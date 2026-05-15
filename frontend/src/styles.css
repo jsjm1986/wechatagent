@@ -1,5 +1,6 @@
 :root {
   color-scheme: light;
+  /* Enterprise UI tokens. Keep layout changes aligned with docs/frontend-design-system.md. */
   --bg: #f4f6f8;
   --surface: #ffffff;
   --surface-subtle: #f8fafc;
@@ -19,6 +20,13 @@
   --danger-soft: #fff1f0;
   --radius: 6px;
   --shadow: 0 1px 2px rgba(15, 23, 42, 0.05), 0 12px 28px rgba(15, 23, 42, 0.06);
+  --sidebar-width: 252px;
+  --page-x: 28px;
+  --page-y: 24px;
+  --section-gap: 18px;
+  --pane-pad: 16px;
+  --control-h: 36px;
+  --row-h: 58px;
   font-family:
     "IBM Plex Sans",
     "Aptos",
@@ -57,7 +65,7 @@ button {
   align-items: center;
   justify-content: center;
   gap: 8px;
-  min-height: 36px;
+  min-height: var(--control-h);
   border: 1px solid var(--accent);
   border-radius: var(--radius);
   background: var(--accent);
@@ -99,7 +107,7 @@ button:disabled {
 
 .app {
   display: grid;
-  grid-template-columns: 252px minmax(0, 1fr);
+  grid-template-columns: var(--sidebar-width) minmax(0, 1fr);
   min-height: 100vh;
 }
 
@@ -174,14 +182,14 @@ nav a:hover {
 
 main {
   min-width: 0;
-  padding: 24px 28px 32px;
+  padding: var(--page-y) var(--page-x) 32px;
 }
 
 .topline {
   display: flex;
   align-items: flex-start;
   justify-content: space-between;
-  gap: 18px;
+  gap: var(--section-gap);
   border-bottom: 1px solid var(--line);
   padding-bottom: 18px;
   margin-bottom: 0;
@@ -229,7 +237,7 @@ h2 {
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
   border-bottom: 1px solid var(--line);
-  margin-bottom: 18px;
+  margin-bottom: var(--section-gap);
 }
 
 .metric {
@@ -265,7 +273,7 @@ h2 {
 .workspace {
   display: grid;
   grid-template-columns: 390px minmax(0, 1fr);
-  gap: 18px;
+  gap: var(--section-gap);
   align-items: start;
 }
 
@@ -277,7 +285,7 @@ h2 {
 }
 
 .pane {
-  padding: 16px;
+  padding: var(--pane-pad);
 }
 
 .paneHead {
@@ -328,7 +336,7 @@ textarea {
 }
 
 input {
-  height: 38px;
+  height: var(--control-h);
 }
 
 input::placeholder,
@@ -357,7 +365,7 @@ textarea {
   justify-content: flex-start;
   gap: 10px;
   width: 100%;
-  min-height: 58px;
+  min-height: var(--row-h);
   border: 0;
   border-bottom: 1px solid var(--line);
   border-radius: 0;
@@ -523,8 +531,8 @@ textarea {
 .opsGrid {
   display: grid;
   grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
-  gap: 18px;
-  margin-top: 18px;
+  gap: var(--section-gap);
+  margin-top: var(--section-gap);
 }
 
 table {

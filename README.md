@@ -71,6 +71,14 @@ cargo run
 
 Rust 服务会托管 `frontend/dist`。
 
+## 前端设计规范
+
+后台 UI 按企业级运营工作台设计语言扩展，新增页面和组件前先阅读：
+
+```text
+docs/frontend-design-system.md
+```
+
 ## 后台流程
 
 1. 打开后台。
