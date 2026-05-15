@@ -79,6 +79,14 @@ Rust 服务会托管 `frontend/dist`。
 docs/frontend-design-system.md
 ```
 
+## 开发文档
+
+完整开发文档从这里开始：
+
+```text
+docs/README.md
+```
+
 ## 后台流程
 
 1. 打开后台。
