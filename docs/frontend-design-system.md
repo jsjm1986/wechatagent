@@ -1,52 +1,90 @@
 # Frontend Design System
 
-This product is an enterprise operations console. The UI must stay restrained, dense, and predictable as features grow.
+WechatAgent is a new AI operations product for enterprise users. The interface must feel premium, calm, trustworthy, and unmistakably AI-enabled without becoming decorative or complex.
 
 ## Visual Thesis
 
-WechatAgent uses a serious enterprise control-room language: graphite navigation, cold white work surfaces, thin structural lines, one cobalt action color, and compact typography. The interface should feel operational, not promotional.
+Use a white enterprise console language: white navigation, cold gray workspace, graphite typography, one AI-blue action color, and a restrained teal AI-status accent. AI should appear through status language, subtle luminous states, and precise system behavior, not heavy gradients or sci-fi decoration.
 
 ## Layout System
 
-Use a stable application shell:
+The application uses a stable channel shell:
 
 ```text
-252px sidebar
-remaining workspace
-topline header
-metric strip
-primary workspace grid
-secondary operations grid
+white sidebar channel navigation
+main workspace
+  page header
+  current channel content
+  optional sub-tabs
 ```
 
 Core CSS tokens live in `frontend/src/styles.css`:
 
 ```css
---sidebar-width: 252px;
---page-x: 28px;
+--sidebar-width: 264px;
+--page-x: 30px;
 --page-y: 24px;
 --section-gap: 18px;
---pane-pad: 16px;
---control-h: 36px;
---row-h: 58px;
+--panel-pad: 18px;
+--control-h: 38px;
+--row-h: 62px;
 ```
 
-Do not introduce page-specific gutters, random max-widths, or nested card stacks. New pages should reuse the shell and either:
+Do not create long pages that stack every product module. Add new capability as either:
 
-- a two-column workspace: `390px minmax(0, 1fr)`
-- a two-column operations grid: `minmax(0, 1fr) minmax(0, 1fr)`
-- a single-column mobile flow below `980px`
+- a new sidebar channel, when it is a first-class product area
+- a sub-tab inside an existing channel, when it is part of that workflow
+- a compact summary card on Overview, when it is only an entry point or status
+
+## Navigation
+
+Use white sidebar navigation by default.
+
+- Sidebar contains brand, AI status, and first-level channels.
+- Channels are product areas, not anchor links into a long page.
+- Main content renders only the active channel.
+- Sub-tabs classify content inside the active channel.
+
+Current channel model:
+
+```text
+Overview
+Contacts
+Agent Profile
+Operations
+```
 
 ## Hierarchy
 
-Use four visual levels only:
+Use four levels only:
 
-1. App shell: dark sidebar and main workspace.
-2. Page orientation: topline title and primary actions.
-3. Operational regions: bordered panes with one header and one job.
-4. Rows, fields, messages, and table entries.
+1. App shell: white sidebar and main workspace.
+2. Channel header: current section title and primary actions.
+3. Panel or summary card: one operational job or one entry point.
+4. Rows, forms, messages, and table entries.
 
-Avoid adding another visual level unless the product model truly needs it. If a new element requires a nested panel inside a pane, first try a divider, table row, segmented area, or inline section.
+Avoid nested panels. If a feature needs secondary content, use sub-tabs, a divider, a table row, or a compact summary card.
+
+## Color
+
+Primary palette:
+
+```css
+--bg: #f6f8fb;
+--surface: #ffffff;
+--ink: #111827;
+--muted: #64748b;
+--accent: #2563eb;
+--ai: #0f766e;
+```
+
+Rules:
+
+- White and near-white surfaces dominate.
+- Blue is only for primary actions, selection, and active UI.
+- Teal is only for AI state or managed/active signals.
+- Danger/success colors are semantic only.
+- No dark navigation, decorative purple gradients, neon effects, or large tinted backgrounds.
 
 ## Typography
 
@@ -58,82 +96,71 @@ Use the existing font stack only:
 
 Rules:
 
-- Page title: 26-38px, one line if possible.
-- Pane title: 18px.
-- Body and table text: 13px.
-- Metadata and labels: 11-12px uppercase where appropriate.
-- Do not use negative letter spacing.
-- Do not scale font size with viewport width except the existing page title clamp.
-
-## Color
-
-Use one accent color:
-
-```css
---accent: #1d4ed8;
-```
-
-Allowed semantic colors:
-
-- success: managed/online/complete
-- danger: errors/destructive states
-- muted: metadata/inactive states
-
-Do not add decorative gradients, multi-accent palettes, purple-blue marketing gradients, or large tinted backgrounds. Data density and alignment should create the premium feeling.
+- Page title: 28-40px.
+- Panel title: 18px.
+- Body, rows, and tables: 13px.
+- Metadata and system labels: 10.5-12px.
+- Letter spacing must be `0` for ordinary text.
+- Do not scale routine UI text with viewport width.
 
 ## Component Rules
 
-Buttons:
+Summary cards:
 
-- Primary button only for direct committed actions.
-- Secondary button for safe reversible actions.
-- Icon + text for commands.
-- Keep height at `--control-h`.
+- Allowed on Overview and as module entry points.
+- Must be clickable or communicate a key status.
+- Do not use card grids as the whole product structure.
 
-Panes:
+Panels:
 
-- One pane = one operational job.
-- Pane headers must include a short English scope label and a Chinese working title.
-- Avoid cards inside panes. Use dividers and rows.
+- One panel = one operational job.
+- Prefer panel + sub-tabs over vertically stacking multiple panels.
+- Avoid putting cards inside panels.
+
+Navigation:
+
+- Sidebar channels are first-level product areas.
+- Sub-tabs are second-level workflow states.
+- Do not add a third persistent navigation level.
 
 Lists:
 
 - Use fixed row height via `--row-h`.
-- Contact rows must truncate names and identifiers.
-- Selection uses `--accent-soft`, not heavy borders.
-
-Tables:
-
-- Tables are for logs/tasks/status.
-- Keep rows compact.
-- Do not place tables inside additional card wrappers.
+- Long names, wxids, aliases, and task content must truncate or wrap within the region.
+- Selection uses soft blue fill, not heavy borders.
 
 Forms:
 
-- Inputs use full width.
-- Textarea is only for substantial operator input.
-- Focus state is the same across fields: accent border plus subtle ring.
+- Inputs are full width.
+- Textarea is reserved for meaningful operator input.
+- All focus states use the same accent ring.
+
+Tables:
+
+- Use for logs, tasks, and status history.
+- Keep rows compact and scannable.
+- Do not wrap tables in extra cards.
 
 ## Responsive Rules
 
-At widths below `980px`:
+At widths below `860px`:
 
-- Sidebar becomes normal flow.
-- Workspace, metric strip, profile grid, and operations grid collapse to one column.
-- Page padding becomes `18px`.
-- Do not introduce separate mobile-only content unless the desktop content cannot be made readable.
+- Sidebar becomes a top block.
+- Channel navigation becomes horizontal scroll.
+- Overview cards collapse to one column.
+- Panels and profile grids collapse to one column.
+- Sub-tabs may scroll horizontally.
 
-Text must never overlap or require horizontal scrolling. Long names, wxids, aliases, task content, and logs must truncate or wrap within their region.
+Do not create mobile-only content unless the desktop content cannot be made readable.
 
 ## Extension Checklist
 
-Before adding a new screen or feature:
+Before adding a new feature:
 
-- Does it fit the existing shell?
-- Does the section have exactly one job?
-- Can it use an existing pane, row, table, or field pattern?
-- Are all dimensions tied to existing tokens?
-- Does mobile collapse follow the `980px` rule?
-- Are there no nested cards or decorative panels?
-- Can an operator understand the page by scanning headings, labels, numbers, and statuses?
+- Is it a channel, a sub-tab, or an overview entry card?
+- Does the active channel still fit without becoming a long page?
+- Does it use existing tokens for spacing, row height, panel padding, and controls?
+- Is the AI expression limited to status, language, and subtle state?
+- Are there no nested cards or third-level persistent navigation?
+- Can an operator understand the screen by scanning channel title, sub-tabs, labels, and statuses?
 
