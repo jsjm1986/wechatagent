@@ -216,7 +216,7 @@ export function App() {
           </div>
           <div>
             <strong>WechatAgent</strong>
-            <span>私聊运营控制台</span>
+            <span>Enterprise Agent Operations</span>
           </div>
         </div>
 
@@ -239,8 +239,8 @@ export function App() {
       <main>
         <header className="topline">
           <div>
-            <p>Agent Operations</p>
-            <h1>只运营被纳管的好友</h1>
+            <p>Managed WeChat Operations</p>
+            <h1>微信运营 Agent 工作台</h1>
           </div>
           <div className="actions">
             <button onClick={() => void syncAccounts()} disabled={busy}>
@@ -258,15 +258,18 @@ export function App() {
 
         <section className="metrics">
           <div className="metric">
-            <span>微信账号</span>
+            <span>Accounts</span>
+            <small>微信账号</small>
             <strong>{accounts.length}</strong>
           </div>
           <div className="metric">
-            <span>已纳管好友</span>
+            <span>Managed</span>
+            <small>Agent 运营好友</small>
             <strong>{managedCount}</strong>
           </div>
           <div className="metric">
-            <span>跟进任务</span>
+            <span>Tasks</span>
+            <small>跟进任务</small>
             <strong>{tasks.length}</strong>
           </div>
         </section>
@@ -459,4 +462,3 @@ function formatTime(value?: string) {
     minute: "2-digit"
   }).format(new Date(value));
 }
-
