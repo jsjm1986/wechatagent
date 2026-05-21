@@ -196,6 +196,21 @@ fn test_config(mongodb_uri: String, mongodb_database: String) -> AppConfig {
         strategic_planner_block_rate_min_runs: 3,
         strategic_planner_block_rate_threshold: 0.6,
         strategic_planner_priority_enabled: true,
+        // ── agent-self-evolution M4：测试默认全部 disabled / 极小值 ──
+        evolution_enabled: false,
+        evolution_tick_seconds: 600,
+        evolution_run_token_budget: 60_000,
+        evolution_run_max_llm_calls: 30,
+        evolution_eval_window_hours: 72,
+        evolution_min_replays: 30,
+        evolution_min_send_success_delta: 0.05,
+        evolution_min_self_critique_delta: 0.10,
+        evolution_max_5gate_hit_increase: 0.10,
+        evolution_replay_concurrency: 4,
+        evolution_replay_max_fail_rate: 0.30,
+        evolution_threshold_release_cooldown_hours: 24,
+        evolution_cohort_per_contact_cap: 3,
+        evolution_cohort_sample_per_failure_bucket: 10,
     }
 }
 

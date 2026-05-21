@@ -147,3 +147,5 @@ npm run build
 ```
 
 CI 合并门：执行 `scripts/check-baseline.ps1`（Windows）或 `scripts/check-baseline.sh`（Linux / CI），核验 `cargo test --lib >= 78` 与 4 个 PBT 文件累计 `>= 33`，任一不达标即 `exit 1`。
+
+文本严禁词 lint：`scripts/check-no-human-takeover.{sh,ps1}` 扫 `src/agent/ src/routes/ src/evolution/ frontend/src/` 新增行禁用 `human / 人工 / 接管 / takeover / hand-off`；演化器隔离 lint：`scripts/check-evolution-isolation.{sh,ps1}` 扫 `src/evolution/` 是否引用 gateway / outbox / MCP（M4 演化器必须保持独立）。

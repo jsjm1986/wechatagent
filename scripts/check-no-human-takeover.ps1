@@ -21,6 +21,7 @@ $ErrorActionPreference = "Stop"
 $ScanDirs = @(
     "src/agent/",
     "src/routes/",
+    "src/evolution/",
     "frontend/src/"
 )
 

@@ -380,6 +380,8 @@ pub(super) async fn ensure_all(db: &Database) -> anyhow::Result<()> {
     ensure_agent_send_outbox_indexes(db).await?;
     ensure_system_taxonomies_indexes(db).await?;
     ensure_taxonomy_candidates_indexes(db).await?;
+    // ── agent-self-evolution W0 (Task 1.2) ──
+    ensure_evolution_indexes(db).await?;
     Ok(())
 }
 
@@ -466,5 +468,146 @@ async fn ensure_taxonomy_candidates_indexes(db: &Database) -> anyhow::Result<()>
             None,
         )
         .await?;
+    Ok(())
+}
+
+/// agent-self-evolution W0 (Task 1.2)：5 张新 collection + prompt_templates
+/// 多版本辅助索引。
+///
+/// - `experiments`：`(workspace_id, account_id, started_at desc)` 列表查询；
+///   `(experiment_id)` 唯一保证 envelope 不重复 insert（Requirements 1.3）。
+/// - `proposals`：`(workspace_id, account_id, status, created_at desc)` 后台
+///   按状态分页；`(experiment_id)` 反查 cohort 下所有 proposal（Requirements 5.x）。
+/// - `shadow_replays`：`(proposal_id)` 聚合；`(workspace_id, account_id,
+///   started_at desc)` 后台监控（Requirements 5.x）。
+/// - `threshold_overrides`：`(workspace_id, account_id, gate_key, released_at
+///   desc)` 是 `resolve_thresholds` 取最新有效值的核心查询路径（Requirements 6.2）。
+/// - `prompt_templates` 多版本支持：`(workspace_id, prompt_key, current_version)`
+///   过滤 current 那条；`(workspace_id, prompt_key, version)` 唯一保证同 key
+///   下版本号不冲突（Requirements 6.4 / 6.5）。
+async fn ensure_evolution_indexes(db: &Database) -> anyhow::Result<()> {
+    // experiments
+    db.experiments()
+        .create_index(
+            IndexModel::builder()
+                .keys(doc! { "workspace_id": 1, "account_id": 1, "started_at": -1 })
+                .build(),
+            None,
+        )
+        .await?;
+    db.experiments()
+        .create_index(
+            IndexModel::builder()
+                .keys(doc! { "experiment_id": 1 })
+                .options(IndexOptions::builder().unique(true).build())
+                .build(),
+            None,
+        )
+        .await?;
+
+    // proposals
+    db.proposals()
+        .create_index(
+            IndexModel::builder()
+                .keys(doc! {
+                    "workspace_id": 1,
+                    "account_id": 1,
+                    "status": 1,
+                    "created_at": -1,
+                })
+                .build(),
+            None,
+        )
+        .await?;
+    db.proposals()
+        .create_index(
+            IndexModel::builder()
+                .keys(doc! { "experiment_id": 1 })
+                .build(),
+            None,
+        )
+        .await?;
+
+    // shadow_replays
+    db.shadow_replays()
+        .create_index(
+            IndexModel::builder()
+                .keys(doc! { "proposal_id": 1 })
+                .build(),
+            None,
+        )
+        .await?;
+    db.shadow_replays()
+        .create_index(
+            IndexModel::builder()
+                .keys(doc! {
+                    "workspace_id": 1,
+                    "account_id": 1,
+                    "started_at": -1,
+                })
+                .build(),
+            None,
+        )
+        .await?;
+
+    // threshold_overrides
+    db.threshold_overrides()
+        .create_index(
+            IndexModel::builder()
+                .keys(doc! {
+                    "workspace_id": 1,
+                    "account_id": 1,
+                    "gate_key": 1,
+                    "released_at": -1,
+                })
+                .build(),
+            None,
+        )
+        .await?;
+
+    // post_release_reviews（W4 Task 5.6 一并加，避免 W4 再补一波索引）
+    db.post_release_reviews()
+        .create_index(
+            IndexModel::builder()
+                .keys(doc! {
+                    "workspace_id": 1,
+                    "account_id": 1,
+                    "scheduled_at": 1,
+                    "completed": 1,
+                })
+                .build(),
+            None,
+        )
+        .await?;
+    db.post_release_reviews()
+        .create_index(
+            IndexModel::builder()
+                .keys(doc! { "proposal_id": 1 })
+                .build(),
+            None,
+        )
+        .await?;
+
+    // prompt_templates 多版本辅助：(workspace_id, prompt_key, current_version)
+    // 用于 ensure_prompt_pack_v2 + release_prompt 在同 key 下定位 current 那条；
+    // (workspace_id, prompt_key, version) 唯一保证多版本不冲突。
+    db.prompt_templates()
+        .create_index(
+            IndexModel::builder()
+                .keys(doc! { "workspace_id": 1, "prompt_key": 1, "current_version": 1 })
+                .build(),
+            None,
+        )
+        .await?;
+    db.prompt_templates()
+        .create_index(
+            IndexModel::builder()
+                .keys(doc! { "workspace_id": 1, "prompt_key": 1, "version": 1 })
+                .options(IndexOptions::builder().unique(true).build())
+                .build(),
+            None,
+        )
+        .await?;
+
     Ok(())
 }

@@ -124,6 +124,9 @@ async fn ensure_missing_prompt_templates(db: &Database, workspace_id: &str) -> A
                     created_by: "system".to_string(),
                     created_at: DateTime::now(),
                     updated_at: DateTime::now(),
+                    current_version: true,
+                    previous_version: None,
+                    seeded_by: Some("system".to_string()),
                 },
                 None,
             )
@@ -189,6 +192,9 @@ pub async fn reset_prompt_pack_v2(
                     created_by: "system".to_string(),
                     created_at: DateTime::now(),
                     updated_at: DateTime::now(),
+                    current_version: true,
+                    previous_version: None,
+                    seeded_by: Some("system".to_string()),
                 },
                 None,
             )

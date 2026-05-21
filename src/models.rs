@@ -263,6 +263,18 @@ pub struct PromptTemplate {
     pub created_by: String,
     pub created_at: DateTime,
     pub updated_at: DateTime,
+    /// agent-self-evolution M4 / W0 Task 1.5：多版本支持。`true` 表示当前生效版本。
+    /// 同 `(workspace_id, prompt_key)` 下应至多有一条 `current_version=true`，由
+    /// `release_prompt` 在 mongo 事务内保证。缺字段时反序列化为 `false`，
+    /// `2026_05_M4_001_prompt_template_versioned` 迁移把历史唯一一条置 `true`。
+    #[serde(default)]
+    pub current_version: bool,
+    /// agent-self-evolution M4：被替换的上一版本号（rollback 时取回它）。
+    /// `release_prompt` 写入新条时设为旧条的 `version`；首次 seed 为 `None`。
+    pub previous_version: Option<i32>,
+    /// agent-self-evolution M4：写入来源（`"system"` / `"legacy_migration"` /
+    /// `"evolution_release"` 等），方便排查谁改的。
+    pub seeded_by: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1811,6 +1823,164 @@ impl OperationDomainConfig {
     }
 }
 
+// ──────────────────────────────────────────────────────────────────────────
+// agent-self-evolution W0 (Task 1.1)：5 个新 collection 的占位结构。
+//
+// 业务字段在 W2/W3/W4 落地（threshold/prompt 候选、shadow replay、release
+// 路径），这里仅给出 BSON 往返所需的最小字段集合，保证 `Database::experiments()`
+// 等 typed accessor 编译通过且 `models_smoke` 单测可往返。
+// ──────────────────────────────────────────────────────────────────────────
+
+/// agent-self-evolution W0：`experiments` 信封（一次 tick 一条）。
+/// Requirements 1.3 / 8.1。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Experiment {
+    #[serde(rename = "_id", skip_serializing_if = "Option::is_none")]
+    pub id: Option<ObjectId>,
+    pub experiment_id: String,
+    pub workspace_id: String,
+    pub account_id: String,
+    /// `"collecting"` | `"evaluating"` | `"awaiting_admin"` | `"released"` | `"aborted"`。
+    pub status: String,
+    pub window_hours: i32,
+    pub started_at: DateTime,
+    pub updated_at: DateTime,
+    pub finished_at: Option<DateTime>,
+    #[serde(default)]
+    pub cohort_threshold_run_ids: Vec<ObjectId>,
+    #[serde(default)]
+    pub cohort_prompt_run_ids: Vec<ObjectId>,
+    #[serde(default)]
+    pub budget_used_tokens: i64,
+    #[serde(default)]
+    pub budget_used_calls: i32,
+    #[serde(default)]
+    pub proposals_count: i32,
+    #[serde(default)]
+    pub proposals_eligible_count: i32,
+}
+
+/// agent-self-evolution W0：`proposals`（threshold 或 prompt 候选）。
+/// Requirements 3.x / 4.x / 5.x / 6.x / 8.1。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Proposal {
+    #[serde(rename = "_id", skip_serializing_if = "Option::is_none")]
+    pub id: Option<ObjectId>,
+    pub experiment_id: String,
+    pub workspace_id: String,
+    pub account_id: String,
+    /// `"threshold"` | `"prompt"`。
+    pub proposal_kind: String,
+    /// `"pending_eval"` | `"evaluating"` | `"eligible_for_release"`
+    /// | `"rejected_below_threshold"` | `"released"` | `"rolled_back"`。
+    pub status: String,
+    /// threshold 类专用（如 `"fact_risk_block"` / `"planner_block_rate_threshold"`）。
+    pub gate_key: Option<String>,
+    /// threshold 类：当前生效值（写入时记快照）。
+    pub current_value: Option<f64>,
+    /// threshold 类：候选值。
+    pub proposed_value: Option<f64>,
+    /// threshold 候选生成的命中率统计 / cohort 备注（自由 Document）。
+    #[serde(default)]
+    pub cohort_notes: Document,
+    /// prompt 类：模板 key（如 `"reply_agent_main"`）。
+    pub proposed_template_key: Option<String>,
+    /// prompt 类：要修订的 section（`"soul" | "system_contract" | "policy" | "operator_instruction"`）。
+    pub proposed_section: Option<String>,
+    /// prompt 类：Critic LLM 输出的 diff 摘要 / 摘要文本。
+    pub diff_summary: Option<String>,
+    pub diff_snippet: Option<String>,
+    pub critic_reasoning: Option<String>,
+    #[serde(default)]
+    pub expected_improvement_on: Vec<String>,
+    pub risk_note: Option<String>,
+    /// release 路径回滚专用：被替换的旧 prompt 版本号（rollback 取回它）。
+    pub previous_prompt_version: Option<String>,
+    /// 显著性测试结果（design.md §4.6）。
+    #[serde(default)]
+    pub eval_metrics: Document,
+    #[serde(default)]
+    pub eval_replays_completed: i32,
+    #[serde(default)]
+    pub eval_replays_failed: i32,
+    pub significance_passed: Option<bool>,
+    pub failure_reason: Option<String>,
+    pub released_at: Option<DateTime>,
+    pub released_by: Option<String>,
+    pub rolled_back_at: Option<DateTime>,
+    pub rolled_back_by: Option<String>,
+    pub created_at: DateTime,
+    pub updated_at: DateTime,
+}
+
+/// agent-self-evolution W0：`shadow_replays`（每条 proposal × source_run_id 一条）。
+/// Requirements 5.x / 8.1。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ShadowReplay {
+    #[serde(rename = "_id", skip_serializing_if = "Option::is_none")]
+    pub id: Option<ObjectId>,
+    pub proposal_id: ObjectId,
+    pub experiment_id: String,
+    pub workspace_id: String,
+    pub account_id: String,
+    pub source_run_id: ObjectId,
+    /// `"completed"` | `"failed"`。
+    pub status: String,
+    pub failure_reason: Option<String>,
+    pub original_final_review_status: Option<String>,
+    pub new_final_review_status: Option<String>,
+    #[serde(default)]
+    pub new_review_risks: Vec<String>,
+    pub new_token_cost: Option<i64>,
+    /// 5 闸命中布尔向量（fact_risk / pressure_risk / human_like / emotional / product_accuracy / planner_block_rate）。
+    #[serde(default)]
+    pub new_5gate_hit: Document,
+    pub new_self_critique_addressed: Option<bool>,
+    /// 与原 reply 的近似度（0.0~1.0）；W3 task 4.1 写 0.0 占位。
+    #[serde(default)]
+    pub similarity_to_original_text: f64,
+    pub started_at: DateTime,
+    pub finished_at: Option<DateTime>,
+}
+
+/// agent-self-evolution W0：`threshold_overrides`（按 gate_key 维度的发布覆盖层）。
+/// Requirements 6.x / 8.1。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ThresholdOverride {
+    #[serde(rename = "_id", skip_serializing_if = "Option::is_none")]
+    pub id: Option<ObjectId>,
+    pub workspace_id: String,
+    pub account_id: String,
+    pub gate_key: String,
+    pub value: f64,
+    pub source_proposal_id: ObjectId,
+    pub released_at: DateTime,
+    pub released_by: String,
+    pub rolled_back_at: Option<DateTime>,
+    pub rolled_back_by: Option<String>,
+}
+
+/// agent-self-evolution W0：`post_release_reviews`（W4 Task 5.6 +24h 对比窗口评测）。
+/// Requirements 9.7。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PostReleaseReview {
+    #[serde(rename = "_id", skip_serializing_if = "Option::is_none")]
+    pub id: Option<ObjectId>,
+    pub proposal_id: ObjectId,
+    pub workspace_id: String,
+    pub account_id: String,
+    /// `"threshold"` | `"prompt"`。
+    pub proposal_kind: String,
+    pub released_at: DateTime,
+    pub scheduled_at: DateTime,
+    #[serde(default)]
+    pub completed: bool,
+    pub actual_send_success_rate_delta: Option<f64>,
+    #[serde(default)]
+    pub actual_5gate_hit_delta: Document,
+    pub completed_at: Option<DateTime>,
+}
+
 #[cfg(test)]
 mod typed_tests {
     use super::*;
@@ -2423,5 +2593,231 @@ mod typed_tests {
         assert_eq!(parsed.status, "pending");
         assert!(parsed.reviewed_at.is_none());
         assert!(parsed.reviewed_by.is_none());
+    }
+
+    // ── agent-self-evolution W0 (Task 1.6) ──
+    //
+    // 5 个新 collection 的 BSON 往返 smoke：保证字段命名 / Option / 嵌套 Document
+    // 在序列化后能还原；W2/W3/W4 落地业务字段后再补显著性 / release 路径专项测试。
+
+    #[test]
+    fn experiment_bson_round_trip() {
+        let now = mongodb::bson::DateTime::now();
+        let exp = Experiment {
+            id: None,
+            experiment_id: "exp_2026_05_001".to_string(),
+            workspace_id: "default".to_string(),
+            account_id: "default".to_string(),
+            status: "collecting".to_string(),
+            window_hours: 72,
+            started_at: now,
+            updated_at: now,
+            finished_at: None,
+            cohort_threshold_run_ids: vec![mongodb::bson::oid::ObjectId::new()],
+            cohort_prompt_run_ids: vec![],
+            budget_used_tokens: 0,
+            budget_used_calls: 0,
+            proposals_count: 0,
+            proposals_eligible_count: 0,
+        };
+        let doc = mongodb::bson::to_document(&exp).expect("serialize Experiment");
+        assert_eq!(doc.get_str("experiment_id").unwrap(), "exp_2026_05_001");
+        assert_eq!(doc.get_str("status").unwrap(), "collecting");
+        assert_eq!(doc.get_i32("window_hours").unwrap(), 72);
+        let parsed: Experiment =
+            mongodb::bson::from_document(doc).expect("deserialize Experiment");
+        assert_eq!(parsed.experiment_id, exp.experiment_id);
+        assert_eq!(parsed.cohort_threshold_run_ids.len(), 1);
+        assert!(parsed.cohort_prompt_run_ids.is_empty());
+        assert!(parsed.finished_at.is_none());
+    }
+
+    #[test]
+    fn proposal_bson_round_trip_threshold_kind() {
+        let now = mongodb::bson::DateTime::now();
+        let p = Proposal {
+            id: None,
+            experiment_id: "exp_001".to_string(),
+            workspace_id: "default".to_string(),
+            account_id: "default".to_string(),
+            proposal_kind: "threshold".to_string(),
+            status: "pending_eval".to_string(),
+            gate_key: Some("fact_risk_block".to_string()),
+            current_value: Some(6.0),
+            proposed_value: Some(7.0),
+            cohort_notes: doc! { "hit_rate_observed": 0.42 },
+            proposed_template_key: None,
+            proposed_section: None,
+            diff_summary: None,
+            diff_snippet: None,
+            critic_reasoning: None,
+            expected_improvement_on: vec![],
+            risk_note: None,
+            previous_prompt_version: None,
+            eval_metrics: doc! {},
+            eval_replays_completed: 0,
+            eval_replays_failed: 0,
+            significance_passed: None,
+            failure_reason: None,
+            released_at: None,
+            released_by: None,
+            rolled_back_at: None,
+            rolled_back_by: None,
+            created_at: now,
+            updated_at: now,
+        };
+        let doc = mongodb::bson::to_document(&p).expect("serialize Proposal");
+        assert_eq!(doc.get_str("proposal_kind").unwrap(), "threshold");
+        assert_eq!(doc.get_str("gate_key").unwrap(), "fact_risk_block");
+        assert_eq!(doc.get_f64("current_value").unwrap(), 6.0);
+        let cohort = doc.get_document("cohort_notes").unwrap();
+        assert_eq!(cohort.get_f64("hit_rate_observed").unwrap(), 0.42);
+        let parsed: Proposal =
+            mongodb::bson::from_document(doc).expect("deserialize Proposal");
+        assert_eq!(parsed.proposed_value, Some(7.0));
+        assert!(parsed.proposed_template_key.is_none());
+    }
+
+    #[test]
+    fn proposal_bson_round_trip_prompt_kind() {
+        let now = mongodb::bson::DateTime::now();
+        let p = Proposal {
+            id: None,
+            experiment_id: "exp_002".to_string(),
+            workspace_id: "default".to_string(),
+            account_id: "default".to_string(),
+            proposal_kind: "prompt".to_string(),
+            status: "pending_eval".to_string(),
+            gate_key: None,
+            current_value: None,
+            proposed_value: None,
+            cohort_notes: doc! {},
+            proposed_template_key: Some("reply_agent_main".to_string()),
+            proposed_section: Some("policy".to_string()),
+            diff_summary: Some("强化 product fact-check 兜底语句".to_string()),
+            diff_snippet: Some("…在引用产品参数前必须确认 knowledge chunk…".to_string()),
+            critic_reasoning: Some("过去 30 条失败 cohort 中 12 条触发 fact_risk_block".to_string()),
+            expected_improvement_on: vec!["blocked_unverified_product_claim".to_string()],
+            risk_note: None,
+            previous_prompt_version: Some("v3".to_string()),
+            eval_metrics: doc! {},
+            eval_replays_completed: 0,
+            eval_replays_failed: 0,
+            significance_passed: None,
+            failure_reason: None,
+            released_at: None,
+            released_by: None,
+            rolled_back_at: None,
+            rolled_back_by: None,
+            created_at: now,
+            updated_at: now,
+        };
+        let doc = mongodb::bson::to_document(&p).expect("serialize Proposal");
+        assert_eq!(doc.get_str("proposal_kind").unwrap(), "prompt");
+        assert_eq!(doc.get_str("proposed_section").unwrap(), "policy");
+        let parsed: Proposal =
+            mongodb::bson::from_document(doc).expect("deserialize Proposal");
+        assert_eq!(parsed.proposed_template_key.as_deref(), Some("reply_agent_main"));
+        assert_eq!(parsed.expected_improvement_on.len(), 1);
+        assert_eq!(parsed.previous_prompt_version.as_deref(), Some("v3"));
+    }
+
+    #[test]
+    fn shadow_replay_bson_round_trip() {
+        let now = mongodb::bson::DateTime::now();
+        let proposal_id = mongodb::bson::oid::ObjectId::new();
+        let source_run_id = mongodb::bson::oid::ObjectId::new();
+        let r = ShadowReplay {
+            id: None,
+            proposal_id,
+            experiment_id: "exp_003".to_string(),
+            workspace_id: "default".to_string(),
+            account_id: "default".to_string(),
+            source_run_id,
+            status: "completed".to_string(),
+            failure_reason: None,
+            original_final_review_status: Some("blocked_unverified_product_claim".to_string()),
+            new_final_review_status: Some("approved".to_string()),
+            new_review_risks: vec!["pressure_risk:hard_close".to_string()],
+            new_token_cost: Some(1234),
+            new_5gate_hit: doc! { "fact_risk": false, "pressure_risk": true },
+            new_self_critique_addressed: Some(true),
+            similarity_to_original_text: 0.0,
+            started_at: now,
+            finished_at: Some(now),
+        };
+        let doc = mongodb::bson::to_document(&r).expect("serialize ShadowReplay");
+        assert_eq!(doc.get_str("status").unwrap(), "completed");
+        assert_eq!(doc.get_f64("similarity_to_original_text").unwrap(), 0.0);
+        let parsed: ShadowReplay =
+            mongodb::bson::from_document(doc).expect("deserialize ShadowReplay");
+        assert_eq!(parsed.proposal_id, proposal_id);
+        assert_eq!(parsed.source_run_id, source_run_id);
+        assert_eq!(parsed.new_token_cost, Some(1234));
+        assert!(parsed.new_self_critique_addressed.unwrap());
+    }
+
+    #[test]
+    fn threshold_override_bson_round_trip() {
+        let now = mongodb::bson::DateTime::now();
+        let proposal_id = mongodb::bson::oid::ObjectId::new();
+        let o = ThresholdOverride {
+            id: None,
+            workspace_id: "default".to_string(),
+            account_id: "default".to_string(),
+            gate_key: "human_like_score_rewrite".to_string(),
+            value: 6.5,
+            source_proposal_id: proposal_id,
+            released_at: now,
+            released_by: "admin@local".to_string(),
+            rolled_back_at: None,
+            rolled_back_by: None,
+        };
+        let doc = mongodb::bson::to_document(&o).expect("serialize ThresholdOverride");
+        assert_eq!(doc.get_str("gate_key").unwrap(), "human_like_score_rewrite");
+        assert_eq!(doc.get_f64("value").unwrap(), 6.5);
+        let parsed: ThresholdOverride =
+            mongodb::bson::from_document(doc).expect("deserialize ThresholdOverride");
+        assert_eq!(parsed.gate_key, "human_like_score_rewrite");
+        assert_eq!(parsed.value, 6.5);
+        assert_eq!(parsed.source_proposal_id, proposal_id);
+        assert!(parsed.rolled_back_at.is_none());
+    }
+
+    #[test]
+    fn post_release_review_bson_round_trip() {
+        let now = mongodb::bson::DateTime::now();
+        let proposal_id = mongodb::bson::oid::ObjectId::new();
+        let r = PostReleaseReview {
+            id: None,
+            proposal_id,
+            workspace_id: "default".to_string(),
+            account_id: "default".to_string(),
+            proposal_kind: "threshold".to_string(),
+            released_at: now,
+            scheduled_at: now,
+            completed: false,
+            actual_send_success_rate_delta: None,
+            actual_5gate_hit_delta: doc! {},
+            completed_at: None,
+        };
+        let doc = mongodb::bson::to_document(&r).expect("serialize PostReleaseReview");
+        assert_eq!(doc.get_str("proposal_kind").unwrap(), "threshold");
+        assert_eq!(doc.get_bool("completed").unwrap(), false);
+        let parsed: PostReleaseReview =
+            mongodb::bson::from_document(doc).expect("deserialize PostReleaseReview");
+        assert_eq!(parsed.proposal_id, proposal_id);
+        assert!(!parsed.completed);
+        assert!(parsed.actual_send_success_rate_delta.is_none());
+    }
+
+    /// W0 / Task 1.6：M4 演化器迁移 ID 必须按字符串字典序排在 M3 末条之后，
+    /// 否则 `migration_ids_are_chronologically_ordered` 测试将失败。
+    /// 这里独立断言一次，给后续追加 M4_002 / M5 时一个明确锚点。
+    #[test]
+    fn m4_migration_id_is_after_2026_05_009() {
+        // `0` (0x30) < `M` (0x4D)：`2026_05_009...` < `2026_05_M4_001...`。
+        assert!("2026_05_009_contact_customer_stage_updated_at_backfill"
+            < "2026_05_M4_001_prompt_template_versioned");
     }
 }

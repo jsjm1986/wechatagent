@@ -33,6 +33,9 @@ fn make_user_template(workspace: &str, key: &str, status: &str) -> PromptTemplat
         created_by: "operator".to_string(),
         created_at: now,
         updated_at: now,
+        current_version: false,
+        previous_version: None,
+        seeded_by: Some("manual".to_string()),
     }
 }
 

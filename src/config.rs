@@ -68,6 +68,40 @@ pub struct AppConfig {
     /// M3 Strategic Planner：是否启用 commitment / stage_stagnation 段的跨联系人优先级排序。
     /// false 时退化为 M2 自然顺序（Mongo cursor 顺序）。默认 true。
     pub strategic_planner_priority_enabled: bool,
+
+    // ── agent-self-evolution M4：演化器（独立 worker） ──
+    //
+    // 默认全部保守值。`evolution_enabled=false` 是安装态默认；运维需显式
+    // 通过 env 打开。所有阈值在 design.md §5 中有明确单位与范围说明。
+
+    /// M4：是否启用 evolutionary worker。默认 false（安装态关停，需运维显式打开）。
+    pub evolution_enabled: bool,
+    /// M4：演化器主循环间隔秒数。默认 21600（6 小时）——比 strategic planner 长一档。
+    pub evolution_tick_seconds: u64,
+    /// M4：单次 tick 的 LLM token 预算上限。Critic LLM 触顶后整波 prompt 候选 drop。
+    pub evolution_run_token_budget: i64,
+    /// M4：单次 tick 的 LLM 调用次数上限。
+    pub evolution_run_max_llm_calls: i32,
+    /// M4：cohort 选择回看窗口小时数。默认 72。
+    pub evolution_eval_window_hours: u32,
+    /// M4：cohort 最少 run 数门槛。低于此值整波 cohort 视为空（不产候选）。
+    pub evolution_min_replays: usize,
+    /// M4：threshold 候选释放门槛——shadow eval 后 send_success_rate 提升必须 ≥ 此值。
+    pub evolution_min_send_success_delta: f64,
+    /// M4：prompt 候选释放门槛——self_critique_addressed_rate 提升必须 ≥ 此值。
+    pub evolution_min_self_critique_delta: f64,
+    /// M4：5 闸命中率任一上升不得超过此值（防止 prompt 修订引入新风险）。
+    pub evolution_max_5gate_hit_increase: f64,
+    /// M4：shadow replay 并发上限（tokio Semaphore 容量）。
+    pub evolution_replay_concurrency: usize,
+    /// M4：shadow replay 失败率上限——超过此比例直接 reject 候选。
+    pub evolution_replay_max_fail_rate: f64,
+    /// M4：同 gate_key 上次 release 的 cooldown 小时数；窗口内同 gate 候选直接 reject。
+    pub evolution_threshold_release_cooldown_hours: u32,
+    /// M4：cohort 内同一 contact_wxid 的 run 上限（去重）。
+    pub evolution_cohort_per_contact_cap: usize,
+    /// M4：每个 finalReviewStatus 失败桶给 Critic LLM 的样本数。
+    pub evolution_cohort_sample_per_failure_bucket: usize,
 }
 
 impl AppConfig {
@@ -150,6 +184,34 @@ impl AppConfig {
                 "STRATEGIC_PLANNER_PRIORITY_ENABLED",
                 "true",
             )),
+            // ── agent-self-evolution M4 ──
+            evolution_enabled: parse_bool(&env_or("EVOLUTION_ENABLED", "false")),
+            evolution_tick_seconds: env_or("EVOLUTION_TICK_SECONDS", "21600").parse()?,
+            evolution_run_token_budget: env_or("EVOLUTION_RUN_TOKEN_BUDGET", "60000").parse()?,
+            evolution_run_max_llm_calls: env_or("EVOLUTION_RUN_MAX_LLM_CALLS", "30").parse()?,
+            evolution_eval_window_hours: env_or("EVOLUTION_EVAL_WINDOW_HOURS", "72").parse()?,
+            evolution_min_replays: env_or("EVOLUTION_MIN_REPLAYS", "30").parse()?,
+            evolution_min_send_success_delta: env_or("EVOLUTION_MIN_SEND_SUCCESS_DELTA", "0.05")
+                .parse()?,
+            evolution_min_self_critique_delta: env_or("EVOLUTION_MIN_SELF_CRITIQUE_DELTA", "0.10")
+                .parse()?,
+            evolution_max_5gate_hit_increase: env_or("EVOLUTION_MAX_5GATE_HIT_INCREASE", "0.10")
+                .parse()?,
+            evolution_replay_concurrency: env_or("EVOLUTION_REPLAY_CONCURRENCY", "4").parse()?,
+            evolution_replay_max_fail_rate: env_or("EVOLUTION_REPLAY_MAX_FAIL_RATE", "0.30")
+                .parse()?,
+            evolution_threshold_release_cooldown_hours: env_or(
+                "EVOLUTION_THRESHOLD_RELEASE_COOLDOWN_HOURS",
+                "24",
+            )
+            .parse()?,
+            evolution_cohort_per_contact_cap: env_or("EVOLUTION_COHORT_PER_CONTACT_CAP", "3")
+                .parse()?,
+            evolution_cohort_sample_per_failure_bucket: env_or(
+                "EVOLUTION_COHORT_SAMPLE_PER_FAILURE_BUCKET",
+                "10",
+            )
+            .parse()?,
         })
     }
 }

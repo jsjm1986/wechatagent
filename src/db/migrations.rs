@@ -71,6 +71,11 @@ pub const MIGRATIONS: &[Migration] = &[
         id: "2026_05_009_contact_customer_stage_updated_at_backfill",
         run: |db| Box::pin(contact_customer_stage_updated_at_backfill(db)),
     },
+    // ── agent-self-evolution M4 (W0 Task 1.5) ──
+    Migration {
+        id: "2026_05_M4_001_prompt_template_versioned",
+        run: |db| Box::pin(prompt_template_versioned(db)),
+    },
 ];
 
 /// 2026_05_001：把存量 contact 的 `last_message_at` 回填到 `last_inbound_at`，
@@ -800,6 +805,99 @@ async fn contact_customer_stage_updated_at_backfill(db: &Database) -> AppResult<
         modified = result.modified_count,
         matched = result.matched_count,
         "backfilled contacts.customer_stage_updated_at from updated_at"
+    );
+    Ok(())
+}
+
+/// 2026_05_M4_001（agent-self-evolution / W0 Task 1.5）：把 `prompt_templates`
+/// 升级为多版本形态。给所有缺字段的旧文档填：
+///   - `current_version`：同 `(workspace_id, prompt_key)` 下 `version` 最大且
+///     `status="active"` 的一条置 `true`，其余置 `false`；同 prompt_key 下
+///     若没有 active，按 version 最大兜底（`status="draft"` 也算）。
+///   - `previous_version: null`（rollback 不能跨迁移点）。
+///   - `seeded_by: "legacy_migration"`（来源标记）。
+///
+/// 幂等：filter 命中"`current_version` 字段不存在"的文档；二次启动时所有文档
+/// 都已具备字段，filter 不再命中。`migrations` 集合的版本记录是双保险。
+async fn prompt_template_versioned(db: &Database) -> AppResult<()> {
+    let coll = db
+        .raw()
+        .collection::<Document>("prompt_templates");
+    // 阶段 1：给所有缺 `current_version` 字段的文档填占位（先全部置 false /
+    // previous_version=null / seeded_by=legacy_migration）。
+    let stage1 = coll
+        .update_many(
+            doc! { "current_version": { "$exists": false } },
+            doc! {
+                "$set": {
+                    "current_version": false,
+                    "previous_version": Bson::Null,
+                    "seeded_by": "legacy_migration",
+                }
+            },
+            None,
+        )
+        .await?;
+
+    // 阶段 2：按 (workspace_id, prompt_key) 分组，挑 status=active 中 version
+    // 最大的一条置 current_version=true；若整组无 active，则 version 最大且
+    // status 任意（draft / archived 也算）的一条置 true（兜底——避免某些 prompt_key
+    // 全部历史都是 draft 时无 current 可读）。
+    let mut cursor = coll
+        .aggregate(
+            vec![
+                doc! {
+                    "$match": {
+                        "current_version": false,
+                        "status": { "$ne": "archived" },
+                    }
+                },
+                doc! {
+                    "$sort": {
+                        "workspace_id": 1,
+                        "prompt_key": 1,
+                        "version": -1,
+                    }
+                },
+                doc! {
+                    "$group": {
+                        "_id": { "workspace_id": "$workspace_id", "prompt_key": "$prompt_key" },
+                        "active_id": {
+                            "$first": {
+                                "$cond": [{ "$eq": ["$status", "active"] }, "$_id", Bson::Null]
+                            }
+                        },
+                        "fallback_id": { "$first": "$_id" },
+                    }
+                },
+            ],
+            None,
+        )
+        .await?;
+    let mut promoted: u64 = 0;
+    while let Some(group) = cursor.try_next().await? {
+        let target_id = group
+            .get("active_id")
+            .and_then(|b| b.as_object_id())
+            .or_else(|| group.get("fallback_id").and_then(|b| b.as_object_id()));
+        let Some(target) = target_id else {
+            continue;
+        };
+        let result = coll
+            .update_one(
+                doc! { "_id": target },
+                doc! { "$set": { "current_version": true } },
+                None,
+            )
+            .await?;
+        promoted += result.modified_count;
+    }
+
+    tracing::info!(
+        migration_id = "2026_05_M4_001_prompt_template_versioned",
+        backfilled = stage1.modified_count,
+        promoted_current = promoted,
+        "upgraded prompt_templates to multi-version layout"
     );
     Ok(())
 }

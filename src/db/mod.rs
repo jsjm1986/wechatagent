@@ -17,11 +17,11 @@ use mongodb::{options::ClientOptions, Client, Collection, Database as MongoDatab
 use crate::models::{
     AgentCommandRun, AgentDecisionReview, AgentEvent, AgentOutcomeMetric, AgentRunLog, AgentSoul,
     AgentTask, AgentToolCall, Contact, ContentAsset, ConversationMessage, EvaluationScenario,
-    KnowledgeUsageLog, LlmCallLog, ManagementAgentMessage, ManagementAgentSession, McpCallLog,
-    MemoryCandidate, MigrationRecord, OperatingMemory, OperationDomainConfig,
+    Experiment, KnowledgeUsageLog, LlmCallLog, ManagementAgentMessage, ManagementAgentSession,
+    McpCallLog, MemoryCandidate, MigrationRecord, OperatingMemory, OperationDomainConfig,
     OperationKnowledgeChunk, OperationKnowledgeDocument, OperationKnowledgeItem, OperationPlaybook,
-    OutboxEntry, PromptTemplate, TaxonomyCandidate, TaxonomyEntry, UserOperationGuidePreview,
-    WechatAccount,
+    OutboxEntry, PostReleaseReview, PromptTemplate, Proposal, ShadowReplay, TaxonomyCandidate,
+    TaxonomyEntry, ThresholdOverride, UserOperationGuidePreview, WechatAccount,
 };
 
 #[derive(Clone)]
@@ -181,5 +181,38 @@ impl Database {
     /// agent-autonomy-loop W0：`taxonomy_candidates` 集合 typed accessor（Requirements 8.3）。
     pub fn collection_taxonomy_candidates(&self) -> Collection<TaxonomyCandidate> {
         self.db.collection("taxonomy_candidates")
+    }
+
+    // ── agent-self-evolution W0 (Task 1.1) ──
+    //
+    // 5 个新增 collection 的 typed accessor。索引创建（`(workspace_id, account_id,
+    // started_at desc)` / `(experiment_id)` 唯一 / `(proposal_id)` 等）见 W0 task 1.2。
+    // 业务字段最终值在 W2/W3/W4 落定（参考 design.md §3.x）。
+
+    /// agent-self-evolution W0：`experiments` 集合 typed accessor（Requirements 1.3 / 8.1）。
+    pub fn experiments(&self) -> Collection<Experiment> {
+        self.db.collection("experiments")
+    }
+
+    /// agent-self-evolution W0：`proposals` 集合 typed accessor（Requirements 3.x / 4.x / 8.1）。
+    pub fn proposals(&self) -> Collection<Proposal> {
+        self.db.collection("proposals")
+    }
+
+    /// agent-self-evolution W0：`shadow_replays` 集合 typed accessor（Requirements 5.x / 8.1）。
+    pub fn shadow_replays(&self) -> Collection<ShadowReplay> {
+        self.db.collection("shadow_replays")
+    }
+
+    /// agent-self-evolution W0：`threshold_overrides` 集合 typed accessor（Requirements 6.x / 8.1）。
+    pub fn threshold_overrides(&self) -> Collection<ThresholdOverride> {
+        self.db.collection("threshold_overrides")
+    }
+
+    /// agent-self-evolution W4 (Task 5.6)：`post_release_reviews` 集合 typed accessor
+    /// （Requirements 9.7）。+24h 对比窗口评测在 release 完成后由 evolution worker
+    /// 末尾扫描；不参与 release 决策本身。
+    pub fn post_release_reviews(&self) -> Collection<PostReleaseReview> {
+        self.db.collection("post_release_reviews")
     }
 }

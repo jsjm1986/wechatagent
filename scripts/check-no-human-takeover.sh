@@ -26,6 +26,7 @@ HEAD_REF="${2:-HEAD}"
 SCAN_DIRS=(
     "src/agent/"
     "src/routes/"
+    "src/evolution/"
     "frontend/src/"
 )
 

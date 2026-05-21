@@ -107,6 +107,10 @@ pub(super) async fn create_prompt_template(
         created_by: "manual".to_string(),
         created_at: DateTime::now(),
         updated_at: DateTime::now(),
+        // 后台手工创建时尚未发布；publish_prompt_template 会接管 current_version 切换。
+        current_version: false,
+        previous_version: None,
+        seeded_by: Some("manual".to_string()),
     };
     let result = state
         .db
