@@ -335,6 +335,261 @@ async fn commit_with_session(session: &mut ClientSession) -> Result<(), Evolutio
     }
 }
 
+/// 把已 release 的 threshold proposal 回滚——把对应 `threshold_overrides`
+/// 文档置 `rolled_back_at=now`，并把 proposal 推到 `rolled_back`。
+///
+/// `resolve_thresholds` 读 override 时已过滤 `rolled_back_at=null`，因此回滚后
+/// 下一个 run 立即读回到上一档（baseline 来自 contact.runtime_parameters /
+/// AppConfig）。Requirements 6.6。
+pub async fn rollback_threshold(
+    state: &AppState,
+    proposal_id: ObjectId,
+    admin: &str,
+) -> Result<(), EvolutionError> {
+    let proposal = state
+        .db
+        .proposals()
+        .find_one(doc! { "_id": proposal_id }, None)
+        .await
+        .map_err(EvolutionError::from)?
+        .ok_or_else(|| EvolutionError::InvalidStatus(format!("proposal not found: {proposal_id}")))?;
+
+    if proposal.proposal_kind != "threshold" {
+        return Err(EvolutionError::InvalidStatus(format!(
+            "expected proposal_kind=threshold, got {}",
+            proposal.proposal_kind
+        )));
+    }
+    if proposal.status != "released" {
+        return Err(EvolutionError::InvalidStatus(format!(
+            "proposal not released (status={}); rollback rejected",
+            proposal.status
+        )));
+    }
+
+    let now = DateTime::now();
+    let workspace_id = proposal.workspace_id.clone();
+    let account_id = proposal.account_id.clone();
+
+    let client = state.db.client();
+    let mut session = client
+        .start_session(None)
+        .await
+        .map_err(EvolutionError::from)?;
+    session
+        .start_transaction(TransactionOptions::builder().build())
+        .await
+        .map_err(EvolutionError::from)?;
+
+    state
+        .db
+        .raw()
+        .collection::<mongodb::bson::Document>("threshold_overrides")
+        .update_one_with_session(
+            doc! {
+                "source_proposal_id": proposal_id,
+                "rolled_back_at": null,
+            },
+            doc! {
+                "$set": {
+                    "rolled_back_at": now,
+                    "rolled_back_by": admin,
+                }
+            },
+            None,
+            &mut session,
+        )
+        .await
+        .map_err(EvolutionError::from)?;
+
+    state
+        .db
+        .raw()
+        .collection::<mongodb::bson::Document>("proposals")
+        .update_one_with_session(
+            doc! { "_id": proposal_id },
+            doc! {
+                "$set": {
+                    "status": "rolled_back",
+                    "rolled_back_at": now,
+                    "rolled_back_by": admin,
+                    "updated_at": now,
+                }
+            },
+            None,
+            &mut session,
+        )
+        .await
+        .map_err(EvolutionError::from)?;
+
+    commit_with_session(&mut session).await?;
+
+    write_release_event(
+        state,
+        "evolution_rollback_completed",
+        &workspace_id,
+        &account_id,
+        proposal_id,
+        admin,
+        Some(doc! {
+            "kind": "threshold",
+            "gate_key": proposal.gate_key.clone().unwrap_or_default(),
+        }),
+    )
+    .await?;
+
+    Ok(())
+}
+
+/// 把已 release 的 prompt proposal 回滚——把当前 `current_version=true` 那条置
+/// false，把 `previous_version` 那条置 true。proposal 推到 `rolled_back`。
+///
+/// 回滚后 commit 也 fetch_add `prompt_pack_version`，让 LRU 立即失效。
+/// Requirements 6.6。
+pub async fn rollback_prompt(
+    state: &AppState,
+    proposal_id: ObjectId,
+    admin: &str,
+) -> Result<(), EvolutionError> {
+    let proposal = state
+        .db
+        .proposals()
+        .find_one(doc! { "_id": proposal_id }, None)
+        .await
+        .map_err(EvolutionError::from)?
+        .ok_or_else(|| EvolutionError::InvalidStatus(format!("proposal not found: {proposal_id}")))?;
+
+    if proposal.proposal_kind != "prompt" {
+        return Err(EvolutionError::InvalidStatus(format!(
+            "expected proposal_kind=prompt, got {}",
+            proposal.proposal_kind
+        )));
+    }
+    if proposal.status != "released" {
+        return Err(EvolutionError::InvalidStatus(format!(
+            "proposal not released (status={}); rollback rejected",
+            proposal.status
+        )));
+    }
+    let prompt_key = proposal.proposed_template_key.clone().ok_or_else(|| {
+        EvolutionError::InvalidStatus(format!(
+            "prompt proposal missing proposed_template_key: {proposal_id}"
+        ))
+    })?;
+    let previous_version_str = proposal.previous_prompt_version.clone().ok_or_else(|| {
+        EvolutionError::InvalidStatus(format!(
+            "prompt proposal missing previous_prompt_version (was it released by W4 release_prompt?): {proposal_id}"
+        ))
+    })?;
+    let previous_version: i32 = previous_version_str.parse().map_err(|_| {
+        EvolutionError::InvalidStatus(format!(
+            "prompt proposal previous_prompt_version not parseable as i32: {previous_version_str}"
+        ))
+    })?;
+
+    let workspace_id = proposal.workspace_id.clone();
+    let account_id = proposal.account_id.clone();
+    let now = DateTime::now();
+
+    let client = state.db.client();
+    let mut session = client
+        .start_session(None)
+        .await
+        .map_err(EvolutionError::from)?;
+    session
+        .start_transaction(TransactionOptions::builder().build())
+        .await
+        .map_err(EvolutionError::from)?;
+
+    // 1. 把当前 current 置 false
+    state
+        .db
+        .raw()
+        .collection::<mongodb::bson::Document>("prompt_templates")
+        .update_one_with_session(
+            doc! {
+                "workspace_id": &workspace_id,
+                "prompt_key": &prompt_key,
+                "current_version": true,
+            },
+            doc! {
+                "$set": {
+                    "current_version": false,
+                    "updated_at": now,
+                }
+            },
+            None,
+            &mut session,
+        )
+        .await
+        .map_err(EvolutionError::from)?;
+
+    // 2. 把 previous_version 那条重新置 true
+    state
+        .db
+        .raw()
+        .collection::<mongodb::bson::Document>("prompt_templates")
+        .update_one_with_session(
+            doc! {
+                "workspace_id": &workspace_id,
+                "prompt_key": &prompt_key,
+                "version": previous_version,
+            },
+            doc! {
+                "$set": {
+                    "current_version": true,
+                    "updated_at": now,
+                }
+            },
+            None,
+            &mut session,
+        )
+        .await
+        .map_err(EvolutionError::from)?;
+
+    // 3. 推 proposal 到 rolled_back
+    state
+        .db
+        .raw()
+        .collection::<mongodb::bson::Document>("proposals")
+        .update_one_with_session(
+            doc! { "_id": proposal_id },
+            doc! {
+                "$set": {
+                    "status": "rolled_back",
+                    "rolled_back_at": now,
+                    "rolled_back_by": admin,
+                    "updated_at": now,
+                }
+            },
+            None,
+            &mut session,
+        )
+        .await
+        .map_err(EvolutionError::from)?;
+
+    commit_with_session(&mut session).await?;
+
+    state.prompt_pack_version.fetch_add(1, Ordering::SeqCst);
+
+    write_release_event(
+        state,
+        "evolution_rollback_completed",
+        &workspace_id,
+        &account_id,
+        proposal_id,
+        admin,
+        Some(doc! {
+            "kind": "prompt",
+            "prompt_key": &prompt_key,
+            "rolled_back_to_version": previous_version,
+        }),
+    )
+    .await?;
+
+    Ok(())
+}
+
 async fn write_release_event(
     state: &AppState,
     kind: &str,
