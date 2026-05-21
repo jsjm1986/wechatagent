@@ -145,3 +145,5 @@ cargo check
 cd frontend
 npm run build
 ```
+
+CI 合并门：执行 `scripts/check-baseline.ps1`（Windows）或 `scripts/check-baseline.sh`（Linux / CI），核验 `cargo test --lib >= 78` 与 4 个 PBT 文件累计 `>= 33`，任一不达标即 `exit 1`。

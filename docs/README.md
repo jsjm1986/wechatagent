@@ -6,10 +6,11 @@
 
 1. [产品模块规划](product-modules.md)
 2. [系统架构](architecture.md)
-3. [Agent 策略与自动化边界](agent-policy.md)
-4. [数据与接口设计原则](data-and-api.md)
-5. [开发路线图](development-roadmap.md)
-6. [前端设计系统](frontend-design-system.md)
+3. [AI Agent 系统设计](ai-agent-system.md)
+4. [Agent 策略与自动化边界](agent-policy.md)
+5. [数据与接口设计原则](data-and-api.md)
+6. [开发路线图](development-roadmap.md)
+7. [前端设计系统](frontend-design-system.md)
 
 ## 当前阶段
 
@@ -32,6 +33,7 @@
 朋友圈运营
 内容资产
 Agent 策略
+AI Command Center
 任务与日志
 账号与系统
 ```
@@ -39,8 +41,8 @@ Agent 策略
 ## 文档维护规则
 
 - 新增一级业务模块前，先更新 `product-modules.md`。
+- 新增 Agent 类型、提示词层级或自然语言操作能力前，先更新 `ai-agent-system.md`。
 - 新增后端能力前，先更新 `architecture.md` 和 `data-and-api.md`。
 - 新增自动化行为前，先更新 `agent-policy.md`。
 - 新增前端频道、子标签或布局规则前，先更新 `frontend-design-system.md`。
 - 文档要服务开发决策，不写无法落地的愿景描述。
-

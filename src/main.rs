@@ -1,22 +1,8 @@
-mod agent;
-mod config;
-mod db;
-mod error;
-mod llm;
-mod mcp;
-mod models;
-mod routes;
-mod tasks;
-mod webhooks;
-
 use std::net::SocketAddr;
+use std::sync::Arc;
 
 use axum::Router;
-use config::AppConfig;
-use db::Database;
-use llm::LlmClient;
-use mcp::McpClient;
-use routes::{api_router, AppState};
+use mongodb::bson::DateTime;
 use tokio::net::TcpListener;
 use tower_http::{
     cors::{Any, CorsLayer},
@@ -24,6 +10,16 @@ use tower_http::{
     trace::TraceLayer,
 };
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+use wechatagent::{
+    config::AppConfig,
+    db::{self, Database},
+    llm::{LlmClient, LlmGenerator},
+    mcp::McpClient,
+    prompts,
+    routes::{api_router, AppState},
+    tasks, webhooks, APP_STARTED_AT,
+};
+use wechatagent::agent::run_outbox_dispatcher;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -37,22 +33,52 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let config = AppConfig::from_env()?;
+    // 在连接 DB 之前记录进程启动时间，供 HP-1 worker stale 回收逻辑使用。
+    let _ = APP_STARTED_AT.set(DateTime::now());
     let db = Database::connect(&config.mongodb_uri, &config.mongodb_database).await?;
+    db::migrations::run(&db).await?;
+    db.ensure_indexes().await?;
+    let llm: Arc<dyn LlmGenerator> = Arc::new(LlmClient::new(
+        config.openai_base_url.clone(),
+        config.openai_api_key.clone(),
+        config.openai_model.clone(),
+        config.llm_timeout_seconds,
+        config.llm_max_retries,
+        config.llm_retry_base_ms,
+    )?);
     let state = AppState {
         db,
         mcp: McpClient::new(config.mcp_base_url.clone(), config.mcp_api_key.clone())?,
-        llm: LlmClient::new(
-            config.openai_base_url.clone(),
-            config.openai_api_key.clone(),
-            config.openai_model.clone(),
-        )?,
+        llm,
         config: config.clone(),
     };
+    prompts::ensure_prompt_pack_v2(
+        &state.db,
+        &state.config.default_workspace_id,
+        &state.config.default_account_id,
+    )
+    .await?;
+    // S-18 / Task 18：种入示例评测场景，缺失时用 fallback 满足 spec 要求。
+    let _ = ensure_example_evaluation_scenario(&state.db, &state.config.default_workspace_id).await;
 
     let worker_state = state.clone();
     tokio::spawn(async move {
         tasks::run_task_worker(worker_state).await;
     });
+
+    let outbox_state = state.clone();
+    tokio::spawn(async move {
+        if let Err(err) = run_outbox_dispatcher(outbox_state).await {
+            tracing::error!(?err, "outbox dispatcher exited");
+        }
+    });
+
+    if state.config.strategic_planner_enabled {
+        let planner_state = state.clone();
+        tokio::spawn(async move {
+            wechatagent::planner::run_strategic_planner(planner_state).await;
+        });
+    }
 
     let static_files = ServeDir::new("frontend/dist")
         .not_found_service(ServeFile::new("frontend/dist/index.html"));
@@ -103,4 +129,52 @@ async fn shutdown_signal() {
         _ = ctrl_c => {},
         _ = terminate => {},
     }
+}
+
+/// S-18 / Task 18：启动时确保至少存在一个示例评测场景，便于运营人员上手。
+async fn ensure_example_evaluation_scenario(
+    db: &wechatagent::db::Database,
+    workspace_id: &str,
+) -> anyhow::Result<()> {
+    use mongodb::bson::{doc, DateTime};
+    let exists = db
+        .evaluation_scenarios()
+        .find_one(
+            doc! { "workspace_id": workspace_id, "scenario_id": "example_high_intent_user" },
+            None,
+        )
+        .await?;
+    if exists.is_some() {
+        return Ok(());
+    }
+    let now = DateTime::now();
+    let scenario = wechatagent::models::EvaluationScenario {
+        id: None,
+        workspace_id: workspace_id.to_string(),
+        scenario_id: "example_high_intent_user".to_string(),
+        title: "高意向用户主动询问产品能力".to_string(),
+        description: "用户主动表达需求并询问能否落地，期望模型给出有信任、有具体性、不施压的回应。"
+            .to_string(),
+        account_id: None,
+        contact_seed: doc! {
+            "operationState": "need_discovery",
+            "intentLevel": "高意向"
+        },
+        inbound_messages: vec![
+            "我们销售经常跟丢客户，AI 能不能帮忙跟进？".to_string(),
+            "如果客户三天没回，你们会一直追吗？".to_string(),
+        ],
+        ground_truth: doc! {
+            "trust": 7,
+            "conversionReadiness": 6,
+            "emotionalValue": 7,
+            "nextBestActionScore": 7
+        },
+        tags: vec!["example".to_string(), "high_intent".to_string()],
+        status: "active".to_string(),
+        created_at: now,
+        updated_at: now,
+    };
+    db.evaluation_scenarios().insert_one(scenario, None).await?;
+    Ok(())
 }

@@ -48,11 +48,39 @@ Use white sidebar navigation by default.
 Current channel model:
 
 ```text
-Overview
-Contacts
+AI Command Center
+Workbench
+User Operations
 Agent Profile
-Operations
+Tasks & Logs
 ```
+
+AI Command Center should be the primary AI-native entry point. It uses a task stream and execution plan layout, not a marketing-style chat page.
+
+Recommended layout:
+
+```text
+scope rail / object context
+natural language task stream
+execution plan / tool calls / confirmations
+```
+
+Keep the surface white and operational. The AI expression should come from live plans, tool states, confirmations, and concise system language.
+
+The current implementation uses Chinese product labels:
+
+```text
+AI 总控
+工作台
+用户运营
+微信群运营
+朋友圈运营
+内容资产
+系统策略
+任务日志
+```
+
+当前开发优先级是把“用户运营”做成完整长期运营工作台：顶部是用户运营大脑配置，中间是好友池和单人画像，下面是用户运营方法和用户 Prompt。微信群运营和朋友圈运营保留一级频道，但详细工作流下一阶段再展开。
 
 ## Hierarchy
 
@@ -158,9 +186,9 @@ Do not create mobile-only content unless the desktop content cannot be made read
 Before adding a new feature:
 
 - Is it a channel, a sub-tab, or an overview entry card?
+- If it is a natural language operation, should it enter through AI Command Center?
 - Does the active channel still fit without becoming a long page?
 - Does it use existing tokens for spacing, row height, panel padding, and controls?
 - Is the AI expression limited to status, language, and subtle state?
 - Are there no nested cards or third-level persistent navigation?
 - Can an operator understand the screen by scanning channel title, sub-tabs, labels, and statuses?
-

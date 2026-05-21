@@ -26,10 +26,10 @@ React Admin
 
 ```text
 Product Modules
-  用户运营 / 群运营 / 朋友圈 / 内容资产 / 策略 / 日志
+  用户运营 / 群运营 / 朋友圈 / 内容资产 / 策略 / AI Command Center / 日志
 
 Agent Layer
-  意图判断 / 回复生成 / 画像更新 / 任务生成 / 策略执行
+  Management Agent / Operations Agents / 意图判断 / 回复生成 / 画像更新 / 任务生成 / 策略执行
 
 Application Services
   联系人服务 / 群服务 / 朋友圈服务 / 内容资产服务 / 任务服务
@@ -44,6 +44,7 @@ Infrastructure
 - Agent 不直接关心 HTTP 和数据库细节。
 - MCP Client 只负责协议和错误包装。
 - 自动化边界由 Agent 策略决定，不散落在业务代码里。
+- Management Agent 只能调用产品动作和授权工具，不直接裸调任意 MCP 工具。
 
 ## Current Backend Modules
 
@@ -60,6 +61,22 @@ src/webhooks.rs   微信消息 webhook
 src/tasks.rs      跟进任务 worker
 ```
 
+## Agent Types
+
+系统应明确区分两类 Agent：
+
+```text
+Management Agent
+  面向内部操作员，负责自然语言后台操作、跨模块调度、执行计划和确认流。
+
+Operations Agents
+  面向具体运营对象，负责好友、微信群、朋友圈等长期业务运营。
+```
+
+Management Agent 的输入是操作员指令，例如“把 xx 加入运营列表”。Operations Agent 的输入是业务事件和上下文，例如好友新消息、群消息摘要、朋友圈计划。
+
+两类 Agent 不共用运行日志和权限模型，但可以共用 LLM client、内容资产、策略服务和 MCP client。
+
 ## Recommended Evolution
 
 随着模块扩展，后端应逐步拆出 service 层：
@@ -70,6 +87,8 @@ src/services/group_service.rs
 src/services/moment_service.rs
 src/services/content_asset_service.rs
 src/services/agent_policy_service.rs
+src/services/agent_soul_service.rs
+src/services/management_agent_service.rs
 src/services/task_service.rs
 ```
 
@@ -134,4 +153,3 @@ external DeepSeek API
 - 多实例部署
 - webhook 签名校验
 - 日志/指标采集
-

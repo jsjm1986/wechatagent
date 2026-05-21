@@ -17,6 +17,57 @@ pub struct AppConfig {
     pub agent_recent_message_limit: i64,
     pub agent_min_reply_interval_seconds: i64,
     pub task_worker_interval_seconds: u64,
+    pub llm_timeout_seconds: u64,
+    pub llm_max_retries: u32,
+    pub llm_retry_base_ms: u64,
+    /// HP-1 / Task 9：Worker 进程崩溃后，状态卡在 `running` 的任务的回收阈值。
+    /// `claimed_at` 早于 `now - 该秒数` 即视为 stale，由下一次 tick 重置回 `retry`。
+    pub task_claim_timeout_seconds: u64,
+    /// HP-3 / Task 10：reaction analysis claim 锁的超时阈值。
+    /// `outcome_status="analyzing"` 但 `reaction_claimed_at` 早于 `now - 该秒数`
+    /// 的 review 会被视为分析进程崩溃，允许下次 webhook 重新 claim。
+    pub reaction_analysis_claim_timeout_seconds: u64,
+    /// LP-14 / Task 20：webhook 限流窗口秒数（默认 60）。
+    pub webhook_rate_limit_window_seconds: u32,
+    /// LP-14 / Task 20：webhook 限流窗口内最大请求数（默认 30）。
+    pub webhook_rate_limit_capacity: u32,
+    /// M1 Strategic Planner：是否启用静默跟进扫描器。默认 false——首发关闭，
+    /// 通过 `STRATEGIC_PLANNER_ENABLED=true` 显式开启；关闭时 `main.rs` 不会
+    /// 启动 planner loop，等价于功能未上线，是回滚开关。
+    pub strategic_planner_enabled: bool,
+    /// M1 Strategic Planner：扫描循环周期秒数（默认 600 / 10 分钟）。
+    pub strategic_planner_interval_seconds: u64,
+    /// M1 Strategic Planner：判定 contact "静默" 的阈值小时数。
+    /// `last_inbound_at < now - 该小时数` 才会被纳入候选。默认 72。
+    pub strategic_planner_silent_threshold_hours: i64,
+    /// M1 Strategic Planner：每个 account 当日最多 emit 多少条 follow-up 任务。
+    /// 防止扫描器一次性把积压的静默联系人全部 emit 出去。默认 20。
+    pub strategic_planner_daily_emit_cap: i64,
+    /// M2 Strategic Planner：commitment.due_at 在 [now, now+N] 内视为 imminent，
+    /// 触发 `Planner: commitment_imminent` 提前提醒。默认 8 小时。
+    pub strategic_planner_commitment_imminent_window_hours: i64,
+    /// M2 Strategic Planner：同一 commitment_id 在多少小时内不重复 emit。
+    /// Planner 通过 `agent_events` 反查同 commitment_id 历史 emit 实现幂等。默认 24 小时。
+    pub strategic_planner_commitment_emit_dedup_hours: i64,
+    /// M2 Strategic Planner：customer_stage 多久未变视为停滞。
+    /// 默认 14 天，比 silent 阈值 (72h) 长，避免与静默扫描器叠加。
+    pub strategic_planner_stage_stagnation_threshold_days: i64,
+    /// M2 Strategic Planner：比此值更近的 inbound 跳过 stage_stagnation emit。
+    /// 默认 24 小时——避免用户刚说过话还没轮到推进就被 Planner 强催。
+    pub strategic_planner_stage_stagnation_recent_inbound_hours: i64,
+    /// M3 Strategic Planner：反馈环回看窗口小时数。
+    /// 在此窗口内反查该 contact 的 `agent_run_logs.final_review_status`，
+    /// 计算 block-rate；默认 24。
+    pub strategic_planner_block_rate_window_hours: i64,
+    /// M3 Strategic Planner：反馈环最少 run 数门槛。
+    /// 窗口内 run 数 < 此值时不参与 backoff 判定（冷启动友好）。默认 3。
+    pub strategic_planner_block_rate_min_runs: i64,
+    /// M3 Strategic Planner：block-rate 阈值（0.0~1.0）。
+    /// `blocked / (blocked + ok) >= 此值` 时当次 emit 跳过，写 backoff 事件。默认 0.6。
+    pub strategic_planner_block_rate_threshold: f64,
+    /// M3 Strategic Planner：是否启用 commitment / stage_stagnation 段的跨联系人优先级排序。
+    /// false 时退化为 M2 自然顺序（Mongo cursor 顺序）。默认 true。
+    pub strategic_planner_priority_enabled: bool,
 }
 
 impl AppConfig {
@@ -38,6 +89,67 @@ impl AppConfig {
             agent_min_reply_interval_seconds: env_or("AGENT_MIN_REPLY_INTERVAL_SECONDS", "20")
                 .parse()?,
             task_worker_interval_seconds: env_or("TASK_WORKER_INTERVAL_SECONDS", "30").parse()?,
+            llm_timeout_seconds: env_or("LLM_TIMEOUT_SECONDS", "45").parse()?,
+            llm_max_retries: env_or("LLM_MAX_RETRIES", "3").parse()?,
+            llm_retry_base_ms: env_or("LLM_RETRY_BASE_MS", "1000").parse()?,
+            task_claim_timeout_seconds: env_or("TASK_CLAIM_TIMEOUT_SECONDS", "300").parse()?,
+            reaction_analysis_claim_timeout_seconds: env_or(
+                "REACTION_ANALYSIS_CLAIM_TIMEOUT_SECONDS",
+                "60",
+            )
+            .parse()?,
+            webhook_rate_limit_window_seconds: env_or("WEBHOOK_RATE_LIMIT_WINDOW_SECONDS", "60")
+                .parse()?,
+            webhook_rate_limit_capacity: env_or("WEBHOOK_RATE_LIMIT_CAPACITY", "30").parse()?,
+            strategic_planner_enabled: parse_bool(&env_or("STRATEGIC_PLANNER_ENABLED", "false")),
+            strategic_planner_interval_seconds: env_or("STRATEGIC_PLANNER_INTERVAL_SECONDS", "600")
+                .parse()?,
+            strategic_planner_silent_threshold_hours: env_or(
+                "STRATEGIC_PLANNER_SILENT_THRESHOLD_HOURS",
+                "72",
+            )
+            .parse()?,
+            strategic_planner_daily_emit_cap: env_or("STRATEGIC_PLANNER_DAILY_EMIT_CAP", "20")
+                .parse()?,
+            strategic_planner_commitment_imminent_window_hours: env_or(
+                "STRATEGIC_PLANNER_COMMITMENT_IMMINENT_WINDOW_HOURS",
+                "8",
+            )
+            .parse()?,
+            strategic_planner_commitment_emit_dedup_hours: env_or(
+                "STRATEGIC_PLANNER_COMMITMENT_EMIT_DEDUP_HOURS",
+                "24",
+            )
+            .parse()?,
+            strategic_planner_stage_stagnation_threshold_days: env_or(
+                "STRATEGIC_PLANNER_STAGE_STAGNATION_THRESHOLD_DAYS",
+                "14",
+            )
+            .parse()?,
+            strategic_planner_stage_stagnation_recent_inbound_hours: env_or(
+                "STRATEGIC_PLANNER_STAGE_STAGNATION_RECENT_INBOUND_HOURS",
+                "24",
+            )
+            .parse()?,
+            strategic_planner_block_rate_window_hours: env_or(
+                "STRATEGIC_PLANNER_BLOCK_RATE_WINDOW_HOURS",
+                "24",
+            )
+            .parse()?,
+            strategic_planner_block_rate_min_runs: env_or(
+                "STRATEGIC_PLANNER_BLOCK_RATE_MIN_RUNS",
+                "3",
+            )
+            .parse()?,
+            strategic_planner_block_rate_threshold: env_or(
+                "STRATEGIC_PLANNER_BLOCK_RATE_THRESHOLD",
+                "0.6",
+            )
+            .parse()?,
+            strategic_planner_priority_enabled: parse_bool(&env_or(
+                "STRATEGIC_PLANNER_PRIORITY_ENABLED",
+                "true",
+            )),
         })
     }
 }
@@ -48,4 +160,11 @@ fn env_or(key: &str, default: &str) -> String {
 
 fn require_env(key: &str) -> anyhow::Result<String> {
     env::var(key).map_err(|_| anyhow::anyhow!("missing required environment variable {key}"))
+}
+
+fn parse_bool(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on"
+    )
 }

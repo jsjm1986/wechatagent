@@ -1,0 +1,1103 @@
+//! 用户运营 Agent 顶层模块入口（LP-11 / Task 23 拆分目标）。
+//!
+//! 本模块原本是一个 5800+ 行的 `src/agent.rs`，在 LP-11 拆分后以
+//! `src/agent/mod.rs` + 一组职责明确的子模块代替；行为完全不变，
+//! 所有外部调用方（`webhooks` / `tasks` / `routes::*` / `main`）仍通过
+//! `crate::agent::xxx` 访问入口函数与类型。
+//!
+//! 子模块职责：
+//! - [`types`]：内部数据契约（[`AgentDecision`]、`DecisionReviewResult`、
+//!   [`KnowledgeRouteResult`]、[`AgentTrigger`] 等）与序列化辅助；
+//! - [`runtime`]：[`UserRuntimeParameters`] 强类型运行参数；
+//! - [`budget`]：[`RunBudget`] task-local 预算计数 (MP-5)；
+//! - [`guards`]：决策守卫（状态机 / 字符串级 fact-risk / 知识支撑校验）；
+//! - [`memory`]：长期 memoryCard 整理与 consolidator (MP-8)；
+//! - [`reaction`]：用户反应分析与 claim 锁 (HP-3)；
+//! - [`knowledge_router`]：知识库加载、Knowledge Tool Planner、未验证告警 (MP-9)；
+//! - [`decision`]：Reply Agent 主决策与初始画像生成；
+//! - [`review`]：Review Agent / 本地评审 / mode 决策 (MP-10)；
+//! - [`gateway`]：发送网关、运行链路编排、`run_user_operation_gateway`；
+//! - [`simulation`]：Shadow 模式 `simulate_user_dialogue`。
+//!
+//! 工具函数 [`generate_agent_json`] 仍由 mod.rs 自身持有：因为它需要
+//! 访问 [`budget`] 模块的 task-local，而被几乎所有子模块共用，放在 mod.rs
+//! 既能避免循环依赖，也能让 LLM 调用计费/缓存/日志的所有逻辑位于一处。
+
+mod budget;
+mod decision;
+mod gateway;
+mod guards;
+mod knowledge_router;
+mod knowledge_tools;
+mod memory;
+mod tool_loop;
+pub(crate) mod outbox;
+pub(crate) mod outbox_dispatcher;
+mod reaction;
+mod review;
+mod runtime;
+pub mod run_envelope;
+mod simulation;
+pub(crate) mod taxonomy;
+pub(crate) mod types;
+
+use std::{num::NonZeroUsize, sync::LazyLock};
+
+use lru::LruCache;
+use mongodb::bson::DateTime;
+use parking_lot::Mutex as PlMutex;
+use serde_json::Value;
+
+use crate::error::{AppError, AppResult};
+use crate::models::LlmCallLog;
+use crate::routes::AppState;
+
+pub use self::budget::RunBudget;
+pub(crate) use self::budget::{current_run_budget, RUN_BUDGET};
+
+// 入口函数 / 类型重新导出，保持与拆分前 `crate::agent::xxx` 完全一致。
+pub use decision::{build_initial_operation_profile, load_operation_playbook_for_contact};
+pub use gateway::{
+    handle_follow_up_task, handle_managed_message, send_contact_message_gateway,
+    write_event_for_account,
+};
+pub use knowledge_router::test_knowledge_route_for_contact;
+pub use memory::{consolidate_contact_memory, handle_memory_consolidation_task};
+pub use outbox_dispatcher::run_outbox_dispatcher;
+
+// W4 / Task 5.8（R13.10）：暴露 dispatcher 内部 helper 给
+// `tests/outbox_integration.rs` 集成测试驱动；不应在生产代码中绕过 `tick`
+// / `process_entry` 直接调用这些 helper。
+pub use outbox_dispatcher::{
+    atomic_claim_pending, cancel_entry, process_entry, reclaim_expired_leases,
+    schedule_retry_or_terminal, second_safety_gate,
+};
+// outbox 公共 API（enqueue + 取消通道 + 类型）的对外重导出，集成测试需要。
+pub use outbox::{
+    cancel_for_contact_on_user_reaction, enqueue, EnqueueOutcome, EnqueueRequest, OutboxStatus,
+};
+pub use reaction::record_user_reaction;
+pub use simulation::simulate_user_dialogue;
+pub use types::{
+    AgentDecision, ContactSendResult, FollowUpDecision, GeneratedOperationProfile,
+    KnowledgeRouteResult, ManualContactSend, RunPlannerResult, UserOperationSimulationTurn,
+};
+
+// 跨模块仍需访问的内部辅助（routes::shared 用 memory_card 相关函数）。
+pub(crate) use memory::{effective_memory_card_for_contact, memory_card_has_signal};
+
+// Task 24：测试可用的 PBT 入口（pure functions，无副作用）。
+pub use guards::{check_state_transition, compute_taxonomy_resolutions, scan_product_claim_marker_labels};
+pub use memory::compact_memory_card_with_previous;
+
+// agent-autonomy-loop W3 / Tasks 4.11-4.15：性质测试 P1-P7 入口。
+//
+// 这些函数原本是 `pub(crate)`（仅 crate 内部使用）。在 W3 阶段需要被
+// `tests/autonomy_protocol_pbt.rs` 这个独立 crate 的测试文件直接调用，因此重
+// 导出为 `pub`。语义不变，仅可见性变化。
+pub use review::{finalize_review_for_send, local_decision_review, FinalizeOutcome, GatewayStatusFinal, PendingFinalizeEvent};
+pub use runtime::UserRuntimeParameters;
+pub use types::{DecisionReviewResult, RawAgentDecision, ReviewScores};
+
+// agent-autonomy-loop W3 / Task 4.14：P4 PBT 需要在独立 crate 中构造
+// `finalize_review_for_send` 的 `&ProductClaimMarkers` 入参；这里把内置默认
+// markers 工厂函数对外暴露，避免每个测试自己重复构造一份。
+pub use guards::{default_product_claim_markers, ProductClaimMarkers};
+
+// agent-autonomy-loop W3 / Task 4.11：让 PBT 通过 `wechatagent::agent::taxonomy`
+// 直接访问 cache 构造 helper 与命中分支枚举。
+pub use taxonomy::{taxonomy_cache_for_tests, TaxonomyCache};
+
+// agent-autonomy-loop W3 / Task 4.5：P7 工具循环性质测试入口。
+//
+// 直接对外暴露 `reply_with_tools_loop` + `ToolCallRequest` 涉及 `pub(crate)`
+// 类型（`RunBudget` / `KnowledgeRuntime`），扩散面太大；本期采用"在 lib
+// `cfg(test)` 中实现 P7"的折衷方案，与 P3/P4 走同一模式。
+//
+// 详见 `src/agent/tool_loop.rs::pbt_tests`。
+// task 6.3：`compact_memory_card_typed` 已与 `compact_memory_card_with_previous`
+// 合并，仅作向后兼容别名保留；外部测试仍引用，需要 `#[allow(deprecated)]`
+// 静默重导出告警，使用方应迁移到 `compact_memory_card_with_previous`。
+#[allow(deprecated)]
+pub use memory::compact_memory_card_typed;
+
+// 波 C4：让 routes 调用方在 publish prompt 后失效进程内缓存。
+pub(crate) use guards::invalidate_product_claim_markers_cache;
+
+static LLM_EXACT_CACHE: LazyLock<PlMutex<LruCache<String, Value>>> = LazyLock::new(|| {
+    PlMutex::new(LruCache::new(
+        NonZeroUsize::new(256).expect("cache capacity must be non-zero"),
+    ))
+});
+
+/// Agent 公共 LLM JSON 调用入口。所有子模块（decision / review /
+/// knowledge_router / memory / reaction 等）都通过它进 LLM，统一处理：
+/// - LRU 精确缓存（限定 prompt key 列表）；
+/// - 写 `llm_call_logs`（success / cache_hit / failed / json_error）；
+/// - 累计当前 run 的 token / 调用次数 (MP-5 task_local budget)；
+/// - 错误类型分类（HP-4：JSON 不可重试，HTTP 5xx/429 由 LlmClient 内部退避）。
+pub(crate) async fn generate_agent_json(
+    state: &AppState,
+    account_id: Option<&str>,
+    contact_wxid: Option<&str>,
+    run_id: Option<&str>,
+    prompt_key: &str,
+    system: &str,
+    user: &str,
+) -> AppResult<Value> {
+    let started_at = DateTime::now();
+    let cache_key = llm_exact_cache_key(prompt_key, system, user);
+    if let Some(key) = cache_key.as_ref() {
+        let cached = {
+            let mut cache = LLM_EXACT_CACHE.lock();
+            cache.get(key).cloned()
+        };
+        if let Some(value) = cached {
+            let _ = state
+                .db
+                .llm_call_logs()
+                .insert_one(
+                    LlmCallLog {
+                        id: None,
+                        workspace_id: state.config.default_workspace_id.clone(),
+                        account_id: account_id.map(ToString::to_string),
+                        contact_wxid: contact_wxid.map(ToString::to_string),
+                        run_id: run_id.map(ToString::to_string),
+                        prompt_key: prompt_key.to_string(),
+                        model: state.config.openai_model.clone(),
+                        status: "cache_hit".to_string(),
+                        latency_ms: DateTime::now().timestamp_millis()
+                            - started_at.timestamp_millis(),
+                        prompt_tokens: 0,
+                        completion_tokens: 0,
+                        total_tokens: 0,
+                        prompt_cache_hit_tokens: 0,
+                        prompt_cache_miss_tokens: 0,
+                        error: None,
+                        retry_count: 0,
+                        final_status: Some("cache_hit".to_string()),
+                        created_at: started_at,
+                    },
+                    None,
+                )
+                .await;
+            return Ok(value);
+        }
+    }
+    match state.llm.generate_json_with_usage(system, user).await {
+        Ok(result) => {
+            let usage = result.usage.clone();
+            let value = result.value;
+            let retry_count_i32 = result.retry_count.min(i32::MAX as u32) as i32;
+            // MP-5 / Task 15：累计到当前 run 的 budget。
+            if let Some(budget) = current_run_budget() {
+                budget.record_call(usage.total_tokens);
+            }
+            if let Some(key) = cache_key {
+                LLM_EXACT_CACHE.lock().put(key, value.clone());
+            }
+            let _ = state
+                .db
+                .llm_call_logs()
+                .insert_one(
+                    LlmCallLog {
+                        id: None,
+                        workspace_id: state.config.default_workspace_id.clone(),
+                        account_id: account_id.map(ToString::to_string),
+                        contact_wxid: contact_wxid.map(ToString::to_string),
+                        run_id: run_id.map(ToString::to_string),
+                        prompt_key: prompt_key.to_string(),
+                        model: result.model,
+                        status: "success".to_string(),
+                        latency_ms: result.latency_ms,
+                        prompt_tokens: usage.prompt_tokens,
+                        completion_tokens: usage.completion_tokens,
+                        total_tokens: usage.total_tokens,
+                        prompt_cache_hit_tokens: usage.prompt_cache_hit_tokens,
+                        prompt_cache_miss_tokens: usage.prompt_cache_miss_tokens,
+                        error: None,
+                        retry_count: retry_count_i32,
+                        final_status: Some("success".to_string()),
+                        created_at: started_at,
+                    },
+                    None,
+                )
+                .await;
+            Ok(value)
+        }
+        Err(error) => {
+            // HP-4：根据错误类型把 final_status 写为 json_error / failed，
+            // 便于后续按状态做成本统计与降级触发统计。
+            let final_status = match &error {
+                AppError::Json(_) => "json_error",
+                _ => "failed",
+            };
+            let _ = state
+                .db
+                .llm_call_logs()
+                .insert_one(
+                    LlmCallLog {
+                        id: None,
+                        workspace_id: state.config.default_workspace_id.clone(),
+                        account_id: account_id.map(ToString::to_string),
+                        contact_wxid: contact_wxid.map(ToString::to_string),
+                        run_id: run_id.map(ToString::to_string),
+                        prompt_key: prompt_key.to_string(),
+                        model: state.config.openai_model.clone(),
+                        status: "failed".to_string(),
+                        latency_ms: DateTime::now().timestamp_millis()
+                            - started_at.timestamp_millis(),
+                        prompt_tokens: 0,
+                        completion_tokens: 0,
+                        total_tokens: 0,
+                        prompt_cache_hit_tokens: 0,
+                        prompt_cache_miss_tokens: 0,
+                        error: Some(error.to_string()),
+                        retry_count: retry_count_from_error(&error.to_string()),
+                        final_status: Some(final_status.to_string()),
+                        created_at: started_at,
+                    },
+                    None,
+                )
+                .await;
+            Err(error)
+        }
+    }
+}
+
+fn retry_count_from_error(error: &str) -> i32 {
+    error
+        .split("retry_count=")
+        .nth(1)
+        .and_then(|tail| {
+            tail.chars()
+                .take_while(|ch| ch.is_ascii_digit())
+                .collect::<String>()
+                .parse::<i32>()
+                .ok()
+        })
+        .unwrap_or(0)
+}
+
+fn llm_exact_cache_key(prompt_key: &str, system: &str, user: &str) -> Option<String> {
+    if !matches!(
+        prompt_key,
+        "knowledge.import.preview"
+            | "playbook.generator"
+            | "playbook.optimizer"
+            | "user.guide.preview"
+    ) {
+        return None;
+    }
+    Some(format!(
+        "{}:{}:{}",
+        prompt_key,
+        stable_agent_hash(system),
+        stable_agent_hash(user)
+    ))
+}
+
+fn stable_agent_hash(value: &str) -> String {
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for byte in value.as_bytes() {
+        hash ^= *byte as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("{hash:016x}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::budget::RunBudget;
+    use super::gateway::inbound_marker_for_context_check;
+    use super::guards::{check_state_transition, normalize_decision_state};
+    use super::guards::{
+        default_product_claim_markers, enforce_decision_guards, enforce_string_fact_risk_guard,
+    };
+    use super::memory::{compact_memory_card, compact_memory_card_with_previous};
+    use super::reaction::reaction_outcome_status;
+    use super::review::{effective_review_mode, review_passed};
+    use super::runtime::UserRuntimeParameters;
+    use super::types::{AgentDecision, DecisionReviewResult, ReviewScores, RunPlannerResult};
+    use crate::models::{AgentStatus, Contact, OperationDomainConfig};
+    use mongodb::bson::{doc, DateTime, Document};
+
+    fn runtime() -> UserRuntimeParameters {
+        UserRuntimeParameters {
+            recent_message_limit: 12,
+            min_reply_interval_seconds: 20,
+            max_daily_touches: 3,
+            max_pending_follow_ups: 3,
+            follow_up_expires_hours: 48,
+            cooldown_after_no_reply_hours: 24,
+            fact_risk_block_at: 6,
+            pressure_risk_block_at: 7,
+            human_like_rewrite_below: 6,
+            emotional_value_rewrite_below: 5,
+            product_accuracy_block_below: 7,
+            operation_state_confidence_full_review_below: 4,
+            run_token_budget: 30000,
+            run_max_llm_calls: 6,
+            simulation_token_budget: 60000,
+            reaction_token_budget: 8000,
+            reaction_max_llm_calls: 2,
+            // agent-autonomy-loop W0 / Task 1.3：测试默认值与
+            // `RuntimeParametersTyped::default()` 保持一致，方便后续 wave 的
+            // gating / clamp 行为复用同一组默认。
+            autonomy_protocol_enabled: true,
+            knowledge_routing_mode: "auto_tool_loop".to_string(),
+            knowledge_max_tool_loops: 3,
+            knowledge_max_tool_calls: 6,
+            knowledge_open_slice_max_k: 4,
+            knowledge_search_top_k: 8,
+            outbox_poll_interval_seconds: 5,
+            outbox_lease_seconds: 60,
+        }
+    }
+
+    #[test]
+    fn review_thresholds_block_risky_reply() {
+        let mut review = DecisionReviewResult {
+            approved: true,
+            ..Default::default()
+        };
+        review.scores.fact_risk = 6;
+        review.scores.pressure_risk = 1;
+        review.scores.human_like = 8;
+        review.scores.emotional_value = 8;
+        review.scores.product_accuracy = 9;
+        assert!(!review_passed(&review, &runtime()));
+    }
+
+    #[test]
+    fn review_thresholds_allow_safe_reply() {
+        let mut review = DecisionReviewResult {
+            approved: true,
+            ..Default::default()
+        };
+        review.scores.fact_risk = 1;
+        review.scores.pressure_risk = 2;
+        review.scores.human_like = 7;
+        review.scores.emotional_value = 6;
+        review.scores.product_accuracy = 8;
+        assert!(review_passed(&review, &runtime()));
+    }
+
+    #[test]
+    fn reaction_outcome_prefers_model_status() {
+        let analysis = doc! {
+            "outcomeStatus": "user_replied_continue_exploring",
+            "stopRequested": true
+        };
+        assert_eq!(
+            reaction_outcome_status(&analysis),
+            "user_replied_continue_exploring"
+        );
+    }
+
+    #[test]
+    fn reaction_outcome_uses_structured_flags_without_keywords() {
+        let analysis = doc! { "buyingSignal": true };
+        assert_eq!(
+            reaction_outcome_status(&analysis),
+            "user_replied_buying_signal"
+        );
+    }
+
+    #[test]
+    fn runtime_document_keeps_gateway_parameters() {
+        let doc = runtime().as_document();
+        assert_eq!(doc.get_i32("factRiskBlockAt").unwrap(), 6);
+        assert_eq!(doc.get_i64("maxDailyTouches").unwrap(), 3);
+    }
+
+    #[test]
+    fn review_guard_blocks_product_claim_without_knowledge() {
+        let decision = AgentDecision {
+            should_reply: true,
+            reply_text: "这是一条需要 Review Agent 语义判断的候选回复。".to_string(),
+            operation_state: Some("new_contact".to_string()),
+            ..Default::default()
+        };
+        let config = OperationDomainConfig {
+            id: None,
+            workspace_id: "default".to_string(),
+            domain: "user_operations".to_string(),
+            name: "用户运营".to_string(),
+            goal: String::new(),
+            methodology: String::new(),
+            workflow: String::new(),
+            tool_policy: String::new(),
+            automation_policy: String::new(),
+            review_policy: String::new(),
+            runtime_parameters: Document::new(),
+            state_machine: doc! { "states": [{ "key": "new_contact", "name": "初始了解", "allowedFrom": ["new_contact"] }] },
+            status: "active".to_string(),
+            updated_at: DateTime::now(),
+        };
+        let mut review = DecisionReviewResult {
+            approved: true,
+            scores: ReviewScores {
+                human_like: 8,
+                emotional_value: 8,
+                product_accuracy: 9,
+                ..Default::default()
+            },
+            claim_analysis: doc! {
+                "hasProductClaim": true,
+                "requiresProductKnowledge": true,
+                "knowledgeSupported": false,
+                "reason": "模型判断这是我方产品能力表述"
+            },
+            ..Default::default()
+        };
+        enforce_decision_guards(
+            &mut review,
+            &decision,
+            Some(&config),
+            &[],
+            &[],
+            Some("new_contact"),
+        );
+        assert!(!review.approved);
+        assert!(review.scores.fact_risk >= 6);
+        assert!(review.scores.product_accuracy <= 6);
+    }
+
+    #[test]
+    fn review_guard_allows_clarification_without_product_knowledge() {
+        let decision = AgentDecision {
+            should_reply: true,
+            reply_text: "嗯，理解你不想做机器人群发。你目前主要想改善哪一类客户跟进？".to_string(),
+            operation_state: Some("new_contact".to_string()),
+            ..Default::default()
+        };
+        let config = OperationDomainConfig {
+            id: None,
+            workspace_id: "default".to_string(),
+            domain: "user_operations".to_string(),
+            name: "用户运营".to_string(),
+            goal: String::new(),
+            methodology: String::new(),
+            workflow: String::new(),
+            tool_policy: String::new(),
+            automation_policy: String::new(),
+            review_policy: String::new(),
+            runtime_parameters: Document::new(),
+            state_machine: doc! { "states": [{ "key": "new_contact", "name": "初始了解", "allowedFrom": ["new_contact"] }] },
+            status: "active".to_string(),
+            updated_at: DateTime::now(),
+        };
+        let mut review = DecisionReviewResult {
+            approved: true,
+            scores: ReviewScores {
+                human_like: 8,
+                emotional_value: 8,
+                product_accuracy: 9,
+                ..Default::default()
+            },
+            claim_analysis: doc! {
+                "hasProductClaim": false,
+                "requiresProductKnowledge": false,
+                "knowledgeSupported": true,
+                "reason": "模型判断只是承接和澄清"
+            },
+            ..Default::default()
+        };
+        enforce_decision_guards(
+            &mut review,
+            &decision,
+            Some(&config),
+            &[],
+            &[],
+            Some("new_contact"),
+        );
+        assert!(review.approved);
+        assert_eq!(review.scores.fact_risk, 0);
+    }
+
+    #[test]
+    fn operation_state_name_is_normalized_to_key() {
+        let config = OperationDomainConfig {
+            id: None,
+            workspace_id: "default".to_string(),
+            domain: "user_operations".to_string(),
+            name: "用户运营".to_string(),
+            goal: String::new(),
+            methodology: String::new(),
+            workflow: String::new(),
+            tool_policy: String::new(),
+            automation_policy: String::new(),
+            review_policy: String::new(),
+            runtime_parameters: Document::new(),
+            state_machine: doc! { "states": [{ "key": "need_discovery", "name": "需求探索", "allowedFrom": ["need_discovery"] }] },
+            status: "active".to_string(),
+            updated_at: DateTime::now(),
+        };
+        let mut decision = AgentDecision {
+            operation_state: Some("需求探索".to_string()),
+            ..Default::default()
+        };
+        normalize_decision_state(&mut decision, Some(&config));
+        assert_eq!(decision.operation_state.as_deref(), Some("need_discovery"));
+    }
+
+    fn test_contact_template() -> Contact {
+        Contact {
+            id: None,
+            workspace_id: "default".to_string(),
+            account_id: "default".to_string(),
+            wxid: "test_wxid".to_string(),
+            nickname: None,
+            remark: None,
+            alias: None,
+            agent_status: AgentStatus::Managed,
+            human_profile_note: None,
+            agent_profile: None,
+            memory_summary: None,
+            playbook_id: None,
+            playbook_version: None,
+            tags: Vec::new(),
+            customer_stage: None,
+            customer_stage_updated_at: None,
+            intent_level: None,
+            commitments: Vec::new(),
+            follow_up_policy: None,
+            operation_state: None,
+            operation_state_reason: None,
+            operation_state_confidence: None,
+            operation_state_updated_at: None,
+            cooldown_until: None,
+            operation_policy: Document::new(),
+            profile_attributes: Document::new(),
+            profile_updated_at: None,
+            last_message_at: None,
+            last_inbound_at: None,
+            last_outbound_at: None,
+            last_agent_run_at: None,
+            created_at: DateTime::now(),
+            updated_at: DateTime::now(),
+        }
+    }
+
+    #[test]
+    fn inbound_marker_prefers_last_inbound_at_over_last_message_at() {
+        // 出站把 last_message_at 推进到 200，但 last_inbound_at 仍停在 100。
+        // context_changed 检查必须只看用户实际说话的时间。
+        let contact = Contact {
+            last_inbound_at: Some(DateTime::from_millis(100)),
+            last_message_at: Some(DateTime::from_millis(200)),
+            ..test_contact_template()
+        };
+        let marker = inbound_marker_for_context_check(&contact)
+            .expect("should fall through to last_inbound_at");
+        assert_eq!(marker.timestamp_millis(), 100);
+    }
+
+    #[test]
+    fn inbound_marker_falls_back_to_last_message_at_when_inbound_missing() {
+        // 老数据 last_inbound_at 还没回填，要兼容地用 last_message_at。
+        let contact = Contact {
+            last_inbound_at: None,
+            last_message_at: Some(DateTime::from_millis(500)),
+            ..test_contact_template()
+        };
+        let marker = inbound_marker_for_context_check(&contact)
+            .expect("should fall back to last_message_at");
+        assert_eq!(marker.timestamp_millis(), 500);
+    }
+
+    #[test]
+    fn inbound_marker_returns_none_when_both_missing() {
+        let contact = test_contact_template();
+        assert!(inbound_marker_for_context_check(&contact).is_none());
+    }
+
+    #[test]
+    fn inbound_marker_blocks_follow_up_when_inbound_after_task() {
+        // 跟进任务在 1000 创建，用户在 1500 又发了一条新消息，
+        // 此时 follow-up 应被 context_changed 拦截。
+        let contact = Contact {
+            last_inbound_at: Some(DateTime::from_millis(1500)),
+            last_message_at: Some(DateTime::from_millis(1500)),
+            ..test_contact_template()
+        };
+        let task_created_at_ms = 1000_i64;
+        let marker = inbound_marker_for_context_check(&contact).expect("should have a marker");
+        assert!(marker.timestamp_millis() > task_created_at_ms);
+    }
+
+    #[test]
+    fn inbound_marker_allows_follow_up_when_only_outbound_advanced() {
+        // 模拟出站后 last_message_at 被推进到 2000（max(inbound, now)），
+        // 但 last_inbound_at 仍停留在 500，跟进任务创建于 1000。
+        // 用 last_message_at 会误判 context_changed；用 last_inbound_at 不会。
+        let contact = Contact {
+            last_inbound_at: Some(DateTime::from_millis(500)),
+            last_message_at: Some(DateTime::from_millis(2000)),
+            ..test_contact_template()
+        };
+        let task_created_at_ms = 1000_i64;
+        let marker = inbound_marker_for_context_check(&contact).expect("should have a marker");
+        assert!(
+            marker.timestamp_millis() <= task_created_at_ms,
+            "agent 自己出站不应触发 context_changed",
+        );
+    }
+
+    fn typed_card_with_core_facts(facts: &[&str]) -> crate::models::MemoryCardTyped {
+        crate::models::MemoryCardTyped {
+            core_facts: facts
+                .iter()
+                .map(|s| crate::models::MemoryFactRepr::Plain(s.to_string()))
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    fn typed_card_with_recent_facts(facts: &[String]) -> crate::models::MemoryCardTyped {
+        crate::models::MemoryCardTyped {
+            recent_facts: facts
+                .iter()
+                .map(|s| crate::models::MemoryFactRepr::Plain(s.clone()))
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    fn fact_texts(facts: &[crate::models::MemoryFactRepr]) -> Vec<String> {
+        facts.iter().map(|f| f.as_text().to_string()).collect()
+    }
+
+    #[test]
+    fn compact_memory_card_caps_core_facts_at_six() {
+        // coreFacts 上限 6：超出的尾部应被截留掉。
+        let card = typed_card_with_core_facts(&["a", "b", "c", "d", "e", "f", "g", "h"]);
+        let compacted = compact_memory_card(&card);
+        assert_eq!(
+            compacted.core_facts.len(),
+            6,
+            "coreFacts must be capped at 6"
+        );
+    }
+
+    #[test]
+    fn compact_memory_card_caps_recent_facts_at_ten() {
+        let recents: Vec<String> = (0..15).map(|i| format!("f{i}")).collect();
+        let card = typed_card_with_recent_facts(&recents);
+        let compacted = compact_memory_card(&card);
+        assert_eq!(
+            compacted.recent_facts.len(),
+            10,
+            "recentFacts must be capped at 10"
+        );
+    }
+
+    #[test]
+    fn compact_memory_card_with_previous_preserves_undiscarded_core_facts() {
+        // MP-8 关键不变量：上一版 coreFacts 中未被 discarded 的事实必须在结果里。
+        let previous = typed_card_with_core_facts(&["important_fact_1", "important_fact_2"]);
+        let incoming = typed_card_with_core_facts(&["new_fact"]);
+        let merged = compact_memory_card_with_previous(&incoming, Some(&previous), &[]);
+        let cores = fact_texts(&merged.core_facts);
+        assert!(cores.contains(&"important_fact_1".to_string()));
+        assert!(cores.contains(&"important_fact_2".to_string()));
+        assert!(cores.contains(&"new_fact".to_string()));
+    }
+
+    #[test]
+    fn compact_memory_card_with_previous_drops_explicitly_discarded() {
+        // discarded 列出的事实必须被显式移除，不会因合并语义又被带回来。
+        let previous = typed_card_with_core_facts(&["old_fact_to_drop", "keep_me"]);
+        let incoming = typed_card_with_core_facts(&["new_fact"]);
+        let discarded = vec!["old_fact_to_drop".to_string()];
+        let merged = compact_memory_card_with_previous(&incoming, Some(&previous), &discarded);
+        let cores = fact_texts(&merged.core_facts);
+        assert!(!cores.contains(&"old_fact_to_drop".to_string()));
+        assert!(cores.contains(&"keep_me".to_string()));
+        assert!(cores.contains(&"new_fact".to_string()));
+    }
+
+    fn risky_decision(reply_text: &str) -> AgentDecision {
+        AgentDecision {
+            should_reply: true,
+            reply_text: reply_text.to_string(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn string_guard_blocks_absolute_claim_without_knowledge() {
+        let decision = risky_decision("我们能保证你转化提升 30%");
+        let mut review = DecisionReviewResult {
+            approved: true,
+            scores: ReviewScores {
+                human_like: 8,
+                emotional_value: 8,
+                product_accuracy: 9,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        enforce_string_fact_risk_guard(&mut review, &decision, &default_product_claim_markers());
+        assert!(!review.approved);
+        assert!(review.scores.fact_risk >= 6);
+        assert!(review
+            .risks
+            .iter()
+            .any(|r| r.starts_with("string_guard: 命中标记")));
+    }
+
+    #[test]
+    fn string_guard_allows_whitelisted_promise() {
+        let decision = risky_decision("我会准时回复你，保证不会让你等太久");
+        let mut review = DecisionReviewResult {
+            approved: true,
+            scores: ReviewScores {
+                human_like: 8,
+                emotional_value: 8,
+                product_accuracy: 9,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        enforce_string_fact_risk_guard(&mut review, &decision, &default_product_claim_markers());
+        assert!(review.approved, "白名单短语应豁免本次命中");
+    }
+
+    #[test]
+    fn string_guard_skips_when_model_marks_safe() {
+        let decision = risky_decision("我们能保证转化提升");
+        let mut review = DecisionReviewResult {
+            approved: true,
+            scores: ReviewScores {
+                human_like: 8,
+                emotional_value: 8,
+                product_accuracy: 9,
+                ..Default::default()
+            },
+            claim_analysis: doc! {
+                "requiresProductKnowledge": false,
+                "knowledgeSupported": true
+            },
+            ..Default::default()
+        };
+        enforce_string_fact_risk_guard(&mut review, &decision, &default_product_claim_markers());
+        assert!(review.approved, "模型语义判定无需知识时跳过字符串扫描");
+    }
+
+    #[test]
+    fn string_guard_skips_when_knowledge_used() {
+        let decision = AgentDecision {
+            should_reply: true,
+            reply_text: "我们能保证响应及时".to_string(),
+            used_knowledge_ids: vec!["chunk_xxx".to_string()],
+            ..Default::default()
+        };
+        let mut review = DecisionReviewResult {
+            approved: true,
+            scores: ReviewScores {
+                human_like: 8,
+                emotional_value: 8,
+                product_accuracy: 9,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        enforce_string_fact_risk_guard(&mut review, &decision, &default_product_claim_markers());
+        assert!(
+            review.approved,
+            "已引用 used_knowledge_ids 时跳过 string guard"
+        );
+    }
+
+    #[test]
+    fn string_guard_catches_price_amount() {
+        let decision = risky_decision("一年只要 ¥9999 元");
+        let mut review = DecisionReviewResult {
+            approved: true,
+            scores: ReviewScores {
+                human_like: 8,
+                emotional_value: 8,
+                product_accuracy: 9,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        enforce_string_fact_risk_guard(&mut review, &decision, &default_product_claim_markers());
+        assert!(!review.approved, "价格金额应触发字符串 guard");
+    }
+
+    fn full_state_machine_config() -> OperationDomainConfig {
+        OperationDomainConfig {
+            id: None,
+            workspace_id: "default".to_string(),
+            domain: "user_operations".to_string(),
+            name: "用户运营".to_string(),
+            goal: String::new(),
+            methodology: String::new(),
+            workflow: String::new(),
+            tool_policy: String::new(),
+            automation_policy: String::new(),
+            review_policy: String::new(),
+            runtime_parameters: Document::new(),
+            state_machine: crate::prompts::default_user_operation_state_machine(),
+            status: "active".to_string(),
+            updated_at: DateTime::now(),
+        }
+    }
+
+    #[test]
+    fn state_transition_allows_legal_path() {
+        let config = full_state_machine_config();
+        // new_contact -> relationship_building 是合法的。
+        assert!(check_state_transition(
+            Some(&config),
+            Some("new_contact"),
+            "relationship_building"
+        )
+        .is_none());
+        // need_discovery -> solution_fit 合法。
+        assert!(
+            check_state_transition(Some(&config), Some("need_discovery"), "solution_fit").is_none()
+        );
+        // commitment_followup -> customer_success 合法。
+        assert!(check_state_transition(
+            Some(&config),
+            Some("commitment_followup"),
+            "customer_success"
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn state_transition_blocks_jump_to_customer_success() {
+        // new_contact 不能直接跳到 customer_success（必须经过 commitment_followup）。
+        let config = full_state_machine_config();
+        let reason = check_state_transition(Some(&config), Some("new_contact"), "customer_success");
+        assert!(reason.is_some());
+        assert!(reason.unwrap().contains("state_transition_invalid"));
+    }
+
+    #[test]
+    fn state_transition_cooldown_allow_from_any() {
+        let config = full_state_machine_config();
+        // 任意状态 -> cooldown 都合法。
+        assert!(check_state_transition(Some(&config), Some("new_contact"), "cooldown").is_none());
+        assert!(check_state_transition(Some(&config), Some("solution_fit"), "cooldown").is_none());
+        assert!(check_state_transition(Some(&config), None, "cooldown").is_none());
+    }
+
+    #[test]
+    fn state_transition_self_loop_allowed() {
+        let config = full_state_machine_config();
+        // 同状态不变不应被拦截。
+        assert!(
+            check_state_transition(Some(&config), Some("solution_fit"), "solution_fit").is_none()
+        );
+    }
+
+    #[test]
+    fn state_transition_empty_from_only_allows_new_contact() {
+        let config = full_state_machine_config();
+        assert!(check_state_transition(Some(&config), None, "new_contact").is_none());
+        assert!(check_state_transition(Some(&config), Some(""), "need_discovery").is_some());
+    }
+
+    #[test]
+    fn state_transition_skips_when_no_state_machine() {
+        // 没有 domain_config 时不强校验。
+        assert!(check_state_transition(None, Some("anywhere"), "anywhere_else").is_none());
+    }
+
+    fn high_risk_planner() -> RunPlannerResult {
+        RunPlannerResult {
+            risk_level: "high".to_string(),
+            ..Default::default()
+        }
+    }
+
+    fn low_risk_light_planner() -> RunPlannerResult {
+        RunPlannerResult {
+            risk_level: "medium".to_string(),
+            review_mode: "light".to_string(),
+            knowledge_required: false,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn effective_review_mode_low_confidence_forces_full() {
+        let runtime = runtime();
+        let planner = low_risk_light_planner();
+        let decision = AgentDecision {
+            operation_state_confidence: Some(3),
+            ..Default::default()
+        };
+        // confidence=3 < threshold=4 强制 full。
+        assert_eq!(
+            effective_review_mode(&planner, &decision, &runtime, false),
+            "full"
+        );
+    }
+
+    #[test]
+    fn effective_review_mode_high_confidence_keeps_light() {
+        let runtime = runtime();
+        let planner = low_risk_light_planner();
+        let decision = AgentDecision {
+            operation_state_confidence: Some(8),
+            ..Default::default()
+        };
+        assert_eq!(
+            effective_review_mode(&planner, &decision, &runtime, false),
+            "light"
+        );
+    }
+
+    #[test]
+    fn effective_review_mode_missing_confidence_keeps_light() {
+        // None 视作 10（最高），不强制 full。
+        let runtime = runtime();
+        let planner = low_risk_light_planner();
+        let decision = AgentDecision::default();
+        assert_eq!(
+            effective_review_mode(&planner, &decision, &runtime, false),
+            "light"
+        );
+    }
+
+    #[test]
+    fn effective_review_mode_high_risk_overrides() {
+        // 高风险不论 confidence 都走 full。
+        let runtime = runtime();
+        let planner = high_risk_planner();
+        let decision = AgentDecision {
+            operation_state_confidence: Some(8),
+            ..Default::default()
+        };
+        assert_eq!(
+            effective_review_mode(&planner, &decision, &runtime, false),
+            "full"
+        );
+    }
+
+    #[test]
+    fn run_budget_record_call_increments() {
+        let budget = RunBudget::new("run_t", 1000, 3, i32::MAX);
+        budget.record_call(200);
+        budget.record_call(300);
+        let snap = budget.snapshot();
+        assert_eq!(snap.tokens_used, 500);
+        assert_eq!(snap.llm_calls_used, 2);
+        assert!(!budget.is_exceeded());
+    }
+
+    #[test]
+    fn run_budget_token_exceeded_marks_exceeded() {
+        let budget = RunBudget::new("run_t", 100, 10, i32::MAX);
+        budget.record_call(60);
+        assert!(!budget.is_exceeded());
+        budget.record_call(50);
+        assert!(budget.is_exceeded(), "tokens_used 110 >= budget 100");
+    }
+
+    #[test]
+    fn run_budget_call_count_exceeded_marks_exceeded() {
+        let budget = RunBudget::new("run_t", 100000, 2, i32::MAX);
+        budget.record_call(1);
+        budget.record_call(1);
+        assert!(budget.is_exceeded(), "llm_calls_used 2 >= max 2");
+    }
+
+    #[test]
+    fn run_budget_mark_degraded_records_reason() {
+        let budget = RunBudget::new("run_t", 100, 2, i32::MAX);
+        budget.mark_degraded("review_skipped_budget_exceeded");
+        budget.mark_degraded("rewrite_skipped_budget_exceeded");
+        let snap = budget.snapshot();
+        assert_eq!(snap.degraded_reasons.len(), 2);
+        assert!(snap.degraded_reasons[0].contains("review"));
+    }
+
+    /// 波 D2：confidence < 阈值时强制 full review，并把 confidence_override_*
+    /// 字段写到 planner，从而 to_document(planner) 后能落进 agent_run_logs.planner。
+    #[test]
+    fn apply_confidence_override_marks_planner_when_below_threshold() {
+        let mut planner = RunPlannerResult {
+            risk_level: "medium".to_string(),
+            review_mode: "light".to_string(),
+            reason: "原因 A".to_string(),
+            ..Default::default()
+        };
+        let decision = AgentDecision {
+            operation_state_confidence: Some(2),
+            ..Default::default()
+        };
+        let mut runtime = runtime();
+        runtime.operation_state_confidence_full_review_below = 4;
+        super::gateway::apply_confidence_override(&mut planner, &decision, &runtime);
+        assert_eq!(planner.review_mode, "full");
+        assert!(planner.confidence_override_triggered);
+        assert!(
+            planner
+                .confidence_override_reason
+                .contains("operation_state_confidence=2"),
+            "reason 中应说明触发的 confidence 值，实际：{}",
+            planner.confidence_override_reason
+        );
+        // 原 reason 不丢，新 reason 追加在后面。
+        assert!(planner.reason.contains("原因 A"));
+        assert!(planner.reason.contains("below threshold 4"));
+
+        // 落进 Document 后的 key 形态（agent_run_logs.planner 实际字段）。
+        let planner_doc = mongodb::bson::to_document(&planner).expect("serialize");
+        assert_eq!(
+            planner_doc.get_bool("confidenceOverrideTriggered").ok(),
+            Some(true),
+            "agent_run_logs.planner.confidenceOverrideTriggered 必须是 true"
+        );
+        assert!(planner_doc
+            .get_str("confidenceOverrideReason")
+            .map(|s| s.contains("operation_state_confidence=2"))
+            .unwrap_or(false));
+    }
+
+    /// 波 D2：confidence ≥ 阈值时不动 planner（保持 light review）。
+    #[test]
+    fn apply_confidence_override_no_op_when_above_threshold() {
+        let mut planner = RunPlannerResult {
+            risk_level: "medium".to_string(),
+            review_mode: "light".to_string(),
+            reason: "原因 A".to_string(),
+            ..Default::default()
+        };
+        let decision = AgentDecision {
+            operation_state_confidence: Some(8),
+            ..Default::default()
+        };
+        let runtime = runtime();
+        super::gateway::apply_confidence_override(&mut planner, &decision, &runtime);
+        assert_eq!(planner.review_mode, "light");
+        assert!(!planner.confidence_override_triggered);
+        assert!(planner.confidence_override_reason.is_empty());
+    }
+
+    /// 波 D2：confidence 缺失时视为 10（最高），不强制 full。
+    #[test]
+    fn apply_confidence_override_treats_missing_as_max() {
+        let mut planner = RunPlannerResult {
+            risk_level: "medium".to_string(),
+            review_mode: "light".to_string(),
+            ..Default::default()
+        };
+        let decision = AgentDecision {
+            operation_state_confidence: None,
+            ..Default::default()
+        };
+        let runtime = runtime();
+        super::gateway::apply_confidence_override(&mut planner, &decision, &runtime);
+        assert_eq!(planner.review_mode, "light");
+        assert!(!planner.confidence_override_triggered);
+    }
+}

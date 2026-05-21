@@ -1,0 +1,791 @@
+//! 运营知识库加载、Knowledge Router 与未验证告警 (MP-9)。
+//!
+//! - `load_operation_knowledge`：按 workspace + account 过滤拉取 documents /
+//!   items / chunks（chunks 仅取 `integrity_status="verified"`）；
+//! - `route_operation_knowledge`：调 Knowledge Tool Planner LLM，规划本轮
+//!   要打开哪些文档/切片；
+//! - `select_operation_knowledge*`、`route_used_knowledge_ids` 等是把
+//!   Router 输出落到具体可注入 prompt 的切片；
+//! - `format_operation_knowledge*` 系列把切片对人类/LLM 友好地格式化；
+//! - `maybe_emit_unverified_warning`：当切片全部未通过校验时按当日去重写一条
+//!   `knowledge_unverified_warning` 事件，避免运营人员困惑；
+//! - `write_knowledge_usage_log`：把每次 run 的知识引用情况写入审计集合；
+//! - `test_knowledge_route_for_contact`：后台知识库测试入口。
+
+use futures::TryStreamExt;
+use mongodb::bson::{doc, to_bson, to_document, Bson, DateTime, Document};
+use mongodb::options::FindOptions;
+
+use crate::error::AppResult;
+use crate::models::{
+    AgentStatus, Contact, ConversationMessage, KnowledgeUsageLog, MessageDirection,
+    OperatingMemory, OperationKnowledgeChunk, OperationKnowledgeItem,
+};
+use crate::routes::AppState;
+
+use super::gateway::write_event_for_account;
+use super::generate_agent_json;
+use super::memory::{
+    default_memory_card, effective_memory_card_for_contact, load_or_create_operating_memory,
+};
+use super::types::{
+    non_empty_option, AgentDecision, DecisionReviewResult, KnowledgeRouteResult, KnowledgeRuntime,
+    RunPlannerResult,
+};
+
+pub(crate) async fn load_operation_knowledge(
+    state: &AppState,
+    contact: &Contact,
+) -> AppResult<KnowledgeRuntime> {
+    let account_filter = vec![
+        doc! { "account_id": null },
+        doc! { "account_id": &contact.account_id },
+    ];
+    let mut document_cursor = state
+        .db
+        .operation_knowledge_documents()
+        .find(
+            doc! {
+                "workspace_id": &contact.workspace_id,
+                "domain": "user_operations",
+                "status": "active",
+                "$or": account_filter.clone()
+            },
+            FindOptions::builder()
+                .sort(doc! { "updated_at": -1 })
+                .limit(80)
+                .build(),
+        )
+        .await?;
+    let mut documents = Vec::new();
+    while let Some(item) = document_cursor.try_next().await? {
+        documents.push(item);
+    }
+    let mut item_cursor = state
+        .db
+        .operation_knowledge_items()
+        .find(
+            doc! {
+                "workspace_id": &contact.workspace_id,
+                "domain": "user_operations",
+                "status": "active",
+                "$or": account_filter.clone()
+            },
+            FindOptions::builder()
+                .sort(doc! { "priority": -1, "updated_at": -1 })
+                .limit(80)
+                .build(),
+        )
+        .await?;
+    let mut items = Vec::new();
+    while let Some(item) = item_cursor.try_next().await? {
+        items.push(item);
+    }
+    let mut chunk_cursor = state
+        .db
+        .operation_knowledge_chunks()
+        .find(
+            doc! {
+                "workspace_id": &contact.workspace_id,
+                "domain": "user_operations",
+                "status": "active",
+                "integrity_status": "verified",
+                "$or": account_filter
+            },
+            FindOptions::builder()
+                .sort(doc! { "priority": -1, "updated_at": -1 })
+                .limit(200)
+                .build(),
+        )
+        .await?;
+    let mut chunks = Vec::new();
+    while let Some(item) = chunk_cursor.try_next().await? {
+        chunks.push(item);
+    }
+    Ok(KnowledgeRuntime {
+        documents,
+        items,
+        chunks,
+    })
+}
+
+/// MP-9 / Task 16：检测 verified chunks 为 0 但 chunks 总数 > 0 的情况，
+/// 并在当日按 contact 去重写一条 `knowledge_unverified_warning` event。
+///
+/// 由 [`super::gateway::run_user_operation_gateway_inner`] 在加载知识库后
+/// 调用。失败被静默（不影响主流程）。
+pub(crate) async fn maybe_emit_unverified_warning(
+    state: &AppState,
+    contact: &Contact,
+) -> AppResult<()> {
+    // 直接在 chunks 集合做 count，避免重复加载已经过滤后的 KnowledgeRuntime。
+    let total = state
+        .db
+        .operation_knowledge_chunks()
+        .count_documents(
+            doc! {
+                "workspace_id": &contact.workspace_id,
+                "domain": "user_operations",
+                "$or": [
+                    { "account_id": null },
+                    { "account_id": &contact.account_id }
+                ]
+            },
+            None,
+        )
+        .await
+        .unwrap_or(0) as i64;
+    if total == 0 {
+        return Ok(());
+    }
+    let verified = state
+        .db
+        .operation_knowledge_chunks()
+        .count_documents(
+            doc! {
+                "workspace_id": &contact.workspace_id,
+                "domain": "user_operations",
+                "integrity_status": "verified",
+                "$or": [
+                    { "account_id": null },
+                    { "account_id": &contact.account_id }
+                ]
+            },
+            None,
+        )
+        .await
+        .unwrap_or(0) as i64;
+    if verified > 0 {
+        return Ok(());
+    }
+    // 当日按 contact 去重。
+    let day_start_ms = today_start_millis();
+    let exists = state
+        .db
+        .events()
+        .find_one(
+            doc! {
+                "workspace_id": &contact.workspace_id,
+                "account_id": &contact.account_id,
+                "contact_wxid": &contact.wxid,
+                "kind": "knowledge_unverified_warning",
+                "created_at": { "$gte": DateTime::from_millis(day_start_ms) }
+            },
+            None,
+        )
+        .await
+        .ok()
+        .flatten();
+    if exists.is_some() {
+        return Ok(());
+    }
+    let _ = write_event_for_account(
+        state,
+        &contact.account_id,
+        Some(&contact.wxid),
+        "knowledge_unverified_warning",
+        "warn",
+        "知识库存在切片但全部未通过校验，运行时不会注入；请运行 auto-verify 或人工核查",
+        Some(doc! {
+            "totalChunks": total as i32,
+            "verifiedChunks": verified as i32
+        }),
+    )
+    .await;
+    Ok(())
+}
+
+fn today_start_millis() -> i64 {
+    let now = DateTime::now().timestamp_millis();
+    let day_ms: i64 = 24 * 60 * 60 * 1000;
+    now - (now.rem_euclid(day_ms))
+}
+
+pub(crate) fn format_operation_knowledge_catalog_for_prompt(runtime: &KnowledgeRuntime) -> String {
+    let documents = runtime
+        .documents
+        .iter()
+        .map(|item| {
+            format!(
+                "- documentId={} title={}\n  catalog={}\n  routingMap={}",
+                item.id.map(|id| id.to_hex()).unwrap_or_default(),
+                item.title,
+                item.catalog_summary
+                    .clone()
+                    .or(item.summary.clone())
+                    .unwrap_or_default(),
+                item.routing_map.join(" / ")
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let items = runtime
+        .items
+        .iter()
+        .map(|item| {
+            format!(
+                "- itemId={} type={} title={}\n  routingCard={}\n  scenes={}",
+                item.id.map(|id| id.to_hex()).unwrap_or_default(),
+                item.knowledge_type
+                    .clone()
+                    .unwrap_or_else(|| item.category.clone()),
+                item.title,
+                item.routing_card
+                    .clone()
+                    .or(item.summary.clone())
+                    .unwrap_or_default(),
+                item.applicable_scenes.join(" / ")
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let chunks = runtime
+        .chunks
+        .iter()
+        .take(120)
+        .map(|item| {
+            format!(
+                "- chunkId={} type={} title={}\n  routingCard={} hasEvidence={}",
+                item.id.map(|id| id.to_hex()).unwrap_or_default(),
+                item.knowledge_type.clone().unwrap_or_default(),
+                item.title,
+                item.routing_card
+                    .clone()
+                    .or(item.summary.clone())
+                    .unwrap_or_default(),
+                !item.evidence_items.is_empty()
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!(
+        "文档目录:\n{}\n\n知识包目录:\n{}\n\n切片目录:\n{}",
+        documents, items, chunks
+    )
+}
+
+pub(crate) fn format_operation_knowledge_for_prompt(
+    items: &[OperationKnowledgeItem],
+    chunks: &[OperationKnowledgeChunk],
+) -> String {
+    let item_text = items
+        .iter()
+        .map(|item| {
+            format!(
+                "- itemId={} type={} context={} title={}\n  summary={}\n  routingCard={}\n  safeClaims={}\n  forbiddenClaims={}\n  scenes={}\n  notScenes={}\n  evidence={}",
+                item.id.map(|id| id.to_hex()).unwrap_or_default(),
+                item.knowledge_type
+                    .clone()
+                    .unwrap_or_else(|| item.category.clone()),
+                item.business_context
+                    .clone()
+                    .unwrap_or_else(|| item.business_type.clone()),
+                item.title,
+                item.summary.clone().unwrap_or_default(),
+                item.routing_card.clone().unwrap_or_default(),
+                item.safe_claims.join(" / "),
+                item.forbidden_claims.join(" / "),
+                item.applicable_scenes.join(" / "),
+                item.not_applicable_scenes.join(" / "),
+                item.evidence_items.join(" / ")
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let chunk_text = chunks
+        .iter()
+        .map(|item| {
+            format!(
+                "- chunkId={} type={} context={} title={}\n  integrityStatus={} confidence={}\n  summary={}\n  body={}\n  verifiedClaims={}\n  safeClaims={}\n  forbiddenClaims={}\n  evidence={}\n  sourceAnchors={}\n  sourceQuote={}",
+                item.id.map(|id| id.to_hex()).unwrap_or_default(),
+                item.knowledge_type.clone().unwrap_or_default(),
+                item.business_context.clone().unwrap_or_default(),
+                item.title,
+                item.integrity_status.clone().unwrap_or_default(),
+                item.confidence_score.unwrap_or_default(),
+                item.summary.clone().unwrap_or_default(),
+                item.body.clone().unwrap_or_default(),
+                item.verified_claims.join(" / "),
+                item.safe_claims.join(" / "),
+                item.forbidden_claims.join(" / "),
+                item.evidence_items.join(" / "),
+                serde_json::to_string(&item.source_anchors).unwrap_or_default(),
+                item.source_quote.clone().unwrap_or_default()
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!(
+        "已打开知识包:\n{}\n\n已打开知识切片:\n{}",
+        item_text, chunk_text
+    )
+}
+
+pub async fn test_knowledge_route_for_contact(
+    state: &AppState,
+    contact: Option<Contact>,
+    account_id: &str,
+    message: &str,
+) -> AppResult<Document> {
+    let has_persisted_contact = contact.is_some();
+    let contact = contact.unwrap_or_else(|| Contact {
+        id: None,
+        workspace_id: state.config.default_workspace_id.clone(),
+        account_id: account_id.to_string(),
+        wxid: "preview".to_string(),
+        nickname: Some("知识命中测试".to_string()),
+        remark: None,
+        alias: None,
+        agent_status: AgentStatus::Managed,
+        human_profile_note: None,
+        agent_profile: None,
+        memory_summary: None,
+        playbook_id: None,
+        playbook_version: None,
+        tags: Vec::new(),
+        customer_stage: None,
+        customer_stage_updated_at: None,
+        intent_level: None,
+        commitments: Vec::new(),
+        follow_up_policy: None,
+        operation_state: Some("new_contact".to_string()),
+        operation_state_reason: None,
+        operation_state_confidence: None,
+        operation_state_updated_at: None,
+        cooldown_until: None,
+        operation_policy: Document::new(),
+        profile_attributes: Document::new(),
+        profile_updated_at: None,
+        last_message_at: None,
+        last_inbound_at: None,
+        last_outbound_at: None,
+        last_agent_run_at: None,
+        created_at: DateTime::now(),
+        updated_at: DateTime::now(),
+    });
+    let inbound = ConversationMessage {
+        id: None,
+        workspace_id: contact.workspace_id.clone(),
+        account_id: contact.account_id.clone(),
+        contact_wxid: contact.wxid.clone(),
+        message_id: Some("knowledge-test".to_string()),
+        dedupe_key: None,
+        direction: MessageDirection::Inbound,
+        content: message.trim().to_string(),
+        raw: Some(doc! { "runMode": "knowledge_test" }),
+        created_at: DateTime::now(),
+    };
+    let memory = if has_persisted_contact {
+        load_or_create_operating_memory(state, &contact)
+            .await
+            .unwrap_or_else(|_| OperatingMemory {
+                id: None,
+                workspace_id: contact.workspace_id.clone(),
+                account_id: contact.account_id.clone(),
+                contact_wxid: contact.wxid.clone(),
+                user_understanding: Document::new(),
+                relationship_state: Document::new(),
+                product_fit: Document::new(),
+                next_action: Document::new(),
+                context_pack: Document::new(),
+                context_pack_version: 0,
+                context_pack_updated_at: None,
+                // task 6.3：直接使用 typed 默认值，不再走 Document → from_document
+                // 兼容路径。
+                memory_card: default_memory_card(),
+                memory_card_version: 0,
+                memory_card_updated_at: None,
+                created_at: DateTime::now(),
+                updated_at: DateTime::now(),
+            })
+    } else {
+        OperatingMemory {
+            id: None,
+            workspace_id: contact.workspace_id.clone(),
+            account_id: contact.account_id.clone(),
+            contact_wxid: contact.wxid.clone(),
+            user_understanding: Document::new(),
+            relationship_state: Document::new(),
+            product_fit: Document::new(),
+            next_action: Document::new(),
+            context_pack: Document::new(),
+            context_pack_version: 0,
+            context_pack_updated_at: None,
+            memory_card: default_memory_card(),
+            memory_card_version: 0,
+            memory_card_updated_at: None,
+            created_at: DateTime::now(),
+            updated_at: DateTime::now(),
+        }
+    };
+    let knowledge = load_operation_knowledge(state, &contact).await?;
+    // task 6.3：边界处把 typed 转为 Document wire shape，下游 prompt 注入路径不变。
+    let memory_card = effective_memory_card_for_contact(&memory, &contact).to_document();
+    let route = route_operation_knowledge(
+        state,
+        &contact,
+        &inbound,
+        &[],
+        &memory,
+        &memory_card,
+        &knowledge,
+        None,
+    )
+    .await?;
+    let selected = select_operation_knowledge(&knowledge.items, &route);
+    let selected_chunks = select_operation_knowledge_chunks(&knowledge.chunks, &route);
+    Ok(doc! {
+        "route": to_document(&route).unwrap_or_default(),
+        "selectedKnowledge": selected.into_iter().map(operation_knowledge_to_bson).collect::<Vec<_>>(),
+        "selectedChunks": selected_chunks.into_iter().map(operation_knowledge_chunk_to_bson).collect::<Vec<_>>()
+    })
+}
+
+pub(crate) async fn route_operation_knowledge(
+    state: &AppState,
+    contact: &Contact,
+    inbound: &ConversationMessage,
+    recent_messages: &[ConversationMessage],
+    memory: &OperatingMemory,
+    context_pack: &Document,
+    knowledge: &KnowledgeRuntime,
+    run_id: Option<&str>,
+) -> AppResult<KnowledgeRouteResult> {
+    if knowledge.documents.is_empty() && knowledge.items.is_empty() && knowledge.chunks.is_empty() {
+        return Ok(KnowledgeRouteResult {
+            risk_level: "medium".to_string(),
+            knowledge_coverage: "missing".to_string(),
+            reason: "没有可用运营知识库".to_string(),
+            ..Default::default()
+        });
+    }
+    let catalog = format_operation_knowledge_catalog_for_prompt(knowledge);
+    let memory_text = serde_json::to_string(&doc! {
+        "memoryCard": context_pack.clone(),
+        "relationshipState": memory.relationship_state.clone(),
+        "productFit": memory.product_fit.clone(),
+        "nextAction": memory.next_action.clone()
+    })
+    .unwrap_or_default();
+    let history = recent_messages
+        .iter()
+        .rev()
+        .take(8)
+        .map(|message| {
+            let speaker = match message.direction {
+                MessageDirection::Inbound => "客户",
+                MessageDirection::Outbound => "我方",
+            };
+            format!("{speaker}: {}", message.content)
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let system = "你是微信用户运营 Knowledge Tool Planner。你要像 Agent 工具调用一样，先阅读知识目录，再决定本轮应该打开哪些文档、知识包、切片和证据。不负责回复客户。必须只输出严格 JSON。";
+    let user = format!(
+        r#"请根据用户当前消息、长期记忆和知识目录，规划本轮用户运营 Agent 的知识工具调用。
+输出 JSON：
+{{
+  "neededCategories": ["自然语言说明需要哪类知识，不要使用固定枚举"],
+  "selectedDocumentIds": [],
+  "selectedKnowledgeIds": [],
+  "selectedChunkIds": [],
+  "selectedSliceReasons": [],
+  "riskLevel": "low | medium | high",
+  "requiresEvidence": false,
+  "knowledgeCoverage": "enough | weak | missing",
+  "missingKnowledge": [],
+  "reason": "",
+  "toolTrace": [
+    {{
+      "tool": "knowledge.list_catalog",
+      "reason": "先阅读目录"
+    }},
+    {{
+      "tool": "knowledge.open_slice",
+      "ids": [],
+      "reason": "说明为什么打开这些切片"
+    }}
+  ]
+}}
+
+规则：
+- 只从目录里的 documentId、itemId、chunkId 选择。
+- 优先选择 chunkId，因为切片才是运行时应打开的最小知识单元。
+- selectedKnowledgeIds 最多 4 个，selectedChunkIds 最多 8 个，selectedDocumentIds 最多 3 个。
+- 涉及产品能力、价格、案例、效果、交付承诺时 requiresEvidence=true。
+- requiresEvidence=true 时必须优先选择有 evidence 的切片；没有证据时 knowledgeCoverage=weak 或 missing。
+- 没有足够知识时 knowledgeCoverage=missing 或 weak，不要硬选无关知识。
+- 不要按关键词机械匹配；要结合用户阶段、长期记忆、当前语义和风险判断。
+
+客户昵称: {}
+客户阶段: {}
+运营状态: {}
+最近聊天:
+{}
+
+长期记忆卡片:
+{}
+
+运营记忆:
+{}
+
+用户最新消息:
+{}
+
+知识目录与可打开切片:
+{}"#,
+        contact.nickname.clone().unwrap_or_default(),
+        contact.customer_stage.clone().unwrap_or_default(),
+        contact.operation_state.clone().unwrap_or_default(),
+        history,
+        serde_json::to_string(context_pack).unwrap_or_default(),
+        memory_text,
+        inbound.content,
+        catalog
+    );
+    let value = generate_agent_json(
+        state,
+        Some(&contact.account_id),
+        Some(&contact.wxid),
+        run_id,
+        "user.knowledge.router",
+        system,
+        &user,
+    )
+    .await?;
+    let mut route: KnowledgeRouteResult = serde_json::from_value(value)?;
+    route.selected_document_ids = route
+        .selected_document_ids
+        .into_iter()
+        .filter(|id| {
+            knowledge.documents.iter().any(|item| {
+                item.id.map(|object_id| object_id.to_hex()).as_deref() == Some(id.as_str())
+            })
+        })
+        .take(3)
+        .collect();
+    route.selected_knowledge_ids = route
+        .selected_knowledge_ids
+        .into_iter()
+        .filter(|id| {
+            knowledge.items.iter().any(|item| {
+                item.id.map(|object_id| object_id.to_hex()).as_deref() == Some(id.as_str())
+            })
+        })
+        .take(4)
+        .collect();
+    route.selected_chunk_ids = route
+        .selected_chunk_ids
+        .into_iter()
+        .filter(|id| {
+            knowledge.chunks.iter().any(|item| {
+                item.id.map(|object_id| object_id.to_hex()).as_deref() == Some(id.as_str())
+            })
+        })
+        .take(8)
+        .collect();
+    let has_catalog_trace = route
+        .tool_trace
+        .iter()
+        .any(|item| item.get_str("tool") == Ok("knowledge.list_catalog"));
+    if !has_catalog_trace {
+        route.tool_trace.insert(
+            0,
+            doc! {
+                "tool": "knowledge.list_catalog",
+                "documents": knowledge.documents.len() as i32,
+                "items": knowledge.items.len() as i32,
+                "chunks": knowledge.chunks.len() as i32
+            },
+        );
+    }
+    let has_open_trace = route
+        .tool_trace
+        .iter()
+        .any(|item| item.get_str("tool") == Ok("knowledge.open_slice"));
+    if !route.selected_chunk_ids.is_empty() && !has_open_trace {
+        route.tool_trace.push(doc! {
+            "tool": "knowledge.open_slice",
+            "ids": route.selected_chunk_ids.clone(),
+            "reason": route.reason.clone()
+        });
+    }
+    if route.knowledge_coverage.trim().is_empty() {
+        route.knowledge_coverage =
+            if route.selected_knowledge_ids.is_empty() && route.selected_chunk_ids.is_empty() {
+                "missing".to_string()
+            } else {
+                "enough".to_string()
+            };
+    }
+    if route.risk_level.trim().is_empty() {
+        route.risk_level = if route.requires_evidence {
+            "high".to_string()
+        } else {
+            "medium".to_string()
+        };
+    }
+    route.tool_trace = dedupe_tool_trace(route.tool_trace);
+    Ok(route)
+}
+
+fn dedupe_tool_trace(items: Vec<Document>) -> Vec<Document> {
+    let mut seen = Vec::new();
+    let mut output = Vec::new();
+    for item in items {
+        let key = format!(
+            "{}:{}",
+            item.get_str("tool").unwrap_or_default(),
+            item.get("ids")
+                .map(|value| value.to_string())
+                .unwrap_or_default()
+        );
+        if !seen.iter().any(|existing| existing == &key) {
+            seen.push(key);
+            output.push(item);
+        }
+    }
+    output
+}
+
+pub(crate) fn empty_knowledge_route(planner: &RunPlannerResult) -> KnowledgeRouteResult {
+    KnowledgeRouteResult {
+        risk_level: planner.risk_level.clone(),
+        knowledge_coverage: "not_required".to_string(),
+        reason: format!("Reply Agent 判断本轮无需打开知识库：{}", planner.reason),
+        tool_trace: vec![doc! {
+            "tool": "knowledge.skip",
+            "reason": planner.reason.clone()
+        }],
+        ..Default::default()
+    }
+}
+
+pub(crate) fn select_operation_knowledge(
+    knowledge: &[OperationKnowledgeItem],
+    route: &KnowledgeRouteResult,
+) -> Vec<OperationKnowledgeItem> {
+    route
+        .selected_knowledge_ids
+        .iter()
+        .filter_map(|id| {
+            knowledge.iter().find(|item| {
+                item.id.map(|object_id| object_id.to_hex()).as_deref() == Some(id.as_str())
+            })
+        })
+        .cloned()
+        .collect::<Vec<_>>()
+}
+
+pub(crate) fn route_used_knowledge_ids(route: &KnowledgeRouteResult) -> Vec<String> {
+    route
+        .selected_knowledge_ids
+        .iter()
+        .chain(route.selected_chunk_ids.iter())
+        .cloned()
+        .collect()
+}
+
+pub(crate) fn select_operation_knowledge_chunks(
+    chunks: &[OperationKnowledgeChunk],
+    route: &KnowledgeRouteResult,
+) -> Vec<OperationKnowledgeChunk> {
+    route
+        .selected_chunk_ids
+        .iter()
+        .filter_map(|id| {
+            chunks.iter().find(|item| {
+                item.id.map(|object_id| object_id.to_hex()).as_deref() == Some(id.as_str())
+            })
+        })
+        .cloned()
+        .collect::<Vec<_>>()
+}
+
+fn operation_knowledge_to_bson(item: OperationKnowledgeItem) -> Bson {
+    to_bson(&doc! {
+        "id": item.id.map(|id| id.to_hex()).unwrap_or_default(),
+        "category": item.category,
+        "businessType": item.business_type,
+        "knowledgeType": item.knowledge_type,
+        "businessContext": item.business_context,
+        "title": item.title,
+        "summary": item.summary,
+        "routingCard": item.routing_card,
+        "safeClaims": item.safe_claims,
+        "forbiddenClaims": item.forbidden_claims,
+        "status": item.status,
+        "updatedAt": item.updated_at
+    })
+    .unwrap_or(Bson::Null)
+}
+
+fn operation_knowledge_chunk_to_bson(item: OperationKnowledgeChunk) -> Bson {
+    to_bson(&doc! {
+        "id": item.id.map(|id| id.to_hex()).unwrap_or_default(),
+        "documentId": item.document_id.map(|id| id.to_hex()),
+        "itemId": item.item_id.map(|id| id.to_hex()),
+        "knowledgeType": item.knowledge_type,
+        "businessContext": item.business_context,
+        "title": item.title,
+        "summary": item.summary,
+        "routingCard": item.routing_card,
+        "body": item.body,
+        "safeClaims": item.safe_claims,
+        "forbiddenClaims": item.forbidden_claims,
+        "evidenceItems": item.evidence_items,
+        "sourceQuote": item.source_quote,
+        "sourceAnchors": item.source_anchors,
+        "integrityStatus": item.integrity_status,
+        "confidenceScore": item.confidence_score,
+        "distortionRisks": item.distortion_risks,
+        "verifiedClaims": item.verified_claims,
+        "unsupportedClaims": item.unsupported_claims,
+        "status": item.status,
+        "updatedAt": item.updated_at
+    })
+    .unwrap_or(Bson::Null)
+}
+
+pub(crate) async fn write_knowledge_usage_log(
+    state: &AppState,
+    contact: &Contact,
+    decision: &AgentDecision,
+    review: &DecisionReviewResult,
+    route: &KnowledgeRouteResult,
+    approved: bool,
+    run_id: &str,
+) -> AppResult<()> {
+    let ids = route
+        .selected_knowledge_ids
+        .iter()
+        .chain(route.selected_chunk_ids.iter())
+        .filter_map(|id| mongodb::bson::oid::ObjectId::parse_str(id).ok())
+        .collect::<Vec<_>>();
+    state
+        .db
+        .knowledge_usage_logs()
+        .insert_one(
+            KnowledgeUsageLog {
+                id: None,
+                workspace_id: contact.workspace_id.clone(),
+                account_id: contact.account_id.clone(),
+                contact_wxid: Some(contact.wxid.clone()),
+                run_id: run_id.to_string(),
+                knowledge_ids: ids,
+                route_result: to_document(route).unwrap_or_default(),
+                reply_text: non_empty_option(&Some(decision.reply_text.clone())),
+                review_approved: approved,
+                blocked_reason: if approved {
+                    None
+                } else {
+                    non_empty_option(&Some(review.review_summary.clone()))
+                },
+                tool_trace: route.tool_trace.clone(),
+                created_at: DateTime::now(),
+            },
+            None,
+        )
+        .await?;
+    Ok(())
+}

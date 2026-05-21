@@ -11,6 +11,13 @@ conversation_messages
 agent_tasks
 agent_events
 mcp_call_logs
+operation_playbooks
+operating_memories
+operation_knowledge_documents
+operation_knowledge_items
+operation_knowledge_chunks
+knowledge_usage_logs
+agent_decision_reviews
 ```
 
 ## Core Identity
@@ -63,15 +70,35 @@ last_agent_run_at
 后续用户运营扩展字段建议：
 
 ```text
+source_channel
+```
+
+已落地的用户运营扩展字段：
+
+```text
+playbook_id
+playbook_version
 tags
 customer_stage
 intent_level
 last_commitment
 follow_up_policy
-source_channel
+profile_attributes
+profile_updated_at
 ```
 
-这些字段不应一次性全部加入。只有当 UI 和 Agent 逻辑实际使用时再添加。
+标签、阶段和意向不使用固定枚举。它们由账号级 `operation_playbooks` 约束方法论，由 Agent 基于单个好友上下文自由生成和持续更新。
+
+运营大脑 V2 新增长期认知对象：
+
+```text
+operating_memories: 每个 managed 好友一份，保存用户理解、关系状态、产品匹配和下一步行动。
+operation_knowledge_documents: 运营知识文档入口。保存导入来源、AI 目录摘要、routing_map、risk_notes 和原文。
+operation_knowledge_items: 运营知识主题包。保留可编辑知识包，但知识类型、业务上下文和适用场景由 AI 自由生成，不使用固定枚举。
+operation_knowledge_chunks: Agent 运行时真正按需打开的知识切片。保存 routing_card、正文、安全事实、禁止承诺、证据和原文引用。
+knowledge_usage_logs: Agent 运行时知识工具调用和引用审计日志，记录 selectedKnowledgeIds、selectedChunkIds、toolTrace、routeResult、回复文本和 Review 结果。
+agent_decision_reviews: 独立评审 Agent 的评分、风险、拦截和改写记录。
+```
 
 ## Future Collections
 
@@ -108,6 +135,20 @@ Agent 策略：
 agent_policies
 policy_versions
 automation_rules
+operation_playbooks
+```
+
+AI Agent 系统：
+
+```text
+agent_souls
+prompt_templates
+agent_prompt_versions
+management_agent_sessions
+management_agent_messages
+agent_command_runs
+agent_tool_calls
+agent_confirmations
 ```
 
 ## API Design Principles
@@ -133,6 +174,8 @@ API 按产品模块组织，而不是按 MCP 工具组织。
 /api/content-assets
 /api/agent-policies
 /api/operations
+/api/management-agent
+/api/agent-souls
 ```
 
 原则：
@@ -182,3 +225,114 @@ Agent 输出必须是结构化 JSON。
 
 解析失败时必须不发送消息，并记录错误事件。
 
+## Management Agent Contract
+
+Management Agent 也必须输出结构化计划，不能直接把自然语言当作执行结果。
+
+建议计划结构：
+
+```json
+{
+  "intent": "send_contact_message",
+  "riskLevel": "act",
+  "requiresConfirmation": true,
+  "target": {
+    "type": "contact",
+    "id": "contact_id"
+  },
+  "steps": [
+    {
+      "action": "resolve_contact",
+      "status": "pending"
+    },
+    {
+      "action": "send_message",
+      "status": "pending"
+    }
+  ],
+  "operatorSummary": "准备给指定好友发送消息，等待确认。"
+}
+```
+
+建议 API：
+
+```text
+POST /api/management-agent/sessions
+POST /api/management-agent/sessions/:id/messages
+GET  /api/management-agent/commands/:id
+GET  /api/management-agent/tool-catalog
+POST /api/management-agent/confirmations/:id/approve
+POST /api/management-agent/confirmations/:id/reject
+
+GET  /api/agent-souls
+POST /api/agent-souls
+GET  /api/operation-playbooks
+POST /api/operation-playbooks
+POST /api/operation-playbooks/generate
+PUT  /api/operation-playbooks/:id
+POST /api/operation-playbooks/:id/set-default
+PUT  /api/contacts/:id/operation-profile
+POST /api/contacts/:id/analyze-profile
+GET  /api/contacts/:id/operating-memory
+PUT  /api/contacts/:id/operating-memory
+GET  /api/operation-knowledge
+POST /api/operation-knowledge
+PUT  /api/operation-knowledge/:id
+DELETE /api/operation-knowledge/:id
+GET  /api/operation-knowledge/documents
+POST /api/operation-knowledge/documents
+GET  /api/operation-knowledge/documents/:id
+PUT  /api/operation-knowledge/documents/:id
+DELETE /api/operation-knowledge/documents/:id
+GET  /api/operation-knowledge/documents/:id/chunks
+GET  /api/operation-knowledge/chunks
+POST /api/operation-knowledge/chunks
+PUT  /api/operation-knowledge/chunks/:id
+DELETE /api/operation-knowledge/chunks/:id
+POST /api/operation-knowledge/import-preview
+POST /api/operation-knowledge/import-apply
+GET  /api/operation-knowledge/catalog
+POST /api/operation-knowledge/tools/search
+POST /api/operation-knowledge/tools/open-slice
+POST /api/operation-knowledge/tools/open-evidence
+POST /api/operation-knowledge/test-match
+GET  /api/operation-knowledge/usage
+GET  /api/decision-reviews
+GET  /api/decision-reviews/:id
+PUT  /api/agent-souls/:id
+POST /api/agent-souls/:id/publish
+GET  /api/prompt-templates
+POST /api/prompt-templates
+PUT  /api/prompt-templates/:id
+POST /api/prompt-templates/:id/publish
+POST /api/prompt-templates/reset-system-pack
+GET  /api/operation-domains
+GET  /api/operation-domains/:domain
+PUT  /api/operation-domains/:domain
+GET  /api/operation-domains/:domain/state-machine
+PUT  /api/operation-domains/:domain/state-machine
+POST /api/operation-domains/:domain/reset
+POST /api/agent-tasks/:id/review-now
+POST /api/agent-tasks/:id/cancel
+```
+
+第一阶段 Management Agent API 通过后端代理暴露 MCP 工具执行能力。请求必须绑定 `accountId`，后端按账号读取 MCP Key，执行结果写入 `agent_tool_calls` 和 `mcp_call_logs`。
+
+`prompt_templates` 当前用于 Prompt Stack v2，核心字段：
+
+```text
+prompt_key
+agent_kind
+layer
+title
+description
+content
+status
+version
+prompt_pack_version
+created_by
+```
+
+`operation_domain_configs` 用于把不同运营域拆开管理。当前用户运营频道已使用 `user_operations` 配置长期目标、方法论、工作流、工具边界、自动化策略、复盘规则、运行参数和状态机。运行参数不是提示词参考，而是发送网关的硬规则。
+
+用户运营自动发送统一经过发送网关。私聊自动回复和 follow-up worker 都必须执行 managed 检查、冷却检查、频控、每日触达上限、上下文刷新、Review Agent 和审计记录。`agent_tasks` 的 follow-up 不允许直接调用微信发送工具。

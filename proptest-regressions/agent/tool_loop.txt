@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 4b51dee726a985b7ae974c826839c0fb4b31770feb6a43acf5754c7be93246ef # shrinks to calls_round_1 = [ToolCallRequest { tool: "knowledge.search", arguments: Document({}) }], calls_round_2 = [ToolCallRequest { tool: "knowledge.search", arguments: Document({}) }, ToolCallRequest { tool: "knowledge.search", arguments: Document({}) }], tool_call_budget = 1
