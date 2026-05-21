@@ -20,6 +20,8 @@ pub mod envelope;
 pub mod error;
 pub mod lint;
 pub mod prompt_critic;
+pub mod replay;
+pub mod significance;
 pub mod threshold;
 
 use std::time::Duration;
@@ -147,19 +149,52 @@ pub async fn run_one_tick(state: &AppState) -> Result<(), EvolutionError> {
         .await
         .map_err(EvolutionError::from)?;
 
-    // 6. 推进状态。W3 引入 shadow eval 后改为：有 pending_eval 候选 → evaluating；
-    //    有 eligible_for_release 候选 → awaiting_admin。当前 W2 只到 evaluating。
+    // 6. M4 W3：shadow replay + 显著性聚合。
+    //    pending_eval 候选驱动；budget 在 prompt critic 阶段已记录消耗，replay
+    //    现阶段 threshold 不调 LLM、prompt 走 placeholder failed，所以这里不会
+    //    再触发 BudgetExceeded。
     let pending_count = threshold_proposals
         .iter()
         .chain(prompt_proposals.iter())
         .filter(|p| p.status == "pending_eval")
         .count();
-    let next_status = if pending_count > 0 {
-        "evaluating"
+    let (eligible_count, rejected_after_eval) = if pending_count > 0 {
+        match replay::eval_all(state, &exp_id, &mut budget).await {
+            Ok(()) => {}
+            Err(EvolutionError::BudgetExceeded {
+                tokens_used,
+                calls_used,
+            }) => {
+                write_budget_exceeded_event(state, &exp_id, tokens_used, calls_used).await?;
+            }
+            Err(e) => return Err(e),
+        }
+        significance::aggregate_and_grade(state, &exp_id).await?
     } else {
-        "awaiting_admin"
+        (0, 0)
     };
-    update_experiment_status(state, &exp_id, next_status).await?;
+
+    // 7. 推进状态：W3 后无论候选是否存在，都直接走 awaiting_admin
+    //    （eligible_for_release 由 admin 二次确认，rejected 也已落字段）。
+    update_experiment_status(state, &exp_id, "awaiting_admin").await?;
+
+    // envelope 上同步写聚合计数，便于前端 EvolutionCenterTab 拉取。
+    state
+        .db
+        .experiments()
+        .update_one(
+            doc! { "experiment_id": &exp_id },
+            doc! {
+                "$set": {
+                    "proposals_count": (threshold_proposals.len() + prompt_proposals.len()) as i32,
+                    "proposals_eligible_count": eligible_count as i32,
+                    "updated_at": DateTime::now(),
+                }
+            },
+            None,
+        )
+        .await
+        .map_err(EvolutionError::from)?;
 
     write_tick_completed_event(
         state,
@@ -169,6 +204,8 @@ pub async fn run_one_tick(state: &AppState) -> Result<(), EvolutionError> {
         threshold_proposals.len(),
         prompt_proposals.len(),
         budget.token_used,
+        eligible_count,
+        rejected_after_eval,
     )
     .await?;
     Ok(())
@@ -230,6 +267,8 @@ async fn write_tick_completed_event(
     threshold_proposals: usize,
     prompt_proposals: usize,
     budget_used_tokens: i64,
+    proposals_eligible_count: usize,
+    proposals_rejected_count: usize,
 ) -> Result<(), EvolutionError> {
     let event = crate::models::AgentEvent {
         id: None,
@@ -239,7 +278,7 @@ async fn write_tick_completed_event(
         kind: "evolution_tick_completed".to_string(),
         status: "ok".to_string(),
         summary: format!(
-            "evolution tick completed (threshold_cohort={threshold_count}, prompt_cohort={prompt_count}, threshold_proposals={threshold_proposals}, prompt_proposals={prompt_proposals})"
+            "evolution tick completed (threshold_cohort={threshold_count}, prompt_cohort={prompt_count}, threshold_proposals={threshold_proposals}, prompt_proposals={prompt_proposals}, eligible={proposals_eligible_count}, rejected={proposals_rejected_count})"
         ),
         details: Some(doc! {
             "experiment_id": exp_id,
@@ -248,6 +287,8 @@ async fn write_tick_completed_event(
             "threshold_proposals_count": threshold_proposals as i32,
             "prompt_proposals_count": prompt_proposals as i32,
             "budget_used_tokens": budget_used_tokens,
+            "proposals_eligible_count": proposals_eligible_count as i32,
+            "proposals_rejected_count": proposals_rejected_count as i32,
         }),
         created_at: DateTime::now(),
     };

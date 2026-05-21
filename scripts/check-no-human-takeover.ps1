@@ -52,6 +52,9 @@ foreach ($f in $changed) {
         "*/__tests__/*" { continue }
         "*.test.*" { continue }
         "*.spec.*" { continue }
+        # M4 W2：演化器自带禁词词典本身就需要列出全部禁词作为运行期黑名单
+        # （`evolution::lint::FORBIDDEN_WORDS`），不应被字面量 lint 反向命中。
+        "src/evolution/lint.rs" { continue }
     }
     if (-not (Test-Path $f)) { continue }
 
