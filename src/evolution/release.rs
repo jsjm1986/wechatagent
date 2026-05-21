@@ -140,6 +140,20 @@ pub async fn release_threshold(
     )
     .await?;
 
+    // M4 W4 Task 5.6：登记 +24h post-release review 任务。失败仅 warn，不影响 release。
+    if let Err(e) = super::post_release::schedule_post_release_review(
+        state,
+        proposal_id,
+        &workspace_id,
+        &account_id,
+        "threshold",
+        now,
+    )
+    .await
+    {
+        tracing::warn!(?e, "schedule_post_release_review failed for threshold release; continuing");
+    }
+
     Ok(())
 }
 
@@ -317,6 +331,20 @@ pub async fn release_prompt(
         }),
     )
     .await?;
+
+    // M4 W4 Task 5.6：登记 +24h post-release review 任务。失败仅 warn，不影响 release。
+    if let Err(e) = super::post_release::schedule_post_release_review(
+        state,
+        proposal_id,
+        &workspace_id,
+        &account_id,
+        "prompt",
+        now,
+    )
+    .await
+    {
+        tracing::warn!(?e, "schedule_post_release_review failed for prompt release; continuing");
+    }
 
     Ok(())
 }

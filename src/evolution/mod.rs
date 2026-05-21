@@ -19,6 +19,7 @@ pub mod cohort;
 pub mod envelope;
 pub mod error;
 pub mod lint;
+pub mod post_release;
 pub mod prompt_critic;
 pub mod release;
 pub mod replay;
@@ -197,6 +198,13 @@ pub async fn run_one_tick(state: &AppState) -> Result<(), EvolutionError> {
         .await
         .map_err(EvolutionError::from)?;
 
+    // 8. M4 W4 Task 5.6：扫一次到期的 post_release_reviews（+24h 对比窗口）。
+    //    单条失败不影响 tick；已 release 的 proposal 仍受 admin 控制是否回滚。
+    let post_release_completed = post_release::run_due_reviews(state).await.unwrap_or_else(|e| {
+        tracing::warn!(?e, "post_release run_due_reviews failed; will retry next tick");
+        0
+    });
+
     write_tick_completed_event(
         state,
         &exp_id,
@@ -207,6 +215,7 @@ pub async fn run_one_tick(state: &AppState) -> Result<(), EvolutionError> {
         budget.token_used,
         eligible_count,
         rejected_after_eval,
+        post_release_completed,
     )
     .await?;
     Ok(())
@@ -270,6 +279,7 @@ async fn write_tick_completed_event(
     budget_used_tokens: i64,
     proposals_eligible_count: usize,
     proposals_rejected_count: usize,
+    post_release_reviews_completed: usize,
 ) -> Result<(), EvolutionError> {
     let event = crate::models::AgentEvent {
         id: None,
@@ -279,7 +289,7 @@ async fn write_tick_completed_event(
         kind: "evolution_tick_completed".to_string(),
         status: "ok".to_string(),
         summary: format!(
-            "evolution tick completed (threshold_cohort={threshold_count}, prompt_cohort={prompt_count}, threshold_proposals={threshold_proposals}, prompt_proposals={prompt_proposals}, eligible={proposals_eligible_count}, rejected={proposals_rejected_count})"
+            "evolution tick completed (threshold_cohort={threshold_count}, prompt_cohort={prompt_count}, threshold_proposals={threshold_proposals}, prompt_proposals={prompt_proposals}, eligible={proposals_eligible_count}, rejected={proposals_rejected_count}, post_release_reviews_completed={post_release_reviews_completed})"
         ),
         details: Some(doc! {
             "experiment_id": exp_id,
@@ -290,6 +300,7 @@ async fn write_tick_completed_event(
             "budget_used_tokens": budget_used_tokens,
             "proposals_eligible_count": proposals_eligible_count as i32,
             "proposals_rejected_count": proposals_rejected_count as i32,
+            "post_release_reviews_completed": post_release_reviews_completed as i32,
         }),
         created_at: DateTime::now(),
     };
