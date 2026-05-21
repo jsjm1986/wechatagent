@@ -146,7 +146,13 @@ pub(crate) async fn generate_agent_json(
     user: &str,
 ) -> AppResult<Value> {
     let started_at = DateTime::now();
-    let cache_key = llm_exact_cache_key(prompt_key, system, user);
+    // M4 W4 Task 5.3：把 prompt_pack_version 折进 cache key，让 release_prompt /
+    // ensure_prompt_pack_v2 / ensure_evolution_prompt_pack_v1 fetch_add 后旧
+    // entry 自动失效，无需 LRU 直接清空。
+    let pack_version = state
+        .prompt_pack_version
+        .load(std::sync::atomic::Ordering::SeqCst);
+    let cache_key = llm_exact_cache_key(prompt_key, system, user, pack_version);
     if let Some(key) = cache_key.as_ref() {
         let cached = {
             let mut cache = LLM_EXACT_CACHE.lock();
@@ -279,7 +285,12 @@ fn retry_count_from_error(error: &str) -> i32 {
         .unwrap_or(0)
 }
 
-fn llm_exact_cache_key(prompt_key: &str, system: &str, user: &str) -> Option<String> {
+fn llm_exact_cache_key(
+    prompt_key: &str,
+    system: &str,
+    user: &str,
+    pack_version: u64,
+) -> Option<String> {
     if !matches!(
         prompt_key,
         "knowledge.import.preview"
@@ -290,8 +301,9 @@ fn llm_exact_cache_key(prompt_key: &str, system: &str, user: &str) -> Option<Str
         return None;
     }
     Some(format!(
-        "{}:{}:{}",
+        "{}:{}:{}:{}",
         prompt_key,
+        pack_version,
         stable_agent_hash(system),
         stable_agent_hash(user)
     ))
@@ -1099,5 +1111,35 @@ mod tests {
         super::gateway::apply_confidence_override(&mut planner, &decision, &runtime);
         assert_eq!(planner.review_mode, "light");
         assert!(!planner.confidence_override_triggered);
+    }
+
+    /// M4 W4 Task 5.3：cache key 折入 prompt_pack_version——不同 version
+    /// 必须产出不同 key，让 release_prompt 后旧 entry 自动失效。
+    #[test]
+    fn llm_exact_cache_key_changes_when_prompt_pack_version_bumps() {
+        let v0 = super::llm_exact_cache_key("playbook.optimizer", "sys-A", "user-A", 0)
+            .expect("whitelisted prompt key produces cache key");
+        let v1 = super::llm_exact_cache_key("playbook.optimizer", "sys-A", "user-A", 1)
+            .expect("whitelisted prompt key produces cache key");
+        assert_ne!(v0, v1, "bumping version must invalidate cache key");
+    }
+
+    /// 同 version + 同 system/user → 同 key（cache hit 正确路径）。
+    #[test]
+    fn llm_exact_cache_key_stable_within_same_version() {
+        let a = super::llm_exact_cache_key("playbook.generator", "sys", "user", 7)
+            .expect("whitelisted prompt key produces cache key");
+        let b = super::llm_exact_cache_key("playbook.generator", "sys", "user", 7)
+            .expect("whitelisted prompt key produces cache key");
+        assert_eq!(a, b);
+    }
+
+    /// 非白名单 prompt_key 永远不进 cache（None），不受 version 影响。
+    #[test]
+    fn llm_exact_cache_key_returns_none_for_non_whitelisted_prompt_key() {
+        assert!(
+            super::llm_exact_cache_key("agent.decision", "sys", "user", 0).is_none(),
+            "non-whitelisted prompt_key must not enter LRU cache"
+        );
     }
 }

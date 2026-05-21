@@ -107,6 +107,14 @@ pub struct AppState {
     pub mcp: McpClient,
     pub llm: Arc<dyn LlmGenerator>,
     pub config: AppConfig,
+    /// agent-self-evolution M4 W4 Task 5.3：prompt 包版本号。
+    ///
+    /// `prompts::ensure_prompt_pack_v2` / `ensure_evolution_prompt_pack_v1`
+    /// 在末尾各 fetch_add 一次；`evolution::release::release_prompt`
+    /// commit 后 fetch_add 一次。`agent::generate_agent_json` 把当前值折进
+    /// LRU cache key，让 release/seed/rollback 任一动作 atomic 触发缓存失效，
+    /// 不需要重启进程。
+    pub prompt_pack_version: Arc<std::sync::atomic::AtomicU64>,
 }
 
 pub fn api_router(state: AppState) -> Router<AppState> {

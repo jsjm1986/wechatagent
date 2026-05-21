@@ -150,7 +150,12 @@ impl TestApp {
             mcp,
             llm: llm.clone(),
             config,
+            prompt_pack_version: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
         };
+        // M4 W4 Task 5.3：seed 完成后 fetch_add 一次，与 main.rs 行为一致。
+        state
+            .prompt_pack_version
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
         TestApp {
             state,
@@ -294,5 +299,6 @@ pub fn rebuild_app_state_with_mcp_url(app: &TestApp, mcp_url: String) -> AppStat
         mcp,
         llm: app.state.llm.clone(),
         config,
+        prompt_pack_version: app.state.prompt_pack_version.clone(),
     }
 }

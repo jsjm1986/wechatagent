@@ -51,6 +51,7 @@ async fn main() -> anyhow::Result<()> {
         mcp: McpClient::new(config.mcp_base_url.clone(), config.mcp_api_key.clone())?,
         llm,
         config: config.clone(),
+        prompt_pack_version: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
     };
     prompts::ensure_prompt_pack_v2(
         &state.db,
@@ -60,6 +61,11 @@ async fn main() -> anyhow::Result<()> {
     .await?;
     // M4 W2 Task 3.2：种入演化器 Critic prompt（不可自我演化的固定 prompt）。
     prompts::ensure_evolution_prompt_pack_v1(&state.db, &state.config.default_workspace_id).await?;
+    // M4 W4 Task 5.3：seed 完成后 fetch_add 一次 prompt_pack_version，让启动后第一个
+    // run 的 LRU cache key 与种入后的 prompt 内容对齐。
+    state
+        .prompt_pack_version
+        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     // S-18 / Task 18：种入示例评测场景，缺失时用 fallback 满足 spec 要求。
     let _ = ensure_example_evaluation_scenario(&state.db, &state.config.default_workspace_id).await;
 

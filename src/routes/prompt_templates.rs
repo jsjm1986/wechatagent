@@ -210,6 +210,10 @@ pub(super) async fn reset_system_prompt_pack(
         &state.config.default_account_id,
     )
     .await?;
+    // M4 W4 Task 5.3：reset 是显式销毁性 reseed，必须 bump 让 LRU cache 失效。
+    state
+        .prompt_pack_version
+        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     Ok(Json(
         json!({ "ok": true, "promptPackVersion": prompts::PROMPT_PACK_VERSION }),
     ))
