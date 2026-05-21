@@ -97,6 +97,7 @@ pub use memory::compact_memory_card_with_previous;
 // 导出为 `pub`。语义不变，仅可见性变化。
 pub use review::{finalize_review_for_send, local_decision_review, FinalizeOutcome, GatewayStatusFinal, PendingFinalizeEvent};
 pub use runtime::UserRuntimeParameters;
+pub use runtime::{resolve_thresholds, ResolvedThresholds};
 pub use types::{DecisionReviewResult, RawAgentDecision, ReviewScores};
 
 // agent-autonomy-loop W3 / Task 4.14：P4 PBT 需要在独立 crate 中构造
