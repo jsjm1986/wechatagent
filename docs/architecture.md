@@ -135,6 +135,55 @@ POST /webhooks/wechat
 - 任务来源模块
 - 幂等键
 
+## Evolution Worker Flow（M4 / agent-self-evolution）
+
+可选后台 tick（`EVOLUTION_ENABLED=true` 才起；默认 false）。完整设计见 `docs/agent-policy.md` 自我演化章节。运行链路：
+
+```text
+[evolution::tick] 每 EVOLUTION_TICK_SECONDS 触发一次
+  ↓
+[evolution::cohort::select_cohorts]
+  ↓ 抽 threshold cohort + prompt failure cohort
+  │  （per-contact cap=3，最少 EVOLUTION_MIN_REPLAYS=30 才发起）
+  ↓
+[evolution::threshold::generate]            [evolution::prompt::generate (Critic LLM)]
+  │  按 THRESHOLD_REASONABLE_BANDS 决定         │  失败 cohort + 当前模板 → diff_snippet
+  │  +step / -step                              │  validate_diffs（剥禁词 / 长度门）
+  ↓                                              ↓
+[Proposal] status=pending_eval ──────┬──────────┘
+                                     ↓
+[evolution::replay::run_shadow_replay] 仅读 agent_run_logs
+                                     │  ❌ 不写 agent_send_outbox
+                                     │  ❌ 不调 mcp_client
+                                     │  ❌ 不写 conversation_messages
+                                     ↓
+[evolution::significance] EVOLUTION_MIN_SEND_SUCCESS_DELTA / *_SELF_CRITIQUE_DELTA
+                                     │ + EVOLUTION_MAX_5GATE_HIT_INCREASE
+                                     ↓
+                          ┌──────── significance_passed? ────────┐
+                          ↓                                       ↓
+              status=eligible_for_release           status=rejected_below_threshold
+                          ↓
+              admin 在 EvolutionCenterTab 手工
+                          ↓
+[evolution::release::release_threshold|release_prompt]
+  ↓ Mongo session transaction
+  │  - threshold: insert threshold_overrides（rolled_back_at=null）
+  │  - prompt:    bump version + current_version 切换 + prompt_pack_version +1（LRU 失效）
+  ↓
+[agent::resolve_thresholds] / [generate_agent_json] 在下一个生产 run 入口读到新值
+
+回滚：admin 点 rollback → release.rs::rollback_threshold|rollback_prompt
+       threshold: rolled_back_at=now → resolve_thresholds 读回 baseline
+       prompt:    current_version 切回旧 version + prompt_pack_version 再 +1
+```
+
+红线（CI 守门）：
+
+- `src/evolution/` SHALL NOT 引用 `crate::agent::gateway / outbox / mcp::` 任意符号（`scripts/check-evolution-isolation.{sh,ps1}`）。
+- 所有新增 `agent_events.kind` / 前端文案过 `scripts/check-no-human-takeover.{sh,ps1}` lint。
+- 100 次 shadow replay 后 `agent_send_outbox` 集合 size 不变（`tests/evolution_isolation.rs`）。
+
 ## Deployment Shape
 
 第一阶段保持简单：

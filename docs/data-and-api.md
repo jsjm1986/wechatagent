@@ -151,6 +151,44 @@ agent_tool_calls
 agent_confirmations
 ```
 
+自我演化（M4 / agent-self-evolution）：
+
+```text
+experiments              # 一次 tick 的信封：experiment_id / cohort_summary / budget / status
+proposals                # 候选：threshold + prompt 共用，status pending_eval/evaluating/eligible_for_release/rejected_below_threshold/released/rolled_back
+shadow_replays           # 单次 source_run 在新阈值/新 prompt 下的重判结果
+threshold_overrides      # 已发布的阈值覆盖：(workspace, account, gate_key)，rolled_back_at=null & released_at 最新者生效
+```
+
+各 collection 关键字段（详见 `src/models.rs` Proposal / Experiment / ShadowReplay / ThresholdOverride）：
+
+```text
+experiments:
+  experiment_id (unique) / workspace_id / account_id / started_at desc
+  cohort_summary { thresholdCount, promptCount }
+  budget { tokensUsed, llmCalls }
+  status: running | finished | aborted
+
+proposals:
+  experiment_id / workspace_id / account_id / proposal_kind (threshold|prompt)
+  status / created_at desc
+  threshold path:    gate_key / current_value / proposed_value
+  prompt path:       proposed_template_key / proposed_section / diff_snippet / critic_reasoning
+  eval: replays_completed / replays_failed / significance_passed / eval_metrics
+  released_at / released_by / rolled_back_at / rolled_back_by
+
+shadow_replays:
+  proposal_id / source_run_id / new_review.scores.* / new_review.final_status
+  outcome_delta { sendSuccess, selfCritique, fiveGateHits }
+
+threshold_overrides:
+  workspace_id / account_id / gate_key
+  proposed_value / released_by / released_at desc / rolled_back_at (null=生效)
+  对应 proposal_id 用于审计
+```
+
+prompt_templates 同步升级为多版本形态（M4 W0 一次性迁移）：`(prompt_key, version)` 唯一 + `(prompt_key, current_version=true)` 至多一行；`seeded_by` 新增枚举 `evolution_release`。
+
 ## API Design Principles
 
 API 按产品模块组织，而不是按 MCP 工具组织。
@@ -163,6 +201,12 @@ API 按产品模块组织，而不是按 MCP 工具组织。
 /api/conversations
 /api/events
 /api/tasks
+/api/outcomes/autonomy
+/api/evolution/experiments        GET     # admin 看 experiment 信封列表
+/api/evolution/proposals          GET     # admin 看 proposal 列表（按 status 桶）
+/api/evolution/proposals/:id/release    POST  # admin 触发 release（threshold|prompt 自动分派）
+/api/evolution/proposals/:id/rollback   POST  # admin 触发 rollback
+/api/evolution/rollback_all       POST    # admin 二次确认（输入 ROLLBACK_ALL）一次性回滚
 ```
 
 未来建议：

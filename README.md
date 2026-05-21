@@ -115,6 +115,17 @@ newMsgId / msgId
 
 解析到的消息会写入 `conversation_messages`。只有已纳管好友会触发 Agent。
 
+## 演化器（Evolution worker / M4）
+
+可选的后台演化器：每 6 小时（`EVOLUTION_TICK_SECONDS` 默认 21600）按 cohort 选样，对 5 闸阈值与运营 prompt 各产 ≤ N 条候选，进 shadow replay + 显著性检验，admin 在前端 EvolutionCenterTab 手工 release / rollback。
+
+- 主开关：`EVOLUTION_ENABLED=false`（默认关，运维需显式打开）。
+- 已发布的 `threshold_overrides` / `prompt_templates` 在主开关关停后**不回退**，由 admin 手工 rollback。
+- 演化器走独立模块 `src/evolution/`，CI lint（`scripts/check-evolution-isolation.{sh,ps1}`）守住"不调用 gateway / outbox / MCP"红线，确保演化器对生产链路零副作用。
+- 完整设计与安全边界见 `docs/agent-policy.md` 自我演化章节。
+
+`.env.example` 已包含 14 条 `EVOLUTION_*` 配置，复制 `.env` 时一并落入即可。
+
 ## 已实现接口
 
 ```text
