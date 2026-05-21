@@ -538,9 +538,9 @@ async fn handle_outcome_aggregation_task(
         None
     };
 
-    // 波 A2：human_handoff_success_rate 暂无事件源，写 None 表示"指标不可用"，
-    // 不再以 0 静默冒充零成功率。后续接入 human_handoff 事件后改为实际比例。
-    let human_handoff_success_rate: Option<f64> = None;
+    // 波 A2：ai_hold_cleared_rate 暂无事件源（AI 自暂缓后由 AI 自身澄清恢复
+    // 继续的比例），写 None 表示"指标不可用"，不再以 0 静默冒充零成功率。
+    let ai_hold_cleared_rate: Option<f64> = None;
 
     // daily_run_count / daily_run_token_total：当日 agent_run_logs 聚合（不取 horizon，固定取 24h）。
     let day_start = mongodb::bson::DateTime::from_millis(now_ms - 24 * 60 * 60 * 1000);
@@ -585,7 +585,7 @@ async fn handle_outcome_aggregation_task(
         date: date.clone(),
         reply_rate,
         conversation_depth,
-        human_handoff_success_rate,
+        ai_hold_cleared_rate,
         agent_block_rate,
         daily_run_count,
         daily_run_token_total,

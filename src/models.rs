@@ -886,11 +886,13 @@ pub struct AgentOutcomeMetric {
     /// 波 A2：managed contact 数为 0 时为 `None`。
     #[serde(default)]
     pub conversation_depth: Option<f64>,
-    /// 波 A2：当前 events 中没有 `human_handoff` 事件源，统一写 `None` 表
-    /// 示"指标暂不可用"，避免前端误判为"零成功率"。后续接入事件源后改为
-    /// 实际比例。
-    #[serde(default)]
-    pub human_handoff_success_rate: Option<f64>,
+    /// 波 A2：AI 自暂缓后由 AI 自身澄清恢复继续的比例。当前 events 中尚无
+    /// 对应事件源，统一写 `None` 表示"指标暂不可用"，避免前端误判为"零成
+    /// 功率"。后续接入事件源后改为实际比例。
+    /// 注：旧字段 `human_handoff_success_rate` 已退役（违反全自治产品定位），
+    /// 使用 `serde(alias)` 兼容历史 BSON 文档读取，写入用新字段名。
+    #[serde(default, alias = "human_handoff_success_rate")]
+    pub ai_hold_cleared_rate: Option<f64>,
     /// 波 A2：review 总数为 0 时为 `None`。
     #[serde(default)]
     pub agent_block_rate: Option<f64>,
@@ -2171,7 +2173,7 @@ mod typed_tests {
             date: "2026-05-18".to_string(),
             reply_rate: None,
             conversation_depth: None,
-            human_handoff_success_rate: None,
+            ai_hold_cleared_rate: None,
             agent_block_rate: None,
             daily_run_count: 0,
             daily_run_token_total: 0,
@@ -2186,19 +2188,19 @@ mod typed_tests {
             Some(mongodb::bson::Bson::Null)
         ));
         assert!(matches!(
-            doc.get("human_handoff_success_rate"),
+            doc.get("ai_hold_cleared_rate"),
             Some(mongodb::bson::Bson::Null)
         ));
         let parsed: AgentOutcomeMetric =
             mongodb::bson::from_document(doc).expect("deserialize metric");
         assert!(parsed.reply_rate.is_none());
-        assert!(parsed.human_handoff_success_rate.is_none());
+        assert!(parsed.ai_hold_cleared_rate.is_none());
         assert!(parsed.agent_block_rate.is_none());
         assert!(parsed.conversation_depth.is_none());
     }
 
-    /// 波 A2：老文档（`replyRate: 0.0`）反序列化保留为 `Some(0.0)`，不会被
-    /// 当作"无数据"丢失。
+    /// 波 A2：旧 BSON 文档（`replyRate: 0.0` 与 `human_handoff_success_rate`
+    /// 字段名）反序列化保留为 `Some(0.0)`，验证 `serde(alias)` 兼容性。
     #[test]
     fn agent_outcome_metric_reads_legacy_zero_value() {
         let legacy = doc! {
@@ -2218,7 +2220,7 @@ mod typed_tests {
         let parsed: AgentOutcomeMetric =
             mongodb::bson::from_document(legacy).expect("deserialize legacy");
         assert_eq!(parsed.reply_rate, Some(0.0));
-        assert_eq!(parsed.human_handoff_success_rate, Some(0.0));
+        assert_eq!(parsed.ai_hold_cleared_rate, Some(0.0));
     }
 
     /// 波 D1：`OperationStateMachineTyped` 能从默认状态机正确反序列化 +

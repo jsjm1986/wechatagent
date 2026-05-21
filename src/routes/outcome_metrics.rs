@@ -70,7 +70,7 @@ pub(super) async fn list_agent_outcome_metrics(
 }
 
 pub(super) fn outcome_metric_json(item: AgentOutcomeMetric) -> Value {
-    // 波 A2：reply_rate / conversation_depth / human_handoff_success_rate /
+    // 波 A2：reply_rate / conversation_depth / ai_hold_cleared_rate /
     // agent_block_rate 都是 Option<f64>，在 JSON 中序列化为 number 或 null。
     // 前端按 null 显示"暂无数据"。
     json!({
@@ -80,7 +80,7 @@ pub(super) fn outcome_metric_json(item: AgentOutcomeMetric) -> Value {
         "date": item.date,
         "replyRate": item.reply_rate,
         "conversationDepth": item.conversation_depth,
-        "humanHandoffSuccessRate": item.human_handoff_success_rate,
+        "aiHoldClearedRate": item.ai_hold_cleared_rate,
         "agentBlockRate": item.agent_block_rate,
         "dailyRunCount": item.daily_run_count,
         "dailyRunTokenTotal": item.daily_run_token_total,

@@ -2292,7 +2292,7 @@ function UserOperationCockpit({
 
       {activeTab === "profile" && (
         <section className="smartTabPanel profileEditor">
-          <div className="modeLine editable">人工可编辑，只影响当前好友</div>
+          <div className="modeLine editable">运营可编辑，只影响当前好友</div>
           <label>
             <span>运营风格模板</span>
             <select value={selectedPlaybookId} onChange={(event) => onSelectedPlaybook(event.target.value)}>
@@ -3623,7 +3623,7 @@ function KnowledgeChunkEditor({
               原文对照
             </button>
             <button type="button" className="secondary" onClick={() => onVerify(editingId)} disabled={busy}>
-              人工确认
+              运营确认
             </button>
             <button type="button" className="secondary" onClick={() => onReject(editingId)} disabled={busy}>
               驳回切片
@@ -5186,7 +5186,7 @@ type OutcomeMetric = {
   date: string;
   replyRate: number | null;
   conversationDepth: number | null;
-  humanHandoffSuccessRate: number | null;
+  aiHoldClearedRate: number | null;
   agentBlockRate: number | null;
   dailyRunCount: number;
   dailyRunTokenTotal: number;
@@ -5337,7 +5337,7 @@ function OutcomeMetricsTab({ accountId }: { accountId?: string }) {
               <th>日期</th>
               <th>回复率</th>
               <th>对话深度</th>
-              <th>转人工成功率</th>
+              <th>AI暂缓澄清率</th>
               <th>Agent 拦截率</th>
               <th>当日 run 数</th>
               <th>当日 token</th>
@@ -5349,7 +5349,7 @@ function OutcomeMetricsTab({ accountId }: { accountId?: string }) {
                 <td>{item.date}</td>
                 <td>{formatRate(item.replyRate)}</td>
                 <td>{formatNumber(item.conversationDepth)}</td>
-                <td>{formatRate(item.humanHandoffSuccessRate)}</td>
+                <td>{formatRate(item.aiHoldClearedRate)}</td>
                 <td>{formatRate(item.agentBlockRate)}</td>
                 <td>{item.dailyRunCount}</td>
                 <td>{item.dailyRunTokenTotal.toLocaleString()}</td>
@@ -5837,7 +5837,7 @@ function AutoVerifyTab({ accountId }: { accountId?: string }) {
         对 <strong>needs_review</strong> 状态的知识切片做 LLM 自动校验。verified 必须满足：
         切片自带 <code>source_quote</code> 非空 + <code>source_anchors</code> 可定位 +
         模型 <code>integrityStatus="verified"</code> + 置信分 ≥ 阈值。否则降级为 needs_review/rejected。
-        随机 <code>sampleRate</code> 比例的 verified 切片改成 needs_human_audit 走人工抽查。
+        随机 <code>sampleRate</code> 比例的 verified 切片改成 needs_human_audit 走运营抽查。
       </p>
       <div className="qualityToolbar">
         <label>
