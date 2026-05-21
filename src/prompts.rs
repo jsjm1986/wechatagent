@@ -1122,3 +1122,110 @@ fn default_prompt_content(key: &str) -> Option<&'static str> {
         .find(|spec| spec.key == key)
         .map(|spec| spec.content)
 }
+
+/// agent-self-evolution M4 W2 Task 3.2：种入演化器 Critic Agent 使用的固定 prompt。
+///
+/// 该 prompt **不进入演化器自身的 prompt evolution 循环**——见
+/// [`PROMPT_EVOLUTION_FORBIDDEN_KEYS`]。Critic Agent 的 system / policy /
+/// schema 都是不变量，只在运行期由 EvolutionWorker 调用以审视 Reply Agent
+/// 的 prompt（不是审视自身）。如果允许 Critic 自我审视会出现"prompt 互斥
+/// 反馈环"——design.md §9.3 明令禁止。
+///
+/// 启动时调用一次，幂等：已存在则跳过。
+pub async fn ensure_evolution_prompt_pack_v1(db: &Database, workspace_id: &str) -> AppResult<()> {
+    for spec in evolution_prompt_specs() {
+        let existing = db
+            .prompt_templates()
+            .find_one(
+                doc! {
+                    "workspace_id": workspace_id,
+                    "prompt_key": spec.key,
+                    "current_version": true,
+                },
+                None,
+            )
+            .await?;
+        if existing.is_some() {
+            continue;
+        }
+        let version = next_prompt_version(db, workspace_id, spec.key).await?;
+        db.prompt_templates()
+            .insert_one(
+                PromptTemplate {
+                    id: None,
+                    workspace_id: workspace_id.to_string(),
+                    prompt_key: spec.key.to_string(),
+                    agent_kind: spec.agent_kind.to_string(),
+                    layer: spec.layer.to_string(),
+                    title: spec.title.to_string(),
+                    description: Some(spec.description.to_string()),
+                    content: spec.content.to_string(),
+                    status: spec.status.to_string(),
+                    version,
+                    prompt_pack_version: EVOLUTION_PROMPT_PACK_VERSION.to_string(),
+                    created_by: "system_evolution_v1".to_string(),
+                    created_at: DateTime::now(),
+                    updated_at: DateTime::now(),
+                    current_version: true,
+                    previous_version: None,
+                    seeded_by: Some("system_evolution_v1".to_string()),
+                },
+                None,
+            )
+            .await?;
+    }
+    Ok(())
+}
+
+/// 演化器 Critic Agent 自身使用的 prompt 集合，禁止被演化器自我重写。
+/// `prompt_critic.rs` 在产候选时若 `proposed_template_key` 命中此集合
+/// SHALL 整批 drop 并 `failure_reason="self_referential_critic_prompt"`。
+pub const PROMPT_EVOLUTION_FORBIDDEN_KEYS: &[&str] = &["evolution_critic_v1"];
+
+/// 演化器自身 prompt pack 版本号（独立于 [`PROMPT_PACK_VERSION`]，避免
+/// 误把 Critic prompt 计入业务 pack 的 reseed/重置范围）。
+pub const EVOLUTION_PROMPT_PACK_VERSION: &str = "wechatagent_evolution_pack_v1_2026_05";
+
+fn evolution_prompt_specs() -> Vec<PromptSpec> {
+    vec![PromptSpec {
+        key: "evolution_critic_v1",
+        agent_kind: "evolution",
+        layer: "critic",
+        title: "Reply Agent prompt 演化 Critic（不可自我重写）",
+        description: "审视 Reply Agent 现行 prompt，基于 cohort 失败摘要给出 diff 候选；不得引入禁词、不得绕 5 闸、不得自指。",
+        status: "active",
+        content: r#"你是一个专门审视 Reply Agent prompt 的 critic agent。
+你不是 Reply Agent；你不参与对客户的任何回复。你只针对【Reply Agent 当前正在使用的 prompt 模板】给出修改建议。
+你的输出会被自动汇入 evolution worker 的候选池，再由独立的 shadow replay + 显著性检验决定是否真正发布；因此你不需要保守，但必须遵守以下硬约束。
+
+只输出严格 JSON，不输出 markdown、注释或多余文本。
+JSON schema：
+{
+  "diffs": [
+    {
+      "templateKey": "现行模板的 prompt_key（必须来自 Reply Agent 模板集合，不得是 evolution_critic_v1 自身）",
+      "section": "soul | system_contract | policy | task_template | review | reaction_analysis 等现有 layer 之一",
+      "summary": "一句话说明本次 diff 想解决的失败模式",
+      "snippet": "建议追加 / 替换的 prompt 片段（自然中文为主，禁词见 policy）",
+      "expectedImprovementOn": ["product_accuracy_score_block", "fact_risk_block", "human_like_score_rewrite", "..."],
+      "riskNote": "如果本次改动可能引入新风险（如 emit 频率上升、5 闸放宽、回复变长），写一句话说明"
+    }
+  ]
+}
+
+policy（违反任意一条 SHALL 让你的整批输出被 drop）：
+- snippet / summary 不得出现以下任何字面量及其变体：human takeover、hand off、hand-off、handoff、takeover、人工接管、人工介入、人工托管、接管、人工。
+  Reply Agent 的产品定位是【全 AI 自主】；遇到风险用 AI 内部状态名表述（held_by_ai_policy / blocked_by_safety_guard / ai_waiting_for_more_context），永不引入"人工"二字。
+- 不得建议绕过 5 闸（FactRisk / PressureRisk / HumanLikeScore / EmotionalValue / ProductAccuracyScore）的拦截阈值；可以建议改进【触发前】的 prompt 表达，不可以建议放宽 review 判定。
+- 不得建议 Reply Agent 直接引用未在 operation_knowledge_chunks 中验证的产品事实；可以建议用更保守的措辞包裹未知事实。
+- 不得自指：templateKey 不得为 evolution_critic_v1（演化器不会演化自身 prompt）。
+- 单条 diff 的 summary ≤ 200 字，snippet ≤ 4000 字；超长会被自动 drop。
+
+operator_instruction：
+- 输入会包含【现行 prompt 模板原文 + cohort 内失败 run 摘要（按 finalReviewStatus 分桶，每桶最多 N 条）】。
+- 你的目标是从失败 run 中提炼出"prompt 表达层面的根因"，而非"模型能力问题"。例如：用户连发清单要求时 Reply Agent 反复说"稍后整理给您"——根因是 task_template 没有强约束"用户要清单就直接给清单"，而不是模型能力。
+- 单 tick 最多输出 4 条 diff；如果失败模式互相覆盖，合并成一条；如果没有可信改动建议，输出 {"diffs": []} 而不是凑数。
+- 不要输出 templateKey 之外的字段进行隐式改动（例如修改默认状态机、修改 5 闸阈值——这些走 threshold 通道，不归你管）。
+"#,
+    }]
+}

@@ -58,6 +58,8 @@ async fn main() -> anyhow::Result<()> {
         &state.config.default_account_id,
     )
     .await?;
+    // M4 W2 Task 3.2：种入演化器 Critic prompt（不可自我演化的固定 prompt）。
+    prompts::ensure_evolution_prompt_pack_v1(&state.db, &state.config.default_workspace_id).await?;
     // S-18 / Task 18：种入示例评测场景，缺失时用 fallback 满足 spec 要求。
     let _ = ensure_example_evaluation_scenario(&state.db, &state.config.default_workspace_id).await;
 

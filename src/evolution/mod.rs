@@ -18,6 +18,9 @@ pub mod budget;
 pub mod cohort;
 pub mod envelope;
 pub mod error;
+pub mod lint;
+pub mod prompt_critic;
+pub mod threshold;
 
 use std::time::Duration;
 
@@ -56,12 +59,14 @@ pub async fn run_evolutionary_worker(state: AppState) {
     }
 }
 
-/// 单次 tick 主流程（W1 骨架版）：
+/// 单次 tick 主流程：
 /// 1. 写 `experiments` 信封；
 /// 2. 选 cohort（threshold + prompt）；
-/// 3. **W1 暂不调** W2/W3 候选生成 / shadow eval / release，直接把 status 推到
-///    `awaiting_admin` 并写一条 `evolution_tick_completed` 事件；
-/// 4. 后续 W2/W3/W4 在此扩展即可（不破坏 envelope shape）。
+/// 3. M4 W2：threshold 候选（纯统计，不消 EvolutionBudget）；
+/// 4. M4 W2：prompt critic 候选（消 EvolutionBudget；耗尽时 silent skip）；
+/// 5. 把 status 推到 `evaluating`（W3 引入 shadow eval 后由 eval 路径
+///    切换到 `awaiting_admin`）；
+/// 6. 写 `evolution_tick_completed` 事件。
 pub async fn run_one_tick(state: &AppState) -> Result<(), EvolutionError> {
     let exp_id = format!(
         "exp_{}_{}",
@@ -86,7 +91,7 @@ pub async fn run_one_tick(state: &AppState) -> Result<(), EvolutionError> {
     let threshold_count = cohorts.threshold.len();
     let prompt_count = cohorts.prompt.len();
 
-    // 3. 推进 cohort 字段（即使为空也写，后台能看到 tick 跑过）
+    // 推进 cohort 字段
     state
         .db
         .experiments()
@@ -104,10 +109,116 @@ pub async fn run_one_tick(state: &AppState) -> Result<(), EvolutionError> {
         .await
         .map_err(EvolutionError::from)?;
 
-    // 4. 占位推进到 awaiting_admin（W2/W3 接入后改为 evaluating）。
-    update_experiment_status(state, &exp_id, "awaiting_admin").await?;
+    // 3. threshold 候选（纯统计，不消 EvolutionBudget）。
+    let threshold_proposals = threshold::generate(state, &exp_id, &cohorts.threshold).await?;
+    insert_proposals(state, &threshold_proposals).await?;
 
-    write_tick_completed_event(state, &exp_id, threshold_count, prompt_count).await?;
+    // 4. prompt critic 候选（消 EvolutionBudget；BudgetExceeded 不向上传播）。
+    let mut budget = EvolutionBudget::from_config(&state.config);
+    let prompt_proposals = match prompt_critic::generate(state, &exp_id, &cohorts, &mut budget).await
+    {
+        Ok(v) => v,
+        Err(EvolutionError::BudgetExceeded {
+            tokens_used,
+            calls_used,
+        }) => {
+            write_budget_exceeded_event(state, &exp_id, tokens_used, calls_used).await?;
+            Vec::new()
+        }
+        Err(e) => return Err(e),
+    };
+    insert_proposals(state, &prompt_proposals).await?;
+
+    // 5. 写预算用量到 envelope。
+    state
+        .db
+        .experiments()
+        .update_one(
+            doc! { "experiment_id": &exp_id },
+            doc! {
+                "$set": {
+                    "budget_used_tokens": budget.token_used,
+                    "budget_used_calls": budget.call_used as i32,
+                    "updated_at": DateTime::now(),
+                }
+            },
+            None,
+        )
+        .await
+        .map_err(EvolutionError::from)?;
+
+    // 6. 推进状态。W3 引入 shadow eval 后改为：有 pending_eval 候选 → evaluating；
+    //    有 eligible_for_release 候选 → awaiting_admin。当前 W2 只到 evaluating。
+    let pending_count = threshold_proposals
+        .iter()
+        .chain(prompt_proposals.iter())
+        .filter(|p| p.status == "pending_eval")
+        .count();
+    let next_status = if pending_count > 0 {
+        "evaluating"
+    } else {
+        "awaiting_admin"
+    };
+    update_experiment_status(state, &exp_id, next_status).await?;
+
+    write_tick_completed_event(
+        state,
+        &exp_id,
+        threshold_count,
+        prompt_count,
+        threshold_proposals.len(),
+        prompt_proposals.len(),
+        budget.token_used,
+    )
+    .await?;
+    Ok(())
+}
+
+async fn insert_proposals(
+    state: &AppState,
+    proposals: &[crate::models::Proposal],
+) -> Result<(), EvolutionError> {
+    if proposals.is_empty() {
+        return Ok(());
+    }
+    state
+        .db
+        .proposals()
+        .insert_many(proposals.to_vec(), None)
+        .await
+        .map_err(EvolutionError::from)?;
+    Ok(())
+}
+
+async fn write_budget_exceeded_event(
+    state: &AppState,
+    exp_id: &str,
+    tokens_used: i64,
+    calls_used: i32,
+) -> Result<(), EvolutionError> {
+    let event = crate::models::AgentEvent {
+        id: None,
+        workspace_id: state.config.default_workspace_id.clone(),
+        account_id: state.config.default_account_id.clone(),
+        contact_wxid: None,
+        kind: "evolution_budget_exceeded".to_string(),
+        status: "warning".to_string(),
+        summary: format!(
+            "evolution budget exceeded (tokens_used={tokens_used}, calls_used={calls_used})"
+        ),
+        details: Some(doc! {
+            "experiment_id": exp_id,
+            "tokens_used": tokens_used,
+            "calls_used": calls_used as i32,
+        }),
+        created_at: DateTime::now(),
+    };
+    state
+        .db
+        .events()
+        .insert_one(event, None)
+        .await
+        .map_err(EvolutionError::from)?;
     Ok(())
 }
 
@@ -116,6 +227,9 @@ async fn write_tick_completed_event(
     exp_id: &str,
     threshold_count: usize,
     prompt_count: usize,
+    threshold_proposals: usize,
+    prompt_proposals: usize,
+    budget_used_tokens: i64,
 ) -> Result<(), EvolutionError> {
     let event = crate::models::AgentEvent {
         id: None,
@@ -125,14 +239,15 @@ async fn write_tick_completed_event(
         kind: "evolution_tick_completed".to_string(),
         status: "ok".to_string(),
         summary: format!(
-            "evolution tick completed (threshold_cohort={threshold_count}, prompt_cohort={prompt_count})"
+            "evolution tick completed (threshold_cohort={threshold_count}, prompt_cohort={prompt_count}, threshold_proposals={threshold_proposals}, prompt_proposals={prompt_proposals})"
         ),
         details: Some(doc! {
             "experiment_id": exp_id,
             "threshold_cohort_size": threshold_count as i32,
             "prompt_cohort_size": prompt_count as i32,
-            "budget_used_tokens": 0_i64,
-            "proposals_count": 0_i32,
+            "threshold_proposals_count": threshold_proposals as i32,
+            "prompt_proposals_count": prompt_proposals as i32,
+            "budget_used_tokens": budget_used_tokens,
         }),
         created_at: DateTime::now(),
     };
