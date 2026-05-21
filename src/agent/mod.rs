@@ -35,7 +35,7 @@ pub(crate) mod outbox;
 pub(crate) mod outbox_dispatcher;
 mod reaction;
 mod review;
-mod runtime;
+pub(crate) mod runtime;
 pub mod run_envelope;
 mod simulation;
 pub(crate) mod taxonomy;

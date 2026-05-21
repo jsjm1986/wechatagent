@@ -837,7 +837,12 @@ async fn should_skip_for_block_rate(
 ) -> anyhow::Result<Option<Document>> {
     let window_hours = state.config.strategic_planner_block_rate_window_hours;
     let min_runs = state.config.strategic_planner_block_rate_min_runs;
-    let threshold = state.config.strategic_planner_block_rate_threshold;
+    // M4 W4 Task 5.1：planner_block_rate_threshold 通过 resolve_thresholds 取值，
+    // 让 threshold_overrides 的 release 在下一个 tick 立即生效。
+    let threshold = crate::agent::runtime::resolve_thresholds(state, contact)
+        .await
+        .map_err(|e| anyhow::anyhow!("resolve_thresholds failed: {e}"))?
+        .planner_block_rate_threshold;
     if window_hours <= 0 || min_runs <= 0 || threshold <= 0.0 {
         return Ok(None);
     }

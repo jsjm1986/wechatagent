@@ -42,7 +42,12 @@ pub async fn simulate_user_dialogue(
     messages: Vec<String>,
 ) -> AppResult<Vec<UserOperationSimulationTurn>> {
     let domain_config = load_user_operation_domain_config(state, &contact.workspace_id).await?;
-    let runtime = UserRuntimeParameters::from_config(domain_config.as_ref(), state);
+    let mut runtime = UserRuntimeParameters::from_config(domain_config.as_ref(), state);
+    // M4 W4 Task 5.1：simulation 也走 review_passed，同样需要把 threshold_overrides
+    // 的最新生效值写回 runtime，让 shadow 模拟和生产 review 共享同一组阈值。
+    crate::agent::runtime::resolve_thresholds(state, &contact)
+        .await?
+        .apply_to_runtime(&mut runtime);
     let run_id = uuid::Uuid::new_v4().to_string();
     let budget = Arc::new(RunBudget::new(
         run_id.clone(),

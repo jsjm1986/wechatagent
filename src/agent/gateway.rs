@@ -105,7 +105,12 @@ pub async fn send_contact_message_gateway(
     }
     let content = request.content.trim().to_string();
     let domain_config = load_user_operation_domain_config(state, &contact.workspace_id).await?;
-    let runtime = UserRuntimeParameters::from_config(domain_config.as_ref(), state);
+    let mut runtime = UserRuntimeParameters::from_config(domain_config.as_ref(), state);
+    // M4 W4 Task 5.1：通过 resolve_thresholds 把 threshold_overrides 的最新生效值
+    // 写回 runtime，5 闸 block/rewrite 阈值即时反映 release。
+    crate::agent::runtime::resolve_thresholds(state, &contact)
+        .await?
+        .apply_to_runtime(&mut runtime);
     let synthetic_inbound = ConversationMessage {
         id: None,
         workspace_id: contact.workspace_id.clone(),
@@ -344,7 +349,12 @@ pub(crate) async fn run_user_operation_gateway(
     let run_id = uuid::Uuid::new_v4().to_string();
     let inbound = trigger_message(&contact, &trigger);
     let domain_config = load_user_operation_domain_config(state, &contact.workspace_id).await?;
-    let runtime = UserRuntimeParameters::from_config(domain_config.as_ref(), state);
+    let mut runtime = UserRuntimeParameters::from_config(domain_config.as_ref(), state);
+    // M4 W4 Task 5.1：通过 resolve_thresholds 把 threshold_overrides 的最新生效值
+    // 写回 runtime，让 5 闸 block/rewrite 阈值即时反映 release，无需重启进程。
+    crate::agent::runtime::resolve_thresholds(state, &contact)
+        .await?
+        .apply_to_runtime(&mut runtime);
 
     // MP-5 / Task 15：为本次 run 构建 budget，并通过 task_local 注入。
     // agent-autonomy-loop W3 / Task 4.1：从 runtime_parameters.knowledgeMaxToolCalls
