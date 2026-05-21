@@ -22,6 +22,7 @@ mod conversations;
 mod domains;
 mod evaluations;
 mod events;
+mod evolution;
 mod guides;
 mod health;
 mod knowledge;
@@ -67,6 +68,10 @@ use evaluations::{
     run_formula_adherence_evaluation, update_evaluation_scenario,
 };
 use events::list_events;
+use evolution::{
+    get_evolution_proposal_detail, list_evolution_experiments, release_evolution_proposal,
+    rollback_evolution_proposal,
+};
 use guides::{apply_user_operation_guide, preview_user_operation_guide};
 use health::health;
 use knowledge::{
@@ -370,5 +375,19 @@ pub fn api_router(state: AppState) -> Router<AppState> {
         // ── agent-autonomy-loop W4 / Task 5.6：outbox admin 路由 ─────────────
         .route("/admin/outbox", get(list_outbox))
         .route("/admin/outbox/:id/cancel", post(cancel_outbox))
+        // ── agent-self-evolution M4 W4 / Task 5.5：evolution admin 路由 ──────
+        .route("/evolution/experiments", get(list_evolution_experiments))
+        .route(
+            "/evolution/proposals/:id",
+            get(get_evolution_proposal_detail),
+        )
+        .route(
+            "/evolution/proposals/:id/release",
+            post(release_evolution_proposal),
+        )
+        .route(
+            "/evolution/proposals/:id/rollback",
+            post(rollback_evolution_proposal),
+        )
         .with_state(state)
 }
