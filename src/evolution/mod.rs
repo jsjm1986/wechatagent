@@ -20,6 +20,7 @@ pub mod envelope;
 pub mod error;
 pub mod lint;
 pub mod prompt_critic;
+pub mod release;
 pub mod replay;
 pub mod significance;
 pub mod threshold;

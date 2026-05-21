@@ -27,6 +27,7 @@ use crate::models::{
 #[derive(Clone)]
 pub struct Database {
     db: MongoDatabase,
+    client: Client,
 }
 
 impl Database {
@@ -35,13 +36,24 @@ impl Database {
         options.app_name = Some("wechatagent".to_string());
         let client = Client::with_options(options)?;
         let db = client.database(database);
-        Ok(Self { db })
+        Ok(Self {
+            db,
+            client,
+        })
     }
 
     /// 创建/确保所有索引。调用方需在 [`migrations::run`] 之后调用，避免迁移
     /// 与索引创建在 schema 不一致时互相干扰。
     pub async fn ensure_indexes(&self) -> anyhow::Result<()> {
         indexes::ensure_all(self).await
+    }
+
+    /// agent-self-evolution M4 W4 Task 5.2：暴露底层 `Client`，让 release.rs 能
+    /// 跨 collection 起 mongo session 实现 transaction（threshold_overrides +
+    /// proposals 必须 atomic 落地，否则会出现 release 已写但 proposal status
+    /// 还是 eligible_for_release 的污染状态）。
+    pub fn client(&self) -> Client {
+        self.client.clone()
     }
 
     pub fn accounts(&self) -> Collection<WechatAccount> {
