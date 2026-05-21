@@ -23,8 +23,10 @@ import {
 import type { LucideIcon } from "lucide-react";
 import { FormEvent, useEffect, useMemo, useState } from "react";
 
+import { EvolutionCenterTab } from "./EvolutionCenterTab";
+
 type AgentStatus = "normal" | "managed";
-type Channel = "command" | "overview" | "userOps" | "groupOps" | "momentOps" | "knowledge" | "content" | "systemStrategy" | "operations" | "autonomy" | "quality";
+type Channel = "command" | "overview" | "userOps" | "groupOps" | "momentOps" | "knowledge" | "content" | "systemStrategy" | "operations" | "autonomy" | "evolution" | "quality";
 type ContactTab = "all" | "managed" | "normal";
 type SmartOpsTab = "cockpit" | "adjust" | "profile" | "memory" | "simulation" | "conversation";
 type TraditionalOpsTab = "playbooks" | "prompts" | "settings" | "audit";
@@ -614,6 +616,8 @@ const channels: Array<{ id: Channel; label: string; caption: string; icon: Lucid
   { id: "operations", label: "任务日志", caption: "执行审计", icon: Activity },
   // W6 / Task 7.2：自治回路监控提到顶级频道（原 QualityCenterView 子 Tab 已下沉到此）
   { id: "autonomy", label: "自治回路监控", caption: "Autonomy Loop", icon: ShieldCheck },
+  // M4 W4 / Task 5.8：演化中心（experiments / proposals / release / rollback）
+  { id: "evolution", label: "演化中心", caption: "Self Evolution", icon: ShieldCheck },
   // 波 B4-B6：运营成效中心（outcome metrics / auto-verify / formula-adherence / 标记词编辑）
   { id: "quality", label: "运营成效", caption: "指标与质量", icon: Workflow }
 ];
@@ -1805,6 +1809,10 @@ export function App() {
 
         {activeChannel === "autonomy" && (
           <AutonomyLoopView accountId={currentAccountId} />
+        )}
+
+        {activeChannel === "evolution" && (
+          <EvolutionCenterView />
         )}
 
         {activeChannel === "quality" && (
@@ -4359,6 +4367,8 @@ function channelTitle(channel: Channel) {
       return "任务与日志";
     case "autonomy":
       return "自治回路监控";
+    case "evolution":
+      return "演化中心";
     case "quality":
       return "运营成效";
   }
@@ -4386,6 +4396,8 @@ function channelEyebrow(channel: Channel) {
       return "Execution Audit";
     case "autonomy":
       return "Autonomy Loop";
+    case "evolution":
+      return "Self Evolution";
     case "quality":
       return "Outcome & Quality";
   }
@@ -4413,6 +4425,8 @@ function channelSubtitle(channel: Channel) {
       return "追踪跟进任务、Agent 决策事件和系统执行结果。";
     case "autonomy":
       return "实时监控自治回路：修订触发率、AI 暂缓三类细分、未验证产品声明拦截、发送链路状态与最近修订记录。";
+    case "evolution":
+      return "查看自演化器产出的 experiments、阈值与 Prompt 候选、Shadow 评测与显著性结论；管理员二次确认后发布或回滚。";
     case "quality":
       return "用户回复率、对话深度等长期指标，知识切片自动校验，公式遵守度评测，产品声明兜底标记词管理。";
   }
@@ -5247,6 +5261,45 @@ function AutonomyLoopView({ accountId }: { accountId?: string }) {
         <ShieldCheck size={18} />
       </div>
       <AutonomyOutcomesTab accountId={accountId} />
+    </section>
+  );
+}
+
+// M4 W4 / Task 5.8：演化中心顶级频道。读 /api/health 的 evolutionEnabled 决定渲染
+// 真正的 EvolutionCenterTab 还是占位文案（演化器未启用时 worker 不 tick，experiments
+// 也会一直为空，但占位文案能让运营更明确知道原因）。
+function EvolutionCenterView() {
+  const [enabled, setEnabled] = useState<boolean | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    fetch("/api/health")
+      .then((r) => (r.ok ? r.json() : { evolutionEnabled: false }))
+      .then((d: { evolutionEnabled?: boolean }) => {
+        if (!cancelled) setEnabled(d.evolutionEnabled === true);
+      })
+      .catch(() => {
+        if (!cancelled) setEnabled(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  return (
+    <section className="qualityCenter">
+      <div className="panelHead compact">
+        <div>
+          <span>Self Evolution</span>
+          <h2>演化中心</h2>
+        </div>
+        <ShieldCheck size={18} />
+      </div>
+      {enabled === null ? (
+        <div className="evolutionEmpty">加载中…</div>
+      ) : (
+        <EvolutionCenterTab enabled={enabled} />
+      )}
     </section>
   );
 }
