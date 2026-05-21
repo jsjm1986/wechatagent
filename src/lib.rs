@@ -11,6 +11,7 @@ pub mod agent;
 pub mod config;
 pub mod db;
 pub mod error;
+pub mod evolution;
 pub mod llm;
 pub mod mcp;
 pub mod models;

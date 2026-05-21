@@ -80,6 +80,17 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
+    // agent-self-evolution M4 W1：演化器 worker。
+    // 关停态默认（`EVOLUTION_ENABLED=false`）；run_evolutionary_worker 内部
+    // 会立即 return，不消耗任何资源。打开后周期跑 cohort 选择 + 候选生成
+    // + shadow eval（W2/W3 落地后）。
+    {
+        let evolution_state = state.clone();
+        tokio::spawn(async move {
+            wechatagent::evolution::run_evolutionary_worker(evolution_state).await;
+        });
+    }
+
     let static_files = ServeDir::new("frontend/dist")
         .not_found_service(ServeFile::new("frontend/dist/index.html"));
     let app = Router::new()
