@@ -185,10 +185,52 @@ pub(super) async fn ensure_all(db: &Database) -> anyhow::Result<()> {
             None,
         )
         .await?;
+    // 知识标签快路径：inbound 子串匹配触发关键词时直接召回 chunk，
+    // 跳过/优先于 LLM Planner 选择。sparse 避免老文档无 trigger_keywords 时占索引空间。
+    db.operation_knowledge_chunks()
+        .create_index(
+            IndexModel::builder()
+                .keys(doc! { "workspace_id": 1, "account_id": 1, "trigger_keywords": 1 })
+                .options(
+                    IndexOptions::builder()
+                        .name("kchunks_trigger_keywords_idx".to_string())
+                        .sparse(true)
+                        .build(),
+                )
+                .build(),
+            None,
+        )
+        .await?;
     db.knowledge_usage_logs()
         .create_index(
             IndexModel::builder()
                 .keys(doc! { "workspace_id": 1, "account_id": 1, "contact_wxid": 1, "created_at": -1 })
+                .build(),
+            None,
+        )
+        .await?;
+    db.knowledge_chat_turns()
+        .create_index(
+            IndexModel::builder()
+                .keys(doc! { "workspace_id": 1, "account_id": 1, "session_id": 1, "turn_index": 1 })
+                .options(
+                    IndexOptions::builder()
+                        .name("kchat_turns_session_idx".to_string())
+                        .build(),
+                )
+                .build(),
+            None,
+        )
+        .await?;
+    db.knowledge_chat_turns()
+        .create_index(
+            IndexModel::builder()
+                .keys(doc! { "workspace_id": 1, "account_id": 1, "created_at": -1 })
+                .options(
+                    IndexOptions::builder()
+                        .name("kchat_turns_recent_idx".to_string())
+                        .build(),
+                )
                 .build(),
             None,
         )

@@ -17,7 +17,7 @@ use mongodb::{options::ClientOptions, Client, Collection, Database as MongoDatab
 use crate::models::{
     AgentCommandRun, AgentDecisionReview, AgentEvent, AgentOutcomeMetric, AgentRunLog, AgentSoul,
     AgentTask, AgentToolCall, Contact, ContentAsset, ConversationMessage, EvaluationScenario,
-    Experiment, KnowledgeUsageLog, LlmCallLog, ManagementAgentMessage, ManagementAgentSession,
+    Experiment, KnowledgeChatTurn, KnowledgeUsageLog, LlmCallLog, ManagementAgentMessage, ManagementAgentSession,
     McpCallLog, MemoryCandidate, MigrationRecord, OperatingMemory, OperationDomainConfig,
     OperationKnowledgeChunk, OperationKnowledgeDocument, OperationKnowledgeItem, OperationPlaybook,
     OutboxEntry, PostReleaseReview, PromptTemplate, Proposal, ShadowReplay, TaxonomyCandidate,
@@ -124,6 +124,10 @@ impl Database {
 
     pub fn knowledge_usage_logs(&self) -> Collection<KnowledgeUsageLog> {
         self.db.collection("knowledge_usage_logs")
+    }
+
+    pub fn knowledge_chat_turns(&self) -> Collection<KnowledgeChatTurn> {
+        self.db.collection("knowledge_chat_turns")
     }
 
     pub fn decision_reviews(&self) -> Collection<AgentDecisionReview> {

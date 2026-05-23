@@ -56,7 +56,7 @@ use contacts::{
     get_operating_memory, get_operation_health, import_contacts_endpoint,
     list_contact_memory_candidates, list_contacts, run_contact_memory_consolidation,
     search_contacts_endpoint, search_import_contacts, update_operating_memory,
-    update_operation_profile, update_profile_note,
+    update_operation_profile, update_profile_note, update_custom_agent_instructions,
 };
 use conversations::list_messages;
 use domains::{
@@ -75,19 +75,23 @@ use evolution::{
 use guides::{apply_user_operation_guide, preview_user_operation_guide};
 use health::health;
 use knowledge::{
-    auto_verify_operation_knowledge_chunks, create_operation_knowledge,
+    answer_chunk_repair, auto_verify_operation_knowledge_chunks, chat_apply, chat_discard,
+    chat_history, chat_turn, create_operation_knowledge,
     create_operation_knowledge_chunk, create_operation_knowledge_document,
     delete_operation_knowledge, delete_operation_knowledge_chunk,
     delete_operation_knowledge_document, get_operation_knowledge_catalog,
     get_operation_knowledge_chunk_source, get_operation_knowledge_completeness,
     get_operation_knowledge_document, get_operation_knowledge_integrity_report,
-    import_operation_knowledge_apply, import_operation_knowledge_preview, list_knowledge_usage,
+    extract_operation_knowledge_tags, import_operation_knowledge_apply,
+    import_operation_knowledge_preview, list_knowledge_usage,
     list_operation_knowledge, list_operation_knowledge_chunks,
     list_operation_knowledge_document_chunks, list_operation_knowledge_documents,
-    open_operation_knowledge_slices, refresh_operation_knowledge_completeness,
+    open_operation_knowledge_slices, propose_chunk_repair, propose_pack_repair,
+    record_repair_apply, refresh_operation_knowledge_completeness,
     reject_operation_knowledge_chunk, search_operation_knowledge_tool,
-    test_operation_knowledge_match, update_operation_knowledge, update_operation_knowledge_chunk,
-    update_operation_knowledge_document, verify_operation_knowledge_chunk,
+    test_operation_knowledge_match, update_operation_knowledge,
+    update_operation_knowledge_chunk, update_operation_knowledge_document,
+    verify_operation_knowledge_chunk,
 };
 use management::{
     create_management_session, get_management_command, get_tool_catalog, post_management_message,
@@ -136,6 +140,10 @@ pub fn api_router(state: AppState) -> Router<AppState> {
         .route("/contacts/:id/enable-agent", post(enable_agent))
         .route("/contacts/:id/disable-agent", post(disable_agent))
         .route("/contacts/:id/profile-note", put(update_profile_note))
+        .route(
+            "/contacts/:id/custom-agent-instructions",
+            put(update_custom_agent_instructions),
+        )
         .route(
             "/contacts/:id/operation-profile",
             put(update_operation_profile),
@@ -224,6 +232,14 @@ pub fn api_router(state: AppState) -> Router<AppState> {
             post(reject_operation_knowledge_chunk),
         )
         .route(
+            "/operation-knowledge/chunks/:id/repair",
+            post(propose_chunk_repair),
+        )
+        .route(
+            "/operation-knowledge/chunks/:id/repair/answer",
+            post(answer_chunk_repair),
+        )
+        .route(
             "/operation-knowledge/catalog",
             get(get_operation_knowledge_catalog),
         )
@@ -261,10 +277,35 @@ pub fn api_router(state: AppState) -> Router<AppState> {
             post(import_operation_knowledge_apply),
         )
         .route(
+            "/operation-knowledge/extract-tags",
+            post(extract_operation_knowledge_tags),
+        )
+        .route(
             "/operation-knowledge/test-match",
             post(test_operation_knowledge_match),
         )
         .route("/operation-knowledge/usage", get(list_knowledge_usage))
+        .route(
+            "/operation-knowledge/items/:id/repair",
+            post(propose_pack_repair),
+        )
+        .route(
+            "/operation-knowledge/repair/applied",
+            post(record_repair_apply),
+        )
+        .route("/operation-knowledge/chat", post(chat_turn))
+        .route(
+            "/operation-knowledge/chat/:session_id",
+            get(chat_history),
+        )
+        .route(
+            "/operation-knowledge/chat/:session_id/apply",
+            post(chat_apply),
+        )
+        .route(
+            "/operation-knowledge/chat/:session_id/discard",
+            post(chat_discard),
+        )
         .route(
             "/operation-knowledge/:id",
             put(update_operation_knowledge).delete(delete_operation_knowledge),

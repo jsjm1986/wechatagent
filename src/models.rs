@@ -81,9 +81,13 @@ pub struct Contact {
     pub nickname: Option<String>,
     pub remark: Option<String>,
     pub alias: Option<String>,
-    #[serde(default)]
     pub agent_status: AgentStatus,
     pub human_profile_note: Option<String>,
+    /// per-contact 运营人员特别指令（最高优先级 Operator Instruction 层）。
+    /// 注入到 user.reply system prompt 末位，覆盖 Soul + Policy 默认行为。
+    /// 上限 1000 字符，由 `PUT /api/contacts/:id/custom-agent-instructions` 维护。
+    #[serde(default)]
+    pub custom_agent_instructions: Option<String>,
     pub agent_profile: Option<AgentProfile>,
     pub memory_summary: Option<String>,
     pub playbook_id: Option<ObjectId>,
@@ -376,6 +380,9 @@ pub struct OperationKnowledgeItem {
     pub id: Option<ObjectId>,
     pub workspace_id: String,
     pub account_id: Option<String>,
+    /// 父文档 ObjectId（import-apply 时回填）。允许 None 兼容直接创建无原文档来源的 pack。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub document_id: Option<ObjectId>,
     pub domain: String,
     pub category: String,
     pub business_type: String,
@@ -409,6 +416,17 @@ pub struct OperationKnowledgeItem {
     pub common_objections: Vec<String>,
     #[serde(default)]
     pub evidence_items: Vec<String>,
+    /// 知识标签（≤5）：产品/品牌/解决方案名称，运行时用于关联和展示。
+    #[serde(default)]
+    pub product_tags: Vec<String>,
+    /// 触发关键词（≤8，含同义/口语化变体，存储为小写）：运行时关键词快路径
+    /// 用 `inbound.contains(kw.to_lowercase())` 进行子串匹配，命中即升档为
+    /// consultative 模式并强制注入对应 chunk 到 selected_chunks 头部。
+    #[serde(default)]
+    pub trigger_keywords: Vec<String>,
+    /// 业务主题（≤3）：本知识包属于哪个业务议题（产品定位/竞品对比/部署方式 ...）。
+    #[serde(default)]
+    pub business_topics: Vec<String>,
     pub source_type: String,
     pub source_name: Option<String>,
     pub status: String,
@@ -434,6 +452,15 @@ pub struct OperationKnowledgeDocument {
     pub routing_map: Vec<String>,
     #[serde(default)]
     pub risk_notes: Vec<String>,
+    /// 文档级聚合标签：等于其下所有 chunks 的 `product_tags` 去重并集（≤5）。
+    #[serde(default)]
+    pub product_tags: Vec<String>,
+    /// 文档级聚合关键词：所有 chunks 的 `trigger_keywords` 去重并集（≤8，全小写）。
+    #[serde(default)]
+    pub trigger_keywords: Vec<String>,
+    /// 文档级业务主题（≤3）：所有 chunks 的 `business_topics` 去重并集。
+    #[serde(default)]
+    pub business_topics: Vec<String>,
     pub raw_content: Option<String>,
     pub content_hash: Option<String>,
     #[serde(default)]
@@ -471,6 +498,18 @@ pub struct OperationKnowledgeChunk {
     pub forbidden_claims: Vec<String>,
     #[serde(default)]
     pub evidence_items: Vec<String>,
+    /// 知识标签（≤5）：产品/品牌/解决方案名称。LLM 在 import-preview 时自动抽取，
+    /// 后台可手动编辑。
+    #[serde(default)]
+    pub product_tags: Vec<String>,
+    /// 触发关键词（≤8，含同义/口语化变体，全小写）：运行时关键词快路径用
+    /// `inbound.contains(kw)` 子串匹配，命中即升档为 consultative 模式并把本
+    /// chunk 强制注入 `selected_chunks` 头部。LLM 输出空列表合法（仅辅助 chunk）。
+    #[serde(default)]
+    pub trigger_keywords: Vec<String>,
+    /// 业务主题（≤3）：本 chunk 属于哪个业务议题（产品定位/竞品对比/部署方式 ...）。
+    #[serde(default)]
+    pub business_topics: Vec<String>,
     pub source_quote: Option<String>,
     #[serde(default)]
     pub source_anchors: Vec<Document>,
@@ -505,6 +544,40 @@ pub struct KnowledgeUsageLog {
     pub blocked_reason: Option<String>,
     #[serde(default)]
     pub tool_trace: Vec<Document>,
+    pub created_at: DateTime,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KnowledgeChatTurn {
+    #[serde(rename = "_id", skip_serializing_if = "Option::is_none")]
+    pub id: Option<ObjectId>,
+    pub workspace_id: String,
+    pub account_id: String,
+    pub session_id: String,
+    /// 会话内单调递增的 turn 序号，从 1 开始；user / assistant 各占一个序号。
+    pub turn_index: i32,
+    /// "user" | "assistant"
+    pub role: String,
+    /// assistant 的 intent 分类；user 一般为空。
+    pub intent: Option<String>,
+    /// 自然语言内容；user 的输入或 assistant 的 naturalReply。
+    pub content: String,
+    /// 引用的切片 / 知识包，attachments 仅 ≤ 1 条。
+    #[serde(default)]
+    pub attachments: Vec<Document>,
+    /// assistant 起草的 chunk / pack patch，未应用前是预览。
+    pub patch: Option<Document>,
+    /// assistant 提示运营仍缺哪些字段。
+    #[serde(default)]
+    pub missing_fields: Vec<String>,
+    /// assistant 提出的追问列表（≤ 3 条）。
+    #[serde(default)]
+    pub followup_questions: Vec<Document>,
+    /// "pending" | "applied" | "discarded"
+    pub status: String,
+    /// 本轮 LLM 大致 token 消耗（用 BudgetSnapshot.tokens 累计）。
+    pub tokens_used: i64,
+    pub prompt_key: Option<String>,
     pub created_at: DateTime,
 }
 
@@ -640,6 +713,15 @@ pub struct AgentRunLog {
     /// R3 / R9：自治控制位 ∈ `auto / assisted / blocked`。
     #[serde(default)]
     pub autonomy_mode: String,
+    /// 对话模式（R-prompt-v3）：四模式人格切换 ∈
+    /// `casual_relationship / value_exchange / consultative / boundary_protection`。
+    /// 详见 docs/conversation-mode-design.md。
+    #[serde(default)]
+    pub conversation_mode: String,
+    /// `conversation_mode` 选定原因（如 `trigger_keywords_fastpath_hit`、
+    /// `customer_stage:proposal_evaluation` 等）。Optional：旧 run log 不带本字段。
+    #[serde(default)]
+    pub conversation_mode_reason: Option<String>,
     /// R9：最终归档状态（前端 horizon 聚合用）。允许枚举详见
     /// requirements.md "状态枚举映射表" finalReviewStatus 列。
     #[serde(default)]
@@ -961,6 +1043,16 @@ pub struct ProfileNoteRequest {
     pub human_profile_note: String,
 }
 
+/// 运营人员特别指令（最高优先级 Operator Instruction 层）写入请求体。
+/// `instructions` 上限 1000 字符，由 `PUT /api/contacts/:id/custom-agent-instructions`
+/// 路由维护。空字符串表示清空（落库为 null）。
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CustomAgentInstructionsRequest {
+    #[serde(default)]
+    pub instructions: String,
+}
+
 #[derive(Debug, Deserialize)]
 pub struct SearchImportRequest {
     pub query: String,
@@ -1034,6 +1126,7 @@ pub struct ApiContact {
     pub alias: Option<String>,
     pub agent_status: AgentStatus,
     pub human_profile_note: Option<String>,
+    pub custom_agent_instructions: Option<String>,
     pub agent_profile: Option<AgentProfile>,
     pub memory_summary: Option<String>,
     pub playbook_id: Option<String>,
@@ -1071,6 +1164,7 @@ impl From<Contact> for ApiContact {
             alias: contact.alias,
             agent_status: contact.agent_status,
             human_profile_note: contact.human_profile_note,
+            custom_agent_instructions: contact.custom_agent_instructions,
             agent_profile: contact.agent_profile,
             memory_summary: contact.memory_summary,
             playbook_id: contact.playbook_id.map(|id| id.to_hex()),
@@ -1322,13 +1416,15 @@ mod typed {
     ///   `#[serde(untagged)]` 包装：当前历史数据形态以 `String`（`Plain`）为主，
     ///   task 6.2 引入完整 [`MemoryFact`] 结构后会通过 `Structured(MemoryFact)`
     ///   分支落地，保证升级后的 round-trip 兼容性。
-    /// * `core_profile` / `relationship_state` 仍为 `Document`，承接历史
-    ///   "free-form 子文档"形态；这两块的强类型化属于后续优化范畴
-    ///   （task 6 之外），本任务保留 Document 以最小化 blast radius。
+    /// * `coreProfile` / `relationshipState` 等 free-form 子文档由 `extra`
+    ///   通过 `#[serde(flatten)]` 兜底承接（历史 wire shape 的 free-form
+    ///   sub-document 形态）。曾经 typed 出 `core_profile` / `relationship_state`
+    ///   两个字段会与 `extra` 同名键冲突，序列化产生重复 BSON 键导致下一次反序
+    ///   `Kind: duplicate field 'coreProfile'`。修复后只保留 `extra` 一份。
     /// * `extra: Document` 通过 `#[serde(flatten)]` 兜底，承接所有未在本结构
-    ///   显式声明的顶层字段（`preferences / doNotDo / commitments /
-    ///   objections / openLoops / recentEpisodeSummary / conflicts /
-    ///   source / version / coreFacts 旧字符串数组` 等），以保证：
+    ///   显式声明的顶层字段（`coreProfile / relationshipState / preferences /
+    ///   doNotDo / commitments / objections / openLoops / recentEpisodeSummary /
+    ///   conflicts / source / version / coreFacts 旧字符串数组` 等），以保证：
     ///   1) 历史 BSON 文档反序列化不丢字段；
     ///   2) Document 版 helper（如 `compact_memory_card_with_previous`）
     ///      仍可在 `to_document()` 之后无缝消费整张卡。
@@ -1336,20 +1432,16 @@ mod typed {
     #[serde(rename_all = "camelCase")]
     pub struct MemoryCardTyped {
         #[serde(default)]
-        pub core_profile: Document,
-        #[serde(default)]
-        pub relationship_state: Document,
-        #[serde(default)]
         pub core_facts: Vec<MemoryFactRepr>,
         #[serde(default)]
         pub recent_facts: Vec<MemoryFactRepr>,
         #[serde(default)]
         pub deprecated_facts: Vec<MemoryFactRepr>,
         /// `#[serde(flatten)]` catch-all：承接所有未在上述字段显式声明的顶层
-        /// 字段，避免历史数据丢失（如 `preferences / doNotDo / commitments /
-        /// objections / openLoops / recentEpisodeSummary / conflicts /
-        /// source / version`），并允许 task 6 之外的字段持续以 free-form
-        /// 形态共存。
+        /// 字段，避免历史数据丢失（如 `coreProfile / relationshipState /
+        /// preferences / doNotDo / commitments / objections / openLoops /
+        /// recentEpisodeSummary / conflicts / source / version`），并允许
+        /// 这些 free-form 子结构持续以 Document 形态共存。
         #[serde(flatten, default)]
         pub extra: Document,
     }
@@ -1602,9 +1694,7 @@ mod typed {
         /// 且 `extra` 也空时返回 true，便于既有 `if !memory.memory_card.is_empty()`
         /// 调用方零改动迁移。
         pub fn is_empty(&self) -> bool {
-            self.core_profile.is_empty()
-                && self.relationship_state.is_empty()
-                && self.core_facts.is_empty()
+            self.core_facts.is_empty()
                 && self.recent_facts.is_empty()
                 && self.deprecated_facts.is_empty()
                 && self.extra.is_empty()
@@ -2021,12 +2111,10 @@ mod typed_tests {
 
     #[test]
     fn memory_card_typed_default_is_empty_document_relationship() {
-        // task 6.1：relationship_state 现在是 Document（非 typed 子结构），
-        // default 应是空 Document。任何"unknown" 默认值由写入侧（如
-        // `memory_card_from_contact`）显式注入。
+        // task 6.1：`coreProfile` / `relationshipState` 现在统一通过 `extra`
+        // catch-all 承接（free-form Document 形态），typed 字段已删除以避免
+        // serde flatten 同名键冲突写出重复 BSON 键。default 应是空 extra。
         let card: MemoryCardTyped = mongodb::bson::from_document(doc! {}).expect("default");
-        assert!(card.relationship_state.is_empty());
-        assert!(card.core_profile.is_empty());
         assert!(card.core_facts.is_empty());
         assert!(card.recent_facts.is_empty());
         assert!(card.deprecated_facts.is_empty());
