@@ -1,13 +1,21 @@
 import {
   Activity,
+  AlertTriangle,
   Bot,
   BrainCircuit,
   CheckCircle2,
+  ChevronDown,
+  ChevronRight,
   Clock3,
+  Copy,
+  FileBox,
   FileText,
+  FlaskConical,
+  Inbox,
   LibraryBig,
   LayoutDashboard,
   MessageSquareText,
+  Package,
   RefreshCw,
   Search,
   SendHorizonal,
@@ -15,13 +23,17 @@ import {
   ShieldCheck,
   Sparkles,
   SquarePen,
+  Trash2,
   UploadCloud,
   UserRoundCheck,
+  User2,
   UsersRound,
-  Workflow
+  Workflow,
+  X
 } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
-import { FormEvent, useEffect, useMemo, useState } from "react";
+import { FormEvent, useEffect, useMemo, useRef, useState, KeyboardEvent, ClipboardEvent } from "react";
+import type * as React from "react";
 
 import { EvolutionCenterTab } from "./EvolutionCenterTab";
 
@@ -32,7 +44,6 @@ type SmartOpsTab = "cockpit" | "adjust" | "profile" | "memory" | "simulation" | 
 type TraditionalOpsTab = "playbooks" | "prompts" | "settings" | "audit";
 type UserOpsMode = "smart" | "traditional";
 type OpsTab = "tasks" | "events" | "reviews" | "llm";
-type KnowledgeTab = "documents" | "catalog" | "library" | "chunks" | "test" | "usage";
 
 type Account = {
   id: string;
@@ -62,6 +73,7 @@ type Contact = {
   alias?: string;
   agentStatus: AgentStatus;
   humanProfileNote?: string;
+  customAgentInstructions?: string | null;
   agentProfile?: AgentProfile;
   memorySummary?: string;
   playbookId?: string;
@@ -286,6 +298,9 @@ type OperationKnowledgeItem = {
   safeClaims: string[];
   forbiddenClaims: string[];
   evidenceItems: string[];
+  productTags?: string[];
+  triggerKeywords?: string[];
+  businessTopics?: string[];
   sourceType: string;
   sourceName?: string;
   status: string;
@@ -314,6 +329,9 @@ type OperationKnowledgeDraft = {
   safeClaims: string;
   forbiddenClaims: string;
   evidenceItems: string;
+  productTags: string;
+  triggerKeywords: string;
+  businessTopics: string;
   sourceName: string;
   status: string;
   priority: string;
@@ -322,12 +340,16 @@ type OperationKnowledgeDraft = {
 type OperationKnowledgeDocument = {
   id: string;
   title: string;
+  domain?: string;
   sourceType: string;
   sourceName?: string;
   summary?: string;
   catalogSummary?: string;
   routingMap: string[];
   riskNotes: string[];
+  productTags?: string[];
+  triggerKeywords?: string[];
+  businessTopics?: string[];
   rawContent?: string;
   contentHash?: string;
   lineIndex: Record<string, unknown>[];
@@ -340,6 +362,7 @@ type OperationKnowledgeChunk = {
   id: string;
   documentId?: string;
   itemId?: string;
+  domain?: string;
   knowledgeType?: string;
   businessContext?: string;
   title: string;
@@ -360,6 +383,10 @@ type OperationKnowledgeChunk = {
   verifiedClaims: string[];
   status: string;
   priority: number;
+  productTags?: string[];
+  triggerKeywords?: string[];
+  businessTopics?: string[];
+  interpretation?: Record<string, unknown>;
   updatedAt?: string;
 };
 
@@ -385,6 +412,41 @@ type OperationKnowledgeChunkDraft = {
   verifiedClaims: string;
   status: string;
   priority: string;
+  productTags: string;
+  triggerKeywords: string;
+  businessTopics: string;
+};
+
+type KnowledgeChatTurnView = {
+  turnIndex: number;
+  role: "user" | "assistant";
+  intent?: string | null;
+  content: string;
+  attachments?: Array<{ chunk_id?: string; item_id?: string }>;
+  patch?: Record<string, unknown> | null;
+  missingFields?: string[];
+  followupQuestions?: Array<{ id?: string; field?: string; question?: string }>;
+  status?: string;
+  tokensUsed?: number;
+  promptKey?: string | null;
+  createdAt?: string;
+};
+
+type KnowledgeChatTurnResponse = {
+  sessionId: string;
+  turnIndex: number;
+  intent: string;
+  naturalReply: string;
+  draftKind?: string | null;
+  draftPreview?: Record<string, unknown> | null;
+  missingFields: string[];
+  followupQuestions: Array<{ id?: string; field?: string; question?: string }>;
+  canApply: boolean;
+  targetChunkId?: string | null;
+  targetPackId?: string | null;
+  promptKey?: string | null;
+  tokensUsed: number;
+  budget?: Record<string, unknown>;
 };
 
 type OperationKnowledgeImportPreview = {
@@ -669,6 +731,15 @@ export function App() {
   const [knowledgeIntegrity, setKnowledgeIntegrity] = useState<KnowledgeIntegrityReport | null>(null);
   const [knowledgeCompleteness, setKnowledgeCompleteness] = useState<KnowledgeCompletenessReport | null>(null);
   const [chunkSource, setChunkSource] = useState<Record<string, unknown> | null>(null);
+  const [aiRepairTarget, setAiRepairTarget] = useState<{ kind: "chunk" | "pack"; id: string; label: string } | null>(null);
+  const [knowledgeChatOpen, setKnowledgeChatOpen] = useState(false);
+  const [knowledgeChatSessionId, setKnowledgeChatSessionId] = useState<string | undefined>(() => {
+    try {
+      return window.localStorage.getItem("wechatagent.knowledgeChatSessionId") || undefined;
+    } catch {
+      return undefined;
+    }
+  });
   const [knowledgeUsage, setKnowledgeUsage] = useState<KnowledgeUsageItem[]>([]);
   const [decisionReviews, setDecisionReviews] = useState<DecisionReview[]>([]);
   const [operatingMemory, setOperatingMemory] = useState<OperatingMemory | null>(null);
@@ -685,6 +756,7 @@ export function App() {
   const [query, setQuery] = useState("");
   const [importQuery, setImportQuery] = useState("");
   const [profileNote, setProfileNote] = useState("");
+  const [customAgentInstructions, setCustomAgentInstructions] = useState("");
   const [selectedPlaybookId, setSelectedPlaybookId] = useState("");
   const [assetDraft, setAssetDraft] = useState({ kind: "text", title: "", body: "", url: "", mediaId: "", usageScene: "" });
   const [soulDraft, setSoulDraft] = useState({ agentKind: "user", name: "", content: "" });
@@ -697,7 +769,17 @@ export function App() {
   const [editingChunkId, setEditingChunkId] = useState("");
   const [chunkDraft, setChunkDraft] = useState<OperationKnowledgeChunkDraft>(emptyChunkDraft());
   const [editingKnowledgeId, setEditingKnowledgeId] = useState("");
-  const [knowledgeTab, setKnowledgeTab] = useState<KnowledgeTab>("documents");
+  const [knowledgeSelectedNodeId, setKnowledgeSelectedNodeId] = useState<string | null>(null);
+  const [knowledgeExpandedNodes, setKnowledgeExpandedNodes] = useState<Set<string>>(new Set());
+  const [knowledgeTreeSearch, setKnowledgeTreeSearch] = useState("");
+  const [knowledgePackSubview, setKnowledgePackSubview] = useState<"overview" | "metadata" | "chunks">("overview");
+  const [knowledgeDebugDrawerOpen, setKnowledgeDebugDrawerOpen] = useState(false);
+  const [knowledgeWorkspaceMode, setKnowledgeWorkspaceMode] = useState<"selection" | "import">("selection");
+  const [knowledgeDocModal, setKnowledgeDocModal] = useState<
+    | { mode: "create"; title: string; sourceName: string; summary: string }
+    | { mode: "edit"; id: string; title: string; sourceName: string; summary: string }
+    | null
+  >(null);
   const [knowledgeImportSource, setKnowledgeImportSource] = useState("运营知识导入");
   const [knowledgeImportText, setKnowledgeImportText] = useState("");
   const [knowledgeImportPreview, setKnowledgeImportPreview] = useState<OperationKnowledgeImportPreview>({
@@ -707,6 +789,27 @@ export function App() {
   });
   const [knowledgeTestMessage, setKnowledgeTestMessage] = useState("客户问：你们能不能保证转化提升？有没有真实案例？");
   const [knowledgeTestResult, setKnowledgeTestResult] = useState<Record<string, unknown> | null>(null);
+  const knowledgeTree = useMemo(
+    () => buildKnowledgeTree(knowledgeDocuments, operationKnowledge, knowledgeChunks),
+    [knowledgeDocuments, operationKnowledge, knowledgeChunks]
+  );
+
+  useEffect(() => {
+    if (!knowledgeSelectedNodeId) return;
+    const ancestors = findAncestors(knowledgeTree, knowledgeSelectedNodeId);
+    if (!ancestors || !ancestors.length) return;
+    setKnowledgeExpandedNodes((prev) => {
+      let changed = false;
+      const next = new Set(prev);
+      for (const id of ancestors) {
+        if (!next.has(id)) {
+          next.add(id);
+          changed = true;
+        }
+      }
+      return changed ? next : prev;
+    });
+  }, [knowledgeSelectedNodeId, knowledgeTree]);
   const [generatePlaybookText, setGeneratePlaybookText] = useState("我们运营 AI 软件定制客户，希望像真实顾问朋友一样长期理解用户，在信任不受损的前提下自然推进需求沟通、方案确认和成交。");
   const [optimizePlaybookText, setOptimizePlaybookText] = useState("让方法更像真人朋友，减少营销感；对高意向用户更自然地主动推进；对沉默客户降低打扰频率。");
   const [commandDraft, setCommandDraft] = useState("把 AI应用开发 加入 Agent 运营列表，并生成一份克制、专业的运营备注");
@@ -813,6 +916,7 @@ export function App() {
   function hydrateSelected(contact: Contact | null, knownPlaybooks = playbooks) {
     setSelected(contact);
     setProfileNote(contact?.humanProfileNote ?? "");
+    setCustomAgentInstructions(contact?.customAgentInstructions ?? "");
     setSelectedPlaybookId(contact?.playbookId || knownPlaybooks.find((playbook) => playbook.isDefault)?.id || knownPlaybooks[0]?.id || "");
     setGuidePreview(null);
     setGuideInstruction("");
@@ -909,6 +1013,18 @@ export function App() {
       const data = await api.put<{ item: Contact }>(`/api/contacts/${selected.id}/profile-note`, {
         humanProfileNote: profileNote
       });
+      hydrateSelected(data.item);
+      await loadAll();
+    });
+  }
+
+  async function saveCustomAgentInstructions() {
+    if (!selected) return;
+    await run(async () => {
+      const data = await api.put<{ item: Contact }>(
+        `/api/contacts/${selected.id}/custom-agent-instructions`,
+        { instructions: customAgentInstructions }
+      );
       hydrateSelected(data.item);
       await loadAll();
     });
@@ -1242,7 +1358,7 @@ export function App() {
         chunks: data.chunks || [],
         integrityReport: data.integrityReport
       });
-      setKnowledgeTab("documents");
+      setKnowledgeWorkspaceMode("import");
     });
   }
 
@@ -1259,7 +1375,7 @@ export function App() {
       setKnowledgeImportPreview({ document: null, items: [], chunks: [] });
       setKnowledgeImportText("");
       await loadAll();
-      setKnowledgeTab("catalog");
+      setKnowledgeWorkspaceMode("selection");
     });
   }
 
@@ -1303,9 +1419,258 @@ export function App() {
     });
   }
 
+  async function createKnowledgeDocumentManual(body: {
+    title: string;
+    sourceName?: string;
+    summary?: string;
+    accountId?: string;
+  }) {
+    await run(async () => {
+      await api.post(`/api/operation-knowledge/documents`, {
+        title: body.title,
+        sourceName: body.sourceName,
+        summary: body.summary,
+        accountId: body.accountId ?? currentAccountId ?? undefined,
+        sourceType: "manual"
+      });
+      await loadAll();
+    });
+  }
+
+  async function updateKnowledgeDocumentMeta(
+    id: string,
+    body: {
+      title: string;
+      sourceName?: string;
+      summary?: string;
+      accountId?: string;
+    }
+  ) {
+    await run(async () => {
+      await api.put(`/api/operation-knowledge/documents/${id}`, {
+        title: body.title,
+        sourceName: body.sourceName,
+        summary: body.summary,
+        accountId: body.accountId ?? currentAccountId ?? undefined,
+        sourceType: "manual"
+      });
+      await loadAll();
+    });
+  }
+
+  async function listChunksByDocument(documentId: string): Promise<OperationKnowledgeChunk[]> {
+    const res = await api.get<{ items: OperationKnowledgeChunk[] }>(
+      `/api/operation-knowledge/documents/${documentId}/chunks`
+    );
+    return res?.items ?? [];
+  }
+
   async function verifyKnowledgeChunk(id: string) {
     await run(async () => {
       await api.post(`/api/operation-knowledge/chunks/${id}/verify`, {});
+      await loadAll();
+    });
+  }
+
+  async function postKnowledgeChatTurn(body: {
+    sessionId?: string;
+    accountId?: string;
+    content: string;
+    attachments?: Array<{ chunkId?: string; itemId?: string }>;
+  }): Promise<KnowledgeChatTurnResponse> {
+    return api.post<KnowledgeChatTurnResponse>("/api/operation-knowledge/chat", body);
+  }
+
+  async function getKnowledgeChatHistory(
+    sessionId: string
+  ): Promise<{ sessionId: string; items: KnowledgeChatTurnView[]; total: number }> {
+    return api.get<{ sessionId: string; items: KnowledgeChatTurnView[]; total: number }>(
+      `/api/operation-knowledge/chat/${encodeURIComponent(sessionId)}`
+    );
+  }
+
+  async function applyKnowledgeChat(
+    sessionId: string,
+    accountId?: string
+  ): Promise<{ ok: boolean; sessionId: string; intent: string; result: Record<string, unknown> }> {
+    return api.post(`/api/operation-knowledge/chat/${encodeURIComponent(sessionId)}/apply`, {
+      accountId
+    });
+  }
+
+  async function discardKnowledgeChat(
+    sessionId: string
+  ): Promise<{ ok: boolean; sessionId: string; discardedCount: number }> {
+    return api.post(`/api/operation-knowledge/chat/${encodeURIComponent(sessionId)}/discard`, {});
+  }
+
+  function openKnowledgeChat(sessionId?: string) {
+    if (sessionId) {
+      setKnowledgeChatSessionId(sessionId);
+      try {
+        window.localStorage.setItem("wechatagent.knowledgeChatSessionId", sessionId);
+      } catch {
+        /* ignore */
+      }
+    }
+    setKnowledgeChatOpen(true);
+  }
+
+  function closeKnowledgeChat(persistedSessionId?: string) {
+    setKnowledgeChatOpen(false);
+    if (persistedSessionId) {
+      setKnowledgeChatSessionId(persistedSessionId);
+      try {
+        window.localStorage.setItem("wechatagent.knowledgeChatSessionId", persistedSessionId);
+      } catch {
+        /* ignore */
+      }
+    }
+  }
+
+  function openKnowledgeDocCreateModal() {
+    setKnowledgeDocModal({ mode: "create", title: "", sourceName: "", summary: "" });
+  }
+
+  function openKnowledgeDocEditModal(doc: OperationKnowledgeDocument) {
+    setKnowledgeDocModal({
+      mode: "edit",
+      id: doc.id,
+      title: doc.title ?? "",
+      sourceName: doc.sourceName ?? "",
+      summary: doc.summary ?? ""
+    });
+  }
+
+  function closeKnowledgeDocModal() {
+    setKnowledgeDocModal(null);
+  }
+
+  async function submitKnowledgeDocModal() {
+    if (!knowledgeDocModal) return;
+    const title = knowledgeDocModal.title.trim();
+    if (!title) return;
+    const payload = {
+      title,
+      sourceName: knowledgeDocModal.sourceName.trim() || undefined,
+      summary: knowledgeDocModal.summary.trim() || undefined
+    };
+    if (knowledgeDocModal.mode === "create") {
+      await createKnowledgeDocumentManual(payload);
+    } else {
+      await updateKnowledgeDocumentMeta(knowledgeDocModal.id, payload);
+    }
+    setKnowledgeDocModal(null);
+  }
+
+  async function refreshKnowledgeCompleteness() {
+    await run(async () => {
+      const accountParam = currentAccountId ? `accountId=${encodeURIComponent(currentAccountId)}` : "";
+      await api.post(
+        `/api/operation-knowledge/completeness${accountParam ? `?${accountParam}` : ""}`,
+        {}
+      );
+      await loadAll();
+    });
+  }
+
+  async function extractTagsForChunk(chunkId: string) {
+    await run(async () => {
+      const result = await api.post<Record<string, unknown>>(
+        "/api/operation-knowledge/extract-tags",
+        {
+          accountId: currentAccountId || undefined,
+          chunkId
+        }
+      );
+      const merged = result?.["item"] as OperationKnowledgeChunk | undefined;
+      if (merged) {
+        setKnowledgeChunks((prev) =>
+          prev.map((c) => (c.id === merged.id ? { ...c, ...merged } : c))
+        );
+      }
+      await loadAll();
+    });
+  }
+
+  async function proposeChunkRepair(chunkId: string): Promise<Record<string, unknown>> {
+    return api.post<Record<string, unknown>>(
+      `/api/operation-knowledge/chunks/${chunkId}/repair`,
+      {}
+    );
+  }
+
+  async function answerChunkRepair(
+    chunkId: string,
+    body: {
+      sessionId?: string;
+      previousPatch?: Record<string, unknown> | null;
+      answers: Array<{ id: string; field?: string; text: string }>;
+      turn: number;
+    }
+  ): Promise<Record<string, unknown>> {
+    return api.post<Record<string, unknown>>(
+      `/api/operation-knowledge/chunks/${chunkId}/repair/answer`,
+      body
+    );
+  }
+
+  async function proposePackRepair(packId: string): Promise<Record<string, unknown>> {
+    return api.post<Record<string, unknown>>(
+      `/api/operation-knowledge/items/${packId}/repair`,
+      {}
+    );
+  }
+
+  async function applyAiRepairPatch(
+    target: { kind: "chunk" | "pack"; id: string },
+    patch: Record<string, unknown>,
+    options: { thenVerify?: boolean } = {},
+    auditMeta: AiRepairApplyAuditMeta = { acceptedFields: [], skippedFields: [] }
+  ) {
+    await run(async () => {
+      // 1) 把 patch 中 schema 没有容器的 `extras` 摘出来，仅作为审计用，不进 PUT。
+      const { extras, ...patchForPut } = (patch as Record<string, unknown>) ?? {};
+      if (target.kind === "chunk") {
+        const chunk = knowledgeChunks.find((c) => c.id === target.id);
+        if (!chunk) {
+          throw new Error("找不到目标切片");
+        }
+        const merged = mergeChunkPatch(chunk, patchForPut);
+        await api.put(`/api/operation-knowledge/chunks/${target.id}`, {
+          accountId: currentAccountId || undefined,
+          ...merged
+        });
+        if (options.thenVerify) {
+          await api.post(`/api/operation-knowledge/chunks/${target.id}/verify`, {});
+        }
+      } else {
+        const pack = operationKnowledge.find((p) => p.id === target.id);
+        if (!pack) {
+          throw new Error("找不到目标知识包");
+        }
+        const merged = mergePackPatch(pack, patchForPut);
+        await api.put(`/api/operation-knowledge/${target.id}`, merged);
+      }
+      // 2) 写一条"AI 修复落库"审计事件——闭合 propose → answer → applied 链路，
+      //    并把 extras（schema 暂无容器、本轮未持久化进业务字段的领域专属建议）
+      //    带进事件 details，便于后续审计回放与 extras 持久化方案落地。
+      try {
+        await api.post(`/api/operation-knowledge/repair/applied`, {
+          targetKind: target.kind,
+          targetId: target.id,
+          sessionId: auditMeta.sessionId ?? null,
+          turn: auditMeta.turn ?? null,
+          acceptedFields: auditMeta.acceptedFields ?? [],
+          skippedFields: auditMeta.skippedFields ?? [],
+          confidenceHint: auditMeta.confidenceHint ?? null,
+          extras: extras ?? null,
+          thenVerify: !!options.thenVerify
+        });
+      } catch (err) {
+        // 审计上报失败不影响业务落库；只在控制台留痕，不打断 UX。
+        console.warn("[ai-repair] applied event upload failed", err);
+      }
       await loadAll();
     });
   }
@@ -1423,11 +1788,16 @@ export function App() {
       safeClaims: (item.safeClaims || []).join("\n"),
       forbiddenClaims: (item.forbiddenClaims || []).join("\n"),
       evidenceItems: (item.evidenceItems || []).join("\n"),
+      productTags: (item.productTags || []).join(", "),
+      triggerKeywords: (item.triggerKeywords || []).join(", "),
+      businessTopics: (item.businessTopics || []).join(", "),
       sourceName: item.sourceName ?? "",
       status: item.status,
       priority: String(item.priority ?? 0)
     });
-    setKnowledgeTab("library");
+    setKnowledgeSelectedNodeId(`pack:${item.id}`);
+    setKnowledgePackSubview("metadata");
+    setKnowledgeWorkspaceMode("selection");
     setActiveChannel("knowledge");
   }
 
@@ -1439,7 +1809,8 @@ export function App() {
   function editChunk(item: OperationKnowledgeChunk) {
     setEditingChunkId(item.id);
     setChunkDraft(draftFromChunk(item));
-    setKnowledgeTab("chunks");
+    setKnowledgeSelectedNodeId(`chunk:${item.id}`);
+    setKnowledgeWorkspaceMode("selection");
     setActiveChannel("knowledge");
   }
 
@@ -1606,6 +1977,7 @@ export function App() {
                   operatingMemory={operatingMemory}
                   playbooks={playbooks}
                   profileNote={profileNote}
+                  customAgentInstructions={customAgentInstructions}
                   selected={selected}
                   selectedPlaybookId={selectedPlaybookId}
                   simulationBusy={simulationBusy}
@@ -1618,9 +1990,11 @@ export function App() {
                   onGuideInstruction={setGuideInstruction}
                   onPreviewGuide={(instruction) => void previewGuideInstruction(instruction)}
                   onProfileNote={setProfileNote}
+                  onCustomAgentInstructions={setCustomAgentInstructions}
                   onRunMemoryConsolidation={() => void runMemoryConsolidation()}
                   onRunSimulation={() => void runDialogueSimulation()}
                   onSaveProfileNote={() => void saveProfileNote()}
+                  onSaveCustomAgentInstructions={() => void saveCustomAgentInstructions()}
                   onSelectedPlaybook={setSelectedPlaybookId}
                   onSimulationInput={setSimulationInput}
                   onTab={setSmartOpsTab}
@@ -1709,7 +2083,6 @@ export function App() {
         {activeChannel === "knowledge" && (
           <OperationKnowledgeView
             busy={busy}
-            currentAccountId={currentAccountId}
             catalog={knowledgeCatalog}
             completeness={knowledgeCompleteness}
             chunkDraft={chunkDraft}
@@ -1727,7 +2100,47 @@ export function App() {
             testMessage={knowledgeTestMessage}
             testResult={knowledgeTestResult}
             usage={knowledgeUsage}
-            activeTab={knowledgeTab}
+            tree={knowledgeTree}
+            selectedNodeId={knowledgeSelectedNodeId}
+            expandedNodes={knowledgeExpandedNodes}
+            treeSearch={knowledgeTreeSearch}
+            packSubview={knowledgePackSubview}
+            workspaceMode={knowledgeWorkspaceMode}
+            debugDrawerOpen={knowledgeDebugDrawerOpen}
+            onSelectNode={setKnowledgeSelectedNodeId}
+            onToggleNode={(id) => {
+              setKnowledgeExpandedNodes((prev) => {
+                const next = new Set(prev);
+                if (next.has(id)) next.delete(id);
+                else next.add(id);
+                return next;
+              });
+              if (id.startsWith("doc:")) {
+                const docId = id.slice(4);
+                void listChunksByDocument(docId)
+                  .then((chunks) => {
+                    if (!chunks.length) return;
+                    setKnowledgeChunks((prev) => {
+                      const byId = new Map(prev.map((c) => [c.id, c]));
+                      for (const c of chunks) byId.set(c.id, c);
+                      return Array.from(byId.values());
+                    });
+                  })
+                  .catch(() => {
+                    /* per-doc 拉取失败不阻塞 UI */
+                  });
+              }
+            }}
+            onCollapseAll={() => setKnowledgeExpandedNodes(new Set())}
+            onTreeSearch={setKnowledgeTreeSearch}
+            onPackSubview={setKnowledgePackSubview}
+            onWorkspaceMode={setKnowledgeWorkspaceMode}
+            onOpenDebugDrawer={() => setKnowledgeDebugDrawerOpen(true)}
+            onCloseDebugDrawer={() => setKnowledgeDebugDrawerOpen(false)}
+            onOpenChat={() => openKnowledgeChat()}
+            onOpenCreateDocModal={openKnowledgeDocCreateModal}
+            onOpenEditDocModal={openKnowledgeDocEditModal}
+            onRefreshCompleteness={() => void refreshKnowledgeCompleteness()}
             onApplyImport={() => void applyKnowledgeImport()}
             onChunkDraft={setChunkDraft}
             onCreateKnowledge={createKnowledge}
@@ -1748,9 +2161,10 @@ export function App() {
             onRunTest={() => void runKnowledgeTest()}
             onSaveKnowledgeChunk={saveKnowledgeChunk}
             onSaveKnowledge={saveKnowledge}
-            onTab={setKnowledgeTab}
             onTestMessage={setKnowledgeTestMessage}
             onVerifyChunk={(id) => void verifyKnowledgeChunk(id)}
+            onAiRepair={(target) => setAiRepairTarget(target)}
+            onExtractTags={(id) => void extractTagsForChunk(id)}
           />
         )}
 
@@ -1819,6 +2233,39 @@ export function App() {
           <QualityCenterView accountId={currentAccountId} />
         )}
       </main>
+      {aiRepairTarget && (
+        <AiRepairPanel
+          target={aiRepairTarget}
+          chunks={knowledgeChunks}
+          packs={operationKnowledge}
+          onClose={() => setAiRepairTarget(null)}
+          proposeChunk={proposeChunkRepair}
+          answerChunk={answerChunkRepair}
+          proposePack={proposePackRepair}
+          onApply={applyAiRepairPatch}
+        />
+      )}
+      <KnowledgeChatPanel
+        open={knowledgeChatOpen}
+        initialSessionId={knowledgeChatSessionId}
+        accountId={currentAccountId || undefined}
+        onClose={(sid) => closeKnowledgeChat(sid)}
+        onApplied={() => {
+          void loadAll();
+        }}
+        postTurn={postKnowledgeChatTurn}
+        getHistory={getKnowledgeChatHistory}
+        apply={applyKnowledgeChat}
+        discard={discardKnowledgeChat}
+      />
+      {knowledgeDocModal && (
+        <KnowledgeDocumentModal
+          state={knowledgeDocModal}
+          onChange={setKnowledgeDocModal}
+          onClose={closeKnowledgeDocModal}
+          onSubmit={() => void submitKnowledgeDocModal()}
+        />
+      )}
     </div>
   );
 }
@@ -2064,6 +2511,7 @@ function UserOperationCockpit({
   operatingMemory,
   playbooks,
   profileNote,
+  customAgentInstructions,
   selected,
   selectedPlaybookId,
   simulationBusy,
@@ -2076,9 +2524,11 @@ function UserOperationCockpit({
   onGuideInstruction,
   onPreviewGuide,
   onProfileNote,
+  onCustomAgentInstructions,
   onRunMemoryConsolidation,
   onRunSimulation,
   onSaveProfileNote,
+  onSaveCustomAgentInstructions,
   onSelectedPlaybook,
   onSimulationInput,
   onTab
@@ -2097,6 +2547,7 @@ function UserOperationCockpit({
   operatingMemory: OperatingMemory | null;
   playbooks: OperationPlaybook[];
   profileNote: string;
+  customAgentInstructions: string;
   selected: Contact | null;
   selectedPlaybookId: string;
   simulationBusy: boolean;
@@ -2109,9 +2560,11 @@ function UserOperationCockpit({
   onGuideInstruction: (value: string) => void;
   onPreviewGuide: (instruction: string) => void;
   onProfileNote: (value: string) => void;
+  onCustomAgentInstructions: (value: string) => void;
   onRunMemoryConsolidation: () => void;
   onRunSimulation: () => void;
   onSaveProfileNote: () => void;
+  onSaveCustomAgentInstructions: () => void;
   onSelectedPlaybook: (value: string) => void;
   onSimulationInput: (value: string) => void;
   onTab: (tab: SmartOpsTab) => void;
@@ -2319,6 +2772,23 @@ function UserOperationCockpit({
               placeholder="写这个人是谁、喜欢什么沟通方式、哪些话题不要碰、下一步希望推进什么。"
             />
           </label>
+          <label>
+            <span>运营人员特别指令（最高优先级，可空）</span>
+            <textarea
+              value={customAgentInstructions}
+              maxLength={1000}
+              rows={5}
+              onChange={(event) => onCustomAgentInstructions(event.target.value)}
+              placeholder="例：这个客户已签约老客户，不要主动推销，只服务问题。Agent 将在每轮对话最末尾读取这段指令。"
+            />
+            <span className="counter">{customAgentInstructions.length} / 1000</span>
+            {selected.agentStatus === "managed" && (
+              <button className="secondary" onClick={onSaveCustomAgentInstructions} disabled={busy} type="button">
+                <SquarePen size={16} />
+                保存特别指令
+              </button>
+            )}
+          </label>
           <div className="buttonRow">
             {selected.agentStatus === "managed" ? (
               <>
@@ -2407,15 +2877,8 @@ function UserOperationCockpit({
 
       {activeTab === "conversation" && (
         <section className="smartTabPanel conversationGrid">
-          <div className="messageList smartMessages">
-            {messages.map((message) => (
-              <div key={message.id} className={`message ${message.direction}`}>
-                <p>{message.content}</p>
-                <span>{formatTime(message.createdAt)}</span>
-              </div>
-            ))}
-            {!messages.length && <EmptyInline text="暂无会话记录" />}
-          </div>
+          <ConversationStream messages={messages} />
+
           <div className="reviewList">
             <div className="sectionCaption">最近复盘</div>
             {decisionReviews.slice(0, 4).map((review) => (
@@ -2830,49 +3293,76 @@ function OperationsView({
       </div>
 
       {opsTab === "tasks" && (
-        <table className="dataTable">
-          <tbody>
-            {tasks.map((task) => (
-              <tr key={task.id}>
-                <td>{task.status}</td>
-                <td>{task.content}</td>
-                <td>{formatTime(task.runAt)}</td>
+        tasks.length === 0 ? (
+          <EmptyInline text="暂无跟进任务" />
+        ) : (
+          <table className="dataTable">
+            <thead>
+              <tr>
+                <th>状态</th>
+                <th>任务内容</th>
+                <th>计划执行</th>
               </tr>
-            ))}
-          </tbody>
-        </table>
+            </thead>
+            <tbody>
+              {tasks.map((task) => (
+                <tr key={task.id}>
+                  <td>{task.status}</td>
+                  <td>{task.content}</td>
+                  <td>{formatTime(task.runAt)}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )
       )}
 
       {opsTab === "events" && (
-        <table className="dataTable">
-          <tbody>
-            {events.map((event) => (
-              <tr key={event.id}>
-                <td>{event.kind}</td>
-                <td>{event.summary}</td>
-                <td>{event.status}</td>
-                <td>{formatTime(event.createdAt)}</td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
+        events.length === 0 ? (
+          <EmptyInline text="暂无运营事件" />
+        ) : (
+          <EventTimeline
+            items={events.map((event) => ({
+              id: event.id,
+              tone: eventTone(event.status),
+              title: event.kind,
+              subtitle: event.summary,
+              meta: formatTime(event.createdAt),
+              chips: event.status ? [event.status] : undefined,
+            }))}
+          />
+        )
       )}
 
       {opsTab === "reviews" && (
-        <table className="dataTable">
-          <tbody>
-            {decisionReviews.map((review) => (
-              <tr key={review.id}>
-                <td>{review.approved ? "通过" : "拦截"}</td>
-                <td>{nextBestActionLabel(review.nextBestAction)}</td>
-                <td>{review.outcomeStatus || "pending"}</td>
-                <td>{formatScores(review.scores)}</td>
-                <td>{review.reviewSummary || review.replyText || "-"}</td>
-                <td>{formatTime(review.createdAt)}</td>
+        decisionReviews.length === 0 ? (
+          <EmptyInline text="暂无 Review 记录" />
+        ) : (
+          <table className="dataTable">
+            <thead>
+              <tr>
+                <th>结论</th>
+                <th>下一步</th>
+                <th>结果</th>
+                <th>评分</th>
+                <th>摘要</th>
+                <th>时间</th>
               </tr>
-            ))}
-          </tbody>
-        </table>
+            </thead>
+            <tbody>
+              {decisionReviews.map((review) => (
+                <tr key={review.id}>
+                  <td>{review.approved ? "通过" : "拦截"}</td>
+                  <td>{nextBestActionLabel(review.nextBestAction)}</td>
+                  <td>{review.outcomeStatus || "pending"}</td>
+                  <td>{formatScores(review.scores)}</td>
+                  <td>{review.reviewSummary || review.replyText || "-"}</td>
+                  <td>{formatTime(review.createdAt)}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )
       )}
 
       {opsTab === "llm" && (
@@ -2895,20 +3385,34 @@ function OperationsView({
               <p>{Math.round((llmUsage?.summary.promptCacheHitRate ?? 0) * 100)}%</p>
             </div>
           </div>
-          <table className="dataTable">
-            <tbody>
-              {(llmUsage?.items || []).map((item) => (
-                <tr key={item.id}>
-                  <td>{item.promptKey}</td>
-                  <td>{item.status}</td>
-                  <td>{item.latencyMs}ms</td>
-                  <td>hit {item.promptCacheHitTokens}</td>
-                  <td>miss {item.promptCacheMissTokens}</td>
-                  <td>{formatTime(item.createdAt)}</td>
+          {(llmUsage?.items || []).length === 0 ? (
+            <EmptyInline text="暂无 LLM 调用记录" />
+          ) : (
+            <table className="dataTable">
+              <thead>
+                <tr>
+                  <th>Prompt Key</th>
+                  <th>状态</th>
+                  <th>耗时</th>
+                  <th>命中</th>
+                  <th>未命中</th>
+                  <th>时间</th>
                 </tr>
-              ))}
-            </tbody>
-          </table>
+              </thead>
+              <tbody>
+                {(llmUsage?.items || []).map((item) => (
+                  <tr key={item.id}>
+                    <td>{item.promptKey}</td>
+                    <td>{item.status}</td>
+                    <td>{item.latencyMs}ms</td>
+                    <td>hit {item.promptCacheHitTokens}</td>
+                    <td>miss {item.promptCacheMissTokens}</td>
+                    <td>{formatTime(item.createdAt)}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          )}
         </section>
       )}
     </section>
@@ -2997,7 +3501,6 @@ function ContentAssetsView({
 }
 
 function OperationKnowledgeView({
-  activeTab,
   busy,
   catalog,
   completeness,
@@ -3016,6 +3519,25 @@ function OperationKnowledgeView({
   testMessage,
   testResult,
   usage,
+  tree,
+  selectedNodeId,
+  expandedNodes,
+  treeSearch,
+  packSubview,
+  workspaceMode,
+  debugDrawerOpen,
+  onSelectNode,
+  onToggleNode,
+  onCollapseAll,
+  onTreeSearch,
+  onPackSubview,
+  onWorkspaceMode,
+  onOpenDebugDrawer,
+  onCloseDebugDrawer,
+  onOpenChat,
+  onOpenCreateDocModal,
+  onOpenEditDocModal,
+  onRefreshCompleteness,
   onApplyImport,
   onChunkDraft,
   onCreateKnowledge,
@@ -3036,13 +3558,12 @@ function OperationKnowledgeView({
   onRunTest,
   onSaveKnowledgeChunk,
   onSaveKnowledge,
-  onTab,
   onTestMessage,
-  onVerifyChunk
+  onVerifyChunk,
+  onAiRepair,
+  onExtractTags
 }: {
-  activeTab: KnowledgeTab;
   busy: boolean;
-  currentAccountId: string;
   catalog: Record<string, unknown> | null;
   completeness: KnowledgeCompletenessReport | null;
   chunkDraft: OperationKnowledgeChunkDraft;
@@ -3060,6 +3581,25 @@ function OperationKnowledgeView({
   testMessage: string;
   testResult: Record<string, unknown> | null;
   usage: KnowledgeUsageItem[];
+  tree: TreeNode[];
+  selectedNodeId: string | null;
+  expandedNodes: Set<string>;
+  treeSearch: string;
+  packSubview: "overview" | "metadata" | "chunks";
+  workspaceMode: "selection" | "import";
+  debugDrawerOpen: boolean;
+  onSelectNode: (id: string | null) => void;
+  onToggleNode: (id: string) => void;
+  onCollapseAll: () => void;
+  onTreeSearch: (value: string) => void;
+  onPackSubview: (sub: "overview" | "metadata" | "chunks") => void;
+  onWorkspaceMode: (mode: "selection" | "import") => void;
+  onOpenDebugDrawer: () => void;
+  onCloseDebugDrawer: () => void;
+  onOpenChat: () => void;
+  onOpenCreateDocModal: () => void;
+  onOpenEditDocModal: (doc: OperationKnowledgeDocument) => void;
+  onRefreshCompleteness: () => void;
   onApplyImport: () => void;
   onChunkDraft: (draft: OperationKnowledgeChunkDraft) => void;
   onCreateKnowledge: (event: FormEvent) => void;
@@ -3080,14 +3620,15 @@ function OperationKnowledgeView({
   onRunTest: () => void;
   onSaveKnowledgeChunk: (event: FormEvent) => void;
   onSaveKnowledge: (event: FormEvent) => void;
-  onTab: (tab: KnowledgeTab) => void;
   onTestMessage: (value: string) => void;
   onVerifyChunk: (id: string) => void;
+  onAiRepair: (target: { kind: "chunk" | "pack"; id: string; label: string }) => void;
+  onExtractTags: (chunkId: string) => void;
 }) {
   const activeChunks = chunks.filter((item) => item.status === "active").length;
   const verifiedChunks = chunks.filter((item) => item.integrityStatus === "verified").length;
   const evidenceItems = chunks.filter((item) => item.evidenceItems.length > 0).length;
-  const previewCount = (importPreview.document ? 1 : 0) + importPreview.items.length + importPreview.chunks.length;
+
   return (
     <section className="knowledgeWorkspace">
       <section className="knowledgeHeader panel">
@@ -3102,6 +3643,17 @@ function OperationKnowledgeView({
           <div><strong>{activeChunks}</strong><span>切片启用</span></div>
           <div><strong>{verifiedChunks}/{evidenceItems}</strong><span>已验证/证据</span></div>
         </div>
+        <div className="knowledgeWorkspaceHeadActions">
+          <button type="button" className="primary" onClick={onOpenChat}>
+            <MessageSquareText size={14} /> 与 AI 对话补完
+          </button>
+          <button type="button" className="secondary" onClick={onOpenCreateDocModal}>
+            <FileText size={14} /> 手动新建文档
+          </button>
+          <button type="button" className="secondary" onClick={onOpenDebugDrawer}>
+            <FlaskConical size={14} /> 运行命中测试
+          </button>
+        </div>
       </section>
 
       {completeness && (
@@ -3115,167 +3667,701 @@ function OperationKnowledgeView({
             <span>verified {completeness.verifiedChunks}</span>
             <span>anchors {completeness.anchoredChunks}</span>
             <span>evidence {completeness.evidenceChunks}</span>
+            <button
+              type="button"
+              className="iconButton"
+              aria-label="重算完整度"
+              title="重算完整度"
+              onClick={onRefreshCompleteness}
+            >
+              <RefreshCw size={14} />
+            </button>
           </div>
         </section>
       )}
 
-      <div className="segmented knowledgeTabs">
-        <button className={activeTab === "documents" ? "active" : ""} onClick={() => onTab("documents")}>
-          <UploadCloud size={15} /> 文档
-        </button>
-        <button className={activeTab === "catalog" ? "active" : ""} onClick={() => onTab("catalog")}>
-          <Workflow size={15} /> AI 目录
-        </button>
-        <button className={activeTab === "library" ? "active" : ""} onClick={() => onTab("library")}>
-          <LibraryBig size={15} /> 知识包
-        </button>
-        <button className={activeTab === "chunks" ? "active" : ""} onClick={() => onTab("chunks")}>
-          <FileText size={15} /> 切片与证据
-        </button>
-        <button className={activeTab === "test" ? "active" : ""} onClick={() => onTab("test")}>
-          <Search size={15} /> 命中测试
-        </button>
-        <button className={activeTab === "usage" ? "active" : ""} onClick={() => onTab("usage")}>
-          <ShieldCheck size={15} /> 使用日志
-        </button>
+      <div className="knowledgeMaster">
+        <KnowledgeTreeSidebar
+          tree={tree}
+          selectedNodeId={selectedNodeId}
+          expandedNodes={expandedNodes}
+          search={treeSearch}
+          workspaceMode={workspaceMode}
+          documents={documents}
+          onSelect={(id) => {
+            onSelectNode(id);
+            onWorkspaceMode("selection");
+          }}
+          onToggle={onToggleNode}
+          onCollapseAll={onCollapseAll}
+          onSearch={onTreeSearch}
+          onImportClick={() => {
+            onSelectNode(null);
+            onWorkspaceMode("import");
+          }}
+          onEditDocument={onOpenEditDocModal}
+        />
+        <KnowledgeWorkspaceRouter
+          tree={tree}
+          selectedNodeId={selectedNodeId}
+          workspaceMode={workspaceMode}
+          packSubview={packSubview}
+          documents={documents}
+          knowledge={knowledge}
+          chunks={chunks}
+          catalog={catalog}
+          integrityReport={integrityReport}
+          importPreview={importPreview}
+          importSource={importSource}
+          importText={importText}
+          knowledgeDraft={knowledgeDraft}
+          chunkDraft={chunkDraft}
+          chunkSource={chunkSource}
+          editingKnowledgeId={editingKnowledgeId}
+          editingChunkId={editingChunkId}
+          busy={busy}
+          onPackSubview={onPackSubview}
+          onSelectNode={onSelectNode}
+          onWorkspaceMode={onWorkspaceMode}
+          onEditKnowledge={onEditKnowledge}
+          onEditChunk={onEditChunk}
+          onDeleteDocument={onDeleteDocument}
+          onDeleteKnowledge={onDeleteKnowledge}
+          onDeleteKnowledgeChunk={onDeleteKnowledgeChunk}
+          onCreateKnowledge={onCreateKnowledge}
+          onSaveKnowledge={onSaveKnowledge}
+          onCreateKnowledgeChunk={onCreateKnowledgeChunk}
+          onSaveKnowledgeChunk={onSaveKnowledgeChunk}
+          onChunkDraft={onChunkDraft}
+          onKnowledgeDraft={onKnowledgeDraft}
+          onLoadChunkSource={onLoadChunkSource}
+          onNewKnowledge={onNewKnowledge}
+          onNewChunk={onNewChunk}
+          onRejectChunk={onRejectChunk}
+          onVerifyChunk={onVerifyChunk}
+          onAiRepair={onAiRepair}
+          onImportSource={onImportSource}
+          onImportText={onImportText}
+          onPreviewImport={onPreviewImport}
+          onApplyImport={onApplyImport}
+        />
       </div>
 
-      {activeTab === "documents" && (
-        <section className="knowledgeImportGrid">
-          <section className="panel assetForm">
-            <div className="panelHead">
-              <div>
-                <span>Text / Markdown</span>
-                <h2>导入文档并生成渐进式目录</h2>
-              </div>
-            </div>
-            <label>
-              <span>来源名称</span>
-              <input value={importSource} onChange={(event) => onImportSource(event.target.value)} />
-            </label>
-            <label>
-              <span>文档内容</span>
-              <textarea
-                className="largeTextArea"
-                value={importText}
-                onChange={(event) => onImportText(event.target.value)}
-                placeholder="粘贴产品说明、服务边界、FAQ、案例证据或运营 SOP。第一版支持文本和 Markdown。"
-              />
-            </label>
-            <div className="buttonRow">
-              <button type="button" onClick={onPreviewImport} disabled={busy || !importText.trim()}>
-                AI 生成目录和切片
-              </button>
-              <button type="button" className="secondary" onClick={onApplyImport} disabled={busy || !previewCount}>
-                确认入库
-              </button>
-            </div>
-          </section>
-          <section className="panel">
-            <div className="panelHead">
-              <div>
-                <span>Preview</span>
-                <h2>AI 结构化预览</h2>
-              </div>
-            </div>
-            <div className="assetList">
-              {importPreview.document && (
-                <div className="assetRow">
-                  <strong>{importPreview.document.title}</strong>
-                  <span>文档目录 / {importPreview.document.status}</span>
-                  <p>{importPreview.document.catalogSummary || importPreview.document.summary || "已生成文档入口"}</p>
-                </div>
-              )}
-              {importPreview.integrityReport && (
-                <div className="assetRow integritySummary">
-                  <strong>完整性校验</strong>
-                  <span>
-                    verified {String(importPreview.integrityReport.verified ?? 0)} / needs review {String(importPreview.integrityReport.needsReview ?? 0)}
-                  </span>
-                  <p>切片必须能追溯原文。未通过校验的切片入库后默认不会作为事实依据自动启用。</p>
-                </div>
-              )}
-              {importPreview.items.map((item, index) => (
-                <button key={`${item.title}-${index}`} className="assetRow selectable" onClick={() => {
-                  onNewKnowledge();
-                  onKnowledgeDraft(draftFromKnowledge(item));
-                  onTab("library");
-                }}>
-                  <strong>{item.title}</strong>
-                  <span>{item.knowledgeType || item.category} / {item.businessContext || item.businessType}</span>
-                  <p>{item.routingCard || item.summary || item.safeClaims.join(" / ")}</p>
-                </button>
-              ))}
-              {importPreview.chunks.map((item, index) => (
-                <button key={`${item.title}-chunk-${index}`} className="assetRow selectable" onClick={() => {
-                  onNewChunk();
-                  onChunkDraft(draftFromChunk(item));
-                  onTab("chunks");
-                }}>
-                  <strong>{item.title}</strong>
-                  <span>切片 / {item.knowledgeType || "AI 生成"} / {item.evidenceItems.length ? "含证据" : "无证据"}</span>
-                  <p>{item.routingCard || item.summary || item.body || "等待确认"}</p>
-                </button>
-              ))}
-              {!previewCount && <EmptyInline text="等待导入预览" />}
-            </div>
-          </section>
-        </section>
-      )}
+      <KnowledgeDebugDrawer
+        open={debugDrawerOpen}
+        onClose={onCloseDebugDrawer}
+        busy={busy}
+        testMessage={testMessage}
+        testResult={testResult}
+        usage={usage}
+        onTestMessage={onTestMessage}
+        onRunTest={onRunTest}
+      />
+    </section>
+  );
+}
 
-      {activeTab === "catalog" && (
-        <section className="knowledgeImportGrid">
-          <section className="panel">
-            <div className="panelHead">
-              <div>
-                <span>Documents</span>
-                <h2>文档目录</h2>
-              </div>
-            </div>
-            <div className="assetList">
-              {documents.map((item) => (
-                <div key={item.id} className="assetRow">
-                  <strong>{item.title}</strong>
-                  <span>{item.sourceName || item.sourceType} / {item.status}</span>
-                  <p>{item.catalogSummary || item.summary || item.routingMap.join(" / ")}</p>
-                  <div className="buttonRow compactActions">
-                    <button type="button" className="secondary compactButton" onClick={() => onDeleteDocument(item.id)} disabled={busy}>删除文档</button>
-                  </div>
-                </div>
-              ))}
-              {!documents.length && <EmptyInline text="暂无文档目录" />}
-            </div>
-          </section>
-          <section className="panel">
-            <div className="panelHead">
-              <div>
-                <span>Catalog JSON</span>
-                <h2>Agent 可见目录</h2>
-              </div>
-            </div>
-            <pre className="jsonPreview">{JSON.stringify(catalog || {}, null, 2)}</pre>
-          </section>
-        </section>
-      )}
+function KnowledgeTreeSidebar({
+  tree,
+  selectedNodeId,
+  expandedNodes,
+  search,
+  workspaceMode,
+  documents,
+  onSelect,
+  onToggle,
+  onCollapseAll,
+  onSearch,
+  onImportClick,
+  onEditDocument
+}: {
+  tree: TreeNode[];
+  selectedNodeId: string | null;
+  expandedNodes: Set<string>;
+  search: string;
+  workspaceMode: "selection" | "import";
+  documents: OperationKnowledgeDocument[];
+  onSelect: (id: string) => void;
+  onToggle: (id: string) => void;
+  onCollapseAll: () => void;
+  onSearch: (value: string) => void;
+  onImportClick: () => void;
+  onEditDocument: (doc: OperationKnowledgeDocument) => void;
+}) {
+  const filterMatch = (node: TreeNode): boolean => {
+    if (!search.trim()) return true;
+    const q = search.trim().toLowerCase();
+    if (node.label.toLowerCase().includes(q)) return true;
+    if (node.meta && node.meta.toLowerCase().includes(q)) return true;
+    if (node.badges && node.badges.some((b) => b.text.toLowerCase().includes(q))) return true;
+    if (node.children) return node.children.some(filterMatch);
+    return false;
+  };
 
-      {activeTab === "library" && (
-        <section className="splitWorkspace embedded">
-          <section>
-            <div className="assetList">
-              {knowledge.map((item) => (
-                <button
-                  key={item.id}
-                  className={editingKnowledgeId === item.id ? "assetRow selectable selected" : "assetRow selectable"}
-                  onClick={() => onEditKnowledge(item)}
-                >
-                  <strong>{item.title}</strong>
-                  <span>{item.knowledgeType || item.category} / {item.businessContext || item.businessType} / {item.status}</span>
-                  <p>{item.routingCard || item.summary || item.safeClaims.join(" / ") || "暂无摘要"}</p>
-                </button>
+  const visibleRoots = tree.filter(filterMatch);
+  const isSearching = search.trim().length > 0;
+
+  return (
+    <section className="knowledgeTree">
+      <div className="knowledgeTree__toolbar">
+        <div className="knowledgeTree__searchWrap">
+          <Search size={14} />
+          <input
+            type="text"
+            className="knowledgeTree__search"
+            placeholder="搜索文档 / 知识包 / 切片"
+            value={search}
+            onChange={(e) => onSearch(e.target.value)}
+          />
+        </div>
+        <button
+          type="button"
+          className={`knowledgeTree__iconBtn primary${workspaceMode === "import" ? " active" : ""}`}
+          aria-label="导入文档"
+          onClick={onImportClick}
+        >
+          <UploadCloud size={14} />
+        </button>
+        <button
+          type="button"
+          className="knowledgeTree__iconBtn"
+          aria-label="折叠全部"
+          onClick={onCollapseAll}
+        >
+          <ChevronRight size={14} />
+        </button>
+      </div>
+      <div className="knowledgeTree__list">
+        {!visibleRoots.length ? (
+          <div className="knowledgeTree__empty">
+            {isSearching ? "无匹配项" : "暂无知识资产 · 点右上 ⤴ 导入第一份文档"}
+          </div>
+        ) : (
+          visibleRoots.map((node) => (
+            <KnowledgeTreeNodeRow
+              key={node.id}
+              node={node}
+              depth={0}
+              selectedNodeId={selectedNodeId}
+              expandedNodes={expandedNodes}
+              search={search}
+              documents={documents}
+              onSelect={onSelect}
+              onToggle={onToggle}
+              onEditDocument={onEditDocument}
+            />
+          ))
+        )}
+      </div>
+    </section>
+  );
+}
+
+function KnowledgeTreeNodeRow({
+  node,
+  depth,
+  selectedNodeId,
+  expandedNodes,
+  search,
+  documents,
+  onSelect,
+  onToggle,
+  onEditDocument
+}: {
+  node: TreeNode;
+  depth: number;
+  selectedNodeId: string | null;
+  expandedNodes: Set<string>;
+  search: string;
+  documents: OperationKnowledgeDocument[];
+  onSelect: (id: string) => void;
+  onToggle: (id: string) => void;
+  onEditDocument: (doc: OperationKnowledgeDocument) => void;
+}) {
+  const hasChildren = !!node.children && node.children.length > 0;
+  const isSearching = search.trim().length > 0;
+  const expanded = isSearching ? true : expandedNodes.has(node.id);
+  const isSelected = selectedNodeId === node.id;
+  const iconCls =
+    node.kind === "document"
+      ? "doc"
+      : node.kind === "pack"
+      ? "pack"
+      : node.kind === "chunk"
+      ? "chunk"
+      : "warn";
+  const Icon =
+    node.kind === "document"
+      ? FileText
+      : node.kind === "pack"
+      ? Package
+      : node.kind === "chunk"
+      ? FileBox
+      : AlertTriangle;
+
+  function handleNodeClick(e: React.MouseEvent) {
+    e.stopPropagation();
+    onSelect(node.id);
+    if (hasChildren && !expanded && !isSearching) onToggle(node.id);
+  }
+
+  function handleCaretClick(e: React.MouseEvent) {
+    e.stopPropagation();
+    if (hasChildren) onToggle(node.id);
+  }
+
+  return (
+    <>
+      <div
+        className={`knowledgeTree__node${isSelected ? " selected" : ""}`}
+        style={{ paddingLeft: 12 + depth * 16 }}
+        onClick={handleNodeClick}
+        role="button"
+        tabIndex={0}
+        title={node.label}
+      >
+        <span className={`knowledgeTree__caret${hasChildren ? "" : " placeholder"}`} onClick={handleCaretClick}>
+          {hasChildren && (expanded ? <ChevronDown size={14} /> : <ChevronRight size={14} />)}
+        </span>
+        <span className={`knowledgeTree__icon ${iconCls}`}>
+          <Icon size={14} />
+        </span>
+        <span className="knowledgeTree__body">
+          <span className="knowledgeTree__labelRow">
+            <span className="knowledgeTree__label">{node.label}</span>
+            {node.badges?.map((b, i) => (
+              <span key={i} className={`knowledgeTree__badge tone-${b.tone}`}>{b.text}</span>
+            ))}
+          </span>
+          {node.meta && <span className="knowledgeTree__meta">{node.meta}</span>}
+        </span>
+        {node.kind === "document" && node.refId && (
+          <button
+            type="button"
+            className="knowledgeTree__nodeAction"
+            aria-label="编辑文档元数据"
+            title="编辑文档元数据"
+            onClick={(e) => {
+              e.stopPropagation();
+              const doc = documents.find((d) => d.id === node.refId);
+              if (doc) onEditDocument(doc);
+            }}
+          >
+            <SquarePen size={12} />
+          </button>
+        )}
+      </div>
+      {hasChildren && expanded && node.children!.map((child) => (
+        <KnowledgeTreeNodeRow
+          key={child.id}
+          node={child}
+          depth={depth + 1}
+          selectedNodeId={selectedNodeId}
+          expandedNodes={expandedNodes}
+          search={search}
+          documents={documents}
+          onSelect={onSelect}
+          onToggle={onToggle}
+          onEditDocument={onEditDocument}
+        />
+      ))}
+    </>
+  );
+}
+
+function KnowledgeWorkspaceRouter({
+  tree,
+  selectedNodeId,
+  workspaceMode,
+  packSubview,
+  documents,
+  knowledge,
+  chunks,
+  catalog,
+  integrityReport,
+  importPreview,
+  importSource,
+  importText,
+  knowledgeDraft,
+  chunkDraft,
+  chunkSource,
+  editingKnowledgeId,
+  editingChunkId,
+  busy,
+  onPackSubview,
+  onSelectNode,
+  onWorkspaceMode,
+  onEditKnowledge,
+  onEditChunk,
+  onDeleteDocument,
+  onDeleteKnowledge,
+  onDeleteKnowledgeChunk,
+  onCreateKnowledge,
+  onSaveKnowledge,
+  onCreateKnowledgeChunk,
+  onSaveKnowledgeChunk,
+  onChunkDraft,
+  onKnowledgeDraft,
+  onLoadChunkSource,
+  onNewKnowledge,
+  onNewChunk,
+  onRejectChunk,
+  onVerifyChunk,
+  onAiRepair,
+  onExtractTags,
+  onImportSource,
+  onImportText,
+  onPreviewImport,
+  onApplyImport
+}: {
+  tree: TreeNode[];
+  selectedNodeId: string | null;
+  workspaceMode: "selection" | "import";
+  packSubview: "overview" | "metadata" | "chunks";
+  documents: OperationKnowledgeDocument[];
+  knowledge: OperationKnowledgeItem[];
+  chunks: OperationKnowledgeChunk[];
+  catalog: Record<string, unknown> | null;
+  integrityReport: KnowledgeIntegrityReport | null;
+  importPreview: OperationKnowledgeImportPreview;
+  importSource: string;
+  importText: string;
+  knowledgeDraft: OperationKnowledgeDraft;
+  chunkDraft: OperationKnowledgeChunkDraft;
+  chunkSource: Record<string, unknown> | null;
+  editingKnowledgeId: string;
+  editingChunkId: string;
+  busy: boolean;
+  onPackSubview: (s: "overview" | "metadata" | "chunks") => void;
+  onSelectNode: (id: string | null) => void;
+  onWorkspaceMode: (mode: "selection" | "import") => void;
+  onEditKnowledge: (item: OperationKnowledgeItem) => void;
+  onEditChunk: (item: OperationKnowledgeChunk) => void;
+  onDeleteDocument: (id: string) => void;
+  onDeleteKnowledge: (id: string) => void;
+  onDeleteKnowledgeChunk: (id: string) => void;
+  onCreateKnowledge: (e: FormEvent) => void;
+  onSaveKnowledge: (e: FormEvent) => void;
+  onCreateKnowledgeChunk: (e: FormEvent) => void;
+  onSaveKnowledgeChunk: (e: FormEvent) => void;
+  onChunkDraft: (d: OperationKnowledgeChunkDraft) => void;
+  onKnowledgeDraft: (d: OperationKnowledgeDraft) => void;
+  onLoadChunkSource: (id: string) => void;
+  onNewKnowledge: () => void;
+  onNewChunk: () => void;
+  onRejectChunk: (id: string) => void;
+  onVerifyChunk: (id: string) => void;
+  onAiRepair: (target: { kind: "chunk" | "pack"; id: string; label: string }) => void;
+  onExtractTags?: (chunkId: string) => void;
+  onImportSource: (v: string) => void;
+  onImportText: (v: string) => void;
+  onPreviewImport: () => void;
+  onApplyImport: () => void;
+}) {
+  const previewCount = (importPreview.document ? 1 : 0) + importPreview.items.length + importPreview.chunks.length;
+  const selectedNode = selectedNodeId ? findTreeNode(tree, selectedNodeId) : null;
+
+  if (workspaceMode === "import") {
+    return (
+      <section className="knowledgeWorkspaceRouter">
+        <div className="knowledgeWorkspaceHead">
+          <div>
+            <span style={{ fontSize: 11, color: "var(--muted)", textTransform: "uppercase", letterSpacing: "0.04em" }}>Import</span>
+            <h2>导入文档并生成渐进式目录</h2>
+            <p>粘贴产品说明、服务边界、FAQ、案例证据或运营 SOP；AI 会自动拆出文档目录、知识包与切片，确认入库后即可在左侧树中查看。</p>
+          </div>
+          <div className="knowledgeWorkspaceHeadActions">
+            <button type="button" className="secondary" onClick={() => onWorkspaceMode("selection")}>
+              <X size={14} /> 取消
+            </button>
+          </div>
+        </div>
+        <div className="formGrid">
+          <label>
+            <span>来源名称</span>
+            <input value={importSource} onChange={(e) => onImportSource(e.target.value)} />
+          </label>
+          <label className="fullSpan">
+            <span>文档内容</span>
+            <textarea
+              className="largeTextArea"
+              value={importText}
+              onChange={(e) => onImportText(e.target.value)}
+              placeholder="粘贴产品说明、服务边界、FAQ、案例证据或运营 SOP。第一版支持文本和 Markdown。"
+            />
+          </label>
+        </div>
+        <div className="buttonRow">
+          <button type="button" onClick={onPreviewImport} disabled={busy || !importText.trim()}>
+            <Sparkles size={14} /> AI 生成目录和切片
+          </button>
+          <button type="button" className="secondary" onClick={onApplyImport} disabled={busy || !previewCount}>
+            确认入库
+          </button>
+        </div>
+        <div className="knowledgeDrawer__section">
+          <h4>AI 结构化预览</h4>
+          <div className="assetList">
+            {importPreview.document && (
+              <div className="assetRow">
+                <strong>{importPreview.document.title}</strong>
+                <span>文档目录 · {importPreview.document.status}</span>
+                <p>{importPreview.document.catalogSummary || importPreview.document.summary || "已生成文档入口"}</p>
+              </div>
+            )}
+            {importPreview.integrityReport && (
+              <div className="assetRow integritySummary">
+                <strong>完整性校验</strong>
+                <span>verified {String(importPreview.integrityReport.verified ?? 0)} / needs review {String(importPreview.integrityReport.needsReview ?? 0)}</span>
+                <p>切片必须能追溯原文。未通过校验的切片入库后默认不会作为事实依据自动启用。</p>
+              </div>
+            )}
+            {importPreview.items.map((item, index) => (
+              <div key={`${item.title}-${index}`} className="assetRow">
+                <strong>{item.title}</strong>
+                <span>知识包 · {item.knowledgeType || item.category} · {item.businessContext || item.businessType}</span>
+                <p>{item.routingCard || item.summary || item.safeClaims.join(" / ")}</p>
+                <KnowledgeChipBlock label="触发关键词" values={item.triggerKeywords} />
+                <KnowledgeChipBlock label="业务主题" values={item.businessTopics} />
+                <KnowledgeChipBlock label="操作状态" values={item.operationStates} />
+                <KnowledgeChipBlock label="意图层级" values={item.intentLevels} />
+                <KnowledgeChipBlock label="适用场景" values={item.applicableScenes} />
+                <KnowledgeChipBlock label="安全表达" values={item.safeClaims} />
+                <KnowledgeChipBlock label="禁止表达" values={item.forbiddenClaims} muted />
+              </div>
+            ))}
+            {importPreview.chunks.map((item, index) => (
+              <div key={`${item.title}-chunk-${index}`} className="assetRow">
+                <strong>{item.title}</strong>
+                <span>
+                  切片 · {item.knowledgeType || "AI 生成"} ·{" "}
+                  {item.integrityStatus
+                    ? `完整性 ${item.integrityStatus}`
+                    : item.evidenceItems.length
+                    ? "含证据"
+                    : "无证据"}
+                  {typeof item.confidenceScore === "number" ? ` · 信心 ${item.confidenceScore}` : ""}
+                </span>
+                <p>{item.routingCard || item.summary || item.body || "等待确认"}</p>
+                <KnowledgeChipBlock label="触发关键词" values={item.triggerKeywords} />
+                <KnowledgeChipBlock label="业务主题" values={item.businessTopics} />
+                <KnowledgeChipBlock label="适用场景" values={item.applicableScenes} />
+                <KnowledgeChipBlock label="安全表达" values={item.safeClaims} />
+                <KnowledgeChipBlock label="禁止表达" values={item.forbiddenClaims} muted />
+                {item.sourceQuote && (
+                  <p className="knowledgeSourceQuote" title="原文锚点">
+                    “{item.sourceQuote}”
+                  </p>
+                )}
+              </div>
+            ))}
+            {!previewCount && <EmptyInline text="等待导入预览，输入文档内容后点 AI 生成" />}
+          </div>
+        </div>
+      </section>
+    );
+  }
+
+  if (!selectedNode) {
+    return (
+      <section className="knowledgeWorkspaceRouter">
+        <EmptyState
+          icon={<Inbox size={28} />}
+          title="选择左侧资源开始"
+          hint="点击文档查看 catalog；点击知识包编辑元数据 / 切片；点击切片编辑详情。也可以点左上 ⤴ 导入新文档。"
+          action={
+            <button type="button" onClick={() => onWorkspaceMode("import")}>
+              <UploadCloud size={14} /> 导入文档
+            </button>
+          }
+        />
+      </section>
+    );
+  }
+
+  if (selectedNode.kind === "document") {
+    const doc = documents.find((d) => d.id === selectedNode.refId);
+    if (!doc) {
+      return (
+        <section className="knowledgeWorkspaceRouter">
+          <EmptyInline text="文档已被移除，请在左树重新选择。" />
+        </section>
+      );
+    }
+    const docPacks = (selectedNode.children || []).filter((c) => c.kind === "pack");
+    const allDocChunks = chunks.filter(
+      (c) =>
+        c.documentId === doc.id ||
+        knowledge.some((k) => docPacks.some((p) => p.refId === k.id) && k.id === c.itemId)
+    );
+    const verified = allDocChunks.filter((c) => c.integrityStatus === "verified").length;
+    const wordEstimate = allDocChunks.reduce((n, c) => n + ((c.body?.length || 0) + (c.summary?.length || 0)), 0);
+    return (
+      <section className="knowledgeWorkspaceRouter">
+        <div className="knowledgeBreadcrumb">
+          <FileText size={12} /> <span className="crumbCurrent">{doc.title}</span>
+        </div>
+        <div className="knowledgeWorkspaceHead">
+          <div>
+            <span style={{ fontSize: 11, color: "var(--muted)", textTransform: "uppercase", letterSpacing: "0.04em" }}>Document</span>
+            <h2>{doc.title}</h2>
+            <p>{doc.catalogSummary || doc.summary || doc.sourceName || "暂无摘要"}</p>
+          </div>
+          <div className="knowledgeWorkspaceHeadActions">
+            <button type="button" className="secondary danger" onClick={() => onDeleteDocument(doc.id)} disabled={busy}>
+              <Trash2 size={14} /> 删除文档
+            </button>
+          </div>
+        </div>
+        <div className="knowledgeMetricRow">
+          <div className="knowledgeMetricCard"><strong>{docPacks.length}</strong><span>知识包</span></div>
+          <div className="knowledgeMetricCard"><strong>{allDocChunks.length}</strong><span>切片</span></div>
+          <div className="knowledgeMetricCard"><strong>{verified}</strong><span>已验证</span></div>
+          <div className="knowledgeMetricCard"><strong>{Math.round(wordEstimate / 1000)}k</strong><span>字数估算</span></div>
+        </div>
+        {doc.routingMap.length > 0 && (
+          <div className="knowledgeDrawer__section">
+            <h4>Routing Map</h4>
+            <div className="metricChipRow">
+              {doc.routingMap.map((r, i) => (
+                <span key={i}>{r}</span>
               ))}
-              {!knowledge.length && <EmptyInline text="暂无运营知识包" />}
             </div>
-          </section>
+          </div>
+        )}
+        <div className="knowledgeDrawer__section knowledgeMetaGrid">
+          <KnowledgeMetaItem label="领域" value={doc.domain} />
+          <KnowledgeMetaItem label="来源类型" value={doc.sourceType} />
+          <KnowledgeMetaItem label="来源名" value={doc.sourceName} />
+          <KnowledgeMetaItem label="状态" value={doc.status} />
+        </div>
+        <KnowledgeChipBlock label="触发关键词" values={doc.triggerKeywords} block />
+        <KnowledgeChipBlock label="业务主题" values={doc.businessTopics} block />
+        <KnowledgeChipBlock label="产品标签" values={doc.productTags} block />
+        {doc.riskNotes && doc.riskNotes.length > 0 && (
+          <div className="knowledgeDrawer__section">
+            <h4>风险备注</h4>
+            <ul className="knowledgeRiskList">
+              {doc.riskNotes.map((note, i) => (
+                <li key={i}>{note}</li>
+              ))}
+            </ul>
+          </div>
+        )}
+        <div className="knowledgeDrawer__section">
+          <h4>Catalog</h4>
+          {catalog ? <StructuredJson data={catalog} defaultExpanded={2} /> : <EmptyInline text="catalog 尚未生成" />}
+        </div>
+      </section>
+    );
+  }
+
+  if (selectedNode.kind === "pack") {
+    const pack = knowledge.find((k) => k.id === selectedNode.refId);
+    if (!pack) {
+      return (
+        <section className="knowledgeWorkspaceRouter">
+          <EmptyInline text="知识包已被移除。" />
+        </section>
+      );
+    }
+    const packChunks = chunks.filter((c) => c.itemId === pack.id);
+    const verified = packChunks.filter((c) => c.integrityStatus === "verified").length;
+    const evidenceN = packChunks.filter((c) => c.evidenceItems.length > 0).length;
+    const ownerDoc = documents.find((d) =>
+      packChunks.some((c) => c.documentId === d.id)
+    );
+    return (
+      <section className="knowledgeWorkspaceRouter">
+        <div className="knowledgeBreadcrumb">
+          {ownerDoc ? (
+            <>
+              <button type="button" onClick={() => onSelectNode(`doc:${ownerDoc.id}`)}>
+                <FileText size={12} /> {ownerDoc.title}
+              </button>
+              <ChevronRight size={11} className="crumbSep" />
+            </>
+          ) : null}
+          <span className="crumbCurrent"><Package size={12} /> {pack.title}</span>
+        </div>
+        <div className="knowledgeWorkspaceHead">
+          <div>
+            <span style={{ fontSize: 11, color: "var(--muted)", textTransform: "uppercase", letterSpacing: "0.04em" }}>Knowledge Pack</span>
+            <h2>{pack.title}</h2>
+            <p>{pack.routingCard || pack.summary || pack.knowledgeType || pack.category}</p>
+          </div>
+          <div className="knowledgeWorkspaceHeadActions">
+            {editingKnowledgeId !== pack.id && (
+              <button type="button" className="secondary" onClick={() => onEditKnowledge(pack)} disabled={busy}>
+                <SquarePen size={14} /> 编辑元数据
+              </button>
+            )}
+          </div>
+        </div>
+
+        <div className="knowledgePackSegmented">
+          <button type="button" className={packSubview === "overview" ? "active" : ""} onClick={() => onPackSubview("overview")}>
+            <LayoutDashboard size={13} /> 概览
+          </button>
+          <button type="button" className={packSubview === "metadata" ? "active" : ""} onClick={() => onPackSubview("metadata")}>
+            <SquarePen size={13} /> 元数据
+          </button>
+          <button type="button" className={packSubview === "chunks" ? "active" : ""} onClick={() => onPackSubview("chunks")}>
+            <FileBox size={13} /> 切片 ({packChunks.length})
+          </button>
+        </div>
+
+        {packSubview === "overview" && (
+          <>
+            <div className="knowledgeMetricRow">
+              <div className="knowledgeMetricCard"><strong>{packChunks.length}</strong><span>切片总数</span></div>
+              <div className="knowledgeMetricCard"><strong>{verified}</strong><span>已验证</span></div>
+              <div className="knowledgeMetricCard"><strong>{evidenceN}</strong><span>含证据</span></div>
+              <div className="knowledgeMetricCard"><strong>{pack.priority}</strong><span>优先级</span></div>
+            </div>
+            <div className="knowledgeDrawer__section">
+              <h4>简介 / 路由卡</h4>
+              <p style={{ margin: 0, color: "var(--ink)", fontSize: 13, lineHeight: 1.6 }}>
+                {pack.routingCard || pack.summary || "暂无路由卡。点【元数据】tab 完善"}
+              </p>
+            </div>
+            {pack.safeClaims.length > 0 && (
+              <div className="knowledgeDrawer__section">
+                <h4>安全主张</h4>
+                <div className="metricChipRow">
+                  {pack.safeClaims.map((c, i) => (<span key={i}>{c}</span>))}
+                </div>
+              </div>
+            )}
+            {pack.forbiddenClaims.length > 0 && (
+              <div className="knowledgeDrawer__section">
+                <h4>禁用主张</h4>
+                <div className="metricChipRow">
+                  {pack.forbiddenClaims.map((c, i) => (<span key={i}>{c}</span>))}
+                </div>
+              </div>
+            )}
+            <KnowledgeChipBlock label="触发关键词" values={pack.triggerKeywords} block />
+            <KnowledgeChipBlock label="业务主题" values={pack.businessTopics} block />
+            <KnowledgeChipBlock label="操作状态" values={pack.operationStates} block />
+            <KnowledgeChipBlock label="意图层级" values={pack.intentLevels} block />
+            <KnowledgeChipBlock label="适用场景" values={pack.applicableScenes} block />
+            <KnowledgeChipBlock label="不适用场景" values={pack.notApplicableScenes} block muted />
+            <KnowledgeChipBlock label="常见问题" values={pack.commonQuestions} block />
+            <KnowledgeChipBlock label="常见异议" values={pack.commonObjections} block />
+            <KnowledgeChipBlock label="证据条目" values={pack.evidenceItems} block />
+            <KnowledgeChipBlock label="产品标签" values={pack.productTags} block />
+            <div className="knowledgeDrawer__section knowledgeMetaGrid">
+              <KnowledgeMetaItem label="分类" value={pack.category} />
+              <KnowledgeMetaItem label="业务类型" value={pack.businessType} />
+              <KnowledgeMetaItem label="知识类型" value={pack.knowledgeType} />
+              <KnowledgeMetaItem label="业务上下文" value={pack.businessContext} />
+              <KnowledgeMetaItem label="状态" value={pack.status} />
+            </div>
+          </>
+        )}
+
+        {packSubview === "metadata" && editingKnowledgeId === pack.id && (
           <KnowledgeEditor
             busy={busy}
             draft={knowledgeDraft}
@@ -3285,108 +4371,405 @@ function OperationKnowledgeView({
             onDraft={onKnowledgeDraft}
             onNew={onNewKnowledge}
             onSave={onSaveKnowledge}
+            onAiRepair={() =>
+              onAiRepair({ kind: "pack", id: pack.id, label: pack.title || "未命名知识包" })
+            }
           />
-        </section>
-      )}
-
-      {activeTab === "chunks" && (
-        <section className="splitWorkspace embedded">
-          <section>
-            <div className="assetList">
-              {chunks.map((item) => (
-                <button key={item.id} className={editingChunkId === item.id ? "assetRow selectable selected" : "assetRow selectable"} onClick={() => onEditChunk(item)}>
-                  <strong>{item.title}</strong>
-                  <span>{item.knowledgeType || "切片"} / {integrityStatusLabel(item.integrityStatus)} / {item.status} / {item.evidenceItems.length ? "含证据" : "无证据"}</span>
-                  <p>{item.routingCard || item.summary || item.body || "暂无摘要"}</p>
-                </button>
-              ))}
-              {!chunks.length && <EmptyInline text="暂无知识切片" />}
-            </div>
-          </section>
-          <KnowledgeChunkEditor
-            busy={busy}
-            draft={chunkDraft}
-            editingId={editingChunkId}
-            onCreate={onCreateKnowledgeChunk}
-            onDelete={onDeleteKnowledgeChunk}
-            onDraft={onChunkDraft}
-            onLoadSource={onLoadChunkSource}
-            onNew={onNewChunk}
-            onReject={onRejectChunk}
-            onSave={onSaveKnowledgeChunk}
-            onVerify={onVerifyChunk}
-            source={chunkSource}
+        )}
+        {packSubview === "metadata" && editingKnowledgeId !== pack.id && (
+          <EmptyState
+            icon={<SquarePen size={26} />}
+            title="点击编辑元数据"
+            hint="进入编辑模式后会展示完整的字段表单。"
+            action={
+              <button type="button" onClick={() => onEditKnowledge(pack)} disabled={busy}>
+                <SquarePen size={14} /> 编辑元数据
+              </button>
+            }
           />
-        </section>
-      )}
+        )}
 
-      {activeTab === "test" && (
-        <section className="knowledgeImportGrid">
-          <section className="panel assetForm">
-            <div className="panelHead">
-              <div>
-                <span>Knowledge Router</span>
-                <h2>命中测试</h2>
-              </div>
+        {packSubview === "chunks" && (
+          <div className="knowledgeDrawer__section">
+            <div className="knowledgeWorkspaceHead">
+              <h4>切片</h4>
+              <button type="button" className="secondary compactButton" onClick={onNewChunk} disabled={busy}>
+                + 新建切片
+              </button>
             </div>
-            <label>
-              <span>用户消息</span>
-              <textarea value={testMessage} onChange={(event) => onTestMessage(event.target.value)} />
-            </label>
-            <button type="button" onClick={onRunTest} disabled={busy || !testMessage.trim()}>
-              运行知识路由
-            </button>
-          </section>
-          <section className="panel">
-            <div className="panelHead">
-              <div>
-                <span>Tool Trace</span>
-                <h2>自主查询轨迹</h2>
+            {packChunks.length ? (
+              <div className="knowledgePackChunksGrid">
+                {packChunks.map((c) => (
+                  <button key={c.id} className="knowledgeChunkCard" onClick={() => onEditChunk(c)}>
+                    <strong>{c.title}</strong>
+                    <div className="chunkCardMeta">
+                      <span>{integrityStatusLabel(c.integrityStatus)}</span>
+                      <span>{c.status}</span>
+                      <span>{c.evidenceItems.length} 证据</span>
+                      {typeof c.confidenceScore === "number" && <span>信心 {c.confidenceScore}</span>}
+                    </div>
+                    {c.routingCard && <p className="chunkCardRouting">{c.routingCard}</p>}
+                    <KnowledgeChipBlock label="触发关键词" values={c.triggerKeywords} />
+                    <KnowledgeChipBlock label="业务主题" values={c.businessTopics} />
+                    <KnowledgeChipBlock label="适用场景" values={c.applicableScenes} />
+                    {c.sourceQuote && (
+                      <p className="knowledgeSourceQuote" title="原文锚点">
+                        “{c.sourceQuote}”
+                      </p>
+                    )}
+                  </button>
+                ))}
               </div>
-            </div>
-            <pre className="jsonPreview">{JSON.stringify(testResult || {}, null, 2)}</pre>
-          </section>
-        </section>
-      )}
+            ) : (
+              <EmptyInline text="此包暂无切片" />
+            )}
+          </div>
+        )}
+      </section>
+    );
+  }
 
-      {activeTab === "usage" && (
-        <section className="panel">
-          <div className="panelHead">
-            <div>
-              <span>Audit</span>
-              <h2>知识使用日志</h2>
-            </div>
-          </div>
-          <div className="assetList">
-            {usage.map((item) => (
-              <div key={item.id} className="assetRow">
-                <strong>{item.reviewApproved ? "Review 通过" : "Review 拦截"} / {formatTime(item.createdAt)}</strong>
-                <span>{item.contactWxid || "未绑定联系人"} / {item.knowledgeIds.length} 个知识包</span>
-                <p>{item.replyText || item.blockedReason || JSON.stringify(item.routeResult)}</p>
-              </div>
-            ))}
-            {!usage.length && <EmptyInline text="暂无知识使用日志" />}
-          </div>
+  if (selectedNode.kind === "chunk") {
+    const chunk = chunks.find((c) => c.id === selectedNode.refId);
+    if (!chunk) {
+      return (
+        <section className="knowledgeWorkspaceRouter">
+          <EmptyInline text="切片已被移除。" />
         </section>
-      )}
+      );
+    }
+    const ownerPack = chunk.itemId ? knowledge.find((k) => k.id === chunk.itemId) : null;
+    const ownerDoc = chunk.documentId ? documents.find((d) => d.id === chunk.documentId) : null;
+    return (
+      <section className="knowledgeWorkspaceRouter">
+        <div className="knowledgeBreadcrumb">
+          {ownerDoc && (
+            <>
+              <button type="button" onClick={() => onSelectNode(`doc:${ownerDoc.id}`)}>
+                <FileText size={12} /> {ownerDoc.title}
+              </button>
+              <ChevronRight size={11} className="crumbSep" />
+            </>
+          )}
+          {ownerPack && (
+            <>
+              <button type="button" onClick={() => onSelectNode(`pack:${ownerPack.id}`)}>
+                <Package size={12} /> {ownerPack.title}
+              </button>
+              <ChevronRight size={11} className="crumbSep" />
+            </>
+          )}
+          <span className="crumbCurrent"><FileBox size={12} /> {chunk.title}</span>
+        </div>
+        <KnowledgeChunkEditor
+          busy={busy}
+          draft={chunkDraft}
+          editingId={editingChunkId}
+          onCreate={onCreateKnowledgeChunk}
+          onDelete={onDeleteKnowledgeChunk}
+          onDraft={onChunkDraft}
+          onLoadSource={onLoadChunkSource}
+          onNew={onNewChunk}
+          onReject={onRejectChunk}
+          onSave={onSaveKnowledgeChunk}
+          onVerify={onVerifyChunk}
+          onAiRepair={() =>
+            onAiRepair({ kind: "chunk", id: chunk.id, label: chunk.title || "未命名切片" })
+          }
+          onExtractTags={onExtractTags ? () => onExtractTags(chunk.id) : undefined}
+          source={chunkSource}
+        />
+      </section>
+    );
+  }
 
-      {integrityReport && (
-        <section className="panel integrityDock">
-          <div className="panelHead">
-            <div>
-              <span>Integrity</span>
-              <h2>完整性状态</h2>
-            </div>
+  if (selectedNode.kind === "group-orphan-packs") {
+    return (
+      <section className="knowledgeWorkspaceRouter">
+        <div className="knowledgeWorkspaceHead">
+          <div>
+            <span style={{ fontSize: 11, color: "var(--muted)", textTransform: "uppercase", letterSpacing: "0.04em" }}>Orphan Packs</span>
+            <h2>未关联文档的知识包</h2>
+            <p>这些包没有与任何文档建立关联，可能是历史导入或手动新建。建议补充来源文档以便 AI 路由。</p>
           </div>
-          <div className="knowledgeStats compactStats">
-            <div><strong>{integrityReport.total}</strong><span>全部切片</span></div>
-            <div><strong>{integrityReport.verified}</strong><span>已验证</span></div>
-            <div><strong>{integrityReport.needsReview}</strong><span>需复核</span></div>
-            <div><strong>{integrityReport.rejected}</strong><span>已拒绝</span></div>
+        </div>
+        <div className="knowledgeOrphanList">
+          {(selectedNode.children || []).map((child) => {
+            const pack = knowledge.find((k) => k.id === child.refId);
+            if (!pack) return null;
+            return (
+              <button key={pack.id} className="knowledgeChunkCard" onClick={() => onSelectNode(`pack:${pack.id}`)}>
+                <strong>{pack.title}</strong>
+                <div className="chunkCardMeta">
+                  <span>{pack.knowledgeType || pack.category}</span>
+                  <span>{pack.status}</span>
+                  {pack.priority ? <span>P{pack.priority}</span> : null}
+                </div>
+                {pack.routingCard && <p className="chunkCardRouting">{pack.routingCard}</p>}
+                <KnowledgeChipBlock label="触发" values={pack.triggerKeywords} />
+                <KnowledgeChipBlock label="主题" values={pack.businessTopics} />
+                <KnowledgeChipBlock label="状态机" values={pack.operationStates} />
+              </button>
+            );
+          })}
+        </div>
+      </section>
+    );
+  }
+
+  if (selectedNode.kind === "group-orphan-chunks") {
+    return (
+      <section className="knowledgeWorkspaceRouter">
+        <div className="knowledgeWorkspaceHead">
+          <div>
+            <span style={{ fontSize: 11, color: "var(--muted)", textTransform: "uppercase", letterSpacing: "0.04em" }}>Orphan Chunks</span>
+            <h2>未关联包的切片</h2>
+            <p>这些切片没有归属到任何知识包。建议关联到知识包让 AI 检索时更精准。</p>
           </div>
-        </section>
-      )}
+        </div>
+        <div className="knowledgeOrphanList">
+          {(selectedNode.children || []).map((child) => {
+            const c = chunks.find((cc) => cc.id === child.refId);
+            if (!c) return null;
+            return (
+              <button key={c.id} className="knowledgeChunkCard" onClick={() => onSelectNode(`chunk:${c.id}`)}>
+                <strong>{c.title}</strong>
+                <div className="chunkCardMeta">
+                  <span>{integrityStatusLabel(c.integrityStatus)}</span>
+                  <span>{c.status}</span>
+                  {typeof c.confidenceScore === "number" && <span>信心 {c.confidenceScore}</span>}
+                </div>
+                {c.routingCard && <p className="chunkCardRouting">{c.routingCard}</p>}
+                <KnowledgeChipBlock label="触发" values={c.triggerKeywords} />
+                <KnowledgeChipBlock label="主题" values={c.businessTopics} />
+                {c.sourceQuote && (
+                  <p className="knowledgeSourceQuote" title="原文锚点">
+                    “{c.sourceQuote}”
+                  </p>
+                )}
+              </button>
+            );
+          })}
+        </div>
+        {integrityReport && (
+          <div className="knowledgeMetricRow">
+            <div className="knowledgeMetricCard"><strong>{integrityReport.total}</strong><span>全部切片</span></div>
+            <div className="knowledgeMetricCard"><strong>{integrityReport.verified}</strong><span>已验证</span></div>
+            <div className="knowledgeMetricCard"><strong>{integrityReport.needsReview}</strong><span>AI 需复核</span></div>
+            <div className="knowledgeMetricCard"><strong>{integrityReport.rejected}</strong><span>已拒绝</span></div>
+          </div>
+        )}
+      </section>
+    );
+  }
+
+  return (
+    <section className="knowledgeWorkspaceRouter">
+      <EmptyInline text="未知节点" />
     </section>
+  );
+}
+
+function KnowledgeDebugDrawer({
+  open,
+  onClose,
+  busy,
+  testMessage,
+  testResult,
+  usage,
+  onTestMessage,
+  onRunTest
+}: {
+  open: boolean;
+  onClose: () => void;
+  busy: boolean;
+  testMessage: string;
+  testResult: Record<string, unknown> | null;
+  usage: KnowledgeUsageItem[];
+  onTestMessage: (v: string) => void;
+  onRunTest: () => void;
+}) {
+  useEffect(() => {
+    if (!open) return;
+    const handler = (e: globalThis.KeyboardEvent) => {
+      if (e.key === "Escape") onClose();
+    };
+    document.addEventListener("keydown", handler);
+    return () => document.removeEventListener("keydown", handler);
+  }, [open, onClose]);
+
+  if (!open) return null;
+  return (
+    <>
+      <div className="knowledgeDrawer__scrim" onClick={onClose} />
+      <aside className="knowledgeDrawer" role="dialog" aria-label="命中测试">
+        <div className="knowledgeDrawer__head">
+          <h3><FlaskConical size={16} /> 知识命中测试</h3>
+          <button type="button" className="knowledgeDrawer__close" aria-label="关闭" onClick={onClose}>
+            <X size={16} />
+          </button>
+        </div>
+        <div className="knowledgeDrawer__body">
+          <section className="knowledgeDrawer__section">
+            <h4>输入用户消息</h4>
+            <textarea
+              value={testMessage}
+              onChange={(e) => onTestMessage(e.target.value)}
+              style={{ minHeight: 96 }}
+            />
+            <div className="buttonRow">
+              <button type="button" onClick={onRunTest} disabled={busy || !testMessage.trim()}>
+                <Sparkles size={14} /> 运行知识路由
+              </button>
+            </div>
+            {testResult && <RouteTraceMetrics result={testResult} />}
+          </section>
+          <section className="knowledgeDrawer__section">
+            <h4>路由轨迹</h4>
+            {testResult ? (
+              <RouteTraceView result={testResult} />
+            ) : (
+              <EmptyState
+                icon={<Search size={26} />}
+                title="尚未运行"
+                hint="输入用户消息后点击运行知识路由，这里会展示 catalog/list_chunks/open_slice 的工具调用轨迹。"
+              />
+            )}
+          </section>
+          <section className="knowledgeDrawer__section">
+            <h4>使用日志</h4>
+            <UsageLogList items={usage} />
+          </section>
+        </div>
+      </aside>
+    </>
+  );
+}
+
+function RouteTraceMetrics({ result }: { result: Record<string, unknown> }) {
+  const candidates = (result.candidates as unknown[]) || (result.candidateChunks as unknown[]) || [];
+  const selected = (result.selectedChunks as unknown[]) || (result.selected as unknown[]) || [];
+  const verified = Array.isArray(selected)
+    ? selected.filter((it) => (it as Record<string, unknown>)?.integrityStatus === "verified").length
+    : 0;
+  const tokens = Number((result.totalTokens as number) ?? (result.tokens as number) ?? 0);
+  return (
+    <div className="metricChipRow">
+      <span><strong>{Array.isArray(candidates) ? candidates.length : 0}</strong>候选</span>
+      <span><strong>{Array.isArray(selected) ? selected.length : 0}</strong>选中</span>
+      <span><strong>{verified}</strong>已验证</span>
+      <span><strong>{tokens}</strong>token</span>
+    </div>
+  );
+}
+
+function RouteTraceView({ result }: { result: Record<string, unknown> }) {
+  const trace = (result.toolTrace as unknown[]) || (result.trace as unknown[]) || [];
+  const selected = (result.selectedChunks as unknown[]) || (result.selected as unknown[]) || [];
+  return (
+    <div className="routeTraceView">
+      {Array.isArray(trace) && trace.length > 0 && (
+        <section>
+          <div className="sectionCaption">工具调用轨迹</div>
+          <ol className="eventTimeline">
+            {trace.map((rawCall, index) => {
+              const call = (rawCall || {}) as Record<string, unknown>;
+              const tool = String(call.tool || call.name || `step-${index + 1}`);
+              const summary = String(call.summary || call.outcome || "");
+              const argsObj = call.arguments || call.args || {};
+              const argChips = typeof argsObj === "object" && argsObj
+                ? Object.entries(argsObj as Record<string, unknown>).slice(0, 3).map(([k, v]) =>
+                    `${k}=${typeof v === "string" ? v : JSON.stringify(v)}`.slice(0, 40)
+                  )
+                : [];
+              return (
+                <li key={index} className="timelineItem tone-ai">
+                  <span className="timelineDot" />
+                  <div className="timelineCard">
+                    <div className="timelineHead">
+                      <strong>{tool}</strong>
+                    </div>
+                    {summary && <p>{summary}</p>}
+                    {argChips.length > 0 && (
+                      <div className="timelineChips">
+                        {argChips.map((chip, idx) => <span key={idx}>{chip}</span>)}
+                      </div>
+                    )}
+                  </div>
+                </li>
+              );
+            })}
+          </ol>
+        </section>
+      )}
+      {Array.isArray(selected) && selected.length > 0 && (
+        <section>
+          <div className="sectionCaption">选中切片</div>
+          <div className="assetList">
+            {selected.map((rawChunk, idx) => {
+              const chunk = (rawChunk || {}) as Record<string, unknown>;
+              return (
+                <div key={String(chunk.id || idx)} className="assetRow">
+                  <strong>{String(chunk.title || `切片 ${idx + 1}`)}</strong>
+                  <span>{integrityStatusLabel(String(chunk.integrityStatus || ""))}</span>
+                  <p>{String(chunk.summary || chunk.body || "").slice(0, 200)}</p>
+                </div>
+              );
+            })}
+          </div>
+        </section>
+      )}
+      <section>
+        <div className="sectionCaption">原始 JSON</div>
+        <StructuredJson data={result} defaultExpanded={1} />
+      </section>
+    </div>
+  );
+}
+
+function UsageLogList({ items }: { items: KnowledgeUsageItem[] }) {
+  if (!items.length) {
+    return <EmptyState icon={<ShieldCheck size={26} />} title="暂无知识使用日志" hint="一旦 Agent 在真实对话中调用知识库，调用记录与 Review 结果会按时间在这里出现。" />;
+  }
+  return (
+    <ol className="eventTimeline">
+      {items.map((item) => {
+        const tone: "good" | "warn" = item.reviewApproved ? "good" : "warn";
+        const headTitle = item.reviewApproved ? "Review 通过" : "Review 拦截";
+        const route = (item.routeResult || {}) as Record<string, unknown>;
+        const trace = (route.toolTrace as unknown[]) || [];
+        const traceCount = Array.isArray(trace) ? trace.length : 0;
+        const chips = [
+          item.contactWxid ? `wxid · ${item.contactWxid}` : "未绑定联系人",
+          `${item.knowledgeIds.length} 个知识包`,
+          traceCount ? `${traceCount} 次工具调用` : ""
+        ].filter(Boolean) as string[];
+        const subtitle = item.replyText || item.blockedReason || "—";
+        return (
+          <li key={item.id} className={`timelineItem tone-${tone}`}>
+            <span className="timelineDot" />
+            <div className="timelineCard">
+              <div className="timelineHead">
+                <strong>{headTitle}</strong>
+                <span>{formatTime(item.createdAt)}</span>
+              </div>
+              <p>{subtitle}</p>
+              {chips.length > 0 && (
+                <div className="timelineChips">
+                  {chips.map((chip, idx) => <span key={idx}>{chip}</span>)}
+                </div>
+              )}
+              {Object.keys(route).length > 0 && (
+                <details className="timelineFold">
+                  <summary>查看完整路由</summary>
+                  <StructuredJson data={route} defaultExpanded={1} copyable={false} />
+                </details>
+              )}
+            </div>
+          </li>
+        );
+      })}
+    </ol>
   );
 }
 
@@ -3398,7 +4781,8 @@ function KnowledgeEditor({
   onDelete,
   onDraft,
   onNew,
-  onSave
+  onSave,
+  onAiRepair
 }: {
   busy: boolean;
   draft: OperationKnowledgeDraft;
@@ -3408,6 +4792,7 @@ function KnowledgeEditor({
   onDraft: (draft: OperationKnowledgeDraft) => void;
   onNew: () => void;
   onSave: (event: FormEvent) => void;
+  onAiRepair?: () => void;
 }) {
   return (
     <form className="assetForm promptEditor" onSubmit={editingId ? onSave : onCreate}>
@@ -3416,11 +4801,24 @@ function KnowledgeEditor({
           <span>{editingId ? "Edit Knowledge" : "Create Knowledge"}</span>
           <h2>{editingId ? "编辑知识包" : "新增知识包"}</h2>
         </div>
-        {editingId && (
-          <button type="button" className="secondary compactButton" onClick={onNew}>
-            新建
-          </button>
-        )}
+        <div className="panelHeadActions">
+          {editingId && onAiRepair && (
+            <button
+              type="button"
+              className="aiPrimary compactButton"
+              onClick={onAiRepair}
+              disabled={busy}
+              title="AI 先归纳整个知识包再补完元数据"
+            >
+              <Sparkles size={14} /> AI 自主修复
+            </button>
+          )}
+          {editingId && (
+            <button type="button" className="secondary compactButton" onClick={onNew}>
+              新建
+            </button>
+          )}
+        </div>
       </div>
       <div className="formGrid">
         <label>
@@ -3460,14 +4858,28 @@ function KnowledgeEditor({
       </div>
       <div className="formGrid">
         <label>
-          <span>适合客户/阶段</span>
-          <textarea value={draft.suitableFor} onChange={(event) => onDraft({ ...draft, suitableFor: event.target.value })} />
+          <span>操作状态（state machine）</span>
+          <textarea value={draft.operationStates} onChange={(event) => onDraft({ ...draft, operationStates: event.target.value })} placeholder="逗号分隔。如 triaged, acknowledged, mitigating" />
         </label>
         <label>
-          <span>不适合使用</span>
-          <textarea value={draft.notSuitableFor} onChange={(event) => onDraft({ ...draft, notSuitableFor: event.target.value })} />
+          <span>意图层级</span>
+          <textarea value={draft.intentLevels} onChange={(event) => onDraft({ ...draft, intentLevels: event.target.value })} placeholder="逗号分隔。如 紧急, 常规" />
         </label>
       </div>
+      <div className="formGrid">
+        <label>
+          <span>触发关键词</span>
+          <textarea value={draft.triggerKeywords} onChange={(event) => onDraft({ ...draft, triggerKeywords: event.target.value })} placeholder="逗号分隔。AI 路由命中关键词" />
+        </label>
+        <label>
+          <span>业务主题</span>
+          <textarea value={draft.businessTopics} onChange={(event) => onDraft({ ...draft, businessTopics: event.target.value })} placeholder="逗号分隔。如 值班 SOP, 数据库切换" />
+        </label>
+      </div>
+      <label>
+        <span>产品标签</span>
+        <input value={draft.productTags} onChange={(event) => onDraft({ ...draft, productTags: event.target.value })} placeholder="逗号分隔。涉及的产品/系统名" />
+      </label>
       <label>
         <span>安全可说事实</span>
         <textarea value={draft.safeClaims} onChange={(event) => onDraft({ ...draft, safeClaims: event.target.value })} />
@@ -3516,6 +4928,8 @@ function KnowledgeChunkEditor({
   onReject,
   onSave,
   onVerify,
+  onAiRepair,
+  onExtractTags,
   source
 }: {
   busy: boolean;
@@ -3529,6 +4943,8 @@ function KnowledgeChunkEditor({
   onReject: (id: string) => void;
   onSave: (event: FormEvent) => void;
   onVerify: (id: string) => void;
+  onAiRepair?: () => void;
+  onExtractTags?: () => void;
   source: Record<string, unknown> | null;
 }) {
   const sourceDocument = (source?.document || {}) as Record<string, unknown>;
@@ -3540,11 +4956,35 @@ function KnowledgeChunkEditor({
           <span>{editingId ? "Edit Slice" : "Create Slice"}</span>
           <h2>{editingId ? "编辑知识切片" : "新增知识切片"}</h2>
         </div>
-        {editingId && (
-          <button type="button" className="secondary compactButton" onClick={onNew}>
-            新建
-          </button>
-        )}
+        <div className="panelHeadActions">
+          {editingId && onAiRepair && (
+            <button
+              type="button"
+              className="aiPrimary compactButton"
+              onClick={onAiRepair}
+              disabled={busy}
+              title="让 AI 自主补完字段；缺资料时由 AI 主动追问"
+            >
+              <Sparkles size={14} /> AI 自主修复
+            </button>
+          )}
+          {editingId && onExtractTags && (
+            <button
+              type="button"
+              className="secondary compactButton"
+              onClick={onExtractTags}
+              disabled={busy}
+              title="一键重抽产品标签 / 触发关键词 / 业务主题"
+            >
+              <Sparkles size={14} /> 一键重抽标签
+            </button>
+          )}
+          {editingId && (
+            <button type="button" className="secondary compactButton" onClick={onNew}>
+              新建
+            </button>
+          )}
+        </div>
       </div>
       <div className="formGrid">
         <label>
@@ -3575,26 +5015,75 @@ function KnowledgeChunkEditor({
       <div className="formGrid">
         <label>
           <span>适用场景</span>
-          <textarea value={draft.applicableScenes} onChange={(event) => onDraft({ ...draft, applicableScenes: event.target.value })} />
+          <TagChipInput
+            value={splitTags(draft.applicableScenes)}
+            placeholder="新人首次咨询 / 价格敏感 / 已签约"
+            onChange={(next) => onDraft({ ...draft, applicableScenes: next.join(", ") })}
+          />
         </label>
         <label>
           <span>不适用场景</span>
-          <textarea value={draft.notApplicableScenes} onChange={(event) => onDraft({ ...draft, notApplicableScenes: event.target.value })} />
+          <TagChipInput
+            value={splitTags(draft.notApplicableScenes)}
+            placeholder="售后投诉 / 法务质询"
+            onChange={(next) => onDraft({ ...draft, notApplicableScenes: next.join(", ") })}
+          />
         </label>
       </div>
       <div className="formGrid">
         <label>
           <span>安全事实</span>
-          <textarea value={draft.safeClaims} onChange={(event) => onDraft({ ...draft, safeClaims: event.target.value })} />
+          <TagChipInput
+            value={splitTags(draft.safeClaims)}
+            placeholder="提供 7 天试用 / 技术对接 1v1"
+            onChange={(next) => onDraft({ ...draft, safeClaims: next.join(", ") })}
+          />
         </label>
         <label>
           <span>禁止承诺</span>
-          <textarea value={draft.forbiddenClaims} onChange={(event) => onDraft({ ...draft, forbiddenClaims: event.target.value })} />
+          <TagChipInput
+            value={splitTags(draft.forbiddenClaims)}
+            placeholder="承诺销量翻倍 / 永久免费"
+            onChange={(next) => onDraft({ ...draft, forbiddenClaims: next.join(", ") })}
+          />
         </label>
       </div>
       <label>
         <span>证据</span>
-        <textarea value={draft.evidenceItems} onChange={(event) => onDraft({ ...draft, evidenceItems: event.target.value })} />
+        <TagChipInput
+          value={splitTags(draft.evidenceItems)}
+          placeholder="案例 A · 销量提升 30% / 内部测试报告 2025-Q1"
+          onChange={(next) => onDraft({ ...draft, evidenceItems: next.join(", ") })}
+        />
+      </label>
+      <div className="formGrid">
+        <label>
+          <span>产品标签 (productTags, 最多 5)</span>
+          <TagChipInput
+            value={splitTags(draft.productTags)}
+            max={5}
+            placeholder="WechatAgent / AI 私域销售助手"
+            onChange={(next) => onDraft({ ...draft, productTags: next.join(", ") })}
+          />
+        </label>
+        <label>
+          <span>触发关键词 (triggerKeywords, 最多 8, 含口语化变体)</span>
+          <TagChipInput
+            value={splitTags(draft.triggerKeywords)}
+            max={8}
+            placeholder="群发工具区别 / 价格"
+            onChange={(next) => onDraft({ ...draft, triggerKeywords: next.join(", ") })}
+          />
+        </label>
+      </div>
+      <label>
+        <span>业务主题 (businessTopics, 最多 3)</span>
+        <TagChipInput
+          value={splitTags(draft.businessTopics)}
+          max={3}
+          placeholder="产品定位差异 / 竞品对比"
+          onChange={(next) => onDraft({ ...draft, businessTopics: next.join(", ") })}
+        />
       </label>
       <label>
         <span>原文引用</span>
@@ -3603,26 +5092,52 @@ function KnowledgeChunkEditor({
       <div className="formGrid">
         <label>
           <span>完整性状态</span>
-          <input value={draft.integrityStatus} onChange={(event) => onDraft({ ...draft, integrityStatus: event.target.value })} />
+          <select
+            value={draft.integrityStatus || "needs_review"}
+            onChange={(event) => onDraft({ ...draft, integrityStatus: event.target.value })}
+          >
+            <option value="needs_review">待 AI 复核 (needs_review)</option>
+            <option value="verified">已运营确认 (verified)</option>
+            <option value="rejected">驳回 (rejected)</option>
+          </select>
         </label>
         <label>
-          <span>置信分</span>
-          <input value={draft.confidenceScore} onChange={(event) => onDraft({ ...draft, confidenceScore: event.target.value })} />
+          <span>置信分（0-100）</span>
+          <input
+            type="number"
+            min={0}
+            max={100}
+            step={1}
+            value={draft.confidenceScore}
+            onChange={(event) => onDraft({ ...draft, confidenceScore: event.target.value })}
+          />
         </label>
       </div>
       <div className="formGrid">
         <label>
           <span>已验证事实</span>
-          <textarea value={draft.verifiedClaims} onChange={(event) => onDraft({ ...draft, verifiedClaims: event.target.value })} />
+          <TagChipInput
+            value={splitLines(draft.verifiedClaims)}
+            placeholder="已被运营确认的事实条目"
+            onChange={(next) => onDraft({ ...draft, verifiedClaims: next.join("\n") })}
+          />
         </label>
         <label>
           <span>无依据声明</span>
-          <textarea value={draft.unsupportedClaims} onChange={(event) => onDraft({ ...draft, unsupportedClaims: event.target.value })} />
+          <TagChipInput
+            value={splitLines(draft.unsupportedClaims)}
+            placeholder="缺少证据的描述"
+            onChange={(next) => onDraft({ ...draft, unsupportedClaims: next.join("\n") })}
+          />
         </label>
       </div>
       <label>
         <span>失真风险</span>
-        <textarea value={draft.distortionRisks} onChange={(event) => onDraft({ ...draft, distortionRisks: event.target.value })} />
+        <TagChipInput
+          value={splitLines(draft.distortionRisks)}
+          placeholder="可能被夸大或误解的点"
+          onChange={(next) => onDraft({ ...draft, distortionRisks: next.join("\n") })}
+        />
       </label>
       {editingId && (
         <section className="sourceCompare">
@@ -4345,6 +5860,386 @@ function EmptyInline({ text }: { text: string }) {
   );
 }
 
+function KnowledgeChipBlock({
+  label,
+  values,
+  muted = false,
+  block = false,
+}: {
+  label: string;
+  values?: string[];
+  muted?: boolean;
+  block?: boolean;
+}) {
+  if (!values || values.length === 0) return null;
+  if (block) {
+    return (
+      <div className="knowledgeDrawer__section">
+        <h4>{label}</h4>
+        <div className={`knowledgeChipRow${muted ? " muted" : ""}`}>
+          {values.map((v, i) => (
+            <span key={i}>{v}</span>
+          ))}
+        </div>
+      </div>
+    );
+  }
+  return (
+    <div className={`knowledgeChipInline${muted ? " muted" : ""}`}>
+      <em>{label}</em>
+      {values.map((v, i) => (
+        <span key={i}>{v}</span>
+      ))}
+    </div>
+  );
+}
+
+function KnowledgeMetaItem({
+  label,
+  value,
+}: {
+  label: string;
+  value?: string | number | null;
+}) {
+  if (value === undefined || value === null || value === "") return null;
+  return (
+    <div className="knowledgeMetaItem">
+      <em>{label}</em>
+      <span>{String(value)}</span>
+    </div>
+  );
+}
+
+function EmptyState({ icon, title, hint, action }: { icon?: React.ReactNode; title: string; hint?: string; action?: React.ReactNode }) {
+  return (
+    <div className="emptyStateRich">
+      <div className="emptyStateRichIcon">{icon ?? <Inbox size={28} />}</div>
+      <strong>{title}</strong>
+      {hint && <p>{hint}</p>}
+      {action && <div className="emptyStateRichAction">{action}</div>}
+    </div>
+  );
+}
+
+function TagChipInput({
+  value,
+  onChange,
+  placeholder,
+  max,
+  disabled
+}: {
+  value: string[];
+  onChange: (next: string[]) => void;
+  placeholder?: string;
+  max?: number;
+  disabled?: boolean;
+}) {
+  const [draft, setDraft] = useState("");
+  const atMax = typeof max === "number" && value.length >= max;
+
+  function commit(raw: string) {
+    if (!raw.trim()) return;
+    const tokens = raw
+      .split(/[,，、\n]+/)
+      .map((token) => token.trim())
+      .filter(Boolean);
+    if (!tokens.length) return;
+    const next = [...value];
+    for (const token of tokens) {
+      if (typeof max === "number" && next.length >= max) break;
+      if (!next.includes(token)) next.push(token);
+    }
+    onChange(next);
+    setDraft("");
+  }
+
+  function handleKey(event: KeyboardEvent<HTMLInputElement>) {
+    if (event.key === "Enter" || event.key === "," || event.key === "，" || event.key === "、") {
+      event.preventDefault();
+      commit(draft);
+    } else if (event.key === "Backspace" && !draft && value.length) {
+      onChange(value.slice(0, -1));
+    }
+  }
+
+  function handlePaste(event: ClipboardEvent<HTMLInputElement>) {
+    const text = event.clipboardData.getData("text");
+    if (text && /[,，、\n]/.test(text)) {
+      event.preventDefault();
+      commit(text);
+    }
+  }
+
+  function removeAt(index: number) {
+    const next = value.slice();
+    next.splice(index, 1);
+    onChange(next);
+  }
+
+  return (
+    <div className={`tagChipInput${disabled ? " disabled" : ""}${atMax ? " atMax" : ""}`}>
+      {value.map((tag, index) => (
+        <span key={`${tag}-${index}`} className="tagChip">
+          {tag}
+          <button
+            type="button"
+            aria-label={`删除 ${tag}`}
+            onClick={() => removeAt(index)}
+            disabled={disabled}
+          >
+            <X size={11} />
+          </button>
+        </span>
+      ))}
+      <input
+        value={draft}
+        placeholder={atMax ? `已达上限 ${max}` : value.length ? "" : placeholder || "回车 / 逗号添加"}
+        onChange={(event) => setDraft(event.target.value)}
+        onKeyDown={handleKey}
+        onPaste={handlePaste}
+        onBlur={() => commit(draft)}
+        disabled={disabled || atMax}
+      />
+    </div>
+  );
+}
+
+function StructuredJson({
+  data,
+  defaultExpanded = 1,
+  copyable = true
+}: {
+  data: unknown;
+  defaultExpanded?: number;
+  copyable?: boolean;
+}) {
+  const [raw, setRaw] = useState(false);
+  if (data === null || data === undefined) {
+    return <EmptyInline text="暂无数据" />;
+  }
+  if (raw) {
+    return (
+      <div className="structuredJson">
+        <div className="structuredJsonToolbar">
+          <button type="button" className="secondary compactButton" onClick={() => setRaw(false)}>
+            返回结构化视图
+          </button>
+        </div>
+        <pre className="jsonPreview">{JSON.stringify(data, null, 2)}</pre>
+      </div>
+    );
+  }
+  return (
+    <div className="structuredJson">
+      <div className="structuredJsonToolbar">
+        {copyable && (
+          <button
+            type="button"
+            className="secondary compactButton"
+            onClick={() => {
+              try {
+                void navigator.clipboard?.writeText(JSON.stringify(data, null, 2));
+              } catch {
+                /* clipboard unavailable */
+              }
+            }}
+          >
+            <Copy size={12} /> 复制 JSON
+          </button>
+        )}
+        <button type="button" className="secondary compactButton" onClick={() => setRaw(true)}>
+          原始视图
+        </button>
+      </div>
+      <div className="structuredJsonBody">
+        <JsonNode value={data} depth={0} defaultExpanded={defaultExpanded} keyName={null} />
+      </div>
+    </div>
+  );
+}
+
+function JsonNode({
+  value,
+  depth,
+  defaultExpanded,
+  keyName
+}: {
+  value: unknown;
+  depth: number;
+  defaultExpanded: number;
+  keyName: string | null;
+}) {
+  const [open, setOpen] = useState(depth < defaultExpanded);
+
+  if (value === null) {
+    return <JsonLeaf keyName={keyName}><span className="jsonNull">null</span></JsonLeaf>;
+  }
+  if (typeof value === "boolean") {
+    return <JsonLeaf keyName={keyName}><span className="jsonBool">{String(value)}</span></JsonLeaf>;
+  }
+  if (typeof value === "number") {
+    return <JsonLeaf keyName={keyName}><span className="jsonNumber">{value}</span></JsonLeaf>;
+  }
+  if (typeof value === "string") {
+    return <JsonStringLeaf keyName={keyName} value={value} />;
+  }
+  if (Array.isArray(value)) {
+    if (!value.length) {
+      return <JsonLeaf keyName={keyName}><span className="jsonMuted">[ ]</span></JsonLeaf>;
+    }
+    return (
+      <div className="jsonNode">
+        <button type="button" className="jsonNodeToggle" onClick={() => setOpen(!open)}>
+          {open ? <ChevronDown size={11} /> : <ChevronRight size={11} />}
+          {keyName !== null && <span className="jsonKey">{keyName}</span>}
+          <span className="jsonMuted">[</span>
+          <span className="jsonBadge">{value.length}</span>
+          {!open && <span className="jsonMuted">…]</span>}
+        </button>
+        {open && (
+          <div className="jsonChildren">
+            {value.map((child, index) => (
+              <JsonNode
+                key={index}
+                value={child}
+                depth={depth + 1}
+                defaultExpanded={defaultExpanded}
+                keyName={String(index)}
+              />
+            ))}
+            <span className="jsonMuted">]</span>
+          </div>
+        )}
+      </div>
+    );
+  }
+  if (typeof value === "object") {
+    const entries = Object.entries(value as Record<string, unknown>);
+    if (!entries.length) {
+      return <JsonLeaf keyName={keyName}><span className="jsonMuted">{"{ }"}</span></JsonLeaf>;
+    }
+    return (
+      <div className="jsonNode">
+        <button type="button" className="jsonNodeToggle" onClick={() => setOpen(!open)}>
+          {open ? <ChevronDown size={11} /> : <ChevronRight size={11} />}
+          {keyName !== null && <span className="jsonKey">{keyName}</span>}
+          <span className="jsonMuted">{"{"}</span>
+          <span className="jsonBadge">{entries.length}</span>
+          {!open && <span className="jsonMuted">…{"}"}</span>}
+        </button>
+        {open && (
+          <div className="jsonChildren">
+            {entries.map(([k, v]) => (
+              <JsonNode
+                key={k}
+                value={v}
+                depth={depth + 1}
+                defaultExpanded={defaultExpanded}
+                keyName={k}
+              />
+            ))}
+            <span className="jsonMuted">{"}"}</span>
+          </div>
+        )}
+      </div>
+    );
+  }
+  return <JsonLeaf keyName={keyName}><span>{String(value)}</span></JsonLeaf>;
+}
+
+function JsonLeaf({ keyName, children }: { keyName: string | null; children: React.ReactNode }) {
+  return (
+    <div className="jsonLeaf">
+      {keyName !== null && <span className="jsonKey">{keyName}</span>}
+      {children}
+    </div>
+  );
+}
+
+function JsonStringLeaf({ keyName, value }: { keyName: string | null; value: string }) {
+  const [expanded, setExpanded] = useState(false);
+  const long = value.length > 200;
+  const display = !long || expanded ? value : `${value.slice(0, 200)}…`;
+  return (
+    <div className="jsonLeaf">
+      {keyName !== null && <span className="jsonKey">{keyName}</span>}
+      <span className="jsonString">{display}</span>
+      {long && (
+        <button type="button" className="jsonStringToggle" onClick={() => setExpanded(!expanded)}>
+          {expanded ? "收起" : "展开"}
+        </button>
+      )}
+    </div>
+  );
+}
+
+function ConversationStream({ messages }: { messages: Message[] }) {
+  if (!messages.length) {
+    return <EmptyState icon={<MessageSquareText size={28} />} title="暂无会话记录" hint="一旦有用户消息或 AI 触达，对话会按时间在这里以左右气泡呈现。" />;
+  }
+  const items: React.ReactNode[] = [];
+  let lastTime: number | null = null;
+  for (const message of messages) {
+    const ts = message.createdAt ? Date.parse(message.createdAt) : Number.NaN;
+    if (!Number.isNaN(ts) && (lastTime === null || ts - lastTime > 30 * 60 * 1000)) {
+      items.push(
+        <div key={`sep-${message.id}`} className="bubbleSeparator">
+          <span>{formatTime(message.createdAt)}</span>
+        </div>
+      );
+    }
+    if (!Number.isNaN(ts)) lastTime = ts;
+    const isInbound = message.direction === "inbound";
+    items.push(
+      <div key={message.id} className={`bubbleRow ${isInbound ? "inbound" : "outbound"}`}>
+        <div className="bubbleAvatar">
+          {isInbound ? <User2 size={13} /> : <Bot size={13} />}
+        </div>
+        <div className="bubbleBody">
+          <div className="bubble">
+            <p>{message.content}</p>
+          </div>
+          <span className="bubbleMeta">{formatTime(message.createdAt)}</span>
+        </div>
+      </div>
+    );
+  }
+  return <div className="conversationStream">{items}</div>;
+}
+
+function EventTimeline({
+  items
+}: {
+  items: { id: string; tone: "ai" | "good" | "warn" | "error" | "neutral"; title: string; subtitle?: string; meta?: string; chips?: string[] }[];
+}) {
+  if (!items.length) {
+    return <EmptyState icon={<Activity size={26} />} title="暂无事件" hint="跟进任务、Agent 决策与拦截会按时间在这里呈现。" />;
+  }
+  return (
+    <ol className="eventTimeline">
+      {items.map((item) => (
+        <li key={item.id} className={`timelineItem tone-${item.tone}`}>
+          <span className="timelineDot" />
+          <div className="timelineCard">
+            <div className="timelineHead">
+              <strong>{item.title}</strong>
+              {item.meta && <span>{item.meta}</span>}
+            </div>
+            {item.subtitle && <p>{item.subtitle}</p>}
+            {item.chips && item.chips.length > 0 && (
+              <div className="timelineChips">
+                {item.chips.map((chip, idx) => (
+                  <span key={`${chip}-${idx}`}>{chip}</span>
+                ))}
+              </div>
+            )}
+          </div>
+        </li>
+      ))}
+    </ol>
+  );
+}
+
 function channelTitle(channel: Channel) {
   switch (channel) {
     case "command":
@@ -4691,6 +6586,9 @@ function emptyKnowledgeDraft(): OperationKnowledgeDraft {
     safeClaims: "",
     forbiddenClaims: "",
     evidenceItems: "",
+    productTags: "",
+    triggerKeywords: "",
+    businessTopics: "",
     sourceName: "",
     status: "active",
     priority: "0"
@@ -4719,7 +6617,10 @@ function emptyChunkDraft(): OperationKnowledgeChunkDraft {
     unsupportedClaims: "",
     verifiedClaims: "",
     status: "active",
-    priority: "0"
+    priority: "0",
+    productTags: "",
+    triggerKeywords: "",
+    businessTopics: ""
   };
 }
 
@@ -4745,6 +6646,9 @@ function draftFromKnowledge(item: OperationKnowledgeItem): OperationKnowledgeDra
     safeClaims: (item.safeClaims || []).join("\n"),
     forbiddenClaims: (item.forbiddenClaims || []).join("\n"),
     evidenceItems: (item.evidenceItems || []).join("\n"),
+    productTags: (item.productTags || []).join(", "),
+    triggerKeywords: (item.triggerKeywords || []).join(", "),
+    businessTopics: (item.businessTopics || []).join(", "),
     sourceName: item.sourceName ?? "",
     status: item.status || "active",
     priority: String(item.priority ?? 0)
@@ -4773,7 +6677,10 @@ function draftFromChunk(item: OperationKnowledgeChunk): OperationKnowledgeChunkD
     unsupportedClaims: (item.unsupportedClaims || []).join("\n"),
     verifiedClaims: (item.verifiedClaims || []).join("\n"),
     status: item.status || "active",
-    priority: String(item.priority ?? 0)
+    priority: String(item.priority ?? 0),
+    productTags: (item.productTags || []).join(", "),
+    triggerKeywords: (item.triggerKeywords || []).join(", "),
+    businessTopics: (item.businessTopics || []).join(", ")
   };
 }
 
@@ -4860,6 +6767,9 @@ function knowledgePayload(draft: OperationKnowledgeDraft) {
     safeClaims: splitLines(draft.safeClaims),
     forbiddenClaims: splitLines(draft.forbiddenClaims),
     evidenceItems: splitLines(draft.evidenceItems),
+    productTags: splitTags(draft.productTags),
+    triggerKeywords: splitTags(draft.triggerKeywords),
+    businessTopics: splitTags(draft.businessTopics),
     sourceType: "manual",
     sourceName: draft.sourceName || undefined,
     status: draft.status || "active",
@@ -4967,8 +6877,139 @@ function chunkPayload(draft: OperationKnowledgeChunkDraft) {
     unsupportedClaims: splitLines(draft.unsupportedClaims),
     verifiedClaims: splitLines(draft.verifiedClaims),
     status: draft.status || "active",
-    priority: Number(draft.priority || 0)
+    priority: Number(draft.priority || 0),
+    productTags: splitTags(draft.productTags),
+    triggerKeywords: splitTags(draft.triggerKeywords),
+    businessTopics: splitTags(draft.businessTopics)
   };
+}
+
+const AI_REPAIR_CHUNK_FIELDS = [
+  "knowledgeType",
+  "businessContext",
+  "title",
+  "summary",
+  "body",
+  "routingCard",
+  "applicableScenes",
+  "notApplicableScenes",
+  "safeClaims",
+  "forbiddenClaims",
+  "evidenceItems",
+  "sourceQuote",
+  "productTags",
+  "triggerKeywords",
+  "businessTopics"
+] as const;
+
+const AI_REPAIR_PACK_FIELDS = [
+  "knowledgeType",
+  "businessContext",
+  "title",
+  "summary",
+  "body",
+  "routingCard",
+  "applicableScenes",
+  "notApplicableScenes",
+  "suitableFor",
+  "notSuitableFor",
+  "customerStages",
+  "operationStates",
+  "intentLevels",
+  "safeClaims",
+  "forbiddenClaims",
+  "commonQuestions",
+  "commonObjections",
+  "evidenceItems",
+  "productTags",
+  "triggerKeywords",
+  "businessTopics"
+] as const;
+
+function mergeChunkPatch(
+  chunk: OperationKnowledgeChunk,
+  patch: Record<string, unknown>
+): Record<string, unknown> {
+  const result: Record<string, unknown> = {
+    documentId: chunk.documentId,
+    itemId: chunk.itemId,
+    domain: "user_operations",
+    knowledgeType: chunk.knowledgeType,
+    businessContext: chunk.businessContext,
+    title: chunk.title,
+    summary: chunk.summary,
+    body: chunk.body,
+    routingCard: chunk.routingCard,
+    applicableScenes: chunk.applicableScenes ?? [],
+    notApplicableScenes: chunk.notApplicableScenes ?? [],
+    safeClaims: chunk.safeClaims ?? [],
+    forbiddenClaims: chunk.forbiddenClaims ?? [],
+    evidenceItems: chunk.evidenceItems ?? [],
+    sourceQuote: chunk.sourceQuote,
+    sourceAnchors: chunk.sourceAnchors ?? [],
+    integrityStatus: chunk.integrityStatus,
+    confidenceScore: chunk.confidenceScore ?? 0,
+    distortionRisks: chunk.distortionRisks ?? [],
+    unsupportedClaims: chunk.unsupportedClaims ?? [],
+    verifiedClaims: chunk.verifiedClaims ?? [],
+    status: chunk.status || "active",
+    priority: chunk.priority ?? 0,
+    productTags: chunk.productTags ?? [],
+    triggerKeywords: chunk.triggerKeywords ?? [],
+    businessTopics: chunk.businessTopics ?? []
+  };
+  for (const key of AI_REPAIR_CHUNK_FIELDS) {
+    if (Object.prototype.hasOwnProperty.call(patch, key)) {
+      const value = patch[key];
+      if (value !== undefined && value !== null) {
+        result[key] = value;
+      }
+    }
+  }
+  return result;
+}
+
+function mergePackPatch(
+  pack: OperationKnowledgeItem,
+  patch: Record<string, unknown>
+): Record<string, unknown> {
+  const result: Record<string, unknown> = {
+    domain: "user_operations",
+    category: pack.category,
+    businessType: pack.businessType,
+    knowledgeType: pack.knowledgeType,
+    businessContext: pack.businessContext,
+    title: pack.title,
+    summary: pack.summary,
+    body: pack.body,
+    routingCard: pack.routingCard,
+    applicableScenes: pack.applicableScenes ?? [],
+    notApplicableScenes: pack.notApplicableScenes ?? [],
+    suitableFor: pack.suitableFor ?? [],
+    notSuitableFor: pack.notSuitableFor ?? [],
+    customerStages: pack.customerStages ?? [],
+    operationStates: pack.operationStates ?? [],
+    intentLevels: pack.intentLevels ?? [],
+    safeClaims: pack.safeClaims ?? [],
+    forbiddenClaims: pack.forbiddenClaims ?? [],
+    commonQuestions: pack.commonQuestions ?? [],
+    commonObjections: pack.commonObjections ?? [],
+    evidenceItems: pack.evidenceItems ?? [],
+    productTags: pack.productTags ?? [],
+    triggerKeywords: pack.triggerKeywords ?? [],
+    businessTopics: pack.businessTopics ?? [],
+    status: pack.status || "active",
+    priority: pack.priority ?? 0
+  };
+  for (const key of AI_REPAIR_PACK_FIELDS) {
+    if (Object.prototype.hasOwnProperty.call(patch, key)) {
+      const value = patch[key];
+      if (value !== undefined && value !== null) {
+        result[key] = value;
+      }
+    }
+  }
+  return result;
 }
 
 function integrityStatusLabel(status?: string) {
@@ -5039,6 +7080,200 @@ function splitLines(value: string) {
     .split(/\n/)
     .map((item) => item.trim())
     .filter(Boolean);
+}
+
+type TreeNodeKind =
+  | "document"
+  | "pack"
+  | "chunk"
+  | "group-orphan-packs"
+  | "group-orphan-chunks";
+
+type TreeNodeBadge = { tone: "good" | "warn" | "error" | "neutral"; text: string };
+
+type TreeNode = {
+  id: string;
+  kind: TreeNodeKind;
+  refId?: string;
+  label: string;
+  meta?: string;
+  badges?: TreeNodeBadge[];
+  children?: TreeNode[];
+};
+
+function chunkBadge(chunk: OperationKnowledgeChunk): TreeNodeBadge | null {
+  const status = (chunk.integrityStatus || "").toLowerCase();
+  if (!status) return null;
+  if (status === "verified") return { tone: "good", text: "已验证" };
+  if (status === "rejected") return { tone: "error", text: "已拒绝" };
+  if (status === "needs_review" || status === "needsreview") return { tone: "warn", text: "AI 需复核" };
+  return { tone: "neutral", text: status };
+}
+
+function buildKnowledgeTree(
+  documents: OperationKnowledgeDocument[],
+  items: OperationKnowledgeItem[],
+  chunks: OperationKnowledgeChunk[]
+): TreeNode[] {
+  const roots: TreeNode[] = [];
+
+  const chunksByItem = new Map<string, OperationKnowledgeChunk[]>();
+  const chunksByDoc = new Map<string, OperationKnowledgeChunk[]>();
+  const chunksOrphan: OperationKnowledgeChunk[] = [];
+  for (const c of chunks) {
+    if (c.itemId) {
+      const arr = chunksByItem.get(c.itemId) || [];
+      arr.push(c);
+      chunksByItem.set(c.itemId, arr);
+    } else if (c.documentId) {
+      const arr = chunksByDoc.get(c.documentId) || [];
+      arr.push(c);
+      chunksByDoc.set(c.documentId, arr);
+    } else {
+      chunksOrphan.push(c);
+    }
+  }
+
+  const docIdByItem = new Map<string, string>();
+  for (const item of items) {
+    const owning = chunks.find((c) => c.itemId === item.id && c.documentId);
+    if (owning?.documentId) docIdByItem.set(item.id, owning.documentId);
+  }
+
+  const itemsByDoc = new Map<string, OperationKnowledgeItem[]>();
+  const orphanItems: OperationKnowledgeItem[] = [];
+  for (const item of items) {
+    const docId = docIdByItem.get(item.id);
+    if (docId) {
+      const arr = itemsByDoc.get(docId) || [];
+      arr.push(item);
+      itemsByDoc.set(docId, arr);
+    } else {
+      const matchedDoc = documents.find(
+        (d) => item.sourceName && (d.title === item.sourceName || d.sourceName === item.sourceName)
+      );
+      if (matchedDoc) {
+        const arr = itemsByDoc.get(matchedDoc.id) || [];
+        arr.push(item);
+        itemsByDoc.set(matchedDoc.id, arr);
+      } else {
+        orphanItems.push(item);
+      }
+    }
+  }
+
+  for (const doc of documents) {
+    const docPacks = itemsByDoc.get(doc.id) || [];
+    const looseChunks = chunksByDoc.get(doc.id) || [];
+    const packNodes: TreeNode[] = docPacks.map((pack) => {
+      const packChunks = chunksByItem.get(pack.id) || [];
+      return {
+        id: `pack:${pack.id}`,
+        kind: "pack",
+        refId: pack.id,
+        label: pack.title,
+        meta: packChunks.length ? `${packChunks.length} 切片` : "0 切片",
+        children: packChunks.map((c) => ({
+          id: `chunk:${c.id}`,
+          kind: "chunk",
+          refId: c.id,
+          label: c.title,
+          badges: [chunkBadge(c)].filter(Boolean) as TreeNodeBadge[]
+        }))
+      };
+    });
+    const looseChunkNodes: TreeNode[] = looseChunks.map((c) => ({
+      id: `chunk:${c.id}`,
+      kind: "chunk",
+      refId: c.id,
+      label: c.title,
+      badges: [chunkBadge(c)].filter(Boolean) as TreeNodeBadge[]
+    }));
+    roots.push({
+      id: `doc:${doc.id}`,
+      kind: "document",
+      refId: doc.id,
+      label: doc.title || doc.sourceName || "未命名文档",
+      meta: `${packNodes.length} 包 · ${packNodes.reduce((n, p) => n + (p.children?.length || 0), 0) + looseChunkNodes.length} 切片`,
+      children: [...packNodes, ...looseChunkNodes]
+    });
+  }
+
+  if (orphanItems.length) {
+    roots.push({
+      id: "group:orphan-packs",
+      kind: "group-orphan-packs",
+      label: "未关联文档的知识包",
+      meta: `${orphanItems.length} 个`,
+      children: orphanItems.map((pack) => {
+        const packChunks = chunksByItem.get(pack.id) || [];
+        return {
+          id: `pack:${pack.id}`,
+          kind: "pack",
+          refId: pack.id,
+          label: pack.title,
+          meta: packChunks.length ? `${packChunks.length} 切片` : "0 切片",
+          children: packChunks.map((c) => ({
+            id: `chunk:${c.id}`,
+            kind: "chunk",
+            refId: c.id,
+            label: c.title,
+            badges: [chunkBadge(c)].filter(Boolean) as TreeNodeBadge[]
+          }))
+        };
+      })
+    });
+  }
+
+  if (chunksOrphan.length) {
+    roots.push({
+      id: "group:orphan-chunks",
+      kind: "group-orphan-chunks",
+      label: "未关联包的切片",
+      meta: `${chunksOrphan.length} 个`,
+      children: chunksOrphan.map((c) => ({
+        id: `chunk:${c.id}`,
+        kind: "chunk",
+        refId: c.id,
+        label: c.title,
+        badges: [chunkBadge(c)].filter(Boolean) as TreeNodeBadge[]
+      }))
+    });
+  }
+
+  return roots;
+}
+
+function findTreeNode(roots: TreeNode[], id: string): TreeNode | null {
+  for (const root of roots) {
+    if (root.id === id) return root;
+    if (root.children) {
+      const found = findTreeNode(root.children, id);
+      if (found) return found;
+    }
+  }
+  return null;
+}
+
+function findAncestors(roots: TreeNode[], id: string, trail: string[] = []): string[] | null {
+  for (const root of roots) {
+    if (root.id === id) return trail;
+    if (root.children) {
+      const next = findAncestors(root.children, id, [...trail, root.id]);
+      if (next) return next;
+    }
+  }
+  return null;
+}
+
+function eventTone(status?: string): "ai" | "good" | "warn" | "error" | "neutral" {
+  const s = (status || "").toLowerCase();
+  if (!s) return "neutral";
+  if (s.includes("success") || s === "ok" || s === "approved" || s.includes("done")) return "good";
+  if (s.includes("fail") || s.includes("error") || s.includes("blocked") || s.includes("rejected")) return "error";
+  if (s.includes("warn") || s.includes("hold") || s.includes("pending") || s.includes("waiting")) return "warn";
+  if (s.includes("ai") || s.includes("agent")) return "ai";
+  return "neutral";
 }
 
 function formatScores(scores: Record<string, number>) {
@@ -5735,12 +7970,19 @@ export function PlannerViewSection({ contact }: { contact: Contact | null }) {
   const commitments = (contact.commitments ?? []).slice(0, 5);
   const hasStage = !!stageUpdatedAt;
   const hasCommitments = commitments.length > 0;
-  if (!hasStage && !hasCommitments) {
+  const lastMode = (contact as { lastConversationMode?: string | null }).lastConversationMode || null;
+  const hasMode = !!lastMode;
+  if (!hasStage && !hasCommitments && !hasMode) {
     return null;
   }
   return (
     <section className="cockpitSection" data-testid="planner-view-section">
       <div className="sectionCaption">Planner 视角</div>
+      {hasMode && (
+        <div data-testid="planner-mode-row" style={{ fontSize: 13, color: "#444", marginBottom: 8 }}>
+          上轮对话模式 <strong>{conversationModeLabel(lastMode!)}</strong>
+        </div>
+      )}
       {hasStage && (
         <div data-testid="planner-stage-row" style={{ fontSize: 13, color: "#444", marginBottom: 8 }}>
           客户阶段 <strong>{contact.customerStage || "未分层"}</strong>
@@ -5761,6 +8003,21 @@ export function PlannerViewSection({ contact }: { contact: Contact | null }) {
       )}
     </section>
   );
+}
+
+function conversationModeLabel(mode: string): string {
+  switch (mode) {
+    case "casual_relationship":
+      return "寒暄关系（casual_relationship）";
+    case "value_exchange":
+      return "价值互换（value_exchange）";
+    case "consultative":
+      return "顾问/销售（consultative）";
+    case "boundary_protection":
+      return "边界保护（boundary_protection）";
+    default:
+      return mode;
+  }
 }
 
 /** M3 / Task 79：把 ISO 时间格式化成 cockpit 显示用的"YYYY-MM-DD HH:mm"。 */
@@ -6193,5 +8450,995 @@ function ProductClaimMarkersTab() {
         </>
       )}
     </div>
+  );
+}
+
+type AiRepairTarget = { kind: "chunk" | "pack"; id: string; label: string };
+
+/// 前端在调用现有 PUT 落库 + 可选 verify 之后，再 POST `/repair/applied`
+/// 写入审计事件时携带的元数据。所有字段都是只读快照，纯审计用，不影响业务字段。
+type AiRepairApplyAuditMeta = {
+  sessionId?: string;
+  turn?: number;
+  confidenceHint?: number;
+  acceptedFields: string[];
+  skippedFields: string[];
+};
+
+type AiRepairProposal = {
+  chunkId?: string;
+  packId?: string;
+  sessionId?: string;
+  turn?: number;
+  promptKey?: string;
+  interpretation?: Record<string, unknown> | null;
+  patch?: Record<string, unknown> | null;
+  missingFields?: Array<{ field: string; reason?: string | null } | string>;
+  followupQuestions?: Array<{ id: string; field?: string; question: string }>;
+  stillMissing?: Array<{ field: string; reason?: string | null } | string>;
+  confidenceHint?: number;
+  isFinalTurn?: boolean;
+};
+
+const AI_REPAIR_FIELD_LABELS: Record<string, string> = {
+  routingCard: "路由卡片",
+  summary: "摘要",
+  body: "正文",
+  knowledgeType: "知识类型",
+  businessContext: "业务上下文",
+  applicableScenes: "适用场景",
+  notApplicableScenes: "不适用场景",
+  safeClaims: "安全事实",
+  forbiddenClaims: "禁止承诺",
+  evidenceItems: "证据",
+  sourceQuote: "源文锚定",
+  customerStages: "客户阶段（按领域重解读）",
+  intentLevels: "意图等级（按领域重解读）",
+  commonQuestions: "常见问题（按领域重解读）",
+  commonObjections: "常见异议（按领域重解读）",
+  suitableFor: "适用对象",
+  notSuitableFor: "不适用对象",
+  productTags: "产品标签",
+  triggerKeywords: "触发关键词",
+  businessTopics: "业务主题",
+  extras: "领域专属字段"
+};
+
+function aiRepairFieldLabel(key: string): string {
+  return AI_REPAIR_FIELD_LABELS[key] ?? key;
+}
+
+const AI_INTERPRETATION_LABELS: Record<string, string> = {
+  domain: "领域",
+  audience: "读者",
+  purpose: "用途",
+  openConditions: "何时打开",
+  catalogContext: "目录脉络",
+  riskNotes: "风险提示",
+  businessTopics: "业务主题",
+  triggerKeywords: "触发关键词",
+  notes: "其他说明"
+};
+
+function aiInterpretationLabel(key: string): string {
+  return AI_INTERPRETATION_LABELS[key] ?? key;
+}
+
+function aiRepairFormatValue(value: unknown): string {
+  if (value === null || value === undefined) return "（空）";
+  if (Array.isArray(value)) {
+    if (value.length === 0) return "（空）";
+    return value
+      .map((v) => (typeof v === "string" ? v : JSON.stringify(v)))
+      .join(" / ");
+  }
+  if (typeof value === "object") {
+    return JSON.stringify(value, null, 2);
+  }
+  const s = String(value);
+  return s.trim() === "" ? "（空）" : s;
+}
+
+function aiRepairCurrentValue(
+  target: AiRepairTarget,
+  field: string,
+  chunks: OperationKnowledgeChunk[],
+  packs: OperationKnowledgeItem[]
+): unknown {
+  if (target.kind === "chunk") {
+    const c = chunks.find((x) => x.id === target.id);
+    if (!c) return undefined;
+    return (c as unknown as Record<string, unknown>)[field];
+  }
+  const p = packs.find((x) => x.id === target.id);
+  if (!p) return undefined;
+  return (p as unknown as Record<string, unknown>)[field];
+}
+
+function AiRepairPanel(props: {
+  target: AiRepairTarget;
+  chunks: OperationKnowledgeChunk[];
+  packs: OperationKnowledgeItem[];
+  onClose: () => void;
+  proposeChunk: (chunkId: string) => Promise<Record<string, unknown>>;
+  answerChunk: (
+    chunkId: string,
+    body: {
+      sessionId?: string;
+      previousPatch?: Record<string, unknown> | null;
+      answers: Array<{ id: string; field?: string; text: string }>;
+      turn: number;
+    }
+  ) => Promise<Record<string, unknown>>;
+  proposePack: (packId: string) => Promise<Record<string, unknown>>;
+  onApply: (
+    target: AiRepairTarget,
+    patch: Record<string, unknown>,
+    options: { thenVerify?: boolean },
+    auditMeta: AiRepairApplyAuditMeta
+  ) => Promise<void>;
+}) {
+  const { target, onClose } = props;
+  const [phase, setPhase] = useState<
+    "proposing" | "reviewing" | "answering" | "applying" | "error"
+  >("proposing");
+  const [proposal, setProposal] = useState<AiRepairProposal | null>(null);
+  const [skippedFields, setSkippedFields] = useState<Set<string>>(new Set());
+  const [answers, setAnswers] = useState<Record<string, string>>({});
+  const [errorMsg, setErrorMsg] = useState<string | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    setPhase("proposing");
+    setProposal(null);
+    setSkippedFields(new Set());
+    setAnswers({});
+    setErrorMsg(null);
+    const propose =
+      target.kind === "chunk"
+        ? props.proposeChunk(target.id)
+        : props.proposePack(target.id);
+    propose
+      .then((data) => {
+        if (cancelled) return;
+        setProposal(data as AiRepairProposal);
+        setPhase("reviewing");
+      })
+      .catch((err: Error) => {
+        if (cancelled) return;
+        setErrorMsg(err.message || "AI 提案失败");
+        setPhase("error");
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [target]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const patch = (proposal?.patch ?? {}) as Record<string, unknown>;
+  const patchEntries = Object.entries(patch);
+  const followup = proposal?.followupQuestions ?? [];
+  const missing = proposal?.missingFields ?? [];
+  const stillMissing = proposal?.stillMissing ?? [];
+  const interpretation = (proposal?.interpretation ?? {}) as Record<string, unknown>;
+
+  function toggleSkip(field: string) {
+    const next = new Set(skippedFields);
+    if (next.has(field)) {
+      next.delete(field);
+    } else {
+      next.add(field);
+    }
+    setSkippedFields(next);
+  }
+
+  function buildAcceptedPatch(): Record<string, unknown> {
+    const out: Record<string, unknown> = {};
+    for (const [k, v] of patchEntries) {
+      if (skippedFields.has(k)) continue;
+      out[k] = v;
+    }
+    return out;
+  }
+
+  async function handleSubmitAnswers() {
+    if (target.kind !== "chunk") return;
+    const turn = (proposal?.turn ?? 1) + 1;
+    const allAnswered = followup.every((q) => (answers[q.id] ?? "").trim().length > 0);
+    if (!allAnswered) return;
+    setPhase("answering");
+    setErrorMsg(null);
+    try {
+      const data = await props.answerChunk(target.id, {
+        sessionId: proposal?.sessionId,
+        previousPatch: proposal?.patch ?? null,
+        answers: followup.map((q) => ({
+          id: q.id,
+          field: q.field,
+          text: answers[q.id] ?? ""
+        })),
+        turn
+      });
+      setProposal(data as AiRepairProposal);
+      setSkippedFields(new Set());
+      setAnswers({});
+      setPhase("reviewing");
+    } catch (err) {
+      setErrorMsg((err as Error).message || "AI 追问合并失败");
+      setPhase("error");
+    }
+  }
+
+  async function handleApply(thenVerify: boolean) {
+    setPhase("applying");
+    setErrorMsg(null);
+    try {
+      const acceptedFields = patchEntries
+        .map(([k]) => k)
+        .filter((k) => !skippedFields.has(k) && k !== "extras");
+      const skipped = Array.from(skippedFields);
+      await props.onApply(
+        target,
+        buildAcceptedPatch(),
+        { thenVerify },
+        {
+          sessionId: proposal?.sessionId,
+          turn: proposal?.turn,
+          confidenceHint: proposal?.confidenceHint,
+          acceptedFields,
+          skippedFields: skipped
+        }
+      );
+      onClose();
+    } catch (err) {
+      setErrorMsg((err as Error).message || "应用失败");
+      setPhase("error");
+    }
+  }
+
+  const acceptedCount = patchEntries.length - skippedFields.size;
+  const finalTurnReached = (proposal?.turn ?? 1) >= 3 || proposal?.isFinalTurn === true;
+  const stillMissingDisplay = stillMissing.length > 0;
+
+  return (
+    <div className="aiRepairScrim" role="dialog" aria-modal="true" aria-label="AI 自主修复">
+      <div className="aiRepairPanel">
+        <div className="aiRepairPanel__head">
+          <div className="title">
+            <Sparkles size={16} className="ai" />
+            <span>AI 自主修复</span>
+            <span className="aiRepairPanel__subject">
+              · {target.kind === "chunk" ? "切片" : "知识包"}：{target.label}
+            </span>
+          </div>
+          <button
+            type="button"
+            className="iconButton"
+            onClick={onClose}
+            aria-label="关闭"
+          >
+            <X size={16} />
+          </button>
+        </div>
+
+        <div className="aiRepairPanel__body">
+          {phase === "proposing" && (
+            <div className="aiRepairSection">
+              <div className="aiRepairSection__title">AI 正在阅读知识，请稍候</div>
+              <div className="aiRepairLoading">分析切片所在领域、原文证据、父知识包……</div>
+            </div>
+          )}
+
+          {phase === "error" && (
+            <div className="aiRepairSection">
+              <div className="aiRepairSection__title">AI 提案出错</div>
+              <div className="error">{errorMsg ?? "未知错误"}</div>
+            </div>
+          )}
+
+          {(phase === "reviewing" || phase === "answering" || phase === "applying") && proposal && (
+            <>
+              {Object.keys(interpretation).length > 0 && (
+                <div className="aiRepairSection">
+                  <div className="aiRepairSection__title">AI 对该条知识的理解</div>
+                  <div className="aiInterpretation">
+                    {Object.entries(interpretation).map(([k, v]) => {
+                      if (v === null || v === undefined || v === "") return null;
+                      const label = aiInterpretationLabel(k);
+                      const text =
+                        typeof v === "string"
+                          ? v
+                          : Array.isArray(v)
+                          ? (v as unknown[]).map(String).join(" / ")
+                          : JSON.stringify(v);
+                      return (
+                        <div key={k}>
+                          <span>{label}</span>
+                          <strong>{text}</strong>
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+              )}
+
+              <div className="aiRepairSection">
+                <div className="aiRepairSection__title">
+                  AI 提案 · 共 {patchEntries.length} 项 · 已接受 {acceptedCount} 项 · 自评可信度{" "}
+                  {proposal.confidenceHint ?? 0}/100
+                </div>
+                {patchEntries.length === 0 ? (
+                  <div className="aiRepairEmpty">AI 未生成任何字段提案；可在下方追问中补充信息。</div>
+                ) : (
+                  patchEntries.map(([field, value]) => {
+                    const before = aiRepairCurrentValue(
+                      target,
+                      field,
+                      props.chunks,
+                      props.packs
+                    );
+                    const skipped = skippedFields.has(field);
+                    return (
+                      <div
+                        key={field}
+                        className={`aiPatchRow${skipped ? " skipped" : ""}`}
+                      >
+                        <div className="aiPatchRow__field">{aiRepairFieldLabel(field)}</div>
+                        <div className="aiPatchRow__before">
+                          <span>现值：</span>
+                          {aiRepairFormatValue(before)}
+                        </div>
+                        <div className="aiPatchRow__after">
+                          <span>AI 建议：</span>
+                          {aiRepairFormatValue(value)}
+                        </div>
+                        <div className="aiPatchRow__actions">
+                          <button
+                            type="button"
+                            className="ghost compactButton"
+                            onClick={() => toggleSkip(field)}
+                          >
+                            {skipped ? "接受此项" : "跳过此项"}
+                          </button>
+                        </div>
+                      </div>
+                    );
+                  })
+                )}
+              </div>
+
+              {missing.length > 0 && (
+                <div className="aiRepairSection">
+                  <div className="aiRepairSection__title">
+                    AI 暂无法补完的字段（{missing.length}）
+                  </div>
+                  <ul className="aiMissingList">
+                    {missing.map((m, idx) => {
+                      const field = typeof m === "string" ? m : m.field;
+                      const reason = typeof m === "string" ? null : m.reason;
+                      return (
+                        <li key={idx}>
+                          <strong>{aiRepairFieldLabel(field)}</strong>
+                          {reason ? <span>· {String(reason)}</span> : null}
+                        </li>
+                      );
+                    })}
+                  </ul>
+                </div>
+              )}
+
+              {target.kind === "chunk" && followup.length > 0 && !finalTurnReached && (
+                <div className="aiRepairSection">
+                  <div className="aiRepairSection__title">
+                    AI 还需要 {followup.length} 项信息确认
+                  </div>
+                  {followup.map((q) => (
+                    <div key={q.id} className="aiQaBubble">
+                      <div className="aiQaBubble__q">
+                        <Bot size={14} className="ai" />
+                        <span>
+                          AI：{q.question}
+                          {q.field ? (
+                            <span className="aiQaBubble__field">
+                              · 关联字段：{aiRepairFieldLabel(q.field)}
+                            </span>
+                          ) : null}
+                        </span>
+                      </div>
+                      <div className="aiQaBubble__a">
+                        <textarea
+                          value={answers[q.id] ?? ""}
+                          onChange={(e) =>
+                            setAnswers({ ...answers, [q.id]: e.target.value })
+                          }
+                          placeholder="把你知道的事实写在这里，AI 只摘取与字段直接相关的部分。"
+                        />
+                      </div>
+                    </div>
+                  ))}
+                  <div className="aiRepairSection__inlineFoot">
+                    <button
+                      type="button"
+                      className="primary"
+                      onClick={() => void handleSubmitAnswers()}
+                      disabled={
+                        phase === "answering" ||
+                        followup.some((q) => (answers[q.id] ?? "").trim().length === 0)
+                      }
+                    >
+                      {phase === "answering" ? "AI 合并中…" : "提交回答继续修复"}
+                    </button>
+                  </div>
+                </div>
+              )}
+
+              {target.kind === "pack" && followup.length > 0 && (
+                <div className="aiRepairSection">
+                  <div className="aiRepairSection__title">
+                    AI 提示需要的额外信息（{followup.length}）
+                  </div>
+                  <ul className="aiMissingList">
+                    {followup.map((q) => (
+                      <li key={q.id}>
+                        <strong>{q.field ? aiRepairFieldLabel(q.field) : "提示"}</strong>
+                        <span>· {q.question}</span>
+                      </li>
+                    ))}
+                  </ul>
+                  <div className="aiRepairWarn">
+                    知识包修复一轮即结束。请在保存前手动在编辑器里补充上述字段。
+                  </div>
+                </div>
+              )}
+
+              {patch.extras && typeof patch.extras === "object" && (
+                <div className="aiRepairSection">
+                  <div className="aiRepairSection__title">领域专属附加字段（extras）</div>
+                  <div className="aiExtrasGrid">
+                    {Object.entries(patch.extras as Record<string, unknown>).map(([k, v]) => (
+                      <div key={k} className="aiExtrasItem">
+                        <em>{k}</em>
+                        <span>{aiRepairFormatValue(v)}</span>
+                      </div>
+                    ))}
+                  </div>
+                  <div className="aiRepairWarn aiRepairWarn--quiet">
+                    extras 不写入主字段，仅审计记录。如果你希望持久化，请把它收敛到对应主字段。
+                  </div>
+                </div>
+              )}
+
+              {stillMissingDisplay && (target.kind === "pack" || finalTurnReached) && (
+                <div className="aiRepairSection">
+                  <div className="aiRepairSection__title">仍信息不足</div>
+                  <div className="aiRepairWarn">
+                    以下字段需要运营手动补完：
+                    {stillMissing
+                      .map((m) => (typeof m === "string" ? m : m.field))
+                      .map(aiRepairFieldLabel)
+                      .join(" / ")}
+                  </div>
+                </div>
+              )}
+            </>
+          )}
+        </div>
+
+        <div className="aiRepairPanel__foot">
+          {phase === "error" ? (
+            <button type="button" className="secondary" onClick={onClose}>
+              关闭
+            </button>
+          ) : (
+            <>
+              <button type="button" className="secondary" onClick={onClose}>
+                全部驳回
+              </button>
+              {target.kind === "chunk" ? (
+                <>
+                  <button
+                    type="button"
+                    className="primary"
+                    onClick={() => void handleApply(false)}
+                    disabled={
+                      phase !== "reviewing" || acceptedCount === 0
+                    }
+                  >
+                    应用所有接受字段
+                  </button>
+                  <button
+                    type="button"
+                    className="success"
+                    onClick={() => void handleApply(true)}
+                    disabled={
+                      phase !== "reviewing" || acceptedCount === 0
+                    }
+                  >
+                    应用并立即运营确认
+                  </button>
+                </>
+              ) : (
+                <button
+                  type="button"
+                  className="primary"
+                  onClick={() => void handleApply(false)}
+                  disabled={phase !== "reviewing" || acceptedCount === 0}
+                >
+                  应用所有接受字段
+                </button>
+              )}
+            </>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+const INTENT_LABELS: Record<string, string> = {
+  create_chunk: "新建",
+  update_chunk: "修改",
+  update_pack: "修改 pack",
+  clarify_chunk: "澄清",
+  freeform: "自由对话"
+};
+
+function KnowledgeChatPanel(props: {
+  open: boolean;
+  initialSessionId?: string;
+  accountId?: string;
+  onClose: (persistedSessionId?: string) => void;
+  onApplied: () => void;
+  postTurn: (body: {
+    sessionId?: string;
+    accountId?: string;
+    content: string;
+    attachments?: Array<{ chunkId?: string; itemId?: string }>;
+  }) => Promise<KnowledgeChatTurnResponse>;
+  getHistory: (
+    sessionId: string
+  ) => Promise<{ sessionId: string; items: KnowledgeChatTurnView[]; total: number }>;
+  apply: (
+    sessionId: string,
+    accountId?: string
+  ) => Promise<{ ok: boolean; sessionId: string; intent: string; result: Record<string, unknown> }>;
+  discard: (sessionId: string) => Promise<{ ok: boolean; sessionId: string; discardedCount: number }>;
+}) {
+  const { open, accountId, onClose, onApplied } = props;
+  const [sessionId, setSessionId] = useState<string | undefined>(props.initialSessionId);
+  const [turns, setTurns] = useState<KnowledgeChatTurnView[]>([]);
+  const [draftKind, setDraftKind] = useState<string | null>(null);
+  const [draftPatch, setDraftPatch] = useState<Record<string, unknown> | null>(null);
+  const [missingFields, setMissingFields] = useState<string[]>([]);
+  const [followups, setFollowups] = useState<
+    Array<{ id?: string; field?: string; question?: string }>
+  >([]);
+  const [canApply, setCanApply] = useState(false);
+  const [phase, setPhase] = useState<"idle" | "sending" | "applying" | "discarding" | "error">("idle");
+  const [error, setError] = useState<string | null>(null);
+  const [input, setInput] = useState("");
+  const streamRef = useRef<HTMLDivElement | null>(null);
+
+  useEffect(() => {
+    if (!open) return;
+    setError(null);
+    if (!props.initialSessionId) {
+      setSessionId(undefined);
+      setTurns([]);
+      setDraftKind(null);
+      setDraftPatch(null);
+      setMissingFields([]);
+      setFollowups([]);
+      setCanApply(false);
+      return;
+    }
+    setSessionId(props.initialSessionId);
+    let cancelled = false;
+    void props
+      .getHistory(props.initialSessionId)
+      .then((data) => {
+        if (cancelled) return;
+        setTurns(data.items || []);
+        const lastAssistant = [...(data.items || [])]
+          .reverse()
+          .find((t) => t.role === "assistant" && t.status === "pending");
+        if (lastAssistant) {
+          setDraftPatch((lastAssistant.patch as Record<string, unknown> | null) || null);
+          setMissingFields(lastAssistant.missingFields || []);
+          setFollowups(lastAssistant.followupQuestions || []);
+          const intent = lastAssistant.intent || "freeform";
+          const dk =
+            intent === "update_pack"
+              ? "pack"
+              : intent === "create_chunk" || intent === "update_chunk"
+              ? "chunk"
+              : null;
+          setDraftKind(dk);
+          setCanApply(
+            !!lastAssistant.patch &&
+              (lastAssistant.missingFields?.length || 0) === 0 &&
+              !!dk
+          );
+        }
+      })
+      .catch((err) => {
+        if (cancelled) return;
+        setError(String(err instanceof Error ? err.message : err));
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [open, props.initialSessionId]);
+
+  useEffect(() => {
+    if (!streamRef.current) return;
+    streamRef.current.scrollTop = streamRef.current.scrollHeight;
+  }, [turns.length]);
+
+  const sessionTurnCount = turns.filter((t) => t.role === "assistant").length;
+  const turnLimitReached = sessionTurnCount >= 8;
+
+  async function handleSend() {
+    const trimmed = input.trim();
+    if (!trimmed || phase === "sending" || phase === "applying") return;
+    setPhase("sending");
+    setError(null);
+    try {
+      const res = await props.postTurn({
+        sessionId,
+        accountId,
+        content: trimmed
+      });
+      setSessionId(res.sessionId);
+      try {
+        window.localStorage.setItem("wechatagent.knowledgeChatSessionId", res.sessionId);
+      } catch {
+        /* ignore */
+      }
+      setTurns((prev) => [
+        ...prev,
+        {
+          turnIndex: res.turnIndex - 1,
+          role: "user",
+          content: trimmed,
+          status: "pending",
+          createdAt: new Date().toISOString()
+        },
+        {
+          turnIndex: res.turnIndex,
+          role: "assistant",
+          intent: res.intent,
+          content: res.naturalReply,
+          patch: res.draftPreview ?? null,
+          missingFields: res.missingFields,
+          followupQuestions: res.followupQuestions,
+          status: "pending",
+          tokensUsed: res.tokensUsed,
+          promptKey: res.promptKey,
+          createdAt: new Date().toISOString()
+        }
+      ]);
+      setDraftKind(res.draftKind ?? null);
+      setDraftPatch(res.draftPreview ?? null);
+      setMissingFields(res.missingFields);
+      setFollowups(res.followupQuestions);
+      setCanApply(res.canApply);
+      setInput("");
+      setPhase("idle");
+    } catch (err) {
+      setError(String(err instanceof Error ? err.message : err));
+      setPhase("error");
+    }
+  }
+
+  async function handleApply() {
+    if (!sessionId || !canApply) return;
+    setPhase("applying");
+    setError(null);
+    try {
+      await props.apply(sessionId, accountId);
+      onApplied();
+      setCanApply(false);
+      setPhase("idle");
+      onClose(sessionId);
+    } catch (err) {
+      setError(String(err instanceof Error ? err.message : err));
+      setPhase("error");
+    }
+  }
+
+  async function handleDiscard() {
+    if (!sessionId) {
+      onClose();
+      return;
+    }
+    setPhase("discarding");
+    setError(null);
+    try {
+      await props.discard(sessionId);
+      try {
+        window.localStorage.removeItem("wechatagent.knowledgeChatSessionId");
+      } catch {
+        /* ignore */
+      }
+      onClose();
+    } catch (err) {
+      setError(String(err instanceof Error ? err.message : err));
+      setPhase("error");
+    }
+  }
+
+  if (!open) return null;
+
+  const draftFields = draftPatch
+    ? Object.entries(draftPatch).filter(([k]) => k !== "extras")
+    : [];
+
+  return (
+    <>
+      <div className="knowledgeChatScrim" onClick={() => onClose(sessionId)} />
+      <aside className="knowledgeChatDrawer" role="dialog" aria-label="AI 对话补完知识库">
+        <header className="knowledgeChatDrawer__head">
+          <div>
+            <strong>AI 对话补完知识库</strong>
+            <p className="muted small">
+              {sessionId
+                ? `session: ${sessionId.slice(0, 8)} · 第 ${sessionTurnCount} 轮`
+                : "新会话 · 第一条消息发出后自动建会话"}
+            </p>
+          </div>
+          <button
+            type="button"
+            className="iconButton"
+            aria-label="关闭"
+            onClick={() => onClose(sessionId)}
+          >
+            ×
+          </button>
+        </header>
+        <div className="knowledgeChatDrawer__body">
+          <div className="knowledgeChatStream" ref={streamRef}>
+            {turns.length === 0 ? (
+              <div className="knowledgeChatEmpty">
+                <p>告诉 AI 您想做什么，例如：</p>
+                <ul>
+                  <li>"再加一条针对宝妈用户的反对话术"</li>
+                  <li>"这条只对个人号生效，企业号不适用，帮我修一下"</li>
+                  <li>"销售口径里关于价格的部分需要再细化"</li>
+                </ul>
+                <p className="muted small">
+                  AI 会起草 / 修改后落库为 <strong>草稿</strong>，需运营在切片编辑器二次审核后才进入检索池。
+                </p>
+              </div>
+            ) : (
+              turns.map((turn, idx) => (
+                <div
+                  key={`${turn.turnIndex}-${idx}`}
+                  className={`bubbleRow ${turn.role === "assistant" ? "ai" : "user"}`}
+                >
+                  <div className="bubbleAvatar" aria-hidden="true">
+                    {turn.role === "assistant" ? <Bot size={14} /> : <User2 size={14} />}
+                  </div>
+                  <div className="bubble">
+                    {turn.role === "assistant" && turn.intent && (
+                      <span className="knowledgeChatIntentBadge">
+                        {INTENT_LABELS[turn.intent] || turn.intent}
+                      </span>
+                    )}
+                    <p>{turn.content}</p>
+                    {turn.role === "assistant" &&
+                      (turn.followupQuestions?.length || 0) > 0 && (
+                        <ul className="knowledgeChatFollowups">
+                          {turn.followupQuestions!.map((q, i) => (
+                            <li key={q.id || `${i}`}>
+                              <strong>{q.field || "追问"}：</strong>
+                              {q.question || ""}
+                            </li>
+                          ))}
+                        </ul>
+                      )}
+                  </div>
+                </div>
+              ))
+            )}
+            {phase === "sending" && (
+              <div className="bubbleRow ai">
+                <div className="bubbleAvatar"><Bot size={14} /></div>
+                <div className="bubble"><span className="muted small">AI 思考中...</span></div>
+              </div>
+            )}
+            {phase === "applying" && (
+              <div className="bubbleRow ai">
+                <div className="bubbleAvatar"><Bot size={14} /></div>
+                <div className="bubble"><span className="muted small">AI 落库为草稿中...</span></div>
+              </div>
+            )}
+          </div>
+          <aside className="knowledgeChatDraft">
+            <div className="knowledgeChatDraft__title">当前草稿预览</div>
+            {!draftPatch ? (
+              <p className="muted small">尚无草稿。先在左侧告诉 AI 想做什么。</p>
+            ) : (
+              <>
+                <p className="small muted">
+                  类型：<strong>{draftKind === "pack" ? "知识包" : "切片"}</strong>
+                  {missingFields.length > 0 && (
+                    <span> · 缺 {missingFields.length} 项</span>
+                  )}
+                </p>
+                {draftFields.map(([k, v]) => {
+                  const isMissing = missingFields.includes(k);
+                  const value =
+                    typeof v === "string"
+                      ? v
+                      : v == null
+                      ? ""
+                      : JSON.stringify(v);
+                  return (
+                    <div
+                      key={k}
+                      className={`knowledgeChatDraft__field ${isMissing ? "missing" : "filled"}`}
+                    >
+                      <span className="knowledgeChatDraft__fieldLabel">{k}</span>
+                      <span>{value || "（空）"}</span>
+                    </div>
+                  );
+                })}
+                {missingFields.length > 0 && (
+                  <p className="small" style={{ color: "#dc2626" }}>
+                    缺失字段：{missingFields.join(" / ")} —— 请在左侧继续回答。
+                  </p>
+                )}
+              </>
+            )}
+            <div className="knowledgeChatDraft__actions">
+              <button
+                type="button"
+                className="primary"
+                disabled={!canApply || phase === "applying"}
+                onClick={() => void handleApply()}
+              >
+                应用为草稿
+              </button>
+              <button
+                type="button"
+                className="secondary"
+                disabled={phase === "discarding"}
+                onClick={() => void handleDiscard()}
+              >
+                丢弃此 session
+              </button>
+            </div>
+          </aside>
+        </div>
+        {error && (
+          <div className="knowledgeChatError">
+            AI 没理解，请换个说法：{error}
+          </div>
+        )}
+        <div className="knowledgeChatInput">
+          <textarea
+            value={input}
+            placeholder={
+              turnLimitReached
+                ? "本会话已达 8 轮上限，请『应用为草稿』或开启新会话"
+                : "告诉 AI 您想做什么..."
+            }
+            disabled={turnLimitReached || phase === "sending" || phase === "applying"}
+            onChange={(e) => setInput(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Enter" && !e.shiftKey) {
+                e.preventDefault();
+                void handleSend();
+              }
+            }}
+          />
+          <button
+            type="button"
+            className="primary"
+            disabled={
+              !input.trim() ||
+              turnLimitReached ||
+              phase === "sending" ||
+              phase === "applying"
+            }
+            onClick={() => void handleSend()}
+          >
+            <SendHorizonal size={14} /> 发送
+          </button>
+        </div>
+      </aside>
+    </>
+  );
+}
+
+type KnowledgeDocModalState =
+  | { mode: "create"; title: string; sourceName: string; summary: string }
+  | { mode: "edit"; id: string; title: string; sourceName: string; summary: string };
+
+function KnowledgeDocumentModal({
+  state,
+  onChange,
+  onClose,
+  onSubmit
+}: {
+  state: KnowledgeDocModalState;
+  onChange: (next: KnowledgeDocModalState) => void;
+  onClose: () => void;
+  onSubmit: () => void;
+}) {
+  const heading = state.mode === "create" ? "手动新建知识文档" : "编辑文档元数据";
+  const submitLabel = state.mode === "create" ? "创建文档" : "保存修改";
+  const canSubmit = state.title.trim().length > 0;
+  return (
+    <>
+      <div className="knowledgeChatScrim" onClick={onClose} />
+      <div
+        className="knowledgeDocModal"
+        role="dialog"
+        aria-modal="true"
+        aria-label={heading}
+      >
+        <div className="knowledgeDocModal__head">
+          <div>
+            <strong>{heading}</strong>
+            <span>仅维护文档元数据；切片仍由 AI 对话补完或手动新增</span>
+          </div>
+          <button
+            type="button"
+            className="knowledgeDocModal__close"
+            aria-label="关闭"
+            onClick={onClose}
+          >
+            <X size={14} />
+          </button>
+        </div>
+        <form
+          className="knowledgeDocModal__body"
+          onSubmit={(e) => {
+            e.preventDefault();
+            if (canSubmit) onSubmit();
+          }}
+        >
+          <label className="knowledgeDocModal__field">
+            <span>文档标题（必填）</span>
+            <input
+              type="text"
+              value={state.title}
+              maxLength={120}
+              autoFocus
+              onChange={(e) => onChange({ ...state, title: e.target.value })}
+            />
+          </label>
+          <label className="knowledgeDocModal__field">
+            <span>来源名称（可选）</span>
+            <input
+              type="text"
+              value={state.sourceName}
+              maxLength={120}
+              placeholder="如：销售口径文档 v3 / 客服 FAQ"
+              onChange={(e) => onChange({ ...state, sourceName: e.target.value })}
+            />
+          </label>
+          <label className="knowledgeDocModal__field">
+            <span>摘要（可选）</span>
+            <textarea
+              rows={4}
+              value={state.summary}
+              maxLength={800}
+              placeholder="一句话说明这份文档的内容范围，便于检索时定位"
+              onChange={(e) => onChange({ ...state, summary: e.target.value })}
+            />
+          </label>
+          <div className="knowledgeDocModal__foot">
+            <button type="button" className="secondary" onClick={onClose}>
+              取消
+            </button>
+            <button type="submit" className="primary" disabled={!canSubmit}>
+              {submitLabel}
+            </button>
+          </div>
+        </form>
+      </div>
+    </>
   );
 }
