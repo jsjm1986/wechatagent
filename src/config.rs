@@ -102,6 +102,21 @@ pub struct AppConfig {
     pub evolution_cohort_per_contact_cap: usize,
     /// M4：每个 finalReviewStatus 失败桶给 Critic LLM 的样本数。
     pub evolution_cohort_sample_per_failure_bucket: usize,
+
+    // ── Knowledge Digest Workstation ──
+    //
+    // 默认关停。设计见 `.kiro/specs/knowledge-digest-workstation/`。
+
+    /// 是否启用知识库日报 worker。默认 false（安装态关停）。
+    pub knowledge_digest_enabled: bool,
+    /// 每天触发合成的小时（运营时区，0..=23）。默认 9。
+    pub knowledge_digest_run_hour: u32,
+    /// 单次 worker tick 的 LLM token 预算上限。
+    pub knowledge_digest_run_token_budget: i64,
+    /// 单次 worker tick 的 LLM 调用次数上限。
+    pub knowledge_digest_run_max_llm_calls: i32,
+    /// `KnowledgeTaskWorker` tick 间隔秒数；0 表示停掉。默认 30。
+    pub knowledge_task_worker_interval_seconds: u64,
 }
 
 impl AppConfig {
@@ -210,6 +225,24 @@ impl AppConfig {
             evolution_cohort_sample_per_failure_bucket: env_or(
                 "EVOLUTION_COHORT_SAMPLE_PER_FAILURE_BUCKET",
                 "10",
+            )
+            .parse()?,
+            // ── Knowledge Digest Workstation ──
+            knowledge_digest_enabled: parse_bool(&env_or("KNOWLEDGE_DIGEST_ENABLED", "false")),
+            knowledge_digest_run_hour: env_or("KNOWLEDGE_DIGEST_RUN_HOUR", "9").parse()?,
+            knowledge_digest_run_token_budget: env_or(
+                "KNOWLEDGE_DIGEST_RUN_TOKEN_BUDGET",
+                "24000",
+            )
+            .parse()?,
+            knowledge_digest_run_max_llm_calls: env_or(
+                "KNOWLEDGE_DIGEST_RUN_MAX_LLM_CALLS",
+                "8",
+            )
+            .parse()?,
+            knowledge_task_worker_interval_seconds: env_or(
+                "KNOWLEDGE_TASK_WORKER_INTERVAL_SECONDS",
+                "30",
             )
             .parse()?,
         })

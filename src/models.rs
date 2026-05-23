@@ -578,6 +578,16 @@ pub struct KnowledgeChatTurn {
     /// 本轮 LLM 大致 token 消耗（用 BudgetSnapshot.tokens 累计）。
     pub tokens_used: i64,
     pub prompt_key: Option<String>,
+    /// knowledge-digest-workstation 扩展：
+    /// `task_progress` / `task_summary` / `tool_call_log` / `null`（向后兼容）。
+    /// 由 `KnowledgeTaskWorker` / tool_loop 写入，旧 turn 缺该字段视为 `None`。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    /// knowledge-digest-workstation 扩展：tool 调用日志，仅 `kind="tool_call_log"`
+    /// 或 assistant 发起 tool-calling 时写入。
+    /// 形如 `[{name, params, result, latency_ms, tokens}]`。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tool_calls: Vec<Document>,
     pub created_at: DateTime,
 }
 
@@ -2069,6 +2079,119 @@ pub struct PostReleaseReview {
     #[serde(default)]
     pub actual_5gate_hit_delta: Document,
     pub completed_at: Option<DateTime>,
+}
+
+// ── Knowledge Digest Workstation ──
+//
+// 完整 schema 注释见 `docs/data-and-api.md` 知识库日报工作站节。
+// 严格不引入"接管 / 人工"语义；状态机用 AI 内部语言。
+
+/// 单张日报卡片（嵌入 `KnowledgeDailyReport.cards` 与 `KnowledgeChatTask.cards`
+/// 快照）。`severity` / `kind` / `suggested_action` 是封闭枚举，写库前必须经
+/// 后端校验，不允许 LLM 输出未知值。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KnowledgeDigestCard {
+    /// 持久 id：前端勾选 / dismiss / single-card 派工都按这个引用。
+    pub card_id: ObjectId,
+    /// `chunk_missing_field` / `chunk_low_hit_rate` / `chunk_caused_block` /
+    /// `pack_outdated` / `evolution_pending` / `evolution_released` / `freeform`
+    pub kind: String,
+    /// ≤ 60 字。后端在写库前截断，超长丢弃整张卡片。
+    pub title: String,
+    /// ≤ 200 字。同上截断规则。
+    pub summary: String,
+    /// `[{kind: "chunk"|"pack"|"item"|"run"|"evolution_proposal", id}]`；
+    /// 写库前做外键存在性校验，不存在的 ref 整张卡片丢弃。
+    #[serde(default)]
+    pub target_refs: Vec<Document>,
+    /// `fix_chunk` / `add_chunk` / `retag` / `review_evolution` / `dismiss` /
+    /// `freeform`；前端按此值映射快捷动作按钮。
+    pub suggested_action: String,
+    /// `info` / `warn` / `critical`；R2.5 排序优先 critical。
+    pub severity: String,
+    /// 可选指标：命中率 / 拦截次数 / 缺字段数。
+    /// `{name, value, threshold}`；前端展示成 metricChip。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metric: Option<Document>,
+}
+
+/// 当日日报（每天 09:00 由 `KnowledgeDigestWorker` 合成；
+/// `(account_id, report_date)` 复合 unique 索引保证一天一份）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KnowledgeDailyReport {
+    #[serde(rename = "_id", skip_serializing_if = "Option::is_none")]
+    pub id: Option<ObjectId>,
+    pub workspace_id: String,
+    pub account_id: String,
+    /// 当日日期，`YYYY-MM-DD`，运营时区。
+    pub report_date: String,
+    pub generated_at: DateTime,
+    /// `worker` / `manual`（手动重算）。
+    pub generated_by: String,
+    /// `ok` / `partial` / `failed`。封闭枚举。
+    pub status: String,
+    /// 失败时的错误分类，与 `AppError::LlmUnavailable.kind` 同源；
+    /// 成功时为 `None`。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_kind: Option<String>,
+    /// `{tokens_used, llm_calls}`，来自 `RunBudgetSnapshot`。
+    #[serde(default)]
+    pub budget_snapshot: Document,
+    #[serde(default)]
+    pub cards: Vec<KnowledgeDigestCard>,
+    /// 运营点过"忽略"的卡片 id，画布据此灰显或隐藏。
+    #[serde(default)]
+    pub dismissed_card_ids: Vec<ObjectId>,
+    /// 本次合成用到的 prompt 版本号；查问题用。
+    #[serde(default)]
+    pub prompt_versions: Document,
+}
+
+/// 长任务（运营在 chat 派工 ≥ 3 cards 或预估 LLM call > 6 时生成；
+/// 由 `KnowledgeTaskWorker` 30s 轮询、按 sessionId 串行执行）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KnowledgeChatTask {
+    #[serde(rename = "_id", skip_serializing_if = "Option::is_none")]
+    pub id: Option<ObjectId>,
+    pub workspace_id: String,
+    pub account_id: String,
+    pub session_id: String,
+    pub operator_id: Option<String>,
+    /// 任务起源 cards 快照（运营勾的那批；不动 `knowledge_daily_reports`）。
+    #[serde(default)]
+    pub cards: Vec<KnowledgeDigestCard>,
+    /// `[{cardId, action, targetChunkId?, hint?}]`，由
+    /// `knowledge.digest.dispatch` LLM 拆出，后端校验后落库。
+    #[serde(default)]
+    pub planned_steps: Vec<Document>,
+    /// `[{cardId, action, chunkId?, error?}]`，worker 每完成一步追加。
+    #[serde(default)]
+    pub completed_steps: Vec<Document>,
+    /// `pending` / `running` / `finished` / `failed` / `cancelled`。封闭枚举。
+    pub status: String,
+    /// 失败时的错误分类。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_kind: Option<String>,
+    pub created_at: DateTime,
+    pub started_at: Option<DateTime>,
+    pub finished_at: Option<DateTime>,
+}
+
+/// 运营偏好记忆（与 `contacts.memory_card` / `agents.soul.memory` 物理隔离）。
+/// 设计动机见 `docs/agent-policy.md` 知识库日报工作站节 R5。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KnowledgeOperatorMemory {
+    #[serde(rename = "_id", skip_serializing_if = "Option::is_none")]
+    pub id: Option<ObjectId>,
+    pub workspace_id: String,
+    pub account_id: String,
+    pub operator_id: String,
+    /// `preference` / `rejection` / `context`。封闭枚举。
+    pub kind: String,
+    pub content: String,
+    pub created_at: DateTime,
+    pub last_used_at: DateTime,
+    pub expires_at: Option<DateTime>,
 }
 
 #[cfg(test)]

@@ -99,6 +99,17 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
+    // knowledge-digest-workstation Phase 1：日报合成 worker。
+    // 关停态默认（`KNOWLEDGE_DIGEST_ENABLED=false`）；worker_loop 内部立即
+    // return。打开后每天 `KNOWLEDGE_DIGEST_RUN_HOUR` 整点扫 4 数据源 + 合成
+    // 卡片（Phase 2 落地）。
+    {
+        let digest_state = state.clone();
+        tokio::spawn(async move {
+            wechatagent::knowledge_digest::worker_loop(digest_state).await;
+        });
+    }
+
     let static_files = ServeDir::new("frontend/dist")
         .not_found_service(ServeFile::new("frontend/dist/index.html"));
     let app = Router::new()

@@ -107,6 +107,11 @@ mod tests {
             evolution_threshold_release_cooldown_hours: 24,
             evolution_cohort_per_contact_cap: 3,
             evolution_cohort_sample_per_failure_bucket: 10,
+            knowledge_digest_enabled: false,
+            knowledge_digest_run_hour: 9,
+            knowledge_digest_run_token_budget: 24000,
+            knowledge_digest_run_max_llm_calls: 8,
+            knowledge_task_worker_interval_seconds: 30,
         }
     }
 

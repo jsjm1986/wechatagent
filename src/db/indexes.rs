@@ -651,5 +651,59 @@ async fn ensure_evolution_indexes(db: &Database) -> anyhow::Result<()> {
         )
         .await?;
 
+    // ── knowledge-digest-workstation ──
+    //
+    // knowledge_daily_reports：(workspace_id, account_id, report_date) 三元组
+    // 复合 unique，保证一天一份；同时支持按 (account_id, report_date desc) 拉
+    // 当日 / 最近 N 天日报。
+    db.knowledge_daily_reports()
+        .create_index(
+            IndexModel::builder()
+                .keys(doc! {
+                    "workspace_id": 1,
+                    "account_id": 1,
+                    "report_date": -1,
+                })
+                .options(IndexOptions::builder().unique(true).build())
+                .build(),
+            None,
+        )
+        .await?;
+
+    // knowledge_chat_tasks：worker 取 pending 用 (status, created_at)；
+    // chat 面板按 sessionId 拉历史用 (session_id, status)。
+    db.knowledge_chat_tasks()
+        .create_index(
+            IndexModel::builder()
+                .keys(doc! { "status": 1, "created_at": 1 })
+                .build(),
+            None,
+        )
+        .await?;
+    db.knowledge_chat_tasks()
+        .create_index(
+            IndexModel::builder()
+                .keys(doc! { "session_id": 1, "status": 1 })
+                .build(),
+            None,
+        )
+        .await?;
+
+    // knowledge_operator_memory：chat 注入按
+    // (account_id, operator_id, last_used_at desc) 拉 top N。
+    db.knowledge_operator_memory()
+        .create_index(
+            IndexModel::builder()
+                .keys(doc! {
+                    "workspace_id": 1,
+                    "account_id": 1,
+                    "operator_id": 1,
+                    "last_used_at": -1,
+                })
+                .build(),
+            None,
+        )
+        .await?;
+
     Ok(())
 }

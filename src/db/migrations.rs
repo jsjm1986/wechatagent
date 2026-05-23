@@ -76,6 +76,14 @@ pub const MIGRATIONS: &[Migration] = &[
         id: "2026_05_M4_001_prompt_template_versioned",
         run: |db| Box::pin(prompt_template_versioned(db)),
     },
+    // ── conversation_mode + per-contact custom instructions + knowledge tags ──
+    // 给 contacts 加 custom_agent_instructions（默认 null），给 operation_knowledge_*
+    // 三集合加 product_tags / trigger_keywords / business_topics（默认 []）。
+    // 全幂等：filter 用 `$exists: false` 仅命中未升级文档。
+    Migration {
+        id: "2026_05_V3_001_contact_custom_instructions_and_knowledge_tags",
+        run: |db| Box::pin(contact_custom_instructions_and_knowledge_tags(db)),
+    },
 ];
 
 /// 2026_05_001：把存量 contact 的 `last_message_at` 回填到 `last_inbound_at`，
@@ -899,6 +907,80 @@ async fn prompt_template_versioned(db: &Database) -> AppResult<()> {
         promoted_current = promoted,
         "upgraded prompt_templates to multi-version layout"
     );
+    Ok(())
+}
+
+/// 2026_05_010：联系人 custom_agent_instructions + 知识库三集合标签字段回填。
+///
+/// 给 `contacts` 加 `custom_agent_instructions: null`（上限 1000 字符的运营人员
+/// 特别指令；后台 PUT 维护，作为 Operator Instruction 层注入 user.reply prompt）。
+///
+/// 给 `operation_knowledge_documents` / `_items` / `_chunks` 三集合加：
+///   - `product_tags: []`（≤5）
+///   - `trigger_keywords: []`（≤8，全小写，运行时关键词快路径用 `inbound.contains`）
+///   - `business_topics: []`（≤3）
+///
+/// 幂等：每个 filter 用 `$exists: false` 仅命中未升级文档；二次启动不变更。
+async fn contact_custom_instructions_and_knowledge_tags(db: &Database) -> AppResult<()> {
+    let contacts_result = db
+        .contacts()
+        .update_many(
+            doc! { "custom_agent_instructions": { "$exists": false } },
+            doc! { "$set": { "custom_agent_instructions": null } },
+            None,
+        )
+        .await?;
+    tracing::info!(
+        migration_id = "2026_05_V3_001_contact_custom_instructions_and_knowledge_tags",
+        contacts_modified = contacts_result.modified_count,
+        contacts_matched = contacts_result.matched_count,
+        "backfilled contacts.custom_agent_instructions"
+    );
+
+    // 三集合做同样的标签字段回填（同时检查三字段任一缺失即触发，但只 set 缺的字段
+    // 会让 update 复杂化，统一 set 三字段更幂等）。
+    let collections: [(&str, &mongodb::Collection<Document>); 3] = [
+        (
+            "operation_knowledge_documents",
+            &db.raw().collection::<Document>("operation_knowledge_documents"),
+        ),
+        (
+            "operation_knowledge_items",
+            &db.raw().collection::<Document>("operation_knowledge_items"),
+        ),
+        (
+            "operation_knowledge_chunks",
+            &db.raw().collection::<Document>("operation_knowledge_chunks"),
+        ),
+    ];
+    for (coll_name, coll) in collections {
+        let result = coll
+            .update_many(
+                doc! {
+                    "$or": [
+                        { "product_tags": { "$exists": false } },
+                        { "trigger_keywords": { "$exists": false } },
+                        { "business_topics": { "$exists": false } },
+                    ]
+                },
+                doc! {
+                    "$set": {
+                        "product_tags": [],
+                        "trigger_keywords": [],
+                        "business_topics": [],
+                    }
+                },
+                None,
+            )
+            .await?;
+        tracing::info!(
+            migration_id = "2026_05_V3_001_contact_custom_instructions_and_knowledge_tags",
+            collection = coll_name,
+            modified = result.modified_count,
+            matched = result.matched_count,
+            "backfilled knowledge tag fields"
+        );
+    }
     Ok(())
 }
 

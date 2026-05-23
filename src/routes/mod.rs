@@ -79,7 +79,7 @@ use knowledge::{
     chat_history, chat_turn, create_operation_knowledge,
     create_operation_knowledge_chunk, create_operation_knowledge_document,
     delete_operation_knowledge, delete_operation_knowledge_chunk,
-    delete_operation_knowledge_document, get_operation_knowledge_catalog,
+    delete_operation_knowledge_document, digest_today, get_operation_knowledge_catalog,
     get_operation_knowledge_chunk_source, get_operation_knowledge_completeness,
     get_operation_knowledge_document, get_operation_knowledge_integrity_report,
     extract_operation_knowledge_tags, import_operation_knowledge_apply,
@@ -306,6 +306,7 @@ pub fn api_router(state: AppState) -> Router<AppState> {
             "/operation-knowledge/chat/:session_id/discard",
             post(chat_discard),
         )
+        .route("/knowledge/digest/today", get(digest_today))
         .route(
             "/operation-knowledge/:id",
             put(update_operation_knowledge).delete(delete_operation_knowledge),

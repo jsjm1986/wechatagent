@@ -4203,6 +4203,8 @@ async fn write_chat_turn(
                 tokens_used,
                 prompt_key: prompt_key.map(|s| s.to_string()),
                 created_at: DateTime::now(),
+                kind: None,
+                tool_calls: vec![],
             },
             None,
         )
@@ -4901,6 +4903,73 @@ fn chunk_request_from_chat_patch(
         status: "draft".to_string(),
         priority: 0,
     }
+}
+
+// ── knowledge-digest-workstation Phase 1：日报路由（最小骨架） ──────────────
+//
+// `GET /api/knowledge/digest/today`：查询当日 `knowledge_daily_reports`，命中
+// 即返回；未命中**直接 404**，**不**触发同步合成（Phase 2 才接 generate）。
+// 设计见 `.kiro/specs/knowledge-digest-workstation/design.md` §6 Routes 与
+// `docs/data-and-api.md` 知识库日报工作站章节。
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct DigestTodayQuery {
+    pub account_id: Option<String>,
+    /// `YYYY-MM-DD`；缺省时用运营时区今天。
+    pub report_date: Option<String>,
+}
+
+pub(super) async fn digest_today(
+    State(state): State<AppState>,
+    Query(query): Query<DigestTodayQuery>,
+) -> AppResult<Json<Value>> {
+    let account_id = query
+        .account_id
+        .clone()
+        .unwrap_or_else(|| state.config.default_account_id.clone());
+    let report_date = query
+        .report_date
+        .clone()
+        .unwrap_or_else(|| chrono::Local::now().format("%Y-%m-%d").to_string());
+
+    let found = state
+        .db
+        .knowledge_daily_reports()
+        .find_one(
+            doc! {
+                "workspace_id": &state.config.default_workspace_id,
+                "account_id": &account_id,
+                "report_date": &report_date,
+            },
+            None,
+        )
+        .await?;
+
+    let Some(report) = found else {
+        return Err(AppError::NotFound(format!(
+            "今日（{report_date}）暂无日报，工作站尚未启用合成"
+        )));
+    };
+
+    Ok(Json(json!({
+        "reportId": report.id.map(|id| id.to_hex()),
+        "workspaceId": report.workspace_id,
+        "accountId": report.account_id,
+        "reportDate": report.report_date,
+        "generatedAt": report.generated_at.to_string(),
+        "generatedBy": report.generated_by,
+        "status": report.status,
+        "errorKind": report.error_kind,
+        "budgetSnapshot": serde_json::to_value(&report.budget_snapshot).unwrap_or(json!({})),
+        "cards": serde_json::to_value(&report.cards).unwrap_or(json!([])),
+        "dismissedCardIds": report
+            .dismissed_card_ids
+            .iter()
+            .map(|id| id.to_hex())
+            .collect::<Vec<_>>(),
+        "promptVersions": serde_json::to_value(&report.prompt_versions).unwrap_or(json!({})),
+    })))
 }
 
 #[cfg(test)]
