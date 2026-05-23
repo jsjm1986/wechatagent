@@ -635,10 +635,58 @@ type CommandResult = {
   toolCalls: CommandToolCall[];
 };
 
+/**
+ * 后端 `AppError::LlmUnavailable` 的前端镜像错误。
+ *
+ * 后端在 LLM 调用经过完整重试（默认 5 次 + 指数退避 + jitter + 尊重 Retry-After）
+ * 后仍失败时，会返回 HTTP 503 + `{"error":"llm_unavailable", "kind", "retryCount", "detail", "hint"}`。
+ * 前端把它从 raw fetch 错误中解出来作为 `LlmUnavailableError`，让所有调 LLM 的面板
+ * （AiRepairPanel / KnowledgeChatPanel / 其它）都能按 `kind` 渲染一致的中文文案 +
+ * 「AI 重试」按钮，而不是把 reqwest 原文 "error sending request for url..." 糊到 UI。
+ */
+export class LlmUnavailableError extends Error {
+  kind: string;
+  retryCount: number;
+  detail: string;
+  hint: string;
+  constructor(payload: { kind: string; retryCount: number; detail: string; hint: string }) {
+    super(payload.hint || payload.detail || "LLM 暂不可用");
+    this.name = "LlmUnavailableError";
+    this.kind = payload.kind;
+    this.retryCount = payload.retryCount;
+    this.detail = payload.detail;
+    this.hint = payload.hint;
+  }
+}
+
+async function parseApiError(response: Response): Promise<Error> {
+  const text = await response.text();
+  try {
+    const json = JSON.parse(text) as Record<string, unknown>;
+    if (json && json.error === "llm_unavailable") {
+      return new LlmUnavailableError({
+        kind: typeof json.kind === "string" ? json.kind : "unknown",
+        retryCount: typeof json.retryCount === "number" ? json.retryCount : 0,
+        detail: typeof json.detail === "string" ? json.detail : text,
+        hint:
+          typeof json.hint === "string"
+            ? json.hint
+            : "调用 LLM 失败，请稍后再试。"
+      });
+    }
+    if (json && typeof json.error === "string") {
+      return new Error(json.error);
+    }
+  } catch {
+    /* 不是 JSON，落到 plain text 路径 */
+  }
+  return new Error(text || `HTTP ${response.status}`);
+}
+
 const api = {
   async get<T>(url: string): Promise<T> {
     const response = await fetch(url);
-    if (!response.ok) throw new Error(await response.text());
+    if (!response.ok) throw await parseApiError(response);
     return response.json();
   },
   async post<T>(url: string, body?: unknown): Promise<T> {
@@ -647,7 +695,7 @@ const api = {
       headers: { "Content-Type": "application/json" },
       body: body ? JSON.stringify(body) : undefined
     });
-    if (!response.ok) throw new Error(await response.text());
+    if (!response.ok) throw await parseApiError(response);
     return response.json();
   },
   async put<T>(url: string, body: unknown): Promise<T> {
@@ -656,15 +704,83 @@ const api = {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body)
     });
-    if (!response.ok) throw new Error(await response.text());
+    if (!response.ok) throw await parseApiError(response);
     return response.json();
   },
   async delete<T>(url: string): Promise<T> {
     const response = await fetch(url, { method: "DELETE" });
-    if (!response.ok) throw new Error(await response.text());
+    if (!response.ok) throw await parseApiError(response);
     return response.json();
   }
 };
+
+const LLM_KIND_LABELS: Record<string, string> = {
+  timeout: "上游超时",
+  connect_failed: "无法连接",
+  body_decode_error: "响应体损坏",
+  network_error: "网络异常",
+  rate_limited: "上游限流",
+  http_5xx: "上游 5xx",
+  http_4xx: "上游 4xx",
+  empty_response: "空响应",
+  external_error: "上游错误",
+  json_decode_error: "JSON 解析失败",
+  unknown: "未知错误"
+};
+
+function llmKindLabel(kind: string): string {
+  return LLM_KIND_LABELS[kind] ?? kind;
+}
+
+/**
+ * 统一渲染 LLM 调用失败的提示横幅，给所有调 LLM 的面板复用。
+ *
+ * - `error` 是 `LlmUnavailableError` → 显示 kind 标签 + hint + 重试次数 + 「AI 重试」
+ * - `error` 是普通 `Error` → 显示 message + 「AI 重试」（走通用错误路径）
+ */
+function LlmErrorBanner(props: {
+  error: Error;
+  onRetry?: () => void;
+  retrying?: boolean;
+}) {
+  const { error, onRetry, retrying } = props;
+  const isLlm = error instanceof LlmUnavailableError;
+  const kind = isLlm ? (error as LlmUnavailableError).kind : "unknown";
+  const hint = isLlm
+    ? (error as LlmUnavailableError).hint
+    : error.message || "调用 LLM 失败，请稍后再试。";
+  const retryCount = isLlm ? (error as LlmUnavailableError).retryCount : 0;
+  const detail = isLlm ? (error as LlmUnavailableError).detail : "";
+  return (
+    <div className="llmErrorBanner" role="alert">
+      <div className="llmErrorBanner__head">
+        <span className="llmErrorBanner__kind">{llmKindLabel(kind)}</span>
+        {retryCount > 0 ? (
+          <span className="llmErrorBanner__retries">已自动重试 {retryCount} 次</span>
+        ) : null}
+      </div>
+      <div className="llmErrorBanner__hint">{hint}</div>
+      {detail && detail !== hint ? (
+        <details className="llmErrorBanner__detail">
+          <summary>查看技术细节</summary>
+          <code>{detail}</code>
+        </details>
+      ) : null}
+      {onRetry ? (
+        <div className="llmErrorBanner__actions">
+          <button
+            type="button"
+            className="primary"
+            onClick={onRetry}
+            disabled={retrying}
+          >
+            {retrying ? "AI 重试中…" : "AI 重试"}
+          </button>
+        </div>
+      ) : null}
+    </div>
+  );
+}
 
 const channels: Array<{ id: Channel; label: string; caption: string; icon: LucideIcon }> = [
   { id: "command", label: "AI 总控", caption: "Command Center", icon: BrainCircuit },
@@ -1829,9 +1945,25 @@ export function App() {
     setMemoryDraft(emptyMemoryDraft());
   }
 
+  // 避免"首屏闪一下全量、再跳到账号过滤集"的双拉：accounts 列表还没回来时，
+  // currentAccountId 必然为空串，此时若直接 loadAll() 会先拉一份 workspace 级
+  // 全量数据写到 state，等 setAccounts 回填后第二轮 effect 才带 accountId 重拉，
+  // 表现就是知识库文档树/可答性横幅在 200~600ms 内跳变。
+  // 解决方案：第一拉走"无账号"分支拿到 accounts 列表（and only that），剩余面板
+  // 数据等 currentAccountId 收敛到真实账号 ID 后再统一加载。
+  const accountsBootstrapRef = useRef(false);
   useEffect(() => {
+    if (accounts.length === 0) {
+      if (accountsBootstrapRef.current) return;
+      accountsBootstrapRef.current = true;
+      void api
+        .get<{ items: Account[] }>("/api/accounts")
+        .then((data) => setAccounts(data.items))
+        .catch((err) => setError(err instanceof Error ? err.message : String(err)));
+      return;
+    }
     void loadAll().catch((err) => setError(err instanceof Error ? err.message : String(err)));
-  }, [currentAccountId]);
+  }, [currentAccountId, accounts.length]);
 
   return (
     <div className="app">
@@ -2107,7 +2239,35 @@ export function App() {
             packSubview={knowledgePackSubview}
             workspaceMode={knowledgeWorkspaceMode}
             debugDrawerOpen={knowledgeDebugDrawerOpen}
-            onSelectNode={setKnowledgeSelectedNodeId}
+            onSelectNode={(id) => {
+              setKnowledgeSelectedNodeId(id);
+              if (id === null) {
+                return;
+              }
+              if (id.startsWith("chunk:")) {
+                const chunkId = id.slice("chunk:".length);
+                const found = knowledgeChunks.find((c) => c.id === chunkId);
+                if (found) {
+                  setEditingChunkId(found.id);
+                  setChunkDraft(draftFromChunk(found));
+                  setKnowledgeWorkspaceMode("selection");
+                }
+              } else if (id.startsWith("pack:")) {
+                if (editingChunkId) {
+                  setEditingChunkId("");
+                  setChunkDraft(emptyChunkDraft());
+                }
+              } else if (id.startsWith("doc:")) {
+                if (editingChunkId) {
+                  setEditingChunkId("");
+                  setChunkDraft(emptyChunkDraft());
+                }
+                if (editingKnowledgeId) {
+                  setEditingKnowledgeId("");
+                  setKnowledgeDraft(emptyKnowledgeDraft());
+                }
+              }
+            }}
             onToggleNode={(id) => {
               setKnowledgeExpandedNodes((prev) => {
                 const next = new Set(prev);
@@ -8585,7 +8745,11 @@ function AiRepairPanel(props: {
   const [proposal, setProposal] = useState<AiRepairProposal | null>(null);
   const [skippedFields, setSkippedFields] = useState<Set<string>>(new Set());
   const [answers, setAnswers] = useState<Record<string, string>>({});
-  const [errorMsg, setErrorMsg] = useState<string | null>(null);
+  const [errorObj, setErrorObj] = useState<Error | null>(null);
+  // proposeNonce 让「AI 重试」按钮通过 +1 来重新触发首轮 propose effect。
+  // 不直接调 props.proposeChunk 是为了保留 effect 内的 cancelled 守卫。
+  const [proposeNonce, setProposeNonce] = useState(0);
+  const errorMsg = errorObj?.message ?? null;
 
   useEffect(() => {
     let cancelled = false;
@@ -8593,7 +8757,7 @@ function AiRepairPanel(props: {
     setProposal(null);
     setSkippedFields(new Set());
     setAnswers({});
-    setErrorMsg(null);
+    setErrorObj(null);
     const propose =
       target.kind === "chunk"
         ? props.proposeChunk(target.id)
@@ -8606,13 +8770,17 @@ function AiRepairPanel(props: {
       })
       .catch((err: Error) => {
         if (cancelled) return;
-        setErrorMsg(err.message || "AI 提案失败");
+        setErrorObj(err instanceof Error ? err : new Error(String(err)));
         setPhase("error");
       });
     return () => {
       cancelled = true;
     };
-  }, [target]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [target, proposeNonce]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  function retryPropose() {
+    setProposeNonce((n) => n + 1);
+  }
 
   const patch = (proposal?.patch ?? {}) as Record<string, unknown>;
   const patchEntries = Object.entries(patch);
@@ -8646,7 +8814,7 @@ function AiRepairPanel(props: {
     const allAnswered = followup.every((q) => (answers[q.id] ?? "").trim().length > 0);
     if (!allAnswered) return;
     setPhase("answering");
-    setErrorMsg(null);
+    setErrorObj(null);
     try {
       const data = await props.answerChunk(target.id, {
         sessionId: proposal?.sessionId,
@@ -8663,14 +8831,14 @@ function AiRepairPanel(props: {
       setAnswers({});
       setPhase("reviewing");
     } catch (err) {
-      setErrorMsg((err as Error).message || "AI 追问合并失败");
+      setErrorObj(err instanceof Error ? err : new Error(String(err)));
       setPhase("error");
     }
   }
 
   async function handleApply(thenVerify: boolean) {
     setPhase("applying");
-    setErrorMsg(null);
+    setErrorObj(null);
     try {
       const acceptedFields = patchEntries
         .map(([k]) => k)
@@ -8690,7 +8858,7 @@ function AiRepairPanel(props: {
       );
       onClose();
     } catch (err) {
-      setErrorMsg((err as Error).message || "应用失败");
+      setErrorObj(err instanceof Error ? err : new Error(String(err)));
       setPhase("error");
     }
   }
@@ -8731,7 +8899,11 @@ function AiRepairPanel(props: {
           {phase === "error" && (
             <div className="aiRepairSection">
               <div className="aiRepairSection__title">AI 提案出错</div>
-              <div className="error">{errorMsg ?? "未知错误"}</div>
+              {errorObj ? (
+                <LlmErrorBanner error={errorObj} onRetry={retryPropose} />
+              ) : (
+                <div className="error">{errorMsg ?? "未知错误"}</div>
+              )}
             </div>
           )}
 
@@ -9014,7 +9186,12 @@ function KnowledgeChatPanel(props: {
   >([]);
   const [canApply, setCanApply] = useState(false);
   const [phase, setPhase] = useState<"idle" | "sending" | "applying" | "discarding" | "error">("idle");
-  const [error, setError] = useState<string | null>(null);
+  const [error, setError] = useState<Error | null>(null);
+  // 失败时记录"刚才在做什么"，让 LlmErrorBanner 的「AI 重试」按钮能够精准重放
+  // 触发失败的那一步，而不是盲目刷新整个 panel。
+  const [lastFailedAction, setLastFailedAction] =
+    useState<"sendTurn" | "apply" | "discard" | "loadHistory" | null>(null);
+  const [pendingInput, setPendingInput] = useState<string>("");
   const [input, setInput] = useState("");
   const streamRef = useRef<HTMLDivElement | null>(null);
 
@@ -9062,7 +9239,9 @@ function KnowledgeChatPanel(props: {
       })
       .catch((err) => {
         if (cancelled) return;
-        setError(String(err instanceof Error ? err.message : err));
+        setError(err instanceof Error ? err : new Error(String(err)));
+        setLastFailedAction("loadHistory");
+        setPhase("error");
       });
     return () => {
       cancelled = true;
@@ -9077,11 +9256,13 @@ function KnowledgeChatPanel(props: {
   const sessionTurnCount = turns.filter((t) => t.role === "assistant").length;
   const turnLimitReached = sessionTurnCount >= 8;
 
-  async function handleSend() {
-    const trimmed = input.trim();
+  async function handleSend(retryText?: string) {
+    const trimmed = (retryText ?? input).trim();
     if (!trimmed || phase === "sending" || phase === "applying") return;
     setPhase("sending");
     setError(null);
+    setLastFailedAction(null);
+    setPendingInput(trimmed);
     try {
       const res = await props.postTurn({
         sessionId,
@@ -9123,9 +9304,11 @@ function KnowledgeChatPanel(props: {
       setFollowups(res.followupQuestions);
       setCanApply(res.canApply);
       setInput("");
+      setPendingInput("");
       setPhase("idle");
     } catch (err) {
-      setError(String(err instanceof Error ? err.message : err));
+      setError(err instanceof Error ? err : new Error(String(err)));
+      setLastFailedAction("sendTurn");
       setPhase("error");
     }
   }
@@ -9134,6 +9317,7 @@ function KnowledgeChatPanel(props: {
     if (!sessionId || !canApply) return;
     setPhase("applying");
     setError(null);
+    setLastFailedAction(null);
     try {
       await props.apply(sessionId, accountId);
       onApplied();
@@ -9141,7 +9325,8 @@ function KnowledgeChatPanel(props: {
       setPhase("idle");
       onClose(sessionId);
     } catch (err) {
-      setError(String(err instanceof Error ? err.message : err));
+      setError(err instanceof Error ? err : new Error(String(err)));
+      setLastFailedAction("apply");
       setPhase("error");
     }
   }
@@ -9153,6 +9338,7 @@ function KnowledgeChatPanel(props: {
     }
     setPhase("discarding");
     setError(null);
+    setLastFailedAction(null);
     try {
       await props.discard(sessionId);
       try {
@@ -9162,8 +9348,34 @@ function KnowledgeChatPanel(props: {
       }
       onClose();
     } catch (err) {
-      setError(String(err instanceof Error ? err.message : err));
+      setError(err instanceof Error ? err : new Error(String(err)));
+      setLastFailedAction("discard");
       setPhase("error");
+    }
+  }
+
+  function retryLastAction() {
+    if (lastFailedAction === "sendTurn" && pendingInput) {
+      void handleSend(pendingInput);
+    } else if (lastFailedAction === "apply") {
+      void handleApply();
+    } else if (lastFailedAction === "discard") {
+      void handleDiscard();
+    } else if (lastFailedAction === "loadHistory" && props.initialSessionId) {
+      // 重新触发 effect：清空 turns 让 effect 重跑
+      setError(null);
+      setTurns([]);
+      props
+        .getHistory(props.initialSessionId)
+        .then((data) => {
+          setTurns(data.items || []);
+          setPhase("idle");
+        })
+        .catch((err) => {
+          setError(err instanceof Error ? err : new Error(String(err)));
+          setLastFailedAction("loadHistory");
+          setPhase("error");
+        });
     }
   }
 
@@ -9312,7 +9524,11 @@ function KnowledgeChatPanel(props: {
         </div>
         {error && (
           <div className="knowledgeChatError">
-            AI 没理解，请换个说法：{error}
+            <LlmErrorBanner
+              error={error}
+              onRetry={lastFailedAction ? retryLastAction : undefined}
+              retrying={phase === "sending" || phase === "applying" || phase === "discarding"}
+            />
           </div>
         )}
         <div className="knowledgeChatInput">

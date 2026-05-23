@@ -90,6 +90,22 @@ impl LlmClient {
             model,
             client: reqwest::Client::builder()
                 .timeout(Duration::from_secs(timeout_seconds))
+                // 防 chunked body 中段被中间设备/CDN 静默掐断 ——
+                // smoke 时观测到 DeepSeek HTTP/1.1 chunked stream 偶发在 60s
+                // 时被中断（status=200 但 body 解码失败）。开 tcp_keepalive
+                // 让 idle 连接周期性发包，避免 NAT/防火墙 idle 超时杀流。
+                .tcp_keepalive(Duration::from_secs(15))
+                // 关掉连接池：smoke 实测同一进程对 DeepSeek 复用 TCP
+                // 时偶发 chunked body 在 60s 截断 —— 怀疑是 keep-alive
+                // 池里的过期连接被复用。直接每请求新拨号，牺牲一点 RTT
+                // 换稳定性（LLM 调用本身 >5s，TCP 握手成本可忽略）。
+                .pool_max_idle_per_host(0)
+                // 强制 HTTP/1.1：smoke 实测 reqwest 默认 HTTP/2 + rustls 通过
+                // DeepSeek 时，对 chunked body 偶发在 ~60s 出现 stream stall
+                // → "error decoding response body"。同样 prompt 通过 urllib
+                // (HTTP/1.1) 17s 就能拿到完整 9980 bytes。改用 HTTP/1.1 后
+                // 整条链路稳定。
+                .http1_only()
                 .build()?,
             max_retries: max_retries.max(1),
             retry_base_ms: retry_base_ms.max(100),
@@ -123,7 +139,21 @@ impl LlmClient {
             .await?;
         let status = response.status();
         let retry_after = parse_retry_after(response.headers());
-        let text = response.text().await?;
+        // 用 bytes() 而不是 text()。reqwest 的 text() 在底层 chunk 流中断时
+        // 只丢一个 "error decoding response body" 出来，没有任何上下文 ——
+        // smoke 时一个 502 会让所有 LLM 路径变盲。改用 bytes() + lossy UTF-8，
+        // 失败时把 status / latency 一并报上来，并打成"LLM HTTP body_decode_error"
+        // 标签让 is_retryable_llm_error 识别为可重试。
+        let text = match response.bytes().await {
+            Ok(buf) => String::from_utf8_lossy(&buf).into_owned(),
+            Err(err) => {
+                let elapsed_ms = started_at.elapsed().as_millis();
+                return Err(AppError::External(format!(
+                    "LLM HTTP body_decode_error status={} elapsed_ms={} cause={}",
+                    status, elapsed_ms, err
+                )));
+            }
+        };
         if !status.is_success() {
             // 把 retry_after 透传给上层，由 retry 循环决定如何用。
             let mut err = AppError::External(format!("LLM HTTP {status}: {text}"));
@@ -164,7 +194,7 @@ impl LlmGenerator for LlmClient {
     }
 
     async fn generate_json_with_usage(&self, system: &str, user: &str) -> AppResult<LlmJsonResult> {
-        let mut last_error = None;
+        let mut last_error: Option<AppError> = None;
         let mut retry_count: u32 = 0;
         for attempt in 1..=self.max_retries {
             match self.generate_json_once(system, user).await {
@@ -174,27 +204,112 @@ impl LlmGenerator for LlmClient {
                 }
                 Err(error) if attempt < self.max_retries && is_retryable_llm_error(&error) => {
                     let retry_after_secs = parse_retry_after_from_error(&error);
-                    last_error = Some(error.to_string());
                     let delay = compute_backoff(attempt, self.retry_base_ms, retry_after_secs);
+                    last_error = Some(error);
                     sleep(delay).await;
                     retry_count = retry_count.saturating_add(1);
                 }
                 Err(error) => {
-                    if retry_count > 0 {
-                        return Err(AppError::External(format!(
-                            "{}; retry_count={}",
-                            error, retry_count
-                        )));
-                    }
-                    return Err(error);
+                    // 重试耗尽（或不可重试的 LLM 错误）—— 把 raw 错误分类成
+                    // [`AppError::LlmUnavailable`]，让前端按 `kind` 渲染中文文案，
+                    // 而不是把 reqwest 原始 "error sending request for url ..."
+                    // 直接糊到面板上。
+                    return Err(classify_llm_error_for_user(&error, retry_count));
                 }
             }
         }
-        Err(AppError::External(format!(
-            "LLM request failed after retries: {}",
-            last_error.unwrap_or_else(|| "unknown error".to_string())
-        )))
+        // for 循环正常退出（max_retries 用完且最后一次也走了可重试分支但 attempt
+        // == max_retries 没机会再 sleep 重试）—— last_error 必有值。
+        let final_err = last_error
+            .unwrap_or_else(|| AppError::External("LLM request failed after retries".to_string()));
+        Err(classify_llm_error_for_user(&final_err, retry_count))
     }
+}
+
+/// 把 LLM 调用最终失败的 raw 错误分类为 [`AppError::LlmUnavailable`]，附带
+/// 中文 hint，供前端面板按 `kind` 渲染明确文案 + 「AI 重试」按钮。
+///
+/// 分类来源：
+/// - `AppError::Http` → 看 reqwest::Error 的 `is_timeout / is_connect / is_request /
+///   is_decode` 标志位；
+/// - `AppError::External("LLM HTTP 4xx/5xx ...")` → 解析 status code 段；
+/// - `AppError::External("LLM HTTP body_decode_error ...")` → `body_decode_error`；
+/// - 其它 → `unknown`。
+fn classify_llm_error_for_user(error: &AppError, retry_count: u32) -> AppError {
+    let detail = error.to_string();
+    let (kind, hint) = match error {
+        AppError::Http(err) => {
+            if err.is_timeout() {
+                (
+                    "timeout",
+                    "上游 LLM 响应超时，已多次重试仍未收到结果。请稍后再试，或检查到 api.deepseek.com 的网络链路。",
+                )
+            } else if err.is_connect() {
+                (
+                    "connect_failed",
+                    "无法连接到上游 LLM 服务（DeepSeek / OpenAI），请检查网络、代理、DNS、TLS 证书是否正常。",
+                )
+            } else if err.is_decode() {
+                (
+                    "body_decode_error",
+                    "上游 LLM 返回了不完整或非法的响应体，已多次重试。请稍后再试。",
+                )
+            } else {
+                (
+                    "network_error",
+                    "请求 LLM 时网络出错，已多次重试。请稍后再试或检查网络连通性。",
+                )
+            }
+        }
+        AppError::External(msg) => {
+            if msg.contains("LLM HTTP 429") {
+                (
+                    "rate_limited",
+                    "上游 LLM 触发限流（429），已多次重试。建议 30 秒后再试，或在 .env 中调高 LLM_RETRY_BASE_MS。",
+                )
+            } else if msg.contains("LLM HTTP 5") {
+                (
+                    "http_5xx",
+                    "上游 LLM 返回 5xx 错误，已多次重试仍失败。这通常是 LLM 平台侧问题，请稍后再试。",
+                )
+            } else if msg.contains("LLM HTTP 4") {
+                (
+                    "http_4xx",
+                    "上游 LLM 拒绝了请求（4xx）。请检查 OPENAI_API_KEY / OPENAI_MODEL 是否正确、配额是否充足。",
+                )
+            } else if msg.contains("LLM HTTP body_decode_error") {
+                (
+                    "body_decode_error",
+                    "上游 LLM 返回的响应体在传输中被截断（chunked stream 中断），已多次重试。请稍后再试。",
+                )
+            } else if msg.contains("LLM returned no choices") {
+                (
+                    "empty_response",
+                    "上游 LLM 返回了空 choices。可能是 prompt 触发了平台过滤策略，请简化措辞后重试。",
+                )
+            } else {
+                ("external_error", "调用 LLM 失败，请稍后再试。")
+            }
+        }
+        AppError::Json(_) => (
+            "json_decode_error",
+            "上游 LLM 返回了非 JSON 文本，已尝试容错修复仍失败。请「AI 重试」一次。",
+        ),
+        AppError::BudgetExceeded { .. } => return error_clone_or_external(error),
+        _ => ("unknown", "调用 LLM 时出现未知错误，请稍后再试。"),
+    };
+    AppError::LlmUnavailable {
+        kind: kind.to_string(),
+        retry_count,
+        detail,
+        hint: hint.to_string(),
+    }
+}
+
+/// `AppError` 没实现 `Clone`，但 BudgetExceeded 是结构化 fields，需要原样转出。
+/// 简单做法：取它的 Display 字符串包成 External，让上层不丢语义。
+fn error_clone_or_external(error: &AppError) -> AppError {
+    AppError::External(error.to_string())
 }
 
 /// HP-4：可重试错误判定。
@@ -210,6 +325,7 @@ pub fn is_retryable_llm_error(error: &AppError) -> bool {
                 || message.contains("LLM HTTP 502")
                 || message.contains("LLM HTTP 503")
                 || message.contains("LLM HTTP 504")
+                || message.contains("LLM HTTP body_decode_error")
         }
         _ => false,
     }
@@ -273,7 +389,86 @@ fn parse_json_content(content: &str) -> AppResult<Value> {
     } else {
         trimmed
     };
-    serde_json::from_str(json_text).map_err(AppError::from)
+    match serde_json::from_str::<Value>(json_text) {
+        Ok(value) => Ok(value),
+        Err(strict_err) => {
+            // R15 / ISSUE-006：DeepSeek 偶发输出含 trailing comma 或末尾未闭合
+            // 的 JSON（实测 user.reply.task / knowledge.import.preview 都中过）。
+            // 严格解析失败时做一次有限容错：去掉 `,` 后跟空白/换行+`}` 或 `]`、
+            // 自动补足末尾未闭合的 `]` / `}`。仍失败就把原始严格错误抛出去，
+            // 不允许把非 JSON 文本当成 JSON。
+            if let Some(repaired) = repair_loose_json(json_text) {
+                if let Ok(value) = serde_json::from_str::<Value>(&repaired) {
+                    return Ok(value);
+                }
+            }
+            Err(AppError::from(strict_err))
+        }
+    }
+}
+
+/// 修复 LLM 偶发输出的非严格 JSON。只做两类局部修复：
+/// 1. trailing comma（`,]` / `,}`）→ 删掉 `,`。
+/// 2. 末尾少 `]` / `}` → 按 brackets 计数补足。
+///
+/// 不做以下"激进"修复：单引号→双引号、未引号 key、注释剥离 —— 这些会让本来
+/// 真正非 JSON 的内容被误吞，反而让上游错误难以诊断。
+pub(crate) fn repair_loose_json(input: &str) -> Option<String> {
+    let mut out = String::with_capacity(input.len());
+    let mut chars = input.chars().peekable();
+    let mut in_string = false;
+    let mut escape = false;
+    let mut depth_obj: i32 = 0;
+    let mut depth_arr: i32 = 0;
+    while let Some(c) = chars.next() {
+        if in_string {
+            out.push(c);
+            if escape {
+                escape = false;
+            } else if c == '\\' {
+                escape = true;
+            } else if c == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match c {
+            '"' => { in_string = true; out.push(c); }
+            '{' => { depth_obj += 1; out.push(c); }
+            '}' => { depth_obj -= 1; out.push(c); }
+            '[' => { depth_arr += 1; out.push(c); }
+            ']' => { depth_arr -= 1; out.push(c); }
+            ',' => {
+                // peek non-whitespace next char
+                let mut peek_iter = chars.clone();
+                let mut next_significant = None;
+                while let Some(&p) = peek_iter.peek() {
+                    if p.is_whitespace() { peek_iter.next(); } else { next_significant = Some(p); break; }
+                }
+                match next_significant {
+                    Some('}') | Some(']') => {
+                        // skip the trailing comma
+                    }
+                    _ => out.push(c),
+                }
+            }
+            _ => out.push(c),
+        }
+    }
+    // 末尾补足未闭合的 `]` `}`（按嵌套深度）。
+    while depth_arr > 0 {
+        out.push(']');
+        depth_arr -= 1;
+    }
+    while depth_obj > 0 {
+        out.push('}');
+        depth_obj -= 1;
+    }
+    if out == input {
+        None
+    } else {
+        Some(out)
+    }
 }
 
 #[cfg(test)]
@@ -295,6 +490,18 @@ mod tests {
     #[test]
     fn http_5xx_is_retryable() {
         let err = AppError::External("LLM HTTP 502: bad gateway".to_string());
+        assert!(is_retryable_llm_error(&err));
+    }
+
+    #[test]
+    fn body_decode_error_is_retryable() {
+        // smoke 中观察到 DeepSeek chunked body 偶发中断 ——
+        // reqwest 抛 "error decoding response body" 没有上下文。
+        // 我们包装成 "LLM HTTP body_decode_error status=... elapsed_ms=... cause=..."
+        // 后必须被分类为可重试，避免一条 TCP 抖动让整个 import-preview 直接 502。
+        let err = AppError::External(
+            "LLM HTTP body_decode_error status=200 elapsed_ms=1830 cause=error decoding response body".to_string(),
+        );
         assert!(is_retryable_llm_error(&err));
     }
 
@@ -325,5 +532,47 @@ mod tests {
         let err =
             AppError::External("LLM HTTP 429: please slow down [retry_after_secs=7]".to_string());
         assert_eq!(parse_retry_after_from_error(&err), Some(7));
+    }
+
+    /// R15 / ISSUE-006：DeepSeek 偶发输出 trailing comma；parse_json_content
+    /// SHALL 在严格解析失败后做一次 trailing-comma 修复，不让一个逗号毁掉整个
+    /// run（user.reply.task 失败 → run 整体 502）。
+    #[test]
+    fn parse_json_content_repairs_trailing_comma_in_object() {
+        let v = parse_json_content(r#"{"a": 1, "b": 2,}"#).unwrap();
+        assert_eq!(v.get("a").and_then(|x| x.as_i64()), Some(1));
+        assert_eq!(v.get("b").and_then(|x| x.as_i64()), Some(2));
+    }
+
+    #[test]
+    fn parse_json_content_repairs_trailing_comma_in_array() {
+        let v = parse_json_content(r#"{"items": [1, 2, 3,]}"#).unwrap();
+        assert_eq!(v.get("items").and_then(|x| x.as_array()).unwrap().len(), 3);
+    }
+
+    #[test]
+    fn parse_json_content_repairs_unclosed_object() {
+        // LLM 偶发末尾被截断；尝试补 `}` 救回。
+        let v = parse_json_content(r#"{"a": 1, "b": 2"#).unwrap();
+        assert_eq!(v.get("b").and_then(|x| x.as_i64()), Some(2));
+    }
+
+    #[test]
+    fn parse_json_content_does_not_swallow_garbage() {
+        // 真的不是 JSON 时仍要报错，避免容错把噪声当数据吞下。
+        assert!(parse_json_content("hello world").is_err());
+    }
+
+    #[test]
+    fn repair_loose_json_keeps_strict_input_unchanged() {
+        // 严格合法的 JSON 应直接走 strict 路径，repair 不应改写。
+        assert_eq!(repair_loose_json(r#"{"a":1}"#), None);
+    }
+
+    #[test]
+    fn repair_loose_json_does_not_remove_comma_inside_string() {
+        // 字符串里的 `,` 后跟 `}` 是字面量，不能误删。
+        let repaired = repair_loose_json(r#"{"x":"a,}b"}"#);
+        assert!(repaired.is_none(), "字符串内的 , 不应触发修复");
     }
 }

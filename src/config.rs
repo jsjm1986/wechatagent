@@ -124,8 +124,8 @@ impl AppConfig {
                 .parse()?,
             task_worker_interval_seconds: env_or("TASK_WORKER_INTERVAL_SECONDS", "30").parse()?,
             llm_timeout_seconds: env_or("LLM_TIMEOUT_SECONDS", "45").parse()?,
-            llm_max_retries: env_or("LLM_MAX_RETRIES", "3").parse()?,
-            llm_retry_base_ms: env_or("LLM_RETRY_BASE_MS", "1000").parse()?,
+            llm_max_retries: env_or("LLM_MAX_RETRIES", "5").parse()?,
+            llm_retry_base_ms: env_or("LLM_RETRY_BASE_MS", "1500").parse()?,
             task_claim_timeout_seconds: env_or("TASK_CLAIM_TIMEOUT_SECONDS", "300").parse()?,
             reaction_analysis_claim_timeout_seconds: env_or(
                 "REACTION_ANALYSIS_CLAIM_TIMEOUT_SECONDS",

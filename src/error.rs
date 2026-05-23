@@ -32,6 +32,18 @@ pub enum AppError {
         retry_after: u64,
         account_id: String,
     },
+    /// LLM 上游（DeepSeek / OpenAI 兼容端点）经过完整重试后仍不可达。
+    /// 由 [`crate::llm::generate_json_with_usage`] 在 retry 耗尽后产出，
+    /// 把网络层 / 上游 5xx / 限流的 raw 错误归并为带分类的可观测错误。
+    /// HTTP 503 + `{"error":"llm_unavailable", "kind", "retryCount", "detail", "hint"}`。
+    /// 前端按 `kind` 给出对应中文文案 + 「AI 重试」按钮。
+    #[error("llm unavailable ({kind}) after {retry_count} retries: {detail}")]
+    LlmUnavailable {
+        kind: String,
+        retry_count: u32,
+        detail: String,
+        hint: String,
+    },
 }
 
 pub type AppResult<T> = Result<T, AppError>;
@@ -64,6 +76,22 @@ impl IntoResponse for AppError {
                 }
                 response
             }
+            AppError::LlmUnavailable {
+                kind,
+                retry_count,
+                detail,
+                hint,
+            } => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({
+                    "error": "llm_unavailable",
+                    "kind": kind,
+                    "retryCount": retry_count,
+                    "detail": detail,
+                    "hint": hint,
+                })),
+            )
+                .into_response(),
             AppError::Db(_)
             | AppError::Http(_)
             | AppError::Json(_)

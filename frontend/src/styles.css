@@ -4666,3 +4666,85 @@ button.aiPrimary:disabled {
   border-color: var(--accent);
 }
 
+/* === LLM error banner ===
+   后端 AppError::LlmUnavailable 在前端的统一展示组件。
+   覆盖所有调 LLM 的面板（AiRepairPanel / KnowledgeChatPanel / 其他），
+   按 kind 渲染统一的中文文案 + 「AI 重试」 按钮，避免 reqwest 原文糊到 UI。 */
+.llmErrorBanner {
+  border: 1px solid #fecaca;
+  background: #fef2f2;
+  border-left: 3px solid #ef4444;
+  border-radius: 8px;
+  padding: 12px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  font-size: 13px;
+  color: #7f1d1d;
+}
+.llmErrorBanner__head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.llmErrorBanner__kind {
+  font-size: 11px;
+  font-weight: 600;
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: #fee2e2;
+  color: #991b1b;
+  letter-spacing: 0.04em;
+}
+.llmErrorBanner__retries {
+  font-size: 11px;
+  color: #b45309;
+}
+.llmErrorBanner__hint {
+  line-height: 1.6;
+  color: #1f2937;
+}
+.llmErrorBanner__detail {
+  font-size: 12px;
+  color: #64748b;
+}
+.llmErrorBanner__detail summary {
+  cursor: pointer;
+  user-select: none;
+}
+.llmErrorBanner__detail code {
+  display: block;
+  margin-top: 6px;
+  padding: 8px 10px;
+  background: #ffffff;
+  border: 1px solid #e5e7eb;
+  border-radius: 6px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 11px;
+  color: #475569;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+.llmErrorBanner__actions {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+.llmErrorBanner__actions .primary {
+  background: #2563eb;
+  color: #ffffff;
+  border: 1px solid #2563eb;
+  padding: 6px 14px;
+  border-radius: 6px;
+  font-size: 12px;
+  cursor: pointer;
+}
+.llmErrorBanner__actions .primary:hover:not(:disabled) {
+  background: #1d4ed8;
+  border-color: #1d4ed8;
+}
+.llmErrorBanner__actions .primary:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
