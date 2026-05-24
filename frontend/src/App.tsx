@@ -449,6 +449,32 @@ type KnowledgeChatTurnResponse = {
   budget?: Record<string, unknown>;
 };
 
+type KnowledgeDigestCardView = {
+  cardId: string;
+  kind: string;
+  title: string;
+  summary: string;
+  targetRefs?: Array<{ kind?: string; id?: string }>;
+  suggestedAction: string;
+  severity: "critical" | "warn" | "info" | string;
+  metric?: { name?: string; value?: number; threshold?: number } | null;
+};
+
+type KnowledgeDailyReportView = {
+  reportId?: string | null;
+  workspaceId: string;
+  accountId: string;
+  reportDate: string;
+  generatedAt?: string;
+  generatedBy?: string;
+  status: "ok" | "partial" | "failed" | string;
+  errorKind?: string | null;
+  budgetSnapshot?: Record<string, unknown>;
+  cards: KnowledgeDigestCardView[];
+  dismissedCardIds?: string[];
+  promptVersions?: Record<string, unknown>;
+};
+
 type OperationKnowledgeImportPreview = {
   document: OperationKnowledgeDocument | null;
   items: OperationKnowledgeItem[];
@@ -732,6 +758,14 @@ function llmKindLabel(kind: string): string {
   return LLM_KIND_LABELS[kind] ?? kind;
 }
 
+function todayLocalDate(): string {
+  const d = new Date();
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, "0");
+  const day = String(d.getDate()).padStart(2, "0");
+  return `${y}-${m}-${day}`;
+}
+
 /**
  * 统一渲染 LLM 调用失败的提示横幅，给所有调 LLM 的面板复用。
  *
@@ -856,6 +890,12 @@ export function App() {
       return undefined;
     }
   });
+  const [knowledgeChatMode, setKnowledgeChatMode] = useState<"drawer" | "docked">("docked");
+  const [digestReport, setDigestReport] = useState<KnowledgeDailyReportView | null>(null);
+  const [digestPhase, setDigestPhase] = useState<"idle" | "loading" | "regenerating" | "error">("idle");
+  const [digestError, setDigestError] = useState<Error | null>(null);
+  const [digestSelectedCardIds, setDigestSelectedCardIds] = useState<string[]>([]);
+  const [digestPendingChatInjection, setDigestPendingChatInjection] = useState<string | null>(null);
   const [knowledgeUsage, setKnowledgeUsage] = useState<KnowledgeUsageItem[]>([]);
   const [decisionReviews, setDecisionReviews] = useState<DecisionReview[]>([]);
   const [operatingMemory, setOperatingMemory] = useState<OperatingMemory | null>(null);
@@ -1620,6 +1660,27 @@ export function App() {
     return api.post(`/api/operation-knowledge/chat/${encodeURIComponent(sessionId)}/discard`, {});
   }
 
+  async function getDigestToday(): Promise<KnowledgeDailyReportView> {
+    return api.get<KnowledgeDailyReportView>(`/api/knowledge/digest/today`);
+  }
+
+  async function regenerateDigest(
+    accountId?: string,
+    force = true
+  ): Promise<KnowledgeDailyReportView> {
+    return api.post<KnowledgeDailyReportView>(`/api/knowledge/digest/regenerate`, {
+      accountId,
+      force
+    });
+  }
+
+  async function dismissDigestCard(cardId: string): Promise<{ ok: boolean; cardId: string }> {
+    return api.post<{ ok: boolean; cardId: string }>(
+      `/api/knowledge/digest/cards/${encodeURIComponent(cardId)}/dismiss`,
+      {}
+    );
+  }
+
   function openKnowledgeChat(sessionId?: string) {
     if (sessionId) {
       setKnowledgeChatSessionId(sessionId);
@@ -1641,6 +1702,128 @@ export function App() {
       } catch {
         /* ignore */
       }
+    }
+  }
+
+  function toggleDigestCardSelected(cardId: string) {
+    setDigestSelectedCardIds((prev) =>
+      prev.includes(cardId) ? prev.filter((id) => id !== cardId) : [...prev, cardId]
+    );
+  }
+
+  function digestSelectAll() {
+    if (!digestReport) return;
+    const dismissed = new Set(digestReport.dismissedCardIds || []);
+    setDigestSelectedCardIds(
+      digestReport.cards
+        .filter((c) => !dismissed.has(c.cardId))
+        .map((c) => c.cardId)
+    );
+  }
+
+  function digestInvertSelect() {
+    if (!digestReport) return;
+    const dismissed = new Set(digestReport.dismissedCardIds || []);
+    const all = digestReport.cards
+      .filter((c) => !dismissed.has(c.cardId))
+      .map((c) => c.cardId);
+    const selected = new Set(digestSelectedCardIds);
+    setDigestSelectedCardIds(all.filter((id) => !selected.has(id)));
+  }
+
+  async function digestIgnoreInfoCards() {
+    if (!digestReport) return;
+    const dismissed = new Set(digestReport.dismissedCardIds || []);
+    const infoCards = digestReport.cards.filter(
+      (c) => c.severity === "info" && !dismissed.has(c.cardId)
+    );
+    for (const card of infoCards) {
+      try {
+        await dismissDigestCard(card.cardId);
+      } catch (err) {
+        setDigestError(err instanceof Error ? err : new Error(String(err)));
+      }
+    }
+    try {
+      const fresh = await getDigestToday();
+      setDigestReport(fresh);
+    } catch {
+      /* ignore refresh failure here; banner already shown */
+    }
+  }
+
+  async function regenerateDigestNow() {
+    setDigestPhase("regenerating");
+    setDigestError(null);
+    try {
+      const fresh = await regenerateDigest(currentAccountId || undefined, true);
+      setDigestReport(fresh);
+      setDigestSelectedCardIds([]);
+      setDigestPhase("idle");
+    } catch (err) {
+      setDigestError(err instanceof Error ? err : new Error(String(err)));
+      setDigestPhase("error");
+    }
+  }
+
+  async function dismissDigestCardAndRefresh(cardId: string) {
+    try {
+      await dismissDigestCard(cardId);
+      setDigestSelectedCardIds((prev) => prev.filter((id) => id !== cardId));
+      const fresh = await getDigestToday();
+      setDigestReport(fresh);
+    } catch (err) {
+      setDigestError(err instanceof Error ? err : new Error(String(err)));
+    }
+  }
+
+  function serializeDigestCardForChat(card: KnowledgeDigestCardView): string {
+    const refs = (card.targetRefs || [])
+      .map((r) => `${r.kind || "?"}:${r.id || "?"}`)
+      .join(", ");
+    const metric = card.metric
+      ? `（${card.metric.name || "metric"}=${card.metric.value ?? "?"}/${card.metric.threshold ?? "?"}）`
+      : "";
+    return `[日报派工] severity=${card.severity} kind=${card.kind} ${card.title}${metric}\n摘要：${card.summary}\n引用：${refs}\n建议动作：${card.suggestedAction}`;
+  }
+
+  function dispatchSelectedCardsToChat() {
+    if (!digestReport || digestSelectedCardIds.length === 0) return;
+    const dismissed = new Set(digestReport.dismissedCardIds || []);
+    const picked = digestReport.cards.filter(
+      (c) => digestSelectedCardIds.includes(c.cardId) && !dismissed.has(c.cardId)
+    );
+    if (picked.length === 0) return;
+    const blob =
+      `请帮我处理以下 ${picked.length} 条日报 issue（按 severity 优先级，每条单独跑一轮 chat）：\n\n` +
+      picked.map((c, i) => `${i + 1}. ${serializeDigestCardForChat(c)}`).join("\n\n");
+    setDigestPendingChatInjection(blob);
+    setKnowledgeChatOpen(true);
+  }
+
+  function dispatchOneCardToChat(cardId: string) {
+    if (!digestReport) return;
+    const card = digestReport.cards.find((c) => c.cardId === cardId);
+    if (!card) return;
+    const blob =
+      `请帮我处理这条日报 issue：\n\n${serializeDigestCardForChat(card)}`;
+    setDigestPendingChatInjection(blob);
+    setKnowledgeChatOpen(true);
+  }
+
+  function openCardTarget(card: KnowledgeDigestCardView) {
+    const ref = (card.targetRefs || [])[0];
+    if (!ref || !ref.kind || !ref.id) return;
+    if (ref.kind === "chunk") {
+      setKnowledgeSelectedNodeId(`chunk:${ref.id}`);
+      const found = knowledgeChunks.find((c) => c.id === ref.id);
+      if (found) {
+        setEditingChunkId(found.id);
+        setChunkDraft(draftFromChunk(found));
+        setKnowledgeWorkspaceMode("selection");
+      }
+    } else if (ref.kind === "pack") {
+      setKnowledgeSelectedNodeId(`pack:${ref.id}`);
     }
   }
 
@@ -1965,6 +2148,23 @@ export function App() {
     void loadAll().catch((err) => setError(err instanceof Error ? err.message : String(err)));
   }, [currentAccountId, accounts.length]);
 
+  useEffect(() => {
+    if (activeChannel !== "knowledge") return;
+    if (digestPhase === "loading" || digestPhase === "regenerating") return;
+    if (digestReport && digestReport.reportDate === todayLocalDate()) return;
+    setDigestPhase("loading");
+    setDigestError(null);
+    void getDigestToday()
+      .then((data) => {
+        setDigestReport(data);
+        setDigestPhase("idle");
+      })
+      .catch((err) => {
+        setDigestError(err instanceof Error ? err : new Error(String(err)));
+        setDigestPhase("error");
+      });
+  }, [activeChannel, currentAccountId]);
+
   return (
     <div className="app">
       <aside className="sidebar">
@@ -2213,7 +2413,9 @@ export function App() {
         )}
 
         {activeChannel === "knowledge" && (
-          <OperationKnowledgeView
+          <div className="knowledgeWorkstation">
+            <div className="knowledgeWorkstation__col knowledgeWorkstation__col--index">
+              <OperationKnowledgeView
             busy={busy}
             catalog={knowledgeCatalog}
             completeness={knowledgeCompleteness}
@@ -2326,6 +2528,55 @@ export function App() {
             onAiRepair={(target) => setAiRepairTarget(target)}
             onExtractTags={(id) => void extractTagsForChunk(id)}
           />
+            </div>
+            <div className="knowledgeWorkstation__col knowledgeWorkstation__col--canvas">
+              <KnowledgeDigestCanvas
+                report={digestReport}
+                phase={digestPhase}
+                error={digestError}
+                selectedCardIds={digestSelectedCardIds}
+                onToggleSelect={toggleDigestCardSelected}
+                onSelectAll={digestSelectAll}
+                onInvertSelect={digestInvertSelect}
+                onIgnoreInfo={digestIgnoreInfoCards}
+                onRegenerate={regenerateDigestNow}
+                onDismissCard={dismissDigestCardAndRefresh}
+                onDispatchSelected={dispatchSelectedCardsToChat}
+                onDispatchOne={dispatchOneCardToChat}
+                onOpenCard={openCardTarget}
+              />
+            </div>
+            <div className="knowledgeWorkstation__col knowledgeWorkstation__col--chat">
+              <KnowledgeChatPanel
+                open={true}
+                mode="docked"
+                initialSessionId={knowledgeChatSessionId}
+                accountId={currentAccountId || undefined}
+                pendingInjection={digestPendingChatInjection}
+                onInjectionConsumed={() => setDigestPendingChatInjection(null)}
+                onClose={(sid) => {
+                  if (sid) {
+                    setKnowledgeChatSessionId(sid);
+                    try {
+                      window.localStorage.setItem(
+                        "wechatagent.knowledgeChatSessionId",
+                        sid
+                      );
+                    } catch {
+                      /* ignore */
+                    }
+                  }
+                }}
+                onApplied={() => {
+                  void loadAll();
+                }}
+                postTurn={postKnowledgeChatTurn}
+                getHistory={getKnowledgeChatHistory}
+                apply={applyKnowledgeChat}
+                discard={discardKnowledgeChat}
+              />
+            </div>
+          </div>
         )}
 
         {activeChannel === "content" && (
@@ -2405,19 +2656,22 @@ export function App() {
           onApply={applyAiRepairPatch}
         />
       )}
-      <KnowledgeChatPanel
-        open={knowledgeChatOpen}
-        initialSessionId={knowledgeChatSessionId}
-        accountId={currentAccountId || undefined}
-        onClose={(sid) => closeKnowledgeChat(sid)}
-        onApplied={() => {
-          void loadAll();
-        }}
-        postTurn={postKnowledgeChatTurn}
-        getHistory={getKnowledgeChatHistory}
-        apply={applyKnowledgeChat}
-        discard={discardKnowledgeChat}
-      />
+      {activeChannel !== "knowledge" && (
+        <KnowledgeChatPanel
+          open={knowledgeChatOpen}
+          mode="drawer"
+          initialSessionId={knowledgeChatSessionId}
+          accountId={currentAccountId || undefined}
+          onClose={(sid) => closeKnowledgeChat(sid)}
+          onApplied={() => {
+            void loadAll();
+          }}
+          postTurn={postKnowledgeChatTurn}
+          getHistory={getKnowledgeChatHistory}
+          apply={applyKnowledgeChat}
+          discard={discardKnowledgeChat}
+        />
+      )}
       {knowledgeDocModal && (
         <KnowledgeDocumentModal
           state={knowledgeDocModal}
@@ -9154,10 +9408,229 @@ const INTENT_LABELS: Record<string, string> = {
   freeform: "自由对话"
 };
 
+const DIGEST_SUGGESTED_ACTION_LABELS: Record<string, string> = {
+  fix_chunk: "修补 chunk",
+  archive_chunk: "归档 chunk",
+  fix_pack: "修补 pack",
+  review_evolution: "走 evolution 评审",
+  rebuild_index: "重建索引",
+  ignore: "忽略"
+};
+
+const DIGEST_SEVERITY_LABELS: Record<string, string> = {
+  critical: "critical",
+  warn: "warn",
+  info: "info"
+};
+
+const DIGEST_KIND_LABELS: Record<string, string> = {
+  chunk_caused_block: "Chunk 触发拦截",
+  chunk_missing_field: "Chunk 字段不全",
+  chunk_outdated: "Chunk 过期",
+  pack_outdated: "Pack 过期",
+  evolution_pending: "Evolution 待处理",
+  trend_pattern: "趋势异常",
+  freeform: "自由形态"
+};
+
+function KnowledgeDigestCanvas(props: {
+  report: KnowledgeDailyReportView | null;
+  phase: "idle" | "loading" | "regenerating" | "error";
+  error: Error | null;
+  selectedCardIds: string[];
+  onToggleSelect: (cardId: string) => void;
+  onSelectAll: () => void;
+  onInvertSelect: () => void;
+  onIgnoreInfo: () => Promise<void>;
+  onRegenerate: () => Promise<void>;
+  onDismissCard: (cardId: string) => Promise<void>;
+  onDispatchSelected: () => void;
+  onDispatchOne: (cardId: string) => void;
+  onOpenCard: (card: KnowledgeDigestCardView) => void;
+}) {
+  const {
+    report,
+    phase,
+    error,
+    selectedCardIds,
+    onToggleSelect,
+    onSelectAll,
+    onInvertSelect,
+    onIgnoreInfo,
+    onRegenerate,
+    onDismissCard,
+    onDispatchSelected,
+    onDispatchOne,
+    onOpenCard
+  } = props;
+  const dismissed = new Set(report?.dismissedCardIds || []);
+  const cards = (report?.cards || []).filter((c) => !dismissed.has(c.cardId));
+  const selectedCount = selectedCardIds.length;
+
+  return (
+    <section className="knowledgeDigestCanvas" aria-label="今日知识库日报画布">
+      <header className="knowledgeDigestCanvas__head">
+        <div className="knowledgeDigestCanvas__title">
+          <strong>📅 {report?.reportDate || todayLocalDate()} 日报</strong>
+          <span className="muted small">
+            {report
+              ? `生成于 ${report.generatedAt?.slice(0, 19) || ""} · ${cards.length} 条待处理`
+              : phase === "loading"
+              ? "AI 正在合成日报..."
+              : "暂无日报"}
+          </span>
+        </div>
+        <div className="knowledgeDigestCanvas__toolbar">
+          <button
+            type="button"
+            className="secondaryButton"
+            onClick={() => void onRegenerate()}
+            disabled={phase === "regenerating" || phase === "loading"}
+          >
+            <RefreshCw size={14} /> 重算今日
+          </button>
+          <button
+            type="button"
+            className="ghostButton"
+            onClick={onSelectAll}
+            disabled={cards.length === 0}
+          >
+            全选
+          </button>
+          <button
+            type="button"
+            className="ghostButton"
+            onClick={onInvertSelect}
+            disabled={cards.length === 0}
+          >
+            反选
+          </button>
+          <button
+            type="button"
+            className="ghostButton"
+            onClick={() => void onIgnoreInfo()}
+            disabled={cards.length === 0}
+          >
+            一键忽略 info
+          </button>
+        </div>
+      </header>
+
+      {phase === "error" && error ? (
+        <LlmErrorBanner error={error} onRetry={() => void onRegenerate()} retrying={false} />
+      ) : null}
+
+      {report?.status === "failed" ? (
+        <div className="knowledgeDigestCanvas__statusBanner knowledgeDigestCanvas__statusBanner--failed">
+          AI 合成失败（{report.errorKind || "未知"}）。可点「重算今日」让 AI 再试。
+        </div>
+      ) : null}
+      {report?.status === "partial" ? (
+        <div className="knowledgeDigestCanvas__statusBanner knowledgeDigestCanvas__statusBanner--partial">
+          AI 在预算上限内只完成了部分分析（{report.errorKind || "budget_exceeded"}）。
+        </div>
+      ) : null}
+
+      <div className="knowledgeDigestCanvas__list">
+        {phase === "loading" && !report ? (
+          <div className="knowledgeDigestCanvas__empty">AI 正在合成日报，请稍候...</div>
+        ) : cards.length === 0 ? (
+          <div className="knowledgeDigestCanvas__empty">
+            {phase === "idle" && report
+              ? "今日无待处理 issue（AI 已巡检过 24h 内 chunk 健康度 / usage / runs / evolution）。"
+              : "暂无卡片。"}
+          </div>
+        ) : (
+          cards.map((card) => {
+            const checked = selectedCardIds.includes(card.cardId);
+            const severity = card.severity || "info";
+            return (
+              <article
+                key={card.cardId}
+                className={`cardSurface knowledgeDigestCard knowledgeDigestCard--${severity}`}
+              >
+                <div className="knowledgeDigestCard__head">
+                  <input
+                    type="checkbox"
+                    checked={checked}
+                    onChange={() => onToggleSelect(card.cardId)}
+                    aria-label={`选中卡片 ${card.title}`}
+                  />
+                  <span className={`severityChip severityChip--${severity}`}>
+                    {DIGEST_SEVERITY_LABELS[severity] || severity}
+                  </span>
+                  <span className="knowledgeDigestCard__kind">
+                    {DIGEST_KIND_LABELS[card.kind] || card.kind}
+                  </span>
+                  <strong className="knowledgeDigestCard__title">{card.title}</strong>
+                </div>
+                <p className="knowledgeDigestCard__summary">{card.summary}</p>
+                <div className="knowledgeDigestCard__meta">
+                  {card.metric ? (
+                    <span className="metricChip">
+                      {card.metric.name || "metric"}: {card.metric.value ?? "—"}
+                      {card.metric.threshold !== undefined ? ` / 阈值 ${card.metric.threshold}` : ""}
+                    </span>
+                  ) : null}
+                  {(card.targetRefs || []).slice(0, 4).map((ref, idx) => (
+                    <span key={idx} className="metricChip metricChip--ref">
+                      {ref.kind}: {(ref.id || "").slice(0, 10)}
+                    </span>
+                  ))}
+                  <span className="muted small">
+                    建议：{DIGEST_SUGGESTED_ACTION_LABELS[card.suggestedAction] || card.suggestedAction}
+                  </span>
+                </div>
+                <div className="knowledgeDigestCard__actions">
+                  <button
+                    type="button"
+                    className="primaryButton"
+                    onClick={() => onDispatchOne(card.cardId)}
+                  >
+                    让 AI 单独处理
+                  </button>
+                  <button
+                    type="button"
+                    className="ghostButton"
+                    onClick={() => void onDismissCard(card.cardId)}
+                  >
+                    忽略
+                  </button>
+                  <button
+                    type="button"
+                    className="ghostButton"
+                    onClick={() => onOpenCard(card)}
+                  >
+                    打开
+                  </button>
+                </div>
+              </article>
+            );
+          })
+        )}
+      </div>
+
+      <footer className="knowledgeDigestCanvas__foot">
+        <button
+          type="button"
+          className="primaryButton"
+          onClick={onDispatchSelected}
+          disabled={selectedCount === 0}
+        >
+          💬 让 AI 处理选中的 {selectedCount} 条
+        </button>
+      </footer>
+    </section>
+  );
+}
+
 function KnowledgeChatPanel(props: {
   open: boolean;
   initialSessionId?: string;
   accountId?: string;
+  mode?: "drawer" | "docked";
+  pendingInjection?: string | null;
+  onInjectionConsumed?: () => void;
   onClose: (persistedSessionId?: string) => void;
   onApplied: () => void;
   postTurn: (body: {
@@ -9176,6 +9649,7 @@ function KnowledgeChatPanel(props: {
   discard: (sessionId: string) => Promise<{ ok: boolean; sessionId: string; discardedCount: number }>;
 }) {
   const { open, accountId, onClose, onApplied } = props;
+  const mode = props.mode || "drawer";
   const [sessionId, setSessionId] = useState<string | undefined>(props.initialSessionId);
   const [turns, setTurns] = useState<KnowledgeChatTurnView[]>([]);
   const [draftKind, setDraftKind] = useState<string | null>(null);
@@ -9194,6 +9668,13 @@ function KnowledgeChatPanel(props: {
   const [pendingInput, setPendingInput] = useState<string>("");
   const [input, setInput] = useState("");
   const streamRef = useRef<HTMLDivElement | null>(null);
+
+  useEffect(() => {
+    if (props.pendingInjection && props.pendingInjection.length > 0) {
+      setInput((prev) => (prev ? `${prev}\n${props.pendingInjection}` : props.pendingInjection!));
+      props.onInjectionConsumed?.();
+    }
+  }, [props.pendingInjection]);
 
   useEffect(() => {
     if (!open) return;
@@ -9385,11 +9866,22 @@ function KnowledgeChatPanel(props: {
     ? Object.entries(draftPatch).filter(([k]) => k !== "extras")
     : [];
 
+  const isDocked = mode === "docked";
+  const containerClass = isDocked ? "knowledgeChatDocked" : "knowledgeChatDrawer";
+  const containerHeadClass = isDocked
+    ? "knowledgeChatDocked__head"
+    : "knowledgeChatDrawer__head";
+  const containerBodyClass = isDocked
+    ? "knowledgeChatDocked__body"
+    : "knowledgeChatDrawer__body";
+
   return (
     <>
-      <div className="knowledgeChatScrim" onClick={() => onClose(sessionId)} />
-      <aside className="knowledgeChatDrawer" role="dialog" aria-label="AI 对话补完知识库">
-        <header className="knowledgeChatDrawer__head">
+      {!isDocked && (
+        <div className="knowledgeChatScrim" onClick={() => onClose(sessionId)} />
+      )}
+      <aside className={containerClass} role="dialog" aria-label="AI 对话补完知识库">
+        <header className={containerHeadClass}>
           <div>
             <strong>AI 对话补完知识库</strong>
             <p className="muted small">
@@ -9398,16 +9890,18 @@ function KnowledgeChatPanel(props: {
                 : "新会话 · 第一条消息发出后自动建会话"}
             </p>
           </div>
-          <button
-            type="button"
-            className="iconButton"
-            aria-label="关闭"
-            onClick={() => onClose(sessionId)}
-          >
-            ×
-          </button>
+          {!isDocked && (
+            <button
+              type="button"
+              className="iconButton"
+              aria-label="关闭"
+              onClick={() => onClose(sessionId)}
+            >
+              ×
+            </button>
+          )}
         </header>
-        <div className="knowledgeChatDrawer__body">
+        <div className={containerBodyClass}>
           <div className="knowledgeChatStream" ref={streamRef}>
             {turns.length === 0 ? (
               <div className="knowledgeChatEmpty">
