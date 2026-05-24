@@ -419,16 +419,20 @@ type OperationKnowledgeChunkDraft = {
 
 type KnowledgeChatTurnView = {
   turnIndex: number;
-  role: "user" | "assistant";
+  role: "user" | "assistant" | "system";
   intent?: string | null;
   content: string;
-  attachments?: Array<{ chunk_id?: string; item_id?: string }>;
+  attachments?: Array<{ chunk_id?: string; item_id?: string; taskId?: string; phase?: string }>;
   patch?: Record<string, unknown> | null;
   missingFields?: string[];
   followupQuestions?: Array<{ id?: string; field?: string; question?: string }>;
   status?: string;
   tokensUsed?: number;
   promptKey?: string | null;
+  /// knowledge-digest-workstation Phase 4：worker 写的进度 turn。
+  /// `task_progress` / `task_summary` / `tool_call_log` / null
+  kind?: string | null;
+  toolCalls?: Array<Record<string, unknown>>;
   createdAt?: string;
 };
 
@@ -439,6 +443,9 @@ type KnowledgeChatTurnResponse = {
   naturalReply: string;
   draftKind?: string | null;
   draftPreview?: Record<string, unknown> | null;
+  /// digest_action intent 命中时返回的 plannedSteps（每条含 stepId/cardId/action/summary/estimatedLlmCalls）。
+  plannedSteps?: Array<Record<string, unknown>> | null;
+  estimatedLlmCalls?: number | null;
   missingFields: string[];
   followupQuestions: Array<{ id?: string; field?: string; question?: string }>;
   canApply: boolean;
@@ -1660,6 +1667,17 @@ export function App() {
     return api.post(`/api/operation-knowledge/chat/${encodeURIComponent(sessionId)}/discard`, {});
   }
 
+  // knowledge-digest-workstation Phase 4 / P4.4：派工长任务 + SSE 进度回调。
+  async function postChatTask(body: {
+    sessionId: string;
+    accountId?: string;
+    operatorId?: string;
+    cardIds?: string[];
+    plannedSteps: Array<Record<string, unknown>>;
+  }): Promise<{ taskId: string; sessionId: string; status: string; totalSteps: number }> {
+    return api.post(`/api/knowledge/chat/tasks`, body);
+  }
+
   async function getDigestToday(): Promise<KnowledgeDailyReportView> {
     return api.get<KnowledgeDailyReportView>(`/api/knowledge/digest/today`);
   }
@@ -2574,6 +2592,7 @@ export function App() {
                 getHistory={getKnowledgeChatHistory}
                 apply={applyKnowledgeChat}
                 discard={discardKnowledgeChat}
+                postChatTask={postChatTask}
               />
             </div>
           </div>
@@ -2670,6 +2689,7 @@ export function App() {
           getHistory={getKnowledgeChatHistory}
           apply={applyKnowledgeChat}
           discard={discardKnowledgeChat}
+          postChatTask={postChatTask}
         />
       )}
       {knowledgeDocModal && (
@@ -9405,6 +9425,7 @@ const INTENT_LABELS: Record<string, string> = {
   update_chunk: "修改",
   update_pack: "修改 pack",
   clarify_chunk: "澄清",
+  digest_action: "派工",
   freeform: "自由对话"
 };
 
@@ -9647,6 +9668,16 @@ function KnowledgeChatPanel(props: {
     accountId?: string
   ) => Promise<{ ok: boolean; sessionId: string; intent: string; result: Record<string, unknown> }>;
   discard: (sessionId: string) => Promise<{ ok: boolean; sessionId: string; discardedCount: number }>;
+  /// knowledge-digest-workstation Phase 4 / P4.4：派工长任务。
+  /// 当 chat_turn 返回 intent="digest_action" + plannedSteps 时，
+  /// panel 渲染「派工确认」小卡，运营点确认后调用本函数落 task。
+  postChatTask?: (body: {
+    sessionId: string;
+    accountId?: string;
+    operatorId?: string;
+    cardIds?: string[];
+    plannedSteps: Array<Record<string, unknown>>;
+  }) => Promise<{ taskId: string; sessionId: string; status: string; totalSteps: number }>;
 }) {
   const { open, accountId, onClose, onApplied } = props;
   const mode = props.mode || "drawer";
@@ -9668,6 +9699,15 @@ function KnowledgeChatPanel(props: {
   const [pendingInput, setPendingInput] = useState<string>("");
   const [input, setInput] = useState("");
   const streamRef = useRef<HTMLDivElement | null>(null);
+  // P4.4：digest_action intent 命中后由 chat_turn 返回的 plannedSteps + 概要。
+  // 运营点「确认派工」即调 postChatTask 把它们落 KnowledgeChatTask；
+  // 取消则直接清空，不影响其它草稿状态。
+  const [pendingPlannedSteps, setPendingPlannedSteps] = useState<
+    Array<Record<string, unknown>> | null
+  >(null);
+  const [estimatedLlmCalls, setEstimatedLlmCalls] = useState<number | null>(null);
+  const [dispatchPhase, setDispatchPhase] = useState<"idle" | "submitting" | "error">("idle");
+  const [dispatchError, setDispatchError] = useState<Error | null>(null);
 
   useEffect(() => {
     if (props.pendingInjection && props.pendingInjection.length > 0) {
@@ -9734,6 +9774,40 @@ function KnowledgeChatPanel(props: {
     streamRef.current.scrollTop = streamRef.current.scrollHeight;
   }, [turns.length]);
 
+  // knowledge-digest-workstation Phase 4 / P4.4：SSE 拉 worker 写的 task_progress
+  // / task_summary turn。`/api/knowledge/chat/sessions/:sid/stream` 在每次 bump
+  // 时推一条 `event: turn`；客户端拿到后 GET history 拿增量。
+  // 注意：开 panel 但还没建 session 的阶段不订阅；session 建好或回放历史触发后才订阅。
+  useEffect(() => {
+    if (!open || !sessionId) return;
+    let closed = false;
+    const url = `/api/knowledge/chat/sessions/${encodeURIComponent(sessionId)}/stream`;
+    const es = new EventSource(url);
+    const refetch = () => {
+      if (closed) return;
+      void props
+        .getHistory(sessionId)
+        .then((data) => {
+          if (closed) return;
+          setTurns(data.items || []);
+        })
+        .catch(() => {
+          /* SSE 触发失败不弹错 banner，避免 worker 长任务噪声打扰 chat 主流程 */
+        });
+    };
+    es.addEventListener("turn", refetch);
+    es.onerror = () => {
+      // EventSource 默认会自动重连；只在 close 阶段彻底放弃。
+      if (closed) {
+        es.close();
+      }
+    };
+    return () => {
+      closed = true;
+      es.close();
+    };
+  }, [open, sessionId]);
+
   const sessionTurnCount = turns.filter((t) => t.role === "assistant").length;
   const turnLimitReached = sessionTurnCount >= 8;
 
@@ -9784,6 +9858,14 @@ function KnowledgeChatPanel(props: {
       setMissingFields(res.missingFields);
       setFollowups(res.followupQuestions);
       setCanApply(res.canApply);
+      // P4.4：digest_action 命中 → 缓存 plannedSteps，等运营点「确认派工」。
+      if (res.intent === "digest_action" && res.plannedSteps && res.plannedSteps.length > 0) {
+        setPendingPlannedSteps(res.plannedSteps);
+        setEstimatedLlmCalls(res.estimatedLlmCalls ?? null);
+      } else {
+        setPendingPlannedSteps(null);
+        setEstimatedLlmCalls(null);
+      }
       setInput("");
       setPendingInput("");
       setPhase("idle");
@@ -9833,6 +9915,43 @@ function KnowledgeChatPanel(props: {
       setLastFailedAction("discard");
       setPhase("error");
     }
+  }
+
+  // P4.4：把 LLM 出的 plannedSteps 落 KnowledgeChatTask{status="pending"}；
+  // worker 30s 内串行执行，期间通过 SSE 推 task_progress / task_summary turn。
+  async function handleDispatch() {
+    if (!sessionId || !pendingPlannedSteps || pendingPlannedSteps.length === 0) return;
+    if (!props.postChatTask) {
+      setDispatchError(new Error("当前面板未注入派工接口"));
+      setDispatchPhase("error");
+      return;
+    }
+    const cardIds: string[] = pendingPlannedSteps
+      .map((s) => (typeof s.cardId === "string" ? (s.cardId as string) : ""))
+      .filter((x) => x.length > 0);
+    setDispatchPhase("submitting");
+    setDispatchError(null);
+    try {
+      await props.postChatTask({
+        sessionId,
+        accountId: props.accountId,
+        cardIds: cardIds.length > 0 ? cardIds : undefined,
+        plannedSteps: pendingPlannedSteps
+      });
+      setPendingPlannedSteps(null);
+      setEstimatedLlmCalls(null);
+      setDispatchPhase("idle");
+    } catch (err) {
+      setDispatchError(err instanceof Error ? err : new Error(String(err)));
+      setDispatchPhase("error");
+    }
+  }
+
+  function handleCancelDispatch() {
+    setPendingPlannedSteps(null);
+    setEstimatedLlmCalls(null);
+    setDispatchError(null);
+    setDispatchPhase("idle");
   }
 
   function retryLastAction() {
@@ -9961,7 +10080,63 @@ function KnowledgeChatPanel(props: {
           </div>
           <aside className="knowledgeChatDraft">
             <div className="knowledgeChatDraft__title">当前草稿预览</div>
-            {!draftPatch ? (
+            {pendingPlannedSteps && pendingPlannedSteps.length > 0 ? (
+              <div className="knowledgeChatDispatch">
+                <p className="small">
+                  AI 已拆出 <strong>{pendingPlannedSteps.length}</strong> 步派工
+                  {estimatedLlmCalls != null && (
+                    <span> · 预估 {estimatedLlmCalls} 次 LLM 调用</span>
+                  )}
+                </p>
+                <ol className="knowledgeChatDispatch__steps">
+                  {pendingPlannedSteps.map((s, idx) => {
+                    const stepId =
+                      typeof s.stepId === "string" ? s.stepId : `step_${idx + 1}`;
+                    const action = typeof s.action === "string" ? s.action : "freeform";
+                    const summary =
+                      typeof s.summary === "string"
+                        ? s.summary
+                        : typeof s.naturalReply === "string"
+                        ? (s.naturalReply as string)
+                        : "";
+                    return (
+                      <li key={stepId}>
+                        <span className="knowledgeChatDispatch__action">{action}</span>
+                        <span>{summary}</span>
+                      </li>
+                    );
+                  })}
+                </ol>
+                <p className="muted small">
+                  确认后 AI 会按上述顺序串行处理；任意一步失败会跳过并继续。处理结果会以
+                  <strong> task_progress / task_summary </strong>
+                  形态实时回传到本对话流。
+                </p>
+                {dispatchError && (
+                  <p className="small" style={{ color: "#dc2626" }}>
+                    派工失败：{dispatchError.message}
+                  </p>
+                )}
+                <div className="knowledgeChatDraft__actions">
+                  <button
+                    type="button"
+                    className="primary"
+                    disabled={dispatchPhase === "submitting"}
+                    onClick={() => void handleDispatch()}
+                  >
+                    {dispatchPhase === "submitting" ? "派工中..." : "确认派工"}
+                  </button>
+                  <button
+                    type="button"
+                    className="secondary"
+                    disabled={dispatchPhase === "submitting"}
+                    onClick={handleCancelDispatch}
+                  >
+                    取消
+                  </button>
+                </div>
+              </div>
+            ) : !draftPatch ? (
               <p className="muted small">尚无草稿。先在左侧告诉 AI 想做什么。</p>
             ) : (
               <>

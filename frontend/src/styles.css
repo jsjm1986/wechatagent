@@ -4483,6 +4483,60 @@ button.aiPrimary:disabled {
   border-top: 1px solid var(--line);
 }
 
+.knowledgeChatDispatch {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 12px 14px;
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+  border: 1px solid var(--ai);
+  box-shadow: 0 6px 18px rgba(15, 23, 42, 0.06);
+}
+
+.knowledgeChatDispatch__title {
+  font-size: 12px;
+  color: var(--ai);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  font-weight: 600;
+}
+
+.knowledgeChatDispatch__hint {
+  font-size: 12px;
+  color: var(--muted);
+  line-height: 1.5;
+}
+
+.knowledgeChatDispatch__steps {
+  margin: 0;
+  padding-left: 20px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  font-size: 12px;
+  color: var(--ink);
+}
+
+.knowledgeChatDispatch__steps li {
+  list-style: decimal;
+  line-height: 1.5;
+}
+
+.knowledgeChatDispatch__action {
+  display: inline-block;
+  font-weight: 600;
+  color: var(--ai);
+  margin-right: 6px;
+}
+
+.knowledgeChatDispatch__actions {
+  display: flex;
+  gap: 8px;
+  padding-top: 8px;
+  border-top: 1px solid var(--line);
+}
+
 .knowledgeChatInput {
   border-top: 1px solid var(--line);
   padding: 12px 16px;

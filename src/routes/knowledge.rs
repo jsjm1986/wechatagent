@@ -3816,6 +3816,12 @@ pub(super) async fn chat_turn(
         .get("promptKey")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
+    // knowledge-digest-workstation Phase 4 / P4.4：digest_action intent 命中时
+    // LLM 出 plannedSteps + estimatedLlmCalls，转发给前端弹「派工确认」小卡。
+    let planned_steps = result.get("plannedSteps").cloned();
+    let estimated_llm_calls = result
+        .get("estimatedLlmCalls")
+        .and_then(|v| v.as_i64());
     let can_apply = patch.is_some()
         && missing_fields.is_empty()
         && draft_kind.is_some();
@@ -3911,6 +3917,8 @@ pub(super) async fn chat_turn(
         "naturalReply": natural_reply,
         "draftKind": draft_kind,
         "draftPreview": patch,
+        "plannedSteps": planned_steps,
+        "estimatedLlmCalls": estimated_llm_calls,
         "missingFields": missing_fields,
         "followupQuestions": followups,
         "canApply": can_apply,
@@ -4227,6 +4235,11 @@ fn chat_turn_to_view(turn: &KnowledgeChatTurn) -> Value {
         "status": turn.status,
         "tokensUsed": turn.tokens_used,
         "promptKey": turn.prompt_key,
+        // knowledge-digest-workstation Phase 4：worker 写的进度 turn 用
+        // `kind = task_progress / task_summary / tool_call_log` 区分；
+        // freeform / chat 默认不写。
+        "kind": turn.kind,
+        "toolCalls": turn.tool_calls,
         "createdAt": turn.created_at.try_to_rfc3339_string().unwrap_or_default(),
     })
 }
@@ -4322,6 +4335,19 @@ async fn run_chat_turn_pipeline(
             .await?;
             v["draftKind"] = json!("pack_update");
             v["promptKey"] = json!("knowledge.chat.update_chunk");
+            v
+        }
+        "digest_action" => {
+            let mut v = dispatch_digest_action_for_chat(
+                state,
+                account_id,
+                session_id,
+                user_content,
+                history,
+            )
+            .await?;
+            v["draftKind"] = json!("digest_dispatch");
+            v["promptKey"] = json!("knowledge.digest.dispatch");
             v
         }
         _ => clarify_for_chat(state, account_id, session_id, user_content, history)
@@ -4695,6 +4721,93 @@ async fn clarify_for_chat(
     .await
 }
 
+/// knowledge-digest-workstation Phase 4 / Task #360：
+/// 把运营从今日日报勾出的一组卡片转成 `plannedSteps` 序列。
+///
+/// 调 `knowledge.digest.dispatch` PromptSpec；输入是当日 cards 摘要 + 运营本轮文字；
+/// 输出含 `plannedSteps[] / estimatedLlmCalls / naturalReply`，由前端拿到后弹「派工
+/// 确认」小卡，确认后再 POST `/api/knowledge/chat/tasks` 落 `KnowledgeChatTask`。
+///
+/// 与 update_chunk_for_chat 不同：本路径不出 patch、不直接落库，仅是步骤计划。
+async fn dispatch_digest_action_for_chat(
+    state: &AppState,
+    account_id: &str,
+    session_id: &str,
+    user_content: &str,
+    history: &[KnowledgeChatTurn],
+) -> AppResult<Value> {
+    let system = prompts::load_prompt(
+        &state.db,
+        &state.config.default_workspace_id,
+        "knowledge.digest.dispatch",
+    )
+    .await
+    .unwrap_or_else(|_| {
+        "你是 AI 调度器，把运营勾的卡片拆成 plannedSteps。只输出 JSON: {plannedSteps, estimatedLlmCalls, naturalReply}.".to_string()
+    });
+
+    // 取今日日报里未 dismiss 的卡片摘要（≤ 20 条）作为参考
+    // 卡片实际勾选由前端在 attachments 里传，但本轮 chat 不收 cardIds —— 让 LLM
+    // 看到全量候选 + 运营自然语言去匹配（运营常说"把这 3 张 fix 了"）。
+    let report_date = chrono::Local::now().format("%Y-%m-%d").to_string();
+    let report = state
+        .db
+        .knowledge_daily_reports()
+        .find_one(
+            doc! {
+                "workspace_id": &state.config.default_workspace_id,
+                "account_id": account_id,
+                "report_date": &report_date,
+            },
+            None,
+        )
+        .await?;
+    let mut card_summaries: Vec<Value> = vec![];
+    if let Some(r) = report {
+        for c in r.cards.iter().take(20) {
+            if r.dismissed_card_ids.contains(&c.card_id) {
+                continue;
+            }
+            card_summaries.push(json!({
+                "cardId": c.card_id.to_hex(),
+                "kind": c.kind,
+                "title": c.title,
+                "summary": c.summary,
+                "suggestedAction": c.suggested_action,
+                "severity": c.severity,
+            }));
+        }
+    }
+
+    let user = format!(
+        r#"运营本轮输入：
+{user_content}
+
+今日日报候选卡片（最多 20 条，未被 dismiss）：
+{cards}
+
+最近历史（最多 6 条）：
+{history}
+
+请按 system 中 schema 输出 plannedSteps（步数 ≤ 8、总 estimatedLlmCalls ≤ 12）。
+每个 step 必须含 stepId / cardId / action / summary / estimatedLlmCalls。
+action 必须在 [fix_chunk, add_chunk, retag, review_evolution, analyze_logs, dismiss] 中。"#,
+        cards = serde_json::to_string_pretty(&card_summaries).unwrap_or_else(|_| "[]".to_string()),
+        history = render_chat_history_for_prompt(history),
+    );
+    let run_id = format!("chat-{session_id}-dispatch");
+    agent::generate_agent_json(
+        state,
+        Some(account_id),
+        None,
+        Some(&run_id),
+        "knowledge.digest.dispatch",
+        &system,
+        &user,
+    )
+    .await
+}
+
 async fn apply_create_chunk(
     state: &AppState,
     account_id: &str,
@@ -5056,6 +5169,246 @@ fn serialize_digest_report(report: &crate::models::KnowledgeDailyReport) -> Json
             .collect::<Vec<_>>(),
         "promptVersions": serde_json::to_value(&report.prompt_versions).unwrap_or(json!({})),
     }))
+}
+
+// ── knowledge-digest-workstation Phase 4：chat 长任务 + SSE ──────────────────
+
+/// `POST /api/knowledge/chat/tasks`：把 chat dispatch 出的 plannedSteps 落库为
+/// `knowledge_chat_tasks{status="pending"}`，由 `KnowledgeTaskWorker` 串行执行。
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct ChatTaskCreateRequest {
+    pub session_id: String,
+    pub account_id: Option<String>,
+    pub operator_id: Option<String>,
+    #[serde(default)]
+    pub card_ids: Vec<String>,
+    #[serde(default)]
+    pub planned_steps: Vec<Value>,
+}
+
+pub(super) async fn chat_task_create(
+    State(state): State<AppState>,
+    Json(body): Json<ChatTaskCreateRequest>,
+) -> AppResult<Json<Value>> {
+    let session_id = body.session_id.trim();
+    if session_id.is_empty() {
+        return Err(AppError::BadRequest("sessionId 不能为空".to_string()));
+    }
+    if body.planned_steps.is_empty() {
+        return Err(AppError::BadRequest(
+            "plannedSteps 不能为空，请先经 chat dispatch 拿到步骤计划".to_string(),
+        ));
+    }
+    if body.planned_steps.len() > 8 {
+        return Err(AppError::BadRequest(
+            "plannedSteps 步数超过 8 条，请由前端分批派工".to_string(),
+        ));
+    }
+    let account_id = body
+        .account_id
+        .clone()
+        .unwrap_or_else(|| state.config.default_account_id.clone());
+
+    // 把 plannedSteps 序列化成 BSON Document 数组（每条至少含 stepId/cardId/action）。
+    let mut steps_doc: Vec<Document> = Vec::with_capacity(body.planned_steps.len());
+    for (idx, step) in body.planned_steps.iter().enumerate() {
+        let mut d = bson_from_json(step)
+            .map_err(|e| AppError::BadRequest(format!("plannedSteps[{idx}] 非法 JSON: {e}")))?;
+        if d.get_str("stepId").is_err() {
+            d.insert("stepId", format!("step_{}", idx + 1));
+        }
+        if d.get_str("action").is_err() {
+            return Err(AppError::BadRequest(format!(
+                "plannedSteps[{idx}].action 缺失"
+            )));
+        }
+        steps_doc.push(d);
+    }
+
+    // cards 快照：从今日日报里反查（best-effort，缺失也允许落 task）。
+    let report_date = chrono::Local::now().format("%Y-%m-%d").to_string();
+    let report = state
+        .db
+        .knowledge_daily_reports()
+        .find_one(
+            doc! {
+                "workspace_id": &state.config.default_workspace_id,
+                "account_id": &account_id,
+                "report_date": &report_date,
+            },
+            None,
+        )
+        .await?;
+    let mut card_snapshots: Vec<crate::models::KnowledgeDigestCard> = vec![];
+    if let Some(r) = report {
+        for cid_hex in &body.card_ids {
+            if let Ok(oid) = ObjectId::parse_str(cid_hex) {
+                if let Some(c) = r.cards.iter().find(|c| c.card_id == oid) {
+                    card_snapshots.push(c.clone());
+                }
+            }
+        }
+    }
+
+    let task_id = ObjectId::new();
+    let task = crate::models::KnowledgeChatTask {
+        id: Some(task_id),
+        workspace_id: state.config.default_workspace_id.clone(),
+        account_id: account_id.clone(),
+        session_id: session_id.to_string(),
+        operator_id: body.operator_id.clone(),
+        cards: card_snapshots,
+        planned_steps: steps_doc,
+        completed_steps: vec![],
+        status: "pending".to_string(),
+        error_kind: None,
+        created_at: DateTime::now(),
+        started_at: None,
+        finished_at: None,
+    };
+    state
+        .db
+        .knowledge_chat_tasks()
+        .insert_one(task, None)
+        .await?;
+
+    // 立刻写一条 task_progress turn 记录派工已落库。
+    let last = state
+        .db
+        .knowledge_chat_turns()
+        .find_one(
+            doc! {
+                "workspace_id": &state.config.default_workspace_id,
+                "session_id": session_id,
+            },
+            mongodb::options::FindOneOptions::builder()
+                .sort(doc! { "turn_index": -1 })
+                .build(),
+        )
+        .await?;
+    let next_index = last.map(|t| t.turn_index).unwrap_or(0) + 1;
+    let turn = KnowledgeChatTurn {
+        id: None,
+        workspace_id: state.config.default_workspace_id.clone(),
+        account_id: account_id.clone(),
+        session_id: session_id.to_string(),
+        turn_index: next_index,
+        role: "system".to_string(),
+        intent: Some("digest_action".to_string()),
+        content: format!(
+            "AI 已收到派工，taskId={}，共 {} 步，等待 worker 串行执行",
+            task_id,
+            body.planned_steps.len()
+        ),
+        attachments: vec![doc! { "taskId": task_id, "phase": "queued" }],
+        patch: None,
+        missing_fields: vec![],
+        followup_questions: vec![],
+        status: "pending".to_string(),
+        tokens_used: 0,
+        prompt_key: None,
+        kind: Some("task_progress".to_string()),
+        tool_calls: vec![],
+        created_at: DateTime::now(),
+    };
+    state
+        .db
+        .knowledge_chat_turns()
+        .insert_one(turn, None)
+        .await?;
+    state.chat_progress_bus.bump(session_id).await;
+
+    Ok(Json(json!({
+        "taskId": task_id.to_hex(),
+        "sessionId": session_id,
+        "status": "pending",
+        "totalSteps": body.planned_steps.len() as i32,
+    })))
+}
+
+/// `GET /api/knowledge/chat/tasks/:id`：查询 task 状态（前端 fallback 拉取）。
+pub(super) async fn chat_task_get(
+    State(state): State<AppState>,
+    Path(id_hex): Path<String>,
+) -> AppResult<Json<Value>> {
+    let oid = ObjectId::parse_str(&id_hex)
+        .map_err(|_| AppError::BadRequest(format!("invalid task id: {id_hex}")))?;
+    let task = state
+        .db
+        .knowledge_chat_tasks()
+        .find_one(doc! { "_id": oid }, None)
+        .await?
+        .ok_or_else(|| AppError::NotFound(format!("knowledge_chat_task {id_hex} 不存在")))?;
+    Ok(Json(json!({
+        "taskId": task.id.map(|i| i.to_hex()).unwrap_or_default(),
+        "sessionId": task.session_id,
+        "status": task.status,
+        "errorKind": task.error_kind,
+        "totalSteps": task.planned_steps.len() as i32,
+        "completedSteps": serde_json::to_value(&task.completed_steps).unwrap_or(json!([])),
+        "plannedSteps": serde_json::to_value(&task.planned_steps).unwrap_or(json!([])),
+        "cards": serde_json::to_value(&task.cards).unwrap_or(json!([])),
+        "createdAt": task.created_at.to_string(),
+        "startedAt": task.started_at.map(|d| d.to_string()),
+        "finishedAt": task.finished_at.map(|d| d.to_string()),
+    })))
+}
+
+/// `POST /api/knowledge/chat/tasks/:id/cancel`：标 status="cancelled"；
+/// worker 在每步开始前 re-read 状态，非 "running" 即停下。
+pub(super) async fn chat_task_cancel(
+    State(state): State<AppState>,
+    Path(id_hex): Path<String>,
+) -> AppResult<Json<Value>> {
+    let oid = ObjectId::parse_str(&id_hex)
+        .map_err(|_| AppError::BadRequest(format!("invalid task id: {id_hex}")))?;
+    let res = state
+        .db
+        .knowledge_chat_tasks()
+        .update_one(
+            doc! { "_id": oid, "status": doc! { "$in": ["pending", "running"] } },
+            doc! { "$set": { "status": "cancelled", "finished_at": DateTime::now() } },
+            None,
+        )
+        .await?;
+    if res.matched_count == 0 {
+        return Err(AppError::NotFound(format!(
+            "task {id_hex} 不存在或已 finished/failed/cancelled"
+        )));
+    }
+    Ok(Json(json!({ "ok": true, "taskId": id_hex, "status": "cancelled" })))
+}
+
+/// `GET /api/knowledge/chat/sessions/:sid/stream`：SSE 推送最新 turn_index。
+/// 客户端按收到的 version 回拉 `chat_history` 拿增量 turn。
+pub(super) async fn chat_session_stream(
+    State(state): State<AppState>,
+    Path(session_id): Path<String>,
+) -> axum::response::Sse<
+    impl futures::Stream<Item = Result<axum::response::sse::Event, std::convert::Infallible>>,
+> {
+    use axum::response::sse::{Event, KeepAlive, Sse};
+    let rx = state.chat_progress_bus.subscribe(&session_id).await;
+    // 用 futures::stream::unfold 把 watch::Receiver 转成 SSE Stream，
+    // 避免引入 tokio-stream 新依赖。
+    let stream = futures::stream::unfold(rx, |mut rx| async move {
+        if rx.changed().await.is_err() {
+            return None;
+        }
+        let v = *rx.borrow_and_update();
+        let event = Event::default().event("turn").data(v.to_string());
+        Some((Ok::<_, std::convert::Infallible>(event), rx))
+    });
+    Sse::new(stream).keep_alive(KeepAlive::default())
+}
+
+/// 把 serde_json::Value 转成 BSON Document（仅接受 object）。
+fn bson_from_json(value: &Value) -> Result<Document, String> {
+    if !value.is_object() {
+        return Err("expected JSON object".to_string());
+    }
+    mongodb::bson::to_document(value).map_err(|e| e.to_string())
 }
 
 #[cfg(test)]
