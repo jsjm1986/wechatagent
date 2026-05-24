@@ -2147,6 +2147,11 @@ pub struct KnowledgeDailyReport {
     pub prompt_versions: Document,
 }
 
+/// `KnowledgeChatTask.status` 的封闭枚举。任何 DB 写入若不属于该集合应被拒绝。
+/// 历史值 `"finished"` 已重命名为 `"completed"`（P2-12）。
+pub const ALLOWED_TASK_STATUS: &[&str] =
+    &["pending", "running", "completed", "failed", "cancelled"];
+
 /// 长任务（运营在 chat 派工 ≥ 3 cards 或预估 LLM call > 6 时生成；
 /// 由 `KnowledgeTaskWorker` 30s 轮询、按 sessionId 串行执行）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2167,7 +2172,10 @@ pub struct KnowledgeChatTask {
     /// `[{cardId, action, chunkId?, error?}]`，worker 每完成一步追加。
     #[serde(default)]
     pub completed_steps: Vec<Document>,
-    /// `pending` / `running` / `finished` / `failed` / `cancelled`。封闭枚举。
+    /// `pending` / `running` / `completed` / `failed` / `cancelled`。封闭枚举，
+    /// 见 [`ALLOWED_TASK_STATUS`]。历史值 `"finished"` 已被 P2-12 重命名为
+    /// `"completed"`：与 outbox / evolution 的 `"completed"` / `"failed"` 终态语义对齐，
+    /// 避免一个项目里 task 终态用三种近义词（finished / completed / done）。
     pub status: String,
     /// 失败时的错误分类。
     #[serde(default, skip_serializing_if = "Option::is_none")]

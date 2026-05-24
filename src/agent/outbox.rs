@@ -817,4 +817,117 @@ mod tests {
         assert_eq!(kind.len(), "outbox_canceled".len());
         assert_eq!(reason, "user_reaction_stop_requested");
     }
+
+    /// R13.4 / ISSUE-002 (R11 补)：cooldown_until 在 dispatcher tick 之间被写到
+    /// 未来时刻 → second gate SHALL 返回 contact_cooldown_active。
+    #[test]
+    fn second_safety_gate_pure_blocks_on_active_cooldown() {
+        const STALE_MS: i64 = 30 * 60 * 1000;
+        let now_ms: i64 = 1_000_000;
+        let entry_created_ms: i64 = now_ms - 5_000;
+        let cooldown_until_ms = Some(now_ms + 60_000);
+        let res = check_second_safety_gate_pure(
+            now_ms,
+            entry_created_ms,
+            cooldown_until_ms,
+            None,
+            "",
+            entry_created_ms,
+            STALE_MS,
+        );
+        assert_eq!(res.as_deref(), Some("contact_cooldown_active"));
+    }
+
+    /// cooldown_until ≤ now（已过期）→ 不命中 cooldown 分支。
+    #[test]
+    fn second_safety_gate_pure_passes_when_cooldown_expired() {
+        const STALE_MS: i64 = 30 * 60 * 1000;
+        let now_ms: i64 = 1_000_000;
+        let res = check_second_safety_gate_pure(
+            now_ms,
+            now_ms - 1_000,
+            Some(now_ms - 60_000),
+            None,
+            "",
+            now_ms - 1_000,
+            STALE_MS,
+        );
+        assert!(res.is_none());
+    }
+
+    /// 用户在 decision 之后回了 stop 信号 → second gate SHALL 返回
+    /// user_stop_requested_after_decision。
+    #[test]
+    fn second_safety_gate_pure_blocks_on_user_stop_after_decision() {
+        const STALE_MS: i64 = 30 * 60 * 1000;
+        let now_ms: i64 = 1_000_000;
+        let decision_created_ms: i64 = now_ms - 30_000;
+        let last_inbound_ms = Some(now_ms - 10_000);
+        let res = check_second_safety_gate_pure(
+            now_ms,
+            decision_created_ms,
+            None,
+            last_inbound_ms,
+            "user_replied_stop_requested",
+            decision_created_ms,
+            STALE_MS,
+        );
+        assert_eq!(res.as_deref(), Some("user_stop_requested_after_decision"));
+    }
+
+    /// 用户在 decision 之前发的消息（last_inbound ≤ decision_created）→ 不算
+    /// stop after decision。
+    #[test]
+    fn second_safety_gate_pure_passes_when_last_inbound_before_decision() {
+        const STALE_MS: i64 = 30 * 60 * 1000;
+        let now_ms: i64 = 1_000_000;
+        let decision_created_ms: i64 = now_ms - 10_000;
+        let last_inbound_ms = Some(now_ms - 60_000);
+        let res = check_second_safety_gate_pure(
+            now_ms,
+            decision_created_ms,
+            None,
+            last_inbound_ms,
+            "user_replied_stop_requested",
+            decision_created_ms,
+            STALE_MS,
+        );
+        assert!(res.is_none());
+    }
+
+    /// outbox 条目超过 stale_threshold（30min）→ second gate SHALL 返回
+    /// outbox_stale_30min（即使 cooldown / stop 都未命中）。
+    #[test]
+    fn second_safety_gate_pure_blocks_on_stale_entry() {
+        let stale_ms: i64 = 30 * 60 * 1000;
+        let now_ms: i64 = 5_000_000;
+        let entry_created_ms: i64 = now_ms - stale_ms - 1;
+        let res = check_second_safety_gate_pure(
+            now_ms,
+            entry_created_ms,
+            None,
+            None,
+            "",
+            entry_created_ms,
+            stale_ms,
+        );
+        assert_eq!(res.as_deref(), Some("outbox_stale_30min"));
+    }
+
+    /// 三条件都不命中（fresh entry + 无 cooldown + 无 stop 信号）→ None。
+    #[test]
+    fn second_safety_gate_pure_passes_when_all_clear() {
+        const STALE_MS: i64 = 30 * 60 * 1000;
+        let now_ms: i64 = 1_000_000;
+        let res = check_second_safety_gate_pure(
+            now_ms,
+            now_ms - 1_000,
+            None,
+            None,
+            "",
+            now_ms - 1_000,
+            STALE_MS,
+        );
+        assert!(res.is_none());
+    }
 }

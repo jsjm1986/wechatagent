@@ -13,6 +13,7 @@ pub mod db;
 pub mod error;
 pub mod evolution;
 pub mod knowledge_digest;
+pub mod knowledge_task;
 pub mod llm;
 pub mod mcp;
 pub mod models;

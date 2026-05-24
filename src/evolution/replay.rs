@@ -509,6 +509,8 @@ mod tests {
             final_review_status: final_status.to_string(),
             outbox_status: None,
             memory_consolidator_warnings: vec![],
+            conversation_mode: String::new(),
+            conversation_mode_reason: None,
             created_at: DateTime::now(),
         }
     }

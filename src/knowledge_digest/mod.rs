@@ -479,6 +479,7 @@ async fn analyze_evolution(
 async fn compose_cards(
     state: &AppState,
     run_id: &str,
+    report_date: &str,
     chunk_health: &[ChunkHealthSignal],
     usage: &UsageDigest,
     blocked: &[BlockSignal],
@@ -575,13 +576,43 @@ async fn compose_cards(
         _ => Vec::new(),
     };
 
-    Ok(parse_cards_from_llm_array(raw_arr))
+    Ok(parse_cards_from_llm_array(raw_arr, report_date))
+}
+
+/// knowledge-digest-workstation R5：dismiss 卡片必须在 regenerate 后仍然生效。
+/// 老实现 `card_id = ObjectId::new()` 每次新随机 → regenerate 后 dismissed_card_ids
+/// 全部成孤儿。改成由 `(report_date, kind, target_refs_signature, title)` 派生
+/// sha256 前 12 字节 → ObjectId，让"同一天 + 同 kind + 同目标 + 同标题"的卡片
+/// 在 regenerate 后保持稳定 cardId。新卡片（运营当日新增问题）天然得到不同 id。
+fn stable_card_id(report_date: &str, kind: &str, target_refs: &[Document], title: &str) -> ObjectId {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(report_date.as_bytes());
+    hasher.update(b"|");
+    hasher.update(kind.as_bytes());
+    hasher.update(b"|");
+    // target_refs 里只取 id+kind 拼成稳定签名（顺序敏感，prompt 已规定 LLM 按出现顺序输出）
+    for tr in target_refs {
+        hasher.update(tr.get_str("kind").unwrap_or("").as_bytes());
+        hasher.update(b":");
+        hasher.update(tr.get_str("id").unwrap_or("").as_bytes());
+        hasher.update(b";");
+    }
+    hasher.update(b"|");
+    hasher.update(title.as_bytes());
+    let digest = hasher.finalize();
+    let mut bytes = [0u8; 12];
+    bytes.copy_from_slice(&digest[..12]);
+    ObjectId::from_bytes(bytes)
 }
 
 /// 从 LLM 返回的 raw JSON 数组校验/裁剪/排序成 [`KnowledgeDigestCard`]。
 /// 抽出此 helper 是为了让 smoke 测试覆盖封闭枚举 + 字段裁剪 + severity 排序，
 /// 而不需要真正起 LLM。
-fn parse_cards_from_llm_array(raw_arr: Vec<Value>) -> Vec<KnowledgeDigestCard> {
+///
+/// `report_date` 与 (kind, target_refs, title) 一起派生稳定 cardId，让 regenerate
+/// 后用户已 dismiss 的卡片不会重新冒出来（R5）。
+fn parse_cards_from_llm_array(raw_arr: Vec<Value>, report_date: &str) -> Vec<KnowledgeDigestCard> {
     let allowed_kinds = [
         "chunk_missing_field",
         "chunk_low_hit_rate",
@@ -676,7 +707,7 @@ fn parse_cards_from_llm_array(raw_arr: Vec<Value>) -> Vec<KnowledgeDigestCard> {
             d
         });
         cards.push(KnowledgeDigestCard {
-            card_id: ObjectId::new(),
+            card_id: stable_card_id(report_date, kind, &target_refs, &title),
             kind: kind.to_string(),
             title,
             summary,
@@ -755,7 +786,7 @@ async fn do_generate(
         let usage = analyze_usage_logs(state, workspace_id, account_id).await?;
         let blocked = analyze_run_logs(state, workspace_id, account_id, run_id).await?;
         let evolution = analyze_evolution(state, workspace_id, account_id).await?;
-        let cards = compose_cards(state, run_id, &chunk_health, &usage, &blocked, &evolution).await?;
+        let cards = compose_cards(state, run_id, report_date, &chunk_health, &usage, &blocked, &evolution).await?;
         Ok((chunk_health, usage, blocked, evolution, cards))
     }
     .await;
@@ -954,7 +985,7 @@ mod tests {
                 "suggestedAction": "freeform", "severity": "info"
             }),
         ];
-        let cards = parse_cards_from_llm_array(raw);
+        let cards = parse_cards_from_llm_array(raw, "2026-05-24");
         assert_eq!(cards.len(), 1, "只有第一张合法卡片可入库");
         assert_eq!(cards[0].kind, "chunk_missing_field");
         assert_eq!(cards[0].severity, "warn");
@@ -991,7 +1022,7 @@ mod tests {
                 "severity": "warn"
             }),
         ];
-        let cards = parse_cards_from_llm_array(raw);
+        let cards = parse_cards_from_llm_array(raw, "2026-05-24");
         assert_eq!(cards.len(), 3);
         assert_eq!(cards[0].severity, "critical", "critical 必须排第一");
         assert_eq!(cards[1].severity, "warn", "warn 第二");
@@ -1023,7 +1054,7 @@ mod tests {
                 })
             })
             .collect();
-        let cards = parse_cards_from_llm_array(raw);
+        let cards = parse_cards_from_llm_array(raw, "2026-05-24");
         assert_eq!(cards.len(), 50, "单批必须裁剪到 ≤ 50");
     }
 
@@ -1043,12 +1074,50 @@ mod tests {
             "suggestedAction": "fix_chunk",
             "severity": "critical"
         })];
-        let cards = parse_cards_from_llm_array(raw);
+        let cards = parse_cards_from_llm_array(raw, "2026-05-24");
         assert_eq!(cards.len(), 1);
         assert_eq!(cards[0].target_refs.len(), 1);
         assert_eq!(
             cards[0].target_refs[0].get_str("id").unwrap_or(""),
             "abc"
+        );
+    }
+
+    /// R5：dismiss 卡片必须在 regenerate 后仍然生效。同一 (report_date, kind,
+    /// target_refs, title) 组合必须派生相同 cardId；不同 title / target / 日期
+    /// 必须派生不同 cardId。否则用户 dismiss 后 regenerate 卡片又冒出来。
+    #[test]
+    fn parse_cards_card_id_is_stable_across_regenerations() {
+        let raw = || {
+            vec![json!({
+                "kind": "chunk_caused_block",
+                "title": "切片 abc 被 fact_risk 拦截",
+                "summary": "AI 建议复核",
+                "targetRefs": [{"kind": "chunk", "id": "abc"}],
+                "suggestedAction": "fix_chunk",
+                "severity": "critical"
+            })]
+        };
+        // 同一天同一卡片：两次 parse 必须得到相同 cardId（regenerate 不破坏 dismiss）。
+        let first = parse_cards_from_llm_array(raw(), "2026-05-24");
+        let second = parse_cards_from_llm_array(raw(), "2026-05-24");
+        assert_eq!(
+            first[0].card_id, second[0].card_id,
+            "同 (date,kind,refs,title) 必须派生相同 cardId"
+        );
+        // 不同日期 → 不同 cardId（昨日 dismiss 不影响今日）。
+        let other_day = parse_cards_from_llm_array(raw(), "2026-05-25");
+        assert_ne!(
+            first[0].card_id, other_day[0].card_id,
+            "不同 report_date 必须派生不同 cardId"
+        );
+        // 同日不同 title → 不同 cardId（避免不同问题被误合并）。
+        let mut diff_title = raw();
+        diff_title[0]["title"] = json!("切片 abc 被 pressure_risk 拦截");
+        let diff = parse_cards_from_llm_array(diff_title, "2026-05-24");
+        assert_ne!(
+            first[0].card_id, diff[0].card_id,
+            "不同 title 必须派生不同 cardId"
         );
     }
 }

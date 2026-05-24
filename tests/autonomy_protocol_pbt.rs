@@ -322,6 +322,7 @@ fn pbt_contact() -> Contact {
         last_inbound_at: None,
         last_outbound_at: None,
         last_agent_run_at: None,
+        custom_agent_instructions: None,
         created_at: BsonDateTime::now(),
         updated_at: BsonDateTime::now(),
     }
@@ -359,6 +360,9 @@ fn pbt_chunk(verified: bool) -> OperationKnowledgeChunk {
         verified_claims: Vec::new(),
         status: "active".to_string(),
         priority: 0,
+        product_tags: Vec::new(),
+        trigger_keywords: Vec::new(),
+        business_topics: Vec::new(),
         created_at: BsonDateTime::now(),
         updated_at: BsonDateTime::now(),
     }
@@ -470,6 +474,7 @@ proptest! {
             &chunks,
             &markers,
             Vec::new(),
+            "",
         );
 
         // R5.4 核心断言。

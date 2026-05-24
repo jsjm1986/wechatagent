@@ -89,8 +89,6 @@ pub(crate) fn default_memory_card() -> MemoryCardTyped {
     extra.insert("source", "memory_card");
     extra.insert("version", 0_i32);
     MemoryCardTyped {
-        core_profile: Document::new(),
-        relationship_state: Document::new(),
         core_facts: Vec::new(),
         recent_facts: Vec::new(),
         deprecated_facts: Vec::new(),
@@ -169,15 +167,7 @@ pub(crate) fn memory_card_has_signal(card: &MemoryCardTyped) -> bool {
     if doc_string(&card.extra, "recentEpisodeSummary").is_some() {
         return true;
     }
-    let core_profile = card
-        .extra
-        .get_document("coreProfile")
-        .ok()
-        .or(if !card.core_profile.is_empty() {
-            Some(&card.core_profile)
-        } else {
-            None
-        });
+    let core_profile = card.extra.get_document("coreProfile").ok();
     if let Some(profile) = core_profile {
         return [
             "identity",
@@ -279,8 +269,6 @@ pub(crate) fn memory_card_from_contact(
     extra.insert("source", "contact_seed");
 
     MemoryCardTyped {
-        core_profile: Document::new(),
-        relationship_state: Document::new(),
         core_facts: core_facts
             .into_iter()
             .map(MemoryFactRepr::Plain)
@@ -1174,7 +1162,140 @@ pub(crate) async fn schedule_memory_consolidation_task(
 }
 
 
-// ── R7 deprecatedFacts 单元测试（agent-autonomy-loop W5 / Task 6.9：≥ 4 例）
+/// knowledge-digest-workstation Phase 5：加载运营长期偏好记忆。
+///
+/// 与 `consolidate_contact_memory` / `compact_memory_card_*` 物理隔离 —
+/// 这些函数都只触达 `contacts.memory_card`；本函数只触达
+/// `knowledge_operator_memory` collection。两者**禁止**互相读写。
+///
+/// 行为：按 `accountId + operatorId` 取最近 `top_n` 条非过期记忆，
+/// 按 `lastUsedAt desc` 排序；命中时把这些记忆的 `lastUsedAt`
+/// 一次性 bump 为 now（运营重新拿出来用过 = 续期）。
+///
+/// 返回的 Vec 已按 `lastUsedAt desc` 排好，调用方拼 prompt header 时
+/// 直接渲染即可。
+pub(crate) async fn load_operator_memory(
+    db: &crate::db::Database,
+    workspace_id: &str,
+    account_id: &str,
+    operator_id: &str,
+    top_n: i64,
+) -> AppResult<Vec<crate::models::KnowledgeOperatorMemory>> {
+    use futures::TryStreamExt;
+    let now = DateTime::now();
+    let filter = doc! {
+        "workspace_id": workspace_id,
+        "account_id": account_id,
+        "operator_id": operator_id,
+        "$or": [
+            { "expires_at": { "$exists": false } },
+            { "expires_at": null },
+            { "expires_at": { "$gt": now } },
+        ],
+    };
+    let opts = FindOptions::builder()
+        .sort(doc! { "last_used_at": -1_i32 })
+        .limit(top_n.max(1))
+        .build();
+    let mut cursor = db
+        .knowledge_operator_memory()
+        .find(filter, opts)
+        .await
+        .map_err(|e| AppError::External(format!("加载运营记忆失败：{e}")))?;
+    let mut out = Vec::new();
+    while let Some(m) = cursor
+        .try_next()
+        .await
+        .map_err(|e| AppError::External(format!("迭代运营记忆失败：{e}")))?
+    {
+        out.push(m);
+    }
+    if !out.is_empty() {
+        let ids: Vec<ObjectId> = out.iter().filter_map(|m| m.id).collect();
+        if !ids.is_empty() {
+            let _ = db
+                .knowledge_operator_memory()
+                .update_many(
+                    doc! { "_id": { "$in": ids } },
+                    doc! { "$set": { "last_used_at": now } },
+                    None,
+                )
+                .await;
+        }
+    }
+    Ok(out)
+}
+
+/// knowledge-digest-workstation Phase 5：写入运营长期偏好记忆。
+///
+/// 同 `(workspace_id, account_id, operator_id, kind, content)` 命中时只
+/// bump `lastUsedAt`，不重复插入，避免运营把同一句话说两遍就刷出两条
+/// 重复 memory。
+pub(crate) async fn record_operator_memory(
+    db: &crate::db::Database,
+    workspace_id: &str,
+    account_id: &str,
+    operator_id: &str,
+    kind: &str,
+    content: &str,
+) -> AppResult<crate::models::KnowledgeOperatorMemory> {
+    let kind_trim = kind.trim();
+    let content_trim = content.trim();
+    if !["preference", "rejection", "context"].contains(&kind_trim) {
+        return Err(AppError::BadRequest(format!(
+            "memoryKind 非法：{kind}（必须在 [preference, rejection, context]）"
+        )));
+    }
+    if content_trim.is_empty() {
+        return Err(AppError::BadRequest(
+            "memoryContent 为空，无法落库".to_string(),
+        ));
+    }
+    let now = DateTime::now();
+    let filter = doc! {
+        "workspace_id": workspace_id,
+        "account_id": account_id,
+        "operator_id": operator_id,
+        "kind": kind_trim,
+        "content": content_trim,
+    };
+    if let Some(existing) = db
+        .knowledge_operator_memory()
+        .find_one(filter.clone(), None)
+        .await
+        .map_err(|e| AppError::External(format!("查询运营记忆失败：{e}")))?
+    {
+        let _ = db
+            .knowledge_operator_memory()
+            .update_one(
+                doc! { "_id": existing.id.expect("existing id") },
+                doc! { "$set": { "last_used_at": now } },
+                None,
+            )
+            .await;
+        let mut bumped = existing;
+        bumped.last_used_at = now;
+        return Ok(bumped);
+    }
+    let mem = crate::models::KnowledgeOperatorMemory {
+        id: Some(ObjectId::new()),
+        workspace_id: workspace_id.to_string(),
+        account_id: account_id.to_string(),
+        operator_id: operator_id.to_string(),
+        kind: kind_trim.to_string(),
+        content: content_trim.to_string(),
+        created_at: now,
+        last_used_at: now,
+        expires_at: None,
+    };
+    db.knowledge_operator_memory()
+        .insert_one(&mem, None)
+        .await
+        .map_err(|e| AppError::External(format!("写入运营记忆失败：{e}")))?;
+    Ok(mem)
+}
+
+
 
 #[cfg(test)]
 mod r7_deprecation_tests {

@@ -272,7 +272,27 @@ pub(crate) async fn decide_reply_with_promote(
         "user.reply.task",
     )
     .await?;
-    let system = format!("{}\n\n{}\n\n{}", soul, system_contract, policy);
+    // R-prompt-v3：Operator Instruction 层（最高优先级）。运营人员可在后台对
+    // 单个联系人写一段 ≤ 1000 字的特别指令，覆盖 Soul + Policy 的默认人格判定
+    // （如"老客户已签约，不要主动推销"、"这个客户技术背景，可以多用术语"）。
+    // 末位注入是为了利用 LLM 的近端注意力优势（recency bias）—— 系统消息越靠后
+    // 的指令权重越高。
+    let operator_instruction = contact
+        .custom_agent_instructions
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| {
+            format!(
+                "\n\n# 运营关于本联系人的特别指令（最高优先级，覆盖 Soul + Policy）\n{}\n\n上述指令来自运营，必须遵守；与 Soul / Policy 冲突时以本指令为准。",
+                s
+            )
+        })
+        .unwrap_or_default();
+    let system = format!(
+        "{}\n\n{}\n\n{}{}",
+        soul, system_contract, policy, operator_instruction
+    );
     let history = recent_messages
         .iter()
         .rev()

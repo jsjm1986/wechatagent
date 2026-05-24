@@ -52,6 +52,9 @@ async fn main() -> anyhow::Result<()> {
         llm,
         config: config.clone(),
         prompt_pack_version: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        chat_progress_bus: std::sync::Arc::new(
+            wechatagent::knowledge_task::ChatProgressBus::new(),
+        ),
     };
     prompts::ensure_prompt_pack_v2(
         &state.db,
@@ -107,6 +110,17 @@ async fn main() -> anyhow::Result<()> {
         let digest_state = state.clone();
         tokio::spawn(async move {
             wechatagent::knowledge_digest::worker_loop(digest_state).await;
+        });
+    }
+
+    // knowledge-digest-workstation Phase 4：chat 长任务 worker。
+    // 默认间隔 30s（`KNOWLEDGE_TASK_WORKER_INTERVAL_SECONDS=0` 关停）。
+    // 取 pending knowledge_chat_tasks 按 sessionId 串行执行 plannedSteps，
+    // 进度回写 knowledge_chat_turns 并经 ChatProgressBus 推 SSE。
+    {
+        let task_state = state.clone();
+        tokio::spawn(async move {
+            wechatagent::knowledge_task::worker_loop(task_state).await;
         });
     }
 

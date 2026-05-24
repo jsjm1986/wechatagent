@@ -477,6 +477,28 @@ pub struct FinalizeOutcome {
 ///   的协议违规标签（如 `missing_required_field:* / invalid_enum_value:* /
 ///   invalid_type:* / decision_phase_invalid:* /
 ///   insufficient_detail_in_critical_turn:*`）。
+/// ISSUE-003 (R13)：判断 inbound 文本中是否有任何产品 / 价格 / 承诺类
+/// marker 命中（白名单豁免后），用于 R5.3.a fail-closed 软化判定。
+///
+/// 返回 true 表示 inbound 完全无产品意图（极简问候 / 闲聊），此时若仅 LLM
+/// reply_text 自发输出含 marker（trigger=string_marker_hit），认为是 LLM
+/// 输出模板偶发误命中，降级到 R5.3.b risks-only 不 block。
+///
+/// inbound_text 为空字符串时返回 false（保持 fail-closed 安全侧默认）。
+pub(crate) fn inbound_has_no_product_marker(
+    inbound_text: &str,
+    markers: &ProductClaimMarkers,
+) -> bool {
+    if inbound_text.is_empty() {
+        return false;
+    }
+    let hits = markers.scan(inbound_text);
+    let real_hit = hits
+        .iter()
+        .any(|hit| !markers.passes_whitelist(inbound_text, hit));
+    !real_hit
+}
+
 pub fn finalize_review_for_send(
     review: DecisionReviewResult,
     decision: &mut AgentDecision,
@@ -485,6 +507,7 @@ pub fn finalize_review_for_send(
     knowledge_chunks: &[OperationKnowledgeChunk],
     markers: &ProductClaimMarkers,
     promote_risks: Vec<String>,
+    inbound_text: &str,
 ) -> FinalizeOutcome {
     let mut review = review;
     let mut pending_events: Vec<PendingFinalizeEvent> = Vec::new();
@@ -608,32 +631,58 @@ pub fn finalize_review_for_send(
         );
 
         if let Some(trigger) = infer_product_claim_trigger(decision, markers) {
-            // R5.3.a：fail-closed → blocked_by_safety_guard
-            review.approved = false;
-            review.scores.fact_risk = review.scores.fact_risk.max(6);
-            decision.should_reply = false;
-            decision.autonomy_mode = "blocked".to_string();
-            let mut details = Document::new();
-            details.insert("triggered_by", trigger.to_string());
-            details.insert("knowledge_need", decision.knowledge_need.clone());
-            details.insert(
-                "used_knowledge_ids_len",
-                decision.used_knowledge_ids.len() as i64,
-            );
-            pending_events.push(PendingFinalizeEvent {
-                kind: "claim_analysis_malformed_fail_closed".to_string(),
-                status: "blocked".to_string(),
-                summary:
-                    "claim_analysis 缺失 / 损坏，推断为产品声明 → fail-closed blocked_by_safety_guard"
-                        .to_string(),
-                details,
-            });
-            review.final_review_status = "blocked_by_safety_guard".to_string();
-            return FinalizeOutcome {
-                review,
-                status: GatewayStatusFinal::BlockedBySafetyGuard,
-                pending_events,
-            };
+            // ISSUE-003 (R13)：S1 happy 极简 inbound 偶发误伤软化路径。
+            // 仅当 trigger=string_marker_hit (LLM 自发输出含 marker 但 inbound
+            // 完全无产品/价格/承诺意图) 时降级到 R5.3.b risks-only。
+            // knowledge_need / used_knowledge_ids 是 LLM 自我声明，不软化。
+            let softened = trigger == "string_marker_hit"
+                && inbound_has_no_product_marker(inbound_text, markers);
+            if softened {
+                let mut details = Document::new();
+                details.insert("original_trigger", trigger.to_string());
+                details.insert("inbound_text_len", inbound_text.chars().count() as i64);
+                pending_events.push(PendingFinalizeEvent {
+                    kind: "claim_analysis_malformed_softened".to_string(),
+                    status: "warning".to_string(),
+                    summary:
+                        "claim_analysis 缺失但 inbound 无产品意图 + 仅 reply_text 误命中 marker → 降级 R5.3.b（仅 risks 不 block）"
+                            .to_string(),
+                    details,
+                });
+                extend_risks_unique(
+                    &mut review.risks,
+                    std::iter::once(format!("claim_malformed_softened:{trigger}")),
+                );
+                // 落入 R5.3.b 路径：不 fail-closed，让下游 should_hold / approved
+                // 自然判定。
+            } else {
+                // R5.3.a：fail-closed → blocked_by_safety_guard
+                review.approved = false;
+                review.scores.fact_risk = review.scores.fact_risk.max(6);
+                decision.should_reply = false;
+                decision.autonomy_mode = "blocked".to_string();
+                let mut details = Document::new();
+                details.insert("triggered_by", trigger.to_string());
+                details.insert("knowledge_need", decision.knowledge_need.clone());
+                details.insert(
+                    "used_knowledge_ids_len",
+                    decision.used_knowledge_ids.len() as i64,
+                );
+                pending_events.push(PendingFinalizeEvent {
+                    kind: "claim_analysis_malformed_fail_closed".to_string(),
+                    status: "blocked".to_string(),
+                    summary:
+                        "claim_analysis 缺失 / 损坏，推断为产品声明 → fail-closed blocked_by_safety_guard"
+                            .to_string(),
+                    details,
+                });
+                review.final_review_status = "blocked_by_safety_guard".to_string();
+                return FinalizeOutcome {
+                    review,
+                    status: GatewayStatusFinal::BlockedBySafetyGuard,
+                    pending_events,
+                };
+            }
         }
         // R5.3.b：claim_analysis 缺失但非产品声明 → 仅 risks 标记，不 block。
     }
@@ -1017,6 +1066,7 @@ mod finalize_review_for_send_tests {
     //!    claim_analysis_malformed_fail_closed / autonomy_hold_category_invalid）。
 
     use mongodb::bson::doc;
+    use mongodb::bson::Document;
 
     use crate::models::{AgentStatus, Contact, OperationKnowledgeChunk};
 
@@ -1026,7 +1076,7 @@ mod finalize_review_for_send_tests {
         AgentDecision, DecisionReviewResult, EVENT_AUTONOMY_HOLD_CATEGORY_INVALID,
         HOLD_CATEGORY_HELD_BY_AI_POLICY,
     };
-    use super::{finalize_review_for_send, GatewayStatusFinal};
+    use super::{finalize_review_for_send, inbound_has_no_product_marker, GatewayStatusFinal};
 
     fn dummy_runtime() -> UserRuntimeParameters {
         // UserRuntimeParameters 没有 Default impl；用 from_config(None, &state) 不可
@@ -1096,6 +1146,7 @@ mod finalize_review_for_send_tests {
             last_inbound_at: None,
             last_outbound_at: None,
             last_agent_run_at: None,
+            custom_agent_instructions: None,
             created_at: mongodb::bson::DateTime::now(),
             updated_at: mongodb::bson::DateTime::now(),
         }
@@ -1136,6 +1187,7 @@ mod finalize_review_for_send_tests {
             &[],
             &markers,
             vec!["missing_required_field:risk_level".to_string()],
+            "",
         );
 
         assert_eq!(outcome.status, GatewayStatusFinal::BlockedByRequiredField);
@@ -1171,6 +1223,7 @@ mod finalize_review_for_send_tests {
             &[],
             &markers,
             Vec::new(),
+            "",
         );
 
         assert_eq!(outcome.status, GatewayStatusFinal::BlockedByBudget);
@@ -1209,6 +1262,7 @@ mod finalize_review_for_send_tests {
             &[],
             &markers,
             Vec::new(),
+            "",
         );
 
         assert_eq!(
@@ -1250,6 +1304,7 @@ mod finalize_review_for_send_tests {
             &[],
             &markers,
             Vec::new(),
+            "",
         );
 
         assert_eq!(outcome.status, GatewayStatusFinal::BlockedBySafetyGuard);
@@ -1294,6 +1349,7 @@ mod finalize_review_for_send_tests {
             &[],
             &markers,
             Vec::new(),
+            "",
         );
 
         assert_eq!(outcome.status, GatewayStatusFinal::Approved);
@@ -1335,6 +1391,7 @@ mod finalize_review_for_send_tests {
             &[],
             &markers,
             Vec::new(),
+            "",
         );
 
         match &outcome.status {
@@ -1393,6 +1450,9 @@ mod finalize_review_for_send_tests {
             verified_claims: Vec::new(),
             status: "active".to_string(),
             priority: 0,
+            product_tags: Vec::new(),
+            trigger_keywords: Vec::new(),
+            business_topics: Vec::new(),
             created_at: mongodb::bson::DateTime::now(),
             updated_at: mongodb::bson::DateTime::now(),
         };
@@ -1419,6 +1479,7 @@ mod finalize_review_for_send_tests {
             std::slice::from_ref(&chunk),
             &markers,
             Vec::new(),
+            "",
         );
 
         assert_eq!(outcome.status, GatewayStatusFinal::Approved);
@@ -1473,6 +1534,9 @@ mod finalize_review_for_send_tests {
             verified_claims: Vec::new(),
             status: "active".to_string(),
             priority: 0,
+            product_tags: Vec::new(),
+            trigger_keywords: Vec::new(),
+            business_topics: Vec::new(),
             created_at: mongodb::bson::DateTime::now(),
             updated_at: mongodb::bson::DateTime::now(),
         }
@@ -1510,6 +1574,7 @@ mod finalize_review_for_send_tests {
             std::slice::from_ref(&chunk),
             &markers,
             Vec::new(),
+            "",
         );
 
         assert_eq!(
@@ -1571,6 +1636,7 @@ mod finalize_review_for_send_tests {
             std::slice::from_ref(&chunk),
             &markers,
             Vec::new(),
+            "",
         );
 
         assert_eq!(outcome.status, GatewayStatusFinal::Approved);
@@ -1627,6 +1693,7 @@ mod finalize_review_for_send_tests {
             &[],
             &markers,
             Vec::new(),
+            "",
         );
 
         assert_eq!(outcome.status, GatewayStatusFinal::Approved);
@@ -1674,6 +1741,7 @@ mod finalize_review_for_send_tests {
             &[],
             &markers,
             Vec::new(),
+            "",
         );
 
         match &outcome.status {
@@ -1728,6 +1796,7 @@ mod finalize_review_for_send_tests {
             &[],
             &markers,
             Vec::new(),
+            "",
         );
 
         match &outcome.status {
@@ -1748,6 +1817,171 @@ mod finalize_review_for_send_tests {
         assert!(!outcome.review.approved);
         // 不应产出 finalize 阶段的事件。
         assert!(outcome.pending_events.is_empty());
+    }
+
+    // ── ISSUE-003 (R13)：claim_analysis_malformed 软化路径单元测试 ──
+    //
+    // 仅当 trigger=string_marker_hit AND inbound 无产品意图时降级到 R5.3.b
+    // risks-only；其它两种 trigger（knowledge_need / used_knowledge_ids）保持
+    // R5.3.a fail-closed 语义不变。
+
+    #[test]
+    fn r13_softens_string_marker_hit_when_inbound_innocuous() {
+        // claim_analysis 空 + LLM 自发输出含 marker（"100%为您服务"）+ inbound
+        // 是简单问候 → 应走 R5.3.b 软化，不 fail-closed。
+        let runtime = dummy_runtime();
+        let contact = dummy_contact();
+        let markers = default_product_claim_markers();
+        let mut decision = approved_decision();
+        decision.reply_text = "100%为您服务！".to_string();
+        decision.knowledge_need = "not_required".to_string();
+        decision.used_knowledge_ids = Vec::new();
+        let mut review = approved_review();
+        review.claim_analysis = Document::new();
+
+        let outcome = finalize_review_for_send(
+            review,
+            &mut decision,
+            &runtime,
+            &contact,
+            &[],
+            &markers,
+            Vec::new(),
+            "你好啊", // inbound 无产品意图
+        );
+
+        // 软化：不应是 BlockedBySafetyGuard
+        assert!(
+            !matches!(outcome.status, GatewayStatusFinal::BlockedBySafetyGuard),
+            "string_marker_hit + inbound 无产品意图 SHALL 软化，不进 BlockedBySafetyGuard，got {:?}",
+            outcome.status
+        );
+        // 应留软化痕迹
+        assert!(outcome
+            .review
+            .risks
+            .iter()
+            .any(|r| r.starts_with("claim_malformed_softened:")));
+        assert!(outcome
+            .pending_events
+            .iter()
+            .any(|e| e.kind == "claim_analysis_malformed_softened"));
+        // claim_analysis_malformed 标签仍保留（R5.3 末段要求）
+        assert!(outcome.review.risks.iter().any(|r| r == "claim_analysis_malformed"));
+    }
+
+    #[test]
+    fn r13_does_not_soften_when_inbound_has_product_marker() {
+        let runtime = dummy_runtime();
+        let contact = dummy_contact();
+        let markers = default_product_claim_markers();
+        let mut decision = approved_decision();
+        decision.reply_text = "100%为您服务！".to_string();
+        decision.knowledge_need = "not_required".to_string();
+        decision.used_knowledge_ids = Vec::new();
+        let mut review = approved_review();
+        review.claim_analysis = Document::new();
+
+        let outcome = finalize_review_for_send(
+            review,
+            &mut decision,
+            &runtime,
+            &contact,
+            &[],
+            &markers,
+            Vec::new(),
+            "你们百分之百保证年化30吗", // inbound 也含强 marker
+        );
+
+        assert_eq!(
+            outcome.status,
+            GatewayStatusFinal::BlockedBySafetyGuard,
+            "inbound 也含产品意图 SHALL 仍 fail-closed"
+        );
+        assert!(outcome
+            .pending_events
+            .iter()
+            .any(|e| e.kind == "claim_analysis_malformed_fail_closed"));
+    }
+
+    #[test]
+    fn r13_does_not_soften_when_trigger_is_knowledge_need() {
+        let runtime = dummy_runtime();
+        let contact = dummy_contact();
+        let markers = default_product_claim_markers();
+        let mut decision = approved_decision();
+        decision.reply_text = "好的".to_string(); // reply 无 marker
+        decision.knowledge_need = "required".to_string(); // LLM 主动声明
+        decision.used_knowledge_ids = Vec::new();
+        let mut review = approved_review();
+        review.claim_analysis = Document::new();
+
+        let outcome = finalize_review_for_send(
+            review,
+            &mut decision,
+            &runtime,
+            &contact,
+            &[],
+            &markers,
+            Vec::new(),
+            "你好啊", // inbound 无产品意图
+        );
+
+        assert_eq!(
+            outcome.status,
+            GatewayStatusFinal::BlockedBySafetyGuard,
+            "knowledge_need=required SHALL 仍 fail-closed（LLM 自我声明优先）"
+        );
+    }
+
+    #[test]
+    fn r13_does_not_soften_when_trigger_is_used_knowledge_ids() {
+        let runtime = dummy_runtime();
+        let contact = dummy_contact();
+        let markers = default_product_claim_markers();
+        let mut decision = approved_decision();
+        decision.reply_text = "好的".to_string();
+        decision.knowledge_need = "not_required".to_string();
+        decision.used_knowledge_ids = vec!["kb_xyz".to_string()];
+        let mut review = approved_review();
+        review.claim_analysis = Document::new();
+
+        let outcome = finalize_review_for_send(
+            review,
+            &mut decision,
+            &runtime,
+            &contact,
+            &[],
+            &markers,
+            Vec::new(),
+            "你好啊",
+        );
+
+        assert_eq!(
+            outcome.status,
+            GatewayStatusFinal::BlockedBySafetyGuard,
+            "used_knowledge_ids 非空 SHALL 仍 fail-closed"
+        );
+    }
+
+    #[test]
+    fn r13_inbound_has_no_product_marker_pure_returns_false_on_empty() {
+        // 防御性：inbound_text 为空时 SHALL 返回 false（保持 fail-closed 安全侧）
+        let markers = default_product_claim_markers();
+        assert!(!inbound_has_no_product_marker("", &markers));
+    }
+
+    #[test]
+    fn r13_inbound_has_no_product_marker_pure_returns_true_on_innocuous() {
+        let markers = default_product_claim_markers();
+        assert!(inbound_has_no_product_marker("你好啊", &markers));
+        assert!(inbound_has_no_product_marker("最近忙什么呢", &markers));
+    }
+
+    #[test]
+    fn r13_inbound_has_no_product_marker_pure_returns_false_when_marker_hit() {
+        let markers = default_product_claim_markers();
+        assert!(!inbound_has_no_product_marker("100%保证年化30", &markers));
     }
 }
 

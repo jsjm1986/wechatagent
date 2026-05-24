@@ -17,8 +17,8 @@ use crate::{
     error::{AppError, AppResult},
     mcp::{self},
     models::{
-        ApiContact, ContactQuery, EnableAgentRequest, ImportContactsRequest, ProfileNoteRequest,
-        SearchImportRequest,
+        ApiContact, ContactQuery, CustomAgentInstructionsRequest, EnableAgentRequest,
+        ImportContactsRequest, ProfileNoteRequest, SearchImportRequest,
     },
 };
 
@@ -253,6 +253,21 @@ pub(super) async fn enable_agent(
     }
     let object_id = parse_object_id(&id)?;
     let contact = find_contact_by_id(&state, &id).await?;
+    // P1：先校验 contact.account_id 在 wechat_accounts 注册过。否则即使写 managed
+    // 进去，webhook 入站时 resolve_account_context 也会因为 appId 匹配不到这个
+    // account 直接 400 拒收，AI 永远不会回复。
+    if state
+        .db
+        .accounts()
+        .find_one(doc! { "account_id": &contact.account_id }, None)
+        .await?
+        .is_none()
+    {
+        return Err(AppError::BadRequest(format!(
+            "contact.account_id={} 在 wechat_accounts 中未注册，无法启用 Agent 运营",
+            contact.account_id
+        )));
+    }
     let playbook =
         resolve_playbook_for_contact(&state, &contact.account_id, payload.playbook_id.as_deref())
             .await?;
@@ -369,6 +384,51 @@ pub(super) async fn update_profile_note(
                 },
                 "$unset": {
                     "last_commitment": ""
+                }
+            },
+            None,
+        )
+        .await?;
+    let contact = find_contact_by_id(&state, &id).await?;
+    Ok(Json(json!({ "item": ApiContact::from(contact) })))
+}
+
+/// `PUT /api/contacts/:id/custom-agent-instructions`
+///
+/// 维护 per-contact 运营人员特别指令（最高优先级 Operator Instruction 层）。
+/// 上限 1000 字符，trim 后空字符串等价于"清空"（落库为 null）。
+///
+/// 该指令会在下一次 user.reply 调用时由 `agent::decision` 注入到 system prompt
+/// 末位，覆盖 Soul + Policy 的默认人格判定（详见
+/// docs/conversation-mode-design.md）。
+pub(super) async fn update_custom_agent_instructions(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(payload): Json<CustomAgentInstructionsRequest>,
+) -> AppResult<Json<Value>> {
+    let object_id = parse_object_id(&id)?;
+    let trimmed = payload.instructions.trim();
+    if trimmed.chars().count() > 1000 {
+        return Err(AppError::BadRequest(
+            "custom_agent_instructions 长度上限 1000 字符".to_string(),
+        ));
+    }
+    // trim 后空 → 清空（落 null）；非空 → 直接保存原始（不 trim 内部空白，
+    // 运营可能用换行 / 前后空白来分块）。
+    let value: mongodb::bson::Bson = if trimmed.is_empty() {
+        mongodb::bson::Bson::Null
+    } else {
+        mongodb::bson::Bson::String(payload.instructions.clone())
+    };
+    state
+        .db
+        .contacts()
+        .update_one(
+            doc! { "_id": object_id },
+            doc! {
+                "$set": {
+                    "custom_agent_instructions": value,
+                    "updated_at": DateTime::now(),
                 }
             },
             None,

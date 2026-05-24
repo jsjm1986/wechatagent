@@ -3815,8 +3815,11 @@ pub(super) async fn chat_turn(
 
     // 加载历史 turns（按 turn_index 升序）
     let history = load_chat_history(&state, &account_id, &session_id).await?;
-    let next_index = history.last().map(|t| t.turn_index).unwrap_or(0) + 1;
-    let assistant_index = next_index + 1;
+    // P1-7：原子预分配两个 turn_index——user turn + assistant turn，避免并发
+    // 写者读到同一 last 制造重复索引。返回的是分配后的最大 seq；user 拿
+    // `assistant_index - 1`、assistant 拿 `assistant_index`。
+    let assistant_index = allocate_next_turn_indices(&state, &session_id, 2).await?;
+    let next_index = assistant_index - 1;
     let assistant_turns_so_far = history
         .iter()
         .filter(|t| t.role == "assistant")
@@ -3970,6 +3973,24 @@ pub(super) async fn chat_turn(
     )
     .await?;
 
+    // P2-15：chat 路径的 KnowledgeUsageLog 必须带 promptVersions，复用 R11 既有 prompt 版本
+    // 审计语义（与日报 / management 路径对齐）。一次 turn 可能命中 intent/draft/update/clarify
+    // 中的多个，统一拉取 4 把 chat 钥匙的 active 版本号；prompt_versions 拉取失败不阻塞主链路。
+    let chat_prompt_versions = prompts::prompt_versions(
+        &state.db,
+        &state.config.default_workspace_id,
+        &[
+            "knowledge.chat.intent",
+            "knowledge.chat.draft_chunk",
+            "knowledge.chat.update_chunk",
+            "knowledge.chat.clarify",
+        ],
+        None,
+        None,
+    )
+    .await
+    .unwrap_or_else(|_| doc! {});
+
     let usage_doc = doc! {
         "kind": "chunk_chat_session",
         "intent": &intent,
@@ -3979,6 +4000,7 @@ pub(super) async fn chat_turn(
         "followupCount": followups.len() as i32,
         "draftKind": draft_kind.clone().unwrap_or_default(),
         "promptKey": prompt_key.clone().unwrap_or_default(),
+        "promptVersions": chat_prompt_versions.clone(),
     };
     let _ = state
         .db
@@ -4225,6 +4247,46 @@ pub(super) async fn chat_discard(
 }
 
 // ----- chat 内部辅助 -------------------------------------------------------
+
+/// P1-7：原子分配下一个 `turn_index`。
+///
+/// 历史路径是「`find_one(sort=desc).turn_index + 1`」，并发两个写者会读到同一
+/// `last`，写出重复 turn_index。本路径用 `knowledge_chat_session_seqs` 行
+/// `{ _id: "{workspace_id}|{session_id}", seq: i64 }`，配 `findOneAndUpdate`
+/// `$inc: { seq: count }` `upsert(true)` `returnDocument=After` 单次原子调
+/// 用，返回的 `seq` 即为「分配给本次写入的最后一个 turn_index」；调用方需要
+/// 一次写多条 turn 时传 `count > 1`，按 `seq - count + 1 .. seq` 顺序使用。
+///
+/// 注意：本助手 SHALL ONLY 用来分配新 turn_index，不能用来读历史 turn 数；
+/// 历史拉取仍走 `load_chat_history`。
+pub(super) async fn allocate_next_turn_indices(
+    state: &AppState,
+    session_id: &str,
+    count: u32,
+) -> AppResult<i32> {
+    use mongodb::options::{FindOneAndUpdateOptions, ReturnDocument};
+    let n = count.max(1) as i64;
+    let key = format!("{}|{}", state.config.default_workspace_id, session_id);
+    let updated = state
+        .db
+        .knowledge_chat_session_seqs()
+        .find_one_and_update(
+            doc! { "_id": &key },
+            doc! { "$inc": { "seq": n } },
+            FindOneAndUpdateOptions::builder()
+                .upsert(true)
+                .return_document(ReturnDocument::After)
+                .build(),
+        )
+        .await?;
+    let seq = updated
+        .as_ref()
+        .and_then(|d| d.get_i64("seq").ok())
+        .unwrap_or(n);
+    // turn_index 字段在模型里是 i32；上限远超 i32::MAX 时直接 saturating，
+    // 单 session ≥ 21 亿 turn 不在产品语义范围内。
+    Ok(seq.try_into().unwrap_or(i32::MAX))
+}
 
 async fn load_chat_history(
     state: &AppState,
@@ -5719,6 +5781,18 @@ pub(super) async fn chat_task_create(
         .unwrap_or_else(|| state.config.default_account_id.clone());
 
     // 把 plannedSteps 序列化成 BSON Document 数组（每条至少含 stepId/cardId/action）。
+    // P1-4：action 闭集校验——只接受 worker `execute_step` 已实装的 6 种 action；
+    // 越界（如 LLM 幻觉出 `delete_chunk`）必须在入库前 400 拦掉，不能依赖 worker
+    // 的 fail-soft match-arm 兜底（fail-soft 会污染 completed_steps + summary 计数）。
+    // 该名单与 `parse_cards_from_llm_array` 的 allowed_actions 保持一致。
+    const ALLOWED_TASK_ACTIONS: &[&str] = &[
+        "fix_chunk",
+        "add_chunk",
+        "retag",
+        "review_evolution",
+        "analyze_logs",
+        "dismiss",
+    ];
     let mut steps_doc: Vec<Document> = Vec::with_capacity(body.planned_steps.len());
     for (idx, step) in body.planned_steps.iter().enumerate() {
         let mut d = bson_from_json(step)
@@ -5726,9 +5800,13 @@ pub(super) async fn chat_task_create(
         if d.get_str("stepId").is_err() {
             d.insert("stepId", format!("step_{}", idx + 1));
         }
-        if d.get_str("action").is_err() {
+        let action = d.get_str("action").map_err(|_| {
+            AppError::BadRequest(format!("plannedSteps[{idx}].action 缺失"))
+        })?;
+        if !ALLOWED_TASK_ACTIONS.contains(&action) {
             return Err(AppError::BadRequest(format!(
-                "plannedSteps[{idx}].action 缺失"
+                "plannedSteps[{idx}].action='{action}' 不在允许集合内：{:?}",
+                ALLOWED_TASK_ACTIONS
             )));
         }
         steps_doc.push(d);
@@ -5782,20 +5860,8 @@ pub(super) async fn chat_task_create(
         .await?;
 
     // 立刻写一条 task_progress turn 记录派工已落库。
-    let last = state
-        .db
-        .knowledge_chat_turns()
-        .find_one(
-            doc! {
-                "workspace_id": &state.config.default_workspace_id,
-                "session_id": session_id,
-            },
-            mongodb::options::FindOneOptions::builder()
-                .sort(doc! { "turn_index": -1 })
-                .build(),
-        )
-        .await?;
-    let next_index = last.map(|t| t.turn_index).unwrap_or(0) + 1;
+    // P1-7：原子分配新 turn_index，避免与并发 chat_turn / worker 写入冲突。
+    let next_index = allocate_next_turn_indices(&state, session_id, 1).await?;
     let turn = KnowledgeChatTurn {
         id: None,
         workspace_id: state.config.default_workspace_id.clone(),
@@ -5865,6 +5931,11 @@ pub(super) async fn chat_task_get(
 
 /// `POST /api/knowledge/chat/tasks/:id/cancel`：标 status="cancelled"；
 /// worker 在每步开始前 re-read 状态，非 "running" 即停下。
+///
+/// P2-10：终态幂等——如果 task 已经是 completed / failed / cancelled，本接口
+/// 返回 200 `{ ok: true, alreadyTerminated: true }` 而不是 404。理由：前端
+/// 有可能在 task 刚 complete 的瞬间 race 一次 cancel，对运营来说"终态"是同一
+/// 类语义；只有真正不存在的 task 才返回 404。
 pub(super) async fn chat_task_cancel(
     State(state): State<AppState>,
     Path(id_hex): Path<String>,
@@ -5881,15 +5952,39 @@ pub(super) async fn chat_task_cancel(
         )
         .await?;
     if res.matched_count == 0 {
-        return Err(AppError::NotFound(format!(
-            "task {id_hex} 不存在或已 finished/failed/cancelled"
-        )));
+        // 未命中可能有两种：(a) task 真不存在；(b) task 已是终态。区分两种是
+        // 因为运营前端在 cancel 后会 GET /tasks/:id 拿最终态——对终态返 404
+        // 会让运营误以为派工记录丢失。
+        let existing = state
+            .db
+            .knowledge_chat_tasks()
+            .find_one(doc! { "_id": oid }, None)
+            .await?;
+        match existing {
+            None => {
+                return Err(AppError::NotFound(format!(
+                    "knowledge_chat_task {id_hex} 不存在"
+                )));
+            }
+            Some(t) => {
+                return Ok(Json(json!({
+                    "ok": true,
+                    "taskId": id_hex,
+                    "status": t.status,
+                    "alreadyTerminated": true,
+                })));
+            }
+        }
     }
     Ok(Json(json!({ "ok": true, "taskId": id_hex, "status": "cancelled" })))
 }
 
 /// `GET /api/knowledge/chat/sessions/:sid/stream`：SSE 推送最新 turn_index。
 /// 客户端按收到的 version 回拉 `chat_history` 拿增量 turn。
+///
+/// P1-6：watch 值为 [`crate::knowledge_task::CLOSE_SENTINEL`] 时，发一个
+/// `close` event 后立即结束流（`return None`）。前端 EventSource 收到 close
+/// 事件应主动关闭 + 不再重连，避免占用连接。
 pub(super) async fn chat_session_stream(
     State(state): State<AppState>,
     Path(session_id): Path<String>,
@@ -5897,16 +5992,26 @@ pub(super) async fn chat_session_stream(
     impl futures::Stream<Item = Result<axum::response::sse::Event, std::convert::Infallible>>,
 > {
     use axum::response::sse::{Event, KeepAlive, Sse};
+    use crate::knowledge_task::CLOSE_SENTINEL;
     let rx = state.chat_progress_bus.subscribe(&session_id).await;
     // 用 futures::stream::unfold 把 watch::Receiver 转成 SSE Stream，
-    // 避免引入 tokio-stream 新依赖。
-    let stream = futures::stream::unfold(rx, |mut rx| async move {
+    // 避免引入 tokio-stream 新依赖。state 是 (Receiver, closed) 元组——一旦
+    // 推过 close event 就把 closed=true，下一次 poll 时直接 return None。
+    let stream = futures::stream::unfold((rx, false), |(mut rx, closed)| async move {
+        if closed {
+            return None;
+        }
         if rx.changed().await.is_err() {
             return None;
         }
         let v = *rx.borrow_and_update();
+        if v == CLOSE_SENTINEL {
+            // 终态：发一条 close 事件后下次循环立即 None。
+            let event = Event::default().event("close").data("done");
+            return Some((Ok::<_, std::convert::Infallible>(event), (rx, true)));
+        }
         let event = Event::default().event("turn").data(v.to_string());
-        Some((Ok::<_, std::convert::Infallible>(event), rx))
+        Some((Ok::<_, std::convert::Infallible>(event), (rx, false)))
     });
     Sse::new(stream).keep_alive(KeepAlive::default())
 }

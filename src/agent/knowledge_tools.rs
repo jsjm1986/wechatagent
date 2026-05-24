@@ -552,12 +552,14 @@ fn exec_open_slice(
 // - 永不写入 outbox / 永不触达 mcp.* / 永不进 user-ops gateway。
 
 #[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct AuditCompletenessArgs {
     #[serde(default)]
     chunk_id: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct SearchChunksArgs {
     #[serde(default)]
     query: Option<String>,
@@ -568,12 +570,14 @@ struct SearchChunksArgs {
 }
 
 #[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct ProposeRepairArgs {
     #[serde(default)]
     chunk_id: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct AnalyzeLogsArgs {
     #[serde(default)]
     account_id: Option<String>,
@@ -598,6 +602,7 @@ struct AnalyzeLogsArgs {
 // 这只是给 agent 一次"主动自检"的能力，与红线"AI 永不自动 verify"不冲突）。
 
 #[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct OpenDocumentArgs {
     #[serde(default)]
     document_id: Option<String>,
@@ -607,12 +612,14 @@ struct OpenDocumentArgs {
 }
 
 #[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct InspectPackArgs {
     #[serde(default)]
     item_id: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct VerifyAnchorArgs {
     #[serde(default)]
     chunk_id: Option<String>,
@@ -1713,5 +1720,76 @@ mod tests {
         assert_eq!(v["kind"].as_str(), Some("chunks"));
         let snap = budget.snapshot();
         assert_eq!(snap.tool_calls_used, 1);
+    }
+
+    // P2-11：锁住 7 个 chat-only Args struct 的 camelCase 反序列化契约。
+    // LLM 通过 tool_calling 把 JSON 入参传进来，字段是 camelCase（chunkId / topK / onlyVerified
+    // / accountId / sourceQuote 等）；P0-1 修复后所有 chat Args 都打了 #[serde(rename_all =
+    // "camelCase")]，本组测试防止后续误删 / 误改 attr 导致 LLM 入参全部反序列化为 None。
+    //
+    // 走 BSON Document → bson::from_document 路径，与生产路径 parse_arguments 一致。
+
+    #[test]
+    fn audit_completeness_args_accept_camel_case() {
+        let d = doc! { "chunkId": "c-1" };
+        let a: AuditCompletenessArgs = mongodb::bson::from_document(d).expect("camelCase 反序列化必须通过");
+        assert_eq!(a.chunk_id.as_deref(), Some("c-1"));
+    }
+
+    #[test]
+    fn search_chunks_args_accept_camel_case() {
+        let d = doc! { "query": "宝妈", "topK": 8_i32, "onlyVerified": true };
+        let a: SearchChunksArgs = mongodb::bson::from_document(d).expect("camelCase 反序列化必须通过");
+        assert_eq!(a.query.as_deref(), Some("宝妈"));
+        assert_eq!(a.top_k, Some(8));
+        assert_eq!(a.only_verified, Some(true));
+    }
+
+    #[test]
+    fn propose_repair_args_accept_camel_case() {
+        let d = doc! { "chunkId": "c-9" };
+        let a: ProposeRepairArgs = mongodb::bson::from_document(d).expect("camelCase 反序列化必须通过");
+        assert_eq!(a.chunk_id.as_deref(), Some("c-9"));
+    }
+
+    #[test]
+    fn analyze_logs_args_accept_camel_case() {
+        let d = doc! { "accountId": "acc-1", "hours": 24_i64, "onlyBlockedOrHeld": true };
+        let a: AnalyzeLogsArgs = mongodb::bson::from_document(d).expect("camelCase 反序列化必须通过");
+        assert_eq!(a.account_id.as_deref(), Some("acc-1"));
+        assert_eq!(a.hours, Some(24));
+        assert_eq!(a.only_blocked_or_held, Some(true));
+    }
+
+    #[test]
+    fn open_document_args_accept_camel_case() {
+        let d = doc! { "documentId": "doc-x", "maxChars": 4000_i32 };
+        let a: OpenDocumentArgs = mongodb::bson::from_document(d).expect("camelCase 反序列化必须通过");
+        assert_eq!(a.document_id.as_deref(), Some("doc-x"));
+        assert_eq!(a.max_chars, Some(4000));
+    }
+
+    #[test]
+    fn inspect_pack_args_accept_camel_case() {
+        let d = doc! { "itemId": "p-7" };
+        let a: InspectPackArgs = mongodb::bson::from_document(d).expect("camelCase 反序列化必须通过");
+        assert_eq!(a.item_id.as_deref(), Some("p-7"));
+    }
+
+    #[test]
+    fn verify_anchor_args_accept_camel_case() {
+        let d = doc! { "chunkId": "c-2", "sourceQuote": "原文片段≥10字" };
+        let a: VerifyAnchorArgs = mongodb::bson::from_document(d).expect("camelCase 反序列化必须通过");
+        assert_eq!(a.chunk_id.as_deref(), Some("c-2"));
+        assert_eq!(a.source_quote.as_deref(), Some("原文片段≥10字"));
+    }
+
+    #[test]
+    fn snake_case_keys_do_not_populate_chat_args_after_p0_1() {
+        // 反向断言：snake_case 字段名应被忽略（serde rename_all 是单向 camelCase 接收）；
+        // 防止后续有人把 #[serde(alias = "chunk_id")] 加进来又恢复为旧的双向 alias 路径。
+        let d = doc! { "chunk_id": "c-1" };
+        let a: AuditCompletenessArgs = mongodb::bson::from_document(d).unwrap_or_default();
+        assert!(a.chunk_id.is_none(), "snake_case 不应被识别（rename_all=camelCase 单向）");
     }
 }

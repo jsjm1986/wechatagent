@@ -1,7 +1,11 @@
 /target
+/target-pbt
 /frontend/node_modules
 /frontend/dist
+/frontend/target-pbt
 .env
 .DS_Store
 npm-debug.log*
 *.log
+__pycache__/
+/tmp/

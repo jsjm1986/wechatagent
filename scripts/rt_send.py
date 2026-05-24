@@ -57,7 +57,7 @@ cmd = [
     "curl", "-sS", "-X", "POST", ENDPOINT,
     "-H", "content-type: application/json; charset=utf-8",
     "--data-binary", f"@{target}",
-    "--max-time", "90",
+    "--max-time", "180",
 ]
 print(f">>> {new_msg_id} :: {content}")
 print(subprocess.check_output(cmd).decode("utf-8", errors="replace"))

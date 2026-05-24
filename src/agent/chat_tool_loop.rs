@@ -438,17 +438,47 @@ mod tests {
 
     /// chat tool loop 的 final 路径在没有 db 调用时也能正常返回（不会因为
     /// db 缺失 panic）。本测试只走 final → strip 逻辑，不实际派发。
+    ///
+    /// P2-16：补真断言。`Database::connect` 走 `parse_options` + `with_options`，
+    /// 是 lazy 的——给一个本地不可达 URI 也能拿到 Database 句柄；只要 final 路径
+    /// 一次都不触达 db，测试就能稳定走完。`final_decision` 的 decision_phase=final
+    /// + tool_calls 为空 → loop 直接走出，不进入 dispatch_chat_turn。
     #[tokio::test]
     async fn chat_final_decision_returns_immediately_without_db() {
         let decisions = Arc::new(parking_lot::Mutex::new(vec![final_decision()]));
         let call_count = Arc::new(AtomicI32::new(0));
-        // db 用 mongodb::Client::with_uri_str 太重，本测试不需要；构造一个未用
-        // 到的 db 句柄即可——但 chat_final 不会触达 db，所以走 final 即可。
-        // 因此本测试的 "loop with db" 改成走 final 直接退出；db 仅供编译期占位。
-        // 由于 reply_with_tools_loop 是 generic over async dispatch，且 final
-        // 路径绝不调用 dispatch_chat_tool_call，因此构造 db 用 unsafe transmute
-        // 不可取——改为 ignore 测试，留给集成测试覆盖 db 路径。
-        let _ = (decisions, call_count);
+        let db = crate::db::Database::connect("mongodb://127.0.0.1:1/test", "wechatagent_test")
+            .await
+            .expect("lazy connect should not fail on URI parse");
+        let runtime = runtime();
+        let knowledge = empty_knowledge();
+        let budget = budget(8);
+        let reply_fn = scripted_reply_fn(decisions.clone(), call_count.clone());
+
+        let outcome = chat_reply_with_tools_loop(
+            &runtime,
+            &knowledge,
+            &db,
+            "ws_test",
+            budget.clone(),
+            None,
+            reply_fn,
+        )
+        .await
+        .expect("final-only loop must succeed without touching db");
+
+        // 真实断言：1) reply_fn 仅被调一次（final 一轮就退）；2) 留下 final decision；
+        // 3) 没有 tool 派发（tool_trace 空 / 没消耗 tool_call 配额）。
+        assert_eq!(call_count.load(Ordering::SeqCst), 1, "final 路径应该只调用一次 reply_fn");
+        assert_eq!(outcome.decision.decision_phase, "final");
+        assert_eq!(outcome.decision.reply_text, "OK");
+        assert!(
+            outcome.tool_trace.is_empty(),
+            "final-only 路径不应留下 tool_trace：{:?}",
+            outcome.tool_trace
+        );
+        let snap = budget.snapshot();
+        assert_eq!(snap.tool_calls_used, 0, "final-only 路径不应消耗 tool_call 配额");
     }
 
     /// 验证常量与同源模块一致：CHAT_TOOL_CALLS_PER_TURN_CAP=6,

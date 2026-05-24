@@ -380,3 +380,112 @@ created_by
 `operation_domain_configs` 用于把不同运营域拆开管理。当前用户运营频道已使用 `user_operations` 配置长期目标、方法论、工作流、工具边界、自动化策略、复盘规则、运行参数和状态机。运行参数不是提示词参考，而是发送网关的硬规则。
 
 用户运营自动发送统一经过发送网关。私聊自动回复和 follow-up worker 都必须执行 managed 检查、冷却检查、频控、每日触达上限、上下文刷新、Review Agent 和审计记录。`agent_tasks` 的 follow-up 不允许直接调用微信发送工具。
+
+## Knowledge Digest Workstation（knowledge-digest-workstation）
+
+完整设计见 `.kiro/specs/knowledge-digest-workstation/` 与 `docs/agent-policy.md` 知识库日报工作站章节。本节列出新增的数据模型与路由。
+
+### 新增 collections
+
+```text
+knowledge_daily_reports
+  _id, accountId, reportDate (YYYY-MM-DD), generatedAt, generatedBy ("worker"|"manual"),
+  status ("ok"|"partial"|"failed"), errorKind?,
+  budgetSnapshot { tokensUsed, llmCalls },
+  cards: [KnowledgeDigestCard],
+  dismissedCardIds: [ObjectId],
+  promptVersions { intent, draft, ... }
+索引: { accountId: 1, reportDate: -1 } unique compound
+
+knowledge_chat_tasks
+  _id, sessionId, accountId, operatorId,
+  cards: [KnowledgeDigestCard],            // 任务起源 cards 快照
+  plannedSteps: [{cardId, action, targetChunkId?, hint?}],
+  completedSteps: [{cardId, action, chunkId?, error?}],
+  status ("pending"|"running"|"finished"|"failed"|"cancelled"),
+  errorKind?,
+  createdAt, startedAt?, finishedAt?
+索引: { sessionId: 1, status: 1 }
+索引: { status: 1, createdAt: 1 }          // worker 取 pending
+
+knowledge_operator_memory
+  _id, accountId, operatorId,
+  kind ("preference"|"rejection"|"context"),
+  content, createdAt, lastUsedAt, expiresAt?
+索引: { accountId: 1, operatorId: 1, lastUsedAt: -1 }
+```
+
+`KnowledgeDigestCard` 结构（嵌入 `knowledge_daily_reports.cards` 与 `knowledge_chat_tasks.cards` 快照）：
+
+```text
+{
+  cardId,                                  // ObjectId 持久 id（前端勾选 / dismiss 用）
+  kind ("chunk_missing_field"|"chunk_low_hit_rate"|"chunk_caused_block"|
+        "pack_outdated"|"evolution_pending"|"evolution_released"|"freeform"),
+  title (≤ 60 字),
+  summary (≤ 200 字),
+  targetRefs: [{kind ("chunk"|"pack"|"item"|"run"|"evolution_proposal"), id}],
+  suggestedAction ("fix_chunk"|"add_chunk"|"retag"|"review_evolution"|"dismiss"|"freeform"),
+  severity ("info"|"warn"|"critical"),
+  metric? { name, value, threshold }
+}
+```
+
+排序优先级：`severity=critical` > `kind=chunk_caused_block` > `kind=chunk_missing_field` > 其他；同级内按 `targetRefs[0].id` 稳定排序。
+
+### 扩展现有 collection
+
+```text
+knowledge_chat_turns
+  追加 kind?: "task_progress"|"task_summary"|"tool_call_log"|null
+  追加 attachments.tool_calls?: [{name, params, result, latency_ms, tokens}]
+  其余字段不变（向后兼容；旧 turn 缺字段视为 null）
+```
+
+### 新增路由
+
+```
+GET  /api/knowledge/digest/today                  当日日报；命中即返回，未命中同步触发合成
+POST /api/knowledge/digest/regenerate             手动重算（body: { force?: bool }）
+POST /api/knowledge/digest/cards/:cardId/dismiss  忽略一张卡片
+POST /api/knowledge/chat/tasks                    chat 派工（body: {sessionId, cardIds, plannedSteps}）
+GET  /api/knowledge/chat/tasks/:taskId            轮询任务进度
+POST /api/knowledge/chat/tasks/:taskId/cancel     取消未开始 / 运行中的任务
+GET  /api/knowledge/chat/sessions/:sid/stream     SSE 长连接，推 turn id
+GET  /api/operation-knowledge/logs/analyze        24h block/hold runs 反查 chunk（tool-calling 用）
+```
+
+`POST /api/operation-knowledge/chat` / `chat/:sid/apply` 等已有路由不变；本轮在 `chat_turn` handler 内增加 `intent="digest_action"` 与 `intent="update_operator_memory"` 两个分支。
+
+### 新增配置（`.env`）
+
+```
+KNOWLEDGE_DIGEST_ENABLED=false                # 默认关停；运维显式打开
+KNOWLEDGE_DIGEST_RUN_HOUR=9                   # 每天 09:00（运营时区）
+KNOWLEDGE_DIGEST_RUN_TOKEN_BUDGET=24000       # 单次 worker tick token 上限
+KNOWLEDGE_DIGEST_RUN_MAX_LLM_CALLS=8          # 单次 tick LLM 调用上限
+KNOWLEDGE_TASK_WORKER_INTERVAL_SECONDS=30     # task worker tick 间隔；0 表示停掉
+```
+
+### 新增 PromptSpec
+
+```
+knowledge.digest.compose          worker 4 数据源摘要 → 卡片数组
+knowledge.digest.dispatch         运营选 N 卡 → plannedSteps 拆解
+knowledge.digest.summarize_logs   24h block/hold log 聚合 → 1 句话 issue
+```
+
+经 `ensure_prompt_pack_v2` seed；版本号挂在 `knowledge_daily_reports.promptVersions` / `llm_call_logs.prompt_version`。
+
+### 新增 AgentEvent kind
+
+```
+knowledge_digest_generated         worker 完成一次合成
+knowledge_digest_failed            合成失败 / 超预算
+knowledge_chat_task_created        派工落库
+knowledge_chat_task_finished       task 全部步骤完成（含 fail-soft）
+knowledge_chat_task_cancelled      运营取消
+knowledge_operator_memory_added    新增运营偏好 / 拒绝项
+```
+
+所有 kind 过 `scripts/check-no-human-takeover.{sh,ps1}` lint，不引入"接管 / 人工"语义。

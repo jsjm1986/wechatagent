@@ -62,6 +62,7 @@ fn make_contact(wxid: &str) -> Contact {
         last_inbound_at: Some(now),
         last_outbound_at: None,
         last_agent_run_at: None,
+        custom_agent_instructions: None,
         created_at: now,
         updated_at: now,
     }

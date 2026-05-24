@@ -33,12 +33,18 @@ pub struct Cohorts {
 /// 失败 finalReviewStatus 子集（用于 prompt cohort）。与 outcomes_autonomy 的
 /// "blocked-like" 集合保持一致；不要让"成功 + 局部决策"的 run 进入 prompt
 /// cohort，因为这些 run 没有"reply 失败"信号让 Critic 学习。
+///
+/// R14 修订：与 `src/agent/run_envelope.rs:67-78` `FINAL_REVIEW_STATUS_VALUES`
+/// 真实枚举对齐。原集合用 `budget_exceeded` 是 stale 命名（真实枚举是
+/// `blocked_by_budget`），且漏了 `blocked_by_required_field`，导致 Critic LLM
+/// 训练数据缺一类失败信号 + 引入永远不会命中的 phantom 取值。
 pub const FAILURE_FINAL_REVIEW_STATUSES: &[&str] = &[
     "blocked_unverified_product_claim",
     "held_by_ai_policy",
     "blocked_by_safety_guard",
     "ai_waiting_for_more_context",
-    "budget_exceeded",
+    "blocked_by_budget",
+    "blocked_by_required_field",
     "revision_failed",
 ];
 
@@ -160,16 +166,43 @@ mod tests {
     #[test]
     fn failure_status_set_includes_5gate_and_budget() {
         // 维护性断言：FAILURE_FINAL_REVIEW_STATUSES 一旦被改，这里要同步更新。
-        // 列出当前覆盖的 6 个分类；未来加新失败类型也来这里登记。
+        // R14 修订后列出 7 个真实失败分类（与 src/agent/run_envelope.rs:67-78
+        // FINAL_REVIEW_STATUS_VALUES 真实枚举对齐）。
         for s in [
             "blocked_unverified_product_claim",
             "held_by_ai_policy",
             "blocked_by_safety_guard",
             "ai_waiting_for_more_context",
-            "budget_exceeded",
+            "blocked_by_budget",
+            "blocked_by_required_field",
             "revision_failed",
         ] {
             assert!(FAILURE_FINAL_REVIEW_STATUSES.contains(&s), "missing {s}");
+        }
+    }
+
+    #[test]
+    fn failure_status_set_is_subset_of_final_review_status_values() {
+        // R14：cohort 的 FAILURE_FINAL_REVIEW_STATUSES SHALL 是
+        // run_envelope 真实枚举的子集，避免 phantom 取值导致 cohort 永远空。
+        use crate::agent::run_envelope::FINAL_REVIEW_STATUS_VALUES;
+        for s in FAILURE_FINAL_REVIEW_STATUSES {
+            assert!(
+                FINAL_REVIEW_STATUS_VALUES.contains(s),
+                "FAILURE 集合的 \"{s}\" 不在 FINAL_REVIEW_STATUS_VALUES 真实枚举里 → cohort 永远空"
+            );
+        }
+    }
+
+    #[test]
+    fn failure_status_set_excludes_success_statuses() {
+        // R14：approved / revision_applied_approved / legacy_mode_unchecked
+        // 是成功类，SHALL NOT 进 prompt cohort（否则 Critic LLM 学不到失败信号）。
+        for s in ["approved", "revision_applied_approved", "legacy_mode_unchecked"] {
+            assert!(
+                !FAILURE_FINAL_REVIEW_STATUSES.contains(&s),
+                "成功类 \"{s}\" 不应该出现在 FAILURE 集合里"
+            );
         }
     }
 }

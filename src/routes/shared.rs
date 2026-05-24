@@ -796,8 +796,6 @@ pub(super) fn effective_route_memory_card_typed(memory: &OperatingMemory) -> Mem
         extra.insert("recentEpisodeSummary", "");
         extra.insert("conflicts", Vec::<Document>::new());
         MemoryCardTyped {
-            core_profile: Document::new(),
-            relationship_state: Document::new(),
             core_facts: Vec::new(),
             recent_facts: Vec::new(),
             deprecated_facts: Vec::new(),

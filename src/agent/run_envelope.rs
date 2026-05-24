@@ -86,6 +86,9 @@ pub const FINAL_REVIEW_STATUS_VALUES: &[&str] = &[
 pub const GATEWAY_STATUS_VALUES: &[&str] = &[
     "pending",
     "approved",
+    "allowed",
+    "sent",
+    "review_blocked",
     "revision_failed",
     "revision_skipped_invalid_direction",
     "revision_skipped_budget_exceeded",
@@ -98,6 +101,15 @@ pub const GATEWAY_STATUS_VALUES: &[&str] = &[
     "blocked_unverified_product_claim",
     "tool_loop_timeout",
     "legacy_mode_unchecked",
+    // gateway pre-block 集合（precheck_send_gateway）
+    "not_managed",
+    "cooldown",
+    "rate_limited",
+    "daily_limit",
+    "expired",
+    "context_changed",
+    "policy_cooldown",
+    "policy_wait_user_reply",
 ];
 
 /// 严禁取值（R2.7 业务语义保护 + R9.2）。任何 finalReviewStatus / gateway_status
@@ -312,6 +324,8 @@ pub async fn write_run_envelope_started(
         post_revision_summary: None,
         self_critique: None,
         autonomy_mode: String::new(),
+        conversation_mode: String::new(),
+        conversation_mode_reason: None,
         final_review_status: String::new(),
         outbox_status: None,
         memory_consolidator_warnings: Vec::new(),
@@ -351,6 +365,8 @@ pub struct AgentRunLogTerminalFields {
     pub post_revision_summary: Option<String>,
     pub self_critique: Option<String>,
     pub autonomy_mode: Option<String>,
+    pub conversation_mode: Option<String>,
+    pub conversation_mode_reason: Option<String>,
     pub final_review_status: Option<String>,
     pub outbox_status: Option<String>,
     pub memory_consolidator_warnings: Option<Vec<String>>,
@@ -423,6 +439,12 @@ impl AgentRunLogTerminalFields {
         }
         if let Some(value) = &self.autonomy_mode {
             set.insert("autonomy_mode", value);
+        }
+        if let Some(value) = &self.conversation_mode {
+            set.insert("conversation_mode", value);
+        }
+        if let Some(value) = &self.conversation_mode_reason {
+            set.insert("conversation_mode_reason", value);
         }
         if let Some(value) = &self.final_review_status {
             set.insert("final_review_status", value);
@@ -565,6 +587,8 @@ async fn insert_envelope_recovery(
         post_revision_summary: fields.post_revision_summary.clone(),
         self_critique: fields.self_critique.clone(),
         autonomy_mode: fields.autonomy_mode.clone().unwrap_or_default(),
+        conversation_mode: fields.conversation_mode.clone().unwrap_or_default(),
+        conversation_mode_reason: fields.conversation_mode_reason.clone(),
         final_review_status: fields.final_review_status.clone().unwrap_or_default(),
         outbox_status: fields.outbox_status.clone(),
         memory_consolidator_warnings: fields
@@ -1128,6 +1152,8 @@ mod tests {
             final_review_status: String::new(),
             outbox_status: None,
             memory_consolidator_warnings: Vec::new(),
+            conversation_mode: String::new(),
+            conversation_mode_reason: None,
             created_at: DateTime::now(),
         };
         let doc = to_document(&log).expect("AgentRunLog should serialize to BSON");
@@ -1189,6 +1215,8 @@ mod tests {
                 "deprecated_fact_id_not_found:abc".to_string(),
                 "superseded_by_id_not_found:abc:def".to_string(),
             ],
+            conversation_mode: "consultative".to_string(),
+            conversation_mode_reason: Some("trigger_keywords_fastpath_hit".to_string()),
             created_at: DateTime::now(),
         };
 

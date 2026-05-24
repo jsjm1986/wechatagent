@@ -72,6 +72,11 @@ fn default_decision_phase() -> String {
     "final".to_string()
 }
 
+/// 缺失时按"寒暄关系"作为最保守模式（不会触发产品话术 + 5 闸宽松）。
+fn default_conversation_mode() -> String {
+    "casual_relationship".to_string()
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentDecision {
@@ -176,6 +181,24 @@ pub struct AgentDecision {
     pub tool_calls: Vec<ToolCallRequest>,
     #[serde(default)]
     pub agent_generated_signals: Vec<AgentSignal>,
+
+    // ── conversation_mode：四模式人格切换（R-prompt-v3） ──
+    //
+    // 取代以前"统一人格 + LLM 自由判断 shouldReply"的单层结构。每轮 Reply Agent
+    // 必须输出 conversation_mode（严格枚举），决定本轮的语气、信息密度、
+    // 5 闸阈值偏好（详见 docs/conversation-mode-design.md）。
+    //
+    // 取值：
+    //   - casual_relationship：寒暄关系，维系熟悉度，不推销
+    //   - value_exchange     ：价值互换，分享内容，不强推产品
+    //   - consultative       ：顾问/销售模式，明确处理产品/价格/方案/异议
+    //   - boundary_protection：边界保护，客户已表达不需要 / 仅服务老客户
+    //
+    // gateway 在 keyword fastpath 命中时会强制覆盖为 consultative。
+    #[serde(default = "default_conversation_mode")]
+    pub conversation_mode: String,
+    #[serde(default)]
+    pub conversation_mode_reason: Option<String>,
 }
 
 impl Default for AgentDecision {
@@ -231,6 +254,9 @@ impl Default for AgentDecision {
             decision_phase: default_decision_phase(),
             tool_calls: Vec::new(),
             agent_generated_signals: Vec::new(),
+            // conversation_mode：默认寒暄模式（最保守）
+            conversation_mode: default_conversation_mode(),
+            conversation_mode_reason: None,
         }
     }
 }
@@ -277,6 +303,10 @@ pub struct RawAgentDecision {
 
     // ── R8 自由信号 ──
     pub agent_generated_signals: Option<Vec<AgentSignal>>,
+
+    // ── R-prompt-v3 conversation_mode：四模式人格切换 ──
+    pub conversation_mode: Option<String>,
+    pub conversation_mode_reason: Option<String>,
 
     // ── 既有回复 / 知识 / 记忆 / 信号字段（保留为 Option，由 promote 落地为非 Option）──
     pub reply_text: Option<String>,
@@ -345,6 +375,12 @@ const KNOWLEDGE_NEED_VALUES: &[&str] = &["not_required", "required", "insufficie
 const RUN_MODE_VALUES: &[&str] =
     &["fast_chat", "memory_candidate", "knowledge_grounded", "high_risk"];
 const AUTONOMY_MODE_VALUES: &[&str] = &["auto", "assisted", "blocked"];
+const CONVERSATION_MODE_VALUES: &[&str] = &[
+    "casual_relationship",
+    "value_exchange",
+    "consultative",
+    "boundary_protection",
+];
 const ALLOWED_TOOL_NAMES: &[&str] = &[
     "knowledge.list_catalog",
     "knowledge.search",
@@ -487,6 +523,12 @@ impl RawAgentDecision {
             self.autonomy_mode.clone(),
             "autonomy_mode",
             AUTONOMY_MODE_VALUES,
+            &mut risks,
+        );
+        let conversation_mode = check_required_enum(
+            self.conversation_mode.clone(),
+            "conversation_mode",
+            CONVERSATION_MODE_VALUES,
             &mut risks,
         );
         let needs_review = check_required_bool(self.needs_review, "needs_review", &mut risks);
@@ -650,6 +692,15 @@ impl RawAgentDecision {
             reply_text: self.reply_text.clone().unwrap_or_default(),
             tool_calls: self.tool_calls.clone().unwrap_or_default(),
             agent_generated_signals: self.agent_generated_signals.clone().unwrap_or_default(),
+            conversation_mode: if conversation_mode.is_empty() {
+                default_conversation_mode()
+            } else {
+                conversation_mode
+            },
+            conversation_mode_reason: self
+                .conversation_mode_reason
+                .clone()
+                .filter(|s| !s.trim().is_empty()),
             ..AgentDecision::default()
         };
 
@@ -715,6 +766,17 @@ fn build_minimal_decision(raw: RawAgentDecision) -> AgentDecision {
         reply_text: raw.reply_text.clone().unwrap_or_default(),
         tool_calls: raw.tool_calls.clone().unwrap_or_default(),
         agent_generated_signals: raw.agent_generated_signals.clone().unwrap_or_default(),
+        conversation_mode: raw
+            .conversation_mode
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(ToString::to_string)
+            .unwrap_or_else(default_conversation_mode),
+        conversation_mode_reason: raw
+            .conversation_mode_reason
+            .clone()
+            .filter(|s| !s.trim().is_empty()),
         ..AgentDecision::default()
     };
     carry_through_fields(raw, &mut decision);

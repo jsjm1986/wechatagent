@@ -454,6 +454,11 @@ fn scenario_contact_from_seed(
             .or_else(|_| seed.get_str("human_profile_note"))
             .ok()
             .map(ToString::to_string),
+        custom_agent_instructions: seed
+            .get_str("customAgentInstructions")
+            .or_else(|_| seed.get_str("custom_agent_instructions"))
+            .ok()
+            .map(ToString::to_string),
         agent_profile: None,
         memory_summary: seed
             .get_str("memorySummary")

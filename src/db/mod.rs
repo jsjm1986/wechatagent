@@ -131,6 +131,14 @@ impl Database {
         self.db.collection("knowledge_chat_turns")
     }
 
+    /// P1-7：每 session 一个 `{ _id: "{workspace_id}|{session_id}", seq: i64 }`
+    /// 行；`findOneAndUpdate $inc seq +1 upsert returnDocument=After` 得到原子
+    /// 自增后的新 turn_index。避免「读 last + 1 → 写」之间出现并发写者读到
+    /// 同一 last 制造重复 turn_index、命中 unique 索引报错的窗口。
+    pub fn knowledge_chat_session_seqs(&self) -> Collection<mongodb::bson::Document> {
+        self.db.collection("knowledge_chat_session_seqs")
+    }
+
     pub fn knowledge_daily_reports(&self) -> Collection<KnowledgeDailyReport> {
         self.db.collection("knowledge_daily_reports")
     }

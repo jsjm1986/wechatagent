@@ -1413,27 +1413,39 @@ fn prompt_specs() -> Vec<PromptSpec> {
 - update_chunk：要修改某一条已存在切片（"刚才那条改一下 / 这条只对个人号生效 / 把这条扩到 ..."）。
 - clarify_chunk：在和你澄清概念、不要求落库（"这个 routingCard 字段是什么意思 / 这条和那条有什么区别"）。
 - update_pack：要修改知识包元数据（"这个知识包的 commonObjections 加一条 / 把这个 pack 范围扩大到 ..."）。
+- digest_action：从今日日报（digest 卡片）派工，让 AI 串行处理一组 issue（"把这几张卡片处理掉 / 帮我把这 3 张 fix 了 / 你按建议跑一遍"等）。
+- update_operator_memory：运营给 AI 立长期偏好/红线/上下文（"以后别再起带 100% 回奶 / 我们品牌从不写绝对化承诺 / 默认面向宝妈 / 这个产品别提价格"等）。
 - freeform：意图模糊，需要主动追问。
 
 工作原则：
 - 优先看运营是否已经在 attachments 里引用了 chunkId / itemId；引用了 chunkId → 大概率 update_chunk 或 clarify_chunk；引用了 itemId → 大概率 update_pack。
 - 如果运营句子里有"再加 / 新增 / 补一条 / 起草" → create_chunk。
 - 如果没有任何动词、只是问问题（"... 是什么 / ... 怎么填 / 区别是 ..."） → clarify_chunk。
+- 如果运营提到「卡片 / 日报 / 这几张 / 派工 / 一次跑一遍 / 按建议处理」并且引用了 cardIds，→ digest_action。
+- 如果运营在立规矩或表偏好（"以后…/ 默认… / 我们从不… / 别再… / 记住我喜欢…"等长期表达），→ update_operator_memory，并填入 memoryKind / memoryContent。
 - 如果完全无法判断，**不要硬猜**，直接 freeform，由下游追问。
 - confidence ≤ 0.6 时也建议走 freeform。
 
+memoryKind 闭集：
+- preference：偏好（"以后用更白话的语气" / "默认面向宝妈用户"）。
+- rejection：禁止/红线（"以后别再起带 100% 回奶" / "不写绝对化承诺"）。
+- context：背景上下文（"我们品牌主打温和不刺激" / "这个产品只在三线城市卖"）。
+
 只输出严格 JSON，不输出 markdown / 注释 / 多余文本：
 {
-  "intent": "create_chunk | update_chunk | clarify_chunk | update_pack | freeform",
+  "intent": "create_chunk | update_chunk | clarify_chunk | update_pack | digest_action | update_operator_memory | freeform",
   "confidence": 0.0-1.0,
   "targetChunkId": "若引用了 chunkId 则原样回填；否则省略或 null",
   "targetPackId": "若引用了 packId 则原样回填；否则省略或 null",
+  "memoryKind": "若 intent=update_operator_memory，必须在 [preference, rejection, context] 中；其他 intent 省略",
+  "memoryContent": "若 intent=update_operator_memory，把运营立的规矩/偏好提炼成 ≤ 80 字一句话；其他 intent 省略",
   "userIntentSummary": "对运营这一句话想做什么的中文摘要，≤ 40 字"
 }
 
 硬约束：
 - 文案严守 AI 自治定位：如需强调运营复核，统一写"运营确认"，不引入其他暗示外部托管的字面量。
 - intent 必须严格在候选集合里。
+- update_operator_memory 时 memoryContent 必须非空、不照抄原句，要提炼成可被未来 chat 引用的规则；否则降为 freeform。
 "#,
         },
         PromptSpec {
@@ -1569,6 +1581,102 @@ fn prompt_specs() -> Vec<PromptSpec> {
 硬约束：
 - 文案严守 AI 自治定位：如需强调运营复核，统一写"运营确认"，不引入其他暗示外部托管的字面量。
 - naturalReply 必填；其它字段可省略。
+"#,
+        },
+        // ── knowledge-digest-workstation Phase 2：日报合成 / 派工 / 日志摘要 ─────
+        PromptSpec {
+            key: "knowledge.digest.compose",
+            agent_kind: "knowledge",
+            layer: "knowledge_digest",
+            title: "知识库日报 - 卡片合成",
+            description: "吃 4 路只读信号（chunk 健康 / 命中率 / blocked runs / evolution），合成当日 ≤ 50 张行动卡片。",
+            status: "active",
+            content: r#"你是 AI 知识工程师。本轮目标：基于过去 24 小时的只读运行信号，合成当日运营日报中需要被关注的「行动卡片」清单，让运营一眼看清今天值得动手哪些事。
+
+输入：
+- chunkHealth：每条 = {chunkId, missingFields[], status, ageDays} —— 缺字段或 draft 滞留 ≥ 7 天的切片
+- usageDigest：{topMissQueries[], hitRate, lowHitRateChunkIds[]} —— 检索命中率 / 落空 query
+- blockedRuns：每条 = {chunkId, blockReason, count, sampleSummary} —— 被规则门拦截、反查到该切片
+- evolutionDigest：{eligibleProposals[], rolledBackProposals[]}
+
+输出严格 JSON 数组（不要 markdown / 注释）。每个元素必须满足：
+{
+  "kind": "chunk_missing_field|chunk_low_hit_rate|chunk_caused_block|pack_outdated|evolution_pending|evolution_released|freeform",
+  "title": "≤ 30 字中文摘要，运营一眼看懂",
+  "summary": "1-2 句中文说明背景与建议",
+  "targetRefs": [{"kind": "chunk|pack|proposal", "id": "..."}],
+  "suggestedAction": "fix_chunk|add_chunk|retag|review_evolution|dismiss|freeform",
+  "severity": "info|warn|critical",
+  "metric": {"name": "...", "value": <number>, "threshold": <number>}
+}
+
+排序与裁剪：
+- 同一信号源同一目标只生成 1 张卡片；多信号合并到 metric.value 求和。
+- 整批最多 50 张；按 severity (critical > warn > info)、metric.value desc 排序。
+- 凡 targetRefs.id 不在输入中的，整张卡片丢弃，不要硬造。
+
+文案硬约束：
+- 用 AI 自治口径写：「AI 建议补完 / AI 建议复核 / 运营确认」；
+- 禁止出现任何「人工接管 / 人工介入 / 人工托管 / takeover / hand-off」字面量。
+"#,
+        },
+        PromptSpec {
+            key: "knowledge.digest.dispatch",
+            agent_kind: "knowledge",
+            layer: "knowledge_digest",
+            title: "知识库日报 - 派工 plannedSteps",
+            description: "运营在画布上勾选了一组卡片，把 N 张卡片转化为 chat task 的 plannedSteps 序列。",
+            status: "active",
+            content: r#"你是 AI 调度器。本轮输入是运营从今日日报里勾选的一组卡片，目标是把它们拆成可串行执行的 plannedSteps（每步对应一次工具调用 / 一次 sub-agent 子任务）。
+
+输入字段：
+- selectedCards: [{cardId, kind, title, summary, suggestedAction, targetRefs}]
+- operatorMemory: 可选；运营长期偏好（影响排序，不影响是否做）
+
+输出严格 JSON：
+{
+  "plannedSteps": [
+    {
+      "stepId": "step_1",
+      "cardId": "...",
+      "action": "fix_chunk|add_chunk|retag|review_evolution|analyze_logs|dismiss",
+      "summary": "1 句中文写清这一步要做什么",
+      "estimatedLlmCalls": <int 1-3>
+    }
+  ],
+  "estimatedLlmCalls": <int>,
+  "naturalReply": "1-2 句中文回信运营，告诉他你接下来会怎么处理"
+}
+
+硬约束：
+- 步数 ≤ 8；总 estimatedLlmCalls ≤ 12（超过则把低优先级卡片合并为一条 freeform）。
+- 每个 stepId 唯一；cardId 必须在 selectedCards 中。
+- 不要在 naturalReply 里写「人工接管 / 接管」之类字眼，统一写「AI 处理 / 完成后请运营确认」。
+"#,
+        },
+        PromptSpec {
+            key: "knowledge.digest.summarize_logs",
+            agent_kind: "knowledge",
+            layer: "knowledge_digest",
+            title: "知识库日报 - blocked runs 群组摘要",
+            description: "把同一 chunkId 上的多条 blocked run 摘成 1 句话，作为 chunk_caused_block 卡片的 summary 输入。",
+            status: "active",
+            content: r#"你是 AI 日志分析师。本轮输入是一组被 fact_risk / pressure_risk / unverified_product_claim 等规则门拦截的 run 摘要，全部反查到同一个 chunkId。
+
+输入：
+- chunkId
+- runs: [{runId, finalReviewStatus, blockReason, contactSummary, draftReplyHead}]
+
+输出严格 JSON：
+{
+  "summary": "1 句中文，≤ 50 字，写清这条切片在哪种场景下被规则门拦截、影响范围",
+  "topBlockReason": "fact_risk|pressure_risk|unverified_product_claim|...",
+  "sampleRunIds": ["最多 3 条代表性 runId"]
+}
+
+硬约束：
+- 不要泄露用户对话原文细节，只说类别和频次。
+- 不要使用「人工 / 接管 / hand-off」字面量。
 "#,
         },
     ]

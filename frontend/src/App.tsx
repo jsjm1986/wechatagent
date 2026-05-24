@@ -867,6 +867,53 @@ const USER_RUNTIME_PARAMETER_FIELDS: Array<{
   { key: "reactionMaxLlmCalls", label: "反应分析调用上限", detail: "用户回应分析最多 LLM 调用次数", kind: "number", defaultValue: 2 }
 ];
 
+// P1-8：知识库 chat sessionId 必须按 account 隔离——切到另一个微信号时不应该
+// 把上一个号的 session 续上去（不同 account 的知识库隔离边界）。把
+// `wechatagent.knowledgeChatSessionId` 升级为
+// `wechatagent.knowledgeChatSessionId.{accountId}`；空 accountId 时退化为
+// 不持久化（避免老的 legacy 全局键继续被无脑读到）。
+const KNOWLEDGE_CHAT_SESSION_KEY_PREFIX = "wechatagent.knowledgeChatSessionId";
+const LEGACY_KNOWLEDGE_CHAT_SESSION_KEY = "wechatagent.knowledgeChatSessionId";
+function chatSessionStorageKey(accountId: string | undefined): string | null {
+  if (!accountId) return null;
+  return `${KNOWLEDGE_CHAT_SESSION_KEY_PREFIX}.${accountId}`;
+}
+function readPersistedChatSession(accountId: string | undefined): string | undefined {
+  try {
+    const key = chatSessionStorageKey(accountId);
+    if (!key) return undefined;
+    const v = window.localStorage.getItem(key);
+    if (v) return v;
+    // legacy 兼容：上一版本是全局键；如果新键空、legacy 有值，搬过来一次。
+    const legacy = window.localStorage.getItem(LEGACY_KNOWLEDGE_CHAT_SESSION_KEY);
+    if (legacy) {
+      window.localStorage.setItem(key, legacy);
+      window.localStorage.removeItem(LEGACY_KNOWLEDGE_CHAT_SESSION_KEY);
+      return legacy;
+    }
+    return undefined;
+  } catch {
+    return undefined;
+  }
+}
+function writePersistedChatSession(accountId: string | undefined, sessionId: string) {
+  try {
+    const key = chatSessionStorageKey(accountId);
+    if (!key) return;
+    window.localStorage.setItem(key, sessionId);
+  } catch {
+    /* ignore */
+  }
+}
+function clearPersistedChatSession(accountId: string | undefined) {
+  try {
+    const key = chatSessionStorageKey(accountId);
+    if (key) window.localStorage.removeItem(key);
+  } catch {
+    /* ignore */
+  }
+}
+
 export function App() {
   const [accounts, setAccounts] = useState<Account[]>([]);
   const [contacts, setContacts] = useState<Contact[]>([]);
@@ -890,13 +937,10 @@ export function App() {
   const [chunkSource, setChunkSource] = useState<Record<string, unknown> | null>(null);
   const [aiRepairTarget, setAiRepairTarget] = useState<{ kind: "chunk" | "pack"; id: string; label: string } | null>(null);
   const [knowledgeChatOpen, setKnowledgeChatOpen] = useState(false);
-  const [knowledgeChatSessionId, setKnowledgeChatSessionId] = useState<string | undefined>(() => {
-    try {
-      return window.localStorage.getItem("wechatagent.knowledgeChatSessionId") || undefined;
-    } catch {
-      return undefined;
-    }
-  });
+  // P1-8：sessionId 按 account 隔离——初值不再从全局 localStorage 读，而是等
+  // currentAccountId 解析后用 useEffect 从 `wechatagent.knowledgeChatSessionId.{accountId}`
+  // 读。account 切换时同样在 useEffect 里换号读取。
+  const [knowledgeChatSessionId, setKnowledgeChatSessionId] = useState<string | undefined>(undefined);
   const [knowledgeChatMode, setKnowledgeChatMode] = useState<"drawer" | "docked">("docked");
   const [digestReport, setDigestReport] = useState<KnowledgeDailyReportView | null>(null);
   const [digestPhase, setDigestPhase] = useState<"idle" | "loading" | "regenerating" | "error">("idle");
@@ -1702,11 +1746,7 @@ export function App() {
   function openKnowledgeChat(sessionId?: string) {
     if (sessionId) {
       setKnowledgeChatSessionId(sessionId);
-      try {
-        window.localStorage.setItem("wechatagent.knowledgeChatSessionId", sessionId);
-      } catch {
-        /* ignore */
-      }
+      writePersistedChatSession(currentAccountId, sessionId);
     }
     setKnowledgeChatOpen(true);
   }
@@ -1715,11 +1755,7 @@ export function App() {
     setKnowledgeChatOpen(false);
     if (persistedSessionId) {
       setKnowledgeChatSessionId(persistedSessionId);
-      try {
-        window.localStorage.setItem("wechatagent.knowledgeChatSessionId", persistedSessionId);
-      } catch {
-        /* ignore */
-      }
+      writePersistedChatSession(currentAccountId, persistedSessionId);
     }
   }
 
@@ -2166,6 +2202,17 @@ export function App() {
     void loadAll().catch((err) => setError(err instanceof Error ? err.message : String(err)));
   }, [currentAccountId, accounts.length]);
 
+  // P1-8：currentAccountId 一旦解析或切换，从 per-account localStorage 读 sessionId。
+  // - 首次进入：从 `wechatagent.knowledgeChatSessionId.{accountId}` 读历史 session（无则 undefined）。
+  // - 切号：丢掉前一账号的 sessionId state，避免「号 A 的 chat 历史显示在号 B」。
+  useEffect(() => {
+    if (!currentAccountId) {
+      setKnowledgeChatSessionId(undefined);
+      return;
+    }
+    setKnowledgeChatSessionId(readPersistedChatSession(currentAccountId));
+  }, [currentAccountId]);
+
   useEffect(() => {
     if (activeChannel !== "knowledge") return;
     if (digestPhase === "loading" || digestPhase === "regenerating") return;
@@ -2575,14 +2622,7 @@ export function App() {
                 onClose={(sid) => {
                   if (sid) {
                     setKnowledgeChatSessionId(sid);
-                    try {
-                      window.localStorage.setItem(
-                        "wechatagent.knowledgeChatSessionId",
-                        sid
-                      );
-                    } catch {
-                      /* ignore */
-                    }
+                    writePersistedChatSession(currentAccountId, sid);
                   }
                 }}
                 onApplied={() => {
@@ -9796,6 +9836,13 @@ function KnowledgeChatPanel(props: {
         });
     };
     es.addEventListener("turn", refetch);
+    // P1-6：worker 写完 summary 后服务端会推一条 `event: close`，标志本 session
+    // 已终态——前端拉一次最终 history 后主动 close EventSource，不再重连。
+    es.addEventListener("close", () => {
+      refetch();
+      closed = true;
+      es.close();
+    });
     es.onerror = () => {
       // EventSource 默认会自动重连；只在 close 阶段彻底放弃。
       if (closed) {
@@ -9807,6 +9854,23 @@ function KnowledgeChatPanel(props: {
       es.close();
     };
   }, [open, sessionId]);
+
+  // P2-14：Esc 关闭抽屉。docked 模式下不抢键（运营在嵌入面板里编辑文档时
+  // 会大量按 Esc 取消下拉/选区），仅在 drawer 模式下生效。
+  useEffect(() => {
+    if (!open) return;
+    if (props.mode !== "drawer") return;
+    const handleEsc = (event: globalThis.KeyboardEvent) => {
+      if (event.key !== "Escape") return;
+      // 输入法 composing 中不关：避免运营输入中文时误触。
+      if (event.isComposing) return;
+      onClose(sessionId);
+    };
+    window.addEventListener("keydown", handleEsc);
+    return () => {
+      window.removeEventListener("keydown", handleEsc);
+    };
+  }, [open, props.mode, onClose, sessionId]);
 
   const sessionTurnCount = turns.filter((t) => t.role === "assistant").length;
   const turnLimitReached = sessionTurnCount >= 8;
@@ -9825,11 +9889,7 @@ function KnowledgeChatPanel(props: {
         content: trimmed
       });
       setSessionId(res.sessionId);
-      try {
-        window.localStorage.setItem("wechatagent.knowledgeChatSessionId", res.sessionId);
-      } catch {
-        /* ignore */
-      }
+      writePersistedChatSession(accountId, res.sessionId);
       setTurns((prev) => [
         ...prev,
         {
@@ -9904,11 +9964,7 @@ function KnowledgeChatPanel(props: {
     setLastFailedAction(null);
     try {
       await props.discard(sessionId);
-      try {
-        window.localStorage.removeItem("wechatagent.knowledgeChatSessionId");
-      } catch {
-        /* ignore */
-      }
+      clearPersistedChatSession(accountId);
       onClose();
     } catch (err) {
       setError(err instanceof Error ? err : new Error(String(err)));
@@ -10113,7 +10169,7 @@ function KnowledgeChatPanel(props: {
                   形态实时回传到本对话流。
                 </p>
                 {dispatchError && (
-                  <p className="small" style={{ color: "#dc2626" }}>
+                  <p className="small" style={{ color: "var(--danger)" }}>
                     派工失败：{dispatchError.message}
                   </p>
                 )}
@@ -10165,7 +10221,7 @@ function KnowledgeChatPanel(props: {
                   );
                 })}
                 {missingFields.length > 0 && (
-                  <p className="small" style={{ color: "#dc2626" }}>
+                  <p className="small" style={{ color: "var(--danger)" }}>
                     缺失字段：{missingFields.join(" / ")} —— 请在左侧继续回答。
                   </p>
                 )}

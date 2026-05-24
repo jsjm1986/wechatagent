@@ -325,16 +325,22 @@ fn full_card_round_trip_preserves_extra_fields() {
     extra.insert("conflicts", Vec::<mongodb::bson::Document>::new());
     extra.insert("source", "test");
     extra.insert("custom_field", "未识别字段也应保留");
+    // `coreProfile` / `relationshipState` 通过 extra 承接（free-form 子文档），
+    // 不再 typed 出独立字段 —— 否则 serde flatten 会和 extra 同名键冲突，
+    // 序列化产生重复 BSON 键，下次读回触发 `duplicate field 'coreProfile'`。
+    extra.insert("coreProfile", doc! { "identity": "测试身份" });
+    extra.insert("relationshipState", doc! { "trust": 5 });
 
     let card = MemoryCardTyped {
         core_facts: vec![MemoryFactRepr::Plain("foo".to_string())],
         recent_facts: vec![],
         deprecated_facts: vec![],
-        core_profile: doc! { "identity": "测试身份" },
-        relationship_state: doc! { "trust": 5 },
         extra,
     };
     let doc = to_document(&card).expect("serialize");
+    // 回归断言：序列化后顶层不应同时出现两份 coreProfile/relationshipState。
+    assert_eq!(doc.iter().filter(|(k, _)| *k == "coreProfile").count(), 1);
+    assert_eq!(doc.iter().filter(|(k, _)| *k == "relationshipState").count(), 1);
     let back: MemoryCardTyped = from_document(doc).expect("deserialize");
     assert_eq!(
         back.extra
@@ -342,7 +348,13 @@ fn full_card_round_trip_preserves_extra_fields() {
             .ok(),
         Some("未识别字段也应保留")
     );
-    assert_eq!(back.core_profile.get_str("identity").ok(), Some("测试身份"));
+    assert_eq!(
+        back.extra
+            .get_document("coreProfile")
+            .ok()
+            .and_then(|d| d.get_str("identity").ok()),
+        Some("测试身份")
+    );
     let prefs = back.extra.get("preferences");
     assert!(matches!(prefs, Some(Bson::Array(_))));
 }

@@ -338,6 +338,7 @@ pub async fn test_knowledge_route_for_contact(
         alias: None,
         agent_status: AgentStatus::Managed,
         human_profile_note: None,
+        custom_agent_instructions: None,
         agent_profile: None,
         memory_summary: None,
         playbook_id: None,
@@ -459,6 +460,12 @@ pub(crate) async fn route_operation_knowledge(
             ..Default::default()
         });
     }
+    // ── 硬关键词快路径 (WB5) ─────────────────────────────────────────────
+    // Reply Agent 永远先跑知识路由；这里在 LLM planner 之前先做一遍
+    // trigger_keywords 子串匹配（大小写不敏感）。命中即在 tool_trace 上写
+    // `keyword_fastpath_hit:<chunkId>:<keyword>`，并把命中 chunk 强制塞进
+    // selected_chunk_ids 头部。gateway 据此覆盖 conversation_mode=consultative。
+    let fastpath_hits = compute_keyword_fastpath_hits(&inbound.content, &knowledge.chunks);
     let catalog = format_operation_knowledge_catalog_for_prompt(knowledge);
     let memory_text = serde_json::to_string(&doc! {
         "memoryCard": context_pack.clone(),
@@ -625,8 +632,87 @@ pub(crate) async fn route_operation_knowledge(
             "medium".to_string()
         };
     }
+    // ── WB5 fastpath 合并 ───────────────────────────────────────────────
+    // 把硬关键词命中的 chunk 强制塞进 selected_chunk_ids 头部（去重保留 LLM 排序），
+    // 并在 tool_trace 上写 keyword_fastpath_hit 行，gateway 据此覆盖
+    // conversation_mode=consultative。即使 LLM planner 没有选中这些 chunk，
+    // fastpath 也会把它们补回来。
+    if !fastpath_hits.is_empty() {
+        let mut prepend: Vec<String> = Vec::new();
+        for (chunk_id, _kw) in &fastpath_hits {
+            if !route.selected_chunk_ids.iter().any(|existing| existing == chunk_id)
+                && !prepend.iter().any(|existing| existing == chunk_id)
+            {
+                prepend.push(chunk_id.clone());
+            }
+        }
+        if !prepend.is_empty() {
+            let mut merged = prepend;
+            merged.extend(route.selected_chunk_ids.drain(..));
+            // 截断到 8 (与 LLM planner 同)，避免 selected_chunk_ids 超长。
+            if merged.len() > 8 {
+                merged.truncate(8);
+            }
+            route.selected_chunk_ids = merged;
+        }
+        for (chunk_id, kw) in &fastpath_hits {
+            route.tool_trace.push(doc! {
+                "tool": "knowledge.keyword_fastpath",
+                "label": format!("keyword_fastpath_hit:{}:{}", chunk_id, kw),
+                "chunkId": chunk_id.clone(),
+                "keyword": kw.clone()
+            });
+        }
+        if route.knowledge_coverage == "missing" {
+            route.knowledge_coverage = "weak".to_string();
+        }
+    }
     route.tool_trace = dedupe_tool_trace(route.tool_trace);
     Ok(route)
+}
+
+/// WB5：硬关键词快路径的纯函数版（不依赖 AppState / LLM / Mongo）。
+///
+/// 对每个 chunk 的 `trigger_keywords` 做大小写不敏感子串匹配；命中即记录
+/// `(chunk_id, matched_keyword)`，每个 chunk 最多记一次。无 id 的 chunk
+/// 直接跳过。inbound 仅含空白时返回空。
+///
+/// 主路径 [`route_operation_knowledge`] 在 LLM planner 之前调用本函数；
+/// 也对外暴露给独立 crate 的 `tests/keyword_fastpath_router.rs` 单测。
+pub fn compute_keyword_fastpath_hits(
+    inbound_content: &str,
+    chunks: &[OperationKnowledgeChunk],
+) -> Vec<(String, String)> {
+    let lower_inbound = inbound_content.to_lowercase();
+    if lower_inbound.trim().is_empty() {
+        return Vec::new();
+    }
+    let mut hits: Vec<(String, String)> = Vec::new();
+    for chunk in chunks {
+        let Some(chunk_id) = chunk.id.map(|oid| oid.to_hex()) else {
+            continue;
+        };
+        for kw in &chunk.trigger_keywords {
+            let normalized = kw.trim().to_lowercase();
+            if normalized.is_empty() {
+                continue;
+            }
+            if lower_inbound.contains(&normalized) {
+                hits.push((chunk_id.clone(), kw.clone()));
+                break;
+            }
+        }
+    }
+    hits
+}
+
+/// WB5：判断本轮知识路由是否命中硬关键词快路径。
+/// gateway 据此把 conversation_mode 强制覆盖为 consultative。
+pub(crate) fn knowledge_route_has_keyword_fastpath_hit(route: &KnowledgeRouteResult) -> bool {
+    route
+        .tool_trace
+        .iter()
+        .any(|item| item.get_str("tool") == Ok("knowledge.keyword_fastpath"))
 }
 
 fn dedupe_tool_trace(items: Vec<Document>) -> Vec<Document> {

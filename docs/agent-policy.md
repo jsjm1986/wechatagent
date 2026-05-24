@@ -344,3 +344,108 @@ WechatAgent 自第二阶段起内置可选的"自我演化"后台 worker（`src/
    - 预期：worker 不再起 tick；**已发布且未 rollback** 的任何 `threshold_overrides` / `prompt_templates` 仍然生效（验证主开关关停不回退已发布演化结果）。
 
 如任何一步偏离预期，按 `docs/agent-policy.md` 自我演化"回滚优先"原则：admin 一键 rollback 该 proposal；必要时调 `POST /api/evolution/rollback_all`（输入 `ROLLBACK_ALL` 二次确认）一次性回滚全部并写 `agent_events kind="evolution_rollback_all"`。
+
+## 知识库日报工作站（knowledge-digest-workstation）
+
+WechatAgent 把"知识库 = AI agent"落到产品形态：chat 是主入口、画布是当日工作台、目录树是索引。完整 spec 见 `.kiro/specs/knowledge-digest-workstation/`。本节说明它**做什么、不做什么、如何被运营消费**。
+
+### 行为概要
+
+- 默认关停：`KNOWLEDGE_DIGEST_ENABLED=false`。运维显式打开后才会起 worker；关停后已生成的 `knowledge_daily_reports` 不删（保留供回看）。
+- 节奏 = 节奏 1（每日一次）：每天 `KNOWLEDGE_DIGEST_RUN_HOUR`（默认 09:00，运营时区）由 `KnowledgeDigestWorker` 主动跑一次，吃 4 个数据源（`operation_knowledge_chunks` / `knowledge_usage_logs` / `agent_run_logs` / `evolution_*`），吐一份当日 `knowledge_daily_reports`。
+- 单 tick 预算：`KNOWLEDGE_DIGEST_RUN_TOKEN_BUDGET`（默认 24000） / `KNOWLEDGE_DIGEST_RUN_MAX_LLM_CALLS`（默认 8）；超额即终止本次 tick，已写入的 partial 报告保留并标 `status="partial"`。
+- **不做**事件驱动 push（webhook 实时叫醒 chat）。所有 AI 主动消息汇集到当日日报，运营在固定时间消费。这是节奏 1 的明确选择，下一轮再考虑实时通道。
+
+### 三栏布局（取代旧抽屉式 chat）
+
+```
+┌─ 25% 目录树 ─┬─ 45% 日报画布 ─┬─ 30% Chat（常驻）─┐
+│  知识库索引   │  紧凑卡片列表    │  会话补完入口      │
+│              │  ☐ severityChip │                     │
+│              │  ☐ ...          │  消息流 + 输入条    │
+│              │  [💬 让 AI 处理 │                     │
+│              │   选中的 N 条]  │                     │
+└──────────────┴────────────────┴────────────────────┘
+```
+
+- **画布形态 = 紧凑卡片列表**（节奏 1 单日 ~20 条 issue 需要批量勾选 + 横向对比；叙事周报式不能高吞吐）。
+- 卡片 schema：`{kind, title, summary, targetRefs, suggestedAction, severity, metric}`；卡片 ≤ 50（超出截断 + status="partial"）；排序优先级：`severity=critical` > `kind=chunk_caused_block` > `kind=chunk_missing_field` > 其他。
+- 画布**不**直接编辑 chunk，是审阅 + 派单面板；编辑入口仍走右侧 chat 或目录树展开后的 `KnowledgeChunkEditor`。
+
+### Long-running task
+
+- 当一次派工 ≥ 3 cards 或预估 LLM call > 6，落库为 `knowledge_chat_tasks` 由后台 `KnowledgeTaskWorker` 串行执行（同 sessionId 同时刻只 1 跑），每完成一步写 `knowledge_chat_turns{kind="task_progress"}`，全部完成写 `kind="task_summary"` 列出 needs_review chunkIds。
+- **完成边界 = AI 直接落 `status="draft" + integrityStatus="needs_review"`**（与现有 chat apply 规则一致）；不要求每条 chunk 都在 chat 里点确认（节奏 1 单批 10+ 条会被 chat 流淹没）。运营在 `KnowledgeChunkEditor` 二次审核走 #329 sourceQuote → anchor 模糊匹配 gate 才能进 verified 池。
+- task 失败 / 超预算走 `LlmUnavailable` 路径（与上一轮 chat 错误统一）；fail-soft，单步失败不阻塞后续 step；最后 summary 列出失败步。
+- task `status="cancelled"` 时 worker 在每步开始前检查并立即停下；不强杀正在跑的步。
+
+### Operator memory（与 chunk / contact / agent memoryCard **物理隔离**）
+
+- 独立 collection `knowledge_operator_memory`（`{kind: "preference"|"rejection"|"context", content, lastUsedAt, ...}`）；**禁止**复用 `contacts.memory_card`（contact 维度）/ `agents.soul.memory`（agent 维度）。运营偏好不能污染对客户/agent 的记忆。
+- chat 在 intent 分类前注入运营当日相关的 ≤ 5 条 operator memory。
+- 写入路径：`knowledge.chat.intent` 命中 `intent=update_operator_memory` → chat handler 写一条 memory + 一条 assistant turn 显式确认（"我已记下这条偏好"）；AI **不**静默写运营记忆。
+
+### Tool-calling 扩展
+
+chat 内 LLM 启用 4 个新工具（基于现有 `agent::tool_loop` 注入模式，不引入新框架）：
+- `audit_completeness({chunkId|packId})` — 调现有 chunk 完整度审计
+- `search_chunks({query, topK})` — 走现有 BM25 + tag 检索
+- `propose_repair({chunkId, hints})` — 调现有 chunk repair 路径
+- `analyze_logs({contactWxid?, hours})` — 新增只读路由 `/api/operation-knowledge/logs/analyze`，反查 24h 内 block/hold runs 关联的 chunk 命中率
+
+per-turn tool call ≤ 6（`RUN_BUDGET` 守门）；超额 fail-fast 写 `kind=tool_budget_exceeded` turn 并停下本 turn。Tool 调用结果 + latency + tokens 写入 `knowledge_chat_turns.attachments.tool_calls`，让运营在 chat 里能展开看到 AI 看到了什么。
+
+### 安全边界（红线，CI 守门）
+
+- **AI 永不自动 verify**：digest worker / chat / task worker 三条路径产出的 chunk 一律 `status="draft" + integrityStatus="needs_review"`；verify gate 仍由 sourceQuote → anchor 把守。
+- **不动演化器**：digest 路径**只读** `evolution_*` 集合（用于卡片提示）；SHALL NOT 写 `prompt_templates` / `threshold_overrides`。这是演化器红线（R9.3 自我引用悖论）。
+- **不引入"接管 / 人工"语义**：所有新增文案过 `scripts/check-no-human-takeover.{sh,ps1}` lint。统一用语「让 AI 处理选中」「AI 起草草稿」「请去 chunk 编辑器审核」「AI 没能生成今日日报」。
+- **LLM 错误统一走 `AppError::LlmUnavailable`**：worker / chat / task 三层任何 LLM 失败都用上一轮已落地的错误分类与前端 `<LlmErrorBanner>`，不允许新增第二套错误样式。
+- **预算硬上限**：digest worker tick / chat per-turn / task per-step 三层都被 `RunBudget` 卡死；超额即终止当前层，不会因为单层失败影响主进程或下一次 tick。
+
+### Admin 视角
+
+- 运营在 Knowledge 频道顶部能看到「当日日报」徽章（数字 = 未处理 cards 数）；过期日报不自动删（保留 30 天供回看）。
+- 唯一可写动作：勾选派工 / 单卡派工 / 忽略 / 重算今日 / 在 chat 里自由对话；所有写动作在 `agent_events` 留痕（`kind=knowledge_digest_generated` / `knowledge_chat_task_*` / `knowledge_operator_memory_*`），事后可审计。
+- 前端不展示"接管 / 介入"等字眼；状态机以 AI 内部语言呈现（pending / running / finished / failed / cancelled）。
+
+### 端到端烟雾 Runbook（首次上线 / 重大变更后）
+
+仅供运维操作。**不要**在生产高峰期执行。每步预期结果失败即停下排查，不要继续。
+
+1. **临时启用 worker**
+   - `.env` 改 `KNOWLEDGE_DIGEST_ENABLED=true` + `KNOWLEDGE_DIGEST_RUN_HOUR=$(当前小时+1)`。
+   - `cargo run` 重启。
+   - 预期：日志看到 `knowledge digest worker started`；不报错退出。
+
+2. **观察当日合成**
+   - 等 ≤ 1 小时（或临时把 RUN_HOUR 拨到当前 +5min）。
+   - 浏览器进 Knowledge 频道。
+   - 预期：画布显示当日日报 N 张卡片；右侧 chat 常驻；左侧目录树正常。
+
+3. **勾选 3 张卡片派工**
+   - 勾选任意 3 张 → 点「💬 让 AI 处理选中的 3 条」→ 在 chat 输入区微调话术 → 发送。
+   - 预期：chat 显示 plannedSteps 弹窗 → 确认 → 弹出 taskId。
+
+4. **观察 task 进度**
+   - 等 ≤ 2 分钟（worker 30s tick）。
+   - 预期：chat 实时显示 3 条 `kind=task_progress` turn + 1 条 `kind=task_summary` turn 列出 needs_review chunkIds。
+
+5. **二次审核**
+   - 点 task_summary 里的某个 chunkId → 跳转到 KnowledgeChunkEditor → 二次审核 → verify。
+   - 预期：chunk 进 verified 池；下次 inbound 检索可用。
+
+6. **operator memory 写入**
+   - 在 chat 输入"以后别再起带 100% 回奶这种话术"。
+   - 预期：chat 显示 assistant turn"我已记下这条偏好…"；mongosh 查 `knowledge_operator_memory` 出现新条目。
+
+7. **故障演练**
+   - 把 `OPENAI_API_KEY` 改成无效值重启。
+   - 进 Knowledge 频道点「🔄 重算今日」。
+   - 预期：画布显示 `<LlmErrorBanner>`（kind=http_4xx 或 connect_failed）+「AI 重试」按钮；不出 5xx 弹窗。
+
+8. **复原**
+   - `.env` 改回 `KNOWLEDGE_DIGEST_ENABLED=false` + 恢复 OPENAI_API_KEY；重启。
+   - 预期：worker 不再起 tick；已生成的 `knowledge_daily_reports` / `knowledge_chat_tasks` / `knowledge_operator_memory` 仍在 Mongo（验证关停不删数据）。
+
+如任何一步偏离预期，按"回滚优先"原则：phase 级 `git revert` + `cargo test --lib` + 浏览器手动复测；不要在生产环境直接热修。

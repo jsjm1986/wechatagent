@@ -184,6 +184,79 @@ POST /webhooks/wechat
 - 所有新增 `agent_events.kind` / 前端文案过 `scripts/check-no-human-takeover.{sh,ps1}` lint。
 - 100 次 shadow replay 后 `agent_send_outbox` 集合 size 不变（`tests/evolution_isolation.rs`）。
 
+## Knowledge Digest Worker Flow（knowledge-digest-workstation）
+
+可选后台 cron-like worker（`KNOWLEDGE_DIGEST_ENABLED=true` 才起；默认 false）。完整设计见 `docs/agent-policy.md` 知识库日报工作站章节与 `.kiro/specs/knowledge-digest-workstation/`。运行链路：
+
+```text
+[knowledge_digest::worker_loop] 每天 KNOWLEDGE_DIGEST_RUN_HOUR 触发一次
+  ↓
+[knowledge_digest::generate_today_digest(account_id)]
+  │  RUN_BUDGET.scope(token=24000, calls=8) {
+  ↓
+  ├─ analyze_chunks_health(db)   读 operation_knowledge_chunks
+  ├─ analyze_usage_logs(db, 24h) 读 knowledge_usage_logs
+  ├─ analyze_run_logs(db, 24h)   读 agent_run_logs（block/hold）→ summarize_logs LLM
+  └─ analyze_evolution(db, 24h)  仅读 proposals
+  ↓
+  compose_cards(signals) → LLM `knowledge.digest.compose`
+  │  ├─ JSON schema 校验
+  │  ├─ targetRefs 外键存在性校验
+  │  ├─ 排序 R2.5 + 截断 ≤ 50
+  │  └─ 失败 → status="failed" / partial
+  ↓
+  upsert knowledge_daily_reports (accountId + reportDate unique)
+  写 KnowledgeUsageLog{kind="digest_compose"}
+  写 AgentEvent{kind="knowledge_digest_generated"}
+  }
+
+[运营 09:30 进 Knowledge 频道] GET /api/knowledge/digest/today
+  ├─ 命中 → 直接渲染
+  └─ 未命中 → 同步 generate_today_digest（同入口、同 budget）
+
+[画布勾选 N 卡 → 派工]
+  ↓
+POST /api/operation-knowledge/chat (intent=digest_action) → plannedSteps
+  ↓
+POST /api/knowledge/chat/tasks (sessionId, cardIds, plannedSteps)
+  ↓ knowledge_chat_tasks{status="pending"}
+  ↓
+[knowledge_task::worker_loop] 每 30s tick
+  ↓ 取 status=pending 按 sessionId 串行
+  for step in plannedSteps:
+    RUN_BUDGET.scope(token=8000, calls=4) {
+      match step.action {
+        fix_chunk   → 走现有 chunk repair propose+apply（强制 draft+needs_review）
+        add_chunk   → 走现有 chunk_from_request（强制 draft+needs_review）
+        retag       → 走现有 /chunks/:id/extract-tags
+        review_evo  → 不动 evolution，仅在 chat 提示运营
+        dismiss     → 写 dismissedCardIds
+      }
+      // 每步写一条 knowledge_chat_turns{kind="task_progress"}
+      // 失败 fail-soft，不阻塞后续 step
+    }
+  ↓ 全部完成
+  写 knowledge_chat_turns{kind="task_summary", attachments: needs_review chunkIds}
+  写 AgentEvent{kind="knowledge_chat_task_finished"}
+
+[前端 SSE GET /api/knowledge/chat/sessions/:sid/stream] 实时推 turn id
+  ↓
+chat 流追加 progress / summary turn
+
+[运营点 summary 里 chunkId] → KnowledgeChunkEditor 二次审核
+  → 现有 #329 sourceQuote → anchor gate → verify
+  → chunk 进 verified 池
+```
+
+红线（CI 守门）：
+
+- `src/knowledge_digest/` 与 `src/knowledge_task/` SHALL NOT 写 `prompt_templates` / `threshold_overrides`（演化器红线 R9.3）。
+- 三层（worker tick / chat per-turn / task per-step）都被 `RunBudget` 卡死；超额即终止当前层。
+- 任何 LLM 失败统一走 `AppError::LlmUnavailable` → 前端 `<LlmErrorBanner>`，不允许新增第二套错误样式。
+- 所有新增文案 / `agent_events.kind` 过 `scripts/check-no-human-takeover.{sh,ps1}` lint。
+- AI 永不自动 verify：worker / chat / task 三条路径产出的 chunk 一律 `status="draft" + integrityStatus="needs_review"`。
+- 节奏 1 阶段**不**接事件驱动 push；webhook 实时不会主动叫醒 chat。
+
 ## Deployment Shape
 
 第一阶段保持简单：

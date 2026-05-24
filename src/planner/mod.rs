@@ -382,7 +382,10 @@ fn silent_hours_for(contact: &Contact, now_ms: i64) -> i64 {
     let Some(last_inbound) = contact.last_inbound_at else {
         return 0;
     };
-    let diff_ms = now_ms.saturating_sub(last_inbound.timestamp_millis());
+    // R14：i64::saturating_sub 在负数时不会 clamp 到 0（saturate at i64::MIN），
+    // 时钟回退 / 测试夹具 last_inbound > now_ms 会导致 silent_hours 为负，
+    // 让下游比较语义出错。这里显式 max(0) 防御。
+    let diff_ms = now_ms.saturating_sub(last_inbound.timestamp_millis()).max(0);
     diff_ms / (60 * 60 * 1000)
 }
 
@@ -1085,6 +1088,7 @@ mod tests {
             last_inbound_at: None,
             last_outbound_at: None,
             last_agent_run_at: None,
+            custom_agent_instructions: None,
             created_at: DateTime::now(),
             updated_at: DateTime::now(),
         }
@@ -1183,6 +1187,48 @@ mod tests {
         };
         let now_ms: i64 = 5 * 60 * 60 * 1000;
         assert_eq!(silent_hours_for(&contact, now_ms), 5);
+    }
+
+    #[test]
+    fn silent_hours_for_returns_zero_on_clock_skew() {
+        // R14：now_ms < last_inbound（时钟回退或测试夹具偏移） SHALL 返回 0
+        // 而非负数，依赖 saturating_sub 防御。
+        let contact = Contact {
+            last_inbound_at: Some(dt(10_000_000)),
+            ..template()
+        };
+        let now_ms: i64 = 5_000_000;
+        assert_eq!(silent_hours_for(&contact, now_ms), 0);
+    }
+
+    #[test]
+    fn silent_hours_for_exact_one_hour_boundary() {
+        // R14：精确 1 小时（3,600,000 ms）SHALL 返回 1
+        let contact = Contact {
+            last_inbound_at: Some(dt(0)),
+            ..template()
+        };
+        let now_ms: i64 = 60 * 60 * 1000;
+        assert_eq!(silent_hours_for(&contact, now_ms), 1);
+    }
+
+    #[test]
+    fn silent_hours_for_just_below_one_hour_returns_zero() {
+        // R14：59min 59s 999ms SHALL 返回 0（向下取整）
+        let contact = Contact {
+            last_inbound_at: Some(dt(0)),
+            ..template()
+        };
+        let now_ms: i64 = 60 * 60 * 1000 - 1;
+        assert_eq!(silent_hours_for(&contact, now_ms), 0);
+    }
+
+    #[test]
+    fn silent_hours_for_handles_missing_inbound() {
+        // R14：last_inbound_at=None SHALL 返回 0（不静默）
+        let contact = template();
+        let now_ms: i64 = 999_999_999_999;
+        assert_eq!(silent_hours_for(&contact, now_ms), 0);
     }
 
     #[test]

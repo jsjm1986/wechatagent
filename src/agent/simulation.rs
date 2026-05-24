@@ -22,12 +22,12 @@ use super::gateway::{
     load_context_messages, load_pending_tasks, precheck_send_gateway, simulation_gateway_document,
 };
 use super::guards::{
-    decision_requires_knowledge, normalize_decision_runtime, normalize_decision_state,
-    planner_from_decision,
+    normalize_decision_runtime, normalize_decision_state, planner_from_decision,
 };
 use super::knowledge_router::{
-    empty_knowledge_route, load_operation_knowledge, route_operation_knowledge,
-    route_used_knowledge_ids, select_operation_knowledge, select_operation_knowledge_chunks,
+    empty_knowledge_route, knowledge_route_has_keyword_fastpath_hit, load_operation_knowledge,
+    route_operation_knowledge, route_used_knowledge_ids, select_operation_knowledge,
+    select_operation_knowledge_chunks,
 };
 use super::memory::{
     effective_memory_card_for_contact, load_or_create_operating_memory, next_memory_card_version,
@@ -122,10 +122,30 @@ async fn simulate_user_dialogue_inner(
             reason: "Shadow 模式复用真实 Reply Agent 内联路由".to_string(),
             ..Default::default()
         };
-        let mut knowledge_route = empty_knowledge_route(&initial_planner);
-        let mut selected_knowledge =
+        // ── WB5：simulation 与生产 gateway 对齐——永远先跑知识路由 ───────────
+        let knowledge_route = if budget.is_exceeded() {
+            budget.mark_degraded("simulation_knowledge_route_skipped_budget_exceeded");
+            let mut route = empty_knowledge_route(&initial_planner);
+            route.reason = "模拟预算超额：跳过知识路由，沿用空知识做保守决策".to_string();
+            route
+        } else {
+            route_operation_knowledge(
+                state,
+                &contact,
+                &inbound,
+                &recent,
+                &memory,
+                &context_pack,
+                &operation_knowledge,
+                Some(&run_id),
+            )
+            .await?
+        };
+        let keyword_fastpath_hit =
+            knowledge_route_has_keyword_fastpath_hit(&knowledge_route);
+        let selected_knowledge =
             select_operation_knowledge(&operation_knowledge.items, &knowledge_route);
-        let mut selected_chunks =
+        let selected_chunks =
             select_operation_knowledge_chunks(&operation_knowledge.chunks, &knowledge_route);
         let mut decision = decide_reply(
             state,
@@ -147,55 +167,19 @@ async fn simulate_user_dialogue_inner(
         .await?;
         normalize_decision_state(&mut decision, domain_config.as_ref());
         normalize_decision_runtime(&mut decision, &initial_planner);
-        let mut planner = planner_from_decision(&decision, "Shadow 首轮内联路由");
-        if decision_requires_knowledge(&decision) {
-            if budget.is_exceeded() {
-                budget.mark_degraded("simulation_knowledge_second_pass_skipped_budget_exceeded");
-                knowledge_route.reason =
-                    "模拟预算超额：跳过知识路由和二次回复决策，沿用首轮保守决策".to_string();
-                planner.reason =
-                    "Shadow 首轮需要知识，但模拟预算超额，跳过二次知识路由".to_string();
-                planner.knowledge_required = true;
-            } else {
-                knowledge_route = route_operation_knowledge(
-                    state,
-                    &contact,
-                    &inbound,
-                    &recent,
-                    &memory,
-                    &context_pack,
-                    &operation_knowledge,
-                    Some(&run_id),
-                )
-                .await?;
-                selected_knowledge =
-                    select_operation_knowledge(&operation_knowledge.items, &knowledge_route);
-                selected_chunks = select_operation_knowledge_chunks(
-                    &operation_knowledge.chunks,
-                    &knowledge_route,
-                );
-                decision = decide_reply(
-                    state,
-                    &contact,
-                    &inbound,
-                    &recent,
-                    &pending_tasks,
-                    playbook.as_ref(),
-                    domain_config.as_ref(),
-                    &runtime,
-                    &memory,
-                    &context_pack,
-                    &selected_knowledge,
-                    &selected_chunks,
-                    &knowledge_route,
-                    None,
-                    Some(&run_id),
-                )
-                .await?;
-                normalize_decision_state(&mut decision, domain_config.as_ref());
-                planner = planner_from_decision(&decision, "Shadow 打开知识库后二次路由");
-                planner.knowledge_required = true;
+        let mut planner = planner_from_decision(&decision, "Shadow 单轮决策（知识路由前置）");
+        if !knowledge_route.selected_chunk_ids.is_empty()
+            || !knowledge_route.selected_knowledge_ids.is_empty()
+        {
+            planner.knowledge_required = true;
+            if planner.review_mode.trim().is_empty() {
+                planner.review_mode = "full".to_string();
             }
+        }
+        if keyword_fastpath_hit && decision.conversation_mode != "consultative" {
+            decision.conversation_mode = "consultative".to_string();
+            decision.conversation_mode_reason =
+                Some("trigger_keywords_fastpath_hit".to_string());
         }
         normalize_decision_runtime(&mut decision, &planner);
         decision.context_pack_version = Some(next_memory_card_version(&memory));

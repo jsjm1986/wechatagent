@@ -40,13 +40,13 @@ use super::decision::{
     load_user_operation_domain_config,
 };
 use super::guards::{
-    decision_requires_knowledge, enforce_decision_taxonomy_guards, load_product_claim_markers,
+    enforce_decision_taxonomy_guards, load_product_claim_markers,
     normalize_decision_runtime, normalize_decision_state, planner_from_decision,
 };
 use super::knowledge_router::{
-    empty_knowledge_route, load_operation_knowledge, maybe_emit_unverified_warning,
-    route_operation_knowledge, route_used_knowledge_ids, select_operation_knowledge,
-    select_operation_knowledge_chunks, write_knowledge_usage_log,
+    empty_knowledge_route, knowledge_route_has_keyword_fastpath_hit, load_operation_knowledge,
+    maybe_emit_unverified_warning, route_operation_knowledge, route_used_knowledge_ids,
+    select_operation_knowledge, select_operation_knowledge_chunks, write_knowledge_usage_log,
 };
 use super::memory::{
     effective_memory_card, effective_memory_card_for_contact, load_or_create_operating_memory,
@@ -446,10 +446,43 @@ async fn run_user_operation_gateway_inner(
         reason: "Reply Agent 内联判断运行链路，普通消息不再前置 Planner".to_string(),
         ..Default::default()
     };
-    let mut knowledge_route = empty_knowledge_route(&initial_planner);
-    let mut selected_knowledge =
+    // ── WB5：永远先跑知识路由（删除原 decision_requires_knowledge short-circuit）───
+    //
+    // ISSUE-012 根因：旧链路是先让 Reply Agent 在没知识的情况下盲跑一遍、
+    // 再据 knowledgeNeed 决定是否打开知识库——第一遍的寒暄态本身就让
+    // knowledgeNeed=not_required，知识库永远进不来。
+    //
+    // 新链路：每轮都先跑 route_operation_knowledge（含硬关键词快路径），
+    // Reply Agent 直接拿着真实知识做 single-pass 决策。预算超额时退化成
+    // empty_knowledge_route 但不再回退到旧的两段式。成本：每轮 +1 LLM call
+    // ≈ +800 tokens / inbound，已经预留在 RunBudget。
+    let knowledge_route = if current_run_budget()
+        .map(|b| b.is_exceeded())
+        .unwrap_or(false)
+    {
+        if let Some(budget) = current_run_budget() {
+            budget.mark_degraded("knowledge_route_skipped_budget_exceeded");
+        }
+        let mut route = empty_knowledge_route(&initial_planner);
+        route.reason = "预算超额：跳过知识路由，沿用空知识做保守决策".to_string();
+        route
+    } else {
+        route_operation_knowledge(
+            state,
+            &contact,
+            &inbound,
+            &recent_messages,
+            &memory,
+            &context_pack,
+            &operation_knowledge,
+            Some(&run_id),
+        )
+        .await?
+    };
+    let keyword_fastpath_hit = knowledge_route_has_keyword_fastpath_hit(&knowledge_route);
+    let selected_knowledge =
         select_operation_knowledge(&operation_knowledge.items, &knowledge_route);
-    let mut selected_chunks =
+    let selected_chunks =
         select_operation_knowledge_chunks(&operation_knowledge.chunks, &knowledge_route);
     // agent-autonomy-loop W2 / Task 3.4：把 RawAgentDecision::validate_and_promote
     // 的 promote_risks 从 reply 调用一路 thread 到 finalize_review_for_send，
@@ -474,64 +507,24 @@ async fn run_user_operation_gateway_inner(
     .await?;
     normalize_decision_state(&mut decision, domain_config.as_ref());
     normalize_decision_runtime(&mut decision, &initial_planner);
-    let mut planner = planner_from_decision(&decision, "Reply Agent 首轮内联路由");
-    apply_confidence_override(&mut planner, &decision, &runtime);
-    if decision_requires_knowledge(&decision) {
-        if current_run_budget()
-            .map(|b| b.is_exceeded())
-            .unwrap_or(false)
-        {
-            if let Some(budget) = current_run_budget() {
-                budget.mark_degraded("knowledge_second_pass_skipped_budget_exceeded");
-            }
-            knowledge_route.reason =
-                "预算超额：跳过知识路由和二次回复决策，沿用首轮保守决策".to_string();
-            planner.reason = "Reply Agent 首轮需要知识，但预算超额，跳过二次知识路由".to_string();
-            planner.knowledge_required = true;
-        } else {
-            knowledge_route = route_operation_knowledge(
-                state,
-                &contact,
-                &inbound,
-                &recent_messages,
-                &memory,
-                &context_pack,
-                &operation_knowledge,
-                Some(&run_id),
-            )
-            .await?;
-            selected_knowledge =
-                select_operation_knowledge(&operation_knowledge.items, &knowledge_route);
-            selected_chunks =
-                select_operation_knowledge_chunks(&operation_knowledge.chunks, &knowledge_route);
-            let (decision_v2, promote_risks_v2) = decide_reply_with_promote(
-                state,
-                &contact,
-                &inbound,
-                &recent_messages,
-                &pending_tasks,
-                playbook.as_ref(),
-                domain_config.as_ref(),
-                &runtime,
-                &memory,
-                &context_pack,
-                &selected_knowledge,
-                &selected_chunks,
-                &knowledge_route,
-                None,
-                Some(&run_id),
-            )
-            .await?;
-            decision = decision_v2;
-            promote_risks = promote_risks_v2;
-            normalize_decision_state(&mut decision, domain_config.as_ref());
-            planner = planner_from_decision(&decision, "Reply Agent 打开知识库后二次路由");
-            planner.knowledge_required = true;
-            if planner.review_mode.trim().is_empty() {
-                planner.review_mode = "full".to_string();
-            }
-            apply_confidence_override(&mut planner, &decision, &runtime);
+    let mut planner = planner_from_decision(&decision, "Reply Agent 单轮决策（知识路由前置）");
+    if !knowledge_route.selected_chunk_ids.is_empty() || !knowledge_route.selected_knowledge_ids.is_empty() {
+        planner.knowledge_required = true;
+        if planner.review_mode.trim().is_empty() {
+            planner.review_mode = "full".to_string();
         }
+    }
+    apply_confidence_override(&mut planner, &decision, &runtime);
+    // ── WB5：硬关键词快路径覆盖 conversation_mode ───────────────────────
+    // 命中 trigger_keywords 但 LLM 没选 consultative 时，强制覆盖为
+    // consultative + reason="trigger_keywords_fastpath_hit"，并把
+    // "conversation_mode_overridden_by_fastpath" 加到 promote_risks 让
+    // finalize_review_for_send 可见。不重跑 LLM 以避免双倍成本。
+    if keyword_fastpath_hit && decision.conversation_mode != "consultative" {
+        decision.conversation_mode = "consultative".to_string();
+        decision.conversation_mode_reason =
+            Some("trigger_keywords_fastpath_hit".to_string());
+        promote_risks.push("conversation_mode_overridden_by_fastpath".to_string());
     }
     apply_confidence_override(&mut planner, &decision, &runtime);
     normalize_decision_runtime(&mut decision, &planner);
@@ -705,6 +698,7 @@ async fn run_user_operation_gateway_inner(
         &selected_chunks,
         &markers,
         promote_risks.clone(),
+        inbound.content.as_str(),
     );
     let FinalizeOutcome {
         review: finalized_review,
@@ -831,6 +825,7 @@ async fn run_user_operation_gateway_inner(
                         &selected_chunks,
                         &markers,
                         promote_risks.clone(),
+                        inbound.content.as_str(),
                     );
                     let FinalizeOutcome {
                         review: second_finalized_review,
@@ -943,10 +938,50 @@ async fn run_user_operation_gateway_inner(
         review.final_review_status = finalize_status.final_review_status_str();
     }
 
+    // ISSUE-001 (R12)：FollowUp 路径下，review 阶段（~3s）期间用户可能中途
+    // 发新 inbound。原逻辑在此处 review-held 短路返回，导致 cancel_task 的 reason
+    // 始终是 "finalize_review_blocked"，掩盖了"用户中途插话"这一真实信号。
+    // 这里先用 last_inbound_at vs task.created_at 重算 context_changed，命中则
+    // 把 finalize_status 改写为 BlockedSafetyGuard + reason 改写，让 cancel_task
+    // / write_event 落库时显式标记 context_changed。
+    let context_changed_followup_hit = match &trigger {
+        AgentTrigger::FollowUp(task) => {
+            let last_inbound_ms = inbound_marker_for_context_check(&contact)
+                .map(|d| d.timestamp_millis());
+            let task_created_ms = task.created_at.timestamp_millis();
+            check_context_changed_followup_pure(last_inbound_ms, task_created_ms)
+        }
+        _ => false,
+    };
+    let context_changed_followup_reason: Option<&'static str> = if context_changed_followup_hit {
+        Some("用户在跟进任务后已有新消息（review 阶段被覆盖），取消旧跟进")
+    } else {
+        None
+    };
+
     // finalize 终态决定是否拦截发送：approved 路径继续走原有 send 逻辑；
     // 其它终态（held / blocked_*）一律 fail-closed（不发送、记录审计）。
     if !matches!(finalize_status, GatewayStatusFinal::Approved) {
-        let blocked_status = finalize_status.gateway_status_str();
+        let (blocked_status, cancel_reason) =
+            if let Some(reason) = context_changed_followup_reason {
+                // ISSUE-001 (R12)：context_changed 抢先覆盖 gateway_status；
+                // final_review_status 保持 finalize 计算值（10 项枚举内合法），
+                // 但通过 review.risks 追加 "follow_up_context_changed" 标签，
+                // 让审计 / observability 能看到这一 race 真实信号。
+                if !review
+                    .risks
+                    .iter()
+                    .any(|r| r == "follow_up_context_changed")
+                {
+                    review.risks.push("follow_up_context_changed".to_string());
+                }
+                ("context_changed".to_string(), reason)
+            } else {
+                (
+                    finalize_status.gateway_status_str(),
+                    "finalize_review_blocked",
+                )
+            };
         write_decision_review(
             state,
             &contact,
@@ -965,7 +1000,7 @@ async fn run_user_operation_gateway_inner(
         )
         .await?;
         if let Some(task_id) = task_id {
-            cancel_task(state, task_id, &blocked_status, "finalize_review_blocked").await?;
+            cancel_task(state, task_id, &blocked_status, cancel_reason).await?;
         }
         write_event_for_account(
             state,
@@ -973,7 +1008,7 @@ async fn run_user_operation_gateway_inner(
             Some(&contact.wxid),
             "blocked_review",
             &blocked_status,
-            "finalize_review_for_send 拦截：本次回复未发送",
+            cancel_reason,
             Some(review_event_details(&review)),
         )
         .await?;
@@ -993,6 +1028,8 @@ async fn run_user_operation_gateway_inner(
             FinalizeRunLogFields {
                 final_review_status: review.final_review_status.clone(),
                 autonomy_mode: final_decision.autonomy_mode.clone(),
+                conversation_mode: final_decision.conversation_mode.clone(),
+                conversation_mode_reason: final_decision.conversation_mode_reason.clone(),
                 revision_applied,
                 revision_reason: revision_reason.clone(),
                 pre_revision_summary: pre_revision_summary.clone(),
@@ -1058,6 +1095,8 @@ async fn run_user_operation_gateway_inner(
             FinalizeRunLogFields {
                 final_review_status: review.final_review_status.clone(),
                 autonomy_mode: final_decision.autonomy_mode.clone(),
+                conversation_mode: final_decision.conversation_mode.clone(),
+                conversation_mode_reason: final_decision.conversation_mode_reason.clone(),
                 revision_applied,
                 revision_reason: revision_reason.clone(),
                 pre_revision_summary: pre_revision_summary.clone(),
@@ -1164,6 +1203,8 @@ async fn run_user_operation_gateway_inner(
         FinalizeRunLogFields {
             final_review_status: review.final_review_status.clone(),
             autonomy_mode: final_decision.autonomy_mode.clone(),
+            conversation_mode: final_decision.conversation_mode.clone(),
+            conversation_mode_reason: final_decision.conversation_mode_reason.clone(),
             revision_applied,
             revision_reason: revision_reason.clone(),
             pre_revision_summary: pre_revision_summary.clone(),
@@ -1871,6 +1912,8 @@ async fn write_agent_run_log(
 struct FinalizeRunLogFields {
     final_review_status: String,
     autonomy_mode: String,
+    conversation_mode: String,
+    conversation_mode_reason: Option<String>,
     revision_applied: bool,
     revision_reason: String,
     pre_revision_summary: Option<String>,
@@ -1950,6 +1993,8 @@ async fn write_agent_run_log_with_finalize(
                 post_revision_summary: finalize_fields.post_revision_summary,
                 self_critique: finalize_fields.self_critique,
                 autonomy_mode: finalize_fields.autonomy_mode,
+                conversation_mode: finalize_fields.conversation_mode,
+                conversation_mode_reason: finalize_fields.conversation_mode_reason,
                 final_review_status: finalize_fields.final_review_status,
                 outbox_status: None,
                 memory_consolidator_warnings: Vec::new(),
@@ -2123,4 +2168,75 @@ pub async fn write_event_for_account(
         )
         .await?;
     Ok(())
+}
+
+/// ISSUE-001 (R12)：FollowUp 路径下"用户中途插话"判定纯函数。
+///
+/// 输入：`last_inbound_ms` = 联系人 last_inbound_at（缺失时 None），
+/// `task_created_ms` = AgentTask.created_at；
+/// 返回：true 表示在 task 创建后又有新 inbound，应当触发 context_changed。
+///
+/// 这是抢先在 review-held 短路前覆盖的判定逻辑，用于让 cancel_task /
+/// write_event 落库时显式标记 context_changed 而非 finalize_review_blocked。
+pub(crate) fn check_context_changed_followup_pure(
+    last_inbound_ms: Option<i64>,
+    task_created_ms: i64,
+) -> bool {
+    match last_inbound_ms {
+        Some(ms) => ms > task_created_ms,
+        None => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn context_changed_followup_pure_hits_when_inbound_after_task() {
+        let task_created_ms: i64 = 1_000_000;
+        let last_inbound_ms = Some(task_created_ms + 5_000);
+        assert!(check_context_changed_followup_pure(
+            last_inbound_ms,
+            task_created_ms
+        ));
+    }
+
+    #[test]
+    fn context_changed_followup_pure_passes_when_inbound_before_task() {
+        let task_created_ms: i64 = 1_000_000;
+        let last_inbound_ms = Some(task_created_ms - 1_000);
+        assert!(!check_context_changed_followup_pure(
+            last_inbound_ms,
+            task_created_ms
+        ));
+    }
+
+    #[test]
+    fn context_changed_followup_pure_passes_when_no_inbound() {
+        let task_created_ms: i64 = 1_000_000;
+        assert!(!check_context_changed_followup_pure(None, task_created_ms));
+    }
+
+    #[test]
+    fn context_changed_followup_pure_passes_on_exact_equality() {
+        let task_created_ms: i64 = 1_000_000;
+        let last_inbound_ms = Some(task_created_ms);
+        // 严格大于：等时刻不算 context_changed，避免对边界 race 过敏
+        assert!(!check_context_changed_followup_pure(
+            last_inbound_ms,
+            task_created_ms
+        ));
+    }
+
+    #[test]
+    fn context_changed_followup_pure_handles_negative_timestamps() {
+        // 防御性：极旧时间戳（migration 数据）应仍走 i64 比较语义
+        let task_created_ms: i64 = -1;
+        let last_inbound_ms = Some(0_i64);
+        assert!(check_context_changed_followup_pure(
+            last_inbound_ms,
+            task_created_ms
+        ));
+    }
 }

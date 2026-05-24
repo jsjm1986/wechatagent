@@ -4491,7 +4491,7 @@ button.aiPrimary:disabled {
   border-radius: var(--radius-sm);
   background: var(--surface);
   border: 1px solid var(--ai);
-  box-shadow: 0 6px 18px rgba(15, 23, 42, 0.06);
+  box-shadow: var(--shadow, 0 6px 18px rgba(15, 23, 42, 0.06));
 }
 
 .knowledgeChatDispatch__title {

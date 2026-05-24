@@ -705,5 +705,25 @@ async fn ensure_evolution_indexes(db: &Database) -> anyhow::Result<()> {
         )
         .await?;
 
+    // P1-9：knowledge_operator_memory.expires_at 上挂 TTL 索引（expireAfterSeconds=0）。
+    // MongoDB 后台进程会在 `expires_at < now()` 时把对应文档自动删除——长期跑下
+    // 来运营 memory 不会无界堆积；`expires_at == None` 的文档不会被 TTL 命中
+    // （MongoDB TTL 只清理 BSON Date 字段，缺失字段会被忽略）。
+    // 名字 `kop_memory_expires_ttl` 显式标记，避免与上面的 last_used_at 索引误并。
+    db.knowledge_operator_memory()
+        .create_index(
+            IndexModel::builder()
+                .keys(doc! { "expires_at": 1 })
+                .options(
+                    IndexOptions::builder()
+                        .name("kop_memory_expires_ttl".to_string())
+                        .expire_after(std::time::Duration::from_secs(0))
+                        .build(),
+                )
+                .build(),
+            None,
+        )
+        .await?;
+
     Ok(())
 }

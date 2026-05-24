@@ -16,7 +16,7 @@
 //!   claim 保证；
 //! - **每个 entry 事件 ≤ 20 条**：写 event 前查询计数，超过即 stop（防 retry
 //!   风暴写爆 events）；
-//! - **lease 自动续约不必要**：lease=60s 比 MCP 5s timeout 大 10x，正常路径
+//! - **lease 自动续约不必要**：lease=60s 大于 MCP 30s timeout，正常路径
 //!   一次 tick 内完成；超时 → 下一轮 reclaim 自动恢复。
 
 use std::time::Duration;
@@ -32,9 +32,14 @@ use super::outbox::{
     backoff_with_jitter_seeded, check_second_safety_gate_pure, write_outbox_event, OutboxStatus,
 };
 
-/// MCP 单次调用 timeout（R13 / N4）。lease (60s) 远大于此，确保 worker 出错
-/// 不会卡住 entry。
-const MCP_SEND_TIMEOUT_SECONDS: u64 = 5;
+/// MCP 单次调用 timeout。lease (60s) 远大于此，确保 worker 出错不会卡住 entry。
+///
+/// 历史值 5s 在远程 MCP（如 47.108.57.147 + 微信协议出栈）上经常不够：
+/// MCP 已经把消息发出去 → wechat 协议层回包慢于 5s → dispatcher timeout
+/// → 重试 → 同一句话被发第二次到客户。提到 30s 与 LLM revision 同档，匹配
+/// 真实链路 RTT；同时 `process_entry` 的 timeout 分支会先查 `mcp_call_logs`
+/// post-hoc 核对，命中已成功则直接标 sent 不重发。
+const MCP_SEND_TIMEOUT_SECONDS: u64 = 30;
 
 /// 二次安全门陈旧度阈值（R13.4：>30min 自动 canceled）。
 const STALE_THRESHOLD_MILLIS: i64 = 30 * 60 * 1000;
@@ -373,6 +378,42 @@ pub async fn schedule_retry_or_terminal(
     Ok(())
 }
 
+/// post-hoc 核对：在 dispatcher timeout 之后，去 `mcp_call_logs` 查 5min 内
+/// 是否已经存在 `tool_name=message_send_text` + 同 recipient + 同 content
+/// 且 `error=null` 的成功记录。命中说明 MCP 实际上已经把消息送出，只是回包
+/// 慢于 dispatcher 的 timeout，再发一次会让客户收到重复消息。
+///
+/// 时间下界用 `entry.created_at`（再向前回看 5 分钟做容差），避免历史相同
+/// 内容的消息误判命中。
+async fn mcp_already_succeeded(
+    state: &AppState,
+    account_id: &str,
+    contact_wxid: &str,
+    content: &str,
+    entry_created_at: DateTime,
+) -> AppResult<bool> {
+    let lower_bound_millis = entry_created_at
+        .timestamp_millis()
+        .saturating_sub(5 * 60 * 1000);
+    let lower_bound = DateTime::from_millis(lower_bound_millis);
+    let count = state
+        .db
+        .mcp_logs()
+        .count_documents(
+            doc! {
+                "account_id": account_id,
+                "tool_name": "message_send_text",
+                "request.recipient": contact_wxid,
+                "request.content": content,
+                "error": null,
+                "created_at": { "$gte": lower_bound },
+            },
+            None,
+        )
+        .await?;
+    Ok(count > 0)
+}
+
 /// 处理单条已抢占的 entry：二次安全门 → MCP 发送 → 状态推进。
 //
 // NOTE: 暴露为 `pub` 仅供 `tests/outbox_integration.rs`（W4 / Task 5.8 / R13.10）
@@ -480,7 +521,59 @@ pub async fn process_entry(state: &AppState, entry: &OutboxEntry) -> AppResult<(
             .await?;
         }
         Err(_) => {
-            schedule_retry_or_terminal(state, entry_id, entry, "send timeout (5s)").await?;
+            // post-hoc 核对：MCP 调用本身在 timeout 之前可能已经成功把消息送达
+            // 微信协议（response 慢于 30s 的极端情况），此时 mcp_call_logs 已写入
+            // tool_name=message_send_text + recipient=contact + content=entry.content
+            // 且 error=null。命中即视为已送达，不再重发，避免给客户重复消息。
+            if let Ok(true) = mcp_already_succeeded(
+                state,
+                &entry.account_id,
+                &entry.contact_wxid,
+                &entry.content,
+                entry.created_at,
+            )
+            .await
+            {
+                collection
+                    .update_one(
+                        doc! {
+                            "_id": entry_id,
+                            "status": OutboxStatus::InFlight.as_str(),
+                        },
+                        doc! {
+                            "$set": {
+                                "status": OutboxStatus::Sent.as_str(),
+                                "sent_at": now,
+                                "updated_at": now,
+                                "last_error": "send timeout (30s) but MCP already succeeded — confirmed via mcp_call_logs",
+                            },
+                            "$unset": {
+                                "worker_id": "",
+                                "locked_until": "",
+                            }
+                        },
+                        None,
+                    )
+                    .await?;
+                let _ = write_event_with_cap(
+                    state,
+                    entry_id,
+                    &entry.account_id,
+                    Some(&entry.contact_wxid),
+                    "outbox_sent_post_hoc",
+                    "warn",
+                    "outbox entry confirmed sent post-hoc via mcp_call_logs after timeout",
+                    Some(doc! {
+                        "outbox_id": entry_id,
+                        "run_id": &entry.run_id,
+                        "attempt": entry.attempt + 1,
+                    }),
+                )
+                .await;
+                update_run_log_outbox_status(state, &entry.run_id, "sent").await;
+            } else {
+                schedule_retry_or_terminal(state, entry_id, entry, "send timeout (30s)").await?;
+            }
         }
     }
     Ok(())
@@ -520,7 +613,7 @@ pub(crate) async fn write_event_with_cap(
 /// 路径的偏好，本 worker 用全局默认即可。
 const DEFAULT_POLL_INTERVAL_SECONDS: u64 = 5;
 
-/// 默认 lease 时长（秒）。> MCP timeout(5s) 远大于 1 个 tick 处理时长，
+/// 默认 lease 时长（秒）。> MCP timeout(30s) 远大于 1 个 tick 处理时长，
 /// 避免正常路径 lease 过期。
 const DEFAULT_LEASE_SECONDS: i32 = 60;
 
@@ -598,9 +691,9 @@ mod tests {
         assert_eq!(STALE_THRESHOLD_MILLIS, 30 * 60 * 1000);
     }
 
-    /// MCP send timeout = 5s 与设计一致。
+    /// MCP send timeout 与 LLM revision 30s 对齐。
     #[test]
-    fn mcp_send_timeout_is_five_seconds() {
-        assert_eq!(MCP_SEND_TIMEOUT_SECONDS, 5);
+    fn mcp_send_timeout_is_thirty_seconds() {
+        assert_eq!(MCP_SEND_TIMEOUT_SECONDS, 30);
     }
 }
