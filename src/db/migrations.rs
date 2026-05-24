@@ -67,10 +67,6 @@ pub const MIGRATIONS: &[Migration] = &[
         id: "2026_05_008_contact_commitments_reshape",
         run: |db| Box::pin(contact_commitments_reshape(db)),
     },
-    Migration {
-        id: "2026_05_009_contact_customer_stage_updated_at_backfill",
-        run: |db| Box::pin(contact_customer_stage_updated_at_backfill(db)),
-    },
     // ── agent-self-evolution M4 (W0 Task 1.5) ──
     Migration {
         id: "2026_05_M4_001_prompt_template_versioned",
@@ -83,6 +79,18 @@ pub const MIGRATIONS: &[Migration] = &[
     Migration {
         id: "2026_05_V3_001_contact_custom_instructions_and_knowledge_tags",
         run: |db| Box::pin(contact_custom_instructions_and_knowledge_tags(db)),
+    },
+    // ── knowledge-base cleanup（推倒销售话术 RAG 形态，全面切到 wiki 方法论）──
+    // 开发期数据无需兼容；生产环境守卫会阻断 drop 操作。
+    // 1) 清空旧三层集合的存量销售域数据（保留集合本身，索引由后续 commit 调整）
+    // 2) 清空 system_taxonomies 中的销售域 seed（customer_stage / intent_level / objection_type）
+    Migration {
+        id: "2026_05_25_drop_legacy_sales_collections",
+        run: |db| Box::pin(drop_legacy_sales_collections(db)),
+    },
+    Migration {
+        id: "2026_05_25_drop_legacy_taxonomy_seed",
+        run: |db| Box::pin(drop_legacy_taxonomy_seed(db)),
     },
 ];
 
@@ -781,42 +789,6 @@ async fn contact_commitments_reshape(db: &Database) -> AppResult<()> {
     Ok(())
 }
 
-/// 2026_05_009（M2 Strategic Planner）：用 `updated_at` 一次性回填
-/// `customer_stage_updated_at`，让 stage_stagnation 扫描器有"上次变化时间"参考。
-///
-/// 用 `updated_at` 是粗近似（contact 任何字段更新都会刷新它），但 stage_stagnation
-/// 默认 14 天阈值远大于多数文档的近度，零星老文档误差最多让 emit 慢一拍，没有反向风险。
-///
-/// 幂等：filter 要求 `customer_stage_updated_at` 不存在或 null，二次执行时不再命中。
-async fn contact_customer_stage_updated_at_backfill(db: &Database) -> AppResult<()> {
-    let pipeline: Vec<Document> = vec![doc! {
-        "$set": {
-            "customer_stage_updated_at": "$updated_at"
-        }
-    }];
-    let result = db
-        .contacts()
-        .update_many(
-            doc! {
-                "customer_stage": { "$exists": true, "$ne": null },
-                "$or": [
-                    { "customer_stage_updated_at": { "$exists": false } },
-                    { "customer_stage_updated_at": null }
-                ]
-            },
-            pipeline,
-            None,
-        )
-        .await?;
-    tracing::info!(
-        migration_id = "2026_05_009_contact_customer_stage_updated_at_backfill",
-        modified = result.modified_count,
-        matched = result.matched_count,
-        "backfilled contacts.customer_stage_updated_at from updated_at"
-    );
-    Ok(())
-}
-
 /// 2026_05_M4_001（agent-self-evolution / W0 Task 1.5）：把 `prompt_templates`
 /// 升级为多版本形态。给所有缺字段的旧文档填：
 ///   - `current_version`：同 `(workspace_id, prompt_key)` 下 `version` 最大且
@@ -981,6 +953,66 @@ async fn contact_custom_instructions_and_knowledge_tags(db: &Database) -> AppRes
             "backfilled knowledge tag fields"
         );
     }
+    Ok(())
+}
+
+/// knowledge-base cleanup（推倒销售话术 RAG 形态）：清空旧三层集合的存量数据。
+///
+/// 开发期数据无价值，无需兼容；本迁移仅清空文档，集合本身保留。
+/// 集合 `operation_knowledge_items` 在 commit 2 移除 typed accessor；这里同步 delete_many
+/// 让所有环境的存量销售域文档归零。
+///
+/// 生产环境守卫：`APP_ENV=production` 时直接报错阻断，避免误删。
+///
+/// 幂等：所有 delete_many 都是按 `{}` 全量删；二次执行 matched=0 即可。
+async fn drop_legacy_sales_collections(db: &Database) -> AppResult<()> {
+    if std::env::var("APP_ENV").unwrap_or_default() == "production" {
+        return Err(crate::error::AppError::External(
+            "禁止在 production 环境执行 cleanup migration: drop_legacy_sales_collections".into(),
+        ));
+    }
+    let raw = db.raw();
+    for name in [
+        "operation_knowledge_items",
+        "operation_knowledge_documents",
+        "operation_knowledge_chunks",
+    ] {
+        let coll = raw.collection::<Document>(name);
+        let result = coll.delete_many(doc! {}, None).await?;
+        tracing::info!(
+            migration_id = "2026_05_25_drop_legacy_sales_collections",
+            collection = name,
+            deleted = result.deleted_count,
+            "cleared legacy knowledge collection"
+        );
+    }
+    Ok(())
+}
+
+/// knowledge-base cleanup：清空 `system_taxonomies` 中的销售域三 kind seed
+/// （`customer_stage` / `intent_level` / `objection_type`），让用户在 admin 通过
+/// DomainSchema + 自定义 taxonomy 自配。
+///
+/// 集合本身保留，仅删销售域 seed。其它 kind（如 evolution-related）不受影响。
+/// 幂等：filter 命中即删，二次执行 matched=0。
+async fn drop_legacy_taxonomy_seed(db: &Database) -> AppResult<()> {
+    if std::env::var("APP_ENV").unwrap_or_default() == "production" {
+        return Err(crate::error::AppError::External(
+            "禁止在 production 环境执行 cleanup migration: drop_legacy_taxonomy_seed".into(),
+        ));
+    }
+    let result = db
+        .collection_system_taxonomies()
+        .delete_many(
+            doc! { "kind": { "$in": ["customer_stage", "intent_level", "objection_type"] } },
+            None,
+        )
+        .await?;
+    tracing::info!(
+        migration_id = "2026_05_25_drop_legacy_taxonomy_seed",
+        deleted = result.deleted_count,
+        "cleared legacy sales-domain taxonomy seeds"
+    );
     Ok(())
 }
 
