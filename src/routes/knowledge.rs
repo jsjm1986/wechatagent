@@ -4946,13 +4946,99 @@ pub(super) async fn digest_today(
         )
         .await?;
 
-    let Some(report) = found else {
-        return Err(AppError::NotFound(format!(
-            "今日（{report_date}）暂无日报，工作站尚未启用合成"
-        )));
+    let report = match found {
+        Some(r) => r,
+        None => {
+            // Phase 2：未命中时**同步合成**今日日报；失败则按 503 / 404 上抛。
+            // 避免运营反复刷新 → 命中 worker 还没醒的窗口期。
+            crate::knowledge_digest::generate_today_digest(&state).await?
+        }
     };
 
+    Ok(serialize_digest_report(&report))
+}
+
+/// `POST /api/knowledge/digest/regenerate`：强制重算今日日报。
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct DigestRegenerateRequest {
+    pub account_id: Option<String>,
+    #[serde(default)]
+    pub force: bool,
+}
+
+pub(super) async fn digest_regenerate(
+    State(state): State<AppState>,
+    Json(body): Json<DigestRegenerateRequest>,
+) -> AppResult<Json<Value>> {
+    let account_id = body
+        .account_id
+        .clone()
+        .unwrap_or_else(|| state.config.default_account_id.clone());
+    let report_date = chrono::Local::now().format("%Y-%m-%d").to_string();
+
+    if !body.force {
+        // 非强制路径：若今日日报已存在，直接返回，不重复调 LLM。
+        if let Some(existing) = state
+            .db
+            .knowledge_daily_reports()
+            .find_one(
+                doc! {
+                    "workspace_id": &state.config.default_workspace_id,
+                    "account_id": &account_id,
+                    "report_date": &report_date,
+                },
+                None,
+            )
+            .await?
+        {
+            return Ok(serialize_digest_report(&existing));
+        }
+    }
+    let report = crate::knowledge_digest::generate_today_digest(&state).await?;
+    Ok(serialize_digest_report(&report))
+}
+
+/// `POST /api/knowledge/digest/cards/:id/dismiss`：把卡片标记为已忽略，画布灰显。
+pub(super) async fn digest_dismiss_card(
+    State(state): State<AppState>,
+    Path(card_id_hex): Path<String>,
+) -> AppResult<Json<Value>> {
+    let card_id = ObjectId::parse_str(&card_id_hex)
+        .map_err(|_| AppError::BadRequest(format!("invalid card_id: {card_id_hex}")))?;
+    let report_date = chrono::Local::now().format("%Y-%m-%d").to_string();
+
+    let result = state
+        .db
+        .knowledge_daily_reports()
+        .update_one(
+            doc! {
+                "workspace_id": &state.config.default_workspace_id,
+                "report_date": &report_date,
+                "cards.cardId": &card_id,
+            },
+            doc! {
+                "$addToSet": { "dismissed_card_ids": &card_id }
+            },
+            None,
+        )
+        .await?;
+
+    if result.matched_count == 0 {
+        return Err(AppError::NotFound(format!(
+            "未找到包含 cardId={} 的今日日报",
+            card_id_hex
+        )));
+    }
     Ok(Json(json!({
+        "ok": true,
+        "cardId": card_id_hex,
+        "reportDate": report_date,
+    })))
+}
+
+fn serialize_digest_report(report: &crate::models::KnowledgeDailyReport) -> Json<Value> {
+    Json(json!({
         "reportId": report.id.map(|id| id.to_hex()),
         "workspaceId": report.workspace_id,
         "accountId": report.account_id,
@@ -4969,7 +5055,7 @@ pub(super) async fn digest_today(
             .map(|id| id.to_hex())
             .collect::<Vec<_>>(),
         "promptVersions": serde_json::to_value(&report.prompt_versions).unwrap_or(json!({})),
-    })))
+    }))
 }
 
 #[cfg(test)]
