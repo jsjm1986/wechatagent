@@ -75,8 +75,10 @@ use evolution::{
 use guides::{apply_user_operation_guide, preview_user_operation_guide};
 use health::health;
 use knowledge::{
-    answer_chunk_repair, auto_verify_operation_knowledge_chunks, chat_apply, chat_discard,
-    chat_history, chat_turn, create_operation_knowledge,
+    analyze_operation_knowledge_logs, answer_chunk_repair, auto_verify_operation_knowledge_chunks,
+    chat_apply, chat_discard,
+    chat_history, chat_session_stream, chat_task_cancel, chat_task_create, chat_task_get,
+    chat_turn, create_operation_knowledge,
     create_operation_knowledge_chunk, create_operation_knowledge_document,
     delete_operation_knowledge, delete_operation_knowledge_chunk,
     delete_operation_knowledge_document, digest_dismiss_card, digest_regenerate, digest_today,
@@ -125,6 +127,10 @@ pub struct AppState {
     /// LRU cache key，让 release/seed/rollback 任一动作 atomic 触发缓存失效，
     /// 不需要重启进程。
     pub prompt_pack_version: Arc<std::sync::atomic::AtomicU64>,
+    /// knowledge-digest-workstation Phase 4：chat 进度总线。
+    /// 由 `KnowledgeTaskWorker` 写 turn 后 `bump` 通知；
+    /// `chat_session_stream` SSE handler 订阅 watch::Receiver 推送 turn id。
+    pub chat_progress_bus: Arc<crate::knowledge_task::ChatProgressBus>,
 }
 
 pub fn api_router(state: AppState) -> Router<AppState> {
@@ -287,6 +293,10 @@ pub fn api_router(state: AppState) -> Router<AppState> {
         )
         .route("/operation-knowledge/usage", get(list_knowledge_usage))
         .route(
+            "/operation-knowledge/logs/analyze",
+            get(analyze_operation_knowledge_logs),
+        )
+        .route(
             "/operation-knowledge/items/:id/repair",
             post(propose_pack_repair),
         )
@@ -312,6 +322,19 @@ pub fn api_router(state: AppState) -> Router<AppState> {
         .route(
             "/knowledge/digest/cards/:id/dismiss",
             post(digest_dismiss_card),
+        )
+        .route("/knowledge/chat/tasks", post(chat_task_create))
+        .route(
+            "/knowledge/chat/tasks/:id",
+            get(chat_task_get),
+        )
+        .route(
+            "/knowledge/chat/tasks/:id/cancel",
+            post(chat_task_cancel),
+        )
+        .route(
+            "/knowledge/chat/sessions/:sid/stream",
+            get(chat_session_stream),
         )
         .route(
             "/operation-knowledge/:id",

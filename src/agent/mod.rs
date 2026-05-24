@@ -24,6 +24,7 @@
 //! 既能避免循环依赖，也能让 LLM 调用计费/缓存/日志的所有逻辑位于一处。
 
 mod budget;
+mod chat_tool_loop;
 mod decision;
 mod gateway;
 mod guards;
@@ -62,6 +63,7 @@ pub use gateway::{
     write_event_for_account,
 };
 pub use knowledge_router::test_knowledge_route_for_contact;
+pub use knowledge_router::compute_keyword_fastpath_hits;
 pub use memory::{consolidate_contact_memory, handle_memory_consolidation_task};
 pub use outbox_dispatcher::run_outbox_dispatcher;
 
@@ -85,6 +87,22 @@ pub use types::{
 
 // 跨模块仍需访问的内部辅助（routes::shared 用 memory_card 相关函数）。
 pub(crate) use memory::{effective_memory_card_for_contact, memory_card_has_signal};
+// knowledge-digest-workstation Phase 5：知识库 chat 用的运营长期偏好记忆
+// 读写入口；与 contact memory_card 物理隔离。
+pub(crate) use memory::{load_operator_memory, record_operator_memory};
+
+// knowledge-digest-workstation Phase 5：chat 多轮工具循环 + 7 个 chat 工具
+// 派发器（含 4 个 chat-only async tool）。仅供 routes::knowledge 内部使用，
+// 永不进 user-ops gateway。
+pub(crate) use chat_tool_loop::{
+    chat_reply_with_tools_loop, ChatReplyFn, ChatReplyResult, ChatToolLoopError,
+    ChatToolLoopOutcome, CHAT_TOOL_LOOP_MAX_LOOPS,
+};
+pub(crate) use knowledge_tools::{
+    AnchorMatchFn, ALLOWED_CHAT_TOOL_NAMES, TOOL_ANALYZE_LOGS, TOOL_AUDIT_COMPLETENESS,
+    TOOL_INSPECT_PACK, TOOL_LIST_CATALOG, TOOL_OPEN_DOCUMENT, TOOL_OPEN_SLICE,
+    TOOL_PROPOSE_REPAIR, TOOL_SEARCH, TOOL_SEARCH_CHUNKS, TOOL_VERIFY_ANCHOR,
+};
 
 // Task 24：测试可用的 PBT 入口（pure functions，无副作用）。
 pub use guards::{check_state_transition, compute_taxonomy_resolutions, scan_product_claim_marker_labels};
@@ -588,6 +606,7 @@ mod tests {
             last_inbound_at: None,
             last_outbound_at: None,
             last_agent_run_at: None,
+            custom_agent_instructions: None,
             created_at: DateTime::now(),
             updated_at: DateTime::now(),
         }

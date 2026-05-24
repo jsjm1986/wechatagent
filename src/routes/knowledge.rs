@@ -1575,6 +1575,107 @@ pub(super) async fn list_knowledge_usage(
     Ok(Json(json!({ "items": items })))
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct AnalyzeLogsQuery {
+    account_id: Option<String>,
+    /// 回看窗口（小时），缺省 24，硬上限 72。
+    hours: Option<i64>,
+    /// 仅统计被拦截 / 暂缓的 run，缺省 true。
+    only_blocked_or_held: Option<bool>,
+}
+
+/// `GET /api/operation-knowledge/logs/analyze`
+///
+/// 只读：按窗口聚合 `knowledge_usage_logs`，输出 `{window_hours, total_runs,
+/// blocked_or_held_runs, top_chunks, items}`。语义与 chat tool
+/// `knowledge.analyze_logs` 完全一致，前端 / 运营审查时直接 HTTP 取，不用走
+/// LLM。
+pub(super) async fn analyze_operation_knowledge_logs(
+    State(state): State<AppState>,
+    Query(query): Query<AnalyzeLogsQuery>,
+) -> AppResult<Json<Value>> {
+    let workspace_id = state.config.default_workspace_id.clone();
+    let hours = query.hours.filter(|v| *v > 0).unwrap_or(24).min(72);
+    let only_blocked = query.only_blocked_or_held.unwrap_or(true);
+    let cutoff = chrono::Utc::now() - chrono::Duration::hours(hours);
+    let cutoff_bson = DateTime::from_millis(cutoff.timestamp_millis());
+
+    let mut filter = doc! {
+        "workspace_id": &workspace_id,
+        "created_at": { "$gte": cutoff_bson },
+    };
+    if let Some(account_id) = query
+        .account_id
+        .as_deref()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+    {
+        filter.insert("account_id", account_id);
+    }
+    if only_blocked {
+        filter.insert(
+            "$or",
+            Bson::Array(vec![
+                Bson::Document(doc! { "review_approved": false }),
+                Bson::Document(doc! {
+                    "blocked_reason": { "$exists": true, "$ne": Bson::Null },
+                }),
+            ]),
+        );
+    }
+
+    let mut cursor = state
+        .db
+        .knowledge_usage_logs()
+        .find(
+            filter,
+            FindOptions::builder()
+                .sort(doc! { "created_at": -1_i32 })
+                .limit(50)
+                .build(),
+        )
+        .await?;
+
+    let mut chunk_freq: std::collections::HashMap<String, i32> = std::collections::HashMap::new();
+    let mut items: Vec<Value> = Vec::new();
+    let mut blocked: i32 = 0;
+    while let Some(log) = cursor.try_next().await? {
+        if log.blocked_reason.is_some() || !log.review_approved {
+            blocked += 1;
+        }
+        for kid in &log.knowledge_ids {
+            *chunk_freq.entry(kid.to_hex()).or_insert(0) += 1;
+        }
+        items.push(json!({
+            "runId": log.run_id,
+            "accountId": log.account_id,
+            "blockedReason": log.blocked_reason,
+            "reviewApproved": log.review_approved,
+            "knowledgeIds": log.knowledge_ids.iter().map(|o| o.to_hex()).collect::<Vec<_>>(),
+            "createdAt": crate::models::dt_to_string(log.created_at),
+        }));
+    }
+
+    let total_runs = items.len() as i32;
+    let mut top_chunks: Vec<(String, i32)> = chunk_freq.into_iter().collect();
+    top_chunks.sort_by(|a, b| b.1.cmp(&a.1));
+    let top_chunks_json: Vec<Value> = top_chunks
+        .into_iter()
+        .take(8)
+        .map(|(id, count)| json!({ "chunkId": id, "hitCount": count }))
+        .collect();
+
+    Ok(Json(json!({
+        "windowHours": hours,
+        "onlyBlockedOrHeld": only_blocked,
+        "totalRuns": total_runs,
+        "blockedOrHeldRuns": blocked,
+        "topChunks": top_chunks_json,
+        "items": items,
+    })))
+}
+
 pub(super) fn operation_knowledge_json(item: OperationKnowledgeItem) -> Value {
     json!({
         "id": item.id.map(|id| id.to_hex()).unwrap_or_default(),
@@ -3674,6 +3775,9 @@ pub(super) struct ChatTurnRequest {
     /// 缺省则后端 new uuid 当 sessionId。
     pub session_id: Option<String>,
     pub account_id: Option<String>,
+    /// knowledge-digest-workstation Phase 5：运营 ID（用于隔离 operator memory）。
+    /// 缺省回退到 `default`，与 chat_task_create 字段对齐。
+    pub operator_id: Option<String>,
     pub content: String,
     /// 引用的切片 / 知识包；本轮只取第 1 条（≤ 1 attachments）。
     #[serde(default)]
@@ -3701,6 +3805,13 @@ pub(super) async fn chat_turn(
         .account_id
         .clone()
         .unwrap_or_else(|| state.config.default_account_id.clone());
+    let operator_id = body
+        .operator_id
+        .as_deref()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| "default".to_string());
 
     // 加载历史 turns（按 turn_index 升序）
     let history = load_chat_history(&state, &account_id, &session_id).await?;
@@ -3756,6 +3867,7 @@ pub(super) async fn chat_turn(
             run_chat_turn_pipeline(
                 &state,
                 &account_id,
+                &operator_id,
                 &session_id,
                 trimmed,
                 chunk_attached,
@@ -4250,12 +4362,27 @@ fn chat_turn_to_view(turn: &KnowledgeChatTurn) -> Value {
 async fn run_chat_turn_pipeline(
     state: &AppState,
     account_id: &str,
+    operator_id: &str,
     session_id: &str,
     user_content: &str,
     chunk_attached: Option<&str>,
     item_attached: Option<&str>,
     history: &[KnowledgeChatTurn],
 ) -> AppResult<Value> {
+    // knowledge-digest-workstation Phase 5：先取运营长期偏好记忆，作为
+    // intent 分类与下游分支的 prompt header。与 contacts.memory_card 物理
+    // 隔离（仅触达 knowledge_operator_memory collection）。
+    let operator_memory = agent::load_operator_memory(
+        &state.db,
+        &state.config.default_workspace_id,
+        account_id,
+        operator_id,
+        5,
+    )
+    .await
+    .unwrap_or_default();
+    let operator_memory_header = render_operator_memory_for_prompt(&operator_memory);
+
     // 1. intent 分类
     let intent_result = classify_intent(
         state,
@@ -4265,6 +4392,7 @@ async fn run_chat_turn_pipeline(
         chunk_attached,
         item_attached,
         history,
+        &operator_memory_header,
     )
     .await?;
     let intent = intent_result
@@ -4350,6 +4478,19 @@ async fn run_chat_turn_pipeline(
             v["promptKey"] = json!("knowledge.digest.dispatch");
             v
         }
+        "update_operator_memory" => {
+            let mut v = update_operator_memory_for_chat(
+                state,
+                account_id,
+                operator_id,
+                user_content,
+                &intent_result,
+            )
+            .await?;
+            v["draftKind"] = json!("operator_memory");
+            v["promptKey"] = json!("knowledge.chat.intent");
+            v
+        }
         _ => clarify_for_chat(state, account_id, session_id, user_content, history)
             .await
             .map(|mut v| {
@@ -4384,6 +4525,367 @@ fn render_chat_history_for_prompt(history: &[KnowledgeChatTurn]) -> String {
     s
 }
 
+/// knowledge-digest-workstation Phase 5：把 KnowledgeOperatorMemory 渲染成
+/// system prompt header（≤ 5 条），帮 intent 分类与下游分支保持运营长期偏好。
+/// 与 contacts.memory_card 物理隔离，prompt header 也分开命名为「运营长期偏好」。
+fn render_operator_memory_for_prompt(
+    memories: &[crate::models::KnowledgeOperatorMemory],
+) -> String {
+    if memories.is_empty() {
+        return String::new();
+    }
+    let mut s = String::from("【运营长期偏好（仅作上下文，不要写回 chunk patch）】\n");
+    for m in memories.iter().take(5) {
+        let kind_label = match m.kind.as_str() {
+            "preference" => "偏好",
+            "rejection" => "红线",
+            "context" => "背景",
+            other => other,
+        };
+        s.push_str(&format!(
+            "- {kind_label}：{}\n",
+            truncate_for_prompt(&m.content, 120)
+        ));
+    }
+    s
+}
+
+// ===========================================================================
+// 知识库 chat agent 的多轮工具循环（knowledge-digest-workstation Phase 5 / P5.2）
+// ---------------------------------------------------------------------------
+//
+// 设计目标：让 chat 三大下游 prompt（draft_chunk / update_chunk / clarify）走真
+// 正的 agent tool loop —— Reply Agent 可以多轮自主调用 knowledge.* 工具去观察
+// 整个知识库（catalog / search / open_slice / audit_completeness / search_chunks /
+// propose_repair / analyze_logs / open_document / inspect_pack / verify_anchor）
+// 再决定最终输出。
+//
+// 强约束（与 user-ops tool_loop 保持同构）：
+// - 单 turn ≤ CHAT_TOOL_LOOP_MAX_LOOPS=4 轮；
+// - 单轮 toolCalls ≤ 6；
+// - 单 dispatch 5s timeout；
+// - 失败连击 ≥3 强制结束；
+// - 总耗时 30s 硬超时；
+// - tool_call_budget 超额按 budget_exceeded 强制结束；
+// - 永不写库、永不进 outbox、永不进 mcp（与 user-ops gateway 物理隔离）；
+// - AI 永不自动 verify：chat 落库由 chat_apply 强制 status=draft + needs_review。
+// ===========================================================================
+
+/// 把基础 system prompt 增广上 tool-calling 协议头：
+/// - 解释 decisionPhase 取值（tool_calling / final）；
+/// - 列出可用 tool 白名单；
+/// - 限制 toolCalls 数量与 final 字段约束。
+///
+/// 注意：本函数只追加协议提示，不删除/改写原 prompt 内容。
+fn augment_chat_system_with_tools(base: &str) -> String {
+    let tool_list = agent::ALLOWED_CHAT_TOOL_NAMES.join(" / ");
+    format!(
+        r#"{base}
+
+【tool-calling 协议（chat agent 必须遵守）】
+- 输出 JSON 必须包含 `decisionPhase`，取值仅限 `tool_calling` / `final`。
+- 当你需要观察知识库当前状态时，输出 `decisionPhase=tool_calling` + `toolCalls` 数组（≤ 6 个），可用工具：
+  {tool_list}
+  工具的入参字段名遵循 camelCase（如 chunkId / documentId / itemId / sourceQuote / topK / onlyVerified / hours）。
+- `tool_calling` 中间轮 **不要** 输出 `naturalReply / patch / missingFields / followupQuestions`；这些字段只在 `final` 轮给。
+- 当不再需要更多工具结果、可以给运营回复时，输出 `decisionPhase=final` + 业务字段（naturalReply / patch? / missingFields? / followupQuestions?）；不要再带 toolCalls。
+- 单 turn 最多 4 轮工具循环、6 次 LLM call；超过会被 budget 截断。
+- 每轮工具结果会以 `[system tool result]` 段附加到 user prompt 末尾，下一轮直接读。
+- 不要伪造工具结果；只能使用实际返回的内容。
+"#
+    )
+}
+
+/// 单次 chat tool-calling 循环的入口。
+///
+/// 行为：
+/// 1. 拉取本 workspace 的 [`agent::types::KnowledgeRuntime`] 快照（document/item/chunk）；
+/// 2. 用当前 [`agent::RUN_BUDGET`] 当作循环 budget；
+/// 3. 构造 reply_fn 闭包：调 `agent::generate_agent_json`（注入累计的
+///    `[system tool result]`）→ 用 `RawAgentDecision::validate_and_promote` 反序列化；
+/// 4. 调 [`agent::chat_reply_with_tools_loop`]；
+/// 5. 在 final 轮把最近一次 LLM 原始 JSON（含 patch / missingFields / followupQuestions /
+///    naturalReply 等业务字段）返回给 caller。
+///
+/// 返回的 Value 形态与原先直接 `generate_agent_json` 输出一致，下游
+/// `run_chat_turn_pipeline` / `chat_turn` handler 不需要任何改造。
+async fn run_chat_with_tools(
+    state: &AppState,
+    account_id: &str,
+    session_id: &str,
+    run_key: &str,
+    prompt_key: &str,
+    system: String,
+    user: String,
+) -> AppResult<Value> {
+    use std::pin::Pin;
+    use std::sync::Mutex as StdMutex;
+
+    use agent::types::{KnowledgeRuntime, RawAgentDecision};
+    use agent::{
+        chat_reply_with_tools_loop, ChatReplyFn, ChatToolLoopError, RunBudget,
+        UserRuntimeParameters,
+    };
+
+    // 拉 KnowledgeRuntime 快照：documents / items / verified chunks。
+    // 与 user-ops `load_operation_knowledge` 的形态对齐，但简化为按 workspace
+    // 全量取（chat 不绑定到具体 contact，没有 account_filter）。limit 与 user-ops
+    // 一致，避免 KnowledgeRuntime 跨 chunk 数量发散。
+    let workspace_id = state.config.default_workspace_id.clone();
+    let documents: Vec<OperationKnowledgeDocument> = state
+        .db
+        .operation_knowledge_documents()
+        .find(
+            doc! { "workspace_id": &workspace_id, "domain": "user_operations", "status": "active" },
+            FindOptions::builder()
+                .sort(doc! { "updated_at": -1_i32 })
+                .limit(80)
+                .build(),
+        )
+        .await?
+        .try_collect()
+        .await?;
+    let items: Vec<OperationKnowledgeItem> = state
+        .db
+        .operation_knowledge_items()
+        .find(
+            doc! { "workspace_id": &workspace_id, "domain": "user_operations", "status": "active" },
+            FindOptions::builder()
+                .sort(doc! { "priority": -1_i32, "updated_at": -1_i32 })
+                .limit(80)
+                .build(),
+        )
+        .await?
+        .try_collect()
+        .await?;
+    let chunks: Vec<OperationKnowledgeChunk> = state
+        .db
+        .operation_knowledge_chunks()
+        .find(
+            doc! {
+                "workspace_id": &workspace_id,
+                "domain": "user_operations",
+                "status": "active",
+                "integrity_status": "verified",
+            },
+            FindOptions::builder()
+                .sort(doc! { "priority": -1_i32, "updated_at": -1_i32 })
+                .limit(200)
+                .build(),
+        )
+        .await?
+        .try_collect()
+        .await?;
+    let knowledge = KnowledgeRuntime {
+        documents,
+        items,
+        chunks,
+    };
+    let runtime = UserRuntimeParameters::default();
+
+    // 取当前 RUN_BUDGET（chat_turn handler 已经 scope 进来了）；
+    // 若拿不到——属于不应发生的情况——回退到一个本地 budget（让 loop 仍能跑）。
+    let budget = agent::current_run_budget().unwrap_or_else(|| {
+        Arc::new(RunBudget::new(
+            format!("chat-fallback-{session_id}-{run_key}"),
+            CHAT_TOKEN_BUDGET_PER_TURN,
+            CHAT_MAX_LLM_CALLS_PER_TURN,
+            i32::MAX,
+        ))
+    });
+
+    // 用 Arc<StdMutex<Option<Value>>> 把每轮 LLM 原始 JSON 透传出来。chat
+    // 路径在 `final` 轮需要 patch / missingFields / followupQuestions /
+    // naturalReply 等字段，AgentDecision 不直接覆盖这些；最简单是把原始
+    // Value 暂存，在循环结束后取出。
+    let last_raw: Arc<StdMutex<Option<Value>>> = Arc::new(StdMutex::new(None));
+
+    // reply_fn 闭包：每轮被 chat_reply_with_tools_loop 调用。
+    let state_arc = Arc::new(state.clone());
+    let account_id_owned = account_id.to_string();
+    let session_id_owned = session_id.to_string();
+    let run_key_owned = run_key.to_string();
+    let prompt_key_owned = prompt_key.to_string();
+    let system_owned = system;
+    let user_owned = user;
+    let last_raw_for_fn = Arc::clone(&last_raw);
+    let runtime_for_fn = runtime.clone();
+
+    let reply_fn: ChatReplyFn<'_> = Box::new(move |tool_results: &str, loop_count: i32| {
+        let state_arc = Arc::clone(&state_arc);
+        let account_id_owned = account_id_owned.clone();
+        let session_id_owned = session_id_owned.clone();
+        let run_key_owned = run_key_owned.clone();
+        let prompt_key_owned = prompt_key_owned.clone();
+        let system_owned = system_owned.clone();
+        let user_owned = user_owned.clone();
+        let tool_results_owned = tool_results.to_string();
+        let last_raw = Arc::clone(&last_raw_for_fn);
+        let runtime_for_fn = runtime_for_fn.clone();
+        let fut: Pin<Box<dyn std::future::Future<Output = _> + Send>> = Box::pin(async move {
+            // 把累计的 [system tool result] 注入 user prompt 末尾。
+            let user_with_tools = if tool_results_owned.is_empty() {
+                user_owned.clone()
+            } else {
+                format!("{user_owned}\n\n[system tool result]{tool_results_owned}")
+            };
+            let run_id = format!(
+                "chat-{session_id_owned}-{run_key_owned}-loop-{loop_count}"
+            );
+            let value = agent::generate_agent_json(
+                &state_arc,
+                Some(&account_id_owned),
+                None,
+                Some(&run_id),
+                &prompt_key_owned,
+                &system_owned,
+                &user_with_tools,
+            )
+            .await?;
+            // 把原始 JSON 暂存：循环结束后从 last_raw 取出来当 final payload。
+            if let Ok(mut guard) = last_raw.lock() {
+                *guard = Some(value.clone());
+            }
+            // 反序列化为 RawAgentDecision，再 promote 到 AgentDecision。
+            let raw: RawAgentDecision =
+                serde_json::from_value(value).map_err(AppError::from)?;
+            let (decision, promote_risks) = raw.validate_and_promote(&runtime_for_fn);
+            Ok((decision, promote_risks))
+        });
+        fut
+    });
+
+    // 跑循环。任意 dispatch 错误以 Value 形态注入下一轮，循环只在 budget /
+    // failure_streak / total_timeout 三种情况下提前结束。
+    let outcome = chat_reply_with_tools_loop(
+        &runtime,
+        &knowledge,
+        &state.db,
+        &workspace_id,
+        budget,
+        Some(source_anchor_for_quote_ffi as agent::AnchorMatchFn),
+        reply_fn,
+    )
+    .await;
+    let final_value = match outcome {
+        Ok(_outcome) => {
+            // 取最后一轮 LLM 原始 JSON 作为 final payload。
+            // 若 last_raw 为空（reply_fn 一次都没调用成功），用 empty object 兜底。
+            last_raw
+                .lock()
+                .ok()
+                .and_then(|g| g.clone())
+                .unwrap_or_else(|| {
+                    json!({
+                        "decisionPhase": "final",
+                        "naturalReply": "（AI 未给出回复）",
+                    })
+                })
+        }
+        Err(ChatToolLoopError::Timeout { elapsed_ms, .. }) => {
+            // 超时——返回温和 final，让上层 handler 仍能写 turn 与 event。
+            json!({
+                "decisionPhase": "final",
+                "naturalReply": format!("（AI 工具循环超时 elapsed_ms={elapsed_ms}，请稍后再试或换个说法）"),
+            })
+        }
+        Err(ChatToolLoopError::Reply(err)) => return Err(err),
+    };
+    Ok(final_value)
+}
+
+/// `verify_anchor` 工具的 source_quote→anchor 模糊匹配实现适配器。
+/// 把 `source_anchor_for_quote(raw_content, document_id, source_quote)` 中
+/// 的 `Option<ObjectId>` 参数转为 `Option<String>`（hex），让其符合
+/// [`agent::AnchorMatchFn`] 的纯函数签名（避免 knowledge_tools.rs 直接依赖
+/// mongodb::bson::oid::ObjectId 与 routes 模块）。
+fn source_anchor_for_quote_ffi(
+    raw_content: &str,
+    document_id_hex: Option<String>,
+    source_quote: &str,
+) -> Option<Document> {
+    let oid = document_id_hex
+        .as_deref()
+        .and_then(|h| ObjectId::parse_str(h).ok());
+    source_anchor_for_quote(raw_content, oid, source_quote)
+}
+
+/// knowledge-digest-workstation Phase 5：intent=update_operator_memory 分支。
+///
+/// 落库 KnowledgeOperatorMemory 一条；返回的 Value 满足 chat_turn handler 对
+/// `naturalReply / missingFields / followupQuestions` 的约定，但不出 patch
+/// （AI 偏好/红线不进 chunk）。
+async fn update_operator_memory_for_chat(
+    state: &AppState,
+    account_id: &str,
+    operator_id: &str,
+    user_content: &str,
+    intent_result: &Value,
+) -> AppResult<Value> {
+    let kind = intent_result
+        .get("memoryKind")
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .unwrap_or("preference");
+    let content = intent_result
+        .get("memoryContent")
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| user_content.trim().to_string());
+    if !["preference", "rejection", "context"].contains(&kind) {
+        return Ok(json!({
+            "naturalReply": "AI 没法判定您要立的是偏好还是红线，能再说得具体一点吗？",
+            "missingFields": ["memoryKind"],
+            "followupQuestions": [{
+                "id": "q1",
+                "field": "memoryKind",
+                "question": "请明确：是偏好（preference）/ 红线（rejection）/ 背景（context）？",
+            }],
+        }));
+    }
+    let mem = agent::record_operator_memory(
+        &state.db,
+        &state.config.default_workspace_id,
+        account_id,
+        operator_id,
+        kind,
+        &content,
+    )
+    .await?;
+    let kind_label = match kind {
+        "preference" => "偏好",
+        "rejection" => "红线",
+        "context" => "背景",
+        other => other,
+    };
+    let summary = format!("已记下您的{kind_label}：{}", truncate_for_prompt(&content, 80));
+    record_repair_event(
+        state,
+        account_id,
+        "knowledge_operator_memory_added",
+        summary.clone(),
+        doc! {
+            "kind": "operator_memory",
+            "memoryKind": kind,
+            "operatorId": operator_id,
+            "memoryId": mem.id.map(|o| o.to_hex()).unwrap_or_default(),
+        },
+    )
+    .await;
+    Ok(json!({
+        "naturalReply": format!("{summary}。AI 会在下次起草时遵守这条偏好；如需撤销请直接告诉我。"),
+        "missingFields": Vec::<String>::new(),
+        "followupQuestions": Vec::<Value>::new(),
+        "operatorMemory": {
+            "id": mem.id.map(|o| o.to_hex()),
+            "kind": mem.kind,
+            "content": mem.content,
+        }
+    }))
+}
+
 async fn classify_intent(
     state: &AppState,
     account_id: &str,
@@ -4392,16 +4894,22 @@ async fn classify_intent(
     chunk_attached: Option<&str>,
     item_attached: Option<&str>,
     history: &[KnowledgeChatTurn],
+    operator_memory_header: &str,
 ) -> AppResult<Value> {
-    let system = prompts::load_prompt(
+    let system_base = prompts::load_prompt(
         &state.db,
         &state.config.default_workspace_id,
         "knowledge.chat.intent",
     )
     .await
     .unwrap_or_else(|_| {
-        "你是知识库对话 Agent，仅识别意图。只输出 JSON: {intent, confidence, targetChunkId?, targetPackId?, userIntentSummary}.".to_string()
+        "你是知识库对话 Agent，仅识别意图。只输出 JSON: {intent, confidence, targetChunkId?, targetPackId?, memoryKind?, memoryContent?, userIntentSummary}.".to_string()
     });
+    let system = if operator_memory_header.is_empty() {
+        system_base
+    } else {
+        format!("{system_base}\n\n{operator_memory_header}")
+    };
     let user = format!(
         r#"运营本轮输入：
 {user_content}
@@ -4412,7 +4920,7 @@ async fn classify_intent(
 最近历史（最多 6 条）：
 {}
 
-请输出 JSON，intent 必须在 [create_chunk, update_chunk, clarify_chunk, update_pack, freeform] 中。"#,
+请输出 JSON，intent 必须在 [create_chunk, update_chunk, clarify_chunk, update_pack, digest_action, update_operator_memory, freeform] 中。"#,
         chunk_attached.unwrap_or("(无)"),
         item_attached.unwrap_or("(无)"),
         render_chat_history_for_prompt(history),
@@ -4512,15 +5020,15 @@ async fn draft_chunk_for_chat(
         serde_json::to_string_pretty(&pack_payload).unwrap_or_default(),
         render_chat_history_for_prompt(history),
     );
-    let run_id = format!("chat-{session_id}-draft");
-    agent::generate_agent_json(
+    let augmented_system = augment_chat_system_with_tools(&system);
+    run_chat_with_tools(
         state,
-        Some(account_id),
-        None,
-        Some(&run_id),
+        account_id,
+        session_id,
+        "draft",
         "knowledge.chat.draft_chunk",
-        &system,
-        &user,
+        augmented_system,
+        user,
     )
     .await
 }
@@ -4596,15 +5104,15 @@ async fn update_chunk_for_chat(
         serde_json::to_string_pretty(&document_payload).unwrap_or_default(),
         render_chat_history_for_prompt(history),
     );
-    let run_id = format!("chat-{session_id}-update");
-    agent::generate_agent_json(
+    let augmented_system = augment_chat_system_with_tools(&system);
+    run_chat_with_tools(
         state,
-        Some(account_id),
-        None,
-        Some(&run_id),
+        account_id,
+        session_id,
+        "update",
         "knowledge.chat.update_chunk",
-        &system,
-        &user,
+        augmented_system,
+        user,
     )
     .await
 }
@@ -4708,15 +5216,15 @@ async fn clarify_for_chat(
 请按 system 中 schema 输出 JSON。"#,
         render_chat_history_for_prompt(history),
     );
-    let run_id = format!("chat-{session_id}-clarify");
-    agent::generate_agent_json(
+    let augmented_system = augment_chat_system_with_tools(&system);
+    run_chat_with_tools(
         state,
-        Some(account_id),
-        None,
-        Some(&run_id),
+        account_id,
+        session_id,
+        "clarify",
         "knowledge.chat.clarify",
-        &system,
-        &user,
+        augmented_system,
+        user,
     )
     .await
 }

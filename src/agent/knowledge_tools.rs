@@ -33,14 +33,22 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use mongodb::bson::Document;
+use chrono::{Duration as ChronoDuration, Utc};
+use futures::TryStreamExt;
+use mongodb::bson::{doc, oid::ObjectId, DateTime as BsonDt, Document};
+use mongodb::options::FindOptions;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
 use super::budget::{BudgetError, RunBudget};
 use super::runtime::UserRuntimeParameters;
 use super::types::{KnowledgeRuntime, ToolCallRequest};
-use crate::models::{OperationKnowledgeChunk, OperationKnowledgeItem};
+use crate::db::Database;
+use crate::error::AppError;
+use crate::models::{
+    KnowledgeUsageLog, OperationKnowledgeChunk, OperationKnowledgeDocument,
+    OperationKnowledgeItem,
+};
 
 /// 单次 dispatch 的硬超时（R4.8）。
 pub(crate) const TOOL_DISPATCH_TIMEOUT: Duration = Duration::from_secs(5);
@@ -68,9 +76,48 @@ pub(crate) const TOOL_LIST_CATALOG: &str = "knowledge.list_catalog";
 pub(crate) const TOOL_SEARCH: &str = "knowledge.search";
 pub(crate) const TOOL_OPEN_SLICE: &str = "knowledge.open_slice";
 
+// knowledge-digest-workstation Phase 5: chat-only async tools。
+// 与 user-ops 三大工具物理隔离：仅在 chat tool loop 内派发，
+// 永不进 user-ops `dispatch_tool_call`（保持 user-ops gateway 路径不变）。
+pub(crate) const TOOL_AUDIT_COMPLETENESS: &str = "knowledge.audit_completeness";
+pub(crate) const TOOL_SEARCH_CHUNKS: &str = "knowledge.search_chunks";
+pub(crate) const TOOL_PROPOSE_REPAIR: &str = "knowledge.propose_repair";
+pub(crate) const TOOL_ANALYZE_LOGS: &str = "knowledge.analyze_logs";
+// 让 agent 拥有"对整个知识库的完整观察"能力的 3 个补充工具：
+// - open_document：按 documentId 取父文档原文（截断）；
+// - inspect_pack：按 itemId 取知识包完整元数据；
+// - verify_anchor：传 chunkId + 候选 sourceQuote，立即返回是否能在父文档命中
+//   （与 verify gate 同一套 source_anchor_for_quote 模糊 anchor 算法，由 chat
+//   route 在 dispatch 时注入回调，避免 knowledge_tools 直接依赖 routes）。
+pub(crate) const TOOL_OPEN_DOCUMENT: &str = "knowledge.open_document";
+pub(crate) const TOOL_INSPECT_PACK: &str = "knowledge.inspect_pack";
+pub(crate) const TOOL_VERIFY_ANCHOR: &str = "knowledge.verify_anchor";
+
 /// 用于 R4.1 toolCalls schema 校验：合法 tool 名白名单。
 pub(crate) const ALLOWED_TOOL_NAMES: &[&str] =
     &[TOOL_LIST_CATALOG, TOOL_SEARCH, TOOL_OPEN_SLICE];
+
+/// chat tool loop 的合法 tool 白名单（user-ops 三件套 + 7 个 chat-only 工具）。
+pub(crate) const ALLOWED_CHAT_TOOL_NAMES: &[&str] = &[
+    TOOL_LIST_CATALOG,
+    TOOL_SEARCH,
+    TOOL_OPEN_SLICE,
+    TOOL_AUDIT_COMPLETENESS,
+    TOOL_SEARCH_CHUNKS,
+    TOOL_PROPOSE_REPAIR,
+    TOOL_ANALYZE_LOGS,
+    TOOL_OPEN_DOCUMENT,
+    TOOL_INSPECT_PACK,
+    TOOL_VERIFY_ANCHOR,
+];
+
+/// chat 工具单 turn 调用次数硬上限（与设计保持一致：≤ 6）。
+pub(crate) const CHAT_TOOL_CALLS_PER_TURN_CAP: usize = 6;
+
+/// chat analyze_logs 的回看窗口（24h）。
+pub(crate) const CHAT_ANALYZE_LOGS_WINDOW_HOURS: i64 = 24;
+/// chat analyze_logs 单次返回的 chunk 上限。
+pub(crate) const CHAT_ANALYZE_LOGS_MAX_CHUNKS: usize = 32;
 
 /// 单 run 内的 tool dispatch 状态（在多轮 [`reply_with_tools_loop`] 之间共享）。
 ///
@@ -496,6 +543,802 @@ fn exec_open_slice(
     json!({ "slices": slices })
 }
 
+// ── chat-only tools (knowledge-digest-workstation Phase 5) ─────────────────
+//
+// 与 user-ops 三件套的关键差异：
+// - 这些 tool 直接读 MongoDB（异步），因此走单独的 `dispatch_chat_tool_call`；
+// - 仍然受 RunBudget tool_call 配额 + 5s 单 dispatch timeout 约束；
+// - 仍然 fail-as-Value（错误也是合法的工具结果，让 LLM 在下一轮自我修正）；
+// - 永不写入 outbox / 永不触达 mcp.* / 永不进 user-ops gateway。
+
+#[derive(Debug, Default, Deserialize)]
+struct AuditCompletenessArgs {
+    #[serde(default)]
+    chunk_id: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct SearchChunksArgs {
+    #[serde(default)]
+    query: Option<String>,
+    #[serde(default)]
+    top_k: Option<i32>,
+    #[serde(default)]
+    only_verified: Option<bool>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct ProposeRepairArgs {
+    #[serde(default)]
+    chunk_id: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct AnalyzeLogsArgs {
+    #[serde(default)]
+    account_id: Option<String>,
+    #[serde(default)]
+    hours: Option<i64>,
+    #[serde(default)]
+    only_blocked_or_held: Option<bool>,
+}
+
+// knowledge-digest-workstation Phase 5 / 工具补完三件套。
+//
+// open_document：让 agent 直接读父文档原文（截断 4000 字），常见用法是
+// update_chunk 之前先看一眼真正的原文段，避免凭 chunk 自身的 sourceQuote 推断；
+//
+// inspect_pack：取整个知识包的完整元数据（routingCard / commonObjections /
+// safeClaims / forbiddenClaims / customerStages 等），让 agent 在 update_pack
+// 前知道当前包到底长什么样、哪些字段还没填；
+//
+// verify_anchor：把 candidate sourceQuote 投到父文档跑一遍 verify gate 的
+// 模糊 anchor 算法，返回 hit/miss + offset；让 agent 在生成 sourceQuote 之前
+// 自己先校验，而不是把无锚草稿直接抛到 chat_apply（apply 也仍会强制 needs_review，
+// 这只是给 agent 一次"主动自检"的能力，与红线"AI 永不自动 verify"不冲突）。
+
+#[derive(Debug, Default, Deserialize)]
+struct OpenDocumentArgs {
+    #[serde(default)]
+    document_id: Option<String>,
+    /// 截断字符数，1..=8000，缺省 4000。超出 → 截到 4000。
+    #[serde(default)]
+    max_chars: Option<i32>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct InspectPackArgs {
+    #[serde(default)]
+    item_id: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct VerifyAnchorArgs {
+    #[serde(default)]
+    chunk_id: Option<String>,
+    /// 待校验的 sourceQuote 候选；缺省 → 用 chunk 当前已存的 source_quote。
+    #[serde(default)]
+    source_quote: Option<String>,
+}
+
+/// `verify_anchor` 模糊匹配回调签名：
+/// `(raw_content, document_id_hex, source_quote) -> Option<doc!{ ... }>`。
+/// 由 chat route 注入；为空时 verify_anchor 工具退化为 best-effort 子串匹配。
+pub(crate) type AnchorMatchFn =
+    fn(&str, Option<String>, &str) -> Option<mongodb::bson::Document>;
+
+/// 异步派发 chat tool call。
+///
+/// 行为概览（与 sync 版本对齐）：
+/// 1. 校验 `call.tool` 在 chat 白名单内；
+/// 2. `RunBudget::record_tool_call` 占 1 槽 + 0 token；
+/// 3. 5s 单次 timeout；
+/// 4. 错误以 Value 返回（不抛异常）。
+///
+/// 与 sync `dispatch_tool_call` 隔离：本函数在 chat_tool_loop 内调用，永不与
+/// user-ops gateway 共享路径。
+pub(crate) async fn dispatch_chat_tool_call(
+    call: &ToolCallRequest,
+    runtime: &UserRuntimeParameters,
+    knowledge: &KnowledgeRuntime,
+    db: &Database,
+    workspace_id: &str,
+    budget: &Arc<RunBudget>,
+    state: &mut ToolDispatchState,
+    anchor_match: Option<AnchorMatchFn>,
+) -> Value {
+    let tool = call.tool.trim();
+    if !ALLOWED_CHAT_TOOL_NAMES.iter().any(|allowed| *allowed == tool) {
+        return tool_error("unknown_tool", &format!("tool name '{tool}' not allowed"));
+    }
+    if let Err(err) = budget.record_tool_call(0) {
+        return budget_error_value(&err);
+    }
+
+    let arguments = call.arguments.clone();
+    let tool_owned = tool.to_string();
+    let workspace_id_owned = workspace_id.to_string();
+
+    // 把所有 dispatch 用 timeout 包住——与 sync 版本对齐。
+    let result = tokio::time::timeout(TOOL_DISPATCH_TIMEOUT, async {
+        match tool_owned.as_str() {
+            TOOL_LIST_CATALOG => exec_list_catalog(&arguments, knowledge, state),
+            TOOL_SEARCH => exec_search(&arguments, knowledge, runtime),
+            TOOL_OPEN_SLICE => exec_open_slice(&arguments, knowledge, runtime),
+            TOOL_AUDIT_COMPLETENESS => {
+                exec_audit_completeness(&arguments, db, &workspace_id_owned).await
+            }
+            TOOL_SEARCH_CHUNKS => {
+                exec_search_chunks(&arguments, db, &workspace_id_owned).await
+            }
+            TOOL_PROPOSE_REPAIR => {
+                exec_propose_repair(&arguments, db, &workspace_id_owned).await
+            }
+            TOOL_ANALYZE_LOGS => {
+                exec_analyze_logs(&arguments, db, &workspace_id_owned).await
+            }
+            TOOL_OPEN_DOCUMENT => {
+                exec_open_document(&arguments, db, &workspace_id_owned).await
+            }
+            TOOL_INSPECT_PACK => {
+                exec_inspect_pack(&arguments, db, &workspace_id_owned).await
+            }
+            TOOL_VERIFY_ANCHOR => {
+                exec_verify_anchor(&arguments, db, &workspace_id_owned, anchor_match).await
+            }
+            _ => unreachable!("chat tool whitelist enforced above"),
+        }
+    })
+    .await;
+    match result {
+        Ok(v) => v,
+        Err(_) => tool_error(
+            "tool_timeout",
+            &format!("tool '{tool}' exceeded 5s timeout"),
+        ),
+    }
+}
+
+// ── exec: knowledge.audit_completeness ─────────────────────────────────
+//
+// 输入：{ chunk_id }；
+// 输出：{ chunk_id, integrity_status, missing_fields, has_source_quote,
+//        verified_claim_count, evidence_count, completeness_score (0..=1) }；
+// 错误：invalid_input / unknown_chunk_id / db_error。
+async fn exec_audit_completeness(
+    arguments: &Document,
+    db: &Database,
+    workspace_id: &str,
+) -> Value {
+    let args: AuditCompletenessArgs = match parse_arguments(arguments) {
+        Ok(args) => args,
+        Err(detail) => return tool_error("invalid_input", &detail),
+    };
+    let chunk_id = match args.chunk_id.as_deref().map(|s| s.trim()).filter(|s| !s.is_empty()) {
+        Some(id) => id.to_string(),
+        None => return tool_error("invalid_input", "chunk_id is required"),
+    };
+    let oid = match ObjectId::parse_str(&chunk_id) {
+        Ok(o) => o,
+        Err(_) => return tool_error("invalid_input", "chunk_id is not a valid ObjectId"),
+    };
+    let chunk = match db
+        .operation_knowledge_chunks()
+        .find_one(
+            doc! { "_id": oid, "workspace_id": workspace_id },
+            None,
+        )
+        .await
+    {
+        Ok(Some(c)) => c,
+        Ok(None) => {
+            return json!({ "error": "unknown_chunk_id", "missing": [chunk_id] });
+        }
+        Err(e) => return tool_error("db_error", &e.to_string()),
+    };
+
+    let mut missing: Vec<&str> = Vec::new();
+    if chunk.title.trim().is_empty() {
+        missing.push("title");
+    }
+    if chunk.summary.as_deref().map(str::trim).unwrap_or("").is_empty() {
+        missing.push("summary");
+    }
+    if chunk
+        .source_quote
+        .as_deref()
+        .map(str::trim)
+        .unwrap_or("")
+        .is_empty()
+    {
+        missing.push("sourceQuote");
+    }
+    if chunk.safe_claims.is_empty() {
+        missing.push("safeClaims");
+    }
+    if chunk.evidence_items.is_empty() {
+        missing.push("evidenceItems");
+    }
+    if chunk.applicable_scenes.is_empty() {
+        missing.push("applicableScenes");
+    }
+
+    let total_checked = 6.0_f64;
+    let filled = (total_checked - missing.len() as f64).max(0.0);
+    let completeness_score = (filled / total_checked * 1000.0).round() / 1000.0;
+
+    json!({
+        "chunk_id": chunk_id,
+        "title": chunk.title,
+        "integrity_status": chunk.integrity_status.clone().unwrap_or_default(),
+        "status": chunk.status,
+        "missing_fields": missing,
+        "has_source_quote": chunk.source_quote.is_some(),
+        "verified_claim_count": chunk.verified_claims.len(),
+        "evidence_count": chunk.evidence_items.len(),
+        "applicable_scene_count": chunk.applicable_scenes.len(),
+        "completeness_score": completeness_score,
+        "updated_at": chunk.updated_at.timestamp_millis(),
+    })
+}
+
+// ── exec: knowledge.search_chunks ──────────────────────────────────────
+//
+// 输入：{ query, top_k?, only_verified? }
+// 输出：{ hits: [{ chunk_id, title, integrity_status, score, snippet,
+//                  redacted }], hit_count, query }
+// 与 user-ops `knowledge.search` 行为相似但走 db query；snippet 仍按 verified
+// 闸门 redact。
+async fn exec_search_chunks(
+    arguments: &Document,
+    db: &Database,
+    workspace_id: &str,
+) -> Value {
+    let args: SearchChunksArgs = match parse_arguments(arguments) {
+        Ok(args) => args,
+        Err(detail) => return tool_error("invalid_input", &detail),
+    };
+    let query_raw = args.query.unwrap_or_default();
+    let query = query_raw.trim();
+    if query.is_empty() {
+        return tool_error("invalid_query", "query is empty");
+    }
+    if query.chars().count() > SEARCH_QUERY_MAX_CHARS {
+        return tool_error(
+            "invalid_query",
+            &format!("query exceeds {SEARCH_QUERY_MAX_CHARS} chars"),
+        );
+    }
+    let top_k = args.top_k.filter(|v| *v > 0).unwrap_or(8).min(32).max(1) as usize;
+    let only_verified = args.only_verified.unwrap_or(false);
+
+    // 简单做法：拉前 200 条候选 in-memory 评分（避免引入 $text 索引依赖）。
+    let mut filter = doc! { "workspace_id": workspace_id };
+    if only_verified {
+        filter.insert("integrity_status", "verified");
+    }
+    let cursor = match db
+        .operation_knowledge_chunks()
+        .find(
+            filter,
+            FindOptions::builder()
+                .sort(doc! { "updated_at": -1_i32 })
+                .limit(200)
+                .build(),
+        )
+        .await
+    {
+        Ok(c) => c,
+        Err(e) => return tool_error("db_error", &e.to_string()),
+    };
+    let chunks: Vec<OperationKnowledgeChunk> = match cursor.try_collect().await {
+        Ok(v) => v,
+        Err(e) => return tool_error("db_error", &e.to_string()),
+    };
+
+    let mut scored: Vec<(f64, &OperationKnowledgeChunk)> = chunks
+        .iter()
+        .filter_map(|c| {
+            let s = score_chunk_for_query(c, query);
+            if s > 0.0 {
+                Some((s, c))
+            } else {
+                None
+            }
+        })
+        .collect();
+    scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+
+    let hits: Vec<Value> = scored
+        .into_iter()
+        .take(top_k)
+        .map(|(score, c)| build_search_hit(c, score))
+        .collect();
+    let hit_count = hits.len();
+    json!({
+        "query": query.to_string(),
+        "hits": hits,
+        "hit_count": hit_count,
+        "only_verified": only_verified,
+    })
+}
+
+// ── exec: knowledge.propose_repair ─────────────────────────────────────
+//
+// 输入：{ chunk_id }
+// 输出：{ chunk_id, suggestions: [...] }，每条 suggestion 形如
+// { field, reason, hint }；不直接写库（与 AI 永不自动 verify 红线一致）。
+async fn exec_propose_repair(
+    arguments: &Document,
+    db: &Database,
+    workspace_id: &str,
+) -> Value {
+    let args: ProposeRepairArgs = match parse_arguments(arguments) {
+        Ok(args) => args,
+        Err(detail) => return tool_error("invalid_input", &detail),
+    };
+    let chunk_id = match args.chunk_id.as_deref().map(|s| s.trim()).filter(|s| !s.is_empty()) {
+        Some(id) => id.to_string(),
+        None => return tool_error("invalid_input", "chunk_id is required"),
+    };
+    let oid = match ObjectId::parse_str(&chunk_id) {
+        Ok(o) => o,
+        Err(_) => return tool_error("invalid_input", "chunk_id is not a valid ObjectId"),
+    };
+    let chunk = match db
+        .operation_knowledge_chunks()
+        .find_one(
+            doc! { "_id": oid, "workspace_id": workspace_id },
+            None,
+        )
+        .await
+    {
+        Ok(Some(c)) => c,
+        Ok(None) => {
+            return json!({ "error": "unknown_chunk_id", "missing": [chunk_id] });
+        }
+        Err(e) => return tool_error("db_error", &e.to_string()),
+    };
+
+    let mut suggestions: Vec<Value> = Vec::new();
+    if chunk
+        .source_quote
+        .as_deref()
+        .map(str::trim)
+        .unwrap_or("")
+        .is_empty()
+    {
+        suggestions.push(json!({
+            "field": "sourceQuote",
+            "reason": "缺少原文出处，无法走 verify 模糊 anchor 校验",
+            "hint": "请粘贴一段父文档中支撑本切片结论的原文（≥10 字）",
+            "severity": "high",
+        }));
+    }
+    if chunk.safe_claims.is_empty() {
+        suggestions.push(json!({
+            "field": "safeClaims",
+            "reason": "未声明可使用的安全话术，AI 起草时无锚点",
+            "hint": "至少给出 1 条可直接对外说的安全话术",
+            "severity": "medium",
+        }));
+    }
+    if chunk.applicable_scenes.is_empty() {
+        suggestions.push(json!({
+            "field": "applicableScenes",
+            "reason": "未声明适用场景，路由器命中率低",
+            "hint": "补 1-3 个场景标签（如『售前/异议处理/复购』）",
+            "severity": "medium",
+        }));
+    }
+    if chunk.evidence_items.is_empty() {
+        suggestions.push(json!({
+            "field": "evidenceItems",
+            "reason": "缺少证据材料，verify 阶段会被 review 退回",
+            "hint": "补 1 条证据（截图链接 / 政策条款 / 数据出处）",
+            "severity": "medium",
+        }));
+    }
+    let integrity = chunk.integrity_status.clone().unwrap_or_default();
+    if integrity != "verified" && integrity != "needs_review" {
+        suggestions.push(json!({
+            "field": "integrityStatus",
+            "reason": format!("当前状态 '{integrity}' 非 verified/needs_review；运营对话起草后应回到 needs_review 等待复核"),
+            "hint": "对话生成新内容后保持 status=draft + integrityStatus=needs_review",
+            "severity": "low",
+        }));
+    }
+
+    json!({
+        "chunk_id": chunk_id,
+        "title": chunk.title,
+        "integrity_status": integrity,
+        "suggestion_count": suggestions.len(),
+        "suggestions": suggestions,
+        "ai_will_not_auto_apply": true,
+    })
+}
+
+// ── exec: knowledge.analyze_logs ───────────────────────────────────────
+//
+// 输入：{ account_id?, hours?, only_blocked_or_held? }
+// 输出：{ window_hours, total_runs, blocked_or_held_runs, top_chunks, items }
+// items[i]: { run_id, blocked_reason, knowledge_ids, created_at }
+// 复用 KnowledgeUsageLog 的 blocked_reason 字段做 24h 块/hold 反查。
+async fn exec_analyze_logs(
+    arguments: &Document,
+    db: &Database,
+    workspace_id: &str,
+) -> Value {
+    let args: AnalyzeLogsArgs = match parse_arguments(arguments) {
+        Ok(args) => args,
+        Err(detail) => return tool_error("invalid_input", &detail),
+    };
+    let hours = args
+        .hours
+        .filter(|v| *v > 0)
+        .unwrap_or(CHAT_ANALYZE_LOGS_WINDOW_HOURS)
+        .min(72);
+    let only_blocked = args.only_blocked_or_held.unwrap_or(true);
+    let cutoff = Utc::now() - ChronoDuration::hours(hours);
+    let cutoff_bson = BsonDt::from_millis(cutoff.timestamp_millis());
+
+    let mut filter = doc! {
+        "workspace_id": workspace_id,
+        "created_at": { "$gte": cutoff_bson },
+    };
+    if let Some(account_id) = args
+        .account_id
+        .as_deref()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+    {
+        filter.insert("account_id", account_id);
+    }
+    if only_blocked {
+        filter.insert(
+            "$or",
+            mongodb::bson::Bson::Array(vec![
+                mongodb::bson::Bson::Document(doc! { "review_approved": false }),
+                mongodb::bson::Bson::Document(doc! {
+                    "blocked_reason": { "$exists": true, "$ne": null },
+                }),
+            ]),
+        );
+    }
+
+    let cursor = match db
+        .knowledge_usage_logs()
+        .find(
+            filter,
+            FindOptions::builder()
+                .sort(doc! { "created_at": -1_i32 })
+                .limit(CHAT_ANALYZE_LOGS_MAX_CHUNKS as i64)
+                .build(),
+        )
+        .await
+    {
+        Ok(c) => c,
+        Err(e) => return tool_error("db_error", &e.to_string()),
+    };
+    let logs: Vec<KnowledgeUsageLog> = match cursor.try_collect().await {
+        Ok(v) => v,
+        Err(e) => return tool_error("db_error", &e.to_string()),
+    };
+
+    let mut chunk_freq: HashMap<String, i32> = HashMap::new();
+    let mut items: Vec<Value> = Vec::with_capacity(logs.len());
+    let total_runs = logs.len();
+    let mut blocked = 0_i32;
+    for log in &logs {
+        if log.blocked_reason.is_some() || !log.review_approved {
+            blocked += 1;
+        }
+        for kid in &log.knowledge_ids {
+            *chunk_freq.entry(kid.to_hex()).or_insert(0) += 1;
+        }
+        items.push(json!({
+            "run_id": log.run_id,
+            "account_id": log.account_id,
+            "blocked_reason": log.blocked_reason,
+            "review_approved": log.review_approved,
+            "knowledge_ids": log.knowledge_ids.iter().map(|o| o.to_hex()).collect::<Vec<_>>(),
+            "created_at": log.created_at.timestamp_millis(),
+        }));
+    }
+    let mut top_chunks: Vec<(String, i32)> = chunk_freq.into_iter().collect();
+    top_chunks.sort_by(|a, b| b.1.cmp(&a.1));
+    let top_chunks_json: Vec<Value> = top_chunks
+        .into_iter()
+        .take(8)
+        .map(|(id, count)| json!({ "chunk_id": id, "hit_count": count }))
+        .collect();
+
+    json!({
+        "window_hours": hours,
+        "only_blocked_or_held": only_blocked,
+        "total_runs": total_runs,
+        "blocked_or_held_runs": blocked,
+        "top_chunks": top_chunks_json,
+        "items": items,
+    })
+}
+
+// ── exec: knowledge.open_document ──────────────────────────────────────
+//
+// 输入：{ document_id, max_chars? }；max_chars 缺省 4000，硬上限 8000。
+// 输出：{ document_id, title, source_type, raw_content_excerpt, raw_content_truncated,
+//        raw_content_total_chars, summary }；
+// 错误：invalid_input / unknown_document_id / db_error。
+async fn exec_open_document(
+    arguments: &Document,
+    db: &Database,
+    workspace_id: &str,
+) -> Value {
+    let args: OpenDocumentArgs = match parse_arguments(arguments) {
+        Ok(args) => args,
+        Err(detail) => return tool_error("invalid_input", &detail),
+    };
+    let document_id = match args
+        .document_id
+        .as_deref()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+    {
+        Some(id) => id.to_string(),
+        None => return tool_error("invalid_input", "document_id is required"),
+    };
+    let oid = match ObjectId::parse_str(&document_id) {
+        Ok(o) => o,
+        Err(_) => {
+            return tool_error("invalid_input", "document_id is not a valid ObjectId")
+        }
+    };
+    let max_chars = args
+        .max_chars
+        .filter(|v| *v > 0)
+        .unwrap_or(4000)
+        .min(8000) as usize;
+    let doc_record: OperationKnowledgeDocument = match db
+        .operation_knowledge_documents()
+        .find_one(
+            doc! { "_id": oid, "workspace_id": workspace_id },
+            None,
+        )
+        .await
+    {
+        Ok(Some(d)) => d,
+        Ok(None) => return json!({ "error": "unknown_document_id", "missing": [document_id] }),
+        Err(e) => return tool_error("db_error", &e.to_string()),
+    };
+    let raw = doc_record.raw_content.clone().unwrap_or_default();
+    let total_chars = raw.chars().count();
+    let truncated = total_chars > max_chars;
+    let excerpt: String = if truncated {
+        raw.chars().take(max_chars).collect()
+    } else {
+        raw
+    };
+    json!({
+        "document_id": document_id,
+        "title": doc_record.title,
+        "source_type": doc_record.source_type,
+        "source_name": doc_record.source_name,
+        "summary": doc_record.summary,
+        "catalog_summary": doc_record.catalog_summary,
+        "status": doc_record.status,
+        "raw_content_excerpt": excerpt,
+        "raw_content_truncated": truncated,
+        "raw_content_total_chars": total_chars as i32,
+        "max_chars": max_chars as i32,
+        "updated_at": doc_record.updated_at.timestamp_millis(),
+    })
+}
+
+// ── exec: knowledge.inspect_pack ───────────────────────────────────────
+//
+// 输入：{ item_id }
+// 输出：{ item_id, title, routing_card, summary, customer_stages, intent_levels,
+//        common_questions, common_objections, safe_claims, forbidden_claims,
+//        evidence_items, applicable_scenes, not_applicable_scenes,
+//        product_tags, trigger_keywords, business_topics, status, updated_at }
+// 错误：invalid_input / unknown_item_id / db_error。
+async fn exec_inspect_pack(
+    arguments: &Document,
+    db: &Database,
+    workspace_id: &str,
+) -> Value {
+    let args: InspectPackArgs = match parse_arguments(arguments) {
+        Ok(args) => args,
+        Err(detail) => return tool_error("invalid_input", &detail),
+    };
+    let item_id = match args
+        .item_id
+        .as_deref()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+    {
+        Some(id) => id.to_string(),
+        None => return tool_error("invalid_input", "item_id is required"),
+    };
+    let oid = match ObjectId::parse_str(&item_id) {
+        Ok(o) => o,
+        Err(_) => return tool_error("invalid_input", "item_id is not a valid ObjectId"),
+    };
+    let item: OperationKnowledgeItem = match db
+        .operation_knowledge_items()
+        .find_one(
+            doc! { "_id": oid, "workspace_id": workspace_id },
+            None,
+        )
+        .await
+    {
+        Ok(Some(i)) => i,
+        Ok(None) => return json!({ "error": "unknown_item_id", "missing": [item_id] }),
+        Err(e) => return tool_error("db_error", &e.to_string()),
+    };
+    json!({
+        "item_id": item_id,
+        "title": item.title,
+        "summary": item.summary,
+        "routing_card": item.routing_card,
+        "business_context": item.business_context,
+        "knowledge_type": item.knowledge_type,
+        "category": item.category,
+        "business_type": item.business_type,
+        "customer_stages": item.customer_stages,
+        "intent_levels": item.intent_levels,
+        "operation_states": item.operation_states,
+        "applicable_scenes": item.applicable_scenes,
+        "not_applicable_scenes": item.not_applicable_scenes,
+        "suitable_for": item.suitable_for,
+        "not_suitable_for": item.not_suitable_for,
+        "common_questions": item.common_questions,
+        "common_objections": item.common_objections,
+        "safe_claims": item.safe_claims,
+        "forbidden_claims": item.forbidden_claims,
+        "evidence_items": item.evidence_items,
+        "product_tags": item.product_tags,
+        "trigger_keywords": item.trigger_keywords,
+        "business_topics": item.business_topics,
+        "source_type": item.source_type,
+        "source_name": item.source_name,
+        "status": item.status,
+        "priority": item.priority,
+        "updated_at": item.updated_at.timestamp_millis(),
+    })
+}
+
+// ── exec: knowledge.verify_anchor ──────────────────────────────────────
+//
+// 输入：{ chunk_id, source_quote? }；缺省 source_quote 时用 chunk 当前已存的。
+// 输出：{ chunk_id, document_id?, anchor_hit, anchor?, source_quote_used,
+//        method: "exact"|"fuzzy"|"none", note? }
+// 错误：invalid_input / missing_parent_document / unknown_chunk_id / db_error。
+async fn exec_verify_anchor(
+    arguments: &Document,
+    db: &Database,
+    workspace_id: &str,
+    anchor_match: Option<AnchorMatchFn>,
+) -> Value {
+    let args: VerifyAnchorArgs = match parse_arguments(arguments) {
+        Ok(args) => args,
+        Err(detail) => return tool_error("invalid_input", &detail),
+    };
+    let chunk_id = match args
+        .chunk_id
+        .as_deref()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+    {
+        Some(id) => id.to_string(),
+        None => return tool_error("invalid_input", "chunk_id is required"),
+    };
+    let oid = match ObjectId::parse_str(&chunk_id) {
+        Ok(o) => o,
+        Err(_) => return tool_error("invalid_input", "chunk_id is not a valid ObjectId"),
+    };
+    let chunk: OperationKnowledgeChunk = match db
+        .operation_knowledge_chunks()
+        .find_one(
+            doc! { "_id": oid, "workspace_id": workspace_id },
+            None,
+        )
+        .await
+    {
+        Ok(Some(c)) => c,
+        Ok(None) => return json!({ "error": "unknown_chunk_id", "missing": [chunk_id] }),
+        Err(e) => return tool_error("db_error", &e.to_string()),
+    };
+    let document_oid = match chunk.document_id {
+        Some(d) => d,
+        None => {
+            return json!({
+                "chunk_id": chunk_id,
+                "anchor_hit": false,
+                "method": "none",
+                "note": "chunk has no parent document_id; cannot verify anchor",
+            });
+        }
+    };
+    let document_id_hex = document_oid.to_hex();
+    let parent: OperationKnowledgeDocument = match db
+        .operation_knowledge_documents()
+        .find_one(
+            doc! { "_id": document_oid, "workspace_id": workspace_id },
+            None,
+        )
+        .await
+    {
+        Ok(Some(d)) => d,
+        Ok(None) => {
+            return tool_error(
+                "missing_parent_document",
+                &format!("document {document_id_hex} not found"),
+            );
+        }
+        Err(e) => return tool_error("db_error", &e.to_string()),
+    };
+    let raw_content = parent.raw_content.clone().unwrap_or_default();
+    let candidate = args
+        .source_quote
+        .as_deref()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| chunk.source_quote.clone().unwrap_or_default());
+    let candidate_trimmed = candidate.trim();
+    if candidate_trimmed.is_empty() {
+        return json!({
+            "chunk_id": chunk_id,
+            "document_id": document_id_hex,
+            "anchor_hit": false,
+            "method": "none",
+            "note": "candidate source_quote is empty",
+        });
+    }
+    if let Some(start) = raw_content.find(candidate_trimmed) {
+        let end = start + candidate_trimmed.len();
+        return json!({
+            "chunk_id": chunk_id,
+            "document_id": document_id_hex,
+            "source_quote_used": candidate_trimmed,
+            "anchor_hit": true,
+            "method": "exact",
+            "anchor": {
+                "startOffset": start as i32,
+                "endOffset": end as i32,
+            },
+        });
+    }
+    // 退回模糊：若调用方注入了 anchor_match，复用 verify gate 同算法。
+    if let Some(matcher) = anchor_match {
+        if let Some(anchor) = matcher(&raw_content, Some(document_id_hex.clone()), candidate_trimmed) {
+            let value = mongodb::bson::Bson::Document(anchor).into_relaxed_extjson();
+            return json!({
+                "chunk_id": chunk_id,
+                "document_id": document_id_hex,
+                "source_quote_used": candidate_trimmed,
+                "anchor_hit": true,
+                "method": "fuzzy",
+                "anchor": value,
+            });
+        }
+    }
+    json!({
+        "chunk_id": chunk_id,
+        "document_id": document_id_hex,
+        "source_quote_used": candidate_trimmed,
+        "anchor_hit": false,
+        "method": "none",
+        "note": "candidate quote did not match parent document (exact + fuzzy both miss)",
+    })
+}
+
+#[allow(dead_code)]
+fn require_db_error_to_app_error(e: &mongodb::error::Error) -> AppError {
+    AppError::External(format!("knowledge tools db error: {e}"))
+}
+
 // ── 内部辅助 ────────────────────────────────────────────────────────────
 
 fn parse_arguments<T: for<'de> Deserialize<'de> + Default>(arguments: &Document) -> Result<T, String> {
@@ -567,6 +1410,9 @@ mod tests {
             verified_claims: vec![],
             status: "active".into(),
             priority: 0,
+            product_tags: vec![],
+            trigger_keywords: vec![],
+            business_topics: vec![],
             created_at: BsonDt::now(),
             updated_at: BsonDt::now(),
         }
@@ -591,6 +1437,9 @@ mod tests {
             section_index: vec![],
             status: "active".into(),
             version: 1,
+            product_tags: vec![],
+            trigger_keywords: vec![],
+            business_topics: vec![],
             created_at: BsonDt::now(),
             updated_at: BsonDt::now(),
         }
@@ -601,6 +1450,7 @@ mod tests {
             id: Some(ObjectId::new()),
             workspace_id: "default".into(),
             account_id: None,
+            document_id: None,
             domain: "user_operations".into(),
             category: "product".into(),
             business_type: "general".into(),
@@ -627,6 +1477,9 @@ mod tests {
             status: "active".into(),
             priority: 0,
             version: 1,
+            product_tags: vec![],
+            trigger_keywords: vec![],
+            business_topics: vec![],
             created_at: BsonDt::now(),
             updated_at: BsonDt::now(),
         }

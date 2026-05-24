@@ -27,7 +27,7 @@ use parking_lot::Mutex as PlMutex;
 /// 兼容）。
 #[derive(Debug, thiserror::Error)]
 #[allow(dead_code)]
-pub(crate) enum BudgetError {
+pub enum BudgetError {
     /// `tool_calls_used >= tool_call_budget`：任何后续 tool call SHALL
     /// 立即返回 `budget_exceeded` 而不实际执行（R4.3）。
     #[error(
@@ -164,7 +164,7 @@ impl RunBudget {
 
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
-pub(crate) struct RunBudgetSnapshot {
+pub struct RunBudgetSnapshot {
     pub run_id: String,
     pub token_budget: i64,
     pub max_llm_calls: i32,
