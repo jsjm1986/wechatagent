@@ -192,12 +192,9 @@ pub(super) async fn publish_prompt_template(
             None,
         )
         .await?;
-    // 波 C4：发布敏感 prompt 后立即让 Rust 端的进程内缓存失效，避免 30s
-    // TTL 之内 review 仍读旧的标记词。目前只有 product_claim_markers 有
-    // 缓存层；后续接入更多就在这里集中失效。
-    if template.prompt_key == "user.review.product_claim_markers" {
-        crate::agent::invalidate_product_claim_markers_cache();
-    }
+    // 旧的 product_claim_markers 缓存随 sales 守卫一起删除，commit 3 wiki
+    // 化以后再决定要不要在这里集中失效新的缓存层。
+    let _ = template;
     Ok(Json(json!({ "ok": true })))
 }
 

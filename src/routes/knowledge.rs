@@ -19,7 +19,6 @@ use crate::{
     error::{AppError, AppResult},
     models::{
         KnowledgeChatTurn, KnowledgeUsageLog, OperationKnowledgeChunk, OperationKnowledgeDocument,
-        OperationKnowledgeItem,
     },
     prompts,
 };
@@ -216,6 +215,17 @@ pub(super) struct OperationKnowledgeImportApplyRequest {
     items: Vec<OperationKnowledgeRequest>,
     #[serde(default)]
     chunks: Vec<OperationKnowledgeChunkRequest>,
+    /// knowledge-wiki Phase D：fence-aware 流式块导入。
+    ///
+    /// 当 caller 提供 `chunkedText` 时，会先 `parse_chunk_blocks` 解析
+    /// `---CHUNK: id---...---END CHUNK---` 形式，然后把每块当作 chunk patch
+    /// 走 `apply_chunk_revision(op=Create, source=Imported)` 落库 + 留 revision。
+    /// 解析 warning（unsafe-id / 流截断 / 重复 id 等）通过 `parseWarnings` 字段
+    /// 返回，**不**冒泡为 4xx。
+    ///
+    /// 与 `chunks` 字段并存：如果两者都给，先处理 `chunks`（旧 JSON 路径），
+    /// 再追加 `chunkedText`（新流式路径）。
+    chunked_text: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -262,44 +272,12 @@ pub(super) struct OperationKnowledgeTestRequest {
 }
 
 pub(super) async fn list_operation_knowledge(
-    State(state): State<AppState>,
-    Query(query): Query<OperationKnowledgeQuery>,
+    State(_state): State<AppState>,
+    Query(_query): Query<OperationKnowledgeQuery>,
 ) -> AppResult<Json<Value>> {
-    let mut filter = doc! {
-        "workspace_id": &state.config.default_workspace_id,
-        "domain": "user_operations"
-    };
-    if let Some(account_id) = query.account_id {
-        filter.insert(
-            "$or",
-            vec![
-                doc! { "account_id": null },
-                doc! { "account_id": account_id },
-            ],
-        );
-    }
-    if let Some(category) = normalize_optional(query.category) {
-        filter.insert("category", category);
-    }
-    if let Some(status) = normalize_optional(query.status) {
-        filter.insert("status", status);
-    }
-    let mut cursor = state
-        .db
-        .operation_knowledge_items()
-        .find(
-            filter,
-            FindOptions::builder()
-                .sort(doc! { "priority": -1, "updated_at": -1 })
-                .limit(300)
-                .build(),
-        )
-        .await?;
-    let mut items = Vec::new();
-    while let Some(item) = cursor.try_next().await? {
-        items.push(operation_knowledge_json(item));
-    }
-    Ok(Json(json!({ "items": items })))
+    // operation_knowledge_items 已随 sales 旧库删除；旧 list 端口现在保持兼容
+    // 形状但永远返回空集合。新的 wiki 流程走 operation_knowledge_chunks。
+    Ok(Json(json!({ "items": Vec::<Value>::new() })))
 }
 
 pub(super) async fn list_operation_knowledge_documents(
@@ -611,7 +589,7 @@ pub(super) async fn verify_operation_knowledge_chunk(
         return Err(AppError::BadRequest(reason));
     }
 
-    let verified_claims = payload.verified_claims.unwrap_or(chunk.safe_claims);
+    let verified_claims = payload.verified_claims.unwrap_or_default();
     state
         .db
         .operation_knowledge_chunks()
@@ -822,9 +800,6 @@ async fn auto_verify_operation_knowledge_chunks_inner(
 正文: {}
 source_quote: {}
 source_anchors: {}
-verifiedClaims: {}
-safeClaims: {}
-forbiddenClaims: {}
 
 输出 JSON：
 {{
@@ -839,9 +814,6 @@ forbiddenClaims: {}
             chunk.body.clone().unwrap_or_default(),
             chunk.source_quote.clone().unwrap_or_default(),
             serde_json::to_string(&chunk.source_anchors).unwrap_or_default(),
-            chunk.verified_claims.join(" / "),
-            chunk.safe_claims.join(" / "),
-            chunk.forbidden_claims.join(" / ")
         );
 
         let value = match agent::generate_agent_json(
@@ -1030,6 +1002,52 @@ pub(super) async fn get_operation_knowledge_catalog(
     Ok(Json(json!({ "item": catalog })))
 }
 
+/// `GET /api/operation-knowledge/catalog/persisted` —— knowledge-wiki Phase E：
+/// 读 `documents.catalog_summary_persisted` 持久化快照，O(1)。
+///
+/// 返回每个 active document 的 `id / title / catalogVersion / catalogSummaryPersisted`。
+/// 若 catalog_rebuild_worker 还没跑过 → `catalogSummaryPersisted=null`，
+/// 调用方应回退到 `/catalog`（live 聚合）。
+pub(super) async fn get_operation_knowledge_catalog_persisted(
+    State(state): State<AppState>,
+    Query(query): Query<AccountScopedQuery>,
+) -> AppResult<Json<Value>> {
+    let account_id = query
+        .account_id
+        .unwrap_or_else(|| state.config.default_account_id.clone());
+    let account_filter = vec![
+        doc! { "account_id": null },
+        doc! { "account_id": &account_id },
+    ];
+    let mut cursor = state
+        .db
+        .operation_knowledge_documents()
+        .find(
+            doc! {
+                "workspace_id": &state.config.default_workspace_id,
+                "domain": "user_operations",
+                "status": "active",
+                "$or": account_filter,
+            },
+            FindOptions::builder()
+                .sort(doc! { "updated_at": -1 })
+                .limit(100)
+                .build(),
+        )
+        .await?;
+    let mut documents = Vec::new();
+    while let Some(d) = cursor.try_next().await? {
+        documents.push(json!({
+            "id": d.id.map(|id| id.to_hex()).unwrap_or_default(),
+            "title": d.title,
+            "catalogVersion": d.catalog_version,
+            "catalogSummaryPersisted": d.catalog_summary_persisted,
+            "updatedAt": crate::models::dt_to_string(d.updated_at).unwrap_or_default(),
+        }));
+    }
+    Ok(Json(json!({ "documents": documents })))
+}
+
 pub(super) async fn get_operation_knowledge_completeness(
     State(state): State<AppState>,
     Query(query): Query<AccountScopedQuery>,
@@ -1089,17 +1107,12 @@ pub(super) async fn get_operation_knowledge_integrity_report(
             "rejected" => rejected += 1,
             _ => needs_review += 1,
         }
-        if chunk.integrity_status.as_deref() != Some("verified")
-            || !chunk.distortion_risks.is_empty()
-            || !chunk.unsupported_claims.is_empty()
-        {
+        if chunk.integrity_status.as_deref() != Some("verified") {
             items.push(json!({
                 "id": chunk.id.map(|id| id.to_hex()).unwrap_or_default(),
                 "title": chunk.title,
                 "integrityStatus": chunk.integrity_status.unwrap_or_else(|| "needs_review".to_string()),
                 "confidenceScore": chunk.confidence_score.unwrap_or_default(),
-                "distortionRisks": chunk.distortion_risks,
-                "unsupportedClaims": chunk.unsupported_claims,
                 "status": chunk.status
             }));
         }
@@ -1168,62 +1181,35 @@ pub(super) async fn open_operation_knowledge_slices(
 }
 
 pub(super) async fn create_operation_knowledge(
-    State(state): State<AppState>,
-    Json(payload): Json<OperationKnowledgeRequest>,
+    State(_state): State<AppState>,
+    Json(_payload): Json<OperationKnowledgeRequest>,
 ) -> AppResult<Json<Value>> {
-    validate_operation_knowledge(&payload)?;
-    let result = state
-        .db
-        .operation_knowledge_items()
-        .insert_one(
-            operation_knowledge_from_request(&state, payload, None),
-            None,
-        )
-        .await?;
-    Ok(Json(
-        json!({ "id": result.inserted_id.as_object_id().map(|id| id.to_hex()) }),
+    // operation_knowledge_items 已随 sales 旧库删除；保留 410 行为占位。
+    Err(AppError::BadRequest(
+        "operation_knowledge_items has been removed; use operation_knowledge_chunks instead"
+            .to_string(),
     ))
 }
 
 pub(super) async fn update_operation_knowledge(
-    State(state): State<AppState>,
-    Path(id): Path<String>,
-    Json(payload): Json<OperationKnowledgeRequest>,
+    State(_state): State<AppState>,
+    Path(_id): Path<String>,
+    Json(_payload): Json<OperationKnowledgeRequest>,
 ) -> AppResult<Json<Value>> {
-    validate_operation_knowledge(&payload)?;
-    let object_id = parse_object_id(&id)?;
-    state
-        .db
-        .operation_knowledge_items()
-        .replace_one(
-            doc! {
-                "_id": object_id,
-                "workspace_id": &state.config.default_workspace_id
-            },
-            operation_knowledge_from_request(&state, payload, Some(object_id)),
-            None,
-        )
-        .await?;
-    Ok(Json(json!({ "ok": true })))
+    Err(AppError::BadRequest(
+        "operation_knowledge_items has been removed; use operation_knowledge_chunks instead"
+            .to_string(),
+    ))
 }
 
 pub(super) async fn delete_operation_knowledge(
-    State(state): State<AppState>,
-    Path(id): Path<String>,
+    State(_state): State<AppState>,
+    Path(_id): Path<String>,
 ) -> AppResult<Json<Value>> {
-    let object_id = parse_object_id(&id)?;
-    state
-        .db
-        .operation_knowledge_items()
-        .delete_one(
-            doc! {
-                "_id": object_id,
-                "workspace_id": &state.config.default_workspace_id
-            },
-            None,
-        )
-        .await?;
-    Ok(Json(json!({ "ok": true })))
+    Err(AppError::BadRequest(
+        "operation_knowledge_items has been removed; use operation_knowledge_chunks instead"
+            .to_string(),
+    ))
 }
 
 pub(super) async fn import_operation_knowledge_preview(
@@ -1444,8 +1430,10 @@ pub(super) async fn import_operation_knowledge_apply(
     State(state): State<AppState>,
     Json(payload): Json<OperationKnowledgeImportApplyRequest>,
 ) -> AppResult<Json<Value>> {
-    if payload.items.is_empty() {
-        return Err(AppError::BadRequest("items are required".to_string()));
+    if payload.items.is_empty() && payload.chunked_text.as_deref().unwrap_or("").trim().is_empty() {
+        return Err(AppError::BadRequest(
+            "items or chunkedText are required".to_string(),
+        ));
     }
     let mut document_id = None;
     let raw_content = payload
@@ -1469,26 +1457,10 @@ pub(super) async fn import_operation_knowledge_apply(
             .await?;
         document_id = result.inserted_id.as_object_id();
     }
-    let mut item_ids = Vec::new();
-    for mut item in payload.items {
-        item.account_id = item.account_id.or(payload.account_id.clone());
-        item.source_name = item.source_name.or(payload.source_name.clone());
-        if item.document_id.is_none() {
-            item.document_id = document_id.map(|id| id.to_hex());
-        }
-        if item.status == "draft" {
-            item.status = "active".to_string();
-        }
-        validate_operation_knowledge(&item)?;
-        let result = state
-            .db
-            .operation_knowledge_items()
-            .insert_one(operation_knowledge_from_request(&state, item, None), None)
-            .await?;
-        if let Some(id) = result.inserted_id.as_object_id() {
-            item_ids.push(id.to_hex());
-        }
-    }
+    // payload.items 路径已随 operation_knowledge_items 删除；保留空列表
+    // 让 chunked_text / chunks 路径继续走。
+    let item_ids: Vec<String> = Vec::new();
+    let _ = payload.items;
     let mut chunk_ids = Vec::new();
     for mut chunk in payload.chunks {
         chunk.account_id = chunk.account_id.or(payload.account_id.clone());
@@ -1518,10 +1490,91 @@ pub(super) async fn import_operation_knowledge_apply(
             chunk_ids.push(id.to_hex());
         }
     }
+    // ── knowledge-wiki Phase D：fence-aware chunked text 流式块导入 ───────
+    let mut parse_warnings_json: Vec<Value> = Vec::new();
+    if let Some(text) = payload.chunked_text.as_deref().filter(|s| !s.trim().is_empty()) {
+        let (blocks, warnings) =
+            crate::knowledge_wiki::block_parser::parse_chunk_blocks(text);
+        for w in &warnings.items {
+            parse_warnings_json.push(parse_warning_to_json(w));
+        }
+        for block in blocks {
+            // payload 中一律期待 camelCase 字段名（与既有 OperationKnowledgeChunkRequest 一致）；
+            // 关键缺省值由下面的 enrich + validate 兜底。
+            let mut chunk_req: OperationKnowledgeChunkRequest =
+                match serde_json::from_value::<OperationKnowledgeChunkRequest>(block.payload.clone()) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        parse_warnings_json.push(json!({
+                            "kind": "blockToChunkRequestError",
+                            "id": block.id,
+                            "reason": format!("{e}"),
+                        }));
+                        continue;
+                    }
+                };
+            chunk_req.account_id = chunk_req.account_id.or(payload.account_id.clone());
+            if chunk_req.document_id.is_none() {
+                chunk_req.document_id = document_id.map(|id| id.to_hex());
+            }
+            if let (Some(raw), Some(document_id_v)) = (raw_content.as_deref(), document_id) {
+                apply_chunk_integrity(&mut chunk_req, raw, Some(document_id_v));
+            }
+            // 流式块走"AI/Imported source"；强制 draft + needs_review，对齐 CLAUDE.md
+            // "AI 永不自动 verify" 硬约束。
+            chunk_req.status = "draft".to_string();
+            chunk_req.integrity_status = chunk_req
+                .integrity_status
+                .or_else(|| Some("needs_review".to_string()));
+            if let Err(e) = validate_operation_knowledge_chunk(&chunk_req) {
+                parse_warnings_json.push(json!({
+                    "kind": "blockValidationError",
+                    "id": block.id,
+                    "reason": format!("{e}"),
+                }));
+                continue;
+            }
+            let result = state
+                .db
+                .operation_knowledge_chunks()
+                .insert_one(
+                    operation_knowledge_chunk_from_request(&state, chunk_req, None)?,
+                    None,
+                )
+                .await?;
+            if let Some(id) = result.inserted_id.as_object_id() {
+                chunk_ids.push(id.to_hex());
+                // 留 chunk_revisions(op=create, source=imported) 痕迹
+                let req = RevisionRequest {
+                    op: RevisionOp::Create,
+                    source: ProvenanceSource::Imported,
+                    patch: Document::new(),
+                    reason: Some(format!("import_apply chunked block id={}", block.id)),
+                    actor: payload.account_id.clone(),
+                };
+                if let Err(e) = apply_chunk_revision(
+                    &state.db,
+                    &state.config.default_workspace_id,
+                    id,
+                    req,
+                )
+                .await
+                {
+                    tracing::warn!(
+                        chunk_id = %id.to_hex(),
+                        block_id = %block.id,
+                        error = %e,
+                        "import_apply: write chunk_revision failed (non-fatal)"
+                    );
+                }
+            }
+        }
+    }
     Ok(Json(json!({
         "documentId": document_id.map(|id| id.to_hex()),
         "itemIds": item_ids,
-        "chunkIds": chunk_ids
+        "chunkIds": chunk_ids,
+        "parseWarnings": parse_warnings_json,
     })))
 }
 
@@ -1676,40 +1729,8 @@ pub(super) async fn analyze_operation_knowledge_logs(
     })))
 }
 
-pub(super) fn operation_knowledge_json(item: OperationKnowledgeItem) -> Value {
-    json!({
-        "id": item.id.map(|id| id.to_hex()).unwrap_or_default(),
-        "workspaceId": item.workspace_id,
-        "accountId": item.account_id,
-        "domain": item.domain,
-        "category": item.category,
-        "businessType": item.business_type,
-        "knowledgeType": item.knowledge_type,
-        "businessContext": item.business_context,
-        "title": item.title,
-        "summary": item.summary,
-        "body": item.body,
-        "routingCard": item.routing_card,
-        "applicableScenes": item.applicable_scenes,
-        "notApplicableScenes": item.not_applicable_scenes,
-        "suitableFor": item.suitable_for,
-        "notSuitableFor": item.not_suitable_for,
-        "customerStages": item.customer_stages,
-        "operationStates": item.operation_states,
-        "intentLevels": item.intent_levels,
-        "safeClaims": item.safe_claims,
-        "forbiddenClaims": item.forbidden_claims,
-        "commonQuestions": item.common_questions,
-        "commonObjections": item.common_objections,
-        "evidenceItems": item.evidence_items,
-        "sourceType": item.source_type,
-        "sourceName": item.source_name,
-        "status": item.status,
-        "priority": item.priority,
-        "version": item.version,
-        "updatedAt": crate::models::dt_to_string(item.updated_at)
-    })
-}
+// operation_knowledge_json removed: OperationKnowledgeItem 已随 sales 旧库删除。
+// 新的 wiki 走 operation_knowledge_chunk_json。
 
 pub(super) fn operation_knowledge_document_json(item: OperationKnowledgeDocument) -> Value {
     json!({
@@ -1747,19 +1768,12 @@ pub(super) fn operation_knowledge_chunk_json(item: OperationKnowledgeChunk) -> V
         "title": item.title,
         "summary": item.summary,
         "body": item.body,
-        "routingCard": item.routing_card,
         "applicableScenes": item.applicable_scenes,
         "notApplicableScenes": item.not_applicable_scenes,
-        "safeClaims": item.safe_claims,
-        "forbiddenClaims": item.forbidden_claims,
-        "evidenceItems": item.evidence_items,
         "sourceQuote": item.source_quote,
         "sourceAnchors": item.source_anchors,
         "integrityStatus": item.integrity_status,
         "confidenceScore": item.confidence_score,
-        "distortionRisks": item.distortion_risks,
-        "unsupportedClaims": item.unsupported_claims,
-        "verifiedClaims": item.verified_claims,
         "status": item.status,
         "priority": item.priority,
         "updatedAt": crate::models::dt_to_string(item.updated_at)
@@ -1837,72 +1851,7 @@ pub(super) fn validate_operation_knowledge_chunk(
     Ok(())
 }
 
-pub(super) fn operation_knowledge_from_request(
-    state: &AppState,
-    payload: OperationKnowledgeRequest,
-    id: Option<ObjectId>,
-) -> OperationKnowledgeItem {
-    let now = DateTime::now();
-    OperationKnowledgeItem {
-        id,
-        workspace_id: state.config.default_workspace_id.clone(),
-        account_id: payload.account_id,
-        document_id: payload
-            .document_id
-            .as_deref()
-            .and_then(|s| ObjectId::parse_str(s.trim()).ok()),
-        domain: normalize_operation_domain(&payload.domain),
-        category: if payload.category.trim().is_empty() {
-            payload
-                .knowledge_type
-                .clone()
-                .unwrap_or_else(|| "未分类知识".to_string())
-        } else {
-            payload.category
-        },
-        business_type: if payload.business_type.trim().is_empty() {
-            default_mixed_business_type()
-        } else {
-            payload.business_type
-        },
-        knowledge_type: normalize_optional(payload.knowledge_type),
-        business_context: normalize_optional(payload.business_context),
-        title: payload.title,
-        summary: normalize_optional(payload.summary),
-        body: normalize_optional(payload.body),
-        routing_card: normalize_optional(payload.routing_card),
-        applicable_scenes: payload.applicable_scenes,
-        not_applicable_scenes: payload.not_applicable_scenes,
-        suitable_for: payload.suitable_for,
-        not_suitable_for: payload.not_suitable_for,
-        customer_stages: payload.customer_stages,
-        operation_states: payload.operation_states,
-        intent_levels: payload.intent_levels,
-        safe_claims: payload.safe_claims,
-        forbidden_claims: payload.forbidden_claims,
-        common_questions: payload.common_questions,
-        common_objections: payload.common_objections,
-        evidence_items: payload.evidence_items,
-        product_tags: normalize_knowledge_tags(payload.product_tags, 5, false),
-        trigger_keywords: normalize_knowledge_tags(payload.trigger_keywords, 8, true),
-        business_topics: normalize_knowledge_tags(payload.business_topics, 3, false),
-        source_type: if payload.source_type.trim().is_empty() {
-            default_manual_source_type()
-        } else {
-            payload.source_type
-        },
-        source_name: normalize_optional(payload.source_name),
-        status: if payload.status.trim().is_empty() {
-            default_active_status()
-        } else {
-            payload.status
-        },
-        priority: payload.priority,
-        version: 1,
-        created_at: now,
-        updated_at: now,
-    }
-}
+// operation_knowledge_from_request removed: OperationKnowledgeItem 已随 sales 旧库删除。
 
 pub(super) fn operation_knowledge_document_from_request(
     state: &AppState,
@@ -1963,6 +1912,9 @@ pub(super) fn operation_knowledge_document_from_request(
         version: 1,
         created_at: now,
         updated_at: now,
+        // knowledge-wiki Phase A: catalog 落库由 worker 异步填，写入侧默认 None。
+        catalog_summary_persisted: None,
+        catalog_version: None,
     }
 }
 
@@ -1994,12 +1946,8 @@ pub(super) fn operation_knowledge_chunk_from_request(
         title: payload.title,
         summary: normalize_optional(payload.summary),
         body: normalize_optional(payload.body),
-        routing_card: normalize_optional(payload.routing_card),
         applicable_scenes: payload.applicable_scenes,
         not_applicable_scenes: payload.not_applicable_scenes,
-        safe_claims: payload.safe_claims,
-        forbidden_claims: payload.forbidden_claims,
-        evidence_items: payload.evidence_items,
         product_tags: normalize_knowledge_tags(payload.product_tags, 5, false),
         trigger_keywords: normalize_knowledge_tags(payload.trigger_keywords, 8, true),
         business_topics: normalize_knowledge_tags(payload.business_topics, 3, false),
@@ -2007,9 +1955,6 @@ pub(super) fn operation_knowledge_chunk_from_request(
         source_anchors: payload.source_anchors,
         integrity_status: normalize_optional(payload.integrity_status),
         confidence_score: payload.confidence_score,
-        distortion_risks: payload.distortion_risks,
-        unsupported_claims: payload.unsupported_claims,
-        verified_claims: payload.verified_claims,
         status: if payload.status.trim().is_empty() {
             default_active_status()
         } else {
@@ -2018,6 +1963,7 @@ pub(super) fn operation_knowledge_chunk_from_request(
         priority: payload.priority,
         created_at: now,
         updated_at: now,
+        ..Default::default()
     })
 }
 
@@ -2558,34 +2504,9 @@ pub(super) async fn build_operation_knowledge_catalog(
             "riskNotes": item.risk_notes
         }));
     }
-    let mut item_cursor = state
-        .db
-        .operation_knowledge_items()
-        .find(
-            doc! {
-                "workspace_id": &state.config.default_workspace_id,
-                "domain": "user_operations",
-                "status": "active",
-                "$or": account_filter.clone()
-            },
-            FindOptions::builder()
-                .sort(doc! { "priority": -1, "updated_at": -1 })
-                .limit(120)
-                .build(),
-        )
-        .await?;
-    let mut items = Vec::new();
-    while let Some(item) = item_cursor.try_next().await? {
-        items.push(json!({
-            "id": item.id.map(|id| id.to_hex()).unwrap_or_default(),
-            "title": item.title,
-            "knowledgeType": item.knowledge_type.or(Some(item.category)),
-            "businessContext": item.business_context.or(Some(item.business_type)),
-            "routingCard": item.routing_card.or(item.summary),
-            "applicableScenes": item.applicable_scenes,
-            "notApplicableScenes": item.not_applicable_scenes
-        }));
-    }
+    // operation_knowledge_items 已随 sales 旧库删除；catalog 中的 items 永远空。
+    let _ = &account_filter;
+    let items: Vec<Value> = Vec::new();
     let mut chunk_cursor = state
         .db
         .operation_knowledge_chunks()
@@ -2612,14 +2533,11 @@ pub(super) async fn build_operation_knowledge_catalog(
             "title": item.title,
             "knowledgeType": item.knowledge_type,
             "businessContext": item.business_context,
-            "routingCard": item.routing_card.or(item.summary),
             "applicableScenes": item.applicable_scenes,
             "notApplicableScenes": item.not_applicable_scenes,
             "integrityStatus": item.integrity_status,
             "confidenceScore": item.confidence_score,
-            "sourceAnchorCount": item.source_anchors.len(),
-            "verifiedClaimCount": item.verified_claims.len(),
-            "hasEvidence": !item.evidence_items.is_empty()
+            "sourceAnchorCount": item.source_anchors.len()
         }));
     }
     Ok(json!({
@@ -2699,12 +2617,7 @@ pub(super) async fn build_operation_knowledge_completeness(
         summaries.push(json!({
             "title": chunk.title,
             "knowledgeType": chunk.knowledge_type,
-            "businessContext": chunk.business_context,
-            "routingCard": chunk.routing_card,
-            "verifiedClaims": chunk.verified_claims,
-            "safeClaims": chunk.safe_claims,
-            "evidenceItems": chunk.evidence_items,
-            "forbiddenClaims": chunk.forbidden_claims
+            "businessContext": chunk.business_context
         }));
     }
     let fallback_mode = if verified == 0 {
@@ -3120,22 +3033,9 @@ pub(super) async fn propose_chunk_repair(
     } else {
         None
     };
-    // parent pack（用于继承 routingCard 上下文）
-    let pack = if let Some(item_id) = chunk.item_id {
-        state
-            .db
-            .operation_knowledge_items()
-            .find_one(
-                doc! {
-                    "_id": item_id,
-                    "workspace_id": &state.config.default_workspace_id
-                },
-                None,
-            )
-            .await?
-    } else {
-        None
-    };
+    // operation_knowledge_items 已删除；pack 永远为 None。
+    let pack: Option<()> = None;
+    let _ = chunk.item_id;
 
     let account_id = chunk
         .account_id
@@ -3164,16 +3064,7 @@ pub(super) async fn propose_chunk_repair(
         .unwrap_or(Value::Null);
     let pack_payload = pack
         .as_ref()
-        .map(|p| {
-            json!({
-                "title": p.title,
-                "routingCard": p.routing_card,
-                "businessContext": p.business_context,
-                "summary": p.summary,
-                "safeClaims": p.safe_claims,
-                "forbiddenClaims": p.forbidden_claims,
-            })
-        })
+        .map(|_| Value::Null)
         .unwrap_or(Value::Null);
 
     let user = format!(
@@ -3441,155 +3332,15 @@ pub(super) async fn answer_chunk_repair(
 }
 
 pub(super) async fn propose_pack_repair(
-    State(state): State<AppState>,
-    Path(id): Path<String>,
+    State(_state): State<AppState>,
+    Path(_id): Path<String>,
 ) -> AppResult<Json<Value>> {
-    let object_id = parse_object_id(&id)?;
-    let pack = state
-        .db
-        .operation_knowledge_items()
-        .find_one(
-            doc! {
-                "_id": object_id,
-                "workspace_id": &state.config.default_workspace_id
-            },
-            None,
-        )
-        .await?
-        .ok_or_else(|| AppError::NotFound("operation knowledge pack not found".to_string()))?;
-
-    // 取该包下最多 5 条 verified 切片，作为 AI 修复信号。
-    let mut chunk_cursor = state
-        .db
-        .operation_knowledge_chunks()
-        .find(
-            doc! {
-                "workspace_id": &state.config.default_workspace_id,
-                "item_id": object_id,
-                "integrity_status": "verified"
-            },
-            FindOptions::builder()
-                .sort(doc! { "updated_at": -1 })
-                .limit(5)
-                .build(),
-        )
-        .await?;
-    let mut chunk_signals: Vec<Value> = Vec::new();
-    while let Some(c) = chunk_cursor.try_next().await? {
-        chunk_signals.push(json!({
-            "title": c.title,
-            "summary": c.summary,
-            "knowledgeType": c.knowledge_type,
-            "safeClaims": c.safe_claims,
-            "forbiddenClaims": c.forbidden_claims,
-        }));
-    }
-
-    let account_id = pack
-        .account_id
-        .clone()
-        .unwrap_or_else(|| state.config.default_account_id.clone());
-
-    let system = prompts::load_prompt(
-        &state.db,
-        &state.config.default_workspace_id,
-        "knowledge.pack.repair.propose",
-    )
-    .await
-    .unwrap_or_else(|_| {
-        "你是 WechatAgent 知识库 AI 修复 Agent，目标是知识包元数据。只输出严格 JSON。".to_string()
-    });
-
-    let user = format!(
-        r#"请为下面这个知识包做 AI 自主修复（一轮）。
-知识包当前字段：
-{}
-
-该包下最多 5 条已 verified 切片信号：
-{}
-
-请按 system 中 schema 输出 JSON：包含 patch / missingFields / confidenceHint。本场景没有 sourceQuote 锚点，因此不需要 followupQuestions。"#,
-        serde_json::to_string_pretty(&operation_knowledge_json(pack.clone())).unwrap_or_default(),
-        serde_json::to_string_pretty(&chunk_signals).unwrap_or_default(),
-    );
-
-    let session_id = uuid::Uuid::new_v4().to_string();
-    let run_id = format!("repair-pack-{}-{}", id, session_id);
-    let budget = Arc::new(agent::RunBudget::new(
-        run_id.clone(),
-        REPAIR_TOKEN_BUDGET_PER_TURN,
-        REPAIR_MAX_LLM_CALLS_PER_TURN,
-        i32::MAX,
-    ));
-
-    let value = agent::RUN_BUDGET
-        .scope(budget.clone(), async {
-            agent::generate_agent_json(
-                &state,
-                Some(&account_id),
-                None,
-                Some(&run_id),
-                "knowledge.pack.repair.propose",
-                &system,
-                &user,
-            )
-            .await
-        })
-        .await?;
-
-    let parsed = parse_repair_response(&value);
-    let confidence = parsed
-        .get("confidenceHint")
-        .and_then(|v| v.as_i64())
-        .unwrap_or(0);
-    let missing = parsed
-        .get("missingFields")
-        .and_then(|v| v.as_array())
-        .cloned()
-        .unwrap_or_default();
-
-    write_repair_usage_log(
-        &state,
-        &account_id,
-        &run_id,
-        pack.id,
-        "pack_repair_session",
-        "knowledge.pack.repair.propose",
-        &id,
-        1,
-        confidence,
-        &missing,
-        0,
-    )
-    .await;
-    record_repair_event(
-        &state,
-        &account_id,
-        "knowledge_repair_proposed",
-        format!("AI 自主修复 pack:{id}"),
-        doc! {
-            "kind": "pack_repair_session",
-            "packId": &id,
-            "turn": 1i32,
-            "confidenceHint": confidence,
-            "missingFieldCount": missing.len() as i32,
-            "chunkSignalCount": chunk_signals.len() as i32,
-            "budget": budget_document(&budget),
-        },
-    )
-    .await;
-
-    Ok(Json(json!({
-        "packId": id,
-        "sessionId": session_id,
-        "turn": 1,
-        "promptKey": "knowledge.pack.repair.propose",
-        "interpretation": parsed.get("interpretation"),
-        "patch": parsed.get("patch"),
-        "missingFields": parsed.get("missingFields"),
-        "confidenceHint": parsed.get("confidenceHint"),
-        "budget": budget_document(&budget),
-    })))
+    // operation_knowledge_items 已删除；pack-level 修复路径暂时下线，
+    // 等 wiki Phase 重新规划包级别 repair。
+    Err(AppError::BadRequest(
+        "operation_knowledge_items has been removed; pack repair temporarily disabled"
+            .to_string(),
+    ))
 }
 
 /// 把 `patch.extras`（如果有）按 JSON 形态分类，仅用于审计 detail 中的
@@ -3671,23 +3422,11 @@ pub(super) async fn record_repair_apply(
                 .and_then(|c| c.account_id),
             Err(_) => None,
         },
-        "pack" => match parse_object_id(&body.target_id) {
-            Ok(oid) => state
-                .db
-                .operation_knowledge_items()
-                .find_one(
-                    doc! {
-                        "_id": oid,
-                        "workspace_id": &state.config.default_workspace_id
-                    },
-                    None,
-                )
-                .await
-                .ok()
-                .flatten()
-                .and_then(|p| p.account_id),
-            Err(_) => None,
-        },
+        "pack" => {
+            // operation_knowledge_items 已删除；pack 维度的 account_id 解析回退到默认账号。
+            let _ = parse_object_id(&body.target_id);
+            None
+        }
         _ => None,
     };
     let account_id =
@@ -4707,19 +4446,6 @@ async fn run_chat_with_tools(
         .await?
         .try_collect()
         .await?;
-    let items: Vec<OperationKnowledgeItem> = state
-        .db
-        .operation_knowledge_items()
-        .find(
-            doc! { "workspace_id": &workspace_id, "domain": "user_operations", "status": "active" },
-            FindOptions::builder()
-                .sort(doc! { "priority": -1_i32, "updated_at": -1_i32 })
-                .limit(80)
-                .build(),
-        )
-        .await?
-        .try_collect()
-        .await?;
     let chunks: Vec<OperationKnowledgeChunk> = state
         .db
         .operation_knowledge_chunks()
@@ -4740,7 +4466,6 @@ async fn run_chat_with_tools(
         .await?;
     let knowledge = KnowledgeRuntime {
         documents,
-        items,
         chunks,
     };
     let runtime = UserRuntimeParameters::default();
@@ -5017,53 +4742,10 @@ async fn draft_chunk_for_chat(
     .unwrap_or_else(|_| {
         "你是知识库对话 Agent，起草新切片草稿。只输出 JSON: {patch, missingFields, followupQuestions, naturalReply}.".to_string()
     });
-    // 加载 catalog 摘要（≤ 10 个 pack）
-    let mut packs_cursor = state
-        .db
-        .operation_knowledge_items()
-        .find(
-            doc! { "workspace_id": &state.config.default_workspace_id },
-            FindOptions::builder().limit(10).build(),
-        )
-        .await?;
-    let mut catalog: Vec<Value> = vec![];
-    while let Some(p) = packs_cursor.try_next().await? {
-        catalog.push(json!({
-            "id": p.id.map(|o| o.to_hex()),
-            "title": p.title,
-            "domain": p.domain,
-            "summary": p.summary,
-        }));
-    }
-    let pack_payload = if let Some(pack_id) = target_pack_id {
-        if let Ok(oid) = ObjectId::parse_str(pack_id) {
-            state
-                .db
-                .operation_knowledge_items()
-                .find_one(
-                    doc! {
-                        "_id": oid,
-                        "workspace_id": &state.config.default_workspace_id,
-                    },
-                    None,
-                )
-                .await?
-                .map(|p| {
-                    json!({
-                        "id": p.id.map(|o| o.to_hex()),
-                        "title": p.title,
-                        "routingCard": p.routing_card,
-                        "businessContext": p.business_context,
-                        "summary": p.summary,
-                    })
-                })
-                .unwrap_or(Value::Null)
-        } else {
-            Value::Null
-        }
-    } else {
-        Value::Null
-    };
+    // operation_knowledge_items 已删除；catalog/pack_payload 永远为空。
+    let catalog: Vec<Value> = vec![];
+    let _ = target_pack_id;
+    let pack_payload = Value::Null;
     let user = format!(
         r#"运营本轮输入：
 {user_content}
@@ -5180,76 +4862,17 @@ async fn update_chunk_for_chat(
 }
 
 async fn update_pack_for_chat(
-    state: &AppState,
-    account_id: &str,
-    session_id: &str,
-    user_content: &str,
+    _state: &AppState,
+    _account_id: &str,
+    _session_id: &str,
+    _user_content: &str,
     pack_id: &str,
-    history: &[KnowledgeChatTurn],
+    _history: &[KnowledgeChatTurn],
 ) -> AppResult<Value> {
-    let oid = parse_object_id(pack_id)?;
-    let pack = state
-        .db
-        .operation_knowledge_items()
-        .find_one(
-            doc! {
-                "_id": oid,
-                "workspace_id": &state.config.default_workspace_id,
-            },
-            None,
-        )
-        .await?
-        .ok_or_else(|| AppError::NotFound(format!("pack {pack_id} not found")))?;
-    // 复用 chat.update_chunk 提示词的 patch 风格（仅改运营提到的字段），
-    // user 中明确告知正在改 pack 元数据（routingCard / customerStages / ...）。
-    let system = prompts::load_prompt(
-        &state.db,
-        &state.config.default_workspace_id,
-        "knowledge.chat.update_chunk",
-    )
-    .await
-    .unwrap_or_else(|_| {
-        "你是知识库对话 Agent，按运营对话给出知识包元数据修改 patch。只输出 JSON: {patch, missingFields, followupQuestions, naturalReply}.".to_string()
-    });
-    let user = format!(
-        r#"本轮目标：在知识包元数据上做局部修改。
-运营本轮输入：
-{user_content}
-
-待修改知识包当前字段：
-{}
-
-最近历史（最多 6 条）：
-{}
-
-请仅对运营提到的字段做改动；其它字段省略。常见可改字段：routingCard / summary / customerStages / commonObjections / safeClaims / forbiddenClaims / extras。"#,
-        serde_json::to_string_pretty(&json!({
-            "id": pack.id.map(|o| o.to_hex()),
-            "title": pack.title,
-            "routingCard": pack.routing_card,
-            "businessContext": pack.business_context,
-            "summary": pack.summary,
-            "customerStages": pack.customer_stages,
-            "intentLevels": pack.intent_levels,
-            "commonQuestions": pack.common_questions,
-            "commonObjections": pack.common_objections,
-            "safeClaims": pack.safe_claims,
-            "forbiddenClaims": pack.forbidden_claims,
-        }))
-        .unwrap_or_default(),
-        render_chat_history_for_prompt(history),
-    );
-    let run_id = format!("chat-{session_id}-pack-update");
-    agent::generate_agent_json(
-        state,
-        Some(account_id),
-        None,
-        Some(&run_id),
-        "knowledge.chat.update_chunk",
-        &system,
-        &user,
-    )
-    .await
+    // operation_knowledge_items 已删除；pack-level chat 路径暂时下线。
+    Err(AppError::BadRequest(format!(
+        "operation_knowledge_items has been removed; pack {pack_id} chat update is disabled"
+    )))
 }
 
 async fn clarify_for_chat(
@@ -5485,52 +5108,15 @@ async fn apply_update_chunk(
 }
 
 async fn apply_update_pack(
-    state: &AppState,
+    _state: &AppState,
     _account_id: &str,
     pack_id: &str,
-    patch: &Document,
+    _patch: &Document,
 ) -> AppResult<Value> {
-    let oid = parse_object_id(pack_id)?;
-    let mut update_doc = Document::new();
-    for (camel, snake) in [
-        ("routingCard", "routing_card"),
-        ("summary", "summary"),
-        ("businessContext", "business_context"),
-        ("customerStages", "customer_stages"),
-        ("intentLevels", "intent_levels"),
-        ("commonQuestions", "common_questions"),
-        ("commonObjections", "common_objections"),
-        ("safeClaims", "safe_claims"),
-        ("forbiddenClaims", "forbidden_claims"),
-    ] {
-        if let Some(val) = patch.get(camel) {
-            update_doc.insert(snake, val.clone());
-        }
-    }
-    if update_doc.is_empty() {
-        return Ok(json!({
-            "updatedPackId": pack_id,
-            "fieldsTouched": 0,
-            "note": "patch 没有可识别字段，未改动",
-        }));
-    }
-    update_doc.insert("updated_at", DateTime::now());
-    state
-        .db
-        .operation_knowledge_items()
-        .update_one(
-            doc! {
-                "_id": oid,
-                "workspace_id": &state.config.default_workspace_id,
-            },
-            doc! { "$set": update_doc.clone() },
-            None,
-        )
-        .await?;
-    Ok(json!({
-        "updatedPackId": pack_id,
-        "fieldsTouched": update_doc.len() - 1,
-    }))
+    // operation_knowledge_items 已删除；pack-level apply 路径暂时下线。
+    Err(AppError::BadRequest(format!(
+        "operation_knowledge_items has been removed; pack {pack_id} update is disabled"
+    )))
 }
 
 /// 把 chat 产出的 patch（camelCase JSON）转成 OperationKnowledgeChunkRequest。
@@ -6024,6 +5610,1200 @@ fn bson_from_json(value: &Value) -> Result<Document, String> {
     mongodb::bson::to_document(value).map_err(|e| e.to_string())
 }
 
+// ── AI Inbox 聚合（GET /operation-knowledge/inbox） ────────────────────────
+//
+// 知识库 AI 协作工作站顶层的待办流。把四类只读信号聚合成统一形态：
+//   1. digest_card    —— 当日 KnowledgeDailyReport.cards（未 dismiss）
+//   2. quote_missing  —— operation_knowledge_chunks 缺 source_quote
+//   3. anchors_missing —— operation_knowledge_chunks 缺 source_anchors
+//   4. pending_review —— integrity_status == "needs_review"
+//
+// 全部 read-only，**不写库**、不动 schema、不新增 collection。
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct InboxQuery {
+    pub account_id: Option<String>,
+    pub priority: Option<String>,
+    pub limit: Option<u32>,
+}
+
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct InboxCardView {
+    pub id: String,
+    pub priority: String,
+    pub kind: String,
+    pub title: String,
+    pub context_summary: String,
+    pub target_chunk_id: Option<String>,
+    pub target_pack_id: Option<String>,
+    pub suggested_actions: Vec<String>,
+    pub origin: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct InboxStats {
+    pub total: usize,
+    pub high: usize,
+    pub mid: usize,
+    pub low: usize,
+}
+
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct InboxResponse {
+    pub items: Vec<InboxCardView>,
+    pub stats: InboxStats,
+}
+
+/// digest 卡片 severity → inbox priority。
+fn severity_to_priority(severity: &str) -> &'static str {
+    match severity {
+        "critical" => "high",
+        "warn" => "mid",
+        _ => "low",
+    }
+}
+
+/// digest 卡片 suggested_action → inbox suggested actions。
+fn digest_action_to_actions(action: &str) -> Vec<String> {
+    match action {
+        "fix_chunk" | "add_chunk" | "retag" => {
+            vec!["open_chat".into(), "dismiss".into()]
+        }
+        "review_evolution" => vec!["open_chat".into(), "dismiss".into()],
+        "dismiss" => vec!["dismiss".into()],
+        _ => vec!["open_chat".into(), "dismiss".into()],
+    }
+}
+
+/// digest 卡片 kind → inbox kind。
+fn digest_kind_to_inbox_kind(kind: &str) -> &'static str {
+    match kind {
+        "chunk_missing_field" => "fill_field",
+        "chunk_low_hit_rate" => "repair_chunk",
+        "chunk_caused_block" => "repair_chunk",
+        "pack_outdated" => "repair_chunk",
+        "evolution_pending" => "repair_chunk",
+        "evolution_released" => "repair_chunk",
+        _ => "repair_chunk",
+    }
+}
+
+/// 比较两条 inbox 条目，priority 高的在前。
+fn priority_rank(p: &str) -> u8 {
+    match p {
+        "high" => 3,
+        "mid" => 2,
+        "low" => 1,
+        _ => 0,
+    }
+}
+
+pub(super) async fn knowledge_inbox(
+    State(state): State<AppState>,
+    Query(query): Query<InboxQuery>,
+) -> AppResult<Json<InboxResponse>> {
+    let account_id = query
+        .account_id
+        .clone()
+        .unwrap_or_else(|| state.config.default_account_id.clone());
+    let limit_cap = query.limit.unwrap_or(24).clamp(1, 100) as usize;
+    let priority_filter = query.priority.as_deref();
+
+    let mut items: Vec<InboxCardView> = Vec::new();
+
+    // 1) digest_card: 当日 KnowledgeDailyReport.cards 未 dismiss。
+    let report_date = chrono::Local::now().format("%Y-%m-%d").to_string();
+    if let Some(report) = state
+        .db
+        .knowledge_daily_reports()
+        .find_one(
+            doc! {
+                "workspace_id": &state.config.default_workspace_id,
+                "account_id": &account_id,
+                "report_date": &report_date,
+            },
+            None,
+        )
+        .await?
+    {
+        let dismissed: std::collections::HashSet<String> = report
+            .dismissed_card_ids
+            .iter()
+            .map(|oid| oid.to_hex())
+            .collect();
+        for card in &report.cards {
+            let card_id_hex = card.card_id.to_hex();
+            if dismissed.contains(&card_id_hex) {
+                continue;
+            }
+            // 提取 target chunk / pack id（如果 target_refs 里有）。
+            let mut target_chunk: Option<String> = None;
+            let mut target_pack: Option<String> = None;
+            for r in &card.target_refs {
+                let kind = r.get_str("kind").unwrap_or("");
+                let id = r.get_str("id").unwrap_or("");
+                if id.is_empty() {
+                    continue;
+                }
+                match kind {
+                    "chunk" => {
+                        if target_chunk.is_none() {
+                            target_chunk = Some(id.to_string());
+                        }
+                    }
+                    "pack" | "item" => {
+                        if target_pack.is_none() {
+                            target_pack = Some(id.to_string());
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            items.push(InboxCardView {
+                id: format!("digest:{}", card_id_hex),
+                priority: severity_to_priority(&card.severity).to_string(),
+                kind: digest_kind_to_inbox_kind(&card.kind).to_string(),
+                title: card.title.clone(),
+                context_summary: card.summary.clone(),
+                target_chunk_id: target_chunk,
+                target_pack_id: target_pack,
+                suggested_actions: digest_action_to_actions(&card.suggested_action),
+                origin: "digest_card".into(),
+                created_at: crate::models::dt_to_string(report.generated_at).unwrap_or_default(),
+            });
+        }
+    }
+
+    // 2/3/4) 三类来源都从 operation_knowledge_chunks 拉。统一拉一次，逐条分类。
+    let chunks_filter = doc! {
+        "workspace_id": &state.config.default_workspace_id,
+        "$or": [
+            { "account_id": null },
+            { "account_id": { "$exists": false } },
+            { "account_id": &account_id },
+        ],
+        "status": { "$in": ["active", "draft"] },
+    };
+    let chunks_cursor = state
+        .db
+        .operation_knowledge_chunks()
+        .find(
+            chunks_filter,
+            FindOptions::builder()
+                .sort(doc! { "updated_at": -1 })
+                .limit(200_i64)
+                .build(),
+        )
+        .await?;
+    let chunks: Vec<OperationKnowledgeChunk> = chunks_cursor.try_collect().await?;
+
+    let cutoff_ms = (chrono::Utc::now()
+        - chrono::Duration::days(7))
+    .timestamp_millis();
+
+    for c in &chunks {
+        let chunk_id_hex = match &c.id {
+            Some(oid) => oid.to_hex(),
+            None => continue,
+        };
+        let title = if c.title.trim().is_empty() {
+            chunk_id_hex.clone()
+        } else {
+            c.title.clone()
+        };
+        let quote = c.source_quote.clone().unwrap_or_default();
+        let has_quote = !quote.trim().is_empty();
+        let has_anchor = !c.source_anchors.is_empty();
+        let integrity = c.integrity_status.clone().unwrap_or_default();
+        let updated_ms = c.updated_at.timestamp_millis();
+
+        // 4) pending_review：integrity_status = needs_review 且 7d 内更新。
+        if integrity == "needs_review" && updated_ms >= cutoff_ms {
+            items.push(InboxCardView {
+                id: format!("chunk:{}:review", chunk_id_hex),
+                priority: "mid".into(),
+                kind: "repair_chunk".into(),
+                title: format!("待审切片：{}", title),
+                context_summary: c
+                    .summary
+                    .clone()
+                    .unwrap_or_else(|| "AI 起草，等运营确认。".into()),
+                target_chunk_id: Some(chunk_id_hex.clone()),
+                target_pack_id: None,
+                suggested_actions: vec!["open_chat".into(), "open_repair".into(), "dismiss".into()],
+                origin: "pending_review".into(),
+                created_at: crate::models::dt_to_string(c.updated_at).unwrap_or_default(),
+            });
+        }
+
+        // 2) quote_missing：active 且无 source_quote。
+        if c.status == "active" && !has_quote {
+            items.push(InboxCardView {
+                id: format!("chunk:{}:quote", chunk_id_hex),
+                priority: "high".into(),
+                kind: "fill_field".into(),
+                title: format!("补原文出处：{}", title),
+                context_summary: "AI 检测到该切片缺 sourceQuote，无法通过验证。".into(),
+                target_chunk_id: Some(chunk_id_hex.clone()),
+                target_pack_id: None,
+                suggested_actions: vec!["open_chat".into(), "open_repair".into()],
+                origin: "quote_missing".into(),
+                created_at: crate::models::dt_to_string(c.updated_at).unwrap_or_default(),
+            });
+        }
+
+        // 3) anchors_missing：active 且无 source_anchors（即便有 quote 也算）。
+        if c.status == "active" && !has_anchor {
+            items.push(InboxCardView {
+                id: format!("chunk:{}:anchor", chunk_id_hex),
+                priority: "high".into(),
+                kind: "repair_chunk".into(),
+                title: format!("修复原文锚点：{}", title),
+                context_summary: "AI 检测到该切片 sourceAnchors 为空，需要重新锚定。".into(),
+                target_chunk_id: Some(chunk_id_hex.clone()),
+                target_pack_id: None,
+                suggested_actions: vec!["open_chat".into(), "open_repair".into()],
+                origin: "anchors_missing".into(),
+                created_at: crate::models::dt_to_string(c.updated_at).unwrap_or_default(),
+            });
+        }
+    }
+
+    // 优先级过滤。
+    if let Some(p) = priority_filter {
+        items.retain(|it| it.priority == p);
+    }
+
+    // 排序：priority 降序，再按 origin 顺序保留稳定。
+    items.sort_by(|a, b| priority_rank(&b.priority).cmp(&priority_rank(&a.priority)));
+
+    // 截断到 limit。
+    if items.len() > limit_cap {
+        items.truncate(limit_cap);
+    }
+
+    let high = items.iter().filter(|c| c.priority == "high").count();
+    let mid = items.iter().filter(|c| c.priority == "mid").count();
+    let low = items.iter().filter(|c| c.priority == "low").count();
+    let stats = InboxStats {
+        total: items.len(),
+        high,
+        mid,
+        low,
+    };
+
+    Ok(Json(InboxResponse { items, stats }))
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// knowledge-wiki Phase C: 7 个 chunk 编辑路由 + 1 个删除级联包装
+// ──────────────────────────────────────────────────────────────────────
+//
+// 全部走 `crate::knowledge_wiki::chunk_revisions::apply_chunk_revision`：
+// 1) 锁定字段守门（patch 含 chunk_id/wiki_type/source_anchor/... → 4xx）
+// 2) 数组字段 union（应用层完成，零 LLM 风险）
+// 3) 70% body 长度阈值（LLM 截断/偷懒拒收）
+// 4) AI source 强制 status=draft + integrity_status=needs_review
+// 5) 双写 chunk_revisions + chunks，先 history 后最新
+// 6) enqueue catalog_rebuild_jobs（best-effort）
+
+use crate::knowledge_wiki::chunk_revisions::{
+    apply_chunk_revision, cleanup_dangling_refs, ProvenanceSource, RevisionApplied, RevisionOp,
+    RevisionRequest,
+};
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct ChunkPatchRequest {
+    /// 字段级 patch；不允许携带 locked_fields。
+    pub patch: Value,
+    /// "ai" / "human" / "rule" / "imported"。
+    #[serde(default = "default_chunk_patch_source")]
+    pub source: String,
+    pub reason: Option<String>,
+    pub actor: Option<String>,
+}
+
+fn default_chunk_patch_source() -> String {
+    "human".to_string()
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct ChunkArchiveRequest {
+    pub reason: Option<String>,
+    pub actor: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct ChunkRollbackRequest {
+    pub actor: Option<String>,
+}
+
+/// JSON Value → BSON Document（用于 ChunkPatchRequest.patch）。
+fn json_object_to_document(v: &Value) -> AppResult<Document> {
+    let obj = v
+        .as_object()
+        .ok_or_else(|| AppError::BadRequest("patch 必须是 JSON 对象".to_string()))?;
+    let bson_value: Bson = mongodb::bson::to_bson(obj)
+        .map_err(|e| AppError::BadRequest(format!("patch 转 BSON 失败: {e}")))?;
+    match bson_value {
+        Bson::Document(d) => Ok(d),
+        _ => Err(AppError::BadRequest("patch 必须是 JSON 对象".to_string())),
+    }
+}
+
+fn revision_applied_to_json(r: &RevisionApplied) -> Value {
+    json!({
+        "ok": true,
+        "revisionId": r.revision_id,
+        "chunkId": r.chunk_id,
+        "op": r.op,
+        "beforeHash": r.before_hash,
+        "afterHash": r.after_hash,
+        "unchanged": r.unchanged,
+    })
+}
+
+/// 把 `block_parser::ParseWarning` 序列化为 import_apply 返回体里的统一形态。
+fn parse_warning_to_json(w: &crate::knowledge_wiki::block_parser::ParseWarning) -> Value {
+    use crate::knowledge_wiki::block_parser::ParseWarning::*;
+    match w {
+        UnsafeBlockId { id } => json!({"kind": "unsafeBlockId", "id": id}),
+        UnterminatedFence { id } => json!({"kind": "unterminatedFence", "id": id}),
+        DuplicateBlockId { id, occurrences } => {
+            json!({"kind": "duplicateBlockId", "id": id, "occurrences": occurrences})
+        }
+        InvalidJson { id, reason } => {
+            json!({"kind": "invalidJson", "id": id, "reason": reason})
+        }
+        StrayText { excerpt } => json!({"kind": "strayText", "excerpt": excerpt}),
+    }
+}
+
+/// `POST /operation-knowledge/chunks/:id/patch` — 字段级 patch。
+pub(super) async fn patch_operation_knowledge_chunk(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(payload): Json<ChunkPatchRequest>,
+) -> AppResult<Json<Value>> {
+    let object_id = parse_object_id(&id)?;
+    let patch = json_object_to_document(&payload.patch)?;
+    let source: ProvenanceSource = payload.source.parse()?;
+    let req = RevisionRequest {
+        op: RevisionOp::Patch,
+        source,
+        patch,
+        reason: payload.reason,
+        actor: payload.actor,
+    };
+    let applied = apply_chunk_revision(
+        &state.db,
+        &state.config.default_workspace_id,
+        object_id,
+        req,
+    )
+    .await?;
+    Ok(Json(revision_applied_to_json(&applied)))
+}
+
+/// `POST /operation-knowledge/chunks/:id/archive` — 软删（status=archived）+
+/// 删除级联（清空其它 chunk 的 related_chunks 引用）。
+pub(super) async fn archive_operation_knowledge_chunk(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(payload): Json<ChunkArchiveRequest>,
+) -> AppResult<Json<Value>> {
+    let object_id = parse_object_id(&id)?;
+    let req = RevisionRequest {
+        op: RevisionOp::Archive,
+        source: ProvenanceSource::Human,
+        patch: Document::new(),
+        reason: payload.reason,
+        actor: payload.actor,
+    };
+    let applied = apply_chunk_revision(
+        &state.db,
+        &state.config.default_workspace_id,
+        object_id,
+        req,
+    )
+    .await?;
+    let cleaned = cleanup_dangling_refs(
+        &state.db,
+        &state.config.default_workspace_id,
+        &applied.chunk_id,
+    )
+    .await
+    .unwrap_or(0);
+    let mut value = revision_applied_to_json(&applied);
+    if let Some(o) = value.as_object_mut() {
+        o.insert("cleanedReferences".to_string(), json!(cleaned));
+    }
+    Ok(Json(value))
+}
+
+/// `POST /operation-knowledge/chunks/:id/restore` — 取消 archive。
+pub(super) async fn restore_operation_knowledge_chunk(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(payload): Json<ChunkArchiveRequest>,
+) -> AppResult<Json<Value>> {
+    let object_id = parse_object_id(&id)?;
+    let req = RevisionRequest {
+        op: RevisionOp::Restore,
+        source: ProvenanceSource::Human,
+        patch: Document::new(),
+        reason: payload.reason,
+        actor: payload.actor,
+    };
+    let applied = apply_chunk_revision(
+        &state.db,
+        &state.config.default_workspace_id,
+        object_id,
+        req,
+    )
+    .await?;
+    Ok(Json(revision_applied_to_json(&applied)))
+}
+
+/// `POST /operation-knowledge/chunks/:id/rollback/:revision_id` — 回滚到某 revision
+/// 之前的 chunk 状态。
+///
+/// 实现方式：找到目标 revision，反向应用 patch（把 patch 中每个 key 的值改回
+/// `before_hash` 时刻的内容）。简化：当前不支持精确"还原到某个时间点"，仅支持
+/// "把当前 chunk 的关键字段重写为目标 revision 的 patch 中字段的反值"——所以
+/// 通常用法是回滚最近一次 patch（其它复杂场景请用 `/patch` 显式指定）。
+///
+/// 写入仍走 apply_chunk_revision(op=Rollback)，留下"我回滚到了 X"的痕迹而非
+/// 物理删除 history。
+pub(super) async fn rollback_operation_knowledge_chunk(
+    State(state): State<AppState>,
+    Path((id, revision_id)): Path<(String, String)>,
+    Json(payload): Json<ChunkRollbackRequest>,
+) -> AppResult<Json<Value>> {
+    let object_id = parse_object_id(&id)?;
+    // 找目标 revision
+    let target = state
+        .db
+        .chunk_revisions()
+        .find_one(
+            doc! {
+                "chunk_id": object_id.to_hex(),
+                "revision_id": &revision_id,
+            },
+            None,
+        )
+        .await?
+        .ok_or_else(|| AppError::NotFound(format!("revision {revision_id} not found")))?;
+    // 找它的"前一条"revision —— 即 created_at < target.created_at 的最近一条
+    let prev = state
+        .db
+        .chunk_revisions()
+        .find_one(
+            doc! {
+                "chunk_id": object_id.to_hex(),
+                "created_at": { "$lt": target.created_at },
+            },
+            mongodb::options::FindOneOptions::builder()
+                .sort(doc! { "created_at": -1 })
+                .build(),
+        )
+        .await?;
+    // 简化策略：rollback 时把目标 revision 的 patch 中所有 key 设为前一条 revision
+    // patch 中相应字段的值；前一条不存在或字段不存在 → 移除（用 $unset，但这里
+    // 走 apply_chunk_revision 路径，所以用 BSON Null 表示移除意图，由
+    // apply_field_patch 兼容处理为空字符串/空数组）。
+    //
+    // 因为 apply_chunk_revision 不直接支持 $unset，我们在 patch 中只回填能找到
+    // 的字段；找不到的字段提示 caller "无法完整回滚某些字段"。
+    let mut rollback_patch = Document::new();
+    let mut missing: Vec<String> = Vec::new();
+    if let Some(prev_rev) = &prev {
+        for key in target.patch.keys() {
+            if let Some(prev_val) = prev_rev.patch.get(key) {
+                rollback_patch.insert(key, prev_val.clone());
+            } else {
+                missing.push(key.to_string());
+            }
+        }
+    } else {
+        for key in target.patch.keys() {
+            missing.push(key.to_string());
+        }
+    }
+    let req = RevisionRequest {
+        op: RevisionOp::Rollback,
+        source: ProvenanceSource::Human,
+        patch: rollback_patch,
+        reason: Some(format!(
+            "rollback to revision {revision_id}; missing_fields={}",
+            missing.len()
+        )),
+        actor: payload.actor,
+    };
+    let applied = apply_chunk_revision(
+        &state.db,
+        &state.config.default_workspace_id,
+        object_id,
+        req,
+    )
+    .await?;
+    let mut value = revision_applied_to_json(&applied);
+    if let Some(o) = value.as_object_mut() {
+        o.insert("rollbackTo".to_string(), json!(revision_id));
+        o.insert("missingFields".to_string(), json!(missing));
+    }
+    Ok(Json(value))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct ChunkRevisionsQuery {
+    pub limit: Option<u32>,
+    pub offset: Option<u32>,
+}
+
+/// `GET /operation-knowledge/chunks/:id/revisions` — 分页拉取编辑历史。
+///
+/// 长字段（patch 内的 body / answer 等）在响应里保留原文；前端长 body 自行 mask。
+pub(super) async fn list_operation_knowledge_chunk_revisions(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Query(query): Query<ChunkRevisionsQuery>,
+) -> AppResult<Json<Value>> {
+    use futures::TryStreamExt;
+    let object_id = parse_object_id(&id)?;
+    let limit = query.limit.unwrap_or(20).clamp(1, 200) as i64;
+    let skip = query.offset.unwrap_or(0) as u64;
+    let opts = FindOptions::builder()
+        .sort(doc! { "created_at": -1 })
+        .limit(limit)
+        .skip(skip)
+        .build();
+    let revisions: Vec<_> = state
+        .db
+        .chunk_revisions()
+        .find(doc! { "chunk_id": object_id.to_hex() }, opts)
+        .await?
+        .try_collect()
+        .await?;
+    let items: Vec<Value> = revisions
+        .iter()
+        .map(|r| {
+            json!({
+                "revisionId": r.revision_id,
+                "chunkId": r.chunk_id,
+                "op": r.op,
+                "patch": mongodb::bson::Bson::Document(r.patch.clone()).into_canonical_extjson(),
+                "beforeHash": r.before_hash,
+                "afterHash": r.after_hash,
+                "source": r.source,
+                "reason": r.reason,
+                "createdAt": r.created_at.to_string(),
+                "createdBy": r.created_by,
+            })
+        })
+        .collect();
+    Ok(Json(json!({
+        "items": items,
+        "limit": limit,
+        "offset": skip,
+    })))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct ChunkSplitRequest {
+    /// 把当前 chunk 内容按这一段拆分成 N 份的锚点描述（仅记入 reason，
+    /// 实际拆分由 caller 提供新 chunks 内容）。
+    pub split_anchor: Option<String>,
+    /// N 个新 chunk 的 patch 描述（每份至少含 title + body）。
+    pub new_chunks: Vec<Value>,
+    pub reason: Option<String>,
+    pub actor: Option<String>,
+}
+
+/// `POST /operation-knowledge/chunks/:id/split` — 拆分 chunk。
+///
+/// 行为：
+/// 1. 把原 chunk 标 archived（写一条 op=split revision）；
+/// 2. 复制原 chunk 的 metadata（domain / wiki_type / workspace_id / document_id），
+///    覆盖 caller 提供的字段，新建 N 个 chunk（每份写 op=create revision，
+///    `previous_version_id` 指向原 chunk）。
+///
+/// 失败回滚不做 atomicity 保证（按 LLW 简化策略：split/merge 是低频运营动作，
+/// 失败时 admin 直接看 history 修复）。
+pub(super) async fn split_operation_knowledge_chunk(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(payload): Json<ChunkSplitRequest>,
+) -> AppResult<Json<Value>> {
+    let object_id = parse_object_id(&id)?;
+    let workspace_id = &state.config.default_workspace_id;
+    if payload.new_chunks.is_empty() {
+        return Err(AppError::BadRequest(
+            "new_chunks 不可为空，至少需要 1 份新 chunk".to_string(),
+        ));
+    }
+    let original = state
+        .db
+        .operation_knowledge_chunks()
+        .find_one(
+            doc! { "_id": object_id, "workspace_id": workspace_id },
+            None,
+        )
+        .await?
+        .ok_or_else(|| AppError::NotFound("operation knowledge chunk not found".to_string()))?;
+    // 1) 原 chunk archive
+    let archive_req = RevisionRequest {
+        op: RevisionOp::Split,
+        source: ProvenanceSource::Human,
+        patch: Document::new(),
+        reason: payload
+            .reason
+            .clone()
+            .or_else(|| Some(format!("split into {} new chunks", payload.new_chunks.len()))),
+        actor: payload.actor.clone(),
+    };
+    // 用 archive 语义但 op 标 Split（apply_chunk_revision 内部把 status 设 archived）
+    let mut archive_patch = Document::new();
+    archive_patch.insert("status", "archived");
+    let archive_req = RevisionRequest {
+        patch: archive_patch,
+        ..archive_req
+    };
+    let archived = apply_chunk_revision(&state.db, workspace_id, object_id, archive_req).await?;
+    // 2) 创建 N 个新 chunk
+    let mut new_ids: Vec<String> = Vec::new();
+    let now = DateTime::now();
+    for raw in &payload.new_chunks {
+        let mut new_doc = Document::new();
+        new_doc.insert("workspace_id", workspace_id);
+        new_doc.insert("account_id", original.account_id.clone());
+        new_doc.insert(
+            "document_id",
+            original
+                .document_id
+                .map(Bson::ObjectId)
+                .unwrap_or(Bson::Null),
+        );
+        new_doc.insert("domain", original.domain.clone());
+        new_doc.insert("title", "拆分草稿（待编辑）");
+        new_doc.insert("status", "draft");
+        new_doc.insert("integrity_status", "needs_review");
+        new_doc.insert("priority", original.priority);
+        new_doc.insert("created_at", now);
+        new_doc.insert("updated_at", now);
+        new_doc.insert(
+            "wiki_type",
+            original
+                .wiki_type
+                .clone()
+                .unwrap_or_else(|| "entity".to_string()),
+        );
+        new_doc.insert("previous_version_id", object_id.to_hex());
+        // 合并 caller 给出的字段（title / body / summary 等）
+        let raw_doc = json_object_to_document(raw)?;
+        for (k, v) in raw_doc.iter() {
+            new_doc.insert(k, v.clone());
+        }
+        let inserted = state
+            .db
+            .operation_knowledge_chunks()
+            .insert_one(
+                mongodb::bson::from_document::<crate::models::OperationKnowledgeChunk>(new_doc.clone())
+                    .map_err(|e| AppError::BadRequest(format!("split 新 chunk 字段不合法: {e}")))?,
+                None,
+            )
+            .await?;
+        if let Some(oid) = inserted.inserted_id.as_object_id() {
+            // 写一条 create revision（source=human，便于审计）
+            let create_req = RevisionRequest {
+                op: RevisionOp::Create,
+                source: ProvenanceSource::Human,
+                patch: raw_doc,
+                reason: Some(format!(
+                    "split from chunk {} (anchor={})",
+                    object_id.to_hex(),
+                    payload.split_anchor.clone().unwrap_or_default()
+                )),
+                actor: payload.actor.clone(),
+            };
+            // 该 chunk 在 DB 中已存在，apply_chunk_revision 会读它再写一次（幂等）
+            let _ = apply_chunk_revision(&state.db, workspace_id, oid, create_req).await;
+            new_ids.push(oid.to_hex());
+        }
+    }
+    Ok(Json(json!({
+        "ok": true,
+        "archived": revision_applied_to_json(&archived),
+        "newChunkIds": new_ids,
+    })))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct ChunkMergeRequest {
+    /// 合并目标的 chunk_id。
+    pub merge_target_id: String,
+    /// "into_target": 内容并入 target，原 chunk 归档；
+    /// "new_chunk": 双 archive，创建新 chunk（new_chunks[0] 为新 chunk 字段集）。
+    #[serde(default = "default_merge_strategy")]
+    pub merge_strategy: String,
+    pub new_chunk: Option<Value>,
+    pub reason: Option<String>,
+    pub actor: Option<String>,
+}
+
+fn default_merge_strategy() -> String {
+    "into_target".to_string()
+}
+
+/// `POST /operation-knowledge/chunks/:id/merge` — 合并 chunk。
+pub(super) async fn merge_operation_knowledge_chunk(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(payload): Json<ChunkMergeRequest>,
+) -> AppResult<Json<Value>> {
+    let object_id = parse_object_id(&id)?;
+    let target_id = parse_object_id(&payload.merge_target_id)?;
+    let workspace_id = &state.config.default_workspace_id;
+    match payload.merge_strategy.as_str() {
+        "into_target" => {
+            // 把原 chunk 归档，target chunk 接收一些字段（数组字段会自动 union）
+            let archive = RevisionRequest {
+                op: RevisionOp::Merge,
+                source: ProvenanceSource::Human,
+                patch: doc! { "status": "archived", "superseded_by": target_id.to_hex() },
+                reason: payload.reason.clone(),
+                actor: payload.actor.clone(),
+            };
+            let arch = apply_chunk_revision(&state.db, workspace_id, object_id, archive).await?;
+            // target chunk 写一条 merge revision（patch=空，意在记录"我吸收了原 chunk"）
+            let target_req = RevisionRequest {
+                op: RevisionOp::Merge,
+                source: ProvenanceSource::Human,
+                patch: doc! { "previous_version_id": object_id.to_hex() },
+                reason: Some(format!("merged from chunk {}", object_id.to_hex())),
+                actor: payload.actor.clone(),
+            };
+            let tgt = apply_chunk_revision(&state.db, workspace_id, target_id, target_req).await?;
+            Ok(Json(json!({
+                "ok": true,
+                "archived": revision_applied_to_json(&arch),
+                "target": revision_applied_to_json(&tgt),
+            })))
+        }
+        "new_chunk" => {
+            // 双 archive + 新 chunk
+            let arch_a = apply_chunk_revision(
+                &state.db,
+                workspace_id,
+                object_id,
+                RevisionRequest {
+                    op: RevisionOp::Merge,
+                    source: ProvenanceSource::Human,
+                    patch: doc! { "status": "archived" },
+                    reason: payload.reason.clone(),
+                    actor: payload.actor.clone(),
+                },
+            )
+            .await?;
+            let arch_b = apply_chunk_revision(
+                &state.db,
+                workspace_id,
+                target_id,
+                RevisionRequest {
+                    op: RevisionOp::Merge,
+                    source: ProvenanceSource::Human,
+                    patch: doc! { "status": "archived" },
+                    reason: payload.reason.clone(),
+                    actor: payload.actor.clone(),
+                },
+            )
+            .await?;
+            let raw = payload.new_chunk.ok_or_else(|| {
+                AppError::BadRequest(
+                    "merge_strategy=new_chunk 时必须提供 new_chunk 字段".to_string(),
+                )
+            })?;
+            let raw_doc = json_object_to_document(&raw)?;
+            let now = DateTime::now();
+            let mut new_doc = raw_doc.clone();
+            new_doc.insert("workspace_id", workspace_id);
+            new_doc.insert("status", "draft");
+            new_doc.insert("integrity_status", "needs_review");
+            new_doc.insert("created_at", now);
+            new_doc.insert("updated_at", now);
+            if !new_doc.contains_key("priority") {
+                new_doc.insert("priority", 0i32);
+            }
+            if !new_doc.contains_key("title") {
+                new_doc.insert("title", "合并草稿（待编辑）");
+            }
+            if !new_doc.contains_key("domain") {
+                new_doc.insert("domain", "user");
+            }
+            if !new_doc.contains_key("wiki_type") {
+                new_doc.insert("wiki_type", "entity");
+            }
+            new_doc.insert(
+                "previous_version_id",
+                format!("{}+{}", object_id.to_hex(), target_id.to_hex()),
+            );
+            let inserted = state
+                .db
+                .operation_knowledge_chunks()
+                .insert_one(
+                    mongodb::bson::from_document::<crate::models::OperationKnowledgeChunk>(
+                        new_doc.clone(),
+                    )
+                    .map_err(|e| {
+                        AppError::BadRequest(format!("merge 新 chunk 字段不合法: {e}"))
+                    })?,
+                    None,
+                )
+                .await?;
+            let new_id = inserted
+                .inserted_id
+                .as_object_id()
+                .map(|o| o.to_hex())
+                .unwrap_or_default();
+            Ok(Json(json!({
+                "ok": true,
+                "archivedA": revision_applied_to_json(&arch_a),
+                "archivedB": revision_applied_to_json(&arch_b),
+                "newChunkId": new_id,
+            })))
+        }
+        other => Err(AppError::BadRequest(format!(
+            "merge_strategy='{other}' 不合法，应为 into_target | new_chunk"
+        ))),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct ChunkRelateRequest {
+    pub target_id: String,
+    /// "superseded_by" / "references" / "requires" / "contradicts" / "clarifies" / "refines"
+    pub kind: String,
+    pub note: Option<String>,
+    pub reason: Option<String>,
+    pub actor: Option<String>,
+}
+
+const ALLOWED_RELATION_KINDS: &[&str] = &[
+    "superseded_by",
+    "references",
+    "requires",
+    "contradicts",
+    "clarifies",
+    "refines",
+];
+
+/// `POST /operation-knowledge/chunks/:id/relate` — 添加一条 related_chunks。
+pub(super) async fn relate_operation_knowledge_chunk(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(payload): Json<ChunkRelateRequest>,
+) -> AppResult<Json<Value>> {
+    let object_id = parse_object_id(&id)?;
+    if !ALLOWED_RELATION_KINDS.contains(&payload.kind.as_str()) {
+        return Err(AppError::BadRequest(format!(
+            "relation kind '{}' 不合法，应为 {}",
+            payload.kind,
+            ALLOWED_RELATION_KINDS.join(" | "),
+        )));
+    }
+    // target 必须存在（同 workspace）
+    let target_oid = parse_object_id(&payload.target_id)?;
+    state
+        .db
+        .operation_knowledge_chunks()
+        .find_one(
+            doc! {
+                "_id": target_oid,
+                "workspace_id": &state.config.default_workspace_id,
+            },
+            None,
+        )
+        .await?
+        .ok_or_else(|| AppError::NotFound("relate target chunk not found".to_string()))?;
+    let existing = state
+        .db
+        .operation_knowledge_chunks()
+        .find_one(
+            doc! {
+                "_id": object_id,
+                "workspace_id": &state.config.default_workspace_id,
+            },
+            None,
+        )
+        .await?
+        .ok_or_else(|| AppError::NotFound("operation knowledge chunk not found".to_string()))?;
+    let mut related = existing.related_chunks.clone().unwrap_or_default();
+    // 同 (target_id, kind) 已存在 → 视为幂等成功，更新 note
+    if let Some(found) = related
+        .iter_mut()
+        .find(|r| r.chunk_id == payload.target_id && r.kind == payload.kind)
+    {
+        found.note = payload.note.clone().or_else(|| found.note.clone());
+    } else {
+        related.push(crate::models::RelatedRef {
+            chunk_id: payload.target_id.clone(),
+            kind: payload.kind.clone(),
+            note: payload.note.clone(),
+        });
+    }
+    let req = RevisionRequest {
+        op: RevisionOp::Patch,
+        source: ProvenanceSource::Human,
+        patch: doc! {
+            "related_chunks": mongodb::bson::to_bson(&related)
+                .map_err(|e| AppError::External(format!("serialize related_chunks failed: {e}")))?
+        },
+        reason: payload.reason.or_else(|| {
+            Some(format!(
+                "relate -> {} ({})",
+                payload.target_id, payload.kind
+            ))
+        }),
+        actor: payload.actor,
+    };
+    let applied = apply_chunk_revision(
+        &state.db,
+        &state.config.default_workspace_id,
+        object_id,
+        req,
+    )
+    .await?;
+    Ok(Json(revision_applied_to_json(&applied)))
+}
+
+/// `DELETE /operation-knowledge/chunks/:id/relate/:target_id` — 移除单条关系。
+pub(super) async fn unrelate_operation_knowledge_chunk(
+    State(state): State<AppState>,
+    Path((id, target_id)): Path<(String, String)>,
+) -> AppResult<Json<Value>> {
+    let object_id = parse_object_id(&id)?;
+    let existing = state
+        .db
+        .operation_knowledge_chunks()
+        .find_one(
+            doc! {
+                "_id": object_id,
+                "workspace_id": &state.config.default_workspace_id,
+            },
+            None,
+        )
+        .await?
+        .ok_or_else(|| AppError::NotFound("operation knowledge chunk not found".to_string()))?;
+    let original_len = existing
+        .related_chunks
+        .as_ref()
+        .map(|v| v.len())
+        .unwrap_or(0);
+    let kept: Vec<_> = existing
+        .related_chunks
+        .clone()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|r| r.chunk_id != target_id)
+        .collect();
+    if kept.len() == original_len {
+        return Ok(Json(json!({
+            "ok": true,
+            "removed": 0,
+        })));
+    }
+    let req = RevisionRequest {
+        op: RevisionOp::Patch,
+        source: ProvenanceSource::Human,
+        patch: doc! {
+            "related_chunks": mongodb::bson::to_bson(&kept)
+                .map_err(|e| AppError::External(format!("serialize related_chunks failed: {e}")))?
+        },
+        reason: Some(format!("unrelate -> {target_id}")),
+        actor: None,
+    };
+    let applied = apply_chunk_revision(
+        &state.db,
+        &state.config.default_workspace_id,
+        object_id,
+        req,
+    )
+    .await?;
+    let mut value = revision_applied_to_json(&applied);
+    if let Some(o) = value.as_object_mut() {
+        o.insert(
+            "removed".to_string(),
+            json!(original_len - kept.len()),
+        );
+    }
+    Ok(Json(value))
+}
+
+// ── knowledge-wiki Phase F：gap-signal 路由 ───────────────────────────────────
+
+/// 列出 gap signal。默认返回 `pending` 状态；`status` 查询参数可选。
+pub(super) async fn list_knowledge_gap_signals(
+    State(state): State<AppState>,
+    Query(query): Query<GapSignalListQuery>,
+) -> AppResult<Json<Value>> {
+    use futures::TryStreamExt;
+    let status = query.status.as_deref().unwrap_or("pending");
+    let mut filter = doc! {
+        "workspace_id": &state.config.default_workspace_id,
+        "status": status,
+    };
+    if let Some(kind) = query.kind.as_deref() {
+        filter.insert("kind", kind);
+    }
+    let cursor = state
+        .db
+        .knowledge_gap_signals()
+        .find(
+            filter,
+            FindOptions::builder()
+                .sort(doc! { "created_at": -1 })
+                .limit(query.limit.unwrap_or(100))
+                .build(),
+        )
+        .await?;
+    let signals: Vec<crate::models::KnowledgeGapSignal> = cursor.try_collect().await?;
+    let items: Vec<Value> = signals
+        .iter()
+        .map(|s| {
+            json!({
+                "signalId": s.signal_id,
+                "kind": s.kind,
+                "title": s.title,
+                "description": s.description,
+                "severity": s.severity,
+                "source": s.source,
+                "status": s.status,
+                "affectedChunkIds": s.affected_chunk_ids,
+                "searchQueries": s.search_queries,
+                "resolutionNote": s.resolution_note,
+                "createdAt": crate::models::dt_to_string(s.created_at).unwrap_or_default(),
+                "resolvedAt": s.resolved_at
+                    .and_then(|t| crate::models::dt_to_string(t)),
+            })
+        })
+        .collect();
+    Ok(Json(json!({ "signals": items })))
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub struct GapSignalListQuery {
+    pub status: Option<String>,
+    pub kind: Option<String>,
+    pub limit: Option<i64>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub struct GapSignalResolutionRequest {
+    #[serde(default)]
+    pub note: Option<String>,
+}
+
+/// 手动 dismiss 一条 signal（运营确认本条不需要处理）。
+pub(super) async fn dismiss_knowledge_gap_signal(
+    State(state): State<AppState>,
+    Path(signal_id): Path<String>,
+    Json(payload): Json<GapSignalResolutionRequest>,
+) -> AppResult<Json<Value>> {
+    let note = payload
+        .note
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| "human:dismissed".into());
+    let now = mongodb::bson::DateTime::now();
+    let result = state
+        .db
+        .knowledge_gap_signals()
+        .update_one(
+            doc! {
+                "signal_id": &signal_id,
+                "workspace_id": &state.config.default_workspace_id,
+                "status": "pending"
+            },
+            doc! { "$set": {
+                "status": "dismissed",
+                "resolution_note": note,
+                "resolved_at": now,
+            }},
+            None,
+        )
+        .await?;
+    if result.matched_count == 0 {
+        return Err(AppError::NotFound("knowledge_gap_signal".into()));
+    }
+    Ok(Json(json!({ "ok": true })))
+}
+
+/// 标记一条 signal 为 applied（运营已按建议改了 chunk）。
+pub(super) async fn apply_knowledge_gap_signal(
+    State(state): State<AppState>,
+    Path(signal_id): Path<String>,
+    Json(payload): Json<GapSignalResolutionRequest>,
+) -> AppResult<Json<Value>> {
+    let note = payload
+        .note
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| "human:applied".into());
+    let now = mongodb::bson::DateTime::now();
+    let result = state
+        .db
+        .knowledge_gap_signals()
+        .update_one(
+            doc! {
+                "signal_id": &signal_id,
+                "workspace_id": &state.config.default_workspace_id,
+                "status": "pending"
+            },
+            doc! { "$set": {
+                "status": "applied",
+                "resolution_note": note,
+                "resolved_at": now,
+            }},
+            None,
+        )
+        .await?;
+    if result.matched_count == 0 {
+        return Err(AppError::NotFound("knowledge_gap_signal".into()));
+    }
+    Ok(Json(json!({ "ok": true })))
+}
+
+/// 手动触发一次 structural lint + stage 1 sweep。
+pub(super) async fn sweep_knowledge_gap_signals(
+    State(state): State<AppState>,
+) -> AppResult<Json<Value>> {
+    use crate::knowledge_wiki::gap_signals;
+    let workspace = &state.config.default_workspace_id;
+    let lint = gap_signals::run_structural_lint(&state.db, workspace).await?;
+    let sweep = gap_signals::sweep_stale_signals(&state.db, workspace).await?;
+    Ok(Json(json!({
+        "structuralLint": {
+            "newSignals": lint.new_signals,
+            "existingPending": lint.existing_pending,
+            "stage1AutoResolved": lint.stage1_auto_resolved,
+        },
+        "sweep": {
+            "stage1AutoResolved": sweep.stage1_auto_resolved,
+            "stage2LlmResolved": sweep.stage2_llm_resolved,
+        }
+    })))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -6288,6 +7068,108 @@ mod tests {
         let forbidden = [cn1, cn2, cn3, cn4, en1, en2];
         for w in &forbidden {
             assert!(!s.contains(w.as_str()), "summary should not contain '{w}': {s}");
+        }
+    }
+
+    // ── AI Inbox 聚合纯函数测试 ────────────────────────────────────────
+
+    /// 不变量：digest 卡片 severity → inbox priority 三档映射稳定。
+    /// critical → high；warn → mid；info / 其它 → low。
+    #[test]
+    fn inbox_severity_to_priority_three_buckets() {
+        assert_eq!(severity_to_priority("critical"), "high");
+        assert_eq!(severity_to_priority("warn"), "mid");
+        assert_eq!(severity_to_priority("info"), "low");
+        assert_eq!(severity_to_priority(""), "low");
+        assert_eq!(severity_to_priority("garbage"), "low");
+    }
+
+    /// 不变量：digest 卡 kind → inbox kind 不漏映射任何已声明形态。
+    /// 这把封闭枚举绑定在测试上，新加 kind 必须显式更新。
+    #[test]
+    fn inbox_digest_kind_mapping_is_total_for_known_kinds() {
+        assert_eq!(digest_kind_to_inbox_kind("chunk_missing_field"), "fill_field");
+        assert_eq!(digest_kind_to_inbox_kind("chunk_low_hit_rate"), "repair_chunk");
+        assert_eq!(digest_kind_to_inbox_kind("chunk_caused_block"), "repair_chunk");
+        assert_eq!(digest_kind_to_inbox_kind("pack_outdated"), "repair_chunk");
+        assert_eq!(digest_kind_to_inbox_kind("evolution_pending"), "repair_chunk");
+        assert_eq!(digest_kind_to_inbox_kind("evolution_released"), "repair_chunk");
+        assert_eq!(digest_kind_to_inbox_kind("freeform"), "repair_chunk");
+        // 未知 kind 走 fallback。
+        assert_eq!(digest_kind_to_inbox_kind("__unknown__"), "repair_chunk");
+    }
+
+    /// 不变量：digest suggested_action → inbox suggestedActions 永远非空，
+    /// 且 dismiss 必须存在（运营总能 ✕ 不采纳）。
+    #[test]
+    fn inbox_action_mapping_always_offers_dismiss() {
+        for act in &[
+            "fix_chunk",
+            "add_chunk",
+            "retag",
+            "review_evolution",
+            "dismiss",
+            "freeform",
+            "__unknown__",
+        ] {
+            let acts = digest_action_to_actions(act);
+            assert!(!acts.is_empty(), "action '{act}' produced empty list");
+            assert!(
+                acts.iter().any(|a| a == "dismiss"),
+                "action '{act}' must allow dismiss, got {:?}",
+                acts
+            );
+        }
+    }
+
+    /// 不变量：priority_rank 单调降序 high > mid > low > 其它。
+    /// 这是 inbox 排序 contract 的核心。
+    #[test]
+    fn inbox_priority_rank_orders_high_first() {
+        assert!(priority_rank("high") > priority_rank("mid"));
+        assert!(priority_rank("mid") > priority_rank("low"));
+        assert!(priority_rank("low") > priority_rank("__unknown__"));
+    }
+
+    /// 不变量：sort_by(priority_rank) 把 high 排到最前，mid 居中，low 在尾。
+    /// 在没有 mongo 的情况下用纯 Vec 验证 inbox 排序行为。
+    #[test]
+    fn inbox_sort_places_high_priority_first() {
+        let mut items: Vec<(&str, &str)> = vec![
+            ("c", "low"),
+            ("a", "high"),
+            ("b", "mid"),
+            ("d", "high"),
+        ];
+        items.sort_by(|x, y| priority_rank(y.1).cmp(&priority_rank(x.1)));
+        let priorities: Vec<&str> = items.iter().map(|(_, p)| *p).collect();
+        assert_eq!(priorities, vec!["high", "high", "mid", "low"]);
+    }
+
+    /// 文案防御：inbox 路径输出文案不应携带禁词。
+    /// 当前涉及到的硬编码标题前缀与 contextSummary 模板都在这里集中校验。
+    #[test]
+    fn inbox_static_strings_have_no_forbidden_words() {
+        let cn1: String = ['人', '工', '接', '管'].iter().collect();
+        let cn2: String = ['人', '工', '介', '入'].iter().collect();
+        let en1: String = ['t', 'a', 'k', 'e', 'o', 'v', 'e', 'r'].iter().collect();
+        let en2: String = ['h', 'a', 'n', 'd', '-', 'o', 'f', 'f'].iter().collect();
+        let forbidden = [cn1, cn2, en1, en2];
+        let candidates = [
+            "待审切片：",
+            "AI 起草，等运营确认。",
+            "补原文出处：",
+            "AI 检测到该切片缺 sourceQuote，无法通过验证。",
+            "修复原文锚点：",
+            "AI 检测到该切片 sourceAnchors 为空，需要重新锚定。",
+        ];
+        for s in &candidates {
+            for w in &forbidden {
+                assert!(
+                    !s.contains(w.as_str()),
+                    "inbox copy '{s}' contains forbidden '{w}'"
+                );
+            }
         }
     }
 }

@@ -40,13 +40,12 @@ use super::decision::{
     load_user_operation_domain_config,
 };
 use super::guards::{
-    enforce_decision_taxonomy_guards, load_product_claim_markers,
     normalize_decision_runtime, normalize_decision_state, planner_from_decision,
 };
 use super::knowledge_router::{
     empty_knowledge_route, knowledge_route_has_keyword_fastpath_hit, load_operation_knowledge,
     maybe_emit_unverified_warning, route_operation_knowledge, route_used_knowledge_ids,
-    select_operation_knowledge, select_operation_knowledge_chunks, write_knowledge_usage_log,
+    select_operation_knowledge_chunks, write_knowledge_usage_log,
 };
 use super::memory::{
     effective_memory_card, effective_memory_card_for_contact, load_or_create_operating_memory,
@@ -168,8 +167,6 @@ pub async fn send_contact_message_gateway(
         Some(&run_id),
     )
     .await?;
-    let selected_knowledge =
-        select_operation_knowledge(&operation_knowledge.items, &knowledge_route);
     let selected_chunks =
         select_operation_knowledge_chunks(&operation_knowledge.chunks, &knowledge_route);
     let decision = AgentDecision {
@@ -193,7 +190,6 @@ pub async fn send_contact_message_gateway(
         &runtime,
         &memory,
         &context_pack,
-        &selected_knowledge,
         &selected_chunks,
         &knowledge_route,
         "full",
@@ -480,8 +476,6 @@ async fn run_user_operation_gateway_inner(
         .await?
     };
     let keyword_fastpath_hit = knowledge_route_has_keyword_fastpath_hit(&knowledge_route);
-    let selected_knowledge =
-        select_operation_knowledge(&operation_knowledge.items, &knowledge_route);
     let selected_chunks =
         select_operation_knowledge_chunks(&operation_knowledge.chunks, &knowledge_route);
     // agent-autonomy-loop W2 / Task 3.4：把 RawAgentDecision::validate_and_promote
@@ -498,7 +492,6 @@ async fn run_user_operation_gateway_inner(
         &runtime,
         &memory,
         &context_pack,
-        &selected_knowledge,
         &selected_chunks,
         &knowledge_route,
         None,
@@ -530,21 +523,7 @@ async fn run_user_operation_gateway_inner(
     normalize_decision_runtime(&mut decision, &planner);
     decision.context_pack_version = Some(next_memory_card_version(&memory));
     decision.used_knowledge_ids = route_used_knowledge_ids(&knowledge_route);
-    // ── agent-autonomy-loop W3 / Task 4.7：taxonomy 字典守卫 ──
-    //
-    // 对 `decision.customer_stage / intent_level` 调 `taxonomy::check_value`，
-    // alias 命中改写为 canonical_id；deprecated / candidate_new 仅追加到
-    // `promote_risks` 让 finalize_review_for_send 一次性合并到 review.risks。
-    // R8.4：候选标记 SHALL NOT 强制 `review.approved=false`。
-    crate::agent::taxonomy::ensure_global_cache_loaded(&state.db).await;
-    enforce_decision_taxonomy_guards(
-        &state.db,
-        &crate::agent::taxonomy::global_taxonomy_cache(),
-        &contact.account_id,
-        &mut decision,
-        &mut promote_risks,
-    )
-    .await;
+    let _ = &mut promote_risks;
     // MP-5 / Task 15：进入 review 前预算超额则降级到 local。
     // agent-autonomy-loop W2 / Task 3.1：`local_decision_review` 改为接受
     // `&RunBudget`，在三分支前先抢一次 task-local 引用，None 时构造一个
@@ -589,7 +568,6 @@ async fn run_user_operation_gateway_inner(
             &runtime,
             &memory,
             &context_pack,
-            &selected_knowledge,
             &selected_chunks,
             &knowledge_route,
             effective_review_mode(&planner, &decision, &runtime, false),
@@ -649,7 +627,6 @@ async fn run_user_operation_gateway_inner(
                 &runtime,
                 &memory,
                 &context_pack,
-                &selected_knowledge,
                 &selected_chunks,
                 &knowledge_route,
                 Some(&review.rewrite_instruction),
@@ -672,7 +649,6 @@ async fn run_user_operation_gateway_inner(
                 &runtime,
                 &memory,
                 &context_pack,
-                &selected_knowledge,
                 &selected_chunks,
                 &knowledge_route,
                 "full",
@@ -689,14 +665,12 @@ async fn run_user_operation_gateway_inner(
     // `final_decision.should_reply=false` 且 `final_decision.autonomy_mode="blocked"`，
     // 并产出待写 `agent_events`（由 [`persist_finalize_pending_events`] 持久化）。
     // 任何上游 `approved=true` SHALL NOT 绕过本调用（详见 design.md §4.5 / N3）。
-    let markers = load_product_claim_markers(state).await;
     let outcome = finalize_review_for_send(
         review,
         &mut final_decision,
         &runtime,
         &contact,
         &selected_chunks,
-        &markers,
         promote_risks.clone(),
         inbound.content.as_str(),
     );
@@ -782,7 +756,6 @@ async fn run_user_operation_gateway_inner(
                 &runtime,
                 &memory,
                 &context_pack,
-                &selected_knowledge,
                 &selected_chunks,
                 &knowledge_route,
                 Some(&revision_direction),
@@ -806,7 +779,6 @@ async fn run_user_operation_gateway_inner(
                         &runtime,
                         &memory,
                         &context_pack,
-                        &selected_knowledge,
                         &selected_chunks,
                         &knowledge_route,
                         "full",
@@ -823,7 +795,6 @@ async fn run_user_operation_gateway_inner(
                         &runtime,
                         &contact,
                         &selected_chunks,
-                        &markers,
                         promote_risks.clone(),
                         inbound.content.as_str(),
                     );
@@ -1576,18 +1547,22 @@ async fn apply_agent_updates(
         set_doc.insert("tags", to_bson_array(&decision.tags));
     }
     if let Some(value) = non_empty_option(&decision.customer_stage) {
-        // M2：customer_stage 实际变化时同步刷新 customer_stage_updated_at，
-        // 让 Planner::scan_stage_stagnation 能区分"长期停滞"与"近期推进"。
-        let prev = contact.customer_stage.as_deref();
-        if prev.map(|s| s != value).unwrap_or(true) {
-            set_doc.insert("customer_stage", value);
-            set_doc.insert("customer_stage_updated_at", DateTime::now());
-        } else {
-            set_doc.insert("customer_stage", value);
-        }
+        // 旧 customer_stage 字段已删除，统一写入 domain_attributes 容器。
+        let mut attrs = contact.domain_attributes.clone().unwrap_or_default();
+        attrs.insert("customer_stage", value);
+        set_doc.insert("domain_attributes", attrs);
+        set_doc.insert("domain_attributes_updated_at", DateTime::now());
     }
     if let Some(value) = non_empty_option(&decision.intent_level) {
-        set_doc.insert("intent_level", value);
+        let mut attrs = set_doc
+            .get_document("domain_attributes")
+            .ok()
+            .cloned()
+            .or_else(|| contact.domain_attributes.clone())
+            .unwrap_or_default();
+        attrs.insert("intent_level", value);
+        set_doc.insert("domain_attributes", attrs);
+        set_doc.insert("domain_attributes_updated_at", DateTime::now());
     }
     if let Some(value) = non_empty_option(&decision.last_commitment) {
         // M2：把 LLM 输出的字符串承诺升级为结构化 CommitmentEntry 追加到

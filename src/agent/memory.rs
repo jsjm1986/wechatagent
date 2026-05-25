@@ -241,8 +241,9 @@ pub(crate) fn memory_card_from_contact(
         "relationshipState",
         doc! {
             "stage": contact
-                .customer_stage
-                .clone()
+                .domain_attributes
+                .as_ref()
+                .and_then(|d| d.get_str("customer_stage").ok().map(|s| s.to_string()))
                 .or_else(|| contact.operation_state.clone())
                 .unwrap_or_else(|| "new_contact".to_string()),
             "trustLevel": doc_string(&memory.relationship_state, "trustLevel")
@@ -863,8 +864,16 @@ async fn consolidate_contact_memory_inner(
         serde_json::to_string(&effective_memory_card(&memory).to_document()).unwrap_or_default(),
         serde_json::to_string(&candidates).unwrap_or_default(),
         contact.nickname.clone().unwrap_or_default(),
-        contact.customer_stage.clone().unwrap_or_default(),
-        contact.intent_level.clone().unwrap_or_default()
+        contact
+            .domain_attributes
+            .as_ref()
+            .and_then(|d| d.get_str("customer_stage").ok().map(|s| s.to_string()))
+            .unwrap_or_default(),
+        contact
+            .domain_attributes
+            .as_ref()
+            .and_then(|d| d.get_str("intent_level").ok().map(|s| s.to_string()))
+            .unwrap_or_default()
     );
     let value = generate_agent_json(
         state,

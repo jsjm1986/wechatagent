@@ -14,6 +14,7 @@ pub mod error;
 pub mod evolution;
 pub mod knowledge_digest;
 pub mod knowledge_task;
+pub mod knowledge_wiki;
 pub mod llm;
 pub mod mcp;
 pub mod models;

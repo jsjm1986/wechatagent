@@ -8,11 +8,45 @@ use tokio::time::sleep;
 
 use crate::error::{AppError, AppResult};
 
+/// 上游协议形态。
+///
+/// `Openai`：`POST {base_url}/chat/completions`，messages: [{system},{user}]，
+/// 解析 `choices[0].message.content`。兼容 DeepSeek / 通义 / mimo 等大量
+/// "OpenAI 兼容" endpoint。
+///
+/// `Anthropic`：`POST {base_url}/v1/messages`，header `x-api-key + anthropic-version`，
+/// `system` 单独字段 + `messages: [{user}]`，解析 `content[0].text`。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LlmFormat {
+    Openai,
+    Anthropic,
+}
+
+impl LlmFormat {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            LlmFormat::Openai => "openai",
+            LlmFormat::Anthropic => "anthropic",
+        }
+    }
+
+    pub fn parse(value: &str) -> AppResult<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "openai" | "" => Ok(Self::Openai),
+            "anthropic" | "claude" => Ok(Self::Anthropic),
+            other => Err(AppError::BadRequest(format!(
+                "unsupported llm format: {other}"
+            ))),
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct LlmClient {
     base_url: String,
     api_key: String,
     model: String,
+    format: LlmFormat,
     client: reqwest::Client,
     max_retries: u32,
     retry_base_ms: u64,
@@ -38,6 +72,30 @@ struct ChatChoice {
 #[derive(Debug, Deserialize)]
 struct ChatChoiceMessage {
     content: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct AnthropicMessageResponse {
+    #[serde(default)]
+    content: Vec<AnthropicContentBlock>,
+    #[serde(default)]
+    usage: Option<AnthropicUsage>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AnthropicContentBlock {
+    #[serde(rename = "type")]
+    kind: Option<String>,
+    #[serde(default)]
+    text: String,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct AnthropicUsage {
+    #[serde(default)]
+    input_tokens: i64,
+    #[serde(default)]
+    output_tokens: i64,
 }
 
 #[derive(Debug, Deserialize, Default, Clone)]
@@ -84,10 +142,31 @@ impl LlmClient {
         max_retries: u32,
         retry_base_ms: u64,
     ) -> anyhow::Result<Self> {
+        Self::with_format(
+            base_url,
+            api_key,
+            model,
+            LlmFormat::Openai,
+            timeout_seconds,
+            max_retries,
+            retry_base_ms,
+        )
+    }
+
+    pub fn with_format(
+        base_url: String,
+        api_key: String,
+        model: String,
+        format: LlmFormat,
+        timeout_seconds: u64,
+        max_retries: u32,
+        retry_base_ms: u64,
+    ) -> anyhow::Result<Self> {
         Ok(Self {
             base_url: base_url.trim_end_matches('/').to_string(),
             api_key,
             model,
+            format,
             client: reqwest::Client::builder()
                 .timeout(Duration::from_secs(timeout_seconds))
                 // 防 chunked body 中段被中间设备/CDN 静默掐断 ——
@@ -116,6 +195,17 @@ impl LlmClient {
     /// `retry_after_seconds` 仅在请求失败时可能 Some，由调用方决定如何与
     /// 指数退避取 max。
     async fn generate_json_once(
+        &self,
+        system: &str,
+        user: &str,
+    ) -> AppResult<(LlmJsonResult, Option<u64>)> {
+        match self.format {
+            LlmFormat::Openai => self.generate_json_once_openai(system, user).await,
+            LlmFormat::Anthropic => self.generate_json_once_anthropic(system, user).await,
+        }
+    }
+
+    async fn generate_json_once_openai(
         &self,
         system: &str,
         user: &str,
@@ -183,6 +273,90 @@ impl LlmClient {
             None,
         ))
     }
+
+    /// Anthropic Messages API 形态：
+    /// `POST {base_url}/v1/messages` （base_url 通常 `https://api.anthropic.com`），
+    /// header `x-api-key: <key>` + `anthropic-version: 2023-06-01`；
+    /// body: `{ model, max_tokens, system, messages: [{role:"user", content}] }`；
+    /// 响应：`{ content: [{type:"text", text:"..."}], usage: { input_tokens, output_tokens }, stop_reason }`。
+    async fn generate_json_once_anthropic(
+        &self,
+        system: &str,
+        user: &str,
+    ) -> AppResult<(LlmJsonResult, Option<u64>)> {
+        let started_at = Instant::now();
+        let body = json!({
+            "model": self.model,
+            "max_tokens": 4096,
+            "temperature": 0.2,
+            "system": system,
+            "messages": [
+                {"role": "user", "content": user}
+            ]
+        });
+
+        let response = self
+            .client
+            .post(format!("{}/v1/messages", self.base_url))
+            .header("x-api-key", &self.api_key)
+            .header("anthropic-version", "2023-06-01")
+            .json(&body)
+            .send()
+            .await?;
+        let status = response.status();
+        let retry_after = parse_retry_after(response.headers());
+        let text = match response.bytes().await {
+            Ok(buf) => String::from_utf8_lossy(&buf).into_owned(),
+            Err(err) => {
+                let elapsed_ms = started_at.elapsed().as_millis();
+                return Err(AppError::External(format!(
+                    "LLM HTTP body_decode_error status={} elapsed_ms={} cause={}",
+                    status, elapsed_ms, err
+                )));
+            }
+        };
+        if !status.is_success() {
+            let mut err = AppError::External(format!("LLM HTTP {status}: {text}"));
+            if let Some(after) = retry_after {
+                err = AppError::External(format!(
+                    "LLM HTTP {status}: {text} [retry_after_secs={after}]"
+                ));
+            }
+            return Err(err);
+        }
+
+        let parsed: AnthropicMessageResponse = serde_json::from_str(&text)?;
+        let content = parsed
+            .content
+            .iter()
+            .find_map(|block| {
+                if block.kind.as_deref() == Some("text") {
+                    Some(block.text.as_str())
+                } else {
+                    None
+                }
+            })
+            .ok_or_else(|| AppError::External("LLM returned no choices".to_string()))?;
+        let usage = parsed
+            .usage
+            .map(|u| ChatUsage {
+                prompt_tokens: u.input_tokens,
+                completion_tokens: u.output_tokens,
+                total_tokens: u.input_tokens.saturating_add(u.output_tokens),
+                ..Default::default()
+            })
+            .unwrap_or_default();
+        Ok((
+            LlmJsonResult {
+                value: parse_json_content(content)?,
+                usage,
+                latency_ms: started_at.elapsed().as_millis() as i64,
+                model: self.model.clone(),
+                retry_count: 0,
+            },
+            None,
+        ))
+    }
 }
 
 #[async_trait]
@@ -242,12 +416,12 @@ fn classify_llm_error_for_user(error: &AppError, retry_count: u32) -> AppError {
             if err.is_timeout() {
                 (
                     "timeout",
-                    "上游 LLM 响应超时，已多次重试仍未收到结果。请稍后再试，或检查到 api.deepseek.com 的网络链路。",
+                    "上游 LLM 响应超时，已多次重试仍未收到结果。请稍后再试，或检查到上游服务商的网络链路。",
                 )
             } else if err.is_connect() {
                 (
                     "connect_failed",
-                    "无法连接到上游 LLM 服务（DeepSeek / OpenAI），请检查网络、代理、DNS、TLS 证书是否正常。",
+                    "无法连接到上游 LLM 服务，请检查 baseUrl、网络、代理、DNS、TLS 证书是否正常。",
                 )
             } else if err.is_decode() {
                 (
@@ -275,7 +449,7 @@ fn classify_llm_error_for_user(error: &AppError, retry_count: u32) -> AppError {
             } else if msg.contains("LLM HTTP 4") {
                 (
                     "http_4xx",
-                    "上游 LLM 拒绝了请求（4xx）。请检查 OPENAI_API_KEY / OPENAI_MODEL 是否正确、配额是否充足。",
+                    "上游 LLM 拒绝了请求（4xx）。请检查 apiKey / model / baseUrl 是否正确、配额是否充足。",
                 )
             } else if msg.contains("LLM HTTP body_decode_error") {
                 (
@@ -468,6 +642,72 @@ pub(crate) fn repair_loose_json(input: &str) -> Option<String> {
         None
     } else {
         Some(out)
+    }
+}
+
+/// 当前激活的 LLM provider 元数据，便于排障日志写出真实使用的 provider。
+#[derive(Debug, Clone)]
+pub struct LlmProviderMeta {
+    pub provider_id: String,
+    pub format: LlmFormat,
+    pub model: String,
+    pub base_url: String,
+}
+
+/// 热替换 LLM 客户端 wrapper。
+///
+/// 行为：
+/// - 持有 `Arc<LlmClient>` + `LlmProviderMeta`，由 `tokio::sync::RwLock` 保护，
+///   生产路径只读锁；前端「启用」一条 provider 时取写锁原子替换。
+/// - 实现 [`LlmGenerator`] 把 `generate_json` / `generate_json_with_usage`
+///   转发给当前 client；调用前先 `read().await` 拿一次 `Arc` 克隆再放锁，
+///   避免持锁期间发起 HTTP 阻塞 swap。
+/// - 不缓存解析结果——只关心客户端实例本身的替换。
+pub struct LlmRegistry {
+    inner: tokio::sync::RwLock<LlmRegistryInner>,
+}
+
+struct LlmRegistryInner {
+    client: std::sync::Arc<LlmClient>,
+    meta: LlmProviderMeta,
+}
+
+impl LlmRegistry {
+    pub fn new(client: LlmClient, meta: LlmProviderMeta) -> Self {
+        Self {
+            inner: tokio::sync::RwLock::new(LlmRegistryInner {
+                client: std::sync::Arc::new(client),
+                meta,
+            }),
+        }
+    }
+
+    pub async fn current_meta(&self) -> LlmProviderMeta {
+        self.inner.read().await.meta.clone()
+    }
+
+    /// 用新 client 原子替换当前实例。`active_provider_id` 等元数据由调用方透传。
+    pub async fn swap(&self, client: LlmClient, meta: LlmProviderMeta) {
+        let mut guard = self.inner.write().await;
+        guard.client = std::sync::Arc::new(client);
+        guard.meta = meta;
+    }
+
+    async fn current(&self) -> std::sync::Arc<LlmClient> {
+        self.inner.read().await.client.clone()
+    }
+}
+
+#[async_trait]
+impl LlmGenerator for LlmRegistry {
+    async fn generate_json(&self, system: &str, user: &str) -> AppResult<Value> {
+        let client = self.current().await;
+        client.generate_json(system, user).await
+    }
+
+    async fn generate_json_with_usage(&self, system: &str, user: &str) -> AppResult<LlmJsonResult> {
+        let client = self.current().await;
+        client.generate_json_with_usage(system, user).await
     }
 }
 

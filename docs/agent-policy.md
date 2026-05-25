@@ -449,3 +449,80 @@ per-turn tool call ≤ 6（`RUN_BUDGET` 守门）；超额 fail-fast 写 `kind=t
    - 预期：worker 不再起 tick；已生成的 `knowledge_daily_reports` / `knowledge_chat_tasks` / `knowledge_operator_memory` 仍在 Mongo（验证关停不删数据）。
 
 如任何一步偏离预期，按"回滚优先"原则：phase 级 `git revert` + `cargo test --lib` + 浏览器手动复测；不要在生产环境直接热修。
+
+## 运营知识库 wiki-style 方法论（knowledge-wiki）
+
+WechatAgent 把"销售话术 RAG"升级为"运营知识 Wiki + 检索面"：知识不是查询时即时拼装，而是**写入时被增量编织进一个持久互联的 chunk 仓**，由 LLM 维护一致性、cross-reference、矛盾标注。**召回算法零改动**（catalog → list_chunks → open_slice），本节说明本轮专心做扎实的四件事：质量 / 可被检索 / 可被修改 / 可被优化。
+
+### 1. 9 类 wiki_type（跨行业稳定）
+
+每个 chunk 写 `wiki_type` 为下列之一：
+
+| wiki_type | 含义 | 销售域典型 chunk | 教培域典型 chunk |
+| --- | --- | --- | --- |
+| `source` | 原始来源 | 销售口径 v3 PDF | 教研周会纪要 |
+| `entity` | 实体 | 产品 SKU / 客户角色 | 课程包 / 师资 |
+| `concept` | 概念/规则/政策 | 退款政策 | 招生话术合规清单 |
+| `comparison` | 对比 | 我方 vs 竞品 | 班型 A vs B |
+| `synthesis` | 综合 | 行业图谱 | 学段升学路径 |
+| `methodology` | 方法/SOP | 反对意见处理框架 | 家长砍价 SOP |
+| `finding` | 发现/数据点 | 转化率统计 | 续报率 |
+| `query` | FAQ | "能否分期" | "孩子基础差能否上 X 班" |
+| `thesis` | 带立场的判断 | "X 客户必须 face-to-face" | "Y 学段必须冲刺班" |
+
+**业务可变字段下沉到 `domain_attributes: bson::Document`**，由 `DomainSchema` 定义；销售域配 `customer_stage / objection_type / pressure_level`，教培域配 `parent_emotion_state / age_segment / subject`。chunk 主表字段稳定，业务字段在 JSON 子文档里。
+
+### 2. 写入路径三层保护：apply_chunk_revision
+
+所有写入（import / patch / split / merge / archive / restore / rollback）走同一个函数 [`crate::knowledge_wiki::chunk_revisions::apply_chunk_revision`]，三层保护一律生效：
+
+1. **锁定字段守门**：patch 试图改 `chunk_id / wiki_type / created_at / source_anchor / verified_at / verified_by / approved_at` 任意一项 → 4xx；
+2. **数组字段 union**：`tags / related_chunks / sources / search_terms / applicable_scenes` 永远应用层 `existing ∪ patch`，0 风险 0 LLM 成本；
+3. **70% body 长度阈值**：patch 改 `answer / explanation` 后正文短于既有 70% → 4xx，识别 LLM 截断 / 偷懒 / 误重写。
+
+写入侧附加规则：
+
+- **AI 写入永不自动 verify**：source=ai 强制 `status="draft" + integrity_status="needs_review"`，verify 仍走现有 `/chunks/:id/verify` + sourceQuote→anchor gate；
+- **双写**：先写 `chunk_revisions`（不可变历史，sha256 before/after hash），后写 `operation_knowledge_chunks`（可变最新版）；万一 chunks 写失败 revisions 仍留下"试图但未成功"的痕迹；
+- **enqueue catalog rebuild**：写完即推 `catalog_rebuild_jobs` 队列，worker 异步落库，写入路径不阻塞。
+
+### 3. patch-only 协议
+
+LLM 编辑 chunk 不返完整页，只返 `patch: { ...field-level diff... }` JSON。后端拿到直接调 `apply_chunk_revision`，模型不可能"顺手"改它没列在 patch 里的字段。借鉴 LLW `enrich-wikilinks.ts` 的核心洞察："让 LLM 只返替换映射而非整页"。
+
+### 4. 反馈闭环
+
+[`crate::knowledge_wiki::feedback_worker::feedback_worker_loop`] 每 `KNOWLEDGE_FEEDBACK_INTERVAL_SECONDS` 秒（默认 600，0 关停）一轮：
+
+1. 30d 滑窗 hit/blocked 回写 `usage_stats`；
+2. `dynamic_confidence = clamp(integrity_score × 0.6 + hit_rate × 0.4 - stale_penalty, 0, 1)`；
+3. structural lint 生成/合并 `knowledge_gap_signals`：
+   - `orphan` — chunk 无入链且 30d 无命中
+   - `broken_link` — `related_chunks.chunk_id` 指向不存在/已 archived 的 chunk
+   - `no_outlinks` — synthesis/comparison/methodology 类 chunk 的 `related_chunks` 为空
+   - `low_confidence` — `dynamic_confidence < 0.3` 但 30d hit > 0
+   - `stale` — `valid_to < now`
+4. **stage 1 sweep**：candidate 不再被规则生成的 pending signal → `auto_resolved`；broken_link 的 target 已恢复 / missing_chunk 标题已存在 / stale 的 valid_to 被推到未来 → `auto_resolved`。
+
+stage 2（LLM 批裁决：contradiction / suggestion / 残留信号是否仍适用）暂留接口，本轮不进入热路径。
+
+### 5. 不可暗示模型品牌（硬约束）
+
+本子系统**禁止**在 prompt / schema / UI / docs / 错误信息里硬编码任何具体模型名（GPT-4 / Claude 3 / Gemini / DeepSeek-v3 / Qwen-Max ...）或品牌词（Anthropic / OpenAI / 千问 / 豆包 / 文心一言 / ChatGLM / kimi ...）做"广告提示 / 暗示用户使用什么模型"。LLM provider 由用户在 `LlmProviderConfigs` 里自填，`ChunkProvenance.llm_model_alias` 仅写 `provider_id`（如 `"default"` / `"reviewer"`）。CI 由 `scripts/check-no-model-hint.sh` 自检；每次 PR 必跑。
+
+### 6. 编辑路由清单
+
+| 路由 | 行为 |
+| --- | --- |
+| `POST /operation-knowledge/chunks/:id/patch` | 字段级 patch；最常用 |
+| `POST /operation-knowledge/chunks/:id/split` | 拆分：原 chunk archive + 新建 N 个，`previous_version_id` 指原 |
+| `POST /operation-knowledge/chunks/:id/merge` | 合并：原 + target 都 archive + 一个新 chunk |
+| `POST /operation-knowledge/chunks/:id/archive` | 软删 + 删除级联清 dangling refs |
+| `POST /operation-knowledge/chunks/:id/restore` | 取消 archive |
+| `POST /operation-knowledge/chunks/:id/rollback/:revision_id` | 找 revision 的 before-state 重写为 current；写新 revision (op=rollback) |
+| `GET /operation-knowledge/chunks/:id/revisions` | 分页 timeline |
+| `POST /operation-knowledge/chunks/:id/relate` / `DELETE` | 维护 `related_chunks` |
+| `GET /operation-knowledge/catalog/persisted` | 读 `documents.catalog_summary_persisted` 持久化快照（O(1)） |
+| `GET /knowledge/gap-signals` | 列 pending / dismissed / auto_resolved 信号 |
+| `POST /knowledge/gap-signals/:id/dismiss` / `apply` | 运营手动消解 |
+| `POST /knowledge/gap-signals/sweep` | 手动触发一次 lint + stage 1 sweep |

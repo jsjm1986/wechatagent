@@ -47,7 +47,6 @@ use crate::db::Database;
 use crate::error::AppError;
 use crate::models::{
     KnowledgeUsageLog, OperationKnowledgeChunk, OperationKnowledgeDocument,
-    OperationKnowledgeItem,
 };
 
 /// 单次 dispatch 的硬超时（R4.8）。
@@ -292,22 +291,8 @@ fn exec_list_catalog(
             (items, total)
         }
         "items" => {
-            let total = knowledge.items.len();
-            let items = knowledge
-                .items
-                .iter()
-                .take(limit)
-                .map(|item| {
-                    json!({
-                        "id": item.id.map(|id| id.to_hex()).unwrap_or_default(),
-                        "title": item.title.clone(),
-                        "category": item.knowledge_type.clone().unwrap_or_else(|| item.category.clone()),
-                        "integrity_status": Value::Null,
-                        "updated_at": item.updated_at.timestamp_millis(),
-                    })
-                })
-                .collect::<Vec<_>>();
-            (items, total)
+            // operation_knowledge_items 已删除；items 维度永远空。
+            (Vec::<Value>::new(), 0)
         }
         _ => {
             // chunks
@@ -414,7 +399,6 @@ fn build_search_hit(chunk: &OperationKnowledgeChunk, score: f64) -> Value {
     let snippet_source = chunk
         .summary
         .clone()
-        .or_else(|| chunk.routing_card.clone())
         .or_else(|| chunk.body.clone())
         .unwrap_or_default();
     let snippet = if is_verified {
@@ -442,11 +426,6 @@ fn score_chunk_for_query(chunk: &OperationKnowledgeChunk, query: &str) -> f64 {
     if let Some(summary) = chunk.summary.as_ref() {
         if summary.to_lowercase().contains(&q) {
             score += 2.0;
-        }
-    }
-    if let Some(routing) = chunk.routing_card.as_ref() {
-        if routing.to_lowercase().contains(&q) {
-            score += 1.5;
         }
     }
     if let Some(body) = chunk.body.as_ref() {
@@ -760,17 +739,11 @@ async fn exec_audit_completeness(
     {
         missing.push("sourceQuote");
     }
-    if chunk.safe_claims.is_empty() {
-        missing.push("safeClaims");
-    }
-    if chunk.evidence_items.is_empty() {
-        missing.push("evidenceItems");
-    }
     if chunk.applicable_scenes.is_empty() {
         missing.push("applicableScenes");
     }
 
-    let total_checked = 6.0_f64;
+    let total_checked = 4.0_f64;
     let filled = (total_checked - missing.len() as f64).max(0.0);
     let completeness_score = (filled / total_checked * 1000.0).round() / 1000.0;
 
@@ -781,8 +754,6 @@ async fn exec_audit_completeness(
         "status": chunk.status,
         "missing_fields": missing,
         "has_source_quote": chunk.source_quote.is_some(),
-        "verified_claim_count": chunk.verified_claims.len(),
-        "evidence_count": chunk.evidence_items.len(),
         "applicable_scene_count": chunk.applicable_scenes.len(),
         "completeness_score": completeness_score,
         "updated_at": chunk.updated_at.timestamp_millis(),
@@ -922,27 +893,11 @@ async fn exec_propose_repair(
             "severity": "high",
         }));
     }
-    if chunk.safe_claims.is_empty() {
-        suggestions.push(json!({
-            "field": "safeClaims",
-            "reason": "未声明可使用的安全话术，AI 起草时无锚点",
-            "hint": "至少给出 1 条可直接对外说的安全话术",
-            "severity": "medium",
-        }));
-    }
     if chunk.applicable_scenes.is_empty() {
         suggestions.push(json!({
             "field": "applicableScenes",
             "reason": "未声明适用场景，路由器命中率低",
             "hint": "补 1-3 个场景标签（如『售前/异议处理/复购』）",
-            "severity": "medium",
-        }));
-    }
-    if chunk.evidence_items.is_empty() {
-        suggestions.push(json!({
-            "field": "evidenceItems",
-            "reason": "缺少证据材料，verify 阶段会被 review 退回",
-            "hint": "补 1 条证据（截图链接 / 政策条款 / 数据出处）",
             "severity": "medium",
         }));
     }
@@ -1152,68 +1107,16 @@ async fn exec_open_document(
 // 错误：invalid_input / unknown_item_id / db_error。
 async fn exec_inspect_pack(
     arguments: &Document,
-    db: &Database,
-    workspace_id: &str,
+    _db: &Database,
+    _workspace_id: &str,
 ) -> Value {
+    // operation_knowledge_items 已删除；inspect_pack 永久返回 unknown_item_id。
     let args: InspectPackArgs = match parse_arguments(arguments) {
         Ok(args) => args,
         Err(detail) => return tool_error("invalid_input", &detail),
     };
-    let item_id = match args
-        .item_id
-        .as_deref()
-        .map(|s| s.trim())
-        .filter(|s| !s.is_empty())
-    {
-        Some(id) => id.to_string(),
-        None => return tool_error("invalid_input", "item_id is required"),
-    };
-    let oid = match ObjectId::parse_str(&item_id) {
-        Ok(o) => o,
-        Err(_) => return tool_error("invalid_input", "item_id is not a valid ObjectId"),
-    };
-    let item: OperationKnowledgeItem = match db
-        .operation_knowledge_items()
-        .find_one(
-            doc! { "_id": oid, "workspace_id": workspace_id },
-            None,
-        )
-        .await
-    {
-        Ok(Some(i)) => i,
-        Ok(None) => return json!({ "error": "unknown_item_id", "missing": [item_id] }),
-        Err(e) => return tool_error("db_error", &e.to_string()),
-    };
-    json!({
-        "item_id": item_id,
-        "title": item.title,
-        "summary": item.summary,
-        "routing_card": item.routing_card,
-        "business_context": item.business_context,
-        "knowledge_type": item.knowledge_type,
-        "category": item.category,
-        "business_type": item.business_type,
-        "customer_stages": item.customer_stages,
-        "intent_levels": item.intent_levels,
-        "operation_states": item.operation_states,
-        "applicable_scenes": item.applicable_scenes,
-        "not_applicable_scenes": item.not_applicable_scenes,
-        "suitable_for": item.suitable_for,
-        "not_suitable_for": item.not_suitable_for,
-        "common_questions": item.common_questions,
-        "common_objections": item.common_objections,
-        "safe_claims": item.safe_claims,
-        "forbidden_claims": item.forbidden_claims,
-        "evidence_items": item.evidence_items,
-        "product_tags": item.product_tags,
-        "trigger_keywords": item.trigger_keywords,
-        "business_topics": item.business_topics,
-        "source_type": item.source_type,
-        "source_name": item.source_name,
-        "status": item.status,
-        "priority": item.priority,
-        "updated_at": item.updated_at.timestamp_millis(),
-    })
+    let item_id = args.item_id.unwrap_or_default();
+    json!({ "error": "unknown_item_id", "missing": [item_id] })
 }
 
 // ── exec: knowledge.verify_anchor ──────────────────────────────────────
@@ -1356,10 +1259,7 @@ fn parse_arguments<T: for<'de> Deserialize<'de> + Default>(arguments: &Document)
     serde_json::from_value::<T>(value).map_err(|e| format!("invalid arguments: {e}"))
 }
 
-#[allow(dead_code)]
-fn item_summary(item: &OperationKnowledgeItem) -> Option<String> {
-    item.summary.clone()
-}
+// item_summary removed: OperationKnowledgeItem 已随 sales 旧库删除。
 
 #[cfg(test)]
 mod tests {
@@ -1422,6 +1322,18 @@ mod tests {
             business_topics: vec![],
             created_at: BsonDt::now(),
             updated_at: BsonDt::now(),
+            wiki_type: None,
+            domain_attributes: None,
+            provenance: None,
+            valid_from: None,
+            valid_to: None,
+            superseded_by: None,
+            previous_version_id: None,
+            related_chunks: None,
+            usage_stats: None,
+            dynamic_confidence: None,
+            integrity_score: None,
+            locked_fields: None,
         }
     }
 
@@ -1449,6 +1361,8 @@ mod tests {
             business_topics: vec![],
             created_at: BsonDt::now(),
             updated_at: BsonDt::now(),
+            catalog_summary_persisted: None,
+            catalog_version: None,
         }
     }
 

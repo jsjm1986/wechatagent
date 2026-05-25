@@ -117,6 +117,10 @@ pub struct AppConfig {
     pub knowledge_digest_run_max_llm_calls: i32,
     /// `KnowledgeTaskWorker` tick 间隔秒数；0 表示停掉。默认 30。
     pub knowledge_task_worker_interval_seconds: u64,
+    /// knowledge-wiki Phase E：catalog rebuild worker tick 间隔秒数；0 表示停掉。默认 3。
+    pub catalog_rebuild_worker_interval_seconds: u64,
+    /// knowledge-wiki Phase F：feedback worker tick 间隔秒数；0 表示停掉。默认 600（10 分钟）。
+    pub knowledge_feedback_interval_seconds: u64,
 }
 
 impl AppConfig {
@@ -243,6 +247,16 @@ impl AppConfig {
             knowledge_task_worker_interval_seconds: env_or(
                 "KNOWLEDGE_TASK_WORKER_INTERVAL_SECONDS",
                 "30",
+            )
+            .parse()?,
+            catalog_rebuild_worker_interval_seconds: env_or(
+                "CATALOG_REBUILD_WORKER_INTERVAL_SECONDS",
+                "3",
+            )
+            .parse()?,
+            knowledge_feedback_interval_seconds: env_or(
+                "KNOWLEDGE_FEEDBACK_INTERVAL_SECONDS",
+                "600",
             )
             .parse()?,
         })

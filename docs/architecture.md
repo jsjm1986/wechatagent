@@ -257,6 +257,66 @@ chat 流追加 progress / summary turn
 - AI 永不自动 verify：worker / chat / task 三条路径产出的 chunk 一律 `status="draft" + integrityStatus="needs_review"`。
 - 节奏 1 阶段**不**接事件驱动 push；webhook 实时不会主动叫醒 chat。
 
+## Knowledge Wiki Subsystem（knowledge-wiki Phase A–G）
+
+把"销售话术 RAG"升级为"运营知识 Wiki + 检索面"。**召回算法零改动**（catalog → list_chunks → open_slice 不动），本子系统专心做扎实的四件事：质量 / 可被检索 / 可被修改 / 可被优化。设计原则与 LLW 借鉴对照见 [`docs/knowledge-wiki.md`](knowledge-wiki.md)；字段 / 路由 / 集合见 [`docs/data-and-api.md`](data-and-api.md#knowledge-wiki-子系统phase-a-g)。
+
+### 写入路径（同步）
+
+```text
+[POST /chunks/:id/patch | split | merge | archive | restore | rollback | import-apply ...]
+  ↓
+apply_chunk_revision (src/knowledge_wiki/chunk_revisions.rs)
+  ├─ 1. 锁定字段守门：patch 含 chunk_id / wiki_type / created_at / source_anchor /
+  │     verified_at / verified_by / approved_at 任意一项 → 400 BadRequest
+  ├─ 2. 数组字段 union（src/knowledge_wiki/page_merge.rs）：tags / related_chunks /
+  │     sources / search_terms / applicable_scenes 永远 existing ∪ patch（应用层，0 LLM）
+  ├─ 3. 70% body 长度阈值：patch 改 answer/explanation 后 new_len < old_len × 0.7 → 400
+  ├─ 4. AI 写入强制 status=draft + integrity_status=needs_review
+  ├─ 5. 双写：先写 chunk_revisions（不可变历史，sha256 before/after hash），
+  │           再写 operation_knowledge_chunks（可变最新版）
+  └─ 6. enqueue catalog_rebuild_jobs（异步，写入路径不阻塞）
+```
+
+### 异步 worker（两条独立 loop）
+
+```text
+[catalog_rebuild_worker]                                  默认每 3s 一轮
+  ├─ 取一批 catalog_rebuild_jobs status=queued
+  ├─ 按 document 聚合 active chunk → 渲染 markdown
+  ├─ 落 documents.catalog_summary_persisted + 自增 catalog_version
+  └─ job.status = done / failed (3 次失败标 failed，feedback worker 周期重试一次)
+
+[feedback_worker]                                         默认每 600s 一轮
+  ├─ 1. 30d 滑窗聚合 knowledge_usage_logs → 每 chunk usage_stats.{hit,blocked}_count_30d
+  ├─ 2. dynamic_confidence = clamp(integrity × 0.6 + hit_rate × 0.4 - stale_penalty, 0, 1)
+  ├─ 3. structural lint（纯查询，无 LLM）：5 类规则信号
+  │     orphan / broken_link / no_outlinks / low_confidence / stale
+  │     → 写入 / 合并 knowledge_gap_signals（按 normalized_title 去重）
+  └─ 4. stage 1 sweep：candidate 不再被规则生成 / target 已恢复 / valid_to 已推到未来
+        → status=auto_resolved
+        stage 2（LLM 批裁决）接口预留，本轮不进入热路径
+```
+
+### 召回路径（零改动 + fire-and-forget hook）
+
+```text
+[现有] catalog → list_chunks → open_slice → tool-loop reply
+  ↓ (write_knowledge_usage_log 写 log 后)
+fire-and-forget: knowledge_wiki::gap_signals::record_chunk_hit
+  └─ $inc usage_stats.hit_count_30d 或 blocked_count_30d
+     $set last_used_at / last_blocked_reason
+  注意：不阻塞 reply 返回；失败 ignore（`let _ = ...`）
+```
+
+### 隔离红线（CI 守门）
+
+- `src/knowledge_wiki/*` SHALL NOT 引用 `crate::agent::gateway / outbox`、`crate::mcp::*`、`agent_send_outbox`、`run_user_operation_gateway`。
+- `record_chunk_hit` 仅接 `&Database`，不接 `AppState`，避免误用 LLM / outbox。
+- `feedback_worker` / `catalog_rebuild_worker` 启动按 `*_INTERVAL_SECONDS == 0` 立即 return（零资源消耗）。
+- `apply_chunk_revision` source=ai 强制 draft+needs_review，**AI 永不自动 verify**（红线沿用）。
+- 所有新增 prompt / schema / UI / docs / 错误信息过 `scripts/check-no-model-hint.sh`，不暗示具体 LLM 品牌；LLM provider 由运营在 `LlmProviderConfigs` 自填。
+
 ## Deployment Shape
 
 第一阶段保持简单：

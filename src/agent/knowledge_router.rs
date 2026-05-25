@@ -19,7 +19,7 @@ use mongodb::options::FindOptions;
 use crate::error::AppResult;
 use crate::models::{
     AgentStatus, Contact, ConversationMessage, KnowledgeUsageLog, MessageDirection,
-    OperatingMemory, OperationKnowledgeChunk, OperationKnowledgeItem,
+    OperatingMemory, OperationKnowledgeChunk,
 };
 use crate::routes::AppState;
 
@@ -61,26 +61,6 @@ pub(crate) async fn load_operation_knowledge(
     while let Some(item) = document_cursor.try_next().await? {
         documents.push(item);
     }
-    let mut item_cursor = state
-        .db
-        .operation_knowledge_items()
-        .find(
-            doc! {
-                "workspace_id": &contact.workspace_id,
-                "domain": "user_operations",
-                "status": "active",
-                "$or": account_filter.clone()
-            },
-            FindOptions::builder()
-                .sort(doc! { "priority": -1, "updated_at": -1 })
-                .limit(80)
-                .build(),
-        )
-        .await?;
-    let mut items = Vec::new();
-    while let Some(item) = item_cursor.try_next().await? {
-        items.push(item);
-    }
     let mut chunk_cursor = state
         .db
         .operation_knowledge_chunks()
@@ -102,11 +82,7 @@ pub(crate) async fn load_operation_knowledge(
     while let Some(item) = chunk_cursor.try_next().await? {
         chunks.push(item);
     }
-    Ok(KnowledgeRuntime {
-        documents,
-        items,
-        chunks,
-    })
+    Ok(KnowledgeRuntime { documents, chunks })
 }
 
 /// MP-9 / Task 16：检测 verified chunks 为 0 但 chunks 总数 > 0 的情况，
@@ -219,84 +195,32 @@ pub(crate) fn format_operation_knowledge_catalog_for_prompt(runtime: &KnowledgeR
         })
         .collect::<Vec<_>>()
         .join("\n");
-    let items = runtime
-        .items
-        .iter()
-        .map(|item| {
-            format!(
-                "- itemId={} type={} title={}\n  routingCard={}\n  scenes={}",
-                item.id.map(|id| id.to_hex()).unwrap_or_default(),
-                item.knowledge_type
-                    .clone()
-                    .unwrap_or_else(|| item.category.clone()),
-                item.title,
-                item.routing_card
-                    .clone()
-                    .or(item.summary.clone())
-                    .unwrap_or_default(),
-                item.applicable_scenes.join(" / ")
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
     let chunks = runtime
         .chunks
         .iter()
         .take(120)
         .map(|item| {
             format!(
-                "- chunkId={} type={} title={}\n  routingCard={} hasEvidence={}",
+                "- chunkId={} type={} title={}\n  summary={}",
                 item.id.map(|id| id.to_hex()).unwrap_or_default(),
                 item.knowledge_type.clone().unwrap_or_default(),
                 item.title,
-                item.routing_card
-                    .clone()
-                    .or(item.summary.clone())
-                    .unwrap_or_default(),
-                !item.evidence_items.is_empty()
+                item.summary.clone().unwrap_or_default(),
             )
         })
         .collect::<Vec<_>>()
         .join("\n");
-    format!(
-        "文档目录:\n{}\n\n知识包目录:\n{}\n\n切片目录:\n{}",
-        documents, items, chunks
-    )
+    format!("文档目录:\n{}\n\n切片目录:\n{}", documents, chunks)
 }
 
 pub(crate) fn format_operation_knowledge_for_prompt(
-    items: &[OperationKnowledgeItem],
     chunks: &[OperationKnowledgeChunk],
 ) -> String {
-    let item_text = items
-        .iter()
-        .map(|item| {
-            format!(
-                "- itemId={} type={} context={} title={}\n  summary={}\n  routingCard={}\n  safeClaims={}\n  forbiddenClaims={}\n  scenes={}\n  notScenes={}\n  evidence={}",
-                item.id.map(|id| id.to_hex()).unwrap_or_default(),
-                item.knowledge_type
-                    .clone()
-                    .unwrap_or_else(|| item.category.clone()),
-                item.business_context
-                    .clone()
-                    .unwrap_or_else(|| item.business_type.clone()),
-                item.title,
-                item.summary.clone().unwrap_or_default(),
-                item.routing_card.clone().unwrap_or_default(),
-                item.safe_claims.join(" / "),
-                item.forbidden_claims.join(" / "),
-                item.applicable_scenes.join(" / "),
-                item.not_applicable_scenes.join(" / "),
-                item.evidence_items.join(" / ")
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
     let chunk_text = chunks
         .iter()
         .map(|item| {
             format!(
-                "- chunkId={} type={} context={} title={}\n  integrityStatus={} confidence={}\n  summary={}\n  body={}\n  verifiedClaims={}\n  safeClaims={}\n  forbiddenClaims={}\n  evidence={}\n  sourceAnchors={}\n  sourceQuote={}",
+                "- chunkId={} type={} context={} title={}\n  integrityStatus={} confidence={}\n  summary={}\n  body={}\n  sourceAnchors={}\n  sourceQuote={}",
                 item.id.map(|id| id.to_hex()).unwrap_or_default(),
                 item.knowledge_type.clone().unwrap_or_default(),
                 item.business_context.clone().unwrap_or_default(),
@@ -305,20 +229,13 @@ pub(crate) fn format_operation_knowledge_for_prompt(
                 item.confidence_score.unwrap_or_default(),
                 item.summary.clone().unwrap_or_default(),
                 item.body.clone().unwrap_or_default(),
-                item.verified_claims.join(" / "),
-                item.safe_claims.join(" / "),
-                item.forbidden_claims.join(" / "),
-                item.evidence_items.join(" / "),
                 serde_json::to_string(&item.source_anchors).unwrap_or_default(),
                 item.source_quote.clone().unwrap_or_default()
             )
         })
         .collect::<Vec<_>>()
         .join("\n");
-    format!(
-        "已打开知识包:\n{}\n\n已打开知识切片:\n{}",
-        item_text, chunk_text
-    )
+    format!("已打开知识切片:\n{}", chunk_text)
 }
 
 pub async fn test_knowledge_route_for_contact(
@@ -344,9 +261,8 @@ pub async fn test_knowledge_route_for_contact(
         playbook_id: None,
         playbook_version: None,
         tags: Vec::new(),
-        customer_stage: None,
-        customer_stage_updated_at: None,
-        intent_level: None,
+        domain_attributes: None,
+        domain_attributes_updated_at: None,
         commitments: Vec::new(),
         follow_up_policy: None,
         operation_state: Some("new_contact".to_string()),
@@ -433,11 +349,9 @@ pub async fn test_knowledge_route_for_contact(
         None,
     )
     .await?;
-    let selected = select_operation_knowledge(&knowledge.items, &route);
     let selected_chunks = select_operation_knowledge_chunks(&knowledge.chunks, &route);
     Ok(doc! {
         "route": to_document(&route).unwrap_or_default(),
-        "selectedKnowledge": selected.into_iter().map(operation_knowledge_to_bson).collect::<Vec<_>>(),
         "selectedChunks": selected_chunks.into_iter().map(operation_knowledge_chunk_to_bson).collect::<Vec<_>>()
     })
 }
@@ -452,7 +366,7 @@ pub(crate) async fn route_operation_knowledge(
     knowledge: &KnowledgeRuntime,
     run_id: Option<&str>,
 ) -> AppResult<KnowledgeRouteResult> {
-    if knowledge.documents.is_empty() && knowledge.items.is_empty() && knowledge.chunks.is_empty() {
+    if knowledge.documents.is_empty() && knowledge.chunks.is_empty() {
         return Ok(KnowledgeRouteResult {
             risk_level: "medium".to_string(),
             knowledge_coverage: "missing".to_string(),
@@ -542,7 +456,11 @@ pub(crate) async fn route_operation_knowledge(
 知识目录与可打开切片:
 {}"#,
         contact.nickname.clone().unwrap_or_default(),
-        contact.customer_stage.clone().unwrap_or_default(),
+        contact
+            .domain_attributes
+            .as_ref()
+            .and_then(|doc| doc.get_str("customer_stage").ok().map(|s| s.to_string()))
+            .unwrap_or_default(),
         contact.operation_state.clone().unwrap_or_default(),
         history,
         serde_json::to_string(context_pack).unwrap_or_default(),
@@ -571,16 +489,7 @@ pub(crate) async fn route_operation_knowledge(
         })
         .take(3)
         .collect();
-    route.selected_knowledge_ids = route
-        .selected_knowledge_ids
-        .into_iter()
-        .filter(|id| {
-            knowledge.items.iter().any(|item| {
-                item.id.map(|object_id| object_id.to_hex()).as_deref() == Some(id.as_str())
-            })
-        })
-        .take(4)
-        .collect();
+    route.selected_knowledge_ids = Vec::new();
     route.selected_chunk_ids = route
         .selected_chunk_ids
         .into_iter()
@@ -601,7 +510,6 @@ pub(crate) async fn route_operation_knowledge(
             doc! {
                 "tool": "knowledge.list_catalog",
                 "documents": knowledge.documents.len() as i32,
-                "items": knowledge.items.len() as i32,
                 "chunks": knowledge.chunks.len() as i32
             },
         );
@@ -747,22 +655,6 @@ pub(crate) fn empty_knowledge_route(planner: &RunPlannerResult) -> KnowledgeRout
     }
 }
 
-pub(crate) fn select_operation_knowledge(
-    knowledge: &[OperationKnowledgeItem],
-    route: &KnowledgeRouteResult,
-) -> Vec<OperationKnowledgeItem> {
-    route
-        .selected_knowledge_ids
-        .iter()
-        .filter_map(|id| {
-            knowledge.iter().find(|item| {
-                item.id.map(|object_id| object_id.to_hex()).as_deref() == Some(id.as_str())
-            })
-        })
-        .cloned()
-        .collect::<Vec<_>>()
-}
-
 pub(crate) fn route_used_knowledge_ids(route: &KnowledgeRouteResult) -> Vec<String> {
     route
         .selected_knowledge_ids
@@ -788,45 +680,19 @@ pub(crate) fn select_operation_knowledge_chunks(
         .collect::<Vec<_>>()
 }
 
-fn operation_knowledge_to_bson(item: OperationKnowledgeItem) -> Bson {
-    to_bson(&doc! {
-        "id": item.id.map(|id| id.to_hex()).unwrap_or_default(),
-        "category": item.category,
-        "businessType": item.business_type,
-        "knowledgeType": item.knowledge_type,
-        "businessContext": item.business_context,
-        "title": item.title,
-        "summary": item.summary,
-        "routingCard": item.routing_card,
-        "safeClaims": item.safe_claims,
-        "forbiddenClaims": item.forbidden_claims,
-        "status": item.status,
-        "updatedAt": item.updated_at
-    })
-    .unwrap_or(Bson::Null)
-}
-
 fn operation_knowledge_chunk_to_bson(item: OperationKnowledgeChunk) -> Bson {
     to_bson(&doc! {
         "id": item.id.map(|id| id.to_hex()).unwrap_or_default(),
         "documentId": item.document_id.map(|id| id.to_hex()),
-        "itemId": item.item_id.map(|id| id.to_hex()),
         "knowledgeType": item.knowledge_type,
         "businessContext": item.business_context,
         "title": item.title,
         "summary": item.summary,
-        "routingCard": item.routing_card,
         "body": item.body,
-        "safeClaims": item.safe_claims,
-        "forbiddenClaims": item.forbidden_claims,
-        "evidenceItems": item.evidence_items,
         "sourceQuote": item.source_quote,
         "sourceAnchors": item.source_anchors,
         "integrityStatus": item.integrity_status,
         "confidenceScore": item.confidence_score,
-        "distortionRisks": item.distortion_risks,
-        "verifiedClaims": item.verified_claims,
-        "unsupportedClaims": item.unsupported_claims,
         "status": item.status,
         "updatedAt": item.updated_at
     })
@@ -873,5 +739,26 @@ pub(crate) async fn write_knowledge_usage_log(
             None,
         )
         .await?;
+    // knowledge-wiki §6.1：每次 run 把命中/拦截原子写回 chunk.usage_stats，
+    // 让 catalog/persisted 的排序与 feedback worker 的 dynamic_confidence 拿到
+    // 实时计数。fire-and-forget——不阻塞 gateway 决策。
+    let block_reason = if approved {
+        None
+    } else {
+        Some(review.review_summary.clone())
+    };
+    for hex_id in route
+        .selected_knowledge_ids
+        .iter()
+        .chain(route.selected_chunk_ids.iter())
+    {
+        let _ = crate::knowledge_wiki::gap_signals::record_chunk_hit(
+            &state.db,
+            hex_id,
+            !approved,
+            block_reason.as_deref(),
+        )
+        .await;
+    }
     Ok(())
 }

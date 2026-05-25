@@ -489,3 +489,135 @@ knowledge_operator_memory_added    新增运营偏好 / 拒绝项
 ```
 
 所有 kind 过 `scripts/check-no-human-takeover.{sh,ps1}` lint，不引入"接管 / 人工"语义。
+
+## knowledge-wiki 子系统（Phase A–G）
+
+把"销售话术 RAG"升级为"运营知识 Wiki + 检索面"。本节只列字段 / 路由 / 集合 / 索引；方法论与 lifecycle 见 [`docs/knowledge-wiki.md`](knowledge-wiki.md)。**召回算法零改动**（catalog → list_chunks → open_slice）。
+
+### 新增字段（向后兼容，全 Option）
+
+`OperationKnowledgeChunk`：
+
+```
+wiki_type             Option<String>          source / entity / concept / comparison /
+                                              synthesis / methodology / finding / query / thesis
+domain_attributes     Option<Document>        行业字段 JSON 容器；由 active domain_schemas 校验
+provenance            Option<ChunkProvenance> { source: ai|human|rule|imported,
+                                              source_doc_id?, source_quote?,
+                                              llm_model_alias?(只写 provider_id),
+                                              edited_at, edited_by? }
+valid_from / valid_to Option<DateTime>        时效性（合同期 / 活动期），feedback worker 标 stale
+superseded_by         Option<String>          redirect 到新 chunk_id
+previous_version_id   Option<String>          版本链
+related_chunks        Option<Vec<RelatedRef>> { chunk_id, kind: superseded_by|references|
+                                              requires|contradicts|clarifies|refines, note? }
+usage_stats           Option<UsageStats>      { hit_count_30d, blocked_count_30d,
+                                              last_used_at?, last_blocked_reason? }
+dynamic_confidence    Option<f64>             feedback worker 回写
+locked_fields         Option<Vec<String>>     默认 [chunk_id, wiki_type, created_at,
+                                              source_anchor, verified_at, verified_by, approved_at]
+```
+
+`OperationKnowledgeDocument`：
+
+```
+catalog_summary_persisted  Option<String>     catalog 落库 markdown 快照
+catalog_version            Option<i64>        每次 rebuild 自增
+```
+
+旧文档读出 None 不报错；写入路径自然填新字段。
+
+### 新增集合
+
+```
+chunk_revisions
+    { _id, chunk_id, revision_id, op, patch: Document,
+      before_hash: sha256, after_hash: sha256,
+      source: ai|human|rule|imported, reason?, created_at, created_by? }
+    op ∈ create | patch | split | merge | rollback | archive | restore | verify | unverify
+    索引：(chunk_id, revision_id desc)、(created_at desc)
+
+knowledge_gap_signals
+    { _id, signal_id, kind, title, description,
+      affected_chunk_ids: [String], search_queries: [String],
+      severity: warning|info, source: rule|llm,
+      status: pending|auto_resolved|llm_resolved|applied|dismissed,
+      resolution_note?, created_at, resolved_at? }
+    kind ∈ orphan | broken_link | no_outlinks | low_confidence | stale
+           | contradiction | missing_chunk | suggestion
+    索引：(workspace_id, status, kind)、(workspace_id, created_at desc)
+
+domain_schemas
+    { _id, schema_id, workspace_id, name, version, fields: [DomainField],
+      alias_dict: Document, guard_dsl?, is_active, created_at, updated_at }
+    DomainField: { name, label, kind: string|enum|number|date|reference,
+                   required, allowed_values?, alias_of? }
+    索引：(workspace_id, schema_id, version desc)、(workspace_id, is_active)
+
+catalog_rebuild_jobs
+    { _id, job_id, workspace_id, document_id, queued_at, status,
+      attempts, last_error?, started_at?, finished_at? }
+    status ∈ queued | running | done | failed
+    索引：(workspace_id, status, queued_at)
+```
+
+### 新增 chunk 编辑路由（7 个）
+
+走同一函数 `apply_chunk_revision`：read-existing → 锁定字段守门 → 数组字段 union → 70% body 长度阈值 → AI 写入强制 draft+needs_review → chunk_revisions + chunks 双写（先 revisions 后 chunks）→ enqueue catalog_rebuild_job。
+
+```
+POST   /api/operation-knowledge/chunks/:id/patch                     字段级 patch
+POST   /api/operation-knowledge/chunks/:id/split                     拆分（原 archive + 新建 N 个）
+POST   /api/operation-knowledge/chunks/:id/merge                     合并（原 + target archive + 一个新）
+POST   /api/operation-knowledge/chunks/:id/archive                   软删 + 删除级联
+POST   /api/operation-knowledge/chunks/:id/restore                   取消 archive
+POST   /api/operation-knowledge/chunks/:id/rollback/:revision_id     回滚到指定 revision 的 before-state
+GET    /api/operation-knowledge/chunks/:id/revisions                 分页 timeline
+POST   /api/operation-knowledge/chunks/:id/relate                    维护 related_chunks（受限 6 关系枚举）
+DELETE /api/operation-knowledge/chunks/:id/relate/:target_id         移除单条关系
+```
+
+### 新增 catalog 双轨
+
+```
+GET /api/operation-knowledge/catalog/persisted                        读 documents.catalog_summary_persisted（O(1)）
+GET /api/operation-knowledge/catalog                                  实时聚合 fallback（既有路由保留）
+```
+
+### 新增 gap-signals 路由（4 个）
+
+```
+GET  /api/knowledge/gap-signals?status=pending&kind=&limit=           列信号
+POST /api/knowledge/gap-signals/:id/dismiss                           运营手动消解
+POST /api/knowledge/gap-signals/:id/apply                             应用建议（接口预留）
+POST /api/knowledge/gap-signals/sweep                                 手动触发 lint + stage 1 sweep
+```
+
+### 新增 domain-schemas admin 路由（5 个）
+
+```
+GET    /api/admin/domain-schemas?workspaceId=&activeOnly=             列出
+POST   /api/admin/domain-schemas                                      新建（自动 version=既有 max+1）
+PUT    /api/admin/domain-schemas/:schemaId                            更新（updates latest version in place）
+DELETE /api/admin/domain-schemas/:schemaId                            删除（不允许删 active）
+POST   /api/admin/domain-schemas/:schemaId/activate                   切换 active（同 workspace 同时只能 1 条）
+```
+
+校验红线：`fields.len() <= 64`、`field.name` 不与 chunk 主表既有字段冲突、kind=enum 必须提供非空 allowed_values、`alias_dict` 每个 value 必须存在于 fields[].name。
+
+### 新增配置（`.env`）
+
+```
+KNOWLEDGE_FEEDBACK_INTERVAL_SECONDS=600       # feedback worker tick；0 = 关停
+CATALOG_REBUILD_WORKER_INTERVAL_SECONDS=3     # catalog rebuild worker tick；0 = 关停
+```
+
+两个 worker 启动时按 interval gated；为 0 立即 return，零资源消耗。
+
+### import_apply 协议变更
+
+`POST /api/operation-knowledge/import-apply` 不再让 LLM 返一次大 JSON。改要求 `---CHUNK: chunk_id---...---END CHUNK---` 流式块（fence-aware parse + unsafe path-like rejection + 流截断 warning）。每块独立校验 + 落库 + 写 chunk_revision (op=create, source=imported)。已闭合块照常落库（不全有总比全无好）。
+
+### record_chunk_hit fire-and-forget hook
+
+`agent::knowledge_router::write_knowledge_usage_log` 写 log 后 fire-and-forget 调用 `crate::knowledge_wiki::gap_signals::record_chunk_hit`：命中 `$inc usage_stats.hit_count_30d`，被 block `$inc usage_stats.blocked_count_30d` + `$set last_blocked_reason`。**不阻塞召回路径**；隔离红线：knowledge_wiki 子系统不引用 `crate::agent::gateway / outbox`、`crate::mcp::*`。

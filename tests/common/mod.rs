@@ -149,6 +149,7 @@ impl TestApp {
             db,
             mcp,
             llm: llm.clone(),
+            llm_registry: None,
             config,
             prompt_pack_version: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             chat_progress_bus: std::sync::Arc::new(
@@ -219,6 +220,11 @@ fn test_config(mongodb_uri: String, mongodb_database: String) -> AppConfig {
         evolution_threshold_release_cooldown_hours: 24,
         evolution_cohort_per_contact_cap: 3,
         evolution_cohort_sample_per_failure_bucket: 10,
+        knowledge_digest_enabled: false,
+        knowledge_digest_run_hour: 9,
+        knowledge_digest_run_token_budget: 60_000,
+        knowledge_digest_run_max_llm_calls: 30,
+        knowledge_task_worker_interval_seconds: 0,
     }
 }
 
@@ -301,6 +307,7 @@ pub fn rebuild_app_state_with_mcp_url(app: &TestApp, mcp_url: String) -> AppStat
         db: app.state.db.clone(),
         mcp,
         llm: app.state.llm.clone(),
+        llm_registry: app.state.llm_registry.clone(),
         config,
         prompt_pack_version: app.state.prompt_pack_version.clone(),
         chat_progress_bus: app.state.chat_progress_bus.clone(),

@@ -476,17 +476,29 @@ fn scenario_contact_from_seed(
                     .collect()
             })
             .unwrap_or_default(),
-        customer_stage: seed
-            .get_str("customerStage")
-            .or_else(|_| seed.get_str("customer_stage"))
-            .ok()
-            .map(ToString::to_string),
-        intent_level: seed
-            .get_str("intentLevel")
-            .or_else(|_| seed.get_str("intent_level"))
-            .ok()
-            .map(ToString::to_string),
-        customer_stage_updated_at: None,
+        domain_attributes: {
+            let mut doc = Document::new();
+            if let Some(value) = seed
+                .get_str("customerStage")
+                .or_else(|_| seed.get_str("customer_stage"))
+                .ok()
+            {
+                doc.insert("customer_stage", value);
+            }
+            if let Some(value) = seed
+                .get_str("intentLevel")
+                .or_else(|_| seed.get_str("intent_level"))
+                .ok()
+            {
+                doc.insert("intent_level", value);
+            }
+            if doc.is_empty() {
+                None
+            } else {
+                Some(doc)
+            }
+        },
+        domain_attributes_updated_at: None,
         commitments: Vec::new(),
         follow_up_policy: None,
         operation_state: seed

@@ -26,8 +26,7 @@ use super::guards::{
 };
 use super::knowledge_router::{
     empty_knowledge_route, knowledge_route_has_keyword_fastpath_hit, load_operation_knowledge,
-    route_operation_knowledge, route_used_knowledge_ids, select_operation_knowledge,
-    select_operation_knowledge_chunks,
+    route_operation_knowledge, route_used_knowledge_ids, select_operation_knowledge_chunks,
 };
 use super::memory::{
     effective_memory_card_for_contact, load_or_create_operating_memory, next_memory_card_version,
@@ -143,8 +142,6 @@ async fn simulate_user_dialogue_inner(
         };
         let keyword_fastpath_hit =
             knowledge_route_has_keyword_fastpath_hit(&knowledge_route);
-        let selected_knowledge =
-            select_operation_knowledge(&operation_knowledge.items, &knowledge_route);
         let selected_chunks =
             select_operation_knowledge_chunks(&operation_knowledge.chunks, &knowledge_route);
         let mut decision = decide_reply(
@@ -158,7 +155,6 @@ async fn simulate_user_dialogue_inner(
             &runtime,
             &memory,
             &context_pack,
-            &selected_knowledge,
             &selected_chunks,
             &knowledge_route,
             None,
@@ -198,7 +194,6 @@ async fn simulate_user_dialogue_inner(
                 &runtime,
                 &memory,
                 &context_pack,
-                &selected_knowledge,
                 &selected_chunks,
                 &knowledge_route,
                 effective_review_mode(&planner, &decision, &runtime, false),

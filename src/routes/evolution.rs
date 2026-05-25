@@ -625,6 +625,8 @@ mod tests {
             knowledge_digest_run_token_budget: 24000,
             knowledge_digest_run_max_llm_calls: 8,
             knowledge_task_worker_interval_seconds: 30,
+            catalog_rebuild_worker_interval_seconds: 0,
+            knowledge_feedback_interval_seconds: 0,
         }
     }
 }

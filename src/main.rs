@@ -13,7 +13,7 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use wechatagent::{
     config::AppConfig,
     db::{self, Database},
-    llm::{LlmClient, LlmGenerator},
+    llm::{LlmClient, LlmFormat, LlmGenerator, LlmProviderMeta, LlmRegistry},
     mcp::McpClient,
     prompts,
     routes::{api_router, AppState},
@@ -38,18 +38,36 @@ async fn main() -> anyhow::Result<()> {
     let db = Database::connect(&config.mongodb_uri, &config.mongodb_database).await?;
     db::migrations::run(&db).await?;
     db.ensure_indexes().await?;
-    let llm: Arc<dyn LlmGenerator> = Arc::new(LlmClient::new(
-        config.openai_base_url.clone(),
-        config.openai_api_key.clone(),
-        config.openai_model.clone(),
-        config.llm_timeout_seconds,
-        config.llm_max_retries,
-        config.llm_retry_base_ms,
-    )?);
+    // LLM 配置：DB 优先，缺则用 .env 当种子。
+    // 启动时若 `llm_provider_configs` 没有 active 记录，写一条来自 .env 的
+    // openai 形态默认记录；之后每次启动都按当前 active 记录构造 LlmClient。
+    let active_provider =
+        ensure_default_llm_provider(&db, &config).await?;
+    let active_format = LlmFormat::parse(&active_provider.format)?;
+    let llm_client = LlmClient::with_format(
+        active_provider.base_url.clone(),
+        active_provider.api_key.clone(),
+        active_provider.model.clone(),
+        active_format,
+        active_provider.timeout_seconds.unwrap_or(config.llm_timeout_seconds),
+        active_provider.max_retries.unwrap_or(config.llm_max_retries),
+        active_provider.retry_base_ms.unwrap_or(config.llm_retry_base_ms),
+    )?;
+    let registry = Arc::new(LlmRegistry::new(
+        llm_client,
+        LlmProviderMeta {
+            provider_id: active_provider.provider_id.clone(),
+            format: active_format,
+            model: active_provider.model.clone(),
+            base_url: active_provider.base_url.clone(),
+        },
+    ));
+    let llm: Arc<dyn LlmGenerator> = registry.clone();
     let state = AppState {
         db,
         mcp: McpClient::new(config.mcp_base_url.clone(), config.mcp_api_key.clone())?,
         llm,
+        llm_registry: Some(registry.clone()),
         config: config.clone(),
         prompt_pack_version: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
         chat_progress_bus: std::sync::Arc::new(
@@ -121,6 +139,38 @@ async fn main() -> anyhow::Result<()> {
         let task_state = state.clone();
         tokio::spawn(async move {
             wechatagent::knowledge_task::worker_loop(task_state).await;
+        });
+    }
+
+    // knowledge-wiki Phase E：catalog rebuild worker。
+    // 默认 3s 一轮（`CATALOG_REBUILD_WORKER_INTERVAL_SECONDS=0` 关停）。消费
+    // `catalog_rebuild_jobs` 队列，把每条 job 对应 document 的所有 active chunk
+    // 渲染为 markdown 落到 `documents.catalog_summary_persisted` + 自增
+    // `catalog_version`，把 catalog 拉取从 O(N 字段) 降到 O(1)。
+    {
+        let db = state.db.clone();
+        let interval = state.config.catalog_rebuild_worker_interval_seconds;
+        tokio::spawn(async move {
+            wechatagent::knowledge_wiki::catalog_rebuild::catalog_rebuild_worker_loop(
+                db, interval,
+            )
+            .await;
+        });
+    }
+
+    // knowledge-wiki Phase F：feedback worker。
+    // 默认 600s 一轮（`KNOWLEDGE_FEEDBACK_INTERVAL_SECONDS=0` 关停）。逐 workspace
+    // 跑 30d usage_stats 滑窗回写 + dynamic_confidence 计算 + structural lint +
+    // stage 1 sweep。stage 2（LLM）暂留接口，本轮不进入热路径。
+    {
+        let feedback_state = state.clone();
+        let interval = state.config.knowledge_feedback_interval_seconds;
+        tokio::spawn(async move {
+            wechatagent::knowledge_wiki::feedback_worker::feedback_worker_loop(
+                feedback_state,
+                interval,
+            )
+            .await;
         });
     }
 
@@ -221,4 +271,65 @@ async fn ensure_example_evaluation_scenario(
     };
     db.evaluation_scenarios().insert_one(scenario, None).await?;
     Ok(())
+}
+
+/// 启动时确保 `llm_provider_configs` 至少有一条 active 记录。
+///
+/// 行为：
+/// - 若已有 `is_active=true` 的记录，原样返回。
+/// - 否则：若任意一条记录存在，把第一条置为 active 返回；
+/// - 否则用 `.env` 的 `OPENAI_*` 写一条 openai 形态默认记录并标 active。
+async fn ensure_default_llm_provider(
+    db: &wechatagent::db::Database,
+    config: &AppConfig,
+) -> anyhow::Result<wechatagent::models::LlmProviderConfig> {
+    use mongodb::bson::{doc, DateTime};
+    if let Some(existing) = db
+        .llm_provider_configs()
+        .find_one(
+            doc! { "workspaceId": &config.default_workspace_id, "isActive": true },
+            None,
+        )
+        .await?
+    {
+        return Ok(existing);
+    }
+    if let Some(any) = db
+        .llm_provider_configs()
+        .find_one(
+            doc! { "workspaceId": &config.default_workspace_id },
+            None,
+        )
+        .await?
+    {
+        db.llm_provider_configs()
+            .update_one(
+                doc! { "workspaceId": &config.default_workspace_id, "providerId": &any.provider_id },
+                doc! { "$set": { "isActive": true, "updatedAt": DateTime::now() } },
+                None,
+            )
+            .await?;
+        let mut activated = any;
+        activated.is_active = true;
+        return Ok(activated);
+    }
+    let now = DateTime::now();
+    let seed = wechatagent::models::LlmProviderConfig {
+        id: None,
+        workspace_id: config.default_workspace_id.clone(),
+        provider_id: "default".to_string(),
+        name: "默认 LLM".to_string(),
+        format: "openai".to_string(),
+        base_url: config.openai_base_url.clone(),
+        api_key: config.openai_api_key.clone(),
+        model: config.openai_model.clone(),
+        is_active: true,
+        timeout_seconds: Some(config.llm_timeout_seconds),
+        max_retries: Some(config.llm_max_retries),
+        retry_base_ms: Some(config.llm_retry_base_ms),
+        created_at: now,
+        updated_at: now,
+    };
+    db.llm_provider_configs().insert_one(&seed, None).await?;
+    Ok(seed)
 }

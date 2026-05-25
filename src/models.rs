@@ -94,14 +94,13 @@ pub struct Contact {
     pub playbook_version: Option<i32>,
     #[serde(default)]
     pub tags: Vec<String>,
-    pub customer_stage: Option<String>,
-    /// agent-autonomy-loop M2：`customer_stage` 上次发生变化的时间。
-    /// 写入约束：仅当 `customer_stage` 实际变更时同步刷新（见
-    /// `routes/shared.rs::set_customer_stage_with_ts`）。Planner
-    /// `scan_stage_stagnation` 据此判定阶段长期停滞。
-    #[serde(default)]
-    pub customer_stage_updated_at: Option<DateTime>,
-    pub intent_level: Option<String>,
+    /// 业务字段 JSON 容器（由 DomainSchema 在写入时校验）。
+    /// 取代旧的销售域硬编码 `customer_stage / intent_level / objection_type`。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub domain_attributes: Option<Document>,
+    /// `domain_attributes` 上次更新时间。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub domain_attributes_updated_at: Option<DateTime>,
     /// agent-autonomy-loop M2：结构化承诺列表（cap 8）。
     ///
     /// 取代原 `last_commitment: Option<String>` 自由文本字段，让 Planner
@@ -375,68 +374,6 @@ pub struct MemoryCandidate {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct OperationKnowledgeItem {
-    #[serde(rename = "_id", skip_serializing_if = "Option::is_none")]
-    pub id: Option<ObjectId>,
-    pub workspace_id: String,
-    pub account_id: Option<String>,
-    /// 父文档 ObjectId（import-apply 时回填）。允许 None 兼容直接创建无原文档来源的 pack。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub document_id: Option<ObjectId>,
-    pub domain: String,
-    pub category: String,
-    pub business_type: String,
-    pub knowledge_type: Option<String>,
-    pub business_context: Option<String>,
-    pub title: String,
-    pub summary: Option<String>,
-    pub body: Option<String>,
-    pub routing_card: Option<String>,
-    #[serde(default)]
-    pub applicable_scenes: Vec<String>,
-    #[serde(default)]
-    pub not_applicable_scenes: Vec<String>,
-    #[serde(default)]
-    pub suitable_for: Vec<String>,
-    #[serde(default)]
-    pub not_suitable_for: Vec<String>,
-    #[serde(default)]
-    pub customer_stages: Vec<String>,
-    #[serde(default)]
-    pub operation_states: Vec<String>,
-    #[serde(default)]
-    pub intent_levels: Vec<String>,
-    #[serde(default)]
-    pub safe_claims: Vec<String>,
-    #[serde(default)]
-    pub forbidden_claims: Vec<String>,
-    #[serde(default)]
-    pub common_questions: Vec<String>,
-    #[serde(default)]
-    pub common_objections: Vec<String>,
-    #[serde(default)]
-    pub evidence_items: Vec<String>,
-    /// 知识标签（≤5）：产品/品牌/解决方案名称，运行时用于关联和展示。
-    #[serde(default)]
-    pub product_tags: Vec<String>,
-    /// 触发关键词（≤8，含同义/口语化变体，存储为小写）：运行时关键词快路径
-    /// 用 `inbound.contains(kw.to_lowercase())` 进行子串匹配，命中即升档为
-    /// consultative 模式并强制注入对应 chunk 到 selected_chunks 头部。
-    #[serde(default)]
-    pub trigger_keywords: Vec<String>,
-    /// 业务主题（≤3）：本知识包属于哪个业务议题（产品定位/竞品对比/部署方式 ...）。
-    #[serde(default)]
-    pub business_topics: Vec<String>,
-    pub source_type: String,
-    pub source_name: Option<String>,
-    pub status: String,
-    pub priority: i32,
-    pub version: i32,
-    pub created_at: DateTime,
-    pub updated_at: DateTime,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OperationKnowledgeDocument {
     #[serde(rename = "_id", skip_serializing_if = "Option::is_none")]
     pub id: Option<ObjectId>,
@@ -471,6 +408,15 @@ pub struct OperationKnowledgeDocument {
     pub version: i32,
     pub created_at: DateTime,
     pub updated_at: DateTime,
+
+    // ── catalog 落库 + 增量重写（feature: catalog persistence） ──
+    /// catalog_rebuild_worker 写出的 markdown 快照；`/catalog/persisted` O(1) 直读。
+    /// 旧文档读出 None；首次 enqueue catalog_rebuild_job 后由 worker 填入。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub catalog_summary_persisted: Option<String>,
+    /// 单调递增版本号；前端 `If-None-Match` 走 304。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub catalog_version: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -487,17 +433,10 @@ pub struct OperationKnowledgeChunk {
     pub title: String,
     pub summary: Option<String>,
     pub body: Option<String>,
-    pub routing_card: Option<String>,
     #[serde(default)]
     pub applicable_scenes: Vec<String>,
     #[serde(default)]
     pub not_applicable_scenes: Vec<String>,
-    #[serde(default)]
-    pub safe_claims: Vec<String>,
-    #[serde(default)]
-    pub forbidden_claims: Vec<String>,
-    #[serde(default)]
-    pub evidence_items: Vec<String>,
     /// 知识标签（≤5）：产品/品牌/解决方案名称。LLM 在 import-preview 时自动抽取，
     /// 后台可手动编辑。
     #[serde(default)]
@@ -515,16 +454,250 @@ pub struct OperationKnowledgeChunk {
     pub source_anchors: Vec<Document>,
     pub integrity_status: Option<String>,
     pub confidence_score: Option<i32>,
-    #[serde(default)]
-    pub distortion_risks: Vec<String>,
-    #[serde(default)]
-    pub unsupported_claims: Vec<String>,
-    #[serde(default)]
-    pub verified_claims: Vec<String>,
     pub status: String,
     pub priority: i32,
     pub created_at: DateTime,
     pub updated_at: DateTime,
+
+    // ── knowledge-wiki 方法论字段（前向兼容；旧文档读出来全 None） ──
+    /// 9 类 wiki_type 之一（source/entity/concept/comparison/synthesis/methodology/finding/query/thesis）。
+    /// 旧文档读出 None；migration `2026_05_W1_001_chunks_wiki_type_default` 把所有缺字段 chunk 默认填 "entity"。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wiki_type: Option<String>,
+    /// 业务字段 JSON 容器：销售域 `customer_stage / objection_type / pressure_level`，
+    /// 教培域 `parent_emotion_state / age_segment / subject` 等。由 DomainSchema 校验。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub domain_attributes: Option<Document>,
+    /// 写入来源标注：ai/human/rule/imported + provider 别名 + source_quote。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provenance: Option<ChunkProvenance>,
+    /// 时效起始；feedback worker 标 stale 时使用。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub valid_from: Option<DateTime>,
+    /// 时效截止；valid_to < now 时 dynamic_confidence 减 stale_penalty。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub valid_to: Option<DateTime>,
+    /// 已被新版本替代时记录新 chunk_id（≈ wiki redirect）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub superseded_by: Option<String>,
+    /// 上一版本的 chunk_id；split/merge/rollback 都会维护这条链路。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_version_id: Option<String>,
+    /// 关系图（≈ wikilinks）：6 种 relation_kind ∈ {superseded_by/references/requires/contradicts/clarifies/refines}。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub related_chunks: Option<Vec<RelatedRef>>,
+    /// 30 天滑窗使用统计；feedback worker 周期回写。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage_stats: Option<UsageStats>,
+    /// feedback worker 计算：base × 0.6 + hit_rate × 0.4 - stale_penalty，clamp [0,1]。
+    /// catalog_persisted 用此字段排序。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dynamic_confidence: Option<f64>,
+    /// 完整度评估（沿用既有评估口径，可被 feedback worker 维护）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub integrity_score: Option<f64>,
+    /// 编辑保护字段清单：patch 试图改这些字段一律 4xx 拒绝。默认 7 项。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub locked_fields: Option<Vec<String>>,
+}
+
+impl Default for OperationKnowledgeChunk {
+    fn default() -> Self {
+        Self {
+            id: None,
+            workspace_id: String::new(),
+            account_id: None,
+            document_id: None,
+            item_id: None,
+            domain: String::new(),
+            knowledge_type: None,
+            business_context: None,
+            title: String::new(),
+            summary: None,
+            body: None,
+            applicable_scenes: Vec::new(),
+            not_applicable_scenes: Vec::new(),
+            product_tags: Vec::new(),
+            trigger_keywords: Vec::new(),
+            business_topics: Vec::new(),
+            source_quote: None,
+            source_anchors: Vec::new(),
+            integrity_status: None,
+            confidence_score: None,
+            status: String::new(),
+            priority: 0,
+            created_at: DateTime::now(),
+            updated_at: DateTime::now(),
+            wiki_type: None,
+            domain_attributes: None,
+            provenance: None,
+            valid_from: None,
+            valid_to: None,
+            superseded_by: None,
+            previous_version_id: None,
+            related_chunks: None,
+            usage_stats: None,
+            dynamic_confidence: None,
+            integrity_score: None,
+            locked_fields: None,
+        }
+    }
+}
+
+/// chunk 的写入来源标注。
+///
+/// `source` ∈ {ai, human, rule, imported}；`llm_model_alias` 用 provider_id 别名
+/// （由用户在 LLM Provider Configs 自填），**不允许出现具体模型名/品牌名**。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChunkProvenance {
+    pub source: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_doc_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_quote: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub llm_model_alias: Option<String>,
+    pub edited_at: DateTime,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub edited_by: Option<String>,
+}
+
+/// chunk 之间的关系引用（≈ wikilink）。`kind` 属于 6 种封闭枚举。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RelatedRef {
+    pub chunk_id: String,
+    pub kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+
+/// chunk 30 天滑窗使用统计。feedback worker 每 N 分钟回写一次。
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct UsageStats {
+    #[serde(default)]
+    pub hit_count_30d: u32,
+    #[serde(default)]
+    pub blocked_count_30d: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_used_at: Option<DateTime>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_blocked_reason: Option<String>,
+}
+
+/// chunk 编辑历史的不可变记录。每次 patch / split / merge / rollback / archive /
+/// restore / verify / unverify 都写一行；revisions 表与 chunks 表双写。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChunkRevision {
+    #[serde(rename = "_id", skip_serializing_if = "Option::is_none")]
+    pub id: Option<ObjectId>,
+    pub chunk_id: String,
+    pub revision_id: String,
+    /// 操作语义 ∈ {create, patch, split, merge, rollback, archive, restore, verify, unverify}。
+    pub op: String,
+    /// 字段级 diff。AI 回复的 chat-canvas 永远只返 patch 而非整 chunk。
+    #[serde(default)]
+    pub patch: Document,
+    pub before_hash: String,
+    pub after_hash: String,
+    /// 写入来源 ∈ {ai, human, rule, imported}。
+    pub source: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    pub created_at: DateTime,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_by: Option<String>,
+}
+
+/// 知识库 gap signal：structural lint（orphan/broken_link/no_outlinks）+
+/// semantic lint（contradiction/stale/missing_chunk/suggestion/low_confidence）。
+///
+/// 两阶段 sweep 后 status 流转：pending → auto_resolved | llm_resolved | applied | dismissed。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KnowledgeGapSignal {
+    #[serde(rename = "_id", skip_serializing_if = "Option::is_none")]
+    pub id: Option<ObjectId>,
+    pub signal_id: String,
+    pub workspace_id: String,
+    /// 8 类信号 kind 之一。
+    pub kind: String,
+    pub title: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub affected_chunk_ids: Vec<String>,
+    #[serde(default)]
+    pub search_queries: Vec<String>,
+    /// "warning" | "info"。
+    pub severity: String,
+    /// "rule" | "llm"。
+    pub source: String,
+    /// pending / auto_resolved / llm_resolved / applied / dismissed。
+    pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolution_note: Option<String>,
+    pub created_at: DateTime,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_at: Option<DateTime>,
+}
+
+/// 行业可配 schema：active 一条 / workspace；chunk 写入时校验 `domain_attributes`。
+///
+/// `alias_dict` 是 `Document`：`{ "客户阶段": "customer_stage", "话术类别": "objection_type" }`，
+/// 写入时透明 rewrite 命中 key 为 canonical name。
+/// `guard_dsl` 简版仅 `field OP value`，多条 AND 组合，复杂 DSL 留下一轮。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DomainSchema {
+    #[serde(rename = "_id", skip_serializing_if = "Option::is_none")]
+    pub id: Option<ObjectId>,
+    pub schema_id: String,
+    pub workspace_id: String,
+    pub name: String,
+    pub version: i32,
+    #[serde(default)]
+    pub fields: Vec<DomainField>,
+    #[serde(default)]
+    pub alias_dict: Document,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guard_dsl: Option<String>,
+    pub is_active: bool,
+    pub created_at: DateTime,
+    pub updated_at: DateTime,
+}
+
+/// `DomainSchema` 的字段定义。`kind` ∈ {string, enum, number, date, reference}。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DomainField {
+    pub name: String,
+    pub label: String,
+    pub kind: String,
+    #[serde(default)]
+    pub required: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allowed_values: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub alias_of: Option<String>,
+}
+
+/// catalog 重建队列：`apply_chunk_revision` 写完即 enqueue；catalog_rebuild_worker
+/// 每 200ms 取一批 status=queued 落库 `documents.catalog_summary_persisted`。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CatalogRebuildJob {
+    #[serde(rename = "_id", skip_serializing_if = "Option::is_none")]
+    pub id: Option<ObjectId>,
+    pub job_id: String,
+    pub workspace_id: String,
+    pub document_id: ObjectId,
+    pub queued_at: DateTime,
+    /// queued / running / done / failed。
+    pub status: String,
+    #[serde(default)]
+    pub attempts: i32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<DateTime>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finished_at: Option<DateTime>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1142,9 +1315,8 @@ pub struct ApiContact {
     pub playbook_id: Option<String>,
     pub playbook_version: Option<i32>,
     pub tags: Vec<String>,
-    pub customer_stage: Option<String>,
-    pub customer_stage_updated_at: Option<String>,
-    pub intent_level: Option<String>,
+    pub domain_attributes: Option<Document>,
+    pub domain_attributes_updated_at: Option<String>,
     pub commitments: Vec<ApiCommitment>,
     pub follow_up_policy: Option<String>,
     pub operation_state: Option<String>,
@@ -1180,9 +1352,10 @@ impl From<Contact> for ApiContact {
             playbook_id: contact.playbook_id.map(|id| id.to_hex()),
             playbook_version: contact.playbook_version,
             tags: contact.tags,
-            customer_stage: contact.customer_stage,
-            customer_stage_updated_at: contact.customer_stage_updated_at.and_then(dt_to_string),
-            intent_level: contact.intent_level,
+            domain_attributes: contact.domain_attributes,
+            domain_attributes_updated_at: contact
+                .domain_attributes_updated_at
+                .and_then(dt_to_string),
             commitments: contact.commitments.iter().map(ApiCommitment::from).collect(),
             follow_up_policy: contact.follow_up_policy,
             operation_state: contact.operation_state,
@@ -1239,16 +1412,14 @@ mod typed {
         pub follow_up_expires_hours: i64,
         #[serde(default = "defaults::cooldown_after_no_reply_hours")]
         pub cooldown_after_no_reply_hours: i64,
-        #[serde(default = "defaults::fact_risk_block_at")]
-        pub fact_risk_block_at: i32,
-        #[serde(default = "defaults::pressure_risk_block_at")]
-        pub pressure_risk_block_at: i32,
+        #[serde(default = "defaults::hallucination_block_at")]
+        pub hallucination_block_at: i32,
+        #[serde(default = "defaults::knowledge_grounding_block_below")]
+        pub knowledge_grounding_block_below: i32,
         #[serde(default = "defaults::human_like_rewrite_below")]
         pub human_like_rewrite_below: i32,
         #[serde(default = "defaults::emotional_value_rewrite_below")]
         pub emotional_value_rewrite_below: i32,
-        #[serde(default = "defaults::product_accuracy_block_below")]
-        pub product_accuracy_block_below: i32,
         #[serde(default = "defaults::operation_state_confidence_full_review_below")]
         pub operation_state_confidence_full_review_below: i32,
         #[serde(default = "defaults::run_token_budget")]
@@ -1306,11 +1477,10 @@ mod typed {
                 max_pending_follow_ups: defaults::max_pending_follow_ups(),
                 follow_up_expires_hours: defaults::follow_up_expires_hours(),
                 cooldown_after_no_reply_hours: defaults::cooldown_after_no_reply_hours(),
-                fact_risk_block_at: defaults::fact_risk_block_at(),
-                pressure_risk_block_at: defaults::pressure_risk_block_at(),
+                hallucination_block_at: defaults::hallucination_block_at(),
+                knowledge_grounding_block_below: defaults::knowledge_grounding_block_below(),
                 human_like_rewrite_below: defaults::human_like_rewrite_below(),
                 emotional_value_rewrite_below: defaults::emotional_value_rewrite_below(),
-                product_accuracy_block_below: defaults::product_accuracy_block_below(),
                 operation_state_confidence_full_review_below:
                     defaults::operation_state_confidence_full_review_below(),
                 run_token_budget: defaults::run_token_budget(),
@@ -1355,20 +1525,17 @@ mod typed {
         pub fn cooldown_after_no_reply_hours() -> i64 {
             24
         }
-        pub fn fact_risk_block_at() -> i32 {
+        pub fn hallucination_block_at() -> i32 {
             6
         }
-        pub fn pressure_risk_block_at() -> i32 {
-            7
+        pub fn knowledge_grounding_block_below() -> i32 {
+            6
         }
         pub fn human_like_rewrite_below() -> i32 {
             6
         }
         pub fn emotional_value_rewrite_below() -> i32 {
             5
-        }
-        pub fn product_accuracy_block_below() -> i32 {
-            7
         }
         pub fn operation_state_confidence_full_review_below() -> i32 {
             4
@@ -2200,6 +2367,36 @@ pub struct KnowledgeOperatorMemory {
     pub created_at: DateTime,
     pub last_used_at: DateTime,
     pub expires_at: Option<DateTime>,
+}
+
+/// LLM 服务商配置。一个 workspace 可以同时存在多条记录，但只有一条 `is_active=true`
+/// 才会被运行时 `LlmRegistry` 加载。`format` 决定底层 HTTP 协议形态：`openai`
+/// 走 `POST {base_url}/chat/completions`（兼容 DeepSeek / mimo / Qwen 等），
+/// `anthropic` 走 `POST {base_url}/v1/messages`（Anthropic Messages API）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LlmProviderConfig {
+    #[serde(rename = "_id", skip_serializing_if = "Option::is_none")]
+    pub id: Option<ObjectId>,
+    pub workspace_id: String,
+    /// 业务侧 slug，前端用它定位记录；同 workspace 内唯一。
+    pub provider_id: String,
+    pub name: String,
+    /// 协议形态：`"openai"` | `"anthropic"`。
+    pub format: String,
+    pub base_url: String,
+    pub api_key: String,
+    pub model: String,
+    #[serde(default)]
+    pub is_active: bool,
+    #[serde(default)]
+    pub timeout_seconds: Option<u64>,
+    #[serde(default)]
+    pub max_retries: Option<u32>,
+    #[serde(default)]
+    pub retry_base_ms: Option<u64>,
+    pub created_at: DateTime,
+    pub updated_at: DateTime,
 }
 
 #[cfg(test)]
@@ -3038,5 +3235,242 @@ mod typed_tests {
         // `0` (0x30) < `M` (0x4D)：`2026_05_009...` < `2026_05_M4_001...`。
         assert!("2026_05_009_contact_customer_stage_updated_at_backfill"
             < "2026_05_M4_001_prompt_template_versioned");
+    }
+
+    /// knowledge-wiki Phase A：旧 chunk 文档（无 wiki_type / domain_attributes /
+    /// provenance / usage_stats / dynamic_confidence / locked_fields 等新字段）
+    /// 必须能被新版 `OperationKnowledgeChunk` 反序列化，且新字段读出为 None。
+    /// 这是前向兼容硬约束（CLAUDE.md R11）。
+    #[test]
+    fn legacy_chunk_doc_deserializes_with_new_fields_none() {
+        let now = DateTime::now();
+        let raw = doc! {
+            "workspace_id": "default",
+            "domain": "user_ops",
+            "title": "legacy",
+            "applicable_scenes": Vec::<String>::new(),
+            "not_applicable_scenes": Vec::<String>::new(),
+            "safe_claims": Vec::<String>::new(),
+            "forbidden_claims": Vec::<String>::new(),
+            "evidence_items": Vec::<String>::new(),
+            "product_tags": Vec::<String>::new(),
+            "trigger_keywords": Vec::<String>::new(),
+            "business_topics": Vec::<String>::new(),
+            "source_anchors": Vec::<Document>::new(),
+            "distortion_risks": Vec::<String>::new(),
+            "unsupported_claims": Vec::<String>::new(),
+            "verified_claims": Vec::<String>::new(),
+            "status": "draft",
+            "priority": 1,
+            "created_at": now,
+            "updated_at": now,
+        };
+        let chunk: OperationKnowledgeChunk =
+            mongodb::bson::from_document(raw).expect("legacy chunk deserialize");
+        assert!(chunk.wiki_type.is_none());
+        assert!(chunk.domain_attributes.is_none());
+        assert!(chunk.provenance.is_none());
+        assert!(chunk.valid_from.is_none());
+        assert!(chunk.valid_to.is_none());
+        assert!(chunk.superseded_by.is_none());
+        assert!(chunk.previous_version_id.is_none());
+        assert!(chunk.related_chunks.is_none());
+        assert!(chunk.usage_stats.is_none());
+        assert!(chunk.dynamic_confidence.is_none());
+        assert!(chunk.integrity_score.is_none());
+        assert!(chunk.locked_fields.is_none());
+    }
+
+    #[test]
+    fn chunk_with_wiki_fields_roundtrip() {
+        let now = DateTime::now();
+        let prov = ChunkProvenance {
+            source: "imported".to_string(),
+            source_doc_id: Some("doc_42".to_string()),
+            source_quote: Some("销售口径 v3 §3.1 …".to_string()),
+            llm_model_alias: Some("provider_alias".to_string()),
+            edited_at: now,
+            edited_by: None,
+        };
+        let related = vec![RelatedRef {
+            chunk_id: "chk_b".to_string(),
+            kind: "references".to_string(),
+            note: None,
+        }];
+        let stats = UsageStats {
+            hit_count_30d: 7,
+            blocked_count_30d: 1,
+            last_used_at: Some(now),
+            last_blocked_reason: Some("FactRisk:6".to_string()),
+        };
+        let chunk = OperationKnowledgeChunk {
+            id: None,
+            workspace_id: "default".to_string(),
+            account_id: None,
+            document_id: None,
+            item_id: None,
+            domain: "user_ops".to_string(),
+            knowledge_type: None,
+            business_context: None,
+            title: "wiki sample".to_string(),
+            summary: None,
+            body: Some("…".to_string()),
+            routing_card: None,
+            applicable_scenes: vec![],
+            not_applicable_scenes: vec![],
+            safe_claims: vec![],
+            forbidden_claims: vec![],
+            evidence_items: vec![],
+            product_tags: vec![],
+            trigger_keywords: vec![],
+            business_topics: vec![],
+            source_quote: None,
+            source_anchors: vec![],
+            integrity_status: Some("verified".to_string()),
+            confidence_score: Some(85),
+            distortion_risks: vec![],
+            unsupported_claims: vec![],
+            verified_claims: vec![],
+            status: "active".to_string(),
+            priority: 1,
+            created_at: now,
+            updated_at: now,
+            wiki_type: Some("methodology".to_string()),
+            domain_attributes: Some(doc! { "customer_stage": "decision" }),
+            provenance: Some(prov),
+            valid_from: Some(now),
+            valid_to: None,
+            superseded_by: None,
+            previous_version_id: None,
+            related_chunks: Some(related),
+            usage_stats: Some(stats),
+            dynamic_confidence: Some(0.74),
+            integrity_score: Some(0.92),
+            locked_fields: Some(vec![
+                "chunk_id".to_string(),
+                "wiki_type".to_string(),
+                "created_at".to_string(),
+            ]),
+        };
+        let doc = mongodb::bson::to_document(&chunk).expect("serialize chunk");
+        assert_eq!(doc.get_str("wiki_type").unwrap(), "methodology");
+        let parsed: OperationKnowledgeChunk =
+            mongodb::bson::from_document(doc).expect("deserialize chunk");
+        assert_eq!(parsed.wiki_type.as_deref(), Some("methodology"));
+        assert_eq!(parsed.dynamic_confidence, Some(0.74));
+        let stats = parsed.usage_stats.expect("usage_stats");
+        assert_eq!(stats.hit_count_30d, 7);
+        assert_eq!(stats.blocked_count_30d, 1);
+        let related = parsed.related_chunks.expect("related_chunks");
+        assert_eq!(related.len(), 1);
+        assert_eq!(related[0].kind, "references");
+    }
+
+    #[test]
+    fn chunk_revision_roundtrip() {
+        let now = DateTime::now();
+        let rev = ChunkRevision {
+            id: None,
+            chunk_id: "chk_x".to_string(),
+            revision_id: "rev_chk_x_001".to_string(),
+            op: "patch".to_string(),
+            patch: doc! { "summary": "new" },
+            before_hash: "h_before".to_string(),
+            after_hash: "h_after".to_string(),
+            source: "ai".to_string(),
+            reason: Some("补出处".to_string()),
+            created_at: now,
+            created_by: None,
+        };
+        let doc = mongodb::bson::to_document(&rev).expect("serialize ChunkRevision");
+        assert_eq!(doc.get_str("op").unwrap(), "patch");
+        let parsed: ChunkRevision =
+            mongodb::bson::from_document(doc).expect("deserialize ChunkRevision");
+        assert_eq!(parsed.revision_id, "rev_chk_x_001");
+        assert_eq!(parsed.source, "ai");
+    }
+
+    #[test]
+    fn knowledge_gap_signal_roundtrip() {
+        let now = DateTime::now();
+        let sig = KnowledgeGapSignal {
+            id: None,
+            signal_id: "gap_001".to_string(),
+            workspace_id: "default".to_string(),
+            kind: "broken_link".to_string(),
+            title: "悬挂关系".to_string(),
+            description: "chunk 引用已归档的目标".to_string(),
+            affected_chunk_ids: vec!["chk_a".to_string(), "chk_b".to_string()],
+            search_queries: vec![],
+            severity: "warning".to_string(),
+            source: "rule".to_string(),
+            status: "pending".to_string(),
+            resolution_note: None,
+            created_at: now,
+            resolved_at: None,
+        };
+        let doc = mongodb::bson::to_document(&sig).expect("serialize");
+        let parsed: KnowledgeGapSignal =
+            mongodb::bson::from_document(doc).expect("deserialize");
+        assert_eq!(parsed.kind, "broken_link");
+        assert_eq!(parsed.affected_chunk_ids.len(), 2);
+    }
+
+    #[test]
+    fn domain_schema_roundtrip() {
+        let now = DateTime::now();
+        let s = DomainSchema {
+            id: None,
+            schema_id: "schema_sales".to_string(),
+            workspace_id: "default".to_string(),
+            name: "销售域 v1".to_string(),
+            version: 1,
+            fields: vec![DomainField {
+                name: "customer_stage".to_string(),
+                label: "客户阶段".to_string(),
+                kind: "enum".to_string(),
+                required: true,
+                allowed_values: Some(vec!["lead".to_string(), "decision".to_string()]),
+                alias_of: None,
+            }],
+            alias_dict: doc! { "客户阶段": "customer_stage" },
+            guard_dsl: None,
+            is_active: true,
+            created_at: now,
+            updated_at: now,
+        };
+        let doc = mongodb::bson::to_document(&s).expect("serialize");
+        let parsed: DomainSchema = mongodb::bson::from_document(doc).expect("deserialize");
+        assert_eq!(parsed.fields.len(), 1);
+        assert_eq!(parsed.fields[0].kind, "enum");
+        assert_eq!(parsed.fields[0].required, true);
+    }
+
+    #[test]
+    fn document_catalog_persisted_default_none() {
+        // 旧 document 文档没有 catalog_summary_persisted / catalog_version 字段，
+        // 仍可反序列化，新字段读出 None。
+        let now = DateTime::now();
+        let raw = doc! {
+            "workspace_id": "default",
+            "domain": "user_ops",
+            "source_type": "manual",
+            "title": "doc",
+            "routing_map": Vec::<String>::new(),
+            "risk_notes": Vec::<String>::new(),
+            "product_tags": Vec::<String>::new(),
+            "trigger_keywords": Vec::<String>::new(),
+            "business_topics": Vec::<String>::new(),
+            "line_index": Vec::<Document>::new(),
+            "section_index": Vec::<Document>::new(),
+            "status": "active",
+            "version": 1,
+            "created_at": now,
+            "updated_at": now,
+        };
+        let d: OperationKnowledgeDocument =
+            mongodb::bson::from_document(raw).expect("legacy doc deserialize");
+        assert!(d.catalog_summary_persisted.is_none());
+        assert!(d.catalog_version.is_none());
     }
 }

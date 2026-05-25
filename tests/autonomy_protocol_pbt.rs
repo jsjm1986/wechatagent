@@ -365,6 +365,18 @@ fn pbt_chunk(verified: bool) -> OperationKnowledgeChunk {
         business_topics: Vec::new(),
         created_at: BsonDateTime::now(),
         updated_at: BsonDateTime::now(),
+        wiki_type: None,
+        domain_attributes: None,
+        provenance: None,
+        valid_from: None,
+        valid_to: None,
+        superseded_by: None,
+        previous_version_id: None,
+        related_chunks: None,
+        usage_stats: None,
+        dynamic_confidence: None,
+        integrity_score: None,
+        locked_fields: None,
     }
 }
 

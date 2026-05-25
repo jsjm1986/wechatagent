@@ -814,7 +814,11 @@ pub(super) async fn execute_management_tool(
                 .unwrap_or_default();
             let new_stage = optional_value_arg(&planned.arguments, "customerStage")
                 .or_else(|| optional_value_arg(&planned.arguments, "customer_stage"));
-            let stage_changed = contact.customer_stage.as_deref() != new_stage.as_deref();
+            let prev_stage = contact
+                .domain_attributes
+                .as_ref()
+                .and_then(|d| d.get_str("customer_stage").ok().map(|s| s.to_string()));
+            let stage_changed = prev_stage.as_deref() != new_stage.as_deref();
             let new_commitment_text = optional_value_arg(&planned.arguments, "lastCommitment")
                 .or_else(|| optional_value_arg(&planned.arguments, "last_commitment"));
             let commitments_bson = commitments_with_optional_text(

@@ -105,7 +105,7 @@ pub(crate) use knowledge_tools::{
 };
 
 // Task 24：测试可用的 PBT 入口（pure functions，无副作用）。
-pub use guards::{check_state_transition, compute_taxonomy_resolutions, scan_product_claim_marker_labels};
+pub use guards::check_state_transition;
 pub use memory::compact_memory_card_with_previous;
 
 // agent-autonomy-loop W3 / Tasks 4.11-4.15：性质测试 P1-P7 入口。
@@ -118,10 +118,8 @@ pub use runtime::UserRuntimeParameters;
 pub use runtime::{resolve_thresholds, ResolvedThresholds};
 pub use types::{DecisionReviewResult, RawAgentDecision, ReviewScores};
 
-// agent-autonomy-loop W3 / Task 4.14：P4 PBT 需要在独立 crate 中构造
-// `finalize_review_for_send` 的 `&ProductClaimMarkers` 入参；这里把内置默认
-// markers 工厂函数对外暴露，避免每个测试自己重复构造一份。
-pub use guards::{default_product_claim_markers, ProductClaimMarkers};
+// agent-autonomy-loop W3 / Task 4.14：P4 PBT 已随销售域守卫一起删除（2026-05-25
+// 知识库清理），ProductClaimMarkers / default_product_claim_markers 不再公开。
 
 // agent-autonomy-loop W3 / Task 4.11：让 PBT 通过 `wechatagent::agent::taxonomy`
 // 直接访问 cache 构造 helper 与命中分支枚举。
@@ -140,8 +138,8 @@ pub use taxonomy::{taxonomy_cache_for_tests, TaxonomyCache};
 #[allow(deprecated)]
 pub use memory::compact_memory_card_typed;
 
-// 波 C4：让 routes 调用方在 publish prompt 后失效进程内缓存。
-pub(crate) use guards::invalidate_product_claim_markers_cache;
+// 波 C4：销售域 product-claim 标记词缓存已随 guards 重写一并删除（2026-05-25
+// 知识库清理），routes 调用方无需再失效缓存。
 
 static LLM_EXACT_CACHE: LazyLock<PlMutex<LruCache<String, Value>>> = LazyLock::new(|| {
     PlMutex::new(LruCache::new(
@@ -342,14 +340,11 @@ mod tests {
     use super::budget::RunBudget;
     use super::gateway::inbound_marker_for_context_check;
     use super::guards::{check_state_transition, normalize_decision_state};
-    use super::guards::{
-        default_product_claim_markers, enforce_decision_guards, enforce_string_fact_risk_guard,
-    };
     use super::memory::{compact_memory_card, compact_memory_card_with_previous};
     use super::reaction::reaction_outcome_status;
-    use super::review::{effective_review_mode, review_passed};
+    use super::review::effective_review_mode;
     use super::runtime::UserRuntimeParameters;
-    use super::types::{AgentDecision, DecisionReviewResult, ReviewScores, RunPlannerResult};
+    use super::types::{AgentDecision, RunPlannerResult};
     use crate::models::{AgentStatus, Contact, OperationDomainConfig};
     use mongodb::bson::{doc, DateTime, Document};
 
@@ -387,34 +382,6 @@ mod tests {
     }
 
     #[test]
-    fn review_thresholds_block_risky_reply() {
-        let mut review = DecisionReviewResult {
-            approved: true,
-            ..Default::default()
-        };
-        review.scores.fact_risk = 6;
-        review.scores.pressure_risk = 1;
-        review.scores.human_like = 8;
-        review.scores.emotional_value = 8;
-        review.scores.product_accuracy = 9;
-        assert!(!review_passed(&review, &runtime()));
-    }
-
-    #[test]
-    fn review_thresholds_allow_safe_reply() {
-        let mut review = DecisionReviewResult {
-            approved: true,
-            ..Default::default()
-        };
-        review.scores.fact_risk = 1;
-        review.scores.pressure_risk = 2;
-        review.scores.human_like = 7;
-        review.scores.emotional_value = 6;
-        review.scores.product_accuracy = 8;
-        assert!(review_passed(&review, &runtime()));
-    }
-
-    #[test]
     fn reaction_outcome_prefers_model_status() {
         let analysis = doc! {
             "outcomeStatus": "user_replied_continue_exploring",
@@ -440,111 +407,6 @@ mod tests {
         let doc = runtime().as_document();
         assert_eq!(doc.get_i32("factRiskBlockAt").unwrap(), 6);
         assert_eq!(doc.get_i64("maxDailyTouches").unwrap(), 3);
-    }
-
-    #[test]
-    fn review_guard_blocks_product_claim_without_knowledge() {
-        let decision = AgentDecision {
-            should_reply: true,
-            reply_text: "这是一条需要 Review Agent 语义判断的候选回复。".to_string(),
-            operation_state: Some("new_contact".to_string()),
-            ..Default::default()
-        };
-        let config = OperationDomainConfig {
-            id: None,
-            workspace_id: "default".to_string(),
-            domain: "user_operations".to_string(),
-            name: "用户运营".to_string(),
-            goal: String::new(),
-            methodology: String::new(),
-            workflow: String::new(),
-            tool_policy: String::new(),
-            automation_policy: String::new(),
-            review_policy: String::new(),
-            runtime_parameters: Document::new(),
-            state_machine: doc! { "states": [{ "key": "new_contact", "name": "初始了解", "allowedFrom": ["new_contact"] }] },
-            status: "active".to_string(),
-            updated_at: DateTime::now(),
-        };
-        let mut review = DecisionReviewResult {
-            approved: true,
-            scores: ReviewScores {
-                human_like: 8,
-                emotional_value: 8,
-                product_accuracy: 9,
-                ..Default::default()
-            },
-            claim_analysis: doc! {
-                "hasProductClaim": true,
-                "requiresProductKnowledge": true,
-                "knowledgeSupported": false,
-                "reason": "模型判断这是我方产品能力表述"
-            },
-            ..Default::default()
-        };
-        enforce_decision_guards(
-            &mut review,
-            &decision,
-            Some(&config),
-            &[],
-            &[],
-            Some("new_contact"),
-        );
-        assert!(!review.approved);
-        assert!(review.scores.fact_risk >= 6);
-        assert!(review.scores.product_accuracy <= 6);
-    }
-
-    #[test]
-    fn review_guard_allows_clarification_without_product_knowledge() {
-        let decision = AgentDecision {
-            should_reply: true,
-            reply_text: "嗯，理解你不想做机器人群发。你目前主要想改善哪一类客户跟进？".to_string(),
-            operation_state: Some("new_contact".to_string()),
-            ..Default::default()
-        };
-        let config = OperationDomainConfig {
-            id: None,
-            workspace_id: "default".to_string(),
-            domain: "user_operations".to_string(),
-            name: "用户运营".to_string(),
-            goal: String::new(),
-            methodology: String::new(),
-            workflow: String::new(),
-            tool_policy: String::new(),
-            automation_policy: String::new(),
-            review_policy: String::new(),
-            runtime_parameters: Document::new(),
-            state_machine: doc! { "states": [{ "key": "new_contact", "name": "初始了解", "allowedFrom": ["new_contact"] }] },
-            status: "active".to_string(),
-            updated_at: DateTime::now(),
-        };
-        let mut review = DecisionReviewResult {
-            approved: true,
-            scores: ReviewScores {
-                human_like: 8,
-                emotional_value: 8,
-                product_accuracy: 9,
-                ..Default::default()
-            },
-            claim_analysis: doc! {
-                "hasProductClaim": false,
-                "requiresProductKnowledge": false,
-                "knowledgeSupported": true,
-                "reason": "模型判断只是承接和澄清"
-            },
-            ..Default::default()
-        };
-        enforce_decision_guards(
-            &mut review,
-            &decision,
-            Some(&config),
-            &[],
-            &[],
-            Some("new_contact"),
-        );
-        assert!(review.approved);
-        assert_eq!(review.scores.fact_risk, 0);
     }
 
     #[test]
@@ -589,9 +451,6 @@ mod tests {
             playbook_id: None,
             playbook_version: None,
             tags: Vec::new(),
-            customer_stage: None,
-            customer_stage_updated_at: None,
-            intent_level: None,
             commitments: Vec::new(),
             follow_up_policy: None,
             operation_state: None,
@@ -602,6 +461,8 @@ mod tests {
             operation_policy: Document::new(),
             profile_attributes: Document::new(),
             profile_updated_at: None,
+            domain_attributes: None,
+            domain_attributes_updated_at: None,
             last_message_at: None,
             last_inbound_at: None,
             last_outbound_at: None,
@@ -748,116 +609,6 @@ mod tests {
         assert!(!cores.contains(&"old_fact_to_drop".to_string()));
         assert!(cores.contains(&"keep_me".to_string()));
         assert!(cores.contains(&"new_fact".to_string()));
-    }
-
-    fn risky_decision(reply_text: &str) -> AgentDecision {
-        AgentDecision {
-            should_reply: true,
-            reply_text: reply_text.to_string(),
-            ..Default::default()
-        }
-    }
-
-    #[test]
-    fn string_guard_blocks_absolute_claim_without_knowledge() {
-        let decision = risky_decision("我们能保证你转化提升 30%");
-        let mut review = DecisionReviewResult {
-            approved: true,
-            scores: ReviewScores {
-                human_like: 8,
-                emotional_value: 8,
-                product_accuracy: 9,
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-        enforce_string_fact_risk_guard(&mut review, &decision, &default_product_claim_markers());
-        assert!(!review.approved);
-        assert!(review.scores.fact_risk >= 6);
-        assert!(review
-            .risks
-            .iter()
-            .any(|r| r.starts_with("string_guard: 命中标记")));
-    }
-
-    #[test]
-    fn string_guard_allows_whitelisted_promise() {
-        let decision = risky_decision("我会准时回复你，保证不会让你等太久");
-        let mut review = DecisionReviewResult {
-            approved: true,
-            scores: ReviewScores {
-                human_like: 8,
-                emotional_value: 8,
-                product_accuracy: 9,
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-        enforce_string_fact_risk_guard(&mut review, &decision, &default_product_claim_markers());
-        assert!(review.approved, "白名单短语应豁免本次命中");
-    }
-
-    #[test]
-    fn string_guard_skips_when_model_marks_safe() {
-        let decision = risky_decision("我们能保证转化提升");
-        let mut review = DecisionReviewResult {
-            approved: true,
-            scores: ReviewScores {
-                human_like: 8,
-                emotional_value: 8,
-                product_accuracy: 9,
-                ..Default::default()
-            },
-            claim_analysis: doc! {
-                "requiresProductKnowledge": false,
-                "knowledgeSupported": true
-            },
-            ..Default::default()
-        };
-        enforce_string_fact_risk_guard(&mut review, &decision, &default_product_claim_markers());
-        assert!(review.approved, "模型语义判定无需知识时跳过字符串扫描");
-    }
-
-    #[test]
-    fn string_guard_skips_when_knowledge_used() {
-        let decision = AgentDecision {
-            should_reply: true,
-            reply_text: "我们能保证响应及时".to_string(),
-            used_knowledge_ids: vec!["chunk_xxx".to_string()],
-            ..Default::default()
-        };
-        let mut review = DecisionReviewResult {
-            approved: true,
-            scores: ReviewScores {
-                human_like: 8,
-                emotional_value: 8,
-                product_accuracy: 9,
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-        enforce_string_fact_risk_guard(&mut review, &decision, &default_product_claim_markers());
-        assert!(
-            review.approved,
-            "已引用 used_knowledge_ids 时跳过 string guard"
-        );
-    }
-
-    #[test]
-    fn string_guard_catches_price_amount() {
-        let decision = risky_decision("一年只要 ¥9999 元");
-        let mut review = DecisionReviewResult {
-            approved: true,
-            scores: ReviewScores {
-                human_like: 8,
-                emotional_value: 8,
-                product_accuracy: 9,
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-        enforce_string_fact_risk_guard(&mut review, &decision, &default_product_claim_markers());
-        assert!(!review.approved, "价格金额应触发字符串 guard");
     }
 
     fn full_state_machine_config() -> OperationDomainConfig {

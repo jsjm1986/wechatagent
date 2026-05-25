@@ -109,8 +109,10 @@ fn override_state_with_cap(app: &common::TestApp, daily_cap: i64, priority: bool
         db: app.state.db.clone(),
         mcp: app.state.mcp.clone(),
         llm: app.state.llm.clone(),
+        llm_registry: app.state.llm_registry.clone(),
         config,
         prompt_pack_version: app.state.prompt_pack_version.clone(),
+        chat_progress_bus: app.state.chat_progress_bus.clone(),
     }
 }
 

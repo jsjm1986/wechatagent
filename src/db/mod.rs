@@ -16,13 +16,15 @@ use mongodb::{options::ClientOptions, Client, Collection, Database as MongoDatab
 
 use crate::models::{
     AgentCommandRun, AgentDecisionReview, AgentEvent, AgentOutcomeMetric, AgentRunLog, AgentSoul,
-    AgentTask, AgentToolCall, Contact, ContentAsset, ConversationMessage, EvaluationScenario,
-    Experiment, KnowledgeChatTask, KnowledgeChatTurn, KnowledgeDailyReport, KnowledgeOperatorMemory,
-    KnowledgeUsageLog, LlmCallLog, ManagementAgentMessage, ManagementAgentSession,
-    McpCallLog, MemoryCandidate, MigrationRecord, OperatingMemory, OperationDomainConfig,
-    OperationKnowledgeChunk, OperationKnowledgeDocument, OperationKnowledgeItem, OperationPlaybook,
-    OutboxEntry, PostReleaseReview, PromptTemplate, Proposal, ShadowReplay, TaxonomyCandidate,
-    TaxonomyEntry, ThresholdOverride, UserOperationGuidePreview, WechatAccount,
+    AgentTask, AgentToolCall, CatalogRebuildJob, ChunkRevision, Contact, ContentAsset,
+    ConversationMessage, DomainSchema, EvaluationScenario, Experiment, KnowledgeChatTask,
+    KnowledgeChatTurn, KnowledgeDailyReport, KnowledgeGapSignal, KnowledgeOperatorMemory,
+    KnowledgeUsageLog, LlmCallLog, LlmProviderConfig, ManagementAgentMessage,
+    ManagementAgentSession, McpCallLog, MemoryCandidate, MigrationRecord, OperatingMemory,
+    OperationDomainConfig, OperationKnowledgeChunk, OperationKnowledgeDocument,
+    OperationPlaybook, OutboxEntry, PostReleaseReview, PromptTemplate,
+    Proposal, ShadowReplay, TaxonomyCandidate, TaxonomyEntry, ThresholdOverride,
+    UserOperationGuidePreview, WechatAccount,
 };
 
 #[derive(Clone)]
@@ -109,10 +111,6 @@ impl Database {
 
     pub fn operating_memories(&self) -> Collection<OperatingMemory> {
         self.db.collection("operating_memories")
-    }
-
-    pub fn operation_knowledge_items(&self) -> Collection<OperationKnowledgeItem> {
-        self.db.collection("operation_knowledge_items")
     }
 
     pub fn operation_knowledge_documents(&self) -> Collection<OperationKnowledgeDocument> {
@@ -251,5 +249,47 @@ impl Database {
     /// 末尾扫描；不参与 release 决策本身。
     pub fn post_release_reviews(&self) -> Collection<PostReleaseReview> {
         self.db.collection("post_release_reviews")
+    }
+
+    /// LLM 服务商配置集合：把原本只读的 `.env`（`OPENAI_BASE_URL` /
+    /// `OPENAI_API_KEY` / `OPENAI_MODEL`）抬升为可在前端运行时编辑的 DB 数据，
+    /// 并支持 `format=openai|anthropic` 双形态。`is_active=true` 的那条会被
+    /// 启动时与切换时由 `LlmRegistry` 加载，作为 `AppState.llm` 的实际后端。
+    pub fn llm_provider_configs(&self) -> Collection<LlmProviderConfig> {
+        self.db.collection("llm_provider_configs")
+    }
+
+    // ── knowledge-wiki Phase A：4 个新 collection 的 typed accessor ──
+    //
+    // 落地"质量 / 可检索 / 可修改 / 可优化"四件事的存储层：
+    //   - `chunk_revisions` 是不可变编辑历史，apply_chunk_revision 与 chunks 双写；
+    //   - `knowledge_gap_signals` 是 structural + semantic lint 的待办队列；
+    //   - `domain_schemas` 是行业可配 schema（active 一条 / workspace）；
+    //   - `catalog_rebuild_jobs` 是 catalog 落库的异步重写队列。
+    //
+    // 索引创建见 `db/indexes.rs`。
+
+    /// chunk 编辑历史（patch / split / merge / rollback / archive / restore /
+    /// verify / unverify）。每次 apply_chunk_revision 都会在 chunks 表更新前先写一行。
+    pub fn chunk_revisions(&self) -> Collection<ChunkRevision> {
+        self.db.collection("chunk_revisions")
+    }
+
+    /// gap signals：orphan / broken_link / no_outlinks / contradiction / stale /
+    /// missing_chunk / suggestion / low_confidence。两阶段 sweep 后状态流转
+    /// pending → auto_resolved | llm_resolved | applied | dismissed。
+    pub fn knowledge_gap_signals(&self) -> Collection<KnowledgeGapSignal> {
+        self.db.collection("knowledge_gap_signals")
+    }
+
+    /// 行业可配 schema：每 workspace 同时只能 1 条 is_active=true。
+    pub fn domain_schemas(&self) -> Collection<DomainSchema> {
+        self.db.collection("domain_schemas")
+    }
+
+    /// catalog 重建队列：apply_chunk_revision 写完即 enqueue；catalog_rebuild_worker
+    /// 每 200ms 取一批 status=queued 落库 `documents.catalog_summary_persisted`。
+    pub fn catalog_rebuild_jobs(&self) -> Collection<CatalogRebuildJob> {
+        self.db.collection("catalog_rebuild_jobs")
     }
 }

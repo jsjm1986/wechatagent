@@ -15,7 +15,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::models::{
     AgentProfile, AgentTask, ConversationMessage, OperationKnowledgeChunk,
-    OperationKnowledgeDocument, OperationKnowledgeItem,
+    OperationKnowledgeDocument,
 };
 
 #[derive(Debug, Serialize, Deserialize, Default)]
@@ -1106,7 +1106,6 @@ pub struct RunPlannerResult {
 #[derive(Debug, Clone, Default)]
 pub(crate) struct KnowledgeRuntime {
     pub documents: Vec<OperationKnowledgeDocument>,
-    pub items: Vec<OperationKnowledgeItem>,
     pub chunks: Vec<OperationKnowledgeChunk>,
 }
 

@@ -22,6 +22,29 @@ use tokio::time::sleep;
 use crate::models::{AgentTask, CommitmentRepr, Contact};
 use crate::routes::AppState;
 
+/// 旧 `customer_stage` 字段已迁入 `Contact.domain_attributes`。这两个 helper 把
+/// 读端集中起来，sales 旧库清理后所有 planner 排序/过滤都从 domain_attributes 读。
+fn contact_customer_stage(contact: &Contact) -> Option<String> {
+    contact
+        .domain_attributes
+        .as_ref()
+        .and_then(|d| d.get_str("customer_stage").ok().map(|s| s.to_string()))
+}
+
+fn contact_intent_level(contact: &Contact) -> Option<String> {
+    contact
+        .domain_attributes
+        .as_ref()
+        .and_then(|d| d.get_str("intent_level").ok().map(|s| s.to_string()))
+}
+
+fn contact_customer_stage_updated_at(contact: &Contact) -> Option<DateTime> {
+    contact
+        .domain_attributes
+        .as_ref()
+        .and_then(|d| d.get_datetime("customer_stage_updated_at").ok().copied())
+}
+
 /// 扫描器结束时输出的统计信息（写入 `*_tick` 事件 detail）。
 #[derive(Debug, Default, Clone, Copy)]
 struct ScanCounters {
@@ -702,13 +725,14 @@ pub(crate) fn stage_stagnation_passes_in_memory(contact: &Contact, now: DateTime
     if !managed_and_not_in_cooldown(contact) {
         return false;
     }
-    let Some(stage) = contact.customer_stage.as_deref() else {
+    let Some(stage) = contact_customer_stage(contact) else {
         return false;
     };
+    let stage = stage.as_str();
     if TERMINAL_STAGES.iter().any(|t| *t == stage) {
         return false;
     }
-    if contact.customer_stage_updated_at.is_none() {
+    if contact_customer_stage_updated_at(contact).is_none() {
         return false;
     }
     // 用户最近刚说过话——交给 silent / 自然回路推进，stage 段不抢 emit。
@@ -787,8 +811,8 @@ pub(crate) fn commitment_priority_key(
         CommitmentReason::Overdue => 0,
         CommitmentReason::Imminent => 1,
     };
-    let stage_w = -stage_priority_weight(contact.customer_stage.as_deref());
-    let intent_w = -intent_level_weight(contact.intent_level.as_deref());
+    let stage_w = -stage_priority_weight(contact_customer_stage(contact).as_deref());
+    let intent_w = -intent_level_weight(contact_intent_level(contact).as_deref());
     (reason_ord, stage_w, intent_w, target.due_at.timestamp_millis())
 }
 
@@ -798,8 +822,8 @@ pub(crate) fn commitment_priority_key(
 /// 1. 客户阶段权重：`-stage_priority_weight`（高价值阶段优先）；
 /// 2. 停滞时长：`-(now_ms - stage_updated_at)`（停滞越久越优先）。
 pub(crate) fn stage_stagnation_priority_key(contact: &Contact, now_ms: i64) -> (i32, i64) {
-    let stage_w = -stage_priority_weight(contact.customer_stage.as_deref());
-    let stagnation_ms = match contact.customer_stage_updated_at {
+    let stage_w = -stage_priority_weight(contact_customer_stage(contact).as_deref());
+    let stagnation_ms = match contact_customer_stage_updated_at(contact) {
         Some(ts) => now_ms.saturating_sub(ts.timestamp_millis()),
         None => 0,
     };
@@ -996,11 +1020,10 @@ async fn scan_stage_stagnation(state: &AppState) -> anyhow::Result<()> {
             write_backoff_event(state, "stage_stagnation", &contact, payload).await?;
             continue;
         }
-        let stage = contact
-            .customer_stage
-            .clone()
+        let stage = contact_customer_stage(&contact)
             .unwrap_or_else(|| "unknown".to_string());
-        let idle_days = idle_days_since(contact.customer_stage_updated_at, now_ms);
+        let stage_updated = contact_customer_stage_updated_at(&contact);
+        let idle_days = idle_days_since(stage_updated, now_ms);
         let content = format!("Planner: stage_stagnation (stage={stage}, idle={idle_days}d)");
         emit_planner_follow_up(state, &contact, content, now).await?;
         write_event(
@@ -1014,8 +1037,7 @@ async fn scan_stage_stagnation(state: &AppState) -> anyhow::Result<()> {
                 "source": "strategic_planner",
                 "stage": &stage,
                 "idleDays": idle_days,
-                "stageUpdatedAt": contact
-                    .customer_stage_updated_at
+                "stageUpdatedAt": stage_updated
                     .map(|d| d.timestamp_millis())
                     .unwrap_or(0),
             }),

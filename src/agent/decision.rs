@@ -13,7 +13,7 @@ use mongodb::bson::{to_document, Document};
 use crate::error::{AppError, AppResult};
 use crate::models::{
     AgentProfile, Contact, ConversationMessage, MessageDirection, OperatingMemory,
-    OperationDomainConfig, OperationKnowledgeChunk, OperationKnowledgeItem, OperationPlaybook,
+    OperationDomainConfig, OperationKnowledgeChunk, OperationPlaybook,
 };
 use crate::prompts;
 use crate::routes::AppState;
@@ -141,7 +141,6 @@ pub(crate) async fn decide_reply(
     runtime: &UserRuntimeParameters,
     memory: &OperatingMemory,
     context_pack: &Document,
-    operation_knowledge: &[OperationKnowledgeItem],
     knowledge_chunks: &[OperationKnowledgeChunk],
     knowledge_route: &KnowledgeRouteResult,
     rewrite_instruction: Option<&str>,
@@ -158,7 +157,6 @@ pub(crate) async fn decide_reply(
         runtime,
         memory,
         context_pack,
-        operation_knowledge,
         knowledge_chunks,
         knowledge_route,
         rewrite_instruction,
@@ -190,7 +188,6 @@ pub(crate) async fn decide_reply_with_promote(
     runtime: &UserRuntimeParameters,
     memory: &OperatingMemory,
     context_pack: &Document,
-    operation_knowledge: &[OperationKnowledgeItem],
     knowledge_chunks: &[OperationKnowledgeChunk],
     knowledge_route: &KnowledgeRouteResult,
     rewrite_instruction: Option<&str>,
@@ -211,7 +208,7 @@ pub(crate) async fn decide_reply_with_promote(
         .unwrap_or_default();
     let runtime_text = serde_json::to_string(&runtime.as_document()).unwrap_or_default();
     let knowledge_text =
-        format_operation_knowledge_for_prompt(operation_knowledge, knowledge_chunks);
+        format_operation_knowledge_for_prompt(knowledge_chunks);
     let knowledge_route_text = serde_json::to_string(knowledge_route).unwrap_or_default();
     // agent-autonomy-loop W5 / Task 6.5：注入最近 K=5 条 deprecated_facts，
     // 让 Reply Agent 知道哪些事实已过期，避免再次引用。仅传 id / text /
@@ -381,8 +378,16 @@ pub(crate) async fn decide_reply_with_promote(
         serde_json::to_string(&contact.agent_profile).unwrap_or_default(),
         contact.memory_summary.clone().unwrap_or_default(),
         contact.tags.join(", "),
-        contact.customer_stage.clone().unwrap_or_default(),
-        contact.intent_level.clone().unwrap_or_default(),
+        contact
+            .domain_attributes
+            .as_ref()
+            .and_then(|doc| doc.get_str("customer_stage").ok().map(|s| s.to_string()))
+            .unwrap_or_default(),
+        contact
+            .domain_attributes
+            .as_ref()
+            .and_then(|doc| doc.get_str("intent_level").ok().map(|s| s.to_string()))
+            .unwrap_or_default(),
         contact
             .commitments
             .last()

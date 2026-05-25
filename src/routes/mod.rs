@@ -10,7 +10,12 @@ use axum::{
 };
 use std::sync::Arc;
 
-use crate::{config::AppConfig, db::Database, llm::LlmGenerator, mcp::McpClient};
+use crate::{
+    config::AppConfig,
+    db::Database,
+    llm::{LlmGenerator, LlmRegistry},
+    mcp::McpClient,
+};
 
 mod accounts;
 mod admin_outbox;
@@ -19,6 +24,7 @@ mod admin_taxonomy_candidates;
 mod assets;
 mod contacts;
 mod conversations;
+mod domain_schemas;
 mod domains;
 mod evaluations;
 mod events;
@@ -26,6 +32,7 @@ mod evolution;
 mod guides;
 mod health;
 mod knowledge;
+mod llm_providers;
 mod management;
 mod outcome_metrics;
 mod outcomes_autonomy;
@@ -59,6 +66,10 @@ use contacts::{
     update_operation_profile, update_profile_note, update_custom_agent_instructions,
 };
 use conversations::list_messages;
+use domain_schemas::{
+    activate_domain_schema, create_domain_schema, delete_domain_schema, list_domain_schemas,
+    update_domain_schema,
+};
 use domains::{
     get_operation_domain, get_operation_domain_state_machine, list_operation_domains,
     reset_operation_domain, update_operation_domain, update_operation_domain_state_machine,
@@ -74,25 +85,41 @@ use evolution::{
 };
 use guides::{apply_user_operation_guide, preview_user_operation_guide};
 use health::health;
+use llm_providers::{
+    activate_provider, create_provider, delete_provider, list_providers, test_provider,
+    update_provider,
+};
 use knowledge::{
-    analyze_operation_knowledge_logs, answer_chunk_repair, auto_verify_operation_knowledge_chunks,
+    analyze_operation_knowledge_logs, answer_chunk_repair,
+    apply_knowledge_gap_signal,
+    archive_operation_knowledge_chunk, auto_verify_operation_knowledge_chunks,
     chat_apply, chat_discard,
     chat_history, chat_session_stream, chat_task_cancel, chat_task_create, chat_task_get,
     chat_turn, create_operation_knowledge,
     create_operation_knowledge_chunk, create_operation_knowledge_document,
     delete_operation_knowledge, delete_operation_knowledge_chunk,
     delete_operation_knowledge_document, digest_dismiss_card, digest_regenerate, digest_today,
-    get_operation_knowledge_catalog,
+    dismiss_knowledge_gap_signal,
+    get_operation_knowledge_catalog, get_operation_knowledge_catalog_persisted,
     get_operation_knowledge_chunk_source, get_operation_knowledge_completeness,
     get_operation_knowledge_document, get_operation_knowledge_integrity_report,
     extract_operation_knowledge_tags, import_operation_knowledge_apply,
-    import_operation_knowledge_preview, list_knowledge_usage,
-    list_operation_knowledge, list_operation_knowledge_chunks,
+    import_operation_knowledge_preview, knowledge_inbox,
+    list_knowledge_gap_signals,
+    list_knowledge_usage,
+    list_operation_knowledge, list_operation_knowledge_chunk_revisions,
+    list_operation_knowledge_chunks,
     list_operation_knowledge_document_chunks, list_operation_knowledge_documents,
-    open_operation_knowledge_slices, propose_chunk_repair, propose_pack_repair,
+    merge_operation_knowledge_chunk,
+    open_operation_knowledge_slices, patch_operation_knowledge_chunk,
+    propose_chunk_repair, propose_pack_repair,
     record_repair_apply, refresh_operation_knowledge_completeness,
-    reject_operation_knowledge_chunk, search_operation_knowledge_tool,
-    test_operation_knowledge_match, update_operation_knowledge,
+    reject_operation_knowledge_chunk, relate_operation_knowledge_chunk,
+    restore_operation_knowledge_chunk, rollback_operation_knowledge_chunk,
+    search_operation_knowledge_tool, split_operation_knowledge_chunk,
+    sweep_knowledge_gap_signals,
+    test_operation_knowledge_match, unrelate_operation_knowledge_chunk,
+    update_operation_knowledge,
     update_operation_knowledge_chunk, update_operation_knowledge_document,
     verify_operation_knowledge_chunk,
 };
@@ -118,6 +145,11 @@ pub struct AppState {
     pub db: Database,
     pub mcp: McpClient,
     pub llm: Arc<dyn LlmGenerator>,
+    /// 当前激活 provider 的热替换 wrapper。生产路径 `main.rs` 让 `llm` 与
+    /// 这里指向同一个 [`LlmRegistry`] 实例；前端「启用 provider」走
+    /// `routes/llm_providers` 时取这个字段进行原子 swap，写一次新 client
+    /// 后整个进程的 LLM 调用就切换到新配置。测试可填 `None`，使用 mock。
+    pub llm_registry: Option<Arc<LlmRegistry>>,
     pub config: AppConfig,
     /// agent-self-evolution M4 W4 Task 5.3：prompt 包版本号。
     ///
@@ -246,9 +278,50 @@ pub fn api_router(state: AppState) -> Router<AppState> {
             "/operation-knowledge/chunks/:id/repair/answer",
             post(answer_chunk_repair),
         )
+        // ── knowledge-wiki Phase C：7 个编辑路由 + 2 个关系路由 ────────────────
+        .route(
+            "/operation-knowledge/chunks/:id/patch",
+            post(patch_operation_knowledge_chunk),
+        )
+        .route(
+            "/operation-knowledge/chunks/:id/archive",
+            post(archive_operation_knowledge_chunk),
+        )
+        .route(
+            "/operation-knowledge/chunks/:id/restore",
+            post(restore_operation_knowledge_chunk),
+        )
+        .route(
+            "/operation-knowledge/chunks/:id/rollback/:revision_id",
+            post(rollback_operation_knowledge_chunk),
+        )
+        .route(
+            "/operation-knowledge/chunks/:id/revisions",
+            get(list_operation_knowledge_chunk_revisions),
+        )
+        .route(
+            "/operation-knowledge/chunks/:id/split",
+            post(split_operation_knowledge_chunk),
+        )
+        .route(
+            "/operation-knowledge/chunks/:id/merge",
+            post(merge_operation_knowledge_chunk),
+        )
+        .route(
+            "/operation-knowledge/chunks/:id/relate",
+            post(relate_operation_knowledge_chunk),
+        )
+        .route(
+            "/operation-knowledge/chunks/:id/relate/:target_id",
+            axum::routing::delete(unrelate_operation_knowledge_chunk),
+        )
         .route(
             "/operation-knowledge/catalog",
             get(get_operation_knowledge_catalog),
+        )
+        .route(
+            "/operation-knowledge/catalog/persisted",
+            get(get_operation_knowledge_catalog_persisted),
         )
         .route(
             "/operation-knowledge/completeness",
@@ -266,6 +339,22 @@ pub fn api_router(state: AppState) -> Router<AppState> {
         .route(
             "/operation-knowledge/auto-verify",
             post(auto_verify_operation_knowledge_chunks),
+        )
+        .route(
+            "/knowledge/gap-signals",
+            get(list_knowledge_gap_signals),
+        )
+        .route(
+            "/knowledge/gap-signals/:id/dismiss",
+            post(dismiss_knowledge_gap_signal),
+        )
+        .route(
+            "/knowledge/gap-signals/:id/apply",
+            post(apply_knowledge_gap_signal),
+        )
+        .route(
+            "/knowledge/gap-signals/sweep",
+            post(sweep_knowledge_gap_signals),
         )
         .route(
             "/operation-knowledge/tools/open-slice",
@@ -305,6 +394,10 @@ pub fn api_router(state: AppState) -> Router<AppState> {
             post(record_repair_apply),
         )
         .route("/operation-knowledge/chat", post(chat_turn))
+        .route(
+            "/operation-knowledge/inbox",
+            get(knowledge_inbox),
+        )
         .route(
             "/operation-knowledge/chat/:session_id",
             get(chat_history),
@@ -446,6 +539,33 @@ pub fn api_router(state: AppState) -> Router<AppState> {
         // ── agent-autonomy-loop W4 / Task 5.6：outbox admin 路由 ─────────────
         .route("/admin/outbox", get(list_outbox))
         .route("/admin/outbox/:id/cancel", post(cancel_outbox))
+        // ── LLM provider 配置 admin 路由：前端 UI 编辑 / 测试 / 热切换 ────
+        .route(
+            "/admin/llm-providers",
+            get(list_providers).post(create_provider),
+        )
+        .route(
+            "/admin/llm-providers/:id",
+            put(update_provider).delete(delete_provider),
+        )
+        .route(
+            "/admin/llm-providers/:id/activate",
+            post(activate_provider),
+        )
+        .route("/admin/llm-providers/test", post(test_provider))
+        // ── knowledge-wiki Phase G：行业可配 schema admin 路由 ─────────────────
+        .route(
+            "/admin/domain-schemas",
+            get(list_domain_schemas).post(create_domain_schema),
+        )
+        .route(
+            "/admin/domain-schemas/:id",
+            put(update_domain_schema).delete(delete_domain_schema),
+        )
+        .route(
+            "/admin/domain-schemas/:id/activate",
+            post(activate_domain_schema),
+        )
         // ── agent-self-evolution M4 W4 / Task 5.5：evolution admin 路由 ──────
         .route("/evolution/experiments", get(list_evolution_experiments))
         .route(

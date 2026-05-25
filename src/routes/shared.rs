@@ -28,6 +28,15 @@ pub(super) fn parse_object_id(id: &str) -> AppResult<ObjectId> {
     ObjectId::parse_str(id).map_err(|_| AppError::BadRequest("invalid object id".to_string()))
 }
 
+/// 从 `Contact.domain_attributes` 中读取销售域字段（已下线的 customer_stage / intent_level）。
+/// 旧字段被 wiki 化，但部分 health/score/event 工具仍以 string-key 形式记录到事件文档。
+pub(super) fn contact_domain_str(contact: &Contact, key: &str) -> Option<String> {
+    contact
+        .domain_attributes
+        .as_ref()
+        .and_then(|d| d.get_str(key).ok().map(|s| s.to_string()))
+}
+
 pub(super) async fn validate_account(state: &AppState, account_id: &str) -> AppResult<()> {
     let found = state
         .db
@@ -379,8 +388,8 @@ pub(super) fn health_scores_document(
 ) -> Document {
     let user_understanding = score_presence(&[
         contact.human_profile_note.clone(),
-        contact.customer_stage.clone(),
-        contact.intent_level.clone(),
+        contact_domain_str(contact, "customer_stage"),
+        contact_domain_str(contact, "intent_level"),
         contact.follow_up_policy.clone(),
         doc_string_ref(&memory.user_understanding, "identity"),
         doc_string_ref(&memory.user_understanding, "businessContext"),
@@ -450,8 +459,8 @@ pub(super) async fn apply_contact_changes(
     }
     if let Some(value) = doc_get_string(changes, "customerStage") {
         // M2：customer_stage 实际变化时同步刷新 customer_stage_updated_at。
-        let prev = contact.customer_stage.as_deref();
-        if prev.map(|s| s != value.as_str()).unwrap_or(true) {
+        let prev = contact_domain_str(contact, "customer_stage");
+        if prev.as_deref().map(|s| s != value.as_str()).unwrap_or(true) {
             set_doc.insert("customer_stage_updated_at", DateTime::now());
         }
         set_doc.insert("customer_stage", value);
@@ -709,8 +718,8 @@ wxid：{}
         contact.remark.as_deref().unwrap_or(""),
         contact.human_profile_note.as_deref().unwrap_or(""),
         contact.tags.join(", "),
-        contact.customer_stage.as_deref().unwrap_or(""),
-        contact.intent_level.as_deref().unwrap_or(""),
+        contact_domain_str(contact, "customer_stage").as_deref().unwrap_or(""),
+        contact_domain_str(contact, "intent_level").as_deref().unwrap_or(""),
         contact.follow_up_policy.as_deref().unwrap_or(""),
         contact.operation_state.as_deref().unwrap_or(""),
         contact.operation_state_reason.as_deref().unwrap_or(""),

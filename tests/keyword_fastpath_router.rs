@@ -51,6 +51,18 @@ fn make_chunk(triggers: Vec<&str>) -> OperationKnowledgeChunk {
         priority: 0,
         created_at: now,
         updated_at: now,
+        wiki_type: None,
+        domain_attributes: None,
+        provenance: None,
+        valid_from: None,
+        valid_to: None,
+        superseded_by: None,
+        previous_version_id: None,
+        related_chunks: None,
+        usage_stats: None,
+        dynamic_confidence: None,
+        integrity_score: None,
+        locked_fields: None,
     }
 }
 

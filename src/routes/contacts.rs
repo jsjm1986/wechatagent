@@ -446,7 +446,11 @@ pub(super) async fn update_operation_profile(
     let object_id = parse_object_id(&id)?;
     let current = find_contact_by_id(&state, &id).await?;
     let new_stage = normalize_optional(payload.customer_stage);
-    let stage_changed = current.customer_stage.as_deref() != new_stage.as_deref();
+    let prev_stage = current
+        .domain_attributes
+        .as_ref()
+        .and_then(|d| d.get_str("customer_stage").ok().map(|s| s.to_string()));
+    let stage_changed = prev_stage.as_deref() != new_stage.as_deref();
     let commitments_bson = commitments_with_optional_text(
         &current.commitments,
         normalize_optional(payload.last_commitment).as_deref(),

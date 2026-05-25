@@ -8,6 +8,8 @@ import {
   ChevronRight,
   Clock3,
   Copy,
+  Eye,
+  EyeOff,
   FileBox,
   FileText,
   FlaskConical,
@@ -38,7 +40,7 @@ import type * as React from "react";
 import { EvolutionCenterTab } from "./EvolutionCenterTab";
 
 type AgentStatus = "normal" | "managed";
-type Channel = "command" | "overview" | "userOps" | "groupOps" | "momentOps" | "knowledge" | "content" | "systemStrategy" | "operations" | "autonomy" | "evolution" | "quality";
+type Channel = "command" | "overview" | "userOps" | "groupOps" | "momentOps" | "knowledge" | "content" | "systemStrategy" | "operations" | "autonomy" | "evolution" | "quality" | "llmProviders" | "knowledgeWiki";
 type ContactTab = "all" | "managed" | "normal";
 type SmartOpsTab = "cockpit" | "adjust" | "profile" | "memory" | "simulation" | "conversation";
 type TraditionalOpsTab = "playbooks" | "prompts" | "settings" | "audit";
@@ -711,9 +713,21 @@ async function parseApiError(response: Response): Promise<Error> {
       return new Error(json.error);
     }
   } catch {
-    /* 不是 JSON，落到 plain text 路径 */
+    /* 不是 JSON：可能是 SPA fallback 返回的 HTML / Axum 默认 405 文本，
+       不能把整段 body 当成错误信息渲染（screenshot 里就是因为这个把
+       <!doctype html> 整个塞进 UI）。统一脱壳成 HTTP 状态码。 */
   }
-  return new Error(text || `HTTP ${response.status}`);
+  const ct = response.headers.get("content-type") ?? "";
+  if (ct.toLowerCase().includes("text/html")) {
+    return new Error(`HTTP ${response.status}（服务端未返回 JSON，可能是后端尚未编译该接口）`);
+  }
+  const trimmed = text.trim();
+  if (!trimmed || /^<!doctype|^<html/i.test(trimmed)) {
+    return new Error(`HTTP ${response.status}`);
+  }
+  // 非 JSON 但是是较短的纯文本（如 axum 的 "Method Not Allowed"），保留前 120 字
+  const safe = trimmed.length > 120 ? `${trimmed.slice(0, 120)}…` : trimmed;
+  return new Error(`HTTP ${response.status}：${safe}`);
 }
 
 const api = {
@@ -771,6 +785,20 @@ function todayLocalDate(): string {
   const m = String(d.getMonth() + 1).padStart(2, "0");
   const day = String(d.getDate()).padStart(2, "0");
   return `${y}-${m}-${day}`;
+}
+
+function stripHtml(input: string | undefined | null): string {
+  if (!input) return "";
+  return input
+    .replace(/<[^>]+>/g, " ")
+    .replace(/&nbsp;/gi, " ")
+    .replace(/&amp;/gi, "&")
+    .replace(/&lt;/gi, "<")
+    .replace(/&gt;/gi, ">")
+    .replace(/&quot;/gi, '"')
+    .replace(/&#39;/gi, "'")
+    .replace(/\s+/g, " ")
+    .trim();
 }
 
 /**
@@ -832,13 +860,16 @@ const channels: Array<{ id: Channel; label: string; caption: string; icon: Lucid
   { id: "knowledge", label: "运营知识库", caption: "知识路由", icon: LibraryBig },
   { id: "content", label: "内容资产", caption: "素材知识", icon: FileText },
   { id: "systemStrategy", label: "系统策略", caption: "全局与总控", icon: Settings2 },
+  { id: "llmProviders", label: "AI 模型配置", caption: "LLM Providers", icon: Bot },
   { id: "operations", label: "任务日志", caption: "执行审计", icon: Activity },
   // W6 / Task 7.2：自治回路监控提到顶级频道（原 QualityCenterView 子 Tab 已下沉到此）
   { id: "autonomy", label: "自治回路监控", caption: "Autonomy Loop", icon: ShieldCheck },
   // M4 W4 / Task 5.8：演化中心（experiments / proposals / release / rollback）
   { id: "evolution", label: "演化中心", caption: "Self Evolution", icon: ShieldCheck },
   // 波 B4-B6：运营成效中心（outcome metrics / auto-verify / formula-adherence / 标记词编辑）
-  { id: "quality", label: "运营成效", caption: "指标与质量", icon: Workflow }
+  { id: "quality", label: "运营成效", caption: "指标与质量", icon: Workflow },
+  // knowledge-wiki Phase G：Wiki 管理（domain_schemas / gap_signals / chunk_revisions）
+  { id: "knowledgeWiki", label: "Wiki 管理", caption: "schema / 信号 / 历史", icon: FileBox }
 ];
 
 const USER_RUNTIME_PARAMETER_FIELDS: Array<{
@@ -937,11 +968,27 @@ export function App() {
   const [chunkSource, setChunkSource] = useState<Record<string, unknown> | null>(null);
   const [aiRepairTarget, setAiRepairTarget] = useState<{ kind: "chunk" | "pack"; id: string; label: string } | null>(null);
   const [knowledgeChatOpen, setKnowledgeChatOpen] = useState(false);
+  // 运营知识库频道双模：AI 协作（inbox + chat 主导）/ 手动（旧三栏入口）。
+  // 持久化到 localStorage `wechatagent.knowledgeMode`，默认 "ai"。
+  const [knowledgeMode, setKnowledgeMode] = useState<"ai" | "manual">(() => {
+    try {
+      const v = localStorage.getItem("wechatagent.knowledgeMode");
+      return v === "manual" ? "manual" : "ai";
+    } catch {
+      return "ai";
+    }
+  });
+  useEffect(() => {
+    try {
+      localStorage.setItem("wechatagent.knowledgeMode", knowledgeMode);
+    } catch {
+      /* localStorage 不可用时静默 */
+    }
+  }, [knowledgeMode]);
   // P1-8：sessionId 按 account 隔离——初值不再从全局 localStorage 读，而是等
   // currentAccountId 解析后用 useEffect 从 `wechatagent.knowledgeChatSessionId.{accountId}`
   // 读。account 切换时同样在 useEffect 里换号读取。
   const [knowledgeChatSessionId, setKnowledgeChatSessionId] = useState<string | undefined>(undefined);
-  const [knowledgeChatMode, setKnowledgeChatMode] = useState<"drawer" | "docked">("docked");
   const [digestReport, setDigestReport] = useState<KnowledgeDailyReportView | null>(null);
   const [digestPhase, setDigestPhase] = useState<"idle" | "loading" | "regenerating" | "error">("idle");
   const [digestError, setDigestError] = useState<Error | null>(null);
@@ -2478,163 +2525,280 @@ export function App() {
         )}
 
         {activeChannel === "knowledge" && (
-          <div className="knowledgeWorkstation">
-            <div className="knowledgeWorkstation__col knowledgeWorkstation__col--index">
-              <OperationKnowledgeView
-            busy={busy}
-            catalog={knowledgeCatalog}
-            completeness={knowledgeCompleteness}
-            chunkDraft={chunkDraft}
-            chunkSource={chunkSource}
-            chunks={knowledgeChunks}
-            documents={knowledgeDocuments}
-            editingChunkId={editingChunkId}
-            editingKnowledgeId={editingKnowledgeId}
-            integrityReport={knowledgeIntegrity}
-            importPreview={knowledgeImportPreview}
-            importSource={knowledgeImportSource}
-            importText={knowledgeImportText}
-            knowledge={operationKnowledge}
-            knowledgeDraft={knowledgeDraft}
-            testMessage={knowledgeTestMessage}
-            testResult={knowledgeTestResult}
-            usage={knowledgeUsage}
-            tree={knowledgeTree}
-            selectedNodeId={knowledgeSelectedNodeId}
-            expandedNodes={knowledgeExpandedNodes}
-            treeSearch={knowledgeTreeSearch}
-            packSubview={knowledgePackSubview}
-            workspaceMode={knowledgeWorkspaceMode}
-            debugDrawerOpen={knowledgeDebugDrawerOpen}
-            onSelectNode={(id) => {
-              setKnowledgeSelectedNodeId(id);
-              if (id === null) {
-                return;
-              }
-              if (id.startsWith("chunk:")) {
-                const chunkId = id.slice("chunk:".length);
-                const found = knowledgeChunks.find((c) => c.id === chunkId);
-                if (found) {
-                  setEditingChunkId(found.id);
-                  setChunkDraft(draftFromChunk(found));
-                  setKnowledgeWorkspaceMode("selection");
-                }
-              } else if (id.startsWith("pack:")) {
-                if (editingChunkId) {
-                  setEditingChunkId("");
-                  setChunkDraft(emptyChunkDraft());
-                }
-              } else if (id.startsWith("doc:")) {
-                if (editingChunkId) {
-                  setEditingChunkId("");
-                  setChunkDraft(emptyChunkDraft());
-                }
-                if (editingKnowledgeId) {
-                  setEditingKnowledgeId("");
-                  setKnowledgeDraft(emptyKnowledgeDraft());
-                }
-              }
-            }}
-            onToggleNode={(id) => {
-              setKnowledgeExpandedNodes((prev) => {
-                const next = new Set(prev);
-                if (next.has(id)) next.delete(id);
-                else next.add(id);
-                return next;
-              });
-              if (id.startsWith("doc:")) {
-                const docId = id.slice(4);
-                void listChunksByDocument(docId)
-                  .then((chunks) => {
-                    if (!chunks.length) return;
-                    setKnowledgeChunks((prev) => {
-                      const byId = new Map(prev.map((c) => [c.id, c]));
-                      for (const c of chunks) byId.set(c.id, c);
-                      return Array.from(byId.values());
+          <div className="knowledgeShell">
+            <header className="knowledgeShell__topbar">
+              <div className="knowledgeShell__title">运营知识库 · AI 自主补完工作站</div>
+              <div className="knowledgeShell__seg" role="tablist" aria-label="知识库工作模式">
+                <button
+                  type="button"
+                  role="tab"
+                  aria-selected={knowledgeMode === "ai"}
+                  className="knowledgeShell__segBtn"
+                  onClick={() => setKnowledgeMode("ai")}
+                >
+                  <Sparkles size={14} /> AI 协作
+                </button>
+                <button
+                  type="button"
+                  role="tab"
+                  aria-selected={knowledgeMode === "manual"}
+                  className="knowledgeShell__segBtn"
+                  onClick={() => setKnowledgeMode("manual")}
+                >
+                  <SquarePen size={14} /> 手动
+                </button>
+              </div>
+            </header>
+
+            {knowledgeMode === "ai" ? (
+              <div className="knowledgeShell__body">
+                <div className="knowledgeShell__main">
+                  <AiInboxStrip
+                    onOpenChat={(injection) => {
+                      if (injection) setDigestPendingChatInjection(injection);
+                    }}
+                    onOpenManual={(target) => {
+                      setKnowledgeMode("manual");
+                      if (target?.kind === "chunk" && target.id) {
+                        setKnowledgeSelectedNodeId(`chunk:${target.id}`);
+                        const found = knowledgeChunks.find((c) => c.id === target.id);
+                        if (found) {
+                          setEditingChunkId(found.id);
+                          setChunkDraft(draftFromChunk(found));
+                          setKnowledgeWorkspaceMode("selection");
+                        }
+                      } else if (target?.kind === "pack" && target.id) {
+                        setKnowledgeSelectedNodeId(`pack:${target.id}`);
+                      }
+                    }}
+                    onDismissDigest={(cardId) => void dismissDigestCardAndRefresh(cardId)}
+                  />
+                  <KnowledgeDigestCanvas
+                    report={digestReport}
+                    phase={digestPhase}
+                    error={digestError}
+                    selectedCardIds={digestSelectedCardIds}
+                    onToggleSelect={toggleDigestCardSelected}
+                    onSelectAll={digestSelectAll}
+                    onInvertSelect={digestInvertSelect}
+                    onIgnoreInfo={digestIgnoreInfoCards}
+                    onRegenerate={regenerateDigestNow}
+                    onDismissCard={dismissDigestCardAndRefresh}
+                    onDispatchSelected={dispatchSelectedCardsToChat}
+                    onDispatchOne={dispatchOneCardToChat}
+                    onOpenCard={openCardTarget}
+                  />
+                  <div className="chatCanvas">
+                    <KnowledgeChatPanel
+                      open={true}
+                      mode="docked"
+                      initialSessionId={knowledgeChatSessionId}
+                      accountId={currentAccountId || undefined}
+                      pendingInjection={digestPendingChatInjection}
+                      onInjectionConsumed={() => setDigestPendingChatInjection(null)}
+                      onClose={(sid) => {
+                        if (sid) {
+                          setKnowledgeChatSessionId(sid);
+                          writePersistedChatSession(currentAccountId, sid);
+                        }
+                      }}
+                      onApplied={() => {
+                        void loadAll();
+                      }}
+                      postTurn={postKnowledgeChatTurn}
+                      getHistory={getKnowledgeChatHistory}
+                      apply={applyKnowledgeChat}
+                      discard={discardKnowledgeChat}
+                      postChatTask={postChatTask}
+                    />
+                  </div>
+                </div>
+                <aside className="statusRail" aria-label="库健康与当前草稿">
+                  <div className="statusRail__card">
+                    <div className="statusRail__cardTitle">库健康</div>
+                    <div className="statusRail__big">
+                      {knowledgeCompleteness && (knowledgeCompleteness.totalChunks ?? 0) > 0
+                        ? `${Math.round(
+                            (knowledgeCompleteness.verifiedChunks / knowledgeCompleteness.totalChunks) * 100
+                          )}%`
+                        : "—"}
+                    </div>
+                    <div className="statusRail__row">
+                      <span className="statusRail__rowMuted">待审 chunk</span>
+                      <span>{knowledgeIntegrity?.needsReview ?? 0}</span>
+                    </div>
+                    <div className="statusRail__row">
+                      <span className="statusRail__rowMuted">已核验</span>
+                      <span>{knowledgeIntegrity?.verified ?? 0}</span>
+                    </div>
+                    <div className="statusRail__row">
+                      <span className="statusRail__rowMuted">已驳回</span>
+                      <span>{knowledgeIntegrity?.rejected ?? 0}</span>
+                    </div>
+                    <button
+                      type="button"
+                      className="ghostButton"
+                      onClick={() => void refreshKnowledgeCompleteness()}
+                      disabled={busy}
+                    >
+                      <RefreshCw size={12} /> 一键重算
+                    </button>
+                  </div>
+                  <div className="statusRail__card">
+                    <div className="statusRail__cardTitle">今日日报</div>
+                    <div className="statusRail__row">
+                      <span className="statusRail__rowMuted">待处理</span>
+                      <span>
+                        {(digestReport?.cards || []).filter(
+                          (c) => !(digestReport?.dismissedCardIds || []).includes(c.cardId)
+                        ).length}
+                      </span>
+                    </div>
+                    <div className="statusRail__row">
+                      <span className="statusRail__rowMuted">已选派</span>
+                      <span>{digestSelectedCardIds.length}</span>
+                    </div>
+                    <button
+                      type="button"
+                      className="ghostButton"
+                      onClick={() => void regenerateDigestNow()}
+                      disabled={digestPhase === "regenerating" || digestPhase === "loading"}
+                    >
+                      <Sparkles size={12} /> 让 AI 重算
+                    </button>
+                  </div>
+                </aside>
+              </div>
+            ) : (
+              <div className="knowledgeShell__manual">
+                <div className="knowledgeShell__manualHint">
+                  <span>手动浏览模式：使用左侧树查阅与编辑切片，需要 AI 协作时点右上角段控件切回。</span>
+                  <button
+                    type="button"
+                    className="ghostButton"
+                    onClick={() => setKnowledgeMode("ai")}
+                  >
+                    <Sparkles size={12} /> 改用 AI 协作
+                  </button>
+                </div>
+                <OperationKnowledgeView
+                  busy={busy}
+                  catalog={knowledgeCatalog}
+                  completeness={knowledgeCompleteness}
+                  chunkDraft={chunkDraft}
+                  chunkSource={chunkSource}
+                  chunks={knowledgeChunks}
+                  documents={knowledgeDocuments}
+                  editingChunkId={editingChunkId}
+                  editingKnowledgeId={editingKnowledgeId}
+                  integrityReport={knowledgeIntegrity}
+                  importPreview={knowledgeImportPreview}
+                  importSource={knowledgeImportSource}
+                  importText={knowledgeImportText}
+                  knowledge={operationKnowledge}
+                  knowledgeDraft={knowledgeDraft}
+                  testMessage={knowledgeTestMessage}
+                  testResult={knowledgeTestResult}
+                  usage={knowledgeUsage}
+                  tree={knowledgeTree}
+                  selectedNodeId={knowledgeSelectedNodeId}
+                  expandedNodes={knowledgeExpandedNodes}
+                  treeSearch={knowledgeTreeSearch}
+                  packSubview={knowledgePackSubview}
+                  workspaceMode={knowledgeWorkspaceMode}
+                  debugDrawerOpen={knowledgeDebugDrawerOpen}
+                  onSelectNode={(id) => {
+                    setKnowledgeSelectedNodeId(id);
+                    if (id === null) {
+                      return;
+                    }
+                    if (id.startsWith("chunk:")) {
+                      const chunkId = id.slice("chunk:".length);
+                      const found = knowledgeChunks.find((c) => c.id === chunkId);
+                      if (found) {
+                        setEditingChunkId(found.id);
+                        setChunkDraft(draftFromChunk(found));
+                        setKnowledgeWorkspaceMode("selection");
+                      }
+                    } else if (id.startsWith("pack:")) {
+                      if (editingChunkId) {
+                        setEditingChunkId("");
+                        setChunkDraft(emptyChunkDraft());
+                      }
+                    } else if (id.startsWith("doc:")) {
+                      if (editingChunkId) {
+                        setEditingChunkId("");
+                        setChunkDraft(emptyChunkDraft());
+                      }
+                      if (editingKnowledgeId) {
+                        setEditingKnowledgeId("");
+                        setKnowledgeDraft(emptyKnowledgeDraft());
+                      }
+                    }
+                  }}
+                  onToggleNode={(id) => {
+                    setKnowledgeExpandedNodes((prev) => {
+                      const next = new Set(prev);
+                      if (next.has(id)) next.delete(id);
+                      else next.add(id);
+                      return next;
                     });
-                  })
-                  .catch(() => {
-                    /* per-doc 拉取失败不阻塞 UI */
-                  });
-              }
-            }}
-            onCollapseAll={() => setKnowledgeExpandedNodes(new Set())}
-            onTreeSearch={setKnowledgeTreeSearch}
-            onPackSubview={setKnowledgePackSubview}
-            onWorkspaceMode={setKnowledgeWorkspaceMode}
-            onOpenDebugDrawer={() => setKnowledgeDebugDrawerOpen(true)}
-            onCloseDebugDrawer={() => setKnowledgeDebugDrawerOpen(false)}
-            onOpenChat={() => openKnowledgeChat()}
-            onOpenCreateDocModal={openKnowledgeDocCreateModal}
-            onOpenEditDocModal={openKnowledgeDocEditModal}
-            onRefreshCompleteness={() => void refreshKnowledgeCompleteness()}
-            onApplyImport={() => void applyKnowledgeImport()}
-            onChunkDraft={setChunkDraft}
-            onCreateKnowledge={createKnowledge}
-            onCreateKnowledgeChunk={createKnowledgeChunk}
-            onDeleteDocument={(id) => void deleteKnowledgeDocument(id)}
-            onDeleteKnowledgeChunk={(id) => void deleteKnowledgeChunk(id)}
-            onDeleteKnowledge={(id) => void deleteKnowledge(id)}
-            onEditChunk={editChunk}
-            onEditKnowledge={editKnowledge}
-            onImportSource={setKnowledgeImportSource}
-            onImportText={setKnowledgeImportText}
-            onKnowledgeDraft={setKnowledgeDraft}
-            onLoadChunkSource={(id) => void loadKnowledgeChunkSource(id)}
-            onNewChunk={newChunkDraft}
-            onNewKnowledge={newKnowledgeDraft}
-            onPreviewImport={() => void previewKnowledgeImport()}
-            onRejectChunk={(id) => void rejectKnowledgeChunk(id)}
-            onRunTest={() => void runKnowledgeTest()}
-            onSaveKnowledgeChunk={saveKnowledgeChunk}
-            onSaveKnowledge={saveKnowledge}
-            onTestMessage={setKnowledgeTestMessage}
-            onVerifyChunk={(id) => void verifyKnowledgeChunk(id)}
-            onAiRepair={(target) => setAiRepairTarget(target)}
-            onExtractTags={(id) => void extractTagsForChunk(id)}
-          />
-            </div>
-            <div className="knowledgeWorkstation__col knowledgeWorkstation__col--canvas">
-              <KnowledgeDigestCanvas
-                report={digestReport}
-                phase={digestPhase}
-                error={digestError}
-                selectedCardIds={digestSelectedCardIds}
-                onToggleSelect={toggleDigestCardSelected}
-                onSelectAll={digestSelectAll}
-                onInvertSelect={digestInvertSelect}
-                onIgnoreInfo={digestIgnoreInfoCards}
-                onRegenerate={regenerateDigestNow}
-                onDismissCard={dismissDigestCardAndRefresh}
-                onDispatchSelected={dispatchSelectedCardsToChat}
-                onDispatchOne={dispatchOneCardToChat}
-                onOpenCard={openCardTarget}
-              />
-            </div>
-            <div className="knowledgeWorkstation__col knowledgeWorkstation__col--chat">
-              <KnowledgeChatPanel
-                open={true}
-                mode="docked"
-                initialSessionId={knowledgeChatSessionId}
-                accountId={currentAccountId || undefined}
-                pendingInjection={digestPendingChatInjection}
-                onInjectionConsumed={() => setDigestPendingChatInjection(null)}
-                onClose={(sid) => {
-                  if (sid) {
-                    setKnowledgeChatSessionId(sid);
-                    writePersistedChatSession(currentAccountId, sid);
-                  }
-                }}
-                onApplied={() => {
-                  void loadAll();
-                }}
-                postTurn={postKnowledgeChatTurn}
-                getHistory={getKnowledgeChatHistory}
-                apply={applyKnowledgeChat}
-                discard={discardKnowledgeChat}
-                postChatTask={postChatTask}
-              />
-            </div>
+                    if (id.startsWith("doc:")) {
+                      const docId = id.slice(4);
+                      void listChunksByDocument(docId)
+                        .then((chunks) => {
+                          if (!chunks.length) return;
+                          setKnowledgeChunks((prev) => {
+                            const byId = new Map(prev.map((c) => [c.id, c]));
+                            for (const c of chunks) byId.set(c.id, c);
+                            return Array.from(byId.values());
+                          });
+                        })
+                        .catch(() => {
+                          /* per-doc 拉取失败不阻塞 UI */
+                        });
+                    }
+                  }}
+                  onCollapseAll={() => setKnowledgeExpandedNodes(new Set())}
+                  onTreeSearch={setKnowledgeTreeSearch}
+                  onPackSubview={setKnowledgePackSubview}
+                  onWorkspaceMode={setKnowledgeWorkspaceMode}
+                  onOpenDebugDrawer={() => setKnowledgeDebugDrawerOpen(true)}
+                  onCloseDebugDrawer={() => setKnowledgeDebugDrawerOpen(false)}
+                  onOpenChat={() => {
+                    setKnowledgeMode("ai");
+                    openKnowledgeChat();
+                  }}
+                  onOpenCreateDocModal={openKnowledgeDocCreateModal}
+                  onOpenEditDocModal={openKnowledgeDocEditModal}
+                  onRefreshCompleteness={() => void refreshKnowledgeCompleteness()}
+                  onApplyImport={() => void applyKnowledgeImport()}
+                  onChunkDraft={setChunkDraft}
+                  onCreateKnowledge={createKnowledge}
+                  onCreateKnowledgeChunk={createKnowledgeChunk}
+                  onDeleteDocument={(id) => void deleteKnowledgeDocument(id)}
+                  onDeleteKnowledgeChunk={(id) => void deleteKnowledgeChunk(id)}
+                  onDeleteKnowledge={(id) => void deleteKnowledge(id)}
+                  onEditChunk={editChunk}
+                  onEditKnowledge={editKnowledge}
+                  onImportSource={setKnowledgeImportSource}
+                  onImportText={setKnowledgeImportText}
+                  onKnowledgeDraft={setKnowledgeDraft}
+                  onLoadChunkSource={(id) => void loadKnowledgeChunkSource(id)}
+                  onNewChunk={newChunkDraft}
+                  onNewKnowledge={newKnowledgeDraft}
+                  onPreviewImport={() => void previewKnowledgeImport()}
+                  onRejectChunk={(id) => void rejectKnowledgeChunk(id)}
+                  onRunTest={() => void runKnowledgeTest()}
+                  onSaveKnowledgeChunk={saveKnowledgeChunk}
+                  onSaveKnowledge={saveKnowledge}
+                  onTestMessage={setKnowledgeTestMessage}
+                  onVerifyChunk={(id) => void verifyKnowledgeChunk(id)}
+                  onAiRepair={(target) => setAiRepairTarget(target)}
+                  onExtractTags={(id) => void extractTagsForChunk(id)}
+                />
+              </div>
+            )}
           </div>
         )}
 
@@ -2701,6 +2865,14 @@ export function App() {
 
         {activeChannel === "quality" && (
           <QualityCenterView accountId={currentAccountId} />
+        )}
+
+        {activeChannel === "llmProviders" && (
+          <LlmProvidersView />
+        )}
+
+        {activeChannel === "knowledgeWiki" && (
+          <KnowledgeWikiView />
         )}
       </main>
       {aiRepairTarget && (
@@ -6284,6 +6456,532 @@ function NextPhasePanel({ text, title }: { text: string; title: string }) {
   );
 }
 
+type LlmProviderItem = {
+  providerId: string;
+  name: string;
+  format: string;
+  baseUrl: string;
+  apiKeyMasked: string;
+  model: string;
+  isActive: boolean;
+  timeoutSeconds?: number | null;
+  maxRetries?: number | null;
+  retryBaseMs?: number | null;
+  createdAt: number;
+  updatedAt: number;
+};
+
+type LlmProviderListResponse = {
+  items: LlmProviderItem[];
+  active: { providerId: string; format: string; model: string; baseUrl: string } | null;
+};
+
+type LlmProviderTestResponse = {
+  ok: boolean;
+  latencyMs: number;
+  preview?: unknown;
+  error?: { kind?: string; retryCount?: number; detail?: string; hint?: string };
+};
+
+type LlmProviderDraft = {
+  isNew: boolean;
+  providerId: string;
+  name: string;
+  format: "openai" | "anthropic";
+  baseUrl: string;
+  apiKey: string;
+  model: string;
+  timeoutSeconds: string;
+  maxRetries: string;
+  retryBaseMs: string;
+};
+
+function emptyLlmProviderDraft(): LlmProviderDraft {
+  return {
+    isNew: true,
+    providerId: "",
+    name: "",
+    format: "openai",
+    baseUrl: "",
+    apiKey: "",
+    model: "",
+    timeoutSeconds: "",
+    maxRetries: "",
+    retryBaseMs: ""
+  };
+}
+
+function draftFromItem(item: LlmProviderItem): LlmProviderDraft {
+  return {
+    isNew: false,
+    providerId: item.providerId,
+    name: item.name,
+    format: item.format === "anthropic" ? "anthropic" : "openai",
+    baseUrl: item.baseUrl,
+    apiKey: item.apiKeyMasked,
+    model: item.model,
+    timeoutSeconds: item.timeoutSeconds == null ? "" : String(item.timeoutSeconds),
+    maxRetries: item.maxRetries == null ? "" : String(item.maxRetries),
+    retryBaseMs: item.retryBaseMs == null ? "" : String(item.retryBaseMs)
+  };
+}
+
+function LlmProvidersView() {
+  const [items, setItems] = useState<LlmProviderItem[]>([]);
+  const [active, setActive] = useState<LlmProviderListResponse["active"]>(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [draft, setDraft] = useState<LlmProviderDraft | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [testing, setTesting] = useState(false);
+  const [testResult, setTestResult] = useState<LlmProviderTestResponse | null>(null);
+  const [showApiKey, setShowApiKey] = useState(false);
+
+  async function refetch() {
+    setLoading(true);
+    setError(null);
+    try {
+      const data = await api.get<LlmProviderListResponse>("/api/admin/llm-providers");
+      setItems(data.items || []);
+      setActive(data.active || null);
+    } catch (err) {
+      setError((err as Error).message);
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  useEffect(() => {
+    void refetch();
+  }, []);
+
+  function startCreate() {
+    setDraft(emptyLlmProviderDraft());
+    setTestResult(null);
+  }
+
+  function startEdit(item: LlmProviderItem) {
+    setDraft(draftFromItem(item));
+    setTestResult(null);
+  }
+
+  function cancelEdit() {
+    setDraft(null);
+    setTestResult(null);
+  }
+
+  function buildUpsertBody(d: LlmProviderDraft) {
+    const body: Record<string, unknown> = {
+      providerId: d.providerId.trim(),
+      name: d.name.trim() || d.providerId.trim(),
+      format: d.format,
+      baseUrl: d.baseUrl.trim(),
+      apiKey: d.apiKey,
+      model: d.model.trim()
+    };
+    if (d.timeoutSeconds.trim()) {
+      const v = Number(d.timeoutSeconds);
+      if (!Number.isNaN(v) && v > 0) body.timeoutSeconds = Math.floor(v);
+    }
+    if (d.maxRetries.trim()) {
+      const v = Number(d.maxRetries);
+      if (!Number.isNaN(v) && v >= 0) body.maxRetries = Math.floor(v);
+    }
+    if (d.retryBaseMs.trim()) {
+      const v = Number(d.retryBaseMs);
+      if (!Number.isNaN(v) && v > 0) body.retryBaseMs = Math.floor(v);
+    }
+    return body;
+  }
+
+  async function saveDraft() {
+    if (!draft) return;
+    if (!draft.providerId.trim()) {
+      window.alert("providerId 不能为空");
+      return;
+    }
+    if (!draft.baseUrl.trim() || !draft.apiKey.trim() || !draft.model.trim()) {
+      window.alert("baseUrl / apiKey / model 不能为空");
+      return;
+    }
+    setBusy(true);
+    try {
+      const body = buildUpsertBody(draft);
+      if (draft.isNew) {
+        await api.post("/api/admin/llm-providers", body);
+      } else {
+        await api.put(`/api/admin/llm-providers/${encodeURIComponent(draft.providerId)}`, body);
+      }
+      await refetch();
+      setDraft(null);
+      setTestResult(null);
+    } catch (err) {
+      window.alert(`保存失败：${(err as Error).message}`);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function deleteItem(item: LlmProviderItem) {
+    if (item.isActive) {
+      window.alert("当前激活配置不可删除，请先激活其它 provider");
+      return;
+    }
+    if (!window.confirm(`确认删除 provider「${item.name || item.providerId}」？`)) return;
+    setBusy(true);
+    try {
+      await api.delete(`/api/admin/llm-providers/${encodeURIComponent(item.providerId)}`);
+      await refetch();
+      if (draft && !draft.isNew && draft.providerId === item.providerId) {
+        setDraft(null);
+      }
+    } catch (err) {
+      window.alert(`删除失败：${(err as Error).message}`);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function activateItem(item: LlmProviderItem) {
+    setBusy(true);
+    try {
+      await api.post(`/api/admin/llm-providers/${encodeURIComponent(item.providerId)}/activate`);
+      await refetch();
+    } catch (err) {
+      window.alert(`激活失败：${(err as Error).message}`);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function runTest() {
+    setTestResult(null);
+    setTesting(true);
+    try {
+      const body: Record<string, unknown> = {};
+      if (draft && !draft.isNew) {
+        body.providerId = draft.providerId;
+        body.format = draft.format;
+        body.baseUrl = draft.baseUrl;
+        body.model = draft.model;
+        if (draft.apiKey && !draft.apiKey.includes("****")) body.apiKey = draft.apiKey;
+        if (draft.timeoutSeconds.trim()) {
+          const v = Number(draft.timeoutSeconds);
+          if (!Number.isNaN(v) && v > 0) body.timeoutSeconds = Math.floor(v);
+        }
+      } else if (draft) {
+        body.format = draft.format;
+        body.baseUrl = draft.baseUrl;
+        body.apiKey = draft.apiKey;
+        body.model = draft.model;
+        if (draft.timeoutSeconds.trim()) {
+          const v = Number(draft.timeoutSeconds);
+          if (!Number.isNaN(v) && v > 0) body.timeoutSeconds = Math.floor(v);
+        }
+      }
+      const result = await api.post<LlmProviderTestResponse>(
+        "/api/admin/llm-providers/test",
+        body
+      );
+      setTestResult(result);
+    } catch (err) {
+      setTestResult({
+        ok: false,
+        latencyMs: 0,
+        error: { kind: "client_error", detail: (err as Error).message }
+      });
+    } finally {
+      setTesting(false);
+    }
+  }
+
+  return (
+    <section className="domainWorkspace llmProvidersView">
+      <section className="panel">
+        <div className="panelHead">
+          <div>
+            <span>LLM Providers</span>
+            <h2>AI 模型服务商配置</h2>
+            <p className="panelHeadHint">
+              {active ? (
+                <>
+                  当前激活：<strong>{active.providerId}</strong> · {active.format} · {active.model}
+                </>
+              ) : (
+                <>尚未加载</>
+              )}
+            </p>
+          </div>
+          <div className="panelActions">
+            <button className="secondary" onClick={() => void refetch()} disabled={loading}>
+              <RefreshCw size={14} /> 刷新
+            </button>
+            <button onClick={startCreate} disabled={busy}>
+              <SquarePen size={14} /> 新增 provider
+            </button>
+          </div>
+        </div>
+        {error && <div className="errorBanner">{error}</div>}
+
+        <div className="llmProvidersList">
+          {items.length === 0 && !loading && (
+            <div className="emptyHint">暂无配置。点击右上「新增 provider」创建第一条。</div>
+          )}
+          {items.map((item) => (
+            <article
+              key={item.providerId}
+              className={`llmProviderCard${item.isActive ? " active" : ""}`}
+            >
+              <header>
+                <div>
+                  <strong>{item.name || item.providerId}</strong>
+                  <span className="providerId">{item.providerId}</span>
+                </div>
+                <div className="badges">
+                  <span className={`formatBadge ${item.format}`}>{item.format.toUpperCase()}</span>
+                  {item.isActive && <span className="activeBadge">已激活</span>}
+                </div>
+              </header>
+              <dl>
+                <div><dt>baseUrl</dt><dd className="mono">{item.baseUrl}</dd></div>
+                <div><dt>model</dt><dd className="mono">{item.model}</dd></div>
+                <div><dt>apiKey</dt><dd className="mono">{item.apiKeyMasked}</dd></div>
+                <div>
+                  <dt>超时 / 重试</dt>
+                  <dd>
+                    {item.timeoutSeconds ?? "默认"}s · 重试 {item.maxRetries ?? "默认"} 次 · 退避基线 {item.retryBaseMs ?? "默认"}ms
+                  </dd>
+                </div>
+              </dl>
+              <footer>
+                {!item.isActive && (
+                  <button className="secondary" onClick={() => void activateItem(item)} disabled={busy}>
+                    激活
+                  </button>
+                )}
+                <button className="secondary" onClick={() => startEdit(item)} disabled={busy}>
+                  <SquarePen size={13} /> 编辑
+                </button>
+                <button
+                  className="danger"
+                  onClick={() => void deleteItem(item)}
+                  disabled={busy || item.isActive}
+                  title={item.isActive ? "请先激活其它 provider 后再删除" : "删除"}
+                >
+                  <Trash2 size={13} /> 删除
+                </button>
+              </footer>
+            </article>
+          ))}
+        </div>
+      </section>
+
+      {draft && (
+        <section className="panel llmProviderEditor">
+          <div className="panelHead">
+            <div>
+              <span>{draft.isNew ? "新增 provider" : "编辑 provider"}</span>
+              <h2>{draft.isNew ? "新增 LLM 服务商" : draft.name || draft.providerId}</h2>
+              {!draft.isNew && (
+                <small className="panelHeadSub">
+                  <code>{draft.providerId}</code> · {draft.format === "anthropic" ? "Anthropic 兼容" : "OpenAI 兼容"}
+                </small>
+              )}
+            </div>
+            <button className="secondary" onClick={cancelEdit} disabled={busy}>
+              <X size={14} /> 关闭
+            </button>
+          </div>
+
+          <div className="editorSectionTitle">协议格式</div>
+          <div className="formatPickerCards">
+            <button
+              type="button"
+              className={`formatCard${draft.format === "openai" ? " selected" : ""}`}
+              onClick={() => setDraft({ ...draft, format: "openai" })}
+              disabled={busy}
+            >
+              <div className="formatCard__title">OpenAI 兼容</div>
+              <div className="formatCard__meta">POST /chat/completions · Authorization: Bearer</div>
+              <div className="formatCard__hint">兼容 OpenAI 协议形态的服务商或自建网关</div>
+            </button>
+            <button
+              type="button"
+              className={`formatCard${draft.format === "anthropic" ? " selected" : ""}`}
+              onClick={() => setDraft({ ...draft, format: "anthropic" })}
+              disabled={busy}
+            >
+              <div className="formatCard__title">Anthropic 兼容</div>
+              <div className="formatCard__meta">POST /v1/messages · x-api-key</div>
+              <div className="formatCard__hint">兼容 Anthropic Messages 协议形态的服务商或自建网关</div>
+            </button>
+          </div>
+
+          <div className="editorSectionTitle">基本信息</div>
+          <div className="formGrid">
+            <label>
+              <span>provider 标识 (providerId)</span>
+              <input
+                value={draft.providerId}
+                onChange={(e) => setDraft({ ...draft, providerId: e.target.value })}
+                disabled={!draft.isNew || busy}
+                placeholder="如 my-llm-prod / gateway-a"
+              />
+              <small>唯一 slug，保存后不可修改</small>
+            </label>
+            <label>
+              <span>展示名称</span>
+              <input
+                value={draft.name}
+                onChange={(e) => setDraft({ ...draft, name: e.target.value })}
+                disabled={busy}
+                placeholder="便于识别的展示名"
+              />
+            </label>
+            <label>
+              <span>model</span>
+              <input
+                value={draft.model}
+                onChange={(e) => setDraft({ ...draft, model: e.target.value })}
+                disabled={busy}
+                placeholder={
+                  draft.format === "anthropic"
+                    ? "请填写 Anthropic 形态的模型 ID"
+                    : "请填写 OpenAI 形态的模型 ID"
+                }
+              />
+            </label>
+          </div>
+
+          <div className="editorSectionTitle">连接配置</div>
+          <div className="formGrid">
+            <label className="spanFull">
+              <span>baseUrl</span>
+              <input
+                value={draft.baseUrl}
+                onChange={(e) => setDraft({ ...draft, baseUrl: e.target.value })}
+                disabled={busy}
+                placeholder={
+                  draft.format === "anthropic"
+                    ? "https://your-host"
+                    : "https://your-host/v1"
+                }
+              />
+              <small>OpenAI 形态需含 /v1；Anthropic 形态填到根域即可</small>
+            </label>
+            <label className="spanFull">
+              <span>apiKey</span>
+              <div className="inputWithAction">
+                <input
+                  type={showApiKey ? "text" : "password"}
+                  value={draft.apiKey}
+                  onChange={(e) => setDraft({ ...draft, apiKey: e.target.value })}
+                  disabled={busy}
+                  placeholder={draft.isNew ? "请填写 apiKey" : "保留 mask 占位则不更新"}
+                  autoComplete="new-password"
+                />
+                <button
+                  type="button"
+                  className="inputActionBtn"
+                  onClick={() => setShowApiKey((v) => !v)}
+                  disabled={busy}
+                  aria-label={showApiKey ? "隐藏 apiKey" : "显示 apiKey"}
+                  title={showApiKey ? "隐藏" : "显示"}
+                >
+                  {showApiKey ? <EyeOff size={14} /> : <Eye size={14} />}
+                </button>
+              </div>
+              <small>编辑模式下若不修改请保持「****」mask 占位，提交时不会覆盖原 key</small>
+            </label>
+          </div>
+
+          <div className="editorSectionTitle">重试与超时</div>
+          <div className="formGrid formGrid--three">
+            <label>
+              <span>超时秒数</span>
+              <input
+                type="number"
+                min={1}
+                value={draft.timeoutSeconds}
+                onChange={(e) => setDraft({ ...draft, timeoutSeconds: e.target.value })}
+                disabled={busy}
+                placeholder="默认沿用 .env"
+              />
+            </label>
+            <label>
+              <span>最大重试</span>
+              <input
+                type="number"
+                min={0}
+                value={draft.maxRetries}
+                onChange={(e) => setDraft({ ...draft, maxRetries: e.target.value })}
+                disabled={busy}
+                placeholder="默认 3"
+              />
+            </label>
+            <label>
+              <span>重试退避基线 (ms)</span>
+              <input
+                type="number"
+                min={1}
+                value={draft.retryBaseMs}
+                onChange={(e) => setDraft({ ...draft, retryBaseMs: e.target.value })}
+                disabled={busy}
+                placeholder="默认 1500"
+              />
+            </label>
+          </div>
+
+          <div className="editorFooter">
+            <button className="secondary" onClick={() => void runTest()} disabled={testing || busy}>
+              <FlaskConical size={14} /> {testing ? "测试中…" : "测试连通性"}
+            </button>
+            <div className="footerSpacer" />
+            <button className="secondary" onClick={cancelEdit} disabled={busy}>
+              取消
+            </button>
+            <button onClick={() => void saveDraft()} disabled={busy}>
+              {draft.isNew ? "创建" : "保存"}
+            </button>
+          </div>
+
+          {testResult && (
+            <div className={`testResult ${testResult.ok ? "ok" : "fail"}`}>
+              <div className="testResultHead">
+                <strong>{testResult.ok ? "测试成功" : "测试失败"}</strong>
+                <span>耗时 {testResult.latencyMs} ms</span>
+              </div>
+              {testResult.ok ? (
+                <pre className="testResultBody">
+{typeof testResult.preview === "string"
+  ? testResult.preview
+  : JSON.stringify(testResult.preview, null, 2)}
+                </pre>
+              ) : (
+                <div className="testResultBody">
+                  <div>
+                    <em>错误类型：</em>
+                    {testResult.error?.kind || "unknown"}
+                    {testResult.error?.retryCount != null && (
+                      <span> · 重试 {testResult.error.retryCount} 次</span>
+                    )}
+                  </div>
+                  {testResult.error?.detail && (
+                    <pre>{testResult.error.detail}</pre>
+                  )}
+                  {testResult.error?.hint && (
+                    <div className="hint">建议：{testResult.error.hint}</div>
+                  )}
+                </div>
+              )}
+            </div>
+          )}
+        </section>
+      )}
+    </section>
+  );
+}
+
 function MetricCard({
   detail,
   label,
@@ -6740,6 +7438,8 @@ function channelTitle(channel: Channel) {
       return "演化中心";
     case "quality":
       return "运营成效";
+    case "llmProviders":
+      return "AI 模型配置";
   }
 }
 
@@ -6769,6 +7469,8 @@ function channelEyebrow(channel: Channel) {
       return "Self Evolution";
     case "quality":
       return "Outcome & Quality";
+    case "llmProviders":
+      return "LLM Providers";
   }
 }
 
@@ -6798,6 +7500,8 @@ function channelSubtitle(channel: Channel) {
       return "查看自演化器产出的 experiments、阈值与 Prompt 候选、Shadow 评测与显著性结论；管理员二次确认后发布或回滚。";
     case "quality":
       return "用户回复率、对话深度等长期指标，知识切片自动校验，公式遵守度评测，产品声明兜底标记词管理。";
+    case "llmProviders":
+      return "管理 LLM 服务商：base_url / api_key / model / 协议格式（OpenAI 兼容、Anthropic 兼容）；支持测试连通性与一键热切换激活配置。";
   }
 }
 
@@ -8010,6 +8714,469 @@ function EvolutionCenterView() {
         <EvolutionCenterTab enabled={enabled} />
       )}
     </section>
+  );
+}
+
+// knowledge-wiki Phase G：Wiki 管理频道——3 个最小可用 admin 视图。
+//
+// - DomainSchemaTab：列 active / 历史版本，一键切换 active；fields 只读展示
+//   （新建 / 删除暂走后端 API + curl，UI 不做表单避免和 chunks 主表互锁）
+// - GapSignalsTab：列 pending 信号 + 一键 sweep + dismiss / apply
+// - ChunkRevisionsDrawer：输入 chunk_id 拉历史 timeline（drawer 形态）
+type KnowledgeWikiTab = "domainSchemas" | "gapSignals" | "revisions";
+
+function KnowledgeWikiView() {
+  const [tab, setTab] = useState<KnowledgeWikiTab>("domainSchemas");
+  return (
+    <section className="qualityCenter knowledgeWiki">
+      <div className="panelHead compact">
+        <div>
+          <span>Knowledge Wiki Admin</span>
+          <h2>Wiki 管理</h2>
+        </div>
+        <FileBox size={18} />
+      </div>
+      <div className="qualityTabs">
+        <button
+          className={tab === "domainSchemas" ? "tab active" : "tab"}
+          onClick={() => setTab("domainSchemas")}
+        >
+          行业 Schema
+        </button>
+        <button
+          className={tab === "gapSignals" ? "tab active" : "tab"}
+          onClick={() => setTab("gapSignals")}
+        >
+          质量信号
+        </button>
+        <button
+          className={tab === "revisions" ? "tab active" : "tab"}
+          onClick={() => setTab("revisions")}
+        >
+          编辑历史
+        </button>
+      </div>
+      {tab === "domainSchemas" && <DomainSchemaTab />}
+      {tab === "gapSignals" && <GapSignalsTab />}
+      {tab === "revisions" && <ChunkRevisionsDrawer />}
+    </section>
+  );
+}
+
+interface DomainSchemaField {
+  name: string;
+  label: string;
+  kind: string;
+  required: boolean;
+  allowedValues?: string[] | null;
+  aliasOf?: string | null;
+}
+interface DomainSchemaItem {
+  schemaId: string;
+  workspaceId: string;
+  name: string;
+  version: number;
+  fields: DomainSchemaField[];
+  aliasDict: Record<string, unknown>;
+  guardDsl?: string | null;
+  isActive: boolean;
+  createdAt: number;
+  updatedAt: number;
+}
+
+function DomainSchemaTab() {
+  const [items, setItems] = useState<DomainSchemaItem[]>([]);
+  const [loading, setLoading] = useState(false);
+  const [activating, setActivating] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [info, setInfo] = useState<string | null>(null);
+
+  async function load() {
+    setLoading(true);
+    setError(null);
+    try {
+      const r = await fetch("/api/admin/domain-schemas");
+      if (!r.ok) throw new Error(await r.text());
+      const data = (await r.json()) as { items: DomainSchemaItem[] };
+      setItems(data.items ?? []);
+    } catch (e: unknown) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  useEffect(() => {
+    void load();
+  }, []);
+
+  async function activate(schemaId: string) {
+    setActivating(schemaId);
+    setError(null);
+    setInfo(null);
+    try {
+      const r = await fetch(`/api/admin/domain-schemas/${encodeURIComponent(schemaId)}/activate`, {
+        method: "POST",
+      });
+      if (!r.ok) throw new Error(await r.text());
+      setInfo(`已切换 active：${schemaId}`);
+      await load();
+    } catch (e: unknown) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setActivating(null);
+    }
+  }
+
+  return (
+    <div className="wikiPanelBody">
+      <div className="wikiToolbar">
+        <button type="button" className="ghost" onClick={() => void load()} disabled={loading}>
+          <RefreshCw size={14} />
+          {loading ? "加载中…" : "刷新"}
+        </button>
+        <span className="wikiHint">
+          新建 / 编辑 schema 走后端 API（POST/PUT /api/admin/domain-schemas）；UI 仅做激活与只读浏览。
+        </span>
+      </div>
+      {error ? <div className="wikiAlert error">{error}</div> : null}
+      {info ? <div className="wikiAlert info">{info}</div> : null}
+      {!loading && items.length === 0 ? (
+        <div className="wikiEmpty">暂无 schema。可通过后端 API 创建一条 fields 数组（≤ 64 项）。</div>
+      ) : null}
+      <div className="wikiList">
+        {items.map((s) => (
+          <div className={s.isActive ? "wikiCard active" : "wikiCard"} key={`${s.schemaId}-${s.version}`}>
+            <div className="wikiCardHead">
+              <div>
+                <span className="wikiCardTitle">{s.name}</span>
+                <span className="wikiCardMeta">
+                  {s.schemaId} · v{s.version} · {s.fields.length} fields
+                </span>
+              </div>
+              <div className="wikiCardActions">
+                {s.isActive ? (
+                  <span className="wikiBadge active">active</span>
+                ) : (
+                  <button
+                    type="button"
+                    className="primary"
+                    onClick={() => void activate(s.schemaId)}
+                    disabled={activating === s.schemaId}
+                  >
+                    {activating === s.schemaId ? "切换中…" : "设为 active"}
+                  </button>
+                )}
+              </div>
+            </div>
+            <div className="wikiCardBody">
+              <div className="wikiFieldList">
+                {s.fields.map((f) => (
+                  <div className="wikiField" key={f.name}>
+                    <span className="wikiFieldName">{f.name}</span>
+                    <span className="wikiFieldKind">{f.kind}</span>
+                    {f.required ? <span className="wikiFieldFlag">required</span> : null}
+                    {f.allowedValues && f.allowedValues.length > 0 ? (
+                      <span className="wikiFieldFlag">enum({f.allowedValues.length})</span>
+                    ) : null}
+                  </div>
+                ))}
+              </div>
+              {Object.keys(s.aliasDict ?? {}).length > 0 ? (
+                <div className="wikiAlias">
+                  <span className="wikiAliasTitle">aliasDict</span>
+                  <code>{JSON.stringify(s.aliasDict)}</code>
+                </div>
+              ) : null}
+            </div>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+interface GapSignalItem {
+  signalId: string;
+  kind: string;
+  title: string;
+  description: string;
+  severity: string;
+  source: string;
+  status: string;
+  affectedChunkIds: string[];
+  searchQueries: string[];
+  resolutionNote?: string | null;
+  createdAt?: string | null;
+  resolvedAt?: string | null;
+}
+
+function GapSignalsTab() {
+  const [items, setItems] = useState<GapSignalItem[]>([]);
+  const [loading, setLoading] = useState(false);
+  const [sweeping, setSweeping] = useState(false);
+  const [busyId, setBusyId] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [info, setInfo] = useState<string | null>(null);
+  const [kindFilter, setKindFilter] = useState<string>("");
+
+  async function load() {
+    setLoading(true);
+    setError(null);
+    try {
+      const params = new URLSearchParams({ status: "pending", limit: "200" });
+      if (kindFilter) params.set("kind", kindFilter);
+      const r = await fetch(`/api/knowledge/gap-signals?${params.toString()}`);
+      if (!r.ok) throw new Error(await r.text());
+      const data = (await r.json()) as { signals: GapSignalItem[] };
+      setItems(data.signals ?? []);
+    } catch (e: unknown) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  useEffect(() => {
+    void load();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [kindFilter]);
+
+  async function sweep() {
+    setSweeping(true);
+    setError(null);
+    setInfo(null);
+    try {
+      const r = await fetch("/api/knowledge/gap-signals/sweep", { method: "POST" });
+      if (!r.ok) throw new Error(await r.text());
+      const data = await r.json();
+      setInfo(
+        `lint 新增 ${data?.structuralLint?.newSignals ?? 0}，` +
+          `stage1 自动消解 ${data?.sweep?.stage1AutoResolved ?? 0}`,
+      );
+      await load();
+    } catch (e: unknown) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setSweeping(false);
+    }
+  }
+
+  async function resolve(signalId: string, action: "dismiss" | "apply") {
+    setBusyId(signalId);
+    setError(null);
+    setInfo(null);
+    try {
+      const r = await fetch(`/api/knowledge/gap-signals/${encodeURIComponent(signalId)}/${action}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({}),
+      });
+      if (!r.ok) throw new Error(await r.text());
+      setInfo(action === "dismiss" ? "已忽略" : "已标记为已应用");
+      await load();
+    } catch (e: unknown) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusyId(null);
+    }
+  }
+
+  const KIND_OPTIONS = [
+    { v: "", label: "全部 kind" },
+    { v: "orphan", label: "orphan" },
+    { v: "broken_link", label: "broken_link" },
+    { v: "no_outlinks", label: "no_outlinks" },
+    { v: "low_confidence", label: "low_confidence" },
+    { v: "stale", label: "stale" },
+  ];
+
+  return (
+    <div className="wikiPanelBody">
+      <div className="wikiToolbar">
+        <button type="button" className="ghost" onClick={() => void load()} disabled={loading}>
+          <RefreshCw size={14} />
+          {loading ? "加载中…" : "刷新"}
+        </button>
+        <button type="button" className="primary" onClick={() => void sweep()} disabled={sweeping}>
+          {sweeping ? "扫描中…" : "立即扫描"}
+        </button>
+        <select
+          className="wikiSelect"
+          value={kindFilter}
+          onChange={(e) => setKindFilter(e.target.value)}
+        >
+          {KIND_OPTIONS.map((o) => (
+            <option key={o.v} value={o.v}>
+              {o.label}
+            </option>
+          ))}
+        </select>
+        <span className="wikiHint">仅展示 status=pending；扫描包含结构 lint + stage1 规则消解。</span>
+      </div>
+      {error ? <div className="wikiAlert error">{error}</div> : null}
+      {info ? <div className="wikiAlert info">{info}</div> : null}
+      {!loading && items.length === 0 ? (
+        <div className="wikiEmpty">没有 pending 信号。库结构当前看起来很健康。</div>
+      ) : null}
+      <div className="wikiSignalList">
+        {items.map((s) => (
+          <div className={`wikiSignalCard sev-${s.severity}`} key={s.signalId}>
+            <div className="wikiSignalHead">
+              <div className="wikiSignalTitle">
+                <span className={`wikiKind ${s.kind}`}>{s.kind}</span>
+                <span className={`wikiSev ${s.severity}`}>{s.severity}</span>
+                <strong>{s.title}</strong>
+              </div>
+              <div className="wikiSignalActions">
+                <button
+                  type="button"
+                  className="ghost"
+                  onClick={() => void resolve(s.signalId, "dismiss")}
+                  disabled={busyId === s.signalId}
+                >
+                  忽略
+                </button>
+                <button
+                  type="button"
+                  className="primary"
+                  onClick={() => void resolve(s.signalId, "apply")}
+                  disabled={busyId === s.signalId}
+                >
+                  标记已处理
+                </button>
+              </div>
+            </div>
+            <p className="wikiSignalDesc">{s.description}</p>
+            {s.affectedChunkIds.length > 0 ? (
+              <div className="wikiSignalRefs">
+                <span className="wikiSignalLabel">affected：</span>
+                {s.affectedChunkIds.slice(0, 8).map((id) => (
+                  <code key={id}>{id}</code>
+                ))}
+                {s.affectedChunkIds.length > 8 ? (
+                  <span className="wikiHint">+{s.affectedChunkIds.length - 8}</span>
+                ) : null}
+              </div>
+            ) : null}
+            {s.searchQueries.length > 0 ? (
+              <div className="wikiSignalRefs">
+                <span className="wikiSignalLabel">queries：</span>
+                {s.searchQueries.slice(0, 5).map((q, i) => (
+                  <code key={`${s.signalId}-q-${i}`}>{q}</code>
+                ))}
+              </div>
+            ) : null}
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+interface ChunkRevisionItem {
+  revisionId: string;
+  chunkId: string;
+  op: string;
+  patch: unknown;
+  beforeHash: string;
+  afterHash: string;
+  source: string;
+  reason?: string | null;
+  createdAt?: string | null;
+  createdBy?: string | null;
+}
+
+function ChunkRevisionsDrawer() {
+  const [chunkId, setChunkId] = useState("");
+  const [pending, setPending] = useState(false);
+  const [items, setItems] = useState<ChunkRevisionItem[]>([]);
+  const [error, setError] = useState<string | null>(null);
+  const [expanded, setExpanded] = useState<Set<string>>(new Set());
+
+  async function load() {
+    const id = chunkId.trim();
+    if (!id) {
+      setError("请输入 chunkId（24 位 ObjectId 十六进制）。");
+      return;
+    }
+    setPending(true);
+    setError(null);
+    try {
+      const r = await fetch(
+        `/api/operation-knowledge/chunks/${encodeURIComponent(id)}/revisions?limit=100`,
+      );
+      if (!r.ok) throw new Error(await r.text());
+      const data = (await r.json()) as { items: ChunkRevisionItem[] };
+      setItems(data.items ?? []);
+      setExpanded(new Set());
+    } catch (e: unknown) {
+      setError(e instanceof Error ? e.message : String(e));
+      setItems([]);
+    } finally {
+      setPending(false);
+    }
+  }
+
+  function toggle(revisionId: string) {
+    setExpanded((s) => {
+      const next = new Set(s);
+      if (next.has(revisionId)) next.delete(revisionId);
+      else next.add(revisionId);
+      return next;
+    });
+  }
+
+  return (
+    <div className="wikiPanelBody">
+      <div className="wikiToolbar">
+        <input
+          type="text"
+          className="wikiInput"
+          placeholder="输入 chunkId 查看 revision 历史"
+          value={chunkId}
+          onChange={(e) => setChunkId(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") void load();
+          }}
+        />
+        <button type="button" className="primary" onClick={() => void load()} disabled={pending}>
+          {pending ? "加载中…" : "拉取历史"}
+        </button>
+        <span className="wikiHint">timeline 倒序；每行展开查看 patch JSON 与 hash。</span>
+      </div>
+      {error ? <div className="wikiAlert error">{error}</div> : null}
+      {!pending && chunkId && items.length === 0 && !error ? (
+        <div className="wikiEmpty">该 chunk 暂无 revision 记录。</div>
+      ) : null}
+      <div className="wikiRevisionList">
+        {items.map((r) => {
+          const isOpen = expanded.has(r.revisionId);
+          return (
+            <div className={`wikiRevCard op-${r.op}`} key={r.revisionId}>
+              <div className="wikiRevHead" onClick={() => toggle(r.revisionId)}>
+                <span className={`wikiOp ${r.op}`}>{r.op}</span>
+                <span className={`wikiSource ${r.source}`}>{r.source}</span>
+                <span className="wikiRevTime">{r.createdAt ?? ""}</span>
+                <span className="wikiRevId">{r.revisionId}</span>
+                {r.reason ? <span className="wikiRevReason">{r.reason}</span> : null}
+                {isOpen ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
+              </div>
+              {isOpen ? (
+                <div className="wikiRevBody">
+                  <div className="wikiRevHash">
+                    <span>before: {r.beforeHash || "-"}</span>
+                    <span>after: {r.afterHash || "-"}</span>
+                    {r.createdBy ? <span>by: {r.createdBy}</span> : null}
+                  </div>
+                  <pre className="wikiRevPatch">{JSON.stringify(r.patch, null, 2)}</pre>
+                </div>
+              ) : null}
+            </div>
+          );
+        })}
+      </div>
+    </div>
   );
 }
 
@@ -9494,6 +10661,200 @@ const DIGEST_KIND_LABELS: Record<string, string> = {
   freeform: "自由形态"
 };
 
+// ── AiInboxStrip：顶部 AI 待办流（GET /operation-knowledge/inbox 聚合） ───
+type InboxCardView = {
+  id: string;
+  priority: "high" | "mid" | "low" | string;
+  kind: string;
+  title: string;
+  contextSummary: string;
+  targetChunkId?: string | null;
+  targetPackId?: string | null;
+  suggestedActions: string[];
+  origin: string;
+  createdAt?: string;
+};
+
+type InboxStatsView = { total: number; high: number; mid: number; low: number };
+
+type InboxResponseView = { items: InboxCardView[]; stats: InboxStatsView };
+
+const INBOX_PRIORITY_LABEL: Record<string, string> = {
+  high: "高",
+  mid: "中",
+  low: "低"
+};
+
+const INBOX_KIND_LABEL: Record<string, string> = {
+  create_chunk: "新建切片",
+  repair_chunk: "修复切片",
+  fill_field: "补字段",
+  extract_tags: "抽标签",
+  merge_chunks: "整合切片"
+};
+
+const INBOX_ORIGIN_LABEL: Record<string, string> = {
+  digest_card: "今日日报",
+  quote_missing: "缺原文",
+  anchors_missing: "缺锚点",
+  pending_review: "待审"
+};
+
+function AiInboxStrip(props: {
+  onOpenChat: (injection: string) => void;
+  onOpenManual: (target: { kind: "chunk" | "pack"; id: string } | null) => void;
+  onDismissDigest: (cardId: string) => void;
+}) {
+  const [items, setItems] = useState<InboxCardView[]>([]);
+  const [stats, setStats] = useState<InboxStatsView>({ total: 0, high: 0, mid: 0, low: 0 });
+  const [phase, setPhase] = useState<"idle" | "loading" | "error">("idle");
+  const [errorMsg, setErrorMsg] = useState("");
+  const [expanded, setExpanded] = useState(false);
+
+  const reload = async () => {
+    setPhase("loading");
+    setErrorMsg("");
+    try {
+      const data = await api.get<InboxResponseView>("/api/operation-knowledge/inbox?limit=24");
+      setItems(Array.isArray(data.items) ? data.items : []);
+      setStats(data.stats || { total: 0, high: 0, mid: 0, low: 0 });
+      setPhase("idle");
+    } catch (err) {
+      setErrorMsg(err instanceof Error ? err.message : String(err));
+      setPhase("error");
+    }
+  };
+
+  useEffect(() => {
+    void reload();
+  }, []);
+
+  const visible = expanded ? items : items.slice(0, 5);
+  const hiddenCount = items.length - visible.length;
+
+  return (
+    <section className="aiInbox" aria-label="今日 AI 待办">
+      <header className="aiInbox__head">
+        <div>
+          <span className="aiInbox__title">今日 AI 待办</span>
+          <span className="aiInbox__meta">
+            {phase === "loading"
+              ? "加载中…"
+              : phase === "error"
+              ? `读取失败：${errorMsg || "未知错误"}`
+              : `${stats.total} 条 · 高 ${stats.high} / 中 ${stats.mid} / 低 ${stats.low}`}
+          </span>
+        </div>
+        <button
+          type="button"
+          className="ghostButton"
+          onClick={() => void reload()}
+          disabled={phase === "loading"}
+        >
+          <RefreshCw size={12} /> 刷新
+        </button>
+      </header>
+
+      {phase === "idle" && items.length === 0 ? (
+        <div className="aiInbox__empty">
+          AI 暂无待办。可以直接在下方与 AI 对话，或让 AI 重算今日日报。
+        </div>
+      ) : null}
+
+      {visible.map((card) => {
+        const priorityCls = `aiInbox__priority aiInbox__priority--${card.priority}`;
+        const offerChat = card.suggestedActions.includes("open_chat");
+        const offerDismiss = card.suggestedActions.includes("dismiss");
+        const titleSafe = stripHtml(card.title);
+        const ctxSafe = stripHtml(card.contextSummary);
+        return (
+          <div key={card.id} className="aiInbox__row">
+            <span className={priorityCls}>{INBOX_PRIORITY_LABEL[card.priority] || card.priority}</span>
+            <span className="aiInbox__kind">{INBOX_KIND_LABEL[card.kind] || card.kind}</span>
+            <div className="aiInbox__main">
+              <div className="aiInbox__title2" title={titleSafe}>
+                {titleSafe}
+              </div>
+              {ctxSafe ? <div className="aiInbox__sub">{ctxSafe}</div> : null}
+              <div className="aiInbox__origin">
+                {INBOX_ORIGIN_LABEL[card.origin] || card.origin}
+              </div>
+            </div>
+            <div className="aiInbox__actions">
+              {offerChat ? (
+                <button
+                  type="button"
+                  className="primaryButton"
+                  onClick={() => {
+                    const target = card.targetChunkId
+                      ? `chunk:${card.targetChunkId}`
+                      : card.targetPackId
+                      ? `pack:${card.targetPackId}`
+                      : "—";
+                    const blob =
+                      `请帮我处理这条 AI 待办：\n` +
+                      `优先级：${INBOX_PRIORITY_LABEL[card.priority] || card.priority}\n` +
+                      `类型：${INBOX_KIND_LABEL[card.kind] || card.kind}\n` +
+                      `标题：${titleSafe}\n` +
+                      `上下文：${ctxSafe}\n` +
+                      `目标：${target}\n` +
+                      `来源：${INBOX_ORIGIN_LABEL[card.origin] || card.origin}`;
+                    props.onOpenChat(blob);
+                  }}
+                >
+                  谈谈
+                </button>
+              ) : null}
+              {(card.targetChunkId || card.targetPackId) ? (
+                <button
+                  type="button"
+                  className="ghostButton"
+                  onClick={() =>
+                    props.onOpenManual(
+                      card.targetChunkId
+                        ? { kind: "chunk", id: card.targetChunkId }
+                        : card.targetPackId
+                        ? { kind: "pack", id: card.targetPackId }
+                        : null
+                    )
+                  }
+                >
+                  打开
+                </button>
+              ) : null}
+              {offerDismiss && card.origin === "digest_card" ? (
+                <button
+                  type="button"
+                  className="ghostButton"
+                  onClick={() => {
+                    const cardId = card.id.startsWith("digest:")
+                      ? card.id.slice("digest:".length)
+                      : card.id;
+                    props.onDismissDigest(cardId);
+                    setItems((prev) => prev.filter((c) => c.id !== card.id));
+                  }}
+                >
+                  不采纳
+                </button>
+              ) : null}
+            </div>
+          </div>
+        );
+      })}
+
+      {hiddenCount > 0 ? (
+        <button
+          type="button"
+          className="aiInbox__expand"
+          onClick={() => setExpanded(true)}
+        >
+          展开 {hiddenCount} 条更多 ▾
+        </button>
+      ) : null}
+    </section>
+  );
+}
+
 function KnowledgeDigestCanvas(props: {
   report: KnowledgeDailyReportView | null;
   phase: "idle" | "loading" | "regenerating" | "error";
@@ -9625,7 +10986,7 @@ function KnowledgeDigestCanvas(props: {
                   </span>
                   <strong className="knowledgeDigestCard__title">{card.title}</strong>
                 </div>
-                <p className="knowledgeDigestCard__summary">{card.summary}</p>
+                <p className="knowledgeDigestCard__summary">{stripHtml(card.summary)}</p>
                 <div className="knowledgeDigestCard__meta">
                   {card.metric ? (
                     <span className="metricChip">

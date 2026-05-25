@@ -153,14 +153,6 @@ pub(super) async fn ensure_all(db: &Database) -> anyhow::Result<()> {
             None,
         )
         .await?;
-    db.operation_knowledge_items()
-        .create_index(
-            IndexModel::builder()
-                .keys(doc! { "workspace_id": 1, "account_id": 1, "domain": 1, "category": 1, "status": 1, "priority": -1, "updated_at": -1 })
-                .build(),
-            None,
-        )
-        .await?;
     db.operation_knowledge_documents()
         .create_index(
             IndexModel::builder()
@@ -424,6 +416,41 @@ pub(super) async fn ensure_all(db: &Database) -> anyhow::Result<()> {
     ensure_taxonomy_candidates_indexes(db).await?;
     // ── agent-self-evolution W0 (Task 1.2) ──
     ensure_evolution_indexes(db).await?;
+    // LLM 服务商配置：(workspace_id, provider_id) 唯一；is_active 部分索引便于
+    // 启动时快速取出当前 active 记录。
+    ensure_llm_provider_indexes(db).await?;
+    Ok(())
+}
+
+async fn ensure_llm_provider_indexes(db: &Database) -> anyhow::Result<()> {
+    // 历史遗留：早期版本错误地用 snake_case 字段建过 unique 索引，
+    // 但模型 BSON 层是 camelCase → 旧索引把所有真实文档当成
+    // (workspace_id=null, provider_id=null) 重复键。开机时 best-effort drop。
+    let _ = db
+        .llm_provider_configs()
+        .drop_index("workspace_id_1_provider_id_1", None)
+        .await;
+    let _ = db
+        .llm_provider_configs()
+        .drop_index("workspace_id_1_is_active_1", None)
+        .await;
+    db.llm_provider_configs()
+        .create_index(
+            IndexModel::builder()
+                .keys(doc! { "workspaceId": 1, "providerId": 1 })
+                .options(IndexOptions::builder().unique(true).build())
+                .build(),
+            None,
+        )
+        .await?;
+    db.llm_provider_configs()
+        .create_index(
+            IndexModel::builder()
+                .keys(doc! { "workspaceId": 1, "isActive": 1 })
+                .build(),
+            None,
+        )
+        .await?;
     Ok(())
 }
 
@@ -718,6 +745,182 @@ async fn ensure_evolution_indexes(db: &Database) -> anyhow::Result<()> {
                     IndexOptions::builder()
                         .name("kop_memory_expires_ttl".to_string())
                         .expire_after(std::time::Duration::from_secs(0))
+                        .build(),
+                )
+                .build(),
+            None,
+        )
+        .await?;
+
+    // ── knowledge-wiki Phase A：4 个新 collection 的索引 + chunks 新字段索引 ──
+    //
+    // 这一组索引服务"四件事"的检索面：
+    //   * chunk_revisions：按 chunk_id 时间倒序读 timeline；按 created_at 全局
+    //     扫"最近 N 条"；
+    //   * knowledge_gap_signals：worker 拉 pending 任务、admin 看 timeline；
+    //   * domain_schemas：workspace+schema_id+version 唯一标识，加 is_active
+    //     快路径；
+    //   * catalog_rebuild_jobs：workspace+status+queued_at 决定 worker 取哪批；
+    //   * operation_knowledge_chunks 三条新查询路径：按 wiki_type 分组、按
+    //     valid_to 找 stale、按 dynamic_confidence 取 top。
+    //
+    // 旧 chunks 索引（trigger_keywords / document_id+item_id+status / status+priority）
+    // 仍然保留，召回算法零改动。
+    db.chunk_revisions()
+        .create_index(
+            IndexModel::builder()
+                .keys(doc! { "chunk_id": 1, "revision_id": -1 })
+                .options(
+                    IndexOptions::builder()
+                        .name("chunk_revisions_chunk_rev_idx".to_string())
+                        .build(),
+                )
+                .build(),
+            None,
+        )
+        .await?;
+    db.chunk_revisions()
+        .create_index(
+            IndexModel::builder()
+                .keys(doc! { "created_at": -1 })
+                .options(
+                    IndexOptions::builder()
+                        .name("chunk_revisions_created_at_idx".to_string())
+                        .build(),
+                )
+                .build(),
+            None,
+        )
+        .await?;
+    db.knowledge_gap_signals()
+        .create_index(
+            IndexModel::builder()
+                .keys(doc! { "workspace_id": 1, "status": 1, "kind": 1 })
+                .options(
+                    IndexOptions::builder()
+                        .name("gap_signals_status_kind_idx".to_string())
+                        .build(),
+                )
+                .build(),
+            None,
+        )
+        .await?;
+    db.knowledge_gap_signals()
+        .create_index(
+            IndexModel::builder()
+                .keys(doc! { "workspace_id": 1, "created_at": -1 })
+                .options(
+                    IndexOptions::builder()
+                        .name("gap_signals_created_at_idx".to_string())
+                        .build(),
+                )
+                .build(),
+            None,
+        )
+        .await?;
+    db.knowledge_gap_signals()
+        .create_index(
+            IndexModel::builder()
+                .keys(doc! { "signal_id": 1 })
+                .options(
+                    IndexOptions::builder()
+                        .name("gap_signals_signal_id_unique".to_string())
+                        .unique(true)
+                        .build(),
+                )
+                .build(),
+            None,
+        )
+        .await?;
+    db.domain_schemas()
+        .create_index(
+            IndexModel::builder()
+                .keys(doc! { "workspace_id": 1, "schema_id": 1, "version": -1 })
+                .options(
+                    IndexOptions::builder()
+                        .name("domain_schemas_ws_id_version_idx".to_string())
+                        .build(),
+                )
+                .build(),
+            None,
+        )
+        .await?;
+    db.domain_schemas()
+        .create_index(
+            IndexModel::builder()
+                .keys(doc! { "workspace_id": 1, "is_active": 1 })
+                .options(
+                    IndexOptions::builder()
+                        .name("domain_schemas_ws_active_idx".to_string())
+                        .build(),
+                )
+                .build(),
+            None,
+        )
+        .await?;
+    db.catalog_rebuild_jobs()
+        .create_index(
+            IndexModel::builder()
+                .keys(doc! { "workspace_id": 1, "status": 1, "queued_at": 1 })
+                .options(
+                    IndexOptions::builder()
+                        .name("catalog_jobs_status_queued_idx".to_string())
+                        .build(),
+                )
+                .build(),
+            None,
+        )
+        .await?;
+    db.catalog_rebuild_jobs()
+        .create_index(
+            IndexModel::builder()
+                .keys(doc! { "job_id": 1 })
+                .options(
+                    IndexOptions::builder()
+                        .name("catalog_jobs_job_id_unique".to_string())
+                        .unique(true)
+                        .build(),
+                )
+                .build(),
+            None,
+        )
+        .await?;
+    db.operation_knowledge_chunks()
+        .create_index(
+            IndexModel::builder()
+                .keys(doc! { "workspace_id": 1, "wiki_type": 1 })
+                .options(
+                    IndexOptions::builder()
+                        .name("kchunks_wiki_type_idx".to_string())
+                        .sparse(true)
+                        .build(),
+                )
+                .build(),
+            None,
+        )
+        .await?;
+    db.operation_knowledge_chunks()
+        .create_index(
+            IndexModel::builder()
+                .keys(doc! { "workspace_id": 1, "valid_to": 1, "status": 1 })
+                .options(
+                    IndexOptions::builder()
+                        .name("kchunks_valid_to_idx".to_string())
+                        .sparse(true)
+                        .build(),
+                )
+                .build(),
+            None,
+        )
+        .await?;
+    db.operation_knowledge_chunks()
+        .create_index(
+            IndexModel::builder()
+                .keys(doc! { "workspace_id": 1, "dynamic_confidence": -1 })
+                .options(
+                    IndexOptions::builder()
+                        .name("kchunks_dynamic_confidence_idx".to_string())
+                        .sparse(true)
                         .build(),
                 )
                 .build(),

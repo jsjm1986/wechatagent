@@ -191,12 +191,6 @@ async fn analyze_chunks_health(
         if chunk.source_quote.as_deref().unwrap_or("").trim().is_empty() {
             missing_fields.push("sourceQuote".to_string());
         }
-        if chunk.evidence_items.is_empty() {
-            missing_fields.push("evidenceItems".to_string());
-        }
-        if chunk.safe_claims.is_empty() {
-            missing_fields.push("safeClaims".to_string());
-        }
         if chunk
             .integrity_status
             .as_deref()
@@ -805,8 +799,8 @@ async fn do_generate(
 
     let (status, error_kind, cards) = match result {
         Ok((_, _, _, _, cards)) => ("ok".to_string(), None, cards),
-        Err(AppError::LlmUnavailable { kind, .. }) => {
-            tracing::warn!(%kind, "knowledge digest compose hit LLM error; saving failed report");
+        Err(AppError::LlmUnavailable { kind, detail, .. }) => {
+            tracing::warn!(%kind, %detail, "knowledge digest compose hit LLM error; saving failed report");
             ("failed".to_string(), Some(kind), Vec::new())
         }
         Err(AppError::BudgetExceeded { reason, .. }) => {
