@@ -2,6 +2,12 @@
 
 > 配套 `requirements.md` 的实施级设计。读 design 之前先读 requirements R1–R9 + 红线 R7。
 > 上一轮已经落地的 KnowledgeChatPanel（`POST /operation-knowledge/chat*`、`knowledge_chat_turns`、`LlmUnavailableError`）作为本轮的 chat 主入口，**不重写**。
+>
+> **⚠️ Note (2026-05-25)**：本文档示例 JSON / 图中的 `blockReason="fact_risk"` /
+> `gateKey="fact_risk_block"` 等字符串是历史稿写作时的写法。运行时已收敛为 3 闸
+> （`hallucination` / `knowledge_grounding` / `run_budget`，详见 `src/agent/guards.rs`）；
+> evolution layer 仍按 `gate_key` 字符串工作，与运行时 guard 解耦。新版 digest 实现
+> 应读 `held_by_ai_policy / blocked_by_safety_guard` 等运行时实际状态。
 
 ## 1. Context
 

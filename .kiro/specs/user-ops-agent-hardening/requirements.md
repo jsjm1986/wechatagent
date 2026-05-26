@@ -1,6 +1,13 @@
 # Requirements Document
 
 > 中文标题：用户运营 Agent 鲁棒性强化 — 需求文档
+>
+> **⚠️ Sunset Notice (2026-05-25)**：本 spec 中针对 `enforce_string_fact_risk_guard` /
+> `safe_claims` / `forbidden_claims` / `routing_card` / `fact_risk_block` /
+> `pressure_risk_block` / `product_accuracy_block_below` 的章节（含 R5.x 等小节）
+> 已在 knowledge-cleanup 中下线。运行时收敛为 3 闸（`enforce_knowledge_grounding /
+> enforce_hallucination / enforce_run_budget`，见 `src/agent/guards.rs`），
+> 销售域字段下沉到 `domain_attributes` + `DomainSchema`。本 spec 保留作历史档案。
 
 ## Introduction
 

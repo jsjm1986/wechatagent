@@ -1,6 +1,11 @@
 
 # Implementation Plan: 用户运营 Agent 自治回路（agent-autonomy-loop）
 
+> **⚠️ Sunset Notice (2026-05-25)**：本任务清单写于销售域知识库时代，其中针对 `customer_stage` /
+> `intent_level` / `objection_type` / 5 闸阈值（fact_risk / pressure_risk / product_accuracy
+> 等）/ `safe_claims` / `routing_card` 的任务条目对应的代码已在 knowledge-cleanup 中下线，
+> 详见 `requirements.md` 顶部 sunset notice。本文件保留作历史档案。
+
 ## Overview
 
 本实施计划严格遵循 design.md §2.2 的 6 波 + 1 收口顺序（W0 基础设施 → W1 协议骨架 → W2 校验/安全门 → W3 工具/字典 → W4 Outbox → W5 MemoryCard → W6 监控/PBT 收口）。每个任务都是可由代码生成 LLM 增量执行的具体编码步骤，引用具体的需求条目（granular sub-requirements）；性质测试任务标注对应的 P1–P7 性质编号与所验证的需求子条款。

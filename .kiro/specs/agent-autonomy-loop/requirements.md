@@ -1,6 +1,15 @@
 # Requirements Document
 
 > 中文标题：用户运营 Agent 自治回路（agent-autonomy-loop）— 需求文档
+>
+> **⚠️ Sunset Notice (2026-05-25)**：本 spec 写于销售域知识库时代，文中所有关于
+> `customer_stage / intent_level / objection_type / fact_risk / pressure_risk /
+> product_accuracy / safe_claims / forbidden_claims / routing_card` 的章节
+> （含 R8.x / P4 / P6 / P7 等小节）属于**已下线的销售域形态**。运行时已在
+> 2026-05-25 knowledge-cleanup 中收敛为 3 闸（`enforce_knowledge_grounding /
+> enforce_hallucination / enforce_run_budget`，详见 `src/agent/guards.rs`），
+> 业务可变字段全量下沉到 `Contact.domain_attributes / OperationKnowledgeChunk.domain_attributes`
+> 由 `DomainSchema` 校验。本 spec 保留作历史档案，不再作为代码实现的对照源。
 
 ## Introduction
 

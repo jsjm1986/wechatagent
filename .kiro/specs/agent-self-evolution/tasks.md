@@ -1,5 +1,13 @@
 # Implementation Plan: 用户运营 Agent 自我演化（agent-self-evolution）
 
+> **⚠️ Note (2026-05-25)**：knowledge-cleanup 已把运行时 5 闸收敛为 3 闸（`enforce_knowledge_grounding /
+> enforce_hallucination / enforce_run_budget`，见 `src/agent/guards.rs`）。本演化器
+> 仍按 `gate_key` 字符串工作（`fact_risk_block` / `pressure_risk_block` /
+> `human_like_score_rewrite` / `emotional_value_rewrite` / `product_accuracy_score_block`），
+> 这些 key 是 `threshold_overrides` 集合的稳定标识符，与运行时 guard 解耦；详见
+> `docs/agent-policy.md` 顶部说明。后续 evolution 维度切到 `hallucination_score` /
+> `knowledge_grounding_score` 留下一轮。
+
 ## Overview
 
 本实施计划严格遵循 design.md §2.3 的 5 波（W0 基础设施 → W1 骨架 → W2 候选生成 → W3 Shadow eval + 显著性 → W4 Release + 前端 + 回滚）+ 1 收口顺序。每个任务都是可由代码生成 LLM 增量执行的具体编码步骤，引用 requirements.md 的 R1–R10 子条款。

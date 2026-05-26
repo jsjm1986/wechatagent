@@ -3,6 +3,11 @@
 > 中文标题：用户运营 Agent 鲁棒性强化 — 技术设计文档
 >
 > 对应需求：见 `requirements.md`，覆盖 Requirement 1-20。
+>
+> **⚠️ Sunset Notice (2026-05-25)**：本设计文档中的 `enforce_string_fact_risk_guard` /
+> `safe_claims` / `routing_card` / 5 闸阈值章节已在 knowledge-cleanup 中下线，
+> 收敛为 3 闸 `enforce_knowledge_grounding / enforce_hallucination / enforce_run_budget`
+> （详见 `src/agent/guards.rs`）。详见 `requirements.md` 顶部 sunset notice。
 
 ## Overview
 

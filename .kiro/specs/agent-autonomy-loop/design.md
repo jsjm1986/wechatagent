@@ -3,6 +3,12 @@
 > 中文标题：用户运营 Agent 自治回路 — 技术设计文档
 > 关联需求文档：`.kiro/specs/agent-autonomy-loop/requirements.md`（R0–R13 + 实现注记 N1–N7）
 > 工作流：requirements-first / specType=feature
+>
+> **⚠️ Sunset Notice (2026-05-25)**：本设计文档中的销售域专属机制（5 闸阈值 / `customer_stage` / `intent_level` /
+> `objection_type` / `safe_claims` / `routing_card` 等）已在 knowledge-cleanup 中下线。运行时收敛为
+> 3 闸（`enforce_knowledge_grounding / enforce_hallucination / enforce_run_budget`，见
+> `src/agent/guards.rs`），业务字段下沉到 `domain_attributes` + `DomainSchema`。详见
+> `requirements.md` 顶部 sunset notice。
 
 ## Overview
 

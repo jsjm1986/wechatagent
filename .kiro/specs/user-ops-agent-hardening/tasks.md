@@ -4,6 +4,10 @@
 >
 > 对应文档：`requirements.md`、`design.md`
 >
+> **⚠️ Sunset Notice (2026-05-25)**：本计划中针对销售域 5 闸 / `enforce_string_fact_risk_guard` /
+> `safe_claims` / `routing_card` 的任务条目对应代码已在 knowledge-cleanup 中下线，
+> 详见 `requirements.md` 顶部 sunset notice。本文件保留作历史档案。
+>
 > 执行顺序按 design.md §"部署顺序与回滚策略"分 5 批，每批内部按依赖排序。
 
 ## Overview
