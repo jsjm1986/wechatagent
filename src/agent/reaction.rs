@@ -269,3 +269,65 @@ pub(crate) fn reaction_outcome_status(analysis: &Document) -> String {
         "user_replied_unclassified".to_string()
     }
 }
+
+/// Phase A1：把最近 N 轮的 `decision_reviews.reaction_analysis` 渲染为下一轮 prompt 段。
+///
+/// 输入是按时间倒序（最新在前）的 reaction Document 列表；返回值是装配进
+/// system prompt 的纯文本片段。空输入返回空串，调用方据此决定是否拼接。
+pub(crate) fn format_reaction_hint(recent: &[Document]) -> String {
+    if recent.is_empty() {
+        return String::new();
+    }
+    let mut buf = String::from("[最近用户反应回顾]\n");
+    for (i, analysis) in recent.iter().enumerate().take(3) {
+        let status = reaction_outcome_status(analysis);
+        let buying = doc_bool(analysis, "buyingSignal") || doc_bool(analysis, "buying_signal");
+        let objection = doc_bool(analysis, "objection");
+        let stop = doc_bool(analysis, "stopRequested") || doc_bool(analysis, "stop_requested");
+        let summary = doc_string(analysis, "summary")
+            .or_else(|| doc_string(analysis, "note"))
+            .unwrap_or_default();
+        buf.push_str(&format!(
+            "- 第{}轮 status={} buying={} objection={} stop={}",
+            i + 1,
+            status,
+            buying,
+            objection,
+            stop
+        ));
+        if !summary.is_empty() {
+            buf.push_str(&format!(" 摘要={}", summary));
+        }
+        buf.push('\n');
+    }
+    buf
+}
+
+#[cfg(test)]
+mod a6_tests {
+    use super::*;
+    use mongodb::bson::doc;
+
+    /// Phase A6: `reaction_hint_present_in_prompt`
+    /// 验证 `format_reaction_hint` 能把最近 reaction_analysis 渲染成可注入下一轮 prompt 的文本段。
+    #[test]
+    fn reaction_hint_present_in_prompt() {
+        let recent = vec![
+            doc! { "outcomeStatus": "user_replied_objection", "objection": true, "summary": "嫌贵" },
+            doc! { "outcomeStatus": "user_replied_buying_signal", "buyingSignal": true },
+        ];
+        let hint = format_reaction_hint(&recent);
+        assert!(hint.contains("[最近用户反应回顾]"), "hint should have header");
+        assert!(hint.contains("user_replied_objection"), "first turn status missing");
+        assert!(hint.contains("user_replied_buying_signal"), "second turn status missing");
+        assert!(hint.contains("摘要=嫌贵"), "summary should be rendered");
+        assert!(hint.contains("buying=true"));
+        assert!(hint.contains("objection=true"));
+    }
+
+    #[test]
+    fn reaction_hint_empty_when_no_history() {
+        let hint = format_reaction_hint(&[]);
+        assert!(hint.is_empty(), "empty history yields empty hint");
+    }
+}

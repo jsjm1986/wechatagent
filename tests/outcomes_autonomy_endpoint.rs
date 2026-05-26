@@ -287,7 +287,7 @@ async fn outcomes_autonomy_taxonomy_candidate_rate_matches_review_risk_prefix() 
             "revision_applied": false,
             "autonomy_mode": "auto",
             "review": doc! {
-                "risks": ["taxonomy_candidate:objection_type=超预算"],
+                "risks": ["taxonomy_candidate:domain_signal=超预算"],
             },
         },
     )
@@ -300,8 +300,8 @@ async fn outcomes_autonomy_taxonomy_candidate_rate_matches_review_risk_prefix() 
             "autonomy_mode": "auto",
             "review": doc! {
                 "risks": [
-                    "fact_risk:product_unverified",
-                    "taxonomy_candidate:intent_level=urgent",
+                    "hallucination:product_unverified",
+                    "taxonomy_candidate:domain_signal=urgent",
                 ],
             },
         },
@@ -314,7 +314,7 @@ async fn outcomes_autonomy_taxonomy_candidate_rate_matches_review_risk_prefix() 
             "revision_applied": false,
             "autonomy_mode": "auto",
             "review": doc! {
-                "risks": ["pressure_risk:hard_close"],
+                "risks": ["knowledge_grounding:missing_citation"],
             },
         },
     )

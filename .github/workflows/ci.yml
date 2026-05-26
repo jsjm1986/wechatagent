@@ -1,0 +1,49 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-Dwarnings"
+
+jobs:
+  baseline:
+    name: Baseline gate (R11.6)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout (with full history for diff)
+        uses: actions/checkout@v4
+        with:
+          # check-no-human-takeover 需要 BASE..HEAD 增量扫描；fetch-depth: 0
+          # 把整段历史拉下来才能在 PR 路径上比 main。
+          fetch-depth: 0
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry / target
+        uses: Swatinem/rust-cache@v2
+
+      - name: cargo test --lib (R11.6 baseline part 1)
+        run: cargo test --lib
+
+      - name: scripts/check-baseline.sh (lib + 4 PBT files)
+        shell: bash
+        run: bash scripts/check-baseline.sh
+
+      - name: scripts/check-no-human-takeover.sh (literal lint)
+        shell: bash
+        env:
+          # PR 路径：与目标分支 diff；push 到 main 时与上一个 commit diff。
+          BASE_REF: ${{ github.event.pull_request.base.ref || 'HEAD~1' }}
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            bash scripts/check-no-human-takeover.sh "origin/${BASE_REF}" "HEAD"
+          else
+            bash scripts/check-no-human-takeover.sh "${BASE_REF}" "HEAD"
+          fi

@@ -225,6 +225,8 @@ fn test_config(mongodb_uri: String, mongodb_database: String) -> AppConfig {
         knowledge_digest_run_token_budget: 60_000,
         knowledge_digest_run_max_llm_calls: 30,
         knowledge_task_worker_interval_seconds: 0,
+        catalog_rebuild_worker_interval_seconds: 0,
+        knowledge_feedback_interval_seconds: 0,
     }
 }
 

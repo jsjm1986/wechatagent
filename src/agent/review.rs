@@ -102,11 +102,9 @@ pub fn local_decision_review(
                 scores: ReviewScores {
                     human_like: 0,
                     emotional_value: 0,
-                    product_accuracy: 0,
-                    relationship_progress: 0,
-                    conversion_readiness: 0,
-                    pressure_risk: 0,
-                    fact_risk: 0,
+                    hallucination_score: 0,
+                    knowledge_grounding_score: 0,
+                    ..Default::default()
                 },
                 risks: vec!["budget_exceeded_no_review".to_string()],
                 review_summary: "预算超额且 needs_review=true：本地兜底拒绝放行，等待 finalize 强制 blocked".to_string(),
@@ -120,15 +118,13 @@ pub fn local_decision_review(
             scores: ReviewScores {
                 human_like: 8,
                 emotional_value: 7,
-                product_accuracy: if decision.knowledge_need == "required" {
+                hallucination_score: 0,
+                knowledge_grounding_score: if decision.knowledge_need == "required" {
                     7
                 } else {
                     10
                 },
-                relationship_progress: 6,
-                conversion_readiness: 5,
-                pressure_risk: 1,
-                fact_risk: 0,
+                ..Default::default()
             },
             risks: vec!["local_review_low_risk_only".to_string()],
             review_summary: "预算超额但 needs_review=false：本地低风险快速通道放行".to_string(),
@@ -142,15 +138,12 @@ pub fn local_decision_review(
         scores: ReviewScores {
             human_like: 8,
             emotional_value: 7,
-            product_accuracy: if decision.knowledge_need == "required" {
+            hallucination_score: 0,
+            knowledge_grounding_score: if decision.knowledge_need == "required" {
                 7
             } else {
                 10
             },
-            relationship_progress: 6,
-            conversion_readiness: 5,
-            pressure_risk: 1,
-            fact_risk: 0,
         },
         review_summary: "低风险 fast_chat 本地轻量审核通过".to_string(),
         ..Default::default()
@@ -162,11 +155,10 @@ pub(crate) fn review_passed(
     runtime: &UserRuntimeParameters,
 ) -> bool {
     review.approved
-        && review.scores.fact_risk < runtime.fact_risk_block_at
-        && review.scores.pressure_risk < runtime.pressure_risk_block_at
+        && review.scores.hallucination_score < runtime.fact_risk_block_at
         && review.scores.human_like >= runtime.human_like_rewrite_below
         && review.scores.emotional_value >= runtime.emotional_value_rewrite_below
-        && review.scores.product_accuracy >= runtime.product_accuracy_block_below
+        && review.scores.knowledge_grounding_score >= runtime.product_accuracy_block_below
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -191,11 +183,8 @@ pub(crate) async fn review_decision(
             scores: ReviewScores {
                 human_like: 10,
                 emotional_value: 10,
-                product_accuracy: 10,
-                relationship_progress: 5,
-                conversion_readiness: 5,
-                pressure_risk: 0,
-                fact_risk: 0,
+                hallucination_score: 0,
+                knowledge_grounding_score: 10,
             },
             review_summary: "无需回复，无发送风险".to_string(),
             ..Default::default()

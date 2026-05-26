@@ -1279,9 +1279,7 @@ mod tests {
     use crate::agent::budget::RunBudget;
     use crate::agent::runtime::UserRuntimeParameters;
     use crate::agent::types::{KnowledgeRuntime, ToolCallRequest};
-    use crate::models::{
-        OperationKnowledgeChunk, OperationKnowledgeDocument, OperationKnowledgeItem,
-    };
+    use crate::models::{OperationKnowledgeChunk, OperationKnowledgeDocument};
     use mongodb::bson::{doc, oid::ObjectId, DateTime as BsonDt, Document};
 
     fn build_chunk(
@@ -1302,19 +1300,12 @@ mod tests {
             title: title.into(),
             summary: summary.map(ToString::to_string),
             body: body.map(ToString::to_string),
-            routing_card: None,
             applicable_scenes: vec![],
             not_applicable_scenes: vec![],
-            safe_claims: vec![],
-            forbidden_claims: vec![],
-            evidence_items: vec![],
             source_quote: Some("doc#1".into()),
             source_anchors: vec![],
             integrity_status: integrity.map(ToString::to_string),
             confidence_score: None,
-            distortion_risks: vec![],
-            unsupported_claims: vec![],
-            verified_claims: vec![],
             status: "active".into(),
             priority: 0,
             product_tags: vec![],
@@ -1366,46 +1357,6 @@ mod tests {
         }
     }
 
-    fn build_item(title: &str) -> OperationKnowledgeItem {
-        OperationKnowledgeItem {
-            id: Some(ObjectId::new()),
-            workspace_id: "default".into(),
-            account_id: None,
-            document_id: None,
-            domain: "user_operations".into(),
-            category: "product".into(),
-            business_type: "general".into(),
-            knowledge_type: Some("product".into()),
-            business_context: None,
-            title: title.into(),
-            summary: Some("s".into()),
-            body: None,
-            routing_card: None,
-            applicable_scenes: vec![],
-            not_applicable_scenes: vec![],
-            suitable_for: vec![],
-            not_suitable_for: vec![],
-            customer_stages: vec![],
-            operation_states: vec![],
-            intent_levels: vec![],
-            safe_claims: vec![],
-            forbidden_claims: vec![],
-            common_questions: vec![],
-            common_objections: vec![],
-            evidence_items: vec![],
-            source_type: "manual".into(),
-            source_name: None,
-            status: "active".into(),
-            priority: 0,
-            version: 1,
-            product_tags: vec![],
-            trigger_keywords: vec![],
-            business_topics: vec![],
-            created_at: BsonDt::now(),
-            updated_at: BsonDt::now(),
-        }
-    }
-
     fn make_runtime() -> UserRuntimeParameters {
         UserRuntimeParameters::default()
     }
@@ -1428,7 +1379,6 @@ mod tests {
         // R4.4：同 run 内同 kind 调用次数上限 2，第三次必须返回 tool_call_repeated。
         let knowledge = KnowledgeRuntime {
             documents: vec![],
-            items: vec![],
             chunks: vec![build_chunk("c1", Some("verified"), None, None)],
         };
         let mut state = ToolDispatchState::new();
@@ -1463,7 +1413,6 @@ mod tests {
             .collect();
         let knowledge = KnowledgeRuntime {
             documents: vec![build_doc("d")],
-            items: vec![build_item("i")],
             chunks,
         };
         let mut state = ToolDispatchState::new();
@@ -1490,7 +1439,6 @@ mod tests {
         // R4.5：非 verified chunk 命中时 snippet 必须为空串且 redacted=true。
         let knowledge = KnowledgeRuntime {
             documents: vec![],
-            items: vec![],
             chunks: vec![build_chunk(
                 "alpha-product",
                 Some("draft"),
@@ -1513,7 +1461,6 @@ mod tests {
         // R4.5 反向：verified chunk 必须返回 snippet 且 redacted=false。
         let knowledge = KnowledgeRuntime {
             documents: vec![],
-            items: vec![],
             chunks: vec![build_chunk(
                 "beta-feature",
                 Some("verified"),
@@ -1537,7 +1484,6 @@ mod tests {
         let known_id = chunk.id.unwrap().to_hex();
         let knowledge = KnowledgeRuntime {
             documents: vec![],
-            items: vec![],
             chunks: vec![chunk],
         };
         let runtime = make_runtime();
@@ -1562,7 +1508,6 @@ mod tests {
         let id = chunk.id.unwrap().to_hex();
         let knowledge = KnowledgeRuntime {
             documents: vec![],
-            items: vec![],
             chunks: vec![chunk],
         };
         let runtime = make_runtime();
@@ -1622,7 +1567,6 @@ mod tests {
         // 端到端：合法 list_catalog 调用应成功返回，并消耗 1 次 tool_call 配额。
         let knowledge = KnowledgeRuntime {
             documents: vec![],
-            items: vec![],
             chunks: vec![build_chunk("c1", Some("verified"), None, None)],
         };
         let runtime = make_runtime();

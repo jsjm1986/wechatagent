@@ -1,5 +1,12 @@
 # Real-task Runbook（kefu-b × Jsjm 真实运营 Agent 能力压测）
 
+> **⚠️ Sunset Notice (2026-05-25)**：本 runbook 写于销售域知识库时代，多处引用旧术语
+> （`customer_stage` / `intent_level` / `objection_type` / `fact_risk` / `pressure_risk` /
+> `safe_claims` / `routing_card` 等）。这些字段已在 W3 knowledge-cleanup 中全量下沉到
+> `Contact.domain_attributes` / `OperationKnowledgeChunk.domain_attributes`，运营域不再
+> 由代码硬编码。本文不再随主线更新；如需新一轮真实流量压测，请优先以
+> `docs/knowledge-wiki.md` + `docs/agent-policy.md` 当前版本为准。
+
 本文是"运行 → 观察 → 优化 → 修复 → 再运行"循环的执行底稿。所有真实流量、真实 LLM 调用、真实 MCP 发消息都按本文档执行；不在文档内的额外动作必须先写进文档再执行。
 
 > **Round N 编号锚点**：决策算法见 `.claude/commands/goal.md` Step 1（footer JSON 优先 + 4 项 ≥ 4 的四分支表）。本行仅做提醒：Round 编号不可复用，§8 为空时从 Round 1 起。具体的"已写标题但无 footer / aborted_by_user"等情况由 §8.0 Round 状态机说明。

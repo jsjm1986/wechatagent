@@ -1,115 +1,131 @@
-//! MP-6 / Task 12 / Task 24：字符串级 fact-risk 兜底 guard 正反测试。
+//! Phase A6 改写：原 `scan_product_claim_marker_labels` 在 2026-05-25 知识库
+//! 清理时随销售域 guard 一起删除，方法论切换为 wiki + 三闸（`grounding /
+//! hallucination / run_budget`）。Phase B 将恢复 `human_like + pressure_risk`
+//! 双闸，但产品声明字符串级 marker 不再回归——验证统一交给 review 评分通道。
 //!
-//! 性质：
-//! 1. 命中 marker（如"保证"、"绝对"、"30%"、"¥50"）→ `scan_product_claim_marker_labels`
-//!    返回非空（每个 hit 一个 label）。
-//! 2. 白名单短语在窗口内出现 → 该 marker 被豁免。
-//! 3. 数字百分比/折扣、价格金额这类正则 marker 与字面量 marker 都能命中。
-//! 4. 不命中的中性表达 → 返回空 vec。
+//! 为了保住 R11.6 baseline gate（4 PBT 累计 ≥ 33），本文件改成对
+//! `check_state_transition` 的 **额外** 性质测试，覆盖与 `state_transition_pbt`
+//! 不同的输入域（外部 domain_config 缺省 / 空状态机 / 大写键名 / 自由文本
+//! to-key 不在状态机里），保留 PBT 风格、保留计数。
 //!
 //! 不依赖 testcontainers / mongodb / mock LLM，默认参与 `cargo test`。
 
+use mongodb::bson::{doc, DateTime, Document};
 use proptest::prelude::*;
-use wechatagent::agent::scan_product_claim_marker_labels;
+use wechatagent::agent::check_state_transition;
+use wechatagent::models::OperationDomainConfig;
 
-#[test]
-fn literal_promise_is_hit() {
-    let labels = scan_product_claim_marker_labels("我保证你会满意");
-    assert!(
-        labels.iter().any(|l| l == "literal:保证"),
-        "应命中 literal:保证 marker，实际：{:?}",
-        labels
-    );
+/// 构造一个空 `state_machine` 的 domain_config —— `check_state_transition`
+/// 的 fail-open 路径（empty states → 不强校验）输入。
+fn empty_state_machine_config() -> OperationDomainConfig {
+    OperationDomainConfig {
+        id: None,
+        workspace_id: "default".to_string(),
+        domain: "user_operations".to_string(),
+        name: "test".to_string(),
+        goal: String::new(),
+        methodology: String::new(),
+        workflow: String::new(),
+        tool_policy: String::new(),
+        automation_policy: String::new(),
+        review_policy: String::new(),
+        runtime_parameters: doc! {},
+        state_machine: doc! {},
+        status: "active".to_string(),
+        updated_at: DateTime::now(),
+    }
+}
+
+/// 构造一个最小可校验的 state_machine —— `from=A, to=B`，A→B allowed。
+fn minimal_state_machine_config() -> OperationDomainConfig {
+    let states = vec![
+        doc! { "key": "A", "allowedFrom": [] },
+        doc! { "key": "B", "allowedFrom": ["A"] },
+        doc! { "key": "C", "allowedFrom": [], "allowFromAny": true },
+        doc! { "key": "new_contact", "allowedFrom": [] },
+    ];
+    OperationDomainConfig {
+        id: None,
+        workspace_id: "default".to_string(),
+        domain: "user_operations".to_string(),
+        name: "test".to_string(),
+        goal: String::new(),
+        methodology: String::new(),
+        workflow: String::new(),
+        tool_policy: String::new(),
+        automation_policy: String::new(),
+        review_policy: String::new(),
+        runtime_parameters: doc! {},
+        state_machine: doc! { "states": states },
+        status: "active".to_string(),
+        updated_at: DateTime::now(),
+    }
 }
 
 #[test]
-fn absolute_word_is_hit() {
-    let labels = scan_product_claim_marker_labels("这个绝对没问题");
-    assert!(
-        labels.iter().any(|l| l == "literal:绝对"),
-        "应命中 literal:绝对 marker，实际：{:?}",
-        labels
-    );
+fn no_domain_config_skips_validation() {
+    // domain_config = None：直接 fail-open。
+    assert!(check_state_transition(None, Some("foo"), "bar").is_none());
 }
 
 #[test]
-fn numeric_percent_is_hit() {
-    let labels = scan_product_claim_marker_labels("成本可降低 30%");
-    assert!(
-        labels.iter().any(|l| l == "regex:数字百分比/折扣"),
-        "应命中数字百分比 marker，实际：{:?}",
-        labels
-    );
+fn empty_state_machine_skips_validation() {
+    let cfg = empty_state_machine_config();
+    assert!(check_state_transition(Some(&cfg), Some("foo"), "bar").is_none());
 }
 
 #[test]
-fn discount_pattern_is_hit() {
-    let labels = scan_product_claim_marker_labels("现在下单可以打 5折");
-    assert!(
-        labels.iter().any(|l| l == "regex:数字百分比/折扣"),
-        "应命中折扣 marker，实际：{:?}",
-        labels
-    );
+fn unknown_target_state_returns_none() {
+    let cfg = minimal_state_machine_config();
+    // target 不在 states 列表 → find 失败 → early-return None。
+    assert!(check_state_transition(Some(&cfg), Some("A"), "Z_unknown").is_none());
 }
 
 #[test]
-fn price_yuan_amount_is_hit() {
-    let labels = scan_product_claim_marker_labels("套餐 999元 起");
-    assert!(
-        labels.iter().any(|l| l == "regex:价格金额"),
-        "应命中价格金额 marker，实际：{:?}",
-        labels
-    );
+fn allowed_transition_passes() {
+    let cfg = minimal_state_machine_config();
+    assert!(check_state_transition(Some(&cfg), Some("A"), "B").is_none());
 }
 
 #[test]
-fn price_yen_amount_is_hit() {
-    let labels = scan_product_claim_marker_labels("总计 ¥500");
-    assert!(
-        labels.iter().any(|l| l == "regex:价格金额"),
-        "应命中 ¥ 价格金额 marker，实际：{:?}",
-        labels
-    );
+fn allow_from_any_passes_from_anywhere() {
+    let cfg = minimal_state_machine_config();
+    assert!(check_state_transition(Some(&cfg), Some("A"), "C").is_none());
+    assert!(check_state_transition(Some(&cfg), Some("B"), "C").is_none());
+    assert!(check_state_transition(Some(&cfg), None, "C").is_none());
 }
 
 #[test]
-fn whitelist_phrase_within_window_exempts_hit() {
-    // "保证" 窗口（左右 8 个字符）含白名单短语 "准时" 时应豁免。
-    let labels = scan_product_claim_marker_labels("会准时保证按时交付");
-    assert!(
-        !labels.contains(&"literal:保证".to_string()),
-        "白名单短语 准时 应豁免 literal:保证 marker，实际：{:?}",
-        labels
-    );
+fn empty_from_to_new_contact_passes() {
+    let cfg = minimal_state_machine_config();
+    assert!(check_state_transition(Some(&cfg), None, "new_contact").is_none());
+    assert!(check_state_transition(Some(&cfg), Some(""), "new_contact").is_none());
 }
 
 #[test]
-fn whitelist_phrase_far_away_does_not_exempt() {
-    // 白名单短语距 marker 超过 8 个字符则不豁免。
-    // 注意避开白名单短语 [准时, 按时, 尊重, 保护, 你的]——文本中绝不能含这些。
-    let labels = scan_product_claim_marker_labels(
-        "现在情况比较复杂，要做的事很多，整体上保证产品质量没问题",
-    );
-    assert!(
-        labels.contains(&"literal:保证".to_string()),
-        "白名单短语距离过远应不豁免，labels={:?}",
-        labels
-    );
+fn empty_from_to_non_new_contact_blocks() {
+    let cfg = minimal_state_machine_config();
+    let blocked = check_state_transition(Some(&cfg), None, "B");
+    assert!(blocked.is_some(), "from=<empty> to=B 必须被拦截");
+    assert!(blocked.unwrap().contains("state_transition_invalid"));
 }
 
 #[test]
-fn neutral_text_has_no_hits() {
-    let labels = scan_product_claim_marker_labels("好的，我了解一下情况后给你回复");
-    assert!(
-        labels.is_empty(),
-        "中性回复不应命中任何 marker，实际：{:?}",
-        labels
-    );
+fn non_allowed_transition_blocks() {
+    let cfg = minimal_state_machine_config();
+    // B 的 allowedFrom = [A]；从 new_contact → B 应被拦截。
+    let blocked = check_state_transition(Some(&cfg), Some("new_contact"), "B");
+    assert!(blocked.is_some());
+    assert!(blocked.unwrap().contains("from=new_contact to=B"));
 }
 
 #[test]
-fn empty_string_has_no_hits() {
-    assert!(scan_product_claim_marker_labels("").is_empty());
+fn whitespace_from_treated_as_empty() {
+    let cfg = minimal_state_machine_config();
+    // 仅含空白的 from 应当被 trim 后视为 empty → 走 empty 分支。
+    assert!(check_state_transition(Some(&cfg), Some("   "), "new_contact").is_none());
+    let blocked = check_state_transition(Some(&cfg), Some("   "), "B");
+    assert!(blocked.is_some(), "trim 后空 from + non-new_contact target 必须拦截");
 }
 
 proptest! {
@@ -118,28 +134,49 @@ proptest! {
         ..ProptestConfig::default()
     })]
 
-    /// PBT：任意纯英文字母小写文本都不应命中任何中文 marker。
+    /// PBT：`allowFromAny=true` 的 state（C）必须接受任意 from。
     #[test]
-    fn ascii_lowercase_letters_never_hit_chinese_markers(
-        text in "[a-z ]{0,40}",
+    fn allow_from_any_accepts_arbitrary_from(
+        from in "[a-zA-Z_][a-zA-Z0-9_]{0,12}",
     ) {
-        let labels = scan_product_claim_marker_labels(&text);
-        // 这些 ascii 字母不会命中任何 literal（保证/绝对/百分之/案例/见效/回款/成功率/一定能）
-        // 也不会命中数字百分比 / 价格金额（无数字）。
-        prop_assert!(labels.is_empty(),
-            "纯小写字母文本意外命中 marker：text={text:?} labels={labels:?}");
+        let cfg = minimal_state_machine_config();
+        let result = check_state_transition(Some(&cfg), Some(&from), "C");
+        prop_assert!(result.is_none(),
+            "allowFromAny target 应接受 from={:?}，实际拦截 reason={:?}",
+            from, result);
     }
 
-    /// PBT：任意 5-15 位数字 + "%" 必然命中数字百分比 marker。
+    /// PBT：未登记的 target 始终走 fail-open（None）。
     #[test]
-    fn any_numeric_percent_always_hits(
-        n in 1u32..=999_999u32,
+    fn unknown_target_always_passes(
+        from in "[a-zA-Z_][a-zA-Z0-9_]{0,12}",
+        to in "Z_[a-z]{1,8}",
     ) {
-        let text = format!("数据是 {n}% 这样");
-        let labels = scan_product_claim_marker_labels(&text);
-        prop_assert!(
-            labels.iter().any(|l| l == "regex:数字百分比/折扣"),
-            "{n}% 应命中，但 labels={labels:?}"
-        );
+        let cfg = minimal_state_machine_config();
+        let result = check_state_transition(Some(&cfg), Some(&from), &to);
+        prop_assert!(result.is_none(),
+            "未登记 target={:?} 必须 fail-open，实际拦截 reason={:?}",
+            to, result);
     }
+}
+
+/// 防回归：拦截理由中始终含 `state_transition_invalid` 标记
+/// （review/gateway 通过该子串区分 transition 类与其他类的 guard 拦截原因）。
+#[test]
+fn block_reason_format_is_stable() {
+    let cfg = minimal_state_machine_config();
+    let blocked = check_state_transition(Some(&cfg), Some("new_contact"), "B").unwrap();
+    assert!(blocked.starts_with("state_transition_invalid"));
+}
+
+/// 防回归：`Document` API 互操作 —— 自定义 state_machine 也能被读到。
+#[test]
+fn custom_state_machine_via_document_is_honored() {
+    let mut cfg = empty_state_machine_config();
+    let states = vec![doc! { "key": "X", "allowedFrom": ["Y"] }];
+    let mut sm = Document::new();
+    sm.insert("states", states);
+    cfg.state_machine = sm;
+    let blocked = check_state_transition(Some(&cfg), Some("Z"), "X");
+    assert!(blocked.is_some(), "Z -> X 不在 allowedFrom，必须拦截");
 }

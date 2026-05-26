@@ -85,11 +85,11 @@ pub const MIGRATIONS: &[Migration] = &[
     // 1) 清空旧三层集合的存量销售域数据（保留集合本身，索引由后续 commit 调整）
     // 2) 清空 system_taxonomies 中的销售域 seed（customer_stage / intent_level / objection_type）
     Migration {
-        id: "2026_05_25_drop_legacy_sales_collections",
+        id: "2026_05_V3_002_drop_legacy_sales_collections",
         run: |db| Box::pin(drop_legacy_sales_collections(db)),
     },
     Migration {
-        id: "2026_05_25_drop_legacy_taxonomy_seed",
+        id: "2026_05_V3_003_drop_legacy_taxonomy_seed",
         run: |db| Box::pin(drop_legacy_taxonomy_seed(db)),
     },
 ];
@@ -980,7 +980,7 @@ async fn drop_legacy_sales_collections(db: &Database) -> AppResult<()> {
         let coll = raw.collection::<Document>(name);
         let result = coll.delete_many(doc! {}, None).await?;
         tracing::info!(
-            migration_id = "2026_05_25_drop_legacy_sales_collections",
+            migration_id = "2026_05_V3_002_drop_legacy_sales_collections",
             collection = name,
             deleted = result.deleted_count,
             "cleared legacy knowledge collection"
@@ -1009,7 +1009,7 @@ async fn drop_legacy_taxonomy_seed(db: &Database) -> AppResult<()> {
         )
         .await?;
     tracing::info!(
-        migration_id = "2026_05_25_drop_legacy_taxonomy_seed",
+        migration_id = "2026_05_V3_003_drop_legacy_taxonomy_seed",
         deleted = result.deleted_count,
         "cleared legacy sales-domain taxonomy seeds"
     );

@@ -79,23 +79,21 @@ source_channel
 playbook_id
 playbook_version
 tags
-customer_stage
-intent_level
+domain_attributes
+domain_attributes_updated_at
 last_commitment
 follow_up_policy
 profile_attributes
 profile_updated_at
 ```
 
-标签、阶段和意向不使用固定枚举。它们由账号级 `operation_playbooks` 约束方法论，由 Agent 基于单个好友上下文自由生成和持续更新。
+标签由账号级 `operation_playbooks` 约束方法论，由 Agent 基于单个好友上下文自由生成和持续更新。业务可变字段（旧版的 `customer_stage` / `intent_level` / `objection_type` 等）下沉到 `domain_attributes: bson::Document`，由 `DomainSchema` 在落库时校验。
 
 运营大脑 V2 新增长期认知对象：
 
 ```text
 operating_memories: 每个 managed 好友一份，保存用户理解、关系状态、产品匹配和下一步行动。
-operation_knowledge_documents: 运营知识文档入口。保存导入来源、AI 目录摘要、routing_map、risk_notes 和原文。
-operation_knowledge_items: 运营知识主题包。保留可编辑知识包，但知识类型、业务上下文和适用场景由 AI 自由生成，不使用固定枚举。
-operation_knowledge_chunks: Agent 运行时真正按需打开的知识切片。保存 routing_card、正文、安全事实、禁止承诺、证据和原文引用。
+operation_knowledge_chunks: Agent 运行时真正按需打开的知识切片。保存 wiki_type / title / summary / body / sources / source_quote / tags / related_chunks / domain_attributes / dynamic_confidence / locked_fields。旧的销售域字段（routing_card / safe_claims / forbidden_claims / evidence_items / distortion_risks / unsupported_claims / verified_claims）已全部下沉到 domain_attributes。
 knowledge_usage_logs: Agent 运行时知识工具调用和引用审计日志，记录 selectedKnowledgeIds、selectedChunkIds、toolTrace、routeResult、回复文本和 Review 结果。
 agent_decision_reviews: 独立评审 Agent 的评分、风险、拦截和改写记录。
 ```

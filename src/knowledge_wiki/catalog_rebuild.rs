@@ -288,12 +288,8 @@ mod tests {
             title: title.to_string(),
             summary: Some(format!("摘要 of {title}")),
             body: None,
-            routing_card: Some("路由说明".to_string()),
             applicable_scenes: vec![],
             not_applicable_scenes: vec![],
-            safe_claims: vec![],
-            forbidden_claims: vec![],
-            evidence_items: vec![],
             product_tags: vec![],
             trigger_keywords: vec![],
             business_topics: vec![],
@@ -301,9 +297,6 @@ mod tests {
             source_anchors: vec![],
             integrity_status: Some("verified".to_string()),
             confidence_score: Some(85),
-            distortion_risks: vec![],
-            unsupported_claims: vec![],
-            verified_claims: vec![],
             status: "active".to_string(),
             priority: 0,
             created_at: DateTime::now(),
@@ -340,7 +333,7 @@ mod tests {
         let s = render_persisted_catalog(&chunks);
         assert!(s.contains("### 测试标题"));
         assert!(s.contains("methodology"));
-        assert!(s.contains("路由说明"));
+        assert!(s.contains("路由: —"));
         assert!(s.contains("dynamic: 0.83"));
         assert!(s.contains("hits/30d: 7"));
         assert!(s.contains("摘要 of 测试标题"));
@@ -351,7 +344,6 @@ mod tests {
         let mut c = empty_chunk("退化");
         c.wiki_type = None;
         c.knowledge_type = None;
-        c.routing_card = None;
         c.dynamic_confidence = None;
         c.usage_stats = None;
         c.summary = None;

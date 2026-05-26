@@ -2409,7 +2409,7 @@ mod typed_tests {
         let p: RuntimeParametersTyped =
             mongodb::bson::from_document(doc! {}).expect("default deserialize");
         assert_eq!(p.recent_message_limit, 12);
-        assert_eq!(p.fact_risk_block_at, 6);
+        assert_eq!(p.hallucination_block_at, 6);
         assert_eq!(p.run_token_budget, 30000);
         assert_eq!(p.run_max_llm_calls, 6);
     }
@@ -2418,15 +2418,15 @@ mod typed_tests {
     fn runtime_parameters_typed_reads_existing_values() {
         let doc = doc! {
             "recentMessageLimit": 24,
-            "factRiskBlockAt": 8,
+            "hallucinationBlockAt": 8,
             "runTokenBudget": 50000_i64
         };
         let p: RuntimeParametersTyped = mongodb::bson::from_document(doc).expect("deserialize");
         assert_eq!(p.recent_message_limit, 24);
-        assert_eq!(p.fact_risk_block_at, 8);
+        assert_eq!(p.hallucination_block_at, 8);
         assert_eq!(p.run_token_budget, 50000);
         // 其它字段 fallback 默认值。
-        assert_eq!(p.pressure_risk_block_at, 7);
+        assert_eq!(p.knowledge_grounding_block_below, 6);
     }
 
     #[test]
@@ -2434,7 +2434,7 @@ mod typed_tests {
         let p = RuntimeParametersTyped::default();
         let doc: Document = p.into();
         assert_eq!(doc.get_i64("recentMessageLimit").unwrap(), 12);
-        assert_eq!(doc.get_i32("factRiskBlockAt").unwrap(), 6);
+        assert_eq!(doc.get_i32("hallucinationBlockAt").unwrap(), 6);
     }
 
     #[test]
@@ -3315,12 +3315,8 @@ mod typed_tests {
             title: "wiki sample".to_string(),
             summary: None,
             body: Some("…".to_string()),
-            routing_card: None,
             applicable_scenes: vec![],
             not_applicable_scenes: vec![],
-            safe_claims: vec![],
-            forbidden_claims: vec![],
-            evidence_items: vec![],
             product_tags: vec![],
             trigger_keywords: vec![],
             business_topics: vec![],
@@ -3328,9 +3324,6 @@ mod typed_tests {
             source_anchors: vec![],
             integrity_status: Some("verified".to_string()),
             confidence_score: Some(85),
-            distortion_risks: vec![],
-            unsupported_claims: vec![],
-            verified_claims: vec![],
             status: "active".to_string(),
             priority: 1,
             created_at: now,

@@ -1,5 +1,13 @@
 # Agent Policy
 
+> **2026-05-25 重要变更**：knowledge-cleanup 已把销售域 5 闸（`fact_risk` / `pressure_risk`
+> / `product_accuracy` / `human_like` / `emotional_value`）收敛到 3 闸：
+> `enforce_knowledge_grounding` / `enforce_hallucination` / `enforce_run_budget`，
+> 实际实现见 `src/agent/guards.rs`。本文档 §自我演化 部分仍引用旧 5 闸名（gate_key 字符串），
+> 是因为 evolution layer 的 `threshold_overrides` 集合按字符串 key 工作，与运行时 guard 解耦；
+> 真实在线 guard 行为以代码为准，不再扩散销售域字段。`Contact` / `OperationKnowledgeChunk`
+> 的业务字段已统一下沉到 `domain_attributes: bson::Document`，由 `DomainSchema` 定义。
+
 Agent 策略定义哪些对象可以自动化、自动化到什么程度、何时停止、如何记录。
 
 策略分两层：
@@ -56,18 +64,18 @@ Trust = Credibility + Reliability + Intimacy - SelfOrientation
 ConversionReadiness = Motivation × ProductFit × Timing × Trust ÷ Friction
 EmotionalValue = Empathy + Validation + Specificity + AutonomySupport - Pressure
 HumanLikeScore = ContextRecall + Specificity + Naturalness + Brevity + EmotionalAttunement - TemplateRisk
-NextBestActionScore = RelationshipGain + UserValue + ConversionProgress + ProductFit + Timing - DisturbanceCost - PressureRisk - FactRisk
+NextBestActionScore = RelationshipGain + UserValue + ConversionProgress + ProductFit + Timing - DisturbanceCost - HallucinationRisk - GroundingRisk
 ```
 
-自动发送约束：
+自动发送约束（2026-05-25 收敛后的 3 闸 / 详见 `src/agent/guards.rs`）：
 
 ```text
-FactRisk >= 6              禁止发送
-PressureRisk >= 7          禁止发送
-HumanLikeScore < 6         改写一次
-EmotionalValue < 5         改写一次
-ProductAccuracyScore < 7   禁止发送涉及产品承诺的内容
+HallucinationScore >= block 阈值     禁止发送 (enforce_hallucination)
+KnowledgeGroundingScore < 阈值       涉及产品 / 价格 / 数据 / 政策 / 合同等关键词时禁止发送 (enforce_knowledge_grounding)
+RunBudget 超限                        终止本 run，落 fallback (enforce_run_budget)
 ```
+
+`HumanLikeScore` / `EmotionalValue` 仍由独立 Review Agent 评估并触发改写，但不再作为闸阈值；不通过时改写一次，二次仍未通过写 `blocked_review`。
 
 当前实现使用统一发送网关。任何自动发送，包括私聊自动回复和 follow-up 定时任务，都必须重新加载上下文，检查 managed、冷却期、最小间隔、每日触达上限和任务是否过期，再进入独立 Review Agent。候选回复先生成，再评审；评审未通过时改写一次；二次仍未通过则写入 `blocked_review`，不调用微信发送工具。
 

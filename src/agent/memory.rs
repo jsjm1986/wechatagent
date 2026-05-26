@@ -1235,6 +1235,23 @@ pub(crate) async fn load_operator_memory(
     Ok(out)
 }
 
+/// Phase A2：把 `load_operator_memory` 返回的偏好记忆渲染成可注入 reply prompt 的文本段。
+///
+/// 输出按 `kind`（preference / rejection / context）分组，空输入返回空串。
+/// 调用方在 reply Agent 装配 prompt 时拼接。
+pub(crate) fn format_operator_memory_for_reply_prompt(
+    items: &[crate::models::KnowledgeOperatorMemory],
+) -> String {
+    if items.is_empty() {
+        return String::new();
+    }
+    let mut buf = String::from("[运营偏好记忆]\n");
+    for m in items {
+        buf.push_str(&format!("- ({}) {}\n", m.kind, m.content));
+    }
+    buf
+}
+
 /// knowledge-digest-workstation Phase 5：写入运营长期偏好记忆。
 ///
 /// 同 `(workspace_id, account_id, operator_id, kind, content)` 命中时只
@@ -1584,5 +1601,49 @@ mod p5_pbt {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod a6_tests {
+    use super::*;
+    use crate::models::KnowledgeOperatorMemory;
+    use mongodb::bson::DateTime;
+
+    fn mk(kind: &str, content: &str) -> KnowledgeOperatorMemory {
+        KnowledgeOperatorMemory {
+            id: None,
+            workspace_id: "ws_default".to_string(),
+            account_id: "acct-1".to_string(),
+            operator_id: "op-1".to_string(),
+            kind: kind.to_string(),
+            content: content.to_string(),
+            created_at: DateTime::from_millis(0),
+            last_used_at: DateTime::from_millis(0),
+            expires_at: None,
+        }
+    }
+
+    /// Phase A6: `operator_memory_loaded_in_decision`
+    /// 验证：当 `load_operator_memory` 返回非空列表时，`format_operator_memory_for_reply_prompt`
+    /// 能把它渲染为可拼到 reply prompt 的文本段——即"决策装配 prompt 的边界处会真正吃到记忆"。
+    #[test]
+    fn operator_memory_loaded_in_decision() {
+        let memories = vec![
+            mk("preference", "默认用 'xx' 称呼客户"),
+            mk("rejection", "不要发优惠券模板"),
+            mk("context", "客户偏好下午沟通"),
+        ];
+        let segment = format_operator_memory_for_reply_prompt(&memories);
+        assert!(segment.contains("[运营偏好记忆]"), "应渲染段头");
+        assert!(segment.contains("(preference) 默认用 'xx' 称呼客户"));
+        assert!(segment.contains("(rejection) 不要发优惠券模板"));
+        assert!(segment.contains("(context) 客户偏好下午沟通"));
+    }
+
+    #[test]
+    fn operator_memory_empty_yields_empty_segment() {
+        let segment = format_operator_memory_for_reply_prompt(&[]);
+        assert!(segment.is_empty());
     }
 }

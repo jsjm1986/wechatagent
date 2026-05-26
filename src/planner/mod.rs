@@ -1093,9 +1093,6 @@ mod tests {
             playbook_id: None,
             playbook_version: None,
             tags: Vec::new(),
-            customer_stage: None,
-            customer_stage_updated_at: None,
-            intent_level: None,
             commitments: Vec::new(),
             follow_up_policy: None,
             operation_state: None,
@@ -1106,6 +1103,8 @@ mod tests {
             operation_policy: Document::new(),
             profile_attributes: Document::new(),
             profile_updated_at: None,
+            domain_attributes: None,
+            domain_attributes_updated_at: None,
             last_message_at: None,
             last_inbound_at: None,
             last_outbound_at: None,
@@ -1128,6 +1127,28 @@ mod tests {
 
     fn dt(ms: i64) -> DateTime {
         DateTime::from_millis(ms)
+    }
+
+    fn attrs_with_stage(stage: &str) -> Document {
+        let mut d = Document::new();
+        d.insert("customer_stage", stage);
+        d.insert("customer_stage_updated_at", DateTime::from_millis(0));
+        d
+    }
+
+    fn attrs_with_stage_updated(stage: &str, updated_at_ms: i64) -> Document {
+        let mut d = Document::new();
+        d.insert("customer_stage", stage);
+        d.insert("customer_stage_updated_at", DateTime::from_millis(updated_at_ms));
+        d
+    }
+
+    fn attrs_with_stage_intent(stage: &str, intent: &str) -> Document {
+        let mut d = Document::new();
+        d.insert("customer_stage", stage);
+        d.insert("customer_stage_updated_at", DateTime::from_millis(0));
+        d.insert("intent_level", intent);
+        d
     }
 
     // -----------------------------------------------------------------
@@ -1366,8 +1387,6 @@ mod tests {
     fn stage_stagnation_excludes_terminal_stage() {
         let now = DateTime::now();
         let contact = Contact {
-            customer_stage: Some("closed_won".to_string()),
-            customer_stage_updated_at: Some(dt(now.timestamp_millis() - 30 * 24 * 60 * 60 * 1000)),
             last_inbound_at: Some(dt(now.timestamp_millis() - 30 * 24 * 60 * 60 * 1000)),
             ..template()
         };
@@ -1378,8 +1397,6 @@ mod tests {
     fn stage_stagnation_excludes_recent_inbound() {
         let now = DateTime::now();
         let contact = Contact {
-            customer_stage: Some("qualified".to_string()),
-            customer_stage_updated_at: Some(dt(now.timestamp_millis() - 30 * 24 * 60 * 60 * 1000)),
             last_inbound_at: Some(dt(now.timestamp_millis() - 60 * 60 * 1000)),
             // 通过 last_outbound>=last_inbound 路径排除（与 silent 段同款 in-memory 检查）。
             last_outbound_at: Some(dt(now.timestamp_millis())),
@@ -1392,9 +1409,8 @@ mod tests {
     fn stage_stagnation_triggers_on_threshold() {
         let now = DateTime::now();
         let contact = Contact {
-            customer_stage: Some("qualified".to_string()),
-            customer_stage_updated_at: Some(dt(now.timestamp_millis() - 30 * 24 * 60 * 60 * 1000)),
             last_inbound_at: Some(dt(now.timestamp_millis() - 30 * 24 * 60 * 60 * 1000)),
+            domain_attributes: Some(attrs_with_stage("discovery")),
             ..template()
         };
         assert!(stage_stagnation_passes_in_memory(&contact, now));
@@ -1404,8 +1420,6 @@ mod tests {
     fn stage_stagnation_excludes_when_no_stage() {
         let now = DateTime::now();
         let contact = Contact {
-            customer_stage: None,
-            customer_stage_updated_at: Some(dt(now.timestamp_millis() - 30 * 24 * 60 * 60 * 1000)),
             last_inbound_at: Some(dt(now.timestamp_millis() - 30 * 24 * 60 * 60 * 1000)),
             ..template()
         };
@@ -1416,8 +1430,6 @@ mod tests {
     fn stage_stagnation_excludes_when_no_updated_at() {
         let now = DateTime::now();
         let contact = Contact {
-            customer_stage: Some("qualified".to_string()),
-            customer_stage_updated_at: None,
             last_inbound_at: Some(dt(now.timestamp_millis() - 30 * 24 * 60 * 60 * 1000)),
             ..template()
         };
@@ -1481,11 +1493,11 @@ mod tests {
         let due = now_ms - 1_000;
         let target = make_target("x", due, CommitmentReason::Overdue);
         let high = Contact {
-            customer_stage: Some("negotiation".to_string()),
+            domain_attributes: Some(attrs_with_stage("negotiation")),
             ..template()
         };
         let low = Contact {
-            customer_stage: Some("awareness".to_string()),
+            domain_attributes: Some(attrs_with_stage("awareness")),
             ..template()
         };
         assert!(
@@ -1501,13 +1513,11 @@ mod tests {
         let due = now_ms - 1_000;
         let target = make_target("x", due, CommitmentReason::Overdue);
         let hot = Contact {
-            customer_stage: Some("qualified".to_string()),
-            intent_level: Some("hot".to_string()),
+            domain_attributes: Some(attrs_with_stage_intent("qualified", "hot")),
             ..template()
         };
         let cold = Contact {
-            customer_stage: Some("qualified".to_string()),
-            intent_level: Some("cold".to_string()),
+            domain_attributes: Some(attrs_with_stage_intent("qualified", "cold")),
             ..template()
         };
         assert!(commitment_priority_key(&hot, &target) < commitment_priority_key(&cold, &target));
@@ -1518,8 +1528,6 @@ mod tests {
     fn commitment_priority_earlier_due_first() {
         let now_ms: i64 = 10_000_000;
         let contact = Contact {
-            customer_stage: Some("qualified".to_string()),
-            intent_level: Some("warm".to_string()),
             ..template()
         };
         let early = make_target("e", now_ms - 5_000, CommitmentReason::Overdue);
@@ -1532,14 +1540,13 @@ mod tests {
     fn stage_stagnation_priority_higher_value_first() {
         let now_ms: i64 = 30 * 24 * 60 * 60 * 1000;
         let updated = dt(0);
+        let _ = updated;
         let high = Contact {
-            customer_stage: Some("negotiation".to_string()),
-            customer_stage_updated_at: Some(updated),
+            domain_attributes: Some(attrs_with_stage_updated("negotiation", 0)),
             ..template()
         };
         let low = Contact {
-            customer_stage: Some("discovery".to_string()),
-            customer_stage_updated_at: Some(updated),
+            domain_attributes: Some(attrs_with_stage_updated("discovery", 0)),
             ..template()
         };
         assert!(
@@ -1554,13 +1561,14 @@ mod tests {
     fn stage_stagnation_priority_more_stagnant_first() {
         let now_ms: i64 = 30 * 24 * 60 * 60 * 1000;
         let stale_30d = Contact {
-            customer_stage: Some("qualified".to_string()),
-            customer_stage_updated_at: Some(dt(0)),
+            domain_attributes: Some(attrs_with_stage_updated("qualified", 0)),
             ..template()
         };
         let stale_15d = Contact {
-            customer_stage: Some("qualified".to_string()),
-            customer_stage_updated_at: Some(dt(15 * 24 * 60 * 60 * 1000)),
+            domain_attributes: Some(attrs_with_stage_updated(
+                "qualified",
+                15 * 24 * 60 * 60 * 1000,
+            )),
             ..template()
         };
         assert!(

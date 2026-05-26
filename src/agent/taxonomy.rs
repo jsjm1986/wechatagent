@@ -680,4 +680,58 @@ mod tests {
         assert_eq!(TaxonomyKind::IntentLevel.as_str(), "intent_level");
         assert_eq!(TaxonomyKind::ObjectionType.as_str(), "objection_type");
     }
+
+    /// Phase A6: `taxonomy_candidate_persisted_on_unknown_value`
+    /// 验证：当用户对话使用了不在 `system_taxonomies` 中的 `customer_stage / intent_level
+    /// / objection_type` 取值时，`check_value` 必须返回 `CandidateNew`——这是
+    /// `enforce_decision_taxonomy_guards` 决定写入 `taxonomy_candidates` 候选队列的契约信号。
+    /// 同时校验已知 active 值不会落入候选路径。
+    #[test]
+    fn taxonomy_candidate_persisted_on_unknown_value() {
+        let cache = make_cache_with_entries(vec![
+            make_entry("global", "customer_stage", "first_contact", &["新客"], "active"),
+            make_entry("global", "intent_level", "hot", &["高意向"], "active"),
+            make_entry("global", "objection_type", "price", &["价格异议"], "active"),
+        ]);
+
+        // 三类未知值都应判为 CandidateNew（由调用方写入 taxonomy_candidates）。
+        let unknown_stage =
+            check_value(TaxonomyKind::CustomerStage, "未知阶段_xx", "acct-1", &cache);
+        let unknown_intent =
+            check_value(TaxonomyKind::IntentLevel, "lukewarm_xx", "acct-1", &cache);
+        let unknown_objection =
+            check_value(TaxonomyKind::ObjectionType, "全新异议_xx", "acct-1", &cache);
+        assert_eq!(unknown_stage, TaxonomyMatch::CandidateNew);
+        assert_eq!(unknown_intent, TaxonomyMatch::CandidateNew);
+        assert_eq!(unknown_objection, TaxonomyMatch::CandidateNew);
+
+        // 已知 active 值不进候选。
+        let known = check_value(TaxonomyKind::CustomerStage, "first_contact", "acct-1", &cache);
+        assert_eq!(known, TaxonomyMatch::Active);
+    }
+
+    /// Phase A6: `taxonomy_init_runs_at_startup`
+    /// 验证：进程级单例 `GLOBAL_TAXONOMY_CACHE` 唯一可达；`init_global_taxonomy_cache`
+    /// 与 `invalidate_global_taxonomy_cache` 都通过 `global_taxonomy_cache()` 操作同一句柄
+    /// （`main.rs` 启动序列依赖该 invariant）。
+    #[test]
+    fn taxonomy_init_runs_at_startup() {
+        let h1 = global_taxonomy_cache();
+        let h2 = global_taxonomy_cache();
+        assert!(Arc::ptr_eq(&h1, &h2), "单例 Arc 必须同源");
+
+        // invalidate 必须真正落到同一句柄上（清空内部 fetched_at）。
+        {
+            let mut inner = h1.inner.lock();
+            inner.fetched_at = Some(Instant::now());
+        }
+        invalidate_global_taxonomy_cache();
+        {
+            let inner = h2.inner.lock();
+            assert!(
+                inner.fetched_at.is_none(),
+                "invalidate 应通过单例清空 fetched_at"
+            );
+        }
+    }
 }

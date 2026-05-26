@@ -3,14 +3,14 @@
 #
 # CI baseline verification (Linux / CI / bash).
 # 关联：requirements.md R11.6 — 升级合并前 CI 必须跑：
-#   - `cargo test --lib`：总通过数 >= 78（升级前基线），0 失败
+#   - `cargo test --lib`：总通过数 >= 350（knowledge cleanup 后基线），0 失败
 #   - 4 个 PBT 文件累计通过数 >= 33（升级前基线 6+9+6+12），0 失败
-#     (state_transition_pbt / memory_card_invariants / string_fact_risk_guard / llm_retry_jitter)
+#     (state_transition_pbt / memory_card_invariants / wiki_chunk_revision_pbt / llm_retry_jitter)
 # 任一不达标即 exit 1。
 
 set -euo pipefail
 
-LIB_BASELINE=78
+LIB_BASELINE=350
 PBT_BASELINE=33
 
 parse_passed() {
@@ -56,7 +56,7 @@ echo "[baseline] step 2/2: cargo test 4 PBT files ..."
 cargo test \
     --test state_transition_pbt \
     --test memory_card_invariants \
-    --test string_fact_risk_guard \
+    --test wiki_chunk_revision_pbt \
     --test llm_retry_jitter 2>&1 | tee "$PBT_LOG" || true
 PBT_PASSED=$(parse_passed "$PBT_LOG")
 PBT_FAILED=$(parse_failed "$PBT_LOG")

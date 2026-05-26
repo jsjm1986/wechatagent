@@ -890,15 +890,9 @@ pub struct ReviewScores {
     #[serde(default, deserialize_with = "number_i32")]
     pub emotional_value: i32,
     #[serde(default, deserialize_with = "number_i32")]
-    pub product_accuracy: i32,
+    pub hallucination_score: i32,
     #[serde(default, deserialize_with = "number_i32")]
-    pub relationship_progress: i32,
-    #[serde(default, deserialize_with = "number_i32")]
-    pub conversion_readiness: i32,
-    #[serde(default, deserialize_with = "number_i32")]
-    pub pressure_risk: i32,
-    #[serde(default, deserialize_with = "number_i32")]
-    pub fact_risk: i32,
+    pub knowledge_grounding_score: i32,
 }
 
 #[derive(Debug, Serialize, Deserialize, Default, Clone)]
