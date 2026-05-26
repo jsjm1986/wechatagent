@@ -335,3 +335,82 @@ external DeepSeek API
 - 多实例部署
 - webhook 签名校验
 - 日志/指标采集
+
+## Phase 0 → E3 时代图（updated）
+
+本节是 `## Webhook Flow` / `## Worker Flow` 之后的补丁——把 Phase 0 → E3 的实际链路落到一处。两份原图保留了"当前最小可运行链路"的语义；本节描绘的是 reaction / outbox / multi-account / multi-locale 全部接通后的真实形态。
+
+### 私聊 Webhook Flow（全链路）
+
+```text
+POST /webhooks/wechat
+→ 解析 appId / fromWxid / content / msgId（参考 webhooks.rs:45-295）
+→ account_scheduler::resolve_account_context 选 persona/capacity/off_hours 命中的账号
+→ 持久化 inbound message
+→ 若 contact.agent_status != managed → 停止（只持久化）
+→ run_user_operation_gateway:
+  1. reload 联系人 + 历史 + 三类 prompt（locale-aware：load_prompt_for_contact 按
+     contact.locale 选 prompt_template 版本，未命中 fallback 到 zh-CN）
+  2. enforce_decision_guards 三闸：grounding / hallucination / run_budget
+     +（Phase B）双软闸：human_like / pressure_risk → 触发 single-shot revision
+     +（Phase A）taxonomy::check_value 校验 customer_stage / intent_level / objection_type，
+       未命中走 taxonomy::upsert_candidate（不阻塞 run）
+     +（Phase B）operation_state_policies forbidden 拦截
+  3. knowledge_router：catalog → list_chunks → open_slice
+     +（Phase B）按 chunk_type 分段拼接（product_fact verified-only / style_template few-shot
+       / negative_example don't-do / peer_case reference）
+     +（Phase D）拼接 contact.intent_trajectory 近 5 项
+     +（Phase A）注入 reaction_analysis 近 3 轮 + load_operator_memory
+  4. decide_reply_with_promote → review_decision（reviewer 输入遮蔽 draft.reasoning）
+  5. （Phase D）style_consistency_check：与 contact.last_outbound_style 比对，差异≥3/5 axes
+     时强制 single-shot revision
+  6. approved → agent_send_outbox enqueue（idempotency key）→ 二次安全门 → MCP message_send_text
+→ 写 agent_run_logs（lifecycle 走 update_run_envelope_terminal，闭集校验）
+→ reaction_phase 异步：record_user_reaction 写 reaction_analysis +
+  reviewer_misjudge_signal + intent_trajectory.push（cap 50） + last_outbound_style 回写
+```
+
+### Worker Flow（多 worker 并行）
+
+```text
+tokio::spawn 主进程内 8 条 loop（启停由 env / mongo flag 控制）：
+
+1. tasks::worker_loop                  follow-up task 调度，走同一 gateway
+2. outbox_dispatcher::run_outbox_dispatcher  五状态机 + idempotency + retry/backoff
+3. planner::run_strategic_planner_loop  M3 strategic planner（commitment due / silent followup）
+4. evolution::worker（EVOLUTION_ENABLED=true 时启）  threshold / prompt 灰度 + post_release
+5. knowledge_wiki::feedback_worker      30d 滑窗 usage_stats / dynamic_confidence + structural lint
+                                        + sweep_stale_signals + lessons_learned 14d 聚合
+6. catalog_rebuild_worker               documents.catalog_summary_persisted 增量重写
+7. knowledge_digest::run_loop           日报工作站（chat-only async tools）
+8. cold_contact_worker                  按 last_outbound_at 阈值挑联系人 → peer_case 钩子重激活
+                                        （COLD_CONTACT_WORKER_ENABLED env 开关，默认 false）
+```
+
+### Phase 0 → E3 新增 collection / 字段速查
+
+| 范畴 | collection / 字段 | 来源 |
+| --- | --- | --- |
+| FSM 闭集 | `agent_run_logs.lifecycle / final_review_status / gateway_status`（assert_*_valid 守门） | Phase 0 |
+| 反馈信号 | `decision_reviews.reaction_analysis` 用于下轮 prompt | Phase A |
+| 操作员记忆 | `load_operator_memory` 在 build_context 阶段注入 | Phase A |
+| 双层标签 | `system_taxonomies` + `taxonomy_candidates` | Phase A |
+| 双闸 | `human_like_gate` / `pressure_risk_gate` 软闸 + 阈值 | Phase B |
+| 知识用途 | `OperationKnowledgeChunk.chunk_type` 4 类 | Phase B |
+| 状态策略 | `operation_state_policies` collection | Phase B |
+| 误判信号 | `decision_reviews.reviewer_misjudge_signal` + `reviewer_stats` | Phase C |
+| 演化 flag | `evolution_runtime_flags` collection | Phase C |
+| 阈值历史 | `threshold_overrides` + `threshold_overrides_audit` | Phase C |
+| 多版本 prompt | `prompt_templates` 多 active + soft-retire `current_version` | Phase C |
+| 意图轨迹 | `Contact.intent_trajectory: Vec<IntentTrajectoryEntry>` cap 50 | Phase D |
+| 风格指纹 | `Contact.last_outbound_style: Option<String>` | Phase D |
+| 多账号 | `WechatAccount.{capacity, persona_tag, off_hours}` | Phase D |
+| 跨用户教训 | `lessons_learned` collection（pending_review → peer_case chunk 候选池） | Phase D |
+| 多 locale | `Contact.locale` + `PromptTemplate.locale`（BCP-47，默认 zh-CN） | Phase E3 |
+
+### 模块隔离红线（不变）
+
+- `crate::knowledge_wiki::*` 严禁引用 `crate::agent::gateway / outbox`、`crate::mcp::*`、`agent_send_outbox`、`run_user_operation_gateway`。
+- `crate::evolution::*` 严禁引用 `crate::agent::gateway / outbox`、`crate::mcp::*`。
+- group / moments domain 永远不折叠到 user-ops 代码路径（CLAUDE.md 红线）。当落地时通过 `trait OpsDomain`（Phase E1，留待第二个 domain 真实需求驱动）分发，user-ops 为第一实现。
+
