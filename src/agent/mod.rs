@@ -104,15 +104,8 @@ pub(crate) use memory::{load_operator_memory, record_operator_memory};
 // knowledge-digest-workstation Phase 5：chat 多轮工具循环 + 7 个 chat 工具
 // 派发器（含 4 个 chat-only async tool）。仅供 routes::knowledge 内部使用，
 // 永不进 user-ops gateway。
-pub(crate) use chat_tool_loop::{
-    chat_reply_with_tools_loop, ChatReplyFn, ChatReplyResult, ChatToolLoopError,
-    ChatToolLoopOutcome, CHAT_TOOL_LOOP_MAX_LOOPS,
-};
-pub(crate) use knowledge_tools::{
-    AnchorMatchFn, ALLOWED_CHAT_TOOL_NAMES, TOOL_ANALYZE_LOGS, TOOL_AUDIT_COMPLETENESS,
-    TOOL_INSPECT_PACK, TOOL_LIST_CATALOG, TOOL_OPEN_DOCUMENT, TOOL_OPEN_SLICE,
-    TOOL_PROPOSE_REPAIR, TOOL_SEARCH, TOOL_SEARCH_CHUNKS, TOOL_VERIFY_ANCHOR,
-};
+pub(crate) use chat_tool_loop::{chat_reply_with_tools_loop, ChatReplyFn, ChatToolLoopError};
+pub(crate) use knowledge_tools::{AnchorMatchFn, ALLOWED_CHAT_TOOL_NAMES};
 
 // Task 24：测试可用的 PBT 入口（pure functions，无副作用）。
 pub use guards::check_state_transition;

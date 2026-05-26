@@ -502,12 +502,6 @@ pub struct FinalizeOutcome {
 ///   的协议违规标签（如 `missing_required_field:* / invalid_enum_value:* /
 ///   invalid_type:* / decision_phase_invalid:* /
 ///   insufficient_detail_in_critical_turn:*`）。
-/// ISSUE-003 (R13) stub: 真正实现已随旧 sales 守卫一起删除，
-/// commit 3 在 wiki 闸架下重写 review.rs 时再补；保留签名避免 callers 编译失败。
-pub(crate) fn inbound_has_no_product_marker(_inbound_text: &str) -> bool {
-    false
-}
-
 pub fn finalize_review_for_send(
     review: DecisionReviewResult,
     decision: &mut AgentDecision,

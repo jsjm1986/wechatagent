@@ -28,6 +28,7 @@ use super::AppState;
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[allow(dead_code)] // HTTP schema：保留兼容旧前端 410 占位 endpoint query
 pub(super) struct OperationKnowledgeQuery {
     account_id: Option<String>,
     category: Option<String>,
@@ -84,6 +85,7 @@ pub(super) struct OperationKnowledgeDocumentRequest {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[allow(dead_code)] // HTTP schema：保留兼容旧前端 410 占位 endpoint payload
 pub(super) struct OperationKnowledgeRequest {
     account_id: Option<String>,
     /// 父文档 ObjectId 字符串（import-apply 自动注入；直接 PUT/POST 时可为空）。
@@ -142,6 +144,7 @@ pub(super) struct OperationKnowledgeRequest {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[allow(dead_code)] // HTTP schema：routing_card / forbidden_claims 字段保留前端兼容
 pub(super) struct OperationKnowledgeChunkRequest {
     account_id: Option<String>,
     document_id: Option<String>,
@@ -1805,12 +1808,7 @@ pub(super) fn normalize_knowledge_tags(
     out
 }
 
-pub(super) fn validate_operation_knowledge(payload: &OperationKnowledgeRequest) -> AppResult<()> {
-    if payload.title.trim().is_empty() {
-        return Err(AppError::BadRequest("title is required".to_string()));
-    }
-    Ok(())
-}pub(super) fn validate_operation_knowledge_document(
+pub(super) fn validate_operation_knowledge_document(
     payload: &OperationKnowledgeDocumentRequest,
 ) -> AppResult<()> {
     if payload.title.trim().is_empty() {

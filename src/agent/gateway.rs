@@ -30,7 +30,6 @@ use crate::mcp;
 use crate::models::{
     AgentDecisionReview, AgentEvent, AgentRunLog, AgentStatus, AgentTask, Contact,
     ConversationMessage, MessageDirection, OperationDomainConfig, OperationPlaybook,
-    OperationStatePolicy,
 };
 use crate::prompts;
 use crate::routes::AppState;

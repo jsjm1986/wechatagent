@@ -19,20 +19,14 @@
 //! `OutboxDispatcher` 持有的 `process_entry` / `cancel_for_contact_on_user_reaction`
 //! 等私有方法。
 
-use std::sync::Arc;
-use std::time::Duration;
-
 use futures::TryStreamExt;
-use mongodb::bson::{doc, oid::ObjectId, Bson, DateTime, Document};
+use mongodb::bson::{doc, oid::ObjectId, DateTime, Document};
 use mongodb::error::{ErrorKind, WriteFailure};
-use mongodb::options::{FindOneAndUpdateOptions, FindOptions, ReturnDocument};
-use serde_json::json;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::error::{AppError, AppResult};
-use crate::mcp;
-use crate::models::{AgentEvent, Contact, OutboxEntry};
+use crate::models::{AgentEvent, OutboxEntry};
 use crate::routes::AppState;
 
 // ── 状态枚举 ────────────────────────────────────────────────────────────
