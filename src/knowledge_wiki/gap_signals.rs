@@ -327,10 +327,24 @@ impl GapSignalCandidate {
         }
     }
 
-    /// `(workspace_id, kind, normalized_title)` 是去重键。
+    /// 去重键：默认 `(kind, normalized_title)`；但 broken_link / missing_chunk
+    /// 是同一对 (from_chunk_id, target_chunk_id) 在 archive↔active 切换下的孪
+    /// 生信号，必须把 dedup key 绑到具体的引用对上（用 affected_chunk_ids 前两
+    /// 项），并对这两类共享同一前缀 `link::from::to`，确保 archive 切换时不会
+    /// 产生重复信号；sweep 阶段也据此双向 resolve。
     pub fn dedup_key(&self) -> String {
-        format!("{}::{}", self.kind, normalize_title(&self.title))
+        signal_dedup_key(&self.kind, &self.title, &self.affected_chunk_ids)
     }
+}
+
+/// 与 [`GapSignalCandidate::dedup_key`] 同语义，可直接作用在已落库的
+/// [`KnowledgeGapSignal`] 上 —— `persist_signals` 加载现有 pending 信号时用它
+/// 还原 dedup key，与候选信号 1:1 对账。
+pub(crate) fn signal_dedup_key(kind: &str, title: &str, affected: &[String]) -> String {
+    if matches!(kind, "broken_link" | "missing_chunk") && affected.len() >= 2 {
+        return format!("link::{}::{}", affected[0], affected[1]);
+    }
+    format!("{}::{}", kind, normalize_title(title))
 }
 
 /// 把候选信号写库（去重 + stage 1 sweep + 落 pending）。
@@ -357,7 +371,7 @@ pub async fn persist_signals(
 
     let mut pending_by_key: HashMap<String, KnowledgeGapSignal> = HashMap::new();
     for s in pending {
-        let key = format!("{}::{}", s.kind, normalize_title(&s.title));
+        let key = signal_dedup_key(&s.kind, &s.title, &s.affected_chunk_ids);
         pending_by_key.insert(key, s);
     }
 
@@ -634,6 +648,43 @@ pub async fn sweep_stale_signals(
         }
     }
 
+    // incoming：chunk_id_hex -> 入链次数（来自所有 active chunk 的 related_chunks）。
+    // 给 orphan arm 用：当前 30d 命中或恢复入链，即视为不再孤立。
+    let mut incoming: HashMap<String, i64> = HashMap::new();
+    for c in &chunks {
+        if let Some(refs) = c.related_chunks.as_ref() {
+            for r in refs {
+                *incoming.entry(r.chunk_id.clone()).or_default() += 1;
+            }
+        }
+    }
+
+    // chunk_view：chunk_id_hex -> (wiki_type, has_outlinks, dynamic_confidence, hit_30d)。
+    // 给 no_outlinks / low_confidence arm 用，避免每次扫描全 chunk。
+    let mut chunk_view: HashMap<String, (Option<String>, bool, Option<f64>, i64)> = HashMap::new();
+    for c in &chunks {
+        let Some(id) = c.id.as_ref() else { continue };
+        let has_outlinks = c
+            .related_chunks
+            .as_ref()
+            .map(|v| !v.is_empty())
+            .unwrap_or(false);
+        let hits = c
+            .usage_stats
+            .as_ref()
+            .map(|s| s.hit_count_30d as i64)
+            .unwrap_or(0);
+        chunk_view.insert(
+            id.to_hex(),
+            (
+                c.wiki_type.clone(),
+                has_outlinks,
+                c.dynamic_confidence,
+                hits,
+            ),
+        );
+    }
+
     let now = DateTime::now();
     let pending_cursor = db
         .knowledge_gap_signals()
@@ -651,13 +702,26 @@ pub async fn sweep_stale_signals(
         // (resolved, resolution_note)：resolution_note 落库时区分各 kind 自愈原因。
         let outcome: Option<&'static str> = match sig.kind.as_str() {
             "broken_link" => {
-                // 末位 affected_chunk_ids 是 target id；目标恢复即视为修复
+                // affected_chunk_ids = [from_id, target_id]：
+                // - target 恢复 active → 链已修复
+                // - 引用源 from 自己 archived → 信号无意义（与 missing_chunk arm 对称）
+                let from_archived = sig
+                    .affected_chunk_ids
+                    .first()
+                    .map(|src| !known_ids.contains(src))
+                    .unwrap_or(false);
                 let recovered = sig
                     .affected_chunk_ids
                     .last()
                     .map(|t| known_ids.contains(t))
                     .unwrap_or(false);
-                if recovered { Some("rule:link_recovered") } else { None }
+                if recovered {
+                    Some("rule:link_recovered")
+                } else if from_archived {
+                    Some("rule:source_archived")
+                } else {
+                    None
+                }
             }
             "missing_chunk" => {
                 // 末位是已 archived 的 target id；当它重新进 active → 视为依赖恢复。
@@ -711,6 +775,69 @@ pub async fn sweep_stale_signals(
                     }
                 };
                 if resolved { Some("rule:contradiction_resolved") } else { None }
+            }
+            "orphan" => {
+                // chunk 拿到入链或 30d 命中，或自身已 archived → 信号失效。
+                if let Some(target) = sig.affected_chunk_ids.first() {
+                    if !known_ids.contains(target) {
+                        Some("rule:chunk_archived")
+                    } else if incoming.get(target).copied().unwrap_or(0) > 0 {
+                        Some("rule:incoming_restored")
+                    } else if chunk_view.get(target).map(|v| v.3 > 0).unwrap_or(false) {
+                        Some("rule:hits_restored")
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            }
+            "no_outlinks" => {
+                // chunk 已补出链 / 改了 wiki_type 不再要求出链 / 自身 archived → 失效。
+                if let Some(target) = sig.affected_chunk_ids.first() {
+                    if !known_ids.contains(target) {
+                        Some("rule:chunk_archived")
+                    } else if let Some((wt, has_outlinks, _, _)) = chunk_view.get(target) {
+                        let still_required = wt
+                            .as_deref()
+                            .map(|t| OUTLINK_REQUIRED_TYPES.contains(&t))
+                            .unwrap_or(false);
+                        if !still_required {
+                            Some("rule:type_changed")
+                        } else if *has_outlinks {
+                            Some("rule:outlinks_added")
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            }
+            "low_confidence" => {
+                // dynamic_confidence 已回到阈值之上 / 30d 命中归零 / 自身 archived → 失效。
+                if let Some(target) = sig.affected_chunk_ids.first() {
+                    if !known_ids.contains(target) {
+                        Some("rule:chunk_archived")
+                    } else if let Some((_, _, conf, hits)) = chunk_view.get(target) {
+                        let lifted = conf
+                            .map(|s| s >= LOW_CONFIDENCE_THRESHOLD)
+                            .unwrap_or(false);
+                        if lifted {
+                            Some("rule:confidence_lifted")
+                        } else if *hits == 0 {
+                            Some("rule:no_recent_hits")
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
             }
             _ => None,
         };

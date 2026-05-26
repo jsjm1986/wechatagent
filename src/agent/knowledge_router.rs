@@ -433,30 +433,57 @@ pub(crate) async fn route_operation_knowledge(
         .filter(|q| !q.quote.trim().is_empty())
         .map(|q| q.quote.clone())
         .collect();
-    let knowledge_coverage = if cited_in_corpus.is_empty() {
-        "missing".to_string()
+    let mut tool_trace = answer.tool_trace.clone();
+
+    // fallback_rank：当 agent 在预算内未给出 cited（budget 早早耗尽 / 3 轮兜底空集
+    // / agent 显式返回 0 cited）时，按 `wiki_type_priority × dynamic_confidence`
+    // 在已加载的 verified corpus 上做静态排序，取 top-N 作为弱证据回填，避免下游
+    // grounding 闸直接 missing。回填时显式标 `risk_level=medium` 与 tool_trace
+    // `fallback=rank`，让 Reply Agent / 审计感知"这是弱兜底而非 agent 推理结果"。
+    const FALLBACK_TOP_N: usize = 5;
+    let (selected_chunk_ids, knowledge_coverage, risk_level) = if cited_in_corpus.is_empty() {
+        let mut ranked: Vec<&OperationKnowledgeChunk> = knowledge.chunks.iter().collect();
+        ranked.sort_by(|a, b| {
+            let pa = super::knowledge_agent::wiki_type_priority(a.wiki_type.as_deref());
+            let pb = super::knowledge_agent::wiki_type_priority(b.wiki_type.as_deref());
+            let ca = a.dynamic_confidence.unwrap_or(0.0);
+            let cb = b.dynamic_confidence.unwrap_or(0.0);
+            pb.cmp(&pa)
+                .then_with(|| cb.partial_cmp(&ca).unwrap_or(std::cmp::Ordering::Equal))
+        });
+        let fallback_ids: Vec<String> = ranked
+            .iter()
+            .take(FALLBACK_TOP_N)
+            .filter_map(|c| c.id.map(|oid| oid.to_hex()))
+            .collect();
+        if fallback_ids.is_empty() {
+            // corpus 也空 — 维持 missing。
+            (Vec::new(), "missing".to_string(), "medium".to_string())
+        } else {
+            tool_trace.push(doc! {
+                "tool": "fallback_rank",
+                "reason": "agent_returned_zero_cited",
+                "selected": fallback_ids.len() as i32,
+            });
+            (fallback_ids, "weak".to_string(), "medium".to_string())
+        }
     } else if evidence_excerpts.is_empty() {
-        "weak".to_string()
+        (cited_in_corpus, "weak".to_string(), "low".to_string())
     } else {
-        "enough".to_string()
-    };
-    let risk_level = if cited_in_corpus.is_empty() {
-        "medium".to_string()
-    } else {
-        "low".to_string()
+        (cited_in_corpus, "enough".to_string(), "low".to_string())
     };
     let route = KnowledgeRouteResult {
         needed_categories: Vec::new(),
         selected_knowledge_ids: Vec::new(),
         selected_document_ids: Vec::new(),
-        selected_chunk_ids: cited_in_corpus,
+        selected_chunk_ids,
         selected_slice_reasons: Vec::new(),
         risk_level,
         requires_evidence: !evidence_excerpts.is_empty(),
         knowledge_coverage,
         missing_knowledge: Vec::new(),
         reason: answer.answer.clone(),
-        tool_trace: answer.tool_trace.clone(),
+        tool_trace,
         evidence_excerpts,
     };
     Ok(route)

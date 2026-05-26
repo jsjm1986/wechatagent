@@ -136,20 +136,36 @@ impl TaxonomyCache {
         Ok(())
     }
 
+    /// TTL 自愈判定：fetched_at 缺失（从未加载）或距今 ≥ TAXONOMY_CACHE_TTL → true。
+    ///
+    /// 抽出独立函数让 lib-level 单测（无 Docker 环境）能直接断言"warm_up 之后
+    /// 30s 内 stale=false / 30s 后 stale=true"的 TTL 自愈语义；`find_or_load` 走
+    /// 同一判定避免双份口径。
+    pub(crate) fn is_stale(&self) -> bool {
+        let inner = self.inner.lock();
+        match inner.fetched_at {
+            Some(t) => t.elapsed() >= TAXONOMY_CACHE_TTL,
+            None => true,
+        }
+    }
+
     /// 查找或自动加载（TTL 过期 → 异步加载）。
     /// 注意：本方法保持调用方 `&self`，内部异步加载完成后写回 inner。
     pub(crate) async fn find_or_load(&self, db: &Database) {
-        let needs_reload = {
-            let inner = self.inner.lock();
-            match inner.fetched_at {
-                Some(t) => t.elapsed() >= TAXONOMY_CACHE_TTL,
-                None => true,
-            }
-        };
-        if needs_reload {
+        if self.is_stale() {
             if let Err(error) = self.reload_from_db(db).await {
                 tracing::warn!(?error, "TaxonomyCache.reload_from_db failed");
             }
+        }
+    }
+
+    /// test-only：把 `fetched_at` 强制回拨指定时长，模拟"距上次加载已经过 N"，
+    /// 让 [`Self::is_stale`] 的 TTL 判定可以在不真等 30s 的前提下被验证。
+    #[cfg(test)]
+    pub(crate) fn rewind_fetched_at_for_test(&self, dur: Duration) {
+        let mut inner = self.inner.lock();
+        if let Some(t) = inner.fetched_at {
+            inner.fetched_at = Some(t.checked_sub(dur).unwrap_or(t));
         }
     }
 }
@@ -699,5 +715,79 @@ mod tests {
                 "invalidate 应通过单例清空 fetched_at"
             );
         }
+    }
+
+    /// Phase A 落地验证 / `taxonomy_cache_stale_when_never_fetched`
+    ///
+    /// 新建的 cache 还没被 warm_up / find_or_load 触达过，is_stale 必须为 true，
+    /// 让首条决策走 find_or_load 时立即 reload，不会用空表去判 CandidateNew。
+    #[test]
+    fn taxonomy_cache_stale_when_never_fetched() {
+        let cache = TaxonomyCache::new();
+        assert!(cache.is_stale(), "fresh cache should be stale");
+    }
+
+    /// Phase A 落地验证 / `taxonomy_cache_not_stale_immediately_after_load`
+    ///
+    /// `make_cache_with_entries` 内部把 fetched_at 设为 Instant::now()，模拟刚从 DB
+    /// 拉完的状态；is_stale 必须为 false，避免每条决策都 reload 把 30s TTL 摊销变零。
+    #[test]
+    fn taxonomy_cache_not_stale_immediately_after_load() {
+        let cache = make_cache_with_entries(vec![make_entry(
+            "global",
+            "customer_stage",
+            "first_contact",
+            &[],
+            "active",
+        )]);
+        assert!(
+            !cache.is_stale(),
+            "freshly-loaded cache should NOT be stale within TTL window"
+        );
+    }
+
+    /// Phase A 落地验证 / `taxonomy_cache_self_heals_after_ttl`
+    ///
+    /// 这是 CLAUDE.md 硬规则"unreviewed candidates must not block runs"在 cache 维度
+    /// 的兜底契约：admin 长期未触发 invalidate 也不会让 cache 永远 stale —— TTL=30s
+    /// 一过，下次 find_or_load 自动 reload。本测用 `rewind_fetched_at_for_test` 把
+    /// 加载时间回拨到 31s 前，断言 is_stale 翻转为 true（reload 副作用本身要 DB，
+    /// 留给 #[ignore] 集成测试覆盖）。
+    #[test]
+    fn taxonomy_cache_self_heals_after_ttl() {
+        let cache = make_cache_with_entries(vec![make_entry(
+            "global",
+            "customer_stage",
+            "first_contact",
+            &[],
+            "active",
+        )]);
+        assert!(!cache.is_stale());
+        cache.rewind_fetched_at_for_test(TAXONOMY_CACHE_TTL + Duration::from_secs(1));
+        assert!(
+            cache.is_stale(),
+            "cache fetched > TTL ago should report stale, triggering find_or_load reload"
+        );
+    }
+
+    /// Phase A 落地验证 / `taxonomy_cache_invalidate_marks_stale`
+    ///
+    /// admin 写一条 system_taxonomies 后调 invalidate，紧接着的下一次 is_stale 必须
+    /// 为 true，保证后台改动至少一次 reload 才能反映到决策路径（与 30s TTL 兜底解耦）。
+    #[test]
+    fn taxonomy_cache_invalidate_marks_stale() {
+        let cache = make_cache_with_entries(vec![make_entry(
+            "global",
+            "customer_stage",
+            "first_contact",
+            &[],
+            "active",
+        )]);
+        assert!(!cache.is_stale());
+        cache.invalidate();
+        assert!(
+            cache.is_stale(),
+            "invalidate must trigger reload on next find_or_load"
+        );
     }
 }

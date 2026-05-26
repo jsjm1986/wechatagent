@@ -571,7 +571,16 @@ async fn run_user_operation_gateway_inner(
     };
     let mut final_decision = decision;
 
-    if final_decision.should_reply && !review_passed(&review, &runtime) {
+    if final_decision.should_reply
+        && !review_passed(&review, &runtime)
+        && !review.needs_revision
+    {
+        // Phase B / B1：`needs_revision=true` 表示 [`route_dual_gate`] 已经
+        // 把当前 review 标为软闸-only 失败，应走 finalize 之后的 single-shot
+        // revision 通道（decide_revision Proceed），而不是这里的 rewrite 路径
+        // （rewrite_instruction 为空、且会再调一次 review 形成双重 LLM 调用）。
+        // 让本分支只接住 hallucination / grounding 硬闸（reviewer 自己也会
+        // 在硬闸失败时写非空 rewrite_instruction）。
         // MP-5 / Task 15：rewrite 之前再检查预算；超额时跳过 rewrite，直接走拦截路径。
         let budget_exceeded_for_rewrite = current_run_budget()
             .map(|b| b.is_exceeded())
@@ -733,50 +742,35 @@ async fn run_user_operation_gateway_inner(
         // 30s 后 find_or_load 自动 reload，防 cache 永远 stale。任何 IO 故障被
         // find_or_load 内部 log 后吞掉。
         cache.find_or_load(&state.db).await;
-        for (kind, raw_opt) in [
-            ("customer_stage", final_decision.customer_stage.clone()),
-            ("intent_level", final_decision.intent_level.clone()),
-        ] {
-            let Some(raw) = raw_opt.filter(|s| !s.trim().is_empty()) else {
-                continue;
-            };
-            match taxonomy_check_value(kind, &raw, &contact.account_id, &cache) {
-                TaxonomyMatch::Active => {}
-                TaxonomyMatch::AliasActive(canonical) => {
-                    if kind == "customer_stage" {
-                        final_decision.customer_stage = Some(canonical.clone());
-                    } else if kind == "intent_level" {
-                        final_decision.intent_level = Some(canonical.clone());
-                    }
-                    let risk = format!("taxonomy_alias_rewritten:{kind}");
-                    if !review.risks.iter().any(|r| r == &risk) {
-                        review.risks.push(risk);
-                    }
-                }
-                TaxonomyMatch::Deprecated => {
-                    let risk = format!("taxonomy_deprecated_value:{kind}");
-                    if !review.risks.iter().any(|r| r == &risk) {
-                        review.risks.push(risk);
-                    }
-                }
-                TaxonomyMatch::CandidateNew => {
-                    let risk = format!("taxonomy_candidate_new:{kind}");
-                    if !review.risks.iter().any(|r| r == &risk) {
-                        review.risks.push(risk);
-                    }
-                    if let Err(error) = taxonomy_upsert_candidate(
-                        &state.db,
-                        &contact.account_id,
-                        kind,
-                        &raw,
-                        Some("user-ops decision path"),
-                        50,
-                    )
-                    .await
-                    {
-                        tracing::warn!(?error, kind = kind, raw = %raw, "taxonomy upsert_candidate failed");
-                    }
-                }
+        let outcome = compute_taxonomy_guard_outcome(
+            final_decision.customer_stage.as_deref(),
+            final_decision.intent_level.as_deref(),
+            &contact.account_id,
+            &cache,
+        );
+        if let Some(canonical) = outcome.customer_stage_rewrite.clone() {
+            final_decision.customer_stage = Some(canonical);
+        }
+        if let Some(canonical) = outcome.intent_level_rewrite.clone() {
+            final_decision.intent_level = Some(canonical);
+        }
+        for risk in &outcome.risks {
+            if !review.risks.iter().any(|r| r == risk) {
+                review.risks.push(risk.clone());
+            }
+        }
+        for (kind, raw) in &outcome.candidate_writes {
+            if let Err(error) = taxonomy_upsert_candidate(
+                &state.db,
+                &contact.account_id,
+                kind,
+                raw,
+                Some("user-ops decision path"),
+                50,
+            )
+            .await
+            {
+                tracing::warn!(?error, kind = kind.as_str(), raw = %raw, "taxonomy upsert_candidate failed");
             }
         }
     }
@@ -2317,6 +2311,56 @@ pub(crate) fn check_context_changed_followup_pure(
     }
 }
 
+/// Phase A / A3：taxonomy 软闸的纯逻辑——给定 LLM 输出的 customer_stage / intent_level
+/// 与 [`TaxonomyCache`]，决定要做的字段改写、要附加的 risks 和要 upsert 的候选。
+///
+/// gateway 主路径只负责把 outcome 应用到 `final_decision` / `review.risks` 并执行
+/// `upsert_candidate` 的 IO；判定本身可以在 lib-level 测，避免靠 #[ignore] 集成测试
+/// 来保证"未知值真的进了候选 + 不阻塞 run"的硬契约。
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct TaxonomyGuardOutcome {
+    pub customer_stage_rewrite: Option<String>,
+    pub intent_level_rewrite: Option<String>,
+    pub risks: Vec<String>,
+    /// 待写入 `taxonomy_candidates` 的 `(kind, raw_value)` 对。空 / 仅空格的 raw 已被过滤。
+    pub candidate_writes: Vec<(String, String)>,
+}
+
+pub(crate) fn compute_taxonomy_guard_outcome(
+    customer_stage: Option<&str>,
+    intent_level: Option<&str>,
+    scope_account_id: &str,
+    cache: &super::taxonomy::TaxonomyCache,
+) -> TaxonomyGuardOutcome {
+    let mut outcome = TaxonomyGuardOutcome::default();
+    for (kind, raw_opt) in [("customer_stage", customer_stage), ("intent_level", intent_level)] {
+        let Some(raw) = raw_opt.map(str::trim).filter(|s| !s.is_empty()) else {
+            continue;
+        };
+        match taxonomy_check_value(kind, raw, scope_account_id, cache) {
+            TaxonomyMatch::Active => {}
+            TaxonomyMatch::AliasActive(canonical) => {
+                if kind == "customer_stage" {
+                    outcome.customer_stage_rewrite = Some(canonical);
+                } else if kind == "intent_level" {
+                    outcome.intent_level_rewrite = Some(canonical);
+                }
+                outcome.risks.push(format!("taxonomy_alias_rewritten:{kind}"));
+            }
+            TaxonomyMatch::Deprecated => {
+                outcome.risks.push(format!("taxonomy_deprecated_value:{kind}"));
+            }
+            TaxonomyMatch::CandidateNew => {
+                outcome.risks.push(format!("taxonomy_candidate_new:{kind}"));
+                outcome
+                    .candidate_writes
+                    .push((kind.to_string(), raw.to_string()));
+            }
+        }
+    }
+    outcome
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2367,5 +2411,215 @@ mod tests {
             last_inbound_ms,
             task_created_ms
         ));
+    }
+
+    // ── Phase A / A3 落地验证：taxonomy 软闸 outcome 纯函数契约 ──────────
+    //
+    // gateway 主路径已经把"决定要做什么 (改写字段 / 追加 risk / upsert 候选)"提为
+    // [`compute_taxonomy_guard_outcome`]，IO 留给调用方做。这里把 4 路命中分支 +
+    // 空 / 空白输入路径 + customer_stage / intent_level 同时命中混合分支都覆盖一遍，
+    // 保证后续重构不会让"未知值不进候选"或"alias 命中却没改写字段"这种契约偷偷失效。
+
+    use super::super::taxonomy::{taxonomy_cache_for_tests, TaxonomyCache};
+    use crate::models::{TaxonomyEntry, TaxonomyValue};
+
+    fn entry(scope: &str, kind: &str, id: &str, aliases: &[&str], status: &str) -> TaxonomyEntry {
+        TaxonomyEntry {
+            id: None,
+            scope: scope.to_string(),
+            kind: kind.to_string(),
+            value: TaxonomyValue {
+                id: id.to_string(),
+                display_name: id.to_string(),
+                description: String::new(),
+                aliases: aliases.iter().map(|s| s.to_string()).collect(),
+                status: status.to_string(),
+            },
+            updated_at: mongodb::bson::DateTime::now(),
+        }
+    }
+
+    fn cache_with(entries: Vec<TaxonomyEntry>) -> TaxonomyCache {
+        taxonomy_cache_for_tests(entries)
+    }
+
+    #[test]
+    fn taxonomy_outcome_empty_when_both_kinds_missing() {
+        // 无任何 LLM 维度输出 → outcome 完全为空，不会乱写候选。
+        let cache = cache_with(vec![]);
+        let out = compute_taxonomy_guard_outcome(None, None, "acct-1", &cache);
+        assert!(out.customer_stage_rewrite.is_none());
+        assert!(out.intent_level_rewrite.is_none());
+        assert!(out.risks.is_empty());
+        assert!(out.candidate_writes.is_empty());
+    }
+
+    #[test]
+    fn taxonomy_outcome_skips_blank_inputs() {
+        // 空白字符串 trim 后等同于 None，不应触发 CandidateNew。
+        let cache = cache_with(vec![]);
+        let out = compute_taxonomy_guard_outcome(Some("   "), Some(""), "acct-1", &cache);
+        assert!(out.candidate_writes.is_empty());
+        assert!(out.risks.is_empty());
+    }
+
+    #[test]
+    fn taxonomy_outcome_active_match_is_silent() {
+        // 命中 active canonical_id：无改写、无 risk、无候选写入。
+        let cache = cache_with(vec![entry(
+            "global",
+            "customer_stage",
+            "first_contact",
+            &[],
+            "active",
+        )]);
+        let out =
+            compute_taxonomy_guard_outcome(Some("first_contact"), None, "acct-1", &cache);
+        assert!(out.customer_stage_rewrite.is_none());
+        assert!(out.risks.is_empty());
+        assert!(out.candidate_writes.is_empty());
+    }
+
+    #[test]
+    fn taxonomy_outcome_alias_active_rewrites_field_and_appends_risk() {
+        // alias 命中 → 改写为 canonical_id + 追加 taxonomy_alias_rewritten:* risk。
+        let cache = cache_with(vec![entry(
+            "global",
+            "customer_stage",
+            "first_contact",
+            &["新客", "刚加好友"],
+            "active",
+        )]);
+        let out = compute_taxonomy_guard_outcome(Some("新客"), None, "acct-1", &cache);
+        assert_eq!(
+            out.customer_stage_rewrite.as_deref(),
+            Some("first_contact"),
+            "alias 应被重写为 canonical_id"
+        );
+        assert!(
+            out.risks
+                .iter()
+                .any(|r| r == "taxonomy_alias_rewritten:customer_stage"),
+            "应追加 taxonomy_alias_rewritten:customer_stage risk，实际 {:?}",
+            out.risks
+        );
+        assert!(
+            out.candidate_writes.is_empty(),
+            "alias 命中不应写候选，实际 {:?}",
+            out.candidate_writes
+        );
+    }
+
+    #[test]
+    fn taxonomy_outcome_deprecated_only_appends_risk() {
+        // deprecated 命中：仅追加 risk，不改写、不写候选。
+        let cache = cache_with(vec![entry(
+            "global",
+            "intent_level",
+            "lukewarm",
+            &[],
+            "deprecated",
+        )]);
+        let out = compute_taxonomy_guard_outcome(None, Some("lukewarm"), "acct-1", &cache);
+        assert!(out.intent_level_rewrite.is_none());
+        assert!(out
+            .risks
+            .iter()
+            .any(|r| r == "taxonomy_deprecated_value:intent_level"));
+        assert!(out.candidate_writes.is_empty());
+    }
+
+    /// CLAUDE.md 硬规则"unreviewed candidates must not block runs"的核心契约：
+    /// 完全未知值 → 写候选 + 标 risk，但 review.approved 的判定是 gateway 主路径
+    /// 自己做的事，与 outcome 无关；此处只断言 outcome 形状不会"反向阻塞"——没有
+    /// 字段说"必须 fail review"。如果未来重构里 outcome 长出 `must_block: bool`
+    /// 字段，本测会立刻失效，强制重新审视该硬规则。
+    #[test]
+    fn taxonomy_outcome_candidate_new_writes_to_queue_without_blocking() {
+        let cache = cache_with(vec![entry(
+            "global",
+            "customer_stage",
+            "first_contact",
+            &[],
+            "active",
+        )]);
+        let out = compute_taxonomy_guard_outcome(
+            Some("完全没听过的阶段"),
+            None,
+            "acct-1",
+            &cache,
+        );
+        assert!(
+            out.risks
+                .iter()
+                .any(|r| r == "taxonomy_candidate_new:customer_stage"),
+            "未知值应附加 taxonomy_candidate_new:* risk"
+        );
+        assert_eq!(
+            out.candidate_writes,
+            vec![("customer_stage".to_string(), "完全没听过的阶段".to_string())],
+            "未知值必须进 candidate_writes，admin 才能在后台审核"
+        );
+        assert!(out.customer_stage_rewrite.is_none());
+    }
+
+    #[test]
+    fn taxonomy_outcome_handles_both_kinds_in_single_pass() {
+        // customer_stage 命中 alias，intent_level 完全未知：两个维度独立产出 risk
+        // 与 candidate_writes，相互不串扰，保证 user-ops 决策路径上每条 LLM 输出
+        // 都被走到。
+        let cache = cache_with(vec![entry(
+            "global",
+            "customer_stage",
+            "first_contact",
+            &["新客"],
+            "active",
+        )]);
+        let out = compute_taxonomy_guard_outcome(
+            Some("新客"),
+            Some("never_seen_intent"),
+            "acct-1",
+            &cache,
+        );
+        assert_eq!(
+            out.customer_stage_rewrite.as_deref(),
+            Some("first_contact")
+        );
+        assert!(out.intent_level_rewrite.is_none());
+        let risks: Vec<&str> = out.risks.iter().map(String::as_str).collect();
+        assert!(risks.contains(&"taxonomy_alias_rewritten:customer_stage"));
+        assert!(risks.contains(&"taxonomy_candidate_new:intent_level"));
+        assert_eq!(
+            out.candidate_writes,
+            vec![(
+                "intent_level".to_string(),
+                "never_seen_intent".to_string()
+            )],
+            "只有 intent_level 一个维度该进候选"
+        );
+    }
+
+    #[test]
+    fn taxonomy_outcome_account_scope_overrides_global() {
+        // account 私有字典定义了 alias，global 没有：scope_account_id 走 account-first
+        // fallback。本测确保 outcome 计算把 scope 透传给 check_value，避免回归到
+        // "永远只查 global"。
+        let cache = cache_with(vec![
+            entry("global", "customer_stage", "first_contact", &[], "active"),
+            entry(
+                "acct-1",
+                "customer_stage",
+                "premium_first_contact",
+                &["首单 VIP"],
+                "active",
+            ),
+        ]);
+        let out =
+            compute_taxonomy_guard_outcome(Some("首单 VIP"), None, "acct-1", &cache);
+        assert_eq!(
+            out.customer_stage_rewrite.as_deref(),
+            Some("premium_first_contact"),
+            "应命中 account scope 的 alias，而非回落 global"
+        );
     }
 }

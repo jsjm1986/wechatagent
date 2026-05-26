@@ -67,6 +67,12 @@ pub struct CatalogFilter {
     pub business_topics: Vec<String>,
     #[serde(default)]
     pub status: Option<String>,
+    /// 默认 false：catalog / open_chunk 仅暴露 `integrity_status="verified"` chunk，
+    /// 与 [`super::knowledge_router::load_operation_knowledge`] 的 verified-only
+    /// 加载对齐。设为 true 时上层（如内部审阅工具）可越权拉取 needs_review / draft
+    /// chunk，但 router 路径永远走 false。
+    #[serde(default)]
+    pub include_unverified: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -210,6 +216,10 @@ pub async fn answer(state: &AppState, req: AnswerRequest) -> AppResult<AnswerRes
         });
     }
 
+    // last_completed_round：跟踪实际跑完了多少轮（含 budget_exceeded 提前 break /
+    // invalid_action continue 的情况）。供兜底 / budget 提前退出时上报真实
+    // rounds_used，避免前端误以为"用了 max_rounds 才放弃"。
+    let mut last_completed_round: i32 = 0;
     for round in 1..=max_rounds {
         if let Some(budget) = current_run_budget() {
             if budget.is_exceeded() {
@@ -220,6 +230,7 @@ pub async fn answer(state: &AppState, req: AnswerRequest) -> AppResult<AnswerRes
                 break;
             }
         }
+        last_completed_round = round;
 
         let user_prompt = build_prompt(&req.query, &opened, &catalog, round, max_rounds);
         let value = generate_agent_json(
@@ -335,14 +346,16 @@ pub async fn answer(state: &AppState, req: AnswerRequest) -> AppResult<AnswerRes
         }
     }
 
-    // 兜底：3 轮内未 answer，强制用当前 opened 列表 answer。
+    // 兜底：未在循环内 answer。可能原因：跑完 max_rounds、budget 提前 break、
+    // 多次 invalid_action 把轮数耗光。rounds_used 上报真实跑过的轮数（最低 0），
+    // 而不是 max_rounds，避免前端误读。
     let cited_chunk_ids: Vec<String> = opened
         .iter()
         .map(|c| c.chunk_id.clone())
         .collect();
     tool_trace.push(doc! {
         "tool": "answer",
-        "rounds": max_rounds,
+        "rounds": last_completed_round,
         "truncated": true,
         "citedCount": cited_chunk_ids.len() as i32,
     });
@@ -351,7 +364,7 @@ pub async fn answer(state: &AppState, req: AnswerRequest) -> AppResult<AnswerRes
         cited_chunk_ids,
         source_quotes: Vec::new(),
         tool_trace,
-        rounds_used: max_rounds,
+        rounds_used: last_completed_round,
         truncated: true,
     })
 }
@@ -370,6 +383,11 @@ pub async fn list_catalog(
         "domain": "user_operations",
         "status": filter.status.clone().unwrap_or_else(|| "active".to_string()),
     };
+    // 默认仅暴露 verified chunk（与 router corpus 对齐）。include_unverified=true
+    // 由上层显式开启（例如知识库后台审阅 UI 想看 needs_review）。
+    if !filter.include_unverified {
+        query.insert("integrity_status", "verified");
+    }
     let account_or = match account_id {
         Some(id) => vec![doc! { "account_id": null }, doc! { "account_id": id }],
         None => vec![doc! { "account_id": null }],
@@ -420,6 +438,9 @@ pub async fn list_catalog(
 }
 
 /// 打开单条 chunk 的完整正文 + 引用 + relations。
+///
+/// 默认只返回 `integrity_status="verified"` 的 chunk；非 verified（draft /
+/// needs_review）静默返回 `None`，避免 agent cite 到未 verify 的内容。
 pub async fn open_chunk(
     state: &AppState,
     workspace_id: &str,
@@ -436,6 +457,7 @@ pub async fn open_chunk(
             doc! {
                 "_id": oid,
                 "workspace_id": workspace_id,
+                "integrity_status": "verified",
             },
             None,
         )
@@ -489,7 +511,12 @@ pub async fn follow_relations(
                     .db
                     .operation_knowledge_chunks()
                     .find_one(
-                        doc! { "_id": target_oid, "workspace_id": workspace_id, "status": "active" },
+                        doc! {
+                            "_id": target_oid,
+                            "workspace_id": workspace_id,
+                            "status": "active",
+                            "integrity_status": "verified",
+                        },
                         None,
                     )
                     .await?
@@ -688,6 +715,7 @@ fn build_prompt(
 规则：
 - citedChunkIds 必须是上面"已 open 的 chunks"中的 chunkId 子集；不能凭空创造。
 - 每个 cited 必须配 sourceQuote；如某 chunk 没有可引用原文，可省略 sourceQuote 但仍可 cite。
+- 候选 catalog 中所有 chunk 都已 integrity_status=verified；遇到 verified=false 是异常，不要 cite。
 - 当用户查询无相关知识时，answer 直接说"知识库无相关内容"，cited 留空。
 - 不要复述 catalog 中的整段 summary；用自然语言总结答复。"#,
         query = query,

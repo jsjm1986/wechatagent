@@ -1736,6 +1736,15 @@ pub(super) fn operation_knowledge_document_json(item: OperationKnowledgeDocument
 }
 
 pub(super) fn operation_knowledge_chunk_json(item: OperationKnowledgeChunk) -> Value {
+    // source_anchors 是 Vec<bson::Document>；直接 serde_json 序列化会暴露 BSON
+    // Extended JSON（如 `{"$numberInt":"42"}`）。前端 KnowledgeTreeView /
+    // ReviewView 直接读 `anchor.startLine / endLine / quoteHash / documentId`，
+    // 必须先走 `.into_relaxed_extjson()` 桥接成纯 JSON。
+    let source_anchors_json: Vec<Value> = item
+        .source_anchors
+        .into_iter()
+        .map(|d| mongodb::bson::Bson::Document(d).into_relaxed_extjson())
+        .collect();
     json!({
         "id": item.id.map(|id| id.to_hex()).unwrap_or_default(),
         "workspaceId": item.workspace_id,
@@ -1751,16 +1760,28 @@ pub(super) fn operation_knowledge_chunk_json(item: OperationKnowledgeChunk) -> V
         "applicableScenes": item.applicable_scenes,
         "notApplicableScenes": item.not_applicable_scenes,
         "sourceQuote": item.source_quote,
-        "sourceAnchors": item.source_anchors,
+        "sourceAnchors": source_anchors_json,
         "integrityStatus": item.integrity_status,
         "confidenceScore": item.confidence_score,
         "status": item.status,
         "priority": item.priority,
+        "wikiType": item.wiki_type,
+        "relatedChunks": item.related_chunks,
+        "businessTopics": item.business_topics,
         "updatedAt": crate::models::dt_to_string(item.updated_at)
     })
 }
 
 pub(super) fn knowledge_usage_json(item: KnowledgeUsageLog) -> Value {
+    // tool_trace / route_result 都是 BSON Document — 走 extjson 桥接避免
+    // `{"$numberInt":"…"}` 等 BSON 包装泄漏到前端。
+    let route_result_json =
+        mongodb::bson::Bson::Document(item.route_result).into_relaxed_extjson();
+    let tool_trace_json: Vec<Value> = item
+        .tool_trace
+        .into_iter()
+        .map(|d| mongodb::bson::Bson::Document(d).into_relaxed_extjson())
+        .collect();
     json!({
         "id": item.id.map(|id| id.to_hex()).unwrap_or_default(),
         "workspaceId": item.workspace_id,
@@ -1768,11 +1789,11 @@ pub(super) fn knowledge_usage_json(item: KnowledgeUsageLog) -> Value {
         "contactWxid": item.contact_wxid,
         "runId": item.run_id,
         "knowledgeIds": item.knowledge_ids.into_iter().map(|id| id.to_hex()).collect::<Vec<_>>(),
-        "routeResult": item.route_result,
+        "routeResult": route_result_json,
         "replyText": item.reply_text,
         "reviewApproved": item.review_approved,
         "blockedReason": item.blocked_reason,
-        "toolTrace": item.tool_trace,
+        "toolTrace": tool_trace_json,
         "createdAt": crate::models::dt_to_string(item.created_at)
     })
 }
@@ -6828,11 +6849,23 @@ pub(super) async fn ask_knowledge(
             wiki_types: req.filter.wiki_types,
             business_topics: req.filter.business_topics,
             status: req.filter.status,
+            // /api/knowledge/ask 是用户/agent 主入口，沿用 router 路径的 verified-only
+            // 语义：未审核 chunk 不上 prompt（[`CatalogFilter::include_unverified`]）。
+            include_unverified: false,
         },
         max_rounds: req.max_rounds,
     };
     let result = agent::knowledge_agent::answer(&state, agent_req).await?;
     let took_ms = started_at.elapsed().as_millis() as u64;
+    // tool_trace 是 Vec<bson::Document>；直接 serde_json 序列化会暴露 BSON Extended
+    // JSON（如 `{"$numberInt":"3"}`），前端时间线需要纯 JSON，故走
+    // `.into_relaxed_extjson()` 桥接（与 src/agent/tool_loop.rs:359 / chat_tool_loop.rs:316
+    // / knowledge_tools.rs:1252 / routes/domain_schemas.rs:150 一致）。
+    let tool_trace_json: Vec<Value> = result
+        .tool_trace
+        .into_iter()
+        .map(|d| mongodb::bson::Bson::Document(d).into_relaxed_extjson())
+        .collect();
     Ok(Json(json!({
         "answer": result.answer,
         "citedChunkIds": result.cited_chunk_ids,
@@ -6841,7 +6874,7 @@ pub(super) async fn ask_knowledge(
             "quote": q.quote,
             "sourceAnchorIndex": q.source_anchor_index,
         })).collect::<Vec<_>>(),
-        "toolTrace": result.tool_trace,
+        "toolTrace": tool_trace_json,
         "roundsUsed": result.rounds_used,
         "truncated": result.truncated,
         "tookMs": took_ms,

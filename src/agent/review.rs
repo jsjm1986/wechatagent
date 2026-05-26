@@ -200,6 +200,155 @@ pub fn review_passed(
             || review.scores.pressure_risk < runtime.pressure_risk_block_at)
 }
 
+/// Phase B / B1：双闸分类结果。
+///
+/// `review_passed` 把硬闸（hallucination / knowledge_grounding）和软闸
+/// （humanLike / pressureRisk / emotionalValue）一起折叠成一个 bool，导致
+/// 软闸失败后 `approved=false` → finalize 走 Held 分支，single-shot
+/// revision 通道（[`decide_revision`]）永远 `NotEligible`，本意"软闸失败
+/// 触发 revision"被绕过。
+///
+/// 本枚举把两类失败显式区分，让 [`route_dual_gate`] 在软闸失败时仍保留
+/// `approved=true` + 写 `needs_revision=true` + `revision_direction`，让
+/// finalize 进入 `Approved`、再由 `decide_revision` 走 `Proceed` 触发
+/// revision。硬闸失败仍然 `approved=false` → finalize 走 Held。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum DualGateClassification {
+    /// 硬 / 软闸都通过。
+    AllPass,
+    /// 硬闸失败（hallucination ≥ 阈值 / knowledge_grounding < 阈值），
+    /// SHALL 直接 `approved=false`，finalize 走 Held。
+    HardGateFailure { risks: Vec<String> },
+    /// 软闸失败（humanLike < 阈值 / pressureRisk ≥ 阈值 / emotionalValue
+    /// < 阈值），SHALL 保留 `approved` 不变（finalize 走 Approved）但
+    /// 写 `needs_revision=true` + `revision_direction`，触发 single-shot
+    /// revision；硬闸通过的前提下才能进入本分支。
+    SoftGateFailure {
+        direction: String,
+        risks: Vec<String>,
+    },
+}
+
+/// Phase B / B1：纯函数版双闸分类，按"硬闸优先"裁定。
+///
+/// 与 [`review_passed`] 对偶：本函数不读 `review.approved`，只看分数 vs
+/// runtime 阈值，便于单测同时覆盖 reviewer `approved=false` 但分数全过、
+/// reviewer `approved=true` 但软闸失败等组合。
+pub(crate) fn classify_dual_gate(
+    review: &DecisionReviewResult,
+    runtime: &UserRuntimeParameters,
+) -> DualGateClassification {
+    let mut hard_risks: Vec<String> = Vec::new();
+    if review.scores.hallucination_score >= runtime.fact_risk_block_at {
+        hard_risks.push(format!(
+            "hallucination_score_{}_ge_{}",
+            review.scores.hallucination_score, runtime.fact_risk_block_at
+        ));
+    }
+    if review.scores.knowledge_grounding_score < runtime.product_accuracy_block_below {
+        hard_risks.push(format!(
+            "knowledge_grounding_{}_lt_{}",
+            review.scores.knowledge_grounding_score, runtime.product_accuracy_block_below
+        ));
+    }
+    if !hard_risks.is_empty() {
+        return DualGateClassification::HardGateFailure { risks: hard_risks };
+    }
+
+    let mut soft_risks: Vec<String> = Vec::new();
+    let mut direction_parts: Vec<String> = Vec::new();
+    if review.scores.human_like < runtime.human_like_rewrite_below {
+        soft_risks.push(format!(
+            "human_like_{}_lt_{}",
+            review.scores.human_like, runtime.human_like_rewrite_below
+        ));
+        direction_parts.push(format!(
+            "humanLike 评分 {} 低于阈值 {}：请把语气改写得更像微信真人对话——\
+             少模板、少销售腔、贴近上下文；保留要表达的事实，但句式与停顿向\
+             自然口语靠拢。",
+            review.scores.human_like, runtime.human_like_rewrite_below
+        ));
+    }
+    if review.scores.pressure_risk != 0
+        && review.scores.pressure_risk >= runtime.pressure_risk_block_at
+    {
+        soft_risks.push(format!(
+            "pressure_risk_{}_ge_{}",
+            review.scores.pressure_risk, runtime.pressure_risk_block_at
+        ));
+        direction_parts.push(format!(
+            "pressureRisk 评分 {} 高于等于阈值 {}：去掉催促、紧迫、稀缺感、\
+             连环追问；改为承接对方顾虑 + 1 个轻量澄清问题或 1 个具体小建议，\
+             留出对方思考空间。",
+            review.scores.pressure_risk, runtime.pressure_risk_block_at
+        ));
+    }
+    if review.scores.emotional_value < runtime.emotional_value_rewrite_below {
+        soft_risks.push(format!(
+            "emotional_value_{}_lt_{}",
+            review.scores.emotional_value, runtime.emotional_value_rewrite_below
+        ));
+        direction_parts.push(format!(
+            "emotionalValue 评分 {} 低于阈值 {}：增加对对方处境的具体共情、\
+             承接对方关切的细节；避免泛泛的安慰或纯交易语气。",
+            review.scores.emotional_value, runtime.emotional_value_rewrite_below
+        ));
+    }
+    if soft_risks.is_empty() {
+        return DualGateClassification::AllPass;
+    }
+    let direction = direction_parts.join(" ");
+    DualGateClassification::SoftGateFailure {
+        direction,
+        risks: soft_risks,
+    }
+}
+
+/// Phase B / B1：把 `classify_dual_gate` 的判定写回 review 字段。
+///
+/// 设计要点：
+/// * `HardGateFailure`：照旧 `approved=false`（finalize 会进 Held 分支）。
+/// * `SoftGateFailure`：保持 `approved` 由原始 `review_passed` 算出（也就是
+///   `false`），但同时**写 `needs_revision=true` + `revision_direction`**。
+///   `finalize_review_for_send` 会先看 protocol violation / budget /
+///   should_hold 三道硬门——这三道都没命中时，新增的"soft-gate 唯一原因"
+///   分支会把 `approved` 强制改回 `true` 并保留 `needs_revision`，让
+///   `decide_revision` 进入 `Proceed`。
+/// * `AllPass`：照旧用 `review_passed` 决定 `approved`。
+///
+/// 调用方 SHALL 在反序列化 reviewer JSON 后立即调用本函数，替换原本的
+/// `review.approved = review_passed(&review, runtime)`。
+pub(crate) fn route_dual_gate(
+    review: &mut DecisionReviewResult,
+    runtime: &UserRuntimeParameters,
+) {
+    let classification = classify_dual_gate(review, runtime);
+    // 先按 review_passed 写一遍 approved（保持现有 PBT / 老调用点的语义不
+    // 变；soft-gate 路径下 finalize 会再矫正回 true）。
+    let baseline_approved = review_passed(review, runtime);
+    review.approved = baseline_approved;
+    match classification {
+        DualGateClassification::AllPass | DualGateClassification::HardGateFailure { .. } => {
+            // 硬闸失败：approved=false，finalize 进 Held。本函数不再追加 risks，
+            // 因为 finalize 已有自己的 risk 通道；硬闸细节走 review.risks 即可。
+        }
+        DualGateClassification::SoftGateFailure { direction, risks } => {
+            // 软闸失败：标记 needs_revision，让 finalize 改写 approved=true。
+            // reviewer 自己已经写了 revision_direction（prompt 鼓励它给方向）
+            // 时不覆盖；为空才用机器化方向兜底。
+            if review.revision_direction.trim().is_empty() {
+                review.revision_direction = direction;
+            }
+            review.needs_revision = true;
+            for risk in risks {
+                if !review.risks.iter().any(|r| r == &risk) {
+                    review.risks.push(risk);
+                }
+            }
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn review_decision(
     state: &AppState,
@@ -362,7 +511,11 @@ Review 模式: {}
     .await?;
     let mut review: DecisionReviewResult = serde_json::from_value(value)?;
     let _ = (decision, domain_config, knowledge_chunks, contact);
-    review.approved = review_passed(&review, runtime);
+    // Phase B / B1：双闸路由替换原 `review.approved = review_passed(...)`。
+    // 软闸失败时保持 approved=false（review_passed 行为）但同时写
+    // needs_revision=true / revision_direction，让 finalize 在硬门未命中时
+    // 把 soft-gate-only 失败矫正为 Approved，以触发 single-shot revision。
+    route_dual_gate(&mut review, runtime);
     Ok(review)
 }
 
@@ -606,6 +759,26 @@ pub fn finalize_review_for_send(
 
     // 默认：approved 通过
     if review.approved && decision.should_reply {
+        review.final_review_status = "approved".to_string();
+        FinalizeOutcome {
+            review,
+            status: GatewayStatusFinal::Approved,
+            pending_events,
+        }
+    } else if review.needs_revision
+        && !review.revision_direction.trim().is_empty()
+        && !review.should_hold
+        && decision.should_reply
+    {
+        // Phase B / B1：soft-gate-only failure（humanLike / pressureRisk /
+        // emotionalValue 任一软闸不达标，但 hallucination / grounding 硬闸
+        // 通过，且 protocol / budget / should_hold 三道硬门都未命中）。
+        // route_dual_gate 已写好 revision_direction + needs_revision，这里
+        // 把 approved 矫正回 true，让 finalReviewStatus="approved" 进入
+        // gateway 的 single-shot revision 通道（decide_revision Proceed）。
+        // 注意：硬闸失败永远走不到这里（hard 失败时 needs_revision 不会被
+        // route_dual_gate 写为 true）。
+        review.approved = true;
         review.final_review_status = "approved".to_string();
         FinalizeOutcome {
             review,
@@ -1133,5 +1306,394 @@ mod reviewer_decision_view_tests {
         let parsed: serde_json::Value =
             serde_json::from_str(&view).expect("reviewer view 必须是合法 JSON");
         assert!(parsed.is_object(), "reviewer view 必须是 JSON 对象");
+    }
+}
+
+#[cfg(test)]
+mod dual_gate_classification_tests {
+    //! Phase B / B1：双闸分类纯函数 + soft-gate-only 路由 + finalize 矫正 +
+    //! decide_revision Proceed 的端到端单测。证明 humanLike / pressureRisk /
+    //! emotionalValue 任一软闸不达标时，flow 走的是 single-shot revision
+    //! 而不是 hold。硬闸失败仍走 hold。
+
+    use super::super::runtime::UserRuntimeParameters;
+    use super::super::types::{
+        AgentDecision, DecisionReviewResult, ReviewScores, HOLD_CATEGORY_HELD_BY_AI_POLICY,
+    };
+    use super::{
+        classify_dual_gate, decide_revision, finalize_review_for_send, route_dual_gate,
+        DualGateClassification, FinalizeOutcome, GatewayStatusFinal, RevisionDecision,
+    };
+    use crate::models::{AgentStatus, Contact};
+    use mongodb::bson::{DateTime, Document};
+
+    fn full_pass_review() -> DecisionReviewResult {
+        DecisionReviewResult {
+            approved: true,
+            scores: ReviewScores {
+                human_like: 80,
+                emotional_value: 70,
+                hallucination_score: 1,
+                knowledge_grounding_score: 80,
+                pressure_risk: 1,
+            },
+            ..Default::default()
+        }
+    }
+
+    fn finalize_contact() -> Contact {
+        Contact {
+            id: None,
+            workspace_id: "default".to_string(),
+            account_id: "default".to_string(),
+            wxid: "test_wxid".to_string(),
+            nickname: None,
+            remark: None,
+            alias: None,
+            agent_status: AgentStatus::Managed,
+            human_profile_note: None,
+            custom_agent_instructions: None,
+            agent_profile: None,
+            memory_summary: None,
+            playbook_id: None,
+            playbook_version: None,
+            tags: Vec::new(),
+            domain_attributes: None,
+            domain_attributes_updated_at: None,
+            commitments: Vec::new(),
+            follow_up_policy: None,
+            operation_state: None,
+            operation_state_reason: None,
+            operation_state_confidence: None,
+            operation_state_updated_at: None,
+            cooldown_until: None,
+            operation_policy: Document::new(),
+            profile_attributes: Document::new(),
+            profile_updated_at: None,
+            last_message_at: None,
+            last_inbound_at: None,
+            last_outbound_at: None,
+            last_agent_run_at: None,
+            last_outbound_style: None,
+            intent_trajectory: Vec::new(),
+            locale: None,
+            created_at: DateTime::now(),
+            updated_at: DateTime::now(),
+        }
+    }
+
+    fn shouldreply_decision() -> AgentDecision {
+        AgentDecision {
+            should_reply: true,
+            reply_text: "好的，我来想想看".to_string(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn classify_dual_gate_returns_all_pass_when_full_score() {
+        let runtime = UserRuntimeParameters::default();
+        let review = full_pass_review();
+        assert_eq!(
+            classify_dual_gate(&review, &runtime),
+            DualGateClassification::AllPass
+        );
+    }
+
+    #[test]
+    fn classify_dual_gate_marks_hallucination_as_hard_failure() {
+        let runtime = UserRuntimeParameters::default();
+        let mut review = full_pass_review();
+        review.scores.hallucination_score = runtime.fact_risk_block_at + 1;
+        match classify_dual_gate(&review, &runtime) {
+            DualGateClassification::HardGateFailure { risks } => {
+                assert!(risks.iter().any(|r| r.starts_with("hallucination_score_")));
+            }
+            other => panic!("expected HardGateFailure, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn classify_dual_gate_marks_low_grounding_as_hard_failure() {
+        let runtime = UserRuntimeParameters::default();
+        let mut review = full_pass_review();
+        review.scores.knowledge_grounding_score = runtime.product_accuracy_block_below - 1;
+        match classify_dual_gate(&review, &runtime) {
+            DualGateClassification::HardGateFailure { risks } => {
+                assert!(risks
+                    .iter()
+                    .any(|r| r.starts_with("knowledge_grounding_")));
+            }
+            other => panic!("expected HardGateFailure, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn classify_dual_gate_marks_low_human_like_as_soft_failure() {
+        let runtime = UserRuntimeParameters::default();
+        let mut review = full_pass_review();
+        review.scores.human_like = runtime.human_like_rewrite_below - 1;
+        match classify_dual_gate(&review, &runtime) {
+            DualGateClassification::SoftGateFailure { direction, risks } => {
+                assert!(direction.contains("humanLike"));
+                assert!(!direction.trim().is_empty());
+                assert!(risks.iter().any(|r| r.starts_with("human_like_")));
+            }
+            other => panic!("expected SoftGateFailure, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn classify_dual_gate_marks_high_pressure_risk_as_soft_failure() {
+        let runtime = UserRuntimeParameters::default();
+        let mut review = full_pass_review();
+        review.scores.pressure_risk = runtime.pressure_risk_block_at;
+        match classify_dual_gate(&review, &runtime) {
+            DualGateClassification::SoftGateFailure { direction, risks } => {
+                assert!(direction.contains("pressureRisk"));
+                assert!(risks.iter().any(|r| r.starts_with("pressure_risk_")));
+            }
+            other => panic!("expected SoftGateFailure, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn classify_dual_gate_ignores_pressure_risk_zero_as_legacy() {
+        // R11 兼容：pressure_risk == 0 视作未填，不参与分类。
+        let runtime = UserRuntimeParameters::default();
+        let mut review = full_pass_review();
+        review.scores.pressure_risk = 0;
+        assert_eq!(
+            classify_dual_gate(&review, &runtime),
+            DualGateClassification::AllPass
+        );
+    }
+
+    #[test]
+    fn classify_dual_gate_marks_low_emotional_value_as_soft_failure() {
+        let runtime = UserRuntimeParameters::default();
+        let mut review = full_pass_review();
+        review.scores.emotional_value = runtime.emotional_value_rewrite_below - 1;
+        match classify_dual_gate(&review, &runtime) {
+            DualGateClassification::SoftGateFailure { direction, risks } => {
+                assert!(direction.contains("emotionalValue"));
+                assert!(risks.iter().any(|r| r.starts_with("emotional_value_")));
+            }
+            other => panic!("expected SoftGateFailure, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn classify_dual_gate_combines_multiple_soft_failures() {
+        let runtime = UserRuntimeParameters::default();
+        let mut review = full_pass_review();
+        review.scores.human_like = runtime.human_like_rewrite_below - 1;
+        review.scores.pressure_risk = runtime.pressure_risk_block_at + 1;
+        match classify_dual_gate(&review, &runtime) {
+            DualGateClassification::SoftGateFailure { direction, risks } => {
+                assert!(direction.contains("humanLike"));
+                assert!(direction.contains("pressureRisk"));
+                assert!(risks.iter().any(|r| r.starts_with("human_like_")));
+                assert!(risks.iter().any(|r| r.starts_with("pressure_risk_")));
+            }
+            other => panic!("expected SoftGateFailure, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn classify_dual_gate_hard_failure_wins_over_soft() {
+        // 同时硬闸 + 软闸失败时，硬闸优先 — soft path 不可绕过 hard path。
+        let runtime = UserRuntimeParameters::default();
+        let mut review = full_pass_review();
+        review.scores.hallucination_score = runtime.fact_risk_block_at + 1;
+        review.scores.human_like = runtime.human_like_rewrite_below - 1;
+        match classify_dual_gate(&review, &runtime) {
+            DualGateClassification::HardGateFailure { .. } => {}
+            other => panic!("expected HardGateFailure, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn route_dual_gate_sets_needs_revision_on_soft_failure() {
+        let runtime = UserRuntimeParameters::default();
+        let mut review = full_pass_review();
+        review.scores.human_like = runtime.human_like_rewrite_below - 1;
+        route_dual_gate(&mut review, &runtime);
+        assert!(review.needs_revision, "软闸失败必须写 needs_revision");
+        assert!(
+            !review.revision_direction.trim().is_empty(),
+            "软闸失败必须自动补 revision_direction"
+        );
+        // approved 由 review_passed 决定，软闸下应为 false（finalize 会矫正）。
+        assert!(!review.approved);
+    }
+
+    #[test]
+    fn route_dual_gate_preserves_reviewer_revision_direction() {
+        let runtime = UserRuntimeParameters::default();
+        let mut review = full_pass_review();
+        review.scores.human_like = runtime.human_like_rewrite_below - 1;
+        review.revision_direction = "reviewer 自己写的明确方向".to_string();
+        route_dual_gate(&mut review, &runtime);
+        assert_eq!(
+            review.revision_direction, "reviewer 自己写的明确方向",
+            "reviewer 已给方向时不可被机器化兜底覆盖"
+        );
+        assert!(review.needs_revision);
+    }
+
+    #[test]
+    fn route_dual_gate_leaves_hard_failure_without_revision_flag() {
+        let runtime = UserRuntimeParameters::default();
+        let mut review = full_pass_review();
+        review.scores.hallucination_score = runtime.fact_risk_block_at + 1;
+        let prev_dir = review.revision_direction.clone();
+        route_dual_gate(&mut review, &runtime);
+        assert!(!review.needs_revision, "硬闸失败不能触发 revision");
+        assert_eq!(review.revision_direction, prev_dir);
+        assert!(!review.approved);
+    }
+
+    #[test]
+    fn route_dual_gate_keeps_all_pass_approved_true() {
+        let runtime = UserRuntimeParameters::default();
+        let mut review = full_pass_review();
+        route_dual_gate(&mut review, &runtime);
+        assert!(review.approved);
+        assert!(!review.needs_revision);
+    }
+
+    #[test]
+    fn finalize_promotes_soft_gate_failure_to_approved() {
+        // route_dual_gate(soft fail) → finalize 应矫正 approved=true 并返回
+        // GatewayStatusFinal::Approved，让 decide_revision 进 Proceed。
+        let runtime = UserRuntimeParameters::default();
+        let mut review = full_pass_review();
+        review.scores.pressure_risk = runtime.pressure_risk_block_at + 2;
+        route_dual_gate(&mut review, &runtime);
+        let mut decision = shouldreply_decision();
+        let contact = finalize_contact();
+        let outcome = finalize_review_for_send(
+            review,
+            &mut decision,
+            &runtime,
+            &contact,
+            &[],
+            Vec::new(),
+            "用户最新消息",
+        );
+        let FinalizeOutcome {
+            review: finalized,
+            status,
+            ..
+        } = outcome;
+        assert_eq!(
+            status,
+            GatewayStatusFinal::Approved,
+            "软闸 soft-gate-only 失败必须矫正为 Approved"
+        );
+        assert!(finalized.approved);
+        assert!(finalized.needs_revision);
+        assert_eq!(finalized.final_review_status, "approved");
+    }
+
+    #[test]
+    fn finalize_keeps_hard_gate_failure_in_held() {
+        // route_dual_gate(hard fail) → finalize 应仍走 Held(held_by_ai_policy)。
+        let runtime = UserRuntimeParameters::default();
+        let mut review = full_pass_review();
+        review.scores.hallucination_score = runtime.fact_risk_block_at + 1;
+        route_dual_gate(&mut review, &runtime);
+        let mut decision = shouldreply_decision();
+        let contact = finalize_contact();
+        let outcome = finalize_review_for_send(
+            review,
+            &mut decision,
+            &runtime,
+            &contact,
+            &[],
+            Vec::new(),
+            "用户最新消息",
+        );
+        let FinalizeOutcome {
+            review: finalized,
+            status,
+            ..
+        } = outcome;
+        match status {
+            GatewayStatusFinal::Held(category) => {
+                assert_eq!(category, HOLD_CATEGORY_HELD_BY_AI_POLICY);
+            }
+            other => panic!("expected Held, got {:?}", other),
+        }
+        assert!(!finalized.approved);
+        assert_eq!(
+            finalized.final_review_status,
+            HOLD_CATEGORY_HELD_BY_AI_POLICY
+        );
+    }
+
+    #[test]
+    fn decide_revision_proceeds_after_soft_gate_matchback() {
+        // 端到端：reviewer 给出软闸失败的分数 → route_dual_gate 写
+        // needs_revision + revision_direction → finalize 矫正为 Approved →
+        // decide_revision 必须返回 Proceed，触发 single-shot revision。
+        let runtime = UserRuntimeParameters::default();
+        let mut review = full_pass_review();
+        review.scores.human_like = runtime.human_like_rewrite_below - 2;
+        route_dual_gate(&mut review, &runtime);
+        let mut decision = shouldreply_decision();
+        let contact = finalize_contact();
+        let outcome = finalize_review_for_send(
+            review,
+            &mut decision,
+            &runtime,
+            &contact,
+            &[],
+            Vec::new(),
+            "用户最新消息",
+        );
+        let FinalizeOutcome {
+            review: finalized,
+            status,
+            ..
+        } = outcome;
+        assert_eq!(status, GatewayStatusFinal::Approved);
+        let revision = decide_revision(&status, &finalized, false);
+        assert_eq!(
+            revision,
+            RevisionDecision::Proceed,
+            "soft-gate-only 失败必须最终触发 Proceed"
+        );
+    }
+
+    #[test]
+    fn decide_revision_does_not_proceed_after_hard_gate_failure() {
+        let runtime = UserRuntimeParameters::default();
+        let mut review = full_pass_review();
+        review.scores.knowledge_grounding_score = runtime.product_accuracy_block_below - 1;
+        route_dual_gate(&mut review, &runtime);
+        let mut decision = shouldreply_decision();
+        let contact = finalize_contact();
+        let outcome = finalize_review_for_send(
+            review,
+            &mut decision,
+            &runtime,
+            &contact,
+            &[],
+            Vec::new(),
+            "用户最新消息",
+        );
+        let FinalizeOutcome {
+            review: finalized,
+            status,
+            ..
+        } = outcome;
+        let revision = decide_revision(&status, &finalized, false);
+        assert_eq!(
+            revision,
+            RevisionDecision::NotEligible,
+            "硬闸失败永远不能触发 revision"
+        );
     }
 }

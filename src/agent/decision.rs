@@ -187,16 +187,11 @@ pub(crate) async fn decide_reply(
 async fn load_recent_reaction_hint(state: &AppState, contact: &Contact) -> String {
     use futures::TryStreamExt;
     use mongodb::options::FindOptions;
-    let filter = doc! {
-        "workspace_id": &contact.workspace_id,
-        "account_id": &contact.account_id,
-        "contact_wxid": &contact.wxid,
-        "reaction_analysis": { "$exists": true, "$ne": {} },
-    };
+    let filter = build_reaction_hint_filter(&contact.workspace_id, &contact.account_id, &contact.wxid);
     let opts = FindOptions::builder()
-        .sort(doc! { "created_at": -1 })
-        .limit(3)
-        .projection(doc! { "reaction_analysis": 1 })
+        .sort(reaction_hint_sort())
+        .limit(REACTION_HINT_LIMIT)
+        .projection(reaction_hint_projection())
         .build();
     let cursor = match state.db.decision_reviews().clone_with_type::<Document>().find(filter, opts).await {
         Ok(c) => c,
@@ -212,11 +207,44 @@ async fn load_recent_reaction_hint(state: &AppState, contact: &Contact) -> Strin
             return String::new();
         }
     };
-    let analyses: Vec<Document> = docs
-        .into_iter()
-        .filter_map(|d| d.get_document("reaction_analysis").ok().cloned())
-        .collect();
+    let analyses: Vec<Document> = extract_reaction_analyses(docs);
     format_reaction_hint(&analyses)
+}
+
+/// 最近 reaction_analysis 的回看深度。3 条由 [`format_reaction_hint`] 渲染时再裁
+/// 一次，但 mongo 端先 limit(3) 减少 IO。
+pub(crate) const REACTION_HINT_LIMIT: i64 = 3;
+
+/// Phase A / A1 契约：取 `decision_reviews` 中本 contact 维度、且
+/// `reaction_analysis` 字段非空的行。`$exists + $ne {}` 双条件挡住既未跑过反应分析、
+/// 也跑了但落空 doc 的行——避免渲染段头但内容全空。
+pub(crate) fn build_reaction_hint_filter(
+    workspace_id: &str,
+    account_id: &str,
+    contact_wxid: &str,
+) -> Document {
+    doc! {
+        "workspace_id": workspace_id,
+        "account_id": account_id,
+        "contact_wxid": contact_wxid,
+        "reaction_analysis": { "$exists": true, "$ne": {} },
+    }
+}
+
+pub(crate) fn reaction_hint_sort() -> Document {
+    doc! { "created_at": -1 }
+}
+
+pub(crate) fn reaction_hint_projection() -> Document {
+    doc! { "reaction_analysis": 1 }
+}
+
+/// 从带 `reaction_analysis` 投影的 decision_reviews 行里抽出非空的子 Document，
+/// 喂给 [`format_reaction_hint`]。
+pub(crate) fn extract_reaction_analyses(docs: Vec<Document>) -> Vec<Document> {
+    docs.into_iter()
+        .filter_map(|d| d.get_document("reaction_analysis").ok().cloned())
+        .collect()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -707,4 +735,113 @@ pub(crate) async fn load_context_assets(state: &AppState, account_id: &str) -> A
         ));
     }
     Ok(lines.join("\n"))
+}
+
+#[cfg(test)]
+mod reaction_hint_loader_tests {
+    //! Phase A / A1：把 `load_recent_reaction_hint` 的 mongo query 形状（filter +
+    //! sort + projection + limit）抽成纯函数后，这里覆盖契约——避免 query 形状被
+    //! 静默改坏（例如 sort 顺序倒置 / projection 漏 reaction_analysis 字段）。
+    //! 端到端"DB 写入后真的能读出来"留给 #[ignore] + testcontainers。
+
+    use super::*;
+    use mongodb::bson::doc;
+
+    #[test]
+    fn reaction_hint_filter_pins_three_keys_and_requires_non_empty_analysis() {
+        let f = build_reaction_hint_filter("ws", "acct", "wx_user_1");
+        assert_eq!(f.get_str("workspace_id").ok(), Some("ws"));
+        assert_eq!(f.get_str("account_id").ok(), Some("acct"));
+        assert_eq!(f.get_str("contact_wxid").ok(), Some("wx_user_1"));
+        let cond = f
+            .get_document("reaction_analysis")
+            .expect("reaction_analysis filter present");
+        assert_eq!(cond.get_bool("$exists").ok(), Some(true));
+        let ne_doc = cond.get_document("$ne").expect("$ne sub-doc");
+        assert!(
+            ne_doc.is_empty(),
+            "$ne 应当为空 doc {{}}，挡住 reaction_analysis: {{}} 的 'falsy' 行"
+        );
+    }
+
+    #[test]
+    fn reaction_hint_sort_is_descending_by_created_at() {
+        // 取最近 3 轮 → created_at:-1。倒置会让我们读到最旧的 3 条，prompt 段就成
+        // 了"最早 3 轮"——直接破坏 reaction_hint 的语义。
+        let s = reaction_hint_sort();
+        assert_eq!(s.get_i32("created_at").ok(), Some(-1));
+    }
+
+    #[test]
+    fn reaction_hint_projection_keeps_only_reaction_analysis() {
+        // 投影只取 reaction_analysis 字段，减少传输；改回完整 doc 也能跑但会浪费 IO。
+        let p = reaction_hint_projection();
+        assert_eq!(p.get_i32("reaction_analysis").ok(), Some(1));
+    }
+
+    #[test]
+    fn reaction_hint_limit_is_three() {
+        // format_reaction_hint 自己 take(3)；这里 mongo 侧也只 limit(3)，否则会
+        // 把整段历史传上来再丢掉，浪费 mongo cursor 带宽。
+        assert_eq!(REACTION_HINT_LIMIT, 3);
+    }
+
+    #[test]
+    fn extract_reaction_analyses_filters_missing_or_non_doc() {
+        // 投影遗漏（reaction_analysis 缺失）/ 类型错误（不是 sub-doc）的行应被丢掉，
+        // 不应 panic 或污染下游 format_reaction_hint。
+        let docs = vec![
+            doc! { "reaction_analysis": { "outcomeStatus": "user_replied_objection" } },
+            doc! { "other_field": 1 }, // 没有 reaction_analysis
+            doc! { "reaction_analysis": "not a sub-doc" }, // 类型错
+            doc! { "reaction_analysis": { "outcomeStatus": "user_replied_buying_signal" } },
+        ];
+        let extracted = extract_reaction_analyses(docs);
+        assert_eq!(
+            extracted.len(),
+            2,
+            "只有两条带合法 sub-doc 的行能进入 hint 渲染"
+        );
+        assert_eq!(
+            extracted[0].get_str("outcomeStatus").ok(),
+            Some("user_replied_objection")
+        );
+        assert_eq!(
+            extracted[1].get_str("outcomeStatus").ok(),
+            Some("user_replied_buying_signal")
+        );
+    }
+
+    #[test]
+    fn extract_then_format_renders_reaction_hint_segment() {
+        // load_recent_reaction_hint 的整体契约：rows → extract → format。本测把
+        // mongo cursor 之外的链路 wire 起来一次，确保 prompt 段头与 reaction
+        // outcome 都能从 decision_reviews-shaped 文档里走通到 prompt 文本。
+        let rows = vec![
+            doc! {
+                "_id": mongodb::bson::oid::ObjectId::new(),
+                "reaction_analysis": {
+                    "outcomeStatus": "user_replied_objection",
+                    "objection": true,
+                    "summary": "对价格有顾虑"
+                },
+            },
+            doc! {
+                "_id": mongodb::bson::oid::ObjectId::new(),
+                "reaction_analysis": {
+                    "outcomeStatus": "user_replied_buying_signal",
+                    "buyingSignal": true,
+                },
+            },
+        ];
+        let analyses = extract_reaction_analyses(rows);
+        let hint = super::super::reaction::format_reaction_hint(&analyses);
+        assert!(
+            hint.contains("[最近用户反应回顾]"),
+            "段头缺失，prompt 注入失效：{hint}"
+        );
+        assert!(hint.contains("user_replied_objection"));
+        assert!(hint.contains("user_replied_buying_signal"));
+        assert!(hint.contains("摘要=对价格有顾虑"));
+    }
 }

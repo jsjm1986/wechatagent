@@ -5038,16 +5038,27 @@ function EvolutionCenterView() {
   );
 }
 
-// knowledge-wiki Phase G：Wiki 管理频道——3 个最小可用 admin 视图。
+// knowledge-wiki Phase G+：Wiki 管理频道——agent-first 渐进式披露主入口。
 //
-// - DomainSchemaTab：列 active / 历史版本，一键切换 active；fields 只读展示
-//   （新建 / 删除暂走后端 API + curl，UI 不做表单避免和 chunks 主表互锁）
-// - GapSignalsTab：列 pending 信号 + 一键 sweep + dismiss / apply
-// - ChunkRevisionsDrawer：输入 chunk_id 拉历史 timeline（drawer 形态）
-type KnowledgeWikiTab = "domainSchemas" | "gapSignals" | "revisions";
+// - AskView：调 /api/knowledge/ask，agent 自驱 list_catalog → open_chunk →
+//   follow_relations → answer，渲染答案 + cited 卡片 + tool_trace 时间线
+// - LintView：8 类 kind 计数树 + signal 列表（替代旧 GapSignalsTab）
+// - ReviewView：5 类待评审处置（needs_review / contested / source_orphan /
+//   pending_verification / dependents_pending）
+// - TreeView：3 级树（wiki_type → business_topic → chunk title），右侧
+//   ChunkDetail 透出 source_quote 黄边块 + source_anchors 锚点 + related_chunks 跳转
+// - DomainSchemaTab：列 active / 历史版本，一键切换 active
+// - ChunkRevisionsDrawer：输入 chunk_id 拉历史 timeline
+type KnowledgeWikiTab =
+  | "ask"
+  | "lint"
+  | "review"
+  | "tree"
+  | "domainSchemas"
+  | "revisions";
 
 function KnowledgeWikiView() {
-  const [tab, setTab] = useState<KnowledgeWikiTab>("domainSchemas");
+  const [tab, setTab] = useState<KnowledgeWikiTab>("ask");
   return (
     <section className="qualityCenter knowledgeWiki">
       <div className="panelHead compact">
@@ -5059,16 +5070,34 @@ function KnowledgeWikiView() {
       </div>
       <div className="qualityTabs">
         <button
+          className={tab === "ask" ? "tab active" : "tab"}
+          onClick={() => setTab("ask")}
+        >
+          知识问答
+        </button>
+        <button
+          className={tab === "lint" ? "tab active" : "tab"}
+          onClick={() => setTab("lint")}
+        >
+          质量信号
+        </button>
+        <button
+          className={tab === "review" ? "tab active" : "tab"}
+          onClick={() => setTab("review")}
+        >
+          待评审
+        </button>
+        <button
+          className={tab === "tree" ? "tab active" : "tab"}
+          onClick={() => setTab("tree")}
+        >
+          知识树
+        </button>
+        <button
           className={tab === "domainSchemas" ? "tab active" : "tab"}
           onClick={() => setTab("domainSchemas")}
         >
           行业 Schema
-        </button>
-        <button
-          className={tab === "gapSignals" ? "tab active" : "tab"}
-          onClick={() => setTab("gapSignals")}
-        >
-          质量信号
         </button>
         <button
           className={tab === "revisions" ? "tab active" : "tab"}
@@ -5077,8 +5106,11 @@ function KnowledgeWikiView() {
           编辑历史
         </button>
       </div>
+      {tab === "ask" && <AskView />}
+      {tab === "lint" && <LintView />}
+      {tab === "review" && <ReviewView />}
+      {tab === "tree" && <KnowledgeTreeView />}
       {tab === "domainSchemas" && <DomainSchemaTab />}
-      {tab === "gapSignals" && <GapSignalsTab />}
       {tab === "revisions" && <ChunkRevisionsDrawer />}
     </section>
   );
@@ -5232,21 +5264,212 @@ interface GapSignalItem {
   resolvedAt?: string | null;
 }
 
-function GapSignalsTab() {
+// 8 类 gap_signal kind —— 与 src/knowledge_wiki/gap_signals.rs:11-19 对齐。
+const GAP_SIGNAL_KINDS: { v: string; label: string }[] = [
+  { v: "orphan", label: "孤立 chunk" },
+  { v: "broken_link", label: "断链" },
+  { v: "no_outlinks", label: "缺出链" },
+  { v: "low_confidence", label: "低分被命中" },
+  { v: "stale", label: "时效已过" },
+  { v: "contradiction", label: "同题异说" },
+  { v: "missing_chunk", label: "依赖已归档" },
+  { v: "suggestion", label: "建议补完" },
+];
+
+interface AskSourceQuote {
+  chunkId: string;
+  quote: string;
+  sourceAnchorIndex?: number | null;
+}
+interface AskToolTraceStep {
+  tool: string;
+  [key: string]: unknown;
+}
+interface AskResult {
+  answer: string;
+  citedChunkIds: string[];
+  sourceQuotes: AskSourceQuote[];
+  toolTrace: AskToolTraceStep[];
+  roundsUsed: number;
+  truncated: boolean;
+  tookMs: number;
+}
+
+// AskView：把 /api/knowledge/ask 包装成"输入 → answer + cited 卡片 + tool_trace 时间线"。
+//
+// 设计要点：
+//   - 一次性 fetch 回包；agent 内部 ≤ 3 轮 LLM 由后端控制，前端只渲染最终结果
+//   - cited 卡片可折叠展开，展开后显示 source_quote 黄边引用块（与 Review 视图对齐）
+//   - tool_trace 折叠默认收起；展开后呈现 list_catalog → open_chunk → answer 三阶段时间线
+function AskView() {
+  const [query, setQuery] = useState("");
+  const [pending, setPending] = useState(false);
+  const [result, setResult] = useState<AskResult | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [showTrace, setShowTrace] = useState(false);
+  const [openCited, setOpenCited] = useState<Set<string>>(new Set());
+
+  async function submit(e?: FormEvent<HTMLFormElement>) {
+    e?.preventDefault();
+    const q = query.trim();
+    if (!q) {
+      setError("请输入问题。");
+      return;
+    }
+    setPending(true);
+    setError(null);
+    setResult(null);
+    setOpenCited(new Set());
+    setShowTrace(false);
+    try {
+      const r = await fetch("/api/knowledge/ask", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ query: q }),
+      });
+      if (!r.ok) throw new Error(await r.text());
+      const data = (await r.json()) as AskResult;
+      setResult(data);
+    } catch (err: unknown) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setPending(false);
+    }
+  }
+
+  function toggleCited(id: string) {
+    setOpenCited((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  }
+
+  // chunk_id → quote 索引，方便在 cited 卡片里直接渲染引用。
+  const quoteByChunk = useMemo(() => {
+    const m = new Map<string, AskSourceQuote>();
+    if (result) {
+      for (const q of result.sourceQuotes) m.set(q.chunkId, q);
+    }
+    return m;
+  }, [result]);
+
+  return (
+    <div className="wikiPanelBody">
+      <form className="wikiAskForm" onSubmit={submit}>
+        <textarea
+          className="wikiAskInput"
+          placeholder="问知识库一个问题（agent 自驱阅读 catalog → open_chunk → 回答）"
+          value={query}
+          onChange={(e) => setQuery(e.target.value)}
+          rows={3}
+          disabled={pending}
+        />
+        <div className="wikiAskActions">
+          <span className="wikiHint">最多 3 轮工具调用；超过预算自动收尾。</span>
+          <button type="submit" className="primary" disabled={pending || !query.trim()}>
+            <Sparkles size={14} />
+            {pending ? "思考中…" : "提问"}
+          </button>
+        </div>
+      </form>
+      {error ? <div className="wikiAlert error">{error}</div> : null}
+      {result ? (
+        <div className="wikiAskResult">
+          <div className="wikiAskMeta">
+            <span>
+              <Clock3 size={12} /> {result.tookMs} ms
+            </span>
+            <span>轮次：{result.roundsUsed}/3</span>
+            {result.truncated ? (
+              <span className="wikiBadge warn">已截断</span>
+            ) : null}
+            <span>引用：{result.citedChunkIds.length}</span>
+          </div>
+          <div className="wikiAskAnswer">{result.answer || "（agent 未给出文本回答）"}</div>
+          {result.citedChunkIds.length > 0 ? (
+            <div className="wikiCitedList">
+              <div className="wikiCitedTitle">引用 chunks</div>
+              {result.citedChunkIds.map((cid) => {
+                const q = quoteByChunk.get(cid);
+                const open = openCited.has(cid);
+                return (
+                  <div key={cid} className="wikiCitedCard">
+                    <button
+                      type="button"
+                      className="wikiCitedHead"
+                      onClick={() => toggleCited(cid)}
+                    >
+                      {open ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
+                      <code className="wikiCitedId">{cid}</code>
+                      {q ? (
+                        <span className="wikiCitedHint">含 source_quote</span>
+                      ) : (
+                        <span className="wikiCitedHint muted">无 source_quote</span>
+                      )}
+                    </button>
+                    {open && q ? (
+                      <blockquote className="wikiCitedQuote">{q.quote}</blockquote>
+                    ) : null}
+                    {open && !q ? (
+                      <p className="wikiHint">该引用未配 source_quote；请在 Review 视图补齐。</p>
+                    ) : null}
+                  </div>
+                );
+              })}
+            </div>
+          ) : null}
+          <div className="wikiToolTrace">
+            <button
+              type="button"
+              className="wikiToolTraceToggle"
+              onClick={() => setShowTrace((v) => !v)}
+            >
+              {showTrace ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
+              工具调用时间线（{result.toolTrace.length} 步）
+            </button>
+            {showTrace ? (
+              <ol className="wikiToolTraceList">
+                {result.toolTrace.map((step, i) => (
+                  <li key={i} className="wikiToolTraceStep">
+                    <span className={`wikiToolTraceTool tool-${step.tool}`}>{step.tool}</span>
+                    <code>{JSON.stringify(stripTool(step))}</code>
+                  </li>
+                ))}
+              </ol>
+            ) : null}
+          </div>
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+function stripTool(step: AskToolTraceStep): Record<string, unknown> {
+  const { tool: _tool, ...rest } = step;
+  void _tool;
+  return rest;
+}
+
+// LintView：8 类 kind 树 + signal 列表 + 处置三按钮。替代旧 GapSignalsTab。
+//
+// 树是计数视图：左侧每行 [kind label] [count]；点击切换右侧 filter。
+// 处置：dismiss（忽略）/ apply（标记已处理）；外加 sweep 一键扫描刷新。
+function LintView() {
   const [items, setItems] = useState<GapSignalItem[]>([]);
   const [loading, setLoading] = useState(false);
   const [sweeping, setSweeping] = useState(false);
   const [busyId, setBusyId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [info, setInfo] = useState<string | null>(null);
-  const [kindFilter, setKindFilter] = useState<string>("");
+  const [activeKind, setActiveKind] = useState<string>("");
 
   async function load() {
     setLoading(true);
     setError(null);
     try {
-      const params = new URLSearchParams({ status: "pending", limit: "200" });
-      if (kindFilter) params.set("kind", kindFilter);
+      const params = new URLSearchParams({ status: "pending", limit: "300" });
       const r = await fetch(`/api/knowledge/gap-signals?${params.toString()}`);
       if (!r.ok) throw new Error(await r.text());
       const data = (await r.json()) as { signals: GapSignalItem[] };
@@ -5260,8 +5483,7 @@ function GapSignalsTab() {
 
   useEffect(() => {
     void load();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [kindFilter]);
+  }, []);
 
   async function sweep() {
     setSweeping(true);
@@ -5288,11 +5510,14 @@ function GapSignalsTab() {
     setError(null);
     setInfo(null);
     try {
-      const r = await fetch(`/api/knowledge/gap-signals/${encodeURIComponent(signalId)}/${action}`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({}),
-      });
+      const r = await fetch(
+        `/api/knowledge/gap-signals/${encodeURIComponent(signalId)}/${action}`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({}),
+        },
+      );
       if (!r.ok) throw new Error(await r.text());
       setInfo(action === "dismiss" ? "已忽略" : "已标记为已应用");
       await load();
@@ -5303,17 +5528,19 @@ function GapSignalsTab() {
     }
   }
 
-  const KIND_OPTIONS = [
-    { v: "", label: "全部 kind" },
-    { v: "orphan", label: "orphan" },
-    { v: "broken_link", label: "broken_link" },
-    { v: "no_outlinks", label: "no_outlinks" },
-    { v: "low_confidence", label: "low_confidence" },
-    { v: "stale", label: "stale" },
-  ];
+  const counts = useMemo(() => {
+    const m = new Map<string, number>();
+    for (const s of items) m.set(s.kind, (m.get(s.kind) ?? 0) + 1);
+    return m;
+  }, [items]);
+
+  const visible = useMemo(() => {
+    if (!activeKind) return items;
+    return items.filter((s) => s.kind === activeKind);
+  }, [items, activeKind]);
 
   return (
-    <div className="wikiPanelBody">
+    <div className="wikiPanelBody wikiLintBody">
       <div className="wikiToolbar">
         <button type="button" className="ghost" onClick={() => void load()} disabled={loading}>
           <RefreshCw size={14} />
@@ -5322,77 +5549,712 @@ function GapSignalsTab() {
         <button type="button" className="primary" onClick={() => void sweep()} disabled={sweeping}>
           {sweeping ? "扫描中…" : "立即扫描"}
         </button>
-        <select
-          className="wikiSelect"
-          value={kindFilter}
-          onChange={(e) => setKindFilter(e.target.value)}
-        >
-          {KIND_OPTIONS.map((o) => (
-            <option key={o.v} value={o.v}>
-              {o.label}
-            </option>
-          ))}
-        </select>
-        <span className="wikiHint">仅展示 status=pending；扫描包含结构 lint + stage1 规则消解。</span>
+        <span className="wikiHint">
+          仅展示 status=pending；扫描包含 structural lint + stage 1 规则消解。
+        </span>
       </div>
       {error ? <div className="wikiAlert error">{error}</div> : null}
       {info ? <div className="wikiAlert info">{info}</div> : null}
-      {!loading && items.length === 0 ? (
-        <div className="wikiEmpty">没有 pending 信号。库结构当前看起来很健康。</div>
-      ) : null}
-      <div className="wikiSignalList">
-        {items.map((s) => (
-          <div className={`wikiSignalCard sev-${s.severity}`} key={s.signalId}>
-            <div className="wikiSignalHead">
-              <div className="wikiSignalTitle">
-                <span className={`wikiKind ${s.kind}`}>{s.kind}</span>
-                <span className={`wikiSev ${s.severity}`}>{s.severity}</span>
-                <strong>{s.title}</strong>
-              </div>
-              <div className="wikiSignalActions">
-                <button
-                  type="button"
-                  className="ghost"
-                  onClick={() => void resolve(s.signalId, "dismiss")}
-                  disabled={busyId === s.signalId}
-                >
-                  忽略
-                </button>
-                <button
-                  type="button"
-                  className="primary"
-                  onClick={() => void resolve(s.signalId, "apply")}
-                  disabled={busyId === s.signalId}
-                >
-                  标记已处理
-                </button>
-              </div>
+      <div className="wikiLintLayout">
+        <div className="wikiLintTree">
+          <button
+            type="button"
+            className={`wikiLintTreeNode ${activeKind === "" ? "active" : ""}`}
+            onClick={() => setActiveKind("")}
+          >
+            <span>全部</span>
+            <span className="wikiLintCount">{items.length}</span>
+          </button>
+          {GAP_SIGNAL_KINDS.map((k) => {
+            const c = counts.get(k.v) ?? 0;
+            return (
+              <button
+                type="button"
+                key={k.v}
+                className={`wikiLintTreeNode ${activeKind === k.v ? "active" : ""} ${
+                  c === 0 ? "empty" : ""
+                }`}
+                onClick={() => setActiveKind(k.v)}
+              >
+                <span>
+                  <span className={`wikiKind ${k.v}`}>{k.v}</span> {k.label}
+                </span>
+                <span className="wikiLintCount">{c}</span>
+              </button>
+            );
+          })}
+        </div>
+        <div className="wikiLintPanel">
+          {!loading && visible.length === 0 ? (
+            <div className="wikiEmpty">
+              {activeKind ? `当前 kind 没有 pending 信号。` : "没有 pending 信号。库结构当前看起来很健康。"}
             </div>
-            <p className="wikiSignalDesc">{s.description}</p>
-            {s.affectedChunkIds.length > 0 ? (
-              <div className="wikiSignalRefs">
-                <span className="wikiSignalLabel">affected：</span>
-                {s.affectedChunkIds.slice(0, 8).map((id) => (
-                  <code key={id}>{id}</code>
-                ))}
-                {s.affectedChunkIds.length > 8 ? (
-                  <span className="wikiHint">+{s.affectedChunkIds.length - 8}</span>
+          ) : null}
+          <div className="wikiSignalList">
+            {visible.map((s) => (
+              <div className={`wikiSignalCard sev-${s.severity}`} key={s.signalId}>
+                <div className="wikiSignalHead">
+                  <div className="wikiSignalTitle">
+                    <span className={`wikiKind ${s.kind}`}>{s.kind}</span>
+                    <span className={`wikiSev ${s.severity}`}>{s.severity}</span>
+                    <strong>{s.title}</strong>
+                  </div>
+                  <div className="wikiSignalActions">
+                    <button
+                      type="button"
+                      className="ghost"
+                      onClick={() => void resolve(s.signalId, "dismiss")}
+                      disabled={busyId === s.signalId}
+                    >
+                      忽略
+                    </button>
+                    <button
+                      type="button"
+                      className="primary"
+                      onClick={() => void resolve(s.signalId, "apply")}
+                      disabled={busyId === s.signalId}
+                    >
+                      标记已处理
+                    </button>
+                  </div>
+                </div>
+                <p className="wikiSignalDesc">{s.description}</p>
+                {s.affectedChunkIds.length > 0 ? (
+                  <div className="wikiSignalRefs">
+                    <span className="wikiSignalLabel">affected：</span>
+                    {s.affectedChunkIds.slice(0, 8).map((id) => (
+                      <code key={id}>{id}</code>
+                    ))}
+                    {s.affectedChunkIds.length > 8 ? (
+                      <span className="wikiHint">+{s.affectedChunkIds.length - 8}</span>
+                    ) : null}
+                  </div>
+                ) : null}
+                {s.searchQueries.length > 0 ? (
+                  <div className="wikiSignalRefs">
+                    <span className="wikiSignalLabel">queries：</span>
+                    {s.searchQueries.slice(0, 5).map((q, i) => (
+                      <code key={`${s.signalId}-q-${i}`}>{q}</code>
+                    ))}
+                  </div>
                 ) : null}
               </div>
-            ) : null}
-            {s.searchQueries.length > 0 ? (
-              <div className="wikiSignalRefs">
-                <span className="wikiSignalLabel">queries：</span>
-                {s.searchQueries.slice(0, 5).map((q, i) => (
-                  <code key={`${s.signalId}-q-${i}`}>{q}</code>
-                ))}
-              </div>
-            ) : null}
+            ))}
           </div>
-        ))}
+        </div>
       </div>
     </div>
   );
+}
+
+// ReviewView：把 active chunks 客户端分类成 5 类待评审视图。
+//
+// 5 类（互斥优先级，从严到宽）：
+//   1. contested            integrityStatus=rejected — 被否的需要重新审视
+//   2. needs_review         integrityStatus=needs_review — 等待运营初审
+//   3. source_orphan        缺 sourceQuote 或 sourceAnchors — 无法定位回源文档
+//   4. pending_verification integrityStatus=needs_review 且 已有 sourceQuote — 距离 verify 一步之遥
+//   5. dependents_pending   relatedChunks 引用的 chunk 不在当前活跃集合 — 关系链残缺
+//
+// 处置走现有路由：
+//   - Verify  → POST /api/operation-knowledge/chunks/:id/verify
+//   - Reject  → POST /api/operation-knowledge/chunks/:id/reject
+//   - Patch   → 切到 编辑历史 tab，用户用现有 ChunkRevisionsDrawer 修
+//
+// AI 永不自动 verify：所有按钮都是显式管理员维护动作，前端不做"批量自动 verify"。
+type ReviewCategory =
+  | "contested"
+  | "needs_review"
+  | "source_orphan"
+  | "pending_verification"
+  | "dependents_pending";
+
+interface ReviewChunkItem {
+  id: string;
+  workspaceId?: string;
+  accountId?: string | null;
+  title: string;
+  summary?: string | null;
+  body?: string | null;
+  sourceQuote?: string | null;
+  sourceAnchors?: unknown[] | null;
+  integrityStatus?: string | null;
+  status?: string | null;
+  wikiType?: string | null;
+  relatedChunks?: { chunk_id: string; kind: string; note?: string | null }[] | null;
+  updatedAt?: string | null;
+}
+
+const REVIEW_CATEGORIES: { v: ReviewCategory; label: string; hint: string }[] = [
+  { v: "contested", label: "被否决", hint: "integrity_status=rejected — 已被管理员或 AI 否决，等待重新评估" },
+  { v: "needs_review", label: "待初审", hint: "integrity_status=needs_review — 等待管理员初审或补完证据" },
+  { v: "source_orphan", label: "缺源", hint: "缺 source_quote 或 source_anchors — 无法定位回原文档" },
+  { v: "pending_verification", label: "待 verify", hint: "已经有 source_quote，距 verify 一步之遥" },
+  { v: "dependents_pending", label: "关系残缺", hint: "related_chunks 引用了不在活跃集合中的 chunk" }
+];
+
+function ReviewView() {
+  const [items, setItems] = useState<ReviewChunkItem[]>([]);
+  const [loading, setLoading] = useState(false);
+  const [busyId, setBusyId] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [info, setInfo] = useState<string | null>(null);
+  const [activeCategory, setActiveCategory] = useState<ReviewCategory>("needs_review");
+  const [openBody, setOpenBody] = useState<Set<string>>(new Set());
+
+  async function load() {
+    setLoading(true);
+    setError(null);
+    try {
+      const r = await fetch("/api/operation-knowledge/chunks");
+      if (!r.ok) throw new Error(await r.text());
+      const data = (await r.json()) as { items: ReviewChunkItem[] };
+      setItems(data.items ?? []);
+    } catch (e: unknown) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  useEffect(() => {
+    void load();
+  }, []);
+
+  // 按优先级把每个 chunk 归入第一个命中的类别。
+  // 注意：active chunks 列表也包含 status=rejected 的（status 与 integrity_status 是两条轴）；
+  // contested 走 integrity_status，本视图不再二次过滤 status。
+  const classified = useMemo(() => {
+    const byId = new Set(items.map((i) => i.id));
+    const out = new Map<ReviewCategory, ReviewChunkItem[]>();
+    for (const cat of REVIEW_CATEGORIES) out.set(cat.v, []);
+    for (const it of items) {
+      const cat = classifyChunk(it, byId);
+      if (cat) out.get(cat)!.push(it);
+    }
+    return out;
+  }, [items]);
+
+  const counts = useMemo(() => {
+    const m = new Map<ReviewCategory, number>();
+    for (const cat of REVIEW_CATEGORIES) m.set(cat.v, classified.get(cat.v)?.length ?? 0);
+    return m;
+  }, [classified]);
+
+  const visible = classified.get(activeCategory) ?? [];
+
+  function toggleBody(id: string) {
+    setOpenBody((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  }
+
+  async function verify(id: string) {
+    setBusyId(id);
+    setError(null);
+    setInfo(null);
+    try {
+      const r = await fetch(
+        `/api/operation-knowledge/chunks/${encodeURIComponent(id)}/verify`,
+        { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({}) }
+      );
+      if (!r.ok) throw new Error(await r.text());
+      setInfo(`已 verify：${id}`);
+      await load();
+    } catch (e: unknown) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusyId(null);
+    }
+  }
+
+  async function reject(id: string) {
+    setBusyId(id);
+    setError(null);
+    setInfo(null);
+    try {
+      const r = await fetch(
+        `/api/operation-knowledge/chunks/${encodeURIComponent(id)}/reject`,
+        { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({}) }
+      );
+      if (!r.ok) throw new Error(await r.text());
+      setInfo(`已 reject：${id}`);
+      await load();
+    } catch (e: unknown) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusyId(null);
+    }
+  }
+
+  return (
+    <div className="wikiPanelBody wikiReviewBody">
+      <div className="wikiToolbar">
+        <button type="button" className="ghost" onClick={() => void load()} disabled={loading}>
+          <RefreshCw size={14} />
+          {loading ? "加载中…" : "刷新"}
+        </button>
+        <span className="wikiHint">
+          仅展示活跃 chunks。verify / reject 直接走现有路由，AI 永不自动 verify。
+        </span>
+      </div>
+      {error ? <div className="wikiAlert error">{error}</div> : null}
+      {info ? <div className="wikiAlert info">{info}</div> : null}
+      <div className="wikiLintLayout">
+        <div className="wikiReviewFilter">
+          {REVIEW_CATEGORIES.map((cat) => {
+            const c = counts.get(cat.v) ?? 0;
+            return (
+              <button
+                type="button"
+                key={cat.v}
+                className={`wikiLintTreeNode ${activeCategory === cat.v ? "active" : ""} ${
+                  c === 0 ? "empty" : ""
+                }`}
+                onClick={() => setActiveCategory(cat.v)}
+                title={cat.hint}
+              >
+                <span>{cat.label}</span>
+                <span className="wikiLintCount">{c}</span>
+              </button>
+            );
+          })}
+        </div>
+        <div className="wikiLintPanel">
+          {!loading && visible.length === 0 ? (
+            <div className="wikiEmpty">
+              当前类别没有待评审 chunk。
+            </div>
+          ) : null}
+          <div className="wikiSignalList">
+            {visible.map((c) => {
+              const open = openBody.has(c.id);
+              const hasQuote = !!c.sourceQuote && c.sourceQuote.trim().length > 0;
+              const hasAnchor = (c.sourceAnchors?.length ?? 0) > 0;
+              return (
+                <div className="wikiReviewChunkCard" key={c.id}>
+                  <div className="wikiSignalHead">
+                    <div className="wikiSignalTitle">
+                      <span className={`wikiKind ${c.wikiType ?? "unknown"}`}>{c.wikiType ?? "—"}</span>
+                      <span className={`wikiSev ${c.integrityStatus === "rejected" ? "error" : "info"}`}>
+                        {c.integrityStatus ?? "—"}
+                      </span>
+                      <strong>{c.title}</strong>
+                    </div>
+                    <div className="wikiSignalActions">
+                      <button
+                        type="button"
+                        className="wikiReviewActionBtn verify"
+                        onClick={() => void verify(c.id)}
+                        disabled={busyId === c.id || !hasQuote || !hasAnchor}
+                        title={!hasQuote || !hasAnchor ? "verify gate：需 sourceQuote + sourceAnchors 全有" : "标记为 verified"}
+                      >
+                        <CheckCircle2 size={14} />
+                        Verify
+                      </button>
+                      <button
+                        type="button"
+                        className="wikiReviewActionBtn reject"
+                        onClick={() => void reject(c.id)}
+                        disabled={busyId === c.id}
+                      >
+                        <X size={14} />
+                        Reject
+                      </button>
+                    </div>
+                  </div>
+                  {c.summary ? <p className="wikiSignalDesc">{c.summary}</p> : null}
+                  {hasQuote ? (
+                    <blockquote className="wikiReviewSourceQuote">{c.sourceQuote}</blockquote>
+                  ) : (
+                    <div className="wikiHint">未配 source_quote — verify gate 将硬挡。</div>
+                  )}
+                  <div className="wikiReviewMeta">
+                    <span>id：<code>{c.id}</code></span>
+                    {hasAnchor ? (
+                      <span>anchors：{c.sourceAnchors?.length ?? 0}</span>
+                    ) : (
+                      <span className="wikiBadge warn">无 anchors</span>
+                    )}
+                    {c.relatedChunks && c.relatedChunks.length > 0 ? (
+                      <span>related：{c.relatedChunks.length}</span>
+                    ) : null}
+                    <button
+                      type="button"
+                      className="wikiCitedHead"
+                      onClick={() => toggleBody(c.id)}
+                    >
+                      {open ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
+                      {open ? "收起正文" : "展开正文"}
+                    </button>
+                  </div>
+                  {open && c.body ? <pre className="wikiReviewBodyText">{c.body}</pre> : null}
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function classifyChunk(
+  c: ReviewChunkItem,
+  activeIds: Set<string>
+): ReviewCategory | null {
+  // 优先级：contested > needs_review > source_orphan > pending_verification > dependents_pending
+  if (c.integrityStatus === "rejected") return "contested";
+  const hasQuote = !!c.sourceQuote && c.sourceQuote.trim().length > 0;
+  const hasAnchor = (c.sourceAnchors?.length ?? 0) > 0;
+  if (c.integrityStatus === "needs_review") {
+    if (!hasQuote || !hasAnchor) return "source_orphan";
+    return "pending_verification";
+  }
+  if (!hasQuote || !hasAnchor) return "source_orphan";
+  if (c.relatedChunks && c.relatedChunks.length > 0) {
+    const broken = c.relatedChunks.some((r) => !activeIds.has(r.chunk_id));
+    if (broken) return "dependents_pending";
+  }
+  // verified 且关系完好的 chunk 不进 review 视图。
+  return null;
+}
+
+// KnowledgeTreeView：3 级树（wiki_type → business_topic → chunk title），右侧
+// ChunkDetail 透出 source_quote 黄边块 + source_anchors 锚点 + related_chunks 跳转。
+//
+// 数据全部从 /api/operation-knowledge/chunks 取，纯客户端聚合：
+//   l1: 9 类 wiki_type（source / entity / concept / comparison / synthesis /
+//        methodology / finding / query / thesis；缺省落 "未分类"）
+//   l2: chunk.business_topics[0]（缺省 "通用"）
+//   l3: chunk.title（点击进入右侧 detail）
+//
+// 右侧 ChunkDetail 用同一个 chunk 数据渲染：
+//   - title + wikiType + integrityStatus + status badge
+//   - summary
+//   - source_quote 黄边引用块（与 Review / Ask 视图风格一致）
+//   - source_anchors 锚点列表：[startLine-endLine] [hash 短前缀]，hover 显示
+//     完整 quoteHash + offsets；点击复制 anchor JSON 到剪贴板
+//   - related_chunks 跳转 chip：点击切到目标 chunk
+//   - body 默认收起；展开后用 <pre> 渲染原文（white-space pre-wrap）
+//
+// 全部只读：本视图不修改 chunk，verify / reject 走 ReviewView。
+const WIKI_TYPES_ORDER: { v: string; label: string }[] = [
+  { v: "source", label: "原始资料 source" },
+  { v: "entity", label: "实体 entity" },
+  { v: "concept", label: "概念 concept" },
+  { v: "comparison", label: "对比 comparison" },
+  { v: "synthesis", label: "综合 synthesis" },
+  { v: "methodology", label: "方法论 methodology" },
+  { v: "finding", label: "结论 finding" },
+  { v: "query", label: "查询 query" },
+  { v: "thesis", label: "命题 thesis" },
+  { v: "unknown", label: "未分类" }
+];
+
+interface TreeChunkItem extends ReviewChunkItem {
+  businessTopics?: string[] | null;
+}
+
+function KnowledgeTreeView() {
+  const [items, setItems] = useState<TreeChunkItem[]>([]);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [info, setInfo] = useState<string | null>(null);
+  const [activeId, setActiveId] = useState<string | null>(null);
+  const [expandL1, setExpandL1] = useState<Set<string>>(new Set());
+  const [expandL2, setExpandL2] = useState<Set<string>>(new Set()); // key = `${l1}|${l2}`
+  const [showBody, setShowBody] = useState(false);
+
+  async function load() {
+    setLoading(true);
+    setError(null);
+    try {
+      const r = await fetch("/api/operation-knowledge/chunks");
+      if (!r.ok) throw new Error(await r.text());
+      const data = (await r.json()) as { items: TreeChunkItem[] };
+      setItems(data.items ?? []);
+    } catch (e: unknown) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  useEffect(() => {
+    void load();
+  }, []);
+
+  const tree = useMemo(() => {
+    // l1Key -> l2Key -> chunk[]
+    const t = new Map<string, Map<string, TreeChunkItem[]>>();
+    for (const it of items) {
+      const l1 = it.wikiType ?? "unknown";
+      const l2 = (it.businessTopics && it.businessTopics[0]) || "通用";
+      if (!t.has(l1)) t.set(l1, new Map());
+      const lvl2 = t.get(l1)!;
+      if (!lvl2.has(l2)) lvl2.set(l2, []);
+      lvl2.get(l2)!.push(it);
+    }
+    return t;
+  }, [items]);
+
+  const indexById = useMemo(() => {
+    const m = new Map<string, TreeChunkItem>();
+    for (const it of items) m.set(it.id, it);
+    return m;
+  }, [items]);
+
+  const active = activeId ? indexById.get(activeId) ?? null : null;
+
+  function toggleL1(k: string) {
+    setExpandL1((prev) => {
+      const next = new Set(prev);
+      if (next.has(k)) next.delete(k);
+      else next.add(k);
+      return next;
+    });
+  }
+  function toggleL2(k: string) {
+    setExpandL2((prev) => {
+      const next = new Set(prev);
+      if (next.has(k)) next.delete(k);
+      else next.add(k);
+      return next;
+    });
+  }
+
+  function selectChunk(id: string) {
+    setActiveId(id);
+    setShowBody(false);
+    setInfo(null);
+    // 自动展开它所在路径
+    const it = indexById.get(id);
+    if (it) {
+      const l1 = it.wikiType ?? "unknown";
+      const l2 = (it.businessTopics && it.businessTopics[0]) || "通用";
+      setExpandL1((prev) => new Set(prev).add(l1));
+      setExpandL2((prev) => new Set(prev).add(`${l1}|${l2}`));
+    }
+  }
+
+  async function copyAnchor(anchor: Record<string, unknown>) {
+    try {
+      await navigator.clipboard.writeText(JSON.stringify(anchor, null, 2));
+      setInfo("已复制 anchor JSON 到剪贴板");
+    } catch (e: unknown) {
+      setError(e instanceof Error ? e.message : String(e));
+    }
+  }
+
+  return (
+    <div className="wikiPanelBody wikiTreeBody">
+      <div className="wikiToolbar">
+        <button type="button" className="ghost" onClick={() => void load()} disabled={loading}>
+          <RefreshCw size={14} />
+          {loading ? "加载中…" : "刷新"}
+        </button>
+        <span className="wikiHint">
+          只读视图。verify / reject 请去"待评审"，编辑请去"编辑历史"。
+        </span>
+      </div>
+      {error ? <div className="wikiAlert error">{error}</div> : null}
+      {info ? <div className="wikiAlert info">{info}</div> : null}
+      <div className="wikiLintLayout wikiTreeLayout">
+        <div className="wikiTreePane">
+          {WIKI_TYPES_ORDER.map((t) => {
+            const lvl2 = tree.get(t.v);
+            const total = lvl2
+              ? Array.from(lvl2.values()).reduce((acc, arr) => acc + arr.length, 0)
+              : 0;
+            const expanded = expandL1.has(t.v);
+            return (
+              <div key={t.v} className="wikiTreeBlock">
+                <button
+                  type="button"
+                  className={`wikiTreeNode l1 ${total === 0 ? "empty" : ""}`}
+                  onClick={() => toggleL1(t.v)}
+                >
+                  {expanded ? <ChevronDown size={12} /> : <ChevronRight size={12} />}
+                  <span className={`wikiKind ${t.v}`}>{t.v}</span>
+                  <span className="wikiTreeLabel">{t.label}</span>
+                  <span className="wikiLintCount">{total}</span>
+                </button>
+                {expanded && lvl2 ? (
+                  <div className="wikiTreeChildren">
+                    {Array.from(lvl2.entries())
+                      .sort((a, b) => a[0].localeCompare(b[0]))
+                      .map(([topic, chunks]) => {
+                        const k = `${t.v}|${topic}`;
+                        const open2 = expandL2.has(k);
+                        return (
+                          <div key={k} className="wikiTreeBlock">
+                            <button
+                              type="button"
+                              className="wikiTreeNode l2"
+                              onClick={() => toggleL2(k)}
+                            >
+                              {open2 ? <ChevronDown size={12} /> : <ChevronRight size={12} />}
+                              <span className="wikiTreeLabel">{topic}</span>
+                              <span className="wikiLintCount">{chunks.length}</span>
+                            </button>
+                            {open2 ? (
+                              <div className="wikiTreeChildren">
+                                {chunks
+                                  .slice()
+                                  .sort((a, b) => a.title.localeCompare(b.title))
+                                  .map((c) => (
+                                    <button
+                                      type="button"
+                                      key={c.id}
+                                      className={`wikiTreeNode l3 ${
+                                        activeId === c.id ? "active" : ""
+                                      }`}
+                                      onClick={() => selectChunk(c.id)}
+                                      title={c.title}
+                                    >
+                                      <span className="wikiTreeLabel">{c.title}</span>
+                                    </button>
+                                  ))}
+                              </div>
+                            ) : null}
+                          </div>
+                        );
+                      })}
+                  </div>
+                ) : null}
+              </div>
+            );
+          })}
+        </div>
+        <div className="wikiTreeDetail">
+          {!active ? (
+            <div className="wikiEmpty">从左侧选择一个 chunk 查看详情。</div>
+          ) : (
+            <ChunkDetail
+              chunk={active}
+              showBody={showBody}
+              onToggleBody={() => setShowBody((v) => !v)}
+              onJump={selectChunk}
+              onCopyAnchor={(a) => void copyAnchor(a)}
+              indexById={indexById}
+            />
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function ChunkDetail(props: {
+  chunk: TreeChunkItem;
+  showBody: boolean;
+  onToggleBody: () => void;
+  onJump: (id: string) => void;
+  onCopyAnchor: (anchor: Record<string, unknown>) => void;
+  indexById: Map<string, TreeChunkItem>;
+}) {
+  const { chunk, showBody, onToggleBody, onJump, onCopyAnchor, indexById } = props;
+  const hasQuote = !!chunk.sourceQuote && chunk.sourceQuote.trim().length > 0;
+  const anchors = (chunk.sourceAnchors as Record<string, unknown>[] | null) ?? [];
+  const related = chunk.relatedChunks ?? [];
+
+  return (
+    <article className="wikiChunkDetail">
+      <header className="wikiChunkDetailHead">
+        <div className="wikiChunkDetailTitle">
+          <span className={`wikiKind ${chunk.wikiType ?? "unknown"}`}>{chunk.wikiType ?? "—"}</span>
+          <h3>{chunk.title}</h3>
+        </div>
+        <div className="wikiChunkDetailMeta">
+          <span className={`wikiSev ${chunk.integrityStatus === "rejected" ? "error" : "info"}`}>
+            {chunk.integrityStatus ?? "—"}
+          </span>
+          <span className="wikiBadge">{chunk.status ?? "—"}</span>
+          <code>{chunk.id}</code>
+        </div>
+      </header>
+      {chunk.summary ? <p className="wikiChunkSummary">{chunk.summary}</p> : null}
+      {hasQuote ? (
+        <blockquote className="wikiSourceQuote">{chunk.sourceQuote}</blockquote>
+      ) : (
+        <div className="wikiHint">无 source_quote — 该 chunk 不可被 verify。</div>
+      )}
+      {anchors.length > 0 ? (
+        <section className="wikiSourceAnchorsSection">
+          <div className="wikiSectionTitle">source_anchors（{anchors.length}）</div>
+          <div className="wikiSourceAnchorList">
+            {anchors.map((a, i) => {
+              const sl = numberOr(a["startLine"]);
+              const el = numberOr(a["endLine"]);
+              const so = numberOr(a["startOffset"]);
+              const eo = numberOr(a["endOffset"]);
+              const hash = stringOr(a["quoteHash"]);
+              const docId = stringOr(a["documentId"]);
+              return (
+                <button
+                  type="button"
+                  key={`${chunk.id}-anchor-${i}`}
+                  className="wikiSourceAnchor"
+                  onClick={() => onCopyAnchor(a)}
+                  title={`复制 anchor JSON\nhash=${hash}\noffset=${so}-${eo}${
+                    docId ? `\ndoc=${docId}` : ""
+                  }`}
+                >
+                  <span className="wikiSourceAnchorRange">L{sl}-L{el}</span>
+                  {hash ? (
+                    <code className="wikiSourceAnchorHash">{hash.slice(0, 12)}…</code>
+                  ) : null}
+                  {docId ? <span className="wikiBadge">doc</span> : null}
+                </button>
+              );
+            })}
+          </div>
+        </section>
+      ) : null}
+      {related.length > 0 ? (
+        <section>
+          <div className="wikiSectionTitle">related_chunks（{related.length}）</div>
+          <div className="wikiRelatedList">
+            {related.map((r, i) => {
+              const target = indexById.get(r.chunk_id);
+              const dead = !target;
+              return (
+                <button
+                  type="button"
+                  key={`${chunk.id}-rel-${i}`}
+                  className={`wikiRelatedChip ${dead ? "dead" : ""}`}
+                  disabled={dead}
+                  onClick={() => onJump(r.chunk_id)}
+                  title={dead ? "目标 chunk 不在活跃集合（已 archived 或不存在）" : r.note ?? ""}
+                >
+                  <span className="wikiRelatedKind">{r.kind}</span>
+                  <span className="wikiRelatedTitle">{target ? target.title : r.chunk_id}</span>
+                </button>
+              );
+            })}
+          </div>
+        </section>
+      ) : null}
+      <section>
+        <button type="button" className="wikiCitedHead" onClick={onToggleBody}>
+          {showBody ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
+          {showBody ? "收起正文" : "展开正文"}
+        </button>
+        {showBody && chunk.body ? <pre className="wikiReviewBodyText">{chunk.body}</pre> : null}
+      </section>
+    </article>
+  );
+}
+
+function numberOr(v: unknown): number {
+  return typeof v === "number" ? v : Number(v ?? 0) || 0;
+}
+function stringOr(v: unknown): string {
+  return typeof v === "string" ? v : "";
 }
 
 interface ChunkRevisionItem {

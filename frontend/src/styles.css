@@ -4032,3 +4032,615 @@ td:nth-child(3) {
   max-height: 360px;
   overflow: auto;
 }
+
+/* ── AskView：知识问答 ─────────────────────────────────── */
+.knowledgeWiki .wikiAskForm {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-bottom: 12px;
+}
+.knowledgeWiki .wikiAskInput {
+  width: 100%;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--surface);
+  color: var(--ink);
+  font-size: 13px;
+  font-family: inherit;
+  line-height: 1.55;
+  resize: vertical;
+  min-height: 64px;
+}
+.knowledgeWiki .wikiAskInput:focus {
+  outline: 2px solid var(--accent);
+  outline-offset: -1px;
+}
+.knowledgeWiki .wikiAskActions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+.knowledgeWiki .wikiAskResult {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  margin-top: 8px;
+}
+.knowledgeWiki .wikiAskMeta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  align-items: center;
+  font-size: 12px;
+  color: var(--ink-muted);
+}
+.knowledgeWiki .wikiAskMeta > span {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+.knowledgeWiki .wikiBadge.warn {
+  background: #fff2dc;
+  color: #92651a;
+  padding: 1px 6px;
+  border-radius: 3px;
+  font-size: 11px;
+}
+.knowledgeWiki .wikiAskAnswer {
+  padding: 12px 14px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--accent);
+  border-radius: 6px;
+  font-size: 13.5px;
+  line-height: 1.7;
+  color: var(--ink);
+  white-space: pre-wrap;
+}
+.knowledgeWiki .wikiCitedList {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.knowledgeWiki .wikiCitedTitle {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--ink-muted);
+  letter-spacing: 0.3px;
+  text-transform: uppercase;
+}
+.knowledgeWiki .wikiCitedCard {
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--surface);
+}
+.knowledgeWiki .wikiCitedHead {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px;
+  background: transparent;
+  border: 0;
+  cursor: pointer;
+  font-size: 12.5px;
+  text-align: left;
+  color: var(--ink);
+}
+.knowledgeWiki .wikiCitedHead:hover {
+  background: var(--surface-soft);
+}
+.knowledgeWiki .wikiCitedId {
+  font-family: ui-monospace, "SFMono-Regular", Menlo, monospace;
+  font-size: 11.5px;
+  background: var(--surface-soft);
+  padding: 2px 6px;
+  border-radius: 4px;
+  color: #2f3a52;
+}
+.knowledgeWiki .wikiCitedHint {
+  font-size: 11.5px;
+  color: var(--ink-muted);
+  margin-left: auto;
+}
+.knowledgeWiki .wikiCitedHint.muted {
+  color: #b4b4b4;
+}
+.knowledgeWiki .wikiCitedQuote {
+  margin: 0;
+  padding: 10px 12px 10px 14px;
+  border-left: 3px solid #d29419;
+  background: #fff8eb;
+  color: #5a4317;
+  font-size: 12.5px;
+  line-height: 1.6;
+  border-radius: 0 0 6px 6px;
+}
+.knowledgeWiki .wikiToolTrace {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.knowledgeWiki .wikiToolTraceToggle {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  background: transparent;
+  border: 0;
+  padding: 4px 0;
+  cursor: pointer;
+  font-size: 12px;
+  color: var(--ink-muted);
+}
+.knowledgeWiki .wikiToolTraceToggle:hover {
+  color: var(--ink);
+}
+.knowledgeWiki .wikiToolTraceList {
+  list-style: none;
+  margin: 0;
+  padding: 8px 12px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 11.5px;
+}
+.knowledgeWiki .wikiToolTraceStep {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 0;
+  border-bottom: 1px dashed var(--border);
+}
+.knowledgeWiki .wikiToolTraceStep:last-child {
+  border-bottom: 0;
+}
+.knowledgeWiki .wikiToolTraceTool {
+  flex: 0 0 auto;
+  padding: 2px 6px;
+  border-radius: 4px;
+  font-family: ui-monospace, "SFMono-Regular", Menlo, monospace;
+  background: var(--surface-soft);
+  color: #2f3a52;
+  text-transform: lowercase;
+  letter-spacing: 0.3px;
+}
+.knowledgeWiki .wikiToolTraceTool.tool-list_catalog {
+  background: #e7f0fb;
+  color: #335a90;
+}
+.knowledgeWiki .wikiToolTraceTool.tool-open_chunk {
+  background: #e6f4ea;
+  color: #2f6b3c;
+}
+.knowledgeWiki .wikiToolTraceTool.tool-follow_relations {
+  background: #f5e8fa;
+  color: #6c3a82;
+}
+.knowledgeWiki .wikiToolTraceTool.tool-answer {
+  background: #fff2dc;
+  color: #92651a;
+}
+.knowledgeWiki .wikiToolTraceStep code {
+  flex: 1 1 auto;
+  font-family: ui-monospace, "SFMono-Regular", Menlo, monospace;
+  font-size: 11px;
+  color: var(--ink-muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* ── LintView：左树 + 右列表 ───────────────────────────── */
+.knowledgeWiki .wikiLintBody {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.knowledgeWiki .wikiLintLayout {
+  display: grid;
+  grid-template-columns: 220px 1fr;
+  gap: 12px;
+  align-items: start;
+}
+.knowledgeWiki .wikiLintTree {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 6px;
+  background: var(--surface);
+  position: sticky;
+  top: 8px;
+}
+.knowledgeWiki .wikiLintTreeNode {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 8px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  font-size: 12.5px;
+  text-align: left;
+  color: var(--ink);
+  cursor: pointer;
+}
+.knowledgeWiki .wikiLintTreeNode:hover {
+  background: var(--surface-soft);
+}
+.knowledgeWiki .wikiLintTreeNode.active {
+  background: var(--accent-soft, #e7f0fb);
+  color: var(--accent, #335a90);
+  font-weight: 600;
+}
+.knowledgeWiki .wikiLintTreeNode.empty {
+  color: #b4b4b4;
+}
+.knowledgeWiki .wikiLintTreeNode.empty .wikiKind {
+  opacity: 0.5;
+}
+.knowledgeWiki .wikiLintCount {
+  font-family: ui-monospace, "SFMono-Regular", Menlo, monospace;
+  font-size: 11.5px;
+  background: var(--surface-soft);
+  padding: 1px 6px;
+  border-radius: 8px;
+  color: var(--ink-muted);
+}
+.knowledgeWiki .wikiLintTreeNode.active .wikiLintCount {
+  background: #fff;
+  color: var(--accent, #335a90);
+}
+.knowledgeWiki .wikiLintPanel {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-width: 0;
+}
+.knowledgeWiki .wikiSignalCard.sev-error {
+  border-left-color: #c43a3a;
+}
+.knowledgeWiki .wikiSev.error {
+  background: #fce7e7;
+  color: #8a2222;
+}
+
+/* knowledge-wiki Phase G+ · ReviewView 5 类待评审处置 */
+.knowledgeWiki .wikiReviewBody {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+.knowledgeWiki .wikiReviewFilter {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 6px;
+  background: var(--surface-soft);
+  border: 1px solid var(--border, #e3e6ec);
+  border-radius: 8px;
+  height: fit-content;
+}
+.knowledgeWiki .wikiReviewChunkCard {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 12px 14px;
+  background: #fff;
+  border: 1px solid var(--border, #e3e6ec);
+  border-left: 3px solid var(--accent, #335a90);
+  border-radius: 8px;
+}
+.knowledgeWiki .wikiReviewSourceQuote {
+  margin: 0;
+  padding: 8px 12px;
+  background: #fff8eb;
+  border-left: 3px solid #d29419;
+  color: #5b3a08;
+  font-size: 13px;
+  line-height: 1.55;
+  white-space: pre-wrap;
+  border-radius: 4px;
+}
+.knowledgeWiki .wikiReviewMeta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  align-items: center;
+  font-size: 12px;
+  color: var(--ink-muted);
+}
+.knowledgeWiki .wikiReviewMeta code {
+  font-family: ui-monospace, "SFMono-Regular", Menlo, monospace;
+  font-size: 11.5px;
+  background: var(--surface-soft);
+  padding: 1px 6px;
+  border-radius: 4px;
+}
+.knowledgeWiki .wikiReviewBodyText {
+  margin: 0;
+  padding: 10px 12px;
+  background: var(--surface-soft);
+  border-radius: 6px;
+  font-family: ui-monospace, "SFMono-Regular", Menlo, monospace;
+  font-size: 12px;
+  line-height: 1.55;
+  white-space: pre-wrap;
+  max-height: 320px;
+  overflow: auto;
+}
+.knowledgeWiki .wikiReviewActionBtn {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 10px;
+  font-size: 12px;
+  border-radius: 6px;
+  border: 1px solid transparent;
+  cursor: pointer;
+  transition: background 120ms ease, border-color 120ms ease, color 120ms ease;
+}
+.knowledgeWiki .wikiReviewActionBtn.verify {
+  background: #e6f4ea;
+  color: #1d6f3b;
+  border-color: #b6dfc2;
+}
+.knowledgeWiki .wikiReviewActionBtn.verify:hover:not(:disabled) {
+  background: #d3eddc;
+  border-color: #95cda8;
+}
+.knowledgeWiki .wikiReviewActionBtn.verify:disabled {
+  background: #f1f3f4;
+  color: #9aa0a6;
+  border-color: #e3e6ec;
+  cursor: not-allowed;
+}
+.knowledgeWiki .wikiReviewActionBtn.reject {
+  background: #fce7e7;
+  color: #8a2222;
+  border-color: #f0bdbd;
+}
+.knowledgeWiki .wikiReviewActionBtn.reject:hover:not(:disabled) {
+  background: #f6cfcf;
+  border-color: #db9b9b;
+}
+.knowledgeWiki .wikiReviewActionBtn.reject:disabled {
+  background: #f1f3f4;
+  color: #9aa0a6;
+  border-color: #e3e6ec;
+  cursor: not-allowed;
+}
+
+/* knowledge-wiki Phase G+ · KnowledgeTreeView 3 级树 + ChunkDetail */
+.knowledgeWiki .wikiTreeBody {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+.knowledgeWiki .wikiTreeLayout {
+  grid-template-columns: 280px 1fr;
+}
+.knowledgeWiki .wikiTreePane {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 6px;
+  background: var(--surface-soft);
+  border: 1px solid var(--border, #e3e6ec);
+  border-radius: 8px;
+  height: fit-content;
+  max-height: 70vh;
+  overflow: auto;
+}
+.knowledgeWiki .wikiTreeBlock {
+  display: flex;
+  flex-direction: column;
+}
+.knowledgeWiki .wikiTreeChildren {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  padding-left: 14px;
+  border-left: 1px dashed var(--border, #e3e6ec);
+  margin-left: 8px;
+  margin-top: 1px;
+  margin-bottom: 1px;
+}
+.knowledgeWiki .wikiTreeNode {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 6px;
+  font-size: 12.5px;
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 5px;
+  cursor: pointer;
+  text-align: left;
+  color: var(--ink, #1f2329);
+  width: 100%;
+}
+.knowledgeWiki .wikiTreeNode:hover {
+  background: rgba(51, 90, 144, 0.05);
+}
+.knowledgeWiki .wikiTreeNode.l1 {
+  font-weight: 600;
+}
+.knowledgeWiki .wikiTreeNode.l1.empty {
+  color: var(--ink-muted, #6a7085);
+  font-weight: 400;
+}
+.knowledgeWiki .wikiTreeNode.l2 {
+  color: var(--ink-muted, #6a7085);
+}
+.knowledgeWiki .wikiTreeNode.l3 {
+  font-size: 12px;
+  padding: 3px 6px;
+  color: var(--ink, #1f2329);
+}
+.knowledgeWiki .wikiTreeNode.l3.active {
+  background: rgba(51, 90, 144, 0.1);
+  border-color: var(--accent, #335a90);
+  color: var(--accent, #335a90);
+  font-weight: 600;
+}
+.knowledgeWiki .wikiTreeLabel {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.knowledgeWiki .wikiTreeDetail {
+  min-width: 0;
+}
+.knowledgeWiki .wikiChunkDetail {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 16px 18px;
+  background: #fff;
+  border: 1px solid var(--border, #e3e6ec);
+  border-radius: 10px;
+}
+.knowledgeWiki .wikiChunkDetailHead {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.knowledgeWiki .wikiChunkDetailTitle {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.knowledgeWiki .wikiChunkDetailTitle h3 {
+  margin: 0;
+  font-size: 16px;
+  font-weight: 600;
+  color: var(--ink, #1f2329);
+}
+.knowledgeWiki .wikiChunkDetailMeta {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  font-size: 12px;
+  color: var(--ink-muted, #6a7085);
+}
+.knowledgeWiki .wikiChunkDetailMeta code {
+  font-family: ui-monospace, "SFMono-Regular", Menlo, monospace;
+  font-size: 11.5px;
+  background: var(--surface-soft);
+  padding: 1px 6px;
+  border-radius: 4px;
+}
+.knowledgeWiki .wikiChunkSummary {
+  margin: 0;
+  font-size: 13.5px;
+  line-height: 1.6;
+  color: var(--ink, #1f2329);
+}
+.knowledgeWiki .wikiSourceQuote {
+  margin: 0;
+  padding: 8px 12px;
+  background: #fff8eb;
+  border-left: 3px solid #d29419;
+  color: #5b3a08;
+  font-size: 13px;
+  line-height: 1.55;
+  white-space: pre-wrap;
+  border-radius: 4px;
+}
+.knowledgeWiki .wikiSectionTitle {
+  font-size: 11.5px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--ink-muted, #6a7085);
+  margin-bottom: 6px;
+}
+.knowledgeWiki .wikiSourceAnchorsSection {
+  display: flex;
+  flex-direction: column;
+}
+.knowledgeWiki .wikiSourceAnchorList {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.knowledgeWiki .wikiSourceAnchor {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 8px;
+  font-size: 11.5px;
+  background: #fff8eb;
+  color: #5b3a08;
+  border: 1px solid #f0d8a4;
+  border-radius: 4px;
+  cursor: pointer;
+}
+.knowledgeWiki .wikiSourceAnchor:hover {
+  background: #fdecc4;
+  border-color: #d29419;
+}
+.knowledgeWiki .wikiSourceAnchorRange {
+  font-family: ui-monospace, "SFMono-Regular", Menlo, monospace;
+}
+.knowledgeWiki .wikiSourceAnchorHash {
+  font-family: ui-monospace, "SFMono-Regular", Menlo, monospace;
+  background: rgba(255, 255, 255, 0.6);
+  padding: 0 4px;
+  border-radius: 3px;
+  color: #6b4810;
+}
+.knowledgeWiki .wikiRelatedList {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.knowledgeWiki .wikiRelatedChip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 10px;
+  font-size: 12px;
+  background: rgba(51, 90, 144, 0.06);
+  border: 1px solid rgba(51, 90, 144, 0.18);
+  color: var(--accent, #335a90);
+  border-radius: 14px;
+  cursor: pointer;
+}
+.knowledgeWiki .wikiRelatedChip:hover {
+  background: rgba(51, 90, 144, 0.12);
+}
+.knowledgeWiki .wikiRelatedChip.dead {
+  background: #f1f3f4;
+  color: #9aa0a6;
+  border-color: #e3e6ec;
+  cursor: not-allowed;
+  text-decoration: line-through;
+}
+.knowledgeWiki .wikiRelatedKind {
+  font-size: 10.5px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  background: rgba(255, 255, 255, 0.7);
+  padding: 1px 5px;
+  border-radius: 3px;
+  color: var(--ink-muted, #6a7085);
+}
+.knowledgeWiki .wikiRelatedTitle {
+  max-width: 240px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
