@@ -109,10 +109,6 @@ impl RunBudget {
     /// 两把锁按固定顺序（tokens → tool_calls）抢占，避免与其它路径死锁。
     /// 任何 LLM 调用入口（[`Self::record_call`]）只锁 `tokens_used` 与
     /// `llm_calls_used`，不与本方法竞争 `tool_calls_used`，所以不会形成环。
-    ///
-    /// `dead_code` allow：MCP knowledge.* dispatcher 在 Task 4.2 才接入，
-    /// 当前 lib build 中暂无调用方，但 Task 4.1 单测已覆盖三条主路径。
-    #[allow(dead_code)]
     pub fn record_tool_call(&self, tokens_consumed: i64) -> Result<(), BudgetError> {
         let consumed = tokens_consumed.max(0);
         let mut tokens = self.tokens_used.lock();

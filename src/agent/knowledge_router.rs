@@ -176,43 +176,6 @@ fn today_start_millis() -> i64 {
     now - (now.rem_euclid(day_ms))
 }
 
-#[allow(dead_code)]
-pub(crate) fn format_operation_knowledge_catalog_for_prompt(runtime: &KnowledgeRuntime) -> String {
-    let documents = runtime
-        .documents
-        .iter()
-        .map(|item| {
-            format!(
-                "- documentId={} title={}\n  catalog={}\n  routingMap={}",
-                item.id.map(|id| id.to_hex()).unwrap_or_default(),
-                item.title,
-                item.catalog_summary
-                    .clone()
-                    .or(item.summary.clone())
-                    .unwrap_or_default(),
-                item.routing_map.join(" / ")
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-    let chunks = runtime
-        .chunks
-        .iter()
-        .take(120)
-        .map(|item| {
-            format!(
-                "- chunkId={} type={} title={}\n  summary={}",
-                item.id.map(|id| id.to_hex()).unwrap_or_default(),
-                item.knowledge_type.clone().unwrap_or_default(),
-                item.title,
-                item.summary.clone().unwrap_or_default(),
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-    format!("文档目录:\n{}\n\n切片目录:\n{}", documents, chunks)
-}
-
 pub fn format_operation_knowledge_for_prompt(
     chunks: &[OperationKnowledgeChunk],
 ) -> String {

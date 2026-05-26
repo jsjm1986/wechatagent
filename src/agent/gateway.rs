@@ -729,6 +729,10 @@ async fn run_user_operation_gateway_inner(
         // 队列供 admin review。任何 IO 故障静默跳过（best-effort），不阻塞 run。
         // 这是 CLAUDE.md 硬规则"unreviewed candidates must not block runs"的实现位。
         let cache = global_taxonomy_cache();
+        // TTL 自愈：启动 warm_up 后若长期无 admin 写操作触发 invalidate，
+        // 30s 后 find_or_load 自动 reload，防 cache 永远 stale。任何 IO 故障被
+        // find_or_load 内部 log 后吞掉。
+        cache.find_or_load(&state.db).await;
         for (kind, raw_opt) in [
             ("customer_stage", final_decision.customer_stage.clone()),
             ("intent_level", final_decision.intent_level.clone()),

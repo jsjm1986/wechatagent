@@ -44,7 +44,6 @@ use super::budget::{BudgetError, RunBudget};
 use super::runtime::UserRuntimeParameters;
 use super::types::{KnowledgeRuntime, ToolCallRequest};
 use crate::db::Database;
-use crate::error::AppError;
 use crate::models::{
     KnowledgeUsageLog, OperationKnowledgeChunk, OperationKnowledgeDocument,
 };
@@ -1242,11 +1241,6 @@ async fn exec_verify_anchor(
         "method": "none",
         "note": "candidate quote did not match parent document (exact + fuzzy both miss)",
     })
-}
-
-#[allow(dead_code)]
-fn require_db_error_to_app_error(e: &mongodb::error::Error) -> AppError {
-    AppError::External(format!("knowledge tools db error: {e}"))
 }
 
 // ── 内部辅助 ────────────────────────────────────────────────────────────

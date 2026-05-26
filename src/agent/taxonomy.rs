@@ -138,7 +138,7 @@ impl TaxonomyCache {
 
     /// 查找或自动加载（TTL 过期 → 异步加载）。
     /// 注意：本方法保持调用方 `&self`，内部异步加载完成后写回 inner。
-    async fn find_or_load(&self, db: &Database) {
+    pub(crate) async fn find_or_load(&self, db: &Database) {
         let needs_reload = {
             let inner = self.inner.lock();
             match inner.fetched_at {
@@ -449,13 +449,6 @@ pub(crate) async fn reject(
     Ok(())
 }
 
-/// 公开 helper：让 cache 自动加载（异步），供 `enforce_decision_guards`
-/// 在调用 `check_value` 之前用。
-#[allow(dead_code)]
-pub(crate) async fn ensure_cache_loaded(cache: &TaxonomyCache, db: &Database) {
-    cache.find_or_load(db).await;
-}
-
 // ─────────────────────────────────────────────────────────────────
 // 进程级共享 TaxonomyCache。
 //
@@ -481,17 +474,8 @@ pub async fn init_global_taxonomy_cache(db: &Database) {
 
 /// 后台 API（admin_taxonomies / admin_taxonomy_candidates）在写后调用以让缓
 /// 存立即失效。
-#[allow(dead_code)]
 pub(crate) fn invalidate_global_taxonomy_cache() {
     GLOBAL_TAXONOMY_CACHE.invalidate();
-}
-
-/// `find_or_load` 的公开包装：调用方传入 `&Database`，本函数自动按 TTL 决定
-/// 是否重新加载。供 `enforce_decision_taxonomy_guards` 在每次 run 调用前
-/// 使用，确保字典数据不超过 TTL 陈旧度。
-#[allow(dead_code)]
-pub(crate) async fn ensure_global_cache_loaded(db: &Database) {
-    GLOBAL_TAXONOMY_CACHE.find_or_load(db).await;
 }
 
 /// 测试用 helper — 把已构造好的 [`TaxonomyEntry`] 集合直接灌入一个新 cache。
