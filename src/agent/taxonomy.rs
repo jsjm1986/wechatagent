@@ -46,7 +46,6 @@ const TAXONOMY_CACHE_TTL: Duration = Duration::from_secs(30);
 /// `AliasActive` 改写 / `Deprecated` 追加 risk / `CandidateNew` 追加 risk +
 /// upsert（**不**强制 review fail）。
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code)] // Phase A 接入待 follow-up（enforce_decision_guards 调用）
 pub(crate) enum TaxonomyMatch {
     /// 命中字典中 `status="active"` 且 `value.id == raw`。
     Active,
@@ -77,7 +76,6 @@ struct TaxonomyCacheInner {
 }
 
 #[derive(Debug, Clone)]
-#[allow(dead_code)] // Phase A 接入待 follow-up（enforce_decision_guards 调用）
 struct CachedEntry {
     canonical_id: String,
     aliases: Vec<String>,
@@ -171,7 +169,6 @@ impl TaxonomyCache {
 /// 4. 否则 → [`TaxonomyMatch::CandidateNew`]
 ///
 /// `scope` 优先按 `account_id` 查，未命中再按 `"global"` 查（两层 fallback）。
-#[allow(dead_code)] // Phase A 接入待 follow-up（enforce_decision_guards 调用）
 pub(crate) fn check_value(
     kind: &str,
     raw_value: &str,
@@ -229,7 +226,6 @@ pub(crate) fn check_value(
 /// 强幂等键：`(scope, kind, raw_value)` 唯一索引。`kind` 由调用方按字典中
 /// 实际维度名传入（snake_case，与 `system_taxonomies.kind` 一致）。
 /// 并发竞争（两个 run 同时 upsert 同 raw_value）由 unique index + retry 保护。
-#[allow(dead_code)]
 pub(crate) async fn upsert_candidate(
     db: &Database,
     scope_account_id: &str,
@@ -473,15 +469,13 @@ static GLOBAL_TAXONOMY_CACHE: std::sync::LazyLock<Arc<TaxonomyCache>> =
 
 /// 进程级单例 cache 句柄；`enforce_decision_taxonomy_guards` 调用方在没有
 /// 注入自定义 cache 时使用本入口。
-#[allow(dead_code)] // Phase A 接入待 follow-up（enforce_decision_guards 调用）
 pub(crate) fn global_taxonomy_cache() -> Arc<TaxonomyCache> {
     GLOBAL_TAXONOMY_CACHE.clone()
 }
 
 /// 启动期预热：由 `main.rs` / `Database::ensure_indexes` 后调用。失败被静默
 /// （log warning），不阻塞应用启动；下次 `check_value` 会触发懒加载。
-#[allow(dead_code)]
-pub(crate) async fn init_global_taxonomy_cache(db: &Database) {
+pub async fn init_global_taxonomy_cache(db: &Database) {
     GLOBAL_TAXONOMY_CACHE.warm_up(db).await;
 }
 

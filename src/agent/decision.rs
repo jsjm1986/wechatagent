@@ -8,7 +8,7 @@
 //! 所有 prompt 加载、上下文格式化、调用 LLM 都集中在这里；其它子模块
 //! 通过 `pub(crate)` 调用 `decide_reply` 复用同一份 prompt 渲染逻辑。
 
-use mongodb::bson::{to_document, Document};
+use mongodb::bson::{doc, to_document, Document};
 
 use crate::error::{AppError, AppResult};
 use crate::models::{
@@ -20,6 +20,8 @@ use crate::routes::AppState;
 
 use super::generate_agent_json;
 use super::knowledge_router::format_operation_knowledge_for_prompt;
+use super::memory::{format_operator_memory_for_reply_prompt, load_operator_memory};
+use super::reaction::format_reaction_hint;
 use super::runtime::UserRuntimeParameters;
 use super::types::{
     optional_string, string_array, AgentDecision, GeneratedOperationProfile, KnowledgeRouteResult,
@@ -176,6 +178,47 @@ pub(crate) async fn decide_reply(
 /// 单纯 `decide_reply` 把 promote_risks 默默丢掉以保持 simulation /
 /// management_send 等老入口的二元接口；新链路（task 3.4 之后）SHALL 直接调
 /// 本函数把 risks 透传给 gateway 主流程。
+/// Phase A / A1：从 `agent_decision_reviews` 读最近 3 条 reaction_analysis（按
+/// `created_at` 倒序），交 [`format_reaction_hint`] 渲染为 prompt 段。
+///
+/// best-effort：DB / 索引故障 → 返回空串，不阻塞决策。索引
+/// `(workspace_id, account_id, contact_wxid, created_at:-1)` 已在
+/// `db/indexes.rs:226` 建好。
+async fn load_recent_reaction_hint(state: &AppState, contact: &Contact) -> String {
+    use futures::TryStreamExt;
+    use mongodb::options::FindOptions;
+    let filter = doc! {
+        "workspace_id": &contact.workspace_id,
+        "account_id": &contact.account_id,
+        "contact_wxid": &contact.wxid,
+        "reaction_analysis": { "$exists": true, "$ne": {} },
+    };
+    let opts = FindOptions::builder()
+        .sort(doc! { "created_at": -1 })
+        .limit(3)
+        .projection(doc! { "reaction_analysis": 1 })
+        .build();
+    let cursor = match state.db.decision_reviews().clone_with_type::<Document>().find(filter, opts).await {
+        Ok(c) => c,
+        Err(error) => {
+            tracing::warn!(?error, "load_recent_reaction_hint find failed");
+            return String::new();
+        }
+    };
+    let docs: Vec<Document> = match cursor.try_collect().await {
+        Ok(v) => v,
+        Err(error) => {
+            tracing::warn!(?error, "load_recent_reaction_hint collect failed");
+            return String::new();
+        }
+    };
+    let analyses: Vec<Document> = docs
+        .into_iter()
+        .filter_map(|d| d.get_document("reaction_analysis").ok().cloned())
+        .collect();
+    format_reaction_hint(&analyses)
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn decide_reply_with_promote(
     state: &AppState,
@@ -256,6 +299,24 @@ pub(crate) async fn decide_reply_with_promote(
     // 落入 `intent_trajectory_text == ""` 路径，向前兼容。
     let intent_trajectory_text =
         super::reaction::format_intent_trajectory_hint(&contact.intent_trajectory);
+    // Phase A / A1：reaction_hint 段（最近 3 轮 reaction_analysis）。
+    // 查 decision_reviews 同 (workspace, account, contact_wxid) 下 created_at 倒序
+    // 前 3 条；任意 IO 错误回落空串（best-effort，不阻塞决策）。
+    let reaction_hint_text = load_recent_reaction_hint(state, contact).await;
+    // Phase A / A2：operator_memory 段。
+    // operator_id 取 account_id —— 在 user-ops 路径下，每个微信号背后是同一个
+    // 人格（运营人员）；admin chat 路径走 KnowledgeChatTask.operator_id 不冲突。
+    // best-effort：DB 故障 → 空串。
+    let operator_memory_text = load_operator_memory(
+        &state.db,
+        &contact.workspace_id,
+        &contact.account_id,
+        &contact.account_id,
+        5,
+    )
+    .await
+    .map(|items| format_operator_memory_for_reply_prompt(&items))
+    .unwrap_or_default();
     // Phase C / C4：prompt A/B 灰度。当 (workspace, prompt_key) 下存在多条
     // status="active" 的版本时，按 hash(contact.wxid) % count 选一份；同一 contact
     // 永远拿同一份 prompt，保证 A/B 一致性。单 active 版本时退化为 load_prompt 行为。
@@ -354,6 +415,12 @@ pub(crate) async fn decide_reply_with_promote(
 意图轨迹:
 {}
 
+最近用户反应:
+{}
+
+运营偏好记忆:
+{}
+
 改写要求:
 {}
 
@@ -389,6 +456,8 @@ pub(crate) async fn decide_reply_with_promote(
         knowledge_text,
         knowledge_route_text,
         intent_trajectory_text,
+        reaction_hint_text,
+        operator_memory_text,
         rewrite_text,
         contact.wxid,
         contact.nickname.clone().unwrap_or_default(),

@@ -66,6 +66,10 @@ use super::types::{
     ManualContactSend, RunPlannerResult, SendGatewayResult,
 };
 use super::outbox::{enqueue as outbox_enqueue, EnqueueOutcome, EnqueueRequest};
+use super::taxonomy::{
+    check_value as taxonomy_check_value, global_taxonomy_cache, upsert_candidate as taxonomy_upsert_candidate,
+    TaxonomyMatch,
+};
 
 pub async fn handle_managed_message(
     state: &AppState,
@@ -715,6 +719,61 @@ async fn run_user_operation_gateway_inner(
                 }),
             )
             .await?;
+        }
+
+        // ── Phase A / A3：taxonomy 软闸 ──
+        //
+        // 校验 final_decision 上 LLM 给出的 customer_stage / intent_level 是否在
+        // system_taxonomies 字典里：命中 active → 通过；命中 alias → 改写为
+        // canonical id；deprecated → 仅 risks 追加；CandidateNew → upsert 候选
+        // 队列供 admin review。任何 IO 故障静默跳过（best-effort），不阻塞 run。
+        // 这是 CLAUDE.md 硬规则"unreviewed candidates must not block runs"的实现位。
+        let cache = global_taxonomy_cache();
+        for (kind, raw_opt) in [
+            ("customer_stage", final_decision.customer_stage.clone()),
+            ("intent_level", final_decision.intent_level.clone()),
+        ] {
+            let Some(raw) = raw_opt.filter(|s| !s.trim().is_empty()) else {
+                continue;
+            };
+            match taxonomy_check_value(kind, &raw, &contact.account_id, &cache) {
+                TaxonomyMatch::Active => {}
+                TaxonomyMatch::AliasActive(canonical) => {
+                    if kind == "customer_stage" {
+                        final_decision.customer_stage = Some(canonical.clone());
+                    } else if kind == "intent_level" {
+                        final_decision.intent_level = Some(canonical.clone());
+                    }
+                    let risk = format!("taxonomy_alias_rewritten:{kind}");
+                    if !review.risks.iter().any(|r| r == &risk) {
+                        review.risks.push(risk);
+                    }
+                }
+                TaxonomyMatch::Deprecated => {
+                    let risk = format!("taxonomy_deprecated_value:{kind}");
+                    if !review.risks.iter().any(|r| r == &risk) {
+                        review.risks.push(risk);
+                    }
+                }
+                TaxonomyMatch::CandidateNew => {
+                    let risk = format!("taxonomy_candidate_new:{kind}");
+                    if !review.risks.iter().any(|r| r == &risk) {
+                        review.risks.push(risk);
+                    }
+                    if let Err(error) = taxonomy_upsert_candidate(
+                        &state.db,
+                        &contact.account_id,
+                        kind,
+                        &raw,
+                        Some("user-ops decision path"),
+                        50,
+                    )
+                    .await
+                    {
+                        tracing::warn!(?error, kind = kind, raw = %raw, "taxonomy upsert_candidate failed");
+                    }
+                }
+            }
         }
     }
 

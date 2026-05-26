@@ -452,7 +452,6 @@ fn truncate_for_title(text: &str, max_chars: usize) -> String {
 ///
 /// 输入是按时间倒序（最新在前）的 reaction Document 列表；返回值是装配进
 /// system prompt 的纯文本片段。空输入返回空串，调用方据此决定是否拼接。
-#[allow(dead_code)] // Phase A helper，生产路径接入待 follow-up
 pub(crate) fn format_reaction_hint(recent: &[Document]) -> String {
     if recent.is_empty() {
         return String::new();

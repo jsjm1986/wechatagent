@@ -1239,7 +1239,6 @@ pub(crate) async fn load_operator_memory(
 ///
 /// 输出按 `kind`（preference / rejection / context）分组，空输入返回空串。
 /// 调用方在 reply Agent 装配 prompt 时拼接。
-#[allow(dead_code)] // Phase A helper，生产路径接入待 follow-up
 pub(crate) fn format_operator_memory_for_reply_prompt(
     items: &[crate::models::KnowledgeOperatorMemory],
 ) -> String {
