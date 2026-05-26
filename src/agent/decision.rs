@@ -251,22 +251,36 @@ pub(crate) async fn decide_reply_with_promote(
     .unwrap_or_default();
     let memory_card_text = serde_json::to_string(context_pack).unwrap_or_default();
     let rewrite_text = rewrite_instruction.unwrap_or("");
-    let system_contract = prompts::load_prompt(
+    // Phase D / D1：intent_trajectory 段（最近 5 项）。空时为空串；
+    // contact 老文档（无 intent_trajectory 字段）反序列化为 default 空 Vec，
+    // 落入 `intent_trajectory_text == ""` 路径，向前兼容。
+    let intent_trajectory_text =
+        super::reaction::format_intent_trajectory_hint(&contact.intent_trajectory);
+    // Phase C / C4：prompt A/B 灰度。当 (workspace, prompt_key) 下存在多条
+    // status="active" 的版本时，按 hash(contact.wxid) % count 选一份；同一 contact
+    // 永远拿同一份 prompt，保证 A/B 一致性。单 active 版本时退化为 load_prompt 行为。
+    let (system_contract, _system_version) = prompts::load_prompt_for_contact(
         &state.db,
         &state.config.default_workspace_id,
         "user.reply.system",
+        &contact.wxid,
+        contact.locale.as_deref(),
     )
     .await?;
-    let policy = prompts::load_prompt(
+    let (policy, _policy_version) = prompts::load_prompt_for_contact(
         &state.db,
         &state.config.default_workspace_id,
         "user.reply.policy",
+        &contact.wxid,
+        contact.locale.as_deref(),
     )
     .await?;
-    let task_template = prompts::load_prompt(
+    let (task_template, _task_version) = prompts::load_prompt_for_contact(
         &state.db,
         &state.config.default_workspace_id,
         "user.reply.task",
+        &contact.wxid,
+        contact.locale.as_deref(),
     )
     .await?;
     // R-prompt-v3：Operator Instruction 层（最高优先级）。运营人员可在后台对
@@ -337,6 +351,9 @@ pub(crate) async fn decide_reply_with_promote(
 知识路由:
 {}
 
+意图轨迹:
+{}
+
 改写要求:
 {}
 
@@ -371,6 +388,7 @@ pub(crate) async fn decide_reply_with_promote(
         serde_json::to_string(&deprecated_facts_recent).unwrap_or_default(),
         knowledge_text,
         knowledge_route_text,
+        intent_trajectory_text,
         rewrite_text,
         contact.wxid,
         contact.nickname.clone().unwrap_or_default(),
@@ -475,6 +493,35 @@ pub(crate) async fn load_user_operation_domain_config(
             doc! {
                 "workspace_id": workspace_id,
                 "domain": "user_operations"
+            },
+            None,
+        )
+        .await
+        .map_err(AppError::from)
+}
+
+/// Phase B / B4：按 `(workspace_id, domain="user_operations", state_key)` 加载
+/// `operation_state_policies` 行。无行 / 老库无 collection / `state_key` 为空均
+/// 返回 `Ok(None)` —— 调用方 `enforce_state_action_policy(None, ...)` fallthrough，
+/// 向前兼容（老部署不被 Phase B 引入新边界破坏）。
+pub(crate) async fn load_operation_state_policy(
+    state: &AppState,
+    workspace_id: &str,
+    state_key: &str,
+) -> AppResult<Option<crate::models::OperationStatePolicy>> {
+    use mongodb::bson::doc;
+    let key = state_key.trim();
+    if key.is_empty() {
+        return Ok(None);
+    }
+    state
+        .db
+        .operation_state_policies()
+        .find_one(
+            doc! {
+                "workspace_id": workspace_id,
+                "domain": "user_operations",
+                "state_key": key,
             },
             None,
         )

@@ -25,7 +25,7 @@ use super::guards::{
     normalize_decision_runtime, normalize_decision_state, planner_from_decision,
 };
 use super::knowledge_router::{
-    empty_knowledge_route, knowledge_route_has_keyword_fastpath_hit, load_operation_knowledge,
+    empty_knowledge_route, load_operation_knowledge,
     route_operation_knowledge, route_used_knowledge_ids, select_operation_knowledge_chunks,
 };
 use super::memory::{
@@ -140,8 +140,6 @@ async fn simulate_user_dialogue_inner(
             )
             .await?
         };
-        let keyword_fastpath_hit =
-            knowledge_route_has_keyword_fastpath_hit(&knowledge_route);
         let selected_chunks =
             select_operation_knowledge_chunks(&operation_knowledge.chunks, &knowledge_route);
         let mut decision = decide_reply(
@@ -171,11 +169,6 @@ async fn simulate_user_dialogue_inner(
             if planner.review_mode.trim().is_empty() {
                 planner.review_mode = "full".to_string();
             }
-        }
-        if keyword_fastpath_hit && decision.conversation_mode != "consultative" {
-            decision.conversation_mode = "consultative".to_string();
-            decision.conversation_mode_reason =
-                Some("trigger_keywords_fastpath_hit".to_string());
         }
         normalize_decision_runtime(&mut decision, &planner);
         decision.context_pack_version = Some(next_memory_card_version(&memory));

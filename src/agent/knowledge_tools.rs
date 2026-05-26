@@ -1103,7 +1103,7 @@ async fn exec_open_document(
 // 输出：{ item_id, title, routing_card, summary, customer_stages, intent_levels,
 //        common_questions, common_objections, safe_claims, forbidden_claims,
 //        evidence_items, applicable_scenes, not_applicable_scenes,
-//        product_tags, trigger_keywords, business_topics, status, updated_at }
+//        product_tags, business_topics, status, updated_at }
 // 错误：invalid_input / unknown_item_id / db_error。
 async fn exec_inspect_pack(
     arguments: &Document,
@@ -1309,7 +1309,6 @@ mod tests {
             status: "active".into(),
             priority: 0,
             product_tags: vec![],
-            trigger_keywords: vec![],
             business_topics: vec![],
             created_at: BsonDt::now(),
             updated_at: BsonDt::now(),
@@ -1325,6 +1324,7 @@ mod tests {
             dynamic_confidence: None,
             integrity_score: None,
             locked_fields: None,
+            chunk_type: "product_fact".to_string(),
         }
     }
 
@@ -1348,7 +1348,6 @@ mod tests {
             status: "active".into(),
             version: 1,
             product_tags: vec![],
-            trigger_keywords: vec![],
             business_topics: vec![],
             created_at: BsonDt::now(),
             updated_at: BsonDt::now(),

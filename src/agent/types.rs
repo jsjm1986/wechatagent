@@ -893,6 +893,11 @@ pub struct ReviewScores {
     pub hallucination_score: i32,
     #[serde(default, deserialize_with = "number_i32")]
     pub knowledge_grounding_score: i32,
+    /// Phase B / B1：恢复 `pressure_risk` 软闸评分（0-100）。Reviewer 输出，
+    /// `review_passed` 与 single-shot revision 通道判定时使用。R11 兼容：
+    /// 缺省 `0`，旧 review JSON 反序列化不破坏。
+    #[serde(default, deserialize_with = "number_i32")]
+    pub pressure_risk: i32,
 }
 
 #[derive(Debug, Serialize, Deserialize, Default, Clone)]
@@ -1074,6 +1079,8 @@ pub struct KnowledgeRouteResult {
     pub reason: String,
     #[serde(default, deserialize_with = "document_vec")]
     pub tool_trace: Vec<Document>,
+    #[serde(default, deserialize_with = "string_or_vec")]
+    pub evidence_excerpts: Vec<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Default, Clone)]

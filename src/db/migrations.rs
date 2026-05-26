@@ -74,7 +74,7 @@ pub const MIGRATIONS: &[Migration] = &[
     },
     // ── conversation_mode + per-contact custom instructions + knowledge tags ──
     // 给 contacts 加 custom_agent_instructions（默认 null），给 operation_knowledge_*
-    // 三集合加 product_tags / trigger_keywords / business_topics（默认 []）。
+    // 三集合加 product_tags / business_topics（默认 []）。
     // 全幂等：filter 用 `$exists: false` 仅命中未升级文档。
     Migration {
         id: "2026_05_V3_001_contact_custom_instructions_and_knowledge_tags",
@@ -91,6 +91,20 @@ pub const MIGRATIONS: &[Migration] = &[
     Migration {
         id: "2026_05_V3_003_drop_legacy_taxonomy_seed",
         run: |db| Box::pin(drop_legacy_taxonomy_seed(db)),
+    },
+    // ── Phase B / B4：operation_state_policies 默认 policy 行（idempotent）──
+    // 给所有已有的 `user_operations` 状态机里每个 state_key 写一行 active policy；
+    // 已存在的 (workspace_id, domain, state_key) 不覆盖（保留运营人员手改值）。
+    Migration {
+        id: "2026_05_W4_001_seed_user_operation_state_policies",
+        run: |db| Box::pin(seed_user_operation_state_policies(db)),
+    },
+    // ── 切除 trigger_keywords 字段：知识库进入 Agent-first 渐进式披露形态后，
+    // 关键词快路径不再使用，索引与字段一并下线。开发期 unset 即可；生产环境
+    // 通过 `APP_ENV` 守卫为 noop（保留字段直至运维显式 drop）。
+    Migration {
+        id: "2026_05_W4_002_drop_trigger_keywords",
+        run: |db| Box::pin(drop_trigger_keywords(db)),
     },
 ];
 
@@ -889,7 +903,6 @@ async fn prompt_template_versioned(db: &Database) -> AppResult<()> {
 ///
 /// 给 `operation_knowledge_documents` / `_items` / `_chunks` 三集合加：
 ///   - `product_tags: []`（≤5）
-///   - `trigger_keywords: []`（≤8，全小写，运行时关键词快路径用 `inbound.contains`）
 ///   - `business_topics: []`（≤3）
 ///
 /// 幂等：每个 filter 用 `$exists: false` 仅命中未升级文档；二次启动不变更。
@@ -931,14 +944,12 @@ async fn contact_custom_instructions_and_knowledge_tags(db: &Database) -> AppRes
                 doc! {
                     "$or": [
                         { "product_tags": { "$exists": false } },
-                        { "trigger_keywords": { "$exists": false } },
                         { "business_topics": { "$exists": false } },
                     ]
                 },
                 doc! {
                     "$set": {
                         "product_tags": [],
-                        "trigger_keywords": [],
                         "business_topics": [],
                     }
                 },
@@ -1013,6 +1024,127 @@ async fn drop_legacy_taxonomy_seed(db: &Database) -> AppResult<()> {
         deleted = result.deleted_count,
         "cleared legacy sales-domain taxonomy seeds"
     );
+    Ok(())
+}
+
+/// 2026_05_W4_001：为每个 user_operations 状态机里的 state_key 写一行默认 policy。
+///
+/// 默认策略遵循"宽允许 / 窄禁止"原则：所有 state 默认允许 `["reply","silent","follow_up"]`
+/// 三动作；只有 `cooldown` state 强制 `forbidden=["reply"]`（冷却期不主动回复）。
+/// 已存在的 (workspace_id, domain, state_key) 行被跳过，保留运营人员的手工调整。
+async fn seed_user_operation_state_policies(db: &Database) -> AppResult<()> {
+    use crate::models::OperationStatePolicy;
+    let mut cursor = db
+        .operation_domain_configs()
+        .find(doc! { "domain": "user_operations" }, None)
+        .await?;
+    let mut inserted = 0_u64;
+    let mut skipped = 0_u64;
+    while let Some(config) = cursor.try_next().await? {
+        let states = config
+            .state_machine
+            .get_array("states")
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|item| item.as_document().cloned())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        for state in &states {
+            let Some(state_key) = state.get_str("key").ok().map(ToString::to_string) else {
+                continue;
+            };
+            let existing = db
+                .operation_state_policies()
+                .find_one(
+                    doc! {
+                        "workspace_id": &config.workspace_id,
+                        "domain": "user_operations",
+                        "state_key": &state_key,
+                    },
+                    None,
+                )
+                .await?;
+            if existing.is_some() {
+                skipped += 1;
+                continue;
+            }
+            let (allowed, forbidden): (Vec<String>, Vec<String>) = if state_key == "cooldown" {
+                (
+                    vec!["silent".to_string(), "follow_up".to_string()],
+                    vec!["reply".to_string()],
+                )
+            } else {
+                (
+                    vec![
+                        "reply".to_string(),
+                        "silent".to_string(),
+                        "follow_up".to_string(),
+                    ],
+                    Vec::new(),
+                )
+            };
+            let policy = OperationStatePolicy {
+                id: None,
+                workspace_id: config.workspace_id.clone(),
+                domain: "user_operations".to_string(),
+                state_key: state_key.clone(),
+                allowed,
+                forbidden,
+                recommended_pace: None,
+                status: "active".to_string(),
+                updated_at: DateTime::now(),
+            };
+            db.operation_state_policies()
+                .insert_one(&policy, None)
+                .await?;
+            inserted += 1;
+        }
+    }
+    tracing::info!(
+        migration_id = "2026_05_W4_001_seed_user_operation_state_policies",
+        inserted,
+        skipped,
+        "seeded operation_state_policies for user_operations"
+    );
+    Ok(())
+}
+
+/// 2026_05_26：从 operation_knowledge_chunks / _items / _documents 三集合
+/// `$unset` `trigger_keywords` 字段。Agent-first 渐进式披露形态接管之后，
+/// 关键词快路径与 `trigger_keywords` 索引一并下线。
+///
+/// 生产环境守卫：`APP_ENV=production` 时 noop 返回，避免误删；
+/// 运维需在确认所有副本与备份不再依赖该字段后再手工 unset。
+async fn drop_trigger_keywords(db: &Database) -> AppResult<()> {
+    if std::env::var("APP_ENV").unwrap_or_default() == "production" {
+        tracing::warn!(
+            migration_id = "2026_05_W4_002_drop_trigger_keywords",
+            "production guard: skipped trigger_keywords unset; run manually after backup verification"
+        );
+        return Ok(());
+    }
+    let collections: [&str; 3] = [
+        "operation_knowledge_documents",
+        "operation_knowledge_items",
+        "operation_knowledge_chunks",
+    ];
+    for coll_name in collections {
+        let coll = db.raw().collection::<Document>(coll_name);
+        let result = coll
+            .update_many(
+                doc! { "trigger_keywords": { "$exists": true } },
+                doc! { "$unset": { "trigger_keywords": "" } },
+                None,
+            )
+            .await?;
+        tracing::info!(
+            migration_id = "2026_05_W4_002_drop_trigger_keywords",
+            collection = coll_name,
+            modified = result.modified_count,
+            "unset trigger_keywords"
+        );
+    }
     Ok(())
 }
 

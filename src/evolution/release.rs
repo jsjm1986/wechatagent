@@ -125,6 +125,25 @@ pub async fn release_threshold(
 
     commit_with_session(&mut session).await?;
 
+    // Phase C / C5：commit 后追加 audit 行。失败仅 warn，不影响主路径。
+    write_threshold_override_audit(
+        state,
+        &workspace_id,
+        &account_id,
+        &gate_key,
+        "released",
+        proposal.current_value,
+        Some(proposed_value),
+        proposal_id,
+        admin,
+        proposal
+            .cohort_notes
+            .get_f64("hit_rate_observed")
+            .ok(),
+        Some(proposal.eval_metrics.clone()),
+    )
+    .await;
+
     write_release_event(
         state,
         "evolution_threshold_released",
@@ -452,6 +471,23 @@ pub async fn rollback_threshold(
 
     commit_with_session(&mut session).await?;
 
+    // Phase C / C5：rollback 也写 audit。previous = 被回滚的 proposed_value；
+    // new_value 留 None（回滚后回到 baseline 或更早 override，由审计读路径自行还原）。
+    write_threshold_override_audit(
+        state,
+        &workspace_id,
+        &account_id,
+        proposal.gate_key.as_deref().unwrap_or(""),
+        "rolled_back",
+        proposal.proposed_value,
+        None,
+        proposal_id,
+        admin,
+        None,
+        None,
+    )
+    .await;
+
     write_release_event(
         state,
         "evolution_rollback_completed",
@@ -654,6 +690,58 @@ async fn write_release_event(
         .await
         .map_err(EvolutionError::from)?;
     Ok(())
+}
+
+/// Phase C / C5：在 `threshold_overrides_audit` 追加一条不可变变更日志。
+///
+/// release / rollback / auto-release 三条主路径在 commit 成功之后调用，失败仅
+/// warn——audit 是事后审计字段，缺一行不影响主路径正确性，但绝不能因为 audit
+/// 写失败就回滚已经落地的 threshold 变更。
+///
+/// `previous_value` / `new_value` 调用方根据动作语义传入：
+///   - released：previous = 上一条 active override.value（无则 baseline 兜底）, new = proposal.proposed_value
+///   - rolled_back：previous = proposal.proposed_value（即被回滚的值）, new = 回滚后生效值（baseline 或更早 override）
+async fn write_threshold_override_audit(
+    state: &AppState,
+    workspace_id: &str,
+    account_id: &str,
+    gate_key: &str,
+    action: &str,
+    previous_value: Option<f64>,
+    new_value: Option<f64>,
+    source_proposal_id: ObjectId,
+    decided_by: &str,
+    hit_rate_observed: Option<f64>,
+    significance_metrics: Option<mongodb::bson::Document>,
+) {
+    let audit = crate::models::ThresholdOverrideAudit {
+        id: None,
+        workspace_id: workspace_id.to_string(),
+        account_id: account_id.to_string(),
+        gate_key: gate_key.to_string(),
+        action: action.to_string(),
+        previous_value,
+        new_value,
+        source_proposal_id,
+        decided_by: decided_by.to_string(),
+        decided_at: DateTime::now(),
+        hit_rate_observed,
+        significance_metrics,
+    };
+    if let Err(err) = state
+        .db
+        .threshold_overrides_audit()
+        .insert_one(audit, None)
+        .await
+    {
+        tracing::warn!(
+            ?err,
+            workspace_id,
+            gate_key,
+            action,
+            "threshold_overrides_audit insert failed (best-effort)"
+        );
+    }
 }
 
 #[cfg(test)]

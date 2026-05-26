@@ -38,6 +38,7 @@ fn pending_review(workspace: &str, account: &str, wxid: &str) -> AgentDecisionRe
         outcome_status: Some("pending".to_string()),
         reaction_analysis: Document::new(),
         reaction_claimed_at: None,
+        reviewer_misjudge_signal: None,
         status: "sent".to_string(),
         created_at: DateTime::now(),
     }

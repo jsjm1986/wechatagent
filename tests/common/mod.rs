@@ -205,6 +205,9 @@ fn test_config(mongodb_uri: String, mongodb_database: String) -> AppConfig {
         strategic_planner_block_rate_min_runs: 3,
         strategic_planner_block_rate_threshold: 0.6,
         strategic_planner_priority_enabled: true,
+        cold_contact_worker_enabled: false,
+        cold_contact_threshold_hours: 168,
+        cold_contact_daily_emit_cap: 5,
         // ── agent-self-evolution M4：测试默认全部 disabled / 极小值 ──
         evolution_enabled: false,
         evolution_tick_seconds: 600,

@@ -69,6 +69,19 @@ pub struct AppConfig {
     /// false 时退化为 M2 自然顺序（Mongo cursor 顺序）。默认 true。
     pub strategic_planner_priority_enabled: bool,
 
+    // ── Phase D / D3：cold contact reactivation ──
+
+    /// Phase D / D3：是否启用冷联系人重激活扫描器（与静默扫描器互补：
+    /// 关注 `last_outbound_at` 远早于 now 的 contact，由 peer_case 钩子文案推动）。
+    /// 默认 false——首发关闭，通过 `COLD_CONTACT_WORKER_ENABLED=true` 显式开启。
+    pub cold_contact_worker_enabled: bool,
+    /// Phase D / D3：判定 contact "冷链路" 的阈值小时数。
+    /// `last_outbound_at < now - 该小时数` 才会被纳入候选；默认 168（7 天）。
+    pub cold_contact_threshold_hours: i64,
+    /// Phase D / D3：单 account 当日最多 emit 多少条冷重激活 follow_up；
+    /// 与 strategic_planner_daily_emit_cap 解耦，避免拖累常规 follow_up。默认 5。
+    pub cold_contact_daily_emit_cap: i64,
+
     // ── agent-self-evolution M4：演化器（独立 worker） ──
     //
     // 默认全部保守值。`evolution_enabled=false` 是安装态默认；运维需显式
@@ -203,6 +216,12 @@ impl AppConfig {
                 "STRATEGIC_PLANNER_PRIORITY_ENABLED",
                 "true",
             )),
+            cold_contact_worker_enabled: parse_bool(&env_or(
+                "COLD_CONTACT_WORKER_ENABLED",
+                "false",
+            )),
+            cold_contact_threshold_hours: env_or("COLD_CONTACT_THRESHOLD_HOURS", "168").parse()?,
+            cold_contact_daily_emit_cap: env_or("COLD_CONTACT_DAILY_EMIT_CAP", "5").parse()?,
             // ── agent-self-evolution M4 ──
             evolution_enabled: parse_bool(&env_or("EVOLUTION_ENABLED", "false")),
             evolution_tick_seconds: env_or("EVOLUTION_TICK_SECONDS", "21600").parse()?,

@@ -34,9 +34,14 @@ use tokio::time::interval;
 use crate::routes::AppState;
 
 pub use self::budget::EvolutionBudget;
-pub use self::cohort::{select_cohorts, Cohorts};
+pub use self::cohort::{select_cohorts, select_cohorts_filtered, Cohorts};
 pub use self::envelope::{insert_experiment_envelope, update_experiment_status};
 pub use self::error::EvolutionError;
+
+pub mod runtime_flag;
+pub use self::runtime_flag::{
+    bucket_for_contact, is_evolution_enabled_for, load_runtime_flag, rollout_bucket_index,
+};
 
 /// 演化器主循环。`EVOLUTION_ENABLED=false` 时立即 return，等价于功能未启用。
 ///
@@ -90,8 +95,23 @@ pub async fn run_one_tick(state: &AppState) -> Result<(), EvolutionError> {
     )
     .await?;
 
-    // 2. cohort
-    let cohorts = select_cohorts(state, &workspace_id, &account_id).await?;
+    // Phase C / C3：mongo runtime flag 决定灰度桶。`enabled=false` 或文档不存在
+    // → 全员排除（worker 仍跑空 tick，保留可观察性 + 写 envelope）；`enabled=true`
+    // 时按 `hash(contact_id) % 100 < rollout_percent` 分桶。
+    //
+    // 读失败按 None 处理，避免 mongo 抖动让灰度门误开。
+    let runtime_flag = match self::runtime_flag::load_runtime_flag(state, &workspace_id).await {
+        Ok(v) => v,
+        Err(err) => {
+            tracing::warn!(?err, "evolution runtime_flag load failed; treating as disabled this tick");
+            None
+        }
+    };
+
+    // 2. cohort（灰度过滤）
+    let cohorts =
+        select_cohorts_filtered(state, &workspace_id, &account_id, runtime_flag.as_ref())
+            .await?;
     let threshold_count = cohorts.threshold.len();
     let prompt_count = cohorts.prompt.len();
 

@@ -80,8 +80,8 @@ use evaluations::{
 };
 use events::list_events;
 use evolution::{
-    get_evolution_proposal_detail, list_evolution_experiments, release_evolution_proposal,
-    rollback_evolution_proposal,
+    get_evolution_proposal_detail, get_evolution_runtime_flag, list_evolution_experiments,
+    put_evolution_runtime_flag, release_evolution_proposal, rollback_evolution_proposal,
 };
 use guides::{apply_user_operation_guide, preview_user_operation_guide};
 use health::health;
@@ -579,6 +579,12 @@ pub fn api_router(state: AppState) -> Router<AppState> {
         .route(
             "/evolution/proposals/:id/rollback",
             post(rollback_evolution_proposal),
+        )
+        // Phase C / C3：evolution 灰度运行时开关。env `EVOLUTION_ENABLED=true`
+        // 仍是最外层熔断；mongo flag 决定 contact 维度是否落桶。
+        .route(
+            "/evolution/runtime-flag",
+            get(get_evolution_runtime_flag).put(put_evolution_runtime_flag),
         )
         .with_state(state)
 }

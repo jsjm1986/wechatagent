@@ -53,7 +53,6 @@ pub const DEFAULT_UNION_ARRAY_KEYS: &[&str] = &[
     "sources",
     "applicable_scenes",
     "not_applicable_scenes",
-    "trigger_keywords",
     "business_topics",
     "product_tags",
     "safe_claims",

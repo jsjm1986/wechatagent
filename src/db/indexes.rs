@@ -144,6 +144,18 @@ pub(super) async fn ensure_all(db: &Database) -> anyhow::Result<()> {
             None,
         )
         .await?;
+    // Phase B / B4：operation_state_policies 唯一索引——
+    //   (workspace_id, domain, state_key) 复合 unique。
+    // enforce 路径单次 find_one，索引保命中。
+    db.operation_state_policies()
+        .create_index(
+            IndexModel::builder()
+                .keys(doc! { "workspace_id": 1, "domain": 1, "state_key": 1 })
+                .options(IndexOptions::builder().unique(true).build())
+                .build(),
+            None,
+        )
+        .await?;
     db.operating_memories()
         .create_index(
             IndexModel::builder()
@@ -173,22 +185,6 @@ pub(super) async fn ensure_all(db: &Database) -> anyhow::Result<()> {
         .create_index(
             IndexModel::builder()
                 .keys(doc! { "document_id": 1, "item_id": 1, "status": 1 })
-                .build(),
-            None,
-        )
-        .await?;
-    // 知识标签快路径：inbound 子串匹配触发关键词时直接召回 chunk，
-    // 跳过/优先于 LLM Planner 选择。sparse 避免老文档无 trigger_keywords 时占索引空间。
-    db.operation_knowledge_chunks()
-        .create_index(
-            IndexModel::builder()
-                .keys(doc! { "workspace_id": 1, "account_id": 1, "trigger_keywords": 1 })
-                .options(
-                    IndexOptions::builder()
-                        .name("kchunks_trigger_keywords_idx".to_string())
-                        .sparse(true)
-                        .build(),
-                )
                 .build(),
             None,
         )
@@ -764,7 +760,7 @@ async fn ensure_evolution_indexes(db: &Database) -> anyhow::Result<()> {
     //   * operation_knowledge_chunks 三条新查询路径：按 wiki_type 分组、按
     //     valid_to 找 stale、按 dynamic_confidence 取 top。
     //
-    // 旧 chunks 索引（trigger_keywords / document_id+item_id+status / status+priority）
+    // 旧 chunks 索引（document_id+item_id+status / status+priority）
     // 仍然保留，召回算法零改动。
     db.chunk_revisions()
         .create_index(

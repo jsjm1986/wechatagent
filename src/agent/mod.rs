@@ -28,6 +28,7 @@ mod chat_tool_loop;
 mod decision;
 mod gateway;
 mod guards;
+pub mod knowledge_agent;
 mod knowledge_router;
 mod knowledge_tools;
 mod memory;
@@ -63,7 +64,16 @@ pub use gateway::{
     write_event_for_account,
 };
 pub use knowledge_router::test_knowledge_route_for_contact;
-pub use knowledge_router::compute_keyword_fastpath_hits;
+// Agent-first 渐进式披露入口：`/api/knowledge/ask` 路由直接调用本 agent。
+pub use knowledge_agent::{
+    answer as knowledge_agent_answer, AnswerRequest as KnowledgeAnswerRequest,
+    AnswerResult as KnowledgeAnswerResult, CatalogEntry as KnowledgeCatalogEntry,
+    CatalogFilter as KnowledgeCatalogFilter, ChunkFull as KnowledgeChunkFull,
+};
+// Phase B / B3 / B6：`tests/chunk_type_routing_pbt.rs` 需要直接驱动
+// `format_operation_knowledge_for_prompt`，因此对外 re-export。生产路径调用方
+// 仍走 `agent/knowledge_router.rs` 内部，不应跨越 mod 边界使用此符号。
+pub use knowledge_router::format_operation_knowledge_for_prompt;
 pub use memory::{consolidate_contact_memory, handle_memory_consolidation_task};
 pub use outbox_dispatcher::run_outbox_dispatcher;
 
@@ -114,6 +124,10 @@ pub use memory::compact_memory_card_with_previous;
 // `tests/autonomy_protocol_pbt.rs` 这个独立 crate 的测试文件直接调用，因此重
 // 导出为 `pub`。语义不变，仅可见性变化。
 pub use review::{finalize_review_for_send, local_decision_review, FinalizeOutcome, GatewayStatusFinal, PendingFinalizeEvent};
+// Phase B / B6：把 `review_passed` 暴露到 crate 边界，让 PBT 文件
+// (`tests/human_like_threshold_pbt.rs` / `tests/pressure_risk_threshold_pbt.rs`)
+// 直接断言"双闸阈值穿越是否拦截"——契约性测试的最小暴露面。
+pub use review::review_passed;
 pub use runtime::UserRuntimeParameters;
 pub use runtime::{resolve_thresholds, ResolvedThresholds};
 pub use types::{DecisionReviewResult, RawAgentDecision, ReviewScores};
@@ -468,6 +482,9 @@ mod tests {
             last_outbound_at: None,
             last_agent_run_at: None,
             custom_agent_instructions: None,
+            last_outbound_style: None,
+            intent_trajectory: Vec::new(),
+            locale: None,
             created_at: DateTime::now(),
             updated_at: DateTime::now(),
         }

@@ -24,7 +24,6 @@ use crate::models::{
 use crate::routes::AppState;
 
 use super::gateway::write_event_for_account;
-use super::generate_agent_json;
 use super::memory::{
     default_memory_card, effective_memory_card_for_contact, load_or_create_operating_memory,
 };
@@ -177,6 +176,7 @@ fn today_start_millis() -> i64 {
     now - (now.rem_euclid(day_ms))
 }
 
+#[allow(dead_code)]
 pub(crate) fn format_operation_knowledge_catalog_for_prompt(runtime: &KnowledgeRuntime) -> String {
     let documents = runtime
         .documents
@@ -213,29 +213,63 @@ pub(crate) fn format_operation_knowledge_catalog_for_prompt(runtime: &KnowledgeR
     format!("文档目录:\n{}\n\n切片目录:\n{}", documents, chunks)
 }
 
-pub(crate) fn format_operation_knowledge_for_prompt(
+pub fn format_operation_knowledge_for_prompt(
     chunks: &[OperationKnowledgeChunk],
 ) -> String {
-    let chunk_text = chunks
+    if chunks.is_empty() {
+        return "已打开知识切片:\n（空）".to_string();
+    }
+    // Phase B / B3：按 `chunk_type` 分段输出 + 每段带不同的 prompt 指令。
+    // - product_fact：仅 `verified` 状态可作产品声明背书；
+    // - style_template：作为 few-shot 模板供 reply-agent 参考语气；
+    // - negative_example：作为 don't-do 示例（来自 reviewer 误判反馈队列）；
+    // - peer_case：作为同行案例 reference，不作产品承诺背书。
+    let mut by_type: std::collections::BTreeMap<&'static str, Vec<&OperationKnowledgeChunk>> =
+        std::collections::BTreeMap::new();
+    for c in chunks {
+        let bucket = match c.chunk_type.as_str() {
+            "style_template" => "style_template",
+            "negative_example" => "negative_example",
+            "peer_case" => "peer_case",
+            // 缺省 / "product_fact" / 任意其它值 → 走最保守的 product_fact 路径。
+            _ => "product_fact",
+        };
+        by_type.entry(bucket).or_default().push(c);
+    }
+    let render_chunk = |item: &OperationKnowledgeChunk| -> String {
+        format!(
+            "- chunkId={} type={} chunkType={} context={} title={}\n  integrityStatus={} confidence={}\n  summary={}\n  body={}\n  sourceAnchors={}\n  sourceQuote={}",
+            item.id.map(|id| id.to_hex()).unwrap_or_default(),
+            item.knowledge_type.clone().unwrap_or_default(),
+            item.chunk_type,
+            item.business_context.clone().unwrap_or_default(),
+            item.title,
+            item.integrity_status.clone().unwrap_or_default(),
+            item.confidence_score.unwrap_or_default(),
+            item.summary.clone().unwrap_or_default(),
+            item.body.clone().unwrap_or_default(),
+            serde_json::to_string(&item.source_anchors).unwrap_or_default(),
+            item.source_quote.clone().unwrap_or_default()
+        )
+    };
+    // 固定输出顺序：product_fact → style_template → peer_case → negative_example。
+    // BTreeMap 顺序与"运营优先级"不一致，这里强制顺序，确保 prompt 稳定。
+    let order = [
+        ("product_fact", "【产品事实 product_fact】仅 verified 切片可用作产品声明背书；needs_review/rejected 不作背书。"),
+        ("style_template", "【语气模板 style_template】作为 few-shot 参考；不直接复制内容，仅借鉴节奏与措辞。"),
+        ("peer_case", "【同行案例 peer_case】仅作 reference，不作我方产品承诺；引用必须显式标注「行业经验/同行案例」。"),
+        ("negative_example", "【反例 negative_example】don't-do 列表；候选回复语气/结构若与本段相似，必须改写。"),
+    ];
+    let sections = order
         .iter()
-        .map(|item| {
-            format!(
-                "- chunkId={} type={} context={} title={}\n  integrityStatus={} confidence={}\n  summary={}\n  body={}\n  sourceAnchors={}\n  sourceQuote={}",
-                item.id.map(|id| id.to_hex()).unwrap_or_default(),
-                item.knowledge_type.clone().unwrap_or_default(),
-                item.business_context.clone().unwrap_or_default(),
-                item.title,
-                item.integrity_status.clone().unwrap_or_default(),
-                item.confidence_score.unwrap_or_default(),
-                item.summary.clone().unwrap_or_default(),
-                item.body.clone().unwrap_or_default(),
-                serde_json::to_string(&item.source_anchors).unwrap_or_default(),
-                item.source_quote.clone().unwrap_or_default()
-            )
+        .filter_map(|(key, header)| {
+            by_type.get(key).map(|items| {
+                let body = items.iter().map(|c| render_chunk(c)).collect::<Vec<_>>().join("\n");
+                format!("{}\n{}", header, body)
+            })
         })
-        .collect::<Vec<_>>()
-        .join("\n");
-    format!("已打开知识切片:\n{}", chunk_text)
+        .collect::<Vec<_>>();
+    format!("已打开知识切片:\n{}", sections.join("\n\n"))
 }
 
 pub async fn test_knowledge_route_for_contact(
@@ -277,6 +311,9 @@ pub async fn test_knowledge_route_for_contact(
         last_inbound_at: None,
         last_outbound_at: None,
         last_agent_run_at: None,
+        last_outbound_style: None,
+        intent_trajectory: Vec::new(),
+        locale: None,
         created_at: DateTime::now(),
         updated_at: DateTime::now(),
     });
@@ -361,8 +398,8 @@ pub(crate) async fn route_operation_knowledge(
     contact: &Contact,
     inbound: &ConversationMessage,
     recent_messages: &[ConversationMessage],
-    memory: &OperatingMemory,
-    context_pack: &Document,
+    _memory: &OperatingMemory,
+    _context_pack: &Document,
     knowledge: &KnowledgeRuntime,
     run_id: Option<&str>,
 ) -> AppResult<KnowledgeRouteResult> {
@@ -374,21 +411,12 @@ pub(crate) async fn route_operation_knowledge(
             ..Default::default()
         });
     }
-    // ── 硬关键词快路径 (WB5) ─────────────────────────────────────────────
-    // Reply Agent 永远先跑知识路由；这里在 LLM planner 之前先做一遍
-    // trigger_keywords 子串匹配（大小写不敏感）。命中即在 tool_trace 上写
-    // `keyword_fastpath_hit:<chunkId>:<keyword>`，并把命中 chunk 强制塞进
-    // selected_chunk_ids 头部。gateway 据此覆盖 conversation_mode=consultative。
-    let fastpath_hits = compute_keyword_fastpath_hits(&inbound.content, &knowledge.chunks);
-    let catalog = format_operation_knowledge_catalog_for_prompt(knowledge);
-    let memory_text = serde_json::to_string(&doc! {
-        "memoryCard": context_pack.clone(),
-        "relationshipState": memory.relationship_state.clone(),
-        "productFit": memory.product_fit.clone(),
-        "nextAction": memory.next_action.clone()
-    })
-    .unwrap_or_default();
-    let history = recent_messages
+
+    // ── Agent-first 渐进式披露 ──────────────────────────────────────────
+    // 把"运营消息上下文"折成 query 喂给 knowledge_agent，让它自己 list_catalog
+    // → open_chunk → follow_relations → answer。本路径完全不再做硬关键词匹配；
+    // 所有命中都来自 LLM 决策，运行时只读、不写 chunk。
+    let history_block = recent_messages
         .iter()
         .rev()
         .take(8)
@@ -401,245 +429,74 @@ pub(crate) async fn route_operation_knowledge(
         })
         .collect::<Vec<_>>()
         .join("\n");
-    let system = "你是微信用户运营 Knowledge Tool Planner。你要像 Agent 工具调用一样，先阅读知识目录，再决定本轮应该打开哪些文档、知识包、切片和证据。不负责回复客户。必须只输出严格 JSON。";
-    let user = format!(
-        r#"请根据用户当前消息、长期记忆和知识目录，规划本轮用户运营 Agent 的知识工具调用。
-输出 JSON：
-{{
-  "neededCategories": ["自然语言说明需要哪类知识，不要使用固定枚举"],
-  "selectedDocumentIds": [],
-  "selectedKnowledgeIds": [],
-  "selectedChunkIds": [],
-  "selectedSliceReasons": [],
-  "riskLevel": "low | medium | high",
-  "requiresEvidence": false,
-  "knowledgeCoverage": "enough | weak | missing",
-  "missingKnowledge": [],
-  "reason": "",
-  "toolTrace": [
-    {{
-      "tool": "knowledge.list_catalog",
-      "reason": "先阅读目录"
-    }},
-    {{
-      "tool": "knowledge.open_slice",
-      "ids": [],
-      "reason": "说明为什么打开这些切片"
-    }}
-  ]
-}}
+    let query = if history_block.trim().is_empty() {
+        inbound.content.clone()
+    } else {
+        format!(
+            "用户当前消息：\n{}\n\n最近对话：\n{}",
+            inbound.content, history_block
+        )
+    };
 
-规则：
-- 只从目录里的 documentId、itemId、chunkId 选择。
-- 优先选择 chunkId，因为切片才是运行时应打开的最小知识单元。
-- selectedKnowledgeIds 最多 4 个，selectedChunkIds 最多 8 个，selectedDocumentIds 最多 3 个。
-- 涉及产品能力、价格、案例、效果、交付承诺时 requiresEvidence=true。
-- requiresEvidence=true 时必须优先选择有 evidence 的切片；没有证据时 knowledgeCoverage=weak 或 missing。
-- 没有足够知识时 knowledgeCoverage=missing 或 weak，不要硬选无关知识。
-- 不要按关键词机械匹配；要结合用户阶段、长期记忆、当前语义和风险判断。
-
-客户昵称: {}
-客户阶段: {}
-运营状态: {}
-最近聊天:
-{}
-
-长期记忆卡片:
-{}
-
-运营记忆:
-{}
-
-用户最新消息:
-{}
-
-知识目录与可打开切片:
-{}"#,
-        contact.nickname.clone().unwrap_or_default(),
-        contact
-            .domain_attributes
-            .as_ref()
-            .and_then(|doc| doc.get_str("customer_stage").ok().map(|s| s.to_string()))
-            .unwrap_or_default(),
-        contact.operation_state.clone().unwrap_or_default(),
-        history,
-        serde_json::to_string(context_pack).unwrap_or_default(),
-        memory_text,
-        inbound.content,
-        catalog
-    );
-    let value = generate_agent_json(
+    let answer = super::knowledge_agent::answer(
         state,
-        Some(&contact.account_id),
-        Some(&contact.wxid),
-        run_id,
-        "user.knowledge.router",
-        system,
-        &user,
+        super::knowledge_agent::AnswerRequest {
+            workspace_id: contact.workspace_id.clone(),
+            account_id: Some(contact.account_id.clone()),
+            query,
+            filter: super::knowledge_agent::CatalogFilter::default(),
+            max_rounds: None,
+        },
     )
     .await?;
-    let mut route: KnowledgeRouteResult = serde_json::from_value(value)?;
-    route.selected_document_ids = route
-        .selected_document_ids
-        .into_iter()
-        .filter(|id| {
-            knowledge.documents.iter().any(|item| {
-                item.id.map(|object_id| object_id.to_hex()).as_deref() == Some(id.as_str())
-            })
-        })
-        .take(3)
-        .collect();
-    route.selected_knowledge_ids = Vec::new();
-    route.selected_chunk_ids = route
-        .selected_chunk_ids
-        .into_iter()
+    let _ = run_id;
+
+    // 保留 KnowledgeRouteResult 既有字段语义；selected_chunk_ids 直接用 agent
+    // cited，evidence_excerpts 取 source_quotes，tool_trace 透传。
+    let cited_in_corpus: Vec<String> = answer
+        .cited_chunk_ids
+        .iter()
         .filter(|id| {
             knowledge.chunks.iter().any(|item| {
                 item.id.map(|object_id| object_id.to_hex()).as_deref() == Some(id.as_str())
             })
         })
         .take(8)
+        .cloned()
         .collect();
-    let has_catalog_trace = route
-        .tool_trace
+    let evidence_excerpts: Vec<String> = answer
+        .source_quotes
         .iter()
-        .any(|item| item.get_str("tool") == Ok("knowledge.list_catalog"));
-    if !has_catalog_trace {
-        route.tool_trace.insert(
-            0,
-            doc! {
-                "tool": "knowledge.list_catalog",
-                "documents": knowledge.documents.len() as i32,
-                "chunks": knowledge.chunks.len() as i32
-            },
-        );
-    }
-    let has_open_trace = route
-        .tool_trace
-        .iter()
-        .any(|item| item.get_str("tool") == Ok("knowledge.open_slice"));
-    if !route.selected_chunk_ids.is_empty() && !has_open_trace {
-        route.tool_trace.push(doc! {
-            "tool": "knowledge.open_slice",
-            "ids": route.selected_chunk_ids.clone(),
-            "reason": route.reason.clone()
-        });
-    }
-    if route.knowledge_coverage.trim().is_empty() {
-        route.knowledge_coverage =
-            if route.selected_knowledge_ids.is_empty() && route.selected_chunk_ids.is_empty() {
-                "missing".to_string()
-            } else {
-                "enough".to_string()
-            };
-    }
-    if route.risk_level.trim().is_empty() {
-        route.risk_level = if route.requires_evidence {
-            "high".to_string()
-        } else {
-            "medium".to_string()
-        };
-    }
-    // ── WB5 fastpath 合并 ───────────────────────────────────────────────
-    // 把硬关键词命中的 chunk 强制塞进 selected_chunk_ids 头部（去重保留 LLM 排序），
-    // 并在 tool_trace 上写 keyword_fastpath_hit 行，gateway 据此覆盖
-    // conversation_mode=consultative。即使 LLM planner 没有选中这些 chunk，
-    // fastpath 也会把它们补回来。
-    if !fastpath_hits.is_empty() {
-        let mut prepend: Vec<String> = Vec::new();
-        for (chunk_id, _kw) in &fastpath_hits {
-            if !route.selected_chunk_ids.iter().any(|existing| existing == chunk_id)
-                && !prepend.iter().any(|existing| existing == chunk_id)
-            {
-                prepend.push(chunk_id.clone());
-            }
-        }
-        if !prepend.is_empty() {
-            let mut merged = prepend;
-            merged.extend(route.selected_chunk_ids.drain(..));
-            // 截断到 8 (与 LLM planner 同)，避免 selected_chunk_ids 超长。
-            if merged.len() > 8 {
-                merged.truncate(8);
-            }
-            route.selected_chunk_ids = merged;
-        }
-        for (chunk_id, kw) in &fastpath_hits {
-            route.tool_trace.push(doc! {
-                "tool": "knowledge.keyword_fastpath",
-                "label": format!("keyword_fastpath_hit:{}:{}", chunk_id, kw),
-                "chunkId": chunk_id.clone(),
-                "keyword": kw.clone()
-            });
-        }
-        if route.knowledge_coverage == "missing" {
-            route.knowledge_coverage = "weak".to_string();
-        }
-    }
-    route.tool_trace = dedupe_tool_trace(route.tool_trace);
+        .filter(|q| !q.quote.trim().is_empty())
+        .map(|q| q.quote.clone())
+        .collect();
+    let knowledge_coverage = if cited_in_corpus.is_empty() {
+        "missing".to_string()
+    } else if evidence_excerpts.is_empty() {
+        "weak".to_string()
+    } else {
+        "enough".to_string()
+    };
+    let risk_level = if cited_in_corpus.is_empty() {
+        "medium".to_string()
+    } else {
+        "low".to_string()
+    };
+    let route = KnowledgeRouteResult {
+        needed_categories: Vec::new(),
+        selected_knowledge_ids: Vec::new(),
+        selected_document_ids: Vec::new(),
+        selected_chunk_ids: cited_in_corpus,
+        selected_slice_reasons: Vec::new(),
+        risk_level,
+        requires_evidence: !evidence_excerpts.is_empty(),
+        knowledge_coverage,
+        missing_knowledge: Vec::new(),
+        reason: answer.answer.clone(),
+        tool_trace: answer.tool_trace.clone(),
+        evidence_excerpts,
+    };
     Ok(route)
-}
-
-/// WB5：硬关键词快路径的纯函数版（不依赖 AppState / LLM / Mongo）。
-///
-/// 对每个 chunk 的 `trigger_keywords` 做大小写不敏感子串匹配；命中即记录
-/// `(chunk_id, matched_keyword)`，每个 chunk 最多记一次。无 id 的 chunk
-/// 直接跳过。inbound 仅含空白时返回空。
-///
-/// 主路径 [`route_operation_knowledge`] 在 LLM planner 之前调用本函数；
-/// 也对外暴露给独立 crate 的 `tests/keyword_fastpath_router.rs` 单测。
-pub fn compute_keyword_fastpath_hits(
-    inbound_content: &str,
-    chunks: &[OperationKnowledgeChunk],
-) -> Vec<(String, String)> {
-    let lower_inbound = inbound_content.to_lowercase();
-    if lower_inbound.trim().is_empty() {
-        return Vec::new();
-    }
-    let mut hits: Vec<(String, String)> = Vec::new();
-    for chunk in chunks {
-        let Some(chunk_id) = chunk.id.map(|oid| oid.to_hex()) else {
-            continue;
-        };
-        for kw in &chunk.trigger_keywords {
-            let normalized = kw.trim().to_lowercase();
-            if normalized.is_empty() {
-                continue;
-            }
-            if lower_inbound.contains(&normalized) {
-                hits.push((chunk_id.clone(), kw.clone()));
-                break;
-            }
-        }
-    }
-    hits
-}
-
-/// WB5：判断本轮知识路由是否命中硬关键词快路径。
-/// gateway 据此把 conversation_mode 强制覆盖为 consultative。
-pub(crate) fn knowledge_route_has_keyword_fastpath_hit(route: &KnowledgeRouteResult) -> bool {
-    route
-        .tool_trace
-        .iter()
-        .any(|item| item.get_str("tool") == Ok("knowledge.keyword_fastpath"))
-}
-
-fn dedupe_tool_trace(items: Vec<Document>) -> Vec<Document> {
-    let mut seen = Vec::new();
-    let mut output = Vec::new();
-    for item in items {
-        let key = format!(
-            "{}:{}",
-            item.get_str("tool").unwrap_or_default(),
-            item.get("ids")
-                .map(|value| value.to_string())
-                .unwrap_or_default()
-        );
-        if !seen.iter().any(|existing| existing == &key) {
-            seen.push(key);
-            output.push(item);
-        }
-    }
-    output
 }
 
 pub(crate) fn empty_knowledge_route(planner: &RunPlannerResult) -> KnowledgeRouteResult {
@@ -762,3 +619,151 @@ pub(crate) async fn write_knowledge_usage_log(
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    //! Phase B / B3：`format_operation_knowledge_for_prompt` 按 chunk_type 分段输出的单测。
+    //!
+    //! 不依赖 AppState/LLM/Mongo——纯 in-memory 渲染，验证：
+    //! 1. 4 类 chunk_type 各自命中独立 section + 对应 header；
+    //! 2. 输出顺序固定为 product_fact → style_template → peer_case → negative_example，
+    //!    与输入顺序无关；
+    //! 3. 空入参返回 placeholder；
+    //! 4. 未知/缺省 chunk_type 落到 product_fact bucket。
+    use super::*;
+    use mongodb::bson::{oid::ObjectId, DateTime};
+    use crate::models::OperationKnowledgeChunk;
+
+    fn mk_chunk(title: &str, chunk_type: &str) -> OperationKnowledgeChunk {
+        let now = DateTime::now();
+        OperationKnowledgeChunk {
+            id: Some(ObjectId::new()),
+            workspace_id: "default".to_string(),
+            account_id: Some("default".to_string()),
+            document_id: None,
+            item_id: None,
+            domain: "user".to_string(),
+            knowledge_type: None,
+            business_context: None,
+            title: title.to_string(),
+            summary: Some(format!("摘要 {title}")),
+            body: None,
+            applicable_scenes: Vec::new(),
+            not_applicable_scenes: Vec::new(),
+            product_tags: Vec::new(),
+            business_topics: Vec::new(),
+            source_quote: None,
+            source_anchors: Vec::new(),
+            integrity_status: Some("verified".to_string()),
+            confidence_score: Some(80),
+            status: "active".to_string(),
+            priority: 0,
+            created_at: now,
+            updated_at: now,
+            wiki_type: None,
+            domain_attributes: None,
+            provenance: None,
+            valid_from: None,
+            valid_to: None,
+            superseded_by: None,
+            previous_version_id: None,
+            related_chunks: None,
+            usage_stats: None,
+            dynamic_confidence: None,
+            integrity_score: None,
+            locked_fields: None,
+            chunk_type: chunk_type.to_string(),
+        }
+    }
+
+    #[test]
+    fn empty_input_returns_placeholder() {
+        let s = format_operation_knowledge_for_prompt(&[]);
+        assert!(s.contains("（空）"));
+    }
+
+    #[test]
+    fn all_four_buckets_render_with_their_headers() {
+        let chunks = vec![
+            mk_chunk("产品事实-1", "product_fact"),
+            mk_chunk("语气模板-1", "style_template"),
+            mk_chunk("反例-1", "negative_example"),
+            mk_chunk("同行案例-1", "peer_case"),
+        ];
+        let s = format_operation_knowledge_for_prompt(&chunks);
+        assert!(s.contains("【产品事实 product_fact】"));
+        assert!(s.contains("【语气模板 style_template】"));
+        assert!(s.contains("【同行案例 peer_case】"));
+        assert!(s.contains("【反例 negative_example】"));
+        assert!(s.contains("产品事实-1"));
+        assert!(s.contains("语气模板-1"));
+        assert!(s.contains("反例-1"));
+        assert!(s.contains("同行案例-1"));
+    }
+
+    #[test]
+    fn section_order_is_fixed_regardless_of_input_order() {
+        // 输入顺序故意打乱，输出 section 顺序仍应为
+        // product_fact → style_template → peer_case → negative_example。
+        let chunks = vec![
+            mk_chunk("反例", "negative_example"),
+            mk_chunk("同行案例", "peer_case"),
+            mk_chunk("语气模板", "style_template"),
+            mk_chunk("产品事实", "product_fact"),
+        ];
+        let s = format_operation_knowledge_for_prompt(&chunks);
+        let p = s.find("【产品事实").expect("missing product_fact section");
+        let st = s.find("【语气模板").expect("missing style_template section");
+        let pc = s.find("【同行案例").expect("missing peer_case section");
+        let n = s.find("【反例").expect("missing negative_example section");
+        assert!(
+            p < st && st < pc && pc < n,
+            "section order broken: p={p} st={st} pc={pc} n={n}\n{s}"
+        );
+    }
+
+    #[test]
+    fn unknown_chunk_type_falls_back_to_product_fact() {
+        // 未知 chunk_type 应落到 product_fact bucket，而非另起 section。
+        let chunks = vec![mk_chunk("奇怪类型", "totally_unknown_xyz")];
+        let s = format_operation_knowledge_for_prompt(&chunks);
+        assert!(
+            s.contains("【产品事实 product_fact】"),
+            "unknown type 应落到 product_fact bucket: {s}"
+        );
+        // 不应自创 section
+        assert!(!s.contains("totally_unknown_xyz】"));
+        assert!(s.contains("奇怪类型"));
+    }
+
+    #[test]
+    fn empty_chunk_type_string_falls_back_to_product_fact() {
+        let chunks = vec![mk_chunk("空类型", "")];
+        let s = format_operation_knowledge_for_prompt(&chunks);
+        assert!(s.contains("【产品事实 product_fact】"));
+        assert!(s.contains("空类型"));
+    }
+
+    #[test]
+    fn render_includes_chunk_type_field_in_each_line() {
+        let chunks = vec![
+            mk_chunk("a", "product_fact"),
+            mk_chunk("b", "style_template"),
+        ];
+        let s = format_operation_knowledge_for_prompt(&chunks);
+        assert!(s.contains("chunkType=product_fact"));
+        assert!(s.contains("chunkType=style_template"));
+    }
+
+    #[test]
+    fn missing_buckets_do_not_emit_their_headers() {
+        // 仅 style_template，不应出现 product_fact / peer_case / negative_example header。
+        let chunks = vec![mk_chunk("仅模板", "style_template")];
+        let s = format_operation_knowledge_for_prompt(&chunks);
+        assert!(s.contains("【语气模板 style_template】"));
+        assert!(!s.contains("【产品事实 product_fact】"));
+        assert!(!s.contains("【同行案例 peer_case】"));
+        assert!(!s.contains("【反例 negative_example】"));
+    }
+}
+

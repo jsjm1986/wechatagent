@@ -24,7 +24,7 @@ use crate::models::{
     OperationDomainConfig, OperationKnowledgeChunk, OperationKnowledgeDocument,
     OperationPlaybook, OutboxEntry, PostReleaseReview, PromptTemplate,
     Proposal, ShadowReplay, TaxonomyCandidate, TaxonomyEntry, ThresholdOverride,
-    UserOperationGuidePreview, WechatAccount,
+    ThresholdOverrideAudit, UserOperationGuidePreview, WechatAccount,
 };
 
 #[derive(Clone)]
@@ -103,6 +103,13 @@ impl Database {
 
     pub fn operation_domain_configs(&self) -> Collection<OperationDomainConfig> {
         self.db.collection("operation_domain_configs")
+    }
+
+    /// Phase B / B4：`operation_state_policies` typed accessor。
+    /// 行结构 [`crate::models::OperationStatePolicy`]，每行对应单 (workspace, domain, state_key)
+    /// 的"允许/禁止动作 + 推荐节奏" policy。enforce 路径在 `agent::guards`。
+    pub fn operation_state_policies(&self) -> Collection<crate::models::OperationStatePolicy> {
+        self.db.collection("operation_state_policies")
     }
 
     pub fn prompt_templates(&self) -> Collection<PromptTemplate> {
@@ -244,11 +251,26 @@ impl Database {
         self.db.collection("threshold_overrides")
     }
 
+    /// Phase C / C5：`threshold_overrides_audit` 不可变审计表。每次 release /
+    /// rollback / auto-release 都追加一行；与 `threshold_overrides` 当前生效层
+    /// 解耦，方便事后追因（"为什么 X 阈值在 YYYY-MM 跳到 Z"）。
+    pub fn threshold_overrides_audit(&self) -> Collection<ThresholdOverrideAudit> {
+        self.db.collection("threshold_overrides_audit")
+    }
+
     /// agent-self-evolution W4 (Task 5.6)：`post_release_reviews` 集合 typed accessor
     /// （Requirements 9.7）。+24h 对比窗口评测在 release 完成后由 evolution worker
     /// 末尾扫描；不参与 release 决策本身。
     pub fn post_release_reviews(&self) -> Collection<PostReleaseReview> {
         self.db.collection("post_release_reviews")
+    }
+
+    /// Phase C / C3：`evolution_runtime_flags` 集合 typed accessor。
+    /// 运行时演化器开关 + 灰度比例（0..=100）。`evolution::is_evolution_enabled_for`
+    /// 读这条文档计算 `hash(contact_id) % 100 < rollout_percent`。同一 workspace
+    /// 单条文档；不存在时按"关停态"处理。
+    pub fn evolution_runtime_flags(&self) -> Collection<crate::models::EvolutionRuntimeFlag> {
+        self.db.collection("evolution_runtime_flags")
     }
 
     /// LLM 服务商配置集合：把原本只读的 `.env`（`OPENAI_BASE_URL` /

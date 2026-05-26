@@ -20,9 +20,11 @@ use mongodb::{
     options::FindOptions,
 };
 
+use crate::models::EvolutionRuntimeFlag;
 use crate::routes::AppState;
 
 use super::error::EvolutionError;
+use super::runtime_flag::bucket_for_contact;
 
 #[derive(Debug, Default, Clone)]
 pub struct Cohorts {
@@ -53,6 +55,22 @@ pub async fn select_cohorts(
     workspace_id: &str,
     account_id: &str,
 ) -> Result<Cohorts, EvolutionError> {
+    select_cohorts_filtered(state, workspace_id, account_id, None).await
+}
+
+/// Phase C / C3：可灰度过滤版 cohort 选择。
+///
+/// `runtime_flag = Some(flag)` 时仅保留 `bucket_for_contact(flag, contact_wxid)` 命中
+/// 的 run（即 `enabled=true && hash(contact_id) % 100 < rollout_percent` 的 contact）；
+/// `None` 等价于"不过滤、全量收"，保持 W1 行为以兼容尚未配 mongo flag 的 workspace。
+///
+/// 同一 contact 在 rollout_percent 单调上升时永远在桶里——见 [`super::runtime_flag`]。
+pub async fn select_cohorts_filtered(
+    state: &AppState,
+    workspace_id: &str,
+    account_id: &str,
+    runtime_flag: Option<&EvolutionRuntimeFlag>,
+) -> Result<Cohorts, EvolutionError> {
     let window_hours = state.config.evolution_eval_window_hours.max(1) as i64;
     let cap_per_contact = state.config.evolution_cohort_per_contact_cap.max(1);
     let min_replays = state.config.evolution_min_replays;
@@ -82,6 +100,12 @@ pub async fn select_cohorts(
     while let Some(run) = cursor.try_next().await.map_err(EvolutionError::from)? {
         let Some(id) = run.id else { continue };
         let contact = run.contact_wxid.clone().unwrap_or_default();
+        if let Some(flag) = runtime_flag {
+            // 空 contact_wxid 视作"无法判定的桶"，灰度模式下排除以避免污染样本。
+            if contact.is_empty() || !bucket_for_contact(flag, &contact) {
+                continue;
+            }
+        }
         threshold_pool.push((id, contact, run.final_review_status.clone()));
     }
 

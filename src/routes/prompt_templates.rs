@@ -37,6 +37,9 @@ pub(super) struct PromptTemplateRequest {
     title: String,
     description: Option<String>,
     content: String,
+    /// Phase E / E3：可选 locale（BCP-47），未提供时落到 [`prompts::DEFAULT_LOCALE`]。
+    #[serde(default)]
+    locale: Option<String>,
 }
 
 pub(super) async fn list_prompt_templates(
@@ -111,6 +114,8 @@ pub(super) async fn create_prompt_template(
         current_version: false,
         previous_version: None,
         seeded_by: Some("manual".to_string()),
+        locale: normalize_optional(payload.locale)
+            .or_else(|| Some(prompts::DEFAULT_LOCALE.to_string())),
     };
     let result = state
         .db

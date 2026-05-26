@@ -108,6 +108,9 @@ pub(super) async fn sync_accounts(State(state): State<AppState>) -> AppResult<Js
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false),
             last_sync_at: DateTime::now(),
+            capacity: 0,
+            persona_tag: None,
+            off_hours: Vec::new(),
             created_at: DateTime::now(),
             updated_at: DateTime::now(),
         };

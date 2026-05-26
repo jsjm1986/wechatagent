@@ -32,7 +32,7 @@ use crate::{
         error::EvolutionError,
         release::{release_prompt, release_threshold, rollback_prompt, rollback_threshold},
     },
-    models::{Experiment, Proposal, ShadowReplay, ThresholdOverride},
+    models::{Experiment, EvolutionRuntimeFlag, Proposal, ShadowReplay, ThresholdOverride},
 };
 
 use super::shared::parse_object_id;
@@ -529,6 +529,97 @@ fn bson_doc_to_json(d: &mongodb::bson::Document) -> Value {
     serde_json::to_value(Bson::Document(d.clone())).unwrap_or_else(|_| json!({}))
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct UpdateRuntimeFlagRequest {
+    /// `true`/`false` 总开关；`enabled=false` 时一票否决整个灰度。
+    enabled: bool,
+    /// 灰度百分比 0..=100；超出范围由 server 钳制。
+    rollout_percent: u32,
+    /// 操作者审计字段；可选（未登录态写 "admin" 默认值）。
+    #[serde(default)]
+    updated_by: Option<String>,
+}
+
+/// `GET /api/evolution/runtime-flag` —— Phase C / C3 当前灰度配置。
+///
+/// 文档不存在时返回 `enabled=false, rollout_percent=0` 的逻辑默认（即"未配置=关停"），
+/// 不在读路径触发写入；admin 通过 PUT 才显式落库。
+pub(super) async fn get_evolution_runtime_flag(
+    State(state): State<AppState>,
+) -> AppResult<Json<Value>> {
+    // FORBIDDEN: enqueue agent_send_outbox / mcp call
+    let workspace_id = state.config.default_workspace_id.clone();
+    let flag = state
+        .db
+        .evolution_runtime_flags()
+        .find_one(doc! { "workspace_id": &workspace_id }, None)
+        .await?;
+    Ok(Json(json!({
+        "workspaceId": workspace_id,
+        "envEvolutionEnabled": state.config.evolution_enabled,
+        "flag": flag.as_ref().map(runtime_flag_json),
+    })))
+}
+
+/// `PUT /api/evolution/runtime-flag` —— upsert 灰度配置。
+pub(super) async fn put_evolution_runtime_flag(
+    State(state): State<AppState>,
+    Json(payload): Json<UpdateRuntimeFlagRequest>,
+) -> AppResult<Json<Value>> {
+    // FORBIDDEN: enqueue agent_send_outbox / mcp call
+    let workspace_id = state.config.default_workspace_id.clone();
+    let rollout_percent = payload.rollout_percent.min(100);
+    let updated_by = payload
+        .updated_by
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or(DEFAULT_RELEASE_ADMIN);
+    let now = DateTime::now();
+
+    state
+        .db
+        .evolution_runtime_flags()
+        .update_one(
+            doc! { "workspace_id": &workspace_id },
+            doc! {
+                "$set": {
+                    "workspace_id": &workspace_id,
+                    "enabled": payload.enabled,
+                    "rollout_percent": rollout_percent as i64,
+                    "updated_by": updated_by,
+                    "updated_at": now,
+                }
+            },
+            mongodb::options::UpdateOptions::builder().upsert(true).build(),
+        )
+        .await?;
+
+    let saved = state
+        .db
+        .evolution_runtime_flags()
+        .find_one(doc! { "workspace_id": &workspace_id }, None)
+        .await?
+        .ok_or_else(|| {
+            AppError::External("evolution_runtime_flags upsert returned no document".to_string())
+        })?;
+    Ok(Json(json!({
+        "ok": true,
+        "flag": runtime_flag_json(&saved),
+    })))
+}
+
+fn runtime_flag_json(f: &EvolutionRuntimeFlag) -> Value {
+    json!({
+        "workspaceId": f.workspace_id,
+        "enabled": f.enabled,
+        "rolloutPercent": f.rollout_percent_clamped(),
+        "rolloutPercentRaw": f.rollout_percent,
+        "updatedBy": f.updated_by,
+        "updatedAt": datetime_to_rfc3339(f.updated_at),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -606,6 +697,9 @@ mod tests {
             strategic_planner_block_rate_min_runs: 3,
             strategic_planner_block_rate_threshold: 0.6,
             strategic_planner_priority_enabled: true,
+            cold_contact_worker_enabled: false,
+            cold_contact_threshold_hours: 168,
+            cold_contact_daily_emit_cap: 5,
             evolution_enabled: false,
             evolution_tick_seconds: 600,
             evolution_run_token_budget: 60_000,

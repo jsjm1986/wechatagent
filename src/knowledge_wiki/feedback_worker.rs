@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use tokio::time::sleep;
 
-use crate::knowledge_wiki::gap_signals;
+use crate::knowledge_wiki::{gap_signals, lessons_learned};
 use crate::routes::AppState;
 
 /// 反馈 worker 主循环。`interval_secs == 0` 直接 return。
@@ -69,6 +69,24 @@ async fn run_one_round(state: &AppState) -> anyhow::Result<()> {
             }
             Err(err) => {
                 tracing::warn!(workspace_id = %ws, ?err, "sweep_stale_signals failed");
+            }
+        }
+        // Phase D / D5：跨用户 lessons_learned 聚合（14d 滑窗）。
+        // 默认每轮都跑——纯 mongo 聚合 + upsert，不发 LLM 调用，廉价。
+        match lessons_learned::aggregate_lessons_for_workspace(state, &ws, 14).await {
+            Ok(report) => {
+                if report.success_lessons + report.failure_lessons + report.blocked_lessons > 0 {
+                    tracing::info!(
+                        workspace_id = %ws,
+                        success = report.success_lessons,
+                        failure = report.failure_lessons,
+                        blocked = report.blocked_lessons,
+                        "lessons_learned aggregate done"
+                    );
+                }
+            }
+            Err(err) => {
+                tracing::warn!(workspace_id = %ws, ?err, "lessons_learned aggregate failed");
             }
         }
     }

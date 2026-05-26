@@ -67,8 +67,34 @@ pub struct WechatAccount {
     pub mcp_api_key: Option<String>,
     pub online: bool,
     pub last_sync_at: DateTime,
+    /// Phase D / D4：单 account 在调度窗口内允许承接的并发联系人上限。
+    /// 0 表示未配置（视为不参与多账号轮询，落回单 account 行为）。
+    #[serde(default)]
+    pub capacity: u32,
+    /// Phase D / D4：账号 persona 标签（`sales_assistant` / `support` /
+    /// `community_ops` 等运营自定义），调度器把同 persona 的 account 视为
+    /// 互替；跨 persona 不互替，避免风格漂移。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub persona_tag: Option<String>,
+    /// Phase D / D4：账号每日"勿打扰"窗口（小时区间，运营时区）。
+    /// 命中任一区间时该账号 round-robin 跳过，不被分配新 contact。
+    #[serde(default)]
+    pub off_hours: Vec<HourRange>,
     pub created_at: DateTime,
     pub updated_at: DateTime,
+}
+
+/// Phase D / D4：账号"勿打扰"小时区间。运营时区下的 [start_hour, end_hour) 半开
+/// 区间；跨午夜（如 22-2）合法，调度器内部会拆成两段比较。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct HourRange {
+    /// 0..=23
+    #[serde(default)]
+    pub start_hour: u32,
+    /// 0..=24（24 表示当日结尾，便于 0..24 表达"全天关停"）
+    #[serde(default)]
+    pub end_hour: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -125,6 +151,23 @@ pub struct Contact {
     pub last_inbound_at: Option<DateTime>,
     pub last_outbound_at: Option<DateTime>,
     pub last_agent_run_at: Option<DateTime>,
+    /// Phase D / D2：上次出站回复的风格指纹（长度桶 / emoji / 标点 / 句式特征
+    /// 拼接而成的短串）。reviewer 在新 draft 通过审批前与本字段比对，差异过大时
+    /// 触发 single-shot revision，避免单 contact 不同回合风格漂移。
+    /// 缺字段时反序列化为 None，向前兼容历史 contact 文档。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_outbound_style: Option<String>,
+    /// Phase D / D1：意图轨迹滑窗（最近 50 项）。`record_user_reaction` 完成后
+    /// 追加一条；`knowledge_router` 在装 prompt 时拼接近 N 项（默认 5）。
+    /// 缺字段时反序列化为空 Vec，向前兼容历史 contact 文档。
+    #[serde(default)]
+    pub intent_trajectory: Vec<IntentTrajectoryEntry>,
+    /// Phase E / E3：联系人语种（BCP-47 短形式，如 `zh-CN` / `en-US`）。
+    /// `load_prompt_for_contact` 在 prompt_templates 多 locale 并存时按本字段
+    /// 选最匹配版本；缺字段时反序列化为 None，由 `contact_locale_or_default`
+    /// 回退到 [`DEFAULT_LOCALE`]（`zh-CN`），向前兼容历史 contact 文档。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub locale: Option<String>,
     pub created_at: DateTime,
     pub updated_at: DateTime,
 }
@@ -278,6 +321,13 @@ pub struct PromptTemplate {
     /// agent-self-evolution M4：写入来源（`"system"` / `"legacy_migration"` /
     /// `"evolution_release"` 等），方便排查谁改的。
     pub seeded_by: Option<String>,
+    /// Phase E / E3：模板语种（BCP-47 短形式，如 `zh-CN` / `en-US`）。
+    /// `load_prompt_for_contact` 优先选 `(workspace_id, prompt_key, locale)` 三元
+    /// 全匹配的 active 版本；未命中时 fallback 到 `DEFAULT_LOCALE` 的版本。
+    /// 缺字段时反序列化为 None，由 `template_locale_or_default` 回退到 `zh-CN`，
+    /// 与历史模板（无 locale 字段）兼容。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub locale: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -323,6 +373,82 @@ pub struct OperationDomainConfig {
     pub state_machine: Document,
     pub status: String,
     pub updated_at: DateTime,
+}
+
+/// Phase B / B4：`operation_state_policies` collection 行结构。
+///
+/// 目的：把"该状态允许 / 禁止 agent 做哪类动作"从 `OperationDomainConfig.state_machine`
+/// 里抽出来独立维护，让运营人员可以在不动状态机本身的情况下迭代 send 策略。
+///
+/// 唯一键：`(workspace_id, domain, state_key)`。`enforce_state_action_policy`
+/// 在 review 通过后再扣一道：若 policy 命中 forbidden 列表，则 reply 拦截。
+///
+/// `recommended_pace` 是软提示（如 `"slow"` / `"normal"` / `"hold"`），仅作为
+/// 后续 follow-up worker 的节奏建议，不参与硬拦截。
+///
+/// 兼容性：`status="active"` 才参与拦截；老库无此 collection 时 `enforce_*`
+/// 直接 fallthrough（向前兼容，避免 Phase B 引入新边界破坏既有部署）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OperationStatePolicy {
+    #[serde(rename = "_id", skip_serializing_if = "Option::is_none")]
+    pub id: Option<ObjectId>,
+    pub workspace_id: String,
+    pub domain: String,
+    pub state_key: String,
+    /// 该 state 下允许的 action 类型。空数组表示"全部允许"（白名单不启用）。
+    #[serde(default)]
+    pub allowed: Vec<String>,
+    /// 该 state 下禁止的 action 类型。命中即拦截。优先级高于 `allowed`。
+    #[serde(default)]
+    pub forbidden: Vec<String>,
+    /// 推荐节奏（软提示）：`"slow" / "normal" / "hold"`。
+    #[serde(default)]
+    pub recommended_pace: Option<String>,
+    /// `"active" / "draft"`。仅 `active` 参与拦截。
+    pub status: String,
+    pub updated_at: DateTime,
+}
+
+/// Phase C / C3：`evolution_runtime_flags` collection 行结构。
+///
+/// 把"演化器开关 + 灰度比例"从 `EVOLUTION_ENABLED` 单一 env 变量抬升为可在
+/// 运行时按 workspace 调整的 mongo 文档，让运维不需要重启即可推进
+/// 5% → 20% → 50% 的灰度节奏。`enabled=false` 等价于 env 关停态。
+///
+/// 灰度判定算法：`hash(contact_id) % 100 < rollout_percent`。同一 contact_id
+/// 在 rollout_percent 不变时永远落入同一桶，避免回滚抖动；rollout_percent 单调
+/// 上调时新增桶覆盖既有桶，已经在桶里的用户不会被踢出。
+///
+/// `rollout_percent` 取值范围 `[0, 100]`，超出范围时按 [`rollout_percent_clamped`]
+/// 钳制；`updated_by` 为审计字段（admin user / system worker），可空。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EvolutionRuntimeFlag {
+    #[serde(rename = "_id", skip_serializing_if = "Option::is_none")]
+    pub id: Option<ObjectId>,
+    pub workspace_id: String,
+    /// 演化器整体开关。false 等价于 worker 直接 return；env `EVOLUTION_ENABLED=false`
+    /// 仍可硬关停（启动期 short-circuit），优先级高。
+    pub enabled: bool,
+    /// 灰度比例 0..=100。`hash(contact_id) % 100 < rollout_percent` 命中即在桶内。
+    #[serde(default)]
+    pub rollout_percent: u32,
+    /// 审计：上次写入者（admin id / system worker name）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updated_by: Option<String>,
+    /// Phase C / C5：closed-loop 自动 release 开关。`true` 时显著性 + 邻接性
+    /// 双过滤通过的 threshold proposal 由 evolution worker 自动 release 而无需
+    /// admin 点击；`false`（默认）保持 M4 W4 的 admin 二次确认行为。env
+    /// `EVOLUTION_ENABLED=false` 时该字段无意义（worker 不跑）。
+    #[serde(default)]
+    pub threshold_auto_release_enabled: bool,
+    pub updated_at: DateTime,
+}
+
+impl EvolutionRuntimeFlag {
+    /// 钳制 `rollout_percent` 到 `[0, 100]`，避免脏数据让灰度计算溢出。
+    pub fn rollout_percent_clamped(&self) -> u32 {
+        self.rollout_percent.min(100)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -392,9 +518,6 @@ pub struct OperationKnowledgeDocument {
     /// 文档级聚合标签：等于其下所有 chunks 的 `product_tags` 去重并集（≤5）。
     #[serde(default)]
     pub product_tags: Vec<String>,
-    /// 文档级聚合关键词：所有 chunks 的 `trigger_keywords` 去重并集（≤8，全小写）。
-    #[serde(default)]
-    pub trigger_keywords: Vec<String>,
     /// 文档级业务主题（≤3）：所有 chunks 的 `business_topics` 去重并集。
     #[serde(default)]
     pub business_topics: Vec<String>,
@@ -441,11 +564,6 @@ pub struct OperationKnowledgeChunk {
     /// 后台可手动编辑。
     #[serde(default)]
     pub product_tags: Vec<String>,
-    /// 触发关键词（≤8，含同义/口语化变体，全小写）：运行时关键词快路径用
-    /// `inbound.contains(kw)` 子串匹配，命中即升档为 consultative 模式并把本
-    /// chunk 强制注入 `selected_chunks` 头部。LLM 输出空列表合法（仅辅助 chunk）。
-    #[serde(default)]
-    pub trigger_keywords: Vec<String>,
     /// 业务主题（≤3）：本 chunk 属于哪个业务议题（产品定位/竞品对比/部署方式 ...）。
     #[serde(default)]
     pub business_topics: Vec<String>,
@@ -499,6 +617,27 @@ pub struct OperationKnowledgeChunk {
     /// 编辑保护字段清单：patch 试图改这些字段一律 4xx 拒绝。默认 7 项。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub locked_fields: Option<Vec<String>>,
+
+    /// Phase B / B3：4 类 **运营用途** 标签（`product_fact / style_template /
+    /// negative_example / peer_case`）。与 `wiki_type`（9 类知识形态）正交：
+    /// `wiki_type` 描述"它是什么知识"，`chunk_type` 描述"运营时怎么用它"。
+    /// `knowledge_router` 按 `chunk_type` 分段拼接到 prompt：
+    ///
+    /// - `product_fact`：仅 `verified` 状态可用作产品声明背书；
+    /// - `style_template`：作为 few-shot 模板供 reply-agent 参考语气；
+    /// - `negative_example`：作为 don't-do 示例（来自 reviewer 误判反馈）；
+    /// - `peer_case`：作为同行案例 reference（不作产品承诺）。
+    ///
+    /// R11 兼容：缺省值反序列化时由 [`default_chunk_type`] 填 `"product_fact"`，
+    /// 旧文档不破坏。
+    #[serde(default = "default_chunk_type")]
+    pub chunk_type: String,
+}
+
+/// Phase B / B3：[`OperationKnowledgeChunk::chunk_type`] 缺省值。
+/// 旧文档反序列化时缺该字段 → 视为 `product_fact`（最保守、走 verified-only 路径）。
+pub(crate) fn default_chunk_type() -> String {
+    "product_fact".to_string()
 }
 
 impl Default for OperationKnowledgeChunk {
@@ -518,7 +657,6 @@ impl Default for OperationKnowledgeChunk {
             applicable_scenes: Vec::new(),
             not_applicable_scenes: Vec::new(),
             product_tags: Vec::new(),
-            trigger_keywords: Vec::new(),
             business_topics: Vec::new(),
             source_quote: None,
             source_anchors: Vec::new(),
@@ -540,6 +678,7 @@ impl Default for OperationKnowledgeChunk {
             dynamic_confidence: None,
             integrity_score: None,
             locked_fields: None,
+            chunk_type: default_chunk_type(),
         }
     }
 }
@@ -805,6 +944,12 @@ pub struct AgentDecisionReview {
     pub reaction_analysis: Document,
     #[serde(default)]
     pub reaction_claimed_at: Option<DateTime>,
+    /// Phase C / C1: reviewer 误判信号（reviewer 判断与用户实际反应不一致时记录）。
+    /// 取值：`approved_but_user_negative` / `blocked_but_user_positive` / None。
+    /// 由 `record_user_reaction_inner` 在 reaction_analysis 写入后计算并 $set 同步落库，
+    /// 供 feedback_worker 周期汇总 reviewer_stats，C2 分支据此挑选 negative_example 候选。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reviewer_misjudge_signal: Option<String>,
     pub status: String,
     pub created_at: DateTime,
 }
@@ -901,8 +1046,8 @@ pub struct AgentRunLog {
     /// 详见 docs/conversation-mode-design.md。
     #[serde(default)]
     pub conversation_mode: String,
-    /// `conversation_mode` 选定原因（如 `trigger_keywords_fastpath_hit`、
-    /// `customer_stage:proposal_evaluation` 等）。Optional：旧 run log 不带本字段。
+    /// `conversation_mode` 选定原因（如 `customer_stage:proposal_evaluation` 等）。
+    /// Optional：旧 run log 不带本字段。
     #[serde(default)]
     pub conversation_mode_reason: Option<String>,
     /// R9：最终归档状态（前端 horizon 聚合用）。允许枚举详见
@@ -2026,6 +2171,33 @@ mod typed {
         }
     }
 
+    /// Phase D / D1：intent 轨迹元素。每次 `record_user_reaction` 完成后追加一条，
+    /// 上限 50 项滑窗（最早条目滚出）。`turn_index` 是该 contact 的回合序号
+    /// （从已有 `conversation_messages` 行数估算或调用方递增）；`intent` 是
+    /// reaction LLM 给出的归一化 outcomeStatus（`user_replied_buying_signal`
+    /// / `user_replied_objection` / ...）；`objection_type` 当前从 reaction
+    /// `objection_type` 字段提取，若 reaction agent 未填写则为 `None`。
+    ///
+    /// 反序列化兼容：缺字段全部 `#[serde(default)]`；老 contact 文档无该字段时
+    /// 在 `Contact` 上以 `intent_trajectory: Vec<>` 默认空 Vec。
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+    #[serde(rename_all = "camelCase")]
+    pub struct IntentTrajectoryEntry {
+        #[serde(default)]
+        pub turn_index: i32,
+        #[serde(default)]
+        pub intent: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub objection_type: Option<String>,
+        #[serde(default = "default_epoch_dt")]
+        pub recorded_at: DateTime,
+    }
+
+    impl IntentTrajectoryEntry {
+        /// 上限滑窗：保留最近 50 项，最早条目滚出。
+        pub const MAX_ITEMS: usize = 50;
+    }
+
     /// 波 D1：`OperationDomainConfig.state_machine` 的强类型版本。
     ///
     /// 与运行时 `crate::agent::guards::check_state_transition` 消费的字段对齐。
@@ -2070,8 +2242,8 @@ mod typed {
 }
 
 pub use typed::{
-    CommitmentEntry, CommitmentRepr, MemoryCardTyped, MemoryFact, MemoryFactRepr,
-    OperationStateMachineTyped, OperationStateTyped, RuntimeParametersTyped,
+    CommitmentEntry, CommitmentRepr, IntentTrajectoryEntry, MemoryCardTyped, MemoryFact,
+    MemoryFactRepr, OperationStateMachineTyped, OperationStateTyped, RuntimeParametersTyped,
 };
 
 impl OperationDomainConfig {
@@ -2225,6 +2397,40 @@ pub struct ThresholdOverride {
     pub released_by: String,
     pub rolled_back_at: Option<DateTime>,
     pub rolled_back_by: Option<String>,
+}
+
+/// Phase C / C5：`threshold_overrides_audit` 不可变审计表。
+///
+/// 每次 release / rollback / auto-release 都写一条；与 `threshold_overrides`
+/// 区别：threshold_overrides 是"当前生效层"（rollback 把 rolled_back_at 写出来
+/// 即等价于失效），audit 表是"完整变更日志"，永不更新只追加，方便事后追因
+/// "为什么 fact_risk_block 在 2026-04-12 从 6.0 跳到 5.5"。
+///
+/// `decided_by` 取值：
+///   - `"admin:<id>"`：UI 点 RELEASE/ROLLBACK 触发；
+///   - `"evolution_auto"`：closed-loop 自动 release（C5 后续启用，先把字段挂上）；
+///   - `"evolution_release"` / `"evolution_rollback"`：worker 走自动通道时的细分。
+///
+/// `action` 枚举：`"released"` / `"rolled_back"` / `"auto_released"`。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ThresholdOverrideAudit {
+    #[serde(rename = "_id", skip_serializing_if = "Option::is_none")]
+    pub id: Option<ObjectId>,
+    pub workspace_id: String,
+    pub account_id: String,
+    pub gate_key: String,
+    pub action: String,
+    pub previous_value: Option<f64>,
+    pub new_value: Option<f64>,
+    pub source_proposal_id: ObjectId,
+    pub decided_by: String,
+    pub decided_at: DateTime,
+    /// 触发本次变更时的 cohort 命中率（如可得）；纯审计字段。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hit_rate_observed: Option<f64>,
+    /// 触发本次变更时的显著性指标（来自 proposal.eval_metrics 的快照）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub significance_metrics: Option<mongodb::bson::Document>,
 }
 
 /// agent-self-evolution W0：`post_release_reviews`（W4 Task 5.6 +24h 对比窗口评测）。
@@ -3254,7 +3460,6 @@ mod typed_tests {
             "forbidden_claims": Vec::<String>::new(),
             "evidence_items": Vec::<String>::new(),
             "product_tags": Vec::<String>::new(),
-            "trigger_keywords": Vec::<String>::new(),
             "business_topics": Vec::<String>::new(),
             "source_anchors": Vec::<Document>::new(),
             "distortion_risks": Vec::<String>::new(),
@@ -3318,7 +3523,6 @@ mod typed_tests {
             applicable_scenes: vec![],
             not_applicable_scenes: vec![],
             product_tags: vec![],
-            trigger_keywords: vec![],
             business_topics: vec![],
             source_quote: None,
             source_anchors: vec![],
@@ -3344,6 +3548,7 @@ mod typed_tests {
                 "wiki_type".to_string(),
                 "created_at".to_string(),
             ]),
+            chunk_type: "product_fact".to_string(),
         };
         let doc = mongodb::bson::to_document(&chunk).expect("serialize chunk");
         assert_eq!(doc.get_str("wiki_type").unwrap(), "methodology");
@@ -3452,7 +3657,6 @@ mod typed_tests {
             "routing_map": Vec::<String>::new(),
             "risk_notes": Vec::<String>::new(),
             "product_tags": Vec::<String>::new(),
-            "trigger_keywords": Vec::<String>::new(),
             "business_topics": Vec::<String>::new(),
             "line_index": Vec::<Document>::new(),
             "section_index": Vec::<Document>::new(),

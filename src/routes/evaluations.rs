@@ -522,6 +522,9 @@ fn scenario_contact_from_seed(
         last_inbound_at: None,
         last_outbound_at: None,
         last_agent_run_at: None,
+        last_outbound_style: None,
+        intent_trajectory: Vec::new(),
+        locale: None,
         created_at: now,
         updated_at: now,
     }

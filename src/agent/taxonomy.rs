@@ -1,16 +1,14 @@
-//! agent-autonomy-loop W3 / Task 4.6：`system_taxonomies` 字典 + `taxonomy_candidates`
-//! 候选集合的运行时入口。
+//! `system_taxonomies` 严格字典 + `taxonomy_candidates` 候选集合的运行时入口。
 //!
-//! 双层标签设计（详见 design.md §3.3 / §3.4 + requirements.md R8）：
+//! 双层标签设计（运营领域无关）：
 //!
-//! 1. **严格字典层 (`system_taxonomies`)**：`customer_stage / intent_level /
-//!    objection_type` 三个维度的可枚举取值，由迁移 `2026_05_006_taxonomy_seed`
-//!    填充默认值，后台 API 可增删改（详见 task 4.8）。
+//! 1. **严格字典层 (`system_taxonomies`)**：按 `(scope, kind)` 任意维度组织的可
+//!    枚举取值。`kind` 是字符串，由运营在后台维护（不再硬编码具体维度）。
 //! 2. **候选层 (`taxonomy_candidates`)**：Reply Agent 输出但不在字典里的取值
 //!    自动落入此集合（含 evidence / first_seen_at / occurrences），由后台审核
-//!    后并入正式字典。**候选 SHALL NOT 阻塞 Reply Agent**（R8.4）。
+//!    后并入正式字典。**候选 SHALL NOT 阻塞 Reply Agent**。
 //!
-//! 核心 API：
+//! 核心 API（`kind` 全部按 `&str` 传入，调用方自定语义）：
 //!
 //! - [`check_value`]：纯函数，对照 `TaxonomyCache` 命中判定，返回 [`TaxonomyMatch`]。
 //! - [`upsert_candidate`]：幂等 upsert（按 `(scope, kind, raw_value)` 唯一），
@@ -19,8 +17,8 @@
 //!   `system_taxonomies` 并把 candidate.status=approved。
 //! - [`TaxonomyCache`]：进程级 TTL 缓存，启动期 + API 写后失效。
 //!
-//! 与 `enforce_decision_guards` 的接入在 task 4.7：对 `decision.customer_stage /
-//! intent_level / objection_type` 三字段调 `check_value`，按 match 分支：
+//! 与 `enforce_decision_guards` 接入：上层把 LLM 返回的 `domainSignals` 字典逐
+//! 项调 `check_value(kind, value, ...)`，按 match 分支：
 //! - `Active`：合法值，无操作；
 //! - `AliasActive(canonical_id)`：把 decision 字段改写为 canonical_id；
 //! - `Deprecated`：追加 `taxonomy_deprecated_value:<kind>:<value>` risk；
@@ -42,33 +40,11 @@ use crate::models::{TaxonomyCandidate, TaxonomyEntry, TaxonomyValue};
 /// 在没有写操作时 30s 摊开 DB 加载开销。
 const TAXONOMY_CACHE_TTL: Duration = Duration::from_secs(30);
 
-/// agent-autonomy-loop W3 / Task 4.6：维度类型枚举（强类型化常用 kind）。
+/// `check_value` 命中分支。
 ///
-/// `enforce_decision_guards` 只需要查 `customer_stage / intent_level /
-/// objection_type` 三个维度，强类型化能避免拼写错误并让 `&str` 转换在编译期
-/// 提前失败。`as_str` 返回小写 snake_case 与字典里的 `kind` 字段一致。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(crate) enum TaxonomyKind {
-    CustomerStage,
-    IntentLevel,
-    ObjectionType,
-}
-
-impl TaxonomyKind {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            TaxonomyKind::CustomerStage => "customer_stage",
-            TaxonomyKind::IntentLevel => "intent_level",
-            TaxonomyKind::ObjectionType => "objection_type",
-        }
-    }
-}
-
-/// agent-autonomy-loop W3 / Task 4.6：`check_value` 命中分支。
-///
-/// 与 design.md §3.3 一致；`enforce_decision_guards` 在 task 4.7 按本枚举做
-/// 4 路分支：`Active` 通过 / `AliasActive` 改写 / `Deprecated` 追加 risk /
-/// `CandidateNew` 追加 risk + upsert（**不**强制 review fail）。
+/// `enforce_decision_guards` 按本枚举做 4 路分支：`Active` 通过 /
+/// `AliasActive` 改写 / `Deprecated` 追加 risk / `CandidateNew` 追加 risk +
+/// upsert（**不**强制 review fail）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum TaxonomyMatch {
     /// 命中字典中 `status="active"` 且 `value.id == raw`。
@@ -178,10 +154,12 @@ impl TaxonomyCache {
     }
 }
 
-/// agent-autonomy-loop W3 / Task 4.6：纯查表 `check_value`（无 IO）。
+/// 纯查表 `check_value`（无 IO）。
 ///
 /// 调用方负责保证 `cache` 已加载（`warm_up` 或 `find_or_load`）；本函数仅做
 /// O(1) 查表 + alias 反向查找，不做 DB 调用。
+///
+/// `kind` 直接传字典里的 snake_case 字符串（与 `system_taxonomies.kind` 字段一致）。
 ///
 /// 命中规则（按优先级）：
 /// 1. 任一 entry 的 `canonical_id == raw && status == "active"` → [`TaxonomyMatch::Active`]
@@ -192,16 +170,15 @@ impl TaxonomyCache {
 ///
 /// `scope` 优先按 `account_id` 查，未命中再按 `"global"` 查（两层 fallback）。
 pub(crate) fn check_value(
-    kind: TaxonomyKind,
+    kind: &str,
     raw_value: &str,
     scope_account_id: &str,
     cache: &TaxonomyCache,
 ) -> TaxonomyMatch {
-    let kind_str = kind.as_str();
     let inner = cache.inner.lock();
     // 优先看 account 私有字典；未命中再看 global。
     for scope in [scope_account_id, "global"] {
-        let key = (scope.to_string(), kind_str.to_string());
+        let key = (scope.to_string(), kind.to_string());
         if let Some(entries) = inner.entries.get(&key) {
             // 1) canonical_id 命中（active 优先于 deprecated）。
             if let Some(entry) = entries
@@ -237,7 +214,7 @@ pub(crate) fn check_value(
     TaxonomyMatch::CandidateNew
 }
 
-/// agent-autonomy-loop W3 / Task 4.6：异步 upsert 候选。
+/// 异步 upsert 候选。
 ///
 /// 行为：
 /// - 已存在 `status="rejected"` → 仅 `last_seen_at` 刷新，**不**递增 occurrences；
@@ -246,18 +223,18 @@ pub(crate) fn check_value(
 ///   保守处理为 `last_seen_at` 刷新 + warning log；
 /// - 不存在 → insert 一条 `status="pending"` 的新候选。
 ///
-/// 强幂等键：`(scope, kind, raw_value)` 唯一索引（详见 task 1.2）。
+/// 强幂等键：`(scope, kind, raw_value)` 唯一索引。`kind` 由调用方按字典中
+/// 实际维度名传入（snake_case，与 `system_taxonomies.kind` 一致）。
 /// 并发竞争（两个 run 同时 upsert 同 raw_value）由 unique index + retry 保护。
 #[allow(dead_code)]
 pub(crate) async fn upsert_candidate(
     db: &Database,
     scope_account_id: &str,
-    kind: TaxonomyKind,
+    kind: &str,
     raw_value: &str,
     evidence: Option<&str>,
     confidence: i32,
 ) -> AppResult<()> {
-    let kind_str = kind.as_str();
     let now = DateTime::now();
     let collection = db.collection_taxonomy_candidates();
 
@@ -266,7 +243,7 @@ pub(crate) async fn upsert_candidate(
         .find_one(
             doc! {
                 "scope": scope_account_id,
-                "kind": kind_str,
+                "kind": kind,
                 "raw_value": raw_value,
             },
             None,
@@ -289,7 +266,7 @@ pub(crate) async fn upsert_candidate(
                 // 不该发生：approved 候选已并入字典；保守处理。
                 tracing::warn!(
                     scope = scope_account_id,
-                    kind = kind_str,
+                    kind = kind,
                     raw_value,
                     "upsert_candidate hit status=approved candidate; cache may be stale"
                 );
@@ -321,7 +298,7 @@ pub(crate) async fn upsert_candidate(
     let candidate = TaxonomyCandidate {
         id: None,
         scope: scope_account_id.to_string(),
-        kind: kind_str.to_string(),
+        kind: kind.to_string(),
         raw_value: raw_value.to_string(),
         evidence: evidence.map(|s| s.to_string()),
         confidence: confidence.clamp(0, 10),
@@ -342,7 +319,7 @@ pub(crate) async fn upsert_candidate(
             if msg.contains("E11000") || msg.contains("duplicate key") {
                 tracing::debug!(
                     scope = scope_account_id,
-                    kind = kind_str,
+                    kind = kind,
                     raw_value,
                     "upsert_candidate insert lost race; another worker won, ignored"
                 );
@@ -354,7 +331,7 @@ pub(crate) async fn upsert_candidate(
     }
 }
 
-/// agent-autonomy-loop W3 / Task 4.6：后台审核 — 通过候选。
+/// 后台审核 — 通过候选。
 ///
 /// 行为：
 /// 1. 把候选 `(scope, kind, raw_value)` 作为 `value.id` 写入 `system_taxonomies`
@@ -442,7 +419,7 @@ pub(crate) async fn approve(
     Ok(entry)
 }
 
-/// agent-autonomy-loop W3 / Task 4.6：后台审核 — 拒绝候选。
+/// 后台审核 — 拒绝候选。
 /// 仅把候选 `status` 改为 `"rejected"`，**不**写字典。
 #[allow(dead_code)]
 pub(crate) async fn reject(
@@ -481,11 +458,11 @@ pub(crate) async fn ensure_cache_loaded(cache: &TaxonomyCache, db: &Database) {
 }
 
 // ─────────────────────────────────────────────────────────────────
-// agent-autonomy-loop W3 / Task 4.7：进程级共享 TaxonomyCache。
+// 进程级共享 TaxonomyCache。
 //
 // `enforce_decision_taxonomy_guards` 在每次 run 都会查 cache；启动期
-// 由 `init_global_taxonomy_cache(db)` 预热（task 4.6 / main.rs 接入），
-// 后台 API（task 4.8）写后调 [`invalidate_global_taxonomy_cache`] 失效。
+// 由 `init_global_taxonomy_cache(db)` 预热（main.rs 接入），后台 API 写
+// 后调 [`invalidate_global_taxonomy_cache`] 失效。
 // ─────────────────────────────────────────────────────────────────
 
 static GLOBAL_TAXONOMY_CACHE: std::sync::LazyLock<Arc<TaxonomyCache>> =
@@ -519,14 +496,12 @@ pub(crate) async fn ensure_global_cache_loaded(db: &Database) {
     GLOBAL_TAXONOMY_CACHE.find_or_load(db).await;
 }
 
-/// agent-autonomy-loop W3 / Task 4.10：测试用 helper — 把已构造好的
-/// [`TaxonomyEntry`] 集合直接灌入一个新 cache。让其它模块（如 `guards.rs`）的
-/// 单元测试可以构造任意"字典内容"并对照断言 `check_value` / 上层守卫的行为，
-/// 而无需 Mongo 实例。
+/// 测试用 helper — 把已构造好的 [`TaxonomyEntry`] 集合直接灌入一个新 cache。
+/// 让其它模块（如 `guards.rs`）的单元测试可以构造任意"字典内容"并对照断言
+/// `check_value` / 上层守卫的行为，而无需 Mongo 实例。
 ///
-/// agent-autonomy-loop W3 / Task 4.11：同一 helper 也供 `tests/autonomy_protocol_pbt.rs`
-/// 在独立 crate 中调用，因此从 `cfg(test)` 升级为 `pub`（类型 `TaxonomyCache`
-/// 已经是 `pub(crate)`，需要同步升 pub —— 见 `TaxonomyCache` 上方）。
+/// 同一 helper 也供 `tests/autonomy_protocol_pbt.rs` 在独立 crate 中调用，
+/// 因此从 `cfg(test)` 升级为 `pub`。
 pub fn taxonomy_cache_for_tests(entries: Vec<TaxonomyEntry>) -> TaxonomyCache {
     let cache = TaxonomyCache::new();
     let mut grouped: HashMap<(String, String), Vec<CachedEntry>> = HashMap::new();
@@ -604,7 +579,7 @@ mod tests {
             &["新客", "刚加好友"],
             "active",
         )]);
-        let m = check_value(TaxonomyKind::CustomerStage, "first_contact", "acct-1", &cache);
+        let m = check_value("customer_stage", "first_contact", "acct-1", &cache);
         assert_eq!(m, TaxonomyMatch::Active);
     }
 
@@ -617,7 +592,7 @@ mod tests {
             &["新客", "刚加好友"],
             "active",
         )]);
-        let m = check_value(TaxonomyKind::CustomerStage, "新客", "acct-1", &cache);
+        let m = check_value("customer_stage", "新客", "acct-1", &cache);
         assert_eq!(m, TaxonomyMatch::AliasActive("first_contact".to_string()));
     }
 
@@ -630,7 +605,7 @@ mod tests {
             &[],
             "deprecated",
         )]);
-        let m = check_value(TaxonomyKind::IntentLevel, "lukewarm", "acct-1", &cache);
+        let m = check_value("intent_level", "lukewarm", "acct-1", &cache);
         assert_eq!(m, TaxonomyMatch::Deprecated);
     }
 
@@ -644,7 +619,7 @@ mod tests {
             "active",
         )]);
         let m = check_value(
-            TaxonomyKind::ObjectionType,
+            "objection_type",
             "完全没听过的异议类型",
             "acct-1",
             &cache,
@@ -666,7 +641,7 @@ mod tests {
                 "active",
             ),
         ]);
-        let m = check_value(TaxonomyKind::CustomerStage, "first_contact", "acct-1", &cache);
+        let m = check_value("customer_stage", "first_contact", "acct-1", &cache);
         // 命中 account scope 的 alias，返回 canonical_id = premium_first_contact
         assert_eq!(
             m,
@@ -675,17 +650,29 @@ mod tests {
     }
 
     #[test]
-    fn taxonomy_kind_str_matches_dict_kind_field() {
-        assert_eq!(TaxonomyKind::CustomerStage.as_str(), "customer_stage");
-        assert_eq!(TaxonomyKind::IntentLevel.as_str(), "intent_level");
-        assert_eq!(TaxonomyKind::ObjectionType.as_str(), "objection_type");
+    fn check_value_distinct_kinds_do_not_collide() {
+        // 同一 raw_value 在不同 kind 下相互独立；本案验证 kind 字符串作为查表键
+        // 不会被错误共享。
+        let cache = make_cache_with_entries(vec![
+            make_entry("global", "customer_stage", "shared_value", &[], "active"),
+            make_entry(
+                "global",
+                "intent_level",
+                "shared_value",
+                &[],
+                "deprecated",
+            ),
+        ]);
+        let stage = check_value("customer_stage", "shared_value", "acct-1", &cache);
+        let intent = check_value("intent_level", "shared_value", "acct-1", &cache);
+        assert_eq!(stage, TaxonomyMatch::Active);
+        assert_eq!(intent, TaxonomyMatch::Deprecated);
     }
 
-    /// Phase A6: `taxonomy_candidate_persisted_on_unknown_value`
-    /// 验证：当用户对话使用了不在 `system_taxonomies` 中的 `customer_stage / intent_level
-    /// / objection_type` 取值时，`check_value` 必须返回 `CandidateNew`——这是
-    /// `enforce_decision_taxonomy_guards` 决定写入 `taxonomy_candidates` 候选队列的契约信号。
-    /// 同时校验已知 active 值不会落入候选路径。
+    /// `taxonomy_candidate_persisted_on_unknown_value`
+    /// 验证：当 LLM 输出了不在 `system_taxonomies` 中的取值时，`check_value` 必须返回
+    /// `CandidateNew`——这是 `enforce_decision_taxonomy_guards` 决定写入
+    /// `taxonomy_candidates` 候选队列的契约信号。同时校验已知 active 值不会落入候选路径。
     #[test]
     fn taxonomy_candidate_persisted_on_unknown_value() {
         let cache = make_cache_with_entries(vec![
@@ -695,22 +682,19 @@ mod tests {
         ]);
 
         // 三类未知值都应判为 CandidateNew（由调用方写入 taxonomy_candidates）。
-        let unknown_stage =
-            check_value(TaxonomyKind::CustomerStage, "未知阶段_xx", "acct-1", &cache);
-        let unknown_intent =
-            check_value(TaxonomyKind::IntentLevel, "lukewarm_xx", "acct-1", &cache);
-        let unknown_objection =
-            check_value(TaxonomyKind::ObjectionType, "全新异议_xx", "acct-1", &cache);
+        let unknown_stage = check_value("customer_stage", "未知阶段_xx", "acct-1", &cache);
+        let unknown_intent = check_value("intent_level", "lukewarm_xx", "acct-1", &cache);
+        let unknown_objection = check_value("objection_type", "全新异议_xx", "acct-1", &cache);
         assert_eq!(unknown_stage, TaxonomyMatch::CandidateNew);
         assert_eq!(unknown_intent, TaxonomyMatch::CandidateNew);
         assert_eq!(unknown_objection, TaxonomyMatch::CandidateNew);
 
         // 已知 active 值不进候选。
-        let known = check_value(TaxonomyKind::CustomerStage, "first_contact", "acct-1", &cache);
+        let known = check_value("customer_stage", "first_contact", "acct-1", &cache);
         assert_eq!(known, TaxonomyMatch::Active);
     }
 
-    /// Phase A6: `taxonomy_init_runs_at_startup`
+    /// `taxonomy_init_runs_at_startup`
     /// 验证：进程级单例 `GLOBAL_TAXONOMY_CACHE` 唯一可达；`init_global_taxonomy_cache`
     /// 与 `invalidate_global_taxonomy_cache` 都通过 `global_taxonomy_cache()` 操作同一句柄
     /// （`main.rs` 启动序列依赖该 invariant）。

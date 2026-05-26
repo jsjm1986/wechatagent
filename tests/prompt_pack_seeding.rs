@@ -36,6 +36,7 @@ fn make_user_template(workspace: &str, key: &str, status: &str) -> PromptTemplat
         current_version: false,
         previous_version: None,
         seeded_by: Some("manual".to_string()),
+        locale: Some(prompts::DEFAULT_LOCALE.to_string()),
     }
 }
 

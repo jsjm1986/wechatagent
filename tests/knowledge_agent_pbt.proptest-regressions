@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc d257dc48b2212c0baf4d03dc8f52a89aee32153ea3b110371ee5fa6bd58c0543 # shrinks to base = [CatalogEntry { chunk_id: "k", wiki_type: "methodology", chunk_type: "product_fact", title: "a", summary: "a", business_topics: [], verified: true, has_source_quote: true, dynamic_confidence: 0.9, related_count: 0 }, CatalogEntry { chunk_id: "k", wiki_type: "methodology", chunk_type: "product_fact", title: "a", summary: "a", business_topics: [], verified: true, has_source_quote: true, dynamic_confidence: 0.9, related_count: 0 }], incoming = []

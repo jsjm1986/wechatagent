@@ -8,7 +8,7 @@
 
 use mongodb::bson::Document;
 
-use crate::models::OperationDomainConfig;
+use crate::models::{OperationDomainConfig, OperationStatePolicy};
 
 use super::types::{AgentDecision, RunPlannerResult};
 
@@ -155,3 +155,188 @@ pub fn check_state_transition(
         }
     }
 }
+
+// ── Phase B / B4：operation_state_policies enforcement ────────────────────
+
+/// Phase B / B4：把一个 [`AgentDecision`] 归一到一个 action 类型字符串。
+///
+/// 当前归一规则（Phase B 范围）：
+/// - `should_reply == true` → `"reply"`
+/// - `should_reply == false`, follow_up.kind 为 `"silent_followup"` 或 `"proactive_followup"`
+///   → `"follow_up"`
+/// - `should_reply == false` 且 `cooldown_until` 非空 → `"cooldown"`
+/// - 其它 → `"silent"`
+///
+/// 该字符串与 `operation_state_policies.allowed / forbidden` 数组里的标签**字面量**对齐。
+/// 后续 Phase E 引入 `ActionType` enum 时可平滑替换字符串字面量为枚举 to_string。
+pub fn classify_decision_action(decision: &AgentDecision) -> &'static str {
+    if decision.should_reply {
+        return "reply";
+    }
+    if let Some(fu) = decision.follow_up.as_ref() {
+        if fu.needed {
+            return "follow_up";
+        }
+    }
+    if decision
+        .cooldown_until
+        .as_deref()
+        .map(str::trim)
+        .map(|s| !s.is_empty())
+        .unwrap_or(false)
+    {
+        return "cooldown";
+    }
+    "silent"
+}
+
+/// Phase B / B4：用 `operation_state_policies` 行校验候选 action 是否被允许。
+///
+/// 拦截规则：
+/// 1. policy 缺失（含 `status != "active"`）→ `Ok(())`，向前兼容老部署；
+/// 2. `forbidden` 命中 action → `Err(reason)`，优先级最高；
+/// 3. `allowed` 非空且不包含 action → `Err(reason)`，白名单收敛模式；
+/// 4. 其它 → `Ok(())`。
+///
+/// `reason` 字符串前缀固定为 `state_action_forbidden:` / `state_action_not_allowed:`，
+/// 便于上层 finalize 走 reason 分流。
+pub fn enforce_state_action_policy(
+    policy: Option<&OperationStatePolicy>,
+    action: &str,
+) -> Result<(), String> {
+    let Some(policy) = policy else { return Ok(()); };
+    if policy.status != "active" {
+        return Ok(());
+    }
+    if policy.forbidden.iter().any(|a| a == action) {
+        return Err(format!(
+            "state_action_forbidden: state={} action={}",
+            policy.state_key, action
+        ));
+    }
+    if !policy.allowed.is_empty() && !policy.allowed.iter().any(|a| a == action) {
+        return Err(format!(
+            "state_action_not_allowed: state={} action={}",
+            policy.state_key, action
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod policy_tests {
+    //! Phase B / B4：`classify_decision_action` + `enforce_state_action_policy` 单测。
+    use super::*;
+    use crate::models::OperationStatePolicy;
+    use crate::agent::types::FollowUpDecision;
+    use mongodb::bson::DateTime;
+
+    fn mk_policy(state: &str, allowed: &[&str], forbidden: &[&str]) -> OperationStatePolicy {
+        OperationStatePolicy {
+            id: None,
+            workspace_id: "ws".to_string(),
+            domain: "user".to_string(),
+            state_key: state.to_string(),
+            allowed: allowed.iter().map(|s| s.to_string()).collect(),
+            forbidden: forbidden.iter().map(|s| s.to_string()).collect(),
+            recommended_pace: None,
+            status: "active".to_string(),
+            updated_at: DateTime::now(),
+        }
+    }
+
+    fn mk_decision_reply() -> AgentDecision {
+        let mut d = AgentDecision::default();
+        d.should_reply = true;
+        d.reply_text = "test".to_string();
+        d
+    }
+
+    #[test]
+    fn classify_reply_when_should_reply_true() {
+        let mut d = AgentDecision::default();
+        d.should_reply = true;
+        assert_eq!(classify_decision_action(&d), "reply");
+    }
+
+    #[test]
+    fn classify_silent_when_no_signals() {
+        let d = AgentDecision::default();
+        assert_eq!(classify_decision_action(&d), "silent");
+    }
+
+    #[test]
+    fn classify_follow_up_when_silent_followup_kind() {
+        let mut d = AgentDecision::default();
+        d.follow_up = Some(FollowUpDecision {
+            needed: true,
+            ..Default::default()
+        });
+        assert_eq!(classify_decision_action(&d), "follow_up");
+    }
+
+    #[test]
+    fn classify_cooldown_when_should_reply_false_and_cooldown_until_set() {
+        let mut d = AgentDecision::default();
+        d.cooldown_until = Some("2030-01-01T00:00:00Z".to_string());
+        assert_eq!(classify_decision_action(&d), "cooldown");
+    }
+
+    #[test]
+    fn enforce_passes_when_policy_missing() {
+        assert!(enforce_state_action_policy(None, "reply").is_ok());
+    }
+
+    #[test]
+    fn enforce_passes_when_policy_inactive() {
+        let mut p = mk_policy("new_contact", &[], &["reply"]);
+        p.status = "draft".to_string();
+        assert!(enforce_state_action_policy(Some(&p), "reply").is_ok());
+    }
+
+    #[test]
+    fn enforce_blocks_when_action_in_forbidden() {
+        let p = mk_policy("cooldown", &[], &["reply"]);
+        let err = enforce_state_action_policy(Some(&p), "reply").unwrap_err();
+        assert!(err.starts_with("state_action_forbidden:"));
+        assert!(err.contains("state=cooldown"));
+        assert!(err.contains("action=reply"));
+    }
+
+    #[test]
+    fn enforce_blocks_when_allowlist_set_and_action_missing() {
+        let p = mk_policy("warmup", &["follow_up"], &[]);
+        let err = enforce_state_action_policy(Some(&p), "reply").unwrap_err();
+        assert!(err.starts_with("state_action_not_allowed:"));
+    }
+
+    #[test]
+    fn enforce_passes_when_allowlist_empty_and_no_forbidden() {
+        let p = mk_policy("warmup", &[], &[]);
+        assert!(enforce_state_action_policy(Some(&p), "reply").is_ok());
+    }
+
+    #[test]
+    fn enforce_passes_when_action_in_allowlist() {
+        let p = mk_policy("warmup", &["reply", "follow_up"], &[]);
+        assert!(enforce_state_action_policy(Some(&p), "reply").is_ok());
+    }
+
+    #[test]
+    fn forbidden_takes_priority_over_allowed() {
+        // 同一 action 同时出现在 allowed + forbidden → forbidden 胜出。
+        let p = mk_policy("guarded", &["reply"], &["reply"]);
+        let err = enforce_state_action_policy(Some(&p), "reply").unwrap_err();
+        assert!(err.starts_with("state_action_forbidden:"));
+    }
+
+    #[test]
+    fn classify_then_enforce_reply_decision_with_forbidden_state() {
+        let d = mk_decision_reply();
+        let p = mk_policy("cooldown", &[], &["reply"]);
+        let action = classify_decision_action(&d);
+        assert_eq!(action, "reply");
+        assert!(enforce_state_action_policy(Some(&p), action).is_err());
+    }
+}
+

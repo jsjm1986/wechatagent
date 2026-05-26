@@ -109,6 +109,16 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
+    // Phase D / D3：冷联系人重激活 worker。默认关停（COLD_CONTACT_WORKER_ENABLED=false）；
+    // worker 内部检查 flag 后立即 return。打开后周期挑 last_outbound_at 旧的 managed
+    // contact，写 follow_up 任务，下游仍走 gateway / outbox。
+    {
+        let cold_state = state.clone();
+        tokio::spawn(async move {
+            wechatagent::cold_contact_worker::run_cold_contact_worker(cold_state).await;
+        });
+    }
+
     // agent-self-evolution M4 W1：演化器 worker。
     // 关停态默认（`EVOLUTION_ENABLED=false`）；run_evolutionary_worker 内部
     // 会立即 return，不消耗任何资源。打开后周期跑 cohort 选择 + 候选生成

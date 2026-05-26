@@ -14,6 +14,27 @@ use crate::{
 
 pub const PROMPT_PACK_VERSION: &str = "wechatagent_prompt_pack_v3_2026_05_22";
 
+/// Phase E / E3：默认 locale。Contact / PromptTemplate 缺 `locale` 字段时回落到此。
+/// 选 `zh-CN` 是因为 WeChat 私域运营当前唯一使用语种；新 locale 落地按 BCP-47
+/// 短形式扩展（如 `en-US`、`zh-TW`）。
+pub const DEFAULT_LOCALE: &str = "zh-CN";
+
+/// 取 contact.locale，缺字段（旧文档）回落到 [`DEFAULT_LOCALE`]。
+pub fn contact_locale_or_default(locale: Option<&str>) -> &str {
+    match locale {
+        Some(s) if !s.trim().is_empty() => s.trim(),
+        _ => DEFAULT_LOCALE,
+    }
+}
+
+/// 取 prompt_template.locale，缺字段（旧文档）回落到 [`DEFAULT_LOCALE`]。
+pub fn template_locale_or_default(locale: Option<&str>) -> &str {
+    match locale {
+        Some(s) if !s.trim().is_empty() => s.trim(),
+        _ => DEFAULT_LOCALE,
+    }
+}
+
 struct SoulSpec {
     kind: &'static str,
     name: &'static str,
@@ -127,6 +148,7 @@ async fn ensure_missing_prompt_templates(db: &Database, workspace_id: &str) -> A
                     current_version: true,
                     previous_version: None,
                     seeded_by: Some("system".to_string()),
+                    locale: Some(DEFAULT_LOCALE.to_string()),
                 },
                 None,
             )
@@ -195,6 +217,7 @@ pub async fn reset_prompt_pack_v2(
                     current_version: true,
                     previous_version: None,
                     seeded_by: Some("system".to_string()),
+                    locale: Some(DEFAULT_LOCALE.to_string()),
                 },
                 None,
             )
@@ -276,6 +299,93 @@ pub async fn load_prompt(db: &Database, workspace_id: &str, prompt_key: &str) ->
     default_prompt_content(prompt_key)
         .map(ToString::to_string)
         .ok_or_else(|| AppError::NotFound(format!("prompt template not found: {prompt_key}")))
+}
+
+/// Phase C / C4：contact-dimensioned A/B routing。
+///
+/// 当 `(workspace_id, prompt_key)` 下存在多条 `status="active"` 的 prompt_template
+/// 时，按 `hash(contact_id) % active_count` 取一条，使同一 contact 在多版本并存
+/// 期间永远拿同一份 prompt（A/B 一致性的基础）。这与 [`super::evolution::release::release_prompt`]
+/// 的 soft-retire 路径配合：旧版本仍 `status="active" + current_version=false`，
+/// 新版本 `status="active" + current_version=true`，rollback 通过把旧版本切回
+/// current 来还原；rollout 100% 即靠 admin 把不要的版本 `status="archived"`
+/// 退出 rotation。
+///
+/// 单 active 版本时直接返回该版本（等价于 [`load_prompt`]）；零 active 版本时
+/// fallback 到 `default_prompt_content`。返回 `(content, version)` 让调用方
+/// 把 version 写进 `agent_run_logs.promptVersions` 做审计。
+///
+/// Phase E / E3：当 `contact_locale` 提供时优先选同 locale 的 active 模板；
+/// 同 locale 内仍可有多版本 A/B；同 locale 零命中时 fallback 到
+/// [`DEFAULT_LOCALE`] 的版本，再零命中才回落 `default_prompt_content`。
+/// 旧调用方传 `None` 等价于传 [`DEFAULT_LOCALE`]，与本次重构前行为完全一致。
+pub async fn load_prompt_for_contact(
+    db: &Database,
+    workspace_id: &str,
+    prompt_key: &str,
+    contact_id: &str,
+    contact_locale: Option<&str>,
+) -> AppResult<(String, Option<i32>)> {
+    use futures::TryStreamExt;
+    let cursor = db
+        .prompt_templates()
+        .find(
+            doc! {
+                "workspace_id": workspace_id,
+                "prompt_key": prompt_key,
+                "status": "active",
+            },
+            mongodb::options::FindOptions::builder()
+                .sort(doc! { "version": 1 })
+                .build(),
+        )
+        .await?;
+    let templates: Vec<PromptTemplate> = cursor.try_collect().await?;
+
+    let target_locale = contact_locale_or_default(contact_locale);
+    let same_locale: Vec<&PromptTemplate> = templates
+        .iter()
+        .filter(|t| template_locale_or_default(t.locale.as_deref()) == target_locale)
+        .collect();
+    let chosen: Vec<&PromptTemplate> = if !same_locale.is_empty() {
+        same_locale
+    } else {
+        // fallback：当前 locale 无可用模板 → 用 DEFAULT_LOCALE 的模板兜底；
+        // 仍然为空时进入下面的 zero-active 分支。
+        templates
+            .iter()
+            .filter(|t| template_locale_or_default(t.locale.as_deref()) == DEFAULT_LOCALE)
+            .collect()
+    };
+
+    match chosen.len() {
+        0 => default_prompt_content(prompt_key)
+            .map(|s| (s.to_string(), None))
+            .ok_or_else(|| AppError::NotFound(format!("prompt template not found: {prompt_key}"))),
+        1 => {
+            let t = chosen[0];
+            Ok((t.content.clone(), Some(t.version)))
+        }
+        n => {
+            let bucket = ab_bucket_for_contact(contact_id, n);
+            let t = chosen[bucket];
+            Ok((t.content.clone(), Some(t.version)))
+        }
+    }
+}
+
+/// `hash(contact_id) % bucket_count` —— 同一 contact 永远落同一桶。
+///
+/// 使用 `DefaultHasher` 与 [`crate::evolution::runtime_flag::rollout_bucket_index`]
+/// 一致的稳定性保证（同进程内决定性 + 同输入产生同输出）。`bucket_count==0`
+/// 调用者已在 `load_prompt_for_contact` 内拦截，不会进入此分支。
+pub fn ab_bucket_for_contact(contact_id: &str, bucket_count: usize) -> usize {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    debug_assert!(bucket_count > 0);
+    let mut hasher = DefaultHasher::new();
+    contact_id.hash(&mut hasher);
+    (hasher.finish() as usize) % bucket_count.max(1)
 }
 
 pub async fn prompt_versions(
@@ -752,12 +862,11 @@ fn prompt_specs() -> Vec<PromptSpec> {
 每轮按以下优先级**自上而下**判定对话模式，命中即停：
 
 1. **运营人员特别指令优先**：如果系统消息中存在"运营人员关于本联系人的特别指令"段落，必须严格遵守该指令；指令明确指定语气 / 边界 / 模式时按指令直接选择 conversationMode。
-2. **硬关键词触发器命中**：如果系统已在上下文中标记 keyword_fastpath_hit（说明用户消息命中了知识库 trigger_keywords） → conversationMode = "consultative"。
-3. **客户阶段是评估 / 决策**：customer_stage ∈ {方案匹配, 异议处理, 承诺跟进, 评估, 决策中} → conversationMode = "consultative"。
-4. **用户明确问产品向问题**：用户消息明确涉及产品能力、价格、方案、案例、效果、交付、对比、异议、采购流程 → conversationMode = "consultative"。
-5. **用户明确边界**：用户表达"不需要 / 已签约不再咨询 / 请勿打扰 / 改天再说" → conversationMode = "boundary_protection"。
-6. **存在可分享的真实价值**：有产品知识 / 内容资产 / 行业观察 / 清单 / 框架可分享，且用户处于关注或开放心态 → conversationMode = "value_exchange"。
-7. **以上都不命中** → conversationMode = "casual_relationship"（默认兜底）。
+2. **客户阶段是评估 / 决策**：customer_stage ∈ {方案匹配, 异议处理, 承诺跟进, 评估, 决策中} → conversationMode = "consultative"。
+3. **用户明确问产品向问题**：用户消息明确涉及产品能力、价格、方案、案例、效果、交付、对比、异议、采购流程 → conversationMode = "consultative"。
+4. **用户明确边界**：用户表达"不需要 / 已签约不再咨询 / 请勿打扰 / 改天再说" → conversationMode = "boundary_protection"。
+5. **存在可分享的真实价值**：有产品知识 / 内容资产 / 行业观察 / 清单 / 框架可分享，且用户处于关注或开放心态 → conversationMode = "value_exchange"。
+6. **以上都不命中** → conversationMode = "casual_relationship"（默认兜底）。
 
 并把判定理由写进 conversationModeReason，简短一句即可。
 
@@ -1066,13 +1175,15 @@ fn prompt_specs() -> Vec<PromptSpec> {
 你不负责聊天，只负责判断候选微信回复是否允许自动发送。
 只输出严格 JSON，不输出 markdown。
 评分范围 0-10，risk 越高越危险。
-必须执行拦截阈值：
-- FactRisk >= 6 禁止发送
-- PressureRisk >= 7 禁止发送
-- HumanLikeScore < 6 需要改写
+必须执行拦截阈值（Phase B 双闸 + 三 hard 闸）：
+- FactRisk >= 6 禁止发送（hallucination 闸）
+- PressureRisk >= 7 禁止发送（软闸；0 仅在你完全无法判断压迫感时使用，正常情况必须给 1-10 的实分）
+- HumanLikeScore < 6 需要改写（软闸；必须填实分）
 - EmotionalValue < 5 需要改写
-- ProductAccuracyScore < 7 禁止发送涉及产品承诺的内容
-评审重点：事实准确、像真人微信、情绪价值、低压推进、产品知识一致性、没有操控营销。"#,
+- ProductAccuracyScore < 7 禁止发送涉及产品承诺的内容（grounding 闸）
+评审重点：事实准确、像真人微信、情绪价值、低压推进、产品知识一致性、没有操控营销。
+重要：humanLike / pressureRisk 是 Phase B 软闸独立打分项，必须每次都给出 1-10 的实分；
+PressureRisk=0 仅作为"完全无法判断"的兜底信号，不要为了让 review 通过而强行给 0。"#,
         },
         PromptSpec {
             key: "user.review.light.system",
@@ -1226,7 +1337,7 @@ fn prompt_specs() -> Vec<PromptSpec> {
 你的核心能力 = 在不假设具体领域的前提下，先**读懂这条切片到底在讲什么、属于哪个领域、要服务谁、何时该被使用**，再围绕"让一条不可信切片变成可被运营确认的切片"这一目标，主动决定改什么、怎么改。
 
 你拿到的信号：
-1. 切片当前所有字段（包括 title / body / summary / routing_card / safe_claims / forbidden_claims / evidence_items / applicable_scenes / not_applicable_scenes / source_quote / knowledge_type / business_context / business_topics / trigger_keywords ...）。
+1. 切片当前所有字段（包括 title / body / summary / routing_card / safe_claims / forbidden_claims / evidence_items / applicable_scenes / not_applicable_scenes / source_quote / knowledge_type / business_context / business_topics ...）。
 2. 切片父文档的原文（可能很长，已截断）。
 3. 切片所在父知识包（OperationKnowledgeItem）的元数据，作为"这条切片归属什么主题、面向什么业务"的语境。
 
@@ -1485,7 +1596,6 @@ memoryKind 闭集：
     "forbiddenClaims": ["每条 ≤ 30 字、整体 ≤ 5 条"],
     "evidenceItems": ["每条 ≤ 60 字、整体 ≤ 5 条"],
     "productTags": ["每条 ≤ 12 字、整体 ≤ 8 条"],
-    "triggerKeywords": ["每条 ≤ 12 字、整体 ≤ 8 条"],
     "businessTopics": ["每条 ≤ 12 字、整体 ≤ 8 条"],
     "sourceQuote": "若运营给了原文片段则原样保留；否则省略",
     "extras": {}
@@ -1537,7 +1647,6 @@ memoryKind 闭集：
     "forbiddenClaims": ["仅写最终值"],
     "evidenceItems": ["仅写最终值"],
     "productTags": ["仅写最终值"],
-    "triggerKeywords": ["仅写最终值"],
     "businessTopics": ["仅写最终值"],
     "sourceQuote": "仅在确认原文存在时改",
     "extras": {}
@@ -1745,6 +1854,7 @@ pub async fn ensure_evolution_prompt_pack_v1(db: &Database, workspace_id: &str) 
                     current_version: true,
                     previous_version: None,
                     seeded_by: Some("system_evolution_v1".to_string()),
+                    locale: Some(DEFAULT_LOCALE.to_string()),
                 },
                 None,
             )
@@ -1805,3 +1915,93 @@ operator_instruction：
 "#,
     }]
 }
+
+#[cfg(test)]
+mod ab_bucket_tests {
+    use super::*;
+
+    /// Phase C / C4：同一 contact_id 永远落同一桶（A/B 一致性的基础）。
+    #[test]
+    fn ab_bucket_deterministic_for_same_contact() {
+        let cid = "wxid_abc_123";
+        let b1 = ab_bucket_for_contact(cid, 4);
+        let b2 = ab_bucket_for_contact(cid, 4);
+        let b3 = ab_bucket_for_contact(cid, 4);
+        assert_eq!(b1, b2);
+        assert_eq!(b2, b3);
+        assert!(b1 < 4);
+    }
+
+    /// 桶号严格小于 bucket_count，永远不越界。
+    #[test]
+    fn ab_bucket_within_range() {
+        for n in 1..=8usize {
+            for i in 0..200 {
+                let b = ab_bucket_for_contact(&format!("c_{i}"), n);
+                assert!(b < n, "bucket {b} out of range for n={n}");
+            }
+        }
+    }
+
+    /// `bucket_count=1` 退化为单桶，所有 contact 都返回 0。
+    #[test]
+    fn ab_bucket_single_returns_zero() {
+        for i in 0..50 {
+            assert_eq!(ab_bucket_for_contact(&format!("c_{i}"), 1), 0);
+        }
+    }
+
+    /// 不同 contact_id 至少能产出多个不同桶（probabilistic：1000 个 contact 跑
+    /// 8 桶，命中桶数应≥6，避免 hash 退化成单值）。
+    #[test]
+    fn ab_bucket_distributes_across_contacts() {
+        use std::collections::HashSet;
+        let mut buckets = HashSet::new();
+        for i in 0..1000 {
+            buckets.insert(ab_bucket_for_contact(&format!("contact_{i}"), 8));
+        }
+        assert!(
+            buckets.len() >= 6,
+            "expected ≥6 distinct buckets out of 8, got {}",
+            buckets.len()
+        );
+    }
+}
+
+#[cfg(test)]
+mod locale_tests {
+    use super::*;
+
+    /// Phase E / E3：缺字段（None）回落到 zh-CN。旧 contact / 旧 prompt_template
+    /// 反序列化时 locale 字段不存在，必须能正确退到默认 locale。
+    #[test]
+    fn contact_locale_fallback_to_default_when_missing() {
+        assert_eq!(contact_locale_or_default(None), DEFAULT_LOCALE);
+        assert_eq!(template_locale_or_default(None), DEFAULT_LOCALE);
+    }
+
+    /// 空字符串 / 全空白同样视作缺字段，回落到默认。避免历史导入数据
+    /// 带空字符串导致 `(workspace, prompt_key, "")` 匹配不到任何模板。
+    #[test]
+    fn locale_fallback_treats_empty_and_whitespace_as_missing() {
+        assert_eq!(contact_locale_or_default(Some("")), DEFAULT_LOCALE);
+        assert_eq!(contact_locale_or_default(Some("   ")), DEFAULT_LOCALE);
+        assert_eq!(template_locale_or_default(Some("\t\n")), DEFAULT_LOCALE);
+    }
+
+    /// 非空 locale 透传并 trim，不被默认值覆盖。
+    #[test]
+    fn locale_is_passed_through_when_present() {
+        assert_eq!(contact_locale_or_default(Some("en-US")), "en-US");
+        assert_eq!(contact_locale_or_default(Some("  zh-TW  ")), "zh-TW");
+        assert_eq!(template_locale_or_default(Some("ja-JP")), "ja-JP");
+    }
+
+    /// DEFAULT_LOCALE 锁定为 zh-CN——切换默认 locale 是产品决策，不能由代码
+    /// 重构无意改动；本断言充当审计闸。
+    #[test]
+    fn default_locale_is_zh_cn() {
+        assert_eq!(DEFAULT_LOCALE, "zh-CN");
+    }
+}
+

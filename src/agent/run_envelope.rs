@@ -1216,7 +1216,7 @@ mod tests {
                 "superseded_by_id_not_found:abc:def".to_string(),
             ],
             conversation_mode: "consultative".to_string(),
-            conversation_mode_reason: Some("trigger_keywords_fastpath_hit".to_string()),
+            conversation_mode_reason: Some("customer_stage:proposal_evaluation".to_string()),
             created_at: DateTime::now(),
         };
 

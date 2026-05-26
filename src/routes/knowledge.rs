@@ -69,9 +69,6 @@ pub(super) struct OperationKnowledgeDocumentRequest {
     /// 文档级聚合标签（≤5），通常由所有 chunks 的 product_tags 去重并集而来。
     #[serde(default)]
     product_tags: Vec<String>,
-    /// 文档级聚合关键词（≤8，全小写）。
-    #[serde(default)]
-    trigger_keywords: Vec<String>,
     /// 文档级业务主题（≤3）。
     #[serde(default)]
     business_topics: Vec<String>,
@@ -131,9 +128,6 @@ pub(super) struct OperationKnowledgeRequest {
     /// 知识标签（≤5）。
     #[serde(default)]
     product_tags: Vec<String>,
-    /// 触发关键词（≤8，全小写，含同义/口语化变体）。
-    #[serde(default)]
-    trigger_keywords: Vec<String>,
     /// 业务主题（≤3）。
     #[serde(default)]
     business_topics: Vec<String>,
@@ -173,10 +167,6 @@ pub(super) struct OperationKnowledgeChunkRequest {
     /// 知识标签（≤5）：产品名/解决方案，LLM 自动抽取，后台可编辑。
     #[serde(default)]
     product_tags: Vec<String>,
-    /// 触发关键词（≤8，全小写，含同义/口语化变体）：运行时关键词快路径用于
-    /// inbound 子串匹配。LLM 输出空数组合法（仅辅助 chunk）。
-    #[serde(default)]
-    trigger_keywords: Vec<String>,
     /// 业务主题（≤3）。
     #[serde(default)]
     business_topics: Vec<String>,
@@ -1237,7 +1227,6 @@ pub(super) async fn import_operation_knowledge_preview(
     "routingMap": ["自然语言目录项，不使用固定分类"],
     "riskNotes": ["不能承诺、证据不足或需要人工确认的风险点"],
     "productTags": ["产品/品牌/解决方案名称，最多 5 个，可空"],
-    "triggerKeywords": ["用户消息里可能出现的口语化问法（含同义词），用于 inbound 子串匹配，最多 8 个，可空"],
     "businessTopics": ["业务主题（如 产品定位差异 / 竞品对比 / 部署方式），最多 3 个，可空"],
     "status": "draft"
   }},
@@ -1265,7 +1254,6 @@ pub(super) async fn import_operation_knowledge_preview(
       "commonObjections": [],
       "evidenceItems": [],
       "productTags": ["最多 5 个，可空"],
-      "triggerKeywords": ["最多 8 个，含口语化变体，可空"],
       "businessTopics": ["最多 3 个，可空"],
       "sourceType": "imported_markdown",
       "sourceName": "{}",
@@ -1288,7 +1276,6 @@ pub(super) async fn import_operation_knowledge_preview(
       "forbiddenClaims": [],
       "evidenceItems": [],
       "productTags": ["如：WechatAgent / AI 私域销售助手；最多 5 个；可空"],
-      "triggerKeywords": ["如：群发工具区别 / 和群发的不同 / 你们和那个有啥不一样；最多 8 个；含同义/口语化变体；运行时用于 inbound 子串匹配；可空"],
       "businessTopics": ["如：产品定位差异 / 竞品对比；最多 3 个；可空"],
       "sourceQuote": "如有必要，保留支撑该切片的原文短句",
       "status": "draft",
@@ -1304,11 +1291,8 @@ pub(super) async fn import_operation_knowledge_preview(
 - forbiddenClaims 必须列出不能承诺、不能暗示、不能编造的内容。
 - 案例、报价、效果数据必须进入 evidenceItems；没有证据不要编造成案例。
 - routingCard 要短，供运行时知识工具选择使用，不要堆正文。
-- productTags / triggerKeywords / businessTopics 用于运行时把用户消息匹配到对应 chunk。
-  triggerKeywords 必须包含**用户实际可能说出来的口语化变体**，不是文档原话；
-  长尾问法（"你们这个能干嘛"/"和那个有啥不一样"）要覆盖；不要用书面术语充数。
-- 如果某 chunk 不适合做触发器（如纯辅助 / 事实边界类），triggerKeywords 输出空数组完全合法。
-- document 级 productTags / triggerKeywords / businessTopics 可以是其下所有 chunks 的去重并集，也可由 LLM 自行抽取。
+- productTags / businessTopics 用于运行时把用户消息匹配到对应 chunk。
+- document 级 productTags / businessTopics 可以是其下所有 chunks 的去重并集，也可由 LLM 自行抽取。
 
 导入文本：
 {}"#,
@@ -1360,11 +1344,11 @@ pub(super) struct ExtractKnowledgeTagsRequest {
 }
 
 /// `POST /api/operation-knowledge/extract-tags` —— 给单条 chunk 抽取
-/// productTags / triggerKeywords / businessTopics 三字段。复用与 import-preview
-/// 同样的 LLM prompt 风格，但只生成三字段，作为 backfill / 单条重抽入口。
+/// productTags / businessTopics 两字段。复用与 import-preview
+/// 同样的 LLM prompt 风格，作为 backfill / 单条重抽入口。
 ///
 /// 输入：`{ accountId?, title?, body }`
-/// 输出：`{ productTags: [], triggerKeywords: [], businessTopics: [] }`
+/// 输出：`{ productTags: [], businessTopics: [] }`
 pub(super) async fn extract_operation_knowledge_tags(
     State(state): State<AppState>,
     Json(payload): Json<ExtractKnowledgeTagsRequest>,
@@ -1377,9 +1361,9 @@ pub(super) async fn extract_operation_knowledge_tags(
         .clone()
         .filter(|s| !s.trim().is_empty())
         .unwrap_or_else(|| "未命名知识切片".to_string());
-    let system = "你是企业微信运营知识库的标签抽取 Agent。给定一个知识切片（标题 + 正文），抽取它的 productTags / triggerKeywords / businessTopics。只输出严格 JSON。";
+    let system = "你是企业微信运营知识库的标签抽取 Agent。给定一个知识切片（标题 + 正文），抽取它的 productTags / businessTopics。只输出严格 JSON。";
     let user = format!(
-        r#"请基于下面的知识切片抽取三个字段：
+        r#"请基于下面的知识切片抽取两个字段：
 
 知识标题：{}
 
@@ -1389,13 +1373,10 @@ pub(super) async fn extract_operation_knowledge_tags(
 输出 JSON：
 {{
   "productTags": ["产品/品牌/解决方案名称，最多 5 个，可空"],
-  "triggerKeywords": ["用户消息里可能出现的口语化问法（含同义词），用于 inbound 子串匹配，最多 8 个，可空"],
   "businessTopics": ["业务主题（如 产品定位差异 / 竞品对比 / 部署方式），最多 3 个，可空"]
 }}
 
 要求：
-- triggerKeywords 必须包含**用户实际可能说出来的口语化变体**，不是文档原话；长尾问法要覆盖。
-- 不适合做触发器（如纯事实边界类）输出空数组完全合法。
 - 全部字段允许空数组。
 - 只输出 JSON，不要解释。"#,
         title, payload.body
@@ -1413,15 +1394,11 @@ pub(super) async fn extract_operation_knowledge_tags(
     let product_tags = json_string_list(&value, "productTags")
         .or_else(|| json_string_list(&value, "product_tags"))
         .unwrap_or_default();
-    let trigger_keywords = json_string_list(&value, "triggerKeywords")
-        .or_else(|| json_string_list(&value, "trigger_keywords"))
-        .unwrap_or_default();
     let business_topics = json_string_list(&value, "businessTopics")
         .or_else(|| json_string_list(&value, "business_topics"))
         .unwrap_or_default();
     Ok(Json(json!({
         "productTags": normalize_knowledge_tags(product_tags, 5, false),
-        "triggerKeywords": normalize_knowledge_tags(trigger_keywords, 8, true),
         "businessTopics": normalize_knowledge_tags(business_topics, 3, false),
     })))
 }
@@ -1797,7 +1774,7 @@ pub(super) fn knowledge_usage_json(item: KnowledgeUsageLog) -> Value {
     })
 }
 
-/// 规范化知识标签：trim、可选 lowercase（用于 trigger_keywords 子串匹配）、
+/// 规范化知识标签：trim、可选 lowercase、
 /// 去重（保留首次出现顺序）、跳过空字符串、按 max_len 截断。
 ///
 /// LLM 在 import-preview 偶尔会返回字符串而非数组、或重复元素，统一在这里收口。
@@ -1898,7 +1875,6 @@ pub(super) fn operation_knowledge_document_from_request(
         routing_map: payload.routing_map,
         risk_notes: payload.risk_notes,
         product_tags: normalize_knowledge_tags(payload.product_tags, 5, false),
-        trigger_keywords: normalize_knowledge_tags(payload.trigger_keywords, 8, true),
         business_topics: normalize_knowledge_tags(payload.business_topics, 3, false),
         raw_content,
         content_hash,
@@ -1949,7 +1925,6 @@ pub(super) fn operation_knowledge_chunk_from_request(
         applicable_scenes: payload.applicable_scenes,
         not_applicable_scenes: payload.not_applicable_scenes,
         product_tags: normalize_knowledge_tags(payload.product_tags, 5, false),
-        trigger_keywords: normalize_knowledge_tags(payload.trigger_keywords, 8, true),
         business_topics: normalize_knowledge_tags(payload.business_topics, 3, false),
         source_quote: normalize_optional(payload.source_quote),
         source_anchors: payload.source_anchors,
@@ -2009,7 +1984,6 @@ pub(super) fn normalize_operation_knowledge_preview_item(
         "commonObjections": json_string_list(&value, "commonObjections").or_else(|| json_string_list(&value, "common_objections")).unwrap_or_default(),
         "evidenceItems": json_string_list(&value, "evidenceItems").or_else(|| json_string_list(&value, "evidence_items")).unwrap_or_default(),
         "productTags": json_string_list(&value, "productTags").or_else(|| json_string_list(&value, "product_tags")).unwrap_or_default(),
-        "triggerKeywords": json_string_list(&value, "triggerKeywords").or_else(|| json_string_list(&value, "trigger_keywords")).unwrap_or_default(),
         "businessTopics": json_string_list(&value, "businessTopics").or_else(|| json_string_list(&value, "business_topics")).unwrap_or_default(),
         "sourceType": json_string(&value, "sourceType").or_else(|| json_string(&value, "source_type")).unwrap_or_else(|| "imported_markdown".to_string()),
         "sourceName": json_string(&value, "sourceName").or_else(|| json_string(&value, "source_name")).unwrap_or(source_name),
@@ -2039,7 +2013,6 @@ pub(super) fn normalize_operation_knowledge_preview_document(
         "routingMap": json_string_list(&value, "routingMap").or_else(|| json_string_list(&value, "routing_map")).unwrap_or_default(),
         "riskNotes": json_string_list(&value, "riskNotes").or_else(|| json_string_list(&value, "risk_notes")).unwrap_or_default(),
         "productTags": json_string_list(&value, "productTags").or_else(|| json_string_list(&value, "product_tags")).unwrap_or_default(),
-        "triggerKeywords": json_string_list(&value, "triggerKeywords").or_else(|| json_string_list(&value, "trigger_keywords")).unwrap_or_default(),
         "businessTopics": json_string_list(&value, "businessTopics").or_else(|| json_string_list(&value, "business_topics")).unwrap_or_default(),
         "rawContent": payload.content,
         "contentHash": stable_text_hash(&payload.content),
@@ -2095,7 +2068,6 @@ pub(super) fn normalize_operation_knowledge_preview_chunk(
         "forbiddenClaims": json_string_list(&value, "forbiddenClaims").or_else(|| json_string_list(&value, "forbidden_claims")).unwrap_or_default(),
         "evidenceItems": json_string_list(&value, "evidenceItems").or_else(|| json_string_list(&value, "evidence_items")).unwrap_or_default(),
         "productTags": json_string_list(&value, "productTags").or_else(|| json_string_list(&value, "product_tags")).unwrap_or_default(),
-        "triggerKeywords": json_string_list(&value, "triggerKeywords").or_else(|| json_string_list(&value, "trigger_keywords")).unwrap_or_default(),
         "businessTopics": json_string_list(&value, "businessTopics").or_else(|| json_string_list(&value, "business_topics")).unwrap_or_default(),
         "sourceQuote": json_string(&value, "sourceQuote").or_else(|| json_string(&value, "source_quote")).unwrap_or_default(),
         "sourceAnchors": [],
@@ -5053,7 +5025,6 @@ async fn apply_update_chunk(
         "forbidden_claims",
         "evidence_items",
         "product_tags",
-        "trigger_keywords",
         "business_topics",
         "source_quote",
     ]
@@ -5068,7 +5039,6 @@ async fn apply_update_chunk(
             "forbidden_claims" => "forbiddenClaims",
             "evidence_items" => "evidenceItems",
             "product_tags" => "productTags",
-            "trigger_keywords" => "triggerKeywords",
             "business_topics" => "businessTopics",
             "source_quote" => "sourceQuote",
             other => other,
@@ -5160,7 +5130,6 @@ fn chunk_request_from_chat_patch(
         forbidden_claims: arr(patch, "forbiddenClaims"),
         evidence_items: arr(patch, "evidenceItems"),
         product_tags: arr(patch, "productTags"),
-        trigger_keywords: arr(patch, "triggerKeywords"),
         business_topics: arr(patch, "businessTopics"),
         source_quote: s(patch, "sourceQuote"),
         source_anchors: vec![],

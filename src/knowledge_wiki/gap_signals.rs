@@ -614,7 +614,6 @@ mod tests {
             applicable_scenes: vec![],
             not_applicable_scenes: vec![],
             product_tags: vec![],
-            trigger_keywords: vec![],
             business_topics: vec![],
             source_quote: None,
             source_anchors: vec![],
@@ -649,6 +648,7 @@ mod tests {
             dynamic_confidence: None,
             integrity_score: None,
             locked_fields: None,
+            chunk_type: "product_fact".to_string(),
         }
     }
 

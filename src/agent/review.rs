@@ -144,13 +144,48 @@ pub fn local_decision_review(
             } else {
                 10
             },
+            ..Default::default()
         },
         review_summary: "低风险 fast_chat 本地轻量审核通过".to_string(),
         ..Default::default()
     }
 }
 
-pub(crate) fn review_passed(
+/// Phase B / B2：把 [`AgentDecision`] 投影成 reviewer 可见的 **事实面** 视图，
+/// 剥离所有 reply-agent 的自我推理字段，强制 reviewer 走独立判断路径。
+///
+/// 直接 `serde_json::to_string(decision)` 会把以下字段一并喂给 reviewer：
+///
+/// - `user_understanding / relationship_read / operation_goal`
+/// - `knowledge_need_reason / memory_update_reason / risk_self_check`
+/// - `self_critique / why_should_reply / why_skip_reply`
+/// - `intent_analysis / next_best_action / operating_memory_update`
+///   等推理 doc
+///
+/// 这些字段是 reply-agent 自洽逻辑链的产物，喂给 reviewer 会形成
+/// "reviewer 追认 reply-agent" 的副作用。本函数只暴露候选回复的事实面：
+/// 是否回复、回复文本、知识引用、状态/阶段、tool-loop 协议字段。
+pub(crate) fn build_reviewer_decision_view(decision: &super::types::AgentDecision) -> String {
+    serde_json::to_string(&mongodb::bson::doc! {
+        "shouldReply": decision.should_reply,
+        "replyText": decision.reply_text.clone(),
+        "matchedKnowledgeIds": decision.matched_knowledge_ids.clone(),
+        "safeClaimsUsed": decision.safe_claims_used.clone(),
+        "usedKnowledgeIds": decision.used_knowledge_ids.clone(),
+        "objectionsDetected": decision.objections_detected.clone(),
+        "customerStage": decision.customer_stage.clone().unwrap_or_default(),
+        "intentLevel": decision.intent_level.clone().unwrap_or_default(),
+        "operationState": decision.operation_state.clone().unwrap_or_default(),
+        "decisionPhase": decision.decision_phase.clone(),
+        "autonomyMode": decision.autonomy_mode.clone(),
+        "runMode": decision.run_mode.clone(),
+        "riskLevel": decision.risk_level.clone(),
+        "knowledgeNeed": decision.knowledge_need.clone(),
+    })
+    .unwrap_or_default()
+}
+
+pub fn review_passed(
     review: &DecisionReviewResult,
     runtime: &UserRuntimeParameters,
 ) -> bool {
@@ -159,6 +194,10 @@ pub(crate) fn review_passed(
         && review.scores.human_like >= runtime.human_like_rewrite_below
         && review.scores.emotional_value >= runtime.emotional_value_rewrite_below
         && review.scores.knowledge_grounding_score >= runtime.product_accuracy_block_below
+        // Phase B / B1：恢复 pressure_risk 软闸 — `>=` 阈值视为压迫感过强，拦截。
+        // 0 表示 reviewer 未给分（含老数据反序列化默认），不参与拦截。
+        && (review.scores.pressure_risk == 0
+            || review.scores.pressure_risk < runtime.pressure_risk_block_at)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -185,6 +224,7 @@ pub(crate) async fn review_decision(
                 emotional_value: 10,
                 hallucination_score: 0,
                 knowledge_grounding_score: 10,
+                ..Default::default()
             },
             review_summary: "无需回复，无发送风险".to_string(),
             ..Default::default()
@@ -207,6 +247,15 @@ pub(crate) async fn review_decision(
     })
     .unwrap_or_default();
     let knowledge_route_text = serde_json::to_string(knowledge_route).unwrap_or_default();
+    // Phase B / B2：reviewer 视图剥离 reply-agent 自我推理。直接 `to_string(decision)`
+    // 会把 9 个 self-reasoning 字段（why_should_reply / self_critique /
+    // knowledge_need_reason / memory_update_reason / risk_self_check /
+    // user_understanding / relationship_read / operation_goal / why_skip_reply）
+    // + intent_analysis / next_best_action 推理 doc 一并喂给 reviewer，导致
+    // reviewer 倾向于追认 reply-agent 的逻辑而失去 epistemic distance。
+    // 这里只暴露候选回复事实面：是否回复、回复文本、知识引用、状态/阶段、tool-loop
+    // 协议字段；其余字段（含 reasoning）不进 reviewer 上下文。
+    let decision_view_text = build_reviewer_decision_view(decision);
     let user = format!(
         r#"请评审候选回复。
 Review 模式: {}
@@ -241,6 +290,9 @@ Review 模式: {}
 评审原则：
 - 转化平衡：既允许适度推进，也不能伤害信任。
 - 禁止虚假稀缺、恐惧营销、编造案例、编造价格、编造承诺。
+- humanLike 与 pressureRisk 是 **硬评分** 软闸（Phase B / B1）：humanLike 低于阈值
+  或 pressureRisk 高于等于阈值，会触发 single-shot revision；reviewer 必须给 0-100
+  的具体分数，并在 `needsRevision` / `revisionDirection` 里给出可执行的改写方向。
 - 如果不像微信真人、太模板、太销售，要降低 humanLike 或提高 pressureRisk。
 - 如果没有基于产品知识却做了产品承诺，要提高 factRisk 和降低 productAccuracy。
 - 产品知识为空时，允许关系维护、测试消息和轻量澄清；但任何具体价格、案例、效果保证、产品能力承诺都必须视为事实风险。
@@ -287,7 +339,7 @@ Review 模式: {}
         review_mode,
         inbound.content,
         decision.reply_text,
-        serde_json::to_string(decision).unwrap_or_default(),
+        decision_view_text,
         memory_text,
         memory_card_text,
         playbook.map(format_playbook_for_prompt).unwrap_or_default(),
@@ -728,4 +780,364 @@ pub(crate) fn derive_revision_failure(reason: &str) -> (String, GatewayStatusFin
     // 由调用方在 review.final_review_status 中显式写 "revision_failed"。
     let status = GatewayStatusFinal::Held(HOLD_CATEGORY_HELD_BY_AI_POLICY.to_string());
     (reason.to_string(), status)
+}
+
+/// Phase D / D2：从一段出站文本提取风格指纹。
+///
+/// 设计取舍：选**结构特征**（长度桶 + 标点密度 + emoji 出现 + 句末符号），
+/// 而非 LLM 嵌入向量。理由：
+/// - 廉价、确定性、纯字符串运算，不占 RunBudget；
+/// - 风格漂移最容易在结构上暴露（一会儿一句话、一会儿三段；一会儿带表情、
+///   一会儿正经；一会儿陈述句、一会儿问句堆叠）；
+/// - 语义级风格（如"专业 vs 亲切"）已经在 reviewer prompt 里通过 reply_style
+///   playbook 字段控制，不重复造轮子。
+///
+/// 输出形如 `"len:s|emoji:0|qmark:1|excl:0|tail:.|nl:0"` 的紧凑串。
+pub(crate) fn extract_outbound_style_fingerprint(content: &str) -> String {
+    let trimmed = content.trim();
+    let chars = trimmed.chars().count();
+    let len_bucket = if chars <= 30 {
+        "xs"
+    } else if chars <= 80 {
+        "s"
+    } else if chars <= 200 {
+        "m"
+    } else {
+        "l"
+    };
+
+    let has_emoji = trimmed
+        .chars()
+        .any(|c| matches!(c as u32, 0x1F300..=0x1FAFF | 0x2600..=0x27BF));
+    let has_qmark = trimmed.contains('?') || trimmed.contains('？');
+    let has_excl = trimmed.contains('!') || trimmed.contains('！');
+    let nl_count = trimmed.matches('\n').count().min(9);
+
+    // 句末符号：跳过尾部 emoji / 空白，归一化中英文标点。emoji 常作"装饰"挂在
+    // 真句末符号之后（"方便聊一下吗？😊"），把它纳入 tail 会误把所有带 emoji 句
+    // 都标成 tail:x，掩盖真实的问句 / 陈述句结构差异。
+    let tail = trimmed
+        .chars()
+        .rev()
+        .find(|c| {
+            !c.is_whitespace()
+                && !matches!(*c as u32, 0x1F300..=0x1FAFF | 0x2600..=0x27BF)
+        })
+        .unwrap_or('.');
+    let tail_class = match tail {
+        '?' | '？' => 'q',
+        '!' | '！' => 'e',
+        '。' | '.' => '.',
+        '~' | '～' => '~',
+        _ => 'x',
+    };
+
+    format!(
+        "len:{}|emoji:{}|qmark:{}|excl:{}|tail:{}|nl:{}",
+        len_bucket,
+        if has_emoji { 1 } else { 0 },
+        if has_qmark { 1 } else { 0 },
+        if has_excl { 1 } else { 0 },
+        tail_class,
+        nl_count,
+    )
+}
+
+/// Phase D / D2：判断两条风格指纹是否"分歧足够大"。
+///
+/// 风格指纹是 5 段 `key:value` 拼接的串。分歧度 = 不同 key 数量 ≥ 3 视为发散。
+/// 本函数只做语义判定，不读 contact / state；上层 reviewer 拿 bool 决定要不要
+/// 触发 single-shot revision。
+pub(crate) fn style_diverged(prev: &str, current: &str) -> bool {
+    if prev.is_empty() || current.is_empty() {
+        return false;
+    }
+    let prev_parts: Vec<&str> = prev.split('|').collect();
+    let cur_parts: Vec<&str> = current.split('|').collect();
+    let len = prev_parts.len().min(cur_parts.len());
+    let diff = (0..len)
+        .filter(|i| prev_parts[*i] != cur_parts[*i])
+        .count();
+    diff >= 3
+}
+
+#[cfg(test)]
+mod style_fingerprint_tests {
+    use super::*;
+
+    #[test]
+    fn fingerprint_is_deterministic() {
+        let s = extract_outbound_style_fingerprint("您好，请问需要更多信息吗？");
+        let s2 = extract_outbound_style_fingerprint("您好，请问需要更多信息吗？");
+        assert_eq!(s, s2);
+    }
+
+    #[test]
+    fn fingerprint_captures_length_bucket() {
+        let xs = extract_outbound_style_fingerprint("好的");
+        let m = extract_outbound_style_fingerprint(&"中".repeat(120));
+        assert!(xs.contains("len:xs"));
+        assert!(m.contains("len:m"));
+    }
+
+    #[test]
+    fn fingerprint_captures_emoji_and_question() {
+        let s = extract_outbound_style_fingerprint("方便聊一下吗？😊");
+        assert!(s.contains("emoji:1"));
+        assert!(s.contains("qmark:1"));
+        assert!(s.contains("tail:q"), "trailing emoji 之前是问号: {}", s);
+    }
+
+    #[test]
+    fn fingerprint_captures_newlines() {
+        let s = extract_outbound_style_fingerprint("第一段\n\n第二段\n第三段");
+        assert!(s.contains("nl:3"));
+    }
+
+    /// 完全相同的两条 → 不分歧。
+    #[test]
+    fn style_diverged_same_returns_false() {
+        let a = extract_outbound_style_fingerprint("好的，请稍等。");
+        assert!(!style_diverged(&a, &a));
+    }
+
+    /// 长度桶 + 句末符号 + 问号同时变 → 分歧 ≥ 3 → true。
+    #[test]
+    fn style_diverged_three_axes_changed() {
+        let prev = extract_outbound_style_fingerprint("收到。");
+        let cur = extract_outbound_style_fingerprint(&format!(
+            "{}\n请问您还需要补充哪些信息呢？",
+            "嗯".repeat(120)
+        ));
+        assert!(style_diverged(&prev, &cur), "prev={} cur={}", prev, cur);
+    }
+
+    /// 仅长度桶变（其它一致）→ 1 处不同 → false（容忍小幅波动）。
+    #[test]
+    fn style_diverged_minor_change_returns_false() {
+        let prev = extract_outbound_style_fingerprint("好的。");
+        let cur = extract_outbound_style_fingerprint("好的，已收到。");
+        assert!(!style_diverged(&prev, &cur), "prev={} cur={}", prev, cur);
+    }
+
+    /// 空指纹（首轮回复）→ 永远不分歧，避免误触发首次 revision。
+    #[test]
+    fn style_diverged_empty_returns_false() {
+        let cur = extract_outbound_style_fingerprint("好的。");
+        assert!(!style_diverged("", &cur));
+        assert!(!style_diverged(&cur, ""));
+    }
+}
+
+#[cfg(test)]
+mod review_passed_dual_gate_tests {
+    //! Phase B / B1：`review_passed` 在 hallucination / grounding 两闸之外，
+    //! 还要承担 humanLike + pressureRisk 双软闸。验证：
+    //!
+    //! * pressureRisk == 0（老数据 / reviewer 未填）→ 不参与拦截；
+    //! * pressureRisk >= 阈值（默认 7）→ 必须返回 false，下游走
+    //!   single-shot revision 通道；
+    //! * humanLike < 阈值（默认 6）→ 必须返回 false；
+    //! * 全分通过且 approved=true → 返回 true。
+
+    use super::super::runtime::UserRuntimeParameters;
+    use super::super::types::{DecisionReviewResult, ReviewScores};
+    use super::review_passed;
+
+    fn full_pass_review() -> DecisionReviewResult {
+        DecisionReviewResult {
+            approved: true,
+            scores: ReviewScores {
+                human_like: 80,
+                emotional_value: 70,
+                hallucination_score: 1,
+                knowledge_grounding_score: 80,
+                pressure_risk: 1,
+            },
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn review_passed_passes_when_pressure_risk_under_threshold() {
+        let runtime = UserRuntimeParameters::default();
+        let review = full_pass_review();
+        assert!(
+            review_passed(&review, &runtime),
+            "全分通过的 review 必须 review_passed=true"
+        );
+    }
+
+    #[test]
+    fn review_passed_blocks_when_pressure_risk_at_threshold() {
+        let runtime = UserRuntimeParameters::default();
+        let mut review = full_pass_review();
+        review.scores.pressure_risk = runtime.pressure_risk_block_at;
+        assert!(
+            !review_passed(&review, &runtime),
+            "pressureRisk == block_at 必须拦截，触发 single-shot revision"
+        );
+    }
+
+    #[test]
+    fn review_passed_blocks_when_pressure_risk_above_threshold() {
+        let runtime = UserRuntimeParameters::default();
+        let mut review = full_pass_review();
+        review.scores.pressure_risk = runtime.pressure_risk_block_at + 5;
+        assert!(
+            !review_passed(&review, &runtime),
+            "pressureRisk 超过 block_at 必须拦截"
+        );
+    }
+
+    #[test]
+    fn review_passed_ignores_pressure_risk_zero_for_legacy_data() {
+        // 老数据 / reviewer 未输出 pressureRisk → R11 兼容：默认 0，不拦截。
+        let runtime = UserRuntimeParameters::default();
+        let mut review = full_pass_review();
+        review.scores.pressure_risk = 0;
+        assert!(
+            review_passed(&review, &runtime),
+            "pressureRisk == 0（老数据/未填）必须视为豁免"
+        );
+    }
+
+    #[test]
+    fn review_passed_blocks_when_human_like_below_threshold() {
+        let runtime = UserRuntimeParameters::default();
+        let mut review = full_pass_review();
+        review.scores.human_like = runtime.human_like_rewrite_below - 1;
+        assert!(
+            !review_passed(&review, &runtime),
+            "humanLike < rewrite_below 必须拦截，触发 single-shot revision"
+        );
+    }
+
+    #[test]
+    fn review_passed_blocks_when_approved_false() {
+        let runtime = UserRuntimeParameters::default();
+        let mut review = full_pass_review();
+        review.approved = false;
+        assert!(
+            !review_passed(&review, &runtime),
+            "approved=false 必须直接拦截，无视分数"
+        );
+    }
+}
+
+#[cfg(test)]
+mod reviewer_decision_view_tests {
+    //! Phase B / B2：[`build_reviewer_decision_view`] 必须剥离 reply-agent
+    //! 自我推理。验证：
+    //!
+    //! * 9 个 reasoning 字段（self_critique / why_should_reply 等）即使非空，
+    //!   reviewer 视图里也不应包含其值或 key；
+    //! * 候选回复事实面（reply_text / should_reply / matched_knowledge_ids 等）
+    //!   必须保留；
+    //! * intent_analysis / next_best_action / operating_memory_update 三个
+    //!   推理 Document 不进 reviewer 视图。
+
+    use super::super::types::AgentDecision;
+    use super::build_reviewer_decision_view;
+    use mongodb::bson::doc;
+
+    fn decision_with_reasoning_filled() -> AgentDecision {
+        AgentDecision {
+            run_mode: "deep_reason".to_string(),
+            risk_level: "low".to_string(),
+            knowledge_need: "not_required".to_string(),
+            should_reply: true,
+            reply_text: "好的，明白您的顾虑".to_string(),
+            user_understanding: "用户在表达对价格的担忧".to_string(),
+            relationship_read: "信任度中等，处于评估阶段".to_string(),
+            operation_goal: "建立信任，先不推产品".to_string(),
+            knowledge_need_reason: "本轮不涉及产品承诺".to_string(),
+            memory_update_reason: "unchanged".to_string(),
+            self_critique: "上一轮回复略显急切，本轮放慢节奏".to_string(),
+            why_should_reply: "用户提出了具体顾虑，需要回应".to_string(),
+            why_skip_reply: String::new(),
+            risk_self_check: "无产品承诺，无销售压力".to_string(),
+            customer_stage: Some("evaluating".to_string()),
+            intent_level: Some("medium".to_string()),
+            operation_state: Some("trust_building".to_string()),
+            decision_phase: "final".to_string(),
+            autonomy_mode: "auto".to_string(),
+            matched_knowledge_ids: vec!["k1".to_string(), "k2".to_string()],
+            safe_claims_used: vec!["c1".to_string()],
+            used_knowledge_ids: vec!["k1".to_string()],
+            objections_detected: vec!["price".to_string()],
+            intent_analysis: doc! { "explanation": "should not leak" },
+            next_best_action: doc! { "explanation": "should not leak" },
+            operating_memory_update: doc! { "explanation": "should not leak" },
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn reviewer_view_strips_self_critique_and_reasoning() {
+        let view = build_reviewer_decision_view(&decision_with_reasoning_filled());
+        // 9 个 reasoning 字段值都不应出现
+        let leaked_values = [
+            "用户在表达对价格的担忧",
+            "信任度中等，处于评估阶段",
+            "建立信任，先不推产品",
+            "本轮不涉及产品承诺",
+            "上一轮回复略显急切，本轮放慢节奏",
+            "用户提出了具体顾虑，需要回应",
+            "无产品承诺，无销售压力",
+            "should not leak",
+        ];
+        for needle in leaked_values {
+            assert!(
+                !view.contains(needle),
+                "reviewer view 不应包含 reply-agent 推理片段 {:?}: view={}",
+                needle,
+                view
+            );
+        }
+        // 推理 key 也不应出现
+        let leaked_keys = [
+            "userUnderstanding",
+            "relationshipRead",
+            "operationGoal",
+            "knowledgeNeedReason",
+            "memoryUpdateReason",
+            "selfCritique",
+            "whyShouldReply",
+            "whySkipReply",
+            "riskSelfCheck",
+            "intentAnalysis",
+            "nextBestAction",
+            "operatingMemoryUpdate",
+        ];
+        for key in leaked_keys {
+            assert!(
+                !view.contains(key),
+                "reviewer view 不应包含 reasoning key {:?}: view={}",
+                key,
+                view
+            );
+        }
+    }
+
+    #[test]
+    fn reviewer_view_preserves_reply_facts() {
+        let view = build_reviewer_decision_view(&decision_with_reasoning_filled());
+        // 候选回复事实面必须保留
+        assert!(view.contains("好的，明白您的顾虑"), "应保留 replyText: {}", view);
+        assert!(view.contains("\"shouldReply\":true"), "应保留 shouldReply: {}", view);
+        assert!(view.contains("\"customerStage\":\"evaluating\""), "应保留 customerStage: {}", view);
+        assert!(view.contains("\"operationState\":\"trust_building\""), "应保留 operationState: {}", view);
+        assert!(view.contains("\"k1\""), "应保留 knowledge id 引用: {}", view);
+        assert!(view.contains("price"), "应保留 objectionsDetected: {}", view);
+    }
+
+    #[test]
+    fn reviewer_view_handles_empty_decision() {
+        let view = build_reviewer_decision_view(&AgentDecision::default());
+        // 即使是空 decision，view 也应是合法 JSON 且不 panic
+        let parsed: serde_json::Value =
+            serde_json::from_str(&view).expect("reviewer view 必须是合法 JSON");
+        assert!(parsed.is_object(), "reviewer view 必须是 JSON 对象");
+    }
 }

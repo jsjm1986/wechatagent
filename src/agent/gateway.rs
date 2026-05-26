@@ -30,6 +30,7 @@ use crate::mcp;
 use crate::models::{
     AgentDecisionReview, AgentEvent, AgentRunLog, AgentStatus, AgentTask, Contact,
     ConversationMessage, MessageDirection, OperationDomainConfig, OperationPlaybook,
+    OperationStatePolicy,
 };
 use crate::prompts;
 use crate::routes::AppState;
@@ -37,13 +38,14 @@ use crate::routes::AppState;
 use super::budget::{current_run_budget, RunBudget, RUN_BUDGET};
 use super::decision::{
     decide_reply_with_promote, load_operation_playbook_for_contact,
-    load_user_operation_domain_config,
+    load_operation_state_policy, load_user_operation_domain_config,
 };
 use super::guards::{
-    normalize_decision_runtime, normalize_decision_state, planner_from_decision,
+    classify_decision_action, enforce_state_action_policy, normalize_decision_runtime,
+    normalize_decision_state, planner_from_decision,
 };
 use super::knowledge_router::{
-    empty_knowledge_route, knowledge_route_has_keyword_fastpath_hit, load_operation_knowledge,
+    empty_knowledge_route, load_operation_knowledge,
     maybe_emit_unverified_warning, route_operation_knowledge, route_used_knowledge_ids,
     select_operation_knowledge_chunks, write_knowledge_usage_log,
 };
@@ -475,7 +477,6 @@ async fn run_user_operation_gateway_inner(
         )
         .await?
     };
-    let keyword_fastpath_hit = knowledge_route_has_keyword_fastpath_hit(&knowledge_route);
     let selected_chunks =
         select_operation_knowledge_chunks(&operation_knowledge.chunks, &knowledge_route);
     // agent-autonomy-loop W2 / Task 3.4：把 RawAgentDecision::validate_and_promote
@@ -506,18 +507,6 @@ async fn run_user_operation_gateway_inner(
         if planner.review_mode.trim().is_empty() {
             planner.review_mode = "full".to_string();
         }
-    }
-    apply_confidence_override(&mut planner, &decision, &runtime);
-    // ── WB5：硬关键词快路径覆盖 conversation_mode ───────────────────────
-    // 命中 trigger_keywords 但 LLM 没选 consultative 时，强制覆盖为
-    // consultative + reason="trigger_keywords_fastpath_hit"，并把
-    // "conversation_mode_overridden_by_fastpath" 加到 promote_risks 让
-    // finalize_review_for_send 可见。不重跑 LLM 以避免双倍成本。
-    if keyword_fastpath_hit && decision.conversation_mode != "consultative" {
-        decision.conversation_mode = "consultative".to_string();
-        decision.conversation_mode_reason =
-            Some("trigger_keywords_fastpath_hit".to_string());
-        promote_risks.push("conversation_mode_overridden_by_fastpath".to_string());
     }
     apply_confidence_override(&mut planner, &decision, &runtime);
     normalize_decision_runtime(&mut decision, &planner);
@@ -682,6 +671,54 @@ async fn run_user_operation_gateway_inner(
     let mut review = finalized_review;
     persist_finalize_pending_events(state, &contact, &pending_events).await?;
 
+    // ── Phase B / B4：operation_state_policies 终态再扣一道 ──
+    //
+    // finalize 走 Approved 之后再按当前 operation_state 校验"该状态允许 / 禁止
+    // agent 做哪类动作"。命中 forbidden 或 allowlist 收敛模式不含本次 action，
+    // 强制把 finalize_status 改成 `held_by_ai_policy`、`should_reply=false`，
+    // 落到下面统一的 `!Approved` 拦截分支去写审计 / 取消任务 / 写 run log。
+    //
+    // 老库无 `operation_state_policies` 行 → `enforce_state_action_policy(None, _)`
+    // fallthrough（向前兼容）；该入口不会绕过 outbox / idempotency。
+    if matches!(finalize_status, GatewayStatusFinal::Approved) {
+        let policy_opt = load_operation_state_policy(
+            state,
+            &contact.workspace_id,
+            final_decision.operation_state.as_deref().unwrap_or(""),
+        )
+        .await?;
+        let action = classify_decision_action(&final_decision);
+        if let Err(reason) = enforce_state_action_policy(policy_opt.as_ref(), action) {
+            review.approved = false;
+            review.final_review_status = "held_by_ai_policy".to_string();
+            final_decision.should_reply = false;
+            final_decision.autonomy_mode = "blocked".to_string();
+            if !review.risks.iter().any(|r| r == "state_action_policy_blocked") {
+                review.risks.push("state_action_policy_blocked".to_string());
+            }
+            finalize_status =
+                GatewayStatusFinal::Held("held_by_ai_policy".to_string());
+            write_event_for_account(
+                state,
+                &contact.account_id,
+                Some(&contact.wxid),
+                "state_action_policy_blocked",
+                "blocked",
+                &reason,
+                Some(doc! {
+                    "run_id": &run_id,
+                    "action": action,
+                    "operation_state": final_decision
+                        .operation_state
+                        .clone()
+                        .unwrap_or_default(),
+                    "reason": reason.clone(),
+                }),
+            )
+            .await?;
+        }
+    }
+
     // ── R2 single-shot revision 控制流 ──
     //
     // 触发条件（design.md §4.5 / R2.3 / R2.4 / R2.8 / R2.9）：
@@ -703,6 +740,55 @@ async fn run_user_operation_gateway_inner(
     let budget_exceeded_for_revision = current_run_budget()
         .map(|b| b.is_exceeded())
         .unwrap_or(false);
+
+    // Phase D / D2：如果 finalize Approved 且 reviewer 没要求 revision，再用结构性
+    // 风格指纹和 contact.last_outbound_style 比对一次。3/5 轴漂移 → 强制 single-shot
+    // revision，向 last_outbound_style 风格靠拢。empty prev 视为首轮，跳过。
+    if matches!(finalize_status, GatewayStatusFinal::Approved)
+        && !review.needs_revision
+        && !review.should_hold
+        && final_decision.should_reply
+    {
+        let prev_style = contact
+            .last_outbound_style
+            .clone()
+            .unwrap_or_default();
+        if !prev_style.trim().is_empty() {
+            let new_style =
+                super::review::extract_outbound_style_fingerprint(&final_decision.reply_text);
+            if super::review::style_diverged(&prev_style, &new_style) {
+                let direction = format!(
+                    "上一轮出站风格指纹为 [{}]，本轮草稿为 [{}]，二者结构差异较大；\
+                     请保留本轮内容要点的同时，向上一轮风格靠拢（长度桶 / emoji / \
+                     问句感叹密度 / 句末符号 / 段落数 至少 3 个轴对齐）。",
+                    prev_style, new_style
+                );
+                review.needs_revision = true;
+                review.revision_direction = direction.clone();
+                if !review.risks.iter().any(|r| r == "style_diverged") {
+                    review.risks.push("style_diverged".to_string());
+                }
+                write_event_for_account(
+                    state,
+                    &contact.account_id,
+                    Some(&contact.wxid),
+                    "style_consistency_revision_trigger",
+                    "info",
+                    &format!(
+                        "style_diverged: prev={} new={}",
+                        prev_style, new_style
+                    ),
+                    Some(doc! {
+                        "run_id": &run_id,
+                        "prev_style": &prev_style,
+                        "new_style": &new_style,
+                    }),
+                )
+                .await?;
+            }
+        }
+    }
+
     let revision_decision =
         decide_revision(&finalize_status, &review, budget_exceeded_for_revision);
     match revision_decision {
@@ -1297,6 +1383,10 @@ pub(crate) async fn send_outbound_message(
     // 用 aggregation pipeline 把 last_outbound_at / last_agent_run_at / updated_at
     // 设为 now，并把 last_message_at 设成 max(last_inbound_at, now)，
     // 不改 last_inbound_at（出站不应推进"用户最后一次说话"的时间）。
+    // Phase D / D2：同步把本次出站文本的风格指纹写入 last_outbound_style，
+    // 供下一轮 reviewer 做 style_diverged 判定。
+    let style_fingerprint =
+        super::review::extract_outbound_style_fingerprint(content);
     let pipeline: Vec<Document> = vec![doc! {
         "$set": {
             "last_outbound_at": now,
@@ -1304,7 +1394,8 @@ pub(crate) async fn send_outbound_message(
             "updated_at": now,
             "last_message_at": {
                 "$max": ["$last_inbound_at", now]
-            }
+            },
+            "last_outbound_style": style_fingerprint,
         }
     }];
     state
@@ -1831,6 +1922,7 @@ pub(crate) async fn write_decision_review(
                 outcome_status: Some("pending".to_string()),
                 reaction_analysis: Document::new(),
                 reaction_claimed_at: None,
+                reviewer_misjudge_signal: None,
                 status: status.to_string(),
                 created_at: DateTime::now(),
             },
