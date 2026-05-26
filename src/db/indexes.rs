@@ -828,6 +828,22 @@ async fn ensure_evolution_indexes(db: &Database) -> anyhow::Result<()> {
             None,
         )
         .await?;
+    // LintView dashboard：按 (kind, status) 分组的时间线视图。
+    // 与 gap_signals_status_kind_idx 的差异是字段顺序与排序键 —— 前端
+    // /api/knowledge/gap-signals?kind=X 直接走这条避免 in-memory sort。
+    db.knowledge_gap_signals()
+        .create_index(
+            IndexModel::builder()
+                .keys(doc! { "workspace_id": 1, "kind": 1, "status": 1, "created_at": -1 })
+                .options(
+                    IndexOptions::builder()
+                        .name("gap_signals_kind_status_created_idx".to_string())
+                        .build(),
+                )
+                .build(),
+            None,
+        )
+        .await?;
     db.domain_schemas()
         .create_index(
             IndexModel::builder()

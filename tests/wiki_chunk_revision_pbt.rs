@@ -22,7 +22,7 @@
 
 use std::collections::BTreeSet;
 
-use mongodb::bson::{doc, Bson, Document};
+use mongodb::bson::{doc, Bson};
 use proptest::prelude::*;
 use wechatagent::knowledge_wiki::chunk_revisions::normalize_ref_key;
 use wechatagent::knowledge_wiki::page_merge::{

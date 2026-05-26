@@ -359,7 +359,7 @@ fn full_card_round_trip_preserves_extra_fields() {
     assert!(matches!(prefs, Some(Bson::Array(_))));
 }
 
-/// 旧 Vec<String> 输入下 cap=6/10 与"未 discarded 必保留"性质（PBT）。
+// 旧 Vec<String> 输入下 cap=6/10 与"未 discarded 必保留"性质（PBT）。
 proptest! {
     #![proptest_config(ProptestConfig {
         cases: 64,

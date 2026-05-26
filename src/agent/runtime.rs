@@ -256,6 +256,7 @@ pub struct ResolvedThresholds {
 /// 6 个 gate_key 字面量，与 `evolution::threshold` /
 /// `evolution::release_threshold` 写入 `threshold_overrides.gate_key` 时使用的
 /// 字面量保持一致。改动需同步检查 W2 / W4 演化器侧。
+#[allow(dead_code)] // 字面量校验常量，生产路径用字面量；test 验证完整性
 pub const RESOLVED_GATE_KEYS: &[&str] = &[
     "fact_risk_block",
     "pressure_risk_block",

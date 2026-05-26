@@ -46,6 +46,7 @@ const TAXONOMY_CACHE_TTL: Duration = Duration::from_secs(30);
 /// `AliasActive` 改写 / `Deprecated` 追加 risk / `CandidateNew` 追加 risk +
 /// upsert（**不**强制 review fail）。
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)] // Phase A 接入待 follow-up（enforce_decision_guards 调用）
 pub(crate) enum TaxonomyMatch {
     /// 命中字典中 `status="active"` 且 `value.id == raw`。
     Active,
@@ -76,6 +77,7 @@ struct TaxonomyCacheInner {
 }
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)] // Phase A 接入待 follow-up（enforce_decision_guards 调用）
 struct CachedEntry {
     canonical_id: String,
     aliases: Vec<String>,
@@ -169,6 +171,7 @@ impl TaxonomyCache {
 /// 4. 否则 → [`TaxonomyMatch::CandidateNew`]
 ///
 /// `scope` 优先按 `account_id` 查，未命中再按 `"global"` 查（两层 fallback）。
+#[allow(dead_code)] // Phase A 接入待 follow-up（enforce_decision_guards 调用）
 pub(crate) fn check_value(
     kind: &str,
     raw_value: &str,
@@ -470,6 +473,7 @@ static GLOBAL_TAXONOMY_CACHE: std::sync::LazyLock<Arc<TaxonomyCache>> =
 
 /// 进程级单例 cache 句柄；`enforce_decision_taxonomy_guards` 调用方在没有
 /// 注入自定义 cache 时使用本入口。
+#[allow(dead_code)] // Phase A 接入待 follow-up（enforce_decision_guards 调用）
 pub(crate) fn global_taxonomy_cache() -> Arc<TaxonomyCache> {
     GLOBAL_TAXONOMY_CACHE.clone()
 }

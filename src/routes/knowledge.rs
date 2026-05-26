@@ -6771,6 +6771,83 @@ pub(super) async fn sweep_knowledge_gap_signals(
     })))
 }
 
+// ── /api/knowledge/ask: Agent-first 渐进式披露问答入口 ─────────────────
+//
+// 让前端 AskView 与运营 agent 共享同一条 knowledge_agent 主循环；不走 BM25 / 向量
+// 召回，由 LLM 自己 list_catalog → open_chunk → follow_relations → answer。
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct KnowledgeAskRequest {
+    workspace_id: Option<String>,
+    account_id: Option<String>,
+    query: String,
+    /// 1..=3；为 None 时由 knowledge_agent 默认走 3 轮。
+    max_rounds: Option<i32>,
+    #[serde(default)]
+    filter: KnowledgeAskFilter,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct KnowledgeAskFilter {
+    #[serde(default)]
+    wiki_types: Vec<String>,
+    #[serde(default)]
+    business_topics: Vec<String>,
+    #[serde(default)]
+    status: Option<String>,
+}
+
+/// `POST /api/knowledge/ask`：调用 [`crate::agent::knowledge_agent::answer`] 主循环。
+///
+/// 返回 schema：`{ answer, citedChunkIds, sourceQuotes, toolTrace, roundsUsed,
+/// truncated, tookMs }`。`tookMs` 为后端测得的端到端耗时（含 LLM 与 mongo I/O）。
+pub(super) async fn ask_knowledge(
+    State(state): State<AppState>,
+    Json(req): Json<KnowledgeAskRequest>,
+) -> AppResult<Json<Value>> {
+    let started_at = std::time::Instant::now();
+    if req.query.trim().is_empty() {
+        return Err(AppError::BadRequest("query 不能为空".into()));
+    }
+    let workspace_id = req
+        .workspace_id
+        .clone()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| state.config.default_workspace_id.clone());
+    let account_id = req
+        .account_id
+        .clone()
+        .filter(|s| !s.trim().is_empty());
+    let agent_req = agent::knowledge_agent::AnswerRequest {
+        workspace_id,
+        account_id,
+        query: req.query.clone(),
+        filter: agent::knowledge_agent::CatalogFilter {
+            wiki_types: req.filter.wiki_types,
+            business_topics: req.filter.business_topics,
+            status: req.filter.status,
+        },
+        max_rounds: req.max_rounds,
+    };
+    let result = agent::knowledge_agent::answer(&state, agent_req).await?;
+    let took_ms = started_at.elapsed().as_millis() as u64;
+    Ok(Json(json!({
+        "answer": result.answer,
+        "citedChunkIds": result.cited_chunk_ids,
+        "sourceQuotes": result.source_quotes.iter().map(|q| json!({
+            "chunkId": q.chunk_id,
+            "quote": q.quote,
+            "sourceAnchorIndex": q.source_anchor_index,
+        })).collect::<Vec<_>>(),
+        "toolTrace": result.tool_trace,
+        "roundsUsed": result.rounds_used,
+        "truncated": result.truncated,
+        "tookMs": took_ms,
+    })))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -10,13 +10,16 @@
 //!
 //! 8 类 signal kind:
 //! - `orphan` — chunk 既无入链也无 30d 命中，疑似死页
-//! - `broken_link` — chunk.related_chunks 指向已 archived/不存在的 chunk
+//! - `broken_link` — chunk.related_chunks 指向不存在的 chunk_id
 //! - `no_outlinks` — synthesis/comparison/methodology 类 chunk 的 related_chunks 为空
 //! - `low_confidence` — `dynamic_confidence < 0.3` 且 30d hit > 0（命中却低分）
 //! - `stale` — `valid_to < now`，时效已过
-//! - `contradiction` — semantic LLM 标记的双 chunk 矛盾
-//! - `missing_chunk` — semantic LLM 推测应存在但缺失的页
-//! - `suggestion` — semantic LLM 给出的改进建议
+//! - `contradiction` — 同 workspace 同 normalize_title 多 chunk + body 首段 sha256 不一致
+//! - `missing_chunk` — chunk.related_chunks 指向已 archived 的 chunk（依赖被回收）
+//! - `suggestion` — `usage_stats.blocked_count_30d > 3 && integrity_status != "verified"`
+//!
+//! 三个新 kind（`contradiction` / `missing_chunk` / `suggestion`）全部走纯规则路径，
+//! 不调用 LLM；source 字段维持 `"rule"`，与 stage 1 sweep 一致。
 //!
 //! 两阶段 sweep（[`sweep_stale_signals`]）：
 //! - **Stage 1（规则）**：broken_link 的 target 已恢复 → auto_resolved；
@@ -70,6 +73,33 @@ pub async fn load_active_chunks(
     cursor.try_collect().await.map_err(AppError::from)
 }
 
+/// 取 workspace 下所有 archived chunk 的 hex id —— missing_chunk 区分用。
+///
+/// `broken_link` vs `missing_chunk` 的差异：目标 id 在 archived 集合里 → missing_chunk
+/// （依赖被运营回收，severity=error）；既不在 active 也不在 archived → broken_link
+/// （引用拼错或目标从未存在，severity=warning）。
+pub async fn load_archived_chunk_ids(
+    db: &Database,
+    workspace_id: &str,
+) -> Result<HashSet<String>, AppError> {
+    let cursor = db
+        .operation_knowledge_chunks()
+        .find(
+            doc! {
+                "workspace_id": workspace_id,
+                "status": "archived"
+            },
+            None,
+        )
+        .await
+        .map_err(AppError::from)?;
+    let archived: Vec<OperationKnowledgeChunk> = cursor.try_collect().await.map_err(AppError::from)?;
+    Ok(archived
+        .iter()
+        .filter_map(|c| c.id.as_ref().map(|o| o.to_hex()))
+        .collect())
+}
+
 /// 执行一次 structural lint：纯规则、不调 LLM。
 ///
 /// 流程：
@@ -82,15 +112,18 @@ pub async fn run_structural_lint(
     workspace_id: &str,
 ) -> Result<LintReport, AppError> {
     let chunks = load_active_chunks(db, workspace_id).await?;
-    let candidates = compute_structural_candidates(&chunks, DateTime::now());
+    let archived_ids = load_archived_chunk_ids(db, workspace_id).await?;
+    let candidates = compute_structural_candidates(&chunks, &archived_ids, DateTime::now());
     persist_signals(db, workspace_id, candidates).await
 }
 
 /// 纯函数：从一组 active chunk 生成 structural lint 的候选 signal。
 ///
-/// 拆出来便于 PBT / 单测 —— 不需要数据库。
+/// 拆出来便于 PBT / 单测 —— 不需要数据库。`archived_ids` 用来区分
+/// `broken_link`（引用从未存在）与 `missing_chunk`（引用了已 archived 的 chunk）。
 pub fn compute_structural_candidates(
     chunks: &[OperationKnowledgeChunk],
+    archived_ids: &HashSet<String>,
     now: DateTime,
 ) -> Vec<GapSignalCandidate> {
     let known_ids: HashSet<String> = chunks
@@ -131,16 +164,29 @@ pub fn compute_structural_candidates(
             ));
         }
 
-        // 2. broken_link
+        // 2. broken_link / missing_chunk
+        //    - 目标既不在 active 也不在 archived → broken_link（warning）
+        //    - 目标在 archived → missing_chunk（error，依赖被回收）
         if let Some(refs) = c.related_chunks.as_ref() {
             for r in refs {
-                if !known_ids.contains(&r.chunk_id) {
+                if known_ids.contains(&r.chunk_id) {
+                    continue;
+                }
+                if archived_ids.contains(&r.chunk_id) {
+                    out.push(GapSignalCandidate::new(
+                        "missing_chunk",
+                        format!("依赖已归档：{} → {}", title, r.chunk_id),
+                        "error",
+                        vec![chunk_id.clone(), r.chunk_id.clone()],
+                        Some("引用了已 archived 的 chunk，需要补回或换引用"),
+                    ));
+                } else {
                     out.push(GapSignalCandidate::new(
                         "broken_link",
                         format!("断链：{} → {}", title, r.chunk_id),
                         "warning",
                         vec![chunk_id.clone(), r.chunk_id.clone()],
-                        Some("目标 chunk 已不存在或已 archived"),
+                        Some("目标 chunk 不存在；可能是 id 拼错或从未导入"),
                     ));
                 }
             }
@@ -192,6 +238,63 @@ pub fn compute_structural_candidates(
                 ));
             }
         }
+
+        // 6. suggestion: 未 verified 且 30d 被 grounding 闸 blocked > 3 次
+        let blocked = c
+            .usage_stats
+            .as_ref()
+            .map(|s| s.blocked_count_30d as i64)
+            .unwrap_or(0);
+        let verified = c.integrity_status.as_deref() == Some("verified");
+        if !verified && blocked > 3 {
+            out.push(GapSignalCandidate::new(
+                "suggestion",
+                format!("建议补完后 verify：{}", title),
+                "info",
+                vec![chunk_id.clone()],
+                Some(format!(
+                    "30 天累计被 grounding 闸拦截 {blocked} 次，建议补 source_quote 后 verify",
+                )),
+            ));
+        }
+    }
+
+    // 7. contradiction: 同 normalize_title 的多 chunk + body 首段 sha256 不一致
+    //    遍历完单条规则后再跨 chunk 聚合，避免每个 chunk 内重复扫整表。
+    let mut by_title: HashMap<String, Vec<(&OperationKnowledgeChunk, String)>> = HashMap::new();
+    for c in chunks {
+        if let Some(body) = c.body.as_deref() {
+            let key = normalize_title(&c.title);
+            if key.is_empty() {
+                continue;
+            }
+            let hash = sha256_hex(first_paragraph(body));
+            by_title.entry(key).or_default().push((c, hash));
+        }
+    }
+    for (norm_title, members) in by_title {
+        if members.len() < 2 {
+            continue;
+        }
+        let unique_hashes: HashSet<&str> = members.iter().map(|(_, h)| h.as_str()).collect();
+        if unique_hashes.len() < 2 {
+            continue; // 同题但首段一致 → 视为重复，由其它流程处理
+        }
+        let display_title = members
+            .first()
+            .map(|(c, _)| c.title.clone())
+            .unwrap_or(norm_title);
+        let affected: Vec<String> = members
+            .iter()
+            .filter_map(|(c, _)| c.id.as_ref().map(|o| o.to_hex()))
+            .collect();
+        out.push(GapSignalCandidate::new(
+            "contradiction",
+            format!("同题异说：{}", display_title),
+            "error",
+            affected,
+            Some("同题多 chunk 首段不一致，需要确认权威说法或合并"),
+        ));
     }
 
     out
@@ -497,7 +600,9 @@ pub async fn record_chunk_hit(
 /// 与 `persist_signals` 的差异：
 /// - `persist_signals` 在 lint 一轮内完成"新规则未生成 → auto_resolved"；
 /// - `sweep_stale_signals` 是反向兜底——即使 lint 没跑（如 LLM 信号），
-///   也能基于当前数据消解明显已修复的 broken_link / missing_chunk / stale。
+///   也能基于当前数据消解明显已修复的 broken_link / missing_chunk / stale /
+///   suggestion / contradiction。每类用独立 `resolution_note`，方便审计追溯
+///   信号是被哪条规则消解的。
 pub async fn sweep_stale_signals(
     db: &Database,
     workspace_id: &str,
@@ -507,10 +612,27 @@ pub async fn sweep_stale_signals(
         .iter()
         .filter_map(|c| c.id.as_ref().map(|o| o.to_hex()))
         .collect();
-    let known_titles: HashSet<String> = chunks
-        .iter()
-        .map(|c| normalize_title(&c.title))
-        .collect();
+
+    // 同 normalize_title 在 active 集合中的 (chunk_id_hex, body_first_paragraph_sha256) 视图，
+    // 用于 contradiction 自愈检查（首段哈希再次一致或同题只剩一条）。
+    let mut title_groups: HashMap<String, Vec<String>> = HashMap::new();
+    for c in &chunks {
+        if let Some(body) = c.body.as_deref() {
+            let key = normalize_title(&c.title);
+            if key.is_empty() {
+                continue;
+            }
+            title_groups.entry(key).or_default().push(sha256_hex(first_paragraph(body)));
+        }
+    }
+
+    // chunk_id_hex -> integrity_status，用于 suggestion 自愈检查（被 verify 即消解）。
+    let mut integrity_by_id: HashMap<String, String> = HashMap::new();
+    for c in &chunks {
+        if let (Some(id), Some(st)) = (c.id.as_ref(), c.integrity_status.as_deref()) {
+            integrity_by_id.insert(id.to_hex(), st.to_string());
+        }
+    }
 
     let now = DateTime::now();
     let pending_cursor = db
@@ -526,18 +648,36 @@ pub async fn sweep_stale_signals(
 
     let mut report = SweepReport::default();
     for sig in pending {
-        let resolved = match sig.kind.as_str() {
+        // (resolved, resolution_note)：resolution_note 落库时区分各 kind 自愈原因。
+        let outcome: Option<&'static str> = match sig.kind.as_str() {
             "broken_link" => {
                 // 末位 affected_chunk_ids 是 target id；目标恢复即视为修复
-                sig.affected_chunk_ids
+                let recovered = sig
+                    .affected_chunk_ids
                     .last()
                     .map(|t| known_ids.contains(t))
-                    .unwrap_or(false)
+                    .unwrap_or(false);
+                if recovered { Some("rule:link_recovered") } else { None }
             }
-            "missing_chunk" => known_titles.contains(&normalize_title(&sig.title)),
+            "missing_chunk" => {
+                // 末位是已 archived 的 target id；当它重新进 active → 视为依赖恢复。
+                let dep_back = sig
+                    .affected_chunk_ids
+                    .last()
+                    .map(|t| known_ids.contains(t))
+                    .unwrap_or(false);
+                if dep_back {
+                    Some("rule:dep_restored")
+                } else if sig.affected_chunk_ids.first().map(|src| !known_ids.contains(src)).unwrap_or(false) {
+                    // 引用源 chunk 自己也 archived 了 → 信号无意义。
+                    Some("rule:dep_unrelated")
+                } else {
+                    None
+                }
+            }
             "stale" => {
                 // 找 affected chunk 看 valid_to 是否被推到未来
-                if let Some(target) = sig.affected_chunk_ids.first() {
+                let extended = if let Some(target) = sig.affected_chunk_ids.first() {
                     chunks
                         .iter()
                         .find(|c| c.id.as_ref().map(|o| o.to_hex()) == Some(target.clone()))
@@ -546,20 +686,42 @@ pub async fn sweep_stale_signals(
                         .unwrap_or(false)
                 } else {
                     false
-                }
+                };
+                if extended { Some("rule:valid_to_extended") } else { None }
             }
-            _ => false,
+            "suggestion" => {
+                // chunk 被 verify → 信号失效。
+                let verified = sig
+                    .affected_chunk_ids
+                    .first()
+                    .and_then(|id| integrity_by_id.get(id))
+                    .map(|st| st == "verified")
+                    .unwrap_or(false);
+                if verified { Some("rule:chunk_verified") } else { None }
+            }
+            "contradiction" => {
+                // 同题只剩 1 条，或同题首段哈希已收敛到一致 → 视为冲突已解决。
+                let key = normalize_title(&sig.title.replace("同题异说：", ""));
+                let resolved = match title_groups.get(&key) {
+                    None => true,
+                    Some(hashes) if hashes.len() < 2 => true,
+                    Some(hashes) => {
+                        let unique: HashSet<&str> = hashes.iter().map(|s| s.as_str()).collect();
+                        unique.len() < 2
+                    }
+                };
+                if resolved { Some("rule:contradiction_resolved") } else { None }
+            }
+            _ => None,
         };
-        if !resolved {
-            continue;
-        }
+        let Some(note) = outcome else { continue };
         db.knowledge_gap_signals()
             .update_one(
                 doc! { "signal_id": &sig.signal_id, "status": "pending" },
                 doc! {
                     "$set": {
                         "status": "auto_resolved",
-                        "resolution_note": "rule:condition_recovered",
+                        "resolution_note": note,
                         "resolved_at": DateTime::now(),
                     }
                 },
@@ -587,6 +749,25 @@ pub fn normalize_title(s: &str) -> String {
         .chars()
         .filter(|c| !c.is_whitespace() && *c != '-' && *c != '_')
         .collect()
+}
+
+/// 取 body 的"第一段"——以双换行为分隔。空 body / 全空白 body 返回空串。
+/// 用作 contradiction 检测：同题多 chunk 首段哈希不同 → 视为冲突。
+pub fn first_paragraph(body: &str) -> &str {
+    let trimmed = body.trim_start();
+    let end = trimmed.find("\n\n").unwrap_or(trimmed.len());
+    trimmed[..end].trim_end()
+}
+
+/// SHA-256 hex digest，仅用于 contradiction 等同性比较（非密码学用途）。
+pub fn sha256_hex(s: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(s.as_bytes());
+    let mut out = String::with_capacity(digest.len() * 2);
+    for b in digest {
+        out.push_str(&format!("{:02x}", b));
+    }
+    out
 }
 
 fn id_str(c: &OperationKnowledgeChunk) -> String {
@@ -658,7 +839,7 @@ mod tests {
             chunk("entity 页", Some("entity"), vec![]),
             chunk("方法论页", Some("methodology"), vec![]),
         ];
-        let cands = compute_structural_candidates(&cs, DateTime::now());
+        let cands = compute_structural_candidates(&cs, &HashSet::new(), DateTime::now());
         let kinds: Vec<&str> = cands.iter().map(|c| c.kind.as_str()).collect();
         assert!(kinds.contains(&"no_outlinks"));
         // entity 页只该出 orphan，不该出 no_outlinks
@@ -677,7 +858,7 @@ mod tests {
             last_used_at: None,
             last_blocked_reason: None,
         });
-        let cands = compute_structural_candidates(&cs, DateTime::now());
+        let cands = compute_structural_candidates(&cs, &HashSet::new(), DateTime::now());
         assert!(cands.iter().any(|c| c.kind == "broken_link"));
     }
 
@@ -685,7 +866,7 @@ mod tests {
     fn stale_when_valid_to_expired() {
         let mut c = chunk("过期页", Some("entity"), vec![]);
         c.valid_to = Some(DateTime::from_millis(0));
-        let cands = compute_structural_candidates(&[c], DateTime::now());
+        let cands = compute_structural_candidates(&[c], &HashSet::new(), DateTime::now());
         assert!(cands.iter().any(|s| s.kind == "stale"));
     }
 
@@ -699,8 +880,90 @@ mod tests {
             last_used_at: None,
             last_blocked_reason: None,
         });
-        let cands = compute_structural_candidates(&[c], DateTime::now());
+        let cands = compute_structural_candidates(&[c], &HashSet::new(), DateTime::now());
         assert!(cands.iter().any(|s| s.kind == "low_confidence"));
+    }
+
+    #[test]
+    fn missing_chunk_when_target_archived() {
+        // 引用 target 在 archived 集合里 → 应出 missing_chunk 而不是 broken_link
+        let cs = vec![chunk(
+            "源页",
+            Some("entity"),
+            vec![("archived_target_id", "references")],
+        )];
+        let mut archived = HashSet::new();
+        archived.insert("archived_target_id".to_string());
+        let cands = compute_structural_candidates(&cs, &archived, DateTime::now());
+        assert!(cands.iter().any(|c| c.kind == "missing_chunk"));
+        assert!(
+            !cands.iter().any(|c| c.kind == "broken_link"),
+            "目标在 archived 时不该再出 broken_link"
+        );
+    }
+
+    #[test]
+    fn suggestion_when_unverified_and_blocked_repeatedly() {
+        let mut c = chunk("常被拦的草稿", Some("entity"), vec![]);
+        c.integrity_status = Some("needs_review".to_string());
+        c.usage_stats = Some(crate::models::UsageStats {
+            hit_count_30d: 1,
+            blocked_count_30d: 5,
+            last_used_at: None,
+            last_blocked_reason: None,
+        });
+        let cands = compute_structural_candidates(&[c], &HashSet::new(), DateTime::now());
+        assert!(cands.iter().any(|s| s.kind == "suggestion"));
+
+        // 一旦 verified，suggestion 不应再出现
+        let mut c2 = chunk("常被拦的草稿", Some("entity"), vec![]);
+        c2.integrity_status = Some("verified".to_string());
+        c2.usage_stats = Some(crate::models::UsageStats {
+            hit_count_30d: 1,
+            blocked_count_30d: 5,
+            last_used_at: None,
+            last_blocked_reason: None,
+        });
+        let cands2 = compute_structural_candidates(&[c2], &HashSet::new(), DateTime::now());
+        assert!(!cands2.iter().any(|s| s.kind == "suggestion"));
+    }
+
+    #[test]
+    fn contradiction_when_same_title_different_first_paragraph() {
+        // 同 normalize_title 多 chunk，body 首段哈希不一致 → contradiction
+        let mut a = chunk("产品价格策略", Some("methodology"), vec![]);
+        a.body = Some("策略一：阶梯价。\n\n详细说明……".to_string());
+        let mut b = chunk("产品价格策略", Some("methodology"), vec![]);
+        b.body = Some("策略二：固定价。\n\n详细说明……".to_string());
+        let cands = compute_structural_candidates(&[a, b], &HashSet::new(), DateTime::now());
+        assert!(cands.iter().any(|s| s.kind == "contradiction"));
+
+        // 同 normalize_title 多 chunk 但首段一致 → 不出 contradiction
+        let mut x = chunk("产品价格策略", Some("methodology"), vec![]);
+        x.body = Some("策略一：阶梯价。\n\n详细说明……".to_string());
+        let mut y = chunk("产品价格策略", Some("methodology"), vec![]);
+        y.body = Some("策略一：阶梯价。\n\n另一段补充。".to_string());
+        let cands2 = compute_structural_candidates(&[x, y], &HashSet::new(), DateTime::now());
+        assert!(!cands2.iter().any(|s| s.kind == "contradiction"));
+    }
+
+    #[test]
+    fn first_paragraph_splits_on_double_newline_and_trims() {
+        assert_eq!(first_paragraph("hello\n\nworld"), "hello");
+        assert_eq!(first_paragraph("only one"), "only one");
+        assert_eq!(first_paragraph("  leading\n\nrest"), "leading");
+        assert_eq!(first_paragraph(""), "");
+    }
+
+    #[test]
+    fn sha256_hex_is_64_chars_lowercase() {
+        let h = sha256_hex("hello");
+        assert_eq!(h.len(), 64);
+        assert!(h.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+        // 同输入哈希一致
+        assert_eq!(sha256_hex("hello"), sha256_hex("hello"));
+        // 不同输入哈希不同
+        assert_ne!(sha256_hex("hello"), sha256_hex("hello world"));
     }
 
     #[test]
