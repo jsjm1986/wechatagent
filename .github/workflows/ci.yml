@@ -47,3 +47,18 @@ jobs:
           else
             bash scripts/check-no-human-takeover.sh "${BASE_REF}" "HEAD"
           fi
+
+      - name: scripts/check-no-model-hint.sh (literal lint)
+        shell: bash
+        env:
+          BASE_REF: ${{ github.event.pull_request.base.ref || 'HEAD~1' }}
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            bash scripts/check-no-model-hint.sh "origin/${BASE_REF}" "HEAD"
+          else
+            bash scripts/check-no-model-hint.sh "${BASE_REF}" "HEAD"
+          fi
+
+      - name: scripts/check-evolution-isolation.sh (R1.6 / R8.4 / R9.4)
+        shell: bash
+        run: bash scripts/check-evolution-isolation.sh
