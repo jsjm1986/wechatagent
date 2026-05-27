@@ -18,6 +18,7 @@ use crate::{
 };
 
 mod accounts;
+mod admin_ops_versions;
 mod admin_outbox;
 mod admin_taxonomies;
 mod admin_taxonomy_candidates;
@@ -50,6 +51,13 @@ pub use outcomes_autonomy::{
 pub use shared::upsert_contact_from_value;
 
 use accounts::{list_accounts, sync_accounts, update_account_mcp_key};
+use admin_ops_versions::{
+    publish_operation_domain_version, publish_operation_state_policy_version,
+    publish_taxonomy_version, rollback_operation_domain_version,
+    rollback_operation_state_policy_version, rollback_taxonomy_version,
+    rollout_operation_domain_version, rollout_operation_state_policy_version,
+    rollout_taxonomy_version,
+};
 use admin_outbox::{cancel_outbox, list_outbox};
 use admin_taxonomies::{
     create_taxonomy, delete_taxonomy, list_taxonomies, patch_taxonomy,
@@ -549,6 +557,45 @@ pub fn api_router(state: AppState) -> Router<AppState> {
         .route(
             "/admin/taxonomy-candidates/:id/reject",
             post(reject_taxonomy_candidate),
+        )
+        // ── Phase E / E5-T1：ops 三表多版本灰度 admin 路由 ──────────────────────
+        // 同一套 publish/rollout/rollback 三动作分别覆盖
+        // operation_domain_configs / operation_state_policies / system_taxonomies。
+        .route(
+            "/admin/operation-domains/:id/publish",
+            post(publish_operation_domain_version),
+        )
+        .route(
+            "/admin/operation-domains/:id/rollout",
+            post(rollout_operation_domain_version),
+        )
+        .route(
+            "/admin/operation-domains/:id/rollback",
+            post(rollback_operation_domain_version),
+        )
+        .route(
+            "/admin/operation-state-policies/:id/publish",
+            post(publish_operation_state_policy_version),
+        )
+        .route(
+            "/admin/operation-state-policies/:id/rollout",
+            post(rollout_operation_state_policy_version),
+        )
+        .route(
+            "/admin/operation-state-policies/:id/rollback",
+            post(rollback_operation_state_policy_version),
+        )
+        .route(
+            "/admin/taxonomies/:id/publish",
+            post(publish_taxonomy_version),
+        )
+        .route(
+            "/admin/taxonomies/:id/rollout",
+            post(rollout_taxonomy_version),
+        )
+        .route(
+            "/admin/taxonomies/:id/rollback",
+            post(rollback_taxonomy_version),
         )
         // ── agent-autonomy-loop W4 / Task 5.6：outbox admin 路由 ─────────────
         .route("/admin/outbox", get(list_outbox))

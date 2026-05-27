@@ -33,6 +33,10 @@ fn empty_state_machine_config() -> OperationDomainConfig {
         state_machine: doc! {},
         status: "active".to_string(),
         updated_at: DateTime::now(),
+        version: 1,
+        current_version: true,
+        previous_version: None,
+        seeded_by: None,
     }
 }
 
@@ -59,6 +63,10 @@ fn minimal_state_machine_config() -> OperationDomainConfig {
         state_machine: doc! { "states": states },
         status: "active".to_string(),
         updated_at: DateTime::now(),
+        version: 1,
+        current_version: true,
+        previous_version: None,
+        seeded_by: None,
     }
 }
 
