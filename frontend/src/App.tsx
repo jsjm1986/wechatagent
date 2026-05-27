@@ -317,6 +317,45 @@ type OperationDomainConfig = {
   stateMachine: Record<string, unknown>;
   status: string;
   updatedAt?: string;
+  // Phase E / E5-T1：active_versions 灰度字段。后端在 m015 之后保证非空。
+  version?: number;
+  currentVersion?: boolean;
+  previousVersion?: number | null;
+  seededBy?: string | null;
+};
+
+// Phase E / E5-T1：operation_state_policies / system_taxonomies 同款灰度元数据，
+// 抽出公共 type 给三个 admin 面板复用。
+type ActiveVersionMeta = {
+  id: string;
+  version?: number;
+  currentVersion?: boolean;
+  previousVersion?: number | null;
+  seededBy?: string | null;
+  updatedAt?: string;
+};
+
+type OperationStatePolicyEntry = ActiveVersionMeta & {
+  workspaceId?: string;
+  domain: string;
+  stateKey: string;
+  allowed: string[];
+  forbidden: string[];
+  recommendedPace?: string | null;
+  status: string;
+};
+
+type TaxonomyEntry = ActiveVersionMeta & {
+  scope: string;
+  kind: string;
+  value: {
+    id: string;
+    label: string;
+    displayName?: string;
+    description?: string;
+    aliases?: string[];
+    status: string;
+  };
 };
 
 type OperationDomainDraft = {
@@ -1486,6 +1525,7 @@ export function App() {
                     onDraft={(draft) => setDomainDrafts({ ...domainDrafts, user_operations: draft })}
                     onReset={() => void resetOperationDomain("user_operations")}
                     onSave={() => void saveOperationDomain("user_operations")}
+                    onAfterVersionAction={() => loadAll()}
                   />
                 )}
 
@@ -2781,6 +2821,122 @@ function ContentAssetsView({
   );
 }
 
+// Phase E / E5-T1：ops 三表多版本灰度元数据徽章 + publish/rollout/rollback 三动作。
+//
+// 同一组件复用于 operation_domain_configs / operation_state_policies / system_taxonomies
+// 三个面板，所以只接收 ActiveVersionMeta 与 endpoint 前缀，不耦合资源 schema。
+//
+// `previousVersion` 不为 null 时渲染 "v3 ← v2" 回滚链；`seededBy` 显示写入来源徽章
+// （manual / system / legacy_migration）。`canPublish` 由调用方决定（admin 操作员
+// 是否手上有未发布草稿），canRollback 受 previousVersion 是否存在管控。
+function ActiveVersionsBar({
+  meta,
+  endpointPrefix,
+  resourceLabel,
+  busy,
+  canPublish = false,
+  onAfterAction
+}: {
+  meta: ActiveVersionMeta | undefined;
+  endpointPrefix: string;
+  resourceLabel: string;
+  busy: boolean;
+  canPublish?: boolean;
+  onAfterAction?: () => void | Promise<void>;
+}) {
+  const [actionBusy, setActionBusy] = useState(false);
+  if (!meta || !meta.id) {
+    return null;
+  }
+  const version = meta.version ?? 1;
+  const isCurrent = meta.currentVersion !== false;
+  const previousVersion = meta.previousVersion ?? null;
+  const seededBy = meta.seededBy ?? null;
+
+  async function runAction(action: "publish" | "rollout" | "rollback") {
+    if (!meta || !meta.id) return;
+    const confirmText =
+      action === "publish"
+        ? `确认发布 ${resourceLabel} 新版本（version=${version + 1}）？`
+        : action === "rollout"
+        ? `确认把 ${resourceLabel} v${version} 设为当前生效版本？`
+        : `确认回滚 ${resourceLabel} 到上一版本（v${previousVersion ?? "?"}）？`;
+    if (!window.confirm(confirmText)) return;
+    setActionBusy(true);
+    try {
+      await api.post(`${endpointPrefix}/${meta.id}/${action}`, {});
+      if (onAfterAction) await onAfterAction();
+    } catch (error) {
+      window.alert(`${resourceLabel} ${action} 失败：${(error as Error).message}`);
+    } finally {
+      setActionBusy(false);
+    }
+  }
+
+  const disabled = busy || actionBusy;
+
+  return (
+    <div className="activeVersionsBar">
+      <div className="activeVersionsMeta">
+        <span className={`activeVersionsBadge ${isCurrent ? "current" : "shadow"}`}>
+          v{version}
+          {isCurrent ? " · current" : " · shadow"}
+        </span>
+        {previousVersion !== null && (
+          <span className="activeVersionsChain" title="previous_version 回滚链">
+            ← v{previousVersion}
+          </span>
+        )}
+        {seededBy && (
+          <span className={`activeVersionsSeeded seeded-${seededBy}`} title="写入来源">
+            {seededBy}
+          </span>
+        )}
+        {meta.updatedAt && (
+          <span className="activeVersionsTimestamp" title="updated_at">
+            {meta.updatedAt}
+          </span>
+        )}
+      </div>
+      <div className="activeVersionsActions">
+        {canPublish && (
+          <button
+            type="button"
+            className="secondary"
+            onClick={() => void runAction("publish")}
+            disabled={disabled}
+            title="基于当前 row 发布新版本（version+1，previous_version 自动写入）"
+          >
+            发布新版本
+          </button>
+        )}
+        {!isCurrent && (
+          <button
+            type="button"
+            className="secondary"
+            onClick={() => void runAction("rollout")}
+            disabled={disabled}
+            title="把这一版本切到当前生效（其他版本 soft demote）"
+          >
+            切到当前
+          </button>
+        )}
+        {previousVersion !== null && isCurrent && (
+          <button
+            type="button"
+            className="secondary"
+            onClick={() => void runAction("rollback")}
+            disabled={disabled}
+            title="把上一版本重新激活到当前生效"
+          >
+            回滚到 v{previousVersion}
+          </button>
+        )}
+      </div>
+    </div>
+  );
+}
+
 function DomainConfigEditor({
   busy,
   config,
@@ -2788,7 +2944,8 @@ function DomainConfigEditor({
   mode: _mode,
   onDraft,
   onReset,
-  onSave
+  onSave,
+  onAfterVersionAction
 }: {
   busy: boolean;
   config?: OperationDomainConfig;
@@ -2797,6 +2954,7 @@ function DomainConfigEditor({
   onDraft: (draft: OperationDomainDraft) => void;
   onReset: () => void;
   onSave: () => void;
+  onAfterVersionAction?: () => void | Promise<void>;
 }) {
   const runtimeParams = runtimeParametersFromText(draft.runtimeParameters);
   const states = stateMachineStates(draft.stateMachine);
@@ -2831,6 +2989,17 @@ function DomainConfigEditor({
           </button>
         </div>
       </div>
+
+      {config && (
+        <ActiveVersionsBar
+          meta={config}
+          endpointPrefix="/api/admin/operation-domains"
+          resourceLabel={`Domain ${config.domain}`}
+          busy={busy}
+          canPublish
+          onAfterAction={onAfterVersionAction}
+        />
+      )}
 
       <div className="settingsLayout">
         <section className="settingsSection">
@@ -3404,9 +3573,206 @@ function SystemStrategyView(props: {
         defaultAgentKind="management"
         title="系统总控 Prompt"
       />
+      <StatePolicyAdmin busy={props.busy} />
+      <TaxonomiesAdmin busy={props.busy} />
     </section>
   );
 }
+
+// Phase E / E5-T1：operation_state_policies 灰度面板（admin 只读列表 + 三动作）。
+function StatePolicyAdmin({ busy }: { busy: boolean }) {
+  const [items, setItems] = useState<OperationStatePolicyEntry[]>([]);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [includeAll, setIncludeAll] = useState(true);
+
+  async function reload() {
+    setLoading(true);
+    setError(null);
+    try {
+      const data = await api.get<{ items: OperationStatePolicyEntry[] }>(
+        `/api/admin/operation-state-policies?includeAllVersions=${includeAll}`
+      );
+      setItems(data.items ?? []);
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  useEffect(() => {
+    void reload();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [includeAll]);
+
+  return (
+    <section className="panel">
+      <div className="panelHead">
+        <div>
+          <span>State Policies</span>
+          <h2>状态机动作策略灰度</h2>
+        </div>
+        <div className="buttonRow">
+          <label className="inlineCheckbox">
+            <input
+              type="checkbox"
+              checked={includeAll}
+              onChange={(event) => setIncludeAll(event.target.checked)}
+            />
+            <span>显示历史版本</span>
+          </label>
+          <button type="button" className="secondary" onClick={() => void reload()} disabled={busy || loading}>
+            刷新
+          </button>
+        </div>
+      </div>
+      {error && <div className="inlineError">{error}</div>}
+      {!loading && items.length === 0 && <EmptyInline text="暂无状态策略" />}
+      <div className="versionedList">
+        {items.map((item) => (
+          <div key={item.id} className="versionedListItem">
+            <div className="versionedListHead">
+              <div>
+                <span className="versionedListScope">{item.domain}</span>
+                <h3>{item.stateKey}</h3>
+              </div>
+              <span className={`badge ${item.status === "active" ? "ok" : "degraded"}`}>{item.status}</span>
+            </div>
+            <ActiveVersionsBar
+              meta={item}
+              endpointPrefix="/api/admin/operation-state-policies"
+              resourceLabel={`State ${item.domain}/${item.stateKey}`}
+              busy={busy}
+              canPublish
+              onAfterAction={reload}
+            />
+            <div className="versionedListBody">
+              <div className="versionedListChunk">
+                <span>allowed</span>
+                <p>{item.allowed.join("，") || "—"}</p>
+              </div>
+              <div className="versionedListChunk">
+                <span>forbidden</span>
+                <p>{item.forbidden.join("，") || "—"}</p>
+              </div>
+              <div className="versionedListChunk">
+                <span>recommendedPace</span>
+                <p>{item.recommendedPace || "—"}</p>
+              </div>
+            </div>
+          </div>
+        ))}
+      </div>
+    </section>
+  );
+}
+
+// Phase E / E5-T1：system_taxonomies 灰度面板。
+function TaxonomiesAdmin({ busy }: { busy: boolean }) {
+  const [items, setItems] = useState<TaxonomyEntry[]>([]);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [includeAll, setIncludeAll] = useState(true);
+  const [includeDeprecated, setIncludeDeprecated] = useState(false);
+
+  async function reload() {
+    setLoading(true);
+    setError(null);
+    try {
+      const params = new URLSearchParams();
+      params.set("includeAllVersions", String(includeAll));
+      params.set("includeDeprecated", String(includeDeprecated));
+      const data = await api.get<{ items: TaxonomyEntry[] }>(
+        `/api/admin/taxonomies?${params.toString()}`
+      );
+      setItems(data.items ?? []);
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  useEffect(() => {
+    void reload();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [includeAll, includeDeprecated]);
+
+  return (
+    <section className="panel">
+      <div className="panelHead">
+        <div>
+          <span>Taxonomies</span>
+          <h2>双层标签字典灰度</h2>
+        </div>
+        <div className="buttonRow">
+          <label className="inlineCheckbox">
+            <input
+              type="checkbox"
+              checked={includeAll}
+              onChange={(event) => setIncludeAll(event.target.checked)}
+            />
+            <span>显示历史版本</span>
+          </label>
+          <label className="inlineCheckbox">
+            <input
+              type="checkbox"
+              checked={includeDeprecated}
+              onChange={(event) => setIncludeDeprecated(event.target.checked)}
+            />
+            <span>显示已废弃</span>
+          </label>
+          <button type="button" className="secondary" onClick={() => void reload()} disabled={busy || loading}>
+            刷新
+          </button>
+        </div>
+      </div>
+      {error && <div className="inlineError">{error}</div>}
+      {!loading && items.length === 0 && <EmptyInline text="暂无字典条目" />}
+      <div className="versionedList">
+        {items.map((item) => (
+          <div key={item.id} className="versionedListItem">
+            <div className="versionedListHead">
+              <div>
+                <span className="versionedListScope">{item.scope} · {item.kind}</span>
+                <h3>{item.value.label || item.value.id}</h3>
+              </div>
+              <span className={`badge ${item.value.status === "active" ? "ok" : "degraded"}`}>
+                {item.value.status}
+              </span>
+            </div>
+            <ActiveVersionsBar
+              meta={item}
+              endpointPrefix="/api/admin/taxonomies"
+              resourceLabel={`Taxonomy ${item.scope}/${item.kind}/${item.value.id}`}
+              busy={busy}
+              canPublish
+              onAfterAction={reload}
+            />
+            <div className="versionedListBody">
+              <div className="versionedListChunk">
+                <span>id</span>
+                <p>{item.value.id}</p>
+              </div>
+              <div className="versionedListChunk">
+                <span>aliases</span>
+                <p>{(item.value.aliases ?? []).join("，") || "—"}</p>
+              </div>
+              {item.value.description && (
+                <div className="versionedListChunk">
+                  <span>description</span>
+                  <p>{item.value.description}</p>
+                </div>
+              )}
+            </div>
+          </div>
+        ))}
+      </div>
+    </section>
+  );
+}
+
 
 function NextPhasePanel({ text, title }: { text: string; title: string }) {
   return (

@@ -4753,3 +4753,189 @@ td:nth-child(3) {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+
+/* ===== Phase E / E5-T1：active_versions 灰度面板样式 =====
+ * 为 ActiveVersionsBar / StatePolicyAdmin / TaxonomiesAdmin 三块新组件定义
+ * 企业白渠道一致的视觉。复用全局 token (--line / --radius / --ai 等)。
+ */
+
+.activeVersionsBar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  flex-wrap: wrap;
+  margin: 12px 0 14px;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  background: var(--surface-soft);
+}
+
+.activeVersionsMeta {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  font-size: 12px;
+}
+
+.activeVersionsBadge {
+  display: inline-flex;
+  align-items: center;
+  font-weight: 600;
+  font-size: 11.5px;
+  letter-spacing: 0.02em;
+  padding: 3px 8px;
+  border-radius: 999px;
+  border: 1px solid transparent;
+}
+
+.activeVersionsBadge.current {
+  background: var(--ai-soft);
+  color: var(--ai);
+  border-color: rgba(4, 116, 129, 0.25);
+}
+
+.activeVersionsBadge.shadow {
+  background: var(--surface-quiet);
+  color: var(--muted);
+  border-color: var(--line-strong);
+}
+
+.activeVersionsChain {
+  color: var(--muted);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11.5px;
+  padding: 2px 6px;
+  border-radius: 4px;
+  background: rgba(255, 255, 255, 0.7);
+  border: 1px dashed var(--line-strong);
+}
+
+.activeVersionsSeeded {
+  font-size: 11px;
+  font-weight: 500;
+  padding: 2px 7px;
+  border-radius: 4px;
+  border: 1px solid var(--line);
+  background: var(--surface);
+  color: var(--ink-soft);
+  text-transform: lowercase;
+  letter-spacing: 0.02em;
+}
+
+.activeVersionsSeeded.seeded-manual {
+  background: var(--accent-soft);
+  color: var(--accent-ink);
+  border-color: rgba(24, 73, 169, 0.25);
+}
+
+.activeVersionsSeeded.seeded-system {
+  background: var(--ai-soft);
+  color: var(--ai);
+  border-color: rgba(4, 116, 129, 0.2);
+}
+
+.activeVersionsSeeded.seeded-legacy_migration {
+  background: #fff7ed;
+  color: var(--warn);
+  border-color: rgba(181, 71, 8, 0.25);
+}
+
+.activeVersionsTimestamp {
+  color: var(--muted-soft);
+  font-size: 11px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+.activeVersionsActions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.activeVersionsActions button {
+  font-size: 12px;
+  padding: 5px 10px;
+}
+
+.inlineCheckbox {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--ink-soft);
+  cursor: pointer;
+  user-select: none;
+}
+
+.inlineCheckbox input[type="checkbox"] {
+  margin: 0;
+  cursor: pointer;
+}
+
+.inlineError {
+  margin: 8px 0;
+  padding: 8px 10px;
+  border: 1px solid rgba(180, 35, 24, 0.25);
+  background: var(--danger-soft);
+  color: var(--danger);
+  border-radius: var(--radius-sm);
+  font-size: 12px;
+}
+
+.versionedList {
+  display: grid;
+  gap: 12px;
+}
+
+.versionedListItem {
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--surface);
+  padding: 12px 14px;
+}
+
+.versionedListHead {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin-bottom: 6px;
+}
+
+.versionedListScope {
+  font-weight: 600;
+  font-size: 13px;
+  color: var(--ink);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+.versionedListBody {
+  display: grid;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--ink-soft);
+  border-top: 1px dashed var(--line);
+  padding-top: 8px;
+}
+
+.versionedListChunk {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: baseline;
+}
+
+.versionedListChunk strong {
+  color: var(--muted);
+  font-weight: 500;
+  font-size: 11.5px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  min-width: 90px;
+}
+
