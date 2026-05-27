@@ -134,6 +134,21 @@ pub struct AppConfig {
     pub catalog_rebuild_worker_interval_seconds: u64,
     /// knowledge-wiki Phase F：feedback worker tick 间隔秒数；0 表示停掉。默认 600（10 分钟）。
     pub knowledge_feedback_interval_seconds: u64,
+    /// Phase E / E2：reviewer 双脑并行开关。`true` 时 review_decision 会用第二
+    /// provider 并行跑一次评分；与主 reviewer 在 `approved` 或软闸命中上分歧
+    /// 即触发 single-shot revision，达到 epistemic diversity。`false`（默认）
+    /// 退回单 reviewer，行为与开关引入前完全一致。
+    pub reviewer_dual_enabled: bool,
+    /// 第二 reviewer provider 的 base_url；`reviewer_dual_enabled=true` 但本字段
+    /// 为空时启动序列拒绝（避免静默退化为单 reviewer）。
+    pub reviewer_second_provider_base_url: Option<String>,
+    /// 第二 reviewer provider 的 api_key。
+    pub reviewer_second_provider_api_key: Option<String>,
+    /// 第二 reviewer provider 的 model 名（如 `deepseek-chat` / `claude-3-5-haiku`）。
+    pub reviewer_second_provider_model: Option<String>,
+    /// 第二 reviewer provider 的协议形态：`openai`（默认，覆盖 OpenAI / DeepSeek /
+    /// 兼容路径）/ `anthropic`。与 [`crate::llm::LlmFormat`] 同集合。
+    pub reviewer_second_provider_format: String,
 }
 
 impl AppConfig {
@@ -278,6 +293,11 @@ impl AppConfig {
                 "600",
             )
             .parse()?,
+            reviewer_dual_enabled: parse_bool(&env_or("REVIEWER_DUAL_ENABLED", "false")),
+            reviewer_second_provider_base_url: env::var("REVIEWER_SECOND_PROVIDER_BASE_URL").ok(),
+            reviewer_second_provider_api_key: env::var("REVIEWER_SECOND_PROVIDER_API_KEY").ok(),
+            reviewer_second_provider_model: env::var("REVIEWER_SECOND_PROVIDER_MODEL").ok(),
+            reviewer_second_provider_format: env_or("REVIEWER_SECOND_PROVIDER_FORMAT", "openai"),
         })
     }
 }

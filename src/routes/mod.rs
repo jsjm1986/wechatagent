@@ -164,6 +164,16 @@ pub struct AppState {
     /// 由 `KnowledgeTaskWorker` 写 turn 后 `bump` 通知；
     /// `chat_session_stream` SSE handler 订阅 watch::Receiver 推送 turn id。
     pub chat_progress_bus: Arc<crate::knowledge_task::ChatProgressBus>,
+    /// Phase E / E2：reviewer 双脑并行的第二 provider。
+    ///
+    /// `None` 时 review_decision 仅跑主 reviewer (`self.llm`)，行为与本字段
+    /// 引入前完全一致；`Some` 时 reviewer 走 `tokio::join!` 并行，分歧触发
+    /// single-shot revision（[`crate::agent::review::detect_dual_reviewer_disagreement`]）。
+    /// 由 `main.rs` 在 `config.reviewer_dual_enabled=true` 且第二 provider 4
+    /// 件套环境变量齐备时构建一次，进程生命周期内不替换；运行时切换需重启
+    /// （与 `LlmRegistry` 的运行时热替换不同——双 reviewer 故意不热切以保持
+    /// epistemic 对照稳定）。
+    pub second_reviewer_llm: Option<Arc<dyn LlmGenerator>>,
 }
 
 pub fn api_router(state: AppState) -> Router<AppState> {

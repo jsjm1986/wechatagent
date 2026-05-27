@@ -721,6 +721,11 @@ mod tests {
             knowledge_task_worker_interval_seconds: 30,
             catalog_rebuild_worker_interval_seconds: 0,
             knowledge_feedback_interval_seconds: 0,
+            reviewer_dual_enabled: false,
+            reviewer_second_provider_base_url: None,
+            reviewer_second_provider_api_key: None,
+            reviewer_second_provider_model: None,
+            reviewer_second_provider_format: "openai".to_string(),
         }
     }
 }

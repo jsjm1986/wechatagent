@@ -66,6 +66,47 @@ async fn main() -> anyhow::Result<()> {
         },
     ));
     let llm: Arc<dyn LlmGenerator> = registry.clone();
+    // Phase E / E2：reviewer 双脑并行——`REVIEWER_DUAL_ENABLED=true` 且第二
+    // provider 4 件套 (BASE_URL/API_KEY/MODEL/FORMAT) 齐备时，构建独立 LlmClient
+    // 注入 AppState.second_reviewer_llm；review_decision 看到 Some 即并行调用。
+    // 缺件视为配置错误：拒绝启动，避免静默退化为单 reviewer。
+    let second_reviewer_llm: Option<Arc<dyn LlmGenerator>> = if config.reviewer_dual_enabled {
+        let base_url = config.reviewer_second_provider_base_url.as_ref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "REVIEWER_DUAL_ENABLED=true 但 REVIEWER_SECOND_PROVIDER_BASE_URL 未配置"
+            )
+        })?;
+        let api_key = config.reviewer_second_provider_api_key.as_ref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "REVIEWER_DUAL_ENABLED=true 但 REVIEWER_SECOND_PROVIDER_API_KEY 未配置"
+            )
+        })?;
+        let model = config.reviewer_second_provider_model.as_ref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "REVIEWER_DUAL_ENABLED=true 但 REVIEWER_SECOND_PROVIDER_MODEL 未配置"
+            )
+        })?;
+        let format = LlmFormat::parse(&config.reviewer_second_provider_format)?;
+        let client = LlmClient::with_format(
+            base_url.clone(),
+            api_key.clone(),
+            model.clone(),
+            format,
+            config.llm_timeout_seconds,
+            config.llm_max_retries,
+            config.llm_retry_base_ms,
+        )?;
+        let arc: Arc<dyn LlmGenerator> = Arc::new(client);
+        tracing::info!(
+            base_url = %base_url,
+            model = %model,
+            format = format.as_str(),
+            "reviewer dual mode enabled — second provider attached"
+        );
+        Some(arc)
+    } else {
+        None
+    };
     let state = AppState {
         db,
         mcp: McpClient::new(config.mcp_base_url.clone(), config.mcp_api_key.clone())?,
@@ -76,6 +117,7 @@ async fn main() -> anyhow::Result<()> {
         chat_progress_bus: std::sync::Arc::new(
             wechatagent::knowledge_task::ChatProgressBus::new(),
         ),
+        second_reviewer_llm,
     };
     prompts::ensure_prompt_pack_v2(
         &state.db,
