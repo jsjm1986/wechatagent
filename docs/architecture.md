@@ -336,9 +336,9 @@ external DeepSeek API
 - webhook 签名校验
 - 日志/指标采集
 
-## Phase 0 → E3 时代图（updated）
+## Phase 0 → E5-T1 时代图（updated）
 
-本节是 `## Webhook Flow` / `## Worker Flow` 之后的补丁——把 Phase 0 → E3 的实际链路落到一处。两份原图保留了"当前最小可运行链路"的语义；本节描绘的是 reaction / outbox / multi-account / multi-locale 全部接通后的真实形态。
+本节是 `## Webhook Flow` / `## Worker Flow` 之后的补丁——把 Phase 0 → E5-T1 的实际链路落到一处。两份原图保留了"当前最小可运行链路"的语义；本节描绘的是 reaction / outbox / multi-account / multi-locale / reviewer 双模 / ops 三表灰度全部接通后的真实形态。
 
 ### 私聊 Webhook Flow（全链路）
 
@@ -351,6 +351,9 @@ POST /webhooks/wechat
 → run_user_operation_gateway:
   1. reload 联系人 + 历史 + 三类 prompt（locale-aware：load_prompt_for_contact 按
      contact.locale 选 prompt_template 版本，未命中 fallback 到 zh-CN）
+     +（Phase E5-T1）operation_domain_configs / operation_state_policies / system_taxonomies
+       三表 active_versions 桶选：hash(contact_id) % active_count，同 contact 同桶稳定，
+       老库无 current_version 字段时 `$ne:false` / `$exists=false` 兜底
   2. enforce_decision_guards 三闸：grounding / hallucination / run_budget
      +（Phase B）双软闸：human_like / pressure_risk → 触发 single-shot revision
      +（Phase A）taxonomy::check_value 校验 customer_stage / intent_level / objection_type，
@@ -362,6 +365,8 @@ POST /webhooks/wechat
      +（Phase D）拼接 contact.intent_trajectory 近 5 项
      +（Phase A）注入 reaction_analysis 近 3 轮 + load_operator_memory
   4. decide_reply_with_promote → review_decision（reviewer 输入遮蔽 draft.reasoning）
+     +（Phase E2）REVIEWER_DUAL_MODEL_ENABLED=true 时 LlmProvider 双模并行 reviewer，
+       分歧（评分差≥阈值或 grounding/hallucination 决策不一致）触发 single-shot revision
   5. （Phase D）style_consistency_check：与 contact.last_outbound_style 比对，差异≥3/5 axes
      时强制 single-shot revision
   6. approved → agent_send_outbox enqueue（idempotency key）→ 二次安全门 → MCP message_send_text
@@ -387,7 +392,7 @@ tokio::spawn 主进程内 8 条 loop（启停由 env / mongo flag 控制）：
                                         （COLD_CONTACT_WORKER_ENABLED env 开关，默认 false）
 ```
 
-### Phase 0 → E3 新增 collection / 字段速查
+### Phase 0 → E5-T1 新增 collection / 字段速查
 
 | 范畴 | collection / 字段 | 来源 |
 | --- | --- | --- |
@@ -407,6 +412,8 @@ tokio::spawn 主进程内 8 条 loop（启停由 env / mongo flag 控制）：
 | 多账号 | `WechatAccount.{capacity, persona_tag, off_hours}` | Phase D |
 | 跨用户教训 | `lessons_learned` collection（pending_review → peer_case chunk 候选池） | Phase D |
 | 多 locale | `Contact.locale` + `PromptTemplate.locale`（BCP-47，默认 zh-CN） | Phase E3 |
+| LLM provider 抽象 | `trait LlmProvider` (`src/llm_provider.rs`) + reviewer 双模并行（`REVIEWER_DUAL_MODEL_ENABLED`） | Phase E2 |
+| ops 三表灰度 | `operation_domain_configs / operation_state_policies / system_taxonomies` 加 `version / current_version / previous_version / seeded_by`；`hash(contact_id) % active_count` 桶；`admin_ops_versions` 三动作 publish/rollout/rollback | Phase E5-T1 |
 
 ### 模块隔离红线（不变）
 
