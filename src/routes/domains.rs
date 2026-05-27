@@ -1,7 +1,7 @@
 //! 运营领域配置路由：领域目标、方法论与状态机。
 
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     Json,
 };
 use futures::TryStreamExt;
@@ -19,6 +19,16 @@ use crate::{
 };
 
 use super::AppState;
+
+/// Phase E / E5-T1：list 路径默认只返回 `current_version=true` 的 row，
+/// admin 灰度面板传 `?includeAllVersions=true` 拿到完整版本流水以渲染
+/// "v3 → v4 各 50%" 的桶分布与回滚链。老库无该字段时 `m015` 已 backfill。
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct ListOperationDomainsQuery {
+    #[serde(default)]
+    include_all_versions: bool,
+}
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -38,14 +48,23 @@ pub(super) struct OperationDomainRequest {
 
 pub(super) async fn list_operation_domains(
     State(state): State<AppState>,
+    Query(query): Query<ListOperationDomainsQuery>,
 ) -> AppResult<Json<Value>> {
     ensure_operation_domains(&state).await?;
+    // 默认只列 current_version=true；老 row（m015 之前）`current_version` 字段缺失，
+    // 用 `$ne: false` 兼容，让历史部署 import 后无须显式 publish 也能正常显示。
+    let mut filter = doc! { "workspace_id": &state.config.default_workspace_id };
+    if !query.include_all_versions {
+        filter.insert("current_version", doc! { "$ne": false });
+    }
     let mut cursor = state
         .db
         .operation_domain_configs()
         .find(
-            doc! { "workspace_id": &state.config.default_workspace_id },
-            FindOptions::builder().sort(doc! { "domain": 1 }).build(),
+            filter,
+            FindOptions::builder()
+                .sort(doc! { "domain": 1, "version": -1 })
+                .build(),
         )
         .await?;
     let mut items = Vec::new();
@@ -81,7 +100,11 @@ pub(super) async fn update_operation_domain(
         .update_one(
             doc! {
                 "workspace_id": &state.config.default_workspace_id,
-                "domain": &domain
+                "domain": &domain,
+                // Phase E / E5-T1：PATCH 只更新当前生效版本，避免在多版本灰度时
+                // 非确定性写到任意 row。`$ne: false` 让 m015 之前未 backfill 的
+                // 老 row（无 current_version 字段）继续被命中。
+                "current_version": { "$ne": false },
             },
             doc! {
                 "$set": {
@@ -128,7 +151,10 @@ pub(super) async fn update_operation_domain_state_machine(
         .update_one(
             doc! {
                 "workspace_id": &state.config.default_workspace_id,
-                "domain": &domain
+                "domain": &domain,
+                // Phase E / E5-T1：state-machine PATCH 与 update_operation_domain 同源，
+                // 只写当前 active 版本。
+                "current_version": { "$ne": false },
             },
             doc! {
                 "$set": {
@@ -186,7 +212,13 @@ pub(super) fn operation_domain_json(config: OperationDomainConfig) -> Value {
         "runtimeParameters": config.runtime_parameters,
         "stateMachine": config.state_machine,
         "status": config.status,
-        "updatedAt": crate::models::dt_to_string(config.updated_at)
+        "updatedAt": crate::models::dt_to_string(config.updated_at),
+        // Phase E / E5-T1：active_versions 灰度字段。前端在 OperationDomainSettings
+        // 面板渲染当前版本号 + previous_version 回滚链 + seededBy 写入来源徽章。
+        "version": config.version,
+        "currentVersion": config.current_version,
+        "previousVersion": config.previous_version,
+        "seededBy": config.seeded_by,
     })
 }
 
@@ -328,13 +360,28 @@ pub(super) async fn find_operation_domain(
     state: &AppState,
     domain: &str,
 ) -> AppResult<OperationDomainConfig> {
-    state
-        .db
-        .operation_domain_configs()
+    // Phase E / E5-T1：单条读路径优先取 `current_version=true`；m015 之前老库
+    // 没该字段时 fallback 到 `$exists=false` 行（与 runtime.rs:371 同形态）。
+    let coll = state.db.operation_domain_configs();
+    if let Some(active) = coll
         .find_one(
             doc! {
                 "workspace_id": &state.config.default_workspace_id,
-                "domain": domain
+                "domain": domain,
+                "current_version": true,
+            },
+            None,
+        )
+        .await?
+    {
+        return Ok(active);
+    }
+    coll
+        .find_one(
+            doc! {
+                "workspace_id": &state.config.default_workspace_id,
+                "domain": domain,
+                "current_version": { "$exists": false },
             },
             None,
         )

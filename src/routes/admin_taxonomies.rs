@@ -41,6 +41,10 @@ pub(super) struct ListTaxonomiesQuery {
     /// 默认 `false`：列表只返回 `value.status = "active"` 的条目。
     #[serde(default)]
     include_deprecated: bool,
+    /// Phase E / E5-T1：默认 `false` 时只列 `current_version=true` 的版本，
+    /// admin 灰度面板传 `true` 拿历史版本流水（用于 rollback / 回滚链 UI）。
+    #[serde(default)]
+    include_all_versions: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -90,6 +94,11 @@ pub(super) async fn list_taxonomies(
     if !query.include_deprecated {
         filter.insert("value.status", "active");
     }
+    if !query.include_all_versions {
+        // Phase E / E5-T1：默认只列当前生效版本；老 row（m015 之前）`current_version`
+        // 字段缺失，用 `$ne: false` 兼容。
+        filter.insert("current_version", doc! { "$ne": false });
+    }
 
     let mut cursor = state
         .db
@@ -97,7 +106,7 @@ pub(super) async fn list_taxonomies(
         .find(
             filter,
             FindOptions::builder()
-                .sort(doc! { "scope": 1, "kind": 1, "value.id": 1 })
+                .sort(doc! { "scope": 1, "kind": 1, "value.id": 1, "version": -1 })
                 .build(),
         )
         .await?;
@@ -267,7 +276,12 @@ pub(super) fn taxonomy_entry_json(entry: TaxonomyEntry) -> Value {
             "aliases": entry.value.aliases,
             "status": entry.value.status,
         },
-        "updatedAt": crate::models::dt_to_string(entry.updated_at)
+        "updatedAt": crate::models::dt_to_string(entry.updated_at),
+        // Phase E / E5-T1：active_versions 灰度字段。
+        "version": entry.version,
+        "currentVersion": entry.current_version,
+        "previousVersion": entry.previous_version,
+        "seededBy": entry.seeded_by,
     })
 }
 

@@ -20,6 +20,7 @@ use crate::{
 mod accounts;
 mod admin_ops_versions;
 mod admin_outbox;
+mod admin_state_policies;
 mod admin_taxonomies;
 mod admin_taxonomy_candidates;
 mod assets;
@@ -59,6 +60,7 @@ use admin_ops_versions::{
     rollout_taxonomy_version,
 };
 use admin_outbox::{cancel_outbox, list_outbox};
+use admin_state_policies::{get_operation_state_policy, list_operation_state_policies};
 use admin_taxonomies::{
     create_taxonomy, delete_taxonomy, list_taxonomies, patch_taxonomy,
 };
@@ -561,6 +563,16 @@ pub fn api_router(state: AppState) -> Router<AppState> {
         // ── Phase E / E5-T1：ops 三表多版本灰度 admin 路由 ──────────────────────
         // 同一套 publish/rollout/rollback 三动作分别覆盖
         // operation_domain_configs / operation_state_policies / system_taxonomies。
+        // state-policies 没有独立 CRUD（写路径走 publish），但前端面板需要列表 + 详情
+        // 来渲染 active_versions 流水与回滚链。
+        .route(
+            "/admin/operation-state-policies",
+            get(list_operation_state_policies),
+        )
+        .route(
+            "/admin/operation-state-policies/:id",
+            get(get_operation_state_policy),
+        )
         .route(
             "/admin/operation-domains/:id/publish",
             post(publish_operation_domain_version),
