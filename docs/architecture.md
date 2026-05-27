@@ -365,7 +365,7 @@ POST /webhooks/wechat
      +（Phase D）拼接 contact.intent_trajectory 近 5 项
      +（Phase A）注入 reaction_analysis 近 3 轮 + load_operator_memory
   4. decide_reply_with_promote → review_decision（reviewer 输入遮蔽 draft.reasoning）
-     +（Phase E2）REVIEWER_DUAL_MODEL_ENABLED=true 时 LlmProvider 双模并行 reviewer，
+     +（Phase E2）REVIEWER_DUAL_ENABLED=true 时 LlmProvider 双模并行 reviewer，
        分歧（评分差≥阈值或 grounding/hallucination 决策不一致）触发 single-shot revision
   5. （Phase D）style_consistency_check：与 contact.last_outbound_style 比对，差异≥3/5 axes
      时强制 single-shot revision
@@ -412,7 +412,7 @@ tokio::spawn 主进程内 8 条 loop（启停由 env / mongo flag 控制）：
 | 多账号 | `WechatAccount.{capacity, persona_tag, off_hours}` | Phase D |
 | 跨用户教训 | `lessons_learned` collection（pending_review → peer_case chunk 候选池） | Phase D |
 | 多 locale | `Contact.locale` + `PromptTemplate.locale`（BCP-47，默认 zh-CN） | Phase E3 |
-| LLM provider 抽象 | `trait LlmProvider` (`src/llm_provider.rs`) + reviewer 双模并行（`REVIEWER_DUAL_MODEL_ENABLED`） | Phase E2 |
+| LLM provider 抽象 | `trait LlmProvider` (`src/llm_provider.rs`) + reviewer 双模并行（`REVIEWER_DUAL_ENABLED`） | Phase E2 |
 | ops 三表灰度 | `operation_domain_configs / operation_state_policies / system_taxonomies` 加 `version / current_version / previous_version / seeded_by`；`hash(contact_id) % active_count` 桶；`admin_ops_versions` 三动作 publish/rollout/rollback | Phase E5-T1 |
 
 ### 模块隔离红线（不变）
