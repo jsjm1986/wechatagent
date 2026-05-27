@@ -37,7 +37,7 @@ use crate::routes::AppState;
 use super::budget::{current_run_budget, RunBudget, RUN_BUDGET};
 use super::decision::{
     decide_reply_with_promote, load_operation_playbook_for_contact,
-    load_operation_state_policy, load_user_operation_domain_config,
+    load_operation_state_policy_for_contact, load_user_operation_domain_config_for_contact,
 };
 use super::guards::{
     classify_decision_action, enforce_state_action_policy, normalize_decision_runtime,
@@ -108,7 +108,9 @@ pub async fn send_contact_message_gateway(
         return Err(AppError::BadRequest("content is required".to_string()));
     }
     let content = request.content.trim().to_string();
-    let domain_config = load_user_operation_domain_config(state, &contact.workspace_id).await?;
+    let domain_config =
+        load_user_operation_domain_config_for_contact(state, &contact.workspace_id, &contact.wxid)
+            .await?;
     let mut runtime = UserRuntimeParameters::from_config(domain_config.as_ref(), state);
     // M4 W4 Task 5.1：通过 resolve_thresholds 把 threshold_overrides 的最新生效值
     // 写回 runtime，5 闸 block/rewrite 阈值即时反映 release。
@@ -349,7 +351,9 @@ pub(crate) async fn run_user_operation_gateway(
 ) -> AppResult<()> {
     let run_id = uuid::Uuid::new_v4().to_string();
     let inbound = trigger_message(&contact, &trigger);
-    let domain_config = load_user_operation_domain_config(state, &contact.workspace_id).await?;
+    let domain_config =
+        load_user_operation_domain_config_for_contact(state, &contact.workspace_id, &contact.wxid)
+            .await?;
     let mut runtime = UserRuntimeParameters::from_config(domain_config.as_ref(), state);
     // M4 W4 Task 5.1：通过 resolve_thresholds 把 threshold_overrides 的最新生效值
     // 写回 runtime，让 5 闸 block/rewrite 阈值即时反映 release，无需重启进程。
@@ -693,10 +697,11 @@ async fn run_user_operation_gateway_inner(
     // 老库无 `operation_state_policies` 行 → `enforce_state_action_policy(None, _)`
     // fallthrough（向前兼容）；该入口不会绕过 outbox / idempotency。
     if matches!(finalize_status, GatewayStatusFinal::Approved) {
-        let policy_opt = load_operation_state_policy(
+        let policy_opt = load_operation_state_policy_for_contact(
             state,
             &contact.workspace_id,
             final_decision.operation_state.as_deref().unwrap_or(""),
+            &contact.wxid,
         )
         .await?;
         let action = classify_decision_action(&final_decision);
@@ -2436,6 +2441,10 @@ mod tests {
                 status: status.to_string(),
             },
             updated_at: mongodb::bson::DateTime::now(),
+            version: 1,
+            current_version: true,
+            previous_version: None,
+            seeded_by: None,
         }
     }
 

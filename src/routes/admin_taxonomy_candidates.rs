@@ -182,6 +182,10 @@ pub(super) async fn approve_taxonomy_candidate(
             status: "active".to_string(),
         },
         updated_at: now,
+        version: 1,
+        current_version: true,
+        previous_version: None,
+        seeded_by: Some("manual".to_string()),
     };
 
     match state

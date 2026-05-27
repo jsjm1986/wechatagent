@@ -5055,7 +5055,8 @@ type KnowledgeWikiTab =
   | "review"
   | "tree"
   | "domainSchemas"
-  | "revisions";
+  | "revisions"
+  | "metrics";
 
 function KnowledgeWikiView() {
   const [tab, setTab] = useState<KnowledgeWikiTab>("ask");
@@ -5105,6 +5106,12 @@ function KnowledgeWikiView() {
         >
           编辑历史
         </button>
+        <button
+          className={tab === "metrics" ? "tab active" : "tab"}
+          onClick={() => setTab("metrics")}
+        >
+          指标
+        </button>
       </div>
       {tab === "ask" && <AskView />}
       {tab === "lint" && <LintView />}
@@ -5112,6 +5119,7 @@ function KnowledgeWikiView() {
       {tab === "tree" && <KnowledgeTreeView />}
       {tab === "domainSchemas" && <DomainSchemaTab />}
       {tab === "revisions" && <ChunkRevisionsDrawer />}
+      {tab === "metrics" && <MetricsTab />}
     </section>
   );
 }
@@ -5298,16 +5306,52 @@ interface AskResult {
 // AskView：把 /api/knowledge/ask 包装成"输入 → answer + cited 卡片 + tool_trace 时间线"。
 //
 // 设计要点：
-//   - 一次性 fetch 回包；agent 内部 ≤ 3 轮 LLM 由后端控制，前端只渲染最终结果
-//   - cited 卡片可折叠展开，展开后显示 source_quote 黄边引用块（与 Review 视图对齐）
-//   - tool_trace 折叠默认收起；展开后呈现 list_catalog → open_chunk → answer 三阶段时间线
+//   - 默认实时模式（streamMode）走 SSE: trace → trace → ... → answer → close；
+//     时间线渐进出现，运营可看到 agent 在哪一步、为什么没收敛
+//   - 浏览器无 EventSource 或显式关掉实时模式 → 走原一次性 fetch
+//   - cited 卡片折叠展开，展开后显示 source_quote 黄边引用块（与 Review 视图对齐）
+//   - tool_trace 实时模式默认展开（让运营看到进度）；非实时模式下默认收起
 function AskView() {
+  const supportsEventSource = typeof window !== "undefined" && typeof window.EventSource !== "undefined";
   const [query, setQuery] = useState("");
   const [pending, setPending] = useState(false);
   const [result, setResult] = useState<AskResult | null>(null);
+  const [liveTrace, setLiveTrace] = useState<AskToolTraceStep[]>([]);
   const [error, setError] = useState<string | null>(null);
+  const [streamMode, setStreamMode] = useState(supportsEventSource);
   const [showTrace, setShowTrace] = useState(false);
   const [openCited, setOpenCited] = useState<Set<string>>(new Set());
+  // E6：workspace 显式覆盖。空字符串 → 后端用 default_workspace_id；
+  // localStorage 持久化，方便多租户切换后保留选择。
+  const [workspaceId, setWorkspaceId] = useState<string>(() => {
+    if (typeof window === "undefined") return "";
+    return window.localStorage.getItem("knowledgeAsk.workspaceId") ?? "";
+  });
+  const esRef = useRef<EventSource | null>(null);
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    if (workspaceId) {
+      window.localStorage.setItem("knowledgeAsk.workspaceId", workspaceId);
+    } else {
+      window.localStorage.removeItem("knowledgeAsk.workspaceId");
+    }
+  }, [workspaceId]);
+
+  // 组件卸载/重新提交时关掉旧 EventSource，避免连接泄漏。
+  useEffect(() => () => {
+    esRef.current?.close();
+    esRef.current = null;
+  }, []);
+
+  function resetForSubmit() {
+    setError(null);
+    setResult(null);
+    setLiveTrace([]);
+    setOpenCited(new Set());
+    esRef.current?.close();
+    esRef.current = null;
+  }
 
   async function submit(e?: FormEvent<HTMLFormElement>) {
     e?.preventDefault();
@@ -5316,16 +5360,18 @@ function AskView() {
       setError("请输入问题。");
       return;
     }
+    if (streamMode && supportsEventSource) {
+      submitStream(q);
+      return;
+    }
     setPending(true);
-    setError(null);
-    setResult(null);
-    setOpenCited(new Set());
+    resetForSubmit();
     setShowTrace(false);
     try {
       const r = await fetch("/api/knowledge/ask", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ query: q }),
+        body: JSON.stringify(workspaceId ? { query: q, workspaceId } : { query: q }),
       });
       if (!r.ok) throw new Error(await r.text());
       const data = (await r.json()) as AskResult;
@@ -5335,6 +5381,63 @@ function AskView() {
     } finally {
       setPending(false);
     }
+  }
+
+  // 实时路径：EventSource 监听 trace / answer / error / close 四类事件。
+  // 后端 ask_knowledge_stream 的 event:trace data 直接是 payload JSON（含 tool 字段）。
+  function submitStream(q: string) {
+    setPending(true);
+    resetForSubmit();
+    setShowTrace(true);
+    const startedAt = Date.now();
+    const params = new URLSearchParams({ query: q });
+    if (workspaceId) params.set("workspaceId", workspaceId);
+    const url = `/api/knowledge/ask/stream?${params.toString()}`;
+    const es = new EventSource(url);
+    esRef.current = es;
+
+    es.addEventListener("trace", (ev) => {
+      try {
+        const payload = JSON.parse((ev as MessageEvent).data) as AskToolTraceStep;
+        setLiveTrace((prev) => [...prev, payload]);
+      } catch {
+        // 单帧坏 JSON 不致命，忽略后续依赖 close 兜底
+      }
+    });
+    es.addEventListener("answer", (ev) => {
+      try {
+        const data = JSON.parse((ev as MessageEvent).data) as Omit<AskResult, "tookMs"> & {
+          tookMs?: number;
+        };
+        setResult({ ...data, tookMs: data.tookMs ?? Date.now() - startedAt });
+      } catch (err) {
+        setError(err instanceof Error ? err.message : "解析 answer 帧失败");
+      }
+    });
+    es.addEventListener("error", () => {
+      // 浏览器在 close 后也会触发 error；只在还没拿到 answer 时报警，避免误报。
+      if (!result) {
+        setError("流式连接错误（请关闭实时模式或重试）");
+      }
+      es.close();
+      esRef.current = null;
+      setPending(false);
+    });
+    es.addEventListener("close", () => {
+      es.close();
+      esRef.current = null;
+      setPending(false);
+    });
+  }
+
+  // 用户中断：关闭 EventSource 即让后端 SSE body drop → 取消信号置位，
+  // agent 在下一个 cancel checkpoint 自行收尾并发出 cancelled answer 帧。
+  // 此处前端不等 answer 帧，直接把 pending 置 false，UI 立即解锁。
+  function cancelStream() {
+    esRef.current?.close();
+    esRef.current = null;
+    setPending(false);
+    setError(null);
   }
 
   function toggleCited(id: string) {
@@ -5355,6 +5458,13 @@ function AskView() {
     return m;
   }, [result]);
 
+  // 时间线源：实时模式跑过 trace 就用 liveTrace，否则用 result.toolTrace。
+  const traceSteps: AskToolTraceStep[] = result
+    ? streamMode && liveTrace.length > 0
+      ? liveTrace
+      : result.toolTrace
+    : liveTrace;
+
   return (
     <div className="wikiPanelBody">
       <form className="wikiAskForm" onSubmit={submit}>
@@ -5368,13 +5478,53 @@ function AskView() {
         />
         <div className="wikiAskActions">
           <span className="wikiHint">最多 3 轮工具调用；超过预算自动收尾。</span>
+          <label className="wikiAskWsField">
+            workspace
+            <input
+              type="text"
+              value={workspaceId}
+              onChange={(e) => setWorkspaceId(e.target.value)}
+              placeholder="default"
+              disabled={pending}
+            />
+          </label>
+          {supportsEventSource ? (
+            <label className="wikiAskModeToggle">
+              <input
+                type="checkbox"
+                checked={streamMode}
+                onChange={(e) => setStreamMode(e.target.checked)}
+                disabled={pending}
+              />
+              实时模式
+            </label>
+          ) : null}
           <button type="submit" className="primary" disabled={pending || !query.trim()}>
             <Sparkles size={14} />
             {pending ? "思考中…" : "提问"}
           </button>
+          {pending && streamMode ? (
+            <button
+              type="button"
+              className="wikiAskCancelBtn"
+              onClick={cancelStream}
+            >
+              中断
+            </button>
+          ) : null}
         </div>
       </form>
       {error ? <div className="wikiAlert error">{error}</div> : null}
+      {pending && streamMode && traceSteps.length > 0 ? (
+        <ol className="wikiToolTraceList">
+          {traceSteps.map((step, i) => (
+            <li key={i} className="wikiToolTraceStep wikiToolTraceStep--live">
+              <span className={`wikiToolTraceTool tool-${step.tool}`}>{step.tool}</span>
+              <code>{JSON.stringify(stripTool(step))}</code>
+            </li>
+          ))}
+        </ol>
+      ) : null}
       {result ? (
         <div className="wikiAskResult">
           <div className="wikiAskMeta">
@@ -5427,11 +5577,11 @@ function AskView() {
               onClick={() => setShowTrace((v) => !v)}
             >
               {showTrace ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
-              工具调用时间线（{result.toolTrace.length} 步）
+              工具调用时间线（{traceSteps.length} 步）
             </button>
             {showTrace ? (
               <ol className="wikiToolTraceList">
-                {result.toolTrace.map((step, i) => (
+                {traceSteps.map((step, i) => (
                   <li key={i} className="wikiToolTraceStep">
                     <span className={`wikiToolTraceTool tool-${step.tool}`}>{step.tool}</span>
                     <code>{JSON.stringify(stripTool(step))}</code>
@@ -5450,6 +5600,91 @@ function stripTool(step: AskToolTraceStep): Record<string, unknown> {
   const { tool: _tool, ...rest } = step;
   void _tool;
   return rest;
+}
+
+// MetricsTab：进程级 knowledge agent 指标透出。当前只显示 answer cache
+// 命中率，后续可扩展。
+//
+// E5：拉 /api/knowledge/metrics → 渲染 cache hits / misses / entries / TTL。
+// 5 秒手动刷新一次（不做 SSE，避免 EventSource 资源滥用）。
+function MetricsTab() {
+  const [data, setData] = useState<{ answerCache?: AnswerCacheMetrics } | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  async function refresh() {
+    setLoading(true);
+    setError(null);
+    try {
+      const r = await fetch("/api/knowledge/metrics");
+      if (!r.ok) throw new Error(await r.text());
+      setData(await r.json());
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "加载指标失败");
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  useEffect(() => {
+    refresh();
+  }, []);
+
+  const cache = data?.answerCache;
+  const total = cache ? cache.hits + cache.misses : 0;
+  const hitRate = total > 0 ? ((cache!.hits / total) * 100).toFixed(1) : "—";
+
+  return (
+    <div className="wikiPanelBody">
+      <div className="wikiMetricsHead">
+        <div className="wikiMetricsTitle">Answer Cache</div>
+        <button type="button" className="wikiMetricsRefresh" onClick={refresh} disabled={loading}>
+          {loading ? "刷新中…" : "刷新"}
+        </button>
+      </div>
+      {error ? <div className="wikiAlert error">{error}</div> : null}
+      {cache ? (
+        <div className="wikiMetricsGrid">
+          <div className="wikiMetricCard">
+            <div className="wikiMetricLabel">命中</div>
+            <div className="wikiMetricValue">{cache.hits}</div>
+          </div>
+          <div className="wikiMetricCard">
+            <div className="wikiMetricLabel">未命中</div>
+            <div className="wikiMetricValue">{cache.misses}</div>
+          </div>
+          <div className="wikiMetricCard">
+            <div className="wikiMetricLabel">命中率</div>
+            <div className="wikiMetricValue">{hitRate}%</div>
+          </div>
+          <div className="wikiMetricCard">
+            <div className="wikiMetricLabel">条目</div>
+            <div className="wikiMetricValue">
+              {cache.entries}
+              <span className="wikiMetricSub"> / {cache.maxEntries}</span>
+            </div>
+          </div>
+          <div className="wikiMetricCard">
+            <div className="wikiMetricLabel">TTL</div>
+            <div className="wikiMetricValue">
+              {cache.ttlSeconds}
+              <span className="wikiMetricSub"> 秒</span>
+            </div>
+          </div>
+        </div>
+      ) : !loading && !error ? (
+        <div className="wikiHint">暂无指标数据。</div>
+      ) : null}
+    </div>
+  );
+}
+
+interface AnswerCacheMetrics {
+  entries: number;
+  hits: number;
+  misses: number;
+  maxEntries: number;
+  ttlSeconds: number;
 }
 
 // LintView：8 类 kind 树 + signal 列表 + 处置三按钮。替代旧 GapSignalsTab。

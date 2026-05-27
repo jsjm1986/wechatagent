@@ -763,8 +763,12 @@ pub async fn consolidate_contact_memory(
 ) -> AppResult<()> {
     // 波 C3：从 OperationDomainConfig.runtime_parameters 读 run_token_budget /
     // run_max_llm_calls，避免硬编码 60000/4 让运营策略页的预算控件形同虚设。
-    let domain_config =
-        super::decision::load_user_operation_domain_config(state, &contact.workspace_id).await?;
+    let domain_config = super::decision::load_user_operation_domain_config_for_contact(
+        state,
+        &contact.workspace_id,
+        &contact.wxid,
+    )
+    .await?;
     let runtime = super::runtime::UserRuntimeParameters::from_config(domain_config.as_ref(), state);
     let run_id = uuid::Uuid::new_v4().to_string();
     let budget = std::sync::Arc::new(RunBudget::new(

@@ -40,6 +40,7 @@ mod m011_drop_legacy_sales_collections;
 mod m012_drop_legacy_taxonomy_seed;
 mod m013_seed_user_operation_state_policies;
 mod m014_drop_trigger_keywords;
+mod m015_ops_tables_active_versions;
 
 type MigrationFuture<'a> = Pin<Box<dyn Future<Output = AppResult<()>> + Send + 'a>>;
 pub type MigrationFn = for<'a> fn(&'a Database) -> MigrationFuture<'a>;
@@ -107,6 +108,10 @@ pub const MIGRATIONS: &[Migration] = &[
     Migration {
         id: "2026_05_W4_002_drop_trigger_keywords",
         run: |db| Box::pin(m014_drop_trigger_keywords::run_step(db)),
+    },
+    Migration {
+        id: "2026_05_W4_003_ops_tables_active_versions",
+        run: |db| Box::pin(m015_ops_tables_active_versions::run_step(db)),
     },
 ];
 

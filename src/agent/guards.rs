@@ -242,6 +242,10 @@ mod policy_tests {
             recommended_pace: None,
             status: "active".to_string(),
             updated_at: DateTime::now(),
+            version: 1,
+            current_version: true,
+            previous_version: None,
+            seeded_by: None,
         }
     }
 

@@ -325,8 +325,9 @@ pub async fn resolve_thresholds(
     contact: &Contact,
 ) -> AppResult<ResolvedThresholds> {
     // 步骤 1：构造 baseline（contact 维度运行时参数 + AppConfig PlannerBlockRate 默认）。
-    let domain_config = load_user_operation_domain_config_for_resolve(state, &contact.workspace_id)
-        .await?;
+    let domain_config =
+        load_user_operation_domain_config_for_resolve(state, &contact.workspace_id, &contact.wxid)
+            .await?;
     let runtime = UserRuntimeParameters::from_config(domain_config.as_ref(), state);
     let mut resolved = ResolvedThresholds::baseline(
         &runtime,
@@ -362,25 +363,50 @@ pub async fn resolve_thresholds(
     Ok(resolved)
 }
 
-/// 内部 helper：避免与 `agent::decision::load_user_operation_domain_config`
+/// 内部 helper：避免与 `agent::decision::load_user_operation_domain_config_for_contact`
 /// 形成循环依赖（runtime.rs 不应反向依赖 decision.rs 的 pub(crate) 函数）。
-/// 行为与之等价：按 `(workspace_id, domain="user_operations")` 取一条。
+/// 行为与之等价：按 `(workspace_id, domain="user_operations", current_version=true)`
+/// 列取 active 集合，多条时按 `ab_bucket_for_contact(contact_id, n)` 哈希分桶；
+/// 0 条时退回 `current_version: { $exists: false }` 老形态以兼容 m015 之前的库。
 async fn load_user_operation_domain_config_for_resolve(
     state: &AppState,
     workspace_id: &str,
+    contact_id: &str,
 ) -> AppResult<Option<OperationDomainConfig>> {
-    state
-        .db
-        .operation_domain_configs()
-        .find_one(
+    use futures::TryStreamExt;
+    let coll = state.db.operation_domain_configs();
+    let mut active: Vec<OperationDomainConfig> = coll
+        .find(
             doc! {
                 "workspace_id": workspace_id,
                 "domain": "user_operations",
+                "current_version": true,
             },
             None,
         )
         .await
-        .map_err(crate::error::AppError::from)
+        .map_err(crate::error::AppError::from)?
+        .try_collect()
+        .await
+        .map_err(crate::error::AppError::from)?;
+    if active.is_empty() {
+        return coll
+            .find_one(
+                doc! {
+                    "workspace_id": workspace_id,
+                    "domain": "user_operations",
+                    "current_version": { "$exists": false },
+                },
+                None,
+            )
+            .await
+            .map_err(crate::error::AppError::from);
+    }
+    if active.len() == 1 {
+        return Ok(Some(active.remove(0)));
+    }
+    let bucket = crate::prompts::ab_bucket_for_contact(contact_id, active.len());
+    Ok(Some(active.swap_remove(bucket)))
 }
 
 #[cfg(test)]
@@ -405,6 +431,10 @@ mod tests {
             state_machine: Document::new(),
             status: "active".into(),
             updated_at: BsonDt::now(),
+            version: 1,
+            current_version: true,
+            previous_version: None,
+            seeded_by: None,
         }
     }
 

@@ -13,12 +13,15 @@
 //!   保持 agent 子模块对运营网关零耦合，可独立给 `/api/knowledge/ask` 用。
 
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 use futures::TryStreamExt;
-use mongodb::bson::{doc, oid::ObjectId, to_bson, Document};
+use mongodb::bson::{doc, oid::ObjectId, to_bson, Bson, Document};
 use mongodb::options::FindOptions;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use tokio::sync::mpsc::UnboundedSender;
 
 use crate::error::AppResult;
 use crate::models::OperationKnowledgeChunk;
@@ -26,6 +29,9 @@ use crate::routes::AppState;
 
 use super::budget::current_run_budget;
 use super::generate_agent_json;
+
+mod cache;
+pub use cache::{cache_stats, AnswerCacheStats};
 
 /// 单轮探索的硬上限：3 轮 LLM 决策（catalog → open / follow → answer）。
 /// 第 4 轮直接强制 answer；与 [`super::RunBudget::max_llm_calls`] 互不替代——
@@ -39,6 +45,8 @@ const CATALOG_PAGE_SIZE: usize = 30;
 const OPEN_CHUNK_BATCH: usize = 8;
 
 /// `follow_relations` 单跳/双跳最大展开数量。
+/// 取 [`CATALOG_PAGE_SIZE`] / 2：单次跳跃顶多占 catalog 半席，避免 follow_relations
+/// 把 catalog 挤爆，让后续 list_catalog 还能补进新 chunk。
 const FOLLOW_RELATIONS_LIMIT: usize = 16;
 
 /// `summary` 在 catalog 中的截断长度（按 char 数算，CJK 友好）。
@@ -133,6 +141,24 @@ pub struct AnswerResult {
     pub rounds_used: i32,
     /// true 表示 3 轮内未给出 answer，由兜底逻辑强制返回。
     pub truncated: bool,
+    /// true 表示客户端断开 / 显式取消，agent 提前退出循环。
+    /// 与 `truncated` 不互斥（cancel 触发的兜底也算 truncated）。
+    pub cancelled: bool,
+}
+
+/// SSE 流式接口的事件载荷。每个 `Step` 与 [`AnswerResult::tool_trace`] 中的一条
+/// Document 一一对应；`Final` 在 inner 跑完后发一次，携带最终聚合结果。
+///
+/// **为什么不直接传 `bson::Document`**：BSON Document 序列化会输出 ExtJson
+/// （`{"$numberInt":"3"}`），前端需要再二次桥接。这里直接走 `serde_json::Value`，
+/// 在 emit 点一次性 `into_relaxed_extjson()`，SSE 主循环只做 `serde_json::to_string`。
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum TraceEvent {
+    /// 一步工具调用：与 `tool_trace` 中的 Document 内容相同（已转 relaxed extjson）。
+    Step { payload: serde_json::Value },
+    /// 终态：携带最终 `AnswerResult`（不再有 step）。
+    Final { answer: AnswerResult },
 }
 
 /// LLM 在每一轮回包必须遵守的 action 协议。
@@ -189,6 +215,52 @@ const SYSTEM_PROMPT: &str = "你是运营知识库的 wiki 研究员。\n\
 /// 3. 收到 `answer` action 立即返回；
 /// 4. 超过 3 轮或 budget 用尽 → 用当前 opened 强制 answer，标 `truncated=true`。
 pub async fn answer(state: &AppState, req: AnswerRequest) -> AppResult<AnswerResult> {
+    answer_inner(state, req, None, None).await
+}
+
+/// 流式版本：每个 `tool_trace.push` 同步通过 `tx` 发出 [`TraceEvent::Step`]，跑完
+/// 再发一次 [`TraceEvent::Final`] 携带最终 [`AnswerResult`]。`tx` 在前端断开时
+/// `send` 静默失败，不影响主线 LLM 调用与 mongo I/O 完成度（写库、写日志照常）。
+///
+/// `cancel`：取消标志位。客户端断开时 SSE handler 把它 `store(true)`，agent 在
+/// 下次轮询前检测到 → push `cancelled` step + 走兜底路径返回（`cancelled=true`）。
+/// 取消是软取消：正在跑的 LLM call 不强 abort（避免连接池脏），但下一轮不会启动。
+///
+/// 与 [`answer`] 共用 [`answer_inner`] 主体，行为完全等价；本函数只是把 `tx` /
+/// `cancel` 包成 `Some` 注入。
+pub async fn answer_streaming(
+    state: &AppState,
+    req: AnswerRequest,
+    tx: UnboundedSender<TraceEvent>,
+    cancel: Option<Arc<AtomicBool>>,
+) -> AppResult<AnswerResult> {
+    let result = answer_inner(state, req, Some(&tx), cancel.as_ref()).await?;
+    let _ = tx.send(TraceEvent::Final {
+        answer: result.clone(),
+    });
+    Ok(result)
+}
+
+/// 把一条 trace doc 同时写进 `tool_trace` 与可选 `tx`。`tx` 走 relaxed extjson
+/// 桥接，前端拿到的就是纯 JSON（`3` 而不是 `{"$numberInt":"3"}`）。
+fn push_trace(
+    tool_trace: &mut Vec<Document>,
+    tx: Option<&UnboundedSender<TraceEvent>>,
+    entry: Document,
+) {
+    if let Some(tx) = tx {
+        let payload = Bson::Document(entry.clone()).into_relaxed_extjson();
+        let _ = tx.send(TraceEvent::Step { payload });
+    }
+    tool_trace.push(entry);
+}
+
+async fn answer_inner(
+    state: &AppState,
+    req: AnswerRequest,
+    tx: Option<&UnboundedSender<TraceEvent>>,
+    cancel: Option<&Arc<AtomicBool>>,
+) -> AppResult<AnswerResult> {
     let max_rounds = req
         .max_rounds
         .unwrap_or(MAX_ROUNDS)
@@ -199,11 +271,15 @@ pub async fn answer(state: &AppState, req: AnswerRequest) -> AppResult<AnswerRes
     let mut opened_seen: HashSet<String> = HashSet::new();
     let mut catalog =
         list_catalog(state, &req.workspace_id, req.account_id.as_deref(), &req.filter).await?;
-    tool_trace.push(doc! {
-        "tool": "list_catalog",
-        "filter": filter_to_doc(&req.filter),
-        "returned": catalog.len() as i32,
-    });
+    push_trace(
+        &mut tool_trace,
+        tx,
+        doc! {
+            "tool": "list_catalog",
+            "filter": filter_to_doc(&req.filter),
+            "returned": catalog.len() as i32,
+        },
+    );
 
     if catalog.is_empty() {
         return Ok(AnswerResult {
@@ -213,20 +289,77 @@ pub async fn answer(state: &AppState, req: AnswerRequest) -> AppResult<AnswerRes
             tool_trace,
             rounds_used: 0,
             truncated: false,
+            cancelled: false,
         });
     }
+
+    // E4：相同 query × 相同 corpus 签名（chunk 集合 + dynamic_confidence + related_count）
+    // 命中 → 跳过整个 LLM 循环。chunk 任一更新都会让 dynamic_confidence 变 → 签名变。
+    // 取消路径不查 cache（用户显式想重跑）。
+    let cache_key = if !is_cancelled(cancel) {
+        let sig_items: Vec<(String, i64)> = catalog
+            .iter()
+            .map(|e| {
+                let bits = e.dynamic_confidence.to_bits() as i64;
+                let mixed = bits ^ ((e.related_count as i64) << 8);
+                (e.chunk_id.clone(), mixed)
+            })
+            .collect();
+        let key = cache::CacheKey {
+            workspace_id: req.workspace_id.clone(),
+            account_id: req.account_id.clone(),
+            query_norm: cache::normalize_query(&req.query),
+            corpus_sig: cache::corpus_signature(&sig_items),
+            max_rounds,
+        };
+        if let Some(cached) = cache::get(&key) {
+            push_trace(
+                &mut tool_trace,
+                tx,
+                doc! {
+                    "tool": "cache_hit",
+                    "rounds": cached.rounds_used,
+                    "citedCount": cached.cited_chunk_ids.len() as i32,
+                },
+            );
+            let mut out = cached;
+            out.tool_trace = tool_trace;
+            return Ok(out);
+        }
+        Some(key)
+    } else {
+        None
+    };
 
     // last_completed_round：跟踪实际跑完了多少轮（含 budget_exceeded 提前 break /
     // invalid_action continue 的情况）。供兜底 / budget 提前退出时上报真实
     // rounds_used，避免前端误以为"用了 max_rounds 才放弃"。
     let mut last_completed_round: i32 = 0;
+    let mut cancelled = false;
     for round in 1..=max_rounds {
+        if is_cancelled(cancel) {
+            push_trace(
+                &mut tool_trace,
+                tx,
+                doc! {
+                    "tool": "cancelled",
+                    "round": round,
+                    "phase": "loop_top",
+                },
+            );
+            cancelled = true;
+            break;
+        }
         if let Some(budget) = current_run_budget() {
             if budget.is_exceeded() {
-                tool_trace.push(doc! {
-                    "tool": "budget_exceeded",
-                    "round": round,
-                });
+                push_trace(
+                    &mut tool_trace,
+                    tx,
+                    doc! {
+                        "tool": "budget_exceeded",
+                        "round": round,
+                    },
+                );
                 break;
             }
         }
@@ -244,15 +377,36 @@ pub async fn answer(state: &AppState, req: AnswerRequest) -> AppResult<AnswerRes
         )
         .await?;
 
+        // LLM 跑完后再查一次 cancel：客户端在这次 LLM call 期间断开的话，下一轮
+        // 不该再启动；当前轮的 mongo 副作用（写日志/usage）已在 generate_agent_json
+        // 内完成，不需要回滚。
+        if is_cancelled(cancel) {
+            push_trace(
+                &mut tool_trace,
+                tx,
+                doc! {
+                    "tool": "cancelled",
+                    "round": round,
+                    "phase": "post_llm",
+                },
+            );
+            cancelled = true;
+            break;
+        }
+
         let action = match serde_json::from_value::<AgentAction>(value.clone()) {
             Ok(action) => action,
             Err(err) => {
-                tool_trace.push(doc! {
-                    "tool": "error",
-                    "round": round,
-                    "reason": format!("invalid_action:{err}"),
-                    "raw": value.to_string(),
-                });
+                push_trace(
+                    &mut tool_trace,
+                    tx,
+                    doc! {
+                        "tool": "error",
+                        "round": round,
+                        "reason": format!("invalid_action:{err}"),
+                        "raw": value.to_string(),
+                    },
+                );
                 continue;
             }
         };
@@ -266,12 +420,16 @@ pub async fn answer(state: &AppState, req: AnswerRequest) -> AppResult<AnswerRes
                     &filter,
                 )
                 .await?;
-                tool_trace.push(doc! {
-                    "tool": "list_catalog",
-                    "round": round,
-                    "filter": filter_to_doc(&filter),
-                    "returned": catalog.len() as i32,
-                });
+                push_trace(
+                    &mut tool_trace,
+                    tx,
+                    doc! {
+                        "tool": "list_catalog",
+                        "round": round,
+                        "filter": filter_to_doc(&filter),
+                        "returned": catalog.len() as i32,
+                    },
+                );
             }
             AgentAction::OpenChunk { ids } => {
                 let mut opened_now: Vec<String> = Vec::new();
@@ -299,7 +457,7 @@ pub async fn answer(state: &AppState, req: AnswerRequest) -> AppResult<AnswerRes
                 if !not_found.is_empty() {
                     entry.insert("notFound", not_found);
                 }
-                tool_trace.push(entry);
+                push_trace(&mut tool_trace, tx, entry);
             }
             AgentAction::FollowRelations { chunk_id, depth } => {
                 let depth = depth.unwrap_or(1).clamp(1, 2);
@@ -313,13 +471,17 @@ pub async fn answer(state: &AppState, req: AnswerRequest) -> AppResult<AnswerRes
                 .await?;
                 let appended = entries.len() as i32;
                 merge_catalog(&mut catalog, entries);
-                tool_trace.push(doc! {
-                    "tool": "follow_relations",
-                    "round": round,
-                    "chunkId": chunk_id,
-                    "depth": depth as i32,
-                    "appended": appended,
-                });
+                push_trace(
+                    &mut tool_trace,
+                    tx,
+                    doc! {
+                        "tool": "follow_relations",
+                        "round": round,
+                        "chunkId": chunk_id,
+                        "depth": depth as i32,
+                        "appended": appended,
+                    },
+                );
             }
             AgentAction::Answer {
                 cited_chunk_ids,
@@ -328,45 +490,73 @@ pub async fn answer(state: &AppState, req: AnswerRequest) -> AppResult<AnswerRes
             } => {
                 let (cited, quotes) =
                     filter_answer_against_opened(&opened_seen, cited_chunk_ids, source_quotes);
-                tool_trace.push(doc! {
-                    "tool": "answer",
-                    "round": round,
-                    "citedCount": cited.len() as i32,
-                    "quoteCount": quotes.len() as i32,
-                });
-                return Ok(AnswerResult {
+                push_trace(
+                    &mut tool_trace,
+                    tx,
+                    doc! {
+                        "tool": "answer",
+                        "round": round,
+                        "citedCount": cited.len() as i32,
+                        "quoteCount": quotes.len() as i32,
+                    },
+                );
+                let result = AnswerResult {
                     answer,
                     cited_chunk_ids: cited,
                     source_quotes: quotes,
                     tool_trace,
                     rounds_used: round,
                     truncated: false,
-                });
+                    cancelled: false,
+                };
+                if let Some(k) = cache_key.clone() {
+                    cache::put(k, result.clone());
+                }
+                return Ok(result);
             }
         }
     }
 
     // 兜底：未在循环内 answer。可能原因：跑完 max_rounds、budget 提前 break、
-    // 多次 invalid_action 把轮数耗光。rounds_used 上报真实跑过的轮数（最低 0），
-    // 而不是 max_rounds，避免前端误读。
+    // 多次 invalid_action 把轮数耗光、客户端取消。rounds_used 上报真实跑过的轮数
+    //（最低 0），而不是 max_rounds，避免前端误读。
     let cited_chunk_ids: Vec<String> = opened
         .iter()
         .map(|c| c.chunk_id.clone())
         .collect();
-    tool_trace.push(doc! {
-        "tool": "answer",
-        "rounds": last_completed_round,
-        "truncated": true,
-        "citedCount": cited_chunk_ids.len() as i32,
-    });
+    push_trace(
+        &mut tool_trace,
+        tx,
+        doc! {
+            "tool": "answer",
+            "rounds": last_completed_round,
+            "truncated": true,
+            "cancelled": cancelled,
+            "citedCount": cited_chunk_ids.len() as i32,
+        },
+    );
+    let answer_text = if cancelled {
+        "取消：agent 已停止探索；返回当前已打开的 chunk 摘要。".to_string()
+    } else {
+        "知识库未在限定轮数内得出结论；已返回当前打开的 chunk 摘要供运营人员判断。".to_string()
+    };
     Ok(AnswerResult {
-        answer: "知识库未在限定轮数内得出结论；已返回当前打开的 chunk 摘要供运营人员判断。".to_string(),
+        answer: answer_text,
         cited_chunk_ids,
         source_quotes: Vec::new(),
         tool_trace,
         rounds_used: last_completed_round,
         truncated: true,
+        cancelled,
     })
+}
+
+/// `cancel.is_some_and(|c| c.load(Relaxed))` 的简短形式。`Relaxed` 足够：
+/// 取消是单向 false→true，跨任务延迟一两轮可接受（软取消语义）。
+fn is_cancelled(cancel: Option<&Arc<AtomicBool>>) -> bool {
+    cancel
+        .map(|c| c.load(Ordering::Relaxed))
+        .unwrap_or(false)
 }
 
 /// 列出 chunk 摘要（不含 body）。按 `dynamic_confidence` × `wiki_type` 优先级

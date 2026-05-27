@@ -4063,6 +4063,115 @@ td:nth-child(3) {
   justify-content: space-between;
   gap: 12px;
 }
+.knowledgeWiki .wikiAskModeToggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--ink-muted);
+  cursor: pointer;
+  user-select: none;
+}
+.knowledgeWiki .wikiAskModeToggle input {
+  margin: 0;
+  cursor: pointer;
+}
+.knowledgeWiki .wikiAskCancelBtn {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 6px 12px;
+  font-size: 12px;
+  color: var(--danger-ink, #b3261e);
+  background: var(--surface-elevated, #fff);
+  border: 1px solid var(--danger-border, #e7c4c2);
+  border-radius: 6px;
+  cursor: pointer;
+  transition: background 0.15s ease;
+}
+.knowledgeWiki .wikiAskCancelBtn:hover {
+  background: var(--danger-soft, #fbecea);
+}
+.knowledgeWiki .wikiAskWsField {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--ink-muted);
+}
+.knowledgeWiki .wikiAskWsField input {
+  width: 140px;
+  padding: 4px 8px;
+  font-size: 12px;
+  font-family: var(--font-mono, monospace);
+  border: 1px solid var(--border-subtle, #e1e5ea);
+  border-radius: 4px;
+  background: var(--surface-elevated, #fff);
+}
+.knowledgeWiki .wikiMetricsHead {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 6px 0 12px;
+}
+.knowledgeWiki .wikiMetricsTitle {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--ink-strong, #1a1f29);
+}
+.knowledgeWiki .wikiMetricsRefresh {
+  padding: 4px 12px;
+  font-size: 12px;
+  border: 1px solid var(--border-subtle, #e1e5ea);
+  border-radius: 4px;
+  background: var(--surface-elevated, #fff);
+  cursor: pointer;
+}
+.knowledgeWiki .wikiMetricsRefresh:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+.knowledgeWiki .wikiMetricsGrid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+  gap: 12px;
+}
+.knowledgeWiki .wikiMetricCard {
+  padding: 12px 14px;
+  background: var(--surface-elevated, #fff);
+  border: 1px solid var(--border-subtle, #e1e5ea);
+  border-radius: 6px;
+}
+.knowledgeWiki .wikiMetricLabel {
+  font-size: 11px;
+  color: var(--ink-muted);
+  margin-bottom: 4px;
+}
+.knowledgeWiki .wikiMetricValue {
+  font-size: 22px;
+  font-weight: 600;
+  color: var(--ink-strong, #1a1f29);
+  font-variant-numeric: tabular-nums;
+}
+.knowledgeWiki .wikiMetricSub {
+  font-size: 12px;
+  font-weight: 400;
+  color: var(--ink-muted);
+  margin-left: 4px;
+}
+.knowledgeWiki .wikiToolTraceStep--live {
+  animation: wikiToolTraceFadeIn 0.22s ease-out;
+}
+@keyframes wikiToolTraceFadeIn {
+  from {
+    opacity: 0;
+    transform: translateY(-2px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
 .knowledgeWiki .wikiAskResult {
   display: flex;
   flex-direction: column;

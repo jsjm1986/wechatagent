@@ -582,48 +582,119 @@ pub(crate) async fn load_user_operation_domain_config(
     state: &AppState,
     workspace_id: &str,
 ) -> AppResult<Option<OperationDomainConfig>> {
+    load_user_operation_domain_config_for_contact(state, workspace_id, "").await
+}
+
+/// Phase E5-T1：active_versions 灰度感知 loader。
+///
+/// 选择规则：
+///   1. 拉所有 `(workspace_id, domain="user_operations", current_version=true)` 行；
+///   2. 0 行 → 退回 `current_version: { $exists: false }` 的老形态（向前兼容老库）；
+///   3. 1 行 → 直接返回；
+///   4. ≥2 行 → 用 `prompts::ab_bucket_for_contact(contact_id, n)` 哈希挑一份；
+///      `contact_id` 为空字符串时退化为桶 0（admin / 模拟路径不分桶，稳定可重放）。
+///
+/// `(workspace_id, domain, current_version=true)` 部分索引由
+/// `db::indexes::ensure_ops_versioned_indexes` 创建，索引保命中。
+pub(crate) async fn load_user_operation_domain_config_for_contact(
+    state: &AppState,
+    workspace_id: &str,
+    contact_id: &str,
+) -> AppResult<Option<OperationDomainConfig>> {
+    use futures::TryStreamExt;
     use mongodb::bson::doc;
-    state
-        .db
-        .operation_domain_configs()
-        .find_one(
+    let coll = state.db.operation_domain_configs();
+    let mut active: Vec<OperationDomainConfig> = coll
+        .find(
             doc! {
                 "workspace_id": workspace_id,
-                "domain": "user_operations"
+                "domain": "user_operations",
+                "current_version": true,
             },
             None,
         )
         .await
-        .map_err(AppError::from)
+        .map_err(AppError::from)?
+        .try_collect()
+        .await
+        .map_err(AppError::from)?;
+    if active.is_empty() {
+        // 老库（pre-E5-T1，缺 current_version 字段）兜底；m015 backfill 后这条
+        // 路径不会再命中，仅做单次升级窗口的防御。
+        return coll
+            .find_one(
+                doc! {
+                    "workspace_id": workspace_id,
+                    "domain": "user_operations",
+                    "current_version": { "$exists": false },
+                },
+                None,
+            )
+            .await
+            .map_err(AppError::from);
+    }
+    if active.len() == 1 {
+        return Ok(Some(active.remove(0)));
+    }
+    let bucket = crate::prompts::ab_bucket_for_contact(contact_id, active.len());
+    Ok(Some(active.swap_remove(bucket)))
 }
 
 /// Phase B / B4：按 `(workspace_id, domain="user_operations", state_key)` 加载
 /// `operation_state_policies` 行。无行 / 老库无 collection / `state_key` 为空均
 /// 返回 `Ok(None)` —— 调用方 `enforce_state_action_policy(None, ...)` fallthrough，
 /// 向前兼容（老部署不被 Phase B 引入新边界破坏）。
-pub(crate) async fn load_operation_state_policy(
+///
+/// Phase E5-T1：与 [`load_user_operation_domain_config_for_contact`] 同形的
+/// active_versions 灰度感知 loader。`contact_id` 用于在多版本 active 集合上
+/// 哈希分桶；admin / 模拟路径可传空字符串，退化为桶 0 稳定可重放。
+pub(crate) async fn load_operation_state_policy_for_contact(
     state: &AppState,
     workspace_id: &str,
     state_key: &str,
+    contact_id: &str,
 ) -> AppResult<Option<crate::models::OperationStatePolicy>> {
+    use futures::TryStreamExt;
     use mongodb::bson::doc;
     let key = state_key.trim();
     if key.is_empty() {
         return Ok(None);
     }
-    state
-        .db
-        .operation_state_policies()
-        .find_one(
+    let coll = state.db.operation_state_policies();
+    let mut active: Vec<crate::models::OperationStatePolicy> = coll
+        .find(
             doc! {
                 "workspace_id": workspace_id,
                 "domain": "user_operations",
                 "state_key": key,
+                "current_version": true,
             },
             None,
         )
         .await
-        .map_err(AppError::from)
+        .map_err(AppError::from)?
+        .try_collect()
+        .await
+        .map_err(AppError::from)?;
+    if active.is_empty() {
+        return coll
+            .find_one(
+                doc! {
+                    "workspace_id": workspace_id,
+                    "domain": "user_operations",
+                    "state_key": key,
+                    "current_version": { "$exists": false },
+                },
+                None,
+            )
+            .await
+            .map_err(AppError::from);
+    }
+    if active.len() == 1 {
+        return Ok(Some(active.remove(0)));
+    }
+    let bucket = crate::prompts::ab_bucket_for_contact(contact_id, active.len());
+    Ok(Some(active.swap_remove(bucket)))
 }
 
 pub(crate) fn format_operation_domain_config_for_prompt(config: &OperationDomainConfig) -> String {

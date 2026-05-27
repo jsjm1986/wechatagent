@@ -436,6 +436,10 @@ mod tests {
             state_machine: doc! { "states": [{ "key": "need_discovery", "name": "需求探索", "allowedFrom": ["need_discovery"] }] },
             status: "active".to_string(),
             updated_at: DateTime::now(),
+            version: 1,
+            current_version: true,
+            previous_version: None,
+            seeded_by: None,
         };
         let mut decision = AgentDecision {
             operation_state: Some("需求探索".to_string()),
@@ -640,6 +644,10 @@ mod tests {
             state_machine: crate::prompts::default_user_operation_state_machine(),
             status: "active".to_string(),
             updated_at: DateTime::now(),
+            version: 1,
+            current_version: true,
+            previous_version: None,
+            seeded_by: None,
         }
     }
 

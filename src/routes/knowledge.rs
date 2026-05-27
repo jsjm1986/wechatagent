@@ -6881,6 +6881,183 @@ pub(super) async fn ask_knowledge(
     })))
 }
 
+// ── /api/knowledge/ask/stream: SSE 流式版 /api/knowledge/ask ──────────
+//
+// 浏览器 EventSource 仅支持 GET，所以参数走 query string；filter 用逗号分隔字符串。
+// 每个 tool_trace 步同步推 `event:trace`，跑完推 `event:answer`，最后 `event:close`。
+// 与 chat_session_stream:5562 同模式（`futures::stream::unfold` 包 receiver、零新依赖）。
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct KnowledgeAskStreamQuery {
+    query: String,
+    workspace_id: Option<String>,
+    account_id: Option<String>,
+    max_rounds: Option<i32>,
+    /// 逗号分隔，例如 `wikiTypes=methodology,thesis`。
+    wiki_types: Option<String>,
+    /// 同上：`businessTopics=价格异议,客户分级`。
+    business_topics: Option<String>,
+    status: Option<String>,
+}
+
+fn split_csv(raw: Option<&str>) -> Vec<String> {
+    raw.map(|s| {
+        s.split(',')
+            .map(|p| p.trim())
+            .filter(|p| !p.is_empty())
+            .map(str::to_string)
+            .collect()
+    })
+    .unwrap_or_default()
+}
+
+/// `GET /api/knowledge/ask/stream`：SSE 推送 [`agent::knowledge_agent::answer_streaming`]
+/// 的实时事件。事件类型：
+///   - `trace` —— 每一步工具调用（与 `tool_trace` 一一对应，纯 JSON）
+///   - `answer` —— 终态 `AnswerResult`（同 `/api/knowledge/ask` JSON 形态）
+///   - `close` —— 流结束信号；前端收到后应主动 `es.close()` 不再重连
+pub(super) async fn ask_knowledge_stream(
+    State(state): State<AppState>,
+    Query(req): Query<KnowledgeAskStreamQuery>,
+) -> AppResult<
+    axum::response::Sse<
+        impl futures::Stream<Item = Result<axum::response::sse::Event, std::convert::Infallible>>,
+    >,
+> {
+    use axum::response::sse::{Event, KeepAlive, Sse};
+
+    if req.query.trim().is_empty() {
+        return Err(AppError::BadRequest("query 不能为空".into()));
+    }
+    let workspace_id = req
+        .workspace_id
+        .clone()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| state.config.default_workspace_id.clone());
+    let account_id = req
+        .account_id
+        .clone()
+        .filter(|s| !s.trim().is_empty());
+    let agent_req = agent::knowledge_agent::AnswerRequest {
+        workspace_id,
+        account_id,
+        query: req.query.clone(),
+        filter: agent::knowledge_agent::CatalogFilter {
+            wiki_types: split_csv(req.wiki_types.as_deref()),
+            business_topics: split_csv(req.business_topics.as_deref()),
+            status: req.status,
+            include_unverified: false,
+        },
+        max_rounds: req.max_rounds,
+    };
+
+    // tx/rx 跨任务推 TraceEvent；tx 在 spawn 任务里 drop，rx 端走完就发 close。
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<agent::knowledge_agent::TraceEvent>();
+    // 取消句柄：客户端断开 → unfold state drop → CancelOnDrop::drop 翻 true →
+    // spawn 任务在下次轮询前检测到 → 兜底返回 cancelled=true。
+    let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let cancel_for_agent = cancel.clone();
+    let state_clone = state.clone();
+    tokio::spawn(async move {
+        // answer_streaming 末尾会发 TraceEvent::Final；error 路径只能 drop tx，
+        // 所以这里把 Err 转成一条 error 事件再发出去再退出。
+        if let Err(err) = agent::knowledge_agent::answer_streaming(
+            &state_clone,
+            agent_req,
+            tx.clone(),
+            Some(cancel_for_agent),
+        )
+        .await
+        {
+            let _ = tx.send(agent::knowledge_agent::TraceEvent::Step {
+                payload: json!({
+                    "tool": "error",
+                    "reason": format!("agent_error:{err}"),
+                }),
+            });
+        }
+        // tx 在此 drop（仅剩 spawn 任务持有；drop 后 rx.recv 会拿到 None）。
+    });
+
+    /// `unfold` 的 state 类型；Drop 时翻 cancel。axum 在 client 断开时 drop body
+    /// 流，body 流的 state 跟着 drop → 这里顺手把取消标志位 set 住。spawn 任务
+    /// 看到后会主动早退出。
+    struct CancelOnDrop {
+        rx: tokio::sync::mpsc::UnboundedReceiver<agent::knowledge_agent::TraceEvent>,
+        closed: bool,
+        cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+    impl Drop for CancelOnDrop {
+        fn drop(&mut self) {
+            self.cancel
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    let initial = CancelOnDrop {
+        rx,
+        closed: false,
+        cancel: cancel.clone(),
+    };
+    let stream = futures::stream::unfold(initial, |mut st| async move {
+        if st.closed {
+            return None;
+        }
+        match st.rx.recv().await {
+            Some(agent::knowledge_agent::TraceEvent::Step { payload }) => {
+                let data = payload.to_string();
+                Some((
+                    Ok::<_, std::convert::Infallible>(Event::default().event("trace").data(data)),
+                    st,
+                ))
+            }
+            Some(agent::knowledge_agent::TraceEvent::Final { answer }) => {
+                // 与 /api/knowledge/ask 的 JSON 形态对齐：tool_trace 走 relaxed extjson。
+                let tool_trace_json: Vec<Value> = answer
+                    .tool_trace
+                    .iter()
+                    .cloned()
+                    .map(|d| mongodb::bson::Bson::Document(d).into_relaxed_extjson())
+                    .collect();
+                let payload = json!({
+                    "answer": answer.answer,
+                    "citedChunkIds": answer.cited_chunk_ids,
+                    "sourceQuotes": answer.source_quotes.iter().map(|q| json!({
+                        "chunkId": q.chunk_id,
+                        "quote": q.quote,
+                        "sourceAnchorIndex": q.source_anchor_index,
+                    })).collect::<Vec<_>>(),
+                    "toolTrace": tool_trace_json,
+                    "roundsUsed": answer.rounds_used,
+                    "truncated": answer.truncated,
+                    "cancelled": answer.cancelled,
+                });
+                Some((Ok(Event::default().event("answer").data(payload.to_string())), st))
+            }
+            None => {
+                st.closed = true;
+                Some((Ok(Event::default().event("close").data("done")), st))
+            }
+        }
+    });
+
+    Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
+}
+
+/// Phase E / E5：knowledge agent 进程级指标。
+///
+/// 当前只透出 [`agent::knowledge_agent::cache_stats`]（answer cache 命中率 + TTL 配置）。
+/// 后续可在此聚合 budget 用尽次数 / cancel 比率等。返回 200 + JSON。
+pub(super) async fn knowledge_metrics(
+    State(_state): State<AppState>,
+) -> AppResult<axum::Json<serde_json::Value>> {
+    let cache = agent::knowledge_agent::cache_stats();
+    Ok(axum::Json(serde_json::json!({
+        "answerCache": cache,
+    })))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

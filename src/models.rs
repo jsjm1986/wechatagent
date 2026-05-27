@@ -373,6 +373,26 @@ pub struct OperationDomainConfig {
     pub state_machine: Document,
     pub status: String,
     pub updated_at: DateTime,
+    /// Phase E / E5-T1：多版本灰度。同 `(workspace_id, domain)` 下 `version` 单调递增；
+    /// `m015` 迁移把历史唯一一条 backfill 为 `version=1`。新版本由
+    /// `routes::operation_domains::publish_operation_domain_version` 写入并切换 current。
+    #[serde(default = "default_version_one")]
+    pub version: i32,
+    /// Phase E / E5-T1：当前生效版本标记。同 `(workspace_id, domain)` 下应至多有一条
+    /// `current_version=true`，由 publish 路径在切换时事务性保证；缺字段反序列化为 false，
+    /// 由迁移把历史唯一一条置 true。
+    #[serde(default)]
+    pub current_version: bool,
+    /// Phase E / E5-T1：被替换的上一版本号（rollback 时取回它）。首次 seed 为 None。
+    #[serde(default)]
+    pub previous_version: Option<i32>,
+    /// Phase E / E5-T1：写入来源（`"system"` / `"legacy_migration"` / `"manual"` 等）。
+    #[serde(default)]
+    pub seeded_by: Option<String>,
+}
+
+fn default_version_one() -> i32 {
+    1
 }
 
 /// Phase B / B4：`operation_state_policies` collection 行结构。
@@ -407,6 +427,20 @@ pub struct OperationStatePolicy {
     /// `"active" / "draft"`。仅 `active` 参与拦截。
     pub status: String,
     pub updated_at: DateTime,
+    /// Phase E / E5-T1：多版本灰度。同 `(workspace_id, domain, state_key)` 下 `version`
+    /// 单调递增；`m015` 迁移 backfill 为 1。新版本由 admin REST publish 写入并切换 current。
+    #[serde(default = "default_version_one")]
+    pub version: i32,
+    /// Phase E / E5-T1：当前生效版本标记。同 `(workspace_id, domain, state_key)` 下应至多
+    /// 有一条 `current_version=true`，由 publish 路径在切换时事务性保证。
+    #[serde(default)]
+    pub current_version: bool,
+    /// Phase E / E5-T1：被替换的上一版本号。
+    #[serde(default)]
+    pub previous_version: Option<i32>,
+    /// Phase E / E5-T1：写入来源标签。
+    #[serde(default)]
+    pub seeded_by: Option<String>,
 }
 
 /// Phase C / C3：`evolution_runtime_flags` collection 行结构。
@@ -1131,6 +1165,20 @@ pub struct TaxonomyEntry {
     pub kind: String,
     pub value: TaxonomyValue,
     pub updated_at: DateTime,
+    /// Phase E / E5-T1：多版本灰度。同 `(scope, kind, value.id)` 下 `version` 单调递增；
+    /// `m015` 迁移 backfill 为 1。多个 active 版本可共存（rollout 阶段），
+    /// 但 `current_version=true` 至多一条。
+    #[serde(default = "default_version_one")]
+    pub version: i32,
+    /// Phase E / E5-T1：当前生效版本标记。
+    #[serde(default)]
+    pub current_version: bool,
+    /// Phase E / E5-T1：被替换的上一版本号。
+    #[serde(default)]
+    pub previous_version: Option<i32>,
+    /// Phase E / E5-T1：写入来源标签。
+    #[serde(default)]
+    pub seeded_by: Option<String>,
 }
 
 /// agent-autonomy-loop W0：`TaxonomyEntry.value` 内嵌结构。字段名采用 camelCase
@@ -2947,6 +2995,10 @@ mod typed_tests {
             state_machine: Document::new(),
             status: "active".to_string(),
             updated_at: DateTime::now(),
+            version: 1,
+            current_version: true,
+            previous_version: None,
+            seeded_by: None,
         };
         let typed = cfg.runtime_parameters_typed();
         assert_eq!(typed.recent_message_limit, 16);
@@ -3035,6 +3087,10 @@ mod typed_tests {
             state_machine: default_user_operation_state_machine(),
             status: "active".to_string(),
             updated_at: DateTime::now(),
+            version: 1,
+            current_version: true,
+            previous_version: None,
+            seeded_by: None,
         };
         let typed = cfg.state_machine_typed();
         assert!(!typed.states.is_empty());
@@ -3144,6 +3200,10 @@ mod typed_tests {
                 status: "active".to_string(),
             },
             updated_at: now,
+            version: 1,
+            current_version: true,
+            previous_version: None,
+            seeded_by: None,
         };
 
         let doc = mongodb::bson::to_document(&entry).expect("serialize TaxonomyEntry");

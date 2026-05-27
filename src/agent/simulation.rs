@@ -16,7 +16,7 @@ use crate::routes::AppState;
 
 use super::budget::{RunBudget, RUN_BUDGET};
 use super::decision::{
-    decide_reply, load_operation_playbook_for_contact, load_user_operation_domain_config,
+    decide_reply, load_operation_playbook_for_contact, load_user_operation_domain_config_for_contact,
 };
 use super::gateway::{
     load_context_messages, load_pending_tasks, precheck_send_gateway, simulation_gateway_document,
@@ -40,7 +40,9 @@ pub async fn simulate_user_dialogue(
     contact: Contact,
     messages: Vec<String>,
 ) -> AppResult<Vec<UserOperationSimulationTurn>> {
-    let domain_config = load_user_operation_domain_config(state, &contact.workspace_id).await?;
+    let domain_config =
+        load_user_operation_domain_config_for_contact(state, &contact.workspace_id, &contact.wxid)
+            .await?;
     let mut runtime = UserRuntimeParameters::from_config(domain_config.as_ref(), state);
     // M4 W4 Task 5.1：simulation 也走 review_passed，同样需要把 threshold_overrides
     // 的最新生效值写回 runtime，让 shadow 模拟和生产 review 共享同一组阈值。

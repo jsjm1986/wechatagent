@@ -47,6 +47,10 @@ fn build_domain_config() -> OperationDomainConfig {
         state_machine: default_user_operation_state_machine(),
         status: "active".to_string(),
         updated_at: DateTime::now(),
+        version: 1,
+        current_version: true,
+        previous_version: None,
+        seeded_by: None,
     }
 }
 

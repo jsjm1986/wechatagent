@@ -117,7 +117,15 @@ impl TaxonomyCache {
 
     async fn reload_from_db(&self, db: &Database) -> AppResult<()> {
         use futures::TryStreamExt;
-        let mut cursor = db.collection_system_taxonomies().find(doc! {}, None).await?;
+        // Phase E5-T1：只读 `current_version=true` 行。多版本同时驻留 collection
+        // 时，每个版本的 alias 集合会以"并集"形态进入缓存——这是有意为之：value.id
+        // 的 canonical 含义跨版本必须稳定，新版加入的 alias 立即生效，旧版本下线
+        // 的 alias 在 `rollback` 之前仍可命中，避免历史 run 引用陈旧 raw_value 时
+        // 突然失效导致候选写入风暴。
+        let mut cursor = db
+            .collection_system_taxonomies()
+            .find(doc! { "current_version": true }, None)
+            .await?;
         let mut entries: HashMap<(String, String), Vec<CachedEntry>> = HashMap::new();
         while let Some(entry) = cursor.try_next().await? {
             let key = (entry.scope.clone(), entry.kind.clone());
@@ -391,6 +399,10 @@ pub(crate) async fn approve(
             status: "active".to_string(),
         },
         updated_at: now,
+        version: 1,
+        current_version: true,
+        previous_version: None,
+        seeded_by: Some("manual".to_string()),
     };
 
     // 先写字典：(scope, kind, value.id) 唯一索引保证幂等；冲突视为已存在，跳过。
@@ -565,6 +577,10 @@ mod tests {
                 status: status.to_string(),
             },
             updated_at: DateTime::now(),
+            version: 1,
+            current_version: true,
+            previous_version: None,
+            seeded_by: None,
         }
     }
 

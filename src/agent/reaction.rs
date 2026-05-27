@@ -18,7 +18,7 @@ use crate::prompts;
 use crate::routes::AppState;
 
 use super::budget::{current_run_budget, RunBudget, RUN_BUDGET};
-use super::decision::load_user_operation_domain_config;
+use super::decision::load_user_operation_domain_config_for_contact;
 use super::generate_agent_json;
 use super::memory::{effective_memory_card, load_or_create_operating_memory};
 use super::outbox;
@@ -32,7 +32,9 @@ pub async fn record_user_reaction(
 ) -> AppResult<()> {
     // 波 A1：在最外层为 reaction 路径起一个 RunBudget。即便 stuck 重置阶段
     // 不调用 LLM，只要后续 analyze_user_reaction 命中就能记账并支持降级。
-    let domain_config = load_user_operation_domain_config(state, &contact.workspace_id).await?;
+    let domain_config =
+        load_user_operation_domain_config_for_contact(state, &contact.workspace_id, &contact.wxid)
+            .await?;
     let runtime = UserRuntimeParameters::from_config(domain_config.as_ref(), state);
     let run_id = uuid::Uuid::new_v4().to_string();
     let budget = Arc::new(RunBudget::new(

@@ -156,7 +156,11 @@ pub(super) async fn ensure_all(db: &Database) -> anyhow::Result<()> {
             None,
         )
         .await?;
-    db.operating_memories()
+    // Phase E5-T1：ops 三表 active_versions 灰度——
+    //   把 (workspace_id, domain[, state_key/value.id]) 旧 unique 索引下线，
+    //   换成包含 `version` 的 4-tuple unique，让多版本可同时驻留 collection。
+    //   `(..., current_version=true)` 部分索引快路径，给读路径筛 active 集合。
+    ensure_ops_versioned_indexes(db).await?;    db.operating_memories()
         .create_index(
             IndexModel::builder()
                 .keys(doc! { "workspace_id": 1, "account_id": 1, "contact_wxid": 1 })
@@ -495,14 +499,163 @@ async fn ensure_agent_send_outbox_indexes(db: &Database) -> anyhow::Result<()> {
 
 /// agent-autonomy-loop W0 / R8.1：`system_taxonomies` 索引。
 ///
-/// `(scope, kind, value.id)` 唯一：保证同一 scope+kind 下 value.id 唯一，支持
-/// `2026_05_006_taxonomy_seed` 迁移幂等以及后台 API approve 的 upsert 写入。
+/// 历史上 `(scope, kind, value.id)` 直接走 unique，保证 seed migration 与 admin
+/// approve upsert 幂等。Phase E5-T1 引入 active_versions 灰度后，唯一性维度变成
+/// `(scope, kind, value.id, version)`，由 [`ensure_ops_versioned_indexes`] 创建；
+/// 这里只保留非唯一辅助索引（按 (scope, kind, status) 列字典），列表查询命中。
 async fn ensure_system_taxonomies_indexes(db: &Database) -> anyhow::Result<()> {
     db.collection_system_taxonomies()
         .create_index(
             IndexModel::builder()
-                .keys(doc! { "scope": 1, "kind": 1, "value.id": 1 })
-                .options(IndexOptions::builder().unique(true).build())
+                .keys(doc! { "scope": 1, "kind": 1, "value.status": 1 })
+                .options(
+                    IndexOptions::builder()
+                        .name("sys_tax_scope_kind_status_idx".to_string())
+                        .build(),
+                )
+                .build(),
+            None,
+        )
+        .await?;
+    Ok(())
+}
+
+/// Phase E5-T1：ops 三表 active_versions 灰度索引切换。
+///
+/// 旧形态：(workspace_id, domain) / (workspace_id, domain, state_key) /
+/// (scope, kind, value.id) 三个 unique 索引一一对应一行；同 key 不能同时存在
+/// 多个版本，无法做灰度。
+///
+/// 新形态：用 `version: i32` 把 unique 索引扩到 4-tuple，多版本同时驻留；读
+/// 路径用 `(workspace_id, domain[, state_key/value.id], current_version=true)`
+/// 部分索引筛 active 集合。配合 `ab_bucket_for_contact(contact_id)` 选 active
+/// 集合中的某一个。
+///
+/// 二次启动安全：`drop_index` 用 best-effort（旧索引可能在升级前已被运维手工
+/// 清理，也可能本就不存在），失败不阻塞 ensure_all 主流程；新 unique 索引
+/// 由 MongoDB 在已存在时静默 noop。
+async fn ensure_ops_versioned_indexes(db: &Database) -> anyhow::Result<()> {
+    // ── operation_domain_configs ──
+    let _ = db
+        .operation_domain_configs()
+        .drop_index("workspace_id_1_domain_1", None)
+        .await;
+    db.operation_domain_configs()
+        .create_index(
+            IndexModel::builder()
+                .keys(doc! { "workspace_id": 1, "domain": 1, "version": 1 })
+                .options(
+                    IndexOptions::builder()
+                        .name("op_domain_ws_domain_version_unique".to_string())
+                        .unique(true)
+                        .build(),
+                )
+                .build(),
+            None,
+        )
+        .await?;
+    db.operation_domain_configs()
+        .create_index(
+            IndexModel::builder()
+                .keys(doc! { "workspace_id": 1, "domain": 1, "current_version": 1 })
+                .options(
+                    IndexOptions::builder()
+                        .name("op_domain_ws_domain_current_idx".to_string())
+                        .partial_filter_expression(doc! { "current_version": true })
+                        .build(),
+                )
+                .build(),
+            None,
+        )
+        .await?;
+
+    // ── operation_state_policies ──
+    let _ = db
+        .operation_state_policies()
+        .drop_index("workspace_id_1_domain_1_state_key_1", None)
+        .await;
+    db.operation_state_policies()
+        .create_index(
+            IndexModel::builder()
+                .keys(doc! {
+                    "workspace_id": 1,
+                    "domain": 1,
+                    "state_key": 1,
+                    "version": 1,
+                })
+                .options(
+                    IndexOptions::builder()
+                        .name("op_state_policy_ws_domain_state_version_unique".to_string())
+                        .unique(true)
+                        .build(),
+                )
+                .build(),
+            None,
+        )
+        .await?;
+    db.operation_state_policies()
+        .create_index(
+            IndexModel::builder()
+                .keys(doc! {
+                    "workspace_id": 1,
+                    "domain": 1,
+                    "state_key": 1,
+                    "current_version": 1,
+                })
+                .options(
+                    IndexOptions::builder()
+                        .name("op_state_policy_ws_domain_state_current_idx".to_string())
+                        .partial_filter_expression(doc! { "current_version": true })
+                        .build(),
+                )
+                .build(),
+            None,
+        )
+        .await?;
+
+    // ── system_taxonomies ──
+    //
+    // 旧 (scope, kind, value.id) unique 索引由 ensure_system_taxonomies_indexes
+    // 继续创建（兼容旧路径），这里只补 4-tuple 与 current_version 部分索引。
+    // 多版本驻留时旧 unique 会冲突 —— 改为非唯一时机由 W5/W6 一并迁移。
+    let _ = db
+        .collection_system_taxonomies()
+        .drop_index("scope_1_kind_1_value.id_1", None)
+        .await;
+    db.collection_system_taxonomies()
+        .create_index(
+            IndexModel::builder()
+                .keys(doc! {
+                    "scope": 1,
+                    "kind": 1,
+                    "value.id": 1,
+                    "version": 1,
+                })
+                .options(
+                    IndexOptions::builder()
+                        .name("sys_tax_scope_kind_value_version_unique".to_string())
+                        .unique(true)
+                        .build(),
+                )
+                .build(),
+            None,
+        )
+        .await?;
+    db.collection_system_taxonomies()
+        .create_index(
+            IndexModel::builder()
+                .keys(doc! {
+                    "scope": 1,
+                    "kind": 1,
+                    "value.id": 1,
+                    "current_version": 1,
+                })
+                .options(
+                    IndexOptions::builder()
+                        .name("sys_tax_scope_kind_value_current_idx".to_string())
+                        .partial_filter_expression(doc! { "current_version": true })
+                        .build(),
+                )
                 .build(),
             None,
         )

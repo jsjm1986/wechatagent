@@ -146,6 +146,10 @@ pub(super) fn default_taxonomy_seed_entries(now: DateTime) -> Vec<TaxonomyEntry>
                 status: "active".to_string(),
             },
             updated_at: now,
+            version: 1,
+            current_version: true,
+            previous_version: None,
+            seeded_by: Some("legacy_migration".to_string()),
         });
     }
 
@@ -183,6 +187,10 @@ pub(super) fn default_taxonomy_seed_entries(now: DateTime) -> Vec<TaxonomyEntry>
                 status: "active".to_string(),
             },
             updated_at: now,
+            version: 1,
+            current_version: true,
+            previous_version: None,
+            seeded_by: Some("legacy_migration".to_string()),
         });
     }
 
@@ -244,6 +252,10 @@ pub(super) fn default_taxonomy_seed_entries(now: DateTime) -> Vec<TaxonomyEntry>
                 status: "active".to_string(),
             },
             updated_at: now,
+            version: 1,
+            current_version: true,
+            previous_version: None,
+            seeded_by: Some("legacy_migration".to_string()),
         });
     }
 

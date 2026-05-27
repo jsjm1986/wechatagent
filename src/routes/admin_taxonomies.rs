@@ -141,6 +141,10 @@ pub(super) async fn create_taxonomy(
             status: "active".to_string(),
         },
         updated_at: now,
+        version: 1,
+        current_version: true,
+        previous_version: None,
+        seeded_by: Some("manual".to_string()),
     };
 
     match state
@@ -303,6 +307,10 @@ mod tests {
                 status: "active".to_string(),
             },
             updated_at: DateTime::now(),
+            version: 1,
+            current_version: true,
+            previous_version: None,
+            seeded_by: None,
         };
         let value = taxonomy_entry_json(entry);
         assert_eq!(value["id"], oid.to_hex());

@@ -92,7 +92,7 @@ use llm_providers::{
 use knowledge::{
     analyze_operation_knowledge_logs, answer_chunk_repair,
     apply_knowledge_gap_signal,
-    archive_operation_knowledge_chunk, ask_knowledge,
+    archive_operation_knowledge_chunk, ask_knowledge, ask_knowledge_stream, knowledge_metrics,
     auto_verify_operation_knowledge_chunks,
     chat_apply, chat_discard,
     chat_history, chat_session_stream, chat_task_cancel, chat_task_create, chat_task_get,
@@ -368,6 +368,8 @@ pub fn api_router(state: AppState) -> Router<AppState> {
             post(sweep_knowledge_gap_signals),
         )
         .route("/knowledge/ask", post(ask_knowledge))
+        .route("/knowledge/ask/stream", get(ask_knowledge_stream))
+        .route("/knowledge/metrics", get(knowledge_metrics))
         .route(
             "/operation-knowledge/tools/open-slice",
             post(open_operation_knowledge_slices),

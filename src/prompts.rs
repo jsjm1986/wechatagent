@@ -511,6 +511,10 @@ pub fn default_domain_configs(workspace_id: &str) -> Vec<OperationDomainConfig> 
             state_machine: default_user_operation_state_machine(),
             status: "active".to_string(),
             updated_at: DateTime::now(),
+            version: 1,
+            current_version: true,
+            previous_version: None,
+            seeded_by: Some("system".to_string()),
         },
         OperationDomainConfig {
             id: None,
@@ -533,6 +537,10 @@ pub fn default_domain_configs(workspace_id: &str) -> Vec<OperationDomainConfig> 
             state_machine: Document::new(),
             status: "active".to_string(),
             updated_at: DateTime::now(),
+            version: 1,
+            current_version: true,
+            previous_version: None,
+            seeded_by: Some("system".to_string()),
         },
         OperationDomainConfig {
             id: None,
@@ -555,6 +563,10 @@ pub fn default_domain_configs(workspace_id: &str) -> Vec<OperationDomainConfig> 
             state_machine: Document::new(),
             status: "active".to_string(),
             updated_at: DateTime::now(),
+            version: 1,
+            current_version: true,
+            previous_version: None,
+            seeded_by: Some("system".to_string()),
         },
     ]
 }
