@@ -358,6 +358,20 @@ type TaxonomyEntry = ActiveVersionMeta & {
   };
 };
 
+// Phase D / D5：跨用户教训聚合（lessons_learned）。
+// 后端 src/knowledge_wiki/lessons_learned.rs 周期 upsert，admin 只读列表。
+type LessonLearnedEntry = {
+  lessonId: string;
+  workspaceId: string;
+  patternKind: string; // "success" | "reviewer_misjudge_negative" | "blocked_by_safety_guard"
+  count: number;
+  sampleRunIds: string[];
+  updatedAt: string;
+  createdAt: string;
+  reviewStatus: string; // 默认 "pending_review"
+  promotedChunkId: string | null;
+};
+
 type OperationDomainDraft = {
   name: string;
   goal: string;
@@ -3575,6 +3589,7 @@ function SystemStrategyView(props: {
       />
       <StatePolicyAdmin busy={props.busy} />
       <TaxonomiesAdmin busy={props.busy} />
+      <LessonsLearnedAdmin busy={props.busy} />
     </section>
   );
 }
@@ -3763,6 +3778,125 @@ function TaxonomiesAdmin({ busy }: { busy: boolean }) {
                 <div className="versionedListChunk">
                   <span>description</span>
                   <p>{item.value.description}</p>
+                </div>
+              )}
+            </div>
+          </div>
+        ))}
+      </div>
+    </section>
+  );
+}
+
+
+function LessonsLearnedAdmin({ busy }: { busy: boolean }) {
+  const [items, setItems] = useState<LessonLearnedEntry[]>([]);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [patternKind, setPatternKind] = useState<string>("");
+
+  async function reload() {
+    setLoading(true);
+    setError(null);
+    try {
+      const params = new URLSearchParams();
+      if (patternKind) params.set("patternKind", patternKind);
+      const qs = params.toString();
+      const data = await api.get<{ items: LessonLearnedEntry[] }>(
+        `/api/admin/lessons-learned${qs ? `?${qs}` : ""}`
+      );
+      setItems(data.items ?? []);
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  useEffect(() => {
+    void reload();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [patternKind]);
+
+  function patternBadgeClass(kind: string): string {
+    if (kind === "success") return "badge ok";
+    if (kind === "reviewer_misjudge_negative") return "badge degraded";
+    if (kind === "blocked_by_safety_guard") return "badge warn";
+    return "badge";
+  }
+
+  function patternLabel(kind: string): string {
+    if (kind === "success") return "成功模式";
+    if (kind === "reviewer_misjudge_negative") return "Reviewer 误判（用户负反应）";
+    if (kind === "blocked_by_safety_guard") return "安全门拦截";
+    return kind || "未识别";
+  }
+
+  return (
+    <section className="panel">
+      <div className="panelHead">
+        <div>
+          <span>Lessons Learned</span>
+          <h2>跨用户教训归纳（14d 滑窗）</h2>
+        </div>
+        <div className="buttonRow">
+          <select
+            value={patternKind}
+            onChange={(event) => setPatternKind(event.target.value)}
+            disabled={busy || loading}
+          >
+            <option value="">全部模式</option>
+            <option value="success">success</option>
+            <option value="reviewer_misjudge_negative">reviewer_misjudge_negative</option>
+            <option value="blocked_by_safety_guard">blocked_by_safety_guard</option>
+          </select>
+          <button type="button" className="secondary" onClick={() => void reload()} disabled={busy || loading}>
+            刷新
+          </button>
+        </div>
+      </div>
+      <p className="panelHint">
+        feedback_worker 周期把 agent_run_logs 的胜/败模式压缩成可被下一轮决策检索的颗粒；
+        是否晋升为 peer_case chunk 由 admin 在知识审核队列里决定（本面板仅观测）。
+      </p>
+      {error && <div className="inlineError">{error}</div>}
+      {!loading && items.length === 0 && <EmptyInline text="暂无教训聚合（窗口内无命中样本）" />}
+      <div className="versionedList">
+        {items.map((item) => (
+          <div key={item.lessonId} className="versionedListItem">
+            <div className="versionedListHead">
+              <div>
+                <span className="versionedListScope">{patternLabel(item.patternKind)}</span>
+                <h3>
+                  {item.lessonId}
+                  <span style={{ marginLeft: 8, fontWeight: 400, opacity: 0.7 }}>×{item.count}</span>
+                </h3>
+              </div>
+              <span className={patternBadgeClass(item.patternKind)}>{item.reviewStatus}</span>
+            </div>
+            <div className="versionedListBody">
+              <div className="versionedListChunk">
+                <span>sample run ids ({item.sampleRunIds.length})</span>
+                <p>
+                  {item.sampleRunIds.length === 0
+                    ? "—"
+                    : item.sampleRunIds.map((rid) => (
+                        <code key={rid} style={{ marginRight: 6, opacity: 0.85 }}>{rid}</code>
+                      ))}
+                </p>
+              </div>
+              <div className="versionedListChunk">
+                <span>updated</span>
+                <p>{item.updatedAt || "—"}</p>
+              </div>
+              <div className="versionedListChunk">
+                <span>created</span>
+                <p>{item.createdAt || "—"}</p>
+              </div>
+              {item.promotedChunkId && (
+                <div className="versionedListChunk">
+                  <span>promoted chunk</span>
+                  <p><code>{item.promotedChunkId}</code></p>
                 </div>
               )}
             </div>
