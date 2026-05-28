@@ -37,6 +37,7 @@ mod knowledge;
 mod lessons_learned;
 mod llm_providers;
 mod management;
+mod observability;
 mod outcome_metrics;
 mod outcomes_autonomy;
 mod playbooks;
@@ -149,6 +150,7 @@ use management::{
     create_management_session, get_management_command, get_tool_catalog, post_management_message,
 };
 use lessons_learned::{list_lessons_learned, promote_lesson_to_peer_case};
+use observability::phase_rollup;
 use outcome_metrics::list_agent_outcome_metrics;
 use playbooks::{
     create_operation_playbook, generate_operation_playbook, list_operation_playbooks,
@@ -650,6 +652,9 @@ pub fn api_router(state: AppState) -> Router<AppState> {
             "/admin/lessons-learned/:lesson_id/promote-to-peer-case",
             post(promote_lesson_to_peer_case),
         )
+        // ── Phase 0-D 自治信号 admin 聚合（lifecycle / revision_reason /
+        //    reviewer_misjudge_signal / negative_example pending）只读 ────────
+        .route("/admin/observability/phase-rollup", get(phase_rollup))
         // ── LLM provider 配置 admin 路由：前端 UI 编辑 / 测试 / 热切换 ────
         .route(
             "/admin/llm-providers",
