@@ -38,6 +38,10 @@ async fn main() -> anyhow::Result<()> {
     let db = Database::connect(&config.mongodb_uri, &config.mongodb_database).await?;
     db::migrations::run(&db).await?;
     db.ensure_indexes().await?;
+    // S1.2 (Phase 0)：active operation_domain_configs 必须配非空 state_machine。
+    // 与 check_state_transition 的 fail-closed 路径配对——启动期先拒绝错误配置，
+    // runtime defense-in-depth 兜底。
+    run_active_domain_state_machine_sanity_check(&db).await?;
     // Phase A / A3：启动期预热 system_taxonomies 进程级 cache。失败被静默
     // （`init_global_taxonomy_cache` 内部 log warning），下一次 check_value 触发懒加载。
     wechatagent::agent::init_global_taxonomy_cache(&db).await;
@@ -387,4 +391,46 @@ async fn ensure_default_llm_provider(
     };
     db.llm_provider_configs().insert_one(&seed, None).await?;
     Ok(seed)
+}
+
+/// S1.2 (Phase 0)：扫描所有 `status="active"` 的 `operation_domain_configs`，
+/// 拒绝 `state_machine.states` 缺失或为空的记录。
+///
+/// 目的：与 [`wechatagent::agent::check_state_transition`] 的 fail-closed 路径配对。
+/// runtime 已经在 `states.is_empty() && cfg.is_some()` 分支里返回拦截 reason；
+/// 但更早的兜底是启动期就拒绝这种配置，避免 100% 的决策被 guards 拦下。
+///
+/// 不影响 simulation / 老路径：`check_state_transition(None, ...)` 仍然 fail-open。
+async fn run_active_domain_state_machine_sanity_check(
+    db: &wechatagent::db::Database,
+) -> anyhow::Result<()> {
+    use futures::TryStreamExt;
+    use mongodb::bson::doc;
+
+    let mut cursor = db
+        .operation_domain_configs()
+        .find(doc! { "status": "active" }, None)
+        .await?;
+    let mut offenders: Vec<String> = Vec::new();
+    while let Some(cfg) = cursor.try_next().await? {
+        let states = cfg
+            .state_machine
+            .get_array("states")
+            .ok()
+            .map(|arr| arr.len())
+            .unwrap_or(0);
+        if states == 0 {
+            offenders.push(format!(
+                "workspace={} domain={} version={}",
+                cfg.workspace_id, cfg.domain, cfg.version
+            ));
+        }
+    }
+    if !offenders.is_empty() {
+        anyhow::bail!(
+            "active operation_domain_configs 缺少非空 state_machine.states：{}",
+            offenders.join("; ")
+        );
+    }
+    Ok(())
 }

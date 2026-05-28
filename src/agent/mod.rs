@@ -88,7 +88,7 @@ pub use outbox_dispatcher::{
 pub use outbox::{
     cancel_for_contact_on_user_reaction, enqueue, EnqueueOutcome, EnqueueRequest, OutboxStatus,
 };
-pub use reaction::record_user_reaction;
+pub use reaction::{cap_intent_trajectory, record_user_reaction};
 pub use simulation::simulate_user_dialogue;
 pub use types::{
     AgentDecision, ContactSendResult, FollowUpDecision, GeneratedOperationProfile,

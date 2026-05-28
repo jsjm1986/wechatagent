@@ -165,27 +165,38 @@ pub(super) fn judge_user_operation_scenario(
             "recommendation": "检查 simulation 输入和联系人状态"
         });
     };
+    // S1.3 (Phase 0)：simulation 不再硬编码 5 闸阈值，改成"读 prod 路径的
+    // enforce_decision_guards / review_passed 终态"。`simulate_user_dialogue`
+    // 已经走 gateway → review，所以 review.scores / final_review_status /
+    // gateway_status 与 prod 同源。本函数只把 review 终态翻译成 evaluation 视图。
     let scores = last_turn.review.get_document("scores").ok();
     let human_like = doc_i32_opt(scores, "humanLike");
     let emotional_value = doc_i32_opt(scores, "emotionalValue");
-    let product_accuracy = doc_i32_opt(scores, "productAccuracy");
+    let hallucination = doc_i32_opt(scores, "hallucinationScore");
+    let knowledge_grounding = doc_i32_opt(scores, "knowledgeGroundingScore");
     let pressure_risk = doc_i32_opt(scores, "pressureRisk");
-    let fact_risk = doc_i32_opt(scores, "factRisk");
+    let final_review_status = last_turn
+        .review
+        .get_str("finalReviewStatus")
+        .unwrap_or("")
+        .to_string();
     let mut issues = Vec::new();
-    if fact_risk >= 6 {
-        issues.push("事实风险过高");
+    // 硬闸：与 review_passed 同源——hallucination 高 / knowledge_grounding 低 必拦。
+    // 软闸：human_like / emotional_value / pressure_risk —— 不直接拦截，仅作评测信号。
+    if hallucination >= 50 {
+        issues.push("hallucination 评分过高（≥50）");
     }
-    if pressure_risk >= 7 {
-        issues.push("压迫感风险过高");
+    if knowledge_grounding > 0 && knowledge_grounding < 60 {
+        issues.push("knowledge_grounding 评分不足（<60）");
     }
-    if human_like < 6 {
-        issues.push("微信表达不够像真人");
-    }
-    if emotional_value < 5 {
-        issues.push("情绪价值不足");
-    }
-    if product_accuracy < 7 {
-        issues.push("产品事实准确性不足");
+    if matches!(
+        final_review_status.as_str(),
+        "rejected"
+            | "blocked_by_safety_guard"
+            | "held_by_ai_policy"
+            | "ai_waiting_for_more_context"
+    ) {
+        issues.push("Review 终态非 approved");
     }
     if last_turn.should_reply && last_turn.status == "gateway_blocked" {
         issues.push("发送网关拦截，需要检查频控或纳管状态");
@@ -193,17 +204,17 @@ pub(super) fn judge_user_operation_scenario(
     let passed = issues.is_empty();
     json!({
         "passed": passed,
+        "runMode": "shadow",
         "scores": {
-            "userValue": emotional_value,
-            "doNotDoCompliance": 10 - pressure_risk.min(10),
-            "factAccuracy": 10 - fact_risk.min(10),
-            "stateTransition": 7,
-            "memoryUpdate": if last_turn.memory_preview.is_empty() { 5 } else { 8 },
             "humanLike": human_like,
-            "productAccuracy": product_accuracy
+            "emotionalValue": emotional_value,
+            "hallucinationScore": hallucination,
+            "knowledgeGroundingScore": knowledge_grounding,
+            "pressureRisk": pressure_risk,
         },
+        "finalReviewStatus": final_review_status,
         "issues": issues,
-        "summary": if passed { "场景通过 Review Agent 评分约束" } else { "场景存在需要优化的风险项" },
+        "summary": if passed { "场景通过 prod 同源 review 终态" } else { "场景存在需要优化的风险项" },
         "scenario": scenario,
         "expected": expected,
         "recommendation": if passed { "保持当前策略，继续做长对话回归" } else { "查看 turns 中的 reply、review 和 memoryCard 后优化提示词或知识库" }

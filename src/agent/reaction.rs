@@ -548,6 +548,25 @@ pub(crate) async fn push_intent_trajectory_entry(
     Ok(())
 }
 
+/// Phase D / D1：纯函数版滑窗，镜像 mongo `$push + $slice: -MAX_ITEMS`。
+///
+/// 用于 PBT：给定既有 trajectory 与新 entry，返回追加 + 截尾后的新 vec。
+/// 任意输入大小 N 与 cap 关系下，输出长度永远 `min(N+1, MAX_ITEMS)`，且保留
+/// 最末 cap 条；与 mongo 端的 `$slice: -k` 语义一致（保留尾部）。
+pub fn cap_intent_trajectory(
+    existing: &[crate::models::IntentTrajectoryEntry],
+    new_entry: crate::models::IntentTrajectoryEntry,
+) -> Vec<crate::models::IntentTrajectoryEntry> {
+    let cap = crate::models::IntentTrajectoryEntry::MAX_ITEMS;
+    let mut combined: Vec<crate::models::IntentTrajectoryEntry> = existing.to_vec();
+    combined.push(new_entry);
+    if combined.len() > cap {
+        let drop_n = combined.len() - cap;
+        combined.drain(0..drop_n);
+    }
+    combined
+}
+
 /// Phase D / D1：把最近 N=5 项 intent_trajectory 渲染为 prompt 段。
 ///
 /// 输入是 contact.intent_trajectory（按写入顺序，最早在前）；返回值是

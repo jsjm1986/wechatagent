@@ -25,6 +25,7 @@ pub mod release;
 pub mod replay;
 pub mod significance;
 pub mod threshold;
+pub mod auto_release;
 
 use std::time::Duration;
 
@@ -225,6 +226,17 @@ pub async fn run_one_tick(state: &AppState) -> Result<(), EvolutionError> {
         0
     });
 
+    // 9. Phase C / C5：threshold proposal 自动 release 闭环。
+    //    `evolution_auto_release_enabled=false` 时立即 return 0；
+    //    `released_count > 0` 表示本 tick 触发了 hold_rate close-loop 自动放量。
+    //    rollback 永远人工——Requirements 9.7 不允许自动回滚。
+    let auto_released = auto_release::auto_release_eligible_thresholds(state)
+        .await
+        .unwrap_or_else(|e| {
+            tracing::warn!(?e, "auto_release_eligible_thresholds failed; will retry next tick");
+            0
+        });
+
     write_tick_completed_event(
         state,
         &exp_id,
@@ -236,6 +248,7 @@ pub async fn run_one_tick(state: &AppState) -> Result<(), EvolutionError> {
         eligible_count,
         rejected_after_eval,
         post_release_completed,
+        auto_released,
     )
     .await?;
     Ok(())
@@ -300,6 +313,7 @@ async fn write_tick_completed_event(
     proposals_eligible_count: usize,
     proposals_rejected_count: usize,
     post_release_reviews_completed: usize,
+    auto_released_count: usize,
 ) -> Result<(), EvolutionError> {
     let event = crate::models::AgentEvent {
         id: None,
@@ -309,7 +323,7 @@ async fn write_tick_completed_event(
         kind: "evolution_tick_completed".to_string(),
         status: "ok".to_string(),
         summary: format!(
-            "evolution tick completed (threshold_cohort={threshold_count}, prompt_cohort={prompt_count}, threshold_proposals={threshold_proposals}, prompt_proposals={prompt_proposals}, eligible={proposals_eligible_count}, rejected={proposals_rejected_count}, post_release_reviews_completed={post_release_reviews_completed})"
+            "evolution tick completed (threshold_cohort={threshold_count}, prompt_cohort={prompt_count}, threshold_proposals={threshold_proposals}, prompt_proposals={prompt_proposals}, eligible={proposals_eligible_count}, rejected={proposals_rejected_count}, post_release_reviews_completed={post_release_reviews_completed}, auto_released={auto_released_count})"
         ),
         details: Some(doc! {
             "experiment_id": exp_id,
@@ -321,6 +335,7 @@ async fn write_tick_completed_event(
             "proposals_eligible_count": proposals_eligible_count as i32,
             "proposals_rejected_count": proposals_rejected_count as i32,
             "post_release_reviews_completed": post_release_reviews_completed as i32,
+            "auto_released_count": auto_released_count as i32,
         }),
         created_at: DateTime::now(),
     };

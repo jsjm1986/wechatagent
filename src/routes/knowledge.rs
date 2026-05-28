@@ -6639,6 +6639,391 @@ pub(super) async fn unrelate_operation_knowledge_chunk(
     Ok(Json(value))
 }
 
+// ── G3 · 反向查询 + 批量动作（人工触发，非 AI 自动）──────────────────────
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChunkReferrersQuery {
+    pub target_id: String,
+}
+
+/// `GET /operation-knowledge/chunks/referrers?target_id=...`
+/// 扫 `related_chunks.chunk_id == target_id`，返回反向引用列表。
+/// 不物化反向 link（避免双向写入一致性问题），每次查询走 query path。
+pub async fn list_chunk_referrers(
+    State(state): State<AppState>,
+    Query(q): Query<ChunkReferrersQuery>,
+) -> AppResult<Json<Value>> {
+    if q.target_id.trim().is_empty() {
+        return Err(AppError::BadRequest("target_id is required".to_string()));
+    }
+    let mut cur = state
+        .db
+        .operation_knowledge_chunks()
+        .find(
+            doc! {
+                "workspace_id": &state.config.default_workspace_id,
+                "related_chunks.chunk_id": &q.target_id,
+            },
+            None,
+        )
+        .await?;
+    let mut items: Vec<Value> = Vec::new();
+    while cur.advance().await? {
+        let chunk = cur.deserialize_current()?;
+        let chunk_id = chunk
+            .id
+            .map(|o| o.to_hex())
+            .unwrap_or_default();
+        let related = chunk.related_chunks.clone().unwrap_or_default();
+        let matched: Vec<&_> = related
+            .iter()
+            .filter(|r| r.chunk_id == q.target_id)
+            .collect();
+        for r in matched {
+            items.push(json!({
+                "chunkId": chunk_id,
+                "title": chunk.title.clone(),
+                "wikiType": chunk.wiki_type.clone(),
+                "status": chunk.status.clone(),
+                "kind": r.kind.clone(),
+                "note": r.note.clone(),
+            }));
+            if items.len() >= 50 {
+                break;
+            }
+        }
+        if items.len() >= 50 {
+            break;
+        }
+    }
+    Ok(Json(json!({ "items": items })))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChunkBatchVerifyRequest {
+    pub ids: Vec<String>,
+    #[serde(default)]
+    pub note: Option<String>,
+}
+
+/// `POST /operation-knowledge/chunks/batch-verify`
+/// 批量调用 verify_operation_knowledge_chunk 主体逻辑；每条独立 chunk_revisions(op=verify)。
+/// 单条失败不阻断其它（部分成功）；返回 `{ verified: [...], skipped: [{id, reason}] }`。
+/// AI 永不自动 verify 红线保留：批量入口仍需人工触发，与单条同 auth 路径。
+pub async fn batch_verify_chunks(
+    State(state): State<AppState>,
+    Json(payload): Json<ChunkBatchVerifyRequest>,
+) -> AppResult<Json<Value>> {
+    if payload.ids.is_empty() {
+        return Err(AppError::BadRequest("ids is required".to_string()));
+    }
+    if payload.ids.len() > 100 {
+        return Err(AppError::BadRequest("max 100 ids per batch".to_string()));
+    }
+    let mut verified: Vec<String> = Vec::new();
+    let mut skipped: Vec<Value> = Vec::new();
+    for id in payload.ids.iter() {
+        let object_id = match parse_object_id(id) {
+            Ok(v) => v,
+            Err(_) => {
+                skipped.push(json!({ "id": id, "reason": "invalid_object_id" }));
+                continue;
+            }
+        };
+        let chunk = match state
+            .db
+            .operation_knowledge_chunks()
+            .find_one(
+                doc! { "_id": object_id, "workspace_id": &state.config.default_workspace_id },
+                None,
+            )
+            .await
+        {
+            Ok(Some(c)) => c,
+            Ok(None) => {
+                skipped.push(json!({ "id": id, "reason": "not_found" }));
+                continue;
+            }
+            Err(e) => {
+                skipped.push(json!({ "id": id, "reason": format!("db_error: {}", e) }));
+                continue;
+            }
+        };
+        let has_quote = chunk
+            .source_quote
+            .as_deref()
+            .map(|s| !s.trim().is_empty())
+            .unwrap_or(false);
+        let has_anchor = !chunk.source_anchors.is_empty();
+        if let Some(reason) = chunk_verify_gate_reason(has_quote, has_anchor) {
+            skipped.push(json!({ "id": id, "reason": reason }));
+            continue;
+        }
+        match state
+            .db
+            .operation_knowledge_chunks()
+            .update_one(
+                doc! { "_id": object_id, "workspace_id": &state.config.default_workspace_id },
+                doc! {
+                    "$set": {
+                        "integrity_status": "verified",
+                        "confidence_score": 100,
+                        "unsupported_claims": Bson::Array(Vec::new()),
+                        "status": "active",
+                        "updated_at": DateTime::now()
+                    }
+                },
+                None,
+            )
+            .await
+        {
+            Ok(_) => verified.push(id.clone()),
+            Err(e) => skipped.push(json!({ "id": id, "reason": format!("update_failed: {}", e) })),
+        }
+    }
+    Ok(Json(json!({
+        "verified": verified,
+        "skipped": skipped,
+        "note": payload.note,
+    })))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChunkBatchArchiveRequest {
+    pub ids: Vec<String>,
+    #[serde(default)]
+    pub reason: Option<String>,
+    #[serde(default)]
+    pub actor: Option<String>,
+}
+
+/// `POST /operation-knowledge/chunks/batch-archive`
+/// 复用 archive_operation_knowledge_chunk 内部 RevisionRequest 路径。
+pub async fn batch_archive_chunks(
+    State(state): State<AppState>,
+    Json(payload): Json<ChunkBatchArchiveRequest>,
+) -> AppResult<Json<Value>> {
+    if payload.ids.is_empty() {
+        return Err(AppError::BadRequest("ids is required".to_string()));
+    }
+    if payload.ids.len() > 100 {
+        return Err(AppError::BadRequest("max 100 ids per batch".to_string()));
+    }
+    let mut archived: Vec<String> = Vec::new();
+    let mut skipped: Vec<Value> = Vec::new();
+    for id in payload.ids.iter() {
+        let object_id = match parse_object_id(id) {
+            Ok(v) => v,
+            Err(_) => {
+                skipped.push(json!({ "id": id, "reason": "invalid_object_id" }));
+                continue;
+            }
+        };
+        let req = RevisionRequest {
+            op: RevisionOp::Archive,
+            source: ProvenanceSource::Human,
+            patch: Document::new(),
+            reason: payload.reason.clone(),
+            actor: payload.actor.clone(),
+        };
+        match apply_chunk_revision(
+            &state.db,
+            &state.config.default_workspace_id,
+            object_id,
+            req,
+        )
+        .await
+        {
+            Ok(_) => archived.push(id.clone()),
+            Err(e) => skipped.push(json!({ "id": id, "reason": format!("{}", e) })),
+        }
+    }
+    Ok(Json(json!({
+        "archived": archived,
+        "skipped": skipped,
+    })))
+}
+
+// ── G5 · 元信息聚合：单次 $facet 拉 4 维 ─────────────────────────────
+//
+// 返回：
+//   - wikiTypeCounts:        Vec<{ wikiType, count }>
+//   - verifiedRatioByType:   Vec<{ wikiType, total, verified, ratio }>
+//   - topEditors:            Vec<{ author, count }>      (top 10)
+//   - recentActivity7d:      Vec<{ date, op, count }>     (最近 7 天)
+//
+// **不写库 / 不修 schema / 不引外部缓存**。一次 aggregate 命中 4 个维度。
+pub async fn knowledge_aggregate_metadata(
+    State(state): State<AppState>,
+) -> AppResult<Json<Value>> {
+    use futures::StreamExt;
+    let ws = &state.config.default_workspace_id;
+    let cutoff = mongodb::bson::DateTime::from_millis(
+        (chrono::Utc::now() - chrono::Duration::days(7)).timestamp_millis(),
+    );
+
+    // 1) wikiTypeCounts + verifiedRatioByType 在 chunks 上做。
+    let chunks_pipe = vec![
+        doc! { "$match": { "workspace_id": ws } },
+        doc! {
+            "$facet": {
+                "wikiTypeCounts": [
+                    { "$group": {
+                        "_id": { "$ifNull": ["$wiki_type", "unknown"] },
+                        "count": { "$sum": 1 },
+                    } },
+                    { "$sort": { "count": -1 } },
+                ],
+                "verifiedRatio": [
+                    { "$group": {
+                        "_id": { "$ifNull": ["$wiki_type", "unknown"] },
+                        "total": { "$sum": 1 },
+                        "verified": { "$sum": {
+                            "$cond": [{ "$eq": ["$integrity_status", "verified"] }, 1, 0]
+                        } },
+                    } },
+                    { "$sort": { "_id": 1 } },
+                ],
+            }
+        },
+    ];
+    let mut cursor = state
+        .db
+        .operation_knowledge_chunks()
+        .aggregate(chunks_pipe, None)
+        .await?;
+    let chunks_facet = match cursor.next().await {
+        Some(Ok(d)) => d,
+        Some(Err(e)) => return Err(AppError::from(e)),
+        None => Document::new(),
+    };
+
+    let wiki_type_counts: Vec<Value> = chunks_facet
+        .get_array("wikiTypeCounts")
+        .ok()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_document().cloned())
+                .map(|d| {
+                    json!({
+                        "wikiType": d.get_str("_id").unwrap_or("unknown"),
+                        "count": d.get_i32("count").unwrap_or(0),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let verified_ratio_by_type: Vec<Value> = chunks_facet
+        .get_array("verifiedRatio")
+        .ok()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_document().cloned())
+                .map(|d| {
+                    let total = d.get_i32("total").unwrap_or(0);
+                    let verified = d.get_i32("verified").unwrap_or(0);
+                    let ratio = if total > 0 {
+                        verified as f64 / total as f64
+                    } else {
+                        0.0
+                    };
+                    json!({
+                        "wikiType": d.get_str("_id").unwrap_or("unknown"),
+                        "total": total,
+                        "verified": verified,
+                        "ratio": ratio,
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    // 2) topEditors + recentActivity7d 在 chunk_revisions 上做。
+    // chunk_revisions 没有 workspace_id 字段（绑定 chunk_id），单租户部署下无影响；
+    // 多租户场景需要后续 $lookup 关联 chunks 集合，超出本波范围。
+    let revisions_pipe = vec![
+        doc! {
+            "$facet": {
+                "topEditors": [
+                    { "$match": { "created_by": { "$exists": true, "$ne": null } } },
+                    { "$group": {
+                        "_id": "$created_by",
+                        "count": { "$sum": 1 },
+                    } },
+                    { "$sort": { "count": -1 } },
+                    { "$limit": 10 },
+                ],
+                "recentActivity": [
+                    { "$match": { "created_at": { "$gte": cutoff } } },
+                    { "$group": {
+                        "_id": {
+                            "date": { "$dateToString": { "format": "%Y-%m-%d", "date": "$created_at" } },
+                            "op": { "$ifNull": ["$op", "unknown"] },
+                        },
+                        "count": { "$sum": 1 },
+                    } },
+                    { "$sort": { "_id.date": 1 } },
+                ],
+            }
+        },
+    ];
+    let mut rcursor = state
+        .db
+        .chunk_revisions()
+        .aggregate(revisions_pipe, None)
+        .await?;
+    let rev_facet = match rcursor.next().await {
+        Some(Ok(d)) => d,
+        Some(Err(e)) => return Err(AppError::from(e)),
+        None => Document::new(),
+    };
+
+    let top_editors: Vec<Value> = rev_facet
+        .get_array("topEditors")
+        .ok()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_document().cloned())
+                .map(|d| {
+                    json!({
+                        "author": d.get_str("_id").unwrap_or("unknown"),
+                        "count": d.get_i32("count").unwrap_or(0),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let recent_activity_7d: Vec<Value> = rev_facet
+        .get_array("recentActivity")
+        .ok()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_document().cloned())
+                .map(|d| {
+                    let key = d.get_document("_id").cloned().unwrap_or_default();
+                    json!({
+                        "date": key.get_str("date").unwrap_or(""),
+                        "op": key.get_str("op").unwrap_or("unknown"),
+                        "count": d.get_i32("count").unwrap_or(0),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    Ok(Json(json!({
+        "wikiTypeCounts": wiki_type_counts,
+        "verifiedRatioByType": verified_ratio_by_type,
+        "topEditors": top_editors,
+        "recentActivity7d": recent_activity_7d,
+    })))
+}
+
 // ── knowledge-wiki Phase F：gap-signal 路由 ───────────────────────────────────
 
 /// 列出 gap signal。默认返回 `pending` 状态；`status` 查询参数可选。
@@ -7055,6 +7440,97 @@ pub(super) async fn knowledge_metrics(
     let cache = agent::knowledge_agent::cache_stats();
     Ok(axum::Json(serde_json::json!({
         "answerCache": cache,
+    })))
+}
+
+/// `GET /api/knowledge/operator-memory`：列出运营长期偏好记忆。
+///
+/// Phase F：Atlas 视图需要展示运营自己写过的偏好/拒绝/上下文记忆，
+/// 以便核对哪些会被注入到 reply prompt。**只读**，不 bump `last_used_at`
+/// （bump 仅在真正被 reply Agent 复用时发生，UI 浏览不算复用）。
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct OperatorMemoryQuery {
+    pub account_id: Option<String>,
+    pub operator_id: Option<String>,
+    pub kind: Option<String>,
+    pub limit: Option<i64>,
+}
+
+pub(super) async fn list_operator_memory(
+    State(state): State<AppState>,
+    Query(query): Query<OperatorMemoryQuery>,
+) -> AppResult<Json<Value>> {
+    let workspace_id = state.config.default_workspace_id.clone();
+    let account_id = query
+        .account_id
+        .clone()
+        .unwrap_or_else(|| state.config.default_account_id.clone());
+    let operator_id = query
+        .operator_id
+        .clone()
+        .unwrap_or_else(|| "default".to_string());
+    let limit = query.limit.unwrap_or(50).clamp(1, 200);
+
+    let now = DateTime::now();
+    let mut filter = doc! {
+        "workspace_id": &workspace_id,
+        "account_id": &account_id,
+        "operator_id": &operator_id,
+        "$or": [
+            { "expires_at": { "$exists": false } },
+            { "expires_at": null },
+            { "expires_at": { "$gt": now } },
+        ],
+    };
+    if let Some(kind) = query.kind.as_deref() {
+        let kind_trim = kind.trim();
+        if !kind_trim.is_empty() {
+            if !["preference", "rejection", "context"].contains(&kind_trim) {
+                return Err(AppError::BadRequest(format!(
+                    "kind 非法：{kind_trim}（必须在 [preference, rejection, context]）"
+                )));
+            }
+            filter.insert("kind", kind_trim);
+        }
+    }
+
+    let opts = FindOptions::builder()
+        .sort(doc! { "last_used_at": -1_i32 })
+        .limit(limit)
+        .build();
+
+    let mut cursor = state
+        .db
+        .knowledge_operator_memory()
+        .find(filter, opts)
+        .await
+        .map_err(|e| AppError::External(format!("查询运营记忆失败：{e}")))?;
+
+    let mut items: Vec<Value> = Vec::new();
+    while let Some(m) = cursor
+        .try_next()
+        .await
+        .map_err(|e| AppError::External(format!("迭代运营记忆失败：{e}")))?
+    {
+        items.push(json!({
+            "id": m.id.map(|i| i.to_hex()),
+            "workspaceId": m.workspace_id,
+            "accountId": m.account_id,
+            "operatorId": m.operator_id,
+            "kind": m.kind,
+            "content": m.content,
+            "createdAt": m.created_at.try_to_rfc3339_string().ok(),
+            "lastUsedAt": m.last_used_at.try_to_rfc3339_string().ok(),
+            "expiresAt": m.expires_at.and_then(|d| d.try_to_rfc3339_string().ok()),
+        }));
+    }
+
+    Ok(Json(json!({
+        "workspaceId": workspace_id,
+        "accountId": account_id,
+        "operatorId": operator_id,
+        "items": items,
     })))
 }
 

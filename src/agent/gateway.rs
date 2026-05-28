@@ -58,7 +58,11 @@ use super::review::{
     local_decision_review, review_decision, review_passed, should_run_review, FinalizeOutcome,
     GatewayStatusFinal, PendingFinalizeEvent, RevisionDecision,
 };
-use super::run_envelope::{assert_final_review_status_valid, assert_gateway_status_valid};
+use super::run_envelope::{
+    assert_final_review_status_valid, assert_gateway_status_valid, assert_lifecycle_valid,
+    derive_lifecycle_from_status, SOURCE_KIND_FOLLOW_UP_TASK, SOURCE_KIND_INBOUND_MESSAGE,
+    SOURCE_KIND_MANUAL_SEND,
+};
 use super::runtime::UserRuntimeParameters;
 use super::types::{
     doc_bool, doc_i64, doc_string, non_empty_option, parse_rfc3339_to_bson, to_bson_array,
@@ -278,28 +282,18 @@ pub async fn send_contact_message_gateway(
         });
     }
 
-    let response = send_outbound_message(
-        state,
-        &contact,
-        &content,
-        Some(doc! {
-            "source": "management_agent_send",
-            "managementSource": request.source,
-            "originalContentLocked": request.original_content_locked,
-        }),
-    )
-    .await?;
-    let message_id = response
-        .get("newMsgId")
-        .and_then(|value| value.as_str())
-        .map(ToString::to_string);
-    let sent_result = SendGatewayResult {
+    // S5.2 (Phase 0)：原先这里直接调 `send_outbound_message`，绕过 outbox →
+    // 失去 R13 幂等键 + 二次安全门保护。改成 enqueue 到 `agent_send_outbox`，
+    // dispatcher worker 接管真正的 MCP 发送。返回值的 messageId 在管理 API
+    // 同步路径下不再可得（dispatcher 异步），按 R13.2 设计语义返回
+    // gateway_status="outbox_enqueued"，调用方据此感知"已交付到发送队列"。
+    let pending_result = SendGatewayResult {
         allowed: true,
-        status: "sent".to_string(),
-        reason: "发送成功".to_string(),
+        status: "outbox_enqueued".to_string(),
+        reason: "Review 通过，已入队 outbox 等待 dispatcher 发送".to_string(),
         policy_blocks: Vec::new(),
         run_mode: "live".to_string(),
-        message_id: message_id.clone(),
+        message_id: None,
     };
     let review_id = write_decision_review(
         state,
@@ -310,24 +304,61 @@ pub async fn send_contact_message_gateway(
         playbook.as_ref(),
         domain_config.as_ref(),
         &runtime,
-        &sent_result,
+        &pending_result,
         &context_pack,
-        "sent",
+        "outbox_enqueued",
         &knowledge_route,
         &run_id,
         &planner,
     )
     .await?;
+
+    let enqueue_req = EnqueueRequest {
+        workspace_id: contact.workspace_id.clone(),
+        account_id: contact.account_id.clone(),
+        contact_wxid: contact.wxid.clone(),
+        run_id: run_id.clone(),
+        decision_id: Some(review_id),
+        // 管理 Agent 主动发送没有真实 inbound message_id，走 SOURCE_KIND_MANUAL_SEND
+        // 语义；outbox::enqueue 的 synthetic 兜底会基于 run_id + content_hash 生成
+        // idempotency_key，所以重复点 "发送" 不会真重复发。
+        source_event_id: String::new(),
+        source_kind: SOURCE_KIND_MANUAL_SEND.to_string(),
+        content: content.clone(),
+        max_attempts: 3,
+    };
+    match outbox_enqueue(state, enqueue_req).await {
+        Ok(EnqueueOutcome::Created { outbox_id, .. }) => {
+            tracing::info!(
+                %run_id,
+                %outbox_id,
+                contact_wxid = %contact.wxid,
+                "management send enqueued to outbox"
+            );
+        }
+        Ok(EnqueueOutcome::IdempotentSkip { idempotency_key }) => {
+            tracing::info!(
+                %run_id,
+                %idempotency_key,
+                contact_wxid = %contact.wxid,
+                "management send outbox idempotent skip"
+            );
+        }
+        Err(err) => {
+            tracing::error!(?err, %run_id, "management send outbox enqueue failed");
+            return Err(err.into());
+        }
+    }
+
     write_event_for_account(
         state,
         &contact.account_id,
         Some(&contact.wxid),
         "management_send",
-        "success",
-        "生产发送网关已发送私聊消息",
+        "enqueued",
+        "生产发送网关已入队 outbox，dispatcher 将异步发送",
         Some(doc! {
             "sentContent": &content,
-            "messageId": message_id.clone(),
             "decisionReviewId": review_id.to_hex(),
             "originalContentLocked": request.original_content_locked,
         }),
@@ -335,12 +366,36 @@ pub async fn send_contact_message_gateway(
     .await?;
     Ok(ContactSendResult {
         sent_content: content,
-        message_id,
+        message_id: None,
         review_approved: true,
-        gateway_status: "sent".to_string(),
-        gateway_reason: "发送成功".to_string(),
+        gateway_status: "outbox_enqueued".to_string(),
+        gateway_reason: "已入队 outbox，dispatcher 将异步发送".to_string(),
         decision_review_id: Some(review_id.to_hex()),
     })
+}
+
+/// S1.1 (Phase 0)：把 [`AgentTrigger`] 派生为 `(source_event_id, source_kind)`，
+/// 透传给 `write_agent_run_log_with_finalize` 用于 R0.1 envelope 字段。
+///
+/// * `Inbound` → message_id（缺失走 `synthetic:` 前缀兜底）+ `inbound_message`
+/// * `FollowUp` → task_id.hex + `follow_up_task`
+fn trigger_envelope_source(trigger: &AgentTrigger<'_>) -> (String, &'static str) {
+    match trigger {
+        AgentTrigger::Inbound(message) => {
+            let id = message
+                .message_id
+                .clone()
+                .unwrap_or_else(|| format!("synthetic:{}", message.contact_wxid));
+            (id, SOURCE_KIND_INBOUND_MESSAGE)
+        }
+        AgentTrigger::FollowUp(task) => {
+            let id = task
+                .id
+                .map(|oid| oid.to_hex())
+                .unwrap_or_else(|| "synthetic:follow_up".to_string());
+            (id, SOURCE_KIND_FOLLOW_UP_TASK)
+        }
+    }
 }
 
 pub(crate) async fn run_user_operation_gateway(
@@ -399,6 +454,10 @@ async fn run_user_operation_gateway_inner(
     domain_config: Option<OperationDomainConfig>,
     runtime: UserRuntimeParameters,
 ) -> AppResult<()> {
+    // S1.1 (Phase 0)：派生 R0.1 envelope 的 (source_event_id, source_kind)，
+    // 在所有终态写入点透传，确保 agent_run_logs 闭集字段非空。
+    let (envelope_source_event_id, envelope_source_kind) = trigger_envelope_source(&trigger);
+    let envelope_source_kind = envelope_source_kind.to_string();
     let precheck = precheck_send_gateway(state, &contact, &trigger, &runtime).await?;
     if !precheck.allowed {
         if let Some(task_id) = task_id {
@@ -427,6 +486,8 @@ async fn run_user_operation_gateway_inner(
             Document::new(),
             to_document(&precheck).unwrap_or_default(),
             None,
+            &envelope_source_event_id,
+            &envelope_source_kind,
         )
         .await?;
         return Ok(());
@@ -1153,6 +1214,8 @@ async fn run_user_operation_gateway_inner(
                 pre_revision_summary: pre_revision_summary.clone(),
                 post_revision_summary: post_revision_summary.clone(),
                 self_critique: non_empty_option(&Some(final_decision.self_critique.clone())),
+                source_event_id: envelope_source_event_id.clone(),
+                source_kind: envelope_source_kind.clone(),
             },
         )
         .await?;
@@ -1220,6 +1283,8 @@ async fn run_user_operation_gateway_inner(
                 pre_revision_summary: pre_revision_summary.clone(),
                 post_revision_summary: post_revision_summary.clone(),
                 self_critique: non_empty_option(&Some(final_decision.self_critique.clone())),
+                source_event_id: envelope_source_event_id.clone(),
+                source_kind: envelope_source_kind.clone(),
             },
         )
         .await?;
@@ -1328,6 +1393,8 @@ async fn run_user_operation_gateway_inner(
             pre_revision_summary: pre_revision_summary.clone(),
             post_revision_summary: post_revision_summary.clone(),
             self_critique: non_empty_option(&Some(final_decision.self_critique.clone())),
+            source_event_id: envelope_source_event_id.clone(),
+            source_kind: envelope_source_kind.clone(),
         },
     )
     .await?;
@@ -2010,6 +2077,8 @@ async fn write_agent_run_log(
     review: Document,
     gateway_result: Document,
     error: Option<String>,
+    source_event_id: &str,
+    source_kind: &str,
 ) -> AppResult<()> {
     write_agent_run_log_with_finalize(
         state,
@@ -2024,7 +2093,11 @@ async fn write_agent_run_log(
         review,
         gateway_result,
         error,
-        FinalizeRunLogFields::default(),
+        FinalizeRunLogFields {
+            source_event_id: source_event_id.to_string(),
+            source_kind: source_kind.to_string(),
+            ..FinalizeRunLogFields::default()
+        },
     )
     .await
 }
@@ -2036,6 +2109,10 @@ async fn write_agent_run_log(
 /// `FinalizeRunLogFields::default()` 时退化为既有 `write_agent_run_log` 行为
 /// （这些字段以空字符串 / None / false 形式落库，与 task 2.4 的占位一致）；
 /// task 3.4 的 finalize 路径会传入实际值。
+///
+/// S1.1 (Phase 0)：扩出 `source_event_id / source_kind`，写库前由 `status`
+/// 推算 `lifecycle`，全部经过 [`assert_lifecycle_valid`]，杜绝裸 `String::new()`
+/// 漏 lifecycle 闭集校验的回归。
 #[derive(Debug, Default, Clone)]
 struct FinalizeRunLogFields {
     final_review_status: String,
@@ -2047,6 +2124,8 @@ struct FinalizeRunLogFields {
     pre_revision_summary: Option<String>,
     post_revision_summary: Option<String>,
     self_critique: Option<String>,
+    source_event_id: String,
+    source_kind: String,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2068,6 +2147,14 @@ async fn write_agent_run_log_with_finalize(
     // R9.10.e：写库前先校验 finalReviewStatus / gateway_status，脏值 fail-closed。
     assert_final_review_status_valid(&finalize_fields.final_review_status)?;
     assert_gateway_status_valid(status)?;
+
+    // S1.1 (Phase 0)：lifecycle 闭集校验。由 `status` + `error` 派生终态
+    // lifecycle（与 R0.3 / R0.10 状态机对齐），任何脏值 fail-closed 不写库。
+    // 这取代了既有"裸 String::new() 占位"路径——envelope 在 W1 task 2.5 改造完成
+    // 之前，本路径是 agent_run_logs 唯一终态写入点，必须保证 lifecycle 永远落非空闭集值。
+    let lifecycle =
+        derive_lifecycle_from_status(status, error.as_deref()).to_string();
+    assert_lifecycle_valid(&lifecycle)?;
 
     // MP-5 / Task 15：从 task_local 读 budget snapshot，落 agent_run_logs。
     let budget_snapshot = current_run_budget().map(|b| b.snapshot());
@@ -2103,16 +2190,13 @@ async fn write_agent_run_log_with_finalize(
                 tokens_used,
                 llm_calls_used,
                 degraded_reasons,
-                // ── agent-autonomy-loop W2 (Task 3.4) ──
-                //
-                // finalize_review_for_send 终态字段。`write_agent_run_log`
-                // 调用方走 default，保留旧 trace（lifecycle / source_event_id /
-                // source_kind 在 W1 task 2.5 接入 envelope 时写入；
-                // task 3.4 仅负责 finalReviewStatus / autonomyMode / revision*
-                // 这一组 R9 自治审计字段）。
-                lifecycle: String::new(),
-                source_event_id: String::new(),
-                source_kind: String::new(),
+                // S1.1 (Phase 0)：lifecycle 由 derive_lifecycle_from_status
+                // 推算并经 assert_lifecycle_valid 闭集校验；source_event_id /
+                // source_kind 由调用方按 trigger 显式传入（FinalizeRunLogFields）。
+                // 杜绝旧的裸 String::new() 占位路径。
+                lifecycle: lifecycle.clone(),
+                source_event_id: finalize_fields.source_event_id.clone(),
+                source_kind: finalize_fields.source_kind.clone(),
                 error_summary: None,
                 abort_reason: None,
                 revision_applied: finalize_fields.revision_applied,

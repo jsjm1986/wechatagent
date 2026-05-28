@@ -612,7 +612,11 @@ Review 模式: {}
         format_operation_knowledge_for_prompt(knowledge_chunks),
         knowledge_route_text
     );
-    let value = generate_agent_json(
+    // S2 (Phase 0)：reviewer 双模真并行——主 reviewer 走 generate_agent_json
+    // （含 LRU cache + llm_call_logs），第二 reviewer 走纯 LlmGenerator。
+    // 两路用 tokio::join! 并发，墙钟 ≈ max(p1, p2) 而非 p1 + p2。
+    // 双脑禁用时（second_reviewer_llm = None）退化为单 future，行为不变。
+    let primary_future = generate_agent_json(
         state,
         Some(&contact.account_id),
         Some(&contact.wxid),
@@ -620,23 +624,26 @@ Review 模式: {}
         prompt_key,
         &system,
         &user,
-    )
-    .await?;
-    let mut review: DecisionReviewResult = serde_json::from_value(value)?;
-    let _ = (decision, domain_config, knowledge_chunks, contact);
-    // Phase B / B1：双闸路由替换原 `review.approved = review_passed(...)`。
-    // 软闸失败时保持 approved=false（review_passed 行为）但同时写
-    // needs_revision=true / revision_direction，让 finalize 在硬门未命中时
-    // 把 soft-gate-only 失败矫正为 Approved，以触发 single-shot revision。
-    route_dual_gate(&mut review, runtime);
+    );
+    let value = if let Some(second_llm) = state.second_reviewer_llm.as_ref() {
+        let second_future = second_llm.generate_json(&system, &user);
+        let (primary_res, second_res) = tokio::join!(primary_future, second_future);
+        let primary_value = primary_res?;
+        let mut review: DecisionReviewResult = serde_json::from_value(primary_value)?;
+        let _ = (decision, domain_config, knowledge_chunks, contact);
+        // Phase B / B1：双闸路由替换原 `review.approved = review_passed(...)`。
+        // 软闸失败时保持 approved=false（review_passed 行为）但同时写
+        // needs_revision=true / revision_direction，让 finalize 在硬门未命中时
+        // 把 soft-gate-only 失败矫正为 Approved，以触发 single-shot revision。
+        route_dual_gate(&mut review, runtime);
 
-    // Phase E / E2：reviewer 双脑并行——若 AppState 注入了第二 provider，再跑
-    // 一份独立评分，与主 reviewer 走 [`detect_dual_reviewer_disagreement`]
-    // 比较；分歧即触发 single-shot revision，达到 epistemic diversity。
-    // 第二 provider 调用失败仅 warn 不阻塞——双脑是增益机制，不应成为新故障源。
-    if let Some(second_llm) = state.second_reviewer_llm.as_ref() {
-        match second_llm.generate_json(&system, &user).await {
-            Ok(second_value) => match serde_json::from_value::<DecisionReviewResult>(second_value) {
+        // Phase E / E2：reviewer 双脑并行——若 AppState 注入了第二 provider，再跑
+        // 一份独立评分，与主 reviewer 走 [`detect_dual_reviewer_disagreement`]
+        // 比较；分歧即触发 single-shot revision，达到 epistemic diversity。
+        // 第二 provider 调用失败仅 warn 不阻塞——双脑是增益机制，不应成为新故障源。
+        match second_res {
+            Ok(second_value) => match serde_json::from_value::<DecisionReviewResult>(second_value)
+            {
                 Ok(mut second_review) => {
                     route_dual_gate(&mut second_review, runtime);
                     if let Some(disagreement) =
@@ -667,7 +674,13 @@ Review 模式: {}
                 );
             }
         }
-    }
+        return Ok(review);
+    } else {
+        primary_future.await?
+    };
+    let mut review: DecisionReviewResult = serde_json::from_value(value)?;
+    let _ = (decision, domain_config, knowledge_chunks, contact);
+    route_dual_gate(&mut review, runtime);
 
     Ok(review)
 }

@@ -59,7 +59,6 @@ pub async fn tick(state: &AppState) -> anyhow::Result<()> {
 
 async fn scan_cold_outbound(state: &AppState) -> anyhow::Result<()> {
     let workspace_id = state.config.default_workspace_id.clone();
-    let account_id = state.config.default_account_id.clone();
     let now = DateTime::now();
     let now_ms = now.timestamp_millis();
     let threshold_ms = state
@@ -68,12 +67,16 @@ async fn scan_cold_outbound(state: &AppState) -> anyhow::Result<()> {
         .saturating_mul(60 * 60 * 1000);
     let cold_before = DateTime::from_millis(now_ms - threshold_ms);
 
-    let filter = cold_candidate_filter(&workspace_id, &account_id, cold_before);
+    // S4 (Phase 0)：原先用 default_account_id 锁定单账号扫描，多账号 workspace
+    // 下其它 account 的 cold contact 永远不会被重激活。改成 workspace 级扫描；
+    // emit 仍按 contact 自带 account_id（粘性绑定，不绕过 account_scheduler 的
+    // "已绑定 contact 仍走原账号" 不变量）。
+    let filter = cold_candidate_filter_workspace(&workspace_id, cold_before);
     let mut cursor = state.db.contacts().find(filter, None).await?;
 
     let daily_cap = state.config.cold_contact_daily_emit_cap;
     let already_emitted_today =
-        count_today_cold_emit(state, &workspace_id, &account_id, now).await?;
+        count_today_cold_emit_workspace(state, &workspace_id, now).await?;
     let mut remaining = daily_cap.saturating_sub(already_emitted_today);
 
     let peer_hooks = load_peer_case_hooks(state, &workspace_id).await.unwrap_or_default();
@@ -92,6 +95,17 @@ async fn scan_cold_outbound(state: &AppState) -> anyhow::Result<()> {
         if remaining <= 0 {
             break;
         }
+        // S4 (Phase 0)：写一条 account_scheduler_assignment 审计——contact 已经
+        // 绑定 account，scheduler 结果只用作"哪个时间被路由到哪个账号"的统一
+        // 审计流。失败被吞掉（assign_account 内部已 best-effort 写事件）。
+        let _ = crate::account_scheduler::assign_account(
+            state,
+            &contact.workspace_id,
+            &contact.wxid,
+            None,
+        )
+        .await;
+
         let hook = pick_hook(&peer_hooks, &contact.wxid);
         let last_outbound_repr = contact
             .last_outbound_at
@@ -128,7 +142,7 @@ async fn scan_cold_outbound(state: &AppState) -> anyhow::Result<()> {
 
     write_event(
         state,
-        &account_id,
+        &state.config.default_account_id,
         None,
         "cold_contact_tick",
         "ok",
@@ -145,14 +159,14 @@ async fn scan_cold_outbound(state: &AppState) -> anyhow::Result<()> {
     Ok(())
 }
 
-pub(crate) fn cold_candidate_filter(
+/// S4 (Phase 0)：workspace 级 cold filter。多账号 workspace 的所有 managed
+/// contact 都会被扫描，emit 仍按 contact 自己的 account_id 走（粘性）。
+pub(crate) fn cold_candidate_filter_workspace(
     workspace_id: &str,
-    account_id: &str,
     cold_before: DateTime,
 ) -> Document {
     doc! {
         "workspace_id": workspace_id,
-        "account_id": account_id,
         "agent_status": "managed",
         "last_outbound_at": { "$lt": cold_before },
         "$or": [
@@ -185,14 +199,14 @@ pub(crate) fn cold_candidate_passes_in_memory(contact: &Contact, _now_ms: i64) -
     true
 }
 
-async fn count_today_cold_emit(
+/// S4 (Phase 0)：workspace 级当日已 emit 计数，配合
+/// `cold_candidate_filter_workspace`。daily cap 是 workspace 维度，避免一个
+/// account 把整个池子的预算吃光也不影响其它 account。
+async fn count_today_cold_emit_workspace(
     state: &AppState,
-    _workspace_id: &str,
-    account_id: &str,
+    workspace_id: &str,
     now: DateTime,
 ) -> anyhow::Result<i64> {
-    // 当日 [00:00, now]（UTC 边界，与 planner 一致；落地阶段如需改运营时区
-    // 与 planner::day_start_before 一起调）。
     let now_ms = now.timestamp_millis();
     let day_ms = 24 * 60 * 60 * 1000;
     let day_start_ms = (now_ms / day_ms) * day_ms;
@@ -201,7 +215,7 @@ async fn count_today_cold_emit(
         .events()
         .count_documents(
             doc! {
-                "account_id": account_id,
+                "workspace_id": workspace_id,
                 "kind": "cold_contact_emit",
                 "created_at": { "$gte": DateTime::from_millis(day_start_ms) },
             },
@@ -330,6 +344,67 @@ fn pick_hook(pool: &[String], contact_wxid: &str) -> Option<String> {
     Some(pool[idx].clone())
 }
 
+/// Phase D / D3：纯决策函数版本的"是否要为该 contact 在本 tick 发冷重激活"。
+///
+/// 镜像生产路径 [`scan_cold_outbound`] 的判定（不含 LLM / DB 写入）：
+/// - 必须是 managed contact；
+/// - `last_outbound_at` 必须早于 `cold_before` 阈值；
+/// - 上一轮 inbound 比 outbound 还新 → 属 silent 段，不属 cold；
+/// - cooldown 未过期 → 跳过；
+/// - 已存在 pending follow_up（同 contact）→ 跳过（与 planner 共用幂等池）。
+///
+/// 用于 PBT 断言："同一 contact + 已 emit pending follow_up + 同一 tick 内重复
+/// 调用，必然返回 Skip"，即 D3 计划锁定的 cold_reactivation_idempotent 不变量。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ColdEmitDecision {
+    /// 当前 tick 应为该 contact emit 一次冷重激活 follow_up。
+    Emit,
+    /// 不在 cold 范围（outbound 太新）。
+    NotCold,
+    /// 用户已经回过话（属 silent 段）。
+    UserRecentlyReplied,
+    /// 状态非 managed。
+    NotManaged,
+    /// cooldown 未过期。
+    OnCooldown,
+    /// 从未 outbound 过（属新建未触达，不算冷）。
+    NeverOutbound,
+    /// 已有 pending follow_up，幂等跳过。
+    AlreadyPending,
+}
+
+pub fn decide_cold_emit(
+    contact: &Contact,
+    now_ms: i64,
+    cold_before_ms: i64,
+    has_pending_follow_up: bool,
+) -> ColdEmitDecision {
+    use crate::models::AgentStatus;
+    if !matches!(contact.agent_status, AgentStatus::Managed) {
+        return ColdEmitDecision::NotManaged;
+    }
+    let Some(last_outbound) = contact.last_outbound_at else {
+        return ColdEmitDecision::NeverOutbound;
+    };
+    if last_outbound.timestamp_millis() >= cold_before_ms {
+        return ColdEmitDecision::NotCold;
+    }
+    if let Some(last_inbound) = contact.last_inbound_at {
+        if last_inbound.timestamp_millis() > last_outbound.timestamp_millis() {
+            return ColdEmitDecision::UserRecentlyReplied;
+        }
+    }
+    if let Some(cooldown) = contact.cooldown_until {
+        if cooldown.timestamp_millis() > now_ms {
+            return ColdEmitDecision::OnCooldown;
+        }
+    }
+    if has_pending_follow_up {
+        return ColdEmitDecision::AlreadyPending;
+    }
+    ColdEmitDecision::Emit
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -381,7 +456,7 @@ mod tests {
     #[test]
     fn cold_filter_targets_outbound_not_inbound() {
         let cold_before = DateTime::from_millis(1_000);
-        let filter = cold_candidate_filter("default", "default", cold_before);
+        let filter = cold_candidate_filter_workspace("default", cold_before);
         // 静默段查 last_inbound_at；冷段必须查 last_outbound_at，不能搞混。
         assert!(filter.contains_key("last_outbound_at"));
         assert!(!filter.contains_key("last_inbound_at"));

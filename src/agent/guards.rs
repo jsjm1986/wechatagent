@@ -108,7 +108,10 @@ pub(crate) fn operation_states(domain_config: Option<&OperationDomainConfig>) ->
 /// 状态机迁移合法性校验。
 ///
 /// 规则：
-/// - 状态机为空（domain_config 缺失）时不做迁移校验，向后兼容老配置；
+/// - `domain_config = None` 时不做迁移校验（simulation / 老路径 fail-open）；
+/// - `domain_config` 提供但 `state_machine.states` 为空：S1.2 (Phase 0)
+///   fail-closed，返回 `Some("state_transition_invalid: state_machine_empty ...")`，
+///   active domain 未配状态机视为配置错误，启动期 sanity check（main.rs）会先拒绝；
 /// - 目标 state `allowFromAny=true`（如 cooldown）总是合法；
 /// - `from` 为空时只有目标 = `new_contact` 合法；
 /// - 否则 `from` 必须出现在目标 state 的 `allowedFrom` 列表中。
@@ -119,9 +122,21 @@ pub fn check_state_transition(
     from: Option<&str>,
     to: &str,
 ) -> Option<String> {
+    // domain_config = None：simulation / 老调用方 fail-open，不强校验。
+    if domain_config.is_none() {
+        return None;
+    }
     let states = operation_states(domain_config);
     if states.is_empty() {
-        return None; // 没有状态机不强校验。
+        // S1.2 (Phase 0)：active domain 未配状态机即配置错误，runtime fail-closed。
+        // 启动期 main.rs::run_active_domain_state_machine_sanity_check 会先拒绝
+        // 这种情况，本路径只是"defense in depth"以防有未挂状态机的 domain 漏过。
+        return Some(format!(
+            "state_transition_invalid: state_machine_empty domain={} to={to}",
+            domain_config
+                .map(|c| c.domain.as_str())
+                .unwrap_or("<unknown>"),
+        ));
     }
     let target = states
         .iter()

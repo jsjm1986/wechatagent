@@ -50,6 +50,13 @@ mod tasks;
 pub use outcomes_autonomy::{
     get_autonomy_outcomes, list_autonomy_revisions, AutonomyMetricsQuery, AutonomyRevisionsQuery,
 };
+pub use knowledge::{
+    ChunkBatchArchiveRequest, ChunkBatchVerifyRequest, ChunkReferrersQuery,
+};
+// G3：批量动作 + 反向查询的处理函数。集成测试直接调用绕过 axum HTTP 层。
+pub mod ext_knowledge {
+    pub use super::knowledge::{batch_archive_chunks, batch_verify_chunks, list_chunk_referrers};
+}
 pub use shared::upsert_contact_from_value;
 
 use accounts::{list_accounts, sync_accounts, update_account_mcp_key};
@@ -105,6 +112,7 @@ use knowledge::{
     apply_knowledge_gap_signal,
     archive_operation_knowledge_chunk, ask_knowledge, ask_knowledge_stream, knowledge_metrics,
     auto_verify_operation_knowledge_chunks,
+    batch_archive_chunks, batch_verify_chunks,
     chat_apply, chat_discard,
     chat_history, chat_session_stream, chat_task_cancel, chat_task_create, chat_task_get,
     chat_turn, create_operation_knowledge,
@@ -116,12 +124,14 @@ use knowledge::{
     get_operation_knowledge_chunk_source, get_operation_knowledge_completeness,
     get_operation_knowledge_document, get_operation_knowledge_integrity_report,
     extract_operation_knowledge_tags, import_operation_knowledge_apply,
-    import_operation_knowledge_preview, knowledge_inbox,
+    import_operation_knowledge_preview, knowledge_aggregate_metadata, knowledge_inbox,
+    list_chunk_referrers,
     list_knowledge_gap_signals,
     list_knowledge_usage,
     list_operation_knowledge, list_operation_knowledge_chunk_revisions,
     list_operation_knowledge_chunks,
     list_operation_knowledge_document_chunks, list_operation_knowledge_documents,
+    list_operator_memory,
     merge_operation_knowledge_chunk,
     open_operation_knowledge_slices, patch_operation_knowledge_chunk,
     propose_chunk_repair, propose_pack_repair,
@@ -338,6 +348,19 @@ pub fn api_router(state: AppState) -> Router<AppState> {
             "/operation-knowledge/chunks/:id/relate/:target_id",
             axum::routing::delete(unrelate_operation_knowledge_chunk),
         )
+        // ── G3 · 反向查询 + 批量动作（人工触发，非 AI 自动） ─────────────
+        .route(
+            "/operation-knowledge/chunks/referrers",
+            get(list_chunk_referrers),
+        )
+        .route(
+            "/operation-knowledge/chunks/batch-verify",
+            post(batch_verify_chunks),
+        )
+        .route(
+            "/operation-knowledge/chunks/batch-archive",
+            post(batch_archive_chunks),
+        )
         .route(
             "/operation-knowledge/catalog",
             get(get_operation_knowledge_catalog),
@@ -382,6 +405,7 @@ pub fn api_router(state: AppState) -> Router<AppState> {
         .route("/knowledge/ask", post(ask_knowledge))
         .route("/knowledge/ask/stream", get(ask_knowledge_stream))
         .route("/knowledge/metrics", get(knowledge_metrics))
+        .route("/knowledge/operator-memory", get(list_operator_memory))
         .route(
             "/operation-knowledge/tools/open-slice",
             post(open_operation_knowledge_slices),
@@ -423,6 +447,10 @@ pub fn api_router(state: AppState) -> Router<AppState> {
         .route(
             "/operation-knowledge/inbox",
             get(knowledge_inbox),
+        )
+        .route(
+            "/operation-knowledge/metadata",
+            get(knowledge_aggregate_metadata),
         )
         .route(
             "/operation-knowledge/chat/:session_id",

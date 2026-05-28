@@ -116,6 +116,24 @@ pub struct AppConfig {
     /// M4：每个 finalReviewStatus 失败桶给 Critic LLM 的样本数。
     pub evolution_cohort_sample_per_failure_bucket: usize,
 
+    // ── Phase C / C5：threshold_overrides 自动 release（hold_rate close-loop） ──
+    //
+    // 默认关停。`evolution_auto_release_enabled=true` 时演化器 tick 末尾会扫描
+    // status="eligible_for_release" 的 threshold proposal，回看
+    // `evolution_auto_release_window_hours` 小时窗口的 hold_rate / hit_rate 信号；
+    // 仍在异常区间 → 自动调 release_threshold（admin id="evolution_auto_release"）；
+    // 已回到正常区间 → 跳过留给 admin 显式判断。
+    //
+    // 自动通道仅适用于 threshold（纯统计可观测）；prompt 候选仍要 admin 二次确认。
+    // rollback 永远人工——Requirements 9.7 的硬约束。
+
+    /// Phase C / C5：是否启用 threshold proposal 自动 release。默认 false。
+    pub evolution_auto_release_enabled: bool,
+    /// Phase C / C5：自动 release 决策回看窗口（小时）。默认 336（14 天）。
+    pub evolution_auto_release_window_hours: u32,
+    /// Phase C / C5：单 tick 自动 release 的 proposal 数量上限（防止一波打开过多 gate）。
+    pub evolution_auto_release_per_tick_cap: usize,
+
     // ── Knowledge Digest Workstation ──
     //
     // 默认关停。设计见 `.kiro/specs/knowledge-digest-workstation/`。
@@ -263,6 +281,21 @@ impl AppConfig {
             evolution_cohort_sample_per_failure_bucket: env_or(
                 "EVOLUTION_COHORT_SAMPLE_PER_FAILURE_BUCKET",
                 "10",
+            )
+            .parse()?,
+            // ── Phase C / C5：自动 release ──
+            evolution_auto_release_enabled: parse_bool(&env_or(
+                "EVOLUTION_AUTO_RELEASE_ENABLED",
+                "false",
+            )),
+            evolution_auto_release_window_hours: env_or(
+                "EVOLUTION_AUTO_RELEASE_WINDOW_HOURS",
+                "336",
+            )
+            .parse()?,
+            evolution_auto_release_per_tick_cap: env_or(
+                "EVOLUTION_AUTO_RELEASE_PER_TICK_CAP",
+                "1",
             )
             .parse()?,
             // ── Knowledge Digest Workstation ──

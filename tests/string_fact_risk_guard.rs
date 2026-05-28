@@ -15,8 +15,8 @@ use proptest::prelude::*;
 use wechatagent::agent::check_state_transition;
 use wechatagent::models::OperationDomainConfig;
 
-/// 构造一个空 `state_machine` 的 domain_config —— `check_state_transition`
-/// 的 fail-open 路径（empty states → 不强校验）输入。
+/// 构造一个空 `state_machine` 的 domain_config —— S1.2 (Phase 0)
+/// fail-closed 输入：active domain 必须有非空 state machine。
 fn empty_state_machine_config() -> OperationDomainConfig {
     OperationDomainConfig {
         id: None,
@@ -77,9 +77,15 @@ fn no_domain_config_skips_validation() {
 }
 
 #[test]
-fn empty_state_machine_skips_validation() {
+fn empty_state_machine_fails_closed() {
+    // S1.2 (Phase 0)：active domain 提供 cfg 但 state_machine 为空 → 必须拦截。
+    // 启动期 sanity check 会拒绝这种配置；runtime 这里是 defense-in-depth。
     let cfg = empty_state_machine_config();
-    assert!(check_state_transition(Some(&cfg), Some("foo"), "bar").is_none());
+    let blocked = check_state_transition(Some(&cfg), Some("foo"), "bar");
+    assert!(blocked.is_some(), "empty state_machine + active domain 必须 fail-closed");
+    let reason = blocked.unwrap();
+    assert!(reason.contains("state_transition_invalid"));
+    assert!(reason.contains("state_machine_empty"));
 }
 
 #[test]

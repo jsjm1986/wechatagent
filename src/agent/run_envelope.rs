@@ -88,6 +88,7 @@ pub const GATEWAY_STATUS_VALUES: &[&str] = &[
     "approved",
     "allowed",
     "sent",
+    "no_reply",
     "review_blocked",
     "revision_failed",
     "revision_skipped_invalid_direction",
@@ -110,6 +111,16 @@ pub const GATEWAY_STATUS_VALUES: &[&str] = &[
     "context_changed",
     "policy_cooldown",
     "policy_wait_user_reply",
+    // S5.1 (Phase 0)：补齐 gateway.rs 实际写入但漏录的两条状态。
+    // - "gateway_blocked"：precheck 第二轮失败（gateway.rs:1240）
+    // - "precheck_blocked"：precheck 第一轮失败的 lifecycle 推导口径
+    //   （derive_lifecycle_from_status 已识别但闭集未包含）
+    "gateway_blocked",
+    "precheck_blocked",
+    // S5.2 (Phase 0)：管理 Agent send_contact_message_gateway 改走 outbox 后
+    // decision_reviews / agent_run_logs 可能写入 "outbox_enqueued" 终态。
+    // dispatcher 完成 MCP 发送后会补一条 "sent"。
+    "outbox_enqueued",
 ];
 
 /// 严禁取值（R2.7 业务语义保护 + R9.2）。任何 finalReviewStatus / gateway_status
@@ -126,9 +137,8 @@ const FORBIDDEN_HUMAN_HANDOFF_VALUES: &[&str] = &[
 /// R9.10.e：写库前校验 `finalReviewStatus` 取值是否在合法枚举内。
 ///
 /// 空字符串视为合法（envelope-started 占位语义，详见 R0.1）；其它脏值
-/// SHALL 触发 `tracing::error!` + `debug_assert!` + 返回
-/// [`AppError::External`]（采用 External 而非 BadRequest，因为这是内部
-/// 协议违规、不是用户输入错误）。
+/// SHALL 触发 `tracing::error!` + 返回 [`AppError::External`]（采用 External
+/// 而非 BadRequest，因为这是内部协议违规、不是用户输入错误）。
 pub fn assert_final_review_status_valid(value: &str) -> AppResult<()> {
     // 空字符串是合法占位（envelope-started 时未确定终态）
     if value.is_empty() {
@@ -139,7 +149,6 @@ pub fn assert_final_review_status_valid(value: &str) -> AppResult<()> {
             "agent_protocol_violation: finalReviewStatus={value} is forbidden (human-handoff semantics)"
         );
         tracing::error!("{}", msg);
-        debug_assert!(false, "{}", msg);
         return Err(AppError::External(msg));
     }
     if !FINAL_REVIEW_STATUS_VALUES.contains(&value) {
@@ -148,7 +157,6 @@ pub fn assert_final_review_status_valid(value: &str) -> AppResult<()> {
             FINAL_REVIEW_STATUS_VALUES
         );
         tracing::error!("{}", msg);
-        debug_assert!(false, "{}", msg);
         return Err(AppError::External(msg));
     }
     Ok(())
@@ -167,7 +175,6 @@ pub fn assert_gateway_status_valid(value: &str) -> AppResult<()> {
             "agent_protocol_violation: gateway_status={value} is forbidden (human-handoff semantics)"
         );
         tracing::error!("{}", msg);
-        debug_assert!(false, "{}", msg);
         return Err(AppError::External(msg));
     }
     if !GATEWAY_STATUS_VALUES.contains(&value) {
@@ -176,10 +183,63 @@ pub fn assert_gateway_status_valid(value: &str) -> AppResult<()> {
             GATEWAY_STATUS_VALUES
         );
         tracing::error!("{}", msg);
-        debug_assert!(false, "{}", msg);
         return Err(AppError::External(msg));
     }
     Ok(())
+}
+
+/// S1.1 (Phase 0)：写库前校验 `lifecycle` 取值是否在合法枚举内。
+///
+/// 空字符串**不**视为合法 —— envelope 已经在 `write_run_envelope_started`
+/// 写入时把 `lifecycle="started"` 落库；终态写入路径（gateway finalize）
+/// SHALL 显式给出一个非空 lifecycle，否则前端筛选会落入"未完成"分桶。
+pub fn assert_lifecycle_valid(value: &str) -> AppResult<()> {
+    if matches!(
+        value,
+        LIFECYCLE_STARTED
+            | LIFECYCLE_RUNNING
+            | LIFECYCLE_COMPLETED
+            | LIFECYCLE_FAILED_BEFORE_DECISION
+            | LIFECYCLE_FAILED_AFTER_DECISION
+            | LIFECYCLE_ABORTED_BY_BUDGET
+            | LIFECYCLE_ABORTED_BY_EXTERNAL_SIGNAL
+    ) {
+        return Ok(());
+    }
+    let msg = format!(
+        "agent_protocol_violation: lifecycle={value} is not in the allowed enum (started/running/completed/failed_*/aborted_*)"
+    );
+    tracing::error!("{}", msg);
+    Err(AppError::External(msg))
+}
+
+/// S1.1 (Phase 0)：由 `gateway_status` + 是否 budget-exceeded 推算终态 `lifecycle`。
+///
+/// 推算规则（与 R0.3 / R0.10 一致）：
+/// * `precheck_blocked / cooldown / rate_limited / daily_limit / expired /
+///   not_managed / context_changed / policy_*`：决策前被拦 → `failed_before_decision`；
+/// * `blocked_by_budget` 或 `error == Some(budget_exceeded)`：→ `aborted_by_budget`；
+/// * `sent / no_reply / outbox_enqueued / approved / allowed`：→ `completed`；
+/// * 其它（review_blocked / blocked_by_safety_guard / held_by_ai_policy /
+///   blocked_unverified_product_claim / revision_failed / tool_loop_timeout 等）：
+///   决策已生成但被守门拦下 → `failed_after_decision`。
+pub fn derive_lifecycle_from_status(gateway_status: &str, error: Option<&str>) -> &'static str {
+    if matches!(
+        gateway_status,
+        "blocked_by_budget" | "ai_waiting_for_more_context"
+    ) || error
+        .map(|e| e.contains("budget_exceeded") || e.contains("BudgetExceeded"))
+        .unwrap_or(false)
+    {
+        return LIFECYCLE_ABORTED_BY_BUDGET;
+    }
+    match gateway_status {
+        "sent" | "no_reply" | "approved" | "allowed" | "outbox_enqueued" => LIFECYCLE_COMPLETED,
+        "not_managed" | "cooldown" | "rate_limited" | "daily_limit" | "expired"
+        | "context_changed" | "policy_cooldown" | "policy_wait_user_reply"
+        | "precheck_blocked" => LIFECYCLE_FAILED_BEFORE_DECISION,
+        _ => LIFECYCLE_FAILED_AFTER_DECISION,
+    }
 }
 
 /// R0.2 / R0.10：lifecycle 状态机合法转换判定。
@@ -962,6 +1022,25 @@ mod tests {
         // 该路径不应被拒收（否则会破坏 W1 信封先于 LLM 写入的不变量）。
         assert!(assert_final_review_status_valid("").is_ok());
         assert!(assert_gateway_status_valid("").is_ok());
+    }
+
+    /// S5.1 (Phase 0)：补齐三个被 gateway.rs 写入但漏录闭集的 status：
+    /// - `no_reply`：should_reply=false 时 finalize 路径写入
+    /// - `gateway_blocked`：precheck 第二轮失败
+    /// - `precheck_blocked`：lifecycle 推导口径
+    ///
+    /// 这条测试是回归门——任何 PR 把它们从 `GATEWAY_STATUS_VALUES` 删掉，会
+    /// 导致 prod 路径写库时 fail-closed 不写库。
+    #[test]
+    fn audit_phase0_s5_added_gateway_statuses_are_in_closed_set() {
+        for value in &["no_reply", "gateway_blocked", "precheck_blocked"] {
+            assert!(
+                assert_gateway_status_valid(value).is_ok(),
+                "{value} SHALL 在 GATEWAY_STATUS_VALUES 闭集内"
+            );
+        }
+        // sanity：未补录的脏值仍然 fail-closed。
+        assert!(assert_gateway_status_valid("not_a_real_status").is_err());
     }
 
     // ── agent-autonomy-loop W6 / Task 7.8：autonomy_mode 落库兜底单元测试 ──

@@ -183,6 +183,65 @@ fn stable_pick<'a>(pool: &'a [&'a WechatAccount], contact_wxid: &str) -> &'a Wec
     pool[idx]
 }
 
+/// Phase D / D4：纯决策函数版本的"在已知 pool + 当日已用量 + 当前小时下挑账号"。
+///
+/// 与 [`assign_account`] 的核心决策逻辑同源（off_hours / capacity / online 过滤
+/// + stable_pick 散列），但不读 / 不写 mongo，便于单元 + PBT 直接断言：
+/// - **不变量 1（capacity full → fallback only when forced）**：所有账号 capacity
+///   均满 + 至少一个 online 时，返回任一 online 账号 ID，**绝不返回 None**（保送达
+///   优先）。
+/// - **不变量 2（同 wxid 同 pool 决策稳定）**：同 (pool, used, cur_hour, wxid)
+///   两次调用必返回同一 account_id。
+/// - **不变量 3（容量为 0 视为不限）**：capacity=0 始终参与候选。
+/// - **不变量 4（off_hours 命中跳过）**：命中 off_hours 的账号在严格池里不参与，
+///   只有"所有候选都被 off_hours / capacity 排除时"才退化到 online-only。
+pub fn decide_assigned_account<'a>(
+    accounts: &'a [WechatAccount],
+    used_today: &[(String, i64)],
+    cur_hour: u32,
+    contact_wxid: &str,
+) -> Option<&'a WechatAccount> {
+    if accounts.is_empty() {
+        return None;
+    }
+    let strict_idxs: Vec<usize> = accounts
+        .iter()
+        .enumerate()
+        .filter(|(_, a)| a.online)
+        .filter(|(_, a)| !is_in_off_hours(&a.off_hours, cur_hour))
+        .filter(|(_, a)| {
+            if a.capacity == 0 {
+                return true;
+            }
+            let used = used_today
+                .iter()
+                .find(|(id, _)| id == &a.account_id)
+                .map(|(_, c)| *c)
+                .unwrap_or(0);
+            (used as u32) < a.capacity
+        })
+        .map(|(i, _)| i)
+        .collect();
+
+    let pool_idxs: Vec<usize> = if !strict_idxs.is_empty() {
+        strict_idxs
+    } else {
+        accounts
+            .iter()
+            .enumerate()
+            .filter(|(_, a)| a.online)
+            .map(|(i, _)| i)
+            .collect()
+    };
+    if pool_idxs.is_empty() {
+        return None;
+    }
+    let mut hasher = DefaultHasher::new();
+    contact_wxid.hash(&mut hasher);
+    let pick = pool_idxs[(hasher.finish() as usize) % pool_idxs.len()];
+    Some(&accounts[pick])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

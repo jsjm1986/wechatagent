@@ -1,24 +1,36 @@
 import {
   Activity,
   AlertTriangle,
+  Archive,
+  ArrowRight,
   Bot,
+  BookOpen,
   BrainCircuit,
+  Calendar,
   CheckCircle2,
   ChevronDown,
   ChevronRight,
   Clock3,
+  Compass,
   Copy,
   Eye,
   EyeOff,
   FileBox,
   FileText,
   FlaskConical,
+  GitMerge,
+  History,
   Inbox,
   LibraryBig,
   LayoutDashboard,
+  Link2,
+  Loader2,
+  Map as MapIcon,
   MessageSquareText,
   Package,
+  Plus,
   RefreshCw,
+  Scissors,
   Search,
   SendHorizonal,
   Settings2,
@@ -26,15 +38,17 @@ import {
   Sparkles,
   SquarePen,
   Trash2,
+  Undo2,
   UploadCloud,
   UserRoundCheck,
   User2,
   UsersRound,
+  Wrench,
   Workflow,
   X
 } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
-import { FormEvent, useEffect, useMemo, useRef, useState, KeyboardEvent, ClipboardEvent } from "react";
+import { Fragment, FormEvent, useCallback, useEffect, useMemo, useRef, useState, KeyboardEvent, ClipboardEvent } from "react";
 import type * as React from "react";
 
 import { EvolutionCenterTab } from "./EvolutionCenterTab";
@@ -5277,7 +5291,9 @@ function eventTone(status?: string): "ai" | "good" | "warn" | "error" | "neutral
 }
 
 function formatScores(scores: Record<string, number>) {
-  const keys = ["humanLike", "emotionalValue", "knowledgeGrounding", "hallucination"];
+  // S1.4 (Phase 0)：与 src/agent/types.rs::ReviewScores 同源——仅展示当前
+  // 三闸 + 软闸字段，移除 productAccuracy / factRisk 五老评分键。
+  const keys = ["humanLike", "emotionalValue", "hallucinationScore", "knowledgeGroundingScore", "pressureRisk"];
   return keys
     .filter((key) => scores[key] !== undefined)
     .map((key) => `${key}:${scores[key]}`)
@@ -5549,78 +5565,647 @@ function EvolutionCenterView() {
 //   ChunkDetail 透出 source_quote 黄边块 + source_anchors 锚点 + related_chunks 跳转
 // - DomainSchemaTab：列 active / 历史版本，一键切换 active
 // - ChunkRevisionsDrawer：输入 chunk_id 拉历史 timeline
-type KnowledgeWikiTab =
-  | "ask"
-  | "lint"
-  | "review"
-  | "tree"
-  | "domainSchemas"
-  | "revisions"
-  | "metrics";
+type KnowledgeMode = "today" | "explore" | "steward" | "atlas";
+
+interface ModeMeta {
+  key: KnowledgeMode;
+  label: string;
+  caption: string;
+  Icon: LucideIcon;
+}
+
+const KNOWLEDGE_MODES: ModeMeta[] = [
+  { key: "today", label: "今日", caption: "Digest 与待办", Icon: Calendar },
+  { key: "explore", label: "探索", caption: "知识问答与浏览", Icon: Compass },
+  { key: "steward", label: "治理", caption: "信号、待评审、修订", Icon: Wrench },
+  { key: "atlas", label: "全景", caption: "Schema、指标、记忆", Icon: MapIcon }
+];
 
 function KnowledgeWikiView() {
-  const [tab, setTab] = useState<KnowledgeWikiTab>("ask");
+  const [mode, setMode] = useState<KnowledgeMode>("today");
   return (
-    <section className="qualityCenter knowledgeWiki">
-      <div className="panelHead compact">
-        <div>
-          <span>Knowledge Wiki Admin</span>
-          <h2>Wiki 管理</h2>
-        </div>
-        <FileBox size={18} />
+    <section className="qualityCenter knowledgeWiki knowledgeWorkstation">
+      <header className="wikiArchiveHeader" style={{ padding: "16px 20px 12px", marginBottom: 0 }}>
+        <span className="wikiArchiveSubtitle">Knowledge Workstation · 知识档案馆</span>
+        <h2 style={{ display: "flex", alignItems: "center", gap: 10, fontSize: 22 }}>
+          <FileBox size={20} /> 知识库工作站
+        </h2>
+      </header>
+      <div className="wikiModeBar">
+        {KNOWLEDGE_MODES.map((m) => {
+          const ModeIcon = m.Icon;
+          const active = mode === m.key;
+          return (
+            <button
+              key={m.key}
+              className={active ? "wikiModeBarBtn active" : "wikiModeBarBtn"}
+              onClick={() => setMode(m.key)}
+              type="button"
+            >
+              <ModeIcon size={16} />
+              <span className="wikiModeBarLabel">{m.label}</span>
+              <span className="wikiModeBarCaption">{m.caption}</span>
+            </button>
+          );
+        })}
       </div>
-      <div className="qualityTabs">
-        <button
-          className={tab === "ask" ? "tab active" : "tab"}
-          onClick={() => setTab("ask")}
-        >
-          知识问答
-        </button>
-        <button
-          className={tab === "lint" ? "tab active" : "tab"}
-          onClick={() => setTab("lint")}
-        >
-          质量信号
-        </button>
-        <button
-          className={tab === "review" ? "tab active" : "tab"}
-          onClick={() => setTab("review")}
-        >
-          待评审
-        </button>
-        <button
-          className={tab === "tree" ? "tab active" : "tab"}
-          onClick={() => setTab("tree")}
-        >
-          知识树
-        </button>
-        <button
-          className={tab === "domainSchemas" ? "tab active" : "tab"}
-          onClick={() => setTab("domainSchemas")}
-        >
-          行业 Schema
-        </button>
-        <button
-          className={tab === "revisions" ? "tab active" : "tab"}
-          onClick={() => setTab("revisions")}
-        >
-          编辑历史
-        </button>
-        <button
-          className={tab === "metrics" ? "tab active" : "tab"}
-          onClick={() => setTab("metrics")}
-        >
-          指标
-        </button>
+      <div className="wikiModeStage">
+        {mode === "today" && <TodayMode />}
+        {mode === "explore" && <ExploreMode />}
+        {mode === "steward" && <StewardMode />}
+        {mode === "atlas" && <AtlasMode />}
       </div>
-      {tab === "ask" && <AskView />}
-      {tab === "lint" && <LintView />}
-      {tab === "review" && <ReviewView />}
-      {tab === "tree" && <KnowledgeTreeView />}
-      {tab === "domainSchemas" && <DomainSchemaTab />}
-      {tab === "revisions" && <ChunkRevisionsDrawer />}
-      {tab === "metrics" && <MetricsTab />}
     </section>
+  );
+}
+
+function TodayMode() {
+  const [pane, setPane] = useState<"digest" | "chat" | "inbox">("digest");
+  return (
+    <div className="wikiModeGrid wikiModeGrid--today">
+      <div className="wikiModePane wikiModePane--nav wikiStewardNav">
+        <button
+          type="button"
+          className={pane === "digest" ? "wikiStewardNavBtn active" : "wikiStewardNavBtn"}
+          onClick={() => setPane("digest")}
+        >
+          <Sparkles size={14} /> 今日 Digest
+        </button>
+        <button
+          type="button"
+          className={pane === "chat" ? "wikiStewardNavBtn active" : "wikiStewardNavBtn"}
+          onClick={() => setPane("chat")}
+        >
+          <MessageSquareText size={14} /> AI 协作
+        </button>
+        <button
+          type="button"
+          className={pane === "inbox" ? "wikiStewardNavBtn active" : "wikiStewardNavBtn"}
+          onClick={() => setPane("inbox")}
+        >
+          <Inbox size={14} /> 待办收件箱
+        </button>
+      </div>
+      <div className="wikiModePane wikiModePane--main">
+        {pane === "digest" && <DigestCanvas />}
+        {pane === "chat" && <ChatWorkbench />}
+        {pane === "inbox" && <KnowledgeInbox />}
+      </div>
+      <div className="wikiModePane wikiModePane--side">
+        <TaskRail />
+      </div>
+    </div>
+  );
+}
+
+function ExploreMode() {
+  const [focusedId, setFocusedId] = useState<string | null>(null);
+  const [collapsed, setCollapsed] = useState(false);
+
+  useEffect(() => {
+    function onFocus(e: Event) {
+      const ce = e as CustomEvent<{ chunkId?: string }>;
+      const id = ce.detail?.chunkId;
+      if (typeof id === "string" && id) {
+        setFocusedId(id);
+        setCollapsed(false);
+      }
+    }
+    window.addEventListener("wikiFocusChunk", onFocus as EventListener);
+    return () => window.removeEventListener("wikiFocusChunk", onFocus as EventListener);
+  }, []);
+
+  return (
+    <div className={`wikiModeGrid wikiModeGrid--explore${collapsed ? " is-collapsed" : ""}`}>
+      <div className="wikiModePane wikiModePane--nav">
+        <KnowledgeTreeView />
+      </div>
+      <div className="wikiModePane wikiModePane--main">
+        <AskView />
+      </div>
+      {!collapsed ? (
+        <ChunkInspectorPane
+          chunkId={focusedId}
+          onClose={() => setCollapsed(true)}
+          onClear={() => setFocusedId(null)}
+        />
+      ) : (
+        <button
+          type="button"
+          className="wikiInspectorClose"
+          onClick={() => setCollapsed(false)}
+          title="展开 Inspector"
+          style={{ position: "absolute", right: 8, top: 64 }}
+        >
+          <ChevronRight size={16} />
+        </button>
+      )}
+    </div>
+  );
+}
+
+function StewardMode() {
+  const [pane, setPane] = useState<"lint" | "review" | "revisions" | "documents" | "import" | "observability">("lint");
+  const [focusedId, setFocusedId] = useState<string | null>(null);
+  const [collapsed, setCollapsed] = useState(true);
+
+  useEffect(() => {
+    function onFocus(e: Event) {
+      const ce = e as CustomEvent<{ chunkId?: string }>;
+      const id = ce.detail?.chunkId;
+      if (typeof id === "string" && id) {
+        setFocusedId(id);
+        setCollapsed(false);
+      }
+    }
+    window.addEventListener("wikiFocusChunk", onFocus as EventListener);
+    return () => window.removeEventListener("wikiFocusChunk", onFocus as EventListener);
+  }, []);
+
+  return (
+    <div
+      className={`wikiModeGrid wikiModeGrid--steward${
+        !collapsed ? " has-inspector" : ""
+      }`}
+    >
+      <div className="wikiModePane wikiModePane--nav wikiStewardNav">
+        <button
+          type="button"
+          className={pane === "lint" ? "wikiStewardNavBtn active" : "wikiStewardNavBtn"}
+          onClick={() => setPane("lint")}
+        >
+          <AlertTriangle size={14} /> 质量信号
+        </button>
+        <button
+          type="button"
+          className={pane === "review" ? "wikiStewardNavBtn active" : "wikiStewardNavBtn"}
+          onClick={() => setPane("review")}
+        >
+          <ShieldCheck size={14} /> 待评审
+        </button>
+        <button
+          type="button"
+          className={pane === "revisions" ? "wikiStewardNavBtn active" : "wikiStewardNavBtn"}
+          onClick={() => setPane("revisions")}
+        >
+          <Clock3 size={14} /> 修订历史
+        </button>
+        <button
+          type="button"
+          className={pane === "documents" ? "wikiStewardNavBtn active" : "wikiStewardNavBtn"}
+          onClick={() => setPane("documents")}
+        >
+          <FileText size={14} /> 文档目录
+        </button>
+        <button
+          type="button"
+          className={pane === "import" ? "wikiStewardNavBtn active" : "wikiStewardNavBtn"}
+          onClick={() => setPane("import")}
+        >
+          <UploadCloud size={14} /> 导入向导
+        </button>
+        <button
+          type="button"
+          className={pane === "observability" ? "wikiStewardNavBtn active" : "wikiStewardNavBtn"}
+          onClick={() => setPane("observability")}
+        >
+          <Activity size={14} /> 诊断仪表
+        </button>
+      </div>
+      <div className="wikiModePane wikiModePane--main">
+        {pane === "lint" && <LintView />}
+        {pane === "review" && <ReviewView />}
+        {pane === "revisions" && <ChunkRevisionsDrawer />}
+        {pane === "documents" && <DocumentsView />}
+        {pane === "import" && <ImportWizard />}
+        {pane === "observability" && <ObservabilityDashboard />}
+      </div>
+      {!collapsed ? (
+        <ChunkInspectorPane
+          chunkId={focusedId}
+          onClose={() => setCollapsed(true)}
+          onClear={() => setFocusedId(null)}
+        />
+      ) : null}
+    </div>
+  );
+}
+
+function AtlasMode() {
+  const [pane, setPane] = useState<"schema" | "metrics" | "memory" | "governance">("schema");
+  return (
+    <div className="wikiModeGrid wikiModeGrid--atlas">
+      <div className="wikiModePane wikiModePane--nav wikiStewardNav">
+        <button
+          type="button"
+          className={pane === "schema" ? "wikiStewardNavBtn active" : "wikiStewardNavBtn"}
+          onClick={() => setPane("schema")}
+        >
+          <BookOpen size={14} /> 行业 Schema
+        </button>
+        <button
+          type="button"
+          className={pane === "metrics" ? "wikiStewardNavBtn active" : "wikiStewardNavBtn"}
+          onClick={() => setPane("metrics")}
+        >
+          <Activity size={14} /> 指标总览
+        </button>
+        <button
+          type="button"
+          className={pane === "memory" ? "wikiStewardNavBtn active" : "wikiStewardNavBtn"}
+          onClick={() => setPane("memory")}
+        >
+          <BrainCircuit size={14} /> 运营记忆
+        </button>
+        <button
+          type="button"
+          className={pane === "governance" ? "wikiStewardNavBtn active" : "wikiStewardNavBtn"}
+          onClick={() => setPane("governance")}
+        >
+          <ShieldCheck size={14} /> 治理
+        </button>
+      </div>
+      <div className="wikiModePane wikiModePane--main">
+        {pane === "schema" && <DomainSchemaTab />}
+        {pane === "metrics" && <MetricsTab />}
+        {pane === "memory" && <MemoryDrawer />}
+        {pane === "governance" && <AdminGovernanceView />}
+      </div>
+    </div>
+  );
+}
+
+// ── G2 · DocumentsView · 知识文档目录 CRUD ─────────────────────────────
+interface DocumentItem {
+  id: string;
+  title: string;
+  summary?: string | null;
+  domain?: string | null;
+  sourceType?: string | null;
+  sourceName?: string | null;
+  status?: string | null;
+  catalogSummary?: string | null;
+  updatedAt?: string | null;
+  routingMap?: string[] | null;
+  productTags?: string[] | null;
+  businessTopics?: string[] | null;
+}
+
+function DocumentsView() {
+  const [items, setItems] = useState<DocumentItem[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const [creating, setCreating] = useState(false);
+  const [draft, setDraft] = useState({ title: "", summary: "", sourceName: "", sourceType: "imported_markdown" });
+
+  async function load() {
+    setLoading(true);
+    setError(null);
+    try {
+      const r = await fetch("/api/operation-knowledge/documents");
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      const data = (await r.json()) as { items?: DocumentItem[] };
+      setItems(data.items ?? []);
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  useEffect(() => { void load(); }, []);
+
+  async function handleCreate(ev: FormEvent) {
+    ev.preventDefault();
+    if (!draft.title.trim()) return;
+    setCreating(true);
+    try {
+      const r = await fetch("/api/operation-knowledge/documents", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          domain: "user_operations",
+          title: draft.title.trim(),
+          summary: draft.summary.trim() || null,
+          sourceName: draft.sourceName.trim() || null,
+          sourceType: draft.sourceType,
+          status: "draft"
+        })
+      });
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      setDraft({ title: "", summary: "", sourceName: "", sourceType: "imported_markdown" });
+      await load();
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setCreating(false);
+    }
+  }
+
+  async function handleDelete(id: string) {
+    if (!window.confirm(`删除文档？关联 chunks 不会被删除，但失去文档归属。`)) return;
+    try {
+      const r = await fetch(`/api/operation-knowledge/documents/${encodeURIComponent(id)}`, { method: "DELETE" });
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      await load();
+    } catch (e) {
+      setError(String(e));
+    }
+  }
+
+  return (
+    <div className="wikiArchiveShell" style={{ padding: 18 }}>
+      <header className="wikiArchiveHeader">
+        <span className="wikiArchiveSubtitle">Documents · 文档目录</span>
+        <h3 style={{ fontSize: 20 }}>知识文档</h3>
+      </header>
+      {error ? <div className="wikiAlert error">{error}</div> : null}
+      <form onSubmit={handleCreate} style={{ display: "grid", gridTemplateColumns: "1fr 1fr 200px auto", gap: 8, marginBottom: 16 }}>
+        <input
+          type="text"
+          placeholder="文档标题（必填）"
+          value={draft.title}
+          onChange={(e) => setDraft({ ...draft, title: e.target.value })}
+          className="wikiInput"
+        />
+        <input
+          type="text"
+          placeholder="摘要"
+          value={draft.summary}
+          onChange={(e) => setDraft({ ...draft, summary: e.target.value })}
+          className="wikiInput"
+        />
+        <select
+          value={draft.sourceType}
+          onChange={(e) => setDraft({ ...draft, sourceType: e.target.value })}
+          className="wikiInput"
+        >
+          <option value="imported_markdown">imported_markdown</option>
+          <option value="manual">manual</option>
+          <option value="external_url">external_url</option>
+          <option value="archived">archived</option>
+        </select>
+        <button type="submit" className="wikiBtn" disabled={creating || !draft.title.trim()}>
+          {creating ? "保存中…" : "新建"}
+        </button>
+      </form>
+      {loading ? <div className="wikiHint">加载中…</div> : items.length === 0 ? (
+        <div className="wikiHint">还没有文档。新建第一份，或使用导入向导。</div>
+      ) : (
+        <table className="wikiTable" style={{ width: "100%", borderCollapse: "collapse" }}>
+          <thead>
+            <tr>
+              <th style={{ textAlign: "left", padding: "8px 6px", borderBottom: "1px solid var(--line)" }}>标题</th>
+              <th style={{ textAlign: "left", padding: "8px 6px", borderBottom: "1px solid var(--line)" }}>来源</th>
+              <th style={{ textAlign: "left", padding: "8px 6px", borderBottom: "1px solid var(--line)" }}>状态</th>
+              <th style={{ textAlign: "left", padding: "8px 6px", borderBottom: "1px solid var(--line)" }}>更新</th>
+              <th style={{ padding: "8px 6px", borderBottom: "1px solid var(--line)" }}></th>
+            </tr>
+          </thead>
+          <tbody>
+            {items.map((d) => (
+              <tr key={d.id} style={{ borderBottom: "1px solid var(--line)" }}>
+                <td style={{ padding: "10px 6px" }}>
+                  <div style={{ fontFamily: "var(--font-display)", fontWeight: 600 }}>{d.title}</div>
+                  {d.summary ? <div style={{ color: "var(--muted)", fontSize: 12, marginTop: 2 }}>{d.summary}</div> : null}
+                  <div style={{ marginTop: 4 }}>
+                    {(d.businessTopics ?? []).map((t, i) => <span key={i} className="wikiArchiveTag">{t}</span>)}
+                  </div>
+                </td>
+                <td style={{ padding: "10px 6px", fontFamily: "var(--font-mono)", fontSize: 12 }}>
+                  <div>{d.sourceType ?? "—"}</div>
+                  <div style={{ color: "var(--muted)" }}>{d.sourceName ?? ""}</div>
+                </td>
+                <td style={{ padding: "10px 6px" }}>
+                  <span className="wikiBadge">{d.status ?? "—"}</span>
+                </td>
+                <td style={{ padding: "10px 6px", fontFamily: "var(--font-mono)", fontSize: 11, color: "var(--muted)" }}>
+                  {d.updatedAt ? new Date(d.updatedAt).toLocaleString() : "—"}
+                </td>
+                <td style={{ padding: "10px 6px", textAlign: "right" }}>
+                  <button type="button" className="wikiArchiveRollback" onClick={() => handleDelete(d.id)}>删除</button>
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      )}
+    </div>
+  );
+}
+
+// ── G2 · ImportWizard · 三步条粘贴 → 预览 → 应用 ───────────────────────
+interface ImportPreviewChunk {
+  title?: string | null;
+  body?: string | null;
+  summary?: string | null;
+  wikiType?: string | null;
+  businessTopics?: string[] | null;
+  productTags?: string[] | null;
+  routingCard?: string | null;
+}
+
+interface ImportPreviewResult {
+  document?: { title?: string; summary?: string; catalogSummary?: string } | null;
+  items?: unknown[];
+  chunks?: ImportPreviewChunk[];
+}
+
+function ImportWizard() {
+  const [step, setStep] = useState<1 | 2 | 3>(1);
+  const [content, setContent] = useState("");
+  const [sourceName, setSourceName] = useState("");
+  const [pending, setPending] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [preview, setPreview] = useState<ImportPreviewResult | null>(null);
+  const [selected, setSelected] = useState<Set<number>>(new Set());
+  const [edits, setEdits] = useState<Record<number, Partial<ImportPreviewChunk>>>({});
+  const [created, setCreated] = useState<string[]>([]);
+
+  async function runPreview() {
+    if (!content.trim()) return;
+    setPending(true);
+    setError(null);
+    try {
+      const r = await fetch("/api/operation-knowledge/import-preview", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ content, sourceName: sourceName.trim() || null })
+      });
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      const data = (await r.json()) as ImportPreviewResult;
+      setPreview(data);
+      const all = new Set<number>();
+      (data.chunks ?? []).forEach((_, i) => all.add(i));
+      setSelected(all);
+      setEdits({});
+      setStep(2);
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setPending(false);
+    }
+  }
+
+  async function runApply() {
+    if (!preview) return;
+    setPending(true);
+    setError(null);
+    try {
+      const finalChunks = (preview.chunks ?? [])
+        .map((c, i) => ({ ...c, ...(edits[i] ?? {}) }))
+        .filter((_, i) => selected.has(i));
+      const payload = {
+        document: preview.document,
+        items: preview.items,
+        chunks: finalChunks,
+        sourceName: sourceName.trim() || null
+      };
+      const r = await fetch("/api/operation-knowledge/import-apply", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(payload)
+      });
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      const data = (await r.json()) as { createdChunkIds?: string[]; created_chunk_ids?: string[] };
+      const ids = data.createdChunkIds ?? data.created_chunk_ids ?? [];
+      setCreated(ids);
+      setStep(3);
+      if (ids[0]) {
+        setTimeout(() => focusChunk(ids[0]), 100);
+      }
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setPending(false);
+    }
+  }
+
+  function reset() {
+    setStep(1); setContent(""); setSourceName(""); setPreview(null);
+    setSelected(new Set()); setEdits({}); setCreated([]); setError(null);
+  }
+
+  function toggle(i: number) {
+    const next = new Set(selected);
+    if (next.has(i)) next.delete(i); else next.add(i);
+    setSelected(next);
+  }
+
+  return (
+    <div className="wikiArchiveShell" style={{ padding: 18 }}>
+      <header className="wikiArchiveHeader">
+        <span className="wikiArchiveSubtitle">Import Wizard · 文档导入</span>
+        <h3 style={{ fontSize: 20 }}>导入向导</h3>
+      </header>
+      <div className="wikiImportStepper">
+        {[
+          { n: 1, label: "粘贴" },
+          { n: 2, label: "预览" },
+          { n: 3, label: "应用" }
+        ].map((s) => (
+          <div key={s.n} className={`wikiImportStep${step === s.n ? " active" : ""}${step > s.n ? " done" : ""}`}>
+            <span className="wikiImportStepNum">{s.n}</span> {s.label}
+          </div>
+        ))}
+      </div>
+      {error ? <div className="wikiAlert error">{error}</div> : null}
+      {step === 1 ? (
+        <div style={{ marginTop: 12 }}>
+          <input
+            type="text"
+            placeholder="来源名称（可选）：例如「运营手册 v3」"
+            value={sourceName}
+            onChange={(e) => setSourceName(e.target.value)}
+            className="wikiInput"
+            style={{ width: "100%", marginBottom: 8 }}
+          />
+          <textarea
+            placeholder="粘贴 markdown / 长文本…"
+            value={content}
+            onChange={(e) => setContent(e.target.value)}
+            rows={14}
+            className="wikiInput"
+            style={{ width: "100%", fontFamily: "var(--font-mono)", fontSize: 12 }}
+          />
+          <div style={{ marginTop: 10, display: "flex", gap: 8 }}>
+            <button type="button" className="wikiBtn" onClick={runPreview} disabled={pending || !content.trim()}>
+              {pending ? "解析中…" : "下一步：预览"}
+            </button>
+            <span style={{ color: "var(--muted)", fontSize: 12, alignSelf: "center" }}>
+              将由 AI 拆为候选 chunk，所有 chunk 默认 status=draft + integrity_status=needs_review。
+            </span>
+          </div>
+        </div>
+      ) : null}
+      {step === 2 && preview ? (
+        <div style={{ marginTop: 12 }}>
+          {preview.document ? (
+            <dl className="wikiArchiveMeta">
+              <dt>文档标题</dt><dd>{preview.document.title}</dd>
+              {preview.document.summary ? (<><dt>摘要</dt><dd>{preview.document.summary}</dd></>) : null}
+              {preview.document.catalogSummary ? (<><dt>目录摘要</dt><dd>{preview.document.catalogSummary}</dd></>) : null}
+            </dl>
+          ) : null}
+          <hr className="wikiArchiveRule" />
+          <div style={{ marginBottom: 8, fontFamily: "var(--font-mono)", fontSize: 12, color: "var(--muted)" }}>
+            候选 chunks · {selected.size}/{(preview.chunks ?? []).length} 已选
+          </div>
+          <div style={{ display: "grid", gap: 10 }}>
+            {(preview.chunks ?? []).map((c, i) => {
+              const e = edits[i] ?? {};
+              const merged = { ...c, ...e };
+              const isOn = selected.has(i);
+              return (
+                <div key={i} className={`wikiImportCandidate${isOn ? " selected" : ""}`}>
+                  <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                    <input type="checkbox" checked={isOn} onChange={() => toggle(i)} />
+                    <span className="wikiArchiveTag">{merged.wikiType ?? "—"}</span>
+                    <input
+                      type="text"
+                      value={merged.title ?? ""}
+                      onChange={(ev) => setEdits({ ...edits, [i]: { ...e, title: ev.target.value } })}
+                      className="wikiInput"
+                      style={{ flex: 1, fontFamily: "var(--font-display)", fontWeight: 600 }}
+                    />
+                  </div>
+                  {merged.summary ? <p style={{ color: "var(--muted)", fontSize: 12.5, margin: "6px 0 4px" }}>{merged.summary}</p> : null}
+                  <div className="wikiImportChips">
+                    {(merged.businessTopics ?? []).map((t, j) => <span key={j} className="wikiArchiveTag">{t}</span>)}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+          <div style={{ marginTop: 12, display: "flex", gap: 8 }}>
+            <button type="button" className="wikiBtn" onClick={() => setStep(1)}>← 返回粘贴</button>
+            <button type="button" className="wikiBtn primary" onClick={runApply} disabled={pending || selected.size === 0}>
+              {pending ? "应用中…" : `应用 ${selected.size} 条 →`}
+            </button>
+          </div>
+        </div>
+      ) : null}
+      {step === 3 ? (
+        <div style={{ marginTop: 12 }}>
+          <div style={{ fontFamily: "var(--font-display)", fontSize: 16, marginBottom: 8 }}>
+            ✓ 已写入 {created.length} 条草稿 chunk
+          </div>
+          <p style={{ color: "var(--muted)", fontSize: 12.5 }}>
+            所有 chunk 处于 draft + needs_review 状态，进入「待评审」面板逐条 verify。
+          </p>
+          <div style={{ marginTop: 8, display: "grid", gap: 4 }}>
+            {created.map((id) => (
+              <button key={id} type="button" className="wikiSignalChunkBtn" onClick={() => focusChunk(id)}>
+                <code>{id}</code>
+              </button>
+            ))}
+          </div>
+          <div style={{ marginTop: 14 }}>
+            <button type="button" className="wikiBtn" onClick={reset}>导入更多</button>
+          </div>
+        </div>
+      ) : null}
+    </div>
   );
 }
 
@@ -5941,6 +6526,9 @@ function AskView() {
   }
 
   function toggleCited(id: string) {
+    if (typeof window !== "undefined") {
+      window.dispatchEvent(new CustomEvent("wikiFocusChunk", { detail: { chunkId: id } }));
+    }
     setOpenCited((prev) => {
       const next = new Set(prev);
       if (next.has(id)) next.delete(id);
@@ -6358,7 +6946,15 @@ function LintView() {
                   <div className="wikiSignalRefs">
                     <span className="wikiSignalLabel">affected：</span>
                     {s.affectedChunkIds.slice(0, 8).map((id) => (
-                      <code key={id}>{id}</code>
+                      <button
+                        type="button"
+                        key={id}
+                        className="wikiSignalChunkBtn"
+                        onClick={() => focusChunk(id)}
+                        title="在 Inspector 中打开"
+                      >
+                        <code>{id}</code>
+                      </button>
                     ))}
                     {s.affectedChunkIds.length > 8 ? (
                       <span className="wikiHint">+{s.affectedChunkIds.length - 8}</span>
@@ -6416,6 +7012,7 @@ interface ReviewChunkItem {
   integrityStatus?: string | null;
   status?: string | null;
   wikiType?: string | null;
+  businessTopics?: string[] | null;
   relatedChunks?: { chunk_id: string; kind: string; note?: string | null }[] | null;
   updatedAt?: string | null;
 }
@@ -6436,6 +7033,8 @@ function ReviewView() {
   const [info, setInfo] = useState<string | null>(null);
   const [activeCategory, setActiveCategory] = useState<ReviewCategory>("needs_review");
   const [openBody, setOpenBody] = useState<Set<string>>(new Set());
+  const [selected, setSelected] = useState<Set<string>>(new Set());
+  const [batchBusy, setBatchBusy] = useState(false);
 
   async function load() {
     setLoading(true);
@@ -6525,6 +7124,59 @@ function ReviewView() {
     }
   }
 
+  function toggleSelect(id: string) {
+    setSelected((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  }
+
+  async function batchAction(action: "verify" | "archive") {
+    if (selected.size === 0) return;
+    if (action === "archive" && !window.confirm(`批量 archive ${selected.size} 条 chunk？`)) return;
+    setBatchBusy(true);
+    setError(null);
+    setInfo(null);
+    const ids = [...selected];
+    const path =
+      action === "verify"
+        ? "/api/operation-knowledge/chunks/batch-verify"
+        : "/api/operation-knowledge/chunks/batch-archive";
+    const body =
+      action === "verify"
+        ? { ids, note: "batch verify (admin)" }
+        : { ids, reason: "batch archive (admin)", actor: "admin" };
+    try {
+      const r = await fetch(path, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      if (!r.ok) throw new Error(await r.text());
+      const data = (await r.json()) as {
+        verified?: string[];
+        archived?: string[];
+        skipped?: { id: string; reason: string }[];
+      };
+      const okCount = (data.verified?.length ?? data.archived?.length ?? 0);
+      const skippedCount = data.skipped?.length ?? 0;
+      setInfo(
+        `批量${action === "verify" ? "verify" : "archive"} 完成：成功 ${okCount}，跳过 ${skippedCount}` +
+          (skippedCount > 0 && data.skipped
+            ? `（${data.skipped.slice(0, 3).map((s) => `${s.id}:${s.reason}`).join("； ")}${skippedCount > 3 ? "…" : ""}）`
+            : ""),
+      );
+      setSelected(new Set());
+      await load();
+    } catch (e: unknown) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBatchBusy(false);
+    }
+  }
+
   return (
     <div className="wikiPanelBody wikiReviewBody">
       <div className="wikiToolbar">
@@ -6538,6 +7190,35 @@ function ReviewView() {
       </div>
       {error ? <div className="wikiAlert error">{error}</div> : null}
       {info ? <div className="wikiAlert info">{info}</div> : null}
+      {selected.size > 0 ? (
+        <div className="wikiBatchToolbar">
+          <span className="wikiArchiveTag">已选 {selected.size}</span>
+          <button
+            type="button"
+            className="wikiBtn wikiActionBtn--verify"
+            disabled={batchBusy}
+            onClick={() => void batchAction("verify")}
+          >
+            <CheckCircle2 size={13} /> 批量 verify
+          </button>
+          <button
+            type="button"
+            className="wikiBtn"
+            disabled={batchBusy}
+            onClick={() => void batchAction("archive")}
+          >
+            <Archive size={13} /> 批量 archive
+          </button>
+          <button
+            type="button"
+            className="wikiBtn"
+            disabled={batchBusy}
+            onClick={() => setSelected(new Set())}
+          >
+            清空选中
+          </button>
+        </div>
+      ) : null}
       <div className="wikiLintLayout">
         <div className="wikiReviewFilter">
           {REVIEW_CATEGORIES.map((cat) => {
@@ -6572,12 +7253,26 @@ function ReviewView() {
               return (
                 <div className="wikiReviewChunkCard" key={c.id}>
                   <div className="wikiSignalHead">
+                    <input
+                      type="checkbox"
+                      className="wikiBatchCheckbox"
+                      checked={selected.has(c.id)}
+                      onChange={() => toggleSelect(c.id)}
+                      title="选中以批量 verify / archive"
+                    />
                     <div className="wikiSignalTitle">
                       <span className={`wikiKind ${c.wikiType ?? "unknown"}`}>{c.wikiType ?? "—"}</span>
                       <span className={`wikiSev ${c.integrityStatus === "rejected" ? "error" : "info"}`}>
                         {c.integrityStatus ?? "—"}
                       </span>
-                      <strong>{c.title}</strong>
+                      <button
+                        type="button"
+                        className="wikiReviewTitleBtn"
+                        onClick={() => focusChunk(c.id)}
+                        title="在 Inspector 中打开"
+                      >
+                        <strong>{c.title}</strong>
+                      </button>
                     </div>
                     <div className="wikiSignalActions">
                       <button
@@ -6603,7 +7298,10 @@ function ReviewView() {
                   </div>
                   {c.summary ? <p className="wikiSignalDesc">{c.summary}</p> : null}
                   {hasQuote ? (
-                    <blockquote className="wikiReviewSourceQuote">{c.sourceQuote}</blockquote>
+                    <blockquote className="wikiArchiveCitation">
+                      {c.sourceQuote}
+                      <span className="wikiArchiveCitationSource">{c.id}</span>
+                    </blockquote>
                   ) : (
                     <div className="wikiHint">未配 source_quote — verify gate 将硬挡。</div>
                   )}
@@ -6658,6 +7356,603 @@ function classifyChunk(
   return null;
 }
 
+// ChunkInspectorPane：Explore 第三栏。监听 wikiFocusChunk 事件 → 拉单 chunk
+// 详情。lazy-load：首次聚焦才发起 list 请求；之后从本地 indexById 直接命中。
+function ChunkInspectorPane({
+  chunkId,
+  onClose,
+  onClear,
+}: {
+  chunkId: string | null;
+  onClose: () => void;
+  onClear: () => void;
+}) {
+  const [items, setItems] = useState<TreeChunkItem[] | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [reloadKey, setReloadKey] = useState(0);
+
+  useEffect(() => {
+    if (!chunkId) return;
+    setLoading(true);
+    setError(null);
+    fetch("/api/operation-knowledge/chunks")
+      .then(async (r) => {
+        if (!r.ok) throw new Error(await r.text());
+        return r.json() as Promise<{ items: TreeChunkItem[] }>;
+      })
+      .then((data) => setItems(data.items ?? []))
+      .catch((e: unknown) => setError(e instanceof Error ? e.message : String(e)))
+      .finally(() => setLoading(false));
+  }, [chunkId, reloadKey]);
+
+  const reload = () => setReloadKey((k) => k + 1);
+
+  const indexById = useMemo(() => {
+    const m = new Map<string, TreeChunkItem>();
+    if (items) for (const it of items) m.set(it.id, it);
+    return m;
+  }, [items]);
+
+  const chunk = chunkId ? indexById.get(chunkId) ?? null : null;
+  const anchors = useMemo(() => {
+    if (!chunk?.sourceAnchors) return [] as Record<string, unknown>[];
+    return chunk.sourceAnchors as Record<string, unknown>[];
+  }, [chunk]);
+  const related = useMemo(() => {
+    if (!chunk?.relatedChunks) return [] as { chunk_id: string; kind: string; note?: string | null }[];
+    return chunk.relatedChunks;
+  }, [chunk]);
+  const hasQuote = !!chunk?.sourceQuote;
+
+  return (
+    <aside className="wikiInspectorPane wikiModePane--side">
+      <header className="wikiInspectorHead">
+        <div className="wikiInspectorTitle">
+          <Eye size={14} /> Inspector
+        </div>
+        <div style={{ display: "flex", gap: 4 }}>
+          {chunk ? (
+            <button
+              type="button"
+              className="wikiInspectorClose"
+              onClick={onClear}
+              title="清空选中 chunk"
+            >
+              清空
+            </button>
+          ) : null}
+          <button
+            type="button"
+            className="wikiInspectorClose"
+            onClick={onClose}
+            title="收起 Inspector"
+          >
+            <ChevronRight size={14} />
+          </button>
+        </div>
+      </header>
+      <div className="wikiInspectorBody">
+        {!chunkId ? (
+          <div className="wikiInspectorEmpty">
+            点击左侧树节点或问答中的引用 chunk，详情会出现在这里。
+          </div>
+        ) : loading ? (
+          <div className="wikiInspectorEmpty">加载中…</div>
+        ) : error ? (
+          <div className="wikiAlert error">{error}</div>
+        ) : !chunk ? (
+          <div className="wikiInspectorEmpty">
+            未找到 chunk <code>{chunkId}</code>，可能已 archived 或不在当前 workspace。
+          </div>
+        ) : (
+          <>
+            <dl className="wikiArchiveMeta">
+              <dt>状态</dt>
+              <dd>
+                <span className={`wikiSev ${chunk.integrityStatus === "rejected" ? "error" : "info"}`}>
+                  {chunk.integrityStatus ?? "—"}
+                </span>{" "}
+                <span className="wikiBadge">{chunk.status ?? "—"}</span>
+              </dd>
+              <dt>chunk id</dt>
+              <dd><code>{chunk.id}</code></dd>
+              {chunk.wikiType ? (<><dt>wiki type</dt><dd><span className="wikiArchiveTag">{chunk.wikiType}</span></dd></>) : null}
+              {Array.isArray(chunk.businessTopics) && chunk.businessTopics.length > 0 ? (
+                <>
+                  <dt>business topics</dt>
+                  <dd>{chunk.businessTopics.map((t, i) => <span key={i} className="wikiArchiveTag">{t}</span>)}</dd>
+                </>
+              ) : null}
+            </dl>
+            <hr className="wikiArchiveRule" />
+            <h3 className="wikiInspectorChunkTitle">{chunk.title || "（无标题）"}</h3>
+            {chunk.summary ? <p className="wikiInspectorSummary">{chunk.summary}</p> : null}
+            {hasQuote ? (
+              <blockquote className="wikiArchiveCitation">
+                {chunk.sourceQuote}
+                <span className="wikiArchiveCitationSource">
+                  {chunk.id}
+                  {anchors.length > 0 ? ` · L${numberOr(anchors[0]["startLine"]) ?? "?"}-${numberOr(anchors[0]["endLine"]) ?? "?"}` : ""}
+                </span>
+              </blockquote>
+            ) : (
+              <div className="wikiHint">无 source_quote — 该 chunk 不可被 verify。</div>
+            )}
+            {anchors.length > 0 ? (
+              <section className="wikiInspectorSection">
+                <div className="wikiInspectorSectionTitle">source_anchors（{anchors.length}）</div>
+                <div className="wikiSourceAnchorList">
+                  {anchors.map((a, i) => {
+                    const sl = numberOr(a["startLine"]);
+                    const el = numberOr(a["endLine"]);
+                    const hash = stringOr(a["quoteHash"]);
+                    return (
+                      <span key={`${chunk.id}-ia-${i}`} className="wikiSourceAnchor">
+                        <span className="wikiSourceAnchorRange">L{sl}-L{el}</span>
+                        {hash ? (
+                          <code className="wikiSourceAnchorHash">{hash.slice(0, 12)}…</code>
+                        ) : null}
+                      </span>
+                    );
+                  })}
+                </div>
+              </section>
+            ) : null}
+            {related.length > 0 ? (
+              <section className="wikiInspectorSection">
+                <div className="wikiInspectorSectionTitle">related_chunks（{related.length}）</div>
+                <div className="wikiRelatedList">
+                  {related.map((r, i) => {
+                    const target = indexById.get(r.chunk_id);
+                    const dead = !target;
+                    return (
+                      <button
+                        type="button"
+                        key={`${chunk.id}-irel-${i}`}
+                        className={`wikiRelatedChip ${dead ? "dead" : ""}`}
+                        disabled={dead}
+                        onClick={() => focusChunk(r.chunk_id)}
+                        title={dead ? "目标 chunk 不在活跃集合" : r.note ?? ""}
+                      >
+                        <span className="wikiRelatedKind">{r.kind}</span>
+                        <span className="wikiRelatedTitle">{target ? target.title : r.chunk_id}</span>
+                      </button>
+                    );
+                  })}
+                </div>
+              </section>
+            ) : null}
+            {chunk.body ? (
+              <section className="wikiInspectorSection">
+                <div className="wikiInspectorSectionTitle">正文</div>
+                <pre>{chunk.body}</pre>
+              </section>
+            ) : null}
+            <ChunkActionsBar chunk={chunk} onChanged={reload} />
+            <ChunkReferrersList chunkId={chunk.id} />
+            <ChunkRevisionsTimeline chunkId={chunk.id} onRolledBack={reload} />
+          </>
+        )}
+      </div>
+    </aside>
+  );
+}
+
+// 全局事件桥：发布"打开 chunk Inspector"，AskView / KnowledgeTreeView 调用，
+// ExploreMode / ChunkInspectorPane 监听。
+function focusChunk(chunkId: string) {
+  if (typeof window === "undefined") return;
+  window.dispatchEvent(new CustomEvent("wikiFocusChunk", { detail: { chunkId } }));
+}
+
+// ── G3 · ChunkActionsBar：9 类编辑动作（人工触发） ───────────────────
+// 路由全部为 /api/operation-knowledge/chunks/:id/<action>。AI 永不自动 verify。
+type ChunkActionState = { busy: string | null; error: string | null; info: string | null };
+
+function ChunkActionsBar({
+  chunk,
+  onChanged,
+}: {
+  chunk: TreeChunkItem;
+  onChanged: () => void;
+}) {
+  const [state, setState] = useState<ChunkActionState>({ busy: null, error: null, info: null });
+
+  async function call(
+    action: string,
+    method: "POST" | "DELETE",
+    path: string,
+    body?: Record<string, unknown>,
+  ) {
+    setState({ busy: action, error: null, info: null });
+    try {
+      const init: RequestInit = { method, headers: { "Content-Type": "application/json" } };
+      if (body !== undefined) init.body = JSON.stringify(body);
+      const r = await fetch(path, init);
+      if (!r.ok) throw new Error(await r.text());
+      setState({ busy: null, error: null, info: `已${action}` });
+      onChanged();
+    } catch (e: unknown) {
+      setState({ busy: null, error: e instanceof Error ? e.message : String(e), info: null });
+    }
+  }
+
+  const id = encodeURIComponent(chunk.id);
+  const isArchived = chunk.status === "archived";
+  const isVerified = chunk.integrityStatus === "verified";
+
+  async function onPatch() {
+    const summary = window.prompt("新摘要（覆盖 summary，留空保持不变）", chunk.summary ?? "");
+    if (summary === null) return;
+    await call(
+      "patch",
+      "POST",
+      `/api/operation-knowledge/chunks/${id}/patch`,
+      { summary: summary || undefined, actor: "admin" },
+    );
+  }
+
+  async function onReject() {
+    const reason = window.prompt("reject 原因（必填）");
+    if (!reason) return;
+    await call(
+      "reject",
+      "POST",
+      `/api/operation-knowledge/chunks/${id}/reject`,
+      { reason },
+    );
+  }
+
+  async function onArchive() {
+    if (!window.confirm(`确认 archive chunk ${chunk.id}?`)) return;
+    await call(
+      "archive",
+      "POST",
+      `/api/operation-knowledge/chunks/${id}/archive`,
+      { actor: "admin" },
+    );
+  }
+
+  async function onSplit() {
+    const cutoff = window.prompt("切点（正则或字符位置整数，必填）");
+    if (!cutoff) return;
+    const num = Number(cutoff);
+    const body = Number.isFinite(num)
+      ? { offset: num, actor: "admin" }
+      : { regex: cutoff, actor: "admin" };
+    await call(
+      "split",
+      "POST",
+      `/api/operation-knowledge/chunks/${id}/split`,
+      body,
+    );
+  }
+
+  async function onMerge() {
+    const targetId = window.prompt("合并目标 chunk id（必填）");
+    if (!targetId) return;
+    if (!window.confirm(`将 ${chunk.id} 合并到 ${targetId}？原 chunk 会被 archived。`)) return;
+    await call(
+      "merge",
+      "POST",
+      `/api/operation-knowledge/chunks/${id}/merge`,
+      { target_id: targetId, actor: "admin" },
+    );
+  }
+
+  async function onRelate() {
+    const targetId = window.prompt("关联目标 chunk id");
+    if (!targetId) return;
+    const kind = window.prompt("关联 kind（如 supports / contradicts / superseded_by）", "supports");
+    if (!kind) return;
+    const note = window.prompt("备注（可空）", "") ?? "";
+    await call(
+      "relate",
+      "POST",
+      `/api/operation-knowledge/chunks/${id}/relate`,
+      { target_id: targetId, kind, note: note || null, actor: "admin" },
+    );
+  }
+
+  return (
+    <section className="wikiInspectorSection">
+      <div className="wikiInspectorSectionTitle">编辑动作</div>
+      <div className="wikiActionsBar">
+        <button
+          type="button"
+          className="wikiBtn wikiActionBtn--verify"
+          disabled={!!state.busy || isVerified}
+          onClick={() =>
+            void call(
+              "verify",
+              "POST",
+              `/api/operation-knowledge/chunks/${id}/verify`,
+              {},
+            )
+          }
+          title="标记为 verified（AI 永不自动调用）"
+        >
+          <CheckCircle2 size={13} /> verify
+        </button>
+        <button
+          type="button"
+          className="wikiBtn wikiActionBtn--reject"
+          disabled={!!state.busy}
+          onClick={() => void onReject()}
+        >
+          <X size={13} /> reject
+        </button>
+        <button
+          type="button"
+          className="wikiBtn"
+          disabled={!!state.busy}
+          onClick={() => void onPatch()}
+        >
+          <SquarePen size={13} /> patch
+        </button>
+        <button
+          type="button"
+          className="wikiBtn"
+          disabled={!!state.busy || isArchived}
+          onClick={() => void onArchive()}
+        >
+          <Archive size={13} /> archive
+        </button>
+        <button
+          type="button"
+          className="wikiBtn"
+          disabled={!!state.busy || !isArchived}
+          onClick={() =>
+            void call(
+              "restore",
+              "POST",
+              `/api/operation-knowledge/chunks/${id}/restore`,
+              { actor: "admin" },
+            )
+          }
+        >
+          <Undo2 size={13} /> restore
+        </button>
+        <button
+          type="button"
+          className="wikiBtn"
+          disabled={!!state.busy}
+          onClick={() => void onSplit()}
+        >
+          <Scissors size={13} /> split
+        </button>
+        <button
+          type="button"
+          className="wikiBtn"
+          disabled={!!state.busy}
+          onClick={() => void onMerge()}
+        >
+          <GitMerge size={13} /> merge
+        </button>
+        <button
+          type="button"
+          className="wikiBtn"
+          disabled={!!state.busy}
+          onClick={() => void onRelate()}
+        >
+          <Link2 size={13} /> relate
+        </button>
+      </div>
+      {state.error ? <div className="wikiAlert error">{state.error}</div> : null}
+      {state.info ? <div className="wikiAlert info">{state.info}</div> : null}
+      <div className="wikiHint">
+        rollback 入口在下方"修订时间轴"。AI 强制 status=draft + integrity_status=needs_review；verify 仅人工触发。
+      </div>
+    </section>
+  );
+}
+
+// ── G3 · ChunkReferrersList：反向引用查询 ────────────────────────
+type ReferrerEntry = {
+  chunkId: string;
+  title?: string | null;
+  wikiType?: string | null;
+  status?: string | null;
+  kind?: string | null;
+  note?: string | null;
+};
+
+function ChunkReferrersList({ chunkId }: { chunkId: string }) {
+  const [items, setItems] = useState<ReferrerEntry[] | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [open, setOpen] = useState(false);
+
+  useEffect(() => {
+    if (!open || items !== null) return;
+    setLoading(true);
+    fetch(`/api/operation-knowledge/chunks/referrers?target_id=${encodeURIComponent(chunkId)}`)
+      .then(async (r) => {
+        if (!r.ok) throw new Error(await r.text());
+        return r.json() as Promise<{ items: ReferrerEntry[] }>;
+      })
+      .then((data) => setItems(data.items ?? []))
+      .catch((e: unknown) => setError(e instanceof Error ? e.message : String(e)))
+      .finally(() => setLoading(false));
+  }, [open, items, chunkId]);
+
+  // chunkId 变化重置
+  useEffect(() => {
+    setItems(null);
+    setOpen(false);
+    setError(null);
+  }, [chunkId]);
+
+  return (
+    <section className="wikiInspectorSection">
+      <button
+        type="button"
+        className="wikiInspectorSectionTitle wikiCollapseHead"
+        onClick={() => setOpen((v) => !v)}
+      >
+        {open ? <ChevronDown size={12} /> : <ChevronRight size={12} />} 被引用
+        {items ? `（${items.length}）` : "（点击查询）"}
+      </button>
+      {open ? (
+        loading ? (
+          <div className="wikiInspectorEmpty">加载中…</div>
+        ) : error ? (
+          <div className="wikiAlert error">{error}</div>
+        ) : !items || items.length === 0 ? (
+          <div className="wikiInspectorEmpty">无 chunk 引用此 chunk。</div>
+        ) : (
+          <div className="wikiReferrerList">
+            {items.map((r, i) => (
+              <button
+                type="button"
+                key={`${r.chunkId}-${i}`}
+                className="wikiReferrerCard"
+                onClick={() => focusChunk(r.chunkId)}
+                title={r.note ?? ""}
+              >
+                <div className="wikiReferrerCardHead">
+                  {r.wikiType ? <span className="wikiArchiveTag">{r.wikiType}</span> : null}
+                  <span className="wikiReferrerKind">{r.kind ?? "—"}</span>
+                </div>
+                <div className="wikiReferrerCardTitle">{r.title || r.chunkId}</div>
+                {r.note ? <div className="wikiReferrerCardNote">{r.note}</div> : null}
+              </button>
+            ))}
+          </div>
+        )
+      ) : null}
+    </section>
+  );
+}
+
+// ── G3 · ChunkRevisionsTimeline：版本时间轴 + rollback ────────────────
+type RevisionEntry = {
+  id?: string;
+  revisionId?: string;
+  op: string;
+  source?: string | null;
+  author?: string | null;
+  createdAt?: string | null;
+  summary?: string | null;
+  diff?: unknown;
+};
+
+function ChunkRevisionsTimeline({
+  chunkId,
+  onRolledBack,
+}: {
+  chunkId: string;
+  onRolledBack: () => void;
+}) {
+  const [items, setItems] = useState<RevisionEntry[] | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [open, setOpen] = useState(false);
+  const [busyRev, setBusyRev] = useState<string | null>(null);
+
+  function load() {
+    setLoading(true);
+    setError(null);
+    fetch(`/api/operation-knowledge/chunks/${encodeURIComponent(chunkId)}/revisions`)
+      .then(async (r) => {
+        if (!r.ok) throw new Error(await r.text());
+        return r.json() as Promise<{ items: RevisionEntry[] }>;
+      })
+      .then((data) => setItems(data.items ?? []))
+      .catch((e: unknown) => setError(e instanceof Error ? e.message : String(e)))
+      .finally(() => setLoading(false));
+  }
+
+  useEffect(() => {
+    if (open && items === null) load();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open, items, chunkId]);
+
+  useEffect(() => {
+    setItems(null);
+    setOpen(false);
+    setError(null);
+  }, [chunkId]);
+
+  async function rollback(rev: RevisionEntry) {
+    const rid = rev.revisionId ?? rev.id;
+    if (!rid) return;
+    if (!window.confirm(`确认回滚到 revision ${rid} (op=${rev.op})？将创建新 revision(op=rollback_to)。`))
+      return;
+    setBusyRev(rid);
+    try {
+      const r = await fetch(
+        `/api/operation-knowledge/chunks/${encodeURIComponent(chunkId)}/rollback/${encodeURIComponent(rid)}`,
+        { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ actor: "admin" }) },
+      );
+      if (!r.ok) throw new Error(await r.text());
+      setItems(null);
+      onRolledBack();
+    } catch (e: unknown) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusyRev(null);
+    }
+  }
+
+  return (
+    <section className="wikiInspectorSection">
+      <button
+        type="button"
+        className="wikiInspectorSectionTitle wikiCollapseHead"
+        onClick={() => setOpen((v) => !v)}
+      >
+        {open ? <ChevronDown size={12} /> : <ChevronRight size={12} />}
+        <History size={12} /> 修订时间轴
+        {items ? `（${items.length}）` : "（点击查询）"}
+      </button>
+      {open ? (
+        loading ? (
+          <div className="wikiInspectorEmpty">加载中…</div>
+        ) : error ? (
+          <div className="wikiAlert error">{error}</div>
+        ) : !items || items.length === 0 ? (
+          <div className="wikiInspectorEmpty">无 revisions。</div>
+        ) : (
+          <ol className="wikiArchiveTimeline">
+            {items.map((rev, i) => {
+              const rid = rev.revisionId ?? rev.id ?? `rev-${i}`;
+              return (
+                <li key={rid} className="wikiArchiveTimelineItem">
+                  <span className="wikiArchiveTimelineDot" aria-hidden />
+                  <div className="wikiArchiveTimelineMeta">
+                    <span className="wikiArchiveTimelineTime">
+                      {rev.createdAt ?? "—"}
+                    </span>
+                    <span className="wikiArchiveTag">{rev.op}</span>
+                    {rev.source ? <span className="wikiArchiveTag">{rev.source}</span> : null}
+                    {rev.author ? <code>{rev.author}</code> : null}
+                  </div>
+                  {rev.summary ? (
+                    <div className="wikiArchiveTimelineSummary">{rev.summary}</div>
+                  ) : null}
+                  <div className="wikiArchiveTimelineActions">
+                    <button
+                      type="button"
+                      className="wikiBtn"
+                      disabled={busyRev === rid}
+                      onClick={() => void rollback(rev)}
+                      title="回滚到此版本（创建新 revision)"
+                    >
+                      <Undo2 size={12} /> 回滚至此
+                    </button>
+                  </div>
+                </li>
+              );
+            })}
+          </ol>
+        )
+      ) : null}
+    </section>
+  );
+}
+
 // KnowledgeTreeView：3 级树（wiki_type → business_topic → chunk title），右侧
 // ChunkDetail 透出 source_quote 黄边块 + source_anchors 锚点 + related_chunks 跳转。
 //
@@ -6692,6 +7987,1294 @@ const WIKI_TYPES_ORDER: { v: string; label: string }[] = [
 
 interface TreeChunkItem extends ReviewChunkItem {
   businessTopics?: string[] | null;
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// G4 · ChatWorkbench / KnowledgeInbox / ObservabilityDashboard / TestMatchPanel
+// ──────────────────────────────────────────────────────────────────────
+
+interface ChatTurnView {
+  role: "user" | "assistant";
+  turnIndex: number;
+  intent?: string | null;
+  content: string;
+  naturalReply?: string | null;
+  draftKind?: string | null;
+  draftPreview?: Record<string, unknown> | null;
+  missingFields?: string[];
+  followupQuestions?: string[];
+  canApply?: boolean;
+  status?: string;
+  attachments?: Array<{ chunkId?: string; itemId?: string }>;
+  targetChunkId?: string | null;
+  targetPackId?: string | null;
+}
+
+interface ChatTurnResponse {
+  sessionId: string;
+  turnIndex: number;
+  intent: string;
+  naturalReply: string;
+  draftKind?: string | null;
+  draftPreview?: Record<string, unknown> | null;
+  missingFields?: string[];
+  followupQuestions?: string[];
+  canApply?: boolean;
+  targetChunkId?: string | null;
+  targetPackId?: string | null;
+}
+
+function ChatWorkbench() {
+  const [sessionId, setSessionId] = useState<string>(() => {
+    if (typeof window === "undefined") return "";
+    return window.localStorage.getItem("knowledgeChat.sessionId") ?? "";
+  });
+  const [draft, setDraft] = useState("");
+  const [attachChunkId, setAttachChunkId] = useState<string>("");
+  const [turns, setTurns] = useState<ChatTurnView[]>([]);
+  const [pending, setPending] = useState(false);
+  const [applying, setApplying] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [info, setInfo] = useState<string | null>(null);
+  const esRef = useRef<EventSource | null>(null);
+  const scrollRef = useRef<HTMLDivElement | null>(null);
+
+  const persistSession = useCallback((sid: string) => {
+    if (typeof window === "undefined") return;
+    if (sid) window.localStorage.setItem("knowledgeChat.sessionId", sid);
+    else window.localStorage.removeItem("knowledgeChat.sessionId");
+  }, []);
+
+  const loadHistory = useCallback(async (sid: string) => {
+    if (!sid) {
+      setTurns([]);
+      return;
+    }
+    try {
+      const r = await fetch(`/api/operation-knowledge/chat/${encodeURIComponent(sid)}`);
+      if (!r.ok) throw new Error(await r.text());
+      const data = (await r.json()) as { items: unknown[] };
+      const items = Array.isArray(data.items) ? data.items : [];
+      const list: ChatTurnView[] = items.map((raw) => {
+        const obj = (raw ?? {}) as Record<string, unknown>;
+        return {
+          role: (obj.role as ChatTurnView["role"]) ?? "user",
+          turnIndex: Number(obj.turnIndex ?? 0),
+          intent: (obj.intent as string | null | undefined) ?? null,
+          content: String(obj.content ?? ""),
+          naturalReply: (obj.naturalReply as string | null | undefined) ?? null,
+          draftKind: (obj.draftKind as string | null | undefined) ?? null,
+          draftPreview: (obj.patch as Record<string, unknown> | null | undefined) ?? null,
+          missingFields: (obj.missingFields as string[] | undefined) ?? [],
+          followupQuestions: (obj.followupQuestions as string[] | undefined) ?? [],
+          canApply: Boolean(obj.canApply),
+          status: (obj.status as string | undefined) ?? "",
+          attachments: (obj.attachments as Array<{ chunkId?: string; itemId?: string }> | undefined) ?? []
+        };
+      });
+      setTurns(list);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    }
+  }, []);
+
+  useEffect(() => {
+    if (sessionId) void loadHistory(sessionId);
+  }, [sessionId, loadHistory]);
+
+  useEffect(() => {
+    if (!sessionId || typeof window === "undefined" || typeof window.EventSource === "undefined") return;
+    esRef.current?.close();
+    const es = new EventSource(
+      `/api/knowledge/chat/sessions/${encodeURIComponent(sessionId)}/stream`
+    );
+    esRef.current = es;
+    es.addEventListener("turn", () => {
+      void loadHistory(sessionId);
+    });
+    es.addEventListener("close", () => {
+      es.close();
+    });
+    es.addEventListener("error", () => {
+      es.close();
+    });
+    return () => {
+      es.close();
+    };
+  }, [sessionId, loadHistory]);
+
+  useEffect(() => {
+    if (scrollRef.current) {
+      scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
+    }
+  }, [turns]);
+
+  function newSession() {
+    setSessionId("");
+    persistSession("");
+    setTurns([]);
+    setDraft("");
+    setAttachChunkId("");
+    setError(null);
+    setInfo(null);
+  }
+
+  async function submit() {
+    const content = draft.trim();
+    if (!content) {
+      setError("请输入内容");
+      return;
+    }
+    setPending(true);
+    setError(null);
+    setInfo(null);
+    try {
+      const body: Record<string, unknown> = { content };
+      if (sessionId) body.sessionId = sessionId;
+      const aid = attachChunkId.trim();
+      if (aid) body.attachments = [{ chunkId: aid }];
+      const r = await fetch("/api/operation-knowledge/chat", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body)
+      });
+      if (!r.ok) throw new Error(await r.text());
+      const resp = (await r.json()) as ChatTurnResponse;
+      if (resp.sessionId !== sessionId) {
+        setSessionId(resp.sessionId);
+        persistSession(resp.sessionId);
+      }
+      setDraft("");
+      await loadHistory(resp.sessionId);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setPending(false);
+    }
+  }
+
+  async function apply() {
+    if (!sessionId) return;
+    setApplying(true);
+    setError(null);
+    setInfo(null);
+    try {
+      const r = await fetch(
+        `/api/operation-knowledge/chat/${encodeURIComponent(sessionId)}/apply`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({})
+        }
+      );
+      if (!r.ok) throw new Error(await r.text());
+      const data = (await r.json()) as { chunkId?: string; itemId?: string; status?: string };
+      const fid = data.chunkId || data.itemId;
+      setInfo(`已应用为草稿（${data.status ?? "draft"}）${fid ? `：${fid}` : ""}`);
+      if (data.chunkId) {
+        window.dispatchEvent(
+          new CustomEvent("wikiFocusChunk", { detail: { chunkId: data.chunkId } })
+        );
+      }
+      await loadHistory(sessionId);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setApplying(false);
+    }
+  }
+
+  async function discard() {
+    if (!sessionId) return;
+    if (!window.confirm("丢弃本会话的最后一份草稿？")) return;
+    setError(null);
+    setInfo(null);
+    try {
+      const r = await fetch(
+        `/api/operation-knowledge/chat/${encodeURIComponent(sessionId)}/discard`,
+        { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" }
+      );
+      if (!r.ok) throw new Error(await r.text());
+      setInfo("已丢弃当前草稿");
+      await loadHistory(sessionId);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    }
+  }
+
+  const lastAssistant = useMemo(
+    () => [...turns].reverse().find((t) => t.role === "assistant"),
+    [turns]
+  );
+
+  return (
+    <div className="wikiArchiveShell wikiChatWorkbench">
+      <header className="wikiArchiveHeader">
+        <div>
+          <div className="wikiArchiveEyebrow">today / chat</div>
+          <h2>AI 协作工坊</h2>
+        </div>
+        <div className="wikiArchiveHeaderActions">
+          <span className="wikiArchiveTag">[session]</span>
+          <span className="wikiChatSessionId">{sessionId || "未开始"}</span>
+          <button type="button" onClick={newSession}>
+            <Plus size={14} /> 新会话
+          </button>
+        </div>
+      </header>
+
+      {error ? <div className="wikiBannerError">{error}</div> : null}
+      {info ? <div className="wikiBannerInfo">{info}</div> : null}
+
+      <div className="wikiChatStream" ref={scrollRef}>
+        {turns.length === 0 ? (
+          <div className="wikiEmpty">
+            <MessageSquareText size={28} /> 与 AI 协作起草 / 修复切片。AI 起草不会自动验证，需要运营点击「应用为草稿」。
+          </div>
+        ) : null}
+        {turns.map((t) => (
+          <article
+            key={`${t.role}-${t.turnIndex}`}
+            className={`wikiChatTurn wikiChatTurn--${t.role}`}
+          >
+            <div className="wikiChatTurnHead">
+              <span className="wikiArchiveTag">[{t.role === "user" ? "运营" : "AI"}]</span>
+              <span className="wikiArchiveTimelineTime">#{t.turnIndex}</span>
+              {t.intent ? <span className="wikiArchiveTag">[{t.intent}]</span> : null}
+              {t.draftKind ? <span className="wikiArchiveTag">[{t.draftKind}]</span> : null}
+            </div>
+            <div className="wikiChatTurnBody">
+              {t.role === "assistant" && t.naturalReply ? t.naturalReply : t.content}
+            </div>
+            {t.role === "assistant" && t.followupQuestions && t.followupQuestions.length > 0 ? (
+              <ul className="wikiChatFollowups">
+                {t.followupQuestions.map((q, i) => (
+                  <li key={i}>{q}</li>
+                ))}
+              </ul>
+            ) : null}
+            {t.role === "assistant" && t.draftPreview ? (
+              <details className="wikiChatDraftPreview">
+                <summary>查看 AI 起草内容</summary>
+                <pre>{JSON.stringify(t.draftPreview, null, 2)}</pre>
+              </details>
+            ) : null}
+            {t.role === "assistant" &&
+            t.missingFields &&
+            t.missingFields.length > 0 ? (
+              <div className="wikiChatMissing">
+                缺字段：
+                {t.missingFields.map((f) => (
+                  <span key={f} className="wikiArchiveTag">
+                    [{f}]
+                  </span>
+                ))}
+              </div>
+            ) : null}
+          </article>
+        ))}
+      </div>
+
+      <footer className="wikiChatFooter">
+        <textarea
+          className="wikiChatInput"
+          value={draft}
+          onChange={(e) => setDraft(e.target.value)}
+          placeholder="向 AI 描述要起草 / 修复 / 拆分的切片，可附带 chunkId 引用现有切片"
+          disabled={pending}
+          rows={3}
+          onKeyDown={(e) => {
+            if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) {
+              e.preventDefault();
+              void submit();
+            }
+          }}
+        />
+        <div className="wikiChatFooterRow">
+          <input
+            type="text"
+            className="wikiChatAttachInput"
+            value={attachChunkId}
+            onChange={(e) => setAttachChunkId(e.target.value)}
+            placeholder="可选：附带 chunkId"
+            disabled={pending}
+          />
+          <button
+            type="button"
+            className="primary"
+            onClick={() => void submit()}
+            disabled={pending}
+          >
+            <SendHorizonal size={14} /> {pending ? "发送中…" : "发送"}
+          </button>
+          <button
+            type="button"
+            onClick={() => void apply()}
+            disabled={applying || !lastAssistant?.canApply}
+            title={lastAssistant?.canApply ? "把当前 AI 草稿落库为草稿（status=draft, integrity=needs_review）" : "无可应用草稿"}
+          >
+            <CheckCircle2 size={14} /> {applying ? "应用中…" : "应用为草稿"}
+          </button>
+          <button type="button" onClick={() => void discard()} disabled={!sessionId}>
+            <Trash2 size={14} /> 丢弃草稿
+          </button>
+        </div>
+      </footer>
+    </div>
+  );
+}
+
+interface InboxItemView {
+  id: string;
+  priority: "high" | "mid" | "low" | string;
+  kind: string;
+  title: string;
+  contextSummary: string;
+  targetChunkId?: string | null;
+  targetPackId?: string | null;
+  suggestedActions: string[];
+  origin: string;
+  createdAt: string;
+}
+
+interface InboxResp {
+  items: InboxItemView[];
+  stats: { total: number; high: number; mid: number; low: number };
+}
+
+function KnowledgeInbox() {
+  const [data, setData] = useState<InboxResp | null>(null);
+  const [pending, setPending] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [priority, setPriority] = useState<"" | "high" | "mid" | "low">("");
+
+  const load = useCallback(async () => {
+    setPending(true);
+    setError(null);
+    try {
+      const params = new URLSearchParams();
+      if (priority) params.set("priority", priority);
+      const r = await fetch(
+        `/api/operation-knowledge/inbox${params.toString() ? "?" + params : ""}`
+      );
+      if (!r.ok) throw new Error(await r.text());
+      const d = (await r.json()) as InboxResp;
+      setData(d);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setPending(false);
+    }
+  }, [priority]);
+
+  useEffect(() => {
+    void load();
+  }, [load]);
+
+  return (
+    <div className="wikiArchiveShell wikiInbox">
+      <header className="wikiArchiveHeader">
+        <div>
+          <div className="wikiArchiveEyebrow">today / inbox</div>
+          <h2>待办收件箱</h2>
+        </div>
+        <div className="wikiArchiveHeaderActions">
+          <select
+            value={priority}
+            onChange={(e) => setPriority(e.target.value as typeof priority)}
+          >
+            <option value="">全部优先级</option>
+            <option value="high">高</option>
+            <option value="mid">中</option>
+            <option value="low">低</option>
+          </select>
+          <button type="button" onClick={() => void load()} disabled={pending}>
+            <RefreshCw size={14} /> 刷新
+          </button>
+        </div>
+      </header>
+
+      {error ? <div className="wikiBannerError">{error}</div> : null}
+
+      {data ? (
+        <div className="wikiInboxStats">
+          <span className="wikiArchiveTag">[total {data.stats.total}]</span>
+          <span className="wikiArchiveTag">[high {data.stats.high}]</span>
+          <span className="wikiArchiveTag">[mid {data.stats.mid}]</span>
+          <span className="wikiArchiveTag">[low {data.stats.low}]</span>
+        </div>
+      ) : null}
+
+      <div className="wikiInboxList">
+        {data && data.items.length === 0 ? (
+          <div className="wikiEmpty">
+            <Inbox size={24} /> 暂无待办
+          </div>
+        ) : null}
+        {data?.items.map((it) => (
+          <article
+            key={it.id}
+            className={`wikiInboxCard wikiInboxCard--${it.priority}`}
+          >
+            <div className="wikiInboxCardHead">
+              <span className={`wikiArchiveTag wikiInboxPriority--${it.priority}`}>
+                [{it.priority}]
+              </span>
+              <span className="wikiArchiveTag">[{it.kind}]</span>
+              <span className="wikiArchiveTag">[{it.origin}]</span>
+              <span className="wikiArchiveTimelineTime">{it.createdAt}</span>
+            </div>
+            <h4 className="wikiInboxCardTitle">{it.title}</h4>
+            <p className="wikiInboxCardSummary">{it.contextSummary}</p>
+            <div className="wikiInboxCardActions">
+              {it.targetChunkId ? (
+                <button
+                  type="button"
+                  onClick={() => focusChunk(it.targetChunkId as string)}
+                >
+                  <ArrowRight size={12} /> 聚焦切片
+                </button>
+              ) : null}
+              {it.suggestedActions.includes("open_chat") ? (
+                <span className="wikiArchiveTag">[open_chat]</span>
+              ) : null}
+              {it.suggestedActions.includes("open_repair") ? (
+                <span className="wikiArchiveTag">[open_repair]</span>
+              ) : null}
+              {it.suggestedActions.includes("dismiss") ? (
+                <span className="wikiArchiveTag">[dismiss]</span>
+              ) : null}
+            </div>
+          </article>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+interface CatalogPersistedView {
+  total?: number;
+  items?: unknown[];
+}
+
+interface CompletenessView {
+  perWikiType?: Array<{ wikiType?: string; total?: number; ratio?: number }>;
+  overall?: { total?: number; verified?: number; ratio?: number };
+}
+
+interface IntegrityReportView {
+  needsReview?: number;
+  contested?: number;
+  sourceOrphan?: number;
+  total?: number;
+}
+
+interface LogsAnalyzeView {
+  windowHours?: number;
+  totalCalls?: number;
+  avgTurns?: number;
+  truncationRate?: number;
+  samples?: unknown[];
+}
+
+function ObservabilityDashboard() {
+  const [catalog, setCatalog] = useState<CatalogPersistedView | null>(null);
+  const [catalogLive, setCatalogLive] = useState<{ total?: number } | null>(null);
+  const [completeness, setCompleteness] = useState<CompletenessView | null>(null);
+  const [integrity, setIntegrity] = useState<IntegrityReportView | null>(null);
+  const [logs, setLogs] = useState<LogsAnalyzeView | null>(null);
+  const [pending, setPending] = useState(false);
+  const [sweeping, setSweeping] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [info, setInfo] = useState<string | null>(null);
+
+  const load = useCallback(async () => {
+    setPending(true);
+    setError(null);
+    try {
+      const [a, b, c, d, e] = await Promise.all([
+        fetch("/api/operation-knowledge/catalog/persisted").then((r) => r.json()),
+        fetch("/api/operation-knowledge/catalog").then((r) => r.json()),
+        fetch("/api/operation-knowledge/completeness").then((r) => r.json()),
+        fetch("/api/operation-knowledge/integrity-report").then((r) => r.json()),
+        fetch("/api/operation-knowledge/logs/analyze").then((r) => r.json())
+      ]);
+      setCatalog(a as CatalogPersistedView);
+      setCatalogLive(b as { total?: number });
+      setCompleteness(c as CompletenessView);
+      setIntegrity(d as IntegrityReportView);
+      setLogs(e as LogsAnalyzeView);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setPending(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    void load();
+  }, [load]);
+
+  async function sweep() {
+    setSweeping(true);
+    setError(null);
+    setInfo(null);
+    try {
+      const r = await fetch("/api/knowledge/gap-signals/sweep", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: "{}"
+      });
+      if (!r.ok) throw new Error(await r.text());
+      setInfo("已触发 gap-signals sweep");
+      await load();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setSweeping(false);
+    }
+  }
+
+  const persistedTotal = catalog?.total ?? catalog?.items?.length ?? 0;
+  const liveTotal = catalogLive?.total ?? 0;
+  const drift = liveTotal - persistedTotal;
+
+  return (
+    <div className="wikiArchiveShell wikiObservability">
+      <header className="wikiArchiveHeader">
+        <div>
+          <div className="wikiArchiveEyebrow">steward / diagnostics</div>
+          <h2>诊断仪表</h2>
+        </div>
+        <div className="wikiArchiveHeaderActions">
+          <button type="button" onClick={() => void load()} disabled={pending}>
+            <RefreshCw size={14} /> 刷新
+          </button>
+        </div>
+      </header>
+
+      {error ? <div className="wikiBannerError">{error}</div> : null}
+      {info ? <div className="wikiBannerInfo">{info}</div> : null}
+
+      <div className="wikiObservabilityGrid">
+        <article className="wikiObservabilityCard">
+          <header className="wikiObservabilityCardHead">
+            <span className="wikiArchiveTag">[catalog]</span>
+            <h4>目录覆盖</h4>
+          </header>
+          <dl className="wikiArchiveMeta">
+            <dt>持久化</dt>
+            <dd>{persistedTotal}</dd>
+            <dt>实时</dt>
+            <dd>{liveTotal}</dd>
+            <dt>偏差</dt>
+            <dd className={drift !== 0 ? "wikiObservabilityDrift" : undefined}>
+              {drift > 0 ? `+${drift}` : drift}
+            </dd>
+          </dl>
+          <button
+            type="button"
+            className="wikiObservabilityCta"
+            onClick={() => void sweep()}
+            disabled={sweeping}
+          >
+            <Workflow size={12} /> {sweeping ? "扫描中…" : "触发 sweep"}
+          </button>
+        </article>
+
+        <article className="wikiObservabilityCard">
+          <header className="wikiObservabilityCardHead">
+            <span className="wikiArchiveTag">[completeness]</span>
+            <h4>类型完整度</h4>
+          </header>
+          {completeness?.perWikiType && completeness.perWikiType.length > 0 ? (
+            <div className="wikiCoverageBars">
+              {completeness.perWikiType.map((row, i) => {
+                const ratio = Math.max(0, Math.min(1, Number(row.ratio ?? 0)));
+                return (
+                  <div className="wikiCoverageBarRow" key={i}>
+                    <span className="wikiCoverageBarLabel">{row.wikiType ?? "?"}</span>
+                    <div className="wikiCoverageBar">
+                      <div
+                        className="wikiCoverageBarFill"
+                        style={{ width: `${(ratio * 100).toFixed(0)}%` }}
+                      />
+                    </div>
+                    <span className="wikiCoverageBarValue">
+                      {(ratio * 100).toFixed(0)}% · {row.total ?? 0}
+                    </span>
+                  </div>
+                );
+              })}
+            </div>
+          ) : (
+            <div className="wikiEmpty">无完整度数据</div>
+          )}
+        </article>
+
+        <article className="wikiObservabilityCard">
+          <header className="wikiObservabilityCardHead">
+            <span className="wikiArchiveTag">[integrity]</span>
+            <h4>完整性诊断</h4>
+          </header>
+          <dl className="wikiArchiveMeta">
+            <dt>needs_review</dt>
+            <dd>{integrity?.needsReview ?? 0}</dd>
+            <dt>contested</dt>
+            <dd>{integrity?.contested ?? 0}</dd>
+            <dt>source_orphan</dt>
+            <dd>{integrity?.sourceOrphan ?? 0}</dd>
+            <dt>total</dt>
+            <dd>{integrity?.total ?? 0}</dd>
+          </dl>
+        </article>
+
+        <article className="wikiObservabilityCard">
+          <header className="wikiObservabilityCardHead">
+            <span className="wikiArchiveTag">[logs]</span>
+            <h4>检索 trace（24h）</h4>
+          </header>
+          <dl className="wikiArchiveMeta">
+            <dt>窗口</dt>
+            <dd>{logs?.windowHours ?? 24}h</dd>
+            <dt>调用</dt>
+            <dd>{logs?.totalCalls ?? 0}</dd>
+            <dt>平均轮数</dt>
+            <dd>{logs?.avgTurns?.toFixed?.(1) ?? "—"}</dd>
+            <dt>截断率</dt>
+            <dd>
+              {typeof logs?.truncationRate === "number"
+                ? `${(logs.truncationRate * 100).toFixed(1)}%`
+                : "—"}
+            </dd>
+          </dl>
+        </article>
+      </div>
+
+      <TestMatchPanel />
+    </div>
+  );
+}
+
+function TestMatchPanel() {
+  const [query, setQuery] = useState("");
+  const [pending, setPending] = useState(false);
+  const [result, setResult] = useState<unknown>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  async function run() {
+    const q = query.trim();
+    if (!q) {
+      setError("请输入查询");
+      return;
+    }
+    setPending(true);
+    setError(null);
+    try {
+      const r = await fetch("/api/operation-knowledge/test-match", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ query: q })
+      });
+      if (!r.ok) throw new Error(await r.text());
+      setResult(await r.json());
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setPending(false);
+    }
+  }
+
+  return (
+    <section className="wikiObservabilityCard wikiTestMatch">
+      <header className="wikiObservabilityCardHead">
+        <span className="wikiArchiveTag">[test-match]</span>
+        <h4>检索调试</h4>
+      </header>
+      <div className="wikiTestMatchRow">
+        <input
+          type="text"
+          value={query}
+          onChange={(e) => setQuery(e.target.value)}
+          placeholder="输入查询，看哪些 chunk 命中 + grounding score"
+          onKeyDown={(e) => {
+            if (e.key === "Enter") {
+              e.preventDefault();
+              void run();
+            }
+          }}
+        />
+        <button type="button" className="primary" onClick={() => void run()} disabled={pending}>
+          <Search size={12} /> {pending ? "查询中…" : "试算"}
+        </button>
+      </div>
+      {error ? <div className="wikiBannerError">{error}</div> : null}
+      {result ? (
+        <pre className="wikiTestMatchResult">{JSON.stringify(result, null, 2)}</pre>
+      ) : null}
+    </section>
+  );
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// G5 · AdminGovernanceView / MetadataDashboard / PublishBar
+// ──────────────────────────────────────────────────────────────────────
+
+interface MetadataResp {
+  wikiTypeCounts?: Array<{ wikiType?: string; count?: number }>;
+  verifiedRatioByType?: Array<{
+    wikiType?: string;
+    total?: number;
+    verified?: number;
+    ratio?: number;
+  }>;
+  topEditors?: Array<{ author?: string; count?: number }>;
+  recentActivity7d?: Array<{ date?: string; op?: string; count?: number }>;
+}
+
+function MetadataDashboard() {
+  const [data, setData] = useState<MetadataResp | null>(null);
+  const [pending, setPending] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const load = useCallback(async () => {
+    setPending(true);
+    setError(null);
+    try {
+      const r = await fetch("/api/operation-knowledge/metadata");
+      if (!r.ok) throw new Error(await r.text());
+      setData((await r.json()) as MetadataResp);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setPending(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    void load();
+  }, [load]);
+
+  // 计算 wikiType 柱状图最大值，做归一化。
+  const maxCount = useMemo(() => {
+    const arr = data?.wikiTypeCounts ?? [];
+    return arr.reduce((m, x) => Math.max(m, Number(x.count ?? 0)), 0);
+  }, [data]);
+
+  // 7d 活跃数据按日期归并 + total。
+  const activityByDate = useMemo(() => {
+    const arr = data?.recentActivity7d ?? [];
+    const map: Record<string, number> = {};
+    for (const a of arr) {
+      const d = a.date ?? "";
+      if (!d) continue;
+      map[d] = (map[d] ?? 0) + Number(a.count ?? 0);
+    }
+    return Object.entries(map)
+      .sort((a, b) => a[0].localeCompare(b[0]))
+      .map(([date, count]) => ({ date, count }));
+  }, [data]);
+
+  const maxActivity = useMemo(
+    () => activityByDate.reduce((m, x) => Math.max(m, x.count), 0),
+    [activityByDate]
+  );
+
+  return (
+    <div className="wikiMetadataDashboard">
+      <header className="wikiArchiveHeader">
+        <div>
+          <div className="wikiArchiveEyebrow">atlas / governance</div>
+          <h2>元信息总览</h2>
+        </div>
+        <div className="wikiArchiveHeaderActions">
+          <button type="button" onClick={() => void load()} disabled={pending}>
+            <RefreshCw size={14} /> 刷新
+          </button>
+        </div>
+      </header>
+
+      {error ? <div className="wikiBannerError">{error}</div> : null}
+
+      <div className="wikiMetadataGrid">
+        <article className="wikiObservabilityCard">
+          <header className="wikiObservabilityCardHead">
+            <span className="wikiArchiveTag">[counts]</span>
+            <h4>wiki_type 切片分布</h4>
+          </header>
+          {data?.wikiTypeCounts && data.wikiTypeCounts.length > 0 ? (
+            <div className="wikiCoverageBars">
+              {data.wikiTypeCounts.map((row, i) => {
+                const ratio = maxCount > 0 ? Number(row.count ?? 0) / maxCount : 0;
+                return (
+                  <div className="wikiCoverageBarRow" key={i}>
+                    <span className="wikiCoverageBarLabel">{row.wikiType ?? "?"}</span>
+                    <div className="wikiCoverageBar">
+                      <div
+                        className="wikiCoverageBarFill"
+                        style={{ width: `${(ratio * 100).toFixed(0)}%` }}
+                      />
+                    </div>
+                    <span className="wikiCoverageBarValue">{row.count ?? 0}</span>
+                  </div>
+                );
+              })}
+            </div>
+          ) : (
+            <div className="wikiEmpty">暂无切片</div>
+          )}
+        </article>
+
+        <article className="wikiObservabilityCard">
+          <header className="wikiObservabilityCardHead">
+            <span className="wikiArchiveTag">[ratio]</span>
+            <h4>verified 占比</h4>
+          </header>
+          {data?.verifiedRatioByType && data.verifiedRatioByType.length > 0 ? (
+            <div className="wikiCoverageBars">
+              {data.verifiedRatioByType.map((row, i) => {
+                const ratio = Math.max(0, Math.min(1, Number(row.ratio ?? 0)));
+                return (
+                  <div className="wikiCoverageBarRow" key={i}>
+                    <span className="wikiCoverageBarLabel">{row.wikiType ?? "?"}</span>
+                    <div className="wikiCoverageBar">
+                      <div
+                        className="wikiCoverageBarFill"
+                        style={{ width: `${(ratio * 100).toFixed(0)}%` }}
+                      />
+                    </div>
+                    <span className="wikiCoverageBarValue">
+                      {(ratio * 100).toFixed(0)}% · {row.verified ?? 0}/{row.total ?? 0}
+                    </span>
+                  </div>
+                );
+              })}
+            </div>
+          ) : (
+            <div className="wikiEmpty">暂无数据</div>
+          )}
+        </article>
+
+        <article className="wikiObservabilityCard">
+          <header className="wikiObservabilityCardHead">
+            <span className="wikiArchiveTag">[editors]</span>
+            <h4>近期编辑者</h4>
+          </header>
+          {data?.topEditors && data.topEditors.length > 0 ? (
+            <dl className="wikiArchiveMeta">
+              {data.topEditors.map((row, i) => (
+                <Fragment key={i}>
+                  <dt>{row.author ?? "unknown"}</dt>
+                  <dd>{row.count ?? 0}</dd>
+                </Fragment>
+              ))}
+            </dl>
+          ) : (
+            <div className="wikiEmpty">暂无编辑记录</div>
+          )}
+        </article>
+
+        <article className="wikiObservabilityCard">
+          <header className="wikiObservabilityCardHead">
+            <span className="wikiArchiveTag">[activity]</span>
+            <h4>7 天活跃</h4>
+          </header>
+          {activityByDate.length > 0 ? (
+            <div className="wikiActivityChart">
+              {activityByDate.map((d) => {
+                const h = maxActivity > 0 ? (d.count / maxActivity) * 100 : 0;
+                return (
+                  <div className="wikiActivityBar" key={d.date} title={`${d.date}: ${d.count}`}>
+                    <div
+                      className="wikiActivityBarFill"
+                      style={{ height: `${h.toFixed(0)}%` }}
+                    />
+                    <span className="wikiActivityBarLabel">{d.date.slice(5)}</span>
+                  </div>
+                );
+              })}
+            </div>
+          ) : (
+            <div className="wikiEmpty">7d 内无修订</div>
+          )}
+        </article>
+      </div>
+    </div>
+  );
+}
+
+interface PublishBarProps {
+  resourceKind: "taxonomies" | "operation-state-policies" | "operation-domains";
+  id: string;
+  onChange?: () => void;
+}
+
+function PublishBar({ resourceKind, id, onChange }: PublishBarProps) {
+  const [busy, setBusy] = useState<string>("");
+  const [error, setError] = useState<string | null>(null);
+  const [info, setInfo] = useState<string | null>(null);
+
+  async function call(action: "publish" | "rollout" | "rollback") {
+    if (action === "rollback" && !window.confirm("回退到上一版本？")) return;
+    setBusy(action);
+    setError(null);
+    setInfo(null);
+    try {
+      const r = await fetch(
+        `/api/admin/${resourceKind}/${encodeURIComponent(id)}/${action}`,
+        { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" }
+      );
+      if (!r.ok) throw new Error(await r.text());
+      setInfo(`${action} ok`);
+      onChange?.();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy("");
+    }
+  }
+
+  return (
+    <div className="wikiPublishBar">
+      <button
+        type="button"
+        onClick={() => void call("publish")}
+        disabled={busy !== ""}
+        className="wikiActionBtn--verify"
+      >
+        <CheckCircle2 size={12} /> {busy === "publish" ? "发布中…" : "发布新版"}
+      </button>
+      <button type="button" onClick={() => void call("rollout")} disabled={busy !== ""}>
+        <ArrowRight size={12} /> {busy === "rollout" ? "灰度中…" : "灰度全量"}
+      </button>
+      <button
+        type="button"
+        onClick={() => void call("rollback")}
+        disabled={busy !== ""}
+        className="wikiActionBtn--reject"
+      >
+        <Undo2 size={12} /> {busy === "rollback" ? "回退中…" : "回退上版"}
+      </button>
+      {info ? <span className="wikiPublishBarInfo">{info}</span> : null}
+      {error ? <span className="wikiPublishBarError">{error}</span> : null}
+    </div>
+  );
+}
+
+interface TaxonomyEntryView {
+  id: string;
+  scope?: string;
+  kind?: string;
+  value?: { id?: string; displayName?: string; status?: string };
+  version?: number;
+  currentVersion?: boolean;
+  previousVersion?: number | null;
+  updatedAt?: string;
+}
+
+function AdminGovernanceView() {
+  const [tab, setTab] = useState<"meta" | "taxonomies" | "policies" | "domains">("meta");
+  return (
+    <div className="wikiArchiveShell wikiAdminGovernance">
+      <header className="wikiArchiveHeader">
+        <div>
+          <div className="wikiArchiveEyebrow">atlas / governance</div>
+          <h2>治理工坊</h2>
+        </div>
+      </header>
+      <div className="wikiAdminTabs">
+        <button
+          type="button"
+          className={tab === "meta" ? "wikiAdminTab active" : "wikiAdminTab"}
+          onClick={() => setTab("meta")}
+        >
+          <Activity size={12} /> 元信息
+        </button>
+        <button
+          type="button"
+          className={tab === "taxonomies" ? "wikiAdminTab active" : "wikiAdminTab"}
+          onClick={() => setTab("taxonomies")}
+        >
+          <LibraryBig size={12} /> 分类系统
+        </button>
+        <button
+          type="button"
+          className={tab === "policies" ? "wikiAdminTab active" : "wikiAdminTab"}
+          onClick={() => setTab("policies")}
+        >
+          <ShieldCheck size={12} /> 状态策略
+        </button>
+        <button
+          type="button"
+          className={tab === "domains" ? "wikiAdminTab active" : "wikiAdminTab"}
+          onClick={() => setTab("domains")}
+        >
+          <Workflow size={12} /> 域配置
+        </button>
+      </div>
+      <div className="wikiAdminPanel">
+        {tab === "meta" && <MetadataDashboard />}
+        {tab === "taxonomies" && <TaxonomiesGovernance />}
+        {tab === "policies" && <StatePoliciesGovernance />}
+        {tab === "domains" && <DomainGovernance />}
+      </div>
+    </div>
+  );
+}
+
+function TaxonomiesGovernance() {
+  const [items, setItems] = useState<TaxonomyEntryView[]>([]);
+  const [pending, setPending] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [includeAll, setIncludeAll] = useState(false);
+
+  const load = useCallback(async () => {
+    setPending(true);
+    setError(null);
+    try {
+      const params = new URLSearchParams();
+      if (includeAll) params.set("includeAllVersions", "true");
+      const r = await fetch(
+        `/api/admin/taxonomies${params.toString() ? "?" + params : ""}`
+      );
+      if (!r.ok) throw new Error(await r.text());
+      const d = (await r.json()) as { items?: TaxonomyEntryView[] };
+      setItems(d.items ?? []);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setPending(false);
+    }
+  }, [includeAll]);
+
+  useEffect(() => {
+    void load();
+  }, [load]);
+
+  return (
+    <section>
+      <div className="wikiAdminToolbar">
+        <label className="wikiAdminToolbarLabel">
+          <input
+            type="checkbox"
+            checked={includeAll}
+            onChange={(e) => setIncludeAll(e.target.checked)}
+          />
+          显示历史版本
+        </label>
+        <button type="button" onClick={() => void load()} disabled={pending}>
+          <RefreshCw size={12} /> 刷新
+        </button>
+      </div>
+      {error ? <div className="wikiBannerError">{error}</div> : null}
+      <table className="wikiAdminTable">
+        <thead>
+          <tr>
+            <th>scope</th>
+            <th>kind</th>
+            <th>value</th>
+            <th>label</th>
+            <th>status</th>
+            <th>version</th>
+            <th>active</th>
+            <th>updated</th>
+            <th>actions</th>
+          </tr>
+        </thead>
+        <tbody>
+          {items.length === 0 && !pending ? (
+            <tr>
+              <td colSpan={9}>
+                <div className="wikiEmpty">暂无分类</div>
+              </td>
+            </tr>
+          ) : null}
+          {items.map((it) => (
+            <tr key={it.id} className={it.currentVersion ? "is-active" : ""}>
+              <td>{it.scope}</td>
+              <td>{it.kind}</td>
+              <td className="wikiArchiveTimelineTime">{it.value?.id}</td>
+              <td>{it.value?.displayName}</td>
+              <td>
+                <span className="wikiArchiveTag">[{it.value?.status ?? "?"}]</span>
+              </td>
+              <td className="wikiArchiveTimelineTime">v{it.version ?? 0}</td>
+              <td>{it.currentVersion ? "✓" : ""}</td>
+              <td className="wikiArchiveTimelineTime">{it.updatedAt ?? ""}</td>
+              <td>
+                <PublishBar
+                  resourceKind="taxonomies"
+                  id={it.id}
+                  onChange={() => void load()}
+                />
+              </td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </section>
+  );
+}
+
+interface StatePolicyEntryView {
+  id: string;
+  domain?: string;
+  version?: number;
+  currentVersion?: boolean;
+  updatedAt?: string;
+  states?: unknown[];
+}
+
+function StatePoliciesGovernance() {
+  const [items, setItems] = useState<StatePolicyEntryView[]>([]);
+  const [pending, setPending] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const load = useCallback(async () => {
+    setPending(true);
+    setError(null);
+    try {
+      const r = await fetch("/api/admin/operation-state-policies");
+      if (!r.ok) throw new Error(await r.text());
+      const d = (await r.json()) as { items?: StatePolicyEntryView[] };
+      setItems(d.items ?? []);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setPending(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    void load();
+  }, [load]);
+
+  return (
+    <section>
+      <div className="wikiAdminToolbar">
+        <button type="button" onClick={() => void load()} disabled={pending}>
+          <RefreshCw size={12} /> 刷新
+        </button>
+      </div>
+      {error ? <div className="wikiBannerError">{error}</div> : null}
+      <table className="wikiAdminTable">
+        <thead>
+          <tr>
+            <th>domain</th>
+            <th>version</th>
+            <th>active</th>
+            <th>states</th>
+            <th>updated</th>
+            <th>actions</th>
+          </tr>
+        </thead>
+        <tbody>
+          {items.length === 0 && !pending ? (
+            <tr>
+              <td colSpan={6}>
+                <div className="wikiEmpty">暂无状态策略</div>
+              </td>
+            </tr>
+          ) : null}
+          {items.map((it) => (
+            <tr key={it.id} className={it.currentVersion ? "is-active" : ""}>
+              <td>{it.domain}</td>
+              <td className="wikiArchiveTimelineTime">v{it.version ?? 0}</td>
+              <td>{it.currentVersion ? "✓" : ""}</td>
+              <td className="wikiArchiveTimelineTime">{(it.states ?? []).length} 状态</td>
+              <td className="wikiArchiveTimelineTime">{it.updatedAt ?? ""}</td>
+              <td>
+                <PublishBar
+                  resourceKind="operation-state-policies"
+                  id={it.id}
+                  onChange={() => void load()}
+                />
+              </td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </section>
+  );
+}
+
+interface DomainEntryView {
+  id: string;
+  domain?: string;
+  version?: number;
+  currentVersion?: boolean;
+  updatedAt?: string;
+}
+
+function DomainGovernance() {
+  const [items, setItems] = useState<DomainEntryView[]>([]);
+  const [pending, setPending] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const load = useCallback(async () => {
+    setPending(true);
+    setError(null);
+    try {
+      const r = await fetch("/api/operation-domains");
+      if (!r.ok) throw new Error(await r.text());
+      const d = (await r.json()) as { items?: DomainEntryView[] };
+      setItems(d.items ?? []);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setPending(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    void load();
+  }, [load]);
+
+  return (
+    <section>
+      <div className="wikiAdminToolbar">
+        <button type="button" onClick={() => void load()} disabled={pending}>
+          <RefreshCw size={12} /> 刷新
+        </button>
+      </div>
+      {error ? <div className="wikiBannerError">{error}</div> : null}
+      <table className="wikiAdminTable">
+        <thead>
+          <tr>
+            <th>domain</th>
+            <th>version</th>
+            <th>active</th>
+            <th>updated</th>
+            <th>actions</th>
+          </tr>
+        </thead>
+        <tbody>
+          {items.length === 0 && !pending ? (
+            <tr>
+              <td colSpan={5}>
+                <div className="wikiEmpty">暂无域配置</div>
+              </td>
+            </tr>
+          ) : null}
+          {items.map((it) => (
+            <tr key={it.id} className={it.currentVersion ? "is-active" : ""}>
+              <td>{it.domain}</td>
+              <td className="wikiArchiveTimelineTime">v{it.version ?? 0}</td>
+              <td>{it.currentVersion ? "✓" : ""}</td>
+              <td className="wikiArchiveTimelineTime">{it.updatedAt ?? ""}</td>
+              <td>
+                <PublishBar
+                  resourceKind="operation-domains"
+                  id={it.id}
+                  onChange={() => void load()}
+                />
+              </td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </section>
+  );
 }
 
 function KnowledgeTreeView() {
@@ -6766,6 +9349,9 @@ function KnowledgeTreeView() {
     setActiveId(id);
     setShowBody(false);
     setInfo(null);
+    if (typeof window !== "undefined") {
+      window.dispatchEvent(new CustomEvent("wikiFocusChunk", { detail: { chunkId: id } }));
+    }
     // 自动展开它所在路径
     const it = indexById.get(id);
     if (it) {
@@ -6914,7 +9500,10 @@ function ChunkDetail(props: {
       </header>
       {chunk.summary ? <p className="wikiChunkSummary">{chunk.summary}</p> : null}
       {hasQuote ? (
-        <blockquote className="wikiSourceQuote">{chunk.sourceQuote}</blockquote>
+        <blockquote className="wikiArchiveCitation">
+          {chunk.sourceQuote}
+          <span className="wikiArchiveCitationSource">{chunk.id}</span>
+        </blockquote>
       ) : (
         <div className="wikiHint">无 source_quote — 该 chunk 不可被 verify。</div>
       )}
@@ -7094,6 +9683,440 @@ function ChunkRevisionsDrawer() {
           );
         })}
       </div>
+    </div>
+  );
+}
+
+// ── Phase F · Today Mode：Digest 画布 + 任务侧栏 ──────────────────────────
+
+interface DigestCardView {
+  cardId: string;
+  kind: string;
+  title: string;
+  summary: string;
+  severity: string;
+  suggestedAction: string;
+  targetRefs?: Array<Record<string, unknown>>;
+  metric?: { name?: string; value?: number; threshold?: number } | null;
+}
+
+interface DigestReportView {
+  reportId?: string | null;
+  workspaceId: string;
+  accountId: string;
+  reportDate: string;
+  status: string;
+  errorKind?: string | null;
+  cards: DigestCardView[];
+  dismissedCardIds: string[];
+  generatedAt?: string;
+  generatedBy?: string;
+}
+
+function severityBadgeClass(sev: string): string {
+  return `wikiDigestBadge sev-${sev}`;
+}
+
+function DigestCanvas() {
+  const [report, setReport] = useState<DigestReportView | null>(null);
+  const [pending, setPending] = useState(false);
+  const [regen, setRegen] = useState(false);
+  const [error, setError] = useState<Error | null>(null);
+  const [dismissing, setDismissing] = useState<Set<string>>(new Set());
+
+  async function load() {
+    setPending(true);
+    setError(null);
+    try {
+      const r = await fetch("/api/knowledge/digest/today");
+      if (!r.ok) throw await parseApiError(r);
+      const data = (await r.json()) as DigestReportView;
+      setReport(data);
+    } catch (e) {
+      setError(e instanceof Error ? e : new Error(String(e)));
+      setReport(null);
+    } finally {
+      setPending(false);
+    }
+  }
+
+  async function regenerate() {
+    setRegen(true);
+    setError(null);
+    try {
+      const r = await fetch("/api/knowledge/digest/regenerate", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ force: true })
+      });
+      if (!r.ok) throw await parseApiError(r);
+      const data = (await r.json()) as DigestReportView;
+      setReport(data);
+    } catch (e) {
+      setError(e instanceof Error ? e : new Error(String(e)));
+    } finally {
+      setRegen(false);
+    }
+  }
+
+  async function dismiss(cardId: string) {
+    setDismissing((s) => new Set(s).add(cardId));
+    try {
+      const r = await fetch(
+        `/api/knowledge/digest/cards/${encodeURIComponent(cardId)}/dismiss`,
+        { method: "POST" }
+      );
+      if (!r.ok) throw new Error(await r.text());
+      setReport((prev) =>
+        prev ? { ...prev, dismissedCardIds: [...prev.dismissedCardIds, cardId] } : prev
+      );
+    } catch (e) {
+      setError(e instanceof Error ? e : new Error(String(e)));
+    } finally {
+      setDismissing((s) => {
+        const next = new Set(s);
+        next.delete(cardId);
+        return next;
+      });
+    }
+  }
+
+  useEffect(() => {
+    void load();
+  }, []);
+
+  const visibleCards = useMemo(() => {
+    if (!report) return [];
+    const dismissed = new Set(report.dismissedCardIds);
+    return report.cards.filter((c) => !dismissed.has(c.cardId));
+  }, [report]);
+
+  return (
+    <div className="wikiDigestCanvas">
+      <div className="wikiDigestHead">
+        <div>
+          <h3>今日 Digest</h3>
+          <span className="wikiDigestMeta">
+            {report?.reportDate ?? "—"} · {report?.status ?? "—"} · 生成于 {report?.generatedAt ?? "—"}
+          </span>
+        </div>
+        <div className="wikiDigestActions">
+          <button type="button" onClick={() => void load()} disabled={pending}>
+            <RefreshCw size={14} /> {pending ? "刷新中…" : "刷新"}
+          </button>
+          <button type="button" className="primary" onClick={() => void regenerate()} disabled={regen}>
+            <Sparkles size={14} /> {regen ? "重算中…" : "强制重算"}
+          </button>
+        </div>
+      </div>
+      {error ? <LlmErrorBanner error={error} onRetry={() => void load()} retrying={pending} /> : null}
+      {!error && visibleCards.length === 0 && !pending ? (
+        <div className="wikiEmpty wikiDigestEmpty">
+          <FileBox size={28} /> 今日暂无待办卡片。点击「强制重算」可立即合成。
+        </div>
+      ) : null}
+      <div className="wikiDigestGrid">
+        {visibleCards.map((card) => (
+          <article className={`wikiDigestCard sev-${card.severity}`} key={card.cardId}>
+            <div className="wikiDigestCardHead">
+              <span className={severityBadgeClass(card.severity)}>{card.severity}</span>
+              <span className="wikiDigestKind">{card.kind}</span>
+            </div>
+            <h4 className="wikiDigestTitle">{card.title}</h4>
+            <p className="wikiDigestSummary">{card.summary}</p>
+            {card.metric && card.metric.name ? (
+              <div className="wikiDigestMetric">
+                {card.metric.name}：{card.metric.value ?? "—"}
+                {card.metric.threshold !== undefined ? ` / 阈值 ${card.metric.threshold}` : ""}
+              </div>
+            ) : null}
+            <div className="wikiDigestCardFoot">
+              <span className="wikiDigestAction">建议：{card.suggestedAction}</span>
+              <button
+                type="button"
+                className="wikiDigestDismiss"
+                onClick={() => void dismiss(card.cardId)}
+                disabled={dismissing.has(card.cardId)}
+              >
+                <X size={12} /> 忽略
+              </button>
+            </div>
+          </article>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+async function tryLlmError(_resp: Response, fallback: string): Promise<Error> {
+  return new Error(fallback);
+}
+void tryLlmError;
+
+interface ChatTaskView {
+  taskId: string;
+  sessionId: string;
+  status: string;
+  errorKind?: string | null;
+  totalSteps: number;
+  completedSteps: unknown[];
+  cards: DigestCardView[];
+  createdAt?: string;
+  startedAt?: string | null;
+  finishedAt?: string | null;
+}
+
+function TaskRail() {
+  const [sessionId, setSessionId] = useState("");
+  const [task, setTask] = useState<ChatTaskView | null>(null);
+  const [pending, setPending] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [liveTurns, setLiveTurns] = useState<number[]>([]);
+  const esRef = useRef<EventSource | null>(null);
+
+  function closeStream() {
+    if (esRef.current) {
+      esRef.current.close();
+      esRef.current = null;
+    }
+  }
+
+  function attachStream(sid: string) {
+    closeStream();
+    if (!sid || typeof window === "undefined" || typeof window.EventSource === "undefined") {
+      return;
+    }
+    const es = new EventSource(
+      `/api/knowledge/chat/sessions/${encodeURIComponent(sid)}/stream`
+    );
+    esRef.current = es;
+    es.addEventListener("turn", (ev) => {
+      const v = Number((ev as MessageEvent).data);
+      if (!Number.isNaN(v)) setLiveTurns((prev) => [...prev, v]);
+    });
+    es.addEventListener("close", () => closeStream());
+    es.addEventListener("error", () => closeStream());
+  }
+
+  useEffect(() => () => closeStream(), []);
+
+  async function loadTask(taskId: string) {
+    setPending(true);
+    setError(null);
+    try {
+      const r = await fetch(`/api/knowledge/chat/tasks/${encodeURIComponent(taskId)}`);
+      if (!r.ok) throw new Error(await r.text());
+      const data = (await r.json()) as ChatTaskView;
+      setTask(data);
+      attachStream(data.sessionId);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setPending(false);
+    }
+  }
+
+  async function cancelTask() {
+    if (!task) return;
+    setPending(true);
+    setError(null);
+    try {
+      const r = await fetch(
+        `/api/knowledge/chat/tasks/${encodeURIComponent(task.taskId)}/cancel`,
+        { method: "POST" }
+      );
+      if (!r.ok) throw new Error(await r.text());
+      await loadTask(task.taskId);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setPending(false);
+    }
+  }
+
+  return (
+    <aside className="wikiTaskRail">
+      <div className="wikiTaskRailHead">
+        <h3>派工跟踪</h3>
+        <span className="wikiTaskRailHint">输入 taskId 查看长任务执行进度</span>
+      </div>
+      <div className="wikiTaskRailForm">
+        <input
+          type="text"
+          className="wikiInput"
+          placeholder="taskId（24 位 ObjectId）"
+          value={sessionId}
+          onChange={(e) => setSessionId(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === "Enter" && sessionId.trim()) void loadTask(sessionId.trim());
+          }}
+        />
+        <button
+          type="button"
+          className="primary"
+          disabled={pending || !sessionId.trim()}
+          onClick={() => void loadTask(sessionId.trim())}
+        >
+          <Search size={14} /> 拉取
+        </button>
+      </div>
+      {error ? <div className="wikiAlert error">{error}</div> : null}
+      {task ? (
+        <div className="wikiTaskRailBody">
+          <div className="wikiTaskCard">
+            <div className="wikiTaskCardHead">
+              <span className={`wikiTaskStatus s-${task.status}`}>{task.status}</span>
+              <span className="wikiTaskMeta">
+                {task.completedSteps.length}/{task.totalSteps} 步
+              </span>
+            </div>
+            <div className="wikiTaskMeta wikiTaskMeta--small">session: {task.sessionId}</div>
+            <div className="wikiTaskMeta wikiTaskMeta--small">
+              开始：{task.startedAt ?? "—"} · 结束：{task.finishedAt ?? "—"}
+            </div>
+            {task.errorKind ? (
+              <div className="wikiAlert error">errorKind: {task.errorKind}</div>
+            ) : null}
+            {task.cards.length > 0 ? (
+              <div className="wikiTaskCardList">
+                {task.cards.map((c) => (
+                  <div className="wikiTaskCardEntry" key={c.cardId}>
+                    <span className={severityBadgeClass(c.severity)}>{c.severity}</span>
+                    <span className="wikiTaskCardTitle">{c.title}</span>
+                  </div>
+                ))}
+              </div>
+            ) : null}
+            {task.status === "running" || task.status === "pending" ? (
+              <button
+                type="button"
+                className="wikiTaskCancel"
+                onClick={() => void cancelTask()}
+                disabled={pending}
+              >
+                <X size={12} /> 取消
+              </button>
+            ) : null}
+          </div>
+          {liveTurns.length > 0 ? (
+            <div className="wikiTaskLive">
+              <div className="wikiTaskLiveHead">
+                <Loader2 size={12} className="wikiTaskSpin" />
+                实时 turn
+              </div>
+              <ol className="wikiTaskLiveList">
+                {liveTurns.slice(-12).map((t, i) => (
+                  <li key={`${t}-${i}`}>turn #{t}</li>
+                ))}
+              </ol>
+            </div>
+          ) : null}
+        </div>
+      ) : (
+        <div className="wikiEmpty wikiTaskRailEmpty">
+          暂无任务。在「探索」对话中派工后，可在此输入 taskId 跟踪。
+        </div>
+      )}
+    </aside>
+  );
+}
+
+// ── Phase F · Atlas Mode：运营记忆抽屉 ──────────────────────────────────
+
+interface OperatorMemoryView {
+  id: string | null;
+  workspaceId: string;
+  accountId: string;
+  operatorId: string;
+  kind: string;
+  content: string;
+  createdAt?: string | null;
+  lastUsedAt?: string | null;
+  expiresAt?: string | null;
+}
+
+const OPERATOR_MEMORY_KINDS: Array<{ key: string; label: string }> = [
+  { key: "", label: "全部" },
+  { key: "preference", label: "偏好" },
+  { key: "rejection", label: "拒绝" },
+  { key: "context", label: "上下文" }
+];
+
+function MemoryDrawer() {
+  const [items, setItems] = useState<OperatorMemoryView[]>([]);
+  const [kind, setKind] = useState("");
+  const [pending, setPending] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  async function load() {
+    setPending(true);
+    setError(null);
+    try {
+      const params = new URLSearchParams();
+      if (kind) params.set("kind", kind);
+      params.set("limit", "100");
+      const r = await fetch(`/api/knowledge/operator-memory?${params.toString()}`);
+      if (!r.ok) throw new Error(await r.text());
+      const data = (await r.json()) as { items: OperatorMemoryView[] };
+      setItems(data.items ?? []);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+      setItems([]);
+    } finally {
+      setPending(false);
+    }
+  }
+
+  useEffect(() => {
+    void load();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [kind]);
+
+  return (
+    <div className="wikiMemoryDrawer">
+      <div className="wikiMemoryHead">
+        <h3>运营记忆</h3>
+        <span className="wikiHint">注入到 reply prompt 的长期偏好/拒绝/上下文</span>
+      </div>
+      <div className="wikiMemoryFilter">
+        {OPERATOR_MEMORY_KINDS.map((k) => (
+          <button
+            key={k.key || "all"}
+            type="button"
+            className={kind === k.key ? "wikiMemoryKindBtn active" : "wikiMemoryKindBtn"}
+            onClick={() => setKind(k.key)}
+          >
+            {k.label}
+          </button>
+        ))}
+        <button
+          type="button"
+          className="wikiMemoryKindBtn"
+          onClick={() => void load()}
+          disabled={pending}
+        >
+          <RefreshCw size={12} /> {pending ? "刷新中" : "刷新"}
+        </button>
+      </div>
+      {error ? <div className="wikiAlert error">{error}</div> : null}
+      {!error && !pending && items.length === 0 ? (
+        <div className="wikiEmpty">该筛选下暂无运营记忆。</div>
+      ) : null}
+      <ul className="wikiMemoryList">
+        {items.map((m) => (
+          <li className={`wikiMemoryItem kind-${m.kind}`} key={m.id ?? `${m.kind}-${m.createdAt}`}>
+            <div className="wikiMemoryItemHead">
+              <span className={`wikiMemoryKind kind-${m.kind}`}>{m.kind}</span>
+              <span className="wikiMemoryOperator">{m.operatorId}</span>
+            </div>
+            <div className="wikiMemoryContent">{m.content}</div>
+            <div className="wikiMemoryFoot">
+              <span>last_used_at: {m.lastUsedAt ?? "—"}</span>
+              <span>expires_at: {m.expiresAt ?? "—"}</span>
+            </div>
+          </li>
+        ))}
+      </ul>
     </div>
   );
 }
