@@ -8913,6 +8913,13 @@ function ObservabilityDashboard() {
   const [completeness, setCompleteness] = useState<CompletenessView | null>(null);
   const [integrity, setIntegrity] = useState<IntegrityReportView | null>(null);
   const [logs, setLogs] = useState<LogsAnalyzeView | null>(null);
+  const [cacheStats, setCacheStats] = useState<{
+    entries?: number;
+    hits?: number;
+    misses?: number;
+    maxEntries?: number;
+    ttlSeconds?: number;
+  } | null>(null);
   const [pending, setPending] = useState(false);
   const [sweeping, setSweeping] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -8922,18 +8929,21 @@ function ObservabilityDashboard() {
     setPending(true);
     setError(null);
     try {
-      const [a, b, c, d, e] = await Promise.all([
+      const [a, b, c, d, e, f] = await Promise.all([
         fetch("/api/operation-knowledge/catalog/persisted").then((r) => r.json()),
         fetch("/api/operation-knowledge/catalog").then((r) => r.json()),
         fetch("/api/operation-knowledge/completeness").then((r) => r.json()),
         fetch("/api/operation-knowledge/integrity-report").then((r) => r.json()),
-        fetch("/api/operation-knowledge/logs/analyze").then((r) => r.json())
+        fetch("/api/operation-knowledge/logs/analyze").then((r) => r.json()),
+        fetch("/api/knowledge/metrics").then((r) => r.json())
       ]);
       setCatalog(a as CatalogPersistedView);
       setCatalogLive(b as { total?: number });
       setCompleteness(c as CompletenessView);
       setIntegrity(d as IntegrityReportView);
       setLogs(e as LogsAnalyzeView);
+      const metrics = f as { answerCache?: typeof cacheStats };
+      setCacheStats(metrics?.answerCache ?? null);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -9078,6 +9088,35 @@ function ObservabilityDashboard() {
                 : "—"}
             </dd>
           </dl>
+        </article>
+
+        <article className="wikiObservabilityCard">
+          <header className="wikiObservabilityCardHead">
+            <span className="wikiArchiveTag">[answer-cache]</span>
+            <h4>问答缓存</h4>
+          </header>
+          {(() => {
+            const hits = cacheStats?.hits ?? 0;
+            const misses = cacheStats?.misses ?? 0;
+            const total = hits + misses;
+            const ratio = total > 0 ? (hits / total) * 100 : null;
+            return (
+              <dl className="wikiArchiveMeta">
+                <dt>条目</dt>
+                <dd>{cacheStats?.entries ?? 0} / {cacheStats?.maxEntries ?? "—"}</dd>
+                <dt>命中</dt>
+                <dd>{hits}</dd>
+                <dt>未命中</dt>
+                <dd>{misses}</dd>
+                <dt>命中率</dt>
+                <dd className={ratio !== null && ratio >= 30 ? "wikiObservabilityDrift" : undefined}>
+                  {ratio === null ? "—" : `${ratio.toFixed(1)}%`}
+                </dd>
+                <dt>TTL</dt>
+                <dd>{cacheStats?.ttlSeconds ?? "—"}s</dd>
+              </dl>
+            );
+          })()}
         </article>
       </div>
 
