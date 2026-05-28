@@ -8920,6 +8920,13 @@ function ObservabilityDashboard() {
     maxEntries?: number;
     ttlSeconds?: number;
   } | null>(null);
+  const [phaseRollup, setPhaseRollup] = useState<{
+    windowHours?: number;
+    lifecycle?: Array<{ lifecycle: string; count: number; outOfClosedSet?: boolean }>;
+    revisionReasons?: Array<{ reason: string; count: number }>;
+    reviewerMisjudge?: Array<{ kind: string; count: number }>;
+    negativeExamplePending?: number;
+  } | null>(null);
   const [pending, setPending] = useState(false);
   const [sweeping, setSweeping] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -8929,13 +8936,14 @@ function ObservabilityDashboard() {
     setPending(true);
     setError(null);
     try {
-      const [a, b, c, d, e, f] = await Promise.all([
+      const [a, b, c, d, e, f, g] = await Promise.all([
         fetch("/api/operation-knowledge/catalog/persisted").then((r) => r.json()),
         fetch("/api/operation-knowledge/catalog").then((r) => r.json()),
         fetch("/api/operation-knowledge/completeness").then((r) => r.json()),
         fetch("/api/operation-knowledge/integrity-report").then((r) => r.json()),
         fetch("/api/operation-knowledge/logs/analyze").then((r) => r.json()),
-        fetch("/api/knowledge/metrics").then((r) => r.json())
+        fetch("/api/knowledge/metrics").then((r) => r.json()),
+        fetch("/api/admin/observability/phase-rollup").then((r) => r.json())
       ]);
       setCatalog(a as CatalogPersistedView);
       setCatalogLive(b as { total?: number });
@@ -8944,6 +8952,7 @@ function ObservabilityDashboard() {
       setLogs(e as LogsAnalyzeView);
       const metrics = f as { answerCache?: typeof cacheStats };
       setCacheStats(metrics?.answerCache ?? null);
+      setPhaseRollup(g as typeof phaseRollup);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -9120,8 +9129,121 @@ function ObservabilityDashboard() {
         </article>
       </div>
 
+      <PhaseRollupPanel data={phaseRollup} />
+
       <TestMatchPanel />
     </div>
+  );
+}
+
+function PhaseRollupPanel({
+  data
+}: {
+  data: {
+    windowHours?: number;
+    lifecycle?: Array<{ lifecycle: string; count: number; outOfClosedSet?: boolean }>;
+    revisionReasons?: Array<{ reason: string; count: number }>;
+    reviewerMisjudge?: Array<{ kind: string; count: number }>;
+    negativeExamplePending?: number;
+  } | null;
+}) {
+  if (!data) {
+    return null;
+  }
+  const lifecycle = data.lifecycle ?? [];
+  const lifecycleTotal = lifecycle.reduce((sum, row) => sum + (row.count ?? 0), 0);
+  const revisionReasons = data.revisionReasons ?? [];
+  const reviewerMisjudge = data.reviewerMisjudge ?? [];
+  const negativeExamplePending = data.negativeExamplePending ?? 0;
+  const windowHours = data.windowHours ?? 24;
+
+  return (
+    <section className="wikiObservabilityPhaseRollup">
+      <header className="wikiObservabilityCardHead">
+        <span className="wikiArchiveTag">[phase-rollup]</span>
+        <h4>Phase 0-D 自治信号（{windowHours}h）</h4>
+      </header>
+      <div className="wikiObservabilityGrid">
+        <article className="wikiObservabilityCard">
+          <header className="wikiObservabilityCardHead">
+            <span className="wikiArchiveTag">[lifecycle]</span>
+            <h4>run lifecycle 终态</h4>
+          </header>
+          {lifecycleTotal === 0 ? (
+            <div className="wikiEmpty">窗口内无 run</div>
+          ) : (
+            <dl className="wikiArchiveMeta">
+              {lifecycle.map((row, i) => (
+                <Fragment key={i}>
+                  <dt>
+                    {row.lifecycle}
+                    {row.outOfClosedSet ? (
+                      <span className="wikiObservabilityDrift"> · out-of-closed-set</span>
+                    ) : null}
+                  </dt>
+                  <dd>{row.count}</dd>
+                </Fragment>
+              ))}
+            </dl>
+          )}
+        </article>
+
+        <article className="wikiObservabilityCard">
+          <header className="wikiObservabilityCardHead">
+            <span className="wikiArchiveTag">[revision]</span>
+            <h4>single-shot revision top</h4>
+          </header>
+          {revisionReasons.length === 0 ? (
+            <div className="wikiEmpty">窗口内无 revision</div>
+          ) : (
+            <dl className="wikiArchiveMeta">
+              {revisionReasons.map((row, i) => (
+                <Fragment key={i}>
+                  <dt>{row.reason}</dt>
+                  <dd>{row.count}</dd>
+                </Fragment>
+              ))}
+            </dl>
+          )}
+        </article>
+
+        <article className="wikiObservabilityCard">
+          <header className="wikiObservabilityCardHead">
+            <span className="wikiArchiveTag">[reviewer]</span>
+            <h4>reviewer 误判信号</h4>
+          </header>
+          {reviewerMisjudge.length === 0 ? (
+            <div className="wikiEmpty">窗口内无误判信号</div>
+          ) : (
+            <dl className="wikiArchiveMeta">
+              {reviewerMisjudge.map((row, i) => (
+                <Fragment key={i}>
+                  <dt>{row.kind}</dt>
+                  <dd>{row.count}</dd>
+                </Fragment>
+              ))}
+            </dl>
+          )}
+        </article>
+
+        <article className="wikiObservabilityCard">
+          <header className="wikiObservabilityCardHead">
+            <span className="wikiArchiveTag">[negative-example]</span>
+            <h4>负例候选 needs_review</h4>
+          </header>
+          <dl className="wikiArchiveMeta">
+            <dt>待审核</dt>
+            <dd
+              className={
+                negativeExamplePending > 0 ? "wikiObservabilityDrift" : undefined
+              }
+            >
+              {negativeExamplePending}
+            </dd>
+          </dl>
+        </article>
+      </div>
+    </section>
   );
 }
 

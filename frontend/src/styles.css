@@ -6572,6 +6572,22 @@ td:nth-child(3) {
   padding: 12px 8px;
 }
 
+.knowledgeWiki .wikiObservabilityPhaseRollup {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-top: 8px;
+  padding: 0 8px;
+}
+
+.knowledgeWiki .wikiObservabilityPhaseRollup > .wikiObservabilityCardHead {
+  padding: 0 4px;
+}
+
+.knowledgeWiki .wikiObservabilityPhaseRollup > .wikiObservabilityGrid {
+  padding: 8px 0;
+}
+
 .knowledgeWiki .wikiObservabilityCard {
   border: 1px solid var(--surface-2);
   border-radius: 3px;
