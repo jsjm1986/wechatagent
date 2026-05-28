@@ -7917,12 +7917,20 @@ function ReviewView() {
   }
 
   return (
-    <div className="wikiPanelBody wikiReviewBody">
+    <div className="wikiArchiveShell wikiReviewBody">
+      <header className="wikiArchiveHeader">
+        <div>
+          <div className="wikiArchiveEyebrow">explore / review queue</div>
+          <h2>评审队列</h2>
+        </div>
+        <div className="wikiArchiveHeaderActions">
+          <button type="button" className="ghost wikiBtn" onClick={() => void load()} disabled={loading}>
+            <RefreshCw size={14} />
+            {loading ? "加载中…" : "刷新"}
+          </button>
+        </div>
+      </header>
       <div className="wikiToolbar">
-        <button type="button" className="ghost" onClick={() => void load()} disabled={loading}>
-          <RefreshCw size={14} />
-          {loading ? "加载中…" : "刷新"}
-        </button>
         <span className="wikiHint">
           仅展示活跃 chunks。verify / reject 直接走现有路由，AI 永不自动 verify。
         </span>
@@ -9376,6 +9384,25 @@ function ObservabilityDashboard() {
     reviewerMisjudge?: Array<{ kind: string; count: number }>;
     negativeExamplePending?: number;
   } | null>(null);
+  const [workerHealth, setWorkerHealth] = useState<{
+    chatTasks?: {
+      byStatus?: Array<{ status: string; count: number; outOfClosedSet?: boolean }>;
+      errorKindsTop?: Array<{ errorKind: string; count: number }>;
+    };
+    gapSignals?: {
+      byStatus?: Array<{ status: string; count: number; outOfClosedSet?: boolean }>;
+      pendingKindsTop?: Array<{ kind: string; count: number }>;
+      total?: number;
+      pending?: number;
+      resolved?: number;
+      sweepHitRate?: number;
+    };
+    lessonsLearned?: {
+      windowDays?: number;
+      patternTop?: Array<{ pattern: string; count: number; outOfClosedSet?: boolean }>;
+      blockedTotal?: number;
+    };
+  } | null>(null);
   const [pending, setPending] = useState(false);
   const [sweeping, setSweeping] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -9385,14 +9412,15 @@ function ObservabilityDashboard() {
     setPending(true);
     setError(null);
     try {
-      const [a, b, c, d, e, f, g] = await Promise.all([
+      const [a, b, c, d, e, f, g, h] = await Promise.all([
         fetch("/api/operation-knowledge/catalog/persisted").then((r) => r.json()),
         fetch("/api/operation-knowledge/catalog").then((r) => r.json()),
         fetch("/api/operation-knowledge/completeness").then((r) => r.json()),
         fetch("/api/operation-knowledge/integrity-report").then((r) => r.json()),
         fetch("/api/operation-knowledge/logs/analyze").then((r) => r.json()),
         fetch("/api/knowledge/metrics").then((r) => r.json()),
-        fetch("/api/admin/observability/phase-rollup").then((r) => r.json())
+        fetch("/api/admin/observability/phase-rollup").then((r) => r.json()),
+        fetch("/api/admin/observability/worker-health").then((r) => r.json())
       ]);
       setCatalog(a as CatalogPersistedView);
       setCatalogLive(b as { total?: number });
@@ -9402,6 +9430,7 @@ function ObservabilityDashboard() {
       const metrics = f as { answerCache?: typeof cacheStats };
       setCacheStats(metrics?.answerCache ?? null);
       setPhaseRollup(g as typeof phaseRollup);
+      setWorkerHealth(h as typeof workerHealth);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -9580,6 +9609,8 @@ function ObservabilityDashboard() {
 
       <PhaseRollupPanel data={phaseRollup} />
 
+      <WorkerHealthPanel data={workerHealth} />
+
       <TestMatchPanel />
     </div>
   );
@@ -9690,6 +9721,191 @@ function PhaseRollupPanel({
               {negativeExamplePending}
             </dd>
           </dl>
+        </article>
+      </div>
+    </section>
+  );
+}
+
+// G-后续Ⅱ/2 · ObservabilityDashboard 第二波卡片：worker 健康聚合
+//   - knowledge_chat_tasks 状态分布 + 失败 error_kind top
+//   - knowledge_gap_signals sweep 命中率 + pending kind top
+//   - lessons_learned 14d pattern × review_status 矩阵 + blocked_total
+function WorkerHealthPanel({
+  data
+}: {
+  data: {
+    chatTasks?: {
+      byStatus?: Array<{ status: string; count: number; outOfClosedSet?: boolean }>;
+      errorKindsTop?: Array<{ errorKind: string; count: number }>;
+    };
+    gapSignals?: {
+      byStatus?: Array<{ status: string; count: number; outOfClosedSet?: boolean }>;
+      pendingKindsTop?: Array<{ kind: string; count: number }>;
+      total?: number;
+      pending?: number;
+      resolved?: number;
+      sweepHitRate?: number;
+    };
+    lessonsLearned?: {
+      windowDays?: number;
+      patternTop?: Array<{ pattern: string; count: number; outOfClosedSet?: boolean }>;
+      blockedTotal?: number;
+    };
+  } | null;
+}) {
+  if (!data) {
+    return null;
+  }
+  const chatStatuses = data.chatTasks?.byStatus ?? [];
+  const chatTotal = chatStatuses.reduce((sum, row) => sum + (row.count ?? 0), 0);
+  const chatErrors = data.chatTasks?.errorKindsTop ?? [];
+  const gapStatuses = data.gapSignals?.byStatus ?? [];
+  const gapKinds = data.gapSignals?.pendingKindsTop ?? [];
+  const gapTotal = data.gapSignals?.total ?? 0;
+  const gapPending = data.gapSignals?.pending ?? 0;
+  const gapResolved = data.gapSignals?.resolved ?? 0;
+  const gapHitRate = data.gapSignals?.sweepHitRate ?? 0;
+  const lessonsPatterns = data.lessonsLearned?.patternTop ?? [];
+  const lessonsBlocked = data.lessonsLearned?.blockedTotal ?? 0;
+  const lessonsWindow = data.lessonsLearned?.windowDays ?? 14;
+
+  return (
+    <section className="wikiObservabilityPhaseRollup">
+      <header className="wikiObservabilityCardHead">
+        <span className="wikiArchiveTag">[worker-health]</span>
+        <h4>worker 健康聚合</h4>
+      </header>
+      <div className="wikiObservabilityGrid">
+        <article className="wikiObservabilityCard">
+          <header className="wikiObservabilityCardHead">
+            <span className="wikiArchiveTag">[chat-tasks]</span>
+            <h4>chat task 状态</h4>
+          </header>
+          {chatTotal === 0 ? (
+            <div className="wikiEmpty">无任务</div>
+          ) : (
+            <dl className="wikiArchiveMeta">
+              {chatStatuses.map((row, i) => (
+                <Fragment key={i}>
+                  <dt>
+                    {row.status}
+                    {row.outOfClosedSet ? (
+                      <span className="wikiObservabilityDrift"> · out-of-closed-set</span>
+                    ) : null}
+                  </dt>
+                  <dd
+                    className={
+                      row.status === "failed" && row.count > 0
+                        ? "wikiObservabilityDrift"
+                        : undefined
+                    }
+                  >
+                    {row.count}
+                  </dd>
+                </Fragment>
+              ))}
+            </dl>
+          )}
+          {chatErrors.length > 0 ? (
+            <div className="wikiArchiveCitation">
+              <strong>error_kind top</strong>
+              <ul style={{ margin: 0, paddingLeft: "1.2em" }}>
+                {chatErrors.map((row, i) => (
+                  <li key={i}>
+                    <span className="wikiArchiveTag">[{row.errorKind}]</span> {row.count}
+                  </li>
+                ))}
+              </ul>
+            </div>
+          ) : null}
+        </article>
+
+        <article className="wikiObservabilityCard">
+          <header className="wikiObservabilityCardHead">
+            <span className="wikiArchiveTag">[gap-signals]</span>
+            <h4>gap signals · sweep 命中率</h4>
+          </header>
+          <dl className="wikiArchiveMeta">
+            <dt>总计</dt>
+            <dd>{gapTotal}</dd>
+            <dt>pending</dt>
+            <dd className={gapPending > 0 ? "wikiObservabilityDrift" : undefined}>
+              {gapPending}
+            </dd>
+            <dt>resolved</dt>
+            <dd>{gapResolved}</dd>
+            <dt>命中率</dt>
+            <dd className={gapHitRate >= 0.5 ? "wikiObservabilityDrift" : undefined}>
+              {gapTotal === 0 ? "—" : `${(gapHitRate * 100).toFixed(1)}%`}
+            </dd>
+          </dl>
+          {gapKinds.length > 0 ? (
+            <div className="wikiArchiveCitation">
+              <strong>pending kind top</strong>
+              <ul style={{ margin: 0, paddingLeft: "1.2em" }}>
+                {gapKinds.map((row, i) => (
+                  <li key={i}>
+                    <span className="wikiArchiveTag">[{row.kind}]</span> {row.count}
+                  </li>
+                ))}
+              </ul>
+            </div>
+          ) : null}
+          {gapStatuses.length > 0 ? (
+            <details>
+              <summary>状态明细</summary>
+              <dl className="wikiArchiveMeta">
+                {gapStatuses.map((row, i) => (
+                  <Fragment key={i}>
+                    <dt>
+                      {row.status}
+                      {row.outOfClosedSet ? (
+                        <span className="wikiObservabilityDrift"> · out-of-closed-set</span>
+                      ) : null}
+                    </dt>
+                    <dd>{row.count}</dd>
+                  </Fragment>
+                ))}
+              </dl>
+            </details>
+          ) : null}
+        </article>
+
+        <article className="wikiObservabilityCard">
+          <header className="wikiObservabilityCardHead">
+            <span className="wikiArchiveTag">[lessons-learned]</span>
+            <h4>lessons_learned ({lessonsWindow}d)</h4>
+          </header>
+          {lessonsPatterns.length === 0 ? (
+            <div className="wikiEmpty">窗口内无产出</div>
+          ) : (
+            <dl className="wikiArchiveMeta">
+              {lessonsPatterns.map((row, i) => (
+                <Fragment key={i}>
+                  <dt>
+                    {row.pattern}
+                    {row.outOfClosedSet ? (
+                      <span className="wikiObservabilityDrift"> · out-of-closed-set</span>
+                    ) : null}
+                  </dt>
+                  <dd
+                    className={
+                      row.pattern === "blocked_by_safety_guard" && row.count > 0
+                        ? "wikiObservabilityDrift"
+                        : undefined
+                    }
+                  >
+                    {row.count}
+                  </dd>
+                </Fragment>
+              ))}
+              <dt>blocked_total</dt>
+              <dd className={lessonsBlocked > 0 ? "wikiObservabilityDrift" : undefined}>
+                {lessonsBlocked}
+              </dd>
+            </dl>
+          )}
         </article>
       </div>
     </section>

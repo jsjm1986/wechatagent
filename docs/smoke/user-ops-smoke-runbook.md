@@ -29,7 +29,7 @@ MCP_BASE_URL=http://47.108.57.147:3001
 MCP_API_KEY=<填真>
 OPENAI_BASE_URL=https://api.deepseek.com
 OPENAI_API_KEY=<填真>
-OPENAI_MODEL=deepseek-v4-flash
+OPENAI_MODEL=<填 LlmProviderConfigs 中 active 条目的 model 字段>
 
 # P0 鉴权 / Webhook 签名
 SESSION_TTL_HOURS=8

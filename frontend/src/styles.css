@@ -5831,6 +5831,127 @@ td:nth-child(3) {
   color: var(--muted);
 }
 
+/* ── G-后续Ⅱ/3：档案馆 header 中的 eyebrow / headerActions ──────────── */
+
+.wikiArchiveHeader .wikiArchiveEyebrow {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.18em;
+  color: var(--muted);
+  margin-bottom: 4px;
+}
+
+.wikiArchiveHeader .wikiArchiveHeaderActions {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  position: absolute;
+  right: 0;
+  top: 0;
+}
+
+/* header 自身需 relative 才能让 absolute actions 锚定。 */
+.wikiArchiveHeader {
+  position: relative;
+}
+
+/* ── G-后续Ⅱ/3：档案馆 shell 内的通用元素美学嫁接 ────────────────────
+ *   ReviewView / ImportWizard 残留的 .wikiBtn / .wikiAlert / .wikiHint /
+ *   .wikiInput / .wikiToolbar 在 wikiArchiveShell 上下文内统一切到学术
+ *   字体 + 严格边框 + 方括号 chip 风，避免局部破调。
+ *   这是后代选择器嫁接，不改组件类名，不影响其它 shell（如 wikiPanelBody）。
+ */
+
+.wikiArchiveShell .wikiToolbar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  align-items: center;
+  margin: 10px 0 6px;
+  padding: 6px 0;
+  border-bottom: 1px dashed rgba(60, 50, 30, 0.18);
+  font-family: var(--font-body);
+}
+
+.wikiArchiveShell .wikiHint {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  letter-spacing: 0.04em;
+  color: var(--muted);
+}
+
+.wikiArchiveShell .wikiAlert {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  border: 1px solid rgba(60, 50, 30, 0.4);
+  background: #fffbf2;
+  padding: 8px 12px;
+  margin: 8px 0;
+  border-radius: 0;
+}
+
+.wikiArchiveShell .wikiAlert.error {
+  border-color: #aa3a2a;
+  background: #fdeee8;
+  color: #732012;
+}
+
+.wikiArchiveShell .wikiAlert.info {
+  border-color: rgba(60, 50, 30, 0.45);
+  color: var(--ink);
+}
+
+.wikiArchiveShell .wikiBtn {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  border: 1px solid rgba(60, 50, 30, 0.5);
+  background: #fdfaf3;
+  color: var(--ink);
+  padding: 5px 10px;
+  border-radius: 0;
+  cursor: pointer;
+  transition: background 0.12s ease, color 0.12s ease;
+}
+
+.wikiArchiveShell .wikiBtn:hover:not(:disabled) {
+  background: var(--ink);
+  color: #f9f6ef;
+}
+
+.wikiArchiveShell .wikiBtn.primary {
+  background: var(--ink);
+  color: #f9f6ef;
+}
+
+.wikiArchiveShell .wikiBtn.primary:hover:not(:disabled) {
+  background: #2a1f0e;
+}
+
+.wikiArchiveShell .wikiBtn:disabled,
+.wikiArchiveShell .wikiBtn.primary:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.wikiArchiveShell .wikiInput {
+  font-family: var(--font-body);
+  font-size: 13px;
+  border: 1px solid rgba(60, 50, 30, 0.5);
+  border-radius: 0;
+  padding: 6px 10px;
+  background: #fffefb;
+  color: var(--ink);
+}
+
+.wikiArchiveShell .wikiInput:focus {
+  outline: none;
+  border-color: var(--ink);
+  background: #fffdf8;
+}
+
 .wikiArchiveRule {
   height: 1px;
   border: 0;

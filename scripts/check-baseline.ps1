@@ -7,6 +7,10 @@
 #   - 4 个 PBT 文件累计通过数 >= 33（升级前基线 6+9+6+12），0 失败
 #     (state_transition_pbt / memory_card_invariants / wiki_chunk_revision_pbt / llm_retry_jitter)
 # 任一不达标即 exit 1。
+#
+# G-后续Ⅱ/4：可选 step 3 —— 当 $env:DOCKER_AVAILABLE = "1" 时跑无 LLM/MCP
+# 的知识库集成测试 wiki_gap_signals_3kinds（3 个 #[ignore] 测试，纯 Mongo
+# testcontainers 路径）。失败立刻退出 1。
 
 $ErrorActionPreference = "Continue"
 
@@ -77,6 +81,30 @@ if ($pbtRes.Passed -lt $PBT_BASELINE) {
     exit 1
 }
 
-Write-Host ""
-Write-Host ("baseline OK: lib={0}, pbt={1}" -f $libRes.Passed, $pbtRes.Passed)
+# ── step 3 (可选)：DOCKER_AVAILABLE=1 时跑无 LLM/MCP 的知识库集成测试 ────
+if ($env:DOCKER_AVAILABLE -eq "1") {
+    $GAP_BASELINE = 3
+    Write-Host ""
+    Write-Host "[baseline] step 3/3 (DOCKER_AVAILABLE=1): cargo test --test wiki_gap_signals_3kinds -- --ignored ..."
+    $gapOut = Invoke-Cargo @('--test', 'wiki_gap_signals_3kinds', '--', '--ignored')
+    $gapRes = Parse-CargoTestResults $gapOut
+    Write-Host ("[baseline] gap_signals summary: passed={0} failed={1} (need >= {2} passed, 0 failed)" `
+        -f $gapRes.Passed, $gapRes.Failed, $GAP_BASELINE)
+    if ($gapRes.Failed -gt 0) {
+        Write-Host "[baseline] FAIL: wiki_gap_signals_3kinds has $($gapRes.Failed) failed test(s)"
+        exit 1
+    }
+    if ($gapRes.Passed -lt $GAP_BASELINE) {
+        Write-Host ("[baseline] FAIL: wiki_gap_signals_3kinds only {0} passed (< baseline {1})" `
+            -f $gapRes.Passed, $GAP_BASELINE)
+        exit 1
+    }
+    Write-Host ""
+    Write-Host ("baseline OK: lib={0}, pbt={1}, gap_signals={2}" `
+        -f $libRes.Passed, $pbtRes.Passed, $gapRes.Passed)
+} else {
+    Write-Host ""
+    Write-Host "[baseline] step 3 skipped (DOCKER_AVAILABLE!=1)"
+    Write-Host ("baseline OK: lib={0}, pbt={1}" -f $libRes.Passed, $pbtRes.Passed)
+}
 exit 0

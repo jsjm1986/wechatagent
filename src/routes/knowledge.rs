@@ -7952,4 +7952,145 @@ mod tests {
             }
         }
     }
+
+    // ── G-后续Ⅱ/1：纯逻辑 helper 单测扩展 ─────────────────────────────────
+
+    #[test]
+    fn normalize_knowledge_tags_dedupe_and_trim() {
+        let raw = vec![
+            "  价格异议  ".to_string(),
+            "价格异议".to_string(),
+            "  ".to_string(),
+            "客户分级".to_string(),
+        ];
+        let out = normalize_knowledge_tags(raw, 5, false);
+        assert_eq!(out, vec!["价格异议".to_string(), "客户分级".to_string()]);
+    }
+
+    #[test]
+    fn normalize_knowledge_tags_max_len_caps_output() {
+        let raw = (0..10).map(|i| format!("t{i}")).collect();
+        let out = normalize_knowledge_tags(raw, 3, false);
+        assert_eq!(out.len(), 3);
+        assert_eq!(out[0], "t0");
+        assert_eq!(out[2], "t2");
+    }
+
+    #[test]
+    fn normalize_knowledge_tags_lowercase_dedupe() {
+        let raw = vec!["SaaS".to_string(), "saas".to_string(), "SAAS".to_string()];
+        let out = normalize_knowledge_tags(raw, 5, true);
+        assert_eq!(out, vec!["saas".to_string()]);
+    }
+
+    #[test]
+    fn json_string_list_array_filters_empty_and_trims() {
+        let v = json!({ "tags": ["  a", "", "b  ", "   ", "c"] });
+        let out = json_string_list(&v, "tags").unwrap();
+        assert_eq!(out, vec!["a".to_string(), "b".to_string(), "c".to_string()]);
+    }
+
+    #[test]
+    fn json_string_list_string_falls_through_to_split_lines() {
+        let v = json!({ "tags": "- foo\n* bar\n\n• baz" });
+        let out = json_string_list(&v, "tags").unwrap();
+        assert_eq!(out, vec!["foo".to_string(), "bar".to_string(), "baz".to_string()]);
+    }
+
+    #[test]
+    fn json_string_list_missing_key_returns_none() {
+        let v = json!({});
+        assert!(json_string_list(&v, "anything").is_none());
+    }
+
+    #[test]
+    fn split_lines_strips_bullet_prefixes_and_blanks() {
+        let s = "- alpha\n  * beta \n\n• gamma\n   \n  delta";
+        assert_eq!(
+            split_lines(s),
+            vec![
+                "alpha".to_string(),
+                "beta".to_string(),
+                "gamma".to_string(),
+                "delta".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn stable_text_hash_is_deterministic_and_collision_free_for_obvious_inputs() {
+        let h1 = stable_text_hash("foo");
+        let h2 = stable_text_hash("foo");
+        let h3 = stable_text_hash("bar");
+        assert_eq!(h1, h2, "同输入必须等长 16 hex 同值");
+        assert_eq!(h1.len(), 16);
+        assert_ne!(h1, h3, "不同输入应得不同 hash（FNV-1a 64bit）");
+    }
+
+    #[test]
+    fn build_line_index_offsets_align_with_content_bytes() {
+        let content = "hello\nworld";
+        let idx = build_line_index(content);
+        assert_eq!(idx.len(), 2);
+        let line1 = &idx[0];
+        let line2 = &idx[1];
+        assert_eq!(line1.get_i32("line").unwrap(), 1);
+        assert_eq!(line1.get_i32("startOffset").unwrap(), 0);
+        assert_eq!(line1.get_i32("endOffset").unwrap(), 5);
+        assert_eq!(line2.get_i32("line").unwrap(), 2);
+        // line2 startOffset = "hello\n".len() = 6
+        assert_eq!(line2.get_i32("startOffset").unwrap(), 6);
+        assert_eq!(line2.get_i32("endOffset").unwrap(), 11);
+    }
+
+    #[test]
+    fn source_anchor_for_quote_finds_exact_match() {
+        let raw = "第一行\n这是引文段落\n第三行";
+        let anchor = source_anchor_for_quote(raw, None, "这是引文段落").unwrap();
+        assert_eq!(anchor.get_i32("startLine").unwrap(), 2);
+        assert_eq!(anchor.get_i32("endLine").unwrap(), 2);
+        assert_eq!(anchor.get_str("sourceQuote").unwrap(), "这是引文段落");
+        assert!(!anchor.contains_key("documentId"), "未传 document_id 不应写入");
+    }
+
+    #[test]
+    fn source_anchor_for_quote_includes_document_id_when_provided() {
+        let raw = "abc\nhit\nxyz";
+        let oid = ObjectId::new();
+        let anchor = source_anchor_for_quote(raw, Some(oid), "hit").unwrap();
+        assert_eq!(anchor.get_str("documentId").unwrap(), oid.to_hex());
+    }
+
+    #[test]
+    fn source_anchor_for_quote_returns_none_for_blank_quote() {
+        assert!(source_anchor_for_quote("any", None, "   ").is_none());
+        assert!(source_anchor_for_quote("any", None, "").is_none());
+    }
+
+    #[test]
+    fn chunk_verify_gate_reason_passes_when_both_present() {
+        assert!(chunk_verify_gate_reason(true, true).is_none());
+    }
+
+    #[test]
+    fn chunk_verify_gate_reason_lists_missing_quote_and_anchor() {
+        let r = chunk_verify_gate_reason(false, false).unwrap();
+        assert!(r.contains("sourceQuote"), "应明示缺 sourceQuote: {r}");
+        assert!(r.contains("source_anchors"), "应明示缺 source_anchors: {r}");
+        assert!(r.contains("与"), "多个缺失应用「与」连接: {r}");
+    }
+
+    #[test]
+    fn chunk_verify_gate_reason_only_missing_quote() {
+        let r = chunk_verify_gate_reason(false, true).unwrap();
+        assert!(r.contains("sourceQuote"));
+        assert!(!r.contains("source_anchors"));
+    }
+
+    #[test]
+    fn chunk_verify_gate_reason_only_missing_anchor() {
+        let r = chunk_verify_gate_reason(true, false).unwrap();
+        assert!(r.contains("source_anchors"));
+        assert!(!r.contains("sourceQuote"));
+    }
 }

@@ -7,6 +7,18 @@
 #   - 4 个 PBT 文件累计通过数 >= 33（升级前基线 6+9+6+12），0 失败
 #     (state_transition_pbt / memory_card_invariants / wiki_chunk_revision_pbt / llm_retry_jitter)
 # 任一不达标即 exit 1。
+#
+# G-后续Ⅱ/4：可选 step 3 —— Docker available 时跑无 LLM/MCP 的知识库集成
+# 测试 `wiki_gap_signals_3kinds`（3 个 #[ignore] 测试，纯 testcontainers
+# Mongo 路径），把"运维向"知识库回归引入 CI 而不阻塞本地开发：
+#   - 环境无 docker / DOCKER_AVAILABLE!=1：step 3 跳过，不计入门槛
+#   - 环境有 docker：3 个测试必须 pass，0 fail（任意 fail → exit 1）。
+# 设计原因：
+#   - 这 3 个测试不消耗 LLM/MCP，CI 跑无外部成本；
+#   - 选这一个文件而非全量 #[ignore] 因为其它 ignore 测试要么调 LLM/MCP，
+#     要么对运行时间/网络有依赖。后续可逐步扩；
+#   - 把 testcontainers 触发硬编码在 baseline 脚本里也避免出现"CI 在跑但
+#     人不知道"的暗黑路径——失败时报错信息明确指向本测试。
 
 set -euo pipefail
 
@@ -71,6 +83,34 @@ if [ "$PBT_PASSED" -lt "$PBT_BASELINE" ]; then
     exit 1
 fi
 
-echo ""
-echo "baseline OK: lib=$LIB_PASSED, pbt=$PBT_PASSED"
+# ── step 3 (可选)：Docker available 时跑无 LLM/MCP 的知识库集成测试 ────
+# 触发条件：DOCKER_AVAILABLE=1 显式开关；缺省 OFF。
+# 这个 step 永远不会"沉默通过"——若开了 docker 但测试 fail，立刻退出 1。
+if [ "${DOCKER_AVAILABLE:-0}" = "1" ]; then
+    GAP_LOG=$(mktemp)
+    GAP_BASELINE=3
+    trap 'rm -f "$LIB_LOG" "$PBT_LOG" "$GAP_LOG"' EXIT
+
+    echo ""
+    echo "[baseline] step 3/3 (DOCKER_AVAILABLE=1): cargo test --test wiki_gap_signals_3kinds -- --ignored ..."
+    cargo test --test wiki_gap_signals_3kinds -- --ignored 2>&1 | tee "$GAP_LOG" || true
+    GAP_PASSED=$(parse_passed "$GAP_LOG")
+    GAP_FAILED=$(parse_failed "$GAP_LOG")
+    echo "[baseline] gap_signals summary: passed=$GAP_PASSED failed=$GAP_FAILED (need >= $GAP_BASELINE passed, 0 failed)"
+
+    if [ "$GAP_FAILED" -gt 0 ]; then
+        echo "[baseline] FAIL: wiki_gap_signals_3kinds has $GAP_FAILED failed test(s)"
+        exit 1
+    fi
+    if [ "$GAP_PASSED" -lt "$GAP_BASELINE" ]; then
+        echo "[baseline] FAIL: wiki_gap_signals_3kinds only $GAP_PASSED passed (< baseline $GAP_BASELINE)"
+        exit 1
+    fi
+    echo ""
+    echo "baseline OK: lib=$LIB_PASSED, pbt=$PBT_PASSED, gap_signals=$GAP_PASSED"
+else
+    echo ""
+    echo "[baseline] step 3 skipped (DOCKER_AVAILABLE!=1)"
+    echo "baseline OK: lib=$LIB_PASSED, pbt=$PBT_PASSED"
+fi
 exit 0
