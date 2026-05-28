@@ -5804,7 +5804,7 @@ function ExploreMode() {
 }
 
 function StewardMode() {
-  const [pane, setPane] = useState<"lint" | "review" | "revisions" | "documents" | "import" | "observability">("lint");
+  const [pane, setPane] = useState<"lint" | "review" | "revisions" | "documents" | "import" | "observability" | "tryRecall">("lint");
   const [focusedId, setFocusedId] = useState<string | null>(null);
   const [collapsed, setCollapsed] = useState(true);
 
@@ -5870,6 +5870,13 @@ function StewardMode() {
         >
           <Activity size={14} /> 诊断仪表
         </button>
+        <button
+          type="button"
+          className={pane === "tryRecall" ? "wikiStewardNavBtn active" : "wikiStewardNavBtn"}
+          onClick={() => setPane("tryRecall")}
+        >
+          <Search size={14} /> 试召诊断
+        </button>
       </div>
       <div className="wikiModePane wikiModePane--main">
         {pane === "lint" && <LintView />}
@@ -5878,6 +5885,7 @@ function StewardMode() {
         {pane === "documents" && <DocumentsView />}
         {pane === "import" && <ImportWizard />}
         {pane === "observability" && <ObservabilityDashboard />}
+        {pane === "tryRecall" && <TryRecallView />}
       </div>
       {!collapsed ? (
         <ChunkInspectorPane
@@ -6239,12 +6247,28 @@ interface DocumentItem {
   businessTopics?: string[] | null;
 }
 
+interface DocumentChunkRow {
+  id: string;
+  title?: string | null;
+  wikiType?: string | null;
+  status?: string | null;
+  integrityStatus?: string | null;
+  summary?: string | null;
+  updatedAt?: string | null;
+}
+
 function DocumentsView() {
   const [items, setItems] = useState<DocumentItem[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [creating, setCreating] = useState(false);
   const [draft, setDraft] = useState({ title: "", summary: "", sourceName: "", sourceType: "imported_markdown" });
+  // 行内展开：documentId → 子表状态。后端 GET /documents/:id/chunks
+  // 已存在但前端未挂；这里按需 lazy-load，节省默认列表渲染开销。
+  const [expandedDoc, setExpandedDoc] = useState<string | null>(null);
+  const [docChunks, setDocChunks] = useState<Record<string, DocumentChunkRow[]>>({});
+  const [docChunksLoading, setDocChunksLoading] = useState<string | null>(null);
+  const [docChunksError, setDocChunksError] = useState<string | null>(null);
 
   async function load() {
     setLoading(true);
@@ -6301,6 +6325,27 @@ function DocumentsView() {
     }
   }
 
+  async function toggleDocChunks(docId: string) {
+    if (expandedDoc === docId) {
+      setExpandedDoc(null);
+      return;
+    }
+    setExpandedDoc(docId);
+    if (docChunks[docId]) return; // 已缓存
+    setDocChunksLoading(docId);
+    setDocChunksError(null);
+    try {
+      const r = await fetch(`/api/operation-knowledge/documents/${encodeURIComponent(docId)}/chunks`);
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      const data = (await r.json()) as { items?: DocumentChunkRow[] };
+      setDocChunks({ ...docChunks, [docId]: data.items ?? [] });
+    } catch (e) {
+      setDocChunksError(String(e));
+    } finally {
+      setDocChunksLoading(null);
+    }
+  }
+
   return (
     <div className="wikiArchiveShell" style={{ padding: 18 }}>
       <header className="wikiArchiveHeader">
@@ -6352,7 +6397,8 @@ function DocumentsView() {
           </thead>
           <tbody>
             {items.map((d) => (
-              <tr key={d.id} style={{ borderBottom: "1px solid var(--line)" }}>
+              <Fragment key={d.id}>
+              <tr style={{ borderBottom: "1px solid var(--line)" }}>
                 <td style={{ padding: "10px 6px" }}>
                   <div style={{ fontFamily: "var(--font-display)", fontWeight: 600 }}>{d.title}</div>
                   {d.summary ? <div style={{ color: "var(--muted)", fontSize: 12, marginTop: 2 }}>{d.summary}</div> : null}
@@ -6370,10 +6416,56 @@ function DocumentsView() {
                 <td style={{ padding: "10px 6px", fontFamily: "var(--font-mono)", fontSize: 11, color: "var(--muted)" }}>
                   {d.updatedAt ? new Date(d.updatedAt).toLocaleString() : "—"}
                 </td>
-                <td style={{ padding: "10px 6px", textAlign: "right" }}>
+                <td style={{ padding: "10px 6px", textAlign: "right", whiteSpace: "nowrap" }}>
+                  <button
+                    type="button"
+                    className="wikiArchiveRollback"
+                    style={{ marginRight: 6 }}
+                    onClick={() => void toggleDocChunks(d.id)}
+                  >
+                    {expandedDoc === d.id ? "收起 chunks" : "查看 chunks"}
+                  </button>
                   <button type="button" className="wikiArchiveRollback" onClick={() => handleDelete(d.id)}>删除</button>
                 </td>
               </tr>
+              {expandedDoc === d.id ? (
+                <tr>
+                  <td colSpan={5} style={{ background: "var(--surface-2, #f4efe5)", padding: "10px 14px" }}>
+                    {docChunksLoading === d.id ? (
+                      <div className="wikiHint">正在拉 chunks…</div>
+                    ) : docChunksError ? (
+                      <div className="wikiAlert error">{docChunksError}</div>
+                    ) : (docChunks[d.id]?.length ?? 0) === 0 ? (
+                      <div className="wikiHint">该文档下还没有 chunks。可走导入向导或手工新建。</div>
+                    ) : (
+                      <div style={{ display: "grid", gap: 4 }}>
+                        <div style={{ fontFamily: "var(--font-mono)", fontSize: 11, color: "var(--muted)", marginBottom: 4 }}>
+                          {docChunks[d.id].length} chunks · 点击编号跳到 ChunkInspectorPane
+                        </div>
+                        {docChunks[d.id].map((c) => (
+                          <button
+                            key={c.id}
+                            type="button"
+                            className="wikiSignalChunkBtn"
+                            onClick={() => focusChunk(c.id)}
+                            style={{ textAlign: "left", display: "grid", gridTemplateColumns: "120px 100px 1fr auto", gap: 8, alignItems: "center" }}
+                          >
+                            <span className="wikiArchiveTag">{c.wikiType ?? "—"}</span>
+                            <span style={{ fontFamily: "var(--font-mono)", fontSize: 11 }}>
+                              {c.status ?? "—"} / {c.integrityStatus ?? "—"}
+                            </span>
+                            <span style={{ fontFamily: "var(--font-display)", fontWeight: 600 }}>
+                              {c.title ?? "（无标题）"}
+                            </span>
+                            <code style={{ fontSize: 10, color: "var(--muted)" }}>{c.id.slice(-6)}</code>
+                          </button>
+                        ))}
+                      </div>
+                    )}
+                  </td>
+                </tr>
+              ) : null}
+              </Fragment>
             ))}
           </tbody>
         </table>
@@ -6409,6 +6501,42 @@ function ImportWizard() {
   const [selected, setSelected] = useState<Set<number>>(new Set());
   const [edits, setEdits] = useState<Record<number, Partial<ImportPreviewChunk>>>({});
   const [created, setCreated] = useState<string[]>([]);
+  // G-后续/4：AI 重抽 tags 按钮单条 loading 标记。
+  const [retagging, setRetagging] = useState<number | null>(null);
+
+  async function retagCandidate(i: number) {
+    const merged = { ...(preview?.chunks ?? [])[i], ...(edits[i] ?? {}) };
+    if (!merged.body || !merged.body.trim()) {
+      setError("候选无正文，无法重抽 tags");
+      return;
+    }
+    setRetagging(i);
+    setError(null);
+    try {
+      const r = await fetch("/api/operation-knowledge/extract-tags", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          title: merged.title ?? null,
+          body: merged.body,
+        }),
+      });
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      const data = (await r.json()) as { productTags?: string[]; businessTopics?: string[] };
+      setEdits({
+        ...edits,
+        [i]: {
+          ...(edits[i] ?? {}),
+          productTags: data.productTags ?? [],
+          businessTopics: data.businessTopics ?? [],
+        },
+      });
+    } catch (e) {
+      setError(`重抽 tags 失败：${e}`);
+    } finally {
+      setRetagging(null);
+    }
+  }
 
   async function runPreview() {
     if (!content.trim()) return;
@@ -6559,7 +6687,18 @@ function ImportWizard() {
                   </div>
                   {merged.summary ? <p style={{ color: "var(--muted)", fontSize: 12.5, margin: "6px 0 4px" }}>{merged.summary}</p> : null}
                   <div className="wikiImportChips">
-                    {(merged.businessTopics ?? []).map((t, j) => <span key={j} className="wikiArchiveTag">{t}</span>)}
+                    {(merged.businessTopics ?? []).map((t, j) => <span key={`bt-${j}`} className="wikiArchiveTag">{t}</span>)}
+                    {(merged.productTags ?? []).map((t, j) => <span key={`pt-${j}`} className="wikiArchiveTag" style={{ borderStyle: "dashed" }}>{t}</span>)}
+                    <button
+                      type="button"
+                      className="wikiArchiveRollback"
+                      style={{ marginLeft: "auto", fontSize: 11, padding: "2px 8px" }}
+                      onClick={() => void retagCandidate(i)}
+                      disabled={retagging === i || !merged.body}
+                      title="调 /extract-tags 重抽 productTags / businessTopics"
+                    >
+                      {retagging === i ? "AI 抽取中…" : "AI 重抽 tags"}
+                    </button>
                   </div>
                 </div>
               );
@@ -6592,6 +6731,216 @@ function ImportWizard() {
             <button type="button" className="wikiBtn" onClick={reset}>导入更多</button>
           </div>
         </div>
+      ) : null}
+    </div>
+  );
+}
+
+// ── G-后续/3 · TryRecallView · "按 catalog 试召" 诊断 ─────────────────────
+// 调 POST /tools/search（输入 query → 命中 chunk_ids），再 POST /tools/open-slice
+// 拉具体 chunk 详情。开发者诊断 grounding：看哪些 chunk 被检索器选上、为什么。
+interface TryRecallTraceStep {
+  step?: string | number | null;
+  tool?: string | null;
+  input?: unknown;
+  output?: unknown;
+  notes?: string | null;
+}
+interface TryRecallRouteResult {
+  neededCategories?: string[] | null;
+  selectedKnowledgeIds?: string[] | null;
+  selectedDocumentIds?: string[] | null;
+  selectedChunkIds?: string[] | null;
+  selectedSliceReasons?: string[] | null;
+  riskLevel?: string | null;
+  requiresEvidence?: boolean | null;
+  knowledgeCoverage?: string | null;
+  missingKnowledge?: string[] | null;
+  reason?: string | null;
+  toolTrace?: TryRecallTraceStep[] | null;
+  evidenceExcerpts?: string[] | null;
+}
+interface TryRecallSliceItem {
+  id: string;
+  title?: string | null;
+  wikiType?: string | null;
+  status?: string | null;
+  integrityStatus?: string | null;
+  summary?: string | null;
+  body?: string | null;
+}
+
+function TryRecallView() {
+  const [accountId, setAccountId] = useState("default");
+  const [contactId, setContactId] = useState("");
+  const [query, setQuery] = useState("");
+  const [pending, setPending] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [route, setRoute] = useState<TryRecallRouteResult | null>(null);
+  const [slices, setSlices] = useState<TryRecallSliceItem[]>([]);
+  const [openingSlices, setOpeningSlices] = useState(false);
+
+  async function runSearch() {
+    if (!query.trim()) return;
+    setPending(true);
+    setError(null);
+    setRoute(null);
+    setSlices([]);
+    try {
+      const r = await fetch("/api/operation-knowledge/tools/search", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          accountId: accountId.trim() || "default",
+          contactId: contactId.trim() || null,
+          query: query.trim(),
+        }),
+      });
+      if (!r.ok) throw new Error(`HTTP ${r.status}: ${await r.text()}`);
+      const data = (await r.json()) as { item?: TryRecallRouteResult };
+      const item = data.item ?? null;
+      setRoute(item);
+      const ids = item?.selectedChunkIds ?? [];
+      if (ids.length > 0) {
+        setOpeningSlices(true);
+        try {
+          const r2 = await fetch("/api/operation-knowledge/tools/open-slice", {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ ids }),
+          });
+          if (!r2.ok) throw new Error(`open-slice HTTP ${r2.status}`);
+          const d2 = (await r2.json()) as { items?: TryRecallSliceItem[] };
+          setSlices(d2.items ?? []);
+        } catch (e2) {
+          setError(`检索结果已返回，但 open-slice 失败：${e2}`);
+        } finally {
+          setOpeningSlices(false);
+        }
+      }
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setPending(false);
+    }
+  }
+
+  return (
+    <div className="wikiArchiveShell" style={{ padding: 18 }}>
+      <header className="wikiArchiveHeader">
+        <span className="wikiArchiveSubtitle">Try Recall · 试召诊断</span>
+        <h3 style={{ fontSize: 20 }}>按 catalog 试召</h3>
+      </header>
+      <p style={{ color: "var(--muted)", fontSize: 12.5, margin: "0 0 12px" }}>
+        给定 accountId（可选 contactId）和一句话 query，调用知识路由器看哪些 chunk 被选上，
+        以及 tool_trace 里的 catalog → list_chunks → open_slice 决策链。开发者调试 grounding 用。
+      </p>
+      <form
+        onSubmit={(e) => { e.preventDefault(); void runSearch(); }}
+        style={{ display: "grid", gridTemplateColumns: "200px 200px 1fr auto", gap: 8, marginBottom: 12 }}
+      >
+        <input
+          type="text"
+          placeholder="accountId（默认 default）"
+          value={accountId}
+          onChange={(e) => setAccountId(e.target.value)}
+          className="wikiInput"
+        />
+        <input
+          type="text"
+          placeholder="contactId（可选）"
+          value={contactId}
+          onChange={(e) => setContactId(e.target.value)}
+          className="wikiInput"
+        />
+        <input
+          type="text"
+          placeholder="query：例如「这个产品对接 SaaS 还是私有化」"
+          value={query}
+          onChange={(e) => setQuery(e.target.value)}
+          className="wikiInput"
+        />
+        <button type="submit" className="wikiBtn primary" disabled={pending || !query.trim()}>
+          {pending ? "试召中…" : "试召"}
+        </button>
+      </form>
+      {error ? <div className="wikiAlert error">{error}</div> : null}
+      {route ? (
+        <>
+          <dl className="wikiArchiveMeta">
+            <dt>风险等级</dt><dd>{route.riskLevel || "—"}</dd>
+            <dt>需证据</dt><dd>{route.requiresEvidence ? "是" : "否"}</dd>
+            <dt>覆盖度</dt><dd>{route.knowledgeCoverage || "—"}</dd>
+            {route.reason ? (<><dt>路由原因</dt><dd>{route.reason}</dd></>) : null}
+            {(route.neededCategories ?? []).length > 0 ? (
+              <>
+                <dt>需要类别</dt>
+                <dd>{(route.neededCategories ?? []).map((c, i) => <span key={i} className="wikiArchiveTag">{c}</span>)}</dd>
+              </>
+            ) : null}
+            {(route.missingKnowledge ?? []).length > 0 ? (
+              <>
+                <dt>缺失知识</dt>
+                <dd>{(route.missingKnowledge ?? []).map((c, i) => <span key={i} className="wikiArchiveTag">{c}</span>)}</dd>
+              </>
+            ) : null}
+          </dl>
+          <hr className="wikiArchiveRule" />
+          <div style={{ marginBottom: 6, fontFamily: "var(--font-mono)", fontSize: 12, color: "var(--muted)" }}>
+            命中 chunks · {(route.selectedChunkIds ?? []).length} 条
+            {openingSlices ? "（正在拉详情…）" : ""}
+          </div>
+          <div style={{ display: "grid", gap: 8, marginBottom: 12 }}>
+            {slices.length > 0
+              ? slices.map((s) => (
+                <button
+                  key={s.id}
+                  type="button"
+                  className="wikiSignalChunkBtn"
+                  onClick={() => focusChunk(s.id)}
+                  style={{ textAlign: "left", display: "grid", gap: 4 }}
+                >
+                  <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                    <span className="wikiArchiveTag">{s.wikiType ?? "—"}</span>
+                    <span style={{ fontFamily: "var(--font-mono)", fontSize: 11, color: "var(--muted)" }}>
+                      {s.status ?? "—"} / {s.integrityStatus ?? "—"}
+                    </span>
+                    <span style={{ fontFamily: "var(--font-display)", fontWeight: 600, marginLeft: 4 }}>
+                      {s.title ?? "（无标题）"}
+                    </span>
+                  </div>
+                  {s.summary ? <div style={{ color: "var(--muted)", fontSize: 12 }}>{s.summary}</div> : null}
+                </button>
+              ))
+              : (route.selectedChunkIds ?? []).length === 0
+                ? <div className="wikiHint">本次试召未选中任何 chunk。</div>
+                : null}
+          </div>
+          {(route.selectedSliceReasons ?? []).length > 0 ? (
+            <details>
+              <summary className="wikiInspectorSectionTitle">slice 选择原因（{(route.selectedSliceReasons ?? []).length}）</summary>
+              <ul style={{ margin: "6px 0 0 18px", fontSize: 12.5 }}>
+                {(route.selectedSliceReasons ?? []).map((r, i) => <li key={i}>{r}</li>)}
+              </ul>
+            </details>
+          ) : null}
+          {(route.toolTrace ?? []).length > 0 ? (
+            <details style={{ marginTop: 8 }}>
+              <summary className="wikiInspectorSectionTitle">tool_trace（{(route.toolTrace ?? []).length}）</summary>
+              <pre style={{ fontFamily: "var(--font-mono)", fontSize: 11, background: "var(--surface-2, #f4efe5)", padding: 10, border: "1px solid var(--line)", maxHeight: 320, overflow: "auto" }}>
+                {JSON.stringify(route.toolTrace, null, 2)}
+              </pre>
+            </details>
+          ) : null}
+          {(route.evidenceExcerpts ?? []).length > 0 ? (
+            <details style={{ marginTop: 8 }}>
+              <summary className="wikiInspectorSectionTitle">evidence_excerpts（{(route.evidenceExcerpts ?? []).length}）</summary>
+              <ul style={{ margin: "6px 0 0 18px", fontSize: 12.5 }}>
+                {(route.evidenceExcerpts ?? []).map((e, i) => <li key={i}><code>{e}</code></li>)}
+              </ul>
+            </details>
+          ) : null}
+        </>
       ) : null}
     </div>
   );
@@ -7961,11 +8310,111 @@ function ChunkInspectorPane({
             ) : null}
             <ChunkActionsBar chunk={chunk} onChanged={reload} />
             <ChunkReferrersList chunkId={chunk.id} />
+            <ChunkSourceSection chunkId={chunk.id} />
             <ChunkRevisionsTimeline chunkId={chunk.id} onRolledBack={reload} />
           </>
         )}
       </div>
     </aside>
+  );
+}
+
+// ChunkSourceSection：调 GET /api/operation-knowledge/chunks/:id/source，
+// 折叠加载父文档 raw_content + chunk source_anchors 范围。后端已存在
+// 但前端未挂；这里 lazy-load，默认折叠避免大文档把 Inspector 撑爆。
+function ChunkSourceSection({ chunkId }: { chunkId: string }) {
+  const [open, setOpen] = useState(false);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [data, setData] = useState<{
+    document?: { id?: string; title?: string; rawContent?: string | null } | null;
+    chunk?: { sourceAnchors?: Record<string, unknown>[] } | null;
+  } | null>(null);
+
+  async function expand() {
+    if (open) {
+      setOpen(false);
+      return;
+    }
+    setOpen(true);
+    if (data) return;
+    setLoading(true);
+    setError(null);
+    try {
+      const r = await fetch(`/api/operation-knowledge/chunks/${encodeURIComponent(chunkId)}/source`);
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      const body = (await r.json()) as typeof data;
+      setData(body);
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  const raw = data?.document?.rawContent ?? "";
+  // 截 8KB 防止 5MB 整本手册一次塞 DOM。
+  const truncated = raw.length > 8000;
+  const display = truncated ? raw.slice(0, 8000) + "\n…（已截断 " + (raw.length - 8000) + " 字符）" : raw;
+  const anchors = (data?.chunk?.sourceAnchors ?? []) as Record<string, unknown>[];
+  const ranges = anchors
+    .map((a) => {
+      const sl = numberOr(a["startLine"]);
+      const el = numberOr(a["endLine"]);
+      return sl != null && el != null ? `L${sl}-L${el}` : null;
+    })
+    .filter((s): s is string => !!s);
+
+  return (
+    <section className="wikiInspectorSection">
+      <button
+        type="button"
+        className="wikiInspectorSectionTitle"
+        style={{ display: "flex", alignItems: "center", gap: 6, background: "none", border: 0, padding: 0, cursor: "pointer", width: "100%" }}
+        onClick={() => void expand()}
+        aria-expanded={open}
+      >
+        <span>{open ? "▾" : "▸"}</span>
+        <span>原文</span>
+        <span style={{ marginLeft: "auto", fontFamily: "var(--font-mono)", fontSize: 10, color: "var(--muted)" }}>
+          {data ? (data.document ? `${ranges.join(" / ") || "—"}` : "无父文档") : ""}
+        </span>
+      </button>
+      {open ? (
+        loading ? (
+          <div className="wikiHint">正在拉父文档…</div>
+        ) : error ? (
+          <div className="wikiAlert error">{error}</div>
+        ) : !data?.document ? (
+          <div className="wikiHint">该 chunk 无父文档，无法回看 raw_content。</div>
+        ) : (
+          <>
+            <div style={{ fontFamily: "var(--font-mono)", fontSize: 11, color: "var(--muted)", margin: "4px 0 8px" }}>
+              {data.document.title ?? "（无标题文档）"} · {raw.length} chars
+            </div>
+            <pre
+              style={{
+                maxHeight: 400,
+                overflow: "auto",
+                fontFamily: "var(--font-mono)",
+                fontSize: 12,
+                lineHeight: 1.55,
+                background: "var(--surface-2, #f4efe5)",
+                padding: 10,
+                border: "1px solid var(--line)",
+                whiteSpace: "pre-wrap",
+                wordBreak: "break-word",
+              }}
+            >
+              {display}
+            </pre>
+            {truncated ? (
+              <div className="wikiHint">原文超过 8KB，已截断展示。完整内容仍存在后端。</div>
+            ) : null}
+          </>
+        )
+      ) : null}
+    </section>
   );
 }
 
