@@ -348,7 +348,7 @@ pub fn api_router(state: AppState) -> Router<AppState> {
             "/operation-knowledge/chunks/:id/relate/:target_id",
             axum::routing::delete(unrelate_operation_knowledge_chunk),
         )
-        // ── G3 · 反向查询 + 批量动作（人工触发，非 AI 自动） ─────────────
+        // ── G3 · 反向查询 + 批量动作（admin 手工触发，非 AI 自动） ─────────────
         .route(
             "/operation-knowledge/chunks/referrers",
             get(list_chunk_referrers),

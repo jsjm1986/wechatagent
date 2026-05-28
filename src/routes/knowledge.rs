@@ -6639,7 +6639,7 @@ pub(super) async fn unrelate_operation_knowledge_chunk(
     Ok(Json(value))
 }
 
-// ── G3 · 反向查询 + 批量动作（人工触发，非 AI 自动）──────────────────────
+// ── G3 · 反向查询 + 批量动作（admin 手工触发，非 AI 自动）──────────────────────
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -6711,7 +6711,7 @@ pub struct ChunkBatchVerifyRequest {
 /// `POST /operation-knowledge/chunks/batch-verify`
 /// 批量调用 verify_operation_knowledge_chunk 主体逻辑；每条独立 chunk_revisions(op=verify)。
 /// 单条失败不阻断其它（部分成功）；返回 `{ verified: [...], skipped: [{id, reason}] }`。
-/// AI 永不自动 verify 红线保留：批量入口仍需人工触发，与单条同 auth 路径。
+/// AI 永不自动 verify 红线保留：批量入口仍需 admin 手工触发，与单条同 auth 路径。
 pub async fn batch_verify_chunks(
     State(state): State<AppState>,
     Json(payload): Json<ChunkBatchVerifyRequest>,

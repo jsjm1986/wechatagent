@@ -229,7 +229,7 @@ pub async fn run_one_tick(state: &AppState) -> Result<(), EvolutionError> {
     // 9. Phase C / C5：threshold proposal 自动 release 闭环。
     //    `evolution_auto_release_enabled=false` 时立即 return 0；
     //    `released_count > 0` 表示本 tick 触发了 hold_rate close-loop 自动放量。
-    //    rollback 永远人工——Requirements 9.7 不允许自动回滚。
+    //    rollback 永远由 admin 手工——Requirements 9.7 不允许自动回滚。
     let auto_released = auto_release::auto_release_eligible_thresholds(state)
         .await
         .unwrap_or_else(|e| {
