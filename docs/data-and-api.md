@@ -619,3 +619,78 @@ CATALOG_REBUILD_WORKER_INTERVAL_SECONDS=3     # catalog rebuild worker tick；0 
 ### record_chunk_hit fire-and-forget hook
 
 `agent::knowledge_router::write_knowledge_usage_log` 写 log 后 fire-and-forget 调用 `crate::knowledge_wiki::gap_signals::record_chunk_hit`：命中 `$inc usage_stats.hit_count_30d`，被 block `$inc usage_stats.blocked_count_30d` + `$set last_blocked_reason`。**不阻塞召回路径**；隔离红线：knowledge_wiki 子系统不引用 `crate::agent::gateway / outbox`、`crate::mcp::*`。
+
+### Phase G 交付（前端 4-mode IA + 档案馆美学 + 后端补齐）
+
+Phase G 是一次「前端整库重设计 + 后端能力补齐」的整体落地，不动召回算法、不动核心业务路径，只在「读路径 / 编辑动作 / 治理面 / 观测面」上补齐残缺。共 5 波 commit：
+
+#### G1 · 档案馆 / 学术编目美学基底
+
+`frontend/src/styles.css` 新增 `.wikiArchive*` 命名空间（米色底 + serif display + mono metadata + 学术 citation + 版本 timeline + 方括号学术 chip）。复用现有三 token，0 新字体依赖：
+
+- `--font-display` (Source Han Serif SC / Noto Serif CJK SC) → 章节标题
+- `--font-body` → 卡片正文
+- `--font-mono` (JetBrains Mono) → 时间戳 / 标签 / chunk_id
+
+4-mode 头部统一切到 `.wikiArchiveHeader`，metadata 块统一切到 `.wikiArchiveMeta`（96px+1fr 严格两列），source_quote 统一走 `.wikiArchiveCitation`，revisions 列表统一走 `.wikiArchiveTimeline`。
+
+#### G2 · Documents CRUD + Import 向导（后端 +1 路由）
+
+```
+GET    /api/operation-knowledge/chunks/:id     单 chunk 详情（Inspector / referrers / Import diff 共用）
+```
+
+前端 Steward mode 下的 `<DocumentsView/>` 行内编辑 / 删除 / 跳转 chunks；`<ImportWizard/>` 三步条（粘贴 → 预览 → 应用），调既有 `/import-preview` + `/import-apply`。
+
+#### G3 · Chunk 9 动作 + 反向查询 + 修订 timeline + batch（后端 +3 路由）
+
+```
+GET  /api/operation-knowledge/chunks/referrers?targetId=     反向引用查询（mongo aggregate $filter）
+POST /api/operation-knowledge/chunks/batch-verify            批量 verify（admin 手工触发，永非 AI 自动）
+POST /api/operation-knowledge/chunks/batch-archive           批量 archive
+```
+
+反向查询走 query path 而非物化双向 link（避免双向写一致性问题，chunk 量级 <5k 时性能足够）。批量动作每条独立写 `chunk_revisions(op=verify_batch / archive_batch)`，单条失败不阻断其它（部分成功语义），返回 `{ verified|archived: [...], skipped: [{id, reason}] }`。
+
+前端 `<ChunkActionsBar/>` 9 按钮（verify / reject / patch / archive / restore / rollback / split / merge / relate）+ `<ChunkRevisionsTimeline/>` + `<ChunkReferrersList/>` 全部嵌进 `<ChunkInspectorPane/>`。Explore mode 列表加批量勾选工具条。
+
+`tests/chunk_batch_ops.rs`（#[ignore] 集成）覆盖：批量 verify 3 条 → 全 verified=true + 3 条 chunk_revisions；批量 archive 含 1 条已 archived → skipped 1 + verified 2。
+
+#### G4 · ChatWorkbench 多轮 + Inbox + ObservabilityDashboard（仅前端）
+
+Today mode 下的 `<ChatWorkbench/>` 接 `chat_session_stream` SSE + `chat_turn`（多轮 message 流 + 工具调用阶段标 + 编辑卡 + apply/discard CTA），`<KnowledgeInbox/>` 接 `/operation-knowledge/inbox`。Steward mode 新增「诊断」tab 的 `<ObservabilityDashboard/>` 5 卡：
+
+| 卡 | 数据源 |
+|---|---|
+| 目录覆盖 | `/catalog/persisted` + `/catalog` 差集 |
+| 完整性 | `/completeness` |
+| 完整性诊断 | `/integrity-report` |
+| 检索 trace（24h） | `/logs/analyze` |
+| Answer Cache 命中率 | `/api/knowledge/metrics` 的 `answerCache.{entries,hits,misses,maxEntries,ttlSeconds}` |
+
+#### G5 · Admin 治理三件套 + 元信息聚合（后端 +1 路由）
+
+```
+GET /api/operation-knowledge/metadata    元信息聚合（一次 mongo $facet 拆 4 维）
+```
+
+返回 `{ wikiTypeCounts, verifiedRatioByType, topEditors, recentActivity7d }`。前端 Atlas mode 新「治理」tab 的 `<AdminGovernanceView/>` 三 sub-tab：分类系统 / 状态策略 / 域配置 + Schema，统一走 `<PublishBar resourceKind={...}/>` 抽象（publish / rollout 0-100% 五档 / rollback 三按钮）。顶部嵌 `<MetadataDashboard/>` 渲染纯 CSS 柱状 + 比例环 + 7d 活跃曲线。
+
+#### G P1 · supersededBy 链 / Atlas Graph view / Answer Cache stats
+
+补三个收尾项：
+
+- `OperationKnowledgeChunk` 的 `superseded_by / previous_version_id` 进 JSON 输出（`src/routes/knowledge.rs::operation_knowledge_chunk_json`），Inspector 顶部显示「已被替代 → 跳转」横幅
+- Atlas mode 新 `<ChunkGraphView/>` SVG 极坐标图：FNV-1a 哈希定角度 + 入度压缩半径 + relatedChunks/supersededBy/previousVersionId 三种边样式 + wiki_type filter + legend（0 新依赖）
+- ObservabilityDashboard 第 5 卡接 `/api/knowledge/metrics` 的 answer cache 计数（既有 `crate::agent::knowledge_agent::cache`，TTL 300s / MAX_ENTRIES 256）
+
+#### G 红线（继承 + 新增）
+
+| 红线 | 落地点 |
+|---|---|
+| AI 永不自动 verify | batch-verify 路由仅接受 admin 手工触发；chat / patch / import 仍强制 `status=draft + integrity_status=needs_review` |
+| 0 新依赖 | 前端 React 19 + lucide-react 单一 styles.css；后端 0 新 crate |
+| 知识子系统隔离 | `src/knowledge_wiki/* + src/agent/knowledge_*` 不引用 `agent::gateway/outbox`、`mcp::*`、`agent_send_outbox`、`run_user_operation_gateway` |
+| 状态枚举闭集（R9.10.e） | DB 写入点拒绝未知 status |
+| 不留兼容层 | 无 type alias / serde-skip ghost 字段 / accessor stub / 「兼容历史」注释 |
+| 三 lint 0 增量命中 | `check-no-{human-takeover,model-hint,sales-domain}.sh` |
