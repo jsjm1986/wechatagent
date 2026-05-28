@@ -5693,6 +5693,19 @@ fn priority_rank(p: &str) -> u8 {
     }
 }
 
+/// pending_review chunk 在 inbox 里的优先级。
+///
+/// `chunk_type=negative_example` 是 reviewer 误判反馈链路（reaction 写入 outbox
+/// 失败文本 → enqueue_negative_example_chunk）的 admin 二次确认入口，必须高优；
+/// 其它类型 (peer_case / product_fact / style_template) 维持 mid，避免淹没。
+fn inbox_pending_review_priority(chunk_type: &str) -> &'static str {
+    if chunk_type == "negative_example" {
+        "high"
+    } else {
+        "mid"
+    }
+}
+
 pub(super) async fn knowledge_inbox(
     State(state): State<AppState>,
     Query(query): Query<InboxQuery>,
@@ -5813,20 +5826,39 @@ pub(super) async fn knowledge_inbox(
         let updated_ms = c.updated_at.timestamp_millis();
 
         // 4) pending_review：integrity_status = needs_review 且 7d 内更新。
+        // chunk_type=negative_example 升 priority=high 并标 origin=negative_example_review，
+        // 因为这是 reviewer 误判反馈链路（reaction → enqueue_negative_example_chunk）的
+        // admin 必须二次确认入口；其它类型 (peer_case / product_fact / style_template)
+        // 维持 mid + pending_review。
         if integrity == "needs_review" && updated_ms >= cutoff_ms {
+            let is_negative_example = c.chunk_type == "negative_example";
             items.push(InboxCardView {
                 id: format!("chunk:{}:review", chunk_id_hex),
-                priority: "mid".into(),
+                priority: inbox_pending_review_priority(&c.chunk_type).into(),
                 kind: "repair_chunk".into(),
-                title: format!("待审切片：{}", title),
+                title: if is_negative_example {
+                    format!("待审反例：{}", title)
+                } else {
+                    format!("待审切片：{}", title)
+                },
                 context_summary: c
                     .summary
                     .clone()
-                    .unwrap_or_else(|| "AI 起草，等运营确认。".into()),
+                    .unwrap_or_else(|| {
+                        if is_negative_example {
+                            "AI 从 reviewer 误判信号入队，等运营 admin 二次确认。".into()
+                        } else {
+                            "AI 起草，等运营确认。".into()
+                        }
+                    }),
                 target_chunk_id: Some(chunk_id_hex.clone()),
                 target_pack_id: None,
                 suggested_actions: vec!["open_chat".into(), "open_repair".into(), "dismiss".into()],
-                origin: "pending_review".into(),
+                origin: if is_negative_example {
+                    "negative_example_review".into()
+                } else {
+                    "pending_review".into()
+                },
                 created_at: crate::models::dt_to_string(c.updated_at).unwrap_or_default(),
             });
         }
@@ -7814,6 +7846,22 @@ mod tests {
         assert_eq!(severity_to_priority("info"), "low");
         assert_eq!(severity_to_priority(""), "low");
         assert_eq!(severity_to_priority("garbage"), "low");
+    }
+
+    #[test]
+    fn inbox_pending_review_priority_lifts_negative_example() {
+        // negative_example 是 reviewer 误判反馈链路 admin 二次确认入口，必须高优。
+        assert_eq!(inbox_pending_review_priority("negative_example"), "high");
+    }
+
+    #[test]
+    fn inbox_pending_review_priority_keeps_other_chunk_types_mid() {
+        // 其它 chunk_type 维持 mid，避免淹没真正高优的反例审核。
+        assert_eq!(inbox_pending_review_priority("product_fact"), "mid");
+        assert_eq!(inbox_pending_review_priority("style_template"), "mid");
+        assert_eq!(inbox_pending_review_priority("peer_case"), "mid");
+        assert_eq!(inbox_pending_review_priority(""), "mid");
+        assert_eq!(inbox_pending_review_priority("unknown_future_kind"), "mid");
     }
 
     /// 不变量：digest 卡 kind → inbox kind 不漏映射任何已声明形态。
