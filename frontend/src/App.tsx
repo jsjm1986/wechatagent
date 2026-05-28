@@ -3808,6 +3808,11 @@ function LessonsLearnedAdmin({ busy }: { busy: boolean }) {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [patternKind, setPatternKind] = useState<string>("");
+  const [promoting, setPromoting] = useState<string | null>(null); // lesson_id
+  const [draftTitle, setDraftTitle] = useState("");
+  const [draftBody, setDraftBody] = useState("");
+  const [draftSummary, setDraftSummary] = useState("");
+  const [promoteError, setPromoteError] = useState<string | null>(null);
 
   async function reload() {
     setLoading(true);
@@ -3824,6 +3829,46 @@ function LessonsLearnedAdmin({ busy }: { busy: boolean }) {
       setError((e as Error).message);
     } finally {
       setLoading(false);
+    }
+  }
+
+  function openPromote(lessonId: string) {
+    setPromoting(lessonId);
+    setDraftTitle("");
+    setDraftBody("");
+    setDraftSummary("");
+    setPromoteError(null);
+  }
+
+  function closePromote() {
+    setPromoting(null);
+    setDraftTitle("");
+    setDraftBody("");
+    setDraftSummary("");
+    setPromoteError(null);
+  }
+
+  async function submitPromote() {
+    if (!promoting) return;
+    if (!draftTitle.trim() || !draftBody.trim()) {
+      setPromoteError("title 和 body 都不能为空");
+      return;
+    }
+    setPromoteError(null);
+    try {
+      const payload: Record<string, string> = {
+        title: draftTitle.trim(),
+        body: draftBody.trim(),
+      };
+      if (draftSummary.trim()) payload.summary = draftSummary.trim();
+      await api.post(
+        `/api/admin/lessons-learned/${encodeURIComponent(promoting)}/promote-to-peer-case`,
+        payload
+      );
+      closePromote();
+      void reload();
+    } catch (e) {
+      setPromoteError((e as Error).message);
     }
   }
 
@@ -3871,7 +3916,7 @@ function LessonsLearnedAdmin({ busy }: { busy: boolean }) {
       </div>
       <p className="panelHint">
         feedback_worker 周期把 agent_run_logs 的胜/败模式压缩成可被下一轮决策检索的颗粒；
-        是否晋升为 peer_case chunk 由 admin 在知识审核队列里决定（本面板仅观测）。
+        admin 在此抽象为 chunk_type=peer_case 候选 chunk（仍走知识审核队列二次确认才能 verify）。
       </p>
       {error && <div className="inlineError">{error}</div>}
       {!loading && items.length === 0 && <EmptyInline text="暂无教训聚合（窗口内无命中样本）" />}
@@ -3886,7 +3931,19 @@ function LessonsLearnedAdmin({ busy }: { busy: boolean }) {
                   <span style={{ marginLeft: 8, fontWeight: 400, opacity: 0.7 }}>×{item.count}</span>
                 </h3>
               </div>
-              <span className={patternBadgeClass(item.patternKind)}>{item.reviewStatus}</span>
+              <div className="buttonRow">
+                <span className={patternBadgeClass(item.patternKind)}>{item.reviewStatus}</span>
+                {item.reviewStatus !== "promoted" && (
+                  <button
+                    type="button"
+                    className="secondary"
+                    onClick={() => openPromote(item.lessonId)}
+                    disabled={busy || loading || promoting !== null}
+                  >
+                    晋升为 peer_case
+                  </button>
+                )}
+              </div>
             </div>
             <div className="versionedListBody">
               <div className="versionedListChunk">
@@ -3911,6 +3968,47 @@ function LessonsLearnedAdmin({ busy }: { busy: boolean }) {
                 <div className="versionedListChunk">
                   <span>promoted chunk</span>
                   <p><code>{item.promotedChunkId}</code></p>
+                </div>
+              )}
+              {promoting === item.lessonId && (
+                <div className="versionedListChunk" style={{ gridColumn: "1 / -1" }}>
+                  <span>晋升为 peer_case 候选 chunk（仍需 admin 在知识审核队列 verify）</span>
+                  <div style={{ display: "grid", gap: 8 }}>
+                    <input
+                      type="text"
+                      placeholder="title（≤ 200 字）"
+                      value={draftTitle}
+                      onChange={(e) => setDraftTitle(e.target.value)}
+                      maxLength={200}
+                    />
+                    <input
+                      type="text"
+                      placeholder="summary（一句话，可选）"
+                      value={draftSummary}
+                      onChange={(e) => setDraftSummary(e.target.value)}
+                    />
+                    <textarea
+                      placeholder="body：案例正文（≤ 4000 字）"
+                      value={draftBody}
+                      onChange={(e) => setDraftBody(e.target.value)}
+                      rows={6}
+                      maxLength={4000}
+                    />
+                    {promoteError && <div className="inlineError">{promoteError}</div>}
+                    <div className="buttonRow">
+                      <button
+                        type="button"
+                        className="primary"
+                        onClick={() => void submitPromote()}
+                        disabled={busy || !draftTitle.trim() || !draftBody.trim()}
+                      >
+                        提交晋升
+                      </button>
+                      <button type="button" className="secondary" onClick={closePromote}>
+                        取消
+                      </button>
+                    </div>
+                  </div>
                 </div>
               )}
             </div>
