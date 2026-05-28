@@ -22,7 +22,7 @@ use testcontainers_modules::mongo::Mongo;
 use wechatagent::config::AppConfig;
 use wechatagent::db::Database;
 use wechatagent::error::{AppError, AppResult};
-use wechatagent::llm::{ChatUsage, LlmGenerator, LlmJsonResult};
+use wechatagent::llm::{ChatUsage, LlmJsonResult, LlmProvider};
 use wechatagent::mcp::McpClient;
 use wechatagent::prompts;
 use wechatagent::routes::AppState;
@@ -80,7 +80,7 @@ impl TestLlmGenerator {
 }
 
 #[async_trait]
-impl LlmGenerator for TestLlmGenerator {
+impl LlmProvider for TestLlmGenerator {
     async fn generate_json(&self, _system: &str, _user: &str) -> AppResult<Value> {
         Ok(self.pop_or_error()?.value)
     }

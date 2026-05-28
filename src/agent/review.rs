@@ -613,7 +613,7 @@ Review 模式: {}
         knowledge_route_text
     );
     // S2 (Phase 0)：reviewer 双模真并行——主 reviewer 走 generate_agent_json
-    // （含 LRU cache + llm_call_logs），第二 reviewer 走纯 LlmGenerator。
+    // （含 LRU cache + llm_call_logs），第二 reviewer 走纯 LlmProvider。
     // 两路用 tokio::join! 并发，墙钟 ≈ max(p1, p2) 而非 p1 + p2。
     // 双脑禁用时（second_reviewer_llm = None）退化为单 future，行为不变。
     let primary_future = generate_agent_json(

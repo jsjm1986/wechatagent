@@ -28,7 +28,7 @@ use serde_json::{json, Value};
 
 use crate::{
     error::{AppError, AppResult},
-    llm::{LlmClient, LlmFormat, LlmGenerator, LlmProviderMeta},
+    llm::{LlmClient, LlmFormat, LlmProvider, LlmProviderMeta},
     models::LlmProviderConfig,
 };
 
@@ -496,7 +496,7 @@ async fn swap_registry(
 }
 
 #[allow(dead_code)]
-fn _ensure_llm_generator_object_safe(_g: &dyn LlmGenerator) {}
+fn _ensure_llm_provider_object_safe(_g: &dyn LlmProvider) {}
 
 #[cfg(test)]
 mod tests {

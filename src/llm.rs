@@ -126,9 +126,13 @@ pub struct LlmJsonResult {
 ///
 /// 用 trait 隔离运行时 LLM 客户端与测试中的 mock，便于通过 mockall 或手写
 /// fake 实现注入预期响应；运行时仍使用 [`LlmClient`] 走 HTTP。
+///
+/// 命名口径：与 `docs/agent-policy.md` Phase E2-T1 对齐为 `LlmProvider`，
+/// reviewer 双脑（primary + cross_provider）通过 [`LlmRegistry`] 选择不同
+/// provider 实现达成 epistemic diversity。
 #[async_trait]
 #[cfg_attr(test, mockall::automock)]
-pub trait LlmGenerator: Send + Sync {
+pub trait LlmProvider: Send + Sync {
     async fn generate_json(&self, system: &str, user: &str) -> AppResult<Value>;
     async fn generate_json_with_usage(&self, system: &str, user: &str) -> AppResult<LlmJsonResult>;
 }
@@ -360,7 +364,7 @@ impl LlmClient {
 }
 
 #[async_trait]
-impl LlmGenerator for LlmClient {
+impl LlmProvider for LlmClient {
     async fn generate_json(&self, system: &str, user: &str) -> AppResult<Value> {
         self.generate_json_with_usage(system, user)
             .await
@@ -659,7 +663,7 @@ pub struct LlmProviderMeta {
 /// 行为：
 /// - 持有 `Arc<LlmClient>` + `LlmProviderMeta`，由 `tokio::sync::RwLock` 保护，
 ///   生产路径只读锁；前端「启用」一条 provider 时取写锁原子替换。
-/// - 实现 [`LlmGenerator`] 把 `generate_json` / `generate_json_with_usage`
+/// - 实现 [`LlmProvider`] 把 `generate_json` / `generate_json_with_usage`
 ///   转发给当前 client；调用前先 `read().await` 拿一次 `Arc` 克隆再放锁，
 ///   避免持锁期间发起 HTTP 阻塞 swap。
 /// - 不缓存解析结果——只关心客户端实例本身的替换。
@@ -699,7 +703,7 @@ impl LlmRegistry {
 }
 
 #[async_trait]
-impl LlmGenerator for LlmRegistry {
+impl LlmProvider for LlmRegistry {
     async fn generate_json(&self, system: &str, user: &str) -> AppResult<Value> {
         let client = self.current().await;
         client.generate_json(system, user).await

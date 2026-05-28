@@ -13,7 +13,7 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use wechatagent::{
     config::AppConfig,
     db::{self, Database},
-    llm::{LlmClient, LlmFormat, LlmGenerator, LlmProviderMeta, LlmRegistry},
+    llm::{LlmClient, LlmFormat, LlmProvider, LlmProviderMeta, LlmRegistry},
     mcp::McpClient,
     prompts,
     routes::{api_router, AppState},
@@ -85,12 +85,12 @@ async fn main() -> anyhow::Result<()> {
             base_url: active_provider.base_url.clone(),
         },
     ));
-    let llm: Arc<dyn LlmGenerator> = registry.clone();
+    let llm: Arc<dyn LlmProvider> = registry.clone();
     // Phase E / E2：reviewer 双脑并行——`REVIEWER_DUAL_ENABLED=true` 且第二
     // provider 4 件套 (BASE_URL/API_KEY/MODEL/FORMAT) 齐备时，构建独立 LlmClient
     // 注入 AppState.second_reviewer_llm；review_decision 看到 Some 即并行调用。
     // 缺件视为配置错误：拒绝启动，避免静默退化为单 reviewer。
-    let second_reviewer_llm: Option<Arc<dyn LlmGenerator>> = if config.reviewer_dual_enabled {
+    let second_reviewer_llm: Option<Arc<dyn LlmProvider>> = if config.reviewer_dual_enabled {
         let base_url = config.reviewer_second_provider_base_url.as_ref().ok_or_else(|| {
             anyhow::anyhow!(
                 "REVIEWER_DUAL_ENABLED=true 但 REVIEWER_SECOND_PROVIDER_BASE_URL 未配置"
@@ -116,7 +116,7 @@ async fn main() -> anyhow::Result<()> {
             config.llm_max_retries,
             config.llm_retry_base_ms,
         )?;
-        let arc: Arc<dyn LlmGenerator> = Arc::new(client);
+        let arc: Arc<dyn LlmProvider> = Arc::new(client);
         tracing::info!(
             base_url = %base_url,
             model = %model,

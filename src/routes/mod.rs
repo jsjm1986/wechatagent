@@ -13,7 +13,7 @@ use std::sync::Arc;
 use crate::{
     config::AppConfig,
     db::Database,
-    llm::{LlmGenerator, LlmRegistry},
+    llm::{LlmProvider, LlmRegistry},
     mcp::McpClient,
 };
 
@@ -151,7 +151,7 @@ use management::{
     create_management_session, get_management_command, get_tool_catalog, post_management_message,
 };
 use lessons_learned::{list_lessons_learned, promote_lesson_to_peer_case};
-use observability::phase_rollup;
+use observability::{phase_rollup, worker_health};
 use outcome_metrics::list_agent_outcome_metrics;
 use playbooks::{
     create_operation_playbook, generate_operation_playbook, list_operation_playbooks,
@@ -170,7 +170,7 @@ use tasks::{cancel_agent_task, list_agent_runs, list_llm_usage, list_tasks, revi
 pub struct AppState {
     pub db: Database,
     pub mcp: McpClient,
-    pub llm: Arc<dyn LlmGenerator>,
+    pub llm: Arc<dyn LlmProvider>,
     /// 当前激活 provider 的热替换 wrapper。生产路径 `main.rs` 让 `llm` 与
     /// 这里指向同一个 [`LlmRegistry`] 实例；前端「启用 provider」走
     /// `routes/llm_providers` 时取这个字段进行原子 swap，写一次新 client
@@ -198,7 +198,7 @@ pub struct AppState {
     /// 件套环境变量齐备时构建一次，进程生命周期内不替换；运行时切换需重启
     /// （与 `LlmRegistry` 的运行时热替换不同——双 reviewer 故意不热切以保持
     /// epistemic 对照稳定）。
-    pub second_reviewer_llm: Option<Arc<dyn LlmGenerator>>,
+    pub second_reviewer_llm: Option<Arc<dyn LlmProvider>>,
 }
 
 pub fn api_router(state: AppState) -> Router<AppState> {
@@ -659,6 +659,9 @@ pub fn api_router(state: AppState) -> Router<AppState> {
         // ── Phase 0-D 自治信号 admin 聚合（lifecycle / revision_reason /
         //    reviewer_misjudge_signal / negative_example pending）只读 ────────
         .route("/admin/observability/phase-rollup", get(phase_rollup))
+        // ── G-后续Ⅱ/2：worker 健康聚合（chat_tasks 状态 / gap_signals sweep 命中率 /
+        //    lessons_learned 14d pattern × review_status）一次 RTT 拉齐 ──────
+        .route("/admin/observability/worker-health", get(worker_health))
         // ── LLM provider 配置 admin 路由：前端 UI 编辑 / 测试 / 热切换 ────
         .route(
             "/admin/llm-providers",
