@@ -27,6 +27,7 @@ import {
   Loader2,
   Map as MapIcon,
   MessageSquareText,
+  Network,
   Package,
   Plus,
   RefreshCw,
@@ -5890,7 +5891,7 @@ function StewardMode() {
 }
 
 function AtlasMode() {
-  const [pane, setPane] = useState<"schema" | "metrics" | "memory" | "governance">("schema");
+  const [pane, setPane] = useState<"schema" | "metrics" | "memory" | "graph" | "governance">("schema");
   return (
     <div className="wikiModeGrid wikiModeGrid--atlas">
       <div className="wikiModePane wikiModePane--nav wikiStewardNav">
@@ -5917,6 +5918,13 @@ function AtlasMode() {
         </button>
         <button
           type="button"
+          className={pane === "graph" ? "wikiStewardNavBtn active" : "wikiStewardNavBtn"}
+          onClick={() => setPane("graph")}
+        >
+          <Network size={14} /> 关系图谱
+        </button>
+        <button
+          type="button"
           className={pane === "governance" ? "wikiStewardNavBtn active" : "wikiStewardNavBtn"}
           onClick={() => setPane("governance")}
         >
@@ -5927,7 +5935,289 @@ function AtlasMode() {
         {pane === "schema" && <DomainSchemaTab />}
         {pane === "metrics" && <MetricsTab />}
         {pane === "memory" && <MemoryDrawer />}
+        {pane === "graph" && <ChunkGraphView />}
         {pane === "governance" && <AdminGovernanceView />}
+      </div>
+    </div>
+  );
+}
+
+// ── P1 · ChunkGraphView · 关系图谱（SVG 原生力导布局，0 新依赖）──────────
+//
+// 数据：GET /api/operation-knowledge/chunks → 每条 chunk 一个节点。
+// 边来源：
+//   - relatedChunks: { chunk_id, kind } 6 类（references / requires / contradicts / clarifies / refines / superseded_by）
+//   - supersededBy:  归档链尾 → 现役新版本（隐式 superseded_by）
+//   - previousVersionId: split/merge/rollback 维护的前一版指针
+//
+// 布局：deterministic 极坐标布局——按 wikiType 分扇区，扇区内按 id 哈希排序角度，
+// 半径按"被引用次数 / out-degree" 微调（中心更密=被多次引用的核心 chunk）。
+// 不做 force simulation——避免每帧重排导致的视觉抖动 + 0 依赖红线。
+//
+// 交互：节点 click → focusChunk(id)；hover → 浮窗显示 title + wikiType。
+function ChunkGraphView() {
+  const [items, setItems] = useState<TreeChunkItem[] | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [hovered, setHovered] = useState<string | null>(null);
+  const [filter, setFilter] = useState<string>("all"); // wikiType filter
+
+  useEffect(() => {
+    setLoading(true);
+    fetch("/api/operation-knowledge/chunks")
+      .then(async (r) => {
+        if (!r.ok) throw new Error(await r.text());
+        return r.json() as Promise<{ items: TreeChunkItem[] }>;
+      })
+      .then((data) => setItems(data.items ?? []))
+      .catch((e: unknown) => setError(e instanceof Error ? e.message : String(e)))
+      .finally(() => setLoading(false));
+  }, []);
+
+  const wikiTypes = useMemo(() => {
+    if (!items) return [] as string[];
+    const set = new Set<string>();
+    for (const it of items) if (it.wikiType) set.add(it.wikiType);
+    return Array.from(set).sort();
+  }, [items]);
+
+  const visible = useMemo(() => {
+    if (!items) return [] as TreeChunkItem[];
+    if (filter === "all") return items;
+    return items.filter((it) => it.wikiType === filter);
+  }, [items, filter]);
+
+  const indexById = useMemo(() => {
+    const m = new Map<string, TreeChunkItem>();
+    for (const it of visible) m.set(it.id, it);
+    return m;
+  }, [visible]);
+
+  // FNV-1a 32-bit：deterministic id → 0..1 用作角度噪声。
+  const hash01 = (s: string): number => {
+    let h = 0x811c9dc5;
+    for (let i = 0; i < s.length; i += 1) {
+      h ^= s.charCodeAt(i);
+      h = Math.imul(h, 0x01000193);
+    }
+    return ((h >>> 0) % 100000) / 100000;
+  };
+
+  // 入度（被引用次数）— 半径压缩量。
+  const inDegree = useMemo(() => {
+    const m = new Map<string, number>();
+    for (const it of visible) {
+      if (it.relatedChunks) {
+        for (const r of it.relatedChunks) {
+          m.set(r.chunk_id, (m.get(r.chunk_id) ?? 0) + 1);
+        }
+      }
+      if (it.supersededBy) m.set(it.supersededBy, (m.get(it.supersededBy) ?? 0) + 1);
+      if (it.previousVersionId) m.set(it.previousVersionId, (m.get(it.previousVersionId) ?? 0) + 1);
+    }
+    return m;
+  }, [visible]);
+
+  // 计算节点 polar 坐标。
+  const layout = useMemo(() => {
+    const W = 720;
+    const H = 560;
+    const cx = W / 2;
+    const cy = H / 2;
+    const types = wikiTypes.length ? wikiTypes : ["__none"];
+    const sectorByType = new Map<string, number>();
+    types.forEach((t, i) => sectorByType.set(t, i));
+    const sectorWidth = (Math.PI * 2) / types.length;
+    const positions = new Map<string, { x: number; y: number }>();
+    for (const it of visible) {
+      const t = it.wikiType ?? "__none";
+      const sector = sectorByType.get(t) ?? 0;
+      const noise = hash01(it.id);
+      const angle = sector * sectorWidth + noise * sectorWidth * 0.92 + sectorWidth * 0.04;
+      const deg = inDegree.get(it.id) ?? 0;
+      // 入度越高半径越小（核心 chunk 向内）。
+      const radius = 230 - Math.min(deg, 8) * 18;
+      positions.set(it.id, {
+        x: cx + Math.cos(angle) * radius,
+        y: cy + Math.sin(angle) * radius
+      });
+    }
+    return { positions, W, H, cx, cy };
+  }, [visible, wikiTypes, inDegree]);
+
+  // 颜色：按 wikiType 在 token 色板里 deterministic 选取。
+  const colorFor = (wikiType?: string | null): string => {
+    const palette = [
+      "#7a4a30",
+      "#3d6a52",
+      "#5a4d8a",
+      "#8a6a3a",
+      "#3d6a8a",
+      "#8a3a5a",
+      "#3a6a3a",
+      "#6a3a3a"
+    ];
+    if (!wikiType) return "#888";
+    const h = hash01(wikiType);
+    return palette[Math.floor(h * palette.length)] ?? palette[0];
+  };
+
+  const focused = hovered ? indexById.get(hovered) : null;
+
+  // 边渲染：按 kind 决定线条样式。
+  type Edge = { from: string; to: string; kind: string };
+  const edges: Edge[] = useMemo(() => {
+    const out: Edge[] = [];
+    for (const it of visible) {
+      if (it.relatedChunks) {
+        for (const r of it.relatedChunks) {
+          if (indexById.has(r.chunk_id)) out.push({ from: it.id, to: r.chunk_id, kind: r.kind });
+        }
+      }
+      if (it.supersededBy && indexById.has(it.supersededBy)) {
+        out.push({ from: it.id, to: it.supersededBy, kind: "superseded_by" });
+      }
+      if (it.previousVersionId && indexById.has(it.previousVersionId)) {
+        out.push({ from: it.id, to: it.previousVersionId, kind: "previous_version" });
+      }
+    }
+    return out;
+  }, [visible, indexById]);
+
+  if (loading) return <div className="wikiInspectorEmpty">加载中…</div>;
+  if (error) return <div className="wikiAlert error">{error}</div>;
+  if (!visible.length) return <div className="wikiInspectorEmpty">无 chunk 可绘图</div>;
+
+  return (
+    <div className="wikiGraphPane">
+      <header className="wikiArchiveHeader">
+        <h2>关系图谱</h2>
+        <div className="wikiArchiveSubtitle">
+          {visible.length} chunks · {edges.length} edges{filter !== "all" ? ` · 过滤 ${filter}` : ""}
+        </div>
+      </header>
+      <div className="wikiGraphToolbar">
+        <label className="wikiGraphFilterLabel">wiki_type：</label>
+        <select
+          className="wikiGraphFilterSelect"
+          value={filter}
+          onChange={(e) => setFilter(e.target.value)}
+        >
+          <option value="all">全部</option>
+          {wikiTypes.map((t) => (
+            <option key={t} value={t}>{t}</option>
+          ))}
+        </select>
+        <span className="wikiGraphLegend">
+          {wikiTypes.slice(0, 8).map((t) => (
+            <span key={t} className="wikiGraphLegendItem">
+              <span className="wikiGraphLegendDot" style={{ background: colorFor(t) }} />
+              {t}
+            </span>
+          ))}
+        </span>
+      </div>
+      <div className="wikiGraphSvgWrap">
+        <svg
+          viewBox={`0 0 ${layout.W} ${layout.H}`}
+          className="wikiGraphSvg"
+          xmlns="http://www.w3.org/2000/svg"
+        >
+          <defs>
+            <marker
+              id="wikiGraphArrow"
+              viewBox="0 0 10 10"
+              refX="9"
+              refY="5"
+              markerWidth="5"
+              markerHeight="5"
+              orient="auto-start-reverse"
+            >
+              <path d="M 0 0 L 10 5 L 0 10 z" fill="#666" />
+            </marker>
+          </defs>
+          <g className="wikiGraphEdges">
+            {edges.map((e, i) => {
+              const a = layout.positions.get(e.from);
+              const b = layout.positions.get(e.to);
+              if (!a || !b) return null;
+              const stroke = e.kind === "contradicts"
+                ? "#a13a3a"
+                : e.kind === "superseded_by"
+                ? "#7a4a30"
+                : e.kind === "previous_version"
+                ? "#5a4d8a"
+                : "#999";
+              const dash = e.kind === "contradicts" || e.kind === "superseded_by" ? "4 3" : undefined;
+              const isHovered = hovered === e.from || hovered === e.to;
+              return (
+                <line
+                  key={`${e.from}-${e.to}-${i}`}
+                  x1={a.x}
+                  y1={a.y}
+                  x2={b.x}
+                  y2={b.y}
+                  stroke={stroke}
+                  strokeWidth={isHovered ? 2 : 1}
+                  strokeOpacity={isHovered ? 0.85 : 0.35}
+                  strokeDasharray={dash}
+                  markerEnd="url(#wikiGraphArrow)"
+                />
+              );
+            })}
+          </g>
+          <g className="wikiGraphNodes">
+            {visible.map((it) => {
+              const p = layout.positions.get(it.id);
+              if (!p) return null;
+              const deg = inDegree.get(it.id) ?? 0;
+              const r = 5 + Math.min(deg, 6) * 1.5;
+              const fill = colorFor(it.wikiType);
+              const isHovered = hovered === it.id;
+              const isArchived = it.status === "archived";
+              return (
+                <g
+                  key={it.id}
+                  transform={`translate(${p.x},${p.y})`}
+                  className="wikiGraphNode"
+                  onMouseEnter={() => setHovered(it.id)}
+                  onMouseLeave={() => setHovered(null)}
+                  onClick={() => focusChunk(it.id)}
+                  style={{ cursor: "pointer" }}
+                >
+                  <circle
+                    r={r}
+                    fill={isArchived ? "#fff" : fill}
+                    stroke={fill}
+                    strokeWidth={isHovered ? 2.5 : isArchived ? 1.5 : 1}
+                    opacity={isArchived ? 0.7 : 1}
+                  />
+                  {isHovered ? (
+                    <text
+                      x={r + 4}
+                      y={4}
+                      fontFamily="var(--font-mono)"
+                      fontSize="11"
+                      fill="var(--ink, #222)"
+                    >
+                      {it.title?.slice(0, 28) || it.id.slice(0, 8)}
+                    </text>
+                  ) : null}
+                </g>
+              );
+            })}
+          </g>
+        </svg>
+        {focused ? (
+          <div className="wikiGraphTooltip">
+            <div className="wikiGraphTooltipTitle">{focused.title || "（无标题）"}</div>
+            <div className="wikiGraphTooltipMeta">
+              <span className="wikiArchiveTag">{focused.wikiType ?? "—"}</span>
+              <span className="wikiBadge">{focused.status ?? "—"}</span>
+              <span className="wikiGraphTooltipDeg">入度 {inDegree.get(focused.id) ?? 0}</span>
+            </div>
+          </div>
+        ) : null}
       </div>
     </div>
   );

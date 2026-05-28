@@ -6874,3 +6874,112 @@ td:nth-child(3) {
   margin-top: 2px;
 }
 
+/* ── P1 · ChunkGraphView · 关系图谱 ─────────────────────────────────── */
+
+.wikiGraphPane {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 16px 18px;
+  background: var(--surface-1, #fbf7ee);
+  height: 100%;
+  overflow: auto;
+}
+
+.wikiGraphToolbar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+  padding: 8px 0;
+  border-bottom: 1px solid var(--line-strong, var(--ink));
+}
+
+.wikiGraphFilterLabel {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--muted);
+}
+
+.wikiGraphFilterSelect {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  padding: 4px 8px;
+  border: 1px solid var(--ink);
+  background: transparent;
+  color: var(--ink);
+}
+
+.wikiGraphLegend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.wikiGraphLegendItem {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+
+.wikiGraphLegendDot {
+  display: inline-block;
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+}
+
+.wikiGraphSvgWrap {
+  position: relative;
+  width: 100%;
+  border: 1px solid var(--line-strong, var(--ink));
+  background: #fff;
+}
+
+.wikiGraphSvg {
+  display: block;
+  width: 100%;
+  height: auto;
+}
+
+.wikiGraphNode:hover circle {
+  filter: brightness(1.1);
+}
+
+.wikiGraphTooltip {
+  position: absolute;
+  bottom: 12px;
+  left: 12px;
+  max-width: 320px;
+  padding: 10px 12px;
+  background: var(--surface-1, #fbf7ee);
+  border: 1px solid var(--ink);
+  border-left-width: 4px;
+  pointer-events: none;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.08);
+}
+
+.wikiGraphTooltipTitle {
+  font-family: var(--font-display);
+  font-size: 14px;
+  color: var(--ink);
+  margin-bottom: 6px;
+}
+
+.wikiGraphTooltipMeta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+}
+
+.wikiGraphTooltipDeg {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--muted);
+}
