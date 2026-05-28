@@ -148,7 +148,7 @@ use knowledge::{
 use management::{
     create_management_session, get_management_command, get_tool_catalog, post_management_message,
 };
-use lessons_learned::list_lessons_learned;
+use lessons_learned::{list_lessons_learned, promote_lesson_to_peer_case};
 use outcome_metrics::list_agent_outcome_metrics;
 use playbooks::{
     create_operation_playbook, generate_operation_playbook, list_operation_playbooks,
@@ -644,6 +644,12 @@ pub fn api_router(state: AppState) -> Router<AppState> {
         .route("/admin/outbox/:id/cancel", post(cancel_outbox))
         // ── Phase D / D5：lessons_learned admin 只读列表 ──────────────────────
         .route("/admin/lessons-learned", get(list_lessons_learned))
+        // ── Phase D 收尾：lesson 一键晋升为 peer_case 候选 chunk（仍走 chunk
+        //    review queue 二次确认；admin 手工触发，AI 永不自动 promote） ────
+        .route(
+            "/admin/lessons-learned/:lesson_id/promote-to-peer-case",
+            post(promote_lesson_to_peer_case),
+        )
         // ── LLM provider 配置 admin 路由：前端 UI 编辑 / 测试 / 热切换 ────
         .route(
             "/admin/llm-providers",
