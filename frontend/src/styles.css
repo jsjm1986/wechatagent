@@ -5839,6 +5839,64 @@ td:nth-child(3) {
   opacity: 0.45;
 }
 
+.wikiArchiveRedirect {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 0 0 14px 0;
+  padding: 10px 12px;
+  border: 1px solid var(--line-strong, var(--ink));
+  background: var(--surface-1, #fbf7ee);
+  border-left-width: 4px;
+}
+
+.wikiArchiveRedirectLabel {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+  color: var(--muted);
+  white-space: nowrap;
+}
+
+.wikiArchiveRedirectTitle {
+  flex: 1 1 auto;
+  font-family: var(--font-display);
+  font-size: 14px;
+  color: var(--ink);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.wikiArchiveRedirectTitle code {
+  font-family: var(--font-mono);
+  font-size: 12px;
+}
+
+.wikiArchiveRedirectBtn {
+  flex: 0 0 auto;
+  padding: 4px 10px;
+  border: 1px solid var(--ink);
+  background: transparent;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  letter-spacing: 0.08em;
+  color: var(--ink);
+  cursor: pointer;
+  transition: background 120ms, color 120ms;
+}
+
+.wikiArchiveRedirectBtn:hover:not(:disabled) {
+  background: var(--ink);
+  color: var(--surface-1, #fbf7ee);
+}
+
+.wikiArchiveRedirectBtn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
 .wikiArchiveMeta {
   display: grid;
   grid-template-columns: 96px 1fr;

@@ -1768,6 +1768,8 @@ pub(super) fn operation_knowledge_chunk_json(item: OperationKnowledgeChunk) -> V
         "wikiType": item.wiki_type,
         "relatedChunks": item.related_chunks,
         "businessTopics": item.business_topics,
+        "supersededBy": item.superseded_by,
+        "previousVersionId": item.previous_version_id,
         "updatedAt": crate::models::dt_to_string(item.updated_at)
     })
 }

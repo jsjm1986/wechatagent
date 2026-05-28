@@ -7014,6 +7014,8 @@ interface ReviewChunkItem {
   wikiType?: string | null;
   businessTopics?: string[] | null;
   relatedChunks?: { chunk_id: string; kind: string; note?: string | null }[] | null;
+  supersededBy?: string | null;
+  previousVersionId?: string | null;
   updatedAt?: string | null;
 }
 
@@ -7447,6 +7449,26 @@ function ChunkInspectorPane({
           </div>
         ) : (
           <>
+            {chunk.supersededBy ? (() => {
+              const successor = indexById.get(chunk.supersededBy!);
+              return (
+                <div className="wikiArchiveRedirect">
+                  <span className="wikiArchiveRedirectLabel">已被替代</span>
+                  <span className="wikiArchiveRedirectTitle">
+                    {successor ? successor.title : <code>{chunk.supersededBy}</code>}
+                  </span>
+                  <button
+                    type="button"
+                    className="wikiArchiveRedirectBtn"
+                    disabled={!successor}
+                    onClick={() => focusChunk(chunk.supersededBy!)}
+                    title={successor ? "跳转到新版本" : "目标 chunk 不在活跃集合"}
+                  >
+                    跳转 →
+                  </button>
+                </div>
+              );
+            })() : null}
             <dl className="wikiArchiveMeta">
               <dt>状态</dt>
               <dd>
@@ -7464,6 +7486,26 @@ function ChunkInspectorPane({
                   <dd>{chunk.businessTopics.map((t, i) => <span key={i} className="wikiArchiveTag">{t}</span>)}</dd>
                 </>
               ) : null}
+              {chunk.previousVersionId ? (() => {
+                const prev = indexById.get(chunk.previousVersionId!);
+                return (
+                  <>
+                    <dt>上一版本</dt>
+                    <dd>
+                      <button
+                        type="button"
+                        className="wikiRelatedChip"
+                        disabled={!prev}
+                        onClick={() => focusChunk(chunk.previousVersionId!)}
+                        title={prev ? "跳转到上一版本" : "目标 chunk 不在活跃集合"}
+                      >
+                        <span className="wikiRelatedKind">previous</span>
+                        <span className="wikiRelatedTitle">{prev ? prev.title : chunk.previousVersionId}</span>
+                      </button>
+                    </dd>
+                  </>
+                );
+              })() : null}
             </dl>
             <hr className="wikiArchiveRule" />
             <h3 className="wikiInspectorChunkTitle">{chunk.title || "（无标题）"}</h3>
