@@ -239,6 +239,11 @@ fn test_config(mongodb_uri: String, mongodb_database: String) -> AppConfig {
         reviewer_second_provider_api_key: None,
         reviewer_second_provider_model: None,
         reviewer_second_provider_format: "openai".to_string(),
+        session_ttl_hours: 8,
+        session_cookie_secure: false,
+        bootstrap_admin_username: None,
+        bootstrap_admin_password: None,
+        webhook_verify_signature: false,
     }
 }
 

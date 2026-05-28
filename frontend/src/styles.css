@@ -6999,3 +6999,203 @@ td:nth-child(3) {
   font-size: 11px;
   color: var(--muted);
 }
+
+/* P0-F: 鉴权 LoginScreen + 顶部 badge bar
+   档案馆美学：衬线显示字标题 + mono small caps 副标 + 严格列对齐表单 +
+   1px 内描边卡片 + 米色背景。复用现有 --font-display/body/mono token。 */
+
+.authLoginShell {
+  min-height: 100vh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: #f9f6ef;
+  background-image:
+    radial-gradient(1200px 800px at 50% -20%, rgba(0, 0, 0, 0.04), transparent),
+    repeating-linear-gradient(
+      0deg,
+      transparent 0,
+      transparent 4px,
+      rgba(0, 0, 0, 0.012) 4px,
+      rgba(0, 0, 0, 0.012) 5px
+    );
+  padding: 48px 24px;
+  font-family: var(--font-body);
+  color: var(--ink);
+}
+
+.authLoginCard {
+  width: 100%;
+  max-width: 420px;
+  background: #fffdf7;
+  border: 1px solid rgba(0, 0, 0, 0.55);
+  box-shadow: 8px 8px 0 0 rgba(0, 0, 0, 0.85);
+  padding: 40px 36px 32px;
+}
+
+.authLoginHeader {
+  margin-bottom: 32px;
+  padding-bottom: 20px;
+  border-bottom: 1px solid rgba(0, 0, 0, 0.18);
+}
+
+.authLoginEyebrow {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  letter-spacing: 0.18em;
+  text-transform: uppercase;
+  color: var(--muted);
+  margin-bottom: 8px;
+}
+
+.authLoginTitle {
+  font-family: var(--font-display);
+  font-size: 32px;
+  font-weight: 600;
+  letter-spacing: 0;
+  margin: 0 0 6px 0;
+  color: var(--ink);
+}
+
+.authLoginSubtitle {
+  font-size: 13px;
+  color: var(--muted);
+}
+
+.authLoginForm {
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+}
+
+.authLoginField {
+  display: grid;
+  grid-template-columns: 96px 1fr;
+  align-items: center;
+  gap: 12px;
+}
+
+.authLoginLabel {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.authLoginField input {
+  font-family: var(--font-body);
+  font-size: 14px;
+  padding: 8px 10px;
+  border: 1px solid rgba(0, 0, 0, 0.4);
+  background: #fffdf7;
+  color: var(--ink);
+  outline: none;
+  transition: border-color 120ms ease;
+}
+
+.authLoginField input:focus {
+  border-color: rgba(0, 0, 0, 0.85);
+  box-shadow: inset 0 -2px 0 0 rgba(0, 0, 0, 0.85);
+}
+
+.authLoginField input:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+.authLoginError {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  padding: 8px 10px;
+  border-left: 4px solid #b8443a;
+  background: rgba(184, 68, 58, 0.06);
+  color: #7a2a22;
+}
+
+.authLoginSubmit {
+  margin-top: 6px;
+  padding: 10px 16px;
+  font-family: var(--font-display);
+  font-size: 15px;
+  letter-spacing: 0.04em;
+  background: #1a1a1a;
+  color: #fffdf7;
+  border: 1px solid #1a1a1a;
+  cursor: pointer;
+  transition: transform 120ms ease, box-shadow 120ms ease;
+}
+
+.authLoginSubmit:hover:not(:disabled) {
+  transform: translate(-2px, -2px);
+  box-shadow: 4px 4px 0 0 rgba(0, 0, 0, 0.85);
+}
+
+.authLoginSubmit:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.authLoginFooter {
+  margin-top: 28px;
+  padding-top: 16px;
+  border-top: 1px solid rgba(0, 0, 0, 0.12);
+  font-size: 12px;
+  color: var(--muted);
+  line-height: 1.55;
+}
+
+.authLoginFooter code {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  padding: 1px 6px;
+  background: rgba(0, 0, 0, 0.05);
+  border: 1px solid rgba(0, 0, 0, 0.1);
+}
+
+.authLoginBootstrap {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  letter-spacing: 0.08em;
+  color: var(--muted);
+  text-transform: uppercase;
+}
+
+.authBadgeBar {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 12px;
+  padding: 6px 16px;
+  background: #1a1a1a;
+  color: #fffdf7;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  letter-spacing: 0.08em;
+  border-bottom: 1px solid rgba(0, 0, 0, 0.85);
+}
+
+.authBadgeUser strong {
+  font-family: var(--font-display);
+  font-size: 13px;
+  letter-spacing: 0;
+  font-weight: 600;
+  margin-left: 4px;
+}
+
+.authBadgeLogout {
+  background: transparent;
+  border: 1px solid rgba(255, 253, 247, 0.55);
+  color: #fffdf7;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  padding: 4px 10px;
+  cursor: pointer;
+  transition: background 120ms ease;
+}
+
+.authBadgeLogout:hover {
+  background: rgba(255, 253, 247, 0.12);
+}

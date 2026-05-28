@@ -8,6 +8,7 @@ use mongodb::bson::DateTime;
 use tokio::sync::OnceCell;
 
 pub mod agent;
+pub mod auth;
 pub mod account_scheduler;
 pub mod cold_contact_worker;
 pub mod config;

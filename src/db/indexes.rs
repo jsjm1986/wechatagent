@@ -1093,5 +1093,56 @@ async fn ensure_evolution_indexes(db: &Database) -> anyhow::Result<()> {
         )
         .await?;
 
+    // ── P0 鉴权 / Session ─────────────────────────────────────────────────
+    // admin_users.username unique：登录路径按 username 查；同名禁止。
+    db.raw()
+        .collection::<mongodb::bson::Document>("admin_users")
+        .create_index(
+            IndexModel::builder()
+                .keys(doc! { "username": 1 })
+                .options(
+                    IndexOptions::builder()
+                        .name("admin_users_username_unique".to_string())
+                        .unique(true)
+                        .build(),
+                )
+                .build(),
+            None,
+        )
+        .await?;
+    // admin_sessions.session_id unique：cookie 唯一定位 session。
+    db.raw()
+        .collection::<mongodb::bson::Document>("admin_sessions")
+        .create_index(
+            IndexModel::builder()
+                .keys(doc! { "session_id": 1 })
+                .options(
+                    IndexOptions::builder()
+                        .name("admin_sessions_session_id_unique".to_string())
+                        .unique(true)
+                        .build(),
+                )
+                .build(),
+            None,
+        )
+        .await?;
+    // admin_sessions.expires_at TTL：mongo 自动清理过期 session。
+    // expireAfterSeconds=0 表示「字段时间到达即过期」（不是字段时间 + N 秒）。
+    db.raw()
+        .collection::<mongodb::bson::Document>("admin_sessions")
+        .create_index(
+            IndexModel::builder()
+                .keys(doc! { "expires_at": 1 })
+                .options(
+                    IndexOptions::builder()
+                        .name("admin_sessions_ttl".to_string())
+                        .expire_after(std::time::Duration::from_secs(0))
+                        .build(),
+                )
+                .build(),
+            None,
+        )
+        .await?;
+
     Ok(())
 }

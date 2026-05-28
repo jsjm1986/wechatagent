@@ -11,6 +11,9 @@ pub enum AppError {
     BadRequest(String),
     #[error("{0}")]
     NotFound(String),
+    /// P0 鉴权：未登录 / session 失效 / cookie 缺失。前端按 401 跳回 LoginScreen。
+    #[error("{0}")]
+    Unauthorized(String),
     #[error("database error: {0}")]
     Db(#[from] mongodb::error::Error),
     #[error("http error: {0}")]
@@ -56,6 +59,9 @@ impl IntoResponse for AppError {
             }
             AppError::NotFound(msg) => {
                 (StatusCode::NOT_FOUND, Json(json!({ "error": msg }))).into_response()
+            }
+            AppError::Unauthorized(msg) => {
+                (StatusCode::UNAUTHORIZED, Json(json!({ "error": msg }))).into_response()
             }
             AppError::BudgetExceeded { run_id, reason } => (
                 StatusCode::SERVICE_UNAVAILABLE,

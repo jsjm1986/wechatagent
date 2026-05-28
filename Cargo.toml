@@ -5,14 +5,19 @@ edition = "2021"
 
 [dependencies]
 anyhow = "1.0"
+argon2 = "0.5"
 async-trait = "0.1"
 axum = "0.7"
+axum-extra = { version = "0.9", features = ["cookie"] }
 chrono = { version = "0.4", features = ["serde"] }
+cookie = "0.18"
 dashmap = "6"
 dotenvy = "0.15"
 fastrand = "2"
 futures = "0.3"
 governor = "0.7"
+hex = "0.4"
+hmac = "0.12"
 lru = "0.12"
 mongodb = "2.8"
 parking_lot = "0.12"

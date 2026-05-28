@@ -38,6 +38,22 @@ async fn main() -> anyhow::Result<()> {
     let db = Database::connect(&config.mongodb_uri, &config.mongodb_database).await?;
     db::migrations::run(&db).await?;
     db.ensure_indexes().await?;
+    // P0 鉴权：admin_users 集合空且 env 提供 BOOTSTRAP_ADMIN_USERNAME +
+    // BOOTSTRAP_ADMIN_PASSWORD 时创建第一个 admin。env 留着也幂等。
+    match wechatagent::auth::session::bootstrap_admin_if_needed(
+        &db,
+        config.bootstrap_admin_username.as_deref(),
+        config.bootstrap_admin_password.as_deref(),
+    )
+    .await
+    {
+        Ok(true) => tracing::info!(
+            "bootstrap admin created from env (username={:?})",
+            config.bootstrap_admin_username
+        ),
+        Ok(false) => {}
+        Err(e) => tracing::warn!("bootstrap admin failed: {}", e),
+    }
     // S1.2 (Phase 0)：active operation_domain_configs 必须配非空 state_machine。
     // 与 check_state_transition 的 fail-closed 路径配对——启动期先拒绝错误配置，
     // runtime defense-in-depth 兜底。

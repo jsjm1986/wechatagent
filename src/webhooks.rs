@@ -1,18 +1,25 @@
 use std::num::NonZeroU32;
 use std::sync::{Arc, LazyLock};
 
-use axum::{extract::State, Json};
+use axum::{
+    body::Bytes,
+    extract::State,
+    http::HeaderMap,
+    Json,
+};
 use dashmap::DashMap;
 use governor::{
     clock::{Clock, DefaultClock},
     state::{InMemoryState, NotKeyed},
     Quota, RateLimiter,
 };
+use hmac::{Hmac, Mac};
 use mongodb::{
     bson::{doc, to_document, DateTime},
     options::UpdateOptions,
 };
 use serde_json::Value;
+use sha2::Sha256;
 
 use crate::{
     agent,
@@ -44,8 +51,30 @@ fn limiter_for(account_id: &str, capacity: u32, window_seconds: u32) -> Arc<Webh
 
 pub async fn wechat_webhook(
     State(state): State<AppState>,
-    Json(payload): Json<Value>,
+    headers: HeaderMap,
+    body: Bytes,
 ) -> AppResult<Json<Value>> {
+    // P0-E：HMAC 签名校验。MCP（GeWe）侧约定按 `MCP_API_KEY` 作 HMAC-SHA256
+    // 签 raw body，hex 写到 header `X-MCP-Signature`。env `WEBHOOK_VERIFY_SIGNATURE`
+    // 可临时关停（默认开），仅用于灰度切换 + 联调，不应该在生产长期 false。
+    if state.config.webhook_verify_signature {
+        let provided = headers
+            .get("x-mcp-signature")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        if !verify_hmac_sha256(state.config.mcp_api_key.as_bytes(), &body, provided) {
+            tracing::warn!(
+                "webhook rejected: bad signature (provided_len={}, body_len={})",
+                provided.len(),
+                body.len()
+            );
+            return Err(AppError::BadRequest("invalid signature".into()));
+        }
+    }
+
+    let payload: Value = serde_json::from_slice(&body)
+        .map_err(|e| AppError::BadRequest(format!("invalid json body: {}", e)))?;
+
     // P2：先处理 GeWe 控制事件（在解析 appId / 进限流之前）。控制事件不喂 Agent，
     // 立刻 200 返回，避免占用 per-account 限流配额，也保证 MCP 那边 5s timeout
     // 内一定收到 ack。
@@ -520,4 +549,84 @@ async fn maybe_emit_rate_limit_event(state: &AppState, account_id: &str) -> AppR
         )
         .await;
     Ok(())
+}
+
+/// P0-E：HMAC-SHA256(body, MCP_API_KEY) 常时间比对。
+///
+/// `provided_hex` 是 header `X-MCP-Signature` 的 hex 字符串（大小写不敏感）。
+/// 任一为空 / hex 解码失败 / 长度不匹配 → 直接 false（不泄露具体原因）。
+/// 用 [`hmac::Mac::verify_slice`] 做常时间比对，避免 timing attack。
+fn verify_hmac_sha256(key: &[u8], body: &[u8], provided_hex: &str) -> bool {
+    if provided_hex.is_empty() || key.is_empty() {
+        return false;
+    }
+    let expected_bytes = match hex::decode(provided_hex.trim()) {
+        Ok(b) => b,
+        Err(_) => return false,
+    };
+    type HmacSha256 = Hmac<Sha256>;
+    let mut mac = match HmacSha256::new_from_slice(key) {
+        Ok(m) => m,
+        Err(_) => return false,
+    };
+    mac.update(body);
+    mac.verify_slice(&expected_bytes).is_ok()
+}
+
+#[cfg(test)]
+mod hmac_tests {
+    use super::*;
+
+    fn sign(key: &[u8], body: &[u8]) -> String {
+        type HmacSha256 = Hmac<Sha256>;
+        let mut mac = HmacSha256::new_from_slice(key).unwrap();
+        mac.update(body);
+        hex::encode(mac.finalize().into_bytes())
+    }
+
+    #[test]
+    fn verify_accepts_correct_signature() {
+        let key = b"secret_key";
+        let body = b"{\"appId\":\"a\"}";
+        let sig = sign(key, body);
+        assert!(verify_hmac_sha256(key, body, &sig));
+    }
+
+    #[test]
+    fn verify_accepts_uppercase_hex() {
+        let key = b"secret_key";
+        let body = b"x";
+        let sig = sign(key, body).to_uppercase();
+        assert!(verify_hmac_sha256(key, body, &sig));
+    }
+
+    #[test]
+    fn verify_rejects_wrong_signature() {
+        let key = b"secret_key";
+        let body = b"x";
+        let bad = "0".repeat(64);
+        assert!(!verify_hmac_sha256(key, body, &bad));
+    }
+
+    #[test]
+    fn verify_rejects_tampered_body() {
+        let key = b"secret_key";
+        let sig = sign(key, b"original");
+        assert!(!verify_hmac_sha256(key, b"tampered", &sig));
+    }
+
+    #[test]
+    fn verify_rejects_empty_signature() {
+        assert!(!verify_hmac_sha256(b"k", b"x", ""));
+    }
+
+    #[test]
+    fn verify_rejects_non_hex() {
+        assert!(!verify_hmac_sha256(b"k", b"x", "not-a-hex-string!"));
+    }
+
+    #[test]
+    fn verify_rejects_empty_key() {
+        assert!(!verify_hmac_sha256(b"", b"x", &"00".repeat(32)));
+    }
 }

@@ -24,6 +24,7 @@ mod admin_state_policies;
 mod admin_taxonomies;
 mod admin_taxonomy_candidates;
 mod assets;
+mod auth;
 mod contacts;
 mod conversations;
 mod domain_schemas;
@@ -203,6 +204,9 @@ pub struct AppState {
 pub fn api_router(state: AppState) -> Router<AppState> {
     Router::new()
         .route("/health", get(health))
+        .route("/auth/login", post(auth::login))
+        .route("/auth/logout", post(auth::logout))
+        .route("/auth/me", get(auth::me))
         .route("/accounts", get(list_accounts))
         .route("/accounts/sync", post(sync_accounts))
         .route("/accounts/:id/mcp-key", put(update_account_mcp_key))
@@ -702,5 +706,11 @@ pub fn api_router(state: AppState) -> Router<AppState> {
             "/evolution/runtime-flag",
             get(get_evolution_runtime_flag).put(put_evolution_runtime_flag),
         )
+        // P0-D：session middleware 挂在所有 /api 路由上；白名单 /health + /auth/login。
+        // 注意 layer 顺序——middleware 包住所有上面的 route，路径已剥 /api 前缀。
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            crate::auth::middleware::require_session,
+        ))
         .with_state(state)
 }

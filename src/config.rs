@@ -167,6 +167,23 @@ pub struct AppConfig {
     /// 第二 reviewer provider 的协议形态：`openai`（默认，覆盖 OpenAI / DeepSeek /
     /// 兼容路径）/ `anthropic`。与 [`crate::llm::LlmFormat`] 同集合。
     pub reviewer_second_provider_format: String,
+
+    // ── P0 鉴权 / Session ──
+    //
+    // admin SPA 同 origin 走 cookie session；公网部署阻断未登录访问。
+
+    /// session cookie TTL（小时）。默认 168（7 天）。
+    pub session_ttl_hours: i64,
+    /// Set-Cookie 是否带 Secure 属性。生产环境（HTTPS）必须 true；
+    /// 本地开发 (HTTP) 留 false 否则浏览器会拒绝。
+    pub session_cookie_secure: bool,
+    /// 启动 bootstrap：当 admin_users 集合为空时，从这两个 env 创建首个 admin。
+    /// 留空则不 bootstrap（首次部署后建议清空 env）。
+    pub bootstrap_admin_username: Option<String>,
+    pub bootstrap_admin_password: Option<String>,
+    /// webhook 是否校验 HMAC-SHA256(body, MCP_API_KEY) 签名（X-MCP-Signature 头）。
+    /// 生产必须 true；staging/local 测试可以临时关掉。默认 true。
+    pub webhook_verify_signature: bool,
 }
 
 impl AppConfig {
@@ -331,6 +348,15 @@ impl AppConfig {
             reviewer_second_provider_api_key: env::var("REVIEWER_SECOND_PROVIDER_API_KEY").ok(),
             reviewer_second_provider_model: env::var("REVIEWER_SECOND_PROVIDER_MODEL").ok(),
             reviewer_second_provider_format: env_or("REVIEWER_SECOND_PROVIDER_FORMAT", "openai"),
+            session_ttl_hours: env_or("SESSION_TTL_HOURS", "168").parse()?,
+            session_cookie_secure: parse_bool(&env_or("SESSION_COOKIE_SECURE", "false")),
+            bootstrap_admin_username: env::var("BOOTSTRAP_ADMIN_USERNAME")
+                .ok()
+                .filter(|s| !s.trim().is_empty()),
+            bootstrap_admin_password: env::var("BOOTSTRAP_ADMIN_PASSWORD")
+                .ok()
+                .filter(|s| !s.trim().is_empty()),
+            webhook_verify_signature: parse_bool(&env_or("WEBHOOK_VERIFY_SIGNATURE", "true")),
         })
     }
 }
