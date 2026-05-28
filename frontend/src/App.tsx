@@ -7546,7 +7546,7 @@ function focusChunk(chunkId: string) {
   window.dispatchEvent(new CustomEvent("wikiFocusChunk", { detail: { chunkId } }));
 }
 
-// ── G3 · ChunkActionsBar：9 类编辑动作（人工触发） ───────────────────
+// ── G3 · ChunkActionsBar：9 类编辑动作（admin 手工触发） ───────────────────
 // 路由全部为 /api/operation-knowledge/chunks/:id/<action>。AI 永不自动 verify。
 type ChunkActionState = { busy: string | null; error: string | null; info: string | null };
 
@@ -7742,7 +7742,7 @@ function ChunkActionsBar({
       {state.error ? <div className="wikiAlert error">{state.error}</div> : null}
       {state.info ? <div className="wikiAlert info">{state.info}</div> : null}
       <div className="wikiHint">
-        rollback 入口在下方"修订时间轴"。AI 强制 status=draft + integrity_status=needs_review；verify 仅人工触发。
+        rollback 入口在下方"修订时间轴"。AI 强制 status=draft + integrity_status=needs_review；verify 仅 admin 手工触发。
       </div>
     </section>
   );
