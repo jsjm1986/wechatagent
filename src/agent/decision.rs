@@ -534,7 +534,19 @@ pub(crate) async fn decide_reply_with_promote(
     // insufficient_detail_in_critical_turn:*`）。risks 由调用方在
     // `finalize_review_for_send` 阶段消费。
     let raw: RawAgentDecision = serde_json::from_value(value).map_err(AppError::from)?;
-    let (decision, promote_risks) = raw.validate_and_promote(runtime);
+    let (mut decision, mut promote_risks) = raw.validate_and_promote(runtime);
+    // Phase A / A3 收口：把 LLM 输出的 customer_stage / intent_level 与
+    // `system_taxonomies` 严格字典对照（4 路分支：Active 通过 / AliasActive
+    // 改写为 canonical / Deprecated 加 risk / CandidateNew 加 risk + 异步
+    // upsert candidate）。reviewer 在本函数 return 之后才被调用，因此 alias
+    // 改写发生在评审之前，reviewer 看到的是 canonical id。候选 SHALL NOT
+    // 阻塞 Reply Agent —— upsert 是 fire-and-forget。
+    let taxonomy_risks = super::decision_taxonomy::validate_and_normalize_decision(
+        &state.db,
+        &mut decision,
+        &contact.account_id,
+    );
+    promote_risks.extend(taxonomy_risks);
     Ok((decision, promote_risks))
 }
 

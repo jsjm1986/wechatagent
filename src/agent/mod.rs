@@ -26,6 +26,7 @@
 mod budget;
 mod chat_tool_loop;
 mod decision;
+mod decision_taxonomy;
 mod gateway;
 mod guards;
 pub mod knowledge_agent;
