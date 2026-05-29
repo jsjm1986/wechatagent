@@ -425,7 +425,9 @@ async fn collect_inbound_behavior_signals(
 
     for signal in signals {
         let signal_type = signal.signal_type.clone();
-        if let Err(error) = bs::persist_signal(state, signal).await {
+        let result = bs::persist_signal(state, signal).await;
+        bs::record_signal_metric(state, workspace_id, &result).await;
+        if let Err(error) = result {
             tracing::warn!(
                 error = %error,
                 wxid = %wxid,

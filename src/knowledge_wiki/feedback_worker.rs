@@ -44,6 +44,7 @@ async fn run_one_round(state: &AppState) -> anyhow::Result<()> {
             &state.db,
             &ws,
             state.config.dynamic_confidence_min_samples,
+            state.config.dynamic_confidence_real_outcome_enabled,
         )
         .await
         {

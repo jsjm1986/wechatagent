@@ -91,7 +91,10 @@ async fn scan_silence(state: &AppState) -> anyhow::Result<()> {
             now,
         );
         // 幂等落库：dedupe_key 撞索引 → persist_signal 返回 Ok(false)，不计 emit。
-        match behavior_signals::persist_signal(state, signal).await {
+        let workspace_id = contact.workspace_id.clone();
+        let result = behavior_signals::persist_signal(state, signal).await;
+        behavior_signals::record_signal_metric(state, &workspace_id, &result).await;
+        match result {
             Ok(true) => emitted += 1,
             Ok(false) => {}
             Err(error) => {

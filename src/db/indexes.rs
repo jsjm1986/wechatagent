@@ -176,6 +176,17 @@ pub(super) async fn ensure_all(db: &Database) -> anyhow::Result<()> {
             None,
         )
         .await?;
+    // P3 采集健康度：behavior_signal_metrics 每日每 workspace 三态计数聚合。
+    //   `_id="{workspace_id}:{date}"` 已天然唯一（$inc upsert 幂等），无需额外 unique；
+    //   仅加 `(workspace_id, date desc)` 供 REST 端点按时间倒序拉近期健康度。
+    db.behavior_signal_metrics()
+        .create_index(
+            IndexModel::builder()
+                .keys(doc! { "workspace_id": 1, "date": -1 })
+                .build(),
+            None,
+        )
+        .await?;
     db.content_assets()
         .create_index(
             IndexModel::builder()

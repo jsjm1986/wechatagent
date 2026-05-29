@@ -347,7 +347,7 @@ pub(crate) fn compute_reviewer_misjudge_signal(
     }
 }
 
-fn is_negative_outcome(outcome: &str) -> bool {
+pub(crate) fn is_negative_outcome(outcome: &str) -> bool {
     matches!(
         outcome,
         "user_replied_objection"

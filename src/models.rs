@@ -264,7 +264,9 @@ pub struct BehaviorSignal {
     pub contact_wxid: String,
     /// `"reply_latency"` | `"reply_length"` | `"reactivation"` | `"silence"`。
     pub signal_type: String,
-    /// 系统观察到该信号的时间。
+    /// 信号的**事实发生时刻**（`event_time`）——观察到的客观事件何时发生。
+    /// 与 [`Self::ingest_time`]（落库时刻）配对：未来训练样本必须按 `event_time`
+    /// 切片防 label leakage（成交是延迟事件），而非按写入时刻。语义不改名以避免迁移。
     pub observed_at: DateTime,
     /// 信号来源；系统观察恒 `"system_observed"`。
     pub source: String,
@@ -297,6 +299,41 @@ pub struct BehaviorSignal {
     /// reactivation：久未联系后重新入站的时间。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reactivated_at: Option<DateTime>,
+    /// 写入 DB 的时刻（`ingest_time`），与 [`Self::observed_at`]（`event_time`）配对。
+    /// P2 双时间戳：训练时按 `observed_at` 切片防 label leakage，`ingest_time` 仅供
+    /// 数据工程审计（采集延迟 / 回填识别）。旧文档缺此字段 `#[serde(default)]` 回落 None（R11）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ingest_time: Option<DateTime>,
+}
+
+/// P3 采集健康度：行为信号采集管道的**计数落库**（Data Cascades 教训：
+/// best-effort 旁路若只 warn，管道挂了无感知）。
+///
+/// `_id` 形如 `"{workspace_id}:{date}"`（镜像 [`AgentOutcomeMetric`] 的聚合幂等模式），
+/// 每天每 workspace 一行，`$inc` 累加三态计数 + `$set` 时间戳。三指标
+/// （Monte Carlo 数据可观测性子集）：
+/// - **新鲜度**：`last_success_at`（最近一次成功写入）；
+/// - **量**：`persisted`（真正落库条数，对历史基线判跌量）；
+/// - **失败率**：`errors` / `dedupe_skipped`（去重撞键 vs 真失败分开计）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BehaviorSignalMetric {
+    #[serde(rename = "_id")]
+    pub id: String,
+    pub workspace_id: String,
+    pub date: String,
+    /// 真正写入 DB 的信号条数（`persist_signal` 返回 `Ok(true)`）。
+    #[serde(default)]
+    pub persisted: i64,
+    /// 撞 dedupe partial unique 索引被幂等跳过的条数（`Ok(false)`）——正常现象，非失败。
+    #[serde(default)]
+    pub dedupe_skipped: i64,
+    /// 真失败条数（`persist_signal` 返回 `Err`）——管道健康度告警依据。
+    #[serde(default)]
+    pub errors: i64,
+    /// 最近一次成功写入时刻（新鲜度指标；长时间不更新 = 采集断流）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_success_at: Option<DateTime>,
+    pub updated_at: DateTime,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

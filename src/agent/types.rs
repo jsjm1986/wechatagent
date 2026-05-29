@@ -1118,6 +1118,12 @@ pub struct SelectedChunkRanking {
     /// 排序来源标记（如 `"fallback_rank"` / `"tool_loop"`），便于区分召回路径。
     #[serde(default)]
     pub source: String,
+    /// P4 探索注入：该 chunk 在本次抽样下**被选中的概率**（propensity）。
+    /// 确定性 top-k 模式下为 `None`（等价 1.0，无探索）；探索模式（softmax/ε）
+    /// 下记录抽样概率。**本阶段只记录不消费**——为路线图的 IPS/DR off-policy
+    /// 纠偏留数据（确定性日志 propensity 非 0 即 1，不补探索则一切 off-policy 非法）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selection_prob: Option<f64>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Default, Clone)]

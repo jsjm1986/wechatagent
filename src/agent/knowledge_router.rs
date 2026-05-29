@@ -444,7 +444,20 @@ pub(crate) async fn route_operation_knowledge(
     // 在已加载的 verified corpus 上做静态排序，取 top-N 作为弱证据回填，避免下游
     // grounding 闸直接 missing。回填时显式标 `risk_level=medium` 与 tool_trace
     // `fallback=rank`，让 Reply Agent / 审计感知"这是弱兜底而非 agent 推理结果"。
+    // fallback_rank：当 agent 在预算内未给出 cited（budget 早早耗尽 / 3 轮兜底空集
+    // / agent 显式返回 0 cited）时，按 `wiki_type_priority × dynamic_confidence`
+    // 在已加载的 verified corpus 上做静态排序，取 top-N 作为弱证据回填，避免下游
+    // grounding 闸直接 missing。回填时显式标 `risk_level=medium` 与 tool_trace
+    // `fallback=rank`，让 Reply Agent / 审计感知"这是弱兜底而非 agent 推理结果"。
+    //
+    // P4 探索注入（flag-gated，默认关）：当 `KNOWLEDGE_EXPLORATION_ENABLED` 开且
+    // 候选池 > top-N 时，不再硬取确定性 top-N，而是按 softmax(score/温度) 在**同一
+    // verified 池**内不放回抽样，并记录每个被选 chunk 的 propensity（selection_prob）。
+    // 探索只作用于此 fallback 排序路径——agent 显式 cited 路径完全不碰；候选池仍是
+    // 预过滤的 verified chunks，grounding/FactRisk 硬门在下游照常执行，红线零破坏。
+    // 本阶段只记录 propensity 不消费（为路线图的 IPS/DR 留数据）。
     const FALLBACK_TOP_N: usize = 5;
+    let mut fallback_probs: Option<std::collections::HashMap<String, f64>> = None;
     let (selected_chunk_ids, knowledge_coverage, risk_level) = if cited_in_corpus.is_empty() {
         let mut ranked: Vec<&OperationKnowledgeChunk> = knowledge.chunks.iter().collect();
         ranked.sort_by(|a, b| {
@@ -455,11 +468,36 @@ pub(crate) async fn route_operation_knowledge(
             pb.cmp(&pa)
                 .then_with(|| cb.partial_cmp(&ca).unwrap_or(std::cmp::Ordering::Equal))
         });
-        let fallback_ids: Vec<String> = ranked
-            .iter()
-            .take(FALLBACK_TOP_N)
-            .filter_map(|c| c.id.map(|oid| oid.to_hex()))
-            .collect();
+        let explore = state.config.knowledge_exploration_enabled && ranked.len() > FALLBACK_TOP_N;
+        let fallback_ids: Vec<String> = if explore {
+            let scores: Vec<f64> = ranked
+                .iter()
+                .map(|c| {
+                    let priority =
+                        super::knowledge_agent::wiki_type_priority(c.wiki_type.as_deref());
+                    priority as f64 * c.dynamic_confidence.unwrap_or(0.0)
+                })
+                .collect();
+            let probs = softmax_probs(&scores, state.config.knowledge_exploration_temperature);
+            let picked = sample_k_without_replacement(&probs, FALLBACK_TOP_N, fastrand::f64);
+            let mut prob_map = std::collections::HashMap::new();
+            let ids: Vec<String> = picked
+                .iter()
+                .filter_map(|&i| {
+                    let id = ranked[i].id.map(|oid| oid.to_hex())?;
+                    prob_map.insert(id.clone(), probs.get(i).copied().unwrap_or(0.0));
+                    Some(id)
+                })
+                .collect();
+            fallback_probs = Some(prob_map);
+            ids
+        } else {
+            ranked
+                .iter()
+                .take(FALLBACK_TOP_N)
+                .filter_map(|c| c.id.map(|oid| oid.to_hex()))
+                .collect()
+        };
         if fallback_ids.is_empty() {
             // corpus 也空 — 维持 missing。
             (Vec::new(), "missing".to_string(), "medium".to_string())
@@ -468,6 +506,7 @@ pub(crate) async fn route_operation_knowledge(
                 "tool": "fallback_rank",
                 "reason": "agent_returned_zero_cited",
                 "selected": fallback_ids.len() as i32,
+                "explored": explore,
             });
             (fallback_ids, "weak".to_string(), "medium".to_string())
         }
@@ -490,11 +529,13 @@ pub(crate) async fn route_operation_knowledge(
         tool_trace,
         evidence_excerpts,
         // S4：召回倾向占位。rank = 选中顺序，score = wiki_type_priority ×
-        // dynamic_confidence，pool_size = 已加载候选 chunk 数。本阶段只采集。
+        // dynamic_confidence，pool_size = 已加载候选 chunk 数。
+        // P4：探索抽样时 selection_prob 记录每个被选 chunk 的 softmax 概率（propensity）。
         selected_chunk_rankings: build_chunk_rankings(
             &selected_chunk_ids,
             &knowledge.chunks,
             "tool_loop",
+            fallback_probs.as_ref(),
         ),
     };
     Ok(route)
@@ -506,10 +547,15 @@ pub(crate) async fn route_operation_knowledge(
 /// `score` 取 `wiki_type_priority × dynamic_confidence`（与排序键同源，缺
 /// dynamic_confidence 时按 0.0）；`pool_size` 统一取候选 chunk 池大小，作为未来
 /// 计算 propensity 的分母基数。未在 corpus 中找到的 id 跳过（不杜撰快照）。
+///
+/// P4 探索：`probs` 给定时（探索抽样路径），按 chunk_id 取出该 chunk 的 softmax
+/// 选中概率写入 `selection_prob`；为 `None`（确定性 top-k）时 `selection_prob=None`
+/// （等价 propensity=1.0，无探索）。
 pub(crate) fn build_chunk_rankings(
     selected_ids: &[String],
     chunks: &[OperationKnowledgeChunk],
     source: &str,
+    probs: Option<&std::collections::HashMap<String, f64>>,
 ) -> Vec<SelectedChunkRanking> {
     let pool_size = chunks.len();
     selected_ids
@@ -528,9 +574,72 @@ pub(crate) fn build_chunk_rankings(
                 score: priority as f64 * confidence,
                 pool_size,
                 source: source.to_string(),
+                selection_prob: probs.and_then(|m| m.get(id).copied()),
             })
         })
         .collect()
+}
+
+/// P4 探索：对一组排序分做带温度的 softmax（纯函数，可单测）。
+///
+/// 数值稳定：先减去最大值再 exp。`temperature<=0` 视为退化（夹到极小正数，
+/// 趋近 argmax）。归一后概率和恒 ≈ 1；当 exp 全下溢/非有限时回落**均匀分布**
+/// （绝不返回 NaN/全 0，否则下游抽样会卡死）。空输入返回空。
+pub(crate) fn softmax_probs(scores: &[f64], temperature: f64) -> Vec<f64> {
+    let n = scores.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    let temp = if temperature <= 0.0 { 1e-6 } else { temperature };
+    let max = scores.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    if !max.is_finite() {
+        let u = 1.0 / n as f64;
+        return vec![u; n];
+    }
+    let exps: Vec<f64> = scores.iter().map(|s| ((s - max) / temp).exp()).collect();
+    let sum: f64 = exps.iter().sum();
+    if !sum.is_finite() || sum <= 0.0 {
+        let u = 1.0 / n as f64;
+        return vec![u; n];
+    }
+    exps.iter().map(|e| e / sum).collect()
+}
+
+/// P4 探索：按概率 `probs` 从 `0..probs.len()` 不放回抽 `k` 个下标（纯函数，可单测）。
+///
+/// `draw` 是 `[0,1)` 取数器（生产传 `fastrand::f64`，测试传确定序列）。每步在
+/// 剩余项上按当前权重做轮盘赌选择，选中即移出（不放回）。`k >= n` 时返回全部。
+/// 剩余权重全 0（退化）时退回按顺序取剩余项，保证恒返回 `min(k,n)` 个不重复下标。
+pub(crate) fn sample_k_without_replacement(
+    probs: &[f64],
+    k: usize,
+    mut draw: impl FnMut() -> f64,
+) -> Vec<usize> {
+    let n = probs.len();
+    let k = k.min(n);
+    let mut remaining: Vec<usize> = (0..n).collect();
+    let mut out = Vec::with_capacity(k);
+    for _ in 0..k {
+        let total: f64 = remaining.iter().map(|&i| probs[i].max(0.0)).sum();
+        let chosen_pos = if !total.is_finite() || total <= 0.0 {
+            0
+        } else {
+            let r = draw().clamp(0.0, 1.0) * total;
+            let mut acc = 0.0;
+            let mut pos = remaining.len() - 1;
+            for (idx, &i) in remaining.iter().enumerate() {
+                acc += probs[i].max(0.0);
+                if r < acc {
+                    pos = idx;
+                    break;
+                }
+            }
+            pos
+        };
+        out.push(remaining[chosen_pos]);
+        remaining.remove(chosen_pos);
+    }
+    out
 }
 
 pub(crate) fn empty_knowledge_route(planner: &RunPlannerResult) -> KnowledgeRouteResult {
@@ -798,6 +907,104 @@ mod tests {
         assert!(!s.contains("【产品事实 product_fact】"));
         assert!(!s.contains("【同行案例 peer_case】"));
         assert!(!s.contains("【反例 negative_example】"));
+    }
+
+    // ---- P4 探索注入：softmax + 不放回抽样 + propensity 记录 ----
+
+    #[test]
+    fn softmax_probs_normalizes_to_one() {
+        let p = softmax_probs(&[1.0, 2.0, 3.0], 1.0);
+        let sum: f64 = p.iter().sum();
+        assert!((sum - 1.0).abs() < 1e-9, "概率和必须≈1，got {sum}");
+        // 分越高概率越大（单调）。
+        assert!(p[2] > p[1] && p[1] > p[0]);
+    }
+
+    #[test]
+    fn softmax_low_temperature_sharpens_toward_argmax() {
+        // 温度→0 时趋近 argmax：最大分项概率接近 1。
+        let p = softmax_probs(&[1.0, 5.0], 0.01);
+        assert!(p[1] > 0.99, "低温应锐化到 argmax，got {p:?}");
+    }
+
+    #[test]
+    fn softmax_handles_empty_and_nonfinite() {
+        assert!(softmax_probs(&[], 1.0).is_empty());
+        // 全 -inf（非有限 max）→ 回落均匀分布，不返回 NaN。
+        let p = softmax_probs(&[f64::NEG_INFINITY, f64::NEG_INFINITY], 1.0);
+        assert_eq!(p.len(), 2);
+        assert!((p[0] - 0.5).abs() < 1e-9 && (p[1] - 0.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn sample_k_returns_distinct_indices() {
+        // 确定性 draw 序列：每次取 0.0 → 总是选剩余里第一个轮盘命中项。
+        let probs = vec![0.25, 0.25, 0.25, 0.25];
+        let mut seq = [0.0, 0.0, 0.0].into_iter();
+        let picked = sample_k_without_replacement(&probs, 3, || seq.next().unwrap_or(0.0));
+        assert_eq!(picked.len(), 3, "必须抽够 k 个");
+        let unique: std::collections::HashSet<_> = picked.iter().collect();
+        assert_eq!(unique.len(), 3, "不放回：下标不得重复");
+    }
+
+    #[test]
+    fn sample_k_caps_at_pool_size() {
+        // k > n → 返回全部 n 个不重复下标。
+        let probs = vec![0.5, 0.5];
+        let picked = sample_k_without_replacement(&probs, 5, || 0.3);
+        assert_eq!(picked.len(), 2);
+        let unique: std::collections::HashSet<_> = picked.iter().collect();
+        assert_eq!(unique.len(), 2);
+    }
+
+    #[test]
+    fn sample_k_degenerate_zero_weights_still_returns_k() {
+        // 全 0 权重（退化）→ 不死循环，按顺序回退取剩余项。
+        let probs = vec![0.0, 0.0, 0.0];
+        let picked = sample_k_without_replacement(&probs, 2, || 0.7);
+        assert_eq!(picked.len(), 2);
+        let unique: std::collections::HashSet<_> = picked.iter().collect();
+        assert_eq!(unique.len(), 2);
+    }
+
+    #[test]
+    fn selection_prob_none_in_deterministic_mode() {
+        // 确定性 top-k（probs=None）：selection_prob 必须 None（等价 propensity=1.0）。
+        let c = mk_chunk("t", "product_fact");
+        let id = c.id.unwrap().to_hex();
+        let rankings = build_chunk_rankings(&[id], &[c], "tool_loop", None);
+        assert_eq!(rankings.len(), 1);
+        assert_eq!(rankings[0].selection_prob, None);
+    }
+
+    #[test]
+    fn selection_prob_recorded_in_exploration_mode() {
+        // 探索模式：传入 prob_map → selection_prob 记录该 chunk 的概率。
+        let c = mk_chunk("t", "product_fact");
+        let id = c.id.unwrap().to_hex();
+        let mut probs = std::collections::HashMap::new();
+        probs.insert(id.clone(), 0.42);
+        let rankings = build_chunk_rankings(&[id], &[c], "tool_loop", Some(&probs));
+        assert_eq!(rankings[0].selection_prob, Some(0.42));
+    }
+
+    #[test]
+    fn selection_prob_omitted_when_none_serializes_clean() {
+        // R11：确定性模式 selection_prob=None，skip_serializing_if 不落该字段。
+        let r = SelectedChunkRanking {
+            chunk_id: "x".to_string(),
+            rank: 0,
+            score: 1.0,
+            pool_size: 3,
+            source: "tool_loop".to_string(),
+            selection_prob: None,
+        };
+        let doc = mongodb::bson::to_document(&r).expect("serialize ranking");
+        assert!(!doc.contains_key("selectionProb"), "None 时不应落 selectionProb");
+        // 反序列化缺字段回落 None（兼容旧文档）。
+        let back: SelectedChunkRanking =
+            mongodb::bson::from_document(doc).expect("deserialize ranking");
+        assert_eq!(back.selection_prob, None);
     }
 }
 

@@ -25,6 +25,7 @@ mod admin_taxonomies;
 mod admin_taxonomy_candidates;
 mod assets;
 mod auth;
+mod behavior_signal_metrics;
 pub mod chunk_locks;
 mod contacts;
 mod conversations;
@@ -162,6 +163,7 @@ use knowledge::{
 use management::{
     create_management_session, get_management_command, get_tool_catalog, post_management_message,
 };
+use behavior_signal_metrics::list_behavior_signal_metrics;
 use lessons_learned::{list_lessons_learned, promote_lesson_to_peer_case};
 use observability::{phase_rollup, worker_health};
 use outcome_metrics::list_agent_outcome_metrics;
@@ -544,6 +546,10 @@ pub fn api_router(state: AppState) -> Router<AppState> {
         .route("/decision-reviews", get(list_decision_reviews))
         .route("/decision-reviews/:id", get(get_decision_review))
         .route("/agent-outcome-metrics", get(list_agent_outcome_metrics))
+        .route(
+            "/behavior-signal-metrics",
+            get(list_behavior_signal_metrics),
+        )
         .route("/outcomes/autonomy", get(get_autonomy_outcomes))
         .route(
             "/outcomes/autonomy/revisions",
@@ -798,6 +804,7 @@ mod tests {
             include_str!("admin_taxonomy_candidates.rs"),
             include_str!("assets.rs"),
             include_str!("auth.rs"),
+            include_str!("behavior_signal_metrics.rs"),
             include_str!("chunk_locks.rs"),
             include_str!("contacts.rs"),
             include_str!("conversations.rs"),

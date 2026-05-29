@@ -403,6 +403,47 @@ WechatAgent 自第二阶段起内置可选的"自我演化"后台 worker（`src/
 - 不换 hit 信号（仍是 reviewer 自评）；不做 IPW 加权；不做 PU learning / 延迟反馈归因；不做 bandit 探索。
 - 不上贝叶斯收缩；不引入任何"人工接管"语义；新功能不改部署拓扑。
 
+## 自学习采集管道（第二阶段，换标签 + 探索注入）
+
+第一阶段铺好了采集底座，但 `dynamic_confidence` 的 hit 信号仍取 reviewer 自评（`review_approved`）——学的是"reviewer 喜欢哪些 chunk"，不是"哪些 chunk 让用户正反应"。第二阶段的核心立场：**换标签，不换估计器**。真实 reward 信号（用户反应）其实已在库（`AgentDecisionReview.outcome_status`，由 `reaction_analysis` 写），只是 Loop 1 没读它。本阶段把它读进来，并补上确定性日志缺的探索维度。
+
+### P1 · dynamic_confidence 换血（默认开启）
+
+- `refresh_usage_stats_and_confidence` 的 hit/block 统计，从 `KnowledgeUsageLog.review_approved` 改为按 `run_id` join `AgentDecisionReview.outcome_status`（真实用户反应）。
+- 新标签纯函数 `classify_outcome_label`（`gap_signals.rs`，可单测）：
+  - `user_replied_buying_signal` → **Hit**
+  - 负向集（objection / stop_requested / unsubscribed / negative / complaint，复用 `reaction::is_negative_outcome` 单一真相源）→ **Block**
+  - `None` / `pending` / `""` / `unclassified` / 无反应 → **Censored**（删失，既不进 hit 也不进 block 分母）
+- **删失语义**：只有"用户确有明确正/负反应"才计入分母——这是右删失处理，杜绝把沉默当负例（铁律 ②）。
+- `compute_dynamic_confidence` 公式本体不动（`base×0.6 + hit_rate×0.4 - stale_penalty` + S7 最小样本门），只换喂进去的 `h`/`b` 来源。
+- **flag `DYNAMIC_CONFIDENCE_REAL_OUTCOME_ENABLED`（默认 true）**：旧逻辑每天都在把 reviewer 偏好喂回召回，换血即止血；置 false 可逐字节退回 `review_approved` 旧统计，一键回滚。
+- **诚实定级**：信号从 T3（reviewer 自评）升到 T2（LLM 分类的真实用户回复），是真实改进，但仍非 T0 成交（`deal_events` 手动标记仍是唯一 T0）。
+
+### P2 · BehaviorSignal 双时间戳
+
+- `BehaviorSignal` 加 `ingest_time: Option<DateTime>`（落库时刻）；现有 `observed_at` 语义固定为 **event_time**（事实发生时刻，不改名避免迁移）。
+- 防 label leakage：成交是延迟事件，未来训练样本须按 event_time 切片，而非写入时刻。
+- R11：`Option` + `#[serde(default)]`，旧文档缺字段回落 None，零迁移。不重构 episode（run_id 锚归路线图）。
+
+### P3 · 采集健康度计数（默认关）
+
+- 第一阶段"失败只 warn"导致管道挂了无感知。本阶段把 `persist_signal` 的三态返回（`Ok(true)` 写入 / `Ok(false)` 去重 / `Err` 失败）按天聚合落库。
+- 新 collection `behavior_signal_metrics`，幂等 `_id = "{workspace_id}:{date}"`（镜像 `AgentOutcomeMetric` 聚合模式）：`persisted` / `dedupe_skipped` / `errors` / `last_success_at`。三指标 = 新鲜度 / 量 / 失败率。
+- 聚合走 webhook 采集点 + silence worker tick（`$inc` 累加，best-effort 不阻断）。
+- **flag `BEHAVIOR_SIGNAL_METRICS_ENABLED`（默认 false）**；只读 REST `GET /api/behavior-signal-metrics`（镜像 `outcome_metrics`，按 workspace 隔离）。
+
+### P4 · 知识召回探索注入 + propensity 记录（默认关）
+
+- 把确定性 top-k 召回改成 **top-k 内**的受控随机（softmax over score / temperature），并**决策时记录每个 chunk 被选中的概率**——这是未来一切 off-policy 纠偏（IPS/DR）合法的唯一前提。确定性日志（propensity 非 0 即 1）判了标准 IPS 的死刑，不补探索没有纠偏方法合法。
+- **探索范围严格受限**：只作用于 fallback 排序路径（`knowledge_router` 的 `fallback_rank`），agent 显式 cited chunks 路径不动；候选池仍是预过滤的 **verified 池**，探索只在已过 grounding 的集合内重排/抽样。FactRisk / ProductAccuracy / grounding 硬门在探索之后照常执行——探索**绝不**让未验证知识进入。
+- `SelectedChunkRanking` 加 `selection_prob: Option<f64>`（本次抽样下被选中的概率；确定性模式 = None）；随 `route_result` 自动落进 `knowledge_usage_log`。
+- **flag `KNOWLEDGE_EXPLORATION_ENABLED`（默认 false）** + `KNOWLEDGE_EXPLORATION_TEMPERATURE`（默认 1.0）。**本阶段只记录 propensity，不消费**（IPS/DR 见路线图）。
+
+### 第二阶段明确不做（解锁前提见 plan 路线图）
+
+- 不消费 propensity（IPS/DR/OPE）；不做 PU learning / MNAR 校正 / 延迟反馈建模；不做弱监督融合；不做安全策略改进闸（HCPI/SPIBB）。
+- 不重构 episode 锚（run_id 关联留路线图）；不上贝叶斯收缩；不引入任何"人工接管"语义。
+
 ## 知识库日报工作站（knowledge-digest-workstation）
 
 WechatAgent 把"知识库 = AI agent"落到产品形态：chat 是主入口、画布是当日工作台、目录树是索引。完整 spec 见 `.kiro/specs/knowledge-digest-workstation/`。本节说明它**做什么、不做什么、如何被运营消费**。

@@ -455,6 +455,39 @@ pub async fn persist_signals(
     Ok(report)
 }
 
+/// 换血标签：把一条 usage_log 对应的**真实用户反应**映射成三态。
+///
+/// 病根（镜厅效应）是 hit 信号取 reviewer 自评（`review_approved`），系统学的是
+/// "reviewer 喜欢哪些 chunk"而非"哪些 chunk 让用户正反应"。换血即把信号源从
+/// reviewer 自评换成按 `run_id` join 出来的 `AgentDecisionReview.outcome_status`。
+///
+/// 三态语义（Iron Law ②：沉默 = 删失，绝不当负例）：
+/// - `Hit`：用户确有正向反应（购买信号）→ 计入 hit 分子；
+/// - `Block`：用户确有负向反应（异议/止/退订/投诉/负面）→ 计入 block；
+/// - `Censored`：沉默 / 无反应 / `pending` / 空 / 含义不明 → **删失**，既不进
+///   hit 也不进 block —— 分母只含"用户确有明确反应"的样本。
+///
+/// 负向集合复用 [`crate::agent::is_negative_outcome`]，保持单一真相源。
+pub fn classify_outcome_label(outcome_status: Option<&str>) -> OutcomeLabel {
+    match outcome_status {
+        Some("user_replied_buying_signal") => OutcomeLabel::Hit,
+        Some(s) if crate::agent::is_negative_outcome(s) => OutcomeLabel::Block,
+        // None / "pending" / "" / user_replied_unclassified / 其它 → 删失（不臆测）。
+        _ => OutcomeLabel::Censored,
+    }
+}
+
+/// [`classify_outcome_label`] 的三态结果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutcomeLabel {
+    /// 用户确有正向反应 → hit 分子。
+    Hit,
+    /// 用户确有负向反应 → block。
+    Block,
+    /// 删失：沉默 / 无反应 / pending / 含义不明 → 不进任何分母。
+    Censored,
+}
+
 /// 30 天滑窗 hit/blocked 统计回写 `usage_stats`，并按朴素公式写 `dynamic_confidence`。
 ///
 /// 公式（见 design.md §6.2）：
@@ -469,10 +502,17 @@ pub async fn persist_signals(
 ///
 /// S7 止血：`min_samples` 控制信 hit_rate 所需的最小样本数（hits+blocks）。
 /// 低于此值时 dynamic_confidence 只用 base（详见 [`compute_dynamic_confidence`]）。
+///
+/// **换血（P1）**：`real_outcome_enabled=true`（默认）时，hit/block 不再取
+/// reviewer 自评 `review_approved`，而是按 `run_id` join `AgentDecisionReview`
+/// 的真实用户反应 `outcome_status`，经 [`classify_outcome_label`] 三态判定：
+/// 正向→hit、负向→block、沉默/pending/无反应→删失排除（不进任何分母）。
+/// `false`（回滚）时逐字节退回旧 `review_approved` 逻辑。公式本体不变。
 pub async fn refresh_usage_stats_and_confidence(
     db: &Database,
     workspace_id: &str,
     min_samples: u64,
+    real_outcome_enabled: bool,
 ) -> Result<UsageStatsReport, AppError> {
     use mongodb::bson::Bson;
     let now = DateTime::now();
@@ -493,20 +533,79 @@ pub async fn refresh_usage_stats_and_confidence(
     let logs: Vec<crate::models::KnowledgeUsageLog> =
         cursor.try_collect().await.map_err(AppError::from)?;
 
+    // 换血：按本批 logs 的 run_id 批量拉 decision_reviews，建 run_id → outcome_status map。
+    // 关闭（回滚）时跳过这次 join，省一次查询。
+    let outcome_by_run: HashMap<String, Option<String>> = if real_outcome_enabled {
+        let run_ids: Vec<String> = logs
+            .iter()
+            .map(|l| l.run_id.clone())
+            .filter(|r| !r.is_empty())
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect();
+        if run_ids.is_empty() {
+            HashMap::new()
+        } else {
+            let review_cursor = db
+                .decision_reviews()
+                .find(doc! { "run_id": { "$in": &run_ids } }, None)
+                .await
+                .map_err(AppError::from)?;
+            let reviews: Vec<crate::models::AgentDecisionReview> =
+                review_cursor.try_collect().await.map_err(AppError::from)?;
+            let mut map: HashMap<String, Option<String>> = HashMap::new();
+            for review in reviews {
+                if let Some(rid) = review.run_id {
+                    map.insert(rid, review.outcome_status);
+                }
+            }
+            map
+        }
+    } else {
+        HashMap::new()
+    };
+
     let mut hit: HashMap<String, u32> = HashMap::new();
     let mut blocked: HashMap<String, u32> = HashMap::new();
     let mut last_used: HashMap<String, DateTime> = HashMap::new();
     let mut last_block_reason: HashMap<String, String> = HashMap::new();
 
     for log in logs {
+        // 换血：真实用户反应三态；删失（Censored）整条 log 跳过 hit/block 统计，
+        // 但仍参与 last_used 记账（chunk 确实被召回过）。回滚时退回 reviewer 自评。
+        let label = if real_outcome_enabled {
+            let outcome = outcome_by_run
+                .get(&log.run_id)
+                .and_then(|o| o.as_deref());
+            Some(classify_outcome_label(outcome))
+        } else {
+            None
+        };
         for oid in &log.knowledge_ids {
             let key = oid.to_hex();
-            if log.review_approved {
-                *hit.entry(key.clone()).or_default() += 1;
-            } else {
-                *blocked.entry(key.clone()).or_default() += 1;
-                if let Some(reason) = log.blocked_reason.clone() {
-                    last_block_reason.insert(key.clone(), reason);
+            match label {
+                Some(OutcomeLabel::Hit) => {
+                    *hit.entry(key.clone()).or_default() += 1;
+                }
+                Some(OutcomeLabel::Block) => {
+                    *blocked.entry(key.clone()).or_default() += 1;
+                    if let Some(reason) = log.blocked_reason.clone() {
+                        last_block_reason.insert(key.clone(), reason);
+                    }
+                }
+                Some(OutcomeLabel::Censored) => {
+                    // 删失：不计 hit 也不计 block，只走下面的 last_used 记账。
+                }
+                None => {
+                    // 回滚路径：逐字节退回旧 reviewer 自评逻辑。
+                    if log.review_approved {
+                        *hit.entry(key.clone()).or_default() += 1;
+                    } else {
+                        *blocked.entry(key.clone()).or_default() += 1;
+                        if let Some(reason) = log.blocked_reason.clone() {
+                            last_block_reason.insert(key.clone(), reason);
+                        }
+                    }
                 }
             }
             let entry = last_used.entry(key).or_insert(log.created_at);
@@ -1209,5 +1308,60 @@ mod tests {
             None::<&str>,
         );
         assert_eq!(a.dedup_key(), b.dedup_key());
+    }
+
+    // ---- P1 换血：classify_outcome_label 三态判定 ----
+
+    #[test]
+    fn classify_buying_signal_is_hit() {
+        assert_eq!(
+            classify_outcome_label(Some("user_replied_buying_signal")),
+            OutcomeLabel::Hit
+        );
+    }
+
+    #[test]
+    fn classify_negative_outcomes_are_block() {
+        // 复用 reaction.rs 的负向集合：异议 / 止 / 退订 / 负面 / 投诉。
+        for s in [
+            "user_replied_objection",
+            "user_replied_stop_requested",
+            "user_replied_unsubscribed",
+            "user_replied_negative",
+            "user_replied_complaint",
+        ] {
+            assert_eq!(
+                classify_outcome_label(Some(s)),
+                OutcomeLabel::Block,
+                "{s} 应判为 Block"
+            );
+        }
+    }
+
+    #[test]
+    fn classify_silence_and_pending_are_censored() {
+        // Iron Law ②：沉默 / 无反应 / pending / 空 / 含义不明 → 删失（不进任何分母）。
+        assert_eq!(classify_outcome_label(None), OutcomeLabel::Censored);
+        assert_eq!(classify_outcome_label(Some("")), OutcomeLabel::Censored);
+        assert_eq!(classify_outcome_label(Some("pending")), OutcomeLabel::Censored);
+        assert_eq!(
+            classify_outcome_label(Some("user_replied_unclassified")),
+            OutcomeLabel::Censored
+        );
+        // 未知/未来枚举值同样删失，不臆测成 hit 或 block。
+        assert_eq!(
+            classify_outcome_label(Some("some_future_status")),
+            OutcomeLabel::Censored
+        );
+    }
+
+    #[test]
+    fn censored_never_counts_as_block() {
+        // 回归门：删失绝不能滑成负例（这正是镜厅/把沉默当负例的病根）。
+        assert_ne!(classify_outcome_label(None), OutcomeLabel::Block);
+        assert_ne!(
+            classify_outcome_label(Some("pending")),
+            OutcomeLabel::Block
+        );
     }
 }

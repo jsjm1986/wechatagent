@@ -289,6 +289,9 @@ apply_chunk_revision (src/knowledge_wiki/chunk_revisions.rs)
 
 [feedback_worker]                                         默认每 600s 一轮
   ├─ 1. 30d 滑窗聚合 knowledge_usage_logs → 每 chunk usage_stats.{hit,blocked}_count_30d
+  │     hit/block 标签默认取真实用户反应：按 run_id join decision_reviews.outcome_status
+  │     （buying_signal→hit，负向集→block，沉默/pending/unclassified→删失排除，不进分母）。
+  │     DYNAMIC_CONFIDENCE_REAL_OUTCOME_ENABLED=false 时退回 review_approved 旧统计。
   ├─ 2. dynamic_confidence = clamp(integrity × 0.6 + hit_rate × 0.4 - stale_penalty, 0, 1)
   ├─ 3. structural lint（纯查询，无 LLM）：5 类规则信号
   │     orphan / broken_link / no_outlinks / low_confidence / stale
@@ -308,6 +311,8 @@ fire-and-forget: knowledge_wiki::gap_signals::record_chunk_hit
      $set last_used_at / last_blocked_reason
   注意：不阻塞 reply 返回；失败 ignore（`let _ = ...`）
 ```
+
+**可选探索注入（KNOWLEDGE_EXPLORATION_ENABLED，默认 false）**：fallback 排序路径（非 agent cited 路径）在 verified 池内、top-k 之上做 softmax(score/temperature) 受控抽样，并把每个 chunk 的 selection_prob 落进 route_result → knowledge_usage_log，为未来 off-policy 纠偏（IPS/DR）留 propensity。探索只重排已过 grounding 的 verified 集合，FactRisk/ProductAccuracy/grounding 硬门在其后照常执行；本阶段只记录不消费。
 
 ### 隔离红线（CI 守门）
 
@@ -390,7 +395,10 @@ tokio::spawn 主进程内 9 条 loop（启停由 env / mongo flag 控制）：
 4. evolution::worker（EVOLUTION_ENABLED=true 时启）  threshold / prompt 灰度 + post_release
 5. knowledge_wiki::feedback_worker      30d 滑窗 usage_stats / dynamic_confidence + structural lint
                                         + sweep_stale_signals + lessons_learned 14d 聚合
-                                        （dynamic_confidence 带最小样本门 DYNAMIC_CONFIDENCE_MIN_SAMPLES）
+                                        （dynamic_confidence 带最小样本门 DYNAMIC_CONFIDENCE_MIN_SAMPLES；
+                                         hit/block 标签默认取真实用户反应 outcome_status，按 run_id join
+                                         decision_reviews，沉默删失排除——DYNAMIC_CONFIDENCE_REAL_OUTCOME_ENABLED
+                                         默认 true，置 false 退回 reviewer 自评 review_approved 旧统计）
 6. catalog_rebuild_worker               documents.catalog_summary_persisted 增量重写
 7. knowledge_digest::run_loop           日报工作站（chat-only async tools）
 8. cold_contact_worker                  按 last_outbound_at 阈值挑联系人 → peer_case 钩子重激活
@@ -398,6 +406,8 @@ tokio::spawn 主进程内 9 条 loop（启停由 env / mongo flag 控制）：
 9. silence_signal_worker                按 last_outbound_at 阈值挑"久未回复"联系人 → 落
                                         censored=true 沉默信号（只采集不发消息；
                                         SILENCE_SIGNAL_WORKER_ENABLED env 开关，默认 false）
+                                        采集三态（写入/去重/失败）按天 $inc 进 behavior_signal_metrics
+                                        （webhook 采集点同写；BEHAVIOR_SIGNAL_METRICS_ENABLED 默认 false）
 ```
 
 ### Phase 0 → E5-T1 新增 collection / 字段速查

@@ -101,6 +101,24 @@ pub struct AppConfig {
     /// S7 止血：dynamic_confidence 信 hit_rate 所需的最小样本数（hits+blocks）。
     /// 低于此值时只用 base（不被 1-2 个 reviewer 自评样本甩飞）。默认 5。
     pub dynamic_confidence_min_samples: u64,
+    /// P1 换血（第二阶段）：dynamic_confidence 的 hit/block 信号是否取**真实用户反应**
+    /// （按 run_id join `agent_decision_reviews.outcome_status`）而非 reviewer 自评
+    /// （`review_approved`）。默认 **true**——立即止住"镜厅效应"（系统学的是 reviewer
+    /// 喜欢什么，不是用户正反应什么）。设 false 可秒级回滚到旧的 review_approved 统计。
+    /// 沉默/无反应（pending/None/unclassified）一律删失排除，不进 hit 也不进 block 分母。
+    pub dynamic_confidence_real_outcome_enabled: bool,
+    /// P3（第二阶段）：是否启用行为信号采集健康度计数（写入 `behavior_signal_metrics`）。
+    /// 默认 false。打开后在采集点按 persisted/dedupe_skipped/errors 三态 `$inc` 累加，
+    /// best-effort 不阻断主链。
+    pub behavior_signal_metrics_enabled: bool,
+    /// P4（第二阶段）：是否在知识召回 fallback 排序处启用受控探索（top-k 内 softmax 抽样）
+    /// 并记录每个 chunk 的选中概率（selection_prob），为未来 off-policy 纠偏留 propensity。
+    /// 默认 **false**（保持现状确定性 top-k）。探索只在已验证（verified）池内做，
+    /// grounding/FactRisk/ProductAccuracy 硬门照常在其后执行，红线零破坏。
+    pub knowledge_exploration_enabled: bool,
+    /// P4：探索 softmax 温度。越大越接近均匀抽样、越小越接近确定性 argmax。默认 1.0。
+    /// 仅在 `knowledge_exploration_enabled=true` 时生效。
+    pub knowledge_exploration_temperature: f64,
 
     // ── agent-self-evolution M4：演化器（独立 worker） ──
     //
@@ -372,6 +390,20 @@ impl AppConfig {
                 .parse()?,
             silence_signal_daily_cap: env_or("SILENCE_SIGNAL_DAILY_CAP", "500").parse()?,
             dynamic_confidence_min_samples: env_or("DYNAMIC_CONFIDENCE_MIN_SAMPLES", "5").parse()?,
+            dynamic_confidence_real_outcome_enabled: parse_bool(&env_or(
+                "DYNAMIC_CONFIDENCE_REAL_OUTCOME_ENABLED",
+                "true",
+            )),
+            behavior_signal_metrics_enabled: parse_bool(&env_or(
+                "BEHAVIOR_SIGNAL_METRICS_ENABLED",
+                "false",
+            )),
+            knowledge_exploration_enabled: parse_bool(&env_or(
+                "KNOWLEDGE_EXPLORATION_ENABLED",
+                "false",
+            )),
+            knowledge_exploration_temperature: env_or("KNOWLEDGE_EXPLORATION_TEMPERATURE", "1.0")
+                .parse()?,
             // ── agent-self-evolution M4 ──
             evolution_enabled: parse_bool(&env_or("EVOLUTION_ENABLED", "false")),
             evolution_tick_seconds: env_or("EVOLUTION_TICK_SECONDS", "21600").parse()?,

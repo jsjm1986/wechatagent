@@ -16,7 +16,8 @@ use mongodb::{options::ClientOptions, Client, Collection, Database as MongoDatab
 
 use crate::models::{
     AgentCommandRun, AgentDecisionReview, AgentEvent, AgentOutcomeMetric, AgentRunLog, AgentSoul,
-    AgentTask, AgentToolCall, BehaviorSignal, CatalogRebuildJob, ChunkRevision, Contact,
+    AgentTask, AgentToolCall, BehaviorSignal, BehaviorSignalMetric, CatalogRebuildJob,
+    ChunkRevision, Contact,
     ContentAsset, ConversationMessage, DomainSchema, EvaluationScenario, Experiment, IngestSource,
     KnowledgeChatTask, KnowledgeChatTurn, KnowledgeDailyReport, KnowledgeGapSignal,
     KnowledgeOperatorMemory, KnowledgeUsageLog, LlmCallLog, LlmProviderConfig,
@@ -91,6 +92,12 @@ impl Database {
     /// `(workspace_id, dedupe_key)` partial unique 幂等约束）见 `db/indexes.rs`。
     pub fn behavior_signals(&self) -> Collection<BehaviorSignal> {
         self.db.collection("behavior_signals")
+    }
+
+    /// P3 采集健康度：`behavior_signal_metrics` 每日每 workspace 三态计数聚合
+    /// （`_id="{workspace_id}:{date}"`）。索引见 `db/indexes.rs`。
+    pub fn behavior_signal_metrics(&self) -> Collection<BehaviorSignalMetric> {
+        self.db.collection("behavior_signal_metrics")
     }
 
     pub fn mcp_logs(&self) -> Collection<McpCallLog> {

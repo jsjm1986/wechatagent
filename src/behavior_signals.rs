@@ -85,6 +85,7 @@ pub fn build_reply_latency(
         silence_ms: None,
         unanswered: None,
         reactivated_at: None,
+        ingest_time: Some(DateTime::now()),
     }
 }
 
@@ -113,6 +114,7 @@ pub fn build_reply_length(
         silence_ms: None,
         unanswered: None,
         reactivated_at: None,
+        ingest_time: Some(DateTime::now()),
     }
 }
 
@@ -148,6 +150,7 @@ pub fn build_reactivation(
         silence_ms: None,
         unanswered: None,
         reactivated_at: Some(inbound_at),
+        ingest_time: Some(DateTime::now()),
     }
 }
 
@@ -177,6 +180,7 @@ pub fn build_silence(
         silence_ms: Some(silence_ms),
         unanswered: Some(true),
         reactivated_at: None,
+        ingest_time: Some(DateTime::now()),
     }
 }
 
@@ -190,6 +194,74 @@ pub async fn persist_signal(state: &AppState, signal: BehaviorSignal) -> anyhow:
         Ok(_) => Ok(true),
         Err(err) if is_duplicate_key_error(&err) => Ok(false),
         Err(err) => Err(err.into()),
+    }
+}
+
+/// P3 采集健康度：把一次 [`persist_signal`] 的三态结果计数进 `behavior_signal_metrics`。
+///
+/// best-effort 旁路：自身失败只 warn，**绝不影响主应答链路**，也绝不让健康度计数
+/// 反过来拖垮采集。flag `BEHAVIOR_SIGNAL_METRICS_ENABLED` 关闭时（默认）直接返回。
+///
+/// 幂等：`_id="{workspace_id}:{date}"` + `$inc`，重复 tick 只累加不重置；
+/// 成功写入额外 `$set last_success_at`（新鲜度指标）。
+pub async fn record_signal_metric(
+    state: &AppState,
+    workspace_id: &str,
+    result: &anyhow::Result<bool>,
+) {
+    if !state.config.behavior_signal_metrics_enabled {
+        return;
+    }
+    let date = metric_date_string();
+    let id = format!("{workspace_id}:{date}");
+    let now = mongodb::bson::DateTime::now();
+    let mut inc = mongodb::bson::Document::new();
+    let mut set = mongodb::bson::doc! { "updated_at": now };
+    inc.insert(metric_inc_field(result), 1_i64);
+    if matches!(result, Ok(true)) {
+        // 仅真正写入才刷新新鲜度时戳；去重/失败不算"成功采集"。
+        set.insert("last_success_at", now);
+    }
+    let update = mongodb::bson::doc! {
+        "$inc": inc,
+        "$set": set,
+        "$setOnInsert": {
+            "workspace_id": workspace_id,
+            "date": &date,
+        },
+    };
+    let opts = mongodb::options::UpdateOptions::builder()
+        .upsert(true)
+        .build();
+    if let Err(err) = state
+        .db
+        .behavior_signal_metrics()
+        .update_one(mongodb::bson::doc! { "_id": &id }, update, opts)
+        .await
+    {
+        tracing::warn!(?err, workspace_id, "record_signal_metric failed (non-fatal)");
+    }
+}
+
+/// 当日 `YYYY-MM-DD`（UTC 截断到日）——`behavior_signal_metrics._id` 的日期分量。
+/// 与 `tasks.rs::today_date_string` 同口径（epoch 天数粗截断，足够幂等聚合用）。
+fn metric_date_string() -> String {
+    let now_ms = mongodb::bson::DateTime::now().timestamp_millis();
+    let day_ms: i64 = 24 * 60 * 60 * 1000;
+    let days = now_ms / day_ms;
+    let secs = days * 24 * 60 * 60;
+    let datetime =
+        chrono::DateTime::<chrono::Utc>::from_timestamp(secs, 0).unwrap_or_else(chrono::Utc::now);
+    datetime.format("%Y-%m-%d").to_string()
+}
+
+/// 三态 → `$inc` 字段名（纯函数，可单测）。`Ok(true)`=真正写入→persisted；
+/// `Ok(false)`=撞 dedupe 索引幂等跳过→dedupe_skipped；`Err`=真失败→errors。
+fn metric_inc_field(result: &anyhow::Result<bool>) -> &'static str {
+    match result {
+        Ok(true) => "persisted",
+        Ok(false) => "dedupe_skipped",
+        Err(_) => "errors",
     }
 }
 
@@ -365,5 +437,68 @@ mod tests {
         assert_eq!(k1, k2);
         // 不同 outbound → 不同 key。
         assert_ne!(silence_dedupe_key("w", 12_345), silence_dedupe_key("w", 12_346));
+    }
+
+    // ---- P2 双时间戳：observed_at(event_time) + ingest_time(write-time) ----
+
+    #[test]
+    fn builders_fill_ingest_time() {
+        // 四个 builder 都必须填 ingest_time（落库时刻），否则数据工程无法识别采集延迟/回填。
+        let latency = build_reply_latency("ws", "w", "m", DateTime::from_millis(10_000), Some(3_000));
+        let length = build_reply_length("ws", "w", "m", DateTime::from_millis(10_000), "hi");
+        let react = build_reactivation("ws", "w", "m", DateTime::from_millis(10_000));
+        let silence = build_silence("ws", "w", DateTime::from_millis(1_000), DateTime::from_millis(90_000));
+        for sig in [latency, length, react, silence] {
+            assert!(sig.ingest_time.is_some(), "{} 必须填 ingest_time", sig.signal_type);
+        }
+    }
+
+    #[test]
+    fn event_time_and_ingest_time_coexist() {
+        // observed_at = event_time（事实发生时刻，由调用方传入），ingest_time = 落库时刻；
+        // 两者独立存在，event_time 不被 builder 篡改成 now()。
+        let event_ms = 10_000;
+        let sig = build_reply_latency("ws", "w", "m", DateTime::from_millis(event_ms), Some(3_000));
+        assert_eq!(sig.observed_at.timestamp_millis(), event_ms, "event_time 必须保留调用方传入值");
+        assert!(sig.ingest_time.is_some());
+    }
+
+    #[test]
+    fn ingest_time_defaults_none_for_legacy_docs() {
+        // R11：旧文档无 ingest_time 字段，反序列化必须回落 None，不报错。
+        let doc = mongodb::bson::doc! {
+            "workspace_id": "ws",
+            "contact_wxid": "w",
+            "signal_type": "reply_length",
+            "observed_at": DateTime::from_millis(1),
+            "source": SOURCE_SYSTEM_OBSERVED,
+            "confidence": 1.0,
+            "censored": false,
+            "dedupe_key": "reply_length:w:m",
+            "char_len": 2_i64,
+        };
+        let sig: BehaviorSignal =
+            mongodb::bson::from_document(doc).expect("legacy doc without ingest_time must deserialize");
+        assert_eq!(sig.ingest_time, None);
+    }
+
+    // ---- P3 采集健康度：三态 → $inc 字段 ----
+
+    #[test]
+    fn metric_inc_field_maps_three_states() {
+        assert_eq!(metric_inc_field(&Ok(true)), "persisted");
+        assert_eq!(metric_inc_field(&Ok(false)), "dedupe_skipped");
+        assert_eq!(
+            metric_inc_field(&Err(anyhow::anyhow!("boom"))),
+            "errors"
+        );
+    }
+
+    #[test]
+    fn metric_date_string_is_iso_day() {
+        let d = metric_date_string();
+        // YYYY-MM-DD：10 字符，两个连字符。
+        assert_eq!(d.len(), 10, "got {d}");
+        assert_eq!(d.matches('-').count(), 2, "got {d}");
     }
 }
