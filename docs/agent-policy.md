@@ -366,6 +366,43 @@ WechatAgent 自第二阶段起内置可选的"自我演化"后台 worker（`src/
 
 如任何一步偏离预期，按 `docs/agent-policy.md` 自我演化"回滚优先"原则：admin 一键 rollback 该 proposal；必要时调 `POST /api/evolution/rollback_all`（输入 `ROLLBACK_ALL` 二次确认）一次性回滚全部并写 `agent_events kind="evolution_rollback_all"`。
 
+## 自学习采集管道（第一阶段，self-learning collection pipeline）
+
+完整方案与"镜厅效应"诊断见 plan；本节落地"做什么、不做什么"。**核心立场：零数据起点，只铺"未来可学的形状"，不调任何学习目标函数。** 当前唯一在跑的学习回路 `dynamic_confidence` 的 hit 信号取自 reviewer 自评（`review_approved`），学的是"哪些 chunk reviewer 喜欢"而非"哪些 chunk 让用户成交/正反应"——在没有真实 reward 信号前，任何公式调参都是在对噪声调参。第一阶段因此只做采集底座 + 一个最小止血，全部新功能默认 **DISABLED**，零迁移、R11 向后兼容、不碰闸门/红线语义。
+
+### 7 条铁律（采集层不变量）
+
+1. **观察与解释分层**：本阶段只存"系统观察到的客观量"（延迟毫秒、字符数、沉默时长、是否重新激活），**不写任何 LLM 解释标签**。解释层仍由既有 `reaction_analysis` 负责。
+2. **沉默 = 删失（censored），不是负例**：沉默信号带 `censored=true`，绝不当负反馈喂任何公式。
+3. **结构上强制只存观察层**：`behavior_signals` schema 不含解释字段。
+4. **每条信号带元数据**：`source`（恒 `system_observed`）/ `observed_at` / `confidence`（系统观察恒 1.0）/ `dedupe_key`。
+5. **采集必须幂等**：所有写入走 `dedupe_key` + partial unique 索引 `{ workspace_id:1, dedupe_key:1 }`（`$type:"string"` 过滤，**禁 `$in`**，否则 Error 67 让 `ensure_indexes` panic）。
+6. **记录召回倾向**：`KnowledgeRouteResult.selected_chunk_rankings` 落 rank/score/pool_size，为未来 IPW 留位，本阶段不消费。
+7. **最小样本门止血**：`dynamic_confidence` 在 `hit+blocked < DYNAMIC_CONFIDENCE_MIN_SAMPLES`（默认 5）时只用 `clamp(base - stale_penalty)`，不信少量 reviewer 自评把置信度甩飞。**明确不上 Wilson/Beta**——贝叶斯收缩属于"换血 hit 信号"阶段，给镜厅自评上贝叶斯只会让镜厅更精致。
+
+### S1–S7 落点
+
+| 编号 | 信号/能力 | 落点 | 触发 | 默认 |
+| --- | --- | --- | --- | --- |
+| S1 | T1 行为信号（reply_latency / reply_length / reactivation） | `behavior_signals` collection | webhook 入站持久化后 best-effort 追加（失败只 `warn!`，不阻断应答） | 随 webhook 常开 |
+| S2 | 沉默 = 删失 | `behavior_signals`（`censored=true`） | silence worker 探测 | 随 S6 |
+| S3 | 观察/解释两层分离 | 同上（结构强制） | — | — |
+| S4 | 召回倾向（propensity 占位） | `KnowledgeRouteResult.selected_chunk_rankings` | knowledge_router 排序后填，随 `route_result` 落 `knowledge_usage_log` | 随召回常开 |
+| S5 | admin 成交标记（正例事件） | `Contact.deal_events` + `POST /api/contacts/:id/deal-events` | admin 手动 | 手动 |
+| S6 | 沉默探测 worker | `src/silence_signal_worker.rs` | 周期挑 `last_outbound_at` 超 `SILENCE_THRESHOLD_SECONDS`（默认 24h）且无后续 inbound → 落 S2 信号；**只写信号，不发任何消息** | `SILENCE_SIGNAL_WORKER_ENABLED=false` |
+| S7 | dynamic_confidence 最小样本门 | `gap_signals::compute_dynamic_confidence` 纯函数 | feedback_worker 调用 | `DYNAMIC_CONFIDENCE_MIN_SAMPLES=5` |
+
+### dedupe_key 约定
+
+- reply_latency / reply_length：`"{type}:{wxid}:{inbound_message_id}"`
+- reactivation：`"reactivation:{wxid}:{inbound_message_id}"`
+- silence：`"silence:{wxid}:{last_outbound_at_ms}"`（同一条 outbound 多轮 tick 只产一次沉默事件）
+
+### 本阶段明确不做（解锁前提见 plan 路线图）
+
+- 不换 hit 信号（仍是 reviewer 自评）；不做 IPW 加权；不做 PU learning / 延迟反馈归因；不做 bandit 探索。
+- 不上贝叶斯收缩；不引入任何"人工接管"语义；新功能不改部署拓扑。
+
 ## 知识库日报工作站（knowledge-digest-workstation）
 
 WechatAgent 把"知识库 = AI agent"落到产品形态：chat 是主入口、画布是当日工作台、目录树是索引。完整 spec 见 `.kiro/specs/knowledge-digest-workstation/`。本节说明它**做什么、不做什么、如何被运营消费**。

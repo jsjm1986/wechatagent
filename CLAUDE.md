@@ -47,6 +47,8 @@ A second merge gate is `scripts/check-no-human-takeover.{sh,ps1}` — a CI lint 
 
 Most integration tests under `tests/` are `#[ignore]` by default and require Docker (testcontainers MongoDB). `cargo test` will compile them but skip ignored tests; run explicitly via `cargo test --test <name> -- --ignored` when Docker is available.
 
+**Local vs CI split (disk-space discipline).** The dev disk is small and compiling the 100+ integration test binaries (`pdf-extract` / `feed-rs` / `scraper` / `jsonwebtoken` pull a large `target/`) plus pulling the `mongo` image routinely fills it (`os error 112` / `no space left on device`). So locally run only the cheap, small-footprint suites: `cargo test --lib` and individual PBT files (`cargo test --test <name>`). Leave the full `--ignored` integration suite to GitHub CI — `.github/workflows/ci.yml`'s `integration` job frees ~30GB of pre-installed SDKs before building, which a local machine can't. Every push to `main` / PR runs both the baseline gate and integration job, so committed work is always exercised on CI. When the local disk does fill, delete `target/debug/incremental` first (regenerated automatically, several GB, no dependency rebuild) before any heavier cleanup.
+
 ## Architecture (big picture)
 
 Single Rust process: hosts the admin SPA, exposes the JSON API under `/api`, receives WeChat callbacks at `POST /webhooks/wechat`, and runs the follow-up task worker in a background `tokio::spawn`.

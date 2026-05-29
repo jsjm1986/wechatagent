@@ -212,6 +212,37 @@ fn is_duplicate_key_error(err: &mongodb::error::Error) -> bool {
 mod tests {
     use super::*;
 
+    /// 回归门：`BehaviorSignal` 必须以 snake_case 落库。
+    ///
+    /// 幂等索引 `{workspace_id, dedupe_key}` 的 `partialFilterExpression` 按
+    /// snake-case `dedupe_key` 匹配（`db/indexes.rs`）。若 struct 误加
+    /// `#[serde(rename_all = "camelCase")]`，字段会序列化成 `dedupeKey`，partial
+    /// filter 命中 0 文档 → unique 约束失效 → 重复信号全部落库（曾被
+    /// `behavior_signal_smoke` 集成测试逮到）。本测试在 lib 层（无需 Docker）锁死
+    /// 字段名，任何重新引入 camelCase 的改动都会在此处编译期之外即时失败。
+    #[test]
+    fn serializes_to_snake_case_for_index_match() {
+        let sig = build_reply_latency(
+            "ws",
+            "wxid_a",
+            "msg1",
+            DateTime::from_millis(10_000),
+            Some(3_000),
+        );
+        let doc = mongodb::bson::to_document(&sig).expect("serialize BehaviorSignal");
+        // 索引 / 查询依赖的字段名必须是 snake_case。
+        assert!(doc.contains_key("dedupe_key"), "幂等键必须落库为 dedupe_key");
+        assert!(doc.contains_key("workspace_id"), "必须落库为 workspace_id");
+        assert!(doc.contains_key("contact_wxid"), "必须落库为 contact_wxid");
+        assert!(doc.contains_key("signal_type"), "必须落库为 signal_type");
+        assert!(doc.contains_key("observed_at"), "必须落库为 observed_at");
+        assert!(doc.contains_key("latency_ms"), "必须落库为 latency_ms");
+        // 绝不能出现任何 camelCase 变体。
+        assert!(!doc.contains_key("dedupeKey"), "camelCase dedupeKey 会让 partial 索引失效");
+        assert!(!doc.contains_key("contactWxid"));
+        assert!(!doc.contains_key("signalType"));
+    }
+
     #[test]
     fn latency_none_when_no_prior_outbound() {
         // 从未出站过 → 没有基准，latency_ms 必须 None（不臆造 0）。

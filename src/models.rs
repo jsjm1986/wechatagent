@@ -251,8 +251,12 @@ pub struct DealEvent {
 ///   同一观察重复采集只落一次。
 ///
 /// 本阶段只采集、不消费——任何学习公式都不读它，直到积累到可学样本量。
+///
+/// 字段一律 snake_case 落库（与 [`ConversationMessage`] 等同库结构一致）：索引
+/// `{workspace_id, dedupe_key}` 的 `partialFilterExpression` 按 snake-case 字段名
+/// 匹配，若改成 camelCase 会让 partial filter 命中 0 文档 → unique 约束形同虚设、
+/// 重复信号全部落库（已被 `behavior_signal_smoke` 集成测试逮到）。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
 pub struct BehaviorSignal {
     #[serde(rename = "_id", skip_serializing_if = "Option::is_none")]
     pub id: Option<ObjectId>,
