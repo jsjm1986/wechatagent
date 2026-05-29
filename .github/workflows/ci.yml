@@ -84,5 +84,13 @@ jobs:
       # ubuntu-latest runner 预装 Docker daemon；testcontainers
       # （tests/common/mod.rs:116 `Mongo::default().start()`）自动拉起
       # 临时 MongoDB 容器，无需额外 service 声明。
+      #
+      # 关掉全局 RUSTFLAGS=-Dwarnings：这 38 个 #[ignore] 测试文件从未在
+      # 新 rustc 下编译过，借用检查器进步会把陈年 `unused_mut`/`unused_var`
+      # 变成 warning。warnings-as-errors 会让 cargo 在跑任何一个测试前就编译
+      # 失败，与本 job「拿真实绿/红测试分布」的目的相悖。production lib 代码
+      # 的 -Dwarnings 仍由 baseline job 守住。
       - name: cargo test -- --ignored (testcontainers MongoDB)
+        env:
+          RUSTFLAGS: ""
         run: cargo test -- --ignored

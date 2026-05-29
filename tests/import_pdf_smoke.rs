@@ -48,7 +48,7 @@ fn minimal_pdf(text: &str) -> Vec<u8> {
     // 二进制注释行，提示这是二进制文件。
     buf.extend_from_slice(b"%\xE2\xE3\xCF\xD3\n");
 
-    let mut push_obj = |buf: &mut Vec<u8>, offsets: &mut Vec<usize>, body: &[u8]| {
+    let push_obj = |buf: &mut Vec<u8>, offsets: &mut Vec<usize>, body: &[u8]| {
         offsets.push(buf.len());
         buf.extend_from_slice(body);
     };
