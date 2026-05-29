@@ -25,6 +25,7 @@ mod admin_taxonomies;
 mod admin_taxonomy_candidates;
 mod assets;
 mod auth;
+pub mod chunk_locks;
 mod contacts;
 mod conversations;
 mod domain_schemas;
@@ -34,7 +35,7 @@ mod events;
 mod evolution;
 mod guides;
 mod health;
-mod knowledge;
+pub(crate) mod knowledge;
 mod lessons_learned;
 mod llm_providers;
 mod management;
@@ -58,6 +59,12 @@ pub use knowledge::{
 // G3：批量动作 + 反向查询的处理函数。集成测试直接调用绕过 axum HTTP 层。
 pub mod ext_knowledge {
     pub use super::knowledge::{batch_archive_chunks, batch_verify_chunks, list_chunk_referrers};
+    // P1-5 / #574：multimodal 导入 + ingest 核心，供集成测试绕过 axum extractor
+    // （Multipart 无法在测试里手工构造）直接驱动字节 / 图片导入路径。
+    pub use super::knowledge::{
+        import_operation_knowledge_apply_image, import_pdf_bytes, ingest_chunked_text,
+        ImportApplyImageRequest, IngestOutcome,
+    };
 }
 pub use shared::upsert_contact_from_value;
 
@@ -101,12 +108,14 @@ use evaluations::{
 use events::list_events;
 use evolution::{
     get_evolution_proposal_detail, get_evolution_runtime_flag, list_evolution_experiments,
-    put_evolution_runtime_flag, release_evolution_proposal, rollback_evolution_proposal,
+    list_threshold_override_audit, put_evolution_runtime_flag, release_evolution_proposal,
+    rollback_evolution_proposal,
 };
 use guides::{apply_user_operation_guide, preview_user_operation_guide};
 use health::health;
 use llm_providers::{
-    activate_provider, create_provider, delete_provider, list_providers, test_provider,
+    activate_provider, create_provider, delete_provider, list_providers, set_vision_active,
+    test_provider,
     update_provider,
 };
 use knowledge::{
@@ -117,17 +126,19 @@ use knowledge::{
     batch_archive_chunks, batch_verify_chunks,
     chat_apply, chat_discard,
     chat_history, chat_session_stream, chat_task_cancel, chat_task_create, chat_task_get,
-    chat_turn, create_operation_knowledge,
+    chat_turn, create_ingest_source, create_operation_knowledge,
     create_operation_knowledge_chunk, create_operation_knowledge_document,
-    delete_operation_knowledge, delete_operation_knowledge_chunk,
+    delete_ingest_source, delete_operation_knowledge, delete_operation_knowledge_chunk,
     delete_operation_knowledge_document, digest_dismiss_card, digest_regenerate, digest_today,
     dismiss_knowledge_gap_signal,
     get_operation_knowledge_catalog, get_operation_knowledge_catalog_persisted,
     get_operation_knowledge_chunk_source, get_operation_knowledge_completeness,
     get_operation_knowledge_document, get_operation_knowledge_integrity_report,
     extract_operation_knowledge_tags, import_operation_knowledge_apply,
+    import_operation_knowledge_apply_image, import_operation_knowledge_apply_pdf,
     import_operation_knowledge_preview, knowledge_aggregate_metadata, knowledge_inbox,
     list_chunk_referrers,
+    list_ingest_sources,
     list_knowledge_gap_signals,
     list_knowledge_usage,
     list_operation_knowledge, list_operation_knowledge_chunk_revisions,
@@ -145,6 +156,7 @@ use knowledge::{
     test_operation_knowledge_match, unrelate_operation_knowledge_chunk,
     update_operation_knowledge,
     update_operation_knowledge_chunk, update_operation_knowledge_document,
+    update_ingest_source,
     verify_operation_knowledge_chunk,
 };
 use management::{
@@ -199,6 +211,16 @@ pub struct AppState {
     /// （与 `LlmRegistry` 的运行时热替换不同——双 reviewer 故意不热切以保持
     /// epistemic 对照稳定）。
     pub second_reviewer_llm: Option<Arc<dyn LlmProvider>>,
+    /// Phase G P1-4：知识 chunk 软锁表。进程内 DashMap，重启清空。
+    /// key=chunk_id；value 含 owner / 过期时间，TTL 见 [`chunk_locks::CHUNK_LOCK_TTL_SECONDS`]。
+    pub chunk_locks: chunk_locks::ChunkLockMap,
+    /// Phase G P1-4：知识 chunk 事件总线。WebSocket handler 订阅；
+    /// patch/archive/restore/... handler 写入 `Revised` 事件。
+    /// 多副本部署需 Redis pub/sub —— 留 P2。
+    pub chunk_event_bus: tokio::sync::broadcast::Sender<chunk_locks::ChunkEvent>,
+    /// Phase G P1-7：RS256 JWT keypair。`jwt_enabled=false` → None；
+    /// `true` 时 main.rs 启动期 `JwtKeys::from_config` 解码 PEM 失败直接 panic。
+    pub jwt_keys: Option<Arc<crate::auth::jwt::JwtKeys>>,
 }
 
 pub fn api_router(state: AppState) -> Router<AppState> {
@@ -207,6 +229,8 @@ pub fn api_router(state: AppState) -> Router<AppState> {
         .route("/auth/login", post(auth::login))
         .route("/auth/logout", post(auth::logout))
         .route("/auth/me", get(auth::me))
+        .route("/auth/workspace", post(auth::switch_workspace))
+        .route("/auth/token", post(auth::issue_token))
         .route("/accounts", get(list_accounts))
         .route("/accounts/sync", post(sync_accounts))
         .route("/accounts/:id/mcp-key", put(update_account_mcp_key))
@@ -354,6 +378,13 @@ pub fn api_router(state: AppState) -> Router<AppState> {
             "/operation-knowledge/chunks/:id/relate/:target_id",
             axum::routing::delete(unrelate_operation_knowledge_chunk),
         )
+        // ── Phase G P1-4 · 软锁 + WebSocket 事件总线 ───────────────────────────
+        .route(
+            "/operation-knowledge/chunks/:id/lock",
+            post(chunk_locks::acquire_chunk_lock)
+                .delete(chunk_locks::release_chunk_lock),
+        )
+        .route("/ws/chunks", get(chunk_locks::chunk_event_websocket))
         // ── G3 · 反向查询 + 批量动作（admin 手工触发，非 AI 自动） ─────────────
         .route(
             "/operation-knowledge/chunks/referrers",
@@ -429,6 +460,14 @@ pub fn api_router(state: AppState) -> Router<AppState> {
             post(import_operation_knowledge_apply),
         )
         .route(
+            "/operation-knowledge/import-apply-pdf",
+            post(import_operation_knowledge_apply_pdf),
+        )
+        .route(
+            "/operation-knowledge/import-apply-image",
+            post(import_operation_knowledge_apply_image),
+        )
+        .route(
             "/operation-knowledge/extract-tags",
             post(extract_operation_knowledge_tags),
         )
@@ -488,6 +527,14 @@ pub fn api_router(state: AppState) -> Router<AppState> {
         .route(
             "/knowledge/chat/sessions/:sid/stream",
             get(chat_session_stream),
+        )
+        .route(
+            "/knowledge/ingest-sources",
+            get(list_ingest_sources).post(create_ingest_source),
+        )
+        .route(
+            "/knowledge/ingest-sources/:id",
+            patch(update_ingest_source).delete(delete_ingest_source),
         )
         .route(
             "/operation-knowledge/:id",
@@ -675,6 +722,10 @@ pub fn api_router(state: AppState) -> Router<AppState> {
             "/admin/llm-providers/:id/activate",
             post(activate_provider),
         )
+        .route(
+            "/admin/llm-providers/:id/vision",
+            post(set_vision_active),
+        )
         .route("/admin/llm-providers/test", post(test_provider))
         // ── knowledge-wiki Phase G：行业可配 schema admin 路由 ─────────────────
         .route(
@@ -703,6 +754,11 @@ pub fn api_router(state: AppState) -> Router<AppState> {
             "/evolution/proposals/:id/rollback",
             post(rollback_evolution_proposal),
         )
+        // Phase C / C5：threshold 变更不可变审计日志（release/rollback/auto-release）。
+        .route(
+            "/evolution/threshold-overrides/audit",
+            get(list_threshold_override_audit),
+        )
         // Phase C / C3：evolution 灰度运行时开关。env `EVOLUTION_ENABLED=true`
         // 仍是最外层熔断；mongo flag 决定 contact 维度是否落桶。
         .route(
@@ -716,4 +772,101 @@ pub fn api_router(state: AppState) -> Router<AppState> {
             crate::auth::middleware::require_session,
         ))
         .with_state(state)
+}
+
+#[cfg(test)]
+mod tests {
+    /// P2-6：routes/* 死路由 tripwire。
+    ///
+    /// 把 `pub async fn` 路由 handler 名单读出来，再与 `api_router()` 当前
+    /// 静态文本中实际 mount 的字符串做比对——任何新增 `pub async fn` 但忘了
+    /// 接进 router / 任何被取消 mount 但忘了删函数，都会让本测试 fail，
+    /// 防止"实现了但不连"的死路由再次出现。
+    ///
+    /// 已显式列入 [`KNOWN_NON_ROUTE_HANDLERS`] 的属于"框架/复用 helper"，
+    /// 不计入 mount 校验。
+    #[test]
+    fn no_orphan_pub_async_route_handlers() {
+        let mod_src = include_str!("mod.rs");
+        let route_files = [
+            include_str!("accounts.rs"),
+            include_str!("admin_ops_versions.rs"),
+            include_str!("admin_outbox.rs"),
+            include_str!("admin_state_policies.rs"),
+            include_str!("admin_taxonomies.rs"),
+            include_str!("admin_taxonomy_candidates.rs"),
+            include_str!("assets.rs"),
+            include_str!("auth.rs"),
+            include_str!("chunk_locks.rs"),
+            include_str!("contacts.rs"),
+            include_str!("conversations.rs"),
+            include_str!("domain_schemas.rs"),
+            include_str!("domains.rs"),
+            include_str!("evaluations.rs"),
+            include_str!("events.rs"),
+            include_str!("evolution.rs"),
+            include_str!("guides.rs"),
+            include_str!("health.rs"),
+            include_str!("knowledge.rs"),
+            include_str!("lessons_learned.rs"),
+            include_str!("llm_providers.rs"),
+            include_str!("management.rs"),
+            include_str!("observability.rs"),
+            include_str!("outcome_metrics.rs"),
+            include_str!("outcomes_autonomy.rs"),
+            include_str!("playbooks.rs"),
+            include_str!("prompt_templates.rs"),
+            include_str!("reviews.rs"),
+            include_str!("shared.rs"),
+            include_str!("simulations.rs"),
+            include_str!("souls.rs"),
+            include_str!("tasks.rs"),
+        ];
+
+        // 已知不是 axum handler 的 `pub async fn`：integration helper / WS handler。
+        const KNOWN_NON_ROUTE_HANDLERS: &[&str] = &[
+            // shared.rs：webhooks.rs / 集成测试通过 `pub use` 直接调用。
+            "upsert_contact_from_value",
+            // knowledge.rs：lib 内部复用的导入流水（不绑 HTTP）。
+            "ingest_chunked_text",
+            // knowledge.rs：PDF multipart handler 委托的字节级 helper（集成测试直调）。
+            "import_pdf_bytes",
+        ];
+
+        let mut handlers: Vec<&str> = Vec::new();
+        for src in &route_files {
+            for line in src.lines() {
+                let trimmed = line.trim_start();
+                let prefix = if trimmed.starts_with("pub async fn ") {
+                    "pub async fn "
+                } else if trimmed.starts_with("pub(crate) async fn ") {
+                    "pub(crate) async fn "
+                } else {
+                    continue;
+                };
+                let rest = &trimmed[prefix.len()..];
+                if let Some(end) = rest.find('(') {
+                    handlers.push(&rest[..end]);
+                }
+            }
+        }
+
+        let mut orphans: Vec<&str> = Vec::new();
+        for h in &handlers {
+            if KNOWN_NON_ROUTE_HANDLERS.contains(h) {
+                continue;
+            }
+            // 在 mod.rs 中查 `(<name>)` 或 `::<name>)`（chunk_locks 命名空间）。
+            let direct = format!("({h})");
+            let nested = format!("::{h})");
+            if !mod_src.contains(&direct) && !mod_src.contains(&nested) {
+                orphans.push(h);
+            }
+        }
+
+        assert!(
+            orphans.is_empty(),
+            "发现未挂载的 pub async fn 路由 handler（请在 api_router 中 .route 或加入 KNOWN_NON_ROUTE_HANDLERS）：{orphans:?}"
+        );
+    }
 }

@@ -28,6 +28,26 @@ pub(super) fn parse_object_id(id: &str) -> AppResult<ObjectId> {
     ObjectId::parse_str(id).map_err(|_| AppError::BadRequest("invalid object id".to_string()))
 }
 
+/// #154：把用户输入转义为 Mongo `$regex` 字面量，防 ReDoS / regex 注入。
+///
+/// `list_contacts` 的搜索框 `q` 原样塞进 `Regex { pattern }`，恶意/手滑的
+/// `(a+)+$`、`.*.*.*` 等 pattern 会让 Mongo 正则引擎灾难性回溯（DoS），
+/// 元字符（`.`、`*`、`|` 等）也会改变查询语义。对所有正则特殊字符前置
+/// `\` 后，输入被当作纯字面子串匹配（仍保留 `options:"i"` 大小写不敏感）。
+pub(super) fn escape_regex_literal(input: &str) -> String {
+    const SPECIAL: &[char] = &[
+        '\\', '.', '+', '*', '?', '(', ')', '|', '[', ']', '{', '}', '^', '$', '-',
+    ];
+    let mut out = String::with_capacity(input.len());
+    for ch in input.chars() {
+        if SPECIAL.contains(&ch) {
+            out.push('\\');
+        }
+        out.push(ch);
+    }
+    out
+}
+
 /// 从 `Contact.domain_attributes` 中读取销售域字段（已下线的 customer_stage / intent_level）。
 /// 旧字段被 wiki 化，但部分 health/score/event 工具仍以 string-key 形式记录到事件文档。
 pub(super) fn contact_domain_str(contact: &Contact, key: &str) -> Option<String> {
@@ -37,13 +57,17 @@ pub(super) fn contact_domain_str(contact: &Contact, key: &str) -> Option<String>
         .and_then(|d| d.get_str(key).ok().map(|s| s.to_string()))
 }
 
-pub(super) async fn validate_account(state: &AppState, account_id: &str) -> AppResult<()> {
+pub(super) async fn validate_account(
+    state: &AppState,
+    workspace_id: &str,
+    account_id: &str,
+) -> AppResult<()> {
     let found = state
         .db
         .accounts()
         .find_one(
             doc! {
-                "workspace_id": &state.config.default_workspace_id,
+                "workspace_id": workspace_id,
                 "account_id": account_id
             },
             None,
@@ -55,18 +79,33 @@ pub(super) async fn validate_account(state: &AppState, account_id: &str) -> AppR
     Ok(())
 }
 
-pub(super) async fn find_contact_by_id(state: &AppState, id: &str) -> AppResult<Contact> {
+/// 按 `_id` 取联系人，**强制** workspace 隔离。
+///
+/// 安全契约：`workspace_id` 是必填参数，查询条件恒含 `workspace_id` 过滤。
+/// 跨 workspace 的 contact_id 返回 `NotFound`（404，不泄漏存在性），而非
+/// 返回他人数据。任何调用方都必须传入当前登录态的 `admin.current_workspace`
+/// （webhook / worker 等内部路径传各自上下文的 workspace_id）。签名要求
+/// workspace_id 即编译期 fail-closed——漏传无法通过编译。
+pub(super) async fn find_contact_by_id(
+    state: &AppState,
+    workspace_id: &str,
+    id: &str,
+) -> AppResult<Contact> {
     let object_id = parse_object_id(id)?;
     state
         .db
         .contacts()
-        .find_one(doc! { "_id": object_id }, None)
+        .find_one(
+            doc! { "_id": object_id, "workspace_id": workspace_id },
+            None,
+        )
         .await?
         .ok_or_else(|| AppError::NotFound("contact not found".to_string()))
 }
 
 pub async fn upsert_contact_from_value(
     state: &AppState,
+    workspace_id: &str,
     account_id: &str,
     contact_value: &Value,
 ) -> AppResult<Option<Contact>> {
@@ -98,7 +137,7 @@ pub async fn upsert_contact_from_value(
         .contacts()
         .update_one(
             doc! {
-                "workspace_id": &state.config.default_workspace_id,
+                "workspace_id": workspace_id,
                 "account_id": account_id,
                 "wxid": &wxid
             },
@@ -110,7 +149,7 @@ pub async fn upsert_contact_from_value(
                     "updated_at": DateTime::now()
                 },
                 "$setOnInsert": {
-                    "workspace_id": &state.config.default_workspace_id,
+                    "workspace_id": workspace_id,
                     "account_id": account_id,
                     "wxid": &wxid,
                     "agent_status": "normal",
@@ -125,7 +164,7 @@ pub async fn upsert_contact_from_value(
         .contacts()
         .find_one(
             doc! {
-                "workspace_id": &state.config.default_workspace_id,
+                "workspace_id": workspace_id,
                 "account_id": account_id,
                 "wxid": &wxid
             },
@@ -309,6 +348,7 @@ pub(super) async fn latest_decision_review(
 
 pub(super) async fn resolve_playbook_for_contact(
     state: &AppState,
+    workspace_id: &str,
     account_id: &str,
     playbook_id: Option<&str>,
 ) -> AppResult<OperationPlaybook> {
@@ -320,7 +360,7 @@ pub(super) async fn resolve_playbook_for_contact(
             .find_one(
                 doc! {
                     "_id": object_id,
-                    "workspace_id": &state.config.default_workspace_id,
+                    "workspace_id": workspace_id,
                     "account_id": account_id
                 },
                 None,
@@ -333,7 +373,7 @@ pub(super) async fn resolve_playbook_for_contact(
             "operation playbook not found".to_string(),
         ));
     }
-    super::playbooks::ensure_default_playbook(state, account_id).await
+    super::playbooks::ensure_default_playbook(state, workspace_id, account_id).await
 }
 
 pub(super) fn operation_health_json(
@@ -350,8 +390,9 @@ pub(super) fn operation_health_json(
             health_item("relationshipQuality", "信任关系质量", score("relationshipQuality"), "当前互动是否适合推进，是否需要先建立信任"),
             health_item("productFit", "产品匹配清晰度", score("productFit"), "是否知道用户需求与产品价值之间的真实匹配"),
             health_item("rhythmRisk", "跟进节奏风险", score("rhythmRisk"), "是否存在过度打扰或冷却中的风险"),
-            health_item("pressureRisk", "销售压迫感风险", score("pressureRisk"), "表达是否可能显得催促、强推或过度营销"),
-            health_item("factRisk", "事实风险", score("factRisk"), "是否可能出现编造案例、承诺结果或产品事实不准确")
+            health_item("knowledgeGrounding", "知识匹配度", score("knowledgeGrounding"), "回应是否被 verified 知识支撑"),
+            health_item("hallucinationRisk", "幻觉风险", score("hallucinationRisk"), "是否可能出现编造案例、承诺结果或产品事实不准确"),
+            health_item("pressureRisk", "销售压迫感风险", score("pressureRisk"), "表达是否可能显得催促、强推或过度营销")
         ]
     })
 }
@@ -427,8 +468,12 @@ pub(super) fn health_scores_document(
         "relationshipQuality": relationship_quality,
         "productFit": product_fit,
         "rhythmRisk": rhythm_risk.clamp(0, 100),
-        "pressureRisk": review_score("pressureRisk") * 10,
-        "factRisk": review_score("factRisk") * 10
+        // P0-4：与 Phase B 三闸/软闸口径对齐——前端 healthFromScores 读
+        // `knowledgeGrounding / hallucinationRisk`，后端必须发对应键。
+        // 旧 5 闸键 `factRisk` 已下线，不再写入；`pressureRisk` 作为软闸保留。
+        "knowledgeGrounding": review_score("knowledgeGroundingScore") * 10,
+        "hallucinationRisk": review_score("hallucinationScore") * 10,
+        "pressureRisk": review_score("pressureRisk") * 10
     }
 }
 
@@ -582,7 +627,11 @@ pub(super) async fn apply_playbook_changes(
     Ok(())
 }
 
-pub(super) async fn apply_domain_changes(state: &AppState, changes: &Document) -> AppResult<()> {
+pub(super) async fn apply_domain_changes(
+    state: &AppState,
+    workspace_id: &str,
+    changes: &Document,
+) -> AppResult<()> {
     let Some(runtime_patch) = doc_get_document(changes, "domainRuntimeParameters") else {
         return Ok(());
     };
@@ -594,7 +643,7 @@ pub(super) async fn apply_domain_changes(state: &AppState, changes: &Document) -
         .operation_domain_configs()
         .find_one(
             doc! {
-                "workspace_id": &state.config.default_workspace_id,
+                "workspace_id": workspace_id,
                 "domain": "user_operations"
             },
             None,
@@ -648,7 +697,7 @@ pub(super) fn build_guide_preview_prompt(
     "factRisk": 0-100
   }},
   "suggestedChanges": {{
-    "humanProfileNote": "可选，新的人工运营备注",
+    "humanProfileNote": "可选，新的运营备注（运营 admin 录入）",
     "tags": ["可选标签"],
     "customerStage": "可选客户阶段",
     "intentLevel": "可选意向等级",
@@ -697,7 +746,7 @@ pub(super) fn build_guide_preview_prompt(
 wxid：{}
 昵称：{}
 备注：{}
-人工备注：{}
+运营备注：{}
 标签：{}
 客户阶段：{}
 意向等级：{}
@@ -1062,5 +1111,35 @@ pub(super) fn commitments_with_optional_text(
         }
     }
     to_bson(&commitments).unwrap_or(Bson::Array(Vec::new()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::escape_regex_literal;
+
+    #[test]
+    fn escape_regex_literal_neutralizes_redos_pattern() {
+        // 经典灾难性回溯 pattern：转义后每个元字符都被字面化
+        assert_eq!(escape_regex_literal("(a+)+$"), "\\(a\\+\\)\\+\\$");
+        assert_eq!(escape_regex_literal(".*.*.*"), "\\.\\*\\.\\*\\.\\*");
+    }
+
+    #[test]
+    fn escape_regex_literal_leaves_plain_text_untouched() {
+        assert_eq!(escape_regex_literal("张三"), "张三");
+        assert_eq!(escape_regex_literal("alice 99"), "alice 99");
+        assert_eq!(escape_regex_literal(""), "");
+    }
+
+    #[test]
+    fn escape_regex_literal_escapes_every_special_char() {
+        for ch in [
+            '\\', '.', '+', '*', '?', '(', ')', '|', '[', ']', '{', '}', '^', '$', '-',
+        ] {
+            let input: String = ch.to_string();
+            let escaped = escape_regex_literal(&input);
+            assert_eq!(escaped, format!("\\{ch}"), "char {ch:?} not escaped");
+        }
+    }
 }
 

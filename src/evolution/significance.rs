@@ -40,6 +40,29 @@ pub const FIVE_GATE_KEYS: &[&str] = &[
 /// 把 final_review_status 视为"成功送出"的状态集。与 design.md §4.6 一致。
 pub const SEND_SUCCESS_STATUSES: &[&str] = &["approved", "approved_after_revision"];
 
+/// 三个**安全闸**（block 类）与其 `final_review_status` 拦截态的映射。
+///
+/// 与 [`crate::evolution::threshold::classify_gate_hit`] 同一份约定，方向反置：
+/// 给定 gate_key 找到"被该闸拦下时写入的终态字符串"。`human_like /
+/// emotional_value` 是 rewrite 类、`planner_block_rate` 属 planner 域，都**不**是
+/// 安全闸，不在此表内——放松它们不构成"漏过风险消息"。
+///
+/// #152 反向显著性门只对本表内的 gate 生效。
+pub const SAFETY_GATE_BLOCK_STATUS: &[(&str, &str)] = &[
+    ("fact_risk_block", "held_by_ai_policy"),
+    ("pressure_risk_block", "blocked_by_safety_guard"),
+    ("product_accuracy_score_block", "blocked_unverified_product_claim"),
+];
+
+/// 给定 gate_key 返回其安全拦截态；非安全闸 / None → None。
+pub fn safety_block_status_for(gate_key: Option<&str>) -> Option<&'static str> {
+    let key = gate_key?;
+    SAFETY_GATE_BLOCK_STATUS
+        .iter()
+        .find(|(g, _)| *g == key)
+        .map(|(_, status)| *status)
+}
+
 /// 显著性配置（无 IO 版本）。从 [`AppConfig`] 摘取。
 #[derive(Debug, Clone)]
 pub struct SignificanceCfg {
@@ -48,6 +71,10 @@ pub struct SignificanceCfg {
     pub min_self_critique_delta: f64,
     pub max_5gate_hit_increase: f64,
     pub max_fail_rate: f64,
+    /// #152：安全闸放松回归率上限。shadow 中"原本被该安全闸拦下、新配置却
+    /// 放行"的占比超过此值即 reject，哪怕 send_success / self_critique 都达标。
+    /// 默认 0.0 —— 零容忍：任一条风险消息从 blocked 翻成 sent 即否决放松提案。
+    pub max_safety_regression_rate: f64,
 }
 
 impl SignificanceCfg {
@@ -58,8 +85,44 @@ impl SignificanceCfg {
             min_self_critique_delta: cfg.evolution_min_self_critique_delta,
             max_5gate_hit_increase: cfg.evolution_max_5gate_hit_increase,
             max_fail_rate: cfg.evolution_replay_max_fail_rate,
+            max_safety_regression_rate: cfg.evolution_max_safety_regression_rate,
         }
     }
+}
+
+/// #152 反向显著性门：算"安全回归率"——`completed` 中 `original_final_review_status`
+/// 等于该安全闸拦截态、但 `new_final_review_status` 落在 [`SEND_SUCCESS_STATUSES`]
+/// 的占比（分母为全部 completed replay，即"放走的风险消息占整体流量比例"）。
+///
+/// 返回 `(passed, rate, count)`。`block_status=None`（非安全闸提案）→ 直接 pass，
+/// rate/count 记 0，调用方据此跳过该门。
+fn grade_safety_regression(
+    completed: &[&ShadowReplay],
+    block_status: Option<&str>,
+    cfg: &SignificanceCfg,
+) -> (bool, f64, u64) {
+    let Some(block_status) = block_status else {
+        return (true, 0.0, 0);
+    };
+    let n = completed.len();
+    if n == 0 {
+        return (true, 0.0, 0);
+    }
+    let count = completed
+        .iter()
+        .filter(|r| {
+            r.original_final_review_status.as_deref() == Some(block_status)
+                && r.new_final_review_status
+                    .as_deref()
+                    .map(|s| SEND_SUCCESS_STATUSES.contains(&s))
+                    .unwrap_or(false)
+        })
+        .count() as u64;
+    let rate = count as f64 / n as f64;
+    // `>` 而非 `>=`：默认 max=0.0 时，count=0→rate=0.0→0.0>0.0=false→pass；
+    // 任一回归→rate>0→fail。
+    let passed = rate <= cfg.max_safety_regression_rate;
+    (passed, rate, count)
 }
 
 /// 阈值候选显著性测试。
@@ -69,7 +132,13 @@ impl SignificanceCfg {
 /// - failed / total ≤ max_fail_rate
 /// - send_success_rate_delta ≥ min_send_success_delta
 /// - 5 闸任一项 new_hit_rate - original_hit_rate ≤ max_5gate_hit_increase
-pub fn grade_threshold(replays: &[ShadowReplay], cfg: &SignificanceCfg) -> (bool, Document) {
+/// - #152：若 `gate_key` 是安全闸（[`SAFETY_GATE_BLOCK_STATUS`]），安全回归率
+///   ≤ `max_safety_regression_rate`（默认 0.0）。非安全闸该门恒过。
+pub fn grade_threshold(
+    replays: &[ShadowReplay],
+    cfg: &SignificanceCfg,
+    gate_key: Option<&str>,
+) -> (bool, Document) {
     if let Some(reason) = early_reject(replays, cfg) {
         return reason;
     }
@@ -93,9 +162,14 @@ pub fn grade_threshold(replays: &[ShadowReplay], cfg: &SignificanceCfg) -> (bool
         .map(|(_, d)| *d)
         .fold(f64::NEG_INFINITY, f64::max);
 
+    // #152 反向显著性门：放松安全闸时，原本被拦下的风险消息不得翻成已发送。
+    let safety_block_status = safety_block_status_for(gate_key);
+    let (safety_passed, safety_rate, safety_count) =
+        grade_safety_regression(&completed, safety_block_status, cfg);
+
     let send_passed = send_delta >= cfg.min_send_success_delta;
     let gate_passed = max_increase <= cfg.max_5gate_hit_increase;
-    let passed = send_passed && gate_passed;
+    let passed = send_passed && gate_passed && safety_passed;
 
     let mut metrics = doc! {
         "kind": "threshold",
@@ -107,14 +181,23 @@ pub fn grade_threshold(replays: &[ShadowReplay], cfg: &SignificanceCfg) -> (bool
         "max_5gate_hit_increase_observed": max_increase,
         "send_success_delta_passed": send_passed,
         "gate_increase_passed": gate_passed,
+        "safety_regression_passed": safety_passed,
+        "safety_regression_rate": safety_rate,
+        "safety_regression_count": safety_count as i64,
     };
+    if let Some(status) = safety_block_status {
+        metrics.insert("safety_gate_block_status", status);
+    }
     let mut gate_doc = Document::new();
     for (gate, delta) in gate_deltas {
         gate_doc.insert(gate, Bson::Double(delta));
     }
     metrics.insert("five_gate_hit_delta_per_gate", gate_doc);
     if !passed {
-        let reason = if !send_passed {
+        // 优先暴露安全回归（最危险），其次 send，最后 gate。
+        let reason = if !safety_passed {
+            "safety_gate_regression_above_threshold"
+        } else if !send_passed {
             "send_success_delta_below_threshold"
         } else {
             "gate_hit_increase_above_threshold"
@@ -408,7 +491,7 @@ pub async fn aggregate_and_grade(
 
         // 3. 按 kind 调对应 grader。
         let (passed, metrics) = match proposal.proposal_kind.as_str() {
-            "threshold" => grade_threshold(&replays, &cfg),
+            "threshold" => grade_threshold(&replays, &cfg, proposal.gate_key.as_deref()),
             "prompt" => grade_prompt(&replays, &cfg),
             other => (
                 false,
@@ -475,6 +558,7 @@ mod tests {
             min_self_critique_delta: 0.10,
             max_5gate_hit_increase: 0.10,
             max_fail_rate: 0.30,
+            max_safety_regression_rate: 0.0,
         }
     }
 
@@ -527,7 +611,7 @@ mod tests {
             let new = if i < 21 { Some("approved") } else { Some("blocked_by_safety_guard") };
             replays.push(rep("completed", original, new, no_gate(), None, None));
         }
-        let (passed, metrics) = grade_threshold(&replays, &cfg());
+        let (passed, metrics) = grade_threshold(&replays, &cfg(), None);
         assert!(passed, "expected passed for +0.10 send_success delta, got metrics={metrics:?}");
         assert_eq!(metrics.get_str("kind").unwrap(), "threshold");
     }
@@ -550,7 +634,7 @@ mod tests {
         for _ in 0..14 {
             replays.push(rep("failed", None, None, no_gate(), None, None));
         }
-        let (passed, metrics) = grade_threshold(&replays, &cfg());
+        let (passed, metrics) = grade_threshold(&replays, &cfg(), None);
         assert!(!passed);
         assert_eq!(
             metrics.get_str("reason").unwrap(),
@@ -600,7 +684,7 @@ mod tests {
                 None,
             ));
         }
-        let (passed, metrics) = grade_threshold(&replays, &cfg());
+        let (passed, metrics) = grade_threshold(&replays, &cfg(), None);
         assert!(!passed);
         assert_eq!(
             metrics.get_str("reason").unwrap(),
@@ -635,7 +719,7 @@ mod tests {
                 None,
             ));
         }
-        let (passed, metrics) = grade_threshold(&replays, &cfg());
+        let (passed, metrics) = grade_threshold(&replays, &cfg(), None);
         // 原 30/30=1.0，新 24/30=0.8，delta=-0.2，应 reject
         assert!(!passed);
         assert_eq!(
@@ -664,7 +748,7 @@ mod tests {
             ));
         }
         // 同时 send_success 持平（delta=0）— 必失败 send 这一项；用 +delta 的样本另测
-        let (passed, _) = grade_threshold(&replays, &cfg());
+        let (passed, _) = grade_threshold(&replays, &cfg(), None);
         assert!(!passed); // delta=0 < 0.05
     }
 
@@ -694,5 +778,118 @@ mod tests {
     fn nan_in_gate_deltas_returns_reject() {
         let bad = vec![("fact_risk_block", f64::NAN)];
         assert_eq!(nan_in_gate_deltas(&bad), Some("nan_in_metrics"));
+    }
+
+    /// #152：放松 fact_risk_block 安全闸——shadow 里有一条原本 held_by_ai_policy
+    /// 被拦下的 run，新阈值放行成 approved。即便 send_success +delta 达标，
+    /// 默认零容忍（max_safety_regression_rate=0.0）也必须 reject。
+    #[test]
+    fn safety_gate_loosening_rejected_when_blocked_run_flips_to_sent() {
+        let mut replays = Vec::new();
+        // 1 条危险翻转：原 held_by_ai_policy → 新 approved。
+        replays.push(rep(
+            "completed",
+            Some("held_by_ai_policy"),
+            Some("approved"),
+            no_gate(),
+            None,
+            None,
+        ));
+        // 29 条普通成功 run（让 send_success delta 为正、过 min_replays）。
+        for _ in 0..29 {
+            replays.push(rep(
+                "completed",
+                Some("held_by_ai_policy"),
+                Some("approved"),
+                no_gate(),
+                None,
+                None,
+            ));
+        }
+        let (passed, metrics) = grade_threshold(&replays, &cfg(), Some("fact_risk_block"));
+        assert!(!passed, "放走风险消息必须 reject，metrics={metrics:?}");
+        assert_eq!(
+            metrics.get_str("reason").unwrap(),
+            "safety_gate_regression_above_threshold"
+        );
+        assert!(metrics.get_f64("safety_regression_rate").unwrap() > 0.0);
+    }
+
+    /// #152：收紧 fact_risk_block（原 approved → 新 held_by_ai_policy）不算回归——
+    /// 安全回归率只统计"原 blocked → 新 sent"方向，反向（更安全）恒不触发。
+    #[test]
+    fn safety_gate_tightening_not_counted_as_regression() {
+        let mut replays = Vec::new();
+        // 30 条原 approved → 新 approved（无任何 blocked→sent 翻转），
+        // 且 send_success 持平。回归门应过（rate=0）。
+        for _ in 0..30 {
+            replays.push(rep(
+                "completed",
+                Some("approved"),
+                Some("approved"),
+                no_gate(),
+                None,
+                None,
+            ));
+        }
+        let (_passed, metrics) = grade_threshold(&replays, &cfg(), Some("fact_risk_block"));
+        assert_eq!(metrics.get_f64("safety_regression_rate").unwrap(), 0.0);
+        assert!(metrics.get_bool("safety_regression_passed").unwrap());
+    }
+
+    /// #152：非安全闸（human_like_score_rewrite）提案不受反向门约束——
+    /// 即便存在 blocked→sent 翻转也不按安全回归处理（rewrite 闸放松不漏风险）。
+    #[test]
+    fn non_safety_gate_skips_regression_check() {
+        let mut replays = Vec::new();
+        replays.push(rep(
+            "completed",
+            Some("held_by_ai_policy"),
+            Some("approved"),
+            no_gate(),
+            None,
+            None,
+        ));
+        for _ in 0..29 {
+            replays.push(rep(
+                "completed",
+                Some("approved"),
+                Some("approved"),
+                no_gate(),
+                None,
+                None,
+            ));
+        }
+        let (_passed, metrics) =
+            grade_threshold(&replays, &cfg(), Some("human_like_score_rewrite"));
+        // 非安全闸：回归门恒过（rate=0、count=0），不应出现 safety reason。
+        assert!(metrics.get_bool("safety_regression_passed").unwrap());
+        assert_eq!(metrics.get_i64("safety_regression_count").unwrap(), 0);
+        assert!(metrics.get_str("safety_gate_block_status").is_err());
+    }
+
+    /// #152：安全闸映射覆盖三个 block 类闸、且排除 rewrite / planner 闸。
+    #[test]
+    fn safety_block_status_mapping_is_exhaustive_and_exclusive() {
+        assert_eq!(
+            safety_block_status_for(Some("fact_risk_block")),
+            Some("held_by_ai_policy")
+        );
+        assert_eq!(
+            safety_block_status_for(Some("pressure_risk_block")),
+            Some("blocked_by_safety_guard")
+        );
+        assert_eq!(
+            safety_block_status_for(Some("product_accuracy_score_block")),
+            Some("blocked_unverified_product_claim")
+        );
+        // rewrite 类 / planner 域 / None 都不是安全闸。
+        assert_eq!(safety_block_status_for(Some("human_like_score_rewrite")), None);
+        assert_eq!(safety_block_status_for(Some("emotional_value_rewrite")), None);
+        assert_eq!(
+            safety_block_status_for(Some("planner_block_rate_threshold")),
+            None
+        );
+        assert_eq!(safety_block_status_for(None), None);
     }
 }

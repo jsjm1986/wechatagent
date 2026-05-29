@@ -292,6 +292,7 @@ async fn write_budget_exceeded_event(
             "calls_used": calls_used as i32,
         }),
         created_at: DateTime::now(),
+        dedupe_key: None,
     };
     state
         .db
@@ -338,6 +339,7 @@ async fn write_tick_completed_event(
             "auto_released_count": auto_released_count as i32,
         }),
         created_at: DateTime::now(),
+        dedupe_key: None,
     };
     state
         .db
@@ -362,6 +364,7 @@ async fn write_tick_failed_event(
         summary: format!("evolution tick failed: {}", truncate(error_summary, 1024)),
         details: Some(doc! { "error": truncate(error_summary, 1024) }),
         created_at: DateTime::now(),
+        dedupe_key: None,
     };
     state
         .db

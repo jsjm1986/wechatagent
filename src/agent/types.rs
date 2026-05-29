@@ -889,9 +889,12 @@ pub struct ReviewScores {
     pub human_like: i32,
     #[serde(default, deserialize_with = "number_i32")]
     pub emotional_value: i32,
-    #[serde(default, deserialize_with = "number_i32")]
+    /// 反序列化兼容：reviewer prompt 历史上以 `factRisk` 命名该评分键，
+    /// 接受 alias 以免 LLM 输出 / 旧持久化文档静默落 0（5→3 闸方法论塌缩遗留）。
+    #[serde(default, deserialize_with = "number_i32", alias = "factRisk")]
     pub hallucination_score: i32,
-    #[serde(default, deserialize_with = "number_i32")]
+    /// 反序列化兼容：reviewer prompt 历史上以 `productAccuracy` 命名该评分键。
+    #[serde(default, deserialize_with = "number_i32", alias = "productAccuracy")]
     pub knowledge_grounding_score: i32,
     /// Phase B / B1：恢复 `pressure_risk` 软闸评分（0-100）。Reviewer 输出，
     /// `review_passed` 与 single-shot revision 通道判定时使用。R11 兼容：
@@ -1849,5 +1852,48 @@ mod decision_review_result_tests {
         }
         // 任意未知字符串也不算禁用（仅在 hold_category 校验环节被矫正）
         assert!(!is_forbidden_hold_category("ai_thinking_more"));
+    }
+
+    #[test]
+    fn review_scores_map_factrisk_and_productaccuracy_aliases() {
+        // 回归守门：reviewer prompt 至今以 `factRisk` / `productAccuracy` 命名
+        // 这两个评分键（review.rs prompt schema），而结构体字段是
+        // hallucination_score / knowledge_grounding_score。若 alias 缺失，
+        // number_i32 会让 missing key 静默落 0 —— 导致 fact-risk 闸（block）
+        // 永远不触发、product-accuracy 闸恒判为 0 < block_below 而误拦。
+        // 本用例锁死 alias 行为，保证评分真正落到判定字段。
+        let json = r#"{
+            "humanLike": 6,
+            "emotionalValue": 5,
+            "productAccuracy": 9,
+            "pressureRisk": 2,
+            "factRisk": 8
+        }"#;
+        let scores: ReviewScores = serde_json::from_str(json).expect("scores parse");
+
+        assert_eq!(scores.human_like, 6);
+        assert_eq!(scores.emotional_value, 5);
+        // factRisk → hallucination_score（≥6 触发 fact-risk block）
+        assert_eq!(scores.hallucination_score, 8);
+        // productAccuracy → knowledge_grounding_score（<7 触发 product-claim block）
+        assert_eq!(scores.knowledge_grounding_score, 9);
+        assert_eq!(scores.pressure_risk, 2);
+    }
+
+    #[test]
+    fn review_scores_accept_canonical_snake_to_camel_keys() {
+        // 新 prompt 若改用规范键（hallucinationScore / knowledgeGroundingScore）
+        // 也 SHALL 正确反序列化 —— alias 是“额外接受”，不替换规范键。
+        let json = r#"{
+            "humanLike": 7,
+            "emotionalValue": 6,
+            "hallucinationScore": 3,
+            "knowledgeGroundingScore": 8,
+            "pressureRisk": 1
+        }"#;
+        let scores: ReviewScores = serde_json::from_str(json).expect("scores parse");
+
+        assert_eq!(scores.hallucination_score, 3);
+        assert_eq!(scores.knowledge_grounding_score, 8);
     }
 }

@@ -2,7 +2,7 @@
 
 use axum::{
     extract::{Path, Query, State},
-    Json,
+    Extension, Json,
 };
 use futures::TryStreamExt;
 use mongodb::{
@@ -14,6 +14,7 @@ use serde_json::{json, Value};
 
 use crate::{
     agent,
+    auth::AuthenticatedAdmin,
     error::{AppError, AppResult},
     models::{Contact, EvaluationScenario},
 };
@@ -62,9 +63,10 @@ pub(super) struct FormulaAdherenceRequest {
 
 pub(super) async fn list_evaluation_scenarios(
     State(state): State<AppState>,
+    Extension(admin): Extension<AuthenticatedAdmin>,
     Query(query): Query<EvaluationScenarioQuery>,
 ) -> AppResult<Json<Value>> {
-    let mut filter = doc! { "workspace_id": &state.config.default_workspace_id };
+    let mut filter = doc! { "workspace_id": &admin.current_workspace };
     if let Some(tag) = query.tag {
         filter.insert("tags", tag);
     }
@@ -92,6 +94,7 @@ pub(super) async fn list_evaluation_scenarios(
 
 pub(super) async fn create_evaluation_scenario(
     State(state): State<AppState>,
+    Extension(admin): Extension<AuthenticatedAdmin>,
     Json(payload): Json<EvaluationScenarioRequest>,
 ) -> AppResult<Json<Value>> {
     if payload.scenario_id.trim().is_empty() {
@@ -100,7 +103,7 @@ pub(super) async fn create_evaluation_scenario(
     let now = DateTime::now();
     let scenario = EvaluationScenario {
         id: None,
-        workspace_id: state.config.default_workspace_id.clone(),
+        workspace_id: admin.current_workspace.clone(),
         scenario_id: payload.scenario_id,
         title: payload.title,
         description: payload.description,
@@ -123,15 +126,16 @@ pub(super) async fn create_evaluation_scenario(
 
 pub(super) async fn update_evaluation_scenario(
     State(state): State<AppState>,
+    Extension(admin): Extension<AuthenticatedAdmin>,
     Path(id): Path<String>,
     Json(payload): Json<EvaluationScenarioRequest>,
 ) -> AppResult<Json<Value>> {
     let object_id = parse_object_id(&id)?;
-    state
+    let result = state
         .db
         .evaluation_scenarios()
         .update_one(
-            doc! { "_id": object_id },
+            doc! { "_id": object_id, "workspace_id": &admin.current_workspace },
             doc! {
                 "$set": {
                     "scenario_id": payload.scenario_id,
@@ -149,19 +153,33 @@ pub(super) async fn update_evaluation_scenario(
             None,
         )
         .await?;
+    if result.matched_count == 0 {
+        return Err(AppError::NotFound(
+            "evaluation scenario not found".to_string(),
+        ));
+    }
     Ok(Json(json!({ "ok": true })))
 }
 
 pub(super) async fn delete_evaluation_scenario(
     State(state): State<AppState>,
+    Extension(admin): Extension<AuthenticatedAdmin>,
     Path(id): Path<String>,
 ) -> AppResult<Json<Value>> {
     let object_id = parse_object_id(&id)?;
-    state
+    let result = state
         .db
         .evaluation_scenarios()
-        .delete_one(doc! { "_id": object_id }, None)
+        .delete_one(
+            doc! { "_id": object_id, "workspace_id": &admin.current_workspace },
+            None,
+        )
         .await?;
+    if result.deleted_count == 0 {
+        return Err(AppError::NotFound(
+            "evaluation scenario not found".to_string(),
+        ));
+    }
     Ok(Json(json!({ "ok": true })))
 }
 
@@ -171,11 +189,12 @@ pub(super) async fn delete_evaluation_scenario(
 /// CI 流水线和 UI 自检不会因数据不全而中断。
 pub(super) async fn run_formula_adherence_evaluation(
     State(state): State<AppState>,
+    Extension(admin): Extension<AuthenticatedAdmin>,
     Json(payload): Json<FormulaAdherenceRequest>,
 ) -> AppResult<Json<Value>> {
-    validate_account(&state, &payload.account_id).await?;
+    validate_account(&state, &admin.current_workspace, &payload.account_id).await?;
     let mut filter = doc! {
-        "workspace_id": &state.config.default_workspace_id,
+        "workspace_id": &admin.current_workspace,
         "status": "active"
     };
     if !payload.scenario_ids.is_empty() {
@@ -218,7 +237,7 @@ pub(super) async fn run_formula_adherence_evaluation(
         .operation_domain_configs()
         .find_one(
             doc! {
-                "workspace_id": &state.config.default_workspace_id,
+                "workspace_id": &admin.current_workspace,
                 "domain": "user_operations"
             },
             None,
@@ -231,7 +250,7 @@ pub(super) async fn run_formula_adherence_evaluation(
         .saturating_mul(scenarios.len() as i64);
 
     let base_contact = match payload.contact_id.as_deref() {
-        Some(id) => Some(find_contact_by_id(&state, id).await?),
+        Some(id) => Some(find_contact_by_id(&state, &admin.current_workspace, id).await?),
         None => None,
     };
 
@@ -268,7 +287,9 @@ pub(super) async fn run_formula_adherence_evaluation(
         }
         let contact = base_contact
             .clone()
-            .unwrap_or_else(|| scenario_contact_from_seed(&state, &payload.account_id, &scenario));
+            .unwrap_or_else(|| {
+                scenario_contact_from_seed(&admin.current_workspace, &payload.account_id, &scenario)
+            });
         let turns = match agent::simulate_user_dialogue(&state, contact, messages).await {
             Ok(t) => t,
             Err(err) => {
@@ -283,7 +304,7 @@ pub(super) async fn run_formula_adherence_evaluation(
         // 用 evaluation 启动后的 agent_run_logs 时间戳过滤当前场景的子 run。
         // 简化处理：累加自评测开始至今的所有 run（多场景共享 account），
         // 不会重复计数因为我们每次循环之后才做一次累加。
-        let scenario_tokens = sum_scenario_tokens(&state, &payload.account_id, evaluation_started_at)
+        let scenario_tokens = sum_scenario_tokens(&state, &admin.current_workspace, &payload.account_id, evaluation_started_at)
             .await
             .saturating_sub(total_tokens_used);
         total_tokens_used = total_tokens_used.saturating_add(scenario_tokens);
@@ -365,7 +386,7 @@ pub(super) async fn run_formula_adherence_evaluation(
         .insert_one(
             crate::models::AgentEvent {
                 id: None,
-                workspace_id: state.config.default_workspace_id.clone(),
+                workspace_id: admin.current_workspace.clone(),
                 account_id: payload.account_id.clone(),
                 contact_wxid: None,
                 kind: "formula_adherence_evaluated".to_string(),
@@ -384,6 +405,7 @@ pub(super) async fn run_formula_adherence_evaluation(
                     "totalTokenBudget": total_token_budget,
                 }),
                 created_at: DateTime::now(),
+                dedupe_key: None,
             },
             None,
         )
@@ -404,14 +426,14 @@ pub(super) async fn run_formula_adherence_evaluation(
 }
 
 /// 波 C2：累加从 `since` 起到现在 evaluation 这个 account 上的所有 agent_run_logs.tokens_used。
-async fn sum_scenario_tokens(state: &AppState, account_id: &str, since: DateTime) -> i64 {
+async fn sum_scenario_tokens(state: &AppState, workspace_id: &str, account_id: &str, since: DateTime) -> i64 {
     let mut total = 0_i64;
     let Ok(mut cur) = state
         .db
         .agent_run_logs()
         .find(
             doc! {
-                "workspace_id": &state.config.default_workspace_id,
+                "workspace_id": workspace_id,
                 "account_id": account_id,
                 "created_at": { "$gte": since }
             },
@@ -428,7 +450,7 @@ async fn sum_scenario_tokens(state: &AppState, account_id: &str, since: DateTime
 }
 
 fn scenario_contact_from_seed(
-    state: &AppState,
+    workspace_id: &str,
     account_id: &str,
     scenario: &EvaluationScenario,
 ) -> Contact {
@@ -442,7 +464,7 @@ fn scenario_contact_from_seed(
         .unwrap_or_else(|| format!("eval_{}", scenario.scenario_id));
     Contact {
         id: None,
-        workspace_id: state.config.default_workspace_id.clone(),
+        workspace_id: workspace_id.to_string(),
         account_id: account_id.to_string(),
         wxid,
         nickname: seed.get_str("nickname").ok().map(ToString::to_string),

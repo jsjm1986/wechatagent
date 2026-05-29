@@ -2,7 +2,7 @@
 
 use axum::{
     extract::{Path, Query, State},
-    Json,
+    Extension, Json,
 };
 use futures::TryStreamExt;
 use mongodb::{
@@ -14,6 +14,7 @@ use serde_json::{json, Value};
 
 use crate::{
     agent,
+    auth::AuthenticatedAdmin,
     error::{AppError, AppResult},
 };
 
@@ -38,6 +39,7 @@ pub(super) struct LlmUsageQuery {
 
 pub(super) async fn list_tasks(
     State(state): State<AppState>,
+    Extension(admin): Extension<AuthenticatedAdmin>,
     Query(query): Query<AccountScopedQuery>,
 ) -> AppResult<Json<Value>> {
     let account_id = query
@@ -48,7 +50,7 @@ pub(super) async fn list_tasks(
         .tasks()
         .find(
             doc! {
-                "workspace_id": &state.config.default_workspace_id,
+                "workspace_id": &admin.current_workspace,
                 "account_id": &account_id
             },
             FindOptions::builder()
@@ -82,13 +84,14 @@ pub(super) async fn list_tasks(
 
 pub(super) async fn list_agent_runs(
     State(state): State<AppState>,
+    Extension(admin): Extension<AuthenticatedAdmin>,
     Query(query): Query<AgentRunQuery>,
 ) -> AppResult<Json<Value>> {
     let account_id = query
         .account_id
         .unwrap_or_else(|| state.config.default_account_id.clone());
     let mut filter = doc! {
-        "workspace_id": &state.config.default_workspace_id,
+        "workspace_id": &admin.current_workspace,
         "account_id": &account_id
     };
     if let Some(contact_wxid) = query.contact_wxid {
@@ -115,9 +118,10 @@ pub(super) async fn list_agent_runs(
 
 pub(super) async fn list_llm_usage(
     State(state): State<AppState>,
+    Extension(admin): Extension<AuthenticatedAdmin>,
     Query(query): Query<LlmUsageQuery>,
 ) -> AppResult<Json<Value>> {
-    let mut filter = doc! { "workspace_id": &state.config.default_workspace_id };
+    let mut filter = doc! { "workspace_id": &admin.current_workspace };
     if let Some(account_id) = query.account_id {
         filter.insert("account_id", account_id);
     }
@@ -161,19 +165,23 @@ pub(super) async fn list_llm_usage(
 pub(super) async fn review_task_now(
     State(state): State<AppState>,
     Path(id): Path<String>,
+    Extension(admin): Extension<AuthenticatedAdmin>,
 ) -> AppResult<Json<Value>> {
     let object_id = parse_object_id(&id)?;
     let task = state
         .db
         .tasks()
-        .find_one(doc! { "_id": object_id }, None)
+        .find_one(
+            doc! { "_id": object_id, "workspace_id": &admin.current_workspace },
+            None,
+        )
         .await?
         .ok_or_else(|| AppError::NotFound("task not found".to_string()))?;
     state
         .db
         .tasks()
         .update_one(
-            doc! { "_id": object_id },
+            doc! { "_id": object_id, "workspace_id": &admin.current_workspace },
             doc! { "$set": { "status": "running", "updated_at": DateTime::now() } },
             None,
         )
@@ -189,23 +197,28 @@ pub(super) async fn review_task_now(
 pub(super) async fn cancel_agent_task(
     State(state): State<AppState>,
     Path(id): Path<String>,
+    Extension(admin): Extension<AuthenticatedAdmin>,
 ) -> AppResult<Json<Value>> {
     let object_id = parse_object_id(&id)?;
-    state
+    crate::models::assert_agent_task_status_valid("cancelled");
+    let result = state
         .db
         .tasks()
         .update_one(
-            doc! { "_id": object_id },
+            doc! { "_id": object_id, "workspace_id": &admin.current_workspace },
             doc! {
                 "$set": {
                     "status": "cancelled",
-                    "gateway_status": "manual_cancelled",
-                    "cancel_reason": "人工取消",
+                    "gateway_status": "admin_cancelled",
+                    "cancel_reason": "admin 取消",
                     "updated_at": DateTime::now()
                 }
             },
             None,
         )
         .await?;
+    if result.matched_count == 0 {
+        return Err(AppError::NotFound("task not found".to_string()));
+    }
     Ok(Json(json!({ "ok": true })))
 }

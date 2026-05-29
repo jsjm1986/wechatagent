@@ -15,7 +15,7 @@
 
 use axum::{
     extract::{Path, Query, State},
-    Json,
+    Extension, Json,
 };
 use futures::TryStreamExt;
 use mongodb::{
@@ -26,6 +26,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::{
+    auth::AuthenticatedAdmin,
     error::{AppError, AppResult},
     models::OperationStatePolicy,
 };
@@ -46,9 +47,10 @@ pub(super) struct ListOperationStatePoliciesQuery {
 
 pub(super) async fn list_operation_state_policies(
     State(state): State<AppState>,
+    Extension(admin): Extension<AuthenticatedAdmin>,
     Query(query): Query<ListOperationStatePoliciesQuery>,
 ) -> AppResult<Json<Value>> {
-    let mut filter = doc! { "workspace_id": &state.config.default_workspace_id };
+    let mut filter = doc! { "workspace_id": &admin.current_workspace };
     if let Some(domain) = query.domain.as_ref().filter(|s| !s.trim().is_empty()) {
         filter.insert("domain", domain.trim());
     }
@@ -77,13 +79,17 @@ pub(super) async fn list_operation_state_policies(
 
 pub(super) async fn get_operation_state_policy(
     State(state): State<AppState>,
+    Extension(admin): Extension<AuthenticatedAdmin>,
     Path(id): Path<String>,
 ) -> AppResult<Json<Value>> {
     let object_id = parse_object_id(&id)?;
     let policy = state
         .db
         .operation_state_policies()
-        .find_one(doc! { "_id": object_id }, None)
+        .find_one(
+            doc! { "_id": object_id, "workspace_id": &admin.current_workspace },
+            None,
+        )
         .await?
         .ok_or_else(|| AppError::NotFound("operation state policy not found".to_string()))?;
     Ok(Json(json!({ "item": operation_state_policy_json(policy) })))

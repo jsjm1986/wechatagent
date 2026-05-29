@@ -41,6 +41,8 @@ mod m012_drop_legacy_taxonomy_seed;
 mod m013_seed_user_operation_state_policies;
 mod m014_drop_trigger_keywords;
 mod m015_ops_tables_active_versions;
+mod m016_backfill_workspace_id_on_legacy_rows;
+mod m017_dedupe_outcome_aggregation;
 
 type MigrationFuture<'a> = Pin<Box<dyn Future<Output = AppResult<()>> + Send + 'a>>;
 pub type MigrationFn = for<'a> fn(&'a Database) -> MigrationFuture<'a>;
@@ -112,6 +114,14 @@ pub const MIGRATIONS: &[Migration] = &[
     Migration {
         id: "2026_05_W4_003_ops_tables_active_versions",
         run: |db| Box::pin(m015_ops_tables_active_versions::run_step(db)),
+    },
+    Migration {
+        id: "2026_05_X1_001_backfill_workspace_id_on_legacy_rows",
+        run: |db| Box::pin(m016_backfill_workspace_id_on_legacy_rows::run_step(db)),
+    },
+    Migration {
+        id: "2026_05_X1_002_dedupe_outcome_aggregation_tasks",
+        run: |db| Box::pin(m017_dedupe_outcome_aggregation::run_step(db)),
     },
 ];
 

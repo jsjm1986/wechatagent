@@ -25,12 +25,13 @@ use mongodb::bson::{doc, oid::ObjectId, DateTime, Document};
 use mongodb::options::{FindOneAndUpdateOptions, ReturnDocument};
 
 use crate::error::AppResult;
-use crate::models::OutboxEntry;
+use crate::models::{AgentStatus, OutboxEntry};
 use crate::routes::AppState;
 
 use super::outbox::{
     backoff_with_jitter_seeded, check_second_safety_gate_pure, write_outbox_event, OutboxStatus,
 };
+use super::run_envelope::SOURCE_KIND_MANUAL_SEND;
 
 /// MCP 单次调用 timeout。lease (60s) 远大于此，确保 worker 出错不会卡住 entry。
 ///
@@ -61,7 +62,9 @@ fn worker_id() -> String {
 }
 
 /// **崩溃恢复**：把所有 `status="in_flight" AND locked_until < now` 的 entry
-/// 改回 pending；同时清空 worker_id / locked_until。返回回收条数。
+/// 改回 pending；同时清空 worker_id / locked_until，并置 `reclaimed_in_flight=true`。
+/// 该标记告诉 `process_entry`：上一个 worker 在写 `sent` 前消失，**可能已把消息
+/// 送达 MCP/微信**，重发前须先跑 `mcp_already_succeeded` post-hoc 核对。返回回收条数。
 //
 // NOTE: 暴露为 `pub` 仅供 `tests/outbox_integration.rs`（W4 / Task 5.8 / R13.10）
 // 直接驱动，不应在生产代码中绕过 `tick` 单独调用。
@@ -77,6 +80,7 @@ pub async fn reclaim_expired_leases(state: &AppState) -> AppResult<u64> {
             doc! {
                 "$set": {
                     "status": OutboxStatus::Pending.as_str(),
+                    "reclaimed_in_flight": true,
                     "updated_at": now,
                 },
                 "$unset": {
@@ -414,6 +418,26 @@ async fn mcp_already_succeeded(
     Ok(count > 0)
 }
 
+/// P1-6：发送前 contact 状态门——纯函数，便于单测。
+///
+/// 入队后到 dispatcher 抢占之间 contact 可能被运营改成 `normal`（撤管）或
+/// `paused`，此时 in-flight MCP 不应继续把消息送出去（违反"撤管即停"语义）。
+/// `manual_send`（admin UI 主动发）不受此门约束——admin 已显式确认发送意图。
+///
+/// 返回 `Some(reason)` 表示应当 cancel；`None` 表示放行。
+pub(crate) fn check_contact_status_pure(
+    source_kind: &str,
+    agent_status: &AgentStatus,
+) -> Option<&'static str> {
+    if source_kind == SOURCE_KIND_MANUAL_SEND {
+        return None;
+    }
+    match agent_status {
+        AgentStatus::Managed => None,
+        _ => Some("contact_status_changed_unmanaged"),
+    }
+}
+
 /// 处理单条已抢占的 entry：二次安全门 → MCP 发送 → 状态推进。
 //
 // NOTE: 暴露为 `pub` 仅供 `tests/outbox_integration.rs`（W4 / Task 5.8 / R13.10）
@@ -458,6 +482,70 @@ pub async fn process_entry(state: &AppState, entry: &OutboxEntry) -> AppResult<(
         }
     };
 
+    if let Some(reason) = check_contact_status_pure(&entry.source_kind, &contact.agent_status) {
+        cancel_entry(state, entry_id, entry, reason).await?;
+        return Ok(());
+    }
+
+    let collection = state.db.collection_agent_send_outbox();
+    let now = DateTime::now();
+
+    // 崩溃恢复幂等门：本条曾被 reclaim（上一个 worker 抢占后在写 sent 前消失），
+    // 它可能已把消息送达 MCP/微信。重发前先 post-hoc 核对 mcp_call_logs；命中即
+    // 标 sent 不重发，避免客户收到重复消息（与 timeout 分支同一核对函数）。
+    if entry.reclaimed_in_flight {
+        if let Ok(true) = mcp_already_succeeded(
+            state,
+            &entry.account_id,
+            &entry.contact_wxid,
+            &entry.content,
+            entry.created_at,
+        )
+        .await
+        {
+            collection
+                .update_one(
+                    doc! {
+                        "_id": entry_id,
+                        "status": OutboxStatus::InFlight.as_str(),
+                    },
+                    doc! {
+                        "$set": {
+                            "status": OutboxStatus::Sent.as_str(),
+                            "sent_at": now,
+                            "updated_at": now,
+                            "last_error": "reclaimed after crash but MCP already succeeded — confirmed via mcp_call_logs",
+                        },
+                        "$unset": {
+                            "worker_id": "",
+                            "locked_until": "",
+                            "reclaimed_in_flight": "",
+                        }
+                    },
+                    None,
+                )
+                .await?;
+            let _ = write_event_with_cap(
+                state,
+                entry_id,
+                &entry.account_id,
+                Some(&entry.contact_wxid),
+                "outbox_sent_post_hoc",
+                "warn",
+                "outbox entry confirmed sent post-hoc via mcp_call_logs after crash reclaim",
+                Some(doc! {
+                    "outbox_id": entry_id,
+                    "run_id": &entry.run_id,
+                    "attempt": entry.attempt + 1,
+                    "reason": "crash_reclaim",
+                }),
+            )
+            .await;
+            update_run_log_outbox_status(state, &entry.run_id, "sent").await;
+            return Ok(());
+        }
+    }
+
     let extra_raw = Some(doc! {
         "outbox_id": entry_id,
         "run_id": &entry.run_id,
@@ -468,9 +556,6 @@ pub async fn process_entry(state: &AppState, entry: &OutboxEntry) -> AppResult<(
         super::gateway::send_outbound_message(state, &contact, &entry.content, extra_raw);
     let send_result =
         tokio::time::timeout(Duration::from_secs(MCP_SEND_TIMEOUT_SECONDS), send_fut).await;
-
-    let collection = state.db.collection_agent_send_outbox();
-    let now = DateTime::now();
 
     match send_result {
         Ok(Ok(_)) => {
@@ -489,6 +574,7 @@ pub async fn process_entry(state: &AppState, entry: &OutboxEntry) -> AppResult<(
                         "$unset": {
                             "worker_id": "",
                             "locked_until": "",
+                            "reclaimed_in_flight": "",
                         }
                     },
                     None,
@@ -550,6 +636,7 @@ pub async fn process_entry(state: &AppState, entry: &OutboxEntry) -> AppResult<(
                             "$unset": {
                                 "worker_id": "",
                                 "locked_until": "",
+                                "reclaimed_in_flight": "",
                             }
                         },
                         None,
@@ -579,8 +666,34 @@ pub async fn process_entry(state: &AppState, entry: &OutboxEntry) -> AppResult<(
     Ok(())
 }
 
-/// 写事件前先看 outbox_id 已有事件数：若 ≥ [`PER_ENTRY_EVENT_CAP`] 直接 skip
-/// （R13.7 防 retry 风暴写爆 events）。
+/// P2-3：闭集化 cap 后行为，方便单测。
+///
+/// * `WriteNormal` —— 未达 cap，正常写事件。
+/// * `WriteSentinel` —— 首次达到 cap，写一条 `outbox.event_cap_reached`
+///   sentinel 事件后转 silent。
+/// * `Silent` —— 已经写过 sentinel，直接静音。
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum CapDecision {
+    WriteNormal,
+    WriteSentinel,
+    Silent,
+}
+
+/// 纯函数：根据 outbox_id 已有事件计数 + 是否已写过 sentinel 决定行为。
+pub(crate) fn decide_cap_action(count: u64, sentinel_already: bool) -> CapDecision {
+    if count < PER_ENTRY_EVENT_CAP as u64 {
+        CapDecision::WriteNormal
+    } else if sentinel_already {
+        CapDecision::Silent
+    } else {
+        CapDecision::WriteSentinel
+    }
+}
+
+/// 写事件前先看 outbox_id 已有事件数：若 ≥ [`PER_ENTRY_EVENT_CAP`]
+/// 则**仅写一条** `outbox.event_cap_reached` sentinel 后转 silent，否则
+/// 正常写事件。Sentinel 通过 `details.kind == "event_cap_reached"` 去重，
+/// 防止 retry 风暴写爆 events，又保证仪表盘能感知"该 entry 被截断"。
 pub(crate) async fn write_event_with_cap(
     state: &AppState,
     outbox_id: ObjectId,
@@ -597,15 +710,65 @@ pub(crate) async fn write_event_with_cap(
         .count_documents(doc! { "details.outbox_id": outbox_id }, None)
         .await
         .unwrap_or(0);
-    if count >= PER_ENTRY_EVENT_CAP as u64 {
-        tracing::warn!(
-            outbox_id = %outbox_id,
-            count,
-            "outbox event cap reached, skipping additional event writes"
-        );
-        return Ok(());
+    if count < PER_ENTRY_EVENT_CAP as u64 {
+        return write_outbox_event(
+            state,
+            account_id,
+            contact_wxid,
+            kind,
+            status,
+            summary,
+            details,
+        )
+        .await;
     }
-    write_outbox_event(state, account_id, contact_wxid, kind, status, summary, details).await
+    let sentinel_already = state
+        .db
+        .events()
+        .count_documents(
+            doc! {
+                "details.outbox_id": outbox_id,
+                "details.kind": "event_cap_reached",
+            },
+            None,
+        )
+        .await
+        .unwrap_or(0)
+        > 0;
+    match decide_cap_action(count, sentinel_already) {
+        CapDecision::WriteNormal => {
+            // 不会进入此分支：count >= cap 已在上方早返。
+            unreachable!("decide_cap_action returned WriteNormal at or above cap")
+        }
+        CapDecision::Silent => {
+            tracing::warn!(
+                outbox_id = %outbox_id,
+                count,
+                "outbox event cap reached, skipping additional event writes"
+            );
+            Ok(())
+        }
+        CapDecision::WriteSentinel => {
+            let sentinel = doc! {
+                "outbox_id": outbox_id,
+                "kind": "event_cap_reached",
+                "cap": PER_ENTRY_EVENT_CAP,
+                "observed_count": count as i64,
+                "suppressed_kind": kind,
+                "suppressed_status": status,
+            };
+            write_outbox_event(
+                state,
+                account_id,
+                contact_wxid,
+                "outbox.event_cap_reached",
+                "capped",
+                "outbox event cap reached, further events suppressed",
+                Some(sentinel),
+            )
+            .await
+        }
+    }
 }
 
 /// 默认 poll 间隔（秒）。worker 是单例后台任务，与 per-account
@@ -664,6 +827,38 @@ mod tests {
         assert_eq!(PER_ENTRY_EVENT_CAP, 20);
     }
 
+    /// P1-6：managed contact 走 inbound_message 路径——放行。
+    #[test]
+    fn contact_status_gate_allows_managed_inbound() {
+        assert!(
+            check_contact_status_pure("inbound_message", &AgentStatus::Managed).is_none(),
+            "managed contact 应当放行"
+        );
+    }
+
+    /// P1-6：撤管后非 manual_send 路径必须 cancel——不能让 in-flight MCP
+    /// 把消息发给已经退出托管的 contact。
+    #[test]
+    fn contact_status_gate_cancels_normal_when_not_manual() {
+        let reason = check_contact_status_pure("inbound_message", &AgentStatus::Normal);
+        assert_eq!(reason, Some("contact_status_changed_unmanaged"));
+        let reason = check_contact_status_pure("follow_up_task", &AgentStatus::Normal);
+        assert_eq!(reason, Some("contact_status_changed_unmanaged"));
+    }
+
+    /// P1-6：admin 主动 manual_send 不受 agent_status 门约束——admin
+    /// 已显式确认发送意图（同 admin 直接联系语义）。
+    #[test]
+    fn contact_status_gate_passthrough_for_manual_send() {
+        assert!(
+            check_contact_status_pure(SOURCE_KIND_MANUAL_SEND, &AgentStatus::Normal).is_none(),
+            "manual_send 不受 agent_status 门约束"
+        );
+        assert!(
+            check_contact_status_pure(SOURCE_KIND_MANUAL_SEND, &AgentStatus::Managed).is_none()
+        );
+    }
+
     /// `worker_id` 含 hostname / pid / uuid 三段。
     #[test]
     fn worker_id_has_three_segments() {
@@ -695,5 +890,80 @@ mod tests {
     #[test]
     fn mcp_send_timeout_is_thirty_seconds() {
         assert_eq!(MCP_SEND_TIMEOUT_SECONDS, 30);
+    }
+
+    /// P2-3：cap 未触发 → 正常写事件。
+    #[test]
+    fn decide_cap_action_below_cap_writes_normal() {
+        for c in [0u64, 1, 5, (PER_ENTRY_EVENT_CAP - 1) as u64] {
+            assert_eq!(
+                decide_cap_action(c, false),
+                CapDecision::WriteNormal,
+                "count={c} 应正常写"
+            );
+            assert_eq!(
+                decide_cap_action(c, true),
+                CapDecision::WriteNormal,
+                "count={c} 即使已写 sentinel 也按正常写（应不可能但要稳）"
+            );
+        }
+    }
+
+    /// P2-3：首次到达 cap → 写一次 sentinel。
+    #[test]
+    fn decide_cap_action_first_hit_writes_sentinel() {
+        assert_eq!(
+            decide_cap_action(PER_ENTRY_EVENT_CAP as u64, false),
+            CapDecision::WriteSentinel
+        );
+        assert_eq!(
+            decide_cap_action((PER_ENTRY_EVENT_CAP + 5) as u64, false),
+            CapDecision::WriteSentinel,
+            "已经超出 cap 但 sentinel 还没写时，仍要补写一次"
+        );
+    }
+
+    /// P2-3：sentinel 已写 → 静音；防止 retry 风暴写爆 events。
+    #[test]
+    fn decide_cap_action_silent_after_sentinel() {
+        assert_eq!(
+            decide_cap_action(PER_ENTRY_EVENT_CAP as u64, true),
+            CapDecision::Silent
+        );
+        assert_eq!(
+            decide_cap_action((PER_ENTRY_EVENT_CAP + 100) as u64, true),
+            CapDecision::Silent
+        );
+    }
+
+    /// 崩溃恢复幂等门：旧 outbox 文档（落库于 `reclaimed_in_flight` 字段引入
+    /// 之前）缺该字段，必须按 `#[serde(default)]` 反序列化为 `false`（R11
+    /// 向后兼容）。否则 process_entry 会对每条历史 entry 误跑 post-hoc 核对。
+    #[test]
+    fn legacy_outbox_doc_defaults_reclaimed_in_flight_false() {
+        use mongodb::bson::{doc, oid::ObjectId, DateTime};
+        let legacy = doc! {
+            "_id": ObjectId::new(),
+            "workspace_id": "default",
+            "account_id": "wx_acc_1",
+            "contact_wxid": "wxid_alice",
+            "run_id": "run-001",
+            "source_event_id": "evt-001",
+            "source_kind": "inbound_message",
+            "content": "你好",
+            "content_hash": "abc",
+            "idempotency_key": "key-1",
+            "attempt": 0_i32,
+            "max_attempts": 3_i32,
+            "status": "pending",
+            "created_at": DateTime::now(),
+            "updated_at": DateTime::now(),
+        };
+        let entry: crate::models::OutboxEntry =
+            mongodb::bson::from_document(legacy).expect("legacy doc should deserialize");
+        assert!(
+            !entry.reclaimed_in_flight,
+            "缺字段的旧文档必须默认 reclaimed_in_flight=false"
+        );
     }
 }

@@ -261,6 +261,7 @@ async fn write_auto_release_decision_event(
         ),
         details: Some(details),
         created_at: DateTime::now(),
+        dedupe_key: None,
     };
     state
         .db

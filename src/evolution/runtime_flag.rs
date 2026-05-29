@@ -28,7 +28,7 @@ use crate::routes::AppState;
 /// 读取指定 workspace 的 `evolution_runtime_flags` 单文档；不存在时返回 `None`。
 ///
 /// 调用方默认应把 `None` 视作"灰度未开"——即便 env `EVOLUTION_ENABLED=true`
-/// 也不应该让全部流量进 evolution（那是 W1 时代的行为，C3 后被 mongo flag 接管）。
+/// 也不应该让全部流量进 evolution（那是 W1 时代的行为，C3 后改由 mongo flag 主导）。
 pub async fn load_runtime_flag(
     state: &AppState,
     workspace_id: &str,

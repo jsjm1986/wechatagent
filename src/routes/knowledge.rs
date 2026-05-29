@@ -2,7 +2,7 @@
 
 use axum::{
     extract::{Path, Query, State},
-    Json,
+    Extension, Json,
 };
 use futures::TryStreamExt;
 use mongodb::{
@@ -15,8 +15,10 @@ use serde_json::{json, Value};
 use std::sync::Arc;
 
 use crate::{
+    auth::AuthenticatedAdmin,
     agent,
     error::{AppError, AppResult},
+    llm::LlmProvider,
     models::{
         KnowledgeChatTurn, KnowledgeUsageLog, OperationKnowledgeChunk, OperationKnowledgeDocument,
     },
@@ -142,7 +144,7 @@ pub(super) struct OperationKnowledgeRequest {
     priority: i32,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[allow(dead_code)] // HTTP schema：routing_card / forbidden_claims 字段保留前端兼容
 pub(super) struct OperationKnowledgeChunkRequest {
@@ -275,10 +277,11 @@ pub(super) async fn list_operation_knowledge(
 
 pub(super) async fn list_operation_knowledge_documents(
     State(state): State<AppState>,
+    Extension(admin): Extension<AuthenticatedAdmin>,
     Query(query): Query<OperationKnowledgeDocumentQuery>,
 ) -> AppResult<Json<Value>> {
     let mut filter = doc! {
-        "workspace_id": &state.config.default_workspace_id,
+        "workspace_id": &admin.current_workspace,
         "domain": "user_operations"
     };
     if let Some(account_id) = query.account_id {
@@ -313,6 +316,7 @@ pub(super) async fn list_operation_knowledge_documents(
 
 pub(super) async fn create_operation_knowledge_document(
     State(state): State<AppState>,
+    Extension(admin): Extension<AuthenticatedAdmin>,
     Json(payload): Json<OperationKnowledgeDocumentRequest>,
 ) -> AppResult<Json<Value>> {
     validate_operation_knowledge_document(&payload)?;
@@ -320,7 +324,7 @@ pub(super) async fn create_operation_knowledge_document(
         .db
         .operation_knowledge_documents()
         .insert_one(
-            operation_knowledge_document_from_request(&state, payload, None),
+            operation_knowledge_document_from_request(&state, &admin.current_workspace, payload, None),
             None,
         )
         .await?;
@@ -331,6 +335,7 @@ pub(super) async fn create_operation_knowledge_document(
 
 pub(super) async fn get_operation_knowledge_document(
     State(state): State<AppState>,
+    Extension(admin): Extension<AuthenticatedAdmin>,
     Path(id): Path<String>,
 ) -> AppResult<Json<Value>> {
     let object_id = parse_object_id(&id)?;
@@ -340,7 +345,7 @@ pub(super) async fn get_operation_knowledge_document(
         .find_one(
             doc! {
                 "_id": object_id,
-                "workspace_id": &state.config.default_workspace_id
+                "workspace_id": &admin.current_workspace
             },
             None,
         )
@@ -353,6 +358,7 @@ pub(super) async fn get_operation_knowledge_document(
 
 pub(super) async fn update_operation_knowledge_document(
     State(state): State<AppState>,
+    Extension(admin): Extension<AuthenticatedAdmin>,
     Path(id): Path<String>,
     Json(payload): Json<OperationKnowledgeDocumentRequest>,
 ) -> AppResult<Json<Value>> {
@@ -364,9 +370,9 @@ pub(super) async fn update_operation_knowledge_document(
         .replace_one(
             doc! {
                 "_id": object_id,
-                "workspace_id": &state.config.default_workspace_id
+                "workspace_id": &admin.current_workspace
             },
-            operation_knowledge_document_from_request(&state, payload, Some(object_id)),
+            operation_knowledge_document_from_request(&state, &admin.current_workspace, payload, Some(object_id)),
             None,
         )
         .await?;
@@ -375,6 +381,7 @@ pub(super) async fn update_operation_knowledge_document(
 
 pub(super) async fn delete_operation_knowledge_document(
     State(state): State<AppState>,
+    Extension(admin): Extension<AuthenticatedAdmin>,
     Path(id): Path<String>,
 ) -> AppResult<Json<Value>> {
     let object_id = parse_object_id(&id)?;
@@ -384,7 +391,7 @@ pub(super) async fn delete_operation_knowledge_document(
         .delete_one(
             doc! {
                 "_id": object_id,
-                "workspace_id": &state.config.default_workspace_id
+                "workspace_id": &admin.current_workspace
             },
             None,
         )
@@ -395,7 +402,7 @@ pub(super) async fn delete_operation_knowledge_document(
         .delete_many(
             doc! {
                 "document_id": object_id,
-                "workspace_id": &state.config.default_workspace_id
+                "workspace_id": &admin.current_workspace
             },
             None,
         )
@@ -405,19 +412,23 @@ pub(super) async fn delete_operation_knowledge_document(
 
 pub(super) async fn list_operation_knowledge_chunks(
     State(state): State<AppState>,
+    Extension(admin): Extension<AuthenticatedAdmin>,
     Query(query): Query<OperationKnowledgeChunkQuery>,
 ) -> AppResult<Json<Value>> {
-    let items = load_operation_knowledge_chunks_for_query(&state, query).await?;
+    let items =
+        load_operation_knowledge_chunks_for_query(&state, &admin.current_workspace, query).await?;
     Ok(Json(json!({ "items": items })))
 }
 
 pub(super) async fn list_operation_knowledge_document_chunks(
     State(state): State<AppState>,
+    Extension(admin): Extension<AuthenticatedAdmin>,
     Path(id): Path<String>,
 ) -> AppResult<Json<Value>> {
     let document_id = parse_object_id(&id)?;
     let items = load_operation_knowledge_chunks_for_query(
         &state,
+        &admin.current_workspace,
         OperationKnowledgeChunkQuery {
             account_id: None,
             document_id: Some(document_id.to_hex()),
@@ -431,6 +442,7 @@ pub(super) async fn list_operation_knowledge_document_chunks(
 
 pub(super) async fn create_operation_knowledge_chunk(
     State(state): State<AppState>,
+    Extension(admin): Extension<AuthenticatedAdmin>,
     Json(payload): Json<OperationKnowledgeChunkRequest>,
 ) -> AppResult<Json<Value>> {
     validate_operation_knowledge_chunk(&payload)?;
@@ -438,7 +450,7 @@ pub(super) async fn create_operation_knowledge_chunk(
         .db
         .operation_knowledge_chunks()
         .insert_one(
-            operation_knowledge_chunk_from_request(&state, payload, None)?,
+            operation_knowledge_chunk_from_request(&state, &admin.current_workspace, payload, None)?,
             None,
         )
         .await?;
@@ -449,6 +461,7 @@ pub(super) async fn create_operation_knowledge_chunk(
 
 pub(super) async fn update_operation_knowledge_chunk(
     State(state): State<AppState>,
+    Extension(admin): Extension<AuthenticatedAdmin>,
     Path(id): Path<String>,
     Json(mut payload): Json<OperationKnowledgeChunkRequest>,
 ) -> AppResult<Json<Value>> {
@@ -468,7 +481,7 @@ pub(super) async fn update_operation_knowledge_chunk(
             .find_one(
                 doc! {
                     "_id": document_id,
-                    "workspace_id": &state.config.default_workspace_id
+                    "workspace_id": &admin.current_workspace
                 },
                 None,
             )
@@ -485,9 +498,9 @@ pub(super) async fn update_operation_knowledge_chunk(
         .replace_one(
             doc! {
                 "_id": object_id,
-                "workspace_id": &state.config.default_workspace_id
+                "workspace_id": &admin.current_workspace
             },
-            operation_knowledge_chunk_from_request(&state, payload, Some(object_id))?,
+            operation_knowledge_chunk_from_request(&state, &admin.current_workspace, payload, Some(object_id))?,
             None,
         )
         .await?;
@@ -496,6 +509,7 @@ pub(super) async fn update_operation_knowledge_chunk(
 
 pub(super) async fn delete_operation_knowledge_chunk(
     State(state): State<AppState>,
+    Extension(admin): Extension<AuthenticatedAdmin>,
     Path(id): Path<String>,
 ) -> AppResult<Json<Value>> {
     let object_id = parse_object_id(&id)?;
@@ -505,7 +519,7 @@ pub(super) async fn delete_operation_knowledge_chunk(
         .delete_one(
             doc! {
                 "_id": object_id,
-                "workspace_id": &state.config.default_workspace_id
+                "workspace_id": &admin.current_workspace
             },
             None,
         )
@@ -515,6 +529,7 @@ pub(super) async fn delete_operation_knowledge_chunk(
 
 pub(super) async fn get_operation_knowledge_chunk_source(
     State(state): State<AppState>,
+    Extension(admin): Extension<AuthenticatedAdmin>,
     Path(id): Path<String>,
 ) -> AppResult<Json<Value>> {
     let object_id = parse_object_id(&id)?;
@@ -524,7 +539,7 @@ pub(super) async fn get_operation_knowledge_chunk_source(
         .find_one(
             doc! {
                 "_id": object_id,
-                "workspace_id": &state.config.default_workspace_id
+                "workspace_id": &admin.current_workspace
             },
             None,
         )
@@ -537,7 +552,7 @@ pub(super) async fn get_operation_knowledge_chunk_source(
             .find_one(
                 doc! {
                     "_id": document_id,
-                    "workspace_id": &state.config.default_workspace_id
+                    "workspace_id": &admin.current_workspace
                 },
                 None,
             )
@@ -553,6 +568,7 @@ pub(super) async fn get_operation_knowledge_chunk_source(
 
 pub(super) async fn verify_operation_knowledge_chunk(
     State(state): State<AppState>,
+    Extension(admin): Extension<AuthenticatedAdmin>,
     Path(id): Path<String>,
     Json(payload): Json<KnowledgeVerifyRequest>,
 ) -> AppResult<Json<Value>> {
@@ -563,7 +579,7 @@ pub(super) async fn verify_operation_knowledge_chunk(
         .find_one(
             doc! {
                 "_id": object_id,
-                "workspace_id": &state.config.default_workspace_id
+                "workspace_id": &admin.current_workspace
             },
             None,
         )
@@ -589,7 +605,7 @@ pub(super) async fn verify_operation_knowledge_chunk(
         .update_one(
             doc! {
                 "_id": object_id,
-                "workspace_id": &state.config.default_workspace_id
+                "workspace_id": &admin.current_workspace
             },
             doc! {
                 "$set": {
@@ -609,6 +625,7 @@ pub(super) async fn verify_operation_knowledge_chunk(
 
 pub(super) async fn reject_operation_knowledge_chunk(
     State(state): State<AppState>,
+    Extension(admin): Extension<AuthenticatedAdmin>,
     Path(id): Path<String>,
 ) -> AppResult<Json<Value>> {
     let object_id = parse_object_id(&id)?;
@@ -618,7 +635,7 @@ pub(super) async fn reject_operation_knowledge_chunk(
         .update_one(
             doc! {
                 "_id": object_id,
-                "workspace_id": &state.config.default_workspace_id
+                "workspace_id": &admin.current_workspace
             },
             doc! {
                 "$set": {
@@ -638,10 +655,11 @@ pub(super) async fn reject_operation_knowledge_chunk(
 ///
 /// - 串行处理，避免并发烧 token；
 /// - confidence ≥ threshold 自动标 `verified`，否则保持 `needs_review`；
-/// - 按 `1/N` 概率把判定结果改成 `needs_human_audit` 走人工抽查；
+/// - 按 `1/N` 概率把判定结果改成 `needs_human_audit` 走 admin 抽查；
 /// - 写一条 `agent_events kind="knowledge_auto_verify_done"`。
 pub(super) async fn auto_verify_operation_knowledge_chunks(
     State(state): State<AppState>,
+    Extension(admin): Extension<AuthenticatedAdmin>,
     Json(payload): Json<KnowledgeAutoVerifyRequest>,
 ) -> AppResult<Json<Value>> {
     let account_id = payload
@@ -655,7 +673,8 @@ pub(super) async fn auto_verify_operation_knowledge_chunks(
         .clamp(0.0, 1.0);
     let limit = payload.limit.unwrap_or(50).clamp(1, 500);
 
-    let (token_budget, max_llm_calls) = auto_verify_budget_limits(&state).await?;
+    let (token_budget, max_llm_calls) =
+        auto_verify_budget_limits(&state, &admin.current_workspace).await?;
     let run_id = uuid::Uuid::new_v4().to_string();
     let budget = Arc::new(agent::RunBudget::new(
         run_id.clone(),
@@ -666,11 +685,13 @@ pub(super) async fn auto_verify_operation_knowledge_chunks(
         // 硬上限；该字段仍参与 record_tool_call 累加，仅不会先于其它维度饱和。
         i32::MAX,
     ));
+    let workspace_id = admin.current_workspace.clone();
     agent::RUN_BUDGET
         .scope(
             budget.clone(),
             auto_verify_operation_knowledge_chunks_inner(
                 state,
+                workspace_id,
                 account_id,
                 threshold,
                 sample_rate,
@@ -682,13 +703,16 @@ pub(super) async fn auto_verify_operation_knowledge_chunks(
         .await
 }
 
-async fn auto_verify_budget_limits(state: &AppState) -> AppResult<(i64, i32)> {
+async fn auto_verify_budget_limits(
+    state: &AppState,
+    workspace_id: &str,
+) -> AppResult<(i64, i32)> {
     let config = state
         .db
         .operation_domain_configs()
         .find_one(
             doc! {
-                "workspace_id": &state.config.default_workspace_id,
+                "workspace_id": workspace_id,
                 "domain": "user_operations"
             },
             None,
@@ -727,6 +751,7 @@ fn doc_i32_with_default(doc: Option<&Document>, key: &str, default: i32) -> i32 
 
 async fn auto_verify_operation_knowledge_chunks_inner(
     state: AppState,
+    workspace_id: String,
     account_id: String,
     threshold: i32,
     sample_rate: f64,
@@ -739,7 +764,7 @@ async fn auto_verify_operation_knowledge_chunks_inner(
         .operation_knowledge_chunks()
         .find(
             doc! {
-                "workspace_id": &state.config.default_workspace_id,
+                "workspace_id": &workspace_id,
                 "domain": "user_operations",
                 "integrity_status": { "$in": ["needs_review", null] },
                 "$or": [
@@ -756,7 +781,7 @@ async fn auto_verify_operation_knowledge_chunks_inner(
 
     let system = prompts::load_prompt(
         &state.db,
-        &state.config.default_workspace_id,
+        &workspace_id,
         "knowledge.auto_verify",
     )
     .await
@@ -897,7 +922,7 @@ source_anchors: {}
             .insert_one(
                 KnowledgeUsageLog {
                     id: None,
-                    workspace_id: state.config.default_workspace_id.clone(),
+                    workspace_id: workspace_id.clone(),
                     account_id: account_id.clone(),
                     contact_wxid: None,
                     run_id: run_id.clone(),
@@ -936,7 +961,7 @@ source_anchors: {}
         .insert_one(
             crate::models::AgentEvent {
                 id: None,
-                workspace_id: state.config.default_workspace_id.clone(),
+                workspace_id: workspace_id.clone(),
                 account_id: account_id.clone(),
                 contact_wxid: None,
                 kind: "knowledge_auto_verify_done".to_string(),
@@ -956,6 +981,7 @@ source_anchors: {}
                     "budget": budget_document(&budget)
                 }),
                 created_at: DateTime::now(),
+                dedupe_key: None,
             },
             None,
         )
@@ -986,12 +1012,14 @@ fn budget_document(budget: &agent::RunBudget) -> Document {
 
 pub(super) async fn get_operation_knowledge_catalog(
     State(state): State<AppState>,
+    Extension(admin): Extension<AuthenticatedAdmin>,
     Query(query): Query<AccountScopedQuery>,
 ) -> AppResult<Json<Value>> {
     let account_id = query
         .account_id
         .unwrap_or_else(|| state.config.default_account_id.clone());
-    let catalog = build_operation_knowledge_catalog(&state, &account_id).await?;
+    let catalog =
+        build_operation_knowledge_catalog(&state, &admin.current_workspace, &account_id).await?;
     Ok(Json(json!({ "item": catalog })))
 }
 
@@ -1003,6 +1031,7 @@ pub(super) async fn get_operation_knowledge_catalog(
 /// 调用方应回退到 `/catalog`（live 聚合）。
 pub(super) async fn get_operation_knowledge_catalog_persisted(
     State(state): State<AppState>,
+    Extension(admin): Extension<AuthenticatedAdmin>,
     Query(query): Query<AccountScopedQuery>,
 ) -> AppResult<Json<Value>> {
     let account_id = query
@@ -1017,7 +1046,7 @@ pub(super) async fn get_operation_knowledge_catalog_persisted(
         .operation_knowledge_documents()
         .find(
             doc! {
-                "workspace_id": &state.config.default_workspace_id,
+                "workspace_id": &admin.current_workspace,
                 "domain": "user_operations",
                 "status": "active",
                 "$or": account_filter,
@@ -1043,28 +1072,35 @@ pub(super) async fn get_operation_knowledge_catalog_persisted(
 
 pub(super) async fn get_operation_knowledge_completeness(
     State(state): State<AppState>,
+    Extension(admin): Extension<AuthenticatedAdmin>,
     Query(query): Query<AccountScopedQuery>,
 ) -> AppResult<Json<Value>> {
     let account_id = query
         .account_id
         .unwrap_or_else(|| state.config.default_account_id.clone());
-    let item = build_operation_knowledge_completeness(&state, &account_id).await?;
+    let item =
+        build_operation_knowledge_completeness(&state, &admin.current_workspace, &account_id)
+            .await?;
     Ok(Json(json!({ "item": item })))
 }
 
 pub(super) async fn refresh_operation_knowledge_completeness(
     State(state): State<AppState>,
+    Extension(admin): Extension<AuthenticatedAdmin>,
     Query(query): Query<AccountScopedQuery>,
 ) -> AppResult<Json<Value>> {
     let account_id = query
         .account_id
         .unwrap_or_else(|| state.config.default_account_id.clone());
-    let item = build_operation_knowledge_completeness(&state, &account_id).await?;
+    let item =
+        build_operation_knowledge_completeness(&state, &admin.current_workspace, &account_id)
+            .await?;
     Ok(Json(json!({ "item": item })))
 }
 
 pub(super) async fn get_operation_knowledge_integrity_report(
     State(state): State<AppState>,
+    Extension(admin): Extension<AuthenticatedAdmin>,
     Query(query): Query<AccountScopedQuery>,
 ) -> AppResult<Json<Value>> {
     let account_id = query
@@ -1075,7 +1111,7 @@ pub(super) async fn get_operation_knowledge_integrity_report(
         .operation_knowledge_chunks()
         .find(
             doc! {
-                "workspace_id": &state.config.default_workspace_id,
+                "workspace_id": &admin.current_workspace,
                 "domain": "user_operations",
                 "$or": [
                     { "account_id": null },
@@ -1123,13 +1159,14 @@ pub(super) async fn get_operation_knowledge_integrity_report(
 
 pub(super) async fn search_operation_knowledge_tool(
     State(state): State<AppState>,
+    Extension(admin): Extension<AuthenticatedAdmin>,
     Json(payload): Json<KnowledgeToolSearchRequest>,
 ) -> AppResult<Json<Value>> {
     if payload.query.trim().is_empty() {
         return Err(AppError::BadRequest("query is required".to_string()));
     }
     let contact = if let Some(contact_id) = payload.contact_id {
-        Some(find_contact_by_id(&state, &contact_id).await?)
+        Some(find_contact_by_id(&state, &admin.current_workspace, &contact_id).await?)
     } else {
         None
     };
@@ -1145,6 +1182,7 @@ pub(super) async fn search_operation_knowledge_tool(
 
 pub(super) async fn open_operation_knowledge_slices(
     State(state): State<AppState>,
+    Extension(admin): Extension<AuthenticatedAdmin>,
     Json(payload): Json<KnowledgeToolOpenRequest>,
 ) -> AppResult<Json<Value>> {
     let ids = payload
@@ -1157,7 +1195,7 @@ pub(super) async fn open_operation_knowledge_slices(
         .operation_knowledge_chunks()
         .find(
             doc! {
-                "workspace_id": &state.config.default_workspace_id,
+                "workspace_id": &admin.current_workspace,
                 "_id": { "$in": ids }
             },
             FindOptions::builder()
@@ -1228,7 +1266,7 @@ pub(super) async fn import_operation_knowledge_preview(
     "summary": "",
     "catalogSummary": "给 Agent 看的目录摘要，说明这份文档解决什么问题、何时应该打开",
     "routingMap": ["自然语言目录项，不使用固定分类"],
-    "riskNotes": ["不能承诺、证据不足或需要人工确认的风险点"],
+    "riskNotes": ["不能承诺、证据不足或需要 admin 后台确认的风险点"],
     "productTags": ["产品/品牌/解决方案名称，最多 5 个，可空"],
     "businessTopics": ["业务主题（如 产品定位差异 / 竞品对比 / 部署方式），最多 3 个，可空"],
     "status": "draft"
@@ -1408,6 +1446,7 @@ pub(super) async fn extract_operation_knowledge_tags(
 
 pub(super) async fn import_operation_knowledge_apply(
     State(state): State<AppState>,
+    Extension(admin): Extension<AuthenticatedAdmin>,
     Json(payload): Json<OperationKnowledgeImportApplyRequest>,
 ) -> AppResult<Json<Value>> {
     if payload.items.is_empty() && payload.chunked_text.as_deref().unwrap_or("").trim().is_empty() {
@@ -1431,7 +1470,7 @@ pub(super) async fn import_operation_knowledge_apply(
             .db
             .operation_knowledge_documents()
             .insert_one(
-                operation_knowledge_document_from_request(&state, document, None),
+                operation_knowledge_document_from_request(&state, &admin.current_workspace, document, None),
                 None,
             )
             .await?;
@@ -1450,19 +1489,18 @@ pub(super) async fn import_operation_knowledge_apply(
         if let (Some(raw), Some(document_id)) = (raw_content.as_deref(), document_id) {
             apply_chunk_integrity(&mut chunk, raw, Some(document_id));
         }
-        if chunk.status == "draft" {
-            chunk.status = match chunk.integrity_status.as_deref() {
-                Some("verified") => "active".to_string(),
-                Some("rejected") => "rejected".to_string(),
-                _ => "review".to_string(),
-            };
-        }
+        // 红线"AI 永不自动 verify"：import 材料本身未经审核，apply_chunk_integrity
+        // 拿 sourceQuote 锚定成功只说明"引用出自这份导入文本"，不等于已核实。无条件
+        // 压回 draft + needs_review（保留算出的 source_anchors 作审核线索），与
+        // ingest_chunked_text / chunked_text 分支一致，由运营 Inspector 二次确认。
+        chunk.status = "draft".to_string();
+        chunk.integrity_status = Some("needs_review".to_string());
         validate_operation_knowledge_chunk(&chunk)?;
         let result = state
             .db
             .operation_knowledge_chunks()
             .insert_one(
-                operation_knowledge_chunk_from_request(&state, chunk, None)?,
+                operation_knowledge_chunk_from_request(&state, &admin.current_workspace, chunk, None)?,
                 None,
             )
             .await?;
@@ -1503,9 +1541,9 @@ pub(super) async fn import_operation_knowledge_apply(
             // 流式块走"AI/Imported source"；强制 draft + needs_review，对齐 CLAUDE.md
             // "AI 永不自动 verify" 硬约束。
             chunk_req.status = "draft".to_string();
-            chunk_req.integrity_status = chunk_req
-                .integrity_status
-                .or_else(|| Some("needs_review".to_string()));
+            // 红线"AI 永不自动 verify"：无条件压回 needs_review，不接受 block 自带的
+            // verified（apply_chunk_integrity 的锚点只作审核线索）。与 ingest_chunked_text 一致。
+            chunk_req.integrity_status = Some("needs_review".to_string());
             if let Err(e) = validate_operation_knowledge_chunk(&chunk_req) {
                 parse_warnings_json.push(json!({
                     "kind": "blockValidationError",
@@ -1518,7 +1556,7 @@ pub(super) async fn import_operation_knowledge_apply(
                 .db
                 .operation_knowledge_chunks()
                 .insert_one(
-                    operation_knowledge_chunk_from_request(&state, chunk_req, None)?,
+                    operation_knowledge_chunk_from_request(&state, &admin.current_workspace, chunk_req, None)?,
                     None,
                 )
                 .await?;
@@ -1534,7 +1572,7 @@ pub(super) async fn import_operation_knowledge_apply(
                 };
                 if let Err(e) = apply_chunk_revision(
                     &state.db,
-                    &state.config.default_workspace_id,
+                    &admin.current_workspace,
                     id,
                     req,
                 )
@@ -1558,15 +1596,432 @@ pub(super) async fn import_operation_knowledge_apply(
     })))
 }
 
+// ── P1-5 · multimodal 入口 ────────────────────────────────────────────────────
+//
+// 复用 `import_operation_knowledge_apply` 的 chunked-text 落库逻辑，把不同来源
+// （PDF 字节 / 图片 base64 + LLM vision）先归一为 markdown / fence 文本，再交给
+// 同一段写入路径。这样保持：
+//   - "AI 永不自动 verify" 仍由原路径强制（status=draft + integrity=needs_review）
+//   - 1 个 import id 出口与原 import-apply 一致
+//   - 红线：fence 文本里的 chunk_id 仍需 admin 在前端 Inspector 二次审核
+//
+// 端点：
+//   POST /operation-knowledge/import-apply-pdf   (multipart, file=...)
+//   POST /operation-knowledge/import-apply-image (json, { imageBase64, mime })
+//
+// 仅当 active LlmProviderConfig.supportsVision==true 时才允许 import-apply-image；
+// 否则 502 + visionNotSupported。
+
+pub(super) async fn import_operation_knowledge_apply_pdf(
+    State(state): State<AppState>,
+    Extension(admin): Extension<AuthenticatedAdmin>,
+    mut multipart: axum::extract::Multipart,
+) -> AppResult<Json<Value>> {
+    let mut file_bytes: Option<Vec<u8>> = None;
+    let mut source_name: Option<String> = None;
+    let mut account_id: Option<String> = None;
+    while let Some(field) = multipart
+        .next_field()
+        .await
+        .map_err(|e| AppError::BadRequest(format!("multipart 解析失败: {e}")))?
+    {
+        let name = field.name().unwrap_or("").to_string();
+        match name.as_str() {
+            "file" => {
+                let bytes = field
+                    .bytes()
+                    .await
+                    .map_err(|e| AppError::BadRequest(format!("读取上传文件失败: {e}")))?;
+                file_bytes = Some(bytes.to_vec());
+            }
+            "sourceName" => {
+                source_name = Some(
+                    field
+                        .text()
+                        .await
+                        .map_err(|e| AppError::BadRequest(format!("sourceName 字段读取失败: {e}")))?,
+                );
+            }
+            "accountId" => {
+                account_id = Some(
+                    field
+                        .text()
+                        .await
+                        .map_err(|e| AppError::BadRequest(format!("accountId 字段读取失败: {e}")))?,
+                );
+            }
+            _ => {}
+        }
+    }
+    let bytes = file_bytes
+        .ok_or_else(|| AppError::BadRequest("缺少 file 字段（PDF 字节）".to_string()))?;
+    let outcome = import_pdf_bytes(
+        &state,
+        &admin.current_workspace,
+        account_id.as_deref(),
+        source_name.as_deref().unwrap_or("uploaded_pdf"),
+        bytes,
+    )
+    .await?;
+    Ok(Json(json!({
+        "documentId": outcome.document_id,
+        "chunkIds": outcome.chunk_ids,
+        "parseWarnings": outcome.parse_warnings,
+        "fallbackBlob": outcome.fallback_blob,
+    })))
+}
+
+/// PDF 字节 → 文本抽取 → `ingest_chunked_text` 落库的纯函数核心。
+/// 从 multipart handler 抽出，便于集成测试（`tests/import_pdf_smoke.rs`）直接喂
+/// PDF 字节、断言产出 chunk（multipart extractor 本身在测试里无法手工构造）。
+pub async fn import_pdf_bytes(
+    state: &AppState,
+    workspace_id: &str,
+    account_id: Option<&str>,
+    source_name: &str,
+    bytes: Vec<u8>,
+) -> AppResult<IngestOutcome> {
+    if bytes.is_empty() {
+        return Err(AppError::BadRequest("file 字段为空".to_string()));
+    }
+    // pdf-extract 是同步阻塞 API，扔到 spawn_blocking 避免堵 tokio 调度器。
+    let extracted = tokio::task::spawn_blocking(move || pdf_extract::extract_text_from_mem(&bytes))
+        .await
+        .map_err(|e| AppError::External(format!("PDF 抽取任务 join 失败: {e}")))?
+        .map_err(|e| AppError::BadRequest(format!("PDF 解析失败: {e}")))?;
+    if extracted.trim().is_empty() {
+        return Err(AppError::BadRequest(
+            "PDF 抽取后文本为空（可能是扫描件 / 加密文档）".to_string(),
+        ));
+    }
+    ingest_chunked_text(state, workspace_id, account_id, source_name, &extracted).await
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImportApplyImageRequest {
+    pub image_base64: String,
+    #[serde(default)]
+    pub mime: Option<String>,
+    #[serde(default)]
+    pub source_name: Option<String>,
+    #[serde(default)]
+    pub account_id: Option<String>,
+    /// 可选 hint：让 LLM 在抽取时偏向某个领域。
+    #[serde(default)]
+    pub hint: Option<String>,
+}
+
+/// 视觉模型解析结果：要么复用运行时 active provider（文字主模型本身支持图片），
+/// 要么用 workspace 指派的专职视觉副模型临时构造的一次性 client。
+enum VisionProvider {
+    Runtime,
+    Dedicated(crate::llm::LlmClient),
+}
+
+pub async fn import_operation_knowledge_apply_image(
+    State(state): State<AppState>,
+    Extension(admin): Extension<AuthenticatedAdmin>,
+    Json(req): Json<ImportApplyImageRequest>,
+) -> AppResult<Json<Value>> {
+    if req.image_base64.trim().is_empty() {
+        return Err(AppError::BadRequest("imageBase64 不能为空".to_string()));
+    }
+    // 1) 解析视觉模型：
+    //    a. 若 active 文字主模型本身 supports_vision → 直接用运行时 state.llm。
+    //    b. 否则查本 workspace 指派的专职视觉模型（is_vision_active=true 且
+    //       supports_vision=true），临时构造一次性 client。
+    //    c. 两者都没有 → 502 visionNotSupported，让运营去模型设置里配视觉模型。
+    let active = state
+        .db
+        .llm_provider_configs()
+        .find_one(
+            doc! { "workspaceId": &admin.current_workspace, "isActive": true },
+            None,
+        )
+        .await?;
+    let vision_provider: VisionProvider = if active
+        .as_ref()
+        .map(|c| c.supports_vision)
+        .unwrap_or(false)
+    {
+        // active 文字模型即视觉模型：复用运行时 provider（含热切换 / registry 语义）。
+        VisionProvider::Runtime
+    } else {
+        // 找专职视觉副模型。
+        let vision_cfg = state
+            .db
+            .llm_provider_configs()
+            .find_one(
+                doc! {
+                    "workspaceId": &admin.current_workspace,
+                    "isVisionActive": true,
+                    "supportsVision": true,
+                },
+                None,
+            )
+            .await?
+            .ok_or_else(|| {
+                AppError::External(
+                    "visionNotSupported: 当前文字模型不支持图片，且未在模型设置中指派专职视觉模型".to_string(),
+                )
+            })?;
+        let fmt = crate::llm::LlmFormat::parse(&vision_cfg.format)?;
+        let client = crate::llm::LlmClient::with_format(
+            vision_cfg.base_url.clone(),
+            vision_cfg.api_key.clone(),
+            vision_cfg.model.clone(),
+            fmt,
+            vision_cfg
+                .timeout_seconds
+                .unwrap_or(state.config.llm_timeout_seconds),
+            vision_cfg.max_retries.unwrap_or(state.config.llm_max_retries),
+            vision_cfg
+                .retry_base_ms
+                .unwrap_or(state.config.llm_retry_base_ms),
+        )
+        .map_err(|e| AppError::External(format!("构造视觉模型 client 失败: {e}")))?;
+        VisionProvider::Dedicated(client)
+    };
+    // 2) 拼 vision prompt：约束 LLM 输出 JSON {"fence": "..." }，让我们直接走 chunked_text 流程。
+    let mime = req.mime.as_deref().unwrap_or("image/png");
+    let hint = req.hint.as_deref().unwrap_or("无特定领域 hint");
+    let system_prompt = "你是知识库 chunk 抽取助手。任务：把图片中的可读文本结构化为 fence 块。每块前后用 `---CHUNK: <短安全 id，仅字母数字和连字符>---` 与 `---END CHUNK---` 包裹（结束符必须是 `---END CHUNK---`，不要写 `---END---`）。块体必须是单个 JSON 对象，至少含 `title` 字段，且 `body`/`summary`/`answer` 中至少一个非空字符串，例如 {\"title\":\"小节标题\",\"body\":\"完整正文\"}。所有 chunk 默认 needs_review，不要写 verified。返回严格 JSON：{\"fence\": <字符串，全部 fence 文本>}。如果图片无文本可抽取，返回 {\"fence\": \"\"}。".to_string();
+    let user_prompt = format!(
+        "请按 fence 格式抽取下面这张图片中的知识 chunk。hint：{hint}"
+    );
+    // 3) 调视觉模型一次：图片以真正的多模态 image_url content block 发送
+    //    （generate_json_with_image），而不是把 base64 当文本塞进 prompt——后者
+    //    会让纯文字模型"看不到"图片。LlmProvider 默认实现对不支持视觉的 provider
+    //    直接报错，这里 VisionProvider 解析阶段已保证选中的是 supports_vision 的模型。
+    let value = match &vision_provider {
+        VisionProvider::Runtime => {
+            state
+                .llm
+                .generate_json_with_image(&system_prompt, &user_prompt, &req.image_base64, mime)
+                .await
+        }
+        VisionProvider::Dedicated(client) => {
+            client
+                .generate_json_with_image(&system_prompt, &user_prompt, &req.image_base64, mime)
+                .await
+        }
+    }
+    .map_err(|e| AppError::External(format!("LLM vision 抽取失败: {e}")))?;
+    let raw = value
+        .get("fence")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    if raw.trim().is_empty() {
+        return Ok(Json(json!({
+            "documentId": null,
+            "chunkIds": [],
+            "parseWarnings": [],
+            "fallbackBlob": false,
+            "note": "vision 返回空文本",
+        })));
+    }
+    let outcome = ingest_chunked_text(
+        &state,
+        &admin.current_workspace,
+        req.account_id.as_deref(),
+        req.source_name.as_deref().unwrap_or("uploaded_image"),
+        &raw,
+    )
+    .await?;
+    Ok(Json(json!({
+        "documentId": outcome.document_id,
+        "chunkIds": outcome.chunk_ids,
+        "parseWarnings": outcome.parse_warnings,
+        "fallbackBlob": outcome.fallback_blob,
+    })))
+}
+
+pub struct IngestOutcome {
+    pub document_id: Option<String>,
+    pub chunk_ids: Vec<String>,
+    pub parse_warnings: Vec<Value>,
+    /// fence 完全没解析出 chunk 时，把整段 `text` 落到一个兜底 blob chunk，
+    /// 让运营在 Inspector 里手动切分。
+    pub fallback_blob: bool,
+}
+
+/// 把已经抽取出的 `text` 走 fence 解析，成功的 block 写 `operation_knowledge_chunks`，
+/// 失败块写 parse_warnings；fence 完全不命中时落一个 wikiType="raw" 的 blob chunk
+/// 让运营手动切分。
+pub async fn ingest_chunked_text(
+    state: &AppState,
+    workspace_id: &str,
+    account_id: Option<&str>,
+    source_name: &str,
+    text: &str,
+) -> AppResult<IngestOutcome> {
+    use crate::knowledge_wiki::block_parser::parse_chunk_blocks;
+
+    let now = DateTime::now();
+    // 先建一个 document 占位，所有 chunk 挂在同一个 document_id 下
+    let document = crate::models::OperationKnowledgeDocument {
+        id: None,
+        workspace_id: workspace_id.to_string(),
+        account_id: account_id.map(|s| s.to_string()),
+        domain: "user_operations".to_string(),
+        source_type: "imported".to_string(),
+        source_name: Some(source_name.to_string()),
+        title: source_name.to_string(),
+        summary: None,
+        catalog_summary: None,
+        routing_map: Vec::new(),
+        risk_notes: Vec::new(),
+        product_tags: Vec::new(),
+        business_topics: Vec::new(),
+        raw_content: Some(text.to_string()),
+        content_hash: None,
+        line_index: Vec::new(),
+        section_index: Vec::new(),
+        status: "active".to_string(),
+        version: 1,
+        created_at: now,
+        updated_at: now,
+        catalog_summary_persisted: None,
+        catalog_version: None,
+    };
+    let doc_result = state
+        .db
+        .operation_knowledge_documents()
+        .insert_one(&document, None)
+        .await?;
+    let document_id = doc_result.inserted_id.as_object_id();
+
+    let (blocks, warnings) = parse_chunk_blocks(text);
+    let mut parse_warnings: Vec<Value> = Vec::new();
+    for w in &warnings.items {
+        parse_warnings.push(parse_warning_to_json(w));
+    }
+    let mut chunk_ids: Vec<String> = Vec::new();
+    let mut fallback_blob = false;
+
+    if blocks.is_empty() {
+        // fence 解析未命中：落一个 blob chunk，让运营在前端 Inspector 切分。
+        fallback_blob = true;
+        let chunk = OperationKnowledgeChunkRequest {
+            account_id: account_id.map(|s| s.to_string()),
+            document_id: document_id.map(|id| id.to_hex()),
+            domain: "user_operations".to_string(),
+            knowledge_type: Some("raw".to_string()),
+            title: format!("{source_name} · 待切分 blob"),
+            summary: Some(
+                "fence 抽取未命中，整段文本落到此 chunk，等待运营在 Inspector 切分。".to_string(),
+            ),
+            body: Some(text.to_string()),
+            integrity_status: Some("needs_review".to_string()),
+            status: "draft".to_string(),
+            ..Default::default()
+        };
+        if let Err(e) = validate_operation_knowledge_chunk(&chunk) {
+            parse_warnings.push(json!({
+                "kind": "blobValidationError",
+                "reason": format!("{e}"),
+            }));
+        } else {
+            let row = operation_knowledge_chunk_from_request(state, workspace_id, chunk, None)?;
+            let result = state
+                .db
+                .operation_knowledge_chunks()
+                .insert_one(&row, None)
+                .await?;
+            if let Some(id) = result.inserted_id.as_object_id() {
+                chunk_ids.push(id.to_hex());
+            }
+        }
+        return Ok(IngestOutcome {
+            document_id: document_id.map(|id| id.to_hex()),
+            chunk_ids,
+            parse_warnings,
+            fallback_blob,
+        });
+    }
+
+    for block in blocks {
+        let mut chunk_req: OperationKnowledgeChunkRequest =
+            match serde_json::from_value::<OperationKnowledgeChunkRequest>(block.payload.clone()) {
+                Ok(c) => c,
+                Err(e) => {
+                    parse_warnings.push(json!({
+                        "kind": "blockToChunkRequestError",
+                        "id": block.id,
+                        "reason": format!("{e}"),
+                    }));
+                    continue;
+                }
+            };
+        if chunk_req.account_id.is_none() {
+            chunk_req.account_id = account_id.map(|s| s.to_string());
+        }
+        if chunk_req.document_id.is_none() {
+            chunk_req.document_id = document_id.map(|id| id.to_hex());
+        }
+        if let Some(document_id_v) = document_id {
+            apply_chunk_integrity(&mut chunk_req, text, Some(document_id_v));
+        }
+        chunk_req.status = "draft".to_string();
+        // 红线"AI 永不自动 verify"：import 路径的 `text` 本身就是这批未经审核的导入
+        // 材料，apply_chunk_integrity 拿 chunk 的 sourceQuote 去 `text` 里锚定成功只能
+        // 说明"引用确实出自这份导入文本"，并不等于该知识已被核实。因此无条件压回
+        // needs_review（保留 apply_chunk_integrity 算出的 source_anchors 作为审核线索），
+        // 让运营在 Inspector 二次确认后才进入 agent 的 verified 池。
+        chunk_req.integrity_status = Some("needs_review".to_string());
+        if let Err(e) = validate_operation_knowledge_chunk(&chunk_req) {
+            parse_warnings.push(json!({
+                "kind": "blockValidationError",
+                "id": block.id,
+                "reason": format!("{e}"),
+            }));
+            continue;
+        }
+        let row = operation_knowledge_chunk_from_request(state, workspace_id, chunk_req, None)?;
+        let result = state
+            .db
+            .operation_knowledge_chunks()
+            .insert_one(&row, None)
+            .await?;
+        if let Some(id) = result.inserted_id.as_object_id() {
+            chunk_ids.push(id.to_hex());
+            let req = RevisionRequest {
+                op: RevisionOp::Create,
+                source: ProvenanceSource::Imported,
+                patch: Document::new(),
+                reason: Some(format!("ingest_chunked_text source={source_name} block={}", block.id)),
+                actor: account_id.map(|s| s.to_string()),
+            };
+            if let Err(e) = apply_chunk_revision(&state.db, workspace_id, id, req).await {
+                tracing::warn!(
+                    chunk_id = %id.to_hex(),
+                    block_id = %block.id,
+                    error = %e,
+                    "ingest_chunked_text: write chunk_revision failed (non-fatal)"
+                );
+            }
+        }
+    }
+    Ok(IngestOutcome {
+        document_id: document_id.map(|id| id.to_hex()),
+        chunk_ids,
+        parse_warnings,
+        fallback_blob,
+    })
+}
+
 pub(super) async fn test_operation_knowledge_match(
     State(state): State<AppState>,
+    Extension(admin): Extension<AuthenticatedAdmin>,
     Json(payload): Json<OperationKnowledgeTestRequest>,
 ) -> AppResult<Json<Value>> {
     if payload.message.trim().is_empty() {
         return Err(AppError::BadRequest("message is required".to_string()));
     }
     let contact = if let Some(contact_id) = payload.contact_id {
-        Some(find_contact_by_id(&state, &contact_id).await?)
+        Some(find_contact_by_id(&state, &admin.current_workspace, &contact_id).await?)
     } else {
         None
     };
@@ -1582,6 +2037,7 @@ pub(super) async fn test_operation_knowledge_match(
 
 pub(super) async fn list_knowledge_usage(
     State(state): State<AppState>,
+    Extension(admin): Extension<AuthenticatedAdmin>,
     Query(query): Query<AccountScopedQuery>,
 ) -> AppResult<Json<Value>> {
     let account_id = query
@@ -1592,7 +2048,7 @@ pub(super) async fn list_knowledge_usage(
         .knowledge_usage_logs()
         .find(
             doc! {
-                "workspace_id": &state.config.default_workspace_id,
+                "workspace_id": &admin.current_workspace,
                 "account_id": account_id
             },
             FindOptions::builder()
@@ -1626,9 +2082,10 @@ pub(super) struct AnalyzeLogsQuery {
 /// LLM。
 pub(super) async fn analyze_operation_knowledge_logs(
     State(state): State<AppState>,
+    Extension(admin): Extension<AuthenticatedAdmin>,
     Query(query): Query<AnalyzeLogsQuery>,
 ) -> AppResult<Json<Value>> {
-    let workspace_id = state.config.default_workspace_id.clone();
+    let workspace_id = admin.current_workspace.clone();
     let hours = query.hours.filter(|v| *v > 0).unwrap_or(24).min(72);
     let only_blocked = query.only_blocked_or_held.unwrap_or(true);
     let cutoff = chrono::Utc::now() - chrono::Duration::hours(hours);
@@ -1852,7 +2309,8 @@ pub(super) fn validate_operation_knowledge_chunk(
 // operation_knowledge_from_request removed: OperationKnowledgeItem 已随 sales 旧库删除。
 
 pub(super) fn operation_knowledge_document_from_request(
-    state: &AppState,
+    _state: &AppState,
+    workspace_id: &str,
     payload: OperationKnowledgeDocumentRequest,
     id: Option<ObjectId>,
 ) -> OperationKnowledgeDocument {
@@ -1881,7 +2339,7 @@ pub(super) fn operation_knowledge_document_from_request(
     };
     OperationKnowledgeDocument {
         id,
-        workspace_id: state.config.default_workspace_id.clone(),
+        workspace_id: workspace_id.to_string(),
         account_id: payload.account_id,
         domain: normalize_operation_domain(&payload.domain),
         source_type: if payload.source_type.trim().is_empty() {
@@ -1916,14 +2374,15 @@ pub(super) fn operation_knowledge_document_from_request(
 }
 
 pub(super) fn operation_knowledge_chunk_from_request(
-    state: &AppState,
+    _state: &AppState,
+    workspace_id: &str,
     payload: OperationKnowledgeChunkRequest,
     id: Option<ObjectId>,
 ) -> AppResult<OperationKnowledgeChunk> {
     let now = DateTime::now();
     Ok(OperationKnowledgeChunk {
         id,
-        workspace_id: state.config.default_workspace_id.clone(),
+        workspace_id: workspace_id.to_string(),
         account_id: payload.account_id,
         document_id: payload
             .document_id
@@ -2421,10 +2880,11 @@ pub(super) fn apply_chunk_integrity(
 
 pub(super) async fn load_operation_knowledge_chunks_for_query(
     state: &AppState,
+    workspace_id: &str,
     query: OperationKnowledgeChunkQuery,
 ) -> AppResult<Vec<Value>> {
     let mut filter = doc! {
-        "workspace_id": &state.config.default_workspace_id,
+        "workspace_id": workspace_id,
         "domain": "user_operations"
     };
     if let Some(account_id) = query.account_id {
@@ -2465,6 +2925,7 @@ pub(super) async fn load_operation_knowledge_chunks_for_query(
 
 pub(super) async fn build_operation_knowledge_catalog(
     state: &AppState,
+    workspace_id: &str,
     account_id: &str,
 ) -> AppResult<Value> {
     let account_filter = vec![
@@ -2476,7 +2937,7 @@ pub(super) async fn build_operation_knowledge_catalog(
         .operation_knowledge_documents()
         .find(
             doc! {
-                "workspace_id": &state.config.default_workspace_id,
+                "workspace_id": workspace_id,
                 "domain": "user_operations",
                 "status": "active",
                 "$or": account_filter.clone()
@@ -2505,7 +2966,7 @@ pub(super) async fn build_operation_knowledge_catalog(
         .operation_knowledge_chunks()
         .find(
             doc! {
-                "workspace_id": &state.config.default_workspace_id,
+                "workspace_id": workspace_id,
                 "domain": "user_operations",
                 "status": "active",
                 "integrity_status": "verified",
@@ -2542,6 +3003,7 @@ pub(super) async fn build_operation_knowledge_catalog(
 
 pub(super) async fn build_operation_knowledge_completeness(
     state: &AppState,
+    workspace_id: &str,
     account_id: &str,
 ) -> AppResult<Value> {
     let account_filter = vec![
@@ -2549,7 +3011,7 @@ pub(super) async fn build_operation_knowledge_completeness(
         doc! { "account_id": account_id },
     ];
     let base_filter = doc! {
-        "workspace_id": &state.config.default_workspace_id,
+        "workspace_id": workspace_id,
         "domain": "user_operations",
         "$or": account_filter.clone()
     };
@@ -2559,7 +3021,7 @@ pub(super) async fn build_operation_knowledge_completeness(
         .count_documents(base_filter.clone(), None)
         .await?;
     let verified_filter = doc! {
-        "workspace_id": &state.config.default_workspace_id,
+        "workspace_id": workspace_id,
         "domain": "user_operations",
         "status": "active",
         "integrity_status": "verified",
@@ -2682,7 +3144,7 @@ pub(super) async fn build_operation_knowledge_completeness(
 }
 
 pub(super) fn default_user_operations_domain() -> String {
-    "user_operations".to_string()
+    crate::agent::domain::USER_OPS_DOMAIN_ID.to_string()
 }
 
 /// 允许进库的运营域白名单。LLM 在 import-preview / import-apply 中可能输出
@@ -2694,7 +3156,11 @@ pub(super) fn default_user_operations_domain() -> String {
 /// 因为 Phase 1 唯一上线的运营域就是 user_operations。group/moments 是
 /// roadmap 占位，等真实模块上线再扩。
 pub(super) fn normalize_operation_domain(input: &str) -> String {
-    const KNOWN: &[&str] = &["user_operations", "group_operations", "moments_operations"];
+    const KNOWN: &[&str] = &[
+        crate::agent::domain::USER_OPS_DOMAIN_ID,
+        "group_operations",
+        "moments_operations",
+    ];
     let trimmed = input.trim();
     if KNOWN.iter().any(|known| *known == trimmed) {
         trimmed.to_string()
@@ -2720,7 +3186,7 @@ pub(super) fn default_active_status() -> String {
 }
 
 
-/// 波 D2：knowledge auto-verify 的"最终状态"判定（先于人工抽样）。
+/// 波 D2：knowledge auto-verify 的"最终状态"判定（先于 admin 后台抽样）。
 ///
 /// 性质：
 /// - `verified` ⇔ source_quote 非空 ∧ source_anchors 可定位 ∧ LLM 输出
@@ -2923,6 +3389,7 @@ fn parse_repair_response(value: &Value) -> Value {
 
 async fn write_repair_usage_log(
     state: &AppState,
+    workspace_id: &str,
     account_id: &str,
     run_id: &str,
     chunk_object_id: Option<ObjectId>,
@@ -2940,7 +3407,7 @@ async fn write_repair_usage_log(
         .insert_one(
             KnowledgeUsageLog {
                 id: None,
-                workspace_id: state.config.default_workspace_id.clone(),
+                workspace_id: workspace_id.to_string(),
                 account_id: account_id.to_string(),
                 contact_wxid: None,
                 run_id: run_id.to_string(),
@@ -2967,6 +3434,7 @@ async fn write_repair_usage_log(
 
 async fn record_repair_event(
     state: &AppState,
+    workspace_id: &str,
     account_id: &str,
     kind: &'static str,
     summary: String,
@@ -2978,7 +3446,7 @@ async fn record_repair_event(
         .insert_one(
             crate::models::AgentEvent {
                 id: None,
-                workspace_id: state.config.default_workspace_id.clone(),
+                workspace_id: workspace_id.to_string(),
                 account_id: account_id.to_string(),
                 contact_wxid: None,
                 kind: kind.to_string(),
@@ -2986,6 +3454,7 @@ async fn record_repair_event(
                 summary,
                 details: Some(details),
                 created_at: DateTime::now(),
+                dedupe_key: None,
             },
             None,
         )
@@ -2994,6 +3463,7 @@ async fn record_repair_event(
 
 pub(super) async fn propose_chunk_repair(
     State(state): State<AppState>,
+    Extension(admin): Extension<AuthenticatedAdmin>,
     Path(id): Path<String>,
 ) -> AppResult<Json<Value>> {
     let object_id = parse_object_id(&id)?;
@@ -3003,7 +3473,7 @@ pub(super) async fn propose_chunk_repair(
         .find_one(
             doc! {
                 "_id": object_id,
-                "workspace_id": &state.config.default_workspace_id
+                "workspace_id": &admin.current_workspace
             },
             None,
         )
@@ -3018,7 +3488,7 @@ pub(super) async fn propose_chunk_repair(
             .find_one(
                 doc! {
                     "_id": document_id,
-                    "workspace_id": &state.config.default_workspace_id
+                    "workspace_id": &admin.current_workspace
                 },
                 None,
             )
@@ -3037,7 +3507,7 @@ pub(super) async fn propose_chunk_repair(
 
     let system = prompts::load_prompt(
         &state.db,
-        &state.config.default_workspace_id,
+        &admin.current_workspace,
         "knowledge.chunk.repair.propose",
     )
     .await
@@ -3120,6 +3590,7 @@ pub(super) async fn propose_chunk_repair(
 
     write_repair_usage_log(
         &state,
+        &admin.current_workspace,
         &account_id,
         &run_id,
         chunk.id,
@@ -3134,6 +3605,7 @@ pub(super) async fn propose_chunk_repair(
     .await;
     record_repair_event(
         &state,
+        &admin.current_workspace,
         &account_id,
         "knowledge_repair_proposed",
         format!("AI 自主修复 chunk:{id} 第 1 轮"),
@@ -3166,6 +3638,7 @@ pub(super) async fn propose_chunk_repair(
 
 pub(super) async fn answer_chunk_repair(
     State(state): State<AppState>,
+    Extension(admin): Extension<AuthenticatedAdmin>,
     Path(id): Path<String>,
     Json(body): Json<ChunkRepairAnswerBody>,
 ) -> AppResult<Json<Value>> {
@@ -3176,7 +3649,7 @@ pub(super) async fn answer_chunk_repair(
         .find_one(
             doc! {
                 "_id": object_id,
-                "workspace_id": &state.config.default_workspace_id
+                "workspace_id": &admin.current_workspace
             },
             None,
         )
@@ -3196,7 +3669,7 @@ pub(super) async fn answer_chunk_repair(
 
     let system = prompts::load_prompt(
         &state.db,
-        &state.config.default_workspace_id,
+        &admin.current_workspace,
         "knowledge.chunk.repair.followup",
     )
     .await
@@ -3280,6 +3753,7 @@ pub(super) async fn answer_chunk_repair(
 
     write_repair_usage_log(
         &state,
+        &admin.current_workspace,
         &account_id,
         &run_id,
         chunk.id,
@@ -3294,6 +3768,7 @@ pub(super) async fn answer_chunk_repair(
     .await;
     record_repair_event(
         &state,
+        &admin.current_workspace,
         &account_id,
         "knowledge_repair_proposed",
         format!("AI 自主修复 chunk:{id} 第 {turn} 轮"),
@@ -3379,6 +3854,7 @@ fn format_repair_apply_summary(
 /// - 不写主业务集合（patch 已通过现有 PUT 落库，重复写会破坏只读性）。
 pub(super) async fn record_repair_apply(
     State(state): State<AppState>,
+    Extension(admin): Extension<AuthenticatedAdmin>,
     Json(body): Json<RepairApplyBody>,
 ) -> AppResult<Json<Value>> {
     let kind_label = match body.target_kind.as_str() {
@@ -3405,7 +3881,7 @@ pub(super) async fn record_repair_apply(
                 .find_one(
                     doc! {
                         "_id": oid,
-                        "workspace_id": &state.config.default_workspace_id
+                        "workspace_id": &admin.current_workspace
                     },
                     None,
                 )
@@ -3444,6 +3920,7 @@ pub(super) async fn record_repair_apply(
 
     record_repair_event(
         &state,
+        &admin.current_workspace,
         &account_id,
         "knowledge_repair_applied",
         summary.clone(),
@@ -3518,6 +3995,7 @@ pub(super) struct ChatTurnRequest {
 
 pub(super) async fn chat_turn(
     State(state): State<AppState>,
+    Extension(admin): Extension<AuthenticatedAdmin>,
     Json(body): Json<ChatTurnRequest>,
 ) -> AppResult<Json<Value>> {
     let trimmed = body.content.trim();
@@ -3546,11 +4024,12 @@ pub(super) async fn chat_turn(
         .unwrap_or_else(|| "default".to_string());
 
     // 加载历史 turns（按 turn_index 升序）
-    let history = load_chat_history(&state, &account_id, &session_id).await?;
+    let history = load_chat_history(&state, &admin.current_workspace, &account_id, &session_id).await?;
     // P1-7：原子预分配两个 turn_index——user turn + assistant turn，避免并发
     // 写者读到同一 last 制造重复索引。返回的是分配后的最大 seq；user 拿
     // `assistant_index - 1`、assistant 拿 `assistant_index`。
-    let assistant_index = allocate_next_turn_indices(&state, &session_id, 2).await?;
+    let assistant_index =
+        allocate_next_turn_indices(&state, &admin.current_workspace, &session_id, 2).await?;
     let next_index = assistant_index - 1;
     let assistant_turns_so_far = history
         .iter()
@@ -3565,6 +4044,7 @@ pub(super) async fn chat_turn(
     // 写 user turn
     write_chat_turn(
         &state,
+        &admin.current_workspace,
         &account_id,
         &session_id,
         next_index,
@@ -3601,6 +4081,7 @@ pub(super) async fn chat_turn(
         .scope(budget.clone(), async {
             run_chat_turn_pipeline(
                 &state,
+                &admin.current_workspace,
                 &account_id,
                 &operator_id,
                 &session_id,
@@ -3689,6 +4170,7 @@ pub(super) async fn chat_turn(
 
     write_chat_turn(
         &state,
+        &admin.current_workspace,
         &account_id,
         &session_id,
         assistant_index,
@@ -3710,7 +4192,7 @@ pub(super) async fn chat_turn(
     // 中的多个，统一拉取 4 把 chat 钥匙的 active 版本号；prompt_versions 拉取失败不阻塞主链路。
     let chat_prompt_versions = prompts::prompt_versions(
         &state.db,
-        &state.config.default_workspace_id,
+        &admin.current_workspace,
         &[
             "knowledge.chat.intent",
             "knowledge.chat.draft_chunk",
@@ -3740,7 +4222,7 @@ pub(super) async fn chat_turn(
         .insert_one(
             KnowledgeUsageLog {
                 id: None,
-                workspace_id: state.config.default_workspace_id.clone(),
+                workspace_id: admin.current_workspace.clone(),
                 account_id: account_id.clone(),
                 contact_wxid: None,
                 run_id: run_id.clone(),
@@ -3757,6 +4239,7 @@ pub(super) async fn chat_turn(
         .await;
     record_repair_event(
         &state,
+        &admin.current_workspace,
         &account_id,
         "knowledge_chat_turn",
         format!(
@@ -3798,6 +4281,7 @@ pub(super) async fn chat_turn(
 
 pub(super) async fn chat_history(
     State(state): State<AppState>,
+    Extension(admin): Extension<AuthenticatedAdmin>,
     Path(session_id): Path<String>,
 ) -> AppResult<Json<Value>> {
     let trimmed = session_id.trim();
@@ -3811,7 +4295,7 @@ pub(super) async fn chat_history(
         .knowledge_chat_turns()
         .find(
             doc! {
-                "workspace_id": &state.config.default_workspace_id,
+                "workspace_id": &admin.current_workspace,
                 "session_id": trimmed,
             },
             FindOptions::builder().sort(doc! { "turn_index": 1 }).build(),
@@ -3836,6 +4320,7 @@ pub(super) struct ChatApplyRequest {
 
 pub(super) async fn chat_apply(
     State(state): State<AppState>,
+    Extension(admin): Extension<AuthenticatedAdmin>,
     Path(session_id): Path<String>,
     Json(body): Json<ChatApplyRequest>,
 ) -> AppResult<Json<Value>> {
@@ -3845,7 +4330,7 @@ pub(super) async fn chat_apply(
             "sessionId cannot be empty".to_string(),
         ));
     }
-    let history = load_chat_history(&state, "*", &trimmed).await?;
+    let history = load_chat_history(&state, &admin.current_workspace, "*", &trimmed).await?;
     let last_assistant = history
         .iter()
         .rev()
@@ -3890,14 +4375,14 @@ pub(super) async fn chat_apply(
 
     let result_value = match intent {
         "create_chunk" => {
-            apply_create_chunk(&state, &account_id, &trimmed, patch, target_pack_id.as_deref())
+            apply_create_chunk(&state, &admin.current_workspace, &account_id, &trimmed, patch, target_pack_id.as_deref())
                 .await?
         }
         "update_chunk" => {
             let chunk_id = target_chunk_id.clone().ok_or_else(|| {
                 AppError::BadRequest("update_chunk 需要 attachments.chunkId".to_string())
             })?;
-            apply_update_chunk(&state, &account_id, &chunk_id, patch).await?
+            apply_update_chunk(&state, &admin.current_workspace, &account_id, &chunk_id, patch).await?
         }
         "update_pack" => {
             let pack_id = target_pack_id.clone().ok_or_else(|| {
@@ -3919,7 +4404,7 @@ pub(super) async fn chat_apply(
         .update_one(
             doc! {
                 "_id": last_assistant.id.expect("turn must have id"),
-                "workspace_id": &state.config.default_workspace_id,
+                "workspace_id": &admin.current_workspace,
             },
             doc! { "$set": { "status": "applied", "updated_at": DateTime::now() } },
             None,
@@ -3928,6 +4413,7 @@ pub(super) async fn chat_apply(
 
     record_repair_event(
         &state,
+        &admin.current_workspace,
         &account_id,
         "knowledge_chat_applied",
         format!("AI 对话产物落库为草稿 sessionId={trimmed} intent={intent}"),
@@ -3950,6 +4436,7 @@ pub(super) async fn chat_apply(
 
 pub(super) async fn chat_discard(
     State(state): State<AppState>,
+    Extension(admin): Extension<AuthenticatedAdmin>,
     Path(session_id): Path<String>,
 ) -> AppResult<Json<Value>> {
     let trimmed = session_id.trim();
@@ -3963,7 +4450,7 @@ pub(super) async fn chat_discard(
         .knowledge_chat_turns()
         .update_many(
             doc! {
-                "workspace_id": &state.config.default_workspace_id,
+                "workspace_id": &admin.current_workspace,
                 "session_id": trimmed,
                 "status": "pending",
             },
@@ -3993,12 +4480,13 @@ pub(super) async fn chat_discard(
 /// 历史拉取仍走 `load_chat_history`。
 pub(super) async fn allocate_next_turn_indices(
     state: &AppState,
+    workspace_id: &str,
     session_id: &str,
     count: u32,
 ) -> AppResult<i32> {
     use mongodb::options::{FindOneAndUpdateOptions, ReturnDocument};
     let n = count.max(1) as i64;
-    let key = format!("{}|{}", state.config.default_workspace_id, session_id);
+    let key = format!("{}|{}", workspace_id, session_id);
     let updated = state
         .db
         .knowledge_chat_session_seqs()
@@ -4022,11 +4510,12 @@ pub(super) async fn allocate_next_turn_indices(
 
 async fn load_chat_history(
     state: &AppState,
+    workspace_id: &str,
     account_id: &str,
     session_id: &str,
 ) -> AppResult<Vec<KnowledgeChatTurn>> {
     let mut filter = doc! {
-        "workspace_id": &state.config.default_workspace_id,
+        "workspace_id": workspace_id,
         "session_id": session_id,
     };
     if account_id != "*" {
@@ -4050,6 +4539,7 @@ async fn load_chat_history(
 #[allow(clippy::too_many_arguments)]
 async fn write_chat_turn(
     state: &AppState,
+    workspace_id: &str,
     account_id: &str,
     session_id: &str,
     turn_index: i32,
@@ -4102,7 +4592,7 @@ async fn write_chat_turn(
         .insert_one(
             KnowledgeChatTurn {
                 id: None,
-                workspace_id: state.config.default_workspace_id.clone(),
+                workspace_id: workspace_id.to_string(),
                 account_id: account_id.to_string(),
                 session_id: session_id.to_string(),
                 turn_index,
@@ -4155,6 +4645,7 @@ fn chat_turn_to_view(turn: &KnowledgeChatTurn) -> Value {
 /// followupQuestions / draftKind / targetChunkId / targetPackId / promptKey。
 async fn run_chat_turn_pipeline(
     state: &AppState,
+    workspace_id: &str,
     account_id: &str,
     operator_id: &str,
     session_id: &str,
@@ -4168,7 +4659,7 @@ async fn run_chat_turn_pipeline(
     // 隔离（仅触达 knowledge_operator_memory collection）。
     let operator_memory = agent::load_operator_memory(
         &state.db,
-        &state.config.default_workspace_id,
+        workspace_id,
         account_id,
         operator_id,
         5,
@@ -4180,6 +4671,7 @@ async fn run_chat_turn_pipeline(
     // 1. intent 分类
     let intent_result = classify_intent(
         state,
+        workspace_id,
         account_id,
         session_id,
         user_content,
@@ -4209,6 +4701,7 @@ async fn run_chat_turn_pipeline(
     let mut out = match intent.as_str() {
         "create_chunk" => draft_chunk_for_chat(
             state,
+            workspace_id,
             account_id,
             session_id,
             user_content,
@@ -4229,6 +4722,7 @@ async fn run_chat_turn_pipeline(
             })?;
             let mut v = update_chunk_for_chat(
                 state,
+                workspace_id,
                 account_id,
                 session_id,
                 user_content,
@@ -4248,6 +4742,7 @@ async fn run_chat_turn_pipeline(
             })?;
             let mut v = update_pack_for_chat(
                 state,
+                workspace_id,
                 account_id,
                 session_id,
                 user_content,
@@ -4262,6 +4757,7 @@ async fn run_chat_turn_pipeline(
         "digest_action" => {
             let mut v = dispatch_digest_action_for_chat(
                 state,
+                workspace_id,
                 account_id,
                 session_id,
                 user_content,
@@ -4275,6 +4771,7 @@ async fn run_chat_turn_pipeline(
         "update_operator_memory" => {
             let mut v = update_operator_memory_for_chat(
                 state,
+                workspace_id,
                 account_id,
                 operator_id,
                 user_content,
@@ -4285,7 +4782,7 @@ async fn run_chat_turn_pipeline(
             v["promptKey"] = json!("knowledge.chat.intent");
             v
         }
-        _ => clarify_for_chat(state, account_id, session_id, user_content, history)
+        _ => clarify_for_chat(state, workspace_id, account_id, session_id, user_content, history)
             .await
             .map(|mut v| {
                 v["promptKey"] = json!("knowledge.chat.clarify");
@@ -4405,6 +4902,7 @@ fn augment_chat_system_with_tools(base: &str) -> String {
 /// `run_chat_turn_pipeline` / `chat_turn` handler 不需要任何改造。
 async fn run_chat_with_tools(
     state: &AppState,
+    workspace_id_in: &str,
     account_id: &str,
     session_id: &str,
     run_key: &str,
@@ -4425,7 +4923,7 @@ async fn run_chat_with_tools(
     // 与 user-ops `load_operation_knowledge` 的形态对齐，但简化为按 workspace
     // 全量取（chat 不绑定到具体 contact，没有 account_filter）。limit 与 user-ops
     // 一致，避免 KnowledgeRuntime 跨 chunk 数量发散。
-    let workspace_id = state.config.default_workspace_id.clone();
+    let workspace_id = workspace_id_in.to_string();
     let documents: Vec<OperationKnowledgeDocument> = state
         .db
         .operation_knowledge_documents()
@@ -4597,6 +5095,7 @@ fn source_anchor_for_quote_ffi(
 /// （AI 偏好/红线不进 chunk）。
 async fn update_operator_memory_for_chat(
     state: &AppState,
+    workspace_id: &str,
     account_id: &str,
     operator_id: &str,
     user_content: &str,
@@ -4627,7 +5126,7 @@ async fn update_operator_memory_for_chat(
     }
     let mem = agent::record_operator_memory(
         &state.db,
-        &state.config.default_workspace_id,
+        workspace_id,
         account_id,
         operator_id,
         kind,
@@ -4643,6 +5142,7 @@ async fn update_operator_memory_for_chat(
     let summary = format!("已记下您的{kind_label}：{}", truncate_for_prompt(&content, 80));
     record_repair_event(
         state,
+        workspace_id,
         account_id,
         "knowledge_operator_memory_added",
         summary.clone(),
@@ -4668,6 +5168,7 @@ async fn update_operator_memory_for_chat(
 
 async fn classify_intent(
     state: &AppState,
+    workspace_id: &str,
     account_id: &str,
     session_id: &str,
     user_content: &str,
@@ -4678,7 +5179,7 @@ async fn classify_intent(
 ) -> AppResult<Value> {
     let system_base = prompts::load_prompt(
         &state.db,
-        &state.config.default_workspace_id,
+        workspace_id,
         "knowledge.chat.intent",
     )
     .await
@@ -4720,6 +5221,7 @@ async fn classify_intent(
 
 async fn draft_chunk_for_chat(
     state: &AppState,
+    workspace_id: &str,
     account_id: &str,
     session_id: &str,
     user_content: &str,
@@ -4728,7 +5230,7 @@ async fn draft_chunk_for_chat(
 ) -> AppResult<Value> {
     let system = prompts::load_prompt(
         &state.db,
-        &state.config.default_workspace_id,
+        workspace_id,
         "knowledge.chat.draft_chunk",
     )
     .await
@@ -4760,6 +5262,7 @@ async fn draft_chunk_for_chat(
     let augmented_system = augment_chat_system_with_tools(&system);
     run_chat_with_tools(
         state,
+        workspace_id,
         account_id,
         session_id,
         "draft",
@@ -4772,6 +5275,7 @@ async fn draft_chunk_for_chat(
 
 async fn update_chunk_for_chat(
     state: &AppState,
+    workspace_id: &str,
     account_id: &str,
     session_id: &str,
     user_content: &str,
@@ -4785,7 +5289,7 @@ async fn update_chunk_for_chat(
         .find_one(
             doc! {
                 "_id": oid,
-                "workspace_id": &state.config.default_workspace_id,
+                "workspace_id": workspace_id,
             },
             None,
         )
@@ -4798,7 +5302,7 @@ async fn update_chunk_for_chat(
             .find_one(
                 doc! {
                     "_id": document_id,
-                    "workspace_id": &state.config.default_workspace_id,
+                    "workspace_id": workspace_id,
                 },
                 None,
             )
@@ -4815,7 +5319,7 @@ async fn update_chunk_for_chat(
     };
     let system = prompts::load_prompt(
         &state.db,
-        &state.config.default_workspace_id,
+        workspace_id,
         "knowledge.chat.update_chunk",
     )
     .await
@@ -4844,6 +5348,7 @@ async fn update_chunk_for_chat(
     let augmented_system = augment_chat_system_with_tools(&system);
     run_chat_with_tools(
         state,
+        workspace_id,
         account_id,
         session_id,
         "update",
@@ -4856,6 +5361,7 @@ async fn update_chunk_for_chat(
 
 async fn update_pack_for_chat(
     _state: &AppState,
+    _workspace_id: &str,
     _account_id: &str,
     _session_id: &str,
     _user_content: &str,
@@ -4870,6 +5376,7 @@ async fn update_pack_for_chat(
 
 async fn clarify_for_chat(
     state: &AppState,
+    workspace_id: &str,
     account_id: &str,
     session_id: &str,
     user_content: &str,
@@ -4877,7 +5384,7 @@ async fn clarify_for_chat(
 ) -> AppResult<Value> {
     let system = prompts::load_prompt(
         &state.db,
-        &state.config.default_workspace_id,
+        workspace_id,
         "knowledge.chat.clarify",
     )
     .await
@@ -4897,6 +5404,7 @@ async fn clarify_for_chat(
     let augmented_system = augment_chat_system_with_tools(&system);
     run_chat_with_tools(
         state,
+        workspace_id,
         account_id,
         session_id,
         "clarify",
@@ -4917,6 +5425,7 @@ async fn clarify_for_chat(
 /// 与 update_chunk_for_chat 不同：本路径不出 patch、不直接落库，仅是步骤计划。
 async fn dispatch_digest_action_for_chat(
     state: &AppState,
+    workspace_id: &str,
     account_id: &str,
     session_id: &str,
     user_content: &str,
@@ -4924,7 +5433,7 @@ async fn dispatch_digest_action_for_chat(
 ) -> AppResult<Value> {
     let system = prompts::load_prompt(
         &state.db,
-        &state.config.default_workspace_id,
+        workspace_id,
         "knowledge.digest.dispatch",
     )
     .await
@@ -4941,7 +5450,7 @@ async fn dispatch_digest_action_for_chat(
         .knowledge_daily_reports()
         .find_one(
             doc! {
-                "workspace_id": &state.config.default_workspace_id,
+                "workspace_id": workspace_id,
                 "account_id": account_id,
                 "report_date": &report_date,
             },
@@ -4996,6 +5505,7 @@ action 必须在 [fix_chunk, add_chunk, retag, review_evolution, analyze_logs, d
 
 async fn apply_create_chunk(
     state: &AppState,
+    workspace_id: &str,
     account_id: &str,
     session_id: &str,
     patch: &Document,
@@ -5009,7 +5519,7 @@ async fn apply_create_chunk(
     payload.source_anchors = vec![]; // 让 backend 重算
 
     validate_operation_knowledge_chunk(&payload)?;
-    let chunk = operation_knowledge_chunk_from_request(state, payload, None)?;
+    let chunk = operation_knowledge_chunk_from_request(state, workspace_id, payload, None)?;
     let inserted = state
         .db
         .operation_knowledge_chunks()
@@ -5030,6 +5540,7 @@ async fn apply_create_chunk(
 
 async fn apply_update_chunk(
     state: &AppState,
+    workspace_id: &str,
     _account_id: &str,
     chunk_id: &str,
     patch: &Document,
@@ -5084,7 +5595,7 @@ async fn apply_update_chunk(
         .update_one(
             doc! {
                 "_id": oid,
-                "workspace_id": &state.config.default_workspace_id,
+                "workspace_id": workspace_id,
             },
             doc! { "$set": update_doc.clone() },
             None,
@@ -5181,6 +5692,7 @@ pub(super) struct DigestTodayQuery {
 
 pub(super) async fn digest_today(
     State(state): State<AppState>,
+    Extension(admin): Extension<AuthenticatedAdmin>,
     Query(query): Query<DigestTodayQuery>,
 ) -> AppResult<Json<Value>> {
     let account_id = query
@@ -5197,7 +5709,7 @@ pub(super) async fn digest_today(
         .knowledge_daily_reports()
         .find_one(
             doc! {
-                "workspace_id": &state.config.default_workspace_id,
+                "workspace_id": &admin.current_workspace,
                 "account_id": &account_id,
                 "report_date": &report_date,
             },
@@ -5228,6 +5740,7 @@ pub(super) struct DigestRegenerateRequest {
 
 pub(super) async fn digest_regenerate(
     State(state): State<AppState>,
+    Extension(admin): Extension<AuthenticatedAdmin>,
     Json(body): Json<DigestRegenerateRequest>,
 ) -> AppResult<Json<Value>> {
     let account_id = body
@@ -5243,7 +5756,7 @@ pub(super) async fn digest_regenerate(
             .knowledge_daily_reports()
             .find_one(
                 doc! {
-                    "workspace_id": &state.config.default_workspace_id,
+                    "workspace_id": &admin.current_workspace,
                     "account_id": &account_id,
                     "report_date": &report_date,
                 },
@@ -5261,6 +5774,7 @@ pub(super) async fn digest_regenerate(
 /// `POST /api/knowledge/digest/cards/:id/dismiss`：把卡片标记为已忽略，画布灰显。
 pub(super) async fn digest_dismiss_card(
     State(state): State<AppState>,
+    Extension(admin): Extension<AuthenticatedAdmin>,
     Path(card_id_hex): Path<String>,
 ) -> AppResult<Json<Value>> {
     let card_id = ObjectId::parse_str(&card_id_hex)
@@ -5272,7 +5786,7 @@ pub(super) async fn digest_dismiss_card(
         .knowledge_daily_reports()
         .update_one(
             doc! {
-                "workspace_id": &state.config.default_workspace_id,
+                "workspace_id": &admin.current_workspace,
                 "report_date": &report_date,
                 "cards.cardId": &card_id,
             },
@@ -5335,6 +5849,7 @@ pub(super) struct ChatTaskCreateRequest {
 
 pub(super) async fn chat_task_create(
     State(state): State<AppState>,
+    Extension(admin): Extension<AuthenticatedAdmin>,
     Json(body): Json<ChatTaskCreateRequest>,
 ) -> AppResult<Json<Value>> {
     let session_id = body.session_id.trim();
@@ -5395,7 +5910,7 @@ pub(super) async fn chat_task_create(
         .knowledge_daily_reports()
         .find_one(
             doc! {
-                "workspace_id": &state.config.default_workspace_id,
+                "workspace_id": &admin.current_workspace,
                 "account_id": &account_id,
                 "report_date": &report_date,
             },
@@ -5416,7 +5931,7 @@ pub(super) async fn chat_task_create(
     let task_id = ObjectId::new();
     let task = crate::models::KnowledgeChatTask {
         id: Some(task_id),
-        workspace_id: state.config.default_workspace_id.clone(),
+        workspace_id: admin.current_workspace.clone(),
         account_id: account_id.clone(),
         session_id: session_id.to_string(),
         operator_id: body.operator_id.clone(),
@@ -5437,10 +5952,10 @@ pub(super) async fn chat_task_create(
 
     // 立刻写一条 task_progress turn 记录派工已落库。
     // P1-7：原子分配新 turn_index，避免与并发 chat_turn / worker 写入冲突。
-    let next_index = allocate_next_turn_indices(&state, session_id, 1).await?;
+    let next_index = allocate_next_turn_indices(&state, &admin.current_workspace, session_id, 1).await?;
     let turn = KnowledgeChatTurn {
         id: None,
-        workspace_id: state.config.default_workspace_id.clone(),
+        workspace_id: admin.current_workspace.clone(),
         account_id: account_id.clone(),
         session_id: session_id.to_string(),
         turn_index: next_index,
@@ -5480,6 +5995,7 @@ pub(super) async fn chat_task_create(
 /// `GET /api/knowledge/chat/tasks/:id`：查询 task 状态（前端 fallback 拉取）。
 pub(super) async fn chat_task_get(
     State(state): State<AppState>,
+    Extension(admin): Extension<AuthenticatedAdmin>,
     Path(id_hex): Path<String>,
 ) -> AppResult<Json<Value>> {
     let oid = ObjectId::parse_str(&id_hex)
@@ -5487,7 +6003,10 @@ pub(super) async fn chat_task_get(
     let task = state
         .db
         .knowledge_chat_tasks()
-        .find_one(doc! { "_id": oid }, None)
+        .find_one(
+            doc! { "_id": oid, "workspace_id": &admin.current_workspace },
+            None,
+        )
         .await?
         .ok_or_else(|| AppError::NotFound(format!("knowledge_chat_task {id_hex} 不存在")))?;
     Ok(Json(json!({
@@ -5514,6 +6033,7 @@ pub(super) async fn chat_task_get(
 /// 类语义；只有真正不存在的 task 才返回 404。
 pub(super) async fn chat_task_cancel(
     State(state): State<AppState>,
+    Extension(admin): Extension<AuthenticatedAdmin>,
     Path(id_hex): Path<String>,
 ) -> AppResult<Json<Value>> {
     let oid = ObjectId::parse_str(&id_hex)
@@ -5522,7 +6042,11 @@ pub(super) async fn chat_task_cancel(
         .db
         .knowledge_chat_tasks()
         .update_one(
-            doc! { "_id": oid, "status": doc! { "$in": ["pending", "running"] } },
+            doc! {
+                "_id": oid,
+                "workspace_id": &admin.current_workspace,
+                "status": doc! { "$in": ["pending", "running"] }
+            },
             doc! { "$set": { "status": "cancelled", "finished_at": DateTime::now() } },
             None,
         )
@@ -5534,7 +6058,10 @@ pub(super) async fn chat_task_cancel(
         let existing = state
             .db
             .knowledge_chat_tasks()
-            .find_one(doc! { "_id": oid }, None)
+            .find_one(
+                doc! { "_id": oid, "workspace_id": &admin.current_workspace },
+                None,
+            )
             .await?;
         match existing {
             None => {
@@ -5708,6 +6235,7 @@ fn inbox_pending_review_priority(chunk_type: &str) -> &'static str {
 
 pub(super) async fn knowledge_inbox(
     State(state): State<AppState>,
+    Extension(admin): Extension<AuthenticatedAdmin>,
     Query(query): Query<InboxQuery>,
 ) -> AppResult<Json<InboxResponse>> {
     let account_id = query
@@ -5726,7 +6254,7 @@ pub(super) async fn knowledge_inbox(
         .knowledge_daily_reports()
         .find_one(
             doc! {
-                "workspace_id": &state.config.default_workspace_id,
+                "workspace_id": &admin.current_workspace,
                 "account_id": &account_id,
                 "report_date": &report_date,
             },
@@ -5784,7 +6312,7 @@ pub(super) async fn knowledge_inbox(
 
     // 2/3/4) 三类来源都从 operation_knowledge_chunks 拉。统一拉一次，逐条分类。
     let chunks_filter = doc! {
-        "workspace_id": &state.config.default_workspace_id,
+        "workspace_id": &admin.current_workspace,
         "$or": [
             { "account_id": null },
             { "account_id": { "$exists": false } },
@@ -6012,6 +6540,7 @@ fn parse_warning_to_json(w: &crate::knowledge_wiki::block_parser::ParseWarning) 
 /// `POST /operation-knowledge/chunks/:id/patch` — 字段级 patch。
 pub(super) async fn patch_operation_knowledge_chunk(
     State(state): State<AppState>,
+    Extension(admin): Extension<AuthenticatedAdmin>,
     Path(id): Path<String>,
     Json(payload): Json<ChunkPatchRequest>,
 ) -> AppResult<Json<Value>> {
@@ -6027,11 +6556,18 @@ pub(super) async fn patch_operation_knowledge_chunk(
     };
     let applied = apply_chunk_revision(
         &state.db,
-        &state.config.default_workspace_id,
+        &admin.current_workspace,
         object_id,
         req,
     )
     .await?;
+    super::chunk_locks::broadcast_chunk_revised_in(
+        &state,
+        &admin.current_workspace,
+        &applied.chunk_id,
+        "patch",
+        &admin.username,
+    );
     Ok(Json(revision_applied_to_json(&applied)))
 }
 
@@ -6039,6 +6575,7 @@ pub(super) async fn patch_operation_knowledge_chunk(
 /// 删除级联（清空其它 chunk 的 related_chunks 引用）。
 pub(super) async fn archive_operation_knowledge_chunk(
     State(state): State<AppState>,
+    Extension(admin): Extension<AuthenticatedAdmin>,
     Path(id): Path<String>,
     Json(payload): Json<ChunkArchiveRequest>,
 ) -> AppResult<Json<Value>> {
@@ -6052,18 +6589,25 @@ pub(super) async fn archive_operation_knowledge_chunk(
     };
     let applied = apply_chunk_revision(
         &state.db,
-        &state.config.default_workspace_id,
+        &admin.current_workspace,
         object_id,
         req,
     )
     .await?;
     let cleaned = cleanup_dangling_refs(
         &state.db,
-        &state.config.default_workspace_id,
+        &admin.current_workspace,
         &applied.chunk_id,
     )
     .await
     .unwrap_or(0);
+    super::chunk_locks::broadcast_chunk_revised_in(
+        &state,
+        &admin.current_workspace,
+        &applied.chunk_id,
+        "archive",
+        &admin.username,
+    );
     let mut value = revision_applied_to_json(&applied);
     if let Some(o) = value.as_object_mut() {
         o.insert("cleanedReferences".to_string(), json!(cleaned));
@@ -6074,6 +6618,7 @@ pub(super) async fn archive_operation_knowledge_chunk(
 /// `POST /operation-knowledge/chunks/:id/restore` — 取消 archive。
 pub(super) async fn restore_operation_knowledge_chunk(
     State(state): State<AppState>,
+    Extension(admin): Extension<AuthenticatedAdmin>,
     Path(id): Path<String>,
     Json(payload): Json<ChunkArchiveRequest>,
 ) -> AppResult<Json<Value>> {
@@ -6087,11 +6632,18 @@ pub(super) async fn restore_operation_knowledge_chunk(
     };
     let applied = apply_chunk_revision(
         &state.db,
-        &state.config.default_workspace_id,
+        &admin.current_workspace,
         object_id,
         req,
     )
     .await?;
+    super::chunk_locks::broadcast_chunk_revised_in(
+        &state,
+        &admin.current_workspace,
+        &applied.chunk_id,
+        "restore",
+        &admin.username,
+    );
     Ok(Json(revision_applied_to_json(&applied)))
 }
 
@@ -6107,6 +6659,7 @@ pub(super) async fn restore_operation_knowledge_chunk(
 /// 物理删除 history。
 pub(super) async fn rollback_operation_knowledge_chunk(
     State(state): State<AppState>,
+    Extension(admin): Extension<AuthenticatedAdmin>,
     Path((id, revision_id)): Path<(String, String)>,
     Json(payload): Json<ChunkRollbackRequest>,
 ) -> AppResult<Json<Value>> {
@@ -6172,11 +6725,18 @@ pub(super) async fn rollback_operation_knowledge_chunk(
     };
     let applied = apply_chunk_revision(
         &state.db,
-        &state.config.default_workspace_id,
+        &admin.current_workspace,
         object_id,
         req,
     )
     .await?;
+    super::chunk_locks::broadcast_chunk_revised_in(
+        &state,
+        &admin.current_workspace,
+        &applied.chunk_id,
+        "rollback",
+        &admin.username,
+    );
     let mut value = revision_applied_to_json(&applied);
     if let Some(o) = value.as_object_mut() {
         o.insert("rollbackTo".to_string(), json!(revision_id));
@@ -6197,11 +6757,23 @@ pub(super) struct ChunkRevisionsQuery {
 /// 长字段（patch 内的 body / answer 等）在响应里保留原文；前端长 body 自行 mask。
 pub(super) async fn list_operation_knowledge_chunk_revisions(
     State(state): State<AppState>,
+    Extension(admin): Extension<AuthenticatedAdmin>,
     Path(id): Path<String>,
     Query(query): Query<ChunkRevisionsQuery>,
 ) -> AppResult<Json<Value>> {
     use futures::TryStreamExt;
     let object_id = parse_object_id(&id)?;
+    // 多租户隔离：先确认该 chunk 属于当前 workspace，再列其编辑历史
+    // （chunk_revisions 自身不带 workspace_id，靠父 chunk 授权）。
+    state
+        .db
+        .operation_knowledge_chunks()
+        .find_one(
+            doc! { "_id": object_id, "workspace_id": &admin.current_workspace },
+            None,
+        )
+        .await?
+        .ok_or_else(|| AppError::NotFound("operation knowledge chunk not found".to_string()))?;
     let limit = query.limit.unwrap_or(20).clamp(1, 200) as i64;
     let skip = query.offset.unwrap_or(0) as u64;
     let opts = FindOptions::builder()
@@ -6264,11 +6836,12 @@ pub(super) struct ChunkSplitRequest {
 /// 失败时 admin 直接看 history 修复）。
 pub(super) async fn split_operation_knowledge_chunk(
     State(state): State<AppState>,
+    Extension(admin): Extension<AuthenticatedAdmin>,
     Path(id): Path<String>,
     Json(payload): Json<ChunkSplitRequest>,
 ) -> AppResult<Json<Value>> {
     let object_id = parse_object_id(&id)?;
-    let workspace_id = &state.config.default_workspace_id;
+    let workspace_id = &admin.current_workspace;
     if payload.new_chunks.is_empty() {
         return Err(AppError::BadRequest(
             "new_chunks 不可为空，至少需要 1 份新 chunk".to_string(),
@@ -6302,6 +6875,13 @@ pub(super) async fn split_operation_knowledge_chunk(
         ..archive_req
     };
     let archived = apply_chunk_revision(&state.db, workspace_id, object_id, archive_req).await?;
+    super::chunk_locks::broadcast_chunk_revised_in(
+        &state,
+        workspace_id,
+        &archived.chunk_id,
+        "split",
+        &admin.username,
+    );
     // 2) 创建 N 个新 chunk
     let mut new_ids: Vec<String> = Vec::new();
     let now = DateTime::now();
@@ -6391,12 +6971,13 @@ fn default_merge_strategy() -> String {
 /// `POST /operation-knowledge/chunks/:id/merge` — 合并 chunk。
 pub(super) async fn merge_operation_knowledge_chunk(
     State(state): State<AppState>,
+    Extension(admin): Extension<AuthenticatedAdmin>,
     Path(id): Path<String>,
     Json(payload): Json<ChunkMergeRequest>,
 ) -> AppResult<Json<Value>> {
     let object_id = parse_object_id(&id)?;
     let target_id = parse_object_id(&payload.merge_target_id)?;
-    let workspace_id = &state.config.default_workspace_id;
+    let workspace_id = &admin.current_workspace;
     match payload.merge_strategy.as_str() {
         "into_target" => {
             // 把原 chunk 归档，target chunk 接收一些字段（数组字段会自动 union）
@@ -6417,6 +6998,20 @@ pub(super) async fn merge_operation_knowledge_chunk(
                 actor: payload.actor.clone(),
             };
             let tgt = apply_chunk_revision(&state.db, workspace_id, target_id, target_req).await?;
+            super::chunk_locks::broadcast_chunk_revised_in(
+                &state,
+                workspace_id,
+                &arch.chunk_id,
+                "merge",
+                &admin.username,
+            );
+            super::chunk_locks::broadcast_chunk_revised_in(
+                &state,
+                workspace_id,
+                &tgt.chunk_id,
+                "merge",
+                &admin.username,
+            );
             Ok(Json(json!({
                 "ok": true,
                 "archived": revision_applied_to_json(&arch),
@@ -6498,6 +7093,29 @@ pub(super) async fn merge_operation_knowledge_chunk(
                 .as_object_id()
                 .map(|o| o.to_hex())
                 .unwrap_or_default();
+            super::chunk_locks::broadcast_chunk_revised_in(
+                &state,
+                workspace_id,
+                &arch_a.chunk_id,
+                "merge",
+                &admin.username,
+            );
+            super::chunk_locks::broadcast_chunk_revised_in(
+                &state,
+                workspace_id,
+                &arch_b.chunk_id,
+                "merge",
+                &admin.username,
+            );
+            if !new_id.is_empty() {
+                super::chunk_locks::broadcast_chunk_revised_in(
+                    &state,
+                    workspace_id,
+                    &new_id,
+                    "create",
+                    &admin.username,
+                );
+            }
             Ok(Json(json!({
                 "ok": true,
                 "archivedA": revision_applied_to_json(&arch_a),
@@ -6534,6 +7152,7 @@ const ALLOWED_RELATION_KINDS: &[&str] = &[
 /// `POST /operation-knowledge/chunks/:id/relate` — 添加一条 related_chunks。
 pub(super) async fn relate_operation_knowledge_chunk(
     State(state): State<AppState>,
+    Extension(admin): Extension<AuthenticatedAdmin>,
     Path(id): Path<String>,
     Json(payload): Json<ChunkRelateRequest>,
 ) -> AppResult<Json<Value>> {
@@ -6553,7 +7172,7 @@ pub(super) async fn relate_operation_knowledge_chunk(
         .find_one(
             doc! {
                 "_id": target_oid,
-                "workspace_id": &state.config.default_workspace_id,
+                "workspace_id": &admin.current_workspace,
             },
             None,
         )
@@ -6565,7 +7184,7 @@ pub(super) async fn relate_operation_knowledge_chunk(
         .find_one(
             doc! {
                 "_id": object_id,
-                "workspace_id": &state.config.default_workspace_id,
+                "workspace_id": &admin.current_workspace,
             },
             None,
         )
@@ -6602,17 +7221,25 @@ pub(super) async fn relate_operation_knowledge_chunk(
     };
     let applied = apply_chunk_revision(
         &state.db,
-        &state.config.default_workspace_id,
+        &admin.current_workspace,
         object_id,
         req,
     )
     .await?;
+    super::chunk_locks::broadcast_chunk_revised_in(
+        &state,
+        &admin.current_workspace,
+        &applied.chunk_id,
+        "relate",
+        &admin.username,
+    );
     Ok(Json(revision_applied_to_json(&applied)))
 }
 
 /// `DELETE /operation-knowledge/chunks/:id/relate/:target_id` — 移除单条关系。
 pub(super) async fn unrelate_operation_knowledge_chunk(
     State(state): State<AppState>,
+    Extension(admin): Extension<AuthenticatedAdmin>,
     Path((id, target_id)): Path<(String, String)>,
 ) -> AppResult<Json<Value>> {
     let object_id = parse_object_id(&id)?;
@@ -6622,7 +7249,7 @@ pub(super) async fn unrelate_operation_knowledge_chunk(
         .find_one(
             doc! {
                 "_id": object_id,
-                "workspace_id": &state.config.default_workspace_id,
+                "workspace_id": &admin.current_workspace,
             },
             None,
         )
@@ -6658,11 +7285,18 @@ pub(super) async fn unrelate_operation_knowledge_chunk(
     };
     let applied = apply_chunk_revision(
         &state.db,
-        &state.config.default_workspace_id,
+        &admin.current_workspace,
         object_id,
         req,
     )
     .await?;
+    super::chunk_locks::broadcast_chunk_revised_in(
+        &state,
+        &admin.current_workspace,
+        &applied.chunk_id,
+        "unrelate",
+        &admin.username,
+    );
     let mut value = revision_applied_to_json(&applied);
     if let Some(o) = value.as_object_mut() {
         o.insert(
@@ -6686,6 +7320,7 @@ pub struct ChunkReferrersQuery {
 /// 不物化反向 link（避免双向写入一致性问题），每次查询走 query path。
 pub async fn list_chunk_referrers(
     State(state): State<AppState>,
+    Extension(admin): Extension<AuthenticatedAdmin>,
     Query(q): Query<ChunkReferrersQuery>,
 ) -> AppResult<Json<Value>> {
     if q.target_id.trim().is_empty() {
@@ -6696,7 +7331,7 @@ pub async fn list_chunk_referrers(
         .operation_knowledge_chunks()
         .find(
             doc! {
-                "workspace_id": &state.config.default_workspace_id,
+                "workspace_id": &admin.current_workspace,
                 "related_chunks.chunk_id": &q.target_id,
             },
             None,
@@ -6748,6 +7383,7 @@ pub struct ChunkBatchVerifyRequest {
 /// AI 永不自动 verify 红线保留：批量入口仍需 admin 手工触发，与单条同 auth 路径。
 pub async fn batch_verify_chunks(
     State(state): State<AppState>,
+    Extension(admin): Extension<AuthenticatedAdmin>,
     Json(payload): Json<ChunkBatchVerifyRequest>,
 ) -> AppResult<Json<Value>> {
     if payload.ids.is_empty() {
@@ -6770,7 +7406,7 @@ pub async fn batch_verify_chunks(
             .db
             .operation_knowledge_chunks()
             .find_one(
-                doc! { "_id": object_id, "workspace_id": &state.config.default_workspace_id },
+                doc! { "_id": object_id, "workspace_id": &admin.current_workspace },
                 None,
             )
             .await
@@ -6799,7 +7435,7 @@ pub async fn batch_verify_chunks(
             .db
             .operation_knowledge_chunks()
             .update_one(
-                doc! { "_id": object_id, "workspace_id": &state.config.default_workspace_id },
+                doc! { "_id": object_id, "workspace_id": &admin.current_workspace },
                 doc! {
                     "$set": {
                         "integrity_status": "verified",
@@ -6838,6 +7474,7 @@ pub struct ChunkBatchArchiveRequest {
 /// 复用 archive_operation_knowledge_chunk 内部 RevisionRequest 路径。
 pub async fn batch_archive_chunks(
     State(state): State<AppState>,
+    Extension(admin): Extension<AuthenticatedAdmin>,
     Json(payload): Json<ChunkBatchArchiveRequest>,
 ) -> AppResult<Json<Value>> {
     if payload.ids.is_empty() {
@@ -6865,7 +7502,7 @@ pub async fn batch_archive_chunks(
         };
         match apply_chunk_revision(
             &state.db,
-            &state.config.default_workspace_id,
+            &admin.current_workspace,
             object_id,
             req,
         )
@@ -6892,9 +7529,10 @@ pub async fn batch_archive_chunks(
 // **不写库 / 不修 schema / 不引外部缓存**。一次 aggregate 命中 4 个维度。
 pub async fn knowledge_aggregate_metadata(
     State(state): State<AppState>,
+    Extension(admin): Extension<AuthenticatedAdmin>,
 ) -> AppResult<Json<Value>> {
     use futures::StreamExt;
-    let ws = &state.config.default_workspace_id;
+    let ws = &admin.current_workspace;
     let cutoff = mongodb::bson::DateTime::from_millis(
         (chrono::Utc::now() - chrono::Duration::days(7)).timestamp_millis(),
     );
@@ -7063,12 +7701,13 @@ pub async fn knowledge_aggregate_metadata(
 /// 列出 gap signal。默认返回 `pending` 状态；`status` 查询参数可选。
 pub(super) async fn list_knowledge_gap_signals(
     State(state): State<AppState>,
+    Extension(admin): Extension<AuthenticatedAdmin>,
     Query(query): Query<GapSignalListQuery>,
 ) -> AppResult<Json<Value>> {
     use futures::TryStreamExt;
     let status = query.status.as_deref().unwrap_or("pending");
     let mut filter = doc! {
-        "workspace_id": &state.config.default_workspace_id,
+        "workspace_id": &admin.current_workspace,
         "status": status,
     };
     if let Some(kind) = query.kind.as_deref() {
@@ -7125,6 +7764,7 @@ pub struct GapSignalResolutionRequest {
 /// 手动 dismiss 一条 signal（运营确认本条不需要处理）。
 pub(super) async fn dismiss_knowledge_gap_signal(
     State(state): State<AppState>,
+    Extension(admin): Extension<AuthenticatedAdmin>,
     Path(signal_id): Path<String>,
     Json(payload): Json<GapSignalResolutionRequest>,
 ) -> AppResult<Json<Value>> {
@@ -7139,7 +7779,7 @@ pub(super) async fn dismiss_knowledge_gap_signal(
         .update_one(
             doc! {
                 "signal_id": &signal_id,
-                "workspace_id": &state.config.default_workspace_id,
+                "workspace_id": &admin.current_workspace,
                 "status": "pending"
             },
             doc! { "$set": {
@@ -7159,6 +7799,7 @@ pub(super) async fn dismiss_knowledge_gap_signal(
 /// 标记一条 signal 为 applied（运营已按建议改了 chunk）。
 pub(super) async fn apply_knowledge_gap_signal(
     State(state): State<AppState>,
+    Extension(admin): Extension<AuthenticatedAdmin>,
     Path(signal_id): Path<String>,
     Json(payload): Json<GapSignalResolutionRequest>,
 ) -> AppResult<Json<Value>> {
@@ -7173,7 +7814,7 @@ pub(super) async fn apply_knowledge_gap_signal(
         .update_one(
             doc! {
                 "signal_id": &signal_id,
-                "workspace_id": &state.config.default_workspace_id,
+                "workspace_id": &admin.current_workspace,
                 "status": "pending"
             },
             doc! { "$set": {
@@ -7193,9 +7834,10 @@ pub(super) async fn apply_knowledge_gap_signal(
 /// 手动触发一次 structural lint + stage 1 sweep。
 pub(super) async fn sweep_knowledge_gap_signals(
     State(state): State<AppState>,
+    Extension(admin): Extension<AuthenticatedAdmin>,
 ) -> AppResult<Json<Value>> {
     use crate::knowledge_wiki::gap_signals;
-    let workspace = &state.config.default_workspace_id;
+    let workspace = &admin.current_workspace;
     let lint = gap_signals::run_structural_lint(&state.db, workspace).await?;
     let sweep = gap_signals::sweep_stale_signals(&state.db, workspace).await?;
     Ok(Json(json!({
@@ -7219,6 +7861,8 @@ pub(super) async fn sweep_knowledge_gap_signals(
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(super) struct KnowledgeAskRequest {
+    /// 已废弃：服务端忽略此字段，一律用 session 的 current_workspace（防跨租户读取）。
+    #[allow(dead_code)]
     workspace_id: Option<String>,
     account_id: Option<String>,
     query: String,
@@ -7245,17 +7889,17 @@ pub(super) struct KnowledgeAskFilter {
 /// truncated, tookMs }`。`tookMs` 为后端测得的端到端耗时（含 LLM 与 mongo I/O）。
 pub(super) async fn ask_knowledge(
     State(state): State<AppState>,
+    Extension(admin): Extension<AuthenticatedAdmin>,
     Json(req): Json<KnowledgeAskRequest>,
 ) -> AppResult<Json<Value>> {
     let started_at = std::time::Instant::now();
     if req.query.trim().is_empty() {
         return Err(AppError::BadRequest("query 不能为空".into()));
     }
-    let workspace_id = req
-        .workspace_id
-        .clone()
-        .filter(|s| !s.trim().is_empty())
-        .unwrap_or_else(|| state.config.default_workspace_id.clone());
+    // 多租户隔离：一律用 session 注入的 current_workspace，忽略 body 里 client 传的
+    // workspaceId（AuthenticatedAdmin 不携带可访问 workspace 列表，无法做 ACL 校验，
+    // 信任 client 值会导致跨租户读取）。切换 workspace 走 POST /api/auth/workspace。
+    let workspace_id = admin.current_workspace.clone();
     let account_id = req
         .account_id
         .clone()
@@ -7310,6 +7954,8 @@ pub(super) async fn ask_knowledge(
 #[serde(rename_all = "camelCase")]
 pub(super) struct KnowledgeAskStreamQuery {
     query: String,
+    /// 已废弃：服务端忽略此字段，一律用 session 的 current_workspace（防跨租户读取）。
+    #[allow(dead_code)]
     workspace_id: Option<String>,
     account_id: Option<String>,
     max_rounds: Option<i32>,
@@ -7338,6 +7984,7 @@ fn split_csv(raw: Option<&str>) -> Vec<String> {
 ///   - `close` —— 流结束信号；前端收到后应主动 `es.close()` 不再重连
 pub(super) async fn ask_knowledge_stream(
     State(state): State<AppState>,
+    Extension(admin): Extension<AuthenticatedAdmin>,
     Query(req): Query<KnowledgeAskStreamQuery>,
 ) -> AppResult<
     axum::response::Sse<
@@ -7349,11 +7996,10 @@ pub(super) async fn ask_knowledge_stream(
     if req.query.trim().is_empty() {
         return Err(AppError::BadRequest("query 不能为空".into()));
     }
-    let workspace_id = req
-        .workspace_id
-        .clone()
-        .filter(|s| !s.trim().is_empty())
-        .unwrap_or_else(|| state.config.default_workspace_id.clone());
+    // 多租户隔离：一律用 session 注入的 current_workspace，忽略 body 里 client 传的
+    // workspaceId（AuthenticatedAdmin 不携带可访问 workspace 列表，无法做 ACL 校验，
+    // 信任 client 值会导致跨租户读取）。切换 workspace 走 POST /api/auth/workspace。
+    let workspace_id = admin.current_workspace.clone();
     let account_id = req
         .account_id
         .clone()
@@ -7431,6 +8077,13 @@ pub(super) async fn ask_knowledge_stream(
                     st,
                 ))
             }
+            Some(agent::knowledge_agent::TraceEvent::Token { delta }) => {
+                let data = json!({ "delta": delta }).to_string();
+                Some((
+                    Ok::<_, std::convert::Infallible>(Event::default().event("token").data(data)),
+                    st,
+                ))
+            }
             Some(agent::knowledge_agent::TraceEvent::Final { answer }) => {
                 // 与 /api/knowledge/ask 的 JSON 形态对齐：tool_trace 走 relaxed extjson。
                 let tool_trace_json: Vec<Value> = answer
@@ -7493,9 +8146,10 @@ pub(super) struct OperatorMemoryQuery {
 
 pub(super) async fn list_operator_memory(
     State(state): State<AppState>,
+    Extension(admin): Extension<AuthenticatedAdmin>,
     Query(query): Query<OperatorMemoryQuery>,
 ) -> AppResult<Json<Value>> {
-    let workspace_id = state.config.default_workspace_id.clone();
+    let workspace_id = admin.current_workspace.clone();
     let account_id = query
         .account_id
         .clone()
@@ -7566,6 +8220,175 @@ pub(super) async fn list_operator_memory(
         "operatorId": operator_id,
         "items": items,
     })))
+}
+
+// ── Phase G P1-6：ingest sources CRUD ────────────────────────────────────
+//
+// 写路径只接受 status="active"；failing/disabled 是 worker 自行迁移的，admin
+// 通过此接口可重置（active），但不能直接写 failing/disabled（违反闭集语义）。
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IngestSourceCreateRequest {
+    pub kind: String,
+    pub url: String,
+    pub schedule_minutes: i64,
+    #[serde(default)]
+    pub label: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IngestSourceUpdateRequest {
+    #[serde(default)]
+    pub url: Option<String>,
+    #[serde(default)]
+    pub schedule_minutes: Option<i64>,
+    #[serde(default)]
+    pub label: Option<String>,
+    /// 仅允许写 "active"——把 failing 重置回 active；其他值 400。
+    #[serde(default)]
+    pub status: Option<String>,
+}
+
+pub async fn list_ingest_sources(
+    State(state): State<AppState>,
+    Extension(admin): Extension<AuthenticatedAdmin>,
+) -> AppResult<Json<Value>> {
+    let workspace_id = admin.current_workspace.clone();
+    let mut cursor = state
+        .db
+        .ingest_sources()
+        .find(doc! { "workspace_id": &workspace_id }, None)
+        .await
+        .map_err(AppError::from)?;
+    let mut items: Vec<Value> = Vec::new();
+    while let Some(src) = cursor.try_next().await.map_err(AppError::from)? {
+        items.push(serde_json::to_value(src).map_err(|e| AppError::External(e.to_string()))?);
+    }
+    Ok(Json(json!({ "workspaceId": workspace_id, "items": items })))
+}
+
+pub async fn create_ingest_source(
+    State(state): State<AppState>,
+    Extension(admin): Extension<AuthenticatedAdmin>,
+    Json(payload): Json<IngestSourceCreateRequest>,
+) -> AppResult<Json<Value>> {
+    if !matches!(payload.kind.as_str(), "rss" | "html") {
+        return Err(AppError::BadRequest(
+            "kind must be 'rss' or 'html'".to_string(),
+        ));
+    }
+    if payload.url.trim().is_empty() {
+        return Err(AppError::BadRequest("url required".to_string()));
+    }
+    if payload.schedule_minutes < 1 {
+        return Err(AppError::BadRequest(
+            "schedule_minutes must be >= 1".to_string(),
+        ));
+    }
+    let now = DateTime::now();
+    let source_id = format!("ing_{}", ObjectId::new().to_hex());
+    let row = crate::models::IngestSource {
+        id: None,
+        source_id: source_id.clone(),
+        workspace_id: admin.current_workspace.clone(),
+        kind: payload.kind,
+        url: payload.url,
+        schedule_minutes: payload.schedule_minutes,
+        label: payload.label,
+        last_fetched_at: None,
+        last_etag: None,
+        last_error: None,
+        status: "active".to_string(),
+        failure_streak: 0,
+        ingest_count: 0,
+        created_at: now,
+        updated_at: now,
+    };
+    state
+        .db
+        .ingest_sources()
+        .insert_one(&row, None)
+        .await
+        .map_err(AppError::from)?;
+    Ok(Json(json!({ "sourceId": source_id })))
+}
+
+pub async fn update_ingest_source(
+    State(state): State<AppState>,
+    Extension(admin): Extension<AuthenticatedAdmin>,
+    Path(source_id): Path<String>,
+    Json(payload): Json<IngestSourceUpdateRequest>,
+) -> AppResult<Json<Value>> {
+    let mut set_doc = doc! { "updated_at": DateTime::now() };
+    if let Some(url) = payload.url {
+        if url.trim().is_empty() {
+            return Err(AppError::BadRequest("url cannot be empty".to_string()));
+        }
+        set_doc.insert("url", url);
+    }
+    if let Some(m) = payload.schedule_minutes {
+        if m < 1 {
+            return Err(AppError::BadRequest(
+                "schedule_minutes must be >= 1".to_string(),
+            ));
+        }
+        set_doc.insert("schedule_minutes", m);
+    }
+    if let Some(label) = payload.label {
+        set_doc.insert("label", label);
+    }
+    if let Some(s) = payload.status {
+        if s != "active" {
+            return Err(AppError::BadRequest(
+                "status only accepts 'active' (failing/disabled is worker-managed)".to_string(),
+            ));
+        }
+        set_doc.insert("status", "active");
+        set_doc.insert("failure_streak", 0);
+        set_doc.insert("last_error", Bson::Null);
+    }
+    let result = state
+        .db
+        .ingest_sources()
+        .update_one(
+            doc! {
+                "source_id": &source_id,
+                "workspace_id": &admin.current_workspace,
+            },
+            doc! { "$set": set_doc },
+            None,
+        )
+        .await
+        .map_err(AppError::from)?;
+    if result.matched_count == 0 {
+        return Err(AppError::NotFound("ingest source not found".to_string()));
+    }
+    Ok(Json(json!({ "sourceId": source_id, "updated": true })))
+}
+
+pub async fn delete_ingest_source(
+    State(state): State<AppState>,
+    Extension(admin): Extension<AuthenticatedAdmin>,
+    Path(source_id): Path<String>,
+) -> AppResult<Json<Value>> {
+    let result = state
+        .db
+        .ingest_sources()
+        .delete_one(
+            doc! {
+                "source_id": &source_id,
+                "workspace_id": &admin.current_workspace,
+            },
+            None,
+        )
+        .await
+        .map_err(AppError::from)?;
+    if result.deleted_count == 0 {
+        return Err(AppError::NotFound("ingest source not found".to_string()));
+    }
+    Ok(Json(json!({ "sourceId": source_id, "deleted": true })))
 }
 
 #[cfg(test)]

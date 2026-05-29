@@ -44,6 +44,7 @@ async fn main() -> anyhow::Result<()> {
         &db,
         config.bootstrap_admin_username.as_deref(),
         config.bootstrap_admin_password.as_deref(),
+        Some(&config.default_workspace_id),
     )
     .await
     {
@@ -127,6 +128,18 @@ async fn main() -> anyhow::Result<()> {
     } else {
         None
     };
+    // P1-7：JWT keys。`JWT_ENABLED=true` 时强制要求 PEM 双密钥；未配置直接 panic
+    // 拒起，避免"以为开了实际没开"。`false`（默认）时为 None，仅 cookie 路径。
+    let jwt_keys_arc: Option<Arc<wechatagent::auth::jwt::JwtKeys>> = if config.jwt_enabled {
+        let keys = wechatagent::auth::jwt::JwtKeys::from_config(&config)?;
+        tracing::info!(
+            ttl_minutes = keys.ttl_minutes,
+            "jwt enabled — Authorization: Bearer route is open"
+        );
+        Some(Arc::new(keys))
+    } else {
+        None
+    };
     let state = AppState {
         db,
         mcp: McpClient::new(config.mcp_base_url.clone(), config.mcp_api_key.clone())?,
@@ -138,6 +151,12 @@ async fn main() -> anyhow::Result<()> {
             wechatagent::knowledge_task::ChatProgressBus::new(),
         ),
         second_reviewer_llm,
+        chunk_locks: std::sync::Arc::new(dashmap::DashMap::new()),
+        chunk_event_bus: tokio::sync::broadcast::channel(
+            wechatagent::routes::chunk_locks::CHUNK_EVENT_CHANNEL_CAPACITY,
+        )
+        .0,
+        jwt_keys: jwt_keys_arc,
     };
     prompts::ensure_prompt_pack_v2(
         &state.db,
@@ -155,67 +174,56 @@ async fn main() -> anyhow::Result<()> {
     // S-18 / Task 18：种入示例评测场景，缺失时用 fallback 满足 spec 要求。
     let _ = ensure_example_evaluation_scenario(&state.db, &state.config.default_workspace_id).await;
 
-    let worker_state = state.clone();
-    tokio::spawn(async move {
-        tasks::run_task_worker(worker_state).await;
+    // P1-7：所有长寿 worker 经 supervisor 包裹，panic 后退避重启 + 写
+    // agent_events.kind=background_worker_panic。
+    use wechatagent::supervisor::spawn_supervised;
+
+    spawn_supervised(state.clone(), "task_worker", |s| async move {
+        tasks::run_task_worker(s).await;
     });
 
-    let outbox_state = state.clone();
-    tokio::spawn(async move {
-        if let Err(err) = run_outbox_dispatcher(outbox_state).await {
+    spawn_supervised(state.clone(), "outbox_dispatcher", |s| async move {
+        if let Err(err) = run_outbox_dispatcher(s).await {
             tracing::error!(?err, "outbox dispatcher exited");
         }
     });
 
     if state.config.strategic_planner_enabled {
-        let planner_state = state.clone();
-        tokio::spawn(async move {
-            wechatagent::planner::run_strategic_planner(planner_state).await;
+        spawn_supervised(state.clone(), "strategic_planner", |s| async move {
+            wechatagent::planner::run_strategic_planner(s).await;
         });
     }
 
     // Phase D / D3：冷联系人重激活 worker。默认关停（COLD_CONTACT_WORKER_ENABLED=false）；
     // worker 内部检查 flag 后立即 return。打开后周期挑 last_outbound_at 旧的 managed
     // contact，写 follow_up 任务，下游仍走 gateway / outbox。
-    {
-        let cold_state = state.clone();
-        tokio::spawn(async move {
-            wechatagent::cold_contact_worker::run_cold_contact_worker(cold_state).await;
-        });
-    }
+    spawn_supervised(state.clone(), "cold_contact_worker", |s| async move {
+        wechatagent::cold_contact_worker::run_cold_contact_worker(s).await;
+    });
 
     // agent-self-evolution M4 W1：演化器 worker。
     // 关停态默认（`EVOLUTION_ENABLED=false`）；run_evolutionary_worker 内部
     // 会立即 return，不消耗任何资源。打开后周期跑 cohort 选择 + 候选生成
     // + shadow eval（W2/W3 落地后）。
-    {
-        let evolution_state = state.clone();
-        tokio::spawn(async move {
-            wechatagent::evolution::run_evolutionary_worker(evolution_state).await;
-        });
-    }
+    spawn_supervised(state.clone(), "evolutionary_worker", |s| async move {
+        wechatagent::evolution::run_evolutionary_worker(s).await;
+    });
 
     // knowledge-digest-workstation Phase 1：日报合成 worker。
     // 关停态默认（`KNOWLEDGE_DIGEST_ENABLED=false`）；worker_loop 内部立即
     // return。打开后每天 `KNOWLEDGE_DIGEST_RUN_HOUR` 整点扫 4 数据源 + 合成
     // 卡片（Phase 2 落地）。
-    {
-        let digest_state = state.clone();
-        tokio::spawn(async move {
-            wechatagent::knowledge_digest::worker_loop(digest_state).await;
-        });
-    }
+    spawn_supervised(state.clone(), "knowledge_digest_worker", |s| async move {
+        wechatagent::knowledge_digest::worker_loop(s).await;
+    });
 
     // knowledge-digest-workstation Phase 4：chat 长任务 worker。
     // 默认间隔 30s（`KNOWLEDGE_TASK_WORKER_INTERVAL_SECONDS=0` 关停）。
     // 取 pending knowledge_chat_tasks 按 sessionId 串行执行 plannedSteps，
     // 进度回写 knowledge_chat_turns 并经 ChatProgressBus 推 SSE。
-    {
-        let task_state = state.clone();
-        tokio::spawn(async move {
-            wechatagent::knowledge_task::worker_loop(task_state).await;
-        });
-    }
+    spawn_supervised(state.clone(), "knowledge_task_worker", |s| async move {
+        wechatagent::knowledge_task::worker_loop(s).await;
+    });
 
     // knowledge-wiki Phase E：catalog rebuild worker。
     // 默认 3s 一轮（`CATALOG_REBUILD_WORKER_INTERVAL_SECONDS=0` 关停）。消费
@@ -223,29 +231,44 @@ async fn main() -> anyhow::Result<()> {
     // 渲染为 markdown 落到 `documents.catalog_summary_persisted` + 自增
     // `catalog_version`，把 catalog 拉取从 O(N 字段) 降到 O(1)。
     {
-        let db = state.db.clone();
         let interval = state.config.catalog_rebuild_worker_interval_seconds;
-        tokio::spawn(async move {
-            wechatagent::knowledge_wiki::catalog_rebuild::catalog_rebuild_worker_loop(
-                db, interval,
-            )
-            .await;
+        spawn_supervised(state.clone(), "catalog_rebuild_worker", move |s| {
+            let interval = interval;
+            async move {
+                wechatagent::knowledge_wiki::catalog_rebuild::catalog_rebuild_worker_loop(
+                    s.db.clone(),
+                    interval,
+                )
+                .await;
+            }
         });
     }
 
     // knowledge-wiki Phase F：feedback worker。
     // 默认 600s 一轮（`KNOWLEDGE_FEEDBACK_INTERVAL_SECONDS=0` 关停）。逐 workspace
     // 跑 30d usage_stats 滑窗回写 + dynamic_confidence 计算 + structural lint +
-    // stage 1 sweep。stage 2（LLM）暂留接口，本轮不进入热路径。
+    // stage 1 sweep。stage 2（LLM）暂留接口,本轮不进入热路径。
     {
-        let feedback_state = state.clone();
         let interval = state.config.knowledge_feedback_interval_seconds;
-        tokio::spawn(async move {
-            wechatagent::knowledge_wiki::feedback_worker::feedback_worker_loop(
-                feedback_state,
-                interval,
-            )
-            .await;
+        spawn_supervised(state.clone(), "knowledge_feedback_worker", move |s| {
+            let interval = interval;
+            async move {
+                wechatagent::knowledge_wiki::feedback_worker::feedback_worker_loop(s, interval)
+                    .await;
+            }
+        });
+    }
+
+    // Phase G P1-6：auto-ingest worker。默认关停（`INGEST_WORKER_ENABLED=false`）。
+    // 每轮跨 workspace 扫 status="active" 的 IngestSource → 条件 GET → feed-rs/scraper
+    // 解析 → ingest_chunked_text 落 chunks（draft + needs_review，红线"AI 永不自动 verify"）。
+    if state.config.ingest_worker_enabled {
+        let interval = state.config.ingest_worker_interval_seconds;
+        spawn_supervised(state.clone(), "ingest_worker", move |s| {
+            let interval = interval;
+            async move {
+                wechatagent::knowledge_wiki::ingest_worker::ingest_worker_loop(s, interval).await;
+            }
         });
     }
 
@@ -402,6 +425,8 @@ async fn ensure_default_llm_provider(
         timeout_seconds: Some(config.llm_timeout_seconds),
         max_retries: Some(config.llm_max_retries),
         retry_base_ms: Some(config.llm_retry_base_ms),
+        supports_vision: false,
+        is_vision_active: false,
         created_at: now,
         updated_at: now,
     };

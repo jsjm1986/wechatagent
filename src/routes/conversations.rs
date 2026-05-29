@@ -2,12 +2,13 @@
 
 use axum::{
     extract::{Path, State},
-    Json,
+    Extension, Json,
 };
 use futures::TryStreamExt;
 use mongodb::{bson::doc, options::FindOptions};
 use serde_json::{json, Value};
 
+use crate::auth::AuthenticatedAdmin;
 use crate::error::AppResult;
 
 use super::shared::*;
@@ -15,9 +16,10 @@ use super::AppState;
 
 pub(super) async fn list_messages(
     State(state): State<AppState>,
+    Extension(admin): Extension<AuthenticatedAdmin>,
     Path(contact_id): Path<String>,
 ) -> AppResult<Json<Value>> {
-    let contact = find_contact_by_id(&state, &contact_id).await?;
+    let contact = find_contact_by_id(&state, &admin.current_workspace, &contact_id).await?;
     let mut cursor = state
         .db
         .messages()

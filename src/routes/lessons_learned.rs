@@ -14,14 +14,14 @@
 //! - 三类 pattern：`success / reviewer_misjudge_negative / blocked_by_safety_guard`，
 //!   与 [`crate::knowledge_wiki::lessons_learned`] 写入端枚举对齐；未识别的 pattern
 //!   保留在 JSON 输出，不在 server 侧白名单（让上游 schema 自由演进）。
-//! - workspace 隔离：filter 强制 `workspace_id == default_workspace_id`，与 ops 三表
+//! - workspace 隔离：filter 强制 `workspace_id == admin.current_workspace`，与 ops 三表
 //!   admin 路由同源。
 //! - 幂等：lesson `review_status="promoted"` 且 `promoted_chunk_id` 已存在时，再次
 //!   POST promote 直接返回已有 chunk_id，不重复写库。
 
 use axum::{
     extract::{Path, Query, State},
-    Json,
+    Extension, Json,
 };
 use futures::TryStreamExt;
 use mongodb::{
@@ -32,6 +32,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::{
+    auth::AuthenticatedAdmin,
     error::{AppError, AppResult},
     models::{dt_to_string, OperationKnowledgeChunk},
 };
@@ -53,9 +54,10 @@ pub(super) struct ListLessonsLearnedQuery {
 
 pub(super) async fn list_lessons_learned(
     State(state): State<AppState>,
+    Extension(admin): Extension<AuthenticatedAdmin>,
     Query(query): Query<ListLessonsLearnedQuery>,
 ) -> AppResult<Json<Value>> {
-    let mut filter = doc! { "workspace_id": &state.config.default_workspace_id };
+    let mut filter = doc! { "workspace_id": &admin.current_workspace };
     if let Some(pk) = query.pattern_kind.as_ref().filter(|s| !s.trim().is_empty()) {
         filter.insert("pattern_kind", pk.trim());
     }
@@ -138,6 +140,7 @@ pub(crate) fn validate_promote_request(
 ///   形态的新 chunk hex id；幂等：再次 POST 直接返回已有 id，不重复 insert。
 pub(super) async fn promote_lesson_to_peer_case(
     State(state): State<AppState>,
+    Extension(admin): Extension<AuthenticatedAdmin>,
     Path(lesson_id): Path<String>,
     Json(payload): Json<PromoteLessonRequest>,
 ) -> AppResult<Json<Value>> {
@@ -155,7 +158,7 @@ pub(super) async fn promote_lesson_to_peer_case(
         .find_one(
             doc! {
                 "lesson_id": lesson_id_trim,
-                "workspace_id": &state.config.default_workspace_id,
+                "workspace_id": &admin.current_workspace,
             },
             None,
         )
@@ -191,7 +194,7 @@ pub(super) async fn promote_lesson_to_peer_case(
     let new_id = ObjectId::new();
     let chunk = OperationKnowledgeChunk {
         id: Some(new_id),
-        workspace_id: state.config.default_workspace_id.clone(),
+        workspace_id: admin.current_workspace.clone(),
         account_id: None,
         document_id: None,
         item_id: None,
@@ -254,7 +257,7 @@ pub(super) async fn promote_lesson_to_peer_case(
     // 写一条 agent_events 审计；与 lessons_learned 是 admin 显式动作的红线对齐。
     let event = crate::models::AgentEvent {
         id: None,
-        workspace_id: state.config.default_workspace_id.clone(),
+        workspace_id: admin.current_workspace.clone(),
         account_id: state.config.default_account_id.clone(),
         contact_wxid: None,
         kind: "lesson_promoted_to_peer_case".to_string(),
@@ -272,6 +275,7 @@ pub(super) async fn promote_lesson_to_peer_case(
             "integrity_status": "needs_review",
         }),
         created_at: now,
+        dedupe_key: None,
     };
     let _ = state.db.events().insert_one(event, None).await;
 

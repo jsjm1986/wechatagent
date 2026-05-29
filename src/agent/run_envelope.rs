@@ -121,6 +121,9 @@ pub const GATEWAY_STATUS_VALUES: &[&str] = &[
     // decision_reviews / agent_run_logs 可能写入 "outbox_enqueued" 终态。
     // dispatcher 完成 MCP 发送后会补一条 "sent"。
     "outbox_enqueued",
+    // P0-7 (Phase 0)：admin SPA 显式取消任务时写入。AI 自治语义上 admin 是
+    // 维护操作员（不是把对话权交给真人继续聊天），cancel_reason 字段记录管理员触发上下文。
+    "admin_cancelled",
 ];
 
 /// 严禁取值（R2.7 业务语义保护 + R9.2）。任何 finalReviewStatus / gateway_status
@@ -224,12 +227,10 @@ pub fn assert_lifecycle_valid(value: &str) -> AppResult<()> {
 ///   blocked_unverified_product_claim / revision_failed / tool_loop_timeout 等）：
 ///   决策已生成但被守门拦下 → `failed_after_decision`。
 pub fn derive_lifecycle_from_status(gateway_status: &str, error: Option<&str>) -> &'static str {
-    if matches!(
-        gateway_status,
-        "blocked_by_budget" | "ai_waiting_for_more_context"
-    ) || error
-        .map(|e| e.contains("budget_exceeded") || e.contains("BudgetExceeded"))
-        .unwrap_or(false)
+    if gateway_status == "blocked_by_budget"
+        || error
+            .map(|e| e.contains("budget_exceeded") || e.contains("BudgetExceeded"))
+            .unwrap_or(false)
     {
         return LIFECYCLE_ABORTED_BY_BUDGET;
     }
@@ -532,6 +533,12 @@ pub async fn update_run_envelope_terminal(
     fields: AgentRunLogTerminalFields,
 ) -> AppResult<()> {
     // R9.10.e：写库前枚举校验。脏值 SHALL fail-closed（不写库）。
+    if let Some(value) = fields.lifecycle.as_deref() {
+        // P0-6（审计 D1 C-1）：终态写入路径必须把 lifecycle 也卷进闭集断言，
+        // 否则 envelope-started 之后 derive_lifecycle_from_status 漏配新枚举
+        // 时会静默写入闭集外脏值。
+        assert_lifecycle_valid(value)?;
+    }
     if let Some(value) = fields.final_review_status.as_deref() {
         assert_final_review_status_valid(value)?;
     }
@@ -601,6 +608,7 @@ pub async fn update_run_envelope_terminal(
             "fields": details,
         }),
         created_at: DateTime::now(),
+        dedupe_key: None,
     };
     db.events().insert_one(event, None).await?;
 
@@ -1075,6 +1083,48 @@ mod tests {
                 mode
             );
         }
+    }
+
+    #[test]
+    fn derive_lifecycle_routes_hold_trio_to_failed_after_decision() {
+        // P2-5（蜂群审查 #138）：hold 三类（held_by_ai_policy /
+        // blocked_by_safety_guard / ai_waiting_for_more_context）都属于
+        // "决策已生成但被守门拦下"，SHALL 落 failed_after_decision；
+        // 此前 ai_waiting_for_more_context 被错配进 aborted_by_budget，
+        // 与 docstring 的"budget 维度耗尽"语义和 holdBreakdown 仪表盘冲突。
+        // budget 仍然只走 blocked_by_budget / error 包含 budget_exceeded。
+        for status in [
+            "held_by_ai_policy",
+            "blocked_by_safety_guard",
+            "ai_waiting_for_more_context",
+            "blocked_unverified_product_claim",
+            "revision_failed",
+            "review_blocked",
+        ] {
+            assert_eq!(
+                derive_lifecycle_from_status(status, None),
+                LIFECYCLE_FAILED_AFTER_DECISION,
+                "{status} SHALL 推算为 failed_after_decision"
+            );
+        }
+        assert_eq!(
+            derive_lifecycle_from_status("blocked_by_budget", None),
+            LIFECYCLE_ABORTED_BY_BUDGET,
+            "blocked_by_budget SHALL 推算为 aborted_by_budget"
+        );
+        assert_eq!(
+            derive_lifecycle_from_status("sent", Some("budget_exceeded: ...")),
+            LIFECYCLE_ABORTED_BY_BUDGET,
+            "error 含 budget_exceeded SHALL 推算为 aborted_by_budget"
+        );
+        assert_eq!(
+            derive_lifecycle_from_status("sent", None),
+            LIFECYCLE_COMPLETED
+        );
+        assert_eq!(
+            derive_lifecycle_from_status("cooldown", None),
+            LIFECYCLE_FAILED_BEFORE_DECISION
+        );
     }
 
     #[test]

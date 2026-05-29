@@ -37,13 +37,13 @@ Configuration is via `.env` (copy from `.env.example`). Required at startup: `MC
 
 `scripts/check-baseline.{sh,ps1}` is the merge gate, defined in `.kiro/specs/agent-autonomy-loop/requirements.md` R11.6. It enforces:
 
-- `cargo test --lib`: **≥ 78 passed, 0 failed**
+- `cargo test --lib`: **≥ 350 passed, 0 failed** (knowledge-cleanup 后基线，与 `scripts/check-baseline.{sh:25,ps1:17}` `LIB_BASELINE=350` 同步)
 - Cumulative across these four PBT files: **≥ 33 passed, 0 failed**
-  - `state_transition_pbt`, `memory_card_invariants`, `string_fact_risk_guard`, `llm_retry_jitter`
+  - `state_transition_pbt`, `memory_card_invariants`, `wiki_chunk_revision_pbt`, `llm_retry_jitter`
 
 Either threshold failing or any failure → `exit 1`. New work should add tests, not lower these numbers. The `coreFacts` field must keep deserializing the legacy `Vec<String>` form for backward compat (R11).
 
-A second merge gate is `scripts/check-no-human-takeover.{sh,ps1}` — a CI lint that scans `git diff` newly-added lines under `src/agent/`, `src/routes/`, `frontend/src/` for forbidden words (`human[_ -]?takeover|takeover|hand[ -]?off|人工接管|人工介入|人工托管|接管|人工`). Tests directories are excluded. The lint enforces the AI-autonomous positioning at the literal string level — pick AI-internal status names and labels (e.g. "AI 策略主动暂缓 / 安全门拦截 / AI 等待更多上下文"), never "人工接管 / takeover / hand-off".
+A second merge gate is `scripts/check-no-human-takeover.{sh,ps1}` — a CI lint that scans `git diff` newly-added lines under `src/agent/`, `src/routes/`, `src/evolution/`, `frontend/src/` for forbidden words (`human[_ -]?takeover|takeover|hand[ -]?off|人工接管|人工介入|人工托管|接管|人工`). Tests directories are excluded. The lint enforces the AI-autonomous positioning at the literal string level — pick AI-internal status names and labels (e.g. "AI 策略主动暂缓 / 安全门拦截 / AI 等待更多上下文"), never "人工接管 / takeover / hand-off".
 
 Most integration tests under `tests/` are `#[ignore]` by default and require Docker (testcontainers MongoDB). `cargo test` will compile them but skip ignored tests; run explicitly via `cargo test --test <name> -- --ignored` when Docker is available.
 
@@ -56,15 +56,20 @@ React Admin (frontend/, served from frontend/dist)
   ↓
 Rust Axum (src/main.rs → src/lib.rs)
   ├── routes/        REST API (split per resource; mounted in routes/mod.rs)
+  │   └── chunk_locks.rs  WebSocket soft-lock + broadcast bus for collaborative chunk editing (P1-4)
   ├── webhooks.rs    POST /webhooks/wechat — parses payload, persists inbound, gates Agent
   ├── tasks.rs       follow-up task worker loop (interval = TASK_WORKER_INTERVAL_SECONDS)
   ├── agent/         user-ops Agent (decision → review → send) — see below
+  ├── auth/          session cookie + Argon2; auth/jwt.rs = RS256 Bearer issue/verify (P1-7, gated by JWT_ENABLED)
+  ├── knowledge_wiki/ knowledge subsystem; ingest_worker.rs = auto-ingest RSS/HTML loop (P1-6, gated by INGEST_WORKER_ENABLED)
   ├── prompts.rs     prompt pack v2 + ensure_prompt_pack_v2 (seeded at startup)
-  ├── llm.rs         OpenAI-compatible client w/ retry/jitter, usage tracking
+  ├── llm.rs         OpenAI-compatible client w/ retry/jitter, usage tracking, token-level streaming SSE (P1-3)
   ├── mcp.rs         MCP JSON-RPC client (account/contact/message_send_text)
   ├── db/            Mongo connect + ensure_indexes + migrations
   └── models.rs      All BSON-serde structs (very large; one file by convention)
 ```
+
+Phase G P1 additions (multi-tenant workspace, graph community layout, token-level LLM streaming, WebSocket collab locks, multimodal PDF/vision import, auto-ingest worker, public JWT auth) are gated by env flags and default off where they touch deploy topology (`JWT_ENABLED`, `INGEST_WORKER_ENABLED`); see `.env.example`. The auth chain accepts a `wa_session` cookie by default and additionally `Authorization: Bearer <jwt>` only when `JWT_ENABLED=true` (`auth/middleware.rs`). Newly ingested/imported knowledge (PDF, image-vision, RSS/HTML) is always written `status=draft` + `integrity_status=needs_review` — the "AI never auto-verifies" red line holds across every ingestion entrypoint.
 
 ### `src/agent/` is the brain — read `src/agent/mod.rs` first
 

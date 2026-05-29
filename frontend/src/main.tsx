@@ -23,6 +23,70 @@ window.fetch = async (input, init) => {
 interface MeResponse {
   username: string;
   userId: string;
+  workspaces?: string[];
+  currentWorkspace?: string;
+}
+
+function WorkspaceSwitcher({ me }: { me: MeResponse }) {
+  const workspaces = me.workspaces ?? [];
+  const current = me.currentWorkspace ?? workspaces[0] ?? "default";
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState("");
+
+  if (workspaces.length <= 1) {
+    return (
+      <span className="authBadgeWorkspace">
+        <span className="authBadgeWorkspaceLabel">workspace</span>
+        <span className="authBadgeWorkspaceValue">{current}</span>
+      </span>
+    );
+  }
+
+  async function onChange(e: React.ChangeEvent<HTMLSelectElement>) {
+    const next = e.target.value;
+    if (next === current) return;
+    setErr("");
+    setBusy(true);
+    try {
+      const r = await originalFetch("/api/auth/workspace", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ workspaceId: next }),
+      });
+      if (!r.ok) {
+        const body = await r.json().catch(() => ({}));
+        setErr((body as { error?: string }).error ?? "switch_failed");
+        setBusy(false);
+        return;
+      }
+      // 切换 workspace 影响后端所有 handler 的过滤范围；重新加载页面
+      // 是最简单且最不易残留缓存的做法（React tree 多处缓存了 workspace 数据）。
+      window.location.reload();
+    } catch (e) {
+      setErr(`网络错误：${(e as Error).message}`);
+      setBusy(false);
+    }
+  }
+
+  return (
+    <span className="authBadgeWorkspace">
+      <span className="authBadgeWorkspaceLabel">workspace</span>
+      <select
+        className="authBadgeWorkspaceSelect"
+        value={current}
+        onChange={onChange}
+        disabled={busy}
+        aria-label="切换 workspace"
+      >
+        {workspaces.map((w) => (
+          <option key={w} value={w}>
+            {w}
+          </option>
+        ))}
+      </select>
+      {err && <span className="authBadgeWorkspaceError">{err}</span>}
+    </span>
+  );
 }
 
 function LoginScreen({ onLoggedIn }: { onLoggedIn: (me: MeResponse) => void }) {
@@ -163,6 +227,7 @@ function AuthGate() {
     <>
       <div className="authBadgeBar">
         <span className="authBadgeUser">已登录：<strong>{me.username}</strong></span>
+        <WorkspaceSwitcher me={me} />
         <button type="button" className="authBadgeLogout" onClick={logout}>登出</button>
       </div>
       <App />

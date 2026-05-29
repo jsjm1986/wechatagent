@@ -52,7 +52,7 @@ where
     Ok(Vec::new())
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct WechatAccount {
     #[serde(rename = "_id", skip_serializing_if = "Option::is_none")]
     pub id: Option<ObjectId>,
@@ -82,6 +82,35 @@ pub struct WechatAccount {
     pub off_hours: Vec<HourRange>,
     pub created_at: DateTime,
     pub updated_at: DateTime,
+}
+
+/// 手写 `Debug`：`mcp_api_key` 走 [`crate::secret::mask_secret`] 掩码，避免
+/// `tracing::*!(?account, ...)` / panic backtrace 把真值泄漏到日志后端。
+impl std::fmt::Debug for WechatAccount {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WechatAccount")
+            .field("id", &self.id)
+            .field("workspace_id", &self.workspace_id)
+            .field("account_id", &self.account_id)
+            .field("alias", &self.alias)
+            .field("display_name", &self.display_name)
+            .field("app_id", &self.app_id)
+            .field("wxid", &self.wxid)
+            .field("nick_name", &self.nick_name)
+            .field("mcp_base_url", &self.mcp_base_url)
+            .field(
+                "mcp_api_key",
+                &self.mcp_api_key.as_deref().map(crate::secret::mask_secret),
+            )
+            .field("online", &self.online)
+            .field("last_sync_at", &self.last_sync_at)
+            .field("capacity", &self.capacity)
+            .field("persona_tag", &self.persona_tag)
+            .field("off_hours", &self.off_hours)
+            .field("created_at", &self.created_at)
+            .field("updated_at", &self.updated_at)
+            .finish()
+    }
 }
 
 /// Phase D / D4：账号"勿打扰"小时区间。运营时区下的 [start_hour, end_hour) 半开
@@ -226,6 +255,69 @@ pub struct AgentTask {
     pub updated_at: DateTime,
 }
 
+/// `AgentTask.status` 的封闭枚举（follow_up_tasks 集合）。所有写入路径
+/// 在 `$set: { status: ... }` 之前必须经过 [`assert_agent_task_status_valid`]
+/// 校验，避免把闭集外脏值写进 DB。
+///
+/// 历史值清单（来自审计 D1 C-2/3/4）：
+/// - `pending / running / retry / failed / cancelled`：reclaim / claim / 重试 / 终态
+/// - `sent`：outcome_aggregation / memory_consolidation 完成态
+/// - `completed`：保留为 R10 reset 一致 alias
+/// - `outbox_enqueued`：gateway 把决策交付给 outbox 后写回的 task 终态
+pub const ALLOWED_AGENT_TASK_STATUS: &[&str] = &[
+    "pending",
+    "running",
+    "retry",
+    "failed",
+    "cancelled",
+    "sent",
+    "completed",
+    "outbox_enqueued",
+];
+
+/// 任意 `agent_tasks.status` 写入站点的闭集断言。命中闭集外值时 panic（debug）
+/// 或 `tracing::error!` + 拒绝写入（release）。R9.10.e 闭集断言契约的 task 表对应。
+#[track_caller]
+pub fn assert_agent_task_status_valid(status: &str) {
+    if !ALLOWED_AGENT_TASK_STATUS.contains(&status) {
+        let msg = format!(
+            "agent_tasks.status='{status}' 不在 ALLOWED_AGENT_TASK_STATUS 闭集 {ALLOWED_AGENT_TASK_STATUS:?}"
+        );
+        debug_assert!(false, "{msg}");
+        tracing::error!(target: "agent_protocol_violation", "{msg}");
+    }
+}
+
+#[cfg(test)]
+mod agent_task_status_tests {
+    use super::{assert_agent_task_status_valid, ALLOWED_AGENT_TASK_STATUS};
+
+    #[test]
+    fn closed_set_covers_all_known_writers() {
+        // P0-5：固化审计 D1 C-2/3/4 列出的全部写入面（gateway / tasks / memory /
+        // outcome_aggregation / cancel_task）。新增 status 必须先扩闭集。
+        for s in [
+            "pending",
+            "running",
+            "retry",
+            "failed",
+            "cancelled",
+            "sent",
+            "completed",
+            "outbox_enqueued",
+        ] {
+            assert!(ALLOWED_AGENT_TASK_STATUS.contains(&s), "{s} 缺失");
+            assert_agent_task_status_valid(s);
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "ALLOWED_AGENT_TASK_STATUS")]
+    fn unknown_status_panics_in_debug() {
+        assert_agent_task_status_valid("queued");
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentEvent {
     #[serde(rename = "_id", skip_serializing_if = "Option::is_none")]
@@ -238,6 +330,12 @@ pub struct AgentEvent {
     pub summary: String,
     pub details: Option<Document>,
     pub created_at: DateTime,
+    /// P1-2：可选事件级去重锚点。携带 `dedupe_key` 的事件由
+    /// partial unique index（`workspace_id + dedupe_key`，filter
+    /// `dedupe_key: { $type: "string" }`）原子约束，避免并发下 TOCTOU 重复写。
+    /// 既有调用方不携带此字段时不参与去重，保持向后兼容。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dedupe_key: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -813,6 +911,49 @@ pub struct KnowledgeGapSignal {
     pub resolved_at: Option<DateTime>,
 }
 
+/// P1-6：自动 ingest 数据源。worker tick 内逐条拉取 → 解析 → 调
+/// `ingest_chunked_text` 落 chunks。`kind` 闭集：`"rss"` / `"html"`。
+/// `status` 闭集：`"active"`（参与轮询）/ `"failing"`（连续失败 ≥ 3 次,
+/// 仍参与但稀释）/ `"disabled"`（≥ 7 天不可达，跳过）。所有写入由 worker 与
+/// `routes::knowledge::ingest_sources` CRUD 维护，handler 不接受 `failing` /
+/// `disabled` 入参（语义闭集兜底）。AI 永不自动 verify：worker 落 chunk 走
+/// `ingest_chunked_text`，全部 `status="draft"` + `integrity_status="needs_review"`。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IngestSource {
+    #[serde(rename = "_id", skip_serializing_if = "Option::is_none")]
+    pub id: Option<ObjectId>,
+    pub source_id: String,
+    pub workspace_id: String,
+    /// 闭集：`"rss"` / `"html"`。
+    pub kind: String,
+    pub url: String,
+    /// 计划轮询周期（分钟）；worker 自身 tick 周期独立，本字段是单 source
+    /// 的"距离上次拉取至少 N 分钟才再拉"。
+    pub schedule_minutes: i64,
+    /// 友好名称，前端展示。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    /// 上次 200 / 304 时间。`None` 表示从未成功拉取。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_fetched_at: Option<DateTime>,
+    /// HTTP `ETag` 缓存键；下一轮带 `If-None-Match` 上来。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_etag: Option<String>,
+    /// 上次错误（若有），用于前端排障。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+    /// 闭集：`"active"` / `"failing"` / `"disabled"`。
+    pub status: String,
+    /// 连续失败计数；成功（含 304）后清零。
+    #[serde(default)]
+    pub failure_streak: i32,
+    /// 累计成功拉到 chunk 的次数（不计 304）。
+    #[serde(default)]
+    pub ingest_count: i64,
+    pub created_at: DateTime,
+    pub updated_at: DateTime,
+}
+
 /// 行业可配 schema：active 一条 / workspace；chunk 写入时校验 `domain_attributes`。
 ///
 /// `alias_dict` 是 `Document`：`{ "客户阶段": "customer_stage", "话术类别": "objection_type" }`，
@@ -1145,6 +1286,13 @@ pub struct OutboxEntry {
     pub next_retry_at: Option<DateTime>,
     pub worker_id: Option<String>,
     pub locked_until: Option<DateTime>,
+    /// 崩溃恢复标记：`reclaim_expired_leases` 把一条 `in_flight`（lease 过期）
+    /// 改回 `pending` 时置 true。说明上一个 worker 抢占后在写 `sent` 前消失
+    /// （OOM / 部署 / panic），它**可能已把消息送达 MCP/微信**。dispatcher 重发
+    /// 前据此对这条（且仅这条）跑 `mcp_already_succeeded` post-hoc 核对，命中即
+    /// 标 sent 不重发——避免给客户发重复消息。`#[serde(default)]` 兼容旧文档。
+    #[serde(default)]
+    pub reclaimed_in_flight: bool,
     pub created_at: DateTime,
     pub updated_at: DateTime,
     pub sent_at: Option<DateTime>,
@@ -1722,7 +1870,7 @@ mod typed {
             6
         }
         pub fn knowledge_grounding_block_below() -> i32 {
-            6
+            7
         }
         pub fn human_like_rewrite_below() -> i32 {
             6
@@ -2627,7 +2775,7 @@ pub struct KnowledgeOperatorMemory {
 /// 才会被运行时 `LlmRegistry` 加载。`format` 决定底层 HTTP 协议形态：`openai`
 /// 走 `POST {base_url}/chat/completions`（兼容 DeepSeek / mimo / Qwen 等），
 /// `anthropic` 走 `POST {base_url}/v1/messages`（Anthropic Messages API）。
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LlmProviderConfig {
     #[serde(rename = "_id", skip_serializing_if = "Option::is_none")]
@@ -2649,8 +2797,43 @@ pub struct LlmProviderConfig {
     pub max_retries: Option<u32>,
     #[serde(default)]
     pub retry_base_ms: Option<u64>,
+    /// P1-5：是否支持 multimodal vision 输入。`true` 时该 provider 可被指派为
+    /// workspace 视觉模型（`is_vision_active`）；缺省 `false`，保持向后兼容。
+    #[serde(default)]
+    pub supports_vision: bool,
+    /// #574：是否被指派为本 workspace 的**专职视觉模型**。一个 workspace 至多
+    /// 一条为 `true`。当 active 文字模型本身 `supports_vision=false` 时，
+    /// `/import-apply-image` 改用这条记录处理图片；要求其 `supports_vision=true`。
+    /// 与 `is_active`（文字主模型）正交：文字主模型与视觉副模型可以是两条不同记录。
+    #[serde(default)]
+    pub is_vision_active: bool,
     pub created_at: DateTime,
     pub updated_at: DateTime,
+}
+
+/// 手写 `Debug`：`api_key` 走 [`crate::secret::mask_secret`] 掩码，避免
+/// `tracing::*!(?cfg, ...)` / panic backtrace 把真值泄漏到日志后端。
+impl std::fmt::Debug for LlmProviderConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LlmProviderConfig")
+            .field("id", &self.id)
+            .field("workspace_id", &self.workspace_id)
+            .field("provider_id", &self.provider_id)
+            .field("name", &self.name)
+            .field("format", &self.format)
+            .field("base_url", &self.base_url)
+            .field("api_key", &crate::secret::mask_secret(&self.api_key))
+            .field("model", &self.model)
+            .field("is_active", &self.is_active)
+            .field("timeout_seconds", &self.timeout_seconds)
+            .field("max_retries", &self.max_retries)
+            .field("retry_base_ms", &self.retry_base_ms)
+            .field("supports_vision", &self.supports_vision)
+            .field("is_vision_active", &self.is_vision_active)
+            .field("created_at", &self.created_at)
+            .field("updated_at", &self.updated_at)
+            .finish()
+    }
 }
 
 #[cfg(test)]
@@ -2680,7 +2863,7 @@ mod typed_tests {
         assert_eq!(p.hallucination_block_at, 8);
         assert_eq!(p.run_token_budget, 50000);
         // 其它字段 fallback 默认值。
-        assert_eq!(p.knowledge_grounding_block_below, 6);
+        assert_eq!(p.knowledge_grounding_block_below, 7);
     }
 
     #[test]
@@ -3145,6 +3328,7 @@ mod typed_tests {
             next_retry_at: None,
             worker_id: None,
             locked_until: None,
+            reclaimed_in_flight: false,
             created_at: now,
             updated_at: now,
             sent_at: None,

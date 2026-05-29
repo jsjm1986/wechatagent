@@ -1,9 +1,11 @@
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
+use futures::StreamExt;
 use reqwest::header::HeaderMap;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use tokio::sync::mpsc::UnboundedSender;
 use tokio::time::sleep;
 
 use crate::error::{AppError, AppResult};
@@ -74,6 +76,29 @@ struct ChatChoiceMessage {
     content: String,
 }
 
+/// OpenAI 兼容 `stream: true` 的单条 SSE chunk 形态：
+/// `data: {"choices":[{"delta":{"content":"..."}}],"usage":{...}}`。
+/// `usage` 一般仅在最后一条（`stream_options.include_usage=true` 时）出现。
+#[derive(Debug, Deserialize)]
+struct StreamChunkResponse {
+    #[serde(default)]
+    choices: Vec<StreamChoice>,
+    #[serde(default)]
+    usage: Option<ChatUsage>,
+}
+
+#[derive(Debug, Deserialize)]
+struct StreamChoice {
+    #[serde(default)]
+    delta: StreamDelta,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct StreamDelta {
+    #[serde(default)]
+    content: Option<String>,
+}
+
 #[derive(Debug, Deserialize)]
 struct AnthropicMessageResponse {
     #[serde(default)]
@@ -135,6 +160,54 @@ pub struct LlmJsonResult {
 pub trait LlmProvider: Send + Sync {
     async fn generate_json(&self, system: &str, user: &str) -> AppResult<Value>;
     async fn generate_json_with_usage(&self, system: &str, user: &str) -> AppResult<LlmJsonResult>;
+
+    /// 流式生成：把**上游模型原始输出**（对本系统而言即模型逐 token 吐出的 JSON
+    /// 文本片段）作为 delta 通过 `token_tx` 增量推出；函数返回时给出与
+    /// [`generate_json_with_usage`] 同形的最终结果（含完整解析后的 `value` 与 usage）。
+    ///
+    /// 约定 `token_tx` 承载的是**原始 content**（不是解码后的答案正文）。需要"干净
+    /// 答案正文"的消费方（如知识库 agent）自行在通道下游跑增量 JSON `answer` 字段
+    /// 抽取器，避免把 JSON 语法泄露到前端。
+    ///
+    /// 默认实现是**非流式兜底**：先 `generate_json_with_usage` 拿到整段结果，再把
+    /// 解析后的 `value` 重新序列化成一段 JSON 文本，作为单个 delta 一次性推出 ——
+    /// 与真流式路径口径一致（都喂"JSON 文本"给下游抽取器）。这样 `LlmRegistry` /
+    /// `TestLlmGenerator` / mockall 生成的 mock 无需改动即可编译；真正的 token 级
+    /// 上游 SSE 由 [`LlmClient`] 覆写实现。
+    ///
+    /// `token_tx` 在前端断开时 `send` 静默失败，不影响最终结果的返回与日志写入。
+    async fn generate_json_streaming(
+        &self,
+        system: &str,
+        user: &str,
+        token_tx: UnboundedSender<String>,
+    ) -> AppResult<LlmJsonResult> {
+        let result = self.generate_json_with_usage(system, user).await?;
+        if let Ok(raw) = serde_json::to_string(&result.value) {
+            if !raw.is_empty() {
+                let _ = token_tx.send(raw);
+            }
+        }
+        Ok(result)
+    }
+
+    /// 多模态生成：把一张图片（base64 原始字节，无 data-uri 前缀）作为
+    /// OpenAI 兼容的 `image_url` content block 与文本一起发给模型，返回解析后的 JSON。
+    ///
+    /// 默认实现**直接报错**（`vision_not_supported`）而非把 base64 当作文本塞进
+    /// prompt —— 后者会让纯文字模型"看不到"图片却又不报错。真正支持视觉的
+    /// provider（[`LlmClient`]，OpenAI 格式）覆写此方法发真正的 image content block。
+    async fn generate_json_with_image(
+        &self,
+        _system: &str,
+        _user: &str,
+        _image_base64: &str,
+        _mime: &str,
+    ) -> AppResult<Value> {
+        Err(AppError::External(
+            "vision_not_supported: 当前 provider 未实现多模态图片输入".to_string(),
+        ))
+    }
 }
 
 impl LlmClient {
@@ -278,7 +351,63 @@ impl LlmClient {
         ))
     }
 
-    /// Anthropic Messages API 形态：
+    /// OpenAI 兼容多模态：user message 的 content 用数组形式
+    /// `[{type:"text",...},{type:"image_url",image_url:{url:"data:<mime>;base64,<b64>"}}]`，
+    /// 让 vision-capable 模型真正"看到"图片，而不是把 base64 当文本。
+    async fn generate_json_once_openai_vision(
+        &self,
+        system: &str,
+        user: &str,
+        image_base64: &str,
+        mime: &str,
+    ) -> AppResult<LlmJsonResult> {
+        let started_at = Instant::now();
+        let data_uri = format!("data:{mime};base64,{image_base64}");
+        let body = json!({
+            "model": self.model,
+            "temperature": 0.2,
+            "messages": [
+                { "role": "system", "content": system },
+                { "role": "user", "content": [
+                    { "type": "text", "text": user },
+                    { "type": "image_url", "image_url": { "url": data_uri } }
+                ]}
+            ]
+        });
+        let response = self
+            .client
+            .post(format!("{}/chat/completions", self.base_url))
+            .bearer_auth(&self.api_key)
+            .json(&body)
+            .send()
+            .await?;
+        let status = response.status();
+        let text = match response.bytes().await {
+            Ok(buf) => String::from_utf8_lossy(&buf).into_owned(),
+            Err(err) => {
+                let elapsed_ms = started_at.elapsed().as_millis();
+                return Err(AppError::External(format!(
+                    "LLM HTTP body_decode_error status={status} elapsed_ms={elapsed_ms} cause={err}"
+                )));
+            }
+        };
+        if !status.is_success() {
+            return Err(AppError::External(format!("LLM HTTP {status}: {text}")));
+        }
+        let parsed: ChatCompletionResponse = serde_json::from_str(&text)?;
+        let content = parsed
+            .choices
+            .first()
+            .map(|choice| choice.message.content.as_str())
+            .ok_or_else(|| AppError::External("LLM returned no choices".to_string()))?;
+        Ok(LlmJsonResult {
+            value: parse_json_content(content)?,
+            usage: parsed.usage.unwrap_or_default(),
+            latency_ms: started_at.elapsed().as_millis() as i64,
+            model: self.model.clone(),
+            retry_count: 0,
+        })
+    }
     /// `POST {base_url}/v1/messages` （base_url 通常 `https://api.anthropic.com`），
     /// header `x-api-key: <key>` + `anthropic-version: 2023-06-01`；
     /// body: `{ model, max_tokens, system, messages: [{role:"user", content}] }`；
@@ -361,6 +490,122 @@ impl LlmClient {
             None,
         ))
     }
+
+    /// OpenAI 兼容 `stream: true` 的真流式实现：消费 `bytes_stream()`，按 SSE
+    /// `\n\n` 事件边界增量解析 `choices[0].delta.content`，逐 token 通过
+    /// `token_tx` 推出（**原始 content 片段**，由下游决定如何抽取答案正文），
+    /// 累积成完整文本后 `parse_json_content` 得到最终 `value`。
+    ///
+    /// `stream_options.include_usage=true` 让上游在最后一条 chunk 带 usage；
+    /// 若上游不支持则 usage fallback 到 `ChatUsage::default()`（token 计费按 0 计，
+    /// 由 budget 的整体上限兜底，不影响功能）。
+    ///
+    /// 单次尝试、不走 `generate_json_with_usage` 的重试循环 —— 流式一旦开始
+    /// 推 token，重试会导致前端重复/错乱；HTTP/1.1 + keepalive 已稳定链路，
+    /// 失败直接上抛由调用方降级。
+    async fn generate_json_streaming_openai(
+        &self,
+        system: &str,
+        user: &str,
+        token_tx: &UnboundedSender<String>,
+    ) -> AppResult<LlmJsonResult> {
+        let started_at = Instant::now();
+        let body = json!({
+            "model": self.model,
+            "temperature": 0.2,
+            "stream": true,
+            "stream_options": {"include_usage": true},
+            "messages": [
+                ChatMessage { role: "system", content: system },
+                ChatMessage { role: "user", content: user }
+            ]
+        });
+
+        let response = self
+            .client
+            .post(format!("{}/chat/completions", self.base_url))
+            .bearer_auth(&self.api_key)
+            .json(&body)
+            .send()
+            .await?;
+        let status = response.status();
+        if !status.is_success() {
+            let retry_after = parse_retry_after(response.headers());
+            let text = match response.bytes().await {
+                Ok(buf) => String::from_utf8_lossy(&buf).into_owned(),
+                Err(err) => format!("<body read failed: {err}>"),
+            };
+            let mut err = AppError::External(format!("LLM HTTP {status}: {text}"));
+            if let Some(after) = retry_after {
+                err = AppError::External(format!(
+                    "LLM HTTP {status}: {text} [retry_after_secs={after}]"
+                ));
+            }
+            return Err(err);
+        }
+
+        let mut stream = response.bytes_stream();
+        let mut buffer = String::new();
+        let mut accumulated = String::new();
+        let mut usage: Option<ChatUsage> = None;
+
+        'outer: while let Some(chunk) = stream.next().await {
+            let bytes = chunk.map_err(|err| {
+                AppError::External(format!(
+                    "LLM HTTP body_decode_error status={} elapsed_ms={} cause={}",
+                    status,
+                    started_at.elapsed().as_millis(),
+                    err
+                ))
+            })?;
+            // 归一化 CRLF，确保后续以 `\n\n` 切分事件边界对 `\r\n\r\n` 服务也成立。
+            buffer.push_str(&String::from_utf8_lossy(&bytes).replace("\r\n", "\n"));
+
+            // SSE 事件以空行分隔；逐个抽出完整事件，残缺片段留在 buffer 等下一帧。
+            while let Some(idx) = buffer.find("\n\n") {
+                let event: String = buffer.drain(..idx + 2).collect();
+                for line in event.lines() {
+                    let data = match line.trim().strip_prefix("data:") {
+                        Some(rest) => rest.trim(),
+                        None => continue,
+                    };
+                    if data == "[DONE]" {
+                        break 'outer;
+                    }
+                    if data.is_empty() {
+                        continue;
+                    }
+                    // 容忍单条 chunk 解析失败（keepalive 注释 / 非标准心跳行）：跳过。
+                    let parsed: StreamChunkResponse = match serde_json::from_str(data) {
+                        Ok(p) => p,
+                        Err(_) => continue,
+                    };
+                    if let Some(u) = parsed.usage {
+                        usage = Some(u);
+                    }
+                    if let Some(content) = parsed
+                        .choices
+                        .first()
+                        .and_then(|choice| choice.delta.content.as_ref())
+                    {
+                        if !content.is_empty() {
+                            accumulated.push_str(content);
+                            let _ = token_tx.send(content.clone());
+                        }
+                    }
+                }
+            }
+        }
+
+        let value = parse_json_content(&accumulated)?;
+        Ok(LlmJsonResult {
+            value,
+            usage: usage.unwrap_or_default(),
+            latency_ms: started_at.elapsed().as_millis() as i64,
+            model: self.model.clone(),
+            retry_count: 0,
+        })
+    }
 }
 
 #[async_trait]
@@ -401,6 +646,53 @@ impl LlmProvider for LlmClient {
         let final_err = last_error
             .unwrap_or_else(|| AppError::External("LLM request failed after retries".to_string()));
         Err(classify_llm_error_for_user(&final_err, retry_count))
+    }
+
+    async fn generate_json_streaming(
+        &self,
+        system: &str,
+        user: &str,
+        token_tx: UnboundedSender<String>,
+    ) -> AppResult<LlmJsonResult> {
+        match self.format {
+            // OpenAI 兼容端点走真 SSE 流式。
+            LlmFormat::Openai => self
+                .generate_json_streaming_openai(system, user, &token_tx)
+                .await
+                .map_err(|err| classify_llm_error_for_user(&err, 0)),
+            // Anthropic 形态暂未实现 SSE 解析 —— 退回 trait 默认的非流式兜底
+            // （整段一次性推），保持答案正确，仅失去 token 级增量。
+            LlmFormat::Anthropic => {
+                let result = self.generate_json_with_usage(system, user).await?;
+                if let Ok(raw) = serde_json::to_string(&result.value) {
+                    if !raw.is_empty() {
+                        let _ = token_tx.send(raw);
+                    }
+                }
+                Ok(result)
+            }
+        }
+    }
+
+    async fn generate_json_with_image(
+        &self,
+        system: &str,
+        user: &str,
+        image_base64: &str,
+        mime: &str,
+    ) -> AppResult<Value> {
+        match self.format {
+            LlmFormat::Openai => self
+                .generate_json_once_openai_vision(system, user, image_base64, mime)
+                .await
+                .map(|r| r.value)
+                .map_err(|err| classify_llm_error_for_user(&err, 0)),
+            // Anthropic 的图片 block 形态（source.type=base64）与 OpenAI 不同，
+            // 当前仅支持 OpenAI 兼容视觉端点；Anthropic 视觉留待后续。
+            LlmFormat::Anthropic => Err(AppError::External(
+                "vision_not_supported: Anthropic 格式的多模态输入尚未实现".to_string(),
+            )),
+        }
     }
 }
 
@@ -712,6 +1004,29 @@ impl LlmProvider for LlmRegistry {
     async fn generate_json_with_usage(&self, system: &str, user: &str) -> AppResult<LlmJsonResult> {
         let client = self.current().await;
         client.generate_json_with_usage(system, user).await
+    }
+
+    async fn generate_json_streaming(
+        &self,
+        system: &str,
+        user: &str,
+        token_tx: UnboundedSender<String>,
+    ) -> AppResult<LlmJsonResult> {
+        let client = self.current().await;
+        client.generate_json_streaming(system, user, token_tx).await
+    }
+
+    async fn generate_json_with_image(
+        &self,
+        system: &str,
+        user: &str,
+        image_base64: &str,
+        mime: &str,
+    ) -> AppResult<Value> {
+        let client = self.current().await;
+        client
+            .generate_json_with_image(system, user, image_base64, mime)
+            .await
     }
 }
 

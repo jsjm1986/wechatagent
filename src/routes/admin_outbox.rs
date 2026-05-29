@@ -15,7 +15,7 @@ use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
     response::{IntoResponse, Response},
-    Json,
+    Extension, Json,
 };
 use futures::TryStreamExt;
 use mongodb::bson::{doc, DateTime, Document};
@@ -25,6 +25,7 @@ use serde_json::{json, Value};
 
 use crate::{
     agent::outbox::{outbox_status_is_user_cancelable, OutboxStatus},
+    auth::AuthenticatedAdmin,
     error::{AppError, AppResult},
     models::OutboxEntry,
 };
@@ -59,10 +60,11 @@ pub(super) struct CancelOutboxRequest {
 
 pub(super) async fn list_outbox(
     State(state): State<AppState>,
+    Extension(admin): Extension<AuthenticatedAdmin>,
     Query(query): Query<ListOutboxQuery>,
 ) -> AppResult<Json<Value>> {
     let mut filter = Document::new();
-    filter.insert("workspace_id", &state.config.default_workspace_id);
+    filter.insert("workspace_id", &admin.current_workspace);
 
     if let Some(raw) = query.status.as_ref().filter(|s| !s.trim().is_empty()) {
         let statuses = parse_status_filter(raw)?;
@@ -114,6 +116,7 @@ pub(super) async fn list_outbox(
 
 pub(super) async fn cancel_outbox(
     State(state): State<AppState>,
+    Extension(admin): Extension<AuthenticatedAdmin>,
     Path(id): Path<String>,
     Json(payload): Json<CancelOutboxRequest>,
 ) -> Result<Response, AppError> {
@@ -145,6 +148,7 @@ pub(super) async fn cancel_outbox(
         .find_one_and_update(
             doc! {
                 "_id": object_id,
+                "workspace_id": &admin.current_workspace,
                 "status": { "$in": &cancelable_statuses },
             },
             doc! {
@@ -196,6 +200,7 @@ pub(super) async fn cancel_outbox(
                     "source": "admin_route"
                 }),
                 created_at: DateTime::now(),
+                dedupe_key: None,
             },
             None,
         )
@@ -285,6 +290,7 @@ mod tests {
             next_retry_at: None,
             worker_id: None,
             locked_until: None,
+            reclaimed_in_flight: false,
             created_at: DateTime::now(),
             updated_at: DateTime::now(),
             sent_at: None,

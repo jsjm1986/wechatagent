@@ -123,11 +123,9 @@ pub async fn release_threshold(
         .await
         .map_err(EvolutionError::from)?;
 
-    commit_with_session(&mut session).await?;
-
-    // Phase C / C5：commit 后追加 audit 行。失败仅 warn，不影响主路径。
-    write_threshold_override_audit(
-        state,
+    // #155(P1)：audit 行与 override / proposal 推进写在同一 transaction，commit 前
+    // 完成。旧实现 commit 后才 best-effort 写 + 仅 warn，阈值变更可能无审计行生效。
+    let release_audit = build_threshold_override_audit(
         &workspace_id,
         &account_id,
         &gate_key,
@@ -136,13 +134,17 @@ pub async fn release_threshold(
         Some(proposed_value),
         proposal_id,
         admin,
-        proposal
-            .cohort_notes
-            .get_f64("hit_rate_observed")
-            .ok(),
+        proposal.cohort_notes.get_f64("hit_rate_observed").ok(),
         Some(proposal.eval_metrics.clone()),
-    )
-    .await;
+    );
+    state
+        .db
+        .threshold_overrides_audit()
+        .insert_one_with_session(release_audit, None, &mut session)
+        .await
+        .map_err(EvolutionError::from)?;
+
+    commit_with_session(&mut session).await?;
 
     write_release_event(
         state,
@@ -469,12 +471,10 @@ pub async fn rollback_threshold(
         .await
         .map_err(EvolutionError::from)?;
 
-    commit_with_session(&mut session).await?;
-
-    // Phase C / C5：rollback 也写 audit。previous = 被回滚的 proposed_value；
-    // new_value 留 None（回滚后回到 baseline 或更早 override，由审计读路径自行还原）。
-    write_threshold_override_audit(
-        state,
+    // #155(P1)：rollback 的 audit 行也写进同一 transaction，commit 前完成。
+    // previous = 被回滚的 proposed_value；new_value 留 None（回滚后回到 baseline 或
+    // 更早 override，由审计读路径自行还原）。
+    let rollback_audit = build_threshold_override_audit(
         &workspace_id,
         &account_id,
         proposal.gate_key.as_deref().unwrap_or(""),
@@ -485,8 +485,15 @@ pub async fn rollback_threshold(
         admin,
         None,
         None,
-    )
-    .await;
+    );
+    state
+        .db
+        .threshold_overrides_audit()
+        .insert_one_with_session(rollback_audit, None, &mut session)
+        .await
+        .map_err(EvolutionError::from)?;
+
+    commit_with_session(&mut session).await?;
 
     write_release_event(
         state,
@@ -682,6 +689,7 @@ async fn write_release_event(
         summary: format!("evolution release: {kind} by {admin} for proposal {proposal_id}"),
         details: Some(details),
         created_at: DateTime::now(),
+        dedupe_key: None,
     };
     state
         .db
@@ -701,8 +709,14 @@ async fn write_release_event(
 /// `previous_value` / `new_value` 调用方根据动作语义传入：
 ///   - released：previous = 上一条 active override.value（无则 baseline 兜底）, new = proposal.proposed_value
 ///   - rolled_back：previous = proposal.proposed_value（即被回滚的值）, new = 回滚后生效值（baseline 或更早 override）
-async fn write_threshold_override_audit(
-    state: &AppState,
+/// Phase C / C5 + #155(P1)：构造一条 `threshold_overrides_audit`。
+///
+/// 不再独立 `insert_one`（旧实现 commit 后 best-effort + 仅 warn，阈值变更可能在
+/// 无审计行的情况下生效）。调用方现在在 release / rollback 的同一 transaction 内
+/// `insert_one_with_session(...)` 写入本 struct，commit 前完成——审计行与阈值
+/// 变更 atomic：要么都生效要么都回滚。
+#[allow(clippy::too_many_arguments)]
+fn build_threshold_override_audit(
     workspace_id: &str,
     account_id: &str,
     gate_key: &str,
@@ -713,8 +727,8 @@ async fn write_threshold_override_audit(
     decided_by: &str,
     hit_rate_observed: Option<f64>,
     significance_metrics: Option<mongodb::bson::Document>,
-) {
-    let audit = crate::models::ThresholdOverrideAudit {
+) -> crate::models::ThresholdOverrideAudit {
+    crate::models::ThresholdOverrideAudit {
         id: None,
         workspace_id: workspace_id.to_string(),
         account_id: account_id.to_string(),
@@ -727,20 +741,6 @@ async fn write_threshold_override_audit(
         decided_at: DateTime::now(),
         hit_rate_observed,
         significance_metrics,
-    };
-    if let Err(err) = state
-        .db
-        .threshold_overrides_audit()
-        .insert_one(audit, None)
-        .await
-    {
-        tracing::warn!(
-            ?err,
-            workspace_id,
-            gate_key,
-            action,
-            "threshold_overrides_audit insert failed (best-effort)"
-        );
     }
 }
 
@@ -758,5 +758,55 @@ mod tests {
         let msg = format!("{e}");
         assert!(msg.contains("eligible"));
         assert!(msg.contains("pending_eval"));
+    }
+
+    /// #155(P1)：audit 构造器把入参原样落到不可变审计行；release / rollback 各自
+    /// 在同一 transaction 内 insert 本 struct（不再 commit 后 best-effort）。
+    #[test]
+    fn build_threshold_override_audit_carries_all_fields() {
+        let pid = ObjectId::new();
+        let metrics = doc! { "p_value": 0.01_f64 };
+        let audit = build_threshold_override_audit(
+            "ws-1",
+            "acct-1",
+            "pressure_risk_block",
+            "released",
+            Some(7.0),
+            Some(6.5),
+            pid,
+            "admin@x",
+            Some(0.12),
+            Some(metrics.clone()),
+        );
+        assert_eq!(audit.workspace_id, "ws-1");
+        assert_eq!(audit.account_id, "acct-1");
+        assert_eq!(audit.gate_key, "pressure_risk_block");
+        assert_eq!(audit.action, "released");
+        assert_eq!(audit.previous_value, Some(7.0));
+        assert_eq!(audit.new_value, Some(6.5));
+        assert_eq!(audit.source_proposal_id, pid);
+        assert_eq!(audit.decided_by, "admin@x");
+        assert_eq!(audit.hit_rate_observed, Some(0.12));
+        assert_eq!(audit.significance_metrics, Some(metrics));
+        assert!(audit.id.is_none());
+    }
+
+    #[test]
+    fn build_threshold_override_audit_rollback_leaves_new_value_none() {
+        let audit = build_threshold_override_audit(
+            "ws-1",
+            "acct-1",
+            "fact_risk_block",
+            "rolled_back",
+            Some(5.5),
+            None,
+            ObjectId::new(),
+            "admin@x",
+            None,
+            None,
+        );
+        assert_eq!(audit.action, "rolled_back");
+        assert_eq!(audit.previous_value, Some(5.5));
+        assert!(audit.new_value.is_none());
     }
 }

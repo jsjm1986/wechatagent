@@ -17,11 +17,11 @@ use mongodb::{options::ClientOptions, Client, Collection, Database as MongoDatab
 use crate::models::{
     AgentCommandRun, AgentDecisionReview, AgentEvent, AgentOutcomeMetric, AgentRunLog, AgentSoul,
     AgentTask, AgentToolCall, CatalogRebuildJob, ChunkRevision, Contact, ContentAsset,
-    ConversationMessage, DomainSchema, EvaluationScenario, Experiment, KnowledgeChatTask,
-    KnowledgeChatTurn, KnowledgeDailyReport, KnowledgeGapSignal, KnowledgeOperatorMemory,
-    KnowledgeUsageLog, LlmCallLog, LlmProviderConfig, ManagementAgentMessage,
-    ManagementAgentSession, McpCallLog, MemoryCandidate, MigrationRecord, OperatingMemory,
-    OperationDomainConfig, OperationKnowledgeChunk, OperationKnowledgeDocument,
+    ConversationMessage, DomainSchema, EvaluationScenario, Experiment, IngestSource,
+    KnowledgeChatTask, KnowledgeChatTurn, KnowledgeDailyReport, KnowledgeGapSignal,
+    KnowledgeOperatorMemory, KnowledgeUsageLog, LlmCallLog, LlmProviderConfig,
+    ManagementAgentMessage, ManagementAgentSession, McpCallLog, MemoryCandidate, MigrationRecord,
+    OperatingMemory, OperationDomainConfig, OperationKnowledgeChunk, OperationKnowledgeDocument,
     OperationPlaybook, OutboxEntry, PostReleaseReview, PromptTemplate,
     Proposal, ShadowReplay, TaxonomyCandidate, TaxonomyEntry, ThresholdOverride,
     ThresholdOverrideAudit, UserOperationGuidePreview, WechatAccount,
@@ -313,5 +313,12 @@ impl Database {
     /// 每 200ms 取一批 status=queued 落库 `documents.catalog_summary_persisted`。
     pub fn catalog_rebuild_jobs(&self) -> Collection<CatalogRebuildJob> {
         self.db.collection("catalog_rebuild_jobs")
+    }
+
+    /// P1-6：自动 ingest 数据源 typed accessor。`ingest_worker_loop` 逐 workspace
+    /// 扫 `status="active"` 的 source，按 `schedule_minutes` 节流后 GET → 解析 →
+    /// `ingest_chunked_text` 落 chunks（`integrity_status="needs_review"`）。
+    pub fn ingest_sources(&self) -> Collection<IngestSource> {
+        self.db.collection("ingest_sources")
     }
 }

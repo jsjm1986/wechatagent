@@ -34,6 +34,7 @@ pub mod knowledge_agent;
 mod knowledge_router;
 mod knowledge_tools;
 mod memory;
+pub(crate) mod prompt_isolation;
 mod tool_loop;
 pub(crate) mod outbox;
 pub(crate) mod outbox_dispatcher;
@@ -231,73 +232,184 @@ pub(crate) async fn generate_agent_json(
             if let Some(key) = cache_key {
                 LLM_EXACT_CACHE.lock().put(key, value.clone());
             }
-            let _ = state
-                .db
-                .llm_call_logs()
-                .insert_one(
-                    LlmCallLog {
-                        id: None,
-                        workspace_id: state.config.default_workspace_id.clone(),
-                        account_id: account_id.map(ToString::to_string),
-                        contact_wxid: contact_wxid.map(ToString::to_string),
-                        run_id: run_id.map(ToString::to_string),
-                        prompt_key: prompt_key.to_string(),
-                        model: result.model,
-                        status: "success".to_string(),
-                        latency_ms: result.latency_ms,
-                        prompt_tokens: usage.prompt_tokens,
-                        completion_tokens: usage.completion_tokens,
-                        total_tokens: usage.total_tokens,
-                        prompt_cache_hit_tokens: usage.prompt_cache_hit_tokens,
-                        prompt_cache_miss_tokens: usage.prompt_cache_miss_tokens,
-                        error: None,
-                        retry_count: retry_count_i32,
-                        final_status: Some("success".to_string()),
-                        created_at: started_at,
-                    },
-                    None,
-                )
-                .await;
+            log_llm_call_success(
+                state,
+                account_id,
+                contact_wxid,
+                run_id,
+                prompt_key,
+                result.model,
+                result.latency_ms,
+                &usage,
+                retry_count_i32,
+                started_at,
+            )
+            .await;
             Ok(value)
         }
         Err(error) => {
-            // HP-4：根据错误类型把 final_status 写为 json_error / failed，
-            // 便于后续按状态做成本统计与降级触发统计。
-            let final_status = match &error {
-                AppError::Json(_) => "json_error",
-                _ => "failed",
-            };
-            let _ = state
-                .db
-                .llm_call_logs()
-                .insert_one(
-                    LlmCallLog {
-                        id: None,
-                        workspace_id: state.config.default_workspace_id.clone(),
-                        account_id: account_id.map(ToString::to_string),
-                        contact_wxid: contact_wxid.map(ToString::to_string),
-                        run_id: run_id.map(ToString::to_string),
-                        prompt_key: prompt_key.to_string(),
-                        model: state.config.openai_model.clone(),
-                        status: "failed".to_string(),
-                        latency_ms: DateTime::now().timestamp_millis()
-                            - started_at.timestamp_millis(),
-                        prompt_tokens: 0,
-                        completion_tokens: 0,
-                        total_tokens: 0,
-                        prompt_cache_hit_tokens: 0,
-                        prompt_cache_miss_tokens: 0,
-                        error: Some(error.to_string()),
-                        retry_count: retry_count_from_error(&error.to_string()),
-                        final_status: Some(final_status.to_string()),
-                        created_at: started_at,
-                    },
-                    None,
-                )
-                .await;
+            log_llm_call_failure(
+                state,
+                account_id,
+                contact_wxid,
+                run_id,
+                prompt_key,
+                &error,
+                started_at,
+            )
+            .await;
             Err(error)
         }
     }
+}
+
+/// 流式版本的 [`generate_agent_json`]：走 [`LlmProvider::generate_json_streaming`]，
+/// 把上游模型**原始 JSON 文本片段**逐段推入 `token_tx`（由调用方在通道下游做
+/// 增量答案抽取），返回时给出与 [`generate_agent_json`] 同形的最终 `value`。
+///
+/// 与非流式版共用 budget 计费与 `llm_call_logs` 写入语义（success / failed /
+/// json_error），但**不走 LRU 精确缓存** —— 唯一调用方是 `knowledge.agent`
+/// prompt key，本就不在 [`llm_exact_cache_key`] 白名单内，省掉缓存读写不改变行为。
+pub(crate) async fn generate_agent_json_streaming(
+    state: &AppState,
+    account_id: Option<&str>,
+    contact_wxid: Option<&str>,
+    run_id: Option<&str>,
+    prompt_key: &str,
+    system: &str,
+    user: &str,
+    token_tx: tokio::sync::mpsc::UnboundedSender<String>,
+) -> AppResult<Value> {
+    let started_at = DateTime::now();
+    match state
+        .llm
+        .generate_json_streaming(system, user, token_tx)
+        .await
+    {
+        Ok(result) => {
+            let usage = result.usage.clone();
+            let value = result.value;
+            let retry_count_i32 = result.retry_count.min(i32::MAX as u32) as i32;
+            if let Some(budget) = current_run_budget() {
+                budget.record_call(usage.total_tokens);
+            }
+            log_llm_call_success(
+                state,
+                account_id,
+                contact_wxid,
+                run_id,
+                prompt_key,
+                result.model,
+                result.latency_ms,
+                &usage,
+                retry_count_i32,
+                started_at,
+            )
+            .await;
+            Ok(value)
+        }
+        Err(error) => {
+            log_llm_call_failure(
+                state,
+                account_id,
+                contact_wxid,
+                run_id,
+                prompt_key,
+                &error,
+                started_at,
+            )
+            .await;
+            Err(error)
+        }
+    }
+}
+
+/// 写一条 `success` 的 `llm_call_logs` 行。供 [`generate_agent_json`] 与
+/// [`generate_agent_json_streaming`] 共用，`model` 取上游实际返回的模型名。
+#[allow(clippy::too_many_arguments)]
+async fn log_llm_call_success(
+    state: &AppState,
+    account_id: Option<&str>,
+    contact_wxid: Option<&str>,
+    run_id: Option<&str>,
+    prompt_key: &str,
+    model: String,
+    latency_ms: i64,
+    usage: &crate::llm::ChatUsage,
+    retry_count_i32: i32,
+    started_at: DateTime,
+) {
+    let _ = state
+        .db
+        .llm_call_logs()
+        .insert_one(
+            LlmCallLog {
+                id: None,
+                workspace_id: state.config.default_workspace_id.clone(),
+                account_id: account_id.map(ToString::to_string),
+                contact_wxid: contact_wxid.map(ToString::to_string),
+                run_id: run_id.map(ToString::to_string),
+                prompt_key: prompt_key.to_string(),
+                model,
+                status: "success".to_string(),
+                latency_ms,
+                prompt_tokens: usage.prompt_tokens,
+                completion_tokens: usage.completion_tokens,
+                total_tokens: usage.total_tokens,
+                prompt_cache_hit_tokens: usage.prompt_cache_hit_tokens,
+                prompt_cache_miss_tokens: usage.prompt_cache_miss_tokens,
+                error: None,
+                retry_count: retry_count_i32,
+                final_status: Some("success".to_string()),
+                created_at: started_at,
+            },
+            None,
+        )
+        .await;
+}
+
+/// 写一条 `failed` 的 `llm_call_logs` 行。HP-4：按错误类型把 `final_status`
+/// 区分为 `json_error` / `failed`，model 用配置默认（失败时无上游实际模型名）。
+async fn log_llm_call_failure(
+    state: &AppState,
+    account_id: Option<&str>,
+    contact_wxid: Option<&str>,
+    run_id: Option<&str>,
+    prompt_key: &str,
+    error: &AppError,
+    started_at: DateTime,
+) {
+    let final_status = match error {
+        AppError::Json(_) => "json_error",
+        _ => "failed",
+    };
+    let _ = state
+        .db
+        .llm_call_logs()
+        .insert_one(
+            LlmCallLog {
+                id: None,
+                workspace_id: state.config.default_workspace_id.clone(),
+                account_id: account_id.map(ToString::to_string),
+                contact_wxid: contact_wxid.map(ToString::to_string),
+                run_id: run_id.map(ToString::to_string),
+                prompt_key: prompt_key.to_string(),
+                model: state.config.openai_model.clone(),
+                status: "failed".to_string(),
+                latency_ms: DateTime::now().timestamp_millis() - started_at.timestamp_millis(),
+                prompt_tokens: 0,
+                completion_tokens: 0,
+                total_tokens: 0,
+                prompt_cache_hit_tokens: 0,
+                prompt_cache_miss_tokens: 0,
+                error: Some(error.to_string()),
+                retry_count: retry_count_from_error(&error.to_string()),
+                final_status: Some(final_status.to_string()),
+                created_at: started_at,
+            },
+            None,
+        )
+        .await;
 }
 
 fn retry_count_from_error(error: &str) -> i32 {

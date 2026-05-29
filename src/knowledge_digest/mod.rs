@@ -908,6 +908,7 @@ async fn do_generate(
             "llmCallsUsed": snapshot.llm_calls_used as i64,
         }),
         created_at: now,
+        dedupe_key: None,
     };
     if let Err(err) = state.db.events().insert_one(&event, None).await {
         tracing::warn!(?err, "agent_events insert failed (digest); ignoring");
@@ -953,9 +954,9 @@ mod tests {
                 "suggestedAction": "fix_chunk",
                 "severity": "warn"
             }),
-            // 非法 kind
+            // 非法 kind（测试用占位，避免使用产品红线词）
             json!({
-                "kind": "human_takeover",
+                "kind": "unknown_card_kind",
                 "title": "x", "summary": "y",
                 "suggestedAction": "fix_chunk", "severity": "warn"
             }),

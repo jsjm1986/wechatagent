@@ -3460,6 +3460,32 @@ td:nth-child(3) {
   color: var(--success);
   font-weight: 600;
 }
+.llmProviderCard .visionBadge {
+  font-size: 10px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: #eef2ff;
+  color: #4338ca;
+  font-weight: 600;
+}
+.llmProviderCard .visionActiveBadge {
+  font-size: 10px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: #fef3c7;
+  color: #b45309;
+  font-weight: 600;
+}
+.llmProviderEditor .checkboxRow {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  gap: 8px;
+}
+.llmProviderEditor .checkboxRow input[type="checkbox"] {
+  width: auto;
+  margin: 0;
+}
 .llmProviderCard dl {
   margin: 0;
   display: flex;
@@ -5689,6 +5715,60 @@ td:nth-child(3) {
   text-align: center;
 }
 
+/* P1-4 · 锁徽章：进入 Inspector 后实时显示当前 chunk 锁状态。
+ * self  — 自己持锁，绿点；
+ * other — 他人持锁（HTTP 409 或 ws 推 locked），琥珀点 + 暂只读语义；
+ * error — 锁信道异常（网络错或 5xx），灰点；UI 不阻塞但提醒。
+ */
+.wikiInspectorLockBadge {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px;
+  margin: 0 0 12px;
+  border-radius: 6px;
+  font-size: 12px;
+  font-family: var(--font-body);
+  border: 1px solid transparent;
+  background: var(--surface-2, #f5f5f5);
+}
+
+.wikiInspectorLockBadge--self {
+  background: rgba(34, 139, 84, 0.08);
+  border-color: rgba(34, 139, 84, 0.28);
+  color: #1f6f48;
+}
+
+.wikiInspectorLockBadge--other {
+  background: rgba(204, 132, 22, 0.10);
+  border-color: rgba(204, 132, 22, 0.32);
+  color: #8a5a10;
+}
+
+.wikiInspectorLockBadge--error {
+  background: rgba(120, 120, 120, 0.10);
+  border-color: rgba(120, 120, 120, 0.28);
+  color: var(--muted);
+}
+
+.wikiInspectorLockDot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex-shrink: 0;
+  background: currentColor;
+  box-shadow: 0 0 0 3px color-mix(in srgb, currentColor 18%, transparent);
+}
+
+.wikiInspectorLockBadge--self .wikiInspectorLockDot {
+  animation: wikiInspectorLockPulse 1.6s ease-in-out infinite;
+}
+
+@keyframes wikiInspectorLockPulse {
+  0%, 100% { opacity: 1; }
+  50%      { opacity: 0.55; }
+}
+
 .wikiInspectorMeta {
   display: flex;
   flex-wrap: wrap;
@@ -7319,4 +7399,90 @@ td:nth-child(3) {
 
 .authBadgeLogout:hover {
   background: rgba(255, 253, 247, 0.12);
+}
+
+.authBadgeWorkspace {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  letter-spacing: 0.06em;
+  color: rgba(255, 253, 247, 0.78);
+  padding: 0 4px;
+}
+
+.authBadgeWorkspaceLabel {
+  text-transform: uppercase;
+  font-size: 10px;
+  letter-spacing: 0.14em;
+  color: rgba(255, 253, 247, 0.55);
+}
+
+.authBadgeWorkspaceValue {
+  color: #fffdf7;
+  font-weight: 500;
+}
+
+.authBadgeWorkspaceSelect {
+  background: transparent;
+  border: 1px solid rgba(255, 253, 247, 0.45);
+  color: #fffdf7;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  padding: 3px 6px;
+  cursor: pointer;
+  outline: none;
+}
+
+.authBadgeWorkspaceSelect:focus {
+  border-color: rgba(255, 253, 247, 0.85);
+}
+
+.authBadgeWorkspaceSelect option {
+  background: #1a1a1a;
+  color: #fffdf7;
+}
+
+.authBadgeWorkspaceError {
+  color: #ffb4b4;
+  font-size: 10px;
+  letter-spacing: 0.04em;
+}
+
+.wikiGraphCommunityHint {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--ink-muted, #6a6a6a);
+  letter-spacing: 0.04em;
+}
+
+.wikiAskStreamingAnswer {
+  margin-top: 10px;
+  padding: 12px 14px;
+  border: 1px dashed var(--ink-soft, #c8c8c8);
+  border-radius: 6px;
+  background: var(--paper-soft, #fafafa);
+  font-family: var(--font-body, system-ui);
+  font-size: 13px;
+  line-height: 1.65;
+  color: var(--ink-strong, #1f1f1f);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.wikiAskStreamingCaret {
+  display: inline-block;
+  width: 6px;
+  height: 1em;
+  margin-left: 2px;
+  vertical-align: text-bottom;
+  background: var(--ink-strong, #1f1f1f);
+  animation: wikiAskStreamingCaretBlink 1s steps(2, start) infinite;
+}
+
+@keyframes wikiAskStreamingCaretBlink {
+  to {
+    visibility: hidden;
+  }
 }

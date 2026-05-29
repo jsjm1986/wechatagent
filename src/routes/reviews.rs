@@ -2,14 +2,17 @@
 
 use axum::{
     extract::{Path, Query, State},
-    Json,
+    Extension, Json,
 };
 use futures::TryStreamExt;
 use mongodb::{bson::doc, options::FindOptions};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use crate::error::{AppError, AppResult};
+use crate::{
+    auth::AuthenticatedAdmin,
+    error::{AppError, AppResult},
+};
 
 use super::shared::*;
 use super::AppState;
@@ -25,17 +28,18 @@ pub(super) struct DecisionReviewQuery {
 
 pub(super) async fn list_decision_reviews(
     State(state): State<AppState>,
+    Extension(admin): Extension<AuthenticatedAdmin>,
     Query(query): Query<DecisionReviewQuery>,
 ) -> AppResult<Json<Value>> {
     let account_id = query
         .account_id
         .unwrap_or_else(|| state.config.default_account_id.clone());
     let mut filter = doc! {
-        "workspace_id": &state.config.default_workspace_id,
+        "workspace_id": &admin.current_workspace,
         "account_id": &account_id
     };
     if let Some(contact_id) = query.contact_id {
-        let contact = find_contact_by_id(&state, &contact_id).await?;
+        let contact = find_contact_by_id(&state, &admin.current_workspace, &contact_id).await?;
         filter.insert("contact_wxid", contact.wxid);
     } else if let Some(contact_wxid) = query.contact_wxid {
         if !contact_wxid.is_empty() {
@@ -62,6 +66,7 @@ pub(super) async fn list_decision_reviews(
 
 pub(super) async fn get_decision_review(
     State(state): State<AppState>,
+    Extension(admin): Extension<AuthenticatedAdmin>,
     Path(id): Path<String>,
 ) -> AppResult<Json<Value>> {
     let object_id = parse_object_id(&id)?;
@@ -71,7 +76,7 @@ pub(super) async fn get_decision_review(
         .find_one(
             doc! {
                 "_id": object_id,
-                "workspace_id": &state.config.default_workspace_id
+                "workspace_id": &admin.current_workspace
             },
             None,
         )

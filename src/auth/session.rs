@@ -41,10 +41,14 @@ fn admin_sessions(db: &Database) -> Collection<AdminSession> {
 
 /// 启动时调用：当 admin_users 为空且 env 提供了 username+password 时创建第一个 admin。
 /// 已存在 admin 则跳过（幂等）。env 缺一就跳过（不报错，便于本地开发）。
+///
+/// `default_workspace` 用 `config.default_workspace_id` 兜底；admin 可后续在
+/// 治理面新增/编辑 workspace 列表。
 pub async fn bootstrap_admin_if_needed(
     db: &Database,
     username: Option<&str>,
     password_plain: Option<&str>,
+    default_workspace: Option<&str>,
 ) -> Result<bool, AuthError> {
     let (Some(username), Some(password_plain)) = (username, password_plain) else {
         return Ok(false);
@@ -54,12 +58,17 @@ pub async fn bootstrap_admin_if_needed(
     if existing > 0 {
         return Ok(false);
     }
+    let workspaces = default_workspace
+        .map(|w| vec![w.to_string()])
+        .unwrap_or_default();
     let user = AdminUser {
         user_id: uuid::Uuid::new_v4().to_string(),
         username: username.to_string(),
         password_hash: password::hash_password(password_plain)?,
         created_at: Utc::now(),
         last_login_at: None,
+        workspaces,
+        default_workspace: default_workspace.map(|w| w.to_string()),
     };
     coll.insert_one(&user, None).await?;
     Ok(true)
@@ -91,18 +100,27 @@ pub async fn authenticate(
 }
 
 /// 创建一条 session（写 mongo + 返结构）。session_id 用 uuid v4。
+/// `current_workspace` 在登录时初始为 user.default_workspace（或 fallback 到
+/// `config.default_workspace_id`）；后续可由 [`update_session_workspace`] 切换。
 pub async fn create_session(
     db: &Database,
     user: &AdminUser,
     ttl_hours: i64,
+    fallback_workspace: &str,
 ) -> Result<AdminSession, AuthError> {
     let now = Utc::now();
+    let initial_ws = user
+        .default_workspace
+        .clone()
+        .or_else(|| user.workspaces.first().cloned())
+        .unwrap_or_else(|| fallback_workspace.to_string());
     let session = AdminSession {
         session_id: uuid::Uuid::new_v4().to_string(),
         admin_user_id: user.user_id.clone(),
         username: user.username.clone(),
         created_at: now,
         expires_at: now + Duration::hours(ttl_hours.max(1)),
+        current_workspace: Some(initial_ws),
     };
     admin_sessions(db).insert_one(&session, None).await?;
     Ok(session)
@@ -130,4 +148,32 @@ pub async fn delete_session(db: &Database, session_id: &str) -> Result<(), AuthE
         .delete_one(doc! { "session_id": session_id }, None)
         .await?;
     Ok(())
+}
+
+/// 切换当前 session 的 workspace。caller 必须先校验目标 workspace 在
+/// `admin_user.workspaces` 列表内（中间层做权限校验，本函数只写 DB）。
+pub async fn update_session_workspace(
+    db: &Database,
+    session_id: &str,
+    new_workspace: &str,
+) -> Result<(), AuthError> {
+    admin_sessions(db)
+        .update_one(
+            doc! { "session_id": session_id },
+            doc! { "$set": { "current_workspace": new_workspace } },
+            None,
+        )
+        .await?;
+    Ok(())
+}
+
+/// 按 user_id 查 admin user，用于切换 workspace 时校验权限。
+pub async fn get_admin_user(
+    db: &Database,
+    user_id: &str,
+) -> Result<Option<AdminUser>, AuthError> {
+    let user = admin_users(db)
+        .find_one(doc! { "user_id": user_id }, None)
+        .await?;
+    Ok(user)
 }

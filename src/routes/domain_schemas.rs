@@ -24,7 +24,7 @@
 
 use axum::{
     extract::{Path, Query, State},
-    Json,
+    Extension, Json,
 };
 use futures::TryStreamExt;
 use mongodb::bson::{doc, to_bson, DateTime, Document};
@@ -33,6 +33,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::{
+    auth::AuthenticatedAdmin,
     error::{AppError, AppResult},
     models::{DomainField, DomainSchema},
 };
@@ -165,12 +166,13 @@ impl From<&DomainSchema> for DomainSchemaView {
 
 pub(super) async fn list_domain_schemas(
     State(state): State<AppState>,
+    Extension(admin): Extension<AuthenticatedAdmin>,
     Query(params): Query<ListQuery>,
 ) -> AppResult<Json<Value>> {
     let workspace_id = params
         .workspace_id
         .clone()
-        .unwrap_or_else(|| state.config.default_workspace_id.clone());
+        .unwrap_or_else(|| admin.current_workspace.clone());
     let mut filter = doc! { "workspaceId": &workspace_id };
     if params.active_only {
         filter.insert("isActive", true);
@@ -194,12 +196,13 @@ pub(super) async fn list_domain_schemas(
 
 pub(super) async fn create_domain_schema(
     State(state): State<AppState>,
+    Extension(admin): Extension<AuthenticatedAdmin>,
     Json(body): Json<UpsertRequest>,
 ) -> AppResult<Json<Value>> {
     let workspace_id = body
         .workspace_id
         .clone()
-        .unwrap_or_else(|| state.config.default_workspace_id.clone());
+        .unwrap_or_else(|| admin.current_workspace.clone());
     if body.schema_id.trim().is_empty() {
         return Err(AppError::BadRequest("schemaId 不能为空".to_string()));
     }
@@ -234,13 +237,14 @@ pub(super) async fn create_domain_schema(
 
 pub(super) async fn update_domain_schema(
     State(state): State<AppState>,
+    Extension(admin): Extension<AuthenticatedAdmin>,
     Path(schema_id): Path<String>,
     Json(body): Json<UpsertRequest>,
 ) -> AppResult<Json<Value>> {
     let workspace_id = body
         .workspace_id
         .clone()
-        .unwrap_or_else(|| state.config.default_workspace_id.clone());
+        .unwrap_or_else(|| admin.current_workspace.clone());
     let existing = state
         .db
         .domain_schemas()
@@ -289,13 +293,14 @@ pub(super) async fn update_domain_schema(
 
 pub(super) async fn delete_domain_schema(
     State(state): State<AppState>,
+    Extension(admin): Extension<AuthenticatedAdmin>,
     Path(schema_id): Path<String>,
     Query(params): Query<ListQuery>,
 ) -> AppResult<Json<Value>> {
     let workspace_id = params
         .workspace_id
         .clone()
-        .unwrap_or_else(|| state.config.default_workspace_id.clone());
+        .unwrap_or_else(|| admin.current_workspace.clone());
     let existing = state
         .db
         .domain_schemas()
@@ -325,13 +330,14 @@ pub(super) async fn delete_domain_schema(
 
 pub(super) async fn activate_domain_schema(
     State(state): State<AppState>,
+    Extension(admin): Extension<AuthenticatedAdmin>,
     Path(schema_id): Path<String>,
     Query(params): Query<ListQuery>,
 ) -> AppResult<Json<Value>> {
     let workspace_id = params
         .workspace_id
         .clone()
-        .unwrap_or_else(|| state.config.default_workspace_id.clone());
+        .unwrap_or_else(|| admin.current_workspace.clone());
     let target = state
         .db
         .domain_schemas()

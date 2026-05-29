@@ -2,7 +2,7 @@
 
 use axum::{
     extract::{Path, Query, State},
-    Json,
+    Extension, Json,
 };
 use futures::TryStreamExt;
 use mongodb::{
@@ -11,9 +11,11 @@ use mongodb::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::collections::HashSet;
 
 use crate::{
     agent,
+    auth::AuthenticatedAdmin,
     error::{AppError, AppResult},
     mcp::{self},
     models::{
@@ -73,12 +75,13 @@ pub(super) struct PlannedToolCall {
 
 pub(super) async fn create_management_session(
     State(state): State<AppState>,
+    Extension(admin): Extension<AuthenticatedAdmin>,
     Json(payload): Json<CreateSessionRequest>,
 ) -> AppResult<Json<Value>> {
-    validate_account(&state, &payload.account_id).await?;
+    validate_account(&state, &admin.current_workspace, &payload.account_id).await?;
     let session = ManagementAgentSession {
         id: None,
-        workspace_id: state.config.default_workspace_id.clone(),
+        workspace_id: admin.current_workspace.clone(),
         account_id: payload.account_id,
         title: payload
             .title
@@ -100,13 +103,14 @@ pub(super) async fn create_management_session(
 
 pub(super) async fn post_management_message(
     State(state): State<AppState>,
+    Extension(admin): Extension<AuthenticatedAdmin>,
     Path(id): Path<String>,
     Json(payload): Json<ManagementMessageRequest>,
 ) -> AppResult<Json<Value>> {
     if payload.content.trim().is_empty() {
         return Err(AppError::BadRequest("content is required".to_string()));
     }
-    validate_account(&state, &payload.account_id).await?;
+    validate_account(&state, &admin.current_workspace, &payload.account_id).await?;
     let session_id = parse_object_id(&id)?;
     let session = state
         .db
@@ -123,7 +127,7 @@ pub(super) async fn post_management_message(
         .insert_one(
             ManagementAgentMessage {
                 id: None,
-                workspace_id: state.config.default_workspace_id.clone(),
+                workspace_id: admin.current_workspace.clone(),
                 account_id: payload.account_id.clone(),
                 session_id,
                 role: "user".to_string(),
@@ -136,10 +140,12 @@ pub(super) async fn post_management_message(
 
     let tools = mcp::list_tools_for_account(&state, &payload.account_id).await?;
     let tools = merge_product_tools(tools);
-    let context = management_context(&state, &payload.account_id).await?;
+    let advertised_tools = advertised_tool_names(&tools);
+    let context = management_context(&state, &admin.current_workspace, &payload.account_id).await?;
     let effective_dry_run = payload.dry_run.unwrap_or(session.dry_run);
     let mut plan = build_management_plan(
         &state,
+        &admin.current_workspace,
         &payload.account_id,
         &payload.content,
         &tools,
@@ -150,7 +156,7 @@ pub(super) async fn post_management_message(
     let plan_doc = to_document(&plan)?;
     let prompt_versions = prompts::prompt_versions(
         &state.db,
-        &state.config.default_workspace_id,
+        &admin.current_workspace,
         &["management.plan.system", "management.plan.policy"],
         Some("management"),
         None,
@@ -158,7 +164,7 @@ pub(super) async fn post_management_message(
     .await?;
     let run = AgentCommandRun {
         id: None,
-        workspace_id: state.config.default_workspace_id.clone(),
+        workspace_id: admin.current_workspace.clone(),
         account_id: payload.account_id.clone(),
         session_id,
         operator_message: payload.content.clone(),
@@ -187,7 +193,7 @@ pub(super) async fn post_management_message(
         let arguments_doc = to_document(&planned.arguments).unwrap_or_else(|_| Document::new());
         let call_start = AgentToolCall {
             id: None,
-            workspace_id: state.config.default_workspace_id.clone(),
+            workspace_id: admin.current_workspace.clone(),
             account_id: payload.account_id.clone(),
             command_run_id: run_id,
             tool_name: planned.tool_name.clone(),
@@ -208,7 +214,7 @@ pub(super) async fn post_management_message(
             .as_object_id()
             .ok_or_else(|| AppError::External("tool call id missing".to_string()))?;
         let result =
-            execute_management_tool(&state, &payload.account_id, planned, effective_dry_run).await;
+            execute_management_tool(&state, &admin.current_workspace, &payload.account_id, planned, effective_dry_run, &advertised_tools).await;
         let succeeded_status = if should_dry_run_tool(&planned.tool_name, effective_dry_run) {
             "dry_run"
         } else {
@@ -343,19 +349,23 @@ pub(super) async fn post_management_message(
 pub(super) async fn get_management_command(
     State(state): State<AppState>,
     Path(id): Path<String>,
+    Extension(admin): Extension<AuthenticatedAdmin>,
 ) -> AppResult<Json<Value>> {
     let run_id = parse_object_id(&id)?;
     let run = state
         .db
         .command_runs()
-        .find_one(doc! { "_id": run_id }, None)
+        .find_one(
+            doc! { "_id": run_id, "workspace_id": &admin.current_workspace },
+            None,
+        )
         .await?
         .ok_or_else(|| AppError::NotFound("command run not found".to_string()))?;
     let mut cursor = state
         .db
         .tool_calls()
         .find(
-            doc! { "command_run_id": run_id },
+            doc! { "command_run_id": run_id, "workspace_id": &admin.current_workspace },
             FindOptions::builder()
                 .sort(doc! { "created_at": 1 })
                 .build(),
@@ -462,6 +472,58 @@ pub(super) fn merge_product_tools(mut tools: Value) -> Value {
         }
     }
     tools
+}
+
+/// 从合并后的工具目录中收集所有"已被 tools/list 公布 + 已注册的产品工具"名称白名单。
+/// 用于在 `execute_management_tool` 的兜底分支拦截 LLM 幻觉/注入出来、
+/// MCP 服务端从未公布过的工具名，避免裸 `tools/call` 打到生产 MCP。
+pub(super) fn advertised_tool_names(tools: &Value) -> HashSet<String> {
+    fn collect(value: &Value, names: &mut HashSet<String>) {
+        match value {
+            Value::Object(map) => {
+                // tools / product_tools：对象数组，取每项的 name
+                for key in ["tools", "product_tools"] {
+                    if let Some(Value::Array(items)) = map.get(key) {
+                        for item in items {
+                            if let Some(name) = item.get("name").and_then(Value::as_str) {
+                                names.insert(name.to_string());
+                            } else if let Some(name) = item.as_str() {
+                                names.insert(name.to_string());
+                            }
+                        }
+                    }
+                }
+                // allowed_tools：字符串数组
+                if let Some(Value::Array(items)) = map.get("allowed_tools") {
+                    for item in items {
+                        if let Some(name) = item.as_str() {
+                            names.insert(name.to_string());
+                        }
+                    }
+                }
+                // auth.allowed_tools / mcp.*：嵌套结构递归
+                if let Some(auth) = map.get("auth") {
+                    collect(auth, names);
+                }
+                if let Some(inner) = map.get("mcp") {
+                    collect(inner, names);
+                }
+            }
+            Value::Array(items) => {
+                for item in items {
+                    if let Some(name) = item.get("name").and_then(Value::as_str) {
+                        names.insert(name.to_string());
+                    } else if let Some(name) = item.as_str() {
+                        names.insert(name.to_string());
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut names = HashSet::new();
+    collect(tools, &mut names);
+    names
 }
 
 pub(super) fn apply_locked_send_content(
@@ -608,9 +670,11 @@ pub(super) fn should_dry_run_tool(tool_name: &str, dry_run: bool) -> bool {
 
 pub(super) async fn execute_management_tool(
     state: &AppState,
+    workspace_id: &str,
     account_id: &str,
     planned: &PlannedToolCall,
     dry_run: bool,
+    advertised: &HashSet<String>,
 ) -> AppResult<Value> {
     // S-20 / Task 19：dry-run 模式下，所有非 read 类工具直接返回
     // would_execute 计划，不实际调用底层 MCP 或写库。
@@ -658,7 +722,7 @@ pub(super) async fn execute_management_tool(
             for item in items {
                 if let Some(contact_value) = item.get("contact") {
                     if let Some(contact) =
-                        upsert_contact_from_value(state, account_id, contact_value).await?
+                        upsert_contact_from_value(state, workspace_id, account_id, contact_value).await?
                     {
                         imported.push(ApiContact::from(contact));
                     }
@@ -669,9 +733,9 @@ pub(super) async fn execute_management_tool(
         "wechatagent.enable_contact_agent" => {
             let note = string_arg(&planned.arguments, "humanProfileNote")
                 .or_else(|_| string_arg(&planned.arguments, "note"))?;
-            let contact = resolve_contact_arg(state, account_id, &planned.arguments).await?;
+            let contact = resolve_contact_arg(state, workspace_id, account_id, &planned.arguments).await?;
             let playbook_id = planned.arguments.get("playbookId").and_then(Value::as_str);
-            let playbook = resolve_playbook_for_contact(state, account_id, playbook_id).await?;
+            let playbook = resolve_playbook_for_contact(state, workspace_id, account_id, playbook_id).await?;
             let generated =
                 agent::build_initial_operation_profile(state, &note, Some(&playbook)).await?;
             let commitments_bson = commitments_with_optional_text(
@@ -711,11 +775,11 @@ pub(super) async fn execute_management_tool(
                     None,
                 )
                 .await?;
-            let updated = find_contact_by_id(state, &contact.id.unwrap().to_hex()).await?;
+            let updated = find_contact_by_id(state, workspace_id, &contact.id.unwrap().to_hex()).await?;
             Ok(json!({ "item": ApiContact::from(updated) }))
         }
         "wechatagent.disable_contact_agent" => {
-            let contact = resolve_contact_arg(state, account_id, &planned.arguments).await?;
+            let contact = resolve_contact_arg(state, workspace_id, account_id, &planned.arguments).await?;
             state
                 .db
                 .contacts()
@@ -728,7 +792,7 @@ pub(super) async fn execute_management_tool(
             Ok(json!({ "ok": true }))
         }
         "wechatagent.create_follow_up_task" => {
-            let contact = resolve_contact_arg(state, account_id, &planned.arguments).await?;
+            let contact = resolve_contact_arg(state, workspace_id, account_id, &planned.arguments).await?;
             let content = string_arg(&planned.arguments, "content")?;
             let run_at = string_arg(&planned.arguments, "runAt")
                 .ok()
@@ -740,7 +804,7 @@ pub(super) async fn execute_management_tool(
                 .insert_one(
                     crate::models::AgentTask {
                         id: None,
-                        workspace_id: state.config.default_workspace_id.clone(),
+                        workspace_id: workspace_id.to_string(),
                         account_id: account_id.to_string(),
                         contact_wxid: contact.wxid,
                         kind: "follow_up".to_string(),
@@ -770,7 +834,7 @@ pub(super) async fn execute_management_tool(
         }
         "wechatagent.send_contact_message" => {
             let content = string_arg(&planned.arguments, "content")?;
-            let contact = resolve_contact_arg(state, account_id, &planned.arguments).await?;
+            let contact = resolve_contact_arg(state, workspace_id, account_id, &planned.arguments).await?;
             let response = agent::send_contact_message_gateway(
                 state,
                 contact,
@@ -791,7 +855,7 @@ pub(super) async fn execute_management_tool(
             Ok(json!(response))
         }
         "wechatagent.update_contact_profile" => {
-            let contact = resolve_contact_arg(state, account_id, &planned.arguments).await?;
+            let contact = resolve_contact_arg(state, workspace_id, account_id, &planned.arguments).await?;
             let tags = planned
                 .arguments
                 .get("tags")
@@ -855,6 +919,14 @@ pub(super) async fn execute_management_tool(
             Ok(json!({ "ok": true }))
         }
         _ => {
+            // 兜底分支：只允许把 tools/list 真实公布过的工具名透传给生产 MCP。
+            // 拦截 LLM 幻觉或提示注入产生的、服务端从未声明的工具名。
+            if !advertised.contains(planned.tool_name.as_str()) {
+                return Err(AppError::BadRequest(format!(
+                    "tool '{}' is not advertised by the MCP server and is not a known product tool",
+                    planned.tool_name
+                )));
+            }
             mcp::logged_call_for_account(
                 state,
                 account_id,
@@ -887,11 +959,12 @@ pub(super) fn optional_value_arg(arguments: &Value, key: &str) -> Option<String>
 
 pub(super) async fn resolve_contact_arg(
     state: &AppState,
+    workspace_id: &str,
     account_id: &str,
     arguments: &Value,
 ) -> AppResult<Contact> {
     if let Some(contact_id) = arguments.get("contactId").and_then(Value::as_str) {
-        let contact = find_contact_by_id(state, contact_id).await?;
+        let contact = find_contact_by_id(state, workspace_id, contact_id).await?;
         if contact.account_id == account_id {
             return Ok(contact);
         }
@@ -906,7 +979,7 @@ pub(super) async fn resolve_contact_arg(
         .contacts()
         .find_one(
             doc! {
-                "workspace_id": &state.config.default_workspace_id,
+                "workspace_id": workspace_id,
                 "account_id": account_id,
                 "wxid": wxid
             },
@@ -916,13 +989,13 @@ pub(super) async fn resolve_contact_arg(
         .ok_or_else(|| AppError::NotFound("contact not found".to_string()))
 }
 
-pub(super) async fn management_context(state: &AppState, account_id: &str) -> AppResult<String> {
+pub(super) async fn management_context(state: &AppState, workspace_id: &str, account_id: &str) -> AppResult<String> {
     let mut contacts = state
         .db
         .contacts()
         .find(
             doc! {
-                "workspace_id": &state.config.default_workspace_id,
+                "workspace_id": workspace_id,
                 "account_id": account_id
             },
             FindOptions::builder()
@@ -950,7 +1023,7 @@ pub(super) async fn management_context(state: &AppState, account_id: &str) -> Ap
         .content_assets()
         .find(
             doc! {
-                "workspace_id": &state.config.default_workspace_id,
+                "workspace_id": workspace_id,
                 "$or": [
                     { "account_id": null },
                     { "account_id": account_id }
@@ -976,6 +1049,7 @@ pub(super) async fn management_context(state: &AppState, account_id: &str) -> Ap
 
 pub(super) async fn build_management_plan(
     state: &AppState,
+    workspace_id: &str,
     account_id: &str,
     instruction: &str,
     tools: &Value,
@@ -985,13 +1059,13 @@ pub(super) async fn build_management_plan(
         "{}\n\n{}",
         prompts::load_prompt(
             &state.db,
-            &state.config.default_workspace_id,
+            workspace_id,
             "management.plan.system",
         )
         .await?,
         prompts::load_prompt(
             &state.db,
-            &state.config.default_workspace_id,
+            workspace_id,
             "management.plan.policy",
         )
         .await?
@@ -1097,5 +1171,66 @@ mod tests {
             args.get("lockedContentError").and_then(Value::as_str),
             Some("send_contact_message arguments must be an object")
         );
+    }
+
+    #[test]
+    fn advertised_tool_names_collects_from_tools_array() {
+        // tools/list 公布的对象数组 + merge_product_tools 追加的产品工具
+        let merged = merge_product_tools(json!({
+            "tools": [
+                { "name": "account_list", "description": "list accounts" },
+                { "name": "contacts_search", "description": "search" }
+            ]
+        }));
+        let names = advertised_tool_names(&merged);
+        assert!(names.contains("account_list"));
+        assert!(names.contains("contacts_search"));
+        // 产品工具也应进入白名单
+        assert!(names.contains("wechatagent.send_contact_message"));
+        assert!(names.contains("wechatagent.import_contacts"));
+    }
+
+    #[test]
+    fn advertised_tool_names_collects_from_allowed_tools_and_auth() {
+        // allowed_tools 字符串数组形态
+        let merged = merge_product_tools(json!({
+            "allowed_tools": ["account_list", "message_send_text"]
+        }));
+        let names = advertised_tool_names(&merged);
+        assert!(names.contains("account_list"));
+        assert!(names.contains("message_send_text"));
+        assert!(names.contains("wechatagent.search_contacts"));
+
+        // auth.allowed_tools 嵌套形态
+        let merged_auth = merge_product_tools(json!({
+            "auth": { "allowed_tools": ["contacts_search"] }
+        }));
+        let names_auth = advertised_tool_names(&merged_auth);
+        assert!(names_auth.contains("contacts_search"));
+    }
+
+    #[test]
+    fn advertised_tool_names_collects_from_non_object_catalog() {
+        // tools/list 返回非对象（数组）时 merge_product_tools 包成 { mcp, product_tools }
+        let merged = merge_product_tools(json!([
+            { "name": "account_list" },
+            { "name": "message_send_text" }
+        ]));
+        let names = advertised_tool_names(&merged);
+        assert!(names.contains("account_list"));
+        assert!(names.contains("message_send_text"));
+        assert!(names.contains("wechatagent.update_contact_profile"));
+    }
+
+    #[test]
+    fn unadvertised_tool_name_is_not_in_whitelist() {
+        // LLM 幻觉/注入产生的、tools/list 从未公布的工具名不得进入白名单
+        let merged = merge_product_tools(json!({
+            "tools": [{ "name": "account_list" }]
+        }));
+        let names = advertised_tool_names(&merged);
+        assert!(!names.contains("os.exec"));
+        assert!(!names.contains("message_send_text"));
+        assert!(!names.contains("admin.delete_workspace"));
     }
 }

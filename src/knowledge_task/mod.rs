@@ -412,6 +412,7 @@ pub async fn run_task(
                     "needsReviewCount": dedup_review.len() as i32,
                 }),
                 created_at: DateTime::now(),
+                dedupe_key: None,
             },
             None,
         )

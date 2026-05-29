@@ -14,9 +14,10 @@
 mod common;
 
 use axum::extract::{Query, State};
-use axum::Json;
+use axum::{Extension, Json};
 use mongodb::bson::{oid::ObjectId, DateTime as BsonDt, Document};
 use serde_json::json;
+use wechatagent::auth::AuthenticatedAdmin;
 use wechatagent::models::{OperationKnowledgeChunk, RelatedRef};
 use wechatagent::routes::ext_knowledge::{
     batch_archive_chunks, batch_verify_chunks, list_chunk_referrers,
@@ -26,6 +27,15 @@ use wechatagent::routes::{
 };
 
 use crate::common::TestApp;
+
+/// 测试用 admin extractor：current_workspace 复用 TestApp 的默认 ws。
+fn admin(app: &TestApp) -> Extension<AuthenticatedAdmin> {
+    Extension(AuthenticatedAdmin {
+        user_id: "test_admin".into(),
+        username: "test_admin".into(),
+        current_workspace: app.state.config.default_workspace_id.clone(),
+    })
+}
 
 fn verifiable_chunk(workspace_id: &str, title: &str) -> OperationKnowledgeChunk {
     let mut anchor = Document::new();
@@ -79,6 +89,7 @@ async fn batch_verify_marks_three_chunks_verified() {
 
     let resp = batch_verify_chunks(
         State(app.state.clone()),
+        admin(&app),
         Json(ChunkBatchVerifyRequest {
             ids: vec![id1.clone(), id2.clone(), id3.clone()],
             note: Some("admin batch verify".to_string()),
@@ -134,6 +145,7 @@ async fn batch_archive_skips_already_archived() {
 
     let resp = batch_archive_chunks(
         State(app.state.clone()),
+        admin(&app),
         Json(ChunkBatchArchiveRequest {
             ids: vec![id_a.clone(), id_b.clone(), id_arch.clone()],
             reason: Some("end-of-life".to_string()),
@@ -206,6 +218,7 @@ async fn list_chunk_referrers_returns_referrer_with_kind_and_note() {
 
     let resp = list_chunk_referrers(
         State(app.state.clone()),
+        admin(&app),
         Query(ChunkReferrersQuery {
             target_id: target_id.clone(),
         }),
@@ -229,6 +242,7 @@ async fn batch_verify_rejects_empty_ids() {
     let app = TestApp::start().await;
     let resp = batch_verify_chunks(
         State(app.state.clone()),
+        admin(&app),
         Json(ChunkBatchVerifyRequest {
             ids: vec![],
             note: None,
@@ -251,6 +265,7 @@ async fn batch_verify_skips_chunk_without_quote() {
 
     let resp = batch_verify_chunks(
         State(app.state.clone()),
+        admin(&app),
         Json(ChunkBatchVerifyRequest {
             ids: vec![id.clone()],
             note: None,

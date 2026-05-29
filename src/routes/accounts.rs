@@ -2,7 +2,7 @@
 
 use axum::{
     extract::{Path, State},
-    Json,
+    Extension, Json,
 };
 use futures::TryStreamExt;
 use mongodb::{
@@ -13,6 +13,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::{
+    auth::AuthenticatedAdmin,
     error::{AppError, AppResult},
     mcp::{self},
     models::WechatAccount,
@@ -28,12 +29,15 @@ pub(super) struct UpdateAccountMcpKeyRequest {
     mcp_base_url: Option<String>,
 }
 
-pub(super) async fn list_accounts(State(state): State<AppState>) -> AppResult<Json<Value>> {
+pub(super) async fn list_accounts(
+    State(state): State<AppState>,
+    Extension(admin): Extension<AuthenticatedAdmin>,
+) -> AppResult<Json<Value>> {
     let mut cursor = state
         .db
         .accounts()
         .find(
-            doc! {},
+            doc! { "workspace_id": &admin.current_workspace },
             FindOptions::builder().sort(doc! { "alias": 1 }).build(),
         )
         .await?;
@@ -56,7 +60,10 @@ pub(super) async fn list_accounts(State(state): State<AppState>) -> AppResult<Js
     Ok(Json(json!({ "items": items })))
 }
 
-pub(super) async fn sync_accounts(State(state): State<AppState>) -> AppResult<Json<Value>> {
+pub(super) async fn sync_accounts(
+    State(state): State<AppState>,
+    Extension(admin): Extension<AuthenticatedAdmin>,
+) -> AppResult<Json<Value>> {
     let result = mcp::logged_call(&state, "account_list", json!({})).await?;
     let items = result
         .get("items")
@@ -78,7 +85,7 @@ pub(super) async fn sync_accounts(State(state): State<AppState>) -> AppResult<Js
             .to_string();
         let account = WechatAccount {
             id: None,
-            workspace_id: state.config.default_workspace_id.clone(),
+            workspace_id: admin.current_workspace.clone(),
             account_id: account_id.clone(),
             alias,
             display_name: item
@@ -152,17 +159,18 @@ pub(super) async fn sync_accounts(State(state): State<AppState>) -> AppResult<Js
 pub(super) async fn update_account_mcp_key(
     State(state): State<AppState>,
     Path(id): Path<String>,
+    Extension(admin): Extension<AuthenticatedAdmin>,
     Json(payload): Json<UpdateAccountMcpKeyRequest>,
 ) -> AppResult<Json<Value>> {
     if payload.mcp_api_key.trim().is_empty() {
         return Err(AppError::BadRequest("mcpApiKey is required".to_string()));
     }
     let object_id = parse_object_id(&id)?;
-    state
+    let result = state
         .db
         .accounts()
         .update_one(
-            doc! { "_id": object_id },
+            doc! { "_id": object_id, "workspace_id": &admin.current_workspace },
             doc! {
                 "$set": {
                     "mcp_api_key": payload.mcp_api_key,
@@ -173,5 +181,8 @@ pub(super) async fn update_account_mcp_key(
             None,
         )
         .await?;
+    if result.matched_count == 0 {
+        return Err(AppError::NotFound("account not found".to_string()));
+    }
     Ok(Json(json!({ "ok": true })))
 }

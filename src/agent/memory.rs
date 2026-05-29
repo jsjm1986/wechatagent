@@ -596,6 +596,25 @@ pub(crate) fn next_memory_card_version(memory: &OperatingMemory) -> i32 {
     memory.memory_card_version.saturating_add(1)
 }
 
+/// P1-5：OCC filter 构造器。`memory_card_version` 在 filter 中作为乐观锁
+/// 谓词；同 (workspace, account, contact) 下的 read-modify-write 中，只有
+/// 看到 `prev_version` 的 writer 能命中 update_one，其余被 modified_count==0
+/// 兜回 stale 分支。Mongo 的 update_one 单条文档 atomic，与 unique 索引
+/// `(workspace_id, account_id, contact_wxid)` 联合保证全局至多一条 winner。
+pub(crate) fn occ_memory_filter(
+    workspace_id: &str,
+    account_id: &str,
+    contact_wxid: &str,
+    prev_version: i32,
+) -> Document {
+    doc! {
+        "workspace_id": workspace_id,
+        "account_id": account_id,
+        "contact_wxid": contact_wxid,
+        "memory_card_version": prev_version,
+    }
+}
+
 pub(crate) async fn load_or_create_operating_memory(
     state: &AppState,
     contact: &Contact,
@@ -617,30 +636,31 @@ pub(crate) async fn load_or_create_operating_memory(
             let seeded = memory_card_from_contact(contact, &memory);
             if memory_card_has_signal(&seeded) {
                 let updated_at = DateTime::now();
+                let prev_version = memory.memory_card_version;
+                let next_version = next_memory_card_version(&memory);
                 // task 6.3：typed-only 路径。compact 在 typed 域完成，
                 // `extra.version` 注入后通过 `bson::to_document` 一次性序列化
                 // 落库；不再保留 typed/Document 双轨表示。
                 let mut compact = compact_memory_card(&seeded);
-                memory.memory_card_version = next_memory_card_version(&memory);
-                compact
-                    .extra
-                    .insert("version", memory.memory_card_version);
+                compact.extra.insert("version", next_version);
                 let compact_doc = to_document(&compact).unwrap_or_default();
-                memory.memory_card = compact;
-                memory.memory_card_updated_at = Some(updated_at);
-                state
+                // P1-5：OCC 写入。filter 锁定 prev_version，并发 tick 中只能有
+                // 一个 writer 命中；输的那一方 modified_count==0，重读 memory
+                // 走"对方已写入" 路径，避免 last-write-wins 覆盖。
+                let res = state
                     .db
                     .operating_memories()
                     .update_one(
-                        doc! {
-                            "workspace_id": &contact.workspace_id,
-                            "account_id": &contact.account_id,
-                            "contact_wxid": &contact.wxid
-                        },
+                        occ_memory_filter(
+                            &contact.workspace_id,
+                            &contact.account_id,
+                            &contact.wxid,
+                            prev_version,
+                        ),
                         doc! {
                             "$set": {
                                 "memory_card": compact_doc,
-                                "memory_card_version": memory.memory_card_version,
+                                "memory_card_version": next_version,
                                 "memory_card_updated_at": updated_at,
                                 "updated_at": updated_at
                             }
@@ -648,6 +668,28 @@ pub(crate) async fn load_or_create_operating_memory(
                         None,
                     )
                     .await?;
+                if res.modified_count == 1 {
+                    memory.memory_card_version = next_version;
+                    memory.memory_card = compact;
+                    memory.memory_card_updated_at = Some(updated_at);
+                } else {
+                    // 输给并发 writer：重读最新版本，让上层吃最新 memory。
+                    if let Some(latest) = state
+                        .db
+                        .operating_memories()
+                        .find_one(
+                            doc! {
+                                "workspace_id": &contact.workspace_id,
+                                "account_id": &contact.account_id,
+                                "contact_wxid": &contact.wxid
+                            },
+                            None,
+                        )
+                        .await?
+                    {
+                        memory = latest;
+                    }
+                }
             }
         }
         return Ok(memory);
@@ -818,6 +860,7 @@ async fn consolidate_contact_memory_inner(
     }
     if candidates.is_empty() {
         if let Some(task_id) = task_id {
+            crate::models::assert_agent_task_status_valid("sent");
             state
                 .db
                 .tasks()
@@ -991,15 +1034,22 @@ async fn consolidate_contact_memory_inner(
         .extra
         .insert("source", "memory_consolidator_agent");
     let compact_doc = to_document(&compact).unwrap_or_default();
-    state
+    // P1-5：OCC 写入。consolidator 路径与 load_or_create 的 seeding 路径
+    // 共享同一份 OperatingMemory，并发 tick（如 webhook 入站 reload + 后台
+    // memory_consolidation 任务并发）都会 read-modify-write memory_card_version。
+    // 用 prev version 作 filter 让落败的 writer 走 stale 分支，重读后再决定
+    // 是否值得整理（最常见情况：对方已经写入新版，本次跳过落库即可）。
+    let prev_version = memory.memory_card_version;
+    let res = state
         .db
         .operating_memories()
         .update_one(
-            doc! {
-                "workspace_id": &contact.workspace_id,
-                "account_id": &contact.account_id,
-                "contact_wxid": &contact.wxid
-            },
+            occ_memory_filter(
+                &contact.workspace_id,
+                &contact.account_id,
+                &contact.wxid,
+                prev_version,
+            ),
             doc! {
                 "$set": {
                     "memory_card": compact_doc,
@@ -1011,6 +1061,31 @@ async fn consolidate_contact_memory_inner(
             None,
         )
         .await?;
+    if res.modified_count == 0 {
+        // 输给并发 writer：候选还停在 pending（不 mark consolidated），
+        // 下个 tick 由对方或本 tick 自然重跑；事件 + task 状态仍走原路径，
+        // 避免 candidate 被吞但 memory_card 未更新的撕裂状态。
+        tracing::warn!(
+            workspace_id = %contact.workspace_id,
+            contact_wxid = %contact.wxid,
+            prev_version,
+            next_version,
+            "memory_card OCC lost race; skipping consolidation persist"
+        );
+        if let Some(task_id) = task_id {
+            crate::models::assert_agent_task_status_valid("retry");
+            state
+                .db
+                .tasks()
+                .update_one(
+                    doc! { "_id": task_id },
+                    doc! { "$set": { "status": "retry", "gateway_status": "memory_card_occ_conflict", "updated_at": DateTime::now() } },
+                    None,
+                )
+                .await?;
+        }
+        return Ok(());
+    }
     if !candidate_ids.is_empty() {
         state
             .db
@@ -1039,6 +1114,7 @@ async fn consolidate_contact_memory_inner(
     )
     .await?;
     if let Some(task_id) = task_id {
+        crate::models::assert_agent_task_status_valid("sent");
         state
             .db
             .tasks()
@@ -1649,5 +1725,78 @@ mod a6_tests {
     fn operator_memory_empty_yields_empty_segment() {
         let segment = format_operator_memory_for_reply_prompt(&[]);
         assert!(segment.is_empty());
+    }
+}
+
+/// P1-5：OCC filter / version 推进的纯单元覆盖。DB 真集成在
+/// tests/ 下另起 #[ignore] 集成测试（needs Docker），单元层先把 filter
+/// 形状和版本递推不变量锁住。
+#[cfg(test)]
+mod p1_5_occ_tests {
+    use super::{next_memory_card_version, occ_memory_filter};
+    use crate::models::{MemoryCardTyped, OperatingMemory};
+    use mongodb::bson::{DateTime, Document};
+
+    fn empty_memory(version: i32) -> OperatingMemory {
+        OperatingMemory {
+            id: None,
+            workspace_id: "ws".to_string(),
+            account_id: "acct".to_string(),
+            contact_wxid: "u_a".to_string(),
+            user_understanding: Document::new(),
+            relationship_state: Document::new(),
+            product_fit: Document::new(),
+            next_action: Document::new(),
+            context_pack: Document::new(),
+            context_pack_version: 0,
+            context_pack_updated_at: None,
+            memory_card: MemoryCardTyped::default(),
+            memory_card_version: version,
+            memory_card_updated_at: None,
+            created_at: DateTime::from_millis(0),
+            updated_at: DateTime::from_millis(0),
+        }
+    }
+
+    #[test]
+    fn occ_filter_includes_version_predicate() {
+        let f = occ_memory_filter("ws", "acct", "u_a", 7);
+        assert_eq!(f.get_str("workspace_id").unwrap(), "ws");
+        assert_eq!(f.get_str("account_id").unwrap(), "acct");
+        assert_eq!(f.get_str("contact_wxid").unwrap(), "u_a");
+        assert_eq!(f.get_i32("memory_card_version").unwrap(), 7);
+    }
+
+    #[test]
+    fn occ_filter_distinct_for_distinct_versions() {
+        // 不同 prev_version 必须产生不同 filter——OCC 的核心不变量。
+        let a = occ_memory_filter("ws", "acct", "u_a", 0);
+        let b = occ_memory_filter("ws", "acct", "u_a", 1);
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn next_version_advances_by_one() {
+        assert_eq!(next_memory_card_version(&empty_memory(0)), 1);
+        assert_eq!(next_memory_card_version(&empty_memory(41)), 42);
+    }
+
+    #[test]
+    fn next_version_saturates_at_i32_max() {
+        // 不应 panic / 翻负——i32::MAX 后停在 i32::MAX，OCC filter 永远命不中
+        // （version 不再变化），等价"该 contact 已耗尽版本空间"——可观测、可治理。
+        let pinned = empty_memory(i32::MAX);
+        assert_eq!(next_memory_card_version(&pinned), i32::MAX);
+    }
+
+    /// OCC filter 在 (ws, acct, contact, version) 任一维度变化时必须
+    /// 区分。这是"并发 writer 看不见对方写完的版本"的最小数学保证。
+    #[test]
+    fn occ_filter_segregates_by_each_key() {
+        let base = occ_memory_filter("ws", "acct", "u_a", 0);
+        assert_ne!(base, occ_memory_filter("ws2", "acct", "u_a", 0));
+        assert_ne!(base, occ_memory_filter("ws", "acct2", "u_a", 0));
+        assert_ne!(base, occ_memory_filter("ws", "acct", "u_b", 0));
+        assert_ne!(base, occ_memory_filter("ws", "acct", "u_a", 1));
     }
 }

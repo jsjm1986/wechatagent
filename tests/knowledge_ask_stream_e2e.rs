@@ -82,6 +82,7 @@ fn step_tool(ev: &TraceEvent) -> Option<String> {
             .get("tool")
             .and_then(|v| v.as_str())
             .map(str::to_string),
+        TraceEvent::Token { .. } => None,
         TraceEvent::Final { .. } => None,
     }
 }
@@ -98,6 +99,17 @@ async fn drain(rx: &mut mpsc::UnboundedReceiver<TraceEvent>) -> (Vec<TraceEvent>
         events.push(ev);
     }
     (events, final_answer)
+}
+
+/// 把所有 [`TraceEvent::Token`] 的 delta 拼成一整串（前端实际渲染的增量正文）。
+fn concat_tokens(events: &[TraceEvent]) -> String {
+    events
+        .iter()
+        .filter_map(|ev| match ev {
+            TraceEvent::Token { delta } => Some(delta.as_str()),
+            _ => None,
+        })
+        .collect()
 }
 
 /// 场景 1：正常路径 — Step(list_catalog) → Step(open_chunk) → Step(answer) → Final。
@@ -234,6 +246,7 @@ async fn stream_emits_truncated_when_llm_never_emits_answer() {
         .rev()
         .find_map(|ev| match ev {
             TraceEvent::Step { payload } => Some(payload),
+            TraceEvent::Token { .. } => None,
             TraceEvent::Final { .. } => None,
         })
         .expect("应至少有一条 Step");
@@ -293,6 +306,7 @@ async fn stream_emits_cancelled_when_cancel_flag_set_before_loop() {
                 .get("tool")
                 .and_then(|v| v.as_str())
                 .map(str::to_string),
+            TraceEvent::Token { .. } => None,
             TraceEvent::Final { .. } => None,
         })
         .collect();
@@ -309,5 +323,91 @@ async fn stream_emits_cancelled_when_cancel_flag_set_before_loop() {
             assert!(answer.truncated, "Final.answer.truncated 必须 true");
         }
         _ => panic!("最后一条事件必须是 Final"),
+    }
+}
+
+/// 场景 5（P1-3 真流式断言）：answer 轮必须通过 [`TraceEvent::Token`] 把**解码后的
+/// 答案正文**逐段推出，且拼接结果恰好等于最终 `AnswerResult.answer`——不多 JSON 语法、
+/// 不少正文字符。这是"真上游 SSE → AnswerStreamer 抽取顶层 answer 字段"链路的守门：
+/// TestLlmGenerator 的默认 `generate_json_streaming` 把整段答案 JSON 作为一个 raw
+/// 片段推入，下游 AnswerStreamer 解码出 answer 正文 → 至少 1 个非空 Token。
+///
+/// 关键不变量：
+///   1. answer 轮至少产 1 个 Token（正文非空时）；
+///   2. 所有 Token delta 拼接 == Final.answer（前端增量渲染 == 最终答案）；
+///   3. 工具轮（open_chunk / list_catalog）不产 Token（无 answer 字段）。
+#[tokio::test]
+#[ignore]
+async fn stream_emits_decoded_answer_tokens_matching_final() {
+    let app = TestApp::start().await;
+
+    let chunk = verified_chunk(
+        "三步价格异议处理",
+        "Step1 共情；Step2 说价值；Step3 给方案。",
+    );
+    let chunk_hex = chunk.id.expect("oid").to_hex();
+    insert(&app, &[chunk]).await;
+
+    // 第 1 轮 open_chunk（工具轮，无 answer 字段 → 0 Token）；
+    // 第 2 轮 answer（含中文正文 → 解码出 Token）。
+    app.llm.push_response(json!({
+        "action": "open_chunk",
+        "ids": [chunk_hex.clone()],
+    }));
+    let final_text = "三步：共情 → 说价值 → 给方案。";
+    app.llm.push_response(json!({
+        "action": "answer",
+        "answer": final_text,
+        "citedChunkIds": [chunk_hex.clone()],
+        "sourceQuotes": [{
+            "chunkId": chunk_hex.clone(),
+            "quote": "Step1 共情；Step2 说价值；Step3 给方案。",
+            "sourceAnchorIndex": null,
+        }],
+    }));
+
+    let (tx, mut rx) = mpsc::unbounded_channel::<TraceEvent>();
+    let result = answer_streaming(&app.state, req("价格异议怎么处理"), tx, None)
+        .await
+        .expect("answer_streaming");
+
+    let (events, final_answer) = drain(&mut rx).await;
+
+    // 至少 1 个 Token 事件。
+    let token_count = events
+        .iter()
+        .filter(|ev| matches!(ev, TraceEvent::Token { .. }))
+        .count();
+    assert!(
+        token_count >= 1,
+        "answer 轮正文非空时必须至少产 1 个 Token，实际 {token_count}",
+    );
+
+    // 拼接的 Token == 最终答案 == Final.answer。
+    let streamed = concat_tokens(&events);
+    assert_eq!(
+        streamed, result.answer,
+        "Token 拼接必须等于 AnswerResult.answer（不漏字 / 不混入 JSON 语法）",
+    );
+    assert_eq!(
+        Some(streamed.as_str()),
+        final_answer.as_deref(),
+        "Token 拼接必须等于 Final.answer",
+    );
+    assert_eq!(result.answer, final_text, "最终答案应为模型给的正文");
+
+    // 末尾必须是 Final，且 Final 在所有 Token 之后（增量先于终帧）。
+    assert!(
+        matches!(events.last(), Some(TraceEvent::Final { .. })),
+        "最后一条事件必须是 Final",
+    );
+    let last_token_idx = events
+        .iter()
+        .rposition(|ev| matches!(ev, TraceEvent::Token { .. }));
+    let final_idx = events
+        .iter()
+        .rposition(|ev| matches!(ev, TraceEvent::Final { .. }));
+    if let (Some(lt), Some(f)) = (last_token_idx, final_idx) {
+        assert!(lt < f, "所有 Token 必须在 Final 之前");
     }
 }

@@ -1,12 +1,13 @@
 //! 用户运营模拟路由：影子对话和场景化评估。
 
-use axum::{extract::State, Json};
+use axum::{extract::State, Extension, Json};
 use mongodb::bson::{doc, Document};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::{
     agent,
+    auth::AuthenticatedAdmin,
     error::{AppError, AppResult},
 };
 
@@ -35,9 +36,10 @@ pub(super) struct UserOperationEvaluationRequest {
 
 pub(super) async fn simulate_user_operation_dialogue(
     State(state): State<AppState>,
+    Extension(admin): Extension<AuthenticatedAdmin>,
     Json(payload): Json<UserDialogueSimulationRequest>,
 ) -> AppResult<Json<Value>> {
-    validate_account(&state, &payload.account_id).await?;
+    validate_account(&state, &admin.current_workspace, &payload.account_id).await?;
     if payload.apply_memory {
         return Err(AppError::BadRequest(
             "shadow simulation cannot apply memory yet".to_string(),
@@ -53,7 +55,7 @@ pub(super) async fn simulate_user_operation_dialogue(
     if messages.is_empty() {
         return Err(AppError::BadRequest("messages are required".to_string()));
     }
-    let contact = find_contact_by_id(&state, &payload.contact_id).await?;
+    let contact = find_contact_by_id(&state, &admin.current_workspace, &payload.contact_id).await?;
     if contact.account_id != payload.account_id {
         return Err(AppError::BadRequest(
             "contact does not belong to account".to_string(),
@@ -69,10 +71,11 @@ pub(super) async fn simulate_user_operation_dialogue(
 
 pub(super) async fn run_user_operation_evaluation(
     State(state): State<AppState>,
+    Extension(admin): Extension<AuthenticatedAdmin>,
     Json(payload): Json<UserOperationEvaluationRequest>,
 ) -> AppResult<Json<Value>> {
-    validate_account(&state, &payload.account_id).await?;
-    let contact = find_contact_by_id(&state, &payload.contact_id).await?;
+    validate_account(&state, &admin.current_workspace, &payload.account_id).await?;
+    let contact = find_contact_by_id(&state, &admin.current_workspace, &payload.contact_id).await?;
     if contact.account_id != payload.account_id {
         return Err(AppError::BadRequest(
             "contact does not belong to account".to_string(),

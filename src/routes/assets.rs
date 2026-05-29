@@ -2,7 +2,7 @@
 
 use axum::{
     extract::{Query, State},
-    Json,
+    Extension, Json,
 };
 use futures::TryStreamExt;
 use mongodb::{
@@ -13,6 +13,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::{
+    auth::AuthenticatedAdmin,
     error::{AppError, AppResult},
     models::ContentAsset,
 };
@@ -42,9 +43,10 @@ pub(super) struct ContentAssetRequest {
 
 pub(super) async fn list_content_assets(
     State(state): State<AppState>,
+    Extension(admin): Extension<AuthenticatedAdmin>,
     Query(query): Query<ContentAssetQuery>,
 ) -> AppResult<Json<Value>> {
-    let mut filter = doc! { "workspace_id": &state.config.default_workspace_id };
+    let mut filter = doc! { "workspace_id": &admin.current_workspace };
     if let Some(account_id) = query.account_id {
         filter.insert(
             "$or",
@@ -91,6 +93,7 @@ pub(super) async fn list_content_assets(
 
 pub(super) async fn create_content_asset(
     State(state): State<AppState>,
+    Extension(admin): Extension<AuthenticatedAdmin>,
     Json(payload): Json<ContentAssetRequest>,
 ) -> AppResult<Json<Value>> {
     if payload.kind.trim().is_empty() || payload.title.trim().is_empty() {
@@ -100,7 +103,7 @@ pub(super) async fn create_content_asset(
     }
     let asset = ContentAsset {
         id: None,
-        workspace_id: state.config.default_workspace_id.clone(),
+        workspace_id: admin.current_workspace.clone(),
         account_id: payload.account_id,
         kind: payload.kind,
         title: payload.title,

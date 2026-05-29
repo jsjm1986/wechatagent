@@ -346,5 +346,5 @@ idempotency key 形如 `sha256(source_event_id:contact_wxid:content_hash)`
 - [ ] 触发 reviewer_misjudge 后 `operation_knowledge_chunks` 出现
       `chunk_type=negative_example, integrity_status=needs_review` 一条，admin 路径可复核
 - [ ] `agent_send_outbox` 三轮 pending→sent；status 不出现 "failed" / "queued"
-- [ ] `scripts/check-baseline.sh` 通过（cargo test --lib ≥ 78 + 4 PBT 累计 ≥ 33 不回归）
+- [ ] `scripts/check-baseline.sh` 通过（cargo test --lib ≥ 350 + 4 PBT 累计 ≥ 33 不回归，PBT 集合见脚本 `LIB_BASELINE` / `PBT_BASELINE`）
 - [ ] `scripts/check-no-human-takeover.sh` 通过（新增字面量不命中禁词）

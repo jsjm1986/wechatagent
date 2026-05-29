@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use tokio::time::sleep;
 
-use crate::knowledge_wiki::{gap_signals, lessons_learned};
+use crate::knowledge_wiki::{gap_signals, lessons_learned, reviewer_stats};
 use crate::routes::AppState;
 
 /// 反馈 worker 主循环。`interval_secs == 0` 直接 return。
@@ -87,6 +87,25 @@ async fn run_one_round(state: &AppState) -> anyhow::Result<()> {
             }
             Err(err) => {
                 tracing::warn!(workspace_id = %ws, ?err, "lessons_learned aggregate failed");
+            }
+        }
+        // Phase C / C1：reviewer 度量层聚合（14d 滑窗）。同样纯 mongo count +
+        // upsert，廉价；汇总 reviewer 通过率 / 误判率，供 admin 面板与 C2
+        // negative_example 候选挑选参考。
+        match reviewer_stats::aggregate_reviewer_stats_for_workspace(state, &ws, 14).await {
+            Ok(report) => {
+                if report.considered > 0 {
+                    tracing::info!(
+                        workspace_id = %ws,
+                        considered = report.considered,
+                        approved = report.approved,
+                        misjudge = report.approved_but_user_negative,
+                        "reviewer_stats aggregate done"
+                    );
+                }
+            }
+            Err(err) => {
+                tracing::warn!(workspace_id = %ws, ?err, "reviewer_stats aggregate failed");
             }
         }
     }

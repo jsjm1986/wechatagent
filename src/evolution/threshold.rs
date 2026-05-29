@@ -123,6 +123,9 @@ pub async fn generate(
 
     // 2. 算每 gate 的命中率与候选方向。
     let cooldown_skipped = load_gate_cooldowns(state, &workspace_id, &account_id).await?;
+    // #155(P1)：候选的 current_value 必须基于当前生效 override，而非硬编码占位。
+    let active_overrides =
+        load_active_threshold_overrides(state, &workspace_id, &account_id).await?;
     let now = DateTime::now();
 
     #[derive(Debug)]
@@ -145,7 +148,10 @@ pub async fn generate(
             // 已在目标区间，不产候选。
             continue;
         }
-        let current_value = current_threshold_value(state, gate);
+        let current_value = active_overrides
+            .get(*gate)
+            .copied()
+            .unwrap_or_else(|| default_threshold_value(state, gate));
         let step = if *gate == "planner_block_rate_threshold" {
             PLANNER_BLOCK_RATE_STEP
         } else {
@@ -282,10 +288,10 @@ async fn load_gate_cooldowns(
     Ok(set)
 }
 
-/// 当前生效的 gate 阈值——M4 W2 阶段优先读 AppConfig 的相关字段；W4 task 5.1
-/// 引入 `resolve_thresholds` 中央读路径后改为读 threshold_overrides 兜底。
-/// 这里是占位实现，避免 W2 强行依赖 W4 还未落地的 helper。
-fn current_threshold_value(state: &AppState, gate: &str) -> f64 {
+/// 静态默认阈值——当 `threshold_overrides` 里某 gate 还没有任何生效覆盖时的
+/// baseline。与 `agent::runtime::ResolvedThresholds::baseline` 的 AppConfig 默认
+/// 保持同源（5 闸默认值见 CLAUDE.md 硬规则）。
+fn default_threshold_value(state: &AppState, gate: &str) -> f64 {
     match gate {
         "fact_risk_block" => 6.0,
         "pressure_risk_block" => 7.0,
@@ -295,6 +301,42 @@ fn current_threshold_value(state: &AppState, gate: &str) -> f64 {
         "planner_block_rate_threshold" => state.config.strategic_planner_block_rate_threshold,
         _ => 0.0,
     }
+}
+
+/// #155(P1)：读取当前生效的 `threshold_overrides`（per gate_key 最新且未 rollback）。
+///
+/// 旧实现 `current_threshold_value` 是硬编码占位，完全忽略已 release 的 override，
+/// 导致下一轮候选从过期的 baseline 起步、且 audit 的 `previous_value` 是错的
+/// （与 #152 反向显著性门配套——放松提案必须基于真实当前值才能判定方向）。
+/// 这里复用 `resolve_thresholds` 的 override 读取语义（`rolled_back_at=null` +
+/// `released_at desc` 去重），但工作在 workspace/account 维度（演化器 tick 无
+/// `Contact` 上下文，不能直接调 `resolve_thresholds`）。
+async fn load_active_threshold_overrides(
+    state: &AppState,
+    workspace_id: &str,
+    account_id: &str,
+) -> Result<HashMap<String, f64>, EvolutionError> {
+    let mut cursor = state
+        .db
+        .threshold_overrides()
+        .find(
+            doc! {
+                "workspace_id": workspace_id,
+                "account_id": account_id,
+                "rolled_back_at": null,
+            },
+            FindOptions::builder()
+                .sort(doc! { "released_at": -1 })
+                .build(),
+        )
+        .await
+        .map_err(EvolutionError::from)?;
+    let mut out: HashMap<String, f64> = HashMap::new();
+    while let Some(o) = cursor.try_next().await.map_err(EvolutionError::from)? {
+        // 首见即最新（已按 released_at desc 排序），后续同 gate 跳过。
+        out.entry(o.gate_key).or_insert(o.value);
+    }
+    Ok(out)
 }
 
 /// 纯函数版本：给定 gate 名 / 当前阈值 / 命中率 / 区间，返回（建议值, 是否被 clamp）。

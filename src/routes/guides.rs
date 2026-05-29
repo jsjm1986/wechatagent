@@ -1,12 +1,13 @@
 //! 用户运营引导路由：自然语言指令转配置预览与确认应用。
 
-use axum::{extract::State, Json};
+use axum::{extract::State, Extension, Json};
 use mongodb::bson::{doc, DateTime, Document};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::{
     agent,
+    auth::AuthenticatedAdmin,
     error::{AppError, AppResult},
     models::{ApiContact, UserOperationGuidePreview},
 };
@@ -31,13 +32,14 @@ pub(super) struct GuideApplyRequest {
 
 pub(super) async fn preview_user_operation_guide(
     State(state): State<AppState>,
+    Extension(admin): Extension<AuthenticatedAdmin>,
     Json(payload): Json<GuidePreviewRequest>,
 ) -> AppResult<Json<Value>> {
     if payload.instruction.trim().is_empty() {
         return Err(AppError::BadRequest("instruction is required".to_string()));
     }
-    validate_account(&state, &payload.account_id).await?;
-    let contact = find_contact_by_id(&state, &payload.contact_id).await?;
+    validate_account(&state, &admin.current_workspace, &payload.account_id).await?;
+    let contact = find_contact_by_id(&state, &admin.current_workspace, &payload.contact_id).await?;
     if contact.account_id != payload.account_id {
         return Err(AppError::BadRequest(
             "contact does not belong to account".to_string(),
@@ -83,7 +85,7 @@ pub(super) async fn preview_user_operation_guide(
     let risk_warnings = json_string_vec_any(&generated, &["riskWarnings", "risk_warnings"]);
     let preview = UserOperationGuidePreview {
         id: None,
-        workspace_id: state.config.default_workspace_id.clone(),
+        workspace_id: admin.current_workspace.clone(),
         account_id: payload.account_id,
         contact_id: contact
             .id
@@ -122,13 +124,17 @@ pub(super) async fn preview_user_operation_guide(
 
 pub(super) async fn apply_user_operation_guide(
     State(state): State<AppState>,
+    Extension(admin): Extension<AuthenticatedAdmin>,
     Json(payload): Json<GuideApplyRequest>,
 ) -> AppResult<Json<Value>> {
     let preview_id = parse_object_id(&payload.preview_id)?;
     let preview = state
         .db
         .user_operation_guide_previews()
-        .find_one(doc! { "_id": preview_id }, None)
+        .find_one(
+            doc! { "_id": preview_id, "workspace_id": &admin.current_workspace },
+            None,
+        )
         .await?
         .ok_or_else(|| AppError::NotFound("guide preview not found".to_string()))?;
     if preview.status != "pending" {
@@ -152,7 +158,7 @@ pub(super) async fn apply_user_operation_guide(
     apply_contact_changes(&state, &contact, &preview.suggested_changes).await?;
     apply_memory_changes(&state, &contact, &preview.suggested_changes).await?;
     apply_playbook_changes(&state, &contact, &preview.suggested_changes).await?;
-    apply_domain_changes(&state, &preview.suggested_changes).await?;
+    apply_domain_changes(&state, &admin.current_workspace, &preview.suggested_changes).await?;
     state
         .db
         .user_operation_guide_previews()
@@ -183,6 +189,7 @@ pub(super) async fn apply_user_operation_guide(
                     "suggestedChanges": preview.suggested_changes
                 }),
                 created_at: DateTime::now(),
+                dedupe_key: None,
             },
             None,
         )

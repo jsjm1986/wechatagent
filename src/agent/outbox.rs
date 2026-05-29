@@ -29,6 +29,8 @@ use crate::error::{AppError, AppResult};
 use crate::models::{AgentEvent, OutboxEntry};
 use crate::routes::AppState;
 
+use super::run_envelope::SOURCE_KIND_MANUAL_SEND;
+
 // ── 状态枚举 ────────────────────────────────────────────────────────────
 
 /// `agent_send_outbox.status` 合法取值（design.md §3.2 / R13.5 / R13.10）。
@@ -43,7 +45,7 @@ pub enum OutboxStatus {
     InFlight,
     /// MCP 发送成功并落 `sent_at`。
     Sent,
-    /// 重试上限耗尽（`attempt >= max_attempts`），需要人工介入查 `last_error`。
+    /// 重试上限耗尽（`attempt >= max_attempts`），需要 admin 在后台查 `last_error`。
     FailedTerminal,
     /// 用户拒绝 / cooldown / 30min 陈旧 / 后台手动取消。
     Canceled,
@@ -174,10 +176,21 @@ pub async fn enqueue(state: &AppState, req: EnqueueRequest) -> Result<EnqueueOut
     // 空 source_event_id（典型场景：跟进任务 follow-up，没有入站消息触发）
     // SHALL 走 synthetic 前缀，让 idempotency_key 仍能唯一约束"同一 run +
     // 同一 contact + 同一 content 不重复发送"。
+    //
+    // P1-4：manual_send 路径每次点击都会拿到全新 run_id，若仍把 run_id 拌进
+    // synthetic key，admin 双击发送同一内容时 idempotency_key 不冲突，会真发
+    // 两次。manual_send 视语义是"内容级幂等"——同 contact + 同 content 在
+    // 24h 内只发一次（足以避免双击 + 不挡明天的合理重发）。其他 source_kind
+    // 仍用 run_id 兜底，保持既有契约。
+    let day_bucket = now.timestamp_millis() / (24 * 60 * 60 * 1000);
     let (idempotency_key, used_synthetic) = if req.source_event_id.trim().is_empty() {
-        let key = format!(
-            "synthetic:{}:{}:{}",
-            req.run_id, req.contact_wxid, content_hash
+        let key = compute_synthetic_key(
+            &req.source_kind,
+            &req.account_id,
+            &req.contact_wxid,
+            &req.run_id,
+            &content_hash,
+            day_bucket,
         );
         (sha256_hex(key.as_bytes()), true)
     } else {
@@ -236,6 +249,7 @@ pub async fn enqueue(state: &AppState, req: EnqueueRequest) -> Result<EnqueueOut
         next_retry_at: None,
         worker_id: None,
         locked_until: None,
+        reclaimed_in_flight: false,
         created_at: now,
         updated_at: now,
         sent_at: None,
@@ -345,6 +359,7 @@ pub(crate) async fn write_outbox_event(
                 summary: summary.to_string(),
                 details,
                 created_at: DateTime::now(),
+                dedupe_key: None,
             },
             None,
         )
@@ -353,6 +368,30 @@ pub(crate) async fn write_outbox_event(
 }
 
 // ── 纯函数 helpers（W4 task 5.3 / 5.4 — 与 dispatcher 共用，提前抽出便于单测）──
+
+/// P1-4：synthetic idempotency key 计算（与 [`enqueue`] 保持等价）。
+///
+/// 对 `manual_send`（admin 主动 UI 触发）：只锚定 `account + contact + content + day_bucket`,
+/// 摘掉 `run_id`，使得双击同样内容当天去重；次日同样内容是合理重发。
+///
+/// 其他 source_kind 走旧契约：`synthetic:run_id:contact_wxid:content_hash`，
+/// 保持下游 dispatcher 已有审计语义。
+pub(crate) fn compute_synthetic_key(
+    source_kind: &str,
+    account_id: &str,
+    contact_wxid: &str,
+    run_id: &str,
+    content_hash: &str,
+    day_bucket: i64,
+) -> String {
+    if source_kind == SOURCE_KIND_MANUAL_SEND {
+        format!(
+            "synthetic_manual:{account_id}:{contact_wxid}:{content_hash}:{day_bucket}"
+        )
+    } else {
+        format!("synthetic:{run_id}:{contact_wxid}:{content_hash}")
+    }
+}
 
 /// 重试 backoff 计算（R13.5）。
 ///
@@ -590,6 +629,83 @@ mod tests {
         // 与"非 synthetic 但同样 64-hex"形态对比：DOM 维度上无冲突可能。
         let normal_input = "evt_99:wxid_alice:abcd";
         assert_ne!(hashed, sha256_hex(normal_input.as_bytes()));
+    }
+
+    /// P1-4：`manual_send` 源 SHALL 在 fallback 路径里摘掉 `run_id`，
+    /// 改以 `(account, contact, content, day_bucket)` 锚定，
+    /// 这样 admin 在同一天双击同样内容才会被 idempotency 拦掉。
+    #[test]
+    fn compute_synthetic_key_manual_send_drops_run_id() {
+        let key_a = compute_synthetic_key(
+            SOURCE_KIND_MANUAL_SEND,
+            "acct_1",
+            "wxid_alice",
+            "run_a",
+            "abcd",
+            12345,
+        );
+        let key_b = compute_synthetic_key(
+            SOURCE_KIND_MANUAL_SEND,
+            "acct_1",
+            "wxid_alice",
+            "run_b",
+            "abcd",
+            12345,
+        );
+        assert_eq!(
+            key_a, key_b,
+            "manual_send 路径不依赖 run_id，同一天同样内容必须共享 key"
+        );
+        assert!(key_a.starts_with("synthetic_manual:acct_1:wxid_alice:abcd:"));
+    }
+
+    /// P1-4：跨天同样内容应允许重发，因此 `day_bucket` 必须进 key。
+    #[test]
+    fn compute_synthetic_key_manual_send_segregates_by_day() {
+        let day1 = compute_synthetic_key(
+            SOURCE_KIND_MANUAL_SEND,
+            "acct_1",
+            "wxid_alice",
+            "run_a",
+            "abcd",
+            12345,
+        );
+        let day2 = compute_synthetic_key(
+            SOURCE_KIND_MANUAL_SEND,
+            "acct_1",
+            "wxid_alice",
+            "run_a",
+            "abcd",
+            12346,
+        );
+        assert_ne!(day1, day2, "day_bucket 不同应得到不同 key");
+    }
+
+    /// P1-4：非 `manual_send` 源保留旧契约（`synthetic:run_id:...`），
+    /// 确保 webhook / 任务 worker 的兜底路径未被改动。
+    #[test]
+    fn compute_synthetic_key_non_manual_preserves_run_id_contract() {
+        let key_run_a = compute_synthetic_key(
+            "wechat_inbound",
+            "acct_1",
+            "wxid_alice",
+            "run_a",
+            "abcd",
+            12345,
+        );
+        let key_run_b = compute_synthetic_key(
+            "wechat_inbound",
+            "acct_1",
+            "wxid_alice",
+            "run_b",
+            "abcd",
+            12345,
+        );
+        assert_ne!(
+            key_run_a, key_run_b,
+            "非 manual_send 路径必须保留 run_id 维度，避免改动旧契约"
+        );
+        assert_eq!(key_run_a, "synthetic:run_a:wxid_alice:abcd");
     }
 
     /// R13.10 item 5：相同 `source_event_id` + `contact_wxid` + `content` 在不同

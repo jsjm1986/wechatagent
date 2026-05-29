@@ -25,13 +25,14 @@
 
 use axum::{
     extract::{Path, State},
-    Json,
+    Extension, Json,
 };
 use mongodb::bson::{doc, DateTime, Document};
 use serde_json::{json, Value};
 
 use crate::{
     agent::taxonomy::invalidate_global_taxonomy_cache,
+    auth::AuthenticatedAdmin,
     error::{AppError, AppResult},
     models::{OperationDomainConfig, OperationStatePolicy, TaxonomyEntry},
 };
@@ -43,12 +44,16 @@ use super::AppState;
 
 pub(super) async fn publish_operation_domain_version(
     State(state): State<AppState>,
+    Extension(admin): Extension<AuthenticatedAdmin>,
     Path(id): Path<String>,
 ) -> AppResult<Json<Value>> {
     let object_id = parse_object_id(&id)?;
     let coll = state.db.operation_domain_configs();
     let source = coll
-        .find_one(doc! { "_id": object_id }, None)
+        .find_one(
+            doc! { "_id": object_id, "workspace_id": &admin.current_workspace },
+            None,
+        )
         .await?
         .ok_or_else(|| AppError::NotFound("operation domain config not found".to_string()))?;
 
@@ -103,12 +108,16 @@ pub(super) async fn publish_operation_domain_version(
 
 pub(super) async fn rollout_operation_domain_version(
     State(state): State<AppState>,
+    Extension(admin): Extension<AuthenticatedAdmin>,
     Path(id): Path<String>,
 ) -> AppResult<Json<Value>> {
     let object_id = parse_object_id(&id)?;
     let coll = state.db.operation_domain_configs();
     let target = coll
-        .find_one(doc! { "_id": object_id }, None)
+        .find_one(
+            doc! { "_id": object_id, "workspace_id": &admin.current_workspace },
+            None,
+        )
         .await?
         .ok_or_else(|| AppError::NotFound("operation domain config not found".to_string()))?;
     let now = DateTime::now();
@@ -133,12 +142,16 @@ pub(super) async fn rollout_operation_domain_version(
 
 pub(super) async fn rollback_operation_domain_version(
     State(state): State<AppState>,
+    Extension(admin): Extension<AuthenticatedAdmin>,
     Path(id): Path<String>,
 ) -> AppResult<Json<Value>> {
     let object_id = parse_object_id(&id)?;
     let coll = state.db.operation_domain_configs();
     let target = coll
-        .find_one(doc! { "_id": object_id }, None)
+        .find_one(
+            doc! { "_id": object_id, "workspace_id": &admin.current_workspace },
+            None,
+        )
         .await?
         .ok_or_else(|| AppError::NotFound("operation domain config not found".to_string()))?;
     let prev_version = target.previous_version.ok_or_else(|| {
@@ -186,12 +199,16 @@ pub(super) async fn rollback_operation_domain_version(
 
 pub(super) async fn publish_operation_state_policy_version(
     State(state): State<AppState>,
+    Extension(admin): Extension<AuthenticatedAdmin>,
     Path(id): Path<String>,
 ) -> AppResult<Json<Value>> {
     let object_id = parse_object_id(&id)?;
     let coll = state.db.operation_state_policies();
     let source = coll
-        .find_one(doc! { "_id": object_id }, None)
+        .find_one(
+            doc! { "_id": object_id, "workspace_id": &admin.current_workspace },
+            None,
+        )
         .await?
         .ok_or_else(|| AppError::NotFound("operation state policy not found".to_string()))?;
     let scope = doc! {
@@ -242,12 +259,16 @@ pub(super) async fn publish_operation_state_policy_version(
 
 pub(super) async fn rollout_operation_state_policy_version(
     State(state): State<AppState>,
+    Extension(admin): Extension<AuthenticatedAdmin>,
     Path(id): Path<String>,
 ) -> AppResult<Json<Value>> {
     let object_id = parse_object_id(&id)?;
     let coll = state.db.operation_state_policies();
     let target = coll
-        .find_one(doc! { "_id": object_id }, None)
+        .find_one(
+            doc! { "_id": object_id, "workspace_id": &admin.current_workspace },
+            None,
+        )
         .await?
         .ok_or_else(|| AppError::NotFound("operation state policy not found".to_string()))?;
     let now = DateTime::now();
@@ -273,12 +294,16 @@ pub(super) async fn rollout_operation_state_policy_version(
 
 pub(super) async fn rollback_operation_state_policy_version(
     State(state): State<AppState>,
+    Extension(admin): Extension<AuthenticatedAdmin>,
     Path(id): Path<String>,
 ) -> AppResult<Json<Value>> {
     let object_id = parse_object_id(&id)?;
     let coll = state.db.operation_state_policies();
     let target = coll
-        .find_one(doc! { "_id": object_id }, None)
+        .find_one(
+            doc! { "_id": object_id, "workspace_id": &admin.current_workspace },
+            None,
+        )
         .await?
         .ok_or_else(|| AppError::NotFound("operation state policy not found".to_string()))?;
     let prev_version = target.previous_version.ok_or_else(|| {

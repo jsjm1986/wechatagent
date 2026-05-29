@@ -2,7 +2,7 @@
 
 use axum::{
     extract::{Path, Query, State},
-    Json,
+    Extension, Json,
 };
 use futures::TryStreamExt;
 use mongodb::{
@@ -14,6 +14,7 @@ use serde_json::{json, Value};
 
 use crate::{
     agent,
+    auth::AuthenticatedAdmin,
     error::{AppError, AppResult},
     mcp::{self},
     models::{
@@ -60,13 +61,14 @@ pub(super) struct MemoryCandidateQuery {
 
 pub(super) async fn list_contacts(
     State(state): State<AppState>,
+    Extension(admin): Extension<AuthenticatedAdmin>,
     Query(query): Query<ContactQuery>,
 ) -> AppResult<Json<Value>> {
     let mut filter = doc! {};
     let account_id = query
         .account_id
         .unwrap_or_else(|| state.config.default_account_id.clone());
-    filter.insert("workspace_id", &state.config.default_workspace_id);
+    filter.insert("workspace_id", &admin.current_workspace);
     filter.insert("account_id", &account_id);
     if let Some(status) = query.status {
         if !status.is_empty() {
@@ -75,6 +77,7 @@ pub(super) async fn list_contacts(
     }
     if let Some(q) = query.q {
         if !q.is_empty() {
+            let q = escape_regex_literal(&q);
             filter.insert(
                 "$or",
                 vec![
@@ -112,6 +115,7 @@ pub(super) async fn list_contacts(
 /// 的副作用与契约误解。
 pub(super) async fn search_contacts_endpoint(
     State(state): State<AppState>,
+    Extension(admin): Extension<AuthenticatedAdmin>,
     Json(payload): Json<SearchImportRequest>,
 ) -> AppResult<Json<Value>> {
     if payload.query.trim().is_empty() {
@@ -121,6 +125,7 @@ pub(super) async fn search_contacts_endpoint(
         .account_id
         .clone()
         .unwrap_or_else(|| state.config.default_account_id.clone());
+    validate_account(&state, &admin.current_workspace, &account_id).await?;
     let result = mcp::logged_call_for_account(
         &state,
         &account_id,
@@ -150,12 +155,14 @@ pub(super) async fn search_contacts_endpoint(
 /// - `{ "candidates": [...], "accountId": "..." }`：直接导入前端拿到的候选项。
 pub(super) async fn import_contacts_endpoint(
     State(state): State<AppState>,
+    Extension(admin): Extension<AuthenticatedAdmin>,
     Json(payload): Json<ImportContactsRequest>,
 ) -> AppResult<Json<Value>> {
     let account_id = payload
         .account_id
         .clone()
         .unwrap_or_else(|| state.config.default_account_id.clone());
+    validate_account(&state, &admin.current_workspace, &account_id).await?;
     let candidates: Vec<Value> = if !payload.candidates.is_empty() {
         payload.candidates.clone()
     } else if let Some(query) = payload.query.as_deref().map(str::trim).filter(|q| !q.is_empty()) {
@@ -180,7 +187,8 @@ pub(super) async fn import_contacts_endpoint(
     for item in candidates {
         let contact_value = item.get("contact").unwrap_or(&item);
         if let Some(contact) =
-            upsert_contact_from_value(&state, &account_id, contact_value).await?
+            upsert_contact_from_value(&state, &admin.current_workspace, &account_id, contact_value)
+                .await?
         {
             imported.push(ApiContact::from(contact));
         }
@@ -192,6 +200,7 @@ pub(super) async fn import_contacts_endpoint(
 /// [`search_contacts_endpoint`] / [`import_contacts_endpoint`]。
 pub(super) async fn search_import_contacts(
     State(state): State<AppState>,
+    Extension(admin): Extension<AuthenticatedAdmin>,
     Json(payload): Json<SearchImportRequest>,
 ) -> AppResult<Json<Value>> {
     if payload.query.trim().is_empty() {
@@ -201,6 +210,7 @@ pub(super) async fn search_import_contacts(
         .account_id
         .clone()
         .unwrap_or_else(|| state.config.default_account_id.clone());
+    validate_account(&state, &admin.current_workspace, &account_id).await?;
     let result = mcp::logged_call_for_account(
         &state,
         &account_id,
@@ -220,7 +230,8 @@ pub(super) async fn search_import_contacts(
     for item in items {
         if let Some(contact_value) = item.get("contact") {
             if let Some(contact) =
-                upsert_contact_from_value(&state, &account_id, contact_value).await?
+                upsert_contact_from_value(&state, &admin.current_workspace, &account_id, contact_value)
+                    .await?
             {
                 imported.push(ApiContact::from(contact));
             }
@@ -235,14 +246,16 @@ pub(super) async fn search_import_contacts(
 
 pub(super) async fn get_contact(
     State(state): State<AppState>,
+    Extension(admin): Extension<AuthenticatedAdmin>,
     Path(id): Path<String>,
 ) -> AppResult<Json<Value>> {
-    let contact = find_contact_by_id(&state, &id).await?;
+    let contact = find_contact_by_id(&state, &admin.current_workspace, &id).await?;
     Ok(Json(json!({ "item": ApiContact::from(contact) })))
 }
 
 pub(super) async fn enable_agent(
     State(state): State<AppState>,
+    Extension(admin): Extension<AuthenticatedAdmin>,
     Path(id): Path<String>,
     Json(payload): Json<EnableAgentRequest>,
 ) -> AppResult<Json<Value>> {
@@ -252,7 +265,7 @@ pub(super) async fn enable_agent(
         ));
     }
     let object_id = parse_object_id(&id)?;
-    let contact = find_contact_by_id(&state, &id).await?;
+    let contact = find_contact_by_id(&state, &admin.current_workspace, &id).await?;
     // P1：先校验 contact.account_id 在 wechat_accounts 注册过。否则即使写 managed
     // 进去，webhook 入站时 resolve_account_context 也会因为 appId 匹配不到这个
     // account 直接 400 拒收，AI 永远不会回复。
@@ -268,9 +281,13 @@ pub(super) async fn enable_agent(
             contact.account_id
         )));
     }
-    let playbook =
-        resolve_playbook_for_contact(&state, &contact.account_id, payload.playbook_id.as_deref())
-            .await?;
+    let playbook = resolve_playbook_for_contact(
+        &state,
+        &admin.current_workspace,
+        &contact.account_id,
+        payload.playbook_id.as_deref(),
+    )
+    .await?;
     let generated = agent::build_initial_operation_profile(
         &state,
         &payload.human_profile_note,
@@ -314,12 +331,13 @@ pub(super) async fn enable_agent(
             None,
         )
         .await?;
-    let contact = find_contact_by_id(&state, &id).await?;
+    let contact = find_contact_by_id(&state, &admin.current_workspace, &id).await?;
     Ok(Json(json!({ "item": ApiContact::from(contact) })))
 }
 
 pub(super) async fn disable_agent(
     State(state): State<AppState>,
+    Extension(admin): Extension<AuthenticatedAdmin>,
     Path(id): Path<String>,
 ) -> AppResult<Json<Value>> {
     let object_id = parse_object_id(&id)?;
@@ -327,7 +345,7 @@ pub(super) async fn disable_agent(
         .db
         .contacts()
         .update_one(
-            doc! { "_id": object_id },
+            doc! { "_id": object_id, "workspace_id": &admin.current_workspace },
             doc! {
                 "$set": {
                     "agent_status": "normal",
@@ -337,17 +355,18 @@ pub(super) async fn disable_agent(
             None,
         )
         .await?;
-    let contact = find_contact_by_id(&state, &id).await?;
+    let contact = find_contact_by_id(&state, &admin.current_workspace, &id).await?;
     Ok(Json(json!({ "item": ApiContact::from(contact) })))
 }
 
 pub(super) async fn update_profile_note(
     State(state): State<AppState>,
+    Extension(admin): Extension<AuthenticatedAdmin>,
     Path(id): Path<String>,
     Json(payload): Json<ProfileNoteRequest>,
 ) -> AppResult<Json<Value>> {
     let object_id = parse_object_id(&id)?;
-    let contact = find_contact_by_id(&state, &id).await?;
+    let contact = find_contact_by_id(&state, &admin.current_workspace, &id).await?;
     let playbook = agent::load_operation_playbook_for_contact(&state, &contact).await?;
     let generated = agent::build_initial_operation_profile(
         &state,
@@ -363,7 +382,7 @@ pub(super) async fn update_profile_note(
         .db
         .contacts()
         .update_one(
-            doc! { "_id": object_id },
+            doc! { "_id": object_id, "workspace_id": &admin.current_workspace },
             doc! {
                 "$set": {
                     "human_profile_note": payload.human_profile_note,
@@ -375,7 +394,7 @@ pub(super) async fn update_profile_note(
                     "commitments": commitments_bson,
                     "follow_up_policy": generated.follow_up_policy,
                     "operation_state": "new_contact",
-                    "operation_state_reason": "根据人工备注重新生成初始运营状态",
+                    "operation_state_reason": "根据 admin 备注重新生成初始运营状态",
                     "operation_state_confidence": 6,
                     "operation_state_updated_at": DateTime::now(),
                     "profile_attributes": generated.profile_attributes,
@@ -389,7 +408,7 @@ pub(super) async fn update_profile_note(
             None,
         )
         .await?;
-    let contact = find_contact_by_id(&state, &id).await?;
+    let contact = find_contact_by_id(&state, &admin.current_workspace, &id).await?;
     Ok(Json(json!({ "item": ApiContact::from(contact) })))
 }
 
@@ -403,6 +422,7 @@ pub(super) async fn update_profile_note(
 /// docs/conversation-mode-design.md）。
 pub(super) async fn update_custom_agent_instructions(
     State(state): State<AppState>,
+    Extension(admin): Extension<AuthenticatedAdmin>,
     Path(id): Path<String>,
     Json(payload): Json<CustomAgentInstructionsRequest>,
 ) -> AppResult<Json<Value>> {
@@ -424,7 +444,7 @@ pub(super) async fn update_custom_agent_instructions(
         .db
         .contacts()
         .update_one(
-            doc! { "_id": object_id },
+            doc! { "_id": object_id, "workspace_id": &admin.current_workspace },
             doc! {
                 "$set": {
                     "custom_agent_instructions": value,
@@ -434,17 +454,18 @@ pub(super) async fn update_custom_agent_instructions(
             None,
         )
         .await?;
-    let contact = find_contact_by_id(&state, &id).await?;
+    let contact = find_contact_by_id(&state, &admin.current_workspace, &id).await?;
     Ok(Json(json!({ "item": ApiContact::from(contact) })))
 }
 
 pub(super) async fn update_operation_profile(
     State(state): State<AppState>,
+    Extension(admin): Extension<AuthenticatedAdmin>,
     Path(id): Path<String>,
     Json(payload): Json<OperationProfileRequest>,
 ) -> AppResult<Json<Value>> {
     let object_id = parse_object_id(&id)?;
-    let current = find_contact_by_id(&state, &id).await?;
+    let current = find_contact_by_id(&state, &admin.current_workspace, &id).await?;
     let new_stage = normalize_optional(payload.customer_stage);
     let prev_stage = current
         .domain_attributes
@@ -472,7 +493,7 @@ pub(super) async fn update_operation_profile(
         .db
         .contacts()
         .update_one(
-            doc! { "_id": object_id },
+            doc! { "_id": object_id, "workspace_id": &admin.current_workspace },
             doc! {
                 "$set": set_doc,
                 "$unset": { "last_commitment": "" }
@@ -480,15 +501,16 @@ pub(super) async fn update_operation_profile(
             None,
         )
         .await?;
-    let contact = find_contact_by_id(&state, &id).await?;
+    let contact = find_contact_by_id(&state, &admin.current_workspace, &id).await?;
     Ok(Json(json!({ "item": ApiContact::from(contact) })))
 }
 
 pub(super) async fn analyze_contact_profile(
     State(state): State<AppState>,
+    Extension(admin): Extension<AuthenticatedAdmin>,
     Path(id): Path<String>,
 ) -> AppResult<Json<Value>> {
-    let contact = find_contact_by_id(&state, &id).await?;
+    let contact = find_contact_by_id(&state, &admin.current_workspace, &id).await?;
     let playbook = agent::load_operation_playbook_for_contact(&state, &contact).await?;
     let note = contact.human_profile_note.clone().unwrap_or_else(|| {
         format!(
@@ -535,25 +557,27 @@ pub(super) async fn analyze_contact_profile(
             None,
         )
         .await?;
-    let updated = find_contact_by_id(&state, &id).await?;
+    let updated = find_contact_by_id(&state, &admin.current_workspace, &id).await?;
     Ok(Json(json!({ "item": ApiContact::from(updated) })))
 }
 
 pub(super) async fn get_operating_memory(
     State(state): State<AppState>,
+    Extension(admin): Extension<AuthenticatedAdmin>,
     Path(id): Path<String>,
 ) -> AppResult<Json<Value>> {
-    let contact = find_contact_by_id(&state, &id).await?;
+    let contact = find_contact_by_id(&state, &admin.current_workspace, &id).await?;
     let memory = ensure_operating_memory(&state, &contact).await?;
     Ok(Json(json!({ "item": operating_memory_json(memory) })))
 }
 
 pub(super) async fn update_operating_memory(
     State(state): State<AppState>,
+    Extension(admin): Extension<AuthenticatedAdmin>,
     Path(id): Path<String>,
     Json(payload): Json<OperatingMemoryRequest>,
 ) -> AppResult<Json<Value>> {
-    let contact = find_contact_by_id(&state, &id).await?;
+    let contact = find_contact_by_id(&state, &admin.current_workspace, &id).await?;
     ensure_operating_memory(&state, &contact).await?;
     state
         .db
@@ -582,9 +606,10 @@ pub(super) async fn update_operating_memory(
 
 pub(super) async fn get_contact_memory_card(
     State(state): State<AppState>,
+    Extension(admin): Extension<AuthenticatedAdmin>,
     Path(id): Path<String>,
 ) -> AppResult<Json<Value>> {
-    let contact = find_contact_by_id(&state, &id).await?;
+    let contact = find_contact_by_id(&state, &admin.current_workspace, &id).await?;
     let memory = ensure_operating_memory(&state, &contact).await?;
     Ok(Json(json!({
         "item": {
@@ -601,10 +626,11 @@ pub(super) async fn get_contact_memory_card(
 
 pub(super) async fn list_contact_memory_candidates(
     State(state): State<AppState>,
+    Extension(admin): Extension<AuthenticatedAdmin>,
     Path(id): Path<String>,
     Query(query): Query<MemoryCandidateQuery>,
 ) -> AppResult<Json<Value>> {
-    let contact = find_contact_by_id(&state, &id).await?;
+    let contact = find_contact_by_id(&state, &admin.current_workspace, &id).await?;
     let mut filter = doc! {
         "workspace_id": &contact.workspace_id,
         "account_id": &contact.account_id,
@@ -633,9 +659,10 @@ pub(super) async fn list_contact_memory_candidates(
 
 pub(super) async fn run_contact_memory_consolidation(
     State(state): State<AppState>,
+    Extension(admin): Extension<AuthenticatedAdmin>,
     Path(id): Path<String>,
 ) -> AppResult<Json<Value>> {
-    let contact = find_contact_by_id(&state, &id).await?;
+    let contact = find_contact_by_id(&state, &admin.current_workspace, &id).await?;
     agent::consolidate_contact_memory(&state, &contact, None).await?;
     let memory = ensure_operating_memory(&state, &contact).await?;
     Ok(Json(
@@ -645,9 +672,10 @@ pub(super) async fn run_contact_memory_consolidation(
 
 pub(super) async fn get_operation_health(
     State(state): State<AppState>,
+    Extension(admin): Extension<AuthenticatedAdmin>,
     Path(id): Path<String>,
 ) -> AppResult<Json<Value>> {
-    let contact = find_contact_by_id(&state, &id).await?;
+    let contact = find_contact_by_id(&state, &admin.current_workspace, &id).await?;
     let memory = ensure_operating_memory(&state, &contact).await?;
     let latest_review = latest_decision_review(&state, &contact).await?;
     Ok(Json(operation_health_json(

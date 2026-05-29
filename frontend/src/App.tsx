@@ -31,6 +31,7 @@ import {
   Package,
   Plus,
   RefreshCw,
+  Rss,
   Scissors,
   Search,
   SendHorizonal,
@@ -763,6 +764,9 @@ export function App() {
   const [busy, setBusy] = useState(false);
   const [commandBusy, setCommandBusy] = useState(false);
   const [error, setError] = useState("");
+
+  // P1-4：登录态后挂一次 WebSocket，进程内所有 ChunkInspectorPane / 锁徽章共享。
+  useChunkEventStream();
 
   const managedCount = useMemo(
     () => contacts.filter((contact) => contact.agentStatus === "managed").length,
@@ -2420,8 +2424,8 @@ function SimulationResult({ turns }: { turns: SimulationTurn[] }) {
             </div>
             <div className="simMetrics">
               <span>网关：{gatewayAllowed ? "通过" : String(turn.gatewayResult?.reason || "拦截")}</span>
-              <span>幻觉风险：{reviewScores.hallucination ?? "-"}</span>
-              <span>知识匹配：{reviewScores.knowledgeGrounding ?? "-"}</span>
+              <span>幻觉风险：{reviewScores.hallucinationScore ?? "-"}</span>
+              <span>知识匹配：{reviewScores.knowledgeGroundingScore ?? "-"}</span>
               <span>真人感：{reviewScores.humanLike ?? "-"}</span>
               <span>知识切片：{selectedChunks}</span>
               <span>状态：{String(turn.stateTransition?.from || "-")} → {String(turn.stateTransition?.to || "-")}</span>
@@ -4041,6 +4045,8 @@ type LlmProviderItem = {
   timeoutSeconds?: number | null;
   maxRetries?: number | null;
   retryBaseMs?: number | null;
+  supportsVision: boolean;
+  isVisionActive: boolean;
   createdAt: number;
   updatedAt: number;
 };
@@ -4068,6 +4074,7 @@ type LlmProviderDraft = {
   timeoutSeconds: string;
   maxRetries: string;
   retryBaseMs: string;
+  supportsVision: boolean;
 };
 
 function emptyLlmProviderDraft(): LlmProviderDraft {
@@ -4081,7 +4088,8 @@ function emptyLlmProviderDraft(): LlmProviderDraft {
     model: "",
     timeoutSeconds: "",
     maxRetries: "",
-    retryBaseMs: ""
+    retryBaseMs: "",
+    supportsVision: false
   };
 }
 
@@ -4096,7 +4104,8 @@ function draftFromItem(item: LlmProviderItem): LlmProviderDraft {
     model: item.model,
     timeoutSeconds: item.timeoutSeconds == null ? "" : String(item.timeoutSeconds),
     maxRetries: item.maxRetries == null ? "" : String(item.maxRetries),
-    retryBaseMs: item.retryBaseMs == null ? "" : String(item.retryBaseMs)
+    retryBaseMs: item.retryBaseMs == null ? "" : String(item.retryBaseMs),
+    supportsVision: Boolean(item.supportsVision)
   };
 }
 
@@ -4151,7 +4160,8 @@ function LlmProvidersView() {
       format: d.format,
       baseUrl: d.baseUrl.trim(),
       apiKey: d.apiKey,
-      model: d.model.trim()
+      model: d.model.trim(),
+      supportsVision: d.supportsVision
     };
     if (d.timeoutSeconds.trim()) {
       const v = Number(d.timeoutSeconds);
@@ -4223,6 +4233,25 @@ function LlmProvidersView() {
       await refetch();
     } catch (err) {
       window.alert(`激活失败：${(err as Error).message}`);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  // #574：指派 / 取消本 workspace 专职视觉模型。要求 supportsVision=true。
+  async function setVisionItem(item: LlmProviderItem, active: boolean) {
+    if (active && !item.supportsVision) {
+      window.alert("该 provider 未勾选「支持图片」，请先在编辑里开启 supportsVision 再指派为视觉模型");
+      return;
+    }
+    setBusy(true);
+    try {
+      await api.post(`/api/admin/llm-providers/${encodeURIComponent(item.providerId)}/vision`, {
+        active
+      });
+      await refetch();
+    } catch (err) {
+      window.alert(`设置视觉模型失败：${(err as Error).message}`);
     } finally {
       setBusy(false);
     }
@@ -4314,6 +4343,8 @@ function LlmProvidersView() {
                 <div className="badges">
                   <span className={`formatBadge ${item.format}`}>{item.format.toUpperCase()}</span>
                   {item.isActive && <span className="activeBadge">已激活</span>}
+                  {item.supportsVision && <span className="visionBadge">支持图片</span>}
+                  {item.isVisionActive && <span className="visionActiveBadge">视觉模型</span>}
                 </div>
               </header>
               <dl>
@@ -4331,6 +4362,26 @@ function LlmProvidersView() {
                 {!item.isActive && (
                   <button className="secondary" onClick={() => void activateItem(item)} disabled={busy}>
                     激活
+                  </button>
+                )}
+                {item.supportsVision && !item.isVisionActive && (
+                  <button
+                    className="secondary"
+                    onClick={() => void setVisionItem(item, true)}
+                    disabled={busy}
+                    title="指派为本 workspace 处理图片的专职视觉模型"
+                  >
+                    设为视觉模型
+                  </button>
+                )}
+                {item.isVisionActive && (
+                  <button
+                    className="secondary"
+                    onClick={() => void setVisionItem(item, false)}
+                    disabled={busy}
+                    title="取消视觉模型指派"
+                  >
+                    取消视觉模型
                   </button>
                 )}
                 <button className="secondary" onClick={() => startEdit(item)} disabled={busy}>
@@ -4504,6 +4555,22 @@ function LlmProvidersView() {
                 placeholder="默认 1500"
               />
             </label>
+          </div>
+
+          <div className="editorSectionTitle">多模态能力</div>
+          <div className="formGrid">
+            <label className="spanFull checkboxRow">
+              <input
+                type="checkbox"
+                checked={draft.supportsVision}
+                onChange={(e) => setDraft({ ...draft, supportsVision: e.target.checked })}
+                disabled={busy}
+              />
+              <span>支持图片输入（multimodal vision）</span>
+            </label>
+            <small className="spanFull">
+              勾选后该模型可识别图片。若文字主模型不支持图片，可单独配置一条支持图片的模型，保存后在卡片上「设为视觉模型」——图片导入会自动路由到该视觉模型；否则图片导入返回 visionNotSupported。
+            </small>
           </div>
 
           <div className="editorFooter">
@@ -5804,7 +5871,7 @@ function ExploreMode() {
 }
 
 function StewardMode() {
-  const [pane, setPane] = useState<"lint" | "review" | "revisions" | "documents" | "import" | "observability" | "tryRecall">("lint");
+  const [pane, setPane] = useState<"lint" | "review" | "revisions" | "documents" | "import" | "ingest" | "observability" | "tryRecall">("lint");
   const [focusedId, setFocusedId] = useState<string | null>(null);
   const [collapsed, setCollapsed] = useState(true);
 
@@ -5865,6 +5932,13 @@ function StewardMode() {
         </button>
         <button
           type="button"
+          className={pane === "ingest" ? "wikiStewardNavBtn active" : "wikiStewardNavBtn"}
+          onClick={() => setPane("ingest")}
+        >
+          <Rss size={14} /> 外部源
+        </button>
+        <button
+          type="button"
           className={pane === "observability" ? "wikiStewardNavBtn active" : "wikiStewardNavBtn"}
           onClick={() => setPane("observability")}
         >
@@ -5884,6 +5958,7 @@ function StewardMode() {
         {pane === "revisions" && <ChunkRevisionsDrawer />}
         {pane === "documents" && <DocumentsView />}
         {pane === "import" && <ImportWizard />}
+        {pane === "ingest" && <IngestSourcesView />}
         {pane === "observability" && <ObservabilityDashboard />}
         {pane === "tryRecall" && <TryRecallView />}
       </div>
@@ -5950,7 +6025,7 @@ function AtlasMode() {
   );
 }
 
-// ── P1 · ChunkGraphView · 关系图谱（SVG 原生力导布局，0 新依赖）──────────
+// ── P1 · ChunkGraphView · 关系图谱（SVG 原生布局，0 新依赖）─────────────
 //
 // 数据：GET /api/operation-knowledge/chunks → 每条 chunk 一个节点。
 // 边来源：
@@ -5958,9 +6033,14 @@ function AtlasMode() {
 //   - supersededBy:  归档链尾 → 现役新版本（隐式 superseded_by）
 //   - previousVersionId: split/merge/rollback 维护的前一版指针
 //
-// 布局：deterministic 极坐标布局——按 wikiType 分扇区，扇区内按 id 哈希排序角度，
-// 半径按"被引用次数 / out-degree" 微调（中心更密=被多次引用的核心 chunk）。
-// 不做 force simulation——避免每帧重排导致的视觉抖动 + 0 依赖红线。
+// 两种布局模式：
+//   1) polar（确定性）：按 wikiType 分扇区，扇区内按 id 哈希分布角度，
+//      半径按"被引用次数" 微调（核心 chunk 向中心收）。0 抖动。
+//   2) force（力导向）：以 polar 为初始解 → 200 步 spring + 排斥力迭代，
+//      时间步逐步降温（dt *= 0.99）。同步算完一次 setLayout，无每帧重排。
+//
+// 颜色：默认按 wikiType；切到"社区"模式时用并查集找连通分量，按 component
+// 索引分配 HSL 等距色环。
 //
 // 交互：节点 click → focusChunk(id)；hover → 浮窗显示 title + wikiType。
 function ChunkGraphView() {
@@ -5969,12 +6049,14 @@ function ChunkGraphView() {
   const [error, setError] = useState<string | null>(null);
   const [hovered, setHovered] = useState<string | null>(null);
   const [filter, setFilter] = useState<string>("all"); // wikiType filter
+  const [layoutMode, setLayoutMode] = useState<"polar" | "force">("polar");
+  const [colorMode, setColorMode] = useState<"wikiType" | "community">("wikiType");
 
   useEffect(() => {
     setLoading(true);
     fetch("/api/operation-knowledge/chunks")
       .then(async (r) => {
-        if (!r.ok) throw new Error(await r.text());
+        if (!r.ok) throw await parseApiError(r);
         return r.json() as Promise<{ items: TreeChunkItem[] }>;
       })
       .then((data) => setItems(data.items ?? []))
@@ -6026,7 +6108,62 @@ function ChunkGraphView() {
     return m;
   }, [visible]);
 
-  // 计算节点 polar 坐标。
+  // 边渲染：按 kind 决定线条样式。
+  type Edge = { from: string; to: string; kind: string };
+  const edges: Edge[] = useMemo(() => {
+    const out: Edge[] = [];
+    const idSet = new Set(visible.map((it) => it.id));
+    for (const it of visible) {
+      if (it.relatedChunks) {
+        for (const r of it.relatedChunks) {
+          if (idSet.has(r.chunk_id)) out.push({ from: it.id, to: r.chunk_id, kind: r.kind });
+        }
+      }
+      if (it.supersededBy && idSet.has(it.supersededBy)) {
+        out.push({ from: it.id, to: it.supersededBy, kind: "superseded_by" });
+      }
+      if (it.previousVersionId && idSet.has(it.previousVersionId)) {
+        out.push({ from: it.id, to: it.previousVersionId, kind: "previous_version" });
+      }
+    }
+    return out;
+  }, [visible]);
+
+  // 社区检测：把节点 + 边喂并查集，输出 nodeId → componentIdx。
+  // 同 component 节点同色（用于"社区染色"模式）。
+  const community = useMemo(() => {
+    const parent = new Map<string, string>();
+    const find = (x: string): string => {
+      let p = parent.get(x) ?? x;
+      if (p === x) return x;
+      const root = find(p);
+      parent.set(x, root);
+      return root;
+    };
+    const union = (a: string, b: string) => {
+      const ra = find(a);
+      const rb = find(b);
+      if (ra !== rb) parent.set(ra, rb);
+    };
+    for (const it of visible) parent.set(it.id, it.id);
+    for (const e of edges) {
+      if (parent.has(e.from) && parent.has(e.to)) union(e.from, e.to);
+    }
+    const idxByRoot = new Map<string, number>();
+    const result = new Map<string, number>();
+    for (const it of visible) {
+      const root = find(it.id);
+      let idx = idxByRoot.get(root);
+      if (idx === undefined) {
+        idx = idxByRoot.size;
+        idxByRoot.set(root, idx);
+      }
+      result.set(it.id, idx);
+    }
+    return { byId: result, count: idxByRoot.size };
+  }, [visible, edges]);
+
+  // 计算节点坐标。layoutMode 决定 polar / force。
   const layout = useMemo(() => {
     const W = 720;
     const H = 560;
@@ -6043,18 +6180,100 @@ function ChunkGraphView() {
       const noise = hash01(it.id);
       const angle = sector * sectorWidth + noise * sectorWidth * 0.92 + sectorWidth * 0.04;
       const deg = inDegree.get(it.id) ?? 0;
-      // 入度越高半径越小（核心 chunk 向内）。
       const radius = 230 - Math.min(deg, 8) * 18;
       positions.set(it.id, {
         x: cx + Math.cos(angle) * radius,
         y: cy + Math.sin(angle) * radius
       });
     }
-    return { positions, W, H, cx, cy };
-  }, [visible, wikiTypes, inDegree]);
 
-  // 颜色：按 wikiType 在 token 色板里 deterministic 选取。
-  const colorFor = (wikiType?: string | null): string => {
+    if (layoutMode === "force" && visible.length > 0) {
+      // 200 步弹簧 + 排斥力迭代。常量在 100-500 节点规模上调过：
+      //   k_spring = 0.06     边 → 拉近
+      //   rest_len = 80       边目标长度
+      //   k_repel  = 1400     节点间 → 推开
+      //   dt0      = 0.5      每步位移系数；逐步退火 dt *= 0.99
+      //   bounds   = 边界回拉，避免节点飞出 viewBox
+      const ids = visible.map((it) => it.id);
+      const adj = new Map<string, Set<string>>();
+      for (const id of ids) adj.set(id, new Set());
+      for (const e of edges) {
+        adj.get(e.from)?.add(e.to);
+        adj.get(e.to)?.add(e.from);
+      }
+      const k_spring = 0.06;
+      const rest_len = 80;
+      const k_repel = 1400;
+      let dt = 0.5;
+      const padding = 40;
+      for (let step = 0; step < 200; step += 1) {
+        const fx = new Map<string, number>();
+        const fy = new Map<string, number>();
+        for (const id of ids) {
+          fx.set(id, 0);
+          fy.set(id, 0);
+        }
+        // 排斥力 O(N²)
+        for (let i = 0; i < ids.length; i += 1) {
+          const a = positions.get(ids[i])!;
+          for (let j = i + 1; j < ids.length; j += 1) {
+            const b = positions.get(ids[j])!;
+            let dx = a.x - b.x;
+            let dy = a.y - b.y;
+            let dist2 = dx * dx + dy * dy;
+            if (dist2 < 1) dist2 = 1;
+            const dist = Math.sqrt(dist2);
+            const force = k_repel / dist2;
+            dx /= dist;
+            dy /= dist;
+            fx.set(ids[i], (fx.get(ids[i]) ?? 0) + dx * force);
+            fy.set(ids[i], (fy.get(ids[i]) ?? 0) + dy * force);
+            fx.set(ids[j], (fx.get(ids[j]) ?? 0) - dx * force);
+            fy.set(ids[j], (fy.get(ids[j]) ?? 0) - dy * force);
+          }
+        }
+        // 弹簧力
+        for (const e of edges) {
+          const a = positions.get(e.from);
+          const b = positions.get(e.to);
+          if (!a || !b) continue;
+          const dx = b.x - a.x;
+          const dy = b.y - a.y;
+          const dist = Math.sqrt(dx * dx + dy * dy) || 1;
+          const f = k_spring * (dist - rest_len);
+          const ux = dx / dist;
+          const uy = dy / dist;
+          fx.set(e.from, (fx.get(e.from) ?? 0) + ux * f);
+          fy.set(e.from, (fy.get(e.from) ?? 0) + uy * f);
+          fx.set(e.to, (fx.get(e.to) ?? 0) - ux * f);
+          fy.set(e.to, (fy.get(e.to) ?? 0) - uy * f);
+        }
+        // 应用位移 + 边界回拉
+        for (const id of ids) {
+          const p = positions.get(id)!;
+          let nx = p.x + (fx.get(id) ?? 0) * dt;
+          let ny = p.y + (fy.get(id) ?? 0) * dt;
+          if (nx < padding) nx = padding;
+          if (nx > W - padding) nx = W - padding;
+          if (ny < padding) ny = padding;
+          if (ny > H - padding) ny = H - padding;
+          positions.set(id, { x: nx, y: ny });
+        }
+        dt *= 0.99;
+      }
+    }
+
+    return { positions, W, H, cx, cy };
+  }, [visible, wikiTypes, inDegree, edges, layoutMode]);
+
+  // 颜色：wikiType 模式按 token 色板；community 模式按 component 索引等距分布 HSL。
+  const colorFor = (it: TreeChunkItem): string => {
+    if (colorMode === "community") {
+      const idx = community.byId.get(it.id) ?? 0;
+      const total = Math.max(community.count, 1);
+      const hue = Math.round((idx * 360) / total);
+      return `hsl(${hue}, 48%, 42%)`;
+    }
     const palette = [
       "#7a4a30",
       "#3d6a52",
@@ -6065,32 +6284,28 @@ function ChunkGraphView() {
       "#3a6a3a",
       "#6a3a3a"
     ];
-    if (!wikiType) return "#888";
+    if (!it.wikiType) return "#888";
+    const h = hash01(it.wikiType);
+    return palette[Math.floor(h * palette.length)] ?? palette[0];
+  };
+
+  // 图例颜色（只取 wikiType；community 模式下只显示组数）。
+  const legendColorFor = (wikiType: string): string => {
+    const palette = [
+      "#7a4a30",
+      "#3d6a52",
+      "#5a4d8a",
+      "#8a6a3a",
+      "#3d6a8a",
+      "#8a3a5a",
+      "#3a6a3a",
+      "#6a3a3a"
+    ];
     const h = hash01(wikiType);
     return palette[Math.floor(h * palette.length)] ?? palette[0];
   };
 
   const focused = hovered ? indexById.get(hovered) : null;
-
-  // 边渲染：按 kind 决定线条样式。
-  type Edge = { from: string; to: string; kind: string };
-  const edges: Edge[] = useMemo(() => {
-    const out: Edge[] = [];
-    for (const it of visible) {
-      if (it.relatedChunks) {
-        for (const r of it.relatedChunks) {
-          if (indexById.has(r.chunk_id)) out.push({ from: it.id, to: r.chunk_id, kind: r.kind });
-        }
-      }
-      if (it.supersededBy && indexById.has(it.supersededBy)) {
-        out.push({ from: it.id, to: it.supersededBy, kind: "superseded_by" });
-      }
-      if (it.previousVersionId && indexById.has(it.previousVersionId)) {
-        out.push({ from: it.id, to: it.previousVersionId, kind: "previous_version" });
-      }
-    }
-    return out;
-  }, [visible, indexById]);
 
   if (loading) return <div className="wikiInspectorEmpty">加载中…</div>;
   if (error) return <div className="wikiAlert error">{error}</div>;
@@ -6116,13 +6331,37 @@ function ChunkGraphView() {
             <option key={t} value={t}>{t}</option>
           ))}
         </select>
+        <label className="wikiGraphFilterLabel">布局：</label>
+        <select
+          className="wikiGraphFilterSelect"
+          value={layoutMode}
+          onChange={(e) => setLayoutMode(e.target.value as "polar" | "force")}
+        >
+          <option value="polar">极坐标（确定性）</option>
+          <option value="force">力导向（200 步）</option>
+        </select>
+        <label className="wikiGraphFilterLabel">染色：</label>
+        <select
+          className="wikiGraphFilterSelect"
+          value={colorMode}
+          onChange={(e) => setColorMode(e.target.value as "wikiType" | "community")}
+        >
+          <option value="wikiType">按 wiki_type</option>
+          <option value="community">按社区（{community.count} 组）</option>
+        </select>
         <span className="wikiGraphLegend">
-          {wikiTypes.slice(0, 8).map((t) => (
-            <span key={t} className="wikiGraphLegendItem">
-              <span className="wikiGraphLegendDot" style={{ background: colorFor(t) }} />
-              {t}
-            </span>
-          ))}
+          {colorMode === "wikiType"
+            ? wikiTypes.slice(0, 8).map((t) => (
+                <span key={t} className="wikiGraphLegendItem">
+                  <span className="wikiGraphLegendDot" style={{ background: legendColorFor(t) }} />
+                  {t}
+                </span>
+              ))
+            : (
+                <span className="wikiGraphCommunityHint">
+                  {community.count} 个连通分量 · 颜色按分量索引等距分布
+                </span>
+              )}
         </span>
       </div>
       <div className="wikiGraphSvgWrap">
@@ -6180,7 +6419,7 @@ function ChunkGraphView() {
               if (!p) return null;
               const deg = inDegree.get(it.id) ?? 0;
               const r = 5 + Math.min(deg, 6) * 1.5;
-              const fill = colorFor(it.wikiType);
+              const fill = colorFor(it);
               const isHovered = hovered === it.id;
               const isArchived = it.status === "archived";
               return (
@@ -6275,7 +6514,7 @@ function DocumentsView() {
     setError(null);
     try {
       const r = await fetch("/api/operation-knowledge/documents");
-      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      if (!r.ok) throw await parseApiError(r);
       const data = (await r.json()) as { items?: DocumentItem[] };
       setItems(data.items ?? []);
     } catch (e) {
@@ -6304,7 +6543,7 @@ function DocumentsView() {
           status: "draft"
         })
       });
-      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      if (!r.ok) throw await parseApiError(r);
       setDraft({ title: "", summary: "", sourceName: "", sourceType: "imported_markdown" });
       await load();
     } catch (e) {
@@ -6318,7 +6557,7 @@ function DocumentsView() {
     if (!window.confirm(`删除文档？关联 chunks 不会被删除，但失去文档归属。`)) return;
     try {
       const r = await fetch(`/api/operation-knowledge/documents/${encodeURIComponent(id)}`, { method: "DELETE" });
-      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      if (!r.ok) throw await parseApiError(r);
       await load();
     } catch (e) {
       setError(String(e));
@@ -6336,7 +6575,7 @@ function DocumentsView() {
     setDocChunksError(null);
     try {
       const r = await fetch(`/api/operation-knowledge/documents/${encodeURIComponent(docId)}/chunks`);
-      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      if (!r.ok) throw await parseApiError(r);
       const data = (await r.json()) as { items?: DocumentChunkRow[] };
       setDocChunks({ ...docChunks, [docId]: data.items ?? [] });
     } catch (e) {
@@ -6521,7 +6760,7 @@ function ImportWizard() {
           body: merged.body,
         }),
       });
-      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      if (!r.ok) throw await parseApiError(r);
       const data = (await r.json()) as { productTags?: string[]; businessTopics?: string[] };
       setEdits({
         ...edits,
@@ -6548,7 +6787,7 @@ function ImportWizard() {
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ content, sourceName: sourceName.trim() || null })
       });
-      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      if (!r.ok) throw await parseApiError(r);
       const data = (await r.json()) as ImportPreviewResult;
       setPreview(data);
       const all = new Set<number>();
@@ -6582,7 +6821,7 @@ function ImportWizard() {
         headers: { "content-type": "application/json" },
         body: JSON.stringify(payload)
       });
-      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      if (!r.ok) throw await parseApiError(r);
       const data = (await r.json()) as { createdChunkIds?: string[]; created_chunk_ids?: string[] };
       const ids = data.createdChunkIds ?? data.created_chunk_ids ?? [];
       setCreated(ids);
@@ -6651,6 +6890,93 @@ function ImportWizard() {
             <span style={{ color: "var(--muted)", fontSize: 12, alignSelf: "center" }}>
               将由 AI 拆为候选 chunk，所有 chunk 默认 status=draft + integrity_status=needs_review。
             </span>
+          </div>
+          <div style={{ marginTop: 14, padding: "10px 12px", border: "1px dashed var(--border)", borderRadius: 6 }}>
+            <div style={{ fontSize: 12, color: "var(--muted)", marginBottom: 6 }}>
+              · multimodal 入口（绕过 AI preview，直接 fence 解析 / vision 抽取，落 status=draft）
+            </div>
+            <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
+              <label className="wikiBtn" style={{ cursor: pending ? "not-allowed" : "pointer", margin: 0 }}>
+                {pending ? "上传中…" : "上传 PDF"}
+                <input
+                  type="file"
+                  accept="application/pdf,.pdf"
+                  hidden
+                  disabled={pending}
+                  onChange={async (ev) => {
+                    const f = ev.target.files?.[0];
+                    if (!f) return;
+                    setPending(true);
+                    setError(null);
+                    try {
+                      const fd = new FormData();
+                      fd.append("file", f);
+                      fd.append("sourceName", sourceName.trim() || f.name);
+                      const r = await fetch("/api/operation-knowledge/import-apply-pdf", {
+                        method: "POST",
+                        body: fd,
+                      });
+                      if (!r.ok) throw await parseApiError(r);
+                      const data = (await r.json()) as { chunkIds?: string[]; fallbackBlob?: boolean };
+                      setCreated(data.chunkIds ?? []);
+                      setStep(3);
+                      if ((data.chunkIds ?? [])[0]) {
+                        setTimeout(() => focusChunk(data.chunkIds![0]), 100);
+                      }
+                    } catch (e) {
+                      setError(`PDF 导入失败：${e}`);
+                    } finally {
+                      setPending(false);
+                      ev.target.value = "";
+                    }
+                  }}
+                />
+              </label>
+              <label className="wikiBtn" style={{ cursor: pending ? "not-allowed" : "pointer", margin: 0 }}>
+                {pending ? "上传中…" : "上传图片（vision）"}
+                <input
+                  type="file"
+                  accept="image/*"
+                  hidden
+                  disabled={pending}
+                  onChange={async (ev) => {
+                    const f = ev.target.files?.[0];
+                    if (!f) return;
+                    setPending(true);
+                    setError(null);
+                    try {
+                      const buf = await f.arrayBuffer();
+                      let bin = "";
+                      const u8 = new Uint8Array(buf);
+                      for (let i = 0; i < u8.byteLength; i++) bin += String.fromCharCode(u8[i]);
+                      const b64 = btoa(bin);
+                      const r = await fetch("/api/operation-knowledge/import-apply-image", {
+                        method: "POST",
+                        headers: { "content-type": "application/json" },
+                        body: JSON.stringify({
+                          imageBase64: b64,
+                          mime: f.type || "image/png",
+                          sourceName: sourceName.trim() || f.name,
+                        }),
+                      });
+                      if (!r.ok) throw await parseApiError(r);
+                      const data = (await r.json()) as { chunkIds?: string[]; note?: string };
+                      setCreated(data.chunkIds ?? []);
+                      setStep(3);
+                      if (data.note) setError(`vision 提示：${data.note}`);
+                      if ((data.chunkIds ?? [])[0]) {
+                        setTimeout(() => focusChunk(data.chunkIds![0]), 100);
+                      }
+                    } catch (e) {
+                      setError(`图片导入失败：${e}（需文字主模型支持图片，或在模型设置里指派一个「视觉模型」）`);
+                    } finally {
+                      setPending(false);
+                      ev.target.value = "";
+                    }
+                  }}
+                />
+              </label>
+            </div>
           </div>
         </div>
       ) : null}
@@ -6796,7 +7122,7 @@ function TryRecallView() {
           query: query.trim(),
         }),
       });
-      if (!r.ok) throw new Error(`HTTP ${r.status}: ${await r.text()}`);
+      if (!r.ok) throw await parseApiError(r);
       const data = (await r.json()) as { item?: TryRecallRouteResult };
       const item = data.item ?? null;
       setRoute(item);
@@ -6809,7 +7135,7 @@ function TryRecallView() {
             headers: { "content-type": "application/json" },
             body: JSON.stringify({ ids }),
           });
-          if (!r2.ok) throw new Error(`open-slice HTTP ${r2.status}`);
+          if (!r2.ok) throw await parseApiError(r2);
           const d2 = (await r2.json()) as { items?: TryRecallSliceItem[] };
           setSlices(d2.items ?? []);
         } catch (e2) {
@@ -6979,7 +7305,7 @@ function DomainSchemaTab() {
     setError(null);
     try {
       const r = await fetch("/api/admin/domain-schemas");
-      if (!r.ok) throw new Error(await r.text());
+      if (!r.ok) throw await parseApiError(r);
       const data = (await r.json()) as { items: DomainSchemaItem[] };
       setItems(data.items ?? []);
     } catch (e: unknown) {
@@ -7001,7 +7327,7 @@ function DomainSchemaTab() {
       const r = await fetch(`/api/admin/domain-schemas/${encodeURIComponent(schemaId)}/activate`, {
         method: "POST",
       });
-      if (!r.ok) throw new Error(await r.text());
+      if (!r.ok) throw await parseApiError(r);
       setInfo(`已切换 active：${schemaId}`);
       await load();
     } catch (e: unknown) {
@@ -7139,6 +7465,7 @@ function AskView() {
   const [pending, setPending] = useState(false);
   const [result, setResult] = useState<AskResult | null>(null);
   const [liveTrace, setLiveTrace] = useState<AskToolTraceStep[]>([]);
+  const [streamText, setStreamText] = useState<string>("");
   const [error, setError] = useState<string | null>(null);
   const [streamMode, setStreamMode] = useState(supportsEventSource);
   const [showTrace, setShowTrace] = useState(false);
@@ -7170,6 +7497,7 @@ function AskView() {
     setError(null);
     setResult(null);
     setLiveTrace([]);
+    setStreamText("");
     setOpenCited(new Set());
     esRef.current?.close();
     esRef.current = null;
@@ -7195,7 +7523,7 @@ function AskView() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(workspaceId ? { query: q, workspaceId } : { query: q }),
       });
-      if (!r.ok) throw new Error(await r.text());
+      if (!r.ok) throw await parseApiError(r);
       const data = (await r.json()) as AskResult;
       setResult(data);
     } catch (err: unknown) {
@@ -7224,6 +7552,16 @@ function AskView() {
         setLiveTrace((prev) => [...prev, payload]);
       } catch {
         // 单帧坏 JSON 不致命，忽略后续依赖 close 兜底
+      }
+    });
+    es.addEventListener("token", (ev) => {
+      try {
+        const data = JSON.parse((ev as MessageEvent).data) as { delta?: string };
+        if (typeof data.delta === "string") {
+          setStreamText((prev) => prev + data.delta);
+        }
+      } catch {
+        // 单帧坏 JSON 不致命；最终 answer 帧会兜底
       }
     });
     es.addEventListener("answer", (ev) => {
@@ -7350,6 +7688,12 @@ function AskView() {
           ))}
         </ol>
       ) : null}
+      {pending && streamMode && streamText ? (
+        <div className="wikiAskStreamingAnswer" aria-live="polite">
+          {streamText}
+          <span className="wikiAskStreamingCaret" aria-hidden="true" />
+        </div>
+      ) : null}
       {result ? (
         <div className="wikiAskResult">
           <div className="wikiAskMeta">
@@ -7442,7 +7786,7 @@ function MetricsTab() {
     setError(null);
     try {
       const r = await fetch("/api/knowledge/metrics");
-      if (!r.ok) throw new Error(await r.text());
+      if (!r.ok) throw await parseApiError(r);
       setData(await r.json());
     } catch (e) {
       setError(e instanceof Error ? e.message : "加载指标失败");
@@ -7531,7 +7875,7 @@ function LintView() {
     try {
       const params = new URLSearchParams({ status: "pending", limit: "300" });
       const r = await fetch(`/api/knowledge/gap-signals?${params.toString()}`);
-      if (!r.ok) throw new Error(await r.text());
+      if (!r.ok) throw await parseApiError(r);
       const data = (await r.json()) as { signals: GapSignalItem[] };
       setItems(data.signals ?? []);
     } catch (e: unknown) {
@@ -7551,7 +7895,7 @@ function LintView() {
     setInfo(null);
     try {
       const r = await fetch("/api/knowledge/gap-signals/sweep", { method: "POST" });
-      if (!r.ok) throw new Error(await r.text());
+      if (!r.ok) throw await parseApiError(r);
       const data = await r.json();
       setInfo(
         `lint 新增 ${data?.structuralLint?.newSignals ?? 0}，` +
@@ -7578,7 +7922,7 @@ function LintView() {
           body: JSON.stringify({}),
         },
       );
-      if (!r.ok) throw new Error(await r.text());
+      if (!r.ok) throw await parseApiError(r);
       setInfo(action === "dismiss" ? "已忽略" : "已标记为已应用");
       await load();
     } catch (e: unknown) {
@@ -7780,7 +8124,7 @@ function ReviewView() {
     setError(null);
     try {
       const r = await fetch("/api/operation-knowledge/chunks");
-      if (!r.ok) throw new Error(await r.text());
+      if (!r.ok) throw await parseApiError(r);
       const data = (await r.json()) as { items: ReviewChunkItem[] };
       setItems(data.items ?? []);
     } catch (e: unknown) {
@@ -7834,7 +8178,7 @@ function ReviewView() {
         `/api/operation-knowledge/chunks/${encodeURIComponent(id)}/verify`,
         { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({}) }
       );
-      if (!r.ok) throw new Error(await r.text());
+      if (!r.ok) throw await parseApiError(r);
       setInfo(`已 verify：${id}`);
       await load();
     } catch (e: unknown) {
@@ -7853,7 +8197,7 @@ function ReviewView() {
         `/api/operation-knowledge/chunks/${encodeURIComponent(id)}/reject`,
         { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({}) }
       );
-      if (!r.ok) throw new Error(await r.text());
+      if (!r.ok) throw await parseApiError(r);
       setInfo(`已 reject：${id}`);
       await load();
     } catch (e: unknown) {
@@ -7893,7 +8237,7 @@ function ReviewView() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(body),
       });
-      if (!r.ok) throw new Error(await r.text());
+      if (!r.ok) throw await parseApiError(r);
       const data = (await r.json()) as {
         verified?: string[];
         archived?: string[];
@@ -8118,6 +8462,7 @@ function ChunkInspectorPane({
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [reloadKey, setReloadKey] = useState(0);
+  const lock = useChunkInspectorLock(chunkId);
 
   useEffect(() => {
     if (!chunkId) return;
@@ -8125,7 +8470,7 @@ function ChunkInspectorPane({
     setError(null);
     fetch("/api/operation-knowledge/chunks")
       .then(async (r) => {
-        if (!r.ok) throw new Error(await r.text());
+        if (!r.ok) throw await parseApiError(r);
         return r.json() as Promise<{ items: TreeChunkItem[] }>;
       })
       .then((data) => setItems(data.items ?? []))
@@ -8134,6 +8479,19 @@ function ChunkInspectorPane({
   }, [chunkId, reloadKey]);
 
   const reload = () => setReloadKey((k) => k + 1);
+
+  // P1-4：另一端写入此 chunk 时自动 reload，让两个 admin 同步看到。
+  useEffect(() => {
+    if (!chunkId) return;
+    const onRevised = (e: Event) => {
+      const detail = (e as CustomEvent<{ chunk_id?: string }>).detail;
+      if (detail?.chunk_id === chunkId) {
+        setReloadKey((k) => k + 1);
+      }
+    };
+    window.addEventListener("wikiChunkRevised", onRevised);
+    return () => window.removeEventListener("wikiChunkRevised", onRevised);
+  }, [chunkId]);
 
   const indexById = useMemo(() => {
     const m = new Map<string, TreeChunkItem>();
@@ -8180,6 +8538,7 @@ function ChunkInspectorPane({
         </div>
       </header>
       <div className="wikiInspectorBody">
+        {chunkId ? <ChunkLockBadge lock={lock} /> : null}
         {!chunkId ? (
           <div className="wikiInspectorEmpty">
             点击左侧树节点或问答中的引用 chunk，详情会出现在这里。
@@ -8350,7 +8709,7 @@ function ChunkSourceSection({ chunkId }: { chunkId: string }) {
     setError(null);
     try {
       const r = await fetch(`/api/operation-knowledge/chunks/${encodeURIComponent(chunkId)}/source`);
-      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      if (!r.ok) throw await parseApiError(r);
       const body = (await r.json()) as typeof data;
       setData(body);
     } catch (e) {
@@ -8433,6 +8792,287 @@ function focusChunk(chunkId: string) {
   window.dispatchEvent(new CustomEvent("wikiFocusChunk", { detail: { chunkId } }));
 }
 
+// ── P1-4 · WebSocket 软锁 + 事件总线 ───────────────────────────────────────
+//
+// `useChunkEventStream` 在 App 顶层挂一次：连 ws://.../api/ws/chunks，把后端
+// 推下来的 ChunkEvent 转成两类 window CustomEvent：
+//   - `wikiChunkLocked` / `wikiChunkUnlocked`：lock 状态变迁
+//   - `wikiChunkRevised`：chunk 被编辑（patch / archive / restore / split / merge / ...）
+// ChunkInspectorPane 监听 `wikiChunkRevised` 比对 chunkId 触发 reload，
+// 让两个 admin 同步看到对方的写入；锁徽章监听前两个事件实时刷新。
+//
+// 重连：onclose → 5s 后重试，最长 30s 退避。WebSocket 失败不阻塞业务功能，
+// 锁的状态在写入时仍然是真实的（acquire/release 走 HTTP）。
+type ChunkEventEnvelope =
+  | { kind: "hello"; workspace: string }
+  | { kind: "lagged" }
+  | {
+      kind: "locked";
+      chunk_id: string;
+      workspace_id: string;
+      owner_user_id: string;
+      owner_username: string;
+      expires_at: string;
+    }
+  | {
+      kind: "unlocked";
+      chunk_id: string;
+      workspace_id: string;
+      owner_user_id: string;
+    }
+  | {
+      kind: "revised";
+      chunk_id: string;
+      workspace_id: string;
+      revision_kind: string;
+      actor: string;
+    };
+
+function useChunkEventStream() {
+  useEffect(() => {
+    let socket: WebSocket | null = null;
+    let cancelled = false;
+    let backoffMs = 1000;
+    let timer: number | null = null;
+
+    const connect = () => {
+      if (cancelled) return;
+      const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
+      const url = `${proto}//${window.location.host}/api/ws/chunks`;
+      try {
+        socket = new WebSocket(url);
+      } catch {
+        scheduleReconnect();
+        return;
+      }
+      socket.onopen = () => {
+        backoffMs = 1000;
+      };
+      socket.onmessage = (ev) => {
+        let parsed: ChunkEventEnvelope | null = null;
+        try {
+          parsed = JSON.parse(typeof ev.data === "string" ? ev.data : "") as ChunkEventEnvelope;
+        } catch {
+          return;
+        }
+        if (!parsed) return;
+        switch (parsed.kind) {
+          case "hello":
+          case "lagged":
+            return;
+          case "locked":
+            window.dispatchEvent(new CustomEvent("wikiChunkLocked", { detail: parsed }));
+            return;
+          case "unlocked":
+            window.dispatchEvent(new CustomEvent("wikiChunkUnlocked", { detail: parsed }));
+            return;
+          case "revised":
+            window.dispatchEvent(new CustomEvent("wikiChunkRevised", { detail: parsed }));
+            return;
+        }
+      };
+      socket.onclose = () => {
+        scheduleReconnect();
+      };
+      socket.onerror = () => {
+        try {
+          socket?.close();
+        } catch {
+          // ignore
+        }
+      };
+    };
+
+    const scheduleReconnect = () => {
+      if (cancelled) return;
+      if (timer != null) return;
+      timer = window.setTimeout(() => {
+        timer = null;
+        connect();
+      }, backoffMs);
+      backoffMs = Math.min(backoffMs * 2, 30000);
+    };
+
+    connect();
+
+    return () => {
+      cancelled = true;
+      if (timer != null) {
+        window.clearTimeout(timer);
+        timer = null;
+      }
+      try {
+        socket?.close();
+      } catch {
+        // ignore
+      }
+    };
+  }, []);
+}
+
+// 锁状态机：
+//   - 'idle' 初始；
+//   - 'self' 当前 admin 持锁，60s 心跳续期；
+//   - 'other' 已被他人持锁（409 返回 lock 信息）；
+//   - 'error' 网络错或 5xx，UI 静默退化为只读。
+type LockHolder = {
+  ownerUserId: string;
+  ownerUsername: string;
+  expiresAt: string;
+};
+
+type ChunkLockState =
+  | { state: "idle" }
+  | { state: "self"; holder: LockHolder }
+  | { state: "other"; holder: LockHolder }
+  | { state: "error"; reason: string };
+
+function formatLockExpiry(iso: string): string {
+  if (!iso) return "";
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return "";
+  const hh = String(d.getHours()).padStart(2, "0");
+  const mm = String(d.getMinutes()).padStart(2, "0");
+  return `${hh}:${mm}`;
+}
+
+function ChunkLockBadge({ lock }: { lock: ChunkLockState }) {
+  if (lock.state === "idle") return null;
+  if (lock.state === "self") {
+    const at = formatLockExpiry(lock.holder.expiresAt);
+    return (
+      <div className="wikiInspectorLockBadge wikiInspectorLockBadge--self" role="status">
+        <span className="wikiInspectorLockDot" aria-hidden />
+        <span>我正在编辑{at ? ` · 自动续期至 ${at}` : ""}</span>
+      </div>
+    );
+  }
+  if (lock.state === "other") {
+    const at = formatLockExpiry(lock.holder.expiresAt);
+    const who = lock.holder.ownerUsername || lock.holder.ownerUserId || "其他 admin";
+    return (
+      <div className="wikiInspectorLockBadge wikiInspectorLockBadge--other" role="status">
+        <span className="wikiInspectorLockDot" aria-hidden />
+        <span>由 {who} 编辑中{at ? `（至 ${at}）` : ""} · 暂只读</span>
+      </div>
+    );
+  }
+  return (
+    <div className="wikiInspectorLockBadge wikiInspectorLockBadge--error" role="status">
+      <span className="wikiInspectorLockDot" aria-hidden />
+      <span>锁信道异常 · {lock.reason}</span>
+    </div>
+  );
+}
+
+function useChunkInspectorLock(chunkId: string | null): ChunkLockState {
+  const [lock, setLock] = useState<ChunkLockState>({ state: "idle" });
+
+  useEffect(() => {
+    if (!chunkId) {
+      setLock({ state: "idle" });
+      return;
+    }
+    let cancelled = false;
+    let heartbeat: number | null = null;
+
+    const acquire = async () => {
+      try {
+        const r = await fetch(`/api/operation-knowledge/chunks/${encodeURIComponent(chunkId)}/lock`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({}),
+        });
+        if (cancelled) return;
+        const body = await r.json().catch(() => ({}) as Record<string, unknown>);
+        if (r.status === 409) {
+          const lk = (body as { lock?: { owner_user_id?: string; owner_username?: string; expires_at?: string } }).lock;
+          if (lk) {
+            setLock({
+              state: "other",
+              holder: {
+                ownerUserId: lk.owner_user_id ?? "",
+                ownerUsername: lk.owner_username ?? "",
+                expiresAt: lk.expires_at ?? "",
+              },
+            });
+          } else {
+            setLock({ state: "error", reason: "lock_conflict_no_payload" });
+          }
+          return;
+        }
+        if (!r.ok) {
+          setLock({ state: "error", reason: `http_${r.status}` });
+          return;
+        }
+        const lk = (body as { lock?: { owner_user_id?: string; owner_username?: string; expires_at?: string } }).lock;
+        if (!lk) {
+          setLock({ state: "error", reason: "missing_lock_payload" });
+          return;
+        }
+        setLock({
+          state: "self",
+          holder: {
+            ownerUserId: lk.owner_user_id ?? "",
+            ownerUsername: lk.owner_username ?? "",
+            expiresAt: lk.expires_at ?? "",
+          },
+        });
+      } catch (e) {
+        if (!cancelled) setLock({ state: "error", reason: String(e) });
+      }
+    };
+
+    void acquire();
+    // 60s 心跳：再 POST 一次相当于续期
+    heartbeat = window.setInterval(() => {
+      void acquire();
+    }, 60000);
+
+    // WebSocket 推 unlocked 时刷一次（他人主动 release，给当前 admin 一次抢锁机会）
+    const onUnlocked = (e: Event) => {
+      const detail = (e as CustomEvent<{ chunk_id?: string }>).detail;
+      if (detail?.chunk_id === chunkId) {
+        void acquire();
+      }
+    };
+    const onLocked = (e: Event) => {
+      const detail = (e as CustomEvent<{ chunk_id?: string; owner_user_id?: string; owner_username?: string; expires_at?: string }>).detail;
+      if (detail?.chunk_id === chunkId) {
+        // 别人加锁——只有不是我自己时才覆盖；我自己的 acquire 会先把状态写成 self。
+        setLock((prev) => {
+          if (prev.state === "self" && prev.holder.ownerUserId === detail.owner_user_id) {
+            return prev;
+          }
+          return {
+            state: "other",
+            holder: {
+              ownerUserId: detail.owner_user_id ?? "",
+              ownerUsername: detail.owner_username ?? "",
+              expiresAt: detail.expires_at ?? "",
+            },
+          };
+        });
+      }
+    };
+    window.addEventListener("wikiChunkUnlocked", onUnlocked);
+    window.addEventListener("wikiChunkLocked", onLocked);
+
+    return () => {
+      cancelled = true;
+      if (heartbeat != null) window.clearInterval(heartbeat);
+      window.removeEventListener("wikiChunkUnlocked", onUnlocked);
+      window.removeEventListener("wikiChunkLocked", onLocked);
+      // best-effort release：unmount / 切 chunk 时把锁还回去
+      void fetch(`/api/operation-knowledge/chunks/${encodeURIComponent(chunkId)}/lock`, {
+        method: "DELETE",
+      }).catch(() => undefined);
+    };
+  }, [chunkId]);
+
+  return lock;
+}
+
 // ── G3 · ChunkActionsBar：9 类编辑动作（admin 手工触发） ───────────────────
 // 路由全部为 /api/operation-knowledge/chunks/:id/<action>。AI 永不自动 verify。
 type ChunkActionState = { busy: string | null; error: string | null; info: string | null };
@@ -8457,7 +9097,7 @@ function ChunkActionsBar({
       const init: RequestInit = { method, headers: { "Content-Type": "application/json" } };
       if (body !== undefined) init.body = JSON.stringify(body);
       const r = await fetch(path, init);
-      if (!r.ok) throw new Error(await r.text());
+      if (!r.ok) throw await parseApiError(r);
       setState({ busy: null, error: null, info: `已${action}` });
       onChanged();
     } catch (e: unknown) {
@@ -8656,7 +9296,7 @@ function ChunkReferrersList({ chunkId }: { chunkId: string }) {
     setLoading(true);
     fetch(`/api/operation-knowledge/chunks/referrers?target_id=${encodeURIComponent(chunkId)}`)
       .then(async (r) => {
-        if (!r.ok) throw new Error(await r.text());
+        if (!r.ok) throw await parseApiError(r);
         return r.json() as Promise<{ items: ReferrerEntry[] }>;
       })
       .then((data) => setItems(data.items ?? []))
@@ -8743,7 +9383,7 @@ function ChunkRevisionsTimeline({
     setError(null);
     fetch(`/api/operation-knowledge/chunks/${encodeURIComponent(chunkId)}/revisions`)
       .then(async (r) => {
-        if (!r.ok) throw new Error(await r.text());
+        if (!r.ok) throw await parseApiError(r);
         return r.json() as Promise<{ items: RevisionEntry[] }>;
       })
       .then((data) => setItems(data.items ?? []))
@@ -8773,7 +9413,7 @@ function ChunkRevisionsTimeline({
         `/api/operation-knowledge/chunks/${encodeURIComponent(chunkId)}/rollback/${encodeURIComponent(rid)}`,
         { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ actor: "admin" }) },
       );
-      if (!r.ok) throw new Error(await r.text());
+      if (!r.ok) throw await parseApiError(r);
       setItems(null);
       onRolledBack();
     } catch (e: unknown) {
@@ -8939,7 +9579,7 @@ function ChatWorkbench() {
     }
     try {
       const r = await fetch(`/api/operation-knowledge/chat/${encodeURIComponent(sid)}`);
-      if (!r.ok) throw new Error(await r.text());
+      if (!r.ok) throw await parseApiError(r);
       const data = (await r.json()) as { items: unknown[] };
       const items = Array.isArray(data.items) ? data.items : [];
       const list: ChatTurnView[] = items.map((raw) => {
@@ -9025,7 +9665,7 @@ function ChatWorkbench() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(body)
       });
-      if (!r.ok) throw new Error(await r.text());
+      if (!r.ok) throw await parseApiError(r);
       const resp = (await r.json()) as ChatTurnResponse;
       if (resp.sessionId !== sessionId) {
         setSessionId(resp.sessionId);
@@ -9054,7 +9694,7 @@ function ChatWorkbench() {
           body: JSON.stringify({})
         }
       );
-      if (!r.ok) throw new Error(await r.text());
+      if (!r.ok) throw await parseApiError(r);
       const data = (await r.json()) as { chunkId?: string; itemId?: string; status?: string };
       const fid = data.chunkId || data.itemId;
       setInfo(`已应用为草稿（${data.status ?? "draft"}）${fid ? `：${fid}` : ""}`);
@@ -9081,7 +9721,7 @@ function ChatWorkbench() {
         `/api/operation-knowledge/chat/${encodeURIComponent(sessionId)}/discard`,
         { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" }
       );
-      if (!r.ok) throw new Error(await r.text());
+      if (!r.ok) throw await parseApiError(r);
       setInfo("已丢弃当前草稿");
       await loadHistory(sessionId);
     } catch (e) {
@@ -9244,7 +9884,7 @@ function KnowledgeInbox() {
       const r = await fetch(
         `/api/operation-knowledge/inbox${params.toString() ? "?" + params : ""}`
       );
-      if (!r.ok) throw new Error(await r.text());
+      if (!r.ok) throw await parseApiError(r);
       const d = (await r.json()) as InboxResp;
       setData(d);
     } catch (e) {
@@ -9364,6 +10004,232 @@ interface LogsAnalyzeView {
   samples?: unknown[];
 }
 
+interface IngestSourceItem {
+  sourceId: string;
+  workspaceId: string;
+  kind: string;
+  url: string;
+  label?: string | null;
+  scheduleMinutes: number;
+  lastFetchedAt?: string | null;
+  lastEtag?: string | null;
+  status: string;
+  failureStreak?: number;
+  lastError?: string | null;
+  ingestCount?: number;
+  createdAt?: string | null;
+  updatedAt?: string | null;
+}
+
+function IngestSourcesView() {
+  const [items, setItems] = useState<IngestSourceItem[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const [creating, setCreating] = useState(false);
+  const [draft, setDraft] = useState({ kind: "rss", url: "", label: "", scheduleMinutes: 60 });
+
+  async function load() {
+    setLoading(true);
+    setError(null);
+    try {
+      const r = await fetch("/api/knowledge/ingest-sources");
+      if (!r.ok) throw await parseApiError(r);
+      const data = (await r.json()) as { items?: IngestSourceItem[] };
+      setItems(data.items ?? []);
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  useEffect(() => { void load(); }, []);
+
+  async function handleCreate(ev: FormEvent) {
+    ev.preventDefault();
+    if (!draft.url.trim()) return;
+    setCreating(true);
+    try {
+      const r = await fetch("/api/knowledge/ingest-sources", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          kind: draft.kind,
+          url: draft.url.trim(),
+          label: draft.label.trim() || null,
+          scheduleMinutes: draft.scheduleMinutes,
+        }),
+      });
+      if (!r.ok) throw await parseApiError(r);
+      setDraft({ kind: "rss", url: "", label: "", scheduleMinutes: 60 });
+      await load();
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setCreating(false);
+    }
+  }
+
+  async function handleReactivate(id: string) {
+    try {
+      const r = await fetch(`/api/knowledge/ingest-sources/${encodeURIComponent(id)}`, {
+        method: "PATCH",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ status: "active" }),
+      });
+      if (!r.ok) throw await parseApiError(r);
+      await load();
+    } catch (e) {
+      setError(String(e));
+    }
+  }
+
+  async function handleDelete(id: string) {
+    if (!window.confirm("删除外部源？已 ingest 的 chunks 不会被回收。")) return;
+    try {
+      const r = await fetch(`/api/knowledge/ingest-sources/${encodeURIComponent(id)}`, { method: "DELETE" });
+      if (!r.ok) throw await parseApiError(r);
+      await load();
+    } catch (e) {
+      setError(String(e));
+    }
+  }
+
+  return (
+    <div className="wikiArchiveShell" style={{ padding: 18 }}>
+      <header className="wikiArchiveHeader">
+        <span className="wikiArchiveSubtitle">Ingest Sources · 外部源自动 ingest</span>
+        <h3 style={{ fontSize: 20 }}>外部源</h3>
+        <p style={{ color: "var(--wiki-muted)", fontSize: 12, marginTop: 6 }}>
+          周期性拉取 RSS / HTML 源，落库 chunk 默认 draft + needs_review（AI 永不自动 verify）。
+          连续 3 次失败 → status=failing；7 天不可达 → status=disabled。
+        </p>
+      </header>
+      {error ? <div className="wikiAlert error">{error}</div> : null}
+      <form
+        onSubmit={handleCreate}
+        style={{
+          display: "grid",
+          gridTemplateColumns: "120px 1fr 1fr 140px auto",
+          gap: 8,
+          marginBottom: 16,
+        }}
+      >
+        <select
+          value={draft.kind}
+          onChange={(e) => setDraft({ ...draft, kind: e.target.value })}
+          className="wikiInput"
+        >
+          <option value="rss">rss</option>
+          <option value="html">html</option>
+        </select>
+        <input
+          type="text"
+          placeholder="URL（必填）"
+          value={draft.url}
+          onChange={(e) => setDraft({ ...draft, url: e.target.value })}
+          className="wikiInput"
+        />
+        <input
+          type="text"
+          placeholder="标签（可选，便于识别）"
+          value={draft.label}
+          onChange={(e) => setDraft({ ...draft, label: e.target.value })}
+          className="wikiInput"
+        />
+        <input
+          type="number"
+          min={1}
+          placeholder="间隔（分钟）"
+          value={draft.scheduleMinutes}
+          onChange={(e) => setDraft({ ...draft, scheduleMinutes: Number(e.target.value) || 60 })}
+          className="wikiInput"
+        />
+        <button type="submit" className="wikiBtn primary" disabled={creating || !draft.url.trim()}>
+          {creating ? "创建中…" : "新增"}
+        </button>
+      </form>
+      {loading ? (
+        <div className="wikiHint">加载中…</div>
+      ) : items.length === 0 ? (
+        <div className="wikiHint">暂无外部源。新增后由 worker 周期拉取。</div>
+      ) : (
+        <table className="wikiTable" style={{ width: "100%", fontSize: 13 }}>
+          <thead>
+            <tr>
+              <th style={{ textAlign: "left" }}>kind</th>
+              <th style={{ textAlign: "left" }}>URL / 标签</th>
+              <th style={{ textAlign: "right" }}>间隔</th>
+              <th style={{ textAlign: "left" }}>最后拉取</th>
+              <th style={{ textAlign: "left" }}>状态</th>
+              <th style={{ textAlign: "right" }}>失败次数</th>
+              <th style={{ textAlign: "right" }}>已 ingest</th>
+              <th style={{ textAlign: "left" }}>错误</th>
+              <th />
+            </tr>
+          </thead>
+          <tbody>
+            {items.map((it) => (
+              <tr key={it.sourceId}>
+                <td>{it.kind}</td>
+                <td style={{ maxWidth: 360, wordBreak: "break-all" }}>
+                  <div>{it.url}</div>
+                  {it.label ? (
+                    <div style={{ color: "var(--wiki-muted)", fontSize: 11 }}>{it.label}</div>
+                  ) : null}
+                </td>
+                <td style={{ textAlign: "right" }}>{it.scheduleMinutes}m</td>
+                <td style={{ fontSize: 11, color: "var(--wiki-muted)" }}>
+                  {it.lastFetchedAt ? new Date(it.lastFetchedAt).toLocaleString() : "—"}
+                </td>
+                <td>
+                  <span
+                    className="wikiBadge"
+                    style={{
+                      background:
+                        it.status === "active"
+                          ? "var(--wiki-ok-bg, #d1fadf)"
+                          : it.status === "failing"
+                          ? "var(--wiki-warn-bg, #fef0c7)"
+                          : "var(--wiki-error-bg, #fee4e2)",
+                    }}
+                  >
+                    {it.status}
+                  </span>
+                </td>
+                <td style={{ textAlign: "right" }}>{it.failureStreak ?? 0}</td>
+                <td style={{ textAlign: "right" }}>{it.ingestCount ?? 0}</td>
+                <td style={{ maxWidth: 220, fontSize: 11, color: "var(--wiki-error, #b42318)" }}>
+                  {it.lastError ?? ""}
+                </td>
+                <td style={{ whiteSpace: "nowrap" }}>
+                  {it.status !== "active" ? (
+                    <button
+                      type="button"
+                      className="wikiBtn"
+                      onClick={() => handleReactivate(it.sourceId)}
+                    >
+                      重新激活
+                    </button>
+                  ) : null}
+                  <button
+                    type="button"
+                    className="wikiBtn danger"
+                    style={{ marginLeft: 6 }}
+                    onClick={() => handleDelete(it.sourceId)}
+                  >
+                    删除
+                  </button>
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      )}
+    </div>
+  );
+}
+
 function ObservabilityDashboard() {
   const [catalog, setCatalog] = useState<CatalogPersistedView | null>(null);
   const [catalogLive, setCatalogLive] = useState<{ total?: number } | null>(null);
@@ -9452,7 +10318,7 @@ function ObservabilityDashboard() {
         headers: { "Content-Type": "application/json" },
         body: "{}"
       });
-      if (!r.ok) throw new Error(await r.text());
+      if (!r.ok) throw await parseApiError(r);
       setInfo("已触发 gap-signals sweep");
       await load();
     } catch (e) {
@@ -9932,7 +10798,7 @@ function TestMatchPanel() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ query: q })
       });
-      if (!r.ok) throw new Error(await r.text());
+      if (!r.ok) throw await parseApiError(r);
       setResult(await r.json());
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
@@ -9998,7 +10864,7 @@ function MetadataDashboard() {
     setError(null);
     try {
       const r = await fetch("/api/operation-knowledge/metadata");
-      if (!r.ok) throw new Error(await r.text());
+      if (!r.ok) throw await parseApiError(r);
       setData((await r.json()) as MetadataResp);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
@@ -10180,7 +11046,7 @@ function PublishBar({ resourceKind, id, onChange }: PublishBarProps) {
         `/api/admin/${resourceKind}/${encodeURIComponent(id)}/${action}`,
         { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" }
       );
-      if (!r.ok) throw new Error(await r.text());
+      if (!r.ok) throw await parseApiError(r);
       setInfo(`${action} ok`);
       onChange?.();
     } catch (e) {
@@ -10293,7 +11159,7 @@ function TaxonomiesGovernance() {
       const r = await fetch(
         `/api/admin/taxonomies${params.toString() ? "?" + params : ""}`
       );
-      if (!r.ok) throw new Error(await r.text());
+      if (!r.ok) throw await parseApiError(r);
       const d = (await r.json()) as { items?: TaxonomyEntryView[] };
       setItems(d.items ?? []);
     } catch (e) {
@@ -10391,7 +11257,7 @@ function StatePoliciesGovernance() {
     setError(null);
     try {
       const r = await fetch("/api/admin/operation-state-policies");
-      if (!r.ok) throw new Error(await r.text());
+      if (!r.ok) throw await parseApiError(r);
       const d = (await r.json()) as { items?: StatePolicyEntryView[] };
       setItems(d.items ?? []);
     } catch (e) {
@@ -10472,7 +11338,7 @@ function DomainGovernance() {
     setError(null);
     try {
       const r = await fetch("/api/operation-domains");
-      if (!r.ok) throw new Error(await r.text());
+      if (!r.ok) throw await parseApiError(r);
       const d = (await r.json()) as { items?: DomainEntryView[] };
       setItems(d.items ?? []);
     } catch (e) {
@@ -10548,7 +11414,7 @@ function KnowledgeTreeView() {
     setError(null);
     try {
       const r = await fetch("/api/operation-knowledge/chunks");
-      if (!r.ok) throw new Error(await r.text());
+      if (!r.ok) throw await parseApiError(r);
       const data = (await r.json()) as { items: TreeChunkItem[] };
       setItems(data.items ?? []);
     } catch (e: unknown) {
@@ -10869,7 +11735,7 @@ function ChunkRevisionsDrawer() {
       const r = await fetch(
         `/api/operation-knowledge/chunks/${encodeURIComponent(id)}/revisions?limit=100`,
       );
-      if (!r.ok) throw new Error(await r.text());
+      if (!r.ok) throw await parseApiError(r);
       const data = (await r.json()) as { items: ChunkRevisionItem[] };
       setItems(data.items ?? []);
       setExpanded(new Set());
@@ -11022,7 +11888,7 @@ function DigestCanvas() {
         `/api/knowledge/digest/cards/${encodeURIComponent(cardId)}/dismiss`,
         { method: "POST" }
       );
-      if (!r.ok) throw new Error(await r.text());
+      if (!r.ok) throw await parseApiError(r);
       setReport((prev) =>
         prev ? { ...prev, dismissedCardIds: [...prev.dismissedCardIds, cardId] } : prev
       );
@@ -11161,7 +12027,7 @@ function TaskRail() {
     setError(null);
     try {
       const r = await fetch(`/api/knowledge/chat/tasks/${encodeURIComponent(taskId)}`);
-      if (!r.ok) throw new Error(await r.text());
+      if (!r.ok) throw await parseApiError(r);
       const data = (await r.json()) as ChatTaskView;
       setTask(data);
       attachStream(data.sessionId);
@@ -11181,7 +12047,7 @@ function TaskRail() {
         `/api/knowledge/chat/tasks/${encodeURIComponent(task.taskId)}/cancel`,
         { method: "POST" }
       );
-      if (!r.ok) throw new Error(await r.text());
+      if (!r.ok) throw await parseApiError(r);
       await loadTask(task.taskId);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
@@ -11312,7 +12178,7 @@ function MemoryDrawer() {
       if (kind) params.set("kind", kind);
       params.set("limit", "100");
       const r = await fetch(`/api/knowledge/operator-memory?${params.toString()}`);
-      if (!r.ok) throw new Error(await r.text());
+      if (!r.ok) throw await parseApiError(r);
       const data = (await r.json()) as { items: OperatorMemoryView[] };
       setItems(data.items ?? []);
     } catch (e) {

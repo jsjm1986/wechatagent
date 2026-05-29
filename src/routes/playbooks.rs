@@ -2,7 +2,7 @@
 
 use axum::{
     extract::{Path, Query, State},
-    Json,
+    Extension, Json,
 };
 use futures::TryStreamExt;
 use mongodb::{
@@ -14,6 +14,7 @@ use serde_json::{json, Value};
 
 use crate::{
     agent,
+    auth::AuthenticatedAdmin,
     error::{AppError, AppResult},
     models::OperationPlaybook,
     prompts,
@@ -61,18 +62,19 @@ pub(super) struct OptimizePlaybookRequest {
 
 pub(super) async fn list_operation_playbooks(
     State(state): State<AppState>,
+    Extension(admin): Extension<AuthenticatedAdmin>,
     Query(query): Query<OperationPlaybookQuery>,
 ) -> AppResult<Json<Value>> {
     let account_id = query
         .account_id
         .unwrap_or_else(|| state.config.default_account_id.clone());
-    ensure_default_playbook(&state, &account_id).await?;
+    ensure_default_playbook(&state, &admin.current_workspace, &account_id).await?;
     let mut cursor = state
         .db
         .operation_playbooks()
         .find(
             doc! {
-                "workspace_id": &state.config.default_workspace_id,
+                "workspace_id": &admin.current_workspace,
                 "account_id": &account_id
             },
             FindOptions::builder()
@@ -89,6 +91,7 @@ pub(super) async fn list_operation_playbooks(
 
 pub(super) async fn create_operation_playbook(
     State(state): State<AppState>,
+    Extension(admin): Extension<AuthenticatedAdmin>,
     Json(payload): Json<OperationPlaybookRequest>,
 ) -> AppResult<Json<Value>> {
     let account_id = payload
@@ -101,7 +104,7 @@ pub(super) async fn create_operation_playbook(
             .operation_playbooks()
             .find_one(
                 doc! {
-                    "workspace_id": &state.config.default_workspace_id,
+                    "workspace_id": &admin.current_workspace,
                     "account_id": &account_id
                 },
                 None,
@@ -109,11 +112,11 @@ pub(super) async fn create_operation_playbook(
             .await?
             .is_none();
     if is_default {
-        unset_default_playbooks(&state, &account_id).await?;
+        unset_default_playbooks(&state, &admin.current_workspace, &account_id).await?;
     }
     let playbook = OperationPlaybook {
         id: None,
-        workspace_id: state.config.default_workspace_id.clone(),
+        workspace_id: admin.current_workspace.clone(),
         account_id,
         name: payload.name,
         description: normalize_optional(payload.description),
@@ -144,6 +147,7 @@ pub(super) async fn create_operation_playbook(
 
 pub(super) async fn update_operation_playbook(
     State(state): State<AppState>,
+    Extension(admin): Extension<AuthenticatedAdmin>,
     Path(id): Path<String>,
     Json(payload): Json<OperationPlaybookRequest>,
 ) -> AppResult<Json<Value>> {
@@ -155,14 +159,14 @@ pub(super) async fn update_operation_playbook(
         .find_one(
             doc! {
                 "_id": object_id,
-                "workspace_id": &state.config.default_workspace_id
+                "workspace_id": &admin.current_workspace
             },
             None,
         )
         .await?
         .ok_or_else(|| AppError::NotFound("operation playbook not found".to_string()))?;
     if payload.is_default.unwrap_or(existing.is_default) {
-        unset_default_playbooks(&state, &existing.account_id).await?;
+        unset_default_playbooks(&state, &admin.current_workspace, &existing.account_id).await?;
     }
     state
         .db
@@ -195,6 +199,7 @@ pub(super) async fn update_operation_playbook(
 
 pub(super) async fn set_default_operation_playbook(
     State(state): State<AppState>,
+    Extension(admin): Extension<AuthenticatedAdmin>,
     Path(id): Path<String>,
 ) -> AppResult<Json<Value>> {
     let object_id = parse_object_id(&id)?;
@@ -204,13 +209,13 @@ pub(super) async fn set_default_operation_playbook(
         .find_one(
             doc! {
                 "_id": object_id,
-                "workspace_id": &state.config.default_workspace_id
+                "workspace_id": &admin.current_workspace
             },
             None,
         )
         .await?
         .ok_or_else(|| AppError::NotFound("operation playbook not found".to_string()))?;
-    unset_default_playbooks(&state, &playbook.account_id).await?;
+    unset_default_playbooks(&state, &admin.current_workspace, &playbook.account_id).await?;
     state
         .db
         .operation_playbooks()
@@ -230,15 +235,16 @@ pub(super) async fn set_default_operation_playbook(
 
 pub(super) async fn generate_operation_playbook(
     State(state): State<AppState>,
+    Extension(admin): Extension<AuthenticatedAdmin>,
     Json(payload): Json<GeneratePlaybookRequest>,
 ) -> AppResult<Json<Value>> {
-    validate_account(&state, &payload.account_id).await?;
+    validate_account(&state, &admin.current_workspace, &payload.account_id).await?;
     if payload.description.trim().is_empty() {
         return Err(AppError::BadRequest("description is required".to_string()));
     }
     let system = prompts::load_prompt(
         &state.db,
-        &state.config.default_workspace_id,
+        &admin.current_workspace,
         "playbook.generator.system",
     )
     .await?;
@@ -258,7 +264,7 @@ pub(super) async fn generate_operation_playbook(
         .operation_playbooks()
         .find_one(
             doc! {
-                "workspace_id": &state.config.default_workspace_id,
+                "workspace_id": &admin.current_workspace,
                 "account_id": &payload.account_id
             },
             None,
@@ -267,11 +273,11 @@ pub(super) async fn generate_operation_playbook(
         .is_some();
     let is_default = !exists;
     if is_default {
-        unset_default_playbooks(&state, &payload.account_id).await?;
+        unset_default_playbooks(&state, &admin.current_workspace, &payload.account_id).await?;
     }
     let playbook = OperationPlaybook {
         id: None,
-        workspace_id: state.config.default_workspace_id.clone(),
+        workspace_id: admin.current_workspace.clone(),
         account_id: payload.account_id,
         name: json_string_any(&generated, &["name"])
             .unwrap_or_else(|| "AI 生成运营方法".to_string()),
@@ -304,6 +310,7 @@ pub(super) async fn generate_operation_playbook(
 
 pub(super) async fn optimize_operation_playbook(
     State(state): State<AppState>,
+    Extension(admin): Extension<AuthenticatedAdmin>,
     Path(id): Path<String>,
     Json(payload): Json<OptimizePlaybookRequest>,
 ) -> AppResult<Json<Value>> {
@@ -317,7 +324,7 @@ pub(super) async fn optimize_operation_playbook(
         .find_one(
             doc! {
                 "_id": object_id,
-                "workspace_id": &state.config.default_workspace_id
+                "workspace_id": &admin.current_workspace
             },
             None,
         )
@@ -325,7 +332,7 @@ pub(super) async fn optimize_operation_playbook(
         .ok_or_else(|| AppError::NotFound("operation playbook not found".to_string()))?;
     let system = prompts::load_prompt(
         &state.db,
-        &state.config.default_workspace_id,
+        &admin.current_workspace,
         "playbook.generator.system",
     )
     .await?;
@@ -393,7 +400,7 @@ pub(super) async fn optimize_operation_playbook(
         .find_one(
             doc! {
                 "_id": object_id,
-                "workspace_id": &state.config.default_workspace_id
+                "workspace_id": &admin.current_workspace
             },
             None,
         )
@@ -436,6 +443,7 @@ pub(super) fn validate_playbook_input(name: &str, method_prompt: &str) -> AppRes
 
 pub(super) async fn ensure_default_playbook(
     state: &AppState,
+    workspace_id: &str,
     account_id: &str,
 ) -> AppResult<OperationPlaybook> {
     if let Some(playbook) = state
@@ -443,7 +451,7 @@ pub(super) async fn ensure_default_playbook(
         .operation_playbooks()
         .find_one(
             doc! {
-                "workspace_id": &state.config.default_workspace_id,
+                "workspace_id": workspace_id,
                 "account_id": account_id,
                 "is_default": true
             },
@@ -455,7 +463,7 @@ pub(super) async fn ensure_default_playbook(
     {
         return Ok(playbook);
     }
-    let playbook = prompts::default_playbook(&state.config.default_workspace_id, account_id);
+    let playbook = prompts::default_playbook(workspace_id, account_id);
     let result = state
         .db
         .operation_playbooks()
@@ -473,13 +481,17 @@ pub(super) async fn ensure_default_playbook(
         .ok_or_else(|| AppError::External("operation playbook not found after insert".to_string()))
 }
 
-pub(super) async fn unset_default_playbooks(state: &AppState, account_id: &str) -> AppResult<()> {
+pub(super) async fn unset_default_playbooks(
+    state: &AppState,
+    workspace_id: &str,
+    account_id: &str,
+) -> AppResult<()> {
     state
         .db
         .operation_playbooks()
         .update_many(
             doc! {
-                "workspace_id": &state.config.default_workspace_id,
+                "workspace_id": workspace_id,
                 "account_id": account_id,
                 "is_default": true
             },

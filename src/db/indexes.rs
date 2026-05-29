@@ -88,6 +88,32 @@ pub(super) async fn ensure_all(db: &Database) -> anyhow::Result<()> {
             None,
         )
         .await?;
+    // P1-1：outcome_aggregation 任务幂等去重靠 (kind, account_id, content) 唯一约束。
+    // tasks.rs::ensure_today_outcome_aggregation_tasks 之前用 find_one 后 insert_one
+    // 存在 TOCTOU；改原子 insert + 11000 dup-key 视作"已存在"前必须有此索引。
+    // partial filter 限定 kind 否则会误伤其他 kind 同 content 的合法重复（如
+    // follow_up 同一 contact 不同回合的内容）。
+    db.tasks()
+        .create_index(
+            IndexModel::builder()
+                .keys(doc! {
+                    "kind": 1,
+                    "account_id": 1,
+                    "content": 1
+                })
+                .options(
+                    IndexOptions::builder()
+                        .unique(true)
+                        .partial_filter_expression(
+                            doc! { "kind": "outcome_aggregation" },
+                        )
+                        .name("uniq_outcome_aggregation_kind_account_content".to_string())
+                        .build(),
+                )
+                .build(),
+            None,
+        )
+        .await?;
     db.events()
         .create_index(
             IndexModel::builder()
@@ -97,6 +123,25 @@ pub(super) async fn ensure_all(db: &Database) -> anyhow::Result<()> {
                     "contact_wxid": 1,
                     "created_at": -1
                 })
+                .build(),
+            None,
+        )
+        .await?;
+    // P1-2：可选事件去重锚点。携带 `dedupe_key` 的事件按 (workspace_id, dedupe_key)
+    // 严格唯一；不携带的事件落 partial filter 之外，正常重复写。
+    db.events()
+        .create_index(
+            IndexModel::builder()
+                .keys(doc! { "workspace_id": 1, "dedupe_key": 1 })
+                .options(
+                    IndexOptions::builder()
+                        .unique(true)
+                        .name("uniq_events_workspace_dedupe_key".to_string())
+                        .partial_filter_expression(doc! {
+                            "dedupe_key": { "$type": "string" }
+                        })
+                        .build(),
+                )
                 .build(),
             None,
         )
@@ -328,6 +373,19 @@ pub(super) async fn ensure_all(db: &Database) -> anyhow::Result<()> {
             None,
         )
         .await?;
+    // #154：crash-recovery post-hoc 核对（outbox_dispatcher::mcp_already_succeeded）
+    // 在热路径上 count `mcp_call_logs` by (account_id, tool_name, created_at>=lb)。
+    // 无索引时 reclaim 一次就全表扫 mcp_call_logs（高写入量集合）。复合索引让
+    // 候选集先按 account_id+tool_name+时间窗收敛，request.recipient/content/error
+    // 作残余过滤。
+    db.mcp_logs()
+        .create_index(
+            IndexModel::builder()
+                .keys(doc! { "account_id": 1, "tool_name": 1, "created_at": -1 })
+                .build(),
+            None,
+        )
+        .await?;
     db.memory_candidates()
         .create_index(
             IndexModel::builder()
@@ -396,6 +454,45 @@ pub(super) async fn ensure_all(db: &Database) -> anyhow::Result<()> {
             None,
         )
         .await?;
+    // #154：高写入量日志集合 TTL（默认 30 天）。llm_call_logs / agent_run_logs /
+    // mcp_call_logs 是每条入站/每次决策都追加的诊断日志，无上限会无限增长并拖慢
+    // 上面那些 (workspace_id, ..., created_at) 复合查询。TTL 只清诊断日志，不动
+    // 业务事实表（contacts / conversation_messages / agent_send_outbox 等）。
+    // 0 表示禁用 TTL（保留全部历史）。
+    let log_ttl_days: u64 = std::env::var("DIAGNOSTIC_LOG_TTL_DAYS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(30);
+    if log_ttl_days > 0 {
+        let log_ttl = std::time::Duration::from_secs(log_ttl_days * 24 * 60 * 60);
+        db.llm_call_logs()
+            .create_index(
+                IndexModel::builder()
+                    .keys(doc! { "created_at": 1 })
+                    .options(IndexOptions::builder().expire_after(log_ttl).build())
+                    .build(),
+                None,
+            )
+            .await?;
+        db.agent_run_logs()
+            .create_index(
+                IndexModel::builder()
+                    .keys(doc! { "created_at": 1 })
+                    .options(IndexOptions::builder().expire_after(log_ttl).build())
+                    .build(),
+                None,
+            )
+            .await?;
+        db.mcp_logs()
+            .create_index(
+                IndexModel::builder()
+                    .keys(doc! { "created_at": 1 })
+                    .options(IndexOptions::builder().expire_after(log_ttl).build())
+                    .build(),
+                None,
+            )
+            .await?;
+    }
     // S-18 / Task 18：evaluation_scenarios 唯一索引（scenario_id 在 workspace 内唯一）。
     db.evaluation_scenarios()
         .create_index(
@@ -783,6 +880,23 @@ async fn ensure_evolution_indexes(db: &Database) -> anyhow::Result<()> {
         )
         .await?;
 
+    // threshold_overrides_audit（Phase C / C5）：不可变变更日志。admin 审计读路径
+    // 按 (workspace_id, account_id, gate_key, decided_at desc) 拉单 gate 历史，
+    // 也支持去掉 gate_key 拉全量；append-only，无 unique 约束。
+    db.threshold_overrides_audit()
+        .create_index(
+            IndexModel::builder()
+                .keys(doc! {
+                    "workspace_id": 1,
+                    "account_id": 1,
+                    "gate_key": 1,
+                    "decided_at": -1,
+                })
+                .build(),
+            None,
+        )
+        .await?;
+
     // post_release_reviews（W4 Task 5.6 一并加，避免 W4 再补一波索引）
     db.post_release_reviews()
         .create_index(
@@ -1137,6 +1251,75 @@ async fn ensure_evolution_indexes(db: &Database) -> anyhow::Result<()> {
                     IndexOptions::builder()
                         .name("admin_sessions_ttl".to_string())
                         .expire_after(std::time::Duration::from_secs(0))
+                        .build(),
+                )
+                .build(),
+            None,
+        )
+        .await?;
+
+    // ── P1-6 auto-ingest ──────────────────────────────────────────────────
+    // ingest_sources：worker 每轮扫 (workspace_id, kind, status="active") 决定要拉哪些 source。
+    db.ingest_sources()
+        .create_index(
+            IndexModel::builder()
+                .keys(doc! { "workspace_id": 1, "kind": 1, "status": 1 })
+                .options(
+                    IndexOptions::builder()
+                        .name("ingest_sources_ws_kind_status_idx".to_string())
+                        .build(),
+                )
+                .build(),
+            None,
+        )
+        .await?;
+    // ingest_sources.source_id unique：CRUD 与 worker 落点都按 source_id 定位单行。
+    db.ingest_sources()
+        .create_index(
+            IndexModel::builder()
+                .keys(doc! { "source_id": 1 })
+                .options(
+                    IndexOptions::builder()
+                        .name("ingest_sources_source_id_unique".to_string())
+                        .unique(true)
+                        .build(),
+                )
+                .build(),
+            None,
+        )
+        .await?;
+
+    // ── Phase C / C1 reviewer_stats ───────────────────────────────────────
+    // reviewer_stats.stat_id unique：feedback_worker 每 workspace 一行滚动统计，
+    // upsert 落点按 stat_id (`<workspace_id>::reviewer`) 定位。
+    db.raw()
+        .collection::<mongodb::bson::Document>("reviewer_stats")
+        .create_index(
+            IndexModel::builder()
+                .keys(doc! { "stat_id": 1 })
+                .options(
+                    IndexOptions::builder()
+                        .name("reviewer_stats_stat_id_unique".to_string())
+                        .unique(true)
+                        .build(),
+                )
+                .build(),
+            None,
+        )
+        .await?;
+
+    // ── Phase G / P2 lessons_learned ──────────────────────────────────────
+    // lessons_learned 经 raw collection 读写（无 typed accessor）；list 查询按
+    // {workspace_id} 过滤 + {updated_at:-1} 排序（lessons_learned.rs:60,76），
+    // 此复合索引覆盖该访问路径。
+    db.raw()
+        .collection::<mongodb::bson::Document>("lessons_learned")
+        .create_index(
+            IndexModel::builder()
+                .keys(doc! { "workspace_id": 1, "updated_at": -1 })
+                .options(
+                    IndexOptions::builder()
+                        .name("lessons_learned_ws_updated".to_string())
                         .build(),
                 )
                 .build(),

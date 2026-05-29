@@ -102,6 +102,7 @@ pub async fn ensure_prompt_pack_v2(
                         summary,
                         details: Some(details),
                         created_at: DateTime::now(),
+                        dedupe_key: None,
                     },
                     None,
                 )

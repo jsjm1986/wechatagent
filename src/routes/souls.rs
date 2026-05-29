@@ -2,7 +2,7 @@
 
 use axum::{
     extract::{Path, State},
-    Json,
+    Extension, Json,
 };
 use futures::TryStreamExt;
 use mongodb::{
@@ -13,6 +13,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::{
+    auth::AuthenticatedAdmin,
     error::{AppError, AppResult},
     models::AgentSoul,
     prompts,
@@ -29,13 +30,16 @@ pub(super) struct AgentSoulRequest {
     content: String,
 }
 
-pub(super) async fn list_agent_souls(State(state): State<AppState>) -> AppResult<Json<Value>> {
-    ensure_default_souls(&state).await?;
+pub(super) async fn list_agent_souls(
+    State(state): State<AppState>,
+    Extension(admin): Extension<AuthenticatedAdmin>,
+) -> AppResult<Json<Value>> {
+    ensure_default_souls(&state, &admin.current_workspace).await?;
     let mut cursor = state
         .db
         .agent_souls()
         .find(
-            doc! { "workspace_id": &state.config.default_workspace_id },
+            doc! { "workspace_id": &admin.current_workspace },
             FindOptions::builder()
                 .sort(doc! { "agent_kind": 1, "version": -1 })
                 .build(),
@@ -58,6 +62,7 @@ pub(super) async fn list_agent_souls(State(state): State<AppState>) -> AppResult
 
 pub(super) async fn create_agent_soul(
     State(state): State<AppState>,
+    Extension(admin): Extension<AuthenticatedAdmin>,
     Json(payload): Json<AgentSoulRequest>,
 ) -> AppResult<Json<Value>> {
     if payload.agent_kind.trim().is_empty() || payload.content.trim().is_empty() {
@@ -70,7 +75,7 @@ pub(super) async fn create_agent_soul(
         .agent_souls()
         .find_one(
             doc! {
-                "workspace_id": &state.config.default_workspace_id,
+                "workspace_id": &admin.current_workspace,
                 "agent_kind": &payload.agent_kind
             },
             FindOneOptions::builder()
@@ -81,7 +86,7 @@ pub(super) async fn create_agent_soul(
     let version = latest.map(|item| item.version + 1).unwrap_or(1);
     let soul = AgentSoul {
         id: None,
-        workspace_id: state.config.default_workspace_id.clone(),
+        workspace_id: admin.current_workspace.clone(),
         agent_kind: payload.agent_kind,
         name: payload.name,
         content: payload.content,
@@ -98,6 +103,7 @@ pub(super) async fn create_agent_soul(
 
 pub(super) async fn update_agent_soul(
     State(state): State<AppState>,
+    Extension(admin): Extension<AuthenticatedAdmin>,
     Path(id): Path<String>,
     Json(payload): Json<AgentSoulRequest>,
 ) -> AppResult<Json<Value>> {
@@ -116,7 +122,7 @@ pub(super) async fn update_agent_soul(
         .update_one(
             doc! {
                 "_id": object_id,
-                "workspace_id": &state.config.default_workspace_id
+                "workspace_id": &admin.current_workspace
             },
             doc! {
                 "$set": {
@@ -135,12 +141,16 @@ pub(super) async fn update_agent_soul(
 pub(super) async fn publish_agent_soul(
     State(state): State<AppState>,
     Path(id): Path<String>,
+    Extension(admin): Extension<AuthenticatedAdmin>,
 ) -> AppResult<Json<Value>> {
     let object_id = parse_object_id(&id)?;
     let soul = state
         .db
         .agent_souls()
-        .find_one(doc! { "_id": object_id }, None)
+        .find_one(
+            doc! { "_id": object_id, "workspace_id": &admin.current_workspace },
+            None,
+        )
         .await?
         .ok_or_else(|| AppError::NotFound("agent soul not found".to_string()))?;
     state
@@ -148,7 +158,7 @@ pub(super) async fn publish_agent_soul(
         .agent_souls()
         .delete_many(
             doc! {
-                "workspace_id": &soul.workspace_id,
+                "workspace_id": &admin.current_workspace,
                 "agent_kind": &soul.agent_kind,
                 "_id": { "$ne": object_id }
             },
@@ -159,7 +169,7 @@ pub(super) async fn publish_agent_soul(
         .db
         .agent_souls()
         .update_one(
-            doc! { "_id": object_id },
+            doc! { "_id": object_id, "workspace_id": &admin.current_workspace },
             doc! { "$set": { "status": "published", "updated_at": DateTime::now() } },
             None,
         )
@@ -167,10 +177,10 @@ pub(super) async fn publish_agent_soul(
     Ok(Json(json!({ "ok": true })))
 }
 
-pub(super) async fn ensure_default_souls(state: &AppState) -> AppResult<()> {
+pub(super) async fn ensure_default_souls(state: &AppState, workspace_id: &str) -> AppResult<()> {
     prompts::ensure_prompt_pack_v2(
         &state.db,
-        &state.config.default_workspace_id,
+        workspace_id,
         &state.config.default_account_id,
     )
     .await

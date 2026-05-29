@@ -2,7 +2,7 @@
 
 use axum::{
     extract::{Path, Query, State},
-    Json,
+    Extension, Json,
 };
 use futures::TryStreamExt;
 use mongodb::{
@@ -13,6 +13,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::{
+    auth::AuthenticatedAdmin,
     error::{AppError, AppResult},
     models::OperationDomainConfig,
     prompts,
@@ -48,12 +49,11 @@ pub(super) struct OperationDomainRequest {
 
 pub(super) async fn list_operation_domains(
     State(state): State<AppState>,
+    Extension(admin): Extension<AuthenticatedAdmin>,
     Query(query): Query<ListOperationDomainsQuery>,
 ) -> AppResult<Json<Value>> {
-    ensure_operation_domains(&state).await?;
-    // 默认只列 current_version=true；老 row（m015 之前）`current_version` 字段缺失，
-    // 用 `$ne: false` 兼容，让历史部署 import 后无须显式 publish 也能正常显示。
-    let mut filter = doc! { "workspace_id": &state.config.default_workspace_id };
+    ensure_operation_domains(&state, &admin.current_workspace).await?;
+    let mut filter = doc! { "workspace_id": &admin.current_workspace };
     if !query.include_all_versions {
         filter.insert("current_version", doc! { "$ne": false });
     }
@@ -76,30 +76,30 @@ pub(super) async fn list_operation_domains(
 
 pub(super) async fn get_operation_domain(
     State(state): State<AppState>,
+    Extension(admin): Extension<AuthenticatedAdmin>,
     Path(domain): Path<String>,
 ) -> AppResult<Json<Value>> {
-    ensure_operation_domains(&state).await?;
-    let config = find_operation_domain(&state, &domain).await?;
+    ensure_operation_domains(&state, &admin.current_workspace).await?;
+    let config = find_operation_domain(&state, &admin.current_workspace, &domain).await?;
     Ok(Json(json!({ "item": operation_domain_json(config) })))
 }
 
 pub(super) async fn update_operation_domain(
     State(state): State<AppState>,
+    Extension(admin): Extension<AuthenticatedAdmin>,
     Path(domain): Path<String>,
     Json(mut payload): Json<OperationDomainRequest>,
 ) -> AppResult<Json<Value>> {
     validate_operation_domain_input(&payload)?;
     validate_state_machine(&payload.state_machine)?;
-    // 波 C1：`allowFromAny=true` 的 state 写入前把 `allowedFrom` 归一化为 `[]`，
-    // 避免出现"列表里写了来源但运行时被忽略"的认知偏差。
     normalize_state_machine_allow_from_any(&mut payload.state_machine);
-    ensure_operation_domains(&state).await?;
+    ensure_operation_domains(&state, &admin.current_workspace).await?;
     state
         .db
         .operation_domain_configs()
         .update_one(
             doc! {
-                "workspace_id": &state.config.default_workspace_id,
+                "workspace_id": &admin.current_workspace,
                 "domain": &domain,
                 // Phase E / E5-T1：PATCH 只更新当前生效版本，避免在多版本灰度时
                 // 非确定性写到任意 row。`$ne: false` 让 m015 之前未 backfill 的
@@ -129,31 +129,30 @@ pub(super) async fn update_operation_domain(
 
 pub(super) async fn get_operation_domain_state_machine(
     State(state): State<AppState>,
+    Extension(admin): Extension<AuthenticatedAdmin>,
     Path(domain): Path<String>,
 ) -> AppResult<Json<Value>> {
-    ensure_operation_domains(&state).await?;
-    let config = find_operation_domain(&state, &domain).await?;
+    ensure_operation_domains(&state, &admin.current_workspace).await?;
+    let config = find_operation_domain(&state, &admin.current_workspace, &domain).await?;
     Ok(Json(json!({ "item": config.state_machine })))
 }
 
 pub(super) async fn update_operation_domain_state_machine(
     State(state): State<AppState>,
+    Extension(admin): Extension<AuthenticatedAdmin>,
     Path(domain): Path<String>,
     Json(mut payload): Json<Document>,
 ) -> AppResult<Json<Value>> {
-    ensure_operation_domains(&state).await?;
+    ensure_operation_domains(&state, &admin.current_workspace).await?;
     validate_state_machine(&payload)?;
-    // 波 C1：归一化 `allowFromAny=true` 时的 allowedFrom。
     normalize_state_machine_allow_from_any(&mut payload);
     state
         .db
         .operation_domain_configs()
         .update_one(
             doc! {
-                "workspace_id": &state.config.default_workspace_id,
+                "workspace_id": &admin.current_workspace,
                 "domain": &domain,
-                // Phase E / E5-T1：state-machine PATCH 与 update_operation_domain 同源，
-                // 只写当前 active 版本。
                 "current_version": { "$ne": false },
             },
             doc! {
@@ -170,9 +169,10 @@ pub(super) async fn update_operation_domain_state_machine(
 
 pub(super) async fn reset_operation_domain(
     State(state): State<AppState>,
+    Extension(admin): Extension<AuthenticatedAdmin>,
     Path(domain): Path<String>,
 ) -> AppResult<Json<Value>> {
-    let Some(default_config) = prompts::default_domain_configs(&state.config.default_workspace_id)
+    let Some(default_config) = prompts::default_domain_configs(&admin.current_workspace)
         .into_iter()
         .find(|item| item.domain == domain)
     else {
@@ -183,7 +183,7 @@ pub(super) async fn reset_operation_domain(
         .operation_domain_configs()
         .delete_many(
             doc! {
-                "workspace_id": &state.config.default_workspace_id,
+                "workspace_id": &admin.current_workspace,
                 "domain": &domain
             },
             None,
@@ -213,8 +213,6 @@ pub(super) fn operation_domain_json(config: OperationDomainConfig) -> Value {
         "stateMachine": config.state_machine,
         "status": config.status,
         "updatedAt": crate::models::dt_to_string(config.updated_at),
-        // Phase E / E5-T1：active_versions 灰度字段。前端在 OperationDomainSettings
-        // 面板渲染当前版本号 + previous_version 回滚链 + seededBy 写入来源徽章。
         "version": config.version,
         "currentVersion": config.current_version,
         "previousVersion": config.previous_version,
@@ -294,10 +292,6 @@ pub(super) fn validate_state_machine(machine: &Document) -> AppResult<()> {
 }
 
 /// 波 C1：把 `allowFromAny=true` 的 state 的 `allowedFrom` 归一化为空数组。
-///
-/// 运行时 `check_state_transition` 在 `allowFromAny=true` 时直接放行，不再读
-/// `allowedFrom`，所以保留旧值无意义但会让运营误以为"列表生效"。这里在写
-/// 入前清掉，前端读回时就只显示空数组 + 「该状态允许从任意状态迁入」提示。
 pub(super) fn normalize_state_machine_allow_from_any(machine: &mut Document) {
     let Ok(states) = machine.get_array_mut("states") else {
         return;
@@ -312,14 +306,17 @@ pub(super) fn normalize_state_machine_allow_from_any(machine: &mut Document) {
     }
 }
 
-pub(super) async fn ensure_operation_domains(state: &AppState) -> AppResult<()> {
-    for config in prompts::default_domain_configs(&state.config.default_workspace_id) {
+pub(super) async fn ensure_operation_domains(
+    state: &AppState,
+    workspace_id: &str,
+) -> AppResult<()> {
+    for config in prompts::default_domain_configs(workspace_id) {
         let existing = state
             .db
             .operation_domain_configs()
             .find_one(
                 doc! {
-                    "workspace_id": &state.config.default_workspace_id,
+                    "workspace_id": workspace_id,
                     "domain": &config.domain
                 },
                 None,
@@ -332,7 +329,7 @@ pub(super) async fn ensure_operation_domains(state: &AppState) -> AppResult<()> 
                     .operation_domain_configs()
                     .update_one(
                         doc! {
-                            "workspace_id": &state.config.default_workspace_id,
+                            "workspace_id": workspace_id,
                             "domain": "user_operations"
                         },
                         doc! {
@@ -358,15 +355,14 @@ pub(super) async fn ensure_operation_domains(state: &AppState) -> AppResult<()> 
 
 pub(super) async fn find_operation_domain(
     state: &AppState,
+    workspace_id: &str,
     domain: &str,
 ) -> AppResult<OperationDomainConfig> {
-    // Phase E / E5-T1：单条读路径优先取 `current_version=true`；m015 之前老库
-    // 没该字段时 fallback 到 `$exists=false` 行（与 runtime.rs:371 同形态）。
     let coll = state.db.operation_domain_configs();
     if let Some(active) = coll
         .find_one(
             doc! {
-                "workspace_id": &state.config.default_workspace_id,
+                "workspace_id": workspace_id,
                 "domain": domain,
                 "current_version": true,
             },
@@ -376,17 +372,16 @@ pub(super) async fn find_operation_domain(
     {
         return Ok(active);
     }
-    coll
-        .find_one(
-            doc! {
-                "workspace_id": &state.config.default_workspace_id,
-                "domain": domain,
-                "current_version": { "$exists": false },
-            },
-            None,
-        )
-        .await?
-        .ok_or_else(|| AppError::NotFound("operation domain not found".to_string()))
+    coll.find_one(
+        doc! {
+            "workspace_id": workspace_id,
+            "domain": domain,
+            "current_version": { "$exists": false },
+        },
+        None,
+    )
+    .await?
+    .ok_or_else(|| AppError::NotFound("operation domain not found".to_string()))
 }
 
 
@@ -395,7 +390,6 @@ mod tests {
     use super::*;
     use mongodb::bson::{doc, Bson};
 
-    /// 波 C1：`allowFromAny=true` 的 state 写入前 allowedFrom 被清空。
     #[test]
     fn normalize_clears_allowed_from_when_allow_from_any() {
         let mut machine = doc! {
@@ -432,7 +426,6 @@ mod tests {
         );
     }
 
-    /// 波 C1：缺失 allowFromAny 字段时不改 allowedFrom。
     #[test]
     fn normalize_keeps_allowed_from_when_allow_from_any_missing() {
         let mut machine = doc! {
@@ -452,7 +445,6 @@ mod tests {
         );
     }
 
-    /// 波 C1：validate_state_machine 对重复 key / 未知 from 报 BadRequest。
     #[test]
     fn validate_state_machine_rejects_duplicate_keys() {
         let machine = doc! {

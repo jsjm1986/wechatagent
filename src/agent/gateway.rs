@@ -284,7 +284,7 @@ pub async fn send_contact_message_gateway(
 
     // S5.2 (Phase 0)：原先这里直接调 `send_outbound_message`，绕过 outbox →
     // 失去 R13 幂等键 + 二次安全门保护。改成 enqueue 到 `agent_send_outbox`，
-    // dispatcher worker 接管真正的 MCP 发送。返回值的 messageId 在管理 API
+    // dispatcher worker 异步消费 outbox 完成 MCP 发送。返回值的 messageId 在管理 API
     // 同步路径下不再可得（dispatcher 异步），按 R13.2 设计语义返回
     // gateway_status="outbox_enqueued"，调用方据此感知"已交付到发送队列"。
     let pending_result = SendGatewayResult {
@@ -1296,6 +1296,7 @@ async fn run_user_operation_gateway_inner(
             // W4 / Task 5.5：发送改异步走 outbox，把 task 状态推进为
             // `outbox_enqueued` 而不是 `sent`；真正 `sent` 由 dispatcher 在
             // MCP 成功后更新（dispatcher 反向通道见 5.4）。
+            crate::models::assert_agent_task_status_valid("outbox_enqueued");
             state
                 .db
                 .tasks()
@@ -1375,7 +1376,7 @@ async fn run_user_operation_gateway_inner(
         &contact,
         &run_id,
         trigger.kind(),
-        if final_decision.should_reply { "sent" } else { "no_reply" },
+        if final_decision.should_reply { "outbox_enqueued" } else { "no_reply" },
         &planner,
         doc! { "refreshed": should_refresh_context, "version": context_pack.get_i32("version").unwrap_or_default() },
         &knowledge_route,
@@ -1729,6 +1730,7 @@ async fn cancel_task(
     status: &str,
     reason: &str,
 ) -> AppResult<()> {
+    crate::models::assert_agent_task_status_valid("cancelled");
     state
         .db
         .tasks()
@@ -1746,6 +1748,29 @@ async fn cancel_task(
         )
         .await?;
     Ok(())
+}
+
+/// P2-4：判定 operation_state 是否发生有效迁移。
+///
+/// * 返回 `Some((prior_normalized, next_normalized))` 表示需要写一条
+///   `agent.operation_state_transitioned` stage event；
+/// * 返回 `None` 表示无变化（同状态 / 新状态空 / 仅大小写空白差异）。
+///
+/// `prior` 取自 contact 当前 doc，`next` 取自 LLM 决策 (`decision.operation_state`)。
+/// 二者均做 `trim` 归一化；prior 缺失视为空串。
+pub(crate) fn detect_state_transition<'a>(
+    prior: Option<&'a str>,
+    next: Option<&'a str>,
+) -> Option<(String, String)> {
+    let next_norm = next.map(str::trim).unwrap_or("");
+    if next_norm.is_empty() {
+        return None;
+    }
+    let prior_norm = prior.map(str::trim).unwrap_or("");
+    if prior_norm == next_norm {
+        return None;
+    }
+    Some((prior_norm.to_string(), next_norm.to_string()))
 }
 
 async fn apply_agent_updates(
@@ -1850,6 +1875,32 @@ async fn apply_agent_updates(
         .contacts()
         .update_one(doc! { "_id": contact.id }, doc! { "$set": set_doc }, None)
         .await?;
+
+    // P2-4：operation_state 发生迁移时写一条 stage event，便于 staleness /
+    // funnel / dashboard 复盘。同状态或新状态为空时不发，避免噪声。
+    if let Some((prior, next)) = detect_state_transition(
+        contact.operation_state.as_deref(),
+        decision.operation_state.as_deref(),
+    ) {
+        write_event_for_account(
+            state,
+            &contact.account_id,
+            Some(&contact.wxid),
+            "agent.operation_state_transitioned",
+            "transitioned",
+            &format!("operation_state {prior} → {next}"),
+            Some(doc! {
+                "prior_state": &prior,
+                "next_state": &next,
+                "reason": decision
+                    .operation_state_reason
+                    .clone()
+                    .unwrap_or_default(),
+                "confidence": decision.operation_state_confidence.unwrap_or(0),
+            }),
+        )
+        .await?;
+    }
 
     if let Some(follow_up) = &decision.follow_up {
         if follow_up.needed && !follow_up.content.trim().is_empty() {
@@ -2375,6 +2426,7 @@ pub async fn write_event_for_account(
                 summary: summary.to_string(),
                 details,
                 created_at: DateTime::now(),
+                dedupe_key: None,
             },
             None,
         )
@@ -2713,6 +2765,41 @@ mod tests {
             out.customer_stage_rewrite.as_deref(),
             Some("premium_first_contact"),
             "应命中 account scope 的 alias，而非回落 global"
+        );
+    }
+
+    /// P2-4：operation_state 同状态 / 缺值 SHALL 不触发 stage event。
+    #[test]
+    fn detect_state_transition_skips_no_op() {
+        assert!(detect_state_transition(None, None).is_none());
+        assert!(detect_state_transition(None, Some("")).is_none());
+        assert!(detect_state_transition(None, Some("   ")).is_none());
+        assert!(detect_state_transition(Some("intro"), Some("intro")).is_none());
+        assert!(
+            detect_state_transition(Some("  intro  "), Some("intro")).is_none(),
+            "trim 后相等也算同状态"
+        );
+    }
+
+    /// P2-4：从空 / None → 新状态 SHALL 触发首次 stage event。
+    #[test]
+    fn detect_state_transition_emits_on_first_state() {
+        let out = detect_state_transition(None, Some("intro"));
+        assert_eq!(out, Some(("".to_string(), "intro".to_string())));
+        let out = detect_state_transition(Some(""), Some("intro"));
+        assert_eq!(out, Some(("".to_string(), "intro".to_string())));
+    }
+
+    /// P2-4：A → B SHALL 触发 stage event；prior 与 next 双双归一化。
+    #[test]
+    fn detect_state_transition_emits_on_change() {
+        let out = detect_state_transition(Some("intro"), Some("qualifying"));
+        assert_eq!(out, Some(("intro".to_string(), "qualifying".to_string())));
+        let out = detect_state_transition(Some(" intro\n"), Some(" closing "));
+        assert_eq!(
+            out,
+            Some(("intro".to_string(), "closing".to_string())),
+            "返回值应是 trim 后字符串"
         );
     }
 }

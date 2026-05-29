@@ -15,8 +15,10 @@
 mod common;
 
 use axum::extract::{Query, State};
+use axum::Extension;
 use mongodb::bson::{doc, oid::ObjectId, DateTime, Document};
 use serde_json::Value;
+use wechatagent::auth::AuthenticatedAdmin;
 use wechatagent::routes::{get_autonomy_outcomes, AutonomyMetricsQuery};
 
 /// 直接插入一条 `agent_run_logs` 原始 BSON 文档（不走 typed `AgentRunLog`），
@@ -54,7 +56,12 @@ async fn call_metrics(app: &common::TestApp) -> Value {
     // account_id=config.default_account_id。serde-urlencoded 走不通时这里
     // 直接 deserialize 一个空字符串就能命中"全 None"。
     let q: AutonomyMetricsQuery = serde_json::from_value(serde_json::json!({})).unwrap();
-    let resp = get_autonomy_outcomes(State(app.state.clone()), Query(q))
+    let admin = AuthenticatedAdmin {
+        user_id: "test_admin".into(),
+        username: "test_admin".into(),
+        current_workspace: app.state.config.default_workspace_id.clone(),
+    };
+    let resp = get_autonomy_outcomes(State(app.state.clone()), Extension(admin), Query(q))
         .await
         .expect("get_autonomy_outcomes ok");
     resp.0

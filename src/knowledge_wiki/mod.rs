@@ -22,5 +22,7 @@ pub mod catalog_rebuild;
 pub mod chunk_revisions;
 pub mod feedback_worker;
 pub mod gap_signals;
+pub mod ingest_worker;
 pub mod lessons_learned;
 pub mod page_merge;
+pub mod reviewer_stats;

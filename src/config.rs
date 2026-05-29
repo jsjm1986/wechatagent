@@ -1,6 +1,8 @@
 use std::env;
 
-#[derive(Debug, Clone)]
+use crate::secret::mask_secret;
+
+#[derive(Clone)]
 pub struct AppConfig {
     pub app_host: String,
     pub app_port: u16,
@@ -105,6 +107,11 @@ pub struct AppConfig {
     pub evolution_min_self_critique_delta: f64,
     /// M4：5 闸命中率任一上升不得超过此值（防止 prompt 修订引入新风险）。
     pub evolution_max_5gate_hit_increase: f64,
+    /// #152：安全闸（fact_risk_block / pressure_risk_block / product_accuracy_score_block）
+    /// 放松提案的「安全回归率」上限——shadow 中"原本被该安全闸拦下、新阈值却放行"
+    /// 的占比超过此值即 reject，哪怕 send_success 提升达标。默认 0.0（零容忍：
+    /// 任一条风险消息从 blocked 翻成 sent 即否决放松）。
+    pub evolution_max_safety_regression_rate: f64,
     /// M4：shadow replay 并发上限（tokio Semaphore 容量）。
     pub evolution_replay_concurrency: usize,
     /// M4：shadow replay 失败率上限——超过此比例直接 reject 候选。
@@ -152,6 +159,12 @@ pub struct AppConfig {
     pub catalog_rebuild_worker_interval_seconds: u64,
     /// knowledge-wiki Phase F：feedback worker tick 间隔秒数；0 表示停掉。默认 600（10 分钟）。
     pub knowledge_feedback_interval_seconds: u64,
+    /// Phase G P1-6：auto-ingest worker 总开关。默认 false（安装态关停，需运维显式打开）。
+    /// 关闭时 `main.rs` 不 spawn worker，等价于功能未上线，是回滚开关。
+    pub ingest_worker_enabled: bool,
+    /// Phase G P1-6：auto-ingest worker tick 间隔秒数；0 表示停掉。默认 3600（每小时一轮）。
+    /// 单 source 自身的 schedule_minutes 节流叠加在这之上（更长时间间隔以 source 为准）。
+    pub ingest_worker_interval_seconds: u64,
     /// Phase E / E2：reviewer 双脑并行开关。`true` 时 review_decision 会用第二
     /// provider 并行跑一次评分；与主 reviewer 在 `approved` 或软闸命中上分歧
     /// 即触发 single-shot revision，达到 epistemic diversity。`false`（默认）
@@ -184,6 +197,65 @@ pub struct AppConfig {
     /// webhook 是否校验 HMAC-SHA256(body, MCP_API_KEY) 签名（X-MCP-Signature 头）。
     /// 生产必须 true；staging/local 测试可以临时关掉。默认 true。
     pub webhook_verify_signature: bool,
+    // ── P1-7：JWT RS256（公网 Bearer token 鉴权） ──
+    //
+    // session cookie 同 origin 路径，已经覆盖 admin SPA。公网 / 第三方调用走 JWT：
+    // `Authorization: Bearer <jwt>`。`jwt_enabled=false`（默认）时 middleware 仅
+    // 接 cookie 路径；置 true 必须同时配齐 PEM 双密钥，否则启动期 panic 拒起。
+    /// JWT 总开关。`true` 时 `/auth/token` 路由开放、middleware 接受 Bearer 头。
+    pub jwt_enabled: bool,
+    /// JWT 过期窗口（分钟）。默认 60。
+    pub jwt_ttl_minutes: i64,
+    /// RS256 私钥 PEM。`jwt_enabled=true` 时必填。
+    pub jwt_private_key_pem: Option<String>,
+    /// RS256 公钥 PEM。`jwt_enabled=true` 时必填，用于 verify。
+    pub jwt_public_key_pem: Option<String>,
+}
+
+/// 手写 `Debug` 实现：把所有 secret 字段过 [`mask_secret`]，避免日志/panic
+/// 输出 `{:?}` 时把完整 api_key / 密码泄漏到 stdout 与 tracing 后端。
+/// 非 secret 字段保持透出，方便启动期诊断。
+impl std::fmt::Debug for AppConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AppConfig")
+            .field("app_host", &self.app_host)
+            .field("app_port", &self.app_port)
+            .field("app_base_url", &self.app_base_url)
+            .field("mongodb_uri", &self.mongodb_uri)
+            .field("mongodb_database", &self.mongodb_database)
+            .field("mcp_base_url", &self.mcp_base_url)
+            .field("mcp_api_key", &mask_secret(&self.mcp_api_key))
+            .field("openai_base_url", &self.openai_base_url)
+            .field("openai_api_key", &mask_secret(&self.openai_api_key))
+            .field("openai_model", &self.openai_model)
+            .field("default_workspace_id", &self.default_workspace_id)
+            .field("default_account_id", &self.default_account_id)
+            .field(
+                "reviewer_second_provider_api_key",
+                &self
+                    .reviewer_second_provider_api_key
+                    .as_deref()
+                    .map(mask_secret),
+            )
+            .field("bootstrap_admin_username", &self.bootstrap_admin_username)
+            .field(
+                "bootstrap_admin_password",
+                &self.bootstrap_admin_password.as_deref().map(mask_secret),
+            )
+            .field("webhook_verify_signature", &self.webhook_verify_signature)
+            .field("session_cookie_secure", &self.session_cookie_secure)
+            .field("jwt_enabled", &self.jwt_enabled)
+            .field("jwt_ttl_minutes", &self.jwt_ttl_minutes)
+            .field(
+                "jwt_private_key_pem",
+                &self.jwt_private_key_pem.as_deref().map(mask_secret),
+            )
+            .field(
+                "jwt_public_key_pem",
+                &self.jwt_public_key_pem.as_deref().map(mask_secret),
+            )
+            .finish_non_exhaustive()
+    }
 }
 
 impl AppConfig {
@@ -285,6 +357,11 @@ impl AppConfig {
                 .parse()?,
             evolution_max_5gate_hit_increase: env_or("EVOLUTION_MAX_5GATE_HIT_INCREASE", "0.10")
                 .parse()?,
+            evolution_max_safety_regression_rate: env_or(
+                "EVOLUTION_MAX_SAFETY_REGRESSION_RATE",
+                "0.0",
+            )
+            .parse()?,
             evolution_replay_concurrency: env_or("EVOLUTION_REPLAY_CONCURRENCY", "4").parse()?,
             evolution_replay_max_fail_rate: env_or("EVOLUTION_REPLAY_MAX_FAIL_RATE", "0.30")
                 .parse()?,
@@ -343,6 +420,9 @@ impl AppConfig {
                 "600",
             )
             .parse()?,
+            ingest_worker_enabled: parse_bool(&env_or("INGEST_WORKER_ENABLED", "false")),
+            ingest_worker_interval_seconds: env_or("INGEST_WORKER_INTERVAL_SECONDS", "3600")
+                .parse()?,
             reviewer_dual_enabled: parse_bool(&env_or("REVIEWER_DUAL_ENABLED", "false")),
             reviewer_second_provider_base_url: env::var("REVIEWER_SECOND_PROVIDER_BASE_URL").ok(),
             reviewer_second_provider_api_key: env::var("REVIEWER_SECOND_PROVIDER_API_KEY").ok(),
@@ -357,6 +437,14 @@ impl AppConfig {
                 .ok()
                 .filter(|s| !s.trim().is_empty()),
             webhook_verify_signature: parse_bool(&env_or("WEBHOOK_VERIFY_SIGNATURE", "true")),
+            jwt_enabled: parse_bool(&env_or("JWT_ENABLED", "false")),
+            jwt_ttl_minutes: env_or("JWT_TTL_MINUTES", "60").parse()?,
+            jwt_private_key_pem: env::var("JWT_PRIVATE_KEY_PEM")
+                .ok()
+                .filter(|s| !s.trim().is_empty()),
+            jwt_public_key_pem: env::var("JWT_PUBLIC_KEY_PEM")
+                .ok()
+                .filter(|s| !s.trim().is_empty()),
         })
     }
 }

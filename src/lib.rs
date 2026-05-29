@@ -24,6 +24,8 @@ pub mod models;
 pub mod planner;
 pub mod prompts;
 pub mod routes;
+pub mod secret;
+pub mod supervisor;
 pub mod tasks;
 pub mod webhooks;
 

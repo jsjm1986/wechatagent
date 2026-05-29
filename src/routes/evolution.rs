@@ -16,7 +16,7 @@
 
 use axum::{
     extract::{Path, Query, State},
-    Json,
+    Extension, Json,
 };
 use futures::TryStreamExt;
 use mongodb::{
@@ -27,6 +27,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::{
+    auth::AuthenticatedAdmin,
     error::{AppError, AppResult},
     evolution::{
         error::EvolutionError,
@@ -63,6 +64,7 @@ pub(super) struct ConfirmationRequest {
 /// `GET /api/evolution/experiments?limit=20` —— 最近 N 个 experiment 信封 + proposals 摘要。
 pub(super) async fn list_evolution_experiments(
     State(state): State<AppState>,
+    Extension(admin): Extension<AuthenticatedAdmin>,
     Query(query): Query<ListExperimentsQuery>,
 ) -> AppResult<Json<Value>> {
     // FORBIDDEN: enqueue agent_send_outbox / mcp call
@@ -71,7 +73,7 @@ pub(super) async fn list_evolution_experiments(
         .unwrap_or(DEFAULT_EXPERIMENT_LIMIT)
         .clamp(1, MAX_EXPERIMENT_LIMIT);
 
-    let workspace_id = state.config.default_workspace_id.clone();
+    let workspace_id = admin.current_workspace.clone();
     let account_id = state.config.default_account_id.clone();
 
     let mut cursor = state
@@ -547,9 +549,10 @@ pub(super) struct UpdateRuntimeFlagRequest {
 /// 不在读路径触发写入；admin 通过 PUT 才显式落库。
 pub(super) async fn get_evolution_runtime_flag(
     State(state): State<AppState>,
+    Extension(admin): Extension<AuthenticatedAdmin>,
 ) -> AppResult<Json<Value>> {
     // FORBIDDEN: enqueue agent_send_outbox / mcp call
-    let workspace_id = state.config.default_workspace_id.clone();
+    let workspace_id = admin.current_workspace.clone();
     let flag = state
         .db
         .evolution_runtime_flags()
@@ -565,10 +568,11 @@ pub(super) async fn get_evolution_runtime_flag(
 /// `PUT /api/evolution/runtime-flag` —— upsert 灰度配置。
 pub(super) async fn put_evolution_runtime_flag(
     State(state): State<AppState>,
+    Extension(admin): Extension<AuthenticatedAdmin>,
     Json(payload): Json<UpdateRuntimeFlagRequest>,
 ) -> AppResult<Json<Value>> {
     // FORBIDDEN: enqueue agent_send_outbox / mcp call
-    let workspace_id = state.config.default_workspace_id.clone();
+    let workspace_id = admin.current_workspace.clone();
     let rollout_percent = payload.rollout_percent.min(100);
     let updated_by = payload
         .updated_by
@@ -607,6 +611,67 @@ pub(super) async fn put_evolution_runtime_flag(
         "ok": true,
         "flag": runtime_flag_json(&saved),
     })))
+}
+
+/// `GET /api/evolution/threshold-overrides/audit?gateKey=&limit=` —— Phase C / C5
+/// 阈值变更不可变审计日志（release / rollback / auto-release 全量），按 decided_at
+/// 倒序。admin 用它追因"某个 gate 何时、被谁、从哪个值改到哪个值、当时命中率多少"。
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct ThresholdAuditQuery {
+    gate_key: Option<String>,
+    limit: Option<i64>,
+}
+
+pub(super) async fn list_threshold_override_audit(
+    State(state): State<AppState>,
+    Extension(admin): Extension<AuthenticatedAdmin>,
+    Query(query): Query<ThresholdAuditQuery>,
+) -> AppResult<Json<Value>> {
+    // FORBIDDEN: enqueue agent_send_outbox / mcp call
+    let workspace_id = admin.current_workspace.clone();
+    let account_id = state.config.default_account_id.clone();
+    let limit = query.limit.unwrap_or(50).clamp(1, 200);
+
+    let mut filter = doc! {
+        "workspace_id": &workspace_id,
+        "account_id": &account_id,
+    };
+    if let Some(gate_key) = query.gate_key.as_deref().filter(|s| !s.trim().is_empty()) {
+        filter.insert("gate_key", gate_key);
+    }
+
+    let mut cursor = state
+        .db
+        .threshold_overrides_audit()
+        .find(
+            filter,
+            FindOptions::builder()
+                .sort(doc! { "decided_at": -1 })
+                .limit(limit)
+                .build(),
+        )
+        .await?;
+    let mut items = Vec::new();
+    while let Some(a) = cursor.try_next().await? {
+        items.push(threshold_override_audit_json(&a));
+    }
+    Ok(Json(json!({ "items": items })))
+}
+
+fn threshold_override_audit_json(a: &crate::models::ThresholdOverrideAudit) -> Value {
+    json!({
+        "id": a.id.map(|x| x.to_hex()),
+        "gateKey": a.gate_key,
+        "action": a.action,
+        "previousValue": a.previous_value,
+        "newValue": a.new_value,
+        "sourceProposalId": a.source_proposal_id.to_hex(),
+        "decidedBy": a.decided_by,
+        "decidedAt": datetime_to_rfc3339(a.decided_at),
+        "hitRateObserved": a.hit_rate_observed,
+        "significanceMetrics": a.significance_metrics.as_ref().map(bson_doc_to_json),
+    })
 }
 
 fn runtime_flag_json(f: &EvolutionRuntimeFlag) -> Value {
@@ -661,6 +726,32 @@ mod tests {
         }
     }
 
+    #[test]
+    fn threshold_override_audit_json_carries_value_transition() {
+        let audit = crate::models::ThresholdOverrideAudit {
+            id: Some(ObjectId::new()),
+            workspace_id: "default".to_string(),
+            account_id: "acct".to_string(),
+            gate_key: "fact_risk_block".to_string(),
+            action: "auto_released".to_string(),
+            previous_value: Some(6.0),
+            new_value: Some(5.5),
+            source_proposal_id: ObjectId::new(),
+            decided_by: "evolution_auto_release".to_string(),
+            decided_at: DateTime::now(),
+            hit_rate_observed: Some(0.012),
+            significance_metrics: None,
+        };
+        let v = threshold_override_audit_json(&audit);
+        assert_eq!(v["gateKey"], "fact_risk_block");
+        assert_eq!(v["action"], "auto_released");
+        assert_eq!(v["previousValue"], 6.0);
+        assert_eq!(v["newValue"], 5.5);
+        assert_eq!(v["decidedBy"], "evolution_auto_release");
+        // None significance_metrics 必须序列化成 null，不是缺字段。
+        assert!(v["significanceMetrics"].is_null());
+    }
+
     fn test_app_config() -> crate::config::AppConfig {
         crate::config::AppConfig {
             app_host: "127.0.0.1".to_string(),
@@ -709,6 +800,7 @@ mod tests {
             evolution_min_send_success_delta: 0.05,
             evolution_min_self_critique_delta: 0.10,
             evolution_max_5gate_hit_increase: 0.10,
+            evolution_max_safety_regression_rate: 0.0,
             evolution_replay_concurrency: 4,
             evolution_replay_max_fail_rate: 0.30,
             evolution_threshold_release_cooldown_hours: 24,
@@ -734,6 +826,12 @@ mod tests {
             bootstrap_admin_username: None,
             bootstrap_admin_password: None,
             webhook_verify_signature: false,
+            ingest_worker_enabled: false,
+            ingest_worker_interval_seconds: 3600,
+            jwt_enabled: false,
+            jwt_ttl_minutes: 60,
+            jwt_private_key_pem: None,
+            jwt_public_key_pem: None,
         }
     }
 }

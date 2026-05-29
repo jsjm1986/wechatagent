@@ -20,7 +20,7 @@
 
 use axum::{
     extract::{Query, State},
-    Json,
+    Extension, Json,
 };
 use chrono::Duration;
 use futures::TryStreamExt;
@@ -31,6 +31,7 @@ use mongodb::{
 use serde::Deserialize;
 use serde_json::{json, Value};
 
+use crate::auth::AuthenticatedAdmin;
 use crate::error::AppResult;
 
 use super::AppState;
@@ -217,9 +218,10 @@ async fn fetch_planner_section(
 
 pub async fn get_autonomy_outcomes(
     State(state): State<AppState>,
+    Extension(admin): Extension<AuthenticatedAdmin>,
     Query(query): Query<AutonomyMetricsQuery>,
 ) -> AppResult<Json<Value>> {
-    let workspace_id = state.config.default_workspace_id.clone();
+    let workspace_id = admin.current_workspace.clone();
     let account_id = query
         .account_id
         .unwrap_or_else(|| state.config.default_account_id.clone());
@@ -440,9 +442,10 @@ pub async fn get_autonomy_outcomes(
 
 pub async fn list_autonomy_revisions(
     State(state): State<AppState>,
+    Extension(admin): Extension<AuthenticatedAdmin>,
     Query(query): Query<AutonomyRevisionsQuery>,
 ) -> AppResult<Json<Value>> {
-    let workspace_id = state.config.default_workspace_id.clone();
+    let workspace_id = admin.current_workspace.clone();
     let account_id = query
         .account_id
         .unwrap_or_else(|| state.config.default_account_id.clone());

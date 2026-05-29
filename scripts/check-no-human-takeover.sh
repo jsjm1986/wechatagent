@@ -3,9 +3,9 @@
 #
 # CI 严禁词文本 lint（agent-autonomy-loop W6 / Task 7.7 / Requirement 2.7）。
 #
-# 在 git diff 新增行（+ 开头）范围内扫描 src/agent/ src/routes/ frontend/src/
-# 下是否引入了"human / 人工 / 接管 / takeover / hand-off"等违反"全自治、
-# 无人工接管"产品定位的字面量。任意命中 → exit 1。
+# 在 git diff 新增行（+ 开头）范围内扫描 src/agent/ src/routes/ src/evolution/
+# frontend/src/ 下是否引入了"human / 人工 / 接管 / takeover / hand-off"等违反
+# "全自治、无人工接管"产品定位的字面量。任意命中 → exit 1。
 #
 # 使用：
 #   scripts/check-no-human-takeover.sh                # 默认：origin/main..HEAD
@@ -15,7 +15,7 @@
 # 注意：
 # - 仅扫描"diff 新增内容"，老代码里历史命中不计；这是渐进治理路径。
 # - 命中字面量但属于注释/文档说明（如 sunset-plan.md）不算违规：本脚本只
-#   扫 src/agent/ src/routes/ frontend/src/ 三个目录。
+#   扫 src/agent/ src/routes/ src/evolution/ frontend/src/ 四个目录。
 
 set -euo pipefail
 

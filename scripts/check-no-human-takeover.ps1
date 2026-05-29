@@ -2,8 +2,8 @@
 #
 # CI 严禁词文本 lint（agent-autonomy-loop W6 / Task 7.7 / Requirement 2.7）的
 # Windows / PowerShell 版本，与 .sh 等价：扫描 git diff 新增行在 src/agent/
-# src/routes/ frontend/src/ 下是否引入"human / 人工 / 接管 / takeover / hand-off"
-# 等违反"全自治、无人工接管"产品定位的字面量。
+# src/routes/ src/evolution/ frontend/src/ 下是否引入"human / 人工 / 接管 /
+# takeover / hand-off"等违反"全自治、无人工接管"产品定位的字面量。
 #
 # 用法：
 #   pwsh scripts/check-no-human-takeover.ps1

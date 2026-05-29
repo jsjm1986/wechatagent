@@ -44,7 +44,7 @@ Infrastructure
 - Agent 不直接关心 HTTP 和数据库细节。
 - MCP Client 只负责协议和错误包装。
 - 自动化边界由 Agent 策略决定，不散落在业务代码里。
-- Management Agent 只能调用产品动作和授权工具，不直接裸调任意 MCP 工具。
+- Management Agent 只能调用产品动作和授权工具，不直接裸调任意 MCP 工具。兜底透传分支只放行 `tools/list` 实际公布过的工具名（外加已注册的 `wechatagent.*` 产品工具），LLM 幻觉或提示注入产生的未公布工具名在打到生产 MCP 之前被拒绝（`routes/management.rs` `advertised_tool_names` + `execute_management_tool` 白名单门）。
 
 ## Current Backend Modules
 
@@ -354,7 +354,11 @@ POST /webhooks/wechat
      +（Phase E5-T1）operation_domain_configs / operation_state_policies / system_taxonomies
        三表 active_versions 桶选：hash(contact_id) % active_count，同 contact 同桶稳定，
        老库无 current_version 字段时 `$ne:false` / `$exists=false` 兜底
-  2. enforce_decision_guards 三闸：grounding / hallucination / run_budget
+  2. 三闸（grounding / hallucination / run_budget）— 实际入口是
+     review::classify_dual_gate / review::review_passed（评分门）+
+     review::finalize_review_for_send（verified 产品声明结构化兜底）；
+     历史文档里的 `enforce_decision_guards` 是 2026-05-25 知识库清理前的旧符号，
+     现已不存在，遇到请按上述真实符号阅读
      +（Phase B）双软闸：human_like / pressure_risk → 触发 single-shot revision
      +（Phase A）taxonomy::check_value 校验 customer_stage / intent_level / objection_type，
        未命中走 taxonomy::upsert_candidate（不阻塞 run）
@@ -412,7 +416,7 @@ tokio::spawn 主进程内 8 条 loop（启停由 env / mongo flag 控制）：
 | 多账号 | `WechatAccount.{capacity, persona_tag, off_hours}` | Phase D |
 | 跨用户教训 | `lessons_learned` collection（pending_review → peer_case chunk 候选池） | Phase D |
 | 多 locale | `Contact.locale` + `PromptTemplate.locale`（BCP-47，默认 zh-CN） | Phase E3 |
-| LLM provider 抽象 | `trait LlmProvider` (`src/llm_provider.rs`) + reviewer 双模并行（`REVIEWER_DUAL_ENABLED`） | Phase E2 |
+| LLM provider 抽象 | `trait LlmProvider` (`src/llm.rs::LlmProvider`，方法 `generate_json` / `generate_json_with_usage`) + reviewer 双模并行（`REVIEWER_DUAL_ENABLED`） | Phase E2 |
 | ops 三表灰度 | `operation_domain_configs / operation_state_policies / system_taxonomies` 加 `version / current_version / previous_version / seeded_by`；`hash(contact_id) % active_count` 桶；`admin_ops_versions` 三动作 publish/rollout/rollback | Phase E5-T1 |
 
 ### 模块隔离红线（不变）

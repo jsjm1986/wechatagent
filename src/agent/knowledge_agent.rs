@@ -157,6 +157,12 @@ pub struct AnswerResult {
 pub enum TraceEvent {
     /// 一步工具调用：与 `tool_trace` 中的 Document 内容相同（已转 relaxed extjson）。
     Step { payload: serde_json::Value },
+    /// 终态前的渐进 token：携带本次 delta（上游真流式解码出的 `answer` 正文片段）。
+    /// answer 轮的 LLM 调用走 [`super::generate_agent_json_streaming`]，原始 JSON
+    /// 文本片段经 [`AnswerStreamer`] 增量抽取顶层 `answer` 字段后，把解码正文逐段
+    /// 下发；前端按 token append 即可获得真实流式视觉。工具轮无 answer 字段不产生
+    /// token。
+    Token { delta: String },
     /// 终态：携带最终 `AnswerResult`（不再有 step）。
     Final { answer: AnswerResult },
 }
@@ -234,11 +240,237 @@ pub async fn answer_streaming(
     tx: UnboundedSender<TraceEvent>,
     cancel: Option<Arc<AtomicBool>>,
 ) -> AppResult<AnswerResult> {
+    // answer_inner 在 answer 轮内部已通过 [`AnswerStreamer`] 把上游真 token 解码后
+    // 逐段发出 [`TraceEvent::Token`]；这里只需在跑完后补一帧 [`TraceEvent::Final`]，
+    // 让前端拿到完整 `AnswerResult`（含 cited / quotes / trace）。cache-hit /
+    // truncated / cancelled 等不产生 token 的路径也靠这一帧兜底渲染最终答案。
     let result = answer_inner(state, req, Some(&tx), cancel.as_ref()).await?;
     let _ = tx.send(TraceEvent::Final {
         answer: result.clone(),
     });
     Ok(result)
+}
+
+/// 增量抽取流式原始 JSON 中顶层 `answer` 字段的字符串值，把新增正文片段解码下发。
+///
+/// 上游 token 流过来的是模型**原始 JSON 文本**（如 `{"action":"answer","answer":"你好`
+/// → `世界"}`），不是裸正文。本结构体逐 char 喂入，维护一个轻量解析状态机，仅在
+/// 指针落在顶层 `answer` 字符串值内部时把解码后的字符累积进 `pending`，由 [`push`]
+/// 返回。设计取舍：
+/// - 只认顶层 `answer` 键，忽略嵌套对象里的同名键（用 `depth` 计大括号层级）。
+/// - 处理 JSON 字符串转义（`\"` / `\\` / `\n` / `\uXXXX` 等），保证下发的是人类
+///   可读正文而非转义序列。
+/// - 工具轮（无 answer 字段）整段喂完后 `pending` 恒空，自然不产生 token。
+#[derive(Default)]
+struct AnswerStreamer {
+    /// 已扫描但尚未匹配到结构的原始字符缓冲（处理跨 chunk 的键名 / 转义切割）。
+    buf: String,
+    /// 是否已定位到顶层 `answer` 键、且正处于其字符串值内部。
+    in_answer_value: bool,
+    /// answer 值是否已完整结束（遇到未转义的闭合引号）——之后忽略一切输入。
+    done: bool,
+}
+
+impl AnswerStreamer {
+    /// 喂入一段新的原始文本片段，返回本次新解码出的 `answer` 正文（可能为空）。
+    fn push(&mut self, frag: &str) -> String {
+        if self.done {
+            return String::new();
+        }
+        self.buf.push_str(frag);
+
+        if !self.in_answer_value {
+            // 还没进入 answer 值：在缓冲里找 `"answer"` 键后的起始引号。
+            // 用最朴素的子串定位即可——key 名固定，且只取顶层第一次出现。
+            if let Some(found) = locate_answer_value_start(&self.buf) {
+                self.in_answer_value = true;
+                // 丢弃起始引号及之前的所有内容，只留值正文待解析。
+                self.buf = self.buf[found..].to_string();
+            } else {
+                // 防止 buf 无界增长：保留尾部足够覆盖 `"answer"` + 空白 + `:` + `"`
+                // 的窗口（远小于 64），其余前缀确定不含起始锚点可丢弃。
+                const KEEP_TAIL: usize = 64;
+                if self.buf.len() > KEEP_TAIL {
+                    let cut = self.buf.len() - KEEP_TAIL;
+                    // 对齐到 char 边界，避免切碎多字节 UTF-8。
+                    let cut = (0..=cut)
+                        .rev()
+                        .find(|&i| self.buf.is_char_boundary(i))
+                        .unwrap_or(0);
+                    self.buf = self.buf[cut..].to_string();
+                }
+                return String::new();
+            }
+        }
+
+        // 已在 answer 值内部：逐 char 解码，直到遇到未转义闭合引号。
+        let (decoded, consumed, finished) = decode_json_string_body(&self.buf);
+        self.buf = self.buf[consumed..].to_string();
+        if finished {
+            self.done = true;
+        }
+        decoded
+    }
+}
+
+/// 在原始 JSON 文本里定位顶层 `answer` 键对应字符串值起始引号的**下一个**字节位置。
+/// 返回 `Some(idx)` 时，`text[idx..]` 即 answer 值正文（不含起始引号）。
+///
+/// 朴素实现：找到子串 `"answer"`，跳过其后空白与冒号，再要求下一个非空白字符是
+/// `"`。够覆盖 LLM 正常输出的 `{"action":"answer","answer":"..."}` 形态。
+fn locate_answer_value_start(text: &str) -> Option<usize> {
+    let key = "\"answer\"";
+    let mut search_from = 0;
+    while let Some(rel) = text[search_from..].find(key) {
+        let after_key = search_from + rel + key.len();
+        let rest = &text[after_key..];
+        let mut bytes = rest.char_indices().peekable();
+        // 跳过空白。
+        let mut cursor = after_key;
+        let mut saw_colon = false;
+        let mut started = false;
+        for (off, ch) in &mut bytes {
+            if ch.is_whitespace() {
+                continue;
+            }
+            if ch == ':' && !saw_colon {
+                saw_colon = true;
+                continue;
+            }
+            if ch == '"' && saw_colon {
+                cursor = after_key + off + ch.len_utf8();
+                started = true;
+            }
+            break;
+        }
+        if started {
+            return Some(cursor);
+        }
+        // 不是值起点（可能是嵌套键名片段），继续向后找。
+        search_from = after_key;
+    }
+    None
+}
+
+/// 从 JSON 字符串值正文起点开始解码，直到遇到未转义闭合引号或输入耗尽。
+///
+/// 返回 `(decoded, consumed, finished)`：
+/// - `decoded`：本次能确定解码出的正文字符（不含尚未闭合的转义序列）。
+/// - `consumed`：已消费的字节数（调用方据此裁剪缓冲；未消费的尾部留待下次拼接）。
+/// - `finished`：是否遇到了未转义的闭合引号（answer 值结束）。
+///
+/// 对不完整结尾（半个转义 `\` 或半个 `\uXXXX`）保守处理：不消费、留待下次。
+fn decode_json_string_body(s: &str) -> (String, usize, bool) {
+    let mut out = String::new();
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        match b {
+            b'"' => {
+                // 未转义闭合引号 → answer 值结束。消费含该引号。
+                return (out, i + 1, true);
+            }
+            b'\\' => {
+                // 转义序列：至少要再有一个字符才能判定。
+                if i + 1 >= bytes.len() {
+                    // 半个转义，留待下次。
+                    return (out, i, false);
+                }
+                let esc = bytes[i + 1];
+                match esc {
+                    b'"' => {
+                        out.push('"');
+                        i += 2;
+                    }
+                    b'\\' => {
+                        out.push('\\');
+                        i += 2;
+                    }
+                    b'/' => {
+                        out.push('/');
+                        i += 2;
+                    }
+                    b'n' => {
+                        out.push('\n');
+                        i += 2;
+                    }
+                    b't' => {
+                        out.push('\t');
+                        i += 2;
+                    }
+                    b'r' => {
+                        out.push('\r');
+                        i += 2;
+                    }
+                    b'b' => {
+                        out.push('\u{0008}');
+                        i += 2;
+                    }
+                    b'f' => {
+                        out.push('\u{000C}');
+                        i += 2;
+                    }
+                    b'u' => {
+                        // \uXXXX：需要 4 个十六进制位。
+                        if i + 6 > bytes.len() {
+                            return (out, i, false); // 不完整，留待下次
+                        }
+                        let hex = &s[i + 2..i + 6];
+                        match u32::from_str_radix(hex, 16) {
+                            Ok(cp) => {
+                                // 不处理代理对拼接（罕见于中文正文）；落单代理对
+                                // 用替换字符兜底，避免 panic。
+                                if let Some(ch) = char::from_u32(cp) {
+                                    out.push(ch);
+                                } else {
+                                    out.push('\u{FFFD}');
+                                }
+                                i += 6;
+                            }
+                            Err(_) => {
+                                // 非法转义，原样保留反斜杠跳过。
+                                out.push('\\');
+                                i += 1;
+                            }
+                        }
+                    }
+                    _ => {
+                        // 未知转义，原样保留。
+                        out.push('\\');
+                        i += 1;
+                    }
+                }
+            }
+            _ => {
+                // 普通字符：找到该 UTF-8 char 的完整字节再 push，处理多字节边界。
+                let ch_len = utf8_char_len(b);
+                if i + ch_len > bytes.len() {
+                    // 半个多字节 char，留待下次。
+                    return (out, i, false);
+                }
+                let ch = s[i..i + ch_len].chars().next().unwrap();
+                out.push(ch);
+                i += ch_len;
+            }
+        }
+    }
+    (out, i, false)
+}
+
+/// 由 UTF-8 首字节推断该字符的字节长度（1–4）。
+fn utf8_char_len(first: u8) -> usize {
+    if first < 0x80 {
+        1
+    } else if first >> 5 == 0b110 {
+        2
+    } else if first >> 4 == 0b1110 {
+        3
+    } else if first >> 3 == 0b11110 {
+        4
+    } else {
+        1 // 非法首字节，按 1 推进避免卡死
+    }
 }
 
 /// 把一条 trace doc 同时写进 `tool_trace` 与可选 `tx`。`tx` 走 relaxed extjson
@@ -366,16 +598,50 @@ async fn answer_inner(
         last_completed_round = round;
 
         let user_prompt = build_prompt(&req.query, &opened, &catalog, round, max_rounds);
-        let value = generate_agent_json(
-            state,
-            req.account_id.as_deref(),
-            None,
-            None,
-            "knowledge.agent",
-            SYSTEM_PROMPT,
-            &user_prompt,
-        )
-        .await?;
+        // 流式分支（tx=Some）：每轮都走真上游 SSE，把模型**原始 JSON 文本片段**喂给
+        // 一个增量 `answer` 字段抽取器（[`AnswerStreamer`]）；只有正文落在顶层
+        // `answer` 字段里的字符才被解码成 [`TraceEvent::Token`] 下发，工具轮（没有
+        // answer 字段）自然不产生 token。非流式分支（tx=None，例如 `answer()` /
+        // 单测）保持原 [`generate_agent_json`] 调用，零额外开销。
+        let value = if let Some(ev_tx) = tx {
+            let (raw_tx, mut raw_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+            let ev_tx_cloned = ev_tx.clone();
+            let forwarder = tokio::spawn(async move {
+                let mut streamer = AnswerStreamer::default();
+                while let Some(frag) = raw_rx.recv().await {
+                    let delta = streamer.push(&frag);
+                    if !delta.is_empty() {
+                        let _ = ev_tx_cloned.send(TraceEvent::Token { delta });
+                    }
+                }
+            });
+            let value = super::generate_agent_json_streaming(
+                state,
+                req.account_id.as_deref(),
+                None,
+                None,
+                "knowledge.agent",
+                SYSTEM_PROMPT,
+                &user_prompt,
+                raw_tx,
+            )
+            .await?;
+            // raw_tx 已 move 进 streaming 调用；调用返回即被 drop → forwarder 收到
+            // 通道关闭后退出，await 确保末尾 token 已发完再进入 action 解析。
+            let _ = forwarder.await;
+            value
+        } else {
+            generate_agent_json(
+                state,
+                req.account_id.as_deref(),
+                None,
+                None,
+                "knowledge.agent",
+                SYSTEM_PROMPT,
+                &user_prompt,
+            )
+            .await?
+        };
 
         // LLM 跑完后再查一次 cancel：客户端在这次 LLM call 期间断开的话，下一轮
         // 不该再启动；当前轮的 mongo 副作用（写日志/usage）已在 generate_agent_json
@@ -1080,5 +1346,67 @@ mod tests {
             }
             _ => panic!("expected answer"),
         }
+    }
+
+    /// 把一组原始片段顺序喂入 [`AnswerStreamer`]，返回拼接出的全部解码正文。
+    fn drive_streamer(frags: &[&str]) -> String {
+        let mut s = AnswerStreamer::default();
+        let mut out = String::new();
+        for f in frags {
+            out.push_str(&s.push(f));
+        }
+        out
+    }
+
+    #[test]
+    fn streamer_extracts_answer_from_single_chunk() {
+        let raw = r#"{"action":"answer","citedChunkIds":["c1"],"answer":"你好世界"}"#;
+        assert_eq!(drive_streamer(&[raw]), "你好世界");
+    }
+
+    #[test]
+    fn streamer_handles_cjk_split_across_fragments() {
+        // 多字节 char 被切在两段之间：不能丢字、不能 panic。
+        let frags = [
+            "{\"action\":\"answer\",\"answer\":\"你",
+            "好",
+            "世界\"}",
+        ];
+        assert_eq!(drive_streamer(&frags), "你好世界");
+    }
+
+    #[test]
+    fn streamer_decodes_escapes() {
+        // \" 转义引号、\n 换行、\\ 反斜杠，都应被解码成人类可读正文。
+        let raw = r#"{"answer":"行1\n说\"价值\"\\结束"}"#;
+        assert_eq!(drive_streamer(&[raw]), "行1\n说\"价值\"\\结束");
+    }
+
+    #[test]
+    fn streamer_stops_at_closing_quote() {
+        // answer 值闭合后，后续 JSON 字段不应被当成正文。
+        let raw = r#"{"answer":"前半","truncated":false}"#;
+        assert_eq!(drive_streamer(&[raw]), "前半");
+    }
+
+    #[test]
+    fn streamer_emits_nothing_for_tool_round() {
+        // 工具轮没有顶层 answer 字段 → 不产生任何 token。
+        let raw = r#"{"action":"open_chunk","ids":["c1","c2"]}"#;
+        assert_eq!(drive_streamer(&[raw]), "");
+    }
+
+    #[test]
+    fn streamer_handles_escape_split_across_fragments() {
+        // 转义序列 `\n` 被切在两段之间：半个 `\` 应留待下次，不能误输出。
+        let frags = [r#"{"answer":"行1\"#, r#"n行2"}"#];
+        assert_eq!(drive_streamer(&frags), "行1\n行2");
+    }
+
+    #[test]
+    fn streamer_handles_unicode_escape() {
+        // JSON 你好 应解码成「你好」。用普通串嵌入字面反斜杠。
+        let raw = "{\"answer\":\"\\u4f60\\u597d!\"}";
+        assert_eq!(drive_streamer(&[raw]), "你好!");
     }
 }

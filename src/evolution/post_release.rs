@@ -217,6 +217,7 @@ async fn process_one_review(state: &AppState, review: &Document) -> Result<(), E
         ),
         details: Some(details),
         created_at: now,
+        dedupe_key: None,
     };
     state
         .db

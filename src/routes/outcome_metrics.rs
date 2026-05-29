@@ -2,7 +2,7 @@
 
 use axum::{
     extract::{Query, State},
-    Json,
+    Extension, Json,
 };
 use futures::TryStreamExt;
 use mongodb::{
@@ -12,7 +12,8 @@ use mongodb::{
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use crate::{error::AppResult, models::AgentOutcomeMetric};
+use crate::{
+    auth::AuthenticatedAdmin,error::AppResult, models::AgentOutcomeMetric};
 
 use super::AppState;
 
@@ -28,13 +29,14 @@ pub(super) struct OutcomeMetricsQuery {
 
 pub(super) async fn list_agent_outcome_metrics(
     State(state): State<AppState>,
+    Extension(admin): Extension<AuthenticatedAdmin>,
     Query(query): Query<OutcomeMetricsQuery>,
 ) -> AppResult<Json<Value>> {
     let account_id = query
         .account_id
         .unwrap_or_else(|| state.config.default_account_id.clone());
     let mut filter = doc! {
-        "workspace_id": &state.config.default_workspace_id,
+        "workspace_id": &admin.current_workspace,
         "account_id": &account_id
     };
     if let Some(horizon) = query.horizon {

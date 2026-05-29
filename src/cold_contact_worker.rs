@@ -77,7 +77,6 @@ async fn scan_cold_outbound(state: &AppState) -> anyhow::Result<()> {
     let daily_cap = state.config.cold_contact_daily_emit_cap;
     let already_emitted_today =
         count_today_cold_emit_workspace(state, &workspace_id, now).await?;
-    let mut remaining = daily_cap.saturating_sub(already_emitted_today);
 
     let peer_hooks = load_peer_case_hooks(state, &workspace_id).await.unwrap_or_default();
 
@@ -92,7 +91,13 @@ async fn scan_cold_outbound(state: &AppState) -> anyhow::Result<()> {
         if has_pending_follow_up(state, &contact).await? {
             continue;
         }
-        if remaining <= 0 {
+        // P1-3：每个候选 emit 之前重新拉一次"今日已 emit 数"，作为 hard cap。
+        // 旧实现只在 tick 起始读一次 count，并在内存里 decrement 一个本地
+        // counter，并发 tick 之间会让真实 emit 数翻倍。改为每轮 re-count，
+        // 让 cap 与 cold_contact_emit 事件 collection 真实实时对齐。
+        let live_count =
+            count_today_cold_emit_workspace(state, &workspace_id, now).await?;
+        if cap_reached(live_count, daily_cap) {
             break;
         }
         // S4 (Phase 0)：写一条 account_scheduler_assignment 审计——contact 已经
@@ -137,7 +142,6 @@ async fn scan_cold_outbound(state: &AppState) -> anyhow::Result<()> {
         )
         .await?;
         emitted += 1;
-        remaining -= 1;
     }
 
     write_event(
@@ -197,6 +201,16 @@ pub(crate) fn cold_candidate_passes_in_memory(contact: &Contact, _now_ms: i64) -
         }
     }
     true
+}
+
+/// P1-3：cold_contact_worker 当日 cap 比较。
+///
+/// 提取出来纯粹是为了让 `cap_reached(live_count, daily_cap)` 可单测：
+/// `live_count >= daily_cap` 时返回 true（应停止 emit）。`daily_cap == 0`
+/// 关停冷链路；负值视为 0；i64 溢出由 saturating 形式预防。
+pub(crate) fn cap_reached(live_count: i64, daily_cap: i64) -> bool {
+    let cap = daily_cap.max(0);
+    live_count.max(0) >= cap
 }
 
 /// S4 (Phase 0)：workspace 级当日已 emit 计数，配合
@@ -519,5 +533,35 @@ mod tests {
         // 同 wxid + 同 pool 必然同结果（稳定散列）。
         let again = pick_hook(&pool, "wxid_stable").expect("non-empty pool");
         assert_eq!(pick, again);
+    }
+
+    /// P1-3：cap 比较的边界——live_count 严格小于 cap 时放行，
+    /// 等于或超出时停止 emit。
+    #[test]
+    fn cap_reached_open_when_below_cap() {
+        assert!(!cap_reached(0, 5));
+        assert!(!cap_reached(4, 5));
+    }
+
+    /// P1-3：等量必停 + 防越界——并发 tick 把 live_count 推到 cap 之上时
+    /// 必须返回 true，避免双 tick 越缸。
+    #[test]
+    fn cap_reached_blocks_when_at_or_above_cap() {
+        assert!(cap_reached(5, 5));
+        assert!(cap_reached(6, 5));
+    }
+
+    /// P1-3：daily_cap = 0 应等价"关停冷链路"——任意 live_count 都立即停止。
+    #[test]
+    fn cap_reached_zero_cap_disables_emits() {
+        assert!(cap_reached(0, 0));
+        assert!(cap_reached(7, 0));
+    }
+
+    /// P1-3：负值 sanitization——不应让历史脏数据穿透 cap 保护。
+    #[test]
+    fn cap_reached_negative_inputs_are_clamped_to_zero() {
+        assert!(!cap_reached(-1, 5));
+        assert!(cap_reached(0, -3));
     }
 }

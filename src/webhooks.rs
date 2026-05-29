@@ -16,6 +16,7 @@ use governor::{
 use hmac::{Hmac, Mac};
 use mongodb::{
     bson::{doc, to_document, DateTime},
+    error::{ErrorKind, WriteFailure},
     options::UpdateOptions,
 };
 use serde_json::Value;
@@ -202,21 +203,30 @@ pub async fn wechat_webhook(
         .map(|id| format!("message:{id}"))
         .unwrap_or_else(|| format!("payload:{}", stable_payload_hash(&payload)));
 
-    if state
-        .db
-        .messages()
-        .find_one(
-            doc! {
-                "workspace_id": &workspace_id,
-                "account_id": &account_id,
-                "dedupe_key": &dedupe_key
-            },
-            None,
-        )
-        .await?
-        .is_some()
-    {
-        return Ok(Json(serde_json::json!({ "ok": true, "duplicate": true })));
+    // P0-19：dedupe 原子化。原 check-then-insert 存在 TOCTOU 竞态，两个并发
+    // webhook 的 find_one 都可能返回 None，导致同一条入站消息被双写。改为
+    // 直接 insert_one + 捕获 11000 duplicate key 错误（依赖
+    // db/indexes.rs:55-63 的 partial unique index `workspace_id+account_id+dedupe_key`），
+    // 让 MongoDB 在写入时原子去重。
+    let raw = to_document(&payload).ok();
+    let inbound = ConversationMessage {
+        id: None,
+        workspace_id: workspace_id.clone(),
+        account_id: account_id.clone(),
+        contact_wxid: from_wxid.clone(),
+        message_id: effective_message_id.clone(),
+        dedupe_key: Some(dedupe_key.clone()),
+        direction: MessageDirection::Inbound,
+        content,
+        raw,
+        created_at: DateTime::now(),
+    };
+    match state.db.messages().insert_one(&inbound, None).await {
+        Ok(_) => {}
+        Err(error) if is_duplicate_key_error(&error) => {
+            return Ok(Json(serde_json::json!({ "ok": true, "duplicate": true })));
+        }
+        Err(error) => return Err(error.into()),
     }
 
     let mut contact = state
@@ -241,20 +251,6 @@ pub async fn wechat_webhook(
         return Err(AppError::External("failed to create contact".to_string()));
     };
 
-    let raw = to_document(&payload).ok();
-    let inbound = ConversationMessage {
-        id: None,
-        workspace_id: contact.workspace_id.clone(),
-        account_id: contact.account_id.clone(),
-        contact_wxid: from_wxid.clone(),
-        message_id: effective_message_id,
-        dedupe_key: Some(dedupe_key),
-        direction: MessageDirection::Inbound,
-        content,
-        raw,
-        created_at: DateTime::now(),
-    };
-    state.db.messages().insert_one(&inbound, None).await?;
     let now = DateTime::now();
     state
         .db
@@ -284,32 +280,62 @@ pub async fn wechat_webhook(
         let bg_from_wxid = from_wxid.clone();
         let bg_app_id = app_id.clone();
         tokio::spawn(async move {
-            if let Err(error) =
-                agent::record_user_reaction(&bg_state, &bg_contact, &bg_inbound).await
-            {
+            // P1-7：per-webhook spawn 也包一层 catch_unwind。这里和 main.rs
+            // 长寿 worker 不同，一次 panic 只丢一条消息（不需要重启），但仍要
+            // 写 agent_events.kind=webhook_handler_panic 让 admin 看见。
+            use futures::FutureExt;
+            use std::panic::AssertUnwindSafe;
+            let bg_state_for_panic = bg_state.clone();
+            let bg_account_for_panic = bg_account_id.clone();
+            let bg_wxid_for_panic = bg_from_wxid.clone();
+            let bg_app_for_panic = bg_app_id.clone();
+            let inner = async move {
+                if let Err(error) =
+                    agent::record_user_reaction(&bg_state, &bg_contact, &bg_inbound).await
+                {
+                    let _ = agent::write_event_for_account(
+                        &bg_state,
+                        &bg_account_id,
+                        Some(&bg_from_wxid),
+                        "agent_error",
+                        "failed",
+                        &format!("record_user_reaction failed: {error}"),
+                        bg_app_id.clone().map(|v| doc! { "app_id": v }),
+                    )
+                    .await;
+                    return;
+                }
+                if let Err(error) =
+                    agent::handle_managed_message(&bg_state, bg_contact, &bg_inbound).await
+                {
+                    let _ = agent::write_event_for_account(
+                        &bg_state,
+                        &bg_account_id,
+                        Some(&bg_from_wxid),
+                        "agent_error",
+                        "failed",
+                        &error.to_string(),
+                        bg_app_id.map(|v| doc! { "app_id": v }),
+                    )
+                    .await;
+                }
+            };
+            if let Err(panic_payload) = AssertUnwindSafe(inner).catch_unwind().await {
+                let panic_msg = panic_payload_message(&panic_payload);
+                tracing::error!(
+                    account_id = %bg_account_for_panic,
+                    wxid = %bg_wxid_for_panic,
+                    panic = %panic_msg,
+                    "webhook background handler panicked"
+                );
                 let _ = agent::write_event_for_account(
-                    &bg_state,
-                    &bg_account_id,
-                    Some(&bg_from_wxid),
-                    "agent_error",
-                    "failed",
-                    &format!("record_user_reaction failed: {error}"),
-                    bg_app_id.clone().map(|v| doc! { "app_id": v }),
-                )
-                .await;
-                return;
-            }
-            if let Err(error) =
-                agent::handle_managed_message(&bg_state, bg_contact, &bg_inbound).await
-            {
-                let _ = agent::write_event_for_account(
-                    &bg_state,
-                    &bg_account_id,
-                    Some(&bg_from_wxid),
-                    "agent_error",
-                    "failed",
-                    &error.to_string(),
-                    bg_app_id.map(|v| doc! { "app_id": v }),
+                    &bg_state_for_panic,
+                    &bg_account_for_panic,
+                    Some(&bg_wxid_for_panic),
+                    "webhook_handler_panic",
+                    "warning",
+                    &format!("webhook background handler panicked: {panic_msg}"),
+                    bg_app_for_panic.map(|v| doc! { "app_id": v }),
                 )
                 .await;
             }
@@ -331,6 +357,35 @@ fn stable_payload_hash(value: &Value) -> String {
         hash = hash.wrapping_mul(0x100000001b3);
     }
     format!("{hash:016x}")
+}
+
+/// 判定 mongodb 错误是否为 DuplicateKey（code 11000 / 11001）。
+/// 与 `agent::outbox::is_duplicate_key_error` 同语义；不跨 mod 复用以避免
+/// webhook 反向依赖 agent 内部 helper。
+fn is_duplicate_key_error(err: &mongodb::error::Error) -> bool {
+    match &*err.kind {
+        ErrorKind::Write(WriteFailure::WriteError(write_error)) => {
+            write_error.code == 11000 || write_error.code == 11001
+        }
+        ErrorKind::BulkWrite(bulk) => bulk
+            .write_errors
+            .as_ref()
+            .map(|errs| errs.iter().any(|e| e.code == 11000 || e.code == 11001))
+            .unwrap_or(false),
+        _ => false,
+    }
+}
+
+/// 把 panic payload 解析成可读字符串。与 supervisor::panic_payload_to_string
+/// 同语义；不跨 mod 复用以保持 webhook 模块 self-contained。
+fn panic_payload_message(payload: &Box<dyn std::any::Any + Send>) -> String {
+    if let Some(s) = payload.downcast_ref::<&'static str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "<non-string panic payload>".to_string()
+    }
 }
 
 fn find_string(value: &Value, keys: &[&str]) -> Option<String> {
@@ -408,6 +463,7 @@ async fn emit_unknown_app_id_event(state: &AppState, app_id: Option<&str>) -> Ap
                 summary,
                 details: app_id.map(|id| doc! { "app_id": id }),
                 created_at: DateTime::now(),
+                dedupe_key: None,
             },
             None,
         )
@@ -461,6 +517,7 @@ async fn upsert_webhook_contact(
                             "wxid": wxid,
                         }),
                         created_at: DateTime::now(),
+                        dedupe_key: None,
                     },
                     None,
                 )
@@ -507,48 +564,44 @@ async fn upsert_webhook_contact(
         .map_err(AppError::from)
 }
 
+/// P1-2：rate_limit 事件 partial-unique 去重 key。
+///
+/// 形式 `rate_limit:{account}:{day_bucket}`，`day_bucket = epoch_ms / 86_400_000`。
+/// 同一账号在同一 UTC 天最多一条 `webhook_rate_limited` 事件，由 partial unique
+/// index `workspace_id + dedupe_key` 在并发下原子约束。
+fn rate_limit_event_dedupe_key(account_id: &str, day_bucket: i64) -> String {
+    format!("rate_limit:{}:{}", account_id, day_bucket)
+}
+
 /// LP-14 / Task 20：限流命中时按 account 当日去重写一条 agent_event，避免事件爆量。
+///
+/// P1-2：旧实现 `find_one + insert_one` 在并发限流命中时存在 TOCTOU——
+/// 两条请求都查到 `None`，都写入，事件爆量。改为携带 `dedupe_key` 原子写：
+/// `dedupe_key = "rate_limit:{account}:{day_bucket}"`，配合 partial unique
+/// index（`workspace_id + dedupe_key`）让重复 insert 直接命中 dup-key error
+/// 后被吞掉；首条写入获胜，后续都视为"今天已记录"。
 async fn maybe_emit_rate_limit_event(state: &AppState, account_id: &str) -> AppResult<()> {
-    let day_start_ms = {
-        let now = DateTime::now().timestamp_millis();
-        let day_ms: i64 = 24 * 60 * 60 * 1000;
-        now - (now.rem_euclid(day_ms))
+    let day_ms: i64 = 24 * 60 * 60 * 1000;
+    let now_ms = DateTime::now().timestamp_millis();
+    let day_bucket = now_ms / day_ms;
+    let dedupe_key = rate_limit_event_dedupe_key(account_id, day_bucket);
+    let event = crate::models::AgentEvent {
+        id: None,
+        workspace_id: state.config.default_workspace_id.clone(),
+        account_id: account_id.to_string(),
+        contact_wxid: None,
+        kind: "webhook_rate_limited".to_string(),
+        status: "blocked".to_string(),
+        summary: "webhook 入口触发 per-account 限流".to_string(),
+        details: None,
+        created_at: DateTime::now(),
+        dedupe_key: Some(dedupe_key),
     };
-    let exists = state
-        .db
-        .events()
-        .find_one(
-            doc! {
-                "workspace_id": &state.config.default_workspace_id,
-                "account_id": account_id,
-                "kind": "webhook_rate_limited",
-                "created_at": { "$gte": DateTime::from_millis(day_start_ms) }
-            },
-            None,
-        )
-        .await?;
-    if exists.is_some() {
-        return Ok(());
+    match state.db.events().insert_one(&event, None).await {
+        Ok(_) => Ok(()),
+        Err(error) if is_duplicate_key_error(&error) => Ok(()),
+        Err(error) => Err(error.into()),
     }
-    let _ = state
-        .db
-        .events()
-        .insert_one(
-            crate::models::AgentEvent {
-                id: None,
-                workspace_id: state.config.default_workspace_id.clone(),
-                account_id: account_id.to_string(),
-                contact_wxid: None,
-                kind: "webhook_rate_limited".to_string(),
-                status: "blocked".to_string(),
-                summary: "webhook 入口触发 per-account 限流".to_string(),
-                details: None,
-                created_at: DateTime::now(),
-            },
-            None,
-        )
-        .await;
-    Ok(())
 }
 
 /// P0-E：HMAC-SHA256(body, MCP_API_KEY) 常时间比对。
@@ -628,5 +681,36 @@ mod hmac_tests {
     #[test]
     fn verify_rejects_empty_key() {
         assert!(!verify_hmac_sha256(b"", b"x", &"00".repeat(32)));
+    }
+}
+
+#[cfg(test)]
+mod rate_limit_dedupe_tests {
+    use super::*;
+
+    /// P1-2：同一账号 + 同一 day_bucket → 同一 dedupe_key，
+    /// partial unique index 才能在并发下原子去重。
+    #[test]
+    fn dedupe_key_is_stable_per_account_and_day() {
+        let a = rate_limit_event_dedupe_key("acct_42", 19_876);
+        let b = rate_limit_event_dedupe_key("acct_42", 19_876);
+        assert_eq!(a, b);
+        assert_eq!(a, "rate_limit:acct_42:19876");
+    }
+
+    /// 跨天必须不同 key，否则次日的限流事件被错误压制。
+    #[test]
+    fn dedupe_key_segregates_by_day_bucket() {
+        let day_a = rate_limit_event_dedupe_key("acct_42", 19_876);
+        let day_b = rate_limit_event_dedupe_key("acct_42", 19_877);
+        assert_ne!(day_a, day_b);
+    }
+
+    /// 不同账号不可共享 key（否则 A 触发限流，B 整天再触发都被压制）。
+    #[test]
+    fn dedupe_key_segregates_by_account() {
+        let a = rate_limit_event_dedupe_key("acct_a", 19_876);
+        let b = rate_limit_event_dedupe_key("acct_b", 19_876);
+        assert_ne!(a, b);
     }
 }

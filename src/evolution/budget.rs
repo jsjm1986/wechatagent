@@ -105,6 +105,7 @@ mod tests {
             evolution_min_send_success_delta: 0.05,
             evolution_min_self_critique_delta: 0.10,
             evolution_max_5gate_hit_increase: 0.10,
+            evolution_max_safety_regression_rate: 0.0,
             evolution_replay_concurrency: 4,
             evolution_replay_max_fail_rate: 0.30,
             evolution_threshold_release_cooldown_hours: 24,
@@ -130,6 +131,12 @@ mod tests {
             bootstrap_admin_username: None,
             bootstrap_admin_password: None,
             webhook_verify_signature: false,
+            ingest_worker_enabled: false,
+            ingest_worker_interval_seconds: 3600,
+            jwt_enabled: false,
+            jwt_ttl_minutes: 60,
+            jwt_private_key_pem: None,
+            jwt_public_key_pem: None,
         }
     }
 

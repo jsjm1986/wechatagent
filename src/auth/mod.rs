@@ -10,6 +10,7 @@
 //! - session 走 mongo 一张表 `admin_sessions`，TTL index 自动过期；不放内存（重启不掉线 + 多实例就绪）。
 //! - 不返 access/refresh 双 token；session 只有一个 cookie + DB 行，登出删行 + 清 cookie 即彻底失效。
 
+pub mod jwt;
 pub mod middleware;
 pub mod password;
 pub mod session;
@@ -19,6 +20,11 @@ use serde::{Deserialize, Serialize};
 
 /// admin 用户：username 唯一，password_hash 是 Argon2id PHC 字符串
 /// （`$argon2id$v=19$m=...$...$...`，自带盐，可直接落库）。
+///
+/// `workspaces` 列出该 admin 可访问的全部 workspace；为空表示 fallback 到
+/// `config.default_workspace_id`（兼容旧单租户 admin）。`default_workspace`
+/// 是登录时初始 current_workspace；session 写入后由 `current_workspace` 字段
+/// 保存当前选择，admin 可通过 `POST /api/auth/workspace` 切换。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AdminUser {
     pub user_id: String,
@@ -26,10 +32,16 @@ pub struct AdminUser {
     pub password_hash: String,
     pub created_at: DateTime<Utc>,
     pub last_login_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub workspaces: Vec<String>,
+    #[serde(default)]
+    pub default_workspace: Option<String>,
 }
 
 /// admin session：cookie 里只存 session_id；admin_user_id 反向关联。
 /// `expires_at` 同时是 mongo TTL index 的字段（过期自动清理）。
+/// `current_workspace` 表示该 session 当前选中的 workspace；切换 workspace
+/// 时由 `routes/auth::switch_workspace` 原地更新这一字段。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AdminSession {
     pub session_id: String,
@@ -37,6 +49,8 @@ pub struct AdminSession {
     pub username: String,
     pub created_at: DateTime<Utc>,
     pub expires_at: DateTime<Utc>,
+    #[serde(default)]
+    pub current_workspace: Option<String>,
 }
 
 /// 通过 middleware 注入到 request extension 的已认证 admin 上下文。
@@ -45,6 +59,9 @@ pub struct AdminSession {
 pub struct AuthenticatedAdmin {
     pub user_id: String,
     pub username: String,
+    /// 当前选中 workspace，由 middleware 从 session 注入。handler 应使用
+    /// 此字段而非 `state.config.default_workspace_id`，以支持多租户隔离。
+    pub current_workspace: String,
 }
 
 /// session cookie 名。固定字面量，前后端约定一致。

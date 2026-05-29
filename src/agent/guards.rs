@@ -8,9 +8,9 @@
 
 use mongodb::bson::Document;
 
-use crate::models::{OperationDomainConfig, OperationStatePolicy};
+use crate::models::{OperationDomainConfig, OperationKnowledgeChunk, OperationStatePolicy};
 
-use super::types::{AgentDecision, RunPlannerResult};
+use super::types::{doc_bool, AgentDecision, RunPlannerResult};
 
 pub(crate) fn normalize_decision_state(
     decision: &mut AgentDecision,
@@ -72,6 +72,15 @@ pub(crate) fn decision_requires_knowledge(decision: &AgentDecision) -> bool {
     )
 }
 
+/// 某个 state key 是否存在于域状态机字典里。
+///
+/// #155(P2)：`states.is_empty()` 时返回 `true`（"存在"）是**有意**的局部 fail-open，
+/// 但它**不是**迁移闸——真正的迁移合法性由 [`check_state_transition`] 把关，且后者
+/// 对空状态机已 fail-closed（`state_machine_empty`），启动期
+/// `main.rs::run_active_domain_state_machine_sanity_check` 还会先拒绝未挂状态机的
+/// active domain。本函数唯一调用方 [`normalize_decision_state`] 仅用它决定"要不要把
+/// Agent 输出的 state 名归一成 key"；空字典时跳过归一（保留原值交给 check 拦）是正确的，
+/// 不能在这里 fail-closed，否则会把"待 check 拦截"的值提前清掉、丢失拦截理由。
 pub(crate) fn operation_state_exists(
     domain_config: Option<&OperationDomainConfig>,
     key: &str,
@@ -236,6 +245,73 @@ pub fn enforce_state_action_policy(
         ));
     }
     Ok(())
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// R5.1 / R5.4：verified-knowledge 产品声明强约束辅助。
+//
+// 2026-05-25 知识库清理把 fact-risk / safe_claims / string-marker 串联硬门
+// 整体删除，留下 `finalize_review_for_send` 里被注释掉的 R5 闸（review.rs）。
+// 但 CLAUDE.md 硬规则仍要求"产品声明必须由 operation_knowledge_chunks 中
+// verified 知识背书，否则 blocked_unverified_product_claim"——这条结构化闸
+// 不依赖 LLW reviewer 自评分（不可信），是对 knowledge_grounding_score 软闸
+// 的确定性兜底。本次只恢复 R5.4 这一道（R5.7 safe_claims 反向门 / R5.3
+// string-marker fail-closed 依赖已删除的 chunk.safe_claims / ProductClaimMarkers，
+// 不在本次恢复范围）。
+// ─────────────────────────────────────────────────────────────────────────
+
+/// R5.1：chunk 是否 `integrity_status == "verified"`（trim + 大小写不敏感）。
+pub(crate) fn is_verified(chunk: &OperationKnowledgeChunk) -> bool {
+    chunk
+        .integrity_status
+        .as_deref()
+        .map(str::trim)
+        .map(|s| s.eq_ignore_ascii_case("verified"))
+        .unwrap_or(false)
+}
+
+/// R5.4：reviewer 的 `claim_analysis` 是否显式声明本次候选回复需要产品知识背书。
+/// 兼容 camelCase / snake_case 两种历史命名。
+pub(crate) fn claim_requires_product_knowledge(claim_analysis: &Document) -> bool {
+    doc_bool(claim_analysis, "requiresProductKnowledge")
+        || doc_bool(claim_analysis, "requires_product_knowledge")
+}
+
+/// R5.4：从本 run 已加载的 chunks 里取出"被 `used_knowledge_ids` 引用且
+/// `integrity_status==verified`"的交集。
+///
+/// `used_knowledge_ids` 是 hex `ObjectId` 字符串（与
+/// `select_operation_knowledge_chunks` 索引方式一致）；空 / 不可解析的 id
+/// 自动跳过；同一 chunk 重复只计一次；返回顺序按 `chunks` 原始顺序。
+pub(crate) fn compute_verified_chunks<'a>(
+    used_knowledge_ids: &[String],
+    chunks: &'a [OperationKnowledgeChunk],
+) -> Vec<&'a OperationKnowledgeChunk> {
+    let used: std::collections::HashSet<&str> = used_knowledge_ids
+        .iter()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if used.is_empty() {
+        return Vec::new();
+    }
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut out: Vec<&'a OperationKnowledgeChunk> = Vec::new();
+    for chunk in chunks {
+        if !is_verified(chunk) {
+            continue;
+        }
+        let Some(hex) = chunk.id.map(|id| id.to_hex()) else {
+            continue;
+        };
+        if !used.contains(hex.as_str()) {
+            continue;
+        }
+        if seen.insert(hex) {
+            out.push(chunk);
+        }
+    }
+    out
 }
 
 #[cfg(test)]

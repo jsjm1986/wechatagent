@@ -156,6 +156,12 @@ impl TestApp {
                 wechatagent::knowledge_task::ChatProgressBus::new(),
             ),
             second_reviewer_llm: None,
+            chunk_locks: std::sync::Arc::new(dashmap::DashMap::new()),
+            chunk_event_bus: tokio::sync::broadcast::channel(
+                wechatagent::routes::chunk_locks::CHUNK_EVENT_CHANNEL_CAPACITY,
+            )
+            .0,
+            jwt_keys: None,
         };
         // M4 W4 Task 5.3：seed 完成后 fetch_add 一次，与 main.rs 行为一致。
         state
@@ -219,6 +225,7 @@ fn test_config(mongodb_uri: String, mongodb_database: String) -> AppConfig {
         evolution_min_send_success_delta: 0.05,
         evolution_min_self_critique_delta: 0.10,
         evolution_max_5gate_hit_increase: 0.10,
+        evolution_max_safety_regression_rate: 0.0,
         evolution_replay_concurrency: 4,
         evolution_replay_max_fail_rate: 0.30,
         evolution_threshold_release_cooldown_hours: 24,
@@ -234,6 +241,8 @@ fn test_config(mongodb_uri: String, mongodb_database: String) -> AppConfig {
         knowledge_task_worker_interval_seconds: 0,
         catalog_rebuild_worker_interval_seconds: 0,
         knowledge_feedback_interval_seconds: 0,
+        ingest_worker_enabled: false,
+        ingest_worker_interval_seconds: 0,
         reviewer_dual_enabled: false,
         reviewer_second_provider_base_url: None,
         reviewer_second_provider_api_key: None,
@@ -244,6 +253,10 @@ fn test_config(mongodb_uri: String, mongodb_database: String) -> AppConfig {
         bootstrap_admin_username: None,
         bootstrap_admin_password: None,
         webhook_verify_signature: false,
+        jwt_enabled: false,
+        jwt_ttl_minutes: 60,
+        jwt_private_key_pem: None,
+        jwt_public_key_pem: None,
     }
 }
 
@@ -331,5 +344,8 @@ pub fn rebuild_app_state_with_mcp_url(app: &TestApp, mcp_url: String) -> AppStat
         prompt_pack_version: app.state.prompt_pack_version.clone(),
         chat_progress_bus: app.state.chat_progress_bus.clone(),
         second_reviewer_llm: app.state.second_reviewer_llm.clone(),
+        chunk_locks: app.state.chunk_locks.clone(),
+        chunk_event_bus: app.state.chunk_event_bus.clone(),
+        jwt_keys: app.state.jwt_keys.clone(),
     }
 }

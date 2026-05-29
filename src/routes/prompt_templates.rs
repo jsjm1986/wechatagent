@@ -2,7 +2,7 @@
 
 use axum::{
     extract::{Path, Query, State},
-    Json,
+    Extension, Json,
 };
 use futures::TryStreamExt;
 use mongodb::{
@@ -13,6 +13,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::{
+    auth::AuthenticatedAdmin,
     error::{AppError, AppResult},
     models::PromptTemplate,
     prompts,
@@ -44,15 +45,16 @@ pub(super) struct PromptTemplateRequest {
 
 pub(super) async fn list_prompt_templates(
     State(state): State<AppState>,
+    Extension(admin): Extension<AuthenticatedAdmin>,
     Query(query): Query<PromptTemplateQuery>,
 ) -> AppResult<Json<Value>> {
     prompts::ensure_prompt_pack_v2(
         &state.db,
-        &state.config.default_workspace_id,
+        &admin.current_workspace,
         &state.config.default_account_id,
     )
     .await?;
-    let mut filter = doc! { "workspace_id": &state.config.default_workspace_id };
+    let mut filter = doc! { "workspace_id": &admin.current_workspace };
     if let Some(agent_kind) = normalize_optional(query.agent_kind) {
         filter.insert("agent_kind", agent_kind);
     }
@@ -78,6 +80,7 @@ pub(super) async fn list_prompt_templates(
 
 pub(super) async fn create_prompt_template(
     State(state): State<AppState>,
+    Extension(admin): Extension<AuthenticatedAdmin>,
     Json(payload): Json<PromptTemplateRequest>,
 ) -> AppResult<Json<Value>> {
     validate_prompt_template_input(&payload)?;
@@ -86,7 +89,7 @@ pub(super) async fn create_prompt_template(
         .prompt_templates()
         .find_one(
             doc! {
-                "workspace_id": &state.config.default_workspace_id,
+                "workspace_id": &admin.current_workspace,
                 "prompt_key": &payload.prompt_key
             },
             FindOneOptions::builder()
@@ -97,7 +100,7 @@ pub(super) async fn create_prompt_template(
     let version = latest.map(|item| item.version + 1).unwrap_or(1);
     let template = PromptTemplate {
         id: None,
-        workspace_id: state.config.default_workspace_id.clone(),
+        workspace_id: admin.current_workspace.clone(),
         prompt_key: payload.prompt_key,
         agent_kind: payload.agent_kind,
         layer: payload.layer,
@@ -110,7 +113,7 @@ pub(super) async fn create_prompt_template(
         created_by: "manual".to_string(),
         created_at: DateTime::now(),
         updated_at: DateTime::now(),
-        // 后台手工创建时尚未发布；publish_prompt_template 会接管 current_version 切换。
+        // 后台手工创建时尚未发布；publish_prompt_template 负责 current_version 切换。
         current_version: false,
         previous_version: None,
         seeded_by: Some("manual".to_string()),
@@ -129,6 +132,7 @@ pub(super) async fn create_prompt_template(
 
 pub(super) async fn update_prompt_template(
     State(state): State<AppState>,
+    Extension(admin): Extension<AuthenticatedAdmin>,
     Path(id): Path<String>,
     Json(payload): Json<PromptTemplateRequest>,
 ) -> AppResult<Json<Value>> {
@@ -140,7 +144,7 @@ pub(super) async fn update_prompt_template(
         .update_one(
             doc! {
                 "_id": object_id,
-                "workspace_id": &state.config.default_workspace_id
+                "workspace_id": &admin.current_workspace
             },
             doc! {
                 "$set": {
@@ -161,6 +165,7 @@ pub(super) async fn update_prompt_template(
 
 pub(super) async fn publish_prompt_template(
     State(state): State<AppState>,
+    Extension(admin): Extension<AuthenticatedAdmin>,
     Path(id): Path<String>,
 ) -> AppResult<Json<Value>> {
     let object_id = parse_object_id(&id)?;
@@ -170,7 +175,7 @@ pub(super) async fn publish_prompt_template(
         .find_one(
             doc! {
                 "_id": object_id,
-                "workspace_id": &state.config.default_workspace_id
+                "workspace_id": &admin.current_workspace
             },
             None,
         )
@@ -205,10 +210,11 @@ pub(super) async fn publish_prompt_template(
 
 pub(super) async fn reset_system_prompt_pack(
     State(state): State<AppState>,
+    Extension(admin): Extension<AuthenticatedAdmin>,
 ) -> AppResult<Json<Value>> {
     prompts::reset_prompt_pack_v2(
         &state.db,
-        &state.config.default_workspace_id,
+        &admin.current_workspace,
         &state.config.default_account_id,
     )
     .await?;

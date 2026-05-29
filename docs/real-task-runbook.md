@@ -161,7 +161,7 @@ GET /api/evolution/experiments     (仅 S9 期间有效)
 | 5 闸 | PressureRisk block | review.rs LLM 评分 | S3 | `final_review_status` ∈ {blocked_by_safety_guard, held_by_ai_policy}；`pressureRisk ≥ 7`（**实测注**：同 S2，pressureRisk 是 review LLM free-form 评分，自然路径偏低；治理末端兜底有效但前端阈值识别信号有损） |
 | 5 闸 | HumanLikeScore rewrite | gateway.rs:611-690 | S4 | `final_review_status=revision_applied_approved` + `revision_applied=true` |
 | 5 闸 | EmotionalValue rewrite | 同上 | S4 备用 | 同上，`emotionalValue<5` |
-| 5 闸 | ProductAccuracyScore block | review.rs:552-591 | S5 | `final_review_status=blocked_unverified_product_claim` + 无 verified chunk |
+| 5 闸 | ProductAccuracyScore block | review.rs:885-925（R5.4 结构化兜底）+ guards.rs `claim_requires_product_knowledge` / `compute_verified_chunks` | S5 | `final_review_status=blocked_unverified_product_claim` + 无 verified chunk（reviewer `claimAnalysis.requiresProductKnowledge=true` 触发） |
 | Review | 二次仍未通过 | review.rs:860-865 | revision 后仍 fail 的输入 | `final_review_status=revision_failed` |
 | Review | 必填字段拦截 | review.rs:496-526 | LLM 输出缺自治协议字段 | `final_review_status=blocked_by_required_field` + `risks` 含 `missing_required_field:*` |
 | Review | local_decision_review fallback | review.rs:99-164 | RunBudget 即将耗尽 | `final_review_status=approved` + `decision_reviews.review_mode=local_decision_review`（local_decision_review 是模式名不是 final_review_status 取值） |
@@ -170,7 +170,7 @@ GET /api/evolution/experiments     (仅 S9 期间有效)
 | Outbox | 第二道 safety gate | outbox_dispatcher.rs:143-195 | 在 dispatcher tick 之前把 `cooldown_until` 设未来 | outbox `status=cancelled`，无 MCP 调用 |
 | Outbox | post-hoc MCP 核对 | outbox_dispatcher.rs:381-415 | 不强制；偶发 timeout 时观察 | `outbox_sent_post_hoc` 事件存在则 PASS |
 | Knowledge | catalog → search → open_slice 工具链 | knowledge_router.rs:444-630 | S6 | `knowledge_usage_logs.toolTrace.length≥2` |
-| Knowledge | verified chunk 缺失 → block | review.rs:552-591 | S5 | `selectedChunkIds=[]` + product block |
+| Knowledge | verified chunk 缺失 → block | review.rs:885-925（R5.4） | S5 | `selectedChunkIds=[]` + product block |
 | 状态机 | check_state_transition 拒绝非法跳转 | guards.rs / mod.rs:533 | 输入暗示直接 `customer_success` 但当前 `new_contact` | `operation_state` 不变 + `risks` 含 `state_transition_invalid:*` |
 | 双层标签 | 系统标签命中 | taxonomy.rs:194-249 | 输入命中 stage / intent | `customer_stage` / `intent_level` 写入 system_taxonomies 既有值 |
 | 双层标签 | 候选写入未阻塞 run | taxonomy.rs:252-369 | 输入产生新主题 | `taxonomy_candidates` 增 + run 仍 approved |

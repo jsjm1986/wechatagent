@@ -19,7 +19,7 @@
 
 use axum::{
     extract::{Path, Query, State},
-    Json,
+    Extension, Json,
 };
 use futures::TryStreamExt;
 use mongodb::bson::{doc, DateTime};
@@ -27,21 +27,20 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::{
+    auth::AuthenticatedAdmin,
     error::{AppError, AppResult},
     llm::{LlmClient, LlmFormat, LlmProvider, LlmProviderMeta},
     models::LlmProviderConfig,
+    secret::mask_secret,
 };
 
 use super::AppState;
 
-/// api_key mask：保留前 3 + 后 4，中间统一为 `****`。极短 key 全部 mask。
+/// api_key mask：复用 [`crate::secret::mask_secret`]（保留前 3 + 后 4，
+/// 中间 `****`）。本路由保留 `mask_api_key` 名称是为兼容已有调用站点；
+/// 实现委托给共享 helper，与 Debug / tracing 输出口径统一。
 fn mask_api_key(key: &str) -> String {
-    if key.len() <= 8 {
-        return "****".to_string();
-    }
-    let head: String = key.chars().take(3).collect();
-    let tail: String = key.chars().rev().take(4).collect::<String>().chars().rev().collect();
-    format!("{head}****{tail}")
+    mask_secret(key)
 }
 
 fn is_masked_value(value: &str) -> bool {
@@ -61,6 +60,8 @@ struct LlmProviderView {
     timeout_seconds: Option<u64>,
     max_retries: Option<u32>,
     retry_base_ms: Option<u64>,
+    supports_vision: bool,
+    is_vision_active: bool,
     created_at: i64,
     updated_at: i64,
 }
@@ -78,6 +79,8 @@ impl From<&LlmProviderConfig> for LlmProviderView {
             timeout_seconds: cfg.timeout_seconds,
             max_retries: cfg.max_retries,
             retry_base_ms: cfg.retry_base_ms,
+            supports_vision: cfg.supports_vision,
+            is_vision_active: cfg.is_vision_active,
             created_at: cfg.created_at.timestamp_millis(),
             updated_at: cfg.updated_at.timestamp_millis(),
         }
@@ -92,11 +95,12 @@ pub(super) struct ListQuery {
 
 pub(super) async fn list_providers(
     State(state): State<AppState>,
+    Extension(admin): Extension<AuthenticatedAdmin>,
     Query(params): Query<ListQuery>,
 ) -> AppResult<Json<Value>> {
     let workspace_id = params
         .workspace_id
-        .unwrap_or_else(|| state.config.default_workspace_id.clone());
+        .unwrap_or_else(|| admin.current_workspace.clone());
     let mut cursor = state
         .db
         .llm_provider_configs()
@@ -134,16 +138,19 @@ pub(super) struct UpsertRequest {
     pub timeout_seconds: Option<u64>,
     pub max_retries: Option<u32>,
     pub retry_base_ms: Option<u64>,
+    #[serde(default)]
+    pub supports_vision: Option<bool>,
 }
 
 pub(super) async fn create_provider(
     State(state): State<AppState>,
+    Extension(admin): Extension<AuthenticatedAdmin>,
     Json(body): Json<UpsertRequest>,
 ) -> AppResult<Json<Value>> {
     let workspace_id = body
         .workspace_id
         .clone()
-        .unwrap_or_else(|| state.config.default_workspace_id.clone());
+        .unwrap_or_else(|| admin.current_workspace.clone());
     LlmFormat::parse(&body.format)?;
     if body.provider_id.trim().is_empty() {
         return Err(AppError::BadRequest("providerId 不能为空".to_string()));
@@ -175,6 +182,8 @@ pub(super) async fn create_provider(
         timeout_seconds: body.timeout_seconds,
         max_retries: body.max_retries,
         retry_base_ms: body.retry_base_ms,
+        supports_vision: body.supports_vision.unwrap_or(false),
+        is_vision_active: false,
         created_at: now,
         updated_at: now,
     };
@@ -193,13 +202,14 @@ pub(super) async fn create_provider(
 
 pub(super) async fn update_provider(
     State(state): State<AppState>,
+    Extension(admin): Extension<AuthenticatedAdmin>,
     Path(provider_id): Path<String>,
     Json(body): Json<UpsertRequest>,
 ) -> AppResult<Json<Value>> {
     let workspace_id = body
         .workspace_id
         .clone()
-        .unwrap_or_else(|| state.config.default_workspace_id.clone());
+        .unwrap_or_else(|| admin.current_workspace.clone());
     LlmFormat::parse(&body.format)?;
     let existing = state
         .db
@@ -233,6 +243,9 @@ pub(super) async fn update_provider(
     if let Some(v) = body.retry_base_ms {
         update.insert("retryBaseMs", v as i64);
     }
+    if let Some(v) = body.supports_vision {
+        update.insert("supportsVision", v);
+    }
     state
         .db
         .llm_provider_configs()
@@ -262,13 +275,14 @@ pub(super) async fn update_provider(
 
 pub(super) async fn delete_provider(
     State(state): State<AppState>,
+    Extension(admin): Extension<AuthenticatedAdmin>,
     Path(provider_id): Path<String>,
     Query(params): Query<ListQuery>,
 ) -> AppResult<Json<Value>> {
     let workspace_id = params
         .workspace_id
         .clone()
-        .unwrap_or_else(|| state.config.default_workspace_id.clone());
+        .unwrap_or_else(|| admin.current_workspace.clone());
     let existing = state
         .db
         .llm_provider_configs()
@@ -296,13 +310,14 @@ pub(super) async fn delete_provider(
 
 pub(super) async fn activate_provider(
     State(state): State<AppState>,
+    Extension(admin): Extension<AuthenticatedAdmin>,
     Path(provider_id): Path<String>,
     Query(params): Query<ListQuery>,
 ) -> AppResult<Json<Value>> {
     let workspace_id = params
         .workspace_id
         .clone()
-        .unwrap_or_else(|| state.config.default_workspace_id.clone());
+        .unwrap_or_else(|| admin.current_workspace.clone());
     let target = state
         .db
         .llm_provider_configs()
@@ -341,6 +356,87 @@ pub(super) async fn activate_provider(
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub(super) struct VisionActivateRequest {
+    pub workspace_id: Option<String>,
+    /// `true` 指派为视觉模型；`false` 取消本 workspace 的视觉模型指派。
+    #[serde(default = "default_true")]
+    pub active: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+/// #574：把某条 provider 指派为本 workspace 的专职视觉模型（或取消指派）。
+///
+/// - `active=true`：要求该 provider `supports_vision=true`，否则 400；先清掉同
+///   workspace 其它 `is_vision_active`，再把本条置 true（保证至多一条）。
+/// - `active=false`：仅把本条置 false。
+///
+/// 与 [`activate_provider`]（文字主模型）正交：不触碰 `is_active`，也不热切换
+/// `LlmRegistry`——视觉模型按需在 `/import-apply-image` 里临时构造 client。
+pub(super) async fn set_vision_active(
+    State(state): State<AppState>,
+    Extension(admin): Extension<AuthenticatedAdmin>,
+    Path(provider_id): Path<String>,
+    Json(body): Json<VisionActivateRequest>,
+) -> AppResult<Json<Value>> {
+    let workspace_id = body
+        .workspace_id
+        .clone()
+        .unwrap_or_else(|| admin.current_workspace.clone());
+    let target = state
+        .db
+        .llm_provider_configs()
+        .find_one(
+            doc! { "workspaceId": &workspace_id, "providerId": &provider_id },
+            None,
+        )
+        .await?
+        .ok_or_else(|| AppError::NotFound(format!("provider {provider_id} not found")))?;
+    let now = DateTime::now();
+    if body.active {
+        if !target.supports_vision {
+            return Err(AppError::BadRequest(
+                "该 provider 未开启 supportsVision，不能指派为视觉模型".to_string(),
+            ));
+        }
+        // 清掉同 workspace 其它视觉指派，保证至多一条。
+        state
+            .db
+            .llm_provider_configs()
+            .update_many(
+                doc! { "workspaceId": &workspace_id, "isVisionActive": true, "providerId": { "$ne": &provider_id } },
+                doc! { "$set": { "isVisionActive": false, "updatedAt": now } },
+                None,
+            )
+            .await?;
+    }
+    state
+        .db
+        .llm_provider_configs()
+        .update_one(
+            doc! { "workspaceId": &workspace_id, "providerId": &provider_id },
+            doc! { "$set": { "isVisionActive": body.active, "updatedAt": now } },
+            None,
+        )
+        .await?;
+    let refreshed = state
+        .db
+        .llm_provider_configs()
+        .find_one(
+            doc! { "workspaceId": &workspace_id, "providerId": &provider_id },
+            None,
+        )
+        .await?
+        .ok_or_else(|| AppError::NotFound("provider 更新后未找到".to_string()))?;
+    Ok(Json(
+        json!({ "ok": true, "item": LlmProviderView::from(&refreshed) }),
+    ))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub(super) struct TestRequest {
     pub workspace_id: Option<String>,
     /// 优先级：若提供 providerId，按 DB 中该条配置测；否则取 inline 字段直接构造一次性 client。
@@ -354,12 +450,13 @@ pub(super) struct TestRequest {
 
 pub(super) async fn test_provider(
     State(state): State<AppState>,
+    Extension(admin): Extension<AuthenticatedAdmin>,
     Json(body): Json<TestRequest>,
 ) -> AppResult<Json<Value>> {
     let workspace_id = body
         .workspace_id
         .clone()
-        .unwrap_or_else(|| state.config.default_workspace_id.clone());
+        .unwrap_or_else(|| admin.current_workspace.clone());
     let (format, base_url, api_key, model, timeout) = if let Some(pid) = body
         .provider_id
         .as_ref()

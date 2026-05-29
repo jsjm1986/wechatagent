@@ -8,7 +8,7 @@
 //!
 //! 设计取舍：
 //! - 全只读，零写路径，红线零引入。
-//! - workspace_id 强制 default_workspace_id，与 ops 三表 admin 路由同源。
+//! - workspace_id 强制 admin.current_workspace，与 ops 三表 admin 路由同源。
 //! - 空集合返回空数组 / 0；不抛 5xx 给前端。
 //! - lifecycle 闭集与 [`crate::agent::run_envelope`] 同源，DB 偶发出现非闭集
 //!   值时（理论上 R9.10.e 已拦截）原样透出，不静默吞掉。
@@ -19,12 +19,15 @@
 //! - lessons_learned pattern × status 矩阵：已在 [`super::lessons_learned`]
 //!   面板单独出现，不在本接口重复。
 
-use axum::{extract::State, Json};
+use axum::{extract::State, Json,
+    Extension
+};
 use futures::TryStreamExt;
 use mongodb::bson::{doc, Document};
 use serde_json::{json, Value};
 
 use crate::{
+    auth::AuthenticatedAdmin,
     agent::run_envelope::{
         LIFECYCLE_ABORTED_BY_BUDGET, LIFECYCLE_ABORTED_BY_EXTERNAL_SIGNAL, LIFECYCLE_COMPLETED,
         LIFECYCLE_FAILED_AFTER_DECISION, LIFECYCLE_FAILED_BEFORE_DECISION, LIFECYCLE_RUNNING,
@@ -44,19 +47,24 @@ const REVISION_REASON_TOP_N: i64 = 10;
 
 pub(super) async fn phase_rollup(
     State(state): State<AppState>,
+    Extension(admin): Extension<AuthenticatedAdmin>,
 ) -> AppResult<Json<Value>> {
-    let workspace = state.config.default_workspace_id.clone();
+    let workspace = admin.current_workspace.clone();
 
     let lifecycle = aggregate_lifecycle(&state, &workspace).await?;
+    let hold_breakdown = aggregate_hold_breakdown(&state, &workspace).await?;
     let revision_reasons = aggregate_revision_reasons(&state, &workspace).await?;
     let reviewer_misjudge = aggregate_reviewer_misjudge(&state, &workspace).await?;
+    let reviewer_stats = read_reviewer_stats(&state, &workspace).await?;
     let negative_example_pending = count_negative_example_pending(&state, &workspace).await?;
 
     Ok(Json(json!({
         "windowHours": 24,
         "lifecycle": lifecycle,
+        "holdBreakdown": hold_breakdown,
         "revisionReasons": revision_reasons,
         "reviewerMisjudge": reviewer_misjudge,
+        "reviewerStats": reviewer_stats,
         "negativeExamplePending": negative_example_pending,
     })))
 }
@@ -112,6 +120,59 @@ async fn aggregate_lifecycle(
     Ok(Value::Array(items))
 }
 
+/// P2-2：final_review_status 中"hold"语义三类（held_by_ai_policy /
+/// blocked_by_safety_guard / ai_waiting_for_more_context）的近 24h 计数。
+///
+/// 与 `outcomes_autonomy` 的 hold ratio 同源（都扫 `agent_run_logs` 上
+/// `final_review_status`），但前者是 7 日窗 + ratio，本函数是 24h 窗 + raw count，
+/// 与 [`aggregate_lifecycle`] 同 dashboard 卡片对齐。空集合稳定输出 3 个 0。
+async fn aggregate_hold_breakdown(state: &AppState, workspace: &str) -> AppResult<Value> {
+    let since = mongodb::bson::DateTime::from_millis(now_ms() - WINDOW_MS);
+    let coll = state.db.raw().collection::<Document>("agent_run_logs");
+    let pipeline = vec![
+        doc! { "$match": {
+            "workspace_id": workspace,
+            "created_at": { "$gte": since },
+            "final_review_status": {
+                "$in": [
+                    "held_by_ai_policy",
+                    "blocked_by_safety_guard",
+                    "ai_waiting_for_more_context",
+                ]
+            },
+        } },
+        doc! { "$group": { "_id": "$final_review_status", "count": { "$sum": 1 } } },
+    ];
+    let mut cursor = coll.aggregate(pipeline, None).await?;
+    let mut buckets: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
+    while let Some(d) = cursor.try_next().await? {
+        let key = d
+            .get("_id")
+            .and_then(|b| b.as_str())
+            .map(str::to_string)
+            .unwrap_or_default();
+        let count = d.get_i64("count").unwrap_or(0);
+        if !key.is_empty() {
+            buckets.insert(key, count);
+        }
+    }
+    let known: [&str; 3] = [
+        "held_by_ai_policy",
+        "blocked_by_safety_guard",
+        "ai_waiting_for_more_context",
+    ];
+    let items: Vec<Value> = known
+        .iter()
+        .map(|k| {
+            json!({
+                "finalReviewStatus": k,
+                "count": buckets.remove(*k).unwrap_or(0),
+            })
+        })
+        .collect();
+    Ok(Value::Array(items))
+}
+
 async fn aggregate_revision_reasons(
     state: &AppState,
     workspace: &str,
@@ -150,7 +211,7 @@ async fn aggregate_reviewer_misjudge(
     workspace: &str,
 ) -> AppResult<Value> {
     let since = mongodb::bson::DateTime::from_millis(now_ms() - WINDOW_MS);
-    let coll = state.db.raw().collection::<Document>("decision_reviews");
+    let coll = state.db.raw().collection::<Document>("agent_decision_reviews");
     let pipeline = vec![
         doc! { "$match": {
             "workspace_id": workspace,
@@ -180,6 +241,26 @@ async fn aggregate_reviewer_misjudge(
             .cmp(&a.get("count").and_then(Value::as_i64).unwrap_or(0))
     });
     Ok(Value::Array(items))
+}
+
+async fn read_reviewer_stats(
+    state: &AppState,
+    workspace: &str,
+) -> AppResult<Value> {
+    let stat_id = format!("{workspace}::reviewer");
+    let coll = state.db.raw().collection::<Document>("reviewer_stats");
+    let Some(doc) = coll.find_one(doc! { "stat_id": &stat_id }, None).await? else {
+        // feedback_worker 还没跑过该 workspace：返回空对象，前端按缺省渲染。
+        return Ok(json!({}));
+    };
+    Ok(json!({
+        "windowDays": doc.get_i64("window_days").unwrap_or(0),
+        "considered": doc.get_i64("considered").unwrap_or(0),
+        "approved": doc.get_i64("approved").unwrap_or(0),
+        "approvedButUserNegative": doc.get_i64("approved_but_user_negative").unwrap_or(0),
+        "passRate": doc.get_f64("pass_rate").unwrap_or(0.0),
+        "misjudgeRate": doc.get_f64("misjudge_rate").unwrap_or(0.0),
+    }))
 }
 
 async fn count_negative_example_pending(
@@ -226,8 +307,9 @@ fn now_ms() -> i64 {
 ///   但 R9.10.e 防御性透出便于诊断历史脏数据）。
 pub(super) async fn worker_health(
     State(state): State<AppState>,
+    Extension(admin): Extension<AuthenticatedAdmin>,
 ) -> AppResult<Json<Value>> {
-    let workspace = state.config.default_workspace_id.clone();
+    let workspace = admin.current_workspace.clone();
 
     let chat_tasks = aggregate_chat_tasks(&state, &workspace).await?;
     let gap_signals = aggregate_gap_signals(&state, &workspace).await?;
@@ -523,6 +605,25 @@ mod tests {
     #[test]
     fn window_ms_is_exactly_24_hours() {
         assert_eq!(WINDOW_MS, 86_400_000);
+    }
+
+    /// P2-2：hold breakdown 三类闭集与 `final_review_status` 中"hold"语义同步。
+    /// 改 FINAL_REVIEW_STATUS_VALUES 时必须同步本测试与 aggregate_hold_breakdown
+    /// 的 known 数组。
+    #[test]
+    fn hold_breakdown_closed_set_aligns_with_final_review_status() {
+        use crate::agent::run_envelope::FINAL_REVIEW_STATUS_VALUES;
+        let hold_keys = [
+            "held_by_ai_policy",
+            "blocked_by_safety_guard",
+            "ai_waiting_for_more_context",
+        ];
+        for k in hold_keys.iter() {
+            assert!(
+                FINAL_REVIEW_STATUS_VALUES.contains(k),
+                "hold key {k} 必须在 FINAL_REVIEW_STATUS_VALUES 闭集中"
+            );
+        }
     }
 
     #[test]
