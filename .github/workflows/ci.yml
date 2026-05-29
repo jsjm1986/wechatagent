@@ -62,3 +62,27 @@ jobs:
       - name: scripts/check-evolution-isolation.sh (R1.6 / R8.4 / R9.4)
         shell: bash
         run: bash scripts/check-evolution-isolation.sh
+
+  integration:
+    name: Integration tests (Docker / testcontainers)
+    runs-on: ubuntu-latest
+    # 首次接入：101 个 #[ignore] 集成测试从未在 CI 跑过，bit-rot 几乎必然。
+    # 先 continue-on-error 拿到真实绿/红体检报告，不阻塞合并；逐个修复后
+    # 再视情况抬升为硬门（与 baseline 同级）。
+    continue-on-error: true
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry / target
+        uses: Swatinem/rust-cache@v2
+
+      # ubuntu-latest runner 预装 Docker daemon；testcontainers
+      # （tests/common/mod.rs:116 `Mongo::default().start()`）自动拉起
+      # 临时 MongoDB 容器，无需额外 service 声明。
+      - name: cargo test -- --ignored (testcontainers MongoDB)
+        run: cargo test -- --ignored
