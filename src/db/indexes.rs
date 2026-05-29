@@ -290,13 +290,12 @@ pub(super) async fn ensure_all(db: &Database) -> anyhow::Result<()> {
                     "status": 1,
                     "outcome_status": 1
                 })
-                .options(
-                    IndexOptions::builder()
-                        .partial_filter_expression(
-                            doc! { "outcome_status": { "$in": ["pending", "analyzing"] } },
-                        )
-                        .build(),
-                )
+                // 注意：不能用 partialFilterExpression { outcome_status: { $in: [...] } }——
+                // MongoDB partial index 只接受 $eq/$gt/$gte/$lt/$lte/$exists/$type/$and 及
+                // 单值相等，$in/$or 会被拒（Error 67 CannotCreateIndex），且会让整个
+                // ensure_indexes panic。reaction claim 查询走前缀
+                // (workspace_id, account_id, contact_wxid, status) + outcome_status 等值，
+                // 全键复合索引已能覆盖；放弃"只索引活跃 review"的体积优化以换取合法性。
                 .build(),
             None,
         )
