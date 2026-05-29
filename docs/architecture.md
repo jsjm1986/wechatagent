@@ -382,7 +382,7 @@ POST /webhooks/wechat
 ### Worker Flow（多 worker 并行）
 
 ```text
-tokio::spawn 主进程内 8 条 loop（启停由 env / mongo flag 控制）：
+tokio::spawn 主进程内 9 条 loop（启停由 env / mongo flag 控制）：
 
 1. tasks::worker_loop                  follow-up task 调度，走同一 gateway
 2. outbox_dispatcher::run_outbox_dispatcher  五状态机 + idempotency + retry/backoff
@@ -390,10 +390,14 @@ tokio::spawn 主进程内 8 条 loop（启停由 env / mongo flag 控制）：
 4. evolution::worker（EVOLUTION_ENABLED=true 时启）  threshold / prompt 灰度 + post_release
 5. knowledge_wiki::feedback_worker      30d 滑窗 usage_stats / dynamic_confidence + structural lint
                                         + sweep_stale_signals + lessons_learned 14d 聚合
+                                        （dynamic_confidence 带最小样本门 DYNAMIC_CONFIDENCE_MIN_SAMPLES）
 6. catalog_rebuild_worker               documents.catalog_summary_persisted 增量重写
 7. knowledge_digest::run_loop           日报工作站（chat-only async tools）
 8. cold_contact_worker                  按 last_outbound_at 阈值挑联系人 → peer_case 钩子重激活
                                         （COLD_CONTACT_WORKER_ENABLED env 开关，默认 false）
+9. silence_signal_worker                按 last_outbound_at 阈值挑"久未回复"联系人 → 落
+                                        censored=true 沉默信号（只采集不发消息；
+                                        SILENCE_SIGNAL_WORKER_ENABLED env 开关，默认 false）
 ```
 
 ### Phase 0 → E5-T1 新增 collection / 字段速查

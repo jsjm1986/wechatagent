@@ -1,5 +1,6 @@
 /target
 /target-pbt
+/target-check
 /frontend/node_modules
 /frontend/dist
 /frontend/target-pbt

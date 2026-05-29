@@ -67,27 +67,48 @@ fn make_contact(wxid: &str) -> Contact {
         last_outbound_style: None,
         intent_trajectory: Vec::new(),
         locale: None,
+        deal_events: Vec::new(),
         created_at: now,
         updated_at: now,
     }
 }
 
-/// 启 wiremock，POST /mcp 一律返回 MCP `tools/call` 成功 envelope。
+/// 每次请求返回唯一 `newMsgId` 的成功 responder。
+///
+/// gateway::send_outbound_message 会把 `newMsgId` 写进 conversation_messages.message_id，
+/// 而该字段有 sparse+unique 索引；若多次发送返回同一 id，第二次插入会撞 E11000、
+/// 投递被重新置回 pending。真实 MCP 每条消息都有独立 id，故 mock 必须逐请求递增。
+struct UniqueMsgIdResponder {
+    counter: std::sync::atomic::AtomicU64,
+}
+
+impl wiremock::Respond for UniqueMsgIdResponder {
+    fn respond(&self, _request: &wiremock::Request) -> ResponseTemplate {
+        let seq = self
+            .counter
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let body = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {
+                "structuredContent": {
+                    "newMsgId": format!("mock_msg_id_{seq}"),
+                    "content": []
+                }
+            }
+        });
+        ResponseTemplate::new(200).set_body_json(body)
+    }
+}
+
+/// 启 wiremock，POST /mcp 返回 MCP `tools/call` 成功 envelope（每请求唯一 newMsgId）。
 async fn start_mcp_mock_success() -> MockServer {
     let server = MockServer::start().await;
-    let body = json!({
-        "jsonrpc": "2.0",
-        "id": 1,
-        "result": {
-            "structuredContent": {
-                "newMsgId": "mock_msg_id_42",
-                "content": []
-            }
-        }
-    });
     Mock::given(method("POST"))
         .and(path("/mcp"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(body))
+        .respond_with(UniqueMsgIdResponder {
+            counter: std::sync::atomic::AtomicU64::new(0),
+        })
         .mount(&server)
         .await;
     server

@@ -1084,6 +1084,40 @@ pub struct KnowledgeRouteResult {
     pub tool_trace: Vec<Document>,
     #[serde(default, deserialize_with = "string_or_vec")]
     pub evidence_excerpts: Vec<String>,
+    /// 自学习采集管道 S4：召回倾向占位（recall propensity）。
+    ///
+    /// 记录本次检索每条被选 chunk 的排名 / 排序分 / 候选池大小，为未来 IPW
+    /// （inverse-propensity weighting）纠偏召回偏置留位——没有 propensity 就无法
+    /// 区分"chunk 真的好"与"chunk 只是恰好排前面被高频选中"。本阶段只采集落库，
+    /// 不参与任何加权。随 `knowledge_router` 既有 `to_document(route)` 自动持久化
+    /// 到 `knowledge_usage_logs.route_result`。缺字段时反序列化为空 Vec（R11 安全）。
+    #[serde(default)]
+    pub selected_chunk_rankings: Vec<SelectedChunkRanking>,
+}
+
+/// 自学习采集管道 S4：单条被选 chunk 的召回倾向快照。
+///
+/// 只承载"该 chunk 在本次检索里如何被排到"的客观量，不含任何质量判断——质量
+/// 判断（reviewer 是否采纳）由 `knowledge_usage_logs.review_approved` 另行承载，
+/// 两层刻意分离（Law ③ 观察/解释分层）。
+#[derive(Debug, Serialize, Deserialize, Default, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct SelectedChunkRanking {
+    /// chunk 的 hex id。
+    #[serde(default)]
+    pub chunk_id: String,
+    /// 0-based 排名（0 = 排序后第一名）。
+    #[serde(default)]
+    pub rank: usize,
+    /// 排序分（既有 `wiki_type_priority × dynamic_confidence` 等综合分）。
+    #[serde(default)]
+    pub score: f64,
+    /// 本次检索的候选池大小（计算 propensity 的分母基数）。
+    #[serde(default)]
+    pub pool_size: usize,
+    /// 排序来源标记（如 `"fallback_rank"` / `"tool_loop"`），便于区分召回路径。
+    #[serde(default)]
+    pub source: String,
 }
 
 #[derive(Debug, Serialize, Deserialize, Default, Clone)]

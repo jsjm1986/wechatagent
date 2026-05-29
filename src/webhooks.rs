@@ -252,6 +252,11 @@ pub async fn wechat_webhook(
     };
 
     let now = DateTime::now();
+    // S1（自学习采集管道）：在 contact 的 last_inbound_at / last_outbound_at 被本轮
+    // 更新覆盖之前，先快照出"上一条入站 / 上一条出站"时间，用于构造 T1 行为信号
+    // （reply_latency / reactivation）。采集是 best-effort 旁路，绝不阻断应答。
+    let prev_last_inbound_ms = contact.last_inbound_at.map(|d| d.timestamp_millis());
+    let prev_last_outbound_ms = contact.last_outbound_at.map(|d| d.timestamp_millis());
     state
         .db
         .contacts()
@@ -267,6 +272,20 @@ pub async fn wechat_webhook(
             None,
         )
         .await?;
+
+    // S1：落 T1 行为信号（观察层，不解释、不评分）。每条带 dedupe_key，重复
+    // webhook / 重放只落一次。任何一段失败仅 warn，不影响后续 Agent 应答。
+    collect_inbound_behavior_signals(
+        &state,
+        &workspace_id,
+        &from_wxid,
+        effective_message_id.as_deref(),
+        &inbound.content,
+        now,
+        prev_last_inbound_ms,
+        prev_last_outbound_ms,
+    )
+    .await;
 
     // P2：MCP（GeWe-agent）那一侧 fetch(messageWebhookUrl) 用了 5s AbortController
     // timeout 且失败不重试。Agent 决策 + Review 流水线一次约 10–15s，远超
@@ -362,6 +381,61 @@ fn stable_payload_hash(value: &Value) -> String {
 /// 判定 mongodb 错误是否为 DuplicateKey（code 11000 / 11001）。
 /// 与 `agent::outbox::is_duplicate_key_error` 同语义；不跨 mod 复用以避免
 /// webhook 反向依赖 agent 内部 helper。
+/// S1（自学习采集管道）：落本条入站对应的 T1 行为信号（best-effort 旁路）。
+///
+/// 在 contact 的 last_* 时间戳被本轮覆盖之前由调用方快照 `prev_*_ms` 传入。
+/// 缺 `message_id` 时退化用 `observed_at` 毫秒作为 dedupe 后缀——保证仍幂等
+/// （同一时刻的同 contact 不会重复落），但跨重放去重精度略降。
+///
+/// 任何一段失败只 `warn`，绝不向上抛——采集出错不能拖累用户应答。
+#[allow(clippy::too_many_arguments)]
+async fn collect_inbound_behavior_signals(
+    state: &AppState,
+    workspace_id: &str,
+    wxid: &str,
+    message_id: Option<&str>,
+    content: &str,
+    inbound_at: DateTime,
+    prev_last_inbound_ms: Option<i64>,
+    prev_last_outbound_ms: Option<i64>,
+) {
+    use crate::behavior_signals as bs;
+    let dedupe_suffix = message_id
+        .map(ToString::to_string)
+        .unwrap_or_else(|| inbound_at.timestamp_millis().to_string());
+
+    let mut signals = vec![
+        bs::build_reply_latency(
+            workspace_id,
+            wxid,
+            &dedupe_suffix,
+            inbound_at,
+            prev_last_outbound_ms,
+        ),
+        bs::build_reply_length(workspace_id, wxid, &dedupe_suffix, inbound_at, content),
+    ];
+    if bs::is_reactivation(prev_last_inbound_ms, inbound_at, bs::REACTIVATION_THRESHOLD_MS) {
+        signals.push(bs::build_reactivation(
+            workspace_id,
+            wxid,
+            &dedupe_suffix,
+            inbound_at,
+        ));
+    }
+
+    for signal in signals {
+        let signal_type = signal.signal_type.clone();
+        if let Err(error) = bs::persist_signal(state, signal).await {
+            tracing::warn!(
+                error = %error,
+                wxid = %wxid,
+                signal_type = %signal_type,
+                "behavior_signal persist failed (best-effort, ignored)"
+            );
+        }
+    }
+}
+
 fn is_duplicate_key_error(err: &mongodb::error::Error) -> bool {
     match &*err.kind {
         ErrorKind::Write(WriteFailure::WriteError(write_error)) => {

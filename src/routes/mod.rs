@@ -86,8 +86,8 @@ use admin_taxonomy_candidates::{
 };
 use assets::{create_content_asset, list_content_assets};
 use contacts::{
-    analyze_contact_profile, disable_agent, enable_agent, get_contact, get_contact_memory_card,
-    get_operating_memory, get_operation_health, import_contacts_endpoint,
+    analyze_contact_profile, add_deal_event, disable_agent, enable_agent, get_contact,
+    get_contact_memory_card, get_operating_memory, get_operation_health, import_contacts_endpoint,
     list_contact_memory_candidates, list_contacts, run_contact_memory_consolidation,
     search_contacts_endpoint, search_import_contacts, update_operating_memory,
     update_operation_profile, update_profile_note, update_custom_agent_instructions,
@@ -250,6 +250,7 @@ pub fn api_router(state: AppState) -> Router<AppState> {
             "/contacts/:id/operation-profile",
             put(update_operation_profile),
         )
+        .route("/contacts/:id/deal-events", post(add_deal_event))
         .route(
             "/contacts/:id/analyze-profile",
             post(analyze_contact_profile),

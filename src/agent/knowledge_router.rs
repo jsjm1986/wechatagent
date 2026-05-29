@@ -29,7 +29,7 @@ use super::memory::{
 };
 use super::types::{
     non_empty_option, AgentDecision, DecisionReviewResult, KnowledgeRouteResult, KnowledgeRuntime,
-    RunPlannerResult,
+    RunPlannerResult, SelectedChunkRanking,
 };
 
 pub(crate) async fn load_operation_knowledge(
@@ -276,6 +276,7 @@ pub async fn test_knowledge_route_for_contact(
         last_agent_run_at: None,
         last_outbound_style: None,
         intent_trajectory: Vec::new(),
+        deal_events: Vec::new(),
         locale: None,
         created_at: DateTime::now(),
         updated_at: DateTime::now(),
@@ -479,7 +480,7 @@ pub(crate) async fn route_operation_knowledge(
         needed_categories: Vec::new(),
         selected_knowledge_ids: Vec::new(),
         selected_document_ids: Vec::new(),
-        selected_chunk_ids,
+        selected_chunk_ids: selected_chunk_ids.clone(),
         selected_slice_reasons: Vec::new(),
         risk_level,
         requires_evidence: !evidence_excerpts.is_empty(),
@@ -488,8 +489,48 @@ pub(crate) async fn route_operation_knowledge(
         reason: answer.answer.clone(),
         tool_trace,
         evidence_excerpts,
+        // S4：召回倾向占位。rank = 选中顺序，score = wiki_type_priority ×
+        // dynamic_confidence，pool_size = 已加载候选 chunk 数。本阶段只采集。
+        selected_chunk_rankings: build_chunk_rankings(
+            &selected_chunk_ids,
+            &knowledge.chunks,
+            "tool_loop",
+        ),
     };
     Ok(route)
+}
+
+/// 自学习采集管道 S4：从最终被选 chunk 列表构造召回倾向快照（纯函数，可单测）。
+///
+/// 对每个被选 chunk：`rank` 取其在 `selected_ids` 中的下标（0-based，越小越靠前）；
+/// `score` 取 `wiki_type_priority × dynamic_confidence`（与排序键同源，缺
+/// dynamic_confidence 时按 0.0）；`pool_size` 统一取候选 chunk 池大小，作为未来
+/// 计算 propensity 的分母基数。未在 corpus 中找到的 id 跳过（不杜撰快照）。
+pub(crate) fn build_chunk_rankings(
+    selected_ids: &[String],
+    chunks: &[OperationKnowledgeChunk],
+    source: &str,
+) -> Vec<SelectedChunkRanking> {
+    let pool_size = chunks.len();
+    selected_ids
+        .iter()
+        .enumerate()
+        .filter_map(|(rank, id)| {
+            let chunk = chunks.iter().find(|c| {
+                c.id.map(|oid| oid.to_hex()).as_deref() == Some(id.as_str())
+            })?;
+            let priority =
+                super::knowledge_agent::wiki_type_priority(chunk.wiki_type.as_deref());
+            let confidence = chunk.dynamic_confidence.unwrap_or(0.0);
+            Some(SelectedChunkRanking {
+                chunk_id: id.clone(),
+                rank,
+                score: priority as f64 * confidence,
+                pool_size,
+                source: source.to_string(),
+            })
+        })
+        .collect()
 }
 
 pub(crate) fn empty_knowledge_route(planner: &RunPlannerResult) -> KnowledgeRouteResult {

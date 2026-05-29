@@ -21,6 +21,7 @@ use serde_json::json;
 use wechatagent::agent::{consolidate_contact_memory, handle_managed_message};
 use wechatagent::models::{
     AgentStatus, Contact, ConversationMessage, MemoryCandidate, MessageDirection,
+    OperationKnowledgeChunk,
 };
 
 fn make_contact(wxid: &str) -> Contact {
@@ -60,6 +61,7 @@ fn make_contact(wxid: &str) -> Contact {
         last_outbound_style: None,
         intent_trajectory: Vec::new(),
         locale: None,
+        deal_events: Vec::new(),
         created_at: now,
         updated_at: now,
     }
@@ -216,7 +218,50 @@ fn make_inbound(contact: &Contact, message_id: &str, content: &str) -> Conversat
     }
 }
 
-/// 构造 Reply Agent 9 字段自治协议的 happy-path JSON（critical_turn 长度安全）。
+/// 种入一条 active + verified 的 user_operations chunk，返回其 hex chunk_id。
+///
+/// agent-first knowledge_agent 的 list_catalog / open_chunk 都只暴露
+/// `integrity_status="verified"` 的 active chunk（与 router corpus 对齐），故 fixture
+/// 必须显式置 verified + active，否则 agent 看不到也打不开。
+async fn seed_verified_chunk(
+    app: &common::TestApp,
+    contact: &Contact,
+    title: &str,
+    body: &str,
+) -> String {
+    let id = ObjectId::new();
+    let now = DateTime::now();
+    let chunk = OperationKnowledgeChunk {
+        id: Some(id),
+        workspace_id: contact.workspace_id.clone(),
+        account_id: Some(contact.account_id.clone()),
+        domain: "user_operations".to_string(),
+        knowledge_type: Some("product_capability".to_string()),
+        title: title.to_string(),
+        summary: Some(body.to_string()),
+        body: Some(body.to_string()),
+        source_quote: Some(body.to_string()),
+        integrity_status: Some("verified".to_string()),
+        confidence_score: Some(88),
+        status: "active".to_string(),
+        priority: 10,
+        created_at: now,
+        updated_at: now,
+        wiki_type: Some("methodology".to_string()),
+        dynamic_confidence: Some(0.9),
+        chunk_type: "product_fact".to_string(),
+        ..Default::default()
+    };
+    app.state
+        .db
+        .operation_knowledge_chunks()
+        .insert_one(&chunk, None)
+        .await
+        .expect("insert verified chunk");
+    id.to_hex()
+}
+
+
 ///
 /// `reply_text` / `why_should_reply` 由调用方覆盖以表达 revision 前后版本；
 /// `knowledge_need` 默认 `not_required`，tool-loop 测试覆盖为 `required`。
@@ -429,35 +474,35 @@ async fn autonomy_tool_loop_happy_path() {
         .await
         .expect("insert inbound message");
 
-    // 不种子 operation_knowledge_*，让 router 在空知识库上返回 list_catalog→search→open_slice
-    // 三段 tool_trace（mock LLM 直接给完整 trace；selected_chunk_ids 留空避开 DB 过滤）。
-    //
-    // LLM 调用序列：
-    //   #1 Reply Agent —— knowledge_need=required，触发 router；
-    //   #2 Knowledge Router —— 直接给三段 tool_trace；
-    //   #3 Reply Agent —— 二轮决策，knowledge_need=required（依然，但已携带 router 上下文）；
+    // 种入一条 verified chunk，让 agent-first knowledge_agent 真正进入多轮探索循环。
+    // route_operation_knowledge 在知识库非空时把上下文折成 query 喂给 knowledge_agent::answer，
+    // 后者先 list_catalog（DB 调用，不耗 LLM），再进入 ≤3 轮 LLM 循环。
+    let chunk_id = seed_verified_chunk(
+        &app,
+        &contact,
+        "企业 IM 接入能力清单",
+        "覆盖账号纳管、自动应答、手动指令三类核心能力；支持私有化部署与 webhook 回调。",
+    )
+    .await;
+
+    // LLM 调用序列（agent-first 架构）：
+    //   #1 knowledge_agent round1 —— open_chunk 打开上面种入的 chunk；
+    //   #2 knowledge_agent round2 —— answer，cite 该 chunk；
+    //   #3 Reply Agent —— 单轮决策（知识路由前置，已携带 agent 命中上下文）；
     //   #4 Review Agent —— full review，approved 通过。
-    app.llm.push_response(reply_agent_decision_json(
-        "我们已经形成了企业 IM 场景下的能力清单，让我先调出对应模块给你做精确匹配，避免给你笼统罗列。",
-        "客户明确询问能力覆盖范围，需要结合知识库的具体切片来给出可信支撑而非泛泛而谈。",
-        "required",
-    ));
     app.llm.push_response(json!({
-        "neededCategories": ["product_capability"],
-        "selectedKnowledgeIds": [],
-        "selectedDocumentIds": [],
-        "selectedChunkIds": [],
-        "selectedSliceReasons": ["企业 IM 接入能力总览"],
-        "riskLevel": "medium",
-        "requiresEvidence": false,
-        "knowledgeCoverage": "enough",
-        "missingKnowledge": [],
-        "reason": "客户问能力清单：先扫总目录，再按企业 IM 关键词搜索，最后开启对应切片以给出具体支撑。",
-        "toolTrace": [
-            { "tool": "knowledge.list_catalog", "documents": 0, "items": 0, "chunks": 0 },
-            { "tool": "knowledge.search", "query": "企业 IM 接入能力", "hits": 0 },
-            { "tool": "knowledge.open_slice", "ids": [], "reason": "命中能力清单切片" }
-        ],
+        "action": "open_chunk",
+        "ids": [chunk_id.clone()],
+    }));
+    app.llm.push_response(json!({
+        "action": "answer",
+        "citedChunkIds": [chunk_id.clone()],
+        "sourceQuotes": [{
+            "chunkId": chunk_id.clone(),
+            "quote": "覆盖账号纳管、自动应答、手动指令三类核心能力",
+            "sourceAnchorIndex": 0
+        }],
+        "answer": "我们已形成企业 IM 场景的能力清单，覆盖账号纳管、自动应答、手动指令三类核心能力。",
     }));
     app.llm.push_response(reply_agent_decision_json(
         "我们已经形成了企业 IM 场景下的能力清单，按你们的接入侧重点会优先覆盖账号纳管、自动应答、手动指令三类，要不要我先发一份场景对照？",
@@ -467,7 +512,7 @@ async fn autonomy_tool_loop_happy_path() {
     app.llm.push_response(review_agent_pass_json(
         false,
         "",
-        "知识路由已扫过 list_catalog/search/open_slice，回复未越界做产品承诺，整体可放行。",
+        "知识路由已扫过 list_catalog/open_chunk/answer，回复未越界做产品承诺，整体可放行。",
     ));
 
     let before_calls = app.llm.calls();
@@ -478,7 +523,7 @@ async fn autonomy_tool_loop_happy_path() {
     assert_eq!(
         after_calls - before_calls,
         4,
-        "tool-loop happy path: Reply ×2 + Router ×1 + Review ×1 = 4 次 LLM 调用"
+        "tool-loop happy path: knowledge_agent ×2（open_chunk + answer）+ Reply ×1 + Review ×1 = 4 次 LLM 调用"
     );
 
     let log = app
@@ -503,15 +548,16 @@ async fn autonomy_tool_loop_happy_path() {
     );
 
     // KnowledgeRouteResult serde_rename_all="camelCase" → BSON 字段为 toolTrace。
+    // agent-first knowledge_agent 透传的 trace：第一段恒为 list_catalog（启动时 DB 拉目录），
+    // 随后是 LLM 驱动的 open_chunk / answer。
     let tool_trace = log
         .knowledge_route
         .get_array("toolTrace")
         .expect("knowledge_route.toolTrace array")
         .clone();
-    assert_eq!(
-        tool_trace.len(),
-        3,
-        "tool_trace 必须包含 list_catalog/search/open_slice 三段，实际 {:?}",
+    assert!(
+        tool_trace.len() >= 3,
+        "tool_trace 必须至少包含 list_catalog/open_chunk/answer 三段，实际 {:?}",
         tool_trace
     );
     let tool_names: Vec<String> = tool_trace
@@ -520,18 +566,18 @@ async fn autonomy_tool_loop_happy_path() {
         .filter_map(|d| d.get_str("tool").ok().map(|s| s.to_string()))
         .collect();
     assert!(
-        tool_names.iter().any(|n| n == "knowledge.list_catalog"),
-        "tool_trace 必须含 knowledge.list_catalog，实际 {:?}",
+        tool_names.iter().any(|n| n == "list_catalog"),
+        "tool_trace 必须含 list_catalog，实际 {:?}",
         tool_names
     );
     assert!(
-        tool_names.iter().any(|n| n == "knowledge.search"),
-        "tool_trace 必须含 knowledge.search，实际 {:?}",
+        tool_names.iter().any(|n| n == "open_chunk"),
+        "tool_trace 必须含 open_chunk，实际 {:?}",
         tool_names
     );
     assert!(
-        tool_names.iter().any(|n| n == "knowledge.open_slice"),
-        "tool_trace 必须含 knowledge.open_slice，实际 {:?}",
+        tool_names.iter().any(|n| n == "answer"),
+        "tool_trace 必须含 answer，实际 {:?}",
         tool_names
     );
 

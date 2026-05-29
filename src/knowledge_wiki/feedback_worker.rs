@@ -40,7 +40,13 @@ pub async fn feedback_worker_loop(state: AppState, interval_secs: u64) {
 async fn run_one_round(state: &AppState) -> anyhow::Result<()> {
     let workspaces = list_workspaces(state).await?;
     for ws in workspaces {
-        if let Err(err) = gap_signals::refresh_usage_stats_and_confidence(&state.db, &ws).await {
+        if let Err(err) = gap_signals::refresh_usage_stats_and_confidence(
+            &state.db,
+            &ws,
+            state.config.dynamic_confidence_min_samples,
+        )
+        .await
+        {
             tracing::warn!(workspace_id = %ws, ?err, "refresh_usage_stats failed");
         }
         match gap_signals::run_structural_lint(&state.db, &ws).await {

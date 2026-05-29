@@ -466,9 +466,13 @@ pub async fn persist_signals(
 /// ```
 ///
 /// 单次扫 workspace：bulk update —— 当前用单条 update 的 N 次循环（chunk 总量级假设 < 5000）。
+///
+/// S7 止血：`min_samples` 控制信 hit_rate 所需的最小样本数（hits+blocks）。
+/// 低于此值时 dynamic_confidence 只用 base（详见 [`compute_dynamic_confidence`]）。
 pub async fn refresh_usage_stats_and_confidence(
     db: &Database,
     workspace_id: &str,
+    min_samples: u64,
 ) -> Result<UsageStatsReport, AppError> {
     use mongodb::bson::Bson;
     let now = DateTime::now();
@@ -524,16 +528,12 @@ pub async fn refresh_usage_stats_and_confidence(
         let last_blocked_reason = last_block_reason.get(&key).cloned();
 
         let base = c.integrity_score.unwrap_or(0.5);
-        let hit_rate = if h + b == 0 {
-            0.0
-        } else {
-            h as f64 / (h as f64 + b as f64)
-        };
         let stale_penalty = match c.valid_to {
             Some(vt) if vt.timestamp_millis() < now.timestamp_millis() => 0.3,
             _ => 0.0,
         };
-        let dyn_conf = (base * 0.6 + hit_rate * 0.4 - stale_penalty).clamp(0.0, 1.0);
+        let dyn_conf =
+            compute_dynamic_confidence(base, h as u64, b as u64, stale_penalty, min_samples);
 
         let mut set: Document = doc! {
             "usage_stats": {
@@ -561,6 +561,42 @@ pub async fn refresh_usage_stats_and_confidence(
     }
 
     Ok(report)
+}
+
+/// S7 止血：dynamic_confidence 计算的纯函数（无 IO，可单测）。
+///
+/// 公式（保持与 design.md §6.2 一致）：
+/// ```text
+/// hit_rate = h / (h + b)
+/// dynamic_confidence = clamp(base * 0.6 + hit_rate * 0.4 - stale_penalty, 0, 1)
+/// ```
+///
+/// **最小样本门**：当 `h + b < min_samples` 时，hit_rate 由太少的样本估计，
+/// 噪声极大（1-2 个 reviewer 自评就能把置信度甩到极端）。此时**不信
+/// hit_rate**，只用 `clamp(base - stale_penalty, 0, 1)`。
+///
+/// 明确**不做**贝叶斯收缩（Wilson/Beta）——那属于"换血 hit 信号"阶段；当前
+/// hit 仍是 reviewer 自评（镜厅效应），给它上贝叶斯只会让镜厅更精致。最小
+/// 样本门只是防止极少样本就把置信度甩飞，不改变信号本身的来源。
+pub fn compute_dynamic_confidence(
+    base: f64,
+    h: u64,
+    b: u64,
+    stale_penalty: f64,
+    min_samples: u64,
+) -> f64 {
+    let total = h + b;
+    if total < min_samples {
+        return (base - stale_penalty).clamp(0.0, 1.0);
+    }
+    // total==0 仅在 min_samples==0（止血门关闭）时能走到这；无样本时 hit_rate
+    // 取 0（与旧实现一致），避免 0/0 = NaN。
+    let hit_rate = if total == 0 {
+        0.0
+    } else {
+        h as f64 / total as f64
+    };
+    (base * 0.6 + hit_rate * 0.4 - stale_penalty).clamp(0.0, 1.0)
 }
 
 /// `refresh_usage_stats_and_confidence` 的输出统计。
@@ -905,6 +941,62 @@ fn id_str(c: &OperationKnowledgeChunk) -> String {
 mod tests {
     use super::*;
     use mongodb::bson::oid::ObjectId;
+
+    /// S7：样本不足（h+b < min_samples）→ 只用 base，不被少量 hit 甩飞。
+    #[test]
+    fn dyn_conf_below_min_samples_uses_base_only() {
+        // base=0.5，全是 hit（h=2,b=0），若信 hit_rate 会被推到 0.7；
+        // 但样本不足 5 → 必须只用 base=0.5。
+        let v = compute_dynamic_confidence(0.5, 2, 0, 0.0, 5);
+        assert!((v - 0.5).abs() < 1e-9, "got {v}");
+    }
+
+    /// S7：样本充足 → 走加权公式 base*0.6 + hit_rate*0.4 - stale。
+    #[test]
+    fn dyn_conf_at_or_above_min_samples_uses_weighted() {
+        // h=4,b=1 → hit_rate=0.8；base=0.5 → 0.5*0.6 + 0.8*0.4 = 0.62。
+        let v = compute_dynamic_confidence(0.5, 4, 1, 0.0, 5);
+        assert!((v - 0.62).abs() < 1e-9, "got {v}");
+    }
+
+    /// S7：边界——恰好等于 min_samples 即视为充足（>=）。
+    #[test]
+    fn dyn_conf_exactly_min_samples_is_sufficient() {
+        // h+b == 5 == min_samples → 走加权分支。
+        let weighted = compute_dynamic_confidence(0.5, 5, 0, 0.0, 5);
+        // 全 hit → hit_rate=1.0 → 0.5*0.6 + 1.0*0.4 = 0.7。
+        assert!((weighted - 0.7).abs() < 1e-9, "got {weighted}");
+    }
+
+    /// S7：样本不足时 stale_penalty 仍生效（从 base 扣）。
+    #[test]
+    fn dyn_conf_below_min_samples_still_applies_stale_penalty() {
+        let v = compute_dynamic_confidence(0.5, 1, 0, 0.3, 5);
+        assert!((v - 0.2).abs() < 1e-9, "got {v}");
+    }
+
+    /// S7：clamp 下界——base 极低 + stale 扣到负 → 夹到 0。
+    #[test]
+    fn dyn_conf_clamps_to_zero() {
+        let v = compute_dynamic_confidence(0.1, 0, 0, 0.3, 5);
+        assert_eq!(v, 0.0);
+    }
+
+    /// S7：clamp 上界——加权结果超过 1 → 夹到 1。
+    #[test]
+    fn dyn_conf_clamps_to_one() {
+        // base=1.0 全 hit → 1.0*0.6 + 1.0*0.4 = 1.0；再给个负 stale 试图超界。
+        let v = compute_dynamic_confidence(1.0, 10, 0, -0.5, 5);
+        assert_eq!(v, 1.0);
+    }
+
+    /// S7：min_samples=0 → 永远走加权（等价关闭止血门），保留旧行为可回退。
+    #[test]
+    fn dyn_conf_min_samples_zero_always_weighted() {
+        // h=0,b=0,total=0 >= 0 → 走加权，hit_rate=0 → base*0.6。
+        let v = compute_dynamic_confidence(0.5, 0, 0, 0.0, 0);
+        assert!((v - 0.3).abs() < 1e-9, "got {v}");
+    }
 
     fn chunk(title: &str, wiki: Option<&str>, related: Vec<(&str, &str)>) -> OperationKnowledgeChunk {
         OperationKnowledgeChunk {

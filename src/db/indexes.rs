@@ -146,6 +146,36 @@ pub(super) async fn ensure_all(db: &Database) -> anyhow::Result<()> {
             None,
         )
         .await?;
+    // 自学习采集管道 S1–S5：behavior_signals append-only 事件日志。
+    //   - `(workspace_id, dedupe_key)` partial unique：幂等键，同一观察重复采集
+    //     只落一次。partialFilterExpression 用 `$type: "string"`（等价 $exists 但
+    //     更严）——绝不能用 `$in`，会触发 Error 67 让 ensure_indexes panic。
+    //   - `(workspace_id, contact_wxid, observed_at desc)`：按联系人取近期信号。
+    db.behavior_signals()
+        .create_index(
+            IndexModel::builder()
+                .keys(doc! { "workspace_id": 1, "dedupe_key": 1 })
+                .options(
+                    IndexOptions::builder()
+                        .unique(true)
+                        .name("uniq_behavior_signals_workspace_dedupe_key".to_string())
+                        .partial_filter_expression(doc! {
+                            "dedupe_key": { "$type": "string" }
+                        })
+                        .build(),
+                )
+                .build(),
+            None,
+        )
+        .await?;
+    db.behavior_signals()
+        .create_index(
+            IndexModel::builder()
+                .keys(doc! { "workspace_id": 1, "contact_wxid": 1, "observed_at": -1 })
+                .build(),
+            None,
+        )
+        .await?;
     db.content_assets()
         .create_index(
             IndexModel::builder()

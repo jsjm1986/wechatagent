@@ -18,7 +18,7 @@ use crate::{
     error::{AppError, AppResult},
     mcp::{self},
     models::{
-        ApiContact, ContactQuery, CustomAgentInstructionsRequest, EnableAgentRequest,
+        ApiContact, ContactQuery, CustomAgentInstructionsRequest, DealEvent, EnableAgentRequest,
         ImportContactsRequest, ProfileNoteRequest, SearchImportRequest,
     },
 };
@@ -57,6 +57,21 @@ pub(super) struct OperatingMemoryRequest {
 pub(super) struct MemoryCandidateQuery {
     status: Option<String>,
     limit: Option<i64>,
+}
+
+/// `POST /api/contacts/:id/deal-events` 请求体。
+///
+/// S5（自学习采集管道）：admin 手动登记一条成交（T0 硬事件）正例。本阶段
+/// 只 append-only 记录，不反推任何置信、不归因——为将来 PU learning 铺正例池。
+/// 全部字段可选：最小可用只需点一下"标记成交"，金额/币种/发生时间/备注按需回填。
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct DealEventRequest {
+    /// 成交实际发生时间的毫秒时间戳（可选，缺省用服务端 now 作为 marked_at）。
+    occurred_at_ms: Option<i64>,
+    amount: Option<f64>,
+    currency: Option<String>,
+    note: Option<String>,
 }
 
 pub(super) async fn list_contacts(
@@ -501,6 +516,72 @@ pub(super) async fn update_operation_profile(
             None,
         )
         .await?;
+    let contact = find_contact_by_id(&state, &admin.current_workspace, &id).await?;
+    Ok(Json(json!({ "item": ApiContact::from(contact) })))
+}
+
+/// `POST /api/contacts/:id/deal-events`
+///
+/// S5（自学习采集管道·第一阶段）：admin 手动登记一条成交事件（T0 硬事件正例）。
+/// 平台入站只有文字、无支付/订单回填，成交只能靠 admin 手动标记 —— 稀疏、延迟、
+/// 只有正例（PU learning 形状）。本阶段**只 append-only 落正例池**：
+/// - 不反推任何 chunk 置信；
+/// - 不做多触点归因；
+/// - `source` 恒 `"manual"`，`marked_by` 取登录 admin，用于审计。
+///
+/// 写库走 `$push contact.deal_events` + 一条 `deal_event_marked` 审计事件。
+pub(super) async fn add_deal_event(
+    State(state): State<AppState>,
+    Extension(admin): Extension<AuthenticatedAdmin>,
+    Path(id): Path<String>,
+    Json(payload): Json<DealEventRequest>,
+) -> AppResult<Json<Value>> {
+    let object_id = parse_object_id(&id)?;
+    let contact = find_contact_by_id(&state, &admin.current_workspace, &id).await?;
+    if let Some(amount) = payload.amount {
+        if !amount.is_finite() || amount < 0.0 {
+            return Err(AppError::BadRequest(
+                "amount 必须是非负有限数".to_string(),
+            ));
+        }
+    }
+    let now = DateTime::now();
+    let deal_event = DealEvent {
+        marked_at: now,
+        occurred_at: payload.occurred_at_ms.map(DateTime::from_millis),
+        amount: payload.amount,
+        currency: normalize_optional(payload.currency),
+        source: "manual".to_string(),
+        marked_by: admin.username.clone(),
+        note: normalize_optional(payload.note),
+    };
+    state
+        .db
+        .contacts()
+        .update_one(
+            doc! { "_id": object_id, "workspace_id": &admin.current_workspace },
+            doc! {
+                "$push": { "deal_events": to_bson(&deal_event)? },
+                "$set": { "updated_at": now },
+            },
+            None,
+        )
+        .await?;
+    agent::write_event_for_account(
+        &state,
+        &contact.account_id,
+        Some(&contact.wxid),
+        "deal_event_marked",
+        "ok",
+        "admin 手动登记成交事件",
+        Some(doc! {
+            "source": "manual",
+            "markedBy": &admin.username,
+            "amount": payload.amount,
+            "hasOccurredAt": payload.occurred_at_ms.is_some(),
+        }),
+    )
+    .await?;
     let contact = find_contact_by_id(&state, &admin.current_workspace, &id).await?;
     Ok(Json(json!({ "item": ApiContact::from(contact) })))
 }

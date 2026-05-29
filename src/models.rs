@@ -191,6 +191,12 @@ pub struct Contact {
     /// 缺字段时反序列化为空 Vec，向前兼容历史 contact 文档。
     #[serde(default)]
     pub intent_trajectory: Vec<IntentTrajectoryEntry>,
+    /// 自学习采集管道 S5：admin 手动标记的成交事件（正例-only，稀疏 + 延迟）。
+    /// 成交（T0 硬事件）不可从 WeChat 文字入站观测，只能由运营人员手动登记；
+    /// 本字段是未来 PU-learning / 延迟反馈归因的唯一正例来源。本阶段只采集、
+    /// 不参与任何评分或置信反推。缺字段时反序列化为空 Vec，向前兼容历史文档。
+    #[serde(default)]
+    pub deal_events: Vec<DealEvent>,
     /// Phase E / E3：联系人语种（BCP-47 短形式，如 `zh-CN` / `en-US`）。
     /// `load_prompt_for_contact` 在 prompt_templates 多 locale 并存时按本字段
     /// 选最匹配版本；缺字段时反序列化为 None，由 `contact_locale_or_default`
@@ -199,6 +205,94 @@ pub struct Contact {
     pub locale: Option<String>,
     pub created_at: DateTime,
     pub updated_at: DateTime,
+}
+
+/// 自学习采集管道 S5：单条成交事件（admin 手动标记）。
+///
+/// 设计取舍——成交是 T0 硬事件，但 WeChat 私聊入站只有文字，系统无法自动观测
+/// 支付/下单；唯一可信来源是运营人员事后登记。因此该结构刻意只承载"被标记的
+/// 客观事实"（标记时间、可选实际发生时间、可选金额），不含任何 LLM 解释或
+/// 置信度反推。本阶段仅落库，作为未来归因/PU-learning 的正例。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct DealEvent {
+    /// admin 在后台点击"标记成交"的时间。
+    pub marked_at: DateTime,
+    /// 成交实际发生时间（admin 可回填；缺省时下游用 `marked_at` 近似）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub occurred_at: Option<DateTime>,
+    /// 成交金额（可选，业务自行决定是否登记）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub amount: Option<f64>,
+    /// 金额币种（ISO-4217 短码，如 `CNY`）；与 `amount` 配套。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub currency: Option<String>,
+    /// 事件来源；本阶段恒 `"manual"`（将来可扩 `"imported"` 等）。
+    #[serde(default)]
+    pub source: String,
+    /// 标记人（admin 用户名/ID），用于审计。
+    #[serde(default)]
+    pub marked_by: String,
+    /// 备注（可选）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+
+/// 自学习采集管道 S1–S3：行为信号（append-only 事件日志）。
+///
+/// 方法论铁律落到结构上的体现：
+/// - **观察与解释分层**（Law ③）：本结构只存"系统直接观察到的客观量"
+///   （延迟毫秒、字符数、沉默时长、是否重新激活），**不存任何 LLM 解释标签**。
+///   解释层另由 `agent_decision_reviews.reaction_analysis` 承载。
+/// - **沉默 = 删失**（Law ②）：`signal_type="silence"` 的事件 `censored=true`，
+///   下游绝不可当作负反馈喂入任何评分。
+/// - **每条信号带元数据**（Law ④）：`source`/`observed_at`/`confidence`/`dedupe_key`。
+/// - **幂等**（Law ⑤）：`(workspace_id, dedupe_key)` partial unique index 约束，
+///   同一观察重复采集只落一次。
+///
+/// 本阶段只采集、不消费——任何学习公式都不读它，直到积累到可学样本量。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct BehaviorSignal {
+    #[serde(rename = "_id", skip_serializing_if = "Option::is_none")]
+    pub id: Option<ObjectId>,
+    pub workspace_id: String,
+    pub contact_wxid: String,
+    /// `"reply_latency"` | `"reply_length"` | `"reactivation"` | `"silence"`。
+    pub signal_type: String,
+    /// 系统观察到该信号的时间。
+    pub observed_at: DateTime,
+    /// 信号来源；系统观察恒 `"system_observed"`。
+    pub source: String,
+    /// 观察置信度；系统直接观测恒 `1.0`（LLM 解释信号才会 <1.0，不在本表）。
+    pub confidence: f64,
+    /// 删失标记：`silence` 事件为 `true`，其余为 `false`。删失 ≠ 负例。
+    pub censored: bool,
+    /// 幂等键。约定：
+    /// - reply_latency / reply_length：`"{type}:{wxid}:{inbound_message_id}"`
+    /// - reactivation：`"reactivation:{wxid}:{inbound_message_id}"`
+    /// - silence：`"silence:{wxid}:{last_outbound_at_ms}"`
+    pub dedupe_key: String,
+
+    // ── 按 signal_type 选填的客观量（只存观察，不存解释）──
+    /// reply_latency：上一条 outbound → 本条 inbound 的间隔毫秒。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latency_ms: Option<i64>,
+    /// reply_length：本条 inbound 文本的字符数（`chars().count()`，多字节安全）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub char_len: Option<i64>,
+    /// silence：从哪条 outbound 起算沉默。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub silence_since: Option<DateTime>,
+    /// silence：已沉默时长（毫秒）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub silence_ms: Option<i64>,
+    /// silence：该 outbound 至今是否仍无回复。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unanswered: Option<bool>,
+    /// reactivation：久未联系后重新入站的时间。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reactivated_at: Option<DateTime>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

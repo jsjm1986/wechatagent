@@ -59,6 +59,7 @@ fn template(wxid: &str) -> Contact {
         last_outbound_style: None,
         intent_trajectory: Vec::new(),
         locale: None,
+        deal_events: Vec::new(),
         created_at: now,
         updated_at: now,
     }

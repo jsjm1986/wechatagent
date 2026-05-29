@@ -201,6 +201,14 @@ async fn main() -> anyhow::Result<()> {
         wechatagent::cold_contact_worker::run_cold_contact_worker(s).await;
     });
 
+    // 自学习采集管道（第一阶段）/ S6：沉默删失探测 worker。
+    // 默认关停（`SILENCE_SIGNAL_WORKER_ENABLED=false`）；run_silence_signal_worker
+    // 内部会立即 return。打开后周期把"最后一条 outbound 至今无回"的 contact
+    // 落成 censored=true 的删失信号——只采集，不发任何消息。
+    spawn_supervised(state.clone(), "silence_signal_worker", |s| async move {
+        wechatagent::silence_signal_worker::run_silence_signal_worker(s).await;
+    });
+
     // agent-self-evolution M4 W1：演化器 worker。
     // 关停态默认（`EVOLUTION_ENABLED=false`）；run_evolutionary_worker 内部
     // 会立即 return，不消耗任何资源。打开后周期跑 cohort 选择 + 候选生成

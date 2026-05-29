@@ -16,8 +16,8 @@ use mongodb::{options::ClientOptions, Client, Collection, Database as MongoDatab
 
 use crate::models::{
     AgentCommandRun, AgentDecisionReview, AgentEvent, AgentOutcomeMetric, AgentRunLog, AgentSoul,
-    AgentTask, AgentToolCall, CatalogRebuildJob, ChunkRevision, Contact, ContentAsset,
-    ConversationMessage, DomainSchema, EvaluationScenario, Experiment, IngestSource,
+    AgentTask, AgentToolCall, BehaviorSignal, CatalogRebuildJob, ChunkRevision, Contact,
+    ContentAsset, ConversationMessage, DomainSchema, EvaluationScenario, Experiment, IngestSource,
     KnowledgeChatTask, KnowledgeChatTurn, KnowledgeDailyReport, KnowledgeGapSignal,
     KnowledgeOperatorMemory, KnowledgeUsageLog, LlmCallLog, LlmProviderConfig,
     ManagementAgentMessage, ManagementAgentSession, McpCallLog, MemoryCandidate, MigrationRecord,
@@ -83,6 +83,14 @@ impl Database {
 
     pub fn events(&self) -> Collection<AgentEvent> {
         self.db.collection("agent_events")
+    }
+
+    /// 自学习采集管道 S1–S3：`behavior_signals` append-only 事件日志 typed
+    /// accessor。只存系统观察到的客观行为量（reply_latency / reply_length /
+    /// reactivation / silence），不含任何 LLM 解释。索引（含
+    /// `(workspace_id, dedupe_key)` partial unique 幂等约束）见 `db/indexes.rs`。
+    pub fn behavior_signals(&self) -> Collection<BehaviorSignal> {
+        self.db.collection("behavior_signals")
     }
 
     pub fn mcp_logs(&self) -> Collection<McpCallLog> {

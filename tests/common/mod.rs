@@ -228,6 +228,12 @@ fn test_config(mongodb_uri: String, mongodb_database: String) -> AppConfig {
         cold_contact_worker_enabled: false,
         cold_contact_threshold_hours: 168,
         cold_contact_daily_emit_cap: 5,
+        // ── 自学习采集管道（第一阶段）：测试默认全部 disabled / 极小值 ──
+        silence_signal_worker_enabled: false,
+        silence_threshold_seconds: 86400,
+        silence_signal_interval_seconds: 0,
+        silence_signal_daily_cap: 500,
+        dynamic_confidence_min_samples: 5,
         // ── agent-self-evolution M4：测试默认全部 disabled / 极小值 ──
         evolution_enabled: false,
         evolution_tick_seconds: 600,

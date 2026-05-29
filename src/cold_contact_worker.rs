@@ -461,6 +461,7 @@ mod tests {
             custom_agent_instructions: None,
             last_outbound_style: None,
             intent_trajectory: Vec::new(),
+            deal_events: Vec::new(),
             locale: None,
             created_at: now,
             updated_at: now,

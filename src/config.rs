@@ -84,6 +84,24 @@ pub struct AppConfig {
     /// 与 strategic_planner_daily_emit_cap 解耦，避免拖累常规 follow_up。默认 5。
     pub cold_contact_daily_emit_cap: i64,
 
+    // ── 自学习采集管道（第一阶段）：行为信号 + 沉默删失 + 止血 ──
+    //
+    // 全部默认关停 / 保守值。本阶段只铺 append-only 采集底座，不调任何学习
+    // 公式。沉默信号恒带 censored=true（删失，绝不当负例）。
+
+    /// 是否启用沉默信号探测 worker（S6）。默认 false——首发关闭，需显式
+    /// `SILENCE_SIGNAL_WORKER_ENABLED=true` 打开。只写信号，绝不发任何消息。
+    pub silence_signal_worker_enabled: bool,
+    /// 判定一条 outbound "沉默"（用户至今未回）的阈值秒数。默认 86400（24h）。
+    pub silence_threshold_seconds: i64,
+    /// 沉默探测 worker 主循环间隔秒数。默认 600（10 分钟）。
+    pub silence_signal_interval_seconds: u64,
+    /// 单 workspace 单 tick 最多落多少条沉默信号；防首跑信号风暴。默认 500。
+    pub silence_signal_daily_cap: i64,
+    /// S7 止血：dynamic_confidence 信 hit_rate 所需的最小样本数（hits+blocks）。
+    /// 低于此值时只用 base（不被 1-2 个 reviewer 自评样本甩飞）。默认 5。
+    pub dynamic_confidence_min_samples: u64,
+
     // ── agent-self-evolution M4：演化器（独立 worker） ──
     //
     // 默认全部保守值。`evolution_enabled=false` 是安装态默认；运维需显式
@@ -344,6 +362,16 @@ impl AppConfig {
             )),
             cold_contact_threshold_hours: env_or("COLD_CONTACT_THRESHOLD_HOURS", "168").parse()?,
             cold_contact_daily_emit_cap: env_or("COLD_CONTACT_DAILY_EMIT_CAP", "5").parse()?,
+            // ── 自学习采集管道（第一阶段） ──
+            silence_signal_worker_enabled: parse_bool(&env_or(
+                "SILENCE_SIGNAL_WORKER_ENABLED",
+                "false",
+            )),
+            silence_threshold_seconds: env_or("SILENCE_THRESHOLD_SECONDS", "86400").parse()?,
+            silence_signal_interval_seconds: env_or("SILENCE_SIGNAL_INTERVAL_SECONDS", "600")
+                .parse()?,
+            silence_signal_daily_cap: env_or("SILENCE_SIGNAL_DAILY_CAP", "500").parse()?,
+            dynamic_confidence_min_samples: env_or("DYNAMIC_CONFIDENCE_MIN_SAMPLES", "5").parse()?,
             // ── agent-self-evolution M4 ──
             evolution_enabled: parse_bool(&env_or("EVOLUTION_ENABLED", "false")),
             evolution_tick_seconds: env_or("EVOLUTION_TICK_SECONDS", "21600").parse()?,
