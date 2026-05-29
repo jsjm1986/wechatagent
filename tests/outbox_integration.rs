@@ -27,7 +27,9 @@ use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 /// 构造一个 managed contact（dispatcher 在 process_entry 时会按
-/// (workspace_id, account_id, wxid) 查 contact）。
+/// (workspace_id, account_id, wxid) 查 contact，并经 P1-6 发送前状态门
+/// `check_contact_status_pure` 拦截非 Managed 的投递——故 fixture 必须显式
+/// 置 Managed，否则会被 cancel 成 contact_status_changed_unmanaged）。
 fn make_contact(wxid: &str) -> Contact {
     let now = DateTime::now();
     Contact {
@@ -38,7 +40,7 @@ fn make_contact(wxid: &str) -> Contact {
         nickname: Some("集成测试客户".to_string()),
         remark: None,
         alias: None,
-        agent_status: Default::default(),
+        agent_status: wechatagent::models::AgentStatus::Managed,
         human_profile_note: None,
         agent_profile: None,
         memory_summary: None,

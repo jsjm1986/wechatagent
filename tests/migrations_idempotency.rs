@@ -1,4 +1,6 @@
-//! 验证迁移框架的幂等性：连续两次调用 `migrations::run` 不会重复执行。
+//! 验证迁移框架的幂等性：`TestApp::start()` 已在启动链路跑过一轮
+//! `migrations::run`，每条迁移在 `migrations` 集合留一行账。再调一次
+//! `migrations::run` 必须按 `_id` 跳过全部已应用项——账册条数不变。
 //!
 //! 默认 `#[ignore]`，需要 Docker；CI 用 `cargo test -- --ignored` 触发。
 
@@ -8,9 +10,10 @@ use mongodb::bson::doc;
 
 #[tokio::test]
 #[ignore]
-async fn run_is_idempotent_with_empty_migrations() {
+async fn run_is_idempotent_across_reruns() {
     let app = common::TestApp::start().await;
 
+    // 启动链路已执行全部迁移，每条留一行账。
     let count = app
         .state
         .db
@@ -18,7 +21,11 @@ async fn run_is_idempotent_with_empty_migrations() {
         .count_documents(doc! {}, None)
         .await
         .expect("count migrations");
-    assert_eq!(count, 0, "no migrations defined yet");
+    assert_eq!(
+        count as usize,
+        wechatagent::db::migrations::MIGRATIONS.len(),
+        "启动后每条 migration 应各留一行账"
+    );
 
     wechatagent::db::migrations::run(&app.state.db)
         .await
@@ -31,5 +38,8 @@ async fn run_is_idempotent_with_empty_migrations() {
         .count_documents(doc! {}, None)
         .await
         .expect("count migrations after rerun");
-    assert_eq!(count_after, 0);
+    assert_eq!(
+        count_after, count,
+        "二次 run 必须按 _id 跳过已应用项，账册条数不变"
+    );
 }

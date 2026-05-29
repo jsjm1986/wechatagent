@@ -59,7 +59,7 @@ pub trait OpsDomain: Send + Sync + 'static {
 /// 用法（仅推荐在新代码中使用，旧代码 22 处 `"user_operations"` 字面量
 /// 不强制替换）：
 ///
-/// ```ignore
+/// ```text
 /// use crate::agent::domain::{OpsDomain, UserOpsDomain};
 /// let domain = UserOpsDomain;
 /// assert_eq!(domain.id(), "user_operations");

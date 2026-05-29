@@ -776,7 +776,7 @@ pub struct PendingFinalizeEvent {
 /// `finalize_review_for_send` 完整输出。
 ///
 /// 调用方典型用法（task 3.4）：
-/// ```ignore
+/// ```text
 /// let outcome = finalize_review_for_send(raw_review, &mut decision, &runtime, ...);
 /// for event in &outcome.pending_events {
 ///     write_event_for_account(state, ..., &event.kind, &event.status,
@@ -1071,7 +1071,7 @@ pub(crate) enum RevisionDecision {
 /// 是否触发 single-shot revision。
 ///
 /// 调用方典型用法（gateway.rs）：
-/// ```ignore
+/// ```text
 /// let budget_exceeded = current_run_budget()
 ///     .map(|b| b.is_exceeded())
 ///     .unwrap_or(false);

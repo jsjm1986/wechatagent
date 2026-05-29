@@ -14,7 +14,7 @@
 //!   调 async update_one；强行 spawn 会有 panic-in-panic 风险）。
 //!
 //! 使用顺序（W1 task 2.5 接入）：
-//! ```ignore
+//! ```text
 //! write_run_envelope_started(&db, &run_id, ..).await?;
 //! let result = std::panic::catch_unwind(|| run_pipeline()).unwrap_or_else(|_| failed_terminal());
 //! update_run_envelope_terminal(&db, &run_id, build_terminal_fields(&result)).await?;

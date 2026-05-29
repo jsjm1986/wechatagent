@@ -146,8 +146,11 @@ async fn image_import_with_vision_capable_primary_produces_review_chunks() {
     insert_provider(&app, &provider(&ws, "vision_primary", true, true, false)).await;
 
     // mock LLM 返回 fence 文本（与 vision prompt 约定 {"fence": "..."} 一致）。
+    // fence 必须是 block_parser 的合法形态：`---CHUNK: <id>---` + 单个 JSON 对象
+    // 块体（含 title + 非空 body/summary/answer 之一）+ `---END CHUNK---`，
+    // 才会真正走 fence 解析落 chunk，而非兜底 blob 路径。
     app.llm.push_response(json!({
-        "fence": "---CHUNK: img-c1---\n# 图片抽取小节\n图片里的可读文本摘要。\n---END---",
+        "fence": "---CHUNK: img-c1---\n{\"title\":\"图片抽取小节\",\"body\":\"图片里的可读文本摘要。\"}\n---END CHUNK---",
     }));
 
     let resp = import_operation_knowledge_apply_image(

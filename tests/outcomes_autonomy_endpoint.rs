@@ -360,12 +360,17 @@ async fn outcomes_autonomy_outbox_link_breaks_down_by_status() {
 
     let now = DateTime::now();
     let mut docs = Vec::new();
+    let mut seq = 0;
     let mut push = |status: &str| {
+        seq += 1;
         docs.push(doc! {
             "_id": ObjectId::new(),
             "workspace_id": &workspace_id,
             "account_id": &account_id,
             "contact_wxid": "user_outbox",
+            // agent_send_outbox 有 unique 索引 idempotency_key_1；多条 null 会
+            // 触发 E11000 dup key。给每条唯一 key 模拟真实入队形态。
+            "idempotency_key": format!("idem_outbox_{seq}"),
             "status": status,
             "created_at": now,
         });

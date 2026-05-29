@@ -4,7 +4,7 @@
 //! 迁移本身必须幂等（即使标记丢失，重跑也不破坏数据），以便支持回滚后重跑。
 //!
 //! 使用方式：
-//! ```ignore
+//! ```text
 //! let db = Database::connect(...).await?;
 //! db::migrations::run(&db).await?;   // 先迁移
 //! db.ensure_indexes().await?;        // 再建索引

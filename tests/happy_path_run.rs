@@ -246,6 +246,8 @@ fn reply_agent_decision_json(
         "shouldReply": true,
         "replyText": reply_text,
         "usedKnowledgeIds": [],
+        "conversationMode": "consultative",
+        "conversationModeReason": "客户进入方案/能力评估阶段，按顾问模式明确处理产品与排期问题。",
     })
 }
 

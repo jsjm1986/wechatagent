@@ -92,6 +92,19 @@ impl LlmProvider for TestLlmGenerator {
     ) -> AppResult<LlmJsonResult> {
         self.pop_or_error()
     }
+
+    /// 模拟一个 supports_vision 的 provider：忽略图片字节，从同一队列取下一条
+    /// 预排响应。vision_safety_gate 集成测试靠这个让 import-apply-image 走通
+    /// generate_json_with_image 路径（默认实现会报 vision_not_supported）。
+    async fn generate_json_with_image(
+        &self,
+        _system: &str,
+        _user: &str,
+        _image_base64: &str,
+        _mime: &str,
+    ) -> AppResult<Value> {
+        Ok(self.pop_or_error()?.value)
+    }
 }
 
 /// 启动好测试环境的 wrapper：持有 [`AppState`] 与底层容器句柄，

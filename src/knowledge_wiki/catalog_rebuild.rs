@@ -35,7 +35,7 @@ const BATCH_SIZE: usize = 16;
 /// catalog rebuild worker 主循环。
 ///
 /// 由 `main.rs` 在启动时 `tokio::spawn`：
-/// ```ignore
+/// ```text
 /// tokio::spawn(catalog_rebuild_worker_loop(db.clone(), 3));
 /// ```
 ///
