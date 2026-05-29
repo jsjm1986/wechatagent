@@ -5,8 +5,8 @@
 //! （否则破坏 reply Agent 的语义理解），而是：
 //!
 //! 1. 用闭合定界符把可信文本与外部文本物理隔开（LLM 在多数实现里会把"标
-//!    签外的东西"看作系统指令，"标签内的东西"看作数据）。这是 OpenAI /
-//!    Anthropic 双家在 prompt-engineering guide 里都点名的"用 XML/分隔符
+//!    签外的东西"看作系统指令，"标签内的东西"看作数据）。这是主流 LLM
+//!    provider 在 prompt-engineering guide 里都点名的"用 XML/分隔符
 //!    包裹用户输入"模式。
 //! 2. 把外部文本里出现的同名 tag（`<<<USER_TURN>>>` / `<<<END_USER_TURN>>>`）
 //!    剥掉，避免对手伪造 tag 关闭。普通 `<user>` / `</user>` 也会被剥（哪
