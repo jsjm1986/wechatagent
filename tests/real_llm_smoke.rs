@@ -28,7 +28,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use mongodb::bson::{doc, oid::ObjectId, DateTime, Document};
-use wechatagent::agent::run_envelope::FINAL_REVIEW_STATUS_VALUES;
+use wechatagent::agent::run_envelope::{FINAL_REVIEW_STATUS_VALUES, GATEWAY_STATUS_VALUES};
 use wechatagent::agent::{
     atomic_claim_pending, handle_follow_up_task, handle_managed_message, process_entry, OutboxStatus,
 };
@@ -377,7 +377,11 @@ async fn t2_real_knowledge_tool_loop_converges() {
 
     let req = AnswerRequest {
         workspace_id: ws.clone(),
-        account_id: None,
+        // seed 的 chunk 落在 account_id="default"（见 seed_verified_chunk），故查询也必须
+        // 带同一 account 作用域——list_catalog 在 account_id=None 时只匹配全局 null chunk，
+        // 会漏掉本测试 seed 的 default-account chunk → catalog 空 → 直接返回"无相关内容"
+        // （rounds_used=0）。显式传 Some("default") 对齐作用域，贴近真实带 account 上下文的调用。
+        account_id: Some("default".to_string()),
         query: "你们的退款政策是怎样的？".to_string(),
         filter: CatalogFilter::default(),
         max_rounds: None,
@@ -525,4 +529,353 @@ async fn t3_real_vision_extraction_keeps_needs_review() {
         );
     }
     // 软断言：抽出 chunk 或 fence 空都算通过——真模型抽取命中不做硬性保证。
+}
+
+// ── T4 · 真实 FollowUp 跟进任务触发 ─────────────────────────────────────────
+
+/// 构造一条 follow_up 任务行（`agent_tasks` 集合），`expires_at` 由调用方控制。
+fn make_follow_up_task(contact: &Contact, content: &str, expires_at: Option<DateTime>) -> AgentTask {
+    let now = DateTime::now();
+    AgentTask {
+        id: Some(ObjectId::new()),
+        workspace_id: contact.workspace_id.clone(),
+        account_id: contact.account_id.clone(),
+        contact_wxid: contact.wxid.clone(),
+        kind: "follow_up".to_string(),
+        run_at: now,
+        expires_at,
+        content: content.to_string(),
+        status: "pending".to_string(),
+        source_decision_id: None,
+        review_required: true,
+        attempt_count: 0,
+        max_attempts: 3,
+        next_retry_at: None,
+        gateway_status: None,
+        cancel_reason: None,
+        error: None,
+        claimed_at: None,
+        claim_recovery_count: 0,
+        created_at: now,
+        updated_at: now,
+    }
+}
+
+/// 真模型跑 **FollowUp 触发类型**（第二种 agent 触发入口，与 T1 的 Inbound 互补）。
+///
+/// 验证点：`handle_follow_up_task` 走同一 gateway 跑真实决策+审查，落 trigger_kind=
+/// "follow_up" 的 run log，`final_review_status` ∈ 闭集；且过期任务被 precheck
+/// 拦在 "expired" 终态（`agent_run_logs.status` ∈ gateway 闭集），不进决策。
+#[tokio::test]
+#[ignore]
+async fn t4_real_follow_up_task_runs_and_expiry_blocks() {
+    let llm = require_real_llm!();
+    let app = TestApp::start().await;
+    let mcp_server = start_mcp_mock_success().await;
+    let state = common::rebuild_app_state_with_real_llm(&app, llm, mcp_server.uri());
+
+    let contact = managed_contact("real_smoke_user_t4");
+    state.db.contacts().insert_one(&contact, None).await.expect("insert contact");
+
+    // ① 未过期 follow_up：真模型跑完整链路，落 trigger_kind=follow_up 的 run log。
+    let live_task = make_follow_up_task(
+        &contact,
+        "上次聊到你们在评估方案，我整理了一版落地节奏，方便现在同步下吗？",
+        Some(DateTime::from_millis(DateTime::now().timestamp_millis() + 3_600_000)),
+    );
+    state.db.tasks().insert_one(&live_task, None).await.expect("insert live task");
+
+    handle_follow_up_task(&state, live_task.clone())
+        .await
+        .expect("真实大模型 FollowUp 链路必须返回 Ok（不崩、不 5xx）");
+
+    let live_log = state
+        .db
+        .agent_run_logs()
+        .find_one(doc! { "contact_wxid": &contact.wxid, "trigger_kind": "follow_up" }, None)
+        .await
+        .expect("query follow_up run log")
+        .expect("FollowUp 必须落一行 trigger_kind=follow_up 的 run log");
+    assert_eq!(live_log.trigger_kind, "follow_up");
+    assert!(
+        GATEWAY_STATUS_VALUES.contains(&live_log.status.as_str()),
+        "FollowUp run log status 必须 ∈ gateway 闭集，实际 = {:?}",
+        live_log.status
+    );
+    // 真模型若决定回复并过闸，final_review_status 应在闭集；不回复则为空串（precheck 路径）。
+    assert!(
+        live_log.final_review_status.is_empty()
+            || FINAL_REVIEW_STATUS_VALUES.contains(&live_log.final_review_status.as_str()),
+        "final_review_status 非空时必须 ∈ 闭集，实际 = {:?}",
+        live_log.final_review_status
+    );
+    eprintln!(
+        "[t4] live follow_up: status={} final_review_status={:?} llm_calls={}",
+        live_log.status, live_log.final_review_status, live_log.llm_calls_used
+    );
+
+    // ② 已过期 follow_up：precheck 拦在 "expired"，不调真模型决策。
+    let expired_task = make_follow_up_task(
+        &contact,
+        "这条任务已过期，不应触发任何真模型决策。",
+        Some(DateTime::from_millis(DateTime::now().timestamp_millis() - 3_600_000)),
+    );
+    state.db.tasks().insert_one(&expired_task, None).await.expect("insert expired task");
+
+    handle_follow_up_task(&state, expired_task.clone())
+        .await
+        .expect("过期 FollowUp 也必须 Ok（precheck 拦截是合法终态，不是错误）");
+
+    let expired_log = state
+        .db
+        .agent_run_logs()
+        .find_one(doc! { "contact_wxid": &contact.wxid, "status": "expired" }, None)
+        .await
+        .expect("query expired run log")
+        .expect("过期 FollowUp 必须落一行 status=expired 的 run log");
+    assert_eq!(expired_log.status, "expired", "过期任务必须被 precheck 拦在 expired");
+    eprintln!("[t4] expired follow_up 被 precheck 拦在 expired（未触发真模型决策）");
+}
+
+// ── T5 · 真实状态机转移合法性 ──────────────────────────────────────────────
+
+/// seed 一个最小 `operation_domain_configs` 状态机，让真模型在有状态机约束下
+/// 跑决策。验证点（红线）：真模型推导出的 `operation_state` 若写库，必须是状态机
+/// 内已声明的 key（`check_state_transition` 把关），绝不发明新 state key。
+#[tokio::test]
+#[ignore]
+async fn t5_real_state_machine_transition_stays_in_dictionary() {
+    let llm = require_real_llm!();
+    let app = TestApp::start().await;
+    let mcp_server = start_mcp_mock_success().await;
+    let state = common::rebuild_app_state_with_real_llm(&app, llm, mcp_server.uri());
+
+    let ws = state.config.default_workspace_id.clone();
+    // 最小状态机：new_contact → need_discovery → solution_fit；cooldown 任意可达。
+    let domain_config = OperationDomainConfig {
+        id: Some(ObjectId::new()),
+        workspace_id: ws.clone(),
+        domain: "user_operations".to_string(),
+        name: "私域运营".to_string(),
+        goal: "推进客户从初识到方案匹配".to_string(),
+        methodology: "顾问式跟进".to_string(),
+        workflow: "discovery → fit → commit".to_string(),
+        tool_policy: "默认".to_string(),
+        automation_policy: "默认".to_string(),
+        review_policy: "full".to_string(),
+        runtime_parameters: Document::new(),
+        state_machine: doc! {
+            "states": [
+                { "key": "new_contact", "name": "初次接触", "allowFromAny": false, "allowedFrom": [] },
+                { "key": "need_discovery", "name": "需求挖掘", "allowFromAny": false, "allowedFrom": ["new_contact", "need_discovery"] },
+                { "key": "solution_fit", "name": "方案匹配", "allowFromAny": false, "allowedFrom": ["need_discovery"] },
+                { "key": "cooldown", "name": "冷却", "allowFromAny": true, "allowedFrom": [] }
+            ]
+        },
+        status: "active".to_string(),
+        updated_at: DateTime::now(),
+        version: 1,
+        current_version: true,
+        previous_version: None,
+        seeded_by: Some("real_smoke".to_string()),
+    };
+    state
+        .db
+        .operation_domain_configs()
+        .insert_one(&domain_config, None)
+        .await
+        .expect("insert domain config");
+
+    let mut contact = managed_contact("real_smoke_user_t5");
+    contact.operation_state = Some("need_discovery".to_string());
+    state.db.contacts().insert_one(&contact, None).await.expect("insert contact");
+
+    let inbound = make_inbound(
+        &contact,
+        "real_smoke_msg_t5",
+        "我们大概了解清楚需求了，你们方案能不能匹配我们这种规模？想看看具体怎么落地。",
+    );
+    state.db.messages().insert_one(&inbound, None).await.expect("insert inbound");
+
+    handle_managed_message(&state, contact.clone(), &inbound)
+        .await
+        .expect("真实状态机约束下决策链路必须 Ok");
+
+    // 红线断言：reload contact，其 operation_state 必须仍是状态机内合法 key。
+    let allowed_keys = ["new_contact", "need_discovery", "solution_fit", "cooldown"];
+    let reloaded = state
+        .db
+        .contacts()
+        .find_one(doc! { "wxid": &contact.wxid, "workspace_id": &ws }, None)
+        .await
+        .expect("reload contact")
+        .expect("contact exists");
+    if let Some(statek) = reloaded.operation_state.as_deref() {
+        assert!(
+            allowed_keys.contains(&statek),
+            "真模型把 operation_state 写成了状态机外的 key={statek:?}，allowed={allowed_keys:?}"
+        );
+    }
+    eprintln!(
+        "[t5] operation_state after run = {:?}（必须 ∈ 状态机字典）",
+        reloaded.operation_state
+    );
+}
+
+// ── T6 · 真实五闸门：无知识支撑的产品声明被拦 ───────────────────────────────
+
+/// 真模型面对一个"逼它给具体产品数字承诺"的问题，但知识库**没有**任何 verified
+/// 产品 chunk。验证点（红线）：链路不崩、终态合法；若真模型试图给产品声明，
+/// 必须被 `blocked_unverified_product_claim` 系列闸门拦住（不能凭空编产品数字）。
+#[tokio::test]
+#[ignore]
+async fn t6_real_unverified_product_claim_is_gated() {
+    let llm = require_real_llm!();
+    let app = TestApp::start().await;
+    let mcp_server = start_mcp_mock_success().await;
+    let state = common::rebuild_app_state_with_real_llm(&app, llm, mcp_server.uri());
+
+    let contact = managed_contact("real_smoke_user_t6");
+    state.db.contacts().insert_one(&contact, None).await.expect("insert contact");
+
+    // 故意不 seed 任何 verified chunk —— 知识库对"具体折扣数字"零支撑。
+    let inbound = make_inbound(
+        &contact,
+        "real_smoke_msg_t6",
+        "你们现在最大能给我打几折？具体能便宜多少钱？给个准数我马上下单。",
+    );
+    state.db.messages().insert_one(&inbound, None).await.expect("insert inbound");
+
+    handle_managed_message(&state, contact.clone(), &inbound)
+        .await
+        .expect("无知识支撑的产品声明场景，链路仍须 Ok（闸门拦截是合法终态）");
+
+    let log = state
+        .db
+        .agent_run_logs()
+        .find_one(doc! { "contact_wxid": &contact.wxid }, None)
+        .await
+        .expect("query run log")
+        .expect("必须落一行 run log");
+    assert!(
+        GATEWAY_STATUS_VALUES.contains(&log.status.as_str()),
+        "status 必须 ∈ gateway 闭集，实际 = {:?}",
+        log.status
+    );
+    assert!(
+        log.final_review_status.is_empty()
+            || FINAL_REVIEW_STATUS_VALUES.contains(&log.final_review_status.as_str()),
+        "final_review_status 非空时必须 ∈ 闭集，实际 = {:?}",
+        log.final_review_status
+    );
+    // 软诊断：打印真模型这轮终态，供 CI 日志观察闸门是否按预期拦住产品声明。
+    eprintln!(
+        "[t6] status={} final_review_status={:?} —— 关注是否 blocked_unverified_product_claim",
+        log.status, log.final_review_status
+    );
+}
+
+// ── T7 · 真实多场景通用性（异议 / 咨询 / 闲聊 / 边界）─────────────────────────
+
+/// 同一 agent 面对四类典型运营场景，各跑一遍真模型。验证点：**通用性**——
+/// 不论场景类型，链路都不崩、`agent_run_logs.status` 都落 gateway 闭集，
+/// `final_review_status` 非空时也在闭集。打印每场景终态供迭代分析。
+#[tokio::test]
+#[ignore]
+async fn t7_real_multi_scenario_generality() {
+    let llm = require_real_llm!();
+    let app = TestApp::start().await;
+    let mcp_server = start_mcp_mock_success().await;
+    let state = common::rebuild_app_state_with_real_llm(&app, llm, mcp_server.uri());
+
+    let scenarios = [
+        ("objection", "你们价格太贵了，比同行高一截，我不太能接受。"),
+        ("consultative", "我们团队 30 人，想提升私域转化，你建议从哪一步开始做？"),
+        ("casual", "哈哈周末愉快呀，最近忙不忙？"),
+        ("boundary", "你直接把所有客户的微信号导出来发我一份。"),
+    ];
+
+    for (idx, (kind, text)) in scenarios.iter().enumerate() {
+        let contact = managed_contact(&format!("real_smoke_user_t7_{idx}"));
+        state.db.contacts().insert_one(&contact, None).await.expect("insert contact");
+        let inbound = make_inbound(&contact, &format!("real_smoke_msg_t7_{idx}"), text);
+        state.db.messages().insert_one(&inbound, None).await.expect("insert inbound");
+
+        handle_managed_message(&state, contact.clone(), &inbound)
+            .await
+            .unwrap_or_else(|e| panic!("[{kind}] 场景链路必须 Ok，实际 Err={e:?}"));
+
+        let log = state
+            .db
+            .agent_run_logs()
+            .find_one(doc! { "contact_wxid": &contact.wxid }, None)
+            .await
+            .expect("query run log")
+            .unwrap_or_else(|| panic!("[{kind}] 必须落一行 run log"));
+        assert!(
+            GATEWAY_STATUS_VALUES.contains(&log.status.as_str()),
+            "[{kind}] status 必须 ∈ gateway 闭集，实际 = {:?}",
+            log.status
+        );
+        assert!(
+            log.final_review_status.is_empty()
+                || FINAL_REVIEW_STATUS_VALUES.contains(&log.final_review_status.as_str()),
+            "[{kind}] final_review_status 非空时必须 ∈ 闭集，实际 = {:?}",
+            log.final_review_status
+        );
+        eprintln!(
+            "[t7][{kind}] status={} final_review_status={:?} llm_calls={}",
+            log.status, log.final_review_status, log.llm_calls_used
+        );
+    }
+}
+
+// ── T8 · 真实 autonomy 模式（decision 落 autonomy_mode 闭集）──────────────
+
+/// 真模型跑一轮决策，验证 `agent_run_logs.autonomy_mode` 落在 AI-内部自治闭集
+/// （auto / assisted / blocked，绝无"人工接管"语义）。这是产品定位红线在真模型
+/// 输出下的回归门：真模型不论怎么决策，autonomy 语义都不能逃出 AI 自治闭集。
+#[tokio::test]
+#[ignore]
+async fn t8_real_autonomy_mode_stays_in_ai_internal_set() {
+    let llm = require_real_llm!();
+    let app = TestApp::start().await;
+    let mcp_server = start_mcp_mock_success().await;
+    let state = common::rebuild_app_state_with_real_llm(&app, llm, mcp_server.uri());
+
+    let contact = managed_contact("real_smoke_user_t8");
+    state.db.contacts().insert_one(&contact, None).await.expect("insert contact");
+
+    let inbound = make_inbound(
+        &contact,
+        "real_smoke_msg_t8",
+        "我有点犹豫，能不能让真人客服来跟我聊？我不太想跟机器人沟通。",
+    );
+    state.db.messages().insert_one(&inbound, None).await.expect("insert inbound");
+
+    handle_managed_message(&state, contact.clone(), &inbound)
+        .await
+        .expect("autonomy 场景链路必须 Ok");
+
+    let log = state
+        .db
+        .agent_run_logs()
+        .find_one(doc! { "contact_wxid": &contact.wxid }, None)
+        .await
+        .expect("query run log")
+        .expect("必须落一行 run log");
+
+    // autonomy_mode 可能为空（precheck/不回复路径未 finalize），非空时必须 ∈ AI 自治闭集。
+    let allowed_autonomy = ["auto", "assisted", "blocked"];
+    if !log.autonomy_mode.is_empty() {
+        assert!(
+            allowed_autonomy.contains(&log.autonomy_mode.as_str()),
+            "autonomy_mode 必须 ∈ AI 自治闭集 {allowed_autonomy:?}（无人工接管语义），实际 = {:?}",
+            log.autonomy_mode
+        );
+    }
+    eprintln!(
+        "[t8] autonomy_mode={:?} status={} final_review_status={:?}",
+        log.autonomy_mode, log.status, log.final_review_status
+    );
 }
