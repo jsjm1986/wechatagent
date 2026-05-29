@@ -234,6 +234,10 @@ fn test_config(mongodb_uri: String, mongodb_database: String) -> AppConfig {
         silence_signal_interval_seconds: 0,
         silence_signal_daily_cap: 500,
         dynamic_confidence_min_samples: 5,
+        dynamic_confidence_real_outcome_enabled: true,
+        behavior_signal_metrics_enabled: false,
+        knowledge_exploration_enabled: false,
+        knowledge_exploration_temperature: 1.0,
         // ── agent-self-evolution M4：测试默认全部 disabled / 极小值 ──
         evolution_enabled: false,
         evolution_tick_seconds: 600,
@@ -363,6 +367,38 @@ pub fn rebuild_app_state_with_mcp_url(app: &TestApp, mcp_url: String) -> AppStat
         prompt_pack_version: app.state.prompt_pack_version.clone(),
         chat_progress_bus: app.state.chat_progress_bus.clone(),
         second_reviewer_llm: app.state.second_reviewer_llm.clone(),
+        chunk_locks: app.state.chunk_locks.clone(),
+        chunk_event_bus: app.state.chunk_event_bus.clone(),
+        jwt_keys: app.state.jwt_keys.clone(),
+    }
+}
+
+/// 同时替换 `llm`（注入真实 [`LlmProvider`]，如 [`wechatagent::llm::LlmClient`]）
+/// 与 `mcp_base_url`（指向 wiremock）的 [`AppState`]，复用 [`TestApp`] 已建好的
+/// Mongo 容器。
+///
+/// real-LLM smoke 测试用它：决策/审查链路跑**真实大模型**，但 MCP 永远是桩——
+/// 绝不真发微信。`second_reviewer_llm` 保持 `None`（单脑复审），把真模型调用次数
+/// 压到最小、也避开双脑分歧分支——首波只验核心链路在真模型下能否跑通。其余字段
+/// 沿用 `TestApp`。
+pub fn rebuild_app_state_with_real_llm(
+    app: &TestApp,
+    llm: Arc<dyn LlmProvider>,
+    mcp_url: String,
+) -> AppState {
+    let mut config = app.state.config.clone();
+    config.mcp_base_url = mcp_url.clone();
+    let mcp = McpClient::new(mcp_url, config.mcp_api_key.clone())
+        .expect("rebuild mcp client with overridden url");
+    AppState {
+        db: app.state.db.clone(),
+        mcp,
+        llm,
+        llm_registry: app.state.llm_registry.clone(),
+        config,
+        prompt_pack_version: app.state.prompt_pack_version.clone(),
+        chat_progress_bus: app.state.chat_progress_bus.clone(),
+        second_reviewer_llm: None,
         chunk_locks: app.state.chunk_locks.clone(),
         chunk_event_bus: app.state.chunk_event_bus.clone(),
         jwt_keys: app.state.jwt_keys.clone(),

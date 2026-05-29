@@ -112,3 +112,53 @@ jobs:
         # abort（cargo 默认 fail-fast 会 exit 101 后跳过剩余 ~96 个测试，拿不到
         # 真实绿/红分布）。本 job continue-on-error，失败不阻塞合并。
         run: cargo test --no-fail-fast -- --ignored
+
+  real-llm:
+    name: Real-LLM smoke (真实大模型 / MCP 桩)
+    runs-on: ubuntu-latest
+    # 用**真实大模型**（MiMo / OpenAI 兼容端点）跑 T1 文本决策+审查 / T2 知识
+    # tool-loop / T3 多模态 vision 抽取，验证 mock 测不到的真实 schema/闸门/收敛。
+    # MCP 永远是 wiremock 桩（绝不真发微信）。real-LLM 限流/抖动不该阻塞合并，
+    # 故 continue-on-error；conclusion 恒 success，必看 job 日志拿真实绿/红。
+    continue-on-error: true
+    timeout-minutes: 45
+    # 密钥提到 job 级 env：GitHub Actions 的 job 级 `if:` 读不到 secrets 上下文，
+    # 但 step 级 `if:` 能读 env，故下方各重步用 `if: env.REAL_LLM_API_KEY != ''`
+    # 守卫——未配 secret（fork PR / 没配）时直接跳过编译/跑测，不浪费 CI 分钟、不红。
+    env:
+      REAL_LLM_API_KEY: ${{ secrets.REAL_LLM_API_KEY }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # 同 integration job：清预装 SDK 腾 ~30GB，否则 target + mongo 镜像撑爆磁盘。
+      - name: Free disk space
+        if: ${{ env.REAL_LLM_API_KEY != '' }}
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android \
+            /usr/local/share/boost /usr/local/share/powershell \
+            /usr/lib/jvm "$AGENT_TOOLSDIRECTORY" || true
+          sudo docker image prune --all --force || true
+          df -h
+
+      - name: Install Rust toolchain
+        if: ${{ env.REAL_LLM_API_KEY != '' }}
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry / target
+        if: ${{ env.REAL_LLM_API_KEY != '' }}
+        uses: Swatinem/rust-cache@v2
+
+      # 真实大模型 smoke：T1/T2/T3 默认 #[ignore]，靠 --ignored 触发。
+      # 密钥只走 GitHub Secrets（REAL_LLM_API_KEY），永不进代码/日志；
+      # 端点 / 模型名是非密钥，可硬写。--nocapture 让 eprintln! 的 skip/诊断
+      # 行进 CI 日志。关 -Dwarnings 同 integration job 理由（测试文件陈年
+      # warning 不该阻断真实跑测）。
+      - name: cargo test --test real_llm_smoke -- --ignored --nocapture
+        if: ${{ env.REAL_LLM_API_KEY != '' }}
+        env:
+          RUSTFLAGS: ""
+          REAL_LLM_BASE_URL: https://token-plan-cn.xiaomimimo.com/v1
+          REAL_LLM_MODEL: mimo-v2.5-pro
+          REAL_LLM_VISION_MODEL: mimo-v2.5
+        run: cargo test --no-fail-fast --test real_llm_smoke -- --ignored --nocapture
