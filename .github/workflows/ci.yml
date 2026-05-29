@@ -75,6 +75,21 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # ubuntu-latest 自带 ~14GB 可用磁盘，预装大量 SDK（Android / .NET /
+      # GHC / Haskell / CodeQL 等）。本 job 现在要编译 100+ 个集成测试二进制
+      # （pdf-extract / feed-rs / scraper / jsonwebtoken 等已审计依赖让 target
+      # 体积进一步膨胀），target 目录会在 testcontainers 拉 mongo:5.0.6 镜像
+      # 之前把磁盘塞满，导致 "no space left on device / failed to register
+      # layer"，全部集成测试在容器启动处 panic。先清掉用不到的预装 SDK
+      # 腾出 ~30GB，再进入构建。
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android \
+            /usr/local/share/boost /usr/local/share/powershell \
+            /usr/lib/jvm "$AGENT_TOOLSDIRECTORY" || true
+          sudo docker image prune --all --force || true
+          df -h
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
