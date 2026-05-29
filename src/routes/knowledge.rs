@@ -1838,6 +1838,7 @@ pub async fn import_operation_knowledge_apply_image(
     })))
 }
 
+#[derive(Debug)]
 pub struct IngestOutcome {
     pub document_id: Option<String>,
     pub chunk_ids: Vec<String>,
