@@ -90,7 +90,10 @@ jobs:
       # 变成 warning。warnings-as-errors 会让 cargo 在跑任何一个测试前就编译
       # 失败，与本 job「拿真实绿/红测试分布」的目的相悖。production lib 代码
       # 的 -Dwarnings 仍由 baseline job 守住。
-      - name: cargo test -- --ignored (testcontainers MongoDB)
+      - name: cargo test --no-fail-fast -- --ignored (testcontainers MongoDB)
         env:
           RUSTFLAGS: ""
-        run: cargo test -- --ignored
+        # --no-fail-fast：跑完所有 test 二进制再汇总，不在第一个失败的二进制处
+        # abort（cargo 默认 fail-fast 会 exit 101 后跳过剩余 ~96 个测试，拿不到
+        # 真实绿/红分布）。本 job continue-on-error，失败不阻塞合并。
+        run: cargo test --no-fail-fast -- --ignored

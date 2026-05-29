@@ -279,9 +279,9 @@ async fn batch_verify_skips_chunk_without_quote() {
     let skipped = body["skipped"].as_array().unwrap();
     assert!(verified.is_empty(), "must not verify w/o quote");
     assert_eq!(skipped.len(), 1);
-    let reason = skipped[0]["reason"].as_str().unwrap_or("");
+    let reason = skipped[0]["reason"].as_str().unwrap_or("").to_lowercase();
     assert!(
-        reason.contains("source_quote") || reason.contains("anchor") || reason.contains("quote"),
+        reason.contains("sourcequote") || reason.contains("anchor") || reason.contains("quote"),
         "skip reason should mention source gate: {body:?}"
     );
     let _ = json!(body); // satisfy import
