@@ -184,8 +184,10 @@ jobs:
       # 状态机字典闭集 / 未验证产品声明闸门 / 多场景通用性 / autonomy 闭集 /
       # 用户反应 outcome 闭集 / 冷启动初始画像 / 长期记忆整理。与 T1–T3 同环境，
       # MCP 仍是桩（绝不真发微信）。
+      # !cancelled()：同 real_llm_knowledge 步——本套件不依赖前面 real_llm_smoke /
+      # real_llm_knowledge 步的绿/红，前者偶发失败不该把运营 T4–T11 一并跳过。
       - name: cargo test --test real_llm_ops_smoke -- --ignored --nocapture
-        if: ${{ env.REAL_LLM_API_KEY != '' }}
+        if: ${{ !cancelled() && env.REAL_LLM_API_KEY != '' }}
         env:
           RUSTFLAGS: ""
           REAL_LLM_BASE_URL: https://token-plan-cn.xiaomimimo.com/v1

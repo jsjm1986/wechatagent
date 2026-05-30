@@ -892,13 +892,33 @@ pub(crate) fn repair_loose_json(input: &str) -> Option<String> {
     let mut depth_arr: i32 = 0;
     while let Some(c) = chars.next() {
         if in_string {
-            out.push(c);
             if escape {
+                out.push(c);
                 escape = false;
-            } else if c == '\\' {
-                escape = true;
-            } else if c == '"' {
-                in_string = false;
+                continue;
+            }
+            match c {
+                '\\' => {
+                    out.push(c);
+                    escape = true;
+                }
+                '"' => {
+                    out.push(c);
+                    in_string = false;
+                }
+                // 真模型偶发在字符串值里塞**裸控制字符**（未转义的换行/制表符等），
+                // serde 严格模式直接拒收（"control character ( -) found
+                // while parsing a string"）。这里把它们转义成合法 JSON 转义序列——
+                // 只改**表示形式**不改字符串语义，符合"只容错等价表达"红线。
+                '\n' => out.push_str("\\n"),
+                '\r' => out.push_str("\\r"),
+                '\t' => out.push_str("\\t"),
+                '\u{0008}' => out.push_str("\\b"),
+                '\u{000C}' => out.push_str("\\f"),
+                other if (other as u32) < 0x20 => {
+                    out.push_str(&format!("\\u{:04x}", other as u32));
+                }
+                other => out.push(other),
             }
             continue;
         }
@@ -1133,5 +1153,29 @@ mod tests {
         // 字符串里的 `,` 后跟 `}` 是字面量，不能误删。
         let repaired = repair_loose_json(r#"{"x":"a,}b"}"#);
         assert!(repaired.is_none(), "字符串内的 , 不应触发修复");
+    }
+
+    #[test]
+    fn parse_json_content_escapes_bare_control_chars_in_string() {
+        // 真模型偶发在字符串值里塞**裸换行/制表符**（未转义），serde 严格模式拒收
+        // （"control character ( -) found while parsing a string"）。
+        // parse_json_content SHALL 把裸控制字符转义成合法 JSON 转义序列后救回，
+        // 只改表示形式不改字符串语义。
+        let raw = "{\"reply\": \"第一行\n第二行\t制表\"}";
+        let v = parse_json_content(raw).expect("裸控制字符必须被容错转义后解析成功");
+        assert_eq!(
+            v.get("reply").and_then(|x| x.as_str()),
+            Some("第一行\n第二行\t制表"),
+            "转义后字符串语义必须与原文一致（换行/制表保留）"
+        );
+    }
+
+    #[test]
+    fn repair_loose_json_escapes_low_control_char_as_unicode() {
+        // 非常见的低位控制字符（如 ）走 \uXXXX 兜底转义。
+        let raw = "{\"x\":\"a\u{0001}b\"}";
+        let repaired = repair_loose_json(raw).expect("含 \\u0001 应触发修复");
+        let v: Value = serde_json::from_str(&repaired).expect("修复后必须是合法 JSON");
+        assert_eq!(v.get("x").and_then(|x| x.as_str()), Some("a\u{0001}b"));
     }
 }
