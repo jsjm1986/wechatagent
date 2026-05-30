@@ -77,6 +77,14 @@ pub mod ext_knowledge {
         propose_chunk_repair, verify_operation_knowledge_chunk, ExtractKnowledgeTagsRequest,
         KnowledgeAutoVerifyRequest, KnowledgeVerifyRequest, OperationKnowledgeImportRequest,
     };
+    // real-LLM 知识库全能力 smoke（real_llm_knowledge.rs K10–K11）：
+    // K10 = 对话工作台（chat_turn → run_chat_turn_pipeline，真模型意图分类 + 切片起草）；
+    // K11 = LLM 完整度审计（build_operation_knowledge_completeness）。两者均为 mock 测不到
+    // 的真模型链路；红线由测试侧硬断言锁（chat 起草只产 proposal 永不自动落库；
+    // completeness answeringMode ∈ 闭集、绝不触发 auto-verify）。
+    pub use super::knowledge::{
+        build_operation_knowledge_completeness, chat_turn, ChatTurnRequest,
+    };
 }
 pub use shared::upsert_contact_from_value;
 
@@ -850,6 +858,9 @@ mod tests {
             "ingest_chunked_text",
             // knowledge.rs：PDF multipart handler 委托的字节级 helper（集成测试直调）。
             "import_pdf_bytes",
+            // knowledge.rs：完整度审计内核 helper，被 get/refresh completeness 两个 handler
+            // 复用、不直接绑 HTTP；real_llm_knowledge.rs K11 通过 `pub use` 直调真模型审计。
+            "build_operation_knowledge_completeness",
         ];
 
         let mut handlers: Vec<&str> = Vec::new();

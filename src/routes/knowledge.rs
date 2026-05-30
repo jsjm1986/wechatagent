@@ -3007,7 +3007,7 @@ pub(super) async fn build_operation_knowledge_catalog(
     }))
 }
 
-pub(super) async fn build_operation_knowledge_completeness(
+pub async fn build_operation_knowledge_completeness(
     state: &AppState,
     workspace_id: &str,
     account_id: &str,
@@ -3979,14 +3979,14 @@ const CHAT_MAX_FOLLOWUPS: usize = 3;
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub(super) struct ChatAttachment {
+pub struct ChatAttachment {
     pub chunk_id: Option<String>,
     pub item_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub(super) struct ChatTurnRequest {
+pub struct ChatTurnRequest {
     /// 缺省则后端 new uuid 当 sessionId。
     pub session_id: Option<String>,
     pub account_id: Option<String>,
@@ -3999,7 +3999,7 @@ pub(super) struct ChatTurnRequest {
     pub attachments: Vec<ChatAttachment>,
 }
 
-pub(super) async fn chat_turn(
+pub async fn chat_turn(
     State(state): State<AppState>,
     Extension(admin): Extension<AuthenticatedAdmin>,
     Json(body): Json<ChatTurnRequest>,

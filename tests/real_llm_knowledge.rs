@@ -14,6 +14,16 @@
 //!   凭空捏造引用 id（红线：cite ⊆ seed）。
 //! - **K4 · 未审定知识永不上桌**：答案只在一条 `needs_review` chunk 里 → 生产闸门
 //!   （catalog/open_chunk 均 verified-only）保证它**永不进 catalog、永不被 cite**。
+//! - **K5 · 文章抽取保持 needs_review**：preview 抽取出的 chunk 恒 draft+needs_review。
+//! - **K6 · vision 抽取保持 needs_review**：图片抽取出的 chunk 恒 draft+needs_review。
+//! - **K7 · 自动审定 provenance 闸门**：缺 source_quote/anchor 时绝不自动 verified。
+//! - **K8 · AI 修复只产 patch**：propose_chunk_repair 永不自动落库。
+//! - **K9 · 标签抽取双数组**：productTags / businessTopics 形状稳定。
+//! - **K10 · 知识对话工作台**：chat_turn 真模型意图分类 + 起草，红线——对话起草只产
+//!   proposal，**永不自动落库**任何 chunk（更不可能写 verified）。
+//! - **K11 · LLM 完整度审计**：build_operation_knowledge_completeness，红线——
+//!   answeringMode ∈ 闭集 {relationship_only, product_safe, fully_supported}，审计只读
+//!   绝不 auto-verify（needs_review chunk 审计后仍 needs_review）。
 //!
 //! ## 红线
 //! - **MCP 永远是桩**：知识链路本不发消息，但 `rebuild_app_state_with_real_llm`
@@ -44,10 +54,11 @@ use wechatagent::auth::AuthenticatedAdmin;
 use wechatagent::llm::LlmClient;
 use wechatagent::models::{LlmProviderConfig, OperationKnowledgeChunk, RelatedRef};
 use wechatagent::routes::ext_knowledge::{
-    auto_verify_operation_knowledge_chunks, decide_auto_verify_status,
-    extract_operation_knowledge_tags, import_operation_knowledge_apply_image,
-    import_operation_knowledge_preview, propose_chunk_repair, ExtractKnowledgeTagsRequest,
-    ImportApplyImageRequest, KnowledgeAutoVerifyRequest, OperationKnowledgeImportRequest,
+    auto_verify_operation_knowledge_chunks, build_operation_knowledge_completeness, chat_turn,
+    decide_auto_verify_status, extract_operation_knowledge_tags,
+    import_operation_knowledge_apply_image, import_operation_knowledge_preview,
+    propose_chunk_repair, ChatTurnRequest, ExtractKnowledgeTagsRequest, ImportApplyImageRequest,
+    KnowledgeAutoVerifyRequest, OperationKnowledgeImportRequest,
 };
 
 use crate::common::TestApp;
@@ -965,5 +976,222 @@ async fn k9_real_tag_extraction_returns_two_arrays() {
         body["businessTopics"].is_array(),
         "businessTopics 必须是数组，实际 {:?}",
         body.get("businessTopics")
+    );
+}
+
+// ── K10 · 知识对话工作台（chat_turn → run_chat_turn_pipeline）─────────────────
+//
+// 「AI 知识对话补完工作台」全能力：运营在对话框里说一句「我想新建一条切片」，真模型
+// 走 `classify_intent`（意图分类）→ 按意图起草 patch / 追问缺失字段 / 自然语言回复。
+// 这是 mock 测不到的真模型多分支链路（意图闭集 + 起草 JSON shape）。
+//
+// **红线（硬断言）**：chat 起草**只产 proposal**——返回体里 draftPreview/canApply 是
+// 给运营「应用为草稿」用的待确认补丁，**绝不**直接往 `operation_knowledge_chunks` 写
+// 任何 chunk（更不可能写 verified）。断言「调用前后该 collection 计数不变」锁死
+// 「对话起草永不自动落库」契约。intent 必须 ∈ 生产闭集。
+#[tokio::test]
+#[ignore]
+async fn k10_real_chat_workstation_drafts_proposal_never_persists() {
+    let llm = require_real_llm!();
+    let app = TestApp::start().await;
+    let mcp = dummy_mcp_server().await;
+    let state = common::rebuild_app_state_with_real_llm(&app, llm, mcp.uri());
+    let ws = state.config.default_workspace_id.clone();
+
+    // 调用前：知识切片 collection 基线计数（必须保持不变 = 永不自动落库）。
+    let chunks_before = state
+        .db
+        .operation_knowledge_chunks()
+        .count_documents(doc! { "workspace_id": &ws }, None)
+        .await
+        .expect("count chunks before");
+
+    let admin = Extension(AuthenticatedAdmin {
+        user_id: "k10_admin".into(),
+        username: "k10_admin".into(),
+        current_workspace: ws.clone(),
+    });
+    // 明确的「新建切片」意图：让真模型走 create_chunk 分支起草 patch。
+    let req: ChatTurnRequest = serde_json::from_value(json!({
+        "sessionId": null,
+        "accountId": null,
+        "operatorId": "k10_operator",
+        "content": "帮我新建一条知识切片：我们的企业版支持私有化部署，数据不出客户内网。\
+                    知识类型是产品能力，请帮我起草标题、摘要和正文。",
+        "attachments": [],
+    }))
+    .expect("构造 ChatTurnRequest");
+
+    let resp = unwrap_or_skip_transient!(
+        chat_turn(State(state.clone()), admin, Json(req)).await,
+        "真实知识对话工作台 chat_turn（不崩、JSON 能解析）"
+    );
+    let body = resp.0;
+    let intent = body.get("intent").and_then(|v| v.as_str()).unwrap_or("");
+    eprintln!(
+        "[k10] intent={intent} canApply={:?} draftKind={:?} naturalReply.len={:?} missingFields={:?}",
+        body.get("canApply"),
+        body.get("draftKind"),
+        body.get("naturalReply").and_then(|v| v.as_str()).map(|s| s.chars().count()),
+        body.get("missingFields"),
+    );
+
+    // 形状红线：intent ∈ 生产闭集；naturalReply 非空字符串。
+    const INTENTS: &[&str] = &[
+        "create_chunk",
+        "update_chunk",
+        "clarify_chunk",
+        "update_pack",
+        "digest_action",
+        "update_operator_memory",
+        "freeform",
+    ];
+    assert!(
+        INTENTS.contains(&intent),
+        "intent 必须 ∈ 生产闭集 {INTENTS:?}，实际 {intent:?}"
+    );
+    assert!(
+        body.get("naturalReply").and_then(|v| v.as_str()).map(|s| !s.trim().is_empty()).unwrap_or(false),
+        "naturalReply 必须是非空字符串，实际 {:?}",
+        body.get("naturalReply")
+    );
+    assert!(
+        body.get("canApply").map(|v| v.is_boolean()).unwrap_or(false),
+        "canApply 必须是 bool，实际 {:?}",
+        body.get("canApply")
+    );
+
+    // 核心红线：对话起草**绝不**自动落库任何 chunk —— collection 计数必须不变。
+    let chunks_after = state
+        .db
+        .operation_knowledge_chunks()
+        .count_documents(doc! { "workspace_id": &ws }, None)
+        .await
+        .expect("count chunks after");
+    assert_eq!(
+        chunks_before, chunks_after,
+        "chat 对话起草自动落库了 chunk（before={chunks_before} after={chunks_after}）——\
+         「对话起草只产 proposal、永不自动落库」红线被击穿！"
+    );
+    // 兜底红线：即便真模型在 patch 里塞了 verified，也绝不能有任何 verified chunk 落库
+    // （collection 计数不变已蕴含此点，这里再显式锁一次终态）。
+    let verified_after = state
+        .db
+        .operation_knowledge_chunks()
+        .count_documents(
+            doc! { "workspace_id": &ws, "integrity_status": "verified", "status": "active" },
+            None,
+        )
+        .await
+        .expect("count verified after");
+    assert_eq!(
+        verified_after, 0,
+        "chat 对话起草落库了 verified chunk——AI 永不自动 verify 红线被击穿！"
+    );
+}
+
+// ── K11 · LLM 知识完整度审计（build_operation_knowledge_completeness）──────────
+//
+// 「知识库完整度自评」全能力：真模型作为 Auditor，基于已验证切片判断 Agent 当前能
+// 回答到什么程度（answeringMode）。这是 mock 测不到的真模型评估链路。
+//
+// **红线（硬断言）**：
+// 1. answeringMode 必须 ∈ 闭集 {relationship_only, product_safe, fully_supported}
+//    （生产代码 `.unwrap_or(fallback)` 保证即便真模型乱答也回退到确定性闭集值）。
+// 2. Auditor **只读不写**——它统计/评估，绝不改任何 chunk 的 integrity_status，更不
+//    auto-verify。seed 一条 needs_review chunk，断言审计后它仍 needs_review。
+// 3. 统计计数（totalChunks/verifiedChunks）与 seed 实况一致（真模型不影响计数，计数
+//    由确定性 count_documents 得出）。
+#[tokio::test]
+#[ignore]
+async fn k11_real_completeness_audit_closed_mode_never_verifies() {
+    let llm = require_real_llm!();
+    let app = TestApp::start().await;
+    let mcp = dummy_mcp_server().await;
+    let state = common::rebuild_app_state_with_real_llm(&app, llm, mcp.uri());
+    let ws = state.config.default_workspace_id.clone();
+    let account_id = state.config.default_account_id.clone();
+
+    // seed：1 条 verified（有 body 作证据线索）+ 1 条 needs_review（审计绝不能转它）。
+    let _verified_id = seed_verified(
+        &app,
+        &ws,
+        "企业版交付边界",
+        "企业版交付边界与服务范围说明。",
+        "企业版支持私有化部署，标准交付周期 5 个工作日，含 3 次远程培训。",
+    )
+    .await;
+    let needs_review_id = seed_chunk(
+        &app,
+        &ws,
+        "未审定的报价草稿",
+        "一条尚未审定的报价说明。",
+        "专业版 299 元/月（待核实）。",
+        "needs_review",
+        "active",
+        0.9,
+        Vec::new(),
+    )
+    .await;
+
+    // 确定性基线计数（不依赖真模型）。
+    let verified_seeded = state
+        .db
+        .operation_knowledge_chunks()
+        .count_documents(
+            doc! {
+                "workspace_id": &ws,
+                "domain": "user_operations",
+                "status": "active",
+                "integrity_status": "verified",
+            },
+            None,
+        )
+        .await
+        .expect("count verified seeded");
+
+    let audit = unwrap_or_skip_transient!(
+        build_operation_knowledge_completeness(&state, &ws, &account_id).await,
+        "真实知识完整度审计（不崩、JSON 能解析）"
+    );
+    let mode = audit.get("answeringMode").and_then(|v| v.as_str()).unwrap_or("");
+    eprintln!(
+        "[k11] answeringMode={mode} totalChunks={:?} verifiedChunks={:?} evidenceChunks={:?} gaps={:?}",
+        audit.get("totalChunks"),
+        audit.get("verifiedChunks"),
+        audit.get("evidenceChunks"),
+        audit.get("gaps"),
+    );
+
+    // 红线 1：answeringMode ∈ 生产闭集（fallback 保证）。
+    const MODES: &[&str] = &["relationship_only", "product_safe", "fully_supported"];
+    assert!(
+        MODES.contains(&mode),
+        "answeringMode 必须 ∈ 闭集 {MODES:?}，实际 {mode:?}"
+    );
+
+    // 红线 3：verifiedChunks 计数与 seed 实况一致（真模型不左右确定性统计）。
+    assert_eq!(
+        audit.get("verifiedChunks").and_then(|v| v.as_i64()),
+        Some(verified_seeded as i64),
+        "verifiedChunks 计数应等于 seed 的 verified 数（确定性统计，真模型不参与计数）"
+    );
+
+    // 红线 2：审计是只读评估——needs_review chunk 在审计后绝不被转成 verified。
+    let after = state
+        .db
+        .operation_knowledge_chunks()
+        .find_one(
+            doc! { "_id": ObjectId::parse_str(&needs_review_id).expect("parse oid") },
+            None,
+        )
+        .await
+        .expect("query needs_review chunk")
+        .expect("needs_review chunk exists");
+    assert_eq!(
+        after.integrity_status.as_deref(),
+        Some("needs_review"),
+        "完整度审计把 needs_review chunk 改成了 {:?}——审计只读红线被击穿（Auditor 绝不 verify）！",
+        after.integrity_status
     );
 }
