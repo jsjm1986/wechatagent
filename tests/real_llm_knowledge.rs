@@ -210,6 +210,24 @@ fn trace_opened_id(
     })
 }
 
+/// 断言 tool_trace 里某个 follow_relations 步骤的 `openedBodies` 数组包含目标 id。
+/// `openedBodies` 是 K2 召回修复（follow_relations 预取关联目标正文直接载入 opened）
+/// 留下的审计线索——它出现即证明真模型经一次 follow_relations 当轮就拿到了 B 的正文，
+/// 无需再花一轮 open_chunk。
+fn trace_follow_opened_body(
+    result: &wechatagent::agent::knowledge_agent::AnswerResult,
+    id: &str,
+) -> bool {
+    result.tool_trace.iter().any(|d| {
+        d.get_str("tool")
+            .map(|t| t == "follow_relations")
+            .unwrap_or(false)
+            && d.get_array("openedBodies")
+                .map(|arr| arr.iter().any(|b| b.as_str() == Some(id)))
+                .unwrap_or(false)
+    })
+}
+
 // ── K1 · open_chunk 深检索（答案只在 body，不在 catalog 摘要）────────────────
 
 /// catalog 只暴露 `summary`（截断 120 char）。本测试故意把**赔付比例数字**只放进
@@ -364,13 +382,20 @@ async fn k2_real_follow_relations_reaches_excluded_chunk() {
 
     let reached_b_via_follow = trace_has_tool(&result, "follow_relations");
     let reached_b_via_open = trace_opened_id(&result, &id_b);
+    let follow_loaded_b = trace_follow_opened_body(&result, &id_b);
+    let answer_hits_spec = ["8 核", "8核", "16G", "200G", "Docker"]
+        .iter()
+        .any(|t| result.answer.contains(t));
     eprintln!(
-        "[k2] rounds_used={} used_follow={} opened_B={} cited={:?} cited_has_B={} answer={:?}",
+        "[k2] rounds_used={} used_follow={} opened_B={} follow_loaded_B={} \
+         cited={:?} cited_has_B={} answer_hits_spec={} answer={:?}",
         result.rounds_used,
         reached_b_via_follow,
         reached_b_via_open,
+        follow_loaded_b,
         result.cited_chunk_ids,
         result.cited_chunk_ids.contains(&id_b),
+        answer_hits_spec,
         result.answer.chars().take(120).collect::<String>(),
     );
 
@@ -399,6 +424,19 @@ async fn k2_real_follow_relations_reaches_excluded_chunk() {
          tool_trace={:?}",
         result.tool_trace
     );
+    // K2 召回修复验证（follow_relations 预取关联目标正文进 opened）：若真模型**仅**经
+    // follow_relations 触达 B（没另外 open_chunk(B)），则修复保证 B 正文在该 follow 步
+    // 即被预取进 opened（trace.openedBodies 含 B）——否则模型读不到 B 正文、cite⊆opened
+    // 红线会把 B 滤掉，召回仍是残的。这条断言锁死「follow 当轮即载正文」这一修复行为。
+    if reached_b_via_follow && !reached_b_via_open {
+        assert!(
+            follow_loaded_b,
+            "真模型经 follow_relations 触达 B，但 trace.openedBodies 未含 B——\
+             follow_relations 预取正文（K2 召回修复）失效，B 正文没被载入 opened。\
+             tool_trace={:?}",
+            result.tool_trace
+        );
+    }
 }
 
 // ── K3 · 无幻觉（catalog 非空但无相关 chunk）─────────────────────────────────

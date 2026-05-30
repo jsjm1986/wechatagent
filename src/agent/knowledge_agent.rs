@@ -49,6 +49,13 @@ const OPEN_CHUNK_BATCH: usize = 8;
 /// 把 catalog 挤爆，让后续 list_catalog 还能补进新 chunk。
 const FOLLOW_RELATIONS_LIMIT: usize = 16;
 
+/// `follow_relations` 单次最多把几条 depth-1 关联目标的【完整正文】直接载入
+/// `opened`，让 agent 当轮即可 cite，免去再花一轮 `open_chunk`（关联链
+/// open A → follow → answer 正好 3 轮，不撞 [`MAX_ROUNDS`]）。取 3：覆盖最相关
+/// 的直接关联又不撑爆 prompt；其余关联仍只进 catalog 摘要（需要时再 open_chunk）。
+/// 复用 [`follow_relations`] 中已 `find_one` 出的完整文档——零额外 DB / 零额外 LLM 轮次。
+const FOLLOW_PREFETCH_BODIES: usize = 3;
+
 /// `summary` 在 catalog 中的截断长度（按 char 数算，CJK 友好）。
 const CATALOG_SUMMARY_CHARS: usize = 120;
 
@@ -727,7 +734,7 @@ async fn answer_inner(
             }
             AgentAction::FollowRelations { chunk_id, depth } => {
                 let depth = depth.unwrap_or(1).clamp(1, 2);
-                let entries = follow_relations(
+                let (entries, prefetched) = follow_relations(
                     state,
                     &req.workspace_id,
                     &chunk_id,
@@ -737,17 +744,26 @@ async fn answer_inner(
                 .await?;
                 let appended = entries.len() as i32;
                 merge_catalog(&mut catalog, entries);
-                push_trace(
-                    &mut tool_trace,
-                    tx,
-                    doc! {
-                        "tool": "follow_relations",
-                        "round": round,
-                        "chunkId": chunk_id,
-                        "depth": depth as i32,
-                        "appended": appended,
-                    },
-                );
+                // 关联目标的完整正文直接载入 opened（镜像 OpenChunk 分支），
+                // 让 agent 当轮即可 cite，无需再花一轮 open_chunk。
+                let mut opened_bodies: Vec<String> = Vec::new();
+                for full in prefetched {
+                    if opened_seen.insert(full.chunk_id.clone()) {
+                        opened_bodies.push(full.chunk_id.clone());
+                        opened.push(full);
+                    }
+                }
+                let mut entry = doc! {
+                    "tool": "follow_relations",
+                    "round": round,
+                    "chunkId": chunk_id,
+                    "depth": depth as i32,
+                    "appended": appended,
+                };
+                if !opened_bodies.is_empty() {
+                    entry.insert("openedBodies", opened_bodies);
+                }
+                push_trace(&mut tool_trace, tx, entry);
             }
             AgentAction::Answer {
                 cited_chunk_ids,
@@ -921,21 +937,25 @@ pub async fn open_chunk(
     Ok(result.map(chunk_to_full))
 }
 
-/// 沿 `related_chunks` 跳一跳或两跳；返回的 chunk 摘要去除已 opened 的，避免
-/// 重复给 agent。
+/// 沿 `related_chunks` 跳一跳或两跳。返回 `(catalog_entries, prefetched_bodies)`：
+/// 最先发现的前 [`FOLLOW_PREFETCH_BODIES`] 个 verified 关联目标的【完整正文】
+/// 直接以 `ChunkFull` 返回（供调用方推进 `opened`，当轮即可 cite），其余只回
+/// 摘要 `CatalogEntry`。已 opened 的目标在遍历中被跳过，避免重复给 agent。
 pub async fn follow_relations(
     state: &AppState,
     workspace_id: &str,
     chunk_id: &str,
     depth: u32,
     opened_seen: &HashSet<String>,
-) -> AppResult<Vec<CatalogEntry>> {
+) -> AppResult<(Vec<CatalogEntry>, Vec<ChunkFull>)> {
     let mut visited: HashSet<String> = HashSet::new();
     visited.insert(chunk_id.to_string());
     let mut frontier: Vec<String> = vec![chunk_id.to_string()];
-    let mut output: Vec<CatalogEntry> = Vec::new();
+    // 按发现顺序收集完整文档：depth-1 在前、depth-2 在后；split_prefetch 取最前
+    // FOLLOW_PREFETCH_BODIES 个载正文（即最相关的直接关联），其余转摘要。
+    let mut collected: Vec<OperationKnowledgeChunk> = Vec::new();
 
-    for _ in 0..depth {
+    'outer: for _ in 0..depth {
         let mut next: Vec<String> = Vec::new();
         for src in frontier.drain(..) {
             let oid = match ObjectId::parse_str(&src) {
@@ -977,10 +997,10 @@ pub async fn follow_relations(
                     )
                     .await?
                 {
-                    output.push(chunk_to_catalog_entry(target));
+                    collected.push(target);
                     next.push(rel.chunk_id);
-                    if output.len() >= FOLLOW_RELATIONS_LIMIT {
-                        return Ok(output);
+                    if collected.len() >= FOLLOW_RELATIONS_LIMIT {
+                        break 'outer;
                     }
                 }
             }
@@ -990,7 +1010,12 @@ pub async fn follow_relations(
             break;
         }
     }
-    Ok(output)
+
+    let (prefetch_chunks, rest_chunks) = split_prefetch(collected, FOLLOW_PREFETCH_BODIES);
+    let prefetched: Vec<ChunkFull> = prefetch_chunks.into_iter().map(chunk_to_full).collect();
+    let catalog: Vec<CatalogEntry> =
+        rest_chunks.into_iter().map(chunk_to_catalog_entry).collect();
+    Ok((catalog, prefetched))
 }
 
 fn chunk_to_catalog_entry(chunk: OperationKnowledgeChunk) -> CatalogEntry {
@@ -1078,6 +1103,17 @@ fn merge_catalog(target: &mut Vec<CatalogEntry>, incoming: Vec<CatalogEntry>) {
 /// 验证幂等性 / 去重 / 顺序保留。
 pub fn merge_catalog_pure(target: &mut Vec<CatalogEntry>, incoming: Vec<CatalogEntry>) {
     merge_catalog(target, incoming)
+}
+
+/// 把按发现顺序收集的关联目标切成「前 `cap` 个载正文 / 其余转摘要」两段。
+/// 纯函数，供 [`follow_relations`] 调用，并由 cfg(test) 单测 + PBT 锁死不变量：
+/// 1. `prefetch.len() <= cap`；
+/// 2. `prefetch` ⧺ `rest` 顺序拼接 == 原输入（不丢不乱序）；
+/// 3. 两段无交叠（按位置切分，天然无重复）。
+pub fn split_prefetch<T>(mut items: Vec<T>, cap: usize) -> (Vec<T>, Vec<T>) {
+    let take = cap.min(items.len());
+    let rest = items.split_off(take);
+    (items, rest)
 }
 
 /// 从 LLM 输出的 cited_chunk_ids / source_quotes 过滤出仅包含已 open 过的
@@ -1170,6 +1206,7 @@ fn build_prompt(
 
 规则：
 - citedChunkIds 必须是上面"已 open 的 chunks"中的 chunkId 子集；不能凭空创造。
+- follow_relations 会把最相关的关联条目【正文】直接载入上面"已 open 的 chunks"，可当轮直接 cite，无需再 open_chunk。
 - 每个 cited 必须配 sourceQuote；如某 chunk 没有可引用原文，可省略 sourceQuote 但仍可 cite。
 - 候选 catalog 中所有 chunk 都已 integrity_status=verified；遇到 verified=false 是异常，不要 cite。
 - 当用户查询无相关知识时，answer 直接说"知识库无相关内容"，cited 留空。
@@ -1263,6 +1300,31 @@ pub(crate) mod test_helpers {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn split_prefetch_caps_and_preserves_order() {
+        let (head, tail) = split_prefetch(vec![1, 2, 3, 4, 5], 3);
+        assert_eq!(head, vec![1, 2, 3]);
+        assert_eq!(tail, vec![4, 5]);
+        // 不变量：拼回 == 原输入
+        let mut roundtrip = head.clone();
+        roundtrip.extend(tail.clone());
+        assert_eq!(roundtrip, vec![1, 2, 3, 4, 5]);
+    }
+
+    #[test]
+    fn split_prefetch_cap_exceeds_len_takes_all() {
+        let (head, tail) = split_prefetch(vec![1, 2], 5);
+        assert_eq!(head, vec![1, 2]);
+        assert!(tail.is_empty());
+    }
+
+    #[test]
+    fn split_prefetch_zero_cap_keeps_all_in_rest() {
+        let (head, tail) = split_prefetch(vec![1, 2, 3], 0);
+        assert!(head.is_empty());
+        assert_eq!(tail, vec![1, 2, 3]);
+    }
 
     #[test]
     fn truncate_chars_handles_cjk_boundary() {

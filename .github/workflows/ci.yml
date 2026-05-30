@@ -180,6 +180,23 @@ jobs:
           REAL_LLM_VISION_MODEL: mimo-v2.5
         run: cargo test --no-fail-fast --test real_llm_knowledge -- --ignored --nocapture
 
+      # 知识库内容质量套件（real_llm_knowledge_quality.rs Q1–Q7）：在 K 系列「红线/
+      # shape」之上叠加**内容质量度量**——同一真模型作 LLM-as-judge（0–10 打分）量化
+      # 7 个 LLM 能力（检索/文章抽取/vision/对话/审计/修复/打标）的专业度。每个 Q
+      # 既硬命中红线（cite⊆seed / 恒 draft+needs_review / 只产 proposal / 审计只读 /
+      # 修复不落库 / 双数组），又断言 judge overall ≥ MIN_QUALITY_FLOOR(6.0)。
+      # 日志里 `[QUALITY] {Qid}/{scene} overall=...` 可被 grep 出每能力分，驱动多轮
+      # 「测→读分→修生产代码→再测」收敛闭环。
+      # !cancelled()：同 real_llm_knowledge 步——不依赖前序步的绿/红。
+      - name: cargo test --test real_llm_knowledge_quality -- --ignored --nocapture
+        if: ${{ !cancelled() && env.REAL_LLM_API_KEY != '' }}
+        env:
+          RUSTFLAGS: ""
+          REAL_LLM_BASE_URL: https://token-plan-cn.xiaomimimo.com/v1
+          REAL_LLM_MODEL: mimo-v2.5-pro
+          REAL_LLM_VISION_MODEL: mimo-v2.5
+        run: cargo test --no-fail-fast --test real_llm_knowledge_quality -- --ignored --nocapture
+
       # 运营 agent 全能力 smoke（real_llm_ops_smoke.rs T4–T11）：FollowUp 任务 /
       # 状态机字典闭集 / 未验证产品声明闸门 / 多场景通用性 / autonomy 闭集 /
       # 用户反应 outcome 闭集 / 冷启动初始画像 / 长期记忆整理。与 T1–T3 同环境，

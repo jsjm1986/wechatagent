@@ -26,8 +26,8 @@ use std::collections::HashSet;
 
 use proptest::prelude::*;
 use wechatagent::agent::knowledge_agent::{
-    filter_answer_against_opened, merge_catalog_pure, truncate_chars, wiki_type_priority,
-    CatalogEntry, RawSourceQuote,
+    filter_answer_against_opened, merge_catalog_pure, split_prefetch, truncate_chars,
+    wiki_type_priority, CatalogEntry, RawSourceQuote,
 };
 
 // ── 字符串生成器 ─────────────────────────────────────────────────────
@@ -244,5 +244,27 @@ proptest! {
             prop_assert_eq!(out_chars, max_chars + 1);
             prop_assert!(out.ends_with('…'));
         }
+    }
+}
+
+// ── Property 7：split_prefetch_preserves_input ───────────────────────
+
+proptest! {
+    /// follow_relations 把按发现顺序收集的关联目标切成「前 cap 个载正文 / 其余
+    /// 转摘要」两段（split_prefetch）。锁死三条不变量：
+    /// 1. prefetch.len() ≤ cap；
+    /// 2. prefetch ⧺ rest 顺序拼接 == 原输入（不丢、不乱序、不重复——证明
+    ///    follow_relations 不会因切分丢掉任何已 find_one 出的关联 chunk）。
+    #[test]
+    fn split_prefetch_preserves_input(
+        items in proptest::collection::vec(0i32..1000, 0..20),
+        cap in 0usize..10,
+    ) {
+        let original = items.clone();
+        let (prefetch, rest) = split_prefetch(items, cap);
+        prop_assert!(prefetch.len() <= cap, "prefetch len {} exceeds cap {}", prefetch.len(), cap);
+        let mut roundtrip = prefetch;
+        roundtrip.extend(rest);
+        prop_assert_eq!(roundtrip, original, "prefetch ⧺ rest must equal input");
     }
 }
