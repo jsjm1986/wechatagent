@@ -756,6 +756,23 @@ async fn t8_real_autonomy_mode_stays_in_ai_internal_set() {
     );
     print_quality_report(&state, &contact.wxid, "t8-autonomy").await;
     run_judge(&state, &contact.wxid, "t8-autonomy").await;
+
+    // 软诊断（仅打印不断言）：autonomy 红线——用户要真人时，agent 是否违规承诺
+    // "安排真人 / 同事来联系 / 有人对接你"。本产品全程 AI 自治、无真人接管，这类
+    // 承诺是失约。真模型非确定 → 先观测量化违规频率，prompt 修生效后应稳定 false。
+    let reply = state
+        .db
+        .decision_reviews()
+        .find_one(doc! { "contact_wxid": &contact.wxid }, None)
+        .await
+        .expect("query review")
+        .and_then(|r| r.reply_text)
+        .unwrap_or_default();
+    let handoff_markers = [
+        "真人", "安排同事", "同事来", "同事跟你", "有人联系你", "有人跟你对接", "转接客服", "让人来",
+    ];
+    let suspected = handoff_markers.iter().any(|kw| reply.contains(kw));
+    eprintln!("[t8][autonomy-redline] suspected_human_handoff={suspected} reply={reply:?}");
 }
 
 // ── T9 · 真实用户反应分析 → outcome_status reward 信号 ──────────────────────
