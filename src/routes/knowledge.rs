@@ -3081,6 +3081,38 @@ pub async fn build_operation_knowledge_completeness(
             "businessContext": chunk.business_context
         }));
     }
+    // 待审定（needs_review）切片：审计必须让运营看到「还有多少未审定知识、涉及哪些主题」，
+    // 否则完整度报告只报 verified 的好消息、gaps 恒为空，对运营毫无指导价值（真模型在
+    // 缺这份上下文时识别不出「报价含未核实草稿」这类缺口）。
+    let needs_review_filter = doc! {
+        "workspace_id": workspace_id,
+        "domain": "user_operations",
+        "integrity_status": "needs_review",
+        "$or": account_filter.clone()
+    };
+    let needs_review = state
+        .db
+        .operation_knowledge_chunks()
+        .count_documents(needs_review_filter.clone(), None)
+        .await?;
+    let mut pending_cursor = state
+        .db
+        .operation_knowledge_chunks()
+        .find(
+            needs_review_filter,
+            FindOptions::builder()
+                .sort(doc! { "updated_at": -1 })
+                .limit(40)
+                .build(),
+        )
+        .await?;
+    let mut pending = Vec::new();
+    while let Some(chunk) = pending_cursor.try_next().await? {
+        pending.push(json!({
+            "title": chunk.title,
+            "knowledgeType": chunk.knowledge_type
+        }));
+    }
     let fallback_mode = if verified == 0 {
         "relationship_only"
     } else if evidence == 0 {
@@ -3088,6 +3120,19 @@ pub async fn build_operation_knowledge_completeness(
     } else {
         "fully_supported"
     };
+    // fallback gaps：verified==0 报缺 verified；只要存在 needs_review 草稿，
+    // 无论 verified 多少都把「待审定知识」列为缺口——AI 永不自动 verify，
+    // 这些草稿在审定前不可作为产品事实依据，运营必须看到。
+    let mut fallback_gaps: Vec<String> = Vec::new();
+    if verified == 0 {
+        fallback_gaps.push("缺少 verified 知识切片".to_string());
+    }
+    if needs_review > 0 {
+        fallback_gaps.push(format!(
+            "存在 {} 条 needs_review 待审定切片，审定前不可作为产品事实依据，需人工核实",
+            needs_review
+        ));
+    }
     let fallback = json!({
         "answeringMode": fallback_mode,
         "summary": if verified == 0 { "当前没有已验证知识切片，Agent 只能做关系维护和需求澄清。" } else { "当前存在已验证知识切片，Agent 可在证据边界内回答事实问题。" },
@@ -3098,11 +3143,11 @@ pub async fn build_operation_knowledge_completeness(
             "effectClaims": evidence > 0,
             "deliveryBoundary": verified > 0
         },
-        "gaps": if verified == 0 { vec!["缺少 verified 知识切片"] } else { Vec::<&str>::new() }
+        "gaps": fallback_gaps
     });
-    let system = "你是企业用户运营知识库完整度 Auditor。你只评估已验证知识是否足够支撑 Agent 回答产品/服务事实，不负责生成销售内容。只输出严格 JSON。";
+    let system = "你是企业用户运营知识库完整度 Auditor。你评估已验证知识是否足够支撑 Agent 回答产品/服务事实，并识别尚未审定的知识缺口，不负责生成销售内容。只输出严格 JSON。";
     let user = format!(
-        r#"请基于已验证知识切片输出 JSON：
+        r#"请基于已验证知识切片与待审定切片输出 JSON：
 {{
   "answeringMode": "relationship_only | product_safe | fully_supported",
   "summary": "",
@@ -3121,16 +3166,23 @@ pub async fn build_operation_knowledge_completeness(
 - product_safe: 可回答部分产品/服务能力，但报价、案例、效果或交付边界仍不足。
 - fully_supported: 能力、边界、证据类内容足够支撑常见产品事实问题。
 - 不要按固定标签硬判，必须从 verifiedClaims、safeClaims、evidenceItems 和 forbiddenClaims 的语义判断。
+- 待审定（needs_review）切片**尚未审定**，在审定前绝不可作为产品/服务事实依据。若待审定切片涉及报价、承诺、效果或交付边界，必须在 gaps 中明确指出「该主题存在未核实草稿，需人工审定」，且**不得**因为这些草稿存在就判 fully_supported——审定前等同缺口。
+- coverage.pricing 只有在**已验证**切片真正覆盖报价时才为 true；报价仅存在于待审定草稿时必须为 false 并进 gaps。
 
-统计：total={} verified={} anchored={} evidence={}
+统计：total={} verified={} anchored={} evidence={} needsReview={}
 
 已验证知识切片：
+{}
+
+待审定（needs_review，尚未审定，不可作为事实依据）切片：
 {}"#,
         total,
         verified,
         anchored,
         evidence,
-        serde_json::to_string(&summaries).unwrap_or_default()
+        needs_review,
+        serde_json::to_string(&summaries).unwrap_or_default(),
+        serde_json::to_string(&pending).unwrap_or_default()
     );
     let audit = state
         .llm
@@ -3142,6 +3194,8 @@ pub async fn build_operation_knowledge_completeness(
         "verifiedChunks": verified,
         "anchoredChunks": anchored,
         "evidenceChunks": evidence,
+        "needsReviewChunks": needs_review,
+        "pendingReview": pending,
         "answeringMode": json_string(&audit, "answeringMode").unwrap_or_else(|| fallback_mode.to_string()),
         "summary": json_string(&audit, "summary").unwrap_or_default(),
         "coverage": audit.get("coverage").cloned().unwrap_or_else(|| json!({})),
