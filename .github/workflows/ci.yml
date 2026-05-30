@@ -197,14 +197,47 @@ jobs:
           REAL_LLM_VISION_MODEL: mimo-v2.5
         run: cargo test --no-fail-fast --test real_llm_knowledge_quality -- --ignored --nocapture
 
-      # 运营 agent 全能力 smoke（real_llm_ops_smoke.rs T4–T11）：FollowUp 任务 /
+  # 运营 agent 全能力 smoke 独立成 job：原先它在 real-llm job 里排第 4 位，
+  # 前 3 个 smoke/knowledge/quality 套件（real_llm_smoke ~161s + real_llm_knowledge
+  # ~755s + knowledge_quality）会吃掉 45min 墙的绝大部分，导致运营多轮套件
+  # （T4–T17，含 K=3 重复采样 judge，每次 judge 调用 ~54s）一开跑就被墙腰斩
+  # （round-4 只跑到 t16A-turn1 就被 cancel）。拆成并行 job 后它独享一整个 45min
+  # 墙，与知识库套件在不同 runner 上并发，互不饿死。MCP 仍是桩（绝不真发微信）。
+  real-llm-ops:
+    name: Real-LLM ops smoke (运营 agent 多轮 / MCP 桩)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    timeout-minutes: 45
+    env:
+      REAL_LLM_API_KEY: ${{ secrets.REAL_LLM_API_KEY }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Free disk space
+        if: ${{ env.REAL_LLM_API_KEY != '' }}
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android \
+            /usr/local/share/boost /usr/local/share/powershell \
+            /usr/lib/jvm "$AGENT_TOOLSDIRECTORY" || true
+          sudo docker image prune --all --force || true
+          df -h
+
+      - name: Install Rust toolchain
+        if: ${{ env.REAL_LLM_API_KEY != '' }}
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry / target
+        if: ${{ env.REAL_LLM_API_KEY != '' }}
+        uses: Swatinem/rust-cache@v2
+
+      # 运营 agent 全能力 smoke（real_llm_ops_smoke.rs T4–T17）：FollowUp 任务 /
       # 状态机字典闭集 / 未验证产品声明闸门 / 多场景通用性 / autonomy 闭集 /
-      # 用户反应 outcome 闭集 / 冷启动初始画像 / 长期记忆整理。与 T1–T3 同环境，
-      # MCP 仍是桩（绝不真发微信）。
-      # !cancelled()：同 real_llm_knowledge 步——本套件不依赖前面 real_llm_smoke /
-      # real_llm_knowledge 步的绿/红，前者偶发失败不该把运营 T4–T11 一并跳过。
+      # 用户反应 outcome 闭集 / 冷启动初始画像 / 长期记忆整理 + 多轮深弧/千人千面/
+      # 边界压测（t15/t16/t17）+ 科学可重复 judge（K=3 采样并发）+ 全能力逐轮快照。
+      # REAL_LLM_JUDGE=1 打开 judge 诊断。MCP 仍是桩（绝不真发微信）。
       - name: cargo test --test real_llm_ops_smoke -- --ignored --nocapture
-        if: ${{ !cancelled() && env.REAL_LLM_API_KEY != '' }}
+        if: ${{ env.REAL_LLM_API_KEY != '' }}
         env:
           RUSTFLAGS: ""
           REAL_LLM_BASE_URL: https://token-plan-cn.xiaomimimo.com/v1
