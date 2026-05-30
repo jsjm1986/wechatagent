@@ -3129,7 +3129,7 @@ pub async fn build_operation_knowledge_completeness(
     }
     if needs_review > 0 {
         fallback_gaps.push(format!(
-            "存在 {} 条 needs_review 待审定切片，审定前不可作为产品事实依据，需人工核实",
+            "存在 {} 条 needs_review 待审定切片，审定前不可作为产品事实依据，需运营核实",
             needs_review
         ));
     }
@@ -3166,7 +3166,7 @@ pub async fn build_operation_knowledge_completeness(
 - product_safe: 可回答部分产品/服务能力，但报价、案例、效果或交付边界仍不足。
 - fully_supported: 能力、边界、证据类内容足够支撑常见产品事实问题。
 - 不要按固定标签硬判，必须从 verifiedClaims、safeClaims、evidenceItems 和 forbiddenClaims 的语义判断。
-- 待审定（needs_review）切片**尚未审定**，在审定前绝不可作为产品/服务事实依据。若待审定切片涉及报价、承诺、效果或交付边界，必须在 gaps 中明确指出「该主题存在未核实草稿，需人工审定」，且**不得**因为这些草稿存在就判 fully_supported——审定前等同缺口。
+- 待审定（needs_review）切片**尚未审定**，在审定前绝不可作为产品/服务事实依据。若待审定切片涉及报价、承诺、效果或交付边界，必须在 gaps 中明确指出「该主题存在未核实草稿，需运营审定」，且**不得**因为这些草稿存在就判 fully_supported——审定前等同缺口。
 - coverage.pricing 只有在**已验证**切片真正覆盖报价时才为 true；报价仅存在于待审定草稿时必须为 false 并进 gaps。
 
 统计：total={} verified={} anchored={} evidence={} needsReview={}
