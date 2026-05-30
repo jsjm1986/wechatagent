@@ -358,8 +358,13 @@ async fn run_judge(state: &AppState, wxid: &str, label: &str) {
     let mut first_reasons: Option<serde_json::Value> = None;
     let mut ok_calls = 0usize;
 
-    for i in 0..k {
-        match state.llm.generate_json_with_usage(JUDGE_SYSTEM, &user).await {
+    // K 次采样并发跑（join_all）：真模型单次 latency 高，串行 K 次会饿死 CI 45min 墙；
+    // 并发把 ~K×latency 压成 ~1×latency，重复性度量口径不变。
+    let results =
+        futures::future::join_all((0..k).map(|_| state.llm.generate_json_with_usage(JUDGE_SYSTEM, &user)))
+            .await;
+    for (i, r) in results.into_iter().enumerate() {
+        match r {
             Ok(res) => {
                 ok_calls += 1;
                 for d in DIMS {
