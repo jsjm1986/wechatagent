@@ -1405,7 +1405,7 @@ mod validate_and_promote_tests {
             fact_risk_block_at: 6,
             pressure_risk_block_at: 7,
             human_like_rewrite_below: 6,
-            emotional_value_rewrite_below: 5,
+            emotional_value_rewrite_below: 6,
             product_accuracy_block_below: 7,
             operation_state_confidence_full_review_below: 4,
             run_token_budget: 30000,

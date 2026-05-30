@@ -2011,7 +2011,7 @@ mod typed {
             6
         }
         pub fn emotional_value_rewrite_below() -> i32 {
-            5
+            6
         }
         pub fn operation_state_confidence_full_review_below() -> i32 {
             4
