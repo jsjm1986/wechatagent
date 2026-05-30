@@ -1284,3 +1284,121 @@ async fn t13_real_persona_differentiation() {
     run_judge(&state, &contact_b.wxid, "t13-persona-B").await;
 }
 
+// ── T14 · 画像写侧抖动体检（一句弱信号能否推翻已建立的高置信画像）──────────────
+//
+// 红线（feedback_cautious_profiling）：不要因为用户一句话或几个字就盲目画像，画像是
+// 长期漫长的累积过程，保守优先——宁可不更新，不要误更新。但当前 apply_agent_updates
+// 对 contact 画像是"present 即整体覆盖"：tags 用单轮 LLM 输出整体替换累积标签集、
+// stage/intent 直接覆盖、memory_summary 朴素 append，全程无置信门/无滞后。本轮**只
+// 体检量化**：造一个已建立高置信画像的老客户，发一句最弱的信号（"在吗"），观测真模型
+// 这一轮会不会把累积画像冲掉/翻转，并读 gateway 落库的 `agent.profile_churn_observed`
+// 审计事件。真模型非确定 → 只软诊断 eprintln 量化翻转频率，**不硬断言**（沿用 t8/t13
+// 方法论）；契约层仍弱断言 run log status ∈ gateway 闭集证明链路 Ok。
+#[tokio::test]
+#[ignore]
+async fn t14_real_profile_churn_under_weak_signal() {
+    use mongodb::options::FindOneOptions;
+    let llm = require_real_llm!();
+    let app = TestApp::start().await;
+    let mcp_server = start_mcp_mock_success().await;
+    let state = common::rebuild_app_state_with_real_llm(&app, llm, mcp_server.uri());
+
+    // 已建立的高置信画像：高 LTV 老客户、技术理性、处于"决策"阶段、意向"高"，
+    // 且已有一段累积 memory_summary。这些都是长期沉淀的资产，不应被一句"在吗"冲掉。
+    let mut contact = managed_contact("real_ops_user_t14");
+    contact.agent_profile = Some(AgentProfile {
+        summary: "合作两年的高 LTV 老客户，技术背景，理性决策，已多次复购".to_string(),
+        interests: vec!["投入产出比".to_string(), "长期稳定".to_string()],
+        communication_style: "精确理性，偏好直接结论，不需要寒暄".to_string(),
+        operation_goal: "维护长期关系，适时推进续费/扩容".to_string(),
+    });
+    let established_tags = vec![
+        "高LTV老客户".to_string(),
+        "技术".to_string(),
+        "理性决策".to_string(),
+    ];
+    contact.tags = established_tags.clone();
+    contact.domain_attributes = Some(doc! { "customer_stage": "决策", "intent_level": "高" });
+    let established_summary =
+        "长期合作客户，过去一年三次复购；关注稳定性与 ROI；上次沟通确认了 Q3 扩容意向。".to_string();
+    contact.memory_summary = Some(established_summary.clone());
+    state.db.contacts().insert_one(&contact, None).await.expect("insert contact");
+
+    // 最弱的信号：一句"在吗"，几乎不携带任何画像证据。
+    let inbound = make_inbound(&contact, "real_ops_msg_t14", "在吗");
+    state.db.messages().insert_one(&inbound, None).await.expect("insert inbound");
+
+    handle_managed_message(&state, contact.clone(), &inbound)
+        .await
+        .expect("t14 链路必须 Ok");
+
+    // 契约层弱断言：run log status ∈ gateway 闭集（链路跑通）。
+    let log = state
+        .db
+        .agent_run_logs()
+        .find_one(doc! { "contact_wxid": &contact.wxid }, None)
+        .await
+        .expect("query run log")
+        .expect("必须落一行 run log");
+    assert!(
+        GATEWAY_STATUS_VALUES.contains(&log.status.as_str()),
+        "status 必须 ∈ gateway 闭集，实际={:?}",
+        log.status
+    );
+
+    // 观测层（不断言）：读回 contact，量化一句弱信号后已建立画像的翻转/丢失。
+    let after = state
+        .db
+        .contacts()
+        .find_one(doc! { "wxid": &contact.wxid }, None)
+        .await
+        .expect("query contact")
+        .expect("contact 必须还在");
+    let new_stage = after
+        .domain_attributes
+        .as_ref()
+        .and_then(|d| d.get_str("customer_stage").ok())
+        .unwrap_or("<none>");
+    let new_intent = after
+        .domain_attributes
+        .as_ref()
+        .and_then(|d| d.get_str("intent_level").ok())
+        .unwrap_or("<none>");
+    let tags_lost: Vec<&String> = established_tags
+        .iter()
+        .filter(|t| !after.tags.iter().any(|n| n == *t))
+        .collect();
+    let summary_before = established_summary.len();
+    let summary_after = after.memory_summary.as_deref().map(str::len).unwrap_or(0);
+    eprintln!(
+        "[t14][profile-churn] 一句弱信号「在吗」后：\
+         stage 决策→{new_stage} | intent 高→{new_intent} | \
+         tags 建立={:?} 现存={:?} 丢失={:?} | summary {summary_before}→{summary_after}",
+        established_tags, after.tags, tags_lost
+    );
+
+    // 读 gateway 落库的 churn 审计事件（noise-gated，只在 notable 时发）。
+    let latest = || FindOneOptions::builder().sort(doc! { "created_at": -1 }).build();
+    match state
+        .db
+        .events()
+        .find_one(
+            doc! { "contact_wxid": &contact.wxid, "kind": "agent.profile_churn_observed" },
+            latest(),
+        )
+        .await
+    {
+        Ok(Some(ev)) => eprintln!(
+            "[t14][profile-churn] 抖动事件命中：summary={} details={}",
+            ev.summary,
+            ev.details.as_ref().map(fmt_doc).unwrap_or_else(|| "<none>".to_string())
+        ),
+        Ok(None) => eprintln!(
+            "[t14][profile-churn] 本轮无抖动事件（notable=false：未丢标签/未翻转/summary 未超水位）"
+        ),
+        Err(e) => eprintln!("[t14][profile-churn] 查抖动事件失败（仅诊断不失败）: {e:?}"),
+    }
+
+    print_quality_report(&state, &contact.wxid, "t14-profile-churn").await;
+}
+

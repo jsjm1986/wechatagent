@@ -1773,6 +1773,118 @@ pub(crate) fn detect_state_transition<'a>(
     Some((prior_norm.to_string(), next_norm.to_string()))
 }
 
+/// 画像/标签/记忆**写侧抖动**的纯观测报告（第一轮：体检量化，不改写库逻辑）。
+///
+/// 背景：`apply_agent_updates` 对 contact 画像是"present 即整体覆盖"——`tags` 用
+/// LLM 单轮输出整体替换累积标签集、`memory_summary` 朴素 append、stage/intent 直接
+/// 覆盖，全程无置信门 / 无滞后 / 无"已建立画像 vs 单轮弱信号"对比。这会让一句弱信号
+/// （如"在吗"）就推翻长期累积的高置信画像。本结构只**量化**这种抖动严重度，供 CI
+/// 真模型多轮跑积累数据后决定下一轮是否升级结构化 TagEntry + 置信门 / union / cap。
+///
+/// 纯审计：不参与任何写库 / 发送决策，仅用于 `agent.profile_churn_observed` 事件与
+/// 单测，定位仿 [`detect_state_transition`]（纯函数、可单测、零副作用）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ProfileChurnReport {
+    /// new 有、old 无的标签数。
+    pub tags_added: usize,
+    /// old 有、new 无的标签数——整体覆盖导致的"丢标签"风险，本轮重点量化。
+    pub tags_removed: usize,
+    /// 标签净变化（new.len - old.len），负数表示净丢失。
+    pub tags_net: i64,
+    /// stage 翻转：old 与 new 都非空且不同 → (old, new)。old 空（首次画像）不算翻转。
+    pub stage_flipped: Option<(String, String)>,
+    /// intent 翻转：同 stage 语义。
+    pub intent_flipped: Option<(String, String)>,
+    /// append 前 summary 长度（字符数）。
+    pub summary_len_before: usize,
+    /// append 后 summary 长度（字符数）——量化无界增长。
+    pub summary_len_after: usize,
+    /// 是否值得记审计：丢标签 OR stage 翻转 OR intent 翻转 OR summary 超软水位。
+    /// 用于事件噪声门——无抖动时不发，仿 operation_state 迁移事件的同状态不发。
+    pub notable: bool,
+}
+
+/// summary append 后超过此字符数即视为"无界增长"信号之一，计入 `notable`。
+const PROFILE_SUMMARY_SOFT_CAP: usize = 2000;
+
+/// 计算单轮自动回复对已建立画像造成的抖动（纯函数，无 IO）。
+///
+/// 入参语义与 `apply_agent_updates` 的写侧保持一致：
+/// * `old_*` 取自 contact 当前 doc；
+/// * `new_tags` 仅在 `decision.tags` 非空时才与 old 比对（与"非空才写"对齐）；空时
+///   视作"本轮未给标签"，不计 added/removed；
+/// * `old_stage`/`new_stage`、`old_intent`/`new_intent` 经 trim 归一，空当作未知；
+/// * `appended_update` = `decision.memory_update`（已 trim 非空才进来），summary
+///   长度按"existing + 换行 + update"（与 L1864-1870 的 append 一致）估算。
+pub(crate) fn compute_profile_churn(
+    old_tags: &[String],
+    new_tags: &[String],
+    old_stage: Option<&str>,
+    new_stage: Option<&str>,
+    old_intent: Option<&str>,
+    new_intent: Option<&str>,
+    old_summary: Option<&str>,
+    appended_update: &str,
+) -> ProfileChurnReport {
+    // 标签比对仅在本轮确实给了标签时计入（new 空 = 未更新，不算丢标签）。
+    let (tags_added, tags_removed, tags_net) = if new_tags.is_empty() {
+        (0usize, 0usize, 0i64)
+    } else {
+        let added = new_tags
+            .iter()
+            .filter(|t| !old_tags.iter().any(|o| o == *t))
+            .count();
+        let removed = old_tags
+            .iter()
+            .filter(|o| !new_tags.iter().any(|t| t == *o))
+            .count();
+        let net = new_tags.len() as i64 - old_tags.len() as i64;
+        (added, removed, net)
+    };
+
+    let stage_flipped = flip_of(old_stage, new_stage);
+    let intent_flipped = flip_of(old_intent, new_intent);
+
+    let summary_len_before = old_summary.map(str::len).unwrap_or(0);
+    let trimmed_update = appended_update.trim();
+    let summary_len_after = if trimmed_update.is_empty() {
+        summary_len_before
+    } else if summary_len_before == 0 {
+        trimmed_update.len()
+    } else {
+        // 与写侧 `format!("{}\n{}", existing, update)` 一致：+1 为换行符。
+        summary_len_before + 1 + trimmed_update.len()
+    };
+
+    let notable = tags_removed > 0
+        || stage_flipped.is_some()
+        || intent_flipped.is_some()
+        || summary_len_after > PROFILE_SUMMARY_SOFT_CAP;
+
+    ProfileChurnReport {
+        tags_added,
+        tags_removed,
+        tags_net,
+        stage_flipped,
+        intent_flipped,
+        summary_len_before,
+        summary_len_after,
+        notable,
+    }
+}
+
+/// 翻转判定：old 与 new 都非空（trim 后）且不同 → Some((old, new))；否则 None。
+/// old 空表示首次建立该维度，不算翻转。
+fn flip_of(old: Option<&str>, new: Option<&str>) -> Option<(String, String)> {
+    let old_norm = old.map(str::trim).unwrap_or("");
+    let new_norm = new.map(str::trim).unwrap_or("");
+    if old_norm.is_empty() || new_norm.is_empty() || old_norm == new_norm {
+        None
+    } else {
+        Some((old_norm.to_string(), new_norm.to_string()))
+    }
+}
+
 async fn apply_agent_updates(
     state: &AppState,
     contact: &Contact,
@@ -1875,6 +1987,69 @@ async fn apply_agent_updates(
         .contacts()
         .update_one(doc! { "_id": contact.id }, doc! { "$set": set_doc }, None)
         .await?;
+
+    // 画像写侧抖动观测（第一轮：体检量化，不改写库逻辑）。
+    // 用 contact 写库前的现状 vs 本轮 decision 计算 churn，仅在 notable（丢标签 /
+    // stage 翻转 / intent 翻转 / summary 超软水位）时写一条 `agent.profile_churn_observed`
+    // 审计事件——仿 operation_state 迁移事件的噪声门，无抖动不发避免每条消息刷屏。
+    // 纯审计：不改任何写库内容，供 CI 真模型多轮跑积累"一句弱信号推翻已建立画像"的频率。
+    let old_stage = contact
+        .domain_attributes
+        .as_ref()
+        .and_then(|d| d.get_str("customer_stage").ok());
+    let old_intent = contact
+        .domain_attributes
+        .as_ref()
+        .and_then(|d| d.get_str("intent_level").ok());
+    let churn = compute_profile_churn(
+        &contact.tags,
+        &decision.tags,
+        old_stage,
+        decision.customer_stage.as_deref(),
+        old_intent,
+        decision.intent_level.as_deref(),
+        contact.memory_summary.as_deref(),
+        &decision.memory_update,
+    );
+    if churn.notable {
+        let stage_flip = churn
+            .stage_flipped
+            .as_ref()
+            .map(|(o, n)| format!("{o} → {n}"))
+            .unwrap_or_default();
+        let intent_flip = churn
+            .intent_flipped
+            .as_ref()
+            .map(|(o, n)| format!("{o} → {n}"))
+            .unwrap_or_default();
+        write_event_for_account(
+            state,
+            &contact.account_id,
+            Some(&contact.wxid),
+            "agent.profile_churn_observed",
+            "observed",
+            &format!(
+                "profile churn: tags +{}/-{} (net {}), stage[{}] intent[{}], summary {}→{}",
+                churn.tags_added,
+                churn.tags_removed,
+                churn.tags_net,
+                stage_flip,
+                intent_flip,
+                churn.summary_len_before,
+                churn.summary_len_after,
+            ),
+            Some(doc! {
+                "tags_added": churn.tags_added as i64,
+                "tags_removed": churn.tags_removed as i64,
+                "tags_net": churn.tags_net,
+                "stage_flip": stage_flip,
+                "intent_flip": intent_flip,
+                "summary_len_before": churn.summary_len_before as i64,
+                "summary_len_after": churn.summary_len_after as i64,
+            }),
+        )
+        .await?;
+    }
 
     // P2-4：operation_state 发生迁移时写一条 stage event，便于 staleness /
     // funnel / dashboard 复盘。同状态或新状态为空时不发，避免噪声。
@@ -2801,5 +2976,133 @@ mod tests {
             Some(("intro".to_string(), "closing".to_string())),
             "返回值应是 trim 后字符串"
         );
+    }
+
+    // ---- compute_profile_churn 画像写侧抖动探针（纯函数，确定性单测）----
+
+    fn s(v: &[&str]) -> Vec<String> {
+        v.iter().map(|x| x.to_string()).collect()
+    }
+
+    /// ① 整体覆盖丢标签：old=[A,B,C] new=[A] → removed=2、net=-2、notable。
+    #[test]
+    fn churn_detects_tag_loss_from_full_overwrite() {
+        let r = compute_profile_churn(
+            &s(&["高LTV老客户", "技术", "理性决策"]),
+            &s(&["高LTV老客户"]),
+            None,
+            None,
+            None,
+            None,
+            None,
+            "",
+        );
+        assert_eq!(r.tags_removed, 2, "整体覆盖丢了 2 个累积标签");
+        assert_eq!(r.tags_added, 0);
+        assert_eq!(r.tags_net, -2);
+        assert!(r.notable, "丢标签必须计入 notable");
+    }
+
+    /// ② stage 翻转：old 决策 / new 关注 → flipped、notable。
+    #[test]
+    fn churn_detects_stage_flip() {
+        let r = compute_profile_churn(
+            &[],
+            &[],
+            Some("决策"),
+            Some("关注"),
+            None,
+            None,
+            None,
+            "",
+        );
+        assert_eq!(
+            r.stage_flipped,
+            Some(("决策".to_string(), "关注".to_string()))
+        );
+        assert!(r.notable);
+    }
+
+    /// ③ old 空不算翻转：首次建立 stage 不是 flip，无抖动。
+    #[test]
+    fn churn_first_time_stage_is_not_flip() {
+        let r = compute_profile_churn(
+            &[],
+            &[],
+            None,
+            Some("决策"),
+            Some(""),
+            Some("高"),
+            None,
+            "",
+        );
+        assert_eq!(r.stage_flipped, None, "old 空 = 首次画像，不算翻转");
+        assert_eq!(r.intent_flipped, None, "old 空串 = 未知，不算翻转");
+        assert!(!r.notable);
+    }
+
+    /// ④ summary append 长度增长，与写侧 `existing\nupdate` 一致（+1 换行）。
+    #[test]
+    fn churn_tracks_summary_growth() {
+        let r = compute_profile_churn(
+            &[],
+            &[],
+            None,
+            None,
+            None,
+            None,
+            Some("abc"),
+            "de",
+        );
+        assert_eq!(r.summary_len_before, 3);
+        assert_eq!(r.summary_len_after, 3 + 1 + 2, "existing + 换行 + update");
+    }
+
+    /// ④b summary 超软水位 → notable（无界增长信号）。
+    #[test]
+    fn churn_summary_over_soft_cap_is_notable() {
+        let existing = "x".repeat(PROFILE_SUMMARY_SOFT_CAP);
+        let r = compute_profile_churn(&[], &[], None, None, None, None, Some(&existing), "y");
+        assert!(r.summary_len_after > PROFILE_SUMMARY_SOFT_CAP);
+        assert!(r.notable, "summary 超软水位必须计入 notable");
+    }
+
+    /// ⑤ 无抖动：稳定标签 + 无翻转 + 短 summary → notable=false（不发事件）。
+    #[test]
+    fn churn_quiet_when_stable() {
+        let r = compute_profile_churn(
+            &s(&["技术", "理性决策"]),
+            &s(&["技术", "理性决策", "高意向"]),
+            Some("决策"),
+            Some("决策"),
+            Some("高"),
+            Some("高"),
+            Some("已有简介"),
+            "补充一句",
+        );
+        assert_eq!(r.tags_removed, 0, "纯新增不丢标签");
+        assert_eq!(r.tags_added, 1);
+        assert_eq!(r.stage_flipped, None);
+        assert_eq!(r.intent_flipped, None);
+        assert!(!r.notable, "纯新增 + 无翻转 + 短 summary 不算抖动，不发事件");
+    }
+
+    /// ⑥ new 空 = 本轮未给标签，不计 added/removed（与"非空才写"对齐）。
+    #[test]
+    fn churn_empty_new_tags_means_no_update() {
+        let r = compute_profile_churn(
+            &s(&["技术", "理性决策"]),
+            &[],
+            None,
+            None,
+            None,
+            None,
+            None,
+            "",
+        );
+        assert_eq!(r.tags_removed, 0, "new 空 = 未更新，不算丢标签");
+        assert_eq!(r.tags_added, 0);
+        assert_eq!(r.tags_net, 0);
+        assert!(!r.notable);
     }
 }
