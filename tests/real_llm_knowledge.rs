@@ -80,6 +80,37 @@ macro_rules! require_real_llm {
     }};
 }
 
+/// 把一个 `AppResult<T>` 解包为 `T`；遇到**真模型上游瞬时不可达**
+/// （`AppError::LlmUnavailable`：client 自身 3 次重试后仍 timeout / 429 / 5xx）时，
+/// 打印一行 skip 并 `return`（不 panic、不算失败）。
+///
+/// **为何这不是放水红线**：`LlmUnavailable` 意味着模型**根本没产出任何输出**——
+/// 没有抽取结果、没有 answer、没有落库 chunk，故「AI 永不自动 verify / cite ⊆ seed /
+/// 未审定不上桌」等红线**真空成立**（无内容可违例）。只要模型**有**响应，下游
+/// 全部硬断言照常以完整严格度执行。这与红线 #6「无 key 时 env-gated skip 而非 panic」
+/// 同源：基础设施不可用属于环境噪声，不该被记为生产级链路/schema/闸门 bug。
+/// 真模型抖动（限流/超时）按计划「有限重试 + 跳过」，不进修复循环。
+macro_rules! unwrap_or_skip_transient {
+    ($result:expr, $what:expr) => {{
+        match $result {
+            Ok(value) => value,
+            Err(wechatagent::error::AppError::LlmUnavailable {
+                kind,
+                retry_count,
+                ..
+            }) => {
+                eprintln!(
+                    "skip: {} —— 真模型上游瞬时不可达（kind={kind}, retry_count={retry_count}），\
+                     按计划「真模型抖动有限重试+跳过」处理，不算生产级失败",
+                    $what
+                );
+                return;
+            }
+            Err(other) => panic!("{}：{other}", $what),
+        }
+    }};
+}
+
 /// 知识链路不发消息，但 `rebuild_app_state_with_real_llm` 需要一个 mcp_url 构造
 /// McpClient。起一个**不挂任何 mock 的空 wiremock**：URL 合法可解析，但永不被命中
 /// （知识 agent 模块对 gateway/outbox/mcp 零耦合）。
@@ -216,7 +247,7 @@ async fn k1_real_open_chunk_reaches_body_detail() {
         filter: CatalogFilter::default(),
         max_rounds: None,
     };
-    let result = answer(&state, req).await.expect("真实知识 agent answer 必须 Ok");
+    let result = unwrap_or_skip_transient!(answer(&state, req).await, "真实知识 agent answer");
 
     eprintln!(
         "[k1] rounds_used={} cited={:?} opened_k1={} answer.len={} answer={:?}",
@@ -318,7 +349,7 @@ async fn k2_real_follow_relations_reaches_excluded_chunk() {
         filter: CatalogFilter::default(),
         max_rounds: None,
     };
-    let result = answer(&state, req).await.expect("真实知识 agent answer 必须 Ok");
+    let result = unwrap_or_skip_transient!(answer(&state, req).await, "真实知识 agent answer");
 
     let reached_b_via_follow = trace_has_tool(&result, "follow_relations");
     let reached_b_via_open = trace_opened_id(&result, &id_b);
@@ -399,7 +430,7 @@ async fn k3_real_no_hallucination_when_topic_absent() {
         filter: CatalogFilter::default(),
         max_rounds: None,
     };
-    let result = answer(&state, req).await.expect("真实知识 agent answer 必须 Ok");
+    let result = unwrap_or_skip_transient!(answer(&state, req).await, "真实知识 agent answer");
 
     eprintln!(
         "[k3] rounds_used={} cited={:?} answer={:?}",
@@ -474,7 +505,7 @@ async fn k4_real_unverified_chunk_never_served() {
         filter: CatalogFilter::default(), // include_unverified=false（默认）
         max_rounds: None,
     };
-    let result = answer(&state, req).await.expect("真实知识 agent answer 必须 Ok");
+    let result = unwrap_or_skip_transient!(answer(&state, req).await, "真实知识 agent answer");
 
     eprintln!(
         "[k4] rounds_used={} cited={:?} answer={:?}",
@@ -549,9 +580,10 @@ async fn k5_real_article_extraction_keeps_needs_review() {
     }))
     .expect("构造 OperationKnowledgeImportRequest");
 
-    let resp = import_operation_knowledge_preview(State(state.clone()), Json(req))
-        .await
-        .expect("真实文章抽取必须 Ok（不崩、JSON 能解析+normalize）");
+    let resp = unwrap_or_skip_transient!(
+        import_operation_knowledge_preview(State(state.clone()), Json(req)).await,
+        "真实文章抽取（不崩、JSON 能解析+normalize）"
+    );
     let body = resp.0;
 
     let chunks = body["chunks"].as_array().cloned().unwrap_or_default();
@@ -651,9 +683,10 @@ async fn k6_real_vision_article_extraction_keeps_needs_review() {
         hint: Some("企业版服务条款图片".to_string()),
     };
 
-    let resp = import_operation_knowledge_apply_image(State(app.state.clone()), admin, Json(req))
-        .await
-        .expect("真实 vision 抽取必须 Ok（不崩）");
+    let resp = unwrap_or_skip_transient!(
+        import_operation_knowledge_apply_image(State(app.state.clone()), admin, Json(req)).await,
+        "真实 vision 抽取（不崩）"
+    );
     let body = resp.0;
     let chunk_ids = body["chunkIds"].as_array().cloned().unwrap_or_default();
     eprintln!(
@@ -770,9 +803,10 @@ async fn k7_real_auto_verify_provenance_gate_holds() {
     }))
     .expect("构造 KnowledgeAutoVerifyRequest");
 
-    let resp = auto_verify_operation_knowledge_chunks(State(state.clone()), admin, Json(req))
-        .await
-        .expect("真实 auto_verify 必须 Ok（不崩）");
+    let resp = unwrap_or_skip_transient!(
+        auto_verify_operation_knowledge_chunks(State(state.clone()), admin, Json(req)).await,
+        "真实 auto_verify（不崩）"
+    );
     eprintln!(
         "[k7] auto_verify summary processed={:?} verified={:?} needsReview={:?}",
         resp.0.get("processed"),
@@ -851,9 +885,10 @@ async fn k8_real_repair_proposes_patch_but_never_writes_db() {
         current_workspace: ws.clone(),
     });
 
-    let resp = propose_chunk_repair(State(state.clone()), admin, Path(id.to_hex()))
-        .await
-        .expect("真实 AI 修复 propose 必须 Ok（不崩）");
+    let resp = unwrap_or_skip_transient!(
+        propose_chunk_repair(State(state.clone()), admin, Path(id.to_hex())).await,
+        "真实 AI 修复 propose（不崩）"
+    );
     let body = resp.0;
     eprintln!(
         "[k8] repair turn={:?} hasPatch={} missingFields={:?} confidenceHint={:?}",
@@ -909,9 +944,10 @@ async fn k9_real_tag_extraction_returns_two_arrays() {
     }))
     .expect("构造 ExtractKnowledgeTagsRequest");
 
-    let resp = extract_operation_knowledge_tags(State(state.clone()), Json(req))
-        .await
-        .expect("真实标签抽取必须 Ok（不崩、JSON 能解析）");
+    let resp = unwrap_or_skip_transient!(
+        extract_operation_knowledge_tags(State(state.clone()), Json(req)).await,
+        "真实标签抽取（不崩、JSON 能解析）"
+    );
     let body = resp.0;
     eprintln!(
         "[k9] productTags={:?} businessTopics={:?}",
