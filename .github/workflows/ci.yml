@@ -193,4 +193,5 @@ jobs:
           REAL_LLM_BASE_URL: https://token-plan-cn.xiaomimimo.com/v1
           REAL_LLM_MODEL: mimo-v2.5-pro
           REAL_LLM_VISION_MODEL: mimo-v2.5
+          REAL_LLM_JUDGE: "1"
         run: cargo test --no-fail-fast --test real_llm_ops_smoke -- --ignored --nocapture
