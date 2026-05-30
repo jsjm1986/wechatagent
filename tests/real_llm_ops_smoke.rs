@@ -7,7 +7,8 @@
 //! - **状态机字典约束**（真模型推导的 operation_state 必须 ∈ 已声明 key）；
 //! - **五闸门红线**（无 verified 知识支撑的产品声明必被拦）；
 //! - **多场景通用性**（异议/咨询/闲聊/边界四类各跑一遍，链路都不崩）；
-//! - **autonomy 定位红线**（autonomy_mode 落 AI 自治闭集，绝无人工接管语义）。
+//! - **autonomy 定位红线**（autonomy_mode 落 AI 自治闭集，绝无人工接管语义）；
+//! - **千人千面差异化**（同一消息 × 对立画像 → 实质不同回复，验证按画像区别对待）。
 //!
 //! ## 红线（与 real_llm_smoke 同）
 //! - **MCP 永远是桩**：`rebuild_app_state_with_real_llm` 把 `mcp_base_url` 指向
@@ -37,7 +38,8 @@ use wechatagent::agent::{
 };
 use wechatagent::llm::LlmClient;
 use wechatagent::models::{
-    AgentStatus, AgentTask, Contact, ConversationMessage, MemoryCandidate, MessageDirection,
+    AgentProfile, AgentStatus, AgentTask, Contact, ConversationMessage, MemoryCandidate,
+    MessageDirection,
 };
 
 use crate::common::TestApp;
@@ -1141,5 +1143,127 @@ async fn t12_real_steerability_honors_custom_instructions() {
     eprintln!(
         "[t12] 指令遵守启发式 honored={honored}（运营指令=推荐前先问预算；真模型是否主动问预算）"
     );
+}
+
+// ── T13 · 千人千面（同消息 × 对立画像 → 实质不同回复）─────────────────────────
+
+/// 验证运营 Agent 的「千人千面」——用户最强诉求「通过用户画像做到独立个性、区别对待」。
+///
+/// 造两个**画像对立**的 contact，投**同一条** inbound：
+///   - A：communication_style 精确理性 + tags=[技术,理性决策] + customer_stage=评估；
+///   - B：communication_style 需要鼓励 + tags=[首次创业,焦虑] + customer_stage=关注。
+/// Soul 的「看清后口吻怎么变」映射应让两条回复实质不同（A 术语直给、B 先共情再给步骤）。
+///
+/// 契约层（鲁棒断言，不卡质量）：两条链路 Ok、run log status ∈ gateway 闭集、
+/// 两条 reply_text 均非空、`reply_a != reply_b`（差异化的最小可判定证据）。
+/// 质量层（本测试重点，仅观测不断言——真模型非确定）：对 A/B 各打体检报告 + 裁判分，
+/// 并打印两条回复长度，由人 + judge 读 CI 日志评估差异化质量并据此迭代 Soul。
+#[tokio::test]
+#[ignore]
+async fn t13_real_persona_differentiation() {
+    let llm = require_real_llm!();
+    let app = TestApp::start().await;
+    let mcp_server = start_mcp_mock_success().await;
+    let state = common::rebuild_app_state_with_real_llm(&app, llm, mcp_server.uri());
+
+    // 画像 A：技术理性、偏好术语和直接结论、处于评估阶段。
+    let mut contact_a = managed_contact("real_ops_user_t13_a");
+    contact_a.agent_profile = Some(AgentProfile {
+        summary: "技术背景的理性决策者，偏好直接结论".to_string(),
+        interests: vec!["技术细节".to_string(), "投入产出比".to_string()],
+        communication_style: "精确理性，偏好术语和直接结论，不需要寒暄铺垫".to_string(),
+        operation_goal: "提供可验证的判断依据，推进评估".to_string(),
+    });
+    contact_a.tags = vec!["技术".to_string(), "理性决策".to_string()];
+    contact_a.domain_attributes = Some(doc! { "customer_stage": "评估", "intent_level": "中" });
+
+    // 画像 B：首次创业、容易焦虑、需要鼓励、处于关注阶段。
+    let mut contact_b = managed_contact("real_ops_user_t13_b");
+    contact_b.agent_profile = Some(AgentProfile {
+        summary: "首次创业者，容易焦虑，需要被鼓励和陪伴".to_string(),
+        interests: vec!["少走弯路".to_string(), "有人指点".to_string()],
+        communication_style: "需要鼓励，容易焦虑，希望被理解和一步步带着走".to_string(),
+        operation_goal: "先建立信任、稳定情绪，再给最小可执行步骤".to_string(),
+    });
+    contact_b.tags = vec!["首次创业".to_string(), "焦虑".to_string()];
+    contact_b.domain_attributes = Some(doc! { "customer_stage": "关注", "intent_level": "低" });
+
+    state.db.contacts().insert_one(&contact_a, None).await.expect("insert contact a");
+    state.db.contacts().insert_one(&contact_b, None).await.expect("insert contact b");
+
+    // 同一条措辞模糊、可被不同画像各自承接的 inbound。
+    let inbound_a = make_inbound(&contact_a, "real_ops_msg_t13_a", "这个我有点拿不准，能给点建议吗？");
+    let inbound_b = make_inbound(&contact_b, "real_ops_msg_t13_b", "这个我有点拿不准，能给点建议吗？");
+    state.db.messages().insert_one(&inbound_a, None).await.expect("insert inbound a");
+    state.db.messages().insert_one(&inbound_b, None).await.expect("insert inbound b");
+
+    handle_managed_message(&state, contact_a.clone(), &inbound_a)
+        .await
+        .expect("画像 A 链路必须 Ok");
+    handle_managed_message(&state, contact_b.clone(), &inbound_b)
+        .await
+        .expect("画像 B 链路必须 Ok");
+
+    // 契约层弱断言：两条 run log status ∈ gateway 闭集。
+    for wxid in [&contact_a.wxid, &contact_b.wxid] {
+        let log = state
+            .db
+            .agent_run_logs()
+            .find_one(doc! { "contact_wxid": wxid }, None)
+            .await
+            .expect("query run log")
+            .expect("必须落一行 run log");
+        assert!(
+            GATEWAY_STATUS_VALUES.contains(&log.status.as_str()),
+            "status 必须 ∈ gateway 闭集，wxid={wxid} 实际={:?}",
+            log.status
+        );
+        assert!(
+            log.final_review_status.is_empty()
+                || FINAL_REVIEW_STATUS_VALUES.contains(&log.final_review_status.as_str()),
+            "final_review_status 非空时必须 ∈ 闭集，wxid={wxid} 实际={:?}",
+            log.final_review_status
+        );
+    }
+
+    let reply_of = |wxid: String| {
+        let state = &state;
+        async move {
+            state
+                .db
+                .decision_reviews()
+                .find_one(doc! { "contact_wxid": wxid }, None)
+                .await
+                .expect("query review")
+                .and_then(|r| r.reply_text)
+                .unwrap_or_default()
+        }
+    };
+    let reply_a = reply_of(contact_a.wxid.clone()).await;
+    let reply_b = reply_of(contact_b.wxid.clone()).await;
+
+    assert!(!reply_a.trim().is_empty(), "画像 A 必须产出非空回复");
+    assert!(!reply_b.trim().is_empty(), "画像 B 必须产出非空回复");
+    // 千人千面的最小可判定证据：同一句话、对立画像 → 回复不应逐字相同。
+    assert_ne!(
+        reply_a, reply_b,
+        "对立画像收到同一消息应产出实质不同的回复（千人千面），实际两条逐字相同"
+    );
+
+    // 质量层观测（不断言）：体检 + 裁判分 + 长度差，由人/judge 评估差异化质量。
+    eprintln!(
+        "[t13][千人千面] A(技术理性,len={}) = {}",
+        reply_a.chars().count(),
+        reply_a
+    );
+    eprintln!(
+        "[t13][千人千面] B(首次创业焦虑,len={}) = {}",
+        reply_b.chars().count(),
+        reply_b
+    );
+    print_quality_report(&state, &contact_a.wxid, "t13-persona-A").await;
+    run_judge(&state, &contact_a.wxid, "t13-persona-A").await;
+    print_quality_report(&state, &contact_b.wxid, "t13-persona-B").await;
+    run_judge(&state, &contact_b.wxid, "t13-persona-B").await;
 }
 
