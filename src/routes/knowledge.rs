@@ -194,7 +194,7 @@ pub(super) struct OperationKnowledgeChunkRequest {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub(super) struct OperationKnowledgeImportRequest {
+pub struct OperationKnowledgeImportRequest {
     account_id: Option<String>,
     source_name: Option<String>,
     content: String,
@@ -239,13 +239,13 @@ pub(super) struct KnowledgeToolOpenRequest {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub(super) struct KnowledgeVerifyRequest {
+pub struct KnowledgeVerifyRequest {
     verified_claims: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub(super) struct KnowledgeAutoVerifyRequest {
+pub struct KnowledgeAutoVerifyRequest {
     account_id: Option<String>,
     /// 模型置信度阈值（0-10），≥ 该值才算 verified；默认 7。
     #[serde(default)]
@@ -566,7 +566,7 @@ pub(super) async fn get_operation_knowledge_chunk_source(
     })))
 }
 
-pub(super) async fn verify_operation_knowledge_chunk(
+pub async fn verify_operation_knowledge_chunk(
     State(state): State<AppState>,
     Extension(admin): Extension<AuthenticatedAdmin>,
     Path(id): Path<String>,
@@ -657,7 +657,7 @@ pub(super) async fn reject_operation_knowledge_chunk(
 /// - confidence ≥ threshold 自动标 `verified`，否则保持 `needs_review`；
 /// - 按 `1/N` 概率把判定结果改成 `needs_human_audit` 走 admin 抽查；
 /// - 写一条 `agent_events kind="knowledge_auto_verify_done"`。
-pub(super) async fn auto_verify_operation_knowledge_chunks(
+pub async fn auto_verify_operation_knowledge_chunks(
     State(state): State<AppState>,
     Extension(admin): Extension<AuthenticatedAdmin>,
     Json(payload): Json<KnowledgeAutoVerifyRequest>,
@@ -1243,7 +1243,7 @@ pub(super) async fn delete_operation_knowledge(
     ))
 }
 
-pub(super) async fn import_operation_knowledge_preview(
+pub async fn import_operation_knowledge_preview(
     State(state): State<AppState>,
     Json(payload): Json<OperationKnowledgeImportRequest>,
 ) -> AppResult<Json<Value>> {
@@ -1378,7 +1378,7 @@ pub(super) async fn import_operation_knowledge_preview(
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub(super) struct ExtractKnowledgeTagsRequest {
+pub struct ExtractKnowledgeTagsRequest {
     account_id: Option<String>,
     title: Option<String>,
     body: String,
@@ -1390,7 +1390,7 @@ pub(super) struct ExtractKnowledgeTagsRequest {
 ///
 /// 输入：`{ accountId?, title?, body }`
 /// 输出：`{ productTags: [], businessTopics: [] }`
-pub(super) async fn extract_operation_knowledge_tags(
+pub async fn extract_operation_knowledge_tags(
     State(state): State<AppState>,
     Json(payload): Json<ExtractKnowledgeTagsRequest>,
 ) -> AppResult<Json<Value>> {
@@ -3196,7 +3196,7 @@ pub(super) fn default_active_status() -> String {
 /// - 其它一律 `needs_review`，**包括** 4 项之一缺失但 LLM 自称 verified。
 ///
 /// 这是 spec「auto-verify 证据强约束」的关键判定，单测覆盖防止后续误改。
-pub(super) fn decide_auto_verify_status(
+pub fn decide_auto_verify_status(
     has_source_quote: bool,
     has_source_anchor: bool,
     confidence: i32,
@@ -3462,7 +3462,7 @@ async fn record_repair_event(
         .await;
 }
 
-pub(super) async fn propose_chunk_repair(
+pub async fn propose_chunk_repair(
     State(state): State<AppState>,
     Extension(admin): Extension<AuthenticatedAdmin>,
     Path(id): Path<String>,

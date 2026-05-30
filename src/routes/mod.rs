@@ -66,6 +66,17 @@ pub mod ext_knowledge {
         import_operation_knowledge_apply_image, import_pdf_bytes, ingest_chunked_text,
         ImportApplyImageRequest, IngestOutcome,
     };
+    // real-LLM 知识库全能力 smoke（real_llm_knowledge.rs K5–K9）：把 LLM 驱动的
+    // 抽取 / 自动审定 / AI 修复 / 标签抽取 handler + 其请求体类型暴露给测试 crate，
+    // 让真模型直接驱动这些「mock 测不到」的链路。请求体字段为私有但派生
+    // `Deserialize`，测试侧用 `serde_json::from_value` 构造，无需放开字段可见性。
+    // `decide_auto_verify_status` 暴露用于直接对 provenance 闸门做单元级红线断言。
+    pub use super::knowledge::{
+        auto_verify_operation_knowledge_chunks, decide_auto_verify_status,
+        extract_operation_knowledge_tags, import_operation_knowledge_preview,
+        propose_chunk_repair, verify_operation_knowledge_chunk, ExtractKnowledgeTagsRequest,
+        KnowledgeAutoVerifyRequest, KnowledgeVerifyRequest, OperationKnowledgeImportRequest,
+    };
 }
 pub use shared::upsert_contact_from_value;
 

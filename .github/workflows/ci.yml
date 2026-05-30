@@ -162,3 +162,17 @@ jobs:
           REAL_LLM_MODEL: mimo-v2.5-pro
           REAL_LLM_VISION_MODEL: mimo-v2.5
         run: cargo test --no-fail-fast --test real_llm_smoke -- --ignored --nocapture
+
+      # 知识库全能力 smoke（real_llm_knowledge.rs K1–K9）：渐进式披露检索
+      # （open_chunk 深检索 / follow_relations 关系跳转 / 无幻觉 / 未审定不上桌）
+      # + 抽取全能力（文章抽取 / 多模态图片抽取 / 自动审定 provenance 闸门 /
+      # AI 修复只产 patch / 标签抽取）。与 T1–T3 同环境，MCP 仍是桩；
+      # 红线：抽取/落库 chunk 恒 draft+needs_review，AI 永不自动 verify。
+      - name: cargo test --test real_llm_knowledge -- --ignored --nocapture
+        if: ${{ env.REAL_LLM_API_KEY != '' }}
+        env:
+          RUSTFLAGS: ""
+          REAL_LLM_BASE_URL: https://token-plan-cn.xiaomimimo.com/v1
+          REAL_LLM_MODEL: mimo-v2.5-pro
+          REAL_LLM_VISION_MODEL: mimo-v2.5
+        run: cargo test --no-fail-fast --test real_llm_knowledge -- --ignored --nocapture
