@@ -314,6 +314,24 @@ pub(crate) fn compute_verified_chunks<'a>(
     out
 }
 
+/// item ①「先观测」：候选回复正文是否含「绝对化产品承诺」字面。
+///
+/// 仅供 `finalize_review_for_send` 的非拦截观测探针使用——量化 reviewer 漏判
+/// （未自报 `requiresProductKnowledge` 却写了硬承诺）的频率，**不参与任何
+/// 发送判定**。词表与 `prompts.rs` 既有 `user.review.product_claim_markers`
+/// 模板对齐（其 Rust 消费者 2026-05-25 随 string-marker 硬门删除，此处只借
+/// 词表语义做观测，不恢复判罚）。命中即返回 true。
+pub(crate) fn reply_contains_commitment_claim(reply_text: &str) -> bool {
+    const COMMITMENT_MARKERS: [&str; 8] = [
+        "保证", "一定能", "绝对", "百分之", "百分百", "成功率", "见效", "回款",
+    ];
+    let text = reply_text.trim();
+    if text.is_empty() {
+        return false;
+    }
+    COMMITMENT_MARKERS.iter().any(|m| text.contains(m))
+}
+
 #[cfg(test)]
 mod policy_tests {
     //! Phase B / B4：`classify_decision_action` + `enforce_state_action_policy` 单测。

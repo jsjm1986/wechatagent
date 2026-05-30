@@ -41,6 +41,7 @@ use wechatagent::models::{
 };
 
 use crate::common::TestApp;
+use wechatagent::routes::AppState;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -199,6 +200,138 @@ fn make_follow_up_task(contact: &Contact, content: &str, expires_at: Option<Date
     }
 }
 
+// ── 内容质量体检报告 helper（纯诊断，不断言）────────────────────────────────
+//
+// 真模型套件的契约断言（status/final_review_status/state 闭集）只证明「链路跑通」，
+// 看不到真模型实际生成的**内容质量**。本 helper 把每轮 managed run 已落库的真实
+// 产出全维度 eprintln! 进 CI 日志（--nocapture），供人逐轮评估话术/闸门判罚/画像/
+// 可操控性，规划迭代。只读 decision_reviews + agent_run_logs，零 production 改动。
+//
+// 取最近一条（created_at 降序）：T4-T8/T12 每个 contact 恰好一轮 managed run。
+
+/// 把 BSON Document 压成一行便于日志阅读；空 doc 打 `<empty>`。
+fn fmt_doc(doc: &Document) -> String {
+    if doc.is_empty() {
+        "<empty>".to_string()
+    } else {
+        doc.to_string()
+    }
+}
+
+/// 取 Document 里的 i32（兼容 i32/i64/f64），缺键返回 None。
+fn doc_score(doc: &Document, key: &str) -> Option<i64> {
+    doc.get_i32(key)
+        .map(i64::from)
+        .ok()
+        .or_else(|| doc.get_i64(key).ok())
+        .or_else(|| doc.get_f64(key).ok().map(|v| v as i64))
+}
+
+/// 打印某 contact 最近一轮 managed run 的真实产出（话术/五闸门/评语/知识/自治/审查/运营）。
+async fn print_quality_report(state: &AppState, wxid: &str, label: &str) {
+    use mongodb::options::FindOneOptions;
+    let latest = || FindOneOptions::builder().sort(doc! { "created_at": -1 }).build();
+
+    eprintln!("\n===== [体检] {label} wxid={wxid} =====");
+
+    match state
+        .db
+        .decision_reviews()
+        .find_one(doc! { "contact_wxid": wxid }, latest())
+        .await
+    {
+        Ok(Some(review)) => {
+            eprintln!(
+                "[话术] reply_text = {}",
+                review.reply_text.as_deref().unwrap_or("<none>")
+            );
+            eprintln!(
+                "[闸门] humanLike={:?}(<6改写) emotionalValue={:?}(<5改写) \
+                 factRisk={:?}(>=6拦) productAccuracy={:?}(<7拦产品声明) pressureRisk={:?}(>=7拦)",
+                doc_score(&review.scores, "humanLike"),
+                doc_score(&review.scores, "emotionalValue"),
+                doc_score(&review.scores, "hallucinationScore"),
+                doc_score(&review.scores, "knowledgeGroundingScore"),
+                doc_score(&review.scores, "pressureRisk"),
+            );
+            eprintln!(
+                "[评语] review_summary = {}",
+                review.review_summary.as_deref().unwrap_or("<none>")
+            );
+            eprintln!("[评语] risks = {:?}", review.risks);
+            eprintln!(
+                "[知识] used_knowledge_ids = {:?}（引用的 verified chunk 数={}）",
+                review.used_knowledge_ids,
+                review.used_knowledge_ids.len()
+            );
+            eprintln!(
+                "[运营] operation_state={:?} next_best_action={}",
+                review.operation_state,
+                fmt_doc(&review.next_best_action)
+            );
+        }
+        Ok(None) => eprintln!("[体检] 无 decision_review（真模型本轮未进决策/未发，属合法分支）"),
+        Err(e) => eprintln!("[体检] 查 decision_review 失败（仅诊断不失败）: {e:?}"),
+    }
+
+    match state
+        .db
+        .agent_run_logs()
+        .find_one(doc! { "contact_wxid": wxid }, latest())
+        .await
+    {
+        Ok(Some(log)) => {
+            eprintln!(
+                "[自治] autonomy_mode={:?} conversation_mode={:?} reason={:?}",
+                log.autonomy_mode, log.conversation_mode, log.conversation_mode_reason
+            );
+            eprintln!(
+                "[审查] final_review_status={:?} status={:?} revision_applied={} llm_calls={} tokens={}",
+                log.final_review_status,
+                log.status,
+                log.revision_applied,
+                log.llm_calls_used,
+                log.tokens_used
+            );
+            eprintln!(
+                "[审查] self_critique = {}",
+                log.self_critique.as_deref().unwrap_or("<none>")
+            );
+            if log.revision_applied {
+                eprintln!(
+                    "[改写] pre = {} | post = {}",
+                    log.pre_revision_summary.as_deref().unwrap_or("<none>"),
+                    log.post_revision_summary.as_deref().unwrap_or("<none>")
+                );
+            }
+        }
+        Ok(None) => eprintln!("[体检] 无 agent_run_log（异常，正常每轮必落一行）"),
+        Err(e) => eprintln!("[体检] 查 agent_run_log 失败（仅诊断不失败）: {e:?}"),
+    }
+
+    // item ①「先观测」：grounding 漏判探针——reviewer 未自报需产品知识，但回复含
+    // 绝对化承诺且无 verified 背书时，finalize 会落一条 kind=grounding_probe_reviewer_missed
+    // 的 AgentEvent。打出来量化真模型「reviewer 漏判硬承诺」的频率（不断言，纯诊断）。
+    match state
+        .db
+        .events()
+        .find_one(
+            doc! { "contact_wxid": wxid, "kind": "grounding_probe_reviewer_missed" },
+            latest(),
+        )
+        .await
+    {
+        Ok(Some(ev)) => eprintln!(
+            "[grounding观测] reviewer 漏判命中！summary={} details={}",
+            ev.summary,
+            ev.details.as_ref().map(fmt_doc).unwrap_or_else(|| "<none>".to_string())
+        ),
+        Ok(None) => eprintln!("[grounding观测] 本轮无 reviewer 漏判（探针未触发，正常）"),
+        Err(e) => eprintln!("[grounding观测] 查探针事件失败（仅诊断不失败）: {e:?}"),
+    }
+    eprintln!("===== [体检] {label} 结束 =====\n");
+}
+
 // ── T4 · 真实 FollowUp 跟进任务触发 ─────────────────────────────────────────
 
 /// 真模型跑 **FollowUp 触发类型**（第二种 agent 触发入口，与 inbound 互补）。
@@ -253,6 +386,7 @@ async fn t4_real_follow_up_task_runs_and_expiry_blocks() {
         "[t4] live follow_up: status={} final_review_status={:?} llm_calls={}",
         live_log.status, live_log.final_review_status, live_log.llm_calls_used
     );
+    print_quality_report(&state, &contact.wxid, "t4-live-followup").await;
 
     // ② 已过期 follow_up：precheck 拦在 "expired"，不调真模型决策。
     let expired_task = make_follow_up_task(
@@ -342,6 +476,7 @@ async fn t5_real_state_machine_transition_stays_in_dictionary() {
         "[t5] operation_state after run = {:?}（必须 ∈ 生产状态机字典）",
         reloaded.operation_state
     );
+    print_quality_report(&state, &contact.wxid, "t5-state").await;
 }
 
 // ── T6 · 真实五闸门：无知识支撑的产品声明被拦 ───────────────────────────────
@@ -395,6 +530,7 @@ async fn t6_real_unverified_product_claim_is_gated() {
         "[t6] status={} final_review_status={:?} —— 关注是否 blocked_unverified_product_claim",
         log.status, log.final_review_status
     );
+    print_quality_report(&state, &contact.wxid, "t6-product-claim").await;
 }
 
 // ── T7 · 真实多场景通用性（异议 / 咨询 / 闲聊 / 边界）─────────────────────────
@@ -449,6 +585,7 @@ async fn t7_real_multi_scenario_generality() {
             "[t7][{kind}] status={} final_review_status={:?} llm_calls={}",
             log.status, log.final_review_status, log.llm_calls_used
         );
+        print_quality_report(&state, &contact.wxid, &format!("t7-{kind}")).await;
     }
 }
 
@@ -500,6 +637,7 @@ async fn t8_real_autonomy_mode_stays_in_ai_internal_set() {
         "[t8] autonomy_mode={:?} status={} final_review_status={:?}",
         log.autonomy_mode, log.status, log.final_review_status
     );
+    print_quality_report(&state, &contact.wxid, "t8-autonomy").await;
 }
 
 // ── T9 · 真实用户反应分析 → outcome_status reward 信号 ──────────────────────
@@ -609,6 +747,14 @@ async fn t9_real_user_reaction_outcome_in_closed_set() {
         "[t9] outcome_status={:?}（真模型对买入信号回复的判定，必须 ∈ 闭集）",
         reacted.outcome_status
     );
+    eprintln!(
+        "[t9] reaction_analysis = {}",
+        fmt_doc(&reacted.reaction_analysis)
+    );
+    eprintln!(
+        "[t9] reviewer_misjudge_signal = {:?}（approved_but_user_negative / blocked_but_user_positive / None）",
+        reacted.reviewer_misjudge_signal
+    );
 }
 
 // ── T10 · 真实初始运营画像生成 ─────────────────────────────────────────────
@@ -655,6 +801,17 @@ async fn t10_real_initial_profile_generation() {
         profile.tags,
         p.summary.chars().count(),
         p.interests.len()
+    );
+    // 维度③ 画像洞察质量：打印真模型生成的画像全文，供人评估洞察是否准确、克制、可用。
+    eprintln!("[t10][画像] summary = {}", p.summary);
+    eprintln!("[t10][画像] interests = {:?}", p.interests);
+    eprintln!("[t10][画像] communication_style = {}", p.communication_style);
+    eprintln!("[t10][画像] operation_goal = {}", p.operation_goal);
+    eprintln!(
+        "[t10][画像] last_commitment={:?} follow_up_policy={:?} profile_attributes={}",
+        profile.last_commitment,
+        profile.follow_up_policy,
+        fmt_doc(&profile.profile_attributes)
     );
 }
 
@@ -775,6 +932,97 @@ async fn t11_real_memory_consolidation_merges_candidates() {
     eprintln!(
         "[t11] memory_card_version={} candidate_status={}",
         memory.memory_card_version, reloaded.status
+    );
+    // 维度③ 记忆洞察质量：打印真模型把 3 条候选（含预算重复 + 画像事实）整理成的
+    // memoryCard 全文，供人评估去重/合并/克制是否到位（mock 测不到此）。
+    eprintln!(
+        "[t11][记忆] memory_card = {}",
+        serde_json::to_string(&memory.memory_card).unwrap_or_else(|e| format!("<序列化失败: {e}>"))
+    );
+    eprintln!(
+        "[t11][记忆] user_understanding = {}",
+        fmt_doc(&memory.user_understanding)
+    );
+    eprintln!(
+        "[t11][记忆] relationship_state = {} product_fit = {} next_action = {}",
+        fmt_doc(&memory.relationship_state),
+        fmt_doc(&memory.product_fit),
+        fmt_doc(&memory.next_action)
+    );
+}
+
+// ── T12 · 端到端可操控性（steerability）──────────────────────────────────────
+
+/// 验证运营方通过 `custom_agent_instructions`（最高优先级末位注入，覆盖 Soul+Policy）
+/// **正确操控**真模型的运营行为——用户最强诉求「是否能根据提示词/运营方案正确运营用户」。
+///
+/// 造一条带运营指令「推荐方案前必须先问预算」的 contact，再投一条**直接索要方案**的
+/// inbound（一个不先问预算的诱导）。验证点（契约层，弱断言不卡质量）：链路 Ok、
+/// run log status ∈ gateway 闭集、final_review_status 非空时 ∈ 闭集。
+///
+/// 质量层（本测试重点）：体检报告打印真模型话术全文 + 一行「指令遵守启发式」软诊断
+/// （是否含预算相关意图），仅打印不断言——真模型可能换措辞问预算，硬断言会误杀，
+/// 由人读 CI 日志判断遵守质量并据此迭代提示词。
+#[tokio::test]
+#[ignore]
+async fn t12_real_steerability_honors_custom_instructions() {
+    let llm = require_real_llm!();
+    let app = TestApp::start().await;
+    let mcp_server = start_mcp_mock_success().await;
+    let state = common::rebuild_app_state_with_real_llm(&app, llm, mcp_server.uri());
+
+    let mut contact = managed_contact("real_ops_user_t12");
+    contact.custom_agent_instructions =
+        Some("在推荐任何方案前，必须先主动询问对方的预算范围".to_string());
+    state.db.contacts().insert_one(&contact, None).await.expect("insert contact");
+
+    let inbound = make_inbound(
+        &contact,
+        "real_ops_msg_t12",
+        "你们能直接给我推荐个适合的方案吗？我想看看怎么搞。",
+    );
+    state.db.messages().insert_one(&inbound, None).await.expect("insert inbound");
+
+    handle_managed_message(&state, contact.clone(), &inbound)
+        .await
+        .expect("可操控性场景链路必须 Ok");
+
+    let log = state
+        .db
+        .agent_run_logs()
+        .find_one(doc! { "contact_wxid": &contact.wxid }, None)
+        .await
+        .expect("query run log")
+        .expect("必须落一行 run log");
+    assert!(
+        GATEWAY_STATUS_VALUES.contains(&log.status.as_str()),
+        "status 必须 ∈ gateway 闭集，实际 = {:?}",
+        log.status
+    );
+    assert!(
+        log.final_review_status.is_empty()
+            || FINAL_REVIEW_STATUS_VALUES.contains(&log.final_review_status.as_str()),
+        "final_review_status 非空时必须 ∈ 闭集，实际 = {:?}",
+        log.final_review_status
+    );
+
+    print_quality_report(&state, &contact.wxid, "t12-steerability").await;
+
+    // 软诊断（仅打印不断言）：真模型是否遵守「先问预算」指令。启发式 contains，
+    // 真模型换措辞（如"预算大概多少"/"价位区间"）也算命中；最终由人读话术判断。
+    let reply = state
+        .db
+        .decision_reviews()
+        .find_one(doc! { "contact_wxid": &contact.wxid }, None)
+        .await
+        .expect("query review")
+        .and_then(|r| r.reply_text)
+        .unwrap_or_default();
+    let honored = ["预算", "价位", "多少钱", "费用", "投入", "预期投入"]
+        .iter()
+        .any(|kw| reply.contains(kw));
+    eprintln!(
+        "[t12] 指令遵守启发式 honored={honored}（运营指令=推荐前先问预算；真模型是否主动问预算）"
     );
 }
 

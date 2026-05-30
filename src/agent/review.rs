@@ -321,6 +321,7 @@ pub(crate) fn classify_dual_gate(
 pub(crate) fn route_dual_gate(
     review: &mut DecisionReviewResult,
     runtime: &UserRuntimeParameters,
+    reply_text: &str,
 ) {
     let classification = classify_dual_gate(review, runtime);
     // 先按 review_passed 写一遍 approved（保持现有 PBT / 老调用点的语义不
@@ -339,6 +340,16 @@ pub(crate) fn route_dual_gate(
             if review.revision_direction.trim().is_empty() {
                 review.revision_direction = direction;
             }
+            // item ②：把本次回复的客观特征（问句数 / 字数 / 共情词密度）追加到
+            // 改写方向后，让单次改写有的放矢，而非只给机械模板。对 reviewer 自带
+            // 方向同样追加（事实标注不冲突，只补充客观信息）。
+            let features = reply_objective_features(reply_text);
+            if !features.is_empty() {
+                if !review.revision_direction.is_empty() {
+                    review.revision_direction.push(' ');
+                }
+                review.revision_direction.push_str(&features);
+            }
             review.needs_revision = true;
             for risk in risks {
                 if !review.risks.iter().any(|r| r == &risk) {
@@ -347,6 +358,30 @@ pub(crate) fn route_dual_gate(
             }
         }
     }
+}
+
+/// item ②：从候选回复正文提取廉价客观特征，供软闸改写指令使用。
+///
+/// 不做任何判罚——只把「问句数 / 字数 / 共情词命中数」这三个真模型自己难以
+/// 准确自测的客观量算出来，拼成一句中文提示追加到 revision_direction，让单次
+/// 改写有具体抓手（如"0 个问句、58 字、共情词 0"→ 加自然反问 / 精简 / 补共情）。
+/// 空回复返回空串（不追加）。
+fn reply_objective_features(reply_text: &str) -> String {
+    let text = reply_text.trim();
+    if text.is_empty() {
+        return String::new();
+    }
+    let questions = text.matches(['?', '？']).count();
+    let chars = text.chars().count();
+    const EMPATHY_WORDS: [&str; 10] = [
+        "理解", "明白", "辛苦", "不容易", "感受", "确实", "懂", "体会", "替你", "为你",
+    ];
+    let empathy: usize = EMPATHY_WORDS.iter().map(|w| text.matches(w).count()).sum();
+    format!(
+        "【本次回复客观特征】问句 {questions} 个、{chars} 字、共情词约 {empathy} 处——\
+         改写时据此调整：问句过少可加 1 个自然反问以推进对话；篇幅过长可精简到口语节奏；\
+         共情词偏少可先承接对方处境再给信息。"
+    )
 }
 
 /// Phase E / E2：reviewer 双脑并行分歧种类。
@@ -635,7 +670,7 @@ Review 模式: {}
         // 软闸失败时保持 approved=false（review_passed 行为）但同时写
         // needs_revision=true / revision_direction，让 finalize 在硬门未命中时
         // 把 soft-gate-only 失败矫正为 Approved，以触发 single-shot revision。
-        route_dual_gate(&mut review, runtime);
+        route_dual_gate(&mut review, runtime, &decision.reply_text);
 
         // Phase E / E2：reviewer 双脑并行——若 AppState 注入了第二 provider，再跑
         // 一份独立评分，与主 reviewer 走 [`detect_dual_reviewer_disagreement`]
@@ -645,7 +680,7 @@ Review 模式: {}
             Ok(second_value) => match serde_json::from_value::<DecisionReviewResult>(second_value)
             {
                 Ok(mut second_review) => {
-                    route_dual_gate(&mut second_review, runtime);
+                    route_dual_gate(&mut second_review, runtime, &decision.reply_text);
                     if let Some(disagreement) =
                         detect_dual_reviewer_disagreement(&review, &second_review, runtime)
                     {
@@ -680,7 +715,7 @@ Review 模式: {}
     };
     let mut review: DecisionReviewResult = serde_json::from_value(value)?;
     let _ = (decision, domain_config, knowledge_chunks, contact);
-    route_dual_gate(&mut review, runtime);
+    route_dual_gate(&mut review, runtime, &decision.reply_text);
 
     Ok(review)
 }
@@ -922,6 +957,44 @@ pub fn finalize_review_for_send(
                 status: GatewayStatusFinal::BlockedUnverifiedProductClaim,
                 pending_events,
             };
+        }
+    }
+
+    // ── item ①「先观测后判罚」：grounding 漏判探针（非拦截） ──
+    //
+    // R5.4 硬闸只在 reviewer 自报 requiresProductKnowledge=true 时触发。若
+    // reviewer 漏判（未自报），含「保证三个月回款」这类绝对化产品承诺、又无
+    // verified chunk 背书的回复会直接放行——这是质量红线上的真实缺口。
+    //
+    // 本探针**不改变任何发送判定**（不动 review.approved / final_review_status /
+    // 返回 status），只在「reviewer 未自报 ∧ 回复含硬承诺 ∧ 无 verified 背书」
+    // 三者同现时落一条 telemetry，量化 reviewer 到底多久漏判一次。位置在 R5.4
+    // 硬闸之后——若 reviewer 已自报、上方已 block/return，本探针不会执行，故不
+    // 与真阳性重复计数。有统计意义的漏判率证据后，再决定是否抬成硬闸（用户决策：
+    // 先观测，避免重新引入 2026-05-25 刻意删除的脆弱 string-marker 判罚）。
+    if !super::guards::claim_requires_product_knowledge(&review.claim_analysis)
+        && super::guards::reply_contains_commitment_claim(&decision.reply_text)
+    {
+        let verified =
+            super::guards::compute_verified_chunks(&decision.used_knowledge_ids, knowledge_chunks);
+        if verified.is_empty() {
+            let mut details = Document::new();
+            details.insert(
+                "reply_excerpt",
+                decision.reply_text.chars().take(80).collect::<String>(),
+            );
+            details.insert("used_knowledge_ids", decision.used_knowledge_ids.clone());
+            details.insert("knowledge_chunk_total", knowledge_chunks.len() as i64);
+            pending_events.push(PendingFinalizeEvent {
+                // 注：status "observe" 只是 AgentEvent.status 自由字符串字段值，
+                // 不是 gateway/finalReview 闭集枚举，不触发 R9.10.e 闭集校验。
+                kind: "grounding_probe_reviewer_missed".to_string(),
+                status: "observe".to_string(),
+                summary:
+                    "观测：回复含绝对化产品承诺且无 verified 背书，但 reviewer 未标 requiresProductKnowledge"
+                        .to_string(),
+                details,
+            });
         }
     }
 
@@ -1723,7 +1796,7 @@ mod dual_gate_classification_tests {
         let runtime = UserRuntimeParameters::default();
         let mut review = full_pass_review();
         review.scores.human_like = runtime.human_like_rewrite_below - 1;
-        route_dual_gate(&mut review, &runtime);
+        route_dual_gate(&mut review, &runtime, "好的，我来想想看");
         assert!(review.needs_revision, "软闸失败必须写 needs_revision");
         assert!(
             !review.revision_direction.trim().is_empty(),
@@ -1739,10 +1812,12 @@ mod dual_gate_classification_tests {
         let mut review = full_pass_review();
         review.scores.human_like = runtime.human_like_rewrite_below - 1;
         review.revision_direction = "reviewer 自己写的明确方向".to_string();
-        route_dual_gate(&mut review, &runtime);
-        assert_eq!(
-            review.revision_direction, "reviewer 自己写的明确方向",
-            "reviewer 已给方向时不可被机器化兜底覆盖"
+        route_dual_gate(&mut review, &runtime, "好的，我来想想看");
+        assert!(
+            review
+                .revision_direction
+                .starts_with("reviewer 自己写的明确方向"),
+            "reviewer 已给方向时其原文必须保留在前缀（item ② 仅追加客观特征，不覆盖）"
         );
         assert!(review.needs_revision);
     }
@@ -1753,7 +1828,7 @@ mod dual_gate_classification_tests {
         let mut review = full_pass_review();
         review.scores.hallucination_score = runtime.fact_risk_block_at + 1;
         let prev_dir = review.revision_direction.clone();
-        route_dual_gate(&mut review, &runtime);
+        route_dual_gate(&mut review, &runtime, "好的，我来想想看");
         assert!(!review.needs_revision, "硬闸失败不能触发 revision");
         assert_eq!(review.revision_direction, prev_dir);
         assert!(!review.approved);
@@ -1763,7 +1838,7 @@ mod dual_gate_classification_tests {
     fn route_dual_gate_keeps_all_pass_approved_true() {
         let runtime = UserRuntimeParameters::default();
         let mut review = full_pass_review();
-        route_dual_gate(&mut review, &runtime);
+        route_dual_gate(&mut review, &runtime, "好的，我来想想看");
         assert!(review.approved);
         assert!(!review.needs_revision);
     }
@@ -1775,7 +1850,7 @@ mod dual_gate_classification_tests {
         let runtime = UserRuntimeParameters::default();
         let mut review = full_pass_review();
         review.scores.pressure_risk = runtime.pressure_risk_block_at + 2;
-        route_dual_gate(&mut review, &runtime);
+        route_dual_gate(&mut review, &runtime, "好的，我来想想看");
         let mut decision = shouldreply_decision();
         let contact = finalize_contact();
         let outcome = finalize_review_for_send(
@@ -1808,7 +1883,7 @@ mod dual_gate_classification_tests {
         let runtime = UserRuntimeParameters::default();
         let mut review = full_pass_review();
         review.scores.hallucination_score = runtime.fact_risk_block_at + 1;
-        route_dual_gate(&mut review, &runtime);
+        route_dual_gate(&mut review, &runtime, "好的，我来想想看");
         let mut decision = shouldreply_decision();
         let contact = finalize_contact();
         let outcome = finalize_review_for_send(
@@ -1846,7 +1921,7 @@ mod dual_gate_classification_tests {
         let runtime = UserRuntimeParameters::default();
         let mut review = full_pass_review();
         review.scores.human_like = runtime.human_like_rewrite_below - 2;
-        route_dual_gate(&mut review, &runtime);
+        route_dual_gate(&mut review, &runtime, "好的，我来想想看");
         let mut decision = shouldreply_decision();
         let contact = finalize_contact();
         let outcome = finalize_review_for_send(
@@ -1877,7 +1952,7 @@ mod dual_gate_classification_tests {
         let runtime = UserRuntimeParameters::default();
         let mut review = full_pass_review();
         review.scores.knowledge_grounding_score = runtime.product_accuracy_block_below - 1;
-        route_dual_gate(&mut review, &runtime);
+        route_dual_gate(&mut review, &runtime, "好的，我来想想看");
         let mut decision = shouldreply_decision();
         let contact = finalize_contact();
         let outcome = finalize_review_for_send(
@@ -2027,6 +2102,95 @@ mod dual_gate_classification_tests {
         );
         assert_eq!(outcome.status, GatewayStatusFinal::Approved);
         assert!(outcome.review.approved);
+    }
+
+    // ── item ①「先观测」：grounding 漏判探针（非拦截）单测 ──
+
+    #[test]
+    fn finalize_emits_grounding_probe_on_reviewer_missed_commitment() {
+        // reviewer 未自报 requiresProductKnowledge，但回复含「一定能」硬承诺、
+        // 且无 verified chunk → 落 grounding_probe_reviewer_missed 观测事件，
+        // 但**不改变任何发送判定**（仍 Approved、approved=true、should_reply=true）。
+        let runtime = UserRuntimeParameters::default();
+        let mut review = full_pass_review();
+        review.claim_analysis = mongodb::bson::doc! { "requiresProductKnowledge": false };
+        let mut decision = shouldreply_decision();
+        decision.reply_text = "这个方案一定能帮您解决问题".to_string();
+        let contact = finalize_contact();
+        let outcome = finalize_review_for_send(
+            review,
+            &mut decision,
+            &runtime,
+            &contact,
+            &[],
+            Vec::new(),
+            "你们能解决我的问题吗",
+        );
+        // 零拦截：判定不变。
+        assert_eq!(outcome.status, GatewayStatusFinal::Approved);
+        assert!(outcome.review.approved);
+        assert!(decision.should_reply);
+        // 但落了观测事件。
+        assert!(outcome
+            .pending_events
+            .iter()
+            .any(|e| e.kind == "grounding_probe_reviewer_missed" && e.status == "observe"));
+    }
+
+    #[test]
+    fn finalize_no_grounding_probe_when_reviewer_already_flagged() {
+        // reviewer 已自报 requiresProductKnowledge=true → 走原 R5.4 硬闸 block，
+        // 观测探针不执行（不与真阳性重复计数）。
+        let runtime = UserRuntimeParameters::default();
+        let mut review = full_pass_review();
+        review.claim_analysis = mongodb::bson::doc! { "requiresProductKnowledge": true };
+        let mut decision = shouldreply_decision();
+        decision.reply_text = "这个方案一定能帮您解决问题".to_string();
+        let contact = finalize_contact();
+        let outcome = finalize_review_for_send(
+            review,
+            &mut decision,
+            &runtime,
+            &contact,
+            &[],
+            Vec::new(),
+            "你们能解决我的问题吗",
+        );
+        // R5.4 硬闸生效。
+        assert_eq!(
+            outcome.status,
+            GatewayStatusFinal::BlockedUnverifiedProductClaim
+        );
+        // 观测探针未执行：无 grounding_probe_reviewer_missed 事件，避免重复计数。
+        assert!(!outcome
+            .pending_events
+            .iter()
+            .any(|e| e.kind == "grounding_probe_reviewer_missed"));
+    }
+
+    #[test]
+    fn finalize_no_grounding_probe_when_reply_has_no_commitment() {
+        // reviewer 未自报 + 回复不含承诺词 → 探针不触发。
+        let runtime = UserRuntimeParameters::default();
+        let mut review = full_pass_review();
+        review.claim_analysis = mongodb::bson::doc! { "requiresProductKnowledge": false };
+        let mut decision = shouldreply_decision();
+        decision.reply_text = "好的，我先了解下你的具体情况".to_string();
+        let contact = finalize_contact();
+        let outcome = finalize_review_for_send(
+            review,
+            &mut decision,
+            &runtime,
+            &contact,
+            &[],
+            Vec::new(),
+            "你们能解决我的问题吗",
+        );
+        assert_eq!(outcome.status, GatewayStatusFinal::Approved);
+        assert!(!outcome
+            .pending_events
+            .iter()
+            .any(|e| e.kind == "grounding_probe_reviewer_missed"));
     }
 }
 
