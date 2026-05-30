@@ -2745,7 +2745,8 @@ fn normalize_for_anchor(s: &str) -> String {
 }
 
 pub(super) fn integrity_report_for_preview(raw_content: &str, chunks: &mut [Value]) -> Value {
-    let mut verified = 0;
+    // 红线「AI 永不自动 verify」：preview 路径恒 0 verified，anchor 命中只作审计线索。
+    let verified = 0;
     let mut needs_review = 0;
     let mut rejected = 0;
     let mut items = Vec::new();
@@ -2768,17 +2769,21 @@ pub(super) fn integrity_report_for_preview(raw_content: &str, chunks: &mut [Valu
             risks.push("存在安全事实或证据项，但没有可验证原文锚点".to_string());
         }
         let has_quote = !source_quote.trim().is_empty();
-        let status = if !anchors.is_empty() && risks.is_empty() {
-            verified += 1;
-            "verified"
-        } else if has_quote || (safe_claims.is_empty() && evidence_items.is_empty()) {
+        let anchored = !anchors.is_empty() && risks.is_empty();
+        // 红线「AI 永不自动 verify」：preview 与 apply handler（见
+        // import_operation_knowledge_apply / *_apply_chunked 落库前
+        // 无条件压回 needs_review）保持一致——anchor 命中只作审计线索
+        // （保留 anchors + confidence=90，前端「距离 verify 一步之遥」可用），
+        // integrityStatus 绝不直接 verified。光有声明却无源仍硬挡 rejected（更严方向）。
+        let status = if anchored || has_quote || (safe_claims.is_empty() && evidence_items.is_empty())
+        {
             needs_review += 1;
             "needs_review"
         } else {
             rejected += 1;
             "rejected"
         };
-        let confidence = if status == "verified" { 90 } else { 45 };
+        let confidence = if anchored { 90 } else { 45 };
         if let Some(object) = chunk.as_object_mut() {
             object.insert("sourceAnchors".to_string(), json!(anchors));
             object.insert("integrityStatus".to_string(), json!(status));
@@ -8429,6 +8434,52 @@ mod tests {
     fn passes_through_rejected_status() {
         let s = decide_auto_verify_status(true, true, 9, 7, "rejected");
         assert_eq!(s, "rejected");
+    }
+
+    /// 红线「AI 永不自动 verify」：preview 路径即使 sourceQuote 完整命中原文锚点，
+    /// integrityStatus 也只能到 needs_review，绝不能直接 verified（K5 真模型暴露）。
+    #[test]
+    fn preview_anchor_match_never_auto_verifies() {
+        let raw = "WechatAgent 企业版提供 7x24 小时自动应答，支持私域多账号统一纳管。";
+        let mut chunks = vec![json!({
+            "title": "企业版能力",
+            "sourceQuote": "WechatAgent 企业版提供 7x24 小时自动应答",
+            "safeClaims": ["提供 7x24 小时自动应答"],
+            "evidenceItems": ["官网服务说明"]
+        })];
+        let report = integrity_report_for_preview(raw, &mut chunks);
+        // 报告聚合：verified 恒 0。
+        assert_eq!(report["verified"], json!(0), "preview 聚合 verified 必须恒 0");
+        // 单 chunk：anchor 命中 → 保留锚点+confidence 90 作审计线索，但状态压回 needs_review。
+        assert_eq!(
+            chunks[0]["integrityStatus"],
+            json!("needs_review"),
+            "anchor 命中也只能 needs_review，绝不 verified"
+        );
+        assert_eq!(
+            chunks[0]["confidenceScore"],
+            json!(90),
+            "anchor 命中保留 confidence=90 审计线索"
+        );
+        assert!(
+            chunks[0]["sourceAnchors"].as_array().map_or(false, |a| !a.is_empty()),
+            "anchor 命中保留 sourceAnchors 审计线索"
+        );
+    }
+
+    /// preview：有声明/证据但完全无原文引用与锚点 → rejected（更严方向，硬挡）。
+    #[test]
+    fn preview_claim_without_source_is_rejected() {
+        let raw = "本文与产品声明无关的纯背景介绍。";
+        let mut chunks = vec![json!({
+            "title": "无源声明",
+            "sourceQuote": "",
+            "safeClaims": ["保证三天见效"],
+            "evidenceItems": ["内部数据"]
+        })];
+        let report = integrity_report_for_preview(raw, &mut chunks);
+        assert_eq!(chunks[0]["integrityStatus"], json!("rejected"));
+        assert_eq!(report["verified"], json!(0));
     }
 
     /// 波 D2：未知 model_status 默认 needs_review，不会偷渡为 verified。
