@@ -180,17 +180,45 @@ jobs:
           REAL_LLM_VISION_MODEL: mimo-v2.5
         run: cargo test --no-fail-fast --test real_llm_knowledge -- --ignored --nocapture
 
-  # 运营 agent 全能力 smoke 独立成 job：原先它在 real-llm job 里排第 4 位，
-  # 前面的 smoke/knowledge/quality 套件（real_llm_smoke ~161s + real_llm_knowledge
-  # ~755s + knowledge_quality）会吃掉 45min 墙的绝大部分，导致运营多轮套件
-  # （T4–T17，含 K=3 重复采样 judge，每次 judge 调用 ~54s）一开跑就被墙腰斩
-  # （round-4 只跑到 t16A-turn1 就被 cancel）。拆成并行 job 后它独享一整个 45min
-  # 墙，与知识库套件在不同 runner 上并发，互不饿死。MCP 仍是桩（绝不真发微信）。
+  # 运营 agent 全能力 smoke（real_llm_ops_smoke.rs t4–t18）。原先是**单 job 跑全部
+  # 15 个测试**（cargo 默认进程内并行 + 每个多轮弧 t15/t16/t17 各发数十次 LLM 调用 +
+  # K=3 judge 采样），15 个 #[tokio::test] 同时冲同一把 MiMo key → 瞬时请求峰值远超
+  # 上游配额 → 体检显示 9/15 全因 `LlmUnavailable rate_limited`(HTTP 429) panic（**非
+  # 回归、非断言失败**），且把 t14_real_profile_churn_under_weak_signal（画像写侧弱信号
+  # 体检，cautious-profiling 跨样本数据的唯一来源）在 assert 前就打挂——仪器把自己的
+  # 结论给屏蔽了。
+  #
+  # 兄弟套件（knowledge-quality 7 Q、adversarial 7 弧）早已用「按测试名 matrix 拆并行 +
+  # max-parallel:2」根治同一 429 风暴，本 run 它们 7/7 全绿；唯独 ops-smoke 是漏网的
+  # 单体 job。这里把它对齐成同一形态：每个测试一个独立 matrix job，max-parallel:2 把跨
+  # job 瞬时并发压到 ~2，每个 job 进程内只跑一个测试（并发塌到该测试自身的串行调用）。
+  # 队列中的 matrix job 不启动 timeout 计时，故每测试仍独享完整 45min 墙，限流只推迟
+  # 开始不吃墙。零 src/ 改动（agent 冻结），纯仪器抗 429。MCP 仍是桩（绝不真发微信）。
   real-llm-ops:
-    name: Real-LLM ops smoke (运营 agent 多轮 / MCP 桩)
+    name: Real-LLM ops smoke (${{ matrix.t }} / MCP 桩)
     runs-on: ubuntu-latest
     continue-on-error: true
     timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        t:
+          - t4_real_follow_up_task_runs_and_expiry_blocks
+          - t5_real_state_machine_transition_stays_in_dictionary
+          - t6_real_unverified_product_claim_is_gated
+          - t7_real_multi_scenario_generality
+          - t8_real_autonomy_mode_stays_in_ai_internal_set
+          - t9_real_user_reaction_outcome_in_closed_set
+          - t10_real_initial_profile_generation
+          - t11_real_memory_consolidation_merges_candidates
+          - t12_real_steerability_honors_custom_instructions
+          - t13_real_persona_differentiation
+          - t14_real_profile_churn_under_weak_signal
+          - t15_real_multiturn_deal_arc
+          - t16_real_multiturn_persona_cross
+          - t17_real_multiturn_boundary_stress
+          - t18_real_warm_start_operator_seeded_arc
     env:
       REAL_LLM_API_KEY: ${{ secrets.REAL_LLM_API_KEY }}
     steps:
@@ -214,12 +242,12 @@ jobs:
         if: ${{ env.REAL_LLM_API_KEY != '' }}
         uses: Swatinem/rust-cache@v2
 
-      # 运营 agent 全能力 smoke（real_llm_ops_smoke.rs T4–T17）：FollowUp 任务 /
-      # 状态机字典闭集 / 未验证产品声明闸门 / 多场景通用性 / autonomy 闭集 /
-      # 用户反应 outcome 闭集 / 冷启动初始画像 / 长期记忆整理 + 多轮深弧/千人千面/
-      # 边界压测（t15/t16/t17）+ 科学可重复 judge（K=3 采样并发）+ 全能力逐轮快照。
+      # 单个运营 agent 能力测试：FollowUp 任务 / 状态机字典闭集 / 未验证产品声明闸门 /
+      # 多场景通用性 / autonomy 闭集 / 用户反应 outcome 闭集 / 冷启动初始画像 / 长期
+      # 记忆整理 / 可操控性 / 千人千面 / 画像写侧弱信号体检（t14）/ 多轮深弧 + 边界
+      # 压测（t15/t16/t17）/ 暖启动种子弧（t18）+ K=3 采样并发 judge + 全能力逐轮快照。
       # REAL_LLM_JUDGE=1 打开 judge 诊断。MCP 仍是桩（绝不真发微信）。
-      - name: cargo test --test real_llm_ops_smoke -- --ignored --nocapture
+      - name: cargo test --test real_llm_ops_smoke ${{ matrix.t }}
         if: ${{ env.REAL_LLM_API_KEY != '' }}
         env:
           RUSTFLAGS: ""
@@ -227,7 +255,7 @@ jobs:
           REAL_LLM_MODEL: mimo-v2.5-pro
           REAL_LLM_VISION_MODEL: mimo-v2.5
           REAL_LLM_JUDGE: "1"
-        run: cargo test --no-fail-fast --test real_llm_ops_smoke -- --ignored --nocapture
+        run: cargo test --no-fail-fast --test real_llm_ops_smoke ${{ matrix.t }} -- --ignored --nocapture
 
   # 知识库内容质量套件（real_llm_knowledge_quality.rs Q1–Q7）——「裁判校准层」重构后
   # 升级为双 checkpoint 裁判团（mimo-v2.5-pro + mimo-v2.5）+ 跨裁判分歧效度门 + 每 Q
