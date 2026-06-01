@@ -106,6 +106,8 @@ mod tests {
     fn empty_split_is_not_ok() {
         let r = generalization_report(&[], &[0.9], 0.7, 0.18);
         assert!(r.empty_split);
+        // 空 train 不得借 floor flag 顺带触发：floor flag 带 !is_empty() 守卫，空 split 只走 empty_split。
+        assert!(!r.train_below_floor, "空 split 的 floor flag 必须为 false（守卫隔离）");
         assert!(!r.ok(), "空 train split 不能算过");
     }
 

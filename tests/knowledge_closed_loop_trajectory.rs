@@ -54,11 +54,13 @@ fn seed_chunk(title: &str, body_terms: &str) -> OperationKnowledgeChunk {
 }
 
 /// 清空本 ws 的 chunk，保证 catalog 干净。
+/// 字段名用 snake_case `workspace_id`——OperationKnowledgeChunk 无 rename_all，
+/// 落库即 snake_case（与 list_catalog/insert/verify 一致）；用 camelCase 会匹配 0 条。
 async fn reset_ws(app: &TestApp) {
     app.state
         .db
         .operation_knowledge_chunks()
-        .delete_many(doc! { "workspaceId": WS }, None)
+        .delete_many(doc! { "workspace_id": WS }, None)
         .await
         .expect("clean ws_closed_loop chunks");
 }
@@ -103,11 +105,10 @@ async fn write_then_recall_preserves_baseline_and_adds_new() {
     let app = TestApp::start().await;
     reset_ws(&app).await;
 
-    // 基线：两条已有知识。
+    // 基线：两条已有知识（base_b 作无关噪声，验证不回归不依赖单条）。
     let base_a = seed_chunk("已读不回唤回三阶段", "已读不回 唤回 沉默客户 激活");
     let base_b = seed_chunk("新客开场白模板", "新客户 首次 开场白 破冰");
     let base_a_hex = base_a.id.expect("oid").to_hex();
-    let base_b_hex = base_b.id.expect("oid").to_hex();
     for c in [&base_a, &base_b] {
         app.state.db.operation_knowledge_chunks().insert_one(c, None).await.expect("insert base");
     }
@@ -128,7 +129,6 @@ async fn write_then_recall_preserves_baseline_and_adds_new() {
     assert!(after.contains(&base_a_hex), "写入后基线命中 base_a 不应丢失：{after:?}");
     // 新内容可召回：added 出现。
     assert!(after.contains(&added_hex), "新增 chunk 应可被召回：{after:?}");
-    let _ = base_b_hex;
 }
 
 /// 门 1b：SUPERSEDE 旧降新升。旧 chunk 被 superseded_by 指向新 chunk → trust×0.1 →
@@ -168,10 +168,13 @@ async fn supersede_demotes_old_below_new() {
     let still_exists = app.state.db.operation_knowledge_chunks()
         .find_one(doc! { "_id": old.id.unwrap() }, None).await.expect("find old").is_some();
     assert!(still_exists, "SUPERSEDE 不得物理删除旧 chunk");
-    // 新版必须排在旧版之前（旧版 trust×0.1 降权）。
+    // 新版必须排在旧版之前（旧版 trust×0.1 降权）。降权只重排不剔除——旧版必须仍在
+    // catalog 候选里（knowledge_agent rank_key 不变量：降格 chunk 不被过滤掉）。
     match (pos_new, pos_old) {
         (Some(pn), Some(po)) => assert!(pn < po, "新版应排在旧版之前：new@{pn} old@{po} ids={ids:?}"),
-        (Some(_), None) => { /* 旧版被降到 catalog 尾部之外也可接受（更强的降权） */ }
+        (Some(_), None) => panic!(
+            "SUPERSEDE 只应降权重排，旧版不得被剔除出 catalog（rank_key 不变量）：ids={ids:?}"
+        ),
         _ => panic!("新版 chunk 必须可召回：ids={ids:?}"),
     }
 }
