@@ -295,6 +295,13 @@ jobs:
     timeout-minutes: 45
     strategy:
       fail-fast: false
+      # max-parallel 限流：7 条弧 + 并行 agent 的 real-llm/ops/quality 三 job 共用
+      # 同一把 MiMo key，若 7 弧全并发各自 K=3 judge 采样(join_all 并发)+红队
+      # 多轮生成同时打 MiMo，瞬时并发 20-35 请求→上游 HTTP 429 风暴（round-4
+      # 实测 price/fake_emotion 弧 turn-1 后红队下一击 429 收弧、校准 2 条 429
+      # median 丢采样）。限并发到 2 把瞬时请求压到 ~10 以内。队列中的 matrix job
+      # 不启动 timeout 计时，故每弧仍独享完整 45min 墙，限流只推迟开始不吃墙。
+      max-parallel: 2
       matrix:
         arc:
           - t_judge_calibration
