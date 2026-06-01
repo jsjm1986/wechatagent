@@ -88,3 +88,38 @@ async fn smoke_catalog_returns_seeded_chunk() {
     let ids = catalog_ids(&app, "客户嫌价格贵怎么办").await;
     assert!(ids.contains(&hex), "种子 chunk 应出现在 catalog：{ids:?}");
 }
+
+/// 门 1a：写入新 chunk 后，基线命中的 chunk 仍在 catalog（不回归），且新 chunk 可召回。
+#[tokio::test]
+#[ignore]
+async fn write_then_recall_preserves_baseline_and_adds_new() {
+    let app = TestApp::start().await;
+    reset_ws(&app).await;
+
+    // 基线：两条已有知识。
+    let base_a = seed_chunk("已读不回唤回三阶段", "已读不回 唤回 沉默客户 激活");
+    let base_b = seed_chunk("新客开场白模板", "新客户 首次 开场白 破冰");
+    let base_a_hex = base_a.id.expect("oid").to_hex();
+    let base_b_hex = base_b.id.expect("oid").to_hex();
+    for c in [&base_a, &base_b] {
+        app.state.db.operation_knowledge_chunks().insert_one(c, None).await.expect("insert base");
+    }
+
+    // 基线召回快照。
+    let before = catalog_ids(&app, "客户已读不回怎么唤回").await;
+    assert!(before.contains(&base_a_hex), "基线应命中 base_a：{before:?}");
+
+    // 维护 agent 新增一条相关知识（draft→verified 路径在 Task 6 验证；此处直接种 verified）。
+    let added = seed_chunk("已读不回唤回话术升级版", "已读不回 唤回 二次激活 限时优惠");
+    let added_hex = added.id.expect("oid").to_hex();
+    app.state.db.operation_knowledge_chunks().insert_one(&added, None).await.expect("insert added");
+
+    // 写入后再召回（live，无索引重建）。
+    let after = catalog_ids(&app, "客户已读不回怎么唤回").await;
+
+    // 不回归：基线命中的 base_a 仍在。
+    assert!(after.contains(&base_a_hex), "写入后基线命中 base_a 不应丢失：{after:?}");
+    // 新内容可召回：added 出现。
+    assert!(after.contains(&added_hex), "新增 chunk 应可被召回：{after:?}");
+    let _ = base_b_hex;
+}
