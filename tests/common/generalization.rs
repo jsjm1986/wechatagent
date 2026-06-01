@@ -61,7 +61,7 @@ pub fn generalization_report(
         train_n: train.len(),
         holdout_n: holdout.len(),
         empty_split,
-        // 空 split 时 mean=0，floor 检查会顺带为真；但 empty_split 已独立兜底。
+        // floor 标志带 !is_empty() 守卫：只在"有数据且偏低"时为真；空 split 由 empty_split 独立兜底，语义不串。
         train_below_floor: !train.is_empty() && train_mean < floor,
         holdout_below_floor: !holdout.is_empty() && holdout_mean < floor,
         gap_exceeded: !empty_split && gap > max_gap,
@@ -95,8 +95,10 @@ mod tests {
 
     #[test]
     fn fails_when_train_below_floor() {
-        let r = generalization_report(&[0.6], &[0.62], 0.7, 0.18);
-        assert!(r.train_below_floor);
+        // holdout 高于 floor，确保只有 train_below_floor 单独触发（隔离该 flag）。
+        let r = generalization_report(&[0.6], &[0.75], 0.7, 0.5);
+        assert!(r.train_below_floor, "train 0.6<0.7 应触发");
+        assert!(!r.holdout_below_floor, "holdout 0.75≥0.7 不应触发");
         assert!(!r.ok());
     }
 
