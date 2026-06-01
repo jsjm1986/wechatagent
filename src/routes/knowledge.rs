@@ -3164,15 +3164,28 @@ pub async fn build_operation_knowledge_completeness(
             needs_review
         ));
     }
+    // 维度认知状态对象：verifiedFact / methodologyOnly / pendingDraft 三个**独立**布尔
+    // + 派生 state 摘要。pendingDraft 与 verifiedFact 正交——同一维度可同时「有已审定
+    // 客观事实」且「有未审定草稿」（如企业版报价已审定、旗舰版报价仍是草稿），扁平单
+    // bool 无法表达这种共存态，会与 gaps 自相矛盾（coverage 说完全覆盖、gap 却说有草稿）。
+    // 这是抽象的认知状态表达问题，对任意语料成立，与具体是报价/SLA/案例无关。
+    let cov_state = |verified_fact: bool| {
+        json!({
+            "verifiedFact": verified_fact,
+            "methodologyOnly": false,
+            "pendingDraft": false,
+            "state": if verified_fact { "verified" } else { "missing" }
+        })
+    };
     let fallback = json!({
         "answeringMode": fallback_mode,
         "summary": if verified == 0 { "当前没有已验证知识切片，Agent 只能做关系维护和需求澄清。" } else { "当前存在已验证知识切片，Agent 可在证据边界内回答事实问题。" },
         "coverage": {
-            "capability": verified > 0,
-            "pricing": false,
-            "caseEvidence": evidence > 0,
-            "effectClaims": evidence > 0,
-            "deliveryBoundary": verified > 0
+            "capability": cov_state(verified > 0),
+            "pricing": cov_state(false),
+            "caseEvidence": cov_state(evidence > 0),
+            "effectClaims": cov_state(evidence > 0),
+            "deliveryBoundary": cov_state(verified > 0)
         },
         "gaps": fallback_gaps
     });
@@ -3183,11 +3196,11 @@ pub async fn build_operation_knowledge_completeness(
   "answeringMode": "relationship_only | product_safe | fully_supported",
   "summary": "",
   "coverage": {{
-    "capability": false,
-    "pricing": false,
-    "caseEvidence": false,
-    "effectClaims": false,
-    "deliveryBoundary": false
+    "capability":      {{ "verifiedFact": false, "methodologyOnly": false, "pendingDraft": false }},
+    "pricing":         {{ "verifiedFact": false, "methodologyOnly": false, "pendingDraft": false }},
+    "caseEvidence":    {{ "verifiedFact": false, "methodologyOnly": false, "pendingDraft": false }},
+    "effectClaims":    {{ "verifiedFact": false, "methodologyOnly": false, "pendingDraft": false }},
+    "deliveryBoundary":{{ "verifiedFact": false, "methodologyOnly": false, "pendingDraft": false }}
   }},
   "gaps": []
 }}
@@ -3202,17 +3215,20 @@ pub async fn build_operation_knowledge_completeness(
   2. 仅方法论/话术：只讲怎么做、怎么沟通、价值主张、谈判策略，不含可对客的客观事实数字；
   3. 未审定草稿：相关具体信息只存在于 needs_review 切片中，审定前不可作为事实依据；
   4. 缺失：知识库里没有该维度的任何内容。
-  **只有第 1 类「已验证客观事实」才能让对应 coverage 维度为 true**；方法论/话术、未审定草稿、缺失一律视为该维度尚未被事实覆盖（coverage=false）。此判据对 pricing / caseEvidence / effectClaims / deliveryBoundary / capability 每一维都同样适用，不得对某一维放宽或收紧。
-- 各 coverage 维度命中锚点（满足"已验证客观事实"时即应判 true，**不要漏判**）：
+- coverage 的每个维度是一个**认知状态对象**，三个布尔位**相互独立、可同时为 true**，必须如实并存标注（不是单选）：
+  - "verifiedFact": 该维度存在第 1 类「已验证客观事实」时为 true；
+  - "methodologyOnly": 该维度存在第 2 类「仅方法论/话术」内容时为 true；
+  - "pendingDraft": 该维度的具体信息存在于 needs_review 草稿中（第 3 类）时为 true。
+  **关键：同一维度可以既 verifiedFact=true 又 pendingDraft=true**（例如企业版报价已审定为客观事实、旗舰版报价仍是未审定草稿，则 pricing 的 verifiedFact 与 pendingDraft 都为 true）。绝不能因为有 verified 事实就把 pendingDraft 抹成 false，也绝不能因为有草稿就把已具备的 verifiedFact 抹成 false——两个方向的漏标都要扣分。三位全 false 表示该维度缺失（第 4 类）。此判据对 pricing / caseEvidence / effectClaims / deliveryBoundary / capability 每一维都同样适用。
+- 各 coverage 维度判 verifiedFact=true 的命中锚点（满足"已验证客观事实"时即应判 true，**不要漏判**）：
   - capability：有 verified 切片陈述产品/服务"能做什么"的具体能力或功能事实。
-  - pricing：有 verified 切片含具体报价/计费/套餐金额（注意：仅 needs_review 草稿里的报价不算，对应维度判 false 并入 gap）。
+  - pricing：有 verified 切片含具体报价/计费/套餐金额（注意：仅 needs_review 草稿里的报价不计入 verifiedFact，而应置 pendingDraft=true 并入 gap）。
   - caseEvidence：有 verified 切片描述**具体客户案例/实施成效**（含可核验的主体、场景或落地结果），即判 true。
   - effectClaims：有 verified 切片含**可核验的效果数据/量化成果**（如转化率提升、响应时长变化等具体数字），即判 true。
   - deliveryBoundary：有 verified 切片陈述交付方式/SLA/可用性/部署边界等具体条款。
-  既要避免把方法论/草稿误判为 true，也要避免把已具备的"已验证客观事实"漏判为 false——两个方向的误差都要扣分。
-- needs_review 切片**尚未审定**，在审定前绝不可作为产品/服务事实依据；若其涉及关键事实维度，必须在 gaps 中写明「该主题存在未核实草稿，需运营审定」，且**不得**因草稿存在就判 fully_supported。
+- needs_review 切片**尚未审定**，在审定前绝不可作为产品/服务事实依据；若其涉及关键事实维度，必须把对应维度 pendingDraft 置 true、在 gaps 中写明「该主题存在未核实草稿，需运营审定」，且**不得**因草稿存在就判 fully_supported。
 - summary 字段必须如实反映知识库现状：对任一关键维度，若 verified 侧只有方法论/话术或仅有未审定草稿，summary 要点明「具备相关方法论但缺已审定的客观事实」，不要笼统说「可回答产品事实」。
-- gaps 必须有指导价值：每条 gap 是一句自含的整改指令，需同时写清三要素——①哪个事实维度；②它当前处于哪种认知状态（缺失 / 仅未审定草稿 / 仅方法论话术）；③运营下一步该做什么（补采可验证事实 / 审定指定草稿 / 标注为不可对客）。**禁止**输出「知识不足」「需完善」之类无维度、无状态、无动作的笼统空话。每个未达 verified 客观事实的维度都要各有一条对应 gap，不要把多维并成一句含糊带过。
+- gaps 必须有指导价值：每条 gap 是一句自含的整改指令，需同时写清三要素——①哪个事实维度；②它当前处于哪种认知状态（缺失 / 仅未审定草稿 / 仅方法论话术 / 已有事实但另有待审定草稿）；③运营下一步该做什么（补采可验证事实 / 审定指定草稿 / 标注为不可对客）。**禁止**输出「知识不足」「需完善」之类无维度、无状态、无动作的笼统空话。每个未达 verified 客观事实、或虽有事实但仍存在待审定草稿的维度都要各有一条对应 gap，不要把多维并成一句含糊带过。
 
 统计：total={} verified={} anchored={} evidence={} needsReview={}
 
