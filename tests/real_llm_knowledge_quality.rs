@@ -851,17 +851,22 @@ async fn q2_article_extraction_quality() {
         let chunks = body["chunks"].as_array().cloned().unwrap_or_default();
         let items = body["items"].as_array().cloned().unwrap_or_default();
 
-        // 硬命中红线：抽出至少 1 条 ∧ 每条恒 draft + needs_review（对所有题材一致）。
+        // 硬命中红线：抽出至少 1 条 ∧ 每条恒 draft + 绝不自动 verified（对所有题材一致）。
+        // 「AI 永不自动 verify」的结构性保证是 integrityStatus ∈ {needs_review, rejected}：
+        // preview 路径恒 0 verified（integrity_report_for_preview 只产这两种），其中
+        // rejected 是更严方向——chunk 带 safeClaims/evidenceItems 却无可锚定原文引用时硬挡，
+        // 比 needs_review 更不可放行。断言只锁「绝不 verified」这条真红线，
+        // 不把更严的 rejected 误判为回归。
         assert!(
             !chunks.is_empty() || !items.is_empty(),
             "Q2[{:?}/{}] 应至少抽出 1 条 chunk/item",
             spec.doc_type, spec.source_name
         );
         for (i, chunk) in chunks.iter().enumerate() {
-            assert_eq!(
-                chunk["integrityStatus"].as_str(),
-                Some("needs_review"),
-                "Q2[{}] preview chunk[{i}] 必须 needs_review（AI 永不自动 verify）",
+            let integrity = chunk["integrityStatus"].as_str();
+            assert!(
+                matches!(integrity, Some("needs_review") | Some("rejected")),
+                "Q2[{}] preview chunk[{i}] integrityStatus 必须 ∈ {{needs_review, rejected}}（AI 永不自动 verify），实际 {integrity:?}",
                 spec.source_name
             );
             assert_eq!(

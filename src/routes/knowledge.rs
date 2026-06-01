@@ -3013,6 +3013,26 @@ pub(super) async fn build_operation_knowledge_catalog(
     }))
 }
 
+/// 完整度审计 `answeringMode` 的**确定性认知状态闸**（方法论点 6：AI 永不自动
+/// verify；草稿审定前不可作为事实依据）。
+///
+/// `fully_supported` 是最强断言——语义是「关键事实维度都已有 verified 客观事实
+/// 支撑」。只要知识库里还存在任何 `needs_review` 待审定草稿，该断言就不成立：
+/// 草稿尚未审定、不可作为产品/服务事实依据，知识库就不处于「完全支撑」状态，
+/// 至多 `product_safe`（有 verified 证据可在边界内回答，但仍有待审定知识）。
+///
+/// 这是抽象的认知状态规则，对**任意语料**成立（与具体是报价/SLA/案例无关），
+/// 放在代码层兜底，不依赖 LLM 自觉——LLM 在 verified 丰富时常无视草稿误判
+/// `fully_supported`。`relationship_only`（无 verified）与 `product_safe` 不上调，
+/// 只把过强的 `fully_supported` 在有草稿时降一级。纯函数，cfg(test) 锁。
+fn clamp_answering_mode(mode: &str, needs_review: u64) -> String {
+    if mode == "fully_supported" && needs_review > 0 {
+        "product_safe".to_string()
+    } else {
+        mode.to_string()
+    }
+}
+
 pub async fn build_operation_knowledge_completeness(
     state: &AppState,
     workspace_id: &str,
@@ -3202,6 +3222,10 @@ pub async fn build_operation_knowledge_completeness(
         .generate_json(system, &user)
         .await
         .unwrap_or(fallback);
+    let resolved_mode =
+        json_string(&audit, "answeringMode").unwrap_or_else(|| fallback_mode.to_string());
+    // 认知状态闸：有任何待审定草稿就绝不宣称 fully_supported（见 [`clamp_answering_mode`]）。
+    let answering_mode = clamp_answering_mode(&resolved_mode, needs_review);
     Ok(json!({
         "totalChunks": total,
         "verifiedChunks": verified,
@@ -3209,7 +3233,7 @@ pub async fn build_operation_knowledge_completeness(
         "evidenceChunks": evidence,
         "needsReviewChunks": needs_review,
         "pendingReview": pending,
-        "answeringMode": json_string(&audit, "answeringMode").unwrap_or_else(|| fallback_mode.to_string()),
+        "answeringMode": answering_mode,
         "summary": json_string(&audit, "summary").unwrap_or_default(),
         "coverage": audit.get("coverage").cloned().unwrap_or_else(|| json!({})),
         "gaps": json_string_list(&audit, "gaps").unwrap_or_default()
@@ -8467,6 +8491,25 @@ pub async fn delete_ingest_source(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 认知状态闸：有任何待审定草稿（needs_review>0）→ fully_supported 必降为
+    /// product_safe；草稿清零后才允许 fully_supported。
+    #[test]
+    fn clamp_answering_mode_demotes_fully_supported_when_drafts_pending() {
+        assert_eq!(clamp_answering_mode("fully_supported", 1), "product_safe");
+        assert_eq!(clamp_answering_mode("fully_supported", 7), "product_safe");
+        assert_eq!(clamp_answering_mode("fully_supported", 0), "fully_supported");
+    }
+
+    /// 认知状态闸：product_safe / relationship_only 永不被上调或改写（只降不升）。
+    #[test]
+    fn clamp_answering_mode_never_upgrades_weaker_modes() {
+        for mode in ["product_safe", "relationship_only"] {
+            for nr in [0u64, 1, 9] {
+                assert_eq!(clamp_answering_mode(mode, nr), mode);
+            }
+        }
+    }
 
     /// 波 D2：4 项证据齐 → verified。
     #[test]

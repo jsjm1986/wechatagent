@@ -8,8 +8,8 @@
 //! 2. **空 corpus**：workspace 无任何 verified chunk → 立即返回
 //!    "知识库无相关内容。"，0 LLM 调用，rounds_used=0。
 //! 3. **rounds_used 真实上报**：mock LLM 始终输出 `list_catalog`（不收敛到
-//!    answer），3 轮耗尽后兜底 answer 必须 `truncated=true`、`rounds_used=3`、
-//!    LLM 真实被调用 3 次（非 0 / max_rounds 默认值）。
+//!    answer），4 轮耗尽后兜底 answer 必须 `truncated=true`、`rounds_used=4`、
+//!    LLM 真实被调用 4 次（非 0 / max_rounds 默认值）。
 //! 4. **未 verified 不可见**：corpus 仅 `integrity_status=needs_review` chunk
 //!    → catalog 必为空，行为与场景 2 一致（放在 list_catalog/open_chunk
 //!    的 verified-only 守门上验证）。
@@ -145,7 +145,7 @@ async fn ask_returns_no_relevant_when_corpus_empty() {
     assert_eq!(first.get_i32("returned").ok(), Some(0));
 }
 
-/// 场景 3：LLM 始终不 answer → 兜底 truncated；rounds_used=3 反映真实轮数，
+/// 场景 3：LLM 始终不 answer → 兜底 truncated；rounds_used=4 反映真实轮数，
 /// 而不是默认值或 max_rounds 常量。
 #[tokio::test]
 #[ignore]
@@ -155,8 +155,8 @@ async fn ask_falls_back_to_truncated_when_llm_never_emits_answer() {
     let chunk = verified_chunk("方法论 A", "正文 A");
     insert(&app, &[chunk]).await;
 
-    // 三轮都返回 list_catalog（不收敛 answer）。第 4 轮不会发生：MAX_ROUNDS=3。
-    for _ in 0..3 {
+    // 四轮都返回 list_catalog（不收敛 answer）。第 5 轮不会发生：MAX_ROUNDS=4。
+    for _ in 0..4 {
         app.llm.push_response(json!({
             "action": "list_catalog",
             "filter": {},
@@ -167,12 +167,12 @@ async fn ask_falls_back_to_truncated_when_llm_never_emits_answer() {
         .await
         .expect("answer");
 
-    assert!(result.truncated, "3 轮未 answer 必须 truncated=true");
+    assert!(result.truncated, "4 轮未 answer 必须 truncated=true");
     assert_eq!(
-        result.rounds_used, 3,
-        "rounds_used 必须如实上报 3，而不是 0/max_rounds 占位"
+        result.rounds_used, 4,
+        "rounds_used 必须如实上报 4，而不是 0/max_rounds 占位"
     );
-    assert_eq!(app.llm.calls(), 3, "LLM 应正好被调 max_rounds 次");
+    assert_eq!(app.llm.calls(), 4, "LLM 应正好被调 max_rounds 次");
     assert!(
         result.cited_chunk_ids.is_empty(),
         "未 open 任何 chunk 时兜底 cited 为空"

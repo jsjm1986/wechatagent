@@ -13,7 +13,7 @@
 //!    Step(open_chunk) → Step(answer) → Final → close。
 //! 2. **空 corpus**：returned=0 → 立即 Step(list_catalog) → Final（answer="知识库
 //!    无相关内容。"）→ close。0 LLM 调用。
-//! 3. **truncated**：3 轮 list_catalog 始终不 answer → 末尾 Step(answer truncated=true)
+//! 3. **truncated**：4 轮 list_catalog 始终不 answer → 末尾 Step(answer truncated=true)
 //!    → Final（truncated=true）→ close。
 //!
 //! `#[ignore]` 守门：依赖 testcontainers MongoDB，CI 用 `cargo test -- --ignored`。
@@ -213,7 +213,7 @@ async fn stream_emits_final_immediately_when_corpus_empty() {
     );
 }
 
-/// 场景 3：3 轮 list_catalog 不收敛 → 末尾 Step(answer truncated=true) → Final(truncated=true)。
+/// 场景 3：4 轮 list_catalog 不收敛 → 末尾 Step(answer truncated=true) → Final(truncated=true)。
 #[tokio::test]
 #[ignore]
 async fn stream_emits_truncated_when_llm_never_emits_answer() {
@@ -222,7 +222,7 @@ async fn stream_emits_truncated_when_llm_never_emits_answer() {
     let chunk = verified_chunk("方法论 A", "正文 A");
     insert(&app, &[chunk]).await;
 
-    for _ in 0..3 {
+    for _ in 0..4 {
         app.llm.push_response(json!({
             "action": "list_catalog",
             "filter": {},
@@ -236,9 +236,9 @@ async fn stream_emits_truncated_when_llm_never_emits_answer() {
 
     let (events, _final_answer) = drain(&mut rx).await;
 
-    assert!(result.truncated, "3 轮未 answer 必须 truncated=true");
-    assert_eq!(result.rounds_used, 3);
-    assert_eq!(app.llm.calls(), 3);
+    assert!(result.truncated, "4 轮未 answer 必须 truncated=true");
+    assert_eq!(result.rounds_used, 4);
+    assert_eq!(app.llm.calls(), 4);
 
     // 末尾 Step 必须是 answer 且 truncated=true。
     let last_step = events
