@@ -26,3 +26,4 @@ pub mod ingest_worker;
 pub mod lessons_learned;
 pub mod page_merge;
 pub mod reviewer_stats;
+pub mod structural_proposals;

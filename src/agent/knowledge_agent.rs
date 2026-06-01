@@ -1,10 +1,12 @@
 //! Agent-first 渐进式披露知识库 agent（替代 BM25 / 向量召回路径）。
 //!
 //! 设计目标：让 LLM 自己驱动 wiki chunk 探索，按 skills 那样的"按需披露"模式：
-//! - 工具集：`list_catalog`（只看目录摘要） / `open_chunk`（按需展开正文+引用） /
-//!   `follow_relations`（沿 related_chunks 跳）。
-//! - 多轮预算：≤ 3 轮 LLM 决策（catalog → open → follow / answer）；超出强制
-//!   answer 当前已 opened chunks。
+//! - 工具集：`list_catalog`（按 query 重排后的 chunk 摘要） / `open_document`
+//!   （按文档下钻到它的原子摘要） / `open_chunk`（按需展开正文+引用） /
+//!   `follow_relations`（沿 related_chunks 跳）。round 1 额外注入**文档级目录**
+//!   （catalogSummary / routingMap 导航卡片），让 agent 先选文档再下钻原子（#619）。
+//! - 多轮预算：≤ 4 轮 LLM 决策（文档目录+catalog → open_document → open_chunk /
+//!   follow → answer）；超出强制 answer 当前已 opened chunks。
 //! - 预算复用：所有 LLM 调用走 [`super::generate_agent_json`]，自动累计到当前
 //!   run 的 [`super::RunBudget`]；上游 gateway 已用掉大半 budget 时，本 agent
 //!   会被自然挤掉早 answer。
@@ -17,13 +19,15 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use futures::TryStreamExt;
-use mongodb::bson::{doc, oid::ObjectId, to_bson, Bson, Document};
+use mongodb::bson::{doc, oid::ObjectId, to_bson, Bson, DateTime, Document};
 use mongodb::options::FindOptions;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::error::AppResult;
+use crate::knowledge_wiki::gap_signals::{persist_recall_signal, GapSignalCandidate};
+use crate::knowledge_wiki::structural_proposals::{propose_structural_change, StructuralKind};
 use crate::models::OperationKnowledgeChunk;
 use crate::routes::AppState;
 
@@ -33,10 +37,12 @@ use super::generate_agent_json;
 mod cache;
 pub use cache::{cache_stats, AnswerCacheStats};
 
-/// 单轮探索的硬上限：3 轮 LLM 决策（catalog → open / follow → answer）。
-/// 第 4 轮直接强制 answer；与 [`super::RunBudget::max_llm_calls`] 互不替代——
-/// budget 用尽更早跳出循环。
-const MAX_ROUNDS: i32 = 3;
+/// 单轮探索的硬上限：4 轮 LLM 决策。分层召回（#619）后最坏路径多一跳——
+/// `round1 看文档目录 + catalog → open_document 下钻到原子 → open_chunk 展开正文
+/// → answer` 正好 4 轮；旧的 `list_catalog → open_chunk → follow_relations → answer`
+/// 链路同样 4 轮。第 5 轮直接强制 answer；与 [`super::RunBudget::max_llm_calls`]
+/// 互不替代——budget 用尽更早跳出循环。
+const MAX_ROUNDS: i32 = 4;
 
 /// `list_catalog` 一次返回 chunk 摘要的硬上限，控制 prompt size。
 const CATALOG_PAGE_SIZE: usize = 30;
@@ -58,6 +64,21 @@ const FOLLOW_PREFETCH_BODIES: usize = 3;
 
 /// `summary` 在 catalog 中的截断长度（按 char 数算，CJK 友好）。
 const CATALOG_SUMMARY_CHARS: usize = 120;
+
+/// `list_catalog` 在 query 非空时从 DB 拉取的候选上限。先按静态置信度排序取这么多，
+/// 再在进程内按 **query 相关度** 重排、截断到 [`CATALOG_PAGE_SIZE`]。
+///
+/// **为什么需要它（#619 召回硬伤）**：旧实现按 `dynamic_confidence` 取 120 条后直接
+/// `truncate(30)`，完全无视 query —— 一条「与查询高度相关但置信度排 31+」的 chunk
+/// 会被静态截断悄悄丢掉，知识库 agent 与运营 agent 都召回残缺。把窗口放到 400 并在
+/// 进程内按 query 相关度重排后，私域运营知识库的现实规模（单 workspace verified chunk
+/// 通常数十到数百条）下「全量重排」，相关 chunk 不再被静态置信度埋没。
+///
+/// **为什么不上向量库 / `$text`**：MongoDB `$text` 不对 CJK 分词（中文查询近乎失效），
+/// 向量库是新依赖 + 部署拓扑变更。这里用语言无关的 bigram + token 覆盖度在进程内重排，
+/// 零新依赖、对中英混排都鲁棒。corpus 超过 400 条 verified 的极端规模才会有尾部漏召，
+/// 届时再引入 DB 侧检索（明确的后续工作，不在本修复内）。
+const CATALOG_CANDIDATE_CAP: usize = 400;
 
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct AnswerRequest {
@@ -103,6 +124,24 @@ pub struct CatalogEntry {
     pub has_source_quote: bool,
     pub dynamic_confidence: f64,
     pub related_count: i32,
+}
+
+/// 文档级导航卡片（#619 分层召回）——给 agent 在 **round 1** 当「目录/索引」读的
+/// 上层信号，密度远高于 30 条等价原子摘要。`catalogSummary` / `routingMap` 是抽取
+/// 时**专门写给 agent**的导航文本（"这份文档解决什么问题、何时该打开"），旧召回
+/// 链路从未用过它们；这里把它们暴露出来，让 agent 先按文档下钻、再展开原子。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DocEntry {
+    pub document_id: String,
+    pub title: String,
+    /// 给 agent 看的目录摘要（抽取时写入），无则回退到 `summary`。
+    pub catalog_summary: String,
+    /// 自然语言目录项（章节级路标），帮助 agent 判断该不该 open_document 下钻。
+    pub routing_map: Vec<String>,
+    pub business_topics: Vec<String>,
+    /// 该文档下 verified chunk 数量（=open_document 能下钻出多少原子）。
+    pub verified_chunk_count: i32,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -186,6 +225,13 @@ enum AgentAction {
         #[serde(default)]
         ids: Vec<String>,
     },
+    /// #619 分层召回下钻：按 documentId 把该文档下所有 verified chunk 的【摘要】
+    /// 合并进 catalog（不直接载正文，避免 prompt 爆炸；agent 再 open_chunk 展开
+    /// 选中的原子）。这是「先文档目录、再下钻原子」的中间一跳。
+    OpenDocument {
+        #[serde(default, alias = "documentId")]
+        document_id: String,
+    },
     FollowRelations {
         #[serde(default, alias = "chunkId")]
         chunk_id: String,
@@ -214,10 +260,10 @@ pub struct RawSourceQuote {
 }
 
 const SYSTEM_PROMPT: &str = "你是运营知识库的 wiki 研究员。\n\
-你必须按 skills 的渐进式披露模式工作：先看 catalog 摘要，再选择性地 open_chunk 完整正文，最后给出带引用的 answer。\n\
+你必须按 skills 的渐进式披露模式工作：先读文档目录（每份文档的 catalogSummary / routingMap 是给你导航的索引），判断哪份文档相关后 open_document 下钻到它的原子摘要，再选择性地 open_chunk 展开完整正文，最后给出带引用的 answer。\n\
 你不能凭空回答；任何回答都必须来自被你 open 过的 chunk。\n\
-你只输出严格 JSON。每轮只能输出 4 个 action 之一：list_catalog / open_chunk / follow_relations / answer。\n\
-最多 3 轮工具调用。最后一轮必须 answer。";
+你只输出严格 JSON。每轮只能输出 5 个 action 之一：list_catalog / open_document / open_chunk / follow_relations / answer。\n\
+最多 4 轮工具调用。最后一轮必须 answer。";
 
 /// 知识库 agent 主循环。
 ///
@@ -228,7 +274,48 @@ const SYSTEM_PROMPT: &str = "你是运营知识库的 wiki 研究员。\n\
 /// 3. 收到 `answer` action 立即返回；
 /// 4. 超过 3 轮或 budget 用尽 → 用当前 opened 强制 answer，标 `truncated=true`。
 pub async fn answer(state: &AppState, req: AnswerRequest) -> AppResult<AnswerResult> {
-    answer_inner(state, req, None, None).await
+    // workspace_id 在 answer_inner 消费 req 前先捕获，供失败签名落库时尊重隔离。
+    let workspace_id = req.workspace_id.clone();
+    let result = answer_inner(state, req, None, None).await?;
+    // 在线召回-trace 闭环（方法论点 5）：把本次召回的失败签名 fire-and-forget 入
+    // 离线整改队列。镜像 record_chunk_hit 的非阻塞模式——绝不 .await 在召回热路径
+    // 内，落库失败只丢日志、不影响已返回给调用方的 result。
+    if let Some(candidate) = classify_recall_outcome(&result) {
+        let db = state.db.clone();
+        let ws = workspace_id.clone();
+        // 点 5→点 6 接驳：recall_low_yield = 多 open 少 cite，是典型的「粒度过粗」
+        // 信号 → 顺带 emit 一条 split StructuralProposal intent（只入队、绝不应用、
+        // 绝不物理删除），把召回失败导向结构化写质检队列。recall_miss 是「查无内容」
+        // 偽阴性（缺知识/放置问题），不映射到拆分意图，仅留 gap_signal。
+        let split_targets = if candidate.kind == "recall_low_yield" {
+            Some(candidate.affected_chunk_ids.clone())
+        } else {
+            None
+        };
+        tokio::spawn(async move {
+            if let Err(e) = persist_recall_signal(&db, &ws, candidate).await {
+                tracing::warn!(error = %e, "persist_recall_signal failed (non-fatal)");
+            }
+            if let Some(targets) = split_targets {
+                if !targets.is_empty() {
+                    if let Err(e) = propose_structural_change(
+                        &db,
+                        &ws,
+                        StructuralKind::Split,
+                        targets,
+                        "recall_low_yield：多 open 少 cite，疑似原子粒度过粗，建议拆细视图",
+                        "recall_trace",
+                        None,
+                    )
+                    .await
+                    {
+                        tracing::warn!(error = %e, "propose_structural_change failed (non-fatal)");
+                    }
+                }
+            }
+        });
+    }
+    Ok(result)
 }
 
 /// 流式版本：每个 `tool_trace.push` 同步通过 `tx` 发出 [`TraceEvent::Step`]，跑完
@@ -508,8 +595,14 @@ async fn answer_inner(
     let mut tool_trace: Vec<Document> = Vec::new();
     let mut opened: Vec<ChunkFull> = Vec::new();
     let mut opened_seen: HashSet<String> = HashSet::new();
-    let mut catalog =
-        list_catalog(state, &req.workspace_id, req.account_id.as_deref(), &req.filter).await?;
+    let mut catalog = list_catalog(
+        state,
+        &req.workspace_id,
+        req.account_id.as_deref(),
+        &req.filter,
+        Some(&req.query),
+    )
+    .await?;
     push_trace(
         &mut tool_trace,
         tx,
@@ -691,6 +784,7 @@ async fn answer_inner(
                     &req.workspace_id,
                     req.account_id.as_deref(),
                     &filter,
+                    Some(&req.query),
                 )
                 .await?;
                 push_trace(
@@ -701,6 +795,28 @@ async fn answer_inner(
                         "round": round,
                         "filter": filter_to_doc(&filter),
                         "returned": catalog.len() as i32,
+                    },
+                );
+            }
+            AgentAction::OpenDocument { document_id } => {
+                let entries = open_document(
+                    state,
+                    &req.workspace_id,
+                    req.account_id.as_deref(),
+                    &document_id,
+                    Some(&req.query),
+                )
+                .await?;
+                let appended = entries.len() as i32;
+                merge_catalog(&mut catalog, entries);
+                push_trace(
+                    &mut tool_trace,
+                    tx,
+                    doc! {
+                        "tool": "open_document",
+                        "round": round,
+                        "documentId": document_id,
+                        "appended": appended,
                     },
                 );
             }
@@ -841,16 +957,19 @@ fn is_cancelled(cancel: Option<&Arc<AtomicBool>>) -> bool {
         .unwrap_or(false)
 }
 
-/// 列出 chunk 摘要（不含 body）。按 `dynamic_confidence` × `wiki_type` 优先级
-/// 倒排，限制 30 条。account_id=None 时只看 workspace 共享 chunk；带 account_id
-/// 时合并查（共享 + 私有）。
+/// 列出 chunk 摘要（不含 body）。`query` 非空时按 [`rank_key`]（relevance ×
+/// trust/recency + 静态平手序）在 `CATALOG_CANDIDATE_CAP` 候选窗内**全量重排**
+/// 再截 `CATALOG_PAGE_SIZE`，修 #619「与查询高相关但静态置信度排在窗外」的漏召；
+/// query 为空时退化为 live 优先 + 静态序。account_id=None 时只看 workspace 共享
+/// chunk；带 account_id 时合并查（共享 + 私有）。
 pub async fn list_catalog(
     state: &AppState,
     workspace_id: &str,
     account_id: Option<&str>,
     filter: &CatalogFilter,
+    query: Option<&str>,
 ) -> AppResult<Vec<CatalogEntry>> {
-    let mut query = doc! {
+    let mut q = doc! {
         "workspace_id": workspace_id,
         "domain": "user_operations",
         "status": filter.status.clone().unwrap_or_else(|| "active".to_string()),
@@ -858,35 +977,37 @@ pub async fn list_catalog(
     // 默认仅暴露 verified chunk（与 router corpus 对齐）。include_unverified=true
     // 由上层显式开启（例如知识库后台审阅 UI 想看 needs_review）。
     if !filter.include_unverified {
-        query.insert("integrity_status", "verified");
+        q.insert("integrity_status", "verified");
     }
     let account_or = match account_id {
         Some(id) => vec![doc! { "account_id": null }, doc! { "account_id": id }],
         None => vec![doc! { "account_id": null }],
     };
-    query.insert("$or", account_or);
+    q.insert("$or", account_or);
     if !filter.wiki_types.is_empty() {
-        query.insert("wiki_type", doc! { "$in": filter.wiki_types.clone() });
+        q.insert("wiki_type", doc! { "$in": filter.wiki_types.clone() });
     }
     if !filter.business_topics.is_empty() {
-        query.insert(
+        q.insert(
             "business_topics",
             doc! { "$in": filter.business_topics.clone() },
         );
     }
 
+    // DB 侧仍按静态序拉一个宽候选窗（CATALOG_CANDIDATE_CAP），把 query 相关度重排
+    // 放进程内做——MongoDB `$text` 不分 CJK 词，靠 [`rank_key`] 的 bigram 覆盖率。
     let mut cursor = state
         .db
         .operation_knowledge_chunks()
         .find(
-            query,
+            q,
             FindOptions::builder()
                 .sort(doc! {
                     "dynamic_confidence": -1,
                     "priority": -1,
                     "updated_at": -1,
                 })
-                .limit(CATALOG_PAGE_SIZE as i64 * 4)
+                .limit(CATALOG_CANDIDATE_CAP as i64)
                 .build(),
         )
         .await?;
@@ -895,14 +1016,12 @@ pub async fn list_catalog(
         chunks.push(item);
     }
 
+    let now = DateTime::now();
+    let query = query.unwrap_or("");
     chunks.sort_by(|a, b| {
-        let pa = wiki_type_priority(a.wiki_type.as_deref());
-        let pb = wiki_type_priority(b.wiki_type.as_deref());
-        let ca = a.dynamic_confidence.unwrap_or(0.0);
-        let cb = b.dynamic_confidence.unwrap_or(0.0);
-        pb.cmp(&pa)
-            .then(cb.partial_cmp(&ca).unwrap_or(std::cmp::Ordering::Equal))
-            .then(b.priority.cmp(&a.priority))
+        let ka = rank_key(query, a, now);
+        let kb = rank_key(query, b, now);
+        kb.cmp(&ka)
     });
     chunks.truncate(CATALOG_PAGE_SIZE);
 
@@ -937,7 +1056,52 @@ pub async fn open_chunk(
     Ok(result.map(chunk_to_full))
 }
 
-/// 沿 `related_chunks` 跳一跳或两跳。返回 `(catalog_entries, prefetched_bodies)`：
+/// #619 分层召回下钻：按 `document_id` 把该文档下所有 verified chunk 的【摘要】
+/// 取出，按 [`rank_key`]（query 相关度 + trust/recency）排序后返回 `CatalogEntry`，
+/// 供调用方 merge 进 catalog。不直接载正文（避免 prompt 爆炸；agent 再 open_chunk
+/// 展开选中原子）。account 可见域与 [`list_catalog`] 一致（共享 + 该 account 私有）。
+/// `document_id` 非法 / 不属于本 workspace → 返回空集。
+pub async fn open_document(
+    state: &AppState,
+    workspace_id: &str,
+    account_id: Option<&str>,
+    document_id: &str,
+    query: Option<&str>,
+) -> AppResult<Vec<CatalogEntry>> {
+    let doc_oid = match ObjectId::parse_str(document_id) {
+        Ok(oid) => oid,
+        Err(_) => return Ok(Vec::new()),
+    };
+    let mut q = doc! {
+        "workspace_id": workspace_id,
+        "domain": "user_operations",
+        "document_id": doc_oid,
+        "status": "active",
+        "integrity_status": "verified",
+        "$or": account_or(account_id),
+    };
+    let _ = &mut q;
+    let mut cursor = state
+        .db
+        .operation_knowledge_chunks()
+        .find(
+            q,
+            FindOptions::builder()
+                .sort(doc! { "dynamic_confidence": -1, "priority": -1, "updated_at": -1 })
+                .limit(CATALOG_CANDIDATE_CAP as i64)
+                .build(),
+        )
+        .await?;
+    let mut chunks: Vec<OperationKnowledgeChunk> = Vec::new();
+    while let Some(item) = cursor.try_next().await? {
+        chunks.push(item);
+    }
+    let now = DateTime::now();
+    let query = query.unwrap_or("");
+    chunks.sort_by(|a, b| rank_key(query, b, now).cmp(&rank_key(query, a, now)));
+    chunks.truncate(CATALOG_PAGE_SIZE);
+    Ok(chunks.into_iter().map(chunk_to_catalog_entry).collect())
+}
 /// 最先发现的前 [`FOLLOW_PREFETCH_BODIES`] 个 verified 关联目标的【完整正文】
 /// 直接以 `ChunkFull` 返回（供调用方推进 `opened`，当轮即可 cite），其余只回
 /// 摘要 `CatalogEntry`。已 opened 的目标在遍历中被跳过，避免重复给 agent。
@@ -1198,13 +1362,15 @@ fn build_prompt(
 候选 catalog（仅摘要，不含正文）：
 {catalog_json}
 
-下一步只输出以下 4 种 action 之一的严格 JSON：
+下一步只输出以下 5 种 action 之一的严格 JSON：
 {{"action":"list_catalog","filter":{{"wikiTypes":["..."],"businessTopics":["..."]}}}}
+{{"action":"open_document","documentId":"..."}}
 {{"action":"open_chunk","ids":["chunk_id_1","chunk_id_2"]}}
 {{"action":"follow_relations","chunkId":"...","depth":1}}
 {{"action":"answer","citedChunkIds":["..."],"sourceQuotes":[{{"chunkId":"...","quote":"...","sourceAnchorIndex":0}}],"answer":"..."}}
 
 规则：
+- 分层召回优先：先按文档级目录用 open_document 下钻定位文档的原子摘要，再 open_chunk 展开正文；catalog/document 目录都按与本次 query 的相关度排过序，越靠前越相关。
 - citedChunkIds 必须是上面"已 open 的 chunks"中的 chunkId 子集；不能凭空创造。
 - follow_relations 会把最相关的关联条目【正文】直接载入上面"已 open 的 chunks"，可当轮直接 cite，无需再 open_chunk。
 - 每个 cited 必须配 sourceQuote；如某 chunk 没有可引用原文，可省略 sourceQuote 但仍可 cite。
@@ -1244,12 +1410,276 @@ pub fn wiki_type_priority(wiki_type: Option<&str>) -> i32 {
     }
 }
 
+/// 召回排序键（方法论点 3「排序检索」+ 点 4「trust/recency 层」）。**全序**
+/// （`Ord` 派生，字段从主到次按下序词典比较），`list_catalog` 用 `b.cmp(&a)`
+/// 降序排（key 大者排前）：
+/// 1. `effective_relevance_micros`：query↔chunk 覆盖率 [`relevance_score`] ×
+///    trust 因子，量化成微整数。**主键**——relevance 驱动漏斗。
+/// 2. `live`：未被 superseded 且未过期 → true。同 relevance 时 live 排在前，
+///    兑现「superseded 绝不与现行版同列竞争」。
+/// 3. `wiki_priority` → 4. `confidence_micros` → 5. `priority`：静态平手序。
+///
+/// **trust/recency 降格不剔除**：superseded 把有效相关度乘 0.1（重罚排底，需 10×
+/// 原始相关度才追平 live 同行）、过期再乘 0.5。降格的 chunk 仍留在候选里，仍受
+/// [`open_chunk`] 的 verified-only 硬门约束——只重排不剔除，cite⊆opened /
+/// verified-only 不破。query 为空（无检索意图）时有效相关度恒 0，整体退化为
+/// 「live 优先 + 静态序」。
+///
+/// 纯函数（无 IO），cfg(test) 单测 + `tests/knowledge_agent_pbt.rs` 锁：全序 ∧
+/// now 单调（now 增大只可能令 chunk 过期 → 排名只降不升）∧ 「除 superseded 惩罚
+/// 外全等的 live 同行」恒排在 superseded 之前。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct RankKey {
+    pub effective_relevance_micros: i64,
+    pub live: bool,
+    pub wiki_priority: i32,
+    pub confidence_micros: i64,
+    pub priority: i32,
+}
+
+/// 见 [`RankKey`]。`now` 显式传入（不在函数内取 `DateTime::now()`）以便 PBT 锁
+/// now 单调性。
+pub fn rank_key(query: &str, chunk: &OperationKnowledgeChunk, now: DateTime) -> RankKey {
+    let base = relevance_score(query, &chunk_haystack(chunk));
+    let superseded = chunk
+        .superseded_by
+        .as_deref()
+        .map(|s| !s.trim().is_empty())
+        .unwrap_or(false);
+    let expired = chunk
+        .valid_to
+        .map(|t| t.timestamp_millis() < now.timestamp_millis())
+        .unwrap_or(false);
+    let trust_factor =
+        if superseded { 0.1 } else { 1.0 } * if expired { 0.5 } else { 1.0 };
+    let effective = base * trust_factor;
+    RankKey {
+        effective_relevance_micros: (effective * 1_000_000.0) as i64,
+        live: !superseded && !expired,
+        wiki_priority: wiki_type_priority(chunk.wiki_type.as_deref()),
+        confidence_micros: (chunk.dynamic_confidence.unwrap_or(0.0) * 1_000_000.0) as i64,
+        priority: chunk.priority,
+    }
+}
+
+/// 在线召回-trace 闭环（方法论点 5）的失败签名分类器。
+///
+/// 输入一次 [`AnswerResult`]，输出**一条**待入队的离线整改候选信号
+/// （[`GapSignalCandidate`]），或 `None`（本次召回健康，不打扰运营队列）。生产者
+/// 在 [`answer`] wrapper 返回后 fire-and-forget 落库（见 `persist_recall_signal`），
+/// **绝不在召回热路径内 await**。
+///
+/// 两类签名（按严重度从高到低短路）：
+/// 1. **recall_miss**：`cited==0` 且（`truncated` 或一个正文都没 open）。即「查了
+///    等于没查」——空 catalog 偽阴性、4 轮没收敛、或开了一堆摘要却没能 open 到任何
+///    正文。这是粒度/放置问题最强的信号。
+/// 2. **recall_low_yield**：open 了 ≥ [`LOW_YIELD_OPENED_MIN`] 个正文却只 cite
+///    ≤ [`LOW_YIELD_CITED_MAX`] 个——「多 open 少 cite」，典型「找到一堆但都不够
+///    精确支撑回答」，提示该主题的原子要么太粗（该 split）要么放错文档（该
+///    reclassify）。affected 记 opened-但-未-cite 的那批（诊断价值最高）。
+///
+/// 设计红线：
+/// - `cancelled`（用户主动取消）→ `None`：那不是召回质量问题。
+/// - 纯函数、无 IO、永不 panic（解析 trace 全用容错读法，缺字段当空集）。
+/// - `affected_chunk_ids ⊆ 本次 opened ∪ cited`（PBT 锁），尊重 workspace 隔离由
+///   调用方 `persist_recall_signal(db, workspace_id, _)` 负责。
+const LOW_YIELD_OPENED_MIN: usize = 3;
+const LOW_YIELD_CITED_MAX: usize = 1;
+
+pub fn classify_recall_outcome(result: &AnswerResult) -> Option<GapSignalCandidate> {
+    // 用户主动取消不算召回缺陷：提前退出循环是预期行为。
+    if result.cancelled {
+        return None;
+    }
+
+    // 统计本次「载入正文、可被 cite」的 chunk：open_chunk.opened ∪
+    // follow_relations.openedBodies。摘要级（open_document/list_catalog appended）
+    // 不算——它们没正文，本就不能直接 cite。
+    let mut opened: HashSet<String> = HashSet::new();
+    for entry in &result.tool_trace {
+        let tool = entry.get_str("tool").unwrap_or("");
+        let field = match tool {
+            "open_chunk" => "opened",
+            "follow_relations" => "openedBodies",
+            _ => continue,
+        };
+        if let Ok(arr) = entry.get_array(field) {
+            for v in arr {
+                if let Bson::String(s) = v {
+                    opened.insert(s.clone());
+                }
+            }
+        }
+    }
+    let cited_count = result.cited_chunk_ids.len();
+
+    // 签名 1：recall_miss（最高优先，短路）。
+    if cited_count == 0 && (result.truncated || opened.is_empty()) {
+        let affected: Vec<String> = opened.into_iter().collect();
+        return Some(GapSignalCandidate {
+            kind: "recall_miss".into(),
+            title: "召回偽阴性：查询未命中可引用知识".into(),
+            severity: "high".into(),
+            affected_chunk_ids: affected,
+            description: format!(
+                "本次召回 cited=0（truncated={}，opened_bodies={}）。疑似目标知识缺失、\
+                 粒度过粗或放置错位，待运营质检定位补/拆/重分类。",
+                result.truncated,
+                result.rounds_used,
+            ),
+        });
+    }
+
+    // 签名 2：recall_low_yield。
+    if opened.len() >= LOW_YIELD_OPENED_MIN && cited_count <= LOW_YIELD_CITED_MAX {
+        let cited_set: HashSet<&str> =
+            result.cited_chunk_ids.iter().map(|s| s.as_str()).collect();
+        // affected = open 了正文却没被 cite 的那批（诊断价值最高）；恒 ⊆ opened。
+        let affected: Vec<String> = opened
+            .iter()
+            .filter(|id| !cited_set.contains(id.as_str()))
+            .cloned()
+            .collect();
+        return Some(GapSignalCandidate {
+            kind: "recall_low_yield".into(),
+            title: "召回低产出：多 open 少 cite".into(),
+            severity: "medium".into(),
+            affected_chunk_ids: affected,
+            description: format!(
+                "本次 open 正文 {} 个但仅 cite {} 个。原子可能过粗或放错文档，\
+                 待运营质检判断该 split / reclassify。",
+                opened.len(),
+                cited_count,
+            ),
+        });
+    }
+
+    None
+}
+
 pub fn truncate_chars(s: &str, max_chars: usize) -> String {
     if s.chars().count() <= max_chars {
         return s.to_string();
     }
     let truncated: String = s.chars().take(max_chars).collect();
     format!("{truncated}…")
+}
+
+/// `account_id=None` 只看 workspace 共享（account_id=null）；带 id 时合并查
+///（共享 + 该 account 私有）。三处召回查询（chunk catalog / document 目录 /
+/// open_document）共用，保证可见域一致。
+fn account_or(account_id: Option<&str>) -> Vec<Document> {
+    match account_id {
+        Some(id) => vec![doc! { "account_id": null }, doc! { "account_id": id }],
+        None => vec![doc! { "account_id": null }],
+    }
+}
+
+/// 语言无关的 query↔文本相关度，落在 `[0,1]`：query 的检索信号在候选文本里被
+/// 覆盖的比例。CJK 用相邻字符 bigram（单字回退 unigram）、ASCII 用连续 alnum
+/// token。零依赖、对中英混排鲁棒，**不是**针对任何样本调过的特征——纯覆盖率。
+///
+/// 用于 [`list_catalog`] 在 query 非空时对候选 chunk 重排：把「与查询高相关但静态
+/// 置信度排在 30 名外」的 chunk 拉进 catalog 头部，修 #619 静态截断漏召。query
+/// 为空（无检索意图）返回 0，调用方回退到静态 wiki_type/confidence 排序。
+///
+/// 纯函数，cfg(test) 单测 + `tests/knowledge_agent_pbt.rs` 锁不变量：
+/// 结果恒 `[0,1]`；query/haystack 任一为空信号集 → 0；haystack ⊇ query 信号 → 1。
+pub fn relevance_score(query: &str, haystack: &str) -> f64 {
+    let q = text_signals(query);
+    if q.is_empty() {
+        return 0.0;
+    }
+    let h = text_signals(haystack);
+    if h.is_empty() {
+        return 0.0;
+    }
+    let hit = q.iter().filter(|t| h.contains(*t)).count();
+    hit as f64 / q.len() as f64
+}
+
+/// 把文本拆成「检索信号」集合：ASCII 连续 alnum 串（小写整体当一个 token）+
+/// 相邻 CJK 字符 bigram（单字 run 回退 unigram，覆盖单字查询）。其它字符当分隔符。
+fn text_signals(s: &str) -> HashSet<String> {
+    let mut out: HashSet<String> = HashSet::new();
+    let mut ascii = String::new();
+    let mut cjk_run: Vec<char> = Vec::new();
+    for ch in s.chars() {
+        if ch.is_ascii_alphanumeric() {
+            push_cjk(&cjk_run, &mut out);
+            cjk_run.clear();
+            ascii.push(ch.to_ascii_lowercase());
+        } else if is_cjk(ch) {
+            if !ascii.is_empty() {
+                out.insert(std::mem::take(&mut ascii));
+            }
+            cjk_run.push(ch);
+        } else {
+            if !ascii.is_empty() {
+                out.insert(std::mem::take(&mut ascii));
+            }
+            push_cjk(&cjk_run, &mut out);
+            cjk_run.clear();
+        }
+    }
+    if !ascii.is_empty() {
+        out.insert(ascii);
+    }
+    push_cjk(&cjk_run, &mut out);
+    out
+}
+
+/// 把一段连续 CJK run 拆成 bigram 写进 `out`；单字 run 回退 unigram（覆盖单字
+/// 查询，否则单字永远 0 命中）。空 run 无操作。
+fn push_cjk(run: &[char], out: &mut HashSet<String>) {
+    match run.len() {
+        0 => {}
+        1 => {
+            out.insert(run[0].to_string());
+        }
+        _ => {
+            for w in run.windows(2) {
+                out.insert(w.iter().collect());
+            }
+        }
+    }
+}
+
+/// 常见 CJK / 假名码段。够覆盖中文与中日混排私域语料；非穷举（不含韩文/扩展 B+），
+/// 命中之外的字符当分隔符处理，不影响 ASCII / 中文主路径。
+fn is_cjk(ch: char) -> bool {
+    matches!(
+        ch as u32,
+        0x4E00..=0x9FFF      // CJK 统一表意文字
+        | 0x3400..=0x4DBF    // 扩展 A
+        | 0x3040..=0x30FF    // 平假名 + 片假名
+        | 0xF900..=0xFAFF    // 兼容表意文字
+    )
+}
+
+/// 把一条 chunk 的可检索文本拼成一个 haystack，喂给 [`relevance_score`]。
+/// 覆盖 title / summary / body / business_topics / wiki_type —— 召回信号尽量全，
+/// 不漏掉只在正文出现的关键词。
+fn chunk_haystack(c: &OperationKnowledgeChunk) -> String {
+    let mut s = String::with_capacity(256);
+    s.push_str(&c.title);
+    if let Some(x) = &c.summary {
+        s.push(' ');
+        s.push_str(x);
+    }
+    if let Some(x) = &c.body {
+        s.push(' ');
+        s.push_str(x);
+    }
+    for t in &c.business_topics {
+        s.push(' ');
+        s.push_str(t);
+    }
+    if let Some(x) = &c.wiki_type {
+        s.push(' ');
+        s.push_str(x);
+    }
+    s
 }
 
 /// PBT 入口：knowledge_agent 多轮预算上限。
@@ -1339,6 +1769,201 @@ mod tests {
         assert!(wiki_type_priority(Some("thesis")) > wiki_type_priority(Some("source")));
         assert!(wiki_type_priority(Some("methodology")) > wiki_type_priority(Some("entity")));
         assert_eq!(wiki_type_priority(None), wiki_type_priority(Some("entity")));
+    }
+
+    /// rank_key 单测用：构造一条最小可用 chunk（只填 rank_key 读到的字段 + 必填）。
+    fn rk_chunk(
+        title: &str,
+        body: &str,
+        wiki_type: &str,
+        confidence: f64,
+        priority: i32,
+    ) -> OperationKnowledgeChunk {
+        OperationKnowledgeChunk {
+            id: None,
+            workspace_id: "w".to_string(),
+            account_id: None,
+            document_id: None,
+            item_id: None,
+            domain: "user_operations".to_string(),
+            knowledge_type: None,
+            business_context: None,
+            title: title.to_string(),
+            summary: None,
+            body: Some(body.to_string()),
+            applicable_scenes: Vec::new(),
+            not_applicable_scenes: Vec::new(),
+            product_tags: Vec::new(),
+            business_topics: Vec::new(),
+            source_quote: None,
+            source_anchors: Vec::new(),
+            integrity_status: Some("verified".to_string()),
+            confidence_score: None,
+            status: "active".to_string(),
+            priority,
+            created_at: DateTime::now(),
+            updated_at: DateTime::now(),
+            wiki_type: Some(wiki_type.to_string()),
+            domain_attributes: None,
+            provenance: None,
+            valid_from: None,
+            valid_to: None,
+            superseded_by: None,
+            previous_version_id: None,
+            related_chunks: None,
+            usage_stats: None,
+            dynamic_confidence: Some(confidence),
+            integrity_score: None,
+            locked_fields: None,
+            chunk_type: "product_fact".to_string(),
+        }
+    }
+
+    #[test]
+    fn rank_key_relevance_beats_static_confidence() {
+        // 高相关但低静态置信度的 chunk，应排在低相关高置信度 chunk 之前。
+        let now = DateTime::now();
+        let relevant = rk_chunk("价格异议处理方法论", "先共情后说价值", "entity", 0.1, 0);
+        let irrelevant = rk_chunk("产品定价表", "标准版每月99元", "thesis", 0.99, 100);
+        let kr = rank_key("价格异议", &relevant, now);
+        let ki = rank_key("价格异议", &irrelevant, now);
+        assert!(kr > ki, "high-relevance chunk must outrank high-confidence irrelevant one");
+    }
+
+    #[test]
+    fn rank_key_superseded_demoted_below_live_peer() {
+        // 除 superseded 惩罚外全等的 live 同行，必排在 superseded 之前。
+        let now = DateTime::now();
+        let live = rk_chunk("价格异议处理", "先共情", "methodology", 0.8, 10);
+        let mut superseded = rk_chunk("价格异议处理", "先共情", "methodology", 0.8, 10);
+        superseded.superseded_by = Some("newer-chunk-id".to_string());
+        let kl = rank_key("价格异议", &live, now);
+        let ks = rank_key("价格异议", &superseded, now);
+        assert!(kl > ks, "live peer must outrank superseded");
+        assert!(kl.live && !ks.live);
+    }
+
+    #[test]
+    fn rank_key_expired_demoted_below_live_peer() {
+        // valid_to < now 的过期 chunk，排在除时效外全等的 live 同行之后。
+        let now = DateTime::now();
+        let live = rk_chunk("价格异议处理", "先共情", "methodology", 0.8, 10);
+        let mut expired = rk_chunk("价格异议处理", "先共情", "methodology", 0.8, 10);
+        expired.valid_to = Some(DateTime::from_millis(now.timestamp_millis() - 86_400_000));
+        let kl = rank_key("价格异议", &live, now);
+        let ke = rank_key("价格异议", &expired, now);
+        assert!(kl > ke, "live peer must outrank expired");
+        assert!(kl.live && !ke.live);
+    }
+
+    #[test]
+    fn rank_key_empty_query_falls_back_to_static_order() {
+        // query 空 → 有效相关度恒 0，退化为 live 优先 + 静态序（thesis > entity）。
+        let now = DateTime::now();
+        let thesis = rk_chunk("A", "x", "thesis", 0.5, 0);
+        let entity = rk_chunk("B", "y", "entity", 0.5, 0);
+        let kt = rank_key("", &thesis, now);
+        let ke = rank_key("", &entity, now);
+        assert_eq!(kt.effective_relevance_micros, 0);
+        assert_eq!(ke.effective_relevance_micros, 0);
+        assert!(kt > ke, "with empty query, thesis outranks entity by static priority");
+    }
+
+    #[test]
+    fn rank_key_blank_superseded_by_is_still_live() {
+        // superseded_by 为空白串不算 superseded（防脏数据误降格）。
+        let now = DateTime::now();
+        let mut c = rk_chunk("A", "x", "entity", 0.5, 0);
+        c.superseded_by = Some("   ".to_string());
+        assert!(rank_key("", &c, now).live);
+    }
+
+    /// classify_recall_outcome 单测用：构造一条 AnswerResult，trace 里塞
+    /// open_chunk / follow_relations 步以驱动 opened 统计。
+    fn ar(
+        cited: Vec<&str>,
+        truncated: bool,
+        cancelled: bool,
+        opened_chunks: Vec<&str>,
+        opened_bodies: Vec<&str>,
+    ) -> AnswerResult {
+        let mut trace: Vec<Document> = Vec::new();
+        if !opened_chunks.is_empty() {
+            trace.push(doc! {
+                "tool": "open_chunk",
+                "opened": opened_chunks.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+            });
+        }
+        if !opened_bodies.is_empty() {
+            trace.push(doc! {
+                "tool": "follow_relations",
+                "openedBodies": opened_bodies.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+            });
+        }
+        AnswerResult {
+            answer: String::new(),
+            cited_chunk_ids: cited.iter().map(|s| s.to_string()).collect(),
+            source_quotes: Vec::new(),
+            tool_trace: trace,
+            rounds_used: 1,
+            truncated,
+            cancelled,
+        }
+    }
+
+    #[test]
+    fn classify_healthy_recall_is_none() {
+        // open 了正文且 cite 命中 → 健康，不打扰队列。
+        let r = ar(vec!["a", "b"], false, false, vec!["a", "b", "c"], vec![]);
+        assert!(classify_recall_outcome(&r).is_none());
+    }
+
+    #[test]
+    fn classify_empty_catalog_false_negative_is_recall_miss() {
+        // 空 catalog 偽阴性：没 open 任何正文、cited=0、未 truncated。
+        let r = ar(vec![], false, false, vec![], vec![]);
+        let c = classify_recall_outcome(&r).expect("should flag recall_miss");
+        assert_eq!(c.kind, "recall_miss");
+        assert!(c.affected_chunk_ids.is_empty());
+    }
+
+    #[test]
+    fn classify_truncated_zero_cite_is_recall_miss() {
+        // 4 轮没收敛、强制兜底、cited=0 → recall_miss；affected ⊆ opened。
+        let r = ar(vec![], true, false, vec!["a", "b"], vec![]);
+        let c = classify_recall_outcome(&r).expect("should flag recall_miss");
+        assert_eq!(c.kind, "recall_miss");
+        assert_eq!(c.affected_chunk_ids.len(), 2);
+        for id in &c.affected_chunk_ids {
+            assert!(["a", "b"].contains(&id.as_str()));
+        }
+    }
+
+    #[test]
+    fn classify_many_open_few_cite_is_low_yield() {
+        // open 4 个正文只 cite 1 个 → recall_low_yield；affected = open 但未 cite 的。
+        let r = ar(vec!["a"], false, false, vec!["a", "b", "c", "d"], vec![]);
+        let c = classify_recall_outcome(&r).expect("should flag low_yield");
+        assert_eq!(c.kind, "recall_low_yield");
+        // affected 恰是 b/c/d（open 但未 cite），不含已 cite 的 a。
+        let mut ids = c.affected_chunk_ids.clone();
+        ids.sort();
+        assert_eq!(ids, vec!["b".to_string(), "c".to_string(), "d".to_string()]);
+    }
+
+    #[test]
+    fn classify_low_yield_counts_follow_relations_bodies() {
+        // openedBodies（follow_relations 预取正文）也计入 opened 统计。
+        let r = ar(vec!["a"], false, false, vec!["a"], vec!["b", "c"]);
+        let c = classify_recall_outcome(&r).expect("should flag low_yield");
+        assert_eq!(c.kind, "recall_low_yield");
+    }
+
+    #[test]
+    fn classify_cancelled_is_none() {
+        // 用户主动取消不算召回缺陷，即使 cited=0。
+        let r = ar(vec![], true, true, vec![], vec![]);
+        assert!(classify_recall_outcome(&r).is_none());
     }
 
     #[test]

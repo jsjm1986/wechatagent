@@ -410,7 +410,7 @@ pub(crate) async fn route_operation_knowledge(
         super::knowledge_agent::AnswerRequest {
             workspace_id: contact.workspace_id.clone(),
             account_id: Some(contact.account_id.clone()),
-            query,
+            query: query.clone(),
             filter: super::knowledge_agent::CatalogFilter::default(),
             max_rounds: None,
         },
@@ -459,23 +459,31 @@ pub(crate) async fn route_operation_knowledge(
     const FALLBACK_TOP_N: usize = 5;
     let mut fallback_probs: Option<std::collections::HashMap<String, f64>> = None;
     let (selected_chunk_ids, knowledge_coverage, risk_level) = if cited_in_corpus.is_empty() {
+        // 闭降格漏点：fallback 弱证据回填必须消费与 list_catalog 同一 `rank_key`，
+        // 否则 superseded / 过期 chunk 会绕过 trust/recency 降格从这条弱路径泄漏到
+        // 选中集。rank_key 把 superseded 乘 0.1、过期乘 0.5 并令 live=false 排底。
+        let now = mongodb::bson::DateTime::now();
         let mut ranked: Vec<&OperationKnowledgeChunk> = knowledge.chunks.iter().collect();
         ranked.sort_by(|a, b| {
-            let pa = super::knowledge_agent::wiki_type_priority(a.wiki_type.as_deref());
-            let pb = super::knowledge_agent::wiki_type_priority(b.wiki_type.as_deref());
-            let ca = a.dynamic_confidence.unwrap_or(0.0);
-            let cb = b.dynamic_confidence.unwrap_or(0.0);
-            pb.cmp(&pa)
-                .then_with(|| cb.partial_cmp(&ca).unwrap_or(std::cmp::Ordering::Equal))
+            let ka = super::knowledge_agent::rank_key(&query, a, now);
+            let kb = super::knowledge_agent::rank_key(&query, b, now);
+            kb.cmp(&ka)
         });
         let explore = state.config.knowledge_exploration_enabled && ranked.len() > FALLBACK_TOP_N;
         let fallback_ids: Vec<String> = if explore {
             let scores: Vec<f64> = ranked
                 .iter()
                 .map(|c| {
-                    let priority =
-                        super::knowledge_agent::wiki_type_priority(c.wiki_type.as_deref());
-                    priority as f64 * c.dynamic_confidence.unwrap_or(0.0)
+                    // 探索打分同样消费 rank_key 的有效相关度（含 trust/recency 降格），
+                    // 使 superseded/过期 chunk 在 softmax 里也获得趋零权重。
+                    let k = super::knowledge_agent::rank_key(&query, c, now);
+                    let relevance = k.effective_relevance_micros as f64 / 1_000_000.0;
+                    let static_score = super::knowledge_agent::wiki_type_priority(
+                        c.wiki_type.as_deref(),
+                    ) as f64
+                        * c.dynamic_confidence.unwrap_or(0.0);
+                    let trust = if k.live { 1.0 } else { 0.1 };
+                    (relevance + static_score) * trust
                 })
                 .collect();
             let probs = softmax_probs(&scores, state.config.knowledge_exploration_temperature);

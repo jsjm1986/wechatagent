@@ -1786,7 +1786,13 @@ pub async fn import_operation_knowledge_apply_image(
     // 2) 拼 vision prompt：约束 LLM 输出 JSON {"fence": "..." }，让我们直接走 chunked_text 流程。
     let mime = req.mime.as_deref().unwrap_or("image/png");
     let hint = req.hint.as_deref().unwrap_or("无特定领域 hint");
-    let system_prompt = "你是知识库 chunk 抽取助手。任务：把图片中的可读文本**完整穷尽**地结构化为 fence 块。每块前后用 `---CHUNK: <短安全 id，仅字母数字和连字符>---` 与 `---END CHUNK---` 包裹（结束符必须是 `---END CHUNK---`，不要写 `---END---`）。块体必须是单个 JSON 对象，至少含 `title` 字段，且 `body`/`summary`/`answer` 中至少一个非空字符串，例如 {\"title\":\"小节标题\",\"body\":\"完整正文\"}。\n抽取要求：\n1. 逐条覆盖图中每一个主题/小节/条款（如产品定位、功能、退款政策、SLA、价格、适用范围等），不要只抽其中一部分；宁可多分几个 chunk，也不要遗漏图中出现的任何关键信息或数字。\n2. body 要保留原文的关键表述与具体数字（如时长、比例、金额、期限），不要概括压缩成一句话。\n3. 只抽图里**真实存在**的文字，绝不编造、补全或推测图中没有的内容；图里没写的就不写。\n所有 chunk 默认 needs_review，不要写 verified。返回严格 JSON：{\"fence\": <字符串，全部 fence 文本>}。如果图片无文本可抽取，返回 {\"fence\": \"\"}。".to_string();
+    let system_prompt = "你是知识库 chunk 抽取助手。任务：把图片中的可读文本结构化为 fence 块。每块前后用 `---CHUNK: <短安全 id，仅字母数字和连字符>---` 与 `---END CHUNK---` 包裹（结束符必须是 `---END CHUNK---`，不要写 `---END---`）。块体必须是单个 JSON 对象，至少含 `title` 字段，且 `body`/`summary`/`answer` 中至少一个非空字符串，例如 {\"title\":\"小节标题\",\"body\":\"完整正文\"}。\n\
+抽取方法（原子信息单元召回，对任何图片一视同仁，不针对特定主题）：\n\
+1. 先把图片内容在脑中拆解为一组**原子信息单元**——每个单元是一条可独立成立、不可再拆的事实/条目/字段/陈述（一行表格、一个标题下的一段说明、一条编号项、一组「字段名:值」都各算一个单元）。\n\
+2. **穷尽枚举**这些单元：逐个落成 chunk，覆盖图中出现的每一个单元，不要只挑你觉得重要的几条；宁可多分几个 chunk，也不要遗漏。划分以图片自身的视觉/语义边界（标题、分栏、表格行、列表项）为准，而不是以任何预设的主题清单为准。\n\
+3. **保留原文 token 粒度**：body 照搬原文的关键表述、专有名词与具体数值（数字、比例、金额、期限、单位、阈值都要原样保留），不要概括、改写或压缩成一句话。\n\
+4. **只抽真实存在的文字**：绝不编造、补全、推断或脑补图中没有的内容；图里没写的就不写，看不清的标注为不确定而非猜测。\n\
+所有 chunk 默认 needs_review，不要写 verified。返回严格 JSON：{\"fence\": <字符串，全部 fence 文本>}。如果图片无文本可抽取，返回 {\"fence\": \"\"}。".to_string();
     let user_prompt = format!(
         "请按 fence 格式抽取下面这张图片中的知识 chunk。hint：{hint}"
     );
@@ -3167,11 +3173,14 @@ pub async fn build_operation_knowledge_completeness(
 - product_safe: 可回答部分产品/服务能力，但报价、案例、效果或交付边界仍不足。
 - fully_supported: 能力、边界、证据类内容足够支撑常见产品事实问题。
 - 不要按固定标签硬判，必须从每条切片的 title / knowledgeType / businessContext / summary 的真实语义判断它到底覆盖了什么事实，不要只看标题里的关键词。
-- 待审定（needs_review）切片**尚未审定**，在审定前绝不可作为产品/服务事实依据。若待审定切片涉及报价、承诺、效果或交付边界，必须在 gaps 中明确指出「该主题存在未核实草稿，需运营审定」，且**不得**因为这些草稿存在就判 fully_supported——审定前等同缺口。
-- coverage 各维必须严格区分「方法论/话术」与「客观事实」：
-  - coverage.pricing 表示「知识库是否有可直接对客的具体报价事实（价格数字、套餐、计费方式、报价承诺）」。**价格异议处理方法论、谈判话术、价值锚点不等于报价事实**——只有 verified 切片含具体价格数字/套餐/计费时 pricing 才为 true；若具体报价只在 needs_review 草稿里、verified 侧只有方法论，则 pricing 必须为 false 并把「缺已审定的具体报价」写进 gaps。
-  - 同理 caseEvidence/effectClaims 要求 verified 切片含真实案例数据/效果数字，泛泛主张不算。
-- summary 字段必须如实反映知识库现状：若报价等关键维度只有方法论或未审定草稿，summary 要点明「具备价格沟通方法论但缺已审定的具体报价事实」，不要笼统说「可回答产品事实」。
+- 认知状态分类（对所有维度一视同仁，不偏向任何单一维度）：把每条切片对某业务维度的支撑程度归为四类之一——
+  1. 已验证客观事实：verified 切片含可直接对客的具体事实（确定的数字/条款/边界/案例数据/效果数字等可被核验的客观信息）；
+  2. 仅方法论/话术：只讲怎么做、怎么沟通、价值主张、谈判策略，不含可对客的客观事实数字；
+  3. 未审定草稿：相关具体信息只存在于 needs_review 切片中，审定前不可作为事实依据；
+  4. 缺失：知识库里没有该维度的任何内容。
+  **只有第 1 类「已验证客观事实」才能让对应 coverage 维度为 true**；方法论/话术、未审定草稿、缺失一律视为该维度尚未被事实覆盖（coverage=false）。此判据对 pricing / caseEvidence / effectClaims / deliveryBoundary / capability 每一维都同样适用，不得对某一维放宽或收紧。
+- needs_review 切片**尚未审定**，在审定前绝不可作为产品/服务事实依据；若其涉及关键事实维度，必须在 gaps 中写明「该主题存在未核实草稿，需运营审定」，且**不得**因草稿存在就判 fully_supported。
+- summary 字段必须如实反映知识库现状：对任一关键维度，若 verified 侧只有方法论/话术或仅有未审定草稿，summary 要点明「具备相关方法论但缺已审定的客观事实」，不要笼统说「可回答产品事实」。
 
 统计：total={} verified={} anchored={} evidence={} needsReview={}
 

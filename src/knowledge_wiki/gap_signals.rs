@@ -46,6 +46,23 @@ const OUTLINK_REQUIRED_TYPES: &[&str] = &["synthesis", "comparison", "methodolog
 /// dynamic_confidence 低于此值且 30d hit > 0 时标 low_confidence。
 const LOW_CONFIDENCE_THRESHOLD: f64 = 0.3;
 
+/// 悬空 anchor 的 dynamic_confidence 罚分（方法论点 1 软降格半）：被判悬空的
+/// chunk 在离线 dynamic_confidence 重算时额外扣此分，与 stale_penalty 叠加。
+/// rank_key 读 dynamic_confidence（confidence_micros），故悬空 chunk 自然排低
+/// —— 软降格：只降置信、不剔除、不硬阻断、不动 verified-only。
+const DANGLING_ANCHOR_PENALTY: f64 = 0.3;
+
+/// 离线降格半的纯函数：仅当文档原文存在（`raw_content` 传入即代表存在）且
+/// `source_quote` 被判悬空时返回罚分，否则 0。强制「查无原文不罚」的软语义由
+/// 形参签名兜住（调用方只在 `raw_by_doc` 命中时才传 raw 进来）。
+fn dangling_anchor_penalty(quote: Option<&str>, raw_content: &str) -> f64 {
+    if anchor_is_dangling(quote, Some(raw_content)) {
+        DANGLING_ANCHOR_PENALTY
+    } else {
+        0.0
+    }
+}
+
 /// Structural lint 单轮报告：返回新增 / 已存在 pending / 自动消解条数。
 #[derive(Debug, Default, Clone)]
 pub struct LintReport {
@@ -113,17 +130,75 @@ pub async fn run_structural_lint(
 ) -> Result<LintReport, AppError> {
     let chunks = load_active_chunks(db, workspace_id).await?;
     let archived_ids = load_archived_chunk_ids(db, workspace_id).await?;
-    let candidates = compute_structural_candidates(&chunks, &archived_ids, DateTime::now());
+    let raw_by_doc = load_raw_content_by_doc(db, workspace_id).await?;
+    let candidates =
+        compute_structural_candidates(&chunks, &archived_ids, &raw_by_doc, DateTime::now());
     persist_signals(db, workspace_id, candidates).await
+}
+
+/// 取 workspace 下所有文档的 `document_id_hex -> raw_content`，供 `dangling_anchor`
+/// 检测把 chunk.source_quote 回原文校验（方法论点 1：anchor 永不悬空）。无 raw_content
+/// 的文档不入表 —— 检测端「查无原文则跳过」，保持软语义、不误报。
+async fn load_raw_content_by_doc(
+    db: &Database,
+    workspace_id: &str,
+) -> Result<HashMap<String, String>, AppError> {
+    let cursor = db
+        .operation_knowledge_documents()
+        .find(doc! { "workspace_id": workspace_id }, None)
+        .await
+        .map_err(AppError::from)?;
+    let docs: Vec<crate::models::OperationKnowledgeDocument> =
+        cursor.try_collect().await.map_err(AppError::from)?;
+    let mut out: HashMap<String, String> = HashMap::new();
+    for d in docs {
+        if let (Some(id), Some(raw)) = (d.id.as_ref(), d.raw_content.as_ref()) {
+            if !raw.trim().is_empty() {
+                out.insert(id.to_hex(), raw.clone());
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// 软 anchor 校验（方法论点 1）：判断 chunk 的 `source_quote` 相对其文档 `raw_content`
+/// 是否**悬空**（即引用文本已无法在原文中定位）。
+///
+/// 契约（纯函数、无 IO、PBT 锁）：
+/// - `quote` 为 None / 空 / 全空白 → **不算悬空**（没有引用可校验，不打扰）；
+/// - 去除两侧所有 Unicode 空白后，`quote` 是 `raw_content` 的子串 → **不悬空**
+///   （容忍 PDF 抽取换行/空格差异，降低误报）；
+/// - 其余（含 `raw_content` 为 None 而 quote 非空）→ **悬空**。
+///
+/// 注意：检测端 [`compute_structural_candidates`] 只在 raw_content **存在**时才调用本
+/// 函数，故「查无原文」不会被误判为悬空——软语义只在能确证「引用不在原文」时才出信号。
+pub fn anchor_is_dangling(quote: Option<&str>, raw_content: Option<&str>) -> bool {
+    let q = match quote {
+        Some(s) if !s.trim().is_empty() => s,
+        _ => return false,
+    };
+    let raw = match raw_content {
+        Some(s) => s,
+        None => return true,
+    };
+    let strip_ws = |s: &str| -> String { s.chars().filter(|c| !c.is_whitespace()).collect() };
+    let q_norm = strip_ws(q);
+    if q_norm.is_empty() {
+        return false;
+    }
+    !strip_ws(raw).contains(&q_norm)
 }
 
 /// 纯函数：从一组 active chunk 生成 structural lint 的候选 signal。
 ///
 /// 拆出来便于 PBT / 单测 —— 不需要数据库。`archived_ids` 用来区分
 /// `broken_link`（引用从未存在）与 `missing_chunk`（引用了已 archived 的 chunk）。
+/// `raw_by_doc`（document_id_hex -> raw_content）供第 9 类 `dangling_anchor` 把
+/// chunk.source_quote 回原文软校验；查无 raw_content 的文档其 chunk 跳过校验。
 pub fn compute_structural_candidates(
     chunks: &[OperationKnowledgeChunk],
     archived_ids: &HashSet<String>,
+    raw_by_doc: &HashMap<String, String>,
     now: DateTime,
 ) -> Vec<GapSignalCandidate> {
     let known_ids: HashSet<String> = chunks
@@ -256,6 +331,24 @@ pub fn compute_structural_candidates(
                     "30 天累计被 grounding 闸拦截 {blocked} 次，建议补 source_quote 后 verify",
                 )),
             ));
+        }
+
+        // 9. dangling_anchor: source_quote 已无法在文档 raw_content 中定位
+        //    （方法论点 1：anchor 永不悬空）。软语义——只在能拿到原文且确证
+        //    引用不在原文时才出信号；查无原文（raw_by_doc 缺该文档）直接跳过，
+        //    不误报。rank_key 侧据此降格（不硬阻断 open / cite）。
+        if let Some(doc_id) = c.document_id.as_ref().map(|o| o.to_hex()) {
+            if let Some(raw) = raw_by_doc.get(&doc_id) {
+                if anchor_is_dangling(c.source_quote.as_deref(), Some(raw)) {
+                    out.push(GapSignalCandidate::new(
+                        "dangling_anchor",
+                        format!("引用悬空：{}", title),
+                        "warning",
+                        vec![chunk_id.clone()],
+                        Some("source_quote 已无法在文档原文中定位，需重锚或更新引用"),
+                    ));
+                }
+            }
         }
     }
 
@@ -455,7 +548,75 @@ pub async fn persist_signals(
     Ok(report)
 }
 
-/// 换血标签：把一条 usage_log 对应的**真实用户反应**映射成三态。
+/// 在线召回-trace 闭环（方法论点 5）专用的**只增不消解**落库口。
+///
+/// 与 [`persist_signals`] 的关键差异：`persist_signals` 跑完一轮 lint 后会把
+/// 「本轮规则未再生成」的 pending 信号 stage-1 auto_resolve —— 那是**离线全量**
+/// 语义。在线召回钩子每次只携带「本次这一问」的单条候选，**绝不能**触发那套
+/// sweep，否则会把离线 lint 攒下的 pending 信号全冲掉。所以这里只做
+/// 「dedup 命中则合并 affected / 未命中则 insert」，永不 resolve 任何信号。
+///
+/// `source="recall_trace"`，与离线 `"rule"` / `"llm"` 区分，便于运营按来源筛、
+/// 也避免被离线 sweep 的 `source=="rule"` 过滤误消解。fire-and-forget 调用，
+/// 失败只丢一条日志、不影响召回热路径。
+pub async fn persist_recall_signal(
+    db: &Database,
+    workspace_id: &str,
+    candidate: GapSignalCandidate,
+) -> Result<(), AppError> {
+    let key = candidate.dedup_key();
+    let existing = db
+        .knowledge_gap_signals()
+        .find_one(
+            doc! { "workspace_id": workspace_id, "status": "pending", "kind": &candidate.kind },
+            None,
+        )
+        .await
+        .map_err(AppError::from)?
+        .filter(|s| signal_dedup_key(&s.kind, &s.title, &s.affected_chunk_ids) == key);
+
+    if let Some(existing) = existing {
+        let mut merged: HashSet<String> = existing.affected_chunk_ids.iter().cloned().collect();
+        let before = merged.len();
+        for id in &candidate.affected_chunk_ids {
+            merged.insert(id.clone());
+        }
+        if merged.len() > before {
+            let new_vec: Vec<String> = merged.into_iter().collect();
+            db.knowledge_gap_signals()
+                .update_one(
+                    doc! { "signal_id": &existing.signal_id },
+                    doc! { "$set": { "affected_chunk_ids": &new_vec } },
+                    None,
+                )
+                .await
+                .map_err(AppError::from)?;
+        }
+        return Ok(());
+    }
+
+    let signal = KnowledgeGapSignal {
+        id: None,
+        signal_id: format!("sig_{}", Uuid::new_v4().simple()),
+        workspace_id: workspace_id.to_string(),
+        kind: candidate.kind,
+        title: candidate.title,
+        description: candidate.description,
+        affected_chunk_ids: candidate.affected_chunk_ids,
+        search_queries: Vec::new(),
+        severity: candidate.severity,
+        source: "recall_trace".into(),
+        status: "pending".into(),
+        resolution_note: None,
+        created_at: DateTime::now(),
+        resolved_at: None,
+    };
+    db.knowledge_gap_signals()
+        .insert_one(&signal, None)
+        .await
+        .map_err(AppError::from)?;
+    Ok(())
+}
 ///
 /// 病根（镜厅效应）是 hit 信号取 reviewer 自评（`review_approved`），系统学的是
 /// "reviewer 喜欢哪些 chunk"而非"哪些 chunk 让用户正反应"。换血即把信号源从
@@ -616,6 +777,7 @@ pub async fn refresh_usage_stats_and_confidence(
     }
 
     let chunks = load_active_chunks(db, workspace_id).await?;
+    let raw_by_doc = load_raw_content_by_doc(db, workspace_id).await?;
     let mut report = UsageStatsReport::default();
 
     for c in &chunks {
@@ -631,8 +793,22 @@ pub async fn refresh_usage_stats_and_confidence(
             Some(vt) if vt.timestamp_millis() < now.timestamp_millis() => 0.3,
             _ => 0.0,
         };
-        let dyn_conf =
-            compute_dynamic_confidence(base, h as u64, b as u64, stale_penalty, min_samples);
+        // Gap3 软降格半（方法论点 1）：source_quote 在文档原文中悬空 → 叠加罚分。
+        // 仅文档有 raw_content 时才校验（查无原文不罚），与离线检测同源。
+        let dangling_penalty = c
+            .document_id
+            .as_ref()
+            .map(|o| o.to_hex())
+            .and_then(|doc_id| raw_by_doc.get(&doc_id))
+            .map(|raw| dangling_anchor_penalty(c.source_quote.as_deref(), raw))
+            .unwrap_or(0.0);
+        let dyn_conf = compute_dynamic_confidence(
+            base,
+            h as u64,
+            b as u64,
+            stale_penalty + dangling_penalty,
+            min_samples,
+        );
 
         let mut set: Document = doc! {
             "usage_stats": {
@@ -1157,7 +1333,7 @@ mod tests {
             chunk("entity 页", Some("entity"), vec![]),
             chunk("方法论页", Some("methodology"), vec![]),
         ];
-        let cands = compute_structural_candidates(&cs, &HashSet::new(), DateTime::now());
+        let cands = compute_structural_candidates(&cs, &HashSet::new(), &HashMap::new(), DateTime::now());
         let kinds: Vec<&str> = cands.iter().map(|c| c.kind.as_str()).collect();
         assert!(kinds.contains(&"no_outlinks"));
         // entity 页只该出 orphan，不该出 no_outlinks
@@ -1176,7 +1352,7 @@ mod tests {
             last_used_at: None,
             last_blocked_reason: None,
         });
-        let cands = compute_structural_candidates(&cs, &HashSet::new(), DateTime::now());
+        let cands = compute_structural_candidates(&cs, &HashSet::new(), &HashMap::new(), DateTime::now());
         assert!(cands.iter().any(|c| c.kind == "broken_link"));
     }
 
@@ -1184,7 +1360,7 @@ mod tests {
     fn stale_when_valid_to_expired() {
         let mut c = chunk("过期页", Some("entity"), vec![]);
         c.valid_to = Some(DateTime::from_millis(0));
-        let cands = compute_structural_candidates(&[c], &HashSet::new(), DateTime::now());
+        let cands = compute_structural_candidates(&[c], &HashSet::new(), &HashMap::new(), DateTime::now());
         assert!(cands.iter().any(|s| s.kind == "stale"));
     }
 
@@ -1198,7 +1374,7 @@ mod tests {
             last_used_at: None,
             last_blocked_reason: None,
         });
-        let cands = compute_structural_candidates(&[c], &HashSet::new(), DateTime::now());
+        let cands = compute_structural_candidates(&[c], &HashSet::new(), &HashMap::new(), DateTime::now());
         assert!(cands.iter().any(|s| s.kind == "low_confidence"));
     }
 
@@ -1212,7 +1388,7 @@ mod tests {
         )];
         let mut archived = HashSet::new();
         archived.insert("archived_target_id".to_string());
-        let cands = compute_structural_candidates(&cs, &archived, DateTime::now());
+        let cands = compute_structural_candidates(&cs, &archived, &HashMap::new(), DateTime::now());
         assert!(cands.iter().any(|c| c.kind == "missing_chunk"));
         assert!(
             !cands.iter().any(|c| c.kind == "broken_link"),
@@ -1230,7 +1406,7 @@ mod tests {
             last_used_at: None,
             last_blocked_reason: None,
         });
-        let cands = compute_structural_candidates(&[c], &HashSet::new(), DateTime::now());
+        let cands = compute_structural_candidates(&[c], &HashSet::new(), &HashMap::new(), DateTime::now());
         assert!(cands.iter().any(|s| s.kind == "suggestion"));
 
         // 一旦 verified，suggestion 不应再出现
@@ -1242,7 +1418,7 @@ mod tests {
             last_used_at: None,
             last_blocked_reason: None,
         });
-        let cands2 = compute_structural_candidates(&[c2], &HashSet::new(), DateTime::now());
+        let cands2 = compute_structural_candidates(&[c2], &HashSet::new(), &HashMap::new(), DateTime::now());
         assert!(!cands2.iter().any(|s| s.kind == "suggestion"));
     }
 
@@ -1253,7 +1429,7 @@ mod tests {
         a.body = Some("策略一：阶梯价。\n\n详细说明……".to_string());
         let mut b = chunk("产品价格策略", Some("methodology"), vec![]);
         b.body = Some("策略二：固定价。\n\n详细说明……".to_string());
-        let cands = compute_structural_candidates(&[a, b], &HashSet::new(), DateTime::now());
+        let cands = compute_structural_candidates(&[a, b], &HashSet::new(), &HashMap::new(), DateTime::now());
         assert!(cands.iter().any(|s| s.kind == "contradiction"));
 
         // 同 normalize_title 多 chunk 但首段一致 → 不出 contradiction
@@ -1261,8 +1437,100 @@ mod tests {
         x.body = Some("策略一：阶梯价。\n\n详细说明……".to_string());
         let mut y = chunk("产品价格策略", Some("methodology"), vec![]);
         y.body = Some("策略一：阶梯价。\n\n另一段补充。".to_string());
-        let cands2 = compute_structural_candidates(&[x, y], &HashSet::new(), DateTime::now());
+        let cands2 = compute_structural_candidates(&[x, y], &HashSet::new(), &HashMap::new(), DateTime::now());
         assert!(!cands2.iter().any(|s| s.kind == "contradiction"));
+    }
+
+    #[test]
+    fn anchor_is_dangling_contract() {
+        // 无引用 → 不悬空（不打扰）
+        assert!(!anchor_is_dangling(None, Some("任意原文")));
+        assert!(!anchor_is_dangling(Some(""), Some("任意原文")));
+        assert!(!anchor_is_dangling(Some("   "), Some("任意原文")));
+        // 引用是原文子串 → 不悬空
+        assert!(!anchor_is_dangling(Some("阶梯价"), Some("我们采用阶梯价策略")));
+        // 容忍空白差异：原文有换行/空格，引用无
+        assert!(!anchor_is_dangling(
+            Some("阶梯价策略"),
+            Some("我们采用阶梯\n价 策略")
+        ));
+        // 引用不在原文 → 悬空
+        assert!(anchor_is_dangling(Some("固定价"), Some("我们采用阶梯价策略")));
+        // 有引用但无原文 → 悬空
+        assert!(anchor_is_dangling(Some("固定价"), None));
+    }
+
+    #[test]
+    fn dangling_anchor_flagged_when_quote_not_in_raw() {
+        let doc_id = ObjectId::new();
+        let mut c = chunk("引用悬空页", Some("entity"), vec![]);
+        c.document_id = Some(doc_id);
+        c.source_quote = Some("某段不存在于原文的引用".to_string());
+        let mut raw_by_doc = HashMap::new();
+        raw_by_doc.insert(doc_id.to_hex(), "这是完全不同的文档原文内容".to_string());
+        let cands = compute_structural_candidates(
+            &[c],
+            &HashSet::new(),
+            &raw_by_doc,
+            DateTime::now(),
+        );
+        assert!(cands.iter().any(|s| s.kind == "dangling_anchor"));
+    }
+
+    #[test]
+    fn dangling_anchor_not_flagged_when_quote_present_or_no_raw() {
+        let doc_id = ObjectId::new();
+        // 引用命中原文 → 不出 dangling_anchor
+        let mut hit = chunk("引用命中页", Some("entity"), vec![]);
+        hit.document_id = Some(doc_id);
+        hit.source_quote = Some("阶梯价".to_string());
+        let mut raw_by_doc = HashMap::new();
+        raw_by_doc.insert(doc_id.to_hex(), "我们采用阶梯价策略".to_string());
+        let cands = compute_structural_candidates(
+            &[hit],
+            &HashSet::new(),
+            &raw_by_doc,
+            DateTime::now(),
+        );
+        assert!(!cands.iter().any(|s| s.kind == "dangling_anchor"));
+
+        // 查无原文（raw_by_doc 缺该文档）→ 软语义跳过，不误报
+        let mut no_raw = chunk("查无原文页", Some("entity"), vec![]);
+        no_raw.document_id = Some(ObjectId::new());
+        no_raw.source_quote = Some("任意引用".to_string());
+        let cands2 = compute_structural_candidates(
+            &[no_raw],
+            &HashSet::new(),
+            &HashMap::new(),
+            DateTime::now(),
+        );
+        assert!(!cands2.iter().any(|s| s.kind == "dangling_anchor"));
+    }
+
+    /// Gap3 软降格半：悬空 anchor → dynamic_confidence 多扣 DANGLING_ANCHOR_PENALTY；
+    /// 命中 / 无引用 → 不扣。罚分进 compute_dynamic_confidence 的 stale 位，
+    /// rank_key 读 dynamic_confidence 即自然降格（软：只降不剔除）。
+    #[test]
+    fn dangling_anchor_penalty_demotes_only_dangling() {
+        // 悬空：quote 不在原文 → 罚分 = DANGLING_ANCHOR_PENALTY
+        let p_dangling = dangling_anchor_penalty(Some("固定价"), "我们采用阶梯价策略");
+        assert!((p_dangling - DANGLING_ANCHOR_PENALTY).abs() < 1e-9);
+        // 命中：quote 是原文子串 → 不罚
+        assert_eq!(dangling_anchor_penalty(Some("阶梯价"), "我们采用阶梯价策略"), 0.0);
+        // 无引用 → 不罚
+        assert_eq!(dangling_anchor_penalty(None, "任意原文"), 0.0);
+
+        // 端到端：同 base/样本，悬空者 dynamic_confidence 严格低于命中者。
+        let base = 0.8;
+        let live = compute_dynamic_confidence(base, 5, 0, 0.0, 5);
+        let demoted = compute_dynamic_confidence(
+            base,
+            5,
+            0,
+            dangling_anchor_penalty(Some("固定价"), "我们采用阶梯价策略"),
+            5,
+        );
+        assert!(demoted < live, "dangling demoted={demoted} must be < live={live}");
     }
 
     #[test]
