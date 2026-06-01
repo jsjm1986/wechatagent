@@ -245,3 +245,74 @@ jobs:
           REAL_LLM_VISION_MODEL: mimo-v2.5
           REAL_LLM_JUDGE: "1"
         run: cargo test --no-fail-fast --test real_llm_ops_smoke -- --ignored --nocapture
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # 对抗式科学测试仪表台（Phase A：先校准仪器，agent 冻结为对照）。
+  # real_llm_adversarial.rs 五合一：① 红队对手 agent（读真回复升级攻击）
+  # ② 多裁判团 + 跨裁判分歧信号（MiMo 双 checkpoint = 效度代理）
+  # ③ 金标集裁判效度校准（命中率 = 准不准）④ 分数台账 JSONL artifact 跨轮对比
+  # ⑤ 长期运行能力弧（回填跨周历史 + 手动 consolidation 量化记忆/画像漂移）。
+  #
+  # 用 matrix 把每条弧切到独立并行 runner——每个 arc 各享一整个 45min 墙，
+  # 互不阻塞（fail-fast:false）。各 arc 只 `cargo test <name>` 跑自己那一片，
+  # 抗 45min 墙腰斩（judge K=3 采样、红队多轮、长程回填都很慢）。
+  # Phase A 全软诊断（唯一硬断言是 gateway 闭集），continue-on-error:true 不卡合并。
+  # MCP 仍是桩（绝不真发微信）。台账末尾 upload-artifact 传出跨轮人工/脚本对比。
+  real-llm-adversarial:
+    name: Real-LLM adversarial (${{ matrix.arc }})
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        arc:
+          - t_judge_calibration
+          - t_adv_price_objection
+          - t_adv_human_takeover_bait
+          - t_adv_contradiction_trap
+          - t_adv_fake_emotion_bait
+          - t_adv_knowledge_fabrication_bait
+          - t_longrun_capability
+    env:
+      REAL_LLM_API_KEY: ${{ secrets.REAL_LLM_API_KEY }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Free disk space
+        if: ${{ env.REAL_LLM_API_KEY != '' }}
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android \
+            /usr/local/share/boost /usr/local/share/powershell \
+            /usr/lib/jvm "$AGENT_TOOLSDIRECTORY" || true
+          sudo docker image prune --all --force || true
+          df -h
+
+      - name: Install Rust toolchain
+        if: ${{ env.REAL_LLM_API_KEY != '' }}
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry / target
+        if: ${{ env.REAL_LLM_API_KEY != '' }}
+        uses: Swatinem/rust-cache@v2
+
+      - name: cargo test --test real_llm_adversarial ${{ matrix.arc }}
+        if: ${{ env.REAL_LLM_API_KEY != '' }}
+        env:
+          RUSTFLAGS: ""
+          REAL_LLM_BASE_URL: https://token-plan-cn.xiaomimimo.com/v1
+          REAL_LLM_MODEL: mimo-v2.5-pro
+          REAL_LLM_VISION_MODEL: mimo-v2.5
+          REAL_LLM_JUDGE: "1"
+          REAL_LLM_LEDGER: target/real_llm_ledger
+        run: cargo test --no-fail-fast --test real_llm_adversarial ${{ matrix.arc }} -- --ignored --nocapture
+
+      - name: Upload score ledger
+        if: ${{ always() && env.REAL_LLM_API_KEY != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: real-llm-ledger-${{ matrix.arc }}
+          path: target/real_llm_ledger/
+          if-no-files-found: ignore
+          retention-days: 30
