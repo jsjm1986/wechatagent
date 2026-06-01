@@ -1442,6 +1442,8 @@ async fn q2_article_extraction_quality() {
         report.train_mean, report.train_n, report.holdout_mean, report.holdout_n, report.gap
     );
 
+    // 空 split 断言必须排在 floor 断言之前：floor 标志带 !is_empty() 守卫，空 split 时为
+    // false（不触发），靠这条 empty_split 断言先 panic 兜底。勿调换顺序。
     assert!(
         !report.empty_split,
         "Q2 训练/留出集都必须有样本（实际 train={} holdout={}）",
