@@ -1906,4 +1906,124 @@ async fn t17_real_multiturn_boundary_stress() {
     }
 }
 
+// ── T18 · 运营人工录入暖启动 → 全流程多轮（生产真实入口）─────────────────────────
+//
+// 生产里把好友纳入运营 Agent 的真实起点（src/routes/contacts.rs::enable_agent）：
+// 运营人员在「人工录入框」写两段东西——① 怎么运营这个用户（custom_agent_instructions，
+// Operator Instruction 层，最高优先级，覆盖 Soul+Policy）；② 一段简单的用户画像备注
+// （human_profile_note，因为对方可能是老客户 / 之前的朋友，不一定是全新陌生人）。
+// 备注先过 build_initial_operation_profile 生成结构化初始画像，再连同备注 + 特别指令
+// 一起落库、置 managed。此后每轮回复 prompt 都注入 human_profile_note / agent_profile /
+// custom_agent_instructions（src/agent/decision.rs:380-391 / 496-497）。
+//
+// 此前 t15/t16/t17 全是「冷启动陌生人」——直接手搓 agent_profile 塞进 contact，从不走
+// 这条人工录入暖启动入口；t10 只验证画像生成本身、之后没有对话。本测试补齐这条生产主路径：
+// 老客户暖启动 → 运营特别指令（别当新客户推销、维护关系）→ 多轮 → 软诊断 Agent 是否
+// 真的吃进了「这是老客户 / 别推销」这条人工录入，而不是把熟人当陌生人重新寒暄、硬推。
+//
+// 唯一硬断言仍是每轮 status ∈ gateway 闭集（真模型非确定，其余全软诊断），与 t15/t17 同口径。
+// 抽象性（反过拟合）：测的是「人工录入的画像 + 运营指令必须贯穿多轮被尊重」这条通用能力，
+// 不是某条具体话术；换任何老客户画像 / 任何运营指令都应成立。
+#[tokio::test]
+#[ignore]
+async fn t18_real_warm_start_operator_seeded_arc() {
+    use mongodb::options::FindOneOptions;
+    let llm = require_real_llm!();
+    let app = TestApp::start().await;
+    let mcp_server = start_mcp_mock_success().await;
+    let state = common::rebuild_app_state_with_real_llm(&app, llm, mcp_server.uri());
+
+    // ① 运营人工录入框 · 简单画像备注（老客户 / 之前的朋友，非全新用户）。
+    let human_profile_note =
+        "这是合作了一年多的老客户，去年就签约用我们方案了，平时关系处得不错，\
+         偶尔会私聊问点用法。性子比较急，喜欢直来直去，别跟他绕。最近合同快到期了。";
+
+    // ② 用人工录入备注走生产暖启动入口，真模型生成结构化初始画像（与 enable_agent 同路径）。
+    let generated = build_initial_operation_profile(&state, human_profile_note, None)
+        .await
+        .expect("暖启动初始画像生成必须 Ok（不崩、JSON 可解析）");
+    eprintln!(
+        "[t18][暖启动画像] summary={} stage={:?} intent={:?} tags={:?}",
+        generated.agent_profile.summary,
+        generated.customer_stage,
+        generated.intent_level,
+        generated.tags
+    );
+
+    // ③ 运营人工录入框 · 怎么运营这个用户（Operator Instruction，最高优先级覆盖 Soul+Policy）。
+    let operator_instruction =
+        "这是已签约的老客户，不要当新客户推销、不要逼单。重点是维护关系、答疑、\
+         自然地聊到续约即可，别硬推。他问什么就好好答什么。";
+
+    // ④ 落库为 managed，带上人工录入的备注 + 生成画像 + 特别指令（镜像 enable_agent 的 $set）。
+    let mut contact = managed_contact("real_ops_user_t18");
+    contact.human_profile_note = Some(human_profile_note.to_string());
+    contact.agent_profile = Some(generated.agent_profile.clone());
+    contact.tags = generated.tags.clone();
+    contact.custom_agent_instructions = Some(operator_instruction.to_string());
+    if let (Some(stage), Some(intent)) = (&generated.customer_stage, &generated.intent_level) {
+        contact.domain_attributes = Some(doc! { "customer_stage": stage, "intent_level": intent });
+    }
+    contact.operation_state = Some("new_contact".to_string());
+    state.db.contacts().insert_one(&contact, None).await.expect("insert contact");
+
+    // ⑤ 老客户回来私聊的多轮弧：熟人式开口 → 用法问题 → 提到合同 → 价格敏感。
+    // 软诊断点：暖启动后 Agent 该把对方当「记得的老客户」承接，而不是陌生人重新寒暄；
+    // 且运营指令「别推销别逼单」应跨轮守住——即便聊到续约也保持答疑/维护口吻。
+    let arc = [
+        ("熟人开口", "在忙吗？好久没找你了，想问个用法上的事。"),
+        ("用法问题", "我那个功能最近老是想不起来在哪点，你帮我理一下呗。"),
+        ("提到合同", "对了，是不是我合同快到期了？前两天系统好像提醒了一下。"),
+        ("价格敏感", "续的话价格还跟去年一样吗？别给我涨啊，老客户了。"),
+    ];
+
+    // 暖启动校验：陌生人式冷开场标记——熟人不该被重新自我介绍 / 初次寒暄。
+    let cold_stranger_markers = [
+        "初次", "第一次", "认识一下", "自我介绍", "我是您的", "很高兴认识",
+    ];
+    // 推销/逼单标记——运营指令明确禁止，跨轮不该出现。
+    let hard_sell_markers = ["立即购买", "马上下单", "现在就定", "名额有限", "错过", "优惠仅剩", "先付"];
+
+    let mut prev_reply = String::new();
+    for (i, (tag, content)) in arc.iter().enumerate() {
+        let turn = i + 1;
+        let inbound = make_inbound(&contact, &format!("real_ops_msg_t18_{turn}"), content);
+        state.db.messages().insert_one(&inbound, None).await.expect("insert inbound");
+
+        handle_managed_message(&state, contact.clone(), &inbound)
+            .await
+            .unwrap_or_else(|e| panic!("t18 turn-{turn}({tag}) 链路必须 Ok: {e:?}"));
+
+        let log = state
+            .db
+            .agent_run_logs()
+            .find_one(
+                doc! { "contact_wxid": &contact.wxid },
+                FindOneOptions::builder().sort(doc! { "created_at": -1 }).build(),
+            )
+            .await
+            .expect("query run log")
+            .expect("必须落一行 run log");
+        assert!(
+            GATEWAY_STATUS_VALUES.contains(&log.status.as_str()),
+            "t18 turn-{turn}({tag}) status 必须 ∈ gateway 闭集，实际={:?}",
+            log.status
+        );
+
+        eprintln!("\n########## [t18][turn-{turn}] {tag} ##########");
+        print_quality_report(&state, &contact.wxid, &format!("t18-turn{turn}-{tag}")).await;
+        prev_reply = print_capability_snapshot(&state, &contact.wxid, "t18", turn, &prev_reply).await;
+        run_judge(&state, &contact.wxid, &format!("t18-turn{turn}-{tag}")).await;
+
+        // 暖启动软诊断：① 是否把老客户当陌生人重新寒暄；② 运营「别推销」指令是否被违反。
+        let treats_as_stranger = cold_stranger_markers.iter().any(|kw| prev_reply.contains(kw));
+        let hard_selling = hard_sell_markers.iter().any(|kw| prev_reply.contains(kw));
+        eprintln!(
+            "[t18][turn-{turn}][暖启动] treats_old_customer_as_stranger={treats_as_stranger}（应 false）\
+             hard_selling={hard_selling}（运营指令禁止，应 false）"
+        );
+    }
+    print_long_term_memory(&state, &contact.wxid, "t18").await;
+}
+
 
