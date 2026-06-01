@@ -16,7 +16,7 @@ mod common;
 
 use mongodb::bson::{doc, oid::ObjectId, DateTime as BsonDt};
 use wechatagent::agent::knowledge_agent::{list_catalog, CatalogFilter};
-use wechatagent::models::OperationKnowledgeChunk;
+use wechatagent::models::{OperationKnowledgeChunk, RelatedRef};
 
 use crate::common::TestApp;
 
@@ -122,4 +122,84 @@ async fn write_then_recall_preserves_baseline_and_adds_new() {
     // 新内容可召回：added 出现。
     assert!(after.contains(&added_hex), "新增 chunk 应可被召回：{after:?}");
     let _ = base_b_hex;
+}
+
+/// 门 1b：SUPERSEDE 旧降新升。旧 chunk 被 superseded_by 指向新 chunk → trust×0.1 →
+/// 同 query 下新 chunk 必须排在旧 chunk 之前。验证「结构化写永不物理删除」——旧 chunk
+/// 仍在库（未被删），只是降权。
+#[tokio::test]
+#[ignore]
+async fn supersede_demotes_old_below_new() {
+    let app = TestApp::start().await;
+    reset_ws(&app).await;
+
+    // 旧版 + 新版，相同主题（query 相关度相近），靠 trust 拉开。
+    let old = seed_chunk("竞品对比方法论 v1", "竞品对比 客观陈述 优劣 旧版");
+    let new = seed_chunk("竞品对比方法论 v2", "竞品对比 客观陈述 优劣 升级");
+    let old_hex = old.id.expect("oid").to_hex();
+    let new_hex = new.id.expect("oid").to_hex();
+    for c in [&old, &new] {
+        app.state.db.operation_knowledge_chunks().insert_one(c, None).await.expect("insert");
+    }
+
+    // 维护 agent 取代：旧版打 superseded_by=新版。物理保留旧 chunk。
+    app.state
+        .db
+        .operation_knowledge_chunks()
+        .update_one(
+            doc! { "_id": old.id.unwrap() },
+            doc! { "$set": { "superseded_by": &new_hex } },
+            None,
+        )
+        .await
+        .expect("mark superseded");
+
+    let ids = catalog_ids(&app, "竞品对比怎么客观陈述").await;
+    let pos_old = ids.iter().position(|x| x == &old_hex);
+    let pos_new = ids.iter().position(|x| x == &new_hex);
+    // 旧 chunk 仍在库（未被物理删）——查得到。
+    let still_exists = app.state.db.operation_knowledge_chunks()
+        .find_one(doc! { "_id": old.id.unwrap() }, None).await.expect("find old").is_some();
+    assert!(still_exists, "SUPERSEDE 不得物理删除旧 chunk");
+    // 新版必须排在旧版之前（旧版 trust×0.1 降权）。
+    match (pos_new, pos_old) {
+        (Some(pn), Some(po)) => assert!(pn < po, "新版应排在旧版之前：new@{pn} old@{po} ids={ids:?}"),
+        (Some(_), None) => { /* 旧版被降到 catalog 尾部之外也可接受（更强的降权） */ }
+        _ => panic!("新版 chunk 必须可召回：ids={ids:?}"),
+    }
+}
+
+/// 门 1c：关系图完整。写入带 related_chunks 的 chunk 后，其每条引用的 chunk_id
+/// 都能在库内解析（无悬空引用）。validate「结构化写」维护关系链完整。
+#[tokio::test]
+#[ignore]
+async fn relation_graph_has_no_dangling_refs() {
+    let app = TestApp::start().await;
+    reset_ws(&app).await;
+
+    let target = seed_chunk("价格异议处理", "价格 异议 让步 话术");
+    let target_hex = target.id.expect("oid").to_hex();
+    app.state.db.operation_knowledge_chunks().insert_one(&target, None).await.expect("insert target");
+
+    // 维护 agent 新增一条 chunk，关系指向 target。
+    let mut linked = seed_chunk("价格异议进阶应对", "价格 异议 进阶 谈判");
+    linked.related_chunks = Some(vec![RelatedRef {
+        chunk_id: target_hex.clone(),
+        kind: "references".to_string(),
+        note: None,
+    }]);
+    let linked_hex = linked.id.expect("oid").to_hex();
+    app.state.db.operation_knowledge_chunks().insert_one(&linked, None).await.expect("insert linked");
+
+    // 校验：linked 的每条 related_chunks 引用都能在库内 find 到（无悬空）。
+    let fetched = app.state.db.operation_knowledge_chunks()
+        .find_one(doc! { "_id": linked.id.unwrap() }, None).await.expect("find linked")
+        .expect("linked exists");
+    for r in fetched.related_chunks.unwrap_or_default() {
+        let ref_oid = ObjectId::parse_str(&r.chunk_id).expect("related chunk_id is valid oid");
+        let resolved = app.state.db.operation_knowledge_chunks()
+            .find_one(doc! { "_id": ref_oid }, None).await.expect("find related").is_some();
+        assert!(resolved, "related_chunks 引用 {} 必须能解析（无悬空）", r.chunk_id);
+    }
+    assert!(catalog_ids(&app, "价格异议").await.contains(&linked_hex), "linked 应可召回");
 }
