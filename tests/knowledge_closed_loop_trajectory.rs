@@ -16,7 +16,14 @@ mod common;
 
 use mongodb::bson::{doc, oid::ObjectId, DateTime as BsonDt};
 use wechatagent::agent::knowledge_agent::{list_catalog, CatalogFilter};
+use wechatagent::auth::AuthenticatedAdmin;
 use wechatagent::models::{OperationKnowledgeChunk, RelatedRef};
+use wechatagent::routes::ext_knowledge::{
+    verify_operation_knowledge_chunk, KnowledgeVerifyRequest,
+};
+
+use axum::extract::{Path, State};
+use axum::{Extension, Json};
 
 use crate::common::TestApp;
 
@@ -202,4 +209,46 @@ async fn relation_graph_has_no_dangling_refs() {
         assert!(resolved, "related_chunks 引用 {} 必须能解析（无悬空）", r.chunk_id);
     }
     assert!(catalog_ids(&app, "价格异议").await.contains(&linked_hex), "linked 应可召回");
+}
+
+/// 门 1d（负例 + 审批路径）：维护 agent 提案落 draft+needs_review 时不可召回；
+/// 仅在显式经生产 verify 审批转 verified 后才进 catalog。锁住「AI 永不自动审定」。
+#[tokio::test]
+#[ignore]
+async fn unverified_draft_not_recallable_until_approved() {
+    let app = TestApp::start().await;
+    reset_ws(&app).await;
+
+    // 维护 agent 提案：落 needs_review（带 source_quote/source_anchors 以便后续 verify）。
+    let mut draft = seed_chunk("退款时效说明", "退款 时效 到账 周期");
+    draft.integrity_status = Some("needs_review".to_string());
+    // status 仍 active（catalog 默认 status=active 过滤），靠 integrity_status 把它挡在外面。
+    let draft_hex = draft.id.expect("oid").to_hex();
+    app.state.db.operation_knowledge_chunks().insert_one(&draft, None).await.expect("insert draft");
+
+    // 负例：未审定不可召回（默认 catalog 只暴露 integrity_status=verified）。
+    let before = catalog_ids(&app, "退款多久到账").await;
+    assert!(!before.contains(&draft_hex), "未审定 draft 不得出现在默认 catalog：{before:?}");
+
+    // 经生产审批路径转 verified。
+    let admin = Extension(AuthenticatedAdmin {
+        user_id: "closed_loop_admin".into(),
+        username: "closed_loop_admin".into(),
+        current_workspace: WS.to_string(),
+    });
+    let req: KnowledgeVerifyRequest =
+        serde_json::from_value(serde_json::json!({ "verifiedClaims": [] })).expect("verify req");
+    let resp = verify_operation_knowledge_chunk(
+        State(app.state.clone()),
+        admin,
+        Path(draft_hex.clone()),
+        Json(req),
+    )
+    .await
+    .expect("verify must succeed");
+    assert_eq!(resp.0.get("ok").and_then(|v| v.as_bool()), Some(true), "verify 应成功：{:?}", resp.0);
+
+    // 审批后可召回。
+    let after = catalog_ids(&app, "退款多久到账").await;
+    assert!(after.contains(&draft_hex), "审批 verified 后应可召回：{after:?}");
 }
