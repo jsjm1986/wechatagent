@@ -180,25 +180,8 @@ jobs:
           REAL_LLM_VISION_MODEL: mimo-v2.5
         run: cargo test --no-fail-fast --test real_llm_knowledge -- --ignored --nocapture
 
-      # 知识库内容质量套件（real_llm_knowledge_quality.rs Q1–Q7）：在 K 系列「红线/
-      # shape」之上叠加**内容质量度量**——同一真模型作 LLM-as-judge（0–10 打分）量化
-      # 7 个 LLM 能力（检索/文章抽取/vision/对话/审计/修复/打标）的专业度。每个 Q
-      # 既硬命中红线（cite⊆seed / 恒 draft+needs_review / 只产 proposal / 审计只读 /
-      # 修复不落库 / 双数组），又断言 judge overall ≥ MIN_QUALITY_FLOOR(6.0)。
-      # 日志里 `[QUALITY] {Qid}/{scene} overall=...` 可被 grep 出每能力分，驱动多轮
-      # 「测→读分→修生产代码→再测」收敛闭环。
-      # !cancelled()：同 real_llm_knowledge 步——不依赖前序步的绿/红。
-      - name: cargo test --test real_llm_knowledge_quality -- --ignored --nocapture
-        if: ${{ !cancelled() && env.REAL_LLM_API_KEY != '' }}
-        env:
-          RUSTFLAGS: ""
-          REAL_LLM_BASE_URL: https://token-plan-cn.xiaomimimo.com/v1
-          REAL_LLM_MODEL: mimo-v2.5-pro
-          REAL_LLM_VISION_MODEL: mimo-v2.5
-        run: cargo test --no-fail-fast --test real_llm_knowledge_quality -- --ignored --nocapture
-
   # 运营 agent 全能力 smoke 独立成 job：原先它在 real-llm job 里排第 4 位，
-  # 前 3 个 smoke/knowledge/quality 套件（real_llm_smoke ~161s + real_llm_knowledge
+  # 前面的 smoke/knowledge/quality 套件（real_llm_smoke ~161s + real_llm_knowledge
   # ~755s + knowledge_quality）会吃掉 45min 墙的绝大部分，导致运营多轮套件
   # （T4–T17，含 K=3 重复采样 judge，每次 judge 调用 ~54s）一开跑就被墙腰斩
   # （round-4 只跑到 t16A-turn1 就被 cancel）。拆成并行 job 后它独享一整个 45min
@@ -245,6 +228,53 @@ jobs:
           REAL_LLM_VISION_MODEL: mimo-v2.5
           REAL_LLM_JUDGE: "1"
         run: cargo test --no-fail-fast --test real_llm_ops_smoke -- --ignored --nocapture
+
+  # 知识库内容质量套件（real_llm_knowledge_quality.rs Q1–Q7）独立成 job：原先它在
+  # real-llm job 里排第 3 位，前 2 个套件（real_llm_smoke ~161s + real_llm_knowledge
+  # ~755s）跑完后只剩 ~30min，而 Q1–Q7 每维 median-of-3 采样 + judge（每次调用
+  # ~54s）整套 >27min，一开跑就被 45min 墙腰斩（round-2 跑到末尾 Q step 被 cancel，
+  # 所有跑出的分都过地板但套件没收尾）。拆成并行 job 后它独享一整个 45min 墙，与
+  # smoke/knowledge 在不同 runner 上并发，互不饿死。MCP 仍是桩（绝不真发微信）。
+  # 每个 Q 既硬命中红线（cite⊆seed / 恒 draft+needs_review / 只产 proposal / 审计
+  # 只读 / 修复不落库 / 双数组），又断言 judge overall ≥ MIN_QUALITY_FLOOR(6.0)。
+  # 日志里 `[QUALITY] {Qid}/{scene} overall=...` 可 grep 出每能力分，驱动多轮
+  # 「测→读分→修生产代码→再测」收敛闭环。
+  real-llm-quality:
+    name: Real-LLM knowledge quality (Q1–Q7 judge / MCP 桩)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    timeout-minutes: 45
+    env:
+      REAL_LLM_API_KEY: ${{ secrets.REAL_LLM_API_KEY }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Free disk space
+        if: ${{ env.REAL_LLM_API_KEY != '' }}
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android \
+            /usr/local/share/boost /usr/local/share/powershell \
+            /usr/lib/jvm "$AGENT_TOOLSDIRECTORY" || true
+          sudo docker image prune --all --force || true
+          df -h
+
+      - name: Install Rust toolchain
+        if: ${{ env.REAL_LLM_API_KEY != '' }}
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry / target
+        if: ${{ env.REAL_LLM_API_KEY != '' }}
+        uses: Swatinem/rust-cache@v2
+
+      - name: cargo test --test real_llm_knowledge_quality -- --ignored --nocapture
+        if: ${{ env.REAL_LLM_API_KEY != '' }}
+        env:
+          RUSTFLAGS: ""
+          REAL_LLM_BASE_URL: https://token-plan-cn.xiaomimimo.com/v1
+          REAL_LLM_MODEL: mimo-v2.5-pro
+          REAL_LLM_VISION_MODEL: mimo-v2.5
+        run: cargo test --no-fail-fast --test real_llm_knowledge_quality -- --ignored --nocapture
 
   # ════════════════════════════════════════════════════════════════════════════
   # 对抗式科学测试仪表台（Phase A：先校准仪器，agent 冻结为对照）。
