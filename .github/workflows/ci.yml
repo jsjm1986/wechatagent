@@ -229,21 +229,40 @@ jobs:
           REAL_LLM_JUDGE: "1"
         run: cargo test --no-fail-fast --test real_llm_ops_smoke -- --ignored --nocapture
 
-  # 知识库内容质量套件（real_llm_knowledge_quality.rs Q1–Q7）独立成 job：原先它在
-  # real-llm job 里排第 3 位，前 2 个套件（real_llm_smoke ~161s + real_llm_knowledge
-  # ~755s）跑完后只剩 ~30min，而 Q1–Q7 每维 median-of-3 采样 + judge（每次调用
-  # ~54s）整套 >27min，一开跑就被 45min 墙腰斩（round-2 跑到末尾 Q step 被 cancel，
-  # 所有跑出的分都过地板但套件没收尾）。拆成并行 job 后它独享一整个 45min 墙，与
-  # smoke/knowledge 在不同 runner 上并发，互不饿死。MCP 仍是桩（绝不真发微信）。
-  # 每个 Q 既硬命中红线（cite⊆seed / 恒 draft+needs_review / 只产 proposal / 审计
-  # 只读 / 修复不落库 / 双数组），又断言 judge overall ≥ MIN_QUALITY_FLOOR(6.0)。
-  # 日志里 `[QUALITY] {Qid}/{scene} overall=...` 可 grep 出每能力分，驱动多轮
-  # 「测→读分→修生产代码→再测」收敛闭环。
+  # 知识库内容质量套件（real_llm_knowledge_quality.rs Q1–Q7）——「裁判校准层」重构后
+  # 升级为双 checkpoint 裁判团（mimo-v2.5-pro + mimo-v2.5）+ 跨裁判分歧效度门 + 每 Q
+  # 金标 good/bad 校准锚 + JSONL 台账。判分从单模型自评（self-enhancement bias）变成
+  # 双裁判各 median-of-3、保守取低裁决；三态正交：跨裁判分歧大 → skip（结论不可信，绝不
+  # 据此放水）；双裁判一致 < MIN_QUALITY_FLOOR(6.0) → fail（修生产代码绝不放水）；校准锚
+  # 拉不开 → skip。硬命中红线（cite⊆seed / 恒 draft+needs_review / 只产 proposal / 审计
+  # 只读 / 修复不落库 / 双数组 + Q2 确定性召回与泛化差距门）原位不动。
+  #
+  # 按 Q 用 matrix 拆并行：原先单 step 跑 Q1–Q7（round-3 实测 1097s），双裁判翻倍后朴素
+  # 串行 ≈73min 必爆 45min 墙。三招解：① run_quality_panel 把 panel×K=2×3=6 次一次
+  # join_all（单判分点串行 162s→~90s），翻倍后比现状还快；② 校准 CALIB_RUNS=1；③ 按 Q
+  # matrix 拆并行，各 Q 独享整个 45min 墙（简单 Q ~2.5min，Q2 旗舰 ~16min），不砍 K=3
+  # 保科学性。max-parallel:2 限流——7 Q + adversarial 7 弧 + smoke/knowledge/ops 共用
+  # 同一把 MiMo key，全并发会瞬时 429 风暴；限并发把瞬时请求压到 ~10 以内（队列中的
+  # matrix job 不启动 timeout 计时，故每 Q 仍独享完整 45min 墙）。MCP 仍是桩（绝不真发
+  # 微信）。台账 artifact `real-llm-ledger-{q}` 含逐裁判每维 / `<cross>` 分歧 / calib /
+  # verdict 行，驱动多轮「测→读分→定位短板→修生产代码→再测」收敛闭环。
   real-llm-quality:
-    name: Real-LLM knowledge quality (Q1–Q7 judge / MCP 桩)
+    name: Real-LLM knowledge quality (${{ matrix.q }} 双裁判 / MCP 桩)
     runs-on: ubuntu-latest
     continue-on-error: true
     timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        q:
+          - q1_retrieval_price_objection_quality
+          - q2_article_extraction_quality
+          - q3_vision_extraction_quality
+          - q4_chat_workstation_quality
+          - q5_completeness_audit_quality
+          - q6_repair_patch_quality
+          - q7_tag_extraction_quality
     env:
       REAL_LLM_API_KEY: ${{ secrets.REAL_LLM_API_KEY }}
     steps:
@@ -267,14 +286,24 @@ jobs:
         if: ${{ env.REAL_LLM_API_KEY != '' }}
         uses: Swatinem/rust-cache@v2
 
-      - name: cargo test --test real_llm_knowledge_quality -- --ignored --nocapture
+      - name: cargo test --test real_llm_knowledge_quality ${{ matrix.q }}
         if: ${{ env.REAL_LLM_API_KEY != '' }}
         env:
           RUSTFLAGS: ""
           REAL_LLM_BASE_URL: https://token-plan-cn.xiaomimimo.com/v1
           REAL_LLM_MODEL: mimo-v2.5-pro
           REAL_LLM_VISION_MODEL: mimo-v2.5
-        run: cargo test --no-fail-fast --test real_llm_knowledge_quality -- --ignored --nocapture
+          REAL_LLM_LEDGER: target/real_llm_ledger
+        run: cargo test --no-fail-fast --test real_llm_knowledge_quality ${{ matrix.q }} -- --ignored --nocapture
+
+      - name: Upload score ledger
+        if: ${{ always() && env.REAL_LLM_API_KEY != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: real-llm-ledger-${{ matrix.q }}
+          path: target/real_llm_ledger/
+          if-no-files-found: ignore
+          retention-days: 30
 
   # ════════════════════════════════════════════════════════════════════════════
   # 对抗式科学测试仪表台（Phase A：先校准仪器，agent 冻结为对照）。
