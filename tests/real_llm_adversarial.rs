@@ -39,7 +39,9 @@ use futures::future::join_all;
 use mongodb::bson::{doc, oid::ObjectId, DateTime, Document};
 use mongodb::options::FindOneOptions;
 use wechatagent::agent::run_envelope::GATEWAY_STATUS_VALUES;
-use wechatagent::agent::{consolidate_contact_memory, handle_follow_up_task, handle_managed_message};
+use wechatagent::agent::{
+    consolidate_contact_memory, handle_follow_up_task, handle_managed_message, record_user_reaction,
+};
 use wechatagent::llm::{LlmClient, LlmProvider};
 use wechatagent::models::{
     AgentProfile, AgentStatus, AgentTask, Contact, ConversationMessage, MemoryCandidate,
@@ -487,14 +489,6 @@ async fn run_panel(panel: &[Judge], arc: &str, turn: usize, label: &str, inbound
 // 能力快照（纯诊断，每轮读回全能力）—— 复制自 ops_smoke 的精简版
 // ════════════════════════════════════════════════════════════════════════════
 
-fn fmt_doc(doc: &Document) -> String {
-    if doc.is_empty() {
-        "<empty>".to_string()
-    } else {
-        doc.to_string()
-    }
-}
-
 /// 读回本轮 reply（最新 decision_review）。
 async fn latest_reply(state: &AppState, wxid: &str) -> String {
     let latest = FindOneOptions::builder().sort(doc! { "created_at": -1 }).build();
@@ -601,6 +595,13 @@ async fn cap_snapshot(state: &AppState, wxid: &str, turn: usize, prev_reply: &st
 async fn run_managed_turn(state: &AppState, contact: &Contact, arc: &str, turn: usize, content: &str) -> bool {
     let inbound = make_inbound(contact, &format!("{arc}_msg_{turn}"), content);
     state.db.messages().insert_one(&inbound, None).await.expect("insert inbound");
+    // 生产 webhook 两步链路：先 record_user_reaction（分析用户对上一条 agent 回复的反应、
+    // push intent_trajectory），再 handle_managed_message 生成本轮回复（webhooks.rs:313/328）。
+    // 红队弧/长程弧都走同一入口 → 与生产对齐。best-effort：内部无 pending review 时自然 no-op，
+    // 返回 Err 不腰斩弧，仅记一行诊断（Phase A 纯诊断纪律）。
+    if let Err(e) = record_user_reaction(state, contact, &inbound).await {
+        eprintln!("[{arc}][turn-{turn}][reaction-err] record_user_reaction 返回 Err（best-effort，不腰斩）: {e:?}");
+    }
     if let Err(e) = handle_managed_message(state, contact.clone(), &inbound).await {
         eprintln!("[{arc}][turn-{turn}][gateway-err] 链路返回 Err（诊断记录，不腰斩弧）: {e:?}");
         ledger_append(
@@ -1171,10 +1172,19 @@ async fn t_longrun_capability() {
         .await
         .expect("query contact")
         .expect("contact 必须在");
+    let final_stage = final_contact
+        .domain_attributes
+        .as_ref()
+        .and_then(|d| d.get_str("customer_stage").ok())
+        .unwrap_or("<none>");
+    let final_intent = final_contact
+        .domain_attributes
+        .as_ref()
+        .and_then(|d| d.get_str("intent_level").ok())
+        .unwrap_or("<none>");
     eprintln!(
-        "[长程][终态] tags={:?} stage={:?} intent_trajectory_len={} memory_summary_len={} commitments={}",
+        "[长程][终态] tags={:?} stage={final_stage} intent={final_intent} intent_trajectory_len={} memory_summary_len={} commitments={}",
         final_contact.tags,
-        final_contact.domain_attributes.as_ref().map(fmt_doc),
         final_contact.intent_trajectory.len(),
         final_contact.memory_summary.as_deref().map(str::len).unwrap_or(0),
         final_contact.commitments.len()
