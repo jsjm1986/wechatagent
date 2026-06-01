@@ -1370,12 +1370,14 @@ fn build_prompt(
 {{"action":"answer","citedChunkIds":["..."],"sourceQuotes":[{{"chunkId":"...","quote":"...","sourceAnchorIndex":0}}],"answer":"..."}}
 
 规则：
-- 分层召回优先：先按文档级目录用 open_document 下钻定位文档的原子摘要，再 open_chunk 展开正文；catalog/document 目录都按与本次 query 的相关度排过序，越靠前越相关。
+- 召回漏斗：catalog 已按与本次 query 的相关度排过序，越靠前越相关。看到与 query 相关的候选，**默认动作就是 open_chunk 展开它的正文**再核对作答。
+- catalog 只给【摘要】且会被截断，回答任何细节问题（具体数字/比例/条件/期限等）前**必须先 open_chunk 读正文**，绝不能仅凭摘要臆测或直接说没有。
+- open_document 仅在你已掌握某条目的 documentId、想一次性查看同文档下其它原子摘要时才用；没有 documentId 时无需 open_document，直接 open_chunk 即可。
+- 只有当 catalog 里确实没有任何与 query 相关的候选时，才回答"知识库无相关内容"并 cited 留空；**在尚未 open 任何相关候选正文之前，禁止下此结论**。
 - citedChunkIds 必须是上面"已 open 的 chunks"中的 chunkId 子集；不能凭空创造。
 - follow_relations 会把最相关的关联条目【正文】直接载入上面"已 open 的 chunks"，可当轮直接 cite，无需再 open_chunk。
 - 每个 cited 必须配 sourceQuote；如某 chunk 没有可引用原文，可省略 sourceQuote 但仍可 cite。
 - 候选 catalog 中所有 chunk 都已 integrity_status=verified；遇到 verified=false 是异常，不要 cite。
-- 当用户查询无相关知识时，answer 直接说"知识库无相关内容"，cited 留空。
 - 不要复述 catalog 中的整段 summary；用自然语言总结答复。"#,
         query = query,
         round = round,

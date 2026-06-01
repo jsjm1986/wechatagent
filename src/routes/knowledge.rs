@@ -1328,6 +1328,8 @@ pub async fn import_operation_knowledge_preview(
 要求：
 - 不要用固定枚举分类；知识类型、适用场景、目录项都用自然语言生成。
 - document 是整篇资料的目录入口；items 是主题包；chunks 是 Agent 运行时真正按需打开的知识切片。
+- 穷尽且忠实抽取：原文中每一个量化事实（数字/比例/金额/期限/数量）及其**限定条件**（起售门槛、前置要求、适用范围、例外、有效期等）都必须落入对应 chunk 的 body，**绝不能丢掉限定条件**只留主数字（例："X 元起，含 N 个起"必须连"含 N 个起"一起保留）。一条原子承载一个规格/事实时尤其要完整。
+- 只忠于原文：body、summary、safeClaims、evidenceItems 只能包含原文已陈述的内容，**禁止补充原文没有的描述、范围、功能、优惠条件或推断**。拿不准是否在原文里，就不写。
 - safeClaims 必须是有依据、可安全对客户表达的事实。
 - forbiddenClaims 必须列出不能承诺、不能暗示、不能编造的内容。
 - 案例、报价、效果数据必须进入 evidenceItems；没有证据不要编造成案例。
@@ -3201,6 +3203,7 @@ pub async fn build_operation_knowledge_completeness(
   **只有第 1 类「已验证客观事实」才能让对应 coverage 维度为 true**；方法论/话术、未审定草稿、缺失一律视为该维度尚未被事实覆盖（coverage=false）。此判据对 pricing / caseEvidence / effectClaims / deliveryBoundary / capability 每一维都同样适用，不得对某一维放宽或收紧。
 - needs_review 切片**尚未审定**，在审定前绝不可作为产品/服务事实依据；若其涉及关键事实维度，必须在 gaps 中写明「该主题存在未核实草稿，需运营审定」，且**不得**因草稿存在就判 fully_supported。
 - summary 字段必须如实反映知识库现状：对任一关键维度，若 verified 侧只有方法论/话术或仅有未审定草稿，summary 要点明「具备相关方法论但缺已审定的客观事实」，不要笼统说「可回答产品事实」。
+- gaps 必须有指导价值：每条 gap 是一句自含的整改指令，需同时写清三要素——①哪个事实维度；②它当前处于哪种认知状态（缺失 / 仅未审定草稿 / 仅方法论话术）；③运营下一步该做什么（补采可验证事实 / 审定指定草稿 / 标注为不可对客）。**禁止**输出「知识不足」「需完善」之类无维度、无状态、无动作的笼统空话。每个未达 verified 客观事实的维度都要各有一条对应 gap，不要把多维并成一句含糊带过。
 
 统计：total={} verified={} anchored={} evidence={} needsReview={}
 
