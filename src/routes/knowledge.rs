@@ -3109,7 +3109,12 @@ pub async fn build_operation_knowledge_completeness(
             "title": chunk.title,
             "knowledgeType": chunk.knowledge_type,
             "businessContext": chunk.business_context,
-            "summary": chunk.summary
+            "summary": chunk.summary,
+            // body 是该切片的实际内容——可验证事实（具体数字/条款/能力陈述）住在这里，
+            // summary 只是一行 teaser。审计要判「该维度有无具体客观事实 vs 仅方法论话术」，
+            // 缺 body 就只能从压缩摘要猜，会把「正文含具体能力事实、摘要却读着像方法论」的
+            // 切片（如整体方案/对比/概念）误判为仅方法论。补 body 是与具体语料无关的根因修复。
+            "body": chunk.body
         }));
     }
     // 待审定（needs_review）切片：审计必须让运营看到「还有多少未审定知识、涉及哪些主题」，
@@ -3209,7 +3214,7 @@ pub async fn build_operation_knowledge_completeness(
 - relationship_only: 没有足够 verified 知识支撑产品/服务事实，只能关系维护、澄清需求、收集信息。
 - product_safe: 可回答部分产品/服务能力，但报价、案例、效果或交付边界仍不足。
 - fully_supported: 能力、边界、证据类内容足够支撑常见产品事实问题。
-- 不要按固定标签硬判，必须从每条切片的 title / knowledgeType / businessContext / summary 的真实语义判断它到底覆盖了什么事实，不要只看标题里的关键词。
+- 不要按固定标签硬判，必须从每条切片的 title / knowledgeType / businessContext / summary / body 的真实语义判断它到底覆盖了什么事实，不要只看标题里的关键词。**body 是切片正文，可验证的具体事实（数字/条款/能力陈述）通常住在 body 而非 summary——summary 读着像方法论不代表该切片没有客观事实，务必读 body 判断。**
 - 认知状态分类（对所有维度一视同仁，不偏向任何单一维度）：把每条切片对某业务维度的支撑程度归为四类之一——
   1. 已验证客观事实：verified 切片含可直接对客的具体事实（确定的数字/条款/边界/案例数据/效果数字等可被核验的客观信息）；
   2. 仅方法论/话术：只讲怎么做、怎么沟通、价值主张、谈判策略，不含可对客的客观事实数字；
