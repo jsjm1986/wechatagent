@@ -604,3 +604,115 @@ proptest! {
     }
 }
 
+// ── #620：rank_key 离线召回度量（recall@k / 命中率，确定性，无 LLM/Docker） ──
+//
+// Gap2 排序层的**质量**回归锁：前两个 rank_key property 锁的是「全序 / now 单调 /
+// superseded 降格」这些代数不变量，但没回答「相关的 chunk 真的会被排进 top-k 吗」。
+// 这里用一组确定性语料 + 已知 relevant 集，按 rank_key 排序后算 recall@k / hit@1，
+// 锁住 #619 的核心承诺：query 相关度主导排序、static confidence/priority 不能把
+// 强相关 chunk 挤出 top-k、superseded/expired 不毒化召回。
+
+/// 对一组 chunk 按 rank_key(query) 降序排，返回排序后的 chunk 引用（top 在前）。
+fn rank_sorted<'a>(
+    query: &str,
+    chunks: &'a [OperationKnowledgeChunk],
+    now: DateTime,
+) -> Vec<&'a OperationKnowledgeChunk> {
+    let mut idx: Vec<&OperationKnowledgeChunk> = chunks.iter().collect();
+    // rank_key 大者更优（effective_relevance 在前），故降序。
+    idx.sort_by(|a, b| rank_key(query, b, now).cmp(&rank_key(query, a, now)));
+    idx
+}
+
+/// recall@k：top-k 命中的 relevant 标题数 / relevant 总数。
+fn recall_at_k(ranked: &[&OperationKnowledgeChunk], relevant: &HashSet<&str>, k: usize) -> f64 {
+    if relevant.is_empty() {
+        return 1.0;
+    }
+    let hit = ranked
+        .iter()
+        .take(k)
+        .filter(|c| relevant.contains(c.title.as_str()))
+        .count();
+    hit as f64 / relevant.len() as f64
+}
+
+#[test]
+fn metric_relevant_chunks_rank_into_top_k() {
+    // 语料：3 条与 query「报价 折扣」强相关（标题/正文含信号），7 条噪声。
+    // 关键反作弊：把强相关的 3 条 dynamic_confidence/priority 全压到最低、
+    // 噪声条全拉到最高静态分——若排序只看 static（#619 的硬伤），相关条会被挤出
+    // top-3。rank_key 必须靠 query 相关度把它们拉回头部。
+    let now = DateTime::now();
+    let mut corpus = Vec::new();
+    // 强相关，故意 static 最差（conf=0.01, priority=0）。
+    corpus.push(mk_rank_chunk("报价规则", "标准报价与折扣阶梯说明", "methodology", 0.01, 0, false, None));
+    corpus.push(mk_rank_chunk("折扣政策", "大客户折扣报价审批", "methodology", 0.02, 0, false, None));
+    corpus.push(mk_rank_chunk("报价折扣常见问答", "报价 折扣 如何组合", "finding", 0.01, 0, false, None));
+    // 噪声，故意 static 最优（conf=0.99, priority=99）。
+    for t in ["售后流程", "物流时效", "退换货", "会员等级", "门店地址", "营业时间", "联系方式"] {
+        corpus.push(mk_rank_chunk(t, "与报价无关的运营资料", "entity", 0.99, 99, false, None));
+    }
+
+    let relevant: HashSet<&str> = ["报价规则", "折扣政策", "报价折扣常见问答"].into_iter().collect();
+    let ranked = rank_sorted("报价 折扣", &corpus, now);
+
+    // recall@3 必须满分：3 条强相关全部进 top-3，static 噪声压不住相关度。
+    let r3 = recall_at_k(&ranked, &relevant, 3);
+    assert!(
+        (r3 - 1.0).abs() < f64::EPSILON,
+        "recall@3 应为 1.0（相关度主导排序），实得 {}；排序后 top5={:?}",
+        r3,
+        ranked.iter().take(5).map(|c| c.title.as_str()).collect::<Vec<_>>(),
+    );
+    // hit@1：排第一的必是 relevant。
+    assert!(
+        relevant.contains(ranked[0].title.as_str()),
+        "top-1 应命中 relevant，实得 {}",
+        ranked[0].title,
+    );
+}
+
+#[test]
+fn metric_superseded_expired_do_not_poison_topk() {
+    // 同一强相关内容存在 3 个版本：live / superseded / expired。三者 query 相关度
+    // 全等，但 trust/recency 必须把 live 排到 superseded、expired 之前——即「永不删」
+    // 不毒化召回（方法论点 4）。再混入噪声，断言 top-1 恒为 live 版。
+    let now = DateTime::now();
+    let past = DateTime::from_millis(now.timestamp_millis() - 7 * 86_400_000);
+    let mut corpus = Vec::new();
+    // 三版本同标题前缀内容，relevance 全等；只 trust/recency 不同。
+    corpus.push(mk_rank_chunk("报价规则-现行", "报价 折扣 阶梯", "methodology", 0.5, 10, false, None));
+    corpus.push(mk_rank_chunk("报价规则-旧版", "报价 折扣 阶梯", "methodology", 0.5, 10, true, None));
+    corpus.push(mk_rank_chunk("报价规则-过期", "报价 折扣 阶梯", "methodology", 0.5, 10, false, Some(past)));
+    // 噪声。
+    for t in ["售后流程", "物流时效", "退换货"] {
+        corpus.push(mk_rank_chunk(t, "与报价无关", "entity", 0.99, 99, false, None));
+    }
+
+    let ranked = rank_sorted("报价 折扣 阶梯", &corpus, now);
+    assert_eq!(
+        ranked[0].title, "报价规则-现行",
+        "live 版必须排在 superseded/expired 同内容之前；实得 top3={:?}",
+        ranked.iter().take(3).map(|c| c.title.as_str()).collect::<Vec<_>>(),
+    );
+    // live 版排名必须严格优于它的 superseded / expired 同内容版本。
+    let pos = |title: &str| ranked.iter().position(|c| c.title == title).unwrap();
+    assert!(pos("报价规则-现行") < pos("报价规则-旧版"), "live 必先于 superseded");
+    assert!(pos("报价规则-现行") < pos("报价规则-过期"), "live 必先于 expired");
+}
+
+#[test]
+fn metric_empty_query_degrades_to_static_order() {
+    // query 为空（无检索意图）→ effective_relevance 恒 0，rank_key 退化为
+    // 「live 优先 + wiki_priority + confidence + priority」静态序。锁这条退化路径：
+    // 高 confidence 的 live chunk 排在低 confidence 之前，不 panic。
+    let now = DateTime::now();
+    let corpus = vec![
+        mk_rank_chunk("低分", "x", "entity", 0.1, 1, false, None),
+        mk_rank_chunk("高分", "y", "entity", 0.9, 1, false, None),
+    ];
+    let ranked = rank_sorted("", &corpus, now);
+    assert_eq!(ranked[0].title, "高分", "空 query 应退化为高 confidence 优先");
+}
+
