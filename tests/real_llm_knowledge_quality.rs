@@ -1430,35 +1430,41 @@ async fn q2_article_extraction_quality() {
     }
 
     // ── 确定性召回断言（不受裁判影响，抗过拟合主门）──────────────────────────
-    let mean = |xs: &[f64]| if xs.is_empty() { 0.0 } else { xs.iter().sum::<f64>() / xs.len() as f64 };
-    let train_mean = mean(&train_recalls);
-    let holdout_mean = mean(&holdout_recalls);
-    let gap = (train_mean - holdout_mean).abs();
+    // 复用 common::generalization 纯函数（与闭环轨迹测试共用同一判据）。
+    let report = common::generalization::generalization_report(
+        &train_recalls,
+        &holdout_recalls,
+        MIN_RECALL_FLOOR,
+        MAX_GENERALIZATION_GAP,
+    );
     eprintln!(
         "[Q2-GENERALIZE] train_recall={:.2}(n={}) holdout_recall={:.2}(n={}) gap={:.2} (max={MAX_GENERALIZATION_GAP})",
-        train_mean, train_recalls.len(), holdout_mean, holdout_recalls.len(), gap
+        report.train_mean, report.train_n, report.holdout_mean, report.holdout_n, report.gap
     );
 
     assert!(
-        !train_recalls.is_empty() && !holdout_recalls.is_empty(),
+        !report.empty_split,
         "Q2 训练/留出集都必须有样本（实际 train={} holdout={}）",
-        train_recalls.len(), holdout_recalls.len()
+        report.train_n, report.holdout_n
     );
     assert!(
-        train_mean >= MIN_RECALL_FLOOR,
-        "Q2 训练集平均召回 {train_mean:.2} < 基线 {MIN_RECALL_FLOOR}——抽取漏掉过多参考事实，\
-         修通用抽取 prompt（原子单元召回），绝不放水"
+        !report.train_below_floor,
+        "Q2 训练集平均召回 {:.2} < 基线 {MIN_RECALL_FLOOR}——抽取漏掉过多参考事实，\
+         修通用抽取 prompt（原子单元召回），绝不放水",
+        report.train_mean
     );
     assert!(
-        holdout_mean >= MIN_RECALL_FLOOR,
-        "Q2 留出集平均召回 {holdout_mean:.2} < 基线 {MIN_RECALL_FLOOR}——在没见过的题材上抽取召回不足，\
-         说明 prompt 通用性不够，修通用认知原则而非堆题材枚举"
+        !report.holdout_below_floor,
+        "Q2 留出集平均召回 {:.2} < 基线 {MIN_RECALL_FLOOR}——在没见过的题材上抽取召回不足，\
+         说明 prompt 通用性不够，修通用认知原则而非堆题材枚举",
+        report.holdout_mean
     );
     assert!(
-        gap <= MAX_GENERALIZATION_GAP,
-        "Q2 泛化差距 {gap:.2} > 上限 {MAX_GENERALIZATION_GAP}（train={train_mean:.2} holdout={holdout_mean:.2}）\
+        !report.gap_exceeded,
+        "Q2 泛化差距 {:.2} > 上限 {MAX_GENERALIZATION_GAP}（train={:.2} holdout={:.2}）\
          ——train 召回远高于 holdout = prompt 被特调适配训练文档（过拟合/作弊）。\
-         必须把 prompt 收敛回与题材无关的通用原则，绝不靠枚举特定文档结构取巧"
+         必须把 prompt 收敛回与题材无关的通用原则，绝不靠枚举特定文档结构取巧",
+        report.gap, report.train_mean, report.holdout_mean
     );
 }
 
