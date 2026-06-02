@@ -1916,6 +1916,49 @@ pub(crate) fn merge_tags_union_capped(old: &[String], new: &[String], cap: usize
     merged
 }
 
+/// 逐消息短期记忆（memory_summary）的保留行数上限。超过时丢弃最旧的行——记忆偏好"保新"，
+/// 与 [`merge_tags_union_capped`] 的"保已累积"方向相反：标签是长期画像资产（误删代价高，保旧），
+/// 短期 memory_summary 是滚动上下文（旧行已被 consolidation 吸收进 memoryCard，保新更有信息量）。
+const MEMORY_SUMMARY_MAX_LINES: usize = 12;
+/// memory_summary 字节软上限。封顶时从最旧行开始整行丢弃直到落到上限内，避免逐字符截断切碎多字节中文。
+const MEMORY_SUMMARY_MAX_BYTES: usize = 1200;
+
+/// 短期记忆写侧去重 + cap（纯函数，无 IO）：把本轮 `update` 追加到 `existing`，
+/// **按整行去重**（已存在的行不重复追加）并按行数 / 字节双重封顶（超限丢最旧行）。
+/// 取代旧的 naive `format!("{existing}\n{update}")` 无界 append——
+/// [[cautious-profiling]] 第 3 点的**结构层**修复：即使 consolidation 长时间不介入，
+/// 逐消息路径自身也不再无界增长 / 不再堆叠重复行。
+///
+/// 语义：
+/// * `update` 自身可能多行；逐行追加，已在结果中出现过的行（trim 后逐字节相等）跳过；
+/// * 追加后若超过 `max_lines` 或 `max_bytes`，从**最旧**行开始整行丢弃（保新）直到两上限都满足；
+/// * 真正的语义压缩 / 冲突消解仍交给有版本锁的 memory consolidation（memoryCard 路径），
+///   逐消息路径只做"防无界 + 防重复"的保守封顶。
+pub(crate) fn merge_memory_summary_dedup_capped(
+    existing: &str,
+    update: &str,
+    max_lines: usize,
+    max_bytes: usize,
+) -> String {
+    let mut lines: Vec<String> = Vec::new();
+    for line in existing.lines().chain(update.lines()) {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if !lines.iter().any(|existing_line| existing_line == trimmed) {
+            lines.push(trimmed.to_string());
+        }
+    }
+    while lines.len() > max_lines {
+        lines.remove(0);
+    }
+    while lines.len() > 1 && lines.iter().map(|l| l.len() + 1).sum::<usize>() > max_bytes {
+        lines.remove(0);
+    }
+    lines.join("\n")
+}
+
 async fn apply_agent_updates(
     state: &AppState,
     contact: &Contact,
@@ -2012,11 +2055,15 @@ async fn apply_agent_updates(
     }
     if !decision.memory_update.trim().is_empty() {
         let existing = contact.memory_summary.clone().unwrap_or_default();
-        let merged = if existing.is_empty() {
-            decision.memory_update.clone()
-        } else {
-            format!("{}\n{}", existing, decision.memory_update)
-        };
+        // [[cautious-profiling]] 第 3 点结构层修复（Phase B Round 3）：旧写法是 naive
+        // `format!("{existing}\n{update}")`，无去重无 cap = consolidation 不介入时无界增长且会
+        // 堆叠重复行。改为按行去重 + 行数/字节双封顶（保新丢旧），与 tags union+cap 同源的写侧严谨化。
+        let merged = merge_memory_summary_dedup_capped(
+            &existing,
+            &decision.memory_update,
+            MEMORY_SUMMARY_MAX_LINES,
+            MEMORY_SUMMARY_MAX_BYTES,
+        );
         set_doc.insert("memory_summary", merged);
     }
 
@@ -3184,5 +3231,51 @@ mod tests {
     fn merge_tags_empty_old_takes_new() {
         let out = merge_tags_union_capped(&[], &s(&["A", "A", "B"]), TAGS_PER_MESSAGE_CAP);
         assert_eq!(out, s(&["A", "B"]), "首次画像吃 new 并去重");
+    }
+
+    // ── Phase B Round 3：memory_summary 去重 + cap 写侧严谨化（[[cautious-profiling]] 第3点）──
+
+    /// ① 空 existing：首条记忆直接落地（不再 naive concat 出前导换行）。
+    #[test]
+    fn memory_summary_empty_existing_takes_update() {
+        let out = merge_memory_summary_dedup_capped("", "用户咨询五万预算方案", 12, 1200);
+        assert_eq!(out, "用户咨询五万预算方案");
+    }
+
+    /// ② 正常追加：existing 与 update 各成一行，保序拼接。
+    #[test]
+    fn memory_summary_appends_new_line() {
+        let out = merge_memory_summary_dedup_capped("第一轮要点", "第二轮要点", 12, 1200);
+        assert_eq!(out, "第一轮要点\n第二轮要点");
+    }
+
+    /// ③ 整行去重：update 重复 existing 已有行时不再堆叠（修旧 naive append 的重复行病灶）。
+    #[test]
+    fn memory_summary_dedups_repeated_line() {
+        let out = merge_memory_summary_dedup_capped("用户否认买意向", "用户否认买意向", 12, 1200);
+        assert_eq!(out, "用户否认买意向", "重复行只保留一份");
+    }
+
+    /// ④ 行数封顶丢最旧（保新）：max_lines=2，已有 [a,b] + 追加 c → [b,c]。
+    #[test]
+    fn memory_summary_line_cap_drops_oldest() {
+        let out = merge_memory_summary_dedup_capped("a\nb", "c", 2, 1200);
+        assert_eq!(out, "b\nc", "超行数上限丢最旧行，保新");
+    }
+
+    /// ⑤ 字节封顶丢最旧：三行各远超半 cap，max_bytes 很小 → 只剩最新行（但至少保 1 行）。
+    #[test]
+    fn memory_summary_byte_cap_drops_oldest_keeps_one() {
+        let line = "x".repeat(40);
+        let existing = format!("{line}\n{line}");
+        let out = merge_memory_summary_dedup_capped(&existing, &line, 12, 50);
+        assert_eq!(out, line, "超字节上限丢到只剩最新一行，绝不丢空");
+    }
+
+    /// ⑥ 空白行被过滤：update 全是空白不污染结果，existing 原样保留。
+    #[test]
+    fn memory_summary_skips_blank_lines() {
+        let out = merge_memory_summary_dedup_capped("要点A", "   \n\n", 12, 1200);
+        assert_eq!(out, "要点A", "空白行不追加");
     }
 }
