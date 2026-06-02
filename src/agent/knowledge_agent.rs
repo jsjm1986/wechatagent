@@ -276,11 +276,14 @@ const SYSTEM_PROMPT: &str = "你是运营知识库的 wiki 研究员。\n\
 pub async fn answer(state: &AppState, req: AnswerRequest) -> AppResult<AnswerResult> {
     // workspace_id 在 answer_inner 消费 req 前先捕获，供失败签名落库时尊重隔离。
     let workspace_id = req.workspace_id.clone();
+    // 原始 query 在 answer_inner 消费 req 前先捕获：诚实弃答时把它确定性写进 gap
+    // 信号，供运营用对话形式补全知识库（零 LLM 依赖，恒在）。
+    let query = req.query.clone();
     let result = answer_inner(state, req, None, None).await?;
     // 在线召回-trace 闭环（方法论点 5）：把本次召回的失败签名 fire-and-forget 入
     // 离线整改队列。镜像 record_chunk_hit 的非阻塞模式——绝不 .await 在召回热路径
     // 内，落库失败只丢日志、不影响已返回给调用方的 result。
-    if let Some(candidate) = classify_recall_outcome(&result) {
+    if let Some(mut candidate) = classify_recall_outcome(&result) {
         let db = state.db.clone();
         let ws = workspace_id.clone();
         // 点 5→点 6 接驳：recall_low_yield = 多 open 少 cite，是典型的「粒度过粗」
@@ -292,7 +295,25 @@ pub async fn answer(state: &AppState, req: AnswerRequest) -> AppResult<AnswerRes
         } else {
             None
         };
+        // recall_miss = 诚实弃答/查无内容：把原始 query 确定性写入待补全线索（恒在，
+        // 不依赖 LLM）；随后在 spawn 内 fire-and-forget 追加一句 LLM 生成的追问，
+        // 两者结合给人类更完整的对话补全入口。low_yield 是结构拆分信号，不带 query。
+        let followup_query = if candidate.kind == "recall_miss" {
+            candidate.search_queries = vec![query.clone()];
+            Some(query.clone())
+        } else {
+            None
+        };
+        let state_clone = state.clone();
         tokio::spawn(async move {
+            // 仅 recall_miss 才生成对话追问；fire-and-forget，失败/超时不影响信号落库。
+            if let Some(q) = followup_query {
+                if let Some(followup) = generate_gap_followup_question(&state_clone, &q).await {
+                    if !followup.is_empty() && followup != q {
+                        candidate.search_queries.push(followup);
+                    }
+                }
+            }
             if let Err(e) = persist_recall_signal(&db, &ws, candidate).await {
                 tracing::warn!(error = %e, "persist_recall_signal failed (non-fatal)");
             }
@@ -316,6 +337,31 @@ pub async fn answer(state: &AppState, req: AnswerRequest) -> AppResult<AnswerRes
         });
     }
     Ok(result)
+}
+
+/// 为「知识库查无可引用知识」生成一句面向人类运营的追问，供其用对话形式补全知识库。
+/// fire-and-forget：任何错误/超时返回 None，调用方回退到仅用原始 query。system/user
+/// 以字面量传入 `generate_agent_json`，不触 prompts.rs；prompt_key 仅作日志/缓存标签。
+async fn generate_gap_followup_question(state: &AppState, query: &str) -> Option<String> {
+    let system = "你是知识库补全助手。知识库对用户问题查无可引用知识。请只输出 JSON \
+                  {\"question\":\"<一句精炼、面向人类运营的追问，引导其补充缺失知识>\"}，\
+                  不要编造任何事实，只生成引导补全的问题。";
+    let user = format!("用户原始问题：{query}\n请生成一句追问。");
+    let v = super::generate_agent_json(
+        state,
+        None,
+        None,
+        None,
+        "knowledge.gap.followup",
+        system,
+        &user,
+    )
+    .await
+    .ok()?;
+    v.get("question")
+        .and_then(|q| q.as_str())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
 }
 
 /// 流式版本：每个 `tool_trace.push` 同步通过 `tx` 发出 [`TraceEvent::Step`]，跑完
@@ -1390,6 +1436,7 @@ fn build_prompt(
 - catalog 只给【摘要】且会被截断，回答任何细节问题（具体数字/比例/条件/期限等）前**必须先 open_chunk 读正文**，绝不能仅凭摘要臆测或直接说没有。
 - open_document 仅在你已掌握某条目的 documentId、想一次性查看同文档下其它原子摘要时才用；没有 documentId 时无需 open_document，直接 open_chunk 即可。
 - 只有当 catalog 里确实没有任何与 query 相关的候选时，才回答"知识库无相关内容"并 cited 留空；**在尚未 open 任何相关候选正文之前，禁止下此结论**。
+- **诚实弃答原则**：判定一条候选能否支撑作答，标准是它是否【直接覆盖本 query 所问的对象与口径】，而非主题词面相近。若 open 后只有【主题相邻、口径不同、或仅部分相关，不能直接回答本 query】的内容，必须诚实说明"知识库仅有近似/相关知识，无法据此确切作答"，并 cited 留空或仅 cite 真正能支撑的部分；**绝不把近似知识当确切事实硬答，绝不编造或外推未在正文中明确给出的数字/比例/条件/期限/范围**。宁可承认不知道，也不臆造。
 - citedChunkIds 必须是上面"已 open 的 chunks"中的 chunkId 子集；不能凭空创造。
 - follow_relations 会把最相关的关联条目【正文】直接载入上面"已 open 的 chunks"，可当轮直接 cite，无需再 open_chunk。
 - 每个 cited 必须配 sourceQuote；如某 chunk 没有可引用原文，可省略 sourceQuote 但仍可 cite。
@@ -1532,13 +1579,18 @@ pub fn classify_recall_outcome(result: &AnswerResult) -> Option<GapSignalCandida
     let cited_count = result.cited_chunk_ids.len();
 
     // 签名 1：recall_miss（最高优先，短路）。
-    if cited_count == 0 && (result.truncated || opened.is_empty()) {
+    // 条件放宽为「本次没产出任何可引用知识 = cited==0」即视为召回偽阴性/诚实弃答：
+    // 不再要求 truncated || opened.is_empty()。诚实弃答的中间态（open 了几条却都
+    // 不相关、未 truncated）此前落空，人类永远收不到补全 TODO；放宽后这类也留 gap
+    // 信号。所有 cited≥1 的用例仍走下方 low_yield/None 分支，cancelled 已在上方短路。
+    if cited_count == 0 {
         let affected: Vec<String> = opened.into_iter().collect();
         return Some(GapSignalCandidate {
             kind: "recall_miss".into(),
             title: "召回偽阴性：查询未命中可引用知识".into(),
             severity: "high".into(),
             affected_chunk_ids: affected,
+            search_queries: Vec::new(),
             description: format!(
                 "本次召回 cited=0（truncated={}，opened_bodies={}）。疑似目标知识缺失、\
                  粒度过粗或放置错位，待运营质检定位补/拆/重分类。",
@@ -1563,6 +1615,7 @@ pub fn classify_recall_outcome(result: &AnswerResult) -> Option<GapSignalCandida
             title: "召回低产出：多 open 少 cite".into(),
             severity: "medium".into(),
             affected_chunk_ids: affected,
+            search_queries: Vec::new(),
             description: format!(
                 "本次 open 正文 {} 个但仅 cite {} 个。原子可能过粗或放错文档，\
                  待运营质检判断该 split / reclassify。",

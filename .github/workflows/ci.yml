@@ -294,6 +294,7 @@ jobs:
           - q5_completeness_audit_quality
           - q6_repair_patch_quality
           - q7_tag_extraction_quality
+          - q8_honest_abstention_quality
     env:
       # 被测内容生成 + 文本双裁判走 deepseek（api.supxh.xin），与 adversarial 套件同 key。
       # MiMo 已弃用（429 配额耗尽 + 端点停用）。`if:` 守卫读此 job 级 env，空 key 时各步自动跳过。

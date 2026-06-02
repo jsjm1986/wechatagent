@@ -505,6 +505,54 @@ async fn k3_real_no_hallucination_when_topic_absent() {
             result.cited_chunk_ids
         );
     }
+
+    // ── 闭环红线（确定性）：诚实弃答路径必产出携带原始 query 的 recall_miss gap 信号 ──
+    // 仅当真模型走了诚实弃答路径（cited 为空）时强断；over-cite 时跳过该断言，避免模型
+    // 方差导致 flaky。原始 query 的写入是确定性的（answer() 同步注入，不依赖 LLM 追问），
+    // 故此断言零模型方差——这正是「确定性闭环」落在 K（而非 Q）的意义。gap 信号经
+    // tokio::spawn fire-and-forget 持久化，有延迟，故 bounded-retry 轮询（~10×300ms）。
+    if result.cited_chunk_ids.is_empty() {
+        let original_query = "你们支持哪些海外支付货币？跨境结算的手续费是多少个百分点？";
+        let mut found: Option<wechatagent::models::KnowledgeGapSignal> = None;
+        for _ in 0..10 {
+            let mut cursor = state
+                .db
+                .knowledge_gap_signals()
+                .find(
+                    doc! { "workspace_id": &ws, "kind": "recall_miss", "status": "pending" },
+                    None,
+                )
+                .await
+                .expect("query knowledge_gap_signals");
+            use futures::StreamExt;
+            while let Some(next) = cursor.next().await {
+                let sig = next.expect("decode gap signal");
+                if sig.search_queries.iter().any(|q| q == original_query) {
+                    found = Some(sig);
+                    break;
+                }
+            }
+            if found.is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        }
+        let sig = found.expect(
+            "诚实弃答（cited 为空）后必须留下 kind=recall_miss / status=pending 的 gap 信号，\
+             且其 search_queries 包含原始 query（确定性闭环：人类可据此用对话补全知识库）",
+        );
+        assert_eq!(sig.kind, "recall_miss", "gap 信号 kind 必须是 recall_miss");
+        assert_eq!(sig.status, "pending", "新留 gap 信号必须是 pending（待人类补全）");
+        assert!(
+            sig.search_queries.iter().any(|q| q == original_query),
+            "gap 信号 search_queries 必须包含原始 query（确定性），实际={:?}",
+            sig.search_queries
+        );
+        eprintln!(
+            "[k3] 闭环 gap 信号 ✓ signal_id={} kind={} search_queries={:?}",
+            sig.signal_id, sig.kind, sig.search_queries
+        );
+    }
 }
 
 // ── K4 · 未审定知识永不上桌（needs_review chunk 永不进 catalog / 永不被 cite）──

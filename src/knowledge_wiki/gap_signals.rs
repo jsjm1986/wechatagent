@@ -400,6 +400,10 @@ pub struct GapSignalCandidate {
     pub title: String,
     pub severity: String,
     pub affected_chunk_ids: Vec<String>,
+    /// 召回缺失场景下的「待人类补全」线索：原始 query + 可选的一句 LLM 生成追问。
+    /// 运营据此用对话形式补充知识库，闭环实际业务知识仓库。默认空（结构/链接类
+    /// 信号不携带 query）；仅 recall_miss（诚实弃答/查无内容）会写入。
+    pub search_queries: Vec<String>,
     pub description: String,
 }
 
@@ -416,6 +420,7 @@ impl GapSignalCandidate {
             title,
             severity: severity.into(),
             affected_chunk_ids: affected,
+            search_queries: Vec::new(),
             description: desc.map(Into::into).unwrap_or_default(),
         }
     }
@@ -581,12 +586,30 @@ pub async fn persist_recall_signal(
         for id in &candidate.affected_chunk_ids {
             merged.insert(id.clone());
         }
-        if merged.len() > before {
-            let new_vec: Vec<String> = merged.into_iter().collect();
+        // search_queries 并集：同一缺失主题反复弃答时累积所有 query 变体（去重、丢空），
+        // 给人类更全的对话补全线索。原 affected_chunk_ids 并集逻辑保持不变。
+        let mut queries: Vec<String> = existing.search_queries.clone();
+        let q_before = queries.len();
+        for q in &candidate.search_queries {
+            if !q.trim().is_empty() && !queries.iter().any(|e| e == q) {
+                queries.push(q.clone());
+            }
+        }
+        let affected_grew = merged.len() > before;
+        let queries_grew = queries.len() > q_before;
+        if affected_grew || queries_grew {
+            let mut set = doc! {};
+            if affected_grew {
+                let new_vec: Vec<String> = merged.into_iter().collect();
+                set.insert("affected_chunk_ids", new_vec);
+            }
+            if queries_grew {
+                set.insert("search_queries", &queries);
+            }
             db.knowledge_gap_signals()
                 .update_one(
                     doc! { "signal_id": &existing.signal_id },
-                    doc! { "$set": { "affected_chunk_ids": &new_vec } },
+                    doc! { "$set": set },
                     None,
                 )
                 .await
@@ -603,7 +626,7 @@ pub async fn persist_recall_signal(
         title: candidate.title,
         description: candidate.description,
         affected_chunk_ids: candidate.affected_chunk_ids,
-        search_queries: Vec::new(),
+        search_queries: candidate.search_queries,
         severity: candidate.severity,
         source: "recall_trace".into(),
         status: "pending".into(),
