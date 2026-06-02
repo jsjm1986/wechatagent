@@ -1,4 +1,5 @@
 use std::num::NonZeroU32;
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock};
 
 use axum::{
@@ -49,6 +50,239 @@ fn limiter_for(account_id: &str, capacity: u32, window_seconds: u32) -> Arc<Webh
         .or_insert_with(|| limiter.clone())
         .clone()
 }
+
+// ───────────────────────── 并发多消息去抖调度器 ─────────────────────────
+//
+// 问题：用户连发多条消息时，旧逻辑每条 webhook 各 spawn 一条独立的
+// decision→review→send 流水线（~10-15s），三条 → 三条并发流水线 → 发三条
+// 回复，且 min_reply_interval 存在 TOCTOU、画像/记忆并发写竞态。
+//
+// 方案 = 去抖聚合 + 单联系人串行 + 新消息抢占重算：
+// - 按联系人单 runner（PENDING 里 entry 存在即"runner 存活"），同一联系人两条
+//   流水线不可能重叠 → 天然串行；
+// - 每条入站刷新 deadline（去抖窗口重置），runner 等用户说完再只跑一次，
+//   聚合由 gateway 的 load_recent_messages 天然完成；
+// - 每条入站 generation +1；runner 跑完一轮发现 generation 变了就重算，并把
+//   "运行期间到新消息"协作式传给网关（should_abort_send），让已过时的生成在
+//   落盘/入队前主动放弃。
+//
+// caveat：PENDING 是进程内 DashMap——串行只在单副本下成立。若 webhook 摄入
+// 将来横向扩多副本，需改用 DB 原子 claim + 心跳（参 tasks.rs 的 lease 模式）。
+
+fn contact_key(workspace_id: &str, account_id: &str, wxid: &str) -> String {
+    format!("{workspace_id}:{account_id}:{wxid}")
+}
+
+/// 单联系人的去抖 / 抢占共享状态。`generation` 每入站 +1，既是去抖触发也是
+/// 抢占信号；`deadline_ms` 每入站刷新即重置去抖窗口；`latest_inbound` 是最新
+/// 入站快照（短锁，绝不跨 `.await` 持有）。
+struct PendingState {
+    generation: AtomicU64,
+    deadline_ms: AtomicI64,
+    latest_inbound: parking_lot::Mutex<ConversationMessage>,
+}
+
+static PENDING: LazyLock<DashMap<String, Arc<PendingState>>> = LazyLock::new(DashMap::new);
+
+fn now_ms() -> i64 {
+    DateTime::now().timestamp_millis()
+}
+
+/// 去抖截止时刻 = now + window，饱和加防溢出（纯函数，便于单测）。
+fn next_deadline_ms(now: i64, window_ms: u64) -> i64 {
+    now.saturating_add(window_ms as i64)
+}
+
+/// 抢占判定：当前 generation 与 runner 起跑时的快照不同 → 期间有新入站。
+fn barge_in_triggered(gen_at_start: u64, current_generation: u64) -> bool {
+    gen_at_start != current_generation
+}
+
+/// 注册一条入站到去抖调度器。在 DashMap `entry()` shard 锁内原子决策
+/// spawn-vs-bump：已有 runner 只刷新 deadline / 替换最新入站 / bump generation
+/// （不再 spawn）；没有则插入新状态并 spawn 一个 runner。返回 true 表示本次
+/// 新起了 runner（调用方据此 spawn）。
+fn register_inbound(
+    key: String,
+    inbound: ConversationMessage,
+    window_ms: u64,
+) -> (Arc<PendingState>, bool) {
+    let deadline = next_deadline_ms(now_ms(), window_ms);
+    let entry = PENDING.entry(key).or_insert_with(|| {
+        Arc::new(PendingState {
+            generation: AtomicU64::new(0),
+            deadline_ms: AtomicI64::new(deadline),
+            latest_inbound: parking_lot::Mutex::new(inbound.clone()),
+        })
+    });
+    let st = entry.clone();
+    // generation 起始 0，本次入站统一 +1 → 首条 runner 起跑快照见到 1。
+    let prev_gen = st.generation.fetch_add(1, Ordering::AcqRel);
+    st.deadline_ms.store(deadline, Ordering::Release);
+    *st.latest_inbound.lock() = inbound;
+    let spawned_now = prev_gen == 0;
+    (st, spawned_now)
+}
+
+/// 去抖 runner 主体：等用户说完（deadline 到）→ 快照 generation + 最新入站 →
+/// reload contact（非 managed 则退休）→ 一次反应分析 + 一次聚合网关（带抢占
+/// guard）→ 若期间有新入站则重算，否则原子退休。
+async fn run_debounce_pipeline(
+    state: AppState,
+    key: String,
+    st: Arc<PendingState>,
+    account_id: String,
+    from_wxid: String,
+    app_id: Option<String>,
+) {
+    use futures::FutureExt;
+    use std::panic::AssertUnwindSafe;
+
+    let state_for_panic = state.clone();
+    let account_for_panic = account_id.clone();
+    let wxid_for_panic = from_wxid.clone();
+    let app_for_panic = app_id.clone();
+    let key_for_panic = key.clone();
+
+    let inner = async move {
+        loop {
+            // (a) 去抖睡眠——可被后到入站刷新 deadline 反复重置。
+            loop {
+                let now = now_ms();
+                let dl = st.deadline_ms.load(Ordering::Acquire);
+                if now >= dl {
+                    break;
+                }
+                let wait = (dl - now).max(0) as u64;
+                tokio::time::sleep(std::time::Duration::from_millis(wait)).await;
+            }
+
+            // (b) 快照本轮 generation + 最新入站（锁立即释放，绝不跨 .await）。
+            let gen_at_start = st.generation.load(Ordering::Acquire);
+            let inbound = st.latest_inbound.lock().clone();
+
+            // (c) reload contact——窗口期可能转 unmanaged / 被删，早退。
+            let contact = match reload_managed_contact(&state, &from_wxid, &account_id).await {
+                Ok(Some(c)) => c,
+                Ok(None) => {
+                    PENDING.remove(&key);
+                    return;
+                }
+                Err(error) => {
+                    let _ = agent::write_event_for_account(
+                        &state,
+                        &account_id,
+                        Some(&from_wxid),
+                        "agent_error",
+                        "failed",
+                        &format!("debounce reload contact failed: {error}"),
+                        app_id.clone().map(|v| doc! { "app_id": v }),
+                    )
+                    .await;
+                    PENDING.remove(&key);
+                    return;
+                }
+            };
+
+            // (d) 一次反应分析（每串只在最新入站上跑一次 → 串行化，修反应写竞态）。
+            if let Err(error) = agent::record_user_reaction(&state, &contact, &inbound).await {
+                let _ = agent::write_event_for_account(
+                    &state,
+                    &account_id,
+                    Some(&from_wxid),
+                    "agent_error",
+                    "failed",
+                    &format!("record_user_reaction failed: {error}"),
+                    app_id.clone().map(|v| doc! { "app_id": v }),
+                )
+                .await;
+            } else {
+                // (e) 一次聚合网关，带协作式抢占 guard：运行期间 generation 变了即放弃。
+                let guard_state = st.clone();
+                let guard: Arc<dyn Fn() -> bool + Send + Sync> = Arc::new(move || {
+                    barge_in_triggered(gen_at_start, guard_state.generation.load(Ordering::Acquire))
+                });
+                if let Err(error) = agent::handle_managed_message_aggregated(
+                    &state,
+                    contact,
+                    &inbound,
+                    Some(guard),
+                )
+                .await
+                {
+                    let _ = agent::write_event_for_account(
+                        &state,
+                        &account_id,
+                        Some(&from_wxid),
+                        "agent_error",
+                        "failed",
+                        &error.to_string(),
+                        app_id.clone().map(|v| doc! { "app_id": v }),
+                    )
+                    .await;
+                }
+            }
+
+            // (f) 运行期间有新入站 → 重算（deadline 已被 register_inbound 刷新过）。
+            if barge_in_triggered(gen_at_start, st.generation.load(Ordering::Acquire)) {
+                continue;
+            }
+
+            // (g) 原子退休：谓词在 shard 锁内复核 generation 未变才移除；若晚到
+            // 入站刚 bump 过 generation，谓词失败 → 不移除 → 回 loop 重算。
+            if PENDING
+                .remove_if(&key, |_, s| {
+                    s.generation.load(Ordering::Acquire) == gen_at_start
+                })
+                .is_some()
+            {
+                return;
+            }
+        }
+    };
+
+    if let Err(panic_payload) = AssertUnwindSafe(inner).catch_unwind().await {
+        // runner panic：写事件 + 移除 state，下条入站会重 spawn。一次 panic 最多
+        // 丢在途这一串（与旧 per-webhook spawn 同爆炸半径）。
+        PENDING.remove(&key_for_panic);
+        let panic_msg = panic_payload_message(&panic_payload);
+        tracing::error!(
+            account_id = %account_for_panic,
+            wxid = %wxid_for_panic,
+            panic = %panic_msg,
+            "debounce pipeline panicked"
+        );
+        let _ = agent::write_event_for_account(
+            &state_for_panic,
+            &account_for_panic,
+            Some(&wxid_for_panic),
+            "webhook_handler_panic",
+            "warning",
+            &format!("debounce pipeline panicked: {panic_msg}"),
+            app_for_panic.map(|v| doc! { "app_id": v }),
+        )
+        .await;
+    }
+}
+
+/// reload contact 并判定是否仍 managed。返回 `Ok(None)` 表示不存在或已非 managed
+/// （runner 应退休，只持久化不应答）。
+async fn reload_managed_contact(
+    state: &AppState,
+    wxid: &str,
+    account_id: &str,
+) -> AppResult<Option<Contact>> {
+    let contact = state
+        .db
+        .contacts()
+        .find_one(
+            doc! { "account_id": account_id, "wxid": wxid },
+            None,
+        )
+        .await?;
+    Ok(contact.filter(|c| c.agent_status == AgentStatus::Managed))
+}
+
 
 pub async fn wechat_webhook(
     State(state): State<AppState>,
@@ -289,76 +523,34 @@ pub async fn wechat_webhook(
 
     // P2：MCP（GeWe-agent）那一侧 fetch(messageWebhookUrl) 用了 5s AbortController
     // timeout 且失败不重试。Agent 决策 + Review 流水线一次约 10–15s，远超
-     // 5s，必须把它挪到后台 spawn，主请求落库后立即 ack。
+    // 5s，必须把它挪到后台 spawn，主请求落库后立即 ack。
+    //
+    // 并发多消息去抖：不再每条 webhook 直接 spawn 一条流水线，而是注册到按联系人
+    // 的去抖调度器。已有 runner 时只刷新 deadline + bump generation（不 spawn）；
+    // 没有时插入状态并 spawn 一个 runner。runner 等去抖窗口到再跑一次聚合流水线，
+    // 运行期间到的新消息会触发抢占重算（见 run_debounce_pipeline）。
     let managed = contact.agent_status == AgentStatus::Managed;
     if managed {
-        let bg_state = state.clone();
-        let bg_contact = contact.clone();
-        let bg_inbound = inbound.clone();
-        let bg_account_id = account_id.clone();
-        let bg_from_wxid = from_wxid.clone();
-        let bg_app_id = app_id.clone();
-        tokio::spawn(async move {
-            // P1-7：per-webhook spawn 也包一层 catch_unwind。这里和 main.rs
-            // 长寿 worker 不同，一次 panic 只丢一条消息（不需要重启），但仍要
-            // 写 agent_events.kind=webhook_handler_panic 让 admin 看见。
-            use futures::FutureExt;
-            use std::panic::AssertUnwindSafe;
-            let bg_state_for_panic = bg_state.clone();
-            let bg_account_for_panic = bg_account_id.clone();
-            let bg_wxid_for_panic = bg_from_wxid.clone();
-            let bg_app_for_panic = bg_app_id.clone();
-            let inner = async move {
-                if let Err(error) =
-                    agent::record_user_reaction(&bg_state, &bg_contact, &bg_inbound).await
-                {
-                    let _ = agent::write_event_for_account(
-                        &bg_state,
-                        &bg_account_id,
-                        Some(&bg_from_wxid),
-                        "agent_error",
-                        "failed",
-                        &format!("record_user_reaction failed: {error}"),
-                        bg_app_id.clone().map(|v| doc! { "app_id": v }),
-                    )
-                    .await;
-                    return;
-                }
-                if let Err(error) =
-                    agent::handle_managed_message(&bg_state, bg_contact, &bg_inbound).await
-                {
-                    let _ = agent::write_event_for_account(
-                        &bg_state,
-                        &bg_account_id,
-                        Some(&bg_from_wxid),
-                        "agent_error",
-                        "failed",
-                        &error.to_string(),
-                        bg_app_id.map(|v| doc! { "app_id": v }),
-                    )
-                    .await;
-                }
-            };
-            if let Err(panic_payload) = AssertUnwindSafe(inner).catch_unwind().await {
-                let panic_msg = panic_payload_message(&panic_payload);
-                tracing::error!(
-                    account_id = %bg_account_for_panic,
-                    wxid = %bg_wxid_for_panic,
-                    panic = %panic_msg,
-                    "webhook background handler panicked"
-                );
-                let _ = agent::write_event_for_account(
-                    &bg_state_for_panic,
-                    &bg_account_for_panic,
-                    Some(&bg_wxid_for_panic),
-                    "webhook_handler_panic",
-                    "warning",
-                    &format!("webhook background handler panicked: {panic_msg}"),
-                    bg_app_for_panic.map(|v| doc! { "app_id": v }),
+        let key = contact_key(&workspace_id, &account_id, &from_wxid);
+        let window_ms = state.config.message_debounce_window_ms;
+        let (st, spawned_now) = register_inbound(key.clone(), inbound.clone(), window_ms);
+        if spawned_now {
+            let bg_state = state.clone();
+            let bg_account_id = account_id.clone();
+            let bg_from_wxid = from_wxid.clone();
+            let bg_app_id = app_id.clone();
+            tokio::spawn(async move {
+                run_debounce_pipeline(
+                    bg_state,
+                    key,
+                    st,
+                    bg_account_id,
+                    bg_from_wxid,
+                    bg_app_id,
                 )
                 .await;
-            }
-        });
+            });
+        }
     }
 
     Ok(Json(serde_json::json!({
@@ -757,6 +949,71 @@ mod hmac_tests {
     #[test]
     fn verify_rejects_empty_key() {
         assert!(!verify_hmac_sha256(b"", b"x", &"00".repeat(32)));
+    }
+}
+
+#[cfg(test)]
+mod debounce_tests {
+    use super::*;
+
+    #[test]
+    fn contact_key_is_workspace_account_wxid() {
+        assert_eq!(contact_key("ws", "acct", "wx1"), "ws:acct:wx1");
+    }
+
+    #[test]
+    fn next_deadline_adds_window() {
+        assert_eq!(next_deadline_ms(1_000, 4_000), 5_000);
+        assert_eq!(next_deadline_ms(0, 1_000), 1_000);
+    }
+
+    #[test]
+    fn next_deadline_saturates_instead_of_overflow() {
+        // 饱和加：i64::MAX + window 不应回绕成负数（否则 runner 立即认为已过期）。
+        assert_eq!(next_deadline_ms(i64::MAX, 4_000), i64::MAX);
+        assert_eq!(next_deadline_ms(i64::MAX - 1, 4_000), i64::MAX);
+    }
+
+    #[test]
+    fn barge_in_triggers_only_on_generation_change() {
+        // generation 未变 → 无新入站 → 不抢占。
+        assert!(!barge_in_triggered(3, 3));
+        // generation 变了 → 期间有新入站 → 抢占重算。
+        assert!(barge_in_triggered(3, 4));
+        assert!(barge_in_triggered(0, 1));
+    }
+
+    #[test]
+    fn register_first_inbound_spawns_then_subsequent_only_bump() {
+        // 用唯一 key 避免与其它测试共享全局 PENDING。
+        let key = "ws-test:acct-test:wx-debounce-spawn".to_string();
+        PENDING.remove(&key);
+        let msg = ConversationMessage {
+            id: None,
+            workspace_id: "ws-test".to_string(),
+            account_id: "acct-test".to_string(),
+            contact_wxid: "wx-debounce-spawn".to_string(),
+            message_id: None,
+            dedupe_key: None,
+            direction: MessageDirection::Inbound,
+            content: "hi".to_string(),
+            raw: None,
+            created_at: DateTime::now(),
+        };
+
+        let (st1, spawned1) = register_inbound(key.clone(), msg.clone(), 4_000);
+        assert!(spawned1, "首条入站 SHALL 触发 spawn");
+        assert_eq!(st1.generation.load(Ordering::Acquire), 1);
+
+        // 第二、三条：runner 已活，只 bump generation，不再 spawn。
+        let (st2, spawned2) = register_inbound(key.clone(), msg.clone(), 4_000);
+        assert!(!spawned2, "后续入站 SHALL NOT 再 spawn");
+        assert_eq!(st2.generation.load(Ordering::Acquire), 2);
+        let (st3, spawned3) = register_inbound(key.clone(), msg.clone(), 4_000);
+        assert!(!spawned3);
+        assert_eq!(st3.generation.load(Ordering::Acquire), 3);
+
+        PENDING.remove(&key);
     }
 }
 

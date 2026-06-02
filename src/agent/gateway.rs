@@ -80,7 +80,28 @@ pub async fn handle_managed_message(
     contact: Contact,
     inbound: &ConversationMessage,
 ) -> AppResult<()> {
-    run_user_operation_gateway(state, contact, AgentTrigger::Inbound(inbound), None).await
+    run_user_operation_gateway(state, contact, AgentTrigger::Inbound(inbound), None, None).await
+}
+
+/// 并发多消息去抖：与 [`handle_managed_message`] 等价，但额外带一个协作式
+/// 中止判定 `should_abort_send`。调度器在用户连发多条时只起一个 runner，
+/// 跑这条聚合流水线；运行期间若有更新的入站到达，`should_abort_send()` 返回
+/// true，网关会在落盘 / 入队前放弃这次（已过时的）生成，交由调度器用更全
+/// 的上下文重算。判定为纯查询（读 generation 计数），无副作用、可多次调用。
+pub async fn handle_managed_message_aggregated(
+    state: &AppState,
+    contact: Contact,
+    inbound: &ConversationMessage,
+    should_abort_send: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
+) -> AppResult<()> {
+    run_user_operation_gateway(
+        state,
+        contact,
+        AgentTrigger::Inbound(inbound),
+        None,
+        should_abort_send,
+    )
+    .await
 }
 
 pub async fn handle_follow_up_task(state: &AppState, task: AgentTask) -> AppResult<()> {
@@ -100,7 +121,8 @@ pub async fn handle_follow_up_task(state: &AppState, task: AgentTask) -> AppResu
         )
         .await?
         .ok_or_else(|| AppError::NotFound("follow-up contact not found".to_string()))?;
-    run_user_operation_gateway(state, contact, AgentTrigger::FollowUp(&task), Some(task_id)).await
+    run_user_operation_gateway(state, contact, AgentTrigger::FollowUp(&task), Some(task_id), None)
+        .await
 }
 
 pub async fn send_contact_message_gateway(
@@ -403,6 +425,7 @@ pub(crate) async fn run_user_operation_gateway(
     contact: Contact,
     trigger: AgentTrigger<'_>,
     task_id: Option<ObjectId>,
+    should_abort_send: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
 ) -> AppResult<()> {
     let run_id = uuid::Uuid::new_v4().to_string();
     let inbound = trigger_message(&contact, &trigger);
@@ -438,6 +461,7 @@ pub(crate) async fn run_user_operation_gateway(
                 inbound,
                 domain_config,
                 runtime,
+                should_abort_send,
             ),
         )
         .await
@@ -453,6 +477,7 @@ async fn run_user_operation_gateway_inner(
     inbound: ConversationMessage,
     domain_config: Option<OperationDomainConfig>,
     runtime: UserRuntimeParameters,
+    should_abort_send: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
 ) -> AppResult<()> {
     // S1.1 (Phase 0)：派生 R0.1 envelope 的 (source_event_id, source_kind)，
     // 在所有终态写入点透传，确保 agent_run_logs 闭集字段非空。
@@ -1291,6 +1316,39 @@ async fn run_user_operation_gateway_inner(
         return Ok(());
     }
 
+    // 并发多消息去抖——主中止检查（强制落在 apply_agent_updates 之前）。
+    //
+    // 决策与审查已完成，但尚未写任何画像 / 记忆 / outbox。若此刻调度器观察到
+    // 更新的入站（用户在这次生成期间又发了消息），should_abort_send() 返回 true：
+    // 放弃这次已过时的生成，写一条终态 run log（gateway_status=
+    // superseded_by_new_inbound），交由调度器用更全的上下文重算。
+    //
+    // 关键：必须在 apply_agent_updates 之前——后者无条件把 last_agent_run_at 推到
+    // now，若先落库再放弃，重算时 precheck 会因 min_reply_interval 误判 rate_limited
+    // 吞掉聚合回复。这里直接 return 不触碰 last_agent_run_at，重算 precheck 干净。
+    if let Some(guard) = &should_abort_send {
+        if guard() {
+            write_agent_run_log(
+                state,
+                &contact,
+                &run_id,
+                trigger.kind(),
+                "superseded_by_new_inbound",
+                &planner,
+                doc! { "refreshed": should_refresh_context, "version": context_pack.get_i32("version").unwrap_or_default() },
+                &knowledge_route,
+                to_document(&final_decision).unwrap_or_default(),
+                to_document(&review).unwrap_or_default(),
+                to_document(&final_precheck).unwrap_or_default(),
+                None,
+                &envelope_source_event_id,
+                &envelope_source_kind,
+            )
+            .await?;
+            return Ok(());
+        }
+    }
+
     if final_decision.should_reply && !final_decision.reply_text.trim().is_empty() {
         if let Some(task_id) = task_id {
             // W4 / Task 5.5：发送改异步走 outbox，把 task 状态推进为
@@ -1408,6 +1466,22 @@ async fn run_user_operation_gateway_inner(
     let outbox_eligible = final_decision.should_reply
         && !final_decision.reply_text.trim().is_empty()
         && (final_status == "approved" || final_status == "revision_applied_approved");
+    // 并发多消息去抖——兜底中止检查（outbox 入队之前）。主检查在 apply 之前已挡掉
+    // 绝大多数；这里再查一次，接住 apply / memory / decision-review 写入期间到达的
+    // 更新入站，避免发出一条已过时的回复。此前的画像 / 记忆写入已落库（幂等、
+    // last-write-wins），重算会再覆盖一遍，不丢正确性；唯一保证是"不入队过时回复"。
+    if outbox_eligible {
+        if let Some(guard) = &should_abort_send {
+            if guard() {
+                tracing::info!(
+                    %run_id,
+                    contact_wxid = %contact.wxid,
+                    "outbox enqueue skipped: superseded by newer inbound"
+                );
+                return Ok(());
+            }
+        }
+    }
     if outbox_eligible {
         let source_event_id = match &trigger {
             AgentTrigger::Inbound(msg) => msg.message_id.clone().unwrap_or_default(),

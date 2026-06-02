@@ -18,6 +18,10 @@ pub struct AppConfig {
     pub default_account_id: String,
     pub agent_recent_message_limit: i64,
     pub agent_min_reply_interval_seconds: i64,
+    /// 并发多消息去抖窗口（毫秒）。用户连发多条时，调度器在收到最后一条后
+    /// 等待此窗口再跑一次聚合流水线，把整串消息塌成一次回复（去抖 + 单联系人串行）。
+    /// 默认 4000ms（3-5s 区间中点），clamp 到 [1000, 10000] 防退化忙等 / 误填。
+    pub message_debounce_window_ms: u64,
     pub task_worker_interval_seconds: u64,
     pub llm_timeout_seconds: u64,
     pub llm_max_retries: u32,
@@ -312,6 +316,9 @@ impl AppConfig {
             agent_recent_message_limit: env_or("AGENT_RECENT_MESSAGE_LIMIT", "12").parse()?,
             agent_min_reply_interval_seconds: env_or("AGENT_MIN_REPLY_INTERVAL_SECONDS", "20")
                 .parse()?,
+            message_debounce_window_ms: env_or("MESSAGE_DEBOUNCE_WINDOW_MS", "4000")
+                .parse::<u64>()?
+                .clamp(1000, 10_000),
             task_worker_interval_seconds: env_or("TASK_WORKER_INTERVAL_SECONDS", "30").parse()?,
             llm_timeout_seconds: env_or("LLM_TIMEOUT_SECONDS", "45").parse()?,
             llm_max_retries: env_or("LLM_MAX_RETRIES", "5").parse()?,

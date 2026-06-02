@@ -63,8 +63,8 @@ pub(crate) use self::budget::{current_run_budget, RUN_BUDGET};
 // 入口函数 / 类型重新导出，保持与拆分前 `crate::agent::xxx` 完全一致。
 pub use decision::{build_initial_operation_profile, load_operation_playbook_for_contact};
 pub use gateway::{
-    handle_follow_up_task, handle_managed_message, send_contact_message_gateway,
-    write_event_for_account,
+    handle_follow_up_task, handle_managed_message, handle_managed_message_aggregated,
+    send_contact_message_gateway, write_event_for_account,
 };
 pub use knowledge_router::test_knowledge_route_for_contact;
 // Agent-first 渐进式披露入口：`/api/knowledge/ask` 路由直接调用本 agent。

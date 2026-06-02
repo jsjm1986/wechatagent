@@ -124,6 +124,10 @@ pub const GATEWAY_STATUS_VALUES: &[&str] = &[
     // P0-7 (Phase 0)：admin SPA 显式取消任务时写入。AI 自治语义上 admin 是
     // 维护操作员（不是把对话权交给真人继续聊天），cancel_reason 字段记录管理员触发上下文。
     "admin_cancelled",
+    // 并发多消息去抖：在途 run 在落盘 / 入队前观察到更新的入站消息，主动放弃
+    // 这次（已过时的）生成，交由调度器用更全的上下文重算。语义是"被更新的入站
+    // 取代"（superseded by newer inbound），是外部信号触发的过程态，仍属 AI 自治闭环。
+    "superseded_by_new_inbound",
 ];
 
 /// 严禁取值（R2.7 业务语义保护 + R9.2）。任何 finalReviewStatus / gateway_status
@@ -239,6 +243,8 @@ pub fn derive_lifecycle_from_status(gateway_status: &str, error: Option<&str>) -
         "not_managed" | "cooldown" | "rate_limited" | "daily_limit" | "expired"
         | "context_changed" | "policy_cooldown" | "policy_wait_user_reply"
         | "precheck_blocked" => LIFECYCLE_FAILED_BEFORE_DECISION,
+        // 并发去抖：被更新的入站取代 → 外部信号中止（终态已存在，吸收态）。
+        "superseded_by_new_inbound" => LIFECYCLE_ABORTED_BY_EXTERNAL_SIGNAL,
         _ => LIFECYCLE_FAILED_AFTER_DECISION,
     }
 }
@@ -1125,6 +1131,36 @@ mod tests {
             derive_lifecycle_from_status("cooldown", None),
             LIFECYCLE_FAILED_BEFORE_DECISION
         );
+    }
+
+    #[test]
+    fn superseded_by_new_inbound_is_valid_and_maps_to_external_abort() {
+        // 并发多消息去抖：在途 run 被更新的入站取代时写 gateway_status=
+        // superseded_by_new_inbound。校验三点：
+        // 1) 是合法 gateway_status（写库不被 R9.10.e 阻断）；
+        // 2) 推算 lifecycle 为既有的 aborted_by_external_signal 终态；
+        // 3) 不污染 finalReviewStatus 闭集（过程态只由 gateway_status 承载）。
+        assert!(
+            assert_gateway_status_valid("superseded_by_new_inbound").is_ok(),
+            "superseded_by_new_inbound SHALL 是合法 gateway_status"
+        );
+        assert_eq!(
+            derive_lifecycle_from_status("superseded_by_new_inbound", None),
+            LIFECYCLE_ABORTED_BY_EXTERNAL_SIGNAL,
+            "被更新入站取代 SHALL 推算为 aborted_by_external_signal"
+        );
+        // started/running → aborted_by_external_signal 都是合法转换（终态可达）。
+        assert!(is_valid_lifecycle_transition(
+            LIFECYCLE_RUNNING,
+            LIFECYCLE_ABORTED_BY_EXTERNAL_SIGNAL
+        ));
+        // 不进 finalReviewStatus 闭集——过程态绝不污染终评枚举。
+        assert!(
+            !FINAL_REVIEW_STATUS_VALUES.contains(&"superseded_by_new_inbound"),
+            "superseded_by_new_inbound 绝不进 finalReviewStatus 闭集"
+        );
+        // 对禁词集合 clean（自治语义，非外部交接）。
+        assert!(assert_final_review_status_valid("approved").is_ok());
     }
 
     #[test]
