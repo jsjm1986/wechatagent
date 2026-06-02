@@ -72,8 +72,13 @@ fn real_llm_from_env() -> Option<Arc<LlmClient>> {
     let base_url = std::env::var("REAL_LLM_BASE_URL")
         .unwrap_or_else(|_| "https://api.supxh.xin/v1".to_string());
     let model = std::env::var("REAL_LLM_MODEL").unwrap_or_else(|_| "deepseek-v4-pro".to_string());
+    // 重试配置对齐 adversarial 套件的 (180, 5, 2500)：两套件共享同一 deepseek 端点
+    // (api.supxh.xin)，并发互撞导致 429/瞬时不可达。adversarial 用 max_retries=5 +
+    // retry_base_ms=2500 实测能骑过这段抖动拿到真分，本套件原 (3, 1500) 偏弱，多轮
+    // 6/7 Q 因 rate_limited/calib_judge_unavailable 瞬时 skip 拿不到真分。抬齐重试预算
+    // 让仪器穿过共享端点抖动——纯测试仪器抗抖动，不动生产代码、不改任何断言。
     let client =
-        LlmClient::new(base_url, api_key, model, 180, 3, 1500).expect("构造真实 LlmClient");
+        LlmClient::new(base_url, api_key, model, 180, 5, 2500).expect("构造真实 LlmClient");
     Some(Arc::new(client))
 }
 
@@ -439,8 +444,10 @@ fn quality_judge_panel() -> Option<Vec<QualityJudge>> {
     // REAL_LLM_VISION_MODEL 彻底解耦（vision 仍走 MiMo 多模态，judge 走 deepseek 文本）。
     let lite = std::env::var("REAL_LLM_JUDGE_LITE_MODEL")
         .unwrap_or_else(|_| "deepseek-v4-flash".to_string());
-    let c1 = LlmClient::new(base_url.clone(), api_key.clone(), pro, 180, 3, 1500).ok()?;
-    let c2 = LlmClient::new(base_url, api_key, lite, 180, 3, 1500).ok()?;
+    // 重试 (180, 5, 2500)：双裁判与被测内容共享 deepseek 端点，对齐 adversarial 套件
+    // 抗共享端点 429/瞬时抖动（详见 real_llm_from_env 注释）。
+    let c1 = LlmClient::new(base_url.clone(), api_key.clone(), pro, 180, 5, 2500).ok()?;
+    let c2 = LlmClient::new(base_url, api_key, lite, 180, 5, 2500).ok()?;
     let mut panel = vec![
         QualityJudge {
             label: "deepseek-pro",
@@ -472,7 +479,8 @@ fn hetero_qwen_judge() -> Option<QualityJudge> {
     let base_url = std::env::var("QWEN_JUDGE_BASE_URL")
         .unwrap_or_else(|_| "https://dashscope.aliyuncs.com/compatible-mode/v1".to_string());
     let model = std::env::var("QWEN_JUDGE_MODEL").unwrap_or_else(|_| "qwen3.7-max".to_string());
-    let c = LlmClient::new(base_url, api_key, model, 180, 3, 1500).ok()?;
+    // 重试 (180, 5, 2500)：与文本裁判一致；DashScope 偶有限流，抬齐预算抗抖动。
+    let c = LlmClient::new(base_url, api_key, model, 180, 5, 2500).ok()?;
     Some(QualityJudge {
         label: "qwen-hetero",
         client: Arc::new(c) as Arc<dyn LlmProvider>,
@@ -1699,8 +1707,8 @@ async fn q3_vision_extraction_quality() {
         model: vision_model,
         is_active: false,
         timeout_seconds: Some(180),
-        max_retries: Some(3),
-        retry_base_ms: Some(1500),
+        max_retries: Some(5),
+        retry_base_ms: Some(2500),
         supports_vision: true,
         is_vision_active: true,
         created_at: DateTime::now(),
