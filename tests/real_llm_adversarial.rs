@@ -64,7 +64,12 @@ fn real_llm_from_env() -> Option<Arc<LlmClient>> {
     let base_url = std::env::var("REAL_LLM_BASE_URL")
         .unwrap_or_else(|_| "https://token-plan-cn.xiaomimimo.com/v1".to_string());
     let model = std::env::var("REAL_LLM_MODEL").unwrap_or_else(|_| "mimo-v2.5-pro".to_string());
-    let client = LlmClient::new(base_url, api_key, model, 180, 3, 1500).expect("构造真实 LlmClient");
+    // 重试参数 max_retries=5 / base_ms=2500（退避序列 ~2.5/5/10/20s，总恢复窗口 ~37s）：
+    // gpt-5.5 端点偶发 HTTP 503 `auth_unavailable: no auth available (providers=codex)`，
+    // 是端点后端 codex provider 间歇性鉴权/配额不可用（非速率限制）。旧 3/1500（窗口 ~4.5s）
+    // 对鉴权恢复偏短 → Round 5 有 3/7 弧 turn-1 即被 503 收弧。加大窗口给端点恢复时间
+    // （同 round-9 限并发解 429 一类基础设施抗性修复，纯测试侧、零生产改动、反过拟合-clean）。
+    let client = LlmClient::new(base_url, api_key, model, 180, 5, 2500).expect("构造真实 LlmClient");
     Some(Arc::new(client))
 }
 
@@ -302,7 +307,9 @@ fn judge_panel() -> Option<Vec<Judge>> {
     // judge1 的 label 从真实 model 名派生（leak 成 &'static str，测试二进制内一次性、有界）。
     // 主模型从 MiMo 换 gpt-5.5 后，台账 `judge` 字段须如实反映被测/裁判模型，否则跨轮读账串味。
     let label1: &'static str = Box::leak(pro.clone().into_boxed_str());
-    let c1 = LlmClient::new(base_url.clone(), api_key.clone(), pro, 180, 3, 1500).ok()?;
+    // 重试参数同 real_llm_from_env 加大到 5/2500：判分调用也走 gpt-5.5/Qwen 端点，
+    // 同样可能撞 503 auth_unavailable，给裁判调用同等恢复窗口防判分丢采样。
+    let c1 = LlmClient::new(base_url.clone(), api_key.clone(), pro, 180, 5, 2500).ok()?;
 
     // 第二裁判：优先跨家族 Qwen（REAL_LLM_JUDGE2_API_KEY）；缺则退化回同家族 MiMo lite。
     let (label2, c2) = match std::env::var("REAL_LLM_JUDGE2_API_KEY")
@@ -315,13 +322,13 @@ fn judge_panel() -> Option<Vec<Judge>> {
             });
             let j2_model =
                 std::env::var("REAL_LLM_JUDGE2_MODEL").unwrap_or_else(|_| "qwen3.7-max".to_string());
-            let c = LlmClient::new(j2_base, j2_key, j2_model, 180, 3, 1500).ok()?;
+            let c = LlmClient::new(j2_base, j2_key, j2_model, 180, 5, 2500).ok()?;
             ("qwen-max", c)
         }
         None => {
             let lite =
                 std::env::var("REAL_LLM_VISION_MODEL").unwrap_or_else(|_| "mimo-v2.5".to_string());
-            let c = LlmClient::new(base_url, api_key, lite, 180, 3, 1500).ok()?;
+            let c = LlmClient::new(base_url, api_key, lite, 180, 5, 2500).ok()?;
             ("mimo-lite", c)
         }
     };
