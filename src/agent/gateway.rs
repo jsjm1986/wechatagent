@@ -1885,6 +1885,37 @@ fn flip_of(old: Option<&str>, new: Option<&str>) -> Option<(String, String)> {
     }
 }
 
+/// 逐消息自动回复路径的标签累积上限。union 后超过此数时，本轮新增的溢出标签暂不并入
+/// （保留已累积画像），真正的裁剪 / 去重 / 冲突消解交给有版本锁的 memory consolidation
+/// 路径，而非每条消息的写侧——逐消息路径保守优先。
+const TAGS_PER_MESSAGE_CAP: usize = 16;
+
+/// 标签写侧 union + cap（纯函数，无 IO）：把本轮 `new` 标签**只增不减**地并入已累积
+/// `old`，去重保序，封顶 `cap`。取代旧的整体覆盖写法——
+/// [[cautious-profiling]] 红线的**结构层**防御：即使 LLM 单轮 `decision.tags` 漏掉已
+/// 累积标签或贴情景标签，结构层也保证长期画像不被一句弱信号抹平。
+///
+/// 语义：
+/// * 先保留全部 `old`（累积画像优先），再追加 `new` 中 old 未含的标签；
+/// * 封顶时保留靠前（累积）标签、丢弃溢出新增——宁可不更新，不要误抹；删除 / 替换交给
+///   consolidation（有版本锁 / 去重 / 冲突追踪），不在逐消息路径做。
+///
+/// 定位仿 [`compute_profile_churn`]：纯函数、可确定性单测、零副作用。注意 churn 探针仍按
+/// `decision.tags` **原始单轮意图**量化（不看 merge 结果），故结构层修复后 churn 仍能独立
+/// 反映 LLM 单轮是否还想丢标签 / 贴情景标签。
+pub(crate) fn merge_tags_union_capped(old: &[String], new: &[String], cap: usize) -> Vec<String> {
+    let mut merged: Vec<String> = Vec::with_capacity(old.len() + new.len());
+    for tag in old.iter().chain(new.iter()) {
+        if !merged.iter().any(|m| m == tag) {
+            merged.push(tag.clone());
+        }
+    }
+    if merged.len() > cap {
+        merged.truncate(cap);
+    }
+    merged
+}
+
 async fn apply_agent_updates(
     state: &AppState,
     contact: &Contact,
@@ -1900,7 +1931,14 @@ async fn apply_agent_updates(
         set_doc.insert("agent_profile", to_document(profile)?);
     }
     if !decision.tags.is_empty() {
-        set_doc.insert("tags", to_bson_array(&decision.tags));
+        // [[cautious-profiling]] 结构层修复（Phase B Round 2）：旧写法 `set_doc.insert("tags",
+        // to_bson_array(&decision.tags))` 是**整体覆盖**——LLM 单轮只要给非空 tags 就把累积画像
+        // 整列替换，无 union / 无置信门 / 无情景标签隔离。情景压力下 LLM 倾向输出本轮情景化标签
+        // （实测对抗压力弧贴 "对抗测试"），直接覆写成持久画像。改为 union + cap：只增不减地并入，
+        // 保证一句弱信号无法抹平长期标签。删除 / 替换 / 冲突消解交给有版本锁的 consolidation
+        // 路径，逐消息写侧保守优先（宁可不更新，不要误抹）。churn 探针仍按原始 decision.tags 量化。
+        let merged = merge_tags_union_capped(&contact.tags, &decision.tags, TAGS_PER_MESSAGE_CAP);
+        set_doc.insert("tags", to_bson_array(&merged));
     }
     if let Some(value) = non_empty_option(&decision.customer_stage) {
         // 旧 customer_stage 字段已删除，统一写入 domain_attributes 容器。
@@ -3104,5 +3142,47 @@ mod tests {
         assert_eq!(r.tags_added, 0);
         assert_eq!(r.tags_net, 0);
         assert!(!r.notable);
+    }
+
+    // ---- merge_tags_union_capped 标签写侧结构层防御（纯函数，确定性单测）----
+
+    /// ① 累积画像不被单轮覆盖：old=[A,B,C] new=[A] → 仍含 [A,B,C]（保序，只增不减）。
+    /// 这是 [[cautious-profiling]] 结构层红线——一句弱信号无法抹平长期标签。
+    #[test]
+    fn merge_tags_keeps_accumulated_against_overwrite() {
+        let out = merge_tags_union_capped(
+            &s(&["高LTV老客户", "技术", "理性决策"]),
+            &s(&["高LTV老客户"]),
+            TAGS_PER_MESSAGE_CAP,
+        );
+        assert_eq!(out, s(&["高LTV老客户", "技术", "理性决策"]), "覆盖式单轮不得丢累积标签");
+    }
+
+    /// ② 新增标签 union 进来：old=[A,B] new=[C] → [A,B,C]，old 在前保序。
+    #[test]
+    fn merge_tags_appends_new_in_order() {
+        let out = merge_tags_union_capped(&s(&["A", "B"]), &s(&["C"]), TAGS_PER_MESSAGE_CAP);
+        assert_eq!(out, s(&["A", "B", "C"]));
+    }
+
+    /// ③ 去重：old 与 new 重叠只保留一份，且保 old 的位置。
+    #[test]
+    fn merge_tags_dedups_overlap() {
+        let out = merge_tags_union_capped(&s(&["A", "B"]), &s(&["B", "D"]), TAGS_PER_MESSAGE_CAP);
+        assert_eq!(out, s(&["A", "B", "D"]), "重叠去重，保 old 顺序");
+    }
+
+    /// ④ 封顶保累积、丢溢出新增：cap=2，old=[A,B] new=[C] → [A,B]（宁可不更新）。
+    #[test]
+    fn merge_tags_cap_prefers_accumulated() {
+        let out = merge_tags_union_capped(&s(&["A", "B"]), &s(&["C"]), 2);
+        assert_eq!(out, s(&["A", "B"]), "封顶时丢溢出新增，保累积画像");
+    }
+
+    /// ⑤ old 空：首次画像直接吃 new（去重保序），不受影响。
+    #[test]
+    fn merge_tags_empty_old_takes_new() {
+        let out = merge_tags_union_capped(&[], &s(&["A", "A", "B"]), TAGS_PER_MESSAGE_CAP);
+        assert_eq!(out, s(&["A", "B"]), "首次画像吃 new 并去重");
     }
 }
