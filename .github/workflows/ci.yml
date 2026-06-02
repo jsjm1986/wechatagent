@@ -379,7 +379,10 @@ jobs:
           - t_adv_knowledge_fabrication_bait
           - t_longrun_capability
     env:
-      REAL_LLM_API_KEY: ${{ secrets.REAL_LLM_API_KEY }}
+      # 全面弃用 MiMo（用户 2026-06-02 决策）：被测 agent + 主裁判都换 gpt-5.5（备用
+      # secret REAL_LLM_BACKUP_API_KEY，端点见下方 step env）。`if:` 守卫读 job 级此 env，
+      # 故空 key（未配 backup secret）时整个 adversarial job 各步自动跳过、不红不耗 CI 分钟。
+      REAL_LLM_API_KEY: ${{ secrets.REAL_LLM_BACKUP_API_KEY }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -405,14 +408,18 @@ jobs:
         if: ${{ env.REAL_LLM_API_KEY != '' }}
         env:
           RUSTFLAGS: ""
-          REAL_LLM_BASE_URL: https://token-plan-cn.xiaomimimo.com/v1
-          REAL_LLM_MODEL: mimo-v2.5-pro
-          REAL_LLM_VISION_MODEL: mimo-v2.5
+          # 主模型（被测 agent + 主裁判 judge1 共用 REAL_LLM_MODEL/_BASE_URL/_API_KEY）换 gpt-5.5。
+          # 端点是明文 HTTP + 裸 IP（用户 2026-06-02 明确「没有 https 就用 http 就行」，已接受
+          # 不再追问）。gpt-5.5 走 OpenAI 兼容 /v1，reasoning_content 落独立字段被 serde 忽略
+          # → 零生产代码改动。judge1 的台账 label 从该 model 名派生，跨轮读账不串味。
+          REAL_LLM_BASE_URL: http://123.56.164.230:3002/v1
+          REAL_LLM_MODEL: gpt-5.5
+          REAL_LLM_VISION_MODEL: gpt-5.5
           REAL_LLM_JUDGE: "1"
           REAL_LLM_LEDGER: target/real_llm_ledger
-          # round-5 起裁判团第二裁判换成跨家族 Qwen（阿里 DashScope，OpenAI 兼容协议）
-          # ——跨家族 median 分歧才暴露家族级共享盲区（同家族双 checkpoint 测不到）。
-          # 缺该 secret 时 judge_panel() 自动退化回 MiMo lite，不致整团失效。
+          # 第二裁判 = 跨家族 Qwen（阿里 DashScope，OpenAI 兼容）。主裁判换 gpt-5.5 后与被测
+          # agent 同家族自评，跨家族效度信号**完全依赖**这一路 Qwen——读账以 |gpt5.5−qwen| 为
+          # 家族盲区代理。缺该 secret 时 judge_panel() 退化回 lite 第二裁判（用 VISION_MODEL）。
           REAL_LLM_JUDGE2_API_KEY: ${{ secrets.REAL_LLM_JUDGE2_API_KEY }}
           REAL_LLM_JUDGE2_BASE_URL: https://dashscope.aliyuncs.com/compatible-mode/v1
           REAL_LLM_JUDGE2_MODEL: qwen3.7-max

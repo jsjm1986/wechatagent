@@ -277,13 +277,17 @@ struct Judge {
     client: Arc<dyn LlmProvider>,
 }
 
-/// 构造**跨家族**裁判团：① mimo-v2.5-pro（REAL_LLM_MODEL，小米 MiMo，已校准锚裁判）
+/// 构造**跨家族**裁判团：① 主裁判 = REAL_LLM_MODEL（与被测 agent 同一主模型，本轮起
+/// gpt-5.5，经 ci.yml 指向 http://123.56.164.230:3002/v1；label 从 model 名派生写台账）
 /// + ② 跨家族第二裁判（REAL_LLM_JUDGE2_*，默认阿里 DashScope qwen3.7-max）。
 ///
-/// round-4 起从「MiMo 双 checkpoint（同家族，残留家族级盲区）」升级为「MiMo × Qwen
-/// 跨家族」——跨家族 median 分歧才能真正暴露**家族级共享盲区**（单家族两 checkpoint 测不到）。
-/// Qwen 已用 11 条品类级金标离线校准：4 核心维高/低端 8 例全 HIT、中性轮两把尺 2 例 HIT，
-/// 仅「中性中间带 5-6」这一**已知最难歧义带**偏高（正是跨家族要暴露的 rubric 歧义，非误判）。
+/// 全面弃用 MiMo（用户 2026-06-02 决策）：主模型与主裁判都换 gpt-5.5，跨家族效度仍靠
+/// 异族 Qwen 第二裁判守住。注意主裁判与被测 agent 同为 gpt-5.5（同家族自评），故跨家族
+/// 分歧信号完全依赖 Qwen 那一路——读账时以 |gpt5.5 − qwen| 为家族盲区代理，不能只看 gpt5.5 自评。
+///
+/// round-4 起从「MiMo 双 checkpoint（同家族）」升级为跨家族；Qwen 已用 11 条品类级金标离线
+/// 校准：4 核心维高/低端 8 例全 HIT、中性轮两把尺 2 例 HIT，仅「中性中间带 5-6」这一**已知最难
+/// 歧义带**偏高（正是跨家族要暴露的 rubric 歧义，非误判）。
 ///
 /// DashScope 走 OpenAI 兼容协议（`/compatible-mode/v1`）→ `LlmClient::new` 默认
 /// `LlmFormat::Openai` 直接可用；Qwen 的思维链落在独立 `reasoning_content` 字段，serde
@@ -295,6 +299,9 @@ fn judge_panel() -> Option<Vec<Judge>> {
     let base_url = std::env::var("REAL_LLM_BASE_URL")
         .unwrap_or_else(|_| "https://token-plan-cn.xiaomimimo.com/v1".to_string());
     let pro = std::env::var("REAL_LLM_MODEL").unwrap_or_else(|_| "mimo-v2.5-pro".to_string());
+    // judge1 的 label 从真实 model 名派生（leak 成 &'static str，测试二进制内一次性、有界）。
+    // 主模型从 MiMo 换 gpt-5.5 后，台账 `judge` 字段须如实反映被测/裁判模型，否则跨轮读账串味。
+    let label1: &'static str = Box::leak(pro.clone().into_boxed_str());
     let c1 = LlmClient::new(base_url.clone(), api_key.clone(), pro, 180, 3, 1500).ok()?;
 
     // 第二裁判：优先跨家族 Qwen（REAL_LLM_JUDGE2_API_KEY）；缺则退化回同家族 MiMo lite。
@@ -320,7 +327,7 @@ fn judge_panel() -> Option<Vec<Judge>> {
     };
 
     Some(vec![
-        Judge { label: "mimo-pro", client: Arc::new(c1) as Arc<dyn LlmProvider> },
+        Judge { label: label1, client: Arc::new(c1) as Arc<dyn LlmProvider> },
         Judge { label: label2, client: Arc::new(c2) as Arc<dyn LlmProvider> },
     ])
 }
