@@ -65,13 +65,14 @@ fn real_llm_from_env() -> Option<Arc<LlmClient>> {
     let base_url = std::env::var("REAL_LLM_BASE_URL")
         .unwrap_or_else(|_| "https://token-plan-cn.xiaomimimo.com/v1".to_string());
     let model = std::env::var("REAL_LLM_MODEL").unwrap_or_else(|_| "mimo-v2.5-pro".to_string());
-    // 重试参数 max_retries=5 / base_ms=2500（退避序列 ~2.5/5/10/20s，总恢复窗口 ~37s）：
-    // 真实大模型端点偶发 5xx（gpt-5.5 曾频发 HTTP 503 `auth_unavailable: no auth available
-    // (providers=codex)`，是端点后端 provider 间歇性鉴权/配额不可用，非速率限制）。旧 3/1500
-    // （窗口 ~4.5s）对鉴权恢复偏短 → Round 5 有 3/7 弧 turn-1 即被 503 收弧。加大窗口给端点恢复
-    // 时间（同 round-9 限并发解 429 一类基础设施抗性修复，纯测试侧、零生产改动、反过拟合-clean）。
-    // 本轮起主模型 = deepseek-v4-pro（api.supxh.xin，HTTPS），仍保留此恢复窗以防端点抖动。
-    let client = LlmClient::new(base_url, api_key, model, 180, 5, 2500).expect("构造真实 LlmClient");
+    // 重试参数 base_ms=2500（退避序列 ~2.5/5/10/20s）。max_retries 由 `primary_max_retries()`
+    // 决定：**有备胎时 1（fail-fast ~2.5s 切 kimi）、无备胎时 5（熬 ~37s 恢复窗）**——见该函数
+    // 注释（Round 10 解 429 风暴下 failover 重试税撞 45min job 墙）。真实大模型端点偶发 5xx
+    // （gpt-5.5 曾频发 HTTP 503 `auth_unavailable`，是端点后端 provider 间歇性鉴权/配额不可用，
+    // 非速率限制）；无备胎时旧 3/1500（窗口 ~4.5s）对鉴权恢复偏短 → Round 5 有 3/7 弧 turn-1
+    // 即被 503 收弧，故缺备胎仍保 5。本轮起主模型 = deepseek-v4-pro（api.supxh.xin，HTTPS）。
+    let client = LlmClient::new(base_url, api_key, model, 180, primary_max_retries(), 2500)
+        .expect("构造真实 LlmClient");
     Some(Arc::new(client))
 }
 
@@ -148,17 +149,36 @@ impl LlmProvider for FailoverProvider {
     }
 }
 
-/// 从 env 构造备胎链（默认 NVIDIA `/v1` 上 kimi-k2.6 / minimax-m2.7 / glm-5.1，已延迟升序）。
-/// 缺 `REAL_LLM_FAILOVER_API_KEY` → 返 `vec![]`，FailoverProvider 退化为「只主模型」=
-/// 与今天行为完全一致（不回归、不强依赖 NVIDIA key）。
-fn failover_backups() -> Vec<Arc<LlmClient>> {
-    let key = match std::env::var("REAL_LLM_FAILOVER_API_KEY")
+/// FAILOVER key 是否已配——决定①备胎链是否可用、②主模型该 fail-fast 还是熬满重试窗。
+fn failover_key_present() -> bool {
+    std::env::var("REAL_LLM_FAILOVER_API_KEY")
         .ok()
         .filter(|k| !k.trim().is_empty())
-    {
-        Some(k) => k,
-        None => return Vec::new(),
-    };
+        .is_some()
+}
+
+/// 主模型重试预算（Round 10）：**有健康备胎（FAILOVER key 已配）时主模型 fail-fast**——只 1
+/// 次退避（≈2.5s）就切备胎，而非熬满 5 次（≈37s）。根因：Round 9 实测 calibration 弧在
+/// deepseek 端点 429 风暴下，failover 虽每采样都生效兜底，但**每次都要先干等 ~37s 主模型
+/// 重试耗尽才切 kimi**，144 次调用累积把正常 ~7min 的弧吹爆撞 45min job 墙被 cancel。备胎
+/// （kimi 1.9s）健康可用时，主模型没必要久等——快速切换才真正「全程跑完」。**缺备胎（无 key）
+/// 时维持 5（≈37s 恢复窗熬过端点抖动），与 Round 9 前行为完全一致（无回归）**。
+fn primary_max_retries() -> u32 {
+    if failover_key_present() {
+        1
+    } else {
+        5
+    }
+}
+
+/// 从 env 构造备胎链（默认 NVIDIA `/v1` 上 kimi-k2.6 / minimax-m2.7 / glm-5.1，已延迟升序）。
+/// 缺 `REAL_LLM_FAILOVER_API_KEY` → 返 `vec![]`，FailoverProvider 退化为「只主模型」=
+/// 与今天行为完全一致（不回归、不强依赖 NVIDIA key）。备胎自身保留 5 次重试（兜底网应尽力）。
+fn failover_backups() -> Vec<Arc<LlmClient>> {
+    if !failover_key_present() {
+        return Vec::new();
+    }
+    let key = std::env::var("REAL_LLM_FAILOVER_API_KEY").unwrap_or_default();
     let base = std::env::var("REAL_LLM_FAILOVER_BASE_URL")
         .unwrap_or_else(|_| "https://integrate.api.nvidia.com/v1".to_string());
     failover_model_list()
@@ -183,11 +203,7 @@ fn failover_model_list() -> Vec<String> {
 /// 台账判定：某次成功采样的 `res.model` 是否来自备胎（用于打 `fallback` 标记）。
 /// 缺 FAILOVER key → 备胎链空 → 永远 false（正常轮台账无 fallback 噪声）。
 fn is_backup_model(model: &str) -> bool {
-    if std::env::var("REAL_LLM_FAILOVER_API_KEY")
-        .ok()
-        .filter(|k| !k.trim().is_empty())
-        .is_none()
-    {
+    if !failover_key_present() {
         return false;
     }
     failover_model_list().iter().any(|m| m == model)
@@ -488,9 +504,10 @@ fn judge_panel() -> Option<Vec<Judge>> {
     // judge1 的 label 从真实 model 名派生（leak 成 &'static str，测试二进制内一次性、有界）。
     // 台账 `judge` 字段须如实反映裁判模型，否则跨轮读账串味。
     let label1: &'static str = Box::leak(judge1_model.clone().into_boxed_str());
-    // 重试参数同 real_llm_from_env 加大到 5/2500：判分调用也走 deepseek/Qwen 端点，给端点
-    // 偶发 5xx 同等恢复窗口防判分丢采样（沿用 gpt-5.5 503 一轮立的基础设施抗性参数）。
-    let c1 = LlmClient::new(base_url.clone(), api_key.clone(), judge1_model, 180, 5, 2500).ok()?;
+    // 重试参数 base_ms=2500，max_retries 走 `primary_max_retries()`（有备胎 1 / 无备胎 5）：
+    // 判分调用也走 deepseek/Qwen 端点，有备胎时 fail-fast 快速切 kimi 兜底判分、无备胎时保 ~37s
+    // 恢复窗防判分丢采样（Round 10 解 429 风暴下重试税撞 45min 墙）。
+    let c1 = LlmClient::new(base_url.clone(), api_key.clone(), judge1_model, 180, primary_max_retries(), 2500).ok()?;
 
     // 第二裁判：优先跨家族 Qwen（REAL_LLM_JUDGE2_API_KEY）；缺则退化回同家族 MiMo lite。
     let (label2, label2_endpoint, c2) = match std::env::var("REAL_LLM_JUDGE2_API_KEY")
@@ -503,13 +520,13 @@ fn judge_panel() -> Option<Vec<Judge>> {
             });
             let j2_model =
                 std::env::var("REAL_LLM_JUDGE2_MODEL").unwrap_or_else(|_| "qwen3.7-max".to_string());
-            let c = LlmClient::new(j2_base.clone(), j2_key, j2_model, 180, 5, 2500).ok()?;
+            let c = LlmClient::new(j2_base.clone(), j2_key, j2_model, 180, primary_max_retries(), 2500).ok()?;
             ("qwen-max", j2_base, c)
         }
         None => {
             let lite =
                 std::env::var("REAL_LLM_VISION_MODEL").unwrap_or_else(|_| "mimo-v2.5".to_string());
-            let c = LlmClient::new(base_url.clone(), api_key.clone(), lite, 180, 5, 2500).ok()?;
+            let c = LlmClient::new(base_url.clone(), api_key.clone(), lite, 180, primary_max_retries(), 2500).ok()?;
             ("mimo-lite", base_url.clone(), c)
         }
     };
@@ -531,7 +548,7 @@ fn judge_panel() -> Option<Vec<Judge>> {
             .unwrap_or_else(|_| "https://open.bigmodel.cn/api/coding/paas/v4".to_string());
         let j3_model =
             std::env::var("REAL_LLM_JUDGE3_MODEL").unwrap_or_else(|_| "GLM-5.1".to_string());
-        if let Ok(c3) = LlmClient::new(j3_base.clone(), j3_key, j3_model, 180, 5, 2500) {
+        if let Ok(c3) = LlmClient::new(j3_base.clone(), j3_key, j3_model, 180, primary_max_retries(), 2500) {
             panel.push(Judge { label: "glm-5.1", endpoint: j3_base, client: wrap_with_failover("glm-5.1".to_string(), Arc::new(c3)) });
         }
     }
@@ -545,7 +562,7 @@ fn judge_panel() -> Option<Vec<Judge>> {
     if let Ok(j4_model) = std::env::var("REAL_LLM_MODEL") {
         if !j4_model.trim().is_empty() {
             let label4: &'static str = Box::leak(format!("{j4_model}-selfeval").into_boxed_str());
-            if let Ok(c4) = LlmClient::new(base_url.clone(), api_key, j4_model, 180, 5, 2500) {
+            if let Ok(c4) = LlmClient::new(base_url.clone(), api_key, j4_model, 180, primary_max_retries(), 2500) {
                 panel.push(Judge { label: label4, endpoint: base_url, client: wrap_with_failover(label4.to_string(), Arc::new(c4)) });
             }
         }
