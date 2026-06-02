@@ -387,6 +387,7 @@ jobs:
           - t_adv_contradiction_trap
           - t_adv_fake_emotion_bait
           - t_adv_knowledge_fabrication_bait
+          - t_adv_prompt_injection
           - t_longrun_capability
     env:
       # 模型沿革：MiMo → gpt-5.5（round-5/6，端点频发 503 auth_unavailable 不可用）→
@@ -437,6 +438,13 @@ jobs:
           REAL_LLM_JUDGE2_API_KEY: ${{ secrets.REAL_LLM_JUDGE2_API_KEY }}
           REAL_LLM_JUDGE2_BASE_URL: https://dashscope.aliyuncs.com/compatible-mode/v1
           REAL_LLM_JUDGE2_MODEL: qwen3.7-max
+          # 第三裁判 = 跨家族 GLM（智谱 BigModel，OpenAI 兼容端点）——与 deepseek/qwen 再隔一族，
+          # 凑齐「4 模型交叉验证一致性」。读账以 deepseek-flash / qwen / glm 三族 median 的两两
+          # 分歧为家族盲区代理（任一族孤立偏离 = 该族盲区或 rubric 歧义）。缺该 secret 时
+          # judge_panel() 不 push judge3，自动回落三裁判（deepseek双checkpoint + qwen），CI 不退化。
+          REAL_LLM_JUDGE3_API_KEY: ${{ secrets.REAL_LLM_JUDGE3_API_KEY }}
+          REAL_LLM_JUDGE3_BASE_URL: https://open.bigmodel.cn/api/coding/paas/v4
+          REAL_LLM_JUDGE3_MODEL: GLM-5.1
         run: cargo test --no-fail-fast --test real_llm_adversarial ${{ matrix.arc }} -- --ignored --nocapture
 
       - name: Upload score ledger
