@@ -410,6 +410,12 @@ jobs:
           REAL_LLM_VISION_MODEL: mimo-v2.5
           REAL_LLM_JUDGE: "1"
           REAL_LLM_LEDGER: target/real_llm_ledger
+          # round-5 起裁判团第二裁判换成跨家族 Qwen（阿里 DashScope，OpenAI 兼容协议）
+          # ——跨家族 median 分歧才暴露家族级共享盲区（同家族双 checkpoint 测不到）。
+          # 缺该 secret 时 judge_panel() 自动退化回 MiMo lite，不致整团失效。
+          REAL_LLM_JUDGE2_API_KEY: ${{ secrets.REAL_LLM_JUDGE2_API_KEY }}
+          REAL_LLM_JUDGE2_BASE_URL: https://dashscope.aliyuncs.com/compatible-mode/v1
+          REAL_LLM_JUDGE2_MODEL: qwen3.7-max
         run: cargo test --no-fail-fast --test real_llm_adversarial ${{ matrix.arc }} -- --ignored --nocapture
 
       - name: Upload score ledger

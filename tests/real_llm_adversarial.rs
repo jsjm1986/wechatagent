@@ -277,20 +277,51 @@ struct Judge {
     client: Arc<dyn LlmProvider>,
 }
 
-/// 构造 MiMo 双 checkpoint 裁判团：mimo-v2.5-pro（REAL_LLM_MODEL）+ mimo-v2.5
-/// （REAL_LLM_VISION_MODEL）。同家族——接受可能残留家族级盲区（用户已选"先用 MiMo
-/// 双 checkpoint"），但跨 checkpoint 分歧仍能暴露 rubric 歧义。缺 key → None。
+/// 构造**跨家族**裁判团：① mimo-v2.5-pro（REAL_LLM_MODEL，小米 MiMo，已校准锚裁判）
+/// + ② 跨家族第二裁判（REAL_LLM_JUDGE2_*，默认阿里 DashScope qwen3.7-max）。
+///
+/// round-4 起从「MiMo 双 checkpoint（同家族，残留家族级盲区）」升级为「MiMo × Qwen
+/// 跨家族」——跨家族 median 分歧才能真正暴露**家族级共享盲区**（单家族两 checkpoint 测不到）。
+/// Qwen 已用 11 条品类级金标离线校准：4 核心维高/低端 8 例全 HIT、中性轮两把尺 2 例 HIT，
+/// 仅「中性中间带 5-6」这一**已知最难歧义带**偏高（正是跨家族要暴露的 rubric 歧义，非误判）。
+///
+/// DashScope 走 OpenAI 兼容协议（`/compatible-mode/v1`）→ `LlmClient::new` 默认
+/// `LlmFormat::Openai` 直接可用；Qwen 的思维链落在独立 `reasoning_content` 字段，serde
+/// `ChatMessage` 只反序列化 `content`（干净 JSON）→ **零生产代码改动**。
+///
+/// 缺主 key → None（整个裁判团关闭）。缺 JUDGE2 key → 退化回 MiMo lite 第二裁判（不致整团失效）。
 fn judge_panel() -> Option<Vec<Judge>> {
     let api_key = std::env::var("REAL_LLM_API_KEY").ok().filter(|k| !k.trim().is_empty())?;
     let base_url = std::env::var("REAL_LLM_BASE_URL")
         .unwrap_or_else(|_| "https://token-plan-cn.xiaomimimo.com/v1".to_string());
     let pro = std::env::var("REAL_LLM_MODEL").unwrap_or_else(|_| "mimo-v2.5-pro".to_string());
-    let lite = std::env::var("REAL_LLM_VISION_MODEL").unwrap_or_else(|_| "mimo-v2.5".to_string());
     let c1 = LlmClient::new(base_url.clone(), api_key.clone(), pro, 180, 3, 1500).ok()?;
-    let c2 = LlmClient::new(base_url, api_key, lite, 180, 3, 1500).ok()?;
+
+    // 第二裁判：优先跨家族 Qwen（REAL_LLM_JUDGE2_API_KEY）；缺则退化回同家族 MiMo lite。
+    let (label2, c2) = match std::env::var("REAL_LLM_JUDGE2_API_KEY")
+        .ok()
+        .filter(|k| !k.trim().is_empty())
+    {
+        Some(j2_key) => {
+            let j2_base = std::env::var("REAL_LLM_JUDGE2_BASE_URL").unwrap_or_else(|_| {
+                "https://dashscope.aliyuncs.com/compatible-mode/v1".to_string()
+            });
+            let j2_model =
+                std::env::var("REAL_LLM_JUDGE2_MODEL").unwrap_or_else(|_| "qwen3.7-max".to_string());
+            let c = LlmClient::new(j2_base, j2_key, j2_model, 180, 3, 1500).ok()?;
+            ("qwen-max", c)
+        }
+        None => {
+            let lite =
+                std::env::var("REAL_LLM_VISION_MODEL").unwrap_or_else(|_| "mimo-v2.5".to_string());
+            let c = LlmClient::new(base_url, api_key, lite, 180, 3, 1500).ok()?;
+            ("mimo-lite", c)
+        }
+    };
+
     Some(vec![
         Judge { label: "mimo-pro", client: Arc::new(c1) as Arc<dyn LlmProvider> },
-        Judge { label: "mimo-lite", client: Arc::new(c2) as Arc<dyn LlmProvider> },
+        Judge { label: label2, client: Arc::new(c2) as Arc<dyn LlmProvider> },
     ])
 }
 
