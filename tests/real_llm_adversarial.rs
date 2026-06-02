@@ -1374,26 +1374,67 @@ async fn t_judge_calibration() {
     // hits[judge_label][dim] = (命中数, 总数)
     let mut tally: HashMap<(&str, &str), (usize, usize)> = HashMap::new();
 
+    // 按端点分组限流（与 run_panel 同结构）：同端点裁判（deepseek-flash + deepseek-pro-selfeval
+    // 共用 api.supxh.xin 一把 key）串行错峰、跨端点分组并发，每端点瞬时并发恒为 K。
+    // Round 11 修：原 20 金标 × 4 裁判**全串行**（仅 K 采样并发），80 次顺序 dispatch 每次都阻塞
+    // 在最慢裁判（GLM ~17s 尾）上→撞 45min job 墙被 cancelled。现镜像 run_panel 的端点分组并发，
+    // 把跨端点裁判压成 ~1×latency，机械等价（同 20 金标/K/band/median/tally/台账字段，零测量值改动）。
+    let mut groups: Vec<Vec<usize>> = Vec::new();
+    let mut group_of: HashMap<&str, usize> = HashMap::new();
+    for (ji, j) in panel.iter().enumerate() {
+        let g = *group_of.entry(j.endpoint.as_str()).or_insert_with(|| {
+            groups.push(Vec::new());
+            groups.len() - 1
+        });
+        groups[g].push(ji);
+    }
+    let panel_ref = &panel;
+
     for (gi, g) in GOLD.iter().enumerate() {
         // 金标是单条 reply（无运营目标、无此前对话），故 goal/history 传空——
         // judge_user 省略对应块，consistency 走「无对话默认高分」口径（与 JUDGE_SYSTEM 一致）。
         let user = judge_user(&format!("gold-{gi}: {}", g.context), g.context, g.reply, "", "");
 
-        for j in &panel {
-            let results =
-                join_all((0..k).map(|_| j.client.generate_json_with_usage(JUDGE_SYSTEM, &user))).await;
-            let mut scores: Vec<i64> = Vec::new();
-            for r in results {
-                match r {
-                    Ok(res) => {
-                        if let Some(s) = judge_score(&res.value, g.dimension) {
-                            scores.push(s);
-                        }
-                    }
-                    Err(e) => eprintln!("[校准][{}][gold-{gi}] 采样失败（仅诊断）: {e:?}", j.label),
+        // 端点分组并发采样：跨端点 group 之间 join_all 并发，同端点裁判串行，组内 K 采样并发。
+        let user_ref = &user;
+        let group_futs = groups.iter().map(|judges| async move {
+            let mut out = Vec::new();
+            for &ji in judges {
+                let client = panel_ref[ji].client.clone();
+                let batch: Vec<_> = (0..k)
+                    .map(|_| {
+                        let c = client.clone();
+                        let u = user_ref.clone();
+                        async move { c.generate_json_with_usage(JUDGE_SYSTEM, &u).await }
+                    })
+                    .collect();
+                for r in join_all(batch).await {
+                    out.push((ji, r));
                 }
             }
-            let med = median(&scores);
+            out
+        });
+        let results: Vec<(usize, _)> =
+            join_all(group_futs).await.into_iter().flatten().collect();
+
+        // 采样并发收集后，逐裁判（保留 panel 顺序）串行算 median/hit/tally/台账——纯本地计算无 I/O。
+        let mut per_judge_scores: Vec<Vec<i64>> = (0..panel.len()).map(|_| Vec::new()).collect();
+        for (ji, r) in results {
+            match r {
+                Ok(res) => {
+                    if let Some(s) = judge_score(&res.value, g.dimension) {
+                        per_judge_scores[ji].push(s);
+                    }
+                }
+                Err(e) => {
+                    eprintln!("[校准][{}][gold-{gi}] 采样失败（仅诊断）: {e:?}", panel[ji].label)
+                }
+            }
+        }
+
+        for (ji, j) in panel.iter().enumerate() {
+            let scores = &per_judge_scores[ji];
+            let med = median(scores);
             let hit = med.map(|m| m >= g.band.0 && m <= g.band.1).unwrap_or(false);
             let entry = tally.entry((j.label, g.dimension)).or_insert((0, 0));
             entry.1 += 1;
