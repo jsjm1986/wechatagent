@@ -886,6 +886,22 @@ async fn answer_inner(
                 source_quotes,
                 answer,
             } => {
+                // 服务端不信任「声称回答却无正文」的终态：LLM 偶尔 emit 一个结构合法
+                // 但 answer 为空白的 Answer action 提前收尾，会让调用方拿到空答案。
+                // 空白正文不当终态——push 纠正 trace 并 continue：还有剩余轮次则让
+                // agent 重新作答，已是末轮则循环自然结束落到下方兜底产出非空摘要。
+                if answer.trim().is_empty() {
+                    push_trace(
+                        &mut tool_trace,
+                        tx,
+                        doc! {
+                            "tool": "error",
+                            "round": round,
+                            "reason": "empty_answer:Answer action 正文为空白，已忽略并要求继续作答",
+                        },
+                    );
+                    continue;
+                }
                 let (cited, quotes) =
                     filter_answer_against_opened(&opened_seen, cited_chunk_ids, source_quotes);
                 push_trace(
