@@ -1015,6 +1015,192 @@ mod debounce_tests {
 
         PENDING.remove(&key);
     }
+
+    /// 测试用最小入站消息构造器（内容/key 由调用方区分）。
+    fn test_inbound(wxid: &str, content: &str) -> ConversationMessage {
+        ConversationMessage {
+            id: None,
+            workspace_id: "ws-test".to_string(),
+            account_id: "acct-test".to_string(),
+            contact_wxid: wxid.to_string(),
+            message_id: None,
+            dedupe_key: None,
+            direction: MessageDirection::Inbound,
+            content: content.to_string(),
+            raw: None,
+            created_at: DateTime::now(),
+        }
+    }
+
+    /// 正常退休：runner 起跑快照 gen_at_start，期间无新入站 → remove_if 谓词
+    /// （generation 未变）成立 → 原子移除，key 不再驻留 PENDING。
+    #[test]
+    fn retire_succeeds_when_generation_unchanged() {
+        let key = "ws-test:acct-test:wx-retire-ok".to_string();
+        PENDING.remove(&key);
+
+        let (st, spawned) = register_inbound(key.clone(), test_inbound("wx-retire-ok", "hi"), 4_000);
+        assert!(spawned);
+        let gen_at_start = st.generation.load(Ordering::Acquire);
+        assert_eq!(gen_at_start, 1);
+
+        // runner (g) 步：谓词在 shard 锁内复核 generation 未变才移除。
+        let removed = PENDING
+            .remove_if(&key, |_, s| {
+                s.generation.load(Ordering::Acquire) == gen_at_start
+            })
+            .is_some();
+        assert!(removed, "generation 未变时 SHALL 成功退休");
+        assert!(!PENDING.contains_key(&key), "退休后 key 不得驻留");
+    }
+
+    /// 退休竞态（核心不变量，对应 plan「清理竞态证明」）：runner 起跑快照
+    /// gen_at_start=1，跑流水线期间晚到一条入站把 generation bump 到 2；runner
+    /// 到达 (g) 步执行 remove_if(gen==1) → 谓词失败 → 不移除 → key 仍在 →
+    /// runner 据此回 loop 重算。证明边界期到达的消息绝不被丢。
+    #[test]
+    fn retire_blocked_when_late_inbound_bumped_generation() {
+        let key = "ws-test:acct-test:wx-retire-race".to_string();
+        PENDING.remove(&key);
+
+        let (st, _) = register_inbound(key.clone(), test_inbound("wx-retire-race", "first"), 4_000);
+        let gen_at_start = st.generation.load(Ordering::Acquire);
+        assert_eq!(gen_at_start, 1);
+
+        // 晚到入站：runner 已过抢占检查、正走向退休的窗口里到达，bump generation。
+        let (_, spawned2) =
+            register_inbound(key.clone(), test_inbound("wx-retire-race", "late"), 4_000);
+        assert!(!spawned2, "晚到入站不得再 spawn——runner 仍在");
+
+        // runner (g) 步：谓词复核 gen==gen_at_start(=1)，实际已是 2 → 失败 → 不移除。
+        let removed = PENDING
+            .remove_if(&key, |_, s| {
+                s.generation.load(Ordering::Acquire) == gen_at_start
+            })
+            .is_some();
+        assert!(!removed, "晚到入站 bump 后 SHALL NOT 退休（否则丢这条消息）");
+        assert!(
+            PENDING.contains_key(&key),
+            "退休被阻时 runner 状态必须留存以供重算"
+        );
+        // runner 据 barge_in_triggered 判定需重算。
+        assert!(barge_in_triggered(
+            gen_at_start,
+            PENDING.get(&key).unwrap().generation.load(Ordering::Acquire)
+        ));
+
+        PENDING.remove(&key);
+    }
+
+    /// 退休后重 spawn：runner 成功退休移除 key 后，新入站落 Vacant 分支 →
+    /// 插入全新状态（generation 从 0 重新 +1 = 1）→ spawned_now 再次为 true。
+    #[test]
+    fn retire_then_new_inbound_respawns() {
+        let key = "ws-test:acct-test:wx-respawn".to_string();
+        PENDING.remove(&key);
+
+        let (st1, spawned1) =
+            register_inbound(key.clone(), test_inbound("wx-respawn", "a"), 4_000);
+        assert!(spawned1);
+        let gen0 = st1.generation.load(Ordering::Acquire);
+        PENDING.remove_if(&key, |_, s| {
+            s.generation.load(Ordering::Acquire) == gen0
+        });
+        assert!(!PENDING.contains_key(&key));
+
+        // 退休后的新入站：必须重新 spawn（runner 已退场）。
+        let (st2, spawned2) =
+            register_inbound(key.clone(), test_inbound("wx-respawn", "b"), 4_000);
+        assert!(spawned2, "退休后新入站 SHALL 重新 spawn runner");
+        assert_eq!(
+            st2.generation.load(Ordering::Acquire),
+            1,
+            "重 spawn 后 generation 从全新状态的 1 起算"
+        );
+
+        PENDING.remove(&key);
+    }
+
+    /// 并发 spawn 原子性：N 个线程同时注册同一 key，DashMap entry 持 shard 写锁
+    /// 串行化 → 恰好一个线程拿到 spawned_now=true（防 double-spawn），最终
+    /// generation == N。断言的是计数不变量，不依赖线程调度顺序 → 不 flaky。
+    #[test]
+    fn concurrent_register_same_key_spawns_exactly_once() {
+        use std::sync::atomic::AtomicU32;
+        use std::sync::{Arc as StdArc, Barrier};
+        use std::thread;
+
+        let key = "ws-test:acct-test:wx-concurrent".to_string();
+        PENDING.remove(&key);
+
+        const N: usize = 16;
+        let barrier = StdArc::new(Barrier::new(N));
+        let spawn_count = StdArc::new(AtomicU32::new(0));
+
+        let handles: Vec<_> = (0..N)
+            .map(|i| {
+                let key = key.clone();
+                let barrier = barrier.clone();
+                let spawn_count = spawn_count.clone();
+                thread::spawn(move || {
+                    barrier.wait();
+                    let (_, spawned) = register_inbound(
+                        key.clone(),
+                        test_inbound("wx-concurrent", &format!("m{i}")),
+                        4_000,
+                    );
+                    if spawned {
+                        spawn_count.fetch_add(1, Ordering::AcqRel);
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().expect("thread join");
+        }
+
+        assert_eq!(
+            spawn_count.load(Ordering::Acquire),
+            1,
+            "N 线程并发注册同一 key 必须恰好 spawn 一次"
+        );
+        assert_eq!(
+            PENDING.get(&key).unwrap().generation.load(Ordering::Acquire),
+            N as u64,
+            "每条入站各 bump 一次 generation，最终须等于线程数"
+        );
+
+        PENDING.remove(&key);
+    }
+
+    /// 抢占链端到端：runner 起跑快照 gen_at_start，期间多条入站把 generation
+    /// 推高 → barge_in_triggered 成立 → 网关 guard 返回 true → 放弃在途生成重算。
+    /// 无新入站时 guard 恒 false，正常走完。
+    #[test]
+    fn barge_in_chain_from_register_to_guard() {
+        let key = "ws-test:acct-test:wx-barge-chain".to_string();
+        PENDING.remove(&key);
+
+        let (st, _) = register_inbound(key.clone(), test_inbound("wx-barge-chain", "1"), 4_000);
+        let gen_at_start = st.generation.load(Ordering::Acquire);
+
+        // 无新入站：guard 视角 generation 未变 → 不抢占。
+        assert!(!barge_in_triggered(
+            gen_at_start,
+            st.generation.load(Ordering::Acquire)
+        ));
+
+        // 期间到 2 条新入站。
+        register_inbound(key.clone(), test_inbound("wx-barge-chain", "2"), 4_000);
+        register_inbound(key.clone(), test_inbound("wx-barge-chain", "3"), 4_000);
+
+        assert!(
+            barge_in_triggered(gen_at_start, st.generation.load(Ordering::Acquire)),
+            "期间有新入站时 guard SHALL 触发抢占重算"
+        );
+
+        PENDING.remove(&key);
+    }
 }
 
 #[cfg(test)]
