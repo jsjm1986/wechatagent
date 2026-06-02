@@ -368,23 +368,28 @@ jobs:
   # ③ 金标集裁判效度校准（命中率 = 准不准）④ 分数台账 JSONL artifact 跨轮对比
   # ⑤ 长期运行能力弧（回填跨周历史 + 手动 consolidation 量化记忆/画像漂移）。
   #
-  # 用 matrix 把每条弧切到独立并行 runner——每个 arc 各享一整个 45min 墙，
-  # 互不阻塞（fail-fast:false）。各 arc 只 `cargo test <name>` 跑自己那一片，
-  # 抗 45min 墙腰斩（judge K=3 采样、红队多轮、长程回填都很慢）。
+  # 用 matrix 把每条弧切到独立并行 runner——每个 arc 各享独立墙（calibration 90min、其余 45min，
+  # 见下 timeout-minutes 表达式），互不阻塞（fail-fast:false）。各 arc 只 `cargo test <name>` 跑自己
+  # 那一片，抗墙腰斩（judge K=3 采样、红队多轮、长程回填都很慢）。
   # Phase A 全软诊断（唯一硬断言是 gateway 闭集），continue-on-error:true 不卡合并。
   # MCP 仍是桩（绝不真发微信）。台账末尾 upload-artifact 传出跨轮人工/脚本对比。
   real-llm-adversarial:
     name: Real-LLM adversarial (${{ matrix.arc }})
     runs-on: ubuntu-latest
     continue-on-error: true
-    timeout-minutes: 45
+    # 每弧独享墙。t_judge_calibration 是仪器最重的一片——20 金标 × 4 裁判 × K=3 = 240 次真模型调用，
+    # Round 9 硬日志实测 ~208s/金标 × 20 ≈ 70min（GLM 单调 ~17s × K=3 同端点串行 + 偶发 json_decode
+    # 5 重退避尾巴），Round 9/10/11 连三轮卡 45min 墙被腰斩（仅 ~12.5/20 金标完成、零裁判出闸退出门）。
+    # 用户确认 45min 是我们自设非平台限制（GH hosted runner 默认 360min），据日志抬此弧到 90min 让 240
+    # 调用真跑完；其余对抗弧 ~6 轮、有 failover 兜底，45min 足够，不抬以免单弧失控空烧 CI 分钟。
+    timeout-minutes: ${{ matrix.arc == 't_judge_calibration' && 90 || 45 }}
     strategy:
       fail-fast: false
       # max-parallel 限流：7 条弧若全并发，各自 K=3 judge 采样(join_all 并发)+红队多轮生成
       # 同时打 deepseek 端点（api.supxh.xin），瞬时并发 20-35 请求易触发上游 5xx/限流。
       # 限并发到 2 把瞬时请求压到 ~10 以内。本 job 现用独立 deepseek key（不再与 MiMo 共享），
       # 但限并发对新端点抗抖动仍有益。队列中的 matrix job 不启动 timeout 计时，故每弧仍独享
-      # 完整 45min 墙，限流只推迟开始不吃墙。
+      # 各自完整墙（calibration 90min / 其余 45min），限流只推迟开始不吃墙。
       max-parallel: 2
       matrix:
         arc:
