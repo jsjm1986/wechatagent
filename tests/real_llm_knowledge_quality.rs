@@ -1721,6 +1721,41 @@ async fn q3_vision_extraction_quality() {
         .await
         .expect("insert vision provider");
 
+    // 备用视觉模型（异族多模态，NVIDIA 托管 kimi-k2.6）：supports_vision=true 但
+    // is_vision_active=false，故生产候选链把它排在专职 gpt-5.4 之后——主模型瞬时
+    // 不可达（429/配额/网关超时）时自动切换到它。缺 BACKUP key 时不插入，链退化为单主模型，
+    // 不影响测试。模型名/端点是 tests 内字面量（check-no-model-hint 对 tests/ 豁免）。
+    if let Ok(backup_key) = std::env::var("REAL_LLM_VISION_BACKUP_API_KEY") {
+        let backup_base = std::env::var("REAL_LLM_VISION_BACKUP_BASE_URL")
+            .unwrap_or_else(|_| "https://integrate.api.nvidia.com/v1".to_string());
+        let backup_model = std::env::var("REAL_LLM_VISION_BACKUP_MODEL")
+            .unwrap_or_else(|_| "moonshotai/kimi-k2.6".to_string());
+        let backup_cfg = LlmProviderConfig {
+            id: Some(ObjectId::new()),
+            workspace_id: ws.clone(),
+            provider_id: "real_vision_q3_backup".to_string(),
+            name: "real_vision_q3_backup".to_string(),
+            format: "openai".to_string(),
+            base_url: backup_base,
+            api_key: backup_key,
+            model: backup_model,
+            is_active: false,
+            timeout_seconds: Some(180),
+            max_retries: Some(5),
+            retry_base_ms: Some(2500),
+            supports_vision: true,
+            is_vision_active: false,
+            created_at: DateTime::now(),
+            updated_at: DateTime::now(),
+        };
+        app.state
+            .db
+            .llm_provider_configs()
+            .insert_one(&backup_cfg, None)
+            .await
+            .expect("insert backup vision provider");
+    }
+
     let admin = Extension(AuthenticatedAdmin {
         user_id: "q3_admin".into(),
         username: "q3_admin".into(),

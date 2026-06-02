@@ -335,6 +335,13 @@ jobs:
           REAL_LLM_VISION_API_KEY: ${{ secrets.REAL_LLM_VISION_API_KEY || 'sk-4iVIgfidl3eewYS26qRTrKDbqHY1QKsGs3aqL2YzVE4UrhxD' }}
           REAL_LLM_VISION_BASE_URL: https://gpt.api456.me/v1
           REAL_LLM_VISION_MODEL: gpt-5.4
+          # 备用视觉模型（异族多模态，NVIDIA 托管 kimi-k2.6）：gpt-5.4 瞬时不可达时
+          # 生产候选链自动切换到它（supports_vision=true / is_vision_active=false 排其后）。
+          # 缺 BACKUP key 时 Q3 测试不插备用配置，链退化为单主模型，CI 不退化。
+          # key 优先 secret，缺则回落字面量（与上方同纪律：tests/CI 豁免 model-hint lint）。
+          REAL_LLM_VISION_BACKUP_API_KEY: ${{ secrets.REAL_LLM_VISION_BACKUP_API_KEY || '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' }}
+          REAL_LLM_VISION_BACKUP_BASE_URL: https://integrate.api.nvidia.com/v1
+          REAL_LLM_VISION_BACKUP_MODEL: moonshotai/kimi-k2.6
           REAL_LLM_LEDGER: target/real_llm_ledger
           # 跨家族第三裁判（阿里云 DashScope，OpenAI 兼容端点）——与 deepseek 跨厂商，
           # 照出同家族双 checkpoint 的家族级盲区（#618 最高 ROI 杠杆）。优先用
@@ -445,6 +452,13 @@ jobs:
           REAL_LLM_JUDGE3_API_KEY: ${{ secrets.REAL_LLM_JUDGE3_API_KEY }}
           REAL_LLM_JUDGE3_BASE_URL: https://open.bigmodel.cn/api/coding/paas/v4
           REAL_LLM_JUDGE3_MODEL: GLM-5.1
+          # 跨模型 failover 备胎链（NVIDIA 托管，OpenAI 兼容 /v1）：被测 agent / 红队对手 /
+          # 裁判团任一调用主端点重试耗尽仍 429/503/超时 时，自动切到下列备胎（已按延迟升序，
+          # kimi 1.9s → minimax 7.6s → glm 16.9s 兜底），保「全程跑完」。台账记 actual_model +
+          # fallback 标记区分主模型原生分与备胎兜底分。缺该 secret 时备胎链空 = 与今天行为一致。
+          REAL_LLM_FAILOVER_API_KEY: ${{ secrets.REAL_LLM_FAILOVER_API_KEY }}
+          REAL_LLM_FAILOVER_BASE_URL: https://integrate.api.nvidia.com/v1
+          REAL_LLM_FAILOVER_MODELS: moonshotai/kimi-k2.6,minimaxai/minimax-m2.7,z-ai/glm-5.1
         run: cargo test --no-fail-fast --test real_llm_adversarial ${{ matrix.arc }} -- --ignored --nocapture
 
       - name: Upload score ledger

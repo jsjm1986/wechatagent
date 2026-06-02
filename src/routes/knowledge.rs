@@ -1718,10 +1718,13 @@ pub struct ImportApplyImageRequest {
 }
 
 /// 视觉模型解析结果：要么复用运行时 active provider（文字主模型本身支持图片），
-/// 要么用 workspace 指派的专职视觉副模型临时构造的一次性 client。
+/// 要么用 workspace 指派的视觉副模型构造的候选链。`Dedicated` 携带按优先级排好序的
+/// 一次性 client 列表（专职视觉模型在前，其余支持视觉的备用模型在后），主模型瞬时
+/// 不可达时依次自动切换到下一候选，全部失败才向上游报错。`String` 是该候选的 model
+/// 名，仅用于切换日志（运行时 DB 值，非源码字面量）。
 enum VisionProvider {
     Runtime,
-    Dedicated(crate::llm::LlmClient),
+    Dedicated(Vec<(String, crate::llm::LlmClient)>),
 }
 
 pub async fn import_operation_knowledge_apply_image(
@@ -1734,9 +1737,10 @@ pub async fn import_operation_knowledge_apply_image(
     }
     // 1) 解析视觉模型：
     //    a. 若 active 文字主模型本身 supports_vision → 直接用运行时 state.llm。
-    //    b. 否则查本 workspace 指派的专职视觉模型（is_vision_active=true 且
-    //       supports_vision=true），临时构造一次性 client。
-    //    c. 两者都没有 → 502 visionNotSupported，让运营去模型设置里配视觉模型。
+    //    b. 否则收集本 workspace 所有支持视觉的副模型（supports_vision=true），
+    //       专职视觉模型（is_vision_active=true）排在最前，其余按 updated_at 倒序
+    //       作为自动切换备用，构造候选 client 链。
+    //    c. 一条都没有 → 502 visionNotSupported，让运营去模型设置里配视觉模型。
     let active = state
         .db
         .llm_provider_configs()
@@ -1753,40 +1757,47 @@ pub async fn import_operation_knowledge_apply_image(
         // active 文字模型即视觉模型：复用运行时 provider（含热切换 / registry 语义）。
         VisionProvider::Runtime
     } else {
-        // 找专职视觉副模型。
-        let vision_cfg = state
+        // 收集所有支持视觉的副模型，专职视觉模型在前、其余备用在后，组成切换候选链。
+        // 排序键：is_vision_active 倒序（专职优先），其次 updated_at 倒序（新配置优先）。
+        let cursor = state
             .db
             .llm_provider_configs()
-            .find_one(
+            .find(
                 doc! {
                     "workspaceId": &admin.current_workspace,
-                    "isVisionActive": true,
                     "supportsVision": true,
                 },
-                None,
+                FindOptions::builder()
+                    .sort(doc! { "isVisionActive": -1, "updatedAt": -1 })
+                    .build(),
             )
-            .await?
-            .ok_or_else(|| {
-                AppError::External(
-                    "visionNotSupported: 当前文字模型不支持图片，且未在模型设置中指派专职视觉模型".to_string(),
-                )
-            })?;
-        let fmt = crate::llm::LlmFormat::parse(&vision_cfg.format)?;
-        let client = crate::llm::LlmClient::with_format(
-            vision_cfg.base_url.clone(),
-            vision_cfg.api_key.clone(),
-            vision_cfg.model.clone(),
-            fmt,
-            vision_cfg
-                .timeout_seconds
-                .unwrap_or(state.config.llm_timeout_seconds),
-            vision_cfg.max_retries.unwrap_or(state.config.llm_max_retries),
-            vision_cfg
-                .retry_base_ms
-                .unwrap_or(state.config.llm_retry_base_ms),
-        )
-        .map_err(|e| AppError::External(format!("构造视觉模型 client 失败: {e}")))?;
-        VisionProvider::Dedicated(client)
+            .await?;
+        let vision_cfgs: Vec<_> = cursor.try_collect().await?;
+        if vision_cfgs.is_empty() {
+            return Err(AppError::External(
+                "visionNotSupported: 当前文字模型不支持图片，且未在模型设置中指派专职视觉模型".to_string(),
+            ));
+        }
+        let mut candidates = Vec::with_capacity(vision_cfgs.len());
+        for vision_cfg in &vision_cfgs {
+            let fmt = crate::llm::LlmFormat::parse(&vision_cfg.format)?;
+            let client = crate::llm::LlmClient::with_format(
+                vision_cfg.base_url.clone(),
+                vision_cfg.api_key.clone(),
+                vision_cfg.model.clone(),
+                fmt,
+                vision_cfg
+                    .timeout_seconds
+                    .unwrap_or(state.config.llm_timeout_seconds),
+                vision_cfg.max_retries.unwrap_or(state.config.llm_max_retries),
+                vision_cfg
+                    .retry_base_ms
+                    .unwrap_or(state.config.llm_retry_base_ms),
+            )
+            .map_err(|e| AppError::External(format!("构造视觉模型 client 失败: {e}")))?;
+            candidates.push((vision_cfg.model.clone(), client));
+        }
+        VisionProvider::Dedicated(candidates)
     };
     // 2) 拼 vision prompt：约束 LLM 输出 JSON {"fence": "..." }，让我们直接走 chunked_text 流程。
     let mime = req.mime.as_deref().unwrap_or("image/png");
@@ -1805,25 +1816,68 @@ pub async fn import_operation_knowledge_apply_image(
     //    （generate_json_with_image），而不是把 base64 当文本塞进 prompt——后者
     //    会让纯文字模型"看不到"图片。LlmProvider 默认实现对不支持视觉的 provider
     //    直接报错，这里 VisionProvider 解析阶段已保证选中的是 supports_vision 的模型。
-    let value = match &vision_provider {
-        VisionProvider::Runtime => {
-            state
-                .llm
-                .generate_json_with_image(&system_prompt, &user_prompt, &req.image_base64, mime)
-                .await
+    let raw_value = match &vision_provider {
+        VisionProvider::Runtime => state
+            .llm
+            .generate_json_with_image(&system_prompt, &user_prompt, &req.image_base64, mime)
+            .await
+            .map_err(|e| match e {
+                // 瞬时不可达（429/限流/配额耗尽/网关超时）原样透传结构化变体，
+                // 让上游（测试 skip 宏、网关回退逻辑）按瞬时态处理而非当成内容失败。
+                AppError::LlmUnavailable { .. } => e,
+                other => AppError::External(format!("LLM vision 抽取失败: {other}")),
+            }),
+        // 候选链：主视觉模型瞬时不可达时自动切到下一备用模型；非瞬时错误立即失败
+        // （内容/请求问题换模型也救不了）；全部候选都瞬时不可达才把最后一个瞬时变体
+        // 上抛，让上游按瞬时态 skip 而非当成内容失败。
+        VisionProvider::Dedicated(candidates) => {
+            let mut last_transient: Option<AppError> = None;
+            let mut result: Option<AppResult<Value>> = None;
+            for (idx, (model, client)) in candidates.iter().enumerate() {
+                match client
+                    .generate_json_with_image(&system_prompt, &user_prompt, &req.image_base64, mime)
+                    .await
+                {
+                    Ok(v) => {
+                        result = Some(Ok(v));
+                        break;
+                    }
+                    Err(e @ AppError::LlmUnavailable { .. }) => {
+                        // 当前候选瞬时不可达，记录并切换到下一候选（若有）。
+                        if idx + 1 < candidates.len() {
+                            tracing::warn!(
+                                model = %model,
+                                next = %candidates[idx + 1].0,
+                                error = %e,
+                                "视觉模型瞬时不可达，自动切换到下一备用模型"
+                            );
+                        } else {
+                            tracing::warn!(
+                                model = %model,
+                                error = %e,
+                                "视觉模型瞬时不可达，已无更多备用模型可切换"
+                            );
+                        }
+                        last_transient = Some(e);
+                    }
+                    Err(other) => {
+                        // 非瞬时错误（内容/请求/格式问题）：换模型也无济于事，立即失败。
+                        result = Some(Err(AppError::External(format!(
+                            "LLM vision 抽取失败: {other}"
+                        ))));
+                        break;
+                    }
+                }
+            }
+            result.unwrap_or_else(|| {
+                // 全部候选都瞬时不可达：上抛最后一个瞬时变体，让上游按瞬时态处理。
+                Err(last_transient.unwrap_or_else(|| {
+                    AppError::External("LLM vision 抽取失败: 无可用视觉模型候选".to_string())
+                }))
+            })
         }
-        VisionProvider::Dedicated(client) => {
-            client
-                .generate_json_with_image(&system_prompt, &user_prompt, &req.image_base64, mime)
-                .await
-        }
-    }
-    .map_err(|e| match e {
-        // 瞬时不可达（429/限流/配额耗尽/网关超时）原样透传结构化变体，
-        // 让上游（测试 skip 宏、网关回退逻辑）按瞬时态处理而非当成内容失败。
-        AppError::LlmUnavailable { .. } => e,
-        other => AppError::External(format!("LLM vision 抽取失败: {other}")),
-    })?;
+    };
+    let value = raw_value?;
     let raw = value
         .get("fence")
         .and_then(|v| v.as_str())
