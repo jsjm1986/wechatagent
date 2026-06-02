@@ -42,7 +42,8 @@ use wechatagent::agent::run_envelope::GATEWAY_STATUS_VALUES;
 use wechatagent::agent::{
     consolidate_contact_memory, handle_follow_up_task, handle_managed_message, record_user_reaction,
 };
-use wechatagent::llm::{LlmClient, LlmProvider};
+use wechatagent::error::{AppError, AppResult};
+use wechatagent::llm::{LlmClient, LlmJsonResult, LlmProvider};
 use wechatagent::models::{
     AgentProfile, AgentStatus, AgentTask, Contact, ConversationMessage, MemoryCandidate,
     MessageDirection,
@@ -74,10 +75,145 @@ fn real_llm_from_env() -> Option<Arc<LlmClient>> {
     Some(Arc::new(client))
 }
 
-/// 无 key 时打印一行 skip 并 `return`（不 panic、不算失败）。
+// ════════════════════════════════════════════════════════════════════════════
+// 跨模型 failover 备胎（Round 9）—— 主模型遇 429/503 重试耗尽后自动切到独立端点的
+// 备用模型续跑，把「端点抖动污染机械健全性」解耦，保「全程跑完测试」。纯测试侧、零
+// 生产改动、agent 仍冻结为对照。覆盖三类 LLM 调用：被测 agent / 红队对手 / 裁判团。
+// ════════════════════════════════════════════════════════════════════════════
+
+/// 该错误是否值得切下一个备胎。可恢复 = 端点侧抖动（限流 / 5xx / 超时 / 连接 / 传输截断
+/// / 网络），换个独立端点的模型可能成功。**不可恢复 = fail-fast**：`http_4xx`（key/model/
+/// 配额错，换模型也没用）、`json_decode_error` / `empty_response`（prompt 触发，是 prompt
+/// 问题不是端点问题，换模型仍会同样失败，徒增延迟撞 45min 墙）。
+fn is_failover_worthy(e: &AppError) -> bool {
+    match e {
+        AppError::LlmUnavailable { kind, .. } => matches!(
+            kind.as_str(),
+            "rate_limited"
+                | "http_5xx"
+                | "timeout"
+                | "connect_failed"
+                | "body_decode_error"
+                | "network_error"
+        ),
+        // 极少数 raw reqwest 错误未经 classify 直接冒泡（理论上 generate_json_with_usage
+        // 已全归并，这里兜底）：仅超时 / 连接失败可切。
+        AppError::Http(h) => h.is_timeout() || h.is_connect(),
+        _ => false,
+    }
+}
+
+/// 顺序 failover provider：`clients = [主, 备1, 备2, ...]`（已按延迟升序）。
+/// `generate_json_with_usage` 顺序尝试——`Ok` 即返（命中备胎时 eprintln `[failover]`
+/// 供 CI 日志 grep 确认真切换过）；可恢复 `Err` 记下切下一个；不可恢复 `Err` 立即 fail-fast。
+/// 缺备胎时 `clients` 只有主一个 = 与今天行为完全一致（无回归）。
+struct FailoverProvider {
+    /// 主模型 model 串（仅用于 `[failover]` 日志标识落到哪条主链兜底；台账侧用 backup 名集判定）。
+    primary_label: String,
+    clients: Vec<Arc<LlmClient>>,
+}
+
+#[async_trait::async_trait]
+impl LlmProvider for FailoverProvider {
+    async fn generate_json(&self, system: &str, user: &str) -> AppResult<serde_json::Value> {
+        self.generate_json_with_usage(system, user).await.map(|r| r.value)
+    }
+
+    async fn generate_json_with_usage(&self, system: &str, user: &str) -> AppResult<LlmJsonResult> {
+        let mut last_err: Option<AppError> = None;
+        for (i, client) in self.clients.iter().enumerate() {
+            match client.generate_json_with_usage(system, user).await {
+                Ok(r) => {
+                    if i > 0 {
+                        eprintln!(
+                            "[failover] 主模型 {} 不可用，已切到备胎[{i}] {} 兜底成功",
+                            self.primary_label, r.model
+                        );
+                    }
+                    return Ok(r);
+                }
+                Err(e) if is_failover_worthy(&e) => {
+                    eprintln!(
+                        "[failover] {} 第{i}个候选不可用，尝试下一个备胎: {e}",
+                        self.primary_label
+                    );
+                    last_err = Some(e);
+                }
+                // 4xx / json / empty：换模型也没用，立即 fail-fast。
+                Err(e) => return Err(e),
+            }
+        }
+        Err(last_err
+            .unwrap_or_else(|| AppError::External("failover: 无可用 LLM 客户端".to_string())))
+    }
+}
+
+/// 从 env 构造备胎链（默认 NVIDIA `/v1` 上 kimi-k2.6 / minimax-m2.7 / glm-5.1，已延迟升序）。
+/// 缺 `REAL_LLM_FAILOVER_API_KEY` → 返 `vec![]`，FailoverProvider 退化为「只主模型」=
+/// 与今天行为完全一致（不回归、不强依赖 NVIDIA key）。
+fn failover_backups() -> Vec<Arc<LlmClient>> {
+    let key = match std::env::var("REAL_LLM_FAILOVER_API_KEY")
+        .ok()
+        .filter(|k| !k.trim().is_empty())
+    {
+        Some(k) => k,
+        None => return Vec::new(),
+    };
+    let base = std::env::var("REAL_LLM_FAILOVER_BASE_URL")
+        .unwrap_or_else(|_| "https://integrate.api.nvidia.com/v1".to_string());
+    failover_model_list()
+        .into_iter()
+        .filter_map(|m| LlmClient::new(base.clone(), key.clone(), m, 180, 5, 2500).ok().map(Arc::new))
+        .collect()
+}
+
+/// 备胎 model 名列表（逗号分隔，已延迟升序）。缺 key 时仍返默认列表，但 `failover_backups`
+/// 会因缺 key 返空——本函数也供台账侧 `is_backup_model` 判定「该采样是否备胎兜底分」。
+fn failover_model_list() -> Vec<String> {
+    std::env::var("REAL_LLM_FAILOVER_MODELS")
+        .unwrap_or_else(|_| {
+            "moonshotai/kimi-k2.6,minimaxai/minimax-m2.7,z-ai/glm-5.1".to_string()
+        })
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
+/// 台账判定：某次成功采样的 `res.model` 是否来自备胎（用于打 `fallback` 标记）。
+/// 缺 FAILOVER key → 备胎链空 → 永远 false（正常轮台账无 fallback 噪声）。
+fn is_backup_model(model: &str) -> bool {
+    if std::env::var("REAL_LLM_FAILOVER_API_KEY")
+        .ok()
+        .filter(|k| !k.trim().is_empty())
+        .is_none()
+    {
+        return false;
+    }
+    failover_model_list().iter().any(|m| m == model)
+}
+
+/// 把一个主 client 包成带备胎链的 `FailoverProvider`（备胎缺失时退化为只主）。
+fn wrap_with_failover(primary_label: String, primary: Arc<LlmClient>) -> Arc<dyn LlmProvider> {
+    let mut clients = vec![primary];
+    clients.extend(failover_backups());
+    Arc::new(FailoverProvider { primary_label, clients })
+}
+
+/// 主模型 + 备胎链 → `Arc<dyn LlmProvider>`。供被测 agent 注入 + 红队对手共用。
+/// 缺主 key → None（与 real_llm_from_env 同口径自跳过）。
+fn real_llm_with_failover() -> Option<Arc<dyn LlmProvider>> {
+    let primary = real_llm_from_env()?;
+    let primary_label =
+        std::env::var("REAL_LLM_MODEL").unwrap_or_else(|_| "mimo-v2.5-pro".to_string());
+    Some(wrap_with_failover(primary_label, primary))
+}
+
+/// 无 key 时打印一行 skip 并 `return`（不 panic、不算失败）。返回 `Arc<dyn LlmProvider>`
+/// （主模型 + 备胎链），让被测 agent / 长程弧注入即享 failover。
 macro_rules! require_real_llm {
     () => {{
-        match real_llm_from_env() {
+        match real_llm_with_failover() {
             Some(llm) => llm,
             None => {
                 eprintln!("skip: REAL_LLM_API_KEY 未配置，跳过对抗式 ops 测试");
@@ -379,8 +515,8 @@ fn judge_panel() -> Option<Vec<Judge>> {
     };
 
     let mut panel = vec![
-        Judge { label: label1, endpoint: base_url.clone(), client: Arc::new(c1) as Arc<dyn LlmProvider> },
-        Judge { label: label2, endpoint: label2_endpoint, client: Arc::new(c2) as Arc<dyn LlmProvider> },
+        Judge { label: label1, endpoint: base_url.clone(), client: wrap_with_failover(label1.to_string(), Arc::new(c1)) },
+        Judge { label: label2, endpoint: label2_endpoint, client: wrap_with_failover(label2.to_string(), Arc::new(c2)) },
     ];
 
     // 第三裁判 = 第二个**跨家族**模型（REAL_LLM_JUDGE3_*，默认智谱 GLM-5.1，open.bigmodel.cn
@@ -396,7 +532,7 @@ fn judge_panel() -> Option<Vec<Judge>> {
         let j3_model =
             std::env::var("REAL_LLM_JUDGE3_MODEL").unwrap_or_else(|_| "GLM-5.1".to_string());
         if let Ok(c3) = LlmClient::new(j3_base.clone(), j3_key, j3_model, 180, 5, 2500) {
-            panel.push(Judge { label: "glm-5.1", endpoint: j3_base, client: Arc::new(c3) as Arc<dyn LlmProvider> });
+            panel.push(Judge { label: "glm-5.1", endpoint: j3_base, client: wrap_with_failover("glm-5.1".to_string(), Arc::new(c3)) });
         }
     }
 
@@ -410,7 +546,7 @@ fn judge_panel() -> Option<Vec<Judge>> {
         if !j4_model.trim().is_empty() {
             let label4: &'static str = Box::leak(format!("{j4_model}-selfeval").into_boxed_str());
             if let Ok(c4) = LlmClient::new(base_url.clone(), api_key, j4_model, 180, 5, 2500) {
-                panel.push(Judge { label: label4, endpoint: base_url, client: Arc::new(c4) as Arc<dyn LlmProvider> });
+                panel.push(Judge { label: label4, endpoint: base_url, client: wrap_with_failover(label4.to_string(), Arc::new(c4)) });
             }
         }
     }
@@ -547,11 +683,15 @@ async fn run_panel(
         (0..panel.len()).map(|_| DIMS.iter().map(|d| (*d, Vec::new())).collect()).collect();
     let mut first_reason: Vec<Option<serde_json::Value>> = vec![None; panel.len()];
     let mut ok_calls = vec![0usize; panel.len()];
+    // 每裁判每个真实生效 model 的采样计数（failover 切备胎时同一裁判会出现多个 model）。
+    let mut model_counts: Vec<HashMap<String, usize>> =
+        (0..panel.len()).map(|_| HashMap::new()).collect();
 
     for (ji, r) in results {
         match r {
             Ok(res) => {
                 ok_calls[ji] += 1;
+                *model_counts[ji].entry(res.model.clone()).or_insert(0) += 1;
                 for d in DIMS {
                     if let Some(s) = judge_score(&res.value, d) {
                         samples[ji].get_mut(d).unwrap().push(s);
@@ -571,6 +711,19 @@ async fn run_panel(
         if ok_calls[ji] == 0 {
             eprintln!("[裁判团][{}] {k} 次采样全失败，跳过", j.label);
             continue;
+        }
+        // 该裁判本条 reply 多数采样真实生效的 model（failover 切备胎时取众数）。
+        let actual_model = model_counts[ji]
+            .iter()
+            .max_by_key(|(_, c)| **c)
+            .map(|(m, _)| m.clone())
+            .unwrap_or_default();
+        let fallback = is_backup_model(&actual_model);
+        if fallback {
+            eprintln!(
+                "[裁判团][{}][turn-{turn}] ⚠ 本条采样兜底到备胎模型 {actual_model}——该裁判本轮为备胎兜底分（跨家族信号降级）",
+                j.label
+            );
         }
         for d in DIMS {
             if let Some((lo, med, hi)) = score_stats(samples[ji].get(d).unwrap()) {
@@ -593,6 +746,8 @@ async fn run_panel(
                         "median": med,
                         "spread": hi - lo,
                         "ok_calls": ok_calls[ji],
+                        "actual_model": actual_model.clone(),
+                        "fallback": fallback,
                     }),
                 );
             }
@@ -802,7 +957,7 @@ struct AttackGoal {
 /// 红队对手出下一条攻击消息：输入 (攻击目标 system, 含 agent 真实回复的逐行对话脚本)，
 /// 输出 {message, should_stop}。调用失败/无 message → None（调用方收弧，并记录机械健全性）。
 async fn adversary_next(
-    adversary: &Arc<LlmClient>,
+    adversary: &Arc<dyn LlmProvider>,
     goal: &AttackGoal,
     transcript: &str,
 ) -> Option<(String, bool)> {
@@ -837,7 +992,7 @@ async fn adversary_next(
 /// 回复生成下一击，直到 should_stop / max_turns / 对手失败。机械健全性（实际跑到第几轮）打日志。
 async fn run_adversarial_arc(goal: &AttackGoal) {
     let llm = require_real_llm!();
-    let adversary = match real_llm_from_env() {
+    let adversary = match real_llm_with_failover() {
         Some(a) => a,
         None => return,
     };
