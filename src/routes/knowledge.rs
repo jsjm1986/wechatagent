@@ -4871,6 +4871,61 @@ fn chat_turn_to_view(turn: &KnowledgeChatTurn) -> Value {
     })
 }
 
+/// 当 LLM 产出了 patch/起草结果却漏写 naturalReply（或留空）时，从结构化
+/// 字段确定性地合成一句对话回执。通用于所有 draft/update 分支、与具体业务
+/// 领域无关：只读结构化字段名，不内嵌任何样例文案。
+fn synthesize_natural_reply_from_patch(out: &Value) -> Option<String> {
+    let patch = out.get("patch")?.as_object()?;
+    fn field_label(k: &str) -> &str {
+        match k {
+            "title" => "标题",
+            "summary" => "摘要",
+            "body" => "正文",
+            "tags" => "标签",
+            "knowledgeType" | "knowledge_type" => "知识类型",
+            "priority" => "优先级",
+            other => other,
+        }
+    }
+    let filled: Vec<&str> = patch
+        .iter()
+        .filter(|(_, v)| match v {
+            Value::String(s) => !s.trim().is_empty(),
+            Value::Null => false,
+            Value::Array(a) => !a.is_empty(),
+            _ => true,
+        })
+        .map(|(k, _)| field_label(k.as_str()))
+        .collect();
+    if filled.is_empty() {
+        return None;
+    }
+    let missing: Vec<String> = out
+        .get("missingFields")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|x| {
+                    x.as_str().map(|s| s.to_string()).or_else(|| {
+                        x.get("field").and_then(|f| f.as_str()).map(|s| s.to_string())
+                    })
+                })
+                .map(|s| field_label(&s).to_string())
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut reply = format!("我已经为您起草好了{}。", filled.join("、"));
+    if missing.is_empty() {
+        reply.push_str("您看一下内容是否准确，确认无误后即可应用为草稿。");
+    } else {
+        reply.push_str(&format!(
+            "还差{} 需要补充，方便的话请再给我一些信息，我好把它补全。",
+            missing.join("、")
+        ));
+    }
+    Some(reply)
+}
+
 /// chat_turn 的核心 LLM 编排：先识别 intent，再分流到对应子 prompt。
 /// 返回的 Value 至少包含 intent / naturalReply；可选 patch / missingFields /
 /// followupQuestions / draftKind / targetChunkId / targetPackId / promptKey。
@@ -5027,6 +5082,16 @@ async fn run_chat_turn_pipeline(
     }
     if let Some(p) = target_pack_id {
         out["targetPackId"] = json!(p);
+    }
+    let reply_blank = out
+        .get("naturalReply")
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim().is_empty() || s.trim() == "（AI 未给出回复）")
+        .unwrap_or(true);
+    if reply_blank {
+        if let Some(synth) = synthesize_natural_reply_from_patch(&out) {
+            out["naturalReply"] = json!(synth);
+        }
     }
     Ok(out)
 }
@@ -5489,6 +5554,7 @@ async fn draft_chunk_for_chat(
 - patch 必须把运营本轮明确点名要起草的字段全部填上——运营若说「起草标题、摘要和正文」，patch 就必须同时含非空的 title、summary、body 三者，缺任何一个都算答非所问。
 - body（正文）是切片的实体内容，承载可验证事实，绝不能因为它最长就省略或留空；其余字段齐全而独缺 body 视为未完成起草。
 - 信息确实不足以填某字段时，把该字段名写进 missingFields 并用 followupQuestions 向运营追问，而不是静默丢弃运营已点名的字段。
+- naturalReply 必填、不可留空：用对话口吻向运营回报你起草了什么、还差什么（例如「我已经起草好标题/摘要/正文，您看看是否准确」），这是给人看的回执，不能只产 patch 就沉默。
 
 请按 system 中 schema 输出 JSON 起草一条新切片草稿。"#,
         serde_json::to_string_pretty(&catalog).unwrap_or_default(),
