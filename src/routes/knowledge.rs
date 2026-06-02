@@ -1818,7 +1818,12 @@ pub async fn import_operation_knowledge_apply_image(
                 .await
         }
     }
-    .map_err(|e| AppError::External(format!("LLM vision 抽取失败: {e}")))?;
+    .map_err(|e| match e {
+        // 瞬时不可达（429/限流/配额耗尽/网关超时）原样透传结构化变体，
+        // 让上游（测试 skip 宏、网关回退逻辑）按瞬时态处理而非当成内容失败。
+        AppError::LlmUnavailable { .. } => e,
+        other => AppError::External(format!("LLM vision 抽取失败: {other}")),
+    })?;
     let raw = value
         .get("fence")
         .and_then(|v| v.as_str())
