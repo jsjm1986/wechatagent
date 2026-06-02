@@ -3038,6 +3038,26 @@ fn clamp_answering_mode(mode: &str, needs_review: u64) -> String {
     }
 }
 
+/// 完整度 gaps 的确定性下界保证：服务端从 DB count 已知的客观缺口（无 verified /
+/// 存在 needs_review 草稿）必须恒在 gaps 中，绝不因 LLM 返回 `gaps: []` 而丢失。
+/// 与 [`clamp_answering_mode`] 同源——服务端永不信任 LLM 自觉删掉可自证的事实。
+/// 合并语义：确定性下界在前（稳定排序）∪ LLM 追加项；按 trim 后文本去重、丢空串。
+/// 纯函数、与具体语料无关，cfg(test) 锁。
+fn merge_completeness_gaps(deterministic: Vec<String>, llm_gaps: Vec<String>) -> Vec<String> {
+    let mut merged: Vec<String> = Vec::with_capacity(deterministic.len() + llm_gaps.len());
+    for gap in deterministic.into_iter().chain(llm_gaps.into_iter()) {
+        let trimmed = gap.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if merged.iter().any(|existing| existing == trimmed) {
+            continue;
+        }
+        merged.push(trimmed.to_string());
+    }
+    merged
+}
+
 pub async fn build_operation_knowledge_completeness(
     state: &AppState,
     workspace_id: &str,
@@ -3144,7 +3164,12 @@ pub async fn build_operation_knowledge_completeness(
         )
         .await?;
     let mut pending = Vec::new();
+    let mut pending_titles: Vec<String> = Vec::new();
     while let Some(chunk) = pending_cursor.try_next().await? {
+        let title = chunk.title.trim().to_string();
+        if !title.is_empty() {
+            pending_titles.push(title);
+        }
         pending.push(json!({
             "title": chunk.title,
             "knowledgeType": chunk.knowledge_type
@@ -3162,12 +3187,25 @@ pub async fn build_operation_knowledge_completeness(
     // 这些草稿在审定前不可作为产品事实依据，运营必须看到。
     let mut fallback_gaps: Vec<String> = Vec::new();
     if verified == 0 {
-        fallback_gaps.push("缺少 verified 知识切片".to_string());
+        fallback_gaps.push(
+            "能力/边界/证据维度均缺已验证客观事实，需补采可核验事实切片并审定后方可对客".to_string(),
+        );
     }
     if needs_review > 0 {
+        let topics = pending_titles
+            .iter()
+            .take(5)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("、");
+        let topic_clause = if topics.is_empty() {
+            String::new()
+        } else {
+            format!("（涉及：{topics}）")
+        };
         fallback_gaps.push(format!(
-            "存在 {} 条 needs_review 待审定切片，审定前不可作为产品事实依据，需运营核实",
-            needs_review
+            "存在 {needs_review} 条 needs_review 待审定切片{topic_clause}，当前仅为未审定草稿，\
+审定前不可作为产品事实依据，需运营逐条核实后审定或标注为不可对客",
         ));
     }
     // 维度认知状态对象：verifiedFact / methodologyOnly / pendingDraft 三个**独立**布尔
@@ -3193,7 +3231,7 @@ pub async fn build_operation_knowledge_completeness(
             "effectClaims": cov_state(evidence > 0),
             "deliveryBoundary": cov_state(verified > 0)
         },
-        "gaps": fallback_gaps
+        "gaps": fallback_gaps.clone()
     });
     let system = "你是企业用户运营知识库完整度 Auditor。你评估已验证知识是否足够支撑 Agent 回答产品/服务事实，并识别尚未审定的知识缺口，不负责生成销售内容。只输出严格 JSON。";
     let user = format!(
@@ -3260,6 +3298,9 @@ pub async fn build_operation_knowledge_completeness(
         json_string(&audit, "answeringMode").unwrap_or_else(|| fallback_mode.to_string());
     // 认知状态闸：有任何待审定草稿就绝不宣称 fully_supported（见 [`clamp_answering_mode`]）。
     let answering_mode = clamp_answering_mode(&resolved_mode, needs_review);
+    // gaps 确定性下界：服务端已知客观缺口恒在，LLM 返回空 gaps 不得抹掉（见 [`merge_completeness_gaps`]）。
+    let llm_gaps = json_string_list(&audit, "gaps").unwrap_or_default();
+    let gaps = merge_completeness_gaps(fallback_gaps, llm_gaps);
     Ok(json!({
         "totalChunks": total,
         "verifiedChunks": verified,
@@ -3270,7 +3311,7 @@ pub async fn build_operation_knowledge_completeness(
         "answeringMode": answering_mode,
         "summary": json_string(&audit, "summary").unwrap_or_default(),
         "coverage": audit.get("coverage").cloned().unwrap_or_else(|| json!({})),
-        "gaps": json_string_list(&audit, "gaps").unwrap_or_default()
+        "gaps": gaps
     }))
 }
 
@@ -8548,6 +8589,35 @@ mod tests {
                 assert_eq!(clamp_answering_mode(mode, nr), mode);
             }
         }
+    }
+
+    /// gaps 下界：LLM 返回空 gaps 时，服务端确定性缺口恒保留（绝不被抹掉）。
+    #[test]
+    fn merge_completeness_gaps_keeps_deterministic_floor_when_llm_empty() {
+        let det = vec!["缺 verified".to_string(), "有 3 条待审定草稿".to_string()];
+        let merged = merge_completeness_gaps(det.clone(), vec![]);
+        assert_eq!(merged, det, "LLM 空 gaps 不得抹掉服务端已知缺口");
+    }
+
+    /// gaps 合并：确定性下界在前、LLM 追加项在后，去重后 union。
+    #[test]
+    fn merge_completeness_gaps_unions_deterministic_then_llm_extra() {
+        let det = vec!["缺 verified".to_string()];
+        let llm = vec!["缺 verified".to_string(), "效果数据缺量化".to_string(), "案例缺主体".to_string()];
+        let merged = merge_completeness_gaps(det, llm);
+        assert_eq!(merged.len(), 3, "重复项去重后应为 3 条");
+        assert_eq!(merged[0], "缺 verified", "确定性下界排在最前");
+        assert_eq!(merged[1], "效果数据缺量化");
+        assert_eq!(merged[2], "案例缺主体");
+    }
+
+    /// gaps 合并：跨确定性/LLM 去重，且丢弃纯空白项。
+    #[test]
+    fn merge_completeness_gaps_dedups_and_drops_empty() {
+        let det = vec!["待审定草稿".to_string(), "   ".to_string()];
+        let llm = vec!["待审定草稿".to_string(), "".to_string(), "新缺口".to_string()];
+        let merged = merge_completeness_gaps(det, llm);
+        assert_eq!(merged, vec!["待审定草稿".to_string(), "新缺口".to_string()]);
     }
 
     /// 波 D2：4 项证据齐 → verified。
