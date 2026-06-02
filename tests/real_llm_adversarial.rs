@@ -65,10 +65,11 @@ fn real_llm_from_env() -> Option<Arc<LlmClient>> {
         .unwrap_or_else(|_| "https://token-plan-cn.xiaomimimo.com/v1".to_string());
     let model = std::env::var("REAL_LLM_MODEL").unwrap_or_else(|_| "mimo-v2.5-pro".to_string());
     // 重试参数 max_retries=5 / base_ms=2500（退避序列 ~2.5/5/10/20s，总恢复窗口 ~37s）：
-    // gpt-5.5 端点偶发 HTTP 503 `auth_unavailable: no auth available (providers=codex)`，
-    // 是端点后端 codex provider 间歇性鉴权/配额不可用（非速率限制）。旧 3/1500（窗口 ~4.5s）
-    // 对鉴权恢复偏短 → Round 5 有 3/7 弧 turn-1 即被 503 收弧。加大窗口给端点恢复时间
-    // （同 round-9 限并发解 429 一类基础设施抗性修复，纯测试侧、零生产改动、反过拟合-clean）。
+    // 真实大模型端点偶发 5xx（gpt-5.5 曾频发 HTTP 503 `auth_unavailable: no auth available
+    // (providers=codex)`，是端点后端 provider 间歇性鉴权/配额不可用，非速率限制）。旧 3/1500
+    // （窗口 ~4.5s）对鉴权恢复偏短 → Round 5 有 3/7 弧 turn-1 即被 503 收弧。加大窗口给端点恢复
+    // 时间（同 round-9 限并发解 429 一类基础设施抗性修复，纯测试侧、零生产改动、反过拟合-clean）。
+    // 本轮起主模型 = deepseek-v4-pro（api.supxh.xin，HTTPS），仍保留此恢复窗以防端点抖动。
     let client = LlmClient::new(base_url, api_key, model, 180, 5, 2500).expect("构造真实 LlmClient");
     Some(Arc::new(client))
 }
@@ -282,34 +283,39 @@ struct Judge {
     client: Arc<dyn LlmProvider>,
 }
 
-/// 构造**跨家族**裁判团：① 主裁判 = REAL_LLM_MODEL（与被测 agent 同一主模型，本轮起
-/// gpt-5.5，经 ci.yml 指向 http://123.56.164.230:3002/v1；label 从 model 名派生写台账）
-/// + ② 跨家族第二裁判（REAL_LLM_JUDGE2_*，默认阿里 DashScope qwen3.7-max）。
+/// 构造**跨家族**裁判团：① 主裁判 judge1 = REAL_LLM_JUDGE1_MODEL（本轮起 deepseek-v4-flash，
+/// 与被测 agent 的 deepseek-v4-pro 同厂不同 checkpoint；缺则回落 REAL_LLM_MODEL）经 ci.yml 指向
+/// https://api.supxh.xin/v1；label 从 model 名派生写台账）+ ② 跨家族第二裁判（REAL_LLM_JUDGE2_*，
+/// 默认阿里 DashScope qwen3.7-max）。
 ///
-/// 全面弃用 MiMo（用户 2026-06-02 决策）：主模型与主裁判都换 gpt-5.5，跨家族效度仍靠
-/// 异族 Qwen 第二裁判守住。注意主裁判与被测 agent 同为 gpt-5.5（同家族自评），故跨家族
-/// 分歧信号完全依赖 Qwen 那一路——读账时以 |gpt5.5 − qwen| 为家族盲区代理，不能只看 gpt5.5 自评。
+/// 模型沿革：MiMo 双 checkpoint（round-4 前）→ Qwen 跨家族第二裁判（round-4）→ gpt-5.5 主模型
+/// （round-5/6，agent 与 judge1 同为 gpt-5.5 同模型自评）→ **deepseek-v4（本轮，2026-06-02）**。
+/// gpt-5.5 端点 503 auth_unavailable 频繁不可用，用户换 deepseek-v4-pro/flash（api.supxh.xin，
+/// HTTPS）。本轮 agent=pro、judge1=flash 解耦：judge1≠agent 模型，比 gpt-5.5 自评干净（不再逐字
+/// 自我背书），跨家族效度仍由 Qwen 守住——读账以 |deepseek-flash − qwen| 为家族盲区代理。
 ///
-/// round-4 起从「MiMo 双 checkpoint（同家族）」升级为跨家族；Qwen 已用 11 条品类级金标离线
-/// 校准：4 核心维高/低端 8 例全 HIT、中性轮两把尺 2 例 HIT，仅「中性中间带 5-6」这一**已知最难
-/// 歧义带**偏高（正是跨家族要暴露的 rubric 歧义，非误判）。
+/// deepseek 端点是 OpenAI 兼容 /v1，content 干净 JSON、思维链落独立字段被 serde 忽略 → **零生产
+/// 代码改动**（同 MiMo/gpt-5.5/Qwen 一样的结论）。已离线 probe 验证两模型均出标准 OpenAI 格式。
 ///
-/// DashScope 走 OpenAI 兼容协议（`/compatible-mode/v1`）→ `LlmClient::new` 默认
-/// `LlmFormat::Openai` 直接可用；Qwen 的思维链落在独立 `reasoning_content` 字段，serde
-/// `ChatMessage` 只反序列化 `content`（干净 JSON）→ **零生产代码改动**。
-///
-/// 缺主 key → None（整个裁判团关闭）。缺 JUDGE2 key → 退化回 MiMo lite 第二裁判（不致整团失效）。
+/// 缺主 key → None（整个裁判团关闭）。缺 JUDGE2 key → 退化回 lite 第二裁判（不致整团失效）。
 fn judge_panel() -> Option<Vec<Judge>> {
     let api_key = std::env::var("REAL_LLM_API_KEY").ok().filter(|k| !k.trim().is_empty())?;
     let base_url = std::env::var("REAL_LLM_BASE_URL")
         .unwrap_or_else(|_| "https://token-plan-cn.xiaomimimo.com/v1".to_string());
-    let pro = std::env::var("REAL_LLM_MODEL").unwrap_or_else(|_| "mimo-v2.5-pro".to_string());
+    // judge1 模型 = REAL_LLM_JUDGE1_MODEL（缺则回落 REAL_LLM_MODEL）。本轮起被测 agent 与 judge1
+    // 解耦：agent 走 deepseek-v4-pro（REAL_LLM_MODEL），judge1 走 deepseek-v4-flash（同厂不同
+    // checkpoint）——比上轮 gpt-5.5 自评（agent 与 judge1 同模型）干净，judge1≠agent 避免逐字
+    // 自我背书。跨家族效度仍靠 judge2 Qwen，三裁判 = deepseek-flash + qwen-max 判 deepseek-pro。
+    let judge1_model =
+        std::env::var("REAL_LLM_JUDGE1_MODEL").unwrap_or_else(|_| {
+            std::env::var("REAL_LLM_MODEL").unwrap_or_else(|_| "mimo-v2.5-pro".to_string())
+        });
     // judge1 的 label 从真实 model 名派生（leak 成 &'static str，测试二进制内一次性、有界）。
-    // 主模型从 MiMo 换 gpt-5.5 后，台账 `judge` 字段须如实反映被测/裁判模型，否则跨轮读账串味。
-    let label1: &'static str = Box::leak(pro.clone().into_boxed_str());
-    // 重试参数同 real_llm_from_env 加大到 5/2500：判分调用也走 gpt-5.5/Qwen 端点，
-    // 同样可能撞 503 auth_unavailable，给裁判调用同等恢复窗口防判分丢采样。
-    let c1 = LlmClient::new(base_url.clone(), api_key.clone(), pro, 180, 5, 2500).ok()?;
+    // 台账 `judge` 字段须如实反映裁判模型，否则跨轮读账串味。
+    let label1: &'static str = Box::leak(judge1_model.clone().into_boxed_str());
+    // 重试参数同 real_llm_from_env 加大到 5/2500：判分调用也走 deepseek/Qwen 端点，给端点
+    // 偶发 5xx 同等恢复窗口防判分丢采样（沿用 gpt-5.5 503 一轮立的基础设施抗性参数）。
+    let c1 = LlmClient::new(base_url.clone(), api_key.clone(), judge1_model, 180, 5, 2500).ok()?;
 
     // 第二裁判：优先跨家族 Qwen（REAL_LLM_JUDGE2_API_KEY）；缺则退化回同家族 MiMo lite。
     let (label2, c2) = match std::env::var("REAL_LLM_JUDGE2_API_KEY")
