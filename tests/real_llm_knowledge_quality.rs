@@ -137,6 +137,13 @@ const DIVERGENCE_SKIP_THRESHOLD: f64 = 3.0;
 /// 校准锚的采样次数：校准只需判「good 是否显著高于 bad」这一粗粒度问题，K=1 足够，
 /// 翻倍裁判团后控 CI 墙时间（每 Q 仅 +~60s）。判分本身仍走 K=[`JUDGE_RUNS`]=3。
 const CALIB_RUNS: usize = 1;
+/// 单裁判**自身** K 次采样的 overall 极差上限：median-of-K 压方差，但若同一裁判对**同一**
+/// 输出在 K 次里给出极差 > 此（如 0/3/6），说明这把尺子自相矛盾、那次 median 不可信 →
+/// 在跨裁判判定前先**剔除**该裁判（只看精度/极差，**绝不看分数**——反放水：不能靠剔除把
+/// 高分/低分裁判留下来凑 pass/fail）。剔后有效裁判 <2 → `SkipInsufficientJudges`（仪器不
+/// 可靠，**非内容失败**）。与跨裁判 `DIVERGENCE_SKIP_THRESHOLD` 同性质：那个治「两把尺子
+/// 互相不一致」，这个治「一把尺子跟自己不一致」。可被 env `QUALITY_INTRA_SPREAD_MAX` 覆盖。
+const INTRA_JUDGE_SPREAD_MAX: f64 = 3.0;
 
 /// 跨裁判分歧 skip 阈值（env `QUALITY_DIVERGENCE_MAX` 可覆盖，缺省 [`DIVERGENCE_SKIP_THRESHOLD`]）。
 fn divergence_max() -> f64 {
@@ -145,6 +152,15 @@ fn divergence_max() -> f64 {
         .and_then(|v| v.parse::<f64>().ok())
         .filter(|v| *v >= 0.0)
         .unwrap_or(DIVERGENCE_SKIP_THRESHOLD)
+}
+
+/// 单裁判 K 极差效度门（env `QUALITY_INTRA_SPREAD_MAX` 可覆盖，缺省 [`INTRA_JUDGE_SPREAD_MAX`]）。
+fn intra_spread_max() -> f64 {
+    std::env::var("QUALITY_INTRA_SPREAD_MAX")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .filter(|v| *v >= 0.0)
+        .unwrap_or(INTRA_JUDGE_SPREAD_MAX)
 }
 
 // ── JSONL 分数台账（跨轮回归对比；复制自 real_llm_adversarial.rs，arc 形参化）──────
@@ -299,15 +315,18 @@ async fn judge_quality(
 // **被断言对象**，故分歧不止于诊断，而要决定「是裁判飘(skip) 还是内容真差(fail)」）：
 // 双裁判各 median-of-K → `decide_quality` 三态正交裁决。
 //
-// **反放水的结构性保证**（核心红线）：
-//   - skip 分支条件式**只看 divergence、绝不含 floor**；
-//   - fail 分支条件式**只看分数、绝不含 divergence**。
-// 两条件各只依赖一个变量，从结构上杜绝「分低就 skip」这种放水。
+// **反放水的结构性保证**（核心红线）：两道效度门都**只看精度/分歧、绝不看分数**，
+// 判分门**只看分数、绝不看精度/分歧**——每个判定各只依赖一个变量，从结构上杜绝放水：
+//   - ⓪ 单裁判 K 极差门（剔除自相矛盾的裁判）：只依赖该裁判自身 spread，不含 floor；
+//   - ① 跨裁判分歧门（`SkipDivergent`）：只依赖 divergence，不含 floor；
+//   - ② 判分门（`Pass`/`Fail`）：只依赖分数（保守取低），不含 divergence/spread。
+// 剔除门尤其要防「靠剔除留下高分裁判凑 Pass / 留下低分裁判凑 Fail」——所以剔除条件式
+// **只比 spread 与门限**，与 median 高低完全无关。
 
 /// 双裁判校准层的三态裁决（外加两种 skip 子型与校准 skip）。严格正交：
-/// - `Pass`/`Fail` 只由分数决定（与分歧无关）；
-/// - `SkipDivergent` 只由分歧决定（与分数无关）——分歧大=尺子不一致，结论不可信；
-/// - `SkipInsufficientJudges`：有效裁判 <2，无法做跨裁判效度判断；
+/// - `Pass`/`Fail` 只由分数决定（与分歧/精度无关）；
+/// - `SkipDivergent` 只由跨裁判分歧决定（与分数无关）——分歧大=尺子不一致，结论不可信；
+/// - `SkipInsufficientJudges`：剔除自相矛盾裁判后有效裁判 <2，无法做跨裁判效度判断；
 /// - `SkipCalib`：校准锚拉不开（裁判此刻分辨不了 good/bad），判分不可信。
 #[derive(Debug, Clone, PartialEq)]
 enum QualityVerdict {
@@ -318,17 +337,29 @@ enum QualityVerdict {
     SkipCalib,
 }
 
-/// 三态正交裁决。`per_judge_overall` = 每个有效裁判各自 median-of-K 后的 overall。
+/// 三态正交裁决。`per_judge` = 每个裁判的 `(overall median-of-K, overall K 极差)`。
 /// 判定顺序与红线：
-///   1. 有效裁判 <2 → `SkipInsufficientJudges`（无法跨裁判判效度）。
+///   ⓪ 先剔除自身 K 极差 > `intra_spread_max` 的裁判（**只看精度，不看分数**：尺子自相
+///      矛盾→那次 median 不可信；剔除与该裁判 median 高低无关，杜绝靠剔除凑 pass/fail）。
+///   1. 剔后有效裁判 <2 → `SkipInsufficientJudges`（无法跨裁判判效度，仪器不可靠非内容失败）。
 ///   2. 跨裁判分歧 = max-min；**> skip_max** → `SkipDivergent`（**只看分歧，不看分数**：
 ///      两把尺子不一致 = 该结论不可信，绝不据任一裁判判 pass/fail）。
 ///   3. 分歧可接受 → 取 `min(medians)` 作 agreed（self-enhancement 抬分，**保守取低**者
-///      更可信）；**只看分数**：agreed ≥ floor → `Pass`，否则 `Fail`（**不看分歧**）。
-/// 自检反例：a=8,b=2 → divergence=6 > 3 → SkipDivergent（不据 pro 的 8 判 pass、
-/// 不据 lite 的 2 判 fail，只 skip + 大声诊断）。
-fn decide_quality(per_judge_overall: &[f64], floor: f64, skip_max: f64) -> QualityVerdict {
-    let meds: Vec<f64> = per_judge_overall.to_vec();
+///      更可信）；**只看分数**：agreed ≥ floor → `Pass`，否则 `Fail`（**不看分歧/精度**）。
+/// 自检反例：a=(8,0),b=(2,0) → divergence=6 > 3 → SkipDivergent（不据任一裁判判 pass/fail）。
+/// a=(6,0),b=(4,6) → 剔除 b（极差6>3）→ 仅剩 1 裁判 → SkipInsufficientJudges（不据 a 的 6 判 pass）。
+fn decide_quality(
+    per_judge: &[(f64, f64)],
+    floor: f64,
+    skip_max: f64,
+    intra_spread_max: f64,
+) -> QualityVerdict {
+    // ⓪ 效度门：剔除自身 K 极差超限的失灵裁判。只比 spread 与门限，绝不看 median 高低。
+    let meds: Vec<f64> = per_judge
+        .iter()
+        .filter(|(_omed, ospread)| *ospread <= intra_spread_max)
+        .map(|(omed, _ospread)| *omed)
+        .collect();
     if meds.len() < 2 {
         return QualityVerdict::SkipInsufficientJudges;
     }
@@ -342,7 +373,7 @@ fn decide_quality(per_judge_overall: &[f64], floor: f64, skip_max: f64) -> Quali
             medians: meds,
         };
     }
-    // pass/fail 分支：仅依赖分数（保守取低），不含 divergence。
+    // pass/fail 分支：仅依赖分数（保守取低），不含 divergence/spread。
     let agreed = lo;
     if agreed >= floor {
         QualityVerdict::Pass {
@@ -533,9 +564,9 @@ struct PanelOutcome {
 }
 
 impl PanelOutcome {
-    /// 各有效裁判 overall median 列表（喂给 decide_quality）。
-    fn overalls(&self) -> Vec<f64> {
-        self.per_judge.iter().map(|(_, m, _)| *m).collect()
+    /// 各裁判 `(overall median, overall K 极差)`，喂给 decide_quality 做效度门 + 判分。
+    fn judge_stats(&self) -> Vec<(f64, f64)> {
+        self.per_judge.iter().map(|(_, m, sp)| (*m, *sp)).collect()
     }
 }
 
@@ -747,7 +778,12 @@ async fn evaluate_quality_panel(
             });
         }
     };
-    let verdict = decide_quality(&outcome.overalls(), MIN_QUALITY_FLOOR, divergence_max());
+    let verdict = decide_quality(
+        &outcome.judge_stats(),
+        MIN_QUALITY_FLOOR,
+        divergence_max(),
+        intra_spread_max(),
+    );
     // 诊断：把各裁判 reasons 打出来，便于 Fail 时定位短板维度。
     for (label, score) in &outcome.sample_scores {
         eprintln!(
@@ -1416,8 +1452,12 @@ async fn q2_article_extraction_quality() {
                 .await
                 {
                     Some(outcome) => {
-                        let verdict =
-                            decide_quality(&outcome.overalls(), MIN_QUALITY_FLOOR, divergence_max());
+                        let verdict = decide_quality(
+                            &outcome.judge_stats(),
+                            MIN_QUALITY_FLOOR,
+                            divergence_max(),
+                            intra_spread_max(),
+                        );
                         ledger_verdict("Q2", spec.source_name, &verdict);
                         handle_verdict("Q2", spec.source_name, verdict);
                     }
@@ -1973,27 +2013,28 @@ fn corpus_matrix_has_both_splits_and_diverse_types() {
 fn decide_quality_three_states_are_orthogonal() {
     let floor = 6.0;
     let skip = 3.0;
+    let isp = 3.0; // intra-spread 门；本测试所有裁判 spread=0（自洽），只验跨裁判三态。
 
     // ① 双裁判一致且都达标 → Pass，agreed 取低者（保守）。
-    match decide_quality(&[8.0, 9.0], floor, skip) {
+    match decide_quality(&[(8.0, 0.0), (9.0, 0.0)], floor, skip, isp) {
         QualityVerdict::Pass { agreed_overall } => assert_eq!(agreed_overall, 8.0),
         v => panic!("期望 Pass，实际 {v:?}"),
     }
     // 边界：恰好 = floor 也算 Pass。
     assert!(matches!(
-        decide_quality(&[6.0, 6.0], floor, skip),
+        decide_quality(&[(6.0, 0.0), (6.0, 0.0)], floor, skip, isp),
         QualityVerdict::Pass { .. }
     ));
 
     // ② 双裁判一致但都不达标 → Fail（只看分数，不看分歧）。
-    match decide_quality(&[4.0, 5.0], floor, skip) {
+    match decide_quality(&[(4.0, 0.0), (5.0, 0.0)], floor, skip, isp) {
         QualityVerdict::Fail { agreed_overall } => assert_eq!(agreed_overall, 4.0),
         v => panic!("期望 Fail，实际 {v:?}"),
     }
 
     // ③ 分歧 > skip_max → SkipDivergent（只看分歧，不看分数）。
     // 关键反放水反例：a=8/b=2，分歧=6>3。绝不据 pro 的 8 判 pass，也绝不据 lite 的 2 判 fail。
-    match decide_quality(&[8.0, 2.0], floor, skip) {
+    match decide_quality(&[(8.0, 0.0), (2.0, 0.0)], floor, skip, isp) {
         QualityVerdict::SkipDivergent { divergence, medians } => {
             assert_eq!(divergence, 6.0);
             assert_eq!(medians, vec![8.0, 2.0]);
@@ -2002,41 +2043,86 @@ fn decide_quality_three_states_are_orthogonal() {
     }
     // 分歧大且**两裁判都低分**：仍必须 SkipDivergent，绝不因分低就 skip 之外再判 fail；
     // 也绝不出现「agreed<floor 却 skip」——skip 由分歧触发，与分数无关。
-    match decide_quality(&[5.0, 1.0], floor, skip) {
+    match decide_quality(&[(5.0, 0.0), (1.0, 0.0)], floor, skip, isp) {
         QualityVerdict::SkipDivergent { divergence, .. } => assert_eq!(divergence, 4.0),
         v => panic!("期望 SkipDivergent，实际 {v:?}"),
     }
 
     // ④ 分歧恰好 = skip_max（不 > ）→ 不 skip，落正常 pass/fail。
     // 例：medians=[3,6] 分歧=3，不>3；取低=3<floor → Fail。
-    match decide_quality(&[3.0, 6.0], floor, skip) {
+    match decide_quality(&[(3.0, 0.0), (6.0, 0.0)], floor, skip, isp) {
         QualityVerdict::Fail { agreed_overall } => assert_eq!(agreed_overall, 3.0),
         v => panic!("期望 Fail（分歧=skip_max 不触发 skip），实际 {v:?}"),
     }
 
     // ⑤ 有效裁判 <2 → SkipInsufficientJudges（无法跨裁判判效度）。
     assert_eq!(
-        decide_quality(&[8.0], floor, skip),
+        decide_quality(&[(8.0, 0.0)], floor, skip, isp),
         QualityVerdict::SkipInsufficientJudges
     );
     assert_eq!(
-        decide_quality(&[], floor, skip),
+        decide_quality(&[], floor, skip, isp),
         QualityVerdict::SkipInsufficientJudges
     );
 }
 
 #[test]
 fn decide_quality_never_skips_for_low_score_alone() {
-    // 反放水审计的纯逻辑佐证：只要双裁判一致（分歧≤skip_max），无论分多低都必须 Fail，
-    // 绝不退化成 skip。把分数从 0 扫到 floor-，分歧恒 0，必须全程 Fail。
+    // 反放水审计的纯逻辑佐证：只要双裁判一致（分歧≤skip_max）且各自自洽（spread≤isp），
+    // 无论分多低都必须 Fail，绝不退化成 skip。把分数从 0 扫到 floor-，分歧恒 0，必须全程 Fail。
     let floor = 6.0;
     let skip = 3.0;
+    let isp = 3.0;
     for s in [0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 5.9] {
-        match decide_quality(&[s, s], floor, skip) {
+        match decide_quality(&[(s, 0.0), (s, 0.0)], floor, skip, isp) {
             QualityVerdict::Fail { agreed_overall } => assert_eq!(agreed_overall, s),
             v => panic!("一致低分 {s} 必须 Fail（绝不放水成 skip），实际 {v:?}"),
         }
     }
+}
+
+#[test]
+fn decide_quality_evicts_incoherent_judge_by_intra_spread() {
+    // 单裁判 K 极差效度门（round-2 修 Q2 的核心）。门只看 spread、绝不看 median 高低。
+    let floor = 6.0;
+    let skip = 3.0;
+    let isp = 3.0;
+
+    // ① CI 真实案例：mimo-pro=(6.0, spread0 自洽)，mimo-lite=(4.0, spread6 自相矛盾)。
+    // 剔除 lite（6>3）→ 仅剩 pro 一个 → SkipInsufficientJudges。
+    // 关键：绝不退化成「据 pro 的 6.0 判 Pass」或「据 lite 的 4.0 判 Fail」。
+    assert_eq!(
+        decide_quality(&[(6.0, 0.0), (4.0, 6.0)], floor, skip, isp),
+        QualityVerdict::SkipInsufficientJudges,
+        "lite 自相矛盾(极差6>3)应被剔除，剩 1 裁判 → SkipInsufficientJudges"
+    );
+
+    // ② 反向反放水：失灵的是**高分**裁判。lite=(9.0, spread6) 被剔，剩 pro=(5.0,0)<floor。
+    // 若错误保留 lite，会凑成 Pass/分歧——必须剔除后 SkipInsufficientJudges，绝不靠剔除凑 Pass。
+    assert_eq!(
+        decide_quality(&[(5.0, 0.0), (9.0, 6.0)], floor, skip, isp),
+        QualityVerdict::SkipInsufficientJudges,
+        "剔除自相矛盾的高分裁判，绝不靠它凑 Pass"
+    );
+
+    // ③ 两裁判都自洽（spread≤门）→ 不剔除，正常走跨裁判三态。
+    match decide_quality(&[(8.0, 1.0), (7.0, 2.0)], floor, skip, isp) {
+        QualityVerdict::Pass { agreed_overall } => assert_eq!(agreed_overall, 7.0),
+        v => panic!("两裁判自洽且达标应 Pass，实际 {v:?}"),
+    }
+
+    // ④ 边界：spread 恰好 = 门（不 > ）→ 保留。两裁判都恰好达门 → 都保留 → 正常判分。
+    match decide_quality(&[(8.0, 3.0), (7.0, 3.0)], floor, skip, isp) {
+        QualityVerdict::Pass { agreed_overall } => assert_eq!(agreed_overall, 7.0),
+        v => panic!("spread=门(不>)应保留，实际 {v:?}"),
+    }
+
+    // ⑤ 两裁判都自相矛盾 → 全剔除 → SkipInsufficientJudges。
+    assert_eq!(
+        decide_quality(&[(6.0, 5.0), (4.0, 6.0)], floor, skip, isp),
+        QualityVerdict::SkipInsufficientJudges,
+        "两裁判都失灵 → 全剔除 → SkipInsufficientJudges"
+    );
 }
 
 #[test]
