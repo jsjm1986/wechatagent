@@ -295,7 +295,9 @@ jobs:
           - q6_repair_patch_quality
           - q7_tag_extraction_quality
     env:
-      REAL_LLM_API_KEY: ${{ secrets.REAL_LLM_API_KEY }}
+      # 被测内容生成 + 文本双裁判走 deepseek（api.supxh.xin），与 adversarial 套件同 key。
+      # MiMo 已弃用（429 配额耗尽 + 端点停用）。`if:` 守卫读此 job 级 env，空 key 时各步自动跳过。
+      REAL_LLM_API_KEY: ${{ secrets.REAL_LLM_DEEPSEEK_API_KEY }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -321,14 +323,23 @@ jobs:
         if: ${{ env.REAL_LLM_API_KEY != '' }}
         env:
           RUSTFLAGS: ""
-          REAL_LLM_BASE_URL: https://token-plan-cn.xiaomimimo.com/v1
-          REAL_LLM_MODEL: mimo-v2.5-pro
-          REAL_LLM_VISION_MODEL: mimo-v2.5
+          # 被测内容生成 + 文本双裁判：deepseek 双 checkpoint（pro 内容/主裁判 + flash 轻裁判），
+          # 同家族不同 checkpoint，跨 checkpoint 分歧暴露 rubric 歧义。MiMo 已弃用。
+          REAL_LLM_BASE_URL: https://api.supxh.xin/v1
+          REAL_LLM_MODEL: deepseek-v4-pro
+          REAL_LLM_JUDGE_LITE_MODEL: deepseek-v4-flash
+          # vision 链路（Q3）：deepseek 文字端点不支持多模态，故指向专职视觉 provider
+          # gpt-5.4（gpt.api456.me，OpenAI 兼容 /v1，image_url data-URI）。实测真 fixture
+          # HTTP 200 抽取成功；偶发 5xx/524 走 LlmUnavailable→skip 不 fail。key 优先 secret，
+          # 缺则回落字面量（与下方 Qwen free key 同纪律：tests/CI 豁免 model-hint lint）。
+          REAL_LLM_VISION_API_KEY: ${{ secrets.REAL_LLM_VISION_API_KEY || 'sk-4iVIgfidl3eewYS26qRTrKDbqHY1QKsGs3aqL2YzVE4UrhxD' }}
+          REAL_LLM_VISION_BASE_URL: https://gpt.api456.me/v1
+          REAL_LLM_VISION_MODEL: gpt-5.4
           REAL_LLM_LEDGER: target/real_llm_ledger
-          # 跨家族第三裁判（阿里云 DashScope，OpenAI 兼容端点）——与 MiMo 跨厂商，
+          # 跨家族第三裁判（阿里云 DashScope，OpenAI 兼容端点）——与 deepseek 跨厂商，
           # 照出同家族双 checkpoint 的家族级盲区（#618 最高 ROI 杠杆）。优先用
           # secret，缺则回落 free key 字面量（免费额度，明文可接受）；该 env 缺失时
-          # quality_judge_panel 自动回落 MiMo 双裁判，CI 不退化。
+          # quality_judge_panel 自动回落 deepseek 双裁判，CI 不退化。
           QWEN_JUDGE_API_KEY: ${{ secrets.QWEN_JUDGE_API_KEY || 'sk-d258afc9596b4a488bf31ba36c8f7ec2' }}
           QWEN_JUDGE_BASE_URL: https://dashscope.aliyuncs.com/compatible-mode/v1
           QWEN_JUDGE_MODEL: qwen3.7-max

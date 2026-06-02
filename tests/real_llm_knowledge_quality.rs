@@ -28,12 +28,14 @@
 //!
 //! ## 运行
 //! ```sh
-//! REAL_LLM_API_KEY=... REAL_LLM_MODEL=mimo-v2.5-pro \
+//! REAL_LLM_API_KEY=... REAL_LLM_MODEL=deepseek-v4-pro \
 //!   cargo test --test real_llm_knowledge_quality -- --ignored --nocapture
 //! ```
 //! 可选：额外配 `QWEN_JUDGE_API_KEY`（+ 可选 `QWEN_JUDGE_BASE_URL` /
-//! `QWEN_JUDGE_MODEL`）启用**跨家族**第三裁判（阿里云 DashScope，与 MiMo 跨厂商），
-//! 照出 MiMo 同家族双 checkpoint 的家族级盲区；缺该 key 自动回落 MiMo 双裁判，不退化。
+//! `QWEN_JUDGE_MODEL`）启用**跨家族**第三裁判（阿里云 DashScope，与被测/主裁判跨厂商），
+//! 照出同家族双 checkpoint 的家族级盲区；缺该 key 自动回落同家族双裁判，不退化。
+//! vision 链路（Q3）走独立 `REAL_LLM_VISION_API_KEY` / `REAL_LLM_VISION_BASE_URL` /
+//! `REAL_LLM_VISION_MODEL`（被测文字端点不支持多模态时指向专职视觉 provider）。
 //! CI 日志可 `grep '\[QUALITY\]'` 拿到每能力/场景的 judge 分，驱动定位短板。
 
 mod common;
@@ -68,8 +70,8 @@ use wiremock::MockServer;
 fn real_llm_from_env() -> Option<Arc<LlmClient>> {
     let api_key = std::env::var("REAL_LLM_API_KEY").ok().filter(|k| !k.trim().is_empty())?;
     let base_url = std::env::var("REAL_LLM_BASE_URL")
-        .unwrap_or_else(|_| "https://token-plan-cn.xiaomimimo.com/v1".to_string());
-    let model = std::env::var("REAL_LLM_MODEL").unwrap_or_else(|_| "mimo-v2.5-pro".to_string());
+        .unwrap_or_else(|_| "https://api.supxh.xin/v1".to_string());
+    let model = std::env::var("REAL_LLM_MODEL").unwrap_or_else(|_| "deepseek-v4-pro".to_string());
     let client =
         LlmClient::new(base_url, api_key, model, 180, 3, 1500).expect("构造真实 LlmClient");
     Some(Arc::new(client))
@@ -394,59 +396,67 @@ fn calib_gap_ok(good_overall: f64, bad_overall: f64, min_gap: f64) -> bool {
     good_overall - bad_overall >= min_gap
 }
 
-// ── 校准层 · 跨家族裁判团（双 checkpoint MiMo + 可选异族 Qwen）─────────────────────
+// ── 校准层 · 跨家族裁判团（deepseek 双 checkpoint + 可选异族 Qwen）──────────────────
 //
-// 单模型自评的系统性偏差靠 median-of-K 消不掉（见上）。第一阶段用 MiMo 双 checkpoint
-// （mimo-v2.5-pro=REAL_LLM_MODEL + mimo-v2.5=REAL_LLM_VISION_MODEL）当两把尺子——
-// 同家族，能暴露 rubric 歧义但留有**家族级盲区**（两 checkpoint 共享同一套训练偏好，
+// 单模型自评的系统性偏差靠 median-of-K 消不掉（见上）。文本判分用 deepseek 双 checkpoint
+// （deepseek-v4-pro=REAL_LLM_MODEL + deepseek-v4-flash=REAL_LLM_JUDGE_LITE_MODEL）当两把
+// 尺子——同家族，能暴露 rubric 歧义但留有**家族级盲区**（两 checkpoint 共享同一套训练偏好，
 // 可能对同一类内容系统性同向偏置，median-of-K / 跨 checkpoint 分歧都看不出来）。
 //
-// 第二阶段（本轮·#618 最高 ROI 杠杆兑现）：接入**真异族裁判** Qwen（阿里云 DashScope
-// OpenAI 兼容端点 base_url=…/compatible-mode/v1，POST …/chat/completions），与 MiMo
-// 跨厂商、跨预训练语料、跨对齐策略。异族裁判与 MiMo 在同一被测内容上若**一致**，结论
-// 可信度远高于同家族一致；若**分歧大**，正是家族级盲区被照出来——交给 decide_quality
-// 的跨裁判分歧门按 skip 处理（不据任一家判 pass/fail，绝不放水）。decide_quality /
+// 第二阶段（#618 最高 ROI 杠杆兑现）：接入**真异族裁判** Qwen（阿里云 DashScope OpenAI
+// 兼容端点 base_url=…/compatible-mode/v1，POST …/chat/completions），与 deepseek 跨厂商、
+// 跨预训练语料、跨对齐策略。异族裁判与 deepseek 在同一被测内容上若**一致**，结论可信度
+// 远高于同家族一致；若**分歧大**，正是家族级盲区被照出来——交给 decide_quality 的跨裁判
+// 分歧门按 skip 处理（不据任一家判 pass/fail，绝不放水）。decide_quality /
 // panel_calibrated / run_quality_panel 全部按 N 裁判泛化（divergence=max-min，
 // agreed=min(medians)，逐裁判各自校准+剔除），故第三位裁判**零结构改动**即融入。
 //
-// Qwen 走**独立 env**（QWEN_JUDGE_API_KEY / _BASE_URL / _MODEL），与 MiMo 的
-// REAL_LLM_* 解耦：缺 Qwen key → 自动回落到 MiMo 双 checkpoint（行为不退化，CI 不挂）；
-// 缺 MiMo key（REAL_LLM_API_KEY）→ None（调用方 skip，沿用原语义）。
+// **provider 沿革（2026-06-02 用户决策）**：MiMo 配额耗尽 → 文本 Q 与文本裁判全切
+// deepseek-v4（api.supxh.xin，OpenAI 兼容 /v1，已验 json_object 可用）。判分裁判第二
+// checkpoint 从 REAL_LLM_VISION_MODEL 解耦到**独立** REAL_LLM_JUDGE_LITE_MODEL——因为
+// REAL_LLM_VISION_MODEL 现在专供 Q3 vision 走 MiMo 多模态（deepseek 非多模态），两者
+// 不能再共用一个 env（旧实现把 judge-lite 和 vision 模型双关绑死，切 provider 必撞）。
+//
+// Qwen 走**独立 env**（QWEN_JUDGE_API_KEY / _BASE_URL / _MODEL），与 deepseek 的
+// REAL_LLM_* 解耦：缺 Qwen key → 自动回落到 deepseek 双 checkpoint（行为不退化，CI 不挂）；
+// 缺文本裁判 key（REAL_LLM_API_KEY）→ None（调用方 skip，沿用原语义）。
 
 struct QualityJudge {
     label: &'static str,
     client: Arc<dyn LlmProvider>,
 }
 
-/// 构造质量套件跨家族裁判团：MiMo 双 checkpoint（必备）+ 可选异族 Qwen（DashScope）。
-/// MiMo key（REAL_LLM_API_KEY）缺失 → None（调用方 skip）；Qwen key 缺失 → 回落 2 裁判。
+/// 构造质量套件跨家族裁判团：deepseek 双 checkpoint（必备）+ 可选异族 Qwen（DashScope）。
+/// 文本裁判 key（REAL_LLM_API_KEY）缺失 → None（调用方 skip）；Qwen key 缺失 → 回落 2 裁判。
 fn quality_judge_panel() -> Option<Vec<QualityJudge>> {
     let api_key = std::env::var("REAL_LLM_API_KEY")
         .ok()
         .filter(|k| !k.trim().is_empty())?;
     let base_url = std::env::var("REAL_LLM_BASE_URL")
-        .unwrap_or_else(|_| "https://token-plan-cn.xiaomimimo.com/v1".to_string());
-    let pro = std::env::var("REAL_LLM_MODEL").unwrap_or_else(|_| "mimo-v2.5-pro".to_string());
-    let lite =
-        std::env::var("REAL_LLM_VISION_MODEL").unwrap_or_else(|_| "mimo-v2.5".to_string());
+        .unwrap_or_else(|_| "https://api.supxh.xin/v1".to_string());
+    let pro = std::env::var("REAL_LLM_MODEL").unwrap_or_else(|_| "deepseek-v4-pro".to_string());
+    // judge-lite checkpoint 走**独立** REAL_LLM_JUDGE_LITE_MODEL，与 Q3 vision 的
+    // REAL_LLM_VISION_MODEL 彻底解耦（vision 仍走 MiMo 多模态，judge 走 deepseek 文本）。
+    let lite = std::env::var("REAL_LLM_JUDGE_LITE_MODEL")
+        .unwrap_or_else(|_| "deepseek-v4-flash".to_string());
     let c1 = LlmClient::new(base_url.clone(), api_key.clone(), pro, 180, 3, 1500).ok()?;
     let c2 = LlmClient::new(base_url, api_key, lite, 180, 3, 1500).ok()?;
     let mut panel = vec![
         QualityJudge {
-            label: "mimo-pro",
+            label: "deepseek-pro",
             client: Arc::new(c1) as Arc<dyn LlmProvider>,
         },
         QualityJudge {
-            label: "mimo-lite",
+            label: "deepseek-flash",
             client: Arc::new(c2) as Arc<dyn LlmProvider>,
         },
     ];
-    // 异族裁判（与 MiMo 跨厂商）。独立 env，缺则回落同家族双 checkpoint，不退化。
+    // 异族裁判（与 deepseek 跨厂商）。独立 env，缺则回落同家族双 checkpoint，不退化。
     if let Some(hetero) = hetero_qwen_judge() {
         panel.push(hetero);
     } else {
         eprintln!(
-            "[质量裁判团] 未配置 QWEN_JUDGE_API_KEY，回落 MiMo 双 checkpoint（同家族）；\
+            "[质量裁判团] 未配置 QWEN_JUDGE_API_KEY，回落 deepseek 双 checkpoint（同家族）；\
              配置异族 key 可启用跨家族裁判，照出家族级盲区"
         );
     }
@@ -1667,12 +1677,17 @@ async fn q3_vision_extraction_quality() {
     let app = TestApp::start().await;
     let ws = app.state.config.default_workspace_id.clone();
 
-    let api_key = std::env::var("REAL_LLM_API_KEY").expect("require_real_llm 已保证存在");
-    let base_url = std::env::var("REAL_LLM_BASE_URL")
-        .unwrap_or_else(|_| "https://token-plan-cn.xiaomimimo.com/v1".to_string());
-    let vision_model = std::env::var("REAL_LLM_VISION_MODEL")
-        .or_else(|_| std::env::var("REAL_LLM_MODEL"))
-        .unwrap_or_else(|_| "mimo-v2.5".to_string());
+    // vision 链路用**独立** env 三元组：被测文字/裁判端点（deepseek @ api.supxh.xin）
+    // 不支持多模态，故 Q3 走专职视觉 provider（gpt-5.4 @ gpt.api456.me）。缺 VISION key
+    // 时回落到通用 REAL_LLM_API_KEY/BASE_URL（兼容单端点既支持文字又支持 vision 的形态）。
+    let api_key = std::env::var("REAL_LLM_VISION_API_KEY")
+        .or_else(|_| std::env::var("REAL_LLM_API_KEY"))
+        .expect("require_real_llm 已保证存在");
+    let base_url = std::env::var("REAL_LLM_VISION_BASE_URL")
+        .or_else(|_| std::env::var("REAL_LLM_BASE_URL"))
+        .unwrap_or_else(|_| "https://gpt.api456.me/v1".to_string());
+    let vision_model =
+        std::env::var("REAL_LLM_VISION_MODEL").unwrap_or_else(|_| "gpt-5.4".to_string());
     let vision_cfg = LlmProviderConfig {
         id: Some(ObjectId::new()),
         workspace_id: ws.clone(),
