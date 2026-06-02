@@ -31,6 +31,9 @@
 //! REAL_LLM_API_KEY=... REAL_LLM_MODEL=mimo-v2.5-pro \
 //!   cargo test --test real_llm_knowledge_quality -- --ignored --nocapture
 //! ```
+//! 可选：额外配 `QWEN_JUDGE_API_KEY`（+ 可选 `QWEN_JUDGE_BASE_URL` /
+//! `QWEN_JUDGE_MODEL`）启用**跨家族**第三裁判（阿里云 DashScope，与 MiMo 跨厂商），
+//! 照出 MiMo 同家族双 checkpoint 的家族级盲区；缺该 key 自动回落 MiMo 双裁判，不退化。
 //! CI 日志可 `grep '\[QUALITY\]'` 拿到每能力/场景的 judge 分，驱动定位短板。
 
 mod common;
@@ -391,19 +394,32 @@ fn calib_gap_ok(good_overall: f64, bad_overall: f64, min_gap: f64) -> bool {
     good_overall - bad_overall >= min_gap
 }
 
-// ── 校准层 · 双 checkpoint 裁判团（照搬 real_llm_adversarial.rs:judge_panel 模式）────
+// ── 校准层 · 跨家族裁判团（双 checkpoint MiMo + 可选异族 Qwen）─────────────────────
 //
-// 单模型自评的系统性偏差靠 median-of-K 消不掉（见上）。对策：用 MiMo 双 checkpoint
-// （mimo-v2.5-pro=REAL_LLM_MODEL + mimo-v2.5=REAL_LLM_VISION_MODEL）当两把尺子，
-// 跨 checkpoint 分歧暴露 rubric 歧义。同家族——接受可能残留的家族级盲区（用户已选
-// "先用 MiMo 双 checkpoint"），下一轮再议真异族裁判。缺 key → None（调用方 skip）。
+// 单模型自评的系统性偏差靠 median-of-K 消不掉（见上）。第一阶段用 MiMo 双 checkpoint
+// （mimo-v2.5-pro=REAL_LLM_MODEL + mimo-v2.5=REAL_LLM_VISION_MODEL）当两把尺子——
+// 同家族，能暴露 rubric 歧义但留有**家族级盲区**（两 checkpoint 共享同一套训练偏好，
+// 可能对同一类内容系统性同向偏置，median-of-K / 跨 checkpoint 分歧都看不出来）。
+//
+// 第二阶段（本轮·#618 最高 ROI 杠杆兑现）：接入**真异族裁判** Qwen（阿里云 DashScope
+// OpenAI 兼容端点 base_url=…/compatible-mode/v1，POST …/chat/completions），与 MiMo
+// 跨厂商、跨预训练语料、跨对齐策略。异族裁判与 MiMo 在同一被测内容上若**一致**，结论
+// 可信度远高于同家族一致；若**分歧大**，正是家族级盲区被照出来——交给 decide_quality
+// 的跨裁判分歧门按 skip 处理（不据任一家判 pass/fail，绝不放水）。decide_quality /
+// panel_calibrated / run_quality_panel 全部按 N 裁判泛化（divergence=max-min，
+// agreed=min(medians)，逐裁判各自校准+剔除），故第三位裁判**零结构改动**即融入。
+//
+// Qwen 走**独立 env**（QWEN_JUDGE_API_KEY / _BASE_URL / _MODEL），与 MiMo 的
+// REAL_LLM_* 解耦：缺 Qwen key → 自动回落到 MiMo 双 checkpoint（行为不退化，CI 不挂）；
+// 缺 MiMo key（REAL_LLM_API_KEY）→ None（调用方 skip，沿用原语义）。
 
 struct QualityJudge {
     label: &'static str,
     client: Arc<dyn LlmProvider>,
 }
 
-/// 构造质量套件双裁判团；与 adversarial:judge_panel 同构（同 key/base_url，两 model）。
+/// 构造质量套件跨家族裁判团：MiMo 双 checkpoint（必备）+ 可选异族 Qwen（DashScope）。
+/// MiMo key（REAL_LLM_API_KEY）缺失 → None（调用方 skip）；Qwen key 缺失 → 回落 2 裁判。
 fn quality_judge_panel() -> Option<Vec<QualityJudge>> {
     let api_key = std::env::var("REAL_LLM_API_KEY")
         .ok()
@@ -415,7 +431,7 @@ fn quality_judge_panel() -> Option<Vec<QualityJudge>> {
         std::env::var("REAL_LLM_VISION_MODEL").unwrap_or_else(|_| "mimo-v2.5".to_string());
     let c1 = LlmClient::new(base_url.clone(), api_key.clone(), pro, 180, 3, 1500).ok()?;
     let c2 = LlmClient::new(base_url, api_key, lite, 180, 3, 1500).ok()?;
-    Some(vec![
+    let mut panel = vec![
         QualityJudge {
             label: "mimo-pro",
             client: Arc::new(c1) as Arc<dyn LlmProvider>,
@@ -424,7 +440,33 @@ fn quality_judge_panel() -> Option<Vec<QualityJudge>> {
             label: "mimo-lite",
             client: Arc::new(c2) as Arc<dyn LlmProvider>,
         },
-    ])
+    ];
+    // 异族裁判（与 MiMo 跨厂商）。独立 env，缺则回落同家族双 checkpoint，不退化。
+    if let Some(hetero) = hetero_qwen_judge() {
+        panel.push(hetero);
+    } else {
+        eprintln!(
+            "[质量裁判团] 未配置 QWEN_JUDGE_API_KEY，回落 MiMo 双 checkpoint（同家族）；\
+             配置异族 key 可启用跨家族裁判，照出家族级盲区"
+        );
+    }
+    Some(panel)
+}
+
+/// 可选异族裁判：Qwen（阿里云 DashScope，OpenAI 兼容 …/compatible-mode/v1）。
+/// 走独立 QWEN_JUDGE_* env，与 MiMo 的 REAL_LLM_* 完全解耦。缺 key 或构造失败 → None。
+fn hetero_qwen_judge() -> Option<QualityJudge> {
+    let api_key = std::env::var("QWEN_JUDGE_API_KEY")
+        .ok()
+        .filter(|k| !k.trim().is_empty())?;
+    let base_url = std::env::var("QWEN_JUDGE_BASE_URL")
+        .unwrap_or_else(|_| "https://dashscope.aliyuncs.com/compatible-mode/v1".to_string());
+    let model = std::env::var("QWEN_JUDGE_MODEL").unwrap_or_else(|_| "qwen3.7-max".to_string());
+    let c = LlmClient::new(base_url, api_key, model, 180, 3, 1500).ok()?;
+    Some(QualityJudge {
+        label: "qwen-hetero",
+        client: Arc::new(c) as Arc<dyn LlmProvider>,
+    })
 }
 
 // ── 校准层 · 每能力金标 good/bad 校准对（与被测文档解耦，防过拟合）──────────────────
@@ -2123,6 +2165,48 @@ fn decide_quality_evicts_incoherent_judge_by_intra_spread() {
         QualityVerdict::SkipInsufficientJudges,
         "两裁判都失灵 → 全剔除 → SkipInsufficientJudges"
     );
+}
+
+#[test]
+fn decide_quality_generalizes_to_cross_family_third_judge() {
+    // 接入异族 Qwen 后裁判从 2 个变 3 个。decide_quality 按 N 裁判泛化
+    // （divergence=max-min，agreed=min(medians)），此测锁死三裁判语义不退化、
+    // 且异族裁判照出家族级盲区时的反放水行为正确。
+    let floor = 6.0;
+    let skip = 3.0;
+    let isp = 3.0;
+
+    // ① 三裁判都自洽且分歧可接受 → Pass，agreed 取三者最低（保守）。
+    // mimo-pro=8 / mimo-lite=8 / qwen=6：MiMo 同家族都偏高，异族 Qwen 更保守=6，
+    // 分歧=8-6=2≤3 → 仍 Pass 但 agreed=6（异族把同家族的虚高拉了下来，正是其价值）。
+    match decide_quality(&[(8.0, 0.0), (8.0, 0.0), (6.0, 0.0)], floor, skip, isp) {
+        QualityVerdict::Pass { agreed_overall } => assert_eq!(agreed_overall, 6.0),
+        v => panic!("三裁判自洽且分歧≤门应 Pass、agreed 取最低，实际 {v:?}"),
+    }
+
+    // ② 家族级盲区被异族照出：MiMo 双 checkpoint 一致高（9/9），异族 Qwen 判 4——
+    // 跨家族分歧=9-4=5>3 → SkipDivergent。关键反放水：绝不据 MiMo 同家族多数(9)
+    // 判 Pass（这正是单家族会犯的错），也绝不据 Qwen 的 4 判 Fail；分歧大=结论不可信→skip。
+    match decide_quality(&[(9.0, 0.0), (9.0, 0.0), (4.0, 0.0)], floor, skip, isp) {
+        QualityVerdict::SkipDivergent { divergence, medians } => {
+            assert_eq!(divergence, 5.0);
+            assert_eq!(medians, vec![9.0, 9.0, 4.0]);
+        }
+        v => panic!("跨家族分歧>门必须 SkipDivergent（绝不据同家族多数放水），实际 {v:?}"),
+    }
+
+    // ③ 三裁判一致低（含异族）→ Fail。异族也认同低分，证据强于同家族一致低。
+    match decide_quality(&[(5.0, 0.0), (4.0, 0.0), (5.0, 0.0)], floor, skip, isp) {
+        QualityVerdict::Fail { agreed_overall } => assert_eq!(agreed_overall, 4.0),
+        v => panic!("三裁判（含异族）一致低必须 Fail，实际 {v:?}"),
+    }
+
+    // ④ 异族裁判自相矛盾（K 极差超门）被剔除，剩 MiMo 双 checkpoint 仍自洽 →
+    // 回落到两裁判正常判分（不因第三裁判失灵而误 skip 整个结论）。
+    match decide_quality(&[(7.0, 0.0), (8.0, 1.0), (3.0, 6.0)], floor, skip, isp) {
+        QualityVerdict::Pass { agreed_overall } => assert_eq!(agreed_overall, 7.0),
+        v => panic!("剔除失灵异族裁判后剩两 MiMo 自洽达标应 Pass，实际 {v:?}"),
+    }
 }
 
 #[test]
