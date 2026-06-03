@@ -116,7 +116,7 @@ jobs:
   real-llm:
     name: Real-LLM smoke (真实大模型 / MCP 桩)
     runs-on: ubuntu-latest
-    # 用**真实大模型**（deepseek-v4 / OpenAI 兼容端点）跑 T1 文本决策+审查 / T2 知识
+    # 用**真实大模型**（MiMo mimo-v2.5 / OpenAI 兼容端点）跑 T1 文本决策+审查 / T2 知识
     # tool-loop / T3 多模态 vision 抽取，验证 mock 测不到的真实 schema/闸门/收敛。
     # MCP 永远是 wiremock 桩（绝不真发微信）。real-LLM 限流/抖动不该阻塞合并，
     # 故 continue-on-error；conclusion 恒 success，必看 job 日志拿真实绿/红。
@@ -125,10 +125,11 @@ jobs:
     # 密钥提到 job 级 env：GitHub Actions 的 job 级 `if:` 读不到 secrets 上下文，
     # 但 step 级 `if:` 能读 env，故下方各重步用 `if: env.REAL_LLM_API_KEY != ''`
     # 守卫——未配 secret（fork PR / 没配）时直接跳过编译/跑测，不浪费 CI 分钟、不红。
-    # provider 沿革（2026-06-03）：MiMo 配额耗尽 + 端点下线 → 文本切 deepseek-v4
-    # （key 走 secret REAL_LLM_DEEPSEEK_API_KEY），与 ops/adversarial/quality 套件同源。
+    # provider 沿革（2026-06-03）：MiMo 配额耗尽 → deepseek-v4（令牌 2026-06-03 过期/无效）
+    # → 文本切回 MiMo mimo-v2.5（用户指定 api.xiaomimimo.com，key 走 secret
+    # REAL_LLM_MIMO_API_KEY，缺则回落字面量），与 ops/adversarial/quality 套件同源。
     env:
-      REAL_LLM_API_KEY: ${{ secrets.REAL_LLM_DEEPSEEK_API_KEY }}
+      REAL_LLM_API_KEY: ${{ secrets.REAL_LLM_MIMO_API_KEY || 'sk-cfvcwg5ga1onypq5g01ejdig7w44p67e9bk7odzwo0oxiocz' }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -160,10 +161,10 @@ jobs:
         if: ${{ env.REAL_LLM_API_KEY != '' }}
         env:
           RUSTFLAGS: ""
-          # 文本主链路（T1/T2）走 deepseek-v4（api.supxh.xin，OpenAI 兼容 /v1）。
-          REAL_LLM_BASE_URL: https://api.supxh.xin/v1
-          REAL_LLM_MODEL: deepseek-v4-pro
-          # vision（T3）：deepseek 文字端点不支持多模态，故指向专职视觉 provider
+          # 文本主链路（T1/T2）走 MiMo mimo-v2.5（api.xiaomimimo.com，OpenAI 兼容 /v1）。
+          REAL_LLM_BASE_URL: https://api.xiaomimimo.com/v1
+          REAL_LLM_MODEL: mimo-v2.5
+          # vision（T3）：MiMo 主文本 checkpoint 不复用多模态，故指向专职视觉 provider
           # gpt-5.4（gpt.api456.me，OpenAI 兼容 /v1）。key 优先 secret，缺则回落字面量
           # （与 quality 套件同纪律：tests/CI 豁免 model-hint lint）。偶发 5xx/524 走
           # LlmUnavailable→skip 不 fail。
@@ -184,10 +185,10 @@ jobs:
         if: ${{ !cancelled() && env.REAL_LLM_API_KEY != '' }}
         env:
           RUSTFLAGS: ""
-          # 文本知识链路（K1–K5/K7–K11）走 deepseek-v4（api.supxh.xin）。
-          REAL_LLM_BASE_URL: https://api.supxh.xin/v1
-          REAL_LLM_MODEL: deepseek-v4-pro
-          # vision（K6）：deepseek 文字端点不支持多模态，故指向专职视觉 provider
+          # 文本知识链路（K1–K5/K7–K11）走 MiMo mimo-v2.5（api.xiaomimimo.com）。
+          REAL_LLM_BASE_URL: https://api.xiaomimimo.com/v1
+          REAL_LLM_MODEL: mimo-v2.5
+          # vision（K6）：MiMo 主文本 checkpoint 不复用多模态，故指向专职视觉 provider
           # gpt-5.4（gpt.api456.me）。key 优先 secret，缺则回落字面量（与 quality 套件
           # 同纪律：tests/CI 豁免 model-hint lint）。偶发 5xx/524 走 LlmUnavailable→skip。
           REAL_LLM_VISION_API_KEY: ${{ secrets.REAL_LLM_VISION_API_KEY || 'sk-4iVIgfidl3eewYS26qRTrKDbqHY1QKsGs3aqL2YzVE4UrhxD' }}
@@ -209,8 +210,9 @@ jobs:
   # job 瞬时并发压到 ~2，每个 job 进程内只跑一个测试（并发塌到该测试自身的串行调用）。
   # 队列中的 matrix job 不启动 timeout 计时，故每测试仍独享完整 45min 墙，限流只推迟
   # 开始不吃墙。零 src/ 改动（agent 冻结），纯仪器抗 429。MCP 仍是桩（绝不真发微信）。
-  # 端点已从弃用的 MiMo（429 配额耗尽 + 端点停用）迁到 deepseek（api.supxh.xin），与
-  # adversarial 被测 agent 同模型 deepseek-v4-pro、同 key REAL_LLM_DEEPSEEK_API_KEY。
+  # 端点沿革：MiMo（429）→ deepseek（api.supxh.xin，令牌 2026-06-03 过期/无效）→ 切回
+  # MiMo mimo-v2.5（api.xiaomimimo.com，用户指定），与 adversarial 被测 agent 同模型、
+  # 同 key（secret REAL_LLM_MIMO_API_KEY，缺则回落字面量）。
   real-llm-ops:
     name: Real-LLM ops smoke (${{ matrix.t }} / MCP 桩)
     runs-on: ubuntu-latest
@@ -237,7 +239,7 @@ jobs:
           - t17_real_multiturn_boundary_stress
           - t18_real_warm_start_operator_seeded_arc
     env:
-      REAL_LLM_API_KEY: ${{ secrets.REAL_LLM_DEEPSEEK_API_KEY }}
+      REAL_LLM_API_KEY: ${{ secrets.REAL_LLM_MIMO_API_KEY || 'sk-cfvcwg5ga1onypq5g01ejdig7w44p67e9bk7odzwo0oxiocz' }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -263,15 +265,15 @@ jobs:
       # 多场景通用性 / autonomy 闭集 / 用户反应 outcome 闭集 / 冷启动初始画像 / 长期
       # 记忆整理 / 可操控性 / 千人千面 / 画像写侧弱信号体检（t14）/ 多轮深弧 + 边界
       # 压测（t15/t16/t17）/ 暖启动种子弧（t18）+ K=3 采样并发 judge + 全能力逐轮快照。
-      # REAL_LLM_JUDGE=1 打开 judge 诊断。端点用 deepseek（api.supxh.xin），与 adversarial
-      # 被测 agent 同模型 deepseek-v4-pro（MiMo 已弃用：429 配额耗尽 + 端点停用）。
+      # REAL_LLM_JUDGE=1 打开 judge 诊断。端点用 MiMo mimo-v2.5（api.xiaomimimo.com），与
+      # adversarial 被测 agent 同模型（deepseek 令牌 2026-06-03 过期，切回 MiMo）。
       # MCP 仍是桩（绝不真发微信）。
       - name: cargo test --test real_llm_ops_smoke ${{ matrix.t }}
         if: ${{ env.REAL_LLM_API_KEY != '' }}
         env:
           RUSTFLAGS: ""
-          REAL_LLM_BASE_URL: https://api.supxh.xin/v1
-          REAL_LLM_MODEL: deepseek-v4-pro
+          REAL_LLM_BASE_URL: https://api.xiaomimimo.com/v1
+          REAL_LLM_MODEL: mimo-v2.5
           REAL_LLM_JUDGE: "1"
         run: cargo test --no-fail-fast --test real_llm_ops_smoke ${{ matrix.t }} -- --ignored --nocapture
 
@@ -314,9 +316,9 @@ jobs:
           - q7_tag_extraction_quality
           - q8_honest_abstention_quality
     env:
-      # 被测内容生成 + 文本双裁判走 deepseek（api.supxh.xin），与 adversarial 套件同 key。
-      # MiMo 已弃用（429 配额耗尽 + 端点停用）。`if:` 守卫读此 job 级 env，空 key 时各步自动跳过。
-      REAL_LLM_API_KEY: ${{ secrets.REAL_LLM_DEEPSEEK_API_KEY }}
+      # 被测内容生成 + 文本双裁判走 MiMo mimo-v2.5（api.xiaomimimo.com），与 adversarial 套件
+      # 同 key（deepseek 令牌 2026-06-03 过期，切回 MiMo）。`if:` 守卫读此 job 级 env，空 key 时各步自动跳过。
+      REAL_LLM_API_KEY: ${{ secrets.REAL_LLM_MIMO_API_KEY || 'sk-cfvcwg5ga1onypq5g01ejdig7w44p67e9bk7odzwo0oxiocz' }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -342,12 +344,12 @@ jobs:
         if: ${{ env.REAL_LLM_API_KEY != '' }}
         env:
           RUSTFLAGS: ""
-          # 被测内容生成 + 文本双裁判：deepseek 双 checkpoint（pro 内容/主裁判 + flash 轻裁判），
-          # 同家族不同 checkpoint，跨 checkpoint 分歧暴露 rubric 歧义。MiMo 已弃用。
-          REAL_LLM_BASE_URL: https://api.supxh.xin/v1
-          REAL_LLM_MODEL: deepseek-v4-pro
-          REAL_LLM_JUDGE_LITE_MODEL: deepseek-v4-flash
-          # vision 链路（Q3）：deepseek 文字端点不支持多模态，故指向专职视觉 provider
+          # 被测内容生成 + 文本双裁判：MiMo 双 checkpoint（mimo-v2.5 内容/主裁判 + mimo-v2.5-pro 轻裁判），
+          # 同家族不同 checkpoint，跨 checkpoint 分歧暴露 rubric 歧义。（deepseek 令牌 2026-06-03 过期，切回 MiMo。）
+          REAL_LLM_BASE_URL: https://api.xiaomimimo.com/v1
+          REAL_LLM_MODEL: mimo-v2.5
+          REAL_LLM_JUDGE_LITE_MODEL: mimo-v2.5-pro
+          # vision 链路（Q3）：MiMo 主文本 checkpoint 不复用多模态，故指向专职视觉 provider
           # gpt-5.4（gpt.api456.me，OpenAI 兼容 /v1，image_url data-URI）。实测真 fixture
           # HTTP 200 抽取成功；偶发 5xx/524 走 LlmUnavailable→skip 不 fail。key 优先 secret，
           # 缺则回落字面量（与下方 Qwen free key 同纪律：tests/CI 豁免 model-hint lint）。
@@ -369,8 +371,8 @@ jobs:
           QWEN_JUDGE_API_KEY: ${{ secrets.QWEN_JUDGE_API_KEY || 'sk-d258afc9596b4a488bf31ba36c8f7ec2' }}
           QWEN_JUDGE_BASE_URL: https://dashscope.aliyuncs.com/compatible-mode/v1
           QWEN_JUDGE_MODEL: qwen3.7-max
-          # 文本侧 failover 备胎链（替换/重试机制）：被测内容生成 + 文本双裁判共享 deepseek
-          # 端点（api.supxh.xin），并发互撞偶发 429/5xx/瞬时不可达。配此 key 后主模型遇
+          # 文本侧 failover 备胎链（替换/重试机制）：被测内容生成 + 文本双裁判共享 MiMo
+          # 端点（api.xiaomimimo.com），并发互撞偶发 429/5xx/瞬时不可达。配此 key 后主模型遇
           # **可转移**故障（429/5xx/timeout/connect/网络）即快速切到 NVIDIA integrate 上的
           # 异族文本模型（kimi/minimax/glm）兜底，让 Q 判分流程**跑完拿真分**而非 skip。
           # 复用 vision 备用的 NVIDIA key（同端点托管文本模型）。缺此 key 时退回单主模型 +
@@ -414,10 +416,9 @@ jobs:
     strategy:
       fail-fast: false
       # max-parallel 限流：7 条弧若全并发，各自 K=3 judge 采样(join_all 并发)+红队多轮生成
-      # 同时打 deepseek 端点（api.supxh.xin），瞬时并发 20-35 请求易触发上游 5xx/限流。
-      # 限并发到 2 把瞬时请求压到 ~10 以内。本 job 现用独立 deepseek key（不再与 MiMo 共享），
-      # 但限并发对新端点抗抖动仍有益。队列中的 matrix job 不启动 timeout 计时，故每弧仍独享
-      # 各自完整墙（calibration 90min / 其余 45min），限流只推迟开始不吃墙。
+      # 同时打 MiMo 端点（api.xiaomimimo.com），瞬时并发 20-35 请求易触发上游 5xx/限流。
+      # 限并发到 2 把瞬时请求压到 ~10 以内。限并发对端点抗抖动有益。队列中的 matrix job 不启动
+      # timeout 计时，故每弧仍独享各自完整墙（calibration 90min / 其余 45min），限流只推迟开始不吃墙。
       max-parallel: 2
       matrix:
         arc:
@@ -431,11 +432,12 @@ jobs:
           - t_longrun_capability
     env:
       # 模型沿革：MiMo → gpt-5.5（round-5/6，端点频发 503 auth_unavailable 不可用）→
-      # **deepseek-v4（2026-06-02 用户决策）**。被测 agent = deepseek-v4-pro，主裁判 judge1 =
-      # deepseek-v4-flash（同厂不同 checkpoint，见下方 step env REAL_LLM_JUDGE1_MODEL），
-      # 第二裁判 = 跨家族 Qwen。key 走 secret REAL_LLM_DEEPSEEK_API_KEY，端点 HTTPS（api.supxh.xin）。
+      # deepseek-v4（2026-06-02）→ **切回 MiMo mimo-v2.5（2026-06-03，deepseek 令牌过期/无效）**。
+      # 被测 agent = mimo-v2.5，主裁判 judge1 = mimo-v2.5-pro（同厂不同 checkpoint，见下方 step env
+      # REAL_LLM_JUDGE1_MODEL），第二裁判 = 跨家族 Qwen。key 走 secret REAL_LLM_MIMO_API_KEY（缺则
+      # 回落字面量），端点 HTTPS（api.xiaomimimo.com）。
       # `if:` 守卫读 job 级此 env，故空 key 时整个 adversarial job 各步自动跳过、不红不耗 CI 分钟。
-      REAL_LLM_API_KEY: ${{ secrets.REAL_LLM_DEEPSEEK_API_KEY }}
+      REAL_LLM_API_KEY: ${{ secrets.REAL_LLM_MIMO_API_KEY || 'sk-cfvcwg5ga1onypq5g01ejdig7w44p67e9bk7odzwo0oxiocz' }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -461,15 +463,15 @@ jobs:
         if: ${{ env.REAL_LLM_API_KEY != '' }}
         env:
           RUSTFLAGS: ""
-          # 被测 agent = deepseek-v4-pro（REAL_LLM_MODEL）；主裁判 judge1 = deepseek-v4-flash
-          # （REAL_LLM_JUDGE1_MODEL，同厂不同 checkpoint）——judge1≠agent 模型，比上轮 gpt-5.5
-          # 自评干净（不再逐字自我背书）。端点 HTTPS（api.supxh.xin），OpenAI 兼容 /v1，
+          # 被测 agent = mimo-v2.5（REAL_LLM_MODEL）；主裁判 judge1 = mimo-v2.5-pro
+          # （REAL_LLM_JUDGE1_MODEL，同厂不同 checkpoint）——judge1≠agent checkpoint，比上轮 gpt-5.5
+          # 自评干净（不再逐字自我背书）。端点 HTTPS（api.xiaomimimo.com），OpenAI 兼容 /v1，
           # reasoning_content 落独立字段被 serde 忽略 → 零生产代码改动。台账 judge label 从
           # 各 model 名派生，跨轮读账不串味。
-          REAL_LLM_BASE_URL: https://api.supxh.xin/v1
-          REAL_LLM_MODEL: deepseek-v4-pro
-          REAL_LLM_JUDGE1_MODEL: deepseek-v4-flash
-          REAL_LLM_VISION_MODEL: deepseek-v4-pro
+          REAL_LLM_BASE_URL: https://api.xiaomimimo.com/v1
+          REAL_LLM_MODEL: mimo-v2.5
+          REAL_LLM_JUDGE1_MODEL: mimo-v2.5-pro
+          REAL_LLM_VISION_MODEL: mimo-v2.5
           REAL_LLM_JUDGE: "1"
           REAL_LLM_LEDGER: target/real_llm_ledger
           # 第二裁判 = 跨家族 Qwen（阿里 DashScope，OpenAI 兼容）。agent/judge1 同为 deepseek
