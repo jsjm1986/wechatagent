@@ -36,7 +36,7 @@
 //!
 //! ## 运行
 //! ```sh
-//! REAL_LLM_API_KEY=... REAL_LLM_MODEL=mimo-v2.5-pro \
+//! REAL_LLM_API_KEY=... REAL_LLM_MODEL=deepseek-v4-pro \
 //!   cargo test --test real_llm_knowledge -- --ignored --nocapture
 //! ```
 //! 由 GitHub CI 的 `real-llm` job 驱动（见 `.github/workflows/ci.yml`）。
@@ -68,11 +68,14 @@ use wiremock::MockServer;
 //    编译，fixture 不跨文件共享，故本文件自带一份）────────────────────────────
 
 /// 从 env 构造真实文本 provider。缺 `REAL_LLM_API_KEY` → None（调用方自我跳过）。
+///
+/// provider 沿革（2026-06-03）：MiMo 配额耗尽 + 端点下线 → 文本默认切
+/// deepseek-v4（api.supxh.xin，OpenAI 兼容 /v1，已验 json_object 可用）。
 fn real_llm_from_env() -> Option<Arc<LlmClient>> {
     let api_key = std::env::var("REAL_LLM_API_KEY").ok().filter(|k| !k.trim().is_empty())?;
     let base_url = std::env::var("REAL_LLM_BASE_URL")
-        .unwrap_or_else(|_| "https://token-plan-cn.xiaomimimo.com/v1".to_string());
-    let model = std::env::var("REAL_LLM_MODEL").unwrap_or_else(|_| "mimo-v2.5-pro".to_string());
+        .unwrap_or_else(|_| "https://api.supxh.xin/v1".to_string());
+    let model = std::env::var("REAL_LLM_MODEL").unwrap_or_else(|_| "deepseek-v4-pro".to_string());
     let client =
         LlmClient::new(base_url, api_key, model, 180, 3, 1500).expect("构造真实 LlmClient");
     Some(Arc::new(client))
@@ -719,8 +722,9 @@ async fn k5_real_article_extraction_keeps_needs_review() {
 // ── K6 · 真实多模态图片抽取（import_operation_knowledge_apply_image）────────────
 //
 // 走「专职视觉副模型」分支：seed 一条 `supports_vision + is_vision_active` 的
-// LlmProviderConfig（真实 MiMo 多模态），handler 临时构造真实 vision client 从图片
-// 抽 chunk。图片是 PIL 生成的一张含可读中文条款的文章图（tests/fixtures）。
+// LlmProviderConfig（专职视觉 provider，独立 REAL_LLM_VISION_* 端点），handler 临时
+// 构造真实 vision client 从图片抽 chunk。图片是 PIL 生成的一张含可读中文条款的文章图
+// （tests/fixtures）。
 //
 // 软断言：真模型抽取命中不做硬性保证（抽出 chunk 或 fence 空都通过）。
 // **硬断言（红线）**：任何落库 chunk 必 `draft` + `needs_review`。
@@ -735,13 +739,18 @@ async fn k6_real_vision_article_extraction_keeps_needs_review() {
     let app = TestApp::start().await;
     let ws = app.state.config.default_workspace_id.clone();
 
-    // seed 专职视觉副模型（真实 MiMo 多模态）。
-    let api_key = std::env::var("REAL_LLM_API_KEY").expect("require_real_llm 已保证存在");
-    let base_url = std::env::var("REAL_LLM_BASE_URL")
-        .unwrap_or_else(|_| "https://token-plan-cn.xiaomimimo.com/v1".to_string());
-    let vision_model = std::env::var("REAL_LLM_VISION_MODEL")
-        .or_else(|_| std::env::var("REAL_LLM_MODEL"))
-        .unwrap_or_else(|_| "mimo-v2.5".to_string());
+    // seed 专职视觉副模型。vision 端点独立配置（REAL_LLM_VISION_* 三元组）：deepseek
+    // 文字端点不支持多模态，故 K6 vision 走专职视觉 provider（默认 gpt.api456），缺
+    // VISION key 时回落通用 REAL_LLM_API_KEY/BASE_URL（兼容单端点既支持文字又支持
+    // vision 的形态）。
+    let api_key = std::env::var("REAL_LLM_VISION_API_KEY")
+        .or_else(|_| std::env::var("REAL_LLM_API_KEY"))
+        .expect("require_real_llm 已保证 REAL_LLM_API_KEY 存在");
+    let base_url = std::env::var("REAL_LLM_VISION_BASE_URL")
+        .or_else(|_| std::env::var("REAL_LLM_BASE_URL"))
+        .unwrap_or_else(|_| "https://gpt.api456.me/v1".to_string());
+    let vision_model =
+        std::env::var("REAL_LLM_VISION_MODEL").unwrap_or_else(|_| "gpt-5.4".to_string());
     let vision_cfg = LlmProviderConfig {
         id: Some(ObjectId::new()),
         workspace_id: ws.clone(),

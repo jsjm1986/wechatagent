@@ -2,7 +2,7 @@
 //!
 //! 与其它集成测试的关键区别：其它测试用 mock LLM（`TestLlmGenerator` 预排队
 //! JSON），只验证「业务逻辑接住了正确形状的输出」；本套件把 `AppState.llm`
-//! 换成真实 [`LlmClient`]（OpenAI 兼容端点，默认 MiMo），验证**真模型在真实
+//! 换成真实 [`LlmClient`]（OpenAI 兼容端点，默认 deepseek-v4），验证**真模型在真实
 //! prompt 下输出的 JSON 能否被 serde 解析、过五闸门、知识 agent 多轮 tool-loop
 //! 在真模型下是否真的收敛、真实多模态模型能否抽出 chunk**。
 //!
@@ -16,7 +16,7 @@
 //!
 //! ## 运行
 //! ```sh
-//! REAL_LLM_API_KEY=... REAL_LLM_MODEL=mimo-v2.5-pro \
+//! REAL_LLM_API_KEY=... REAL_LLM_MODEL=deepseek-v4-pro \
 //!   cargo test --test real_llm_smoke -- --ignored --nocapture
 //! ```
 //! 缺 Docker 时 testcontainers 起不来——本套件与其它集成测试一样需要 Docker，
@@ -47,30 +47,45 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 
 /// 从 env 构造真实文本 provider。缺 `REAL_LLM_API_KEY` → None（调用方自我跳过）。
 ///
-/// timeout=180s / retries=3 / retry_base=1500ms 与生产 MiMo 配置同量级
-/// （MiMo 响应慢，给足超时）。`REAL_LLM_BASE_URL` / `REAL_LLM_MODEL` 有合理默认值。
+/// timeout=180s / retries=3 / retry_base=1500ms 给足超时。
+/// `REAL_LLM_BASE_URL` / `REAL_LLM_MODEL` 有合理默认值。
+///
+/// provider 沿革（2026-06-03）：MiMo 配额耗尽 + 端点下线 → 文本默认切
+/// deepseek-v4（api.supxh.xin，OpenAI 兼容 /v1，已验 json_object 可用）。
 fn real_llm_from_env() -> Option<Arc<LlmClient>> {
     let api_key = std::env::var("REAL_LLM_API_KEY").ok().filter(|k| !k.trim().is_empty())?;
     let base_url = std::env::var("REAL_LLM_BASE_URL")
-        .unwrap_or_else(|_| "https://token-plan-cn.xiaomimimo.com/v1".to_string());
+        .unwrap_or_else(|_| "https://api.supxh.xin/v1".to_string());
     let model =
-        std::env::var("REAL_LLM_MODEL").unwrap_or_else(|_| "mimo-v2.5-pro".to_string());
+        std::env::var("REAL_LLM_MODEL").unwrap_or_else(|_| "deepseek-v4-pro".to_string());
     let client = LlmClient::new(base_url, api_key, model, 180, 3, 1500)
         .expect("构造真实 LlmClient");
     Some(Arc::new(client))
 }
 
-/// vision 副模型名：`REAL_LLM_VISION_MODEL`，缺省回退 `REAL_LLM_MODEL`，
-/// 再回退多模态默认 `mimo-v2.5`。
+/// vision 副模型名：`REAL_LLM_VISION_MODEL`，缺省默认专职视觉 provider 模型 `gpt-5.4`。
+///
+/// 与文本端点彻底解耦——deepseek 文本端点不支持多模态，T3 vision 走独立视觉
+/// provider（gpt.api456）。不再回退 `REAL_LLM_MODEL`（旧实现把 vision 与文本模型
+/// 双关绑死，切 provider 必撞）。
 fn real_vision_model() -> String {
-    std::env::var("REAL_LLM_VISION_MODEL")
-        .or_else(|_| std::env::var("REAL_LLM_MODEL"))
-        .unwrap_or_else(|_| "mimo-v2.5".to_string())
+    std::env::var("REAL_LLM_VISION_MODEL").unwrap_or_else(|_| "gpt-5.4".to_string())
 }
 
-fn real_llm_base_url() -> String {
-    std::env::var("REAL_LLM_BASE_URL")
-        .unwrap_or_else(|_| "https://token-plan-cn.xiaomimimo.com/v1".to_string())
+/// vision 端点 base_url：独立 `REAL_LLM_VISION_BASE_URL`，缺省回落通用
+/// `REAL_LLM_BASE_URL`，再缺省专职视觉 provider `gpt.api456`。
+fn real_vision_base_url() -> String {
+    std::env::var("REAL_LLM_VISION_BASE_URL")
+        .or_else(|_| std::env::var("REAL_LLM_BASE_URL"))
+        .unwrap_or_else(|_| "https://gpt.api456.me/v1".to_string())
+}
+
+/// vision 端点 api_key：独立 `REAL_LLM_VISION_API_KEY`，缺省回落通用
+/// `REAL_LLM_API_KEY`（兼容单端点既支持文字又支持 vision 的形态）。
+fn real_vision_api_key() -> String {
+    std::env::var("REAL_LLM_VISION_API_KEY")
+        .or_else(|_| std::env::var("REAL_LLM_API_KEY"))
+        .expect("require_real_llm 已保证 REAL_LLM_API_KEY 存在")
 }
 
 /// 跳过宏：无 key 时打印一行 skip 并 `return`（不 panic、不算失败）。
@@ -443,16 +458,18 @@ async fn t3_real_vision_extraction_keeps_needs_review() {
     let app = TestApp::start().await;
     let ws = app.state.config.default_workspace_id.clone();
 
-    // seed 专职视觉副模型（真实 MiMo 多模态），文字主模型不存在 →
-    // handler 走 Dedicated 分支，用这条配置真实构造 vision client。
-    let api_key = std::env::var("REAL_LLM_API_KEY").expect("require_real_llm 已保证存在");
+    // seed 专职视觉副模型，文字主模型不存在 → handler 走 Dedicated 分支，
+    // 用这条配置真实构造 vision client。vision 端点独立配置：deepseek 文字端点
+    // 不支持多模态，故走 REAL_LLM_VISION_* 三元组（默认 gpt.api456），缺 VISION
+    // key 时回落通用 REAL_LLM_API_KEY/BASE_URL。
+    let api_key = real_vision_api_key();
     let vision_cfg = LlmProviderConfig {
         id: Some(ObjectId::new()),
         workspace_id: ws.clone(),
         provider_id: "real_vision".to_string(),
         name: "real_vision".to_string(),
         format: "openai".to_string(),
-        base_url: real_llm_base_url(),
+        base_url: real_vision_base_url(),
         api_key,
         model: real_vision_model(),
         is_active: false,
