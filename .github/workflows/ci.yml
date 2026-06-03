@@ -194,6 +194,8 @@ jobs:
   # job 瞬时并发压到 ~2，每个 job 进程内只跑一个测试（并发塌到该测试自身的串行调用）。
   # 队列中的 matrix job 不启动 timeout 计时，故每测试仍独享完整 45min 墙，限流只推迟
   # 开始不吃墙。零 src/ 改动（agent 冻结），纯仪器抗 429。MCP 仍是桩（绝不真发微信）。
+  # 端点已从弃用的 MiMo（429 配额耗尽 + 端点停用）迁到 deepseek（api.supxh.xin），与
+  # adversarial 被测 agent 同模型 deepseek-v4-pro、同 key REAL_LLM_DEEPSEEK_API_KEY。
   real-llm-ops:
     name: Real-LLM ops smoke (${{ matrix.t }} / MCP 桩)
     runs-on: ubuntu-latest
@@ -220,7 +222,7 @@ jobs:
           - t17_real_multiturn_boundary_stress
           - t18_real_warm_start_operator_seeded_arc
     env:
-      REAL_LLM_API_KEY: ${{ secrets.REAL_LLM_API_KEY }}
+      REAL_LLM_API_KEY: ${{ secrets.REAL_LLM_DEEPSEEK_API_KEY }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -246,14 +248,15 @@ jobs:
       # 多场景通用性 / autonomy 闭集 / 用户反应 outcome 闭集 / 冷启动初始画像 / 长期
       # 记忆整理 / 可操控性 / 千人千面 / 画像写侧弱信号体检（t14）/ 多轮深弧 + 边界
       # 压测（t15/t16/t17）/ 暖启动种子弧（t18）+ K=3 采样并发 judge + 全能力逐轮快照。
-      # REAL_LLM_JUDGE=1 打开 judge 诊断。MCP 仍是桩（绝不真发微信）。
+      # REAL_LLM_JUDGE=1 打开 judge 诊断。端点用 deepseek（api.supxh.xin），与 adversarial
+      # 被测 agent 同模型 deepseek-v4-pro（MiMo 已弃用：429 配额耗尽 + 端点停用）。
+      # MCP 仍是桩（绝不真发微信）。
       - name: cargo test --test real_llm_ops_smoke ${{ matrix.t }}
         if: ${{ env.REAL_LLM_API_KEY != '' }}
         env:
           RUSTFLAGS: ""
-          REAL_LLM_BASE_URL: https://token-plan-cn.xiaomimimo.com/v1
-          REAL_LLM_MODEL: mimo-v2.5-pro
-          REAL_LLM_VISION_MODEL: mimo-v2.5
+          REAL_LLM_BASE_URL: https://api.supxh.xin/v1
+          REAL_LLM_MODEL: deepseek-v4-pro
           REAL_LLM_JUDGE: "1"
         run: cargo test --no-fail-fast --test real_llm_ops_smoke ${{ matrix.t }} -- --ignored --nocapture
 
