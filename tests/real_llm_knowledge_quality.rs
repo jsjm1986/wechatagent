@@ -51,8 +51,8 @@ use mongodb::bson::{doc, oid::ObjectId, DateTime};
 use serde_json::json;
 use wechatagent::agent::knowledge_agent::{answer, AnswerRequest, CatalogFilter};
 use wechatagent::auth::AuthenticatedAdmin;
-use wechatagent::error::AppResult;
-use wechatagent::llm::{LlmClient, LlmProvider};
+use wechatagent::error::{AppError, AppResult};
+use wechatagent::llm::{LlmClient, LlmJsonResult, LlmProvider};
 use wechatagent::models::{LlmProviderConfig, OperationKnowledgeChunk, RelatedRef};
 use wechatagent::routes::ext_knowledge::{
     build_operation_knowledge_completeness, chat_turn, extract_operation_knowledge_tags,
@@ -72,19 +72,149 @@ fn real_llm_from_env() -> Option<Arc<LlmClient>> {
     let base_url = std::env::var("REAL_LLM_BASE_URL")
         .unwrap_or_else(|_| "https://api.supxh.xin/v1".to_string());
     let model = std::env::var("REAL_LLM_MODEL").unwrap_or_else(|_| "deepseek-v4-pro".to_string());
-    // 重试配置对齐 adversarial 套件的 (180, 5, 2500)：两套件共享同一 deepseek 端点
-    // (api.supxh.xin)，并发互撞导致 429/瞬时不可达。adversarial 用 max_retries=5 +
-    // retry_base_ms=2500 实测能骑过这段抖动拿到真分，本套件原 (3, 1500) 偏弱，多轮
-    // 6/7 Q 因 rate_limited/calib_judge_unavailable 瞬时 skip 拿不到真分。抬齐重试预算
-    // 让仪器穿过共享端点抖动——纯测试仪器抗抖动，不动生产代码、不改任何断言。
-    let client =
-        LlmClient::new(base_url, api_key, model, 180, 5, 2500).expect("构造真实 LlmClient");
+    // 重试配置对齐 adversarial 套件的 (180, *, 2500)：两套件共享同一 deepseek 端点
+    // (api.supxh.xin)，并发互撞导致 429/瞬时不可达。max_retries 走 primary_max_retries()：
+    // 配了 failover 备胎 key 时取 1（快速失败 ~2.5s 即切备胎，省下重试税，避免拖爆 45min
+    // job 墙），无备胎时取 5（自愈窗口，与 adversarial 同形，无备胎场景零退化）。
+    let client = LlmClient::new(base_url, api_key, model, 180, primary_max_retries(), 2500)
+        .expect("构造真实 LlmClient");
     Some(Arc::new(client))
+}
+
+// ── 测试仪器级 failover：被测/裁判模型瞬时不可用（429/5xx/超时/连不上）时，自动
+//    切到**异端点**备胎模型兜底，让 Q 判分流程**跑完拿真分**而非 skip。纯测试仪器，
+//    零生产改动；与 real_llm_adversarial.rs 同形（各测试 crate 独立编译，不跨文件共享）。
+//    备胎 key 缺失 → 备胎链为空 → FailoverProvider 退化为 primary-only（行为零退化）。
+
+/// 判定某错误是否「值得切备胎」：上游瞬时不可用类（限流/5xx/超时/连不上/解码/网络）
+/// 才切；4xx/json 解析失败/空响应等「换模型也没用」的错误 fail-fast 直接抛。
+fn is_failover_worthy(e: &AppError) -> bool {
+    match e {
+        AppError::LlmUnavailable { kind, .. } => matches!(
+            kind.as_str(),
+            "rate_limited"
+                | "http_5xx"
+                | "timeout"
+                | "connect_failed"
+                | "body_decode_error"
+                | "network_error"
+        ),
+        AppError::Http(h) => h.is_timeout() || h.is_connect(),
+        _ => false,
+    }
+}
+
+/// 有序候选 provider 包装：主模型 + 异端点备胎。主模型遇可切错误时顺次降级到下一个
+/// 候选，全部耗尽才返回最后一个错误。任一备胎成功打印 `[failover]`（供 CI grep 验证）。
+struct FailoverProvider {
+    primary_label: String,
+    clients: Vec<Arc<LlmClient>>,
+}
+
+#[async_trait::async_trait]
+impl LlmProvider for FailoverProvider {
+    async fn generate_json(&self, system: &str, user: &str) -> AppResult<serde_json::Value> {
+        self.generate_json_with_usage(system, user)
+            .await
+            .map(|r| r.value)
+    }
+
+    async fn generate_json_with_usage(
+        &self,
+        system: &str,
+        user: &str,
+    ) -> AppResult<LlmJsonResult> {
+        let mut last_err: Option<AppError> = None;
+        for (i, client) in self.clients.iter().enumerate() {
+            match client.generate_json_with_usage(system, user).await {
+                Ok(r) => {
+                    if i > 0 {
+                        eprintln!(
+                            "[failover] 主模型 {} 不可用，已切到备胎[{i}] {} 兜底成功",
+                            self.primary_label, r.model
+                        );
+                    }
+                    return Ok(r);
+                }
+                Err(e) if is_failover_worthy(&e) => {
+                    eprintln!(
+                        "[failover] {} 第{i}个候选不可用，尝试下一个备胎: {e}",
+                        self.primary_label
+                    );
+                    last_err = Some(e);
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Err(last_err.unwrap_or_else(|| AppError::External("failover: 无可用 LLM 客户端".to_string())))
+    }
+}
+
+/// 是否配置了 failover 备胎 key（决定主模型重试预算 + 是否构建备胎链）。
+fn failover_key_present() -> bool {
+    std::env::var("REAL_LLM_FAILOVER_API_KEY")
+        .ok()
+        .filter(|k| !k.trim().is_empty())
+        .is_some()
+}
+
+/// 主模型重试次数：有备胎时取 1（快速失败切备胎，省重试税控 job 墙），无备胎时取 5。
+fn primary_max_retries() -> u32 {
+    if failover_key_present() {
+        1
+    } else {
+        5
+    }
+}
+
+/// 构建异端点备胎链（默认 NVIDIA integrate 端点）。缺 key → 空 vec（退化 primary-only）。
+fn failover_backups() -> Vec<Arc<LlmClient>> {
+    if !failover_key_present() {
+        return Vec::new();
+    }
+    let key = std::env::var("REAL_LLM_FAILOVER_API_KEY").unwrap_or_default();
+    let base = std::env::var("REAL_LLM_FAILOVER_BASE_URL")
+        .unwrap_or_else(|_| "https://integrate.api.nvidia.com/v1".to_string());
+    failover_model_list()
+        .into_iter()
+        .filter_map(|m| {
+            LlmClient::new(base.clone(), key.clone(), m, 180, 5, 2500)
+                .ok()
+                .map(Arc::new)
+        })
+        .collect()
+}
+
+/// 备胎模型清单（逗号分隔，env 可覆盖）。备胎各自保留 5 次重试。
+fn failover_model_list() -> Vec<String> {
+    std::env::var("REAL_LLM_FAILOVER_MODELS")
+        .unwrap_or_else(|_| "moonshotai/kimi-k2.6,minimaxai/minimax-m2.7,z-ai/glm-5.1".to_string())
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
+/// 把主模型 client 包成带异端点备胎链的 FailoverProvider。
+fn wrap_with_failover(primary_label: String, primary: Arc<LlmClient>) -> Arc<dyn LlmProvider> {
+    let mut clients = vec![primary];
+    clients.extend(failover_backups());
+    Arc::new(FailoverProvider {
+        primary_label,
+        clients,
+    })
+}
+
+/// 被测 SUT 用的真实 provider：主 deepseek + 异端点备胎链。缺主 key → None（调用方 skip）。
+fn real_llm_with_failover() -> Option<Arc<dyn LlmProvider>> {
+    let primary = real_llm_from_env()?;
+    let primary_label = std::env::var("REAL_LLM_MODEL").unwrap_or_else(|_| "deepseek-v4-pro".to_string());
+    Some(wrap_with_failover(primary_label, primary))
 }
 
 macro_rules! require_real_llm {
     () => {{
-        match real_llm_from_env() {
+        match real_llm_with_failover() {
             Some(llm) => llm,
             None => {
                 eprintln!("skip: REAL_LLM_API_KEY 未配置，跳过真实大模型知识库质量套件");
@@ -444,18 +574,19 @@ fn quality_judge_panel() -> Option<Vec<QualityJudge>> {
     // REAL_LLM_VISION_MODEL 彻底解耦（vision 仍走 MiMo 多模态，judge 走 deepseek 文本）。
     let lite = std::env::var("REAL_LLM_JUDGE_LITE_MODEL")
         .unwrap_or_else(|_| "deepseek-v4-flash".to_string());
-    // 重试 (180, 5, 2500)：双裁判与被测内容共享 deepseek 端点，对齐 adversarial 套件
-    // 抗共享端点 429/瞬时抖动（详见 real_llm_from_env 注释）。
-    let c1 = LlmClient::new(base_url.clone(), api_key.clone(), pro, 180, 5, 2500).ok()?;
-    let c2 = LlmClient::new(base_url, api_key, lite, 180, 5, 2500).ok()?;
+    // 重试 (180, primary_max_retries(), 2500)：双裁判与被测内容共享 deepseek 端点，对齐
+    // adversarial 套件抗共享端点 429/瞬时抖动（详见 real_llm_from_env 注释）。每个 checkpoint
+    // 再裹 wrap_with_failover：主 deepseek 瞬时不可用时切异端点备胎，让判分流程跑完拿真分。
+    let c1 = LlmClient::new(base_url.clone(), api_key.clone(), pro, 180, primary_max_retries(), 2500).ok()?;
+    let c2 = LlmClient::new(base_url, api_key, lite, 180, primary_max_retries(), 2500).ok()?;
     let mut panel = vec![
         QualityJudge {
             label: "deepseek-pro",
-            client: Arc::new(c1) as Arc<dyn LlmProvider>,
+            client: wrap_with_failover("deepseek-pro".to_string(), Arc::new(c1)),
         },
         QualityJudge {
             label: "deepseek-flash",
-            client: Arc::new(c2) as Arc<dyn LlmProvider>,
+            client: wrap_with_failover("deepseek-flash".to_string(), Arc::new(c2)),
         },
     ];
     // 异族裁判（与 deepseek 跨厂商）。独立 env，缺则回落同家族双 checkpoint，不退化。
@@ -479,11 +610,12 @@ fn hetero_qwen_judge() -> Option<QualityJudge> {
     let base_url = std::env::var("QWEN_JUDGE_BASE_URL")
         .unwrap_or_else(|_| "https://dashscope.aliyuncs.com/compatible-mode/v1".to_string());
     let model = std::env::var("QWEN_JUDGE_MODEL").unwrap_or_else(|_| "qwen3.7-max".to_string());
-    // 重试 (180, 5, 2500)：与文本裁判一致；DashScope 偶有限流，抬齐预算抗抖动。
-    let c = LlmClient::new(base_url, api_key, model, 180, 5, 2500).ok()?;
+    // 重试 (180, primary_max_retries(), 2500)：与文本裁判一致；DashScope 偶有限流。
+    // 同样裹 wrap_with_failover：异族裁判瞬时不可用时切备胎兜底，不让 calib/判分 skip。
+    let c = LlmClient::new(base_url, api_key, model, 180, primary_max_retries(), 2500).ok()?;
     Some(QualityJudge {
         label: "qwen-hetero",
-        client: Arc::new(c) as Arc<dyn LlmProvider>,
+        client: wrap_with_failover("qwen-hetero".to_string(), Arc::new(c)),
     })
 }
 
