@@ -101,6 +101,29 @@ macro_rules! require_real_llm {
     }};
 }
 
+/// 链路解包宏：真模型上游瞬时不可达（限流 429 / 超时等 `LlmUnavailable`）→ 打印 skip 并
+/// `return`，**不算能力失败**——上游没产出内容时 agent 根本没真正运行，断言无对象，跳过
+/// 而非误判崩溃（这不是放水：链路真返回内容时所有红线断言照旧执行）。其它 `Err` 仍 panic。
+/// 镜像姊妹套件 `real_llm_ops_smoke.rs` / `real_llm_knowledge_quality.rs` 的同名宏，使
+/// 运营 Agent 决策+审查链路（T1）、知识 tool-loop（T2）、vision 抽取（T3）的真模型回归
+/// 在上游限流时产出有效信号而非永久假红。
+macro_rules! unwrap_or_skip_transient {
+    ($result:expr, $what:expr) => {{
+        match $result {
+            Ok(value) => value,
+            Err(wechatagent::error::AppError::LlmUnavailable { kind, retry_count, .. }) => {
+                eprintln!(
+                    "skip: {} —— 真模型上游瞬时不可达（kind={kind}, retry_count={retry_count}），\
+                     按计划「真模型抖动有限重试+跳过」处理，不算能力失败",
+                    $what
+                );
+                return;
+            }
+            Err(other) => panic!("{}：{other:?}", $what),
+        }
+    }};
+}
+
 // ── wiremock MCP 成功桩（每请求唯一 newMsgId）────────────────────────────────
 // 与 outbox_integration.rs 同形：gateway 把 newMsgId 写进 conversation_messages
 // .message_id（sparse+unique 索引），同 id 会撞 E11000，故逐请求递增。
@@ -277,10 +300,12 @@ async fn t1_real_text_decision_review_chain() {
         .expect("insert inbound");
 
     // 真实链路：决策 → 审查 →（可选 revision）→ outbox。真模型抖动/限流时
-    // LlmClient 自带 retries=3；这里只断言链路不崩、状态合法。
-    handle_managed_message(&state, contact.clone(), &inbound)
-        .await
-        .expect("真实大模型决策+审查链路必须返回 Ok（不崩、不 5xx）");
+    // LlmClient 自带 retries=3；耗尽后上游仍 429/超时 → skip（不算能力失败），
+    // 链路真返回 Ok 时下方所有红线断言照旧执行。
+    unwrap_or_skip_transient!(
+        handle_managed_message(&state, contact.clone(), &inbound).await,
+        "真实大模型决策+审查链路（T1）"
+    );
 
     // agent_run_logs 必落一行，且 final_review_status 是闭集内合法枚举。
     let log = state
@@ -401,7 +426,10 @@ async fn t2_real_knowledge_tool_loop_converges() {
         max_rounds: None,
     };
 
-    let result = answer(&state, req).await.expect("真实知识 agent answer 必须 Ok");
+    let result = unwrap_or_skip_transient!(
+        answer(&state, req).await,
+        "真实知识 agent answer（T2 tool-loop）"
+    );
 
     eprintln!(
         "[t2] rounds_used={} truncated={} cited={:?} answer.len={}",
@@ -508,9 +536,10 @@ async fn t3_real_vision_extraction_keeps_needs_review() {
         hint: Some("退款政策图片".to_string()),
     };
 
-    let resp = import_operation_knowledge_apply_image(State(app.state.clone()), admin, Json(req))
-        .await
-        .expect("真实 vision 抽取必须 Ok（不崩）");
+    let resp = unwrap_or_skip_transient!(
+        import_operation_knowledge_apply_image(State(app.state.clone()), admin, Json(req)).await,
+        "真实 vision 抽取（T3）"
+    );
     let body = resp.0;
     let chunk_ids = body["chunkIds"].as_array().cloned().unwrap_or_default();
     eprintln!(
