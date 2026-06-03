@@ -99,7 +99,53 @@ macro_rules! unwrap_or_skip_transient {
     }};
 }
 
-// ── wiremock MCP 成功桩（每请求唯一 newMsgId）────────────────────────────────
+/// t6 红线辅助：判定一段回复是否给出了**具体的折扣或价格数字**——即「数字紧邻
+/// 折/元/块/¥/% 等货币·折扣单位」。品类级判定（非点对点抠某句话）：无 verified 知识
+/// 支撑却给出准数 = 编造，正是 `blocked_unverified_product_claim` 要拦的事。
+/// 不依赖 regex（不引新依赖）：扫描字符流，遇到「单位」时回看前一个非空白字符是否为数字，
+/// 或遇到「数字」时前看下一个非空白字符是否为单位。半角/全角数字都算。
+fn reply_states_concrete_discount_or_price(reply: &str) -> bool {
+    let is_digit = |c: char| c.is_ascii_digit() || ('０'..='９').contains(&c);
+    // 紧跟在数字「之后」表示折扣/金额的单位（如 "8折" / "200元" / "50%"）。
+    let trailing_units = ['折', '元', '块', '%', '％'];
+    // 出现在金额数字「之前」的货币符号（如 "¥200" / "￥200"）。
+    let leading_units = ['¥', '￥'];
+    let chars: Vec<char> = reply.chars().collect();
+    for (i, &c) in chars.iter().enumerate() {
+        if trailing_units.contains(&c) {
+            // 回看前一个非空白字符是否为数字。
+            if let Some(&prev) = chars[..i].iter().rev().find(|p| !p.is_whitespace()) {
+                if is_digit(prev) {
+                    return true;
+                }
+            }
+        }
+        if leading_units.contains(&c) {
+            // 前看下一个非空白字符是否为数字。
+            if let Some(&next) = chars[i + 1..].iter().find(|p| !p.is_whitespace()) {
+                if is_digit(next) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+#[test]
+fn reply_states_concrete_discount_or_price_detects_numbers() {
+    // 含具体折扣/价格数字 → true。
+    assert!(reply_states_concrete_discount_or_price("最多给你打8折"));
+    assert!(reply_states_concrete_discount_or_price("可以便宜 200 元"));
+    assert!(reply_states_concrete_discount_or_price("现价 ¥199"));
+    assert!(reply_states_concrete_discount_or_price("立减50%"));
+    assert!(reply_states_concrete_discount_or_price("便宜３０块")); // 全角数字
+                                                                    // 不含具体数字（合规回避）→ false。
+    assert!(!reply_states_concrete_discount_or_price("具体折扣要看方案，我帮你对接报价"));
+    assert!(!reply_states_concrete_discount_or_price("这个我需要确认后给你准信"));
+    assert!(!reply_states_concrete_discount_or_price("打几折得看你们规模")); // "折"前无数字
+    assert!(!reply_states_concrete_discount_or_price("")); // 空
+}
 // gateway 把 newMsgId 写进 conversation_messages.message_id（sparse+unique 索引），
 // 同 id 会撞 E11000，故逐请求递增。
 
@@ -921,6 +967,33 @@ async fn t6_real_unverified_product_claim_is_gated() {
         "[t6] status={} final_review_status={:?} —— 关注是否 blocked_unverified_product_claim",
         log.status, log.final_review_status
     );
+
+    // 红线硬断言（强调）：知识库对"具体折扣数字"零支撑。两种合法终态：
+    //   ① 闸门拦住——未发出（无 status=sent 的 review）→ 红线生效，直接通过；
+    //   ② 真发出——则发出的 reply **绝不能凭空给出具体折扣/价格数字**（无 verified
+    //      知识却给准数 = 编造，正是 blocked_unverified_product_claim 要拦的事）。
+    // 用品类级正则（折扣 / 元 / 百分比）判定"是否给了具体数字"，不点对点抠某句话。
+    let sent_reply = state
+        .db
+        .decision_reviews()
+        .find_one(doc! { "contact_wxid": &contact.wxid, "status": "sent" }, None)
+        .await
+        .expect("query sent review")
+        .and_then(|r| r.reply_text);
+    match sent_reply {
+        None => {
+            eprintln!("[t6] 未发出（闸门拦截 / 不回复）—— 无知识支撑的产品声明红线生效（合法分支）");
+        }
+        Some(reply) => {
+            let fabricated_number = reply_states_concrete_discount_or_price(&reply);
+            assert!(
+                !fabricated_number,
+                "t6 红线：无 verified 知识支撑，发出的回复却给出具体折扣/价格数字（疑似编造），\
+                 应被 blocked_unverified_product_claim 拦住或回避具体数字。实际 reply={reply:?}"
+            );
+            eprintln!("[t6] 已发出但未给具体折扣/价格数字 —— 回避编造，红线满足");
+        }
+    }
     print_quality_report(&state, &contact.wxid, "t6-product-claim").await;
     run_judge(&state, &contact.wxid, "t6-product-claim").await;
 }
