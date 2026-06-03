@@ -116,7 +116,7 @@ jobs:
   real-llm:
     name: Real-LLM smoke (真实大模型 / MCP 桩)
     runs-on: ubuntu-latest
-    # 用**真实大模型**（MiMo / OpenAI 兼容端点）跑 T1 文本决策+审查 / T2 知识
+    # 用**真实大模型**（deepseek-v4 / OpenAI 兼容端点）跑 T1 文本决策+审查 / T2 知识
     # tool-loop / T3 多模态 vision 抽取，验证 mock 测不到的真实 schema/闸门/收敛。
     # MCP 永远是 wiremock 桩（绝不真发微信）。real-LLM 限流/抖动不该阻塞合并，
     # 故 continue-on-error；conclusion 恒 success，必看 job 日志拿真实绿/红。
@@ -125,8 +125,10 @@ jobs:
     # 密钥提到 job 级 env：GitHub Actions 的 job 级 `if:` 读不到 secrets 上下文，
     # 但 step 级 `if:` 能读 env，故下方各重步用 `if: env.REAL_LLM_API_KEY != ''`
     # 守卫——未配 secret（fork PR / 没配）时直接跳过编译/跑测，不浪费 CI 分钟、不红。
+    # provider 沿革（2026-06-03）：MiMo 配额耗尽 + 端点下线 → 文本切 deepseek-v4
+    # （key 走 secret REAL_LLM_DEEPSEEK_API_KEY），与 ops/adversarial/quality 套件同源。
     env:
-      REAL_LLM_API_KEY: ${{ secrets.REAL_LLM_API_KEY }}
+      REAL_LLM_API_KEY: ${{ secrets.REAL_LLM_DEEPSEEK_API_KEY }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -158,9 +160,16 @@ jobs:
         if: ${{ env.REAL_LLM_API_KEY != '' }}
         env:
           RUSTFLAGS: ""
-          REAL_LLM_BASE_URL: https://token-plan-cn.xiaomimimo.com/v1
-          REAL_LLM_MODEL: mimo-v2.5-pro
-          REAL_LLM_VISION_MODEL: mimo-v2.5
+          # 文本主链路（T1/T2）走 deepseek-v4（api.supxh.xin，OpenAI 兼容 /v1）。
+          REAL_LLM_BASE_URL: https://api.supxh.xin/v1
+          REAL_LLM_MODEL: deepseek-v4-pro
+          # vision（T3）：deepseek 文字端点不支持多模态，故指向专职视觉 provider
+          # gpt-5.4（gpt.api456.me，OpenAI 兼容 /v1）。key 优先 secret，缺则回落字面量
+          # （与 quality 套件同纪律：tests/CI 豁免 model-hint lint）。偶发 5xx/524 走
+          # LlmUnavailable→skip 不 fail。
+          REAL_LLM_VISION_API_KEY: ${{ secrets.REAL_LLM_VISION_API_KEY || 'sk-4iVIgfidl3eewYS26qRTrKDbqHY1QKsGs3aqL2YzVE4UrhxD' }}
+          REAL_LLM_VISION_BASE_URL: https://gpt.api456.me/v1
+          REAL_LLM_VISION_MODEL: gpt-5.4
         run: cargo test --no-fail-fast --test real_llm_smoke -- --ignored --nocapture
 
       # 知识库全能力 smoke（real_llm_knowledge.rs K1–K9）：渐进式披露检索
@@ -175,9 +184,15 @@ jobs:
         if: ${{ !cancelled() && env.REAL_LLM_API_KEY != '' }}
         env:
           RUSTFLAGS: ""
-          REAL_LLM_BASE_URL: https://token-plan-cn.xiaomimimo.com/v1
-          REAL_LLM_MODEL: mimo-v2.5-pro
-          REAL_LLM_VISION_MODEL: mimo-v2.5
+          # 文本知识链路（K1–K5/K7–K11）走 deepseek-v4（api.supxh.xin）。
+          REAL_LLM_BASE_URL: https://api.supxh.xin/v1
+          REAL_LLM_MODEL: deepseek-v4-pro
+          # vision（K6）：deepseek 文字端点不支持多模态，故指向专职视觉 provider
+          # gpt-5.4（gpt.api456.me）。key 优先 secret，缺则回落字面量（与 quality 套件
+          # 同纪律：tests/CI 豁免 model-hint lint）。偶发 5xx/524 走 LlmUnavailable→skip。
+          REAL_LLM_VISION_API_KEY: ${{ secrets.REAL_LLM_VISION_API_KEY || 'sk-4iVIgfidl3eewYS26qRTrKDbqHY1QKsGs3aqL2YzVE4UrhxD' }}
+          REAL_LLM_VISION_BASE_URL: https://gpt.api456.me/v1
+          REAL_LLM_VISION_MODEL: gpt-5.4
         run: cargo test --no-fail-fast --test real_llm_knowledge -- --ignored --nocapture
 
   # 运营 agent 全能力 smoke（real_llm_ops_smoke.rs t4–t18）。原先是**单 job 跑全部
@@ -354,6 +369,15 @@ jobs:
           QWEN_JUDGE_API_KEY: ${{ secrets.QWEN_JUDGE_API_KEY || 'sk-d258afc9596b4a488bf31ba36c8f7ec2' }}
           QWEN_JUDGE_BASE_URL: https://dashscope.aliyuncs.com/compatible-mode/v1
           QWEN_JUDGE_MODEL: qwen3.7-max
+          # 文本侧 failover 备胎链（替换/重试机制）：被测内容生成 + 文本双裁判共享 deepseek
+          # 端点（api.supxh.xin），并发互撞偶发 429/5xx/瞬时不可达。配此 key 后主模型遇
+          # **可转移**故障（429/5xx/timeout/connect/网络）即快速切到 NVIDIA integrate 上的
+          # 异族文本模型（kimi/minimax/glm）兜底，让 Q 判分流程**跑完拿真分**而非 skip。
+          # 复用 vision 备用的 NVIDIA key（同端点托管文本模型）。缺此 key 时退回单主模型 +
+          # max_retries=5 自愈窗口，CI 不退化。tests/CI 豁免 model-hint lint。
+          REAL_LLM_FAILOVER_API_KEY: ${{ secrets.REAL_LLM_VISION_BACKUP_API_KEY || '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' }}
+          REAL_LLM_FAILOVER_BASE_URL: https://integrate.api.nvidia.com/v1
+          REAL_LLM_FAILOVER_MODELS: moonshotai/kimi-k2.6,minimaxai/minimax-m2.7,z-ai/glm-5.1
         run: cargo test --no-fail-fast --test real_llm_knowledge_quality ${{ matrix.q }} -- --ignored --nocapture
 
       - name: Upload score ledger
