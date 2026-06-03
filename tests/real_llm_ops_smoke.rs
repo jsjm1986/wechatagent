@@ -77,6 +77,28 @@ macro_rules! require_real_llm {
     }};
 }
 
+/// 链路解包宏：真模型上游瞬时不可达（限流 429 / 超时等 `LlmUnavailable`）→ 打印 skip 并
+/// `return`，**不算能力失败**——上游没产出内容时 agent 根本没真正运行，断言无对象，跳过
+/// 而非误判崩溃（这不是放水：链路真返回内容时所有红线断言照旧执行）。其它 `Err` 仍 panic。
+/// 镜像姊妹套件 `real_llm_knowledge_quality.rs` 的 `unwrap_or_skip_transient!`，使运营 Agent
+/// 的真模型回归在上游限流时产出有效信号而非永久假红。
+macro_rules! unwrap_or_skip_transient {
+    ($result:expr, $what:expr) => {{
+        match $result {
+            Ok(value) => value,
+            Err(wechatagent::error::AppError::LlmUnavailable { kind, retry_count, .. }) => {
+                eprintln!(
+                    "skip: {} —— 真模型上游瞬时不可达（kind={kind}, retry_count={retry_count}），\
+                     按计划「真模型抖动有限重试+跳过」处理，不算能力失败",
+                    $what
+                );
+                return;
+            }
+            Err(other) => panic!("{}：{other:?}", $what),
+        }
+    }};
+}
+
 // ── wiremock MCP 成功桩（每请求唯一 newMsgId）────────────────────────────────
 // gateway 把 newMsgId 写进 conversation_messages.message_id（sparse+unique 索引），
 // 同 id 会撞 E11000，故逐请求递增。
@@ -721,9 +743,10 @@ async fn t4_real_follow_up_task_runs_and_expiry_blocks() {
     );
     state.db.tasks().insert_one(&live_task, None).await.expect("insert live task");
 
-    handle_follow_up_task(&state, live_task.clone())
-        .await
-        .expect("真实大模型 FollowUp 链路必须返回 Ok（不崩、不 5xx）");
+    unwrap_or_skip_transient!(
+        handle_follow_up_task(&state, live_task.clone()).await,
+        "真实大模型 FollowUp 链路必须返回 Ok（不崩、不 5xx）"
+    );
 
     let live_log = state
         .db
@@ -760,9 +783,10 @@ async fn t4_real_follow_up_task_runs_and_expiry_blocks() {
     );
     state.db.tasks().insert_one(&expired_task, None).await.expect("insert expired task");
 
-    handle_follow_up_task(&state, expired_task.clone())
-        .await
-        .expect("过期 FollowUp 也必须 Ok（precheck 拦截是合法终态，不是错误）");
+    unwrap_or_skip_transient!(
+        handle_follow_up_task(&state, expired_task.clone()).await,
+        "过期 FollowUp 也必须 Ok（precheck 拦截是合法终态，不是错误）"
+    );
 
     let expired_log = state
         .db
@@ -806,9 +830,10 @@ async fn t5_real_state_machine_transition_stays_in_dictionary() {
     );
     state.db.messages().insert_one(&inbound, None).await.expect("insert inbound");
 
-    handle_managed_message(&state, contact.clone(), &inbound)
-        .await
-        .expect("真实状态机约束下决策链路必须 Ok");
+    unwrap_or_skip_transient!(
+        handle_managed_message(&state, contact.clone(), &inbound).await,
+        "真实状态机约束下决策链路必须 Ok"
+    );
 
     // 红线断言：reload contact，其 operation_state 必须仍是**生产状态机**内合法 key。
     // 与 `prompts::default_user_operation_state_machine` 的 states[].key 全集对齐。
@@ -868,9 +893,10 @@ async fn t6_real_unverified_product_claim_is_gated() {
     );
     state.db.messages().insert_one(&inbound, None).await.expect("insert inbound");
 
-    handle_managed_message(&state, contact.clone(), &inbound)
-        .await
-        .expect("无知识支撑的产品声明场景，链路仍须 Ok（闸门拦截是合法终态）");
+    unwrap_or_skip_transient!(
+        handle_managed_message(&state, contact.clone(), &inbound).await,
+        "无知识支撑的产品声明场景，链路仍须 Ok（闸门拦截是合法终态）"
+    );
 
     let log = state
         .db
@@ -925,9 +951,10 @@ async fn t7_real_multi_scenario_generality() {
         let inbound = make_inbound(&contact, &format!("real_ops_msg_t7_{idx}"), text);
         state.db.messages().insert_one(&inbound, None).await.expect("insert inbound");
 
-        handle_managed_message(&state, contact.clone(), &inbound)
-            .await
-            .unwrap_or_else(|e| panic!("[{kind}] 场景链路必须 Ok，实际 Err={e:?}"));
+        unwrap_or_skip_transient!(
+            handle_managed_message(&state, contact.clone(), &inbound).await,
+            format!("[{kind}] 场景链路必须 Ok")
+        );
 
         let log = state
             .db
@@ -979,9 +1006,10 @@ async fn t8_real_autonomy_mode_stays_in_ai_internal_set() {
     );
     state.db.messages().insert_one(&inbound, None).await.expect("insert inbound");
 
-    handle_managed_message(&state, contact.clone(), &inbound)
-        .await
-        .expect("autonomy 场景链路必须 Ok");
+    unwrap_or_skip_transient!(
+        handle_managed_message(&state, contact.clone(), &inbound).await,
+        "autonomy 场景链路必须 Ok"
+    );
 
     let log = state
         .db
@@ -1055,9 +1083,10 @@ async fn t9_real_user_reaction_outcome_in_closed_set() {
         "你们这个产品我挺感兴趣的，能简单介绍下能帮我解决什么问题吗？",
     );
     state.db.messages().insert_one(&inbound1, None).await.expect("insert inbound1");
-    handle_managed_message(&state, contact.clone(), &inbound1)
-        .await
-        .expect("第一轮决策+审查链路必须 Ok");
+    unwrap_or_skip_transient!(
+        handle_managed_message(&state, contact.clone(), &inbound1).await,
+        "第一轮决策+审查链路必须 Ok"
+    );
 
     // 若真模型 approved → 入队 outbox，推一次 dispatcher 到 sent（命中 MCP 桩）。
     if let Some(entry) = state
@@ -1099,9 +1128,10 @@ async fn t9_real_user_reaction_outcome_in_closed_set() {
     );
     state.db.messages().insert_one(&inbound2, None).await.expect("insert inbound2");
 
-    record_user_reaction(&state, &contact, &inbound2)
-        .await
-        .expect("真实用户反应分析链路必须 Ok");
+    unwrap_or_skip_transient!(
+        record_user_reaction(&state, &contact, &inbound2).await,
+        "真实用户反应分析链路必须 Ok"
+    );
 
     // 红线断言：outcome_status 必须 ∈ 反应分析闭集（user_replied_* 系列）。
     let reacted = state
@@ -1161,9 +1191,10 @@ async fn t10_real_initial_profile_generation() {
                 之前合作过一家 SaaS 但觉得太重。说话直接，关注 ROI 和落地速度。";
 
     // playbook 传 None：handler 内部回退到"自由生成克制画像"提示，不依赖额外 seed。
-    let profile = build_initial_operation_profile(&state, note, None)
-        .await
-        .expect("真实初始画像生成必须 Ok（不崩、JSON 可解析）");
+    let profile = unwrap_or_skip_transient!(
+        build_initial_operation_profile(&state, note, None).await,
+        "真实初始画像生成必须 Ok（不崩、JSON 可解析）"
+    );
 
     // 结构化断言：真模型输出的 JSON 必须被 serde 解析成 GeneratedOperationProfile，
     // 且 agent_profile 至少有一个非空字段（画像不能整体为空壳）。
@@ -1275,9 +1306,10 @@ async fn t11_real_memory_consolidation_merges_candidates() {
 
     // 真实整理：consolidate_contact_memory 内部 load_or_create 出 v0 记忆，
     // 真模型整理候选 → 严格 JSON → typed 合并 → OCC 落库 → 候选 mark consolidated。
-    consolidate_contact_memory(&state, &contact, None)
-        .await
-        .expect("真实记忆整理必须 Ok（不崩、JSON 可解析）");
+    unwrap_or_skip_transient!(
+        consolidate_contact_memory(&state, &contact, None).await,
+        "真实记忆整理必须 Ok（不崩、JSON 可解析）"
+    );
 
     // 断言①：候选被消费（pending → consolidated）。真模型必须产出可落库的卡，
     // 否则 OCC 输或空卡分支会让候选停在 pending——这里要求整理真的发生。
@@ -1368,9 +1400,10 @@ async fn t12_real_steerability_honors_custom_instructions() {
     );
     state.db.messages().insert_one(&inbound, None).await.expect("insert inbound");
 
-    handle_managed_message(&state, contact.clone(), &inbound)
-        .await
-        .expect("可操控性场景链路必须 Ok");
+    unwrap_or_skip_transient!(
+        handle_managed_message(&state, contact.clone(), &inbound).await,
+        "可操控性场景链路必须 Ok"
+    );
 
     let log = state
         .db
@@ -1464,12 +1497,14 @@ async fn t13_real_persona_differentiation() {
     state.db.messages().insert_one(&inbound_a, None).await.expect("insert inbound a");
     state.db.messages().insert_one(&inbound_b, None).await.expect("insert inbound b");
 
-    handle_managed_message(&state, contact_a.clone(), &inbound_a)
-        .await
-        .expect("画像 A 链路必须 Ok");
-    handle_managed_message(&state, contact_b.clone(), &inbound_b)
-        .await
-        .expect("画像 B 链路必须 Ok");
+    unwrap_or_skip_transient!(
+        handle_managed_message(&state, contact_a.clone(), &inbound_a).await,
+        "画像 A 链路必须 Ok"
+    );
+    unwrap_or_skip_transient!(
+        handle_managed_message(&state, contact_b.clone(), &inbound_b).await,
+        "画像 B 链路必须 Ok"
+    );
 
     // 契约层弱断言：两条 run log status ∈ gateway 闭集。
     for wxid in [&contact_a.wxid, &contact_b.wxid] {
@@ -1578,9 +1613,10 @@ async fn t14_real_profile_churn_under_weak_signal() {
     let inbound = make_inbound(&contact, "real_ops_msg_t14", "在吗");
     state.db.messages().insert_one(&inbound, None).await.expect("insert inbound");
 
-    handle_managed_message(&state, contact.clone(), &inbound)
-        .await
-        .expect("t14 链路必须 Ok");
+    unwrap_or_skip_transient!(
+        handle_managed_message(&state, contact.clone(), &inbound).await,
+        "t14 链路必须 Ok"
+    );
 
     // 契约层弱断言：run log status ∈ gateway 闭集（链路跑通）。
     let log = state
@@ -1697,9 +1733,10 @@ async fn t15_real_multiturn_deal_arc() {
         let inbound = make_inbound(&contact, &format!("real_ops_msg_t15_{turn}"), content);
         state.db.messages().insert_one(&inbound, None).await.expect("insert inbound");
 
-        handle_managed_message(&state, contact.clone(), &inbound)
-            .await
-            .unwrap_or_else(|e| panic!("t15 turn-{turn}({tag}) 链路必须 Ok: {e:?}"));
+        unwrap_or_skip_transient!(
+            handle_managed_message(&state, contact.clone(), &inbound).await,
+            format!("t15 turn-{turn}({tag}) 链路必须 Ok")
+        );
 
         let log = state
             .db
@@ -1777,12 +1814,14 @@ async fn t16_real_multiturn_persona_cross() {
         state.db.messages().insert_one(&in_a, None).await.expect("insert a");
         state.db.messages().insert_one(&in_b, None).await.expect("insert b");
 
-        handle_managed_message(&state, contact_a.clone(), &in_a)
-            .await
-            .unwrap_or_else(|e| panic!("t16 A turn-{turn}({tag}) 链路必须 Ok: {e:?}"));
-        handle_managed_message(&state, contact_b.clone(), &in_b)
-            .await
-            .unwrap_or_else(|e| panic!("t16 B turn-{turn}({tag}) 链路必须 Ok: {e:?}"));
+        unwrap_or_skip_transient!(
+            handle_managed_message(&state, contact_a.clone(), &in_a).await,
+            format!("t16 A turn-{turn}({tag}) 链路必须 Ok")
+        );
+        unwrap_or_skip_transient!(
+            handle_managed_message(&state, contact_b.clone(), &in_b).await,
+            format!("t16 B turn-{turn}({tag}) 链路必须 Ok")
+        );
 
         let latest = || FindOneOptions::builder().sort(doc! { "created_at": -1 }).build();
         for wxid in [&contact_a.wxid, &contact_b.wxid] {
@@ -1874,9 +1913,10 @@ async fn t17_real_multiturn_boundary_stress() {
         let inbound = make_inbound(&contact, &format!("real_ops_msg_t17_{turn}"), content);
         state.db.messages().insert_one(&inbound, None).await.expect("insert inbound");
 
-        handle_managed_message(&state, contact.clone(), &inbound)
-            .await
-            .unwrap_or_else(|e| panic!("t17 turn-{turn}({tag}) 链路必须 Ok: {e:?}"));
+        unwrap_or_skip_transient!(
+            handle_managed_message(&state, contact.clone(), &inbound).await,
+            format!("t17 turn-{turn}({tag}) 链路必须 Ok")
+        );
 
         let latest = || FindOneOptions::builder().sort(doc! { "created_at": -1 }).build();
         let log = state
@@ -1939,9 +1979,10 @@ async fn t18_real_warm_start_operator_seeded_arc() {
          偶尔会私聊问点用法。性子比较急，喜欢直来直去，别跟他绕。最近合同快到期了。";
 
     // ② 用人工录入备注走生产暖启动入口，真模型生成结构化初始画像（与 enable_agent 同路径）。
-    let generated = build_initial_operation_profile(&state, human_profile_note, None)
-        .await
-        .expect("暖启动初始画像生成必须 Ok（不崩、JSON 可解析）");
+    let generated = unwrap_or_skip_transient!(
+        build_initial_operation_profile(&state, human_profile_note, None).await,
+        "暖启动初始画像生成必须 Ok（不崩、JSON 可解析）"
+    );
     eprintln!(
         "[t18][暖启动画像] summary={} stage={:?} intent={:?} tags={:?}",
         generated.agent_profile.summary,
@@ -1990,9 +2031,10 @@ async fn t18_real_warm_start_operator_seeded_arc() {
         let inbound = make_inbound(&contact, &format!("real_ops_msg_t18_{turn}"), content);
         state.db.messages().insert_one(&inbound, None).await.expect("insert inbound");
 
-        handle_managed_message(&state, contact.clone(), &inbound)
-            .await
-            .unwrap_or_else(|e| panic!("t18 turn-{turn}({tag}) 链路必须 Ok: {e:?}"));
+        unwrap_or_skip_transient!(
+            handle_managed_message(&state, contact.clone(), &inbound).await,
+            format!("t18 turn-{turn}({tag}) 链路必须 Ok")
+        );
 
         let log = state
             .db
