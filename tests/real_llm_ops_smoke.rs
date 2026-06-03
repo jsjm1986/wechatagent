@@ -613,22 +613,30 @@ async fn print_capability_snapshot(
     label: &str,
     turn: usize,
     prev_reply: &str,
+    current_message_id: &str,
 ) -> String {
     use mongodb::options::FindOneOptions;
     let latest = || FindOneOptions::builder().sort(doc! { "created_at": -1 }).build();
 
     eprintln!("----- [cap][turn-{turn}] {label} wxid={wxid} -----");
 
-    // 本轮 reply（最新一条 decision_review）。
-    let reply = state
+    // 本轮 reply：**严格绑定本轮 inbound_message_id** 的 decision_review，而非
+    // "该联系人最新一条"。被拦/无回复轮不会产出新 review，若取"最新一条"会读到
+    // 上一轮陈旧 reply → 对话连贯硬断言出现假阳。绑定 message_id 后：本轮真有产出
+    // 才拿到 Some(reply)，否则 None（不拿旧 reply 冒充本轮）——零假阳的前提。
+    let fresh_reply: Option<String> = state
         .db
         .decision_reviews()
-        .find_one(doc! { "contact_wxid": wxid }, latest())
+        .find_one(
+            doc! { "contact_wxid": wxid, "inbound_message_id": current_message_id },
+            latest(),
+        )
         .await
         .ok()
         .flatten()
         .and_then(|r| r.reply_text)
-        .unwrap_or_default();
+        .filter(|s| !s.trim().is_empty());
+    let reply = fresh_reply.clone().unwrap_or_default();
 
     // ① 上下文连续性：与上轮逐字重复率 + 是否含重复寒暄词（对话进行中不该再寒暄）。
     let greet_markers = ["在吗", "在的", "您好", "你好", "在不在", "请问有什么"];
@@ -637,6 +645,29 @@ async fn print_capability_snapshot(
     eprintln!(
         "[cap][turn-{turn}][上下文] 逐字重复上轮={verbatim_repeat} | 重复寒暄词命中={greet_hit:?} | reply={reply:?}"
     );
+
+    // ① 对话连贯**硬断言**——仅当本轮真产出新 reply（fresh_reply=Some）才判，零假阳：
+    //   (a) turn≥2 本轮回复不得与上一条**实际** reply 逐字相同（机械复读）；
+    //   (b) turn≥2 不得用无歧义冷启动寒暄开场（对话进行中重新打招呼=丢上下文）。
+    // 冷启动集只取无子串歧义的强标记（"你好""您好"会误伤"你好好考虑""您好的"故排除；
+    // "在的"会误伤"存在的"故排除）——附合反过拟合 + 零假阳。全集仍走上面软诊断。
+    if let Some(fresh) = fresh_reply.as_deref() {
+        if turn >= 2 && !prev_reply.is_empty() {
+            assert_ne!(
+                fresh, prev_reply,
+                "[{label}][turn-{turn}] 对话连贯红线：本轮回复与上一条实际回复逐字相同（机械复读，丢上下文）\nreply={fresh:?}"
+            );
+        }
+        if turn >= 2 {
+            let cold_open = ["在吗", "在不在", "请问有什么"];
+            let cold_hit: Vec<&str> =
+                cold_open.iter().filter(|g| fresh.contains(**g)).copied().collect();
+            assert!(
+                cold_hit.is_empty(),
+                "[{label}][turn-{turn}] 对话连贯红线：对话进行中仍冷启动寒暄 {cold_hit:?}（把进行中的对话当首次接触）\nreply={fresh:?}"
+            );
+        }
+    }
 
     // 读回 contact 看画像演化全貌。
     let contact = match state
@@ -685,6 +716,18 @@ async fn print_capability_snapshot(
     eprintln!(
         "[cap][turn-{turn}][短期记忆] memory_summary 字节长={summary_len} 内容={:?}",
         contact.memory_summary.as_deref().unwrap_or("<none>")
+    );
+
+    // ⑤ 记忆不无界增长**硬断言**——memory_summary 跨轮字节长不得突破宽松天花板。
+    // 生产写侧 merge_memory_summary_dedup_capped 已按 MEMORY_SUMMARY_MAX_BYTES=1200
+    // 行级封顶（保新丢旧，但保底留 1 行——单行可超 1200），故天花板取 4096：既远高于
+    // 正常封顶值（绝不误伤被正确 cap 的记忆），又能在「封顶逻辑被摘除 / 退化回 naive
+    // append」时于多轮内必然触红（旧 naive append 5-6 轮无界堆叠会冲破 4096）。宽松上限
+    // 而非贴着 1200，符合反过拟合——只钉「无界增长」这一抽象红线，不点对点卡某一样本长度。
+    const MEMORY_SUMMARY_TEST_CEILING_BYTES: usize = 4096;
+    assert!(
+        summary_len <= MEMORY_SUMMARY_TEST_CEILING_BYTES,
+        "[{label}][turn-{turn}] 短期记忆无界增长红线：memory_summary={summary_len} 字节 > 宽松上限 {MEMORY_SUMMARY_TEST_CEILING_BYTES}（写侧封顶疑似失效，退化回无界 append）"
     );
 
     // ⑤ 承诺跟进。
@@ -1826,9 +1869,41 @@ async fn t15_real_multiturn_deal_arc() {
 
         eprintln!("\n########## [t15][turn-{turn}] {tag} ##########");
         print_quality_report(&state, &contact.wxid, &format!("t15-turn{turn}-{tag}")).await;
-        prev_reply = print_capability_snapshot(&state, &contact.wxid, "t15", turn, &prev_reply).await;
+        prev_reply = print_capability_snapshot(&state, &contact.wxid, "t15", turn, &prev_reply, &format!("real_ops_msg_t15_{turn}")).await;
         run_judge(&state, &contact.wxid, &format!("t15-turn{turn}-{tag}")).await;
     }
+
+    // ② 该发就发（谨慎）**硬断言**——跌单弧 6 轮里至少有 N 轮真产出 approved 回复。
+    // 钉的是「系统性过度拦截」这一抽象红线：6 轮经典成交弧（咨询/价格异议/情绪/比价/
+    // 怕踩坑/成交信号）里若 agent 几乎一条都不敢发，说明闸门整体过紧、链路卡死——这是
+    // 生产致命问题。下限取 2（宽松、远低于「健康应发」期望），只兜「近乎全程哑火」的极端
+    // 退化，绝不规定每轮必发 / 不点对点卡某一轮——符合反过拟合 + 谨慎（容忍单轮合法拦截）。
+    // 计数口径：本弧 6 条 inbound 里产出 approved=true 的 decision_review 的**去重轮数**。
+    // 注：t15 无 dispatcher 推送，故按 approved（评审放行）而非 status="sent" 计数。
+    let mut approved_turns = 0usize;
+    for t in 1..=arc.len() {
+        let mid = format!("real_ops_msg_t15_{t}");
+        let approved = state
+            .db
+            .decision_reviews()
+            .find_one(
+                doc! { "contact_wxid": &contact.wxid, "inbound_message_id": &mid, "approved": true },
+                None,
+            )
+            .await
+            .expect("query approved review")
+            .is_some();
+        if approved {
+            approved_turns += 1;
+        }
+    }
+    const T15_MIN_APPROVED_TURNS: usize = 2;
+    eprintln!("[t15][该发就发] 6 轮跌单弧里 approved 轮数={approved_turns}（下限 {T15_MIN_APPROVED_TURNS}）");
+    assert!(
+        approved_turns >= T15_MIN_APPROVED_TURNS,
+        "[t15] 该发就发红线：6 轮成交弧仅 {approved_turns} 轮产出 approved 回复 < 下限 {T15_MIN_APPROVED_TURNS}（闸门系统性过度拦截，链路近乎全程哑火）"
+    );
+
     print_long_term_memory(&state, &contact.wxid, "t15").await;
 }
 
@@ -1936,12 +2011,12 @@ async fn t16_real_multiturn_persona_cross() {
 
         eprintln!("\n########## [t16][turn-{turn}] {tag} 画像 A（技术理性）##########");
         print_quality_report(&state, &contact_a.wxid, &format!("t16A-turn{turn}-{tag}")).await;
-        prev_a = print_capability_snapshot(&state, &contact_a.wxid, "t16A", turn, &prev_a).await;
+        prev_a = print_capability_snapshot(&state, &contact_a.wxid, "t16A", turn, &prev_a, &format!("real_ops_msg_t16a_{turn}")).await;
         run_judge(&state, &contact_a.wxid, &format!("t16A-turn{turn}-{tag}")).await;
 
         eprintln!("\n########## [t16][turn-{turn}] {tag} 画像 B（焦虑首创）##########");
         print_quality_report(&state, &contact_b.wxid, &format!("t16B-turn{turn}-{tag}")).await;
-        prev_b = print_capability_snapshot(&state, &contact_b.wxid, "t16B", turn, &prev_b).await;
+        prev_b = print_capability_snapshot(&state, &contact_b.wxid, "t16B", turn, &prev_b, &format!("real_ops_msg_t16b_{turn}")).await;
         run_judge(&state, &contact_b.wxid, &format!("t16B-turn{turn}-{tag}")).await;
     }
 }
@@ -2007,7 +2082,7 @@ async fn t17_real_multiturn_boundary_stress() {
 
         eprintln!("\n########## [t17][turn-{turn}] {tag} ##########");
         print_quality_report(&state, &contact.wxid, &format!("t17-turn{turn}-{tag}")).await;
-        prev_reply = print_capability_snapshot(&state, &contact.wxid, "t17", turn, &prev_reply).await;
+        prev_reply = print_capability_snapshot(&state, &contact.wxid, "t17", turn, &prev_reply, &format!("real_ops_msg_t17_{turn}")).await;
         run_judge(&state, &contact.wxid, &format!("t17-turn{turn}-{tag}")).await;
 
         // autonomy 红线跨轮检测（每轮都查，第 4 轮"要真人"最关键）。
@@ -2127,7 +2202,7 @@ async fn t18_real_warm_start_operator_seeded_arc() {
 
         eprintln!("\n########## [t18][turn-{turn}] {tag} ##########");
         print_quality_report(&state, &contact.wxid, &format!("t18-turn{turn}-{tag}")).await;
-        prev_reply = print_capability_snapshot(&state, &contact.wxid, "t18", turn, &prev_reply).await;
+        prev_reply = print_capability_snapshot(&state, &contact.wxid, "t18", turn, &prev_reply, &format!("real_ops_msg_t18_{turn}")).await;
         run_judge(&state, &contact.wxid, &format!("t18-turn{turn}-{tag}")).await;
 
         // 暖启动软诊断：① 是否把老客户当陌生人重新寒暄；② 运营「别推销」指令是否被违反。
