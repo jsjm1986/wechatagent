@@ -4914,7 +4914,16 @@ fn synthesize_natural_reply_from_patch(out: &Value) -> Option<String> {
                 .collect()
         })
         .unwrap_or_default();
-    let mut reply = format!("我已经为您起草好了{}。", filled.join("、"));
+    let mut reply = if let Some(t) = patch
+        .get("title")
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+    {
+        format!("我已经按您的要求起草好{}，拟定的标题是「{t}」。", filled.join("、"))
+    } else {
+        format!("我已经为您起草好了{}。", filled.join("、"))
+    };
     if missing.is_empty() {
         reply.push_str("您看一下内容是否准确，确认无误后即可应用为草稿。");
     } else {
@@ -5554,7 +5563,7 @@ async fn draft_chunk_for_chat(
 - patch 必须把运营本轮明确点名要起草的字段全部填上——运营若说「起草标题、摘要和正文」，patch 就必须同时含非空的 title、summary、body 三者，缺任何一个都算答非所问。
 - body（正文）是切片的实体内容，承载可验证事实，绝不能因为它最长就省略或留空；其余字段齐全而独缺 body 视为未完成起草。
 - 信息确实不足以填某字段时，把该字段名写进 missingFields 并用 followupQuestions 向运营追问，而不是静默丢弃运营已点名的字段。
-- naturalReply 必填、不可留空：用对话口吻向运营回报你起草了什么、还差什么（例如「我已经起草好标题/摘要/正文，您看看是否准确」），这是给人看的回执，不能只产 patch 就沉默。
+- naturalReply 必填、不可留空：用对话口吻向运营回报你起草了什么、还差什么，这是给人看的回执，不能只产 patch 就沉默。回执要展示关键产出本身（如把拟定的标题、摘要要点直接说出来），而不是只声明「我起草了标题/摘要」这类字段名——让运营不必去翻 patch 就能判断对不对；仍缺的字段则顺带引导补全。
 
 请按 system 中 schema 输出 JSON 起草一条新切片草稿。"#,
         serde_json::to_string_pretty(&catalog).unwrap_or_default(),
