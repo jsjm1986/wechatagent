@@ -1,0 +1,118 @@
+// 跨 feature 共享类型。从 App.tsx 抽出，作为单一来源。
+
+export type AgentStatus = "normal" | "managed";
+export type Channel =
+  | "command"
+  | "overview"
+  | "userOps"
+  | "groupOps"
+  | "momentOps"
+  | "content"
+  | "systemStrategy"
+  | "operations"
+  | "autonomy"
+  | "evolution"
+  | "quality"
+  | "llmProviders"
+  | "knowledgeWiki";
+export type ContactTab = "all" | "managed" | "normal";
+export type SmartOpsTab = "cockpit" | "adjust" | "profile" | "memory" | "simulation" | "conversation";
+export type TraditionalOpsTab = "playbooks" | "prompts" | "settings" | "audit";
+export type UserOpsMode = "smart" | "traditional";
+export type OpsTab = "tasks" | "events" | "reviews" | "llm";
+
+export type Account = {
+  id: string;
+  accountId: string;
+  alias: string;
+  displayName: string;
+  appId?: string;
+  wxid?: string;
+  nickName?: string;
+  mcpKeyConfigured?: boolean;
+  online: boolean;
+};
+
+export type AgentProfile = {
+  summary: string;
+  interests: string[];
+  communicationStyle: string;
+  operationGoal: string;
+};
+
+export type Contact = {
+  id: string;
+  accountId: string;
+  wxid: string;
+  nickname?: string;
+  remark?: string;
+  alias?: string;
+  agentStatus: AgentStatus;
+  humanProfileNote?: string;
+  customAgentInstructions?: string | null;
+  agentProfile?: AgentProfile;
+  memorySummary?: string;
+  playbookId?: string;
+  playbookVersion?: number;
+  tags: string[];
+  domainAttributes?: Record<string, unknown>;
+  domainAttributesUpdatedAt?: string | null;
+  /** M3 / Task 80：承诺数组（M2 之后由 dialog → contact 同步），cockpit 侧只读展示。 */
+  commitments?: ContactCommitment[];
+  lastCommitment?: string;
+  followUpPolicy?: string;
+  operationState?: string;
+  operationStateReason?: string;
+  operationStateConfidence?: number;
+  operationStateUpdatedAt?: string;
+  cooldownUntil?: string;
+  operationPolicy: Record<string, unknown>;
+  profileAttributes: Record<string, unknown>;
+  profileUpdatedAt?: string;
+  /** 波 A2 / B2：最近一条入站消息时间（不含 outbound）。 */
+  lastInboundAt?: string;
+  /** 波 A2 / B2：最近一次 Agent 主动出站时间。 */
+  lastOutboundAt?: string;
+  /** 兼容字段：max(lastInboundAt, lastOutboundAt)。 */
+  lastMessageAt?: string;
+  updatedAt: string;
+};
+
+/** M3 / Task 80：与后端 `ApiCommitment` 对齐的承诺条目结构。 */
+export type ContactCommitment = {
+  id?: string;
+  text: string;
+  dueAt?: string | null;
+  createdAt?: string | null;
+};
+
+export type Message = {
+  id: string;
+  direction: "inbound" | "outbound";
+  content: string;
+  createdAt?: string;
+};
+
+export type EventItem = {
+  id: string;
+  contactWxid?: string;
+  kind: string;
+  status: string;
+  summary: string;
+  createdAt?: string;
+};
+
+export type TaskItem = {
+  id: string;
+  contactWxid: string;
+  kind: string;
+  runAt?: string;
+  expiresAt?: string;
+  content: string;
+  status: string;
+  sourceDecisionId?: string;
+  reviewRequired?: boolean;
+  gatewayStatus?: string;
+  cancelReason?: string;
+  error?: string;
+};
