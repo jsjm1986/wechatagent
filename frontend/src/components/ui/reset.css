@@ -1,0 +1,3 @@
+/* 极小 reset —— 唯一允许裸标签全局选择器的文件之一（另一个是 tokens.css）。 */
+*, *::before, *::after { box-sizing: border-box; }
+body { margin: 0; -webkit-font-smoothing: antialiased; }
