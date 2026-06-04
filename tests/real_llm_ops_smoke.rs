@@ -1073,8 +1073,23 @@ async fn t4_real_follow_up_task_runs_and_expiry_blocks() {
     run_judge(&state, &contact.wxid, "t4-live-followup").await;
 
     // ② 已过期 follow_up：precheck 拦在 "expired"，不调真模型决策。
+    //
+    // 关键隔离：用**独立 contact**承载过期任务，而非复用 ① 的 contact。原因——
+    // `precheck_send_gateway` 的短路顺序里 `rate_limited`（读 `last_agent_run_at`）排在
+    // `expired` 之前（gateway.rs:1664→1673，生产语义正确）。① 的 live 任务一旦真模型
+    // 决定回复并过闸，就会把 `last_agent_run_at` 推到 now；若 ② 复用同一 contact，过期
+    // 任务会先撞 `rate_limited` 短路、到不了 expired 分支。独立 contact 的 `last_agent_run_at`
+    // 为 None，过期判定必然生效——隔离前置条件，不依赖 ① 是否回复（更强模型更倾向回复）。
+    let expired_contact = managed_contact("real_ops_user_t4_expired");
+    state
+        .db
+        .contacts()
+        .insert_one(&expired_contact, None)
+        .await
+        .expect("insert expired-case contact");
+
     let expired_task = make_follow_up_task(
-        &contact,
+        &expired_contact,
         "这条任务已过期，不应触发任何真模型决策。",
         Some(DateTime::from_millis(DateTime::now().timestamp_millis() - 3_600_000)),
     );
@@ -1088,7 +1103,10 @@ async fn t4_real_follow_up_task_runs_and_expiry_blocks() {
     let expired_log = state
         .db
         .agent_run_logs()
-        .find_one(doc! { "contact_wxid": &contact.wxid, "status": "expired" }, None)
+        .find_one(
+            doc! { "contact_wxid": &expired_contact.wxid, "status": "expired" },
+            None,
+        )
         .await
         .expect("query expired run log")
         .expect("过期 FollowUp 必须落一行 status=expired 的 run log");
