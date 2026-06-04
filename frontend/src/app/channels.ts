@@ -19,6 +19,7 @@ import type { Channel } from "../types";
 
 const OverviewFeature = lazy(() => import("../features/overview"));
 const CommandCenterFeature = lazy(() => import("../features/command-center"));
+const UserOpsFeature = lazy(() => import("../features/user-ops"));
 const ContentAssetsFeature = lazy(() => import("../features/content-assets"));
 const SystemStrategyFeature = lazy(() => import("../features/system-strategy"));
 const OperationsFeature = lazy(() => import("../features/operations"));
@@ -75,7 +76,7 @@ export const CHANNELS: ChannelDef[] = [
     eyebrow: "User Operations",
     title: "用户运营",
     subtitle: "围绕单个好友长期运营，维护用户画像、运营记忆、方法论、提示词和执行边界。",
-    Component: OverviewFeature,
+    Component: UserOpsFeature,
   },
   {
     id: "groupOps",

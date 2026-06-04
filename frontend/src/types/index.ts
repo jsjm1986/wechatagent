@@ -217,3 +217,138 @@ export type PromptTemplateDraft = {
   description: string;
   content: string;
 };
+
+export type OperationPlaybook = {
+  id: string;
+  accountId: string;
+  name: string;
+  description?: string;
+  methodPrompt: string;
+  profileMethod?: string;
+  tagMethod?: string;
+  stageMethod?: string;
+  intentMethod?: string;
+  followUpMethod?: string;
+  replyStyle?: string;
+  forbiddenRules?: string;
+  successCriteria?: string;
+  createdBy: string;
+  isDefault: boolean;
+  version: number;
+  updatedAt?: string;
+};
+
+export type PlaybookDraft = {
+  name: string;
+  description: string;
+  methodPrompt: string;
+  profileMethod: string;
+  tagMethod: string;
+  stageMethod: string;
+  intentMethod: string;
+  followUpMethod: string;
+  replyStyle: string;
+  forbiddenRules: string;
+  successCriteria: string;
+  isDefault: boolean;
+};
+
+export type OperatingMemory = {
+  id: string;
+  userUnderstanding: Record<string, unknown>;
+  relationshipState: Record<string, unknown>;
+  productFit: Record<string, unknown>;
+  nextAction: Record<string, unknown>;
+  memoryCard?: Record<string, unknown>;
+  memoryCardVersion?: number;
+  memoryCardUpdatedAt?: string;
+  contextPack?: Record<string, unknown>;
+  contextPackVersion?: number;
+  contextPackUpdatedAt?: string;
+  updatedAt?: string;
+};
+
+export type MemoryCandidateItem = {
+  id: string;
+  runId?: string;
+  source: string;
+  candidates: Record<string, unknown>[];
+  memoryWriteScore: number;
+  status: string;
+  reason?: string;
+  createdAt?: string;
+  updatedAt?: string;
+};
+
+export type OperatingMemoryDraft = {
+  identity: string;
+  businessContext: string;
+  jobsToBeDone: string;
+  painPoints: string;
+  motivations: string;
+  decisionStyle: string;
+  communicationPreference: string;
+  sensitivePoints: string;
+  trustLevel: string;
+  temperature: string;
+  lastEmotion: string;
+  relationshipGoal: string;
+  doNotDo: string;
+  interestedProducts: string;
+  fitReason: string;
+  objections: string;
+  riskPoints: string;
+  unknowns: string;
+  nextGoal: string;
+  recommendedMove: string;
+  avoid: string;
+  timing: string;
+  reason: string;
+};
+
+export type OperationHealthItem = {
+  key: string;
+  label: string;
+  score: number;
+  tone: "good" | "warn" | "danger";
+  detail: string;
+};
+
+export type OperationHealth = {
+  scores: Record<string, number>;
+  items: OperationHealthItem[];
+};
+
+export type UserOperationGuidePreview = {
+  id: string;
+  accountId: string;
+  contactId: string;
+  contactWxid: string;
+  instruction: string;
+  mode: string;
+  status: string;
+  summary: string;
+  impactScope: string;
+  scopeReason: string;
+  readableChanges: string[];
+  healthScores: Record<string, unknown>;
+  suggestedChanges: Record<string, unknown>;
+  riskWarnings: string[];
+  createdAt?: string;
+  updatedAt?: string;
+};
+
+export type SimulationTurn = {
+  turn: number;
+  inboundText: string;
+  shouldReply: boolean;
+  replyText: string;
+  status: string;
+  decision: Record<string, unknown>;
+  review: Record<string, unknown>;
+  gatewayResult: Record<string, unknown>;
+  knowledgeRoute: Record<string, unknown>;
+  contextPack?: Record<string, unknown>;
+  memoryPreview: Record<string, unknown>;
+  stateTransition: Record<string, unknown>;
+};

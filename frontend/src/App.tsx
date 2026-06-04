@@ -77,97 +77,22 @@ import type {
 } from "./types";
 import { api, parseApiError, LlmUnavailableError } from "./lib/api";
 import { EmptyState as UiEmptyState } from "./components/ui/EmptyState/EmptyState";
-import type { DecisionReview, LlmUsageResponse, LlmUsageItem, PromptTemplate, PromptTemplateDraft } from "./types";
-
-type OperationPlaybook = {
-  id: string;
-  accountId: string;
-  name: string;
-  description?: string;
-  methodPrompt: string;
-  profileMethod?: string;
-  tagMethod?: string;
-  stageMethod?: string;
-  intentMethod?: string;
-  followUpMethod?: string;
-  replyStyle?: string;
-  forbiddenRules?: string;
-  successCriteria?: string;
-  createdBy: string;
-  isDefault: boolean;
-  version: number;
-  updatedAt?: string;
-};
-
-type PlaybookDraft = {
-  name: string;
-  description: string;
-  methodPrompt: string;
-  profileMethod: string;
-  tagMethod: string;
-  stageMethod: string;
-  intentMethod: string;
-  followUpMethod: string;
-  replyStyle: string;
-  forbiddenRules: string;
-  successCriteria: string;
-  isDefault: boolean;
-};
-
-type OperatingMemory = {
-  id: string;
-  userUnderstanding: Record<string, unknown>;
-  relationshipState: Record<string, unknown>;
-  productFit: Record<string, unknown>;
-  nextAction: Record<string, unknown>;
-  memoryCard?: Record<string, unknown>;
-  memoryCardVersion?: number;
-  memoryCardUpdatedAt?: string;
-  contextPack?: Record<string, unknown>;
-  contextPackVersion?: number;
-  contextPackUpdatedAt?: string;
-  updatedAt?: string;
-};
-
-
-type MemoryCandidateItem = {
-  id: string;
-  runId?: string;
-  source: string;
-  candidates: Record<string, unknown>[];
-  memoryWriteScore: number;
-  status: string;
-  reason?: string;
-  createdAt?: string;
-  updatedAt?: string;
-};
-
-type OperatingMemoryDraft = {
-  identity: string;
-  businessContext: string;
-  jobsToBeDone: string;
-  painPoints: string;
-  motivations: string;
-  decisionStyle: string;
-  communicationPreference: string;
-  sensitivePoints: string;
-  trustLevel: string;
-  temperature: string;
-  lastEmotion: string;
-  relationshipGoal: string;
-  doNotDo: string;
-  interestedProducts: string;
-  fitReason: string;
-  objections: string;
-  riskPoints: string;
-  unknowns: string;
-  nextGoal: string;
-  recommendedMove: string;
-  avoid: string;
-  timing: string;
-  reason: string;
-};
-
+import type {
+  DecisionReview,
+  LlmUsageResponse,
+  LlmUsageItem,
+  PromptTemplate,
+  PromptTemplateDraft,
+  OperationPlaybook,
+  PlaybookDraft,
+  OperatingMemory,
+  MemoryCandidateItem,
+  OperatingMemoryDraft,
+  OperationHealthItem,
+  OperationHealth,
+  UserOperationGuidePreview,
+  SimulationTurn
+} from "./types";
 
 type DomainKey = "user_operations" | "group_operations" | "moment_operations";
 
@@ -266,53 +191,6 @@ type OperationStateDraft = {
   successCriteria: string;
 };
 
-
-type OperationHealthItem = {
-  key: string;
-  label: string;
-  score: number;
-  tone: "good" | "warn" | "danger";
-  detail: string;
-};
-
-type OperationHealth = {
-  scores: Record<string, number>;
-  items: OperationHealthItem[];
-};
-
-type UserOperationGuidePreview = {
-  id: string;
-  accountId: string;
-  contactId: string;
-  contactWxid: string;
-  instruction: string;
-  mode: string;
-  status: string;
-  summary: string;
-  impactScope: string;
-  scopeReason: string;
-  readableChanges: string[];
-  healthScores: Record<string, unknown>;
-  suggestedChanges: Record<string, unknown>;
-  riskWarnings: string[];
-  createdAt?: string;
-  updatedAt?: string;
-};
-
-type SimulationTurn = {
-  turn: number;
-  inboundText: string;
-  shouldReply: boolean;
-  replyText: string;
-  status: string;
-  decision: Record<string, unknown>;
-  review: Record<string, unknown>;
-  gatewayResult: Record<string, unknown>;
-  knowledgeRoute: Record<string, unknown>;
-  contextPack?: Record<string, unknown>;
-  memoryPreview: Record<string, unknown>;
-  stateTransition: Record<string, unknown>;
-};
 
 /**
  * 后端 `AppError::LlmUnavailable` 的前端镜像错误。
@@ -1597,7 +1475,7 @@ function OverviewView({
   );
 }
 
-function UserOpsModeHeader({ mode, onMode }: { mode: UserOpsMode; onMode: (mode: UserOpsMode) => void }) {
+export function UserOpsModeHeader({ mode, onMode }: { mode: UserOpsMode; onMode: (mode: UserOpsMode) => void }) {
   return (
     <section className="userModeHeader">
       <div>
@@ -1613,7 +1491,7 @@ function UserOpsModeHeader({ mode, onMode }: { mode: UserOpsMode; onMode: (mode:
   );
 }
 
-function UserOperationCockpit({
+export function UserOperationCockpit({
   activeTab,
   busy,
   decisionReviews,
@@ -2211,7 +2089,7 @@ function SmartOpsTabs({ active, onChange }: { active: SmartOpsTab; onChange: (ta
   );
 }
 
-function TraditionalOpsTabs({
+export function TraditionalOpsTabs({
   active,
   managedCount,
   pendingTasks,
@@ -2247,7 +2125,7 @@ function TraditionalOpsTabs({
   );
 }
 
-function ContactsView({
+export function ContactsView({
   busy,
   contactTab,
   contacts,
@@ -2710,7 +2588,7 @@ function ActiveVersionsBar({
   );
 }
 
-function DomainConfigEditor({
+export function DomainConfigEditor({
   busy,
   config,
   draft,
@@ -2908,7 +2786,7 @@ function DomainConfigEditor({
   );
 }
 
-function UserPlaybookPanel({
+export function UserPlaybookPanel({
   busy,
   editingPlaybookId,
   generatePlaybookText,
