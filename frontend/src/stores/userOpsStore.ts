@@ -88,6 +88,7 @@ interface UserOpsActions {
   runMemoryConsolidation: () => Promise<void>;
   runDialogueSimulation: () => Promise<void>;
   createPlaybook: () => Promise<void>;
+  savePlaybook: () => Promise<void>;
   optimizePlaybook: (id: string) => Promise<void>;
   generatePlaybook: () => Promise<void>;
   setDefaultPlaybook: (id: string) => Promise<void>;
@@ -533,6 +534,29 @@ export const useUserOpsStore = create<UserOpsState & UserOpsActions>((set, get) 
       set({
         playbookDraft: emptyPlaybookDraft(),
         editingPlaybookId: ""
+      });
+
+      await get().loadPlaybooks(currentAccountId);
+    } catch (error) {
+      useUiStore.getState().setError(error instanceof Error ? error.message : String(error));
+    } finally {
+      useUiStore.getState().setBusy(false);
+    }
+  },
+
+  savePlaybook: async () => {
+    const { playbookDraft, editingPlaybookId } = get();
+    const currentAccountId = useAccountStore.getState().currentAccountId();
+
+    if (!editingPlaybookId || !playbookDraft.name.trim() || !currentAccountId) return;
+
+    useUiStore.getState().setBusy(true);
+    useUiStore.getState().setError("");
+
+    try {
+      await api.put(`/api/operation-playbooks/${editingPlaybookId}`, {
+        accountId: currentAccountId,
+        ...playbookPayload(playbookDraft)
       });
 
       await get().loadPlaybooks(currentAccountId);

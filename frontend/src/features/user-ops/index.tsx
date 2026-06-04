@@ -10,14 +10,12 @@ import {
   OperationsView
 } from "../../App";
 import { useUserOpsStore } from "../../stores/userOpsStore";
+import { useStrategyStore } from "../../stores/strategyStore";
 import { useContactStore } from "../../stores/contactStore";
 import { useAccountStore } from "../../stores/accountStore";
 import { useUiStore } from "../../stores/uiStore";
 import type {
-  Contact,
-  AgentSoul,
-  PromptTemplate,
-  PromptTemplateDraft
+  Contact
 } from "../../types";
 import { useMemo } from "react";
 
@@ -73,18 +71,6 @@ function emptyDomainDraft(): OperationDomainDraft {
 
 function operationDomainByKey(configs: OperationDomainConfig[], domain: string) {
   return configs.find((config) => config.domain === domain);
-}
-
-// 临时占位函数（需要从App.tsx移植或重新实现）
-function emptyPromptTemplateDraft(): PromptTemplateDraft {
-  return {
-    promptKey: "",
-    agentKind: "user",
-    layer: "task_template",
-    title: "",
-    description: "",
-    content: ""
-  };
 }
 
 export default function UserOpsFeature() {
@@ -145,6 +131,7 @@ export default function UserOpsFeature() {
     runMemoryConsolidation,
     runDialogueSimulation,
     createPlaybook,
+    savePlaybook,
     optimizePlaybook,
     generatePlaybook,
     setDefaultPlaybook,
@@ -155,6 +142,30 @@ export default function UserOpsFeature() {
   const { contacts, selected, contactTab, setSelected, setContactTab } = contactStore;
   const { currentAccountId, accounts, onlineCount } = accountStore;
   const { busy, error, setBusy, setError } = uiStore;
+
+  // 传统模式 prompts tab：复用 strategyStore 的 souls/prompt CRUD（与系统策略页同一套）
+  const strategyStore = useStrategyStore();
+  const {
+    souls,
+    promptTemplates,
+    soulDraft,
+    editingSoulId,
+    promptDraft,
+    editingPromptId,
+    setSoulDraft,
+    setPromptDraft,
+    loadStrategyData,
+    createSoul,
+    saveSoul,
+    publishSoul,
+    editSoul,
+    newSoulDraftFor,
+    createPromptTemplate,
+    savePromptTemplate,
+    publishPromptTemplate,
+    editPromptTemplate,
+    newPromptDraftFor
+  } = strategyStore;
 
   // 计算衍生状态
   const managedCount = useMemo(
@@ -180,20 +191,10 @@ export default function UserOpsFeature() {
   const query = "";
   const setQuery = () => {};
 
-  // 占位数据 - 这些应该从相应的store获取
-  const souls: AgentSoul[] = [];
-  const promptTemplates: PromptTemplate[] = [];
+  // 占位数据 - operationDomains（settings tab 的 domain 配置尚未迁移到独立 store）
   const operationDomains: OperationDomainConfig[] = [];
   const domainDrafts: Record<string, OperationDomainDraft> = {};
-  const setDomainDrafts = (drafts: Record<string, OperationDomainDraft>) => {};
-
-  // 临时提示词相关状态
-  const soulDraft = { agentKind: "user", name: "", content: "" };
-  const setSoulDraft = () => {};
-  const editingSoulId = "";
-  const promptDraft = emptyPromptTemplateDraft();
-  const setPromptDraft = () => {};
-  const editingPromptId = "";
+  const setDomainDrafts = (_drafts: Record<string, OperationDomainDraft>) => {};
 
   const pendingTasks = tasks.filter((task) => task.status === "pending").length;
 
@@ -207,20 +208,9 @@ export default function UserOpsFeature() {
     await loadMessages(contact);
   };
 
-  // 占位的传统模式函数
-  const createPromptTemplate = async () => {};
-  const createSoul = async () => {};
-  const editPromptTemplate = (template: any) => {};
-  const editSoul = (soul: any) => {};
-  const newPromptDraftFor = (kind: string) => {};
-  const newSoulDraftFor = (kind: string) => {};
-  const publishPromptTemplate = async (id: string) => {};
-  const publishSoul = async (id: string) => {};
-  const savePromptTemplate = async () => {};
-  const saveSoul = async () => {};
-  const resetOperationDomain = async (domain: string) => {};
-  const saveOperationDomain = async (domain: string) => {};
-  const savePlaybook = async () => {};
+  // settings tab 的 domain 配置回调（domain store 尚未迁移，暂保留无操作）
+  const resetOperationDomain = async (_domain: string) => {};
+  const saveOperationDomain = async (_domain: string) => {};
 
   // 挂载时加载剧本
   useEffect(() => {
@@ -229,6 +219,13 @@ export default function UserOpsFeature() {
       loadPlaybooks(accountId);
     }
   }, [currentAccountId, loadPlaybooks]);
+
+  // 切到 traditional 模式时加载 souls/promptTemplates（prompts tab 复用 strategyStore）
+  useEffect(() => {
+    if (userOpsMode === "traditional") {
+      void loadStrategyData();
+    }
+  }, [userOpsMode, loadStrategyData]);
 
   // 选中联系人变化时的处理
   useEffect(() => {
@@ -317,15 +314,15 @@ export default function UserOpsFeature() {
               optimizePlaybookText={optimizePlaybookText}
               playbookDraft={playbookDraft}
               playbooks={playbooks}
-              onCreatePlaybook={createPlaybook}
+              onCreatePlaybook={(e) => { e.preventDefault(); void createPlaybook(); }}
               onEditPlaybook={editPlaybook}
-              onGeneratePlaybook={generatePlaybook}
+              onGeneratePlaybook={(e) => { e.preventDefault(); void generatePlaybook(); }}
               onGeneratePlaybookText={setGeneratePlaybookText}
               onNewPlaybook={newPlaybookDraft}
               onOptimizePlaybook={() => optimizePlaybook(editingPlaybookId)}
               onOptimizePlaybookText={setOptimizePlaybookText}
               onPlaybookDraft={setPlaybookDraft}
-              onSavePlaybook={savePlaybook}
+              onSavePlaybook={(e) => { e.preventDefault(); void savePlaybook(); }}
               onSetDefaultPlaybook={setDefaultPlaybook}
             />
           )}
@@ -343,8 +340,8 @@ export default function UserOpsFeature() {
               soulDraft={soulDraft}
               souls={souls}
               title="用户运营 Agent 提示词"
-              onCreatePromptTemplate={createPromptTemplate}
-              onCreateSoul={createSoul}
+              onCreatePromptTemplate={(e) => { e.preventDefault(); void createPromptTemplate(); }}
+              onCreateSoul={(e) => { e.preventDefault(); void createSoul(); }}
               onEditPromptTemplate={editPromptTemplate}
               onEditSoul={editSoul}
               onNewPromptTemplate={() => newPromptDraftFor("user")}
@@ -352,8 +349,8 @@ export default function UserOpsFeature() {
               onPromptDraft={setPromptDraft}
               onPublishPromptTemplate={publishPromptTemplate}
               onPublishSoul={publishSoul}
-              onSavePromptTemplate={savePromptTemplate}
-              onSaveSoul={saveSoul}
+              onSavePromptTemplate={(e) => { e.preventDefault(); void savePromptTemplate(); }}
+              onSaveSoul={(e) => { e.preventDefault(); void saveSoul(); }}
               onSoulDraft={setSoulDraft}
             />
           )}
