@@ -80,20 +80,25 @@ fn real_llm_from_env() -> Option<Arc<LlmClient>> {
 // ════════════════════════════════════════════════════════════════════════════
 
 /// 该错误是否值得切下一个备胎。可恢复 = 端点侧抖动（限流 / 5xx / 超时 / 连接 / 传输
-/// 截断 / 网络），换个独立端点的模型可能成功。**不可恢复 = fail-fast**：`http_4xx`
-/// （key/model/配额错，换模型也没用）、`json_decode_error` / `empty_response`（prompt
-/// 触发，换模型仍会同样失败，徒增延迟）。
+/// 截断 / 网络），换个独立端点的模型可能成功。
+///
+/// **`http_4xx` 细分**（detail 带原始 "HTTP <code>" 串）：
+/// - **402 Payment Required / 401 Unauthorized → 切备胎**：这是该端点的**账户欠费 / 密钥
+///   失效**——是「这个端点废了，但独立端点的另一个 key 能成」，换端点正是解药（命中今轮
+///   MiMo 余额耗尽场景：自动切 gpt-5.5 续跑，而非整轮 skip）。
+/// - **其余 4xx（400/403/404 等）→ fail-fast**：请求本身非法 / model 不存在，换端点同样失败，
+///   徒增延迟。
+///
+/// `json_decode_error` / `empty_response`（prompt 触发，换模型仍同样失败）→ fail-fast。
 fn is_failover_worthy(e: &AppError) -> bool {
     match e {
-        AppError::LlmUnavailable { kind, .. } => matches!(
-            kind.as_str(),
-            "rate_limited"
-                | "http_5xx"
-                | "timeout"
-                | "connect_failed"
-                | "body_decode_error"
-                | "network_error"
-        ),
+        AppError::LlmUnavailable { kind, detail, .. } => match kind.as_str() {
+            "rate_limited" | "http_5xx" | "timeout" | "connect_failed" | "body_decode_error"
+            | "network_error" => true,
+            // 账户/密钥级 4xx（欠费 402 / 未授权 401）：独立端点能救 → 切备胎。
+            "http_4xx" => detail.contains("HTTP 402") || detail.contains("HTTP 401"),
+            _ => false,
+        },
         AppError::Http(h) => h.is_timeout() || h.is_connect(),
         _ => false,
     }

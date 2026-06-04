@@ -116,3 +116,38 @@ export type TaskItem = {
   cancelReason?: string;
   error?: string;
 };
+
+export type ContentAsset = {
+  id: string;
+  kind: string;
+  title: string;
+  body?: string;
+  url?: string;
+  mediaId?: string;
+  usageScene?: string;
+};
+
+export type AgentSoul = {
+  id: string;
+  agentKind: string;
+  name: string;
+  content: string;
+  status: string;
+  version: number;
+};
+
+export type CommandToolCall = {
+  id: string;
+  toolName: string;
+  arguments?: Record<string, unknown>;
+  status: string;
+  response?: Record<string, unknown>;
+  error?: string;
+};
+
+export type CommandResult = {
+  id: string;
+  status: string;
+  summary: string;
+  toolCalls: CommandToolCall[];
+};

@@ -70,27 +70,12 @@ import type {
   Message,
   EventItem,
   TaskItem,
+  ContentAsset,
+  AgentSoul,
+  CommandToolCall,
+  CommandResult,
 } from "./types";
 import { api, parseApiError, LlmUnavailableError } from "./lib/api";
-
-type ContentAsset = {
-  id: string;
-  kind: string;
-  title: string;
-  body?: string;
-  url?: string;
-  mediaId?: string;
-  usageScene?: string;
-};
-
-type AgentSoul = {
-  id: string;
-  agentKind: string;
-  name: string;
-  content: string;
-  status: string;
-  version: number;
-};
 
 type OperationPlaybook = {
   id: string;
@@ -389,22 +374,6 @@ type SimulationTurn = {
   contextPack?: Record<string, unknown>;
   memoryPreview: Record<string, unknown>;
   stateTransition: Record<string, unknown>;
-};
-
-type CommandToolCall = {
-  id: string;
-  toolName: string;
-  arguments?: Record<string, unknown>;
-  status: string;
-  response?: Record<string, unknown>;
-  error?: string;
-};
-
-type CommandResult = {
-  id: string;
-  status: string;
-  summary: string;
-  toolCalls: CommandToolCall[];
 };
 
 /**
@@ -1480,7 +1449,7 @@ export function App() {
   );
 }
 
-function CommandCenterView({
+export function CommandCenterView({
   accounts,
   assets,
   commandDraft,
@@ -5386,7 +5355,7 @@ function formatChangeValue(value: unknown): string {
   return String(value);
 }
 
-function commandCallDetail(call: CommandToolCall): string {
+export function commandCallDetail(call: CommandToolCall): string {
   if (call.error) return call.error;
   const response = call.response || {};
   // 波 B1：dry-run 时后端返回 { dry_run: true, would_execute: { toolName, arguments } }；

@@ -18,6 +18,7 @@ import {
 import type { Channel } from "../types";
 
 const OverviewFeature = lazy(() => import("../features/overview"));
+const CommandCenterFeature = lazy(() => import("../features/command-center"));
 const AutonomyFeature = lazy(() => import("../features/autonomy"));
 const EvolutionFeature = lazy(() => import("../features/evolution"));
 const QualityFeature = lazy(() => import("../features/quality"));
@@ -49,7 +50,7 @@ export const CHANNELS: ChannelDef[] = [
     eyebrow: "Management Agent",
     title: "AI Command Center",
     subtitle: "用一个后台管理 Agent 统筹好友、微信群、朋友圈与系统任务。",
-    Component: OverviewFeature,
+    Component: CommandCenterFeature,
   },
   {
     id: "overview",
