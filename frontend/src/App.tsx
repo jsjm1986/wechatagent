@@ -77,6 +77,7 @@ import type {
 } from "./types";
 import { api, parseApiError, LlmUnavailableError } from "./lib/api";
 import { EmptyState as UiEmptyState } from "./components/ui/EmptyState/EmptyState";
+import type { DecisionReview, LlmUsageResponse, LlmUsageItem } from "./types";
 
 type OperationPlaybook = {
   id: string;
@@ -128,31 +129,6 @@ type OperatingMemory = {
   updatedAt?: string;
 };
 
-type LlmUsageItem = {
-  id: string;
-  promptKey: string;
-  model: string;
-  status: string;
-  latencyMs: number;
-  promptTokens: number;
-  completionTokens: number;
-  totalTokens: number;
-  promptCacheHitTokens: number;
-  promptCacheMissTokens: number;
-  error?: string;
-  createdAt?: string;
-};
-
-type LlmUsageResponse = {
-  summary: {
-    totalCalls: number;
-    totalTokens: number;
-    promptCacheHitTokens: number;
-    promptCacheMissTokens: number;
-    promptCacheHitRate: number;
-  };
-  items: LlmUsageItem[];
-};
 
 type MemoryCandidateItem = {
   id: string;
@@ -314,21 +290,6 @@ type OperationStateDraft = {
   successCriteria: string;
 };
 
-type DecisionReview = {
-  id: string;
-  contactWxid?: string;
-  replyText?: string;
-  approved: boolean;
-  scores: Record<string, number>;
-  risks: string[];
-  reviewSummary?: string;
-  operationState?: string;
-  nextBestAction?: Record<string, unknown>;
-  sendGatewayResult?: Record<string, unknown>;
-  outcomeStatus?: string;
-  status: string;
-  createdAt?: string;
-};
 
 type OperationHealthItem = {
   key: string;

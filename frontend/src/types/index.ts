@@ -151,3 +151,45 @@ export type CommandResult = {
   summary: string;
   toolCalls: CommandToolCall[];
 };
+
+export type LlmUsageItem = {
+  id: string;
+  promptKey: string;
+  model: string;
+  status: string;
+  latencyMs: number;
+  promptTokens: number;
+  completionTokens: number;
+  totalTokens: number;
+  promptCacheHitTokens: number;
+  promptCacheMissTokens: number;
+  error?: string;
+  createdAt?: string;
+};
+
+export type LlmUsageResponse = {
+  summary: {
+    totalCalls: number;
+    totalTokens: number;
+    promptCacheHitTokens: number;
+    promptCacheMissTokens: number;
+    promptCacheHitRate: number;
+  };
+  items: LlmUsageItem[];
+};
+
+export type DecisionReview = {
+  id: string;
+  contactWxid?: string;
+  replyText?: string;
+  approved: boolean;
+  scores: Record<string, number>;
+  risks: string[];
+  reviewSummary?: string;
+  operationState?: string;
+  nextBestAction?: Record<string, unknown>;
+  sendGatewayResult?: Record<string, unknown>;
+  outcomeStatus?: string;
+  status: string;
+  createdAt?: string;
+};

@@ -20,6 +20,7 @@ import type { Channel } from "../types";
 const OverviewFeature = lazy(() => import("../features/overview"));
 const CommandCenterFeature = lazy(() => import("../features/command-center"));
 const ContentAssetsFeature = lazy(() => import("../features/content-assets"));
+const OperationsFeature = lazy(() => import("../features/operations"));
 const AutonomyFeature = lazy(() => import("../features/autonomy"));
 const EvolutionFeature = lazy(() => import("../features/evolution"));
 const QualityFeature = lazy(() => import("../features/quality"));
@@ -150,7 +151,7 @@ export const CHANNELS: ChannelDef[] = [
     eyebrow: "Execution Audit",
     title: "任务与日志",
     subtitle: "追踪跟进任务、Agent 决策事件和系统执行结果。",
-    Component: OverviewFeature,
+    Component: OperationsFeature,
   },
   {
     id: "autonomy",
