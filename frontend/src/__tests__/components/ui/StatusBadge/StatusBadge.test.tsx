@@ -1,6 +1,6 @@
 import { render, screen } from "@testing-library/react";
 import { describe, expect, it } from "vitest";
-import { StatusBadge } from "../../../../components/ui/StatusBadge/StatusBadge";
+import { StatusBadge } from "../../../../components/ui/StatusBadge";
 
 describe("StatusBadge", () => {
   it("渲染文案与对应语义 tone 的 class", () => {
