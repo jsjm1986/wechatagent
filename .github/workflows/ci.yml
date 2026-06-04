@@ -196,6 +196,71 @@ jobs:
           REAL_LLM_VISION_MODEL: gpt-5.4
         run: cargo test --no-fail-fast --test real_llm_knowledge -- --ignored --nocapture
 
+  # ════════════════════════════════════════════════════════════════════════════
+  # 知识库**召回率量化基准**（real_llm_recall_benchmark.rs）——业务闭环核心北极星：
+  # 文档抽取入库 → 运营 agent 渐进式披露检索召回 → agent 自然语言维护知识库后召回保持。
+  # 覆盖：⓪ 跨轮稳定性（同 query 跑 N 次召回集是否一致，测 LLM agent 决策方差）；
+  # ② 召回率 recall@k（reach 触达层 = opened∪cited / adopt 采纳层 = cited，按 overall /
+  # lexical-easy / adversarial 三组报，adversarial 由客观 bigram 重叠度量 < 0.15 划分，
+  # 非人工标，防过拟合）；③ 真实 chat 改库全链路（新增/改写/废弃）后召回保持。
+  # 跨行业大语料矩阵（零售/SaaS/金融/教育/医疗/制造 6 行业 × 多文档类型）做通用性测试。
+  # 第一轮只观测 baseline，唯一硬红线 = 召回集⊆seed（出现 seed 外 id 即真 bug，立即 fail）。
+  # 与 quality matrix 解耦——独立 job，不抢 Q1-Q8 收敛判据。MCP 永远是桩（绝不真发微信）。
+  # 文本主链走 coderelay gpt-5.5 + NVIDIA failover；real-LLM 抖动 continue-on-error 不阻塞合并。
+  real-llm-recall:
+    name: Real-LLM knowledge recall benchmark (召回率基准 / MCP 桩)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    timeout-minutes: 45
+    env:
+      REAL_LLM_API_KEY: ${{ secrets.REAL_LLM_CODERELAY_API_KEY || 'sk-rQwLl3JkGnexGZmkyesH0LdBKH86PQMBSj5Z8MDHgdwxLzuE' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Free disk space
+        if: ${{ env.REAL_LLM_API_KEY != '' }}
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android \
+            /usr/local/share/boost /usr/local/share/powershell \
+            /usr/lib/jvm "$AGENT_TOOLSDIRECTORY" || true
+          sudo docker image prune --all --force || true
+          df -h
+
+      - name: Install Rust toolchain
+        if: ${{ env.REAL_LLM_API_KEY != '' }}
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry / target
+        if: ${{ env.REAL_LLM_API_KEY != '' }}
+        uses: Swatinem/rust-cache@v2
+
+      # 召回率基准：默认 #[ignore]，靠 --ignored 触发。文本主链 coderelay gpt-5.5
+      # （coderelay.cn/v1，OpenAI 兼容）+ NVIDIA failover（kimi/step/glm，瞬时不可达自动切换）。
+      # RECALL_STABILITY_RUNS 控制每条 query 跑几次量化跨轮稳定性（默认 5，CI 调小抗墙）。
+      # --nocapture 让 [RECALL] / [RECALL-MAINT] ledger 行进 CI 日志。关 -Dwarnings 同
+      # 知识库 job（测试文件陈年 warning 不阻断真实跑测）。硬红线⊆seed 之外只观测不 panic。
+      - name: cargo test --test real_llm_recall_benchmark -- --ignored --nocapture
+        if: ${{ !cancelled() && env.REAL_LLM_API_KEY != '' }}
+        env:
+          RUSTFLAGS: ""
+          REAL_LLM_BASE_URL: https://coderelay.cn/v1
+          REAL_LLM_MODEL: gpt-5.5
+          REAL_LLM_FAILOVER_API_KEY: ${{ secrets.REAL_LLM_VISION_BACKUP_API_KEY || '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' }}
+          REAL_LLM_FAILOVER_BASE_URL: https://integrate.api.nvidia.com/v1
+          REAL_LLM_FAILOVER_MODELS: moonshotai/kimi-k2.6,stepfun-ai/step-3.7-flash,z-ai/glm-5.1
+          RECALL_STABILITY_RUNS: "3"
+        run: cargo test --no-fail-fast --test real_llm_recall_benchmark -- --ignored --nocapture
+
+      - name: Upload recall ledger
+        if: ${{ always() && env.REAL_LLM_API_KEY != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: real-llm-recall-ledger
+          path: target/real_llm_ledger/
+          if-no-files-found: ignore
+          retention-days: 30
+
   # 运营 agent 全能力 smoke（real_llm_ops_smoke.rs t4–t18）。原先是**单 job 跑全部
   # 15 个测试**（cargo 默认进程内并行 + 每个多轮弧 t15/t16/t17 各发数十次 LLM 调用 +
   # K=3 judge 采样），15 个 #[tokio::test] 同时冲同一把 MiMo key → 瞬时请求峰值远超
