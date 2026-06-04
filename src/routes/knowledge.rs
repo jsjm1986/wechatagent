@@ -3320,7 +3320,7 @@ pub async fn build_operation_knowledge_completeness(
   4. 缺失：知识库里没有该维度的任何内容。
 - coverage 的每个维度是一个**认知状态对象**，三个布尔位**相互独立、可同时为 true**，必须如实并存标注（不是单选）：
   - "verifiedFact": 该维度存在第 1 类「已验证客观事实」时为 true；
-  - "methodologyOnly": 该维度存在第 2 类「仅方法论/话术」内容时为 true；
+  - "methodologyOnly": 该维度存在第 2 类「仅方法论/话术」内容时为 true（判定门槛见下方 methodologyOnly 防滥标条，**不要**把已含客观事实的切片也算进来）；
   - "pendingDraft": 该维度的具体信息存在于 needs_review 草稿中（第 3 类）时为 true。
   **关键：同一维度可以既 verifiedFact=true 又 pendingDraft=true**（例如企业版报价已审定为客观事实、旗舰版报价仍是未审定草稿，则 pricing 的 verifiedFact 与 pendingDraft 都为 true）。绝不能因为有 verified 事实就把 pendingDraft 抹成 false，也绝不能因为有草稿就把已具备的 verifiedFact 抹成 false——两个方向的漏标都要扣分。三位全 false 表示该维度缺失（第 4 类）。此判据对 pricing / caseEvidence / effectClaims / deliveryBoundary / capability 每一维都同样适用。
 - 各 coverage 维度判 verifiedFact=true 的命中锚点（满足"已验证客观事实"时即应判 true，**不要漏判**）：
@@ -3329,6 +3329,10 @@ pub async fn build_operation_knowledge_completeness(
   - caseEvidence：有 verified 切片描述**具体客户案例/实施成效**（含可核验的主体、场景或落地结果），即判 true。
   - effectClaims：有 verified 切片含**可核验的效果数据/量化成果**（如转化率提升、响应时长变化等具体数字），即判 true。
   - deliveryBoundary：有 verified 切片陈述交付方式/SLA/可用性/部署边界等具体条款。
+- methodologyOnly=true 的判定门槛（与 verifiedFact 对称，**防滥标**；通用原则，对每一维同样适用）：仅当该维度存在**以方法论/话术/价值主张/谈判策略为主体、且本身不含可对客客观事实（无具体数字/条款/案例数据/效果数字）**的独立 verified 切片时，才标 methodologyOnly=true。判定准则：
+  - 一条切片若已含可核验的客观事实（即让该维度 verifiedFact=true 的那条），**不要**再因它顺带提到「怎么做/如何沟通/价值」就把同维度 methodologyOnly 也标 true——含客观事实的切片归 verifiedFact，**不重复**归 methodologyOnly。
+  - 只有当某维度**除了**客观事实切片之外、**另有**一条纯方法论/话术切片，或该维度根本没有客观事实、只有方法论切片时，methodologyOnly 才为 true。
+  - 拿不准某切片算「客观事实」还是「仅方法论」时，**优先归客观事实**（verifiedFact），methodologyOnly **从严**——宁可漏标 methodologyOnly，不可滥标导致与同维 verifiedFact 表意矛盾。
 - needs_review 切片**尚未审定**，在审定前绝不可作为产品/服务事实依据；若其涉及关键事实维度，必须把对应维度 pendingDraft 置 true、在 gaps 中写明「该主题存在未核实草稿，需运营审定」，且**不得**因草稿存在就判 fully_supported。
 - summary 字段必须如实反映知识库现状：对任一关键维度，若 verified 侧只有方法论/话术或仅有未审定草稿，summary 要点明「具备相关方法论但缺已审定的客观事实」，不要笼统说「可回答产品事实」。
 - gaps 必须有指导价值：每条 gap 是一句自含的整改指令，需同时写清三要素——①哪个事实维度；②它当前处于哪种认知状态（缺失 / 仅未审定草稿 / 仅方法论话术 / 已有事实但另有待审定草稿）；③运营下一步该做什么（补采可验证事实 / 审定指定草稿 / 标注为不可对客）。**禁止**输出「知识不足」「需完善」之类无维度、无状态、无动作的笼统空话。每个未达 verified 客观事实、或虽有事实但仍存在待审定草稿的维度都要各有一条对应 gap，不要把多维并成一句含糊带过。
