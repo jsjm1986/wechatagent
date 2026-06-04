@@ -129,7 +129,7 @@ jobs:
     # → 文本切回 MiMo mimo-v2.5（用户指定 api.xiaomimimo.com，key 走 secret
     # REAL_LLM_MIMO_API_KEY，缺则回落字面量），与 ops/adversarial/quality 套件同源。
     env:
-      REAL_LLM_API_KEY: ${{ secrets.REAL_LLM_MIMO_API_KEY || 'sk-cfvcwg5ga1onypq5g01ejdig7w44p67e9bk7odzwo0oxiocz' }}
+      REAL_LLM_API_KEY: ${{ secrets.REAL_LLM_CODERELAY_API_KEY || 'sk-rQwLl3JkGnexGZmkyesH0LdBKH86PQMBSj5Z8MDHgdwxLzuE' }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -161,9 +161,9 @@ jobs:
         if: ${{ env.REAL_LLM_API_KEY != '' }}
         env:
           RUSTFLAGS: ""
-          # 文本主链路（T1/T2）走 MiMo mimo-v2.5（api.xiaomimimo.com，OpenAI 兼容 /v1）。
-          REAL_LLM_BASE_URL: https://api.xiaomimimo.com/v1
-          REAL_LLM_MODEL: mimo-v2.5
+          # 文本主链路（T1/T2）走 coderelay gpt-5.5（coderelay.cn/v1，OpenAI 兼容；MiMo 额度 2026-06-04 耗尽切此）。
+          REAL_LLM_BASE_URL: https://coderelay.cn/v1
+          REAL_LLM_MODEL: gpt-5.5
           # vision（T3）：MiMo 主文本 checkpoint 不复用多模态，故指向专职视觉 provider
           # gpt-5.4（gpt.api456.me，OpenAI 兼容 /v1）。key 优先 secret，缺则回落字面量
           # （与 quality 套件同纪律：tests/CI 豁免 model-hint lint）。偶发 5xx/524 走
@@ -185,9 +185,9 @@ jobs:
         if: ${{ !cancelled() && env.REAL_LLM_API_KEY != '' }}
         env:
           RUSTFLAGS: ""
-          # 文本知识链路（K1–K5/K7–K11）走 MiMo mimo-v2.5（api.xiaomimimo.com）。
-          REAL_LLM_BASE_URL: https://api.xiaomimimo.com/v1
-          REAL_LLM_MODEL: mimo-v2.5
+          # 文本知识链路（K1–K5/K7–K11）走 coderelay gpt-5.5（coderelay.cn/v1；MiMo 额度 2026-06-04 耗尽切此）。
+          REAL_LLM_BASE_URL: https://coderelay.cn/v1
+          REAL_LLM_MODEL: gpt-5.5
           # vision（K6）：MiMo 主文本 checkpoint 不复用多模态，故指向专职视觉 provider
           # gpt-5.4（gpt.api456.me）。key 优先 secret，缺则回落字面量（与 quality 套件
           # 同纪律：tests/CI 豁免 model-hint lint）。偶发 5xx/524 走 LlmUnavailable→skip。
@@ -239,7 +239,7 @@ jobs:
           - t17_real_multiturn_boundary_stress
           - t18_real_warm_start_operator_seeded_arc
     env:
-      REAL_LLM_API_KEY: ${{ secrets.REAL_LLM_MIMO_API_KEY || 'sk-cfvcwg5ga1onypq5g01ejdig7w44p67e9bk7odzwo0oxiocz' }}
+      REAL_LLM_API_KEY: ${{ secrets.REAL_LLM_CODERELAY_API_KEY || 'sk-rQwLl3JkGnexGZmkyesH0LdBKH86PQMBSj5Z8MDHgdwxLzuE' }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -272,8 +272,8 @@ jobs:
         if: ${{ env.REAL_LLM_API_KEY != '' }}
         env:
           RUSTFLAGS: ""
-          REAL_LLM_BASE_URL: https://api.xiaomimimo.com/v1
-          REAL_LLM_MODEL: mimo-v2.5
+          REAL_LLM_BASE_URL: https://coderelay.cn/v1
+          REAL_LLM_MODEL: gpt-5.5
           REAL_LLM_JUDGE: "1"
           # 裁判用最强模型 gpt-5.5（@ coderelay，OpenAI 兼容）——G-Eval/MT-Bench 方法论：
           # 最强模型当 judge 判分更可信。被测 agent 仍是生产模型 MiMo（REAL_LLM_MODEL），
@@ -462,7 +462,7 @@ jobs:
       # REAL_LLM_JUDGE1_MODEL），第二裁判 = 跨家族 Qwen。key 走 secret REAL_LLM_MIMO_API_KEY（缺则
       # 回落字面量），端点 HTTPS（api.xiaomimimo.com）。
       # `if:` 守卫读 job 级此 env，故空 key 时整个 adversarial job 各步自动跳过、不红不耗 CI 分钟。
-      REAL_LLM_API_KEY: ${{ secrets.REAL_LLM_MIMO_API_KEY || 'sk-cfvcwg5ga1onypq5g01ejdig7w44p67e9bk7odzwo0oxiocz' }}
+      REAL_LLM_API_KEY: ${{ secrets.REAL_LLM_CODERELAY_API_KEY || 'sk-rQwLl3JkGnexGZmkyesH0LdBKH86PQMBSj5Z8MDHgdwxLzuE' }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -488,17 +488,23 @@ jobs:
         if: ${{ env.REAL_LLM_API_KEY != '' }}
         env:
           RUSTFLAGS: ""
-          # 被测 agent = mimo-v2.5（REAL_LLM_MODEL）；主裁判 judge1 = mimo-v2.5-pro
-          # （REAL_LLM_JUDGE1_MODEL，同厂不同 checkpoint）——judge1≠agent checkpoint，比上轮 gpt-5.5
-          # 自评干净（不再逐字自我背书）。端点 HTTPS（api.xiaomimimo.com），OpenAI 兼容 /v1，
-          # reasoning_content 落独立字段被 serde 忽略 → 零生产代码改动。台账 judge label 从
-          # 各 model 名派生，跨轮读账不串味。
-          REAL_LLM_BASE_URL: https://api.xiaomimimo.com/v1
-          REAL_LLM_MODEL: mimo-v2.5
-          REAL_LLM_JUDGE1_MODEL: mimo-v2.5-pro
-          REAL_LLM_VISION_MODEL: mimo-v2.5
+          # 被测 agent = gpt-5.5（REAL_LLM_MODEL）；主裁判 judge1 = gpt-5.4（REAL_LLM_JUDGE1_MODEL，
+          # 同厂不同 checkpoint，judge1≠agent checkpoint，自评干净不逐字自我背书）。端点 coderelay
+          # （MiMo 额度 2026-06-04 耗尽，切 coderelay gpt-5.x）。台账 judge label 从各 model 名派生。
+          REAL_LLM_BASE_URL: https://coderelay.cn/v1
+          REAL_LLM_MODEL: gpt-5.5
+          REAL_LLM_JUDGE1_MODEL: gpt-5.4
+          REAL_LLM_VISION_MODEL: gpt-5.4
           REAL_LLM_JUDGE: "1"
           REAL_LLM_LEDGER: target/real_llm_ledger
+          # 最强模型 gpt-5.5（@ coderelay，OpenAI 兼容）作 agent/红队/判官备胎链**首选**：
+          # MiMo 主端点 402 欠费 / 429 限流 / 5xx 时优先切它续跑（命中 2026-06-04 MiMo 余额
+          # 耗尽场景——此前 402 被判 fail-fast 不切备胎致整轮全挂，现 is_failover_worthy 对
+          # 402/401 切备胎 + 此 key 接上 gpt-5.5 兜底）。key 优先 secret，缺则回落字面量
+          # （tests/CI 豁免 model-hint lint）。缺此 key 时备胎链退回 NVIDIA 链/空，CI 不退化。
+          REAL_LLM_JUDGE_API_KEY: ${{ secrets.REAL_LLM_GPT55_API_KEY || 'sk-rQwLl3JkGnexGZmkyesH0LdBKH86PQMBSj5Z8MDHgdwxLzuE' }}
+          REAL_LLM_JUDGE_BASE_URL: https://coderelay.cn/v1
+          REAL_LLM_JUDGE_MODEL: gpt-5.5
           # 第二裁判 = 跨家族 Qwen（阿里 DashScope，OpenAI 兼容）。agent/judge1 同为 deepseek
           # 家族，跨家族效度信号靠这一路 Qwen——读账以 |deepseek-flash−qwen| 为家族盲区代理。
           # 缺该 secret 时 judge_panel() 退化回 lite 第二裁判（用 VISION_MODEL）。
