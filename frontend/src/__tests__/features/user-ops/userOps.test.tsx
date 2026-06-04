@@ -19,6 +19,10 @@ vi.mock("../../../stores/uiStore", () => ({
   useUiStore: vi.fn()
 }));
 
+vi.mock("../../../stores/strategyStore", () => ({
+  useStrategyStore: vi.fn()
+}));
+
 // Mock所有从App导入的组件
 vi.mock("../../../App", () => ({
   UserOperationCockpit: vi.fn(() => <div data-testid="user-operation-cockpit">UserOperationCockpit</div>),
@@ -35,6 +39,7 @@ import { useUserOpsStore } from "../../../stores/userOpsStore";
 import { useContactStore } from "../../../stores/contactStore";
 import { useAccountStore } from "../../../stores/accountStore";
 import { useUiStore } from "../../../stores/uiStore";
+import { useStrategyStore } from "../../../stores/strategyStore";
 
 describe("UserOpsFeature", () => {
   const mockContact = {
@@ -110,6 +115,9 @@ describe("UserOpsFeature", () => {
     editingPlaybookId: "",
     guideBusy: false,
     simulationBusy: false,
+    // Domain 配置相关
+    operationDomains: [],
+    domainDrafts: {},
     // Actions
     setUserOpsMode: vi.fn(),
     setSmartOpsTab: vi.fn(),
@@ -122,9 +130,11 @@ describe("UserOpsFeature", () => {
     setPlaybookDraft: vi.fn(),
     setGeneratePlaybookText: vi.fn(),
     setOptimizePlaybookText: vi.fn(),
+    setDomainDrafts: vi.fn(),
     hydrateSelected: vi.fn(),
     loadMessages: vi.fn().mockResolvedValue(undefined),
     loadPlaybooks: vi.fn().mockResolvedValue(undefined),
+    loadDomains: vi.fn().mockResolvedValue(undefined),
     enableAgent: vi.fn().mockResolvedValue(undefined),
     disableAgent: vi.fn().mockResolvedValue(undefined),
     saveProfileNote: vi.fn().mockResolvedValue(undefined),
@@ -135,11 +145,15 @@ describe("UserOpsFeature", () => {
     runMemoryConsolidation: vi.fn().mockResolvedValue(undefined),
     runDialogueSimulation: vi.fn().mockResolvedValue(undefined),
     createPlaybook: vi.fn().mockResolvedValue(undefined),
+    savePlaybook: vi.fn().mockResolvedValue(undefined),
     optimizePlaybook: vi.fn().mockResolvedValue(undefined),
     generatePlaybook: vi.fn().mockResolvedValue(undefined),
     setDefaultPlaybook: vi.fn().mockResolvedValue(undefined),
     editPlaybook: vi.fn(),
     newPlaybookDraft: vi.fn(),
+    // Domain 配置业务方法
+    saveOperationDomain: vi.fn().mockResolvedValue(undefined),
+    resetOperationDomain: vi.fn().mockResolvedValue(undefined),
     ...overrides
   });
 
@@ -177,6 +191,28 @@ describe("UserOpsFeature", () => {
       error: "",
       setBusy: vi.fn(),
       setError: vi.fn()
+    });
+
+    (useStrategyStore as any).mockReturnValue({
+      souls: [],
+      promptTemplates: [],
+      soulDraft: { agentKind: "", name: "", content: "" },
+      editingSoulId: "",
+      promptDraft: { promptKey: "", agentKind: "", layer: "", title: "", description: "", content: "" },
+      editingPromptId: "",
+      setSoulDraft: vi.fn(),
+      setPromptDraft: vi.fn(),
+      loadStrategyData: vi.fn().mockResolvedValue(undefined),
+      createSoul: vi.fn().mockResolvedValue(undefined),
+      saveSoul: vi.fn().mockResolvedValue(undefined),
+      publishSoul: vi.fn().mockResolvedValue(undefined),
+      editSoul: vi.fn(),
+      newSoulDraftFor: vi.fn(),
+      createPromptTemplate: vi.fn().mockResolvedValue(undefined),
+      savePromptTemplate: vi.fn().mockResolvedValue(undefined),
+      publishPromptTemplate: vi.fn().mockResolvedValue(undefined),
+      editPromptTemplate: vi.fn(),
+      newPromptDraftFor: vi.fn()
     });
 
     // Mock fetch

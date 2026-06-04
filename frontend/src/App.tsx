@@ -91,31 +91,11 @@ import type {
   OperationHealthItem,
   OperationHealth,
   UserOperationGuidePreview,
-  SimulationTurn
+  SimulationTurn,
+  DomainKey,
+  OperationDomainConfig,
+  OperationDomainDraft
 } from "./types";
-
-type DomainKey = "user_operations" | "group_operations" | "moment_operations";
-
-type OperationDomainConfig = {
-  id: string;
-  domain: DomainKey;
-  name: string;
-  goal: string;
-  methodology: string;
-  workflow: string;
-  toolPolicy: string;
-  automationPolicy: string;
-  reviewPolicy: string;
-  runtimeParameters: Record<string, unknown>;
-  stateMachine: Record<string, unknown>;
-  status: string;
-  updatedAt?: string;
-  // Phase E / E5-T1：active_versions 灰度字段。后端在 m015 之后保证非空。
-  version?: number;
-  currentVersion?: boolean;
-  previousVersion?: number | null;
-  seededBy?: string | null;
-};
 
 // Phase E / E5-T1：operation_state_policies / system_taxonomies 同款灰度元数据，
 // 抽出公共 type 给三个 admin 面板复用。
@@ -163,18 +143,6 @@ type LessonLearnedEntry = {
   createdAt: string;
   reviewStatus: string; // 默认 "pending_review"
   promotedChunkId: string | null;
-};
-
-type OperationDomainDraft = {
-  name: string;
-  goal: string;
-  methodology: string;
-  workflow: string;
-  toolPolicy: string;
-  automationPolicy: string;
-  reviewPolicy: string;
-  runtimeParameters: string;
-  stateMachine: string;
 };
 
 type OperationStateDraft = {

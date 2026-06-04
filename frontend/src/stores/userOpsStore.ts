@@ -13,12 +13,16 @@ import type {
   SimulationTurn,
   UserOpsMode,
   SmartOpsTab,
-  TraditionalOpsTab
+  TraditionalOpsTab,
+  OperationDomainConfig,
+  OperationDomainDraft,
+  DomainKey
 } from "../types";
 import { api } from "../lib/api";
 import { useUiStore } from "./uiStore";
 import { useContactStore } from "./contactStore";
 import { useAccountStore } from "./accountStore";
+import { domainPayload, domainDraftsFromConfigs } from "./userOpsDomainHelpers";
 
 interface UserOpsState {
   // 模式/Tab
@@ -50,6 +54,10 @@ interface UserOpsState {
   optimizePlaybookText: string;
   editingPlaybookId: string;
 
+  // Domain 配置相关
+  operationDomains: OperationDomainConfig[];
+  domainDrafts: Record<string, OperationDomainDraft>;
+
   // 忙碌状态
   guideBusy: boolean;
   simulationBusy: boolean;
@@ -71,11 +79,13 @@ interface UserOpsActions {
   setEditingPlaybookId: (id: string) => void;
   setGuideBusy: (busy: boolean) => void;
   setSimulationBusy: (busy: boolean) => void;
+  setDomainDrafts: (drafts: Record<string, OperationDomainDraft>) => void;
 
   // 核心业务方法
   hydrateSelected: (contact: Contact) => void;
   loadMessages: (contact: Contact) => Promise<void>;
   loadPlaybooks: (accountId: string) => Promise<void>;
+  loadDomains: () => Promise<void>;
 
   // 15个业务回调
   enableAgent: () => Promise<void>;
@@ -94,6 +104,10 @@ interface UserOpsActions {
   setDefaultPlaybook: (id: string) => Promise<void>;
   editPlaybook: (playbook: OperationPlaybook) => void;
   newPlaybookDraft: () => void;
+
+  // Domain 配置相关业务方法
+  saveOperationDomain: (domain: string) => Promise<void>;
+  resetOperationDomain: (domain: string) => Promise<void>;
 }
 
 // 辅助函数
@@ -237,6 +251,10 @@ export const useUserOpsStore = create<UserOpsState & UserOpsActions>((set, get) 
   optimizePlaybookText: "让方法更像真人朋友，减少营销感；对高意向用户更自然地主动推进；对沉默客户降低打扰频率。",
   editingPlaybookId: "",
 
+  // Domain 配置相关
+  operationDomains: [],
+  domainDrafts: {},
+
   guideBusy: false,
   simulationBusy: false,
 
@@ -255,6 +273,7 @@ export const useUserOpsStore = create<UserOpsState & UserOpsActions>((set, get) 
   setEditingPlaybookId: (id) => set({ editingPlaybookId: id }),
   setGuideBusy: (busy) => set({ guideBusy: busy }),
   setSimulationBusy: (busy) => set({ simulationBusy: busy }),
+  setDomainDrafts: (drafts) => set({ domainDrafts: drafts }),
 
   // 选中联系人时同步状态
   hydrateSelected: (contact) => {
@@ -301,6 +320,19 @@ export const useUserOpsStore = create<UserOpsState & UserOpsActions>((set, get) 
       const accountParam = accountId ? `accountId=${encodeURIComponent(accountId)}` : "";
       const data = await api.get<{ items: OperationPlaybook[] }>(`/api/operation-playbooks${accountParam ? `?${accountParam}` : ""}`);
       set({ playbooks: data.items });
+    } catch (error) {
+      useUiStore.getState().setError(error instanceof Error ? error.message : String(error));
+    }
+  },
+
+  // 加载 Domain 配置
+  loadDomains: async () => {
+    try {
+      const data = await api.get<{ items: OperationDomainConfig[] }>("/api/operation-domains");
+      set({
+        operationDomains: data.items,
+        domainDrafts: domainDraftsFromConfigs(data.items)
+      });
     } catch (error) {
       useUiStore.getState().setError(error instanceof Error ? error.message : String(error));
     }
@@ -687,5 +719,38 @@ export const useUserOpsStore = create<UserOpsState & UserOpsActions>((set, get) 
       editingPlaybookId: "",
       playbookDraft: emptyPlaybookDraft()
     });
+  },
+
+  // Domain 配置相关业务方法
+  saveOperationDomain: async (domain) => {
+    const { domainDrafts } = get();
+    const draft = domainDrafts[domain];
+    if (!draft?.name.trim()) return;
+
+    useUiStore.getState().setBusy(true);
+    useUiStore.getState().setError("");
+
+    try {
+      await api.put(`/api/operation-domains/${domain}`, domainPayload(draft));
+      await get().loadDomains();
+    } catch (error) {
+      useUiStore.getState().setError(error instanceof Error ? error.message : String(error));
+    } finally {
+      useUiStore.getState().setBusy(false);
+    }
+  },
+
+  resetOperationDomain: async (domain) => {
+    useUiStore.getState().setBusy(true);
+    useUiStore.getState().setError("");
+
+    try {
+      await api.post(`/api/operation-domains/${domain}/reset`);
+      await get().loadDomains();
+    } catch (error) {
+      useUiStore.getState().setError(error instanceof Error ? error.message : String(error));
+    } finally {
+      useUiStore.getState().setBusy(false);
+    }
   }
 }));

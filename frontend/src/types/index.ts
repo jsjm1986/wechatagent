@@ -352,3 +352,37 @@ export type SimulationTurn = {
   memoryPreview: Record<string, unknown>;
   stateTransition: Record<string, unknown>;
 };
+
+export type DomainKey = "user_operations" | "group_operations" | "moment_operations";
+
+export type OperationDomainConfig = {
+  id: string;
+  domain: DomainKey;
+  name: string;
+  goal: string;
+  methodology: string;
+  workflow: string;
+  toolPolicy: string;
+  automationPolicy: string;
+  reviewPolicy: string;
+  runtimeParameters: Record<string, unknown>;
+  stateMachine: Record<string, unknown>;
+  status: string;
+  updatedAt?: string;
+  version?: number;
+  currentVersion?: boolean;
+  previousVersion?: number | null;
+  seededBy?: string | null;
+};
+
+export type OperationDomainDraft = {
+  name: string;
+  goal: string;
+  methodology: string;
+  workflow: string;
+  toolPolicy: string;
+  automationPolicy: string;
+  reviewPolicy: string;
+  runtimeParameters: string;
+  stateMachine: string;
+};

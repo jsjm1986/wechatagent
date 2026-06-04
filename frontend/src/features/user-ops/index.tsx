@@ -15,44 +15,12 @@ import { useContactStore } from "../../stores/contactStore";
 import { useAccountStore } from "../../stores/accountStore";
 import { useUiStore } from "../../stores/uiStore";
 import type {
-  Contact
+  Contact,
+  DomainKey,
+  OperationDomainConfig,
+  OperationDomainDraft
 } from "../../types";
 import { useMemo } from "react";
-
-// 临时类型定义（这些应该最终移到types中）
-type DomainKey = "user_operations" | "group_operations" | "moment_operations";
-
-type OperationDomainConfig = {
-  id: string;
-  domain: DomainKey;
-  name: string;
-  goal: string;
-  methodology: string;
-  workflow: string;
-  toolPolicy: string;
-  automationPolicy: string;
-  reviewPolicy: string;
-  runtimeParameters: Record<string, unknown>;
-  stateMachine: Record<string, unknown>;
-  status: string;
-  updatedAt?: string;
-  version?: number;
-  currentVersion?: boolean;
-  previousVersion?: number | null;
-  seededBy?: string | null;
-};
-
-type OperationDomainDraft = {
-  name: string;
-  goal: string;
-  methodology: string;
-  workflow: string;
-  toolPolicy: string;
-  automationPolicy: string;
-  reviewPolicy: string;
-  runtimeParameters: string;
-  stateMachine: string;
-};
 
 // 辅助函数
 function emptyDomainDraft(): OperationDomainDraft {
@@ -69,8 +37,8 @@ function emptyDomainDraft(): OperationDomainDraft {
   };
 }
 
-function operationDomainByKey(configs: OperationDomainConfig[], domain: string) {
-  return configs.find((config) => config.domain === domain);
+function operationDomainByKey(configs: OperationDomainConfig[] | undefined, domain: string) {
+  return configs?.find((config) => config.domain === domain);
 }
 
 export default function UserOpsFeature() {
@@ -105,6 +73,9 @@ export default function UserOpsFeature() {
     editingPlaybookId,
     guideBusy,
     simulationBusy,
+    // Domain 配置相关
+    operationDomains,
+    domainDrafts,
     // Actions
     setUserOpsMode,
     setSmartOpsTab,
@@ -117,9 +88,11 @@ export default function UserOpsFeature() {
     setPlaybookDraft,
     setGeneratePlaybookText,
     setOptimizePlaybookText,
+    setDomainDrafts,
     hydrateSelected,
     loadMessages,
     loadPlaybooks,
+    loadDomains,
     // 15个业务回调
     enableAgent,
     disableAgent,
@@ -136,7 +109,10 @@ export default function UserOpsFeature() {
     generatePlaybook,
     setDefaultPlaybook,
     editPlaybook,
-    newPlaybookDraft
+    newPlaybookDraft,
+    // Domain 配置业务方法
+    saveOperationDomain,
+    resetOperationDomain
   } = userOpsStore;
 
   const { contacts, selected, contactTab, setSelected, setContactTab } = contactStore;
@@ -191,11 +167,6 @@ export default function UserOpsFeature() {
   const query = "";
   const setQuery = () => {};
 
-  // 占位数据 - operationDomains（settings tab 的 domain 配置尚未迁移到独立 store）
-  const operationDomains: OperationDomainConfig[] = [];
-  const domainDrafts: Record<string, OperationDomainDraft> = {};
-  const setDomainDrafts = (_drafts: Record<string, OperationDomainDraft>) => {};
-
   const pendingTasks = tasks.filter((task) => task.status === "pending").length;
 
   // 占位函数
@@ -208,10 +179,6 @@ export default function UserOpsFeature() {
     await loadMessages(contact);
   };
 
-  // settings tab 的 domain 配置回调（domain store 尚未迁移，暂保留无操作）
-  const resetOperationDomain = async (_domain: string) => {};
-  const saveOperationDomain = async (_domain: string) => {};
-
   // 挂载时加载剧本
   useEffect(() => {
     const accountId = currentAccountId();
@@ -220,12 +187,13 @@ export default function UserOpsFeature() {
     }
   }, [currentAccountId, loadPlaybooks]);
 
-  // 切到 traditional 模式时加载 souls/promptTemplates（prompts tab 复用 strategyStore）
+  // 切到 traditional 模式时加载 souls/promptTemplates（prompts tab 复用 strategyStore）和 domains
   useEffect(() => {
     if (userOpsMode === "traditional") {
       void loadStrategyData();
+      void loadDomains();
     }
-  }, [userOpsMode, loadStrategyData]);
+  }, [userOpsMode, loadStrategyData, loadDomains]);
 
   // 选中联系人变化时的处理
   useEffect(() => {
@@ -359,12 +327,12 @@ export default function UserOpsFeature() {
             <DomainConfigEditor
               busy={busy}
               config={operationDomainByKey(operationDomains, "user_operations")}
-              draft={domainDrafts.user_operations ?? emptyDomainDraft()}
+              draft={domainDrafts?.user_operations ?? emptyDomainDraft()}
               mode="primary"
-              onDraft={(draft) => setDomainDrafts({ ...domainDrafts, user_operations: draft })}
+              onDraft={(draft) => setDomainDrafts({ ...(domainDrafts || {}), user_operations: draft })}
               onReset={() => void resetOperationDomain("user_operations")}
               onSave={() => void saveOperationDomain("user_operations")}
-              onAfterVersionAction={loadAll}
+              onAfterVersionAction={loadDomains}
             />
           )}
 
