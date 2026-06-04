@@ -1,0 +1,78 @@
+/* 任务与日志 —— 落地 apple-liquid-alive：实色白卡 + 语义色 + tokens.css 变量。
+   button 显式重置，避免全局 styles.css 裸 button 规则污染（蓝底/居中/min-height）。 */
+
+.page { position: relative; }
+
+.panel {
+  border-radius: var(--r-lg); padding: 22px 26px 18px;
+  background: var(--surface-card); border: 1px solid var(--hairline);
+  box-shadow: 0 14px 34px -24px rgba(20,30,60,.3), inset 0 1px 1px rgba(255,255,255,.9);
+}
+
+.head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 16px; }
+.headL { display: flex; flex-direction: column; gap: 2px; }
+.eyebrow { font-size: 11px; color: var(--ink-3); font-weight: 600; letter-spacing: .2px; text-transform: uppercase; }
+.title { font-size: 15px; color: var(--ink-1); font-weight: 600; letter-spacing: -.3px; }
+.clock { width: 32px; height: 32px; border-radius: 10px; display: flex; align-items: center; justify-content: center; color: var(--ink-3); background: var(--fill-scheduled); }
+
+/* 子 tab —— button 全量重置 */
+.tabs { display: flex; gap: 6px; margin-bottom: 18px; flex-wrap: wrap; }
+.tab {
+  font: inherit; font-size: 12.5px; font-weight: 600; letter-spacing: -.1px;
+  padding: 7px 15px; border-radius: 20px; cursor: pointer; min-height: 0;
+  background: transparent; border: 1px solid var(--hairline); color: var(--ink-2);
+  box-shadow: none; justify-content: flex-start; transition: background .18s, color .18s, border-color .18s;
+}
+.tab:hover { background: rgba(0,0,0,.03); color: var(--ink-1); }
+.tabActive, .tabActive:hover {
+  background: var(--fill-scheduled); border-color: rgba(10,132,255,.28); color: var(--color-scheduled);
+  box-shadow: inset 0 1px 1px rgba(255,255,255,.6);
+}
+
+/* 数据表 */
+.table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+.table th {
+  text-align: left; font-weight: 600; color: var(--ink-3); font-size: 11px; letter-spacing: .1px;
+  padding: 9px 12px; border-bottom: 1px solid var(--hairline); white-space: nowrap;
+}
+.table td { padding: 11px 12px; border-bottom: 1px solid var(--hairline); color: var(--ink-1); letter-spacing: -.1px; vertical-align: top; }
+.table tbody tr:last-child td { border-bottom: none; }
+.table tbody tr { transition: background .15s; }
+.table tbody tr:hover { background: rgba(0,0,0,.02); }
+.cellMuted { color: var(--ink-3); }
+.cellNum { font-variant-numeric: tabular-nums; color: var(--ink-2); }
+
+/* LLM 成本统计卡 */
+.usageGrid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 14px; margin-bottom: 18px; }
+.usageCard {
+  border-radius: var(--r-md); padding: 16px 18px;
+  background: var(--surface-card); border: 1px solid var(--hairline);
+  box-shadow: inset 0 1px 1px rgba(255,255,255,.9);
+}
+.usageK { font-size: 11.5px; color: var(--ink-3); font-weight: 500; letter-spacing: -.1px; }
+.usageV { font-size: 28px; font-weight: 680; letter-spacing: -.6px; margin-top: 6px; line-height: 1; color: var(--ink-1); font-variant-numeric: tabular-nums; }
+.usageV.key { color: var(--color-scheduled); }
+
+/* 事件时间线 */
+.timeline { list-style: none; margin: 0; padding: 0; position: relative; }
+.tItem { position: relative; padding: 0 0 18px 24px; }
+.tItem:last-child { padding-bottom: 0; }
+.tItem::before {
+  content: ""; position: absolute; left: 5px; top: 16px; bottom: -2px; width: 1px; background: var(--hairline);
+}
+.tItem:last-child::before { display: none; }
+.tDot { position: absolute; left: 0; top: 5px; width: 11px; height: 11px; border-radius: 50%; border: 2px solid var(--surface-card); background: var(--color-inactive); }
+.tItem.good .tDot { background: var(--color-running); }
+.tItem.warn .tDot { background: var(--color-held); }
+.tItem.error .tDot { background: var(--color-blocked); }
+.tItem.ai .tDot { background: var(--color-brand); }
+.tCard { }
+.tHead { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; }
+.tHead strong { font-size: 13px; color: var(--ink-1); font-weight: 600; letter-spacing: -.2px; }
+.tHead span { font-size: 11px; color: var(--ink-3); letter-spacing: -.1px; flex-shrink: 0; }
+.tCard p { margin: 4px 0 0; font-size: 12.5px; color: var(--ink-2); letter-spacing: -.1px; }
+.tChips { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+.tChips span {
+  font-size: 10.5px; font-weight: 500; color: var(--ink-3); padding: 2px 9px; border-radius: 20px;
+  background: var(--fill-inactive); border: 1px solid var(--hairline);
+}

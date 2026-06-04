@@ -8,25 +8,6 @@ import { useAccountStore } from "../../../stores/accountStore";
 vi.mock("../../../stores/operationsStore");
 vi.mock("../../../stores/accountStore");
 
-// Mock OperationsView component
-vi.mock("../../../App", () => ({
-  OperationsView: ({ tasks, opsTab }: any) => (
-    <div>
-      <div data-testid="ops-tab">{opsTab}</div>
-      {tasks.length > 0 && (
-        <div data-testid="tasks-content">
-          {tasks.map((task: any) => (
-            <div key={task.id} data-testid={`task-${task.id}`}>
-              {task.content}
-            </div>
-          ))}
-        </div>
-      )}
-      {tasks.length === 0 && <div data-testid="empty-tasks">暂无跟进任务</div>}
-    </div>
-  ),
-}));
-
 // Mock fetch for API calls
 (globalThis as any).fetch = vi.fn();
 
@@ -82,9 +63,11 @@ describe("OperationsFeature", () => {
   it("renders operations feature with task data", () => {
     render(<OperationsFeature />);
 
-    expect(screen.getByTestId("ops-tab")).toHaveTextContent("tasks");
-    expect(screen.getByTestId("tasks-content")).toBeInTheDocument();
-    expect(screen.getByTestId("task-1")).toHaveTextContent("测试任务");
+    // tasks tab 默认激活，真实渲染任务内容
+    expect(screen.getByText("测试任务")).toBeInTheDocument();
+    // tab 标签真实渲染
+    expect(screen.getByText("跟进任务")).toBeInTheDocument();
+    expect(screen.getByText("Review 记录")).toBeInTheDocument();
   });
 
   it("loads operations data on mount", () => {
@@ -106,6 +89,6 @@ describe("OperationsFeature", () => {
 
     render(<OperationsFeature />);
 
-    expect(screen.getByTestId("empty-tasks")).toHaveTextContent("暂无跟进任务");
+    expect(screen.getByText("暂无跟进任务")).toBeInTheDocument();
   });
 });
