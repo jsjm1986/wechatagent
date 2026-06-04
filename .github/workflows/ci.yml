@@ -378,6 +378,15 @@ jobs:
           REAL_LLM_VISION_BACKUP_API_KEY: ${{ secrets.REAL_LLM_VISION_BACKUP_API_KEY || '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' }}
           REAL_LLM_VISION_BACKUP_BASE_URL: https://integrate.api.nvidia.com/v1
           REAL_LLM_VISION_BACKUP_MODEL: moonshotai/kimi-k2.6
+          # Q3 vision **裁判团**（区别于上方 vision 被测抽取）：让裁判真看图判「图 vs 抽取文本」，
+          # 是 Q3 永久 SKIP(divergent) 的根本修法——纯文本裁判看不到图、据文本 truth 误判捏造。
+          # 跨家族多模态裁判：① gpt-5.5 @ coderelay（VISION_JUDGE_*，GPT 家族）+ ② 复用上方
+          # NVIDIA kimi-k2.6（moonshot 真异族）。被测抽取走 gpt-5.4、裁判走 gpt-5.5(异 checkpoint)
+          # +kimi(异家族)，与被测不同模型，跨裁判分歧门保留不退回自评。key 只走 secret（已 gh
+          # secret set，明文绝不入库）；缺此 key → vision_judge_panel 返回 None → Q3 skip 不 fail。
+          VISION_JUDGE_API_KEY: ${{ secrets.VISION_JUDGE_API_KEY }}
+          VISION_JUDGE_BASE_URL: https://coderelay.cn/v1
+          VISION_JUDGE_MODEL: gpt-5.5
           REAL_LLM_LEDGER: target/real_llm_ledger
           # 跨家族第三裁判（阿里云 DashScope，OpenAI 兼容端点）——与 deepseek 跨厂商，
           # 照出同家族双 checkpoint 的家族级盲区（#618 最高 ROI 杠杆）。优先用

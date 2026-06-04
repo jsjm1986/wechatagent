@@ -434,6 +434,7 @@ async fn judge_quality(
     model_output: &str,
     ground_truth: &str,
     dims: &[&str],
+    image_base64: Option<&str>,
 ) -> AppResult<JudgeScore> {
     let system = format!(
         "你是严格的私域运营知识内容质检员。针对给定任务，对【模型输出】按【评分维度】\
@@ -446,7 +447,13 @@ async fn judge_quality(
         "## 任务\n{task}\n\n## 评分维度\n{dims_joined}\n\n## 参考事实(ground truth)\n{ground_truth}\n\n## 模型输出\n{model_output}\n",
         dims_joined = dims.join("、"),
     );
-    let value = llm.generate_json(&system, &user).await?;
+    // 有图（Q3 vision 题）→ 走多模态裁判：把原图一并喂裁判，让它直接对比「图 vs 抽取文本」
+    // 的保真/覆盖，不再依赖文本 ground-truth 当唯一基准（消除纯文本裁判「无参考→判捏造」根因）。
+    // 无图（纯文本 Q）→ 走原 generate_json，行为完全不变。
+    let value = match image_base64 {
+        Some(img) => llm.generate_json_with_image(&system, &user, img, "image/png").await?,
+        None => llm.generate_json(&system, &user).await?,
+    };
     Ok(parse_judge_value(&value))
 }
 
@@ -631,6 +638,56 @@ fn hetero_qwen_judge() -> Option<QualityJudge> {
     })
 }
 
+/// Q3 vision 专用裁判团：**跨家族多模态**裁判，真看图判「图 vs 抽取文本」的保真/覆盖。
+///
+/// 为何不复用文本 quality_judge_panel：那是纯文本裁判（deepseek/qwen 文本），看不到图、
+/// 只能据文本 ground-truth 判分——正是 Q3 永久 SKIP(divergent) 的根因。这里换成能读图的
+/// vision 模型，每个走 generate_json_with_image（judge_quality 传 Some(image)）。
+///
+/// 跨家族独立性（核心防线，不退回单裁判自评）：
+///   - 裁判① gpt-5.5 @ coderelay（GPT 家族；VISION_JUDGE_API_KEY）；
+///   - 裁判② kimi-k2.6 @ NVIDIA（moonshot 家族，真异族；复用 REAL_LLM_VISION_BACKUP_*）。
+/// 被测 Q3 抽取走 gpt-5.4，裁判用 gpt-5.5(异 checkpoint)+kimi(异家族)，与被测不同模型，
+/// decide_quality 跨裁判分歧门照常生效。两端点各裹 wrap_with_failover 抗瞬时抖动。
+///
+/// 缺主 vision 裁判 key（VISION_JUDGE_API_KEY）→ None（调用方 skip，不构造不可靠裁判）。
+/// 缺异族备胎 key → 退化为单 vision 裁判（仍可判分，但跨家族分歧门失效，记一句告警）。
+fn vision_judge_panel() -> Option<Vec<QualityJudge>> {
+    let g_key = std::env::var("VISION_JUDGE_API_KEY")
+        .ok()
+        .filter(|k| !k.trim().is_empty())?;
+    let g_base = std::env::var("VISION_JUDGE_BASE_URL")
+        .unwrap_or_else(|_| "https://coderelay.cn/v1".to_string());
+    let g_model = std::env::var("VISION_JUDGE_MODEL").unwrap_or_else(|_| "gpt-5.5".to_string());
+    let g = LlmClient::new(g_base, g_key, g_model, 180, primary_max_retries(), 2500).ok()?;
+    let mut panel = vec![QualityJudge {
+        label: "gpt5.5-vision",
+        client: wrap_with_failover("gpt5.5-vision".to_string(), Arc::new(g)),
+    }];
+    // 异族多模态裁判：kimi-k2.6 @ NVIDIA（moonshot 家族，与 GPT 跨家族）。复用 vision 备胎 env。
+    if let Ok(k_key) = std::env::var("REAL_LLM_VISION_BACKUP_API_KEY") {
+        if !k_key.trim().is_empty() {
+            let k_base = std::env::var("REAL_LLM_VISION_BACKUP_BASE_URL")
+                .unwrap_or_else(|_| "https://integrate.api.nvidia.com/v1".to_string());
+            let k_model = std::env::var("REAL_LLM_VISION_BACKUP_MODEL")
+                .unwrap_or_else(|_| "moonshotai/kimi-k2.6".to_string());
+            if let Ok(k) = LlmClient::new(k_base, k_key, k_model, 180, primary_max_retries(), 2500) {
+                panel.push(QualityJudge {
+                    label: "kimi-vision-hetero",
+                    client: wrap_with_failover("kimi-vision-hetero".to_string(), Arc::new(k)),
+                });
+            }
+        }
+    }
+    if panel.len() < 2 {
+        eprintln!(
+            "[vision 裁判团] 未配置 REAL_LLM_VISION_BACKUP_API_KEY，仅单 vision 裁判（gpt5.5）；\
+             跨家族分歧门失效——配置异族多模态 key 可启用跨家族裁判照出家族级盲区"
+        );
+    }
+    Some(panel)
+}
+
 // ── 校准层 · 每能力金标 good/bad 校准对（与被测文档解耦，防过拟合）──────────────────
 //
 // 病灶：旧 `judge_calibrated` 只有一对**通用退款**锚，没校准 Q5 的 coverage_accuracy、
@@ -800,6 +857,7 @@ async fn run_quality_panel(
     model_output: &str,
     ground_truth: &str,
     dims: &[&str],
+    image_base64: Option<&str>,
 ) -> Option<PanelOutcome> {
     // panel × K 全并发。
     let mut futs = Vec::new();
@@ -810,9 +868,10 @@ async fn run_quality_panel(
             let mo = model_output.to_string();
             let gt = ground_truth.to_string();
             let ds: Vec<String> = dims.iter().map(|s| s.to_string()).collect();
+            let img = image_base64.map(|s| s.to_string());
             futs.push(async move {
                 let ds_ref: Vec<&str> = ds.iter().map(|s| s.as_str()).collect();
-                (ji, judge_quality(client.as_ref(), &t, &mo, &gt, &ds_ref).await)
+                (ji, judge_quality(client.as_ref(), &t, &mo, &gt, &ds_ref, img.as_deref()).await)
             });
         }
     }
@@ -907,11 +966,11 @@ async fn panel_calibrated(panel: &[QualityJudge], qid: &str, anchor: &CalibAncho
         for _ in 0..CALIB_RUNS {
             let c = j.client.clone();
             good_futs.push(async move {
-                judge_quality(c.as_ref(), anchor.task, anchor.good, anchor.truth, anchor.dims).await
+                judge_quality(c.as_ref(), anchor.task, anchor.good, anchor.truth, anchor.dims, None).await
             });
             let c = j.client.clone();
             bad_futs.push(async move {
-                judge_quality(c.as_ref(), anchor.task, anchor.bad, anchor.truth, anchor.dims).await
+                judge_quality(c.as_ref(), anchor.task, anchor.bad, anchor.truth, anchor.dims, None).await
             });
         }
         let goods = join_all(good_futs).await;
@@ -981,13 +1040,14 @@ async fn evaluate_quality_panel(
     ground_truth: &str,
     dims: &[&str],
     anchor: &CalibAnchor,
+    image_base64: Option<&str>,
 ) -> AppResult<QualityVerdict> {
     if !panel_calibrated(panel, qid, anchor).await? {
         let v = QualityVerdict::SkipCalib;
         ledger_verdict(qid, scene, &v);
         return Ok(v);
     }
-    let outcome = match run_quality_panel(panel, qid, scene, task, model_output, ground_truth, dims).await {
+    let outcome = match run_quality_panel(panel, qid, scene, task, model_output, ground_truth, dims, image_base64).await {
         Some(o) => o,
         None => {
             return Err(wechatagent::error::AppError::LlmUnavailable {
@@ -1072,9 +1132,43 @@ macro_rules! judge_quality_panel {
                 $truth,
                 q_dims($qid),
                 calib_anchor_for($qid),
+                None,
             )
             .await,
             concat!($qid, " 双裁判校准判分")
+        );
+        handle_verdict($qid, $scene, verdict);
+    }};
+}
+
+/// Q3 vision 专用：裁判团换成**跨家族多模态裁判**（vision_judge_panel），并把**原图**一并
+/// 喂给裁判，让它直接对比「图 vs 抽取文本」的保真/覆盖——纯文本裁判看不到图、只能据文本
+/// ground-truth 判分，是 Q3 永久 SKIP(divergent) 的根因。多模态裁判真看图后该根因消除，
+/// 且仍是跨家族多裁判（保留 decide_quality 跨裁判分歧门，不退回单裁判自评）。
+/// 缺 vision 裁判 key → skip（不构造不可靠裁判，不算被测对象失败）。
+macro_rules! judge_quality_panel_vision {
+    ($qid:expr, $scene:expr, $task:expr, $output:expr, $truth:expr, $image:expr) => {{
+        let panel = match vision_judge_panel() {
+            Some(p) => p,
+            None => {
+                eprintln!("[QUALITY][{}/{}] skip: 无法构造 vision 裁判团（缺 VISION_JUDGE_API_KEY）", $qid, $scene);
+                return;
+            }
+        };
+        let verdict = unwrap_or_skip_transient!(
+            evaluate_quality_panel(
+                &panel,
+                $qid,
+                $scene,
+                $task,
+                $output,
+                $truth,
+                q_dims($qid),
+                calib_anchor_for($qid),
+                Some($image),
+            )
+            .await,
+            concat!($qid, " vision 裁判校准判分")
         );
         handle_verdict($qid, $scene, verdict);
     }};
@@ -1769,6 +1863,7 @@ async fn q2_article_extraction_quality() {
                     &model_output,
                     spec.content,
                     q_dims("Q2"),
+                    None,
                 )
                 .await
                 {
@@ -1969,24 +2064,24 @@ async fn q3_vision_extraction_quality() {
         eprintln!("[q3] vision 未抽出任何 chunk（真模型软能力，红线真空成立），跳过 judge");
         return;
     }
-    judge_quality_panel!(
+    // Q3 走**跨家族多模态裁判团**：把原图一并喂裁判，裁判直接看图对比抽取文本的保真/覆盖。
+    // 这是比「给纯文本裁判补 OCR-truth」更根本的修法——裁判真看图，图本身即 ground-truth，
+    // 消除纯文本裁判「无参考文本→判捏造」的根因（Q3 永久 SKIP 的病根）。仍是跨家族多裁判
+    // （gpt5.5 + 异族 kimi），decide_quality 跨裁判分歧门保留，不退回单裁判自评。
+    // truth 文本降级为**辅助对照**（OCR 自图片，非倒推）：裁判以所见图为准，truth 仅作交叉校验。
+    judge_quality_panel_vision!(
         "Q3",
         "vision_terms",
-        "评估 AI 从一张中文条款图片里抽取的知识：文字识别是否保真、图中每个信息单元\
-是否被穷尽覆盖、有无编造图中没有的内容。",
+        "你将看到一张中文条款图片，以及 AI 从该图抽取的知识文本。请对照图片本身评估抽取：\
+文字识别是否保真、图中每个信息单元是否被穷尽覆盖、有无编造图中没有的内容。以图为准判分。",
         &extracted_bodies.join("\n"),
-        // truth 携带图中真实条款 ground-truth（OCR 自图片客观提取，非倒推标注）：三把裁判
-        // 均为纯文本模型、看不到图，若 truth 只给评判标准而无事实基准，异族裁判会把「无参考
-        // 文本可比对」误判成「凭空捏造」全判低，与同族裁判的「看着像条款」分歧→永久 SKIP。
-        // 给定客观事实文本后，三裁判才有共同基准评「抽取 vs 真实条款」的保真/覆盖。
-        // 事实忠实于 tests/fixtures/k6_article_image.b64 图片内容，不增删。
-        "图片为一张《企业版服务条款摘要》中文文章图，含四节客观事实：\
-1) 退款政策：下单后 7 天内可无理由退款（需商品完好），超 7 天按损耗比例处理、不退现金；\
-2) 服务可用性 SLA：承诺 99.95% 月度可用性，低于 99.9% 赔付当月服务费 30%、低于 99.5% 赔付 50%；\
-3) 实施周期：标准实施 2 到 4 周，前两周梳理流程接通试点、后两周扩到核心场景；\
-4) 对接方式：支持 OpenAPI 与 Webhook 两种对接，提供沙箱与示例代码。\
-理想抽取应逐条覆盖上述每个条款/字段、保留原文关键表述与数字，且不编造图里没有的内容；\
-评判保真度与覆盖度以上述事实为准（被测输出与之相符即保真，遗漏某节即扣覆盖度）。"
+        // 辅助对照（裁判已能看图，truth 仅作交叉校验，非唯一基准）；OCR 自图片客观提取，非倒推。
+        "（辅助对照，以你所见图片为准）图片为《企业版服务条款摘要》，含四节：\
+1) 退款政策：7 天内可无理由退款（需商品完好），超 7 天按损耗比例、不退现金；\
+2) SLA：承诺 99.95% 月度可用性，低于 99.9% 赔 30%、低于 99.5% 赔 50%；\
+3) 实施周期：2 到 4 周，前两周梳理流程接通试点、后两周扩到核心场景；\
+4) 对接方式：支持 OpenAPI 与 Webhook，提供沙箱与示例代码。",
+        Q3_ARTICLE_IMAGE_BASE64.trim()
     );
 }
 
