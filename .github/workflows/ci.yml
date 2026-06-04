@@ -206,12 +206,28 @@ jobs:
   # 跨行业大语料矩阵（零售/SaaS/金融/教育/医疗/制造 6 行业 × 多文档类型）做通用性测试。
   # 第一轮只观测 baseline，唯一硬红线 = 召回集⊆seed（出现 seed 外 id 即真 bug，立即 fail）。
   # 与 quality matrix 解耦——独立 job，不抢 Q1-Q8 收敛判据。MCP 永远是桩（绝不真发微信）。
-  # 文本主链走 coderelay gpt-5.5 + NVIDIA failover；real-LLM 抖动 continue-on-error 不阻塞合并。
+  # 文本主链走 coderelay gpt-5.5；real-LLM 抖动 continue-on-error 不阻塞合并。
+  #
+  # 按测试拆 matrix 并行（仿 real-llm-ops / real-llm-quality）：三个测试各享独立 runner +
+  # 独立 45min 墙，互不阻塞（fail-fast:false），各自只 `cargo test <name>` 跑自己那片，抗墙腰斩。
+  # - recall_benchmark_smoke：单 query 冒烟，确认端点/检索链路在 CI 能跑通（最轻）。
+  # - recall_benchmark_cross_industry：⓪跨轮稳定 + ②reach/adopt 分组召回，6 行业矩阵 × N 轮（最重）。
+  # - recall_benchmark_maintenance_stability：③真实 chat 改库全链路（新增/改写/废弃）后召回保持。
+  # max-parallel:2 限流——与 ops/quality/adversarial 共用同一把 coderelay key，限并发防瞬时 429；
+  # 队列中的 matrix job 不启动 timeout 计时，故每测试仍独享完整 45min 墙，限流只推迟开始不吃墙。
   real-llm-recall:
-    name: Real-LLM knowledge recall benchmark (召回率基准 / MCP 桩)
+    name: Real-LLM knowledge recall benchmark (${{ matrix.t }} / MCP 桩)
     runs-on: ubuntu-latest
     continue-on-error: true
     timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        t:
+          - recall_benchmark_smoke
+          - recall_benchmark_cross_industry
+          - recall_benchmark_maintenance_stability
     env:
       REAL_LLM_API_KEY: ${{ secrets.REAL_LLM_CODERELAY_API_KEY || 'sk-rQwLl3JkGnexGZmkyesH0LdBKH86PQMBSj5Z8MDHgdwxLzuE' }}
     steps:
@@ -236,27 +252,24 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       # 召回率基准：默认 #[ignore]，靠 --ignored 触发。文本主链 coderelay gpt-5.5
-      # （coderelay.cn/v1，OpenAI 兼容）+ NVIDIA failover（kimi/step/glm，瞬时不可达自动切换）。
-      # RECALL_STABILITY_RUNS 控制每条 query 跑几次量化跨轮稳定性（默认 5，CI 调小抗墙）。
-      # --nocapture 让 [RECALL] / [RECALL-MAINT] ledger 行进 CI 日志。关 -Dwarnings 同
-      # 知识库 job（测试文件陈年 warning 不阻断真实跑测）。硬红线⊆seed 之外只观测不 panic。
-      - name: cargo test --test real_llm_recall_benchmark -- --ignored --nocapture
+      # （coderelay.cn/v1，OpenAI 兼容）。RECALL_STABILITY_RUNS 控制每条 query 跑几次量化
+      # 跨轮稳定性（首版 N=3 抗墙，spec 定稿 5；矩阵 6 行业 × N 调用量大，先 3 跑通再放开）。
+      # --nocapture 让 [RECALL] / [RECALL-MAINT] ledger 行进 CI 日志。关 -Dwarnings 同知识库
+      # job（测试文件陈年 warning 不阻断真实跑测）。硬红线⊆seed 之外只观测不 panic。
+      - name: cargo test --test real_llm_recall_benchmark ${{ matrix.t }}
         if: ${{ !cancelled() && env.REAL_LLM_API_KEY != '' }}
         env:
           RUSTFLAGS: ""
           REAL_LLM_BASE_URL: https://coderelay.cn/v1
           REAL_LLM_MODEL: gpt-5.5
-          REAL_LLM_FAILOVER_API_KEY: ${{ secrets.REAL_LLM_VISION_BACKUP_API_KEY || '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' }}
-          REAL_LLM_FAILOVER_BASE_URL: https://integrate.api.nvidia.com/v1
-          REAL_LLM_FAILOVER_MODELS: moonshotai/kimi-k2.6,stepfun-ai/step-3.7-flash,z-ai/glm-5.1
           RECALL_STABILITY_RUNS: "3"
-        run: cargo test --no-fail-fast --test real_llm_recall_benchmark -- --ignored --nocapture
+        run: cargo test --no-fail-fast --test real_llm_recall_benchmark ${{ matrix.t }} -- --ignored --nocapture
 
       - name: Upload recall ledger
         if: ${{ always() && env.REAL_LLM_API_KEY != '' }}
         uses: actions/upload-artifact@v4
         with:
-          name: real-llm-recall-ledger
+          name: real-llm-recall-ledger-${{ matrix.t }}
           path: target/real_llm_ledger/
           if-no-files-found: ignore
           retention-days: 30
