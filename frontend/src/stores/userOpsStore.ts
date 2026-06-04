@@ -85,6 +85,7 @@ interface UserOpsActions {
   hydrateSelected: (contact: Contact) => void;
   loadMessages: (contact: Contact) => Promise<void>;
   loadPlaybooks: (accountId: string) => Promise<void>;
+  loadContacts: (accountId: string) => Promise<void>;
   loadDomains: () => Promise<void>;
 
   // 15个业务回调
@@ -323,6 +324,11 @@ export const useUserOpsStore = create<UserOpsState & UserOpsActions>((set, get) 
     } catch (error) {
       useUiStore.getState().setError(error instanceof Error ? error.message : String(error));
     }
+  },
+
+  // 加载（切账号 / 挂载时）联系人列表——用户运营页主体数据，复用模块内 refreshContacts
+  loadContacts: async (accountId) => {
+    await refreshContacts(accountId || null);
   },
 
   // 加载 Domain 配置

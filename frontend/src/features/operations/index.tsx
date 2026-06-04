@@ -24,10 +24,14 @@ export default function OperationsFeature() {
     loadOperationsData
   } = useOperationsStore();
 
-  const { currentAccountId } = useAccountStore();
+  const currentAccountId = useAccountStore((s) =>
+    s.accounts.some((a) => a.accountId === s.selectedAccountId)
+      ? s.selectedAccountId
+      : s.accounts[0]?.accountId ?? ""
+  );
 
   useEffect(() => {
-    loadOperationsData(currentAccountId());
+    loadOperationsData(currentAccountId);
   }, [loadOperationsData, currentAccountId]);
 
   return (

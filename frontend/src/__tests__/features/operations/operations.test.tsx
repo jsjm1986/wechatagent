@@ -63,9 +63,18 @@ describe("OperationsFeature", () => {
       loadOperationsData: mockLoadOperationsData,
     });
 
-    (useAccountStore as any).mockReturnValue({
+    // accountStore 既被 selector 形式订阅（effectiveAccountId 派生原始值），
+    // 也被整对象解构使用——mock 同时支持两种调用。
+    const accountState = {
+      accounts: [
+        { id: "test-account-id", accountId: "test-account-id", alias: "测试", displayName: "测试", online: true },
+      ],
+      selectedAccountId: "test-account-id",
       currentAccountId: mockCurrentAccountId,
-    });
+    };
+    (useAccountStore as any).mockImplementation((selector?: any) =>
+      typeof selector === "function" ? selector(accountState) : accountState
+    );
 
     mockCurrentAccountId.mockReturnValue("test-account-id");
   });

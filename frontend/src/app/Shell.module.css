@@ -1,9 +1,13 @@
 .shell { display: flex; min-height: 100vh; background: var(--surface-page); }
 
-/* 侧栏：从顶（品牌）到底（用户）贯通的 flex 列 */
+/* 侧栏：从顶（品牌）到底（用户）贯通的 flex 列。
+   易读基调=白卡基底，但底色微调冷（near-white 渐变）让激活白卡能浮起；
+   右缘 + 内嵌高光是玻璃"点缀"，给一张平白侧栏立体感。 */
 .side {
   width: 252px; flex-shrink: 0; padding: 22px 16px 18px;
-  border-right: 1px solid var(--hairline); background: var(--surface-card);
+  background: linear-gradient(176deg, #fbfcfe 0%, #f4f6fa 100%);
+  border-right: 1px solid var(--hairline);
+  box-shadow: inset -1px 0 1px rgba(255,255,255,.7), 1px 0 0 rgba(0,0,0,.012);
   display: flex; flex-direction: column;
   position: sticky; top: 0; height: 100vh;
 }
@@ -23,35 +27,100 @@
 .brandText b { font-size: 16px; color: var(--ink-1); font-weight: 600; letter-spacing: -.45px; }
 .brandText span { font-size: 10.5px; color: var(--ink-3); font-weight: 500; letter-spacing: .2px; }
 
+/* 账号切换器：整合进底部卡，账号行（触发器自带在线点 + 在线数 + 切换图标） */
+.acct { position: relative; }
+.acctCount { margin-left: auto; flex-shrink: 0; font-style: normal; font-weight: 600;
+  font-size: 10.5px; letter-spacing: -.1px; color: var(--color-running); }
+
+/* 触发器：侧栏原生一行（同导航项节奏，圆角留白对齐） */
+.acctTrigger {
+  display: flex; align-items: center; gap: 9px; width: 100%; cursor: pointer;
+  padding: 9px 12px; border-radius: var(--r-sm); min-height: 0; text-align: left;
+  font-size: 13px; font-weight: 600; font-family: inherit; color: var(--ink-1); letter-spacing: -.2px;
+  background: none; border: 1px solid transparent; box-shadow: none;
+  transition: background .15s ease;
+}
+.acctTrigger:hover { background: rgba(0,0,0,.03); border-color: transparent; box-shadow: none; transform: none; }
+.acctTriggerOpen, .acctTriggerOpen:hover { background: var(--fill-scheduled); }
+.acctTriggerName { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.acctChevron { flex-shrink: 0; color: var(--ink-4); }
+
+/* 在线圆点（触发器 + 选项共用） */
+.acctItemDot, .acctItemDotOff { width: 6px; height: 6px; border-radius: 50%; flex-shrink: 0; }
+.acctItemDot { background: var(--color-running); box-shadow: 0 0 5px 1px rgba(48,209,88,.5); }
+.acctItemDotOff { background: var(--color-inactive); }
+
+/* 菜单：向上弹出，对齐触发器宽度（侧栏内，不被裁切） */
+.acctMenu {
+  position: absolute; left: 0; right: 0; bottom: calc(100% + 6px);
+  padding: 5px; border-radius: var(--r-md); z-index: 30;
+  background: var(--surface-card); border: 1px solid var(--hairline);
+  box-shadow: 0 18px 44px -20px rgba(20,30,60,.4), 0 4px 14px -8px rgba(20,30,60,.18), inset 0 1px 1px rgba(255,255,255,.9);
+  max-height: 280px; overflow-y: auto;
+  animation: acctMenuIn .16s ease;
+}
+@keyframes acctMenuIn { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: translateY(0); } }
+.acctOption {
+  display: flex; align-items: center; gap: 9px; width: 100%; cursor: pointer;
+  padding: 8px 10px; border-radius: var(--r-sm); min-height: 0; text-align: left;
+  font-size: 13px; font-weight: 500; font-family: inherit; color: var(--ink-2); letter-spacing: -.2px;
+  background: none; border: 1px solid transparent; box-shadow: none;
+  transition: background .14s ease, color .14s ease;
+}
+.acctOption + .acctOption { margin-top: 1px; }
+.acctOption:hover { background: rgba(0,0,0,.04); color: var(--ink-1); border-color: transparent; box-shadow: none; transform: none; }
+.acctOptionActive, .acctOptionActive:hover { color: var(--ink-1); font-weight: 600; background: var(--fill-scheduled); }
+.acctOptionName { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.acctCheck { flex-shrink: 0; color: var(--color-scheduled); }
+
 /* 导航 */
-.nav { display: flex; flex-direction: column; gap: 0; flex: 1; overflow-y: auto; }
+.nav { display: flex; flex-direction: column; gap: 0; flex: 1; overflow-y: auto; overflow-x: hidden; }
 .group + .group { margin-top: 8px; }
 .groupLabel { font-size: 10.5px; color: var(--ink-4); font-weight: 600; letter-spacing: .8px;
   text-transform: uppercase; padding: 10px 12px 5px; }
 .channel {
   display: flex; align-items: center; justify-content: flex-start; gap: 11px;
-  padding: 8px 12px; border-radius: var(--r-sm); margin: 1px 0;
+  position: relative;
+  padding: 9px 12px; border-radius: var(--r-sm); margin: 2px 0;
   font-size: 13.5px; color: var(--ink-2); font-weight: 500; cursor: pointer;
   background: none; border: 1px solid transparent; text-align: left; width: 100%;
   font-family: inherit; letter-spacing: -.2px; min-height: 0; box-shadow: none;
-  transition: background .15s ease, color .15s ease;
+  transition: background .2s ease, color .2s ease, transform .12s ease, box-shadow .25s ease;
 }
-.channel:hover { background: rgba(0,0,0,.03); color: var(--ink-1); border-color: transparent; box-shadow: none; transform: none; }
-.channel svg { flex-shrink: 0; opacity: .55; }
-.active { color: var(--ink-1); font-weight: 600; background: var(--fill-scheduled); border-color: transparent; }
-.active:hover { background: var(--fill-scheduled); }
+.channel:hover { color: var(--ink-1); background: rgba(255,255,255,.62); border-color: transparent; box-shadow: none; transform: translateX(2px); }
+.channel svg { flex-shrink: 0; opacity: .5; transition: opacity .2s ease, color .2s ease; }
+/* 激活态：白玻璃浮起卡片（玻璃点缀），不是扁平填充 */
+.active, .active:hover {
+  color: var(--ink-1); font-weight: 600; transform: none;
+  background: linear-gradient(135deg, rgba(255,255,255,.98), rgba(255,255,255,.78));
+  border-color: transparent;
+  box-shadow: 0 4px 14px -5px rgba(20,30,60,.18), inset 0 1.5px 1px rgba(255,255,255,.95), inset 0 0 0 1px rgba(255,255,255,.55);
+}
 .active svg { color: var(--color-scheduled); opacity: 1; }
+/* 标志性的左侧呼吸蓝光条——只在激活频道，慢节奏吸气 */
+.active::before {
+  content: ''; position: absolute; left: 1px; top: 50%; margin-top: -9px;
+  width: 3px; height: 18px; border-radius: 3px;
+  background: var(--color-scheduled); box-shadow: 0 0 8px 1px rgba(10,132,255,.5);
+  animation: chRail 3.6s ease-in-out infinite;
+}
+@keyframes chRail { 0%,100% { opacity: .45; transform: scaleY(.65); } 50% { opacity: 1; transform: scaleY(1); } }
 
-/* 用户区（底部） */
-.userBar {
-  display: grid; grid-template-columns: 32px 1fr auto; align-items: center; gap: 10px;
-  margin-top: 12px; padding: 14px 8px 2px;
+/* 底部区：与侧栏一体（不是独立卡），顶部一条分隔线划分导航/账号用户区 */
+.foot {
+  margin-top: 10px; padding-top: 10px;
   border-top: 1px solid var(--hairline);
 }
+
+/* 用户区（侧栏原生一行，与导航项同款留白节奏） */
+.userBar {
+  display: grid; grid-template-columns: 30px 1fr auto; align-items: center; gap: 9px;
+  padding: 7px 12px 2px;
+}
 .userAvatar {
-  width: 32px; height: 32px; border-radius: 9px; flex-shrink: 0;
+  width: 30px; height: 30px; border-radius: 9px; flex-shrink: 0;
   display: flex; align-items: center; justify-content: center;
-  font-size: 13px; font-weight: 600; color: #fff;
+  font-size: 12.5px; font-weight: 600; color: #fff;
   background: linear-gradient(135deg, var(--color-brand), var(--color-scheduled));
   box-shadow: inset 0 1px 1px rgba(255,255,255,.4);
 }

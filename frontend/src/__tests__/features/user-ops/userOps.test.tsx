@@ -134,6 +134,7 @@ describe("UserOpsFeature", () => {
     hydrateSelected: vi.fn(),
     loadMessages: vi.fn().mockResolvedValue(undefined),
     loadPlaybooks: vi.fn().mockResolvedValue(undefined),
+    loadContacts: vi.fn().mockResolvedValue(undefined),
     loadDomains: vi.fn().mockResolvedValue(undefined),
     enableAgent: vi.fn().mockResolvedValue(undefined),
     disableAgent: vi.fn().mockResolvedValue(undefined),
@@ -172,8 +173,9 @@ describe("UserOpsFeature", () => {
       setContactTab: vi.fn()
     });
 
-    (useAccountStore as any).mockReturnValue({
+    const accountState = {
       currentAccountId: vi.fn(() => "test-account-1"),
+      selectedAccountId: "test-account-1",
       accounts: [
         {
           id: "test-account-1",
@@ -184,7 +186,10 @@ describe("UserOpsFeature", () => {
         }
       ],
       onlineCount: vi.fn(() => 1)
-    });
+    };
+    (useAccountStore as any).mockImplementation((selector?: any) =>
+      typeof selector === "function" ? selector(accountState) : accountState
+    );
 
     (useUiStore as any).mockReturnValue({
       busy: false,

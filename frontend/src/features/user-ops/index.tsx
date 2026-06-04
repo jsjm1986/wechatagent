@@ -92,6 +92,7 @@ export default function UserOpsFeature() {
     hydrateSelected,
     loadMessages,
     loadPlaybooks,
+    loadContacts,
     loadDomains,
     // 15个业务回调
     enableAgent,
@@ -116,7 +117,14 @@ export default function UserOpsFeature() {
   } = userOpsStore;
 
   const { contacts, selected, contactTab, setSelected, setContactTab } = contactStore;
-  const { currentAccountId, accounts, onlineCount } = accountStore;
+  const { accounts, onlineCount } = accountStore;
+  // 订阅派生的原始 accountId 字符串（切账号时值变 → effect 重拉），
+  // 不要解构 currentAccountId 函数引用——它恒稳定，依赖它的 effect 永不触发。
+  const effectiveAccountId = useAccountStore((s) =>
+    s.accounts.some((a) => a.accountId === s.selectedAccountId)
+      ? s.selectedAccountId
+      : s.accounts[0]?.accountId ?? ""
+  );
   const { busy, error, setBusy, setError } = uiStore;
 
   // 传统模式 prompts tab：复用 strategyStore 的 souls/prompt CRUD（与系统策略页同一套）
@@ -179,13 +187,14 @@ export default function UserOpsFeature() {
     await loadMessages(contact);
   };
 
-  // 挂载时加载剧本
+  // 挂载 + 切账号时加载主体数据（联系人列表 + 剧本），依赖 effectiveAccountId 原始值
   useEffect(() => {
-    const accountId = currentAccountId();
-    if (accountId) {
-      loadPlaybooks(accountId);
+    if (effectiveAccountId) {
+      setSelected(null); // 切账号清掉上个账号选中的联系人，避免串号
+      void loadContacts(effectiveAccountId);
+      void loadPlaybooks(effectiveAccountId);
     }
-  }, [currentAccountId, loadPlaybooks]);
+  }, [effectiveAccountId, loadContacts, loadPlaybooks, setSelected]);
 
   // 切到 traditional 模式时加载 souls/promptTemplates（prompts tab 复用 strategyStore）和 domains
   useEffect(() => {
