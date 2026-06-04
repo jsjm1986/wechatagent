@@ -1,0 +1,34 @@
+/* 全站唯一全局变量来源。组件样式只允许引用这里的 var()，禁止硬编码色值。 */
+:root {
+  /* —— 语义颜色 token（spec §2.3 的 6 色）—— */
+  --color-running:   #30D158; /* 进行中 / 成功（唯一呼吸） */
+  --color-scheduled: #0A84FF; /* 已排程 / 关键数据 / 可点击 */
+  --color-held:      #FF9F0A; /* 暂缓 / 待核验 */
+  --color-blocked:   #FF453A; /* 拦截 / 失败 / 风险 */
+  --color-brand:     #5E5CE6; /* AI 身份 / 品牌（不表达状态） */
+  --color-inactive:  #8E8E93; /* 未托管 / 停用 / 历史 */
+
+  /* 各语义色的浅色填充（标签底，半透明） */
+  --fill-running:   rgba(48,209,88,.14);
+  --fill-scheduled: rgba(10,132,255,.13);
+  --fill-held:      rgba(255,159,10,.16);
+  --fill-blocked:   rgba(255,69,58,.14);
+  --fill-brand:     rgba(94,92,230,.12);
+  --fill-inactive:  rgba(142,142,147,.14);
+
+  /* —— 文字阶梯（易读基调：深）—— */
+  --ink-1:#1d1d1f; --ink-2:#515156; --ink-3:#76767b; --ink-4:#b0b0b5;
+
+  /* —— 表面（易读：实色白卡）—— */
+  --surface-page:#eef1f5; --surface-card:#ffffff; --hairline:rgba(0,0,0,.08);
+
+  /* —— 圆角 / 呼吸节奏 —— */
+  --r-sm:11px; --r-md:18px; --r-lg:24px;
+  --breathe-slow:4s; --breathe-mid:3.2s;
+}
+
+/* 功能元素呼吸：仅"进行中"语义使用（spec §2.2） */
+@keyframes breathe-running {
+  0%,100% { box-shadow: inset 0 1px 1px rgba(255,255,255,.5), 0 0 0 0 rgba(48,209,88,0); }
+  50%     { box-shadow: inset 0 1px 1px rgba(255,255,255,.5), 0 0 0 3px rgba(48,209,88,.1); }
+}
