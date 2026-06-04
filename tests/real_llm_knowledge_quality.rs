@@ -1765,12 +1765,21 @@ async fn q1_retrieval_price_objection_quality() {
     );
 
     // LLM-judge 内容质量（双裁判校准层：每裁判 median-of-K + 跨裁判分歧效度门）。
+    // truth 同时给「价格异议方法论」+「零售客户案例」两条事实：被测 query 问价格异议，agent
+    // 合理地会检索方法论(CORPUS_PRICE_METHOD)并整合知识库里真实存在的客户案例(CORPUS_PEER_CASE,
+    // 同在 quality_corpus 里 seed 为 verified)来佐证 ROI 价值重构——这是 grounded 行为。若 truth
+    // 只给方法论单条，裁判看不到案例数字(6周/首响3分钟/激活18%/转化22%)在知识库里，会把真实
+    // grounded 数据误判成「凭空编造」扣 grounding 分（本轮 pro/flash 判 7、qwen 判 10 的分歧根因）。
+    // 给全 agent 可合理引用的 verified 事实，裁判才有完整基准——非放水：数据确在知识库、非捏造。
+    let q1_truth = format!(
+        "{CORPUS_PRICE_METHOD}\n\n【知识库另有可佐证 ROI 的已验证客户案例事实】{CORPUS_PEER_CASE}"
+    );
     judge_quality_panel!(
         "Q1",
         "price_objection",
         "运营问『客户嫌贵怎么回应』，评估 AI 给出的话术建议质量。",
         &result.answer,
-        CORPUS_PRICE_METHOD
+        &q1_truth
     );
 }
 
