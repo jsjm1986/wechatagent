@@ -20,6 +20,7 @@ import type { Channel } from "../types";
 const OverviewFeature = lazy(() => import("../features/overview"));
 const CommandCenterFeature = lazy(() => import("../features/command-center"));
 const ContentAssetsFeature = lazy(() => import("../features/content-assets"));
+const SystemStrategyFeature = lazy(() => import("../features/system-strategy"));
 const OperationsFeature = lazy(() => import("../features/operations"));
 const AutonomyFeature = lazy(() => import("../features/autonomy"));
 const EvolutionFeature = lazy(() => import("../features/evolution"));
@@ -129,7 +130,7 @@ export const CHANNELS: ChannelDef[] = [
     eyebrow: "Global Prompt Policy",
     title: "系统策略",
     subtitle: "管理后台总控 Agent、方法论生成 Agent 和跨模块 Prompt Pack。",
-    Component: OverviewFeature,
+    Component: SystemStrategyFeature,
   },
   {
     id: "llmProviders",

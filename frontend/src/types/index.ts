@@ -193,3 +193,27 @@ export type DecisionReview = {
   status: string;
   createdAt?: string;
 };
+
+export type PromptTemplate = {
+  id: string;
+  promptKey: string;
+  agentKind: string;
+  layer: string;
+  title: string;
+  description?: string;
+  content: string;
+  status: string;
+  version: number;
+  promptPackVersion: string;
+  createdBy: string;
+  updatedAt?: string;
+};
+
+export type PromptTemplateDraft = {
+  promptKey: string;
+  agentKind: string;
+  layer: string;
+  title: string;
+  description: string;
+  content: string;
+};

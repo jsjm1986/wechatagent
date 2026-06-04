@@ -77,7 +77,7 @@ import type {
 } from "./types";
 import { api, parseApiError, LlmUnavailableError } from "./lib/api";
 import { EmptyState as UiEmptyState } from "./components/ui/EmptyState/EmptyState";
-import type { DecisionReview, LlmUsageResponse, LlmUsageItem } from "./types";
+import type { DecisionReview, LlmUsageResponse, LlmUsageItem, PromptTemplate, PromptTemplateDraft } from "./types";
 
 type OperationPlaybook = {
   id: string;
@@ -168,30 +168,6 @@ type OperatingMemoryDraft = {
   reason: string;
 };
 
-
-type PromptTemplate = {
-  id: string;
-  promptKey: string;
-  agentKind: string;
-  layer: string;
-  title: string;
-  description?: string;
-  content: string;
-  status: string;
-  version: number;
-  promptPackVersion: string;
-  createdBy: string;
-  updatedAt?: string;
-};
-
-type PromptTemplateDraft = {
-  promptKey: string;
-  agentKind: string;
-  layer: string;
-  title: string;
-  description: string;
-  content: string;
-};
 
 type DomainKey = "user_operations" | "group_operations" | "moment_operations";
 
@@ -3114,7 +3090,7 @@ function UserPlaybookPanel({
   );
 }
 
-function DomainPromptPanel({
+export function DomainPromptPanel({
   agentKinds,
   busy,
   defaultAgentKind,
@@ -3324,7 +3300,7 @@ function DomainPromptPanel({
   );
 }
 
-function SystemStrategyView(props: {
+export function SystemStrategyView(props: {
   busy: boolean;
   editingPromptId: string;
   editingSoulId: string;
