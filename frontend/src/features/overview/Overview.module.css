@@ -1,0 +1,32 @@
+.overviewGrid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 18px;
+}
+.widePanel { grid-column: span 3; }
+.sidePanel { grid-column: span 1; }
+.widePanel, .sidePanel {
+  border: 1px solid var(--hairline);
+  border-radius: var(--r-lg);
+  background: var(--surface-card);
+  padding: 22px 24px;
+  box-shadow: 0 14px 34px -24px rgba(20,30,60,.3), inset 0 1px 1px rgba(255,255,255,.9);
+}
+.panelHead {
+  display: flex; align-items: center; justify-content: space-between;
+  gap: 12px; min-height: 46px;
+  border-bottom: 1px solid var(--hairline);
+  padding-bottom: 13px; margin-bottom: 14px;
+}
+.panelHead span { font-size: 11px; color: var(--color-brand); font-weight: 600; letter-spacing: .6px; text-transform: uppercase; }
+.panelHead h2 { font-size: 16px; color: var(--ink-1); font-weight: 600; margin: 4px 0 0; letter-spacing: -.3px; }
+.panelHead svg { color: var(--ink-3); }
+.principleGrid {
+  display: grid; grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 1px; overflow: hidden;
+  border: 1px solid var(--hairline); border-radius: var(--r-md);
+  background: var(--hairline);
+}
+.principleGrid div { background: var(--surface-page); padding: 14px; }
+.principleGrid strong { display: block; font-size: 13px; color: var(--ink-1); }
+.principleGrid p { font-size: 13px; color: var(--ink-2); margin: 6px 0 0; line-height: 1.5; }
