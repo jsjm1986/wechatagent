@@ -18,6 +18,11 @@ import {
 import type { Channel } from "../types";
 
 const OverviewFeature = lazy(() => import("../features/overview"));
+const AutonomyFeature = lazy(() => import("../features/autonomy"));
+const EvolutionFeature = lazy(() => import("../features/evolution"));
+const QualityFeature = lazy(() => import("../features/quality"));
+const LlmProvidersFeature = lazy(() => import("../features/llm-providers"));
+const KnowledgeFeature = lazy(() => import("../features/knowledge"));
 
 export interface ChannelDef {
   id: Channel;
@@ -110,7 +115,7 @@ export const CHANNELS: ChannelDef[] = [
     eyebrow: "Knowledge Wiki",
     title: "Wiki 管理",
     subtitle: "管理知识库领域 schema、缺口信号与切片修订历史。",
-    Component: OverviewFeature,
+    Component: KnowledgeFeature,
   },
   {
     id: "systemStrategy",
@@ -132,7 +137,7 @@ export const CHANNELS: ChannelDef[] = [
     eyebrow: "LLM Providers",
     title: "AI 模型配置",
     subtitle: "管理 LLM 服务商：base_url / api_key / model / 协议格式（OpenAI 兼容、Anthropic 兼容）；支持测试连通性与一键热切换激活配置。",
-    Component: OverviewFeature,
+    Component: LlmProvidersFeature,
   },
   {
     id: "operations",
@@ -154,7 +159,7 @@ export const CHANNELS: ChannelDef[] = [
     eyebrow: "Autonomy Loop",
     title: "自治回路监控",
     subtitle: "实时监控自治回路：修订触发率、AI 暂缓三类细分、未验证产品声明拦截、发送链路状态与最近修订记录。",
-    Component: OverviewFeature,
+    Component: AutonomyFeature,
   },
   {
     id: "evolution",
@@ -165,7 +170,7 @@ export const CHANNELS: ChannelDef[] = [
     eyebrow: "Self Evolution",
     title: "演化中心",
     subtitle: "查看自演化器产出的 experiments、阈值与 Prompt 候选、Shadow 评测与显著性结论；管理员二次确认后发布或回滚。",
-    Component: OverviewFeature,
+    Component: EvolutionFeature,
   },
   {
     id: "quality",
@@ -176,6 +181,6 @@ export const CHANNELS: ChannelDef[] = [
     eyebrow: "Outcome & Quality",
     title: "运营成效",
     subtitle: "用户回复率、对话深度等长期指标，知识切片自动校验，公式遵守度评测，产品声明兜底标记词管理。",
-    Component: OverviewFeature,
+    Component: QualityFeature,
   },
 ];

@@ -2519,7 +2519,7 @@ function ContactsView({
   );
 }
 
-function OperationsView({
+export function OperationsView({
   decisionReviews,
   events,
   llmUsage,
@@ -4022,7 +4022,7 @@ function draftFromItem(item: LlmProviderItem): LlmProviderDraft {
   };
 }
 
-function LlmProvidersView() {
+export function LlmProvidersView() {
   const [items, setItems] = useState<LlmProviderItem[]>([]);
   const [active, setActive] = useState<LlmProviderListResponse["active"]>(null);
   const [loading, setLoading] = useState(false);
@@ -5579,7 +5579,7 @@ type PromptTemplateLite = {
   content: string;
 };
 
-function AutonomyLoopView({ accountId }: { accountId?: string }) {
+export function AutonomyLoopView({ accountId }: { accountId?: string }) {
   return (
     <section className="qualityCenter">
       <div className="panelHead compact">
@@ -5597,7 +5597,7 @@ function AutonomyLoopView({ accountId }: { accountId?: string }) {
 // M4 W4 / Task 5.8：演化中心顶级频道。读 /api/health 的 evolutionEnabled 决定渲染
 // 真正的 EvolutionCenterTab 还是占位文案（演化器未启用时 worker 不 tick，experiments
 // 也会一直为空，但占位文案能让运营更明确知道原因）。
-function EvolutionCenterView() {
+export function EvolutionCenterView() {
   const [enabled, setEnabled] = useState<boolean | null>(null);
 
   useEffect(() => {
@@ -5660,7 +5660,7 @@ const KNOWLEDGE_MODES: ModeMeta[] = [
   { key: "atlas", label: "全景", caption: "Schema、指标、记忆", Icon: MapIcon }
 ];
 
-function KnowledgeWikiView() {
+export function KnowledgeWikiView() {
   const [mode, setMode] = useState<KnowledgeMode>("today");
   return (
     <section className="qualityCenter knowledgeWiki knowledgeWorkstation">
@@ -12156,7 +12156,7 @@ function MemoryDrawer() {
   );
 }
 
-function QualityCenterView({ accountId }: { accountId?: string }) {
+export function QualityCenterView({ accountId }: { accountId?: string }) {
   const [tab, setTab] = useState<"outcome" | "autoVerify" | "formula" | "markers">("outcome");
   return (
     <section className="qualityCenter">
