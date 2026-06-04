@@ -36,7 +36,8 @@ use wechatagent::agent::{
     atomic_claim_pending, build_initial_operation_profile, consolidate_contact_memory,
     handle_follow_up_task, handle_managed_message, process_entry, record_user_reaction,
 };
-use wechatagent::llm::LlmClient;
+use wechatagent::error::{AppError, AppResult};
+use wechatagent::llm::{LlmClient, LlmJsonResult, LlmProvider};
 use wechatagent::models::{
     AgentProfile, AgentStatus, AgentTask, Contact, ConversationMessage, MemoryCandidate,
     MessageDirection,
@@ -49,9 +50,11 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 
 // ── env-gated 真实 provider 构造 ───────────────────────────────────────────
 
-/// 从 env 构造真实文本 provider。缺 `REAL_LLM_API_KEY` → None（调用方自我跳过）。
+/// 从 env 构造真实文本主 provider。缺 `REAL_LLM_API_KEY` → None（调用方自我跳过）。
 ///
-/// timeout=180s / retries=3 / retry_base=1500ms 与生产配置同量级（慢模型给足超时）。
+/// timeout=180s / retry_base=2500ms（退避序列 ~2.5/5/10/20s）。max_retries 由
+/// `primary_max_retries()` 决定：**有备胎时 1（fail-fast ~2.5s 切备胎）、无备胎时 5
+/// （熬 ~37s 恢复窗）**——与对抗弧同口径（Round 10 解 429 风暴下 failover 重试税撞墙）。
 /// `REAL_LLM_BASE_URL` / `REAL_LLM_MODEL` 有合理默认值。
 fn real_llm_from_env() -> Option<Arc<LlmClient>> {
     let api_key = std::env::var("REAL_LLM_API_KEY").ok().filter(|k| !k.trim().is_empty())?;
@@ -59,15 +62,153 @@ fn real_llm_from_env() -> Option<Arc<LlmClient>> {
         .unwrap_or_else(|_| "https://token-plan-cn.xiaomimimo.com/v1".to_string());
     let model =
         std::env::var("REAL_LLM_MODEL").unwrap_or_else(|_| "mimo-v2.5-pro".to_string());
-    let client = LlmClient::new(base_url, api_key, model, 180, 3, 1500)
+    let client = LlmClient::new(base_url, api_key, model, 180, primary_max_retries(), 2500)
         .expect("构造真实 LlmClient");
     Some(Arc::new(client))
 }
 
-/// 跳过宏：无 key 时打印一行 skip 并 `return`（不 panic、不算失败）。
+// ════════════════════════════════════════════════════════════════════════════
+// 跨模型 failover 备胎链 —— 与 `real_llm_adversarial.rs` 同口径（Round 9 引入）。
+// 主模型（MiMo）遇 429/5xx/超时等端点抖动重试耗尽后，自动切到独立端点（NVIDIA 上
+// kimi/minimax/glm）续跑，把「端点限流污染能力测评」解耦，保「全程跑完拿真分」。
+// 纯测试侧、零生产改动、agent 仍冻结为对照。被测 agent 与 judge 共享同一注入 provider
+// （run_judge 走 state.llm），故一处包装两者同享 failover。背景：MiMo 单 key 在
+// ops×adversarial 并发矩阵下 429 频发 → t11/t13/t15/t16/t18 多轮弧 turn-1 即被
+// `unwrap_or_skip_transient!` 跳过 → 人设/记忆/跌单弧长期无有效真分。
+// ════════════════════════════════════════════════════════════════════════════
+
+/// 该错误是否值得切下一个备胎。可恢复 = 端点侧抖动（限流 / 5xx / 超时 / 连接 / 传输
+/// 截断 / 网络），换个独立端点的模型可能成功。**不可恢复 = fail-fast**：`http_4xx`
+/// （key/model/配额错，换模型也没用）、`json_decode_error` / `empty_response`（prompt
+/// 触发，换模型仍会同样失败，徒增延迟）。
+fn is_failover_worthy(e: &AppError) -> bool {
+    match e {
+        AppError::LlmUnavailable { kind, .. } => matches!(
+            kind.as_str(),
+            "rate_limited"
+                | "http_5xx"
+                | "timeout"
+                | "connect_failed"
+                | "body_decode_error"
+                | "network_error"
+        ),
+        AppError::Http(h) => h.is_timeout() || h.is_connect(),
+        _ => false,
+    }
+}
+
+/// 顺序 failover provider：`clients = [主, 备1, 备2, ...]`（已按延迟升序）。
+/// 顺序尝试——`Ok` 即返（命中备胎时 eprintln `[failover]` 供 CI 日志 grep 确认真切换）；
+/// 可恢复 `Err` 记下切下一个；不可恢复 `Err` 立即 fail-fast。缺备胎时只有主一个 = 与
+/// failover 前行为完全一致（无回归）。
+struct FailoverProvider {
+    /// 主模型 model 串（仅用于 `[failover]` 日志标识落到哪条主链兜底）。
+    primary_label: String,
+    clients: Vec<Arc<LlmClient>>,
+}
+
+#[async_trait::async_trait]
+impl LlmProvider for FailoverProvider {
+    async fn generate_json(&self, system: &str, user: &str) -> AppResult<serde_json::Value> {
+        self.generate_json_with_usage(system, user).await.map(|r| r.value)
+    }
+
+    async fn generate_json_with_usage(&self, system: &str, user: &str) -> AppResult<LlmJsonResult> {
+        let mut last_err: Option<AppError> = None;
+        for (i, client) in self.clients.iter().enumerate() {
+            match client.generate_json_with_usage(system, user).await {
+                Ok(r) => {
+                    if i > 0 {
+                        eprintln!(
+                            "[failover] 主模型 {} 不可用，已切到备胎[{i}] {} 兜底成功",
+                            self.primary_label, r.model
+                        );
+                    }
+                    return Ok(r);
+                }
+                Err(e) if is_failover_worthy(&e) => {
+                    eprintln!(
+                        "[failover] {} 第{i}个候选不可用，尝试下一个备胎: {e}",
+                        self.primary_label
+                    );
+                    last_err = Some(e);
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Err(last_err
+            .unwrap_or_else(|| AppError::External("failover: 无可用 LLM 客户端".to_string())))
+    }
+}
+
+/// FAILOVER key 是否已配——决定①备胎链是否可用、②主模型该 fail-fast 还是熬满重试窗。
+fn failover_key_present() -> bool {
+    std::env::var("REAL_LLM_FAILOVER_API_KEY")
+        .ok()
+        .filter(|k| !k.trim().is_empty())
+        .is_some()
+}
+
+/// 主模型重试预算：**有健康备胎（FAILOVER key 已配）时主模型 fail-fast**——只 1 次退避
+/// （≈2.5s）就切备胎，而非熬满 5 次（≈37s），避免 429 风暴下重试税累积撞 45min job 墙。
+/// **缺备胎（无 key）时维持 5（≈37s 恢复窗熬过端点抖动），与 failover 前行为一致（无回归）**。
+fn primary_max_retries() -> u32 {
+    if failover_key_present() {
+        1
+    } else {
+        5
+    }
+}
+
+/// 从 env 构造备胎链（默认 NVIDIA `/v1` 上 kimi-k2.6 / minimax-m2.7 / glm-5.1，已延迟升序）。
+/// 缺 `REAL_LLM_FAILOVER_API_KEY` → 返 `vec![]`，FailoverProvider 退化为「只主模型」=
+/// 与 failover 前行为完全一致（不回归、不强依赖 NVIDIA key）。备胎自身保留 5 次重试。
+fn failover_backups() -> Vec<Arc<LlmClient>> {
+    if !failover_key_present() {
+        return Vec::new();
+    }
+    let key = std::env::var("REAL_LLM_FAILOVER_API_KEY").unwrap_or_default();
+    let base = std::env::var("REAL_LLM_FAILOVER_BASE_URL")
+        .unwrap_or_else(|_| "https://integrate.api.nvidia.com/v1".to_string());
+    failover_model_list()
+        .into_iter()
+        .filter_map(|m| LlmClient::new(base.clone(), key.clone(), m, 180, 5, 2500).ok().map(Arc::new))
+        .collect()
+}
+
+/// 备胎 model 名列表（逗号分隔，已延迟升序）。
+fn failover_model_list() -> Vec<String> {
+    std::env::var("REAL_LLM_FAILOVER_MODELS")
+        .unwrap_or_else(|_| {
+            "moonshotai/kimi-k2.6,minimaxai/minimax-m2.7,z-ai/glm-5.1".to_string()
+        })
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
+/// 把一个主 client 包成带备胎链的 `FailoverProvider`（备胎缺失时退化为只主）。
+fn wrap_with_failover(primary_label: String, primary: Arc<LlmClient>) -> Arc<dyn LlmProvider> {
+    let mut clients = vec![primary];
+    clients.extend(failover_backups());
+    Arc::new(FailoverProvider { primary_label, clients })
+}
+
+/// 主模型 + 备胎链 → `Arc<dyn LlmProvider>`。供被测 agent 注入 + judge 共用。
+/// 缺主 key → None（与 real_llm_from_env 同口径自跳过）。
+fn real_llm_with_failover() -> Option<Arc<dyn LlmProvider>> {
+    let primary = real_llm_from_env()?;
+    let primary_label =
+        std::env::var("REAL_LLM_MODEL").unwrap_or_else(|_| "mimo-v2.5-pro".to_string());
+    Some(wrap_with_failover(primary_label, primary))
+}
+
+/// 跳过宏：无 key 时打印一行 skip 并 `return`（不 panic、不算失败）。返回 `Arc<dyn
+/// LlmProvider>`（主模型 + 备胎链），被测 agent / 长程弧 / judge 注入即享 failover。
 macro_rules! require_real_llm {
     () => {{
-        match real_llm_from_env() {
+        match real_llm_with_failover() {
             Some(llm) => llm,
             None => {
                 eprintln!("skip: REAL_LLM_API_KEY 未配置，跳过真实大模型 ops smoke");
