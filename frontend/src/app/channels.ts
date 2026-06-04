@@ -141,7 +141,7 @@ export const CHANNELS: ChannelDef[] = [
     icon: Bot,
     eyebrow: "LLM Providers",
     title: "AI 模型配置",
-    subtitle: "管理 LLM 服务商：base_url / api_key / model / 协议格式（OpenAI 兼容、Anthropic 兼容）；支持测试连通性与一键热切换激活配置。",
+    subtitle: "管理 LLM 服务商：base_url / api_key / model / 协议格式（兼容主流 Chat Completions 与 Messages 协议）；支持测试连通性与一键热切换激活配置。",
     Component: LlmProvidersFeature,
   },
   {
