@@ -1,0 +1,18 @@
+.badge {
+  display: inline-flex; align-items: center; gap: 6px;
+  font-size: 11.5px; font-weight: 600; letter-spacing: -.1px;
+  padding: 7px 13px; border-radius: var(--r-sm); white-space: nowrap;
+  box-shadow: inset 0 1px 1px rgba(255,255,255,.5);
+}
+.dot { width: 6px; height: 6px; border-radius: 50%; }
+
+.running   { color: #1a9c45; background: var(--fill-running);   border: 1px solid rgba(48,209,88,.28);  animation: breathe-running var(--breathe-mid) ease-in-out infinite; }
+.running .dot   { background: var(--color-running); box-shadow: 0 0 6px 1px var(--color-running); }
+.scheduled { color: var(--color-scheduled); background: var(--fill-scheduled); border: 1px solid rgba(10,132,255,.22); }
+.scheduled .dot { background: var(--color-scheduled); }
+.held      { color: #c47800; background: var(--fill-held);      border: 1px solid rgba(255,159,10,.30); }
+.held .dot      { background: var(--color-held); }
+.blocked   { color: #d6342a; background: var(--fill-blocked);   border: 1px solid rgba(255,69,58,.30); }
+.blocked .dot   { background: var(--color-blocked); }
+.inactive  { color: #6e6e73; background: var(--fill-inactive);  border: 1px solid rgba(142,142,147,.28); }
+.inactive .dot  { background: var(--color-inactive); }
