@@ -1,0 +1,12 @@
+.banner {
+  display: flex; align-items: center; justify-content: space-between; gap: 12px;
+  padding: 10px 18px; font-size: 13px; font-weight: 500;
+  color: #d6342a; background: var(--fill-blocked);
+  border-bottom: 1px solid rgba(255,69,58,.3);
+}
+.text { flex: 1; }
+.close {
+  border: none; background: none; cursor: pointer;
+  color: #d6342a; font-size: 13px; line-height: 1; padding: 4px;
+}
+.close:hover { opacity: .7; }
