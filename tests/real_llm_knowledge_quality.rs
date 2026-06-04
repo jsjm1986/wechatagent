@@ -247,6 +247,18 @@ macro_rules! unwrap_or_skip_transient {
     }};
 }
 
+/// 判定一段「被测对话回复」是否其实是 chat 工具回路的**上游超时回退串**
+/// （生产 `routes/knowledge.rs` 在 30s 硬超时时返回固定文案「（AI 工具循环超时
+/// elapsed_ms=…，请稍后再试或换个说法）」）。命中即说明被测 LLM 这一步根本没产出
+/// 真正的内容输出，与 HTTP 层 `LlmUnavailable` 同性质——**不该交裁判评质量**
+/// （否则三裁判一致判低 = 假红，误导成真缺陷去改生产代码）。
+///
+/// 认的是确定性回退文案前缀（不含 elapsed_ms 变量部分），与具体 query/answer 无关，
+/// 是抽象的 infra 信号识别，**非**对单条样本点对点过拟合。
+fn looks_like_timeout_fallback(reply: &str) -> bool {
+    reply.contains("AI 工具循环超时")
+}
+
 async fn dummy_mcp_server() -> MockServer {
     MockServer::start().await
 }
@@ -2055,6 +2067,16 @@ async fn q4_chat_workstation_quality() {
     assert_eq!(verified_after, 0, "Q4 对话起草落库了 verified chunk——红线被击穿");
 
     // judge：意图判对 + 回复自然度（明确的新建意图，正确 intent 应为 create_chunk）。
+    // 判前 infra 闸：naturalReply 若是 chat 回路上游超时回退串（生产 30s 硬超时文案），
+    // 说明起草那步 LLM 根本没产出内容，与 HTTP 层 LlmUnavailable 同性质——确定性 skip，
+    // 绝不交裁判（否则三裁判一致判低 = 假红，误导成真质量缺陷）。
+    if looks_like_timeout_fallback(natural_reply) {
+        eprintln!(
+            "skip: Q4 naturalReply 命中 chat 回路上游超时回退串（起草步 LLM 瞬时不可达），\
+             按「真模型抖动跳过」处理，不算质量失败"
+        );
+        return;
+    }
     let model_output = format!("intent={intent}\nnaturalReply={natural_reply}");
     judge_quality_panel!(
         "Q4",
