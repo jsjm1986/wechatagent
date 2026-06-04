@@ -1,0 +1,10 @@
+.step {
+  display: flex; align-items: flex-start; gap: 10px; padding: 11px;
+  border: 1px solid var(--hairline); border-radius: var(--r-sm);
+  background: var(--surface-page);
+}
+.step .title { display: block; color: var(--ink-1); font-size: 13px; }
+.step .detail { color: var(--ink-2); font-size: 13px; }
+.ready { border-color: rgba(94,92,230,.28); background: var(--fill-brand); }
+.ready svg { color: var(--color-brand); }
+.pending svg { color: var(--ink-4); }

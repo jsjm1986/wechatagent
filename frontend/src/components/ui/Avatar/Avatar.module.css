@@ -1,0 +1,11 @@
+.avatar {
+  width: 40px; height: 40px; border-radius: 13px; flex-shrink: 0;
+  display: flex; align-items: center; justify-content: center; position: relative;
+  font-size: 13.5px; font-weight: 600; color: #fff; border: 1px solid rgba(255,255,255,.5);
+  box-shadow: inset 0 1.5px 1px rgba(255,255,255,.6), 0 6px 14px -6px rgba(20,30,60,.3);
+}
+.running   { background: linear-gradient(135deg,#34d35e,#1fa84a); }
+.scheduled { background: linear-gradient(135deg,#3a9bff,#0a6ff0); }
+.held      { background: linear-gradient(135deg,#ffb43a,#f5920a); }
+.blocked   { background: linear-gradient(135deg,#ff6961,#e5392e); }
+.inactive  { background: linear-gradient(135deg,#aeaeb2,#7c7c80); }

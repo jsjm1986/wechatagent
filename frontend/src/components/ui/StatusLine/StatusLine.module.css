@@ -1,0 +1,12 @@
+.line {
+  display: flex; align-items: center; justify-content: space-between;
+  min-height: 42px; padding: 8px 10px;
+  border: 1px solid var(--hairline); border-radius: var(--r-sm);
+  background: var(--surface-page);
+}
+.line .label { color: var(--ink-3); font-size: 12px; }
+.line .value { color: var(--ink-2); font-size: 12px; }
+.ai .value      { color: var(--color-brand); }
+.good .value    { color: var(--color-running); }
+.warn .value    { color: var(--color-held); }
+.neutral .value { color: var(--ink-2); }
