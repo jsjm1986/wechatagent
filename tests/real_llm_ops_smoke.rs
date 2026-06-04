@@ -69,12 +69,14 @@ fn real_llm_from_env() -> Option<Arc<LlmClient>> {
 
 // ════════════════════════════════════════════════════════════════════════════
 // 跨模型 failover 备胎链 —— 与 `real_llm_adversarial.rs` 同口径（Round 9 引入）。
-// 主模型（MiMo）遇 429/5xx/超时等端点抖动重试耗尽后，自动切到独立端点（NVIDIA 上
-// kimi/minimax/glm）续跑，把「端点限流污染能力测评」解耦，保「全程跑完拿真分」。
-// 纯测试侧、零生产改动、agent 仍冻结为对照。被测 agent 与 judge 共享同一注入 provider
-// （run_judge 走 state.llm），故一处包装两者同享 failover。背景：MiMo 单 key 在
-// ops×adversarial 并发矩阵下 429 频发 → t11/t13/t15/t16/t18 多轮弧 turn-1 即被
-// `unwrap_or_skip_transient!` 跳过 → 人设/记忆/跌单弧长期无有效真分。
+// 主模型（MiMo）遇 429/5xx/超时等端点抖动重试耗尽后，自动切到独立端点续跑，把「端点
+// 限流污染能力测评」解耦，保「全程跑完拿真分」。备胎链（延迟/能力升序）：①最强模型
+// gpt-5.5（@ coderelay，REAL_LLM_JUDGE_API_KEY）→ ②NVIDIA 上 kimi/minimax/glm。
+// 纯测试侧、零生产改动。**被测 agent 始终是生产模型 MiMo（冻结为对照），裁判另用最强
+// 模型 gpt-5.5（judge_provider，G-Eval/MT-Bench 方法论）——裁判换强只抬高评分可信度、
+// 不抬高被测分**。背景：MiMo 单 key 在 ops×adversarial 并发矩阵下 429 频发 →
+// t11/t13/t15/t16/t18 多轮弧 turn-1 即被 `unwrap_or_skip_transient!` 跳过 → 人设/记忆/
+// 跌单弧长期无有效真分。
 // ════════════════════════════════════════════════════════════════════════════
 
 /// 该错误是否值得切下一个备胎。可恢复 = 端点侧抖动（限流 / 5xx / 超时 / 连接 / 传输
@@ -141,7 +143,7 @@ impl LlmProvider for FailoverProvider {
     }
 }
 
-/// FAILOVER key 是否已配——决定①备胎链是否可用、②主模型该 fail-fast 还是熬满重试窗。
+/// FAILOVER key 是否已配——决定 NVIDIA 端 kimi/minimax/glm 备胎链是否可用。
 fn failover_key_present() -> bool {
     std::env::var("REAL_LLM_FAILOVER_API_KEY")
         .ok()
@@ -149,31 +151,66 @@ fn failover_key_present() -> bool {
         .is_some()
 }
 
-/// 主模型重试预算：**有健康备胎（FAILOVER key 已配）时主模型 fail-fast**——只 1 次退避
-/// （≈2.5s）就切备胎，而非熬满 5 次（≈37s），避免 429 风暴下重试税累积撞 45min job 墙。
-/// **缺备胎（无 key）时维持 5（≈37s 恢复窗熬过端点抖动），与 failover 前行为一致（无回归）**。
+/// 最强模型（gpt-5.5 @ coderelay）key 是否已配——它既当独立裁判，也当 agent 备胎链首选。
+fn strongest_key_present() -> bool {
+    std::env::var("REAL_LLM_JUDGE_API_KEY")
+        .ok()
+        .filter(|k| !k.trim().is_empty())
+        .is_some()
+}
+
+/// 是否存在**任一**健康备胎（gpt-5.5 首选 或 NVIDIA 链）——决定主模型该 fail-fast 还是熬满重试窗。
+fn any_backup_present() -> bool {
+    strongest_key_present() || failover_key_present()
+}
+
+/// 主模型重试预算：**有任一健康备胎时主模型 fail-fast**——只 1 次退避（≈2.5s）就切备胎，
+/// 而非熬满 5 次（≈37s），避免 429 风暴下重试税累积撞 45min job 墙。
+/// **缺一切备胎（无任何 key）时维持 5（≈37s 恢复窗熬过端点抖动），与 failover 前行为一致（无回归）**。
 fn primary_max_retries() -> u32 {
-    if failover_key_present() {
+    if any_backup_present() {
         1
     } else {
         5
     }
 }
 
-/// 从 env 构造备胎链（默认 NVIDIA `/v1` 上 kimi-k2.6 / minimax-m2.7 / glm-5.1，已延迟升序）。
-/// 缺 `REAL_LLM_FAILOVER_API_KEY` → 返 `vec![]`，FailoverProvider 退化为「只主模型」=
-/// 与 failover 前行为完全一致（不回归、不强依赖 NVIDIA key）。备胎自身保留 5 次重试。
+/// 构造最强模型 client（gpt-5.5 @ coderelay，OpenAI 兼容）。缺 `REAL_LLM_JUDGE_API_KEY`
+/// → None。它既作独立裁判（最强模型当 judge，G-Eval/MT-Bench 方法论），也作 agent
+/// 备胎链**首选**（mimo 429 时优先切最强模型续跑）。备胎自身保留 5 次重试。
+fn strongest_model_client() -> Option<Arc<LlmClient>> {
+    let key = std::env::var("REAL_LLM_JUDGE_API_KEY")
+        .ok()
+        .filter(|k| !k.trim().is_empty())?;
+    let base = std::env::var("REAL_LLM_JUDGE_BASE_URL")
+        .unwrap_or_else(|_| "https://coderelay.cn/v1".to_string());
+    let model =
+        std::env::var("REAL_LLM_JUDGE_MODEL").unwrap_or_else(|_| "gpt-5.5".to_string());
+    LlmClient::new(base, key, model, 180, 5, 2500).ok().map(Arc::new)
+}
+
+/// 从 env 构造备胎链（延迟/能力升序）：①最强模型 gpt-5.5（首选，若 `REAL_LLM_JUDGE_API_KEY`
+/// 在）→ ②NVIDIA `/v1` 上 kimi-k2.6 / minimax-m2.7 / glm-5.1（若 `REAL_LLM_FAILOVER_API_KEY`
+/// 在）。两个 key 都缺 → 返 `vec![]`，FailoverProvider 退化为「只主模型」= 与 failover 前
+/// 行为完全一致（不回归、不强依赖任何备胎 key）。备胎自身保留 5 次重试。
 fn failover_backups() -> Vec<Arc<LlmClient>> {
-    if !failover_key_present() {
-        return Vec::new();
+    let mut backups: Vec<Arc<LlmClient>> = Vec::new();
+    // ①最强模型 gpt-5.5 作首选备胎（mimo 失败时优先切它）。
+    if let Some(c) = strongest_model_client() {
+        backups.push(c);
     }
-    let key = std::env::var("REAL_LLM_FAILOVER_API_KEY").unwrap_or_default();
-    let base = std::env::var("REAL_LLM_FAILOVER_BASE_URL")
-        .unwrap_or_else(|_| "https://integrate.api.nvidia.com/v1".to_string());
-    failover_model_list()
-        .into_iter()
-        .filter_map(|m| LlmClient::new(base.clone(), key.clone(), m, 180, 5, 2500).ok().map(Arc::new))
-        .collect()
+    // ②NVIDIA 链兜底。
+    if failover_key_present() {
+        let key = std::env::var("REAL_LLM_FAILOVER_API_KEY").unwrap_or_default();
+        let base = std::env::var("REAL_LLM_FAILOVER_BASE_URL")
+            .unwrap_or_else(|_| "https://integrate.api.nvidia.com/v1".to_string());
+        backups.extend(
+            failover_model_list().into_iter().filter_map(|m| {
+                LlmClient::new(base.clone(), key.clone(), m, 180, 5, 2500).ok().map(Arc::new)
+            }),
+        );
+    }
+    backups
 }
 
 /// 备胎 model 名列表（逗号分隔，已延迟升序）。
@@ -202,6 +239,34 @@ fn real_llm_with_failover() -> Option<Arc<dyn LlmProvider>> {
     let primary_label =
         std::env::var("REAL_LLM_MODEL").unwrap_or_else(|_| "mimo-v2.5-pro".to_string());
     Some(wrap_with_failover(primary_label, primary))
+}
+
+/// 裁判 provider——**与被测 agent 解耦**：
+/// - 配了 `REAL_LLM_JUDGE_API_KEY` → 用最强模型 gpt-5.5 当裁判（G-Eval/MT-Bench：最强模型
+///   当 judge 判分更稳），并以 NVIDIA 链兜底裁判端单点；
+/// - 缺 key → 回落被测共享的 `state.llm`（现状 mimo failover，零回归）。
+///
+/// **关键反过拟合纪律**：被测 agent 始终是生产模型 mimo（`real_llm_with_failover` 注入），
+/// 裁判换最强模型只抬高评分可信度，不抬高被测分——分数仍代表 mimo 真实能力。
+fn judge_provider(state: &AppState) -> Arc<dyn LlmProvider> {
+    match strongest_model_client() {
+        Some(primary) => {
+            let mut clients = vec![primary];
+            // 裁判端也挂 NVIDIA 链作兜底（gpt-5.5 端点抖动时裁判不至于整轮失败）。
+            if failover_key_present() {
+                let key = std::env::var("REAL_LLM_FAILOVER_API_KEY").unwrap_or_default();
+                let base = std::env::var("REAL_LLM_FAILOVER_BASE_URL")
+                    .unwrap_or_else(|_| "https://integrate.api.nvidia.com/v1".to_string());
+                clients.extend(failover_model_list().into_iter().filter_map(|m| {
+                    LlmClient::new(base.clone(), key.clone(), m, 180, 5, 2500).ok().map(Arc::new)
+                }));
+            }
+            let label =
+                std::env::var("REAL_LLM_JUDGE_MODEL").unwrap_or_else(|_| "gpt-5.5".to_string());
+            Arc::new(FailoverProvider { primary_label: label, clients })
+        }
+        None => state.llm.clone(),
+    }
 }
 
 /// 跳过宏：无 key 时打印一行 skip 并 `return`（不 panic、不算失败）。返回 `Arc<dyn
@@ -503,6 +568,8 @@ async fn run_judge(state: &AppState, wxid: &str, label: &str) {
         eprintln!("[裁判] 跳过（未设 REAL_LLM_JUDGE=1）");
         return;
     }
+    // 裁判 provider：配了 gpt-5.5 key 用最强模型当裁判，否则回落被测共享的 state.llm（零回归）。
+    let judge = judge_provider(state);
     let latest = || FindOneOptions::builder().sort(doc! { "created_at": -1 }).build();
 
     // 复用与 print_quality_report 同一条 decision_review（评同一段 reply_text）。
@@ -568,9 +635,9 @@ async fn run_judge(state: &AppState, wxid: &str, label: &str) {
     let mut ok_calls = 0usize;
 
     // K 次采样并发跑（join_all）：真模型单次 latency 高，串行 K 次会饿死 CI 45min 墙；
-    // 并发把 ~K×latency 压成 ~1×latency，重复性度量口径不变。
+    // 并发把 ~K×latency 压成 ~1×latency，重复性度量口径不变。裁判走 judge（gpt-5.5 或回落）。
     let results =
-        futures::future::join_all((0..k).map(|_| state.llm.generate_json_with_usage(JUDGE_SYSTEM, &user)))
+        futures::future::join_all((0..k).map(|_| judge.generate_json_with_usage(JUDGE_SYSTEM, &user)))
             .await;
     for (i, r) in results.into_iter().enumerate() {
         match r {

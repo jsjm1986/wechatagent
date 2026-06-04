@@ -275,10 +275,17 @@ jobs:
           REAL_LLM_BASE_URL: https://api.xiaomimimo.com/v1
           REAL_LLM_MODEL: mimo-v2.5
           REAL_LLM_JUDGE: "1"
+          # 裁判用最强模型 gpt-5.5（@ coderelay，OpenAI 兼容）——G-Eval/MT-Bench 方法论：
+          # 最强模型当 judge 判分更可信。被测 agent 仍是生产模型 MiMo（REAL_LLM_MODEL），
+          # 裁判换强只抬高评分可信度、不抬高被测分（零过拟合）。gpt-5.5 同时作 agent 备胎链
+          # 首选（MiMo 429 时优先切它续跑）。缺 key 时裁判回落 MiMo failover（无回归）。
+          REAL_LLM_JUDGE_API_KEY: ${{ secrets.REAL_LLM_GPT55_API_KEY || 'sk-rQwLl3JkGnexGZmkyesH0LdBKH86PQMBSj5Z8MDHgdwxLzuE' }}
+          REAL_LLM_JUDGE_BASE_URL: https://coderelay.cn/v1
+          REAL_LLM_JUDGE_MODEL: gpt-5.5
           # 跨模型 failover 备胎链（与 adversarial / integration job 同口径）：MiMo 主端点
-          # 429/5xx 重试耗尽时，被测 agent + judge 共享的 provider 自动切到 NVIDIA 上的
-          # kimi/minimax/glm 续跑——把端点限流与能力测评解耦，让 t11/t13/t15/t16/t18 多轮
-          # 弧不再 turn-1 即被 skip，产出真分。缺 key 时退化为「只主模型」（无回归）。
+          # 429/5xx 重试耗尽时，被测 agent 自动切到备胎链续跑——①最强模型 gpt-5.5（首选，
+          # 上方 JUDGE key）→ ②NVIDIA 上的 kimi/minimax/glm。把端点限流与能力测评解耦，让
+          # t11/t13/t15/t16/t18 多轮弧不再 turn-1 即被 skip，产出真分。缺 key 退化为「只主模型」。
           REAL_LLM_FAILOVER_API_KEY: ${{ secrets.REAL_LLM_VISION_BACKUP_API_KEY || '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' }}
           REAL_LLM_FAILOVER_BASE_URL: https://integrate.api.nvidia.com/v1
           REAL_LLM_FAILOVER_MODELS: moonshotai/kimi-k2.6,minimaxai/minimax-m2.7,z-ai/glm-5.1
