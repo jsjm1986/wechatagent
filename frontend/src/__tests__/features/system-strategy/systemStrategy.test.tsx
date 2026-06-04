@@ -51,7 +51,7 @@ describe("SystemStrategy Feature", () => {
 
     useUiStore.setState({
       busy: false,
-      error: null,
+      error: "",
       setBusy: vi.fn(),
       setError: vi.fn(),
     });
