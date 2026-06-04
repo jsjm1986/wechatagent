@@ -457,10 +457,12 @@ export const useUserOpsStore = create<UserOpsState & UserOpsActions>((set, get) 
         instruction
       });
 
-      set({
-        guidePreview: data.item,
-        operationHealth: healthFromScores(data.item.healthScores)
-      });
+      const next: Partial<UserOpsState> = { guidePreview: data.item };
+      // 仅当后端确实返回了 healthScores 时才更新健康度（与原逻辑一致，避免用默认值伪造）。
+      if (data.item.healthScores && Object.keys(data.item.healthScores).length > 0) {
+        next.operationHealth = healthFromScores(data.item.healthScores);
+      }
+      set(next);
     } catch (error) {
       useUiStore.getState().setError(error instanceof Error ? error.message : String(error));
     } finally {
