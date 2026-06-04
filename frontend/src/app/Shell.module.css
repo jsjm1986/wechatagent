@@ -1,0 +1,22 @@
+.shell { display: flex; min-height: 100vh; background: var(--surface-page); }
+.side {
+  width: 250px; flex-shrink: 0; padding: 28px 16px;
+  border-right: 1px solid var(--hairline); background: var(--surface-card);
+}
+.nav { display: flex; flex-direction: column; gap: 2px; }
+.group { font-size: 10.5px; color: var(--ink-3); font-weight: 600; letter-spacing: .7px;
+  text-transform: uppercase; padding: 12px 12px 6px; }
+.channel {
+  display: flex; align-items: center; gap: 11px; padding: 9px 12px; border-radius: var(--r-sm);
+  font-size: 13.5px; color: var(--ink-2); font-weight: 500; cursor: pointer;
+  background: none; border: none; text-align: left; width: 100%;
+}
+.channel:hover { background: rgba(0,0,0,.03); color: var(--ink-1); }
+.active { color: var(--ink-1); font-weight: 600; background: var(--fill-scheduled); }
+.active svg { color: var(--color-scheduled); }
+.main { flex: 1; padding: 32px 44px; overflow: hidden; }
+.header { margin-bottom: 24px; }
+.eyebrow { font-size: 11px; color: var(--color-brand); font-weight: 600; letter-spacing: .9px; text-transform: uppercase; }
+.title { font-size: 32px; color: var(--ink-1); font-weight: 700; letter-spacing: -1.2px; margin: 8px 0 4px; }
+.subtitle { font-size: 14px; color: var(--ink-2); }
+.skeleton { padding: 40px; color: var(--ink-3); }
