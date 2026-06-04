@@ -21,8 +21,27 @@ use wechatagent::{
 };
 use wechatagent::agent::run_outbox_dispatcher;
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<()> {
+    // Windows 上 main 线程默认栈较小，启动期深调用（migrations / prompt seed /
+    // taxonomy cache 预热等）会触发 STATUS_STACK_OVERFLOW。把实际启动逻辑挪到一个
+    // 配置了大栈（32MB）的专用线程上跑，绕开 main 线程的栈限制；该线程内自建
+    // 多线程 tokio runtime 承载全部 async 工作。
+    let child = std::thread::Builder::new()
+        .name("wechatagent-main".to_string())
+        .stack_size(32 * 1024 * 1024)
+        .spawn(|| {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .thread_stack_size(32 * 1024 * 1024)
+                .build()?;
+            runtime.block_on(async_main())
+        })?;
+    child
+        .join()
+        .map_err(|_| anyhow::anyhow!("wechatagent-main thread panicked"))?
+}
+
+async fn async_main() -> anyhow::Result<()> {
     dotenvy::dotenv().ok();
     tracing_subscriber::registry()
         .with(

@@ -92,7 +92,10 @@ pub async fn authenticate(
     let now = Utc::now();
     coll.update_one(
         doc! { "user_id": &user.user_id },
-        doc! { "$set": { "last_login_at": mongodb::bson::DateTime::from_millis(now.timestamp_millis()) } },
+        // last_login_at 与 created_at 一样是 chrono DateTime<Utc>（serde 序列化为 RFC3339
+        // 字符串）。这里必须写 RFC3339 字符串，不能写 bson::DateTime（会变成 BSON Date /
+        // map，导致下次反序列化 AdminUser 时 "invalid type: map, expected RFC3339 string"）。
+        doc! { "$set": { "last_login_at": now.to_rfc3339() } },
         None,
     )
     .await?;
