@@ -76,6 +76,7 @@ import type {
   CommandResult,
 } from "./types";
 import { api, parseApiError, LlmUnavailableError } from "./lib/api";
+import { EmptyState as UiEmptyState } from "./components/ui/EmptyState/EmptyState";
 
 type OperationPlaybook = {
   id: string;
@@ -2575,7 +2576,7 @@ export function OperationsView({
   );
 }
 
-function ContentAssetsView({
+export function ContentAssetsView({
   assetDraft,
   assets,
   busy,
@@ -2606,7 +2607,7 @@ function ContentAssetsView({
               <p>{asset.body || asset.url || asset.mediaId || asset.usageScene || "暂无内容"}</p>
             </div>
           ))}
-          {!assets.length && <EmptyInline text="暂无内容资产" />}
+          {!assets.length && <UiEmptyState title="暂无内容资产" />}
         </div>
       </section>
 

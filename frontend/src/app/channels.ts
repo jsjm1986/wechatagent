@@ -19,6 +19,7 @@ import type { Channel } from "../types";
 
 const OverviewFeature = lazy(() => import("../features/overview"));
 const CommandCenterFeature = lazy(() => import("../features/command-center"));
+const ContentAssetsFeature = lazy(() => import("../features/content-assets"));
 const AutonomyFeature = lazy(() => import("../features/autonomy"));
 const EvolutionFeature = lazy(() => import("../features/evolution"));
 const QualityFeature = lazy(() => import("../features/quality"));
@@ -105,7 +106,7 @@ export const CHANNELS: ChannelDef[] = [
     eyebrow: "Knowledge Assets",
     title: "内容资产",
     subtitle: "维护产品资料、FAQ、话术、禁用表达、品牌语气和朋友圈素材。",
-    Component: OverviewFeature,
+    Component: ContentAssetsFeature,
   },
   {
     id: "knowledgeWiki",
