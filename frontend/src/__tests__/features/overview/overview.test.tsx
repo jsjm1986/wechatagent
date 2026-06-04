@@ -9,7 +9,7 @@ describe("OverviewFeature", () => {
   beforeEach(() => {
     useContactStore.setState({
       contacts: [
-        { id: "a", agentStatus: "managed" } as Contact,
+        { id: "a", agentStatus: "managed", remark: "陈先生" } as Contact,
         { id: "b", agentStatus: "normal" } as Contact,
       ],
       selected: null,
@@ -18,14 +18,26 @@ describe("OverviewFeature", () => {
     useAccountStore.setState({ accounts: [], selectedAccountId: "" });
   });
 
-  it("显示 managedCount 指标卡数值", () => {
+  it("显示托管联系人统计数值", () => {
     render(<OverviewFeature />);
-    expect(screen.getByText("Managed Users")).toBeInTheDocument();
+    expect(screen.getByText("托管联系人")).toBeInTheDocument();
     expect(screen.getByText("1")).toBeInTheDocument();
   });
 
-  it("无最近事件时显示空态", () => {
+  it("实时运营流渲染托管联系人 + 自主回复状态", () => {
     render(<OverviewFeature />);
-    expect(screen.getByText("暂无运营事件")).toBeInTheDocument();
+    expect(screen.getByText("实时运营流")).toBeInTheDocument();
+    expect(screen.getByText("陈先生")).toBeInTheDocument();
+    expect(screen.getByText("自主回复")).toBeInTheDocument();
+  });
+
+  it("无托管联系人时显示空态", () => {
+    useContactStore.setState({
+      contacts: [{ id: "b", agentStatus: "normal" } as Contact],
+      selected: null,
+      contactTab: "all",
+    });
+    render(<OverviewFeature />);
+    expect(screen.getByText("暂无托管联系人")).toBeInTheDocument();
   });
 });

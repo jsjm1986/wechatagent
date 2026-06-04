@@ -1,6 +1,7 @@
 import React, { useEffect, useState } from "react";
 import { createRoot } from "react-dom/client";
 import { App } from "./App";
+import { useAuthStore } from "./stores/authStore";
 import "./components/ui/tokens.css";
 import "./components/ui/reset.css";
 import "./styles.css";
@@ -29,67 +30,6 @@ interface MeResponse {
   currentWorkspace?: string;
 }
 
-function WorkspaceSwitcher({ me }: { me: MeResponse }) {
-  const workspaces = me.workspaces ?? [];
-  const current = me.currentWorkspace ?? workspaces[0] ?? "default";
-  const [busy, setBusy] = useState(false);
-  const [err, setErr] = useState("");
-
-  if (workspaces.length <= 1) {
-    return (
-      <span className="authBadgeWorkspace">
-        <span className="authBadgeWorkspaceLabel">workspace</span>
-        <span className="authBadgeWorkspaceValue">{current}</span>
-      </span>
-    );
-  }
-
-  async function onChange(e: React.ChangeEvent<HTMLSelectElement>) {
-    const next = e.target.value;
-    if (next === current) return;
-    setErr("");
-    setBusy(true);
-    try {
-      const r = await originalFetch("/api/auth/workspace", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ workspaceId: next }),
-      });
-      if (!r.ok) {
-        const body = await r.json().catch(() => ({}));
-        setErr((body as { error?: string }).error ?? "switch_failed");
-        setBusy(false);
-        return;
-      }
-      // 切换 workspace 影响后端所有 handler 的过滤范围；重新加载页面
-      // 是最简单且最不易残留缓存的做法（React tree 多处缓存了 workspace 数据）。
-      window.location.reload();
-    } catch (e) {
-      setErr(`网络错误：${(e as Error).message}`);
-      setBusy(false);
-    }
-  }
-
-  return (
-    <span className="authBadgeWorkspace">
-      <span className="authBadgeWorkspaceLabel">workspace</span>
-      <select
-        className="authBadgeWorkspaceSelect"
-        value={current}
-        onChange={onChange}
-        disabled={busy}
-        aria-label="切换 workspace"
-      >
-        {workspaces.map((w) => (
-          <option key={w} value={w}>
-            {w}
-          </option>
-        ))}
-      </select>
-      {err && <span className="authBadgeWorkspaceError">{err}</span>}
-    </span>
-  );
-}
 
 function LoginScreen({ onLoggedIn }: { onLoggedIn: (me: MeResponse) => void }) {
   const [username, setUsername] = useState("");
@@ -225,16 +165,32 @@ function AuthGate() {
   if (!me) {
     return <LoginScreen onLoggedIn={setMe} />;
   }
-  return (
-    <>
-      <div className="authBadgeBar">
-        <span className="authBadgeUser">已登录：<strong>{me.username}</strong></span>
-        <WorkspaceSwitcher me={me} />
-        <button type="button" className="authBadgeLogout" onClick={logout}>登出</button>
-      </div>
-      <App />
-    </>
-  );
+  return <AuthedApp me={me} onLogout={logout} />;
+}
+
+function AuthedApp({ me, onLogout }: { me: MeResponse; onLogout: () => void }) {
+  useEffect(() => {
+    useAuthStore.getState().setUser(me);
+    useAuthStore.getState().setHandlers({
+      onLogout,
+      onSwitchWorkspace: async (workspaceId: string) => {
+        const current = me.currentWorkspace ?? (me.workspaces ?? [])[0] ?? "default";
+        if (workspaceId === current) return;
+        try {
+          const r = await originalFetch("/api/auth/workspace", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ workspaceId }),
+          });
+          if (r.ok) window.location.reload();
+        } catch {
+          /* 切换失败保持原状 */
+        }
+      },
+    });
+  }, [me, onLogout]);
+
+  return <App />;
 }
 
 createRoot(document.getElementById("root")!).render(

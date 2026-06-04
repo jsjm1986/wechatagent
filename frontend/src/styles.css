@@ -7366,77 +7366,78 @@ td:nth-child(3) {
   display: flex;
   align-items: center;
   justify-content: flex-end;
-  gap: 12px;
-  padding: 6px 16px;
-  background: #1a1a1a;
-  color: #fffdf7;
-  font-family: var(--font-mono);
-  font-size: 11px;
-  letter-spacing: 0.08em;
-  border-bottom: 1px solid rgba(0, 0, 0, 0.85);
+  gap: 14px;
+  padding: 10px 24px;
+  background: var(--surface-card, #ffffff);
+  color: var(--ink-2, #515156);
+  font-size: 12px;
+  letter-spacing: 0;
+  border-bottom: 1px solid var(--hairline, rgba(0,0,0,.08));
 }
 
 .authBadgeUser strong {
-  font-family: var(--font-display);
   font-size: 13px;
   letter-spacing: 0;
   font-weight: 600;
   margin-left: 4px;
+  color: var(--ink-1, #1d1d1f);
 }
 
 .authBadgeLogout {
   background: transparent;
-  border: 1px solid rgba(255, 253, 247, 0.55);
-  color: #fffdf7;
-  font-family: var(--font-mono);
-  font-size: 11px;
-  letter-spacing: 0.08em;
-  text-transform: uppercase;
-  padding: 4px 10px;
+  border: 1px solid var(--hairline, rgba(0,0,0,.12));
+  color: var(--ink-2, #515156);
+  font-size: 12px;
+  letter-spacing: 0;
+  text-transform: none;
+  font-weight: 500;
+  padding: 5px 14px;
+  border-radius: 9px;
   cursor: pointer;
-  transition: background 120ms ease;
+  transition: background 140ms ease, border-color 140ms ease, color 140ms ease;
 }
 
 .authBadgeLogout:hover {
-  background: rgba(255, 253, 247, 0.12);
+  background: var(--fill-blocked, rgba(255,69,58,.08));
+  border-color: rgba(255, 69, 58, .35);
+  color: #d6342a;
 }
 
 .authBadgeWorkspace {
   display: inline-flex;
   align-items: center;
   gap: 8px;
-  font-family: var(--font-mono);
-  font-size: 11px;
-  letter-spacing: 0.06em;
-  color: rgba(255, 253, 247, 0.78);
+  font-size: 12px;
+  letter-spacing: 0;
+  color: var(--ink-2, #515156);
   padding: 0 4px;
 }
 
 .authBadgeWorkspaceLabel {
   text-transform: uppercase;
   font-size: 10px;
-  letter-spacing: 0.14em;
-  color: rgba(255, 253, 247, 0.55);
+  letter-spacing: 0.08em;
+  color: var(--ink-3, #76767b);
 }
 
 .authBadgeWorkspaceValue {
-  color: #fffdf7;
-  font-weight: 500;
+  color: var(--color-brand, #5E5CE6);
+  font-weight: 600;
 }
 
 .authBadgeWorkspaceSelect {
-  background: transparent;
-  border: 1px solid rgba(255, 253, 247, 0.45);
-  color: #fffdf7;
-  font-family: var(--font-mono);
-  font-size: 11px;
-  padding: 3px 6px;
+  background: var(--surface-page, #eef1f5);
+  border: 1px solid var(--hairline, rgba(0,0,0,.1));
+  color: var(--ink-1, #1d1d1f);
+  font-size: 12px;
+  padding: 4px 8px;
+  border-radius: 8px;
   cursor: pointer;
   outline: none;
 }
 
 .authBadgeWorkspaceSelect:focus {
-  border-color: rgba(255, 253, 247, 0.85);
+  border-color: var(--color-brand, #5E5CE6);
 }
 
 .authBadgeWorkspaceSelect option {

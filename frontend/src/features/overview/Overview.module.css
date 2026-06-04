@@ -1,32 +1,70 @@
-.overviewGrid {
-  display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
-  gap: 18px;
+/* Overview 工作台 —— 忠实落地 apple-liquid-alive mockup 的"自主运营概览"仪表盘。
+   实色白卡 + 语义色 + 功能元素呼吸（错开慢节奏）。色值统一走 tokens.css 变量。 */
+
+.page { position: relative; }
+
+/* 统计区小标题 + 实时时钟 */
+.statsHead { display: flex; align-items: center; justify-content: space-between; margin-bottom: 12px; }
+.statsTitle { font-size: 13px; color: var(--ink-2); font-weight: 600; letter-spacing: -.2px; }
+.clock { font-size: 11.5px; color: var(--ink-3); font-weight: 500; letter-spacing: -.1px; display: flex; align-items: center; gap: 6px; }
+.clock .d { width: 5px; height: 5px; border-radius: 50%; background: var(--color-running); animation: ovLive 2.2s infinite; }
+
+/* 统计卡 */
+.stats { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; }
+.stat {
+  border-radius: var(--r-lg); padding: 20px 22px; cursor: pointer; text-align: left; width: 100%;
+  display: block; min-height: 0; font: inherit; color: var(--ink-1);
+  background: var(--surface-card); border: 1px solid var(--hairline);
+  box-shadow: 0 14px 34px -24px rgba(20,30,60,.3), inset 0 1px 1px rgba(255,255,255,.9);
+  transition: transform .2s ease, box-shadow .25s;
 }
-.widePanel { grid-column: span 3; }
-.sidePanel { grid-column: span 1; }
-.widePanel, .sidePanel {
-  border: 1px solid var(--hairline);
-  border-radius: var(--r-lg);
+.stat:hover {
+  transform: translateY(-3px);
   background: var(--surface-card);
-  padding: 22px 24px;
+  border-color: var(--hairline);
+  box-shadow: 0 20px 44px -24px rgba(20,30,60,.36), inset 0 1px 1px rgba(255,255,255,.9);
+}
+.stat:active { transform: translateY(-1px); }
+.sh { display: flex; align-items: center; justify-content: space-between; }
+.k { font-size: 12.5px; color: var(--ink-2); font-weight: 500; letter-spacing: -.1px; }
+.badge { font-size: 10px; font-weight: 500; color: var(--ink-3); letter-spacing: -.1px; }
+.v { font-size: 42px; font-weight: 680; letter-spacing: -.8px; margin-top: 8px; line-height: 1; font-variant-numeric: proportional-nums; color: var(--ink-1); }
+.v small { font-size: 20px; color: var(--ink-3); font-weight: 600; margin-left: 2px; }
+.stat.key .v { color: var(--color-scheduled); animation: ovKey 4.4s ease-in-out infinite; }
+.t { font-size: 11.5px; font-weight: 600; margin-top: 9px; letter-spacing: -.1px; display: flex; align-items: center; gap: 5px; }
+.t.up { color: var(--color-running); }
+.t .mut { color: var(--ink-3); font-weight: 500; }
+.spark { display: flex; align-items: flex-end; gap: 3px; height: 20px; margin-top: 11px; }
+.spark i { flex: 1; border-radius: 2px; background: linear-gradient(180deg, var(--color-scheduled), rgba(10,132,255,.14)); transform-origin: bottom; }
+.spark i:last-child { animation: ovBar 2.8s ease-in-out infinite; }
+
+/* 实时运营流面板 */
+.panel {
+  margin-top: 16px; border-radius: var(--r-lg); padding: 22px 26px 14px;
+  background: var(--surface-card); border: 1px solid var(--hairline);
   box-shadow: 0 14px 34px -24px rgba(20,30,60,.3), inset 0 1px 1px rgba(255,255,255,.9);
 }
-.panelHead {
-  display: flex; align-items: center; justify-content: space-between;
-  gap: 12px; min-height: 46px;
-  border-bottom: 1px solid var(--hairline);
-  padding-bottom: 13px; margin-bottom: 14px;
-}
-.panelHead span { font-size: 11px; color: var(--color-brand); font-weight: 600; letter-spacing: .6px; text-transform: uppercase; }
-.panelHead h2 { font-size: 16px; color: var(--ink-1); font-weight: 600; margin: 4px 0 0; letter-spacing: -.3px; }
-.panelHead svg { color: var(--ink-3); }
-.principleGrid {
-  display: grid; grid-template-columns: repeat(3, minmax(0, 1fr));
-  gap: 1px; overflow: hidden;
-  border: 1px solid var(--hairline); border-radius: var(--r-md);
-  background: var(--hairline);
-}
-.principleGrid div { background: var(--surface-page); padding: 14px; }
-.principleGrid strong { display: block; font-size: 13px; color: var(--ink-1); }
-.principleGrid p { font-size: 13px; color: var(--ink-2); margin: 6px 0 0; line-height: 1.5; }
+.ph { display: flex; align-items: center; justify-content: space-between; margin-bottom: 6px; }
+.pl { display: flex; align-items: baseline; gap: 10px; }
+.ph b { font-size: 15px; color: var(--ink-1); font-weight: 600; letter-spacing: -.3px; }
+.pc { font-size: 12px; color: var(--ink-3); font-weight: 500; letter-spacing: -.1px; }
+.chip { font-size: 11.5px; font-weight: 600; padding: 6px 13px; border-radius: 20px; letter-spacing: .1px; display: flex; align-items: center; gap: 7px;
+  background: linear-gradient(135deg, var(--fill-brand), rgba(10,132,255,.04)); border: 1px solid rgba(94,92,230,.22); box-shadow: inset 0 1px 1px rgba(255,255,255,.6); }
+.chip .txt { background: linear-gradient(100deg, var(--color-brand), var(--color-scheduled)); -webkit-background-clip: text; background-clip: text; -webkit-text-fill-color: transparent; }
+.chip .d { width: 7px; height: 7px; border-radius: 50%; background: var(--color-running); box-shadow: 0 0 6px 1px var(--color-running); animation: ovLive 2.2s infinite; }
+
+.item { display: flex; align-items: center; gap: 14px; padding: 14px 4px; border-top: 1px solid var(--hairline); transition: background .2s; border-radius: 12px; }
+.item:first-of-type { border-top: none; }
+.item:hover { background: rgba(0,0,0,.02); }
+.itxt { flex: 1; min-width: 0; }
+.itxt .n { font-size: 14px; color: var(--ink-1); font-weight: 600; letter-spacing: -.2px; display: flex; align-items: center; gap: 8px; }
+.itxt .n em { font-style: normal; font-size: 10.5px; color: var(--ink-3); font-weight: 500; border: 1px solid var(--hairline); padding: 1px 8px; border-radius: 20px; }
+.itxt .s { font-size: 12.5px; color: var(--ink-2); margin-top: 4px; letter-spacing: -.1px; display: flex; align-items: center; gap: 7px; }
+.itxt .s .meta { color: var(--ink-3); font-size: 11.5px; letter-spacing: -.1px; }
+.iend { display: flex; flex-direction: column; align-items: flex-end; gap: 6px; flex-shrink: 0; }
+.iend .tm { font-size: 11px; color: var(--ink-3); letter-spacing: -.1px; }
+
+/* 关键帧 */
+@keyframes ovLive { 0%,100% { box-shadow: 0 0 0 0 rgba(48,209,88,.5); } 50% { box-shadow: 0 0 0 5px rgba(48,209,88,0); } }
+@keyframes ovKey { 0%,100% { opacity: .9; } 50% { opacity: 1; } }
+@keyframes ovBar { 0%,100% { transform: scaleY(.82); } 50% { transform: scaleY(1); } }
