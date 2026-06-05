@@ -63,6 +63,25 @@ pub(crate) fn match_principal_reply(reply: &str, pending: &[AgentPrincipalEscala
     ReplyMatch::Ambiguous(codes)
 }
 
+/// 渲染推给领导的请示卡（结构化、不脱敏）。短码放在最前便于领导引用。
+pub(crate) fn render_principal_card(
+    short_code: &str,
+    customer_label: &str,
+    reason: &str,
+    question_for_principal: &str,
+) -> String {
+    format!(
+        "【请示 #{short_code}】客户「{customer_label}」\n卡点：{reason}\n请示：{question_for_principal}"
+    )
+}
+
+/// 安抚占位的确定性兜底文案。统一占位模型下，占位是 decision Agent 本轮 reply_text 经
+/// outbox 正常发出；本函数仅作回落参考（LLM 未给合适占位 / 降级场景），不由网关直接发送。
+/// 红线：绝不提转接类措辞，只说"帮你确认一下"这类 AI 自然话术。
+pub(crate) fn fallback_holding_reply() -> &'static str {
+    "这个我帮你确认一下，稍等我给你准信。"
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -160,5 +179,13 @@ mod tests {
     fn extract_short_code_is_case_insensitive() {
         let codes = vec!["E1A2".to_string()];
         assert_eq!(extract_short_code("回复 e1a2 同意", &codes), Some("E1A2".into()));
+    }
+
+    #[test]
+    fn principal_card_puts_code_first_and_is_not_redacted() {
+        let card = render_principal_card("E1A2", "张三(老客户)", "超出标准 9 折权限", "是否同意 8 折？");
+        assert!(card.starts_with("【请示 #E1A2】"));
+        assert!(card.contains("张三(老客户)")); // 对领导不脱敏
+        assert!(card.contains("是否同意 8 折？"));
     }
 }
