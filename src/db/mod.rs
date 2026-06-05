@@ -15,7 +15,8 @@ pub mod migrations;
 use mongodb::{options::ClientOptions, Client, Collection, Database as MongoDatabase};
 
 use crate::models::{
-    AgentCommandRun, AgentDecisionReview, AgentEvent, AgentOutcomeMetric, AgentRunLog, AgentSoul,
+    AgentCommandRun, AgentDecisionReview, AgentEvent, AgentOutcomeMetric, AgentPrincipalEscalation,
+    AgentRunLog, AgentSoul,
     AgentTask, AgentToolCall, BehaviorSignal, BehaviorSignalMetric, CatalogRebuildJob,
     ChunkRevision, Contact,
     ContentAsset, ConversationMessage, DomainSchema, EvaluationScenario, Experiment, IngestSource,
@@ -177,6 +178,10 @@ impl Database {
 
     pub fn agent_run_logs(&self) -> Collection<AgentRunLog> {
         self.db.collection("agent_run_logs")
+    }
+
+    pub fn agent_principal_escalations(&self) -> Collection<AgentPrincipalEscalation> {
+        self.db.collection("agent_principal_escalations")
     }
 
     pub fn llm_call_logs(&self) -> Collection<LlmCallLog> {
