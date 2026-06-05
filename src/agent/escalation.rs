@@ -4,7 +4,7 @@
 //! 请示，拿到裁决后用 AI 口吻向客户转述。客户永远只跟 Agent 对话——真人是
 //! 幕后决策源，绝不直接面对客户。这不是真人下场：AI 向内部决策源请示，转述仍由 AI 完成。
 
-use crate::models::AgentPrincipalEscalation;
+use crate::models::{AgentPrincipalEscalation, PrincipalDecision};
 
 /// 短码字符集：base32 去掉易混字符（0/O/1/I/L），便于真人在微信里识读。
 const SHORT_CODE_ALPHABET: &[u8] = b"23456789ABCDEFGHJKMNPQRSTUVWXYZ";
@@ -80,6 +80,31 @@ pub(crate) fn render_principal_card(
 /// 红线：绝不提转接类措辞，只说"帮你确认一下"这类 AI 自然话术。
 pub(crate) fn fallback_holding_reply() -> &'static str {
     "这个我帮你确认一下，稍等我给你准信。"
+}
+
+/// 该条已 resolved 的授权当前是否仍可用于转述。
+/// expires=None 视为不过期（如纯拒绝类裁决无时效）。
+pub(crate) fn authorization_is_usable(
+    expires_at: Option<mongodb::bson::DateTime>,
+    now: mongodb::bson::DateTime,
+) -> bool {
+    match expires_at {
+        None => true,
+        Some(exp) => now.timestamp_millis() < exp.timestamp_millis(),
+    }
+}
+
+/// 转述前选用的事实源：授权有效用真人 substance；过期则回落"不再可用"信号。
+pub(crate) fn relay_substance_if_usable<'a>(
+    decision: &'a PrincipalDecision,
+    expires_at: Option<mongodb::bson::DateTime>,
+    now: mongodb::bson::DateTime,
+) -> Option<&'a str> {
+    if authorization_is_usable(expires_at, now) {
+        Some(&decision.substance)
+    } else {
+        None
+    }
 }
 
 #[cfg(test)]
@@ -187,5 +212,42 @@ mod tests {
         assert!(card.starts_with("【请示 #E1A2】"));
         assert!(card.contains("张三(老客户)")); // 对领导不脱敏
         assert!(card.contains("是否同意 8 折？"));
+    }
+
+    #[test]
+    fn authorization_none_expiry_is_usable() {
+        assert!(authorization_is_usable(None, mongodb::bson::DateTime::now()));
+    }
+
+    #[test]
+    fn authorization_future_expiry_is_usable() {
+        let now = mongodb::bson::DateTime::from_millis(1_000);
+        let future = mongodb::bson::DateTime::from_millis(2_000);
+        assert!(authorization_is_usable(Some(future), now));
+    }
+
+    #[test]
+    fn authorization_past_expiry_is_not_usable() {
+        let now = mongodb::bson::DateTime::from_millis(2_000);
+        let past = mongodb::bson::DateTime::from_millis(1_000);
+        assert!(!authorization_is_usable(Some(past), now));
+    }
+
+    #[test]
+    fn relay_substance_none_when_expired() {
+        let decision = PrincipalDecision {
+            verdict: "conditional".into(),
+            substance: "可以 8 折".into(),
+            constraints: vec!["本周付款".into()],
+            authorization_window_hours: None,
+        };
+        let now = mongodb::bson::DateTime::from_millis(2_000);
+        let past = mongodb::bson::DateTime::from_millis(1_000);
+        assert_eq!(relay_substance_if_usable(&decision, Some(past), now), None);
+        let future = mongodb::bson::DateTime::from_millis(3_000);
+        assert_eq!(
+            relay_substance_if_usable(&decision, Some(future), now),
+            Some("可以 8 折")
+        );
     }
 }
