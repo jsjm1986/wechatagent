@@ -359,6 +359,41 @@ pub struct ConversationMessage {
     pub created_at: DateTime,
 }
 
+/// relay 合成消息的哨兵前缀。decision prompt 见到它即进入"转述模式"（见 user.reply.task prompt 的 relay 输入契约）。
+pub const PRINCIPAL_RELAY_SENTINEL: &str = "__PRINCIPAL_RELAY__";
+
+impl ConversationMessage {
+    /// 构造一条"领导已裁决"的合成 inbound，仅用于触发 relay 转述，不落客户可见会话。
+    /// 以哨兵前缀开头 + 结构化裁决载荷；decision prompt 据哨兵进入转述模式。
+    pub fn synthetic_principal_relay(
+        contact: &Contact,
+        verdict: &str,
+        substance: &str,
+        constraints: &[String],
+    ) -> Self {
+        let constraint_text = if constraints.is_empty() {
+            "（无）".to_string()
+        } else {
+            constraints.join("；")
+        };
+        let payload = format!(
+            "{PRINCIPAL_RELAY_SENTINEL}\nverdict={verdict}\nsubstance={substance}\nconstraints={constraint_text}"
+        );
+        ConversationMessage {
+            id: None,
+            workspace_id: contact.workspace_id.clone(),
+            account_id: contact.account_id.clone(),
+            contact_wxid: contact.wxid.clone(),
+            message_id: None,
+            dedupe_key: None,
+            direction: MessageDirection::Inbound,
+            content: payload,
+            raw: None,
+            created_at: DateTime::now(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentTask {
     #[serde(rename = "_id", skip_serializing_if = "Option::is_none")]

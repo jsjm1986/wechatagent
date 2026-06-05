@@ -39,6 +39,8 @@ use super::decision::{
     decide_reply_with_promote, load_operation_playbook_for_contact,
     load_operation_state_policy_for_contact, load_user_operation_domain_config_for_contact,
 };
+use super::domain::USER_OPS_DOMAIN_ID;
+use super::escalation;
 use super::guards::{
     classify_decision_action, enforce_state_action_policy, normalize_decision_runtime,
     normalize_decision_state, planner_from_decision,
@@ -465,6 +467,129 @@ pub(crate) async fn run_user_operation_gateway(
             ),
         )
         .await
+}
+
+/// decision Agent emit 了 escalation_request 时，在 approved 发送路径末尾调用。
+/// 占位 reply 已由网关经 outbox 正常发给客户——本函数只做不面向客户的两件事：
+/// 推请示卡给领导 wxid + 落 pending 台账。调用方对本函数错误只记 warn、不阻断 run。
+pub(crate) async fn trigger_principal_escalation(
+    state: &AppState,
+    contact: &Contact,
+    req: &crate::models::EscalationRequest,
+) -> AppResult<()> {
+    if !req.needed {
+        return Ok(());
+    }
+    let Some(principal_wxid) =
+        escalation::principal_decider_wxid(state, &contact.workspace_id, USER_OPS_DOMAIN_ID).await?
+    else {
+        return Ok(()); // 未配置领导 = 本 workspace 未启用请示通道
+    };
+    if principal_wxid == contact.wxid {
+        return Err(AppError::BadRequest(
+            "principal_decider 配置等于客户 wxid，拒绝触发请示".into(),
+        ));
+    }
+    let category = req
+        .category
+        .clone()
+        .unwrap_or_else(|| crate::models::ESCALATION_CATEGORY_OUT_OF_SCOPE.to_string());
+    // 去重：同客户同类别已有 pending → 不重复推卡。
+    if escalation::has_pending_for_contact(state, &contact.workspace_id, &contact.wxid, &category)
+        .await?
+    {
+        return Ok(());
+    }
+    let reason = req.reason.clone().unwrap_or_default();
+    let question = req.question_for_principal.clone().unwrap_or_default();
+    let entry = escalation::insert_pending_escalation(
+        state,
+        &contact.workspace_id,
+        &contact.account_id,
+        &contact.wxid,
+        &category,
+        &reason,
+        &question,
+        &principal_wxid,
+        req.is_generalizable,
+    )
+    .await?;
+    let customer_label = contact
+        .remark
+        .clone()
+        .or_else(|| contact.nickname.clone())
+        .or_else(|| contact.alias.clone())
+        .unwrap_or_else(|| contact.wxid.clone());
+    let card =
+        escalation::render_principal_card(&entry.short_code, &customer_label, &reason, &question);
+    escalation::assert_target_is_principal(&principal_wxid, &principal_wxid)?;
+    mcp::logged_call_for_account(
+        state,
+        &contact.account_id,
+        "message_send_text",
+        serde_json::json!({ "recipient": principal_wxid, "content": card }),
+    )
+    .await?;
+    Ok(())
+}
+
+/// relay：把领导裁决用 AI 口吻转述给客户，走现有网关。转述完清等待态、按需发知识提案。
+pub(crate) async fn relay_principal_decision_to_customer(
+    state: &AppState,
+    contact: Contact,
+    entry: &crate::models::AgentPrincipalEscalation,
+    decision: &crate::models::PrincipalDecision,
+) -> AppResult<()> {
+    let synthetic = crate::models::ConversationMessage::synthetic_principal_relay(
+        &contact,
+        &decision.verdict,
+        &decision.substance,
+        &decision.constraints,
+    );
+    run_user_operation_gateway(
+        state,
+        contact.clone(),
+        AgentTrigger::Inbound(&synthetic),
+        None,
+        None,
+    )
+    .await?;
+    clear_awaiting_principal_state(state, &contact).await?;
+    let verdict_yields_knowledge = matches!(
+        decision.verdict.as_str(),
+        crate::models::PRINCIPAL_VERDICT_APPROVED | crate::models::PRINCIPAL_VERDICT_CONDITIONAL
+    );
+    if entry.is_generalizable && verdict_yields_knowledge && !entry.knowledge_proposal_emitted {
+        escalation::emit_knowledge_gap_proposal(state, entry, decision).await?;
+        state
+            .db
+            .agent_principal_escalations()
+            .update_one(
+                doc! { "short_code": &entry.short_code },
+                doc! { "$set": { "knowledge_proposal_emitted": true } },
+                None,
+            )
+            .await?;
+    }
+    Ok(())
+}
+
+/// 清掉客户 state 上的"等待领导决策"标记（key 用 AWAITING_PRINCIPAL_DECISION_ATTR 常量）。
+async fn clear_awaiting_principal_state(state: &AppState, contact: &Contact) -> AppResult<()> {
+    let unset_key = format!(
+        "domain_attributes.{}",
+        crate::models::AWAITING_PRINCIPAL_DECISION_ATTR
+    );
+    state
+        .db
+        .contacts()
+        .update_one(
+            doc! { "workspace_id": &contact.workspace_id, "account_id": &contact.account_id, "wxid": &contact.wxid },
+            doc! { "$unset": { unset_key: "" } },
+            None,
+        )
+        .await?;
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1529,6 +1654,21 @@ async fn run_user_operation_gateway_inner(
             Err(err) => {
                 tracing::error!(?err, %run_id, "outbox enqueue failed");
                 return Err(err.into());
+            }
+        }
+    }
+    // 决策请示触发（统一占位模型）：占位 reply 已入 outbox 正常发给客户，
+    // 这里只做不面向客户的副作用——推请示卡给领导 + 落台账 pending。
+    // 失败不回滚已发占位、不让 run 失败：仅 warn 降级。
+    if let Some(req) = final_decision.escalation_request.as_ref() {
+        if req.needed {
+            if let Err(err) = trigger_principal_escalation(state, &contact, req).await {
+                tracing::warn!(
+                    workspace_id = %contact.workspace_id,
+                    contact_wxid = %contact.wxid,
+                    error = %err,
+                    "principal escalation 推卡/落台账失败（占位已正常发出，降级不阻断 run）"
+                );
             }
         }
     }

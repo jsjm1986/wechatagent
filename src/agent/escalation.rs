@@ -7,7 +7,7 @@
 use super::generate_agent_json;
 use crate::error::{AppError, AppResult};
 use crate::models::{
-    AgentPrincipalEscalation, OperationKnowledgeChunk, PrincipalDecision,
+    AgentPrincipalEscalation, AgentTask, OperationKnowledgeChunk, PrincipalDecision,
     ALLOWED_ESCALATION_CATEGORY, ALLOWED_PRINCIPAL_VERDICT, PRINCIPAL_ESCALATION_STATUS_PENDING,
     PRINCIPAL_ESCALATION_STATUS_RESOLVED, PRINCIPAL_VERDICT_DEFERRED,
 };
@@ -252,6 +252,73 @@ pub(crate) async fn list_pending_for_principal(
         )
         .await?;
     Ok(cursor.try_collect().await?)
+}
+
+/// 该客户是否已有同类别的 pending 请示（去重用：避免等待期重复推卡骚扰领导）。
+pub(crate) async fn has_pending_for_contact(
+    state: &AppState,
+    workspace_id: &str,
+    contact_wxid: &str,
+    category: &str,
+) -> AppResult<bool> {
+    let count = state
+        .db
+        .agent_principal_escalations()
+        .count_documents(
+            doc! {
+                "workspace_id": workspace_id,
+                "contact_wxid": contact_wxid,
+                "category": category,
+                "status": PRINCIPAL_ESCALATION_STATUS_PENDING,
+            },
+            None,
+        )
+        .await?;
+    Ok(count > 0)
+}
+
+/// 处理 principal_decision_relay task：领导已裁决，把决策用 AI 口吻转述给客户。
+pub(crate) async fn handle_principal_decision_relay(
+    state: &AppState,
+    task: &AgentTask,
+) -> AppResult<()> {
+    let short_code = task.content.trim();
+    let entry = state
+        .db
+        .agent_principal_escalations()
+        .find_one(doc! { "short_code": short_code }, None)
+        .await?;
+    let Some(entry) = entry else {
+        return Ok(());
+    };
+    let Some(decision) = entry.decision.clone() else {
+        return Ok(());
+    };
+
+    let now = mongodb::bson::DateTime::now();
+    if relay_substance_if_usable(&decision, entry.authorization_expires_at, now).is_none() {
+        // 授权过期：不拿过期授权乱承诺，结束。
+        return Ok(());
+    }
+
+    let contact = state
+        .db
+        .contacts()
+        .find_one(
+            doc! {
+                "workspace_id": &entry.workspace_id,
+                "account_id": &entry.account_id,
+                "wxid": &entry.contact_wxid
+            },
+            None,
+        )
+        .await?;
+    let Some(contact) = contact else {
+        return Ok(());
+    };
+
+    crate::agent::gateway::relay_principal_decision_to_customer(state, contact, &entry, &decision)
+        .await
 }
 
 /// 把一条 pending 台账标 resolved，写入真人裁决 + 授权过期时间。
