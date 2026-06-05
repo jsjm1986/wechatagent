@@ -582,6 +582,19 @@ async fn enqueue_relay_task(state: &AppState, entry: &AgentPrincipalEscalation) 
     Ok(())
 }
 
+/// 多轮卡死判定（业务决策 #5）：同一议题连续 stalled_turns 轮未推进 + 最近一轮负面反应。
+/// 两条件同时满足才算卡死。纯函数，输入由 gateway 从 state/reaction 取。
+pub(crate) fn is_stuck_or_undelivered(
+    consecutive_unprogressed_turns: u32,
+    threshold: u32,
+    latest_reaction_is_negative: bool,
+) -> bool {
+    consecutive_unprogressed_turns >= threshold && latest_reaction_is_negative
+}
+
+/// 默认卡死轮阈值（spec：默认 3，可配）。
+pub(crate) const DEFAULT_STUCK_THRESHOLD: u32 = 3;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -774,5 +787,21 @@ mod tests {
         assert_eq!(out.verdict, "deferred");
         assert_eq!(out.substance, "x");
         assert_eq!(out.authorization_window_hours, Some(24.0));
+    }
+
+    #[test]
+    fn stuck_needs_both_conditions() {
+        // 轮数够但无负面反应 → 不触发
+        assert!(!is_stuck_or_undelivered(5, 3, false));
+        // 有负面反应但轮数不够 → 不触发
+        assert!(!is_stuck_or_undelivered(2, 3, true));
+        // 两者都满足 → 触发
+        assert!(is_stuck_or_undelivered(3, 3, true));
+        assert!(is_stuck_or_undelivered(4, 3, true));
+    }
+
+    #[test]
+    fn default_stuck_threshold_is_three() {
+        assert_eq!(DEFAULT_STUCK_THRESHOLD, 3);
     }
 }
