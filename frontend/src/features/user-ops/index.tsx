@@ -6,9 +6,9 @@ import {
   UserPlaybookPanel,
   DomainPromptPanel,
   DomainConfigEditor,
-  TraditionalOpsTabs,
-  OperationsView
-} from "../../App";
+  TraditionalOpsTabs
+} from "./legacy";
+import OperationsFeature from "../operations";
 import { useUserOpsStore } from "../../stores/userOpsStore";
 import { useStrategyStore } from "../../stores/strategyStore";
 import { useContactStore } from "../../stores/contactStore";
@@ -165,17 +165,14 @@ export default function UserOpsFeature() {
   }, [contacts, contactTab]);
 
   // 占位数据（这些需要从适当的地方获取）
-  const events: any[] = [];
-  const tasks: any[] = [];
-  const llmUsage: any = null;
-  const opsTab = "tasks";
-  const setOpsTab = () => {};
   const importQuery = "";
   const setImportQuery = () => {};
   const query = "";
   const setQuery = () => {};
 
-  const pendingTasks = tasks.filter((task) => task.status === "pending").length;
+  // 待办计数徽标——真实运营数据现由自包含 OperationsFeature/operationsStore 负责加载，
+  // 这里不再用占位 tasks 反推；徽标后续可订阅 operationsStore.pending 派生。
+  const pendingTasks = 0;
 
   // 占位函数
   const importContacts = async () => {};
@@ -345,16 +342,7 @@ export default function UserOpsFeature() {
             />
           )}
 
-          {traditionalOpsTab === "audit" && (
-            <OperationsView
-              decisionReviews={decisionReviews}
-              events={events}
-              llmUsage={llmUsage}
-              opsTab={opsTab}
-              tasks={tasks}
-              onOpsTab={setOpsTab}
-            />
-          )}
+          {traditionalOpsTab === "audit" && <OperationsFeature />}
         </>
       )}
     </section>

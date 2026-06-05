@@ -23,16 +23,20 @@ vi.mock("../../../stores/strategyStore", () => ({
   useStrategyStore: vi.fn()
 }));
 
-// Mock所有从App导入的组件
-vi.mock("../../../App", () => ({
+// Mock所有从 legacy 模块导入的组件（user-ops 频道私有视图，已从 App.tsx 迁出）
+vi.mock("../../../features/user-ops/legacy", () => ({
   UserOperationCockpit: vi.fn(() => <div data-testid="user-operation-cockpit">UserOperationCockpit</div>),
   ContactsView: vi.fn(() => <div data-testid="contacts-view">ContactsView</div>),
   UserOpsModeHeader: vi.fn(() => <div data-testid="user-ops-mode-header">UserOpsModeHeader</div>),
   UserPlaybookPanel: vi.fn(() => <div data-testid="user-playbook-panel">UserPlaybookPanel</div>),
   DomainPromptPanel: vi.fn(() => <div data-testid="domain-prompt-panel">DomainPromptPanel</div>),
   DomainConfigEditor: vi.fn(() => <div data-testid="domain-config-editor">DomainConfigEditor</div>),
-  TraditionalOpsTabs: vi.fn(() => <div data-testid="traditional-ops-tabs">TraditionalOpsTabs</div>),
-  OperationsView: vi.fn(() => <div data-testid="operations-view">OperationsView</div>)
+  TraditionalOpsTabs: vi.fn(() => <div data-testid="traditional-ops-tabs">TraditionalOpsTabs</div>)
+}));
+
+// audit tab 现渲染自包含的 OperationsFeature（替换原 App.OperationsView 占位接线）
+vi.mock("../../../features/operations", () => ({
+  default: vi.fn(() => <div data-testid="operations-view">OperationsFeature</div>)
 }));
 
 import { useUserOpsStore } from "../../../stores/userOpsStore";
