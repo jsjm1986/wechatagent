@@ -458,6 +458,30 @@ pub(crate) async fn interpret_principal_reply(
     Ok(sanitize_verdict(decision))
 }
 
+/// 反查：在**入站消息自身所属 workspace** 内，from_wxid 是否是某 domain 的 principal_decider。
+/// 返回 Some(domain) 表示该 wxid 是本 workspace 的领导。
+/// 🔒 关键：必须用入站消息自己的 workspace_id 约束查询——否则 A workspace 的领导 wxid
+/// 若恰好也是 B workspace 某业务号的好友，B 收到他消息时会被误路由进 A 的请示流（跨域串扰）。
+pub(crate) async fn lookup_principal_config(
+    state: &AppState,
+    workspace_id: &str,
+    from_wxid: &str,
+) -> AppResult<Option<String>> {
+    let cfg = state
+        .db
+        .operation_domain_configs()
+        .find_one(
+            doc! {
+                "workspace_id": workspace_id,
+                "principal_decider": from_wxid,
+                "current_version": true,
+            },
+            None,
+        )
+        .await?;
+    Ok(cfg.map(|c| c.domain))
+}
+
 /// 处理真人（领导）的微信回复。匹配未决台账→解读→resolve→起 relay task。
 /// 业务决策 #4：不带码且多条未决时反问澄清（向领导发一条，不回流客户）。
 /// 返回 true 表示已作为领导回复消费（调用方据此不再进客户 agent 链路）。
