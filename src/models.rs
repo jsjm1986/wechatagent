@@ -1891,7 +1891,8 @@ pub const ALLOWED_PRINCIPAL_VERDICT: &[&str] = &[
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct EscalationRequest {
-    /// 是否需要请示真人。
+    /// 是否需要请示真人。LLM 漏给该字段时安全回落 false（不请示），与 AgentDecision 的 LLM-容错惯例一致。
+    #[serde(default)]
     pub needed: bool,
     /// 三类之一，见 ALLOWED_ESCALATION_CATEGORY。
     #[serde(default)]
@@ -1911,8 +1912,10 @@ pub struct EscalationRequest {
 }
 
 /// 真人自然语言裁决经 LLM 解读后的结构。绝不原话转发给客户。
+/// 注意：不加 rename_all="camelCase"——本结构会被持久化进 snake_case 的 AgentPrincipalEscalation
+/// 台账（decision 字段），保持 snake_case 让台账文档键统一、避免 decision.authorization_window_hours
+/// 查询/索引时静默 miss。Task 14 的 interpret prompt 须输出 snake_case 键。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
 pub struct PrincipalDecision {
     /// 裁决口径，见 ALLOWED_PRINCIPAL_VERDICT。
     pub verdict: String,
@@ -4188,5 +4191,12 @@ mod principal_escalation_model_tests {
         assert_eq!(req.category, None);
         assert!(!req.is_generalizable);
         assert!(req.self_serviceable_part.is_none());
+    }
+
+    #[test]
+    fn escalation_request_empty_object_defaults_to_not_needed() {
+        let req: EscalationRequest =
+            serde_json::from_str("{}").expect("empty object should deserialize");
+        assert!(!req.needed);
     }
 }
