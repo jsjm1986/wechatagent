@@ -622,6 +622,13 @@ pub struct OperationDomainConfig {
     /// Phase E / E5-T1：写入来源（`"system"` / `"legacy_migration"` / `"manual"` 等）。
     #[serde(default)]
     pub seeded_by: Option<String>,
+    /// 请示通道：接收请示卡的领导 wxid（须是业务号好友）。None=本 workspace 未启用请示通道。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub principal_decider: Option<String>,
+    /// 高风险件升级模式："all"=所有被静默 hold 的高风险件都请示真人；
+    /// "decision_only"=只升级实质需决策/授权的件。None/缺省 = "decision_only"（保守）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub high_risk_escalation_mode: Option<String>,
 }
 
 fn default_version_one() -> i32 {
@@ -3436,6 +3443,8 @@ mod typed_tests {
             current_version: true,
             previous_version: None,
             seeded_by: None,
+            principal_decider: None,
+            high_risk_escalation_mode: None,
         };
         let typed = cfg.runtime_parameters_typed();
         assert_eq!(typed.recent_message_limit, 16);
@@ -3528,6 +3537,8 @@ mod typed_tests {
             current_version: true,
             previous_version: None,
             seeded_by: None,
+            principal_decider: None,
+            high_risk_escalation_mode: None,
         };
         let typed = cfg.state_machine_typed();
         assert!(!typed.states.is_empty());

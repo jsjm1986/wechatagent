@@ -516,6 +516,8 @@ pub fn default_domain_configs(workspace_id: &str) -> Vec<OperationDomainConfig> 
             current_version: true,
             previous_version: None,
             seeded_by: Some("system".to_string()),
+            principal_decider: None,
+            high_risk_escalation_mode: None,
         },
         OperationDomainConfig {
             id: None,
@@ -542,6 +544,8 @@ pub fn default_domain_configs(workspace_id: &str) -> Vec<OperationDomainConfig> 
             current_version: true,
             previous_version: None,
             seeded_by: Some("system".to_string()),
+            principal_decider: None,
+            high_risk_escalation_mode: None,
         },
         OperationDomainConfig {
             id: None,
@@ -568,6 +572,8 @@ pub fn default_domain_configs(workspace_id: &str) -> Vec<OperationDomainConfig> 
             current_version: true,
             previous_version: None,
             seeded_by: Some("system".to_string()),
+            principal_decider: None,
+            high_risk_escalation_mode: None,
         },
     ]
 }

@@ -107,6 +107,23 @@ pub(crate) fn relay_substance_if_usable<'a>(
     }
 }
 
+/// 高风险件升级模式。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum HighRiskEscalationMode {
+    /// 所有被静默 hold 的高风险件都请示真人。
+    All,
+    /// 只升级实质需决策/授权的件（默认，保守）。
+    DecisionOnly,
+}
+
+/// 从 workspace 配置字符串解析升级模式；未配/未知值回落 DecisionOnly（保守默认）。
+pub(crate) fn parse_high_risk_mode(raw: Option<&str>) -> HighRiskEscalationMode {
+    match raw {
+        Some("all") => HighRiskEscalationMode::All,
+        _ => HighRiskEscalationMode::DecisionOnly,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -248,6 +265,21 @@ mod tests {
         assert_eq!(
             relay_substance_if_usable(&decision, Some(future), now),
             Some("可以 8 折")
+        );
+    }
+
+    #[test]
+    fn high_risk_mode_parses_all() {
+        assert_eq!(parse_high_risk_mode(Some("all")), HighRiskEscalationMode::All);
+    }
+
+    #[test]
+    fn high_risk_mode_defaults_to_decision_only() {
+        assert_eq!(parse_high_risk_mode(None), HighRiskEscalationMode::DecisionOnly);
+        assert_eq!(parse_high_risk_mode(Some("garbage")), HighRiskEscalationMode::DecisionOnly);
+        assert_eq!(
+            parse_high_risk_mode(Some("decision_only")),
+            HighRiskEscalationMode::DecisionOnly
         );
     }
 }

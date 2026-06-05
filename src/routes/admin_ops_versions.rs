@@ -86,6 +86,8 @@ pub(super) async fn publish_operation_domain_version(
         current_version: true,
         previous_version: Some(source.version),
         seeded_by: Some("manual".to_string()),
+        principal_decider: source.principal_decider,
+        high_risk_escalation_mode: source.high_risk_escalation_mode,
     };
     let inserted = coll.insert_one(&new_entry, None).await?;
     coll.update_many(
