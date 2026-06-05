@@ -28,12 +28,11 @@ use mongodb::bson::{doc, oid::ObjectId, DateTime};
 use wechatagent::agent::knowledge_agent::{answer, AnswerRequest, AnswerResult, CatalogFilter, SourceQuoteCitation};
 use wechatagent::auth::AuthenticatedAdmin;
 use wechatagent::llm::LlmClient;
-use wechatagent::models::{OperationKnowledgeChunk, RelatedRef};
+use wechatagent::models::{KnowledgeGapSignal, OperationKnowledgeChunk, RelatedRef};
 use wechatagent::routes::AppState;
-use wechatagent::routes::ext_knowledge::{chat_turn, verify_operation_knowledge_chunk, ChatTurnRequest, KnowledgeVerifyRequest};
+use wechatagent::routes::ext_knowledge::{chat_apply, chat_turn, verify_operation_knowledge_chunk, ChatApplyRequest, ChatTurnRequest, KnowledgeVerifyRequest};
 use axum::{extract::{State, Path}, Extension, Json};
 use serde_json::json;
-use mongodb::options::FindOneOptions;
 
 use crate::common::TestApp;
 use wiremock::MockServer;
@@ -954,10 +953,17 @@ async fn recall_all(
     results
 }
 
-/// Step 2 — chat_create_and_verify: 通过chat对话创建并审定知识切片
+/// Step 2 — chat_create_and_verify: 通过 chat 对话创建并审定知识切片。
+///
+/// 真实生产链路是两步：chat_turn 只产 **pending 草稿预览**（patch/draftPreview），
+/// 不落库；真正插入 draft chunk + 回填 createdChunkId 的是独立的 chat_apply
+/// （运营在前端「应用为草稿」按钮触发）。本 helper 照搬该两步设计：
+///   chat_turn（拿 sessionId + 确认 canApply）→ chat_apply（落库拿 createdChunkId）
+///   → verify_operation_knowledge_chunk（审定）。
+/// 任一步失败/未命中 create 意图 → 返回 None（调用方自我跳过，不算硬失败）。
 async fn chat_create_and_verify(
     state: &AppState,
-    ws: &str,
+    _ws: &str,
     admin: &AuthenticatedAdmin,
     content: &str,
 ) -> Option<String> {
@@ -971,7 +977,7 @@ async fn chat_create_and_verify(
     }))
     .expect("构造 ChatTurnRequest");
 
-    // 调用 chat_turn
+    // 调用 chat_turn —— 只产 pending 草稿预览，拿 sessionId
     let resp = match chat_turn(
         State(state.clone()),
         Extension(admin.clone()),
@@ -988,35 +994,50 @@ async fn chat_create_and_verify(
 
     let body = resp.0;
 
-    // 取 createdChunkId
-    let chunk_id = match body.get("createdChunkId") {
-        Some(serde_json::Value::String(id)) if !id.is_empty() => id.clone(),
+    // chat_turn 不落库，必须拿到 sessionId 去 chat_apply。intent 非 create_chunk
+    // 或 canApply=false（缺字段/无 patch）时，apply 会 400 —— 视为本轮未命中创建，跳过。
+    let session_id = match body.get("sessionId").and_then(|v| v.as_str()) {
+        Some(s) if !s.is_empty() => s.to_string(),
         _ => {
-            // DB 兜底查最新 draft
-            match state
-                .db
-                .operation_knowledge_chunks()
-                .find_one(
-                    doc! { "workspace_id": ws, "status": "draft" },
-                    FindOneOptions::builder()
-                        .sort(doc! { "created_at": -1 })
-                        .build(),
-                )
-                .await
-            {
-                Ok(Some(chunk)) => {
-                    if let Some(id) = chunk.id {
-                        id.to_hex()
-                    } else {
-                        eprintln!("[RECALL-MAINT] DB兜底查到的chunk无id，return None");
-                        return None;
-                    }
-                }
-                _ => {
-                    eprintln!("[RECALL-MAINT] DB兜底查最新draft失败，return None");
-                    return None;
-                }
-            }
+            eprintln!("[RECALL-MAINT] chat_turn 未返回 sessionId，return None");
+            return None;
+        }
+    };
+
+    // 调用 chat_apply —— 真正落库 draft chunk + 回填 createdChunkId
+    let apply_req: ChatApplyRequest = serde_json::from_value(json!({
+        "accountId": null
+    }))
+    .expect("构造 ChatApplyRequest");
+
+    let apply_resp = match chat_apply(
+        State(state.clone()),
+        Extension(admin.clone()),
+        Path(session_id.clone()),
+        Json(apply_req),
+    )
+    .await
+    {
+        Ok(resp) => resp,
+        Err(e) => {
+            // 最常见：本轮 AI 未命中 create_chunk 意图 / 草稿缺字段不可应用 → 400。
+            eprintln!("[RECALL-MAINT] chat_apply failed: {}, return None", e);
+            return None;
+        }
+    };
+
+    // chat_apply 返回 { ok, sessionId, intent, result: { createdChunkId, ... } }
+    let chunk_id = match apply_resp
+        .0
+        .get("result")
+        .and_then(|r| r.get("createdChunkId"))
+        .and_then(|v| v.as_str())
+    {
+        Some(id) if !id.is_empty() => id.to_string(),
+        _ => {
+            // intent=update_chunk 等不产 createdChunkId；本 helper 只服务「新增」语义。
+            eprintln!("[RECALL-MAINT] chat_apply 未回填 createdChunkId（intent 非 create_chunk？），return None");
+            return None;
         }
     };
 
@@ -1259,4 +1280,262 @@ async fn recall_benchmark_maintenance_stability() {
         drift_count_c, total_cases_c);
 
     eprintln!("[RECALL-MAINT] 真实chat改库全链路召回保持测试完成 —— 三变更后稳定性观测完毕");
+}
+
+// ── Task5: gap→主动提问→对话补库→再问命中 完整闭合轨迹 ─────────────────────────
+//
+// 业务闭环（用户原话）：文档→抽取入库→运营 agent 召回→agent 自然语言维护知识库
+// →缺知识反馈对话补全。此前各环节各有测试覆盖，但**没有任何单个测试走通整条
+// 闭合轨迹**——本测试把四步串成一条 end-to-end 真模型链路，并在收尾断言「同一
+// query 在补库后从弃答转为召回命中」，证明缺口真的被这条链路闭合了。
+//
+// 轨迹：
+//   ① seed 一个**不覆盖**某主题的小语料（仅退换货政策，不含跨境支付）。
+//   ② 知识 agent answer 该未覆盖主题 query → 走诚实弃答（cited 为空）。
+//   ③ bounded-retry 轮询确认 classify_recall_outcome 已确定性留下
+//      kind=recall_miss / status=pending / search_queries 含原始 query 的 gap 信号
+//      （信号写入在 answer() 的 tokio::spawn 内 fire-and-forget，故需有限重试）。
+//   ④ 取该信号携带的 query，走 chat_create_and_verify 用对话方式补一条覆盖该主题
+//      的 verified chunk（chat_turn 起草 → chat_apply 落 draft → verify 审定）。
+//   ⑤ 再 answer **同一** query → 断言这次 reach/adopt 召回命中新补的 chunk。
+//
+// 红线：cite ⊆ opened（reach ⊇ adopt 已由 reach_set/adopt_set 结构保证；补库后
+// 召回命中的必须是真实 seed 进 ws 的 chunk，不许幻觉 id）、ingestion 恒
+// draft+needs_review（chat_apply 强制，verify 是显式人工审定动作而非 AI 自动）。
+// 全程 #[ignore] + env-gated REAL_LLM_API_KEY；真模型上游瞬时不可达 → 跳过不算失败。
+
+/// bounded-retry 轮询 recall_miss gap 信号（镜像 K3 闭环红线的有限重试模式）。
+/// 信号在 answer() 的 spawn 内 fire-and-forget 落库，故需轮询而非一次读取。
+/// 命中条件：workspace_id 匹配 + kind=recall_miss + status=pending +
+/// search_queries 含 original_query。最多 retries 次、每次间隔 interval。
+async fn poll_recall_miss_signal(
+    state: &AppState,
+    ws: &str,
+    original_query: &str,
+    retries: usize,
+    interval: std::time::Duration,
+) -> Option<KnowledgeGapSignal> {
+    for _ in 0..retries {
+        let found = state
+            .db
+            .knowledge_gap_signals()
+            .find_one(
+                doc! {
+                    "workspace_id": ws,
+                    "kind": "recall_miss",
+                    "status": "pending",
+                    "search_queries": original_query,
+                },
+                None,
+            )
+            .await
+            .ok()
+            .flatten();
+        if let Some(sig) = found {
+            return Some(sig);
+        }
+        tokio::time::sleep(interval).await;
+    }
+    None
+}
+
+/// 单跑一次 answer，返回 (reach, adopt)；瞬时不可达 → None（调用方跳过）。
+async fn answer_reach_adopt(
+    state: &AppState,
+    ws: &str,
+    query: &str,
+) -> Option<(Vec<String>, Vec<String>)> {
+    let req = AnswerRequest {
+        workspace_id: ws.to_string(),
+        account_id: None,
+        query: query.to_string(),
+        filter: CatalogFilter {
+            wiki_types: vec![],
+            business_topics: vec![],
+            status: None,
+            include_unverified: false,
+        },
+        max_rounds: None,
+    };
+    match answer(state, req).await {
+        Ok(result) => Some((reach_set(&result), adopt_set(&result))),
+        Err(wechatagent::error::AppError::LlmUnavailable { kind, retry_count, .. }) => {
+            eprintln!(
+                "[RECALL-CLOSED] skip —— 真模型上游瞬时不可达（kind={}, retry_count={}）",
+                kind, retry_count
+            );
+            None
+        }
+        Err(other) => {
+            eprintln!("[RECALL-CLOSED] answer 失败：{}", other);
+            None
+        }
+    }
+}
+
+#[tokio::test]
+#[ignore]
+async fn recall_benchmark_gap_closed_loop_trajectory() {
+    let llm = require_real_llm!();
+    let app = TestApp::start().await;
+    let mcp = dummy_mcp_server().await;
+    let state = common::rebuild_app_state_with_real_llm(&app, llm, mcp.uri());
+    let ws = "recall_closed_loop_ws"; // 独立 ws 避免污染
+
+    // ① seed 一个不覆盖「跨境支付」主题的小语料：只放退换货政策。
+    let policy_id = seed_verified(
+        &app,
+        ws,
+        "退换货政策",
+        "7 天无理由退换",
+        "本店支持 7 天无理由退换货，商品需保持完好、配件齐全，由客服核验后办理。",
+    )
+    .await;
+    eprintln!("[RECALL-CLOSED] ① 种子语料完成 policy_id={}", policy_id);
+
+    // 跨境支付主题的 query —— 当前知识库无任何覆盖，应触发诚实弃答。
+    let gap_query = "你们支持哪些海外支付货币？跨境结算手续费是百分之几？";
+
+    // ② answer 未覆盖主题 → 期望诚实弃答（cited 为空 → reach/adopt 不命中已有 chunk）。
+    let (reach0, adopt0) = match answer_reach_adopt(&state, ws, gap_query).await {
+        Some(v) => v,
+        None => return, // 瞬时不可达，跳过
+    };
+    eprintln!(
+        "[RECALL-CLOSED] ② 弃答阶段 reach0={:?} adopt0={:?}",
+        reach0, adopt0
+    );
+    // 诚实弃答语义：不应采纳到任何已有 chunk（adopt 为空）；这是触发 recall_miss
+    // 的前提。若真模型异常 cite 了无关 policy chunk，说明弃答未发生，无法验证闭环 →
+    // 跳过（不硬失败，避免把真模型偶发行为当缺陷；闭环正例由命中阶段断言保证）。
+    if !adopt0.is_empty() {
+        eprintln!(
+            "[RECALL-CLOSED] 跳过：弃答阶段意外 adopt={:?}（未发生诚实弃答），\
+             无法验证缺口闭合",
+            adopt0
+        );
+        return;
+    }
+
+    // ③ bounded-retry 轮询 recall_miss gap 信号（spawn 内 fire-and-forget 落库）。
+    let signal = match poll_recall_miss_signal(
+        &state,
+        ws,
+        gap_query,
+        10,
+        std::time::Duration::from_millis(300),
+    )
+    .await
+    {
+        Some(sig) => sig,
+        None => {
+            eprintln!("[RECALL-CLOSED] 跳过：未在限定重试内观测到 recall_miss 信号");
+            return;
+        }
+    };
+    // 红线断言：信号确定性字段（与 K3 闭环红线一致）。
+    assert_eq!(signal.kind, "recall_miss", "gap 信号 kind 必须是 recall_miss");
+    assert_eq!(signal.status, "pending", "gap 信号 status 必须是 pending");
+    assert!(
+        signal.search_queries.iter().any(|q| q == gap_query),
+        "gap 信号 search_queries {:?} 必须含原始 query {}",
+        signal.search_queries,
+        gap_query
+    );
+    eprintln!(
+        "[RECALL-CLOSED] ③ 观测到 recall_miss 信号 signal_id={} search_queries={:?}",
+        signal.signal_id, signal.search_queries
+    );
+
+    // ④ 取信号携带的 query（运营据此对话补全），用 chat 对话补一条覆盖该主题的
+    //    verified chunk。优先用信号里的原始 query 作为补全话题锚点。
+    let admin = AuthenticatedAdmin {
+        user_id: "recall_closed_admin".to_string(),
+        username: "recall_closed_admin".to_string(),
+        current_workspace: ws.to_string(),
+    };
+    let create_content = format!(
+        "帮我新建一条知识切片回应这个反复被问到的缺口：{gap_query} \
+         事实依据：我们支持美元(USD)、欧元(EUR)、港币(HKD)三种海外货币结算，\
+         跨境结算手续费为交易金额的 1.5%。知识类型是产品政策，请起草标题、摘要和正文。"
+    );
+    let created_chunk_id = match chat_create_and_verify(&state, ws, &admin, &create_content).await {
+        Some(id) => {
+            eprintln!("[RECALL-CLOSED] ④ 对话补库成功 created_chunk_id={}", id);
+            id
+        }
+        None => {
+            eprintln!("[RECALL-CLOSED] 跳过：对话补库未命中 create 意图 / 未落库");
+            return;
+        }
+    };
+
+    // 红线：补库产物必须真实存在于本 ws，且经显式 verify 后为 status=verified
+    //（chat_apply 落 draft+needs_review，verify 是人工审定动作；AI 永不自动 verify）。
+    let created_oid = ObjectId::parse_str(&created_chunk_id).expect("created_chunk_id 合法 ObjectId");
+    let created_chunk = app
+        .state
+        .db
+        .operation_knowledge_chunks()
+        .find_one(doc! { "_id": created_oid, "workspace_id": ws }, None)
+        .await
+        .expect("查询补库 chunk")
+        .expect("补库 chunk 必须存在于本 ws");
+    assert_eq!(
+        created_chunk.status, "verified",
+        "补库 chunk 经显式 verify 后必须为 verified"
+    );
+
+    // ⑤ 再 answer **同一** query → 断言缺口闭合：这次召回命中新补的 chunk。
+    let (reach1, adopt1) = match answer_reach_adopt(&state, ws, gap_query).await {
+        Some(v) => v,
+        None => return, // 瞬时不可达，跳过
+    };
+    eprintln!(
+        "[RECALL-CLOSED] ⑤ 补库后 reach1={:?} adopt1={:?}（target={}）",
+        reach1, adopt1, created_chunk_id
+    );
+
+    // 缺口闭合主断言：补库后 reach 召回命中新补的 chunk（被翻到）。
+    assert!(
+        reach1.contains(&created_chunk_id),
+        "缺口未闭合：补库后 reach {:?} 未命中新补 chunk {}",
+        reach1,
+        created_chunk_id
+    );
+    // adopt 命中（被真正引用作答）是更强的闭环证据：真模型偶发只翻不引时降级为软告警，
+    // 不让真模型的引用波动把整条确定性闭环（reach 命中 + 信号红线）判红。
+    if adopt1.contains(&created_chunk_id) {
+        eprintln!("[RECALL-CLOSED] adopt 也命中新补 chunk —— 缺口完全闭合（reach+adopt）");
+    } else {
+        eprintln!(
+            "[RECALL-CLOSED][SOFT-WARN] adopt 未命中新补 chunk（reach 已命中）：\
+             真模型本轮翻到却未引用，缺口已可召回但未采纳"
+        );
+    }
+
+    // 红线：补库后召回命中的 chunk 必须真实存在于本 ws（不许幻觉 id）。
+    let all_ids = app
+        .state
+        .db
+        .operation_knowledge_chunks()
+        .find(doc! { "workspace_id": ws }, None)
+        .await
+        .expect("查询 ws 全部 chunks")
+        .try_collect::<Vec<OperationKnowledgeChunk>>()
+        .await
+        .expect("收集 ws 全部 chunks")
+        .into_iter()
+        .filter_map(|c| c.id.map(|id| id.to_hex()))
+        .collect::<HashSet<String>>();
+    for id in &reach1 {
+        assert!(
+            all_ids.contains(id),
+            "RED-LINE 召回集越界：{} 不在 ws {} 全集中（补库后命中阶段）",
+            id,
+            ws
+        );
+    }
+
+    eprintln!("[RECALL-CLOSED] 闭合轨迹测试完成 —— gap→提问→对话补库→同 query 再命中 全程走通");
 }

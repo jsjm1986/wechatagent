@@ -4549,11 +4549,11 @@ pub(super) async fn chat_history(
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub(super) struct ChatApplyRequest {
+pub struct ChatApplyRequest {
     pub account_id: Option<String>,
 }
 
-pub(super) async fn chat_apply(
+pub async fn chat_apply(
     State(state): State<AppState>,
     Extension(admin): Extension<AuthenticatedAdmin>,
     Path(session_id): Path<String>,
