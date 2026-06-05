@@ -215,7 +215,7 @@ pub(crate) async fn insert_pending_escalation(
                 return Ok(saved);
             }
             Err(e) => {
-                if is_duplicate_key_error(&e) && attempt < 4 {
+                if is_duplicate_key_error(&e) {
                     continue;
                 }
                 return Err(e.into());
