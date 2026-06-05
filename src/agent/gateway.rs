@@ -543,6 +543,7 @@ pub(crate) async fn relay_principal_decision_to_customer(
     contact: Contact,
     entry: &crate::models::AgentPrincipalEscalation,
     decision: &crate::models::PrincipalDecision,
+    task_id: Option<ObjectId>,
 ) -> AppResult<()> {
     let synthetic = crate::models::ConversationMessage::synthetic_principal_relay(
         &contact,
@@ -554,7 +555,7 @@ pub(crate) async fn relay_principal_decision_to_customer(
         state,
         contact.clone(),
         AgentTrigger::Inbound(&synthetic),
-        None,
+        task_id,
         None,
     )
     .await?;

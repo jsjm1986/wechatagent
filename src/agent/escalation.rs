@@ -320,7 +320,7 @@ pub(crate) async fn handle_principal_decision_relay(
         return Ok(());
     };
 
-    crate::agent::gateway::relay_principal_decision_to_customer(state, contact, &entry, &decision)
+    crate::agent::gateway::relay_principal_decision_to_customer(state, contact, &entry, &decision, task.id)
         .await
 }
 
