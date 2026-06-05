@@ -1873,6 +1873,11 @@ pub const ALLOWED_ESCALATION_CATEGORY: &[&str] = &[
     ESCALATION_CATEGORY_STUCK,
 ];
 
+/// contact.domain_attributes 上的布尔标记 key：该客户有一个 pending 请示、正在等待领导决策。
+/// admin 看板据此显示「等待中」；等待期 pre-check 据此识别。统一占位模型下这只是可观测标记，
+/// 不是 hold category——触发请示的 run 本身是 Approved，占位已正常发出。
+pub const AWAITING_PRINCIPAL_DECISION_ATTR: &str = "awaiting_principal_decision";
+
 /// 真人裁决口径闭集。
 pub const PRINCIPAL_VERDICT_APPROVED: &str = "approved";
 pub const PRINCIPAL_VERDICT_REJECTED: &str = "rejected";
@@ -4174,6 +4179,13 @@ mod principal_escalation_model_tests {
         assert!(ALLOWED_PRINCIPAL_ESCALATION_STATUS.contains(&PRINCIPAL_ESCALATION_STATUS_PENDING));
         assert!(ALLOWED_PRINCIPAL_ESCALATION_STATUS.contains(&PRINCIPAL_ESCALATION_STATUS_RESOLVED));
         assert_eq!(ALLOWED_PRINCIPAL_ESCALATION_STATUS.len(), 2);
+    }
+
+    #[test]
+    fn awaiting_principal_decision_attr_key_is_stable() {
+        // set（Task 18 apply_agent_updates）与 unset（Task 16 clear_awaiting_principal_state）
+        // 必须用同一个 key，否则等待标记清不掉。锁死常量值防回归。
+        assert_eq!(AWAITING_PRINCIPAL_DECISION_ATTR, "awaiting_principal_decision");
     }
 
     #[test]
