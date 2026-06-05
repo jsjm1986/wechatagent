@@ -6,8 +6,9 @@
 
 use crate::error::{AppError, AppResult};
 use crate::models::{
-    AgentPrincipalEscalation, PrincipalDecision, ALLOWED_ESCALATION_CATEGORY,
-    PRINCIPAL_ESCALATION_STATUS_PENDING, PRINCIPAL_ESCALATION_STATUS_RESOLVED,
+    AgentPrincipalEscalation, OperationKnowledgeChunk, PrincipalDecision,
+    ALLOWED_ESCALATION_CATEGORY, PRINCIPAL_ESCALATION_STATUS_PENDING,
+    PRINCIPAL_ESCALATION_STATUS_RESOLVED,
 };
 use crate::routes::AppState;
 use mongodb::bson::{doc, DateTime};
@@ -290,6 +291,45 @@ fn is_duplicate_key_error(e: &mongodb::error::Error) -> bool {
         mongodb::error::ErrorKind::Write(mongodb::error::WriteFailure::WriteError(ref we))
             if we.code == 11000
     )
+}
+
+/// 真人决策可泛化时，发一条知识缺口提案（draft + needs_review）。
+/// 复用现有知识子系统的 draft 契约——绝不自动验证（AI 永不自动验证红线）。
+/// 写 workspace 共享域（account_id=None），与既有 chat 补库共享域一致，
+/// 保证提案对整个 workspace 召回可见，而非账号私有。
+pub(crate) async fn emit_knowledge_gap_proposal(
+    state: &AppState,
+    escalation: &AgentPrincipalEscalation,
+    decision: &PrincipalDecision,
+) -> AppResult<()> {
+    let title = format!("真人决策沉淀（待审核）：{}", escalation.reason);
+    let body = format!(
+        "源自客户「{}」请示 #{}。\n卡点：{}\n领导裁决：{}\n约束：{}",
+        escalation.contact_wxid,
+        escalation.short_code,
+        escalation.reason,
+        decision.substance,
+        if decision.constraints.is_empty() {
+            "无".to_string()
+        } else {
+            decision.constraints.join("；")
+        }
+    );
+    let chunk = OperationKnowledgeChunk {
+        workspace_id: escalation.workspace_id.clone(),
+        account_id: None, // workspace 共享域（与既有 chat 补库共享域一致）
+        status: "draft".to_string(),
+        integrity_status: Some("needs_review".to_string()),
+        title,
+        body: Some(body),
+        ..OperationKnowledgeChunk::default()
+    };
+    state
+        .db
+        .operation_knowledge_chunks()
+        .insert_one(&chunk, None)
+        .await?;
+    Ok(())
 }
 
 #[cfg(test)]
