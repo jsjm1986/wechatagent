@@ -4623,7 +4623,22 @@ pub async fn chat_apply(
                 .filter(|c| !c.is_empty())
                 .collect::<Vec<_>>()
                 .join("\n");
-            apply_create_chunk(&state, &admin.current_workspace, &account_id, &trimmed, patch, target_pack_id.as_deref(), &operator_statement)
+            // chat 新建知识默认落 workspace 共享域（account_id=null），与 seed/import/manual
+            // 等所有其它写入口一致——只有运营显式绑定了某个**非 default** 账号时才把切片私有化
+            // 到该账号。否则共享，使共享域召回（account_id=None）与任意联系人生产召回
+            // （account_id=Some(contact) 匹配 null OR contact）都能检索到对话补的知识。
+            let create_account_id: Option<String> = body
+                .account_id
+                .clone()
+                .or_else(|| {
+                    if last_assistant.account_id.is_empty() {
+                        None
+                    } else {
+                        Some(last_assistant.account_id.clone())
+                    }
+                })
+                .filter(|a| !a.is_empty() && *a != state.config.default_account_id);
+            apply_create_chunk(&state, &admin.current_workspace, create_account_id.as_deref(), &trimmed, patch, target_pack_id.as_deref(), &operator_statement)
                 .await?
         }
         "update_chunk" => {
@@ -5834,7 +5849,7 @@ action 必须在 [fix_chunk, add_chunk, retag, review_evolution, analyze_logs, d
 async fn apply_create_chunk(
     state: &AppState,
     workspace_id: &str,
-    account_id: &str,
+    account_id: Option<&str>,
     session_id: &str,
     patch: &Document,
     target_pack_id: Option<&str>,
@@ -5975,7 +5990,7 @@ async fn apply_update_pack(
 /// 缺字段补默认值；让后端的 apply_chunk_integrity 在写入路径上重算 anchor。
 fn chunk_request_from_chat_patch(
     patch: &Value,
-    account_id: &str,
+    account_id: Option<&str>,
     pack_id: Option<&str>,
 ) -> OperationKnowledgeChunkRequest {
     fn s(v: &Value, k: &str) -> Option<String> {
@@ -5996,7 +6011,7 @@ fn chunk_request_from_chat_patch(
             .unwrap_or_default()
     }
     OperationKnowledgeChunkRequest {
-        account_id: Some(account_id.to_string()),
+        account_id: account_id.map(|s| s.to_string()),
         document_id: None,
         item_id: pack_id.map(|s| s.to_string()),
         domain: "user_operations".to_string(),
