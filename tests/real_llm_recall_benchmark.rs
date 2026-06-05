@@ -1308,6 +1308,7 @@ async fn recall_benchmark_maintenance_stability() {
 /// 信号在 answer() 的 spawn 内 fire-and-forget 落库，故需轮询而非一次读取。
 /// 命中条件：workspace_id 匹配 + kind=recall_miss + status=pending +
 /// search_queries 含 original_query。最多 retries 次、每次间隔 interval。
+/// 生产侧 persist 已先于 LLM followup 确定性落库，窗口只需吸收 spawn 调度 + DB 往返。
 async fn poll_recall_miss_signal(
     state: &AppState,
     ws: &str,
@@ -1418,20 +1419,26 @@ async fn recall_benchmark_gap_closed_loop_trajectory() {
     }
 
     // ③ bounded-retry 轮询 recall_miss gap 信号（spawn 内 fire-and-forget 落库）。
+    //    走到此处 = ② 的 answer 已成功（LlmUnavailable 早在 ② return 跳过）且 adopt0 空
+    //    ⟺ cited==0；非 cancelled（本测试无取消机制）→ classify_recall_outcome 确定性产出
+    //    recall_miss，且生产侧已把 persist 排在任何 LLM followup 之前（恒在、零 LLM 依赖）。
+    //    故 20s 窗口内未观测到信号 = 生产落库链路真缺陷，**硬失败**而非软跳过——软跳过会让
+    //    后续 ④ 对话补库→verify 的生产闭环永远走不到、形同没测。
     let signal = match poll_recall_miss_signal(
         &state,
         ws,
         gap_query,
-        10,
-        std::time::Duration::from_millis(300),
+        40,
+        std::time::Duration::from_millis(500),
     )
     .await
     {
         Some(sig) => sig,
-        None => {
-            eprintln!("[RECALL-CLOSED] 跳过：未在限定重试内观测到 recall_miss 信号");
-            return;
-        }
+        None => panic!(
+            "[RECALL-CLOSED] 缺陷：弃答已发生（adopt 空 ⟺ cited==0）却在 20s 内未观测到 \
+             recall_miss 信号。生产侧 persist_recall_signal 应先于 LLM followup 确定性落库，\
+             此处为空说明在线召回-trace 落库链路断裂"
+        ),
     };
     // 红线断言：信号确定性字段（与 K3 闭环红线一致）。
     assert_eq!(signal.kind, "recall_miss", "gap 信号 kind 必须是 recall_miss");
