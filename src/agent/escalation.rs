@@ -4,12 +4,14 @@
 //! 请示，拿到裁决后用 AI 口吻向客户转述。客户永远只跟 Agent 对话——真人是
 //! 幕后决策源，绝不直接面对客户。这不是真人下场：AI 向内部决策源请示，转述仍由 AI 完成。
 
+use super::generate_agent_json;
 use crate::error::{AppError, AppResult};
 use crate::models::{
     AgentPrincipalEscalation, OperationKnowledgeChunk, PrincipalDecision,
-    ALLOWED_ESCALATION_CATEGORY, PRINCIPAL_ESCALATION_STATUS_PENDING,
-    PRINCIPAL_ESCALATION_STATUS_RESOLVED,
+    ALLOWED_ESCALATION_CATEGORY, ALLOWED_PRINCIPAL_VERDICT, PRINCIPAL_ESCALATION_STATUS_PENDING,
+    PRINCIPAL_ESCALATION_STATUS_RESOLVED, PRINCIPAL_VERDICT_DEFERRED,
 };
+use crate::prompts;
 use crate::routes::AppState;
 use mongodb::bson::{doc, DateTime};
 
@@ -332,6 +334,62 @@ pub(crate) async fn emit_knowledge_gap_proposal(
     Ok(())
 }
 
+/// 校验 verdict，越界回落 deferred（纯函数，便于单测）。
+pub(crate) fn sanitize_verdict(decision: PrincipalDecision) -> PrincipalDecision {
+    if ALLOWED_PRINCIPAL_VERDICT.contains(&decision.verdict.as_str()) {
+        decision
+    } else {
+        PrincipalDecision {
+            verdict: PRINCIPAL_VERDICT_DEFERRED.to_string(),
+            substance: decision.substance,
+            constraints: decision.constraints,
+            authorization_window_hours: decision.authorization_window_hours,
+        }
+    }
+}
+
+/// 用 LLM 把真人自然语言回复解读成结构化裁决。绝不原话转发给客户。
+/// 解析失败或 verdict 越界时回落 deferred（保守：宁可当"领导还没定"也不乱转述）。
+pub(crate) async fn interpret_principal_reply(
+    state: &AppState,
+    account_id: &str,
+    escalation: &AgentPrincipalEscalation,
+    principal_reply_text: &str,
+) -> AppResult<PrincipalDecision> {
+    let user = format!(
+        "客户请示问题：{}\n领导回复原话：{}",
+        escalation.question_for_principal, principal_reply_text
+    );
+    let system = prompts::load_prompt(
+        &state.db,
+        &state.config.default_workspace_id,
+        "escalation.principal.interpret",
+    )
+    .await?;
+    let value = generate_agent_json(
+        state,
+        Some(account_id),
+        Some(&escalation.contact_wxid),
+        None,
+        "escalation.principal.interpret",
+        &system,
+        &user,
+    )
+    .await?;
+    let decision: PrincipalDecision = match serde_json::from_value(value) {
+        Ok(d) => d,
+        Err(_) => {
+            return Ok(PrincipalDecision {
+                verdict: PRINCIPAL_VERDICT_DEFERRED.to_string(),
+                substance: String::new(),
+                constraints: vec![],
+                authorization_window_hours: None,
+            });
+        }
+    };
+    Ok(sanitize_verdict(decision))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -499,5 +557,30 @@ mod tests {
     #[test]
     fn assert_target_is_principal_rejects_customer() {
         assert!(assert_target_is_principal("customer_wxid", "boss_wxid").is_err());
+    }
+
+    #[test]
+    fn sanitize_verdict_keeps_valid() {
+        let d = PrincipalDecision {
+            verdict: "approved".into(),
+            substance: "ok".into(),
+            constraints: vec![],
+            authorization_window_hours: None,
+        };
+        assert_eq!(sanitize_verdict(d).verdict, "approved");
+    }
+
+    #[test]
+    fn sanitize_verdict_falls_back_on_garbage() {
+        let d = PrincipalDecision {
+            verdict: "maybe_lol".into(),
+            substance: "x".into(),
+            constraints: vec![],
+            authorization_window_hours: Some(24.0),
+        };
+        let out = sanitize_verdict(d);
+        assert_eq!(out.verdict, "deferred");
+        assert_eq!(out.substance, "x");
+        assert_eq!(out.authorization_window_hours, Some(24.0));
     }
 }

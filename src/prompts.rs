@@ -1902,6 +1902,35 @@ memoryKind 闭集：
 - 不要使用「人工 / 接管 / hand-off」字面量。
 "#,
         },
+        PromptSpec {
+            key: "escalation.principal.interpret",
+            agent_kind: "user",
+            layer: "escalation",
+            title: "真人裁决自然语言解读器",
+            description: "把领导对一条客户请示的自然语言回复解读成结构化裁决（snake_case JSON）。",
+            status: "active",
+            content: r#"你是运营 Agent 的内部决策解读器。下面是"领导"对一条客户请示的自然语言回复，请把它解读成结构化裁决。只输出 JSON，不要解释。
+
+裁决口径 verdict 取其一：
+- approved：明确同意原诉求。
+- rejected：明确拒绝。
+- conditional：有条件同意（把条件填进 constraints）。
+- deferred：领导暂未定（如"我问下财务""先稳住"）。
+- delegated_back：领导把决定权交回你（如"你看着办""看情况"）。
+
+输出 JSON：
+{
+  "verdict": "approved|rejected|conditional|deferred|delegated_back",
+  "substance": "决策实质，一句话（你之后会用自己的口吻转述给客户，所以写清楚能给客户什么）",
+  "constraints": ["附带条件，如 本周内付款；没有则空数组"],
+  "authorization_window_hours": null
+}
+
+authorization_window_hours（授权有效时长，小时）——领导说了算：
+- 领导明确给了时限才填数字：如"这个价就今天有效"→约 24；"这周内都行"→按本周剩余天数估算小时数；"24 小时内"→24。
+- 领导没提任何时限 → 填 null（表示这条授权不设过期窗、长期有效）。
+- 不要自己默认一个时长——没说就是 null。"#,
+        },
     ]
 }
 
