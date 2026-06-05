@@ -184,7 +184,7 @@ export default function CommandCenterFeature() {
         </section>
 
         {/* —— 执行计划 —— */}
-        <aside className={`${styles.panel} ${styles.planPanel}`}>
+        <aside className={styles.panel}>
           <div className={styles.head}>
             <div className={styles.headL}>
               <span className={styles.eyebrow}>Plan Preview</span>
