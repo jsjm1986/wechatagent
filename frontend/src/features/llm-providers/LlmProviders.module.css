@@ -1,0 +1,214 @@
+/* 模型供应商配置 —— 落地 apple-liquid-alive：实色白卡 + 语义色 + tokens.css 变量。
+   button/input/select/textarea 全量重置，规避全局 styles.css 裸控件规则污染
+   （蓝底白字 / 居中 / min-height / border:0）。色值统一走 tokens.css 变量，禁止硬编码。 */
+
+.page { position: relative; display: grid; gap: 18px; }
+
+.panel {
+  border-radius: var(--r-lg);
+  padding: 22px 26px 20px;
+  background: var(--surface-card);
+  border: 1px solid var(--hairline);
+  box-shadow: 0 14px 34px -24px rgba(20, 30, 60, .3), inset 0 1px 1px rgba(255, 255, 255, .9);
+}
+
+/* —— 面板头：eyebrow + 标题 + 当前激活提示 + 操作区 —— */
+.head { display: flex; align-items: flex-start; justify-content: space-between; gap: 14px; margin-bottom: 16px; }
+.headL { display: flex; flex-direction: column; gap: 3px; min-width: 0; }
+.eyebrow { font-size: 11px; color: var(--ink-3); font-weight: 600; letter-spacing: .2px; text-transform: uppercase; }
+.title { font-size: 15px; color: var(--ink-1); font-weight: 600; letter-spacing: -.3px; }
+.activeHint { font-size: 12px; color: var(--ink-3); letter-spacing: -.1px; }
+.activeHint strong { color: var(--color-scheduled); font-weight: 600; }
+.activeHint code { font-family: ui-monospace, "SF Mono", Menlo, monospace; color: var(--ink-2); }
+
+.headR { display: flex; align-items: center; gap: 12px; flex-shrink: 0; }
+.headIcon {
+  width: 32px; height: 32px; border-radius: 10px; flex-shrink: 0;
+  display: flex; align-items: center; justify-content: center;
+  color: var(--color-brand); background: var(--fill-brand);
+}
+.actions { display: flex; gap: 8px; }
+
+/* —— 按钮基类（全量重置裸 button 规则）—— */
+.btnGhost,
+.btnPrimary,
+.btnDanger {
+  font: inherit; font-size: 12.5px; font-weight: 600; letter-spacing: -.1px;
+  min-height: 0; padding: 8px 14px; border-radius: var(--r-sm); cursor: pointer;
+  display: inline-flex; align-items: center; justify-content: flex-start; gap: 6px;
+  transition: background .18s, color .18s, border-color .18s, box-shadow .18s, opacity .18s;
+}
+
+.btnGhost {
+  background: transparent; border: 1px solid var(--hairline); color: var(--ink-2);
+  box-shadow: none;
+}
+.btnGhost:hover:not(:disabled) { background: rgba(0, 0, 0, .03); color: var(--ink-1); border-color: rgba(0, 0, 0, .14); }
+
+.btnPrimary {
+  color: #fff; background: var(--color-scheduled);
+  border: 1px solid rgba(10, 132, 255, .4);
+  box-shadow: 0 8px 20px -12px rgba(10, 132, 255, .7), inset 0 1px 1px rgba(255, 255, 255, .35);
+}
+.btnPrimary:hover:not(:disabled) {
+  background: #0a78ec;
+  box-shadow: 0 10px 24px -12px rgba(10, 132, 255, .8), inset 0 1px 1px rgba(255, 255, 255, .35);
+}
+
+.btnDanger {
+  background: var(--fill-blocked); border: 1px solid rgba(255, 69, 58, .3); color: var(--color-blocked);
+  box-shadow: none;
+}
+.btnDanger:hover:not(:disabled) { background: rgba(255, 69, 58, .2); border-color: rgba(255, 69, 58, .4); }
+
+.btnGhost:disabled,
+.btnPrimary:disabled,
+.btnDanger:disabled { opacity: .5; cursor: not-allowed; box-shadow: none; }
+
+.errorBanner {
+  margin-bottom: 14px; padding: 11px 14px; border-radius: var(--r-sm);
+  font-size: 12.5px; color: var(--color-blocked);
+  background: var(--fill-blocked); border: 1px solid rgba(255, 69, 58, .3);
+}
+
+/* —— 供应商卡片列表 —— */
+.list { display: grid; gap: 12px; }
+.card {
+  border-radius: var(--r-md);
+  border: 1px solid var(--hairline);
+  background: var(--surface-card);
+  padding: 16px 18px;
+  box-shadow: inset 0 1px 1px rgba(255, 255, 255, .9);
+  transition: border-color .18s, background .18s;
+}
+.card:hover { border-color: rgba(94, 92, 230, .26); background: rgba(94, 92, 230, .02); }
+.cardActive {
+  border-color: rgba(48, 209, 88, .35);
+  box-shadow: inset 0 1px 1px rgba(255, 255, 255, .9), 0 0 0 1px rgba(48, 209, 88, .18);
+}
+
+.cardHead { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
+.cardName { display: flex; flex-direction: column; gap: 3px; min-width: 0; }
+.cardName strong { font-size: 14px; color: var(--ink-1); font-weight: 600; letter-spacing: -.2px; }
+.providerId {
+  font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 11px; color: var(--ink-3); letter-spacing: 0;
+}
+
+.badges { display: flex; flex-wrap: wrap; align-items: center; gap: 7px; }
+.protoBadge {
+  font-size: 10.5px; font-weight: 600; letter-spacing: -.1px;
+  color: var(--color-brand); padding: 5px 11px; border-radius: var(--r-sm);
+  background: var(--fill-brand); border: 1px solid rgba(94, 92, 230, .26);
+}
+.capChip {
+  font-size: 10.5px; font-weight: 500; letter-spacing: -.1px;
+  color: var(--ink-3); padding: 5px 11px; border-radius: var(--r-sm);
+  background: var(--fill-inactive); border: 1px solid var(--hairline);
+}
+
+/* 元数据定义列表 */
+.meta { margin: 14px 0 0; display: grid; gap: 8px; }
+.metaRow { display: grid; grid-template-columns: 92px minmax(0, 1fr); gap: 12px; align-items: baseline; }
+.metaRow dt { font-size: 11.5px; color: var(--ink-3); font-weight: 600; letter-spacing: -.1px; }
+.metaRow dd { margin: 0; font-size: 12.5px; color: var(--ink-1); letter-spacing: -.1px; word-break: break-all; }
+.mono { font-family: ui-monospace, "SF Mono", Menlo, monospace; color: var(--ink-2); }
+
+.cardFoot { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 16px; padding-top: 14px; border-top: 1px solid var(--hairline); }
+
+/* —— 编辑器区块标题 —— */
+.sectionTitle {
+  font-size: 11.5px; font-weight: 600; color: var(--ink-2); letter-spacing: .2px; text-transform: uppercase;
+  margin: 18px 0 10px;
+}
+.sectionTitle:first-of-type { margin-top: 4px; }
+
+/* 协议格式选择卡 */
+.protoGrid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+@media (max-width: 720px) { .protoGrid { grid-template-columns: 1fr; } }
+.protoCard {
+  font: inherit; min-height: 0; cursor: pointer; text-align: left;
+  display: flex; flex-direction: column; gap: 5px; justify-content: flex-start; align-items: stretch;
+  padding: 14px 16px; border-radius: var(--r-md);
+  background: var(--surface-card); border: 1px solid var(--hairline); color: var(--ink-1);
+  box-shadow: inset 0 1px 1px rgba(255, 255, 255, .9);
+  transition: border-color .18s, background .18s, box-shadow .18s;
+}
+.protoCard:hover:not(:disabled) { border-color: rgba(94, 92, 230, .3); background: rgba(94, 92, 230, .03); }
+.protoCard:disabled { opacity: .6; cursor: not-allowed; }
+.protoCardSelected,
+.protoCardSelected:hover {
+  border-color: rgba(94, 92, 230, .45); background: var(--fill-brand);
+  box-shadow: inset 0 1px 1px rgba(255, 255, 255, .7), 0 0 0 1px rgba(94, 92, 230, .25);
+}
+.protoTitle { font-size: 13px; font-weight: 600; color: var(--ink-1); letter-spacing: -.2px; }
+.protoMeta { font-size: 11px; color: var(--color-brand); font-family: ui-monospace, "SF Mono", Menlo, monospace; letter-spacing: 0; }
+.protoSub { font-size: 11.5px; color: var(--ink-3); letter-spacing: -.1px; }
+
+/* —— 表单网格 + 控件全量重置 —— */
+.formGrid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
+.formGridThree { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+@media (max-width: 720px) { .formGrid, .formGridThree { grid-template-columns: 1fr; } }
+.spanFull { grid-column: 1 / -1; }
+
+.field { display: grid; gap: 6px; align-content: start; }
+.fieldLabel { font-size: 11.5px; color: var(--ink-3); font-weight: 600; letter-spacing: -.1px; }
+.fieldHint { font-size: 11px; color: var(--ink-4); letter-spacing: -.1px; line-height: 1.5; }
+
+.input {
+  font: inherit; font-size: 13px; width: 100%; height: 40px; color: var(--ink-1);
+  border-radius: var(--r-sm); border: 1px solid var(--hairline);
+  background: var(--surface-card); padding: 10px 12px; outline: none;
+  box-shadow: inset 0 1px 1px rgba(255, 255, 255, .9);
+  transition: border-color .18s, box-shadow .18s;
+}
+.input::placeholder { color: var(--ink-4); }
+.input:focus {
+  border-color: rgba(10, 132, 255, .4);
+  box-shadow: inset 0 1px 1px rgba(255, 255, 255, .9), 0 0 0 3px var(--fill-scheduled);
+}
+.input:disabled { opacity: .6; cursor: not-allowed; background: var(--surface-page); }
+
+/* apiKey 输入 + 显示/隐藏按钮 */
+.inputWrap { position: relative; display: flex; align-items: center; }
+.inputWrap .input { padding-right: 42px; }
+.iconBtn {
+  font: inherit; min-height: 0; box-shadow: none; cursor: pointer; justify-content: center;
+  position: absolute; right: 6px; width: 30px; height: 30px; padding: 0;
+  display: inline-flex; align-items: center;
+  background: transparent; border: none; border-radius: 8px; color: var(--ink-3);
+  transition: background .18s, color .18s;
+}
+.iconBtn:hover:not(:disabled) { background: rgba(0, 0, 0, .05); color: var(--ink-1); }
+.iconBtn:disabled { opacity: .5; cursor: not-allowed; }
+
+/* 复选框行 */
+.checkboxRow { display: flex; flex-direction: row; align-items: center; gap: 9px; }
+.checkboxRow span { font-size: 13px; color: var(--ink-1); letter-spacing: -.1px; }
+.checkbox {
+  font: inherit; min-height: 0; box-shadow: none; width: 16px; height: 16px; flex-shrink: 0;
+  margin: 0; cursor: pointer; accent-color: var(--color-scheduled);
+}
+.checkbox:disabled { opacity: .5; cursor: not-allowed; }
+
+/* 编辑器底部操作栏 */
+.editorFoot { display: flex; align-items: center; gap: 10px; margin-top: 20px; padding-top: 16px; border-top: 1px solid var(--hairline); }
+.footSpacer { flex: 1; }
+
+/* —— 测试结果面板 —— */
+.testResult { margin-top: 16px; border-radius: var(--r-md); padding: 14px 16px; border: 1px solid var(--hairline); }
+.testOk { background: var(--fill-running); border-color: rgba(48, 209, 88, .3); }
+.testFail { background: var(--fill-blocked); border-color: rgba(255, 69, 58, .3); }
+.testHead { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; margin-bottom: 8px; }
+.testHead strong { font-size: 13px; letter-spacing: -.2px; }
+.testOk .testHead strong { color: #1a9c45; }
+.testFail .testHead strong { color: var(--color-blocked); }
+.testHead span { font-size: 11.5px; color: var(--ink-3); }
+.testBody { margin: 0; font-size: 12px; color: var(--ink-2); letter-spacing: -.1px; line-height: 1.55; }
+.testBody pre {
+  margin: 6px 0 0; padding: 10px 12px; border-radius: var(--r-sm);
+  background: var(--surface-card); border: 1px solid var(--hairline);
+  font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 11.5px; color: var(--ink-2);
+  white-space: pre-wrap; word-break: break-word; max-height: 260px; overflow: auto;
+}
+.testBody em { font-style: normal; color: var(--ink-3); font-weight: 600; }
+.testHintLine { margin-top: 8px; font-size: 12px; color: var(--color-held); }

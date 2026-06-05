@@ -1,0 +1,146 @@
+/* Command Center —— Management Agent 指挥台。三栏（操作范围 / 指令 / 执行计划）。
+   实色白卡 + 语义色 + tokens.css 变量；button 全量重置，避免全局 styles.css
+   裸 button 规则污染（蓝底白字 / 居中 / min-height）。呼吸只落功能元素并错开节奏。 */
+
+.page { position: relative; }
+
+.layout {
+  display: grid;
+  grid-template-columns: 260px minmax(0, 1fr) 320px;
+  gap: 16px;
+  align-items: start;
+}
+
+/* —— 通用白卡 —— */
+.panel {
+  border-radius: var(--r-lg); padding: 20px 22px 18px;
+  background: var(--surface-card); border: 1px solid var(--hairline);
+  box-shadow: 0 14px 34px -24px rgba(20,30,60,.3), inset 0 1px 1px rgba(255,255,255,.9);
+}
+.commandPanel {
+  border-radius: var(--r-lg); padding: 22px 24px 18px; min-height: 420px;
+  display: flex; flex-direction: column;
+  background: var(--surface-card); border: 1px solid var(--hairline);
+  box-shadow: 0 14px 34px -24px rgba(20,30,60,.3), inset 0 1px 1px rgba(255,255,255,.9);
+}
+
+/* —— 栏头（eyebrow + title + 图标）—— */
+.head { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 16px; }
+.headL { display: flex; flex-direction: column; gap: 2px; }
+.eyebrow { font-size: 11px; color: var(--ink-3); font-weight: 600; letter-spacing: .2px; text-transform: uppercase; }
+.title { font-size: 15px; color: var(--ink-1); font-weight: 600; letter-spacing: -.3px; }
+.headIcon {
+  width: 32px; height: 32px; border-radius: 10px; flex-shrink: 0;
+  display: flex; align-items: center; justify-content: center;
+  color: var(--color-scheduled); background: var(--fill-scheduled);
+}
+
+/* —— 操作范围 —— */
+.scopeStack { display: grid; gap: 8px; }
+.boundaryBox { margin-top: 16px; border-top: 1px solid var(--hairline); padding-top: 14px; }
+.boundaryBox strong { display: block; color: var(--ink-1); font-size: 13px; font-weight: 600; letter-spacing: -.2px; }
+.boundaryBox p { margin: 6px 0 0; color: var(--ink-2); font-size: 12.5px; line-height: 1.62; letter-spacing: -.1px; }
+
+/* —— 指令面板头：AI 身份 + 在线呼吸点（2.2s）—— */
+.commandHeader {
+  display: flex; align-items: center; gap: 12px; margin-bottom: 16px;
+  border-bottom: 1px solid var(--hairline); padding-bottom: 14px;
+}
+.commandHeaderIcon {
+  width: 38px; height: 38px; border-radius: 11px; flex-shrink: 0;
+  display: flex; align-items: center; justify-content: center;
+  color: var(--color-brand); background: var(--fill-brand);
+}
+.commandHeaderTxt { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.commandHeaderTxt strong { font-size: 14px; color: var(--ink-1); font-weight: 600; letter-spacing: -.2px; display: flex; align-items: center; gap: 8px; }
+.commandHeaderTxt span { font-size: 12px; color: var(--ink-3); letter-spacing: -.1px; }
+.liveDot { width: 7px; height: 7px; border-radius: 50%; background: var(--color-running); box-shadow: 0 0 6px 1px var(--color-running); animation: ccLive 2.2s infinite; }
+
+/* —— 输入区 —— */
+.commandInput {
+  display: block; border-radius: var(--r-md); padding: 14px;
+  background: var(--surface-card); border: 1px solid var(--hairline);
+  box-shadow: inset 0 1px 1px rgba(255,255,255,.9);
+  transition: border-color .16s, box-shadow .16s;
+}
+.commandInput:focus-within { border-color: rgba(10,132,255,.4); box-shadow: 0 0 0 3px rgba(10,132,255,.1); }
+.commandInput textarea {
+  width: 100%; border: 0; outline: 0; background: transparent; resize: vertical;
+  min-height: 132px; line-height: 1.65; font: inherit; font-size: 13.5px; color: var(--ink-1); letter-spacing: -.1px;
+}
+.commandInput textarea::placeholder { color: var(--ink-4); }
+
+/* —— 建议 chip（button 全量重置）—— */
+.suggestionRow { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
+.chip {
+  font: inherit; font-size: 12px; font-weight: 500; letter-spacing: -.1px;
+  padding: 6px 12px; border-radius: 20px; cursor: pointer; min-height: 0;
+  background: var(--fill-inactive); border: 1px solid var(--hairline); color: var(--ink-2);
+  box-shadow: none; justify-content: flex-start;
+  transition: background .18s, color .18s, border-color .18s;
+}
+.chip:hover { background: rgba(0,0,0,.04); color: var(--ink-1); border-color: rgba(0,0,0,.12); }
+
+/* —— 动作行 —— */
+.actions {
+  display: flex; align-items: center; flex-wrap: wrap; gap: 12px;
+  margin-top: 16px; border-top: 1px solid var(--hairline); padding-top: 14px;
+}
+.runBtn {
+  font: inherit; font-size: 13px; font-weight: 600; letter-spacing: -.1px;
+  display: inline-flex; align-items: center; gap: 7px; justify-content: center;
+  padding: 9px 18px; border-radius: 12px; cursor: pointer; min-height: 0;
+  background: var(--color-scheduled); border: 1px solid rgba(10,132,255,.4); color: #fff;
+  box-shadow: 0 8px 18px -10px rgba(10,132,255,.7), inset 0 1px 1px rgba(255,255,255,.3);
+  transition: transform .18s ease, box-shadow .25s, opacity .18s;
+}
+.runBtn:hover:not(:disabled) { transform: translateY(-1px); box-shadow: 0 12px 24px -10px rgba(10,132,255,.8), inset 0 1px 1px rgba(255,255,255,.3); }
+.runBtn:active:not(:disabled) { transform: translateY(0); }
+.runBtn:disabled { opacity: .5; cursor: not-allowed; }
+.runBtn.busy { animation: ccBreathe 3.2s ease-in-out infinite; }
+
+.dryRunToggle { display: flex; align-items: center; gap: 7px; font-size: 12.5px; color: var(--ink-2); letter-spacing: -.1px; cursor: pointer; }
+.dryRunToggle input { width: auto; height: auto; accent-color: var(--color-scheduled); cursor: pointer; }
+.hint { font-size: 12px; color: var(--ink-3); letter-spacing: -.1px; flex: 1; min-width: 0; }
+
+.modeBadge {
+  display: inline-flex; align-items: center; gap: 5px;
+  padding: 4px 11px; border-radius: 20px; font-size: 11.5px; font-weight: 600; letter-spacing: -.1px;
+  border: 1px solid var(--hairline); box-shadow: inset 0 1px 1px rgba(255,255,255,.6);
+}
+.modeBadge.dryRun { background: var(--fill-held); border-color: rgba(255,159,10,.3); color: var(--color-held); }
+.modeBadge.live { background: var(--fill-running); border-color: rgba(48,209,88,.3); color: var(--color-running); }
+
+/* —— 执行结果 —— */
+.result {
+  margin-top: 14px; border-radius: var(--r-md); padding: 13px 15px;
+  border: 1px solid var(--hairline); background: var(--fill-inactive);
+}
+.result.good { border-color: rgba(48,209,88,.4); background: var(--fill-running); }
+.result.error { border-color: rgba(255,69,58,.4); background: var(--fill-blocked); }
+.result.warn { border-color: rgba(255,159,10,.4); background: var(--fill-held); }
+.result strong { display: block; color: var(--ink-1); font-size: 12px; font-weight: 600; letter-spacing: -.1px; text-transform: uppercase; }
+.result p { margin: 6px 0 0; color: var(--ink-2); font-size: 13px; line-height: 1.55; letter-spacing: -.1px; }
+
+/* —— 执行计划 —— */
+.planSteps { display: grid; gap: 10px; }
+
+/* —— 关键帧 —— */
+@keyframes ccLive { 0%,100% { box-shadow: 0 0 0 0 rgba(48,209,88,.5); } 50% { box-shadow: 0 0 0 5px rgba(48,209,88,0); } }
+@keyframes ccBreathe {
+  0%,100% { box-shadow: 0 8px 18px -10px rgba(10,132,255,.7), inset 0 1px 1px rgba(255,255,255,.3), 0 0 0 0 rgba(10,132,255,0); }
+  50%     { box-shadow: 0 8px 18px -10px rgba(10,132,255,.7), inset 0 1px 1px rgba(255,255,255,.3), 0 0 0 4px rgba(10,132,255,.12); }
+}
+
+/* —— 响应式 —— */
+@media (max-width: 1180px) {
+  .layout { grid-template-columns: minmax(0, 1fr) 300px; }
+  .scopePanel { grid-column: 1 / -1; }
+  .scopeStack { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+}
+@media (max-width: 860px) {
+  .layout { grid-template-columns: 1fr; }
+  .scopePanel { grid-column: span 1; }
+  .scopeStack { grid-template-columns: 1fr; }
+  .actions { align-items: flex-start; flex-direction: column; }
+}
