@@ -1125,7 +1125,27 @@ fn prompt_specs() -> Vec<PromptSpec> {
     "needed": false,
     "runAt": "",
     "content": ""
-  }
+  },
+
+  // ── 决策墙请示（escalationRequest，可选；不需要时整个字段省略） ──
+  // escalationRequest：仅当你判断本轮遇到"决策墙"（超出你的职权/能力，需要幕后领导拍板）时输出；否则整个字段省略或 needed=false。
+  // 判定按"事项实质"，不是客户嘴上"要换人对接"——客户嘴上要换人但事项你能处理，就继续自己处理，不要 escalate。
+  // 重要：即使你输出 escalationRequest，这一轮的 reply 仍要正常写——把"安抚占位话术 + selfServiceablePart 里你能自主答的部分"自然地融进 reply 一起发给客户（reply 会照常经发送链路送达，请示是后台动作，客户不会冷场）。绝不要把 reply 留空。
+  // 三类（category 取其一）：
+  //   out_of_scope_decision：合同变更/特殊折扣/退款纠纷/法律承诺/定制需求等超出标准政策权限。
+  //   high_risk_gated：触及未验证产品声明、或风险被闸门拦下、需领导授权才能答的件。
+  //   stuck_or_undelivered：同一议题已多轮未推进且客户有负面情绪。
+  // 字段：{ "needed": true, "category": "...", "reason": "给领导看的卡点", "questionForPrincipal": "向领导提的问题", "selfServiceablePart": "客户这条消息里你能自主答的部分(若有，应已融进 reply)", "isGeneralizable": true/false(这条决策是否能泛化成通用知识) }
+
+  // 【转述模式】如果客户最新消息以 __PRINCIPAL_RELAY__ 开头，这不是客户发的话，而是"领导已就之前一条请示给出裁决"的内部转述任务。载荷字段：verdict（approved/rejected/conditional/deferred/delegated_back）、substance（领导给的实质结论，是你转述的唯一事实源）、constraints（附带条件）。此时你要：
+  //   1) 绝不把 __PRINCIPAL_RELAY__、verdict=、substance= 等任何内部字段或方括号文字发给客户；
+  //   2) 用你自己的口吻、结合该客户当前语境，自然地把结论转述出去；
+  //   3) 按 verdict 决定基调：
+  //      approved/conditional → 正面推进 substance，有 constraints 就说清条件（如"申请下来了可以给你8折，麻烦本周内付款哈"）；
+  //      rejected → 保关系优先，先给 substance 里的替代方案，没有就用标准口径婉拒，别生硬；
+  //      delegated_back → 领导把决定交回你，在标准权限内自己给客户一个答复（substance 可能为空）；
+  //      其它/异常 → 不替领导承诺超权事项，按标准口径稳住客户。
+  //   4) escalationRequest 这一轮通常省略（除非转述里又冒出新的越权点）。
 }
 
 要求：
