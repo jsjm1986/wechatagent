@@ -71,7 +71,9 @@ impl From<&LlmProviderConfig> for LlmProviderView {
         Self {
             provider_id: cfg.provider_id.clone(),
             name: cfg.name.clone(),
-            format: cfg.format.clone(),
+            format: LlmFormat::parse(&cfg.format)
+                .map(|f| f.as_protocol().to_string())
+                .unwrap_or_else(|_| cfg.format.clone()),
             base_url: cfg.base_url.clone(),
             api_key_masked: mask_api_key(&cfg.api_key),
             model: cfg.model.clone(),
@@ -118,7 +120,7 @@ pub(super) async fn list_providers(
         "items": items,
         "active": active_meta.map(|m| json!({
             "providerId": m.provider_id,
-            "format": m.format.as_str(),
+            "format": m.format.as_protocol(),
             "model": m.model,
             "baseUrl": m.base_url,
         })),

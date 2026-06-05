@@ -34,11 +34,23 @@ impl LlmFormat {
 
     pub fn parse(value: &str) -> AppResult<Self> {
         match value.trim().to_ascii_lowercase().as_str() {
-            "openai" | "" => Ok(Self::Openai),
-            "anthropic" | "claude" => Ok(Self::Anthropic),
+            // 中性协议别名（前端/产品代码只用这些，不出现 LLM 品牌字面量）：
+            // "chat" = Chat Completions 协议，"messages" = Messages 协议。
+            // 历史品牌值同样兼容，旧库记录与既有测试不受影响。
+            "chat" | "openai" | "" => Ok(Self::Openai),
+            "messages" | "anthropic" | "claude" => Ok(Self::Anthropic),
             other => Err(AppError::BadRequest(format!(
                 "unsupported llm format: {other}"
             ))),
+        }
+    }
+
+    /// 对外暴露的中性协议名（API/前端用，与 LLM 品牌解耦）。
+    /// `as_str()` 仍返回历史品牌值以保持存储/旧测试向后兼容。
+    pub fn as_protocol(&self) -> &'static str {
+        match self {
+            LlmFormat::Openai => "chat",
+            LlmFormat::Anthropic => "messages",
         }
     }
 }
