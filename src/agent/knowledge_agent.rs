@@ -306,16 +306,26 @@ pub async fn answer(state: &AppState, req: AnswerRequest) -> AppResult<AnswerRes
         };
         let state_clone = state.clone();
         tokio::spawn(async move {
-            // 仅 recall_miss 才生成对话追问；fire-and-forget，失败/超时不影响信号落库。
+            // 先确定性落库（恒在、零 LLM 依赖）：recall_miss 的 search_queries 已在
+            // spawn 前同步置为原始 query，low_yield 携 affected_chunk_ids。绝不把这一步
+            // 排在任何 LLM 调用之后——否则 followup 的真模型往返（常 >数秒）会阻塞信号
+            // 写入，运营/在线闭环要等数秒才见到 gap，等同丢失「恒在」语义。
+            if let Err(e) = persist_recall_signal(&db, &ws, candidate.clone()).await {
+                tracing::warn!(error = %e, "persist_recall_signal failed (non-fatal)");
+            }
+            // recall_miss 增强：落库后再 fire-and-forget 生成一句 LLM 追问，成功则以二次
+            // merge-update 并入同一信号的 search_queries（dedup_key 同 → 命中并集分支）。
+            // 失败/超时只丢日志，首次确定性落库已不可逆地完成。
             if let Some(q) = followup_query {
                 if let Some(followup) = generate_gap_followup_question(&state_clone, &q).await {
                     if !followup.is_empty() && followup != q {
-                        candidate.search_queries.push(followup);
+                        let mut enrich = candidate.clone();
+                        enrich.search_queries = vec![followup];
+                        if let Err(e) = persist_recall_signal(&db, &ws, enrich).await {
+                            tracing::warn!(error = %e, "persist_recall_signal (followup enrich) failed (non-fatal)");
+                        }
                     }
                 }
-            }
-            if let Err(e) = persist_recall_signal(&db, &ws, candidate).await {
-                tracing::warn!(error = %e, "persist_recall_signal failed (non-fatal)");
             }
             if let Some(targets) = split_targets {
                 if !targets.is_empty() {

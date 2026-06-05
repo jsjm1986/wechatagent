@@ -85,6 +85,12 @@ pub mod ext_knowledge {
     pub use super::knowledge::{
         build_operation_knowledge_completeness, chat_turn, ChatTurnRequest,
     };
+    // real-LLM 召回基准 maintenance / 闭环轨迹测试：chat_turn 只产 pending 草稿预览，
+    // 真正落库 draft chunk + 回填 createdChunkId 的是独立的 chat_apply（两步
+    // preview→apply 是生产有意设计）。测试需要在 chat_turn 后补调 chat_apply 才能
+    // 拿到 draft chunk 去 verify。ChatApplyRequest 派生 Deserialize，测试侧用
+    // serde_json::from_value 构造，无需放开字段可见性。
+    pub use super::knowledge::{chat_apply, ChatApplyRequest};
 }
 pub use shared::upsert_contact_from_value;
 

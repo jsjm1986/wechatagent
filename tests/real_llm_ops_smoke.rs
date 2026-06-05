@@ -1078,8 +1078,23 @@ async fn t4_real_follow_up_task_runs_and_expiry_blocks() {
     run_judge(&state, &contact.wxid, "t4-live-followup").await;
 
     // ② 已过期 follow_up：precheck 拦在 "expired"，不调真模型决策。
+    //
+    // 关键隔离：用**独立 contact**承载过期任务，而非复用 ① 的 contact。原因——
+    // `precheck_send_gateway` 的短路顺序里 `rate_limited`（读 `last_agent_run_at`）排在
+    // `expired` 之前（gateway.rs:1664→1673，生产语义正确）。① 的 live 任务一旦真模型
+    // 决定回复并过闸，就会把 `last_agent_run_at` 推到 now；若 ② 复用同一 contact，过期
+    // 任务会先撞 `rate_limited` 短路、到不了 expired 分支。独立 contact 的 `last_agent_run_at`
+    // 为 None，过期判定必然生效——隔离前置条件，不依赖 ① 是否回复（更强模型更倾向回复）。
+    let expired_contact = managed_contact("real_ops_user_t4_expired");
+    state
+        .db
+        .contacts()
+        .insert_one(&expired_contact, None)
+        .await
+        .expect("insert expired-case contact");
+
     let expired_task = make_follow_up_task(
-        &contact,
+        &expired_contact,
         "这条任务已过期，不应触发任何真模型决策。",
         Some(DateTime::from_millis(DateTime::now().timestamp_millis() - 3_600_000)),
     );
@@ -1093,7 +1108,10 @@ async fn t4_real_follow_up_task_runs_and_expiry_blocks() {
     let expired_log = state
         .db
         .agent_run_logs()
-        .find_one(doc! { "contact_wxid": &contact.wxid, "status": "expired" }, None)
+        .find_one(
+            doc! { "contact_wxid": &expired_contact.wxid, "status": "expired" },
+            None,
+        )
         .await
         .expect("query expired run log")
         .expect("过期 FollowUp 必须落一行 status=expired 的 run log");
@@ -1380,6 +1398,19 @@ async fn t8_real_autonomy_mode_stays_in_ai_internal_set() {
     ];
     let suspected = handoff_markers.iter().any(|kw| reply.contains(kw));
     eprintln!("[t8][autonomy-redline] suspected_human_handoff={suspected} reply={reply:?}");
+
+    // 软诊断（仅打印不断言）：正面承接 vs 回避。跨 3 个 main run 复现的稳定短板——
+    // 用户主动要真人时，consultative/casual 模式下 agent 常回避诉求（岔开去问"你担心
+    // 效果还是费用"），judge helpfulness 因此稳定压到 3-4。一个正面接住的回复应当出现
+    // "我直接帮你 / 我来给你 / 长期对接你的就是我 / 不用等转接"这类把诉求当场接下来的
+    // 第一人称承接措辞，而非只抛回一个问题。prompt 跨模式承接红线生效后，should_front 应
+    // 稳定 true、helpfulness 回升。真模型非确定 → 先观测量化，不硬断言。
+    let front_markers = [
+        "我直接", "我来给你", "我来帮你", "我现在", "我先帮你", "我帮你弄", "我给你答复",
+        "对接你的就是我", "对接你的是我", "不用等转接", "不用转接", "不用转",
+    ];
+    let front_addressed = front_markers.iter().any(|kw| reply.contains(kw));
+    eprintln!("[t8][autonomy-frontface] should_front_address=true actual_front_addressed={front_addressed} reply={reply:?}");
 }
 
 // ── T9 · 真实用户反应分析 → outcome_status reward 信号 ──────────────────────
