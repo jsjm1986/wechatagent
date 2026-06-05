@@ -107,6 +107,10 @@ pub async fn handle_managed_message_aggregated(
 }
 
 pub async fn handle_follow_up_task(state: &AppState, task: AgentTask) -> AppResult<()> {
+    // principal_decision_relay：领导已裁决，走专门的 relay 转述路径，而非普通 follow-up。
+    if task.kind == "principal_decision_relay" {
+        return crate::agent::escalation::handle_principal_decision_relay(state, &task).await;
+    }
     let Some(task_id) = task.id else {
         return Ok(());
     };
