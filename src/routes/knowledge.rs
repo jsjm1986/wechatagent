@@ -4610,7 +4610,16 @@ pub async fn chat_apply(
 
     let result_value = match intent {
         "create_chunk" => {
-            apply_create_chunk(&state, &admin.current_workspace, &account_id, &trimmed, patch, target_pack_id.as_deref())
+            // chat 新建知识无父文档，溯源 = 运营在本会话里的陈述。拼接所有 user-role
+            // turn 的正文作为 operator_statement，交给 apply_create_chunk 锚定 sourceQuote。
+            let operator_statement = history
+                .iter()
+                .filter(|t| t.role == "user")
+                .map(|t| t.content.trim())
+                .filter(|c| !c.is_empty())
+                .collect::<Vec<_>>()
+                .join("\n");
+            apply_create_chunk(&state, &admin.current_workspace, &account_id, &trimmed, patch, target_pack_id.as_deref(), &operator_statement)
                 .await?
         }
         "update_chunk" => {
@@ -5825,13 +5834,35 @@ async fn apply_create_chunk(
     session_id: &str,
     patch: &Document,
     target_pack_id: Option<&str>,
+    operator_statement: &str,
 ) -> AppResult<Value> {
     let patch_value: Value = mongodb::bson::Bson::Document(patch.clone()).into();
     let mut payload = chunk_request_from_chat_patch(&patch_value, account_id, target_pack_id);
     // 强制：AI 永不自动 verify
     payload.status = "draft".to_string();
     payload.integrity_status = Some("needs_review".to_string());
-    payload.source_anchors = vec![]; // 让 backend 重算
+
+    // chat 新建的知识没有父文档，溯源 = 运营在会话里的口头陈述本身。优先采用 LLM
+    // patch 给出的 sourceQuote（若能在运营陈述中锚定），否则回退用运营陈述全文作为
+    // quote。这样 D2 verify 闸（sourceQuote + source_anchors 双非空）才能"凭真实出处"
+    // 合法通过——是补齐溯源，而非削弱闸门。
+    let statement = operator_statement.trim();
+    if statement.is_empty() {
+        // 没有运营陈述可溯源时维持旧行为：verify 仍会按 D2 合法拒绝，绝不放水。
+        payload.source_anchors = vec![];
+    } else {
+        let quote = payload
+            .source_quote
+            .as_deref()
+            .map(str::trim)
+            .filter(|q| !q.is_empty() && source_anchor_for_quote(statement, None, q).is_some())
+            .map(|q| q.to_string())
+            .unwrap_or_else(|| statement.to_string());
+        payload.source_anchors = source_anchor_for_quote(statement, None, &quote)
+            .map(|d| vec![d])
+            .unwrap_or_default();
+        payload.source_quote = Some(quote);
+    }
 
     validate_operation_knowledge_chunk(&payload)?;
     let chunk = operation_knowledge_chunk_from_request(state, workspace_id, payload, None)?;

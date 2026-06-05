@@ -213,6 +213,8 @@ jobs:
   # - recall_benchmark_smoke：单 query 冒烟，确认端点/检索链路在 CI 能跑通（最轻）。
   # - recall_benchmark_cross_industry：⓪跨轮稳定 + ②reach/adopt 分组召回，6 行业矩阵 × N 轮（最重）。
   # - recall_benchmark_maintenance_stability：③真实 chat 改库全链路（新增/改写/废弃）后召回保持。
+  # - recall_benchmark_gap_closed_loop_trajectory：北极星全闭环单测——召回 gap → agent 主动
+  #   提问 → 运营对话补库（chat 新建切片，溯源=运营陈述）→ verify 通过 → 同 query 再召回命中。
   # max-parallel:2 限流——与 ops/quality/adversarial 共用同一把 coderelay key，限并发防瞬时 429；
   # 队列中的 matrix job 不启动 timeout 计时，故每测试仍独享完整 45min 墙，限流只推迟开始不吃墙。
   real-llm-recall:
@@ -228,6 +230,7 @@ jobs:
           - recall_benchmark_smoke
           - recall_benchmark_cross_industry
           - recall_benchmark_maintenance_stability
+          - recall_benchmark_gap_closed_loop_trajectory
     env:
       REAL_LLM_API_KEY: ${{ secrets.REAL_LLM_CODERELAY_API_KEY || 'sk-rQwLl3JkGnexGZmkyesH0LdBKH86PQMBSj5Z8MDHgdwxLzuE' }}
     steps:
