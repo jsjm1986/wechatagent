@@ -4,7 +4,13 @@
 //! 请示，拿到裁决后用 AI 口吻向客户转述。客户永远只跟 Agent 对话——真人是
 //! 幕后决策源，绝不直接面对客户。这不是真人下场：AI 向内部决策源请示，转述仍由 AI 完成。
 
-use crate::models::{AgentPrincipalEscalation, PrincipalDecision};
+use crate::error::{AppError, AppResult};
+use crate::models::{
+    AgentPrincipalEscalation, PrincipalDecision, ALLOWED_ESCALATION_CATEGORY,
+    PRINCIPAL_ESCALATION_STATUS_PENDING, PRINCIPAL_ESCALATION_STATUS_RESOLVED,
+};
+use crate::routes::AppState;
+use mongodb::bson::{doc, DateTime};
 
 /// 短码字符集：base32 去掉易混字符（0/O/1/I/L），便于真人在微信里识读。
 const SHORT_CODE_ALPHABET: &[u8] = b"23456789ABCDEFGHJKMNPQRSTUVWXYZ";
@@ -122,6 +128,168 @@ pub(crate) fn parse_high_risk_mode(raw: Option<&str>) -> HighRiskEscalationMode 
         Some("all") => HighRiskEscalationMode::All,
         _ => HighRiskEscalationMode::DecisionOnly,
     }
+}
+
+/// 读取该 workspace+domain 的领导 wxid。未配置返回 None（= 请示通道未启用）。
+pub(crate) async fn principal_decider_wxid(
+    state: &AppState,
+    workspace_id: &str,
+    domain: &str,
+) -> AppResult<Option<String>> {
+    let cfg = state
+        .db
+        .operation_domain_configs()
+        .find_one(
+            doc! { "workspace_id": workspace_id, "domain": domain, "current_version": true },
+            None,
+        )
+        .await?;
+    Ok(cfg.and_then(|c| c.principal_decider))
+}
+
+/// 二次防护：目标 wxid 必须严格等于该 workspace 配置的 principal_decider。
+/// 用于推请示卡前，杜绝把内部请示卡误发给客户。
+pub(crate) fn assert_target_is_principal(
+    target_wxid: &str,
+    configured_principal: &str,
+) -> AppResult<()> {
+    if target_wxid == configured_principal {
+        Ok(())
+    } else {
+        Err(AppError::BadRequest(format!(
+            "请示卡目标 wxid 与配置的领导不符，拒发（target={target_wxid}）"
+        )))
+    }
+}
+
+/// 插入一条 pending 台账。短码碰撞（唯一索引报错）时重试至多 5 次。
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn insert_pending_escalation(
+    state: &AppState,
+    workspace_id: &str,
+    account_id: &str,
+    contact_wxid: &str,
+    category: &str,
+    reason: &str,
+    question_for_principal: &str,
+    principal_wxid: &str,
+    is_generalizable: bool,
+) -> AppResult<AgentPrincipalEscalation> {
+    debug_assert!(
+        ALLOWED_ESCALATION_CATEGORY.contains(&category),
+        "category 必须在闭集内"
+    );
+    let now = DateTime::now();
+    for attempt in 0..5u32 {
+        let seed =
+            (now.timestamp_millis() as u64).wrapping_add(attempt as u64 * 2_654_435_761) as u32;
+        let short_code = short_code_from_seed(seed);
+        let entry = AgentPrincipalEscalation {
+            id: None,
+            workspace_id: workspace_id.to_string(),
+            account_id: account_id.to_string(),
+            contact_wxid: contact_wxid.to_string(),
+            short_code: short_code.clone(),
+            status: PRINCIPAL_ESCALATION_STATUS_PENDING.to_string(),
+            category: category.to_string(),
+            reason: reason.to_string(),
+            question_for_principal: question_for_principal.to_string(),
+            principal_wxid: principal_wxid.to_string(),
+            decision: None,
+            authorization_expires_at: None,
+            is_generalizable,
+            knowledge_proposal_emitted: false,
+            created_at: now,
+            updated_at: now,
+            resolved_at: None,
+        };
+        match state
+            .db
+            .agent_principal_escalations()
+            .insert_one(&entry, None)
+            .await
+        {
+            Ok(res) => {
+                let mut saved = entry;
+                saved.id = res.inserted_id.as_object_id();
+                return Ok(saved);
+            }
+            Err(e) => {
+                if is_duplicate_key_error(&e) && attempt < 4 {
+                    continue;
+                }
+                return Err(e.into());
+            }
+        }
+    }
+    Err(AppError::External(
+        "短码生成连续碰撞，插入请示台账失败".into(),
+    ))
+}
+
+/// 查某 workspace 下某领导 wxid 当前所有 pending 台账（按创建时间升序）。
+pub(crate) async fn list_pending_for_principal(
+    state: &AppState,
+    workspace_id: &str,
+    principal_wxid: &str,
+) -> AppResult<Vec<AgentPrincipalEscalation>> {
+    use futures::TryStreamExt;
+    let cursor = state
+        .db
+        .agent_principal_escalations()
+        .find(
+            doc! {
+                "workspace_id": workspace_id,
+                "principal_wxid": principal_wxid,
+                "status": PRINCIPAL_ESCALATION_STATUS_PENDING,
+            },
+            mongodb::options::FindOptions::builder()
+                .sort(doc! { "created_at": 1 })
+                .build(),
+        )
+        .await?;
+    Ok(cursor.try_collect().await?)
+}
+
+/// 把一条 pending 台账标 resolved，写入真人裁决 + 授权过期时间。
+pub(crate) async fn resolve_escalation(
+    state: &AppState,
+    short_code: &str,
+    decision: &PrincipalDecision,
+    authorization_expires_at: Option<DateTime>,
+) -> AppResult<Option<AgentPrincipalEscalation>> {
+    let now = DateTime::now();
+    let decision_bson = mongodb::bson::to_bson(decision)?;
+    let mut set = doc! {
+        "status": PRINCIPAL_ESCALATION_STATUS_RESOLVED,
+        "decision": decision_bson,
+        "updated_at": now,
+        "resolved_at": now,
+    };
+    if let Some(exp) = authorization_expires_at {
+        set.insert("authorization_expires_at", exp);
+    }
+    let updated = state
+        .db
+        .agent_principal_escalations()
+        .find_one_and_update(
+            doc! { "short_code": short_code, "status": PRINCIPAL_ESCALATION_STATUS_PENDING },
+            doc! { "$set": set },
+            mongodb::options::FindOneAndUpdateOptions::builder()
+                .return_document(mongodb::options::ReturnDocument::After)
+                .build(),
+        )
+        .await?;
+    Ok(updated)
+}
+
+/// 判断 mongodb 错误是否为唯一键冲突（短码碰撞）。
+fn is_duplicate_key_error(e: &mongodb::error::Error) -> bool {
+    matches!(
+        *e.kind,
+        mongodb::error::ErrorKind::Write(mongodb::error::WriteFailure::WriteError(ref we))
+            if we.code == 11000
+    )
 }
 
 #[cfg(test)]
@@ -281,5 +449,15 @@ mod tests {
             parse_high_risk_mode(Some("decision_only")),
             HighRiskEscalationMode::DecisionOnly
         );
+    }
+
+    #[test]
+    fn assert_target_is_principal_accepts_match() {
+        assert!(assert_target_is_principal("boss_wxid", "boss_wxid").is_ok());
+    }
+
+    #[test]
+    fn assert_target_is_principal_rejects_customer() {
+        assert!(assert_target_is_principal("customer_wxid", "boss_wxid").is_err());
     }
 }
