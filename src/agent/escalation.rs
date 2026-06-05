@@ -11,6 +11,7 @@ use crate::models::{
     ALLOWED_ESCALATION_CATEGORY, ALLOWED_PRINCIPAL_VERDICT, PRINCIPAL_ESCALATION_STATUS_PENDING,
     PRINCIPAL_ESCALATION_STATUS_RESOLVED, PRINCIPAL_VERDICT_DEFERRED,
 };
+use crate::mcp;
 use crate::prompts;
 use crate::routes::AppState;
 use mongodb::bson::{doc, DateTime};
@@ -455,6 +456,106 @@ pub(crate) async fn interpret_principal_reply(
         }
     };
     Ok(sanitize_verdict(decision))
+}
+
+/// 处理真人（领导）的微信回复。匹配未决台账→解读→resolve→起 relay task。
+/// 业务决策 #4：不带码且多条未决时反问澄清（向领导发一条，不回流客户）。
+/// 返回 true 表示已作为领导回复消费（调用方据此不再进客户 agent 链路）。
+pub(crate) async fn handle_principal_reply(
+    state: &AppState,
+    workspace_id: &str,
+    account_id: &str,
+    principal_wxid: &str,
+    reply_text: &str,
+) -> AppResult<bool> {
+    let pending = list_pending_for_principal(state, workspace_id, principal_wxid).await?;
+    match match_principal_reply(reply_text, &pending) {
+        ReplyMatch::NoPending => {
+            tracing::info!(
+                principal_wxid,
+                "领导主动消息但无未决请示，不自动生效（待 admin 确认）"
+            );
+            Ok(true)
+        }
+        ReplyMatch::Ambiguous(codes) => {
+            let list = codes
+                .iter()
+                .map(|c| format!("#{c}"))
+                .collect::<Vec<_>>()
+                .join(" / ");
+            let ask = format!(
+                "您刚回复的是哪一条？目前挂着这几条：{list}，麻烦带上编号（如 #{}）再回我一次。",
+                codes.first().cloned().unwrap_or_default()
+            );
+            mcp::logged_call_for_account(
+                state,
+                account_id,
+                "message_send_text",
+                serde_json::json!({ "recipient": principal_wxid, "content": ask }),
+            )
+            .await?;
+            Ok(true)
+        }
+        ReplyMatch::Matched(short_code) => {
+            let entry = pending
+                .iter()
+                .find(|e| e.short_code == short_code)
+                .cloned()
+                .expect("matched code must be in pending");
+            let decision = interpret_principal_reply(state, account_id, &entry, reply_text).await?;
+            if decision.verdict == crate::models::PRINCIPAL_VERDICT_DEFERRED {
+                tracing::info!(short_code = %short_code, "领导暂缓，保持 pending 继续等待");
+                return Ok(true);
+            }
+            // 授权过期时间：领导说了算。LLM 解读出领导明确说的时限→authorization_window_hours；
+            // 领导没提→None=不设过期窗。不再硬编码默认窗。
+            let expires = decision.authorization_window_hours.and_then(|hours| {
+                if hours > 0.0 {
+                    Some(DateTime::from_millis(
+                        DateTime::now().timestamp_millis() + (hours * 3600.0 * 1000.0) as i64,
+                    ))
+                } else {
+                    None
+                }
+            });
+            let resolved = resolve_escalation(state, &short_code, &decision, expires).await?;
+            if resolved.is_none() {
+                return Ok(true); // 已被并发 resolve；幂等。
+            }
+            enqueue_relay_task(state, &entry).await?;
+            Ok(true)
+        }
+    }
+}
+
+/// 创建 principal_decision_relay task（立即可执行）。
+async fn enqueue_relay_task(state: &AppState, entry: &AgentPrincipalEscalation) -> AppResult<()> {
+    let now = DateTime::now();
+    let task = AgentTask {
+        id: None,
+        workspace_id: entry.workspace_id.clone(),
+        account_id: entry.account_id.clone(),
+        contact_wxid: entry.contact_wxid.clone(),
+        kind: "principal_decision_relay".to_string(),
+        run_at: now,
+        expires_at: None,
+        content: entry.short_code.clone(),
+        status: "pending".to_string(),
+        source_decision_id: None,
+        review_required: false,
+        attempt_count: 0,
+        max_attempts: 3,
+        next_retry_at: None,
+        gateway_status: None,
+        cancel_reason: None,
+        error: None,
+        claimed_at: None,
+        claim_recovery_count: 0,
+        created_at: now,
+        updated_at: now,
+    };
+    state.db.tasks().insert_one(&task, None).await?;
+    Ok(())
 }
 
 #[cfg(test)]
