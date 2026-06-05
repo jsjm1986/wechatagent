@@ -2219,6 +2219,25 @@ async fn apply_agent_updates(
         set_doc.insert("domain_attributes", attrs);
         set_doc.insert("domain_attributes_updated_at", DateTime::now());
     }
+    // 请示触发：把"等待领导决策"标记写进客户 domain_attributes（admin 可观测）。
+    // key 用 AWAITING_PRINCIPAL_DECISION_ATTR 常量，与 relay 完成时 clear_awaiting_principal_state 的 $unset 同一字符串。
+    // 注意：这只是可观测布尔标记——本轮 run 是 Approved，占位 reply 已正常发出，不进 Held、不设 hold category、不碰 review。
+    if decision
+        .escalation_request
+        .as_ref()
+        .map(|e| e.needed)
+        .unwrap_or(false)
+    {
+        let mut attrs = set_doc
+            .get_document("domain_attributes")
+            .ok()
+            .cloned()
+            .or_else(|| contact.domain_attributes.clone())
+            .unwrap_or_default();
+        attrs.insert(crate::models::AWAITING_PRINCIPAL_DECISION_ATTR, true);
+        set_doc.insert("domain_attributes", attrs);
+        set_doc.insert("domain_attributes_updated_at", DateTime::now());
+    }
     if let Some(value) = non_empty_option(&decision.last_commitment) {
         // M2：把 LLM 输出的字符串承诺升级为结构化 CommitmentEntry 追加到
         // commitments 数组（cap 8），让 Planner::scan_commitments 在 due_at
