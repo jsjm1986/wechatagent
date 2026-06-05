@@ -28,6 +28,7 @@ mod chat_tool_loop;
 mod decision;
 mod decision_taxonomy;
 pub mod domain;
+pub mod escalation;
 mod gateway;
 mod guards;
 pub mod knowledge_agent;
