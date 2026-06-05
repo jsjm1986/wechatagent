@@ -3776,7 +3776,11 @@ pub async fn propose_chunk_repair(
 父文档（已截断到 4000 字）：
 {}
 
-请先在脑内回答"这条切片在讲什么领域、面向谁、解决什么问题、何时使用"，把判断写进 interpretation 字段；再按 system 中 schema 输出 JSON。followupQuestions 仅在你确实无法从父文档/父知识包推断字段时给出，且与 missingFields 一一对应。如果某 schema 字段在当前领域不适用，写进 missingFields 并附 reason，不要硬填。"#,
+请先在脑内回答"这条切片在讲什么领域、面向谁、解决什么问题、何时使用"，把判断写进 interpretation 字段。
+
+在动手补字段前，先做一次"事实源体检"：父文档是否为空？sourceQuote 是否为空？body 是否只剩标题式的一句话残文？据此把 missingFields 按"对让这条切片变得可被运营确认的重要性"降序排列，最关键的缺口排在第一位。特别地，当父文档为空且 sourceQuote 为空（即当前没有任何可核验出处）时，最该优先指出的缺口就是 sourceQuote / 可溯源原文本身——把它列为 missingFields 首位，并在 interpretation 里点明"当前无可核验出处"；在补到出处之前，summary / safeClaims / forbiddenClaims 这些需要事实支撑的字段宁可留空进 missingFields，绝不能为了"填满"切片而编造内容。
+
+再按 system 中 schema 输出 JSON。followupQuestions 仅在你确实无法从父文档/父知识包推断字段时给出，且与 missingFields 一一对应。如果某 schema 字段在当前领域不适用，写进 missingFields 并附 reason，不要硬填。"#,
         serde_json::to_string_pretty(&operation_knowledge_chunk_json(chunk.clone()))
             .unwrap_or_default(),
         serde_json::to_string_pretty(&pack_payload).unwrap_or_default(),
