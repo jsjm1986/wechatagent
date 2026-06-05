@@ -51,6 +51,8 @@ fn build_domain_config() -> OperationDomainConfig {
         current_version: true,
         previous_version: None,
         seeded_by: None,
+        principal_decider: None,
+        high_risk_escalation_mode: None,
     }
 }
 
