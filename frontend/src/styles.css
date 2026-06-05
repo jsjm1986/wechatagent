@@ -3351,14 +3351,6 @@ td:nth-child(3) {
   font-weight: 600;
   letter-spacing: 0.04em;
 }
-.llmProviderCard .formatBadge.openai {
-  background: var(--ai-soft);
-  color: var(--ai);
-}
-.llmProviderCard .formatBadge.anthropic {
-  background: #f4ebff;
-  color: #6941c6;
-}
 .llmProviderCard .activeBadge {
   font-size: 10px;
   padding: 2px 8px;

@@ -1,4 +1,5 @@
 import { useEffect } from "react";
+import type { FormEvent } from "react";
 import {
   UserOperationCockpit,
   ContactsView,
@@ -61,6 +62,8 @@ export default function UserOpsFeature() {
     decisionReviews,
     profileNote,
     customAgentInstructions,
+    importQuery,
+    searchQuery,
     guideInstruction,
     guidePreview,
     simulationInput,
@@ -85,6 +88,8 @@ export default function UserOpsFeature() {
     setGuideInstruction,
     setSimulationInput,
     setSelectedPlaybookId,
+    setImportQuery,
+    setSearchQuery,
     setPlaybookDraft,
     setGeneratePlaybookText,
     setOptimizePlaybookText,
@@ -94,6 +99,7 @@ export default function UserOpsFeature() {
     loadPlaybooks,
     loadContacts,
     loadDomains,
+    importContacts,
     // 15个业务回调
     enableAgent,
     disableAgent,
@@ -164,19 +170,19 @@ export default function UserOpsFeature() {
     return contacts;
   }, [contacts, contactTab]);
 
-  // 占位数据（这些需要从适当的地方获取）
-  const importQuery = "";
-  const setImportQuery = () => {};
-  const query = "";
-  const setQuery = () => {};
-
   // 待办计数徽标——真实运营数据现由自包含 OperationsFeature/operationsStore 负责加载，
   // 这里不再用占位 tasks 反推；徽标后续可订阅 operationsStore.pending 派生。
   const pendingTasks = 0;
 
-  // 占位函数
-  const importContacts = async () => {};
-  const loadAll = async () => {};
+  // 导入好友：表单提交 → store.importContacts（search→import 两步写库后刷新列表）。
+  const onImportContacts = (event: FormEvent) => {
+    event.preventDefault();
+    void importContacts();
+  };
+  // 过滤已导入好友：onBlur 时按当前 searchQuery 重拉列表（后端 q= 子串过滤）。
+  const reloadFiltered = () => {
+    if (effectiveAccountId) void loadContacts(effectiveAccountId);
+  };
 
   const openContact = async (contact: Contact) => {
     setSelected(contact);
@@ -220,17 +226,17 @@ export default function UserOpsFeature() {
             contactTab={contactTab}
             contacts={filteredContacts}
             importQuery={importQuery}
-            query={query}
+            query={searchQuery}
             totalCount={contacts.length}
             managedCount={managedCount}
             normalCount={normalCount}
             selected={selected}
             onContactTab={setContactTab}
-            onImport={importContacts}
+            onImport={onImportContacts}
             onImportQuery={setImportQuery}
-            onLoadAll={loadAll}
+            onLoadAll={reloadFiltered}
             onOpenContact={openContact}
-            onQuery={setQuery}
+            onQuery={setSearchQuery}
           />
           <UserOperationCockpit
             activeTab={smartOpsTab}

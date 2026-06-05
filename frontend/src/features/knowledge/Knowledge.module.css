@@ -196,6 +196,17 @@
     font-size: 11px;
     letter-spacing: 0.4px;
   }
+  .knowledgeWiki .wikiCardActions {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-shrink: 0;
+  }
+  .knowledgeWiki .wikiCardBody {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }
   .knowledgeWiki .wikiFieldList {
     display: flex;
     flex-wrap: wrap;
