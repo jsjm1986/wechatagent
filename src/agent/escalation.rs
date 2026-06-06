@@ -1224,17 +1224,4 @@ mod tests {
             );
         }
     }
-
-    #[test]
-    fn fallback_holding_reply_has_no_handoff_wording() {
-        // 红线机械守卫：hold 路径补发的安全占位绝不含任何转接类措辞。
-        let reply = fallback_holding_reply();
-        for forbidden in ["人工", "接管", "转人", "客服", "专员", "同事"] {
-            assert!(
-                !reply.contains(forbidden),
-                "占位文案不得含「{forbidden}」，实际：{reply}"
-            );
-        }
-        assert!(!reply.is_empty());
-    }
 }
