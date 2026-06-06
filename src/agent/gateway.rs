@@ -1798,22 +1798,30 @@ pub(crate) async fn precheck_send_gateway(
     if contact.agent_status != AgentStatus::Managed {
         return Ok(blocked("not_managed", "好友未纳入 Agent 运营"));
     }
-    if let Some(cooldown_until) = contact.cooldown_until {
-        if cooldown_until.timestamp_millis() > DateTime::now().timestamp_millis() {
-            return Ok(blocked("cooldown", "用户处于冷却期"));
+    // relay 转述（领导裁决回送客户）豁免频控类 precheck：占位 reply 已把
+    // last_agent_run_at 刷成 now，领导通常秒~分钟级回复，relay 必落在 min_reply_interval
+    // 内——若不豁免，领导裁决永远送不到客户。relay 是客户期待内的被动应答，不属
+    // 主动打扰，故跳过 cooldown/operation_policy/rate_limited/daily_limit；not_managed
+    // 仍保留（好友已退出运营则不应继续转述）。
+    let is_relay = escalation::is_principal_relay_trigger(trigger);
+    if !is_relay {
+        if let Some(cooldown_until) = contact.cooldown_until {
+            if cooldown_until.timestamp_millis() > DateTime::now().timestamp_millis() {
+                return Ok(blocked("cooldown", "用户处于冷却期"));
+            }
         }
-    }
-    if let Some(policy_block) = precheck_operation_policy(state, contact).await? {
-        return Ok(policy_block);
-    }
-    if let Some(last_run) = contact.last_agent_run_at {
-        let elapsed = DateTime::now().timestamp_millis() - last_run.timestamp_millis();
-        if elapsed < runtime.min_reply_interval_seconds * 1000 {
-            return Ok(blocked("rate_limited", "短时间内已触达，跳过本次自动发送"));
+        if let Some(policy_block) = precheck_operation_policy(state, contact).await? {
+            return Ok(policy_block);
         }
-    }
-    if daily_touch_count(state, contact).await? >= runtime.max_daily_touches {
-        return Ok(blocked("daily_limit", "已达到每日触达上限"));
+        if let Some(last_run) = contact.last_agent_run_at {
+            let elapsed = DateTime::now().timestamp_millis() - last_run.timestamp_millis();
+            if elapsed < runtime.min_reply_interval_seconds * 1000 {
+                return Ok(blocked("rate_limited", "短时间内已触达，跳过本次自动发送"));
+            }
+        }
+        if daily_touch_count(state, contact).await? >= runtime.max_daily_touches {
+            return Ok(blocked("daily_limit", "已达到每日触达上限"));
+        }
     }
     if let AgentTrigger::FollowUp(task) = trigger {
         if let Some(expires_at) = task.expires_at {

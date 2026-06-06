@@ -5,6 +5,7 @@
 //! 幕后决策源，绝不直接面对客户。这不是真人下场：AI 向内部决策源请示，转述仍由 AI 完成。
 
 use super::generate_agent_json;
+use super::types::AgentTrigger;
 use crate::error::{AppError, AppResult};
 use crate::models::{
     AgentPrincipalEscalation, AgentTask, OperationKnowledgeChunk, PrincipalDecision,
@@ -282,6 +283,19 @@ pub(crate) async fn has_pending_for_contact(
         )
         .await?;
     Ok(count > 0)
+}
+
+/// 该 trigger 是否是 relay 转述（领导裁决回送客户）。
+/// relay 走合成 Inbound，content 以哨兵 `PRINCIPAL_RELAY_SENTINEL` 开头——
+/// 合成消息仅由 `ConversationMessage::synthetic_principal_relay` 构造、逐字以哨兵开头；
+/// 真实客户消息经 prompt_isolation 隔离，不会以 `__PRINCIPAL_RELAY__` 开头。
+/// 网关据此对 relay 豁免频控类 precheck（领导回复是客户期待内的被动应答，不该被
+/// rate_limited/cooldown/daily_limit 拦掉——否则领导裁决永远送不到客户）。
+pub(crate) fn is_principal_relay_trigger(trigger: &AgentTrigger<'_>) -> bool {
+    matches!(
+        trigger,
+        AgentTrigger::Inbound(m) if m.content.starts_with(crate::models::PRINCIPAL_RELAY_SENTINEL)
+    )
 }
 
 /// 处理 principal_decision_relay task：领导已裁决，把决策用 AI 口吻转述给客户。
@@ -813,5 +827,72 @@ mod tests {
     #[test]
     fn default_stuck_threshold_is_three() {
         assert_eq!(DEFAULT_STUCK_THRESHOLD, 3);
+    }
+
+    fn make_contact(wxid: &str) -> crate::models::Contact {
+        use crate::models::{AgentStatus, Contact};
+        let now = mongodb::bson::DateTime::now();
+        Contact {
+            id: None,
+            workspace_id: "ws1".into(),
+            account_id: "acc1".into(),
+            wxid: wxid.into(),
+            nickname: None,
+            remark: None,
+            alias: None,
+            agent_status: AgentStatus::Managed,
+            human_profile_note: None,
+            custom_agent_instructions: None,
+            agent_profile: None,
+            memory_summary: None,
+            playbook_id: None,
+            playbook_version: None,
+            tags: Vec::new(),
+            domain_attributes: None,
+            domain_attributes_updated_at: None,
+            commitments: Vec::new(),
+            follow_up_policy: None,
+            operation_state: None,
+            operation_state_reason: None,
+            operation_state_confidence: None,
+            operation_state_updated_at: None,
+            cooldown_until: None,
+            operation_policy: mongodb::bson::Document::new(),
+            profile_attributes: mongodb::bson::Document::new(),
+            profile_updated_at: None,
+            last_message_at: None,
+            last_inbound_at: None,
+            last_outbound_at: None,
+            last_agent_run_at: None,
+            last_outbound_style: None,
+            intent_trajectory: Vec::new(),
+            deal_events: Vec::new(),
+            locale: None,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    #[test]
+    fn relay_trigger_detected_for_synthetic_relay() {
+        let contact = make_contact("cust1");
+        let msg = crate::models::ConversationMessage::synthetic_principal_relay(
+            &contact,
+            "approved",
+            "可以给 8 折",
+            &[],
+        );
+        assert!(is_principal_relay_trigger(&AgentTrigger::Inbound(&msg)));
+    }
+
+    #[test]
+    fn relay_trigger_not_detected_for_normal_inbound() {
+        let contact = make_contact("cust1");
+        let mut msg = crate::models::ConversationMessage::synthetic_principal_relay(
+            &contact, "approved", "x", &[],
+        );
+        // 普通客户消息：内容不以哨兵开头。
+        msg.content = "老板能不能再便宜点".into();
+        assert!(!is_principal_relay_trigger(&AgentTrigger::Inbound(&msg)));
     }
 }
