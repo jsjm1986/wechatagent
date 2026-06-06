@@ -972,29 +972,72 @@ pub fn finalize_review_for_send(
     // 硬闸之后——若 reviewer 已自报、上方已 block/return，本探针不会执行，故不
     // 与真阳性重复计数。有统计意义的漏判率证据后，再决定是否抬成硬闸（用户决策：
     // 先观测，避免重新引入 2026-05-25 刻意删除的脆弱 string-marker 判罚）。
-    if !super::guards::claim_requires_product_knowledge(&review.claim_analysis)
-        && super::guards::reply_contains_commitment_claim(&decision.reply_text)
-    {
-        let verified =
-            super::guards::compute_verified_chunks(&decision.used_knowledge_ids, knowledge_chunks);
-        if verified.is_empty() {
-            let mut details = Document::new();
-            details.insert(
-                "reply_excerpt",
-                decision.reply_text.chars().take(80).collect::<String>(),
+    if !super::guards::claim_requires_product_knowledge(&review.claim_analysis) {
+        let class = super::guards::commitment_claim_class(&decision.reply_text);
+        if class != super::guards::CommitmentClass::None {
+            let verified = super::guards::compute_verified_chunks(
+                &decision.used_knowledge_ids,
+                knowledge_chunks,
             );
-            details.insert("used_knowledge_ids", decision.used_knowledge_ids.clone());
-            details.insert("knowledge_chunk_total", knowledge_chunks.len() as i64);
-            pending_events.push(PendingFinalizeEvent {
-                // 注：status "observe" 只是 AgentEvent.status 自由字符串字段值，
-                // 不是 gateway/finalReview 闭集枚举，不触发 R9.10.e 闭集校验。
-                kind: "grounding_probe_reviewer_missed".to_string(),
-                status: "observe".to_string(),
-                summary:
-                    "观测：回复含绝对化产品承诺且无 verified 背书，但 reviewer 未标 requiresProductKnowledge"
-                        .to_string(),
-                details,
-            });
+            if verified.is_empty() {
+                match class {
+                    super::guards::CommitmentClass::ProductEffect => {
+                        // 兜底硬闸：reviewer 漏判效果/数据类承诺且无 verified 背书 → block。
+                        review.approved = false;
+                        review.scores.hallucination_score =
+                            review.scores.hallucination_score.max(6);
+                        extend_risks_unique(
+                            &mut review.risks,
+                            std::iter::once(
+                                "product_claim_without_verified_knowledge".to_string(),
+                            ),
+                        );
+                        decision.should_reply = false;
+                        decision.autonomy_mode = "blocked".to_string();
+                        let mut details = Document::new();
+                        details.insert(
+                            "reply_excerpt",
+                            decision.reply_text.chars().take(80).collect::<String>(),
+                        );
+                        details.insert("used_knowledge_ids", decision.used_knowledge_ids.clone());
+                        details.insert("knowledge_chunk_total", knowledge_chunks.len() as i64);
+                        pending_events.push(PendingFinalizeEvent {
+                            kind: "product_claim_blocked_by_probe_fallback".to_string(),
+                            status: "blocked".to_string(),
+                            summary:
+                                "兜底硬闸：reviewer 漏判，回复含效果/数据类承诺且无 verified 背书，强制 blocked"
+                                    .to_string(),
+                            details,
+                        });
+                        review.final_review_status =
+                            "blocked_unverified_product_claim".to_string();
+                        return FinalizeOutcome {
+                            review,
+                            status: GatewayStatusFinal::BlockedUnverifiedProductClaim,
+                            pending_events,
+                        };
+                    }
+                    super::guards::CommitmentClass::ToneOnly => {
+                        // 语气类：维持现状，仅观测不拦（避免误杀情感承诺）。
+                        let mut details = Document::new();
+                        details.insert(
+                            "reply_excerpt",
+                            decision.reply_text.chars().take(80).collect::<String>(),
+                        );
+                        details.insert("used_knowledge_ids", decision.used_knowledge_ids.clone());
+                        details.insert("knowledge_chunk_total", knowledge_chunks.len() as i64);
+                        pending_events.push(PendingFinalizeEvent {
+                            kind: "grounding_probe_reviewer_missed".to_string(),
+                            status: "observe".to_string(),
+                            summary:
+                                "观测：回复含语气类承诺且无 verified 背书，但 reviewer 未标 requiresProductKnowledge"
+                                    .to_string(),
+                            details,
+                        });
+                    }
+                    super::guards::CommitmentClass::None => {}
+                }
+            }
         }
     }
 
@@ -2290,6 +2333,94 @@ mod dual_gate_classification_tests {
             .pending_events
             .iter()
             .any(|e| e.kind == "grounding_probe_reviewer_missed"));
+    }
+
+    // ── A2：grounding 漏判兜底硬闸（词类型切分）单测 ──
+
+    #[test]
+    fn finalize_blocks_on_product_effect_claim_when_reviewer_missed() {
+        // reviewer 漏判 + 回复含效果词「回款」+ 无 verified → 兜底硬闸 block。
+        let runtime = UserRuntimeParameters::default();
+        let mut review = full_pass_review();
+        review.claim_analysis = mongodb::bson::doc! { "requiresProductKnowledge": false };
+        let mut decision = shouldreply_decision();
+        decision.reply_text = "放心，我们保证按时回款".to_string();
+        let contact = finalize_contact();
+        let outcome = finalize_review_for_send(
+            review,
+            &mut decision,
+            &runtime,
+            &contact,
+            &[],
+            Vec::new(),
+            "你们能保证回款吗",
+        );
+        assert_eq!(
+            outcome.status,
+            GatewayStatusFinal::BlockedUnverifiedProductClaim
+        );
+        assert!(!outcome.review.approved);
+        assert!(!decision.should_reply);
+        assert!(outcome
+            .pending_events
+            .iter()
+            .any(|e| e.kind == "product_claim_blocked_by_probe_fallback"
+                && e.status == "blocked"));
+    }
+
+    #[test]
+    fn finalize_only_observes_on_tone_only_claim_when_reviewer_missed() {
+        // reviewer 漏判 + 回复仅含语气词「保证」(无效果词) + 无 verified → 不拦，仅观测。
+        let runtime = UserRuntimeParameters::default();
+        let mut review = full_pass_review();
+        review.claim_analysis = mongodb::bson::doc! { "requiresProductKnowledge": false };
+        let mut decision = shouldreply_decision();
+        decision.reply_text = "我保证会认真对待你的问题".to_string();
+        let contact = finalize_contact();
+        let outcome = finalize_review_for_send(
+            review,
+            &mut decision,
+            &runtime,
+            &contact,
+            &[],
+            Vec::new(),
+            "你会上心吗",
+        );
+        assert_eq!(outcome.status, GatewayStatusFinal::Approved);
+        assert!(outcome.review.approved);
+        assert!(decision.should_reply);
+        assert!(outcome
+            .pending_events
+            .iter()
+            .any(|e| e.kind == "grounding_probe_reviewer_missed" && e.status == "observe"));
+        assert!(!outcome
+            .pending_events
+            .iter()
+            .any(|e| e.kind == "product_claim_blocked_by_probe_fallback"));
+    }
+
+    #[test]
+    fn finalize_probe_fallback_skipped_when_verified_present() {
+        // reviewer 漏判 + 回复含效果词「成功率」+ 有 verified 交集 → 不误伤,放行。
+        let runtime = UserRuntimeParameters::default();
+        let mut review = full_pass_review();
+        review.claim_analysis = mongodb::bson::doc! { "requiresProductKnowledge": false };
+        let mut decision = shouldreply_decision();
+        decision.reply_text = "我们的成功率确实不错".to_string();
+        let chunk = mk_chunk("verified");
+        decision.used_knowledge_ids = vec![chunk.id.unwrap().to_hex()];
+        let contact = finalize_contact();
+        let outcome = finalize_review_for_send(
+            review,
+            &mut decision,
+            &runtime,
+            &contact,
+            std::slice::from_ref(&chunk),
+            Vec::new(),
+            "成功率怎么样",
+        );
+        assert_eq!(outcome.status, GatewayStatusFinal::Approved);
+        assert!(decision.should_reply);
     }
 }
 
