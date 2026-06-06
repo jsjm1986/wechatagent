@@ -48,7 +48,7 @@
   font: inherit;
   font-size: 13px;
   font-weight: 600;
-  color: var(--accent-ink);
+  color: var(--color-brand);
   background: var(--surface-card);
   border: 1px solid var(--hairline);
   border-radius: var(--r-md);
@@ -58,6 +58,6 @@
 }
 
 .autoVerify:hover {
-  border-color: var(--accent);
+  border-color: var(--color-brand);
   transform: translateY(-1px);
 }
