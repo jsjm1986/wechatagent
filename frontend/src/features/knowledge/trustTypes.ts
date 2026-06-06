@@ -96,3 +96,21 @@ export function parseIntegrityReport(raw: unknown): IntegrityReportView {
     rejected: Number(o.rejected ?? 0),
   };
 }
+
+// chunk 富字段:后端 chunk JSON 下发但前端 ReviewChunkItem 此前从不读。全部可选,旧数据(仅 id/title)仍合法。
+export type ChunkType = "product_fact" | "style_template" | "negative_example" | "peer_case";
+
+export interface ChunkUsageStats { hitCount30d?: number; blockedCount30d?: number; }
+export interface ChunkProvenanceView { source?: string; llmModelAlias?: string | null; }
+
+export interface TrustChunkFields {
+  chunkType?: ChunkType | null;
+  confidenceScore?: number | null;
+  dynamicConfidence?: number | null;
+  distortionRisks?: string[] | null;
+  lockedFields?: string[] | null;
+  validFrom?: string | null;
+  validTo?: string | null;
+  usageStats?: ChunkUsageStats | null;
+  provenance?: ChunkProvenanceView | null;
+}

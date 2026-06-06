@@ -42,7 +42,7 @@ import {
 } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
 import { parseApiError, LlmUnavailableError } from "../../lib/api";
-import { parseCompleteness, parseIntegrityReport, type CompletenessView, type IntegrityReportView } from "./trustTypes";
+import { parseCompleteness, parseIntegrityReport, type CompletenessView, type IntegrityReportView, type TrustChunkFields } from "./trustTypes";
 import "./Knowledge.module.css";
 
 // ==== 以下 LLM 错误横幅 + KnowledgeWikiView 主体自 App.tsx 原样下沉（Stage-1 行为等价） ====
@@ -2475,7 +2475,7 @@ type ReviewCategory =
   | "pending_verification"
   | "dependents_pending";
 
-interface ReviewChunkItem {
+interface ReviewChunkItem extends TrustChunkFields {
   id: string;
   workspaceId?: string;
   accountId?: string | null;

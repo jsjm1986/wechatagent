@@ -1,5 +1,6 @@
 import { describe, it, expect } from "vitest";
 import { parseCompleteness, parseIntegrityReport, type CompletenessView, type CoverageDimension } from "../../features/knowledge/trustTypes";
+import type { TrustChunkFields } from "../../features/knowledge/trustTypes";
 
 describe("parseCompleteness", () => {
   it("解析后端真实响应的 answeringMode + 5 维 coverage", () => {
@@ -53,5 +54,23 @@ describe("parseIntegrityReport", () => {
     const v = parseIntegrityReport({});
     expect(v.total).toBe(0);
     expect(v.verified).toBe(0);
+  });
+});
+
+describe("TrustChunkFields", () => {
+  it("富字段全可选——旧数据(只有 id/title)仍合法", () => {
+    const legacy: TrustChunkFields = {};
+    expect(legacy.chunkType).toBeUndefined();
+    const full: TrustChunkFields = {
+      chunkType: "product_fact",
+      distortionRisks: ["缺锚点已降级"],
+      lockedFields: ["sourceQuote"],
+      usageStats: { hitCount30d: 5, blockedCount30d: 1 },
+      validFrom: "2026-01-01", validTo: null,
+      dynamicConfidence: 0.72, confidenceScore: 8,
+      provenance: { source: "ai", llmModelAlias: "mimo" },
+    };
+    expect(full.chunkType).toBe("product_fact");
+    expect(full.usageStats?.hitCount30d).toBe(5);
   });
 });
