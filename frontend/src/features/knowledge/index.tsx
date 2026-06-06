@@ -43,6 +43,7 @@ import {
 import type { LucideIcon } from "lucide-react";
 import { parseApiError, LlmUnavailableError } from "../../lib/api";
 import { parseCompleteness, parseIntegrityReport, type CompletenessView, type IntegrityReportView, type TrustChunkFields } from "./trustTypes";
+import { CockpitView } from "./cockpit/CockpitView";
 import "./Knowledge.module.css";
 
 // ==== 以下 LLM 错误横幅 + KnowledgeWikiView 主体自 App.tsx 原样下沉（Stage-1 行为等价） ====
@@ -265,7 +266,7 @@ function ExploreMode() {
 }
 
 function StewardMode() {
-  const [pane, setPane] = useState<"lint" | "review" | "revisions" | "documents" | "import" | "ingest" | "observability" | "tryRecall">("lint");
+  const [pane, setPane] = useState<"cockpit" | "lint" | "review" | "revisions" | "documents" | "import" | "ingest" | "observability" | "tryRecall">("cockpit");
   const [focusedId, setFocusedId] = useState<string | null>(null);
   const [collapsed, setCollapsed] = useState(true);
 
@@ -289,6 +290,13 @@ function StewardMode() {
       }`}
     >
       <div className="wikiModePane wikiModePane--nav wikiStewardNav">
+        <button
+          type="button"
+          className={pane === "cockpit" ? "wikiStewardNavBtn active" : "wikiStewardNavBtn"}
+          onClick={() => setPane("cockpit")}
+        >
+          <ShieldCheck size={14} /> 治理总览
+        </button>
         <button
           type="button"
           className={pane === "lint" ? "wikiStewardNavBtn active" : "wikiStewardNavBtn"}
@@ -347,6 +355,12 @@ function StewardMode() {
         </button>
       </div>
       <div className="wikiModePane wikiModePane--main">
+        {pane === "cockpit" && (
+          <CockpitView
+            onOpenReview={() => setPane("review")}
+            onOpenAutoVerify={() => setPane("review")}
+          />
+        )}
         {pane === "lint" && <LintView />}
         {pane === "review" && <ReviewView />}
         {pane === "revisions" && <ChunkRevisionsDrawer />}
