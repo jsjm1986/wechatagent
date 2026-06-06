@@ -314,24 +314,6 @@ pub(crate) fn compute_verified_chunks<'a>(
     out
 }
 
-/// item ①「先观测」：候选回复正文是否含「绝对化产品承诺」字面。
-///
-/// 仅供 `finalize_review_for_send` 的非拦截观测探针使用——量化 reviewer 漏判
-/// （未自报 `requiresProductKnowledge` 却写了硬承诺）的频率，**不参与任何
-/// 发送判定**。词表与 `prompts.rs` 既有 `user.review.product_claim_markers`
-/// 模板对齐（其 Rust 消费者 2026-05-25 随 string-marker 硬门删除，此处只借
-/// 词表语义做观测，不恢复判罚）。命中即返回 true。
-pub(crate) fn reply_contains_commitment_claim(reply_text: &str) -> bool {
-    const COMMITMENT_MARKERS: [&str; 8] = [
-        "保证", "一定能", "绝对", "百分之", "百分百", "成功率", "见效", "回款",
-    ];
-    let text = reply_text.trim();
-    if text.is_empty() {
-        return false;
-    }
-    COMMITMENT_MARKERS.iter().any(|m| text.contains(m))
-}
-
 /// 承诺词类型（grounding 漏判兜底硬闸用）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CommitmentClass {
@@ -344,8 +326,8 @@ pub(crate) enum CommitmentClass {
 }
 
 /// 把候选回复按承诺词类型分类。ProductEffect 优先（同时命中两类时取更危险者）。
-/// 与 `reply_contains_commitment_claim` 的 8 词同源，但切分两类以控制误杀：
-/// 效果/数据类几乎只出现在可验证产品断言；语气类大量出现在情感/口语承诺。
+/// 词表与 `prompts.rs` 既有 `user.review.product_claim_markers` 模板同源，切分两类
+/// 以控制误杀：效果/数据类几乎只出现在可验证产品断言；语气类大量出现在情感/口语承诺。
 pub(crate) fn commitment_claim_class(reply_text: &str) -> CommitmentClass {
     const PRODUCT_EFFECT_MARKERS: [&str; 5] =
         ["成功率", "见效", "回款", "百分之", "百分百"];
