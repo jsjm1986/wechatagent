@@ -19,7 +19,7 @@ mod common;
 
 use mongodb::bson::{doc, oid::ObjectId, DateTime, Document};
 use wechatagent::models::{
-    AgentPrincipalEscalation, AgentStatus, Contact, ConversationMessage, OperationDomainConfig,
+    AgentPrincipalEscalation, AgentStatus, Contact, ConversationMessage,
     OperationKnowledgeChunk, PrincipalDecision, AWAITING_PRINCIPAL_DECISION_ATTR,
     ESCALATION_CATEGORY_OUT_OF_SCOPE, PRINCIPAL_ESCALATION_STATUS_PENDING,
     PRINCIPAL_ESCALATION_STATUS_RESOLVED, PRINCIPAL_RELAY_SENTINEL, PRINCIPAL_VERDICT_CONDITIONAL,
@@ -95,35 +95,6 @@ fn minimal_pending_escalation(short_code: &str, contact_wxid: &str) -> AgentPrin
     }
 }
 
-/// user_operations 域配置；principal_decider / high_risk_escalation_mode 可配。
-fn domain_config_with_principal(
-    principal_decider: Option<&str>,
-    high_risk_escalation_mode: Option<&str>,
-) -> OperationDomainConfig {
-    OperationDomainConfig {
-        id: None,
-        workspace_id: "default".to_string(),
-        domain: "user_operations".to_string(),
-        name: "用户运营".to_string(),
-        goal: String::new(),
-        methodology: String::new(),
-        workflow: String::new(),
-        tool_policy: String::new(),
-        automation_policy: String::new(),
-        review_policy: String::new(),
-        runtime_parameters: doc! {},
-        state_machine: doc! {},
-        status: "active".to_string(),
-        updated_at: DateTime::now(),
-        version: 1,
-        current_version: true,
-        previous_version: None,
-        seeded_by: None,
-        principal_decider: principal_decider.map(str::to_string),
-        high_risk_escalation_mode: high_risk_escalation_mode.map(str::to_string),
-    }
-}
-
 // ───────────────────── §14 DB 集成测试（#[ignore]，CI 跑） ─────────────────────
 
 /// §14.1a：插入 pending 台账后，按 short_code 能查回，且 status=pending、principal_wxid 正确。
@@ -158,17 +129,30 @@ async fn t_escalation_out_of_scope_creates_pending() {
 
 /// §14.1b：high_risk_escalation_mode="all" 的域配置写后读回，字段持久化。
 /// 覆盖升级模式配置的公共切片（parse_high_risk_mode 读的就是这个字段）。
+///
+/// 注：`ensure_prompt_pack_v2`（TestApp::start 调用）已 seed 一行
+/// `(default, user_operations, version=1)`，且 `op_domain_ws_domain_version_unique`
+/// 唯一索引禁止重复插入。请示通道的两字段在生产里也是 admin 编辑 `$set` 到既有
+/// current 行（版本发布才 bump version），故此处镜像该写法——`$set` 到 seeded 行，
+/// 而非另插一行 v1。
 #[tokio::test]
 #[ignore]
 async fn t_high_risk_mode_config_roundtrip() {
     let app = common::TestApp::start().await;
-    let config = domain_config_with_principal(Some("boss_wxid"), Some("all"));
     app.state
         .db
         .operation_domain_configs()
-        .insert_one(&config, None)
+        .update_one(
+            doc! { "workspace_id": "default", "domain": "user_operations", "current_version": true },
+            doc! { "$set": {
+                "principal_decider": "boss_wxid",
+                "high_risk_escalation_mode": "all",
+                "updated_at": DateTime::now(),
+            } },
+            None,
+        )
         .await
-        .expect("insert domain config");
+        .expect("set principal config on seeded domain config");
 
     let found = app
         .state
