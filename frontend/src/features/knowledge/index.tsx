@@ -42,7 +42,7 @@ import {
 } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
 import { parseApiError, LlmUnavailableError } from "../../lib/api";
-import { parseCompleteness, type CompletenessView } from "./trustTypes";
+import { parseCompleteness, parseIntegrityReport, type CompletenessView, type IntegrityReportView } from "./trustTypes";
 import "./Knowledge.module.css";
 
 // ==== 以下 LLM 错误横幅 + KnowledgeWikiView 主体自 App.tsx 原样下沉（Stage-1 行为等价） ====
@@ -4262,13 +4262,6 @@ interface CatalogPersistedView {
   items?: unknown[];
 }
 
-interface IntegrityReportView {
-  needsReview?: number;
-  contested?: number;
-  sourceOrphan?: number;
-  total?: number;
-}
-
 interface LogsAnalyzeView {
   windowHours?: number;
   totalCalls?: number;
@@ -4564,7 +4557,7 @@ function ObservabilityDashboard() {
       setCatalog(a as CatalogPersistedView);
       setCatalogLive(b as { total?: number });
       setCompleteness(parseCompleteness(c));
-      setIntegrity(d as IntegrityReportView);
+      setIntegrity(parseIntegrityReport(d));
       setLogs(e as LogsAnalyzeView);
       const metrics = f as { answerCache?: typeof cacheStats };
       setCacheStats(metrics?.answerCache ?? null);
@@ -4682,10 +4675,10 @@ function ObservabilityDashboard() {
           <dl className="wikiArchiveMeta">
             <dt>needs_review</dt>
             <dd>{integrity?.needsReview ?? 0}</dd>
-            <dt>contested</dt>
-            <dd>{integrity?.contested ?? 0}</dd>
-            <dt>source_orphan</dt>
-            <dd>{integrity?.sourceOrphan ?? 0}</dd>
+            <dt>verified</dt>
+            <dd>{integrity?.verified ?? 0}</dd>
+            <dt>rejected</dt>
+            <dd>{integrity?.rejected ?? 0}</dd>
             <dt>total</dt>
             <dd>{integrity?.total ?? 0}</dd>
           </dl>

@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { parseCompleteness, type CompletenessView, type CoverageDimension } from "../../features/knowledge/trustTypes";
+import { parseCompleteness, parseIntegrityReport, type CompletenessView, type CoverageDimension } from "../../features/knowledge/trustTypes";
 
 describe("parseCompleteness", () => {
   it("解析后端真实响应的 answeringMode + 5 维 coverage", () => {
@@ -38,5 +38,20 @@ describe("parseCompleteness", () => {
       "capability", "pricing", "caseEvidence", "effectClaims", "deliveryBoundary",
     ]);
     expect(dims[0].label).toBe("能力");
+  });
+});
+
+describe("parseIntegrityReport", () => {
+  it("读后端 item.{total,verified,needsReview,rejected}", () => {
+    const v = parseIntegrityReport({ item: { total: 40, verified: 12, needsReview: 2, rejected: 1 } });
+    expect(v.total).toBe(40);
+    expect(v.verified).toBe(12);
+    expect(v.needsReview).toBe(2);
+    expect(v.rejected).toBe(1);
+  });
+  it("缺 item 时全 0", () => {
+    const v = parseIntegrityReport({});
+    expect(v.total).toBe(0);
+    expect(v.verified).toBe(0);
   });
 });

@@ -77,3 +77,22 @@ export function parseCompleteness(raw: unknown): CompletenessView {
     dimensionList: DIM_ORDER.map((d) => ({ key: d.key, label: d.label, ...coverage[d.key] })),
   };
 }
+
+// 完整性诊断:后端 GET /api/operation-knowledge/integrity-report 真实返回 { item: { total, verified, needsReview, rejected, items[] } }。
+export interface IntegrityReportView {
+  total: number;
+  verified: number;
+  needsReview: number;
+  rejected: number;
+}
+
+export function parseIntegrityReport(raw: unknown): IntegrityReportView {
+  const item = ((raw ?? {}) as Record<string, unknown>).item ?? {};
+  const o = item as Record<string, unknown>;
+  return {
+    total: Number(o.total ?? 0),
+    verified: Number(o.verified ?? 0),
+    needsReview: Number(o.needsReview ?? 0),
+    rejected: Number(o.rejected ?? 0),
+  };
+}
