@@ -281,8 +281,15 @@ function StewardMode() {
         setCollapsed(false);
       }
     }
+    function onOpenCockpit() {
+      setPane("cockpit");
+    }
     window.addEventListener("wikiFocusChunk", onFocus as EventListener);
-    return () => window.removeEventListener("wikiFocusChunk", onFocus as EventListener);
+    window.addEventListener("wikiOpenCockpit", onOpenCockpit);
+    return () => {
+      window.removeEventListener("wikiFocusChunk", onFocus as EventListener);
+      window.removeEventListener("wikiOpenCockpit", onOpenCockpit);
+    };
   }, []);
 
   return (
@@ -1459,10 +1466,10 @@ function ImportWizard() {
       {step === 3 ? (
         <div style={{ marginTop: 12 }}>
           <div style={{ fontFamily: "var(--font-display)", fontSize: 16, marginBottom: 8 }}>
-            ✓ 已写入 {created.length} 条草稿 chunk
+            ✓ 已存入 {created.length} 条草稿
           </div>
           <p style={{ color: "var(--muted)", fontSize: 12.5 }}>
-            所有 chunk 处于 draft + needs_review 状态，进入「待评审」面板逐条 verify。
+            这些都是草稿,AI 还<strong>不能</strong>拿去跟客户说。需要你逐条看过、确认没问题后,AI 才会用它们。
           </p>
           <div style={{ marginTop: 8, display: "grid", gap: 4 }}>
             {created.map((id) => (
@@ -1471,7 +1478,14 @@ function ImportWizard() {
               </button>
             ))}
           </div>
-          <div style={{ marginTop: 14 }}>
+          <div style={{ marginTop: 14, display: "flex", gap: 8 }}>
+            <button
+              type="button"
+              className="wikiBtn"
+              onClick={() => window.dispatchEvent(new CustomEvent("wikiOpenCockpit"))}
+            >
+              去治理总览逐条处理 →
+            </button>
             <button type="button" className="wikiBtn" onClick={reset}>导入更多</button>
           </div>
         </div>
