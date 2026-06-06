@@ -114,3 +114,17 @@ export interface TrustChunkFields {
   usageStats?: ChunkUsageStats | null;
   provenance?: ChunkProvenanceView | null;
 }
+
+// 放行检查(D2 闸前端镜像):后端 verify 要求 source_quote + source_anchors 双非空。
+// 这是红线的前端镜像,用于驱动「让 AI 可以用这条」按钮的禁用态,不替代后端校验。
+export interface GoLiveCheck {
+  ok: boolean;
+  missing: ("quote" | "anchor")[];
+}
+
+export function canGoLive(input: { hasQuote: boolean; hasAnchor: boolean }): GoLiveCheck {
+  const missing: ("quote" | "anchor")[] = [];
+  if (!input.hasQuote) missing.push("quote");
+  if (!input.hasAnchor) missing.push("anchor");
+  return { ok: missing.length === 0, missing };
+}

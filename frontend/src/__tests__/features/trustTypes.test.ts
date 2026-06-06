@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { parseCompleteness, parseIntegrityReport, type CompletenessView, type CoverageDimension } from "../../features/knowledge/trustTypes";
+import { parseCompleteness, parseIntegrityReport, canGoLive, type CompletenessView, type CoverageDimension } from "../../features/knowledge/trustTypes";
 import type { TrustChunkFields } from "../../features/knowledge/trustTypes";
 
 describe("parseCompleteness", () => {
@@ -72,5 +72,19 @@ describe("TrustChunkFields", () => {
     };
     expect(full.chunkType).toBe("product_fact");
     expect(full.usageStats?.hitCount30d).toBe(5);
+  });
+});
+
+describe("canGoLive(D2 闸前端镜像)", () => {
+  it("有原话+有锚点 → 可生效", () => {
+    expect(canGoLive({ hasQuote: true, hasAnchor: true }).ok).toBe(true);
+  });
+  it("缺锚点 → 不可生效,missing 含 anchor", () => {
+    const r = canGoLive({ hasQuote: true, hasAnchor: false });
+    expect(r.ok).toBe(false);
+    expect(r.missing).toContain("anchor");
+  });
+  it("缺原话 → 不可生效", () => {
+    expect(canGoLive({ hasQuote: false, hasAnchor: true }).ok).toBe(false);
   });
 });
