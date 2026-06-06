@@ -526,7 +526,6 @@ pub(crate) async fn trigger_principal_escalation(
         .unwrap_or_else(|| contact.wxid.clone());
     let card =
         escalation::render_principal_card(&entry.short_code, &customer_label, &reason, &question);
-    escalation::assert_target_is_principal(&principal_wxid, &principal_wxid)?;
     mcp::logged_call_for_account(
         state,
         &contact.account_id,

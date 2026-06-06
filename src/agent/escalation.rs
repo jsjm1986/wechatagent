@@ -159,6 +159,12 @@ pub(crate) async fn principal_decider_wxid(
 
 /// 二次防护：目标 wxid 必须严格等于该 workspace 配置的 principal_decider。
 /// 用于推请示卡前，杜绝把内部请示卡误发给客户。
+///
+/// 当前所有请示卡发送路径（`trigger_principal_escalation` / `escalate_held_decision`）
+/// 的目标 wxid 都直接取自 `principal_decider_wxid()` 这一权威配置查询，故无需再调本守卫
+/// （调了也是同源恒真）。保留本函数作为「目标 vs 配置」不同源场景的防御 API + 其不变量单测；
+/// `#[allow(dead_code)]` 标注当前无生产调用点。
+#[allow(dead_code)]
 pub(crate) fn assert_target_is_principal(
     target_wxid: &str,
     configured_principal: &str,
