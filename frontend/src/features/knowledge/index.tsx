@@ -44,6 +44,7 @@ import type { LucideIcon } from "lucide-react";
 import { parseApiError, LlmUnavailableError } from "../../lib/api";
 import { parseCompleteness, parseIntegrityReport, type CompletenessView, type IntegrityReportView, type TrustChunkFields } from "./trustTypes";
 import { CockpitView } from "./cockpit/CockpitView";
+import { ReviewChat, type ReviewChatChunk } from "./cockpit/ReviewChat";
 import "./Knowledge.module.css";
 
 // ==== 以下 LLM 错误横幅 + KnowledgeWikiView 主体自 App.tsx 原样下沉（Stage-1 行为等价） ====
@@ -2526,6 +2527,8 @@ function ReviewView() {
   const [openBody, setOpenBody] = useState<Set<string>>(new Set());
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [batchBusy, setBatchBusy] = useState(false);
+  // T9：在主区打开「审核+对话」双栏(ReviewChat)；非空时替代列表。
+  const [chatChunk, setChatChunk] = useState<ReviewChatChunk | null>(null);
 
   async function load() {
     setLoading(true);
@@ -2739,6 +2742,26 @@ function ReviewView() {
           })}
         </div>
         <div className="wikiLintPanel">
+          {chatChunk ? (
+            <>
+              <button
+                type="button"
+                className="ghost wikiBtn"
+                onClick={() => setChatChunk(null)}
+              >
+                <Undo2 size={14} />
+                返回评审列表
+              </button>
+              <ReviewChat
+                chunk={chatChunk}
+                onResolved={() => {
+                  setChatChunk(null);
+                  void load();
+                }}
+              />
+            </>
+          ) : (
+            <>
           {!loading && visible.length === 0 ? (
             <div className="wikiEmpty">
               当前类别没有待评审 chunk。
@@ -2793,6 +2816,15 @@ function ReviewView() {
                         <X size={14} />
                         Reject
                       </button>
+                      <button
+                        type="button"
+                        className="wikiReviewActionBtn"
+                        onClick={() => setChatChunk(c)}
+                        title="打开审核+对话双栏：让 AI 改这条草稿，改完一键放行"
+                      >
+                        <MessageSquareText size={14} />
+                        审核 / 对话
+                      </button>
                     </div>
                   </div>
                   {c.summary ? <p className="wikiSignalDesc">{c.summary}</p> : null}
@@ -2828,6 +2860,8 @@ function ReviewView() {
               );
             })}
           </div>
+            </>
+          )}
         </div>
       </div>
     </div>
