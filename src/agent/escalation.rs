@@ -303,6 +303,21 @@ pub(crate) fn is_principal_relay_trigger(trigger: &AgentTrigger<'_>) -> bool {
     )
 }
 
+/// relay 出站红线守卫：检测一条**拟发给客户**的转述文本是否泄漏了内部 relay 载荷。
+///
+/// relay 转述要求 decision Agent 把领导裁决用 AI 口吻重组、**绝不**把合成消息里的
+/// 哨兵 `__PRINCIPAL_RELAY__` 或 `verdict=`/`substance=`/`constraints=` 等内部字段标记
+/// 透传给客户（见 prompts.rs relay 转述模式契约 + synthetic_principal_relay 载荷格式）。
+/// 该约束此前**只**靠 prompt 约束，无代码级兜底；本函数是出站方向的代码守卫——
+/// 网关在 relay run 入 outbox 前调用，命中即 fail-closed（不发泄漏文本），与解读侧
+/// `sanitize_verdict` 的代码级兜底对称。纯函数，便于单测。
+pub(crate) fn relay_output_leaks_internal_payload(reply_text: &str) -> bool {
+    reply_text.contains(crate::models::PRINCIPAL_RELAY_SENTINEL)
+        || reply_text.contains("verdict=")
+        || reply_text.contains("substance=")
+        || reply_text.contains("constraints=")
+}
+
 /// 从意图轨迹尾部数"连续未推进"轮数：未推进 = 相邻条目 `intent` 相同（含都为空串）。
 /// 例：轨迹 [A,B,B,B] → 末三条 intent 相同 → 返回 3。空轨迹返回 0。
 fn consecutive_unprogressed_turns(trajectory: &[crate::models::IntentTrajectoryEntry]) -> u32 {
@@ -1079,6 +1094,38 @@ mod tests {
         // 普通客户消息：内容不以哨兵开头。
         msg.content = "老板能不能再便宜点".into();
         assert!(!is_principal_relay_trigger(&AgentTrigger::Inbound(&msg)));
+    }
+
+    #[test]
+    fn relay_output_guard_passes_clean_ai_voice_transcription() {
+        // 正常转述：AI 口吻重组，不含任何内部字段标记 → 不应误判泄漏。
+        assert!(!relay_output_leaks_internal_payload(
+            "跟领导申请下来啦，可以给你 8 折，不过得麻烦你这周内完成付款，可以吗？"
+        ));
+        assert!(!relay_output_leaks_internal_payload(""));
+        // "条件"等中文词不含 "constraints=" 字面 → 不误判。
+        assert!(!relay_output_leaks_internal_payload(
+            "这个折扣是有条件的：本周付款。verdict 这种说法不会单独出现"
+        ));
+    }
+
+    #[test]
+    fn relay_output_guard_catches_sentinel_leak() {
+        // LLM 失误把哨兵透传 → 命中。
+        assert!(relay_output_leaks_internal_payload(
+            "__PRINCIPAL_RELAY__\nverdict=approved\nsubstance=可以给8折"
+        ));
+        assert!(relay_output_leaks_internal_payload(
+            "好的，__PRINCIPAL_RELAY__ 领导说可以"
+        ));
+    }
+
+    #[test]
+    fn relay_output_guard_catches_field_marker_leak() {
+        // 即使没透传哨兵，但漏了任一内部字段标记也命中。
+        assert!(relay_output_leaks_internal_payload("verdict=approved 可以给你"));
+        assert!(relay_output_leaks_internal_payload("领导说 substance=8折优惠"));
+        assert!(relay_output_leaks_internal_payload("constraints=本周付款"));
     }
 
     fn traj_entry(intent: &str) -> crate::models::IntentTrajectoryEntry {

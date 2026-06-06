@@ -1607,9 +1607,35 @@ async fn run_user_operation_gateway_inner(
     // 真正发送由 dispatcher worker 异步抢占（atomic claim + lease）后通过
     // `send_outbound_message` 调 MCP（spec R13 / requirements §F）。
     let final_status = review.final_review_status.as_str();
-    let outbox_eligible = final_decision.should_reply
+    let mut outbox_eligible = final_decision.should_reply
         && !final_decision.reply_text.trim().is_empty()
         && (final_status == "approved" || final_status == "revision_applied_approved");
+    // relay 出站红线守卫（代码级兜底）：relay 转述要求 AI 口吻重组、绝不透传内部
+    // 载荷（__PRINCIPAL_RELAY__/verdict=/substance=/constraints=）。此前仅靠 prompt
+    // 约束；这里在入 outbox 前对 relay run 的拟发文本做最后一道纯函数检查，命中即
+    // fail-closed：不入队泄漏文本（宁可客户这轮收不到，也绝不把内部载荷发给客户），
+    // 记 event + warn 供运维定位。非 relay run 不受影响。
+    if outbox_eligible
+        && escalation::is_principal_relay_trigger(&trigger)
+        && escalation::relay_output_leaks_internal_payload(&final_decision.reply_text)
+    {
+        outbox_eligible = false;
+        tracing::warn!(
+            %run_id,
+            contact_wxid = %contact.wxid,
+            "relay 转述拟发文本疑似泄漏内部载荷，已拦截不发（fail-closed）"
+        );
+        write_event_for_account(
+            state,
+            &contact.account_id,
+            Some(&contact.wxid),
+            "blocked_review",
+            "blocked_by_safety_guard",
+            "relay 转述输出含内部载荷标记，安全门拦截不发送",
+            None,
+        )
+        .await?;
+    }
     // 并发多消息去抖——兜底中止检查（outbox 入队之前）。主检查在 apply 之前已挡掉
     // 绝大多数；这里再查一次，接住 apply / memory / decision-review 写入期间到达的
     // 更新入站，避免发出一条已过时的回复。此前的画像 / 记忆写入已落库（幂等、
