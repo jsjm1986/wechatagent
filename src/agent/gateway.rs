@@ -1374,6 +1374,21 @@ async fn run_user_operation_gateway_inner(
             },
         )
         .await?;
+        // hold→升级请示：被风险闸门拦下的高风险件，按 workspace 升级模式请示领导并补发安全占位。
+        // 错误只记 warn、不阻断 run、不改终态（与 approved 末尾 trigger_principal_escalation 同纪律）。
+        // context_changed 不是决策墙，should_escalate_held 对其返回 false，不会误升级。
+        if let Err(e) = escalation::escalate_held_decision(
+            state,
+            &contact,
+            &review,
+            &final_decision,
+            domain_config.as_ref(),
+            &blocked_status,
+        )
+        .await
+        {
+            tracing::warn!(error = %e, contact = %contact.wxid, "hold→升级请示失败（不阻断 run）");
+        }
         return Ok(());
     }
 

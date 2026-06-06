@@ -5,13 +5,14 @@
 //! 幕后决策源，绝不直接面对客户。这不是真人下场：AI 向内部决策源请示，转述仍由 AI 完成。
 
 use super::generate_agent_json;
-use super::types::AgentTrigger;
+use super::types::{AgentDecision, AgentTrigger, DecisionReviewResult};
 use crate::error::{AppError, AppResult};
 use crate::models::{
     AgentPrincipalEscalation, AgentTask, Contact, OperationDomainConfig, OperationKnowledgeChunk,
     PrincipalDecision, ALLOWED_ESCALATION_CATEGORY, ALLOWED_PRINCIPAL_VERDICT,
-    AWAITING_PRINCIPAL_DECISION_ATTR, PRINCIPAL_ESCALATION_STATUS_PENDING,
-    PRINCIPAL_ESCALATION_STATUS_RESOLVED, PRINCIPAL_VERDICT_DEFERRED,
+    AWAITING_PRINCIPAL_DECISION_ATTR, ESCALATION_CATEGORY_HIGH_RISK_GATED,
+    PRINCIPAL_ESCALATION_STATUS_PENDING, PRINCIPAL_ESCALATION_STATUS_RESOLVED,
+    PRINCIPAL_VERDICT_DEFERRED,
 };
 use crate::mcp;
 use crate::prompts;
@@ -357,6 +358,127 @@ pub(crate) fn build_decision_signals_text(
     }
 
     lines.join("\n")
+}
+
+/// 被风险闸门 hold 的件是否要升级请示领导（纯函数，业务判定，便于单测）。
+/// `blocked_status` 是网关 hold 分支算出的终态字面量（见 review::GatewayStatusFinal::gateway_status_str）。
+/// 取舍（已拍板）：安全门/未验证产品声明无条件升级（这两类是"不敢答"的硬风险，领导必须知道）；
+/// ai_policy 仅 All 模式升级（保守默认 DecisionOnly 下，策略性暂缓不打扰领导）；
+/// 等待更多上下文 / 必填缺失 / 预算超额 / context_changed 一律不升级（不是决策墙，是 AI 自身可恢复的状态）。
+pub(crate) fn should_escalate_held(blocked_status: &str, mode: HighRiskEscalationMode) -> bool {
+    match blocked_status {
+        s if s == crate::agent::types::HOLD_CATEGORY_BLOCKED_BY_SAFETY_GUARD => true,
+        "blocked_unverified_product_claim" => true,
+        s if s == crate::agent::types::HOLD_CATEGORY_HELD_BY_AI_POLICY => {
+            mode == HighRiskEscalationMode::All
+        }
+        _ => false,
+    }
+}
+
+/// hold→升级请示：被风险闸门拦下的高风险件，按 workspace 升级模式请示领导并补发安全占位。
+///
+/// 与 `trigger_principal_escalation` 的区别：后者用于 approved 路径（占位已由 outbox 发出，
+/// 本函数只推卡+落台账）；hold 路径无 outbox、客户尚未收到任何回复，故本函数额外**补发安全占位**
+/// 安抚客户（体验与 approved 一致），并直接写 awaiting 标记（hold 路径不走 apply_agent_updates）。
+///
+/// 红线：占位走 `fallback_holding_reply()`（不含任何转接类措辞），客户始终只跟 AI 对话；
+/// 真人仅作幕后决策源。调用方对本函数错误只记 warn、不阻断 run、不改终态。
+pub(crate) async fn escalate_held_decision(
+    state: &AppState,
+    contact: &Contact,
+    review: &DecisionReviewResult,
+    final_decision: &AgentDecision,
+    domain_config: Option<&OperationDomainConfig>,
+    blocked_status: &str,
+) -> AppResult<()> {
+    let mode =
+        parse_high_risk_mode(domain_config.and_then(|c| c.high_risk_escalation_mode.as_deref()));
+    if !should_escalate_held(blocked_status, mode) {
+        return Ok(());
+    }
+    let Some(principal_wxid) =
+        principal_decider_wxid(state, &contact.workspace_id, super::domain::USER_OPS_DOMAIN_ID)
+            .await?
+    else {
+        return Ok(()); // 未配置领导 = 本 workspace 未启用请示通道
+    };
+    if principal_wxid == contact.wxid {
+        return Err(AppError::BadRequest(
+            "principal_decider 配置等于客户 wxid，拒绝触发请示".into(),
+        ));
+    }
+    // 去重：同客户同类别已有 pending → 不重复推卡骚扰领导。
+    if has_pending_for_contact(
+        state,
+        &contact.workspace_id,
+        &contact.wxid,
+        ESCALATION_CATEGORY_HIGH_RISK_GATED,
+    )
+    .await?
+    {
+        return Ok(());
+    }
+    let reason = if !review.hold_reason.trim().is_empty() {
+        review.hold_reason.clone()
+    } else {
+        review.review_summary.clone()
+    };
+    let question = format!(
+        "该客户议题触发高风险闸门（{}），AI 暂不自行答复。拟答风险等级：{}。请领导定夺该如何回复。",
+        blocked_status, final_decision.risk_level
+    );
+    let entry = insert_pending_escalation(
+        state,
+        &contact.workspace_id,
+        &contact.account_id,
+        &contact.wxid,
+        ESCALATION_CATEGORY_HIGH_RISK_GATED,
+        &reason,
+        &question,
+        &principal_wxid,
+        false, // 高风险硬闸件默认不泛化（领导裁决可能是个案）
+    )
+    .await?;
+    let customer_label = contact
+        .remark
+        .clone()
+        .or_else(|| contact.nickname.clone())
+        .or_else(|| contact.alias.clone())
+        .unwrap_or_else(|| contact.wxid.clone());
+    let card = render_principal_card(&entry.short_code, &customer_label, &reason, &question);
+    mcp::logged_call_for_account(
+        state,
+        &contact.account_id,
+        "message_send_text",
+        serde_json::json!({ "recipient": principal_wxid, "content": card }),
+    )
+    .await?;
+    // 补发安全占位安抚客户（hold 路径无 outbox，直发；体验与 approved 占位一致）。
+    mcp::logged_call_for_account(
+        state,
+        &contact.account_id,
+        "message_send_text",
+        serde_json::json!({ "recipient": &contact.wxid, "content": fallback_holding_reply() }),
+    )
+    .await?;
+    // 写 awaiting 标记（hold 路径不走 apply_agent_updates，需单独写），
+    // 否则下一轮 build_decision_signals_text 读不到等待信号。用 dotted key $set，不覆盖其它 domain_attributes。
+    let set_key = format!("domain_attributes.{}", AWAITING_PRINCIPAL_DECISION_ATTR);
+    state
+        .db
+        .contacts()
+        .update_one(
+            doc! {
+                "workspace_id": &contact.workspace_id,
+                "account_id": &contact.account_id,
+                "wxid": &contact.wxid,
+            },
+            doc! { "$set": { set_key: true, "domain_attributes_updated_at": DateTime::now() } },
+            None,
+        )
+        .await?;
+    Ok(())
 }
 
 /// 处理 principal_decision_relay task：领导已裁决，把决策用 AI 口吻转述给客户。
@@ -1024,5 +1146,89 @@ mod tests {
         ];
         assert_eq!(consecutive_unprogressed_turns(&traj), 3);
         assert_eq!(consecutive_unprogressed_turns(&[]), 0);
+    }
+
+    #[test]
+    fn should_escalate_held_safety_guard_unconditional() {
+        use crate::agent::types::HOLD_CATEGORY_BLOCKED_BY_SAFETY_GUARD;
+        // 安全门：两种模式都升级。
+        assert!(should_escalate_held(
+            HOLD_CATEGORY_BLOCKED_BY_SAFETY_GUARD,
+            HighRiskEscalationMode::DecisionOnly
+        ));
+        assert!(should_escalate_held(
+            HOLD_CATEGORY_BLOCKED_BY_SAFETY_GUARD,
+            HighRiskEscalationMode::All
+        ));
+    }
+
+    #[test]
+    fn should_escalate_held_unverified_product_unconditional() {
+        // 未验证产品声明：两种模式都升级。
+        assert!(should_escalate_held(
+            "blocked_unverified_product_claim",
+            HighRiskEscalationMode::DecisionOnly
+        ));
+        assert!(should_escalate_held(
+            "blocked_unverified_product_claim",
+            HighRiskEscalationMode::All
+        ));
+    }
+
+    #[test]
+    fn should_escalate_held_ai_policy_only_in_all_mode() {
+        use crate::agent::types::HOLD_CATEGORY_HELD_BY_AI_POLICY;
+        // 策略性暂缓：仅 All 模式升级，保守 DecisionOnly 不打扰领导。
+        assert!(should_escalate_held(
+            HOLD_CATEGORY_HELD_BY_AI_POLICY,
+            HighRiskEscalationMode::All
+        ));
+        assert!(!should_escalate_held(
+            HOLD_CATEGORY_HELD_BY_AI_POLICY,
+            HighRiskEscalationMode::DecisionOnly
+        ));
+    }
+
+    #[test]
+    fn should_escalate_held_waiting_context_never() {
+        use crate::agent::types::HOLD_CATEGORY_AI_WAITING_FOR_MORE_CONTEXT;
+        // 等待更多上下文：不是决策墙，是 AI 自身可恢复状态，永不升级。
+        assert!(!should_escalate_held(
+            HOLD_CATEGORY_AI_WAITING_FOR_MORE_CONTEXT,
+            HighRiskEscalationMode::All
+        ));
+        assert!(!should_escalate_held(
+            HOLD_CATEGORY_AI_WAITING_FOR_MORE_CONTEXT,
+            HighRiskEscalationMode::DecisionOnly
+        ));
+    }
+
+    #[test]
+    fn should_escalate_held_other_terminal_states_never() {
+        // 必填缺失 / 预算超额 / context_changed：均非决策墙，不升级。
+        for s in [
+            "blocked_by_required_field",
+            "blocked_by_budget",
+            "context_changed",
+        ] {
+            assert!(!should_escalate_held(s, HighRiskEscalationMode::All), "{s} 不应升级");
+            assert!(
+                !should_escalate_held(s, HighRiskEscalationMode::DecisionOnly),
+                "{s} 不应升级"
+            );
+        }
+    }
+
+    #[test]
+    fn fallback_holding_reply_has_no_handoff_wording() {
+        // 红线机械守卫：hold 路径补发的安全占位绝不含任何转接类措辞。
+        let reply = fallback_holding_reply();
+        for forbidden in ["人工", "接管", "转人", "客服", "专员", "同事"] {
+            assert!(
+                !reply.contains(forbidden),
+                "占位文案不得含「{forbidden}」，实际：{reply}"
+            );
+        }
+        assert!(!reply.is_empty());
     }
 }
