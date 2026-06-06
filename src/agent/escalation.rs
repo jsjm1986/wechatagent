@@ -120,6 +120,9 @@ pub(crate) fn relay_substance_if_usable<'a>(
 }
 
 /// 高风险件升级模式。
+/// 注：当前仅单测引用 + 配置已落库；decision Agent 对该模式的消费是 prompt 驱动的后续接线，
+/// 故非测试构建下暂为 dead_code。CI 用 `-D warnings`，显式 allow 待 gateway 注入接线落地后移除。
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) enum HighRiskEscalationMode {
     /// 所有被静默 hold 的高风险件都请示真人。
@@ -129,6 +132,7 @@ pub(crate) enum HighRiskEscalationMode {
 }
 
 /// 从 workspace 配置字符串解析升级模式；未配/未知值回落 DecisionOnly（保守默认）。
+#[allow(dead_code)]
 pub(crate) fn parse_high_risk_mode(raw: Option<&str>) -> HighRiskEscalationMode {
     match raw {
         Some("all") => HighRiskEscalationMode::All,
@@ -586,6 +590,9 @@ async fn enqueue_relay_task(state: &AppState, entry: &AgentPrincipalEscalation) 
 
 /// 多轮卡死判定（业务决策 #5）：同一议题连续 stalled_turns 轮未推进 + 最近一轮负面反应。
 /// 两条件同时满足才算卡死。纯函数，输入由 gateway 从 state/reaction 取。
+/// 注：gateway 把卡死信号注入 decision prompt 的接线是后续增强（计划明示 deferred），
+/// 故当前仅单测引用、非测试构建下暂为 dead_code。CI `-D warnings`，显式 allow 待注入落地后移除。
+#[allow(dead_code)]
 pub(crate) fn is_stuck_or_undelivered(
     consecutive_unprogressed_turns: u32,
     threshold: u32,
@@ -595,6 +602,7 @@ pub(crate) fn is_stuck_or_undelivered(
 }
 
 /// 默认卡死轮阈值（spec：默认 3，可配）。
+#[allow(dead_code)]
 pub(crate) const DEFAULT_STUCK_THRESHOLD: u32 = 3;
 
 #[cfg(test)]
