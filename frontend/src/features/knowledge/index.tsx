@@ -42,6 +42,7 @@ import {
 } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
 import { parseApiError, LlmUnavailableError } from "../../lib/api";
+import { parseCompleteness, type CompletenessView } from "./trustTypes";
 import "./Knowledge.module.css";
 
 // ==== 以下 LLM 错误横幅 + KnowledgeWikiView 主体自 App.tsx 原样下沉（Stage-1 行为等价） ====
@@ -4261,11 +4262,6 @@ interface CatalogPersistedView {
   items?: unknown[];
 }
 
-interface CompletenessView {
-  perWikiType?: Array<{ wikiType?: string; total?: number; ratio?: number }>;
-  overall?: { total?: number; verified?: number; ratio?: number };
-}
-
 interface IntegrityReportView {
   needsReview?: number;
   contested?: number;
@@ -4567,7 +4563,7 @@ function ObservabilityDashboard() {
       ]);
       setCatalog(a as CatalogPersistedView);
       setCatalogLive(b as { total?: number });
-      setCompleteness(c as CompletenessView);
+      setCompleteness(parseCompleteness(c));
       setIntegrity(d as IntegrityReportView);
       setLogs(e as LogsAnalyzeView);
       const metrics = f as { answerCache?: typeof cacheStats };
@@ -4657,26 +4653,22 @@ function ObservabilityDashboard() {
             <span className="wikiArchiveTag">[completeness]</span>
             <h4>类型完整度</h4>
           </header>
-          {completeness?.perWikiType && completeness.perWikiType.length > 0 ? (
-            <div className="wikiCoverageBars">
-              {completeness.perWikiType.map((row, i) => {
-                const ratio = Math.max(0, Math.min(1, Number(row.ratio ?? 0)));
-                return (
-                  <div className="wikiCoverageBarRow" key={i}>
-                    <span className="wikiCoverageBarLabel">{row.wikiType ?? "?"}</span>
-                    <div className="wikiCoverageBar">
-                      <div
-                        className="wikiCoverageBarFill"
-                        style={{ width: `${(ratio * 100).toFixed(0)}%` }}
-                      />
-                    </div>
-                    <span className="wikiCoverageBarValue">
-                      {(ratio * 100).toFixed(0)}% · {row.total ?? 0}
-                    </span>
-                  </div>
-                );
-              })}
-            </div>
+          {completeness ? (
+            <dl className="wikiArchiveMeta">
+              <dt>应答模式</dt>
+              <dd>{completeness.answeringMode}</dd>
+              <dt>已验证</dt>
+              <dd>
+                {completeness.verifiedChunks}/{completeness.totalChunks}
+              </dd>
+              {completeness.summary ? (
+                <>
+                  <dt>摘要</dt>
+                  <dd>{completeness.summary}</dd>
+                </>
+              ) : null}
+              {/* coverage 5 维裁决渲染见后续 cockpit 任务 */}
+            </dl>
           ) : (
             <div className="wikiEmpty">无完整度数据</div>
           )}
