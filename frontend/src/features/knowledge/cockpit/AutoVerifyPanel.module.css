@@ -1,0 +1,228 @@
+/* auto-verify 批量校验屏。语义色只用 var(--token);无左缘竖色杠;裸 button 重置;呼吸克制。 */
+
+.panel {
+  display: flex;
+  flex-direction: column;
+  gap: 22px;
+  padding: 4px 2px 24px;
+}
+
+/* ── 点题条：靛色 fill-brand 卡 ── */
+.intro {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 16px 18px;
+  background: var(--fill-brand);
+  border: 1px solid rgba(94, 92, 230, 0.26);
+  border-radius: var(--r-md);
+}
+
+.introHead {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--color-brand);
+}
+
+.introTitle {
+  font-size: 14.5px;
+  font-weight: 680;
+  letter-spacing: -0.2px;
+}
+
+.introBody {
+  margin: 0;
+  font-size: 13px;
+  line-height: 1.55;
+  color: var(--ink-2);
+}
+
+.introStrong {
+  color: var(--color-brand);
+  font-weight: 680;
+}
+
+/* ── 配置块 ── */
+.block {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.blockLabel {
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  color: var(--ink-3);
+}
+
+.hint {
+  margin: 0;
+  font-size: 12.5px;
+  line-height: 1.5;
+  color: var(--ink-4);
+}
+
+/* ── 分段按钮组 ── */
+.segGroup {
+  display: inline-flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.seg {
+  font: inherit;
+  appearance: none;
+  min-height: 0;
+  justify-content: center;
+  cursor: pointer;
+  font-size: 13px;
+  font-weight: 600;
+  padding: 9px 18px;
+  color: var(--ink-2);
+  background: var(--surface-card);
+  border: 1px solid var(--hairline);
+  border-radius: var(--r-sm);
+  transition: border-color 0.16s ease, background 0.16s ease, color 0.16s ease;
+}
+
+.seg:hover {
+  border-color: rgba(10, 132, 255, 0.4);
+}
+
+.segOn,
+.segOn:hover {
+  color: var(--color-scheduled);
+  background: var(--fill-scheduled);
+  border-color: rgba(10, 132, 255, 0.4);
+}
+
+/* ── 留一批我复查 开关 ── */
+.toggleRow {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 12px 14px;
+  background: var(--surface-card);
+  border: 1px solid var(--hairline);
+  border-radius: var(--r-sm);
+  cursor: pointer;
+}
+
+.toggleInput {
+  width: auto;
+  height: auto;
+  margin-top: 2px;
+  accent-color: var(--color-scheduled);
+  cursor: pointer;
+}
+
+.toggleText {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.toggleTitle {
+  font-size: 13.5px;
+  font-weight: 640;
+  color: var(--ink-1);
+}
+
+.toggleSub {
+  font-size: 12.5px;
+  line-height: 1.45;
+  color: var(--ink-4);
+}
+
+/* ── 开始筛 ── */
+.startBtn {
+  font: inherit;
+  appearance: none;
+  min-height: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  align-self: flex-start;
+  cursor: pointer;
+  font-size: 14px;
+  font-weight: 640;
+  padding: 11px 22px;
+  color: #fff;
+  background: var(--color-brand);
+  border: none;
+  border-radius: var(--r-sm);
+  transition: filter 0.16s ease;
+}
+
+.startBtn:hover:not(:disabled) {
+  filter: brightness(1.06);
+}
+
+.startBtn:disabled {
+  background: rgba(20, 30, 60, 0.12);
+  color: var(--ink-4);
+  cursor: not-allowed;
+}
+
+.error {
+  margin: 0;
+  font-size: 12.5px;
+  color: var(--color-held);
+}
+
+/* ── 结果三堆 ── */
+.pileGrid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 14px;
+}
+
+@media (max-width: 720px) {
+  .pileGrid {
+    grid-template-columns: 1fr;
+  }
+}
+
+.pile {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 16px 16px 14px;
+  background: var(--surface-card);
+  border: 1px solid var(--hairline);
+  border-radius: var(--r-md);
+}
+
+.pileNum {
+  font-size: 26px;
+  font-weight: 700;
+  line-height: 1.1;
+  letter-spacing: -0.5px;
+}
+
+.pileTitle {
+  font-size: 13px;
+  font-weight: 640;
+  color: var(--ink-1);
+}
+
+.pileSub {
+  font-size: 12px;
+  line-height: 1.45;
+  color: var(--ink-4);
+}
+
+.pileVerified .pileNum {
+  color: var(--color-running);
+}
+
+.pileAudit .pileNum {
+  color: var(--color-held);
+}
+
+.pileUnsure .pileNum {
+  color: var(--ink-3);
+}

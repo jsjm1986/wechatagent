@@ -45,6 +45,7 @@ import { parseApiError, LlmUnavailableError } from "../../lib/api";
 import { parseCompleteness, parseIntegrityReport, type CompletenessView, type IntegrityReportView, type TrustChunkFields } from "./trustTypes";
 import { CockpitView } from "./cockpit/CockpitView";
 import { ReviewChat, type ReviewChatChunk } from "./cockpit/ReviewChat";
+import { AutoVerifyPanel } from "./cockpit/AutoVerifyPanel";
 import "./Knowledge.module.css";
 
 // ==== 以下 LLM 错误横幅 + KnowledgeWikiView 主体自 App.tsx 原样下沉（Stage-1 行为等价） ====
@@ -267,7 +268,7 @@ function ExploreMode() {
 }
 
 function StewardMode() {
-  const [pane, setPane] = useState<"cockpit" | "lint" | "review" | "revisions" | "documents" | "import" | "ingest" | "observability" | "tryRecall">("cockpit");
+  const [pane, setPane] = useState<"cockpit" | "lint" | "review" | "autoVerify" | "revisions" | "documents" | "import" | "ingest" | "observability" | "tryRecall">("cockpit");
   const [focusedId, setFocusedId] = useState<string | null>(null);
   const [collapsed, setCollapsed] = useState(true);
 
@@ -311,6 +312,13 @@ function StewardMode() {
           onClick={() => setPane("review")}
         >
           <ShieldCheck size={14} /> 待评审
+        </button>
+        <button
+          type="button"
+          className={pane === "autoVerify" ? "wikiStewardNavBtn active" : "wikiStewardNavBtn"}
+          onClick={() => setPane("autoVerify")}
+        >
+          <Sparkles size={14} /> 批量校验
         </button>
         <button
           type="button"
@@ -359,11 +367,12 @@ function StewardMode() {
         {pane === "cockpit" && (
           <CockpitView
             onOpenReview={() => setPane("review")}
-            onOpenAutoVerify={() => setPane("review")}
+            onOpenAutoVerify={() => setPane("autoVerify")}
           />
         )}
         {pane === "lint" && <LintView />}
         {pane === "review" && <ReviewView />}
+        {pane === "autoVerify" && <AutoVerifyPanel />}
         {pane === "revisions" && <ChunkRevisionsDrawer />}
         {pane === "documents" && <DocumentsView />}
         {pane === "import" && <ImportWizard />}
