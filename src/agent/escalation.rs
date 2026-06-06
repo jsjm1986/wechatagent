@@ -8,8 +8,9 @@ use super::generate_agent_json;
 use super::types::AgentTrigger;
 use crate::error::{AppError, AppResult};
 use crate::models::{
-    AgentPrincipalEscalation, AgentTask, OperationKnowledgeChunk, PrincipalDecision,
-    ALLOWED_ESCALATION_CATEGORY, ALLOWED_PRINCIPAL_VERDICT, PRINCIPAL_ESCALATION_STATUS_PENDING,
+    AgentPrincipalEscalation, AgentTask, Contact, OperationDomainConfig, OperationKnowledgeChunk,
+    PrincipalDecision, ALLOWED_ESCALATION_CATEGORY, ALLOWED_PRINCIPAL_VERDICT,
+    AWAITING_PRINCIPAL_DECISION_ATTR, PRINCIPAL_ESCALATION_STATUS_PENDING,
     PRINCIPAL_ESCALATION_STATUS_RESOLVED, PRINCIPAL_VERDICT_DEFERRED,
 };
 use crate::mcp;
@@ -120,10 +121,8 @@ pub(crate) fn relay_substance_if_usable<'a>(
     }
 }
 
-/// 高风险件升级模式。
-/// 注：当前仅单测引用 + 配置已落库；decision Agent 对该模式的消费是 prompt 驱动的后续接线，
-/// 故非测试构建下暂为 dead_code。CI 用 `-D warnings`，显式 allow 待 gateway 注入接线落地后移除。
-#[allow(dead_code)]
+/// 高风险件升级模式。decision Agent 据此判断被风险闸门拦下的件是否要请示领导，
+/// hold→升级路径(`escalate_held_decision`)据此决定 ai_policy 类是否升级。
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) enum HighRiskEscalationMode {
     /// 所有被静默 hold 的高风险件都请示真人。
@@ -133,7 +132,6 @@ pub(crate) enum HighRiskEscalationMode {
 }
 
 /// 从 workspace 配置字符串解析升级模式；未配/未知值回落 DecisionOnly（保守默认）。
-#[allow(dead_code)]
 pub(crate) fn parse_high_risk_mode(raw: Option<&str>) -> HighRiskEscalationMode {
     match raw {
         Some("all") => HighRiskEscalationMode::All,
@@ -296,6 +294,69 @@ pub(crate) fn is_principal_relay_trigger(trigger: &AgentTrigger<'_>) -> bool {
         trigger,
         AgentTrigger::Inbound(m) if m.content.starts_with(crate::models::PRINCIPAL_RELAY_SENTINEL)
     )
+}
+
+/// 从意图轨迹尾部数"连续未推进"轮数：未推进 = 相邻条目 `intent` 相同（含都为空串）。
+/// 例：轨迹 [A,B,B,B] → 末三条 intent 相同 → 返回 3。空轨迹返回 0。
+fn consecutive_unprogressed_turns(trajectory: &[crate::models::IntentTrajectoryEntry]) -> u32 {
+    let Some(last) = trajectory.last() else {
+        return 0;
+    };
+    let mut count = 0u32;
+    for entry in trajectory.iter().rev() {
+        if entry.intent == last.intent {
+            count += 1;
+        } else {
+            break;
+        }
+    }
+    count
+}
+
+/// 组装注入 decision prompt 的"请示通道信号"段（纯函数，无 IO）。三信号：
+/// ①等待领导决策中（domain_attributes 布尔标记）②多轮卡死（意图轨迹连续未推进+末轮负面）
+/// ③高风险升级模式（workspace 配置）。三信号全缺返回空串（decision.rs 据此决定是否拼接）。
+pub(crate) fn build_decision_signals_text(
+    contact: &Contact,
+    domain_config: Option<&OperationDomainConfig>,
+) -> String {
+    let mut lines: Vec<String> = Vec::new();
+
+    // ① 等待领导决策中：该客户有一条 pending 请示，正在等领导回话。
+    let awaiting = contact
+        .domain_attributes
+        .as_ref()
+        .and_then(|d| d.get_bool(AWAITING_PRINCIPAL_DECISION_ATTR).ok())
+        .unwrap_or(false);
+    if awaiting {
+        lines.push(
+            "- 该客户当前有一条议题已向领导请示、正在等待裁决：勿就同一越权点反复请示，也不要替领导拍板；客户这条消息里非越权、你能自主答的部分照常自然回复。".to_string(),
+        );
+    }
+
+    // ② 多轮卡死：同一议题连续未推进 + 最近一轮负面反应（两条件 AND）。
+    let turns = consecutive_unprogressed_turns(&contact.intent_trajectory);
+    let latest_negative = contact
+        .intent_trajectory
+        .last()
+        .map(|e| crate::agent::reaction::is_negative_outcome(&e.intent))
+        .unwrap_or(false);
+    if is_stuck_or_undelivered(turns, DEFAULT_STUCK_THRESHOLD, latest_negative) {
+        lines.push(
+            "- 该议题已连续多轮未推进且客户有负面反应：避免硬推同一话术，考虑换个角度，或如实告诉客户你需要向领导确认后再答复。".to_string(),
+        );
+    }
+
+    // ③ 高风险升级模式：仅 All 模式需要提示 decision Agent 主动 emit escalation。
+    let mode =
+        parse_high_risk_mode(domain_config.and_then(|c| c.high_risk_escalation_mode.as_deref()));
+    if mode == HighRiskEscalationMode::All {
+        lines.push(
+            "- 本工作区为全量升级模式：凡触及未验证产品声明或被风险闸门拦下的高风险件，都应输出 escalationRequest 请示领导，不要自行硬答。".to_string(),
+        );
+    }
+
+    lines.join("\n")
 }
 
 /// 处理 principal_decision_relay task：领导已裁决，把决策用 AI 口吻转述给客户。
@@ -603,10 +664,7 @@ async fn enqueue_relay_task(state: &AppState, entry: &AgentPrincipalEscalation) 
 }
 
 /// 多轮卡死判定（业务决策 #5）：同一议题连续 stalled_turns 轮未推进 + 最近一轮负面反应。
-/// 两条件同时满足才算卡死。纯函数，输入由 gateway 从 state/reaction 取。
-/// 注：gateway 把卡死信号注入 decision prompt 的接线是后续增强（计划明示 deferred），
-/// 故当前仅单测引用、非测试构建下暂为 dead_code。CI `-D warnings`，显式 allow 待注入落地后移除。
-#[allow(dead_code)]
+/// 两条件同时满足才算卡死。纯函数，输入由 `build_decision_signals_text` 从 contact 取。
 pub(crate) fn is_stuck_or_undelivered(
     consecutive_unprogressed_turns: u32,
     threshold: u32,
@@ -616,7 +674,6 @@ pub(crate) fn is_stuck_or_undelivered(
 }
 
 /// 默认卡死轮阈值（spec：默认 3，可配）。
-#[allow(dead_code)]
 pub(crate) const DEFAULT_STUCK_THRESHOLD: u32 = 3;
 
 #[cfg(test)]
@@ -894,5 +951,78 @@ mod tests {
         // 普通客户消息：内容不以哨兵开头。
         msg.content = "老板能不能再便宜点".into();
         assert!(!is_principal_relay_trigger(&AgentTrigger::Inbound(&msg)));
+    }
+
+    fn traj_entry(intent: &str) -> crate::models::IntentTrajectoryEntry {
+        crate::models::IntentTrajectoryEntry {
+            turn_index: 0,
+            intent: intent.into(),
+            objection_type: None,
+            recorded_at: mongodb::bson::DateTime::now(),
+        }
+    }
+
+    #[test]
+    fn signals_empty_when_no_signal_present() {
+        let contact = make_contact("cust1");
+        assert!(build_decision_signals_text(&contact, None).is_empty());
+    }
+
+    #[test]
+    fn signals_emit_awaiting_when_marker_set() {
+        let mut contact = make_contact("cust1");
+        let mut attrs = mongodb::bson::Document::new();
+        attrs.insert(AWAITING_PRINCIPAL_DECISION_ATTR, true);
+        contact.domain_attributes = Some(attrs);
+        let text = build_decision_signals_text(&contact, None);
+        assert!(text.contains("正在等待裁决"), "应出等待领导信号，实际：{text}");
+    }
+
+    #[test]
+    fn signals_emit_stuck_on_three_same_intent_plus_negative() {
+        let mut contact = make_contact("cust1");
+        // 连续 3 轮同一负面 intent → 卡死两条件同时满足。
+        contact.intent_trajectory = vec![
+            traj_entry("user_replied_objection"),
+            traj_entry("user_replied_objection"),
+            traj_entry("user_replied_objection"),
+        ];
+        let text = build_decision_signals_text(&contact, None);
+        assert!(text.contains("连续多轮未推进"), "应出卡死信号，实际：{text}");
+    }
+
+    #[test]
+    fn signals_no_stuck_below_threshold() {
+        let mut contact = make_contact("cust1");
+        // 仅 2 轮同 intent，未达阈值 3。
+        contact.intent_trajectory = vec![
+            traj_entry("user_replied_objection"),
+            traj_entry("user_replied_objection"),
+        ];
+        assert!(!build_decision_signals_text(&contact, None).contains("连续多轮未推进"));
+    }
+
+    #[test]
+    fn signals_no_stuck_when_latest_not_negative() {
+        let mut contact = make_contact("cust1");
+        // 连续 3 轮但末轮非负面 intent → 不触发。
+        contact.intent_trajectory = vec![
+            traj_entry("user_replied_positive"),
+            traj_entry("user_replied_positive"),
+            traj_entry("user_replied_positive"),
+        ];
+        assert!(!build_decision_signals_text(&contact, None).contains("连续多轮未推进"));
+    }
+
+    #[test]
+    fn consecutive_unprogressed_counts_tail_run() {
+        let traj = vec![
+            traj_entry("a"),
+            traj_entry("b"),
+            traj_entry("b"),
+            traj_entry("b"),
+        ];
+        assert_eq!(consecutive_unprogressed_turns(&traj), 3);
+        assert_eq!(consecutive_unprogressed_turns(&[]), 0);
     }
 }
