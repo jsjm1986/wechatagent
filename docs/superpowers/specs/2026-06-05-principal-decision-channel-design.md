@@ -65,6 +65,8 @@
 
 1. **超职权/需决策事项**（`out_of_scope_decision`）：合同变更、特殊折扣、退款纠纷、法律承诺、定制需求。
 2. **闸门拦截的高风险件**（`high_risk_gated`）：原本被五闸门静默 hold 的件（FactRisk≥6 / 未验证产品声明 / PressureRisk≥7），升级为 hold + 请示。
+   - **实现（hold→升级接线）**：gateway hold 分支末尾调用 `escalation::escalate_held_decision`，按 workspace 的 `high_risk_escalation_mode` 配置决定是否升级——`blocked_by_safety_guard` / `blocked_unverified_product_claim` **无条件升级**；`held_by_ai_policy` **仅 `all` 模式升级**（保守默认 `decision_only` 不打扰领导）；`ai_waiting_for_more_context` / `blocked_by_required_field` / `blocked_by_budget` / `context_changed` 一律不升级（非决策墙，是 AI 自身可恢复状态）。判定逻辑落在纯函数 `should_escalate_held` 便于单测。
+   - 升级时**补发安全占位**（`fallback_holding_reply()`，不含任何转接类措辞）安抚客户——hold 路径无 outbox，直发；体验与 approved 占位一致。同时写 `awaiting_principal_decision` 标记（hold 路径不走 `apply_agent_updates`，需单独 `$set`）。
 3. **多轮卡死/失败兑动**（`stuck_or_undelivered`）：**同一议题连续 N 轮（默认 3，可配）Agent 未推进 + 客户出现负面反应**，gateway 前置 pre-check 识别。不靠纯轮数，避免误触发骚扰真人。
 
 **明确不触发**：客户嘴上说"转真人 / 我要找人工"本身**不**构成上报，Agent 继续自己处理（保留现有 t8 场景的正确行为——见 §11）。触发取决于事项**实质**是否超职权，而非客户字面用词。
@@ -114,6 +116,8 @@
 - **拒绝**：保关系优先，先用真人给的替代方案，否则回落标准报价："8 折确实做不了，但我能给你争取个赠品 + 包邮，你看？"
 - relay 发出后：清 `ai_awaiting_principal_decision` 等待态，台账标 `resolved`，客户回到正常 managed 流。
 
+> **relay 必须豁免频控类 precheck（关键闭环）**：relay 走合成 Inbound 重入网关，而触发请示时的占位 reply 刚把 `last_agent_run_at` 刷成 now；领导通常几秒~几分钟内回复，relay task 到达时距上次 run < 最小回复间隔（默认 20s），若不豁免必被 `rate_limited` 拦掉，**领导裁决永远送不到客户**。故 `precheck_send_gateway` 对 relay trigger 豁免 `cooldown` / `operation_policy` / `rate_limited` / `daily_limit` 四道频控（这些针对"主动打扰/触达频控"，而 relay 是客户期待内的被动应答）；`not_managed` 仍对所有 trigger 生效。识别靠纯函数 `is_principal_relay_trigger`——合成消息逐字以哨兵 `PRINCIPAL_RELAY_SENTINEL` 开头，真实客户消息经 prompt 隔离不会以该哨兵开头。
+
 ---
 
 ## 7. 等待时序与超时兜底
@@ -127,6 +131,8 @@
 等待真人期间，Agent **先把客户消息里"非越权、能自主答"的部分推进**——只把越权点挂起请示，不冻结整段对话。
 
 > 例：客户同一条消息问"能给 8 折吗（越权）+ 发货要多久（可自主）" → Agent 先答发货时效，8 折部分挂起请示。
+
+> **三信号注入 decision prompt（实现）**：等待期的"可分答"行为靠 decision Agent 感知三个信号——纯函数 `escalation::build_decision_signals_text(contact, domain_config)` 从 contact + workspace 配置组装一段"请示通道信号"注入 decision user message（`decision.rs`）：①**等待领导决策中**（读 `awaiting_principal_decision` 标记——该标记由 approved 路径 emit escalation 或 hold→升级路径写入，此处首次被读取消费）→ 提示"勿就同一越权点反复请示、勿替领导拍板、非越权部分照常答"；②**多轮卡死**（`intent_trajectory` 尾部连续未推进 ≥ `DEFAULT_STUCK_THRESHOLD=3` 且末轮经 `reaction::is_negative_outcome` 判定负面，两条件 AND）→ 提示"避免硬推、换角度或如实告知需向领导确认"；③**高风险全量升级模式**（`high_risk_escalation_mode==all`）→ 提示"高风险件主动 emit escalationRequest"。三信号全缺返回空串，不污染 prompt。
 
 ### 7.3 超时兜底：永不代决
 
@@ -243,6 +249,10 @@
 7. 知识缺口提案落 `draft + needs_review`。
 8. wxid 误配防护：目标非 `principal_decider` 拒发。
 9. 等待态 `ai_awaiting_principal_decision` 经 `assert_hold_category_valid` **不被强制改写**。
+10. **relay 豁免 precheck**：`is_principal_relay_trigger` 对合成 relay 消息 true、对普通 Inbound false；`#[ignore]` 集成——managed contact + `last_agent_run_at=now` 下 relay trigger 跑 precheck 得 `allowed=true`，同条件普通 Inbound 得 `rate_limited`。
+11. **三信号组装** `build_decision_signals_text`：awaiting 标记出等待信号；连续 3 轮同 intent + 末轮负面出卡死信号；不足 3 轮 / 末轮非负面不出；全缺返回空串。
+12. **hold→升级判定** `should_escalate_held`：`blocked_by_safety_guard` / `blocked_unverified_product_claim` 两模式都升；`held_by_ai_policy` 仅 `all` 升、`decision_only` 不升；`ai_waiting_for_more_context` / `blocked_by_required_field` / `blocked_by_budget` / `context_changed` 均不升。
+13. hold 路径补发占位红线：`fallback_holding_reply` 不含任何转接类措辞（crate-外测试 §14.9b，避免 src/ 内字面量被 no-human-takeover lint 误判）。
 
 **t8 现有断言不动**——实质驱动边界下，客户嘴说"转真人"仍由 Agent 自己处理，t8 行为仍正确。
 
@@ -256,6 +266,6 @@
 
 - `agent_principal_escalations` 的精确 BSON schema 与索引（短码唯一性、(workspace, status, contact) 复合索引）。
 - 短码生成算法与碰撞处理。
-- 多轮卡死 pre-check 的具体信号实现（复用哪个负面反应判定）。
+- ~~多轮卡死 pre-check 的具体信号实现（复用哪个负面反应判定）~~ → 已实现：`consecutive_unprogressed_turns`（intent 轨迹尾部连续未推进）+ `reaction::is_negative_outcome`（末轮负面），两条件 AND，见 §7.2。
 - workspace 配置 `principal_decider` 的存储位置（复用现有 workspace config collection）与 admin 配置 UI。
 - 等待态在 admin 台账卡片的前端展示（遵守 `docs/frontend-design-system.md`）。
