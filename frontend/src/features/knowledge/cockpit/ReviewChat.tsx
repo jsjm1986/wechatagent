@@ -16,7 +16,21 @@ export interface ReviewChatChunk {
   integrityStatus?: string | null;
   status?: string | null;
   chunkType?: string | null;
+  distortionRisks?: string[] | null;
+  lockedFields?: string[] | null;
+  usageStats?: { hitCount30d?: number; blockedCount30d?: number } | null;
+  validFrom?: string | null;
+  validTo?: string | null;
 }
+
+// 字段锁的英文键 → 大白话中文名;映射不到就显示原名。
+const LOCKED_FIELD_LABELS: Record<string, string> = {
+  sourceQuote: "原话出处",
+  title: "标题",
+  summary: "摘要",
+  body: "正文",
+  sourceAnchors: "来源锚点",
+};
 
 interface ReviewChatProps {
   chunk: ReviewChatChunk;
@@ -43,6 +57,15 @@ export function ReviewChat({ chunk, onResolved }: ReviewChatProps) {
   const [draft, setDraft] = useState("");
   const [sending, setSending] = useState(false);
   const [goLiveError, setGoLiveError] = useState<string | null>(null);
+  const [moreOpen, setMoreOpen] = useState(false);
+
+  const usage = chunk.usageStats;
+  const hasUsage =
+    !!usage && (usage.hitCount30d != null || usage.blockedCount30d != null);
+  const risks = (chunk.distortionRisks ?? []).filter((r) => !!r?.trim());
+  const locks = (chunk.lockedFields ?? []).filter((f) => !!f?.trim());
+  const hasValidity = !!chunk.validFrom || !!chunk.validTo;
+  const hasMore = hasUsage || risks.length > 0 || locks.length > 0 || hasValidity;
 
   const hasQuote = !!chunk.sourceQuote?.trim();
   const hasAnchor = (chunk.sourceAnchors?.length ?? 0) > 0;
@@ -162,6 +185,58 @@ export function ReviewChat({ chunk, onResolved }: ReviewChatProps) {
         )}
 
         {goLiveError && <p className={styles.goLiveError}>{goLiveError}</p>}
+
+        <div className={styles.more}>
+          <button
+            type="button"
+            className={styles.moreToggle}
+            aria-expanded={moreOpen}
+            onClick={() => setMoreOpen((v) => !v)}
+          >
+            {moreOpen ? "▾" : "▸"} 这条的更多信息(用量 / 痕迹)
+          </button>
+          <div className={moreOpen ? styles.moreBody : styles.moreBodyHidden}>
+            {!hasMore && <p className={styles.muted}>暂无更多信息</p>}
+
+            {hasUsage && (
+              <div className={styles.moreItem}>
+                <span className={styles.blockLabel}>最近 30 天</span>
+                <p className={styles.moreText}>
+                  AI 用了 {usage?.hitCount30d ?? 0} 次,被安全闸拦下{" "}
+                  {usage?.blockedCount30d ?? 0} 次
+                </p>
+              </div>
+            )}
+
+            {risks.length > 0 && (
+              <div className={styles.moreItem}>
+                <span className={styles.blockLabel}>这条经历过什么</span>
+                <ul className={styles.moreList}>
+                  {risks.map((r, i) => (
+                    <li key={i}>{r}</li>
+                  ))}
+                </ul>
+              </div>
+            )}
+
+            {locks.length > 0 && (
+              <div className={styles.moreItem}>
+                <p className={styles.moreText}>
+                  🔒 这些项被锁定改不了:
+                  {locks.map((f) => LOCKED_FIELD_LABELS[f] ?? f).join("、")}
+                </p>
+              </div>
+            )}
+
+            {hasValidity && (
+              <div className={styles.moreItem}>
+                <p className={styles.moreText}>
+                  有效期:{chunk.validFrom || "—"} ~ {chunk.validTo || "长期"}
+                </p>
+              </div>
+            )}
+          </div>
+        </div>
 
         <div className={styles.actions}>
           <button

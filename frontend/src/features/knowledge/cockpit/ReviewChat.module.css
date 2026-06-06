@@ -111,6 +111,68 @@
   color: var(--color-blocked);
 }
 
+/* ── 折叠区:富字段大白话显形 ── */
+.more {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.moreToggle {
+  font: inherit;
+  appearance: none;
+  align-self: flex-start;
+  padding: 4px 0;
+  font-size: 12.5px;
+  color: var(--ink-4);
+  background: transparent;
+  border: none;
+  cursor: pointer;
+  transition: color 0.16s ease;
+}
+
+.moreToggle:hover {
+  color: var(--ink-2);
+}
+
+.moreBody {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 12px 14px;
+  background: rgba(20, 30, 60, 0.03);
+  border-radius: var(--r-sm);
+}
+
+.moreBodyHidden {
+  display: none;
+}
+
+.moreItem {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.moreText {
+  margin: 0;
+  font-size: 13px;
+  line-height: 1.5;
+  color: var(--ink-2);
+}
+
+.moreList {
+  margin: 0;
+  padding-left: 18px;
+  font-size: 13px;
+  line-height: 1.5;
+  color: var(--ink-2);
+}
+
+.moreList li {
+  margin: 0;
+}
+
 .actions {
   display: flex;
   gap: 10px;

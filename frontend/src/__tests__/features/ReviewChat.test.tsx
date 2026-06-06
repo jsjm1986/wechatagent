@@ -23,4 +23,17 @@ describe("ReviewChat", () => {
     render(<ReviewChat chunk={chunk as never} onResolved={() => {}} />);
     expect(screen.getByText(/只动这条/)).toBeInTheDocument();
   });
+  it("显形富字段:用量 / 降级痕迹 / 字段锁(大白话)", () => {
+    const rich = {
+      id: "c2", title: "测试", summary: "x",
+      sourceQuote: "q", sourceAnchors: [{ startLine: 1 }],
+      integrityStatus: "needs_review", status: "draft",
+      usageStats: { hitCount30d: 8, blockedCount30d: 2 },
+      distortionRisks: ["提交为 verified 但缺锚点,已降级"],
+      lockedFields: ["sourceQuote"],
+    };
+    render(<ReviewChat chunk={rich as never} onResolved={() => {}} />);
+    expect(screen.getByText(/8 次|用了 8|被用过 8/)).toBeInTheDocument();
+    expect(screen.getByText(/降级|为什么被打回|打回/)).toBeInTheDocument();
+  });
 });
