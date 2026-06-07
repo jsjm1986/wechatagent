@@ -1045,6 +1045,28 @@ fn chunk_verify_gate_reason(has_source_quote: bool, has_source_anchor: bool) -> 
     ))
 }
 
+/// 调用方后门 D2 收口：create/PUT chunk 落库前，若调用方提交 `integrity_status="verified"`
+/// 但缺 sourceQuote 或 source_anchors（未过 D2 闸），降级为 needs_review 并留审计痕迹。
+/// 与 import 路径「锚点只作审核线索、最终 needs_review」语义一致；正路仍是走 /verify。
+pub(in crate::routes) fn coerce_integrity_against_d2_gate(payload: &mut OperationKnowledgeChunkRequest) {
+    if payload.integrity_status.as_deref() != Some("verified") {
+        return;
+    }
+    let has_quote = payload
+        .source_quote
+        .as_deref()
+        .map(|s| !s.trim().is_empty())
+        .unwrap_or(false);
+    let has_anchor = !payload.source_anchors.is_empty();
+    if chunk_verify_gate_reason(has_quote, has_anchor).is_some() {
+        payload.integrity_status = Some("needs_review".to_string());
+        payload.distortion_risks.push(
+            "提交为 verified 但缺 sourceQuote/source_anchors，未过 D2 闸，已降级 needs_review"
+                .to_string(),
+        );
+    }
+}
+
 // ── 知识库 AI 自主修复 ────────────────────────────────────────────
 // propose / answer / apply handlers 及其 helper 已搬至 repair.rs。
 // 仅保留下方共享常量与 truncate_for_prompt（被多个子域复用）。
@@ -1388,5 +1410,60 @@ mod tests {
         let r = chunk_verify_gate_reason(true, false).unwrap();
         assert!(r.contains("source_anchors"));
         assert!(!r.contains("sourceQuote"));
+    }
+
+    #[test]
+    fn coerce_d2_downgrades_verified_without_quote() {
+        let mut p = OperationKnowledgeChunkRequest {
+            title: "t".to_string(),
+            integrity_status: Some("verified".to_string()),
+            source_quote: None,
+            source_anchors: vec![mongodb::bson::doc! { "startOffset": 0i64 }],
+            ..Default::default()
+        };
+        coerce_integrity_against_d2_gate(&mut p);
+        assert_eq!(p.integrity_status.as_deref(), Some("needs_review"));
+        assert!(p.distortion_risks.iter().any(|r| r.contains("D2")));
+    }
+
+    #[test]
+    fn coerce_d2_downgrades_verified_without_anchor() {
+        let mut p = OperationKnowledgeChunkRequest {
+            title: "t".to_string(),
+            integrity_status: Some("verified".to_string()),
+            source_quote: Some("原文引用".to_string()),
+            source_anchors: vec![],
+            ..Default::default()
+        };
+        coerce_integrity_against_d2_gate(&mut p);
+        assert_eq!(p.integrity_status.as_deref(), Some("needs_review"));
+    }
+
+    #[test]
+    fn coerce_d2_keeps_verified_with_quote_and_anchor() {
+        let mut p = OperationKnowledgeChunkRequest {
+            title: "t".to_string(),
+            integrity_status: Some("verified".to_string()),
+            source_quote: Some("原文引用".to_string()),
+            source_anchors: vec![mongodb::bson::doc! { "startOffset": 0i64 }],
+            ..Default::default()
+        };
+        coerce_integrity_against_d2_gate(&mut p);
+        assert_eq!(p.integrity_status.as_deref(), Some("verified"));
+        assert!(p.distortion_risks.is_empty());
+    }
+
+    #[test]
+    fn coerce_d2_ignores_non_verified() {
+        let mut p = OperationKnowledgeChunkRequest {
+            title: "t".to_string(),
+            integrity_status: Some("needs_review".to_string()),
+            source_quote: None,
+            source_anchors: vec![],
+            ..Default::default()
+        };
+        coerce_integrity_against_d2_gate(&mut p);
+        assert_eq!(p.integrity_status.as_deref(), Some("needs_review"));
+        assert!(p.distortion_risks.is_empty());
     }
 }
