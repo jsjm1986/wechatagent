@@ -1,0 +1,63 @@
+.am {
+  padding: 20px 24px;
+}
+
+.amRow {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 13px;
+}
+
+.amDot {
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  background: var(--color-scheduled);
+  animation: breathe-dot 3.2s ease-in-out infinite;
+  flex-shrink: 0;
+}
+
+.amVal {
+  font-size: 19px;
+  font-weight: 680;
+  color: var(--ink-1);
+  letter-spacing: -0.3px;
+}
+
+.amCode {
+  font-size: 12px;
+  color: var(--ink-4);
+  margin-left: auto;
+}
+
+/* 进度轨道:中性轨道色(非语义色),token 无对应浅灰,直接用近似灰 */
+.amMeter {
+  height: 6px;
+  border-radius: 3px;
+  background: #e3e7ee;
+  overflow: hidden;
+  margin-bottom: 12px;
+}
+
+.amFill {
+  height: 100%;
+  background: var(--color-scheduled);
+  border-radius: 3px;
+}
+
+.amRead {
+  font-size: 13px;
+  color: var(--ink-2);
+  line-height: 1.5;
+}
+
+@keyframes breathe-dot {
+  0%,
+  100% {
+    box-shadow: 0 0 7px 1px rgba(10, 132, 255, 0.4);
+  }
+  50% {
+    box-shadow: 0 0 9px 2px rgba(10, 132, 255, 0.6);
+  }
+}
