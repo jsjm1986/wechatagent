@@ -192,9 +192,10 @@ pub(in crate::routes) async fn list_operation_knowledge_document_chunks(
 pub(in crate::routes) async fn create_operation_knowledge_chunk(
     State(state): State<AppState>,
     Extension(admin): Extension<AuthenticatedAdmin>,
-    Json(payload): Json<OperationKnowledgeChunkRequest>,
+    Json(mut payload): Json<OperationKnowledgeChunkRequest>,
 ) -> AppResult<Json<Value>> {
     validate_operation_knowledge_chunk(&payload)?;
+    coerce_integrity_against_d2_gate(&mut payload);
     let result = state
         .db
         .operation_knowledge_chunks()
@@ -241,6 +242,7 @@ pub(in crate::routes) async fn update_operation_knowledge_chunk(
             }
         }
     }
+    coerce_integrity_against_d2_gate(&mut payload);
     state
         .db
         .operation_knowledge_chunks()
