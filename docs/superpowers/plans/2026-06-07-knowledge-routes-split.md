@@ -66,13 +66,23 @@
 
 ## 搬运通用步骤（每个子域任务都按这 6 步，后文不再重复正文）
 
+> **可见性铁律（Task 2/3 执行中发现，所有域必须照做）**：子文件位于 `routes::knowledge`，比 mod.rs 深一级。原 mod.rs 里的 `pub(super)`（= `pub(in crate::routes)`）若照抄进子文件会窄一级（只到 `routes::knowledge`），导致 `routes/mod.rs` import 不到。**解法**：
+> - 子文件里：原 `pub(super)` 对外 handler → `pub(in crate::routes)`；原 `pub`/`pub fn`（ext_knowledge 直调）→ **保持 `pub`**；原私有 → 保持私有。
+> - mod.rs 的 re-export 二选一，**按该域是否含真正 `pub` 项决定**：
+>   - 域内**全是** `pub(in crate::routes)` 项（无 ext_knowledge 直调，如 crud）→ 写 `pub(in crate::routes) use S::*;`（裸 `pub use` 会报 "glob import doesn't reexport anything"）。
+>   - 域内**含真正 `pub` 项**（被 ext_knowledge 直调，如 verify/import/catalog/repair/chat/wiki_edit/sources_meta）→ 写裸 `pub use S::*;`。**不能**用 `pub(in crate::routes) use`——受限 glob 无法把私有子模块里的 `pub` 项提升到模块外，会报 E0364/E0365 "X is private, and cannot be re-exported"。此时裸 `pub use` 因 glob 非空不会触发 unused warning。
+>
+> **字段可见性推论（Task 4 发现）**：若某 struct 搬进子文件，但留在 mod.rs 的共享 helper 仍按 `&Struct` 读它的字段，会报 E0616（父模块看不到子模块私有字段）。解法：把该 struct 被父模块读取的字段标 `pub(super)`（恰好暴露给父模块 `routes::knowledge`，不外泄）。纯可见性调整，零逻辑改动。
+>
+> **`use` 起手式（Task 2 验证可行）**：子文件头部用 `use super::*;` 一次性拉入 mod.rs 的共享 struct/helper，使被搬函数体内的裸名调用无需逐个加前缀、函数体一字不改；再补 `use super::super::shared::*;`、`use super::super::AppState;`、以及 axum/mongodb/serde 等按需 use。`use super::*;` 通常已覆盖共享层，故第 3 步的"逐个改 `super::`"多数情况可省。
+
 对每个子文件 `S`：
-1. **建文件骨架**：`src/routes/knowledge/S.rs` 顶部写文件级 `//!` 注释 + 占位 `use`（先复制原文件头部 17–29 行的 `use` 块，后续裁剪）。
-2. **移动函数/struct**：用 Read 读原 `knowledge.rs` 对应行段，把归属表里属于 `S` 的函数与 struct 整段剪切过去；**函数体一字不改**。
-3. **改路径**：被移动代码若调用了留在 `mod.rs` 的共享 helper，改为 `super::fn`（同模块树兄弟）；若调用同子文件内函数，保持裸名。
+1. **建文件骨架**：`src/routes/knowledge/S.rs` 顶部写文件级 `//!` 注释 + `use super::*;` + `use super::super::shared::*;` + `use super::super::AppState;` + 按需的外部 crate use。
+2. **移动函数/struct**：用 `git show HEAD:src/routes/knowledge.rs` 或读当前 mod.rs 对应行段，把归属表里属于 `S` 的函数整段剪切过去；**函数体一字不改**；`pub(super)` → `pub(in crate::routes)`，`pub` 保持。
+3. **改路径**：有了 `use super::*;`，被搬代码调用 mod.rs 共享项一般无需改前缀；仅当出现命名冲突或 glob 未覆盖时按编译错误补 `super::`。
 4. **裁剪 `use`**：删掉 `S.rs` 里该文件实际不用的 `use`（`-Dwarnings` 会抓 unused import）。
-5. **迁测试**：把归属表标注的 `#[test]` 从原 `mod tests` 剪到 `S.rs` 末尾的 `#[cfg(test)] mod tests { use super::*; ... }`。
-6. **验证**：`cargo check 2>&1 | grep -E "warning|error"` 必须空；`cargo test --lib` 必须 `=基线数字 passed, 0 failed`。绿了才做下一域。
+5. **迁测试**：把归属表标注的 `#[test]` 从 mod.rs 的 `mod tests` 剪到 `S.rs` 末尾的 `#[cfg(test)] mod tests { use super::*; ... }`。
+6. **验证**：`cargo check 2>&1 | grep -E "warning|error"` 必须空；`cargo test --lib` 必须 `=899 passed, 0 failed`（基线，已实测）。绿了才做下一域。
 
 ---
 
@@ -177,8 +187,8 @@ pub use sources_meta::*;
 按"搬运通用步骤"6 步执行。本域内容：
 
 - **handler（标 `pub(super)`）**：`list_operation_knowledge`、`list_operation_knowledge_documents`、`create_operation_knowledge_document`、`get_operation_knowledge_document`、`update_operation_knowledge_document`、`delete_operation_knowledge_document`、`list_operation_knowledge_chunks`、`list_operation_knowledge_document_chunks`、`create_operation_knowledge_chunk`、`update_operation_knowledge_chunk`、`delete_operation_knowledge_chunk`、`get_operation_knowledge_chunk_source`、`create_operation_knowledge`、`update_operation_knowledge`、`delete_operation_knowledge`
-- **struct**：`OperationKnowledgeQuery`(34)、`OperationKnowledgeDocumentQuery`(42)、`OperationKnowledgeChunkQuery`(49)、`OperationKnowledgeDocumentRequest`(58)、`OperationKnowledgeRequest`(91)、`OperationKnowledgeChunkRequest`(150)
-- **对共享 helper 的调用**改 `super::`：`validate_operation_knowledge_*`、`operation_knowledge_*_from_request`、`normalize_operation_domain`、`default_*`、`json_string_list`、`normalize_knowledge_tags` 等
+- **struct（保留在 mod.rs，不随 crud 迁移）**：`OperationKnowledgeQuery`、`OperationKnowledgeDocumentQuery`、`OperationKnowledgeChunkQuery`、`OperationKnowledgeDocumentRequest`、`OperationKnowledgeRequest`、`OperationKnowledgeChunkRequest` — 执行时核实：这 6 个被 import/catalog/chat 多域引用（`OperationKnowledgeChunkRequest` 15 处、`OperationKnowledgeDocumentRequest` 6 处），留在 mod.rs 作共享类型，crud.rs 经 `super::` 引用
+- **对共享 helper/struct 的调用**改 `super::`：`validate_operation_knowledge_*`、`operation_knowledge_*_from_request`、`normalize_operation_domain`、`default_*`、`json_string_list`、`normalize_knowledge_tags`、以及上面 6 个 struct
 - **迁移测试**：本域无独占单测（CRUD 由集成测试覆盖），`mod tests` 不迁
 - **解开 mod.rs**：`mod crud;` + `pub use crud::*;`
 
@@ -192,8 +202,9 @@ pub use sources_meta::*;
 
 - **handler（`pub`：被 ext_knowledge 直调）**：`verify_operation_knowledge_chunk`、`auto_verify_operation_knowledge_chunks`、`decide_auto_verify_status`（`pub fn`）
 - **handler（`pub(super)`）**：`reject_operation_knowledge_chunk`
-- **内部 fn**：`auto_verify_operation_knowledge_chunks_inner`、`auto_verify_budget_limits`、`budget_document`、`doc_i64_with_default`、`doc_i32_with_default`
-- **struct**：`KnowledgeVerifyRequest`(242, `pub`)、`KnowledgeAutoVerifyRequest`(248, `pub`)
+- **内部 fn**：`auto_verify_operation_knowledge_chunks_inner`、`auto_verify_budget_limits`、`doc_i64_with_default`、`doc_i32_with_default`
+- **保留在 mod.rs（不搬）**：`budget_document` — 执行时核实跨 verify/catalog/repair 三域调用（9 处），留 mod.rs 作共享 helper，verify.rs 经 `super::` 引用
+- **struct**：`KnowledgeVerifyRequest`(`pub`)、`KnowledgeAutoVerifyRequest`(`pub`)
 - **迁移测试**（剪到 verify.rs 的 `mod tests`）：`verified_when_all_evidence_present_and_confident`、`needs_review_when_source_quote_missing`、`needs_review_when_source_anchor_missing`、`needs_review_when_confidence_below_threshold`、`passes_through_rejected_status`、`unknown_model_status_falls_back_to_needs_review`、`auto_verify_default_call_cap_is_not_run_max_llm_calls_six`、`auto_verify_default_token_budget_is_not_simulation_60000`
 - 调用 `super::` 共享 helper：`apply_chunk_integrity`、`source_anchor_for_quote` 等
 - 解开 `mod verify; pub use verify::*;`
@@ -224,9 +235,10 @@ pub use sources_meta::*;
 **Files:** Create `src/routes/knowledge/catalog.rs`；Modify `mod.rs`
 
 - **handler（`pub`：ext_knowledge 直调）**：`build_operation_knowledge_completeness`
-- **handler（`pub(super)`）**：`get_operation_knowledge_catalog`、`get_operation_knowledge_catalog_persisted`、`get_operation_knowledge_completeness`、`refresh_operation_knowledge_completeness`、`get_operation_knowledge_integrity_report`、`search_operation_knowledge_tool`、`open_operation_knowledge_slices`、`test_operation_knowledge_match`、`build_operation_knowledge_catalog`、`load_operation_knowledge_chunks_for_query`
+- **handler（`pub(super)` → `pub(in crate::routes)`）**：`get_operation_knowledge_catalog`、`get_operation_knowledge_catalog_persisted`、`get_operation_knowledge_completeness`、`refresh_operation_knowledge_completeness`、`get_operation_knowledge_integrity_report`、`search_operation_knowledge_tool`、`open_operation_knowledge_slices`、`test_operation_knowledge_match`、`build_operation_knowledge_catalog`
+- **保留在 mod.rs（不搬）**：`load_operation_knowledge_chunks_for_query` — 执行时核实被**已搬走的 crud.rs**（168/178）和 catalog 两域共用，必须留 mod.rs 作共享 helper，否则 crud.rs 的 `use super::*;` 够不到。catalog.rs 经 `use super::*;` 调用它。
 - **内部 fn**：`clamp_answering_mode`、`merge_completeness_gaps`
-- **struct**：`KnowledgeToolSearchRequest`(228)、`KnowledgeToolOpenRequest`(236)、`OperationKnowledgeTestRequest`(263)
+- **struct**：`KnowledgeToolSearchRequest`、`KnowledgeToolOpenRequest`、`OperationKnowledgeTestRequest`（均 `pub(super)` → 留 mod.rs 还是随 catalog？执行时按引用核实——若仅 catalog 用则随迁并改 `pub(in crate::routes)`）
 - **迁移测试**：`clamp_answering_mode_demotes_fully_supported_when_drafts_pending`、`clamp_answering_mode_never_upgrades_weaker_modes`、`merge_completeness_gaps_keeps_deterministic_floor_when_llm_empty`、`merge_completeness_gaps_unions_deterministic_then_llm_extra`、`merge_completeness_gaps_dedups_and_drops_empty`
 - 调用 `super::`：`load_*`(域内自调保留裸名)、`apply_chunk_integrity`、`json_string_list`、`normalize_operation_domain` 等
 - 解开 `mod catalog; pub use catalog::*;`
@@ -240,13 +252,16 @@ pub use sources_meta::*;
 **Files:** Create `src/routes/knowledge/repair.rs`；Modify `mod.rs`
 
 - **handler（`pub`：ext_knowledge 直调）**：`propose_chunk_repair`
-- **handler（`pub(super)`）**：`answer_chunk_repair`、`propose_pack_repair`、`record_repair_apply`
-- **内部 fn**：`parse_repair_response`、`write_repair_usage_log`、`record_repair_event`、`classify_extras_kind`、`format_repair_apply_summary`、`truncate_for_prompt`、`chunk_verify_gate_reason`、`fuzzy_locate_quote`、`normalize_for_anchor`
-- **struct**：`ChunkRepairAnswerBody`(3484)、`ChunkRepairAnswer`(3493)、`RepairApplyBody`(3508)
-- **迁移测试**：`parse_repair_response_normalizes_string_missing_fields`、`parse_repair_response_passes_through_object_missing_fields`、`parse_repair_response_caps_followup_questions_to_three`、`parse_repair_response_clamps_confidence_to_0_100`、`parse_repair_response_handles_garbage_input`、`classify_extras_kind_handles_all_shapes`、`format_repair_apply_summary_contains_target_and_counts`、`format_repair_apply_summary_has_no_forbidden_words`、`chunk_verify_gate_passes_when_quote_and_anchor_present`、`chunk_verify_gate_blocks_when_quote_missing`、`chunk_verify_gate_blocks_when_anchor_missing`、`chunk_verify_gate_blocks_when_both_missing_and_lists_both`、`chunk_verify_gate_reason_passes_when_both_present`、`chunk_verify_gate_reason_lists_missing_quote_and_anchor`、`chunk_verify_gate_reason_only_missing_quote`、`chunk_verify_gate_reason_only_missing_anchor`
-- 解开 `mod repair; pub use repair::*;`
-
-> 注：`chunk_verify_gate_reason` 同时有早段(3455)和测试段两组 4 个测试，共 8 个，全部迁入 repair.rs。
+- **handler（`pub(super)` → `pub(in crate::routes)`）**：`answer_chunk_repair`、`propose_pack_repair`、`record_repair_apply`
+- **内部 fn（随 repair 迁）**：`parse_repair_response`、`write_repair_usage_log`、`record_repair_event`、`classify_extras_kind`、`format_repair_apply_summary`
+- **保留在 mod.rs（不搬，执行时核实跨域）**：
+  - `chunk_verify_gate_reason` — 被 verify.rs(74)、chat 域(5507) 调用，留 mod.rs
+  - `truncate_for_prompt` — 被 chat/digest 多域(1471/1638/2862/2887/3191/3368) 调用，留 mod.rs
+  - `fuzzy_locate_quote`、`normalize_for_anchor` — 被 mod.rs 共享 `source_anchor_for_quote` 调用，留 mod.rs
+- **struct**：`ChunkRepairAnswerBody`、`ChunkRepairAnswer`、`RepairApplyBody`（均 `pub(super)` → `pub(in crate::routes)`，执行时核实仅 repair 用）
+- **迁移测试（8 个，仅 repair 自有）**：`parse_repair_response_normalizes_string_missing_fields`、`parse_repair_response_passes_through_object_missing_fields`、`parse_repair_response_caps_followup_questions_to_three`、`parse_repair_response_clamps_confidence_to_0_100`、`parse_repair_response_handles_garbage_input`、`classify_extras_kind_handles_all_shapes`、`format_repair_apply_summary_contains_target_and_counts`、`format_repair_apply_summary_has_no_forbidden_words`
+- **留在 mod.rs 的测试（8 个 `chunk_verify_gate*`）**：因 `chunk_verify_gate_reason` 留 mod.rs，其 8 个测试（`chunk_verify_gate_passes/blocks_*` 4 个 + `chunk_verify_gate_reason_*` 4 个）也留 mod.rs，不迁 repair
+- 解开 `mod repair;` + 裸 `pub use repair::*;`（含 pub 项 propose_chunk_repair）
 
 验证同上。
 
