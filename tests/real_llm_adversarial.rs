@@ -661,6 +661,96 @@ fn median(samples: &[i64]) -> Option<i64> {
     score_stats(samples).map(|(_, m, _)| m)
 }
 
+/// 校准三态：裁判这一条金标的判分结果。
+/// - `Skipped`：裁判没返回有效分（median=None，端点掉线/解析失败）。**不是判错**。
+/// - `Hit`：出分落在期望 band 闭区间内。
+/// - `Miss`：出分落在 band 外（真·判错）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CalibOutcome {
+    Hit,
+    Miss,
+    Skipped,
+}
+
+impl CalibOutcome {
+    fn as_str(self) -> &'static str {
+        match self {
+            CalibOutcome::Hit => "hit",
+            CalibOutcome::Miss => "miss",
+            CalibOutcome::Skipped => "skipped",
+        }
+    }
+}
+
+/// 把 (median, band) 映射到三态。纯函数，单测靶心。
+/// `med=None` → `Skipped`（关键：未出分绝不当判错）；落 `[band.0, band.1]` 闭区间 → `Hit`；否则 `Miss`。
+fn calib_outcome(med: Option<i64>, band: (i64, i64)) -> CalibOutcome {
+    match med {
+        None => CalibOutcome::Skipped,
+        Some(m) if m >= band.0 && m <= band.1 => CalibOutcome::Hit,
+        Some(_) => CalibOutcome::Miss,
+    }
+}
+
+/// 单个 (judge, dim) 的三态计数。`effective_hit_rate` 只在实际出分（hit+miss）样本上算，
+/// 把掉线裁判的影响隔离到 `availability`，避免"裁判挂了"污染"裁判准不准"。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct CalibTally {
+    hits: usize,
+    misses: usize,
+    skipped: usize,
+}
+
+impl CalibTally {
+    fn record(&mut self, outcome: CalibOutcome) {
+        match outcome {
+            CalibOutcome::Hit => self.hits += 1,
+            CalibOutcome::Miss => self.misses += 1,
+            CalibOutcome::Skipped => self.skipped += 1,
+        }
+    }
+
+    /// 实际出分样本数（hit + miss），不含 skipped。
+    fn scored(&self) -> usize {
+        self.hits + self.misses
+    }
+
+    /// 全部尝试数（含 skipped）。
+    fn total(&self) -> usize {
+        self.hits + self.misses + self.skipped
+    }
+
+    /// 退出门口径：只在实际出分样本上的命中率。无出分样本时返回 0.0。
+    fn effective_hit_rate(&self) -> f64 {
+        let s = self.scored();
+        if s == 0 {
+            0.0
+        } else {
+            self.hits as f64 / s as f64
+        }
+    }
+
+    /// 出分率：出分样本 / 全部尝试。掉线裁判这里会低。
+    fn availability(&self) -> f64 {
+        let t = self.total();
+        if t == 0 {
+            0.0
+        } else {
+            self.scored() as f64 / t as f64
+        }
+    }
+
+    /// 旧口径：把 skipped 也当判错（hits / total）。仅留作对照，会被掉线裁判误伤。
+    fn raw_hit_rate(&self) -> f64 {
+        let t = self.total();
+        if t == 0 {
+            0.0
+        } else {
+            self.hits as f64 / t as f64
+        }
+    }
+}
+
 // ════════════════════════════════════════════════════════════════════════════
 // 组件 4 · 分数台账（JSONL，跨轮回归对比；Phase A 仅诊断不设门）
 // ════════════════════════════════════════════════════════════════════════════
@@ -1445,8 +1535,11 @@ async fn t_judge_calibration() {
     };
     let k = judge_k();
 
-    // hits[judge_label][dim] = (命中数, 总数)
-    let mut tally: HashMap<(&str, &str), (usize, usize)> = HashMap::new();
+    // tally[judge_label][dim] = (命中数, 判错数, 未出分数)。三态分离：裁判**没返回有效分**
+    // （median=None，端点连不上/解析失败）记 skipped，**不**等同于"判错(miss)"——否则一个
+    // 全程掉线的裁判会把命中率从真实值砸到地板（如 qwen-max 19/19 全 None 曾把汇总从 ~96%
+    // 拉到 72%）。effective_hit_rate 只在"实际出分"样本上算，availability 单独暴露出分率。
+    let mut tally: HashMap<(&str, &str), CalibTally> = HashMap::new();
 
     // 按端点分组限流（与 run_panel 同结构）：同端点裁判（deepseek-flash + deepseek-pro-selfeval
     // 共用 api.supxh.xin 一把 key）串行错峰、跨端点分组并发，每端点瞬时并发恒为 K。
@@ -1509,16 +1602,11 @@ async fn t_judge_calibration() {
         for (ji, j) in panel.iter().enumerate() {
             let scores = &per_judge_scores[ji];
             let med = median(scores);
-            let hit = med.map(|m| m >= g.band.0 && m <= g.band.1).unwrap_or(false);
-            let entry = tally.entry((j.label, g.dimension)).or_insert((0, 0));
-            entry.1 += 1;
-            if hit {
-                entry.0 += 1;
-            }
-            eprintln!(
-                "[校准][{}][gold-{gi}][{}] median={:?} 期望band={:?} 命中={hit} | why: {}",
-                j.label, g.dimension, med, g.band, g.why
-            );
+            // 三态：med=None → skipped（裁判没出分，不计入命中/判错）；出分落 band 内 → hit；
+            // 落 band 外 → miss。这是把"裁判挂了"与"裁判判错"分开的关键。
+            let outcome = calib_outcome(med, g.band);
+            let entry = tally.entry((j.label, g.dimension)).or_default();
+            entry.record(outcome);
             ledger_append(
                 "t_judge_calibration",
                 serde_json::json!({
@@ -1530,19 +1618,58 @@ async fn t_judge_calibration() {
                     "dim": g.dimension,
                     "median": med,
                     "band": [g.band.0, g.band.1],
-                    "hit": hit,
+                    "outcome": outcome.as_str(),
+                    "hit": outcome == CalibOutcome::Hit,
                 }),
+            );
+            eprintln!(
+                "[校准][{}][gold-{gi}][{}] median={:?} 期望band={:?} 结果={} | why: {}",
+                j.label,
+                g.dimension,
+                med,
+                g.band,
+                outcome.as_str(),
+                g.why
             );
         }
     }
 
     eprintln!("\n===== [校准] 命中率汇总（效度，Phase A 退出门：核心维每裁判 ≥ ~70%）=====");
+    eprintln!("[校准] 说明：effective=只在实际出分样本上的命中率（退出门看这个）；availability=出分率；");
+    eprintln!("[校准]      raw=旧口径（把未出分当判错，会被掉线裁判误伤，仅留作对照）。");
     let mut keys: Vec<&(&str, &str)> = tally.keys().collect();
     keys.sort();
     for key in keys {
-        let (hits, total) = tally[key];
-        let rate = if total > 0 { hits as f64 / total as f64 * 100.0 } else { 0.0 };
-        eprintln!("[校准][命中率] judge={} dim={} = {hits}/{total} ({rate:.0}%)", key.0, key.1);
+        let t = &tally[key];
+        ledger_append(
+            "t_judge_calibration",
+            serde_json::json!({
+                "sha": git_sha(),
+                "ts_ms": DateTime::now().timestamp_millis(),
+                "arc": "t_judge_calibration",
+                "kind": "summary",
+                "judge": key.0,
+                "dim": key.1,
+                "hits": t.hits,
+                "misses": t.misses,
+                "skipped": t.skipped,
+                "effective_hit_rate": t.effective_hit_rate(),
+                "availability": t.availability(),
+                "raw_hit_rate": t.raw_hit_rate(),
+            }),
+        );
+        eprintln!(
+            "[校准][命中率] judge={} dim={} effective={:.0}% (出分 {}/{}) | availability={:.0}% ({}/{}) | raw={:.0}%",
+            key.0,
+            key.1,
+            t.effective_hit_rate() * 100.0,
+            t.hits,
+            t.scored(),
+            t.availability() * 100.0,
+            t.scored(),
+            t.total(),
+            t.raw_hit_rate() * 100.0,
+        );
     }
 }
 
@@ -1717,4 +1844,71 @@ async fn t_longrun_capability() {
         final_contact.memory_summary.as_deref().map(str::len).unwrap_or(0),
         final_contact.commitments.len()
     );
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// 纯函数单测 · 校准三态（不需 Docker/真模型，cargo test --test 直接跑）
+// ════════════════════════════════════════════════════════════════════════════
+
+#[test]
+fn calib_outcome_three_state() {
+    // 关键反 bug：med=None（裁判掉线/没出分）必须是 Skipped，绝不当 Miss——
+    // 这正是旧 .unwrap_or(false) 把 qwen-max 从真实 96% 误拉到 72% 的根因。
+    assert_eq!(calib_outcome(None, (5, 7)), CalibOutcome::Skipped, "None 必须 Skipped，不当判错");
+    // 落 band 闭区间内 → Hit（含两端）。
+    assert_eq!(calib_outcome(Some(5), (5, 7)), CalibOutcome::Hit, "下界含等号");
+    assert_eq!(calib_outcome(Some(7), (5, 7)), CalibOutcome::Hit, "上界含等号");
+    assert_eq!(calib_outcome(Some(6), (5, 7)), CalibOutcome::Hit, "band 内");
+    // 落 band 外 → Miss（真判错）。
+    assert_eq!(calib_outcome(Some(4), (5, 7)), CalibOutcome::Miss, "低于下界");
+    assert_eq!(calib_outcome(Some(8), (5, 7)), CalibOutcome::Miss, "高于上界");
+}
+
+#[test]
+fn calib_tally_isolates_skipped_from_hit_rate() {
+    // 三态计数：effective_hit_rate 只在出分样本(hit+miss)上算，掉线全归 availability，
+    // 避免"裁判挂了"污染"裁判准不准"。
+    let mut t = CalibTally::default();
+    for o in [CalibOutcome::Hit, CalibOutcome::Hit, CalibOutcome::Hit] {
+        t.record(o);
+    }
+    for o in [CalibOutcome::Miss] {
+        t.record(o);
+    }
+    for o in [CalibOutcome::Skipped, CalibOutcome::Skipped, CalibOutcome::Skipped, CalibOutcome::Skipped, CalibOutcome::Skipped, CalibOutcome::Skipped] {
+        t.record(o);
+    }
+    assert_eq!(t.scored(), 4, "出分样本=hit+miss=4");
+    assert_eq!(t.total(), 10, "全部尝试=4+6 skipped=10");
+    // 退出门口径：3 hit / 4 scored = 0.75（6 个掉线完全不拉低命中率）。
+    assert!((t.effective_hit_rate() - 0.75).abs() < 1e-9, "effective=hits/scored 须隔离 skipped");
+    // 出分率：4 scored / 10 total = 0.4（掉线只体现在这里）。
+    assert!((t.availability() - 0.4).abs() < 1e-9, "availability=scored/total");
+    // 旧 buggy 口径对照：3 hit / 10 total = 0.3，被 6 个掉线误伤——证明 bug 的量级。
+    assert!((t.raw_hit_rate() - 0.3).abs() < 1e-9, "raw=hits/total 旧口径会被 skipped 误伤");
+}
+
+#[test]
+fn calib_tally_empty_is_zero_not_nan() {
+    // 全空（裁判从未被调用）：三率都返回 0.0，绝不 NaN（除零会污染聚合）。
+    let t = CalibTally::default();
+    assert_eq!(t.scored(), 0);
+    assert_eq!(t.total(), 0);
+    assert_eq!(t.effective_hit_rate(), 0.0, "无出分样本 effective=0 不 NaN");
+    assert_eq!(t.availability(), 0.0, "无尝试 availability=0 不 NaN");
+    assert_eq!(t.raw_hit_rate(), 0.0, "无尝试 raw=0 不 NaN");
+}
+
+#[test]
+fn calib_tally_all_skipped_keeps_hit_rate_zero_but_availability_zero() {
+    // 端点全程掉线（如 qwen-max median=null 19/19）：effective 没有出分样本→0（而非被当全错），
+    // availability=0 才是真信号（"裁判没出分"而非"裁判全判错"）。
+    let mut t = CalibTally::default();
+    for _ in 0..19 {
+        t.record(CalibOutcome::Skipped);
+    }
+    assert_eq!(t.scored(), 0, "全 skipped 无出分样本");
+    assert_eq!(t.total(), 19);
+    assert_eq!(t.effective_hit_rate(), 0.0, "全掉线 effective=0（无样本），非判错");
+    assert_eq!(t.availability(), 0.0, "全掉线 availability=0——这才是真问题信号");
 }
