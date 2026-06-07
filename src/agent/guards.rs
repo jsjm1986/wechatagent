@@ -314,22 +314,35 @@ pub(crate) fn compute_verified_chunks<'a>(
     out
 }
 
-/// item ①「先观测」：候选回复正文是否含「绝对化产品承诺」字面。
-///
-/// 仅供 `finalize_review_for_send` 的非拦截观测探针使用——量化 reviewer 漏判
-/// （未自报 `requiresProductKnowledge` 却写了硬承诺）的频率，**不参与任何
-/// 发送判定**。词表与 `prompts.rs` 既有 `user.review.product_claim_markers`
-/// 模板对齐（其 Rust 消费者 2026-05-25 随 string-marker 硬门删除，此处只借
-/// 词表语义做观测，不恢复判罚）。命中即返回 true。
-pub(crate) fn reply_contains_commitment_claim(reply_text: &str) -> bool {
-    const COMMITMENT_MARKERS: [&str; 8] = [
-        "保证", "一定能", "绝对", "百分之", "百分百", "成功率", "见效", "回款",
-    ];
+/// 承诺词类型（grounding 漏判兜底硬闸用）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CommitmentClass {
+    /// 效果/数据类断言（成功率/见效/回款/百分比）——漏判+无 verified 时硬闸拦截。
+    ProductEffect,
+    /// 语气类承诺（保证/一定能/绝对）——最易误杀情感承诺，仅观测不拦。
+    ToneOnly,
+    /// 无承诺词。
+    None,
+}
+
+/// 把候选回复按承诺词类型分类。ProductEffect 优先（同时命中两类时取更危险者）。
+/// 词表与 `prompts.rs` 既有 `user.review.product_claim_markers` 模板同源，切分两类
+/// 以控制误杀：效果/数据类几乎只出现在可验证产品断言；语气类大量出现在情感/口语承诺。
+pub(crate) fn commitment_claim_class(reply_text: &str) -> CommitmentClass {
+    const PRODUCT_EFFECT_MARKERS: [&str; 5] =
+        ["成功率", "见效", "回款", "百分之", "百分百"];
+    const TONE_ONLY_MARKERS: [&str; 3] = ["保证", "一定能", "绝对"];
     let text = reply_text.trim();
     if text.is_empty() {
-        return false;
+        return CommitmentClass::None;
     }
-    COMMITMENT_MARKERS.iter().any(|m| text.contains(m))
+    if PRODUCT_EFFECT_MARKERS.iter().any(|m| text.contains(m)) {
+        return CommitmentClass::ProductEffect;
+    }
+    if TONE_ONLY_MARKERS.iter().any(|m| text.contains(m)) {
+        return CommitmentClass::ToneOnly;
+    }
+    CommitmentClass::None
 }
 
 #[cfg(test)]
@@ -450,6 +463,31 @@ mod policy_tests {
         let action = classify_decision_action(&d);
         assert_eq!(action, "reply");
         assert!(enforce_state_action_policy(Some(&p), action).is_err());
+    }
+
+    #[test]
+    fn commitment_class_product_effect_on_data_words() {
+        assert_eq!(commitment_claim_class("我们的成功率高达95%"), CommitmentClass::ProductEffect);
+        assert_eq!(commitment_claim_class("三天就见效"), CommitmentClass::ProductEffect);
+        assert_eq!(commitment_claim_class("保证按时回款"), CommitmentClass::ProductEffect);
+    }
+
+    #[test]
+    fn commitment_class_tone_only_on_soft_words() {
+        assert_eq!(commitment_claim_class("我保证认真对待您的问题"), CommitmentClass::ToneOnly);
+        assert_eq!(commitment_claim_class("这事绝对不怪你"), CommitmentClass::ToneOnly);
+        assert_eq!(commitment_claim_class("这个方案一定能帮到你"), CommitmentClass::ToneOnly);
+    }
+
+    #[test]
+    fn commitment_class_product_effect_wins_when_both_present() {
+        // 同时含语气词「一定能」和效果词「成功率」→ 取更危险的 ProductEffect
+        assert_eq!(commitment_claim_class("一定能把成功率做上去"), CommitmentClass::ProductEffect);
+    }
+
+    #[test]
+    fn commitment_class_none_on_plain_reply() {
+        assert_eq!(commitment_claim_class("好的，我先了解下你的具体情况"), CommitmentClass::None);
     }
 }
 
