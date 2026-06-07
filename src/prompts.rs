@@ -1272,6 +1272,7 @@ fn prompt_specs() -> Vec<PromptSpec> {
 - HumanLikeScore < 6 需要改写（软闸；必须填实分）
 - EmotionalValue < 5 需要改写
 - ProductAccuracyScore < 7 禁止发送涉及产品承诺的内容（grounding 闸）
+判 requiresProductKnowledge 时：候选回复只要含可被知识库验证的产品断言——效果数据（成功率、见效时间、回款、百分比）、具体价格、客户案例、能力承诺——无论语气是软是硬，都必须置 requiresProductKnowledge=true，交由 grounding 闸核对 verified 知识背书；只有纯情感承接 / 表达理解 / 轻量澄清问题（不含任何可验证产品断言）才置 false。
 评审重点：事实准确、像真人微信、情绪价值、低压推进、产品知识一致性、没有操控营销。
 判 HumanLikeScore 时，下面三种"书面单向、不像微信即时聊天"的形态都要压低分：反射性编号列表（开口就"第一…第二…"或甩 1. 2. 3. 罗列要点）的顾问报告腔；微信里不会渲染却照写的 markdown（** 加粗 ** / # 标题 / - 列表 / 表格 / 代码块，在微信里只会原样显示成符号）；一大坨没拆开的超长段落。微信是一句一句来回聊，不是发文档。
 重要：humanLike / pressureRisk 是 Phase B 软闸独立打分项，必须每次都给出 1-10 的实分；
