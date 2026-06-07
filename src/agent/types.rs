@@ -199,6 +199,10 @@ pub struct AgentDecision {
     pub conversation_mode: String,
     #[serde(default)]
     pub conversation_mode_reason: Option<String>,
+
+    /// decision Agent emit 的请示意图；None=本轮无需请示真人。
+    #[serde(default)]
+    pub escalation_request: Option<crate::models::EscalationRequest>,
 }
 
 impl Default for AgentDecision {
@@ -257,6 +261,8 @@ impl Default for AgentDecision {
             // conversation_mode：默认寒暄模式（最保守）
             conversation_mode: default_conversation_mode(),
             conversation_mode_reason: None,
+            // 请示意图：默认无（本轮不向幕后真人请示）
+            escalation_request: None,
         }
     }
 }
@@ -337,6 +343,8 @@ pub struct RawAgentDecision {
     pub memory_update: Option<String>,
     pub context_pack_version: Option<i32>,
     pub follow_up: Option<FollowUpDecision>,
+    #[serde(default)]
+    pub escalation_request: Option<crate::models::EscalationRequest>,
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -866,6 +874,9 @@ fn carry_through_fields(raw: RawAgentDecision, decision: &mut AgentDecision) {
     }
     if raw.follow_up.is_some() {
         decision.follow_up = raw.follow_up;
+    }
+    if raw.escalation_request.is_some() {
+        decision.escalation_request = raw.escalation_request;
     }
     // 自治协议 9 字段已在 promote 主路径填好（或在 minimal/tool_calling 分支处理），
     // 此处不再覆盖，避免 final 轮的 trim 后值被原始 Some(空白) 覆盖。
@@ -1651,6 +1662,30 @@ mod validate_and_promote_tests {
             "risks={:?}",
             risks
         );
+    }
+
+    #[test]
+    fn raw_decision_parses_escalation_request() {
+        let json = r#"{
+            "escalationRequest": {
+                "needed": true,
+                "category": "out_of_scope_decision",
+                "reason": "客户要 8 折，超出标准 9 折权限",
+                "questionForPrincipal": "是否同意 8 折？",
+                "isGeneralizable": false
+            }
+        }"#;
+        let raw: RawAgentDecision = serde_json::from_str(json).expect("parse");
+        let esc = raw.escalation_request.expect("escalation present");
+        assert!(esc.needed);
+        assert_eq!(esc.category.as_deref(), Some("out_of_scope_decision"));
+        assert!(!esc.is_generalizable);
+    }
+
+    #[test]
+    fn raw_decision_without_escalation_still_parses() {
+        let raw: RawAgentDecision = serde_json::from_str(r#"{}"#).expect("parse empty");
+        assert!(raw.escalation_request.is_none());
     }
 }
 

@@ -1367,5 +1367,34 @@ async fn ensure_evolution_indexes(db: &Database) -> anyhow::Result<()> {
         )
         .await?;
 
+    // agent_principal_escalations：复合查询索引 + 短码唯一索引
+    db.agent_principal_escalations()
+        .create_index(
+            IndexModel::builder()
+                .keys(doc! { "workspace_id": 1, "status": 1, "contact_wxid": 1 })
+                .options(
+                    IndexOptions::builder()
+                        .name("idx_principal_escalation_ws_status_contact".to_string())
+                        .build(),
+                )
+                .build(),
+            None,
+        )
+        .await?;
+    db.agent_principal_escalations()
+        .create_index(
+            IndexModel::builder()
+                .keys(doc! { "short_code": 1 })
+                .options(
+                    IndexOptions::builder()
+                        .unique(true)
+                        .name("uniq_principal_escalation_short_code".to_string())
+                        .build(),
+                )
+                .build(),
+            None,
+        )
+        .await?;
+
     Ok(())
 }

@@ -34,7 +34,10 @@ use crate::{
         LIFECYCLE_STARTED,
     },
     error::AppResult,
-    models::ALLOWED_TASK_STATUS,
+    models::{
+        ALLOWED_PRINCIPAL_ESCALATION_STATUS, ALLOWED_TASK_STATUS,
+        PRINCIPAL_ESCALATION_STATUS_PENDING,
+    },
 };
 
 use super::AppState;
@@ -57,6 +60,7 @@ pub(super) async fn phase_rollup(
     let reviewer_misjudge = aggregate_reviewer_misjudge(&state, &workspace).await?;
     let reviewer_stats = read_reviewer_stats(&state, &workspace).await?;
     let negative_example_pending = count_negative_example_pending(&state, &workspace).await?;
+    let principal_escalations = aggregate_escalation_health(&state, &workspace).await?;
 
     Ok(Json(json!({
         "windowHours": 24,
@@ -66,6 +70,7 @@ pub(super) async fn phase_rollup(
         "reviewerMisjudge": reviewer_misjudge,
         "reviewerStats": reviewer_stats,
         "negativeExamplePending": negative_example_pending,
+        "principalEscalations": principal_escalations,
     })))
 }
 
@@ -279,6 +284,129 @@ async fn count_negative_example_pending(
         )
         .await?;
     Ok(n as i64)
+}
+
+/// 请示通道台账健康聚合（决策请示通道 / 幕后领导模式的运维可观测性）。
+///
+/// 台账 `agent_principal_escalations` 已落库但 admin UI 此前完全查不到——这是
+/// 审查识别的真空白：领导请示积压（领导长期不回）、relay 转述投递失败（客户永远
+/// 收不到裁决）这两类异常态没有任何可见信号。本函数一次 RTT 拉齐三块：
+///
+/// - `byStatus`：pending / resolved 闭集计数（与 [`ALLOWED_PRINCIPAL_ESCALATION_STATUS`]
+///   同源，无样本稳定输出 0，前端不抖动）。
+/// - `pendingAgeBuckets`：仅 pending 条目按 `created_at` 距今分桶
+///   （<1h / 1-6h / 6-24h / >24h）。`>24h` 桶非零 = 领导长期未回的告警信号。
+/// - `relayDeliveryFailed`：`agent_tasks` 中 `kind=principal_decision_relay` 且
+///   `status=failed` 的计数——relay 耗尽 `max_attempts` 意味客户收不到领导裁决，
+///   是请示闭环"最后一公里"断裂的硬信号。
+///
+/// 全只读，零写路径；workspace_id 强制 admin.current_workspace，与本面板其他聚合同源。
+async fn aggregate_escalation_health(state: &AppState, workspace: &str) -> AppResult<Value> {
+    let coll = state
+        .db
+        .raw()
+        .collection::<Document>("agent_principal_escalations");
+
+    // ① status 分布（全量，不开窗——运营要看的是"现在积压多少 / 历史共处理多少"）。
+    let pipeline_status = vec![
+        doc! { "$match": { "workspace_id": workspace } },
+        doc! { "$group": { "_id": "$status", "count": { "$sum": 1 } } },
+    ];
+    let mut cursor = coll.aggregate(pipeline_status, None).await?;
+    let mut buckets: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
+    while let Some(d) = cursor.try_next().await? {
+        let key = d
+            .get("_id")
+            .and_then(|b| b.as_str())
+            .map(str::to_string)
+            .unwrap_or_default();
+        let count = d.get_i64("count").unwrap_or(0);
+        if !key.is_empty() {
+            buckets.insert(key, count);
+        }
+    }
+    let mut status_items: Vec<Value> = ALLOWED_PRINCIPAL_ESCALATION_STATUS
+        .iter()
+        .map(|k| {
+            json!({
+                "status": *k,
+                "count": buckets.remove(*k).unwrap_or(0),
+            })
+        })
+        .collect();
+    let mut leftovers: Vec<(String, i64)> = buckets.into_iter().collect();
+    leftovers.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    for (k, v) in leftovers {
+        status_items.push(json!({ "status": k, "count": v, "outOfClosedSet": true }));
+    }
+
+    // ② pending 年龄分桶：拉所有 pending 的 created_at，按距今分桶。pending 条目数
+    //    天然有界（领导请示是低频事件），全量拉取无压力。
+    let now = now_ms();
+    let mut cur_pending = coll
+        .find(
+            doc! { "workspace_id": workspace, "status": PRINCIPAL_ESCALATION_STATUS_PENDING },
+            mongodb::options::FindOptions::builder()
+                .projection(doc! { "created_at": 1 })
+                .build(),
+        )
+        .await?;
+    let mut age_counts = [0i64; AGE_BUCKET_LABELS.len()];
+    let mut oldest_age_ms: i64 = 0;
+    while let Some(d) = cur_pending.try_next().await? {
+        let created = d
+            .get_datetime("created_at")
+            .ok()
+            .map(|dt| dt.timestamp_millis())
+            .unwrap_or(now);
+        let age_ms = (now - created).max(0);
+        oldest_age_ms = oldest_age_ms.max(age_ms);
+        age_counts[age_bucket_index(age_ms)] += 1;
+    }
+    let age_items: Vec<Value> = AGE_BUCKET_LABELS
+        .iter()
+        .enumerate()
+        .map(|(i, label)| json!({ "bucket": *label, "count": age_counts[i] }))
+        .collect();
+
+    // ③ relay 投递失败数：agent_tasks 里 kind=principal_decision_relay && status=failed。
+    let relay_failed = state
+        .db
+        .raw()
+        .collection::<Document>("agent_tasks")
+        .count_documents(
+            doc! {
+                "workspace_id": workspace,
+                "kind": "principal_decision_relay",
+                "status": "failed",
+            },
+            None,
+        )
+        .await? as i64;
+
+    Ok(json!({
+        "byStatus": status_items,
+        "pendingAgeBuckets": age_items,
+        "oldestPendingAgeMs": oldest_age_ms,
+        "relayDeliveryFailed": relay_failed,
+    }))
+}
+
+/// pending 年龄分桶标签（与 [`age_bucket_index`] 下标严格对应）。
+const AGE_BUCKET_LABELS: [&str; 4] = ["lt_1h", "1h_6h", "6h_24h", "gt_24h"];
+
+/// 把 pending 年龄（毫秒）映射到 [`AGE_BUCKET_LABELS`] 下标。纯函数，便于单测边界。
+fn age_bucket_index(age_ms: i64) -> usize {
+    const H: i64 = 60 * 60 * 1000;
+    if age_ms < H {
+        0
+    } else if age_ms < 6 * H {
+        1
+    } else if age_ms < 24 * H {
+        2
+    } else {
+        3
+    }
 }
 
 fn now_ms() -> i64 {
@@ -668,5 +796,45 @@ mod tests {
         sorted.sort();
         sorted.dedup();
         assert_eq!(sorted.len(), 5);
+    }
+
+    // ── 请示通道台账健康聚合 ─────────────────────────────────────────────
+
+    #[test]
+    fn age_bucket_index_covers_all_four_boundaries() {
+        const H: i64 = 60 * 60 * 1000;
+        // 下边界
+        assert_eq!(age_bucket_index(0), 0);
+        assert_eq!(age_bucket_index(H - 1), 0);
+        // 1h 整点进入第二桶
+        assert_eq!(age_bucket_index(H), 1);
+        assert_eq!(age_bucket_index(6 * H - 1), 1);
+        // 6h 整点进入第三桶
+        assert_eq!(age_bucket_index(6 * H), 2);
+        assert_eq!(age_bucket_index(24 * H - 1), 2);
+        // 24h 整点进入告警桶
+        assert_eq!(age_bucket_index(24 * H), 3);
+        assert_eq!(age_bucket_index(100 * 24 * H), 3);
+    }
+
+    #[test]
+    fn age_bucket_labels_align_with_index_arity() {
+        // 标签数组与 age_bucket_index 的返回域必须等长，否则聚合时下标越界。
+        assert_eq!(AGE_BUCKET_LABELS.len(), 4);
+        // 每个标签互不相同
+        let mut sorted = AGE_BUCKET_LABELS.to_vec();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(sorted.len(), 4);
+        // 最末桶是 >24h 告警桶
+        assert_eq!(AGE_BUCKET_LABELS[3], "gt_24h");
+    }
+
+    #[test]
+    fn principal_escalation_status_closed_set_is_two() {
+        // 与 [`crate::models::ALLOWED_PRINCIPAL_ESCALATION_STATUS`] 同源；
+        // 改了那边（新增第三种 status）必须更新本聚合的 known 数组与前端 UI。
+        assert_eq!(ALLOWED_PRINCIPAL_ESCALATION_STATUS.len(), 2);
+        assert!(ALLOWED_PRINCIPAL_ESCALATION_STATUS.contains(&PRINCIPAL_ESCALATION_STATUS_PENDING));
     }
 }

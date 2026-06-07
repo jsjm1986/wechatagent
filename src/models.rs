@@ -359,6 +359,41 @@ pub struct ConversationMessage {
     pub created_at: DateTime,
 }
 
+/// relay 合成消息的哨兵前缀。decision prompt 见到它即进入"转述模式"（见 user.reply.task prompt 的 relay 输入契约）。
+pub const PRINCIPAL_RELAY_SENTINEL: &str = "__PRINCIPAL_RELAY__";
+
+impl ConversationMessage {
+    /// 构造一条"领导已裁决"的合成 inbound，仅用于触发 relay 转述，不落客户可见会话。
+    /// 以哨兵前缀开头 + 结构化裁决载荷；decision prompt 据哨兵进入转述模式。
+    pub fn synthetic_principal_relay(
+        contact: &Contact,
+        verdict: &str,
+        substance: &str,
+        constraints: &[String],
+    ) -> Self {
+        let constraint_text = if constraints.is_empty() {
+            "（无）".to_string()
+        } else {
+            constraints.join("；")
+        };
+        let payload = format!(
+            "{PRINCIPAL_RELAY_SENTINEL}\nverdict={verdict}\nsubstance={substance}\nconstraints={constraint_text}"
+        );
+        ConversationMessage {
+            id: None,
+            workspace_id: contact.workspace_id.clone(),
+            account_id: contact.account_id.clone(),
+            contact_wxid: contact.wxid.clone(),
+            message_id: None,
+            dedupe_key: None,
+            direction: MessageDirection::Inbound,
+            content: payload,
+            raw: None,
+            created_at: DateTime::now(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentTask {
     #[serde(rename = "_id", skip_serializing_if = "Option::is_none")]
@@ -622,6 +657,13 @@ pub struct OperationDomainConfig {
     /// Phase E / E5-T1：写入来源（`"system"` / `"legacy_migration"` / `"manual"` 等）。
     #[serde(default)]
     pub seeded_by: Option<String>,
+    /// 请示通道：接收请示卡的领导 wxid（须是业务号好友）。None=本 workspace 未启用请示通道。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub principal_decider: Option<String>,
+    /// 高风险件升级模式："all"=所有被静默 hold 的高风险件都请示真人；
+    /// "decision_only"=只升级实质需决策/授权的件。None/缺省 = "decision_only"（保守）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub high_risk_escalation_mode: Option<String>,
 }
 
 fn default_version_one() -> i32 {
@@ -1853,6 +1895,125 @@ impl From<Contact> for ApiContact {
 
 pub fn dt_to_string(dt: DateTime) -> Option<String> {
     dt.try_to_rfc3339_string().ok()
+}
+
+/// 请示台账状态闭集。pending=已推送领导待回；resolved=真人已裁决并已起 relay。
+pub const PRINCIPAL_ESCALATION_STATUS_PENDING: &str = "pending";
+pub const PRINCIPAL_ESCALATION_STATUS_RESOLVED: &str = "resolved";
+pub const ALLOWED_PRINCIPAL_ESCALATION_STATUS: &[&str] = &[
+    PRINCIPAL_ESCALATION_STATUS_PENDING,
+    PRINCIPAL_ESCALATION_STATUS_RESOLVED,
+];
+
+/// 请示触发的三类边界（实质驱动）。
+pub const ESCALATION_CATEGORY_OUT_OF_SCOPE: &str = "out_of_scope_decision";
+pub const ESCALATION_CATEGORY_HIGH_RISK_GATED: &str = "high_risk_gated";
+pub const ESCALATION_CATEGORY_STUCK: &str = "stuck_or_undelivered";
+pub const ALLOWED_ESCALATION_CATEGORY: &[&str] = &[
+    ESCALATION_CATEGORY_OUT_OF_SCOPE,
+    ESCALATION_CATEGORY_HIGH_RISK_GATED,
+    ESCALATION_CATEGORY_STUCK,
+];
+
+/// contact.domain_attributes 上的布尔标记 key：该客户有一个 pending 请示、正在等待领导决策。
+/// admin 看板据此显示「等待中」；等待期 pre-check 据此识别。统一占位模型下这只是可观测标记，
+/// 不是 hold category——触发请示的 run 本身是 Approved，占位已正常发出。
+pub const AWAITING_PRINCIPAL_DECISION_ATTR: &str = "awaiting_principal_decision";
+
+/// 真人裁决口径闭集。
+pub const PRINCIPAL_VERDICT_APPROVED: &str = "approved";
+pub const PRINCIPAL_VERDICT_REJECTED: &str = "rejected";
+pub const PRINCIPAL_VERDICT_CONDITIONAL: &str = "conditional";
+pub const PRINCIPAL_VERDICT_DEFERRED: &str = "deferred";
+pub const PRINCIPAL_VERDICT_DELEGATED_BACK: &str = "delegated_back";
+pub const ALLOWED_PRINCIPAL_VERDICT: &[&str] = &[
+    PRINCIPAL_VERDICT_APPROVED,
+    PRINCIPAL_VERDICT_REJECTED,
+    PRINCIPAL_VERDICT_CONDITIONAL,
+    PRINCIPAL_VERDICT_DEFERRED,
+    PRINCIPAL_VERDICT_DELEGATED_BACK,
+];
+
+/// 决策 Agent 在 decision 阶段 emit 的请示意图（内嵌进 AgentDecision）。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct EscalationRequest {
+    /// 是否需要请示真人。LLM 漏给该字段时安全回落 false（不请示），与 AgentDecision 的 LLM-容错惯例一致。
+    #[serde(default)]
+    pub needed: bool,
+    /// 三类之一，见 ALLOWED_ESCALATION_CATEGORY。
+    #[serde(default)]
+    pub category: Option<String>,
+    /// 卡点原因（给真人看）。
+    #[serde(default)]
+    pub reason: Option<String>,
+    /// 向真人提的问题。
+    #[serde(default)]
+    pub question_for_principal: Option<String>,
+    /// 客户同一条消息里"非越权、可自主答"的部分（等待期分答用）。
+    #[serde(default)]
+    pub self_serviceable_part: Option<String>,
+    /// agent 自判该决策是否可泛化（决定是否发知识缺口提案）。
+    #[serde(default)]
+    pub is_generalizable: bool,
+}
+
+/// 真人自然语言裁决经 LLM 解读后的结构。绝不原话转发给客户。
+/// 注意：不加 rename_all="camelCase"——本结构会被持久化进 snake_case 的 AgentPrincipalEscalation
+/// 台账（decision 字段），保持 snake_case 让台账文档键统一、避免 decision.authorization_window_hours
+/// 查询/索引时静默 miss。Task 14 的 interpret prompt 须输出 snake_case 键。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PrincipalDecision {
+    /// 裁决口径，见 ALLOWED_PRINCIPAL_VERDICT。
+    pub verdict: String,
+    /// 决策实质（如"同意 8 折"），AI 口吻转述的事实源。
+    pub substance: String,
+    /// 附带约束（如"本周内付款"）。
+    #[serde(default)]
+    pub constraints: Vec<String>,
+    /// 授权有效时长（小时）。**领导说了算**：领导明确说了期限（"这个价就今天有效"="约 24"、
+    /// "这周内都行"=本周剩余小时数）才填；领导没提期限 → None（= 授权不设过期窗，长期有效）。
+    /// 由 interpret LLM 自判填充；Task 19 据此算 authorization_expires_at。
+    #[serde(default)]
+    pub authorization_window_hours: Option<f64>,
+}
+
+/// 请示台账行（MongoDB collection `agent_principal_escalations`）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentPrincipalEscalation {
+    #[serde(rename = "_id", skip_serializing_if = "Option::is_none")]
+    pub id: Option<ObjectId>,
+    pub workspace_id: String,
+    pub account_id: String,
+    pub contact_wxid: String,
+    /// 人类可读短码，如 "E1A2"。全局唯一。
+    pub short_code: String,
+    /// pending / resolved，见 ALLOWED_PRINCIPAL_ESCALATION_STATUS。
+    pub status: String,
+    /// 三类触发之一，见 ALLOWED_ESCALATION_CATEGORY。
+    pub category: String,
+    /// 卡点原因。
+    pub reason: String,
+    /// 向真人提的问题。
+    pub question_for_principal: String,
+    /// 推给领导的 wxid（= 该 workspace 的 principal_decider）。
+    pub principal_wxid: String,
+    /// resolved 时填：真人裁决解读结果。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decision: Option<PrincipalDecision>,
+    /// resolved 时填：授权过期时间（过期后该条授权不可再用，但条目仍 resolved）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authorization_expires_at: Option<DateTime>,
+    /// agent 在 emit escalation 时自判：该决策是否可泛化成通用知识（决定 relay 后是否发知识缺口提案）。
+    #[serde(default)]
+    pub is_generalizable: bool,
+    /// 是否已据此发过知识缺口提案（防重复）。
+    #[serde(default)]
+    pub knowledge_proposal_emitted: bool,
+    pub created_at: DateTime,
+    pub updated_at: DateTime,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_at: Option<DateTime>,
 }
 
 // LP-12 / Task 21：核心 Document 字段的强类型版本。
@@ -3317,6 +3478,8 @@ mod typed_tests {
             current_version: true,
             previous_version: None,
             seeded_by: None,
+            principal_decider: None,
+            high_risk_escalation_mode: None,
         };
         let typed = cfg.runtime_parameters_typed();
         assert_eq!(typed.recent_message_limit, 16);
@@ -3409,6 +3572,8 @@ mod typed_tests {
             current_version: true,
             previous_version: None,
             seeded_by: None,
+            principal_decider: None,
+            high_risk_escalation_mode: None,
         };
         let typed = cfg.state_machine_typed();
         assert!(!typed.states.is_empty());
@@ -4048,5 +4213,48 @@ mod typed_tests {
             mongodb::bson::from_document(raw).expect("legacy doc deserialize");
         assert!(d.catalog_summary_persisted.is_none());
         assert!(d.catalog_version.is_none());
+    }
+}
+
+#[cfg(test)]
+mod principal_escalation_model_tests {
+    use super::*;
+
+    #[test]
+    fn principal_escalation_status_closed_set_is_self_consistent() {
+        assert!(ALLOWED_PRINCIPAL_ESCALATION_STATUS.contains(&PRINCIPAL_ESCALATION_STATUS_PENDING));
+        assert!(ALLOWED_PRINCIPAL_ESCALATION_STATUS.contains(&PRINCIPAL_ESCALATION_STATUS_RESOLVED));
+        assert_eq!(ALLOWED_PRINCIPAL_ESCALATION_STATUS.len(), 2);
+    }
+
+    #[test]
+    fn awaiting_principal_decision_attr_key_is_stable() {
+        // set（Task 18 apply_agent_updates）与 unset（Task 16 clear_awaiting_principal_state）
+        // 必须用同一个 key，否则等待标记清不掉。锁死常量值防回归。
+        assert_eq!(AWAITING_PRINCIPAL_DECISION_ATTR, "awaiting_principal_decision");
+    }
+
+    #[test]
+    fn escalation_category_and_verdict_closed_sets_are_self_consistent() {
+        assert_eq!(ALLOWED_ESCALATION_CATEGORY.len(), 3);
+        assert_eq!(ALLOWED_PRINCIPAL_VERDICT.len(), 5);
+        assert!(ALLOWED_PRINCIPAL_VERDICT.contains(&PRINCIPAL_VERDICT_DELEGATED_BACK));
+    }
+
+    #[test]
+    fn escalation_request_deserializes_with_defaults() {
+        let req: EscalationRequest =
+            serde_json::from_str(r#"{"needed": true}"#).expect("should deserialize");
+        assert!(req.needed);
+        assert_eq!(req.category, None);
+        assert!(!req.is_generalizable);
+        assert!(req.self_serviceable_part.is_none());
+    }
+
+    #[test]
+    fn escalation_request_empty_object_defaults_to_not_needed() {
+        let req: EscalationRequest =
+            serde_json::from_str("{}").expect("empty object should deserialize");
+        assert!(!req.needed);
     }
 }

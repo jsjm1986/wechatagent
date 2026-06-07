@@ -39,6 +39,8 @@ use super::decision::{
     decide_reply_with_promote, load_operation_playbook_for_contact,
     load_operation_state_policy_for_contact, load_user_operation_domain_config_for_contact,
 };
+use super::domain::USER_OPS_DOMAIN_ID;
+use super::escalation;
 use super::guards::{
     classify_decision_action, enforce_state_action_policy, normalize_decision_runtime,
     normalize_decision_state, planner_from_decision,
@@ -105,6 +107,10 @@ pub async fn handle_managed_message_aggregated(
 }
 
 pub async fn handle_follow_up_task(state: &AppState, task: AgentTask) -> AppResult<()> {
+    // principal_decision_relay：领导已裁决，走专门的 relay 转述路径，而非普通 follow-up。
+    if task.kind == "principal_decision_relay" {
+        return crate::agent::escalation::handle_principal_decision_relay(state, &task).await;
+    }
     let Some(task_id) = task.id else {
         return Ok(());
     };
@@ -465,6 +471,129 @@ pub(crate) async fn run_user_operation_gateway(
             ),
         )
         .await
+}
+
+/// decision Agent emit 了 escalation_request 时，在 approved 发送路径末尾调用。
+/// 占位 reply 已由网关经 outbox 正常发给客户——本函数只做不面向客户的两件事：
+/// 推请示卡给领导 wxid + 落 pending 台账。调用方对本函数错误只记 warn、不阻断 run。
+pub(crate) async fn trigger_principal_escalation(
+    state: &AppState,
+    contact: &Contact,
+    req: &crate::models::EscalationRequest,
+) -> AppResult<()> {
+    if !req.needed {
+        return Ok(());
+    }
+    let Some(principal_wxid) =
+        escalation::principal_decider_wxid(state, &contact.workspace_id, USER_OPS_DOMAIN_ID).await?
+    else {
+        return Ok(()); // 未配置领导 = 本 workspace 未启用请示通道
+    };
+    if principal_wxid == contact.wxid {
+        return Err(AppError::BadRequest(
+            "principal_decider 配置等于客户 wxid，拒绝触发请示".into(),
+        ));
+    }
+    let category = req
+        .category
+        .clone()
+        .unwrap_or_else(|| crate::models::ESCALATION_CATEGORY_OUT_OF_SCOPE.to_string());
+    // 去重：同客户同类别已有 pending → 不重复推卡。
+    if escalation::has_pending_for_contact(state, &contact.workspace_id, &contact.wxid, &category)
+        .await?
+    {
+        return Ok(());
+    }
+    let reason = req.reason.clone().unwrap_or_default();
+    let question = req.question_for_principal.clone().unwrap_or_default();
+    let entry = escalation::insert_pending_escalation(
+        state,
+        &contact.workspace_id,
+        &contact.account_id,
+        &contact.wxid,
+        &category,
+        &reason,
+        &question,
+        &principal_wxid,
+        req.is_generalizable,
+    )
+    .await?;
+    let customer_label = contact
+        .remark
+        .clone()
+        .or_else(|| contact.nickname.clone())
+        .or_else(|| contact.alias.clone())
+        .unwrap_or_else(|| contact.wxid.clone());
+    let card =
+        escalation::render_principal_card(&entry.short_code, &customer_label, &reason, &question);
+    mcp::logged_call_for_account(
+        state,
+        &contact.account_id,
+        "message_send_text",
+        serde_json::json!({ "recipient": principal_wxid, "content": card }),
+    )
+    .await?;
+    Ok(())
+}
+
+/// relay：把领导裁决用 AI 口吻转述给客户，走现有网关。转述完清等待态、按需发知识提案。
+pub(crate) async fn relay_principal_decision_to_customer(
+    state: &AppState,
+    contact: Contact,
+    entry: &crate::models::AgentPrincipalEscalation,
+    decision: &crate::models::PrincipalDecision,
+    task_id: Option<ObjectId>,
+) -> AppResult<()> {
+    let synthetic = crate::models::ConversationMessage::synthetic_principal_relay(
+        &contact,
+        &decision.verdict,
+        &decision.substance,
+        &decision.constraints,
+    );
+    run_user_operation_gateway(
+        state,
+        contact.clone(),
+        AgentTrigger::Inbound(&synthetic),
+        task_id,
+        None,
+    )
+    .await?;
+    clear_awaiting_principal_state(state, &contact).await?;
+    let verdict_yields_knowledge = matches!(
+        decision.verdict.as_str(),
+        crate::models::PRINCIPAL_VERDICT_APPROVED | crate::models::PRINCIPAL_VERDICT_CONDITIONAL
+    );
+    if entry.is_generalizable && verdict_yields_knowledge && !entry.knowledge_proposal_emitted {
+        escalation::emit_knowledge_gap_proposal(state, entry, decision).await?;
+        state
+            .db
+            .agent_principal_escalations()
+            .update_one(
+                doc! { "short_code": &entry.short_code },
+                doc! { "$set": { "knowledge_proposal_emitted": true } },
+                None,
+            )
+            .await?;
+    }
+    Ok(())
+}
+
+/// 清掉客户 state 上的"等待领导决策"标记（key 用 AWAITING_PRINCIPAL_DECISION_ATTR 常量）。
+async fn clear_awaiting_principal_state(state: &AppState, contact: &Contact) -> AppResult<()> {
+    let unset_key = format!(
+        "domain_attributes.{}",
+        crate::models::AWAITING_PRINCIPAL_DECISION_ATTR
+    );
+    state
+        .db
+        .contacts()
+        .update_one(
+            doc! { "workspace_id": &contact.workspace_id, "account_id": &contact.account_id, "wxid": &contact.wxid },
+            doc! { "$unset": { unset_key: "" } },
+            None,
+        )
+        .await?;
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1244,6 +1373,21 @@ async fn run_user_operation_gateway_inner(
             },
         )
         .await?;
+        // hold→升级请示：被风险闸门拦下的高风险件，按 workspace 升级模式请示领导并补发安全占位。
+        // 错误只记 warn、不阻断 run、不改终态（与 approved 末尾 trigger_principal_escalation 同纪律）。
+        // context_changed 不是决策墙，should_escalate_held 对其返回 false，不会误升级。
+        if let Err(e) = escalation::escalate_held_decision(
+            state,
+            &contact,
+            &review,
+            &final_decision,
+            domain_config.as_ref(),
+            &blocked_status,
+        )
+        .await
+        {
+            tracing::warn!(error = %e, contact = %contact.wxid, "hold→升级请示失败（不阻断 run）");
+        }
         return Ok(());
     }
 
@@ -1463,9 +1607,35 @@ async fn run_user_operation_gateway_inner(
     // 真正发送由 dispatcher worker 异步抢占（atomic claim + lease）后通过
     // `send_outbound_message` 调 MCP（spec R13 / requirements §F）。
     let final_status = review.final_review_status.as_str();
-    let outbox_eligible = final_decision.should_reply
+    let mut outbox_eligible = final_decision.should_reply
         && !final_decision.reply_text.trim().is_empty()
         && (final_status == "approved" || final_status == "revision_applied_approved");
+    // relay 出站红线守卫（代码级兜底）：relay 转述要求 AI 口吻重组、绝不透传内部
+    // 载荷（__PRINCIPAL_RELAY__/verdict=/substance=/constraints=）。此前仅靠 prompt
+    // 约束；这里在入 outbox 前对 relay run 的拟发文本做最后一道纯函数检查，命中即
+    // fail-closed：不入队泄漏文本（宁可客户这轮收不到，也绝不把内部载荷发给客户），
+    // 记 event + warn 供运维定位。非 relay run 不受影响。
+    if outbox_eligible
+        && escalation::is_principal_relay_trigger(&trigger)
+        && escalation::relay_output_leaks_internal_payload(&final_decision.reply_text)
+    {
+        outbox_eligible = false;
+        tracing::warn!(
+            %run_id,
+            contact_wxid = %contact.wxid,
+            "relay 转述拟发文本疑似泄漏内部载荷，已拦截不发（fail-closed）"
+        );
+        write_event_for_account(
+            state,
+            &contact.account_id,
+            Some(&contact.wxid),
+            "blocked_review",
+            "blocked_by_safety_guard",
+            "relay 转述输出含内部载荷标记，安全门拦截不发送",
+            None,
+        )
+        .await?;
+    }
     // 并发多消息去抖——兜底中止检查（outbox 入队之前）。主检查在 apply 之前已挡掉
     // 绝大多数；这里再查一次，接住 apply / memory / decision-review 写入期间到达的
     // 更新入站，避免发出一条已过时的回复。此前的画像 / 记忆写入已落库（幂等、
@@ -1529,6 +1699,21 @@ async fn run_user_operation_gateway_inner(
             Err(err) => {
                 tracing::error!(?err, %run_id, "outbox enqueue failed");
                 return Err(err.into());
+            }
+        }
+    }
+    // 决策请示触发（统一占位模型）：占位 reply 已入 outbox 正常发给客户，
+    // 这里只做不面向客户的副作用——推请示卡给领导 + 落台账 pending。
+    // 失败不回滚已发占位、不让 run 失败：仅 warn 降级。
+    if let Some(req) = final_decision.escalation_request.as_ref() {
+        if req.needed {
+            if let Err(err) = trigger_principal_escalation(state, &contact, req).await {
+                tracing::warn!(
+                    workspace_id = %contact.workspace_id,
+                    contact_wxid = %contact.wxid,
+                    error = %err,
+                    "principal escalation 推卡/落台账失败（占位已正常发出，降级不阻断 run）"
+                );
             }
         }
     }
@@ -1653,22 +1838,30 @@ pub(crate) async fn precheck_send_gateway(
     if contact.agent_status != AgentStatus::Managed {
         return Ok(blocked("not_managed", "好友未纳入 Agent 运营"));
     }
-    if let Some(cooldown_until) = contact.cooldown_until {
-        if cooldown_until.timestamp_millis() > DateTime::now().timestamp_millis() {
-            return Ok(blocked("cooldown", "用户处于冷却期"));
+    // relay 转述（领导裁决回送客户）豁免频控类 precheck：占位 reply 已把
+    // last_agent_run_at 刷成 now，领导通常秒~分钟级回复，relay 必落在 min_reply_interval
+    // 内——若不豁免，领导裁决永远送不到客户。relay 是客户期待内的被动应答，不属
+    // 主动打扰，故跳过 cooldown/operation_policy/rate_limited/daily_limit；not_managed
+    // 仍保留（好友已退出运营则不应继续转述）。
+    let is_relay = escalation::is_principal_relay_trigger(trigger);
+    if !is_relay {
+        if let Some(cooldown_until) = contact.cooldown_until {
+            if cooldown_until.timestamp_millis() > DateTime::now().timestamp_millis() {
+                return Ok(blocked("cooldown", "用户处于冷却期"));
+            }
         }
-    }
-    if let Some(policy_block) = precheck_operation_policy(state, contact).await? {
-        return Ok(policy_block);
-    }
-    if let Some(last_run) = contact.last_agent_run_at {
-        let elapsed = DateTime::now().timestamp_millis() - last_run.timestamp_millis();
-        if elapsed < runtime.min_reply_interval_seconds * 1000 {
-            return Ok(blocked("rate_limited", "短时间内已触达，跳过本次自动发送"));
+        if let Some(policy_block) = precheck_operation_policy(state, contact).await? {
+            return Ok(policy_block);
         }
-    }
-    if daily_touch_count(state, contact).await? >= runtime.max_daily_touches {
-        return Ok(blocked("daily_limit", "已达到每日触达上限"));
+        if let Some(last_run) = contact.last_agent_run_at {
+            let elapsed = DateTime::now().timestamp_millis() - last_run.timestamp_millis();
+            if elapsed < runtime.min_reply_interval_seconds * 1000 {
+                return Ok(blocked("rate_limited", "短时间内已触达，跳过本次自动发送"));
+            }
+        }
+        if daily_touch_count(state, contact).await? >= runtime.max_daily_touches {
+            return Ok(blocked("daily_limit", "已达到每日触达上限"));
+        }
     }
     if let AgentTrigger::FollowUp(task) = trigger {
         if let Some(expires_at) = task.expires_at {
@@ -2072,6 +2265,25 @@ async fn apply_agent_updates(
             .or_else(|| contact.domain_attributes.clone())
             .unwrap_or_default();
         attrs.insert("intent_level", value);
+        set_doc.insert("domain_attributes", attrs);
+        set_doc.insert("domain_attributes_updated_at", DateTime::now());
+    }
+    // 请示触发：把"等待领导决策"标记写进客户 domain_attributes（admin 可观测）。
+    // key 用 AWAITING_PRINCIPAL_DECISION_ATTR 常量，与 relay 完成时 clear_awaiting_principal_state 的 $unset 同一字符串。
+    // 注意：这只是可观测布尔标记——本轮 run 是 Approved，占位 reply 已正常发出，不进 Held、不设 hold category、不碰 review。
+    if decision
+        .escalation_request
+        .as_ref()
+        .map(|e| e.needed)
+        .unwrap_or(false)
+    {
+        let mut attrs = set_doc
+            .get_document("domain_attributes")
+            .ok()
+            .cloned()
+            .or_else(|| contact.domain_attributes.clone())
+            .unwrap_or_default();
+        attrs.insert(crate::models::AWAITING_PRINCIPAL_DECISION_ATTR, true);
         set_doc.insert("domain_attributes", attrs);
         set_doc.insert("domain_attributes_updated_at", DateTime::now());
     }

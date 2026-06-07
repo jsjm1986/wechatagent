@@ -407,6 +407,24 @@ pub async fn wechat_webhook(
         ],
     )
     .unwrap_or_default();
+    // 领导回复分流：from_wxid 是本 workspace 的 principal_decider → 走请示通道，不进客户链路。
+    // 必须在落库 / contact-managed 处理之前分流——领导可能同时也是某 contact，
+    // consumed=true 时短路返回，避免领导自己的消息被当成客户入站处理。
+    if (crate::agent::escalation::lookup_principal_config(&state, &workspace_id, &from_wxid).await?)
+        .is_some()
+    {
+        let consumed = crate::agent::escalation::handle_principal_reply(
+            &state,
+            &workspace_id,
+            &account_id,
+            &from_wxid,
+            &content,
+        )
+        .await?;
+        if consumed {
+            return Ok(Json(serde_json::json!({ "ok": true, "routed": "principal" })));
+        }
+    }
     let message_id = find_string(
         &payload,
         &[

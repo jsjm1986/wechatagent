@@ -1477,8 +1477,11 @@ async fn recall_benchmark_gap_closed_loop_trajectory() {
         }
     };
 
-    // 红线：补库产物必须真实存在于本 ws，且经显式 verify 后为 status=verified
+    // 红线：补库产物必须真实存在于本 ws，且经显式 verify 后达到"可召回"双维状态
     //（chat_apply 落 draft+needs_review，verify 是人工审定动作；AI 永不自动 verify）。
+    // verify 语义是双维独立：integrity_status=verified（审计完整度）+ status=active（生命周期
+    // draft→active）——二者正是召回侧过滤器（knowledge_agent.rs / knowledge_router.rs）同时要求
+    // 的两个条件，故此处双断言＝在写侧确认补库产物确实进入"可被 ⑤ 阶段召回"的状态。
     let created_oid = ObjectId::parse_str(&created_chunk_id).expect("created_chunk_id 合法 ObjectId");
     let created_chunk = app
         .state
@@ -1489,8 +1492,13 @@ async fn recall_benchmark_gap_closed_loop_trajectory() {
         .expect("查询补库 chunk")
         .expect("补库 chunk 必须存在于本 ws");
     assert_eq!(
-        created_chunk.status, "verified",
-        "补库 chunk 经显式 verify 后必须为 verified"
+        created_chunk.integrity_status.as_deref(),
+        Some("verified"),
+        "补库 chunk 经显式 verify 后 integrity_status 必须为 verified"
+    );
+    assert_eq!(
+        created_chunk.status, "active",
+        "补库 chunk 经显式 verify 后生命周期 status 必须置 active（draft→active）"
     );
 
     // ⑤ 再 answer **同一** query → 断言缺口闭合：这次召回命中新补的 chunk。
