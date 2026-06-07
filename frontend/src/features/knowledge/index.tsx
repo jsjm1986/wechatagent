@@ -42,6 +42,10 @@ import {
 } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
 import { parseApiError, LlmUnavailableError } from "../../lib/api";
+import { parseCompleteness, parseIntegrityReport, type CompletenessView, type IntegrityReportView, type TrustChunkFields } from "./trustTypes";
+import { CockpitView } from "./cockpit/CockpitView";
+import { ReviewChat, type ReviewChatChunk } from "./cockpit/ReviewChat";
+import { AutoVerifyPanel } from "./cockpit/AutoVerifyPanel";
 import "./Knowledge.module.css";
 
 // ==== 以下 LLM 错误横幅 + KnowledgeWikiView 主体自 App.tsx 原样下沉（Stage-1 行为等价） ====
@@ -264,7 +268,7 @@ function ExploreMode() {
 }
 
 function StewardMode() {
-  const [pane, setPane] = useState<"lint" | "review" | "revisions" | "documents" | "import" | "ingest" | "observability" | "tryRecall">("lint");
+  const [pane, setPane] = useState<"cockpit" | "lint" | "review" | "autoVerify" | "revisions" | "documents" | "import" | "ingest" | "observability" | "tryRecall">("cockpit");
   const [focusedId, setFocusedId] = useState<string | null>(null);
   const [collapsed, setCollapsed] = useState(true);
 
@@ -277,8 +281,15 @@ function StewardMode() {
         setCollapsed(false);
       }
     }
+    function onOpenCockpit() {
+      setPane("cockpit");
+    }
     window.addEventListener("wikiFocusChunk", onFocus as EventListener);
-    return () => window.removeEventListener("wikiFocusChunk", onFocus as EventListener);
+    window.addEventListener("wikiOpenCockpit", onOpenCockpit);
+    return () => {
+      window.removeEventListener("wikiFocusChunk", onFocus as EventListener);
+      window.removeEventListener("wikiOpenCockpit", onOpenCockpit);
+    };
   }, []);
 
   return (
@@ -288,6 +299,13 @@ function StewardMode() {
       }`}
     >
       <div className="wikiModePane wikiModePane--nav wikiStewardNav">
+        <button
+          type="button"
+          className={pane === "cockpit" ? "wikiStewardNavBtn active" : "wikiStewardNavBtn"}
+          onClick={() => setPane("cockpit")}
+        >
+          <ShieldCheck size={14} /> 治理总览
+        </button>
         <button
           type="button"
           className={pane === "lint" ? "wikiStewardNavBtn active" : "wikiStewardNavBtn"}
@@ -301,6 +319,13 @@ function StewardMode() {
           onClick={() => setPane("review")}
         >
           <ShieldCheck size={14} /> 待评审
+        </button>
+        <button
+          type="button"
+          className={pane === "autoVerify" ? "wikiStewardNavBtn active" : "wikiStewardNavBtn"}
+          onClick={() => setPane("autoVerify")}
+        >
+          <Sparkles size={14} /> 批量校验
         </button>
         <button
           type="button"
@@ -346,8 +371,15 @@ function StewardMode() {
         </button>
       </div>
       <div className="wikiModePane wikiModePane--main">
+        {pane === "cockpit" && (
+          <CockpitView
+            onOpenReview={() => setPane("review")}
+            onOpenAutoVerify={() => setPane("autoVerify")}
+          />
+        )}
         {pane === "lint" && <LintView />}
         {pane === "review" && <ReviewView />}
+        {pane === "autoVerify" && <AutoVerifyPanel />}
         {pane === "revisions" && <ChunkRevisionsDrawer />}
         {pane === "documents" && <DocumentsView />}
         {pane === "import" && <ImportWizard />}
@@ -1434,10 +1466,10 @@ function ImportWizard() {
       {step === 3 ? (
         <div style={{ marginTop: 12 }}>
           <div style={{ fontFamily: "var(--font-display)", fontSize: 16, marginBottom: 8 }}>
-            ✓ 已写入 {created.length} 条草稿 chunk
+            ✓ 已存入 {created.length} 条草稿
           </div>
           <p style={{ color: "var(--muted)", fontSize: 12.5 }}>
-            所有 chunk 处于 draft + needs_review 状态，进入「待评审」面板逐条 verify。
+            这些都是草稿,AI 还<strong>不能</strong>拿去跟客户说。需要你逐条看过、确认没问题后,AI 才会用它们。
           </p>
           <div style={{ marginTop: 8, display: "grid", gap: 4 }}>
             {created.map((id) => (
@@ -1446,7 +1478,14 @@ function ImportWizard() {
               </button>
             ))}
           </div>
-          <div style={{ marginTop: 14 }}>
+          <div style={{ marginTop: 14, display: "flex", gap: 8 }}>
+            <button
+              type="button"
+              className="wikiBtn"
+              onClick={() => window.dispatchEvent(new CustomEvent("wikiOpenCockpit"))}
+            >
+              去治理总览逐条处理 →
+            </button>
             <button type="button" className="wikiBtn" onClick={reset}>导入更多</button>
           </div>
         </div>
@@ -2474,7 +2513,7 @@ type ReviewCategory =
   | "pending_verification"
   | "dependents_pending";
 
-interface ReviewChunkItem {
+interface ReviewChunkItem extends TrustChunkFields {
   id: string;
   workspaceId?: string;
   accountId?: string | null;
@@ -2511,6 +2550,8 @@ function ReviewView() {
   const [openBody, setOpenBody] = useState<Set<string>>(new Set());
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [batchBusy, setBatchBusy] = useState(false);
+  // T9：在主区打开「审核+对话」双栏(ReviewChat)；非空时替代列表。
+  const [chatChunk, setChatChunk] = useState<ReviewChatChunk | null>(null);
 
   async function load() {
     setLoading(true);
@@ -2724,6 +2765,26 @@ function ReviewView() {
           })}
         </div>
         <div className="wikiLintPanel">
+          {chatChunk ? (
+            <>
+              <button
+                type="button"
+                className="ghost wikiBtn"
+                onClick={() => setChatChunk(null)}
+              >
+                <Undo2 size={14} />
+                返回评审列表
+              </button>
+              <ReviewChat
+                chunk={chatChunk}
+                onResolved={() => {
+                  setChatChunk(null);
+                  void load();
+                }}
+              />
+            </>
+          ) : (
+            <>
           {!loading && visible.length === 0 ? (
             <div className="wikiEmpty">
               当前类别没有待评审 chunk。
@@ -2778,6 +2839,15 @@ function ReviewView() {
                         <X size={14} />
                         Reject
                       </button>
+                      <button
+                        type="button"
+                        className="wikiReviewActionBtn"
+                        onClick={() => setChatChunk(c)}
+                        title="打开审核+对话双栏：让 AI 改这条草稿，改完一键放行"
+                      >
+                        <MessageSquareText size={14} />
+                        审核 / 对话
+                      </button>
                     </div>
                   </div>
                   {c.summary ? <p className="wikiSignalDesc">{c.summary}</p> : null}
@@ -2813,6 +2883,8 @@ function ReviewView() {
               );
             })}
           </div>
+            </>
+          )}
         </div>
       </div>
     </div>
@@ -4261,18 +4333,6 @@ interface CatalogPersistedView {
   items?: unknown[];
 }
 
-interface CompletenessView {
-  perWikiType?: Array<{ wikiType?: string; total?: number; ratio?: number }>;
-  overall?: { total?: number; verified?: number; ratio?: number };
-}
-
-interface IntegrityReportView {
-  needsReview?: number;
-  contested?: number;
-  sourceOrphan?: number;
-  total?: number;
-}
-
 interface LogsAnalyzeView {
   windowHours?: number;
   totalCalls?: number;
@@ -4567,8 +4627,8 @@ function ObservabilityDashboard() {
       ]);
       setCatalog(a as CatalogPersistedView);
       setCatalogLive(b as { total?: number });
-      setCompleteness(c as CompletenessView);
-      setIntegrity(d as IntegrityReportView);
+      setCompleteness(parseCompleteness(c));
+      setIntegrity(parseIntegrityReport(d));
       setLogs(e as LogsAnalyzeView);
       const metrics = f as { answerCache?: typeof cacheStats };
       setCacheStats(metrics?.answerCache ?? null);
@@ -4657,26 +4717,22 @@ function ObservabilityDashboard() {
             <span className="wikiArchiveTag">[completeness]</span>
             <h4>类型完整度</h4>
           </header>
-          {completeness?.perWikiType && completeness.perWikiType.length > 0 ? (
-            <div className="wikiCoverageBars">
-              {completeness.perWikiType.map((row, i) => {
-                const ratio = Math.max(0, Math.min(1, Number(row.ratio ?? 0)));
-                return (
-                  <div className="wikiCoverageBarRow" key={i}>
-                    <span className="wikiCoverageBarLabel">{row.wikiType ?? "?"}</span>
-                    <div className="wikiCoverageBar">
-                      <div
-                        className="wikiCoverageBarFill"
-                        style={{ width: `${(ratio * 100).toFixed(0)}%` }}
-                      />
-                    </div>
-                    <span className="wikiCoverageBarValue">
-                      {(ratio * 100).toFixed(0)}% · {row.total ?? 0}
-                    </span>
-                  </div>
-                );
-              })}
-            </div>
+          {completeness ? (
+            <dl className="wikiArchiveMeta">
+              <dt>应答模式</dt>
+              <dd>{completeness.answeringMode}</dd>
+              <dt>已验证</dt>
+              <dd>
+                {completeness.verifiedChunks}/{completeness.totalChunks}
+              </dd>
+              {completeness.summary ? (
+                <>
+                  <dt>摘要</dt>
+                  <dd>{completeness.summary}</dd>
+                </>
+              ) : null}
+              {/* coverage 5 维裁决渲染见后续 cockpit 任务 */}
+            </dl>
           ) : (
             <div className="wikiEmpty">无完整度数据</div>
           )}
@@ -4690,10 +4746,10 @@ function ObservabilityDashboard() {
           <dl className="wikiArchiveMeta">
             <dt>needs_review</dt>
             <dd>{integrity?.needsReview ?? 0}</dd>
-            <dt>contested</dt>
-            <dd>{integrity?.contested ?? 0}</dd>
-            <dt>source_orphan</dt>
-            <dd>{integrity?.sourceOrphan ?? 0}</dd>
+            <dt>verified</dt>
+            <dd>{integrity?.verified ?? 0}</dd>
+            <dt>rejected</dt>
+            <dd>{integrity?.rejected ?? 0}</dd>
             <dt>total</dt>
             <dd>{integrity?.total ?? 0}</dd>
           </dl>
