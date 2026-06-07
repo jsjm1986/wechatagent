@@ -132,6 +132,8 @@
 }
 
 .moreToggle:hover {
+  /* 锁透明底,挡全局 button:hover 深蓝填充 */
+  background: transparent;
   color: var(--ink-2);
 }
 
@@ -203,6 +205,8 @@
 }
 
 .goLiveBtn:hover:not(:disabled) {
+  /* 锁品牌底,挡全局 button:hover 深蓝填充,只做提亮 */
+  background: var(--color-brand);
   filter: brightness(1.06);
 }
 
@@ -329,6 +333,8 @@
 }
 
 .sendBtn:hover:not(:disabled) {
+  /* 锁品牌底,挡全局 button:hover 深蓝填充,只做提亮 */
+  background: var(--color-brand);
   filter: brightness(1.06);
 }
 

@@ -12,6 +12,12 @@ describe("AnsweringModeGauge", () => {
     render(<AnsweringModeGauge mode="product_safe" needsReviewChunks={2} summary="" />);
     expect(screen.getByText(/待审/)).toBeInTheDocument();
   });
+  it("有草稿的解读不得承诺「审掉必达完全支撑」(业务红线:clamp 只解除封顶,升档仍看覆盖度)", () => {
+    render(<AnsweringModeGauge mode="product_safe" needsReviewChunks={3} summary="" />);
+    const txt = screen.getByText(/待审草稿/).textContent ?? "";
+    expect(txt).not.toMatch(/审掉即解锁/);
+    expect(txt).toMatch(/覆盖|才有机会|不一定/);
+  });
   it("fully_supported 显示「完全支撑」", () => {
     render(<AnsweringModeGauge mode="fully_supported" needsReviewChunks={0} summary="" />);
     expect(screen.getByText(/完全支撑/)).toBeInTheDocument();

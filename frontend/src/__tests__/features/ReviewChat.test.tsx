@@ -1,5 +1,6 @@
-import { render, screen } from "@testing-library/react";
-import { describe, it, expect } from "vitest";
+import { render, screen, waitFor } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
+import { describe, it, expect, vi } from "vitest";
 import { ReviewChat } from "../../features/knowledge/cockpit/ReviewChat";
 
 const chunk = {
@@ -35,5 +36,27 @@ describe("ReviewChat", () => {
     render(<ReviewChat chunk={rich as never} onResolved={() => {}} />);
     expect(screen.getByText(/8 次|用了 8|被用过 8/)).toBeInTheDocument();
     expect(screen.getByText(/降级|为什么被打回|打回/)).toBeInTheDocument();
+  });
+  it("点「退回」→ 调 reject 端点,成功后关面板(onResolved)", async () => {
+    const calls: string[] = [];
+    globalThis.fetch = vi.fn((url: string) => {
+      calls.push(String(url));
+      return Promise.resolve({ ok: true, json: () => Promise.resolve({}) } as Response);
+    }) as unknown as typeof fetch;
+    const onResolved = vi.fn();
+    render(<ReviewChat chunk={chunk as never} onResolved={onResolved} />);
+    await userEvent.click(screen.getByRole("button", { name: /退回/ }));
+    await waitFor(() => expect(onResolved).toHaveBeenCalledTimes(1));
+    expect(calls.some((c) => c.includes("/chunks/c1/reject"))).toBe(true);
+  });
+  it("退回失败 → 不关面板,显示大白话错误", async () => {
+    globalThis.fetch = vi.fn(() =>
+      Promise.resolve({ ok: false, status: 500, json: () => Promise.resolve({}) } as Response)
+    ) as unknown as typeof fetch;
+    const onResolved = vi.fn();
+    render(<ReviewChat chunk={chunk as never} onResolved={onResolved} />);
+    await userEvent.click(screen.getByRole("button", { name: /退回/ }));
+    await waitFor(() => expect(screen.getByText(/退回没成功/)).toBeInTheDocument());
+    expect(onResolved).not.toHaveBeenCalled();
   });
 });

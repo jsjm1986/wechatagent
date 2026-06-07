@@ -12,6 +12,26 @@
   color: var(--ink-3);
 }
 
+.retry {
+  display: inline-block;
+  margin-left: 10px;
+  font: inherit;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--color-brand);
+  background: var(--surface-card);
+  border: 1px solid var(--hairline);
+  border-radius: var(--r-sm);
+  padding: 6px 14px;
+  cursor: pointer;
+  transition: border-color .18s ease;
+}
+
+.retry:hover {
+  background: var(--surface-card);
+  border-color: var(--color-brand);
+}
+
 .gaugeWrap {
   background: var(--surface-card);
   border: 1px solid var(--hairline);
@@ -58,6 +78,8 @@
 }
 
 .autoVerify:hover {
+  /* 挡住全局 button:hover 的 --accent-ink 深蓝填充,保持白底品牌字 */
+  background: var(--surface-card);
   border-color: var(--color-brand);
   transform: translateY(-1px);
 }

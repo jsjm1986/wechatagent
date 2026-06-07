@@ -58,6 +58,7 @@ export function ReviewChat({ chunk, onResolved }: ReviewChatProps) {
   const [sending, setSending] = useState(false);
   const [goLiveError, setGoLiveError] = useState<string | null>(null);
   const [moreOpen, setMoreOpen] = useState(false);
+  const [rejecting, setRejecting] = useState(false);
 
   const usage = chunk.usageStats;
   const hasUsage =
@@ -88,6 +89,27 @@ export function ReviewChat({ chunk, onResolved }: ReviewChatProps) {
     );
   };
 
+  const handleReject = async () => {
+    if (rejecting) return;
+    setGoLiveError(null);
+    setRejecting(true);
+    try {
+      const resp = await fetch(
+        `/api/operation-knowledge/chunks/${encodeURIComponent(chunk.id)}/reject`,
+        { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" }
+      );
+      if (!resp.ok) {
+        setGoLiveError("退回没成功，稍后再试。");
+        return;
+      }
+      onResolved();
+    } catch {
+      setGoLiveError("退回没成功，稍后再试。");
+    } finally {
+      setRejecting(false);
+    }
+  };
+
   const handleSend = async () => {
     const content = draft.trim();
     if (!content || sending) return;
@@ -109,8 +131,6 @@ export function ReviewChat({ chunk, onResolved }: ReviewChatProps) {
         return;
       }
       const data = (await resp.json()) as Record<string, unknown>;
-      const nextSession =
-        typeof data.sessionId === "string" ? data.sessionId : sessionId;
       if (typeof data.sessionId === "string") setSessionId(data.sessionId);
 
       const turn = (data.turn ?? data) as Record<string, unknown>;
@@ -127,7 +147,6 @@ export function ReviewChat({ chunk, onResolved }: ReviewChatProps) {
         ...prev,
         { role: "ai", text: naturalReply, touchedChunk: touched },
       ]);
-      void nextSession;
     } catch {
       setTurns((prev) => [...prev, { role: "ai", text: "没接上,稍后再发一次。" }]);
     } finally {
@@ -242,7 +261,7 @@ export function ReviewChat({ chunk, onResolved }: ReviewChatProps) {
           <button
             type="button"
             className={styles.goLiveBtn}
-            disabled={!check.ok || pending}
+            disabled={!check.ok || pending || rejecting}
             onClick={handleGoLive}
           >
             {pending ? "正在放行…" : "让 AI 可以用这条"}
@@ -250,12 +269,10 @@ export function ReviewChat({ chunk, onResolved }: ReviewChatProps) {
           <button
             type="button"
             className={styles.rejectBtn}
-            onClick={() => {
-              // TODO: 调 reject 端点退回草稿;当前先关闭面板。
-              onResolved();
-            }}
+            disabled={rejecting || pending}
+            onClick={handleReject}
           >
-            退回
+            {rejecting ? "退回中…" : "退回"}
           </button>
         </div>
       </section>

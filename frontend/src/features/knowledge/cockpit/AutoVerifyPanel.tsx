@@ -56,11 +56,19 @@ export function AutoVerifyPanel(_props: { onClose?: () => void }) {
           limit: count,
         }),
       });
-      if (!r.ok) throw new Error(`auto-verify 请求失败（${r.status}）`);
-      const data = (await r.json()) as AutoVerifyResult;
-      setResult(data);
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      if (!r.ok) throw new Error("fail");
+      const raw = (await r.json()) as Partial<AutoVerifyResult>;
+      // 后端漏字段时兜 0,避免下方算出 NaN 渲染给用户
+      setResult({
+        processed: raw.processed ?? 0,
+        verified: raw.verified ?? 0,
+        needsReview: raw.needsReview ?? 0,
+        rejected: raw.rejected ?? 0,
+        needsHumanAudit: raw.needsHumanAudit ?? 0,
+        degraded: raw.degraded,
+      });
+    } catch {
+      setError("筛选没跑成功，稍后再试。");
     } finally {
       setRunning(false);
     }
@@ -147,7 +155,7 @@ export function AutoVerifyPanel(_props: { onClose?: () => void }) {
         <section className={styles.block}>
           <span className={styles.blockLabel}>
             筛完了 · 共看了 {result.processed} 条
-            {result.degraded ? "（部分降级处理）" : ""}
+            {result.degraded ? "（有一批 AI 没能细看，已按保守处理）" : ""}
           </span>
           <div className={styles.pileGrid}>
             <div className={`${styles.pile} ${styles.pileVerified}`}>

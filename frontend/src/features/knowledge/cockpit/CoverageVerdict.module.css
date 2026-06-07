@@ -30,6 +30,9 @@
 
 .vd:hover {
   transform: translateY(-2px);
+  /* 挡住全局 button:hover 的 --accent-ink 深蓝填充,否则深底+深字读不出 */
+  background: var(--surface-card);
+  border-color: var(--hairline);
 }
 
 .vdDim {

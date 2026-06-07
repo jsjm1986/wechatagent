@@ -19,7 +19,7 @@ export function AnsweringModeGauge({ mode, needsReviewChunks, summary }: Answeri
 
   let reading = "";
   if (needsReviewChunks > 0 && mode !== "fully_supported") {
-    reading = `距「完全支撑」差一步:有 ${needsReviewChunks} 条待审草稿,有待审草稿就绝不宣称完全支撑。审掉即解锁。`;
+    reading = `有 ${needsReviewChunks} 条待审草稿,只要还有草稿,就绝不宣称完全支撑。审掉草稿才有机会往上走(能不能到完全支撑,还看知识覆盖够不够全)。`;
   } else if (needsReviewChunks === 0 && mode === "fully_supported") {
     reading = "知识库已完整支撑对客";
   } else {

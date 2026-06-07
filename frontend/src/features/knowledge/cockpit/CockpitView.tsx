@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { ShieldCheck } from "lucide-react";
 import { parseCompleteness, parseIntegrityReport, type CompletenessView, type IntegrityReportView } from "../trustTypes";
 import { AnsweringModeGauge } from "./AnsweringModeGauge";
@@ -14,9 +14,11 @@ interface CockpitViewProps {
 export function CockpitView({ onOpenReview, onOpenAutoVerify }: CockpitViewProps) {
   const [completeness, setCompleteness] = useState<CompletenessView | null>(null);
   const [integrity, setIntegrity] = useState<IntegrityReportView | null>(null);
+  const [loadFailed, setLoadFailed] = useState(false);
 
-  useEffect(() => {
+  const load = useCallback(() => {
     let alive = true;
+    setLoadFailed(false);
     Promise.all([
       fetch("/api/operation-knowledge/completeness")
         .then((r) => (r.ok ? r.json() : null))
@@ -30,11 +32,25 @@ export function CockpitView({ onOpenReview, onOpenAutoVerify }: CockpitViewProps
       if (!alive) return;
       setCompleteness(comp);
       setIntegrity(integ);
+      if (!comp) setLoadFailed(true);
     });
     return () => {
       alive = false;
     };
   }, []);
+
+  useEffect(() => load(), [load]);
+
+  if (loadFailed) {
+    return (
+      <div className={styles.loading}>
+        没读到知识库状态，可能是网络或服务没响应。
+        <button type="button" className={styles.retry} onClick={() => load()}>
+          重新加载
+        </button>
+      </div>
+    );
+  }
 
   if (!completeness) {
     return <div className={styles.loading}>正在加载知识库状态…</div>;
@@ -67,7 +83,7 @@ export function CockpitView({ onOpenReview, onOpenAutoVerify }: CockpitViewProps
           <MetricCard
             label="需复核"
             value={integrity?.rejected ?? 0}
-            detail="已降级/驳回待处理"
+            detail="AI 核验没过、退回待处理的"
             onClick={() => onOpenReview()}
           />
           <MetricCard
@@ -79,7 +95,7 @@ export function CockpitView({ onOpenReview, onOpenAutoVerify }: CockpitViewProps
         </div>
         <button type="button" className={styles.autoVerify} onClick={onOpenAutoVerify}>
           <ShieldCheck size={15} />
-          批量自动校验 · auto-verify
+          批量自动校验
         </button>
       </section>
     </div>

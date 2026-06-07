@@ -88,6 +88,8 @@
 }
 
 .seg:hover {
+  /* 显式锁白底,挡全局 button:hover 的 --accent-ink 深蓝填充 */
+  background: var(--surface-card);
   border-color: rgba(10, 132, 255, 0.4);
 }
 
@@ -158,6 +160,8 @@
 }
 
 .startBtn:hover:not(:disabled) {
+  /* 锁品牌底,挡全局 button:hover 深蓝填充,只做提亮 */
+  background: var(--color-brand);
   filter: brightness(1.06);
 }
 
