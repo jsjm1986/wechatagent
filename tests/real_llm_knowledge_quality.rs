@@ -584,6 +584,27 @@ fn calib_gap_ok(good_overall: f64, bad_overall: f64, min_gap: f64) -> bool {
     good_overall - bad_overall >= min_gap
 }
 
+/// 观测层诊断（**不参与** pass/fail 判定，纯供人工复看）：
+/// - `borderline`：Pass 但 `agreed` 压在 floor 附近（`agreed - floor <= band`），属"压线放行"，
+///   质量其实贴地板，值得人工复看（如 Q5 agreed=6.0=floor 判 pass）。
+/// - `outlier_spread`：跨裁判 overall 的 max-min 极差。即使没到 skip 阈值，较大的极差也提示
+///   有单裁判离群（如某异族裁判系统性偏高/偏低），保守取低可能采纳了离群的最低分。
+/// 返回 `(borderline, outlier_spread)`。纯函数，单测靶心。
+fn quality_diagnostics(meds: &[f64], agreed: f64, floor: f64, borderline_band: f64) -> (bool, f64) {
+    let borderline = (agreed - floor) <= borderline_band;
+    let spread = if meds.is_empty() {
+        0.0
+    } else {
+        let lo = meds.iter().cloned().fold(f64::MAX, f64::min);
+        let hi = meds.iter().cloned().fold(f64::MIN, f64::max);
+        hi - lo
+    };
+    (borderline, spread)
+}
+
+/// Pass verdict 的"压线放行"判定带宽：agreed 高出 floor 不超过此值即标 borderline。
+const QUALITY_BORDERLINE_BAND: f64 = 1.0;
+
 // ── 校准层 · 跨家族裁判团（deepseek 双 checkpoint + 可选异族 Qwen）──────────────────
 //
 // 单模型自评的系统性偏差靠 median-of-K 消不掉（见上）。文本判分用 deepseek 双 checkpoint
@@ -1043,7 +1064,8 @@ async fn panel_calibrated(panel: &[QualityJudge], qid: &str, anchor: &CalibAncho
 }
 
 /// 记一行三态裁决到台账（供反放水审计：skip_divergent 必伴随 cross_divergence>max）。
-fn ledger_verdict(qid: &str, scene: &str, verdict: &QualityVerdict) {
+/// `meds` = 参与判分的各裁判 overall median（仅供观测层算 borderline /离群极差，**不影响**裁决）。
+fn ledger_verdict(qid: &str, scene: &str, verdict: &QualityVerdict, meds: &[f64]) {
     let (kind, agreed, divergence) = match verdict {
         QualityVerdict::Pass { agreed_overall } => ("pass", Some(*agreed_overall), None),
         QualityVerdict::Fail { agreed_overall } => ("fail", Some(*agreed_overall), None),
@@ -1051,14 +1073,27 @@ fn ledger_verdict(qid: &str, scene: &str, verdict: &QualityVerdict) {
         QualityVerdict::SkipInsufficientJudges => ("skip_insufficient_judges", None, None),
         QualityVerdict::SkipCalib => ("skip_calib", None, None),
     };
+    // 观测层（不参与裁决）：borderline 仅在有 agreed（pass/fail）时有意义；outlier_spread 始终可算。
+    let (borderline, outlier_spread) = match agreed {
+        Some(a) => quality_diagnostics(meds, a, MIN_QUALITY_FLOOR, QUALITY_BORDERLINE_BAND),
+        None => (false, quality_diagnostics(meds, 0.0, MIN_QUALITY_FLOOR, QUALITY_BORDERLINE_BAND).1),
+    };
     ledger_append(
         "quality",
         json!({
             "suite": "quality", "kind": "verdict", "sha": git_sha(),
             "ts_ms": DateTime::now().timestamp_millis(), "qid": qid, "scene": scene,
             "verdict": kind, "agreed_overall": agreed, "cross_divergence": divergence,
+            "borderline": borderline, "outlier_spread": outlier_spread,
         }),
     );
+    if borderline && kind == "pass" {
+        eprintln!(
+            "[QUALITY][{qid}/{scene}] ⚠ borderline pass：agreed={:.1} 压在 floor {MIN_QUALITY_FLOOR} 附近\
+             （band {QUALITY_BORDERLINE_BAND}），跨裁判极差={outlier_spread:.1}，建议人工复看是否单裁判离群拉低",
+            agreed.unwrap_or(0.0)
+        );
+    }
 }
 
 /// 校准层统一评测入口：先校准（拉不开 → SkipCalib）；再双裁判判分；纯逻辑三态裁决；
@@ -1078,7 +1113,7 @@ async fn evaluate_quality_panel(
 ) -> AppResult<QualityVerdict> {
     if !panel_calibrated(panel, qid, anchor).await? {
         let v = QualityVerdict::SkipCalib;
-        ledger_verdict(qid, scene, &v);
+        ledger_verdict(qid, scene, &v, &[]);
         return Ok(v);
     }
     let outcome = match run_quality_panel(panel, qid, scene, task, model_output, ground_truth, dims, image_base64).await {
@@ -1105,7 +1140,8 @@ async fn evaluate_quality_panel(
             score.overall, score.dims, score.reasons
         );
     }
-    ledger_verdict(qid, scene, &verdict);
+    let meds: Vec<f64> = outcome.judge_stats().iter().map(|(m, _)| *m).collect();
+    ledger_verdict(qid, scene, &verdict, &meds);
     Ok(verdict)
 }
 
@@ -1920,7 +1956,8 @@ async fn q2_article_extraction_quality() {
                             divergence_max(),
                             intra_spread_max(),
                         );
-                        ledger_verdict("Q2", spec.source_name, &verdict);
+                        let meds: Vec<f64> = outcome.judge_stats().iter().map(|(m, _)| *m).collect();
+                        ledger_verdict("Q2", spec.source_name, &verdict, &meds);
                         handle_verdict("Q2", spec.source_name, verdict);
                     }
                     None => {
@@ -2779,4 +2816,30 @@ fn calib_anchor_dims_match_each_q() {
     }
     // 未知 id 兜底通用锚，dims 仍自洽。
     assert_eq!(calib_anchor_for("ZZZ").dims, q_dims("ZZZ"));
+}
+
+#[test]
+fn quality_diagnostics_borderline_and_spread() {
+    // 观测层纯函数：borderline = agreed 压在 floor 附近（agreed-floor ≤ band）；
+    // outlier_spread = 跨裁判 median 的 max-min。二者都**不参与**裁决，只供人工复看。
+    let floor = 6.0;
+    let band = 1.0;
+
+    // ① 压线放行：agreed=6.0 恰等 floor → borderline=true（如 Q5 地板 pass）。
+    let (bl, sp) = quality_diagnostics(&[6.0, 6.0], 6.0, floor, band);
+    assert!(bl, "agreed=floor 必须标 borderline（压线放行）");
+    assert_eq!(sp, 0.0, "两裁判同分极差应为 0");
+
+    // ② agreed 高出 floor 恰好 band（6+1=7）→ 仍算 borderline（≤ 边界含等号）。
+    assert!(quality_diagnostics(&[7.0], 7.0, floor, band).0, "agreed-floor=band 仍 borderline");
+
+    // ③ agreed 明显高于 floor（8.0，超出 band）→ 非 borderline。
+    assert!(!quality_diagnostics(&[8.0], 8.0, floor, band).0, "agreed 远高于 floor 不应 borderline");
+
+    // ④ 离群极差：裁判 medians=[8,8,5] → spread=3（异族裁判拉低，保守取低可能采纳离群）。
+    let (_, sp3) = quality_diagnostics(&[8.0, 8.0, 5.0], 5.0, floor, band);
+    assert_eq!(sp3, 3.0, "跨裁判极差应为 max-min=8-5=3");
+
+    // ⑤ 空 medians（无任何有效裁判，如 SkipCalib）→ spread=0，不 panic。
+    assert_eq!(quality_diagnostics(&[], 0.0, floor, band).1, 0.0, "空 medians 极差应为 0");
 }
