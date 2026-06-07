@@ -28,6 +28,7 @@ mod chat_tool_loop;
 mod decision;
 mod decision_taxonomy;
 pub mod domain;
+pub mod escalation;
 mod gateway;
 mod guards;
 pub mod knowledge_agent;
@@ -555,6 +556,8 @@ mod tests {
             current_version: true,
             previous_version: None,
             seeded_by: None,
+            principal_decider: None,
+            high_risk_escalation_mode: None,
         };
         let mut decision = AgentDecision {
             operation_state: Some("需求探索".to_string()),
@@ -764,6 +767,8 @@ mod tests {
             current_version: true,
             previous_version: None,
             seeded_by: None,
+            principal_decider: None,
+            high_risk_escalation_mode: None,
         }
     }
 

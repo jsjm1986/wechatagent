@@ -12,6 +12,8 @@ WechatAgent is a long-running WeChat private-domain operations AI agent system b
 
 Phase 1 scope is **user (private-chat) operations**. Group and Moments operations are planned separate operation domains; do not fold them into the user-ops code path. The product positioning is **fully AI-autonomous** — there is no "human takeover". Held/blocked sends use AI-internal status names (`held_by_ai_policy` / `blocked_by_safety_guard` / `ai_waiting_for_more_context`); admins observe these but the business semantics never become "human handoff".
 
+**"无人工接管"的精确含义**：指客户永远只跟 AI 对话、永不直接面对真人。AI 在遇到超出自身职权/能力的事项时，向**幕后决策源（领导）**请示、拿回结论后用自己的口吻向客户转述——这不是人工接管（客户从不面对人、对话始终是 AI 在说）。详见决策请示通道设计 `docs/superpowers/specs/2026-06-05-principal-decision-channel-design.md`。
+
 ## Common commands
 
 The toolchain is `cargo` (Rust 2021) for the backend and `npm` + Vite for the frontend. There is no Cargo workspace and no top-level `Makefile`.

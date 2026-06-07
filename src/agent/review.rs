@@ -1062,7 +1062,29 @@ pub fn finalize_review_for_send(
             status: GatewayStatusFinal::Approved,
             pending_events,
         }
+    } else if review.approved && !decision.should_reply {
+        // A3「主动沉默」：reviewer 通过了决策（approved=true），但 reply-agent
+        // 本就判 should_reply=false（确认收到 / 无需触达）。这是"已审核通过的
+        // 沉默"，语义上等同 no_reply，而非 hold/block——should_hold 三道硬门、
+        // protocol/budget/product-claim 硬门均未命中（都已在上方 return）。
+        //
+        // 终态返回 Approved：gateway 的 Approved 路径已按 should_reply 分流，
+        // should_reply=false 时落 final_review_status=no_reply、跳过 outbox、
+        // 生命周期映射为 completed（run_envelope::derive_lifecycle_from_status）。
+        // 若误落进下方 else，会被错标 held_by_ai_policy → failed_after_decision，
+        // 把一次正常的"无需回复"误计为策略暂缓。should_run_review 在
+        // should_reply=false 时返回 false，故本路径的 review 来自
+        // local_decision_review（approved=true），不消耗额外 LLM 调用。
+        review.final_review_status = "approved".to_string();
+        FinalizeOutcome {
+            review,
+            status: GatewayStatusFinal::Approved,
+            pending_events,
+        }
     } else {
+        // approved=false 且未触发任何硬门（如 review_passed 阈值不够、reviewer
+        // 直接 approved=false）→ held_by_ai_policy。注意本分支不再承接
+        // approved=true 的沉默决策（已被上一分支接走）。
         review.final_review_status = HOLD_CATEGORY_HELD_BY_AI_POLICY.to_string();
         FinalizeOutcome {
             review,
@@ -1909,6 +1931,83 @@ mod dual_gate_classification_tests {
         assert!(!finalized.approved);
         assert_eq!(
             finalized.final_review_status,
+            HOLD_CATEGORY_HELD_BY_AI_POLICY
+        );
+    }
+
+    #[test]
+    fn finalize_approved_but_silent_decision_is_no_reply_not_held() {
+        // A3「主动沉默」回归门：reviewer 通过（approved=true），但 reply-agent
+        // 本就判 should_reply=false（如"客户只是确认收到"）。这是"已审核通过的
+        // 沉默"，必须落 Approved（gateway 据 should_reply 分流到 no_reply /
+        // completed 生命周期），绝不能被 else-fallthrough 错标 held_by_ai_policy
+        // （→ failed_after_decision，把正常无需回复误计为策略暂缓）。
+        // 对应 full_flow_a3_no_reply_skips_review_and_outbox 的根因修复。
+        let runtime = UserRuntimeParameters::default();
+        let review = full_pass_review(); // approved=true，无任何硬门命中
+        let mut decision = shouldreply_decision();
+        decision.should_reply = false; // reply-agent 主动判沉默
+        decision.reply_text = String::new();
+        let contact = finalize_contact();
+        let outcome = finalize_review_for_send(
+            review,
+            &mut decision,
+            &runtime,
+            &contact,
+            &[],
+            Vec::new(),
+            "收到，谢谢",
+        );
+        assert_eq!(
+            outcome.status,
+            GatewayStatusFinal::Approved,
+            "approved=true + should_reply=false 的主动沉默必须是 Approved，不能 Held"
+        );
+        assert_eq!(
+            outcome.review.final_review_status, "approved",
+            "主动沉默的 final_review_status 应为 approved（gateway 再据 should_reply 写 no_reply）"
+        );
+        assert!(outcome.review.approved);
+        // 沉默路径不应被误标为任何 hold/block 风险。
+        assert!(
+            !outcome
+                .review
+                .risks
+                .iter()
+                .any(|r| r == "state_action_policy_blocked"),
+            "主动沉默不应携带任何策略拦截风险标签"
+        );
+    }
+
+    #[test]
+    fn finalize_unapproved_without_hard_gate_stays_held() {
+        // 反向门：approved=false 且未触发任何硬门（reviewer 直接判不通过、
+        // 软闸阈值不够且无 revision_direction）→ 仍走 Held(held_by_ai_policy)。
+        // 确保上面的 A3 分支没有把"真正该 hold"的 approved=false 也放行。
+        let runtime = UserRuntimeParameters::default();
+        let mut review = full_pass_review();
+        review.approved = false; // reviewer 直接不通过
+        review.needs_revision = false;
+        review.revision_direction = String::new();
+        let mut decision = shouldreply_decision(); // should_reply=true
+        let contact = finalize_contact();
+        let outcome = finalize_review_for_send(
+            review,
+            &mut decision,
+            &runtime,
+            &contact,
+            &[],
+            Vec::new(),
+            "用户最新消息",
+        );
+        match outcome.status {
+            GatewayStatusFinal::Held(category) => {
+                assert_eq!(category, HOLD_CATEGORY_HELD_BY_AI_POLICY);
+            }
+            other => panic!("expected Held(held_by_ai_policy), got {:?}", other),
+        }
+        assert_eq!(
+            outcome.review.final_review_status,
             HOLD_CATEGORY_HELD_BY_AI_POLICY
         );
     }
