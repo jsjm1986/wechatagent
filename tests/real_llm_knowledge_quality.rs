@@ -700,7 +700,7 @@ fn hetero_qwen_judge() -> Option<QualityJudge> {
 /// vision 模型，每个走 generate_json_with_image（judge_quality 传 Some(image)）。
 ///
 /// 跨家族独立性（核心防线，不退回单裁判自评）：
-///   - 裁判① gpt-5.5 @ coderelay（GPT 家族；VISION_JUDGE_API_KEY）；
+///   - 裁判① gpt-5.5 @ api.naxtclaude.com（GPT 家族；VISION_JUDGE_API_KEY）；
 ///   - 裁判② kimi-k2.6 @ NVIDIA（moonshot 家族，真异族；复用 REAL_LLM_VISION_BACKUP_*）。
 /// 被测 Q3 抽取走 gpt-5.4，裁判用 gpt-5.5(异 checkpoint)+kimi(异家族)，与被测不同模型，
 /// decide_quality 跨裁判分歧门照常生效。两端点各裹 wrap_with_failover 抗瞬时抖动。
@@ -712,7 +712,7 @@ fn vision_judge_panel() -> Option<Vec<QualityJudge>> {
         .ok()
         .filter(|k| !k.trim().is_empty())?;
     let g_base = std::env::var("VISION_JUDGE_BASE_URL")
-        .unwrap_or_else(|_| "https://coderelay.cn/v1".to_string());
+        .unwrap_or_else(|_| "https://api.naxtclaude.com/v1".to_string());
     let g_model = std::env::var("VISION_JUDGE_MODEL").unwrap_or_else(|_| "gpt-5.5".to_string());
     let g = LlmClient::new(g_base, g_key, g_model, 180, primary_max_retries(), 2500).ok()?;
     let mut panel = vec![QualityJudge {
@@ -2024,14 +2024,14 @@ async fn q3_vision_extraction_quality() {
     let ws = app.state.config.default_workspace_id.clone();
 
     // vision 链路用**独立** env 三元组：被测文字/裁判端点（deepseek @ api.supxh.xin）
-    // 不支持多模态，故 Q3 走专职视觉 provider（gpt-5.4 @ gpt.api456.me）。缺 VISION key
+    // 不支持多模态，故 Q3 走专职视觉 provider（gpt-5.4 @ api.naxtclaude.com）。缺 VISION key
     // 时回落到通用 REAL_LLM_API_KEY/BASE_URL（兼容单端点既支持文字又支持 vision 的形态）。
     let api_key = std::env::var("REAL_LLM_VISION_API_KEY")
         .or_else(|_| std::env::var("REAL_LLM_API_KEY"))
         .expect("require_real_llm 已保证存在");
     let base_url = std::env::var("REAL_LLM_VISION_BASE_URL")
         .or_else(|_| std::env::var("REAL_LLM_BASE_URL"))
-        .unwrap_or_else(|_| "https://gpt.api456.me/v1".to_string());
+        .unwrap_or_else(|_| "https://api.naxtclaude.com/v1".to_string());
     let vision_model =
         std::env::var("REAL_LLM_VISION_MODEL").unwrap_or_else(|_| "gpt-5.4".to_string());
     let vision_cfg = LlmProviderConfig {
