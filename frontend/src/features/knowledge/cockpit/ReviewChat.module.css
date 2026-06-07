@@ -1,0 +1,345 @@
+/* 审核+对话双栏。语义色只用 var(--token);无左缘竖色杠;裸 button 全局污染重置。 */
+
+.wrap {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 18px;
+  align-items: start;
+}
+
+@media (max-width: 900px) {
+  .wrap {
+    grid-template-columns: 1fr;
+  }
+}
+
+/* ── 左栏:裁决 + 放行 ── */
+.verdictCol,
+.chatCol {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  padding: 20px;
+  background: var(--surface-card);
+  border: 1px solid var(--hairline);
+  border-radius: var(--r-md);
+  box-shadow: 0 14px 34px -24px rgba(20, 30, 60, 0.3),
+    inset 0 1px 1px rgba(255, 255, 255, 0.9);
+}
+
+.verdictHead {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.chunkTitle {
+  margin: 0;
+  font-size: 16px;
+  font-weight: 680;
+  color: var(--ink-1);
+  letter-spacing: -0.2px;
+}
+
+.block {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+
+.blockLabel {
+  font-size: 11.5px;
+  font-weight: 600;
+  color: var(--ink-4);
+  letter-spacing: 0.2px;
+}
+
+.blockBody {
+  margin: 0;
+  font-size: 13.5px;
+  line-height: 1.5;
+  color: var(--ink-2);
+}
+
+.quote {
+  margin: 0;
+  padding: 10px 14px;
+  font-size: 13px;
+  line-height: 1.5;
+  color: var(--ink-2);
+  background: rgba(20, 30, 60, 0.03);
+  border-radius: var(--r-sm);
+}
+
+.muted {
+  margin: 0;
+  font-size: 13px;
+  color: var(--ink-4);
+}
+
+.gapNote {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 12px 14px;
+  font-size: 13px;
+  line-height: 1.5;
+  color: var(--color-held);
+  background: rgba(217, 159, 35, 0.07);
+  border-radius: var(--r-sm);
+}
+
+.gapNote p {
+  margin: 0;
+}
+
+.endorse {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 14px;
+  font-size: 12.5px;
+  line-height: 1.45;
+  color: var(--ink-2);
+  background: rgba(20, 30, 60, 0.03);
+  border-radius: var(--r-sm);
+}
+
+.goLiveError {
+  margin: 0;
+  font-size: 12.5px;
+  color: var(--color-blocked);
+}
+
+/* ── 折叠区:富字段大白话显形 ── */
+.more {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.moreToggle {
+  font: inherit;
+  appearance: none;
+  align-self: flex-start;
+  padding: 4px 0;
+  font-size: 12.5px;
+  color: var(--ink-4);
+  background: transparent;
+  border: none;
+  cursor: pointer;
+  transition: color 0.16s ease;
+}
+
+.moreToggle:hover {
+  /* 锁透明底,挡全局 button:hover 深蓝填充 */
+  background: transparent;
+  color: var(--ink-2);
+}
+
+.moreBody {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 12px 14px;
+  background: rgba(20, 30, 60, 0.03);
+  border-radius: var(--r-sm);
+}
+
+.moreBodyHidden {
+  display: none;
+}
+
+.moreItem {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.moreText {
+  margin: 0;
+  font-size: 13px;
+  line-height: 1.5;
+  color: var(--ink-2);
+}
+
+.moreList {
+  margin: 0;
+  padding-left: 18px;
+  font-size: 13px;
+  line-height: 1.5;
+  color: var(--ink-2);
+}
+
+.moreList li {
+  margin: 0;
+}
+
+.actions {
+  display: flex;
+  gap: 10px;
+  margin-top: 4px;
+}
+
+/* 裸 button 全局污染重置 */
+.goLiveBtn,
+.rejectBtn,
+.sendBtn {
+  font: inherit;
+  appearance: none;
+  min-height: 0;
+  justify-content: center;
+  cursor: pointer;
+  border: none;
+  border-radius: var(--r-sm);
+  transition: filter 0.16s ease, background 0.16s ease;
+}
+
+.goLiveBtn {
+  flex: 1;
+  padding: 11px 18px;
+  font-size: 14px;
+  font-weight: 640;
+  color: #fff;
+  background: var(--color-brand);
+}
+
+.goLiveBtn:hover:not(:disabled) {
+  /* 锁品牌底,挡全局 button:hover 深蓝填充,只做提亮 */
+  background: var(--color-brand);
+  filter: brightness(1.06);
+}
+
+.goLiveBtn:disabled {
+  background: rgba(20, 30, 60, 0.12);
+  color: var(--ink-4);
+  cursor: not-allowed;
+}
+
+.rejectBtn {
+  padding: 11px 18px;
+  font-size: 13.5px;
+  color: var(--ink-3);
+  background: transparent;
+  border: 1px solid var(--hairline);
+}
+
+.rejectBtn:hover {
+  background: rgba(20, 30, 60, 0.03);
+}
+
+/* ── 右栏:对话工坊 ── */
+.chatHead {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.chatTitle {
+  margin: 0;
+  font-size: 15px;
+  font-weight: 680;
+  color: var(--ink-1);
+}
+
+.chatSub {
+  font-size: 12px;
+  color: var(--ink-4);
+}
+
+.msgList {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  min-height: 200px;
+  max-height: 420px;
+  overflow-y: auto;
+  padding: 4px 0;
+}
+
+.msgEmpty {
+  margin: 0;
+  font-size: 13px;
+  line-height: 1.5;
+  color: var(--ink-4);
+}
+
+.msgOp,
+.msgAi {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  max-width: 88%;
+  padding: 9px 13px;
+  border-radius: var(--r-sm);
+}
+
+.msgOp {
+  align-self: flex-end;
+  background: var(--color-brand);
+}
+
+.msgOp .msgText {
+  color: #fff;
+}
+
+.msgAi {
+  align-self: flex-start;
+  background: rgba(20, 30, 60, 0.04);
+}
+
+.msgText {
+  margin: 0;
+  font-size: 13.5px;
+  line-height: 1.5;
+  color: var(--ink-2);
+}
+
+.msgHint {
+  font-size: 11.5px;
+  color: var(--color-brand);
+}
+
+.composer {
+  display: flex;
+  gap: 8px;
+  align-items: flex-end;
+}
+
+.input {
+  flex: 1;
+  resize: none;
+  font: inherit;
+  font-size: 13.5px;
+  line-height: 1.5;
+  padding: 9px 12px;
+  color: var(--ink-1);
+  background: var(--surface-card);
+  border: 1px solid var(--hairline);
+  border-radius: var(--r-sm);
+}
+
+.input:focus {
+  outline: none;
+  border-color: var(--color-brand);
+}
+
+.sendBtn {
+  padding: 10px 18px;
+  font-size: 13.5px;
+  font-weight: 600;
+  color: #fff;
+  background: var(--color-brand);
+}
+
+.sendBtn:hover:not(:disabled) {
+  /* 锁品牌底,挡全局 button:hover 深蓝填充,只做提亮 */
+  background: var(--color-brand);
+  filter: brightness(1.06);
+}
+
+.sendBtn:disabled {
+  background: rgba(20, 30, 60, 0.12);
+  color: var(--ink-4);
+  cursor: not-allowed;
+}
