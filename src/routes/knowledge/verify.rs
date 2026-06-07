@@ -35,7 +35,7 @@ pub struct KnowledgeAutoVerifyRequest {
     /// 模型置信度阈值（0-10），≥ 该值才算 verified；默认 7。
     #[serde(default)]
     confidence_threshold: Option<i32>,
-    /// 人工抽样概率，0.0-1.0；默认 0.1。
+    /// 运营抽样概率，0.0-1.0；默认 0.1。
     #[serde(default)]
     human_audit_sample_rate: Option<f64>,
     /// 单次最多处理多少条 chunks，默认 50。
