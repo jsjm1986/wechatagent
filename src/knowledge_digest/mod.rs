@@ -7,9 +7,9 @@
 //! `crate::mcp::*`、`agent_send_outbox` 写入路径或 `run_user_operation_gateway`
 //! 等生产链路入口。日报合成是离线分析任务，与对话发送链路彻底隔离。
 //!
-//! Phase 1（本波）：仅 worker 骨架 + early-return on disabled flag + Phase 2
-//! 的 `generate_today_digest` 占位（`todo!()`），路由 `GET /api/knowledge/digest/today`
-//! 在未命中时直接 404，不触发同步合成。
+//! `worker_loop` 在 `KNOWLEDGE_DIGEST_ENABLED=false` 时 early-return；启用时按
+//! `KNOWLEDGE_DIGEST_RUN_HOUR` 整点跑 `generate_today_digest` 合成当日日报。
+//! 路由 `GET /api/knowledge/digest/today` 未命中时按需同步合成（见 routes/knowledge/digest_inbox.rs）。
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -44,7 +44,7 @@ pub async fn worker_loop(state: AppState) {
     let run_hour = state.config.knowledge_digest_run_hour.min(23);
     tracing::info!(
         run_hour,
-        "knowledge digest worker starting (Phase 1 skeleton — generate_today_digest is todo!())"
+        "knowledge digest worker starting"
     );
     loop {
         let wait = duration_until_next_run(run_hour);
