@@ -162,7 +162,7 @@ fn failover_key_present() -> bool {
         .is_some()
 }
 
-/// 最强模型（gpt-5.5 @ coderelay）key 是否已配——它作 agent / 红队 / 判官的备胎链首选。
+/// 最强模型（gpt-5.5 @ api.naxtclaude.com）key 是否已配——它作 agent / 红队 / 判官的备胎链首选。
 fn strongest_key_present() -> bool {
     std::env::var("REAL_LLM_JUDGE_API_KEY")
         .ok()
@@ -189,14 +189,14 @@ fn primary_max_retries() -> u32 {
     }
 }
 
-/// 构造最强模型 client（gpt-5.5 @ coderelay，OpenAI 兼容）。缺 `REAL_LLM_JUDGE_API_KEY` →
+/// 构造最强模型 client（gpt-5.5 @ api.naxtclaude.com，OpenAI 兼容）。缺 `REAL_LLM_JUDGE_API_KEY` →
 /// None。它作备胎链**首选**（MiMo 402 欠费 / 429 时优先切它续跑）。备胎自身保留 5 次重试。
 fn strongest_model_client() -> Option<Arc<LlmClient>> {
     let key = std::env::var("REAL_LLM_JUDGE_API_KEY")
         .ok()
         .filter(|k| !k.trim().is_empty())?;
     let base = std::env::var("REAL_LLM_JUDGE_BASE_URL")
-        .unwrap_or_else(|_| "https://coderelay.cn/v1".to_string());
+        .unwrap_or_else(|_| "https://api.naxtclaude.com/v1".to_string());
     let model =
         std::env::var("REAL_LLM_JUDGE_MODEL").unwrap_or_else(|_| "gpt-5.5".to_string());
     LlmClient::new(base, key, model, 180, 5, 2500).ok().map(Arc::new)
