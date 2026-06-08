@@ -219,10 +219,10 @@ fn failover_backups() -> Vec<Arc<LlmClient>> {
         .collect()
 }
 
-/// 备胎模型清单（逗号分隔，env 可覆盖）。备胎各自保留 5 次重试。
+/// 备胎模型清单（逗号分隔，env 可覆盖；异族链避开被测 kimi 与裁判 llama-3.3-70b/qwen）。备胎各自保留 5 次重试。
 fn failover_model_list() -> Vec<String> {
     std::env::var("REAL_LLM_FAILOVER_MODELS")
-        .unwrap_or_else(|_| "moonshotai/kimi-k2.6,minimaxai/minimax-m2.7,z-ai/glm-5.1".to_string())
+        .unwrap_or_else(|_| "z-ai/glm-5.1,stepfun-ai/step-3.7-flash,nvidia/llama-3.3-nemotron-super-49b-v1.5".to_string())
         .split(',')
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
@@ -700,9 +700,9 @@ fn hetero_qwen_judge() -> Option<QualityJudge> {
 /// vision 模型，每个走 generate_json_with_image（judge_quality 传 Some(image)）。
 ///
 /// 跨家族独立性（核心防线，不退回单裁判自评）：
-///   - 裁判① gpt-5.5 @ api.naxtclaude.com（GPT 家族；VISION_JUDGE_API_KEY）；
-///   - 裁判② kimi-k2.6 @ NVIDIA（moonshot 家族，真异族；复用 REAL_LLM_VISION_BACKUP_*）。
-/// 被测 Q3 抽取走 gpt-5.4，裁判用 gpt-5.5(异 checkpoint)+kimi(异家族)，与被测不同模型，
+///   - 裁判① llama-3.2-90b-vision @ NVIDIA（meta 家族；VISION_JUDGE_API_KEY）；
+///   - 裁判② nemotron-vl backup @ NVIDIA（nvidia 家族；复用 REAL_LLM_VISION_BACKUP_*）。
+/// 被测 Q3 抽取走 nemotron-nano-12b-v2-vl(nvidia)，裁判用 llama-vision(meta 异家族)，与被测不同家族，
 /// decide_quality 跨裁判分歧门照常生效。两端点各裹 wrap_with_failover 抗瞬时抖动。
 ///
 /// 缺主 vision 裁判 key（VISION_JUDGE_API_KEY）→ None（调用方 skip，不构造不可靠裁判）。
@@ -712,8 +712,9 @@ fn vision_judge_panel() -> Option<Vec<QualityJudge>> {
         .ok()
         .filter(|k| !k.trim().is_empty())?;
     let g_base = std::env::var("VISION_JUDGE_BASE_URL")
-        .unwrap_or_else(|_| "https://api.naxtclaude.com/v1".to_string());
-    let g_model = std::env::var("VISION_JUDGE_MODEL").unwrap_or_else(|_| "gpt-5.5".to_string());
+        .unwrap_or_else(|_| "https://integrate.api.nvidia.com/v1".to_string());
+    let g_model = std::env::var("VISION_JUDGE_MODEL")
+        .unwrap_or_else(|_| "meta/llama-3.2-90b-vision-instruct".to_string());
     let g = LlmClient::new(g_base, g_key, g_model, 180, primary_max_retries(), 2500).ok()?;
     let mut panel = vec![QualityJudge {
         label: "gpt5.5-vision",
@@ -2023,17 +2024,17 @@ async fn q3_vision_extraction_quality() {
     let app = TestApp::start().await;
     let ws = app.state.config.default_workspace_id.clone();
 
-    // vision 链路用**独立** env 三元组：被测文字/裁判端点（deepseek @ api.supxh.xin）
-    // 不支持多模态，故 Q3 走专职视觉 provider（gpt-5.4 @ api.naxtclaude.com）。缺 VISION key
+    // vision 链路用**独立** env 三元组：被测文字/裁判端点（kimi @ NVIDIA integrate）
+    // 不支持多模态，故 Q3 走专职视觉 provider（nemotron-nano-12b-v2-vl @ NVIDIA integrate）。缺 VISION key
     // 时回落到通用 REAL_LLM_API_KEY/BASE_URL（兼容单端点既支持文字又支持 vision 的形态）。
     let api_key = std::env::var("REAL_LLM_VISION_API_KEY")
         .or_else(|_| std::env::var("REAL_LLM_API_KEY"))
         .expect("require_real_llm 已保证存在");
     let base_url = std::env::var("REAL_LLM_VISION_BASE_URL")
         .or_else(|_| std::env::var("REAL_LLM_BASE_URL"))
-        .unwrap_or_else(|_| "https://api.naxtclaude.com/v1".to_string());
+        .unwrap_or_else(|_| "https://integrate.api.nvidia.com/v1".to_string());
     let vision_model =
-        std::env::var("REAL_LLM_VISION_MODEL").unwrap_or_else(|_| "gpt-5.4".to_string());
+        std::env::var("REAL_LLM_VISION_MODEL").unwrap_or_else(|_| "nvidia/nemotron-nano-12b-v2-vl".to_string());
     let vision_cfg = LlmProviderConfig {
         id: Some(ObjectId::new()),
         workspace_id: ws.clone(),
@@ -2059,15 +2060,16 @@ async fn q3_vision_extraction_quality() {
         .await
         .expect("insert vision provider");
 
-    // 备用视觉模型（异族多模态，NVIDIA 托管 kimi-k2.6）：supports_vision=true 但
-    // is_vision_active=false，故生产候选链把它排在专职 gpt-5.4 之后——主模型瞬时
+    // 备用视觉模型（NVIDIA 托管 nemotron-nano-vl-8b，与主 nemotron-12b 同 nvidia 家族——backup 仅主挂时
+    // 应急，关键是回退后被测 vs vision 裁判(meta llama-vision)仍跨家族）：supports_vision=true 但
+    // is_vision_active=false，故生产候选链把它排在专职 nemotron-vl 之后——主模型瞬时
     // 不可达（429/配额/网关超时）时自动切换到它。缺 BACKUP key 时不插入，链退化为单主模型，
     // 不影响测试。模型名/端点是 tests 内字面量（check-no-model-hint 对 tests/ 豁免）。
     if let Ok(backup_key) = std::env::var("REAL_LLM_VISION_BACKUP_API_KEY") {
         let backup_base = std::env::var("REAL_LLM_VISION_BACKUP_BASE_URL")
             .unwrap_or_else(|_| "https://integrate.api.nvidia.com/v1".to_string());
         let backup_model = std::env::var("REAL_LLM_VISION_BACKUP_MODEL")
-            .unwrap_or_else(|_| "moonshotai/kimi-k2.6".to_string());
+            .unwrap_or_else(|_| "nvidia/llama-3.1-nemotron-nano-vl-8b-v1".to_string());
         let backup_cfg = LlmProviderConfig {
             id: Some(ObjectId::new()),
             workspace_id: ws.clone(),

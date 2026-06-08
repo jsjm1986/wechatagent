@@ -63,21 +63,21 @@ fn real_llm_from_env() -> Option<Arc<LlmClient>> {
     Some(Arc::new(client))
 }
 
-/// vision 副模型名：`REAL_LLM_VISION_MODEL`，缺省默认专职视觉 provider 模型 `gpt-5.4`。
+/// vision 副模型名：`REAL_LLM_VISION_MODEL`，缺省默认专职视觉 provider 模型 `nemotron-nano-12b-v2-vl`。
 ///
-/// 与文本端点彻底解耦——deepseek 文本端点不支持多模态，T3 vision 走独立视觉
-/// provider（api.naxtclaude.com）。不再回退 `REAL_LLM_MODEL`（旧实现把 vision 与文本模型
+/// 与文本端点彻底解耦——文本端点不支持多模态，T3 vision 走独立视觉
+/// provider（NVIDIA integrate）。不再回退 `REAL_LLM_MODEL`（旧实现把 vision 与文本模型
 /// 双关绑死，切 provider 必撞）。
 fn real_vision_model() -> String {
-    std::env::var("REAL_LLM_VISION_MODEL").unwrap_or_else(|_| "gpt-5.4".to_string())
+    std::env::var("REAL_LLM_VISION_MODEL").unwrap_or_else(|_| "nvidia/nemotron-nano-12b-v2-vl".to_string())
 }
 
 /// vision 端点 base_url：独立 `REAL_LLM_VISION_BASE_URL`，缺省回落通用
-/// `REAL_LLM_BASE_URL`，再缺省专职视觉 provider `api.naxtclaude.com`。
+/// `REAL_LLM_BASE_URL`，再缺省专职视觉 provider `NVIDIA integrate`。
 fn real_vision_base_url() -> String {
     std::env::var("REAL_LLM_VISION_BASE_URL")
         .or_else(|_| std::env::var("REAL_LLM_BASE_URL"))
-        .unwrap_or_else(|_| "https://api.naxtclaude.com/v1".to_string())
+        .unwrap_or_else(|_| "https://integrate.api.nvidia.com/v1".to_string())
 }
 
 /// vision 端点 api_key：独立 `REAL_LLM_VISION_API_KEY`，缺省回落通用
@@ -488,7 +488,7 @@ async fn t3_real_vision_extraction_keeps_needs_review() {
 
     // seed 专职视觉副模型，文字主模型不存在 → handler 走 Dedicated 分支，
     // 用这条配置真实构造 vision client。vision 端点独立配置：deepseek 文字端点
-    // 不支持多模态，故走 REAL_LLM_VISION_* 三元组（默认 api.naxtclaude.com），缺 VISION
+    // 不支持多模态，故走 REAL_LLM_VISION_* 三元组（默认 NVIDIA integrate），缺 VISION
     // key 时回落通用 REAL_LLM_API_KEY/BASE_URL。
     let api_key = real_vision_api_key();
     let vision_cfg = LlmProviderConfig {

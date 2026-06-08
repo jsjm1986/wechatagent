@@ -154,7 +154,7 @@ impl LlmProvider for FailoverProvider {
     }
 }
 
-/// FAILOVER key 是否已配——决定 NVIDIA 端 kimi/minimax/glm 备胎链是否可用。
+/// FAILOVER key 是否已配——决定 NVIDIA 端 glm/step/qwen 备胎链是否可用。
 fn failover_key_present() -> bool {
     std::env::var("REAL_LLM_FAILOVER_API_KEY")
         .ok()
@@ -162,7 +162,7 @@ fn failover_key_present() -> bool {
         .is_some()
 }
 
-/// 最强模型（gpt-5.5 @ api.naxtclaude.com）key 是否已配——它作 agent / 红队 / 判官的备胎链首选。
+/// 最强模型（llama-3.3-70b @ NVIDIA integrate）key 是否已配——它作 agent / 红队 / 判官的备胎链首选。
 fn strongest_key_present() -> bool {
     std::env::var("REAL_LLM_JUDGE_API_KEY")
         .ok()
@@ -170,7 +170,7 @@ fn strongest_key_present() -> bool {
         .is_some()
 }
 
-/// 是否存在**任一**健康备胎（gpt-5.5 首选 或 NVIDIA 链）——决定主模型该 fail-fast 还是熬满重试窗。
+/// 是否存在**任一**健康备胎（llama-3.3-70b 首选 或 NVIDIA 链）——决定主模型该 fail-fast 还是熬满重试窗。
 fn any_backup_present() -> bool {
     strongest_key_present() || failover_key_present()
 }
@@ -189,26 +189,26 @@ fn primary_max_retries() -> u32 {
     }
 }
 
-/// 构造最强模型 client（gpt-5.5 @ api.naxtclaude.com，OpenAI 兼容）。缺 `REAL_LLM_JUDGE_API_KEY` →
+/// 构造最强模型 client（llama-3.3-70b @ NVIDIA integrate，OpenAI 兼容）。缺 `REAL_LLM_JUDGE_API_KEY` →
 /// None。它作备胎链**首选**（MiMo 402 欠费 / 429 时优先切它续跑）。备胎自身保留 5 次重试。
 fn strongest_model_client() -> Option<Arc<LlmClient>> {
     let key = std::env::var("REAL_LLM_JUDGE_API_KEY")
         .ok()
         .filter(|k| !k.trim().is_empty())?;
     let base = std::env::var("REAL_LLM_JUDGE_BASE_URL")
-        .unwrap_or_else(|_| "https://api.naxtclaude.com/v1".to_string());
+        .unwrap_or_else(|_| "https://integrate.api.nvidia.com/v1".to_string());
     let model =
-        std::env::var("REAL_LLM_JUDGE_MODEL").unwrap_or_else(|_| "gpt-5.5".to_string());
+        std::env::var("REAL_LLM_JUDGE_MODEL").unwrap_or_else(|_| "meta/llama-3.3-70b-instruct".to_string());
     LlmClient::new(base, key, model, 180, 5, 2500).ok().map(Arc::new)
 }
 
-/// 从 env 构造备胎链（延迟/能力升序）：①最强模型 gpt-5.5（首选，若 `REAL_LLM_JUDGE_API_KEY`
-/// 在）→ ②NVIDIA `/v1` 上 kimi-k2.6 / minimax-m2.7 / glm-5.1（若 `REAL_LLM_FAILOVER_API_KEY`
+/// 从 env 构造备胎链（延迟/能力升序）：①最强模型 llama-3.3-70b（首选，若 `REAL_LLM_JUDGE_API_KEY`
+/// 在）→ ②NVIDIA `/v1` 上 glm-5.1 / step-3.7-flash / qwen3-next-80b（若 `REAL_LLM_FAILOVER_API_KEY`
 /// 在）。两个 key 都缺 → 返 `vec![]`，FailoverProvider 退化为「只主模型」= 与今天行为完全
 /// 一致（不回归、不强依赖任何备胎 key）。备胎自身保留 5 次重试（兜底网应尽力）。
 fn failover_backups() -> Vec<Arc<LlmClient>> {
     let mut backups: Vec<Arc<LlmClient>> = Vec::new();
-    // ①最强模型 gpt-5.5 作首选备胎（MiMo 402/429 失败时优先切它）。
+    // ①最强模型 llama-3.3-70b 作首选备胎（MiMo 402/429 失败时优先切它）。
     if let Some(c) = strongest_model_client() {
         backups.push(c);
     }
@@ -224,12 +224,12 @@ fn failover_backups() -> Vec<Arc<LlmClient>> {
     backups
 }
 
-/// 备胎 model 名列表（逗号分隔，已延迟升序）。缺 key 时仍返默认列表，但 `failover_backups`
+/// 备胎 model 名列表（逗号分隔，异族链避开被测 kimi/主裁判 llama-3.3-70b）。缺 key 时仍返默认列表，但 `failover_backups`
 /// 会因缺 key 返空——本函数也供台账侧 `is_backup_model` 判定「该采样是否备胎兜底分」。
 fn failover_model_list() -> Vec<String> {
     std::env::var("REAL_LLM_FAILOVER_MODELS")
         .unwrap_or_else(|_| {
-            "moonshotai/kimi-k2.6,minimaxai/minimax-m2.7,z-ai/glm-5.1".to_string()
+            "z-ai/glm-5.1,stepfun-ai/step-3.7-flash,qwen/qwen3-next-80b-a3b-instruct".to_string()
         })
         .split(',')
         .map(|s| s.trim().to_string())
@@ -238,10 +238,10 @@ fn failover_model_list() -> Vec<String> {
 }
 
 /// 台账判定：某次成功采样的 `res.model` 是否来自备胎（用于打 `fallback` 标记）。
-/// 备胎 = 最强模型 gpt-5.5（若 JUDGE key 在）∪ NVIDIA 链（若 FAILOVER key 在）。
+/// 备胎 = 最强模型 llama-3.3-70b（若 JUDGE key 在）∪ NVIDIA 链（若 FAILOVER key 在）。
 /// 两 key 都缺 → 备胎链空 → 永远 false（正常轮台账无 fallback 噪声）。
 fn is_backup_model(model: &str) -> bool {
-    let strongest = std::env::var("REAL_LLM_JUDGE_MODEL").unwrap_or_else(|_| "gpt-5.5".to_string());
+    let strongest = std::env::var("REAL_LLM_JUDGE_MODEL").unwrap_or_else(|_| "meta/llama-3.3-70b-instruct".to_string());
     if strongest_key_present() && model == strongest {
         return true;
     }

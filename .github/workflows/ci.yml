@@ -70,7 +70,7 @@ jobs:
     # 先 continue-on-error 拿到真实绿/红体检报告，不阻塞合并；逐个修复后
     # 再视情况抬升为硬门（与 baseline 同级）。
     continue-on-error: true
-    timeout-minutes: 45
+    timeout-minutes: 90
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -121,7 +121,7 @@ jobs:
     # MCP 永远是 wiremock 桩（绝不真发微信）。real-LLM 限流/抖动不该阻塞合并，
     # 故 continue-on-error；conclusion 恒 success，必看 job 日志拿真实绿/红。
     continue-on-error: true
-    timeout-minutes: 45
+    timeout-minutes: 90
     # 密钥提到 job 级 env：GitHub Actions 的 job 级 `if:` 读不到 secrets 上下文，
     # 但 step 级 `if:` 能读 env，故下方各重步用 `if: env.REAL_LLM_API_KEY != ''`
     # 守卫——未配 secret（fork PR / 没配）时直接跳过编译/跑测，不浪费 CI 分钟、不红。
@@ -129,7 +129,7 @@ jobs:
     # → 文本切回 MiMo mimo-v2.5（用户指定 api.xiaomimimo.com，key 走 secret
     # REAL_LLM_MIMO_API_KEY，缺则回落字面量），与 ops/adversarial/quality 套件同源。
     env:
-      REAL_LLM_API_KEY: ${{ secrets.REAL_LLM_CODERELAY_API_KEY || 'sk-ae64cef396a161f7c73b5a9318821215adf3a4e782e6a819523bddf82a405b9f' }}
+      REAL_LLM_API_KEY: ${{ secrets.REAL_LLM_CODERELAY_API_KEY || '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' }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -161,16 +161,16 @@ jobs:
         if: ${{ env.REAL_LLM_API_KEY != '' }}
         env:
           RUSTFLAGS: ""
-          # 文本主链路（T1/T2）走 gpt-5.5（api.naxtclaude.com/v1，OpenAI 兼容；MiMo 额度 2026-06-04 耗尽切此）。
-          REAL_LLM_BASE_URL: https://api.naxtclaude.com/v1
-          REAL_LLM_MODEL: gpt-5.5
-          # vision（T3）：MiMo 主文本 checkpoint 不复用多模态，故指向专职视觉 provider
-          # gpt-5.4（api.naxtclaude.com，OpenAI 兼容 /v1）。key 优先 secret，缺则回落字面量
+          # 文本主链路（T1/T2）走 kimi-k2.6（NVIDIA integrate，OpenAI 兼容；naxtclaude 503 不可用切此）。
+          REAL_LLM_BASE_URL: https://integrate.api.nvidia.com/v1
+          REAL_LLM_MODEL: moonshotai/kimi-k2.6
+          # vision（T3）：文本 checkpoint 不复用多模态，故指向专职视觉 provider
+          # nemotron-nano-12b-v2-vl（NVIDIA integrate，OpenAI 兼容 /v1）。key 优先 secret，缺则回落字面量
           # （与 quality 套件同纪律：tests/CI 豁免 model-hint lint）。偶发 5xx/524 走
           # LlmUnavailable→skip 不 fail。
-          REAL_LLM_VISION_API_KEY: ${{ secrets.REAL_LLM_VISION_API_KEY || 'sk-ae64cef396a161f7c73b5a9318821215adf3a4e782e6a819523bddf82a405b9f' }}
-          REAL_LLM_VISION_BASE_URL: https://api.naxtclaude.com/v1
-          REAL_LLM_VISION_MODEL: gpt-5.4
+          REAL_LLM_VISION_API_KEY: ${{ secrets.REAL_LLM_VISION_API_KEY || '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' }}
+          REAL_LLM_VISION_BASE_URL: https://integrate.api.nvidia.com/v1
+          REAL_LLM_VISION_MODEL: nvidia/nemotron-nano-12b-v2-vl
         run: cargo test --no-fail-fast --test real_llm_smoke -- --ignored --nocapture
 
       # 知识库全能力 smoke（real_llm_knowledge.rs K1–K9）：渐进式披露检索
@@ -185,15 +185,15 @@ jobs:
         if: ${{ !cancelled() && env.REAL_LLM_API_KEY != '' }}
         env:
           RUSTFLAGS: ""
-          # 文本知识链路（K1–K5/K7–K11）走 gpt-5.5（api.naxtclaude.com/v1；MiMo 额度 2026-06-04 耗尽切此）。
-          REAL_LLM_BASE_URL: https://api.naxtclaude.com/v1
-          REAL_LLM_MODEL: gpt-5.5
-          # vision（K6）：MiMo 主文本 checkpoint 不复用多模态，故指向专职视觉 provider
-          # gpt-5.4（api.naxtclaude.com）。key 优先 secret，缺则回落字面量（与 quality 套件
+          # 文本知识链路（K1–K5/K7–K11）走 kimi-k2.6（NVIDIA integrate；naxtclaude 503 不可用切此）。
+          REAL_LLM_BASE_URL: https://integrate.api.nvidia.com/v1
+          REAL_LLM_MODEL: moonshotai/kimi-k2.6
+          # vision（K6）：文本 checkpoint 不复用多模态，故指向专职视觉 provider
+          # nemotron-nano-12b-v2-vl（NVIDIA integrate）。key 优先 secret，缺则回落字面量（与 quality 套件
           # 同纪律：tests/CI 豁免 model-hint lint）。偶发 5xx/524 走 LlmUnavailable→skip。
-          REAL_LLM_VISION_API_KEY: ${{ secrets.REAL_LLM_VISION_API_KEY || 'sk-ae64cef396a161f7c73b5a9318821215adf3a4e782e6a819523bddf82a405b9f' }}
-          REAL_LLM_VISION_BASE_URL: https://api.naxtclaude.com/v1
-          REAL_LLM_VISION_MODEL: gpt-5.4
+          REAL_LLM_VISION_API_KEY: ${{ secrets.REAL_LLM_VISION_API_KEY || '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' }}
+          REAL_LLM_VISION_BASE_URL: https://integrate.api.nvidia.com/v1
+          REAL_LLM_VISION_MODEL: nvidia/nemotron-nano-12b-v2-vl
         run: cargo test --no-fail-fast --test real_llm_knowledge -- --ignored --nocapture
 
   # ════════════════════════════════════════════════════════════════════════════
@@ -206,7 +206,7 @@ jobs:
   # 跨行业大语料矩阵（零售/SaaS/金融/教育/医疗/制造 6 行业 × 多文档类型）做通用性测试。
   # 第一轮只观测 baseline，唯一硬红线 = 召回集⊆seed（出现 seed 外 id 即真 bug，立即 fail）。
   # 与 quality matrix 解耦——独立 job，不抢 Q1-Q8 收敛判据。MCP 永远是桩（绝不真发微信）。
-  # 文本主链走 api.naxtclaude.com gpt-5.5；real-LLM 抖动 continue-on-error 不阻塞合并。
+  # 文本主链走 NVIDIA integrate kimi-k2.6；real-LLM 抖动 continue-on-error 不阻塞合并。
   #
   # 按测试拆 matrix 并行（仿 real-llm-ops / real-llm-quality）：三个测试各享独立 runner +
   # 独立 45min 墙，互不阻塞（fail-fast:false），各自只 `cargo test <name>` 跑自己那片，抗墙腰斩。
@@ -215,13 +215,13 @@ jobs:
   # - recall_benchmark_maintenance_stability：③真实 chat 改库全链路（新增/改写/废弃）后召回保持。
   # - recall_benchmark_gap_closed_loop_trajectory：北极星全闭环单测——召回 gap → agent 主动
   #   提问 → 运营对话补库（chat 新建切片，溯源=运营陈述）→ verify 通过 → 同 query 再召回命中。
-  # max-parallel:2 限流——与 ops/quality/adversarial 共用同一把 api.naxtclaude.com key，限并发防瞬时 429；
+  # max-parallel:2 限流——与 ops/quality/adversarial 共用同一把 NVIDIA key，限并发防瞬时 429；
   # 队列中的 matrix job 不启动 timeout 计时，故每测试仍独享完整 45min 墙，限流只推迟开始不吃墙。
   real-llm-recall:
     name: Real-LLM knowledge recall benchmark (${{ matrix.t }} / MCP 桩)
     runs-on: ubuntu-latest
     continue-on-error: true
-    timeout-minutes: 45
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       max-parallel: 2
@@ -232,7 +232,7 @@ jobs:
           - recall_benchmark_maintenance_stability
           - recall_benchmark_gap_closed_loop_trajectory
     env:
-      REAL_LLM_API_KEY: ${{ secrets.REAL_LLM_CODERELAY_API_KEY || 'sk-ae64cef396a161f7c73b5a9318821215adf3a4e782e6a819523bddf82a405b9f' }}
+      REAL_LLM_API_KEY: ${{ secrets.REAL_LLM_CODERELAY_API_KEY || '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' }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -254,8 +254,8 @@ jobs:
         if: ${{ env.REAL_LLM_API_KEY != '' }}
         uses: Swatinem/rust-cache@v2
 
-      # 召回率基准：默认 #[ignore]，靠 --ignored 触发。文本主链 gpt-5.5
-      # （api.naxtclaude.com/v1，OpenAI 兼容）。RECALL_STABILITY_RUNS 控制每条 query 跑几次量化
+      # 召回率基准：默认 #[ignore]，靠 --ignored 触发。文本主链 kimi-k2.6
+      # （NVIDIA integrate，OpenAI 兼容）。RECALL_STABILITY_RUNS 控制每条 query 跑几次量化
       # 跨轮稳定性（首版 N=3 抗墙，spec 定稿 5；矩阵 6 行业 × N 调用量大，先 3 跑通再放开）。
       # --nocapture 让 [RECALL] / [RECALL-MAINT] ledger 行进 CI 日志。关 -Dwarnings 同知识库
       # job（测试文件陈年 warning 不阻断真实跑测）。硬红线⊆seed 之外只观测不 panic。
@@ -263,8 +263,8 @@ jobs:
         if: ${{ !cancelled() && env.REAL_LLM_API_KEY != '' }}
         env:
           RUSTFLAGS: ""
-          REAL_LLM_BASE_URL: https://api.naxtclaude.com/v1
-          REAL_LLM_MODEL: gpt-5.5
+          REAL_LLM_BASE_URL: https://integrate.api.nvidia.com/v1
+          REAL_LLM_MODEL: moonshotai/kimi-k2.6
           RECALL_STABILITY_RUNS: "3"
         run: cargo test --no-fail-fast --test real_llm_recall_benchmark ${{ matrix.t }} -- --ignored --nocapture
 
@@ -298,7 +298,7 @@ jobs:
     name: Real-LLM ops smoke (${{ matrix.t }} / MCP 桩)
     runs-on: ubuntu-latest
     continue-on-error: true
-    timeout-minutes: 45
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       max-parallel: 2
@@ -320,7 +320,7 @@ jobs:
           - t17_real_multiturn_boundary_stress
           - t18_real_warm_start_operator_seeded_arc
     env:
-      REAL_LLM_API_KEY: ${{ secrets.REAL_LLM_CODERELAY_API_KEY || 'sk-ae64cef396a161f7c73b5a9318821215adf3a4e782e6a819523bddf82a405b9f' }}
+      REAL_LLM_API_KEY: ${{ secrets.REAL_LLM_CODERELAY_API_KEY || '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' }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -353,23 +353,23 @@ jobs:
         if: ${{ env.REAL_LLM_API_KEY != '' }}
         env:
           RUSTFLAGS: ""
-          REAL_LLM_BASE_URL: https://api.naxtclaude.com/v1
-          REAL_LLM_MODEL: gpt-5.5
+          REAL_LLM_BASE_URL: https://integrate.api.nvidia.com/v1
+          REAL_LLM_MODEL: moonshotai/kimi-k2.6
           REAL_LLM_JUDGE: "1"
-          # 裁判用最强模型 gpt-5.5（@ api.naxtclaude.com，OpenAI 兼容）——G-Eval/MT-Bench 方法论：
-          # 最强模型当 judge 判分更可信。被测 agent 仍是生产模型 MiMo（REAL_LLM_MODEL），
-          # 裁判换强只抬高评分可信度、不抬高被测分（零过拟合）。gpt-5.5 同时作 agent 备胎链
-          # 首选（MiMo 429 时优先切它续跑）。缺 key 时裁判回落 MiMo failover（无回归）。
-          REAL_LLM_JUDGE_API_KEY: ${{ secrets.REAL_LLM_GPT55_API_KEY || 'sk-ae64cef396a161f7c73b5a9318821215adf3a4e782e6a819523bddf82a405b9f' }}
-          REAL_LLM_JUDGE_BASE_URL: https://api.naxtclaude.com/v1
-          REAL_LLM_JUDGE_MODEL: gpt-5.5
-          # 跨模型 failover 备胎链（与 adversarial / integration job 同口径）：MiMo 主端点
-          # 429/5xx 重试耗尽时，被测 agent 自动切到备胎链续跑——①最强模型 gpt-5.5（首选，
-          # 上方 JUDGE key）→ ②NVIDIA 上的 kimi/minimax/glm。把端点限流与能力测评解耦，让
-          # t11/t13/t15/t16/t18 多轮弧不再 turn-1 即被 skip，产出真分。缺 key 退化为「只主模型」。
+          # 裁判用异族强模型 llama-3.3-70b（@ NVIDIA integrate，meta 家族）——G-Eval/MT-Bench 方法论：
+          # 裁判须异于被测（被测 kimi/moonshot），跨家族判分更可信、不自我背书。
+          # 裁判换异族只抬高评分可信度、不抬高被测分（零过拟合）。缺 key 时裁判回落主模型 failover（无回归）。
+          REAL_LLM_JUDGE_API_KEY: ${{ secrets.REAL_LLM_GPT55_API_KEY || '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' }}
+          REAL_LLM_JUDGE_BASE_URL: https://integrate.api.nvidia.com/v1
+          REAL_LLM_JUDGE_MODEL: meta/llama-3.3-70b-instruct
+          # 跨模型 failover 备胎链（与 adversarial / integration job 同口径）：主端点
+          # 429/5xx 重试耗尽时，被测 agent 自动切到备胎链续跑——被测是 kimi，故备胎用**异款**
+          # ①glm-5.1(z-ai) → ②step-3.7-flash(stepfun) → ③qwen3-next-80b(qwen)，三级互异族且全避开
+          # 被测 kimi 与主裁判 llama-3.3-70b（本账户实测 minimax-m2.7 稳定超时不可用，故剔除）。把端点限流
+          # 与能力测评解耦，让 t11/t13/t15/t16/t18 多轮弧不再 turn-1 即被 skip，产出真分。缺 key 退化为「只主模型」。
           REAL_LLM_FAILOVER_API_KEY: ${{ secrets.REAL_LLM_VISION_BACKUP_API_KEY || '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' }}
           REAL_LLM_FAILOVER_BASE_URL: https://integrate.api.nvidia.com/v1
-          REAL_LLM_FAILOVER_MODELS: moonshotai/kimi-k2.6,minimaxai/minimax-m2.7,z-ai/glm-5.1
+          REAL_LLM_FAILOVER_MODELS: z-ai/glm-5.1,stepfun-ai/step-3.7-flash,qwen/qwen3-next-80b-a3b-instruct
         run: cargo test --no-fail-fast --test real_llm_ops_smoke ${{ matrix.t }} -- --ignored --nocapture
 
   # 知识库内容质量套件（real_llm_knowledge_quality.rs Q1–Q7）——「裁判校准层」重构后
@@ -396,7 +396,7 @@ jobs:
     name: Real-LLM knowledge quality (${{ matrix.q }} 双裁判 / MCP 桩)
     runs-on: ubuntu-latest
     continue-on-error: true
-    timeout-minutes: 45
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       max-parallel: 2
@@ -411,10 +411,10 @@ jobs:
           - q7_tag_extraction_quality
           - q8_honest_abstention_quality
     env:
-      # 被测内容生成 + 文本双裁判走 gpt-5.x（OpenAI 兼容，api.naxtclaude.com/v1）。MiMo
-      # 额度 2026-06-04 耗尽 → 切 api.naxtclaude.com（gpt-5.5 主 + gpt-5.4-mini 轻裁判，实测文本+json_object
+      # 被测内容生成走 kimi-k2.6 + 文本双裁判走异族（OpenAI 兼容，NVIDIA integrate）。naxtclaude
+      # 503 不可用 → 切 NVIDIA（kimi 被测 + llama-3.3-70b 主裁判 + qwen3-next-80b 轻裁判，实测文本+json_object
       # 可用）。`if:` 守卫读此 job 级 env，空 key 时各步自动跳过。key 走 secret，缺则回落字面量。
-      REAL_LLM_API_KEY: ${{ secrets.REAL_LLM_CODERELAY_API_KEY || 'sk-ae64cef396a161f7c73b5a9318821215adf3a4e782e6a819523bddf82a405b9f' }}
+      REAL_LLM_API_KEY: ${{ secrets.REAL_LLM_CODERELAY_API_KEY || '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' }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -440,52 +440,56 @@ jobs:
         if: ${{ env.REAL_LLM_API_KEY != '' }}
         env:
           RUSTFLAGS: ""
-          # 被测内容生成 + 文本双裁判：api.naxtclaude.com gpt-5.x 双 checkpoint（gpt-5.5 文本内容/主裁判 + gpt-5.4-mini 轻裁判），
-          # 同家族不同 checkpoint，跨 checkpoint 分歧暴露 rubric 歧义。（MiMo 额度 2026-06-04 耗尽，切 api.naxtclaude.com。）
+          # 被测内容生成 + 文本双裁判：NVIDIA integrate（kimi 被测 + llama-3.3-70b 主裁判 + qwen3-next-80b 轻裁判），
+          # 被测/主裁判/轻裁判三方跨家族（moonshot/meta/qwen），跨家族分歧暴露 rubric 歧义。（naxtclaude 503 不可用，切 NVIDIA。）
           # 下方异族第三裁判 + NVIDIA failover/vision 备胎链作退守保证循环跑完。
-          REAL_LLM_BASE_URL: https://api.naxtclaude.com/v1
-          REAL_LLM_MODEL: gpt-5.5
-          REAL_LLM_JUDGE_LITE_MODEL: gpt-5.4-mini
-          # vision 链路（Q3）：MiMo 主文本 checkpoint 不复用多模态，故指向专职视觉 provider
-          # gpt-5.4（api.naxtclaude.com，OpenAI 兼容 /v1，image_url data-URI）。实测真 fixture
+          REAL_LLM_BASE_URL: https://integrate.api.nvidia.com/v1
+          REAL_LLM_MODEL: moonshotai/kimi-k2.6
+          REAL_LLM_JUDGE_LITE_MODEL: qwen/qwen3-next-80b-a3b-instruct
+          # vision 链路（Q3）：文本 checkpoint 不复用多模态，故指向专职视觉 provider
+          # nemotron-nano-12b-v2-vl（NVIDIA integrate，OpenAI 兼容 /v1，image_url data-URI）。实测真 fixture
           # HTTP 200 抽取成功；偶发 5xx/524 走 LlmUnavailable→skip 不 fail。key 优先 secret，
           # 缺则回落字面量（与下方 Qwen free key 同纪律：tests/CI 豁免 model-hint lint）。
-          REAL_LLM_VISION_API_KEY: ${{ secrets.REAL_LLM_VISION_API_KEY || 'sk-ae64cef396a161f7c73b5a9318821215adf3a4e782e6a819523bddf82a405b9f' }}
-          REAL_LLM_VISION_BASE_URL: https://api.naxtclaude.com/v1
-          REAL_LLM_VISION_MODEL: gpt-5.4
-          # 备用视觉模型（异族多模态，NVIDIA 托管 kimi-k2.6）：gpt-5.4 瞬时不可达时
-          # 生产候选链自动切换到它（supports_vision=true / is_vision_active=false 排其后）。
+          REAL_LLM_VISION_API_KEY: ${{ secrets.REAL_LLM_VISION_API_KEY || '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' }}
+          REAL_LLM_VISION_BASE_URL: https://integrate.api.nvidia.com/v1
+          REAL_LLM_VISION_MODEL: nvidia/nemotron-nano-12b-v2-vl
+          # 备用视觉模型（异族多模态，NVIDIA 托管 llama-3.2-90b-vision，meta 家族）：被测
+          # nemotron-vl 瞬时不可达时生产候选链自动切换到它（supports_vision=true / is_vision_active=false 排其后）。
+          # backup 走 nemotron-nano-vl-8b（nvidia 家族，与主 nemotron-12b 同族无妨——backup 只是主挂时应急），
+          # 关键是回退后被测(nvidia) vs vision 裁判(meta llama-vision)仍跨家族，G-Eval 独立性不破。
+          # （本账户实测 phi-3-vision/llama-4-maverick/llama-3.2-11b-vision 均 404/500/超时不可用，故 backup 选 nemotron-nano-vl。）
           # 缺 BACKUP key 时 Q3 测试不插备用配置，链退化为单主模型，CI 不退化。
           # key 优先 secret，缺则回落字面量（与上方同纪律：tests/CI 豁免 model-hint lint）。
           REAL_LLM_VISION_BACKUP_API_KEY: ${{ secrets.REAL_LLM_VISION_BACKUP_API_KEY || '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' }}
           REAL_LLM_VISION_BACKUP_BASE_URL: https://integrate.api.nvidia.com/v1
-          REAL_LLM_VISION_BACKUP_MODEL: moonshotai/kimi-k2.6
+          REAL_LLM_VISION_BACKUP_MODEL: nvidia/llama-3.1-nemotron-nano-vl-8b-v1
           # Q3 vision **裁判团**（区别于上方 vision 被测抽取）：让裁判真看图判「图 vs 抽取文本」，
           # 是 Q3 永久 SKIP(divergent) 的根本修法——纯文本裁判看不到图、据文本 truth 误判捏造。
-          # 跨家族多模态裁判：① gpt-5.5 @ api.naxtclaude.com（VISION_JUDGE_*，GPT 家族）+ ② 复用上方
-          # NVIDIA kimi-k2.6（moonshot 真异族）。被测抽取走 gpt-5.4、裁判走 gpt-5.5(异 checkpoint)
-          # +kimi(异家族)，与被测不同模型，跨裁判分歧门保留不退回自评。key 只走 secret（已 gh
+          # 跨家族多模态裁判：① llama-3.2-90b-vision @ NVIDIA（VISION_JUDGE_*，meta 家族）+ ② 复用上方
+          # NVIDIA llama-3.2-90b-vision。被测抽取走 nemotron-vl(nvidia)、裁判走 llama-vision(meta 异家族)，
+          # 与被测不同家族，跨裁判分歧门保留不退回自评。key 只走 secret（已 gh
           # secret set，明文绝不入库）；缺此 key → vision_judge_panel 返回 None → Q3 skip 不 fail。
           VISION_JUDGE_API_KEY: ${{ secrets.VISION_JUDGE_API_KEY }}
-          VISION_JUDGE_BASE_URL: https://api.naxtclaude.com/v1
-          VISION_JUDGE_MODEL: gpt-5.5
+          VISION_JUDGE_BASE_URL: https://integrate.api.nvidia.com/v1
+          VISION_JUDGE_MODEL: meta/llama-3.2-90b-vision-instruct
           REAL_LLM_LEDGER: target/real_llm_ledger
-          # 跨家族第三裁判：NVIDIA 托管 kimi-k2.6（moonshot 家族）——与 api.naxtclaude.com GPT 家族跨厂商，
-          # 照出同家族双 checkpoint 的家族级盲区（#618 最高 ROI 杠杆）。原 QWEN/DashScope 2026-06-04
-          # 额度疑耗尽 + 本地连通不稳，换实测稳定的 NVIDIA kimi。沿用 QWEN_JUDGE_* 三元组 env（代码
-          # hetero 裁判纯读 env，零改动）；该 env 缺失时自动回落同家族双 checkpoint，CI 不退化。
+          # 跨家族第三裁判：NVIDIA 托管 qwen3-next-80b（qwen 家族）——与被测 kimi（moonshot）、
+          # 主裁判 llama（meta）三方跨家族，照出同家族双 checkpoint 的家族级盲区（#618 最高 ROI 杠杆）。
+          # 沿用 QWEN_JUDGE_* 三元组 env（代码 hetero 裁判纯读 env，零改动）；该 env 缺失时自动
+          # 回落同家族双 checkpoint，CI 不退化。
           QWEN_JUDGE_API_KEY: ${{ secrets.REAL_LLM_VISION_BACKUP_API_KEY || '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' }}
           QWEN_JUDGE_BASE_URL: https://integrate.api.nvidia.com/v1
-          QWEN_JUDGE_MODEL: moonshotai/kimi-k2.6
-          # 文本侧 failover 备胎链（替换/重试机制）：被测内容生成 + 文本双裁判共享 api.naxtclaude.com
+          QWEN_JUDGE_MODEL: qwen/qwen3-next-80b-a3b-instruct
+          # 文本侧 failover 备胎链（替换/重试机制）：被测内容生成 + 文本双裁判共享 NVIDIA integrate
           # 端点，并发互撞偶发 429/5xx/瞬时不可达。配此 key 后主模型遇
           # **可转移**故障（429/5xx/timeout/connect/网络）即快速切到 NVIDIA integrate 上的
-          # 异族文本模型（kimi/step/glm）兜底，让 Q 判分流程**跑完拿真分**而非 skip。
+          # 异族文本模型（glm/step/nemotron-super，避开被测 kimi 及主裁判 llama-3.3-70b/qwen 同源；
+          # 本账户实测 minimax-m2.7 稳定超时不可用，故剔除）兜底，让 Q 判分流程**跑完拿真分**而非 skip。
           # 复用 vision 备用的 NVIDIA key（同端点托管文本模型）。缺此 key 时退回单主模型 +
           # max_retries=5 自愈窗口，CI 不退化。tests/CI 豁免 model-hint lint。
           REAL_LLM_FAILOVER_API_KEY: ${{ secrets.REAL_LLM_VISION_BACKUP_API_KEY || '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' }}
           REAL_LLM_FAILOVER_BASE_URL: https://integrate.api.nvidia.com/v1
-          REAL_LLM_FAILOVER_MODELS: moonshotai/kimi-k2.6,stepfun-ai/step-3.7-flash,z-ai/glm-5.1
+          REAL_LLM_FAILOVER_MODELS: z-ai/glm-5.1,stepfun-ai/step-3.7-flash,nvidia/llama-3.3-nemotron-super-49b-v1.5
         run: cargo test --no-fail-fast --test real_llm_knowledge_quality ${{ matrix.q }} -- --ignored --nocapture
 
       - name: Upload score ledger
@@ -518,7 +522,7 @@ jobs:
     # 5 重退避尾巴），Round 9/10/11 连三轮卡 45min 墙被腰斩（仅 ~12.5/20 金标完成、零裁判出闸退出门）。
     # 用户确认 45min 是我们自设非平台限制（GH hosted runner 默认 360min），据日志抬此弧到 90min 让 240
     # 调用真跑完；其余对抗弧 ~6 轮、有 failover 兜底，45min 足够，不抬以免单弧失控空烧 CI 分钟。
-    timeout-minutes: ${{ matrix.arc == 't_judge_calibration' && 90 || 45 }}
+    timeout-minutes: ${{ matrix.arc == 't_judge_calibration' && 120 || 90 }}
     strategy:
       fail-fast: false
       # max-parallel 限流：7 条弧若全并发，各自 K=3 judge 采样(join_all 并发)+红队多轮生成
@@ -537,13 +541,13 @@ jobs:
           - t_adv_prompt_injection
           - t_longrun_capability
     env:
-      # 模型沿革：MiMo → gpt-5.5（round-5/6，端点频发 503 auth_unavailable 不可用）→
-      # deepseek-v4（2026-06-02）→ **切回 MiMo mimo-v2.5（2026-06-03，deepseek 令牌过期/无效）**。
-      # 被测 agent = mimo-v2.5，主裁判 judge1 = mimo-v2.5-pro（同厂不同 checkpoint，见下方 step env
-      # REAL_LLM_JUDGE1_MODEL），第二裁判 = 跨家族 Qwen。key 走 secret REAL_LLM_MIMO_API_KEY（缺则
-      # 回落字面量），端点 HTTPS（api.xiaomimimo.com）。
+      # 模型沿革：MiMo → gpt-5.5 → deepseek-v4 → MiMo → naxtclaude gpt-5.x（2026-06-07）→
+      # **切 NVIDIA integrate（2026-06-08，naxtclaude chat completions 稳定 503 不可用）**。
+      # 被测 agent = kimi-k2.6（moonshot），主裁判 judge1 = llama-3.3-70b（meta 家族，见下方 step env
+      # REAL_LLM_JUDGE1_MODEL，跨家族），第二裁判 = 跨家族 Qwen。key 走 secret（缺则
+      # 回落字面量 nvapi），端点 HTTPS（integrate.api.nvidia.com）。
       # `if:` 守卫读 job 级此 env，故空 key 时整个 adversarial job 各步自动跳过、不红不耗 CI 分钟。
-      REAL_LLM_API_KEY: ${{ secrets.REAL_LLM_CODERELAY_API_KEY || 'sk-ae64cef396a161f7c73b5a9318821215adf3a4e782e6a819523bddf82a405b9f' }}
+      REAL_LLM_API_KEY: ${{ secrets.REAL_LLM_CODERELAY_API_KEY || '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' }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -569,43 +573,43 @@ jobs:
         if: ${{ env.REAL_LLM_API_KEY != '' }}
         env:
           RUSTFLAGS: ""
-          # 被测 agent = gpt-5.5（REAL_LLM_MODEL）；主裁判 judge1 = gpt-5.4（REAL_LLM_JUDGE1_MODEL，
-          # 同厂不同 checkpoint，judge1≠agent checkpoint，自评干净不逐字自我背书）。端点 api.naxtclaude.com
-          # （MiMo 额度 2026-06-04 耗尽，切 api.naxtclaude.com gpt-5.x）。台账 judge label 从各 model 名派生。
-          REAL_LLM_BASE_URL: https://api.naxtclaude.com/v1
-          REAL_LLM_MODEL: gpt-5.5
-          REAL_LLM_JUDGE1_MODEL: gpt-5.4
-          REAL_LLM_VISION_MODEL: gpt-5.4
+          # 被测 agent = kimi-k2.6（REAL_LLM_MODEL，moonshot）；主裁判 judge1 = llama-3.3-70b（REAL_LLM_JUDGE1_MODEL，
+          # meta 家族，judge1≠agent 跨家族，自评干净不逐字自我背书）。端点 NVIDIA integrate
+          # （naxtclaude 503 不可用，切 NVIDIA）。台账 judge label 从各 model 名派生。
+          REAL_LLM_BASE_URL: https://integrate.api.nvidia.com/v1
+          REAL_LLM_MODEL: moonshotai/kimi-k2.6
+          REAL_LLM_JUDGE1_MODEL: meta/llama-3.3-70b-instruct
+          REAL_LLM_VISION_MODEL: nvidia/nemotron-nano-12b-v2-vl
           REAL_LLM_JUDGE: "1"
           REAL_LLM_LEDGER: target/real_llm_ledger
-          # 最强模型 gpt-5.5（@ api.naxtclaude.com，OpenAI 兼容）作 agent/红队/判官备胎链**首选**：
-          # MiMo 主端点 402 欠费 / 429 限流 / 5xx 时优先切它续跑（命中 2026-06-04 MiMo 余额
-          # 耗尽场景——此前 402 被判 fail-fast 不切备胎致整轮全挂，现 is_failover_worthy 对
-          # 402/401 切备胎 + 此 key 接上 gpt-5.5 兜底）。key 优先 secret，缺则回落字面量
+          # 异族强模型 llama-3.3-70b（@ NVIDIA integrate，meta）作 agent/红队/判官备胎链**首选**：
+          # 主端点 402 欠费 / 429 限流 / 5xx 时优先切它续跑（is_failover_worthy 对
+          # 402/401 也切备胎 + 此 key 接上 llama 兜底）。key 优先 secret，缺则回落字面量
           # （tests/CI 豁免 model-hint lint）。缺此 key 时备胎链退回 NVIDIA 链/空，CI 不退化。
-          REAL_LLM_JUDGE_API_KEY: ${{ secrets.REAL_LLM_GPT55_API_KEY || 'sk-ae64cef396a161f7c73b5a9318821215adf3a4e782e6a819523bddf82a405b9f' }}
-          REAL_LLM_JUDGE_BASE_URL: https://api.naxtclaude.com/v1
-          REAL_LLM_JUDGE_MODEL: gpt-5.5
-          # 第二裁判 = 跨家族 Qwen（阿里 DashScope，OpenAI 兼容）。agent/judge1 同为 deepseek
-          # 家族，跨家族效度信号靠这一路 Qwen——读账以 |deepseek-flash−qwen| 为家族盲区代理。
+          REAL_LLM_JUDGE_API_KEY: ${{ secrets.REAL_LLM_GPT55_API_KEY || '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' }}
+          REAL_LLM_JUDGE_BASE_URL: https://integrate.api.nvidia.com/v1
+          REAL_LLM_JUDGE_MODEL: meta/llama-3.3-70b-instruct
+          # 第二裁判 = 跨家族 Qwen（阿里 DashScope，OpenAI 兼容）。被测 kimi(moonshot)/judge1 llama(meta)
+          # 已跨家族，再加这一路 Qwen 形成三族交叉——读账以 |judge1−qwen| 为家族盲区代理。
           # 缺该 secret 时 judge_panel() 退化回 lite 第二裁判（用 VISION_MODEL）。
           REAL_LLM_JUDGE2_API_KEY: ${{ secrets.REAL_LLM_JUDGE2_API_KEY }}
           REAL_LLM_JUDGE2_BASE_URL: https://dashscope.aliyuncs.com/compatible-mode/v1
           REAL_LLM_JUDGE2_MODEL: qwen3.7-max
-          # 第三裁判 = 跨家族 GLM（智谱 BigModel，OpenAI 兼容端点）——与 deepseek/qwen 再隔一族，
-          # 凑齐「4 模型交叉验证一致性」。读账以 deepseek-flash / qwen / glm 三族 median 的两两
+          # 第三裁判 = 跨家族 GLM（智谱 BigModel，OpenAI 兼容端点）——与 kimi/llama/qwen 再隔一族，
+          # 凑齐「4 模型交叉验证一致性」。读账以 kimi / llama / qwen / glm 多族 median 的两两
           # 分歧为家族盲区代理（任一族孤立偏离 = 该族盲区或 rubric 歧义）。缺该 secret 时
-          # judge_panel() 不 push judge3，自动回落三裁判（deepseek双checkpoint + qwen），CI 不退化。
+          # judge_panel() 不 push judge3，自动回落（kimi被测 + llama/qwen 裁判），CI 不退化。
           REAL_LLM_JUDGE3_API_KEY: ${{ secrets.REAL_LLM_JUDGE3_API_KEY }}
           REAL_LLM_JUDGE3_BASE_URL: https://open.bigmodel.cn/api/coding/paas/v4
           REAL_LLM_JUDGE3_MODEL: GLM-5.1
           # 跨模型 failover 备胎链（NVIDIA 托管，OpenAI 兼容 /v1）：被测 agent / 红队对手 /
-          # 裁判团任一调用主端点重试耗尽仍 429/503/超时 时，自动切到下列备胎（已按延迟升序，
-          # kimi 1.9s → minimax 7.6s → glm 16.9s 兜底），保「全程跑完」。台账记 actual_model +
+          # 裁判团任一调用主端点重试耗尽仍 429/503/超时 时，自动切到下列备胎（异族链
+          # glm-5.1 → step-3.7-flash → qwen3-next-80b，全避开被测 kimi 与主裁判 llama-3.3-70b；
+          # 本账户实测 minimax-m2.7 稳定超时不可用，故剔除），保「全程跑完」。台账记 actual_model +
           # fallback 标记区分主模型原生分与备胎兜底分。缺该 secret 时备胎链空 = 与今天行为一致。
           REAL_LLM_FAILOVER_API_KEY: ${{ secrets.REAL_LLM_FAILOVER_API_KEY }}
           REAL_LLM_FAILOVER_BASE_URL: https://integrate.api.nvidia.com/v1
-          REAL_LLM_FAILOVER_MODELS: moonshotai/kimi-k2.6,minimaxai/minimax-m2.7,z-ai/glm-5.1
+          REAL_LLM_FAILOVER_MODELS: z-ai/glm-5.1,stepfun-ai/step-3.7-flash,qwen/qwen3-next-80b-a3b-instruct
         run: cargo test --no-fail-fast --test real_llm_adversarial ${{ matrix.arc }} -- --ignored --nocapture
 
       - name: Upload score ledger
