@@ -2251,21 +2251,23 @@ async fn apply_agent_updates(
         set_doc.insert("tags", to_bson_array(&merged));
     }
     if let Some(value) = non_empty_option(&decision.customer_stage) {
-        // 旧 customer_stage 字段已删除，统一写入 domain_attributes 容器。
-        let mut attrs = contact.domain_attributes.clone().unwrap_or_default();
-        attrs.insert("customer_stage", value);
-        set_doc.insert("domain_attributes", attrs);
+        // 旧 customer_stage 字段已删除，统一写入 domain_attributes 容器。用 dotted-key
+        // 字段级更新（不 clone 整个子文档再整体替换），避免与下方 intent_level /
+        // escalation 段互相覆盖，也避免 admin 写与 AI 写并发时整体替换丢 key。
+        // stage 变化时刷新 customer_stage_updated_at（planner stagnation 计时器依赖）。
+        let prev_stage = contact
+            .domain_attributes
+            .as_ref()
+            .and_then(|d| d.get_str("customer_stage").ok());
+        let stage_changed = prev_stage != Some(value.as_str());
+        set_doc.insert("domain_attributes.customer_stage", value);
+        if stage_changed {
+            set_doc.insert("domain_attributes.customer_stage_updated_at", DateTime::now());
+        }
         set_doc.insert("domain_attributes_updated_at", DateTime::now());
     }
     if let Some(value) = non_empty_option(&decision.intent_level) {
-        let mut attrs = set_doc
-            .get_document("domain_attributes")
-            .ok()
-            .cloned()
-            .or_else(|| contact.domain_attributes.clone())
-            .unwrap_or_default();
-        attrs.insert("intent_level", value);
-        set_doc.insert("domain_attributes", attrs);
+        set_doc.insert("domain_attributes.intent_level", value);
         set_doc.insert("domain_attributes_updated_at", DateTime::now());
     }
     // 请示触发：把"等待领导决策"标记写进客户 domain_attributes（admin 可观测）。
@@ -2277,14 +2279,10 @@ async fn apply_agent_updates(
         .map(|e| e.needed)
         .unwrap_or(false)
     {
-        let mut attrs = set_doc
-            .get_document("domain_attributes")
-            .ok()
-            .cloned()
-            .or_else(|| contact.domain_attributes.clone())
-            .unwrap_or_default();
-        attrs.insert(crate::models::AWAITING_PRINCIPAL_DECISION_ATTR, true);
-        set_doc.insert("domain_attributes", attrs);
+        set_doc.insert(
+            format!("domain_attributes.{}", crate::models::AWAITING_PRINCIPAL_DECISION_ATTR),
+            true,
+        );
         set_doc.insert("domain_attributes_updated_at", DateTime::now());
     }
     if let Some(value) = non_empty_option(&decision.last_commitment) {
