@@ -220,11 +220,17 @@ jobs:
   real-llm-recall:
     name: Real-LLM knowledge recall benchmark (${{ matrix.t }} / MCP 桩)
     runs-on: ubuntu-latest
+    # NVIDIA integrate 免费层 RPM 硬墙：5 个 real-LLM job-group 并行时瞬时 ~9 runner 同打
+    # 一把 key 必爆 429（实测 retry 6 次仍全 skip 假绿）。max-parallel 只在单 matrix 内限并发、
+    # 不能跨 group 协调，故用 needs 链把 5 个 group 串行化（smoke→recall→ops→quality→adversarial），
+    # 各 group 内 max-parallel:1 → 全局任意时刻仅 1 runner 打 NVIDIA，根治跨 group 429 风暴。
+    # continue-on-error:true 使 conclusion 恒 success，needs 链不会因前置假失败中断。
+    needs: real-llm
     continue-on-error: true
     timeout-minutes: 90
     strategy:
       fail-fast: false
-      max-parallel: 2
+      max-parallel: 1
       matrix:
         t:
           - recall_benchmark_smoke
@@ -297,11 +303,13 @@ jobs:
   real-llm-ops:
     name: Real-LLM ops smoke (${{ matrix.t }} / MCP 桩)
     runs-on: ubuntu-latest
+    # 串行链第 3 环（见 real-llm-recall 注释：跨 group 串行根治 NVIDIA 429）。
+    needs: real-llm-recall
     continue-on-error: true
     timeout-minutes: 90
     strategy:
       fail-fast: false
-      max-parallel: 2
+      max-parallel: 1
       matrix:
         t:
           - t4_real_follow_up_task_runs_and_expiry_blocks
@@ -395,11 +403,13 @@ jobs:
   real-llm-quality:
     name: Real-LLM knowledge quality (${{ matrix.q }} 双裁判 / MCP 桩)
     runs-on: ubuntu-latest
+    # 串行链第 4 环（见 real-llm-recall 注释：跨 group 串行根治 NVIDIA 429）。
+    needs: real-llm-ops
     continue-on-error: true
     timeout-minutes: 90
     strategy:
       fail-fast: false
-      max-parallel: 2
+      max-parallel: 1
       matrix:
         q:
           - q1_retrieval_price_objection_quality
@@ -516,6 +526,8 @@ jobs:
   real-llm-adversarial:
     name: Real-LLM adversarial (${{ matrix.arc }})
     runs-on: ubuntu-latest
+    # 串行链末环（见 real-llm-recall 注释：跨 group 串行根治 NVIDIA 429）。
+    needs: real-llm-quality
     continue-on-error: true
     # 每弧独享墙。t_judge_calibration 是仪器最重的一片——20 金标 × 4 裁判 × K=3 = 240 次真模型调用，
     # Round 9 硬日志实测 ~208s/金标 × 20 ≈ 70min（GLM 单调 ~17s × K=3 同端点串行 + 偶发 json_decode
@@ -525,11 +537,11 @@ jobs:
     timeout-minutes: ${{ matrix.arc == 't_judge_calibration' && 120 || 90 }}
     strategy:
       fail-fast: false
-      # max-parallel 限流：7 条弧若全并发，各自 K=3 judge 采样(join_all 并发)+红队多轮生成
-      # 同时打 MiMo 端点（api.xiaomimimo.com），瞬时并发 20-35 请求易触发上游 5xx/限流。
-      # 限并发到 2 把瞬时请求压到 ~10 以内。限并发对端点抗抖动有益。队列中的 matrix job 不启动
-      # timeout 计时，故每弧仍独享各自完整墙（calibration 90min / 其余 45min），限流只推迟开始不吃墙。
-      max-parallel: 2
+      # max-parallel:1 + needs 串行链：本 group 是 5 个 real-LLM group 串行的末环，各弧 K=3 judge
+      # 采样(join_all 并发)+红队多轮生成同打一把 NVIDIA integrate key，跨 group 并发会爆 429
+      # （实测 retry 6 仍全 skip）。串行 + 组内 1 把全局并发压到 1 runner。队列中的 matrix job 不启动
+      # timeout 计时，故每弧仍独享各自完整墙（calibration 120min / 其余 90min），限流只推迟开始不吃墙。
+      max-parallel: 1
       matrix:
         arc:
           - t_judge_calibration
