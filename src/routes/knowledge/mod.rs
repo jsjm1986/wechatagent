@@ -257,6 +257,15 @@ pub(super) fn operation_knowledge_chunk_json(item: OperationKnowledgeChunk) -> V
         .into_iter()
         .map(|d| mongodb::bson::Bson::Document(d).into_relaxed_extjson())
         .collect();
+    // feedback worker 周期回写的 30d 用量统计 → 手工映射成前端 ChunkUsageStats
+    // 形状（hitCount30d / blockedCount30d）。None（worker 尚未跑过）时下发 null，
+    // 前端 ReviewChat 的 hasUsage 判定为 false。
+    let usage_stats_json = item.usage_stats.as_ref().map(|u| {
+        json!({
+            "hitCount30d": u.hit_count_30d,
+            "blockedCount30d": u.blocked_count_30d,
+        })
+    });
     json!({
         "id": item.id.map(|id| id.to_hex()).unwrap_or_default(),
         "workspaceId": item.workspace_id,
@@ -279,6 +288,11 @@ pub(super) fn operation_knowledge_chunk_json(item: OperationKnowledgeChunk) -> V
         "priority": item.priority,
         "wikiType": item.wiki_type,
         "chunkType": item.chunk_type,
+        "dynamicConfidence": item.dynamic_confidence,
+        "usageStats": usage_stats_json,
+        "lockedFields": item.locked_fields,
+        "validFrom": item.valid_from.and_then(crate::models::dt_to_string),
+        "validTo": item.valid_to.and_then(crate::models::dt_to_string),
         "relatedChunks": item.related_chunks,
         "businessTopics": item.business_topics,
         "supersededBy": item.superseded_by,
