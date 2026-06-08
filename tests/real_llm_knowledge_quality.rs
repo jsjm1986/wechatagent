@@ -192,13 +192,12 @@ fn failover_key_present() -> bool {
         .is_some()
 }
 
-/// 主模型重试次数：有备胎时取 1（快速失败切备胎，省重试税控 job 墙），无备胎时取 5。
+/// 主模型重试次数：统一 **6 次指数退避**（base 2500ms：≈2.5+5+10+20+40+80s，且尊重 Retry-After
+/// 头取 max）熬过 NVIDIA 限流窗。**不再因"有备胎"就 fail-fast 早切**——备胎现已同源 NVIDIA
+/// integrate 同 key（[[reference_llm_backup_gpt55]]），切了照样撞同一 429，早切反让全链秒耗尽 →
+/// 测试全 skip 假绿。timeout 墙已 45→90min 给足，宁可主模型多等也要拿真分。
 fn primary_max_retries() -> u32 {
-    if failover_key_present() {
-        1
-    } else {
-        5
-    }
+    6
 }
 
 /// 构建异端点备胎链（默认 NVIDIA integrate 端点）。缺 key → 空 vec（退化 primary-only）。

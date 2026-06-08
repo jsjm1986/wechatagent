@@ -47,7 +47,8 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 
 /// 从 env 构造真实文本 provider。缺 `REAL_LLM_API_KEY` → None（调用方自我跳过）。
 ///
-/// timeout=180s / retries=3 / retry_base=1500ms 给足超时。
+/// timeout=180s / retries=6 / retry_base=2500ms（指数退避≈2.5+5+10+20+40+80s + 尊重 Retry-After
+/// 头取 max），熬过 NVIDIA integrate 限流窗（429 风暴下少重试即 skip 假绿，[[reference_llm_backup_gpt55]]）。
 /// `REAL_LLM_BASE_URL` / `REAL_LLM_MODEL` 有合理默认值。
 ///
 /// provider 沿革（2026-06-03）：MiMo 配额耗尽 + 端点下线 → 文本默认切
@@ -58,7 +59,7 @@ fn real_llm_from_env() -> Option<Arc<LlmClient>> {
         .unwrap_or_else(|_| "https://api.supxh.xin/v1".to_string());
     let model =
         std::env::var("REAL_LLM_MODEL").unwrap_or_else(|_| "deepseek-v4-pro".to_string());
-    let client = LlmClient::new(base_url, api_key, model, 180, 3, 1500)
+    let client = LlmClient::new(base_url, api_key, model, 180, 6, 2500)
         .expect("构造真实 LlmClient");
     Some(Arc::new(client))
 }
@@ -502,8 +503,8 @@ async fn t3_real_vision_extraction_keeps_needs_review() {
         model: real_vision_model(),
         is_active: false,
         timeout_seconds: Some(180),
-        max_retries: Some(3),
-        retry_base_ms: Some(1500),
+        max_retries: Some(6),
+        retry_base_ms: Some(2500),
         supports_vision: true,
         is_vision_active: true,
         created_at: DateTime::now(),
