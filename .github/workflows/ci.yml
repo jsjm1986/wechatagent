@@ -3,8 +3,21 @@ name: CI
 on:
   pull_request:
     branches: [main]
+    # 纯前端/文档改动不触发后端 CI(baseline + integration + 5 个 real-llm 真模型 job)——
+    # CI 全是 Rust 后端测试,前端改动不影响其结果,跑它们纯浪费时间且烧真模型 API 配额。
+    # 黑名单语义:本次 diff 的文件全落在下列模式内才跳过;只要碰了任何后端代码
+    # (src/tests/Cargo/scripts/ci.yml 等不在表内)就照常全跑——宁可多跑,不漏跑。
+    # 前端有独立的本地 vitest 三连(tsc+build+test)兜底,不依赖此 CI。
+    paths-ignore:
+      - 'frontend/**'
+      - 'docs/**'
+      - '**/*.md'
   push:
     branches: [main]
+    paths-ignore:
+      - 'frontend/**'
+      - 'docs/**'
+      - '**/*.md'
 
 env:
   CARGO_TERM_COLOR: always
