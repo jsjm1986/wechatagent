@@ -170,23 +170,13 @@ fn strongest_key_present() -> bool {
         .is_some()
 }
 
-/// 是否存在**任一**健康备胎（llama-3.3-70b 首选 或 NVIDIA 链）——决定主模型该 fail-fast 还是熬满重试窗。
-fn any_backup_present() -> bool {
-    strongest_key_present() || failover_key_present()
-}
-
-/// 主模型重试预算（Round 10）：**有任一健康备胎时主模型 fail-fast**——只 1 次退避（≈2.5s）
-/// 就切备胎，而非熬满 5 次（≈37s）。根因：Round 9 实测 calibration 弧在 deepseek 端点 429
-/// 风暴下，failover 虽每采样都生效兜底，但**每次都要先干等 ~37s 主模型重试耗尽才切**，144
-/// 次调用累积把正常 ~7min 的弧吹爆撞 45min job 墙被 cancel。备胎健康可用时，主模型没必要
-/// 久等——快速切换才真正「全程跑完」。**缺一切备胎（无任何 key）时维持 5（≈37s 恢复窗熬过
-/// 端点抖动），与 Round 9 前行为完全一致（无回归）**。
+/// 主模型重试预算：统一 **6 次指数退避**（base 2500ms：≈2.5+5+10+20+40+80s，且尊重 Retry-After
+/// 头取 max）熬过 NVIDIA 限流窗。**历史**（Round 9，deepseek 端点）曾因「有备胎则 fail-fast 1 次
+/// 早切」——那时备胎是**异端点**，早切真能避让 429 风暴、避免 144 次调用累积撞 45min 墙。**现在
+/// 失效**：备胎已同源 NVIDIA integrate 同 key（[[reference_llm_backup_gpt55]]），切了照样撞同一
+/// 429，早切反让全链秒耗尽 → 测试全 skip 假绿。timeout 墙已 45→90min 给足，宁可主模型多等拿真分。
 fn primary_max_retries() -> u32 {
-    if any_backup_present() {
-        1
-    } else {
-        5
-    }
+    6
 }
 
 /// 构造最强模型 client（llama-3.3-70b @ NVIDIA integrate，OpenAI 兼容）。缺 `REAL_LLM_JUDGE_API_KEY` →

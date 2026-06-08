@@ -77,7 +77,7 @@ fn real_llm_from_env() -> Option<Arc<LlmClient>> {
         .unwrap_or_else(|_| "https://api.supxh.xin/v1".to_string());
     let model = std::env::var("REAL_LLM_MODEL").unwrap_or_else(|_| "deepseek-v4-pro".to_string());
     let client =
-        LlmClient::new(base_url, api_key, model, 180, 3, 1500).expect("构造真实 LlmClient");
+        LlmClient::new(base_url, api_key, model, 180, 6, 2500).expect("构造真实 LlmClient");
     Some(Arc::new(client))
 }
 
@@ -762,8 +762,8 @@ async fn k6_real_vision_article_extraction_keeps_needs_review() {
         model: vision_model,
         is_active: false,
         timeout_seconds: Some(180),
-        max_retries: Some(3),
-        retry_base_ms: Some(1500),
+        max_retries: Some(6),
+        retry_base_ms: Some(2500),
         supports_vision: true,
         is_vision_active: true,
         created_at: DateTime::now(),

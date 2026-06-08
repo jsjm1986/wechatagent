@@ -156,28 +156,12 @@ fn failover_key_present() -> bool {
         .is_some()
 }
 
-/// 最强模型（llama-3.3-70b @ NVIDIA integrate）key 是否已配——它既当独立裁判，也当 agent 备胎链首选。
-fn strongest_key_present() -> bool {
-    std::env::var("REAL_LLM_JUDGE_API_KEY")
-        .ok()
-        .filter(|k| !k.trim().is_empty())
-        .is_some()
-}
-
-/// 是否存在**任一**健康备胎（llama-3.3-70b 首选 或 NVIDIA 链）——决定主模型该 fail-fast 还是熬满重试窗。
-fn any_backup_present() -> bool {
-    strongest_key_present() || failover_key_present()
-}
-
-/// 主模型重试预算：**有任一健康备胎时主模型 fail-fast**——只 1 次退避（≈2.5s）就切备胎，
-/// 而非熬满 5 次（≈37s），避免 429 风暴下重试税累积撞 45min job 墙。
-/// **缺一切备胎（无任何 key）时维持 5（≈37s 恢复窗熬过端点抖动），与 failover 前行为一致（无回归）**。
+/// 主模型重试预算：统一 **6 次指数退避**（base 2500ms：≈2.5+5+10+20+40+80s，且尊重 Retry-After
+/// 头取 max）熬过 NVIDIA 限流窗。**不再因"有备胎"就 fail-fast 早切**——备胎现已同源 NVIDIA
+/// integrate 同 key（[[reference_llm_backup_gpt55]]），切了照样撞同一 429，早切反而让全链秒耗尽 →
+/// 测试全 skip 假绿。timeout 墙已 45→90min 给足，宁可主模型多等也要拿真分。
 fn primary_max_retries() -> u32 {
-    if any_backup_present() {
-        1
-    } else {
-        5
-    }
+    6
 }
 
 /// 构造最强模型 client（llama-3.3-70b @ NVIDIA integrate，OpenAI 兼容）。缺 `REAL_LLM_JUDGE_API_KEY`
