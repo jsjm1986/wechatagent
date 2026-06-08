@@ -451,7 +451,17 @@ pub async fn chat_apply(
             let chunk_id = target_chunk_id.clone().ok_or_else(|| {
                 AppError::BadRequest("update_chunk 需要 attachments.chunkId".to_string())
             })?;
-            apply_update_chunk(&state, &admin.current_workspace, &account_id, &chunk_id, patch).await?
+            // 与 create_chunk 分支对称：拼接本会话所有 user-role turn 正文作为
+            // operator_statement，供 apply_update_chunk 在 patch 改了 sourceQuote 时重新
+            // 锚定 source_anchors——避免"新 quote + 旧 anchor 失配"绕过 D2 verify 闸。
+            let operator_statement = history
+                .iter()
+                .filter(|t| t.role == "user")
+                .map(|t| t.content.trim())
+                .filter(|c| !c.is_empty())
+                .collect::<Vec<_>>()
+                .join("\n");
+            apply_update_chunk(&state, &admin.current_workspace, &account_id, &chunk_id, patch, &operator_statement).await?
         }
         "update_pack" => {
             let pack_id = target_pack_id.clone().ok_or_else(|| {
@@ -1652,6 +1662,49 @@ action 必须在 [fix_chunk, add_chunk, retag, review_evolution, analyze_logs, d
     .await
 }
 
+/// create / update 两条对话补库路径共用的「运营陈述 → sourceQuote → source_anchors」
+/// 锚定规则（D2 红线核心：quote 与 anchor 必须成对，绝不出现 quote 改了 anchor 没跟上
+/// 的失配）。抽成纯函数以消除两处重复实现的 drift 风险，并可在本地 lib 单测里锁死不变量
+/// （`apply_*_chunk` 本身是 async+db，只有 CI 集成测试能跑）。
+///
+/// - `statement`：运营在会话里的口头陈述（溯源原文）。调用方传入前无需 trim。
+/// - `patch_quote`：LLM patch 给出的候选 sourceQuote（create 来自 payload，update 来自
+///   update_doc）。
+///
+/// 返回 `quote`：`Some` 表示应把 chunk 的 sourceQuote 改写为该值；`None` 表示**不改动**
+/// 现有 quote（仅当 statement 为空——无出处可溯源时）。返回 `anchors`：对最终 quote 的
+/// 锚定结果（锚不上则空，让 D2 verify 闸合法拒绝，绝不放水）。
+struct QuoteAnchorResolution {
+    quote: Option<String>,
+    anchors: Vec<Document>,
+}
+
+fn resolve_quote_anchors(statement: &str, patch_quote: Option<&str>) -> QuoteAnchorResolution {
+    let statement = statement.trim();
+    if statement.is_empty() {
+        // 没有运营陈述可溯源：维持原 quote 不动、清空 anchors，verify 仍按 D2 合法拒绝。
+        return QuoteAnchorResolution {
+            quote: None,
+            anchors: vec![],
+        };
+    }
+    // 优先采用 patch 给出的 sourceQuote（若能在运营陈述中锚定），否则回退用运营陈述全文
+    // 作为 quote。这样 D2 verify 闸（sourceQuote + source_anchors 双非空）才能"凭真实出处"
+    // 合法通过——是补齐溯源，而非削弱闸门。
+    let quote = patch_quote
+        .map(str::trim)
+        .filter(|q| !q.is_empty() && source_anchor_for_quote(statement, None, q).is_some())
+        .map(|q| q.to_string())
+        .unwrap_or_else(|| statement.to_string());
+    let anchors = source_anchor_for_quote(statement, None, &quote)
+        .map(|d| vec![d])
+        .unwrap_or_default();
+    QuoteAnchorResolution {
+        quote: Some(quote),
+        anchors,
+    }
+}
+
 async fn apply_create_chunk(
     state: &AppState,
     workspace_id: &str,
@@ -1667,25 +1720,11 @@ async fn apply_create_chunk(
     payload.status = "draft".to_string();
     payload.integrity_status = Some("needs_review".to_string());
 
-    // chat 新建的知识没有父文档，溯源 = 运营在会话里的口头陈述本身。优先采用 LLM
-    // patch 给出的 sourceQuote（若能在运营陈述中锚定），否则回退用运营陈述全文作为
-    // quote。这样 D2 verify 闸（sourceQuote + source_anchors 双非空）才能"凭真实出处"
-    // 合法通过——是补齐溯源，而非削弱闸门。
-    let statement = operator_statement.trim();
-    if statement.is_empty() {
-        // 没有运营陈述可溯源时维持旧行为：verify 仍会按 D2 合法拒绝，绝不放水。
-        payload.source_anchors = vec![];
-    } else {
-        let quote = payload
-            .source_quote
-            .as_deref()
-            .map(str::trim)
-            .filter(|q| !q.is_empty() && source_anchor_for_quote(statement, None, q).is_some())
-            .map(|q| q.to_string())
-            .unwrap_or_else(|| statement.to_string());
-        payload.source_anchors = source_anchor_for_quote(statement, None, &quote)
-            .map(|d| vec![d])
-            .unwrap_or_default();
+    // chat 新建的知识没有父文档，溯源 = 运营在会话里的口头陈述本身。锚定规则与
+    // apply_update_chunk 共用 resolve_quote_anchors（见其文档）。
+    let resolution = resolve_quote_anchors(operator_statement, payload.source_quote.as_deref());
+    payload.source_anchors = resolution.anchors;
+    if let Some(quote) = resolution.quote {
         payload.source_quote = Some(quote);
     }
 
@@ -1715,6 +1754,7 @@ async fn apply_update_chunk(
     _account_id: &str,
     chunk_id: &str,
     patch: &Document,
+    operator_statement: &str,
 ) -> AppResult<Value> {
     let oid = parse_object_id(chunk_id)?;
     let mut update_doc = Document::new();
@@ -1757,6 +1797,22 @@ async fn apply_update_chunk(
             "note": "patch 没有可识别字段，未改动",
         }));
     }
+    // 运营经 patch 实际改动的字段数（在追加派生 anchors / 元字段之前定格）。
+    let fields_touched = update_doc.len();
+
+    // 若本次 patch 改了 sourceQuote，必须同步重算 source_anchors（与 apply_create_chunk
+    // 共用 resolve_quote_anchors）：新 quote 配新 anchor，杜绝"新 quote + 旧 anchor"失配后
+    // 仍被 D2 verify 闸（仅校验 anchors 非空）放行的隐患。锚不上就写空 anchors，让
+    // D2 合法拒绝 re-verify——这是补齐溯源，绝不削弱闸门。
+    if update_doc.contains_key("source_quote") {
+        let patch_quote = update_doc.get_str("source_quote").ok();
+        let resolution = resolve_quote_anchors(operator_statement, patch_quote);
+        update_doc.insert("source_anchors", resolution.anchors);
+        if let Some(quote) = resolution.quote {
+            update_doc.insert("source_quote", quote);
+        }
+    }
+
     update_doc.insert("integrity_status", "needs_review");
     update_doc.insert("status", "draft");
     update_doc.insert("updated_at", DateTime::now());
@@ -1774,7 +1830,7 @@ async fn apply_update_chunk(
         .await?;
     Ok(json!({
         "updatedChunkId": chunk_id,
-        "fieldsTouched": update_doc.len() - 3,
+        "fieldsTouched": fields_touched,
         "status": "draft",
         "integrityStatus": "needs_review",
     }))
@@ -2132,4 +2188,95 @@ pub(in crate::routes) async fn chat_session_stream(
         Some((Ok::<_, std::convert::Infallible>(event), (rx, false)))
     });
     Sse::new(stream).keep_alive(KeepAlive::default())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // resolve_quote_anchors 是 create / update 两条对话补库路径共用的 D2 锚定规则。
+    // 这些单测把"quote 与 anchor 必须成对"的不变量钉死在本地 lib 层——`apply_*_chunk`
+    // 本身是 async+db、只有 CI 集成测试能跑，纯函数抽出后这条红线终于有了本地安全网。
+
+    #[test]
+    fn resolve_blank_statement_keeps_quote_untouched_and_clears_anchors() {
+        // 无运营陈述可溯源：不改现有 quote（quote=None），anchors 清空，让 D2 verify
+        // 闸按"缺 anchor"合法拒绝——绝不放水。
+        let r = resolve_quote_anchors("   ", Some("某个候选引文"));
+        assert!(r.quote.is_none(), "statement 空时不应改写 quote");
+        assert!(r.anchors.is_empty(), "statement 空时 anchors 必须为空");
+    }
+
+    #[test]
+    fn resolve_uses_patch_quote_when_it_anchors_in_statement() {
+        // patch 给的 quote 是运营陈述的子串 → 采用它，且 anchor 与该 quote 成对。
+        let statement = "客户问能不能退款\n我们承诺七天无理由退款\n超过七天不退";
+        let r = resolve_quote_anchors(statement, Some("七天无理由退款"));
+        assert_eq!(r.quote.as_deref(), Some("七天无理由退款"));
+        assert_eq!(r.anchors.len(), 1, "锚定成功必有 1 个 anchor");
+        assert_eq!(
+            r.anchors[0].get_str("sourceQuote").unwrap(),
+            "七天无理由退款",
+            "anchor 的 sourceQuote 必须等于返回的 quote（成对，不失配）"
+        );
+    }
+
+    #[test]
+    fn resolve_falls_back_to_full_statement_when_patch_quote_not_in_statement() {
+        // patch 给的 quote 不在运营陈述里（锚不上）→ 回退用陈述全文作 quote，并对全文锚定。
+        let statement = "我们承诺七天无理由退款";
+        let r = resolve_quote_anchors(statement, Some("三十天无理由退款"));
+        assert_eq!(
+            r.quote.as_deref(),
+            Some(statement),
+            "patch_quote 锚不上时回退 statement 全文"
+        );
+        assert_eq!(r.anchors.len(), 1);
+        assert_eq!(r.anchors[0].get_str("sourceQuote").unwrap(), statement);
+    }
+
+    #[test]
+    fn resolve_falls_back_to_full_statement_when_no_patch_quote() {
+        // patch 没给 quote → 直接用陈述全文。
+        let statement = "我们承诺七天无理由退款";
+        let r = resolve_quote_anchors(statement, None);
+        assert_eq!(r.quote.as_deref(), Some(statement));
+        assert_eq!(r.anchors.len(), 1);
+        assert_eq!(r.anchors[0].get_str("sourceQuote").unwrap(), statement);
+    }
+
+    #[test]
+    fn resolve_blank_patch_quote_falls_back_to_full_statement() {
+        // patch 给了空白 quote → 视同没给，回退陈述全文。
+        let statement = "我们承诺七天无理由退款";
+        let r = resolve_quote_anchors(statement, Some("   "));
+        assert_eq!(r.quote.as_deref(), Some(statement));
+        assert_eq!(r.anchors.len(), 1);
+    }
+
+    #[test]
+    fn resolve_d2_invariant_quote_and_anchor_always_paired() {
+        // D2 核心不变量：只要返回了 quote（Some），就必有非空 anchors，且 anchor 的
+        // sourceQuote 与返回 quote 严格一致。这正是 apply_update_chunk 当初漏写
+        // source_anchors 重算所违反的不变量——本测试是它的回归网。
+        let cases = [
+            ("我们承诺七天无理由退款", Some("七天无理由退款")),
+            ("我们承诺七天无理由退款", Some("不存在的引文")),
+            ("我们承诺七天无理由退款", None),
+        ];
+        for (statement, patch_quote) in cases {
+            let r = resolve_quote_anchors(statement, patch_quote);
+            let quote = r.quote.expect("statement 非空必返回 quote");
+            assert_eq!(
+                r.anchors.len(),
+                1,
+                "返回 quote 时 anchors 必非空（statement={statement:?} patch={patch_quote:?}）"
+            );
+            assert_eq!(
+                r.anchors[0].get_str("sourceQuote").unwrap(),
+                quote,
+                "anchor.sourceQuote 必须与返回 quote 成对一致"
+            );
+        }
+    }
 }
