@@ -129,7 +129,7 @@ jobs:
     # → 文本切回 MiMo mimo-v2.5（用户指定 api.xiaomimimo.com，key 走 secret
     # REAL_LLM_MIMO_API_KEY，缺则回落字面量），与 ops/adversarial/quality 套件同源。
     env:
-      REAL_LLM_API_KEY: ${{ secrets.REAL_LLM_CODERELAY_API_KEY || 'sk-rQwLl3JkGnexGZmkyesH0LdBKH86PQMBSj5Z8MDHgdwxLzuE' }}
+      REAL_LLM_API_KEY: ${{ secrets.REAL_LLM_CODERELAY_API_KEY || 'sk-ae64cef396a161f7c73b5a9318821215adf3a4e782e6a819523bddf82a405b9f' }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -161,15 +161,15 @@ jobs:
         if: ${{ env.REAL_LLM_API_KEY != '' }}
         env:
           RUSTFLAGS: ""
-          # 文本主链路（T1/T2）走 coderelay gpt-5.5（coderelay.cn/v1，OpenAI 兼容；MiMo 额度 2026-06-04 耗尽切此）。
-          REAL_LLM_BASE_URL: https://coderelay.cn/v1
+          # 文本主链路（T1/T2）走 gpt-5.5（api.naxtclaude.com/v1，OpenAI 兼容；MiMo 额度 2026-06-04 耗尽切此）。
+          REAL_LLM_BASE_URL: https://api.naxtclaude.com/v1
           REAL_LLM_MODEL: gpt-5.5
           # vision（T3）：MiMo 主文本 checkpoint 不复用多模态，故指向专职视觉 provider
-          # gpt-5.4（gpt.api456.me，OpenAI 兼容 /v1）。key 优先 secret，缺则回落字面量
+          # gpt-5.4（api.naxtclaude.com，OpenAI 兼容 /v1）。key 优先 secret，缺则回落字面量
           # （与 quality 套件同纪律：tests/CI 豁免 model-hint lint）。偶发 5xx/524 走
           # LlmUnavailable→skip 不 fail。
-          REAL_LLM_VISION_API_KEY: ${{ secrets.REAL_LLM_VISION_API_KEY || 'sk-4iVIgfidl3eewYS26qRTrKDbqHY1QKsGs3aqL2YzVE4UrhxD' }}
-          REAL_LLM_VISION_BASE_URL: https://gpt.api456.me/v1
+          REAL_LLM_VISION_API_KEY: ${{ secrets.REAL_LLM_VISION_API_KEY || 'sk-ae64cef396a161f7c73b5a9318821215adf3a4e782e6a819523bddf82a405b9f' }}
+          REAL_LLM_VISION_BASE_URL: https://api.naxtclaude.com/v1
           REAL_LLM_VISION_MODEL: gpt-5.4
         run: cargo test --no-fail-fast --test real_llm_smoke -- --ignored --nocapture
 
@@ -185,14 +185,14 @@ jobs:
         if: ${{ !cancelled() && env.REAL_LLM_API_KEY != '' }}
         env:
           RUSTFLAGS: ""
-          # 文本知识链路（K1–K5/K7–K11）走 coderelay gpt-5.5（coderelay.cn/v1；MiMo 额度 2026-06-04 耗尽切此）。
-          REAL_LLM_BASE_URL: https://coderelay.cn/v1
+          # 文本知识链路（K1–K5/K7–K11）走 gpt-5.5（api.naxtclaude.com/v1；MiMo 额度 2026-06-04 耗尽切此）。
+          REAL_LLM_BASE_URL: https://api.naxtclaude.com/v1
           REAL_LLM_MODEL: gpt-5.5
           # vision（K6）：MiMo 主文本 checkpoint 不复用多模态，故指向专职视觉 provider
-          # gpt-5.4（gpt.api456.me）。key 优先 secret，缺则回落字面量（与 quality 套件
+          # gpt-5.4（api.naxtclaude.com）。key 优先 secret，缺则回落字面量（与 quality 套件
           # 同纪律：tests/CI 豁免 model-hint lint）。偶发 5xx/524 走 LlmUnavailable→skip。
-          REAL_LLM_VISION_API_KEY: ${{ secrets.REAL_LLM_VISION_API_KEY || 'sk-4iVIgfidl3eewYS26qRTrKDbqHY1QKsGs3aqL2YzVE4UrhxD' }}
-          REAL_LLM_VISION_BASE_URL: https://gpt.api456.me/v1
+          REAL_LLM_VISION_API_KEY: ${{ secrets.REAL_LLM_VISION_API_KEY || 'sk-ae64cef396a161f7c73b5a9318821215adf3a4e782e6a819523bddf82a405b9f' }}
+          REAL_LLM_VISION_BASE_URL: https://api.naxtclaude.com/v1
           REAL_LLM_VISION_MODEL: gpt-5.4
         run: cargo test --no-fail-fast --test real_llm_knowledge -- --ignored --nocapture
 
@@ -206,7 +206,7 @@ jobs:
   # 跨行业大语料矩阵（零售/SaaS/金融/教育/医疗/制造 6 行业 × 多文档类型）做通用性测试。
   # 第一轮只观测 baseline，唯一硬红线 = 召回集⊆seed（出现 seed 外 id 即真 bug，立即 fail）。
   # 与 quality matrix 解耦——独立 job，不抢 Q1-Q8 收敛判据。MCP 永远是桩（绝不真发微信）。
-  # 文本主链走 coderelay gpt-5.5；real-LLM 抖动 continue-on-error 不阻塞合并。
+  # 文本主链走 api.naxtclaude.com gpt-5.5；real-LLM 抖动 continue-on-error 不阻塞合并。
   #
   # 按测试拆 matrix 并行（仿 real-llm-ops / real-llm-quality）：三个测试各享独立 runner +
   # 独立 45min 墙，互不阻塞（fail-fast:false），各自只 `cargo test <name>` 跑自己那片，抗墙腰斩。
@@ -215,7 +215,7 @@ jobs:
   # - recall_benchmark_maintenance_stability：③真实 chat 改库全链路（新增/改写/废弃）后召回保持。
   # - recall_benchmark_gap_closed_loop_trajectory：北极星全闭环单测——召回 gap → agent 主动
   #   提问 → 运营对话补库（chat 新建切片，溯源=运营陈述）→ verify 通过 → 同 query 再召回命中。
-  # max-parallel:2 限流——与 ops/quality/adversarial 共用同一把 coderelay key，限并发防瞬时 429；
+  # max-parallel:2 限流——与 ops/quality/adversarial 共用同一把 api.naxtclaude.com key，限并发防瞬时 429；
   # 队列中的 matrix job 不启动 timeout 计时，故每测试仍独享完整 45min 墙，限流只推迟开始不吃墙。
   real-llm-recall:
     name: Real-LLM knowledge recall benchmark (${{ matrix.t }} / MCP 桩)
@@ -232,7 +232,7 @@ jobs:
           - recall_benchmark_maintenance_stability
           - recall_benchmark_gap_closed_loop_trajectory
     env:
-      REAL_LLM_API_KEY: ${{ secrets.REAL_LLM_CODERELAY_API_KEY || 'sk-rQwLl3JkGnexGZmkyesH0LdBKH86PQMBSj5Z8MDHgdwxLzuE' }}
+      REAL_LLM_API_KEY: ${{ secrets.REAL_LLM_CODERELAY_API_KEY || 'sk-ae64cef396a161f7c73b5a9318821215adf3a4e782e6a819523bddf82a405b9f' }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -254,8 +254,8 @@ jobs:
         if: ${{ env.REAL_LLM_API_KEY != '' }}
         uses: Swatinem/rust-cache@v2
 
-      # 召回率基准：默认 #[ignore]，靠 --ignored 触发。文本主链 coderelay gpt-5.5
-      # （coderelay.cn/v1，OpenAI 兼容）。RECALL_STABILITY_RUNS 控制每条 query 跑几次量化
+      # 召回率基准：默认 #[ignore]，靠 --ignored 触发。文本主链 gpt-5.5
+      # （api.naxtclaude.com/v1，OpenAI 兼容）。RECALL_STABILITY_RUNS 控制每条 query 跑几次量化
       # 跨轮稳定性（首版 N=3 抗墙，spec 定稿 5；矩阵 6 行业 × N 调用量大，先 3 跑通再放开）。
       # --nocapture 让 [RECALL] / [RECALL-MAINT] ledger 行进 CI 日志。关 -Dwarnings 同知识库
       # job（测试文件陈年 warning 不阻断真实跑测）。硬红线⊆seed 之外只观测不 panic。
@@ -263,7 +263,7 @@ jobs:
         if: ${{ !cancelled() && env.REAL_LLM_API_KEY != '' }}
         env:
           RUSTFLAGS: ""
-          REAL_LLM_BASE_URL: https://coderelay.cn/v1
+          REAL_LLM_BASE_URL: https://api.naxtclaude.com/v1
           REAL_LLM_MODEL: gpt-5.5
           RECALL_STABILITY_RUNS: "3"
         run: cargo test --no-fail-fast --test real_llm_recall_benchmark ${{ matrix.t }} -- --ignored --nocapture
@@ -320,7 +320,7 @@ jobs:
           - t17_real_multiturn_boundary_stress
           - t18_real_warm_start_operator_seeded_arc
     env:
-      REAL_LLM_API_KEY: ${{ secrets.REAL_LLM_CODERELAY_API_KEY || 'sk-rQwLl3JkGnexGZmkyesH0LdBKH86PQMBSj5Z8MDHgdwxLzuE' }}
+      REAL_LLM_API_KEY: ${{ secrets.REAL_LLM_CODERELAY_API_KEY || 'sk-ae64cef396a161f7c73b5a9318821215adf3a4e782e6a819523bddf82a405b9f' }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -353,15 +353,15 @@ jobs:
         if: ${{ env.REAL_LLM_API_KEY != '' }}
         env:
           RUSTFLAGS: ""
-          REAL_LLM_BASE_URL: https://coderelay.cn/v1
+          REAL_LLM_BASE_URL: https://api.naxtclaude.com/v1
           REAL_LLM_MODEL: gpt-5.5
           REAL_LLM_JUDGE: "1"
-          # 裁判用最强模型 gpt-5.5（@ coderelay，OpenAI 兼容）——G-Eval/MT-Bench 方法论：
+          # 裁判用最强模型 gpt-5.5（@ api.naxtclaude.com，OpenAI 兼容）——G-Eval/MT-Bench 方法论：
           # 最强模型当 judge 判分更可信。被测 agent 仍是生产模型 MiMo（REAL_LLM_MODEL），
           # 裁判换强只抬高评分可信度、不抬高被测分（零过拟合）。gpt-5.5 同时作 agent 备胎链
           # 首选（MiMo 429 时优先切它续跑）。缺 key 时裁判回落 MiMo failover（无回归）。
-          REAL_LLM_JUDGE_API_KEY: ${{ secrets.REAL_LLM_GPT55_API_KEY || 'sk-rQwLl3JkGnexGZmkyesH0LdBKH86PQMBSj5Z8MDHgdwxLzuE' }}
-          REAL_LLM_JUDGE_BASE_URL: https://coderelay.cn/v1
+          REAL_LLM_JUDGE_API_KEY: ${{ secrets.REAL_LLM_GPT55_API_KEY || 'sk-ae64cef396a161f7c73b5a9318821215adf3a4e782e6a819523bddf82a405b9f' }}
+          REAL_LLM_JUDGE_BASE_URL: https://api.naxtclaude.com/v1
           REAL_LLM_JUDGE_MODEL: gpt-5.5
           # 跨模型 failover 备胎链（与 adversarial / integration job 同口径）：MiMo 主端点
           # 429/5xx 重试耗尽时，被测 agent 自动切到备胎链续跑——①最强模型 gpt-5.5（首选，
@@ -411,10 +411,10 @@ jobs:
           - q7_tag_extraction_quality
           - q8_honest_abstention_quality
     env:
-      # 被测内容生成 + 文本双裁判走 coderelay gpt-5.x（OpenAI 兼容，coderelay.cn/v1）。MiMo
-      # 额度 2026-06-04 耗尽 → 切 coderelay（gpt-5.5 主 + gpt-5.4-mini 轻裁判，实测文本+json_object
+      # 被测内容生成 + 文本双裁判走 gpt-5.x（OpenAI 兼容，api.naxtclaude.com/v1）。MiMo
+      # 额度 2026-06-04 耗尽 → 切 api.naxtclaude.com（gpt-5.5 主 + gpt-5.4-mini 轻裁判，实测文本+json_object
       # 可用）。`if:` 守卫读此 job 级 env，空 key 时各步自动跳过。key 走 secret，缺则回落字面量。
-      REAL_LLM_API_KEY: ${{ secrets.REAL_LLM_CODERELAY_API_KEY || 'sk-rQwLl3JkGnexGZmkyesH0LdBKH86PQMBSj5Z8MDHgdwxLzuE' }}
+      REAL_LLM_API_KEY: ${{ secrets.REAL_LLM_CODERELAY_API_KEY || 'sk-ae64cef396a161f7c73b5a9318821215adf3a4e782e6a819523bddf82a405b9f' }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -440,18 +440,18 @@ jobs:
         if: ${{ env.REAL_LLM_API_KEY != '' }}
         env:
           RUSTFLAGS: ""
-          # 被测内容生成 + 文本双裁判：coderelay gpt-5.x 双 checkpoint（gpt-5.5 文本内容/主裁判 + gpt-5.4-mini 轻裁判），
-          # 同家族不同 checkpoint，跨 checkpoint 分歧暴露 rubric 歧义。（MiMo 额度 2026-06-04 耗尽，切 coderelay。）
+          # 被测内容生成 + 文本双裁判：api.naxtclaude.com gpt-5.x 双 checkpoint（gpt-5.5 文本内容/主裁判 + gpt-5.4-mini 轻裁判），
+          # 同家族不同 checkpoint，跨 checkpoint 分歧暴露 rubric 歧义。（MiMo 额度 2026-06-04 耗尽，切 api.naxtclaude.com。）
           # 下方异族第三裁判 + NVIDIA failover/vision 备胎链作退守保证循环跑完。
-          REAL_LLM_BASE_URL: https://coderelay.cn/v1
+          REAL_LLM_BASE_URL: https://api.naxtclaude.com/v1
           REAL_LLM_MODEL: gpt-5.5
           REAL_LLM_JUDGE_LITE_MODEL: gpt-5.4-mini
           # vision 链路（Q3）：MiMo 主文本 checkpoint 不复用多模态，故指向专职视觉 provider
-          # gpt-5.4（gpt.api456.me，OpenAI 兼容 /v1，image_url data-URI）。实测真 fixture
+          # gpt-5.4（api.naxtclaude.com，OpenAI 兼容 /v1，image_url data-URI）。实测真 fixture
           # HTTP 200 抽取成功；偶发 5xx/524 走 LlmUnavailable→skip 不 fail。key 优先 secret，
           # 缺则回落字面量（与下方 Qwen free key 同纪律：tests/CI 豁免 model-hint lint）。
-          REAL_LLM_VISION_API_KEY: ${{ secrets.REAL_LLM_VISION_API_KEY || 'sk-4iVIgfidl3eewYS26qRTrKDbqHY1QKsGs3aqL2YzVE4UrhxD' }}
-          REAL_LLM_VISION_BASE_URL: https://gpt.api456.me/v1
+          REAL_LLM_VISION_API_KEY: ${{ secrets.REAL_LLM_VISION_API_KEY || 'sk-ae64cef396a161f7c73b5a9318821215adf3a4e782e6a819523bddf82a405b9f' }}
+          REAL_LLM_VISION_BASE_URL: https://api.naxtclaude.com/v1
           REAL_LLM_VISION_MODEL: gpt-5.4
           # 备用视觉模型（异族多模态，NVIDIA 托管 kimi-k2.6）：gpt-5.4 瞬时不可达时
           # 生产候选链自动切换到它（supports_vision=true / is_vision_active=false 排其后）。
@@ -462,22 +462,22 @@ jobs:
           REAL_LLM_VISION_BACKUP_MODEL: moonshotai/kimi-k2.6
           # Q3 vision **裁判团**（区别于上方 vision 被测抽取）：让裁判真看图判「图 vs 抽取文本」，
           # 是 Q3 永久 SKIP(divergent) 的根本修法——纯文本裁判看不到图、据文本 truth 误判捏造。
-          # 跨家族多模态裁判：① gpt-5.5 @ coderelay（VISION_JUDGE_*，GPT 家族）+ ② 复用上方
+          # 跨家族多模态裁判：① gpt-5.5 @ api.naxtclaude.com（VISION_JUDGE_*，GPT 家族）+ ② 复用上方
           # NVIDIA kimi-k2.6（moonshot 真异族）。被测抽取走 gpt-5.4、裁判走 gpt-5.5(异 checkpoint)
           # +kimi(异家族)，与被测不同模型，跨裁判分歧门保留不退回自评。key 只走 secret（已 gh
           # secret set，明文绝不入库）；缺此 key → vision_judge_panel 返回 None → Q3 skip 不 fail。
           VISION_JUDGE_API_KEY: ${{ secrets.VISION_JUDGE_API_KEY }}
-          VISION_JUDGE_BASE_URL: https://coderelay.cn/v1
+          VISION_JUDGE_BASE_URL: https://api.naxtclaude.com/v1
           VISION_JUDGE_MODEL: gpt-5.5
           REAL_LLM_LEDGER: target/real_llm_ledger
-          # 跨家族第三裁判：NVIDIA 托管 kimi-k2.6（moonshot 家族）——与 coderelay GPT 家族跨厂商，
+          # 跨家族第三裁判：NVIDIA 托管 kimi-k2.6（moonshot 家族）——与 api.naxtclaude.com GPT 家族跨厂商，
           # 照出同家族双 checkpoint 的家族级盲区（#618 最高 ROI 杠杆）。原 QWEN/DashScope 2026-06-04
           # 额度疑耗尽 + 本地连通不稳，换实测稳定的 NVIDIA kimi。沿用 QWEN_JUDGE_* 三元组 env（代码
           # hetero 裁判纯读 env，零改动）；该 env 缺失时自动回落同家族双 checkpoint，CI 不退化。
           QWEN_JUDGE_API_KEY: ${{ secrets.REAL_LLM_VISION_BACKUP_API_KEY || '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' }}
           QWEN_JUDGE_BASE_URL: https://integrate.api.nvidia.com/v1
           QWEN_JUDGE_MODEL: moonshotai/kimi-k2.6
-          # 文本侧 failover 备胎链（替换/重试机制）：被测内容生成 + 文本双裁判共享 coderelay
+          # 文本侧 failover 备胎链（替换/重试机制）：被测内容生成 + 文本双裁判共享 api.naxtclaude.com
           # 端点，并发互撞偶发 429/5xx/瞬时不可达。配此 key 后主模型遇
           # **可转移**故障（429/5xx/timeout/connect/网络）即快速切到 NVIDIA integrate 上的
           # 异族文本模型（kimi/step/glm）兜底，让 Q 判分流程**跑完拿真分**而非 skip。
@@ -543,7 +543,7 @@ jobs:
       # REAL_LLM_JUDGE1_MODEL），第二裁判 = 跨家族 Qwen。key 走 secret REAL_LLM_MIMO_API_KEY（缺则
       # 回落字面量），端点 HTTPS（api.xiaomimimo.com）。
       # `if:` 守卫读 job 级此 env，故空 key 时整个 adversarial job 各步自动跳过、不红不耗 CI 分钟。
-      REAL_LLM_API_KEY: ${{ secrets.REAL_LLM_CODERELAY_API_KEY || 'sk-rQwLl3JkGnexGZmkyesH0LdBKH86PQMBSj5Z8MDHgdwxLzuE' }}
+      REAL_LLM_API_KEY: ${{ secrets.REAL_LLM_CODERELAY_API_KEY || 'sk-ae64cef396a161f7c73b5a9318821215adf3a4e782e6a819523bddf82a405b9f' }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -570,21 +570,21 @@ jobs:
         env:
           RUSTFLAGS: ""
           # 被测 agent = gpt-5.5（REAL_LLM_MODEL）；主裁判 judge1 = gpt-5.4（REAL_LLM_JUDGE1_MODEL，
-          # 同厂不同 checkpoint，judge1≠agent checkpoint，自评干净不逐字自我背书）。端点 coderelay
-          # （MiMo 额度 2026-06-04 耗尽，切 coderelay gpt-5.x）。台账 judge label 从各 model 名派生。
-          REAL_LLM_BASE_URL: https://coderelay.cn/v1
+          # 同厂不同 checkpoint，judge1≠agent checkpoint，自评干净不逐字自我背书）。端点 api.naxtclaude.com
+          # （MiMo 额度 2026-06-04 耗尽，切 api.naxtclaude.com gpt-5.x）。台账 judge label 从各 model 名派生。
+          REAL_LLM_BASE_URL: https://api.naxtclaude.com/v1
           REAL_LLM_MODEL: gpt-5.5
           REAL_LLM_JUDGE1_MODEL: gpt-5.4
           REAL_LLM_VISION_MODEL: gpt-5.4
           REAL_LLM_JUDGE: "1"
           REAL_LLM_LEDGER: target/real_llm_ledger
-          # 最强模型 gpt-5.5（@ coderelay，OpenAI 兼容）作 agent/红队/判官备胎链**首选**：
+          # 最强模型 gpt-5.5（@ api.naxtclaude.com，OpenAI 兼容）作 agent/红队/判官备胎链**首选**：
           # MiMo 主端点 402 欠费 / 429 限流 / 5xx 时优先切它续跑（命中 2026-06-04 MiMo 余额
           # 耗尽场景——此前 402 被判 fail-fast 不切备胎致整轮全挂，现 is_failover_worthy 对
           # 402/401 切备胎 + 此 key 接上 gpt-5.5 兜底）。key 优先 secret，缺则回落字面量
           # （tests/CI 豁免 model-hint lint）。缺此 key 时备胎链退回 NVIDIA 链/空，CI 不退化。
-          REAL_LLM_JUDGE_API_KEY: ${{ secrets.REAL_LLM_GPT55_API_KEY || 'sk-rQwLl3JkGnexGZmkyesH0LdBKH86PQMBSj5Z8MDHgdwxLzuE' }}
-          REAL_LLM_JUDGE_BASE_URL: https://coderelay.cn/v1
+          REAL_LLM_JUDGE_API_KEY: ${{ secrets.REAL_LLM_GPT55_API_KEY || 'sk-ae64cef396a161f7c73b5a9318821215adf3a4e782e6a819523bddf82a405b9f' }}
+          REAL_LLM_JUDGE_BASE_URL: https://api.naxtclaude.com/v1
           REAL_LLM_JUDGE_MODEL: gpt-5.5
           # 第二裁判 = 跨家族 Qwen（阿里 DashScope，OpenAI 兼容）。agent/judge1 同为 deepseek
           # 家族，跨家族效度信号靠这一路 Qwen——读账以 |deepseek-flash−qwen| 为家族盲区代理。

@@ -740,7 +740,7 @@ async fn k6_real_vision_article_extraction_keeps_needs_review() {
     let ws = app.state.config.default_workspace_id.clone();
 
     // seed 专职视觉副模型。vision 端点独立配置（REAL_LLM_VISION_* 三元组）：deepseek
-    // 文字端点不支持多模态，故 K6 vision 走专职视觉 provider（默认 gpt.api456），缺
+    // 文字端点不支持多模态，故 K6 vision 走专职视觉 provider（默认 api.naxtclaude.com），缺
     // VISION key 时回落通用 REAL_LLM_API_KEY/BASE_URL（兼容单端点既支持文字又支持
     // vision 的形态）。
     let api_key = std::env::var("REAL_LLM_VISION_API_KEY")
@@ -748,7 +748,7 @@ async fn k6_real_vision_article_extraction_keeps_needs_review() {
         .expect("require_real_llm 已保证 REAL_LLM_API_KEY 存在");
     let base_url = std::env::var("REAL_LLM_VISION_BASE_URL")
         .or_else(|_| std::env::var("REAL_LLM_BASE_URL"))
-        .unwrap_or_else(|_| "https://gpt.api456.me/v1".to_string());
+        .unwrap_or_else(|_| "https://api.naxtclaude.com/v1".to_string());
     let vision_model =
         std::env::var("REAL_LLM_VISION_MODEL").unwrap_or_else(|_| "gpt-5.4".to_string());
     let vision_cfg = LlmProviderConfig {

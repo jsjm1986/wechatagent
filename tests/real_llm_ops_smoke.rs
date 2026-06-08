@@ -71,7 +71,7 @@ fn real_llm_from_env() -> Option<Arc<LlmClient>> {
 // 跨模型 failover 备胎链 —— 与 `real_llm_adversarial.rs` 同口径（Round 9 引入）。
 // 主模型（MiMo）遇 429/5xx/超时等端点抖动重试耗尽后，自动切到独立端点续跑，把「端点
 // 限流污染能力测评」解耦，保「全程跑完拿真分」。备胎链（延迟/能力升序）：①最强模型
-// gpt-5.5（@ coderelay，REAL_LLM_JUDGE_API_KEY）→ ②NVIDIA 上 kimi/minimax/glm。
+// gpt-5.5（@ api.naxtclaude.com，REAL_LLM_JUDGE_API_KEY）→ ②NVIDIA 上 kimi/minimax/glm。
 // 纯测试侧、零生产改动。**被测 agent 始终是生产模型 MiMo（冻结为对照），裁判另用最强
 // 模型 gpt-5.5（judge_provider，G-Eval/MT-Bench 方法论）——裁判换强只抬高评分可信度、
 // 不抬高被测分**。背景：MiMo 单 key 在 ops×adversarial 并发矩阵下 429 频发 →
@@ -156,7 +156,7 @@ fn failover_key_present() -> bool {
         .is_some()
 }
 
-/// 最强模型（gpt-5.5 @ coderelay）key 是否已配——它既当独立裁判，也当 agent 备胎链首选。
+/// 最强模型（gpt-5.5 @ api.naxtclaude.com）key 是否已配——它既当独立裁判，也当 agent 备胎链首选。
 fn strongest_key_present() -> bool {
     std::env::var("REAL_LLM_JUDGE_API_KEY")
         .ok()
@@ -180,7 +180,7 @@ fn primary_max_retries() -> u32 {
     }
 }
 
-/// 构造最强模型 client（gpt-5.5 @ coderelay，OpenAI 兼容）。缺 `REAL_LLM_JUDGE_API_KEY`
+/// 构造最强模型 client（gpt-5.5 @ api.naxtclaude.com，OpenAI 兼容）。缺 `REAL_LLM_JUDGE_API_KEY`
 /// → None。它既作独立裁判（最强模型当 judge，G-Eval/MT-Bench 方法论），也作 agent
 /// 备胎链**首选**（mimo 429 时优先切最强模型续跑）。备胎自身保留 5 次重试。
 fn strongest_model_client() -> Option<Arc<LlmClient>> {
@@ -188,7 +188,7 @@ fn strongest_model_client() -> Option<Arc<LlmClient>> {
         .ok()
         .filter(|k| !k.trim().is_empty())?;
     let base = std::env::var("REAL_LLM_JUDGE_BASE_URL")
-        .unwrap_or_else(|_| "https://coderelay.cn/v1".to_string());
+        .unwrap_or_else(|_| "https://api.naxtclaude.com/v1".to_string());
     let model =
         std::env::var("REAL_LLM_JUDGE_MODEL").unwrap_or_else(|_| "gpt-5.5".to_string());
     LlmClient::new(base, key, model, 180, 5, 2500).ok().map(Arc::new)
