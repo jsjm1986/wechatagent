@@ -13,7 +13,7 @@ import {
 } from "lucide-react";
 import { parseApiError } from "../../lib/api";
 import { parseCompleteness, parseIntegrityReport, type CompletenessView, type IntegrityReportView } from "./trustTypes";
-import { LlmErrorBanner, ChunkInspectorPane, classifyChunk, focusChunk, type ReviewChunkItem, type ReviewCategory } from "./shared";
+import { ChunkInspectorPane, classifyChunk, focusChunk, type ReviewChunkItem, type ReviewCategory } from "./shared";
 import { ReviewChat, type ReviewChatChunk } from "./cockpit/ReviewChat";
 
 // ── G2 · DocumentsView · 知识文档目录 CRUD ─────────────────────────────
