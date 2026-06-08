@@ -279,7 +279,7 @@ logic(纯函数+38测试) / ledger(台账CRUD) / mod(4个async编排+re-export);
 is_duplicate_key_error+enqueue_relay_task 升 pub(crate) 跨文件;pub use 保 13 处外部调用;
 行为零变更,cargo test --lib 全绿基线≥350
 
-Co-Authored-By: Claude Opus 4 (1M context) <noreply@anthropic.com>
+Co-Authored-By: <agent> <noreply@anthropic.com>
 EOF
 )"
 ```
