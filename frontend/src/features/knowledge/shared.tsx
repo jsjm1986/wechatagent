@@ -14,7 +14,7 @@ import {
   X,
 } from "lucide-react";
 import { parseApiError, LlmUnavailableError } from "../../lib/api";
-import { type TrustChunkFields } from "./trustTypes";
+import { type TrustChunkFields, chunkTypeLabel } from "./trustTypes";
 
 const LLM_KIND_LABELS: Record<string, string> = {
   timeout: "上游超时",
@@ -268,6 +268,7 @@ export function ChunkInspectorPane({
               <dt>chunk id</dt>
               <dd><code>{chunk.id}</code></dd>
               {chunk.wikiType ? (<><dt>wiki type</dt><dd><span className="wikiArchiveTag">{chunk.wikiType}</span></dd></>) : null}
+              {chunkTypeLabel(chunk.chunkType) ? (<><dt>运营用途</dt><dd><span className="wikiArchiveTag">{chunkTypeLabel(chunk.chunkType)}</span></dd></>) : null}
               {Array.isArray(chunk.businessTopics) && chunk.businessTopics.length > 0 ? (
                 <>
                   <dt>business topics</dt>

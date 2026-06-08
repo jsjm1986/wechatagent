@@ -278,6 +278,7 @@ pub(super) fn operation_knowledge_chunk_json(item: OperationKnowledgeChunk) -> V
         "status": item.status,
         "priority": item.priority,
         "wikiType": item.wiki_type,
+        "chunkType": item.chunk_type,
         "relatedChunks": item.related_chunks,
         "businessTopics": item.business_topics,
         "supersededBy": item.superseded_by,
