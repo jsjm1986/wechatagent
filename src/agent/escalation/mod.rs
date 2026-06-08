@@ -9,6 +9,10 @@ mod logic;
 
 pub(crate) use ledger::*;
 pub(crate) use logic::*;
+// fallback_holding_reply 需 crate 外可见（tests/principal_decision_channel.rs §14.9b
+// 红线测试在 crate 外断言兜底文案不含转接类措辞）；pub(crate) use logic::* 会把它降级，
+// 故单独 pub re-export 还原其原始 `pub` 可见性。
+pub use logic::fallback_holding_reply;
 
 use super::generate_agent_json;
 use super::types::{AgentDecision, DecisionReviewResult};
