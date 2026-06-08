@@ -12,7 +12,7 @@ import {
   X,
 } from "lucide-react";
 import { parseApiError } from "../../lib/api";
-import { parseCompleteness, parseIntegrityReport, type CompletenessView, type IntegrityReportView } from "./trustTypes";
+import { parseCompleteness, parseIntegrityReport, chunkTypeLabel, type CompletenessView, type IntegrityReportView } from "./trustTypes";
 import { ChunkInspectorPane, classifyChunk, focusChunk, type ReviewChunkItem, type ReviewCategory } from "./shared";
 import { ReviewChat, type ReviewChatChunk } from "./cockpit/ReviewChat";
 
@@ -1342,6 +1342,9 @@ export function ReviewView() {
                     />
                     <div className="wikiSignalTitle">
                       <span className={`wikiKind ${c.wikiType ?? "unknown"}`}>{c.wikiType ?? "—"}</span>
+                      {chunkTypeLabel(c.chunkType) ? (
+                        <span className="wikiArchiveTag" title="运营用途：这条知识在 AI 回复里怎么用">{chunkTypeLabel(c.chunkType)}</span>
+                      ) : null}
                       <span className={`wikiSev ${c.integrityStatus === "rejected" ? "error" : "info"}`}>
                         {c.integrityStatus ?? "—"}
                       </span>
