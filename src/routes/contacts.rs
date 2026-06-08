@@ -313,38 +313,47 @@ pub(super) async fn enable_agent(
         &contact.commitments,
         generated.last_commitment.as_deref(),
     );
+    // #72：曾运营过的老客户重新启用时，保留已积累的 stage / operation_state /
+    // commitments，不回退到 new_contact；只切 managed + 更新本次 admin 显式输入
+    // （备注 / playbook / 画像）。全新客户才走完整初始化。
+    let mut set_doc = doc! {
+        "agent_status": "managed",
+        "human_profile_note": payload.human_profile_note,
+        "agent_profile": to_bson(&generated.agent_profile)?,
+        "playbook_id": playbook.id,
+        "playbook_version": playbook.version,
+        "tags": generated.tags,
+        "profile_attributes": generated.profile_attributes,
+        "profile_updated_at": DateTime::now(),
+        "updated_at": DateTime::now(),
+    };
+    let mut unset_doc = Document::new();
+    if !is_previously_operated(&contact) {
+        insert_domain_stage_fields(
+            &mut set_doc,
+            generated.customer_stage.as_deref(),
+            generated.intent_level.as_deref(),
+            true,
+        );
+        set_doc.insert("commitments", commitments_bson);
+        set_doc.insert("follow_up_policy", generated.follow_up_policy);
+        set_doc.insert("operation_state", "new_contact");
+        set_doc.insert(
+            "operation_state_reason",
+            "初次纳入 Agent 运营，等待后续互动确认阶段",
+        );
+        set_doc.insert("operation_state_confidence", 6);
+        set_doc.insert("operation_state_updated_at", DateTime::now());
+        unset_doc.insert("last_commitment", "");
+    }
+    let mut update_doc = doc! { "$set": set_doc };
+    if !unset_doc.is_empty() {
+        update_doc.insert("$unset", unset_doc);
+    }
     state
         .db
         .contacts()
-        .update_one(
-            doc! { "_id": object_id },
-            doc! {
-                "$set": {
-                    "agent_status": "managed",
-                    "human_profile_note": payload.human_profile_note,
-                    "agent_profile": to_bson(&generated.agent_profile)?,
-                    "playbook_id": playbook.id,
-                    "playbook_version": playbook.version,
-                    "tags": generated.tags,
-                    "customer_stage": generated.customer_stage,
-                    "customer_stage_updated_at": DateTime::now(),
-                    "intent_level": generated.intent_level,
-                    "commitments": commitments_bson,
-                    "follow_up_policy": generated.follow_up_policy,
-                    "operation_state": "new_contact",
-                    "operation_state_reason": "初次纳入 Agent 运营，等待后续互动确认阶段",
-                    "operation_state_confidence": 6,
-                    "operation_state_updated_at": DateTime::now(),
-                    "profile_attributes": generated.profile_attributes,
-                    "profile_updated_at": DateTime::now(),
-                    "updated_at": DateTime::now()
-                },
-                "$unset": {
-                    "last_commitment": ""
-                }
-            },
-            None,
-        )
+        .update_one(doc! { "_id": object_id }, update_doc, None)
         .await?;
     let contact = find_contact_by_id(&state, &admin.current_workspace, &id).await?;
     Ok(Json(json!({ "item": ApiContact::from(contact) })))
@@ -393,33 +402,45 @@ pub(super) async fn update_profile_note(
         &contact.commitments,
         generated.last_commitment.as_deref(),
     );
+    // #72：曾运营过的老客户重新生成画像时保留 stage / operation_state / commitments，
+    // 不回退 new_contact；全新客户才完整初始化。
+    let mut set_doc = doc! {
+        "human_profile_note": payload.human_profile_note,
+        "agent_profile": to_bson(&generated.agent_profile)?,
+        "tags": generated.tags,
+        "profile_attributes": generated.profile_attributes,
+        "profile_updated_at": DateTime::now(),
+        "updated_at": DateTime::now(),
+    };
+    let mut unset_doc = Document::new();
+    if !is_previously_operated(&contact) {
+        insert_domain_stage_fields(
+            &mut set_doc,
+            generated.customer_stage.as_deref(),
+            generated.intent_level.as_deref(),
+            true,
+        );
+        set_doc.insert("commitments", commitments_bson);
+        set_doc.insert("follow_up_policy", generated.follow_up_policy);
+        set_doc.insert("operation_state", "new_contact");
+        set_doc.insert(
+            "operation_state_reason",
+            "根据 admin 备注重新生成初始运营状态",
+        );
+        set_doc.insert("operation_state_confidence", 6);
+        set_doc.insert("operation_state_updated_at", DateTime::now());
+        unset_doc.insert("last_commitment", "");
+    }
+    let mut update_doc = doc! { "$set": set_doc };
+    if !unset_doc.is_empty() {
+        update_doc.insert("$unset", unset_doc);
+    }
     state
         .db
         .contacts()
         .update_one(
             doc! { "_id": object_id, "workspace_id": &admin.current_workspace },
-            doc! {
-                "$set": {
-                    "human_profile_note": payload.human_profile_note,
-                    "agent_profile": to_bson(&generated.agent_profile)?,
-                    "tags": generated.tags,
-                    "customer_stage": generated.customer_stage,
-                    "customer_stage_updated_at": DateTime::now(),
-                    "intent_level": generated.intent_level,
-                    "commitments": commitments_bson,
-                    "follow_up_policy": generated.follow_up_policy,
-                    "operation_state": "new_contact",
-                    "operation_state_reason": "根据 admin 备注重新生成初始运营状态",
-                    "operation_state_confidence": 6,
-                    "operation_state_updated_at": DateTime::now(),
-                    "profile_attributes": generated.profile_attributes,
-                    "profile_updated_at": DateTime::now(),
-                    "updated_at": DateTime::now()
-                },
-                "$unset": {
-                    "last_commitment": ""
-                }
-            },
+            update_doc,
             None,
         )
         .await?;
@@ -493,17 +514,19 @@ pub(super) async fn update_operation_profile(
     );
     let mut set_doc = doc! {
         "tags": payload.tags,
-        "customer_stage": &new_stage,
-        "intent_level": normalize_optional(payload.intent_level),
         "commitments": commitments_bson,
         "follow_up_policy": normalize_optional(payload.follow_up_policy),
         "profile_attributes": payload.profile_attributes,
         "profile_updated_at": DateTime::now(),
         "updated_at": DateTime::now(),
     };
-    if stage_changed {
-        set_doc.insert("customer_stage_updated_at", DateTime::now());
-    }
+    let intent_level = normalize_optional(payload.intent_level);
+    insert_domain_stage_fields(
+        &mut set_doc,
+        new_stage.as_deref(),
+        intent_level.as_deref(),
+        stage_changed,
+    );
     state
         .db
         .contacts()
@@ -609,34 +632,42 @@ pub(super) async fn analyze_contact_profile(
         &contact.commitments,
         generated.last_commitment.as_deref(),
     );
+    // #72：曾运营过的老客户 AI 重新分析时保留 stage / operation_state / commitments，
+    // 不回退 new_contact；全新客户才完整初始化。
+    let mut set_doc = doc! {
+        "agent_profile": to_bson(&generated.agent_profile)?,
+        "tags": generated.tags,
+        "profile_attributes": generated.profile_attributes,
+        "profile_updated_at": DateTime::now(),
+        "updated_at": DateTime::now(),
+    };
+    let mut unset_doc = Document::new();
+    if !is_previously_operated(&contact) {
+        insert_domain_stage_fields(
+            &mut set_doc,
+            generated.customer_stage.as_deref(),
+            generated.intent_level.as_deref(),
+            true,
+        );
+        set_doc.insert("commitments", commitments_bson);
+        set_doc.insert("follow_up_policy", generated.follow_up_policy);
+        set_doc.insert("operation_state", "new_contact");
+        set_doc.insert(
+            "operation_state_reason",
+            "AI 重新分析后等待后续互动确认阶段",
+        );
+        set_doc.insert("operation_state_confidence", 6);
+        set_doc.insert("operation_state_updated_at", DateTime::now());
+        unset_doc.insert("last_commitment", "");
+    }
+    let mut update_doc = doc! { "$set": set_doc };
+    if !unset_doc.is_empty() {
+        update_doc.insert("$unset", unset_doc);
+    }
     state
         .db
         .contacts()
-        .update_one(
-            doc! { "_id": contact.id },
-            doc! {
-                "$set": {
-                    "agent_profile": to_bson(&generated.agent_profile)?,
-                    "tags": generated.tags,
-                    "customer_stage": generated.customer_stage,
-                    "customer_stage_updated_at": DateTime::now(),
-                    "intent_level": generated.intent_level,
-                    "commitments": commitments_bson,
-                    "follow_up_policy": generated.follow_up_policy,
-                    "operation_state": "new_contact",
-                    "operation_state_reason": "AI 重新分析后等待后续互动确认阶段",
-                    "operation_state_confidence": 6,
-                    "operation_state_updated_at": DateTime::now(),
-                    "profile_attributes": generated.profile_attributes,
-                    "profile_updated_at": DateTime::now(),
-                    "updated_at": DateTime::now()
-                },
-                "$unset": {
-                    "last_commitment": ""
-                }
-            },
-            None,
-        )
+        .update_one(doc! { "_id": contact.id }, update_doc, None)
         .await?;
     let updated = find_contact_by_id(&state, &admin.current_workspace, &id).await?;
     Ok(Json(json!({ "item": ApiContact::from(updated) })))

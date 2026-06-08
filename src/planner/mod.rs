@@ -709,8 +709,8 @@ pub(crate) fn stage_stagnation_candidate_filter(
         "workspace_id": workspace_id,
         "account_id": account_id,
         "agent_status": "managed",
-        "customer_stage": { "$exists": true, "$ne": null, "$nin": TERMINAL_STAGES },
-        "customer_stage_updated_at": { "$lt": stage_updated_before },
+        "domain_attributes.customer_stage": { "$exists": true, "$ne": null, "$nin": TERMINAL_STAGES },
+        "domain_attributes.customer_stage_updated_at": { "$lt": stage_updated_before },
         "last_inbound_at": { "$lt": inbound_before },
         "$or": [
             { "cooldown_until": { "$exists": false } },
@@ -1445,8 +1445,13 @@ mod tests {
         let filter = stage_stagnation_candidate_filter("ws", "acc", dt(1_000), dt(2_000));
         assert!(filter.contains_key("workspace_id"));
         assert!(filter.contains_key("agent_status"));
-        assert!(filter.contains_key("customer_stage"));
-        assert!(filter.contains_key("customer_stage_updated_at"));
+        // customer_stage / customer_stage_updated_at 存在于 domain_attributes 容器，
+        // 不在文档顶层。过滤器必须用 dotted-key 查 domain_attributes.*，否则真实库
+        // 筛空、stage_stagnation 段整段空转。
+        assert!(filter.contains_key("domain_attributes.customer_stage"));
+        assert!(filter.contains_key("domain_attributes.customer_stage_updated_at"));
+        assert!(!filter.contains_key("customer_stage"));
+        assert!(!filter.contains_key("customer_stage_updated_at"));
         assert!(filter.contains_key("last_inbound_at"));
     }
 
