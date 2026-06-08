@@ -57,6 +57,49 @@ pub(super) fn contact_domain_str(contact: &Contact, key: &str) -> Option<String>
         .and_then(|d| d.get_str(key).ok().map(|s| s.to_string()))
 }
 
+/// 把 customer_stage / intent_level 以 `domain_attributes.*` dotted-key 形式写入 `$set`。
+///
+/// `customer_stage`/`intent_level` 早已从 `Contact` 顶层删除、只存在于
+/// `domain_attributes` 容器（见 models.rs 注释）。所有读端（planner / memory /
+/// decision / health score）都从 `domain_attributes` 取值，因此写端必须写进同一
+/// 容器，否则 serde 反序列化时顶层字段被丢弃、读端永远读不到。
+///
+/// 用 dotted-key（而非 clone 整个 `domain_attributes` 子文档再整体替换）有两个好处：
+/// 字段级原子，不会覆盖容器内其它 key；与 escalation 路径写法一致。MongoDB 对不存在
+/// 的 `domain_attributes` 会按 dotted-path 自动建嵌套对象。
+///
+/// `stage_changed` 为真时一并刷新 `domain_attributes.customer_stage_updated_at`
+/// （planner 的 stage_stagnation 计时器依赖它）。容器级 `domain_attributes_updated_at`
+/// 总是刷新。注意：调用方的同一 `$set` 内不能再出现顶层 `domain_attributes` 键，
+/// 否则 MongoDB 会因 path conflict 报错。
+pub(super) fn insert_domain_stage_fields(
+    set_doc: &mut Document,
+    customer_stage: Option<&str>,
+    intent_level: Option<&str>,
+    stage_changed: bool,
+) {
+    if let Some(stage) = customer_stage {
+        set_doc.insert("domain_attributes.customer_stage", stage);
+    }
+    if let Some(intent) = intent_level {
+        set_doc.insert("domain_attributes.intent_level", intent);
+    }
+    if stage_changed {
+        set_doc.insert("domain_attributes.customer_stage_updated_at", DateTime::now());
+    }
+    set_doc.insert("domain_attributes_updated_at", DateTime::now());
+}
+
+/// 该联系人是否曾被 Agent 运营过（用于"重新启用/重新建档不覆盖历史画像"判定）。
+///
+/// `Contact` 没有显式的 `first_managed_at` 字段，用 `last_agent_run_at`（跑过 Agent
+/// 决策即非空）或 `last_outbound_at`（发过出站消息即非空）作为"曾运营过"的代理信号。
+/// 任一非空即视为有运营历史，重新启用时应保留已积累的 stage / 画像 / operation_state，
+/// 只切 `agent_status=managed`；全新客户才走完整初始化。
+pub(super) fn is_previously_operated(contact: &Contact) -> bool {
+    contact.last_agent_run_at.is_some() || contact.last_outbound_at.is_some()
+}
+
 pub(super) async fn validate_account(
     state: &AppState,
     workspace_id: &str,
@@ -505,13 +548,11 @@ pub(super) async fn apply_contact_changes(
     if let Some(value) = doc_get_string(changes, "customerStage") {
         // M2：customer_stage 实际变化时同步刷新 customer_stage_updated_at。
         let prev = contact_domain_str(contact, "customer_stage");
-        if prev.as_deref().map(|s| s != value.as_str()).unwrap_or(true) {
-            set_doc.insert("customer_stage_updated_at", DateTime::now());
-        }
-        set_doc.insert("customer_stage", value);
-    }
-    if let Some(value) = doc_get_string(changes, "intentLevel") {
-        set_doc.insert("intent_level", value);
+        let stage_changed = prev.as_deref().map(|s| s != value.as_str()).unwrap_or(true);
+        let intent = doc_get_string(changes, "intentLevel");
+        insert_domain_stage_fields(&mut set_doc, Some(&value), intent.as_deref(), stage_changed);
+    } else if let Some(value) = doc_get_string(changes, "intentLevel") {
+        insert_domain_stage_fields(&mut set_doc, None, Some(&value), false);
     }
     if let Some(value) = doc_get_string(changes, "followUpPolicy") {
         set_doc.insert("follow_up_policy", value);
@@ -1116,6 +1157,8 @@ pub(super) fn commitments_with_optional_text(
 #[cfg(test)]
 mod tests {
     use super::escape_regex_literal;
+    use super::insert_domain_stage_fields;
+    use mongodb::bson::Document;
 
     #[test]
     fn escape_regex_literal_neutralizes_redos_pattern() {
@@ -1140,6 +1183,52 @@ mod tests {
             let escaped = escape_regex_literal(&input);
             assert_eq!(escaped, format!("\\{ch}"), "char {ch:?} not escaped");
         }
+    }
+
+    // #65：customer_stage / intent_level 必须写进 domain_attributes 容器（dotted-key），
+    // 绝不写文档顶层——顶层会被 serde 丢弃、读端（planner/memory/decision）读不到。
+    #[test]
+    fn insert_domain_stage_fields_uses_dotted_keys_never_top_level() {
+        let mut set_doc = Document::new();
+        insert_domain_stage_fields(&mut set_doc, Some("solution_fit"), Some("high"), true);
+        assert_eq!(
+            set_doc.get_str("domain_attributes.customer_stage").ok(),
+            Some("solution_fit")
+        );
+        assert_eq!(
+            set_doc.get_str("domain_attributes.intent_level").ok(),
+            Some("high")
+        );
+        assert!(set_doc.contains_key("domain_attributes.customer_stage_updated_at"));
+        assert!(set_doc.contains_key("domain_attributes_updated_at"));
+        // 绝不出现顶层字段（serde 会丢弃）。
+        assert!(!set_doc.contains_key("customer_stage"));
+        assert!(!set_doc.contains_key("intent_level"));
+        assert!(!set_doc.contains_key("customer_stage_updated_at"));
+    }
+
+    // stage 未变化时不刷新 customer_stage_updated_at（planner stagnation 计时器不被无谓重置）。
+    #[test]
+    fn insert_domain_stage_fields_skips_updated_at_when_stage_unchanged() {
+        let mut set_doc = Document::new();
+        insert_domain_stage_fields(&mut set_doc, Some("need_discovery"), None, false);
+        assert_eq!(
+            set_doc.get_str("domain_attributes.customer_stage").ok(),
+            Some("need_discovery")
+        );
+        assert!(!set_doc.contains_key("domain_attributes.customer_stage_updated_at"));
+        // intent 为 None 时不写 intent 键。
+        assert!(!set_doc.contains_key("domain_attributes.intent_level"));
+    }
+
+    // None stage + None intent：只刷容器时间戳，不写任何 stage/intent 键（不覆盖已有值）。
+    #[test]
+    fn insert_domain_stage_fields_no_values_only_touches_container_ts() {
+        let mut set_doc = Document::new();
+        insert_domain_stage_fields(&mut set_doc, None, None, false);
+        assert!(!set_doc.contains_key("domain_attributes.customer_stage"));
+        assert!(!set_doc.contains_key("domain_attributes.intent_level"));
+        assert!(set_doc.contains_key("domain_attributes_updated_at"));
     }
 }
 
