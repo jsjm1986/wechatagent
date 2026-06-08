@@ -100,6 +100,20 @@ export function parseIntegrityReport(raw: unknown): IntegrityReportView {
 // chunk 富字段:后端 chunk JSON 下发但前端 ReviewChunkItem 此前从不读。全部可选,旧数据(仅 id/title)仍合法。
 export type ChunkType = "product_fact" | "style_template" | "negative_example" | "peer_case";
 
+// chunk_type 描述「运营时怎么用这条知识」(与 wiki_type「它是什么知识」正交)。
+// 后端 default_chunk_type 兜底为 product_fact,故每条 chunk 必有值。
+export const CHUNK_TYPE_LABELS: Record<ChunkType, string> = {
+  product_fact: "产品事实",
+  style_template: "话术模板",
+  negative_example: "反面示例",
+  peer_case: "同行案例",
+};
+
+export function chunkTypeLabel(t?: string | null): string | null {
+  if (!t) return null;
+  return CHUNK_TYPE_LABELS[t as ChunkType] ?? t;
+}
+
 export interface ChunkUsageStats { hitCount30d?: number; blockedCount30d?: number; }
 export interface ChunkProvenanceView { source?: string; llmModelAlias?: string | null; }
 
