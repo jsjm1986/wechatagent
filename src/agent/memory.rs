@@ -1149,6 +1149,16 @@ pub(crate) async fn write_memory_candidates(
     if candidates.is_empty() {
         return Ok(());
     }
+    // #73：候选记忆的留存状态由「整体 memory_write_score」OR「单条最高 importance」共同决定。
+    // 此前只看 write_score>=6,会把一条 importance=10 的承诺类记忆因整体分低误判为
+    // ignored_low_score 丢弃。importance 已在 validated_memory_candidate 落到 candidate
+    // 内(范围 1-10),这里取 max 作为兜底救援信号。
+    let max_importance = candidates
+        .iter()
+        .filter_map(|c| c.get_i32("importance").ok())
+        .max()
+        .unwrap_or(0);
+    let status = decide_candidate_status(decision.memory_write_score, max_importance);
     state
         .db
         .memory_candidates()
@@ -1162,11 +1172,7 @@ pub(crate) async fn write_memory_candidates(
                 source: decision.run_mode.clone(),
                 candidates,
                 memory_write_score: decision.memory_write_score,
-                status: if decision.memory_write_score >= 6 {
-                    "pending".to_string()
-                } else {
-                    "ignored_low_score".to_string()
-                },
+                status: status.to_string(),
                 reason: Some(decision.memory_update.clone()),
                 created_at: DateTime::now(),
                 updated_at: DateTime::now(),
@@ -1175,6 +1181,19 @@ pub(crate) async fn write_memory_candidates(
         )
         .await?;
     Ok(())
+}
+
+/// 候选记忆留存状态决策(#73)：write_score 达标 **或** 单条 importance 足够高 → pending;
+/// 否则 ignored_low_score。importance 救援阈值取 8——只有高重要度记忆(承诺/强偏好等)
+/// 才在整体分偏低时被救回,避免噪声涌入待审池。纯函数便于单测。
+pub(crate) fn decide_candidate_status(write_score: i32, max_importance: i32) -> &'static str {
+    const WRITE_SCORE_THRESHOLD: i32 = 6;
+    const IMPORTANCE_RESCUE_THRESHOLD: i32 = 8;
+    if write_score >= WRITE_SCORE_THRESHOLD || max_importance >= IMPORTANCE_RESCUE_THRESHOLD {
+        "pending"
+    } else {
+        "ignored_low_score"
+    }
 }
 
 fn validated_memory_candidate(candidate: Document) -> Option<Document> {
@@ -1402,6 +1421,30 @@ pub(crate) async fn record_operator_memory(
 }
 
 
+
+#[cfg(test)]
+mod candidate_status_tests {
+    use super::decide_candidate_status;
+
+    #[test]
+    fn high_write_score_pending() {
+        assert_eq!(decide_candidate_status(6, 0), "pending");
+        assert_eq!(decide_candidate_status(10, 1), "pending");
+    }
+
+    #[test]
+    fn low_score_but_high_importance_rescued() {
+        // #73 核心:整体分低(<6)但单条 importance 高(>=8)→ 救回 pending,不丢承诺类记忆。
+        assert_eq!(decide_candidate_status(3, 8), "pending");
+        assert_eq!(decide_candidate_status(0, 10), "pending");
+    }
+
+    #[test]
+    fn low_score_low_importance_ignored() {
+        assert_eq!(decide_candidate_status(5, 7), "ignored_low_score");
+        assert_eq!(decide_candidate_status(0, 0), "ignored_low_score");
+    }
+}
 
 #[cfg(test)]
 mod r7_deprecation_tests {

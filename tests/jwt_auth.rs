@@ -42,6 +42,8 @@ fn base_cfg() -> AppConfig {
         default_account_id: "default".to_string(),
         agent_recent_message_limit: 1,
         agent_min_reply_interval_seconds: 1,
+        agent_reply_max_segment_chars: 120,
+        agent_reply_max_segments: 4,
         message_debounce_window_ms: 4000,
         task_worker_interval_seconds: 30,
         llm_timeout_seconds: 5,

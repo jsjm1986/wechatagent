@@ -18,6 +18,11 @@ pub struct AppConfig {
     pub default_account_id: String,
     pub agent_recent_message_limit: i64,
     pub agent_min_reply_interval_seconds: i64,
+    /// #68：单条出站消息软上限字符数。回复超过此长度时按句末标点就近切分成多条短消息,
+    /// 更贴微信即时通讯习惯。默认 120。
+    pub agent_reply_max_segment_chars: usize,
+    /// #68：单次回复最多拆成几条短消息,超出则把尾部合并回最后一段,避免刷屏。默认 4。
+    pub agent_reply_max_segments: usize,
     /// 并发多消息去抖窗口（毫秒）。用户连发多条时，调度器在收到最后一条后
     /// 等待此窗口再跑一次聚合流水线，把整串消息塌成一次回复（去抖 + 单联系人串行）。
     /// 默认 4000ms（3-5s 区间中点），clamp 到 [1000, 10000] 防退化忙等 / 误填。
@@ -320,6 +325,12 @@ impl AppConfig {
             agent_recent_message_limit: env_or("AGENT_RECENT_MESSAGE_LIMIT", "12").parse()?,
             agent_min_reply_interval_seconds: env_or("AGENT_MIN_REPLY_INTERVAL_SECONDS", "20")
                 .parse()?,
+            agent_reply_max_segment_chars: env_or("AGENT_REPLY_MAX_SEGMENT_CHARS", "120")
+                .parse::<usize>()?
+                .max(1),
+            agent_reply_max_segments: env_or("AGENT_REPLY_MAX_SEGMENTS", "4")
+                .parse::<usize>()?
+                .max(1),
             message_debounce_window_ms: env_or("MESSAGE_DEBOUNCE_WINDOW_MS", "4000")
                 .parse::<u64>()?
                 .clamp(1000, 10_000),
