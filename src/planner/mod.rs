@@ -425,6 +425,9 @@ pub(crate) struct CommitmentEmitTarget {
     /// reason kind（`"commitment_overdue"` / `"commitment_imminent"`）。
     pub(crate) reason: CommitmentReason,
     pub(crate) due_at: DateTime,
+    /// 该 due_at 是否由 created_at + fallback 窗口合成（承诺本身无显式 due_at）。
+    /// 仅供 emit 事件审计；true 表示这是兜底跟进而非 LLM 给出的真实到期时间。
+    pub(crate) is_fallback_due: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -465,14 +468,19 @@ pub(crate) fn commitment_candidate_filter(workspace_id: &str, account_id: &str) 
 
 /// 在 Rust 侧从 contact.commitments 选"最早到期"那条作为代表 emit 目标。
 ///
-/// - `Plain(_)` 元素无 due_at，跳过；
-/// - `Structured` 元素若 due_at < now → overdue；
-/// - 若 now <= due_at <= now + window → imminent；
+/// - `Plain(_)` 元素无 due_at 也无 created_at，跳过；
+/// - `Structured` 元素若有 due_at：due_at < now → overdue；now <= due_at <= now+window → imminent；
+/// - `Structured` 元素若**无 due_at**：当 `fallback_due_hours > 0` 时用
+///   `created_at + fallback_due_hours` 合成兜底 due_at（标记 `is_fallback_due`），
+///   再按同样的 overdue/imminent 判定——这样 LLM 当前产出的无 due_at 承诺（全部
+///   走 from_plain_text，due_at=None）也能被兜底跟进，而不是永远被跳过；
+///   `fallback_due_hours == 0` 时保留旧行为（无 due_at 即跳过）。
 /// - 选 due_at 最早的那条；overdue 与 imminent 都存在时优先 overdue（更紧迫）。
 pub(crate) fn pick_commitment_emit_target(
     contact: &Contact,
     now: DateTime,
     imminent_window_hours: i64,
+    fallback_due_hours: i64,
 ) -> Option<CommitmentEmitTarget> {
     let now_ms = now.timestamp_millis();
     let imminent_horizon_ms = now_ms.saturating_add(imminent_window_hours * 60 * 60 * 1000);
@@ -484,8 +492,19 @@ pub(crate) fn pick_commitment_emit_target(
         if entry.id.is_empty() {
             continue;
         }
-        let Some(due_at) = entry.due_at else {
-            continue;
+        // due_at 缺失时用 created_at + fallback 窗口合成（仅当 fallback 启用）。
+        let (due_at, is_fallback_due) = match entry.due_at {
+            Some(d) => (d, false),
+            None if fallback_due_hours > 0 => {
+                let synthetic = DateTime::from_millis(
+                    entry
+                        .created_at
+                        .timestamp_millis()
+                        .saturating_add(fallback_due_hours * 60 * 60 * 1000),
+                );
+                (synthetic, true)
+            }
+            None => continue,
         };
         let due_ms = due_at.timestamp_millis();
         let reason = if due_ms < now_ms {
@@ -500,6 +519,7 @@ pub(crate) fn pick_commitment_emit_target(
             text: entry.text.clone(),
             reason,
             due_at,
+            is_fallback_due,
         };
         best = match best {
             None => Some(candidate),
@@ -570,6 +590,7 @@ async fn scan_commitments(state: &AppState) -> anyhow::Result<()> {
     let account_id = state.config.default_account_id.clone();
     let now = DateTime::now();
     let imminent_window = state.config.strategic_planner_commitment_imminent_window_hours;
+    let fallback_due_hours = state.config.strategic_planner_commitment_fallback_due_hours;
     let dedup_hours = state.config.strategic_planner_commitment_emit_dedup_hours;
     let priority_enabled = state.config.strategic_planner_priority_enabled;
 
@@ -589,7 +610,7 @@ async fn scan_commitments(state: &AppState) -> anyhow::Result<()> {
         if !managed_and_not_in_cooldown(&contact) {
             continue;
         }
-        let Some(target) = pick_commitment_emit_target(&contact, now, imminent_window) else {
+        let Some(target) = pick_commitment_emit_target(&contact, now, imminent_window, fallback_due_hours) else {
             continue;
         };
         if commitment_recently_emitted(state, &contact, &target.id, now, dedup_hours).await? {
@@ -657,6 +678,7 @@ async fn scan_commitments(state: &AppState) -> anyhow::Result<()> {
                 "reason": target.reason.label(),
                 "commitmentId": &target.id,
                 "dueAt": due_at_ms,
+                "isFallbackDue": target.is_fallback_due,
                 "textSnippet": snippet,
             }),
         )
@@ -693,9 +715,12 @@ async fn scan_commitments(state: &AppState) -> anyhow::Result<()> {
 // 段 3：stage_stagnation（M2）
 // ---------------------------------------------------------------------------
 
-/// 终状态列表：这些 stage 视为已结案/暂停，不再 emit stage_stagnation。
-/// 暂时硬编码；后续 milestone 可考虑从 `system_taxonomies` 中按 metadata 标记读出。
-const TERMINAL_STAGES: &[&str] = &["closed_won", "closed_lost", "paused"];
+/// 终态/不推进态列表：这些 stage 不再 emit stage_stagnation。
+/// 取值对齐 m006 种子的真实 customer_stage id——`customer_success`(成交后维护)、
+/// `cooldown`(风险冷却,另有 cooldown_until 时间门控)、`dormant_reactivation`
+/// (沉默唤醒,本就低频触达,不应被停滞催)。后续 milestone 可考虑从
+/// `system_taxonomies` 按 metadata 标记读出。
+const TERMINAL_STAGES: &[&str] = &["customer_success", "cooldown", "dormant_reactivation"];
 
 /// MongoDB 端筛 managed + 非冷却 + 非终状态 + customer_stage_updated_at 老于阈值
 /// + last_inbound_at 不太近（avoid 与 silent 段重叠）。
@@ -774,24 +799,31 @@ fn idle_days_since(stage_updated_at: Option<DateTime>, now_ms: i64) -> i64 {
 // ---------------------------------------------------------------------------
 
 /// 客户阶段价值权重：值越大越优先 emit。映射常量化，**不**新增 collection。
-/// `closed_won` 实际不会进 commitment / stage_stagnation 段（已在 TERMINAL_STAGES 排除集），
-/// 这里给个占位值便于将来其它扫描器复用。
+///
+/// 取值来自 `system_taxonomies` 的 customer_stage 种子（m006，9 个 canonical id），
+/// 权重按**销售漏斗推进度**单调排序——越接近成交、越需要及时跟进的阶段权重越高，
+/// 这样 daily cap 撞顶时高价值客户优先被 emit。这是可复现的抽象规则（漏斗序），
+/// 不针对任何单条对话。`customer_success` / `cooldown` / `dormant_reactivation` 是
+/// 成交后 / 冷却 / 沉默的终态或低优先态，已在 TERMINAL_STAGES 内存过滤里排除出
+/// stage_stagnation 段，这里给低位权重供 commitment 段排序复用。
 pub(crate) fn stage_priority_weight(stage: Option<&str>) -> i32 {
     match stage {
-        Some("closed_won") => 100,
-        Some("negotiation") | Some("proposal") => 80,
-        Some("qualified") => 60,
-        Some("discovery") | Some("awareness") => 40,
+        Some("commitment_followup") => 100,
+        Some("objection_handling") | Some("solution_fit") => 80,
+        Some("need_discovery") => 60,
+        Some("relationship_building") => 40,
+        Some("new_contact") => 20,
+        Some("customer_success") | Some("cooldown") | Some("dormant_reactivation") => 10,
         _ => 20,
     }
 }
 
-/// `intent_level` 权重：值越大越优先 emit。
+/// `intent_level` 权重：值越大越优先 emit。取值来自 m006 种子（high / medium / low）。
 pub(crate) fn intent_level_weight(level: Option<&str>) -> i32 {
     match level {
-        Some("hot") => 80,
-        Some("warm") => 50,
-        Some("cold") => 20,
+        Some("high") => 80,
+        Some("medium") => 50,
+        Some("low") => 20,
         _ => 10,
     }
 }
@@ -1315,7 +1347,7 @@ mod tests {
             commitments: vec![later_overdue, earlier_overdue, imminent],
             ..template()
         };
-        let target = pick_commitment_emit_target(&contact, now, 8).expect("target should exist");
+        let target = pick_commitment_emit_target(&contact, now, 8, 0).expect("target should exist");
         assert_eq!(target.id, "id-early");
         assert_eq!(target.reason, CommitmentReason::Overdue);
     }
@@ -1329,7 +1361,7 @@ mod tests {
             commitments: vec![entry("id-im", "4 小时后到期", Some(due))],
             ..template()
         };
-        let target = pick_commitment_emit_target(&contact, now, 8).expect("imminent");
+        let target = pick_commitment_emit_target(&contact, now, 8, 0).expect("imminent");
         assert_eq!(target.reason, CommitmentReason::Imminent);
         assert_eq!(target.id, "id-im");
     }
@@ -1343,7 +1375,7 @@ mod tests {
             commitments: vec![entry("id-far", "12 小时后到期", Some(due))],
             ..template()
         };
-        assert!(pick_commitment_emit_target(&contact, now, 8).is_none());
+        assert!(pick_commitment_emit_target(&contact, now, 8, 0).is_none());
     }
 
     /// `Plain` 元素无 due_at → 跳过；只剩 Plain 时不 emit。
@@ -1354,7 +1386,60 @@ mod tests {
             commitments: vec![CommitmentRepr::Plain("旧字符串承诺".to_string())],
             ..template()
         };
-        assert!(pick_commitment_emit_target(&contact, now, 8).is_none());
+        assert!(pick_commitment_emit_target(&contact, now, 8, 0).is_none());
+    }
+
+    /// 构造一条无 due_at、可控 created_at 的 Structured 承诺(模拟 from_plain_text 落库形态)。
+    fn entry_no_due(id: &str, created_ms: i64) -> CommitmentRepr {
+        CommitmentRepr::Structured(CommitmentEntry {
+            id: id.to_string(),
+            text: "无 due 的承诺".to_string(),
+            due_at: None,
+            created_at: DateTime::from_millis(created_ms),
+            extra: Document::new(),
+        })
+    }
+
+    /// #70 兜底:无 due_at 承诺在 fallback 启用时用 created_at + fallback 合成 due。
+    /// created_at 很早 → 合成 due 已过 now → overdue,被 emit(原行为是永远跳过)。
+    #[test]
+    fn commitment_no_due_with_fallback_emits_overdue() {
+        let now = dt(100 * 60 * 60 * 1000); // now = 100h
+        let contact = Contact {
+            commitments: vec![entry_no_due("id-nodue", 0)], // created=0,fallback=72h → due=72h < now
+            ..template()
+        };
+        let target =
+            pick_commitment_emit_target(&contact, now, 8, 72).expect("fallback should emit");
+        assert_eq!(target.id, "id-nodue");
+        assert_eq!(target.reason, CommitmentReason::Overdue);
+        assert!(target.is_fallback_due, "应标记为兜底合成的 due");
+    }
+
+    /// #70 兜底:fallback=0(禁用)时,无 due_at 承诺仍按旧行为跳过。
+    #[test]
+    fn commitment_no_due_without_fallback_skips() {
+        let now = dt(100 * 60 * 60 * 1000);
+        let contact = Contact {
+            commitments: vec![entry_no_due("id-nodue", 0)],
+            ..template()
+        };
+        assert!(pick_commitment_emit_target(&contact, now, 8, 0).is_none());
+    }
+
+    /// #70 兜底:created_at 较新(合成 due 还在未来窗口内)→ imminent 而非 overdue。
+    #[test]
+    fn commitment_no_due_fallback_imminent_when_recently_created() {
+        // created=98h,fallback=4h → 合成 due=102h;now=100h,imminent 窗口 8h → 102h 在 [100,108] 内。
+        let now = dt(100 * 60 * 60 * 1000);
+        let contact = Contact {
+            commitments: vec![entry_no_due("id-nodue", 98 * 60 * 60 * 1000)],
+            ..template()
+        };
+        let target =
+            pick_commitment_emit_target(&contact, now, 8, 4).expect("fallback imminent");
+        assert_eq!(target.reason, CommitmentReason::Imminent);
+        assert!(target.is_fallback_due);
     }
 
     /// 没有 id 的 Structured（理论上迁移后不该存在）也跳过。
@@ -1369,7 +1454,7 @@ mod tests {
             )],
             ..template()
         };
-        assert!(pick_commitment_emit_target(&contact, now, 8).is_none());
+        assert!(pick_commitment_emit_target(&contact, now, 8, 0).is_none());
     }
 
     /// commitment filter 只筛 commitments 非空。
@@ -1390,8 +1475,11 @@ mod tests {
     #[test]
     fn stage_stagnation_excludes_terminal_stage() {
         let now = DateTime::now();
+        // 真实终态 id（customer_success 成交后维护）应被 TERMINAL_STAGES 内存过滤排除，
+        // 即便 last_inbound 已远超停滞阈值也不 emit。
         let contact = Contact {
             last_inbound_at: Some(dt(now.timestamp_millis() - 30 * 24 * 60 * 60 * 1000)),
+            domain_attributes: Some(attrs_with_stage("customer_success")),
             ..template()
         };
         assert!(!stage_stagnation_passes_in_memory(&contact, now));
@@ -1414,7 +1502,7 @@ mod tests {
         let now = DateTime::now();
         let contact = Contact {
             last_inbound_at: Some(dt(now.timestamp_millis() - 30 * 24 * 60 * 60 * 1000)),
-            domain_attributes: Some(attrs_with_stage("discovery")),
+            domain_attributes: Some(attrs_with_stage("need_discovery")),
             ..template()
         };
         assert!(stage_stagnation_passes_in_memory(&contact, now));
@@ -1480,6 +1568,7 @@ mod tests {
             text: "test".to_string(),
             reason,
             due_at: dt(due_ms),
+            is_fallback_due: false,
         }
     }
 
@@ -1495,38 +1584,38 @@ mod tests {
         assert!(key_a < key_b, "overdue {:?} should sort before imminent {:?}", key_a, key_b);
     }
 
-    /// commitment_priority_key：同 reason 同 due 时，stage 价值高（negotiation）优先于 awareness。
+    /// commitment_priority_key：同 reason 同 due 时，stage 价值高（commitment_followup）优先于 new_contact。
     #[test]
     fn commitment_priority_value_weight_breaks_tie() {
         let now_ms: i64 = 10_000_000;
         let due = now_ms - 1_000;
         let target = make_target("x", due, CommitmentReason::Overdue);
         let high = Contact {
-            domain_attributes: Some(attrs_with_stage("negotiation")),
+            domain_attributes: Some(attrs_with_stage("commitment_followup")),
             ..template()
         };
         let low = Contact {
-            domain_attributes: Some(attrs_with_stage("awareness")),
+            domain_attributes: Some(attrs_with_stage("new_contact")),
             ..template()
         };
         assert!(
             commitment_priority_key(&high, &target) < commitment_priority_key(&low, &target),
-            "negotiation should sort before awareness"
+            "commitment_followup should sort before new_contact"
         );
     }
 
-    /// commitment_priority_key：同 reason / 同 stage 时，hot intent 优先于 cold。
+    /// commitment_priority_key：同 reason / 同 stage 时，high intent 优先于 low。
     #[test]
     fn commitment_priority_intent_weight_breaks_tie() {
         let now_ms: i64 = 10_000_000;
         let due = now_ms - 1_000;
         let target = make_target("x", due, CommitmentReason::Overdue);
         let hot = Contact {
-            domain_attributes: Some(attrs_with_stage_intent("qualified", "hot")),
+            domain_attributes: Some(attrs_with_stage_intent("solution_fit", "high")),
             ..template()
         };
         let cold = Contact {
-            domain_attributes: Some(attrs_with_stage_intent("qualified", "cold")),
+            domain_attributes: Some(attrs_with_stage_intent("solution_fit", "low")),
             ..template()
         };
         assert!(commitment_priority_key(&hot, &target) < commitment_priority_key(&cold, &target));
@@ -1544,24 +1633,24 @@ mod tests {
         assert!(commitment_priority_key(&contact, &early) < commitment_priority_key(&contact, &late));
     }
 
-    /// stage_stagnation_priority_key：同停滞天数下，negotiation 阶段优先于 discovery。
+    /// stage_stagnation_priority_key：同停滞天数下，commitment_followup 阶段优先于 relationship_building。
     #[test]
     fn stage_stagnation_priority_higher_value_first() {
         let now_ms: i64 = 30 * 24 * 60 * 60 * 1000;
         let updated = dt(0);
         let _ = updated;
         let high = Contact {
-            domain_attributes: Some(attrs_with_stage_updated("negotiation", 0)),
+            domain_attributes: Some(attrs_with_stage_updated("commitment_followup", 0)),
             ..template()
         };
         let low = Contact {
-            domain_attributes: Some(attrs_with_stage_updated("discovery", 0)),
+            domain_attributes: Some(attrs_with_stage_updated("relationship_building", 0)),
             ..template()
         };
         assert!(
             stage_stagnation_priority_key(&high, now_ms)
                 < stage_stagnation_priority_key(&low, now_ms),
-            "negotiation should sort before discovery"
+            "commitment_followup should sort before relationship_building"
         );
     }
 
@@ -1570,12 +1659,12 @@ mod tests {
     fn stage_stagnation_priority_more_stagnant_first() {
         let now_ms: i64 = 30 * 24 * 60 * 60 * 1000;
         let stale_30d = Contact {
-            domain_attributes: Some(attrs_with_stage_updated("qualified", 0)),
+            domain_attributes: Some(attrs_with_stage_updated("solution_fit", 0)),
             ..template()
         };
         let stale_15d = Contact {
             domain_attributes: Some(attrs_with_stage_updated(
-                "qualified",
+                "solution_fit",
                 15 * 24 * 60 * 60 * 1000,
             )),
             ..template()
@@ -1587,22 +1676,23 @@ mod tests {
         );
     }
 
-    /// stage_priority_weight：覆盖默认分支（None / 未识别 stage）走 fallback=20。
+    /// stage_priority_weight：覆盖默认分支（None / 未识别 stage）走 fallback=20，
+    /// 以及真实种子 id 的梯度（漏斗推进度）。
     #[test]
     fn stage_priority_weight_fallback() {
         assert_eq!(stage_priority_weight(None), 20);
         assert_eq!(stage_priority_weight(Some("nonsense")), 20);
-        assert_eq!(stage_priority_weight(Some("negotiation")), 80);
-        assert_eq!(stage_priority_weight(Some("qualified")), 60);
+        assert_eq!(stage_priority_weight(Some("commitment_followup")), 100);
+        assert_eq!(stage_priority_weight(Some("need_discovery")), 60);
     }
 
-    /// intent_level_weight：覆盖默认分支。
+    /// intent_level_weight：覆盖默认分支 + 真实种子档位（high/medium/low）。
     #[test]
     fn intent_level_weight_fallback() {
         assert_eq!(intent_level_weight(None), 10);
-        assert_eq!(intent_level_weight(Some("hot")), 80);
-        assert_eq!(intent_level_weight(Some("warm")), 50);
-        assert_eq!(intent_level_weight(Some("cold")), 20);
+        assert_eq!(intent_level_weight(Some("high")), 80);
+        assert_eq!(intent_level_weight(Some("medium")), 50);
+        assert_eq!(intent_level_weight(Some("low")), 20);
         assert_eq!(intent_level_weight(Some("nonsense")), 10);
     }
 

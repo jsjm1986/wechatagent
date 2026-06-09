@@ -87,6 +87,7 @@ mod tests {
             strategic_planner_silent_threshold_hours: 72,
             strategic_planner_daily_emit_cap: 20,
             strategic_planner_commitment_imminent_window_hours: 8,
+            strategic_planner_commitment_fallback_due_hours: 72,
             strategic_planner_commitment_emit_dedup_hours: 24,
             strategic_planner_stage_stagnation_threshold_days: 14,
             strategic_planner_stage_stagnation_recent_inbound_hours: 24,
