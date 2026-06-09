@@ -52,6 +52,10 @@ pub struct AppConfig {
     /// M2 Strategic Planner：commitment.due_at 在 [now, now+N] 内视为 imminent，
     /// 触发 `Planner: commitment_imminent` 提前提醒。默认 8 小时。
     pub strategic_planner_commitment_imminent_window_hours: i64,
+    /// M2 Strategic Planner：无显式 due_at 的承诺，用 `created_at + N 小时` 合成兜底
+    /// 到期时间,使 LLM 当前产出的无 due_at 承诺也能被兜底跟进。默认 72 小时；
+    /// 设 0 禁用兜底(回到"无 due_at 即跳过"的旧行为)。
+    pub strategic_planner_commitment_fallback_due_hours: i64,
     /// M2 Strategic Planner：同一 commitment_id 在多少小时内不重复 emit。
     /// Planner 通过 `agent_events` 反查同 commitment_id 历史 emit 实现幂等。默认 24 小时。
     pub strategic_planner_commitment_emit_dedup_hours: i64,
@@ -345,6 +349,11 @@ impl AppConfig {
             strategic_planner_commitment_imminent_window_hours: env_or(
                 "STRATEGIC_PLANNER_COMMITMENT_IMMINENT_WINDOW_HOURS",
                 "8",
+            )
+            .parse()?,
+            strategic_planner_commitment_fallback_due_hours: env_or(
+                "STRATEGIC_PLANNER_COMMITMENT_FALLBACK_DUE_HOURS",
+                "72",
             )
             .parse()?,
             strategic_planner_commitment_emit_dedup_hours: env_or(
