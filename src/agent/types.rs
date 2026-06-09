@@ -99,6 +99,8 @@ pub struct AgentDecision {
     pub customer_stage: Option<String>,
     pub intent_level: Option<String>,
     pub last_commitment: Option<String>,
+    /// PR-D：结构化承诺（带可选 dueAt）。promote 时从 RawAgentDecision.commitment 透传。
+    pub commitment: Option<CommitmentDecision>,
     pub follow_up_policy: Option<String>,
     #[serde(default)]
     pub profile_attributes: Document,
@@ -219,6 +221,7 @@ impl Default for AgentDecision {
             customer_stage: None,
             intent_level: None,
             last_commitment: None,
+            commitment: None,
             follow_up_policy: None,
             profile_attributes: Document::new(),
             intent_analysis: Document::new(),
@@ -325,6 +328,8 @@ pub struct RawAgentDecision {
     pub customer_stage: Option<String>,
     pub intent_level: Option<String>,
     pub last_commitment: Option<String>,
+    /// PR-D：结构化承诺（带可选 dueAt）。缺失时回落 last_commitment。
+    pub commitment: Option<CommitmentDecision>,
     pub follow_up_policy: Option<String>,
     pub profile_attributes: Option<Document>,
     pub intent_analysis: Option<Document>,
@@ -821,6 +826,23 @@ fn carry_through_fields(raw: RawAgentDecision, decision: &mut AgentDecision) {
     if raw.last_commitment.is_some() {
         decision.last_commitment = raw.last_commitment;
     }
+    if let Some(c) = raw.commitment {
+        // 只在 text 非空时透传，避免 LLM 输出空壳 commitment 对象覆盖 last_commitment 路径。
+        if !c.text.trim().is_empty() {
+            // gateway 落库入口判断 last_commitment 是否非空；LLM 只给结构化 commitment
+            // 而没给 last_commitment 时，用 commitment.text 回填，保证承诺不丢、且 due_at
+            // 从 commitment 取。
+            if decision
+                .last_commitment
+                .as_deref()
+                .map(|s| s.trim().is_empty())
+                .unwrap_or(true)
+            {
+                decision.last_commitment = Some(c.text.clone());
+            }
+            decision.commitment = Some(c);
+        }
+    }
     if raw.follow_up_policy.is_some() {
         decision.follow_up_policy = raw.follow_up_policy;
     }
@@ -891,6 +913,20 @@ pub struct FollowUpDecision {
     pub run_at: String,
     #[serde(default)]
     pub content: String,
+}
+
+/// LLM 输出的结构化承诺（PR-D）：在 `lastCommitment` 字符串之外可选携带 `dueAt`。
+/// 让 Planner 直接拿到承诺到期时间，而非全部走 from_plain_text（due_at=None）兜底。
+/// 向后兼容：LLM 不输出 `commitment` 时该字段为 None，回落旧的 last_commitment 路径。
+#[derive(Debug, Serialize, Deserialize, Default, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct CommitmentDecision {
+    #[serde(default)]
+    pub text: String,
+    /// RFC3339 到期时间；空串 / 非法格式时落库为 due_at=None，由 planner 的
+    /// created_at 兜底接住（见 [`super::super::planner`] commitment fallback）。
+    #[serde(default)]
+    pub due_at: String,
 }
 
 #[derive(Debug, Serialize, Deserialize, Default, Clone)]
@@ -1393,6 +1429,63 @@ pub(crate) fn parse_rfc3339_to_bson(value: &str) -> Option<mongodb::bson::DateTi
     mongodb::bson::DateTime::parse_rfc3339_str(value).ok()
 }
 
+/// 解析 LLM 给出的 follow_up.run_at（RFC3339）；解析失败时**降级**到
+/// `now + degrade_offset_ms` 而非静默丢弃整条跟进任务。
+///
+/// #66：此前 gateway 用 `if let Some(run_at) = parse_rfc3339_to_bson(..)` 无 else
+/// 分支——LLM 给空串 / 非法格式（prompt 模板 runAt 默认空串、无格式约束）时整条
+/// follow_up 无声蒸发、无日志无事件。降级到"现在 + 偏移"后任务仍会入队，由
+/// precheck 的 context_changed / expired 正常守门；返回的 bool 标记是否走了降级，
+/// 供调用方写审计事件。
+pub(crate) fn resolve_run_at_or_degrade(
+    raw: &str,
+    now_ms: i64,
+    degrade_offset_ms: i64,
+) -> (mongodb::bson::DateTime, bool) {
+    match parse_rfc3339_to_bson(raw) {
+        Some(dt) => (dt, false),
+        None => (
+            mongodb::bson::DateTime::from_millis(now_ms.saturating_add(degrade_offset_ms)),
+            true,
+        ),
+    }
+}
+
+#[cfg(test)]
+mod run_at_degrade_tests {
+    use super::resolve_run_at_or_degrade;
+
+    #[test]
+    fn valid_rfc3339_parses_without_degrade() {
+        // 用 UTC 整点避免时区换算的魔数；与 bson 自身解析对照，不硬编码毫秒。
+        let raw = "2026-06-12T00:00:00Z";
+        let (dt, degraded) = resolve_run_at_or_degrade(raw, 0, 999);
+        assert!(!degraded, "合法 RFC3339 不应降级");
+        assert_eq!(
+            dt.timestamp_millis(),
+            mongodb::bson::DateTime::parse_rfc3339_str(raw)
+                .unwrap()
+                .timestamp_millis(),
+        );
+    }
+
+    #[test]
+    fn empty_string_degrades_to_now_plus_offset() {
+        let now_ms = 1_000_000;
+        let (dt, degraded) = resolve_run_at_or_degrade("", now_ms, 3_600_000);
+        assert!(degraded, "空串应降级");
+        assert_eq!(dt.timestamp_millis(), now_ms + 3_600_000);
+    }
+
+    #[test]
+    fn garbage_degrades_to_now_when_offset_zero() {
+        let now_ms = 5_000;
+        let (dt, degraded) = resolve_run_at_or_degrade("明天下午", now_ms, 0);
+        assert!(degraded, "非法格式应降级");
+        assert_eq!(dt.timestamp_millis(), now_ms, "offset=0 时降级到 now");
+    }
+}
+
 #[cfg(test)]
 mod validate_and_promote_tests {
     //! agent-autonomy-loop W1 / Task 2.3：核心校验路径的内联单元测试。
@@ -1461,6 +1554,39 @@ mod validate_and_promote_tests {
             reply_text: Some("好的，谢谢你的问候。".to_string()),
             ..RawAgentDecision::default()
         }
+    }
+
+    #[test]
+    fn commitment_carry_through_backfills_last_commitment_when_only_structured() {
+        // PR-D：LLM 只给结构化 commitment（带 dueAt）、没给 lastCommitment 字符串时，
+        // promote 应回填 last_commitment（gateway 落库入口判断它），并保留 commitment。
+        let mut raw = make_valid_low_routine_raw();
+        raw.commitment = Some(CommitmentDecision {
+            text: "周五前发方案".to_string(),
+            due_at: "2026-06-12T09:00:00+08:00".to_string(),
+        });
+        let runtime = runtime_default(true);
+        let (decision, _risks) = raw.validate_and_promote(&runtime);
+        assert_eq!(decision.last_commitment.as_deref(), Some("周五前发方案"));
+        assert_eq!(
+            decision.commitment.as_ref().map(|c| c.due_at.as_str()),
+            Some("2026-06-12T09:00:00+08:00")
+        );
+    }
+
+    #[test]
+    fn commitment_carry_through_empty_text_does_not_override() {
+        // 空壳 commitment（text 空）不应覆盖 last_commitment 路径，commitment 保持 None。
+        let mut raw = make_valid_low_routine_raw();
+        raw.last_commitment = Some("旧字符串承诺".to_string());
+        raw.commitment = Some(CommitmentDecision {
+            text: "  ".to_string(),
+            due_at: "".to_string(),
+        });
+        let runtime = runtime_default(true);
+        let (decision, _risks) = raw.validate_and_promote(&runtime);
+        assert_eq!(decision.last_commitment.as_deref(), Some("旧字符串承诺"));
+        assert!(decision.commitment.is_none(), "空壳 commitment 不透传");
     }
 
     #[test]
