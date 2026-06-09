@@ -43,6 +43,8 @@ mod m014_drop_trigger_keywords;
 mod m015_ops_tables_active_versions;
 mod m016_backfill_workspace_id_on_legacy_rows;
 mod m017_dedupe_outcome_aggregation;
+/// `pub`:集成测试需直接调用 `m018::run_step` 对预置顶层残留验证回填语义(详见模块内注释)。
+pub mod m018_backfill_domain_stage_from_legacy_top;
 
 type MigrationFuture<'a> = Pin<Box<dyn Future<Output = AppResult<()>> + Send + 'a>>;
 pub type MigrationFn = for<'a> fn(&'a Database) -> MigrationFuture<'a>;
@@ -122,6 +124,10 @@ pub const MIGRATIONS: &[Migration] = &[
     Migration {
         id: "2026_05_X1_002_dedupe_outcome_aggregation_tasks",
         run: |db| Box::pin(m017_dedupe_outcome_aggregation::run_step(db)),
+    },
+    Migration {
+        id: "2026_06_X2_001_backfill_domain_stage_from_legacy_top",
+        run: |db| Box::pin(m018_backfill_domain_stage_from_legacy_top::run_step(db)),
     },
 ];
 
