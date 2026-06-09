@@ -882,6 +882,10 @@ fn prompt_specs() -> Vec<PromptSpec> {
   "customerStage": "当前关系阶段",
   "intentLevel": "意向等级和原因",
   "lastCommitment": "最近承诺或待确认事项",
+  "commitment": {
+    "text": "最近承诺或待确认事项（与 lastCommitment 同义，二选一即可）",
+    "dueAt": "该承诺的到期时间，RFC3339 格式如 2026-06-12T09:00:00+08:00；无明确时间则留空"
+  },
   "followUpPolicy": "下一步跟进策略",
   "profileAttributes": {
     "identity": "身份角色，未知留空",
@@ -1073,6 +1077,10 @@ fn prompt_specs() -> Vec<PromptSpec> {
   "customerStage": "自由生成的客户阶段",
   "intentLevel": "自由生成的意向等级",
   "lastCommitment": "最近承诺或待确认事项",
+  "commitment": {
+    "text": "最近承诺或待确认事项（与 lastCommitment 同义，二选一即可）",
+    "dueAt": "该承诺的到期时间，RFC3339 格式如 2026-06-12T09:00:00+08:00；无明确时间则留空"
+  },
   "followUpPolicy": "下一步跟进策略",
   "profileAttributes": {
     "budget": "如未知则留空",
@@ -1123,7 +1131,7 @@ fn prompt_specs() -> Vec<PromptSpec> {
   "memoryUpdate": "需要写入长期记忆的摘要",
   "followUp": {
     "needed": false,
-    "runAt": "",
+    "runAt": "需要跟进时填 RFC3339 时间，如 2026-06-12T09:00:00+08:00；needed=false 时留空",
     "content": ""
   },
 

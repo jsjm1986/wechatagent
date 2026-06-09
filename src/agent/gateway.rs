@@ -67,7 +67,7 @@ use super::run_envelope::{
 };
 use super::runtime::UserRuntimeParameters;
 use super::types::{
-    doc_bool, doc_i64, doc_string, non_empty_option, parse_rfc3339_to_bson, to_bson_array,
+    doc_bool, doc_i64, doc_string, non_empty_option, to_bson_array,
     AgentDecision, AgentTrigger, ContactSendResult, DecisionReviewResult, KnowledgeRouteResult,
     ManualContactSend, RunPlannerResult, SendGatewayResult,
 };
@@ -2288,15 +2288,19 @@ async fn apply_agent_updates(
     if let Some(value) = non_empty_option(&decision.last_commitment) {
         // M2：把 LLM 输出的字符串承诺升级为结构化 CommitmentEntry 追加到
         // commitments 数组（cap 8），让 Planner::scan_commitments 在 due_at
-        // 到期/快到期时能 emit follow_up。当前 LLM JSON contract 仍输出
-        // 单字符串 last_commitment（无 due_at），后续升级 prompt 后可由
-        // RawAgentDecision 直接吃 commitments 数组。
+        // 到期/快到期时能 emit follow_up。PR-D：优先用结构化 decision.commitment
+        // （带 dueAt），解析成 CommitmentEntry.due_at；LLM 未给结构化 commitment 时
+        // 回落 last_commitment 字符串路径（due_at=None，由 planner created_at 兜底接住）。
         let mut commitments: Vec<crate::models::CommitmentRepr> = contact.commitments.clone();
         let already_present = commitments.iter().any(|c| c.text() == value.as_str());
         if !already_present {
-            commitments.push(crate::models::CommitmentRepr::Structured(
-                crate::models::CommitmentEntry::from_plain_text(value.clone()),
-            ));
+            let mut entry = crate::models::CommitmentEntry::from_plain_text(value.clone());
+            if let Some(c) = &decision.commitment {
+                if c.text.trim() == value.as_str() {
+                    entry.due_at = crate::agent::types::parse_rfc3339_to_bson(&c.due_at);
+                }
+            }
+            commitments.push(crate::models::CommitmentRepr::Structured(entry));
             if commitments.len() > 8 {
                 let drop = commitments.len() - 8;
                 commitments.drain(0..drop);
@@ -2449,42 +2453,62 @@ async fn apply_agent_updates(
     if let Some(follow_up) = &decision.follow_up {
         if follow_up.needed && !follow_up.content.trim().is_empty() {
             if pending_follow_up_count(state, contact).await? < runtime.max_pending_follow_ups {
-                if let Some(run_at) = parse_rfc3339_to_bson(&follow_up.run_at) {
-                    let expires_at = DateTime::from_millis(
-                        run_at.timestamp_millis()
-                            + runtime.follow_up_expires_hours * 60 * 60 * 1000,
-                    );
-                    state
-                        .db
-                        .tasks()
-                        .insert_one(
-                            AgentTask {
-                                id: None,
-                                workspace_id: contact.workspace_id.clone(),
-                                account_id: contact.account_id.clone(),
-                                contact_wxid: contact.wxid.clone(),
-                                kind: "follow_up".to_string(),
-                                run_at,
-                                expires_at: Some(expires_at),
-                                content: follow_up.content.clone(),
-                                status: "pending".to_string(),
-                                source_decision_id: None,
-                                review_required: true,
-                                attempt_count: 0,
-                                max_attempts: 3,
-                                next_retry_at: None,
-                                gateway_status: None,
-                                cancel_reason: None,
-                                error: None,
-                                claimed_at: None,
-                                claim_recovery_count: 0,
-                                created_at: DateTime::now(),
-                                updated_at: DateTime::now(),
-                            },
-                            None,
-                        )
-                        .await?;
+                // #66：run_at 解析失败时降级到 now（而非静默丢弃整条跟进），
+                // precheck 的 context_changed / expired 仍正常守门。降级时写审计事件。
+                let (run_at, degraded) = crate::agent::types::resolve_run_at_or_degrade(
+                    &follow_up.run_at,
+                    DateTime::now().timestamp_millis(),
+                    0,
+                );
+                if degraded {
+                    write_event_for_account(
+                        state,
+                        &contact.account_id,
+                        Some(&contact.wxid),
+                        "agent.follow_up_run_at_degraded",
+                        "warn",
+                        &format!(
+                            "follow_up.run_at 解析失败，降级到 now：raw={:?}",
+                            follow_up.run_at
+                        ),
+                        Some(doc! { "raw_run_at": &follow_up.run_at }),
+                    )
+                    .await?;
                 }
+                let expires_at = DateTime::from_millis(
+                    run_at.timestamp_millis()
+                        + runtime.follow_up_expires_hours * 60 * 60 * 1000,
+                );
+                state
+                    .db
+                    .tasks()
+                    .insert_one(
+                        AgentTask {
+                            id: None,
+                            workspace_id: contact.workspace_id.clone(),
+                            account_id: contact.account_id.clone(),
+                            contact_wxid: contact.wxid.clone(),
+                            kind: "follow_up".to_string(),
+                            run_at,
+                            expires_at: Some(expires_at),
+                            content: follow_up.content.clone(),
+                            status: "pending".to_string(),
+                            source_decision_id: None,
+                            review_required: true,
+                            attempt_count: 0,
+                            max_attempts: 3,
+                            next_retry_at: None,
+                            gateway_status: None,
+                            cancel_reason: None,
+                            error: None,
+                            claimed_at: None,
+                            claim_recovery_count: 0,
+                            created_at: DateTime::now(),
+                            updated_at: DateTime::now(),
+                        },
+                        None,
+                    )
+                    .await?;
             }
         }
     }
