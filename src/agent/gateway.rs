@@ -1659,46 +1659,65 @@ async fn run_user_operation_gateway_inner(
                 task.id.map(|id| id.to_hex()).unwrap_or_default()
             }
         };
-        let enqueue_req = EnqueueRequest {
-            workspace_id: contact.workspace_id.clone(),
-            account_id: contact.account_id.clone(),
-            contact_wxid: contact.wxid.clone(),
-            run_id: run_id.clone(),
-            decision_id: Some(decision_review_id),
-            source_event_id,
-            source_kind: trigger.kind().to_string(),
-            content: final_decision.reply_text.clone(),
-            max_attempts: 3,
-        };
-        match outbox_enqueue(state, enqueue_req).await {
-            Ok(EnqueueOutcome::Created { outbox_id, .. }) => {
-                tracing::info!(
-                    %run_id,
-                    %outbox_id,
-                    contact_wxid = %contact.wxid,
-                    "outbox enqueued"
-                );
-                let _ = state
-                    .db
-                    .agent_run_logs()
-                    .update_one(
-                        doc! { "run_id": &run_id },
-                        doc! { "$set": { "outbox_status": "pending" } },
-                        None,
-                    )
-                    .await;
-            }
-            Ok(EnqueueOutcome::IdempotentSkip { idempotency_key }) => {
-                tracing::info!(
-                    %run_id,
-                    %idempotency_key,
-                    contact_wxid = %contact.wxid,
-                    "outbox enqueue idempotent skip"
-                );
-            }
-            Err(err) => {
-                tracing::error!(?err, %run_id, "outbox enqueue failed");
-                return Err(err.into());
+        // #68：把整条回复拆成多条短消息,逐条 enqueue。每条把 segment 序号拼进
+        // source_event_id(`{src}#seg{idx}`),保证 N 条幂等 key 天然不碰撞——否则
+        // 两段内容雷同(如都是"好的")时 content_hash 相同会被当幂等 skip 吞掉、丢消息。
+        let segments = split_reply_into_segments(
+            &final_decision.reply_text,
+            state.config.agent_reply_max_segment_chars,
+            state.config.agent_reply_max_segments,
+        );
+        let total = segments.len();
+        for (idx, segment) in segments.into_iter().enumerate() {
+            let seg_source_event_id = if total > 1 {
+                format!("{source_event_id}#seg{idx}")
+            } else {
+                source_event_id.clone()
+            };
+            let enqueue_req = EnqueueRequest {
+                workspace_id: contact.workspace_id.clone(),
+                account_id: contact.account_id.clone(),
+                contact_wxid: contact.wxid.clone(),
+                run_id: run_id.clone(),
+                decision_id: Some(decision_review_id),
+                source_event_id: seg_source_event_id,
+                source_kind: trigger.kind().to_string(),
+                content: segment,
+                max_attempts: 3,
+            };
+            match outbox_enqueue(state, enqueue_req).await {
+                Ok(EnqueueOutcome::Created { outbox_id, .. }) => {
+                    tracing::info!(
+                        %run_id,
+                        %outbox_id,
+                        contact_wxid = %contact.wxid,
+                        segment_index = idx,
+                        segment_total = total,
+                        "outbox enqueued"
+                    );
+                    let _ = state
+                        .db
+                        .agent_run_logs()
+                        .update_one(
+                            doc! { "run_id": &run_id },
+                            doc! { "$set": { "outbox_status": "pending" } },
+                            None,
+                        )
+                        .await;
+                }
+                Ok(EnqueueOutcome::IdempotentSkip { idempotency_key }) => {
+                    tracing::info!(
+                        %run_id,
+                        %idempotency_key,
+                        contact_wxid = %contact.wxid,
+                        segment_index = idx,
+                        "outbox enqueue idempotent skip"
+                    );
+                }
+                Err(err) => {
+                    tracing::error!(?err, %run_id, segment_index = idx, "outbox enqueue failed");
+                    return Err(err.into());
+                }
             }
         }
     }
@@ -1958,6 +1977,98 @@ async fn consecutive_outbound_count(state: &AppState, contact: &Contact) -> AppR
         }
     }
     Ok(count)
+}
+
+/// #68：把一段回复文本拆成多条短消息,贴近微信即时通讯"分条发"的习惯。
+///
+/// LLM 被 prompt 引导"内容多就拆成几条短消息",但 reply_text 是单 String、下游
+/// 整条单发,拆分意图在数据结构层被吞。本函数用**可复现的抽象规则**(结构分隔 +
+/// 长度 + 句界)还原拆分,不针对任何单条话术:
+///
+/// 1. 先按双换行 `\n\n` 切段(LLM 产出多条时的天然分隔);
+/// 2. 每段再按单换行 `\n` 切(微信里换行常代表另起一条);
+/// 3. 仍超过 `max_segment_chars`(按 unicode char 计)的段,按句末标点
+///    (。！？!?；;)就近切,避免硬切词;
+/// 4. 全部 trim、丢弃空白段;
+/// 5. 段数超 `max_segments` 时,把尾部多余段合并回最后一段,避免刷屏;
+/// 6. 退化情形(拆完只剩 1 段或 0 段)返回单元素/原文,等价单发,零风险。
+pub(crate) fn split_reply_into_segments(
+    text: &str,
+    max_segment_chars: usize,
+    max_segments: usize,
+) -> Vec<String> {
+    let max_chars = max_segment_chars.max(1);
+    let max_segs = max_segments.max(1);
+
+    // 1-2：按双换行 + 单换行切出初步段落。
+    let mut rough: Vec<String> = Vec::new();
+    for block in text.split("\n\n") {
+        for line in block.split('\n') {
+            let trimmed = line.trim();
+            if !trimmed.is_empty() {
+                rough.push(trimmed.to_string());
+            }
+        }
+    }
+    if rough.is_empty() {
+        let whole = text.trim();
+        return if whole.is_empty() {
+            Vec::new()
+        } else {
+            vec![whole.to_string()]
+        };
+    }
+
+    // 3：超长段按句末标点就近切。
+    let mut segments: Vec<String> = Vec::new();
+    for seg in rough {
+        if seg.chars().count() <= max_chars {
+            segments.push(seg);
+        } else {
+            segments.extend(split_long_segment(&seg, max_chars));
+        }
+    }
+
+    // 5：段数超上限,尾部合并回最后一段(用换行连接,保留可读性)。
+    if segments.len() > max_segs {
+        let tail = segments.split_off(max_segs - 1);
+        segments.push(tail.join("\n"));
+    }
+
+    segments.retain(|s| !s.trim().is_empty());
+    segments
+}
+
+/// 把一个超长段按句末标点就近切成多块,每块尽量不超过 `max_chars`。
+/// 无标点可切时按字符硬切兜底,保证终止。
+fn split_long_segment(seg: &str, max_chars: usize) -> Vec<String> {
+    const SENTENCE_ENDS: &[char] = &['。', '！', '？', '!', '?', '；', ';', '.'];
+    let mut out: Vec<String> = Vec::new();
+    let mut current = String::new();
+    let mut current_len = 0usize;
+    for ch in seg.chars() {
+        current.push(ch);
+        current_len += 1;
+        let at_sentence_end = SENTENCE_ENDS.contains(&ch);
+        if at_sentence_end && current_len >= max_chars {
+            out.push(current.trim().to_string());
+            current.clear();
+            current_len = 0;
+        } else if current_len >= max_chars.saturating_mul(2) {
+            // 长时间无句末标点:硬切兜底,避免无限堆积。
+            out.push(current.trim().to_string());
+            current.clear();
+            current_len = 0;
+        }
+    }
+    if !current.trim().is_empty() {
+        out.push(current.trim().to_string());
+    }
+    out.retain(|s| !s.is_empty());
+    if out.is_empty() {
+        out.push(seg.trim().to_string());
+    }
+    out
 }
 
 pub(crate) fn blocked(status: &str, reason: &str) -> SendGatewayResult {
@@ -3073,6 +3184,54 @@ pub(crate) fn compute_taxonomy_guard_outcome(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn split_reply_double_newline_into_segments() {
+        let segs = split_reply_into_segments("第一条\n\n第二条\n\n第三条", 120, 4);
+        assert_eq!(segs, vec!["第一条", "第二条", "第三条"]);
+    }
+
+    #[test]
+    fn split_reply_single_line_stays_one_segment() {
+        // 退化:短的单段原样单发(零风险)。
+        let segs = split_reply_into_segments("好的，收到啦", 120, 4);
+        assert_eq!(segs, vec!["好的，收到啦"]);
+    }
+
+    #[test]
+    fn split_reply_empty_or_blank_yields_nothing() {
+        assert!(split_reply_into_segments("", 120, 4).is_empty());
+        assert!(split_reply_into_segments("   \n\n  ", 120, 4).is_empty());
+    }
+
+    #[test]
+    fn split_reply_long_segment_breaks_on_sentence_end() {
+        // 一段超长无换行,按句末标点就近切(max=10)。
+        let text = "这是第一句话呀。这是第二句话哦。这是第三句话呢。";
+        let segs = split_reply_into_segments(text, 10, 8);
+        assert!(segs.len() >= 2, "超长段应被切成多条: {:?}", segs);
+        // 每条不应过度超过软上限(允许到标点为止)。
+        for s in &segs {
+            assert!(s.chars().count() <= 20, "段过长: {s}");
+        }
+    }
+
+    #[test]
+    fn split_reply_caps_segment_count_merging_tail() {
+        // 5 段、上限 3 → 前 2 段独立,后 3 段合并进第 3 段。
+        let segs = split_reply_into_segments("a\n\nb\n\nc\n\nd\n\ne", 120, 3);
+        assert_eq!(segs.len(), 3);
+        assert_eq!(segs[0], "a");
+        assert_eq!(segs[1], "b");
+        assert_eq!(segs[2], "c\nd\ne");
+    }
+
+    #[test]
+    fn split_reply_identical_segments_preserved_for_idempotency() {
+        // 两段内容雷同也都保留(各自 enqueue 时靠 source_event_id 加 seg 序号防幂等碰撞)。
+        let segs = split_reply_into_segments("好的\n\n好的", 120, 4);
+        assert_eq!(segs, vec!["好的", "好的"]);
+    }
 
     #[test]
     fn context_changed_followup_pure_hits_when_inbound_after_task() {
