@@ -68,6 +68,12 @@ pub struct UserRuntimeParameters {
     /// agent-autonomy-loop W0 / Task 1.3：outbox dispatcher claim lease 时长（秒）。
     /// 默认 60，loader 中 clamp 到 `[10, 600]`。
     pub outbox_lease_seconds: i32,
+    /// #69 作息门控：是否启用静默时段。运营域 DB 配置（前端可改），默认 true。
+    pub quiet_hours_enabled: bool,
+    /// #69 作息门控：静默起点小时（运营方进程本地时区，0..=23，含）。默认 22。
+    pub quiet_hours_start: u32,
+    /// #69 作息门控：静默终点 / 醒来小时（0..=23，不含）。默认 8。
+    pub quiet_hours_end: u32,
 }
 
 impl UserRuntimeParameters {
@@ -120,6 +126,9 @@ impl UserRuntimeParameters {
             knowledge_search_top_k: clamp_i32(typed.knowledge_search_top_k, 1, 32, 8),
             outbox_poll_interval_seconds: clamp_i32(typed.outbox_poll_interval_seconds, 1, 60, 5),
             outbox_lease_seconds: clamp_i32(typed.outbox_lease_seconds, 10, 600, 60),
+            quiet_hours_enabled: typed.quiet_hours_enabled,
+            quiet_hours_start: typed.quiet_hours_start.min(23),
+            quiet_hours_end: typed.quiet_hours_end.min(23),
         }
     }
 
@@ -149,7 +158,10 @@ impl UserRuntimeParameters {
             "knowledgeOpenSliceMaxK": self.knowledge_open_slice_max_k,
             "knowledgeSearchTopK": self.knowledge_search_top_k,
             "outboxPollIntervalSeconds": self.outbox_poll_interval_seconds,
-            "outboxLeaseSeconds": self.outbox_lease_seconds
+            "outboxLeaseSeconds": self.outbox_lease_seconds,
+            "quietHoursEnabled": self.quiet_hours_enabled,
+            "quietHoursStart": self.quiet_hours_start as i32,
+            "quietHoursEnd": self.quiet_hours_end as i32
         }
     }
 }
@@ -210,6 +222,9 @@ impl Default for UserRuntimeParameters {
             knowledge_search_top_k: clamp_i32(typed.knowledge_search_top_k, 1, 32, 8),
             outbox_poll_interval_seconds: clamp_i32(typed.outbox_poll_interval_seconds, 1, 60, 5),
             outbox_lease_seconds: clamp_i32(typed.outbox_lease_seconds, 10, 600, 60),
+            quiet_hours_enabled: typed.quiet_hours_enabled,
+            quiet_hours_start: typed.quiet_hours_start.min(23),
+            quiet_hours_end: typed.quiet_hours_end.min(23),
         }
     }
 }
@@ -470,6 +485,9 @@ mod tests {
             knowledge_search_top_k: 8,
             outbox_poll_interval_seconds: 5,
             outbox_lease_seconds: 60,
+            quiet_hours_enabled: true,
+            quiet_hours_start: 22,
+            quiet_hours_end: 8,
         };
         let doc = runtime.as_document();
         assert_eq!(doc.get_i64("reactionTokenBudget").ok(), Some(8000));
@@ -491,6 +509,35 @@ mod tests {
         let blank_typed = blank.runtime_parameters_typed();
         assert_eq!(blank_typed.reaction_token_budget, 8000);
         assert_eq!(blank_typed.reaction_max_llm_calls, 2);
+    }
+
+    /// #69 作息门控：typed 路径解析自定义静默时段；未设置时默认启用 + 22→8。
+    #[test]
+    fn typed_round_trip_carries_quiet_hours() {
+        let config = make_domain_config(doc! {
+            "quietHoursEnabled": false,
+            "quietHoursStart": 23_i64,
+            "quietHoursEnd": 7_i64
+        });
+        let typed = config.runtime_parameters_typed();
+        assert!(!typed.quiet_hours_enabled);
+        assert_eq!(typed.quiet_hours_start, 23);
+        assert_eq!(typed.quiet_hours_end, 7);
+        // 默认（未设置）：启用，22→8。
+        let blank = make_domain_config(Document::new()).runtime_parameters_typed();
+        assert!(blank.quiet_hours_enabled, "缺字段默认启用作息门控");
+        assert_eq!(blank.quiet_hours_start, 22);
+        assert_eq!(blank.quiet_hours_end, 8);
+    }
+
+    /// #69：as_document 把作息门控三字段写进 wire shape（camelCase）。
+    #[test]
+    fn as_document_carries_quiet_hours() {
+        let runtime = UserRuntimeParameters::default();
+        let doc = runtime.as_document();
+        assert_eq!(doc.get_bool("quietHoursEnabled").ok(), Some(true));
+        assert_eq!(doc.get_i32("quietHoursStart").ok(), Some(22));
+        assert_eq!(doc.get_i32("quietHoursEnd").ok(), Some(8));
     }
 
     fn baseline_runtime() -> UserRuntimeParameters {
