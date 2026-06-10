@@ -1160,7 +1160,7 @@
   }
   .wikiModeBar {
     display: grid;
-    grid-template-columns: repeat(4, 1fr);
+    grid-template-columns: repeat(3, 1fr);
     gap: 8px;
     padding: 12px 16px;
     border-bottom: 1px solid var(--hairline);
@@ -1281,6 +1281,34 @@
     color: var(--color-scheduled);
     font-weight: 600;
   }
+  .wikiNavGroupTitle {
+    margin: 10px 0 2px;
+    padding: 0 12px;
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    color: var(--ink-3);
+  }
+  button.wikiNavGroupToggle {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    width: 100%;
+    border: none;
+    background: transparent;
+    cursor: pointer;
+    text-align: left;
+    font-family: var(--font-body);
+  }
+  button.wikiNavGroupToggle:hover {
+    color: var(--ink-2);
+  }
+  .wikiNavSpacer {
+    margin-top: 12px;
+    padding-top: 12px;
+    border-top: 1px solid var(--hairline);
+  }
   /* Today · DigestCanvas */
   .wikiDigestCanvas {
     display: flex;
@@ -1351,10 +1379,6 @@
     flex-direction: column;
     gap: 8px;
   }
-  .wikiDigestCard.sev-fatal {
-    border-left: 3px solid var(--color-blocked);
-    background: var(--fill-blocked);
-  }
   .wikiDigestCard.sev-critical {
     border-left: 3px solid var(--color-blocked);
   }
@@ -1378,10 +1402,6 @@
     text-transform: uppercase;
     letter-spacing: 0.04em;
     font-family: var(--font-mono);
-  }
-  .wikiDigestBadge.sev-fatal {
-    background: var(--color-blocked);
-    color: #fff;
   }
   .wikiDigestBadge.sev-critical {
     background: var(--fill-blocked);
