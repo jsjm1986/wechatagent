@@ -2103,6 +2103,18 @@ mod typed {
         /// 默认 60，loader 中 clamp 到 [10, 600]。
         #[serde(default = "defaults::outbox_lease_seconds")]
         pub outbox_lease_seconds: i32,
+        /// #69 作息门控：是否启用静默时段。默认 **true**（运营域配置，前端可改）。
+        /// 开启后客户在静默时段来消息不立即回，排到醒来时段一次性回复；主动发送
+        /// （planner/follow_up）静默时段到点则重排到醒来时刻。relay 转述豁免。
+        #[serde(default = "defaults::quiet_hours_enabled")]
+        pub quiet_hours_enabled: bool,
+        /// #69 作息门控：静默起点小时（运营方进程本地时区，0..=23，含）。默认 22。
+        #[serde(default = "defaults::quiet_hours_start")]
+        pub quiet_hours_start: u32,
+        /// #69 作息门控：静默终点 / 醒来小时（0..=23，不含）。默认 8。
+        /// `start == end` 退化为永不静默；`start > end`（如 22→8）表示跨午夜。
+        #[serde(default = "defaults::quiet_hours_end")]
+        pub quiet_hours_end: u32,
     }
 
     impl Default for RuntimeParametersTyped {
@@ -2133,6 +2145,9 @@ mod typed {
                 knowledge_search_top_k: defaults::knowledge_search_top_k(),
                 outbox_poll_interval_seconds: defaults::outbox_poll_interval_seconds(),
                 outbox_lease_seconds: defaults::outbox_lease_seconds(),
+                quiet_hours_enabled: defaults::quiet_hours_enabled(),
+                quiet_hours_start: defaults::quiet_hours_start(),
+                quiet_hours_end: defaults::quiet_hours_end(),
             }
         }
     }
@@ -2216,6 +2231,16 @@ mod typed {
         }
         pub fn outbox_lease_seconds() -> i32 {
             60
+        }
+        // ── #69 作息门控默认值 ──
+        pub fn quiet_hours_enabled() -> bool {
+            true
+        }
+        pub fn quiet_hours_start() -> u32 {
+            22
+        }
+        pub fn quiet_hours_end() -> u32 {
+            8
         }
     }
 

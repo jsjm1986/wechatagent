@@ -26,7 +26,7 @@ use sha2::Sha256;
 use crate::{
     agent,
     error::{AppError, AppResult},
-    models::{AgentStatus, Contact, ConversationMessage, MessageDirection},
+    models::{AgentStatus, AgentTask, Contact, ConversationMessage, MessageDirection},
     routes::AppState,
 };
 
@@ -548,34 +548,121 @@ pub async fn wechat_webhook(
     // 没有时插入状态并 spawn 一个 runner。runner 等去抖窗口到再跑一次聚合流水线，
     // 运行期间到的新消息会触发抢占重算（见 run_debounce_pipeline）。
     let managed = contact.agent_status == AgentStatus::Managed;
+    let mut deferred = false;
     if managed {
-        let key = contact_key(&workspace_id, &account_id, &from_wxid);
-        let window_ms = state.config.message_debounce_window_ms;
-        let (st, spawned_now) = register_inbound(key.clone(), inbound.clone(), window_ms);
-        if spawned_now {
-            let bg_state = state.clone();
-            let bg_account_id = account_id.clone();
-            let bg_from_wxid = from_wxid.clone();
-            let bg_app_id = app_id.clone();
-            tokio::spawn(async move {
-                run_debounce_pipeline(
-                    bg_state,
-                    key,
-                    st,
-                    bg_account_id,
-                    bg_from_wxid,
-                    bg_app_id,
-                )
-                .await;
-            });
+        // #69 作息门控：静默时段（运营方进程本地时区）客户来消息时**不立即回**，
+        // 排一条 deferred_inbound_reply 跟进任务到醒来时刻。inbound 已在上面落库，
+        // 醒来时 gateway 的 load_recent_messages 会天然聚合这段时间的全部消息一次性回。
+        // 开关/时段来自运营域配置（RuntimeParametersTyped，前端可改），默认启用。
+        let domain_config = agent::load_user_operation_domain_config_for_contact(
+            &state,
+            &workspace_id,
+            &contact.id.map(|id| id.to_hex()).unwrap_or_default(),
+        )
+        .await?;
+        let runtime =
+            crate::agent::UserRuntimeParameters::from_config(domain_config.as_ref(), &state);
+        let quiet = runtime.quiet_hours_enabled
+            && agent::quiet_hours::is_quiet_now(
+                runtime.quiet_hours_start,
+                runtime.quiet_hours_end,
+            );
+        if quiet {
+            ensure_wake_followup_task(&state, &contact, runtime.quiet_hours_end).await?;
+            deferred = true;
+        } else {
+            let key = contact_key(&workspace_id, &account_id, &from_wxid);
+            let window_ms = state.config.message_debounce_window_ms;
+            let (st, spawned_now) = register_inbound(key.clone(), inbound.clone(), window_ms);
+            if spawned_now {
+                let bg_state = state.clone();
+                let bg_account_id = account_id.clone();
+                let bg_from_wxid = from_wxid.clone();
+                let bg_app_id = app_id.clone();
+                tokio::spawn(async move {
+                    run_debounce_pipeline(
+                        bg_state,
+                        key,
+                        st,
+                        bg_account_id,
+                        bg_from_wxid,
+                        bg_app_id,
+                    )
+                    .await;
+                });
+            }
         }
     }
 
     Ok(Json(serde_json::json!({
         "ok": true,
         "managed": managed,
-        "queued": managed
+        "queued": managed && !deferred,
+        "deferred": deferred
     })))
+}
+
+/// #69 作息门控：静默时段入站时，确保存在一条"醒来回复"跟进任务。
+///
+/// kind = [`agent::quiet_hours::DEFERRED_INBOUND_REPLY_KIND`]，与 planner 主动催进的
+/// `follow_up` 区分——precheck 据此豁免 `context_changed`（这条任务的存在意义恰恰
+/// 就是回 task 创建后累积的客户消息）。`run_at` = 下一次醒来时刻；醒来后由 task
+/// worker → handle_follow_up_task → gateway 走完整决策/审查/拆短/outbox 链路。
+///
+/// 去重：仿 planner `has_pending_follow_up` —— 同 contact 已有未终态的 wake 任务则
+/// 不再插（静默时段连发多条 → 1 task → 醒来基于累积消息回 1 次）。先查后插存在
+/// TOCTOU 窗口，但 precheck 的 rate_limited 闸在醒来时会兜住重复触达，可接受。
+async fn ensure_wake_followup_task(
+    state: &AppState,
+    contact: &Contact,
+    wake_hour: u32,
+) -> AppResult<()> {
+    let existing = state
+        .db
+        .tasks()
+        .count_documents(
+            doc! {
+                "workspace_id": &contact.workspace_id,
+                "account_id": &contact.account_id,
+                "contact_wxid": &contact.wxid,
+                "kind": agent::quiet_hours::DEFERRED_INBOUND_REPLY_KIND,
+                "status": { "$in": ["pending", "retry", "running"] },
+            },
+            None,
+        )
+        .await?;
+    if existing > 0 {
+        return Ok(());
+    }
+    let now = DateTime::now();
+    let run_at = agent::quiet_hours::next_wake_at(wake_hour);
+    // expiry 给 24h 余量（覆盖最长跨午夜窗口 + 醒来后 worker tick 间隔），过期未跑则作废。
+    let expires_at = DateTime::from_millis(run_at.timestamp_millis() + 24 * 60 * 60 * 1000);
+    let task = AgentTask {
+        id: None,
+        workspace_id: contact.workspace_id.clone(),
+        account_id: contact.account_id.clone(),
+        contact_wxid: contact.wxid.clone(),
+        kind: agent::quiet_hours::DEFERRED_INBOUND_REPLY_KIND.to_string(),
+        run_at,
+        expires_at: Some(expires_at),
+        content: "作息时段累积消息，醒来后基于完整上下文回复".to_string(),
+        status: "pending".to_string(),
+        source_decision_id: None,
+        review_required: true,
+        attempt_count: 0,
+        max_attempts: 3,
+        next_retry_at: None,
+        gateway_status: None,
+        cancel_reason: None,
+        error: None,
+        claimed_at: None,
+        claim_recovery_count: 0,
+        created_at: now,
+        updated_at: now,
+    };
+    state.db.tasks().insert_one(task, None).await?;
+    Ok(())
 }
 
 fn stable_payload_hash(value: &Value) -> String {
