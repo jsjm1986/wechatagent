@@ -1,0 +1,21 @@
+.scrim {
+  position: fixed; inset: 0; z-index: var(--z-overlay);
+  display: flex; align-items: center; justify-content: center;
+  padding: 24px;
+  background: var(--overlay-scrim);
+  animation: overlayScrimIn .14s ease;
+}
+@keyframes overlayScrimIn { from { opacity: 0; } to { opacity: 1; } }
+
+.panel {
+  width: 100%; max-width: 480px; max-height: calc(100vh - 48px);
+  overflow-y: auto; outline: none;
+  background: var(--surface-card); border-radius: var(--r-md);
+  border: 1px solid var(--hairline);
+  box-shadow: 0 24px 60px -20px rgba(20,30,60,.45), 0 6px 18px -10px rgba(20,30,60,.25), inset 0 1px 1px rgba(255,255,255,.9);
+  animation: overlayPanelIn .16s cubic-bezier(.2,.7,.3,1);
+}
+@keyframes overlayPanelIn {
+  from { opacity: 0; transform: translateY(8px) scale(.98); }
+  to   { opacity: 1; transform: translateY(0) scale(1); }
+}
