@@ -617,7 +617,7 @@ async fn run_user_operation_gateway_inner(
         if let Some(task_id) = task_id {
             // #69：静默时段命中 → 重排到醒来时刻（不取消，避免丢承诺/催进）；其余 block 维持取消。
             if precheck.status == "quiet_hours_deferred" {
-                let wake_at = crate::agent::quiet_hours::next_wake_at(runtime.quiet_hours_end);
+                let wake_at = crate::agent::quiet_hours::next_wake_at(runtime.quiet_hours_end, runtime.quiet_hours_tz_offset_hours);
                 reschedule_task(state, task_id, wake_at, &precheck.reason).await?;
             } else {
                 cancel_task(state, task_id, &precheck.status, &precheck.reason).await?;
@@ -1410,7 +1410,7 @@ async fn run_user_operation_gateway_inner(
             // 第二道在 LLM 决策之后命中（罕见：仅当静默边界恰好落在决策耗时内），
             // 重排即丢弃这次决策、醒来按完整上下文重跑，语义正确。
             if final_precheck.status == "quiet_hours_deferred" {
-                let wake_at = crate::agent::quiet_hours::next_wake_at(runtime.quiet_hours_end);
+                let wake_at = crate::agent::quiet_hours::next_wake_at(runtime.quiet_hours_end, runtime.quiet_hours_tz_offset_hours);
                 reschedule_task(state, task_id, wake_at, &final_precheck.reason).await?;
             } else {
                 cancel_task(
@@ -1927,6 +1927,7 @@ pub(crate) async fn precheck_send_gateway(
             && crate::agent::quiet_hours::is_quiet_now(
                 runtime.quiet_hours_start,
                 runtime.quiet_hours_end,
+                runtime.quiet_hours_tz_offset_hours,
             )
         {
             return Ok(blocked(

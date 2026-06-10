@@ -97,7 +97,8 @@ const USER_RUNTIME_PARAMETER_FIELDS: Array<{
   { key: "reactionMaxLlmCalls", label: "反应分析调用上限", detail: "用户回应分析最多 LLM 调用次数", kind: "number", defaultValue: 2 },
   { key: "quietHoursEnabled", label: "作息门控", detail: "开启后客户在休息时段来的消息不立即回，等醒来时段一次性回复；主动跟进也顺延到醒来", kind: "boolean", defaultValue: true },
   { key: "quietHoursStart", label: "休息起点(时)", detail: "进入静默的整点小时，运营方本地时区，0-23，含。默认 22", kind: "number", defaultValue: 22 },
-  { key: "quietHoursEnd", label: "醒来时间(时)", detail: "结束静默/醒来回复的整点小时，0-23，不含。默认 8；起点>终点表示跨午夜", kind: "number", defaultValue: 8 }
+  { key: "quietHoursEnd", label: "醒来时间(时)", detail: "结束静默/醒来回复的整点小时，0-23，不含。默认 8；起点>终点表示跨午夜", kind: "number", defaultValue: 8 },
+  { key: "quietHoursTzOffsetHours", label: "作息时区偏移", detail: "运营方所在时区相对 UTC 的小时偏移，中国填 8。不依赖服务器时区，跨机房部署也稳定", kind: "number", defaultValue: 8 }
 ];
 
 export function UserOpsModeHeader({ mode, onMode }: { mode: UserOpsMode; onMode: (mode: UserOpsMode) => void }) {

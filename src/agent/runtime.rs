@@ -74,6 +74,9 @@ pub struct UserRuntimeParameters {
     pub quiet_hours_start: u32,
     /// #69 作息门控：静默终点 / 醒来小时（0..=23，不含）。默认 8。
     pub quiet_hours_end: u32,
+    /// #69 作息门控：运营方时区相对 UTC 的小时偏移（中国 +8）。默认 8。
+    /// 固定偏移使作息判定不依赖部署宿主时区；loader clamp 到 `[-12, 14]`。
+    pub quiet_hours_tz_offset_hours: i32,
 }
 
 impl UserRuntimeParameters {
@@ -129,6 +132,7 @@ impl UserRuntimeParameters {
             quiet_hours_enabled: typed.quiet_hours_enabled,
             quiet_hours_start: typed.quiet_hours_start.min(23),
             quiet_hours_end: typed.quiet_hours_end.min(23),
+            quiet_hours_tz_offset_hours: typed.quiet_hours_tz_offset_hours.clamp(-12, 14),
         }
     }
 
@@ -161,7 +165,8 @@ impl UserRuntimeParameters {
             "outboxLeaseSeconds": self.outbox_lease_seconds,
             "quietHoursEnabled": self.quiet_hours_enabled,
             "quietHoursStart": self.quiet_hours_start as i32,
-            "quietHoursEnd": self.quiet_hours_end as i32
+            "quietHoursEnd": self.quiet_hours_end as i32,
+            "quietHoursTzOffsetHours": self.quiet_hours_tz_offset_hours
         }
     }
 }
@@ -225,6 +230,7 @@ impl Default for UserRuntimeParameters {
             quiet_hours_enabled: typed.quiet_hours_enabled,
             quiet_hours_start: typed.quiet_hours_start.min(23),
             quiet_hours_end: typed.quiet_hours_end.min(23),
+            quiet_hours_tz_offset_hours: typed.quiet_hours_tz_offset_hours.clamp(-12, 14),
         }
     }
 }
@@ -488,6 +494,7 @@ mod tests {
             quiet_hours_enabled: true,
             quiet_hours_start: 22,
             quiet_hours_end: 8,
+            quiet_hours_tz_offset_hours: 8,
         };
         let doc = runtime.as_document();
         assert_eq!(doc.get_i64("reactionTokenBudget").ok(), Some(8000));
@@ -511,26 +518,29 @@ mod tests {
         assert_eq!(blank_typed.reaction_max_llm_calls, 2);
     }
 
-    /// #69 作息门控：typed 路径解析自定义静默时段；未设置时默认启用 + 22→8。
+    /// #69 作息门控：typed 路径解析自定义静默时段；未设置时默认启用 + 22→8 + tz+8。
     #[test]
     fn typed_round_trip_carries_quiet_hours() {
         let config = make_domain_config(doc! {
             "quietHoursEnabled": false,
             "quietHoursStart": 23_i64,
-            "quietHoursEnd": 7_i64
+            "quietHoursEnd": 7_i64,
+            "quietHoursTzOffsetHours": -5_i64
         });
         let typed = config.runtime_parameters_typed();
         assert!(!typed.quiet_hours_enabled);
         assert_eq!(typed.quiet_hours_start, 23);
         assert_eq!(typed.quiet_hours_end, 7);
-        // 默认（未设置）：启用，22→8。
+        assert_eq!(typed.quiet_hours_tz_offset_hours, -5);
+        // 默认（未设置）：启用，22→8，tz+8。
         let blank = make_domain_config(Document::new()).runtime_parameters_typed();
         assert!(blank.quiet_hours_enabled, "缺字段默认启用作息门控");
         assert_eq!(blank.quiet_hours_start, 22);
         assert_eq!(blank.quiet_hours_end, 8);
+        assert_eq!(blank.quiet_hours_tz_offset_hours, 8, "缺字段默认 +8 中国时区");
     }
 
-    /// #69：as_document 把作息门控三字段写进 wire shape（camelCase）。
+    /// #69：as_document 把作息门控四字段写进 wire shape（camelCase）。
     #[test]
     fn as_document_carries_quiet_hours() {
         let runtime = UserRuntimeParameters::default();
@@ -538,6 +548,18 @@ mod tests {
         assert_eq!(doc.get_bool("quietHoursEnabled").ok(), Some(true));
         assert_eq!(doc.get_i32("quietHoursStart").ok(), Some(22));
         assert_eq!(doc.get_i32("quietHoursEnd").ok(), Some(8));
+        assert_eq!(doc.get_i32("quietHoursTzOffsetHours").ok(), Some(8));
+    }
+
+    /// #69：from_config 把 tz 偏移 clamp 到 [-12, 14]，挡住误配。
+    #[test]
+    fn from_config_clamps_tz_offset() {
+        let too_big = make_domain_config(doc! { "quietHoursTzOffsetHours": 99_i64 });
+        let typed = too_big.runtime_parameters_typed();
+        assert_eq!(typed.quiet_hours_tz_offset_hours.clamp(-12, 14), 14);
+        let too_small = make_domain_config(doc! { "quietHoursTzOffsetHours": -99_i64 });
+        let typed2 = too_small.runtime_parameters_typed();
+        assert_eq!(typed2.quiet_hours_tz_offset_hours.clamp(-12, 14), -12);
     }
 
     fn baseline_runtime() -> UserRuntimeParameters {

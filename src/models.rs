@@ -2115,6 +2115,10 @@ mod typed {
         /// `start == end` 退化为永不静默；`start > end`（如 22→8）表示跨午夜。
         #[serde(default = "defaults::quiet_hours_end")]
         pub quiet_hours_end: u32,
+        /// #69 作息门控：运营方时区相对 UTC 的小时偏移（如中国 +8）。默认 8。
+        /// 用固定偏移而非 `chrono::Local`，使作息判定**不依赖部署宿主时区**。
+        #[serde(default = "defaults::quiet_hours_tz_offset_hours")]
+        pub quiet_hours_tz_offset_hours: i32,
     }
 
     impl Default for RuntimeParametersTyped {
@@ -2148,6 +2152,7 @@ mod typed {
                 quiet_hours_enabled: defaults::quiet_hours_enabled(),
                 quiet_hours_start: defaults::quiet_hours_start(),
                 quiet_hours_end: defaults::quiet_hours_end(),
+                quiet_hours_tz_offset_hours: defaults::quiet_hours_tz_offset_hours(),
             }
         }
     }
@@ -2240,6 +2245,9 @@ mod typed {
             22
         }
         pub fn quiet_hours_end() -> u32 {
+            8
+        }
+        pub fn quiet_hours_tz_offset_hours() -> i32 {
             8
         }
     }
