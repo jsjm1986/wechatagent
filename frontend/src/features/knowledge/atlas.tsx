@@ -10,6 +10,7 @@ import {
   Workflow,
 } from "lucide-react";
 import { parseApiError } from "../../lib/api";
+import { useConfirm } from "../../components/ui/ConfirmDialog";
 import { focusChunk, type TreeChunkItem } from "./shared";
 
 // ── P1 · ChunkGraphView · 关系图谱（SVG 原生布局，0 新依赖）─────────────
@@ -484,6 +485,7 @@ export function DomainSchemaTab() {
   const [activating, setActivating] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [info, setInfo] = useState<string | null>(null);
+  const confirm = useConfirm();
 
   async function load() {
     setLoading(true);
@@ -505,6 +507,13 @@ export function DomainSchemaTab() {
   }, []);
 
   async function activate(schemaId: string) {
+    const ok = await confirm({
+      title: "切换为当前在用 Schema？",
+      body: "切换后 AI 将按这套行业 Schema 判断字段与状态，立即影响在途会话。",
+      tone: "danger",
+      confirmText: "确认切换",
+    });
+    if (!ok) return;
     setActivating(schemaId);
     setError(null);
     setInfo(null);
@@ -877,9 +886,35 @@ function PublishBar({ resourceKind, id, onChange }: PublishBarProps) {
   const [busy, setBusy] = useState<string>("");
   const [error, setError] = useState<string | null>(null);
   const [info, setInfo] = useState<string | null>(null);
+  const confirm = useConfirm();
 
   async function call(action: "publish" | "rollout" | "rollback") {
-    if (action === "rollback" && !window.confirm("回退到上一版本？")) return;
+    if (action === "publish") {
+      const ok = await confirm({
+        title: "发布新版？",
+        body: "发布后将成为该资源的当前在用版本，影响 AI 后续判断。",
+        tone: "danger",
+        confirmText: "确认发布",
+      });
+      if (!ok) return;
+    } else if (action === "rollout") {
+      const ok = await confirm({
+        title: "灰度全量？",
+        body: "将把新版本推送给全部会话，立即对所有客户生效，且不可逆。",
+        tone: "danger",
+        requireText: "全量",
+        confirmText: "确认全量发布",
+      });
+      if (!ok) return;
+    } else {
+      const ok = await confirm({
+        title: "回退到上一版本？",
+        body: "将放弃当前版本，恢复为上一个已发布版本。",
+        tone: "danger",
+        confirmText: "确认回退",
+      });
+      if (!ok) return;
+    }
     setBusy(action);
     setError(null);
     setInfo(null);

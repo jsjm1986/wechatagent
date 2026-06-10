@@ -14,7 +14,22 @@ import {
   X,
 } from "lucide-react";
 import { parseApiError, LlmUnavailableError } from "../../lib/api";
+import { useConfirm } from "../../components/ui/ConfirmDialog";
+import { useFormDialog } from "../../components/ui/FormDialog";
+import type { PickerChunk } from "../../components/ui/ChunkRef";
 import { type TrustChunkFields, chunkTypeLabel } from "./trustTypes";
+
+/// merge/relate 的 ChunkPicker 列表加载器:拉全部 chunk 供搜索选择,替代手输 ObjectId。
+async function loadChunkOptions(): Promise<PickerChunk[]> {
+  try {
+    const r = await fetch("/api/operation-knowledge/chunks");
+    if (!r.ok) return [];
+    const data = (await r.json()) as { items?: { id: string; title?: string | null }[] };
+    return (data.items ?? []).map((c) => ({ id: c.id, title: c.title }));
+  } catch {
+    return [];
+  }
+}
 
 const LLM_KIND_LABELS: Record<string, string> = {
   timeout: "上游超时",
@@ -360,7 +375,7 @@ export function ChunkInspectorPane({
                 <pre>{chunk.body}</pre>
               </section>
             ) : null}
-            <ChunkActionsBar chunk={chunk} onChanged={reload} />
+            <ChunkActionsBar chunk={chunk} onChanged={reload} lockedByOther={lock.state === "other"} />
             <ChunkReferrersList chunkId={chunk.id} />
             <ChunkSourceSection chunkId={chunk.id} />
             <ChunkRevisionsTimeline chunkId={chunk.id} onRolledBack={reload} />
@@ -649,11 +664,15 @@ type ChunkActionState = { busy: string | null; error: string | null; info: strin
 function ChunkActionsBar({
   chunk,
   onChanged,
+  lockedByOther,
 }: {
   chunk: TreeChunkItem;
   onChanged: () => void;
+  lockedByOther?: boolean;
 }) {
   const [state, setState] = useState<ChunkActionState>({ busy: null, error: null, info: null });
+  const confirm = useConfirm();
+  const form = useFormDialog();
 
   async function call(
     action: string,
@@ -677,168 +696,177 @@ function ChunkActionsBar({
   const id = encodeURIComponent(chunk.id);
   const isArchived = chunk.status === "archived";
   const isVerified = chunk.integrityStatus === "verified";
+  // 软锁:他人编辑中禁用一切写操作(此前 ChunkActionsBar 完全不读锁态,软锁形同虚设)
+  const writeDisabled = !!state.busy || !!lockedByOther;
 
   async function onPatch() {
-    const summary = window.prompt("新摘要（覆盖 summary，留空保持不变）", chunk.summary ?? "");
-    if (summary === null) return;
-    await call(
-      "patch",
-      "POST",
-      `/api/operation-knowledge/chunks/${id}/patch`,
-      { summary: summary || undefined, actor: "admin" },
-    );
+    const v = await form({
+      title: "改写摘要",
+      fields: [
+        { kind: "textarea", name: "summary", label: "新摘要", defaultValue: chunk.summary ?? "", placeholder: "留空保持不变" },
+      ],
+    });
+    if (!v) return;
+    await call("改写摘要", "POST", `/api/operation-knowledge/chunks/${id}/patch`, {
+      summary: v.summary || undefined,
+      actor: "admin",
+    });
   }
 
   async function onReject() {
-    const reason = window.prompt("reject 原因（必填）");
-    if (!reason) return;
-    await call(
-      "reject",
-      "POST",
-      `/api/operation-knowledge/chunks/${id}/reject`,
-      { reason },
-    );
+    const v = await form({
+      title: "退回这条知识",
+      fields: [
+        { kind: "textarea", name: "reason", label: "退回原因", required: true, placeholder: "如：来源失效 / 内容过期 / 与现有知识矛盾" },
+      ],
+    });
+    if (!v) return;
+    await call("退回", "POST", `/api/operation-knowledge/chunks/${id}/reject`, { reason: v.reason });
   }
 
   async function onArchive() {
-    if (!window.confirm(`确认 archive chunk ${chunk.id}?`)) return;
-    await call(
-      "archive",
-      "POST",
-      `/api/operation-knowledge/chunks/${id}/archive`,
-      { actor: "admin" },
-    );
+    const ok = await confirm({
+      title: "归档这条知识？",
+      body: "归档后 AI 不再使用它回复客户，可在已归档列表恢复。",
+      tone: "danger",
+      confirmText: "确认归档",
+    });
+    if (!ok) return;
+    await call("归档", "POST", `/api/operation-knowledge/chunks/${id}/archive`, { actor: "admin" });
   }
 
   async function onSplit() {
-    const cutoff = window.prompt("切点（正则或字符位置整数，必填）");
-    if (!cutoff) return;
-    const num = Number(cutoff);
-    const body = Number.isFinite(num)
-      ? { offset: num, actor: "admin" }
-      : { regex: cutoff, actor: "admin" };
-    await call(
-      "split",
-      "POST",
-      `/api/operation-knowledge/chunks/${id}/split`,
-      body,
-    );
+    const v = await form({
+      title: "拆分知识条目",
+      fields: [
+        {
+          kind: "select",
+          name: "mode",
+          label: "拆分方式",
+          options: [
+            { value: "offset", label: "按字符位置" },
+            { value: "regex", label: "按正则匹配" },
+          ],
+        },
+        { kind: "text", name: "cutoff", label: "切点", required: true, hint: "按字符位置填整数（如 200）；按正则填表达式" },
+      ],
+    });
+    if (!v) return;
+    const body =
+      v.mode === "offset"
+        ? { offset: Number(v.cutoff), actor: "admin" }
+        : { regex: v.cutoff, actor: "admin" };
+    if (v.mode === "offset" && !Number.isFinite(body.offset as number)) {
+      setState({ busy: null, error: "字符位置必须是整数", info: null });
+      return;
+    }
+    await call("拆分", "POST", `/api/operation-knowledge/chunks/${id}/split`, body);
   }
 
   async function onMerge() {
-    const targetId = window.prompt("合并目标 chunk id（必填）");
-    if (!targetId) return;
-    if (!window.confirm(`将 ${chunk.id} 合并到 ${targetId}？原 chunk 会被 archived。`)) return;
-    await call(
-      "merge",
-      "POST",
-      `/api/operation-knowledge/chunks/${id}/merge`,
-      { target_id: targetId, actor: "admin" },
-    );
+    const v = await form({
+      title: "合并到另一条知识",
+      loadChunks: loadChunkOptions,
+      fields: [
+        { kind: "chunkRef", name: "target", label: "合并目标", required: true, hint: "当前知识会被归档，内容并入目标" },
+      ],
+    });
+    if (!v) return;
+    await call("合并", "POST", `/api/operation-knowledge/chunks/${id}/merge`, {
+      target_id: v.target,
+      actor: "admin",
+    });
   }
 
   async function onRelate() {
-    const targetId = window.prompt("关联目标 chunk id");
-    if (!targetId) return;
-    const kind = window.prompt("关联 kind（如 supports / contradicts / superseded_by）", "supports");
-    if (!kind) return;
-    const note = window.prompt("备注（可空）", "") ?? "";
-    await call(
-      "relate",
-      "POST",
-      `/api/operation-knowledge/chunks/${id}/relate`,
-      { target_id: targetId, kind, note: note || null, actor: "admin" },
-    );
+    const v = await form({
+      title: "建立知识关联",
+      loadChunks: loadChunkOptions,
+      fields: [
+        { kind: "chunkRef", name: "target", label: "关联目标", required: true },
+        {
+          kind: "select",
+          name: "kind",
+          label: "关系类型",
+          options: [
+            { value: "supports", label: "支持" },
+            { value: "contradicts", label: "矛盾" },
+            { value: "superseded_by", label: "被取代" },
+          ],
+        },
+        { kind: "text", name: "note", label: "备注", placeholder: "可空" },
+      ],
+    });
+    if (!v) return;
+    await call("关联", "POST", `/api/operation-knowledge/chunks/${id}/relate`, {
+      target_id: v.target,
+      kind: v.kind,
+      note: v.note || null,
+      actor: "admin",
+    });
   }
 
   return (
     <section className="wikiInspectorSection">
       <div className="wikiInspectorSectionTitle">编辑动作</div>
+      {lockedByOther ? (
+        <div className="wikiAlert info">其他管理员正在编辑这条知识，已暂时锁定，无法修改。</div>
+      ) : null}
       <div className="wikiActionsBar">
         <button
           type="button"
           className="wikiBtn wikiActionBtn--verify"
-          disabled={!!state.busy || isVerified}
+          disabled={writeDisabled || isVerified}
           onClick={() =>
-            void call(
-              "verify",
-              "POST",
-              `/api/operation-knowledge/chunks/${id}/verify`,
-              {},
-            )
+            void call("确认放行", "POST", `/api/operation-knowledge/chunks/${id}/verify`, {})
           }
-          title="标记为 verified（AI 永不自动调用）"
+          title="确认这条知识可被 AI 用于回复客户（AI 永不自动调用）"
         >
-          <CheckCircle2 size={13} /> verify
+          <CheckCircle2 size={13} /> 确认放行
         </button>
         <button
           type="button"
           className="wikiBtn wikiActionBtn--reject"
-          disabled={!!state.busy}
+          disabled={writeDisabled}
           onClick={() => void onReject()}
         >
-          <X size={13} /> reject
+          <X size={13} /> 退回
+        </button>
+        <button type="button" className="wikiBtn" disabled={writeDisabled} onClick={() => void onPatch()}>
+          <SquarePen size={13} /> 改摘要
         </button>
         <button
           type="button"
           className="wikiBtn"
-          disabled={!!state.busy}
-          onClick={() => void onPatch()}
-        >
-          <SquarePen size={13} /> patch
-        </button>
-        <button
-          type="button"
-          className="wikiBtn"
-          disabled={!!state.busy || isArchived}
+          disabled={writeDisabled || isArchived}
           onClick={() => void onArchive()}
         >
-          <Archive size={13} /> archive
+          <Archive size={13} /> 归档
         </button>
         <button
           type="button"
           className="wikiBtn"
-          disabled={!!state.busy || !isArchived}
+          disabled={writeDisabled || !isArchived}
           onClick={() =>
-            void call(
-              "restore",
-              "POST",
-              `/api/operation-knowledge/chunks/${id}/restore`,
-              { actor: "admin" },
-            )
+            void call("恢复", "POST", `/api/operation-knowledge/chunks/${id}/restore`, { actor: "admin" })
           }
         >
-          <Undo2 size={13} /> restore
+          <Undo2 size={13} /> 恢复
         </button>
-        <button
-          type="button"
-          className="wikiBtn"
-          disabled={!!state.busy}
-          onClick={() => void onSplit()}
-        >
-          <Scissors size={13} /> split
+        <button type="button" className="wikiBtn" disabled={writeDisabled} onClick={() => void onSplit()}>
+          <Scissors size={13} /> 拆分
         </button>
-        <button
-          type="button"
-          className="wikiBtn"
-          disabled={!!state.busy}
-          onClick={() => void onMerge()}
-        >
-          <GitMerge size={13} /> merge
+        <button type="button" className="wikiBtn" disabled={writeDisabled} onClick={() => void onMerge()}>
+          <GitMerge size={13} /> 合并
         </button>
-        <button
-          type="button"
-          className="wikiBtn"
-          disabled={!!state.busy}
-          onClick={() => void onRelate()}
-        >
-          <Link2 size={13} /> relate
+        <button type="button" className="wikiBtn" disabled={writeDisabled} onClick={() => void onRelate()}>
+          <Link2 size={13} /> 关联
         </button>
       </div>
       {state.error ? <div className="wikiAlert error">{state.error}</div> : null}
       {state.info ? <div className="wikiAlert info">{state.info}</div> : null}
       <div className="wikiHint">
-        rollback 入口在下方"修订时间轴"。AI 强制 status=draft + integrity_status=needs_review；verify 仅 admin 手工触发。
+        恢复历史版本的入口在下方"修订时间轴"。AI 起草的知识强制为草稿、待确认；只有管理员能手动确认放行。
       </div>
     </section>
   );
@@ -941,6 +969,7 @@ export function ChunkRevisionsTimeline({
   chunkId: string;
   onRolledBack: () => void;
 }) {
+  const confirm = useConfirm();
   const [items, setItems] = useState<RevisionEntry[] | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -974,8 +1003,13 @@ export function ChunkRevisionsTimeline({
   async function rollback(rev: RevisionEntry) {
     const rid = rev.revisionId ?? rev.id;
     if (!rid) return;
-    if (!window.confirm(`确认回滚到 revision ${rid} (op=${rev.op})？将创建新 revision(op=rollback_to)。`))
-      return;
+    const ok = await confirm({
+      title: "回滚到该版本？",
+      body: "会基于这个历史版本生成一条新的修订记录，当前内容仍可追溯。",
+      tone: "danger",
+      confirmText: "确认回滚",
+    });
+    if (!ok) return;
     setBusyRev(rid);
     try {
       const r = await fetch(
