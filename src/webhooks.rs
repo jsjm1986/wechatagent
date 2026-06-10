@@ -553,14 +553,22 @@ pub async fn wechat_webhook(
         // #69 作息门控：静默时段（运营方进程本地时区）客户来消息时**不立即回**，
         // 排一条 deferred_inbound_reply 跟进任务到醒来时刻。inbound 已在上面落库，
         // 醒来时 gateway 的 load_recent_messages 会天然聚合这段时间的全部消息一次性回。
-        // 灰度开关默认 false——关停时完全旁路，等价于功能未上线。
-        let quiet = state.config.quiet_hours_enabled
+        // 开关/时段来自运营域配置（RuntimeParametersTyped，前端可改），默认启用。
+        let domain_config = agent::load_user_operation_domain_config_for_contact(
+            &state,
+            &workspace_id,
+            &contact.id.map(|id| id.to_hex()).unwrap_or_default(),
+        )
+        .await?;
+        let runtime =
+            crate::agent::UserRuntimeParameters::from_config(domain_config.as_ref(), &state);
+        let quiet = runtime.quiet_hours_enabled
             && agent::quiet_hours::is_quiet_now(
-                state.config.quiet_hours_start,
-                state.config.quiet_hours_end,
+                runtime.quiet_hours_start,
+                runtime.quiet_hours_end,
             );
         if quiet {
-            ensure_wake_followup_task(&state, &contact, state.config.quiet_hours_end).await?;
+            ensure_wake_followup_task(&state, &contact, runtime.quiet_hours_end).await?;
             deferred = true;
         } else {
             let key = contact_key(&workspace_id, &account_id, &from_wxid);

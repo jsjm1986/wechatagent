@@ -64,6 +64,7 @@ pub(crate) use self::budget::{current_run_budget, RUN_BUDGET};
 
 // 入口函数 / 类型重新导出，保持与拆分前 `crate::agent::xxx` 完全一致。
 pub use decision::{build_initial_operation_profile, load_operation_playbook_for_contact};
+pub(crate) use decision::load_user_operation_domain_config_for_contact;
 pub use gateway::{
     handle_follow_up_task, handle_managed_message, handle_managed_message_aggregated,
     send_contact_message_gateway, write_event_for_account,
@@ -505,6 +506,9 @@ mod tests {
             knowledge_search_top_k: 8,
             outbox_poll_interval_seconds: 5,
             outbox_lease_seconds: 60,
+            quiet_hours_enabled: true,
+            quiet_hours_start: 22,
+            quiet_hours_end: 8,
         }
     }
 

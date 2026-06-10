@@ -1563,6 +1563,9 @@ mod protocol_skeleton_tests {
             knowledge_search_top_k: 8,
             outbox_poll_interval_seconds: 5,
             outbox_lease_seconds: 60,
+            quiet_hours_enabled: true,
+            quiet_hours_start: 22,
+            quiet_hours_end: 8,
         }
     }
 
