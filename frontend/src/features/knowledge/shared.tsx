@@ -18,6 +18,7 @@ import { useConfirm } from "../../components/ui/ConfirmDialog";
 import { useFormDialog } from "../../components/ui/FormDialog";
 import type { PickerChunk } from "../../components/ui/ChunkRef";
 import { type TrustChunkFields, chunkTypeLabel } from "./trustTypes";
+import { wikiTypeLabel, statusLabel, integrityStatusLabel, revisionOpLabel, revisionSourceLabel } from "./labels";
 
 /// merge/relate 的 ChunkPicker 列表加载器:拉全部 chunk 供搜索选择,替代手输 ObjectId。
 async function loadChunkOptions(): Promise<PickerChunk[]> {
@@ -39,6 +40,7 @@ const LLM_KIND_LABELS: Record<string, string> = {
   rate_limited: "上游限流",
   http_5xx: "上游 5xx",
   http_4xx: "上游 4xx",
+  endpoint_not_found: "地址路径错(404)",
   empty_response: "空响应",
   external_error: "上游错误",
   json_decode_error: "JSON 解析失败",
@@ -276,13 +278,13 @@ export function ChunkInspectorPane({
               <dt>状态</dt>
               <dd>
                 <span className={`wikiSev ${chunk.integrityStatus === "rejected" ? "error" : "info"}`}>
-                  {chunk.integrityStatus ?? "—"}
+                  {integrityStatusLabel(chunk.integrityStatus ?? undefined)}
                 </span>{" "}
-                <span className="wikiBadge">{chunk.status ?? "—"}</span>
+                <span className="wikiBadge">{statusLabel(chunk.status ?? undefined)}</span>
               </dd>
-              <dt>chunk id</dt>
+              <dt>编号</dt>
               <dd><code>{chunk.id}</code></dd>
-              {chunk.wikiType ? (<><dt>wiki type</dt><dd><span className="wikiArchiveTag">{chunk.wikiType}</span></dd></>) : null}
+              {chunk.wikiType ? (<><dt>知识类型</dt><dd><span className="wikiArchiveTag">{wikiTypeLabel(chunk.wikiType)}</span></dd></>) : null}
               {chunkTypeLabel(chunk.chunkType) ? (<><dt>运营用途</dt><dd><span className="wikiArchiveTag">{chunkTypeLabel(chunk.chunkType)}</span></dd></>) : null}
               {Array.isArray(chunk.businessTopics) && chunk.businessTopics.length > 0 ? (
                 <>
@@ -936,7 +938,7 @@ function ChunkReferrersList({ chunkId }: { chunkId: string }) {
                 title={r.note ?? ""}
               >
                 <div className="wikiReferrerCardHead">
-                  {r.wikiType ? <span className="wikiArchiveTag">{r.wikiType}</span> : null}
+                  {r.wikiType ? <span className="wikiArchiveTag">{wikiTypeLabel(r.wikiType)}</span> : null}
                   <span className="wikiReferrerKind">{r.kind ?? "—"}</span>
                 </div>
                 <div className="wikiReferrerCardTitle">{r.title || r.chunkId}</div>
@@ -1055,8 +1057,8 @@ export function ChunkRevisionsTimeline({
                     <span className="wikiArchiveTimelineTime">
                       {rev.createdAt ?? "—"}
                     </span>
-                    <span className="wikiArchiveTag">{rev.op}</span>
-                    {rev.source ? <span className="wikiArchiveTag">{rev.source}</span> : null}
+                    <span className="wikiArchiveTag">{revisionOpLabel(rev.op)}</span>
+                    {rev.source ? <span className="wikiArchiveTag">{revisionSourceLabel(rev.source)}</span> : null}
                     {rev.author ? <code>{rev.author}</code> : null}
                   </div>
                   {rev.summary ? (

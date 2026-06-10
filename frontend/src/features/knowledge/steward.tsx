@@ -16,7 +16,7 @@ import { parseCompleteness, parseIntegrityReport, chunkTypeLabel, type Completen
 import { ChunkInspectorPane, classifyChunk, focusChunk, type ReviewChunkItem, type ReviewCategory } from "./shared";
 import { ReviewChat, type ReviewChatChunk } from "./cockpit/ReviewChat";
 import { useConfirm } from "../../components/ui/ConfirmDialog";
-import { sourceTypeLabel, statusLabel, integrityStatusLabel } from "./labels";
+import { sourceTypeLabel, statusLabel, integrityStatusLabel, wikiTypeLabel, severityLabel, sourceKindLabel, ingestStatusLabel, riskLevelLabel, revisionOpLabel, revisionSourceLabel } from "./labels";
 
 // ── G2 · DocumentsView · 知识文档目录 CRUD ─────────────────────────────
 interface DocumentItem {
@@ -167,10 +167,10 @@ export function DocumentsView() {
           onChange={(e) => setDraft({ ...draft, sourceType: e.target.value })}
           className="wikiInput"
         >
-          <option value="imported_markdown">imported_markdown</option>
-          <option value="manual">manual</option>
-          <option value="external_url">external_url</option>
-          <option value="archived">archived</option>
+          <option value="imported_markdown">{sourceTypeLabel("imported_markdown")}</option>
+          <option value="manual">{sourceTypeLabel("manual")}</option>
+          <option value="external_url">{sourceTypeLabel("external_url")}</option>
+          <option value="archived">{sourceTypeLabel("archived")}</option>
         </select>
         <button type="submit" className="wikiBtn" disabled={creating || !draft.title.trim()}>
           {creating ? "保存中…" : "新建"}
@@ -244,7 +244,7 @@ export function DocumentsView() {
                             onClick={() => focusChunk(c.id)}
                             style={{ textAlign: "left", display: "grid", gridTemplateColumns: "120px 100px 1fr auto", gap: 8, alignItems: "center" }}
                           >
-                            <span className="wikiArchiveTag">{c.wikiType ?? "—"}</span>
+                            <span className="wikiArchiveTag">{wikiTypeLabel(c.wikiType ?? undefined)}</span>
                             <span style={{ fontSize: 11 }}>
                               {statusLabel(c.status ?? undefined)} / {integrityStatusLabel(c.integrityStatus ?? undefined)}
                             </span>
@@ -780,7 +780,7 @@ export function TryRecallView() {
       {route ? (
         <>
           <dl className="wikiArchiveMeta">
-            <dt>风险等级</dt><dd>{route.riskLevel || "—"}</dd>
+            <dt>风险等级</dt><dd>{riskLevelLabel(route.riskLevel ?? undefined)}</dd>
             <dt>需证据</dt><dd>{route.requiresEvidence ? "是" : "否"}</dd>
             <dt>覆盖度</dt><dd>{route.knowledgeCoverage || "—"}</dd>
             {route.reason ? (<><dt>路由原因</dt><dd>{route.reason}</dd></>) : null}
@@ -813,7 +813,7 @@ export function TryRecallView() {
                   style={{ textAlign: "left", display: "grid", gap: 4 }}
                 >
                   <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
-                    <span className="wikiArchiveTag">{s.wikiType ?? "—"}</span>
+                    <span className="wikiArchiveTag">{wikiTypeLabel(s.wikiType ?? undefined)}</span>
                     <span style={{ fontSize: 11, color: "var(--muted)" }}>
                       {statusLabel(s.status ?? undefined)} / {integrityStatusLabel(s.integrityStatus ?? undefined)}
                     </span>
@@ -885,6 +885,14 @@ const GAP_SIGNAL_KINDS: { v: string; label: string }[] = [
   { v: "missing_chunk", label: "依赖已归档" },
   { v: "suggestion", label: "建议补完" },
 ];
+
+const GAP_SIGNAL_KIND_LABEL: Record<string, string> = Object.fromEntries(
+  GAP_SIGNAL_KINDS.map((k) => [k.v, k.label]),
+);
+function gapKindLabel(v?: string | null): string {
+  if (!v) return "—";
+  return GAP_SIGNAL_KIND_LABEL[v] ?? v;
+}
 
 export function LintView() {
   const [items, setItems] = useState<GapSignalItem[]>([]);
@@ -1007,7 +1015,7 @@ export function LintView() {
                 onClick={() => setActiveKind(k.v)}
               >
                 <span>
-                  <span className={`wikiKind ${k.v}`}>{k.v}</span> {k.label}
+                  <span className={`wikiKind ${k.v}`} /> {k.label}
                 </span>
                 <span className="wikiLintCount">{c}</span>
               </button>
@@ -1025,8 +1033,8 @@ export function LintView() {
               <div className={`wikiSignalCard sev-${s.severity}`} key={s.signalId}>
                 <div className="wikiSignalHead">
                   <div className="wikiSignalTitle">
-                    <span className={`wikiKind ${s.kind}`}>{s.kind}</span>
-                    <span className={`wikiSev ${s.severity}`}>{s.severity}</span>
+                    <span className={`wikiKind ${s.kind}`}>{gapKindLabel(s.kind)}</span>
+                    <span className={`wikiSev ${s.severity}`}>{severityLabel(s.severity)}</span>
                     <strong>{s.title}</strong>
                   </div>
                   <div className="wikiSignalActions">
@@ -1396,7 +1404,7 @@ export function ReviewView({ initialDimFilter }: { initialDimFilter?: string | n
                       title="选中以批量 verify / archive"
                     />
                     <div className="wikiSignalTitle">
-                      <span className={`wikiKind ${c.wikiType ?? "unknown"}`}>{c.wikiType ?? "—"}</span>
+                      <span className={`wikiKind ${c.wikiType ?? "unknown"}`}>{wikiTypeLabel(c.wikiType ?? undefined)}</span>
                       {chunkTypeLabel(c.chunkType) ? (
                         <span className="wikiArchiveTag" title="运营用途：这条知识在 AI 回复里怎么用">{chunkTypeLabel(c.chunkType)}</span>
                       ) : null}
@@ -1639,8 +1647,8 @@ export function IngestSourcesView() {
           onChange={(e) => setDraft({ ...draft, kind: e.target.value })}
           className="wikiInput"
         >
-          <option value="rss">rss</option>
-          <option value="html">html</option>
+          <option value="rss">{sourceKindLabel("rss")}</option>
+          <option value="html">{sourceKindLabel("html")}</option>
         </select>
         <input
           type="text"
@@ -1676,13 +1684,13 @@ export function IngestSourcesView() {
         <table className="wikiTable" style={{ width: "100%", fontSize: 13 }}>
           <thead>
             <tr>
-              <th style={{ textAlign: "left" }}>kind</th>
-              <th style={{ textAlign: "left" }}>URL / 标签</th>
+              <th style={{ textAlign: "left" }}>类型</th>
+              <th style={{ textAlign: "left" }}>网址 / 标签</th>
               <th style={{ textAlign: "right" }}>间隔</th>
               <th style={{ textAlign: "left" }}>最后拉取</th>
               <th style={{ textAlign: "left" }}>状态</th>
               <th style={{ textAlign: "right" }}>失败次数</th>
-              <th style={{ textAlign: "right" }}>已 ingest</th>
+              <th style={{ textAlign: "right" }}>已入库</th>
               <th style={{ textAlign: "left" }}>错误</th>
               <th />
             </tr>
@@ -1690,7 +1698,7 @@ export function IngestSourcesView() {
           <tbody>
             {items.map((it) => (
               <tr key={it.sourceId}>
-                <td>{it.kind}</td>
+                <td>{sourceKindLabel(it.kind)}</td>
                 <td style={{ maxWidth: 360, wordBreak: "break-all" }}>
                   <div>{it.url}</div>
                   {it.label ? (
@@ -1713,7 +1721,7 @@ export function IngestSourcesView() {
                           : "var(--wiki-error-bg, #fee4e2)",
                     }}
                   >
-                    {it.status}
+                    {ingestStatusLabel(it.status)}
                   </span>
                 </td>
                 <td style={{ textAlign: "right" }}>{it.failureStreak ?? 0}</td>
@@ -2447,8 +2455,8 @@ export function ChunkRevisionsDrawer() {
           return (
             <div className={`wikiRevCard op-${r.op}`} key={r.revisionId}>
               <div className="wikiRevHead" onClick={() => toggle(r.revisionId)}>
-                <span className={`wikiOp ${r.op}`}>{r.op}</span>
-                <span className={`wikiSource ${r.source}`}>{r.source}</span>
+                <span className={`wikiOp ${r.op}`}>{revisionOpLabel(r.op)}</span>
+                <span className={`wikiSource ${r.source}`}>{revisionSourceLabel(r.source)}</span>
                 <span className="wikiRevTime">{r.createdAt ?? ""}</span>
                 <span className="wikiRevId">{r.revisionId}</span>
                 {r.reason ? <span className="wikiRevReason">{r.reason}</span> : null}
