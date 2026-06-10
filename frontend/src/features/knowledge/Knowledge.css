@@ -1213,7 +1213,7 @@
     min-height: 480px;
   }
   .wikiModeGrid--today {
-    grid-template-columns: minmax(0, 1fr) 320px;
+    grid-template-columns: 200px minmax(0, 1fr) 320px;
   }
   .wikiModeGrid--explore {
     grid-template-columns: 260px minmax(0, 1fr) 360px;
@@ -1351,6 +1351,10 @@
     flex-direction: column;
     gap: 8px;
   }
+  .wikiDigestCard.sev-fatal {
+    border-left: 3px solid var(--color-blocked);
+    background: var(--fill-blocked);
+  }
   .wikiDigestCard.sev-critical {
     border-left: 3px solid var(--color-blocked);
   }
@@ -1374,6 +1378,10 @@
     text-transform: uppercase;
     letter-spacing: 0.04em;
     font-family: var(--font-mono);
+  }
+  .wikiDigestBadge.sev-fatal {
+    background: var(--color-blocked);
+    color: #fff;
   }
   .wikiDigestBadge.sev-critical {
     background: var(--fill-blocked);

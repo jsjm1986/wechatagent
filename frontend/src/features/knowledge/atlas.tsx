@@ -763,7 +763,7 @@ function MetadataDashboard() {
       <div className="wikiMetadataGrid">
         <article className="wikiObservabilityCard">
           <header className="wikiObservabilityCardHead">
-            <span className="wikiArchiveTag">[counts]</span>
+            <span className="wikiArchiveTag">counts</span>
             <h4>wiki_type 切片分布</h4>
           </header>
           {data?.wikiTypeCounts && data.wikiTypeCounts.length > 0 ? (
@@ -791,7 +791,7 @@ function MetadataDashboard() {
 
         <article className="wikiObservabilityCard">
           <header className="wikiObservabilityCardHead">
-            <span className="wikiArchiveTag">[ratio]</span>
+            <span className="wikiArchiveTag">ratio</span>
             <h4>verified 占比</h4>
           </header>
           {data?.verifiedRatioByType && data.verifiedRatioByType.length > 0 ? (
@@ -821,7 +821,7 @@ function MetadataDashboard() {
 
         <article className="wikiObservabilityCard">
           <header className="wikiObservabilityCardHead">
-            <span className="wikiArchiveTag">[editors]</span>
+            <span className="wikiArchiveTag">editors</span>
             <h4>近期编辑者</h4>
           </header>
           {data?.topEditors && data.topEditors.length > 0 ? (
@@ -840,7 +840,7 @@ function MetadataDashboard() {
 
         <article className="wikiObservabilityCard">
           <header className="wikiObservabilityCardHead">
-            <span className="wikiArchiveTag">[activity]</span>
+            <span className="wikiArchiveTag">activity</span>
             <h4>7 天活跃</h4>
           </header>
           {activityByDate.length > 0 ? (
@@ -1060,7 +1060,7 @@ function TaxonomiesGovernance() {
               <td className="wikiArchiveTimelineTime">{it.value?.id}</td>
               <td>{it.value?.displayName}</td>
               <td>
-                <span className="wikiArchiveTag">[{it.value?.status ?? "?"}]</span>
+                <span className="wikiArchiveTag">{it.value?.status ?? "?"}</span>
               </td>
               <td className="wikiArchiveTimelineTime">v{it.version ?? 0}</td>
               <td>{it.currentVersion ? "✓" : ""}</td>

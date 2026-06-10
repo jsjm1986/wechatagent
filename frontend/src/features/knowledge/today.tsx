@@ -239,7 +239,7 @@ export function ChatWorkbench() {
           <h2>AI 协作工坊</h2>
         </div>
         <div className="wikiArchiveHeaderActions">
-          <span className="wikiArchiveTag">[session]</span>
+          <span className="wikiArchiveTag">session</span>
           <span className="wikiChatSessionId">{sessionId || "未开始"}</span>
           <button type="button" onClick={newSession}>
             <Plus size={14} /> 新会话
@@ -262,10 +262,10 @@ export function ChatWorkbench() {
             className={`wikiChatTurn wikiChatTurn--${t.role}`}
           >
             <div className="wikiChatTurnHead">
-              <span className="wikiArchiveTag">[{t.role === "user" ? "运营" : "AI"}]</span>
+              <span className="wikiArchiveTag">{t.role === "user" ? "运营" : "AI"}</span>
               <span className="wikiArchiveTimelineTime">#{t.turnIndex}</span>
-              {t.intent ? <span className="wikiArchiveTag">[{t.intent}]</span> : null}
-              {t.draftKind ? <span className="wikiArchiveTag">[{t.draftKind}]</span> : null}
+              {t.intent ? <span className="wikiArchiveTag">{t.intent}</span> : null}
+              {t.draftKind ? <span className="wikiArchiveTag">{t.draftKind}</span> : null}
             </div>
             <div className="wikiChatTurnBody">
               {t.role === "assistant" && t.naturalReply ? t.naturalReply : t.content}
@@ -289,9 +289,7 @@ export function ChatWorkbench() {
               <div className="wikiChatMissing">
                 缺字段：
                 {t.missingFields.map((f) => (
-                  <span key={f} className="wikiArchiveTag">
-                    [{f}]
-                  </span>
+                  <span key={f} className="wikiArchiveTag">{f}</span>
                 ))}
               </div>
             ) : null}
@@ -422,10 +420,10 @@ export function KnowledgeInbox() {
 
       {data ? (
         <div className="wikiInboxStats">
-          <span className="wikiArchiveTag">[total {data.stats.total}]</span>
-          <span className="wikiArchiveTag">[high {data.stats.high}]</span>
-          <span className="wikiArchiveTag">[mid {data.stats.mid}]</span>
-          <span className="wikiArchiveTag">[low {data.stats.low}]</span>
+          <span className="wikiArchiveTag">total {data.stats.total}</span>
+          <span className="wikiArchiveTag">high {data.stats.high}</span>
+          <span className="wikiArchiveTag">mid {data.stats.mid}</span>
+          <span className="wikiArchiveTag">low {data.stats.low}</span>
         </div>
       ) : null}
 
@@ -442,10 +440,10 @@ export function KnowledgeInbox() {
           >
             <div className="wikiInboxCardHead">
               <span className={`wikiArchiveTag wikiInboxPriority--${it.priority}`}>
-                [{it.priority}]
+                {it.priority}
               </span>
-              <span className="wikiArchiveTag">[{it.kind}]</span>
-              <span className="wikiArchiveTag">[{it.origin}]</span>
+              <span className="wikiArchiveTag">{it.kind}</span>
+              <span className="wikiArchiveTag">{it.origin}</span>
               <span className="wikiArchiveTimelineTime">{it.createdAt}</span>
             </div>
             <h4 className="wikiInboxCardTitle">{it.title}</h4>
@@ -460,13 +458,13 @@ export function KnowledgeInbox() {
                 </button>
               ) : null}
               {it.suggestedActions.includes("open_chat") ? (
-                <span className="wikiArchiveTag">[open_chat]</span>
+                <span className="wikiArchiveTag">open_chat</span>
               ) : null}
               {it.suggestedActions.includes("open_repair") ? (
-                <span className="wikiArchiveTag">[open_repair]</span>
+                <span className="wikiArchiveTag">open_repair</span>
               ) : null}
               {it.suggestedActions.includes("dismiss") ? (
-                <span className="wikiArchiveTag">[dismiss]</span>
+                <span className="wikiArchiveTag">dismiss</span>
               ) : null}
             </div>
           </article>
