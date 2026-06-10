@@ -1809,7 +1809,7 @@ export function ObservabilityDashboard() {
       <div className="wikiObservabilityGrid">
         <article className="wikiObservabilityCard">
           <header className="wikiObservabilityCardHead">
-            <span className="wikiArchiveTag">[catalog]</span>
+            <span className="wikiArchiveTag">catalog</span>
             <h4>目录覆盖</h4>
           </header>
           <dl className="wikiArchiveMeta">
@@ -1834,7 +1834,7 @@ export function ObservabilityDashboard() {
 
         <article className="wikiObservabilityCard">
           <header className="wikiObservabilityCardHead">
-            <span className="wikiArchiveTag">[completeness]</span>
+            <span className="wikiArchiveTag">completeness</span>
             <h4>类型完整度</h4>
           </header>
           {completeness ? (
@@ -1860,7 +1860,7 @@ export function ObservabilityDashboard() {
 
         <article className="wikiObservabilityCard">
           <header className="wikiObservabilityCardHead">
-            <span className="wikiArchiveTag">[integrity]</span>
+            <span className="wikiArchiveTag">integrity</span>
             <h4>完整性诊断</h4>
           </header>
           <dl className="wikiArchiveMeta">
@@ -1877,7 +1877,7 @@ export function ObservabilityDashboard() {
 
         <article className="wikiObservabilityCard">
           <header className="wikiObservabilityCardHead">
-            <span className="wikiArchiveTag">[logs]</span>
+            <span className="wikiArchiveTag">logs</span>
             <h4>检索 trace（24h）</h4>
           </header>
           <dl className="wikiArchiveMeta">
@@ -1898,7 +1898,7 @@ export function ObservabilityDashboard() {
 
         <article className="wikiObservabilityCard">
           <header className="wikiObservabilityCardHead">
-            <span className="wikiArchiveTag">[answer-cache]</span>
+            <span className="wikiArchiveTag">answer-cache</span>
             <h4>问答缓存</h4>
           </header>
           {(() => {
@@ -1959,13 +1959,13 @@ function PhaseRollupPanel({
   return (
     <section className="wikiObservabilityPhaseRollup">
       <header className="wikiObservabilityCardHead">
-        <span className="wikiArchiveTag">[phase-rollup]</span>
+        <span className="wikiArchiveTag">phase-rollup</span>
         <h4>Phase 0-D 自治信号（{windowHours}h）</h4>
       </header>
       <div className="wikiObservabilityGrid">
         <article className="wikiObservabilityCard">
           <header className="wikiObservabilityCardHead">
-            <span className="wikiArchiveTag">[lifecycle]</span>
+            <span className="wikiArchiveTag">lifecycle</span>
             <h4>run lifecycle 终态</h4>
           </header>
           {lifecycleTotal === 0 ? (
@@ -1989,7 +1989,7 @@ function PhaseRollupPanel({
 
         <article className="wikiObservabilityCard">
           <header className="wikiObservabilityCardHead">
-            <span className="wikiArchiveTag">[revision]</span>
+            <span className="wikiArchiveTag">revision</span>
             <h4>single-shot revision top</h4>
           </header>
           {revisionReasons.length === 0 ? (
@@ -2008,7 +2008,7 @@ function PhaseRollupPanel({
 
         <article className="wikiObservabilityCard">
           <header className="wikiObservabilityCardHead">
-            <span className="wikiArchiveTag">[reviewer]</span>
+            <span className="wikiArchiveTag">reviewer</span>
             <h4>reviewer 误判信号</h4>
           </header>
           {reviewerMisjudge.length === 0 ? (
@@ -2027,7 +2027,7 @@ function PhaseRollupPanel({
 
         <article className="wikiObservabilityCard">
           <header className="wikiObservabilityCardHead">
-            <span className="wikiArchiveTag">[negative-example]</span>
+            <span className="wikiArchiveTag">negative-example</span>
             <h4>负例候选 needs_review</h4>
           </header>
           <dl className="wikiArchiveMeta">
@@ -2092,13 +2092,13 @@ function WorkerHealthPanel({
   return (
     <section className="wikiObservabilityPhaseRollup">
       <header className="wikiObservabilityCardHead">
-        <span className="wikiArchiveTag">[worker-health]</span>
+        <span className="wikiArchiveTag">worker-health</span>
         <h4>worker 健康聚合</h4>
       </header>
       <div className="wikiObservabilityGrid">
         <article className="wikiObservabilityCard">
           <header className="wikiObservabilityCardHead">
-            <span className="wikiArchiveTag">[chat-tasks]</span>
+            <span className="wikiArchiveTag">chat-tasks</span>
             <h4>chat task 状态</h4>
           </header>
           {chatTotal === 0 ? (
@@ -2132,7 +2132,7 @@ function WorkerHealthPanel({
               <ul style={{ margin: 0, paddingLeft: "1.2em" }}>
                 {chatErrors.map((row, i) => (
                   <li key={i}>
-                    <span className="wikiArchiveTag">[{row.errorKind}]</span> {row.count}
+                    <span className="wikiArchiveTag">{row.errorKind}</span> {row.count}
                   </li>
                 ))}
               </ul>
@@ -2142,7 +2142,7 @@ function WorkerHealthPanel({
 
         <article className="wikiObservabilityCard">
           <header className="wikiObservabilityCardHead">
-            <span className="wikiArchiveTag">[gap-signals]</span>
+            <span className="wikiArchiveTag">gap-signals</span>
             <h4>gap signals · sweep 命中率</h4>
           </header>
           <dl className="wikiArchiveMeta">
@@ -2165,7 +2165,7 @@ function WorkerHealthPanel({
               <ul style={{ margin: 0, paddingLeft: "1.2em" }}>
                 {gapKinds.map((row, i) => (
                   <li key={i}>
-                    <span className="wikiArchiveTag">[{row.kind}]</span> {row.count}
+                    <span className="wikiArchiveTag">{row.kind}</span> {row.count}
                   </li>
                 ))}
               </ul>
@@ -2193,7 +2193,7 @@ function WorkerHealthPanel({
 
         <article className="wikiObservabilityCard">
           <header className="wikiObservabilityCardHead">
-            <span className="wikiArchiveTag">[lessons-learned]</span>
+            <span className="wikiArchiveTag">lessons-learned</span>
             <h4>lessons_learned ({lessonsWindow}d)</h4>
           </header>
           {lessonsPatterns.length === 0 ? (
@@ -2263,7 +2263,7 @@ function TestMatchPanel() {
   return (
     <section className="wikiObservabilityCard wikiTestMatch">
       <header className="wikiObservabilityCardHead">
-        <span className="wikiArchiveTag">[test-match]</span>
+        <span className="wikiArchiveTag">test-match</span>
         <h4>检索调试</h4>
       </header>
       <div className="wikiTestMatchRow">
