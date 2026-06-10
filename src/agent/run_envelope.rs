@@ -128,6 +128,10 @@ pub const GATEWAY_STATUS_VALUES: &[&str] = &[
     // 这次（已过时的）生成，交由调度器用更全的上下文重算。语义是"被更新的入站
     // 取代"（superseded by newer inbound），是外部信号触发的过程态，仍属 AI 自治闭环。
     "superseded_by_new_inbound",
+    // #69 作息门控：主动发送（planner/follow_up）在运营方静默时段到点，gateway 把任务
+    // **重排**到醒来时刻（status 回 pending + run_at=wake）而非取消——避免丢承诺跟进。
+    // 是 AI 自治内的"挑时段送达"过程态，不是失败、更不是把对话交给真人。
+    "quiet_hours_deferred",
 ];
 
 /// 严禁取值（R2.7 业务语义保护 + R9.2）。任何 finalReviewStatus / gateway_status
@@ -244,7 +248,11 @@ pub fn derive_lifecycle_from_status(gateway_status: &str, error: Option<&str>) -
         | "context_changed" | "policy_cooldown" | "policy_wait_user_reply"
         | "precheck_blocked" => LIFECYCLE_FAILED_BEFORE_DECISION,
         // 并发去抖：被更新的入站取代 → 外部信号中止（终态已存在，吸收态）。
-        "superseded_by_new_inbound" => LIFECYCLE_ABORTED_BY_EXTERNAL_SIGNAL,
+        // #69 作息门控：主动发送在静默时段被重排到醒来时刻——同属外部信号（时段）触发
+        // 的"本次不送达、改时段重来"，任务仍 pending 等醒来，按吸收态记录而非失败。
+        "superseded_by_new_inbound" | "quiet_hours_deferred" => {
+            LIFECYCLE_ABORTED_BY_EXTERNAL_SIGNAL
+        }
         _ => LIFECYCLE_FAILED_AFTER_DECISION,
     }
 }

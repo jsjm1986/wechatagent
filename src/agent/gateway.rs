@@ -615,7 +615,13 @@ async fn run_user_operation_gateway_inner(
     let precheck = precheck_send_gateway(state, &contact, &trigger, &runtime).await?;
     if !precheck.allowed {
         if let Some(task_id) = task_id {
-            cancel_task(state, task_id, &precheck.status, &precheck.reason).await?;
+            // #69：静默时段命中 → 重排到醒来时刻（不取消，避免丢承诺/催进）；其余 block 维持取消。
+            if precheck.status == "quiet_hours_deferred" {
+                let wake_at = crate::agent::quiet_hours::next_wake_at(state.config.quiet_hours_end);
+                reschedule_task(state, task_id, wake_at, &precheck.reason).await?;
+            } else {
+                cancel_task(state, task_id, &precheck.status, &precheck.reason).await?;
+            }
         }
         write_event_for_account(
             state,
@@ -1279,10 +1285,16 @@ async fn run_user_operation_gateway_inner(
     // / write_event 落库时显式标记 context_changed。
     let context_changed_followup_hit = match &trigger {
         AgentTrigger::FollowUp(task) => {
-            let last_inbound_ms = inbound_marker_for_context_check(&contact)
-                .map(|d| d.timestamp_millis());
-            let task_created_ms = task.created_at.timestamp_millis();
-            check_context_changed_followup_pure(last_inbound_ms, task_created_ms)
+            // #69：醒来任务（deferred_inbound_reply）豁免 context_changed——它存在的意义
+            // 就是回 task 创建后客户在静默时段攒下的新消息，绝不能被这些消息触发自取消。
+            if task.kind == crate::agent::quiet_hours::DEFERRED_INBOUND_REPLY_KIND {
+                false
+            } else {
+                let last_inbound_ms = inbound_marker_for_context_check(&contact)
+                    .map(|d| d.timestamp_millis());
+                let task_created_ms = task.created_at.timestamp_millis();
+                check_context_changed_followup_pure(last_inbound_ms, task_created_ms)
+            }
         }
         _ => false,
     };
@@ -1394,13 +1406,21 @@ async fn run_user_operation_gateway_inner(
     let final_precheck = precheck_send_gateway(state, &contact, &trigger, &runtime).await?;
     if final_decision.should_reply && !final_precheck.allowed {
         if let Some(task_id) = task_id {
-            cancel_task(
-                state,
-                task_id,
-                &final_precheck.status,
-                &final_precheck.reason,
-            )
-            .await?;
+            // #69：与第一道 precheck 一致——静默时段命中重排到醒来，其余 block 取消。
+            // 第二道在 LLM 决策之后命中（罕见：仅当静默边界恰好落在决策耗时内），
+            // 重排即丢弃这次决策、醒来按完整上下文重跑，语义正确。
+            if final_precheck.status == "quiet_hours_deferred" {
+                let wake_at = crate::agent::quiet_hours::next_wake_at(state.config.quiet_hours_end);
+                reschedule_task(state, task_id, wake_at, &final_precheck.reason).await?;
+            } else {
+                cancel_task(
+                    state,
+                    task_id,
+                    &final_precheck.status,
+                    &final_precheck.reason,
+                )
+                .await?;
+            }
         }
         write_decision_review(
             state,
@@ -1827,13 +1847,15 @@ pub(crate) fn trigger_message(
             message_id: None,
             dedupe_key: None,
             direction: MessageDirection::Inbound,
-            content: format!(
-                "系统跟进任务到期，请重新判断是否适合主动触达。任务内容：{}",
-                task.content
-            ),
+            // #69 作息门控：醒来任务（deferred_inbound_reply）语义是"回客户在休息时段
+            // 攒下的消息"，不是主动催进——若沿用"主动触达"措辞会把 Reply Agent 带偏成
+            // 没话找话。客户的真实消息已在 load_recent_messages 里，这里只需把"现在醒来、
+            // 基于完整对话回复"的语境交给它。普通 follow_up 仍是"主动触达"判断。
+            content: follow_up_trigger_message_text(&task.kind, &task.content),
             raw: Some(doc! {
                 "trigger": "follow_up_task",
-                "taskId": task.id.map(|id| id.to_hex()).unwrap_or_default()
+                "taskId": task.id.map(|id| id.to_hex()).unwrap_or_default(),
+                "kind": task.kind.clone()
             }),
             created_at: DateTime::now(),
         },
@@ -1863,6 +1885,14 @@ pub(crate) async fn precheck_send_gateway(
     // 主动打扰，故跳过 cooldown/operation_policy/rate_limited/daily_limit；not_managed
     // 仍保留（好友已退出运营则不应继续转述）。
     let is_relay = escalation::is_principal_relay_trigger(trigger);
+    // #69 作息门控：判定这是不是"静默时段排出的延迟被动应答"（醒来任务）。
+    // 醒来任务存在的意义就是回 task 创建后累积的客户消息，因此它**豁免** context_changed
+    // （否则会被自己要回的那些消息触发自取消），但仍受 expires_at 约束。
+    let is_deferred_wake = matches!(
+        trigger,
+        AgentTrigger::FollowUp(task)
+            if task.kind == crate::agent::quiet_hours::DEFERRED_INBOUND_REPLY_KIND
+    );
     if !is_relay {
         if let Some(cooldown_until) = contact.cooldown_until {
             if cooldown_until.timestamp_millis() > DateTime::now().timestamp_millis() {
@@ -1881,6 +1911,29 @@ pub(crate) async fn precheck_send_gateway(
         if daily_touch_count(state, contact).await? >= runtime.max_daily_touches {
             return Ok(blocked("daily_limit", "已达到每日触达上限"));
         }
+        // #69 作息门控（双重保险，与 webhook 入站门控配套）：**主动发送**（planner/follow_up
+        // 跟进任务）在运营方静默时段到点时不立即发，标记 quiet_hours_deferred 让调用方把任务
+        // **重排**到醒来时刻（而非 cancel——避免丢承诺/催进）。
+        //
+        // 仅作用于 FollowUp 主动发送：
+        // - 入站（Inbound）的静默延迟在 webhook 层已是权威（命中即排 wake task、不进流水线）；
+        //   若入站仍走到这里（仅边界跨分钟的极端情形），它无 task 可重排，放行这次"刚收到就回"
+        //   反而是对的，不该静默丢弃；
+        // - relay 转述是客户期待内的被动应答（同频控豁免语义）；
+        // - 醒来任务（is_deferred_wake）恰恰在醒来时刻跑，不应被自己触发的静默门挡回。
+        if matches!(trigger, AgentTrigger::FollowUp(_))
+            && !is_deferred_wake
+            && state.config.quiet_hours_enabled
+            && crate::agent::quiet_hours::is_quiet_now(
+                state.config.quiet_hours_start,
+                state.config.quiet_hours_end,
+            )
+        {
+            return Ok(blocked(
+                "quiet_hours_deferred",
+                "运营方作息时段，主动发送重排到醒来时刻",
+            ));
+        }
     }
     if let AgentTrigger::FollowUp(task) = trigger {
         if let Some(expires_at) = task.expires_at {
@@ -1890,12 +1943,15 @@ pub(crate) async fn precheck_send_gateway(
         }
         // 用 last_inbound_at 判定 context_changed；老数据若 last_inbound_at 还没回填
         // （migration 未跑或回填中），降级使用 last_message_at 兼容。
-        if let Some(last_inbound) = inbound_marker_for_context_check(contact) {
-            if last_inbound.timestamp_millis() > task.created_at.timestamp_millis() {
-                return Ok(blocked(
-                    "context_changed",
-                    "用户在跟进任务后已有新消息，取消旧跟进",
-                ));
+        // 醒来任务豁免：它就是要回 task 创建后累积的那些入站消息（见 is_deferred_wake）。
+        if !is_deferred_wake {
+            if let Some(last_inbound) = inbound_marker_for_context_check(contact) {
+                if last_inbound.timestamp_millis() > task.created_at.timestamp_millis() {
+                    return Ok(blocked(
+                        "context_changed",
+                        "用户在跟进任务后已有新消息，取消旧跟进",
+                    ));
+                }
             }
         }
     }
@@ -2121,6 +2177,42 @@ async fn cancel_task(
                     "cancel_reason": reason,
                     "updated_at": DateTime::now()
                 }
+            },
+            None,
+        )
+        .await?;
+    Ok(())
+}
+
+/// #69 作息门控：把一条到点的主动发送任务从 `running` 重排回 `pending` + 推迟 `run_at`
+/// 到醒来时刻，而不是取消。这样承诺跟进/催进不会因为撞上静默时段而永久丢失——
+/// 醒来后 task worker 会按新的 `run_at` 重新 claim 并跑完整 gateway。
+///
+/// `attempt_count -1` 抵消 worker claim 时的 `+1`：作息重排不是"失败重试"，不应蚕食
+/// max_attempts 配额（否则反复撞静默会过早把任务耗成 failed）。清掉 `claimed_at` /
+/// `next_retry_at` 让 worker 在醒来时干净地重新认领。
+async fn reschedule_task(
+    state: &AppState,
+    task_id: ObjectId,
+    run_at: DateTime,
+    reason: &str,
+) -> AppResult<()> {
+    crate::models::assert_agent_task_status_valid("pending");
+    state
+        .db
+        .tasks()
+        .update_one(
+            doc! { "_id": task_id },
+            doc! {
+                "$set": {
+                    "status": "pending",
+                    "run_at": run_at,
+                    "gateway_status": "quiet_hours_deferred",
+                    "cancel_reason": reason,
+                    "updated_at": DateTime::now()
+                },
+                "$inc": { "attempt_count": -1 },
+                "$unset": { "claimed_at": "", "next_retry_at": "" }
             },
             None,
         )
@@ -3131,6 +3223,19 @@ pub(crate) fn check_context_changed_followup_pure(
     }
 }
 
+/// #69 作息门控：根据跟进任务 kind 选择注入 Reply Agent 的"当前消息"措辞。
+///
+/// 醒来任务（deferred_inbound_reply）是**被动应答**客户在静默时段攒下的消息——
+/// 用"回应客户最近消息"的语境，避免被动场景被"主动触达"措辞带偏成没话找话；
+/// 普通 follow_up 仍是"主动触达"判断，沿用原措辞 + 任务内容。纯函数便于本地锁定。
+pub(crate) fn follow_up_trigger_message_text(kind: &str, task_content: &str) -> String {
+    if kind == crate::agent::quiet_hours::DEFERRED_INBOUND_REPLY_KIND {
+        "你在作息时段暂未回复，客户在此期间发来了消息。现在请基于完整对话历史，自然地回应客户最近的消息。".to_string()
+    } else {
+        format!("系统跟进任务到期，请重新判断是否适合主动触达。任务内容：{task_content}")
+    }
+}
+
 /// Phase A / A3：taxonomy 软闸的纯逻辑——给定 LLM 输出的 customer_stage / intent_level
 /// 与 [`TaxonomyCache`]，决定要做的字段改写、要附加的 risks 和要 upsert 的候选。
 ///
@@ -3279,6 +3384,25 @@ mod tests {
             last_inbound_ms,
             task_created_ms
         ));
+    }
+
+    #[test]
+    fn deferred_wake_trigger_text_is_passive_reply_framing() {
+        // #69：醒来任务用"回应客户最近消息"措辞（被动应答），不能出现"主动触达"。
+        let text = follow_up_trigger_message_text(
+            crate::agent::quiet_hours::DEFERRED_INBOUND_REPLY_KIND,
+            "作息时段累积消息",
+        );
+        assert!(text.contains("回应客户"), "醒来任务应是被动应答措辞: {text}");
+        assert!(!text.contains("主动触达"), "醒来任务不应出现主动触达措辞: {text}");
+    }
+
+    #[test]
+    fn ordinary_follow_up_trigger_text_keeps_proactive_framing() {
+        // 普通 follow_up 仍是"主动触达"判断，并带上任务内容。
+        let text = follow_up_trigger_message_text("follow_up", "三天前承诺的报价");
+        assert!(text.contains("主动触达"), "普通跟进应保留主动触达措辞: {text}");
+        assert!(text.contains("三天前承诺的报价"), "应带上任务内容: {text}");
     }
 
     // ── Phase A / A3 落地验证：taxonomy 软闸 outcome 纯函数契约 ──────────

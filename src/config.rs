@@ -23,6 +23,15 @@ pub struct AppConfig {
     pub agent_reply_max_segment_chars: usize,
     /// #68：单次回复最多拆成几条短消息,超出则把尾部合并回最后一段,避免刷屏。默认 4。
     pub agent_reply_max_segments: usize,
+    /// #69 作息门控：是否启用静默时段。默认 **false**（灰度开关——代码上线 ≠ 行为生效）。
+    /// 开启后，客户在静默时段发来的消息不立即回，排 `deferred_inbound_reply` 任务到醒来时段；
+    /// 主动发送（planner/follow_up）若在静默时段到点则重排到醒来时刻。relay 转述豁免。
+    pub quiet_hours_enabled: bool,
+    /// #69 作息门控：静默时段起点小时（运营方进程本地时区 `chrono::Local`，0..=23，含）。默认 22。
+    pub quiet_hours_start: u32,
+    /// #69 作息门控：静默时段终点 / 醒来小时（0..=23，不含）。默认 8。
+    /// `start == end` 退化为永不静默。`start > end`（如 22→8）表示跨午夜。
+    pub quiet_hours_end: u32,
     /// 并发多消息去抖窗口（毫秒）。用户连发多条时，调度器在收到最后一条后
     /// 等待此窗口再跑一次聚合流水线，把整串消息塌成一次回复（去抖 + 单联系人串行）。
     /// 默认 4000ms（3-5s 区间中点），clamp 到 [1000, 10000] 防退化忙等 / 误填。
@@ -331,6 +340,9 @@ impl AppConfig {
             agent_reply_max_segments: env_or("AGENT_REPLY_MAX_SEGMENTS", "4")
                 .parse::<usize>()?
                 .max(1),
+            quiet_hours_enabled: parse_bool(&env_or("QUIET_HOURS_ENABLED", "false")),
+            quiet_hours_start: env_or("QUIET_HOURS_START", "22").parse::<u32>()?.min(23),
+            quiet_hours_end: env_or("QUIET_HOURS_END", "8").parse::<u32>()?.min(23),
             message_debounce_window_ms: env_or("MESSAGE_DEBOUNCE_WINDOW_MS", "4000")
                 .parse::<u64>()?
                 .clamp(1000, 10_000),

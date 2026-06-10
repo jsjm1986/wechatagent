@@ -36,6 +36,7 @@ mod knowledge_router;
 mod knowledge_tools;
 mod memory;
 pub(crate) mod prompt_isolation;
+pub(crate) mod quiet_hours;
 mod tool_loop;
 pub(crate) mod outbox;
 pub(crate) mod outbox_dispatcher;
