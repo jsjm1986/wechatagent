@@ -5,14 +5,15 @@
 //! 消息回复——最像真人（睡觉时不回、醒来看完所有消息再答）。主动发送（planner
 //! 催进 / 承诺跟进）若在静默时段到点，则**重排**到醒来时刻而非取消（避免丢承诺）。
 //!
-//! 时区：用进程本地 [`chrono::Local`]（运营方部署时区），不引 `chrono-tz`、不在
-//! `Contact` 上加 timezone 字段——与 `knowledge_digest::duration_until_next_run`
-//! 同款约定。
+//! 时区：用**运营参数固定偏移** `quiet_hours_tz_offset_hours`（小时，如中国 +8），
+//! 不依赖部署宿主时区（`chrono::Local` 取的是进程时区，容器多默认 UTC，会让
+//! "22:00 静默"实际在 UTC 22:00 触发、偏 8 小时）。判定全部用 epoch 毫秒 + 偏移的
+//! 纯整数运算——既消除宿主依赖，又规避本地时刻歧义（夏令时 / 不存在的本地时刻）。
 //!
-//! 全部判定逻辑做成**纯函数**（小时数 / 可注入 `now`），最大化本地可测；只有两个
-//! 取真实时钟的薄包装（[`is_quiet_now`] / [`next_wake_at`]）不单测。
+//! 全部判定逻辑做成**纯函数**（UTC 毫秒 + 偏移 / 小时数），完全本地可测；只有两个
+//! 取真实时钟的薄包装（[`is_quiet_now`] / [`next_wake_at`]）用 `Utc::now()`。
 
-use chrono::{DateTime, Local, NaiveTime, TimeZone, Timelike};
+use chrono::Utc;
 
 /// 静默时段入站延迟回复的跟进任务 kind。区别于 planner 主动催进的 `follow_up`，
 /// 用于在 precheck 中豁免 `context_changed`（它存在就是为了回 task 创建后累积的
@@ -39,56 +40,58 @@ pub(crate) fn in_quiet_hours(now_hour: u32, start: u32, end: u32) -> bool {
     }
 }
 
-/// 计算从 `now` 起、下一次"小时 == `hour`、分秒 == 0"的本地时刻。
+/// 给定 UTC 毫秒与运营方时区偏移（小时），返回运营方本地"当前小时"(0..=23)。
 ///
-/// 今天该小时还在未来则取今天，否则取次日。仿
-/// `knowledge_digest::duration_until_next_run` 的范式，但返回时刻而非 Duration，
-/// 且把 `now` 抽成参数以便注入测试。
-pub(crate) fn next_occurrence_of_hour(now: DateTime<Local>, hour: u32) -> DateTime<Local> {
-    let h = hour.min(23);
-    let target_today = Local
-        .from_local_datetime(
-            &now.date_naive()
-                .and_time(NaiveTime::from_hms_opt(h, 0, 0).unwrap_or_default()),
-        )
-        .single();
-    match target_today {
-        Some(t) if t > now => t,
-        _ => {
-            let next_day = now.date_naive().succ_opt().unwrap_or(now.date_naive());
-            Local
-                .from_local_datetime(
-                    &next_day.and_time(NaiveTime::from_hms_opt(h, 0, 0).unwrap_or_default()),
-                )
-                .single()
-                .unwrap_or(now + chrono::Duration::hours(24))
-        }
-    }
+/// 用 `div_euclid` / `rem_euclid` 保证负偏移 / 负毫秒（理论上不会出现，但防御）
+/// 也落在 0..=23，不会出现 Rust `%` 对负数取负的坑。
+pub(crate) fn hour_in_offset(now_utc_ms: i64, tz_offset_hours: i32) -> u32 {
+    let shifted = now_utc_ms + (tz_offset_hours as i64) * 3_600_000;
+    shifted.div_euclid(3_600_000).rem_euclid(24) as u32
 }
 
-/// 静默时段的"醒来时刻" = 下一次 `end` 整点（醒来即静默区间的右开端点）。
-pub(crate) fn next_wake_instant(now: DateTime<Local>, end: u32) -> DateTime<Local> {
-    next_occurrence_of_hour(now, end)
+/// 给定 UTC 毫秒、醒来小时 `end`、时区偏移，返回下一次"运营方本地 `end`:00"对应的
+/// UTC 毫秒。严格在 `now` 之后（恰好命中 `end`:00 也取次日，保证 wake 落在未来，
+/// 与旧 `next_wake_instant` 的"严格大于"语义一致）。
+pub(crate) fn next_wake_utc_ms(now_utc_ms: i64, end: u32, tz_offset_hours: i32) -> i64 {
+    let off = (tz_offset_hours as i64) * 3_600_000;
+    let local_ms = now_utc_ms + off;
+    let day = local_ms.div_euclid(86_400_000); // 本地"第几天"
+    let end_ms_today = day * 86_400_000 + (end.min(23) as i64) * 3_600_000;
+    let local_target = if end_ms_today > local_ms {
+        end_ms_today
+    } else {
+        end_ms_today + 86_400_000
+    };
+    local_target - off // 回到 UTC
 }
 
-/// 薄包装：当前真实本地时刻是否在静默时段。生产判定入口。
-pub(crate) fn is_quiet_now(start: u32, end: u32) -> bool {
-    in_quiet_hours(Local::now().hour(), start, end)
+/// 薄包装：当前真实时刻（按运营方偏移换算）是否在静默时段。生产判定入口。
+pub(crate) fn is_quiet_now(start: u32, end: u32, tz_offset_hours: i32) -> bool {
+    in_quiet_hours(
+        hour_in_offset(Utc::now().timestamp_millis(), tz_offset_hours),
+        start,
+        end,
+    )
 }
 
-/// 薄包装：从现在算下一次醒来时刻，转成 BSON `DateTime` 供 task `run_at` 用。
-pub(crate) fn next_wake_at(end: u32) -> mongodb::bson::DateTime {
-    let wake = next_wake_instant(Local::now(), end);
-    mongodb::bson::DateTime::from_millis(wake.timestamp_millis())
+/// 薄包装：从现在算下一次醒来时刻（UTC），转成 BSON `DateTime` 供 task `run_at` 用。
+pub(crate) fn next_wake_at(end: u32, tz_offset_hours: i32) -> mongodb::bson::DateTime {
+    mongodb::bson::DateTime::from_millis(next_wake_utc_ms(
+        Utc::now().timestamp_millis(),
+        end,
+        tz_offset_hours,
+    ))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::TimeZone;
 
-    fn local_at(y: i32, m: u32, d: u32, h: u32, min: u32) -> DateTime<Local> {
-        Local.with_ymd_and_hms(y, m, d, h, min, 0).single().unwrap()
+    /// 把 "YYYY-MM-DDThh:mm:ssZ" 解析成 UTC 毫秒，便于断言时区换算。
+    fn utc_ms(rfc3339: &str) -> i64 {
+        mongodb::bson::DateTime::parse_rfc3339_str(rfc3339)
+            .unwrap()
+            .timestamp_millis()
     }
 
     #[test]
@@ -127,27 +130,59 @@ mod tests {
     }
 
     #[test]
+    fn hour_in_offset_china_plus8() {
+        // UTC 14:00 + 8 = 北京 22:00（静默起点）。
+        assert_eq!(hour_in_offset(utc_ms("2026-06-09T14:00:00Z"), 8), 22);
+        // UTC 00:00 + 8 = 北京 08:00（醒来）。
+        assert_eq!(hour_in_offset(utc_ms("2026-06-09T00:00:00Z"), 8), 8);
+        // UTC 18:30 + 8 = 北京次日 02:30 → 小时 2。
+        assert_eq!(hour_in_offset(utc_ms("2026-06-09T18:30:00Z"), 8), 2);
+    }
+
+    #[test]
+    fn hour_in_offset_negative_offset_wraps_correctly() {
+        // 西五区 -5：UTC 02:00 - 5 = 前一日 21:00 → 小时 21（rem_euclid 不出负）。
+        assert_eq!(hour_in_offset(utc_ms("2026-06-09T02:00:00Z"), -5), 21);
+        // UTC 00:00 - 12 = 前一日 12:00 → 小时 12。
+        assert_eq!(hour_in_offset(utc_ms("2026-06-09T00:00:00Z"), -12), 12);
+        // 任意偏移结果都落在 0..=23。
+        for off in [-12, -5, 0, 8, 14] {
+            let h = hour_in_offset(utc_ms("2026-06-09T03:17:00Z"), off);
+            assert!(h < 24, "offset {off} 算出非法小时 {h}");
+        }
+    }
+
+    #[test]
     fn wake_same_day_when_end_still_ahead() {
-        // 凌晨 2:30，end=8 → 当天 08:00。
-        let now = local_at(2026, 6, 9, 2, 30);
-        let wake = next_wake_instant(now, 8);
-        assert_eq!(wake, local_at(2026, 6, 9, 8, 0));
+        // 北京 02:30（= UTC 前一日 18:30），end=8 → 北京当天 08:00（= UTC 00:00）。
+        let now = utc_ms("2026-06-08T18:30:00Z");
+        let wake = next_wake_utc_ms(now, 8, 8);
+        assert_eq!(wake, utc_ms("2026-06-09T00:00:00Z"));
     }
 
     #[test]
     fn wake_next_day_when_end_already_passed() {
-        // 夜里 23:00，end=8 → 次日 08:00。
-        let now = local_at(2026, 6, 9, 23, 0);
-        let wake = next_wake_instant(now, 8);
-        assert_eq!(wake, local_at(2026, 6, 10, 8, 0));
+        // 北京 23:00（= UTC 15:00），end=8 → 北京次日 08:00（= 次日 UTC 00:00）。
+        let now = utc_ms("2026-06-09T15:00:00Z");
+        let wake = next_wake_utc_ms(now, 8, 8);
+        assert_eq!(wake, utc_ms("2026-06-10T00:00:00Z"));
     }
 
     #[test]
     fn wake_strictly_after_now_at_exact_hour() {
-        // 恰好 08:00 命中 end → 不取当天（已到点），取次日，保证 wake 严格在未来。
-        let now = local_at(2026, 6, 9, 8, 0);
-        let wake = next_wake_instant(now, 8);
-        assert_eq!(wake, local_at(2026, 6, 10, 8, 0));
+        // 恰好北京 08:00（= UTC 00:00）命中 end → 不取当天，取次日，保证 wake 严格在未来。
+        let now = utc_ms("2026-06-09T00:00:00Z");
+        let wake = next_wake_utc_ms(now, 8, 8);
+        assert_eq!(wake, utc_ms("2026-06-10T00:00:00Z"));
+        assert!(wake > now, "wake 必须严格在 now 之后");
+    }
+
+    #[test]
+    fn wake_respects_negative_offset() {
+        // 西五区 -5：UTC 12:00 = 当地 07:00，end=8 → 当地当天 08:00 = UTC 13:00。
+        let now = utc_ms("2026-06-09T12:00:00Z");
+        let wake = next_wake_utc_ms(now, 8, -5);
+        assert_eq!(wake, utc_ms("2026-06-09T13:00:00Z"));
     }
 
     #[test]

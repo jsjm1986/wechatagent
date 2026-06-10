@@ -55,6 +55,21 @@ Agent 必须遵守：
 - 独立评审未通过时不发送。
 - 不得使用虚假稀缺、恐惧营销、编造案例或编造产品承诺。
 
+### 作息门控（quiet hours，#69）
+
+像真人一样"睡觉时不回、醒来一次性回完"。默认**开启**，由运营参数（`OperationDomainConfig.runtime_parameters`，前端可改、即时生效）控制：
+
+- `quietHoursEnabled`（默认 `true`）：总开关。
+- `quietHoursStart` / `quietHoursEnd`（默认 `22` / `8`，含起点、不含终点；起点 > 终点表示跨午夜）：静默时段。
+- `quietHoursTzOffsetHours`（默认 `8`，clamp `[-12, 14]`）：运营方时区相对 UTC 的整点偏移。
+
+**时区不依赖部署宿主**：判定全部走 `epoch 毫秒 + 偏移` 的纯整数运算（`src/agent/quiet_hours.rs`），不用 `chrono::Local`（取的是进程时区，容器多默认 UTC，会让"22:00 静默"实际偏 8 小时），同时规避夏令时 / 不存在的本地时刻等歧义。换时区运营只需在前端改 `quietHoursTzOffsetHours`，无需重新部署。
+
+行为：
+
+- 静默时段**入站**消息不立即回，排一条 `deferred_inbound_reply` 跟进任务（`run_at` = 下一次醒来时刻），并写一条 `quiet_hours_deferred_inbound` 观测事件供后台审计；连发去重（同 contact 仅 1 条 wake 任务），醒来后基于累积消息走完整决策/审查链路回 1 次。
+- 静默时段到点的**主动发送**（planner 催进 / 承诺跟进）**重排**到醒来时刻而非取消，避免丢承诺。
+
 ## Operating Brain V2
 
 用户运营 Agent 使用转化平衡目标，不是强销售目标。系统内置以下方法论公式：

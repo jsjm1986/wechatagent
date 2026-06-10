@@ -566,9 +566,16 @@ pub async fn wechat_webhook(
             && agent::quiet_hours::is_quiet_now(
                 runtime.quiet_hours_start,
                 runtime.quiet_hours_end,
+                runtime.quiet_hours_tz_offset_hours,
             );
         if quiet {
-            ensure_wake_followup_task(&state, &contact, runtime.quiet_hours_end).await?;
+            ensure_wake_followup_task(
+                &state,
+                &contact,
+                runtime.quiet_hours_end,
+                runtime.quiet_hours_tz_offset_hours,
+            )
+            .await?;
             deferred = true;
         } else {
             let key = contact_key(&workspace_id, &account_id, &from_wxid);
@@ -612,10 +619,14 @@ pub async fn wechat_webhook(
 /// 去重：仿 planner `has_pending_follow_up` —— 同 contact 已有未终态的 wake 任务则
 /// 不再插（静默时段连发多条 → 1 task → 醒来基于累积消息回 1 次）。先查后插存在
 /// TOCTOU 窗口，但 precheck 的 rate_limited 闸在醒来时会兜住重复触达，可接受。
-async fn ensure_wake_followup_task(
+///
+/// `pub`：暴露给 tests/quiet_hours_deferral.rs 集成测试直接驱动排程链路
+/// （`Utc::now` 不可注入，集成测试只验 DB 写入 + 去重 + 埋点，时区由纯函数单测覆盖）。
+pub async fn ensure_wake_followup_task(
     state: &AppState,
     contact: &Contact,
     wake_hour: u32,
+    tz_offset_hours: i32,
 ) -> AppResult<()> {
     let existing = state
         .db
@@ -635,7 +646,7 @@ async fn ensure_wake_followup_task(
         return Ok(());
     }
     let now = DateTime::now();
-    let run_at = agent::quiet_hours::next_wake_at(wake_hour);
+    let run_at = agent::quiet_hours::next_wake_at(wake_hour, tz_offset_hours);
     // expiry 给 24h 余量（覆盖最长跨午夜窗口 + 醒来后 worker tick 间隔），过期未跑则作废。
     let expires_at = DateTime::from_millis(run_at.timestamp_millis() + 24 * 60 * 60 * 1000);
     let task = AgentTask {
@@ -662,6 +673,23 @@ async fn ensure_wake_followup_task(
         updated_at: now,
     };
     state.db.tasks().insert_one(task, None).await?;
+    // 观测埋点：仅真正新建 wake task 时写一条 deferred 事件，运营后台据此看到
+    // "这条为何没秒回"。dedup 命中（上面 early-return）不写，避免静默连发刷屏。
+    // best-effort：失败只吞掉，绝不阻断 webhook ack。
+    let _ = agent::write_event_for_account(
+        state,
+        &contact.account_id,
+        Some(&contact.wxid),
+        "quiet_hours_deferred_inbound",
+        "deferred",
+        "作息时段，客户消息延迟到醒来时刻回复",
+        Some(doc! {
+            "wakeAt": run_at,
+            "kind": agent::quiet_hours::DEFERRED_INBOUND_REPLY_KIND,
+            "tzOffsetHours": tz_offset_hours,
+        }),
+    )
+    .await;
     Ok(())
 }
 

@@ -509,6 +509,7 @@ mod tests {
             quiet_hours_enabled: true,
             quiet_hours_start: 22,
             quiet_hours_end: 8,
+            quiet_hours_tz_offset_hours: 8,
         }
     }
 
