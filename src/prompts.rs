@@ -538,7 +538,10 @@ pub fn default_domain_configs(workspace_id: &str) -> Vec<OperationDomainConfig> 
                 "requireWhitelist": true
             },
             state_machine: Document::new(),
-            status: "active".to_string(),
+            // Phase 1 仅实现 user_operations；group/moment 是规划中的 Phase 2 域，
+            // 暂无 state_machine.states。必须 draft 而非 active——否则启动期
+            // run_active_domain_state_machine_sanity_check 会因空状态机而 bail。
+            status: "draft".to_string(),
             updated_at: DateTime::now(),
             version: 1,
             current_version: true,
@@ -566,7 +569,8 @@ pub fn default_domain_configs(workspace_id: &str) -> Vec<OperationDomainConfig> 
                 "defaultReviewRequired": true
             },
             state_machine: Document::new(),
-            status: "active".to_string(),
+            // 同 group_operations：Phase 2 规划域，暂无状态机，必须 draft。
+            status: "draft".to_string(),
             updated_at: DateTime::now(),
             version: 1,
             current_version: true,
