@@ -15,6 +15,8 @@ import { parseApiError } from "../../lib/api";
 import { parseCompleteness, parseIntegrityReport, chunkTypeLabel, type CompletenessView, type IntegrityReportView } from "./trustTypes";
 import { ChunkInspectorPane, classifyChunk, focusChunk, type ReviewChunkItem, type ReviewCategory } from "./shared";
 import { ReviewChat, type ReviewChatChunk } from "./cockpit/ReviewChat";
+import { useConfirm } from "../../components/ui/ConfirmDialog";
+import { sourceTypeLabel, statusLabel, integrityStatusLabel } from "./labels";
 
 // ── G2 · DocumentsView · 知识文档目录 CRUD ─────────────────────────────
 interface DocumentItem {
@@ -43,6 +45,7 @@ interface DocumentChunkRow {
 }
 
 export function DocumentsView() {
+  const confirm = useConfirm();
   const [items, setItems] = useState<DocumentItem[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -100,7 +103,13 @@ export function DocumentsView() {
   }
 
   async function handleDelete(id: string) {
-    if (!window.confirm(`删除文档？关联 chunks 不会被删除，但失去文档归属。`)) return;
+    const ok = await confirm({
+      title: "删除文档？",
+      body: "关联知识条目不会被删除，但会失去文档归属。",
+      tone: "danger",
+      confirmText: "确认删除",
+    });
+    if (!ok) return;
     try {
       const r = await fetch(`/api/operation-knowledge/documents/${encodeURIComponent(id)}`, { method: "DELETE" });
       if (!r.ok) throw await parseApiError(r);
@@ -191,12 +200,12 @@ export function DocumentsView() {
                     {(d.businessTopics ?? []).map((t, i) => <span key={i} className="wikiArchiveTag">{t}</span>)}
                   </div>
                 </td>
-                <td style={{ padding: "10px 6px", fontFamily: "var(--font-mono)", fontSize: 12 }}>
-                  <div>{d.sourceType ?? "—"}</div>
+                <td style={{ padding: "10px 6px", fontSize: 12 }}>
+                  <div>{sourceTypeLabel(d.sourceType ?? undefined)}</div>
                   <div style={{ color: "var(--muted)" }}>{d.sourceName ?? ""}</div>
                 </td>
                 <td style={{ padding: "10px 6px" }}>
-                  <span className="wikiBadge">{d.status ?? "—"}</span>
+                  <span className="wikiBadge">{statusLabel(d.status ?? undefined)}</span>
                 </td>
                 <td style={{ padding: "10px 6px", fontFamily: "var(--font-mono)", fontSize: 11, color: "var(--muted)" }}>
                   {d.updatedAt ? new Date(d.updatedAt).toLocaleString() : "—"}
@@ -236,8 +245,8 @@ export function DocumentsView() {
                             style={{ textAlign: "left", display: "grid", gridTemplateColumns: "120px 100px 1fr auto", gap: 8, alignItems: "center" }}
                           >
                             <span className="wikiArchiveTag">{c.wikiType ?? "—"}</span>
-                            <span style={{ fontFamily: "var(--font-mono)", fontSize: 11 }}>
-                              {c.status ?? "—"} / {c.integrityStatus ?? "—"}
+                            <span style={{ fontSize: 11 }}>
+                              {statusLabel(c.status ?? undefined)} / {integrityStatusLabel(c.integrityStatus ?? undefined)}
                             </span>
                             <span style={{ fontFamily: "var(--font-display)", fontWeight: 600 }}>
                               {c.title ?? "（无标题）"}
@@ -277,6 +286,7 @@ interface ImportPreviewResult {
 }
 
 export function ImportWizard() {
+  const confirm = useConfirm();
   const [step, setStep] = useState<1 | 2 | 3>(1);
   const [content, setContent] = useState("");
   const [sourceName, setSourceName] = useState("");
@@ -288,6 +298,10 @@ export function ImportWizard() {
   const [created, setCreated] = useState<string[]>([]);
   // G-后续/4：AI 重抽 tags 按钮单条 loading 标记。
   const [retagging, setRetagging] = useState<number | null>(null);
+
+  // 文件直接落库前的知情确认（PDF/图片无逐条预览，B3）
+  const confirmImport = (title: string, body: string) =>
+    confirm({ title, body, confirmText: "继续上传" });
 
   async function retagCandidate(i: number) {
     const merged = { ...(preview?.chunks ?? [])[i], ...(edits[i] ?? {}) };
@@ -439,7 +453,7 @@ export function ImportWizard() {
           </div>
           <div style={{ marginTop: 14, padding: "10px 12px", border: "1px dashed var(--border)", borderRadius: 6 }}>
             <div style={{ fontSize: 12, color: "var(--muted)", marginBottom: 6 }}>
-              · multimodal 入口（绕过 AI preview，直接 fence 解析 / vision 抽取，落 status=draft）
+              · 上传文件由 AI 直接识别为草稿知识（不经逐条预览），识别结果均需在「待评审」里确认后才会被 AI 使用
             </div>
             <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
               <label className="wikiBtn" style={{ cursor: pending ? "not-allowed" : "pointer", margin: 0 }}>
@@ -452,6 +466,14 @@ export function ImportWizard() {
                   onChange={async (ev) => {
                     const f = ev.target.files?.[0];
                     if (!f) return;
+                    const ok = await confirmImport(
+                      "上传 PDF 识别？",
+                      "PDF 将由 AI 直接拆分为草稿知识，不经逐条预览。结果均为草稿，需你稍后在「待评审」里逐条确认才会被 AI 使用。"
+                    );
+                    if (!ok) {
+                      ev.target.value = "";
+                      return;
+                    }
                     setPending(true);
                     setError(null);
                     try {
@@ -479,7 +501,7 @@ export function ImportWizard() {
                 />
               </label>
               <label className="wikiBtn" style={{ cursor: pending ? "not-allowed" : "pointer", margin: 0 }}>
-                {pending ? "上传中…" : "上传图片（vision）"}
+                {pending ? "上传中…" : "上传图片识别"}
                 <input
                   type="file"
                   accept="image/*"
@@ -488,14 +510,25 @@ export function ImportWizard() {
                   onChange={async (ev) => {
                     const f = ev.target.files?.[0];
                     if (!f) return;
+                    const ok = await confirmImport(
+                      "上传图片识别？",
+                      "图片将由 AI（视觉模型）识别为草稿知识，不经逐条预览。识别结果均为草稿，需你稍后在「待评审」里逐条确认才会被 AI 使用。"
+                    );
+                    if (!ok) {
+                      ev.target.value = "";
+                      return;
+                    }
                     setPending(true);
                     setError(null);
                     try {
-                      const buf = await f.arrayBuffer();
-                      let bin = "";
-                      const u8 = new Uint8Array(buf);
-                      for (let i = 0; i < u8.byteLength; i++) bin += String.fromCharCode(u8[i]);
-                      const b64 = btoa(bin);
+                      // 异步 base64：FileReader 不阻塞主线程，避免大图同步逐字节拼接卡死/爆栈
+                      const dataUrl: string = await new Promise((resolve, reject) => {
+                        const reader = new FileReader();
+                        reader.onload = () => resolve(reader.result as string);
+                        reader.onerror = () => reject(reader.error ?? new Error("读取图片失败"));
+                        reader.readAsDataURL(f);
+                      });
+                      const b64 = dataUrl.includes(",") ? dataUrl.slice(dataUrl.indexOf(",") + 1) : dataUrl;
                       const r = await fetch("/api/operation-knowledge/import-apply-image", {
                         method: "POST",
                         headers: { "content-type": "application/json" },
@@ -781,8 +814,8 @@ export function TryRecallView() {
                 >
                   <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
                     <span className="wikiArchiveTag">{s.wikiType ?? "—"}</span>
-                    <span style={{ fontFamily: "var(--font-mono)", fontSize: 11, color: "var(--muted)" }}>
-                      {s.status ?? "—"} / {s.integrityStatus ?? "—"}
+                    <span style={{ fontSize: 11, color: "var(--muted)" }}>
+                      {statusLabel(s.status ?? undefined)} / {integrityStatusLabel(s.integrityStatus ?? undefined)}
                     </span>
                     <span style={{ fontFamily: "var(--font-display)", fontWeight: 600, marginLeft: 4 }}>
                       {s.title ?? "（无标题）"}
@@ -1075,7 +1108,16 @@ const REVIEW_CATEGORIES: { v: ReviewCategory; label: string; hint: string }[] = 
   { v: "dependents_pending", label: "关系残缺", hint: "related_chunks 引用了不在活跃集合中的 chunk" }
 ];
 
-export function ReviewView() {
+const DIM_LABELS: Record<string, string> = {
+  capability: "能力",
+  pricing: "定价",
+  caseEvidence: "案例",
+  effectClaims: "效果数据",
+  deliveryBoundary: "交付边界",
+};
+
+export function ReviewView({ initialDimFilter }: { initialDimFilter?: string | null } = {}) {
+  const confirm = useConfirm();
   const [items, setItems] = useState<ReviewChunkItem[]>([]);
   const [loading, setLoading] = useState(false);
   const [busyId, setBusyId] = useState<string | null>(null);
@@ -1187,7 +1229,15 @@ export function ReviewView() {
 
   async function batchAction(action: "verify" | "archive") {
     if (selected.size === 0) return;
-    if (action === "archive" && !window.confirm(`批量 archive ${selected.size} 条 chunk？`)) return;
+    if (action === "archive") {
+      const ok = await confirm({
+        title: `批量归档 ${selected.size} 条知识？`,
+        body: "归档后这些知识不再参与 AI 应答，可在修订历史里追溯。",
+        tone: "danger",
+        confirmText: "确认归档",
+      });
+      if (!ok) return;
+    }
     setBatchBusy(true);
     setError(null);
     setInfo(null);
@@ -1248,6 +1298,11 @@ export function ReviewView() {
           仅展示活跃 chunks。verify / reject 直接走现有路由，AI 永不自动 verify。
         </span>
       </div>
+      {initialDimFilter ? (
+        <div className="wikiAlert info">
+          从概览「{DIM_LABELS[initialDimFilter] ?? initialDimFilter}」维度下钻而来：下面是待初审的草稿，确认后这块知识才有机会被 AI 使用。
+        </div>
+      ) : null}
       {error ? <div className="wikiAlert error">{error}</div> : null}
       {info ? <div className="wikiAlert info">{info}</div> : null}
       {selected.size > 0 ? (
@@ -1346,7 +1401,7 @@ export function ReviewView() {
                         <span className="wikiArchiveTag" title="运营用途：这条知识在 AI 回复里怎么用">{chunkTypeLabel(c.chunkType)}</span>
                       ) : null}
                       <span className={`wikiSev ${c.integrityStatus === "rejected" ? "error" : "info"}`}>
-                        {c.integrityStatus ?? "—"}
+                        {integrityStatusLabel(c.integrityStatus ?? undefined)}
                       </span>
                       <button
                         type="button"
@@ -1479,6 +1534,7 @@ interface IngestSourceItem {
 }
 
 export function IngestSourcesView() {
+  const confirm = useConfirm();
   const [items, setItems] = useState<IngestSourceItem[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -1542,7 +1598,13 @@ export function IngestSourcesView() {
   }
 
   async function handleDelete(id: string) {
-    if (!window.confirm("删除外部源？已 ingest 的 chunks 不会被回收。")) return;
+    const ok = await confirm({
+      title: "删除外部源？",
+      body: "已抓取入库的知识不会被回收。",
+      tone: "danger",
+      confirmText: "确认删除",
+    });
+    if (!ok) return;
     try {
       const r = await fetch(`/api/knowledge/ingest-sources/${encodeURIComponent(id)}`, { method: "DELETE" });
       if (!r.ok) throw await parseApiError(r);
@@ -1734,26 +1796,38 @@ export function ObservabilityDashboard() {
   const load = useCallback(async () => {
     setPending(true);
     setError(null);
+    // 逐端点隔离:任一失败只让对应卡片空缺,不再整页全黑(此前 Promise.all + 无 r.ok 检查,
+    // 任一端点 500/返回 HTML 即 JSON 解析抛错,八张卡全没)。
+    async function safe<T>(url: string): Promise<T | null> {
+      try {
+        const r = await fetch(url);
+        if (!r.ok) return null;
+        return (await r.json()) as T;
+      } catch {
+        return null;
+      }
+    }
     try {
-      const [a, b, c, d, e, f, g, h] = await Promise.all([
-        fetch("/api/operation-knowledge/catalog/persisted").then((r) => r.json()),
-        fetch("/api/operation-knowledge/catalog").then((r) => r.json()),
-        fetch("/api/operation-knowledge/completeness").then((r) => r.json()),
-        fetch("/api/operation-knowledge/integrity-report").then((r) => r.json()),
-        fetch("/api/operation-knowledge/logs/analyze").then((r) => r.json()),
-        fetch("/api/knowledge/metrics").then((r) => r.json()),
-        fetch("/api/admin/observability/phase-rollup").then((r) => r.json()),
-        fetch("/api/admin/observability/worker-health").then((r) => r.json())
-      ]);
-      setCatalog(a as CatalogPersistedView);
-      setCatalogLive(b as { total?: number });
-      setCompleteness(parseCompleteness(c));
-      setIntegrity(parseIntegrityReport(d));
-      setLogs(e as LogsAnalyzeView);
-      const metrics = f as { answerCache?: typeof cacheStats };
-      setCacheStats(metrics?.answerCache ?? null);
-      setPhaseRollup(g as typeof phaseRollup);
-      setWorkerHealth(h as typeof workerHealth);
+      const [a, b, c, d, e, f, g, h] = await Promise.allSettled([
+        safe<CatalogPersistedView>("/api/operation-knowledge/catalog/persisted"),
+        safe<{ total?: number }>("/api/operation-knowledge/catalog"),
+        safe<unknown>("/api/operation-knowledge/completeness"),
+        safe<unknown>("/api/operation-knowledge/integrity-report"),
+        safe<LogsAnalyzeView>("/api/operation-knowledge/logs/analyze"),
+        safe<{ answerCache?: typeof cacheStats }>("/api/knowledge/metrics"),
+        safe<typeof phaseRollup>("/api/admin/observability/phase-rollup"),
+        safe<typeof workerHealth>("/api/admin/observability/worker-health"),
+      ]).then((rs) => rs.map((r) => (r.status === "fulfilled" ? r.value : null)));
+      if (a) setCatalog(a as CatalogPersistedView);
+      if (b) setCatalogLive(b as { total?: number });
+      if (c) setCompleteness(parseCompleteness(c));
+      if (d) setIntegrity(parseIntegrityReport(d));
+      if (e) setLogs(e as LogsAnalyzeView);
+      if (f) setCacheStats((f as { answerCache?: typeof cacheStats })?.answerCache ?? null);
+      if (g) setPhaseRollup(g as typeof phaseRollup);
+      if (h) setWorkerHealth(h as typeof workerHealth);
+      const failed = [a, b, c, d, e, f, g, h].filter((x) => x === null).length;
+      if (failed > 0) setError(`${failed} 项诊断数据加载失败，其余正常显示`);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {

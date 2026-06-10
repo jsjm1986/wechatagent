@@ -11,11 +11,15 @@ import {
   Search,
   SendHorizonal,
   Sparkles,
+  SquarePen,
   Trash2,
   X,
 } from "lucide-react";
 import { parseApiError } from "../../lib/api";
 import { LlmErrorBanner, focusChunk } from "./shared";
+import { useConfirm } from "../../components/ui/ConfirmDialog";
+import { useToast } from "../../components/ui/Toast";
+import { severityLabel, priorityLabel, originLabel } from "./labels";
 
 interface ChatTurnView {
   role: "user" | "assistant";
@@ -48,13 +52,20 @@ interface ChatTurnResponse {
   targetPackId?: string | null;
 }
 
-export function ChatWorkbench() {
+export function ChatWorkbench({ initialAttachChunkId }: { initialAttachChunkId?: string | null } = {}) {
+  const confirm = useConfirm();
+  const toast = useToast();
   const [sessionId, setSessionId] = useState<string>(() => {
     if (typeof window === "undefined") return "";
     return window.localStorage.getItem("knowledgeChat.sessionId") ?? "";
   });
   const [draft, setDraft] = useState("");
   const [attachChunkId, setAttachChunkId] = useState<string>("");
+
+  // B2：从待办收件箱「找 AI 协作」跳转过来时预填 chunkId。
+  useEffect(() => {
+    if (initialAttachChunkId) setAttachChunkId(initialAttachChunkId);
+  }, [initialAttachChunkId]);
   const [turns, setTurns] = useState<ChatTurnView[]>([]);
   const [pending, setPending] = useState(false);
   const [applying, setApplying] = useState(false);
@@ -210,7 +221,13 @@ export function ChatWorkbench() {
 
   async function discard() {
     if (!sessionId) return;
-    if (!window.confirm("丢弃本会话的最后一份草稿？")) return;
+    const ok = await confirm({
+      title: "丢弃当前草稿？",
+      body: "将丢弃本会话最后一份 AI 起草内容，此操作不可恢复。",
+      tone: "danger",
+      confirmText: "确认丢弃",
+    });
+    if (!ok) return;
     setError(null);
     setInfo(null);
     try {
@@ -219,10 +236,12 @@ export function ChatWorkbench() {
         { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" }
       );
       if (!r.ok) throw await parseApiError(r);
-      setInfo("已丢弃当前草稿");
+      toast.success("已丢弃当前草稿");
       await loadHistory(sessionId);
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      const msg = e instanceof Error ? e.message : String(e);
+      setError(msg);
+      toast.error(msg);
     }
   }
 
@@ -364,11 +383,19 @@ interface InboxResp {
   stats: { total: number; high: number; mid: number; low: number };
 }
 
-export function KnowledgeInbox() {
+export function KnowledgeInbox({
+  onOpenChat,
+  onFocusChunk,
+}: {
+  onOpenChat?: (chunkId?: string) => void;
+  onFocusChunk?: (chunkId: string) => void;
+} = {}) {
+  const toast = useToast();
   const [data, setData] = useState<InboxResp | null>(null);
   const [pending, setPending] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [priority, setPriority] = useState<"" | "high" | "mid" | "low">("");
+  const [dismissed, setDismissed] = useState<Set<string>>(new Set());
 
   const load = useCallback(async () => {
     setPending(true);
@@ -393,11 +420,24 @@ export function KnowledgeInbox() {
     void load();
   }, [load]);
 
+  const focus = onFocusChunk ?? focusChunk;
+
+  function handleOpenChat(chunkId?: string) {
+    if (onOpenChat) onOpenChat(chunkId);
+    else toast.info("请到「AI 协作」标签与 AI 协作补充这条知识");
+  }
+
+  function handleDismiss(id: string) {
+    // 本地乐观隐藏 + toast（后端暂无逐条 dismiss 接口时不发死请求）
+    setDismissed((prev) => new Set(prev).add(id));
+    toast.success("已从待办中移除");
+  }
+
   return (
     <div className="wikiArchiveShell wikiInbox">
       <header className="wikiArchiveHeader">
         <div>
-          <div className="wikiArchiveEyebrow">today / inbox</div>
+          <div className="wikiArchiveEyebrow">今日 / 待办</div>
           <h2>待办收件箱</h2>
         </div>
         <div className="wikiArchiveHeaderActions">
@@ -420,51 +460,53 @@ export function KnowledgeInbox() {
 
       {data ? (
         <div className="wikiInboxStats">
-          <span className="wikiArchiveTag">total {data.stats.total}</span>
-          <span className="wikiArchiveTag">high {data.stats.high}</span>
-          <span className="wikiArchiveTag">mid {data.stats.mid}</span>
-          <span className="wikiArchiveTag">low {data.stats.low}</span>
+          <span className="wikiArchiveTag">共 {data.stats.total}</span>
+          <span className="wikiArchiveTag">高 {data.stats.high}</span>
+          <span className="wikiArchiveTag">中 {data.stats.mid}</span>
+          <span className="wikiArchiveTag">低 {data.stats.low}</span>
         </div>
       ) : null}
 
       <div className="wikiInboxList">
-        {data && data.items.length === 0 ? (
+        {data && data.items.filter((it) => !dismissed.has(it.id)).length === 0 ? (
           <div className="wikiEmpty">
             <Inbox size={24} /> 暂无待办
           </div>
         ) : null}
-        {data?.items.map((it) => (
+        {data?.items.filter((it) => !dismissed.has(it.id)).map((it) => (
           <article
             key={it.id}
             className={`wikiInboxCard wikiInboxCard--${it.priority}`}
           >
             <div className="wikiInboxCardHead">
               <span className={`wikiArchiveTag wikiInboxPriority--${it.priority}`}>
-                {it.priority}
+                {priorityLabel(it.priority)}
               </span>
-              <span className="wikiArchiveTag">{it.kind}</span>
-              <span className="wikiArchiveTag">{it.origin}</span>
+              <span className="wikiArchiveTag">{originLabel(it.origin)}</span>
               <span className="wikiArchiveTimelineTime">{it.createdAt}</span>
             </div>
             <h4 className="wikiInboxCardTitle">{it.title}</h4>
             <p className="wikiInboxCardSummary">{it.contextSummary}</p>
             <div className="wikiInboxCardActions">
               {it.targetChunkId ? (
-                <button
-                  type="button"
-                  onClick={() => focusChunk(it.targetChunkId as string)}
-                >
-                  <ArrowRight size={12} /> 聚焦切片
+                <button type="button" onClick={() => focus(it.targetChunkId as string)}>
+                  <ArrowRight size={12} /> 查看知识
                 </button>
               ) : null}
               {it.suggestedActions.includes("open_chat") ? (
-                <span className="wikiArchiveTag">open_chat</span>
+                <button type="button" onClick={() => handleOpenChat(it.targetChunkId ?? undefined)}>
+                  <MessageSquareText size={12} /> 找 AI 协作
+                </button>
               ) : null}
-              {it.suggestedActions.includes("open_repair") ? (
-                <span className="wikiArchiveTag">open_repair</span>
+              {it.suggestedActions.includes("open_repair") && it.targetChunkId ? (
+                <button type="button" onClick={() => focus(it.targetChunkId as string)}>
+                  <SquarePen size={12} /> 去修复
+                </button>
               ) : null}
               {it.suggestedActions.includes("dismiss") ? (
-                <span className="wikiArchiveTag">dismiss</span>
+                <button type="button" onClick={() => handleDismiss(it.id)}>
+                  <X size={12} /> 忽略
+                </button>
               ) : null}
             </div>
           </article>
@@ -607,7 +649,7 @@ export function DigestCanvas() {
         {visibleCards.map((card) => (
           <article className={`wikiDigestCard sev-${card.severity}`} key={card.cardId}>
             <div className="wikiDigestCardHead">
-              <span className={severityBadgeClass(card.severity)}>{card.severity}</span>
+              <span className={severityBadgeClass(card.severity)}>{severityLabel(card.severity)}</span>
               <span className="wikiDigestKind">{card.kind}</span>
             </div>
             <h4 className="wikiDigestTitle">{card.title}</h4>
