@@ -19,7 +19,7 @@ import { parseApiError } from "../../lib/api";
 import { LlmErrorBanner, focusChunk } from "./shared";
 import { useConfirm } from "../../components/ui/ConfirmDialog";
 import { useToast } from "../../components/ui/Toast";
-import { severityLabel, priorityLabel, originLabel } from "./labels";
+import { severityLabel, priorityLabel, originLabel, draftKindLabel, taskStatusLabel } from "./labels";
 
 interface ChatTurnView {
   role: "user" | "assistant";
@@ -284,7 +284,7 @@ export function ChatWorkbench({ initialAttachChunkId }: { initialAttachChunkId?:
               <span className="wikiArchiveTag">{t.role === "user" ? "运营" : "AI"}</span>
               <span className="wikiArchiveTimelineTime">#{t.turnIndex}</span>
               {t.intent ? <span className="wikiArchiveTag">{t.intent}</span> : null}
-              {t.draftKind ? <span className="wikiArchiveTag">{t.draftKind}</span> : null}
+              {t.draftKind ? <span className="wikiArchiveTag">{draftKindLabel(t.draftKind)}</span> : null}
             </div>
             <div className="wikiChatTurnBody">
               {t.role === "assistant" && t.naturalReply ? t.naturalReply : t.content}
@@ -791,23 +791,23 @@ export function TaskRail() {
         <div className="wikiTaskRailBody">
           <div className="wikiTaskCard">
             <div className="wikiTaskCardHead">
-              <span className={`wikiTaskStatus s-${task.status}`}>{task.status}</span>
+              <span className={`wikiTaskStatus s-${task.status}`}>{taskStatusLabel(task.status)}</span>
               <span className="wikiTaskMeta">
                 {task.completedSteps.length}/{task.totalSteps} 步
               </span>
             </div>
-            <div className="wikiTaskMeta wikiTaskMeta--small">session: {task.sessionId}</div>
+            <div className="wikiTaskMeta wikiTaskMeta--small">会话：{task.sessionId}</div>
             <div className="wikiTaskMeta wikiTaskMeta--small">
               开始：{task.startedAt ?? "—"} · 结束：{task.finishedAt ?? "—"}
             </div>
             {task.errorKind ? (
-              <div className="wikiAlert error">errorKind: {task.errorKind}</div>
+              <div className="wikiAlert error">错误：{task.errorKind}</div>
             ) : null}
             {task.cards.length > 0 ? (
               <div className="wikiTaskCardList">
                 {task.cards.map((c) => (
                   <div className="wikiTaskCardEntry" key={c.cardId}>
-                    <span className={severityBadgeClass(c.severity)}>{c.severity}</span>
+                    <span className={severityBadgeClass(c.severity)}>{severityLabel(c.severity)}</span>
                     <span className="wikiTaskCardTitle">{c.title}</span>
                   </div>
                 ))}

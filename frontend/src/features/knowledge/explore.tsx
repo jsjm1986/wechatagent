@@ -2,6 +2,7 @@ import { useState, useEffect, useRef, useMemo, type FormEvent } from "react";
 import { ChevronDown, ChevronRight, Clock3, RefreshCw, Sparkles } from "lucide-react";
 import { parseApiError } from "../../lib/api";
 import { numberOr, stringOr, type TreeChunkItem } from "./shared";
+import { wikiTypeLabel, statusLabel, integrityStatusLabel } from "./labels";
 
 interface AskSourceQuote {
   chunkId: string;
@@ -571,14 +572,14 @@ function ChunkDetail(props: {
     <article className="wikiChunkDetail">
       <header className="wikiChunkDetailHead">
         <div className="wikiChunkDetailTitle">
-          <span className={`wikiKind ${chunk.wikiType ?? "unknown"}`}>{chunk.wikiType ?? "—"}</span>
+          <span className={`wikiKind ${chunk.wikiType ?? "unknown"}`}>{wikiTypeLabel(chunk.wikiType ?? undefined)}</span>
           <h3>{chunk.title}</h3>
         </div>
         <div className="wikiChunkDetailMeta">
           <span className={`wikiSev ${chunk.integrityStatus === "rejected" ? "error" : "info"}`}>
-            {chunk.integrityStatus ?? "—"}
+            {integrityStatusLabel(chunk.integrityStatus ?? undefined)}
           </span>
-          <span className="wikiBadge">{chunk.status ?? "—"}</span>
+          <span className="wikiBadge">{statusLabel(chunk.status ?? undefined)}</span>
           <code>{chunk.id}</code>
         </div>
       </header>

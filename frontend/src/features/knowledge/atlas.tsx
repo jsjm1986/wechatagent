@@ -12,6 +12,7 @@ import {
 import { parseApiError } from "../../lib/api";
 import { useConfirm } from "../../components/ui/ConfirmDialog";
 import { focusChunk, type TreeChunkItem } from "./shared";
+import { wikiTypeLabel, statusLabel } from "./labels";
 
 // ── P1 · ChunkGraphView · 关系图谱（SVG 原生布局，0 新依赖）─────────────
 //
@@ -781,7 +782,7 @@ function MetadataDashboard() {
                 const ratio = maxCount > 0 ? Number(row.count ?? 0) / maxCount : 0;
                 return (
                   <div className="wikiCoverageBarRow" key={i}>
-                    <span className="wikiCoverageBarLabel">{row.wikiType ?? "?"}</span>
+                    <span className="wikiCoverageBarLabel">{wikiTypeLabel(row.wikiType ?? undefined)}</span>
                     <div className="wikiCoverageBar">
                       <div
                         className="wikiCoverageBarFill"
@@ -809,7 +810,7 @@ function MetadataDashboard() {
                 const ratio = Math.max(0, Math.min(1, Number(row.ratio ?? 0)));
                 return (
                   <div className="wikiCoverageBarRow" key={i}>
-                    <span className="wikiCoverageBarLabel">{row.wikiType ?? "?"}</span>
+                    <span className="wikiCoverageBarLabel">{wikiTypeLabel(row.wikiType ?? undefined)}</span>
                     <div className="wikiCoverageBar">
                       <div
                         className="wikiCoverageBarFill"
@@ -1095,7 +1096,7 @@ function TaxonomiesGovernance() {
               <td className="wikiArchiveTimelineTime">{it.value?.id}</td>
               <td>{it.value?.displayName}</td>
               <td>
-                <span className="wikiArchiveTag">{it.value?.status ?? "?"}</span>
+                <span className="wikiArchiveTag">{statusLabel(it.value?.status ?? undefined)}</span>
               </td>
               <td className="wikiArchiveTimelineTime">v{it.version ?? 0}</td>
               <td>{it.currentVersion ? "✓" : ""}</td>

@@ -105,3 +105,92 @@ export function originLabel(v?: string | null): string {
   if (!v) return "—";
   return ORIGIN_LABELS[v] ?? v;
 }
+
+/// 外部源抓取类型
+export const SOURCE_KIND_LABELS: Record<string, string> = {
+  rss: "RSS 订阅",
+  html: "网页",
+};
+export function sourceKindLabel(v?: string | null): string {
+  if (!v) return "—";
+  return SOURCE_KIND_LABELS[v] ?? v;
+}
+
+/// 外部源运行状态
+export const INGEST_STATUS_LABELS: Record<string, string> = {
+  active: "正常",
+  failing: "连续失败",
+  disabled: "已停用",
+  paused: "已暂停",
+};
+export function ingestStatusLabel(v?: string | null): string {
+  if (!v) return "—";
+  return INGEST_STATUS_LABELS[v] ?? v;
+}
+
+/// 风险等级(知识路由/试召的 riskLevel)
+export const RISK_LEVEL_LABELS: Record<string, string> = {
+  low: "低风险",
+  medium: "中风险",
+  high: "高风险",
+  critical: "极高风险",
+};
+export function riskLevelLabel(v?: string | null): string {
+  if (!v) return "—";
+  return RISK_LEVEL_LABELS[v] ?? v;
+}
+
+/// 修订操作类型(chunk_revisions.op 封闭枚举)
+export const REVISION_OP_LABELS: Record<string, string> = {
+  create: "新建",
+  patch: "修改",
+  split: "拆分",
+  merge: "合并",
+  rollback: "回滚",
+  archive: "归档",
+  restore: "恢复",
+  verify: "确认",
+  unverify: "撤销确认",
+};
+export function revisionOpLabel(v?: string | null): string {
+  if (!v) return "—";
+  return REVISION_OP_LABELS[v] ?? v;
+}
+
+/// 修订来源(chunk_revisions.source 封闭枚举 ai|human|rule|imported)
+export const REVISION_SOURCE_LABELS: Record<string, string> = {
+  ai: "AI",
+  human: "管理员",
+  rule: "规则",
+  imported: "导入",
+};
+export function revisionSourceLabel(v?: string | null): string {
+  if (!v) return "—";
+  return REVISION_SOURCE_LABELS[v] ?? v;
+}
+
+/// AI 协作草稿类型(chat 起草产物 draftKind)
+export const DRAFT_KIND_LABELS: Record<string, string> = {
+  chunk: "新增知识",
+  chunk_update: "更新知识",
+  pack_update: "更新话术包",
+  digest_dispatch: "派发要点",
+  operator_memory: "运营记忆",
+};
+export function draftKindLabel(v?: string | null): string {
+  if (!v) return "—";
+  return DRAFT_KIND_LABELS[v] ?? v;
+}
+
+/// 后台任务状态(knowledge_chat_tasks 封闭枚举)
+export const TASK_STATUS_LABELS: Record<string, string> = {
+  pending: "排队中",
+  running: "执行中",
+  completed: "已完成",
+  failed: "失败",
+  cancelled: "已取消",
+};
+export function taskStatusLabel(v?: string | null): string {
+  if (!v) return "—";
+  return TASK_STATUS_LABELS[v] ?? v;
+}
