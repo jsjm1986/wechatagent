@@ -73,6 +73,24 @@
 .acctOptionName { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .acctCheck { flex-shrink: 0; color: var(--color-scheduled); }
 
+/* 同步微信号：菜单内分隔线 + 0 账号空态的独立入口按钮 */
+.acctMenuDivider { height: 1px; margin: 5px 4px; background: var(--hairline); }
+.acctSync {
+  display: flex; align-items: center; gap: 9px; width: 100%; cursor: pointer;
+  padding: 9px 12px; border-radius: var(--r-sm); min-height: 0; text-align: left;
+  font-size: 13px; font-weight: 600; font-family: inherit; color: var(--color-scheduled); letter-spacing: -.2px;
+  background: none; border: 1px dashed var(--hairline); box-shadow: none;
+  transition: background .15s ease;
+}
+.acctSync:hover:not(:disabled) { background: var(--fill-scheduled); border-color: transparent; }
+.acctSync:disabled { cursor: default; opacity: .7; }
+.acctSyncSpin { animation: acctSpin .8s linear infinite; }
+@keyframes acctSpin { to { transform: rotate(360deg); } }
+.acctSyncErr {
+  margin-top: 6px; padding: 5px 10px; font-size: 11px; line-height: 1.4;
+  color: #d6342a; background: var(--fill-blocked); border-radius: var(--r-sm);
+}
+
 /* 导航 */
 .nav { display: flex; flex-direction: column; gap: 0; flex: 1; overflow-y: auto; overflow-x: hidden; }
 .group + .group { margin-top: 8px; }
