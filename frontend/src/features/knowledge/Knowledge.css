@@ -1,8 +1,7 @@
-/* Knowledge Wiki channel styles — Stage-1 verbatim drain from styles.css.
-   All selectors kept inside :global{} so descendant selectors
-   (.knowledgeWiki .wikiX) and dynamic-suffix classNames behave identically.
-   Stage-2 will token-ize hex values and promote static classNames. */
-:global {
+/* Knowledge Wiki channel styles — 普通全局 CSS（plain .css，不是 CSS module）。
+   组件用全局字符串 className（.knowledgeWiki .wikiX 等）。若放进 *.module.css 并
+   以 `import "./x.module.css"` 副作用方式引入，Rollup 会因无被引用导出而 tree-shake
+   掉整份样式 → 频道裸奔。故这里保持 plain .css，副作用导入永不被摇树。 */
   /* 波 B4-B6：运营成效中心 */
   .qualityCenter {
     padding: 24px;
@@ -3096,4 +3095,3 @@
       visibility: hidden;
     }
   }
-}
