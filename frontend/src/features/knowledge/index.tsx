@@ -33,7 +33,7 @@ import {
 import { CockpitView } from "./cockpit/CockpitView";
 import { ReviewChat, type ReviewChatChunk } from "./cockpit/ReviewChat";
 import { AutoVerifyPanel } from "./cockpit/AutoVerifyPanel";
-import "./Knowledge.module.css";
+import "./Knowledge.css";
 
 // knowledge-wiki Phase G+：Wiki 管理频道——agent-first 渐进式披露主入口。
 //
