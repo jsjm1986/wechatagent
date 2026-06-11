@@ -28,6 +28,7 @@ mod chat_tool_loop;
 mod decision;
 mod decision_taxonomy;
 pub mod domain;
+pub(crate) mod domain_profile;
 pub mod escalation;
 mod gateway;
 mod guards;

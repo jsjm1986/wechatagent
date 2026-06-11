@@ -19,7 +19,7 @@ use crate::models::{
     AgentRunLog, AgentSoul,
     AgentTask, AgentToolCall, BehaviorSignal, BehaviorSignalMetric, CatalogRebuildJob,
     ChunkRevision, Contact,
-    ContentAsset, ConversationMessage, DomainSchema, EvaluationScenario, Experiment, IngestSource,
+    ContentAsset, ConversationMessage, DomainProfile, DomainSchema, EvaluationScenario, Experiment, IngestSource,
     KnowledgeChatTask, KnowledgeChatTurn, KnowledgeDailyReport, KnowledgeGapSignal,
     KnowledgeOperatorMemory, KnowledgeUsageLog, LlmCallLog, LlmProviderConfig,
     ManagementAgentMessage, ManagementAgentSession, McpCallLog, MemoryCandidate, MigrationRecord,
@@ -327,6 +327,13 @@ impl Database {
     /// 行业可配 schema：每 workspace 同时只能 1 条 is_active=true。
     pub fn domain_schemas(&self) -> Collection<DomainSchema> {
         self.db.collection("domain_schemas")
+    }
+
+    /// universal-domain-adaptation Phase 0：行业「总装配单」。每 workspace 同时
+    /// 1 条 is_active=true；运行时按 active 加载（无则 fallback DEFAULT_PROFILE）。
+    /// 详见 `src/agent/domain_profile.rs`。索引见 `db/indexes.rs`。
+    pub fn domain_profiles(&self) -> Collection<DomainProfile> {
+        self.db.collection("domain_profiles")
     }
 
     /// catalog 重建队列：apply_chunk_revision 写完即 enqueue；catalog_rebuild_worker

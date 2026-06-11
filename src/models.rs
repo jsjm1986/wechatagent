@@ -1169,6 +1169,94 @@ pub struct DomainField {
     pub alias_of: Option<String>,
 }
 
+/// universal-domain-adaptation Phase 0：行业/产品「总装配单」。
+///
+/// 让系统对行业**零假设**：一个 `DomainProfile` 声明本行业「参与决策的画像维度
+/// + 关联 chunk 字段表 + prompt 片段 + 承诺词表 + completeness 维度」，由引导层 AI
+/// 对话生成候选 → 人审 → publish。运行时按 `is_active=true` 加载（每 workspace 一条）；
+/// 无 active 时 fallback 到内置 `DEFAULT_PROFILE`（等价当前销售域写死行为，保证零配置
+/// 启动与历史一致）。
+///
+/// 维度的**取值字典**仍存 `system_taxonomies`（按 `kind` 关联，复用 `check_value`
+/// 的 alias 归一/候选发现）；本结构只声明「本行业有哪些维度、哪些进决策校验」。
+/// 版本灰度 4 字段与 [`TaxonomyEntry`] / `DomainSchema` 对齐（E5-T1）。
+///
+/// Phase 0 仅落存储 + 加载器，运行时**暂不消费**（并行加载、零行为变化）；
+/// 消费解耦在 Phase 1。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DomainProfile {
+    #[serde(rename = "_id", skip_serializing_if = "Option::is_none")]
+    pub id: Option<ObjectId>,
+    pub profile_id: String,
+    pub workspace_id: String,
+    pub display_name: String,
+    #[serde(default)]
+    pub description: String,
+    /// 参与/不参与决策的画像维度声明（替代 `decision_taxonomy::TAGGED_FIELDS` const 表）。
+    #[serde(default)]
+    pub profile_dimensions: Vec<ProfileDimension>,
+    /// 关联的 chunk 字段表（引用 `DomainSchema.schema_id`）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub domain_schema_id: Option<String>,
+    /// 行业 prompt 片段（注入决策 prompt，替代写死的销售域维度语义文案）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_fragment: Option<String>,
+    /// 本行业绝对化承诺词表（替代 `guards.rs` 写死的中文销售词）。
+    #[serde(default)]
+    pub commitment_markers: CommitmentMarkers,
+    /// completeness 审计维度（替代 `catalog.rs` 写死的五维 coverage）。
+    #[serde(default)]
+    pub coverage_dimensions: Vec<CoverageDimension>,
+    /// E5-T1 多版本灰度：同 `(workspace_id, profile_id)` 下 `version` 单调递增。
+    #[serde(default = "default_version_one")]
+    pub version: i32,
+    #[serde(default)]
+    pub current_version: bool,
+    #[serde(default)]
+    pub previous_version: Option<i32>,
+    /// 写入来源：`generated_by_ai` / `manual` / `default`。
+    #[serde(default)]
+    pub seeded_by: Option<String>,
+    pub is_active: bool,
+    pub created_at: DateTime,
+    pub updated_at: DateTime,
+}
+
+/// `DomainProfile` 的一个画像维度声明。`kind` 与 `system_taxonomies.kind`
+/// 的 snake_case 一致（如 `customer_stage` / `visit_stage`）；取值字典存
+/// `system_taxonomies`，本结构只声明维度元信息 + 是否进决策校验。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProfileDimension {
+    pub kind: String,
+    pub display_name: String,
+    /// 是否进 Reply Agent 决策的 taxonomy 校验（对应旧 `TAGGED_FIELDS` 成员）。
+    #[serde(default)]
+    pub participates_in_decision: bool,
+    /// 注入 prompt 的语义说明（如「就诊阶段：初诊/复诊/方案确认/已治疗」）。
+    #[serde(default)]
+    pub description: String,
+}
+
+/// 绝对化承诺词表，按 `commitment_claim_class` 分两类（替代 `guards.rs` 写死词表）。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct CommitmentMarkers {
+    /// 产品效果类（如销售域「成功率/见效/回款」，医疗域「根治率」，教培域「保过」）。
+    #[serde(default)]
+    pub product_effect: Vec<String>,
+    /// 纯语气类（如「保证/一定能/绝对」）。
+    #[serde(default)]
+    pub tone_only: Vec<String>,
+}
+
+/// completeness 审计的一个 coverage 维度（替代 `catalog.rs` 写死的五维）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CoverageDimension {
+    pub key: String,
+    pub display_name: String,
+    #[serde(default)]
+    pub required: bool,
+}
+
 /// catalog 重建队列：`apply_chunk_revision` 写完即 enqueue；catalog_rebuild_worker
 /// 每 200ms 取一批 status=queued 落库 `documents.catalog_summary_persisted`。
 #[derive(Debug, Clone, Serialize, Deserialize)]

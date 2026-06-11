@@ -1177,6 +1177,32 @@ async fn ensure_evolution_indexes(db: &Database) -> anyhow::Result<()> {
             None,
         )
         .await?;
+    db.domain_profiles()
+        .create_index(
+            IndexModel::builder()
+                .keys(doc! { "workspace_id": 1, "profile_id": 1, "version": -1 })
+                .options(
+                    IndexOptions::builder()
+                        .name("domain_profiles_ws_id_version_idx".to_string())
+                        .build(),
+                )
+                .build(),
+            None,
+        )
+        .await?;
+    db.domain_profiles()
+        .create_index(
+            IndexModel::builder()
+                .keys(doc! { "workspace_id": 1, "is_active": 1 })
+                .options(
+                    IndexOptions::builder()
+                        .name("domain_profiles_ws_active_idx".to_string())
+                        .build(),
+                )
+                .build(),
+            None,
+        )
+        .await?;
     db.catalog_rebuild_jobs()
         .create_index(
             IndexModel::builder()
