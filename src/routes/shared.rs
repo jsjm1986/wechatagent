@@ -72,21 +72,25 @@ pub(super) fn contact_domain_str(contact: &Contact, key: &str) -> Option<String>
 /// （planner 的 stage_stagnation 计时器依赖它）。容器级 `domain_attributes_updated_at`
 /// 总是刷新。注意：调用方的同一 `$set` 内不能再出现顶层 `domain_attributes` 键，
 /// 否则 MongoDB 会因 path conflict 报错。
+///
+/// universal-domain-adaptation 1D：dotted-key 写入 + stage 计时器逻辑已收敛到
+/// `agent::domain_signals::insert_domain_signal_values` 单一内核（AI 决策路径与本
+/// admin 路径共用）。本 wrapper 仅负责把两个 typed 维度参数装进 signals 容器、并
+/// 保留 admin 路径「容器时间戳总是刷新」的既有契约（即便无维度写入也刷新）。
 pub(super) fn insert_domain_stage_fields(
     set_doc: &mut Document,
     customer_stage: Option<&str>,
     intent_level: Option<&str>,
     stage_changed: bool,
 ) {
+    let mut signals = Document::new();
     if let Some(stage) = customer_stage {
-        set_doc.insert("domain_attributes.customer_stage", stage);
+        signals.insert("customer_stage", stage);
     }
     if let Some(intent) = intent_level {
-        set_doc.insert("domain_attributes.intent_level", intent);
+        signals.insert("intent_level", intent);
     }
-    if stage_changed {
-        set_doc.insert("domain_attributes.customer_stage_updated_at", DateTime::now());
-    }
+    crate::agent::domain_signals::insert_domain_signal_values(set_doc, &signals, stage_changed);
     set_doc.insert("domain_attributes_updated_at", DateTime::now());
 }
 

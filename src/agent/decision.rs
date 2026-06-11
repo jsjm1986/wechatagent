@@ -555,6 +555,10 @@ pub(crate) async fn decide_reply_with_promote(
         &contact.account_id,
     );
     promote_risks.extend(taxonomy_risks);
+    // universal-domain-adaptation H1 / 1D：taxonomy 已把 typed 维度改写为 canonical
+    // id，此处把 typed 维度镜像进 domain_signals 容器（反之容器有值而 typed 缺失时回填
+    // typed），使两侧一致。DEFAULT 销售域里 LLM 只输出 typed，故仅 typed→容器 生效。
+    super::domain_signals::normalize_domain_signals(&mut decision);
     Ok((decision, promote_risks))
 }
 
