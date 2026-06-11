@@ -77,7 +77,62 @@ export const api = {
     const response = await fetch(url, { method: "DELETE" });
     if (!response.ok) throw await parseApiError(response);
     return response.json();
-  }
+  },
+  /// multipart 文件上传（PDF / 图片）。不设 Content-Type，让浏览器带 boundary。
+  async postForm<T>(url: string, form: FormData): Promise<T> {
+    const response = await fetch(url, { method: "POST", body: form });
+    if (!response.ok) throw await parseApiError(response);
+    return response.json();
+  },
+  /// 不抛错的原始 POST：返回 { ok, status, data }，调用方自行处理非 2xx
+  /// （如 lock 409 带 payload 的分支）。data 解析失败时为 null。
+  async postRaw<T>(
+    url: string,
+    body?: unknown
+  ): Promise<{ ok: boolean; status: number; data: T | null }> {
+    const response = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: body ? JSON.stringify(body) : undefined,
+    });
+    let data: T | null = null;
+    try {
+      data = (await response.json()) as T;
+    } catch {
+      data = null;
+    }
+    return { ok: response.ok, status: response.status, data };
+  },
 };
+
+/// 统一 SSE 订阅：封装 close/error 兜底，返回关闭函数。
+/// 替代散落的裸 EventSource（断流不收尾、error 靠旧闭包判断等坑）。
+export function openEventSource(
+  url: string,
+  handlers: {
+    onEvent?: (type: string, data: string) => void;
+    onError?: () => void;
+    events?: string[];
+  }
+): () => void {
+  if (typeof window === "undefined" || typeof window.EventSource === "undefined") {
+    return () => {};
+  }
+  const es = new EventSource(url);
+  let closed = false;
+  const close = () => {
+    if (closed) return;
+    closed = true;
+    es.close();
+  };
+  for (const evt of handlers.events ?? []) {
+    es.addEventListener(evt, (e) => handlers.onEvent?.(evt, (e as MessageEvent).data));
+  }
+  es.addEventListener("error", () => {
+    handlers.onError?.();
+    close();
+  });
+  return close;
+}
 
 export { parseApiError };

@@ -3,12 +3,10 @@ import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import KnowledgeFeature from "../../../features/knowledge";
 
-// knowledge 频道一体化迁移后的视觉/集成测试（追加，不改既有任何用例）。
-// 验证：(1) 自包含 KnowledgeFeature 在新 tokens.css 视觉壳（Knowledge.module.css 全量重塑）
-//           下，渲染档案馆小标题 + 工作站标题（Shell 拥有页头，这里是面板级标题）；
-//       (2) 4 个 mode-bar 模式按钮（今日/探索/治理/全景）真实 DOM 仍正确；
-//       (3) 默认 today 模式按钮持 active 态；点击「治理」后 active 态正确转移——
-//           证明 CSS Module :global{} 壳下 className 动态切换未被破坏。
+// knowledge 频道 IA 重组后的视觉/集成测试。
+// 验证：(1) 自包含 KnowledgeFeature 渲染档案馆小标题 + 工作站标题（Shell 拥有页头）；
+//       (2) 3 个 mode-bar 模式按钮（工作台/知识库/控制台）真实 DOM 正确；
+//       (3) 默认 workbench 模式按钮持 active 态；点击「控制台」后 active 态正确转移。
 
 const realFetch = globalThis.fetch;
 
@@ -46,41 +44,39 @@ describe("KnowledgeFeature — 一体化频道（全量重塑视觉壳）", () =
     globalThis.fetch = realFetch;
   });
 
-  it("渲染档案馆小标题与工作站标题", () => {
+  it("渲染频道小标题与工作站标题", () => {
     render(<KnowledgeFeature />);
-    expect(
-      screen.getByText("Knowledge Workstation · 知识档案馆"),
-    ).toBeInTheDocument();
+    expect(screen.getByText("知识运营工作台")).toBeInTheDocument();
     expect(screen.getByText("知识库工作站")).toBeInTheDocument();
   });
 
-  it("渲染 4 个模式按钮（今日 / 探索 / 治理 / 全景）", () => {
+  it("渲染 3 个模式按钮（工作台 / 知识库 / 控制台）", () => {
     render(<KnowledgeFeature />);
-    for (const label of ["今日", "探索", "治理", "全景"]) {
+    for (const label of ["工作台", "知识库", "控制台"]) {
       expect(screen.getByText(label)).toBeInTheDocument();
     }
     // caption 也应在视觉壳内真实渲染
-    expect(screen.getByText("Digest 与待办")).toBeInTheDocument();
-    expect(screen.getByText("Schema、指标、记忆")).toBeInTheDocument();
+    expect(screen.getByText("今日待办与起草")).toBeInTheDocument();
+    expect(screen.getByText("录入、Schema 与系统")).toBeInTheDocument();
   });
 
-  it("默认 today 模式按钮持 active 态，点击「治理」后 active 转移", async () => {
+  it("默认 workbench 模式按钮持 active 态，点击「控制台」后 active 转移", async () => {
     const user = userEvent.setup();
     render(<KnowledgeFeature />);
 
-    const todayBtn = screen.getByText("今日").closest("button");
-    const stewardBtn = screen.getByText("治理").closest("button");
-    expect(todayBtn).not.toBeNull();
-    expect(stewardBtn).not.toBeNull();
+    const workbenchBtn = screen.getByText("工作台").closest("button");
+    const consoleBtn = screen.getByText("控制台").closest("button");
+    expect(workbenchBtn).not.toBeNull();
+    expect(consoleBtn).not.toBeNull();
 
-    // 初始：today active、steward 非 active
-    expect(todayBtn?.className).toContain("active");
-    expect(stewardBtn?.className).not.toContain("active");
+    // 初始：workbench active、console 非 active
+    expect(workbenchBtn?.className).toContain("active");
+    expect(consoleBtn?.className).not.toContain("active");
 
-    await user.click(stewardBtn as HTMLButtonElement);
+    await user.click(consoleBtn as HTMLButtonElement);
 
-    // 切换后：active 态从 today 转移到 steward
-    expect(stewardBtn?.className).toContain("active");
-    expect(todayBtn?.className).not.toContain("active");
+    // 切换后：active 态从 workbench 转移到 console
+    expect(consoleBtn?.className).toContain("active");
+    expect(workbenchBtn?.className).not.toContain("active");
   });
 });

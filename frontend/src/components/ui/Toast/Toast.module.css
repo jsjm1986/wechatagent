@@ -1,0 +1,28 @@
+.stack {
+  position: fixed; right: 20px; bottom: 20px; z-index: var(--z-toast);
+  display: flex; flex-direction: column; gap: 8px; max-width: 360px;
+  pointer-events: none;
+}
+.toast {
+  pointer-events: auto;
+  display: flex; align-items: center; gap: 9px;
+  padding: 10px 12px; border-radius: var(--r-sm);
+  background: var(--surface-card); border: 1px solid var(--hairline);
+  box-shadow: 0 12px 32px -12px rgba(20,30,60,.32), inset 0 1px 1px rgba(255,255,255,.9);
+  animation: toastIn .18s cubic-bezier(.2,.7,.3,1);
+}
+@keyframes toastIn { from { opacity: 0; transform: translateX(12px); } to { opacity: 1; transform: translateX(0); } }
+.icon { flex-shrink: 0; }
+.msg { flex: 1; font-size: 13px; line-height: 1.45; color: var(--ink-1); }
+.close {
+  flex-shrink: 0; display: inline-flex; padding: 2px; border-radius: 6px; cursor: pointer;
+  background: none; border: none; color: var(--ink-4);
+}
+.close:hover { background: rgba(0,0,0,.06); color: var(--ink-2); }
+
+.success { border-left: 3px solid var(--color-running); }
+.success .icon { color: var(--color-running); }
+.error { border-left: 3px solid var(--color-blocked); }
+.error .icon { color: var(--color-blocked); }
+.info { border-left: 3px solid var(--color-scheduled); }
+.info .icon { color: var(--color-scheduled); }

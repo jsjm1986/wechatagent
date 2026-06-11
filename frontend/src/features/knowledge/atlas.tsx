@@ -10,7 +10,11 @@ import {
   Workflow,
 } from "lucide-react";
 import { parseApiError } from "../../lib/api";
+import { useConfirm } from "../../components/ui/ConfirmDialog";
+import { useToast } from "../../components/ui/Toast";
+import { EmptyState } from "../../components/ui/EmptyState";
 import { focusChunk, type TreeChunkItem } from "./shared";
+import { wikiTypeLabel, statusLabel, fieldKindLabel } from "./labels";
 
 // ── P1 · ChunkGraphView · 关系图谱（SVG 原生布局，0 新依赖）─────────────
 //
@@ -303,11 +307,11 @@ export function ChunkGraphView() {
       <header className="wikiArchiveHeader">
         <h2>关系图谱</h2>
         <div className="wikiArchiveSubtitle">
-          {visible.length} chunks · {edges.length} edges{filter !== "all" ? ` · 过滤 ${filter}` : ""}
+          {visible.length} 个节点 · {edges.length} 条关系{filter !== "all" ? ` · 过滤 ${filter}` : ""}
         </div>
       </header>
       <div className="wikiGraphToolbar">
-        <label className="wikiGraphFilterLabel">wiki_type：</label>
+        <label className="wikiGraphFilterLabel">知识类型：</label>
         <select
           className="wikiGraphFilterSelect"
           value={filter}
@@ -315,7 +319,7 @@ export function ChunkGraphView() {
         >
           <option value="all">全部</option>
           {wikiTypes.map((t) => (
-            <option key={t} value={t}>{t}</option>
+            <option key={t} value={t}>{wikiTypeLabel(t)}</option>
           ))}
         </select>
         <label className="wikiGraphFilterLabel">布局：</label>
@@ -324,8 +328,8 @@ export function ChunkGraphView() {
           value={layoutMode}
           onChange={(e) => setLayoutMode(e.target.value as "polar" | "force")}
         >
-          <option value="polar">极坐标（确定性）</option>
-          <option value="force">力导向（200 步）</option>
+          <option value="polar">星形分布</option>
+          <option value="force">自由分布</option>
         </select>
         <label className="wikiGraphFilterLabel">染色：</label>
         <select
@@ -333,20 +337,20 @@ export function ChunkGraphView() {
           value={colorMode}
           onChange={(e) => setColorMode(e.target.value as "wikiType" | "community")}
         >
-          <option value="wikiType">按 wiki_type</option>
-          <option value="community">按社区（{community.count} 组）</option>
+          <option value="wikiType">按知识类型</option>
+          <option value="community">按关联簇（{community.count} 组）</option>
         </select>
         <span className="wikiGraphLegend">
           {colorMode === "wikiType"
             ? wikiTypes.slice(0, 8).map((t) => (
                 <span key={t} className="wikiGraphLegendItem">
                   <span className="wikiGraphLegendDot" style={{ background: legendColorFor(t) }} />
-                  {t}
+                  {wikiTypeLabel(t)}
                 </span>
               ))
             : (
                 <span className="wikiGraphCommunityHint">
-                  {community.count} 个连通分量 · 颜色按分量索引等距分布
+                  网络被分成 {community.count} 个关联簇，同簇用同色显示
                 </span>
               )}
         </span>
@@ -483,7 +487,8 @@ export function DomainSchemaTab() {
   const [loading, setLoading] = useState(false);
   const [activating, setActivating] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [info, setInfo] = useState<string | null>(null);
+  const confirm = useConfirm();
+  const toast = useToast();
 
   async function load() {
     setLoading(true);
@@ -504,16 +509,22 @@ export function DomainSchemaTab() {
     void load();
   }, []);
 
-  async function activate(schemaId: string) {
+  async function activate(schemaId: string, name: string) {
+    const ok = await confirm({
+      title: "切换为当前使用的字段表？",
+      body: `切换后，AI 将改用「${name}」来判断客户的阶段、意向和异议，正在进行的会话会立即生效。`,
+      tone: "danger",
+      confirmText: "确认切换",
+    });
+    if (!ok) return;
     setActivating(schemaId);
     setError(null);
-    setInfo(null);
     try {
       const r = await fetch(`/api/admin/domain-schemas/${encodeURIComponent(schemaId)}/activate`, {
         method: "POST",
       });
       if (!r.ok) throw await parseApiError(r);
-      setInfo(`已切换 active：${schemaId}`);
+      toast.success(`已切换为「${name}」`);
       await load();
     } catch (e: unknown) {
       setError(e instanceof Error ? e.message : String(e));
@@ -530,61 +541,88 @@ export function DomainSchemaTab() {
           {loading ? "加载中…" : "刷新"}
         </button>
         <span className="wikiHint">
-          新建 / 编辑 schema 走后端 API（POST/PUT /api/admin/domain-schemas）；UI 仅做激活与只读浏览。
+          这里是 AI 判断客户用的「字段表」——它规定了 AI 在对话里会记录客户的哪些信息（如所处阶段、意向程度）。字段表由系统管理员维护，这里可以查看不同版本、切换当前使用的一套，不能直接改内容。
         </span>
       </div>
       {error ? <div className="wikiAlert error">{error}</div> : null}
-      {info ? <div className="wikiAlert info">{info}</div> : null}
       {!loading && items.length === 0 ? (
-        <div className="wikiEmpty">暂无 schema。可通过后端 API 创建一条 fields 数组（≤ 64 项）。</div>
+        <EmptyState
+          icon={<LibraryBig size={28} />}
+          title="还没有配置字段表"
+          hint="字段表由系统管理员在后台创建后，会显示在这里供切换。"
+        />
       ) : null}
-      <div className="wikiList">
-        {items.map((s) => (
-          <div className={s.isActive ? "wikiCard active" : "wikiCard"} key={`${s.schemaId}-${s.version}`}>
-            <div className="wikiCardHead">
-              <div>
-                <span className="wikiCardTitle">{s.name}</span>
-                <span className="wikiCardMeta">
-                  {s.schemaId} · v{s.version} · {s.fields.length} fields
-                </span>
-              </div>
-              <div className="wikiCardActions">
-                {s.isActive ? (
-                  <span className="wikiBadge active">active</span>
-                ) : (
-                  <button
-                    type="button"
-                    className="primary"
-                    onClick={() => void activate(s.schemaId)}
-                    disabled={activating === s.schemaId}
-                  >
-                    {activating === s.schemaId ? "切换中…" : "设为 active"}
-                  </button>
-                )}
-              </div>
-            </div>
-            <div className="wikiCardBody">
-              <div className="wikiFieldList">
-                {s.fields.map((f) => (
-                  <div className="wikiField" key={f.name}>
-                    <span className="wikiFieldName">{f.name}</span>
-                    <span className="wikiFieldKind">{f.kind}</span>
-                    {f.required ? <span className="wikiFieldFlag">required</span> : null}
-                    {f.allowedValues && f.allowedValues.length > 0 ? (
-                      <span className="wikiFieldFlag">enum({f.allowedValues.length})</span>
-                    ) : null}
-                  </div>
-                ))}
-              </div>
-              {Object.keys(s.aliasDict ?? {}).length > 0 ? (
-                <div className="wikiAlias">
-                  <span className="wikiAliasTitle">aliasDict</span>
-                  <code>{JSON.stringify(s.aliasDict)}</code>
+      <div className="wikiSchemaList">
+        {items.map((s) => {
+          const labelByName = new Map(s.fields.map((f) => [f.name, f.label || f.name]));
+          const aliasPairs = Object.entries(s.aliasDict ?? {}).map(
+            ([alias, canonical]) => ({
+              alias,
+              canonical: labelByName.get(String(canonical)) ?? String(canonical),
+            }),
+          );
+          return (
+            <div className={s.isActive ? "wikiSchemaCard active" : "wikiSchemaCard"} key={`${s.schemaId}-${s.version}`}>
+              <div className="wikiSchemaHead">
+                <div className="wikiSchemaTitleWrap">
+                  <span className="wikiSchemaTitle">{s.name}</span>
+                  <span className="wikiSchemaMeta">
+                    第 {s.version} 版 · {s.fields.length} 个字段
+                  </span>
                 </div>
-              ) : null}
+                <div className="wikiSchemaActions">
+                  {s.isActive ? (
+                    <span className="wikiSchemaActiveBadge">
+                      <CheckCircle2 size={13} /> 使用中
+                    </span>
+                  ) : (
+                    <button
+                      type="button"
+                      className="primary"
+                      onClick={() => void activate(s.schemaId, s.name)}
+                      disabled={activating === s.schemaId}
+                    >
+                      {activating === s.schemaId ? "切换中…" : "设为当前使用"}
+                    </button>
+                  )}
+                </div>
+              </div>
+              <div className="wikiSchemaBody">
+                <div className="wikiSchemaSectionTitle">AI 会记录这些信息</div>
+                <div className="wikiSchemaFields">
+                  {s.fields.map((f) => (
+                    <div className="wikiSchemaField" key={f.name}>
+                      <div className="wikiSchemaFieldHead">
+                        <span className="wikiSchemaFieldName">{f.label || f.name}</span>
+                        <span className="wikiSchemaFieldKind">{fieldKindLabel(f.kind)}</span>
+                        {f.required ? <span className="wikiSchemaFieldReq">必填</span> : null}
+                      </div>
+                      {f.allowedValues && f.allowedValues.length > 0 ? (
+                        <div className="wikiSchemaFieldValues">
+                          {f.allowedValues.map((v) => (
+                            <span className="wikiSchemaValueChip" key={v}>{v}</span>
+                          ))}
+                        </div>
+                      ) : null}
+                    </div>
+                  ))}
+                </div>
+                {aliasPairs.length > 0 ? (
+                  <>
+                    <div className="wikiSchemaSectionTitle">同义词识别</div>
+                    <div className="wikiSchemaAlias">
+                      {aliasPairs.map((p) => (
+                        <span className="wikiSchemaAliasPair" key={p.alias}>
+                          客户说「{p.alias}」→ 记到「{p.canonical}」
+                        </span>
+                      ))}
+                    </div>
+                  </>
+                ) : null}
+              </div>
             </div>
-          </div>
-        ))}
+          );
+        })}
       </div>
     </div>
   );
@@ -748,7 +786,6 @@ function MetadataDashboard() {
     <div className="wikiMetadataDashboard">
       <header className="wikiArchiveHeader">
         <div>
-          <div className="wikiArchiveEyebrow">atlas / governance</div>
           <h2>元信息总览</h2>
         </div>
         <div className="wikiArchiveHeaderActions">
@@ -763,8 +800,8 @@ function MetadataDashboard() {
       <div className="wikiMetadataGrid">
         <article className="wikiObservabilityCard">
           <header className="wikiObservabilityCardHead">
-            <span className="wikiArchiveTag">[counts]</span>
-            <h4>wiki_type 切片分布</h4>
+            <span className="wikiArchiveTag">counts</span>
+            <h4>按知识类型分布</h4>
           </header>
           {data?.wikiTypeCounts && data.wikiTypeCounts.length > 0 ? (
             <div className="wikiCoverageBars">
@@ -772,7 +809,7 @@ function MetadataDashboard() {
                 const ratio = maxCount > 0 ? Number(row.count ?? 0) / maxCount : 0;
                 return (
                   <div className="wikiCoverageBarRow" key={i}>
-                    <span className="wikiCoverageBarLabel">{row.wikiType ?? "?"}</span>
+                    <span className="wikiCoverageBarLabel">{wikiTypeLabel(row.wikiType ?? undefined)}</span>
                     <div className="wikiCoverageBar">
                       <div
                         className="wikiCoverageBarFill"
@@ -785,13 +822,13 @@ function MetadataDashboard() {
               })}
             </div>
           ) : (
-            <div className="wikiEmpty">暂无切片</div>
+            <div className="wikiEmpty">暂无知识条目</div>
           )}
         </article>
 
         <article className="wikiObservabilityCard">
           <header className="wikiObservabilityCardHead">
-            <span className="wikiArchiveTag">[ratio]</span>
+            <span className="wikiArchiveTag">ratio</span>
             <h4>verified 占比</h4>
           </header>
           {data?.verifiedRatioByType && data.verifiedRatioByType.length > 0 ? (
@@ -800,7 +837,7 @@ function MetadataDashboard() {
                 const ratio = Math.max(0, Math.min(1, Number(row.ratio ?? 0)));
                 return (
                   <div className="wikiCoverageBarRow" key={i}>
-                    <span className="wikiCoverageBarLabel">{row.wikiType ?? "?"}</span>
+                    <span className="wikiCoverageBarLabel">{wikiTypeLabel(row.wikiType ?? undefined)}</span>
                     <div className="wikiCoverageBar">
                       <div
                         className="wikiCoverageBarFill"
@@ -821,7 +858,7 @@ function MetadataDashboard() {
 
         <article className="wikiObservabilityCard">
           <header className="wikiObservabilityCardHead">
-            <span className="wikiArchiveTag">[editors]</span>
+            <span className="wikiArchiveTag">editors</span>
             <h4>近期编辑者</h4>
           </header>
           {data?.topEditors && data.topEditors.length > 0 ? (
@@ -840,7 +877,7 @@ function MetadataDashboard() {
 
         <article className="wikiObservabilityCard">
           <header className="wikiObservabilityCardHead">
-            <span className="wikiArchiveTag">[activity]</span>
+            <span className="wikiArchiveTag">activity</span>
             <h4>7 天活跃</h4>
           </header>
           {activityByDate.length > 0 ? (
@@ -859,7 +896,7 @@ function MetadataDashboard() {
               })}
             </div>
           ) : (
-            <div className="wikiEmpty">7d 内无修订</div>
+            <div className="wikiEmpty">近 7 天无改动</div>
           )}
         </article>
       </div>
@@ -876,20 +913,50 @@ interface PublishBarProps {
 function PublishBar({ resourceKind, id, onChange }: PublishBarProps) {
   const [busy, setBusy] = useState<string>("");
   const [error, setError] = useState<string | null>(null);
-  const [info, setInfo] = useState<string | null>(null);
+  const confirm = useConfirm();
+  const toast = useToast();
 
   async function call(action: "publish" | "rollout" | "rollback") {
-    if (action === "rollback" && !window.confirm("回退到上一版本？")) return;
+    const successText: Record<typeof action, string> = {
+      publish: "已发布新版",
+      rollout: "已发布给全部客户",
+      rollback: "已回退到上一版本",
+    };
+    if (action === "publish") {
+      const ok = await confirm({
+        title: "发布新版？",
+        body: "发布后将成为该资源的当前在用版本，影响 AI 后续判断。",
+        tone: "danger",
+        confirmText: "确认发布",
+      });
+      if (!ok) return;
+    } else if (action === "rollout") {
+      const ok = await confirm({
+        title: "发布给全部客户？",
+        body: "将把新版本推送给全部会话，立即对所有客户生效，且不可逆。",
+        tone: "danger",
+        requireText: "确认发布",
+        confirmText: "发布给全部客户",
+      });
+      if (!ok) return;
+    } else {
+      const ok = await confirm({
+        title: "回退到上一版本？",
+        body: "将放弃当前版本，恢复为上一个已发布版本。",
+        tone: "danger",
+        confirmText: "确认回退",
+      });
+      if (!ok) return;
+    }
     setBusy(action);
     setError(null);
-    setInfo(null);
     try {
       const r = await fetch(
         `/api/admin/${resourceKind}/${encodeURIComponent(id)}/${action}`,
         { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" }
       );
       if (!r.ok) throw await parseApiError(r);
-      setInfo(`${action} ok`);
+      toast.success(successText[action]);
       onChange?.();
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
@@ -909,7 +976,7 @@ function PublishBar({ resourceKind, id, onChange }: PublishBarProps) {
         <CheckCircle2 size={12} /> {busy === "publish" ? "发布中…" : "发布新版"}
       </button>
       <button type="button" onClick={() => void call("rollout")} disabled={busy !== ""}>
-        <ArrowRight size={12} /> {busy === "rollout" ? "灰度中…" : "灰度全量"}
+        <ArrowRight size={12} /> {busy === "rollout" ? "发布中…" : "发布给全部"}
       </button>
       <button
         type="button"
@@ -919,7 +986,6 @@ function PublishBar({ resourceKind, id, onChange }: PublishBarProps) {
       >
         <Undo2 size={12} /> {busy === "rollback" ? "回退中…" : "回退上版"}
       </button>
-      {info ? <span className="wikiPublishBarInfo">{info}</span> : null}
       {error ? <span className="wikiPublishBarError">{error}</span> : null}
     </div>
   );
@@ -942,7 +1008,6 @@ export function AdminGovernanceView() {
     <div className="wikiArchiveShell wikiAdminGovernance">
       <header className="wikiArchiveHeader">
         <div>
-          <div className="wikiArchiveEyebrow">atlas / governance</div>
           <h2>治理工坊</h2>
         </div>
       </header>
@@ -1060,7 +1125,7 @@ function TaxonomiesGovernance() {
               <td className="wikiArchiveTimelineTime">{it.value?.id}</td>
               <td>{it.value?.displayName}</td>
               <td>
-                <span className="wikiArchiveTag">[{it.value?.status ?? "?"}]</span>
+                <span className="wikiArchiveTag">{statusLabel(it.value?.status ?? undefined)}</span>
               </td>
               <td className="wikiArchiveTimelineTime">v{it.version ?? 0}</td>
               <td>{it.currentVersion ? "✓" : ""}</td>
@@ -1296,7 +1361,7 @@ export function MemoryDrawer() {
     <div className="wikiMemoryDrawer">
       <div className="wikiMemoryHead">
         <h3>运营记忆</h3>
-        <span className="wikiHint">注入到 reply prompt 的长期偏好/拒绝/上下文</span>
+        <span className="wikiHint">长期保存的偏好 / 拒绝项 / 背景说明，AI 回复时会参考</span>
       </div>
       <div className="wikiMemoryFilter">
         {OPERATOR_MEMORY_KINDS.map((k) => (

@@ -569,7 +569,7 @@ textarea {
   color: var(--ink);
 }
 
-input {
+input:not([type="checkbox"]):not([type="radio"]) {
   height: var(--control-h);
 }
 

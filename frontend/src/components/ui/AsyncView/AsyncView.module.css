@@ -1,0 +1,24 @@
+.skeleton { display: flex; flex-direction: column; gap: 10px; padding: 16px 0; }
+.skelRow {
+  height: 56px; border-radius: var(--r-sm);
+  background: linear-gradient(90deg, var(--surface-page) 25%, rgba(0,0,0,.04) 37%, var(--surface-page) 63%);
+  background-size: 400% 100%;
+  animation: skelShimmer 1.4s ease infinite;
+}
+@keyframes skelShimmer { 0% { background-position: 100% 0; } 100% { background-position: 0 0; } }
+
+.error {
+  display: flex; flex-direction: column; align-items: flex-start; gap: 10px;
+  padding: 16px; border-radius: var(--r-md);
+  border: 1px solid rgba(255,69,58,.3); border-left: 3px solid var(--color-blocked);
+  background: var(--fill-blocked);
+}
+.errorMsg { margin: 0; font-size: 13px; color: var(--color-blocked); line-height: 1.5; }
+.retry {
+  display: inline-flex; align-items: center; gap: 6px;
+  padding: 6px 14px; border-radius: var(--r-sm); cursor: pointer;
+  font-size: 12.5px; font-weight: 600; font-family: inherit;
+  background: var(--color-scheduled); color: #fff; border: 1px solid transparent;
+}
+.retry:hover:not(:disabled) { background: #0a78e6; }
+.retry:disabled { opacity: .5; cursor: not-allowed; }

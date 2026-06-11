@@ -754,6 +754,11 @@ fn classify_llm_error_for_user(error: &AppError, retry_count: u32) -> AppError {
                     "http_5xx",
                     "上游 LLM 返回 5xx 错误，已多次重试仍失败。这通常是 LLM 平台侧问题，请稍后再试。",
                 )
+            } else if msg.contains("LLM HTTP 404") {
+                (
+                    "endpoint_not_found",
+                    "上游返回 404：baseUrl 路径不对。系统会在 baseUrl 后直接拼 /chat/completions，请填服务商的「OpenAI 兼容 base_url」原文，不要自行增删路径。阿里云百炼 Qwen 须为 https://dashscope.aliyuncs.com/compatible-mode/v1（注意 /compatible-mode）；DeepSeek 为 https://api.deepseek.com/v1。",
+                )
             } else if msg.contains("LLM HTTP 4") {
                 (
                     "http_4xx",
