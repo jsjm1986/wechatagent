@@ -2,6 +2,7 @@ import { useState, useEffect, useRef, useMemo, type FormEvent } from "react";
 import { ChevronDown, ChevronRight, Clock3, RefreshCw, Sparkles } from "lucide-react";
 import { parseApiError } from "../../lib/api";
 import { numberOr, stringOr, type TreeChunkItem } from "./shared";
+import { EmptyState } from "../../components/ui/EmptyState";
 import { wikiTypeLabel, statusLabel, integrityStatusLabel } from "./labels";
 
 interface AskSourceQuote {
@@ -205,16 +206,16 @@ export function AskView() {
       <form className="wikiAskForm" onSubmit={submit}>
         <textarea
           className="wikiAskInput"
-          placeholder="问知识库一个问题（agent 自驱阅读 catalog → open_chunk → 回答）"
+          placeholder="向知识库提一个问题（例如：产品保修政策是怎么规定的？）"
           value={query}
           onChange={(e) => setQuery(e.target.value)}
           rows={3}
           disabled={pending}
         />
         <div className="wikiAskActions">
-          <span className="wikiHint">最多 3 轮工具调用；超过预算自动收尾。</span>
+          <span className="wikiHint">AI 会自动检索知识库后作答。</span>
           <label className="wikiAskWsField">
-            workspace
+            租户（可选）
             <input
               type="text"
               value={workspaceId}
@@ -224,7 +225,7 @@ export function AskView() {
             />
           </label>
           {supportsEventSource ? (
-            <label className="wikiAskModeToggle">
+            <label className="wikiAskModeToggle" title="开启后可实时看到 AI 检索和作答的过程">
               <input
                 type="checkbox"
                 checked={streamMode}
@@ -538,7 +539,7 @@ export function KnowledgeTreeView() {
         </div>
         <div className="wikiTreeDetail">
           {!active ? (
-            <div className="wikiEmpty">从左侧选择一个 chunk 查看详情。</div>
+            <EmptyState title="未选择知识条目" hint="从左侧知识树中选择一条，查看详情。" />
           ) : (
             <ChunkDetail
               chunk={active}

@@ -305,11 +305,11 @@ export function ChunkGraphView() {
       <header className="wikiArchiveHeader">
         <h2>关系图谱</h2>
         <div className="wikiArchiveSubtitle">
-          {visible.length} chunks · {edges.length} edges{filter !== "all" ? ` · 过滤 ${filter}` : ""}
+          {visible.length} 个节点 · {edges.length} 条关系{filter !== "all" ? ` · 过滤 ${filter}` : ""}
         </div>
       </header>
       <div className="wikiGraphToolbar">
-        <label className="wikiGraphFilterLabel">wiki_type：</label>
+        <label className="wikiGraphFilterLabel">知识类型：</label>
         <select
           className="wikiGraphFilterSelect"
           value={filter}
@@ -317,7 +317,7 @@ export function ChunkGraphView() {
         >
           <option value="all">全部</option>
           {wikiTypes.map((t) => (
-            <option key={t} value={t}>{t}</option>
+            <option key={t} value={t}>{wikiTypeLabel(t)}</option>
           ))}
         </select>
         <label className="wikiGraphFilterLabel">布局：</label>
@@ -326,8 +326,8 @@ export function ChunkGraphView() {
           value={layoutMode}
           onChange={(e) => setLayoutMode(e.target.value as "polar" | "force")}
         >
-          <option value="polar">极坐标（确定性）</option>
-          <option value="force">力导向（200 步）</option>
+          <option value="polar">星形分布</option>
+          <option value="force">自由分布</option>
         </select>
         <label className="wikiGraphFilterLabel">染色：</label>
         <select
@@ -335,20 +335,20 @@ export function ChunkGraphView() {
           value={colorMode}
           onChange={(e) => setColorMode(e.target.value as "wikiType" | "community")}
         >
-          <option value="wikiType">按 wiki_type</option>
-          <option value="community">按社区（{community.count} 组）</option>
+          <option value="wikiType">按知识类型</option>
+          <option value="community">按关联簇（{community.count} 组）</option>
         </select>
         <span className="wikiGraphLegend">
           {colorMode === "wikiType"
             ? wikiTypes.slice(0, 8).map((t) => (
                 <span key={t} className="wikiGraphLegendItem">
                   <span className="wikiGraphLegendDot" style={{ background: legendColorFor(t) }} />
-                  {t}
+                  {wikiTypeLabel(t)}
                 </span>
               ))
             : (
                 <span className="wikiGraphCommunityHint">
-                  {community.count} 个连通分量 · 颜色按分量索引等距分布
+                  网络被分成 {community.count} 个关联簇，同簇用同色显示
                 </span>
               )}
         </span>
@@ -546,7 +546,7 @@ export function DomainSchemaTab() {
       {error ? <div className="wikiAlert error">{error}</div> : null}
       {info ? <div className="wikiAlert info">{info}</div> : null}
       {!loading && items.length === 0 ? (
-        <div className="wikiEmpty">暂无 schema。可通过后端 API 创建一条 fields 数组（≤ 64 项）。</div>
+        <div className="wikiEmpty">暂无行业 Schema 配置。</div>
       ) : null}
       <div className="wikiList">
         {items.map((s) => (
@@ -758,7 +758,6 @@ function MetadataDashboard() {
     <div className="wikiMetadataDashboard">
       <header className="wikiArchiveHeader">
         <div>
-          <div className="wikiArchiveEyebrow">atlas / governance</div>
           <h2>元信息总览</h2>
         </div>
         <div className="wikiArchiveHeaderActions">
@@ -774,7 +773,7 @@ function MetadataDashboard() {
         <article className="wikiObservabilityCard">
           <header className="wikiObservabilityCardHead">
             <span className="wikiArchiveTag">counts</span>
-            <h4>wiki_type 切片分布</h4>
+            <h4>按知识类型分布</h4>
           </header>
           {data?.wikiTypeCounts && data.wikiTypeCounts.length > 0 ? (
             <div className="wikiCoverageBars">
@@ -795,7 +794,7 @@ function MetadataDashboard() {
               })}
             </div>
           ) : (
-            <div className="wikiEmpty">暂无切片</div>
+            <div className="wikiEmpty">暂无知识条目</div>
           )}
         </article>
 
@@ -869,7 +868,7 @@ function MetadataDashboard() {
               })}
             </div>
           ) : (
-            <div className="wikiEmpty">7d 内无修订</div>
+            <div className="wikiEmpty">近 7 天无改动</div>
           )}
         </article>
       </div>
@@ -900,11 +899,11 @@ function PublishBar({ resourceKind, id, onChange }: PublishBarProps) {
       if (!ok) return;
     } else if (action === "rollout") {
       const ok = await confirm({
-        title: "灰度全量？",
+        title: "发布给全部客户？",
         body: "将把新版本推送给全部会话，立即对所有客户生效，且不可逆。",
         tone: "danger",
-        requireText: "全量",
-        confirmText: "确认全量发布",
+        requireText: "确认发布",
+        confirmText: "发布给全部客户",
       });
       if (!ok) return;
     } else {
@@ -945,7 +944,7 @@ function PublishBar({ resourceKind, id, onChange }: PublishBarProps) {
         <CheckCircle2 size={12} /> {busy === "publish" ? "发布中…" : "发布新版"}
       </button>
       <button type="button" onClick={() => void call("rollout")} disabled={busy !== ""}>
-        <ArrowRight size={12} /> {busy === "rollout" ? "灰度中…" : "灰度全量"}
+        <ArrowRight size={12} /> {busy === "rollout" ? "发布中…" : "发布给全部"}
       </button>
       <button
         type="button"
@@ -978,7 +977,6 @@ export function AdminGovernanceView() {
     <div className="wikiArchiveShell wikiAdminGovernance">
       <header className="wikiArchiveHeader">
         <div>
-          <div className="wikiArchiveEyebrow">atlas / governance</div>
           <h2>治理工坊</h2>
         </div>
       </header>
@@ -1332,7 +1330,7 @@ export function MemoryDrawer() {
     <div className="wikiMemoryDrawer">
       <div className="wikiMemoryHead">
         <h3>运营记忆</h3>
-        <span className="wikiHint">注入到 reply prompt 的长期偏好/拒绝/上下文</span>
+        <span className="wikiHint">长期保存的偏好 / 拒绝项 / 背景说明，AI 回复时会参考</span>
       </div>
       <div className="wikiMemoryFilter">
         {OPERATOR_MEMORY_KINDS.map((k) => (

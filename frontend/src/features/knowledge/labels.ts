@@ -182,6 +182,50 @@ export function draftKindLabel(v?: string | null): string {
   return DRAFT_KIND_LABELS[v] ?? v;
 }
 
+/// 今日 Digest 报告状态
+export const REPORT_STATUS_LABELS: Record<string, string> = {
+  active: "已生成",
+  generating: "生成中",
+  failed: "生成失败",
+  empty: "无内容",
+};
+export function reportStatusLabel(v?: string | null): string {
+  if (!v) return "—";
+  return REPORT_STATUS_LABELS[v] ?? v;
+}
+
+/// 今日 Digest 卡片类型
+export const DIGEST_CARD_KIND_LABELS: Record<string, string> = {
+  gap_coverage: "知识缺口",
+  gap_signal: "知识缺口",
+  stale_source: "来源过期",
+  contested: "存在争议",
+  needs_review: "待确认",
+  quality_lint: "质量信号",
+  ingest_failure: "抓取失败",
+  follow_up: "跟进事项",
+};
+export function digestCardKindLabel(v?: string | null): string {
+  if (!v) return "—";
+  return DIGEST_CARD_KIND_LABELS[v] ?? v;
+}
+
+/// 质量信号类型(LintView 的 kind 封闭枚举)
+export const LINT_KIND_LABELS: Record<string, string> = {
+  orphan: "孤立条目",
+  broken_link: "失效引用",
+  no_outlinks: "无出链",
+  low_confidence: "低置信",
+  stale: "内容过期",
+  contradiction: "内容矛盾",
+  missing_chunk: "缺失条目",
+  suggestion: "改进建议",
+};
+export function lintKindLabel(v?: string | null): string {
+  if (!v) return "—";
+  return LINT_KIND_LABELS[v] ?? v;
+}
+
 /// 后台任务状态(knowledge_chat_tasks 封闭枚举)
 export const TASK_STATUS_LABELS: Record<string, string> = {
   pending: "排队中",

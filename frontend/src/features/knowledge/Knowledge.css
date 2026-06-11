@@ -137,14 +137,14 @@
     border: 1px solid var(--hairline);
   }
   .knowledgeWiki .wikiAlert.error {
-    border-color: #f7c2c2;
-    background: #fff4f4;
-    color: #a4282b;
+    border-color: var(--color-blocked);
+    background: var(--fill-blocked);
+    color: var(--color-blocked);
   }
   .knowledgeWiki .wikiAlert.info {
-    border-color: #c5dcf3;
-    background: #f4f8fd;
-    color: #20507a;
+    border-color: var(--color-scheduled);
+    background: var(--fill-scheduled);
+    color: var(--color-scheduled);
   }
   .knowledgeWiki .wikiEmpty {
     padding: 24px;
@@ -229,7 +229,7 @@
     font-style: italic;
   }
   .knowledgeWiki .wikiFieldFlag {
-    color: #92651a;
+    color: var(--color-held);
     font-size: 11px;
   }
   .knowledgeWiki .wikiAlias {
@@ -264,10 +264,10 @@
     background: var(--surface-card);
   }
   .knowledgeWiki .wikiSignalCard.sev-warning {
-    border-left-color: #d29419;
+    border-left-color: var(--color-held);
   }
   .knowledgeWiki .wikiSignalCard.sev-info {
-    border-left-color: #4878b6;
+    border-left-color: var(--color-scheduled);
   }
   .knowledgeWiki .wikiSignalHead {
     display: flex;
@@ -287,29 +287,27 @@
     gap: 6px;
   }
   .knowledgeWiki .wikiKind {
-    text-transform: uppercase;
-    letter-spacing: 0.4px;
+    letter-spacing: 0;
     font-size: 10.5px;
     padding: 2px 6px;
     border-radius: 4px;
     background: var(--surface-page);
-    color: #2f3a52;
+    color: var(--ink-2);
     font-family: ui-monospace, "SFMono-Regular", Menlo, monospace;
   }
   .knowledgeWiki .wikiSev {
     font-size: 11px;
-    text-transform: uppercase;
-    letter-spacing: 0.5px;
+    letter-spacing: 0;
     padding: 1px 6px;
     border-radius: 3px;
   }
   .knowledgeWiki .wikiSev.warning {
-    background: #fff2dc;
-    color: #92651a;
+    background: var(--fill-held);
+    color: var(--color-held);
   }
   .knowledgeWiki .wikiSev.info {
-    background: #e7f0fb;
-    color: #335a90;
+    background: var(--fill-scheduled);
+    color: var(--color-scheduled);
   }
   .knowledgeWiki .wikiSignalDesc {
     margin: 0 0 6px;
@@ -340,6 +338,8 @@
     display: flex;
     flex-direction: column;
     gap: 8px;
+    max-height: 560px;
+    overflow-y: auto;
   }
   .knowledgeWiki .wikiRevCard {
     border: 1px solid var(--hairline);
@@ -358,31 +358,29 @@
     background: var(--surface-page);
   }
   .knowledgeWiki .wikiOp {
-    text-transform: uppercase;
-    letter-spacing: 0.4px;
+    letter-spacing: 0;
     font-size: 11px;
     padding: 1px 6px;
     border-radius: 3px;
     font-family: ui-monospace, "SFMono-Regular", Menlo, monospace;
-    background: #ebeef5;
-    color: #2c3a52;
+    background: var(--surface-page);
+    color: var(--ink-2);
   }
   .knowledgeWiki .wikiOp.create {
-    background: #d8efdf;
-    color: #1f5a39;
+    background: var(--fill-running);
+    color: var(--color-running);
   }
   .knowledgeWiki .wikiOp.archive {
-    background: #f4dada;
-    color: #883232;
+    background: var(--fill-inactive);
+    color: var(--color-inactive);
   }
   .knowledgeWiki .wikiOp.rollback {
-    background: #f4ead0;
-    color: #735518;
+    background: var(--fill-held);
+    color: var(--color-held);
   }
   .knowledgeWiki .wikiSource {
     font-size: 11px;
-    letter-spacing: 0.4px;
-    text-transform: lowercase;
+    letter-spacing: 0;
     padding: 1px 6px;
     border-radius: 3px;
     background: var(--surface-page);
@@ -590,8 +588,8 @@
     gap: 4px;
   }
   .knowledgeWiki .wikiBadge.warn {
-    background: #fff2dc;
-    color: #92651a;
+    background: var(--fill-held);
+    color: var(--color-held);
     padding: 1px 6px;
     border-radius: 3px;
     font-size: 11px;
@@ -617,7 +615,7 @@
     font-weight: 600;
     color: var(--ink-3);
     letter-spacing: 0.3px;
-    text-transform: uppercase;
+    text-transform: none;
   }
   .knowledgeWiki .wikiCitedCard {
     border: 1px solid var(--hairline);
@@ -654,14 +652,14 @@
     margin-left: auto;
   }
   .knowledgeWiki .wikiCitedHint.muted {
-    color: #b4b4b4;
+    color: var(--ink-4);
   }
   .knowledgeWiki .wikiCitedQuote {
     margin: 0;
     padding: 10px 12px 10px 14px;
-    border-left: 3px solid #d29419;
-    background: #fff8eb;
-    color: #5a4317;
+    border-left: 3px solid var(--color-scheduled);
+    background: var(--surface-page);
+    color: var(--ink-2);
     font-size: 12.5px;
     line-height: 1.6;
     border-radius: 0 0 6px 6px;
@@ -713,25 +711,24 @@
     border-radius: 4px;
     font-family: ui-monospace, "SFMono-Regular", Menlo, monospace;
     background: var(--surface-page);
-    color: #2f3a52;
-    text-transform: lowercase;
-    letter-spacing: 0.3px;
+    color: var(--ink-2);
+    letter-spacing: 0;
   }
   .knowledgeWiki .wikiToolTraceTool.tool-list_catalog {
-    background: #e7f0fb;
-    color: #335a90;
+    background: var(--fill-scheduled);
+    color: var(--color-scheduled);
   }
   .knowledgeWiki .wikiToolTraceTool.tool-open_chunk {
-    background: #e6f4ea;
-    color: #2f6b3c;
+    background: var(--fill-running);
+    color: var(--color-running);
   }
   .knowledgeWiki .wikiToolTraceTool.tool-follow_relations {
-    background: #f5e8fa;
-    color: #6c3a82;
+    background: var(--fill-brand);
+    color: var(--color-brand);
   }
   .knowledgeWiki .wikiToolTraceTool.tool-answer {
-    background: #fff2dc;
-    color: #92651a;
+    background: var(--fill-held);
+    color: var(--color-held);
   }
   .knowledgeWiki .wikiToolTraceStep code {
     flex: 1 1 auto;
@@ -847,9 +844,9 @@
   .knowledgeWiki .wikiReviewSourceQuote {
     margin: 0;
     padding: 8px 12px;
-    background: #fff8eb;
-    border-left: 3px solid #d29419;
-    color: #5b3a08;
+    background: var(--surface-page);
+    border-left: 3px solid var(--color-scheduled);
+    color: var(--ink-2);
     font-size: 13px;
     line-height: 1.55;
     white-space: pre-wrap;
@@ -1056,9 +1053,9 @@
   .knowledgeWiki .wikiSourceQuote {
     margin: 0;
     padding: 8px 12px;
-    background: #fff8eb;
-    border-left: 3px solid #d29419;
-    color: #5b3a08;
+    background: var(--surface-page);
+    border-left: 3px solid var(--color-scheduled);
+    color: var(--ink-2);
     font-size: 13px;
     line-height: 1.55;
     white-space: pre-wrap;
@@ -1066,8 +1063,7 @@
   }
   .knowledgeWiki .wikiSectionTitle {
     font-size: 11.5px;
-    text-transform: uppercase;
-    letter-spacing: 0.04em;
+    letter-spacing: 0;
     color: var(--ink-3);
     margin-bottom: 6px;
   }
@@ -1086,15 +1082,16 @@
     gap: 6px;
     padding: 3px 8px;
     font-size: 11.5px;
-    background: #fff8eb;
-    color: #5b3a08;
-    border: 1px solid #f0d8a4;
+    background: var(--surface-page);
+    color: var(--ink-2);
+    border: 1px solid var(--hairline);
     border-radius: 4px;
     cursor: pointer;
   }
   .knowledgeWiki .wikiSourceAnchor:hover {
-    background: #fdecc4;
-    border-color: #d29419;
+    background: var(--fill-scheduled);
+    border-color: var(--color-scheduled);
+    color: var(--color-scheduled);
   }
   .knowledgeWiki .wikiSourceAnchorRange {
     font-family: ui-monospace, "SFMono-Regular", Menlo, monospace;
@@ -1104,7 +1101,7 @@
     background: rgba(255, 255, 255, 0.6);
     padding: 0 4px;
     border-radius: 3px;
-    color: #6b4810;
+    color: var(--ink-3);
   }
   .knowledgeWiki .wikiRelatedList {
     display: flex;
@@ -1135,7 +1132,7 @@
   }
   .knowledgeWiki .wikiRelatedKind {
     font-size: 10.5px;
-    text-transform: uppercase;
+    text-transform: none;
     letter-spacing: 0.04em;
     background: rgba(255, 255, 255, 0.7);
     padding: 1px 5px;
@@ -1150,9 +1147,9 @@
   }
   /* ── Phase F · Knowledge Workstation 4-mode IA ────────────────────────── */
   .knowledgeWorkstation {
-    --font-display: "Source Han Serif SC", "Noto Serif CJK SC", "PingFang SC", "Songti SC", serif;
-    --font-body: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
-    --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    --font-display: "IBM Plex Sans", -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+    --font-body: "IBM Plex Sans", -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+    --font-mono: "IBM Plex Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   }
   .wikiWorkstationHead h2 {
     font-family: var(--font-display);
@@ -1251,6 +1248,44 @@
   .knowledgeWorkstation .wikiModeGrid--atlas .wikiModePane--main {
     border-left: none;
   }
+  /* 质量中心：lint / review / autoVerify 合并后的内部分段切换 */
+  .knowledgeWiki .wikiQualityCenter {
+    display: flex;
+    flex-direction: column;
+    gap: 14px;
+  }
+  .knowledgeWiki .wikiSubTabs {
+    display: inline-flex;
+    gap: 4px;
+    padding: 3px;
+    background: var(--surface-page);
+    border-radius: var(--r-sm);
+    align-self: flex-start;
+  }
+  .knowledgeWiki .wikiSubTab {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    border: none;
+    background: transparent;
+    color: var(--ink-2);
+    font-size: 13px;
+    padding: 6px 14px;
+    border-radius: 8px;
+    cursor: pointer;
+    transition: background 0.15s, color 0.15s;
+  }
+  .knowledgeWiki .wikiSubTab:hover {
+    color: var(--ink-1);
+  }
+  .knowledgeWiki .wikiSubTab--active {
+    background: var(--surface-card);
+    color: var(--color-scheduled);
+    box-shadow: 0 1px 2px rgba(0, 0, 0, 0.06);
+  }
+  .knowledgeWiki .wikiSubTabBody {
+    min-width: 0;
+  }
   .wikiStewardNav {
     display: flex;
     flex-direction: column;
@@ -1287,7 +1322,7 @@
     font-size: 11px;
     font-weight: 600;
     letter-spacing: 0.04em;
-    text-transform: uppercase;
+    text-transform: none;
     color: var(--ink-3);
   }
   button.wikiNavGroupToggle {
@@ -1399,7 +1434,7 @@
     border-radius: 4px;
     font-size: 11px;
     font-weight: 600;
-    text-transform: uppercase;
+    text-transform: none;
     letter-spacing: 0.04em;
     font-family: var(--font-mono);
   }
@@ -1408,7 +1443,7 @@
     color: var(--color-blocked);
   }
   .wikiDigestBadge.sev-warn {
-    background: #fff7ed;
+    background: var(--fill-held);
     color: var(--color-held);
   }
   .wikiDigestBadge.sev-info {
@@ -1546,7 +1581,7 @@
     font-size: 11px;
     font-weight: 600;
     font-family: var(--font-mono);
-    text-transform: uppercase;
+    text-transform: none;
   }
   .wikiTaskStatus.s-pending {
     background: var(--surface-page);
@@ -1576,6 +1611,19 @@
   .wikiTaskMeta--small {
     font-size: 11px;
     color: var(--ink-3);
+  }
+  .wikiTaskProgress {
+    height: 6px;
+    border-radius: 3px;
+    background: var(--surface-page);
+    overflow: hidden;
+    margin: 6px 0;
+  }
+  .wikiTaskProgressFill {
+    height: 100%;
+    background: var(--color-scheduled);
+    border-radius: 3px;
+    transition: width 0.3s ease;
   }
   .wikiTaskCardList {
     display: flex;
@@ -1621,7 +1669,7 @@
     font-size: 11px;
     color: var(--color-brand);
     font-family: var(--font-mono);
-    text-transform: uppercase;
+    text-transform: none;
     letter-spacing: 0.04em;
     margin-bottom: 4px;
   }
@@ -1683,6 +1731,8 @@
     display: flex;
     flex-direction: column;
     gap: 8px;
+    max-height: 560px;
+    overflow-y: auto;
   }
   .wikiMemoryItem {
     border: 1px solid var(--hairline);
@@ -1713,7 +1763,7 @@
     border-radius: 4px;
     font-size: 11px;
     font-family: var(--font-mono);
-    text-transform: uppercase;
+    text-transform: none;
     font-weight: 600;
     letter-spacing: 0.04em;
   }
@@ -1883,7 +1933,7 @@
     font-size: 11px;
     font-weight: 600;
     color: var(--ink-3);
-    text-transform: uppercase;
+    text-transform: none;
     letter-spacing: 0.04em;
     margin-bottom: 6px;
   }
@@ -1932,24 +1982,10 @@
   /* ── Phase G · 档案馆 / 学术编目 美学基底 ───────────────────────────── */
   .wikiArchiveShell {
     position: relative;
-    background:
-      repeating-linear-gradient(
-        0deg,
-        transparent 0,
-        transparent 22px,
-        rgba(60, 50, 30, 0.025) 22px,
-        rgba(60, 50, 30, 0.025) 23px
-      ),
-      #f9f6ef;
+    background: var(--surface-card);
     padding: 22px 28px;
     border: 1px solid var(--hairline);
-  }
-  .wikiArchiveShell::before {
-    content: "";
-    position: absolute;
-    inset: 6px;
-    border: 1px solid rgba(60, 50, 30, 0.08);
-    pointer-events: none;
+    border-radius: var(--r-md);
   }
   .wikiArchiveHeader {
     display: flex;
@@ -1968,18 +2004,16 @@
     color: var(--ink-1);
   }
   .wikiArchiveHeader .wikiArchiveSubtitle {
-    font-family: var(--font-mono);
-    font-size: 11px;
-    text-transform: uppercase;
-    letter-spacing: 0.18em;
+    font-family: var(--font-body);
+    font-size: 12px;
+    letter-spacing: 0;
     color: var(--ink-3);
   }
-  /* ── G-后续Ⅱ/3：档案馆 header 中的 eyebrow / headerActions ──────────── */
+  /* ── header 中的 eyebrow / headerActions ──────────── */
   .wikiArchiveHeader .wikiArchiveEyebrow {
-    font-family: var(--font-mono);
-    font-size: 11px;
-    text-transform: uppercase;
-    letter-spacing: 0.18em;
+    font-family: var(--font-body);
+    font-size: 12px;
+    letter-spacing: 0;
     color: var(--ink-3);
     margin-bottom: 4px;
   }
@@ -2008,56 +2042,58 @@
     align-items: center;
     margin: 10px 0 6px;
     padding: 6px 0;
-    border-bottom: 1px dashed rgba(60, 50, 30, 0.18);
+    border-bottom: 1px solid var(--hairline);
     font-family: var(--font-body);
   }
   .wikiArchiveShell .wikiHint {
-    font-family: var(--font-mono);
-    font-size: 11px;
-    letter-spacing: 0.04em;
+    font-family: var(--font-body);
+    font-size: 12px;
+    letter-spacing: 0;
     color: var(--ink-3);
   }
   .wikiArchiveShell .wikiAlert {
-    font-family: var(--font-mono);
+    font-family: var(--font-body);
     font-size: 12px;
-    border: 1px solid rgba(60, 50, 30, 0.4);
-    background: #fffbf2;
+    border: 1px solid var(--hairline);
+    background: var(--surface-page);
     padding: 8px 12px;
     margin: 8px 0;
-    border-radius: 0;
+    border-radius: var(--r-sm);
   }
   .wikiArchiveShell .wikiAlert.error {
-    border-color: #aa3a2a;
-    background: #fdeee8;
-    color: #732012;
+    border-color: var(--color-blocked);
+    background: var(--fill-blocked);
+    color: var(--color-blocked);
   }
   .wikiArchiveShell .wikiAlert.info {
-    border-color: rgba(60, 50, 30, 0.45);
+    border-color: var(--hairline);
     color: var(--ink-1);
   }
   .wikiArchiveShell .wikiBtn {
-    font-family: var(--font-mono);
-    font-size: 11px;
-    letter-spacing: 0.06em;
-    text-transform: uppercase;
-    border: 1px solid rgba(60, 50, 30, 0.5);
-    background: #fdfaf3;
+    font-family: var(--font-body);
+    font-size: 12px;
+    letter-spacing: 0;
+    border: 1px solid var(--hairline);
+    background: var(--surface-card);
     color: var(--ink-1);
-    padding: 5px 10px;
-    border-radius: 0;
+    padding: 6px 12px;
+    border-radius: var(--r-sm);
     cursor: pointer;
-    transition: background 0.12s ease, color 0.12s ease;
+    transition: background 0.12s ease, color 0.12s ease, border-color 0.12s ease;
   }
   .wikiArchiveShell .wikiBtn:hover:not(:disabled) {
-    background: var(--ink-1);
-    color: #f9f6ef;
+    border-color: var(--color-scheduled);
+    color: var(--color-scheduled);
   }
   .wikiArchiveShell .wikiBtn.primary {
-    background: var(--ink-1);
-    color: #f9f6ef;
+    background: var(--color-scheduled);
+    border-color: var(--color-scheduled);
+    color: #fff;
   }
   .wikiArchiveShell .wikiBtn.primary:hover:not(:disabled) {
-    background: #2a1f0e;
+    background: var(--color-scheduled);
+    color: #fff;
+    opacity: 0.9;
   }
   .wikiArchiveShell .wikiBtn:disabled,
   .wikiArchiveShell .wikiBtn.primary:disabled {
@@ -2067,16 +2103,16 @@
   .wikiArchiveShell .wikiInput {
     font-family: var(--font-body);
     font-size: 13px;
-    border: 1px solid rgba(60, 50, 30, 0.5);
-    border-radius: 0;
+    border: 1px solid var(--hairline);
+    border-radius: var(--r-sm);
     padding: 6px 10px;
-    background: #fffefb;
+    background: var(--surface-card);
     color: var(--ink-1);
   }
   .wikiArchiveShell .wikiInput:focus {
     outline: none;
-    border-color: var(--ink-1);
-    background: #fffdf8;
+    border-color: var(--color-scheduled);
+    background: var(--surface-card);
   }
   .wikiArchiveRule {
     height: 1px;
@@ -2092,14 +2128,13 @@
     margin: 0 0 14px 0;
     padding: 10px 12px;
     border: 1px solid var(--hairline);
-    background: #fbf7ee;
-    border-left-width: 4px;
+    background: var(--surface-page);
+    border-left: 4px solid var(--color-scheduled);
   }
   .wikiArchiveRedirectLabel {
-    font-family: var(--font-mono);
-    font-size: 11px;
-    text-transform: uppercase;
-    letter-spacing: 0.12em;
+    font-family: var(--font-body);
+    font-size: 12px;
+    letter-spacing: 0;
     color: var(--ink-3);
     white-space: nowrap;
   }
@@ -2119,18 +2154,19 @@
   .wikiArchiveRedirectBtn {
     flex: 0 0 auto;
     padding: 4px 10px;
-    border: 1px solid var(--ink-1);
+    border: 1px solid var(--hairline);
     background: transparent;
-    font-family: var(--font-mono);
-    font-size: 11px;
-    letter-spacing: 0.08em;
+    font-family: var(--font-body);
+    font-size: 12px;
+    letter-spacing: 0;
     color: var(--ink-1);
     cursor: pointer;
-    transition: background 120ms, color 120ms;
+    transition: background 120ms, color 120ms, border-color 120ms;
+    border-radius: var(--r-sm);
   }
   .wikiArchiveRedirectBtn:hover:not(:disabled) {
-    background: var(--ink-1);
-    color: #fbf7ee;
+    border-color: var(--color-scheduled);
+    color: var(--color-scheduled);
   }
   .wikiArchiveRedirectBtn:disabled {
     opacity: 0.4;
@@ -2144,10 +2180,9 @@
     padding: 8px 0;
   }
   .wikiArchiveMeta dt {
-    font-family: var(--font-mono);
-    font-size: 11px;
-    text-transform: uppercase;
-    letter-spacing: 0.08em;
+    font-family: var(--font-body);
+    font-size: 12px;
+    letter-spacing: 0;
     color: var(--ink-3);
   }
   .wikiArchiveMeta dd {
@@ -2166,10 +2201,10 @@
     position: relative;
     margin: 14px 0;
     padding: 10px 14px 10px 18px;
-    border-left: 4px solid var(--ink-1);
-    background: rgba(60, 50, 30, 0.03);
-    font-family: var(--font-display);
-    font-style: italic;
+    border-left: 4px solid var(--color-scheduled);
+    background: var(--surface-page);
+    font-family: var(--font-body);
+    font-style: normal;
     font-size: 14px;
     line-height: 1.7;
     color: var(--ink-1);
@@ -2177,11 +2212,11 @@
   .wikiArchiveCitation .wikiArchiveCitationSource {
     display: block;
     margin-top: 8px;
-    font-family: var(--font-mono);
+    font-family: var(--font-body);
     font-style: normal;
-    font-size: 11px;
+    font-size: 12px;
     text-transform: none;
-    letter-spacing: 0.04em;
+    letter-spacing: 0;
     color: var(--ink-3);
   }
   .wikiArchiveCitation .wikiArchiveCitationSource::before {
@@ -2226,7 +2261,7 @@
   .wikiArchiveTimeline .wikiArchiveTimelineStamp {
     font-family: var(--font-mono);
     font-size: 11px;
-    letter-spacing: 0.06em;
+    letter-spacing: 0;
     color: var(--ink-3);
   }
   .wikiArchiveTimeline .wikiArchiveTimelineSummary {
@@ -2259,35 +2294,21 @@
   }
   .wikiArchiveTag {
     display: inline-block;
-    font-family: var(--font-mono);
+    font-family: var(--font-body);
     font-size: 11px;
-    letter-spacing: 0.04em;
-    padding: 1px 6px;
+    letter-spacing: 0;
+    padding: 1px 8px;
     border: 1px solid var(--hairline);
-    border-radius: 0;
+    border-radius: var(--r-sm);
     background: transparent;
     color: var(--ink-2);
     margin-right: 4px;
   }
-  .wikiArchiveTag::before {
-    content: "[";
-    color: var(--ink-3);
-  }
-  .wikiArchiveTag::after {
-    content: "]";
-    color: var(--ink-3);
-  }
   .wikiArchiveTag.is-active,
   .wikiArchiveTag:hover {
-    background: var(--ink-1);
-    color: var(--surface-card);
-    border-color: var(--ink-1);
-  }
-  .wikiArchiveTag.is-active::before,
-  .wikiArchiveTag.is-active::after,
-  .wikiArchiveTag:hover::before,
-  .wikiArchiveTag:hover::after {
-    color: var(--surface-card);
+    background: var(--fill-scheduled);
+    color: var(--color-scheduled);
+    border-color: var(--color-scheduled);
   }
   .knowledgeWorkstation .wikiModeBarBtn.active {
     position: relative;
@@ -2344,7 +2365,7 @@
     padding: 8px 14px;
     font-family: var(--font-mono);
     font-size: 11px;
-    text-transform: uppercase;
+    text-transform: none;
     letter-spacing: 0.08em;
     color: var(--ink-3);
     border-bottom: 2px solid transparent;
@@ -2374,8 +2395,8 @@
     background: var(--surface-card);
   }
   .knowledgeWiki .wikiImportCandidate.selected {
-    border-color: var(--ink-1);
-    background: rgba(60, 50, 30, 0.02);
+    border-color: var(--color-scheduled);
+    background: var(--fill-scheduled);
   }
   .knowledgeWiki .wikiImportChips {
     margin-top: 6px;
@@ -2455,7 +2476,7 @@
     font-family: var(--font-mono);
     font-size: 11px;
     color: var(--ink-3);
-    text-transform: uppercase;
+    text-transform: none;
     letter-spacing: 0.08em;
   }
   .knowledgeWiki .wikiReferrerCardTitle {
@@ -2631,14 +2652,9 @@
     align-items: center;
     flex-wrap: wrap;
   }
-  .knowledgeWiki .wikiChatAttachInput {
+  .knowledgeWiki .wikiChatAttachPicker {
     flex: 1;
-    min-width: 160px;
-    border: 1px solid var(--surface-page);
-    border-radius: 3px;
-    padding: 6px 8px;
-    font-family: var(--font-mono);
-    font-size: 11.5px;
+    min-width: 180px;
   }
   .knowledgeWiki .wikiInbox {
     display: flex;
@@ -2709,6 +2725,11 @@
     gap: 6px;
     flex-wrap: wrap;
     margin-top: 6px;
+    align-items: center;
+  }
+  .knowledgeWiki .wikiInboxCardActions .wikiInboxDismiss {
+    margin-left: auto;
+    color: var(--ink-3);
   }
   .knowledgeWiki .wikiObservability {
     display: flex;
@@ -2783,7 +2804,7 @@
   }
   .knowledgeWiki .wikiCoverageBarLabel {
     color: var(--ink-3);
-    text-transform: uppercase;
+    text-transform: none;
     letter-spacing: 0.06em;
   }
   .knowledgeWiki .wikiCoverageBar {
@@ -2870,7 +2891,7 @@
   .knowledgeWiki .wikiAdminTab {
     font-family: var(--font-mono);
     font-size: 11.5px;
-    text-transform: uppercase;
+    text-transform: none;
     letter-spacing: 0.06em;
     border: none;
     background: transparent;
@@ -2914,7 +2935,7 @@
     text-align: left;
     font-family: var(--font-mono);
     font-size: 11px;
-    text-transform: uppercase;
+    text-transform: none;
     letter-spacing: 0.08em;
     color: var(--ink-3);
     font-weight: 600;
@@ -3001,7 +3022,7 @@
     flex-direction: column;
     gap: 12px;
     padding: 16px 18px;
-    background: #fbf7ee;
+    background: var(--surface-page);
     height: 100%;
     overflow: auto;
   }
@@ -3016,7 +3037,7 @@
   .wikiGraphFilterLabel {
     font-family: var(--font-mono);
     font-size: 11px;
-    text-transform: uppercase;
+    text-transform: none;
     letter-spacing: 0.08em;
     color: var(--ink-3);
   }
@@ -3067,9 +3088,9 @@
     left: 12px;
     max-width: 320px;
     padding: 10px 12px;
-    background: #fbf7ee;
-    border: 1px solid var(--ink-1);
-    border-left-width: 4px;
+    background: var(--surface-card);
+    border: 1px solid var(--hairline);
+    border-left: 4px solid var(--color-scheduled);
     pointer-events: none;
     box-shadow: 0 4px 12px rgba(0, 0, 0, 0.08);
   }
@@ -3121,5 +3142,93 @@
   @keyframes wikiAskStreamingCaretBlink {
     to {
       visibility: hidden;
+    }
+  }
+
+  /* ── 响应式：窄屏自适应（设计规范 §响应式 <860px）─────────────────────
+     1024px：三栏布局去掉右侧栏跟随，主区+导航两栏；侧栏内容降为堆叠。
+     768px：彻底单列堆叠——导航横向滚动、Inspector/侧栏落到主区下方、卡片网格 1 列。 */
+  @media (max-width: 1024px) {
+    .knowledgeWiki .qualityCenter {
+      padding: 16px;
+    }
+    .knowledgeWiki .wikiModeGrid--today {
+      grid-template-columns: 180px minmax(0, 1fr);
+    }
+    .knowledgeWiki .wikiModeGrid--today .wikiModePane--side {
+      grid-column: 1 / -1;
+      border-left: none;
+      border-top: 1px solid var(--hairline);
+    }
+    .knowledgeWiki .wikiModeGrid--explore,
+    .knowledgeWiki .wikiModeGrid--explore.is-collapsed,
+    .knowledgeWiki .wikiModeGrid--steward.has-inspector {
+      grid-template-columns: 220px minmax(0, 1fr);
+    }
+    .knowledgeWiki .wikiModeGrid--explore .wikiModePane--side,
+    .knowledgeWiki .wikiModeGrid--steward.has-inspector .wikiModePane--side {
+      grid-column: 1 / -1;
+      border-left: none;
+      border-top: 1px solid var(--hairline);
+      background: var(--surface-card);
+    }
+    .knowledgeWiki .wikiTreeLayout,
+    .knowledgeWiki .wikiLintLayout {
+      grid-template-columns: 200px 1fr;
+    }
+  }
+
+  @media (max-width: 768px) {
+    .knowledgeWiki .qualityCenter {
+      padding: 12px;
+      border-radius: 0;
+    }
+    /* 模式切换条：3 列 → 横向滚动单行 */
+    .knowledgeWorkstation .wikiModeBar {
+      grid-template-columns: none;
+      display: flex;
+      overflow-x: auto;
+      -webkit-overflow-scrolling: touch;
+    }
+    .knowledgeWorkstation .wikiModeBarBtn {
+      flex: 0 0 auto;
+    }
+    /* 所有模式网格 → 单列堆叠 */
+    .knowledgeWiki .wikiModeGrid--today,
+    .knowledgeWiki .wikiModeGrid--explore,
+    .knowledgeWiki .wikiModeGrid--explore.is-collapsed,
+    .knowledgeWiki .wikiModeGrid--steward,
+    .knowledgeWiki .wikiModeGrid--atlas,
+    .knowledgeWiki .wikiModeGrid--steward.has-inspector {
+      grid-template-columns: minmax(0, 1fr);
+    }
+    .knowledgeWiki .wikiModePane {
+      padding: 12px;
+    }
+    /* 导航栏改横向滚动条，不再占一整列 */
+    .knowledgeWiki .wikiModePane--nav {
+      border-right: none;
+      border-bottom: 1px solid var(--hairline);
+      overflow-x: auto;
+    }
+    .knowledgeWiki .wikiModePane--nav .wikiStewardNav {
+      flex-direction: row;
+      flex-wrap: nowrap;
+      overflow-x: auto;
+    }
+    .knowledgeWiki .wikiModePane--main,
+    .knowledgeWiki .wikiModePane--side {
+      border-left: none;
+      border-top: 1px solid var(--hairline);
+    }
+    /* 树/质量信号双栏 → 单列 */
+    .knowledgeWiki .wikiTreeLayout,
+    .knowledgeWiki .wikiLintLayout {
+      grid-template-columns: minmax(0, 1fr);
+    }
+    /* 各类卡片网格 → 单列 */
+    .knowledgeWiki .wikiMetricsGrid,
+    .knowledgeWiki .wikiObservabilityGrid {
+      grid-template-columns: minmax(0, 1fr);
     }
   }
