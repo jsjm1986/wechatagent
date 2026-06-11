@@ -1,7 +1,7 @@
 # 通用化知识库：LLM 对话驱动的行业/产品自适应 — 设计文档
 
 **日期**：2026-06-11
-**状态**：设计待评审（DRAFT，零代码改动）
+**状态**：设计评审中 — **Phase 0 已提交（commit e93cd63）；Phase 1 子步 1B 已落 working tree（待与本设计一起提交）**；其余子步待实施
 **作者**：运营 agent 侧
 **目标读者**：产品负责人 + 知识库后端维护者
 
@@ -39,6 +39,12 @@
 
 ### 1.2 仍锁在销售域的部分 ❌（本设计的攻坚对象）
 
+> **2026-06-11 修订**：原 H1–H5 漏掉了最硬的一块——`planner`。经穷尽排查（见
+> §1.4 消费点全图），补 H6（planner 漏斗权重/终态/停滞）与 H7（两份独立维度
+> 校验列表）。本设计目标修正为「**二进制里不留任何行业语义**」：哪个维度 / 什么
+> 取值 / 谁优先 / 什么算终态 / 怎么解释，全部下沉到配置（引导层 LLM + 人审生成），
+> 代码只保留「读配置、按配置运转」的通用机制。
+
 | # | 硬编码点 | 位置 | 影响 |
 | --- | --- | --- | --- |
 | H1 | `AgentDecision.customer_stage / intent_level` 是 typed 字段 | `agent/types.rs:99-100` | 换行业维度必须改 Rust 源码 |
@@ -46,14 +52,101 @@
 | H3 | prompt 点名销售维度语义 | `prompts.rs:749,771,886-887,936,1595` | "客户阶段=陌生/关注/评估/决策/成交" 写死 |
 | H4 | grounding 兜底探针词表中文销售词 | `guards.rs:331-345` | 换行业绝对化承诺静默漏判 |
 | H5 | completeness 审计五维 coverage | `catalog.rs:553-605` | capability/pricing/effectClaims 强绑 B2B 销售 |
+| **H6** | **planner 漏斗权重/终态/停滞** | `planner/mod.rs:800-829`(stage/intent 权重)、`737-738`(stagnation dotted-key 过滤)、`TERMINAL_STAGES` 常量 | 9 个销售阶段→优先级权重、high/medium/low→权重、哪些算终态全写死；换行业客户跟进排序失灵 |
+| **H7** | **两份独立维度校验列表** | `decision_taxonomy.rs:38`(decision 阶段) + `gateway.rs:3262`(finalize soft gate) | 同一维度集合写死两遍，各自漂移的正确性风险 |
+| **H8** | **planner 运营范式焊死成单向漏斗** | `planner/mod.rs:70-78`(三扫描器无条件每 tick 跑)、`727-774`(stage_stagnation 过滤硬绑 customer_stage) | 整套主动触达假设「人人都走陌生→成交→维护」；情绪陪伴/关系维护型无法关掉漏斗推进，也无法因用户而异调范式（见 §3.6） |
+| **H9** | **conversationMode 判定 + 模式×5闸阈值写死销售域价值观** | `prompts.rs:935-940`(判定六条 if-else)、`944-950`(模式→闸映射，casual=PressureRisk≥5) | 只有「销售推进/克制寒暄」两种人格，缺「主动经营情感」；casual 被设计成 passive，情感陪伴场景的主动推进被压制（见 §3.8） |
 
-### 1.3 顺带发现的非通用化缺陷（独立问题，本设计标注但不混入）
+
+
+### 1.4 消费点全图（穷尽排查结论，Phase 1 实施依据）
+
+`customer_stage / intent_level` 的写入 + 读取点（改造必须全覆盖，否则双写不一致）：
+
+- **写入 contact.domain_attributes**（3 套实现，须同步）：`gateway.rs:2457-2476`（AI 决策，手写 dotted-key）、`routes/shared.rs:76-91`（helper，被运营改画像 `shared.rs:548-556` + planner `update_profile` 工具 `management.rs:886-915` 共用）。
+- **`customer_stage_updated_at` 时间戳**（planner stagnation 计时器命门）：3 处条件写（仅 stage 变化时刷）`gateway.rs:2468`、`shared.rs:88`、`m018:47`；planner 读它做停滞判定（`planner/mod.rs:738/858`）。`stage_changed` 判定分散 3 处独立实现——改存储方式必须同步，否则计时器失准。
+- **读取点**：planner 排序/过滤（`planner/mod.rs:27-45,737-738,846-858`）、decision prompt 注入（`decision.rs:504-513`）、gateway churn 审计（`gateway.rs:2573-2580`）、memory 健康分（`memory.rs:244-246,915-922`）、shared 画像渲染（`shared.rs:475-476`）。
+- **序列化**：对外 LLM 契约 **camelCase**（`customerStage`），DB 容器内 **snake_case**（`customer_stage`），由反序列化层桥接——新增 `domain_signals` 容器须沿用同一约定。
+- **金标**（不破坏判定标准，仅换输入管道）：`decision_taxonomy.rs:191-336`、`planner/mod.rs:1536-1542`（顶层无 key、必须在 domain_attributes 容器）、`shared.rs:1188-1231`（同左 + stage 未变不刷 updated_at）、`tests/m018_backfill_domain_stage.rs`、`tests/real_llm_*`。
+
+### 1.5 顺带发现的非通用化缺陷（独立问题，本设计标注但不混入）
 
 - **D1**：`DomainSchema` 运行时零消费——CRUD/版本/校验都建了，但没有任何运行时代码读 active schema。文档（`domain_schemas.rs:5-7`、`knowledge-wiki.md §9`）宣称"写入侧按 active schema 校验"是**未落地**。
 - **D2**：verify/reject/auto_verify/PUT/chat 五类写入**绕过** `apply_chunk_revision`，verify 这个关键状态转移**不写 chunk_revisions 历史、不更新 provenance**——审计链在"升级为 verified"处断裂。
 - **D3**：关系图谱 BFS 遍历忽略 `relation_kind`，contradicts 与 references 无差别扩散；superseded_by 不做版本 redirect。
 
 这三个是已有功能的实现缺陷，**与通用化正交**，列入「后续清理」不进本设计主线（除非 §6 分期里顺手）。
+
+### 1.6 CRM 客观业务事实缺口（2026-06-11 双 Opus 子代理审查结论）
+
+用户要求"全面审查数据缺口：有了 CRM 才能知道客户阶段(已购买/售后期)、产品是否购买"。经两个 Opus 子代理交叉核实（证据级 file:line），结论分两层：
+
+**结论一 · 不需要独立 CRM 系统。** `Contact` 事实上已是一个 CRM 数据层：`commitments: Vec<CommitmentRepr>`（带 `due_at`，`models.rs:167`）、`deal_events: Vec<DealEvent>`（带 amount/currency，`models.rs:199`）、`operation_state` 状态机、`intent_trajectory`、全套时间戳、`workspace_id→account_id→contact` 三层多租户。再建独立 CRM 是重复造轮子。多租户层（`WechatAccount` capacity/persona_tag/off_hours 调度）是全仓最完整的实体维度。
+
+**结论二 · 缺一整类「客观购买事实」数据。** 现有三个状态字段全是「对话推进状态」，且都由 LLM 从聊天推断，**没有任何字段回答"买没买/买了什么/在不在售后期"**：
+
+| 字段 | 实际表达 | 性质 | 证据 |
+| --- | --- | --- | --- |
+| `customer_stage` | 9 档销售对话漏斗 | LLM 推断的主观标签 | `m006:80-135`、`prompts.rs:585-690` |
+| `operation_state` | 同 9 档，驱动 AI 动作的状态机 | LLM 推断 + 状态机约束 | `prompts.rs:585-690` |
+| `agent_status` | AI 是否托管(Normal/Managed) | 运营开关 | `models.rs:6-9` |
+
+`DealEvent`（`models.rs:216-239`）是唯一成交锚点，却：**无 `product_id`（只有金额）**、**全代码库只写不读**（注释自述"只采集、不参与任何评分"`models.rs:194-197`）。
+
+**确认缺失的客观事实数据点**：
+- G1 客观购买生命周期状态（未购买/已购买/售后期/复购期）——真缺失
+- G2 结构化产品目录实体（产品 ID/名称/价格/SKU）——真缺失（只有 `product_tags` 字符串标签 + 知识 chunk 非结构化描述）
+- G3 成交关联产品（DealEvent 无 product_id）——真缺失
+- G4 当前产品持有状态（entitlement，区别于历史成交事件）——真缺失
+- G5 售后/续费/保修时间与状态——真缺失
+- G6 客户价值分层（LTV/RFM/tier；`product_fit_score` 是易失单轮 LLM 评分，不在 Contact 上）——真缺失
+
+**与通用化内核的关系（决定为什么"先做内核"是对的）**：缺口分两类，处理方式相反——
+
+1. **生命周期阶段语义**（G1：未购买/已购买/售后期/复购期）**因行业而异**：种植牙是"咨询→面诊→种植→修复期→维护"，SaaS 是"试用→付费→续费→流失"。**绝不能写死成 `purchase_status: enum` 或第二套状态机——那就是又一个 H1 硬编码点。** 它必须作为**一个 profile 维度**（取值存 `system_taxonomies`），由引导层按行业生成。换言之 G1 是"内核的应用"，不是独立功能。
+2. **结构性事实容器**（G2/G3/G4：产品目录、订单关联 product_id、持有状态）**形状跨行业通用**（任何行业都有"产品/订单/持有"概念）。建法遵循现有"稳定结构 + `domain_attributes` 可变容器"哲学，属平行于内核的客观事实增强。
+
+**关键风险（本节固化的目的）**：若不先打好内核就补 CRM，几乎必然有人加 `purchase_status` 枚举制造第 8 个硬编码点。故 **G1 推迟到内核就绪后作为 profile 维度落地；G2/G3/G4 作为独立的"客观事实增强"专题（Phase 3 之后），不混入内核主线**。G5/G6 在"AI 自主运营微信私域"定位下属可后置项。
+
+### 1.7 系统化深审新增硬编码点 H10–H17（2026-06-11 六 Opus 子代理 + 深挖）
+
+H1–H9 是顺对话场景"碰"出来的；为穷尽，按六层（状态机/review五闸/知识分类/采集度量/默认内容/横切边缘）各派一个 Opus 子代理证据级排查，再对"成功/极性"暗线追加一个深挖代理。结论：销售世界观分布在**六个层面**，是同一套漏斗价值观的镜像。新增 H10–H17：
+
+| # | 硬编码点 | 位置 | 风险/性质 |
+| --- | --- | --- | --- |
+| **H10** | **成功事件写死成成交**（deal_events 带 amount，注释自陈"PU-learning 唯一正例"） | `models.rs:194-239`、`routes/contacts.rs:556` | **假锚点·改它零风险**：深挖证实全库**只写不读**，PU-learning 纯注释零实现，连 `ApiContact` 都不映射。非紧急 |
+| **H11** | **负反应/极性词表写死销售**（objection/unsubscribed/complaint） | `reaction.rs:310-359`(`is_negative_outcome`/`reaction_outcome_status`) | **真锚点·改它高风险**：单一真相源，横向渗透**三条已落地回路**（见下）。情感域优质回复永远判不出 Hit→自学习失效 |
+| **H12** | **出厂人格=销售人设**（默认 soul 76 行顾问灵魂 + playbook"成交准备度/复购转介绍"方法论） | `prompts.rs:743-818`、`443-480` | H3 被严重低估的真身：人格主体是编译期 `&'static str`。机制 DB 可配，出厂值锁销售。归 1E 扩展 |
+| **H13** | **状态机 9 态定义本体写死**（goal/信号/风险全锚定异议/成交/复购） | `prompts.rs:585-690` + 初始态 `new_contact` 字面量散落 6 处 + `cooldown` 特例 `m013` | 转移引擎已泛化(读DB字典)，但全系统只 seed 销售这一套。需多套状态机模板随 profile 选 |
+| **H14** | **grounding/ProductAccuracy 硬闸无条件**（每条回复都要 grounding≥7） | `gates.rs:28,114` | 纯情感回复靠 reviewer 每次给满分兜底，脆弱。应条件化（仅产品声明时纳入）。归 Phase 2 |
+| **H15** | **经营公式+rubric 销售化**（ConversionReadiness/ProductFit 公式 + 逼单打分锚点） | `prompts.rs:964-969`、`review/mod.rs:244-247` | 不进硬闸但占 reviewer 注意力 + 被 `/evaluations` 当 ground-truth 度量。归 1E |
+| **H16** | **chunk_type+answeringMode 产品框架**（product_fact 分段 prompt、product_safe 三态） | `knowledge_router.rs:190-235`、`catalog.rs:550-581` | 绕过已铺好的 DomainProfile 管道。归知识库后端 Phase 2 |
+| **H17** | **memoryCard schema+intent_trajectory 销售化**（objections/businessContext 一等字段；情绪史/纪念日无槽） | `memory.rs:62-97`、`models.rs:2812-2821`(`objection_type` typed) | 情感维度只能挤进泛化文本。记忆维度 schema 应随 profile |
+| **H18** | **触达节奏全局写死**（debounce 窗口 4s、account off_hours 用 UTC 小时） | `webhooks.rs:582`、`account_scheduler.rs:47` | 去抖/账号作息节奏全行业共用，未随范式可配。归 1F/Phase 2（off_hours 时区错位是 C 类缺陷） |
+| **H19** | **作息门控无关系类型/contact 维度**（quiet_hours 全域单值，默认 22→8 销售作息） | `runtime.rs:72-79,132-135`、`agent/mod.rs:510-513` | 情感陪伴"晚上是黄金时段"会被作息门压制到次日 8 点；H8/H9 做完仍失效。**必须纳入 `resolve_operation_mode` override 链，否则数字分身落地受阻**。归 1F |
+
+> **2026-06-11 终极审查补充**：第八/九层（入口/作息/persona/迁移/基线/MCP/outbox）扫描发现 H18/H19。其中 **H19（作息门控）是前六层完全没碰、却会阻塞情感陪伴落地的真遗漏**——quiet_hours 是 domain_config 级单值，无 per-relationship_type/contact 维度。**已并入 1F**（resolve_operation_mode 把 quiet_hours 纳入 override 链）。另确认：`persona_tag` 是"路由池标签"≠"对话人格"（`account_scheduler.rs:33-125` 只用于同 persona 账号互替路由），数字分身的关系类型人格走 contact 级 relationship_type→OperationMode，**实施时勿把 relationship_type 复用 persona_tag**（轴混淆）。
+
+**「成功/极性」暗线消费网全图（深挖结论，决定 H10/H11 处置）**：
+
+```
+正例：deal_events ──→ ✗ 无任何消费方（PU-learning 仅注释；前端不映射）  ← H10 假锚点·零风险
+      user_replied_buying_signal ──→ classify_outcome_label→Hit ──→ dynamic_confidence↑ ──→ 知识召回排序  ← 真正活跃的正例
+过程"成功"：send_success_rate=reviewer放行率 ──→ evolution promote/rollback  ← 与业务结果脱钩，跨域错配无告警
+负极性：is_negative_outcome(硬编码5销售词) ──→ ①dynamic_confidence↓召回降级 ②negative_example反向训练 ③escalation卡死判定   ← H11 真锚点·高风险
+```
+
+**H10/H11 处置裁断（修正"优先级"认知）**：
+- **H10**：零消费方，改它当前不影响任何行为 → **可随手做、不紧急**，不值得"抢优先级"。
+- **H11**：是数字分身能否自我学习的**命门**（情感域现在优质回复零正反馈、自学习事实失效），但它是**高风险"动学习逻辑"**——单一真相源喂进召回排序+反例训练+请示，跨域语义错配会**静默污染知识召回且无业务指标兜底告警**。故 **H11 不该"抢做"，应重排到「自学习回路解耦」专门 Phase，配最强护栏（DEFAULT 逐字等价 + 三条回路各自等价性测试 + 召回排序回归基线）**。贸然早做比不做更危险。
+
+**三个正交缺陷（非通用化，但实施时绊脚）**：
+- **C1**：`pressure_risk_block_at=7` 是五闸唯一不走 typed 配置的写死阈值（`runtime.rs:113,211`）——**H9 想放宽情感场景压力阈值在 runtime 层没入口**，是 H9 隐藏前置，须先给 `RuntimeParametersTyped` 加字段。
+- **C2**：`operation_state`（FSM 态）与 `customer_stage`（taxonomy 标签）**双轨冗余**，消费方分裂（planner 只读 customer_stage、gateway 只读 operation_state），可漂移；通用化只改一轨会引入不一致。
+- **C3**：引导层 `PLAYBOOK_METHODOLOGY_SYSTEM`（`prompts.rs:1950`）自带"消费心理学、顾问式销售"偏见——违反 §7"引导层 prompt 不得写死行业词"护栏，会污染 AI 生成的非销售 profile，Phase 3 须清。
+
+**战略结论**：Phase 1 原 1A–1F 只覆盖 H1–H9（决策+planner+prompt 三层）。H10–H17 揭示销售世界观还盘踞在**状态机本体（H13）、review 闸/公式（H14/H15）、知识分类（H16）、记忆/采集/度量与自学习极性（H11/H17）**。其中 H11（极性→自学习）是最深、风险最高的命门，单列高护栏 Phase；H12/H13（出厂人格+状态机本体）是 1E/Phase 2 必须补的人格主体；H10 假锚点随手清。详见 §6 重排分期。
+
 
 ---
 
@@ -94,7 +187,7 @@
 │  版本灰度：publish / rollout / rollback（已存在，全部复用）    │
 └───────────────────────────────────────────────────────────┘
                           ↓ 运行时按 active 配置加载
-┌─ ③ 运行时消费层（解耦写死维度·Phase E 推迟的部分）─────────┐
+┌─ ③ 运行时消费层（解耦写死维度·Phase 1 解耦的部分）─────────┐
 │  AgentDecision.customer_stage/intent_level（写死）            │
 │         → domain_signals: Document（泛化容器，已有先例）      │
 │  TAGGED_FIELDS const 表                                       │
@@ -199,7 +292,190 @@ pub domain_signals: Document,   // { "visit_stage": "consult", "treatment_intent
 //       对 decision.domain_signals 的对应 key 做 check_value（逻辑本身已泛化）。
 ```
 
-`check_value(kind, raw, scope, cache)` **完全不动**——它早已按 kind 泛化（`taxonomy.rs:196`）。只把「遍历哪些 kind」从 const 表换成「读 active profile」。
+`check_value(kind, raw, scope, cache)` **完全不动**——它早已按 kind 泛化（`taxonomy.rs:196`）。只把「遍历哪些 kind」从 const 表换成「读 active profile」。同一改造**必须同步两处**：`decision_taxonomy.rs:38` 与 `gateway.rs:3262` 的 finalize soft gate（H7：消灭两份漂移的列表）。
+
+### 3.4 planner 漏斗权重/终态/停滞配置化（H6）+ 数据模型扩展
+
+planner 的销售漏斗逻辑（`stage_priority_weight` 9 阶段、`intent_level_weight` 三档、`TERMINAL_STAGES`、stagnation 计时）是最深的行业耦合。通用化把「权重/终态」下沉到**维度取值字典**，把「哪个维度驱动停滞计时」下沉到 **profile**：
+
+```rust
+// models.rs：TaxonomyValue 增量加字段（旧数据 #[serde(default)] 兼容）
+pub struct TaxonomyValue {
+    pub id: String,
+    pub display_name: String,
+    // ...既有...
+    #[serde(default)] pub priority_weight: Option<i32>,  // 该取值的跟进优先级权重
+    #[serde(default)] pub is_terminal: bool,             // 是否终态（替代 TERMINAL_STAGES 常量）
+}
+
+// DomainProfile 增量：声明哪个维度驱动 planner 停滞计时（替代写死 customer_stage）
+pub struct DomainProfile {
+    // ...既有...
+    #[serde(default)] pub stagnation_dimension: Option<String>,  // 如 "customer_stage"
+}
+```
+
+planner 取权重从「match 写死的销售 canonical 值」改为「读 taxonomy 取值的 `priority_weight`，缺省 fallback 现有默认」；终态从「`TERMINAL_STAGES.contains`」改为「读取值的 `is_terminal`」；stagnation 过滤的 dotted-key 从写死 `customer_stage` 改为读 `profile.stagnation_dimension`。
+
+**DEFAULT_PROFILE 等价**：m006 seed 给现有 9 个 customer_stage / 3 个 intent_level 取值回填与当前 `stage_priority_weight` / `intent_level_weight` **逐字相等**的 `priority_weight`，现有终态回填 `is_terminal=true`，`stagnation_dimension="customer_stage"`。planner 金标（权重档位、dotted-key 结构）判定值不变。
+
+`customer_stage_updated_at` 时间戳：通用化后改为 `<stagnation_dimension>_updated_at` 动态 key；DEFAULT 下即 `customer_stage_updated_at`，与现状一致。3 处 `stage_changed` 写实现收敛为一个共享 helper（消除散落不一致风险）。
+
+### 3.5 写入收敛
+
+gateway 手写 dotted-key（`gateway.rs:2457-2476`）与 `shared.rs:76-91` helper 两套写实现，通用化时收敛为遍历 `domain_signals` 的单一 helper，避免「typed 字段写旧 key、map 写新 key」的双写不一致（穷尽排查 #2 风险）。
+
+### 3.6 运营范式可配化（H8）—— planner 不再假设「人人都是沙漏」
+
+> **2026-06-11 探索补充**：用户指出"不一定 100% 沙漏型——有些行业是情绪价值/陪伴、
+> 有些是维护某个微信联系人的长期关系，且要能**因用户而异**地调整"。这戳中 planner
+> 最深的隐藏假设：**整套主动触达逻辑都建立在"陌生→成交→维护"单向漏斗上**。H6（漏斗
+> 内部权重/终态可配）不够，必须让**范式本身可换**。
+
+**关键发现（读码结论）**：planner 现有三个扫描器（`scan_silent` / `scan_commitments` /
+`scan_stage_stagnation`，`planner/mod.rs:70-78`）各自回答一种「主动触达的驱动力」，
+其中只有 `stage_stagnation` 是漏斗专属：
+
+| 扫描器 | 驱动力 | 漏斗专属？ |
+| --- | --- | --- |
+| `scan_silent` | 「太久没说话」时间沉默 | ❌ 跨范式通用 |
+| `scan_commitments` | 「答应的事到期」事件/承诺 | ❌ 跨范式通用 |
+| `scan_stage_stagnation` | 「卡在阶段没推进」漏斗推进 | ✅ 沙漏专属 |
+
+所以"范式可配"落到代码 = **三个驱动力各自可开关 + 可调参**，而非把漏斗推倒重写。
+
+**数据模型（两级声明，contact 覆盖 profile）**：
+
+```rust
+/// 运营范式：声明启用哪些「主动触达驱动力」+ 各自参数。
+/// 全字段 #[serde(default)]，缺省即「沿用全局 config」——DEFAULT 下零行为变化。
+pub struct OperationMode {
+    #[serde(default)] pub funnel: FunnelMode,          // 沙漏推进(stage_stagnation)
+    #[serde(default)] pub silence: SilenceMode,        // 沉默唤醒(scan_silent)
+    #[serde(default)] pub commitment: CommitmentMode,  // 承诺到期(scan_commitments)
+}
+pub struct FunnelMode {
+    #[serde(default = "default_true")] pub enabled: bool,
+    #[serde(default)] pub stagnation_threshold_days: Option<i64>, // None→回落全局 config
+}
+// SilenceMode { enabled, threshold_hours: Option<i64> }
+// CommitmentMode { enabled, imminent_window_hours: Option<i64> }  同构
+
+// DomainProfile 增量：行业默认范式
+pub struct DomainProfile { /* ...既有... */
+    #[serde(default)] pub operation_mode: OperationMode,
+}
+// Contact 增量：单客户覆盖（优先级高于 profile，承接「因用户而异」）
+pub struct Contact { /* ...既有... */
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation_mode_override: Option<OperationMode>,
+}
+```
+
+**三种范式怎么落**：
+- **销售型**（DEFAULT）：三驱动力全开 + 阈值缺省回落全局 config → 与现状**逐字等价**，planner 全部金标零变化。
+- **陪伴/情绪型**：`funnel.enabled=false`（不推进阶段，不被 stagnation 催），silence 开但阈值更长更温和，commitment 仍开（约的事还记）。
+- **关系维护型**：funnel 关，silence+commitment 开，阈值按「长期保鲜」调。
+- **因用户而异**：某老客户「只维护不推进」→ 在他 Contact 上设 `operation_mode_override.funnel.enabled=false`，单独对他关漏斗，不影响同号其他客户。
+
+**实现要点（决定本设计安全的根据）**：
+- 关 funnel = `scan_stage_stagnation` 对该 contact 短路 `return false`。**纯减法**，不碰 silent/commitment、不碰任何排序权重、不碰 `stage_priority_weight`。
+- silent/commitment 的 enabled/阈值：现为全局 config（`strategic_planner_silent_threshold_hours` 等，`config.rs`）。改为「effective = contact override ?? profile ?? 全局 config」三级回落；缺省即现状。
+- 三扫描器在 loop 里仍都被调用；变化在**每个扫描器内部**——按 contact 解析出的 effective mode 决定「这个 contact 跑不跑我这段」。解析 helper：`resolve_operation_mode(contact, profile) -> OperationMode`，单一来源避免散落。
+
+**明确划入「做加法」边界、不进当前内核**：上述全是「开关 + 阈值 + 短路」=减法与调参，今天能干净落地。但「陪伴型**主动发起**情绪关怀」需要**新扫描器**（情绪/节奏信号采集），是独立专题，列 Phase 3 之后。当前内核只把「范式可声明、漏斗可关、阈值两级可调」的地基打牢。
+
+**DEFAULT 等价护栏**：`OperationMode::default()` = 三驱动力 enabled=true + 所有阈值 None（回落全局 config）。新增测试断言 `resolve_operation_mode` 在无 profile/无 override 时产出的 effective 参数 = 当前全局 config 值，且 funnel 全开 → planner 现有金标逐条不变。
+
+### 3.7 数字分身：关系类型 × 驱动力组合（H8 的产品兑现）
+
+> **2026-06-11 头脑风暴**：用户进一步定位——这个 agent **不只是"客户运营工具"，而是
+> "微信号本人的 AI 化身"**，要能托管机主**除客户外的社交**：朋友、同行，处理节假日
+> 祝福、社交钩子等，"让人放心托管"。身份范围明确 = **客户 + 同行 + 朋友**三层
+> （家人暂不纳入）。
+
+**核心定位修正**：「数字分身」不是第四个 `OperationMode` 枚举值，而是把 §3.6 的
+「驱动力自由组合」从"按行业"扩展到"按**关系类型**"。每个 contact 有一个
+`relationship_type`（**走 system_taxonomies 维度**——用户已拍板，因行业而异：有些行业
+还有供应商/合作方，不写死枚举），profile 为每种关系类型声明一套 `OperationMode`。
+三层差异 = 三套驱动力组合 + 阈值 + 口吻：
+
+| 关系类型 | 启用驱动力 | 典型配置 |
+| --- | --- | --- |
+| 客户 | 漏斗 + 沉默 + 承诺 + 日历 | 漏斗全开，沉默阈值短（怕丢单），祝福偏商务 |
+| 同行 | 沉默(长) + 承诺 + 日历 | 漏斗关，低频，祝福偏行业节点 |
+| 朋友 | 沉默(长) + 日历 | 漏斗关，承诺可选，祝福偏个人情感、口吻最像本人 |
+
+这比"N 个预设范式"灵活：不是在预设里选，而是每种关系类型**自由组合驱动力**。
+
+**关键设计哲学（用户拍板，必须固化，防止回退）**：
+
+1. **三层全部 100% 全自动发送，无"待确认/草稿/审批"状态。** 理由（用户原话逻辑）：
+   (a) 发出的内容本人在自己手机上**自然可见**，事后能发现纠正；(b) 人的干预点在
+   **"事前配置"**（运营接入时手动调画像 + 调 operation_mode），不在"事中逐条确认"。
+   **"放心托管"= 把规则配好后信任它自动跑，不是每条都盯。**
+2. **因此与 `check-no-human-takeover` 红线零冲突**：没有任何"待人确认/接管"语义。
+   `autonomy_level`/"草稿待确认"这类概念**明确排除出设计**——人的控制权在配置层行使。
+3. **客户侧自主性不变**：朋友/同行是机主的社交，不是"客户对话被人接管"——客户侧
+   仍 100% AI 自主。社交侧也是 AI 自动发，只是机主在配置时定了口吻/驱动力/阈值。
+
+**地基增量（落在现有体系，无平行新系统）**：
+- `relationship_type` = system_taxonomies 的又一维度（复用 check_value / 候选 / 版本灰度）。
+- 三层运营策略 = profile 为每个 relationship_type 配一套 `OperationMode`（§3.6 已建模）。
+- **节日祝福（日历驱动）/ 社交钩子（外部事件驱动）= 给 planner 加新扫描器**——这是
+  **做加法**（新信号采集），是独立专题，**不进当前内核解耦**。当前内核只确保：
+  关系类型可声明、每类关系的驱动力组合可配、漏斗可关、阈值可调。新扫描器在地基就绪
+  后增量挂载，不改 `resolve_operation_mode` 架构。
+
+**待澄清（不阻塞内核）**：日历祝福依赖"生日/纪念日"数据从哪来；社交钩子（朋友圈/群）
+依赖 MCP 能否拉到外部事件——这两个新驱动力落地前需先摸清 MCP 能力边界，列入专题。
+
+### 3.8 conversationMode + 模式×5闸阈值写死销售域价值观（H9）
+
+> **2026-06-11 压力测试发现**：用户给"加好友→托管→像男朋友一样对待她、主动提供
+> 情绪价值、推动亲密关系"这条指令做边界测试。读码核实结论 = **情感陪伴是正式目标
+> 场景**（用户拍板），但现有 `conversationMode` 机制为它埋了一个深层障碍。
+
+**核实结论（先纠正一处误判）**：情感对话**不会**被产品类安全门误杀——
+`casual_relationship` 模式下 FactRisk/ProductAccuracyScore 几乎不参与（`prompts.rs:946`），
+承诺词硬闸也把语气类（保证/一定能/绝对）标为"最易误杀情感承诺，仅观测不拦"
+（`guards.rs:322`）。`custom_agent_instructions` 末位最高优先级注入且能直接指定
+conversationMode（`prompts.rs:935`、`decision.rs:380-391`）——指令链通。
+
+**真正的硬编码点 H9**：`conversationMode` 的**判定规则**（`prompts.rs:935-940` 六条
+if-else）+ **模式→5闸阈值映射**（`prompts.rs:944-950`）把**销售域价值观写死在 prompt
+文案里**：
+
+- 判定规则锚定销售语义：「customer_stage∈{方案匹配/异议处理/承诺跟进}→consultative」
+  「用户问产品/价格/方案→consultative」——非销售行业无"方案/异议/采购"概念。
+- 模式→闸映射写死「**casual_relationship：PressureRisk 阈值收紧 ≥5 即拦，杜绝寒暄里夹
+  推销**」。这把"闲聊"等同于"该克制、给空间、压制主动性"——是销售域价值观（闲聊不
+  该推进）。但**情感陪伴场景价值观相反**：主动提供情绪价值、积极推动亲密是**正当的**。
+  现有机制只有"销售推进(consultative)"和"克制寒暄(casual)"两种人格，**缺"主动经营
+  情感关系"这第三种**——casual 被设计成了 passive。
+
+**影响**：当前 agent 能**被动**把情感对话回应得不错，但**主动经营亲密关系做不到**，且
+casual 模式的"收紧压力门"会与"热烈推进"打架（非误杀，是模式设计就要压制主动性）。
+
+**改造方向（归属 H3/1E，同文件同类改造）**：H9 与 H3（prompt 维度语义注入）都在
+`prompts.rs`、都是"把写死的销售域语义抽到 profile 注入"，故**合入 1E 一起做**：
+- conversationMode 的**取值集合 + 判定规则**从 `profile` 注入（替代写死六条 if-else 和
+  四模式枚举）；情感陪伴 profile 可声明 `intimate_companion` 之类模式。
+- **模式→5闸阈值映射**从 `profile` 读（替代写死「casual=PressureRisk≥5」）；情感 profile
+  可声明「亲密推进模式 PressureRisk 阈值放宽、EmotionalValue 权重提高」。
+- **DEFAULT_PROFILE 逐字复刻当前四模式 + 当前映射**（含 casual=≥5），销售域行为零变化；
+  real-LLM conversationMode 金标判定标准不变。
+
+**红线守护**：H9 放宽的是**情感/社交场景**的主动性阈值，**不触碰** boundary_protection
+模式那套"严禁承诺真人/上级/转交"的反接管硬规则（`prompts.rs:950`）——那条无论什么
+行业都不松动，继续写死。H9 只让"用什么模式 + 各模式 5 闸阈值"可配，不让"反人工接管
+红线"可配。
+
+**Phase 3 端到端验证场景**：情感陪伴（"像男朋友一样"指令 → intimate_companion 模式 →
+主动情绪价值触达 → 不被 PressureRisk 压制）列为非销售行业验证样例之一。
+
+
+
 
 ---
 
@@ -238,13 +514,16 @@ pub domain_signals: Document,   // { "visit_stage": "consult", "treatment_intent
 | `DomainSchema` 运行时接线（修 D1） | 知识库后端 | 让 active schema 真正校验 chunk 写入 |
 | 引导层 AI 生成配置（prompt + 结构化输出 + 审核 UI 后端） | 知识库后端 + 运营 agent 协作 | 跨界，需对齐 |
 | `AgentDecision` 解耦 domain_signals（H1） | **运营 agent（我）** | 核心路径 |
-| `TAGGED_FIELDS` 动态化（H2） | **运营 agent（我）** | 核心路径 |
+| `TAGGED_FIELDS` + gateway soft gate 动态化（H2/H7） | **运营 agent（我）** | 核心路径，两份列表同步 |
 | prompt 维度语义动态注入（H3） | **运营 agent（我）** | 核心路径 |
+| **conversationMode + 模式×5闸阈值配置化（H9）** | **运营 agent（我）** | prompts.rs，与 H3 合入 1E；boundary_protection 反接管红线不可配 |
 | grounding 词表配置化（H4） | **运营 agent（我）** | guards.rs |
 | completeness 维度配置化（H5） | 知识库后端 | catalog.rs |
+| **planner 权重/终态/停滞配置化（H6）** | **运营 agent（我）** | planner/mod.rs + TaxonomyValue 扩字段 |
+| **planner 运营范式可配化（H8）** | **运营 agent（我）** | planner/mod.rs + DomainProfile.operation_mode + Contact.operation_mode_override |
 | 引导层前端向导 UI | **前端（我）** | 控制台新增 |
 
-**需你裁决**：这个工程横跨运营 agent + 知识库后端。建议由我统一推、知识库侧改动列清单供他人 review，还是严格按上表分头做。
+**已裁决**：用户授权由我**统一推进**整个工程（横跨运营 agent + 知识库后端 + 前端，作为一个整体）。知识库侧改动在 commit 信息标注。
 
 ---
 
@@ -255,20 +534,47 @@ pub domain_signals: Document,   // { "visit_stage": "consult", "treatment_intent
 - 运行时**仍走写死路径**，只是并行加载 active profile（无则 DEFAULT）。
 - 验证：零行为变化，基线测试全绿。
 
-### Phase 1：运行时消费层解耦（中风险，核心）
-- `AgentDecision` 加 `domain_signals: Document`，normalize 兼容旧字段。
-- `TAGGED_FIELDS` 改读 active profile.profile_dimensions。
-- prompt 维度语义段从 profile 注入（DEFAULT_PROFILE 文案 = 当前文案，逐字对齐防过拟合）。
-- 验证：DEFAULT_PROFILE 下所有现有 PBT/real-LLM 套件**逐条等价**，这是反过拟合的硬护栏。
+### Phase 1：运行时消费层全面解耦（核心，覆盖 H1–H9）
 
-### Phase 2：grounding / completeness 配置化（中风险）
-- H4 词表、H5 五维从 profile 读，DEFAULT_PROFILE 值 = 当前硬编码值。
-- 修 D1：DomainSchema 运行时接线（顺带，因引导层要它生效）。
+**执行纪律**：每个写死点 = 一个独立 commit；每步在 DEFAULT_PROFILE 下**零行为变化**，跑全基线（lib≥350/0 + 4 PBT≥33/0）+ 三禁词闸验证绿，再进下一步。金标的**判定标准一字不改**——只把「喂数据的管道」从写死常量换成喂 DEFAULT_PROFILE（逐字复刻当前销售值）；每处在 commit 标注。范围**覆盖全部 H1–H9，不中途收工**。
 
-### Phase 3：引导层（你的核心想法，价值兑现）
+子步（**按依赖顺序执行：1B→1D→1A→1C→1E→1F→1G**；数据模型/容器先行，维度列表动态化必须在 domain_signals 容器就绪后，否则二次返工。每步独立 commit + 验证）：
+
+- **1B · 数据模型扩展** ✅**已完成（working tree，待与设计一起提交）**：`TaxonomyValue` 加 `priority_weight`/`is_terminal`，`DomainProfile` 加 `stagnation_dimension`（`#[serde(default)]` 兼容）；m006 seed 回填现有取值的权重/终态使其等价当前 planner 硬编码值；新增等价护栏测试 `seeded_weights_match_planner_hardcoded_verbatim`。lib 963/0。
+- **1D · H1 domain_signals 容器 + 写入收敛**：`AgentDecision` 加 `domain_signals: Document`，**保留 `customer_stage`/`intent_level` typed 字段为 `#[serde(default)]`（红线：删了会破 lib 基线 + state_transition_pbt）**，normalize 双向同步；gateway 手写 + shared helper 两套写实现收敛为单一遍历 `domain_signals` 的 helper，`stage_changed`/updated_at 收口。
+- **1A · H2+H7 维度列表动态化**：`decision_taxonomy.rs:38` 与 `gateway.rs:3262` 两份硬编码列表统一改读 `decision_dimension_kinds(active_profile)`。`check_value` 不动、DEFAULT 返 `["customer_stage","intent_level"]` 逐字等价。**置于 1D 之后**：维度列表消费的是 1D 引入的 `domain_signals`，先做会读到旧 typed 字段、1D 落地后还要再改一次。
+- **1C · H6 planner 漏斗内部配置化**：`stage_priority_weight`/`intent_level_weight` 改读取值字典 `priority_weight`；`TERMINAL_STAGES` 改读 `is_terminal`；stagnation dotted-key 改读 `profile.stagnation_dimension`。金标权重档位值不变（`seeded_weights_match_planner_hardcoded_verbatim` 已锁）。
+- **1E · H3+H9 prompt 语义 + conversationMode 注入**：`prompts.rs` 写死的销售域维度语义段改从 `profile.prompt_fragment` + 维度 `description` 注入（H3）；conversationMode 取值集合/判定规则 + 模式→5闸阈值映射改从 profile 注入（H9，与 H3 同文件同类改造）。DEFAULT_PROFILE 的 fragment + 四模式 + 当前映射（含 casual=PressureRisk≥5）逐字复刻。**boundary_protection 反接管硬规则不可配、继续写死**（红线）。**前置：先补一条确定性单测，断言"DEFAULT profile 注入产出的 conversationMode 取值集 + 模式→阈值映射 == 当前写死值"（现仅有概率性 real-LLM 套件兜底，是全 Phase 1 唯一等价护栏靠概率测试的子步，必须补硬护栏）。**
+- **1F · H8 运营范式可配化（§3.6）**：`OperationMode` 模型（三驱动力开关 + 阈值）落 `DomainProfile.operation_mode` + `Contact.operation_mode_override`；`resolve_operation_mode(contact, profile)` 三级回落 helper；三扫描器内部按 effective mode 决定该 contact 跑不跑本段（关 funnel = stage_stagnation 短路）；silent/commitment 阈值改「override ?? profile ?? 全局 config」。**同时把 quiet_hours 纳入 override 链（H19，见下）**。DEFAULT = 三全开 + 阈值 None 回落 config，planner 金标零变化。**纯减法/调参；新扫描器（情绪/节奏）划入 Phase 3 之后做加法**。
+- **1G · H10 假锚点清理 + C1 前置 + 性能/兼容护栏**：H10 deal_events 泛化为 `outcome_events`（零消费方低风险）；C1 给 `RuntimeParametersTyped` 加 `pressure_risk_block_at` 字段（H9 放宽情感阈值的 runtime 入口）；**确立 profile 加载走与 taxonomy 同款进程缓存 + publish 失效（避免每轮决策 N+1 DB 查询）；确立 profile 版本切换时存量 contact 的维度 fallback 兼容（planner 读 stagnation 维度时 fallback 旧 key，否则换 profile 静默冻结存量客户主动触达）。**
+
+### Phase 1.5：出厂人格 + 状态机本体配置化（H12/H13，1E 的人格延伸）
+- **H12**：默认 user soul（76 行销售顾问灵魂）+ playbook（成交准备度/复购方法论）从 `profile.prompt_fragment` 注入；DEFAULT_PROFILE 逐字复刻当前销售人格。
+- **H13**：`default_user_operation_state_machine` 从"唯一默认"降级为"销售域模板之一"；状态机定义随 DomainProfile 选择；拆 `new_contact` 初始态字面量（6 处）→ state 上标 `initial: true`；拆 `cooldown` 特例（m013）→ state 上标 `forbids_proactive: true`。配套 C2：解决 `operation_state`/`customer_stage` 双轨冗余（收敛为单一来源或强制同步）。
+- DEFAULT 等价：销售域状态机/人格逐字复刻，现有状态机金标 + real-LLM 套件零变化。
+
+### Phase 2：grounding / completeness / 知识分类配置化（H4/H14/H5/H16 + 修 D1）
+- H4 词表（`guards.rs`）、H5 五维（`catalog.rs`）从 profile 读，DEFAULT 值 = 当前硬编码值。
+- **H14**：grounding/ProductAccuracy 硬闸条件化——仅当 `claim_requires_product_knowledge` 或 profile 声明"本域有可验证事实声明"时才纳入闸；纯关系/情感 profile 旁路。
+- **H16**：chunk_type 的 product_fact 分段 prompt + answeringMode 三态（product_safe）文案下沉 profile；语义抽象为"用途角色/中性三态"。
+- 修 D1：DomainSchema 运行时接线（引导层要它生效）。
+
+### Phase 2.5：自学习回路极性配置化（H11，最深命门·最高护栏·独立 Phase）
+> H11 是数字分身能否自我学习的命门，但是**高风险"动学习逻辑"**：`is_negative_outcome` 单一真相源横向渗透知识召回排序 + negative_example 反向训练 + 请示卡死三条已落地回路，跨域语义错配会**静默污染召回且无业务指标兜底告警**。故单列、配最强护栏。
+- `is_negative_outcome` / `reaction_outcome_status` 的正负极性词表从 profile 声明（DEFAULT 逐字复刻当前 5 销售词）。
+- H17：memoryCard 结构化字段集 + memoryCandidate type 集 + intent_trajectory 维度从 profile 读（情感域可声明情绪史/纪念日槽）。
+- **强护栏**：三条回路（dynamic_confidence 召回排序 / negative_example 入队 / escalation 卡死）各自加等价性测试；DEFAULT 下知识召回排序回归基线逐条不变；先补一个"业务结果兜底指标"避免静默污染无告警。
+
+### Phase 3：引导层（核心想法，价值兑现）+ H15 + 清 C3
 - AI 对话 + 文档 → 生成候选配置 → 审核 UI → publish。
+- **H15**：经营公式（ConversionReadiness/ProductFit）+ reviewer rubric 锚点从 profile 注入；`/evaluations` 的 formulas 数组随 profile 动态化。
+- **清 C3**：`PLAYBOOK_METHODOLOGY_SYSTEM` 引导层 system prompt 去"顾问式销售"偏见（违反 §7 护栏）。
 - 前端向导。
-- 端到端验证：用一个**非销售**行业（如选定的目标行业）跑通"对话→生成→审核→激活→AI 按新维度决策"。
+- 端到端验证：用**两个非销售行业**跑通——(a) 一个有转化目标的行业（如教培）；(b) **情感陪伴**（"像男朋友一样"指令 → intimate_companion 模式 → 主动情绪价值触达 → 不被 PressureRisk 压制 → 优质回复能拿到正反馈进自学习）。
+
+### Phase 3 后（客观事实增强 + 新驱动力，做加法专题）
+- CRM 客观事实（§1.6 G2/G3/G4）：产品目录实体、订单关联 product_id、持有状态。
+- 数字分身新驱动力（§3.7）：日历祝福 scan_calendar、社交钩子 scan_external_hook（先摸清 MCP 能力边界）。
 
 ### Phase 4（可选）：清理 D2/D3 审计与图谱缺陷。
 

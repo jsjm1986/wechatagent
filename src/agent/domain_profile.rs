@@ -91,6 +91,8 @@ pub fn default_domain_profile(workspace_id: &str) -> DomainProfile {
             CoverageDimension { key: "effectClaims".to_string(), display_name: "效果声明".to_string(), required: false },
             CoverageDimension { key: "deliveryBoundary".to_string(), display_name: "交付边界".to_string(), required: false },
         ],
+        // 逐字复刻 planner 写死的停滞计时维度（customer_stage）。
+        stagnation_dimension: Some("customer_stage".to_string()),
         version: 1,
         current_version: true,
         previous_version: None,
