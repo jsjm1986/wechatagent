@@ -17,7 +17,7 @@ export function statusLabel(v?: string | null): string {
   return STATUS_LABELS[v] ?? v;
 }
 
-/// 完整性/审核状态(红线:AI 永不自动 verified,运营人工确认)
+/// 完整性/审核状态(红线:AI 永不自动 verified,须由管理员确认)
 export const INTEGRITY_STATUS_LABELS: Record<string, string> = {
   needs_review: "待确认",
   verified: "已确认",
