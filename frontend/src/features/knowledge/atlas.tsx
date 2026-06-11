@@ -11,8 +11,10 @@ import {
 } from "lucide-react";
 import { parseApiError } from "../../lib/api";
 import { useConfirm } from "../../components/ui/ConfirmDialog";
+import { useToast } from "../../components/ui/Toast";
+import { EmptyState } from "../../components/ui/EmptyState";
 import { focusChunk, type TreeChunkItem } from "./shared";
-import { wikiTypeLabel, statusLabel } from "./labels";
+import { wikiTypeLabel, statusLabel, fieldKindLabel } from "./labels";
 
 // ── P1 · ChunkGraphView · 关系图谱（SVG 原生布局，0 新依赖）─────────────
 //
@@ -485,8 +487,8 @@ export function DomainSchemaTab() {
   const [loading, setLoading] = useState(false);
   const [activating, setActivating] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [info, setInfo] = useState<string | null>(null);
   const confirm = useConfirm();
+  const toast = useToast();
 
   async function load() {
     setLoading(true);
@@ -507,23 +509,22 @@ export function DomainSchemaTab() {
     void load();
   }, []);
 
-  async function activate(schemaId: string) {
+  async function activate(schemaId: string, name: string) {
     const ok = await confirm({
-      title: "切换为当前在用 Schema？",
-      body: "切换后 AI 将按这套行业 Schema 判断字段与状态，立即影响在途会话。",
+      title: "切换为当前使用的字段表？",
+      body: `切换后，AI 将改用「${name}」来判断客户的阶段、意向和异议，正在进行的会话会立即生效。`,
       tone: "danger",
       confirmText: "确认切换",
     });
     if (!ok) return;
     setActivating(schemaId);
     setError(null);
-    setInfo(null);
     try {
       const r = await fetch(`/api/admin/domain-schemas/${encodeURIComponent(schemaId)}/activate`, {
         method: "POST",
       });
       if (!r.ok) throw await parseApiError(r);
-      setInfo(`已切换 active：${schemaId}`);
+      toast.success(`已切换为「${name}」`);
       await load();
     } catch (e: unknown) {
       setError(e instanceof Error ? e.message : String(e));
@@ -540,61 +541,88 @@ export function DomainSchemaTab() {
           {loading ? "加载中…" : "刷新"}
         </button>
         <span className="wikiHint">
-          行业 Schema 由系统管理员维护，这里可以查看并激活不同版本，不能直接编辑内容。
+          这里是 AI 判断客户用的「字段表」——它规定了 AI 在对话里会记录客户的哪些信息（如所处阶段、意向程度）。字段表由系统管理员维护，这里可以查看不同版本、切换当前使用的一套，不能直接改内容。
         </span>
       </div>
       {error ? <div className="wikiAlert error">{error}</div> : null}
-      {info ? <div className="wikiAlert info">{info}</div> : null}
       {!loading && items.length === 0 ? (
-        <div className="wikiEmpty">暂无行业 Schema 配置。</div>
+        <EmptyState
+          icon={<LibraryBig size={28} />}
+          title="还没有配置字段表"
+          hint="字段表由系统管理员在后台创建后，会显示在这里供切换。"
+        />
       ) : null}
-      <div className="wikiList">
-        {items.map((s) => (
-          <div className={s.isActive ? "wikiCard active" : "wikiCard"} key={`${s.schemaId}-${s.version}`}>
-            <div className="wikiCardHead">
-              <div>
-                <span className="wikiCardTitle">{s.name}</span>
-                <span className="wikiCardMeta">
-                  {s.schemaId} · v{s.version} · {s.fields.length} fields
-                </span>
-              </div>
-              <div className="wikiCardActions">
-                {s.isActive ? (
-                  <span className="wikiBadge active">active</span>
-                ) : (
-                  <button
-                    type="button"
-                    className="primary"
-                    onClick={() => void activate(s.schemaId)}
-                    disabled={activating === s.schemaId}
-                  >
-                    {activating === s.schemaId ? "切换中…" : "设为 active"}
-                  </button>
-                )}
-              </div>
-            </div>
-            <div className="wikiCardBody">
-              <div className="wikiFieldList">
-                {s.fields.map((f) => (
-                  <div className="wikiField" key={f.name}>
-                    <span className="wikiFieldName">{f.name}</span>
-                    <span className="wikiFieldKind">{f.kind}</span>
-                    {f.required ? <span className="wikiFieldFlag">required</span> : null}
-                    {f.allowedValues && f.allowedValues.length > 0 ? (
-                      <span className="wikiFieldFlag">enum({f.allowedValues.length})</span>
-                    ) : null}
-                  </div>
-                ))}
-              </div>
-              {Object.keys(s.aliasDict ?? {}).length > 0 ? (
-                <div className="wikiAlias">
-                  <span className="wikiAliasTitle">aliasDict</span>
-                  <code>{JSON.stringify(s.aliasDict)}</code>
+      <div className="wikiSchemaList">
+        {items.map((s) => {
+          const labelByName = new Map(s.fields.map((f) => [f.name, f.label || f.name]));
+          const aliasPairs = Object.entries(s.aliasDict ?? {}).map(
+            ([alias, canonical]) => ({
+              alias,
+              canonical: labelByName.get(String(canonical)) ?? String(canonical),
+            }),
+          );
+          return (
+            <div className={s.isActive ? "wikiSchemaCard active" : "wikiSchemaCard"} key={`${s.schemaId}-${s.version}`}>
+              <div className="wikiSchemaHead">
+                <div className="wikiSchemaTitleWrap">
+                  <span className="wikiSchemaTitle">{s.name}</span>
+                  <span className="wikiSchemaMeta">
+                    第 {s.version} 版 · {s.fields.length} 个字段
+                  </span>
                 </div>
-              ) : null}
+                <div className="wikiSchemaActions">
+                  {s.isActive ? (
+                    <span className="wikiSchemaActiveBadge">
+                      <CheckCircle2 size={13} /> 使用中
+                    </span>
+                  ) : (
+                    <button
+                      type="button"
+                      className="primary"
+                      onClick={() => void activate(s.schemaId, s.name)}
+                      disabled={activating === s.schemaId}
+                    >
+                      {activating === s.schemaId ? "切换中…" : "设为当前使用"}
+                    </button>
+                  )}
+                </div>
+              </div>
+              <div className="wikiSchemaBody">
+                <div className="wikiSchemaSectionTitle">AI 会记录这些信息</div>
+                <div className="wikiSchemaFields">
+                  {s.fields.map((f) => (
+                    <div className="wikiSchemaField" key={f.name}>
+                      <div className="wikiSchemaFieldHead">
+                        <span className="wikiSchemaFieldName">{f.label || f.name}</span>
+                        <span className="wikiSchemaFieldKind">{fieldKindLabel(f.kind)}</span>
+                        {f.required ? <span className="wikiSchemaFieldReq">必填</span> : null}
+                      </div>
+                      {f.allowedValues && f.allowedValues.length > 0 ? (
+                        <div className="wikiSchemaFieldValues">
+                          {f.allowedValues.map((v) => (
+                            <span className="wikiSchemaValueChip" key={v}>{v}</span>
+                          ))}
+                        </div>
+                      ) : null}
+                    </div>
+                  ))}
+                </div>
+                {aliasPairs.length > 0 ? (
+                  <>
+                    <div className="wikiSchemaSectionTitle">同义词识别</div>
+                    <div className="wikiSchemaAlias">
+                      {aliasPairs.map((p) => (
+                        <span className="wikiSchemaAliasPair" key={p.alias}>
+                          客户说「{p.alias}」→ 记到「{p.canonical}」
+                        </span>
+                      ))}
+                    </div>
+                  </>
+                ) : null}
+              </div>
             </div>
-          </div>
-        ))}
+          );
+        })}
       </div>
     </div>
   );
@@ -885,10 +913,15 @@ interface PublishBarProps {
 function PublishBar({ resourceKind, id, onChange }: PublishBarProps) {
   const [busy, setBusy] = useState<string>("");
   const [error, setError] = useState<string | null>(null);
-  const [info, setInfo] = useState<string | null>(null);
   const confirm = useConfirm();
+  const toast = useToast();
 
   async function call(action: "publish" | "rollout" | "rollback") {
+    const successText: Record<typeof action, string> = {
+      publish: "已发布新版",
+      rollout: "已发布给全部客户",
+      rollback: "已回退到上一版本",
+    };
     if (action === "publish") {
       const ok = await confirm({
         title: "发布新版？",
@@ -917,14 +950,13 @@ function PublishBar({ resourceKind, id, onChange }: PublishBarProps) {
     }
     setBusy(action);
     setError(null);
-    setInfo(null);
     try {
       const r = await fetch(
         `/api/admin/${resourceKind}/${encodeURIComponent(id)}/${action}`,
         { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" }
       );
       if (!r.ok) throw await parseApiError(r);
-      setInfo(`${action} ok`);
+      toast.success(successText[action]);
       onChange?.();
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
@@ -954,7 +986,6 @@ function PublishBar({ resourceKind, id, onChange }: PublishBarProps) {
       >
         <Undo2 size={12} /> {busy === "rollback" ? "回退中…" : "回退上版"}
       </button>
-      {info ? <span className="wikiPublishBarInfo">{info}</span> : null}
       {error ? <span className="wikiPublishBarError">{error}</span> : null}
     </div>
   );

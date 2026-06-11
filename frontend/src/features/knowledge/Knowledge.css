@@ -206,49 +206,132 @@
     flex-direction: column;
     gap: 8px;
   }
-  .knowledgeWiki .wikiFieldList {
+  /* 行业字段表 DomainSchemaTab —— 面向运营的可读卡片 */
+  .knowledgeWiki .wikiSchemaList {
     display: flex;
-    flex-wrap: wrap;
-    gap: 6px;
+    flex-direction: column;
+    gap: 12px;
   }
-  .knowledgeWiki .wikiField {
-    display: inline-flex;
-    align-items: center;
-    gap: 6px;
-    padding: 4px 8px;
-    border-radius: 4px;
-    background: var(--surface-page);
-    font-size: 12px;
-    font-family: ui-monospace, "SFMono-Regular", Menlo, monospace;
+  .knowledgeWiki .wikiSchemaCard {
+    border: 1px solid var(--hairline);
+    border-radius: 10px;
+    background: var(--surface-card);
+    padding: 16px 18px;
   }
-  .knowledgeWiki .wikiFieldName {
+  .knowledgeWiki .wikiSchemaCard.active {
+    border-color: var(--color-running);
+    box-shadow: 0 0 0 1px var(--color-running) inset;
+  }
+  .knowledgeWiki .wikiSchemaHead {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 12px;
+    margin-bottom: 14px;
+  }
+  .knowledgeWiki .wikiSchemaTitleWrap {
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+    min-width: 0;
+  }
+  .knowledgeWiki .wikiSchemaTitle {
+    font-weight: 600;
+    font-size: 15px;
     color: var(--ink-1);
   }
-  .knowledgeWiki .wikiFieldKind {
-    color: #4f5b75;
-    font-style: italic;
-  }
-  .knowledgeWiki .wikiFieldFlag {
-    color: var(--color-held);
-    font-size: 11px;
-  }
-  .knowledgeWiki .wikiAlias {
-    margin-top: 8px;
-    display: flex;
-    gap: 8px;
-    align-items: flex-start;
+  .knowledgeWiki .wikiSchemaMeta {
+    color: var(--ink-3);
     font-size: 12px;
   }
-  .knowledgeWiki .wikiAlias code {
-    font-family: ui-monospace, "SFMono-Regular", Menlo, monospace;
-    background: var(--surface-page);
-    padding: 2px 6px;
-    border-radius: 4px;
-    word-break: break-all;
+  .knowledgeWiki .wikiSchemaActions {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-shrink: 0;
   }
-  .knowledgeWiki .wikiAliasTitle {
+  .knowledgeWiki .wikiSchemaActiveBadge {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    background: var(--fill-running);
+    color: var(--color-running);
+    padding: 4px 10px;
+    border-radius: 12px;
+    font-size: 12px;
+    font-weight: 500;
+  }
+  .knowledgeWiki .wikiSchemaBody {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }
+  .knowledgeWiki .wikiSchemaSectionTitle {
+    font-size: 12px;
     color: var(--ink-3);
-    white-space: nowrap;
+    margin-top: 4px;
+  }
+  .knowledgeWiki .wikiSchemaFields {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }
+  .knowledgeWiki .wikiSchemaField {
+    border: 1px solid var(--hairline);
+    border-radius: 8px;
+    background: var(--surface-page);
+    padding: 8px 10px;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+  .knowledgeWiki .wikiSchemaFieldHead {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+  }
+  .knowledgeWiki .wikiSchemaFieldName {
+    font-weight: 500;
+    font-size: 13px;
+    color: var(--ink-1);
+  }
+  .knowledgeWiki .wikiSchemaFieldKind {
+    font-size: 11px;
+    color: var(--ink-3);
+    background: var(--surface-card);
+    border: 1px solid var(--hairline);
+    border-radius: 5px;
+    padding: 1px 6px;
+  }
+  .knowledgeWiki .wikiSchemaFieldReq {
+    font-size: 11px;
+    color: var(--color-blocked);
+    background: var(--fill-blocked);
+    border-radius: 5px;
+    padding: 1px 6px;
+  }
+  .knowledgeWiki .wikiSchemaFieldValues {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 5px;
+  }
+  .knowledgeWiki .wikiSchemaValueChip {
+    font-size: 11px;
+    color: var(--ink-2);
+    background: var(--surface-card);
+    border: 1px solid var(--hairline);
+    border-radius: 5px;
+    padding: 1px 7px;
+  }
+  .knowledgeWiki .wikiSchemaAlias {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+  }
+  .knowledgeWiki .wikiSchemaAliasPair {
+    font-size: 12px;
+    color: var(--ink-2);
   }
   /* GapSignalsTab */
   .knowledgeWiki .wikiSignalList {
