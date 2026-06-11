@@ -6,6 +6,10 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Always reply to the user in Chinese (中文). This applies to all conversational responses, explanations, summaries, and status updates. Code, identifiers, commit messages, and file contents follow their existing conventions.
 
+## Subagents
+
+When spawning subagents (the Agent / Task tool), ALWAYS pass `model: "opus"`. Subagents must run on the same Opus-tier model as the main session — never let them fall back to a smaller/cheaper model. This applies to every agent type (Explore, general-purpose, etc.) without exception.
+
 ## Project
 
 WechatAgent is a long-running WeChat private-domain operations AI agent system built as a single Rust (Axum) backend + React admin, talking to MongoDB, an external MCP server (for WeChat account/contact/send tooling), and a DeepSeek/OpenAI-compatible LLM.
