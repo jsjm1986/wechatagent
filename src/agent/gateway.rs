@@ -968,17 +968,27 @@ async fn run_user_operation_gateway_inner(
         // 30s 后 find_or_load 自动 reload，防 cache 永远 stale。任何 IO 故障被
         // find_or_load 内部 log 后吞掉。
         cache.find_or_load(&state.db).await;
+        // universal-domain-adaptation H7：校验维度集合改读 active DomainProfile。
+        // DEFAULT 销售域返回 ["customer_stage","intent_level"] 逐字等价。
+        let active_profile = crate::agent::domain_profile::load_active_domain_profile(
+            &state.db,
+            &contact.workspace_id,
+        )
+        .await;
+        let dimension_kinds =
+            crate::agent::domain_profile::decision_dimension_kinds(&active_profile);
         let outcome = compute_taxonomy_guard_outcome(
-            final_decision.customer_stage.as_deref(),
-            final_decision.intent_level.as_deref(),
+            &final_decision,
+            &dimension_kinds,
             &contact.account_id,
             &cache,
         );
-        if let Some(canonical) = outcome.customer_stage_rewrite.clone() {
-            final_decision.customer_stage = Some(canonical);
-        }
-        if let Some(canonical) = outcome.intent_level_rewrite.clone() {
-            final_decision.intent_level = Some(canonical);
+        for (kind, canonical) in &outcome.rewrites {
+            crate::agent::domain_signals::set_dimension(
+                &mut final_decision,
+                kind,
+                canonical.clone(),
+            );
         }
         for risk in &outcome.risks {
             if !review.risks.iter().any(|r| r == risk) {
@@ -3239,40 +3249,43 @@ pub(crate) fn follow_up_trigger_message_text(kind: &str, task_content: &str) -> 
     }
 }
 
-/// Phase A / A3：taxonomy 软闸的纯逻辑——给定 LLM 输出的 customer_stage / intent_level
-/// 与 [`TaxonomyCache`]，决定要做的字段改写、要附加的 risks 和要 upsert 的候选。
+/// Phase A / A3：taxonomy 软闸的纯逻辑——给定 active profile 的决策维度集合、LLM
+/// 输出的 [`AgentDecision`] 与 [`TaxonomyCache`]，决定要做的字段改写、要附加的 risks
+/// 和要 upsert 的候选。
 ///
 /// gateway 主路径只负责把 outcome 应用到 `final_decision` / `review.risks` 并执行
 /// `upsert_candidate` 的 IO；判定本身可以在 lib-level 测，避免靠 #[ignore] 集成测试
 /// 来保证"未知值真的进了候选 + 不阻塞 run"的硬契约。
+///
+/// universal-domain-adaptation H7：维度集合不再写死两维，由调用方从 active
+/// DomainProfile 取（`decision_dimension_kinds`），读写经 `domain_signals` 访问器。
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(crate) struct TaxonomyGuardOutcome {
-    pub customer_stage_rewrite: Option<String>,
-    pub intent_level_rewrite: Option<String>,
+    /// alias 命中需写回的 `(kind, canonical)` 对。调用方按 kind 应用到对应维度。
+    pub rewrites: Vec<(String, String)>,
     pub risks: Vec<String>,
     /// 待写入 `taxonomy_candidates` 的 `(kind, raw_value)` 对。空 / 仅空格的 raw 已被过滤。
     pub candidate_writes: Vec<(String, String)>,
 }
 
 pub(crate) fn compute_taxonomy_guard_outcome(
-    customer_stage: Option<&str>,
-    intent_level: Option<&str>,
+    decision: &AgentDecision,
+    dimension_kinds: &[String],
     scope_account_id: &str,
     cache: &super::taxonomy::TaxonomyCache,
 ) -> TaxonomyGuardOutcome {
     let mut outcome = TaxonomyGuardOutcome::default();
-    for (kind, raw_opt) in [("customer_stage", customer_stage), ("intent_level", intent_level)] {
-        let Some(raw) = raw_opt.map(str::trim).filter(|s| !s.is_empty()) else {
+    for kind in dimension_kinds {
+        let Some(raw) = super::domain_signals::get_dimension(decision, kind)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        else {
             continue;
         };
         match taxonomy_check_value(kind, raw, scope_account_id, cache) {
             TaxonomyMatch::Active => {}
             TaxonomyMatch::AliasActive(canonical) => {
-                if kind == "customer_stage" {
-                    outcome.customer_stage_rewrite = Some(canonical);
-                } else if kind == "intent_level" {
-                    outcome.intent_level_rewrite = Some(canonical);
-                }
+                outcome.rewrites.push((kind.clone(), canonical));
                 outcome.risks.push(format!("taxonomy_alias_rewritten:{kind}"));
             }
             TaxonomyMatch::Deprecated => {
@@ -3282,7 +3295,7 @@ pub(crate) fn compute_taxonomy_guard_outcome(
                 outcome.risks.push(format!("taxonomy_candidate_new:{kind}"));
                 outcome
                     .candidate_writes
-                    .push((kind.to_string(), raw.to_string()));
+                    .push((kind.clone(), raw.to_string()));
             }
         }
     }
@@ -3444,13 +3457,42 @@ mod tests {
         taxonomy_cache_for_tests(entries)
     }
 
+    /// 测试桥：保留旧两维调用风格（customer_stage / intent_level），内部构造
+    /// AgentDecision + 销售域两维 dimension_kinds 后调新签名。等价护栏：DEFAULT
+    /// 销售域行为不变。
+    fn guard(
+        customer_stage: Option<&str>,
+        intent_level: Option<&str>,
+        scope: &str,
+        cache: &TaxonomyCache,
+    ) -> TaxonomyGuardOutcome {
+        let mut decision = AgentDecision::default();
+        if let Some(s) = customer_stage {
+            decision.customer_stage = Some(s.to_string());
+        }
+        if let Some(i) = intent_level {
+            decision.intent_level = Some(i.to_string());
+        }
+        let dims = vec!["customer_stage".to_string(), "intent_level".to_string()];
+        compute_taxonomy_guard_outcome(&decision, &dims, scope, cache)
+    }
+
+    /// 取某维度的 rewrite canonical（替代旧的 customer_stage_rewrite/intent_level_rewrite 字段）。
+    fn rewrite_of<'a>(outcome: &'a TaxonomyGuardOutcome, kind: &str) -> Option<&'a str> {
+        outcome
+            .rewrites
+            .iter()
+            .find(|(k, _)| k == kind)
+            .map(|(_, v)| v.as_str())
+    }
+
     #[test]
     fn taxonomy_outcome_empty_when_both_kinds_missing() {
         // 无任何 LLM 维度输出 → outcome 完全为空，不会乱写候选。
         let cache = cache_with(vec![]);
-        let out = compute_taxonomy_guard_outcome(None, None, "acct-1", &cache);
-        assert!(out.customer_stage_rewrite.is_none());
-        assert!(out.intent_level_rewrite.is_none());
+        let out = guard(None, None, "acct-1", &cache);
+        assert!(rewrite_of(&out, "customer_stage").is_none());
+        assert!(rewrite_of(&out, "intent_level").is_none());
         assert!(out.risks.is_empty());
         assert!(out.candidate_writes.is_empty());
     }
@@ -3459,7 +3501,7 @@ mod tests {
     fn taxonomy_outcome_skips_blank_inputs() {
         // 空白字符串 trim 后等同于 None，不应触发 CandidateNew。
         let cache = cache_with(vec![]);
-        let out = compute_taxonomy_guard_outcome(Some("   "), Some(""), "acct-1", &cache);
+        let out = guard(Some("   "), Some(""), "acct-1", &cache);
         assert!(out.candidate_writes.is_empty());
         assert!(out.risks.is_empty());
     }
@@ -3475,8 +3517,8 @@ mod tests {
             "active",
         )]);
         let out =
-            compute_taxonomy_guard_outcome(Some("first_contact"), None, "acct-1", &cache);
-        assert!(out.customer_stage_rewrite.is_none());
+            guard(Some("first_contact"), None, "acct-1", &cache);
+        assert!(rewrite_of(&out, "customer_stage").is_none());
         assert!(out.risks.is_empty());
         assert!(out.candidate_writes.is_empty());
     }
@@ -3491,9 +3533,9 @@ mod tests {
             &["新客", "刚加好友"],
             "active",
         )]);
-        let out = compute_taxonomy_guard_outcome(Some("新客"), None, "acct-1", &cache);
+        let out = guard(Some("新客"), None, "acct-1", &cache);
         assert_eq!(
-            out.customer_stage_rewrite.as_deref(),
+            rewrite_of(&out, "customer_stage"),
             Some("first_contact"),
             "alias 应被重写为 canonical_id"
         );
@@ -3521,8 +3563,8 @@ mod tests {
             &[],
             "deprecated",
         )]);
-        let out = compute_taxonomy_guard_outcome(None, Some("lukewarm"), "acct-1", &cache);
-        assert!(out.intent_level_rewrite.is_none());
+        let out = guard(None, Some("lukewarm"), "acct-1", &cache);
+        assert!(rewrite_of(&out, "intent_level").is_none());
         assert!(out
             .risks
             .iter()
@@ -3544,7 +3586,7 @@ mod tests {
             &[],
             "active",
         )]);
-        let out = compute_taxonomy_guard_outcome(
+        let out = guard(
             Some("完全没听过的阶段"),
             None,
             "acct-1",
@@ -3561,7 +3603,7 @@ mod tests {
             vec![("customer_stage".to_string(), "完全没听过的阶段".to_string())],
             "未知值必须进 candidate_writes，admin 才能在后台审核"
         );
-        assert!(out.customer_stage_rewrite.is_none());
+        assert!(rewrite_of(&out, "customer_stage").is_none());
     }
 
     #[test]
@@ -3576,17 +3618,17 @@ mod tests {
             &["新客"],
             "active",
         )]);
-        let out = compute_taxonomy_guard_outcome(
+        let out = guard(
             Some("新客"),
             Some("never_seen_intent"),
             "acct-1",
             &cache,
         );
         assert_eq!(
-            out.customer_stage_rewrite.as_deref(),
+            rewrite_of(&out, "customer_stage"),
             Some("first_contact")
         );
-        assert!(out.intent_level_rewrite.is_none());
+        assert!(rewrite_of(&out, "intent_level").is_none());
         let risks: Vec<&str> = out.risks.iter().map(String::as_str).collect();
         assert!(risks.contains(&"taxonomy_alias_rewritten:customer_stage"));
         assert!(risks.contains(&"taxonomy_candidate_new:intent_level"));
@@ -3616,9 +3658,9 @@ mod tests {
             ),
         ]);
         let out =
-            compute_taxonomy_guard_outcome(Some("首单 VIP"), None, "acct-1", &cache);
+            guard(Some("首单 VIP"), None, "acct-1", &cache);
         assert_eq!(
-            out.customer_stage_rewrite.as_deref(),
+            rewrite_of(&out, "customer_stage"),
             Some("premium_first_contact"),
             "应命中 account scope 的 alias，而非回落 global"
         );
