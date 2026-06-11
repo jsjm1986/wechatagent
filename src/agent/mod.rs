@@ -29,6 +29,7 @@ mod decision;
 mod decision_taxonomy;
 pub mod domain;
 pub(crate) mod domain_profile;
+pub(crate) mod domain_signals;
 pub mod escalation;
 mod gateway;
 mod guards;

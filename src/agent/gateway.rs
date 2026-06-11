@@ -2454,25 +2454,27 @@ async fn apply_agent_updates(
         let merged = merge_tags_union_capped(&contact.tags, &decision.tags, TAGS_PER_MESSAGE_CAP);
         set_doc.insert("tags", to_bson_array(&merged));
     }
-    if let Some(value) = non_empty_option(&decision.customer_stage) {
-        // 旧 customer_stage 字段已删除，统一写入 domain_attributes 容器。用 dotted-key
-        // 字段级更新（不 clone 整个子文档再整体替换），避免与下方 intent_level /
-        // escalation 段互相覆盖，也避免 admin 写与 AI 写并发时整体替换丢 key。
-        // stage 变化时刷新 customer_stage_updated_at（planner stagnation 计时器依赖）。
+    // universal-domain-adaptation H1 / 1D：先把 typed 维度镜像进 domain_signals
+    // 容器（销售域 = customer_stage/intent_level，陪伴域可带任意维度），再经统一写入
+    // 内核落库。stage_changed 仍按「新 stage vs contact 现有 stage」判定，刷新
+    // planner stagnation 计时器。decision 是 &，本地 clone 一份做 normalize。
+    let mut signals_decision = decision.clone();
+    crate::agent::domain_signals::normalize_domain_signals(&mut signals_decision);
+    if !signals_decision.domain_signals.is_empty() {
         let prev_stage = contact
             .domain_attributes
             .as_ref()
             .and_then(|d| d.get_str("customer_stage").ok());
-        let stage_changed = prev_stage != Some(value.as_str());
-        set_doc.insert("domain_attributes.customer_stage", value);
-        if stage_changed {
-            set_doc.insert("domain_attributes.customer_stage_updated_at", DateTime::now());
+        let new_stage = signals_decision.domain_signals.get_str("customer_stage").ok();
+        let stage_changed = new_stage.is_some() && prev_stage != new_stage;
+        let wrote = crate::agent::domain_signals::insert_domain_signal_values(
+            &mut set_doc,
+            &signals_decision.domain_signals,
+            stage_changed,
+        );
+        if wrote {
+            set_doc.insert("domain_attributes_updated_at", DateTime::now());
         }
-        set_doc.insert("domain_attributes_updated_at", DateTime::now());
-    }
-    if let Some(value) = non_empty_option(&decision.intent_level) {
-        set_doc.insert("domain_attributes.intent_level", value);
-        set_doc.insert("domain_attributes_updated_at", DateTime::now());
     }
     // 请示触发：把"等待领导决策"标记写进客户 domain_attributes（admin 可观测）。
     // key 用 AWAITING_PRINCIPAL_DECISION_ATTR 常量，与 relay 完成时 clear_awaiting_principal_state 的 $unset 同一字符串。

@@ -98,6 +98,16 @@ pub struct AgentDecision {
     pub tags: Vec<String>,
     pub customer_stage: Option<String>,
     pub intent_level: Option<String>,
+    /// universal-domain-adaptation H1：对维度名零假设的开放画像信号容器。
+    ///
+    /// 销售域只有 `customer_stage` / `intent_level` 两维（仍保留为上面的 typed
+    /// 字段，删了会破 lib 基线 + state_transition_pbt）；陪伴/同行等非销售域可携带
+    /// `relationship_closeness` / `emotional_state` 等任意维度。
+    /// [`super::domain_signals::normalize_domain_signals`] 在 typed 字段与本容器
+    /// 之间做双向同步，落库经由统一写入内核。DEFAULT 销售域里 LLM 只输出 typed、
+    /// 不输出 `domainSignals`，故本容器由 normalize 从 typed 镜像得来——行为不变。
+    #[serde(default)]
+    pub domain_signals: Document,
     pub last_commitment: Option<String>,
     /// PR-D：结构化承诺（带可选 dueAt）。promote 时从 RawAgentDecision.commitment 透传。
     pub commitment: Option<CommitmentDecision>,
@@ -220,6 +230,7 @@ impl Default for AgentDecision {
             tags: Vec::new(),
             customer_stage: None,
             intent_level: None,
+            domain_signals: Document::new(),
             last_commitment: None,
             commitment: None,
             follow_up_policy: None,
