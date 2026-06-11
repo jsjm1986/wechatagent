@@ -77,63 +77,83 @@ pub(super) fn default_taxonomy_seed_entries(now: DateTime) -> Vec<TaxonomyEntry>
     let mut out = Vec::new();
 
     // ── customer_stage（9 项，对齐 default_user_operation_state_machine）──
-    let customer_stages: &[(&str, &str, &str, &[&str])] = &[
+    // 元组末两列 = (priority_weight, is_terminal)，逐字复刻 planner::stage_priority_weight
+    // 的 match 分支与 planner::TERMINAL_STAGES，使 H6 配置化后 DEFAULT 行为零变化。
+    let customer_stages: &[(&str, &str, &str, &[&str], i32, bool)] = &[
         (
             "new_contact",
             "初始了解",
             "建立基本上下文，避免过早推销。",
             &["陌生接触", "新客", "first_contact", "刚加好友"],
+            20,
+            false,
         ),
         (
             "relationship_building",
             "关系建立",
             "通过具体帮助和稳定回应建立信任。",
             &["初步信任", "关系培养", "trust_building"],
+            40,
+            false,
         ),
         (
             "need_discovery",
             "需求探索",
             "理解真实需求、痛点、动机、阻力和决策方式。",
             &["明确需求", "需求挖掘", "discovery"],
+            60,
+            false,
         ),
         (
             "solution_fit",
             "方案匹配",
             "基于产品知识给出真实、可验证的匹配建议。",
             &["方案评估", "方案推荐", "solution_evaluation"],
+            80,
+            false,
         ),
         (
             "objection_handling",
             "异议处理",
             "识别顾虑，降低风险感，不强压成交。",
             &["顾虑处理", "objection"],
+            80,
+            false,
         ),
         (
             "commitment_followup",
             "承诺跟进",
             "围绕已形成的小承诺做低压推进。",
             &["成交推进", "推进成交", "closing"],
+            100,
+            false,
         ),
         (
             "customer_success",
             "客户维护",
             "维护成交后关系，发现复购、转介绍和服务风险。",
             &["交付维护", "复购转介绍", "post_sale"],
+            10,
+            true,
         ),
         (
             "cooldown",
             "风险冷却",
             "降低打扰和压迫，等待更合适的触达窗口。",
             &["冷却", "暂停推进"],
+            10,
+            true,
         ),
         (
             "dormant_reactivation",
             "沉默唤醒",
             "基于真实价值或明确理由做低频唤醒。",
             &["唤醒", "沉默用户唤醒"],
+            10,
+            true,
         ),
     ];
-    for (id, display, desc, aliases) in customer_stages {
+    for (id, display, desc, aliases, weight, terminal) in customer_stages {
         out.push(TaxonomyEntry {
             id: None,
             scope: "global".to_string(),
@@ -144,6 +164,8 @@ pub(super) fn default_taxonomy_seed_entries(now: DateTime) -> Vec<TaxonomyEntry>
                 description: (*desc).to_string(),
                 aliases: aliases.iter().map(|s| (*s).to_string()).collect(),
                 status: "active".to_string(),
+                priority_weight: Some(*weight),
+                is_terminal: *terminal,
             },
             updated_at: now,
             version: 1,
@@ -154,27 +176,31 @@ pub(super) fn default_taxonomy_seed_entries(now: DateTime) -> Vec<TaxonomyEntry>
     }
 
     // ── intent_level（3 档）──
-    let intent_levels: &[(&str, &str, &str, &[&str])] = &[
+    // 末列 = priority_weight，逐字复刻 planner::intent_level_weight（均非终态）。
+    let intent_levels: &[(&str, &str, &str, &[&str], i32)] = &[
         (
             "high",
             "高意向",
             "主动描述问题、询问方案/价格/周期、愿意提供资料或约时间。",
             &["高", "high_intent", "强意向"],
+            80,
         ),
         (
             "medium",
             "中意向",
             "有兴趣但信息不足，需要继续探索动机与匹配。",
             &["中", "medium_intent", "中等意向"],
+            50,
         ),
         (
             "low",
             "低意向",
             "寒暄、围观、无明确问题或多次回避，时机不成熟。",
             &["低", "low_intent", "弱意向", "无明显意向"],
+            20,
         ),
     ];
-    for (id, display, desc, aliases) in intent_levels {
+    for (id, display, desc, aliases, weight) in intent_levels {
         out.push(TaxonomyEntry {
             id: None,
             scope: "global".to_string(),
@@ -185,6 +211,8 @@ pub(super) fn default_taxonomy_seed_entries(now: DateTime) -> Vec<TaxonomyEntry>
                 description: (*desc).to_string(),
                 aliases: aliases.iter().map(|s| (*s).to_string()).collect(),
                 status: "active".to_string(),
+                priority_weight: Some(*weight),
+                is_terminal: false,
             },
             updated_at: now,
             version: 1,
@@ -250,6 +278,9 @@ pub(super) fn default_taxonomy_seed_entries(now: DateTime) -> Vec<TaxonomyEntry>
                 description: (*desc).to_string(),
                 aliases: aliases.iter().map(|s| (*s).to_string()).collect(),
                 status: "active".to_string(),
+                // objection_type 不参与 planner 漏斗排序，无权重/终态语义。
+                priority_weight: None,
+                is_terminal: false,
             },
             updated_at: now,
             version: 1,
@@ -370,6 +401,61 @@ mod tests {
                  当前 alias 列表：{:?}",
                 term,
                 aliases
+            );
+        }
+    }
+
+    /// universal-domain-adaptation H6 护栏：m006 回填到 customer_stage / intent_level
+    /// 取值上的 `priority_weight` / `is_terminal` 必须与 `planner` 当前写死的
+    /// `stage_priority_weight` / `intent_level_weight` / `TERMINAL_STAGES` **逐字相等**。
+    ///
+    /// Phase 1C 把 planner 从「match 写死」切到「读取值字典」后，这条测试保证
+    /// DEFAULT 行为零变化——任一侧漂移立即变红。
+    #[test]
+    fn seeded_weights_match_planner_hardcoded_verbatim() {
+        let now = DateTime::now();
+        let entries = default_taxonomy_seed_entries(now);
+
+        // planner::TERMINAL_STAGES 是模块私有 const，这里硬编码同一金标三元组。
+        let terminal = ["customer_success", "cooldown", "dormant_reactivation"];
+
+        for entry in entries.iter().filter(|e| e.kind == "customer_stage") {
+            let id = entry.value.id.as_str();
+            assert_eq!(
+                entry.value.priority_weight,
+                Some(crate::planner::stage_priority_weight(Some(id))),
+                "customer_stage \"{}\" 的 priority_weight 必须等于 planner::stage_priority_weight",
+                id
+            );
+            assert_eq!(
+                entry.value.is_terminal,
+                terminal.contains(&id),
+                "customer_stage \"{}\" 的 is_terminal 必须与 TERMINAL_STAGES 一致",
+                id
+            );
+        }
+
+        for entry in entries.iter().filter(|e| e.kind == "intent_level") {
+            let id = entry.value.id.as_str();
+            assert_eq!(
+                entry.value.priority_weight,
+                Some(crate::planner::intent_level_weight(Some(id))),
+                "intent_level \"{}\" 的 priority_weight 必须等于 planner::intent_level_weight",
+                id
+            );
+            assert!(
+                !entry.value.is_terminal,
+                "intent_level 取值不应为终态：\"{}\"",
+                id
+            );
+        }
+
+        // objection_type 不参与漏斗排序，权重应为 None。
+        for entry in entries.iter().filter(|e| e.kind == "objection_type") {
+            assert_eq!(
+                entry.value.priority_weight, None,
+                "objection_type \"{}\" 不应有 priority_weight",
+                entry.value.id
             );
         }
     }

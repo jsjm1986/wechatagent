@@ -3427,6 +3427,8 @@ mod tests {
                 description: String::new(),
                 aliases: aliases.iter().map(|s| s.to_string()).collect(),
                 status: status.to_string(),
+                priority_weight: None,
+                is_terminal: false,
             },
             updated_at: mongodb::bson::DateTime::now(),
             version: 1,

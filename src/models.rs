@@ -1207,6 +1207,11 @@ pub struct DomainProfile {
     /// completeness 审计维度（替代 `catalog.rs` 写死的五维 coverage）。
     #[serde(default)]
     pub coverage_dimensions: Vec<CoverageDimension>,
+    /// universal-domain-adaptation H6：声明哪个画像维度驱动 planner 停滞计时
+    /// （替代写死的 `customer_stage`）。`None` 时 planner fallback 到内置默认
+    /// `customer_stage`（DEFAULT_PROFILE 下即如此，零行为变化）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stagnation_dimension: Option<String>,
     /// E5-T1 多版本灰度：同 `(workspace_id, profile_id)` 下 `version` 单调递增。
     #[serde(default = "default_version_one")]
     pub version: i32,
@@ -1608,6 +1613,15 @@ pub struct TaxonomyValue {
     pub aliases: Vec<String>,
     /// `"active"` | `"deprecated"`。
     pub status: String,
+    /// universal-domain-adaptation H6：该取值的跟进优先级权重。planner 排序读它替代
+    /// 写死的 `stage_priority_weight` / `intent_level_weight` match 分支。`None` 时
+    /// planner fallback 到内置默认（保持旧库零行为变化）。
+    #[serde(default)]
+    pub priority_weight: Option<i32>,
+    /// universal-domain-adaptation H6：是否终态（成交后维护 / 冷却 / 沉默等）。planner
+    /// stagnation 段读它替代写死的 `TERMINAL_STAGES` 常量。旧库默认 `false`。
+    #[serde(default)]
+    pub is_terminal: bool,
 }
 
 /// agent-autonomy-loop W0：`taxonomy_candidates` 集合占位结构。
@@ -3803,6 +3817,8 @@ mod typed_tests {
                 description: "首次建立联系，尚未深入沟通".to_string(),
                 aliases: vec!["新客".to_string(), "first-contact".to_string()],
                 status: "active".to_string(),
+                priority_weight: None,
+                is_terminal: false,
             },
             updated_at: now,
             version: 1,
