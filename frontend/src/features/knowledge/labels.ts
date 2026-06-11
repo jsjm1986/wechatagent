@@ -238,3 +238,16 @@ export function taskStatusLabel(v?: string | null): string {
   if (!v) return "—";
   return TASK_STATUS_LABELS[v] ?? v;
 }
+
+/// 行业 Schema 字段类型(DomainField.kind 封闭枚举 string|enum|number|date|reference)
+export const FIELD_KIND_LABELS: Record<string, string> = {
+  string: "文本",
+  enum: "固定选项",
+  number: "数字",
+  date: "日期",
+  reference: "关联条目",
+};
+export function fieldKindLabel(v?: string | null): string {
+  if (!v) return "—";
+  return FIELD_KIND_LABELS[v] ?? v;
+}
