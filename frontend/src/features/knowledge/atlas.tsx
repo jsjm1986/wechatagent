@@ -540,7 +540,7 @@ export function DomainSchemaTab() {
           {loading ? "加载中…" : "刷新"}
         </button>
         <span className="wikiHint">
-          新建 / 编辑 schema 走后端 API（POST/PUT /api/admin/domain-schemas）；UI 仅做激活与只读浏览。
+          行业 Schema 由系统管理员维护，这里可以查看并激活不同版本，不能直接编辑内容。
         </span>
       </div>
       {error ? <div className="wikiAlert error">{error}</div> : null}
