@@ -80,6 +80,34 @@ fn set_typed_dim(decision: &mut AgentDecision, dim: &str, value: String) {
     }
 }
 
+/// 按维度 `kind` 读取 `AgentDecision` 当前取值（H2/H7 维度列表动态化的统一访问器）。
+///
+/// 销售域两维（`customer_stage`/`intent_level`）从 typed 字段读（它们是 DEFAULT，
+/// LLM 以 typed JSON 键输出）；其它任意维度从 `domain_signals` 容器读。这样
+/// taxonomy 校验循环可以对 `decision_dimension_kinds(profile)` 给出的任意维度集
+/// 工作，而不再写死两维。
+pub(crate) fn get_dimension<'a>(decision: &'a AgentDecision, kind: &str) -> Option<&'a str> {
+    match kind {
+        "customer_stage" => decision.customer_stage.as_deref(),
+        "intent_level" => decision.intent_level.as_deref(),
+        other => decision.domain_signals.get_str(other).ok(),
+    }
+}
+
+/// 按维度 `kind` 写回 `AgentDecision`（alias→canonical 改写时用）。
+///
+/// 销售域两维写 typed 字段（随后由 [`normalize_domain_signals`] 镜像进容器）；
+/// 其它维度直接写容器。
+pub(crate) fn set_dimension(decision: &mut AgentDecision, kind: &str, value: String) {
+    match kind {
+        "customer_stage" => decision.customer_stage = Some(value),
+        "intent_level" => decision.intent_level = Some(value),
+        other => {
+            decision.domain_signals.insert(other.to_string(), value);
+        }
+    }
+}
+
 /// 统一的画像维度写入内核：把 `signals` 中**每个非空字符串维度**以
 /// `domain_attributes.<key>` dotted-key 写进 `set_doc`。
 ///

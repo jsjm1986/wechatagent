@@ -543,15 +543,22 @@ pub(crate) async fn decide_reply_with_promote(
     // `finalize_review_for_send` 阶段消费。
     let raw: RawAgentDecision = serde_json::from_value(value).map_err(AppError::from)?;
     let (mut decision, mut promote_risks) = raw.validate_and_promote(runtime);
-    // Phase A / A3 收口：把 LLM 输出的 customer_stage / intent_level 与
-    // `system_taxonomies` 严格字典对照（4 路分支：Active 通过 / AliasActive
-    // 改写为 canonical / Deprecated 加 risk / CandidateNew 加 risk + 异步
-    // upsert candidate）。reviewer 在本函数 return 之后才被调用，因此 alias
-    // 改写发生在评审之前，reviewer 看到的是 canonical id。候选 SHALL NOT
-    // 阻塞 Reply Agent —— upsert 是 fire-and-forget。
+    // Phase A / A3 收口：把 LLM 输出的维度取值与 `system_taxonomies` 严格字典对照
+    // （4 路分支：Active 通过 / AliasActive 改写为 canonical / Deprecated 加 risk /
+    // CandidateNew 加 risk + 异步 upsert candidate）。reviewer 在本函数 return 之后才
+    // 被调用，因此 alias 改写发生在评审之前，reviewer 看到的是 canonical id。候选
+    // SHALL NOT 阻塞 Reply Agent —— upsert 是 fire-and-forget。
+    //
+    // universal-domain-adaptation H2：校验哪些维度不再写死，改读 active DomainProfile
+    // 的 `decision_dimension_kinds`。DEFAULT 销售域返回 ["customer_stage","intent_level"]
+    // 逐字等价改造前。
+    let active_profile =
+        super::domain_profile::load_active_domain_profile(&state.db, &contact.workspace_id).await;
+    let dimension_kinds = super::domain_profile::decision_dimension_kinds(&active_profile);
     let taxonomy_risks = super::decision_taxonomy::validate_and_normalize_decision(
         &state.db,
         &mut decision,
+        &dimension_kinds,
         &contact.account_id,
     );
     promote_risks.extend(taxonomy_risks);

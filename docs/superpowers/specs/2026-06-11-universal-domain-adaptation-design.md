@@ -1,7 +1,7 @@
 # 通用化知识库：LLM 对话驱动的行业/产品自适应 — 设计文档
 
 **日期**：2026-06-11
-**状态**：实施中 — **Phase 0 已提交（commit e93cd63）；Phase 1 子步 1B 已提交（commit 557cb38）；1D 已落 working tree（待提交）**；后续子步 1A→1C→1E→1F→1G 待实施
+**状态**：实施中 — **Phase 0 已提交（commit e93cd63）；Phase 1 子步 1B 已提交（557cb38）、1D 已提交（a36164d）；1A 已落 working tree（待提交）**；后续子步 1C→1E→1F→1G 待实施
 **作者**：运营 agent 侧
 **目标读者**：产品负责人 + 知识库后端维护者
 
@@ -542,7 +542,7 @@ casual 模式的"收紧压力门"会与"热烈推进"打架（非误杀，是模
 
 - **1B · 数据模型扩展** ✅**已完成（working tree，待与设计一起提交）**：`TaxonomyValue` 加 `priority_weight`/`is_terminal`，`DomainProfile` 加 `stagnation_dimension`（`#[serde(default)]` 兼容）；m006 seed 回填现有取值的权重/终态使其等价当前 planner 硬编码值；新增等价护栏测试 `seeded_weights_match_planner_hardcoded_verbatim`。lib 963/0。
 - **1D · H1 domain_signals 容器 + 写入收敛** ✅**已完成**：`AgentDecision` 加 `domain_signals: Document`（`#[serde(default)]`），**保留 `customer_stage`/`intent_level` typed 字段（红线：删了会破 lib 基线 + state_transition_pbt）**；新模块 `agent/domain_signals.rs` 提供 `normalize_domain_signals`（typed↔容器双向同步，typed 取 canonical 后为权威）+ `insert_domain_signal_values`（遍历容器写 `domain_attributes.<key>` dotted-key + `stage_changed` 刷 `customer_stage_updated_at` 的单一写入内核）。gateway 决策落库（`apply_agent_updates`，clone+normalize 后经内核，捕获第二道 taxonomy 软闸的 canonical 改写）与 `routes::shared::insert_domain_stage_fields`（admin 改画像，wrapper 保留 typed 签名供 6 处调用方 + 既有「容器时间戳总刷」契约）两套写实现收敛到同一内核。normalize 注入点 = `decide_reply_with_promote` 在 taxonomy 规整之后。lib 974/0，PBT 累计 34/0，禁词/model-hint 闸净。
-- **1A · H2+H7 维度列表动态化**：`decision_taxonomy.rs:38` 与 `gateway.rs:3262` 两份硬编码列表统一改读 `decision_dimension_kinds(active_profile)`。`check_value` 不动、DEFAULT 返 `["customer_stage","intent_level"]` 逐字等价。**置于 1D 之后**：维度列表消费的是 1D 引入的 `domain_signals`，先做会读到旧 typed 字段、1D 落地后还要再改一次。
+- **1A · H2+H7 维度列表动态化** ✅**已完成**：`decision_taxonomy::classify_decision_tags`（删 `TAGGED_FIELDS` getter/setter const 表）与 `gateway::compute_taxonomy_guard_outcome`（删两维 named rewrite 字段，改 `rewrites: Vec<(kind,canonical)>`）两份硬编码列表统一改读 `decision_dimension_kinds(active_profile)`，取值读写经 `domain_signals::get_dimension`/`set_dimension`（销售两维走 typed、其它行业维度走容器）。两条生产入口（`decide_reply_with_promote` + gateway 软闸）各 `load_active_domain_profile(workspace_id)` 取维度集。`check_value` 不动；DEFAULT 返 `["customer_stage","intent_level"]` 逐字等价，原 9+9 测试经测试桥（`classify_with_cache_for_tests` 默认两维 / `guard()` + `rewrite_of()`）零改语义保留，新增 4 测覆盖非销售维度（容器读取/alias 改写/未知值进候选）。lib 976/0，PBT 累计 34/0，禁词/model-hint 闸净。
 - **1C · H6 planner 漏斗内部配置化**：`stage_priority_weight`/`intent_level_weight` 改读取值字典 `priority_weight`；`TERMINAL_STAGES` 改读 `is_terminal`；stagnation dotted-key 改读 `profile.stagnation_dimension`。金标权重档位值不变（`seeded_weights_match_planner_hardcoded_verbatim` 已锁）。
 - **1E · H3+H9 prompt 语义 + conversationMode 注入**：`prompts.rs` 写死的销售域维度语义段改从 `profile.prompt_fragment` + 维度 `description` 注入（H3）；conversationMode 取值集合/判定规则 + 模式→5闸阈值映射改从 profile 注入（H9，与 H3 同文件同类改造）。DEFAULT_PROFILE 的 fragment + 四模式 + 当前映射（含 casual=PressureRisk≥5）逐字复刻。**boundary_protection 反接管硬规则不可配、继续写死**（红线）。**前置：先补一条确定性单测，断言"DEFAULT profile 注入产出的 conversationMode 取值集 + 模式→阈值映射 == 当前写死值"（现仅有概率性 real-LLM 套件兜底，是全 Phase 1 唯一等价护栏靠概率测试的子步，必须补硬护栏）。**
 - **1F · H8 运营范式可配化（§3.6）**：`OperationMode` 模型（三驱动力开关 + 阈值）落 `DomainProfile.operation_mode` + `Contact.operation_mode_override`；`resolve_operation_mode(contact, profile)` 三级回落 helper；三扫描器内部按 effective mode 决定该 contact 跑不跑本段（关 funnel = stage_stagnation 短路）；silent/commitment 阈值改「override ?? profile ?? 全局 config」。**同时把 quiet_hours 纳入 override 链（H19，见下）**。DEFAULT = 三全开 + 阈值 None 回落 config，planner 金标零变化。**纯减法/调参；新扫描器（情绪/节奏）划入 Phase 3 之后做加法**。
