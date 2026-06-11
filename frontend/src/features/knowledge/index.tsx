@@ -65,7 +65,8 @@ const KNOWLEDGE_MODES: ModeMeta[] = [
 ];
 
 type WorkbenchPane = "digest" | "chat" | "inbox";
-type LibraryPane = "ask" | "tree" | "lint" | "review" | "autoVerify" | "revisions";
+type LibraryPane = "ask" | "tree" | "quality" | "revisions";
+type QualityTab = "lint" | "review" | "autoVerify";
 type ConsolePane =
   | "cockpit" | "documents" | "import" | "ingest" | "schema" | "sysconfig"
   | "observability" | "tryRecall" | "metrics" | "memory" | "graph";
@@ -76,6 +77,7 @@ export function KnowledgeWikiView() {
   // 跨模式共享状态（提升到顶层）
   const [workbenchPane, setWorkbenchPane] = useState<WorkbenchPane>("digest");
   const [libraryPane, setLibraryPane] = useState<LibraryPane>("ask");
+  const [qualityTab, setQualityTab] = useState<QualityTab>("lint");
   const [consolePane, setConsolePane] = useState<ConsolePane>("cockpit");
 
   const [focusedId, setFocusedId] = useState<string | null>(null);
@@ -114,17 +116,18 @@ export function KnowledgeWikiView() {
     setMode("workbench");
   }, []);
 
-  // B8：概览维度下钻 → 知识库/待评审并带维度上下文。
+  // B8：概览维度下钻 → 知识库/质量中心/待评审并带维度上下文。
   const openReviewForDim = useCallback((dimKey?: string) => {
     setReviewDimFilter(dimKey ?? null);
-    setLibraryPane("review");
+    setLibraryPane("quality");
+    setQualityTab("review");
     setMode("library");
   }, []);
 
   return (
     <section className="qualityCenter knowledgeWiki knowledgeWorkstation">
       <header className="wikiArchiveHeader" style={{ padding: "16px 20px 12px", marginBottom: 0 }}>
-        <span className="wikiArchiveSubtitle">Knowledge Workstation · 知识档案馆</span>
+        <span className="wikiArchiveSubtitle">知识运营工作台</span>
         <h2 style={{ display: "flex", alignItems: "center", gap: 10, fontSize: 22 }}>
           <FileBox size={20} /> 知识库工作站
         </h2>
@@ -164,6 +167,8 @@ export function KnowledgeWikiView() {
           <LibraryMode
             pane={libraryPane}
             setPane={setLibraryPane}
+            qualityTab={qualityTab}
+            setQualityTab={setQualityTab}
             reviewDimFilter={reviewDimFilter}
             focusedId={focusedId}
             inspectorCollapsed={inspectorCollapsed}
@@ -176,7 +181,7 @@ export function KnowledgeWikiView() {
             pane={consolePane}
             setPane={setConsolePane}
             onOpenReview={openReviewForDim}
-            onOpenAutoVerify={() => { setLibraryPane("autoVerify"); setMode("library"); }}
+            onOpenAutoVerify={() => { setLibraryPane("quality"); setQualityTab("autoVerify"); setMode("library"); }}
           />
         )}
       </div>
@@ -225,11 +230,13 @@ function WorkbenchMode({
 
 // ── 知识库 library：问答、浏览与治理 ─────────────────────────────────
 function LibraryMode({
-  pane, setPane, reviewDimFilter,
+  pane, setPane, qualityTab, setQualityTab, reviewDimFilter,
   focusedId, inspectorCollapsed, setInspectorCollapsed, setFocusedId,
 }: {
   pane: LibraryPane;
   setPane: (p: LibraryPane) => void;
+  qualityTab: QualityTab;
+  setQualityTab: (t: QualityTab) => void;
   reviewDimFilter: string | null;
   focusedId: string | null;
   inspectorCollapsed: boolean;
@@ -241,17 +248,44 @@ function LibraryMode({
       <div className="wikiModePane wikiModePane--nav wikiStewardNav">
         <NavBtn active={pane === "ask"} onClick={() => setPane("ask")} Icon={Compass} label="知识问答" />
         <NavBtn active={pane === "tree"} onClick={() => setPane("tree")} Icon={BookOpen} label="知识树" />
-        <NavBtn active={pane === "lint"} onClick={() => setPane("lint")} Icon={AlertTriangle} label="质量信号" />
-        <NavBtn active={pane === "review"} onClick={() => setPane("review")} Icon={ShieldCheck} label="待评审" />
-        <NavBtn active={pane === "autoVerify"} onClick={() => setPane("autoVerify")} Icon={Sparkles} label="批量校验" />
+        <NavBtn active={pane === "quality"} onClick={() => setPane("quality")} Icon={ShieldCheck} label="质量中心" />
         <NavBtn active={pane === "revisions"} onClick={() => setPane("revisions")} Icon={Clock3} label="修订历史" />
       </div>
       <div className="wikiModePane wikiModePane--main">
         {pane === "ask" && <AskView />}
         {pane === "tree" && <KnowledgeTreeView />}
-        {pane === "lint" && <LintView />}
-        {pane === "review" && <ReviewView initialDimFilter={reviewDimFilter} />}
-        {pane === "autoVerify" && <AutoVerifyPanel />}
+        {pane === "quality" && (
+          <div className="wikiQualityCenter">
+            <div className="wikiSubTabs">
+              <button
+                type="button"
+                className={qualityTab === "lint" ? "wikiSubTab wikiSubTab--active" : "wikiSubTab"}
+                onClick={() => setQualityTab("lint")}
+              >
+                <AlertTriangle size={13} /> 质量信号
+              </button>
+              <button
+                type="button"
+                className={qualityTab === "review" ? "wikiSubTab wikiSubTab--active" : "wikiSubTab"}
+                onClick={() => setQualityTab("review")}
+              >
+                <ShieldCheck size={13} /> 待评审
+              </button>
+              <button
+                type="button"
+                className={qualityTab === "autoVerify" ? "wikiSubTab wikiSubTab--active" : "wikiSubTab"}
+                onClick={() => setQualityTab("autoVerify")}
+              >
+                <Sparkles size={13} /> 批量校验
+              </button>
+            </div>
+            <div className="wikiSubTabBody">
+              {qualityTab === "lint" && <LintView />}
+              {qualityTab === "review" && <ReviewView initialDimFilter={reviewDimFilter} />}
+              {qualityTab === "autoVerify" && <AutoVerifyPanel />}
+            </div>
+          </div>
+        )}
         {pane === "revisions" && <ChunkRevisionsDrawer />}
       </div>
       {!inspectorCollapsed ? (

@@ -16,19 +16,28 @@ import {
 import { parseApiError, LlmUnavailableError } from "../../lib/api";
 import { useConfirm } from "../../components/ui/ConfirmDialog";
 import { useFormDialog } from "../../components/ui/FormDialog";
+import { useToast } from "../../components/ui/Toast";
 import type { PickerChunk } from "../../components/ui/ChunkRef";
 import { type TrustChunkFields, chunkTypeLabel } from "./trustTypes";
 import { wikiTypeLabel, statusLabel, integrityStatusLabel, revisionOpLabel, revisionSourceLabel } from "./labels";
 
-/// merge/relate 的 ChunkPicker 列表加载器:拉全部 chunk 供搜索选择,替代手输 ObjectId。
-async function loadChunkOptions(): Promise<PickerChunk[]> {
+/// ChunkPicker 列表加载器:拉全部 chunk 供搜索选择,替代手输 ObjectId。
+/// 模块级缓存 20s,避免多个选择器/Inspector 首次聚焦各拉一次全量。
+let chunkOptionsCache: { at: number; items: PickerChunk[] } | null = null;
+const CHUNK_OPTIONS_TTL_MS = 20_000;
+export async function loadChunkOptions(): Promise<PickerChunk[]> {
+  if (chunkOptionsCache && Date.now() - chunkOptionsCache.at < CHUNK_OPTIONS_TTL_MS) {
+    return chunkOptionsCache.items;
+  }
   try {
     const r = await fetch("/api/operation-knowledge/chunks");
-    if (!r.ok) return [];
+    if (!r.ok) return chunkOptionsCache?.items ?? [];
     const data = (await r.json()) as { items?: { id: string; title?: string | null }[] };
-    return (data.items ?? []).map((c) => ({ id: c.id, title: c.title }));
+    const items = (data.items ?? []).map((c) => ({ id: c.id, title: c.title }));
+    chunkOptionsCache = { at: Date.now(), items };
+    return items;
   } catch {
-    return [];
+    return chunkOptionsCache?.items ?? [];
   }
 }
 
@@ -675,6 +684,7 @@ function ChunkActionsBar({
   const [state, setState] = useState<ChunkActionState>({ busy: null, error: null, info: null });
   const confirm = useConfirm();
   const form = useFormDialog();
+  const toast = useToast();
 
   async function call(
     action: string,
@@ -688,7 +698,8 @@ function ChunkActionsBar({
       if (body !== undefined) init.body = JSON.stringify(body);
       const r = await fetch(path, init);
       if (!r.ok) throw await parseApiError(r);
-      setState({ busy: null, error: null, info: `已${action}` });
+      setState({ busy: null, error: null, info: null });
+      toast.success(`已${action}`);
       onChanged();
     } catch (e: unknown) {
       setState({ busy: null, error: e instanceof Error ? e.message : String(e), info: null });
@@ -746,11 +757,11 @@ function ChunkActionsBar({
           name: "mode",
           label: "拆分方式",
           options: [
-            { value: "offset", label: "按字符位置" },
-            { value: "regex", label: "按正则匹配" },
+            { value: "offset", label: "按字符位置（推荐）" },
+            { value: "regex", label: "按正则匹配（高级）" },
           ],
         },
-        { kind: "text", name: "cutoff", label: "切点", required: true, hint: "按字符位置填整数（如 200）；按正则填表达式" },
+        { kind: "text", name: "cutoff", label: "切点", required: true, hint: "按字符位置：填一个整数，如 200（从第 200 个字处切开）；高级：填正则表达式" },
       ],
     });
     if (!v) return;

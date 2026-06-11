@@ -44,11 +44,9 @@ describe("KnowledgeFeature — 一体化频道（全量重塑视觉壳）", () =
     globalThis.fetch = realFetch;
   });
 
-  it("渲染档案馆小标题与工作站标题", () => {
+  it("渲染频道小标题与工作站标题", () => {
     render(<KnowledgeFeature />);
-    expect(
-      screen.getByText("Knowledge Workstation · 知识档案馆"),
-    ).toBeInTheDocument();
+    expect(screen.getByText("知识运营工作台")).toBeInTheDocument();
     expect(screen.getByText("知识库工作站")).toBeInTheDocument();
   });
 

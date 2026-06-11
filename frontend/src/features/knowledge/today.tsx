@@ -16,10 +16,12 @@ import {
   X,
 } from "lucide-react";
 import { parseApiError } from "../../lib/api";
-import { LlmErrorBanner, focusChunk } from "./shared";
+import { LlmErrorBanner, focusChunk, loadChunkOptions } from "./shared";
+import { ChunkPicker } from "../../components/ui/ChunkRef";
 import { useConfirm } from "../../components/ui/ConfirmDialog";
 import { useToast } from "../../components/ui/Toast";
-import { severityLabel, priorityLabel, originLabel, draftKindLabel, taskStatusLabel } from "./labels";
+import { EmptyState } from "../../components/ui/EmptyState";
+import { severityLabel, priorityLabel, originLabel, draftKindLabel, taskStatusLabel, reportStatusLabel, digestCardKindLabel } from "./labels";
 
 interface ChatTurnView {
   role: "user" | "assistant";
@@ -254,7 +256,6 @@ export function ChatWorkbench({ initialAttachChunkId }: { initialAttachChunkId?:
     <div className="wikiArchiveShell wikiChatWorkbench">
       <header className="wikiArchiveHeader">
         <div>
-          <div className="wikiArchiveEyebrow">today / chat</div>
           <h2>AI 协作工坊</h2>
         </div>
         <div className="wikiArchiveHeaderActions">
@@ -271,9 +272,11 @@ export function ChatWorkbench({ initialAttachChunkId }: { initialAttachChunkId?:
 
       <div className="wikiChatStream" ref={scrollRef}>
         {turns.length === 0 ? (
-          <div className="wikiEmpty">
-            <MessageSquareText size={28} /> 与 AI 协作起草 / 修复切片。AI 起草不会自动验证，需要运营点击「应用为草稿」。
-          </div>
+          <EmptyState
+            icon={<MessageSquareText size={28} />}
+            title="与 AI 协作起草知识"
+            hint="让 AI 帮你起草或修订知识条目。AI 起草不会自动生效，需要你点击「应用为草稿」后再确认。"
+          />
         ) : null}
         {turns.map((t) => (
           <article
@@ -321,7 +324,7 @@ export function ChatWorkbench({ initialAttachChunkId }: { initialAttachChunkId?:
           className="wikiChatInput"
           value={draft}
           onChange={(e) => setDraft(e.target.value)}
-          placeholder="向 AI 描述要起草 / 修复 / 拆分的切片，可附带 chunkId 引用现有切片"
+          placeholder="向 AI 描述要起草 / 修订 / 拆分的知识，可在下方选择要引用的现有条目"
           disabled={pending}
           rows={3}
           onKeyDown={(e) => {
@@ -332,14 +335,14 @@ export function ChatWorkbench({ initialAttachChunkId }: { initialAttachChunkId?:
           }}
         />
         <div className="wikiChatFooterRow">
-          <input
-            type="text"
-            className="wikiChatAttachInput"
-            value={attachChunkId}
-            onChange={(e) => setAttachChunkId(e.target.value)}
-            placeholder="可选：附带 chunkId"
-            disabled={pending}
-          />
+          <div className="wikiChatAttachPicker">
+            <ChunkPicker
+              value={attachChunkId}
+              onChange={setAttachChunkId}
+              loadChunks={loadChunkOptions}
+              placeholder="可选：引用一条现有知识"
+            />
+          </div>
           <button
             type="button"
             className="primary"
@@ -352,7 +355,7 @@ export function ChatWorkbench({ initialAttachChunkId }: { initialAttachChunkId?:
             type="button"
             onClick={() => void apply()}
             disabled={applying || !lastAssistant?.canApply}
-            title={lastAssistant?.canApply ? "把当前 AI 草稿落库为草稿（status=draft, integrity=needs_review）" : "无可应用草稿"}
+            title={lastAssistant?.canApply ? "把 AI 当前草稿保存为待确认草稿，需你确认后 AI 才会使用" : "当前没有可应用的草稿"}
           >
             <CheckCircle2 size={14} /> {applying ? "应用中…" : "应用为草稿"}
           </button>
@@ -437,7 +440,6 @@ export function KnowledgeInbox({
     <div className="wikiArchiveShell wikiInbox">
       <header className="wikiArchiveHeader">
         <div>
-          <div className="wikiArchiveEyebrow">今日 / 待办</div>
           <h2>待办收件箱</h2>
         </div>
         <div className="wikiArchiveHeaderActions">
@@ -469,9 +471,11 @@ export function KnowledgeInbox({
 
       <div className="wikiInboxList">
         {data && data.items.filter((it) => !dismissed.has(it.id)).length === 0 ? (
-          <div className="wikiEmpty">
-            <Inbox size={24} /> 暂无待办
-          </div>
+          <EmptyState
+            icon={<Inbox size={28} />}
+            title="暂无待办"
+            hint="知识缺口、今日要点和质量信号会自动汇集到这里。"
+          />
         ) : null}
         {data?.items.filter((it) => !dismissed.has(it.id)).map((it) => (
           <article
@@ -488,14 +492,18 @@ export function KnowledgeInbox({
             <h4 className="wikiInboxCardTitle">{it.title}</h4>
             <p className="wikiInboxCardSummary">{it.contextSummary}</p>
             <div className="wikiInboxCardActions">
-              {it.targetChunkId ? (
-                <button type="button" onClick={() => focus(it.targetChunkId as string)}>
+              {it.suggestedActions.includes("open_chat") ? (
+                <button type="button" className="primary" onClick={() => handleOpenChat(it.targetChunkId ?? undefined)}>
+                  <MessageSquareText size={12} /> 找 AI 协作
+                </button>
+              ) : it.targetChunkId ? (
+                <button type="button" className="primary" onClick={() => focus(it.targetChunkId as string)}>
                   <ArrowRight size={12} /> 查看知识
                 </button>
               ) : null}
-              {it.suggestedActions.includes("open_chat") ? (
-                <button type="button" onClick={() => handleOpenChat(it.targetChunkId ?? undefined)}>
-                  <MessageSquareText size={12} /> 找 AI 协作
+              {it.suggestedActions.includes("open_chat") && it.targetChunkId ? (
+                <button type="button" onClick={() => focus(it.targetChunkId as string)}>
+                  <ArrowRight size={12} /> 查看知识
                 </button>
               ) : null}
               {it.suggestedActions.includes("open_repair") && it.targetChunkId ? (
@@ -504,7 +512,7 @@ export function KnowledgeInbox({
                 </button>
               ) : null}
               {it.suggestedActions.includes("dismiss") ? (
-                <button type="button" onClick={() => handleDismiss(it.id)}>
+                <button type="button" className="wikiInboxDismiss" onClick={() => handleDismiss(it.id)}>
                   <X size={12} /> 忽略
                 </button>
               ) : null}
@@ -627,7 +635,7 @@ export function DigestCanvas() {
         <div>
           <h3>今日 Digest</h3>
           <span className="wikiDigestMeta">
-            {report?.reportDate ?? "—"} · {report?.status ?? "—"} · 生成于 {report?.generatedAt ?? "—"}
+            {report?.reportDate ?? "—"} · {reportStatusLabel(report?.status)} · 生成于 {report?.generatedAt ?? "—"}
           </span>
         </div>
         <div className="wikiDigestActions">
@@ -641,16 +649,18 @@ export function DigestCanvas() {
       </div>
       {error ? <LlmErrorBanner error={error} onRetry={() => void load()} retrying={pending} /> : null}
       {!error && visibleCards.length === 0 && !pending ? (
-        <div className="wikiEmpty wikiDigestEmpty">
-          <FileBox size={28} /> 今日暂无待办卡片。点击「强制重算」可立即合成。
-        </div>
+        <EmptyState
+          icon={<FileBox size={28} />}
+          title="今日暂无待办卡片"
+          hint="点击右上角「强制重算」可立即重新生成今日要点。"
+        />
       ) : null}
       <div className="wikiDigestGrid">
         {visibleCards.map((card) => (
           <article className={`wikiDigestCard sev-${card.severity}`} key={card.cardId}>
             <div className="wikiDigestCardHead">
               <span className={severityBadgeClass(card.severity)}>{severityLabel(card.severity)}</span>
-              <span className="wikiDigestKind">{card.kind}</span>
+              <span className="wikiDigestKind">{digestCardKindLabel(card.kind)}</span>
             </div>
             <h4 className="wikiDigestTitle">{card.title}</h4>
             <p className="wikiDigestSummary">{card.summary}</p>
@@ -764,13 +774,13 @@ export function TaskRail() {
     <aside className="wikiTaskRail">
       <div className="wikiTaskRailHead">
         <h3>派工跟踪</h3>
-        <span className="wikiTaskRailHint">输入 taskId 查看长任务执行进度</span>
+        <span className="wikiTaskRailHint">输入任务编号查看长任务执行进度</span>
       </div>
       <div className="wikiTaskRailForm">
         <input
           type="text"
           className="wikiInput"
-          placeholder="taskId（24 位 ObjectId）"
+          placeholder="粘贴任务编号"
           value={sessionId}
           onChange={(e) => setSessionId(e.target.value)}
           onKeyDown={(e) => {
@@ -796,12 +806,20 @@ export function TaskRail() {
                 {task.completedSteps.length}/{task.totalSteps} 步
               </span>
             </div>
+            {task.totalSteps > 0 ? (
+              <div className="wikiTaskProgress" role="progressbar" aria-valuenow={task.completedSteps.length} aria-valuemin={0} aria-valuemax={task.totalSteps}>
+                <div
+                  className="wikiTaskProgressFill"
+                  style={{ width: `${Math.min(100, Math.round((task.completedSteps.length / task.totalSteps) * 100))}%` }}
+                />
+              </div>
+            ) : null}
             <div className="wikiTaskMeta wikiTaskMeta--small">会话：{task.sessionId}</div>
             <div className="wikiTaskMeta wikiTaskMeta--small">
               开始：{task.startedAt ?? "—"} · 结束：{task.finishedAt ?? "—"}
             </div>
             {task.errorKind ? (
-              <div className="wikiAlert error">错误：{task.errorKind}</div>
+              <div className="wikiAlert error">执行出错：{task.errorKind}</div>
             ) : null}
             {task.cards.length > 0 ? (
               <div className="wikiTaskCardList">
@@ -839,9 +857,10 @@ export function TaskRail() {
           ) : null}
         </div>
       ) : (
-        <div className="wikiEmpty wikiTaskRailEmpty">
-          暂无任务。在「探索」对话中派工后，可在此输入 taskId 跟踪。
-        </div>
+        <EmptyState
+          title="暂无跟踪任务"
+          hint="在「AI 协作」里派发长任务后，可在此输入任务编号跟踪进度。"
+        />
       )}
     </aside>
   );
