@@ -11,11 +11,17 @@ import {
   Search,
   SendHorizonal,
   Sparkles,
+  SquarePen,
   Trash2,
   X,
 } from "lucide-react";
 import { parseApiError } from "../../lib/api";
-import { LlmErrorBanner, focusChunk } from "./shared";
+import { LlmErrorBanner, focusChunk, loadChunkOptions } from "./shared";
+import { ChunkPicker } from "../../components/ui/ChunkRef";
+import { useConfirm } from "../../components/ui/ConfirmDialog";
+import { useToast } from "../../components/ui/Toast";
+import { EmptyState } from "../../components/ui/EmptyState";
+import { severityLabel, priorityLabel, originLabel, draftKindLabel, taskStatusLabel, reportStatusLabel, digestCardKindLabel } from "./labels";
 
 interface ChatTurnView {
   role: "user" | "assistant";
@@ -48,13 +54,20 @@ interface ChatTurnResponse {
   targetPackId?: string | null;
 }
 
-export function ChatWorkbench() {
+export function ChatWorkbench({ initialAttachChunkId }: { initialAttachChunkId?: string | null } = {}) {
+  const confirm = useConfirm();
+  const toast = useToast();
   const [sessionId, setSessionId] = useState<string>(() => {
     if (typeof window === "undefined") return "";
     return window.localStorage.getItem("knowledgeChat.sessionId") ?? "";
   });
   const [draft, setDraft] = useState("");
   const [attachChunkId, setAttachChunkId] = useState<string>("");
+
+  // B2：从待办收件箱「找 AI 协作」跳转过来时预填 chunkId。
+  useEffect(() => {
+    if (initialAttachChunkId) setAttachChunkId(initialAttachChunkId);
+  }, [initialAttachChunkId]);
   const [turns, setTurns] = useState<ChatTurnView[]>([]);
   const [pending, setPending] = useState(false);
   const [applying, setApplying] = useState(false);
@@ -210,7 +223,13 @@ export function ChatWorkbench() {
 
   async function discard() {
     if (!sessionId) return;
-    if (!window.confirm("丢弃本会话的最后一份草稿？")) return;
+    const ok = await confirm({
+      title: "丢弃当前草稿？",
+      body: "将丢弃本会话最后一份 AI 起草内容，此操作不可恢复。",
+      tone: "danger",
+      confirmText: "确认丢弃",
+    });
+    if (!ok) return;
     setError(null);
     setInfo(null);
     try {
@@ -219,10 +238,12 @@ export function ChatWorkbench() {
         { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" }
       );
       if (!r.ok) throw await parseApiError(r);
-      setInfo("已丢弃当前草稿");
+      toast.success("已丢弃当前草稿");
       await loadHistory(sessionId);
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      const msg = e instanceof Error ? e.message : String(e);
+      setError(msg);
+      toast.error(msg);
     }
   }
 
@@ -235,11 +256,10 @@ export function ChatWorkbench() {
     <div className="wikiArchiveShell wikiChatWorkbench">
       <header className="wikiArchiveHeader">
         <div>
-          <div className="wikiArchiveEyebrow">today / chat</div>
           <h2>AI 协作工坊</h2>
         </div>
         <div className="wikiArchiveHeaderActions">
-          <span className="wikiArchiveTag">[session]</span>
+          <span className="wikiArchiveTag">session</span>
           <span className="wikiChatSessionId">{sessionId || "未开始"}</span>
           <button type="button" onClick={newSession}>
             <Plus size={14} /> 新会话
@@ -252,9 +272,11 @@ export function ChatWorkbench() {
 
       <div className="wikiChatStream" ref={scrollRef}>
         {turns.length === 0 ? (
-          <div className="wikiEmpty">
-            <MessageSquareText size={28} /> 与 AI 协作起草 / 修复切片。AI 起草不会自动验证，需要运营点击「应用为草稿」。
-          </div>
+          <EmptyState
+            icon={<MessageSquareText size={28} />}
+            title="与 AI 协作起草知识"
+            hint="让 AI 帮你起草或修订知识条目。AI 起草不会自动生效，需要你点击「应用为草稿」后再确认。"
+          />
         ) : null}
         {turns.map((t) => (
           <article
@@ -262,10 +284,10 @@ export function ChatWorkbench() {
             className={`wikiChatTurn wikiChatTurn--${t.role}`}
           >
             <div className="wikiChatTurnHead">
-              <span className="wikiArchiveTag">[{t.role === "user" ? "运营" : "AI"}]</span>
+              <span className="wikiArchiveTag">{t.role === "user" ? "运营" : "AI"}</span>
               <span className="wikiArchiveTimelineTime">#{t.turnIndex}</span>
-              {t.intent ? <span className="wikiArchiveTag">[{t.intent}]</span> : null}
-              {t.draftKind ? <span className="wikiArchiveTag">[{t.draftKind}]</span> : null}
+              {t.intent ? <span className="wikiArchiveTag">{t.intent}</span> : null}
+              {t.draftKind ? <span className="wikiArchiveTag">{draftKindLabel(t.draftKind)}</span> : null}
             </div>
             <div className="wikiChatTurnBody">
               {t.role === "assistant" && t.naturalReply ? t.naturalReply : t.content}
@@ -289,9 +311,7 @@ export function ChatWorkbench() {
               <div className="wikiChatMissing">
                 缺字段：
                 {t.missingFields.map((f) => (
-                  <span key={f} className="wikiArchiveTag">
-                    [{f}]
-                  </span>
+                  <span key={f} className="wikiArchiveTag">{f}</span>
                 ))}
               </div>
             ) : null}
@@ -304,7 +324,7 @@ export function ChatWorkbench() {
           className="wikiChatInput"
           value={draft}
           onChange={(e) => setDraft(e.target.value)}
-          placeholder="向 AI 描述要起草 / 修复 / 拆分的切片，可附带 chunkId 引用现有切片"
+          placeholder="向 AI 描述要起草 / 修订 / 拆分的知识，可在下方选择要引用的现有条目"
           disabled={pending}
           rows={3}
           onKeyDown={(e) => {
@@ -315,14 +335,14 @@ export function ChatWorkbench() {
           }}
         />
         <div className="wikiChatFooterRow">
-          <input
-            type="text"
-            className="wikiChatAttachInput"
-            value={attachChunkId}
-            onChange={(e) => setAttachChunkId(e.target.value)}
-            placeholder="可选：附带 chunkId"
-            disabled={pending}
-          />
+          <div className="wikiChatAttachPicker">
+            <ChunkPicker
+              value={attachChunkId}
+              onChange={setAttachChunkId}
+              loadChunks={loadChunkOptions}
+              placeholder="可选：引用一条现有知识"
+            />
+          </div>
           <button
             type="button"
             className="primary"
@@ -335,7 +355,7 @@ export function ChatWorkbench() {
             type="button"
             onClick={() => void apply()}
             disabled={applying || !lastAssistant?.canApply}
-            title={lastAssistant?.canApply ? "把当前 AI 草稿落库为草稿（status=draft, integrity=needs_review）" : "无可应用草稿"}
+            title={lastAssistant?.canApply ? "把 AI 当前草稿保存为待确认草稿，需你确认后 AI 才会使用" : "当前没有可应用的草稿"}
           >
             <CheckCircle2 size={14} /> {applying ? "应用中…" : "应用为草稿"}
           </button>
@@ -366,11 +386,19 @@ interface InboxResp {
   stats: { total: number; high: number; mid: number; low: number };
 }
 
-export function KnowledgeInbox() {
+export function KnowledgeInbox({
+  onOpenChat,
+  onFocusChunk,
+}: {
+  onOpenChat?: (chunkId?: string) => void;
+  onFocusChunk?: (chunkId: string) => void;
+} = {}) {
+  const toast = useToast();
   const [data, setData] = useState<InboxResp | null>(null);
   const [pending, setPending] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [priority, setPriority] = useState<"" | "high" | "mid" | "low">("");
+  const [dismissed, setDismissed] = useState<Set<string>>(new Set());
 
   const load = useCallback(async () => {
     setPending(true);
@@ -395,11 +423,23 @@ export function KnowledgeInbox() {
     void load();
   }, [load]);
 
+  const focus = onFocusChunk ?? focusChunk;
+
+  function handleOpenChat(chunkId?: string) {
+    if (onOpenChat) onOpenChat(chunkId);
+    else toast.info("请到「AI 协作」标签与 AI 协作补充这条知识");
+  }
+
+  function handleDismiss(id: string) {
+    // 本地乐观隐藏 + toast（后端暂无逐条 dismiss 接口时不发死请求）
+    setDismissed((prev) => new Set(prev).add(id));
+    toast.success("已从待办中移除");
+  }
+
   return (
     <div className="wikiArchiveShell wikiInbox">
       <header className="wikiArchiveHeader">
         <div>
-          <div className="wikiArchiveEyebrow">today / inbox</div>
           <h2>待办收件箱</h2>
         </div>
         <div className="wikiArchiveHeaderActions">
@@ -422,51 +462,59 @@ export function KnowledgeInbox() {
 
       {data ? (
         <div className="wikiInboxStats">
-          <span className="wikiArchiveTag">[total {data.stats.total}]</span>
-          <span className="wikiArchiveTag">[high {data.stats.high}]</span>
-          <span className="wikiArchiveTag">[mid {data.stats.mid}]</span>
-          <span className="wikiArchiveTag">[low {data.stats.low}]</span>
+          <span className="wikiArchiveTag">共 {data.stats.total}</span>
+          <span className="wikiArchiveTag">高 {data.stats.high}</span>
+          <span className="wikiArchiveTag">中 {data.stats.mid}</span>
+          <span className="wikiArchiveTag">低 {data.stats.low}</span>
         </div>
       ) : null}
 
       <div className="wikiInboxList">
-        {data && data.items.length === 0 ? (
-          <div className="wikiEmpty">
-            <Inbox size={24} /> 暂无待办
-          </div>
+        {data && data.items.filter((it) => !dismissed.has(it.id)).length === 0 ? (
+          <EmptyState
+            icon={<Inbox size={28} />}
+            title="暂无待办"
+            hint="知识缺口、今日要点和质量信号会自动汇集到这里。"
+          />
         ) : null}
-        {data?.items.map((it) => (
+        {data?.items.filter((it) => !dismissed.has(it.id)).map((it) => (
           <article
             key={it.id}
             className={`wikiInboxCard wikiInboxCard--${it.priority}`}
           >
             <div className="wikiInboxCardHead">
               <span className={`wikiArchiveTag wikiInboxPriority--${it.priority}`}>
-                [{it.priority}]
+                {priorityLabel(it.priority)}
               </span>
-              <span className="wikiArchiveTag">[{it.kind}]</span>
-              <span className="wikiArchiveTag">[{it.origin}]</span>
+              <span className="wikiArchiveTag">{originLabel(it.origin)}</span>
               <span className="wikiArchiveTimelineTime">{it.createdAt}</span>
             </div>
             <h4 className="wikiInboxCardTitle">{it.title}</h4>
             <p className="wikiInboxCardSummary">{it.contextSummary}</p>
             <div className="wikiInboxCardActions">
-              {it.targetChunkId ? (
-                <button
-                  type="button"
-                  onClick={() => focusChunk(it.targetChunkId as string)}
-                >
-                  <ArrowRight size={12} /> 聚焦切片
+              {it.suggestedActions.includes("open_chat") ? (
+                <button type="button" className="primary" onClick={() => handleOpenChat(it.targetChunkId ?? undefined)}>
+                  <MessageSquareText size={12} /> 找 AI 协作
+                </button>
+              ) : it.targetChunkId ? (
+                <button type="button" className="primary" onClick={() => focus(it.targetChunkId as string)}>
+                  <ArrowRight size={12} /> 查看知识
                 </button>
               ) : null}
-              {it.suggestedActions.includes("open_chat") ? (
-                <span className="wikiArchiveTag">[open_chat]</span>
+              {it.suggestedActions.includes("open_chat") && it.targetChunkId ? (
+                <button type="button" onClick={() => focus(it.targetChunkId as string)}>
+                  <ArrowRight size={12} /> 查看知识
+                </button>
               ) : null}
-              {it.suggestedActions.includes("open_repair") ? (
-                <span className="wikiArchiveTag">[open_repair]</span>
+              {it.suggestedActions.includes("open_repair") && it.targetChunkId ? (
+                <button type="button" onClick={() => focus(it.targetChunkId as string)}>
+                  <SquarePen size={12} /> 去修复
+                </button>
               ) : null}
               {it.suggestedActions.includes("dismiss") ? (
-                <span className="wikiArchiveTag">[dismiss]</span>
+                <button type="button" className="wikiInboxDismiss" onClick={() => handleDismiss(it.id)}>
+                  <X size={12} /> 忽略
+                </button>
               ) : null}
             </div>
           </article>
@@ -587,7 +635,7 @@ export function DigestCanvas() {
         <div>
           <h3>今日 Digest</h3>
           <span className="wikiDigestMeta">
-            {report?.reportDate ?? "—"} · {report?.status ?? "—"} · 生成于 {report?.generatedAt ?? "—"}
+            {report?.reportDate ?? "—"} · {reportStatusLabel(report?.status)} · 生成于 {report?.generatedAt ?? "—"}
           </span>
         </div>
         <div className="wikiDigestActions">
@@ -601,16 +649,18 @@ export function DigestCanvas() {
       </div>
       {error ? <LlmErrorBanner error={error} onRetry={() => void load()} retrying={pending} /> : null}
       {!error && visibleCards.length === 0 && !pending ? (
-        <div className="wikiEmpty wikiDigestEmpty">
-          <FileBox size={28} /> 今日暂无待办卡片。点击「强制重算」可立即合成。
-        </div>
+        <EmptyState
+          icon={<FileBox size={28} />}
+          title="今日暂无待办卡片"
+          hint="点击右上角「强制重算」可立即重新生成今日要点。"
+        />
       ) : null}
       <div className="wikiDigestGrid">
         {visibleCards.map((card) => (
           <article className={`wikiDigestCard sev-${card.severity}`} key={card.cardId}>
             <div className="wikiDigestCardHead">
-              <span className={severityBadgeClass(card.severity)}>{card.severity}</span>
-              <span className="wikiDigestKind">{card.kind}</span>
+              <span className={severityBadgeClass(card.severity)}>{severityLabel(card.severity)}</span>
+              <span className="wikiDigestKind">{digestCardKindLabel(card.kind)}</span>
             </div>
             <h4 className="wikiDigestTitle">{card.title}</h4>
             <p className="wikiDigestSummary">{card.summary}</p>
@@ -724,13 +774,13 @@ export function TaskRail() {
     <aside className="wikiTaskRail">
       <div className="wikiTaskRailHead">
         <h3>派工跟踪</h3>
-        <span className="wikiTaskRailHint">输入 taskId 查看长任务执行进度</span>
+        <span className="wikiTaskRailHint">输入任务编号查看长任务执行进度</span>
       </div>
       <div className="wikiTaskRailForm">
         <input
           type="text"
           className="wikiInput"
-          placeholder="taskId（24 位 ObjectId）"
+          placeholder="粘贴任务编号"
           value={sessionId}
           onChange={(e) => setSessionId(e.target.value)}
           onKeyDown={(e) => {
@@ -751,23 +801,31 @@ export function TaskRail() {
         <div className="wikiTaskRailBody">
           <div className="wikiTaskCard">
             <div className="wikiTaskCardHead">
-              <span className={`wikiTaskStatus s-${task.status}`}>{task.status}</span>
+              <span className={`wikiTaskStatus s-${task.status}`}>{taskStatusLabel(task.status)}</span>
               <span className="wikiTaskMeta">
                 {task.completedSteps.length}/{task.totalSteps} 步
               </span>
             </div>
-            <div className="wikiTaskMeta wikiTaskMeta--small">session: {task.sessionId}</div>
+            {task.totalSteps > 0 ? (
+              <div className="wikiTaskProgress" role="progressbar" aria-valuenow={task.completedSteps.length} aria-valuemin={0} aria-valuemax={task.totalSteps}>
+                <div
+                  className="wikiTaskProgressFill"
+                  style={{ width: `${Math.min(100, Math.round((task.completedSteps.length / task.totalSteps) * 100))}%` }}
+                />
+              </div>
+            ) : null}
+            <div className="wikiTaskMeta wikiTaskMeta--small">会话：{task.sessionId}</div>
             <div className="wikiTaskMeta wikiTaskMeta--small">
               开始：{task.startedAt ?? "—"} · 结束：{task.finishedAt ?? "—"}
             </div>
             {task.errorKind ? (
-              <div className="wikiAlert error">errorKind: {task.errorKind}</div>
+              <div className="wikiAlert error">执行出错：{task.errorKind}</div>
             ) : null}
             {task.cards.length > 0 ? (
               <div className="wikiTaskCardList">
                 {task.cards.map((c) => (
                   <div className="wikiTaskCardEntry" key={c.cardId}>
-                    <span className={severityBadgeClass(c.severity)}>{c.severity}</span>
+                    <span className={severityBadgeClass(c.severity)}>{severityLabel(c.severity)}</span>
                     <span className="wikiTaskCardTitle">{c.title}</span>
                   </div>
                 ))}
@@ -799,9 +857,10 @@ export function TaskRail() {
           ) : null}
         </div>
       ) : (
-        <div className="wikiEmpty wikiTaskRailEmpty">
-          暂无任务。在「探索」对话中派工后，可在此输入 taskId 跟踪。
-        </div>
+        <EmptyState
+          title="暂无跟踪任务"
+          hint="在「AI 协作」里派发长任务后，可在此输入任务编号跟踪进度。"
+        />
       )}
     </aside>
   );

@@ -25,6 +25,19 @@
   /* —— 圆角 / 呼吸节奏 —— */
   --r-sm:11px; --r-md:18px; --r-lg:24px;
   --breathe-slow:4s; --breathe-mid:3.2s;
+
+  /* —— 焦点环（键盘可达性，spec §表单要求 accent ring）—— */
+  --focus-ring: 0 0 0 2px var(--surface-card), 0 0 0 4px var(--color-scheduled);
+
+  /* —— 浮层（弹窗 / toast）—— */
+  --z-overlay: 1000; --z-toast: 1100;
+  --overlay-scrim: rgba(20,24,33,.42);
+}
+
+/* 全局键盘焦点环：仅键盘操作时显示，鼠标点击不显示（:focus-visible）。 */
+:where(button, a, input, textarea, select, [tabindex]):focus-visible {
+  outline: none;
+  box-shadow: var(--focus-ring);
 }
 
 /* 功能元素呼吸：仅"进行中"语义使用（spec §2.2） */

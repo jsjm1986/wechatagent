@@ -1,0 +1,28 @@
+.box { padding: 22px 22px 18px; }
+.title { margin: 0 0 10px; font-size: 16px; font-weight: 600; color: var(--ink-1); letter-spacing: -.2px; }
+.body { font-size: 13.5px; line-height: 1.6; color: var(--ink-2); margin-bottom: 14px; }
+
+.requireField {
+  display: flex; flex-direction: column; gap: 6px; margin-bottom: 14px;
+  font-size: 12.5px; color: var(--ink-3);
+}
+.requireField b { color: var(--color-blocked); font-weight: 600; }
+.requireField input {
+  padding: 8px 10px; border: 1px solid var(--hairline); border-radius: var(--r-sm);
+  background: var(--surface-card); color: var(--ink-1); font-size: 13px; font-family: inherit;
+}
+
+.actions { display: flex; justify-content: flex-end; gap: 8px; }
+.cancel, .confirm, .confirmDanger {
+  display: inline-flex; align-items: center; gap: 6px;
+  padding: 8px 16px; border-radius: var(--r-sm); cursor: pointer;
+  font-size: 13px; font-weight: 600; font-family: inherit; border: 1px solid transparent;
+  transition: background .14s ease, opacity .14s ease;
+}
+.cancel { background: none; border-color: var(--hairline); color: var(--ink-2); }
+.cancel:hover { background: rgba(0,0,0,.04); }
+.confirm { background: var(--color-scheduled); color: #fff; }
+.confirm:hover:not(:disabled) { background: #0a78e6; }
+.confirmDanger { background: var(--color-blocked); color: #fff; }
+.confirmDanger:hover:not(:disabled) { background: #e63b31; }
+.confirm:disabled, .confirmDanger:disabled { opacity: .45; cursor: not-allowed; }

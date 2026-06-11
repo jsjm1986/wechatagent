@@ -13,8 +13,12 @@ import {
 } from "lucide-react";
 import { parseApiError } from "../../lib/api";
 import { parseCompleteness, parseIntegrityReport, chunkTypeLabel, type CompletenessView, type IntegrityReportView } from "./trustTypes";
-import { ChunkInspectorPane, classifyChunk, focusChunk, type ReviewChunkItem, type ReviewCategory } from "./shared";
+import { ChunkInspectorPane, classifyChunk, focusChunk, loadChunkOptions, type ReviewChunkItem, type ReviewCategory } from "./shared";
 import { ReviewChat, type ReviewChatChunk } from "./cockpit/ReviewChat";
+import { useConfirm } from "../../components/ui/ConfirmDialog";
+import { ChunkPicker } from "../../components/ui/ChunkRef";
+import { EmptyState } from "../../components/ui/EmptyState";
+import { sourceTypeLabel, statusLabel, integrityStatusLabel, wikiTypeLabel, severityLabel, sourceKindLabel, ingestStatusLabel, riskLevelLabel, revisionOpLabel, revisionSourceLabel } from "./labels";
 
 // ── G2 · DocumentsView · 知识文档目录 CRUD ─────────────────────────────
 interface DocumentItem {
@@ -43,6 +47,7 @@ interface DocumentChunkRow {
 }
 
 export function DocumentsView() {
+  const confirm = useConfirm();
   const [items, setItems] = useState<DocumentItem[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -100,7 +105,13 @@ export function DocumentsView() {
   }
 
   async function handleDelete(id: string) {
-    if (!window.confirm(`删除文档？关联 chunks 不会被删除，但失去文档归属。`)) return;
+    const ok = await confirm({
+      title: "删除文档？",
+      body: "关联知识条目不会被删除，但会失去文档归属。",
+      tone: "danger",
+      confirmText: "确认删除",
+    });
+    if (!ok) return;
     try {
       const r = await fetch(`/api/operation-knowledge/documents/${encodeURIComponent(id)}`, { method: "DELETE" });
       if (!r.ok) throw await parseApiError(r);
@@ -134,7 +145,7 @@ export function DocumentsView() {
   return (
     <div className="wikiArchiveShell" style={{ padding: 18 }}>
       <header className="wikiArchiveHeader">
-        <span className="wikiArchiveSubtitle">Documents · 文档目录</span>
+        <span className="wikiArchiveSubtitle">文档目录</span>
         <h3 style={{ fontSize: 20 }}>知识文档</h3>
       </header>
       {error ? <div className="wikiAlert error">{error}</div> : null}
@@ -158,10 +169,10 @@ export function DocumentsView() {
           onChange={(e) => setDraft({ ...draft, sourceType: e.target.value })}
           className="wikiInput"
         >
-          <option value="imported_markdown">imported_markdown</option>
-          <option value="manual">manual</option>
-          <option value="external_url">external_url</option>
-          <option value="archived">archived</option>
+          <option value="imported_markdown">{sourceTypeLabel("imported_markdown")}</option>
+          <option value="manual">{sourceTypeLabel("manual")}</option>
+          <option value="external_url">{sourceTypeLabel("external_url")}</option>
+          <option value="archived">{sourceTypeLabel("archived")}</option>
         </select>
         <button type="submit" className="wikiBtn" disabled={creating || !draft.title.trim()}>
           {creating ? "保存中…" : "新建"}
@@ -191,12 +202,12 @@ export function DocumentsView() {
                     {(d.businessTopics ?? []).map((t, i) => <span key={i} className="wikiArchiveTag">{t}</span>)}
                   </div>
                 </td>
-                <td style={{ padding: "10px 6px", fontFamily: "var(--font-mono)", fontSize: 12 }}>
-                  <div>{d.sourceType ?? "—"}</div>
+                <td style={{ padding: "10px 6px", fontSize: 12 }}>
+                  <div>{sourceTypeLabel(d.sourceType ?? undefined)}</div>
                   <div style={{ color: "var(--muted)" }}>{d.sourceName ?? ""}</div>
                 </td>
                 <td style={{ padding: "10px 6px" }}>
-                  <span className="wikiBadge">{d.status ?? "—"}</span>
+                  <span className="wikiBadge">{statusLabel(d.status ?? undefined)}</span>
                 </td>
                 <td style={{ padding: "10px 6px", fontFamily: "var(--font-mono)", fontSize: 11, color: "var(--muted)" }}>
                   {d.updatedAt ? new Date(d.updatedAt).toLocaleString() : "—"}
@@ -208,24 +219,24 @@ export function DocumentsView() {
                     style={{ marginRight: 6 }}
                     onClick={() => void toggleDocChunks(d.id)}
                   >
-                    {expandedDoc === d.id ? "收起 chunks" : "查看 chunks"}
+                    {expandedDoc === d.id ? "收起知识条目" : "查看知识条目"}
                   </button>
                   <button type="button" className="wikiArchiveRollback" onClick={() => handleDelete(d.id)}>删除</button>
                 </td>
               </tr>
               {expandedDoc === d.id ? (
                 <tr>
-                  <td colSpan={5} style={{ background: "var(--surface-2, #f4efe5)", padding: "10px 14px" }}>
+                  <td colSpan={5} style={{ background: "var(--surface-page)", padding: "10px 14px" }}>
                     {docChunksLoading === d.id ? (
-                      <div className="wikiHint">正在拉 chunks…</div>
+                      <div className="wikiHint">正在加载…</div>
                     ) : docChunksError ? (
                       <div className="wikiAlert error">{docChunksError}</div>
                     ) : (docChunks[d.id]?.length ?? 0) === 0 ? (
-                      <div className="wikiHint">该文档下还没有 chunks。可走导入向导或手工新建。</div>
+                      <div className="wikiHint">该文档下还没有知识条目。可走导入向导或手工新建。</div>
                     ) : (
                       <div style={{ display: "grid", gap: 4 }}>
                         <div style={{ fontFamily: "var(--font-mono)", fontSize: 11, color: "var(--muted)", marginBottom: 4 }}>
-                          {docChunks[d.id].length} chunks · 点击编号跳到 ChunkInspectorPane
+                          {docChunks[d.id].length} 条知识 · 点击编号查看详情
                         </div>
                         {docChunks[d.id].map((c) => (
                           <button
@@ -235,9 +246,9 @@ export function DocumentsView() {
                             onClick={() => focusChunk(c.id)}
                             style={{ textAlign: "left", display: "grid", gridTemplateColumns: "120px 100px 1fr auto", gap: 8, alignItems: "center" }}
                           >
-                            <span className="wikiArchiveTag">{c.wikiType ?? "—"}</span>
-                            <span style={{ fontFamily: "var(--font-mono)", fontSize: 11 }}>
-                              {c.status ?? "—"} / {c.integrityStatus ?? "—"}
+                            <span className="wikiArchiveTag">{wikiTypeLabel(c.wikiType ?? undefined)}</span>
+                            <span style={{ fontSize: 11 }}>
+                              {statusLabel(c.status ?? undefined)} / {integrityStatusLabel(c.integrityStatus ?? undefined)}
                             </span>
                             <span style={{ fontFamily: "var(--font-display)", fontWeight: 600 }}>
                               {c.title ?? "（无标题）"}
@@ -277,6 +288,7 @@ interface ImportPreviewResult {
 }
 
 export function ImportWizard() {
+  const confirm = useConfirm();
   const [step, setStep] = useState<1 | 2 | 3>(1);
   const [content, setContent] = useState("");
   const [sourceName, setSourceName] = useState("");
@@ -288,6 +300,10 @@ export function ImportWizard() {
   const [created, setCreated] = useState<string[]>([]);
   // G-后续/4：AI 重抽 tags 按钮单条 loading 标记。
   const [retagging, setRetagging] = useState<number | null>(null);
+
+  // 文件直接落库前的知情确认（PDF/图片无逐条预览，B3）
+  const confirmImport = (title: string, body: string) =>
+    confirm({ title, body, confirmText: "继续上传" });
 
   async function retagCandidate(i: number) {
     const merged = { ...(preview?.chunks ?? [])[i], ...(edits[i] ?? {}) };
@@ -396,7 +412,7 @@ export function ImportWizard() {
   return (
     <div className="wikiArchiveShell" style={{ padding: 18 }}>
       <header className="wikiArchiveHeader">
-        <span className="wikiArchiveSubtitle">Import Wizard · 文档导入</span>
+        <span className="wikiArchiveSubtitle">文档导入</span>
         <h3 style={{ fontSize: 20 }}>导入向导</h3>
       </header>
       <div className="wikiImportStepper">
@@ -427,19 +443,19 @@ export function ImportWizard() {
             onChange={(e) => setContent(e.target.value)}
             rows={14}
             className="wikiInput"
-            style={{ width: "100%", fontFamily: "var(--font-mono)", fontSize: 12 }}
+            style={{ width: "100%", fontFamily: "var(--font-mono)", fontSize: 12, minHeight: 200, maxHeight: 500, resize: "vertical" }}
           />
           <div style={{ marginTop: 10, display: "flex", gap: 8 }}>
             <button type="button" className="wikiBtn" onClick={runPreview} disabled={pending || !content.trim()}>
               {pending ? "解析中…" : "下一步：预览"}
             </button>
             <span style={{ color: "var(--muted)", fontSize: 12, alignSelf: "center" }}>
-              将由 AI 拆为候选 chunk，所有 chunk 默认 status=draft + integrity_status=needs_review。
+              AI 会把内容拆成多条知识，全部保存为待确认草稿，需你逐条确认后 AI 才会使用。
             </span>
           </div>
           <div style={{ marginTop: 14, padding: "10px 12px", border: "1px dashed var(--border)", borderRadius: 6 }}>
             <div style={{ fontSize: 12, color: "var(--muted)", marginBottom: 6 }}>
-              · multimodal 入口（绕过 AI preview，直接 fence 解析 / vision 抽取，落 status=draft）
+              上传文件后由 AI 自动识别为草稿知识，结果同样需在「待评审」里确认后才会被 AI 使用。
             </div>
             <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
               <label className="wikiBtn" style={{ cursor: pending ? "not-allowed" : "pointer", margin: 0 }}>
@@ -452,6 +468,14 @@ export function ImportWizard() {
                   onChange={async (ev) => {
                     const f = ev.target.files?.[0];
                     if (!f) return;
+                    const ok = await confirmImport(
+                      "上传 PDF 识别？",
+                      "PDF 将由 AI 直接拆分为草稿知识，不经逐条预览。结果均为草稿，需你稍后在「待评审」里逐条确认才会被 AI 使用。"
+                    );
+                    if (!ok) {
+                      ev.target.value = "";
+                      return;
+                    }
                     setPending(true);
                     setError(null);
                     try {
@@ -479,7 +503,7 @@ export function ImportWizard() {
                 />
               </label>
               <label className="wikiBtn" style={{ cursor: pending ? "not-allowed" : "pointer", margin: 0 }}>
-                {pending ? "上传中…" : "上传图片（vision）"}
+                {pending ? "上传中…" : "上传图片识别"}
                 <input
                   type="file"
                   accept="image/*"
@@ -488,14 +512,25 @@ export function ImportWizard() {
                   onChange={async (ev) => {
                     const f = ev.target.files?.[0];
                     if (!f) return;
+                    const ok = await confirmImport(
+                      "上传图片识别？",
+                      "图片将由 AI（视觉模型）识别为草稿知识，不经逐条预览。识别结果均为草稿，需你稍后在「待评审」里逐条确认才会被 AI 使用。"
+                    );
+                    if (!ok) {
+                      ev.target.value = "";
+                      return;
+                    }
                     setPending(true);
                     setError(null);
                     try {
-                      const buf = await f.arrayBuffer();
-                      let bin = "";
-                      const u8 = new Uint8Array(buf);
-                      for (let i = 0; i < u8.byteLength; i++) bin += String.fromCharCode(u8[i]);
-                      const b64 = btoa(bin);
+                      // 异步 base64：FileReader 不阻塞主线程，避免大图同步逐字节拼接卡死/爆栈
+                      const dataUrl: string = await new Promise((resolve, reject) => {
+                        const reader = new FileReader();
+                        reader.onload = () => resolve(reader.result as string);
+                        reader.onerror = () => reject(reader.error ?? new Error("读取图片失败"));
+                        reader.readAsDataURL(f);
+                      });
+                      const b64 = dataUrl.includes(",") ? dataUrl.slice(dataUrl.indexOf(",") + 1) : dataUrl;
                       const r = await fetch("/api/operation-knowledge/import-apply-image", {
                         method: "POST",
                         headers: { "content-type": "application/json" },
@@ -537,7 +572,7 @@ export function ImportWizard() {
           ) : null}
           <hr className="wikiArchiveRule" />
           <div style={{ marginBottom: 8, fontFamily: "var(--font-mono)", fontSize: 12, color: "var(--muted)" }}>
-            候选 chunks · {selected.size}/{(preview.chunks ?? []).length} 已选
+            候选知识 · 已选 {selected.size} / 共 {(preview.chunks ?? []).length} 条
           </div>
           <div style={{ display: "grid", gap: 10 }}>
             {(preview.chunks ?? []).map((c, i) => {
@@ -567,9 +602,9 @@ export function ImportWizard() {
                       style={{ marginLeft: "auto", fontSize: 11, padding: "2px 8px" }}
                       onClick={() => void retagCandidate(i)}
                       disabled={retagging === i || !merged.body}
-                      title="调 /extract-tags 重抽 productTags / businessTopics"
+                      title="让 AI 重新提取业务主题与产品标签"
                     >
-                      {retagging === i ? "AI 抽取中…" : "AI 重抽 tags"}
+                      {retagging === i ? "AI 抽取中…" : "AI 重新分类"}
                     </button>
                   </div>
                 </div>
@@ -707,12 +742,11 @@ export function TryRecallView() {
   return (
     <div className="wikiArchiveShell" style={{ padding: 18 }}>
       <header className="wikiArchiveHeader">
-        <span className="wikiArchiveSubtitle">Try Recall · 试召诊断</span>
-        <h3 style={{ fontSize: 20 }}>按 catalog 试召</h3>
+        <span className="wikiArchiveSubtitle">知识检索诊断</span>
+        <h3 style={{ fontSize: 20 }}>测试检索</h3>
       </header>
       <p style={{ color: "var(--muted)", fontSize: 12.5, margin: "0 0 12px" }}>
-        给定 accountId（可选 contactId）和一句话 query，调用知识路由器看哪些 chunk 被选上，
-        以及 tool_trace 里的 catalog → list_chunks → open_slice 决策链。开发者调试 grounding 用。
+        输入一个问题，看知识库会匹配出哪些知识条目，帮你检查知识的检索效果。客户 ID、联系人 ID 可选填。
       </p>
       <form
         onSubmit={(e) => { e.preventDefault(); void runSearch(); }}
@@ -720,34 +754,34 @@ export function TryRecallView() {
       >
         <input
           type="text"
-          placeholder="accountId（默认 default）"
+          placeholder="客户 ID（可选，默认 default）"
           value={accountId}
           onChange={(e) => setAccountId(e.target.value)}
           className="wikiInput"
         />
         <input
           type="text"
-          placeholder="contactId（可选）"
+          placeholder="联系人 ID（可选）"
           value={contactId}
           onChange={(e) => setContactId(e.target.value)}
           className="wikiInput"
         />
         <input
           type="text"
-          placeholder="query：例如「这个产品对接 SaaS 还是私有化」"
+          placeholder="问题：例如「这个产品对接 SaaS 还是私有化」"
           value={query}
           onChange={(e) => setQuery(e.target.value)}
           className="wikiInput"
         />
         <button type="submit" className="wikiBtn primary" disabled={pending || !query.trim()}>
-          {pending ? "试召中…" : "试召"}
+          {pending ? "检索中…" : "测试检索"}
         </button>
       </form>
       {error ? <div className="wikiAlert error">{error}</div> : null}
       {route ? (
         <>
           <dl className="wikiArchiveMeta">
-            <dt>风险等级</dt><dd>{route.riskLevel || "—"}</dd>
+            <dt>风险等级</dt><dd>{riskLevelLabel(route.riskLevel ?? undefined)}</dd>
             <dt>需证据</dt><dd>{route.requiresEvidence ? "是" : "否"}</dd>
             <dt>覆盖度</dt><dd>{route.knowledgeCoverage || "—"}</dd>
             {route.reason ? (<><dt>路由原因</dt><dd>{route.reason}</dd></>) : null}
@@ -766,8 +800,8 @@ export function TryRecallView() {
           </dl>
           <hr className="wikiArchiveRule" />
           <div style={{ marginBottom: 6, fontFamily: "var(--font-mono)", fontSize: 12, color: "var(--muted)" }}>
-            命中 chunks · {(route.selectedChunkIds ?? []).length} 条
-            {openingSlices ? "（正在拉详情…）" : ""}
+            匹配到的知识条目 · {(route.selectedChunkIds ?? []).length} 条
+            {openingSlices ? "（正在加载详情…）" : ""}
           </div>
           <div style={{ display: "grid", gap: 8, marginBottom: 12 }}>
             {slices.length > 0
@@ -780,9 +814,9 @@ export function TryRecallView() {
                   style={{ textAlign: "left", display: "grid", gap: 4 }}
                 >
                   <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
-                    <span className="wikiArchiveTag">{s.wikiType ?? "—"}</span>
-                    <span style={{ fontFamily: "var(--font-mono)", fontSize: 11, color: "var(--muted)" }}>
-                      {s.status ?? "—"} / {s.integrityStatus ?? "—"}
+                    <span className="wikiArchiveTag">{wikiTypeLabel(s.wikiType ?? undefined)}</span>
+                    <span style={{ fontSize: 11, color: "var(--muted)" }}>
+                      {statusLabel(s.status ?? undefined)} / {integrityStatusLabel(s.integrityStatus ?? undefined)}
                     </span>
                     <span style={{ fontFamily: "var(--font-display)", fontWeight: 600, marginLeft: 4 }}>
                       {s.title ?? "（无标题）"}
@@ -792,12 +826,12 @@ export function TryRecallView() {
                 </button>
               ))
               : (route.selectedChunkIds ?? []).length === 0
-                ? <div className="wikiHint">本次试召未选中任何 chunk。</div>
+                ? <div className="wikiHint">本次检索没有匹配到知识。</div>
                 : null}
           </div>
           {(route.selectedSliceReasons ?? []).length > 0 ? (
             <details>
-              <summary className="wikiInspectorSectionTitle">slice 选择原因（{(route.selectedSliceReasons ?? []).length}）</summary>
+              <summary className="wikiInspectorSectionTitle">条目选中原因（{(route.selectedSliceReasons ?? []).length}）</summary>
               <ul style={{ margin: "6px 0 0 18px", fontSize: 12.5 }}>
                 {(route.selectedSliceReasons ?? []).map((r, i) => <li key={i}>{r}</li>)}
               </ul>
@@ -805,15 +839,15 @@ export function TryRecallView() {
           ) : null}
           {(route.toolTrace ?? []).length > 0 ? (
             <details style={{ marginTop: 8 }}>
-              <summary className="wikiInspectorSectionTitle">tool_trace（{(route.toolTrace ?? []).length}）</summary>
-              <pre style={{ fontFamily: "var(--font-mono)", fontSize: 11, background: "var(--surface-2, #f4efe5)", padding: 10, border: "1px solid var(--line)", maxHeight: 320, overflow: "auto" }}>
+              <summary className="wikiInspectorSectionTitle">检索过程明细（{(route.toolTrace ?? []).length}）</summary>
+              <pre style={{ fontFamily: "var(--font-mono)", fontSize: 11, background: "var(--surface-page)", padding: 10, border: "1px solid var(--line)", maxHeight: 320, overflow: "auto" }}>
                 {JSON.stringify(route.toolTrace, null, 2)}
               </pre>
             </details>
           ) : null}
           {(route.evidenceExcerpts ?? []).length > 0 ? (
             <details style={{ marginTop: 8 }}>
-              <summary className="wikiInspectorSectionTitle">evidence_excerpts（{(route.evidenceExcerpts ?? []).length}）</summary>
+              <summary className="wikiInspectorSectionTitle">证据摘录（{(route.evidenceExcerpts ?? []).length}）</summary>
               <ul style={{ margin: "6px 0 0 18px", fontSize: 12.5 }}>
                 {(route.evidenceExcerpts ?? []).map((e, i) => <li key={i}><code>{e}</code></li>)}
               </ul>
@@ -843,15 +877,23 @@ interface GapSignalItem {
 
 // 8 类 gap_signal kind —— 与 src/knowledge_wiki/gap_signals.rs:11-19 对齐。
 const GAP_SIGNAL_KINDS: { v: string; label: string }[] = [
-  { v: "orphan", label: "孤立 chunk" },
-  { v: "broken_link", label: "断链" },
-  { v: "no_outlinks", label: "缺出链" },
-  { v: "low_confidence", label: "低分被命中" },
-  { v: "stale", label: "时效已过" },
-  { v: "contradiction", label: "同题异说" },
-  { v: "missing_chunk", label: "依赖已归档" },
-  { v: "suggestion", label: "建议补完" },
+  { v: "orphan", label: "孤立条目" },
+  { v: "broken_link", label: "失效引用" },
+  { v: "no_outlinks", label: "无出链" },
+  { v: "low_confidence", label: "低置信" },
+  { v: "stale", label: "内容过期" },
+  { v: "contradiction", label: "内容矛盾" },
+  { v: "missing_chunk", label: "缺失条目" },
+  { v: "suggestion", label: "改进建议" },
 ];
+
+const GAP_SIGNAL_KIND_LABEL: Record<string, string> = Object.fromEntries(
+  GAP_SIGNAL_KINDS.map((k) => [k.v, k.label]),
+);
+function gapKindLabel(v?: string | null): string {
+  if (!v) return "—";
+  return GAP_SIGNAL_KIND_LABEL[v] ?? v;
+}
 
 export function LintView() {
   const [items, setItems] = useState<GapSignalItem[]>([]);
@@ -891,8 +933,8 @@ export function LintView() {
       if (!r.ok) throw await parseApiError(r);
       const data = await r.json();
       setInfo(
-        `lint 新增 ${data?.structuralLint?.newSignals ?? 0}，` +
-          `stage1 自动消解 ${data?.sweep?.stage1AutoResolved ?? 0}`,
+        `扫描完成：新增 ${data?.structuralLint?.newSignals ?? 0} 个问题，` +
+          `自动处理 ${data?.sweep?.stage1AutoResolved ?? 0} 个。`,
       );
       await load();
     } catch (e: unknown) {
@@ -974,7 +1016,7 @@ export function LintView() {
                 onClick={() => setActiveKind(k.v)}
               >
                 <span>
-                  <span className={`wikiKind ${k.v}`}>{k.v}</span> {k.label}
+                  <span className={`wikiKind ${k.v}`} /> {k.label}
                 </span>
                 <span className="wikiLintCount">{c}</span>
               </button>
@@ -983,17 +1025,18 @@ export function LintView() {
         </div>
         <div className="wikiLintPanel">
           {!loading && visible.length === 0 ? (
-            <div className="wikiEmpty">
-              {activeKind ? `当前 kind 没有 pending 信号。` : "没有 pending 信号。库结构当前看起来很健康。"}
-            </div>
+            <EmptyState
+              title={activeKind ? "该类别暂无质量问题" : "暂无质量问题"}
+              hint={activeKind ? "切换左侧其他类别查看。" : "知识库当前结构健康，没有发现待处理的问题。"}
+            />
           ) : null}
           <div className="wikiSignalList">
             {visible.map((s) => (
               <div className={`wikiSignalCard sev-${s.severity}`} key={s.signalId}>
                 <div className="wikiSignalHead">
                   <div className="wikiSignalTitle">
-                    <span className={`wikiKind ${s.kind}`}>{s.kind}</span>
-                    <span className={`wikiSev ${s.severity}`}>{s.severity}</span>
+                    <span className={`wikiKind ${s.kind}`}>{gapKindLabel(s.kind)}</span>
+                    <span className={`wikiSev ${s.severity}`}>{severityLabel(s.severity)}</span>
                     <strong>{s.title}</strong>
                   </div>
                   <div className="wikiSignalActions">
@@ -1068,14 +1111,23 @@ export function LintView() {
 //
 // AI 永不自动 verify：所有按钮都是显式管理员维护动作，前端不做"批量自动 verify"。
 const REVIEW_CATEGORIES: { v: ReviewCategory; label: string; hint: string }[] = [
-  { v: "contested", label: "被否决", hint: "integrity_status=rejected — 已被管理员或 AI 否决，等待重新评估" },
-  { v: "needs_review", label: "待初审", hint: "integrity_status=needs_review — 等待管理员初审或补完证据" },
-  { v: "source_orphan", label: "缺源", hint: "缺 source_quote 或 source_anchors — 无法定位回原文档" },
-  { v: "pending_verification", label: "待 verify", hint: "已经有 source_quote，距 verify 一步之遥" },
-  { v: "dependents_pending", label: "关系残缺", hint: "related_chunks 引用了不在活跃集合中的 chunk" }
+  { v: "contested", label: "已退回", hint: "已被否决，等待重新评估" },
+  { v: "needs_review", label: "待初审", hint: "等待初审或补充证据" },
+  { v: "source_orphan", label: "缺少来源", hint: "缺少来源信息，无法追溯知识出处" },
+  { v: "pending_verification", label: "待确认", hint: "已有来源，距确认只差一步" },
+  { v: "dependents_pending", label: "关联不完整", hint: "关联到了已不在使用中的知识" }
 ];
 
-export function ReviewView() {
+const DIM_LABELS: Record<string, string> = {
+  capability: "能力",
+  pricing: "定价",
+  caseEvidence: "案例",
+  effectClaims: "效果数据",
+  deliveryBoundary: "交付边界",
+};
+
+export function ReviewView({ initialDimFilter }: { initialDimFilter?: string | null } = {}) {
+  const confirm = useConfirm();
   const [items, setItems] = useState<ReviewChunkItem[]>([]);
   const [loading, setLoading] = useState(false);
   const [busyId, setBusyId] = useState<string | null>(null);
@@ -1187,7 +1239,15 @@ export function ReviewView() {
 
   async function batchAction(action: "verify" | "archive") {
     if (selected.size === 0) return;
-    if (action === "archive" && !window.confirm(`批量 archive ${selected.size} 条 chunk？`)) return;
+    if (action === "archive") {
+      const ok = await confirm({
+        title: `批量归档 ${selected.size} 条知识？`,
+        body: "归档后这些知识不再参与 AI 应答，可在修订历史里追溯。",
+        tone: "danger",
+        confirmText: "确认归档",
+      });
+      if (!ok) return;
+    }
     setBatchBusy(true);
     setError(null);
     setInfo(null);
@@ -1233,7 +1293,6 @@ export function ReviewView() {
     <div className="wikiArchiveShell wikiReviewBody">
       <header className="wikiArchiveHeader">
         <div>
-          <div className="wikiArchiveEyebrow">explore / review queue</div>
           <h2>评审队列</h2>
         </div>
         <div className="wikiArchiveHeaderActions">
@@ -1248,6 +1307,11 @@ export function ReviewView() {
           仅展示活跃 chunks。verify / reject 直接走现有路由，AI 永不自动 verify。
         </span>
       </div>
+      {initialDimFilter ? (
+        <div className="wikiAlert info">
+          从概览「{DIM_LABELS[initialDimFilter] ?? initialDimFilter}」维度下钻而来：下面是待初审的草稿，确认后这块知识才有机会被 AI 使用。
+        </div>
+      ) : null}
       {error ? <div className="wikiAlert error">{error}</div> : null}
       {info ? <div className="wikiAlert info">{info}</div> : null}
       {selected.size > 0 ? (
@@ -1267,7 +1331,7 @@ export function ReviewView() {
             disabled={batchBusy}
             onClick={() => void batchAction("archive")}
           >
-            <Archive size={13} /> 批量 archive
+            <Archive size={13} /> 批量归档
           </button>
           <button
             type="button"
@@ -1321,9 +1385,7 @@ export function ReviewView() {
           ) : (
             <>
           {!loading && visible.length === 0 ? (
-            <div className="wikiEmpty">
-              当前类别没有待评审 chunk。
-            </div>
+            <EmptyState title="该类别暂无待评审知识" hint="切换上方其他类别查看。" />
           ) : null}
           <div className="wikiSignalList">
             {visible.map((c) => {
@@ -1341,12 +1403,12 @@ export function ReviewView() {
                       title="选中以批量 verify / archive"
                     />
                     <div className="wikiSignalTitle">
-                      <span className={`wikiKind ${c.wikiType ?? "unknown"}`}>{c.wikiType ?? "—"}</span>
+                      <span className={`wikiKind ${c.wikiType ?? "unknown"}`}>{wikiTypeLabel(c.wikiType ?? undefined)}</span>
                       {chunkTypeLabel(c.chunkType) ? (
                         <span className="wikiArchiveTag" title="运营用途：这条知识在 AI 回复里怎么用">{chunkTypeLabel(c.chunkType)}</span>
                       ) : null}
                       <span className={`wikiSev ${c.integrityStatus === "rejected" ? "error" : "info"}`}>
-                        {c.integrityStatus ?? "—"}
+                        {integrityStatusLabel(c.integrityStatus ?? undefined)}
                       </span>
                       <button
                         type="button"
@@ -1479,6 +1541,7 @@ interface IngestSourceItem {
 }
 
 export function IngestSourcesView() {
+  const confirm = useConfirm();
   const [items, setItems] = useState<IngestSourceItem[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -1542,7 +1605,13 @@ export function IngestSourcesView() {
   }
 
   async function handleDelete(id: string) {
-    if (!window.confirm("删除外部源？已 ingest 的 chunks 不会被回收。")) return;
+    const ok = await confirm({
+      title: "删除外部源？",
+      body: "已抓取入库的知识不会被回收。",
+      tone: "danger",
+      confirmText: "确认删除",
+    });
+    if (!ok) return;
     try {
       const r = await fetch(`/api/knowledge/ingest-sources/${encodeURIComponent(id)}`, { method: "DELETE" });
       if (!r.ok) throw await parseApiError(r);
@@ -1555,11 +1624,11 @@ export function IngestSourcesView() {
   return (
     <div className="wikiArchiveShell" style={{ padding: 18 }}>
       <header className="wikiArchiveHeader">
-        <span className="wikiArchiveSubtitle">Ingest Sources · 外部源自动 ingest</span>
+        <span className="wikiArchiveSubtitle">外部源自动抓取</span>
         <h3 style={{ fontSize: 20 }}>外部源</h3>
         <p style={{ color: "var(--wiki-muted)", fontSize: 12, marginTop: 6 }}>
-          周期性拉取 RSS / HTML 源，落库 chunk 默认 draft + needs_review（AI 永不自动 verify）。
-          连续 3 次失败 → status=failing；7 天不可达 → status=disabled。
+          从 RSS 或网页定时抓取内容，自动保存为待确认草稿（AI 不会自动确认）。
+          连续 3 次抓取失败会标记为「连续失败」，7 天无法访问会自动停用。
         </p>
       </header>
       {error ? <div className="wikiAlert error">{error}</div> : null}
@@ -1577,8 +1646,8 @@ export function IngestSourcesView() {
           onChange={(e) => setDraft({ ...draft, kind: e.target.value })}
           className="wikiInput"
         >
-          <option value="rss">rss</option>
-          <option value="html">html</option>
+          <option value="rss">{sourceKindLabel("rss")}</option>
+          <option value="html">{sourceKindLabel("html")}</option>
         </select>
         <input
           type="text"
@@ -1609,18 +1678,18 @@ export function IngestSourcesView() {
       {loading ? (
         <div className="wikiHint">加载中…</div>
       ) : items.length === 0 ? (
-        <div className="wikiHint">暂无外部源。新增后由 worker 周期拉取。</div>
+        <div className="wikiHint">暂无外部源。新增后会每隔一段时间自动抓取。</div>
       ) : (
         <table className="wikiTable" style={{ width: "100%", fontSize: 13 }}>
           <thead>
             <tr>
-              <th style={{ textAlign: "left" }}>kind</th>
-              <th style={{ textAlign: "left" }}>URL / 标签</th>
+              <th style={{ textAlign: "left" }}>类型</th>
+              <th style={{ textAlign: "left" }}>网址 / 标签</th>
               <th style={{ textAlign: "right" }}>间隔</th>
               <th style={{ textAlign: "left" }}>最后拉取</th>
               <th style={{ textAlign: "left" }}>状态</th>
               <th style={{ textAlign: "right" }}>失败次数</th>
-              <th style={{ textAlign: "right" }}>已 ingest</th>
+              <th style={{ textAlign: "right" }}>已入库</th>
               <th style={{ textAlign: "left" }}>错误</th>
               <th />
             </tr>
@@ -1628,7 +1697,7 @@ export function IngestSourcesView() {
           <tbody>
             {items.map((it) => (
               <tr key={it.sourceId}>
-                <td>{it.kind}</td>
+                <td>{sourceKindLabel(it.kind)}</td>
                 <td style={{ maxWidth: 360, wordBreak: "break-all" }}>
                   <div>{it.url}</div>
                   {it.label ? (
@@ -1651,7 +1720,7 @@ export function IngestSourcesView() {
                           : "var(--wiki-error-bg, #fee4e2)",
                     }}
                   >
-                    {it.status}
+                    {ingestStatusLabel(it.status)}
                   </span>
                 </td>
                 <td style={{ textAlign: "right" }}>{it.failureStreak ?? 0}</td>
@@ -1734,26 +1803,38 @@ export function ObservabilityDashboard() {
   const load = useCallback(async () => {
     setPending(true);
     setError(null);
+    // 逐端点隔离:任一失败只让对应卡片空缺,不再整页全黑(此前 Promise.all + 无 r.ok 检查,
+    // 任一端点 500/返回 HTML 即 JSON 解析抛错,八张卡全没)。
+    async function safe<T>(url: string): Promise<T | null> {
+      try {
+        const r = await fetch(url);
+        if (!r.ok) return null;
+        return (await r.json()) as T;
+      } catch {
+        return null;
+      }
+    }
     try {
-      const [a, b, c, d, e, f, g, h] = await Promise.all([
-        fetch("/api/operation-knowledge/catalog/persisted").then((r) => r.json()),
-        fetch("/api/operation-knowledge/catalog").then((r) => r.json()),
-        fetch("/api/operation-knowledge/completeness").then((r) => r.json()),
-        fetch("/api/operation-knowledge/integrity-report").then((r) => r.json()),
-        fetch("/api/operation-knowledge/logs/analyze").then((r) => r.json()),
-        fetch("/api/knowledge/metrics").then((r) => r.json()),
-        fetch("/api/admin/observability/phase-rollup").then((r) => r.json()),
-        fetch("/api/admin/observability/worker-health").then((r) => r.json())
-      ]);
-      setCatalog(a as CatalogPersistedView);
-      setCatalogLive(b as { total?: number });
-      setCompleteness(parseCompleteness(c));
-      setIntegrity(parseIntegrityReport(d));
-      setLogs(e as LogsAnalyzeView);
-      const metrics = f as { answerCache?: typeof cacheStats };
-      setCacheStats(metrics?.answerCache ?? null);
-      setPhaseRollup(g as typeof phaseRollup);
-      setWorkerHealth(h as typeof workerHealth);
+      const [a, b, c, d, e, f, g, h] = await Promise.allSettled([
+        safe<CatalogPersistedView>("/api/operation-knowledge/catalog/persisted"),
+        safe<{ total?: number }>("/api/operation-knowledge/catalog"),
+        safe<unknown>("/api/operation-knowledge/completeness"),
+        safe<unknown>("/api/operation-knowledge/integrity-report"),
+        safe<LogsAnalyzeView>("/api/operation-knowledge/logs/analyze"),
+        safe<{ answerCache?: typeof cacheStats }>("/api/knowledge/metrics"),
+        safe<typeof phaseRollup>("/api/admin/observability/phase-rollup"),
+        safe<typeof workerHealth>("/api/admin/observability/worker-health"),
+      ]).then((rs) => rs.map((r) => (r.status === "fulfilled" ? r.value : null)));
+      if (a) setCatalog(a as CatalogPersistedView);
+      if (b) setCatalogLive(b as { total?: number });
+      if (c) setCompleteness(parseCompleteness(c));
+      if (d) setIntegrity(parseIntegrityReport(d));
+      if (e) setLogs(e as LogsAnalyzeView);
+      if (f) setCacheStats((f as { answerCache?: typeof cacheStats })?.answerCache ?? null);
+      if (g) setPhaseRollup(g as typeof phaseRollup);
+      if (h) setWorkerHealth(h as typeof workerHealth);
+      const failed = [a, b, c, d, e, f, g, h].filter((x) => x === null).length;
+      if (failed > 0) setError(`${failed} 项诊断数据加载失败，其余正常显示`);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -1776,7 +1857,7 @@ export function ObservabilityDashboard() {
         body: "{}"
       });
       if (!r.ok) throw await parseApiError(r);
-      setInfo("已触发 gap-signals sweep");
+      setInfo("已开始扫描知识库。");
       await load();
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
@@ -1793,7 +1874,6 @@ export function ObservabilityDashboard() {
     <div className="wikiArchiveShell wikiObservability">
       <header className="wikiArchiveHeader">
         <div>
-          <div className="wikiArchiveEyebrow">steward / diagnostics</div>
           <h2>诊断仪表</h2>
         </div>
         <div className="wikiArchiveHeaderActions">
@@ -1809,7 +1889,7 @@ export function ObservabilityDashboard() {
       <div className="wikiObservabilityGrid">
         <article className="wikiObservabilityCard">
           <header className="wikiObservabilityCardHead">
-            <span className="wikiArchiveTag">[catalog]</span>
+            <span className="wikiArchiveTag">catalog</span>
             <h4>目录覆盖</h4>
           </header>
           <dl className="wikiArchiveMeta">
@@ -1828,13 +1908,13 @@ export function ObservabilityDashboard() {
             onClick={() => void sweep()}
             disabled={sweeping}
           >
-            <Workflow size={12} /> {sweeping ? "扫描中…" : "触发 sweep"}
+            <Workflow size={12} /> {sweeping ? "扫描中…" : "立即扫描"}
           </button>
         </article>
 
         <article className="wikiObservabilityCard">
           <header className="wikiObservabilityCardHead">
-            <span className="wikiArchiveTag">[completeness]</span>
+            <span className="wikiArchiveTag">completeness</span>
             <h4>类型完整度</h4>
           </header>
           {completeness ? (
@@ -1860,7 +1940,7 @@ export function ObservabilityDashboard() {
 
         <article className="wikiObservabilityCard">
           <header className="wikiObservabilityCardHead">
-            <span className="wikiArchiveTag">[integrity]</span>
+            <span className="wikiArchiveTag">integrity</span>
             <h4>完整性诊断</h4>
           </header>
           <dl className="wikiArchiveMeta">
@@ -1877,7 +1957,7 @@ export function ObservabilityDashboard() {
 
         <article className="wikiObservabilityCard">
           <header className="wikiObservabilityCardHead">
-            <span className="wikiArchiveTag">[logs]</span>
+            <span className="wikiArchiveTag">logs</span>
             <h4>检索 trace（24h）</h4>
           </header>
           <dl className="wikiArchiveMeta">
@@ -1898,7 +1978,7 @@ export function ObservabilityDashboard() {
 
         <article className="wikiObservabilityCard">
           <header className="wikiObservabilityCardHead">
-            <span className="wikiArchiveTag">[answer-cache]</span>
+            <span className="wikiArchiveTag">answer-cache</span>
             <h4>问答缓存</h4>
           </header>
           {(() => {
@@ -1959,17 +2039,17 @@ function PhaseRollupPanel({
   return (
     <section className="wikiObservabilityPhaseRollup">
       <header className="wikiObservabilityCardHead">
-        <span className="wikiArchiveTag">[phase-rollup]</span>
+        <span className="wikiArchiveTag">phase-rollup</span>
         <h4>Phase 0-D 自治信号（{windowHours}h）</h4>
       </header>
       <div className="wikiObservabilityGrid">
         <article className="wikiObservabilityCard">
           <header className="wikiObservabilityCardHead">
-            <span className="wikiArchiveTag">[lifecycle]</span>
+            <span className="wikiArchiveTag">lifecycle</span>
             <h4>run lifecycle 终态</h4>
           </header>
           {lifecycleTotal === 0 ? (
-            <div className="wikiEmpty">窗口内无 run</div>
+            <div className="wikiEmpty">该时段无运行记录</div>
           ) : (
             <dl className="wikiArchiveMeta">
               {lifecycle.map((row, i) => (
@@ -1989,11 +2069,11 @@ function PhaseRollupPanel({
 
         <article className="wikiObservabilityCard">
           <header className="wikiObservabilityCardHead">
-            <span className="wikiArchiveTag">[revision]</span>
+            <span className="wikiArchiveTag">revision</span>
             <h4>single-shot revision top</h4>
           </header>
           {revisionReasons.length === 0 ? (
-            <div className="wikiEmpty">窗口内无 revision</div>
+            <div className="wikiEmpty">该时段无改动记录</div>
           ) : (
             <dl className="wikiArchiveMeta">
               {revisionReasons.map((row, i) => (
@@ -2008,11 +2088,11 @@ function PhaseRollupPanel({
 
         <article className="wikiObservabilityCard">
           <header className="wikiObservabilityCardHead">
-            <span className="wikiArchiveTag">[reviewer]</span>
+            <span className="wikiArchiveTag">reviewer</span>
             <h4>reviewer 误判信号</h4>
           </header>
           {reviewerMisjudge.length === 0 ? (
-            <div className="wikiEmpty">窗口内无误判信号</div>
+            <div className="wikiEmpty">该时段无误判信号</div>
           ) : (
             <dl className="wikiArchiveMeta">
               {reviewerMisjudge.map((row, i) => (
@@ -2027,7 +2107,7 @@ function PhaseRollupPanel({
 
         <article className="wikiObservabilityCard">
           <header className="wikiObservabilityCardHead">
-            <span className="wikiArchiveTag">[negative-example]</span>
+            <span className="wikiArchiveTag">negative-example</span>
             <h4>负例候选 needs_review</h4>
           </header>
           <dl className="wikiArchiveMeta">
@@ -2092,13 +2172,13 @@ function WorkerHealthPanel({
   return (
     <section className="wikiObservabilityPhaseRollup">
       <header className="wikiObservabilityCardHead">
-        <span className="wikiArchiveTag">[worker-health]</span>
+        <span className="wikiArchiveTag">worker-health</span>
         <h4>worker 健康聚合</h4>
       </header>
       <div className="wikiObservabilityGrid">
         <article className="wikiObservabilityCard">
           <header className="wikiObservabilityCardHead">
-            <span className="wikiArchiveTag">[chat-tasks]</span>
+            <span className="wikiArchiveTag">chat-tasks</span>
             <h4>chat task 状态</h4>
           </header>
           {chatTotal === 0 ? (
@@ -2132,7 +2212,7 @@ function WorkerHealthPanel({
               <ul style={{ margin: 0, paddingLeft: "1.2em" }}>
                 {chatErrors.map((row, i) => (
                   <li key={i}>
-                    <span className="wikiArchiveTag">[{row.errorKind}]</span> {row.count}
+                    <span className="wikiArchiveTag">{row.errorKind}</span> {row.count}
                   </li>
                 ))}
               </ul>
@@ -2142,7 +2222,7 @@ function WorkerHealthPanel({
 
         <article className="wikiObservabilityCard">
           <header className="wikiObservabilityCardHead">
-            <span className="wikiArchiveTag">[gap-signals]</span>
+            <span className="wikiArchiveTag">gap-signals</span>
             <h4>gap signals · sweep 命中率</h4>
           </header>
           <dl className="wikiArchiveMeta">
@@ -2165,7 +2245,7 @@ function WorkerHealthPanel({
               <ul style={{ margin: 0, paddingLeft: "1.2em" }}>
                 {gapKinds.map((row, i) => (
                   <li key={i}>
-                    <span className="wikiArchiveTag">[{row.kind}]</span> {row.count}
+                    <span className="wikiArchiveTag">{row.kind}</span> {row.count}
                   </li>
                 ))}
               </ul>
@@ -2193,11 +2273,11 @@ function WorkerHealthPanel({
 
         <article className="wikiObservabilityCard">
           <header className="wikiObservabilityCardHead">
-            <span className="wikiArchiveTag">[lessons-learned]</span>
+            <span className="wikiArchiveTag">lessons-learned</span>
             <h4>lessons_learned ({lessonsWindow}d)</h4>
           </header>
           {lessonsPatterns.length === 0 ? (
-            <div className="wikiEmpty">窗口内无产出</div>
+            <div className="wikiEmpty">该时段无产出</div>
           ) : (
             <dl className="wikiArchiveMeta">
               {lessonsPatterns.map((row, i) => (
@@ -2263,7 +2343,7 @@ function TestMatchPanel() {
   return (
     <section className="wikiObservabilityCard wikiTestMatch">
       <header className="wikiObservabilityCardHead">
-        <span className="wikiArchiveTag">[test-match]</span>
+        <span className="wikiArchiveTag">test-match</span>
         <h4>检索调试</h4>
       </header>
       <div className="wikiTestMatchRow">
@@ -2271,7 +2351,7 @@ function TestMatchPanel() {
           type="text"
           value={query}
           onChange={(e) => setQuery(e.target.value)}
-          placeholder="输入查询，看哪些 chunk 命中 + grounding score"
+          placeholder="输入一个问题，看会匹配到哪些知识及其匹配分"
           onKeyDown={(e) => {
             if (e.key === "Enter") {
               e.preventDefault();
@@ -2315,7 +2395,7 @@ export function ChunkRevisionsDrawer() {
   async function load() {
     const id = chunkId.trim();
     if (!id) {
-      setError("请输入 chunkId（24 位 ObjectId 十六进制）。");
+      setError("请先选择一条要查看改动历史的知识。");
       return;
     }
     setPending(true);
@@ -2348,24 +2428,22 @@ export function ChunkRevisionsDrawer() {
   return (
     <div className="wikiPanelBody">
       <div className="wikiToolbar">
-        <input
-          type="text"
-          className="wikiInput"
-          placeholder="输入 chunkId 查看 revision 历史"
-          value={chunkId}
-          onChange={(e) => setChunkId(e.target.value)}
-          onKeyDown={(e) => {
-            if (e.key === "Enter") void load();
-          }}
-        />
+        <div style={{ flex: 1, minWidth: 200 }}>
+          <ChunkPicker
+            value={chunkId}
+            onChange={setChunkId}
+            loadChunks={loadChunkOptions}
+            placeholder="选择要查看改动历史的知识"
+          />
+        </div>
         <button type="button" className="primary" onClick={() => void load()} disabled={pending}>
-          {pending ? "加载中…" : "拉取历史"}
+          {pending ? "加载中…" : "查看历史"}
         </button>
-        <span className="wikiHint">timeline 倒序；每行展开查看 patch JSON 与 hash。</span>
+        <span className="wikiHint">按时间倒序显示该知识的所有改动历史；展开可看改动详情。</span>
       </div>
       {error ? <div className="wikiAlert error">{error}</div> : null}
       {!pending && chunkId && items.length === 0 && !error ? (
-        <div className="wikiEmpty">该 chunk 暂无 revision 记录。</div>
+        <EmptyState title="还没有改动历史" hint="这条知识自创建以来还没有被修改过。" />
       ) : null}
       <div className="wikiRevisionList">
         {items.map((r) => {
@@ -2373,8 +2451,8 @@ export function ChunkRevisionsDrawer() {
           return (
             <div className={`wikiRevCard op-${r.op}`} key={r.revisionId}>
               <div className="wikiRevHead" onClick={() => toggle(r.revisionId)}>
-                <span className={`wikiOp ${r.op}`}>{r.op}</span>
-                <span className={`wikiSource ${r.source}`}>{r.source}</span>
+                <span className={`wikiOp ${r.op}`}>{revisionOpLabel(r.op)}</span>
+                <span className={`wikiSource ${r.source}`}>{revisionSourceLabel(r.source)}</span>
                 <span className="wikiRevTime">{r.createdAt ?? ""}</span>
                 <span className="wikiRevId">{r.revisionId}</span>
                 {r.reason ? <span className="wikiRevReason">{r.reason}</span> : null}

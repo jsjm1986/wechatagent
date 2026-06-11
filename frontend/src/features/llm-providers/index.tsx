@@ -556,11 +556,23 @@ export default function LlmProvidersFeature() {
                 onChange={(e) => setDraft({ ...draft, baseUrl: e.target.value })}
                 disabled={busy}
                 placeholder={
-                  draft.format === "messages" ? "https://your-host" : "https://your-host/v1"
+                  draft.format === "messages"
+                    ? "https://api.your-provider.com"
+                    : "https://api.your-provider.com/v1"
                 }
               />
               <small className={styles.fieldHint}>
-                Chat Completions 协议需含 /v1；Messages 协议填到根域即可
+                {draft.format === "messages" ? (
+                  <>
+                    系统会向 <code>baseUrl + /v1/messages</code> 发请求。请填到根域，<strong>不要</strong>带 <code>/v1</code>（如 <code>https://api.your-provider.com</code>）。
+                  </>
+                ) : (
+                  <>
+                    系统会向 <code>baseUrl + /chat/completions</code> 发请求，<strong>不会自动补任何路径</strong>。请直接粘贴服务商文档里的「OpenAI 兼容 base_url」原文，末尾不带斜杠。常见两种形态：
+                    <br />· 带版本号路径：<code>https://api.your-provider.com/v1</code>
+                    <br />· 带兼容模式路径：<code>https://api.your-provider.com/compatible-mode/v1</code>
+                  </>
+                )}
               </small>
             </label>
             <label className={`${styles.field} ${styles.spanFull}`}>

@@ -1,11 +1,21 @@
 import { Suspense, useEffect, useRef, useState } from "react";
-import { LogOut, Check, ChevronsUpDown } from "lucide-react";
+import { LogOut, Check, ChevronsUpDown, RefreshCw } from "lucide-react";
 import { CHANNELS } from "./channels";
 import { useNavigationStore } from "../stores/navigationStore";
 import { useAuthStore } from "../stores/authStore";
 import { useAccountStore } from "../stores/accountStore";
+import { api } from "../lib/api";
 import type { Account } from "../types";
 import styles from "./Shell.module.css";
+
+/// 从 MCP 拉取并 upsert 微信号，再回拉账号列表刷新 store。供账号选择器
+/// 复用——0 账号空态（新部署）和已有账号下都能触发。返回同步到的账号数。
+async function syncAccounts(): Promise<number> {
+  const res = await api.post<{ synced: number }>("/api/accounts/sync");
+  const data = await api.get<{ items: Account[] }>("/api/accounts");
+  useAccountStore.getState().setAccounts(data.items);
+  return res.synced;
+}
 
 const GROUP_ORDER: ReadonlyArray<"运营" | "知识" | "系统"> = ["运营", "知识", "系统"];
 
@@ -14,6 +24,8 @@ function AccountSwitcher() {
   const selectedAccountId = useAccountStore((s) => s.selectedAccountId);
   const selectAccount = useAccountStore((s) => s.selectAccount);
   const [open, setOpen] = useState(false);
+  const [syncing, setSyncing] = useState(false);
+  const [syncError, setSyncError] = useState("");
   const ref = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -25,7 +37,37 @@ function AccountSwitcher() {
     return () => document.removeEventListener("mousedown", onDoc);
   }, [open]);
 
-  if (accounts.length === 0) return null;
+  async function handleSync() {
+    if (syncing) return;
+    setSyncing(true);
+    setSyncError("");
+    try {
+      await syncAccounts();
+    } catch (e) {
+      setSyncError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setSyncing(false);
+    }
+  }
+
+  // 0 账号空态（如全新部署尚未同步）：选择器无内容可选，直接给一个同步入口，
+  // 否则用户在 UI 里永远拉不进微信号。
+  if (accounts.length === 0) {
+    return (
+      <div className={styles.acct}>
+        <button
+          type="button"
+          className={styles.acctSync}
+          onClick={handleSync}
+          disabled={syncing}
+        >
+          <RefreshCw size={14} className={syncing ? styles.acctSyncSpin : ""} />
+          <span>{syncing ? "正在同步…" : "同步微信号"}</span>
+        </button>
+        {syncError && <div className={styles.acctSyncErr}>{syncError}</div>}
+      </div>
+    );
+  }
 
   const currentAccountId = accounts.some((a) => a.accountId === selectedAccountId)
     ? selectedAccountId
@@ -68,6 +110,19 @@ function AccountSwitcher() {
               </button>
             );
           })}
+          <div className={styles.acctMenuDivider} />
+          <button
+            type="button"
+            className={styles.acctOption}
+            onClick={handleSync}
+            disabled={syncing}
+          >
+            <RefreshCw size={14} className={syncing ? styles.acctSyncSpin : ""} />
+            <span className={styles.acctOptionName}>
+              {syncing ? "正在同步…" : "同步微信号"}
+            </span>
+          </button>
+          {syncError && <div className={styles.acctSyncErr}>{syncError}</div>}
         </div>
       )}
     </div>
