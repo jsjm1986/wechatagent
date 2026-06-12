@@ -81,6 +81,12 @@ struct CachedEntry {
     aliases: Vec<String>,
     /// `"active"` | `"deprecated"`。
     status: String,
+    /// universal-domain-adaptation 1C：planner 漏斗排序权重（来自 TaxonomyValue，
+    /// 1B 已 seed）。`None` = 该维度不参与漏斗排序（如 objection_type）。
+    priority_weight: Option<i32>,
+    /// universal-domain-adaptation 1C：是否终态（成交后维护 / 冷却 / 沉默等不再被
+    /// stage_stagnation 段催促）。planner 据此构造 terminal 集合替代写死的 TERMINAL_STAGES。
+    is_terminal: bool,
 }
 
 impl Default for TaxonomyCache {
@@ -136,6 +142,8 @@ impl TaxonomyCache {
                     canonical_id: entry.value.id,
                     aliases: entry.value.aliases,
                     status: entry.value.status,
+                    priority_weight: entry.value.priority_weight,
+                    is_terminal: entry.value.is_terminal,
                 });
         }
         let mut inner = self.inner.lock();
@@ -236,6 +244,36 @@ pub(crate) fn check_value(
         }
     }
     TaxonomyMatch::CandidateNew
+}
+
+/// universal-domain-adaptation 1C：取某 `kind` 维度所有取值的 `(canonical_id,
+/// priority_weight, is_terminal)`，供 planner 构造漏斗排序权重表 + 终态集合。
+///
+/// 只读 active + deprecated（与 check_value 同源缓存）；scope 优先 account 私有、
+/// 回落 global。同 canonical_id 跨 scope 命中时 account 优先（先插入者赢，account
+/// 在前）。返回的权重 `None` 表示该取值不参与漏斗排序。
+///
+/// 调用方负责保证 cache 已加载。planner 每个 tick 调一次构造 `PlannerStageConfig`，
+/// 避免 N+1。空缓存（未配置 / 加载失败）返回空 Vec，planner 回落写死的 DEFAULT。
+pub(crate) fn dimension_value_weights(
+    kind: &str,
+    scope_account_id: &str,
+    cache: &TaxonomyCache,
+) -> Vec<(String, Option<i32>, bool)> {
+    let inner = cache.inner.lock();
+    let mut out: Vec<(String, Option<i32>, bool)> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for scope in [scope_account_id, "global"] {
+        let key = (scope.to_string(), kind.to_string());
+        if let Some(entries) = inner.entries.get(&key) {
+            for e in entries {
+                if seen.insert(e.canonical_id.clone()) {
+                    out.push((e.canonical_id.clone(), e.priority_weight, e.is_terminal));
+                }
+            }
+        }
+    }
+    out
 }
 
 /// 异步 upsert 候选。
@@ -523,6 +561,8 @@ pub fn taxonomy_cache_for_tests(entries: Vec<TaxonomyEntry>) -> TaxonomyCache {
             canonical_id: entry.value.id,
             aliases: entry.value.aliases,
             status: entry.value.status,
+            priority_weight: entry.value.priority_weight,
+            is_terminal: entry.value.is_terminal,
         });
     }
     {
@@ -550,6 +590,8 @@ mod tests {
                     canonical_id: entry.value.id,
                     aliases: entry.value.aliases,
                     status: entry.value.status,
+                    priority_weight: entry.value.priority_weight,
+                    is_terminal: entry.value.is_terminal,
                 });
         }
         {

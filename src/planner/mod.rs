@@ -45,6 +45,16 @@ fn contact_customer_stage_updated_at(contact: &Contact) -> Option<DateTime> {
         .and_then(|d| d.get_datetime("customer_stage_updated_at").ok().copied())
 }
 
+/// universal-domain-adaptation 1C：按配置的停滞维度读 `<dim>_updated_at` 计时戳。
+/// DEFAULT dim="customer_stage" 时等价 [`contact_customer_stage_updated_at`]。
+fn contact_stagnation_updated_at(contact: &Contact, dim: &str) -> Option<DateTime> {
+    let key = format!("{dim}_updated_at");
+    contact
+        .domain_attributes
+        .as_ref()
+        .and_then(|d| d.get_datetime(key.as_str()).ok().copied())
+}
+
 /// 扫描器结束时输出的统计信息（写入 `*_tick` 事件 detail）。
 #[derive(Debug, Default, Clone, Copy)]
 struct ScanCounters {
@@ -593,6 +603,8 @@ async fn scan_commitments(state: &AppState) -> anyhow::Result<()> {
     let fallback_due_hours = state.config.strategic_planner_commitment_fallback_due_hours;
     let dedup_hours = state.config.strategic_planner_commitment_emit_dedup_hours;
     let priority_enabled = state.config.strategic_planner_priority_enabled;
+    // universal-domain-adaptation 1C：每 tick 构造一次漏斗排序配置（避免 N+1）。
+    let stage_config = resolve_planner_stage_config(state, &workspace_id, &account_id).await;
 
     let filter = commitment_candidate_filter(&workspace_id, &account_id);
     let mut cursor = state.db.contacts().find(filter, None).await?;
@@ -624,7 +636,7 @@ async fn scan_commitments(state: &AppState) -> anyhow::Result<()> {
 
     // 第二阶段：跨 contact 优先级稳定排序。priority_enabled=false 时退回 cursor 自然顺序。
     if priority_enabled {
-        candidates.sort_by(|a, b| commitment_priority_key(&a.0, &a.1).cmp(&commitment_priority_key(&b.0, &b.1)));
+        candidates.sort_by(|a, b| commitment_priority_key(&a.0, &a.1, &stage_config).cmp(&commitment_priority_key(&b.0, &b.1, &stage_config)));
     }
 
     // 第三阶段：按优先级序消费 daily cap，对每个候选检查 block-rate 反馈环。
@@ -722,6 +734,117 @@ async fn scan_commitments(state: &AppState) -> anyhow::Result<()> {
 /// `system_taxonomies` 按 metadata 标记读出。
 const TERMINAL_STAGES: &[&str] = &["customer_success", "cooldown", "dormant_reactivation"];
 
+/// universal-domain-adaptation 1C：planner 漏斗排序的运行时配置，每个 tick 由
+/// [`resolve_planner_stage_config`] 从 active DomainProfile + taxonomy 缓存构造一次
+/// （避免 N+1）。
+///
+/// **DEFAULT 等价**：销售域里 m006 seed 的 priority_weight / is_terminal 与写死的
+/// `stage_priority_weight` / `intent_level_weight` / `TERMINAL_STAGES` 逐字相等
+/// （`seeded_weights_match_planner_hardcoded_verbatim` 已锁），故"读字典"与"读写死"
+/// 对 DEFAULT 产出完全一致。字典缺该取值时回落写死函数（空缓存 / 未配置 / 新加 stage
+/// 尚无权重都安全）。
+///
+/// `stagnation_dimension`：planner stage_stagnation 段的计时维度 dotted-key
+/// （DEFAULT="customer_stage"）。当前仅承载该值供内存判定；MongoDB 端 filter 的
+/// dotted-key 动态化随后续 milestone（需要动态字段名拼接）跟进，DEFAULT 不变。
+#[derive(Debug, Clone)]
+pub(crate) struct PlannerStageConfig {
+    /// customer_stage 取值 → priority_weight（仅含 Some 权重的取值）。
+    stage_weights: std::collections::HashMap<String, i32>,
+    /// intent_level 取值 → priority_weight。
+    intent_weights: std::collections::HashMap<String, i32>,
+    /// 终态 stage canonical id 集合（is_terminal=true）。
+    terminal_stages: std::collections::HashSet<String>,
+    /// stage_stagnation 计时维度（DEFAULT="customer_stage"）。
+    stagnation_dimension: String,
+}
+
+impl Default for PlannerStageConfig {
+    /// 空配置：所有查询回落写死 DEFAULT 函数 + customer_stage 维度。
+    fn default() -> Self {
+        Self {
+            stage_weights: std::collections::HashMap::new(),
+            intent_weights: std::collections::HashMap::new(),
+            terminal_stages: std::collections::HashSet::new(),
+            stagnation_dimension: "customer_stage".to_string(),
+        }
+    }
+}
+
+impl PlannerStageConfig {
+    /// stage 权重：字典命中则用字典值，否则回落写死 [`stage_priority_weight`]。
+    fn stage_weight(&self, stage: Option<&str>) -> i32 {
+        match stage.and_then(|s| self.stage_weights.get(s)) {
+            Some(w) => *w,
+            None => stage_priority_weight(stage),
+        }
+    }
+
+    /// intent 权重：字典命中则用字典值，否则回落写死 [`intent_level_weight`]。
+    fn intent_weight(&self, level: Option<&str>) -> i32 {
+        match level.and_then(|l| self.intent_weights.get(l)) {
+            Some(w) => *w,
+            None => intent_level_weight(level),
+        }
+    }
+
+    /// 是否终态：字典非空时以字典 is_terminal 为准，否则回落写死 [`TERMINAL_STAGES`]。
+    fn is_terminal_stage(&self, stage: &str) -> bool {
+        if self.terminal_stages.is_empty() {
+            TERMINAL_STAGES.iter().any(|t| *t == stage)
+        } else {
+            self.terminal_stages.contains(stage)
+        }
+    }
+}
+
+/// 每个 planner tick 调一次：从 active DomainProfile（取 stagnation_dimension）+
+/// taxonomy 缓存（取 customer_stage / intent_level 取值的 priority_weight /
+/// is_terminal）构造 [`PlannerStageConfig`]。缓存已由 agent 路径 warm_up；这里再
+/// `find_or_load` 一次保证 TTL 自愈。
+pub(crate) async fn resolve_planner_stage_config(
+    state: &AppState,
+    workspace_id: &str,
+    account_id: &str,
+) -> PlannerStageConfig {
+    use crate::agent::taxonomy::{dimension_value_weights, global_taxonomy_cache};
+
+    let profile =
+        crate::agent::domain_profile::load_active_domain_profile(&state.db, workspace_id).await;
+    let stagnation_dimension = profile
+        .stagnation_dimension
+        .clone()
+        .unwrap_or_else(|| "customer_stage".to_string());
+
+    let cache = global_taxonomy_cache();
+    cache.find_or_load(&state.db).await;
+
+    let mut config = PlannerStageConfig {
+        stage_weights: std::collections::HashMap::new(),
+        intent_weights: std::collections::HashMap::new(),
+        terminal_stages: std::collections::HashSet::new(),
+        stagnation_dimension,
+    };
+    for (id, weight, is_terminal) in
+        dimension_value_weights("customer_stage", account_id, &cache)
+    {
+        if let Some(w) = weight {
+            config.stage_weights.insert(id.clone(), w);
+        }
+        if is_terminal {
+            config.terminal_stages.insert(id);
+        }
+    }
+    for (id, weight, _is_terminal) in
+        dimension_value_weights("intent_level", account_id, &cache)
+    {
+        if let Some(w) = weight {
+            config.intent_weights.insert(id, w);
+        }
+    }
+    config
+}
+
 /// MongoDB 端筛 managed + 非冷却 + 非终状态 + customer_stage_updated_at 老于阈值
 /// + last_inbound_at 不太近（avoid 与 silent 段重叠）。
 pub(crate) fn stage_stagnation_candidate_filter(
@@ -746,7 +869,11 @@ pub(crate) fn stage_stagnation_candidate_filter(
 }
 
 /// Rust 侧的语义校验：与 silent 同款 managed/cooldown 检查 + last_outbound>=last_inbound 跳过。
-pub(crate) fn stage_stagnation_passes_in_memory(contact: &Contact, now: DateTime) -> bool {
+pub(crate) fn stage_stagnation_passes_in_memory(
+    contact: &Contact,
+    now: DateTime,
+    config: &PlannerStageConfig,
+) -> bool {
     if !managed_and_not_in_cooldown(contact) {
         return false;
     }
@@ -754,10 +881,11 @@ pub(crate) fn stage_stagnation_passes_in_memory(contact: &Contact, now: DateTime
         return false;
     };
     let stage = stage.as_str();
-    if TERMINAL_STAGES.iter().any(|t| *t == stage) {
+    if config.is_terminal_stage(stage) {
         return false;
     }
-    if contact_customer_stage_updated_at(contact).is_none() {
+    // universal-domain-adaptation 1C：停滞计时维度从 profile 读（DEFAULT=customer_stage）。
+    if contact_stagnation_updated_at(contact, &config.stagnation_dimension).is_none() {
         return false;
     }
     // 用户最近刚说过话——交给 silent / 自然回路推进，stage 段不抢 emit。
@@ -838,13 +966,14 @@ pub(crate) fn intent_level_weight(level: Option<&str>) -> i32 {
 pub(crate) fn commitment_priority_key(
     contact: &Contact,
     target: &CommitmentEmitTarget,
+    config: &PlannerStageConfig,
 ) -> (i32, i32, i32, i64) {
     let reason_ord = match target.reason {
         CommitmentReason::Overdue => 0,
         CommitmentReason::Imminent => 1,
     };
-    let stage_w = -stage_priority_weight(contact_customer_stage(contact).as_deref());
-    let intent_w = -intent_level_weight(contact_intent_level(contact).as_deref());
+    let stage_w = -config.stage_weight(contact_customer_stage(contact).as_deref());
+    let intent_w = -config.intent_weight(contact_intent_level(contact).as_deref());
     (reason_ord, stage_w, intent_w, target.due_at.timestamp_millis())
 }
 
@@ -853,9 +982,13 @@ pub(crate) fn commitment_priority_key(
 /// 序：
 /// 1. 客户阶段权重：`-stage_priority_weight`（高价值阶段优先）；
 /// 2. 停滞时长：`-(now_ms - stage_updated_at)`（停滞越久越优先）。
-pub(crate) fn stage_stagnation_priority_key(contact: &Contact, now_ms: i64) -> (i32, i64) {
-    let stage_w = -stage_priority_weight(contact_customer_stage(contact).as_deref());
-    let stagnation_ms = match contact_customer_stage_updated_at(contact) {
+pub(crate) fn stage_stagnation_priority_key(
+    contact: &Contact,
+    now_ms: i64,
+    config: &PlannerStageConfig,
+) -> (i32, i64) {
+    let stage_w = -config.stage_weight(contact_customer_stage(contact).as_deref());
+    let stagnation_ms = match contact_stagnation_updated_at(contact, &config.stagnation_dimension) {
         Some(ts) => now_ms.saturating_sub(ts.timestamp_millis()),
         None => 0,
     };
@@ -991,6 +1124,8 @@ async fn scan_stage_stagnation(state: &AppState) -> anyhow::Result<()> {
         .config
         .strategic_planner_stage_stagnation_recent_inbound_hours;
     let priority_enabled = state.config.strategic_planner_priority_enabled;
+    // universal-domain-adaptation 1C：每 tick 构造一次漏斗排序配置（避免 N+1）。
+    let stage_config = resolve_planner_stage_config(state, &workspace_id, &account_id).await;
     let stage_updated_before =
         DateTime::from_millis(now_ms - threshold_days.saturating_mul(24 * 60 * 60 * 1000));
     let inbound_before =
@@ -1014,7 +1149,7 @@ async fn scan_stage_stagnation(state: &AppState) -> anyhow::Result<()> {
     let mut candidates: Vec<Contact> = Vec::new();
     while let Some(contact) = cursor.try_next().await? {
         counters.scanned += 1;
-        if !stage_stagnation_passes_in_memory(&contact, now) {
+        if !stage_stagnation_passes_in_memory(&contact, now, &stage_config) {
             continue;
         }
         if has_pending_follow_up(state, &contact).await? {
@@ -1025,7 +1160,7 @@ async fn scan_stage_stagnation(state: &AppState) -> anyhow::Result<()> {
 
     // 第二阶段：跨 contact 优先级稳定排序。priority_enabled=false 时退回 cursor 自然顺序。
     if priority_enabled {
-        candidates.sort_by(|a, b| stage_stagnation_priority_key(a, now_ms).cmp(&stage_stagnation_priority_key(b, now_ms)));
+        candidates.sort_by(|a, b| stage_stagnation_priority_key(a, now_ms, &stage_config).cmp(&stage_stagnation_priority_key(b, now_ms, &stage_config)));
     }
 
     // 第三阶段：按优先级序消费 daily cap，对每个候选检查 block-rate 反馈环。
@@ -1108,6 +1243,12 @@ mod tests {
     use super::*;
     use crate::models::{AgentStatus, CommitmentEntry, CommitmentRepr};
     use mongodb::bson::Document;
+
+    /// 1C：测试用空 PlannerStageConfig——所有查询回落写死 DEFAULT 函数 +
+    /// customer_stage 维度。等价护栏：DEFAULT 行为与改造前逐字一致。
+    fn cfg() -> PlannerStageConfig {
+        PlannerStageConfig::default()
+    }
 
     fn template() -> Contact {
         Contact {
@@ -1482,7 +1623,7 @@ mod tests {
             domain_attributes: Some(attrs_with_stage("customer_success")),
             ..template()
         };
-        assert!(!stage_stagnation_passes_in_memory(&contact, now));
+        assert!(!stage_stagnation_passes_in_memory(&contact, now, &cfg()));
     }
 
     #[test]
@@ -1494,7 +1635,7 @@ mod tests {
             last_outbound_at: Some(dt(now.timestamp_millis())),
             ..template()
         };
-        assert!(!stage_stagnation_passes_in_memory(&contact, now));
+        assert!(!stage_stagnation_passes_in_memory(&contact, now, &cfg()));
     }
 
     #[test]
@@ -1505,7 +1646,7 @@ mod tests {
             domain_attributes: Some(attrs_with_stage("need_discovery")),
             ..template()
         };
-        assert!(stage_stagnation_passes_in_memory(&contact, now));
+        assert!(stage_stagnation_passes_in_memory(&contact, now, &cfg()));
     }
 
     #[test]
@@ -1515,7 +1656,7 @@ mod tests {
             last_inbound_at: Some(dt(now.timestamp_millis() - 30 * 24 * 60 * 60 * 1000)),
             ..template()
         };
-        assert!(!stage_stagnation_passes_in_memory(&contact, now));
+        assert!(!stage_stagnation_passes_in_memory(&contact, now, &cfg()));
     }
 
     #[test]
@@ -1525,7 +1666,7 @@ mod tests {
             last_inbound_at: Some(dt(now.timestamp_millis() - 30 * 24 * 60 * 60 * 1000)),
             ..template()
         };
-        assert!(!stage_stagnation_passes_in_memory(&contact, now));
+        assert!(!stage_stagnation_passes_in_memory(&contact, now, &cfg()));
     }
 
     #[test]
@@ -1579,8 +1720,8 @@ mod tests {
         let contact = template();
         let overdue = make_target("a", now_ms - 1_000, CommitmentReason::Overdue);
         let imminent = make_target("b", now_ms + 1_000, CommitmentReason::Imminent);
-        let key_a = commitment_priority_key(&contact, &overdue);
-        let key_b = commitment_priority_key(&contact, &imminent);
+        let key_a = commitment_priority_key(&contact, &overdue, &cfg());
+        let key_b = commitment_priority_key(&contact, &imminent, &cfg());
         assert!(key_a < key_b, "overdue {:?} should sort before imminent {:?}", key_a, key_b);
     }
 
@@ -1599,7 +1740,7 @@ mod tests {
             ..template()
         };
         assert!(
-            commitment_priority_key(&high, &target) < commitment_priority_key(&low, &target),
+            commitment_priority_key(&high, &target, &cfg()) < commitment_priority_key(&low, &target, &cfg()),
             "commitment_followup should sort before new_contact"
         );
     }
@@ -1618,7 +1759,7 @@ mod tests {
             domain_attributes: Some(attrs_with_stage_intent("solution_fit", "low")),
             ..template()
         };
-        assert!(commitment_priority_key(&hot, &target) < commitment_priority_key(&cold, &target));
+        assert!(commitment_priority_key(&hot, &target, &cfg()) < commitment_priority_key(&cold, &target, &cfg()));
     }
 
     /// commitment_priority_key：同 reason / stage / intent 时，更早 due_at 的更优先。
@@ -1630,7 +1771,7 @@ mod tests {
         };
         let early = make_target("e", now_ms - 5_000, CommitmentReason::Overdue);
         let late = make_target("l", now_ms - 1_000, CommitmentReason::Overdue);
-        assert!(commitment_priority_key(&contact, &early) < commitment_priority_key(&contact, &late));
+        assert!(commitment_priority_key(&contact, &early, &cfg()) < commitment_priority_key(&contact, &late, &cfg()));
     }
 
     /// stage_stagnation_priority_key：同停滞天数下，commitment_followup 阶段优先于 relationship_building。
@@ -1648,8 +1789,8 @@ mod tests {
             ..template()
         };
         assert!(
-            stage_stagnation_priority_key(&high, now_ms)
-                < stage_stagnation_priority_key(&low, now_ms),
+            stage_stagnation_priority_key(&high, now_ms, &cfg())
+                < stage_stagnation_priority_key(&low, now_ms, &cfg()),
             "commitment_followup should sort before relationship_building"
         );
     }
@@ -1670,8 +1811,8 @@ mod tests {
             ..template()
         };
         assert!(
-            stage_stagnation_priority_key(&stale_30d, now_ms)
-                < stage_stagnation_priority_key(&stale_15d, now_ms),
+            stage_stagnation_priority_key(&stale_30d, now_ms, &cfg())
+                < stage_stagnation_priority_key(&stale_15d, now_ms, &cfg()),
             "30d stale should sort before 15d stale"
         );
     }
@@ -1694,6 +1835,62 @@ mod tests {
         assert_eq!(intent_level_weight(Some("medium")), 50);
         assert_eq!(intent_level_weight(Some("low")), 20);
         assert_eq!(intent_level_weight(Some("nonsense")), 10);
+    }
+
+    /// 1C 等价护栏：空 config（PlannerStageConfig::default）的 stage_weight /
+    /// intent_weight / is_terminal_stage 必须与写死函数 / TERMINAL_STAGES 逐字一致。
+    #[test]
+    fn empty_config_falls_back_to_hardcoded_verbatim() {
+        let c = PlannerStageConfig::default();
+        for stage in [
+            Some("commitment_followup"),
+            Some("objection_handling"),
+            Some("solution_fit"),
+            Some("need_discovery"),
+            Some("relationship_building"),
+            Some("new_contact"),
+            Some("customer_success"),
+            Some("nonsense"),
+            None,
+        ] {
+            assert_eq!(c.stage_weight(stage), stage_priority_weight(stage), "stage={stage:?}");
+        }
+        for level in [Some("high"), Some("medium"), Some("low"), Some("x"), None] {
+            assert_eq!(c.intent_weight(level), intent_level_weight(level), "level={level:?}");
+        }
+        for stage in ["customer_success", "cooldown", "dormant_reactivation"] {
+            assert!(c.is_terminal_stage(stage), "{stage} 应为终态");
+        }
+        for stage in ["new_contact", "need_discovery", "commitment_followup"] {
+            assert!(!c.is_terminal_stage(stage), "{stage} 不应为终态");
+        }
+        assert_eq!(c.stagnation_dimension, "customer_stage");
+    }
+
+    /// 1C：非空 config（来自字典）覆盖写死值——权重表 / 终态集 / 停滞维度都可换。
+    /// 这是通用化的核心：换行业 = 换一份 profile/字典，planner 逻辑不变。
+    #[test]
+    fn populated_config_overrides_hardcoded() {
+        let mut stage_weights = std::collections::HashMap::new();
+        // 故意给一个与写死值不同的权重，证明读的是字典。
+        stage_weights.insert("relationship_building".to_string(), 999);
+        let mut terminal = std::collections::HashSet::new();
+        // 故意把一个非默认 stage 标终态，证明终态集来自字典。
+        terminal.insert("custom_done".to_string());
+        let c = PlannerStageConfig {
+            stage_weights,
+            intent_weights: std::collections::HashMap::new(),
+            terminal_stages: terminal,
+            stagnation_dimension: "relationship_closeness".to_string(),
+        };
+        // 字典命中 → 用字典值。
+        assert_eq!(c.stage_weight(Some("relationship_building")), 999);
+        // 字典未命中该 stage → 回落写死。
+        assert_eq!(c.stage_weight(Some("need_discovery")), 60);
+        // 终态集非空时以字典为准：默认销售终态不再算终态，自定义 stage 算终态。
+        assert!(c.is_terminal_stage("custom_done"));
+        assert!(!c.is_terminal_stage("customer_success"));
+        assert_eq!(c.stagnation_dimension, "relationship_closeness");
     }
 
     /// classify_review_status：覆盖 5 闸 + 预算 + ok-like + 未知。
