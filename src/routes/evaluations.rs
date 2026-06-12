@@ -232,7 +232,7 @@ pub(super) async fn run_formula_adherence_evaluation(
     // 这里维护一个 evaluation 总预算上限：每个场景跑完后把子 run 实际 token
     // 消耗（从 agent_run_logs 累加）汇总进来；超额就 break 并把 degraded
     // 字段设为 true，items 中只保留已完成场景。
-    let typed_runtime = state
+    let domain_config = state
         .db
         .operation_domain_configs()
         .find_one(
@@ -242,9 +242,13 @@ pub(super) async fn run_formula_adherence_evaluation(
             },
             None,
         )
-        .await?
+        .await?;
+    let typed_runtime = domain_config
+        .as_ref()
         .map(|cfg| cfg.runtime_parameters_typed())
         .unwrap_or_default();
+    // H13：eval 种子 contact 的初始 operation_state 从 active 状态机取（替代写死 "new_contact"）。
+    let seed_initial_state = agent::initial_operation_state_key(domain_config.as_ref());
     let total_token_budget = typed_runtime
         .simulation_token_budget
         .saturating_mul(scenarios.len() as i64);
@@ -288,7 +292,12 @@ pub(super) async fn run_formula_adherence_evaluation(
         let contact = base_contact
             .clone()
             .unwrap_or_else(|| {
-                scenario_contact_from_seed(&admin.current_workspace, &payload.account_id, &scenario)
+                scenario_contact_from_seed(
+                    &admin.current_workspace,
+                    &payload.account_id,
+                    &scenario,
+                    &seed_initial_state,
+                )
             });
         let turns = match agent::simulate_user_dialogue(&state, contact, messages).await {
             Ok(t) => t,
@@ -453,6 +462,7 @@ fn scenario_contact_from_seed(
     workspace_id: &str,
     account_id: &str,
     scenario: &EvaluationScenario,
+    initial_state: &str,
 ) -> Contact {
     let now = DateTime::now();
     let seed = &scenario.contact_seed;
@@ -529,7 +539,8 @@ fn scenario_contact_from_seed(
             .or_else(|_| seed.get_str("operation_state"))
             .ok()
             .map(ToString::to_string)
-            .or_else(|| Some("new_contact".to_string())),
+            // H13：种子未指定时回落状态机初始态（替代写死 "new_contact"）。
+            .or_else(|| Some(initial_state.to_string())),
         operation_state_reason: None,
         operation_state_confidence: Some(8),
         operation_state_updated_at: Some(now),

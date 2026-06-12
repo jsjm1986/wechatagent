@@ -756,6 +756,10 @@ pub(super) async fn execute_management_tool(
             };
             let mut unset_doc = Document::new();
             if !is_previously_operated(&contact) {
+                // H13：初始 operation_state 从 active 状态机的 initial 态取（替代写死 "new_contact"）。
+                let domain_config =
+                    agent::load_user_operation_domain_config(state, workspace_id).await?;
+                let initial_state = agent::initial_operation_state_key(domain_config.as_ref());
                 insert_domain_stage_fields(
                     &mut set_doc,
                     generated.customer_stage.as_deref(),
@@ -764,7 +768,7 @@ pub(super) async fn execute_management_tool(
                 );
                 set_doc.insert("commitments", commitments_bson);
                 set_doc.insert("follow_up_policy", generated.follow_up_policy);
-                set_doc.insert("operation_state", "new_contact");
+                set_doc.insert("operation_state", initial_state);
                 set_doc.insert(
                     "operation_state_reason",
                     "后台管理 Agent 纳入运营，等待后续互动确认阶段",

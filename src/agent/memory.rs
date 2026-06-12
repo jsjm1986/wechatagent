@@ -118,12 +118,13 @@ pub(crate) fn effective_memory_card(memory: &OperatingMemory) -> MemoryCardTyped
 pub(crate) fn effective_memory_card_for_contact(
     memory: &OperatingMemory,
     contact: &Contact,
+    initial_state: &str,
 ) -> MemoryCardTyped {
     let card = effective_memory_card(memory);
     let mut compact = if memory_card_has_signal(&card) {
         compact_memory_card_with_previous(&card, None, &[])
     } else {
-        compact_memory_card_with_previous(&memory_card_from_contact(contact, memory), None, &[])
+        compact_memory_card_with_previous(&memory_card_from_contact(contact, memory, initial_state), None, &[])
     };
     compact
         .extra
@@ -189,6 +190,7 @@ pub(crate) fn memory_card_has_signal(card: &MemoryCardTyped) -> bool {
 pub(crate) fn memory_card_from_contact(
     contact: &Contact,
     memory: &OperatingMemory,
+    initial_state: &str,
 ) -> MemoryCardTyped {
     let profile: Option<&AgentProfile> = contact.agent_profile.as_ref();
     let identity = contact
@@ -245,7 +247,8 @@ pub(crate) fn memory_card_from_contact(
                 .as_ref()
                 .and_then(|d| d.get_str("customer_stage").ok().map(|s| s.to_string()))
                 .or_else(|| contact.operation_state.clone())
-                .unwrap_or_else(|| "new_contact".to_string()),
+                // H13：回落状态机初始态（替代写死 "new_contact"）。
+                .unwrap_or_else(|| initial_state.to_string()),
             "trustLevel": doc_string(&memory.relationship_state, "trustLevel")
                 .unwrap_or_else(|| "unknown".to_string()),
             "temperature": doc_string(&memory.relationship_state, "temperature")
@@ -619,6 +622,15 @@ pub(crate) async fn load_or_create_operating_memory(
     state: &AppState,
     contact: &Contact,
 ) -> AppResult<OperatingMemory> {
+    // H13：种子记忆卡 / 新建记忆的初始 operation_state 从 active 状态机取（替代写死
+    // "new_contact"）。load 一次复用于本函数内 memory_card_from_contact + 新建分支。
+    let domain_config = super::decision::load_user_operation_domain_config_for_contact(
+        state,
+        &contact.workspace_id,
+        &contact.wxid,
+    )
+    .await?;
+    let initial_state = super::guards::initial_operation_state_key(domain_config.as_ref());
     if let Some(mut memory) = state
         .db
         .operating_memories()
@@ -633,7 +645,7 @@ pub(crate) async fn load_or_create_operating_memory(
         .await?
     {
         if !memory_card_has_signal(&effective_memory_card(&memory)) {
-            let seeded = memory_card_from_contact(contact, &memory);
+            let seeded = memory_card_from_contact(contact, &memory, &initial_state);
             if memory_card_has_signal(&seeded) {
                 let updated_at = DateTime::now();
                 let prev_version = memory.memory_card_version;
@@ -729,7 +741,7 @@ pub(crate) async fn load_or_create_operating_memory(
             "unknowns": Vec::<String>::new()
         },
         next_action: doc! {
-            "currentState": contact.operation_state.clone().unwrap_or_else(|| "new_contact".to_string()),
+            "currentState": contact.operation_state.clone().unwrap_or_else(|| initial_state.clone()),
             "nextBestAction": "",
             "goal": "",
             "recommendedMove": "",
@@ -748,7 +760,7 @@ pub(crate) async fn load_or_create_operating_memory(
         created_at: DateTime::now(),
         updated_at: DateTime::now(),
     };
-    let mut seeded = memory_card_from_contact(contact, &memory);
+    let mut seeded = memory_card_from_contact(contact, &memory, &initial_state);
     let has_signal = memory_card_has_signal(&seeded);
     memory.memory_card_version = if has_signal { 1 } else { 0 };
     seeded.extra.insert("version", memory.memory_card_version);

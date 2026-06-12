@@ -114,6 +114,21 @@ pub(crate) fn operation_states(domain_config: Option<&OperationDomainConfig>) ->
         .unwrap_or_default()
 }
 
+/// H13：取状态机声明的初始态 key（标 `initial:true` 的 state）。替代散落的写死
+/// `"new_contact"` 字面量——onboarding 写侧设定 contact 初始 operation_state、各类
+/// 展示兜底都从这里取。
+///
+/// 回落 `"new_contact"`：domain_config 缺失 / 状态机无 state 标 initial（旧库未跑
+/// m019 迁移）时，与改造前逐字等价。DEFAULT 销售域状态机仅 new_contact 标 initial，
+/// 故 DEFAULT 下恒返 `"new_contact"`，金标零变化；换行业的 profile 可标别的初始态。
+pub fn initial_operation_state_key(domain_config: Option<&OperationDomainConfig>) -> String {
+    operation_states(domain_config)
+        .into_iter()
+        .find(|state| state.get_bool("initial").unwrap_or(false))
+        .and_then(|state| state.get_str("key").ok().map(ToString::to_string))
+        .unwrap_or_else(|| "new_contact".to_string())
+}
+
 /// 状态机迁移合法性校验。
 ///
 /// 规则：
