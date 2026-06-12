@@ -34,11 +34,45 @@ use std::time::{Duration, Instant};
 use crate::db::Database;
 use crate::error::AppResult;
 use crate::models::{
-    CommitmentMarkers, CoverageDimension, DomainProfile, ProfileDimension,
+    ChunkRole, CommitmentMarkers, CoverageDimension, DomainProfile, ProfileDimension,
 };
 
 /// 内置默认 profile 的 `profile_id`。运行时无 active profile 时使用。
 pub const DEFAULT_PROFILE_ID: &str = "__default__";
+
+/// universal-domain-adaptation H16：内置默认 chunk 角色表，逐字复刻
+/// `knowledge_router.rs::format_operation_knowledge_for_prompt` 写死的销售四态分桶 +
+/// header（product_fact 为 fallback 桶）。DEFAULT_PROFILE 用它；active profile 声明了
+/// `chunk_roles`（非空）时由 knowledge_router 覆盖。Phase 2 H16-b 接线后由等价性测试
+/// `default_profile_chunk_roles_match_router_verbatim` 锁死与渲染函数 const 一致。
+pub fn default_chunk_roles() -> Vec<ChunkRole> {
+    vec![
+        ChunkRole {
+            key: "product_fact".to_string(),
+            header: "【产品事实 product_fact】仅 verified 切片可用作产品声明背书；needs_review/rejected 不作背书。".to_string(),
+            order: 0,
+            is_fallback: true,
+        },
+        ChunkRole {
+            key: "style_template".to_string(),
+            header: "【语气模板 style_template】作为 few-shot 参考；不直接复制内容，仅借鉴节奏与措辞。".to_string(),
+            order: 1,
+            is_fallback: false,
+        },
+        ChunkRole {
+            key: "peer_case".to_string(),
+            header: "【同行案例 peer_case】仅作 reference，不作我方产品承诺；引用必须显式标注「行业经验/同行案例」。".to_string(),
+            order: 2,
+            is_fallback: false,
+        },
+        ChunkRole {
+            key: "negative_example".to_string(),
+            header: "【反例 negative_example】don't-do 列表；候选回复语气/结构若与本段相似，必须改写。".to_string(),
+            order: 3,
+            is_fallback: false,
+        },
+    ]
+}
 
 /// 构造内置 DEFAULT_PROFILE。内容逐字等价当前源码写死的销售域行为。
 ///
@@ -112,6 +146,8 @@ pub fn default_domain_profile(workspace_id: &str) -> DomainProfile {
         operation_mode: crate::models::OperationMode::default(),
         // H14：DEFAULT 销售域 = false → grounding 软分数硬闸无条件生效（字节等价）。
         grounding_gate_bypass_without_claim: false,
+        // H16：DEFAULT 销售域 = 逐字复刻 knowledge_router 写死的四态角色（字节等价）。
+        chunk_roles: default_chunk_roles(),
         version: 1,
         current_version: true,
         previous_version: None,
@@ -382,6 +418,27 @@ mod tests {
         // 换行业 = 情感/关系 profile 置 true 旁路。
         let p = default_domain_profile("ws-1");
         assert!(!p.grounding_gate_bypass_without_claim);
+    }
+
+    #[test]
+    fn default_profile_chunk_roles_match_router_verbatim() {
+        // H16 逐字等价护栏：DEFAULT_PROFILE 的 chunk_roles 与 knowledge_router 写死的
+        // 四态分桶 + header + 顺序 + fallback 桶完全一致，保证 H16-b 把渲染函数切到
+        // profile 后销售域 prompt 字节不变。换行业 = 另一份 chunk_roles。
+        let p = default_domain_profile("ws-1");
+        assert_eq!(p.chunk_roles.len(), 4);
+        let keys: Vec<&str> = p.chunk_roles.iter().map(|r| r.key.as_str()).collect();
+        assert_eq!(keys, vec!["product_fact", "style_template", "peer_case", "negative_example"]);
+        // 顺序字段升序 0..3，与渲染函数固定输出顺序一致。
+        assert_eq!(p.chunk_roles.iter().map(|r| r.order).collect::<Vec<_>>(), vec![0, 1, 2, 3]);
+        // 仅 product_fact 是 fallback 桶（未命中任何 key 的 chunk 归入）。
+        assert!(p.chunk_roles[0].is_fallback);
+        assert!(p.chunk_roles[1..].iter().all(|r| !r.is_fallback));
+        // header 逐字复刻 knowledge_router::format_operation_knowledge_for_prompt 的 order[]。
+        assert_eq!(p.chunk_roles[0].header, "【产品事实 product_fact】仅 verified 切片可用作产品声明背书；needs_review/rejected 不作背书。");
+        assert_eq!(p.chunk_roles[1].header, "【语气模板 style_template】作为 few-shot 参考；不直接复制内容，仅借鉴节奏与措辞。");
+        assert_eq!(p.chunk_roles[2].header, "【同行案例 peer_case】仅作 reference，不作我方产品承诺；引用必须显式标注「行业经验/同行案例」。");
+        assert_eq!(p.chunk_roles[3].header, "【反例 negative_example】don't-do 列表；候选回复语气/结构若与本段相似，必须改写。");
     }
 
     #[test]

@@ -1268,6 +1268,12 @@ pub struct DomainProfile {
     /// 任何取值下都不变。运行时经 `UserRuntimeParameters` 同名字段消费。
     #[serde(default)]
     pub grounding_gate_bypass_without_claim: bool,
+    /// universal-domain-adaptation H16：本行业知识切片的「用途角色」表（替代
+    /// `knowledge_router.rs` 写死的销售四态分桶 + header）。空 Vec 时
+    /// `format_operation_knowledge_for_prompt` 回落内置销售四态（DEFAULT_PROFILE 即
+    /// 声明这四态，逐字等价）。换行业可声明任意角色（如情感域情绪记忆/纪念日）。
+    #[serde(default)]
+    pub chunk_roles: Vec<ChunkRole>,
     /// E5-T1 多版本灰度：同 `(workspace_id, profile_id)` 下 `version` 单调递增。
     #[serde(default = "default_version_one")]
     pub version: i32,
@@ -1429,6 +1435,27 @@ pub struct CoverageDimension {
     /// 复刻原 prompt 锚点 → 销售域 prompt 字节等价）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub anchor_hint: Option<String>,
+}
+
+/// universal-domain-adaptation H16：知识切片的「用途角色」（替代 `knowledge_router.rs`
+/// 写死的 product_fact/style_template/peer_case/negative_example 销售四态分桶 + header
+/// 文案）。一个 `ChunkRole` 声明：本行业某类 chunk 的 `chunk_type` key、注入 prompt 的
+/// 分段 header（含使用指令）、输出顺序、是否为 fallback 桶（未匹配任何 key 的 chunk
+/// 归入此桶）。DEFAULT_PROFILE 逐字复刻销售四态 → 渲染结果字节等价；换行业=另一份
+/// chunk_roles（如情感域「情绪记忆/纪念日」角色）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChunkRole {
+    /// 与 `OperationKnowledgeChunk.chunk_type` 字面量对齐的 key。
+    pub key: String,
+    /// 注入 prompt 的分段标题 + 使用指令（如「【产品事实 product_fact】仅 verified…」）。
+    pub header: String,
+    /// 输出顺序（升序）；DEFAULT 销售四态 0..3 复刻原 `order[]` 固定顺序。
+    #[serde(default)]
+    pub order: i32,
+    /// 是否为 fallback 桶：`chunk_type` 未命中任何 role.key 的切片归入此桶。
+    /// DEFAULT 销售域 = `product_fact`（逐字复刻原「缺省/任意其它值→product_fact」）。
+    #[serde(default)]
+    pub is_fallback: bool,
 }
 
 /// catalog 重建队列：`apply_chunk_revision` 写完即 enqueue；catalog_rebuild_worker
