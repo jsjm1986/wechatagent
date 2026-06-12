@@ -2287,6 +2287,12 @@ mod typed {
         pub cooldown_after_no_reply_hours: i64,
         #[serde(default = "defaults::hallucination_block_at")]
         pub hallucination_block_at: i32,
+        /// universal-domain-adaptation C1：压力风险 block 阈值（`PressureRisk ≥ 此值`
+        /// 则 block）。默认 7。此前是五闸里**唯一**写死在 `UserRuntimeParameters`
+        /// （= 7）而不走 typed 配置的阈值；typed 化后 H9 情感/陪伴场景可经运营域配置
+        /// 放宽（如调到 9，允许更主动的情感推进而不被压力门拦）。DEFAULT = 7 逐字等价。
+        #[serde(default = "defaults::pressure_risk_block_at")]
+        pub pressure_risk_block_at: i32,
         #[serde(default = "defaults::knowledge_grounding_block_below")]
         pub knowledge_grounding_block_below: i32,
         #[serde(default = "defaults::human_like_rewrite_below")]
@@ -2367,6 +2373,7 @@ mod typed {
                 follow_up_expires_hours: defaults::follow_up_expires_hours(),
                 cooldown_after_no_reply_hours: defaults::cooldown_after_no_reply_hours(),
                 hallucination_block_at: defaults::hallucination_block_at(),
+                pressure_risk_block_at: defaults::pressure_risk_block_at(),
                 knowledge_grounding_block_below: defaults::knowledge_grounding_block_below(),
                 human_like_rewrite_below: defaults::human_like_rewrite_below(),
                 emotional_value_rewrite_below: defaults::emotional_value_rewrite_below(),
@@ -2420,6 +2427,9 @@ mod typed {
         }
         pub fn hallucination_block_at() -> i32 {
             6
+        }
+        pub fn pressure_risk_block_at() -> i32 {
+            7
         }
         pub fn knowledge_grounding_block_below() -> i32 {
             7
@@ -3412,6 +3422,8 @@ mod typed_tests {
             mongodb::bson::from_document(doc! {}).expect("default deserialize");
         assert_eq!(p.recent_message_limit, 12);
         assert_eq!(p.hallucination_block_at, 6);
+        // C1：pressure_risk_block_at 缺字段默认 7（DEFAULT 逐字等价旧写死值）。
+        assert_eq!(p.pressure_risk_block_at, 7);
         assert_eq!(p.run_token_budget, 30000);
         assert_eq!(p.run_max_llm_calls, 6);
     }
@@ -3421,11 +3433,14 @@ mod typed_tests {
         let doc = doc! {
             "recentMessageLimit": 24,
             "hallucinationBlockAt": 8,
+            "pressureRiskBlockAt": 9,
             "runTokenBudget": 50000_i64
         };
         let p: RuntimeParametersTyped = mongodb::bson::from_document(doc).expect("deserialize");
         assert_eq!(p.recent_message_limit, 24);
         assert_eq!(p.hallucination_block_at, 8);
+        // C1：H9 情感场景可经运营域配置放宽压力阈值（如 9）。
+        assert_eq!(p.pressure_risk_block_at, 9);
         assert_eq!(p.run_token_budget, 50000);
         // 其它字段 fallback 默认值。
         assert_eq!(p.knowledge_grounding_block_below, 7);
