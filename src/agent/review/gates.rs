@@ -507,6 +507,7 @@ pub fn finalize_review_for_send(
     knowledge_chunks: &[crate::models::OperationKnowledgeChunk],
     promote_risks: Vec<String>,
     _inbound_text: &str,
+    commitment_markers: &crate::models::CommitmentMarkers,
 ) -> FinalizeOutcome {
     let mut review = review;
     let mut pending_events: Vec<PendingFinalizeEvent> = Vec::new();
@@ -618,7 +619,7 @@ pub fn finalize_review_for_send(
     // 与真阳性重复计数。有统计意义的漏判率证据后，再决定是否抬成硬闸（用户决策：
     // 先观测，避免重新引入 2026-05-25 刻意删除的脆弱 string-marker 判罚）。
     if !crate::agent::guards::claim_requires_product_knowledge(&review.claim_analysis) {
-        let class = crate::agent::guards::commitment_claim_class(&decision.reply_text);
+        let class = crate::agent::guards::commitment_claim_class(&decision.reply_text, commitment_markers);
         if class != crate::agent::guards::CommitmentClass::None {
             let verified = crate::agent::guards::compute_verified_chunks(
                 &decision.used_knowledge_ids,
@@ -1425,6 +1426,7 @@ mod dual_gate_classification_tests {
             &[],
             Vec::new(),
             "用户最新消息",
+            &crate::models::CommitmentMarkers::default(),
         );
         let FinalizeOutcome {
             review: finalized,
@@ -1458,6 +1460,7 @@ mod dual_gate_classification_tests {
             &[],
             Vec::new(),
             "用户最新消息",
+            &crate::models::CommitmentMarkers::default(),
         );
         let FinalizeOutcome {
             review: finalized,
@@ -1499,6 +1502,7 @@ mod dual_gate_classification_tests {
             &[],
             Vec::new(),
             "收到，谢谢",
+            &crate::models::CommitmentMarkers::default(),
         );
         assert_eq!(
             outcome.status,
@@ -1541,6 +1545,7 @@ mod dual_gate_classification_tests {
             &[],
             Vec::new(),
             "用户最新消息",
+            &crate::models::CommitmentMarkers::default(),
         );
         match outcome.status {
             GatewayStatusFinal::Held(category) => {
@@ -1573,6 +1578,7 @@ mod dual_gate_classification_tests {
             &[],
             Vec::new(),
             "用户最新消息",
+            &crate::models::CommitmentMarkers::default(),
         );
         let FinalizeOutcome {
             review: finalized,
@@ -1604,6 +1610,7 @@ mod dual_gate_classification_tests {
             &[],
             Vec::new(),
             "用户最新消息",
+            &crate::models::CommitmentMarkers::default(),
         );
         let FinalizeOutcome {
             review: finalized,
@@ -1682,6 +1689,7 @@ mod dual_gate_classification_tests {
             std::slice::from_ref(&chunk),
             Vec::new(),
             "我们的产品一定能帮您",
+            &crate::models::CommitmentMarkers::default(),
         );
         assert_eq!(
             outcome.status,
@@ -1719,6 +1727,7 @@ mod dual_gate_classification_tests {
             std::slice::from_ref(&chunk),
             Vec::new(),
             "用户最新消息",
+            &crate::models::CommitmentMarkers::default(),
         );
         assert_eq!(outcome.status, GatewayStatusFinal::Approved);
         assert!(outcome.review.approved);
@@ -1740,6 +1749,7 @@ mod dual_gate_classification_tests {
             &[],
             Vec::new(),
             "今天天气不错",
+            &crate::models::CommitmentMarkers::default(),
         );
         assert_eq!(outcome.status, GatewayStatusFinal::Approved);
         assert!(outcome.review.approved);
@@ -1766,6 +1776,7 @@ mod dual_gate_classification_tests {
             &[],
             Vec::new(),
             "你们能解决我的问题吗",
+            &crate::models::CommitmentMarkers::default(),
         );
         // 零拦截：判定不变。
         assert_eq!(outcome.status, GatewayStatusFinal::Approved);
@@ -1796,6 +1807,7 @@ mod dual_gate_classification_tests {
             &[],
             Vec::new(),
             "你们能解决我的问题吗",
+            &crate::models::CommitmentMarkers::default(),
         );
         // R5.4 硬闸生效。
         assert_eq!(
@@ -1826,6 +1838,7 @@ mod dual_gate_classification_tests {
             &[],
             Vec::new(),
             "你们能解决我的问题吗",
+            &crate::models::CommitmentMarkers::default(),
         );
         assert_eq!(outcome.status, GatewayStatusFinal::Approved);
         assert!(!outcome
@@ -1853,6 +1866,7 @@ mod dual_gate_classification_tests {
             &[],
             Vec::new(),
             "你们能保证回款吗",
+            &crate::models::CommitmentMarkers::default(),
         );
         assert_eq!(
             outcome.status,
@@ -1884,6 +1898,7 @@ mod dual_gate_classification_tests {
             &[],
             Vec::new(),
             "你会上心吗",
+            &crate::models::CommitmentMarkers::default(),
         );
         assert_eq!(outcome.status, GatewayStatusFinal::Approved);
         assert!(outcome.review.approved);
@@ -1917,6 +1932,7 @@ mod dual_gate_classification_tests {
             std::slice::from_ref(&chunk),
             Vec::new(),
             "成功率怎么样",
+            &crate::models::CommitmentMarkers::default(),
         );
         assert_eq!(outcome.status, GatewayStatusFinal::Approved);
         assert!(decision.should_reply);

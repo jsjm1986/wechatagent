@@ -661,6 +661,14 @@ async fn run_user_operation_gateway_inner(
 
     let recent_messages =
         load_recent_messages(state, &contact, runtime.recent_message_limit).await?;
+    // universal-domain-adaptation H4：本 run 的 active DomainProfile 提前加载一次
+    // （30s TTL 进程缓存，命中即廉价），供 finalize 阶段的承诺词表 commitment_markers
+    // 消费。DEFAULT 销售域返回逐字复刻 guards const 的词表 → 行为字节等价。
+    let active_profile = crate::agent::domain_profile::load_active_domain_profile(
+        &state.db,
+        &contact.workspace_id,
+    )
+    .await;
     let pending_tasks = load_pending_tasks(state, &contact).await?;
     let playbook = load_operation_playbook_for_contact(state, &contact).await?;
     let memory = load_or_create_operating_memory(state, &contact).await?;
@@ -910,6 +918,7 @@ async fn run_user_operation_gateway_inner(
         &selected_chunks,
         promote_risks.clone(),
         inbound.content.as_str(),
+        &active_profile.commitment_markers,
     );
     let FinalizeOutcome {
         review: finalized_review,
@@ -981,11 +990,7 @@ async fn run_user_operation_gateway_inner(
         cache.find_or_load(&state.db).await;
         // universal-domain-adaptation H7：校验维度集合改读 active DomainProfile。
         // DEFAULT 销售域返回 ["customer_stage","intent_level"] 逐字等价。
-        let active_profile = crate::agent::domain_profile::load_active_domain_profile(
-            &state.db,
-            &contact.workspace_id,
-        )
-        .await;
+        // （复用本 run 顶部已加载的 active_profile，避免重复 load。）
         let dimension_kinds =
             crate::agent::domain_profile::decision_dimension_kinds(&active_profile);
         let outcome = compute_taxonomy_guard_outcome(
@@ -1186,6 +1191,7 @@ async fn run_user_operation_gateway_inner(
                         &selected_chunks,
                         promote_risks.clone(),
                         inbound.content.as_str(),
+                        &active_profile.commitment_markers,
                     );
                     let FinalizeOutcome {
                         review: second_finalized_review,
