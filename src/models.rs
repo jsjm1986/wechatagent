@@ -1219,6 +1219,20 @@ pub struct DomainProfile {
     /// 行业 prompt 片段（注入决策 prompt，替代写死的销售域维度语义文案）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt_fragment: Option<String>,
+    /// universal-domain-adaptation H12：本行业「出厂人格本体」覆盖（替代 `prompts.rs`
+    /// 写死的销售顾问 user soul）。`Some` 时整体替换决策系统提示的 Soul 层；`None`
+    /// 时回落 DB published soul + 内置销售域兜底（DEFAULT_PROFILE 即 `None`，逐字等价）。
+    /// 与 [`Self::prompt_fragment`] 区别：fragment 是**叠加**的业务上下文层，本字段是
+    /// **替换**的人格本体。**红线**：boundary_protection 边界保护硬规则不在此字段、
+    /// 继续由 `user.reply.policy` 写死，本字段只换人格口吻不放宽边界守护。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub soul_override: Option<String>,
+    /// universal-domain-adaptation H12：本行业「运营方法论本体」覆盖（替代
+    /// `prompts.rs::default_playbook` 写死的成交准备度/复购方法论）。`Some` 时整体
+    /// 替换拼进 user message 的「当前运营方法」段；`None` 时回落 contact 绑定的
+    /// playbook + 内置销售域兜底（DEFAULT_PROFILE 即 `None`，逐字等价）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub methodology_override: Option<String>,
     /// 本行业绝对化承诺词表（替代 `guards.rs` 写死的中文销售词）。
     #[serde(default)]
     pub commitment_markers: CommitmentMarkers,

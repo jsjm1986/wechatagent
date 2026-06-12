@@ -73,6 +73,9 @@ pub fn default_domain_profile(workspace_id: &str) -> DomainProfile {
         ],
         domain_schema_id: None,
         prompt_fragment: None,
+        // H12：DEFAULT 出厂人格/方法论 = None → 回落内置销售域 soul + playbook（逐字等价）。
+        soul_override: None,
+        methodology_override: None,
         commitment_markers: CommitmentMarkers {
             // 逐字复刻 guards.rs::commitment_claim_class
             product_effect: vec![
@@ -357,6 +360,16 @@ mod tests {
         assert!(p.operation_mode.funnel.enabled);
         assert!(p.operation_mode.silence.enabled);
         assert!(p.operation_mode.commitment.enabled);
+    }
+
+    #[test]
+    fn default_profile_persona_overrides_are_none() {
+        // H12 逐字等价护栏：DEFAULT_PROFILE 不覆盖人格/方法论本体 → soul_override /
+        // methodology_override 均 None，决策路径回落内置销售域 soul + playbook，
+        // 保证 H12 切消费点后销售域行为字节不变。换行业 = 另一份 profile 填这两字段。
+        let p = default_domain_profile("ws-1");
+        assert!(p.soul_override.is_none());
+        assert!(p.methodology_override.is_none());
     }
 
     #[test]
