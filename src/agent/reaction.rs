@@ -337,26 +337,43 @@ pub(crate) fn compute_reviewer_misjudge_signal(
     reviewer_approved: bool,
     outcome_status: &str,
 ) -> Option<String> {
+    compute_reviewer_misjudge_signal_with_polarity(
+        reviewer_approved,
+        outcome_status,
+        DEFAULT_NEGATIVE_OUTCOMES,
+    )
+}
+
+/// universal-domain-adaptation 2.5-pre-2：极性可参数化的 reviewer 误判信号核心。
+/// `negative` = 本行业负向 outcome 集（来自 DomainProfile.outcome_polarity.negative；
+/// DEFAULT 销售域 = [`DEFAULT_NEGATIVE_OUTCOMES`]）。reviewer `approved=true` 且用户
+/// 实际反应落入负集 → `approved_but_user_negative`（回路②反向训练触发信号）。
+/// 2.5-main-3 把数据源换成 active profile。
+pub(crate) fn compute_reviewer_misjudge_signal_with_polarity(
+    reviewer_approved: bool,
+    outcome_status: &str,
+    negative: &[impl AsRef<str>],
+) -> Option<String> {
     if !reviewer_approved {
         return None;
     }
-    if is_negative_outcome(outcome_status) {
+    if negative.iter().any(|n| n.as_ref() == outcome_status) {
         Some("approved_but_user_negative".to_string())
     } else {
         None
     }
 }
 
-pub(crate) fn is_negative_outcome(outcome: &str) -> bool {
-    matches!(
-        outcome,
-        "user_replied_objection"
-            | "user_replied_stop_requested"
-            | "user_replied_unsubscribed"
-            | "user_replied_negative"
-            | "user_replied_complaint"
-    )
-}
+/// 2.5-pre-2：DEFAULT 销售域负极（逐字复刻原 `is_negative_outcome` 的 5 词）。
+/// 与 `knowledge_wiki::gap_signals::DEFAULT_NEGATIVE_OUTCOMES` 同源同值（各自 mod 内
+/// 一份 const，2.5-main 切 profile 后两处都改读 DomainProfile.outcome_polarity）。
+pub(crate) const DEFAULT_NEGATIVE_OUTCOMES: &[&str] = &[
+    "user_replied_objection",
+    "user_replied_stop_requested",
+    "user_replied_unsubscribed",
+    "user_replied_negative",
+    "user_replied_complaint",
+];
 
 /// Phase C / C2：把 reviewer 误判后被用户负反应的回复文本，作为
 /// `negative_example` chunk 候选写入 review queue（`integrity_status="needs_review"`）。
@@ -649,6 +666,54 @@ mod a6_tests {
     fn misjudge_signal_none_when_outcome_not_negative() {
         assert!(compute_reviewer_misjudge_signal(true, "user_replied_buying_signal").is_none());
         assert!(compute_reviewer_misjudge_signal(true, "user_replied_unclassified").is_none());
+    }
+
+    // ---- 2.5-pre-2：回路② misjudge 极性参数化 等价性 ----
+
+    #[test]
+    fn misjudge_default_polarity_matches_hardcoded_verbatim() {
+        // 逐字护栏：wrapper(委托默认负极) == 改造前 5 词真值表。
+        for s in DEFAULT_NEGATIVE_OUTCOMES {
+            assert_eq!(
+                compute_reviewer_misjudge_signal(true, s).as_deref(),
+                Some("approved_but_user_negative"),
+                "{s}"
+            );
+            // wrapper 与显式传默认负极同结果。
+            assert_eq!(
+                compute_reviewer_misjudge_signal(true, s),
+                compute_reviewer_misjudge_signal_with_polarity(true, s, DEFAULT_NEGATIVE_OUTCOMES),
+            );
+        }
+        // 默认负极集逐字 = 改造前 5 词。
+        assert_eq!(
+            DEFAULT_NEGATIVE_OUTCOMES,
+            &[
+                "user_replied_objection",
+                "user_replied_stop_requested",
+                "user_replied_unsubscribed",
+                "user_replied_negative",
+                "user_replied_complaint",
+            ]
+        );
+    }
+
+    #[test]
+    fn misjudge_polarity_is_parametric() {
+        // 证明极性来自配置：自定义负极集下,情感域"转冷"触发,原销售 objection 不触发。
+        let negative = ["user_went_cold"];
+        assert_eq!(
+            compute_reviewer_misjudge_signal_with_polarity(true, "user_went_cold", &negative).as_deref(),
+            Some("approved_but_user_negative")
+        );
+        // 原销售负词在情感 profile 下不触发反向训练。
+        assert!(
+            compute_reviewer_misjudge_signal_with_polarity(true, "user_replied_objection", &negative).is_none()
+        );
+        // reviewer 未放行始终不触发(与极性无关)。
+        assert!(
+            compute_reviewer_misjudge_signal_with_polarity(false, "user_went_cold", &negative).is_none()
+        );
     }
 
     /// Phase C / C2: title 截断按字符数，不按字节，避免破坏 UTF-8 边界。
