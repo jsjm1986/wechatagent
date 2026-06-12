@@ -144,6 +144,10 @@ pub use taxonomy::{taxonomy_cache_for_tests, TaxonomyCache};
 // Phase A / A3：启动期预热入口；main.rs 在 ensure_indexes 后调用。
 pub use taxonomy::init_global_taxonomy_cache;
 
+// universal-domain-adaptation 1G-c：active DomainProfile 进程级缓存预热入口；
+// main.rs 在 taxonomy 预热之后调用。
+pub use domain_profile::init_global_domain_profile_cache;
+
 // agent-autonomy-loop W3 / Task 4.5：P7 工具循环性质测试入口。
 //
 // 直接对外暴露 `reply_with_tools_loop` + `ToolCallRequest` 涉及 `pub(crate)`

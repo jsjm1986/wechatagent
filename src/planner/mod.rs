@@ -47,12 +47,20 @@ fn contact_customer_stage_updated_at(contact: &Contact) -> Option<DateTime> {
 
 /// universal-domain-adaptation 1C：按配置的停滞维度读 `<dim>_updated_at` 计时戳。
 /// DEFAULT dim="customer_stage" 时等价 [`contact_customer_stage_updated_at`]。
+///
+/// **1G-c 版本切换兼容**：当配置维度的 `<dim>_updated_at` 缺失时**回落旧
+/// `customer_stage_updated_at`**。否则运营把 profile 的 `stagnation_dimension` 从
+/// `customer_stage` 换成新维度后，存量 contact（尚无 `<新维度>_updated_at` 字段）
+/// 会被 `stage_stagnation_passes_in_memory` 判 None 直接排除，**主动触达静默冻结**
+/// 直到它们碰巧在新维度上被重新打标。DEFAULT dim=customer_stage 时主查与回落同
+/// key，逐字等价（金标零变化）；回落只在"换了维度且存量 contact 无新字段"时生效。
 fn contact_stagnation_updated_at(contact: &Contact, dim: &str) -> Option<DateTime> {
     let key = format!("{dim}_updated_at");
     contact
         .domain_attributes
         .as_ref()
         .and_then(|d| d.get_datetime(key.as_str()).ok().copied())
+        .or_else(|| contact_customer_stage_updated_at(contact))
 }
 
 /// 扫描器结束时输出的统计信息（写入 `*_tick` 事件 detail）。
@@ -1960,6 +1968,57 @@ mod tests {
         assert!(c.is_terminal_stage("custom_done"));
         assert!(!c.is_terminal_stage("customer_success"));
         assert_eq!(c.stagnation_dimension, "relationship_closeness");
+    }
+
+    /// 1G-c 版本切换兼容：DEFAULT dim=customer_stage 时 `contact_stagnation_updated_at`
+    /// 主查与回落同 key，读出的就是 `customer_stage_updated_at`（逐字等价，金标零变化）。
+    #[test]
+    fn stagnation_updated_at_default_dim_reads_customer_stage_verbatim() {
+        let mut c = template();
+        c.domain_attributes = Some(attrs_with_stage_updated("need_discovery", 12_345));
+        assert_eq!(
+            contact_stagnation_updated_at(&c, "customer_stage"),
+            Some(DateTime::from_millis(12_345))
+        );
+    }
+
+    /// 1G-c：换 profile 维度后，存量 contact 只有旧 `customer_stage_updated_at`、
+    /// 无 `<新维度>_updated_at` → 回落旧字段（不被判 None 静默冻结主动触达）。
+    #[test]
+    fn stagnation_updated_at_falls_back_to_customer_stage_for_legacy_contact() {
+        let mut c = template();
+        // 存量 contact：只有旧维度时间戳，没有新维度 relationship_closeness_updated_at。
+        c.domain_attributes = Some(attrs_with_stage_updated("need_discovery", 999));
+        assert_eq!(
+            contact_stagnation_updated_at(&c, "relationship_closeness"),
+            Some(DateTime::from_millis(999)),
+            "新维度缺失应回落旧 customer_stage_updated_at，避免存量客户主动触达冻结"
+        );
+    }
+
+    /// 1G-c：新维度时间戳存在时**优先**用新维度（回落只在缺失时兜底，不抢占已迁移数据）。
+    #[test]
+    fn stagnation_updated_at_prefers_configured_dim_when_present() {
+        let mut c = template();
+        let mut attrs = attrs_with_stage_updated("need_discovery", 100);
+        attrs.insert("relationship_closeness_updated_at", DateTime::from_millis(777));
+        c.domain_attributes = Some(attrs);
+        assert_eq!(
+            contact_stagnation_updated_at(&c, "relationship_closeness"),
+            Some(DateTime::from_millis(777)),
+            "已迁移到新维度的 contact 应读新维度时间戳，而非回落旧字段"
+        );
+    }
+
+    /// 1G-c：两个维度时间戳都缺失 → None（既无新维度也无旧字段，回落无可回落）。
+    #[test]
+    fn stagnation_updated_at_none_when_both_missing() {
+        let mut c = template();
+        let mut attrs = Document::new();
+        attrs.insert("customer_stage", "need_discovery");
+        // 故意不写任何 *_updated_at。
+        c.domain_attributes = Some(attrs);
+        assert_eq!(contact_stagnation_updated_at(&c, "relationship_closeness"), None);
     }
 
     /// classify_review_status：覆盖 5 闸 + 预算 + ok-like + 未知。
