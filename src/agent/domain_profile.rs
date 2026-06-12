@@ -26,8 +26,13 @@
 //! 不改任何通用逻辑。
 
 use mongodb::bson::doc;
+use parking_lot::Mutex as PlMutex;
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use crate::db::Database;
+use crate::error::AppResult;
 use crate::models::{
     CommitmentMarkers, CoverageDimension, DomainProfile, ProfileDimension,
 };
@@ -117,28 +122,166 @@ pub fn default_domain_profile(workspace_id: &str) -> DomainProfile {
 /// 查 `is_active=true` 一条；无则 fallback 到 [`default_domain_profile`]。
 /// DB 错误也 fallback（不阻塞运行时；与 taxonomy cache warm_up 失败静默同精神）。
 ///
-/// Phase 0：本函数已可调用，但运行时各消费点尚未接线——仅供 Phase 1 切换时使用 +
-/// 引导层落库后的读取验证。
+/// **1G-c**：本函数现在走进程级 [`DomainProfileCache`]（30s TTL + publish 失效），
+/// 治理 1A/1C/1E/1F 引入的"每决策 / 每 planner tick 都查 DB"N+1。缓存未命中 /
+/// DB 空 / DB 错误时仍回落 [`default_domain_profile`]，与接缓存前逐字等价。
 pub async fn load_active_domain_profile(db: &Database, workspace_id: &str) -> DomainProfile {
-    match db
-        .domain_profiles()
-        .find_one(
-            doc! { "workspace_id": workspace_id, "is_active": true, "current_version": true },
-            None,
-        )
+    global_domain_profile_cache()
+        .get_or_load(db, workspace_id)
         .await
-    {
-        Ok(Some(profile)) => profile,
-        Ok(None) => default_domain_profile(workspace_id),
-        Err(error) => {
-            tracing::warn!(
-                ?error,
-                workspace_id,
-                "load_active_domain_profile failed; falling back to DEFAULT_PROFILE"
-            );
-            default_domain_profile(workspace_id)
+}
+
+// ─────────────────────────────────────────────────────────────────
+// 1G-c：进程级 active DomainProfile TTL 缓存。
+//
+// 镜像 `agent::taxonomy::TaxonomyCache`：内部 Mutex 保护 (entries, fetched_at)，
+// TTL 自愈 + 显式 invalidate。`reload_from_db` 一次性拉全部 workspace 的 active
+// profile 分组缓存；`get_or_load` TTL 过期则重载，按 workspace_id 命中返回 clone，
+// 未命中（DB 无该 workspace 的 active profile）回落 default。
+//
+// 启动期由 `init_global_domain_profile_cache(db)` 预热（main.rs 接入）；引导层
+// publish profile 后调 `invalidate_global_domain_profile_cache` 让下次 load 立即
+// 见最新（Phase 3 接线，故现暂无调用方，靠 module 级 allow(dead_code) 静默）。
+// ─────────────────────────────────────────────────────────────────
+
+/// profile 缓存有效期：30s（与 `TAXONOMY_CACHE_TTL` 同口径）。
+const DOMAIN_PROFILE_CACHE_TTL: Duration = Duration::from_secs(30);
+
+/// 进程级 active DomainProfile TTL 缓存，按 `workspace_id` 索引。
+pub struct DomainProfileCache {
+    inner: PlMutex<DomainProfileCacheInner>,
+}
+
+struct DomainProfileCacheInner {
+    /// `workspace_id` → 该 workspace 当前 active profile（仅缓存 DB 命中的真实
+    /// profile；DB 无 active 行的 workspace **不**入表，`get_or_load` 对其回落
+    /// default，与接缓存前等价）。
+    entries: HashMap<String, DomainProfile>,
+    fetched_at: Option<Instant>,
+}
+
+impl Default for DomainProfileCache {
+    fn default() -> Self {
+        Self {
+            inner: PlMutex::new(DomainProfileCacheInner {
+                entries: HashMap::new(),
+                fetched_at: None,
+            }),
         }
     }
+}
+
+impl DomainProfileCache {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// 显式失效缓存。引导层 publish/激活 profile 后调用，让下一次 `get_or_load`
+    /// 重新拉取最新 active profile（否则换 profile 后最多 30s 才可见）。
+    pub fn invalidate(&self) {
+        let mut inner = self.inner.lock();
+        inner.entries.clear();
+        inner.fetched_at = None;
+    }
+
+    /// 启动期预热：拉全部 active profile 填充缓存。失败静默（缓存留空，
+    /// 下次 `get_or_load` 重试）。
+    pub async fn warm_up(&self, db: &Database) {
+        if let Err(error) = self.reload_from_db(db).await {
+            tracing::warn!(?error, "DomainProfileCache.warm_up failed; cache remains empty");
+        }
+    }
+
+    async fn reload_from_db(&self, db: &Database) -> AppResult<()> {
+        use futures::TryStreamExt;
+        let mut cursor = db
+            .domain_profiles()
+            .find(doc! { "is_active": true, "current_version": true }, None)
+            .await?;
+        let mut entries: HashMap<String, DomainProfile> = HashMap::new();
+        while let Some(profile) = cursor.try_next().await? {
+            // 同 workspace 多条 active（异常态）时后插入者赢——与 find_one 取任意一条
+            // 同语义；正常态每 workspace 至多一条 active+current。
+            entries.insert(profile.workspace_id.clone(), profile);
+        }
+        let mut inner = self.inner.lock();
+        inner.entries = entries;
+        inner.fetched_at = Some(Instant::now());
+        Ok(())
+    }
+
+    /// TTL 自愈判定：fetched_at 缺失或距今 ≥ TTL → true。抽独立函数让 lib 单测
+    /// 无 Docker 也能断言 TTL 语义。
+    pub(crate) fn is_stale(&self) -> bool {
+        let inner = self.inner.lock();
+        match inner.fetched_at {
+            Some(t) => t.elapsed() >= DOMAIN_PROFILE_CACHE_TTL,
+            None => true,
+        }
+    }
+
+    /// 查找或自动加载：TTL 过期 → 重载全表；按 `workspace_id` 命中返回真实 profile
+    /// 的 clone，未命中回落 [`default_domain_profile`]（DB 错误时重载失败 → 缓存
+    /// 留空 → 同样回落 default，与接缓存前 `load_active_domain_profile` 逐字等价）。
+    pub(crate) async fn get_or_load(&self, db: &Database, workspace_id: &str) -> DomainProfile {
+        if self.is_stale() {
+            if let Err(error) = self.reload_from_db(db).await {
+                tracing::warn!(
+                    ?error,
+                    workspace_id,
+                    "DomainProfileCache.reload_from_db failed; falling back to DEFAULT_PROFILE"
+                );
+            }
+        }
+        self.lookup_or_default(workspace_id)
+    }
+
+    /// 纯查表（无 IO）：命中返回真实 profile clone，未命中回落 default。抽出独立
+    /// 方法让 `get_or_load` 与 lib 单测共用同一回落口径（避免测试内联逻辑漂移）。
+    fn lookup_or_default(&self, workspace_id: &str) -> DomainProfile {
+        let inner = self.inner.lock();
+        match inner.entries.get(workspace_id) {
+            Some(profile) => profile.clone(),
+            None => default_domain_profile(workspace_id),
+        }
+    }
+
+    /// test-only：把 `fetched_at` 强制回拨，模拟"距上次加载已过 N"，验证 TTL。
+    #[cfg(test)]
+    pub(crate) fn rewind_fetched_at_for_test(&self, dur: Duration) {
+        let mut inner = self.inner.lock();
+        if let Some(t) = inner.fetched_at {
+            inner.fetched_at = Some(t.checked_sub(dur).unwrap_or(t));
+        }
+    }
+
+    /// test-only：直接灌入一个 workspace 的 profile 并标记已加载，免 Mongo 即可
+    /// 验证"命中返回真实 profile / 未命中回落 default"。
+    #[cfg(test)]
+    pub(crate) fn seed_for_test(&self, profile: DomainProfile) {
+        let mut inner = self.inner.lock();
+        inner.entries.insert(profile.workspace_id.clone(), profile);
+        inner.fetched_at = Some(Instant::now());
+    }
+}
+
+static GLOBAL_DOMAIN_PROFILE_CACHE: std::sync::LazyLock<Arc<DomainProfileCache>> =
+    std::sync::LazyLock::new(|| Arc::new(DomainProfileCache::new()));
+
+/// 进程级单例 cache 句柄；[`load_active_domain_profile`] 在没有注入自定义 cache
+/// 时使用本入口。
+pub(crate) fn global_domain_profile_cache() -> Arc<DomainProfileCache> {
+    GLOBAL_DOMAIN_PROFILE_CACHE.clone()
+}
+
+/// 启动期预热：由 `main.rs` 在 `ensure_indexes` 后调用。失败被静默。
+pub async fn init_global_domain_profile_cache(db: &Database) {
+    GLOBAL_DOMAIN_PROFILE_CACHE.warm_up(db).await;
+}
+
+/// 引导层 publish/激活 profile 后调用以让缓存立即失效（Phase 3 接线）。
+pub(crate) fn invalidate_global_domain_profile_cache() {
+    GLOBAL_DOMAIN_PROFILE_CACHE.invalidate();
 }
 
 /// 取「参与决策」的维度 kind 列表（对应旧 `TAGGED_FIELDS` 成员集合）。
@@ -224,5 +367,58 @@ mod tests {
         assert_eq!(parsed.profile_id, p.profile_id);
         assert_eq!(parsed.profile_dimensions.len(), 2);
         assert_eq!(parsed.commitment_markers.product_effect.len(), 5);
+    }
+
+    // ── 1G-c：DomainProfileCache TTL / 命中 / 回落 / 失效（无 Docker 纯内存）──
+
+    #[test]
+    fn cache_empty_is_stale_then_seed_clears_staleness() {
+        let cache = DomainProfileCache::new();
+        // 从未加载 → stale=true（首次必触发 reload）。
+        assert!(cache.is_stale());
+        cache.seed_for_test(default_domain_profile("ws-seed"));
+        // seed 写入 fetched_at=now → 不再 stale。
+        assert!(!cache.is_stale());
+    }
+
+    #[test]
+    fn cache_goes_stale_after_ttl_elapses() {
+        let cache = DomainProfileCache::new();
+        cache.seed_for_test(default_domain_profile("ws-1"));
+        assert!(!cache.is_stale());
+        // 回拨刚好一个 TTL → stale=true（>= 边界）。
+        cache.rewind_fetched_at_for_test(DOMAIN_PROFILE_CACHE_TTL);
+        assert!(cache.is_stale());
+    }
+
+    #[test]
+    fn cache_invalidate_resets_to_stale() {
+        let cache = DomainProfileCache::new();
+        cache.seed_for_test(default_domain_profile("ws-1"));
+        assert!(!cache.is_stale());
+        cache.invalidate();
+        // 失效后下一次 get_or_load 必重载。
+        assert!(cache.is_stale());
+    }
+
+    #[test]
+    fn cache_miss_workspace_falls_back_to_default_verbatim() {
+        // 缓存里有 ws-A 的真实 profile，但查 ws-B（未配置）→ 回落 default，
+        // 与接缓存前 load_active_domain_profile 的 Ok(None) 分支逐字等价。
+        // 直接断言 get_or_load 复用的 lookup_or_default，避免测试内联逻辑漂移。
+        let cache = DomainProfileCache::new();
+        let mut seeded = default_domain_profile("ws-A");
+        seeded.display_name = "行业A".to_string();
+        seeded.profile_id = "profile-a".to_string();
+        cache.seed_for_test(seeded);
+
+        // 未命中 workspace → 回落 default（profile_id=__default__，workspace 透传）。
+        let fallback = cache.lookup_or_default("ws-B");
+        assert_eq!(fallback.profile_id, DEFAULT_PROFILE_ID);
+        assert_eq!(fallback.workspace_id, "ws-B");
+        // 命中 ws-A → 真实 profile（非 default）。
+        let hit = cache.lookup_or_default("ws-A");
+        assert_eq!(hit.profile_id, "profile-a");
+        assert_eq!(hit.display_name, "行业A");
     }
 }

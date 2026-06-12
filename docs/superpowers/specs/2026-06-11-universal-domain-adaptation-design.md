@@ -1,7 +1,7 @@
 # 通用化知识库：LLM 对话驱动的行业/产品自适应 — 设计文档
 
 **日期**：2026-06-11
-**状态**：实施中 — **Phase 0 已提交（commit e93cd63）；Phase 1 子步 1B 已提交（557cb38）、1D 已提交（a36164d）、1A 已提交（a40c6ab）、1C 已提交（20288c3）、1E 已提交（1b95d5a）、1F-a 已提交（61eaeaa）、1F-b 已提交（13dfe9b）、1G-a 已提交（fae02a4，C1 pressure_risk typed）；1G-b（H10 deal_events→outcome_events，已落 working tree 待提交）**；1G-c（profile 缓存/版本兼容护栏）待实施，Phase 1 收尾在即
+**状态**：实施中 — **Phase 0 已提交（commit e93cd63）；Phase 1 子步 1B 已提交（557cb38）、1D 已提交（a36164d）、1A 已提交（a40c6ab）、1C 已提交（20288c3）、1E 已提交（1b95d5a）、1F-a 已提交（61eaeaa）、1F-b 已提交（13dfe9b）、1G-a 已提交（fae02a4，C1 pressure_risk typed）、1G-b 已提交（b84de31，H10 deal_events→outcome_events）；1G-c（profile 进程缓存 + 版本切换兼容护栏）已落 working tree 待提交**。**Phase 1（H1–H10 + C1 + 性能/兼容护栏）全部完成，lib 1000/0**；下一步进 Phase 1.5（H12/H13 出厂人格 + 状态机本体 + C2）
 **作者**：运营 agent 侧
 **目标读者**：产品负责人 + 知识库后端维护者
 
@@ -551,7 +551,7 @@ casual 模式的"收紧压力门"会与"热烈推进"打架（非误杀，是模
 - **1G · H10 假锚点清理 + C1 前置 + 性能/兼容护栏** —— 拆为 1G-a/1G-b/1G-c 三个独立 commit：
   - **1G-a · C1 pressure_risk_block_at typed 化** ✅**已完成**：五闸里唯一写死在 `UserRuntimeParameters`（=7）不走 typed 配置的阈值，加入 `RuntimeParametersTyped`（serde 默认 7）+ defaults 模块 + Default impl；`UserRuntimeParameters` 的 `from_config`/`Default` 改读 `typed.pressure_risk_block_at` 替代写死 7。这是 H9 隐藏前置——情感/陪伴场景经运营域配置放宽压力阈值（如 9）的 runtime 入口。DEFAULT=7 逐字等价。扩充既有 2 个 typed 测试。lib 992/0。
   - **1G-b · H10 deal_events 泛化** ✅**已完成**：`DealEvent`→`OutcomeEvent`、`Contact.deal_events`→`outcome_events`（`#[serde(alias = "deal_events")]` 让改名前写入的旧库文档继续可读 = R11 兼容），销售域"成交"语义注释泛化为行业中性"成效/结果"。深挖证实全库**只写不读**（唯一写入方 `add_deal_event` 路由 + S5 采集，PU-learning 纯注释零实现，前端零引用），故零行为风险。路由路径 `/contacts/:id/deal-events` + 请求类型名 `DealEventRequest` 保持不变（API 兼容，无外部消费方依赖语义）；审计事件 kind 改 `outcome_event_marked`。~30 处构造点（含 14 集成测试）+ 路由 + smoke 测试更新；smoke 测试加 alias 向后兼容断言（旧 `deal_events` key 写库经 alias 读入 `outcome_events`）。lib 992/0，PBT 累计 34/0，集成测试 crate `-D warnings` 编译净，禁词/model-hint 闸净。
-  - **1G-c · profile 缓存 + 版本切换兼容护栏**（待实施）：profile 加载走与 taxonomy 同款进程缓存 + publish 失效（1A/1C/1E/1F 已让每轮决策 / 每 planner tick 都 `load_active_domain_profile`，需治 N+1 DB 查询）；profile 版本切换时存量 contact 的维度 fallback 兼容（planner 读 stagnation 维度时 fallback 旧 key，否则换 profile 静默冻结存量客户主动触达）。
+  - **1G-c · profile 缓存 + 版本切换兼容护栏** ✅**已完成**：（缓存）`load_active_domain_profile` 改走与 `TaxonomyCache` 同款进程级 `DomainProfileCache`（按 `workspace_id` 索引，30s TTL + `init_global_domain_profile_cache` 启动预热 + `invalidate_global_domain_profile_cache` publish 失效钩子留 Phase 3 引导层接线），治 1A/1C/1E/1F 引入的"每决策 / 每 planner tick 都查 `domain_profiles`"N+1。命中返回真实 profile clone，未命中 / DB 空 / DB 错误 / 重载失败均回落 `default_domain_profile`，与接缓存前 `find_one` 的 Ok(None)/Err 分支**逐字等价**（`get_or_load` 与单测共用 `lookup_or_default` 同一回落口径）。`get_or_load` 复用 `is_stale` TTL 判定（与 taxonomy 同口径），main.rs 在 taxonomy 预热后接入预热。（版本切换兼容）`contact_stagnation_updated_at` 在配置维度 `<dim>_updated_at` 缺失时**回落旧 `customer_stage_updated_at`**：否则运营把 profile 的 `stagnation_dimension` 从 customer_stage 换到新维度后，尚无 `<新维度>_updated_at` 的存量 contact 会被 `stage_stagnation_passes_in_memory` 判 None 排除、主动触达静默冻结。DEFAULT dim=customer_stage 时主查与回落同 key，逐字等价（金标零变化）；新维度时间戳存在则优先用新维度（回落只兜底）。新增 8 测（4 cache：空缓存 stale / TTL 到期转 stale / invalidate 重置 / 未命中回落 default+命中返真实；4 stagnation：DEFAULT 维度逐字读 / 存量 contact 回落旧字段 / 已迁移优先新维度 / 两者皆缺为 None）。lib 1000/0（`-D warnings` 净），禁词/model-hint 闸净。**Phase 1（H1–H10 + C1 + 性能/兼容护栏）全部完成。**
 
 ### Phase 1.5：出厂人格 + 状态机本体配置化（H12/H13，1E 的人格延伸）
 - **H12**：默认 user soul（76 行销售顾问灵魂）+ playbook（成交准备度/复购方法论）从 `profile.prompt_fragment` 注入；DEFAULT_PROFILE 逐字复刻当前销售人格。
