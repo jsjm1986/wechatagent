@@ -83,6 +83,25 @@ pub(crate) fn next_wake_at(end: u32, tz_offset_hours: i32) -> mongodb::bson::Dat
     ))
 }
 
+/// universal-domain-adaptation H19：解析某 contact 的**有效作息门控开关**。
+///
+/// `contact.operation_mode_override.quiet_hours.enabled_override` 优先，缺省回落
+/// 全局 `global_enabled`（即 `runtime.quiet_hours_enabled`）。纯函数、不查 DB——
+/// 覆盖来自 contact 已加载字段，不在热路径引入额外 IO。
+///
+/// DEFAULT 等价：无 override（`enabled_override = None`）→ 返回 `global_enabled`，
+/// 与改造前逐字一致；情感陪伴 contact 设 `Some(false)` → 夜间不被静默门压制。
+pub(crate) fn effective_quiet_hours_enabled(
+    contact: &crate::models::Contact,
+    global_enabled: bool,
+) -> bool {
+    contact
+        .operation_mode_override
+        .as_ref()
+        .and_then(|m| m.quiet_hours.enabled_override)
+        .unwrap_or(global_enabled)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

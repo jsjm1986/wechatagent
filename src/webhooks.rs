@@ -562,12 +562,14 @@ pub async fn wechat_webhook(
         .await?;
         let runtime =
             crate::agent::UserRuntimeParameters::from_config(domain_config.as_ref(), &state);
-        let quiet = runtime.quiet_hours_enabled
-            && agent::quiet_hours::is_quiet_now(
-                runtime.quiet_hours_start,
-                runtime.quiet_hours_end,
-                runtime.quiet_hours_tz_offset_hours,
-            );
+        let quiet = agent::quiet_hours::effective_quiet_hours_enabled(
+            &contact,
+            runtime.quiet_hours_enabled,
+        ) && agent::quiet_hours::is_quiet_now(
+            runtime.quiet_hours_start,
+            runtime.quiet_hours_end,
+            runtime.quiet_hours_tz_offset_hours,
+        );
         if quiet {
             ensure_wake_followup_task(
                 &state,

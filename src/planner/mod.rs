@@ -2018,8 +2018,7 @@ mod tests {
         assert!(contact.operation_mode_override.is_none(), "template 默认无 override");
         let profile_mode = crate::models::OperationMode {
             funnel: crate::models::FunnelMode { enabled: false, stagnation_threshold_days: Some(30) },
-            silence: crate::models::SilenceMode::default(),
-            commitment: crate::models::CommitmentMode::default(),
+            ..crate::models::OperationMode::default()
         };
         let resolved = resolve_operation_mode(&contact, &profile_mode);
         assert_eq!(resolved, profile_mode, "无 override → 用 profile 范式");
@@ -2034,7 +2033,7 @@ mod tests {
         contact.operation_mode_override = Some(crate::models::OperationMode {
             funnel: crate::models::FunnelMode { enabled: false, stagnation_threshold_days: None },
             silence: crate::models::SilenceMode { enabled: true, threshold_hours: Some(240) },
-            commitment: crate::models::CommitmentMode::default(),
+            ..crate::models::OperationMode::default()
         });
         // profile 范式三全开（销售型）——但 override 优先。
         let profile_mode = crate::models::OperationMode::default();
@@ -2059,6 +2058,58 @@ mod tests {
         assert_eq!(
             m.commitment.imminent_window_hours.unwrap_or(global_imminent_hours),
             global_imminent_hours
+        );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // universal-domain-adaptation H19：作息门控纳入 operation_mode override 链。
+    // 锁死：① DEFAULT(无 override) → 沿用全局 enabled（金标零变化）；② Some(false)
+    // 关闭静默（情感陪伴夜间黄金时段）；③ Some(true) 强制开启。
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// H19：无 override → effective == 全局 enabled（两种全局取值都验证）。
+    #[test]
+    fn h19_no_override_follows_global() {
+        let contact = template();
+        assert!(contact.operation_mode_override.is_none());
+        assert!(crate::agent::quiet_hours::effective_quiet_hours_enabled(&contact, true));
+        assert!(!crate::agent::quiet_hours::effective_quiet_hours_enabled(&contact, false));
+    }
+
+    /// H19：override Some(false) → 关闭静默（即便全局开），夜间不被压制。
+    #[test]
+    fn h19_override_false_disables_quiet_hours() {
+        let mut contact = template();
+        contact.operation_mode_override = Some(crate::models::OperationMode {
+            quiet_hours: crate::models::QuietHoursMode { enabled_override: Some(false) },
+            ..crate::models::OperationMode::default()
+        });
+        // 全局开，但 contact 范式关 → 有效为关。
+        assert!(!crate::agent::quiet_hours::effective_quiet_hours_enabled(&contact, true));
+    }
+
+    /// H19：override Some(true) → 强制开启（即便全局关）。
+    #[test]
+    fn h19_override_true_forces_quiet_hours() {
+        let mut contact = template();
+        contact.operation_mode_override = Some(crate::models::OperationMode {
+            quiet_hours: crate::models::QuietHoursMode { enabled_override: Some(true) },
+            ..crate::models::OperationMode::default()
+        });
+        assert!(crate::agent::quiet_hours::effective_quiet_hours_enabled(&contact, false));
+    }
+
+    /// H19：QuietHoursMode 默认 enabled_override = None（DEFAULT 等价根护栏）。
+    #[test]
+    fn h19_default_quiet_hours_mode_is_none() {
+        assert_eq!(
+            crate::models::QuietHoursMode::default().enabled_override,
+            None
+        );
+        // OperationMode::default() 内含的 quiet_hours 也是 None。
+        assert_eq!(
+            crate::models::OperationMode::default().quiet_hours.enabled_override,
+            None
         );
     }
 }

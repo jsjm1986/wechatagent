@@ -1933,7 +1933,10 @@ pub(crate) async fn precheck_send_gateway(
         // - 醒来任务（is_deferred_wake）恰恰在醒来时刻跑，不应被自己触发的静默门挡回。
         if matches!(trigger, AgentTrigger::FollowUp(_))
             && !is_deferred_wake
-            && runtime.quiet_hours_enabled
+            && crate::agent::quiet_hours::effective_quiet_hours_enabled(
+                contact,
+                runtime.quiet_hours_enabled,
+            )
             && crate::agent::quiet_hours::is_quiet_now(
                 runtime.quiet_hours_start,
                 runtime.quiet_hours_end,
