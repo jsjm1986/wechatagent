@@ -591,6 +591,10 @@ pub fn default_user_operation_state_machine() -> Document {
                 "goal": "建立基本上下文，避免过早推销。",
                 "allowedActions": ["reply", "clarify", "update_profile_only", "wait"],
                 "allowedFrom": ["new_contact"],
+                // H13：标志位替代写死的 `to=="new_contact"` 初始态判定。本字段为 true 的
+                // state 是「空 from 唯一合法迁入目标」（引擎 check_state_transition + planner
+                // 写侧初始态都读它）。DEFAULT 销售域仅 new_contact 标 true，逐字等价。
+                "initial": true,
                 "advanceSignals": ["明确身份", "表达业务背景", "主动描述问题"],
                 "cooldownSignals": ["连续短回复", "拒绝沟通"],
                 "riskRules": ["禁止直接销售", "未知信息必须标记待确认"],
@@ -669,6 +673,11 @@ pub fn default_user_operation_state_machine() -> Document {
                 "allowedActions": ["no_reply", "wait", "update_profile_only"],
                 "allowedFrom": [],
                 "allowFromAny": true,
+                // H13：标志位替代写死的 `state_key=="cooldown"` 禁主动触达特例。本字段为
+                // true 的 state 禁止 planner 主动触达 + m013 policy 禁 reply。DEFAULT 销售域
+                // 仅 cooldown 标 true，逐字等价。陪伴/维护型行业可在另一份 profile 标别的态。
+                // 键名 camelCase 与本 doc 既有约定（allowFromAny 等）一致。
+                "forbidsProactive": true,
                 "advanceSignals": ["用户主动恢复交流", "出现明确新理由"],
                 "cooldownSignals": ["负面反馈", "连续无回复"],
                 "riskRules": ["禁止主动销售触达"],
