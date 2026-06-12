@@ -652,12 +652,51 @@ pub async fn persist_recall_signal(
 ///   hit 也不进 block —— 分母只含"用户确有明确反应"的样本。
 ///
 /// 负向集合复用 [`crate::agent::is_negative_outcome`]，保持单一真相源。
+///
+/// universal-domain-adaptation 2.5-pre-1：本 wrapper 内联当前写死的 5+1 销售极性
+/// （正极 buying_signal + 负极 5 词），委托 [`classify_outcome_label_with_polarity`]
+/// → 零行为变化。2.5-main-2 把数据源换成 active DomainProfile.outcome_polarity。
 pub fn classify_outcome_label(outcome_status: Option<&str>) -> OutcomeLabel {
-    match outcome_status {
-        Some("user_replied_buying_signal") => OutcomeLabel::Hit,
-        Some(s) if crate::agent::is_negative_outcome(s) => OutcomeLabel::Block,
-        // None / "pending" / "" / user_replied_unclassified / 其它 → 删失（不臆测）。
-        _ => OutcomeLabel::Censored,
+    classify_outcome_label_with_polarity(
+        outcome_status,
+        DEFAULT_POSITIVE_OUTCOMES,
+        DEFAULT_NEGATIVE_OUTCOMES,
+    )
+}
+
+/// 2.5-pre-1：DEFAULT 销售域正极（逐字复刻原 `classify_outcome_label` 的 Hit 字面量）。
+pub(crate) const DEFAULT_POSITIVE_OUTCOMES: &[&str] = &["user_replied_buying_signal"];
+
+/// 2.5-pre-1：DEFAULT 销售域负极（逐字复刻 `reaction.rs::is_negative_outcome` 的 5 词）。
+pub(crate) const DEFAULT_NEGATIVE_OUTCOMES: &[&str] = &[
+    "user_replied_objection",
+    "user_replied_stop_requested",
+    "user_replied_unsubscribed",
+    "user_replied_negative",
+    "user_replied_complaint",
+];
+
+/// universal-domain-adaptation 2.5-pre-1：极性可参数化的 outcome 三态判定核心。
+///
+/// `positive` / `negative` 是本行业声明的正/负极 outcome 集合（来自
+/// DomainProfile.outcome_polarity；DEFAULT 销售域 = `DEFAULT_POSITIVE_OUTCOMES` +
+/// `DEFAULT_NEGATIVE_OUTCOMES`）。**删失语义不可配**（Iron Law ②）：不在正/负集里的
+/// 一切（含沉默/pending/空/未分类/未知）一律 Censored，绝不臆测为负。正极优先于负极
+/// （同一 outcome 同时被两集声明时取 Hit，防误配把购买信号当负例）。
+pub fn classify_outcome_label_with_polarity(
+    outcome_status: Option<&str>,
+    positive: &[impl AsRef<str>],
+    negative: &[impl AsRef<str>],
+) -> OutcomeLabel {
+    let Some(s) = outcome_status else {
+        return OutcomeLabel::Censored;
+    };
+    if positive.iter().any(|p| p.as_ref() == s) {
+        OutcomeLabel::Hit
+    } else if negative.iter().any(|n| n.as_ref() == s) {
+        OutcomeLabel::Block
+    } else {
+        OutcomeLabel::Censored
     }
 }
 
@@ -1654,5 +1693,119 @@ mod tests {
             classify_outcome_label(Some("pending")),
             OutcomeLabel::Block
         );
+    }
+
+    // ---- 2.5-pre-1：classify 极性参数化 等价性 + 召回回归基线 ----
+
+    #[test]
+    fn classify_outcome_label_default_polarity_matches_hardcoded_verbatim() {
+        // 逐字护栏：wrapper(委托默认极性) == 改造前写死真值表,保 2.5-main-2 切 profile
+        // 后销售域字节等价。对标 default_profile_chunk_roles_match_router_verbatim 风格。
+        assert_eq!(
+            classify_outcome_label(Some("user_replied_buying_signal")),
+            OutcomeLabel::Hit
+        );
+        for s in DEFAULT_NEGATIVE_OUTCOMES {
+            assert_eq!(classify_outcome_label(Some(s)), OutcomeLabel::Block, "{s}");
+        }
+        for s in [None, Some(""), Some("pending"), Some("user_replied_unclassified"), Some("x")] {
+            assert_eq!(classify_outcome_label(s), OutcomeLabel::Censored, "{s:?}");
+        }
+        // wrapper 与显式传默认极性的核心函数同结果。
+        for s in ["user_replied_buying_signal", "user_replied_objection", "pending", "x"] {
+            assert_eq!(
+                classify_outcome_label(Some(s)),
+                classify_outcome_label_with_polarity(
+                    Some(s),
+                    DEFAULT_POSITIVE_OUTCOMES,
+                    DEFAULT_NEGATIVE_OUTCOMES
+                ),
+            );
+        }
+    }
+
+    #[test]
+    fn classify_outcome_label_polarity_is_parametric() {
+        // 证明极性来自配置：换一套极性集 → 同一 outcome 的三态翻转,且原销售词落 Censored。
+        let positive = ["user_emotion_opened_up"]; // 情感域：示弱/倾诉=正向
+        let negative = ["user_went_cold"]; // 情感域：转冷=负向
+        assert_eq!(
+            classify_outcome_label_with_polarity(Some("user_emotion_opened_up"), &positive, &negative),
+            OutcomeLabel::Hit
+        );
+        assert_eq!(
+            classify_outcome_label_with_polarity(Some("user_went_cold"), &positive, &negative),
+            OutcomeLabel::Block
+        );
+        // 原销售极性词在情感 profile 下不再被识别 → 删失(不臆测)。
+        assert_eq!(
+            classify_outcome_label_with_polarity(Some("user_replied_buying_signal"), &positive, &negative),
+            OutcomeLabel::Censored
+        );
+        assert_eq!(
+            classify_outcome_label_with_polarity(Some("user_replied_objection"), &positive, &negative),
+            OutcomeLabel::Censored
+        );
+    }
+
+    #[test]
+    fn classify_outcome_label_positive_wins_over_negative_on_overlap() {
+        // 同一 outcome 同时被正负集声明（误配）→ 取 Hit,防把购买信号当负例。
+        let both = ["x"];
+        assert_eq!(
+            classify_outcome_label_with_polarity(Some("x"), &both, &both),
+            OutcomeLabel::Hit
+        );
+    }
+
+    #[test]
+    fn classify_outcome_label_censored_semantics_not_configurable() {
+        // 删失语义红线：不在正/负集的一切（含未知未来值）一律 Censored,与极性集内容无关。
+        let positive = ["pos"];
+        let negative = ["neg"];
+        for s in [None, Some(""), Some("pending"), Some("unknown_future")] {
+            assert_eq!(
+                classify_outcome_label_with_polarity(s, &positive, &negative),
+                OutcomeLabel::Censored,
+                "{s:?} 必删失"
+            );
+        }
+    }
+
+    #[test]
+    fn dynamic_confidence_responds_to_polarity_flip() {
+        // 召回排序回归基线（兑现设计 doc「召回排序回归基线」）：同一 outcome 序列喂两套
+        // 极性,DEFAULT 把销售负词计 Block 压低 dyn_conf;翻转极性把同词计 Hit 抬高 dyn_conf。
+        // 证明「极性是召回排序的因」,2.5-main-2 切 profile 后该因果链不变。
+        let outcomes = [
+            Some("user_replied_objection"),
+            Some("user_replied_objection"),
+            Some("user_replied_buying_signal"),
+        ];
+        let count = |pos: &[&str], neg: &[&str]| -> (u64, u64) {
+            let mut h = 0u64;
+            let mut b = 0u64;
+            for o in outcomes {
+                match classify_outcome_label_with_polarity(o, pos, neg) {
+                    OutcomeLabel::Hit => h += 1,
+                    OutcomeLabel::Block => b += 1,
+                    OutcomeLabel::Censored => {}
+                }
+            }
+            (h, b)
+        };
+        let base = 0.5;
+        let min_samples = 0;
+        // DEFAULT：2 objection=Block + 1 buying=Hit → h=1,b=2 → hit_rate=1/3。
+        let (h_def, b_def) = count(DEFAULT_POSITIVE_OUTCOMES, DEFAULT_NEGATIVE_OUTCOMES);
+        assert_eq!((h_def, b_def), (1, 2));
+        let conf_def = compute_dynamic_confidence(base, h_def, b_def, 0.0, min_samples);
+        // 翻转：把 objection 划为正极 → 3 个都 Hit → h=3,b=0 → hit_rate=1.0。
+        let flipped_pos = ["user_replied_objection", "user_replied_buying_signal"];
+        let (h_flip, b_flip) = count(&flipped_pos, &[]);
+        assert_eq!((h_flip, b_flip), (3, 0));
+        let conf_flip = compute_dynamic_confidence(base, h_flip, b_flip, 0.0, min_samples);
+        // 极性翻转使 dyn_conf 严格升高（召回排序权重随之改变）。
+        assert!(conf_flip > conf_def, "翻转极性应抬高 dyn_conf: {conf_flip} vs {conf_def}");
     }
 }
