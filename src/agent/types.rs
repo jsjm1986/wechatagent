@@ -549,10 +549,24 @@ impl RawAgentDecision {
             AUTONOMY_MODE_VALUES,
             &mut risks,
         );
+        // H9 universal-domain-adaptation：conversationMode 允许集合从 runtime
+        // 注入（active DomainProfile.conversation_modes，由 gateway 在加载 profile
+        // 后写入 runtime.allowed_conversation_modes）。空时回落到内置销售域四模式
+        // `CONVERSATION_MODE_VALUES`（DEFAULT 逐字等价 + 兼容 PBT/无 profile 入口）。
+        let conversation_mode_values: Vec<&str> =
+            if runtime.allowed_conversation_modes.is_empty() {
+                CONVERSATION_MODE_VALUES.to_vec()
+            } else {
+                runtime
+                    .allowed_conversation_modes
+                    .iter()
+                    .map(String::as_str)
+                    .collect()
+            };
         let conversation_mode = check_required_enum(
             self.conversation_mode.clone(),
             "conversation_mode",
-            CONVERSATION_MODE_VALUES,
+            &conversation_mode_values,
             &mut risks,
         );
         let needs_review = check_required_bool(self.needs_review, "needs_review", &mut risks);
@@ -1540,6 +1554,7 @@ mod validate_and_promote_tests {
             quiet_hours_start: 22,
             quiet_hours_end: 8,
             quiet_hours_tz_offset_hours: 8,
+            allowed_conversation_modes: crate::agent::runtime::default_conversation_modes(),
         }
     }
 
@@ -1827,6 +1842,110 @@ mod validate_and_promote_tests {
     fn raw_decision_without_escalation_still_parses() {
         let raw: RawAgentDecision = serde_json::from_str(r#"{}"#).expect("parse empty");
         assert!(raw.escalation_request.is_none());
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // universal-domain-adaptation H9：conversationMode 枚举从 runtime 注入。
+    // 锁死：① DEFAULT 销售域四模式逐字等价（反过拟合护栏）；② runtime 注入的
+    // 行业模式集合生效（情感陪伴可声明 intimate_companion）；③ 注入集合外的值被
+    // 严格拒绝；④ runtime 空集合 fallback 到内置四模式。
+    // 这些是确定性单测，替代此前仅有的概率性 real-LLM 兜底。
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// H9 辅助：构造一个能通过 final 校验、且显式带某个 conversation_mode 的 raw。
+    fn raw_with_conversation_mode(mode: &str) -> RawAgentDecision {
+        let mut raw = make_valid_low_routine_raw();
+        raw.conversation_mode = Some(mode.to_string());
+        raw
+    }
+
+    /// 提取与 conversation_mode 相关的违规标签（missing / invalid_enum）。
+    fn conversation_mode_risks(risks: &[String]) -> Vec<&String> {
+        risks
+            .iter()
+            .filter(|r| r.contains("conversation_mode"))
+            .collect()
+    }
+
+    #[test]
+    fn h9_default_runtime_locks_four_sales_modes_verbatim() {
+        // runtime_default(true) 走 UserRuntimeParameters::default → 内置四模式。
+        // 四个销售域模式逐一通过，无 conversation_mode 相关 risk。
+        let runtime = runtime_default(true);
+        for mode in [
+            "casual_relationship",
+            "value_exchange",
+            "consultative",
+            "boundary_protection",
+        ] {
+            let raw = raw_with_conversation_mode(mode);
+            let (decision, risks) = raw.validate_and_promote(&runtime);
+            assert_eq!(decision.conversation_mode, mode, "mode {mode} 应原样保留");
+            assert!(
+                conversation_mode_risks(&risks).is_empty(),
+                "销售域四模式 {mode} 不应产生 conversation_mode risk，实际：{risks:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn h9_default_runtime_rejects_non_sales_mode() {
+        // 默认四模式集合下，情感陪伴模式 intimate_companion 不在集合内 → 被严格拒绝。
+        let runtime = runtime_default(true);
+        let raw = raw_with_conversation_mode("intimate_companion");
+        let (_decision, risks) = raw.validate_and_promote(&runtime);
+        assert!(
+            risks
+                .iter()
+                .any(|r| r == "invalid_enum_value:conversation_mode:intimate_companion"),
+            "默认四模式集合应拒绝 intimate_companion，实际 risks：{risks:?}"
+        );
+    }
+
+    #[test]
+    fn h9_profile_injected_modes_accept_industry_specific_value() {
+        // 模拟 gateway 用 active DomainProfile.conversation_modes 覆盖 runtime：
+        // 情感陪伴行业声明 intimate_companion + 仍保留 boundary_protection（边界保护红线）。
+        let mut runtime = runtime_default(true);
+        runtime.allowed_conversation_modes = vec![
+            "intimate_companion".to_string(),
+            "boundary_protection".to_string(),
+        ];
+        let raw = raw_with_conversation_mode("intimate_companion");
+        let (decision, risks) = raw.validate_and_promote(&runtime);
+        assert_eq!(decision.conversation_mode, "intimate_companion");
+        assert!(
+            conversation_mode_risks(&risks).is_empty(),
+            "profile 已声明 intimate_companion，不应产生 risk，实际：{risks:?}"
+        );
+        // 注入集合外的销售模式 value_exchange 现在反而被拒绝（集合已切换为情感行业）。
+        let raw2 = raw_with_conversation_mode("value_exchange");
+        let (_d2, risks2) = raw2.validate_and_promote(&runtime);
+        assert!(
+            risks2
+                .iter()
+                .any(|r| r == "invalid_enum_value:conversation_mode:value_exchange"),
+            "情感行业集合应拒绝销售模式 value_exchange，实际：{risks2:?}"
+        );
+    }
+
+    #[test]
+    fn h9_empty_runtime_modes_fall_back_to_four_const() {
+        // runtime.allowed_conversation_modes 为空（防御性：理论上 from_config/Default
+        // 都给了四模式，但显式清空模拟边界）→ fallback 到 const 四模式。
+        let mut runtime = runtime_default(true);
+        runtime.allowed_conversation_modes = Vec::new();
+        // 销售模式通过。
+        let raw = raw_with_conversation_mode("consultative");
+        let (decision, risks) = raw.validate_and_promote(&runtime);
+        assert_eq!(decision.conversation_mode, "consultative");
+        assert!(conversation_mode_risks(&risks).is_empty());
+        // 非销售模式仍被拒（fallback 集合 = 四模式）。
+        let raw2 = raw_with_conversation_mode("intimate_companion");
+        let (_d2, risks2) = raw2.validate_and_promote(&runtime);
+        assert!(risks2
+            .iter()
+            .any(|r| r == "invalid_enum_value:conversation_mode:intimate_companion"));
     }
 }
 

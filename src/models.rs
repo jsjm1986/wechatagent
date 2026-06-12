@@ -1212,6 +1212,14 @@ pub struct DomainProfile {
     /// `customer_stage`（DEFAULT_PROFILE 下即如此，零行为变化）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stagnation_dimension: Option<String>,
+    /// universal-domain-adaptation H9：本行业允许的 conversationMode 取值集合
+    /// （替代 `agent::types::CONVERSATION_MODE_VALUES` 写死的四模式枚举）。空 Vec
+    /// 时 `validate_and_promote` fallback 到内置默认四模式（DEFAULT_PROFILE 即声明
+    /// 这四个，零行为变化）。情感陪伴等行业可声明 `intimate_companion` 等额外模式。
+    /// **红线**：`boundary_protection` 反接管语义无论本集合是否含它都继续由 prompt
+    /// 写死守护，本字段只放宽"用哪些模式"，不放宽"反人工接管"。
+    #[serde(default)]
+    pub conversation_modes: Vec<String>,
     /// E5-T1 多版本灰度：同 `(workspace_id, profile_id)` 下 `version` 单调递增。
     #[serde(default = "default_version_one")]
     pub version: i32,

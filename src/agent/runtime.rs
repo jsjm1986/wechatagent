@@ -77,6 +77,24 @@ pub struct UserRuntimeParameters {
     /// #69 作息门控：运营方时区相对 UTC 的小时偏移（中国 +8）。默认 8。
     /// 固定偏移使作息判定不依赖部署宿主时区；loader clamp 到 `[-12, 14]`。
     pub quiet_hours_tz_offset_hours: i32,
+    /// universal-domain-adaptation H9：本轮允许的 conversationMode 取值集合
+    /// （替代 `agent::types::CONVERSATION_MODE_VALUES` 写死四模式）。`from_config`
+    /// 给内置默认四模式；gateway 在加载 active DomainProfile 后用
+    /// `profile.conversation_modes` 覆盖（非空时）。`validate_and_promote` 读它做
+    /// conversationMode 严格枚举校验。DEFAULT 销售域 = 四模式逐字等价。
+    pub allowed_conversation_modes: Vec<String>,
+}
+
+/// H9：内置默认 conversationMode 四模式（逐字复刻 `types::CONVERSATION_MODE_VALUES`）。
+/// `from_config` / `Default` 用它；active profile 声明了 `conversation_modes` 时由
+/// gateway 覆盖。
+pub(crate) fn default_conversation_modes() -> Vec<String> {
+    vec![
+        "casual_relationship".to_string(),
+        "value_exchange".to_string(),
+        "consultative".to_string(),
+        "boundary_protection".to_string(),
+    ]
 }
 
 impl UserRuntimeParameters {
@@ -133,6 +151,9 @@ impl UserRuntimeParameters {
             quiet_hours_start: typed.quiet_hours_start.min(23),
             quiet_hours_end: typed.quiet_hours_end.min(23),
             quiet_hours_tz_offset_hours: typed.quiet_hours_tz_offset_hours.clamp(-12, 14),
+            // H9：from_config 不接 DomainProfile，给内置默认四模式；gateway 在
+            // 加载 active profile 后用 profile.conversation_modes 覆盖（非空时）。
+            allowed_conversation_modes: default_conversation_modes(),
         }
     }
 
@@ -231,6 +252,8 @@ impl Default for UserRuntimeParameters {
             quiet_hours_start: typed.quiet_hours_start.min(23),
             quiet_hours_end: typed.quiet_hours_end.min(23),
             quiet_hours_tz_offset_hours: typed.quiet_hours_tz_offset_hours.clamp(-12, 14),
+            // H9：PBT / 无 profile 入口的默认四模式，与销售域逐字等价。
+            allowed_conversation_modes: default_conversation_modes(),
         }
     }
 }
@@ -495,6 +518,7 @@ mod tests {
             quiet_hours_start: 22,
             quiet_hours_end: 8,
             quiet_hours_tz_offset_hours: 8,
+            allowed_conversation_modes: default_conversation_modes(),
         };
         let doc = runtime.as_document();
         assert_eq!(doc.get_i64("reactionTokenBudget").ok(), Some(8000));
