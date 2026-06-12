@@ -47,7 +47,11 @@ pub(super) async fn run_step(db: &Database) -> AppResult<()> {
                 skipped += 1;
                 continue;
             }
-            let (allowed, forbidden): (Vec<String>, Vec<String>) = if state_key == "cooldown" {
+            // H13：禁主动触达的 state 读 `forbidsProactive` 标志（替代写死的
+            // `state_key == "cooldown"`）。DEFAULT 状态机仅 cooldown 标 forbidsProactive
+            // → 与改造前逐字等价；换行业的 profile 可标别的 state 禁回复。
+            let forbids_proactive = state.get_bool("forbidsProactive").unwrap_or(false);
+            let (allowed, forbidden): (Vec<String>, Vec<String>) = if forbids_proactive {
                 (
                     vec!["silent".to_string(), "follow_up".to_string()],
                     vec!["reply".to_string()],
