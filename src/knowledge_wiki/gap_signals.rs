@@ -711,6 +711,27 @@ pub enum OutcomeLabel {
     Censored,
 }
 
+/// 2.5-main-2：把 active DomainProfile 的 [`OutcomePolarity`](crate::models::OutcomePolarity)
+/// 解析成「有效极性」字符串向量对（正极, 负极）。
+///
+/// **逐极独立回落**（与 main-1 seed 契约一致）：某一极为空 → 该极回落内置销售常量
+/// （`DEFAULT_POSITIVE_OUTCOMES` / `DEFAULT_NEGATIVE_OUTCOMES`），非空 → 用 profile 声明的。
+/// DEFAULT_PROFILE 的 seed 显式填回这两组常量，故 DEFAULT 下解析结果与回落字节相等
+/// → 回路① 召回排序逐字等价。换行业（声明非空极性）时按本行业极性判定。
+fn resolve_effective_polarity(polarity: &crate::models::OutcomePolarity) -> (Vec<String>, Vec<String>) {
+    let positive = if polarity.positive.is_empty() {
+        DEFAULT_POSITIVE_OUTCOMES.iter().map(|s| s.to_string()).collect()
+    } else {
+        polarity.positive.clone()
+    };
+    let negative = if polarity.negative.is_empty() {
+        DEFAULT_NEGATIVE_OUTCOMES.iter().map(|s| s.to_string()).collect()
+    } else {
+        polarity.negative.clone()
+    };
+    (positive, negative)
+}
+
 /// 30 天滑窗 hit/blocked 统计回写 `usage_stats`，并按朴素公式写 `dynamic_confidence`。
 ///
 /// 公式（见 design.md §6.2）：
@@ -728,9 +749,15 @@ pub enum OutcomeLabel {
 ///
 /// **换血（P1）**：`real_outcome_enabled=true`（默认）时，hit/block 不再取
 /// reviewer 自评 `review_approved`，而是按 `run_id` join `AgentDecisionReview`
-/// 的真实用户反应 `outcome_status`，经 [`classify_outcome_label`] 三态判定：
+/// 的真实用户反应 `outcome_status`，经 [`classify_outcome_label_with_polarity`] 三态判定：
 /// 正向→hit、负向→block、沉默/pending/无反应→删失排除（不进任何分母）。
 /// `false`（回滚）时逐字节退回旧 `review_approved` 逻辑。公式本体不变。
+///
+/// **2.5-main-2（极性配置化）**：极性来源从写死常量换成 active
+/// `DomainProfile.outcome_polarity`（顶部一次 `load_active_domain_profile`，命中 30s
+/// 缓存），经 [`resolve_effective_polarity`] 逐极回落常量后沿纯函数传入。DEFAULT_PROFILE
+/// 的 seed 与回落同源 → 销售域召回排序字节等价；换行业按本行业极性判定。只换数据源，
+/// 公式 + 删失语义 + rank_key 全不动。
 pub async fn refresh_usage_stats_and_confidence(
     db: &Database,
     workspace_id: &str,
@@ -741,6 +768,16 @@ pub async fn refresh_usage_stats_and_confidence(
     let now = DateTime::now();
     let window_start_ms = now.timestamp_millis() - 30 * 24 * 60 * 60 * 1000;
     let window_start = DateTime::from_millis(window_start_ms);
+
+    // 2.5-main-2：本 workspace 的有效极性（profile 非空极性 ?? 内置销售常量，逐极独立）。
+    // DEFAULT_PROFILE seed 与回落同源 → 销售域字节等价。命中 1G-c 的 30s TTL 缓存。
+    let (positive_outcomes, negative_outcomes) = if real_outcome_enabled {
+        let profile = crate::agent::domain_profile::load_active_domain_profile(db, workspace_id).await;
+        resolve_effective_polarity(&profile.outcome_polarity)
+    } else {
+        // 回滚路径不查极性（走 review_approved），省一次 profile 解析。
+        (Vec::new(), Vec::new())
+    };
 
     let cursor = db
         .knowledge_usage_logs()
@@ -800,7 +837,11 @@ pub async fn refresh_usage_stats_and_confidence(
             let outcome = outcome_by_run
                 .get(&log.run_id)
                 .and_then(|o| o.as_deref());
-            Some(classify_outcome_label(outcome))
+            Some(classify_outcome_label_with_polarity(
+                outcome,
+                &positive_outcomes,
+                &negative_outcomes,
+            ))
         } else {
             None
         };
@@ -1807,5 +1848,59 @@ mod tests {
         let conf_flip = compute_dynamic_confidence(base, h_flip, b_flip, 0.0, min_samples);
         // 极性翻转使 dyn_conf 严格升高（召回排序权重随之改变）。
         assert!(conf_flip > conf_def, "翻转极性应抬高 dyn_conf: {conf_flip} vs {conf_def}");
+    }
+
+    // ---- 2.5-main-2：resolve_effective_polarity 逐极独立回落 ----
+
+    #[test]
+    fn resolve_effective_polarity_empty_falls_back_to_sales_const() {
+        // 空 profile（OutcomePolarity::default()）→ 两极都回落内置销售常量。
+        // 这是 DEFAULT_PROFILE 与老库（无字段）下回路① 字节等价的根据。
+        let (pos, neg) = resolve_effective_polarity(&crate::models::OutcomePolarity::default());
+        assert_eq!(
+            pos,
+            DEFAULT_POSITIVE_OUTCOMES.iter().map(|s| s.to_string()).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            neg,
+            DEFAULT_NEGATIVE_OUTCOMES.iter().map(|s| s.to_string()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn resolve_effective_polarity_seed_equals_fallback_byte_for_byte() {
+        // DEFAULT_PROFILE 的 seed 极性 resolve 后 == 空集 resolve 后（回落常量）。
+        // 锁死「seed 与回落同源」：销售域无论 profile 是否显式 seed 都判一致。
+        let seeded = crate::agent::domain_profile::default_outcome_polarity();
+        let (sp, sn) = resolve_effective_polarity(&seeded);
+        let (ep, en) = resolve_effective_polarity(&crate::models::OutcomePolarity::default());
+        assert_eq!(sp, ep);
+        assert_eq!(sn, en);
+    }
+
+    #[test]
+    fn resolve_effective_polarity_each_pole_independent() {
+        // 逐极独立：只声明正极 → 正极用 profile、负极仍回落销售常量（漏配某极不静默丢失）。
+        let only_pos = crate::models::OutcomePolarity {
+            positive: vec!["user_emotion_opened_up".to_string()],
+            negative: vec![],
+        };
+        let (pos, neg) = resolve_effective_polarity(&only_pos);
+        assert_eq!(pos, vec!["user_emotion_opened_up"]);
+        assert_eq!(
+            neg,
+            DEFAULT_NEGATIVE_OUTCOMES.iter().map(|s| s.to_string()).collect::<Vec<_>>()
+        );
+        // 只声明负极 → 对称。
+        let only_neg = crate::models::OutcomePolarity {
+            positive: vec![],
+            negative: vec!["user_went_cold".to_string()],
+        };
+        let (pos2, neg2) = resolve_effective_polarity(&only_neg);
+        assert_eq!(
+            pos2,
+            DEFAULT_POSITIVE_OUTCOMES.iter().map(|s| s.to_string()).collect::<Vec<_>>()
+        );
+        assert_eq!(neg2, vec!["user_went_cold"]);
     }
 }
