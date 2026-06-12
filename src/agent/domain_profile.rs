@@ -92,12 +92,12 @@ pub fn default_domain_profile(workspace_id: &str) -> DomainProfile {
             ],
         },
         coverage_dimensions: vec![
-            // 逐字复刻 catalog.rs 五维
-            CoverageDimension { key: "capability".to_string(), display_name: "能力".to_string(), required: false },
-            CoverageDimension { key: "pricing".to_string(), display_name: "报价".to_string(), required: false },
-            CoverageDimension { key: "caseEvidence".to_string(), display_name: "案例证据".to_string(), required: false },
-            CoverageDimension { key: "effectClaims".to_string(), display_name: "效果声明".to_string(), required: false },
-            CoverageDimension { key: "deliveryBoundary".to_string(), display_name: "交付边界".to_string(), required: false },
+            // 逐字复刻 catalog.rs 五维 + 命中锚点散文（H5-b：anchor_hint 注入审计 prompt）。
+            CoverageDimension { key: "capability".to_string(), display_name: "能力".to_string(), required: false, anchor_hint: Some("有 verified 切片陈述产品/服务\"能做什么\"的具体能力或功能事实。".to_string()) },
+            CoverageDimension { key: "pricing".to_string(), display_name: "报价".to_string(), required: false, anchor_hint: Some("有 verified 切片含具体报价/计费/套餐金额（注意：仅 needs_review 草稿里的报价不计入 verifiedFact，而应置 pendingDraft=true 并入 gap）。".to_string()) },
+            CoverageDimension { key: "caseEvidence".to_string(), display_name: "案例证据".to_string(), required: false, anchor_hint: Some("有 verified 切片描述**具体客户案例/实施成效**（含可核验的主体、场景或落地结果），即判 true。".to_string()) },
+            CoverageDimension { key: "effectClaims".to_string(), display_name: "效果声明".to_string(), required: false, anchor_hint: Some("有 verified 切片含**可核验的效果数据/量化成果**（如转化率提升、响应时长变化等具体数字），即判 true。".to_string()) },
+            CoverageDimension { key: "deliveryBoundary".to_string(), display_name: "交付边界".to_string(), required: false, anchor_hint: Some("有 verified 切片陈述交付方式/SLA/可用性/部署边界等具体条款。".to_string()) },
         ],
         // 逐字复刻 planner 写死的停滞计时维度（customer_stage）。
         stagnation_dimension: Some("customer_stage".to_string()),

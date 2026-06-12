@@ -1423,6 +1423,12 @@ pub struct CoverageDimension {
     pub display_name: String,
     #[serde(default)]
     pub required: bool,
+    /// universal-domain-adaptation H5-b：本维度判 `verifiedFact=true` 的命中锚点
+    /// 语义（注入 completeness 审计 prompt 的「命中锚点」段，替代 `catalog.rs` 写死的
+    /// 销售五维锚点散文）。`None` 时该维度不产出锚点行（DEFAULT_PROFILE 五维逐字
+    /// 复刻原 prompt 锚点 → 销售域 prompt 字节等价）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anchor_hint: Option<String>,
 }
 
 /// catalog 重建队列：`apply_chunk_revision` 写完即 enqueue；catalog_rebuild_worker

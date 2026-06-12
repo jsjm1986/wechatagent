@@ -408,6 +408,21 @@ fn build_coverage_skeleton(dims: &[crate::models::CoverageDimension]) -> String 
         .join(",\n")
 }
 
+/// universal-domain-adaptation H5-b：把 active DomainProfile 的 coverage 维度的
+/// `anchor_hint` 渲染成 completeness 审计 prompt 的「命中锚点」段（每维一行
+/// `  - {key}：{hint}`）。逐字复刻原写死 prompt 的缩进/分隔；`anchor_hint=None` 的
+/// 维度不产出行。DEFAULT 销售域五维 anchor_hint 逐字复刻原锚点 → prompt 字节等价。
+fn build_coverage_anchors(dims: &[crate::models::CoverageDimension]) -> String {
+    dims.iter()
+        .filter_map(|d| {
+            d.anchor_hint
+                .as_ref()
+                .map(|hint| format!("  - {}：{hint}", d.key))
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 pub async fn build_operation_knowledge_completeness(
     state: &AppState,
     workspace_id: &str,
@@ -602,6 +617,10 @@ pub async fn build_operation_knowledge_completeness(
     // 见 [`build_coverage_skeleton`]：对齐规则逐字复刻原 prompt，DEFAULT 五维渲染
     // 结果与原字面量逐字一致。
     let coverage_skeleton = build_coverage_skeleton(&active_profile.coverage_dimensions);
+    // H5-b：命中锚点散文按 active profile 维度的 anchor_hint 动态生成（替代写死五行）。
+    // 见 [`build_coverage_anchors`]：DEFAULT 五维 anchor_hint 逐字复刻原 prompt 锚点 →
+    // 销售域 prompt 字节等价；anchor_hint=None 的维度不产出锚点行。
+    let coverage_anchors = build_coverage_anchors(&active_profile.coverage_dimensions);
     let user = format!(
         r#"请基于已验证知识切片与待审定切片输出 JSON：
 {{
@@ -629,11 +648,7 @@ pub async fn build_operation_knowledge_completeness(
   - "pendingDraft": 该维度的具体信息存在于 needs_review 草稿中（第 3 类）时为 true。
   **关键：同一维度可以既 verifiedFact=true 又 pendingDraft=true**（例如企业版报价已审定为客观事实、旗舰版报价仍是未审定草稿，则 pricing 的 verifiedFact 与 pendingDraft 都为 true）。绝不能因为有 verified 事实就把 pendingDraft 抹成 false，也绝不能因为有草稿就把已具备的 verifiedFact 抹成 false——两个方向的漏标都要扣分。三位全 false 表示该维度缺失（第 4 类）。此判据对 pricing / caseEvidence / effectClaims / deliveryBoundary / capability 每一维都同样适用。
 - 各 coverage 维度判 verifiedFact=true 的命中锚点（满足"已验证客观事实"时即应判 true，**不要漏判**）：
-  - capability：有 verified 切片陈述产品/服务"能做什么"的具体能力或功能事实。
-  - pricing：有 verified 切片含具体报价/计费/套餐金额（注意：仅 needs_review 草稿里的报价不计入 verifiedFact，而应置 pendingDraft=true 并入 gap）。
-  - caseEvidence：有 verified 切片描述**具体客户案例/实施成效**（含可核验的主体、场景或落地结果），即判 true。
-  - effectClaims：有 verified 切片含**可核验的效果数据/量化成果**（如转化率提升、响应时长变化等具体数字），即判 true。
-  - deliveryBoundary：有 verified 切片陈述交付方式/SLA/可用性/部署边界等具体条款。
+{coverage_anchors}
 - methodologyOnly=true 的判定门槛（与 verifiedFact 对称，**防滥标**；通用原则，对每一维同样适用）：仅当该维度存在**以方法论/话术/价值主张/谈判策略为主体、且本身不含可对客客观事实（无具体数字/条款/案例数据/效果数字）**的独立 verified 切片时，才标 methodologyOnly=true。判定准则：
   - 一条切片若已含可核验的客观事实（即让该维度 verifiedFact=true 的那条），**不要**再因它顺带提到「怎么做/如何沟通/价值」就把同维度 methodologyOnly 也标 true——含客观事实的切片归 verifiedFact，**不重复**归 methodologyOnly。
   - 只有当某维度**除了**客观事实切片之外、**另有**一条纯方法论/话术切片，或该维度根本没有客观事实、只有方法论切片时，methodologyOnly 才为 true。
@@ -702,13 +717,36 @@ mod tests {
     #[test]
     fn coverage_skeleton_custom_dims_align_to_longest() {
         let dims = vec![
-            crate::models::CoverageDimension { key: "symptom".to_string(), display_name: "症状".to_string(), required: false },
-            crate::models::CoverageDimension { key: "treatmentPlan".to_string(), display_name: "治疗方案".to_string(), required: false },
+            crate::models::CoverageDimension { key: "symptom".to_string(), display_name: "症状".to_string(), required: false, anchor_hint: None },
+            crate::models::CoverageDimension { key: "treatmentPlan".to_string(), display_name: "治疗方案".to_string(), required: false, anchor_hint: None },
         ];
         let got = build_coverage_skeleton(&dims);
         // 最长 key = "treatmentPlan":（15 字符），symptom 行补到同宽。
         let expected = "    \"symptom\":      { \"verifiedFact\": false, \"methodologyOnly\": false, \"pendingDraft\": false },\n    \"treatmentPlan\":{ \"verifiedFact\": false, \"methodologyOnly\": false, \"pendingDraft\": false }";
         assert_eq!(got, expected);
+    }
+
+    /// H5-b 逐字等价护栏：DEFAULT_PROFILE 五维 anchor_hint 渲染出的「命中锚点」段，
+    /// 必须与改造前写死的 5 行锚点散文逐字一致，保证 completeness 审计 prompt 在销售域
+    /// 字节不变。换行业 = 另一份维度各自的 anchor_hint。
+    #[test]
+    fn coverage_anchors_default_profile_byte_equivalent() {
+        let p = crate::agent::domain_profile::default_domain_profile("ws-1");
+        let got = build_coverage_anchors(&p.coverage_dimensions);
+        let expected = "  - capability：有 verified 切片陈述产品/服务\"能做什么\"的具体能力或功能事实。\n  - pricing：有 verified 切片含具体报价/计费/套餐金额（注意：仅 needs_review 草稿里的报价不计入 verifiedFact，而应置 pendingDraft=true 并入 gap）。\n  - caseEvidence：有 verified 切片描述**具体客户案例/实施成效**（含可核验的主体、场景或落地结果），即判 true。\n  - effectClaims：有 verified 切片含**可核验的效果数据/量化成果**（如转化率提升、响应时长变化等具体数字），即判 true。\n  - deliveryBoundary：有 verified 切片陈述交付方式/SLA/可用性/部署边界等具体条款。";
+        assert_eq!(got, expected);
+    }
+
+    /// H5-b：anchor_hint=None 的维度不产出锚点行（只渲染有 hint 的维度）。
+    #[test]
+    fn coverage_anchors_skips_none_hint() {
+        let dims = vec![
+            crate::models::CoverageDimension { key: "a".to_string(), display_name: "A".to_string(), required: false, anchor_hint: Some("锚点A".to_string()) },
+            crate::models::CoverageDimension { key: "b".to_string(), display_name: "B".to_string(), required: false, anchor_hint: None },
+            crate::models::CoverageDimension { key: "c".to_string(), display_name: "C".to_string(), required: false, anchor_hint: Some("锚点C".to_string()) },
+        ];
+        let got = build_coverage_anchors(&dims);
+        assert_eq!(got, "  - a：锚点A\n  - c：锚点C");
     }
 
     /// 认知状态闸：有任何待审定草稿（needs_review>0）→ fully_supported 必降为
