@@ -76,7 +76,7 @@ fn make_contact(wxid: &str) -> Contact {
         last_outbound_style: None,
         intent_trajectory: Vec::new(),
         locale: None,
-        deal_events: Vec::new(),
+        outcome_events: Vec::new(),
         created_at: now,
         updated_at: now,
     }

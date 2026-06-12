@@ -1217,7 +1217,7 @@ mod dual_gate_classification_tests {
             last_agent_run_at: None,
             last_outbound_style: None,
             intent_trajectory: Vec::new(),
-            deal_events: Vec::new(),
+            outcome_events: Vec::new(),
             locale: None,
             created_at: DateTime::now(),
             updated_at: DateTime::now(),
