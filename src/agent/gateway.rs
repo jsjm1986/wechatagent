@@ -42,8 +42,9 @@ use super::decision::{
 use super::domain::USER_OPS_DOMAIN_ID;
 use super::escalation;
 use super::guards::{
-    classify_decision_action, enforce_state_action_policy, initial_operation_state_key,
-    normalize_decision_runtime, normalize_decision_state, planner_from_decision,
+    check_state_transition, classify_decision_action, enforce_state_action_policy,
+    initial_operation_state_key, normalize_decision_runtime, normalize_decision_state,
+    planner_from_decision,
 };
 use super::knowledge_router::{
     empty_knowledge_route, load_operation_knowledge,
@@ -1551,7 +1552,7 @@ async fn run_user_operation_gateway_inner(
         }
     }
 
-    apply_agent_updates(state, &contact, &final_decision, &runtime).await?;
+    apply_agent_updates(state, &contact, &final_decision, &runtime, domain_config.as_ref()).await?;
     apply_operating_memory_update(
         state,
         &contact,
@@ -2458,6 +2459,7 @@ async fn apply_agent_updates(
     contact: &Contact,
     decision: &AgentDecision,
     runtime: &UserRuntimeParameters,
+    domain_config: Option<&OperationDomainConfig>,
 ) -> AppResult<()> {
     let mut set_doc = doc! {
         "updated_at": DateTime::now(),
@@ -2541,9 +2543,44 @@ async fn apply_agent_updates(
     if let Some(value) = non_empty_option(&decision.follow_up_policy) {
         set_doc.insert("follow_up_policy", value);
     }
-    if let Some(value) = non_empty_option(&decision.operation_state) {
-        set_doc.insert("operation_state", value);
-        set_doc.insert("operation_state_updated_at", DateTime::now());
+    // C2：operation_state 与 customer_stage 强制同步——二者取值同属一套 canonical id
+    // 空间（m006 一一对应），历史上各写各、会漂移。这里令 operation_state 派生自
+    // **归一后的** customer_stage（signals_decision.domain_signals，已过 taxonomy
+    // canonical 改写），保两字段一致、消除双轨漂移。customer_stage 缺失时（决策只给
+    // state 不给 stage，如部分 mock / 纯状态推进）回落 decision.operation_state，
+    // 行为与改造前一致。
+    // rejected = check_state_transition 判非法时记 (旧 state, 拟写 state, reason)，
+    // DB 写库后据此补一条审计事件（fail-soft，见下方写入分支）。
+    // applied = 实际写入的 operation_state（被拒/缺失时为 None）；下方 transitioned
+    // 事件据**实际写入值**而非 decision.operation_state 判迁移，保事件与库一致（C2
+    // 单一真值：金标里 customer_stage 缺失 → applied==decision.operation_state，逐字等价）。
+    let mut rejected_state_transition: Option<(String, String, String)> = None;
+    let mut applied_operation_state: Option<String> = None;
+    let synced_state = signals_decision
+        .domain_signals
+        .get_str("customer_stage")
+        .ok()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(ToString::to_string)
+        .or_else(|| non_empty_option(&decision.operation_state));
+    if let Some(value) = synced_state {
+        // C2-2：接回 check_state_transition 校验闸（H13-2 已把引擎 initial/allowFromAny
+        // 泛化为状态机标志驱动）。fail-soft：非法迁移**不阻断 reply**（reply 已在本函数
+        // 之前下发，本函数只做画像/状态落库），仅 (a) 拒绝本次 operation_state 写入、保留
+        // 旧 state；(b) 写一条审计事件。domain_config=None（simulation/老调用）时
+        // check_state_transition 返回 None → fail-open 照常写，行为与改造前一致。
+        match check_state_transition(domain_config, contact.operation_state.as_deref(), &value) {
+            None => {
+                applied_operation_state = Some(value.clone());
+                set_doc.insert("operation_state", value);
+                set_doc.insert("operation_state_updated_at", DateTime::now());
+            }
+            Some(reason) => {
+                rejected_state_transition =
+                    Some((contact.operation_state.clone().unwrap_or_default(), value, reason));
+            }
+        }
     }
     if let Some(value) = non_empty_option(&decision.operation_state_reason) {
         set_doc.insert("operation_state_reason", value);
@@ -2655,9 +2692,28 @@ async fn apply_agent_updates(
 
     // P2-4：operation_state 发生迁移时写一条 stage event，便于 staleness /
     // funnel / dashboard 复盘。同状态或新状态为空时不发，避免噪声。
-    if let Some((prior, next)) = detect_state_transition(
+    // C2-2：非法迁移被 check_state_transition 拒绝时，改写一条 rejected 审计事件
+    // （保留旧 state、reply 已照常下发），并**不**发 transitioned 事件——二者互斥，
+    // 避免对一次被拒迁移既报"已迁移"又报"被拒"。domain_config=None 时不会进 rejected
+    // 分支（fail-open），detect_state_transition 行为与改造前逐字一致。
+    if let Some((prior, attempted, reason)) = &rejected_state_transition {
+        write_event_for_account(
+            state,
+            &contact.account_id,
+            Some(&contact.wxid),
+            "agent.operation_state_transition_rejected",
+            "rejected",
+            &format!("operation_state 拒绝迁移 {prior} → {attempted}：{reason}"),
+            Some(doc! {
+                "prior_state": prior,
+                "attempted_state": attempted,
+                "reason": reason,
+            }),
+        )
+        .await?;
+    } else if let Some((prior, next)) = detect_state_transition(
         contact.operation_state.as_deref(),
-        decision.operation_state.as_deref(),
+        applied_operation_state.as_deref(),
     ) {
         write_event_for_account(
             state,
