@@ -156,7 +156,10 @@ pub fn check_state_transition(
     let from = from.map(str::trim).filter(|s| !s.is_empty());
     match from {
         None => {
-            if to == "new_contact" {
+            // H13：空 from 唯一合法迁入目标 = 标 `initial:true` 的 state（替代写死的
+            // `to=="new_contact"`）。DEFAULT 状态机仅 new_contact 标 initial，逐字等价；
+            // 换行业的 profile 可把别的 state 标初始态。
+            if target.get_bool("initial").unwrap_or(false) {
                 None
             } else {
                 Some(format!("state_transition_invalid: from=<empty> to={to}"))

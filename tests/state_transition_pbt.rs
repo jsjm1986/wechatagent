@@ -75,7 +75,9 @@ fn expected_allow(from: Option<&str>, to: &str) -> bool {
     }
     let from = from.map(str::trim).filter(|s| !s.is_empty());
     match from {
-        None => to == "new_contact",
+        // H13：空 from 唯一合法目标 = 标 `initial:true` 的 state（与引擎 check_state_transition
+        // 同步从写死的 `to=="new_contact"` 改读 initial 标志，保持闭式参考与引擎一致）。
+        None => target.get_bool("initial").unwrap_or(false),
         Some(f) => target
             .get_array("allowedFrom")
             .map(|arr| arr.iter().any(|item| item.as_str() == Some(f)))
