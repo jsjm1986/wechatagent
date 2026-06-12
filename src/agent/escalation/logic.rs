@@ -218,11 +218,10 @@ pub(crate) fn build_decision_signals_text(
 
     // ② 多轮卡死：同一议题连续未推进 + 最近一轮负面反应（两条件 AND）。
     let turns = consecutive_unprogressed_turns(&contact.intent_trajectory);
-    let latest_negative = contact
-        .intent_trajectory
-        .last()
-        .map(|e| crate::agent::reaction::is_negative_outcome(&e.intent))
-        .unwrap_or(false);
+    let latest_negative = latest_reaction_is_negative_with_polarity(
+        &contact.intent_trajectory,
+        crate::agent::reaction::DEFAULT_NEGATIVE_OUTCOMES,
+    );
     if is_stuck_or_undelivered(turns, DEFAULT_STUCK_THRESHOLD, latest_negative) {
         lines.push(
             "- 该议题已连续多轮未推进且客户有负面反应：避免硬推同一话术，考虑换个角度，或如实告诉客户你需要向领导确认后再答复。".to_string(),
@@ -287,6 +286,20 @@ pub(crate) fn is_stuck_or_undelivered(
     latest_reaction_is_negative: bool,
 ) -> bool {
     consecutive_unprogressed_turns >= threshold && latest_reaction_is_negative
+}
+
+/// universal-domain-adaptation 2.5-pre-2：意图轨迹末轮反应是否落入负极集（极性可参数化）。
+/// `negative` = 本行业负向 outcome 集（DEFAULT 销售域 =
+/// `reaction::DEFAULT_NEGATIVE_OUTCOMES`）。空轨迹返回 false。2.5-main-3 把数据源换成
+/// active profile，使回路③卡死判定随行业极性走。
+pub(crate) fn latest_reaction_is_negative_with_polarity(
+    trajectory: &[crate::models::IntentTrajectoryEntry],
+    negative: &[impl AsRef<str>],
+) -> bool {
+    trajectory
+        .last()
+        .map(|e| negative.iter().any(|n| n.as_ref() == e.intent))
+        .unwrap_or(false)
 }
 
 /// 默认卡死轮阈值（spec：默认 3，可配）。
@@ -673,6 +686,30 @@ mod tests {
         ];
         assert_eq!(consecutive_unprogressed_turns(&traj), 3);
         assert_eq!(consecutive_unprogressed_turns(&[]), 0);
+    }
+
+    // ---- 2.5-pre-2：回路③ 末轮负面判定极性参数化 等价性 ----
+
+    #[test]
+    fn latest_reaction_negative_default_polarity_matches_hardcoded() {
+        // 逐字护栏：末轮负面判定走默认负极 == 改造前 is_negative_outcome 真值表。
+        let neg = crate::agent::reaction::DEFAULT_NEGATIVE_OUTCOMES;
+        let traj = vec![traj_entry("user_replied_objection")];
+        assert!(latest_reaction_is_negative_with_polarity(&traj, neg));
+        let traj_pos = vec![traj_entry("user_replied_buying_signal")];
+        assert!(!latest_reaction_is_negative_with_polarity(&traj_pos, neg));
+        // 空轨迹 false。
+        assert!(!latest_reaction_is_negative_with_polarity(&[], neg));
+    }
+
+    #[test]
+    fn latest_reaction_negative_is_parametric() {
+        // 证明极性来自配置：自定义负极下情感域"转冷"判负,原销售 objection 不判负。
+        let negative = ["user_went_cold"];
+        let traj_cold = vec![traj_entry("a"), traj_entry("user_went_cold")];
+        assert!(latest_reaction_is_negative_with_polarity(&traj_cold, &negative));
+        let traj_obj = vec![traj_entry("user_replied_objection")];
+        assert!(!latest_reaction_is_negative_with_polarity(&traj_obj, &negative));
     }
 
     #[test]
