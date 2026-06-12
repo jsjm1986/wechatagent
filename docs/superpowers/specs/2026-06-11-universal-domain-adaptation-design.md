@@ -50,8 +50,8 @@
 | H1 | `AgentDecision.customer_stage / intent_level` 是 typed 字段 | `agent/types.rs:99-100` | 换行业维度必须改 Rust 源码 |
 | H2 | `TAGGED_FIELDS` const 表硬绑 getter/setter | `agent/decision_taxonomy.rs:38-49` | 维度集合写死，不可配 |
 | H3 | prompt 点名销售维度语义 | `prompts.rs:749,771,886-887,936,1595` | "客户阶段=陌生/关注/评估/决策/成交" 写死 |
-| H4 | grounding 兜底探针词表中文销售词 | `guards.rs:331-345` | 换行业绝对化承诺静默漏判 |
-| H5 | completeness 审计五维 coverage | `catalog.rs:553-605` | capability/pricing/effectClaims 强绑 B2B 销售 |
+| H4 | grounding 兜底探针词表中文销售词 | `guards.rs:331-345` | ✅Phase 2 已解：commitment_claim_class 走 profile.commitment_markers，DEFAULT 词表逐字等价 |
+| H5 | completeness 审计五维 coverage | `catalog.rs:553-605` | ✅Phase 2 已解：走 profile.coverage_dimensions(骨架+锚点散文)，DEFAULT 五维 prompt byte-equivalent |
 | **H6** | **planner 漏斗权重/终态/停滞** | `planner/mod.rs:800-829`(stage/intent 权重)、`737-738`(stagnation dotted-key 过滤)、`TERMINAL_STAGES` 常量 | 9 个销售阶段→优先级权重、high/medium/low→权重、哪些算终态全写死；换行业客户跟进排序失灵 |
 | **H7** | **两份独立维度校验列表** | `decision_taxonomy.rs:38`(decision 阶段) + `gateway.rs:3262`(finalize soft gate) | 同一维度集合写死两遍，各自漂移的正确性风险 |
 | **H8** | **planner 运营范式焊死成单向漏斗** | `planner/mod.rs:70-78`(三扫描器无条件每 tick 跑)、`727-774`(stage_stagnation 过滤硬绑 customer_stage) | 整套主动触达假设「人人都走陌生→成交→维护」；情绪陪伴/关系维护型无法关掉漏斗推进，也无法因用户而异调范式（见 §3.6） |
@@ -71,7 +71,7 @@
 
 ### 1.5 顺带发现的非通用化缺陷（独立问题，本设计标注但不混入）
 
-- **D1**：`DomainSchema` 运行时零消费——CRUD/版本/校验都建了，但没有任何运行时代码读 active schema。文档（`domain_schemas.rs:5-7`、`knowledge-wiki.md §9`）宣称"写入侧按 active schema 校验"是**未落地**。
+- **D1** ✅**Phase 2 已解（写侧）**：`enforce_domain_attributes` 纯函数（required/enum/alias）+ `apply_chunk_revision` 第 6.5 步接线（有 active schema 才校验，无则 no-op）。文档宣称的"写入侧按 active schema 校验"已落地。注：其余写入站点（chat/lessons_learned/reaction/escalation）留后续分批接入。原性质：`DomainSchema` 运行时零消费——CRUD/版本/校验都建了但无运行时读取。
 - **D2**：verify/reject/auto_verify/PUT/chat 五类写入**绕过** `apply_chunk_revision`，verify 这个关键状态转移**不写 chunk_revisions 历史、不更新 provenance**——审计链在"升级为 verified"处断裂。
 - **D3**：关系图谱 BFS 遍历忽略 `relation_kind`，contradicts 与 references 无差别扩散；superseded_by 不做版本 redirect。
 
@@ -118,9 +118,9 @@ H1–H9 是顺对话场景"碰"出来的；为穷尽，按六层（状态机/rev
 | **H11** | **负反应/极性词表写死销售**（objection/unsubscribed/complaint） | `reaction.rs:310-359`(`is_negative_outcome`/`reaction_outcome_status`) | **真锚点·改它高风险**：单一真相源，横向渗透**三条已落地回路**（见下）。情感域优质回复永远判不出 Hit→自学习失效 |
 | **H12** | **出厂人格=销售人设**（默认 soul 76 行顾问灵魂 + playbook"成交准备度/复购转介绍"方法论） | `prompts.rs:743-818`、`443-480` | ✅**Phase 1.5 已解**：DomainProfile 加 `soul_override`/`methodology_override`，decision 层 Some 替换 / None 回落硬编码兜底，DEFAULT 销售人格逐字不变。原性质：H3 被严重低估的真身，人格主体是编译期 `&'static str` |
 | **H13** | **状态机 9 态定义本体写死**（goal/信号/风险全锚定异议/成交/复购） | `prompts.rs:585-690` + 初始态 `new_contact` 字面量散落 6 处 + `cooldown` 特例 `m013` | ✅**Phase 1.5 已解**：state 加 `initial`/`forbidsProactive` 标志，引擎+两份 PBT 闭式参考三方原子泛化，写侧 4 处/读侧 5 处走 `initial_operation_state_key`，cooldown 特例改读标志；配套 C2 令 operation_state 派生自 customer_stage + 接回 check_state_transition(fail-soft)。状态机本体随 profile 选属 Phase 3 引导层（仍活 operation_domain_configs） |
-| **H14** | **grounding/ProductAccuracy 硬闸无条件**（每条回复都要 grounding≥7） | `gates.rs:28,114` | 纯情感回复靠 reviewer 每次给满分兜底，脆弱。应条件化（仅产品声明时纳入）。归 Phase 2 |
+| **H14** | **grounding/ProductAccuracy 硬闸无条件**（每条回复都要 grounding≥7） | `gates.rs:28,114` | ✅**Phase 2 已解**：classify_dual_gate grounding 软分数硬闸条件化（profile.grounding_gate_bypass_without_claim + per-msg claim_analysis），DEFAULT bypass=false 字节等价；blocked_unverified_product_claim verified 红线任何取值不变。原性质：纯情感回复靠 reviewer 满分兜底脆弱 |
 | **H15** | **经营公式+rubric 销售化**（ConversionReadiness/ProductFit 公式 + 逼单打分锚点） | `prompts.rs:964-969`、`review/mod.rs:244-247` | 不进硬闸但占 reviewer 注意力 + 被 `/evaluations` 当 ground-truth 度量。归 1E |
-| **H16** | **chunk_type+answeringMode 产品框架**（product_fact 分段 prompt、product_safe 三态） | `knowledge_router.rs:190-235`、`catalog.rs:550-581` | 绕过已铺好的 DomainProfile 管道。归知识库后端 Phase 2 |
+| **H16** | **chunk_type+answeringMode 产品框架**（product_fact 分段 prompt、product_safe 三态） | `knowledge_router.rs:190-235`、`catalog.rs:550-581` | ✅**Phase 2 已解（chunk_type 部分）**：抽象为 ChunkRole「用途角色」(key/header/order/is_fallback)，profile.chunk_roles 驱动分桶渲染,DEFAULT 销售四态逐字等价(chunk_type_routing_pbt 1024 cases 绿)。注：answeringMode 三态文案仍写死 catalog.rs,留后续 |
 | **H17** | **memoryCard schema+intent_trajectory 销售化**（objections/businessContext 一等字段；情绪史/纪念日无槽） | `memory.rs:62-97`、`models.rs:2812-2821`(`objection_type` typed) | 情感维度只能挤进泛化文本。记忆维度 schema 应随 profile |
 | **H18** | **触达节奏全局写死**（debounce 窗口 4s、account off_hours 用 UTC 小时） | `webhooks.rs:582`、`account_scheduler.rs:47` | 去抖/账号作息节奏全行业共用，未随范式可配。归 1F/Phase 2（off_hours 时区错位是 C 类缺陷） |
 | **H19** | **作息门控无关系类型/contact 维度**（quiet_hours 全域单值，默认 22→8 销售作息） | `runtime.rs:72-79,132-135`、`agent/mod.rs:510-513` | 情感陪伴"晚上是黄金时段"会被作息门压制到次日 8 点；H8/H9 做完仍失效。**必须纳入 `resolve_operation_mode` override 链，否则数字分身落地受阻**。归 1F |
@@ -559,11 +559,13 @@ casual 模式的"收紧压力门"会与"热烈推进"打架（非误杀，是模
 - **C2** ✅（强制同步 + 接回校验闸）：gateway `apply_agent_updates` 令 `operation_state` 派生自归一后的 `customer_stage`（同一 canonical id 空间，消除双轨漂移），缺 stage 时回落 `decision.operation_state`（C2-1）；同处补调 check_state_transition 把准死代码引擎接回生产路径，**fail-soft**：非法迁移不阻断 reply、仅拒写 operation_state（留旧 state）+ 写 `agent.operation_state_transition_rejected` 审计事件（与 transitioned 事件互斥），domain_config=None 时 fail-open 逐字等价；transitioned 事件改据**实际写入值** `applied_operation_state` 判定保库/事件一致（C2-2）。CLAUDE.md:134 硬规则注释更新为接回后真实语义。
 - DEFAULT 等价：销售域状态机/人格逐字复刻，现有状态机金标 + real-LLM 套件零变化。lib 1007/0（`-D warnings` 净）；state_transition_pbt 6/0；string_fact_risk_guard 13/0；禁词/model-hint 双闸净。**Phase 1.5（H12 + H13 + C2）全部完成。**
 
-### Phase 2：grounding / completeness / 知识分类配置化（H4/H14/H5/H16 + 修 D1）
-- H4 词表（`guards.rs`）、H5 五维（`catalog.rs`）从 profile 读，DEFAULT 值 = 当前硬编码值。
-- **H14**：grounding/ProductAccuracy 硬闸条件化——仅当 `claim_requires_product_knowledge` 或 profile 声明"本域有可验证事实声明"时才纳入闸；纯关系/情感 profile 旁路。
-- **H16**：chunk_type 的 product_fact 分段 prompt + answeringMode 三态（product_safe）文案下沉 profile；语义抽象为"用途角色/中性三态"。
-- 修 D1：DomainSchema 运行时接线（引导层要它生效）。
+### Phase 2：grounding / completeness / 知识分类配置化（H4/H14/H5/H16 + 修 D1）✅**已完成**
+- **H4** ✅：`commitment_claim_class` 改签名吃 `&CommitmentMarkers`（来自 active profile），两组词表皆空回落内置销售 const；唯一消费方 finalize grounding 漏判探针接 `active_profile.commitment_markers`。DEFAULT 词表逐字复刻 → 字节等价。
+- **H14** ✅：`classify_dual_gate` 的 grounding 软分数硬闸条件化——`grounding_gate_applies = !runtime.grounding_gate_bypass_without_claim || claim_requires_product_knowledge(review.claim_analysis)`。新 profile/runtime 字段 `grounding_gate_bypass_without_claim`（default false=DEFAULT 无条件硬闸字节等价），gateway 加载 profile 后覆盖。**红线不变**：`blocked_unverified_product_claim`（R5.4 verified 强约束 + 漏判探针，在 finalize 不同函数/阶段）任何取值下都不变。
+- **H5** ✅（拆 a/b）：completeness coverage 五维从写死改读 `profile.coverage_dimensions`。a=结构化骨架（fallback 对象 + prompt JSON 骨架由维度动态生成，`build_coverage_skeleton` 对齐规则逐字复刻）；b=命中锚点散文（`CoverageDimension` 加 `anchor_hint`，`build_coverage_anchors` 按维度生成）。两份 byte-equivalence 快照测试锁死 DEFAULT 五维 prompt 字节不变。
+- **H16** ✅（拆 a/b）：chunk 分段从写死销售四态抽象为「用途角色」。a=`ChunkRole{key,header,order,is_fallback}` 模型 + `DomainProfile.chunk_roles` + `default_chunk_roles()` seed（逐字复刻四态）；b=`format_operation_knowledge_for_prompt_with_roles` 按角色分桶/排序/渲染，decision+reviewer 传 `profile.chunk_roles`，无参 wrapper 委托 DEFAULT 供 PBT。`chunk_type_routing_pbt` 1024 cases 全绿。
+- **修 D1** ✅（拆 a/b）：DomainSchema 运行时接回写侧。a=`enforce_domain_attributes(schema, attrs)` 纯函数（required 缺失/enum 越界 reject、alias→canonical rewrite，无 IO）；b=`apply_chunk_revision` 第 6.5 步当且仅当存在 active schema 时校验 domain_attributes，无 active schema（DEFAULT/`domain_schema_id=None`）→ no-op 直通零行为变化。其余写入站点（chat/lessons_learned/reaction/escalation）留后续分批。
+- 验证：lib 1007→1026/0（每步递增等价/行为测试）；4 baseline PBT + chunk_type_routing_pbt 全绿；RUSTFLAGS=-D warnings 净；禁词/model-hint 双闸净。**Phase 2（H4/H14/H5/H16/D1）全部完成。**
 
 ### Phase 2.5：自学习回路极性配置化（H11，最深命门·最高护栏·独立 Phase）
 > H11 是数字分身能否自我学习的命门，但是**高风险"动学习逻辑"**：`is_negative_outcome` 单一真相源横向渗透知识召回排序 + negative_example 反向训练 + 请示卡死三条已落地回路，跨域语义错配会**静默污染召回且无业务指标兜底告警**。故单列、配最强护栏。
