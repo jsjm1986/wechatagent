@@ -19,7 +19,7 @@ use crate::prompts;
 use crate::routes::AppState;
 
 use super::generate_agent_json;
-use super::knowledge_router::format_operation_knowledge_for_prompt;
+use super::knowledge_router::format_operation_knowledge_for_prompt_with_roles;
 use super::memory::{format_operator_memory_for_reply_prompt, load_operator_memory};
 use super::reaction::format_reaction_hint;
 use super::runtime::UserRuntimeParameters;
@@ -297,7 +297,7 @@ pub(crate) async fn decide_reply_with_promote(
         .unwrap_or_default();
     let runtime_text = serde_json::to_string(&runtime.as_document()).unwrap_or_default();
     let knowledge_text =
-        format_operation_knowledge_for_prompt(knowledge_chunks);
+        format_operation_knowledge_for_prompt_with_roles(knowledge_chunks, &active_profile.chunk_roles);
     let knowledge_route_text = serde_json::to_string(knowledge_route).unwrap_or_default();
     // agent-autonomy-loop W5 / Task 6.5：注入最近 K=5 条 deprecated_facts，
     // 让 Reply Agent 知道哪些事实已过期，避免再次引用。仅传 id / text /

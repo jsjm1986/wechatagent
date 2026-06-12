@@ -47,7 +47,7 @@ use crate::routes::AppState;
 use super::budget::RunBudget;
 use super::decision::{format_operation_domain_config_for_prompt, format_playbook_for_prompt};
 use super::generate_agent_json;
-use super::knowledge_router::format_operation_knowledge_for_prompt;
+use super::knowledge_router::format_operation_knowledge_for_prompt_with_roles;
 use super::runtime::UserRuntimeParameters;
 use super::types::{
     AgentDecision, DecisionReviewResult, KnowledgeRouteResult, ReviewScores, RunPlannerResult,
@@ -207,6 +207,13 @@ pub(crate) async fn review_decision(
     };
     let system =
         prompts::load_prompt(&state.db, &state.config.default_workspace_id, prompt_key).await?;
+    // universal-domain-adaptation H16-b：reviewer 的产品知识段也按 active profile 的
+    // chunk_roles 渲染（与 Reply Agent 同源）。缓存命中即廉价；DEFAULT 销售四态字节等价。
+    let active_profile = crate::agent::domain_profile::load_active_domain_profile(
+        &state.db,
+        &contact.workspace_id,
+    )
+    .await;
     let runtime_text = serde_json::to_string(&runtime.as_document()).unwrap_or_default();
     let memory_card_text = serde_json::to_string(context_pack).unwrap_or_default();
     let memory_text = serde_json::to_string(&mongodb::bson::doc! {
@@ -317,7 +324,7 @@ Review 模式: {}
             .map(format_operation_domain_config_for_prompt)
             .unwrap_or_default(),
         runtime_text,
-        format_operation_knowledge_for_prompt(knowledge_chunks),
+        format_operation_knowledge_for_prompt_with_roles(knowledge_chunks, &active_profile.chunk_roles),
         knowledge_route_text
     );
     // S2 (Phase 0)：reviewer 双模真并行——主 reviewer 走 generate_agent_json
