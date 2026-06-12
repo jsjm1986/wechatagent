@@ -93,6 +93,7 @@ fn base_cfg() -> AppConfig {
         evolution_threshold_release_cooldown_hours: 24,
         evolution_cohort_per_contact_cap: 3,
         evolution_cohort_sample_per_failure_bucket: 10,
+        evolution_max_negative_reaction_increase: 0.05,
         evolution_auto_release_enabled: false,
         evolution_auto_release_window_hours: 336,
         evolution_auto_release_per_tick_cap: 1,

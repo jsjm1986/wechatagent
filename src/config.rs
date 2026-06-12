@@ -171,6 +171,14 @@ pub struct AppConfig {
     pub evolution_cohort_per_contact_cap: usize,
     /// M4：每个 finalReviewStatus 失败桶给 Critic LLM 的样本数。
     pub evolution_cohort_sample_per_failure_bucket: usize,
+    /// universal-domain-adaptation 2.5-pre-3：post-release 业务结果兜底观测指标
+    /// `negative_reaction_rate`（窗口内客户负反应占已分类反应的比例，按 run_id join
+    /// `agent_decision_reviews.outcome_status` 经 [`crate::knowledge_wiki::gap_signals::classify_outcome_label`]
+    /// 三态判定，沉默/未分类删失排除）的「升幅」上限。release 后该比率较 release 前
+    /// 上升超过此值，说明放行率提升可能以更多客户负反应为代价（reviewer 过程指标与
+    /// 业务结果背离）。**本期仅观测**：算出 delta 写进 post_release 事件 details 供 admin
+    /// 察觉错配，**不参与任何 promote/rollback 判决**（强制门留 2.5-main-4，默认关）。默认 0.05。
+    pub evolution_max_negative_reaction_increase: f64,
 
     // ── Phase C / C5：threshold_overrides 自动 release（hold_rate close-loop） ──
     //
@@ -462,6 +470,11 @@ impl AppConfig {
             evolution_cohort_sample_per_failure_bucket: env_or(
                 "EVOLUTION_COHORT_SAMPLE_PER_FAILURE_BUCKET",
                 "10",
+            )
+            .parse()?,
+            evolution_max_negative_reaction_increase: env_or(
+                "EVOLUTION_MAX_NEGATIVE_REACTION_INCREASE",
+                "0.05",
             )
             .parse()?,
             // ── Phase C / C5：自动 release ──
