@@ -508,9 +508,85 @@ fn validate_schema_payload(
     Ok((fields, alias_doc))
 }
 
+/// universal-domain-adaptation D1-a：按 active `DomainSchema` 校验 / 重写一份 chunk 的
+/// `domain_attributes` 子文档（纯函数，无 IO）。这是把此前运行时零消费的 DomainSchema
+/// 接回写侧的核心判定（D1-b 在 chunk 写入点调用）。
+///
+/// 语义（与 `domain_schemas.rs` 头部红线一致）：
+/// 1. **alias 透明 rewrite**：`schema.alias_dict` 的 `别名 → canonical` 命中 attrs 的 key
+///    时，把该 key 改写成 canonical（值不动）；canonical 已存在则别名项被丢弃（canonical
+///    优先，避免双写冲突）。
+/// 2. **required 缺失 reject**：rewrite 后，`field.required==true` 的字段缺失（或值为
+///    Null）→ `BadRequest`。
+/// 3. **enum 越界 reject**：`field.kind=="enum"` 且 attrs 提供了该字段时，值必须是字符串
+///    且 ∈ `allowed_values`；否则 `BadRequest`。
+///
+/// 返回 rewrite 后的 `Document`（调用方据此落库）。schema 未声明的额外字段原样保留
+/// （schema 是"必填/枚举/别名"约束层，不是白名单，行业自定义扩展字段不被剔除）。
+///
+/// 注：D1-a 先落纯函数 + 单测；写侧接线（apply_chunk_revision 等）在 D1-b 接入，
+/// 故本函数暂无生产调用方，用 `#[allow(dead_code)]` 静默 `-D warnings`（D1-b 移除）。
+#[allow(dead_code)]
+pub fn enforce_domain_attributes(
+    schema: &DomainSchema,
+    attrs: &Document,
+) -> AppResult<Document> {
+    use mongodb::bson::Bson;
+
+    // 1. alias 透明 rewrite：别名 key → canonical key。
+    let mut out = Document::new();
+    for (key, value) in attrs.iter() {
+        let canonical = schema
+            .alias_dict
+            .get_str(key)
+            .ok()
+            .map(ToString::to_string)
+            .unwrap_or_else(|| key.to_string());
+        // canonical 已被显式提供时不被别名覆盖（canonical 优先，避免双写冲突）。
+        if canonical != *key && out.contains_key(&canonical) {
+            continue;
+        }
+        out.insert(canonical, value.clone());
+    }
+
+    // 2 & 3. 逐 field 校验 required / enum。
+    for field in &schema.fields {
+        let present = out
+            .get(&field.name)
+            .map(|v| !matches!(v, Bson::Null))
+            .unwrap_or(false);
+        if field.required && !present {
+            return Err(AppError::BadRequest(format!(
+                "domain_attributes 缺少必填字段 {}（schema={}）",
+                field.name, schema.schema_id
+            )));
+        }
+        if field.kind == "enum" && present {
+            let Some(allowed) = field.allowed_values.as_ref() else {
+                continue;
+            };
+            let value_str = out.get_str(&field.name).map_err(|_| {
+                AppError::BadRequest(format!(
+                    "domain_attributes.{} 是 enum 字段，值必须为字符串",
+                    field.name
+                ))
+            })?;
+            if !allowed.iter().any(|a| a == value_str) {
+                return Err(AppError::BadRequest(format!(
+                    "domain_attributes.{} = {value_str} 不在允许值 {:?} 内（schema={}）",
+                    field.name, allowed, schema.schema_id
+                )));
+            }
+        }
+    }
+
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mongodb::bson::{doc, DateTime, Document};
     use serde_json::json;
 
     fn enum_field() -> DomainFieldPayload {
@@ -598,5 +674,100 @@ mod tests {
         let err =
             validate_schema_payload(&[enum_field()], &json!({"客户阶段": 123})).unwrap_err();
         assert!(matches!(err, AppError::BadRequest(_)));
+    }
+
+    // ── D1-a：enforce_domain_attributes 纯函数 ──
+
+    fn schema_with(fields: Vec<DomainField>, alias: Document) -> DomainSchema {
+        DomainSchema {
+            id: None,
+            schema_id: "test_schema".to_string(),
+            workspace_id: "ws".to_string(),
+            name: "测试 schema".to_string(),
+            version: 1,
+            fields,
+            alias_dict: alias,
+            guard_dsl: None,
+            is_active: true,
+            created_at: DateTime::now(),
+            updated_at: DateTime::now(),
+        }
+    }
+
+    fn field(name: &str, kind: &str, required: bool, allowed: Option<Vec<&str>>) -> DomainField {
+        DomainField {
+            name: name.to_string(),
+            label: name.to_string(),
+            kind: kind.to_string(),
+            required,
+            allowed_values: allowed.map(|v| v.into_iter().map(String::from).collect()),
+            alias_of: None,
+        }
+    }
+
+    #[test]
+    fn enforce_passes_when_required_present_and_enum_valid() {
+        let schema = schema_with(
+            vec![field("stage", "enum", true, Some(vec!["lead", "won"]))],
+            Document::new(),
+        );
+        let attrs = doc! { "stage": "lead", "note": "任意扩展字段保留" };
+        let out = enforce_domain_attributes(&schema, &attrs).expect("ok");
+        assert_eq!(out.get_str("stage").unwrap(), "lead");
+        // schema 未声明的扩展字段原样保留（schema 非白名单）。
+        assert_eq!(out.get_str("note").unwrap(), "任意扩展字段保留");
+    }
+
+    #[test]
+    fn enforce_rejects_missing_required_field() {
+        let schema = schema_with(vec![field("stage", "string", true, None)], Document::new());
+        let err = enforce_domain_attributes(&schema, &doc! { "other": "x" }).unwrap_err();
+        assert!(matches!(err, AppError::BadRequest(_)));
+    }
+
+    #[test]
+    fn enforce_rejects_enum_value_out_of_range() {
+        let schema = schema_with(
+            vec![field("stage", "enum", false, Some(vec!["lead", "won"]))],
+            Document::new(),
+        );
+        let err = enforce_domain_attributes(&schema, &doc! { "stage": "invalid" }).unwrap_err();
+        assert!(matches!(err, AppError::BadRequest(_)));
+    }
+
+    #[test]
+    fn enforce_rewrites_alias_to_canonical() {
+        let schema = schema_with(
+            vec![field("stage", "enum", true, Some(vec!["lead", "won"]))],
+            doc! { "阶段": "stage" },
+        );
+        // 输入用中文别名「阶段」，应被改写成 canonical「stage」，再过 required/enum 校验。
+        let out = enforce_domain_attributes(&schema, &doc! { "阶段": "won" }).expect("ok");
+        assert_eq!(out.get_str("stage").unwrap(), "won");
+        assert!(!out.contains_key("阶段"), "别名 key 应被改写掉");
+    }
+
+    #[test]
+    fn enforce_canonical_wins_over_alias_when_both_present() {
+        let schema = schema_with(
+            vec![field("stage", "string", false, None)],
+            doc! { "阶段": "stage" },
+        );
+        // canonical「stage」与别名「阶段」同时出现 → canonical 优先，别名项丢弃。
+        let out = enforce_domain_attributes(
+            &schema,
+            &doc! { "stage": "canonical_value", "阶段": "alias_value" },
+        )
+        .expect("ok");
+        assert_eq!(out.get_str("stage").unwrap(), "canonical_value");
+    }
+
+    #[test]
+    fn enforce_empty_schema_is_noop_passthrough() {
+        // 无 fields 无 alias（DEFAULT/未激活语义近似）→ 原样直通。
+        let schema = schema_with(Vec::new(), Document::new());
+        let attrs = doc! { "a": 1, "b": "x" };
+        let out = enforce_domain_attributes(&schema, &attrs).expect("ok");
+        assert_eq!(out, attrs);
     }
 }
