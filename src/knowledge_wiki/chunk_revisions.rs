@@ -229,7 +229,25 @@ pub async fn apply_chunk_revision(
     merged.insert("provenance", Bson::Document(provenance));
 
     // 6) 末次防线：锁定字段强制覆盖回 existing
-    let merged = enforce_locked_fields(&merged, &existing_bson, DEFAULT_LOCKED_FIELDS);
+    let mut merged = enforce_locked_fields(&merged, &existing_bson, DEFAULT_LOCKED_FIELDS);
+
+    // 6.5) universal-domain-adaptation D1-b：active DomainSchema 校验 / 重写
+    // domain_attributes。仅当本 workspace 有 active schema 时生效；无 active schema
+    // （DEFAULT / 未配置行业 schema）→ 完全 no-op 直通，零行为变化。命中 required 缺失
+    // / enum 越界 → BadRequest 拒收；alias 命中 → 透明改写成 canonical 后落库（计入下方
+    // after_hash，alias 改写也算一次实质变更）。
+    if let Some(schema) =
+        crate::routes::domain_schemas::load_active_domain_schema(db, workspace_id).await?
+    {
+        if let Ok(attrs) = merged.get_document("domain_attributes") {
+            let enforced = crate::routes::domain_schemas::enforce_domain_attributes(
+                &schema,
+                &attrs.clone(),
+            )?;
+            merged.insert("domain_attributes", Bson::Document(enforced));
+        }
+    }
+
     let after_hash = compute_chunk_hash(&merged);
     let unchanged = before_hash == after_hash;
 
