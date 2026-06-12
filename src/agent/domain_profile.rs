@@ -34,7 +34,8 @@ use std::time::{Duration, Instant};
 use crate::db::Database;
 use crate::error::AppResult;
 use crate::models::{
-    ChunkRole, CommitmentMarkers, CoverageDimension, DomainProfile, ProfileDimension,
+    ChunkRole, CommitmentMarkers, CoverageDimension, DomainProfile, OutcomePolarity,
+    ProfileDimension,
 };
 
 /// 内置默认 profile 的 `profile_id`。运行时无 active profile 时使用。
@@ -72,6 +73,29 @@ pub fn default_chunk_roles() -> Vec<ChunkRole> {
             is_fallback: false,
         },
     ]
+}
+
+/// universal-domain-adaptation H11：内置默认自学习极性，逐字复刻回路① 的 fallback
+/// 常量（`gap_signals::DEFAULT_POSITIVE_OUTCOMES` + `DEFAULT_NEGATIVE_OUTCOMES`，
+/// 后者同 `reaction.rs::DEFAULT_NEGATIVE_OUTCOMES` 5 词）。**与回落同源**：seed 直接
+/// 引用这两个常量，故 DEFAULT_PROFILE 显式声明的极性与各消费方在空集时回落的极性
+/// 永远字节相等，不会因手抄漂移。DEFAULT_PROFILE 用它；active profile 声明了非空
+/// `outcome_polarity` 时由 2.5-main-2/3 各回路覆盖。等价性测试
+/// `default_profile_outcome_polarity_matches_hardcoded_verbatim` 锁死同步。
+pub fn default_outcome_polarity() -> OutcomePolarity {
+    use crate::knowledge_wiki::gap_signals::{
+        DEFAULT_NEGATIVE_OUTCOMES, DEFAULT_POSITIVE_OUTCOMES,
+    };
+    OutcomePolarity {
+        positive: DEFAULT_POSITIVE_OUTCOMES
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
+        negative: DEFAULT_NEGATIVE_OUTCOMES
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
+    }
 }
 
 /// 构造内置 DEFAULT_PROFILE。内容逐字等价当前源码写死的销售域行为。
@@ -148,6 +172,9 @@ pub fn default_domain_profile(workspace_id: &str) -> DomainProfile {
         grounding_gate_bypass_without_claim: false,
         // H16：DEFAULT 销售域 = 逐字复刻 knowledge_router 写死的四态角色（字节等价）。
         chunk_roles: default_chunk_roles(),
+        // H11：DEFAULT 销售极性 = 显式填回回路① fallback 常量（正极 buying_signal +
+        // 负极 5 词）。空集 default 会让消费方回落同一对常量，故 seed 与回落同源、字节等价。
+        outcome_polarity: default_outcome_polarity(),
         version: 1,
         current_version: true,
         previous_version: None,
@@ -442,6 +469,50 @@ mod tests {
     }
 
     #[test]
+    fn default_profile_outcome_polarity_matches_hardcoded_verbatim() {
+        // H11 逐字等价护栏：DEFAULT_PROFILE 的 outcome_polarity 与回路① 写死的极性
+        // 常量完全一致，保证 main-2/3 把三回路切到 profile 后销售域学习行为字节不变。
+        // seed 直接引用这两个常量（同源），本测试断言"引用关系成立 + 内容如预期"。
+        use crate::knowledge_wiki::gap_signals::{
+            DEFAULT_NEGATIVE_OUTCOMES, DEFAULT_POSITIVE_OUTCOMES,
+        };
+        let p = default_domain_profile("ws-1");
+        // 正极 = buying_signal 单词（回路① classify→Hit 的唯一字面量）。
+        assert_eq!(p.outcome_polarity.positive, vec!["user_replied_buying_signal"]);
+        // 负极 = objection/stop_requested/unsubscribed/negative/complaint 五词
+        // （回路① classify→Block + reaction.rs::is_negative_outcome 旧 5 词）。
+        assert_eq!(
+            p.outcome_polarity.negative,
+            vec![
+                "user_replied_objection",
+                "user_replied_stop_requested",
+                "user_replied_unsubscribed",
+                "user_replied_negative",
+                "user_replied_complaint",
+            ]
+        );
+        // 同源锁死：seed 与回落常量逐元素相等，杜绝手抄漂移。
+        assert_eq!(
+            p.outcome_polarity.positive,
+            DEFAULT_POSITIVE_OUTCOMES.iter().map(|s| s.to_string()).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            p.outcome_polarity.negative,
+            DEFAULT_NEGATIVE_OUTCOMES.iter().map(|s| s.to_string()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn default_outcome_polarity_default_is_empty_not_sales() {
+        // OutcomePolarity::default() 是空集（非销售词）——销售极性由 seed 显式填回。
+        // 这是消费方"空集→回落内置常量"契约的前提：default 不能预埋销售词，否则
+        // 换行业的 profile 若漏配某一极会静默继承销售词。
+        let d = crate::models::OutcomePolarity::default();
+        assert!(d.positive.is_empty());
+        assert!(d.negative.is_empty());
+    }
+
+    #[test]
     fn default_profile_bson_round_trip() {
         let p = default_domain_profile("ws-1");
         let doc = mongodb::bson::to_document(&p).expect("serialize");
@@ -449,6 +520,9 @@ mod tests {
         assert_eq!(parsed.profile_id, p.profile_id);
         assert_eq!(parsed.profile_dimensions.len(), 2);
         assert_eq!(parsed.commitment_markers.product_effect.len(), 5);
+        // H11：outcome_polarity 经 BSON 往返不丢（camelCase positive/negative）。
+        assert_eq!(parsed.outcome_polarity.positive, p.outcome_polarity.positive);
+        assert_eq!(parsed.outcome_polarity.negative, p.outcome_polarity.negative);
     }
 
     // ── 1G-c：DomainProfileCache TTL / 命中 / 回落 / 失效（无 Docker 纯内存）──

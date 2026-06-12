@@ -1274,6 +1274,17 @@ pub struct DomainProfile {
     /// 声明这四态，逐字等价）。换行业可声明任意角色（如情感域情绪记忆/纪念日）。
     #[serde(default)]
     pub chunk_roles: Vec<ChunkRole>,
+    /// universal-domain-adaptation H11：本行业「自学习极性」声明（替代写死的销售域
+    /// 正/负极 outcome 词表——正极 `user_replied_buying_signal`、负极 objection/
+    /// stop_requested/unsubscribed/negative/complaint 五词）。极性是横向渗透三条自学习
+    /// 回路（① dynamic_confidence 召回排序、② negative_example 反向训练、
+    /// ③ escalation 卡死请示）的单一真相源。空集（`OutcomePolarity::default()`，
+    /// DEFAULT_PROFILE 下由 seed 显式填回 5+1 销售词）时各消费方回落内置销售极性，
+    /// 逐字等价。情感/陪伴域可声明「示弱/倾诉/情绪表达」为正极，让优质回复被学习。
+    /// **红线**：删失语义不可配（Iron Law ②）——沉默/pending/未分类一律 Censored、
+    /// 绝不臆测为负；本字段只声明正/负集，不声明"沉默算什么"。
+    #[serde(default)]
+    pub outcome_polarity: OutcomePolarity,
     /// E5-T1 多版本灰度：同 `(workspace_id, profile_id)` 下 `version` 单调递增。
     #[serde(default = "default_version_one")]
     pub version: i32,
@@ -1456,6 +1467,37 @@ pub struct ChunkRole {
     /// DEFAULT 销售域 = `product_fact`（逐字复刻原「缺省/任意其它值→product_fact」）。
     #[serde(default)]
     pub is_fallback: bool,
+}
+
+/// universal-domain-adaptation H11：本行业「自学习极性」= 声明哪些 outcome_status
+/// 算正极（Hit，强化学习/优质示范）、哪些算负极（Block，反向训练/请示卡死）。
+///
+/// 这是横向渗透三条已落地自学习回路的**单一真相源**：
+/// - 回路① `gap_signals::classify_outcome_label` → dynamic_confidence 召回排序；
+/// - 回路② `reaction::compute_reviewer_misjudge_signal` → negative_example 反向训练；
+/// - 回路③ `escalation::logic` 末轮负面判定 → 连续未推进时卡死请示。
+///
+/// **删失语义不可配（Iron Law ②）**：不在正/负集里的一切（含沉默/pending/空/
+/// 未分类/未知）一律 **Censored**，绝不臆测为负。本结构只声明正/负集，不声明
+/// "沉默算什么"。正极优先于负极（同一 outcome 同时被两集声明时取 Hit，防误配把
+/// 购买信号当负例）。
+///
+/// 全字段 `#[serde(default)]`。**注意**：`OutcomePolarity::default()` 是**空集**
+/// （非销售词）——DEFAULT_PROFILE 的销售极性由 `domain_profile.rs` 的 seed **显式**
+/// 填回 `["user_replied_buying_signal"]` + 5 负词。各消费方在收到空集时回落内置
+/// 销售极性常量（`gap_signals::DEFAULT_POSITIVE_OUTCOMES` /
+/// `DEFAULT_NEGATIVE_OUTCOMES`），故 DEFAULT 与老库（无 outcome_polarity 字段）下
+/// 三回路行为逐字等价。换行业 = 另一份 profile 声明本行业正/负极。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct OutcomePolarity {
+    /// 正极 outcome_status 集（→ Hit）。DEFAULT seed = `["user_replied_buying_signal"]`。
+    #[serde(default)]
+    pub positive: Vec<String>,
+    /// 负极 outcome_status 集（→ Block）。DEFAULT seed = objection/stop_requested/
+    /// unsubscribed/negative/complaint 五词。
+    #[serde(default)]
+    pub negative: Vec<String>,
 }
 
 /// catalog 重建队列：`apply_chunk_revision` 写完即 enqueue；catalog_rebuild_worker
