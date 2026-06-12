@@ -3014,6 +3014,14 @@ mod typed {
         pub allowed_from: Vec<String>,
         #[serde(default)]
         pub allow_from_any: bool,
+        /// H13：是否初始态（空 from 唯一合法迁入目标）。替代引擎 / planner 写死的
+        /// `"new_contact"` 字面量。DEFAULT 状态机仅 new_contact=true。camelCase=`initial`。
+        #[serde(default)]
+        pub initial: bool,
+        /// H13：是否禁止主动触达（planner 不主动 emit + policy 禁 reply）。替代写死的
+        /// `state_key=="cooldown"` 特例。DEFAULT 状态机仅 cooldown=true。camelCase=`forbidsProactive`。
+        #[serde(default)]
+        pub forbids_proactive: bool,
         #[serde(default)]
         pub advance_signals: Vec<String>,
         #[serde(default)]
@@ -3894,6 +3902,20 @@ mod typed_tests {
             .find(|s| s.key == "new_contact")
             .expect("new_contact state");
         assert!(new_contact.allowed_from.iter().any(|s| s == "new_contact"));
+        // H13：DEFAULT 状态机的标志位经 camelCase 键正确反序列化——仅 new_contact 初始态、
+        // 仅 cooldown 禁主动触达，其余 state 两标志均 false（逐字等价护栏）。
+        assert!(new_contact.initial, "new_contact 必须是初始态");
+        assert!(!new_contact.forbids_proactive);
+        assert!(cooldown.forbids_proactive, "cooldown 必须禁主动触达");
+        assert!(!cooldown.initial);
+        for s in &typed.states {
+            if s.key != "new_contact" {
+                assert!(!s.initial, "{} 不应是初始态", s.key);
+            }
+            if s.key != "cooldown" {
+                assert!(!s.forbids_proactive, "{} 不应禁主动触达", s.key);
+            }
+        }
     }
 
     // ── agent-autonomy-loop W0 (Task 1.6) ──
