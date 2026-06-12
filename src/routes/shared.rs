@@ -225,6 +225,8 @@ pub(super) async fn ensure_operating_memory(
     state: &AppState,
     contact: &Contact,
 ) -> AppResult<OperatingMemory> {
+    // H13：种子记忆卡无 operation_state 时回落状态机初始态（替代写死 "new_contact"）。
+    let initial_state = agent::initial_operation_state_for_contact(state, contact).await?;
     if let Some(mut memory) = state
         .db
         .operating_memories()
@@ -239,7 +241,7 @@ pub(super) async fn ensure_operating_memory(
         .await?
     {
         if !agent::memory_card_has_signal(&effective_route_memory_card_typed(&memory)) {
-            let seeded = agent::effective_memory_card_for_contact(&memory, contact);
+            let seeded = agent::effective_memory_card_for_contact(&memory, contact, &initial_state);
             if agent::memory_card_has_signal(&seeded) {
                 let updated_at = DateTime::now();
                 memory.memory_card_version = memory.memory_card_version.saturating_add(1);
@@ -337,7 +339,7 @@ pub(super) async fn ensure_operating_memory(
         created_at: DateTime::now(),
         updated_at: DateTime::now(),
     };
-    let mut seeded_typed = agent::effective_memory_card_for_contact(&memory, contact);
+    let mut seeded_typed = agent::effective_memory_card_for_contact(&memory, contact, &initial_state);
     memory.memory_card_version = if agent::memory_card_has_signal(&seeded_typed) {
         1
     } else {

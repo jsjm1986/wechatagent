@@ -332,6 +332,10 @@ pub(super) async fn enable_agent(
     };
     let mut unset_doc = Document::new();
     if !is_previously_operated(&contact) {
+        // H13：初始 operation_state 从 active 状态机的 initial 态取（替代写死 "new_contact"）。
+        let domain_config =
+            agent::load_user_operation_domain_config(&state, &admin.current_workspace).await?;
+        let initial_state = agent::initial_operation_state_key(domain_config.as_ref());
         insert_domain_stage_fields(
             &mut set_doc,
             generated.customer_stage.as_deref(),
@@ -340,7 +344,7 @@ pub(super) async fn enable_agent(
         );
         set_doc.insert("commitments", commitments_bson);
         set_doc.insert("follow_up_policy", generated.follow_up_policy);
-        set_doc.insert("operation_state", "new_contact");
+        set_doc.insert("operation_state", initial_state);
         set_doc.insert(
             "operation_state_reason",
             "初次纳入 Agent 运营，等待后续互动确认阶段",
@@ -417,6 +421,10 @@ pub(super) async fn update_profile_note(
     };
     let mut unset_doc = Document::new();
     if !is_previously_operated(&contact) {
+        // H13：初始 operation_state 从 active 状态机的 initial 态取（替代写死 "new_contact"）。
+        let domain_config =
+            agent::load_user_operation_domain_config(&state, &admin.current_workspace).await?;
+        let initial_state = agent::initial_operation_state_key(domain_config.as_ref());
         insert_domain_stage_fields(
             &mut set_doc,
             generated.customer_stage.as_deref(),
@@ -425,7 +433,7 @@ pub(super) async fn update_profile_note(
         );
         set_doc.insert("commitments", commitments_bson);
         set_doc.insert("follow_up_policy", generated.follow_up_policy);
-        set_doc.insert("operation_state", "new_contact");
+        set_doc.insert("operation_state", initial_state);
         set_doc.insert(
             "operation_state_reason",
             "根据 admin 备注重新生成初始运营状态",
@@ -646,6 +654,10 @@ pub(super) async fn analyze_contact_profile(
     };
     let mut unset_doc = Document::new();
     if !is_previously_operated(&contact) {
+        // H13：初始 operation_state 从 active 状态机的 initial 态取（替代写死 "new_contact"）。
+        let domain_config =
+            agent::load_user_operation_domain_config(&state, &admin.current_workspace).await?;
+        let initial_state = agent::initial_operation_state_key(domain_config.as_ref());
         insert_domain_stage_fields(
             &mut set_doc,
             generated.customer_stage.as_deref(),
@@ -654,7 +666,7 @@ pub(super) async fn analyze_contact_profile(
         );
         set_doc.insert("commitments", commitments_bson);
         set_doc.insert("follow_up_policy", generated.follow_up_policy);
-        set_doc.insert("operation_state", "new_contact");
+        set_doc.insert("operation_state", initial_state);
         set_doc.insert(
             "operation_state_reason",
             "AI 重新分析后等待后续互动确认阶段",
@@ -726,13 +738,15 @@ pub(super) async fn get_contact_memory_card(
 ) -> AppResult<Json<Value>> {
     let contact = find_contact_by_id(&state, &admin.current_workspace, &id).await?;
     let memory = ensure_operating_memory(&state, &contact).await?;
+    // H13：无 operation_state 时回落状态机初始态（替代写死 "new_contact"）。
+    let initial_state = agent::initial_operation_state_for_contact(&state, &contact).await?;
     Ok(Json(json!({
         "item": {
             "contactWxid": contact.wxid,
             // task 6.3：`effective_memory_card_for_contact` 已改为返回
             // `MemoryCardTyped`；路由层 JSON 响应在最末端通过 `to_document()`
             // 转成 Document（保持 wire shape 不变）。
-            "memoryCard": agent::effective_memory_card_for_contact(&memory, &contact).to_document(),
+            "memoryCard": agent::effective_memory_card_for_contact(&memory, &contact, &initial_state).to_document(),
             "memoryCardVersion": memory.memory_card_version,
             "memoryCardUpdatedAt": memory.memory_card_updated_at.and_then(crate::models::dt_to_string)
         }

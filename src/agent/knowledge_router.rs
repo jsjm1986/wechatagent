@@ -242,6 +242,18 @@ pub async fn test_knowledge_route_for_contact(
     message: &str,
 ) -> AppResult<Document> {
     let has_persisted_contact = contact.is_some();
+    // H13：合成预览 contact 的初始 operation_state 从 active 状态机取（替代写死 "new_contact"）。
+    let preview_initial_state = if contact.is_none() {
+        let domain_config = super::decision::load_user_operation_domain_config(
+            state,
+            &state.config.default_workspace_id,
+        )
+        .await?;
+        super::guards::initial_operation_state_key(domain_config.as_ref())
+    } else {
+        // 有真实 contact 时不构造合成默认，此值不被使用。
+        String::new()
+    };
     let contact = contact.unwrap_or_else(|| Contact {
         id: None,
         workspace_id: state.config.default_workspace_id.clone(),
@@ -263,7 +275,7 @@ pub async fn test_knowledge_route_for_contact(
         domain_attributes_updated_at: None,
         commitments: Vec::new(),
         follow_up_policy: None,
-        operation_state: Some("new_contact".to_string()),
+        operation_state: Some(preview_initial_state),
         operation_state_reason: None,
         operation_state_confidence: None,
         operation_state_updated_at: None,
@@ -339,7 +351,10 @@ pub async fn test_knowledge_route_for_contact(
     };
     let knowledge = load_operation_knowledge(state, &contact).await?;
     // task 6.3：边界处把 typed 转为 Document wire shape，下游 prompt 注入路径不变。
-    let memory_card = effective_memory_card_for_contact(&memory, &contact).to_document();
+    // H13：无 operation_state 时回落状态机初始态。
+    let initial_state = super::decision::initial_operation_state_for_contact(state, &contact).await?;
+    let memory_card =
+        effective_memory_card_for_contact(&memory, &contact, &initial_state).to_document();
     let route = route_operation_knowledge(
         state,
         &contact,

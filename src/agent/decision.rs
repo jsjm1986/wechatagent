@@ -657,6 +657,23 @@ pub(crate) async fn load_user_operation_domain_config(
     load_user_operation_domain_config_for_contact(state, workspace_id, "").await
 }
 
+/// H13：取某 contact 所属 workspace 的 active 状态机初始态 key（标 `initial:true`）。
+/// 各读侧兜底（memory 卡 / context_pack）在无 operation_state 时回落它，替代写死的
+/// `"new_contact"`。DEFAULT 销售域状态机仅 new_contact 标 initial → 恒返 "new_contact"，
+/// 逐字等价；旧库未跑 m019 迁移 / 无 config 时 helper 自身回落 "new_contact"。
+pub(crate) async fn initial_operation_state_for_contact(
+    state: &AppState,
+    contact: &Contact,
+) -> AppResult<String> {
+    let domain_config = load_user_operation_domain_config_for_contact(
+        state,
+        &contact.workspace_id,
+        &contact.wxid,
+    )
+    .await?;
+    Ok(super::guards::initial_operation_state_key(domain_config.as_ref()))
+}
+
 /// Phase E5-T1：active_versions 灰度感知 loader。
 ///
 /// 选择规则：

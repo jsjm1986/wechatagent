@@ -42,8 +42,8 @@ use super::decision::{
 use super::domain::USER_OPS_DOMAIN_ID;
 use super::escalation;
 use super::guards::{
-    classify_decision_action, enforce_state_action_policy, normalize_decision_runtime,
-    normalize_decision_state, planner_from_decision,
+    classify_decision_action, enforce_state_action_policy, initial_operation_state_key,
+    normalize_decision_runtime, normalize_decision_state, planner_from_decision,
 };
 use super::knowledge_router::{
     empty_knowledge_route, load_operation_knowledge,
@@ -194,7 +194,12 @@ pub async fn send_contact_message_gateway(
     let context_messages = load_context_messages(state, &contact, &runtime).await?;
     // task 6.3：边界处把 typed 转为 Document wire shape，下游 prompt 注入
     // 路径不变。
-    let context_pack = effective_memory_card_for_contact(&memory, &contact).to_document();
+    let context_pack = effective_memory_card_for_contact(
+        &memory,
+        &contact,
+        &initial_operation_state_key(domain_config.as_ref()),
+    )
+    .to_document();
     let knowledge_route = route_operation_knowledge(
         state,
         &contact,
@@ -663,7 +668,12 @@ async fn run_user_operation_gateway_inner(
     let _ = maybe_emit_unverified_warning(state, &contact).await;
     // task 6.3：边界处把 typed 转为 Document wire shape，下游 prompt 注入
     // 路径不变。
-    let memory_card = effective_memory_card_for_contact(&memory, &contact).to_document();
+    let memory_card = effective_memory_card_for_contact(
+        &memory,
+        &contact,
+        &initial_operation_state_key(domain_config.as_ref()),
+    )
+    .to_document();
     let should_refresh_context = false;
     let context_pack = memory_card;
     let initial_planner = RunPlannerResult {
@@ -2750,9 +2760,11 @@ async fn apply_operating_memory_update(
     let mut set_doc = doc! { "updated_at": DateTime::now() };
     if !memory_card_has_signal(&effective_memory_card(memory)) {
         // task 6.3：把 typed memoryCard 在写入边界一次性转为 Document 落库。
+        // H13：无 operation_state 时回落状态机初始态。
+        let initial_state = super::decision::initial_operation_state_for_contact(state, contact).await?;
         set_doc.insert(
             "memory_card",
-            mongodb::bson::to_document(&effective_memory_card_for_contact(memory, contact))
+            mongodb::bson::to_document(&effective_memory_card_for_contact(memory, contact, &initial_state))
                 .unwrap_or_default(),
         );
         set_doc.insert("memory_card_version", next_memory_card_version(memory));
