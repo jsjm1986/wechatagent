@@ -1280,6 +1280,10 @@ pub struct OperationMode {
     /// 承诺到期驱动力（`scan_commitments`）。跨范式通用。
     #[serde(default)]
     pub commitment: CommitmentMode,
+    /// universal-domain-adaptation H19：作息门控覆盖。情感陪伴「晚上是黄金时段」
+    /// 可在此关掉静默时段抑制，让夜间主动/被动发送不被 22→8 压制。
+    #[serde(default)]
+    pub quiet_hours: QuietHoursMode,
 }
 
 impl Default for OperationMode {
@@ -1288,6 +1292,7 @@ impl Default for OperationMode {
             funnel: FunnelMode::default(),
             silence: SilenceMode::default(),
             commitment: CommitmentMode::default(),
+            quiet_hours: QuietHoursMode::default(),
         }
     }
 }
@@ -1338,6 +1343,25 @@ pub struct CommitmentMode {
 impl Default for CommitmentMode {
     fn default() -> Self {
         Self { enabled: true, imminent_window_hours: None }
+    }
+}
+
+/// H19 作息门控覆盖。`enabled_override`：
+/// - `None`（默认）→ 沿用全局 `runtime.quiet_hours_enabled`（DEFAULT 逐字等价）；
+/// - `Some(false)` → 本 contact/范式**关闭**静默时段抑制（情感陪伴夜间黄金时段不被压制）；
+/// - `Some(true)` → 强制开启（即便全局关）。
+///
+/// 仅覆盖「是否启用静默」；起止小时 / 时区偏移继续走全局 runtime（避免在 contact
+/// 上重复一套作息参数；本阶段需求只是「陪伴型整段关掉作息门」）。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct QuietHoursMode {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled_override: Option<bool>,
+}
+
+impl Default for QuietHoursMode {
+    fn default() -> Self {
+        Self { enabled_override: None }
     }
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
