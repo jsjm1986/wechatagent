@@ -273,16 +273,22 @@ pub(crate) async fn decide_reply_with_promote(
         super::domain_profile::load_active_domain_profile(&state.db, &contact.workspace_id).await;
     // H12：Soul 层回落链 = profile.soul_override ?? DB published soul ?? 内置销售域兜底。
     // DEFAULT_PROFILE 的 soul_override=None → 走 DB published + 兜底，与改造前逐字等价。
-    let soul = match non_empty_soul_override(active_profile.soul_override.as_deref()) {
+    let soul = match non_empty_override(active_profile.soul_override.as_deref()) {
         Some(s) => s,
         None => load_published_soul(state, "user").await?.unwrap_or_else(|| {
             "你是长期运行的微信私域运营 AI Agent。你只为已纳管好友服务，目标是自然、克制、持续推进关系和业务目标。".to_string()
         }),
     };
     let assets = load_context_assets(state, &contact.account_id).await?;
-    let playbook_text = playbook.map(format_playbook_for_prompt).unwrap_or_else(|| {
-        "未配置运营方法。按用户备注、聊天上下文和内容资产自由判断。".to_string()
-    });
+    // H12：运营方法论本体回落链 = profile.methodology_override(非空白) ?? contact 绑定
+    // playbook ?? 内置兜底。DEFAULT_PROFILE 的 methodology_override=None → 走 playbook +
+    // 兜底，与改造前逐字等价。methodology_override 为 Some 时整体替换「当前运营方法」段。
+    let playbook_text = match non_empty_override(active_profile.methodology_override.as_deref()) {
+        Some(text) => text,
+        None => playbook.map(format_playbook_for_prompt).unwrap_or_else(|| {
+            "未配置运营方法。按用户备注、聊天上下文和内容资产自由判断。".to_string()
+        }),
+    };
     let domain_text = domain_config
         .map(format_operation_domain_config_for_prompt)
         .unwrap_or_default();
@@ -817,13 +823,14 @@ pub(crate) fn format_playbook_for_prompt(playbook: &OperationPlaybook) -> String
     )
 }
 
-/// H12：把 profile 的 `soul_override` 规整为「有效覆盖」——`Some(非空白)` 才算覆盖，
-/// `None` / 空串 / 纯空白都视为「不覆盖」返回 `None`，让调用方回落 DB published soul。
+/// H12：把 profile 的 `soul_override` / `methodology_override` 规整为「有效覆盖」——
+/// `Some(非空白)` 才算覆盖，`None` / 空串 / 纯空白都视为「不覆盖」返回 `None`，让调用方
+/// 回落原有出厂本体（DB published soul / contact 绑定 playbook）。
 ///
 /// 抽成纯函数让 lib 单测无需构造完整 `decide_reply_with_promote` 即可锁住回落语义：
-/// DEFAULT_PROFILE(soul_override=None) → `None` → 回落链与 H12 改造前逐字等价。
-fn non_empty_soul_override(profile_soul: Option<&str>) -> Option<String> {
-    profile_soul
+/// DEFAULT_PROFILE(两 override 均 None) → `None` → 回落链与 H12 改造前逐字等价。
+fn non_empty_override(value: Option<&str>) -> Option<String> {
+    value
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(|s| s.to_string())
@@ -996,37 +1003,47 @@ mod reaction_hint_loader_tests {
 }
 
 #[cfg(test)]
-mod soul_override_tests {
-    //! H12-2：Soul 层回落链契约。`non_empty_soul_override` 决定决策系统提示的
-    //! Soul 层是「用 profile 覆盖」还是「回落 DB published + 内置兜底」。
-    //! DEFAULT_PROFILE 的 soul_override=None 必须返回 None（回落），保证销售域字节不变。
+mod persona_override_tests {
+    //! H12-2 / H12-3：Soul 与运营方法论的回落链契约。`non_empty_override` 决定决策
+    //! 系统提示的 Soul 层 / user message 的「当前运营方法」段是「用 profile 覆盖」还是
+    //! 「回落原出厂本体」。DEFAULT_PROFILE 两 override 均 None 必须返回 None（回落），
+    //! 保证销售域字节不变。
 
-    use super::non_empty_soul_override;
+    use super::non_empty_override;
 
     #[test]
     fn none_override_falls_back() {
-        // DEFAULT_PROFILE：soul_override=None → 回落 DB/兜底（逐字等价改造前）。
-        assert_eq!(non_empty_soul_override(None), None);
+        // DEFAULT_PROFILE：soul_override / methodology_override=None → 回落（逐字等价）。
+        assert_eq!(non_empty_override(None), None);
     }
 
     #[test]
     fn empty_or_whitespace_override_falls_back() {
-        // 空串 / 纯空白不算有效人格覆盖 → 回落，避免误把空 profile 字段当人格清空。
-        assert_eq!(non_empty_soul_override(Some("")), None);
-        assert_eq!(non_empty_soul_override(Some("   ")), None);
-        assert_eq!(non_empty_soul_override(Some("\n\t ")), None);
+        // 空串 / 纯空白不算有效覆盖 → 回落，避免误把空 profile 字段当本体清空。
+        assert_eq!(non_empty_override(Some("")), None);
+        assert_eq!(non_empty_override(Some("   ")), None);
+        assert_eq!(non_empty_override(Some("\n\t ")), None);
     }
 
     #[test]
-    fn non_empty_override_replaces() {
+    fn non_empty_soul_override_replaces() {
         // 非空白 soul_override → 整体替换 Soul 层（换行业人格本体）。trim 边界空白。
         assert_eq!(
-            non_empty_soul_override(Some("你是一个温暖的情感陪伴 AI。")),
+            non_empty_override(Some("你是一个温暖的情感陪伴 AI。")),
             Some("你是一个温暖的情感陪伴 AI。".to_string())
         );
         assert_eq!(
-            non_empty_soul_override(Some("  带空白的人格  ")),
+            non_empty_override(Some("  带空白的人格  ")),
             Some("带空白的人格".to_string())
+        );
+    }
+
+    #[test]
+    fn non_empty_methodology_override_replaces() {
+        // 非空白 methodology_override → 整体替换「当前运营方法」段（换行业方法论本体）。
+        assert_eq!(
+            non_empty_override(Some("陪伴方法论：每日问候、情绪回应、纪念日提醒。")),
+            Some("陪伴方法论：每日问候、情绪回应、纪念日提醒。".to_string())
         );
     }
 }
