@@ -384,6 +384,30 @@ fn merge_completeness_gaps(deterministic: Vec<String>, llm_gaps: Vec<String>) ->
     merged
 }
 
+/// universal-domain-adaptation H5-a：把 active DomainProfile 的 coverage 维度渲染成
+/// completeness 审计 prompt 的 coverage JSON 骨架（每维一行三布尔位）。对齐规则逐字
+/// 复刻原写死 prompt：`"{key}":` 后补空格使所有 `{` 对齐到本批最长 key（DEFAULT 销售
+/// 域最长 = `"deliveryBoundary":`），故 DEFAULT 五维渲染结果与原字面量逐字一致；换行业
+/// 维度按自身最长 key 对齐。空维度集返回空串（调用方 prompt 仍合法）。
+fn build_coverage_skeleton(dims: &[crate::models::CoverageDimension]) -> String {
+    let label = |k: &str| format!("\"{k}\":");
+    let max_label = dims
+        .iter()
+        .map(|d| label(&d.key).chars().count())
+        .max()
+        .unwrap_or(0);
+    dims.iter()
+        .map(|d| {
+            let lab = label(&d.key);
+            let pad = " ".repeat(max_label.saturating_sub(lab.chars().count()));
+            format!(
+                "    {lab}{pad}{{ \"verifiedFact\": false, \"methodologyOnly\": false, \"pendingDraft\": false }}"
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",\n")
+}
+
 pub async fn build_operation_knowledge_completeness(
     state: &AppState,
     workspace_id: &str,
@@ -547,30 +571,44 @@ pub async fn build_operation_knowledge_completeness(
             "state": if verified_fact { "verified" } else { "missing" }
         })
     };
+    // universal-domain-adaptation H5-a：completeness coverage 维度改读 active
+    // DomainProfile.coverage_dimensions（替代写死的销售五维）。DEFAULT 销售域 profile
+    // 逐字 seed capability/pricing/caseEvidence/effectClaims/deliveryBoundary →
+    // 行为字节等价（命中初值规则 + prompt JSON 骨架下方按同序生成）。
+    let active_profile =
+        crate::agent::domain_profile::load_active_domain_profile(&state.db, workspace_id).await;
+    // 维度初值规则（DEFAULT 销售域逐字复刻原 fallback）：capability / deliveryBoundary
+    // 跟随「有 verified」、caseEvidence / effectClaims 跟随「有 evidence」、pricing 恒
+    // false（报价默认缺）、未知维度（换行业新维）默认 false（保守缺失）。
+    let dim_initial_verified = |key: &str| -> bool {
+        match key {
+            "capability" | "deliveryBoundary" => verified > 0,
+            "caseEvidence" | "effectClaims" => evidence > 0,
+            _ => false,
+        }
+    };
+    let mut fallback_coverage = serde_json::Map::new();
+    for dim in &active_profile.coverage_dimensions {
+        fallback_coverage.insert(dim.key.clone(), cov_state(dim_initial_verified(&dim.key)));
+    }
     let fallback = json!({
         "answeringMode": fallback_mode,
         "summary": if verified == 0 { "当前没有已验证知识切片，Agent 只能做关系维护和需求澄清。" } else { "当前存在已验证知识切片，Agent 可在证据边界内回答事实问题。" },
-        "coverage": {
-            "capability": cov_state(verified > 0),
-            "pricing": cov_state(false),
-            "caseEvidence": cov_state(evidence > 0),
-            "effectClaims": cov_state(evidence > 0),
-            "deliveryBoundary": cov_state(verified > 0)
-        },
+        "coverage": Value::Object(fallback_coverage),
         "gaps": fallback_gaps.clone()
     });
     let system = "你是企业用户运营知识库完整度 Auditor。你评估已验证知识是否足够支撑 Agent 回答产品/服务事实，并识别尚未审定的知识缺口，不负责生成销售内容。只输出严格 JSON。";
+    // H5-a：coverage JSON 骨架按 active profile 的维度动态生成（替代写死五行）。
+    // 见 [`build_coverage_skeleton`]：对齐规则逐字复刻原 prompt，DEFAULT 五维渲染
+    // 结果与原字面量逐字一致。
+    let coverage_skeleton = build_coverage_skeleton(&active_profile.coverage_dimensions);
     let user = format!(
         r#"请基于已验证知识切片与待审定切片输出 JSON：
 {{
   "answeringMode": "relationship_only | product_safe | fully_supported",
   "summary": "",
   "coverage": {{
-    "capability":      {{ "verifiedFact": false, "methodologyOnly": false, "pendingDraft": false }},
-    "pricing":         {{ "verifiedFact": false, "methodologyOnly": false, "pendingDraft": false }},
-    "caseEvidence":    {{ "verifiedFact": false, "methodologyOnly": false, "pendingDraft": false }},
-    "effectClaims":    {{ "verifiedFact": false, "methodologyOnly": false, "pendingDraft": false }},
-    "deliveryBoundary":{{ "verifiedFact": false, "methodologyOnly": false, "pendingDraft": false }}
+{coverage_skeleton}
   }},
   "gaps": []
 }}
@@ -648,6 +686,30 @@ pub async fn build_operation_knowledge_completeness(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// H5-a 逐字等价护栏：DEFAULT_PROFILE 的 coverage 五维渲染出的 prompt 骨架，
+    /// 必须与改造前写死的 5 行字面量逐字一致（含 `{` 对齐空格），保证 completeness
+    /// 审计 prompt 在销售域字节不变。换行业 = 另一份 coverage_dimensions。
+    #[test]
+    fn coverage_skeleton_default_profile_byte_equivalent() {
+        let p = crate::agent::domain_profile::default_domain_profile("ws-1");
+        let got = build_coverage_skeleton(&p.coverage_dimensions);
+        let expected = "    \"capability\":      { \"verifiedFact\": false, \"methodologyOnly\": false, \"pendingDraft\": false },\n    \"pricing\":         { \"verifiedFact\": false, \"methodologyOnly\": false, \"pendingDraft\": false },\n    \"caseEvidence\":    { \"verifiedFact\": false, \"methodologyOnly\": false, \"pendingDraft\": false },\n    \"effectClaims\":    { \"verifiedFact\": false, \"methodologyOnly\": false, \"pendingDraft\": false },\n    \"deliveryBoundary\":{ \"verifiedFact\": false, \"methodologyOnly\": false, \"pendingDraft\": false }";
+        assert_eq!(got, expected);
+    }
+
+    /// H5-a：换行业 coverage 维度按自身最长 key 对齐，各维一行、逗号换行分隔。
+    #[test]
+    fn coverage_skeleton_custom_dims_align_to_longest() {
+        let dims = vec![
+            crate::models::CoverageDimension { key: "symptom".to_string(), display_name: "症状".to_string(), required: false },
+            crate::models::CoverageDimension { key: "treatmentPlan".to_string(), display_name: "治疗方案".to_string(), required: false },
+        ];
+        let got = build_coverage_skeleton(&dims);
+        // 最长 key = "treatmentPlan":（15 字符），symptom 行补到同宽。
+        let expected = "    \"symptom\":      { \"verifiedFact\": false, \"methodologyOnly\": false, \"pendingDraft\": false },\n    \"treatmentPlan\":{ \"verifiedFact\": false, \"methodologyOnly\": false, \"pendingDraft\": false }";
+        assert_eq!(got, expected);
+    }
 
     /// 认知状态闸：有任何待审定草稿（needs_review>0）→ fully_supported 必降为
     /// product_safe；草稿清零后才允许 fully_supported。
