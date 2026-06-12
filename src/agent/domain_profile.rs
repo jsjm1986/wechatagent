@@ -110,6 +110,8 @@ pub fn default_domain_profile(workspace_id: &str) -> DomainProfile {
         ],
         // H8：DEFAULT 范式 = 三驱动力全开 + 阈值 None 回落全局 config（planner 金标零变化）。
         operation_mode: crate::models::OperationMode::default(),
+        // H14：DEFAULT 销售域 = false → grounding 软分数硬闸无条件生效（字节等价）。
+        grounding_gate_bypass_without_claim: false,
         version: 1,
         current_version: true,
         previous_version: None,
@@ -370,6 +372,16 @@ mod tests {
         let p = default_domain_profile("ws-1");
         assert!(p.soul_override.is_none());
         assert!(p.methodology_override.is_none());
+    }
+
+    #[test]
+    fn default_profile_grounding_gate_unconditional() {
+        // H14 逐字等价护栏：DEFAULT_PROFILE 的 grounding_gate_bypass_without_claim
+        // = false → grounding 软分数硬闸无条件生效，保证 H14 把闸条件化后销售域
+        // 行为字节不变（classify_dual_gate 仍对每条回复判 grounding 低分）。
+        // 换行业 = 情感/关系 profile 置 true 旁路。
+        let p = default_domain_profile("ws-1");
+        assert!(!p.grounding_gate_bypass_without_claim);
     }
 
     #[test]

@@ -1258,6 +1258,16 @@ pub struct DomainProfile {
     /// 单客户覆盖见 [`Contact::operation_mode_override`]。
     #[serde(default)]
     pub operation_mode: OperationMode,
+    /// universal-domain-adaptation H14：本域是否在「无产品声明」时旁路 grounding
+    /// 软分数硬闸（review `classify_dual_gate` 里 `knowledge_grounding_score <
+    /// product_accuracy_block_below` 的判罚）。`false`（DEFAULT/老库 serde 默认）=
+    /// 不旁路 = 每条回复都判 grounding 硬闸（销售域字节等价）；`true` = 纯关系/情感
+    /// 域，仅当本条 `claim_analysis.requiresProductKnowledge=true` 时才纳入闸，
+    /// 纯情感回复不再被 grounding 低分误拦。**红线**：旁路仅作用于 grounding 软分数
+    /// 硬闸，`blocked_unverified_product_claim`（R5.4 verified 强约束 + 漏判探针）
+    /// 任何取值下都不变。运行时经 `UserRuntimeParameters` 同名字段消费。
+    #[serde(default)]
+    pub grounding_gate_bypass_without_claim: bool,
     /// E5-T1 多版本灰度：同 `(workspace_id, profile_id)` 下 `version` 单调递增。
     #[serde(default = "default_version_one")]
     pub version: i32,

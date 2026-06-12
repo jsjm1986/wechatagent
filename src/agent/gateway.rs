@@ -611,7 +611,7 @@ async fn run_user_operation_gateway_inner(
     run_id: String,
     inbound: ConversationMessage,
     domain_config: Option<OperationDomainConfig>,
-    runtime: UserRuntimeParameters,
+    mut runtime: UserRuntimeParameters,
     should_abort_send: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
 ) -> AppResult<()> {
     // S1.1 (Phase 0)：派生 R0.1 envelope 的 (source_event_id, source_kind)，
@@ -661,14 +661,20 @@ async fn run_user_operation_gateway_inner(
 
     let recent_messages =
         load_recent_messages(state, &contact, runtime.recent_message_limit).await?;
-    // universal-domain-adaptation H4：本 run 的 active DomainProfile 提前加载一次
-    // （30s TTL 进程缓存，命中即廉价），供 finalize 阶段的承诺词表 commitment_markers
-    // 消费。DEFAULT 销售域返回逐字复刻 guards const 的词表 → 行为字节等价。
+    // universal-domain-adaptation H4/H14：本 run 的 active DomainProfile 提前加载
+    // 一次（30s TTL 进程缓存，命中即廉价），供 finalize 阶段的承诺词表
+    // commitment_markers（H4）+ runtime grounding 闸开关（H14）消费。DEFAULT 销售域
+    // 词表逐字复刻 guards const、bypass=false → 行为字节等价。
     let active_profile = crate::agent::domain_profile::load_active_domain_profile(
         &state.db,
         &contact.workspace_id,
     )
     .await;
+    // H14：用 active profile 覆盖 runtime 的 grounding 闸开关，让下游
+    // classify_dual_gate / finalize 据本域配置判 grounding 软分数硬闸是否条件化。
+    // DEFAULT profile = false → 与改造前逐字等价（无条件硬闸）。
+    runtime.grounding_gate_bypass_without_claim =
+        active_profile.grounding_gate_bypass_without_claim;
     let pending_tasks = load_pending_tasks(state, &contact).await?;
     let playbook = load_operation_playbook_for_contact(state, &contact).await?;
     let memory = load_or_create_operating_memory(state, &contact).await?;
