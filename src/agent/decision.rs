@@ -267,6 +267,12 @@ pub(crate) async fn decide_reply_with_promote(
     let soul = load_published_soul(state, "user").await?.unwrap_or_else(|| {
         "你是长期运行的微信私域运营 AI Agent。你只为已纳管好友服务，目标是自然、克制、持续推进关系和业务目标。".to_string()
     });
+    // universal-domain-adaptation H2 + H9 + H3：加载本 workspace 当前生效的
+    // DomainProfile（无配置时 = DEFAULT 销售域兜底，逐字等价历史行为）。一次加载、
+    // 三处复用：① H3 prompt_fragment 注入系统提示的「业务上下文」层；② H9
+    // conversationMode 允许集合覆盖 runtime；③ H2 维度校验 decision_dimension_kinds。
+    let active_profile =
+        super::domain_profile::load_active_domain_profile(&state.db, &contact.workspace_id).await;
     let assets = load_context_assets(state, &contact.account_id).await?;
     let playbook_text = playbook.map(format_playbook_for_prompt).unwrap_or_else(|| {
         "未配置运营方法。按用户备注、聊天上下文和内容资产自由判断。".to_string()
@@ -389,9 +395,23 @@ pub(crate) async fn decide_reply_with_promote(
             )
         })
         .unwrap_or_default();
+    // universal-domain-adaptation H3：行业业务上下文片段（profile.prompt_fragment）。
+    // 由「行业配置向导」与 AI 对话生成、人审后落 DomainProfile；运行时把它作为
+    // 独立的「业务上下文」层注入系统提示（介于 Policy 与 Operator Instruction 之间），
+    // 让通用 Soul/Policy 之上叠加本行业语义。DEFAULT 销售域 prompt_fragment = None
+    // → 空串，系统提示与改造前逐字等价（反过拟合护栏）。
+    // **红线**：boundary_protection 边界保护硬规则继续由 user.reply.policy 写死守护，
+    // 不进 prompt_fragment、不可被行业配置覆盖。
+    let business_context = active_profile
+        .prompt_fragment
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| format!("\n\n# 本行业业务上下文（运营配置，补充 Soul + Policy）\n{}", s))
+        .unwrap_or_default();
     let system = format!(
-        "{}\n\n{}\n\n{}{}",
-        soul, system_contract, policy, operator_instruction
+        "{}\n\n{}\n\n{}{}{}",
+        soul, system_contract, policy, business_context, operator_instruction
     );
     let history = recent_messages
         .iter()
@@ -542,7 +562,18 @@ pub(crate) async fn decide_reply_with_promote(
     // insufficient_detail_in_critical_turn:*`）。risks 由调用方在
     // `finalize_review_for_send` 阶段消费。
     let raw: RawAgentDecision = serde_json::from_value(value).map_err(AppError::from)?;
-    let (mut decision, mut promote_risks) = raw.validate_and_promote(runtime);
+    // universal-domain-adaptation H9：active_profile 已在函数顶部加载。`runtime` 由
+    // from_config 给的内置默认四模式；这里用 profile.conversation_modes 覆盖（非空时），
+    // 让 validate_and_promote 按本行业声明的模式集合做严格枚举校验。DEFAULT 销售域
+    // profile 声明四模式 → 与改造前 const 校验逐字等价。
+    let runtime_for_promote = if active_profile.conversation_modes.is_empty() {
+        runtime.clone()
+    } else {
+        let mut r = runtime.clone();
+        r.allowed_conversation_modes = active_profile.conversation_modes.clone();
+        r
+    };
+    let (mut decision, mut promote_risks) = raw.validate_and_promote(&runtime_for_promote);
     // Phase A / A3 收口：把 LLM 输出的维度取值与 `system_taxonomies` 严格字典对照
     // （4 路分支：Active 通过 / AliasActive 改写为 canonical / Deprecated 加 risk /
     // CandidateNew 加 risk + 异步 upsert candidate）。reviewer 在本函数 return 之后才
@@ -552,8 +583,6 @@ pub(crate) async fn decide_reply_with_promote(
     // universal-domain-adaptation H2：校验哪些维度不再写死，改读 active DomainProfile
     // 的 `decision_dimension_kinds`。DEFAULT 销售域返回 ["customer_stage","intent_level"]
     // 逐字等价改造前。
-    let active_profile =
-        super::domain_profile::load_active_domain_profile(&state.db, &contact.workspace_id).await;
     let dimension_kinds = super::domain_profile::decision_dimension_kinds(&active_profile);
     let taxonomy_risks = super::decision_taxonomy::validate_and_normalize_decision(
         &state.db,

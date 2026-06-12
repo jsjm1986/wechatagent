@@ -93,6 +93,13 @@ pub fn default_domain_profile(workspace_id: &str) -> DomainProfile {
         ],
         // 逐字复刻 planner 写死的停滞计时维度（customer_stage）。
         stagnation_dimension: Some("customer_stage".to_string()),
+        // 逐字复刻 agent::types::CONVERSATION_MODE_VALUES 的四模式（H9 DEFAULT 等价）。
+        conversation_modes: vec![
+            "casual_relationship".to_string(),
+            "value_exchange".to_string(),
+            "consultative".to_string(),
+            "boundary_protection".to_string(),
+        ],
         version: 1,
         current_version: true,
         previous_version: None,
@@ -177,6 +184,22 @@ mod tests {
         assert_eq!(
             keys,
             vec!["capability", "pricing", "caseEvidence", "effectClaims", "deliveryBoundary"]
+        );
+    }
+
+    #[test]
+    fn default_profile_conversation_modes_match_const_verbatim() {
+        // H9 逐字等价护栏：DEFAULT_PROFILE 声明的四模式与 types::CONVERSATION_MODE_VALUES
+        // 一致，保证 1E 把校验切到 profile 后销售域行为不变。
+        let p = default_domain_profile("ws-1");
+        assert_eq!(
+            p.conversation_modes,
+            vec![
+                "casual_relationship",
+                "value_exchange",
+                "consultative",
+                "boundary_protection"
+            ]
         );
     }
 
