@@ -267,11 +267,15 @@ async fn scan_silent(state: &AppState) -> anyhow::Result<()> {
     let account_id = state.config.default_account_id.clone();
     let now = DateTime::now();
     let now_ms = now.timestamp_millis();
-    let threshold_ms = state
-        .config
-        .strategic_planner_silent_threshold_hours
-        .saturating_mul(60 * 60 * 1000);
+    let global_threshold_hours = state.config.strategic_planner_silent_threshold_hours;
+    let threshold_ms = global_threshold_hours.saturating_mul(60 * 60 * 1000);
     let silent_before = DateTime::from_millis(now_ms - threshold_ms);
+    // universal-domain-adaptation H8：每 tick 加载一次 active profile，取行业默认范式。
+    // DB 仍按全局阈值粗筛（粗筛 = 全局阈值即所有可能候选的上界，按 contact override
+    // 再收紧只会让候选更少，绝不会漏）；逐 contact 的 enabled 短路 + 阈值收紧在内存做。
+    let profile =
+        crate::agent::domain_profile::load_active_domain_profile(&state.db, &workspace_id).await;
+    let profile_mode = profile.operation_mode.clone();
 
     let filter = silent_candidate_filter(&workspace_id, &account_id, silent_before);
     let mut cursor = state.db.contacts().find(filter, None).await?;
@@ -285,6 +289,20 @@ async fn scan_silent(state: &AppState) -> anyhow::Result<()> {
     while let Some(contact) = cursor.try_next().await? {
         counters.scanned += 1;
         if !silent_candidate_passes_in_memory(&contact) {
+            continue;
+        }
+        // H8：解析有效范式。silence 关 → 该 contact 不走静默唤醒（陪伴/维护型也可能关）。
+        let mode = resolve_operation_mode(&contact, &profile_mode);
+        if !mode.silence.enabled {
+            continue;
+        }
+        // H8：有效静默阈值 = override ?? profile ?? 全局 config。DEFAULT(None)→全局，
+        // 与 DB 粗筛一致 → 此 in-memory 检查为恒真（金标零变化）；override 更长则收紧。
+        let effective_threshold_hours = mode
+            .silence
+            .threshold_hours
+            .unwrap_or(global_threshold_hours);
+        if silent_hours_for(&contact, now_ms) < effective_threshold_hours {
             continue;
         }
         if has_pending_follow_up(state, &contact).await? {
@@ -599,12 +617,16 @@ async fn scan_commitments(state: &AppState) -> anyhow::Result<()> {
     let workspace_id = state.config.default_workspace_id.clone();
     let account_id = state.config.default_account_id.clone();
     let now = DateTime::now();
-    let imminent_window = state.config.strategic_planner_commitment_imminent_window_hours;
+    let global_imminent_window = state.config.strategic_planner_commitment_imminent_window_hours;
     let fallback_due_hours = state.config.strategic_planner_commitment_fallback_due_hours;
     let dedup_hours = state.config.strategic_planner_commitment_emit_dedup_hours;
     let priority_enabled = state.config.strategic_planner_priority_enabled;
-    // universal-domain-adaptation 1C：每 tick 构造一次漏斗排序配置（避免 N+1）。
-    let stage_config = resolve_planner_stage_config(state, &workspace_id, &account_id).await;
+    // universal-domain-adaptation H8/1C：每 tick 加载一次 active profile，复用它构造漏斗
+    // 排序配置 + 取行业默认范式（commitment enabled/窗口）。
+    let profile =
+        crate::agent::domain_profile::load_active_domain_profile(&state.db, &workspace_id).await;
+    let profile_mode = profile.operation_mode.clone();
+    let stage_config = build_planner_stage_config(state, &account_id, &profile).await;
 
     let filter = commitment_candidate_filter(&workspace_id, &account_id);
     let mut cursor = state.db.contacts().find(filter, None).await?;
@@ -622,6 +644,17 @@ async fn scan_commitments(state: &AppState) -> anyhow::Result<()> {
         if !managed_and_not_in_cooldown(&contact) {
             continue;
         }
+        // H8：解析有效范式。commitment 关 → 该 contact 不走承诺到期催进。
+        let mode = resolve_operation_mode(&contact, &profile_mode);
+        if !mode.commitment.enabled {
+            continue;
+        }
+        // H8：有效临近窗口 = override ?? profile ?? 全局 config。DEFAULT(None)→全局
+        // → 与改造前逐字等价；情感/维护型可调长窗口。
+        let imminent_window = mode
+            .commitment
+            .imminent_window_hours
+            .unwrap_or(global_imminent_window);
         let Some(target) = pick_commitment_emit_target(&contact, now, imminent_window, fallback_due_hours) else {
             continue;
         };
@@ -714,7 +747,7 @@ async fn scan_commitments(state: &AppState) -> anyhow::Result<()> {
             "emitted": counters.emitted,
             "dailyEmitCap": daily_cap,
             "alreadyEmittedToday": already_emitted_today,
-            "imminentWindowHours": imminent_window,
+            "imminentWindowHours": global_imminent_window,
             "dedupHours": dedup_hours,
             "priorityEnabled": priority_enabled,
         }),
@@ -735,7 +768,7 @@ async fn scan_commitments(state: &AppState) -> anyhow::Result<()> {
 const TERMINAL_STAGES: &[&str] = &["customer_success", "cooldown", "dormant_reactivation"];
 
 /// universal-domain-adaptation 1C：planner 漏斗排序的运行时配置，每个 tick 由
-/// [`resolve_planner_stage_config`] 从 active DomainProfile + taxonomy 缓存构造一次
+/// [`build_planner_stage_config`] 从 active DomainProfile + taxonomy 缓存构造一次
 /// （避免 N+1）。
 ///
 /// **DEFAULT 等价**：销售域里 m006 seed 的 priority_weight / is_terminal 与写死的
@@ -798,19 +831,17 @@ impl PlannerStageConfig {
     }
 }
 
-/// 每个 planner tick 调一次：从 active DomainProfile（取 stagnation_dimension）+
-/// taxonomy 缓存（取 customer_stage / intent_level 取值的 priority_weight /
-/// is_terminal）构造 [`PlannerStageConfig`]。缓存已由 agent 路径 warm_up；这里再
-/// `find_or_load` 一次保证 TTL 自愈。
-pub(crate) async fn resolve_planner_stage_config(
+/// universal-domain-adaptation H8：从**已加载的** profile + taxonomy 缓存构造
+/// [`PlannerStageConfig`]，让扫描器每 tick 只加载一次 profile（既取 stage 排序配置，
+/// 又取 `profile.operation_mode`），避免对同一 profile 双重加载。缓存已由 agent
+/// 路径 warm_up；这里再 `find_or_load` 一次保证 TTL 自愈。
+pub(crate) async fn build_planner_stage_config(
     state: &AppState,
-    workspace_id: &str,
     account_id: &str,
+    profile: &crate::models::DomainProfile,
 ) -> PlannerStageConfig {
     use crate::agent::taxonomy::{dimension_value_weights, global_taxonomy_cache};
 
-    let profile =
-        crate::agent::domain_profile::load_active_domain_profile(&state.db, workspace_id).await;
     let stagnation_dimension = profile
         .stagnation_dimension
         .clone()
@@ -843,6 +874,23 @@ pub(crate) async fn resolve_planner_stage_config(
         }
     }
     config
+}
+
+/// universal-domain-adaptation H8：解析单个 contact 的**有效运营范式**。
+/// 三级回落：`contact.operation_mode_override ?? profile.operation_mode`
+/// （profile 缺省即 `OperationMode::default()` = 三全开 + 阈值 None）。
+/// 覆盖是**整组**替换（不做逐驱动力 merge），与设计「单客户整套范式覆盖」一致。
+///
+/// DEFAULT_PROFILE + 无 override → 返回 `OperationMode::default()`，三驱动力 enabled
+/// 且阈值 None，planner 行为与改造前逐字等价。
+pub(crate) fn resolve_operation_mode(
+    contact: &Contact,
+    profile_mode: &crate::models::OperationMode,
+) -> crate::models::OperationMode {
+    contact
+        .operation_mode_override
+        .clone()
+        .unwrap_or_else(|| profile_mode.clone())
 }
 
 /// MongoDB 端筛 managed + 非冷却 + 非终状态 + customer_stage_updated_at 老于阈值
@@ -1117,17 +1165,21 @@ async fn scan_stage_stagnation(state: &AppState) -> anyhow::Result<()> {
     let account_id = state.config.default_account_id.clone();
     let now = DateTime::now();
     let now_ms = now.timestamp_millis();
-    let threshold_days = state
+    let global_threshold_days = state
         .config
         .strategic_planner_stage_stagnation_threshold_days;
     let recent_inbound_hours = state
         .config
         .strategic_planner_stage_stagnation_recent_inbound_hours;
     let priority_enabled = state.config.strategic_planner_priority_enabled;
-    // universal-domain-adaptation 1C：每 tick 构造一次漏斗排序配置（避免 N+1）。
-    let stage_config = resolve_planner_stage_config(state, &workspace_id, &account_id).await;
+    // universal-domain-adaptation H8/1C：每 tick 加载一次 active profile，复用它构造漏斗
+    // 排序配置 + 取行业默认范式（funnel enabled/停滞阈值）。
+    let profile =
+        crate::agent::domain_profile::load_active_domain_profile(&state.db, &workspace_id).await;
+    let profile_mode = profile.operation_mode.clone();
+    let stage_config = build_planner_stage_config(state, &account_id, &profile).await;
     let stage_updated_before =
-        DateTime::from_millis(now_ms - threshold_days.saturating_mul(24 * 60 * 60 * 1000));
+        DateTime::from_millis(now_ms - global_threshold_days.saturating_mul(24 * 60 * 60 * 1000));
     let inbound_before =
         DateTime::from_millis(now_ms - recent_inbound_hours.saturating_mul(60 * 60 * 1000));
 
@@ -1150,6 +1202,22 @@ async fn scan_stage_stagnation(state: &AppState) -> anyhow::Result<()> {
     while let Some(contact) = cursor.try_next().await? {
         counters.scanned += 1;
         if !stage_stagnation_passes_in_memory(&contact, now, &stage_config) {
+            continue;
+        }
+        // H8：解析有效范式。funnel 关 = 漏斗推进短路（陪伴/维护型对该 contact 不催阶段）。
+        // 这是设计里的「关 funnel = scan_stage_stagnation 对该 contact return/continue」纯减法。
+        let mode = resolve_operation_mode(&contact, &profile_mode);
+        if !mode.funnel.enabled {
+            continue;
+        }
+        // H8：有效停滞阈值（天）= override ?? profile ?? 全局 config。DEFAULT(None)→全局
+        // → 与 DB 粗筛一致、恒真（金标零变化）；override 更长则收紧。
+        let effective_threshold_days = mode
+            .funnel
+            .stagnation_threshold_days
+            .unwrap_or(global_threshold_days);
+        let stage_updated = contact_stagnation_updated_at(&contact, &stage_config.stagnation_dimension);
+        if idle_days_since(stage_updated, now_ms) < effective_threshold_days {
             continue;
         }
         if has_pending_follow_up(state, &contact).await? {
@@ -1229,7 +1297,7 @@ async fn scan_stage_stagnation(state: &AppState) -> anyhow::Result<()> {
             "emitted": counters.emitted,
             "dailyEmitCap": daily_cap,
             "alreadyEmittedToday": already_emitted_today,
-            "stageStagnationThresholdDays": threshold_days,
+            "stageStagnationThresholdDays": global_threshold_days,
             "recentInboundHours": recent_inbound_hours,
             "priorityEnabled": priority_enabled,
         }),
@@ -1283,6 +1351,7 @@ mod tests {
             last_outbound_at: None,
             last_agent_run_at: None,
             custom_agent_instructions: None,
+            operation_mode_override: None,
             last_outbound_style: None,
             intent_trajectory: Vec::new(),
             deal_events: Vec::new(),
@@ -1920,5 +1989,76 @@ mod tests {
         assert!(!EMIT_EVENT_KINDS.contains(&"strategic_planner_commitment_backoff"));
         assert!(!EMIT_EVENT_KINDS.contains(&"strategic_planner_stage_stagnation_backoff"));
         assert!(!EMIT_EVENT_KINDS.contains(&"strategic_planner_capped"));
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // universal-domain-adaptation H8：运营范式 OperationMode + resolve_operation_mode。
+    // 锁死：① DEFAULT(无 profile/无 override) = 三驱动力全开 + 阈值 None（金标零变化护栏）；
+    // ② contact override 整组替换 profile；③ profile 范式在无 override 时生效。
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// H8：OperationMode::default() = 三驱动力 enabled=true + 所有阈值 None。
+    /// 这是 planner 金标零变化的根护栏——DEFAULT 下三扫描器的 enabled 短路都不触发、
+    /// 阈值全部回落全局 config。
+    #[test]
+    fn h8_default_operation_mode_all_enabled_thresholds_none() {
+        let m = crate::models::OperationMode::default();
+        assert!(m.funnel.enabled, "funnel 默认开");
+        assert!(m.silence.enabled, "silence 默认开");
+        assert!(m.commitment.enabled, "commitment 默认开");
+        assert_eq!(m.funnel.stagnation_threshold_days, None, "阈值默认 None 回落 config");
+        assert_eq!(m.silence.threshold_hours, None);
+        assert_eq!(m.commitment.imminent_window_hours, None);
+    }
+
+    /// H8：无 override 时 resolve_operation_mode 返回 profile 范式（逐字）。
+    #[test]
+    fn h8_resolve_falls_back_to_profile_when_no_override() {
+        let contact = template();
+        assert!(contact.operation_mode_override.is_none(), "template 默认无 override");
+        let profile_mode = crate::models::OperationMode {
+            funnel: crate::models::FunnelMode { enabled: false, stagnation_threshold_days: Some(30) },
+            silence: crate::models::SilenceMode::default(),
+            commitment: crate::models::CommitmentMode::default(),
+        };
+        let resolved = resolve_operation_mode(&contact, &profile_mode);
+        assert_eq!(resolved, profile_mode, "无 override → 用 profile 范式");
+        assert!(!resolved.funnel.enabled, "profile 关 funnel 生效");
+    }
+
+    /// H8：contact override 整组替换 profile（不逐驱动力 merge）。
+    #[test]
+    fn h8_resolve_contact_override_replaces_profile() {
+        let mut contact = template();
+        // 该客户「只维护不推进」：单独关 funnel。
+        contact.operation_mode_override = Some(crate::models::OperationMode {
+            funnel: crate::models::FunnelMode { enabled: false, stagnation_threshold_days: None },
+            silence: crate::models::SilenceMode { enabled: true, threshold_hours: Some(240) },
+            commitment: crate::models::CommitmentMode::default(),
+        });
+        // profile 范式三全开（销售型）——但 override 优先。
+        let profile_mode = crate::models::OperationMode::default();
+        let resolved = resolve_operation_mode(&contact, &profile_mode);
+        assert!(!resolved.funnel.enabled, "override 关 funnel 覆盖 profile 的开");
+        assert_eq!(resolved.silence.threshold_hours, Some(240), "override 自定义静默阈值生效");
+    }
+
+    /// H8 DEFAULT 等价：默认范式下，三驱动力的有效阈值 == 传入的全局 config 值
+    /// （None → unwrap_or(global)），证明无配置时 planner 用的还是全局 config。
+    #[test]
+    fn h8_default_mode_effective_thresholds_equal_global() {
+        let m = crate::models::OperationMode::default();
+        let global_silent_hours = 48_i64;
+        let global_stagnation_days = 7_i64;
+        let global_imminent_hours = 12_i64;
+        assert_eq!(m.silence.threshold_hours.unwrap_or(global_silent_hours), global_silent_hours);
+        assert_eq!(
+            m.funnel.stagnation_threshold_days.unwrap_or(global_stagnation_days),
+            global_stagnation_days
+        );
+        assert_eq!(
+            m.commitment.imminent_window_hours.unwrap_or(global_imminent_hours),
+            global_imminent_hours
+        );
     }
 }

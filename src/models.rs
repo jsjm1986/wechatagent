@@ -143,6 +143,13 @@ pub struct Contact {
     /// 上限 1000 字符，由 `PUT /api/contacts/:id/custom-agent-instructions` 维护。
     #[serde(default)]
     pub custom_agent_instructions: Option<String>,
+    /// universal-domain-adaptation H8：单客户运营范式覆盖（优先级高于
+    /// `DomainProfile.operation_mode`，承接「因用户而异」）。`None` → 用 profile 范式。
+    /// 例：某老客户「只维护不推进」→ 设 `operation_mode_override.funnel.enabled=false`，
+    /// 单独对他关漏斗，不影响同号其他客户。解析见
+    /// [`resolve_operation_mode`](crate::planner::resolve_operation_mode)。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation_mode_override: Option<OperationMode>,
     pub agent_profile: Option<AgentProfile>,
     pub memory_summary: Option<String>,
     pub playbook_id: Option<ObjectId>,
@@ -668,6 +675,12 @@ pub struct OperationDomainConfig {
 
 fn default_version_one() -> i32 {
     1
+}
+
+/// universal-domain-adaptation H8：`OperationMode` 三驱动力 `enabled` 字段的
+/// serde 默认值 = `true`（缺字段 / 旧文档 → 驱动力默认开启 = 当前销售域行为）。
+fn default_true() -> bool {
+    true
 }
 
 /// Phase B / B4：`operation_state_policies` collection 行结构。
@@ -1220,6 +1233,12 @@ pub struct DomainProfile {
     /// 写死守护，本字段只放宽"用哪些模式"，不放宽"反人工接管"。
     #[serde(default)]
     pub conversation_modes: Vec<String>,
+    /// universal-domain-adaptation H8：本行业默认运营范式（三驱动力开关 + 阈值）。
+    /// `OperationMode::default()` = 三全开 + 阈值 None 回落全局 config（DEFAULT_PROFILE
+    /// 即如此，planner 金标零变化）。陪伴/维护型行业可声明 `funnel.enabled=false`。
+    /// 单客户覆盖见 [`Contact::operation_mode_override`]。
+    #[serde(default)]
+    pub operation_mode: OperationMode,
     /// E5-T1 多版本灰度：同 `(workspace_id, profile_id)` 下 `version` 单调递增。
     #[serde(default = "default_version_one")]
     pub version: i32,
@@ -1235,9 +1254,92 @@ pub struct DomainProfile {
     pub updated_at: DateTime,
 }
 
-/// `DomainProfile` 的一个画像维度声明。`kind` 与 `system_taxonomies.kind`
-/// 的 snake_case 一致（如 `customer_stage` / `visit_stage`）；取值字典存
-/// `system_taxonomies`，本结构只声明维度元信息 + 是否进决策校验。
+/// universal-domain-adaptation H8：运营范式 = 声明启用哪些「主动触达驱动力」
+/// + 各自阈值。三驱动力对应 planner 三扫描器（funnel→`scan_stage_stagnation`、
+/// silence→`scan_silent`、commitment→`scan_commitments`）。
+///
+/// 全字段 `#[serde(default)]`，**缺省即「沿用全局 config」**——`OperationMode::default()`
+/// = 三驱动力 `enabled=true` + 所有阈值 `None`（回落 `AppConfig`），故 DEFAULT_PROFILE
+/// 与无 override 的 contact 下 planner 行为与改造前**逐字等价**（金标零变化）。
+///
+/// 两级声明：`DomainProfile.operation_mode`（行业默认范式）+
+/// `Contact.operation_mode_override`（单客户覆盖，承接「因用户而异」，优先级更高）。
+/// 解析走 [`resolve_operation_mode`](crate::planner::resolve_operation_mode)：
+/// `contact override ?? profile ?? OperationMode::default()`。
+///
+/// 范式落法：销售型 = 三全开（DEFAULT）；陪伴/情绪型 = `funnel.enabled=false`
+/// （不推进阶段、不被 stagnation 催）；关系维护型 = funnel 关、silence+commitment 开。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct OperationMode {
+    /// 沙漏推进驱动力（`scan_stage_stagnation`）。陪伴/维护型关掉它。
+    #[serde(default)]
+    pub funnel: FunnelMode,
+    /// 沉默唤醒驱动力（`scan_silent`）。跨范式通用。
+    #[serde(default)]
+    pub silence: SilenceMode,
+    /// 承诺到期驱动力（`scan_commitments`）。跨范式通用。
+    #[serde(default)]
+    pub commitment: CommitmentMode,
+}
+
+impl Default for OperationMode {
+    fn default() -> Self {
+        Self {
+            funnel: FunnelMode::default(),
+            silence: SilenceMode::default(),
+            commitment: CommitmentMode::default(),
+        }
+    }
+}
+
+/// H8 漏斗推进驱动力。`enabled=false` → `scan_stage_stagnation` 对该 contact 短路。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct FunnelMode {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// 停滞推进阈值（天）。`None` → 回落 `strategic_planner_stage_stagnation_threshold_days`。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stagnation_threshold_days: Option<i64>,
+}
+
+impl Default for FunnelMode {
+    fn default() -> Self {
+        Self { enabled: true, stagnation_threshold_days: None }
+    }
+}
+
+/// H8 沉默唤醒驱动力。`enabled=false` → `scan_silent` 对该 contact 短路。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SilenceMode {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// 静默唤醒阈值（小时）。`None` → 回落 `strategic_planner_silent_threshold_hours`。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub threshold_hours: Option<i64>,
+}
+
+impl Default for SilenceMode {
+    fn default() -> Self {
+        Self { enabled: true, threshold_hours: None }
+    }
+}
+
+/// H8 承诺到期驱动力。`enabled=false` → `scan_commitments` 对该 contact 短路。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CommitmentMode {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// 承诺临近窗口（小时）。`None` → 回落
+    /// `strategic_planner_commitment_imminent_window_hours`。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub imminent_window_hours: Option<i64>,
+}
+
+impl Default for CommitmentMode {
+    fn default() -> Self {
+        Self { enabled: true, imminent_window_hours: None }
+    }
+}
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProfileDimension {
     pub kind: String,

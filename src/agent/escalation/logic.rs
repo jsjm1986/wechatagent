@@ -516,6 +516,7 @@ mod tests {
             agent_status: AgentStatus::Managed,
             human_profile_note: None,
             custom_agent_instructions: None,
+            operation_mode_override: None,
             agent_profile: None,
             memory_summary: None,
             playbook_id: None,
