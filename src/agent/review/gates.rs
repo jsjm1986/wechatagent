@@ -111,7 +111,17 @@ pub(crate) fn classify_dual_gate(
             review.scores.hallucination_score, runtime.fact_risk_block_at
         ));
     }
-    if review.scores.knowledge_grounding_score < runtime.product_accuracy_block_below {
+    // universal-domain-adaptation H14：grounding 软分数硬闸条件化。
+    // DEFAULT `bypass=false` → `!false = true` → grounding_gate_applies 恒真 →
+    // 与改造前字节等价（每条回复都判）。情感/关系域 `bypass=true` → 仅当本条
+    // claim_analysis.requiresProductKnowledge=true 时才纳入 grounding 硬闸，纯情感
+    // 回复不再被 grounding 低分误拦。红线：blocked_unverified_product_claim
+    // （finalize 的 R5.4 verified 强约束 + 漏判探针）与本闸不同函数/不同阶段，不受影响。
+    let grounding_gate_applies = !runtime.grounding_gate_bypass_without_claim
+        || crate::agent::guards::claim_requires_product_knowledge(&review.claim_analysis);
+    if grounding_gate_applies
+        && review.scores.knowledge_grounding_score < runtime.product_accuracy_block_below
+    {
         hard_risks.push(format!(
             "knowledge_grounding_{}_lt_{}",
             review.scores.knowledge_grounding_score, runtime.product_accuracy_block_below
@@ -1266,6 +1276,54 @@ mod dual_gate_classification_tests {
                 assert!(risks
                     .iter()
                     .any(|r| r.starts_with("knowledge_grounding_")));
+            }
+            other => panic!("expected HardGateFailure, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn h14_grounding_gate_bypassed_when_no_claim_and_profile_opts_out() {
+        // H14：bypass=true（情感/关系域）+ 本条无产品声明（claim_analysis 空）→
+        // grounding 低分被旁路 → AllPass（不再被 grounding 软分数硬闸误拦）。
+        let mut runtime = UserRuntimeParameters::default();
+        runtime.grounding_gate_bypass_without_claim = true;
+        let mut review = full_pass_review();
+        review.scores.knowledge_grounding_score = runtime.product_accuracy_block_below - 1;
+        // claim_analysis 默认空 → claim_requires_product_knowledge=false。
+        assert_eq!(
+            classify_dual_gate(&review, &runtime),
+            DualGateClassification::AllPass
+        );
+    }
+
+    #[test]
+    fn h14_grounding_gate_still_applies_with_claim_even_when_bypass_on() {
+        // H14：bypass=true 但本条 requiresProductKnowledge=true（出现产品声明）→
+        // grounding 硬闸照常纳入 → HardGateFailure。情感域偶发产品声明仍被守住。
+        let mut runtime = UserRuntimeParameters::default();
+        runtime.grounding_gate_bypass_without_claim = true;
+        let mut review = full_pass_review();
+        review.scores.knowledge_grounding_score = runtime.product_accuracy_block_below - 1;
+        review.claim_analysis = mongodb::bson::doc! { "requiresProductKnowledge": true };
+        match classify_dual_gate(&review, &runtime) {
+            DualGateClassification::HardGateFailure { risks } => {
+                assert!(risks.iter().any(|r| r.starts_with("knowledge_grounding_")));
+            }
+            other => panic!("expected HardGateFailure, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn h14_grounding_gate_unconditional_when_bypass_off_default() {
+        // H14 DEFAULT 等价锁：bypass=false（销售域默认）+ 无产品声明 + grounding 低分
+        // → 仍 HardGateFailure（与改造前逐字一致）。
+        let runtime = UserRuntimeParameters::default();
+        assert!(!runtime.grounding_gate_bypass_without_claim);
+        let mut review = full_pass_review();
+        review.scores.knowledge_grounding_score = runtime.product_accuracy_block_below - 1;
+        match classify_dual_gate(&review, &runtime) {
+            DualGateClassification::HardGateFailure { risks } => {
+                assert!(risks.iter().any(|r| r.starts_with("knowledge_grounding_")));
             }
             other => panic!("expected HardGateFailure, got {:?}", other),
         }

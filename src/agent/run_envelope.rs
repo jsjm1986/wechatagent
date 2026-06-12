@@ -1568,6 +1568,7 @@ mod protocol_skeleton_tests {
             quiet_hours_end: 8,
             quiet_hours_tz_offset_hours: 8,
             allowed_conversation_modes: crate::agent::runtime::default_conversation_modes(),
+            grounding_gate_bypass_without_claim: false,
         }
     }
 
