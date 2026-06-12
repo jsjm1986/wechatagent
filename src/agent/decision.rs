@@ -264,15 +264,21 @@ pub(crate) async fn decide_reply_with_promote(
     rewrite_instruction: Option<&str>,
     run_id: Option<&str>,
 ) -> AppResult<(AgentDecision, Vec<String>)> {
-    let soul = load_published_soul(state, "user").await?.unwrap_or_else(|| {
-        "你是长期运行的微信私域运营 AI Agent。你只为已纳管好友服务，目标是自然、克制、持续推进关系和业务目标。".to_string()
-    });
-    // universal-domain-adaptation H2 + H9 + H3：加载本 workspace 当前生效的
+    // universal-domain-adaptation H2 + H9 + H3 + H12：加载本 workspace 当前生效的
     // DomainProfile（无配置时 = DEFAULT 销售域兜底，逐字等价历史行为）。一次加载、
-    // 三处复用：① H3 prompt_fragment 注入系统提示的「业务上下文」层；② H9
-    // conversationMode 允许集合覆盖 runtime；③ H2 维度校验 decision_dimension_kinds。
+    // 多处复用：① H3 prompt_fragment 注入系统提示的「业务上下文」层；② H9
+    // conversationMode 允许集合覆盖 runtime；③ H2 维度校验 decision_dimension_kinds；
+    // ④ H12 soul_override / methodology_override 替换出厂人格 / 方法论本体。
     let active_profile =
         super::domain_profile::load_active_domain_profile(&state.db, &contact.workspace_id).await;
+    // H12：Soul 层回落链 = profile.soul_override ?? DB published soul ?? 内置销售域兜底。
+    // DEFAULT_PROFILE 的 soul_override=None → 走 DB published + 兜底，与改造前逐字等价。
+    let soul = match non_empty_soul_override(active_profile.soul_override.as_deref()) {
+        Some(s) => s,
+        None => load_published_soul(state, "user").await?.unwrap_or_else(|| {
+            "你是长期运行的微信私域运营 AI Agent。你只为已纳管好友服务，目标是自然、克制、持续推进关系和业务目标。".to_string()
+        }),
+    };
     let assets = load_context_assets(state, &contact.account_id).await?;
     let playbook_text = playbook.map(format_playbook_for_prompt).unwrap_or_else(|| {
         "未配置运营方法。按用户备注、聊天上下文和内容资产自由判断。".to_string()
@@ -811,6 +817,18 @@ pub(crate) fn format_playbook_for_prompt(playbook: &OperationPlaybook) -> String
     )
 }
 
+/// H12：把 profile 的 `soul_override` 规整为「有效覆盖」——`Some(非空白)` 才算覆盖，
+/// `None` / 空串 / 纯空白都视为「不覆盖」返回 `None`，让调用方回落 DB published soul。
+///
+/// 抽成纯函数让 lib 单测无需构造完整 `decide_reply_with_promote` 即可锁住回落语义：
+/// DEFAULT_PROFILE(soul_override=None) → `None` → 回落链与 H12 改造前逐字等价。
+fn non_empty_soul_override(profile_soul: Option<&str>) -> Option<String> {
+    profile_soul
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+}
+
 pub(crate) async fn load_published_soul(
     state: &AppState,
     agent_kind: &str,
@@ -974,5 +992,41 @@ mod reaction_hint_loader_tests {
         assert!(hint.contains("user_replied_objection"));
         assert!(hint.contains("user_replied_buying_signal"));
         assert!(hint.contains("摘要=对价格有顾虑"));
+    }
+}
+
+#[cfg(test)]
+mod soul_override_tests {
+    //! H12-2：Soul 层回落链契约。`non_empty_soul_override` 决定决策系统提示的
+    //! Soul 层是「用 profile 覆盖」还是「回落 DB published + 内置兜底」。
+    //! DEFAULT_PROFILE 的 soul_override=None 必须返回 None（回落），保证销售域字节不变。
+
+    use super::non_empty_soul_override;
+
+    #[test]
+    fn none_override_falls_back() {
+        // DEFAULT_PROFILE：soul_override=None → 回落 DB/兜底（逐字等价改造前）。
+        assert_eq!(non_empty_soul_override(None), None);
+    }
+
+    #[test]
+    fn empty_or_whitespace_override_falls_back() {
+        // 空串 / 纯空白不算有效人格覆盖 → 回落，避免误把空 profile 字段当人格清空。
+        assert_eq!(non_empty_soul_override(Some("")), None);
+        assert_eq!(non_empty_soul_override(Some("   ")), None);
+        assert_eq!(non_empty_soul_override(Some("\n\t ")), None);
+    }
+
+    #[test]
+    fn non_empty_override_replaces() {
+        // 非空白 soul_override → 整体替换 Soul 层（换行业人格本体）。trim 边界空白。
+        assert_eq!(
+            non_empty_soul_override(Some("你是一个温暖的情感陪伴 AI。")),
+            Some("你是一个温暖的情感陪伴 AI。".to_string())
+        );
+        assert_eq!(
+            non_empty_soul_override(Some("  带空白的人格  ")),
+            Some("带空白的人格".to_string())
+        );
     }
 }
