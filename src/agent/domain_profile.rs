@@ -100,6 +100,8 @@ pub fn default_domain_profile(workspace_id: &str) -> DomainProfile {
             "consultative".to_string(),
             "boundary_protection".to_string(),
         ],
+        // H8：DEFAULT 范式 = 三驱动力全开 + 阈值 None 回落全局 config（planner 金标零变化）。
+        operation_mode: crate::models::OperationMode::default(),
         version: 1,
         current_version: true,
         previous_version: None,
@@ -201,6 +203,17 @@ mod tests {
                 "boundary_protection"
             ]
         );
+    }
+
+    #[test]
+    fn default_profile_operation_mode_is_all_enabled_default() {
+        // H8 逐字等价护栏：DEFAULT_PROFILE 的范式 = OperationMode::default()
+        // （三驱动力全开 + 阈值 None 回落全局 config），保证 1F 切 planner 后金标零变化。
+        let p = default_domain_profile("ws-1");
+        assert_eq!(p.operation_mode, crate::models::OperationMode::default());
+        assert!(p.operation_mode.funnel.enabled);
+        assert!(p.operation_mode.silence.enabled);
+        assert!(p.operation_mode.commitment.enabled);
     }
 
     #[test]

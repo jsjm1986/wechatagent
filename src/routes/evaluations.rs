@@ -481,6 +481,7 @@ fn scenario_contact_from_seed(
             .or_else(|_| seed.get_str("custom_agent_instructions"))
             .ok()
             .map(ToString::to_string),
+        operation_mode_override: None,
         agent_profile: None,
         memory_summary: seed
             .get_str("memorySummary")
