@@ -29,7 +29,7 @@ mod behavior_signal_metrics;
 pub mod chunk_locks;
 mod contacts;
 mod conversations;
-mod domain_schemas;
+pub(crate) mod domain_schemas;
 mod domains;
 mod evaluations;
 mod events;
@@ -876,6 +876,9 @@ mod tests {
             // knowledge.rs：完整度审计内核 helper，被 get/refresh completeness 两个 handler
             // 复用、不直接绑 HTTP；real_llm_knowledge.rs K11 通过 `pub use` 直调真模型审计。
             "build_operation_knowledge_completeness",
+            // domain_schemas.rs：D1-b active schema 加载 helper，被 chunk 写侧
+            // （apply_chunk_revision）复用做 domain_attributes 校验，不直接绑 HTTP。
+            "load_active_domain_schema",
         ];
 
         let mut handlers: Vec<&str> = Vec::new();

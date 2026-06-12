@@ -508,6 +508,24 @@ fn validate_schema_payload(
     Ok((fields, alias_doc))
 }
 
+/// universal-domain-adaptation D1-b：加载某 workspace 当前 active 的 `DomainSchema`
+/// （`isActive=true`，每 workspace 至多一条，见 activate 路由维持的不变量）。无 active
+/// schema（DEFAULT / 未配置行业 schema 的 workspace）返回 `None` → 写侧据此 no-op 直通。
+/// DB 错误向上传播（与 chunk 写入同事务语义，配置错误不应被静默吞掉）。
+pub async fn load_active_domain_schema(
+    db: &crate::db::Database,
+    workspace_id: &str,
+) -> AppResult<Option<DomainSchema>> {
+    let found = db
+        .domain_schemas()
+        .find_one(
+            doc! { "workspaceId": workspace_id, "isActive": true },
+            None,
+        )
+        .await?;
+    Ok(found)
+}
+
 /// universal-domain-adaptation D1-a：按 active `DomainSchema` 校验 / 重写一份 chunk 的
 /// `domain_attributes` 子文档（纯函数，无 IO）。这是把此前运行时零消费的 DomainSchema
 /// 接回写侧的核心判定（D1-b 在 chunk 写入点调用）。
@@ -523,10 +541,6 @@ fn validate_schema_payload(
 ///
 /// 返回 rewrite 后的 `Document`（调用方据此落库）。schema 未声明的额外字段原样保留
 /// （schema 是"必填/枚举/别名"约束层，不是白名单，行业自定义扩展字段不被剔除）。
-///
-/// 注：D1-a 先落纯函数 + 单测；写侧接线（apply_chunk_revision 等）在 D1-b 接入，
-/// 故本函数暂无生产调用方，用 `#[allow(dead_code)]` 静默 `-D warnings`（D1-b 移除）。
-#[allow(dead_code)]
 pub fn enforce_domain_attributes(
     schema: &DomainSchema,
     attrs: &Document,
