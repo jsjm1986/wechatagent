@@ -144,13 +144,25 @@ async fn record_user_reaction_inner(
                 doc! { "outcomeStatus": "user_replied_unclassified", "confidence": 0 }
             })
     };
-    let outcome = reaction_outcome_status(&reaction_analysis);
+    // 2.5-main-3：本 contact workspace 的 active 极性（命中 1G-c 30s TTL 缓存）。
+    // 正极驱动 reaction_outcome_status 的 buyingSignal token；负极驱动回路② 误判信号。
+    // DEFAULT_PROFILE seed 与回落同源 → 销售域 outcome/信号字节等价。
+    let active_polarity =
+        crate::agent::domain_profile::load_active_domain_profile(&state.db, &contact.workspace_id)
+            .await
+            .outcome_polarity;
+    let outcome = reaction_outcome_status_with_polarity(&reaction_analysis, &active_polarity);
     let outcome_for_outbox = outcome.clone();
     let reaction_analysis_for_trajectory = reaction_analysis.clone();
     // Phase C / C1: 用 reviewer 当时的 approved 标志 + 用户实际反应 outcome 计算 misjudge 信号。
     // approved=true 但用户负反应 → approved_but_user_negative（reviewer 放过了实际不该发的内容）。
     // 该信号供 feedback_worker 周期汇总到 reviewer_stats，并作为 C2 negative_example 候选挑选源。
-    let reviewer_misjudge_signal = compute_reviewer_misjudge_signal(claimed_review.approved, &outcome);
+    // 2.5-main-3：负极集走 active profile（空集回落 DEFAULT 销售 5 词，字节等价）。
+    let reviewer_misjudge_signal = compute_reviewer_misjudge_signal_with_polarity(
+        claimed_review.approved,
+        &outcome,
+        &effective_negative_outcomes(&active_polarity),
+    );
     let mut update_set = doc! {
         "outcome_status": outcome,
         "send_gateway_result.userReactionMessageId": inbound.message_id.clone().unwrap_or_default(),
@@ -307,7 +319,22 @@ async fn analyze_user_reaction(
     to_document(&value).map_err(AppError::from)
 }
 
-pub(crate) fn reaction_outcome_status(analysis: &Document) -> String {
+/// 从 reaction 分析 Document 推断 outcome_status 字符串。
+///
+/// **2.5-main-3（正极配置化）**：`buyingSignal` flag 分支的正极 token 从写死字面量
+/// 换成 `polarity.positive.first()`（DEFAULT positive[0]=`user_replied_buying_signal`
+/// → 字节等价）。`outcomeStatus` 显式字符串（:311-314）已域无关、直接 passthrough。
+///
+/// **tradeoff（刻意保留）**：`stopRequested` / `objection` 两个 bool flag 分支保留
+/// DEFAULT 负词字面量——这三个 flag 是销售 reaction prompt 专属的输出键（模型按销售
+/// prompt 才会填 buyingSignal/objection/stopRequested），非销售域不产这些 flag、而是
+/// 走 `outcomeStatus` 字符串 passthrough。只配正极 token 即满足"优质回复被学习"诉求，
+/// 避免把 flag→token 词汇表整体搬进 profile 的过度工程；负极识别仍由 negative 全集
+/// （回路①②③ 消费）驱动。
+pub(crate) fn reaction_outcome_status_with_polarity(
+    analysis: &Document,
+    polarity: &crate::models::OutcomePolarity,
+) -> String {
     if let Some(status) =
         doc_string(analysis, "outcomeStatus").or_else(|| doc_string(analysis, "outcome_status"))
     {
@@ -316,11 +343,32 @@ pub(crate) fn reaction_outcome_status(analysis: &Document) -> String {
     if doc_bool(analysis, "stopRequested") || doc_bool(analysis, "stop_requested") {
         "user_replied_stop_requested".to_string()
     } else if doc_bool(analysis, "buyingSignal") || doc_bool(analysis, "buying_signal") {
-        "user_replied_buying_signal".to_string()
+        // 正极 token 走 profile（空集回落 DEFAULT 字面量，字节等价）。
+        polarity
+            .positive
+            .first()
+            .cloned()
+            .unwrap_or_else(|| "user_replied_buying_signal".to_string())
     } else if doc_bool(analysis, "objection") {
         "user_replied_objection".to_string()
     } else {
         "user_replied_unclassified".to_string()
+    }
+}
+
+/// [`reaction_outcome_status_with_polarity`] 的 DEFAULT 销售极性包装：无 profile 上下文
+/// 的纯文本拼装点（如 `format_reaction_hint`）与单测用它，行为与 2.5-main-3 前逐字等价。
+pub(crate) fn reaction_outcome_status(analysis: &Document) -> String {
+    reaction_outcome_status_with_polarity(analysis, &default_outcome_polarity_for_reaction())
+}
+
+/// DEFAULT 销售极性（正极 = buying_signal）供无 profile 上下文的 wrapper 复用。
+/// 与 [`crate::agent::domain_profile::default_outcome_polarity`] 同值，但这里只需正极，
+/// 故就地构造避免跨模块依赖（负极字段对本 wrapper 的 buyingSignal 分支无影响）。
+fn default_outcome_polarity_for_reaction() -> crate::models::OutcomePolarity {
+    crate::models::OutcomePolarity {
+        positive: vec!["user_replied_buying_signal".to_string()],
+        negative: DEFAULT_NEGATIVE_OUTCOMES.iter().map(|s| s.to_string()).collect(),
     }
 }
 
@@ -333,6 +381,11 @@ pub(crate) fn reaction_outcome_status(analysis: &Document) -> String {
 ///
 /// `blocked_but_user_positive` 分支需要旁路扫描被 review 拦截但用户仍持续正向互动的
 /// 历史，更适合 feedback_worker 周期任务，C1 第一刀不在此处计算。
+///
+/// **2.5-main-3**：生产路径已全部改走 [`compute_reviewer_misjudge_signal_with_polarity`]
+/// （`record_user_reaction_inner` 传 active profile 负极集），本 DEFAULT 包装现仅供单测
+/// 做等价基准，故标 `#[cfg(test)]`（避免 dead-code 门）。
+#[cfg(test)]
 pub(crate) fn compute_reviewer_misjudge_signal(
     reviewer_approved: bool,
     outcome_status: &str,
@@ -374,6 +427,20 @@ pub(crate) const DEFAULT_NEGATIVE_OUTCOMES: &[&str] = &[
     "user_replied_negative",
     "user_replied_complaint",
 ];
+
+/// 2.5-main-3：从 active 极性解析出有效负极集（回路②③ 运营域消费）。
+/// 负极非空 → 用 profile 声明的；空 → 回落内置销售 [`DEFAULT_NEGATIVE_OUTCOMES`]。
+/// 与 `gap_signals::resolve_effective_polarity` 的负极支同语义（逐极独立回落），
+/// DEFAULT_PROFILE seed 与回落同源 → 销售域回路②③ 字节等价。
+pub(crate) fn effective_negative_outcomes(
+    polarity: &crate::models::OutcomePolarity,
+) -> Vec<String> {
+    if polarity.negative.is_empty() {
+        DEFAULT_NEGATIVE_OUTCOMES.iter().map(|s| s.to_string()).collect()
+    } else {
+        polarity.negative.clone()
+    }
+}
 
 /// Phase C / C2：把 reviewer 误判后被用户负反应的回复文本，作为
 /// `negative_example` chunk 候选写入 review queue（`integrity_status="needs_review"`）。
@@ -713,6 +780,67 @@ mod a6_tests {
         // reviewer 未放行始终不触发(与极性无关)。
         assert!(
             compute_reviewer_misjudge_signal_with_polarity(false, "user_went_cold", &negative).is_none()
+        );
+    }
+
+    // ---- 2.5-main-3：reaction_outcome_status 正极配置化 + effective_negative_outcomes ----
+
+    #[test]
+    fn reaction_outcome_default_polarity_matches_hardcoded_verbatim() {
+        // 逐字护栏：DEFAULT 极性下 buyingSignal flag → user_replied_buying_signal（字节等价）。
+        let analysis = doc! { "buyingSignal": true };
+        assert_eq!(reaction_outcome_status(&analysis), "user_replied_buying_signal");
+    }
+
+    #[test]
+    fn reaction_outcome_positive_token_comes_from_polarity() {
+        // 正极配置化：buyingSignal flag 的 token 取 polarity.positive.first()。
+        let analysis = doc! { "buyingSignal": true };
+        let emotional = crate::models::OutcomePolarity {
+            positive: vec!["user_emotion_opened_up".to_string()],
+            negative: vec![],
+        };
+        assert_eq!(
+            reaction_outcome_status_with_polarity(&analysis, &emotional),
+            "user_emotion_opened_up"
+        );
+        // 空正极集回落 DEFAULT 字面量（字节等价）。
+        let empty = crate::models::OutcomePolarity::default();
+        assert_eq!(
+            reaction_outcome_status_with_polarity(&analysis, &empty),
+            "user_replied_buying_signal"
+        );
+    }
+
+    #[test]
+    fn reaction_outcome_explicit_status_passthrough_ignores_polarity() {
+        // outcomeStatus 显式字符串域无关、直接 passthrough，不受极性影响（非销售域路径）。
+        let analysis = doc! { "outcomeStatus": "client_signed_contract", "buyingSignal": true };
+        let any = crate::models::OutcomePolarity {
+            positive: vec!["user_emotion_opened_up".to_string()],
+            negative: vec![],
+        };
+        assert_eq!(
+            reaction_outcome_status_with_polarity(&analysis, &any),
+            "client_signed_contract"
+        );
+    }
+
+    #[test]
+    fn effective_negative_outcomes_falls_back_then_overrides() {
+        // 空负极 → 回落销售 5 词；非空 → 用 profile。
+        let empty = crate::models::OutcomePolarity::default();
+        assert_eq!(
+            effective_negative_outcomes(&empty),
+            DEFAULT_NEGATIVE_OUTCOMES.iter().map(|s| s.to_string()).collect::<Vec<_>>()
+        );
+        let custom = crate::models::OutcomePolarity {
+            positive: vec![],
+            negative: vec!["user_went_cold".to_string(), "user_blocked_me".to_string()],
+        };
+        assert_eq!(
+            effective_negative_outcomes(&custom),
+            vec!["user_went_cold", "user_blocked_me"]
         );
     }
 

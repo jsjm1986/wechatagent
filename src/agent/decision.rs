@@ -524,7 +524,11 @@ pub(crate) async fn decide_reply_with_promote(
         knowledge_route_text,
         intent_trajectory_text,
         reaction_hint_text,
-        crate::agent::escalation::build_decision_signals_text(contact, domain_config),
+        crate::agent::escalation::build_decision_signals_text(
+            contact,
+            domain_config,
+            &crate::agent::reaction::effective_negative_outcomes(&active_profile.outcome_polarity),
+        ),
         operator_memory_text,
         rewrite_text,
         contact.wxid,

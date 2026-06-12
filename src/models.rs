@@ -1474,7 +1474,7 @@ pub struct ChunkRole {
 ///
 /// 这是横向渗透三条已落地自学习回路的**单一真相源**：
 /// - 回路① `gap_signals::classify_outcome_label` → dynamic_confidence 召回排序；
-/// - 回路② `reaction::compute_reviewer_misjudge_signal` → negative_example 反向训练；
+/// - 回路② `reaction::compute_reviewer_misjudge_signal_with_polarity` → negative_example 反向训练；
 /// - 回路③ `escalation::logic` 末轮负面判定 → 连续未推进时卡死请示。
 ///
 /// **删失语义不可配（Iron Law ②）**：不在正/负集里的一切（含沉默/pending/空/

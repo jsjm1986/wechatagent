@@ -8,7 +8,7 @@
 //! 输入：近 N 天 `agent_decision_reviews`，已被 `record_user_reaction_inner`
 //! 回填了 `outcome_status`（用户实际反应）与 `reviewer_misjudge_signal`
 //! （reviewer 判断与用户反应不一致的信号，见
-//! [`crate::agent::reaction::compute_reviewer_misjudge_signal`]）。
+//! [`crate::agent::reaction::compute_reviewer_misjudge_signal_with_polarity`]）。
 //!
 //! 输出：每 workspace 一行滚动统计 `reviewer_stats` 文档，字段含
 //! considered / approved / approved_but_user_negative / pass_rate /

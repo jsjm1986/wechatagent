@@ -198,9 +198,15 @@ fn consecutive_unprogressed_turns(trajectory: &[crate::models::IntentTrajectoryE
 /// 组装注入 decision prompt 的"请示通道信号"段（纯函数，无 IO）。三信号：
 /// ①等待领导决策中（domain_attributes 布尔标记）②多轮卡死（意图轨迹连续未推进+末轮负面）
 /// ③高风险升级模式（workspace 配置）。三信号全缺返回空串（decision.rs 据此决定是否拼接）。
+///
+/// **2.5-main-3**：`negative_outcomes` = 本行业有效负极集（来自 active
+/// DomainProfile.outcome_polarity，由调用方 decision.rs 经 `effective_negative_outcomes`
+/// 解析后传入；空集回落内置销售 5 词）。末轮负面判定（信号②）据此识别，故跨域时
+/// "卡死请示"按本行业的负反应定义触发，而非写死销售异议词。DEFAULT 字节等价。
 pub(crate) fn build_decision_signals_text(
     contact: &Contact,
     domain_config: Option<&OperationDomainConfig>,
+    negative_outcomes: &[impl AsRef<str>],
 ) -> String {
     let mut lines: Vec<String> = Vec::new();
 
@@ -220,7 +226,7 @@ pub(crate) fn build_decision_signals_text(
     let turns = consecutive_unprogressed_turns(&contact.intent_trajectory);
     let latest_negative = latest_reaction_is_negative_with_polarity(
         &contact.intent_trajectory,
-        crate::agent::reaction::DEFAULT_NEGATIVE_OUTCOMES,
+        negative_outcomes,
     );
     if is_stuck_or_undelivered(turns, DEFAULT_STUCK_THRESHOLD, latest_negative) {
         lines.push(
@@ -627,7 +633,7 @@ mod tests {
     #[test]
     fn signals_empty_when_no_signal_present() {
         let contact = make_contact("cust1");
-        assert!(build_decision_signals_text(&contact, None).is_empty());
+        assert!(build_decision_signals_text(&contact, None, crate::agent::reaction::DEFAULT_NEGATIVE_OUTCOMES).is_empty());
     }
 
     #[test]
@@ -636,7 +642,7 @@ mod tests {
         let mut attrs = mongodb::bson::Document::new();
         attrs.insert(AWAITING_PRINCIPAL_DECISION_ATTR, true);
         contact.domain_attributes = Some(attrs);
-        let text = build_decision_signals_text(&contact, None);
+        let text = build_decision_signals_text(&contact, None, crate::agent::reaction::DEFAULT_NEGATIVE_OUTCOMES);
         assert!(text.contains("正在等待裁决"), "应出等待领导信号，实际：{text}");
     }
 
@@ -649,7 +655,7 @@ mod tests {
             traj_entry("user_replied_objection"),
             traj_entry("user_replied_objection"),
         ];
-        let text = build_decision_signals_text(&contact, None);
+        let text = build_decision_signals_text(&contact, None, crate::agent::reaction::DEFAULT_NEGATIVE_OUTCOMES);
         assert!(text.contains("连续多轮未推进"), "应出卡死信号，实际：{text}");
     }
 
@@ -661,7 +667,7 @@ mod tests {
             traj_entry("user_replied_objection"),
             traj_entry("user_replied_objection"),
         ];
-        assert!(!build_decision_signals_text(&contact, None).contains("连续多轮未推进"));
+        assert!(!build_decision_signals_text(&contact, None, crate::agent::reaction::DEFAULT_NEGATIVE_OUTCOMES).contains("连续多轮未推进"));
     }
 
     #[test]
@@ -673,7 +679,30 @@ mod tests {
             traj_entry("user_replied_positive"),
             traj_entry("user_replied_positive"),
         ];
-        assert!(!build_decision_signals_text(&contact, None).contains("连续多轮未推进"));
+        assert!(!build_decision_signals_text(&contact, None, crate::agent::reaction::DEFAULT_NEGATIVE_OUTCOMES).contains("连续多轮未推进"));
+    }
+
+    #[test]
+    fn signals_stuck_polarity_comes_from_passed_negative_set() {
+        // 2.5-main-3：回路③ 末轮负面判定的极性来自传入的 negative 集，非写死销售词。
+        let mut contact = make_contact("cust1");
+        contact.intent_trajectory = vec![
+            traj_entry("user_replied_objection"),
+            traj_entry("user_replied_objection"),
+            traj_entry("user_replied_objection"),
+        ];
+        // 自定义负集不含 objection → 末轮非负 → 不触发卡死（即便连续 3 轮同 intent）。
+        let custom_negative = ["user_went_cold"];
+        assert!(
+            !build_decision_signals_text(&contact, None, &custom_negative).contains("连续多轮未推进"),
+            "自定义负集下 objection 不应判负、不触发卡死"
+        );
+        // 自定义负集含 objection → 恢复触发，证明极性确实来自传入集。
+        let custom_with_objection = ["user_replied_objection"];
+        assert!(
+            build_decision_signals_text(&contact, None, &custom_with_objection).contains("连续多轮未推进"),
+            "自定义负集含 objection 时应触发卡死"
+        );
     }
 
     #[test]
