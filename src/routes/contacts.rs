@@ -18,8 +18,8 @@ use crate::{
     error::{AppError, AppResult},
     mcp::{self},
     models::{
-        ApiContact, ContactQuery, CustomAgentInstructionsRequest, DealEvent, EnableAgentRequest,
-        ImportContactsRequest, ProfileNoteRequest, SearchImportRequest,
+        ApiContact, ContactQuery, CustomAgentInstructionsRequest, EnableAgentRequest,
+        ImportContactsRequest, OutcomeEvent, ProfileNoteRequest, SearchImportRequest,
     },
 };
 
@@ -61,13 +61,16 @@ pub(super) struct MemoryCandidateQuery {
 
 /// `POST /api/contacts/:id/deal-events` 请求体。
 ///
-/// S5（自学习采集管道）：admin 手动登记一条成交（T0 硬事件）正例。本阶段
-/// 只 append-only 记录，不反推任何置信、不归因——为将来 PU learning 铺正例池。
-/// 全部字段可选：最小可用只需点一下"标记成交"，金额/币种/发生时间/备注按需回填。
+/// S5（自学习采集管道）：admin 手动登记一条**结果/成效**（T0 硬事件）正例，落
+/// `Contact.outcome_events`（universal-domain-adaptation H10：存储已从销售域
+/// `deal_events` 泛化为行业中性的 `outcome_events`；路由路径 / 请求类型名保持
+/// `deal-events` 不变以维持 API 兼容，无外部消费方依赖具体语义）。本阶段只
+/// append-only 记录，不反推任何置信、不归因——为将来 PU learning 铺正例池。
+/// 全部字段可选：最小可用只需点一下"标记成效"，金额/币种/发生时间/备注按需回填。
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(super) struct DealEventRequest {
-    /// 成交实际发生时间的毫秒时间戳（可选，缺省用服务端 now 作为 marked_at）。
+    /// 结果实际发生时间的毫秒时间戳（可选，缺省用服务端 now 作为 marked_at）。
     occurred_at_ms: Option<i64>,
     amount: Option<f64>,
     currency: Option<String>,
@@ -552,7 +555,7 @@ pub(super) async fn update_operation_profile(
 /// - 不做多触点归因；
 /// - `source` 恒 `"manual"`，`marked_by` 取登录 admin，用于审计。
 ///
-/// 写库走 `$push contact.deal_events` + 一条 `deal_event_marked` 审计事件。
+/// 写库走 `$push contact.outcome_events` + 一条 `outcome_event_marked` 审计事件。
 pub(super) async fn add_deal_event(
     State(state): State<AppState>,
     Extension(admin): Extension<AuthenticatedAdmin>,
@@ -569,7 +572,7 @@ pub(super) async fn add_deal_event(
         }
     }
     let now = DateTime::now();
-    let deal_event = DealEvent {
+    let outcome_event = OutcomeEvent {
         marked_at: now,
         occurred_at: payload.occurred_at_ms.map(DateTime::from_millis),
         amount: payload.amount,
@@ -584,7 +587,7 @@ pub(super) async fn add_deal_event(
         .update_one(
             doc! { "_id": object_id, "workspace_id": &admin.current_workspace },
             doc! {
-                "$push": { "deal_events": to_bson(&deal_event)? },
+                "$push": { "outcome_events": to_bson(&outcome_event)? },
                 "$set": { "updated_at": now },
             },
             None,
@@ -594,9 +597,9 @@ pub(super) async fn add_deal_event(
         &state,
         &contact.account_id,
         Some(&contact.wxid),
-        "deal_event_marked",
+        "outcome_event_marked",
         "ok",
-        "admin 手动登记成交事件",
+        "admin 手动登记成效事件",
         Some(doc! {
             "source": "manual",
             "markedBy": &admin.username,

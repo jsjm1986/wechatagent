@@ -198,12 +198,14 @@ pub struct Contact {
     /// 缺字段时反序列化为空 Vec，向前兼容历史 contact 文档。
     #[serde(default)]
     pub intent_trajectory: Vec<IntentTrajectoryEntry>,
-    /// 自学习采集管道 S5：admin 手动标记的成交事件（正例-only，稀疏 + 延迟）。
-    /// 成交（T0 硬事件）不可从 WeChat 文字入站观测，只能由运营人员手动登记；
-    /// 本字段是未来 PU-learning / 延迟反馈归因的唯一正例来源。本阶段只采集、
-    /// 不参与任何评分或置信反推。缺字段时反序列化为空 Vec，向前兼容历史文档。
-    #[serde(default)]
-    pub deal_events: Vec<DealEvent>,
+    /// 自学习采集管道 S5：admin 手动标记的**结果/成效事件**（正例-only，稀疏 + 延迟）。
+    /// 业务结果（T0 硬事件，如成交 / 报名 / 转化 / 履约完成——具体语义因行业而定）
+    /// 不可从 WeChat 文字入站观测，只能由运营人员事后登记；本字段是未来 PU-learning /
+    /// 延迟反馈归因的唯一正例来源。本阶段只采集、不参与任何评分或置信反推。缺字段时
+    /// 反序列化为空 Vec，向前兼容历史文档；`alias = "deal_events"` 让改名前写入的旧库
+    /// 文档继续可读（universal-domain-adaptation H10：从销售域 `deal_events` 泛化）。
+    #[serde(default, alias = "deal_events")]
+    pub outcome_events: Vec<OutcomeEvent>,
     /// Phase E / E3：联系人语种（BCP-47 短形式，如 `zh-CN` / `en-US`）。
     /// `load_prompt_for_contact` 在 prompt_templates 多 locale 并存时按本字段
     /// 选最匹配版本；缺字段时反序列化为 None，由 `contact_locale_or_default`
@@ -214,21 +216,24 @@ pub struct Contact {
     pub updated_at: DateTime,
 }
 
-/// 自学习采集管道 S5：单条成交事件（admin 手动标记）。
+/// 自学习采集管道 S5：单条**结果/成效事件**（admin 手动标记）。
 ///
-/// 设计取舍——成交是 T0 硬事件，但 WeChat 私聊入站只有文字，系统无法自动观测
-/// 支付/下单；唯一可信来源是运营人员事后登记。因此该结构刻意只承载"被标记的
-/// 客观事实"（标记时间、可选实际发生时间、可选金额），不含任何 LLM 解释或
+/// 设计取舍——业务结果是 T0 硬事件，但 WeChat 私聊入站只有文字，系统无法自动观测
+/// 支付/下单/报名/履约；唯一可信来源是运营人员事后登记。因此该结构刻意只承载
+/// "被标记的客观事实"（标记时间、可选实际发生时间、可选金额），不含任何 LLM 解释或
 /// 置信度反推。本阶段仅落库，作为未来归因/PU-learning 的正例。
+///
+/// universal-domain-adaptation H10：从销售域 `DealEvent`（"成交"）泛化为行业中性的
+/// `OutcomeEvent`（"成效"）。`amount`/`currency` 字段对无金额语义的行业可留空。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
-pub struct DealEvent {
-    /// admin 在后台点击"标记成交"的时间。
+pub struct OutcomeEvent {
+    /// admin 在后台点击"标记成效"的时间。
     pub marked_at: DateTime,
-    /// 成交实际发生时间（admin 可回填；缺省时下游用 `marked_at` 近似）。
+    /// 结果实际发生时间（admin 可回填；缺省时下游用 `marked_at` 近似）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub occurred_at: Option<DateTime>,
-    /// 成交金额（可选，业务自行决定是否登记）。
+    /// 金额（可选，业务自行决定是否登记；无金额语义的行业留空）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub amount: Option<f64>,
     /// 金额币种（ISO-4217 短码，如 `CNY`）；与 `amount` 配套。

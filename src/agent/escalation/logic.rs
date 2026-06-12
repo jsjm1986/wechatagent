@@ -540,7 +540,7 @@ mod tests {
             last_agent_run_at: None,
             last_outbound_style: None,
             intent_trajectory: Vec::new(),
-            deal_events: Vec::new(),
+            outcome_events: Vec::new(),
             locale: None,
             created_at: now,
             updated_at: now,

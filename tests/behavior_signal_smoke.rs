@@ -18,7 +18,7 @@ use std::time::Duration;
 
 use mongodb::bson::{doc, DateTime};
 use wechatagent::behavior_signals as bs;
-use wechatagent::models::{AgentStatus, Contact, DealEvent};
+use wechatagent::models::{AgentStatus, Contact, OutcomeEvent};
 
 use crate::common::TestApp;
 
@@ -59,7 +59,7 @@ fn contact_template(wxid: &str) -> Contact {
         operation_mode_override: None,
         last_outbound_style: None,
         intent_trajectory: Vec::new(),
-        deal_events: Vec::new(),
+        outcome_events: Vec::new(),
         locale: None,
         created_at: now,
         updated_at: now,
@@ -124,7 +124,7 @@ async fn deal_event_push_round_trip() {
     let oid = insert.inserted_id.as_object_id().expect("oid");
     contact.id = Some(oid);
 
-    let deal = DealEvent {
+    let outcome = OutcomeEvent {
         marked_at: DateTime::now(),
         occurred_at: None,
         amount: Some(199.0),
@@ -133,16 +133,18 @@ async fn deal_event_push_round_trip() {
         marked_by: "admin_smoke".to_string(),
         note: Some("首单".to_string()),
     };
+    // H10 向后兼容：故意用**旧** `deal_events` key 写库，验证 serde alias 让旧库
+    // 文档仍能反序列化到新 `outcome_events` 字段（改名前写入的存量数据不丢）。
     state
         .db
         .contacts()
         .update_one(
             doc! { "_id": oid, "workspace_id": "default" },
-            doc! { "$push": { "deal_events": mongodb::bson::to_bson(&deal).unwrap() } },
+            doc! { "$push": { "deal_events": mongodb::bson::to_bson(&outcome).unwrap() } },
             None,
         )
         .await
-        .expect("push deal event");
+        .expect("push outcome event under legacy key");
 
     let reloaded = state
         .db
@@ -151,10 +153,10 @@ async fn deal_event_push_round_trip() {
         .await
         .expect("reload")
         .expect("contact exists");
-    assert_eq!(reloaded.deal_events.len(), 1);
-    assert_eq!(reloaded.deal_events[0].source, "manual");
-    assert_eq!(reloaded.deal_events[0].amount, Some(199.0));
-    assert_eq!(reloaded.deal_events[0].marked_by, "admin_smoke");
+    assert_eq!(reloaded.outcome_events.len(), 1, "旧 deal_events key 经 alias 读入 outcome_events");
+    assert_eq!(reloaded.outcome_events[0].source, "manual");
+    assert_eq!(reloaded.outcome_events[0].amount, Some(199.0));
+    assert_eq!(reloaded.outcome_events[0].marked_by, "admin_smoke");
 }
 
 #[tokio::test]

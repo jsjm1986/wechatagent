@@ -227,7 +227,7 @@ mod tests {
             operation_mode_override: None,
             last_outbound_style: None,
             intent_trajectory: Vec::new(),
-            deal_events: Vec::new(),
+            outcome_events: Vec::new(),
             locale: None,
             created_at: now,
             updated_at: now,
