@@ -86,7 +86,11 @@ pub use knowledge_agent::{
 // Phase B / B3 / B6：`tests/chunk_type_routing_pbt.rs` 需要直接驱动
 // `format_operation_knowledge_for_prompt`，因此对外 re-export。生产路径调用方
 // 仍走 `agent/knowledge_router.rs` 内部，不应跨越 mod 边界使用此符号。
-pub use knowledge_router::format_operation_knowledge_for_prompt;
+// H16-b：`_with_roles` 是生产路径入口（decision / review 传 active profile.chunk_roles），
+// 无参 wrapper 保留供 PBT / 无 profile 入口 = DEFAULT 销售四态。
+pub use knowledge_router::{
+    format_operation_knowledge_for_prompt, format_operation_knowledge_for_prompt_with_roles,
+};
 pub use memory::{consolidate_contact_memory, handle_memory_consolidation_task};
 pub use outbox_dispatcher::run_outbox_dispatcher;
 
