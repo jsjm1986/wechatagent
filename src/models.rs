@@ -1285,6 +1285,13 @@ pub struct DomainProfile {
     /// 绝不臆测为负；本字段只声明正/负集，不声明"沉默算什么"。
     #[serde(default)]
     pub outcome_polarity: OutcomePolarity,
+    /// universal-domain-adaptation H15：本行业「经营公式」声明（替代写死的销售域
+    /// 四公式 Trust / ConversionReadiness / EmotionalValue / NextBestActionScore）。
+    /// reviewer 自检维度 + `/evaluations` ground-truth 度量的锚点。空集
+    /// （`Vec::default()`，DEFAULT_PROFILE 下由 seed 显式填回销售四公式）时各消费方
+    /// 回落内置销售公式常量，逐字等价。不进任何硬闸。
+    #[serde(default)]
+    pub business_formulas: Vec<BusinessFormula>,
     /// E5-T1 多版本灰度：同 `(workspace_id, profile_id)` 下 `version` 单调递增。
     #[serde(default = "default_version_one")]
     pub version: i32,
@@ -1498,6 +1505,40 @@ pub struct OutcomePolarity {
     /// unsubscribed/negative/complaint 五词。
     #[serde(default)]
     pub negative: Vec<String>,
+}
+
+/// universal-domain-adaptation H15：本行业「经营公式」声明 = 一组可读的自检公式
+/// （`key` + 人类可读展开式 `expression` + 中文 `display_name`），替代写死在
+/// prompt 散文/reviewer rubric/`/evaluations` 里的销售域四公式（Trust /
+/// ConversionReadiness / EmotionalValue / NextBestActionScore）。
+///
+/// 公式是 reviewer 自检维度 + `/evaluations` ground-truth 度量的锚点，横跨四处副本
+/// （policy prompt 英文式、playbook method_prompt 中文式、reviewer formulaBreakdown、
+/// evaluations 硬编码 formulas 数组）。本结构是其**单一真相源**——空集
+/// （`Vec::default()`，DEFAULT_PROFILE 下由 `domain_profile.rs` 的 seed 显式填回
+/// 销售四公式）时各消费方回落内置销售公式常量，逐字等价。情感/陪伴域可声明
+/// 「情绪价值 / 陪伴深度」类公式，让 reviewer 自检与度量贴合本行业经营目标。
+///
+/// **不进任何硬闸**：公式只占 reviewer 注意力 + 被 `/evaluations` 当度量基准，
+/// 不参与 send/block 判决（与 §7 护栏一致——引导层不得写死行业词，但 DEFAULT
+/// 逐字复刻销售域以保证零行为变化）。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct BusinessFormula {
+    /// 公式 key，与 reviewer `formulaBreakdown` / `/evaluations` formulas 数组对齐
+    /// （如 `trust` / `conversionReadiness` / `emotionalValue` / `nextBestActionScore`）。
+    pub key: String,
+    /// 人类可读的公式展开式（如 `Motivation × ProductFit × Timing × Trust ÷ Friction`）。
+    /// 注入 prompt 自检段 + reviewer formulaBreakdown 模板。
+    pub expression: String,
+    /// 中文展示名（如「成交准备度」）。playbook 中文公式段用。
+    #[serde(default)]
+    pub display_name: String,
+    /// `/evaluations` 把该公式当 ground-truth 度量时，预测值缺失则回落到哪个
+    /// reviewer score key（替代写死的 `score_key_for` 映射）。DEFAULT 四公式分别
+    /// 回落 humanLike / conversionReadiness / emotionalValue / relationshipProgress。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub eval_score_key: Option<String>,
 }
 
 /// catalog 重建队列：`apply_chunk_revision` 写完即 enqueue；catalog_rebuild_worker
