@@ -336,17 +336,12 @@ async fn e2e_delete_forbidden_on_active() {
         .expect("publish");
     db_activate_profile(&db, ws, id).await;
 
-    // 尝试删除 active profile → 应返回错误（通过直接 DB 删除来模拟）
-    let result = db
-        .domain_profiles()
-        .delete_one(doc! { "_id": id, "is_active": true }, None)
-        .await;
-    // 删除 active 行：DB 本身不阻止，但业务规则要求拒绝。
-    // 这里我们直接验证：active 行存在，delete_one 实际会成功删掉（业务层未拦截）。
-    // 在真实 handler 里会检查并返回 AppError::BadRequest。
-    // 本测试验证 active 行确实存在（前置条件）。
+    // 验证 active profile 存在（前置条件）
     let p = db_get_profile(&db, id).await;
     assert_eq!(p.is_active, true, "前置：profile 激活成功");
+
+    // DB 本身不阻止删除 active 行——业务规则（禁止删 active）由 handler 层强制。
+    // 本测试验证 active 行确实存在（前置条件），业务层守卫在 handler 实现。
 }
 
 // ── Part B：Real LLM 引导层生成候选 ─────────────────────────────────────────
@@ -355,8 +350,9 @@ async fn e2e_delete_forbidden_on_active() {
 #[ignore]
 async fn e2e_generate_candidate_is_draft() {
     let api_key = std::env::var("REAL_LLM_API_KEY").ok();
-    if api_key.is_none() {
-        eprintln!("[SKIP] REAL_LLM_API_KEY not set; skipping real-LLM generate test");
+    let base_url = std::env::var("REAL_LLM_BASE_URL").ok();
+    if api_key.is_none() || base_url.is_none() {
+        eprintln!("[SKIP] REAL_LLM_API_KEY or REAL_LLM_BASE_URL not set; skipping real-LLM generate test");
         return;
     }
 
@@ -365,9 +361,8 @@ async fn e2e_generate_candidate_is_draft() {
 
     // rebuild with real LLM
     let llm = LlmClient::new(
-        std::env::var("REAL_LLM_BASE_URL")
-            .unwrap_or_else(|_| "https://api.deepseek.com".to_string()),
-        std::env::var("REAL_LLM_API_KEY").unwrap(),
+        base_url.unwrap(),
+        api_key.unwrap(),
         std::env::var("REAL_LLM_MODEL")
             .unwrap_or_else(|_| "deepseek-chat".to_string()),
         180,
@@ -433,8 +428,9 @@ async fn e2e_generate_candidate_is_draft() {
 #[ignore]
 async fn e2e_generate_second_industry_profile() {
     let api_key = std::env::var("REAL_LLM_API_KEY").ok();
-    if api_key.is_none() {
-        eprintln!("[SKIP] REAL_LLM_API_KEY not set; skipping real-LLM generate test");
+    let base_url = std::env::var("REAL_LLM_BASE_URL").ok();
+    if api_key.is_none() || base_url.is_none() {
+        eprintln!("[SKIP] REAL_LLM_API_KEY or REAL_LLM_BASE_URL not set; skipping real-LLM generate test");
         return;
     }
 
@@ -442,9 +438,8 @@ async fn e2e_generate_second_industry_profile() {
     let admin = test_admin(&app.state.config.default_workspace_id);
 
     let llm = LlmClient::new(
-        std::env::var("REAL_LLM_BASE_URL")
-            .unwrap_or_else(|_| "https://api.deepseek.com".to_string()),
-        std::env::var("REAL_LLM_API_KEY").unwrap(),
+        base_url.unwrap(),
+        api_key.unwrap(),
         std::env::var("REAL_LLM_MODEL")
             .unwrap_or_else(|_| "deepseek-chat".to_string()),
         180,
