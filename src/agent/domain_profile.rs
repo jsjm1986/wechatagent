@@ -34,8 +34,8 @@ use std::time::{Duration, Instant};
 use crate::db::Database;
 use crate::error::AppResult;
 use crate::models::{
-    ChunkRole, CommitmentMarkers, CoverageDimension, DomainProfile, OutcomePolarity,
-    ProfileDimension,
+    BusinessFormula, ChunkRole, CommitmentMarkers, CoverageDimension, DomainProfile,
+    OutcomePolarity, ProfileDimension,
 };
 
 /// 内置默认 profile 的 `profile_id`。运行时无 active profile 时使用。
@@ -96,6 +96,49 @@ pub fn default_outcome_polarity() -> OutcomePolarity {
             .map(|s| s.to_string())
             .collect(),
     }
+}
+
+/// universal-domain-adaptation H15：DEFAULT_PROFILE 的销售域四公式 seed。逐字复刻
+/// 散落在四处副本的销售经营公式，作为 DEFAULT 等价的单一真相源：
+/// - `prompts.rs` policy「关系经营公式（自检）」英文展开式；
+/// - `prompts.rs` default_playbook method_prompt「核心公式」中文展开式；
+/// - `agent/review/mod.rs` reviewer prompt 的 `formulaBreakdown` 模板；
+/// - `routes/evaluations.rs` 硬编码 `formulas` 数组 + `score_key_for` 映射。
+///
+/// `expression` = policy 英文式逐字；`display_name` = playbook 中文名；
+/// `eval_score_key` = `score_key_for` 映射逐字（trust→humanLike /
+/// conversionReadiness→conversionReadiness / emotionalValue→emotionalValue /
+/// nextBestActionScore→relationshipProgress）。空集时各消费方回落本函数同源常量。
+pub fn default_business_formulas() -> Vec<BusinessFormula> {
+    vec![
+        BusinessFormula {
+            key: "trust".to_string(),
+            expression: "Credibility + Reliability + Intimacy − SelfOrientation".to_string(),
+            display_name: "信任".to_string(),
+            eval_score_key: Some("humanLike".to_string()),
+        },
+        BusinessFormula {
+            key: "conversionReadiness".to_string(),
+            expression: "Motivation × ProductFit × Timing × Trust ÷ Friction".to_string(),
+            display_name: "成交准备度".to_string(),
+            eval_score_key: Some("conversionReadiness".to_string()),
+        },
+        BusinessFormula {
+            key: "emotionalValue".to_string(),
+            expression: "Empathy + Validation + Specificity + AutonomySupport − Pressure"
+                .to_string(),
+            display_name: "情绪价值".to_string(),
+            eval_score_key: Some("emotionalValue".to_string()),
+        },
+        BusinessFormula {
+            key: "nextBestActionScore".to_string(),
+            expression:
+                "RelationshipGain + ConversionProgress + EmotionalValue + ProductFit − PressureRisk − FactRisk"
+                    .to_string(),
+            display_name: "下一步动作评分".to_string(),
+            eval_score_key: Some("relationshipProgress".to_string()),
+        },
+    ]
 }
 
 /// 构造内置 DEFAULT_PROFILE。内容逐字等价当前源码写死的销售域行为。
@@ -175,6 +218,10 @@ pub fn default_domain_profile(workspace_id: &str) -> DomainProfile {
         // H11：DEFAULT 销售极性 = 显式填回回路① fallback 常量（正极 buying_signal +
         // 负极 5 词）。空集 default 会让消费方回落同一对常量，故 seed 与回落同源、字节等价。
         outcome_polarity: default_outcome_polarity(),
+        // H15：DEFAULT 销售域 = 显式填回四公式（Trust/ConversionReadiness/EmotionalValue/
+        // NextBestActionScore）。空集时各消费方回落内置销售公式常量，故 seed 与回落同源、
+        // 字节等价。
+        business_formulas: default_business_formulas(),
         version: 1,
         current_version: true,
         previous_version: None,
@@ -523,6 +570,46 @@ mod tests {
         // H11：outcome_polarity 经 BSON 往返不丢（camelCase positive/negative）。
         assert_eq!(parsed.outcome_polarity.positive, p.outcome_polarity.positive);
         assert_eq!(parsed.outcome_polarity.negative, p.outcome_polarity.negative);
+        // H15：business_formulas 经 BSON 往返不丢（camelCase key/expression/displayName/evalScoreKey）。
+        assert_eq!(parsed.business_formulas, p.business_formulas);
+    }
+
+    // ── 3A-1a H15：经营公式 seed 等价 ──
+
+    #[test]
+    fn default_business_formulas_default_is_empty_not_sales() {
+        // DomainProfile.business_formulas 的 serde 默认是空 Vec（非销售四公式）——
+        // 销售公式由 seed 显式填回。这是消费方"空集→回落内置常量"契约的前提：
+        // default 不能预埋销售公式，否则换行业 profile 漏配会静默继承销售公式。
+        let formulas: Vec<crate::models::BusinessFormula> = Vec::default();
+        assert!(formulas.is_empty());
+    }
+
+    #[test]
+    fn default_business_formulas_seed_matches_sales_four_verbatim() {
+        // seed 四公式的 key / expression / eval_score_key 逐字锁死 —— 与 prompts.rs
+        // policy 英文式、evaluations.rs formulas 数组 + score_key_for 映射同源。
+        // 3A-1b/1c 切换消费点后此测试是 DEFAULT 字节等价的护栏。
+        let f = default_business_formulas();
+        assert_eq!(f.len(), 4);
+        assert_eq!(f[0].key, "trust");
+        assert_eq!(f[0].expression, "Credibility + Reliability + Intimacy − SelfOrientation");
+        assert_eq!(f[0].eval_score_key.as_deref(), Some("humanLike"));
+        assert_eq!(f[1].key, "conversionReadiness");
+        assert_eq!(f[1].expression, "Motivation × ProductFit × Timing × Trust ÷ Friction");
+        assert_eq!(f[1].eval_score_key.as_deref(), Some("conversionReadiness"));
+        assert_eq!(f[2].key, "emotionalValue");
+        assert_eq!(
+            f[2].expression,
+            "Empathy + Validation + Specificity + AutonomySupport − Pressure"
+        );
+        assert_eq!(f[2].eval_score_key.as_deref(), Some("emotionalValue"));
+        assert_eq!(f[3].key, "nextBestActionScore");
+        assert_eq!(
+            f[3].expression,
+            "RelationshipGain + ConversionProgress + EmotionalValue + ProductFit − PressureRisk − FactRisk"
+        );
+        assert_eq!(f[3].eval_score_key.as_deref(), Some("relationshipProgress"));
     }
 
     // ── 1G-c：DomainProfileCache TTL / 命中 / 回落 / 失效（无 Docker 纯内存）──
