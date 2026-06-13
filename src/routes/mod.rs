@@ -29,6 +29,7 @@ mod behavior_signal_metrics;
 pub mod chunk_locks;
 mod contacts;
 mod conversations;
+pub(crate) mod domain_profiles;
 pub(crate) mod domain_schemas;
 mod domains;
 mod evaluations;
@@ -122,6 +123,11 @@ use conversations::list_messages;
 use domain_schemas::{
     activate_domain_schema, create_domain_schema, delete_domain_schema, list_domain_schemas,
     update_domain_schema,
+};
+use domain_profiles::{
+    activate_domain_profile, create_domain_profile, delete_domain_profile, get_domain_profile,
+    list_domain_profiles, publish_domain_profile, rollback_domain_profile, rollout_domain_profile,
+    update_domain_profile,
 };
 use domains::{
     get_operation_domain, get_operation_domain_state_machine, list_operation_domains,
@@ -771,6 +777,33 @@ pub fn api_router(state: AppState) -> Router<AppState> {
         .route(
             "/admin/domain-schemas/:id/activate",
             post(activate_domain_schema),
+        )
+        // ── universal-domain-adaptation Phase 3：行业总装配单 DomainProfile admin 路由 ──
+        .route(
+            "/admin/domain-profiles",
+            get(list_domain_profiles).post(create_domain_profile),
+        )
+        .route(
+            "/admin/domain-profiles/:id",
+            get(get_domain_profile)
+                .put(update_domain_profile)
+                .delete(delete_domain_profile),
+        )
+        .route(
+            "/admin/domain-profiles/:id/publish",
+            post(publish_domain_profile),
+        )
+        .route(
+            "/admin/domain-profiles/:id/rollout",
+            post(rollout_domain_profile),
+        )
+        .route(
+            "/admin/domain-profiles/:id/rollback",
+            post(rollback_domain_profile),
+        )
+        .route(
+            "/admin/domain-profiles/:id/activate",
+            post(activate_domain_profile),
         )
         // ── agent-self-evolution M4 W4 / Task 5.5：evolution admin 路由 ──────
         .route("/evolution/experiments", get(list_evolution_experiments))
