@@ -264,6 +264,30 @@ pub(super) async fn run_formula_adherence_evaluation(
         "emotionalValue",
         "nextBestActionScore",
     ];
+    // H15：经营公式 + 缺失回落 score key 从 active profile 读（替代写死四公式数组 +
+    // score_key_for 映射）。profile.business_formulas 为空（老库无字段/profile 漏配）时
+    // 回落内置销售四公式 + score_key_for——DEFAULT_PROFILE 已 seed 四公式，故等价。
+    let active_profile =
+        agent::domain_profile::load_active_domain_profile(&state.db, &admin.current_workspace)
+            .await;
+    let formula_specs: Vec<(String, String)> = if active_profile.business_formulas.is_empty() {
+        formulas
+            .iter()
+            .map(|k| (k.to_string(), score_key_for(k).to_string()))
+            .collect()
+    } else {
+        active_profile
+            .business_formulas
+            .iter()
+            .map(|f| {
+                let score_key = f
+                    .eval_score_key
+                    .clone()
+                    .unwrap_or_else(|| score_key_for(&f.key).to_string());
+                (f.key.clone(), score_key)
+            })
+            .collect()
+    };
     let mut items: Vec<Value> = Vec::new();
     let mut total_adherence = 0.0_f64;
     let mut counted = 0usize;
@@ -324,13 +348,14 @@ pub(super) async fn run_formula_adherence_evaluation(
         let mut total_delta = 0.0_f64;
         let mut formula_count = 0u32;
         let mut missing_count = 0u32;
-        for formula in formulas {
+        for (formula, score_key) in &formula_specs {
+            let formula = formula.as_str();
             let predicted_value = last
                 .and_then(|t| t.review.get_document("formulaBreakdown").ok())
                 .and_then(|fb| fb.get(formula).cloned())
                 .or_else(|| {
                     last.and_then(|t| t.review.get_document("scores").ok())
-                        .and_then(|s| s.get(score_key_for(formula)).cloned())
+                        .and_then(|s| s.get(score_key.as_str()).cloned())
                 });
             let Some(predicted_value) = predicted_value else {
                 deviations.insert(formula.to_string(), json!("missing"));
