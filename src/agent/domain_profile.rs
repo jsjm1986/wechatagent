@@ -317,6 +317,9 @@ pub fn default_domain_profile(workspace_id: &str) -> DomainProfile {
         // NextBestActionScore）。空集时各消费方回落内置销售公式常量，故 seed 与回落同源、
         // 字节等价。
         business_formulas: default_business_formulas(),
+        // C3：DEFAULT 不声明行业专属生成器引导语 → 回落领域中性 PLAYBOOK_METHODOLOGY_SYSTEM
+        // （已去销售偏见）。换行业可在引导层声明自己的生成偏好。
+        methodology_generator_preamble: None,
         version: 1,
         current_version: true,
         previous_version: None,
