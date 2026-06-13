@@ -186,6 +186,18 @@ jobs:
           REAL_LLM_VISION_MODEL: nvidia/nemotron-nano-12b-v2-vl
         run: cargo test --no-fail-fast --test real_llm_smoke -- --ignored --nocapture
 
+      # ════════════════════════════════════════════════════════════════════════════
+      # universal-domain-adaptation 3C：DomainProfile 端到端（AI 生成候选 → publish
+      # → activate → 运行时加载）。走 step-3.7-flash（Flash 模型成本低、JSON 稳定，足够
+      # 验证 profile 生成链路）。与 real_llm_smoke 同 env/key/guard。
+      - name: cargo test --test domain_profile_e2e -- --ignored --nocapture
+        if: ${{ env.REAL_LLM_API_KEY != '' }}
+        env:
+          RUSTFLAGS: ""
+          REAL_LLM_BASE_URL: https://integrate.api.nvidia.com/v1/chat/completions
+          REAL_LLM_MODEL: stepfun-ai/step-3.7-flash
+        run: cargo test --test domain_profile_e2e -- --ignored --nocapture
+
       # 知识库全能力 smoke（real_llm_knowledge.rs K1–K9）：渐进式披露检索
       # （open_chunk 深检索 / follow_relations 关系跳转 / 无幻觉 / 未审定不上桌）
       # + 抽取全能力（文章抽取 / 多模态图片抽取 / 自动审定 provenance 闸门 /
