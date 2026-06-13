@@ -145,7 +145,7 @@ use evolution::{
     rollback_evolution_proposal,
 };
 use guides::{apply_user_operation_guide, preview_user_operation_guide};
-use guide_profile::{generate_domain_profile_candidate, GenerateProfileRequest};
+use guide_profile::generate_domain_profile_candidate;
 use health::health;
 use llm_providers::{
     activate_provider, create_provider, delete_provider, list_providers, set_vision_active,
