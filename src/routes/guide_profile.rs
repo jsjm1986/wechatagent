@@ -31,7 +31,7 @@ use super::AppState;
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub(super) struct GenerateProfileRequest {
+pub(crate) struct GenerateProfileRequest {
     /// 运营对业务的自然语言描述（行业/产品/客户/经营目标/对话风格等）。
     business_description: String,
     /// 目标 profile slug（如 `dental-implant-private`）；落候选时作 `profile_id`。
@@ -84,32 +84,54 @@ fn build_profile_generation_prompt(
     knowledge_context: &str,
 ) -> String {
     format!(
-        r#"运营对自己业务的描述：
+        r#"你好，我需要你帮我理解我们这个行业。
+
+我先说说我们是什么样的：
 {business_description}
 {knowledge_context}
 
-请基于以上信息，生成一份本行业的画像配置候选（DomainProfile）。严格输出 JSON，字段：
+---
+
+请帮我生成一份「行业画像配置」——这份配置会被 AI 用来理解客户、判断该怎么回应。
+
+它不是写给我自己看的，而是写给 AI 看的。所以要回答这些问题：
+
+**我服务的客户是什么样的人？**（不是人口统计，是他们的处境、痛点、期待）
+**我们和客户对话时，什么是真正重要的？**（那些让客户觉得"你懂我"的时刻）
+**有没有哪些话说出来会让我失去客户的信任？**（比如夸大效果、用错语境）
+**客户来了之后，通常会经历怎样的心理过程？**（从陌生到信任，中间有关键节点）
+**用什么方式说话客户会觉得舒服？**（语气、用词风格、边界感）
+
+请严格输出 JSON，结构如下：
 {{
   "displayName": "{display_name}",
-  "description": "本行业画像说明（人可读，一两句）",
+  "description": "一两句话描述这个行业的 AI 对话画像",
   "profileDimensions": [
-    {{"kind": "维度英文key(snake_case)", "displayName": "中文维度名", "participatesInDecision": true, "description": "该维度含义"}}
+    {{
+      "kind": "维度英文key(snake_case)",
+      "displayName": "中文维度名",
+      "participatesInDecision": true,
+      "description": "这个维度如何影响 AI 的判断（写给 AI 看的，不是写给人看的）"
+    }}
   ],
-  "promptFragment": "本行业业务上下文片段（注入决策提示，解释这些维度怎么理解；不要写死与本行业无关的销售套路）",
-  "conversationModes": ["按本行业需要选择的对话模式key，缺省四模式可不填"],
+  "promptFragment": "一段真实的 AI 决策提示片段——如果你是 AI，面对一个客户，你会怎么想这些问题。要有行业灵魂，不要空洞。",
+  "conversationModes": ["这个行业真正需要的对话模式，不是填四个标准模式"],
   "businessFormulas": [
-    {{"key": "公式key(camelCase)", "expression": "可读展开式", "displayName": "中文名"}}
+    {{"key": "公式key(camelCase)", "expression": "客户视角的可读展开式", "displayName": "中文名"}}
   ],
-  "commitmentMarkers": {{"productEffect": ["本行业绝对化效果承诺词"], "toneOnly": ["语气类夸大词"]}},
+  "commitmentMarkers": {{
+    "productEffect": ["这类话一说出来客户就会失去信任（绝对化效果承诺）"],
+    "toneOnly": ["这类话只有语气上的分量，没有实质承诺"]
+  }},
   "coverageDimensions": [
     {{"key": "covKey", "displayName": "中文名", "required": false}}
   ]
 }}
 
-要求：
-- profile_id 固定为 "{profile_id}"，不要在 JSON 里改它。
-- 维度/取值/词表都用本行业真实语义，不要套用销售域（如「成交阶段」）除非本行业确实是销售。
-- 不确定的字段给空数组/空串，不要编造。"#,
+**重要提醒：**
+- profile_id 是唯一标识，固定为「{profile_id}」，不要改动。
+- 如果某个维度或公式在你的行业里没有对应的，不要硬凑——给空数组或空串就好。
+- promptFragment 要写得像一段真实思考，不是产品说明书。"#,
         business_description = business_description,
         knowledge_context = knowledge_context,
         display_name = display_name,
