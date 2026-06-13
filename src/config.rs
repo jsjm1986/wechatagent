@@ -197,6 +197,21 @@ pub struct AppConfig {
     pub evolution_auto_release_window_hours: u32,
     /// Phase C / C5：单 tick 自动 release 的 proposal 数量上限（防止一波打开过多 gate）。
     pub evolution_auto_release_per_tick_cap: usize,
+    /// universal-domain-adaptation 2.5-main-4：自动 release 的「客户负反应强制门」开关。
+    /// 默认 false（字节等价：关时 auto_release 行为与 main-4 前完全一致）。开启后，
+    /// auto_release 在 `decide_auto_release` 判定放行**之后、实际调 release_threshold
+    /// 之前**，多过一道闸：回看窗口内当前**绝对**负反应率（按 `decision_reviews.outcome_status`
+    /// 经 active `DomainProfile.outcome_polarity` 分类，复用回路① 的 `classify_outcome_label`）
+    /// 高于 [`Self::evolution_auto_release_max_negative_reaction_rate`] 时，强制 SKIP 该候选、
+    /// 退回 admin 显式判断，**不自动放行阈值放松**。这是「拒绝自动放行」而非「回滚」，
+    /// 不触碰 Requirements 9.7（rollback 永远手动）的硬约束。
+    pub evolution_auto_release_negative_reaction_gate_enabled: bool,
+    /// universal-domain-adaptation 2.5-main-4：自动 release 负反应强制门的**绝对**阈值
+    /// （非 pre-3 的前/后窗口升幅 delta —— auto_release 在 release 前决策，没有「后窗口」
+    /// 可比，故看当前窗口的绝对负反应率）。仅当
+    /// [`Self::evolution_auto_release_negative_reaction_gate_enabled`]=true 时生效。
+    /// 默认 0.30。窗口内无已分类客户反应（全删失/无反应）时**不阻拦**（保守：无信号不强制 skip）。
+    pub evolution_auto_release_max_negative_reaction_rate: f64,
 
     // ── Knowledge Digest Workstation ──
     //
@@ -490,6 +505,15 @@ impl AppConfig {
             evolution_auto_release_per_tick_cap: env_or(
                 "EVOLUTION_AUTO_RELEASE_PER_TICK_CAP",
                 "1",
+            )
+            .parse()?,
+            evolution_auto_release_negative_reaction_gate_enabled: parse_bool(&env_or(
+                "EVOLUTION_AUTO_RELEASE_NEGATIVE_REACTION_GATE_ENABLED",
+                "false",
+            )),
+            evolution_auto_release_max_negative_reaction_rate: env_or(
+                "EVOLUTION_AUTO_RELEASE_MAX_NEGATIVE_REACTION_RATE",
+                "0.30",
             )
             .parse()?,
             // ── Knowledge Digest Workstation ──

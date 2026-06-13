@@ -345,7 +345,10 @@ async fn compute_window_metrics(
 ///
 /// **复用回路① 的 classify**：2.5-main-2 把 classify 的极性源换成 active
 /// DomainProfile.outcome_polarity 后，本观测指标自动跟随同一极性，无需二次接线。
-async fn compute_negative_reaction_rate(
+///
+/// 2.5-main-4：提升为 `pub(crate)` 供 `auto_release` 的负反应强制门复用（同一口径、
+/// 同一极性源），避免两处算法 drift。
+pub(crate) async fn compute_negative_reaction_rate(
     state: &AppState,
     workspace_id: &str,
     account_id: &str,
@@ -388,7 +391,10 @@ async fn compute_negative_reaction_rate(
 
 /// 2.5-pre-3：从 Hit / Block 计数算负反应率的纯算术核心（删失已在 caller 排除）。
 /// `Block / (Hit+Block)`；已分类反应为 0 时返回 `None`（避免 0/0 NaN 落库）。
-fn negative_reaction_rate_from_counts(hits: i64, blocks: i64) -> Option<f64> {
+///
+/// 2.5-main-4：提升为 `pub(crate)`，与 [`compute_negative_reaction_rate`] 一并供
+/// `auto_release` 复用。
+pub(crate) fn negative_reaction_rate_from_counts(hits: i64, blocks: i64) -> Option<f64> {
     let classified = hits + blocks;
     if classified > 0 {
         Some(blocks as f64 / classified as f64)
