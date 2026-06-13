@@ -1,5 +1,5 @@
 import { create } from "zustand";
-import type { AgentSoul, PromptTemplate, PromptTemplateDraft } from "../types";
+import type { AgentSoul, PromptTemplate, PromptTemplateDraft, DomainProfile, DomainProfileDraft } from "../types";
 import { api } from "../lib/api";
 import { useUiStore } from "./uiStore";
 
@@ -10,6 +10,14 @@ interface StrategyState {
   editingSoulId: string;
   promptDraft: PromptTemplateDraft;
   editingPromptId: string;
+  // ── DomainProfile ───────────────────────────────────────────────────────
+  domainProfiles: DomainProfile[];
+  editingProfile: DomainProfile | null;
+  profileDraft: DomainProfileDraft;
+  profileTab: "list" | "generate";
+  generating: boolean;
+  generateError: string;
+  generateResult: { id: string; profileId: string } | null;
 }
 
 interface StrategyActions {
@@ -27,6 +35,17 @@ interface StrategyActions {
   newSoulDraftFor: (kind: string) => void;
   editPromptTemplate: (template: PromptTemplate) => void;
   newPromptDraftFor: (kind: string) => void;
+  // ── DomainProfile ───────────────────────────────────────────────────────
+  loadDomainProfiles: () => Promise<void>;
+  generateDomainProfile: (businessDescription: string, profileId: string, displayName?: string) => Promise<void>;
+  selectProfileTab: (tab: "list" | "generate") => void;
+  editDomainProfile: (profile: DomainProfile) => void;
+  newDomainProfileDraft: () => void;
+  setProfileDraft: (draft: DomainProfileDraft) => void;
+  saveDomainProfile: (id: string) => Promise<void>;
+  publishDomainProfile: (id: string) => Promise<void>;
+  activateDomainProfile: (id: string) => Promise<void>;
+  deleteDomainProfile: (id: string) => Promise<void>;
 }
 
 // 辅助函数
@@ -66,6 +85,14 @@ export const useStrategyStore = create<StrategyState & StrategyActions>((set, ge
   editingSoulId: "",
   promptDraft: emptyPromptTemplateDraft(),
   editingPromptId: "",
+  // DomainProfile initial state
+  domainProfiles: [],
+  editingProfile: null,
+  profileDraft: {},
+  profileTab: "list",
+  generating: false,
+  generateError: "",
+  generateResult: null,
 
   setSoulDraft: (draft) => set({ soulDraft: draft }),
   setPromptDraft: (draft) => set({ promptDraft: draft }),
@@ -240,5 +267,113 @@ export const useStrategyStore = create<StrategyState & StrategyActions>((set, ge
       editingPromptId: "",
       promptDraft: { ...emptyPromptTemplateDraft(), agentKind }
     });
+  },
+
+  // ── DomainProfile actions ────────────────────────────────────────────────
+
+  loadDomainProfiles: async () => {
+    try {
+      const data = await api.get<{ items: DomainProfile[] }>("/api/admin/domain-profiles");
+      set({ domainProfiles: data.items ?? [] });
+    } catch (error) {
+      useUiStore.getState().setError(error instanceof Error ? error.message : String(error));
+    }
+  },
+
+  selectProfileTab: (tab) => set({ profileTab: tab, generateError: "", generateResult: null }),
+
+  generateDomainProfile: async (businessDescription: string, profileId: string, displayName?: string) => {
+    if (!businessDescription.trim() || !profileId.trim()) return;
+    set({ generating: true, generateError: "", generateResult: null });
+    useUiStore.getState().setBusy(true);
+    try {
+      const payload: Record<string, string> = { businessDescription, profileId };
+      if (displayName) payload.displayName = displayName;
+      const result = await api.post<{ id: string; profileId: string }>("/api/admin/domain-profiles/generate", payload);
+      set({ generating: false, generateResult: { id: result.id, profileId: result.profileId } });
+      await get().loadDomainProfiles();
+    } catch (error) {
+      set({ generating: false, generateError: error instanceof Error ? error.message : String(error) });
+    } finally {
+      useUiStore.getState().setBusy(false);
+    }
+  },
+
+  editDomainProfile: (profile: DomainProfile) => {
+    set({
+      editingProfile: profile,
+      profileDraft: {
+        profile_id: profile.profile_id,
+        display_name: profile.display_name,
+        description: profile.description,
+        profile_dimensions: profile.profile_dimensions,
+        prompt_fragment: profile.prompt_fragment,
+        conversation_modes: profile.conversation_modes,
+        business_formulas: profile.business_formulas,
+        commitment_markers: profile.commitment_markers,
+        coverage_dimensions: profile.coverage_dimensions,
+        methodology_generator_preamble: profile.methodology_generator_preamble ?? undefined,
+      }
+    });
+  },
+
+  newDomainProfileDraft: () => {
+    set({
+      editingProfile: null,
+      profileDraft: {}
+    });
+  },
+
+  setProfileDraft: (draft: DomainProfileDraft) => set({ profileDraft: draft }),
+
+  saveDomainProfile: async (id: string) => {
+    const { profileDraft } = get();
+    useUiStore.getState().setBusy(true);
+    try {
+      await api.put(`/api/admin/domain-profiles/${id}`, profileDraft);
+      await get().loadDomainProfiles();
+    } catch (error) {
+      useUiStore.getState().setError(error instanceof Error ? error.message : String(error));
+    } finally {
+      useUiStore.getState().setBusy(false);
+    }
+  },
+
+  publishDomainProfile: async (id: string) => {
+    useUiStore.getState().setBusy(true);
+    try {
+      await api.post(`/api/admin/domain-profiles/${id}/publish`, {});
+      await get().loadDomainProfiles();
+    } catch (error) {
+      useUiStore.getState().setError(error instanceof Error ? error.message : String(error));
+    } finally {
+      useUiStore.getState().setBusy(false);
+    }
+  },
+
+  activateDomainProfile: async (id: string) => {
+    useUiStore.getState().setBusy(true);
+    try {
+      await api.post(`/api/admin/domain-profiles/${id}/activate`, {});
+      await get().loadDomainProfiles();
+    } catch (error) {
+      useUiStore.getState().setError(error instanceof Error ? error.message : String(error));
+    } finally {
+      useUiStore.getState().setBusy(false);
+    }
+  },
+
+  deleteDomainProfile: async (id: string) => {
+    if (!window.confirm("确认删除该行业配置？")) return;
+    useUiStore.getState().setBusy(true);
+    try {
+      await api.delete(`/api/admin/domain-profiles/${id}`);
+      set({ editingProfile: null });
+      await get().loadDomainProfiles();
+    } catch (error) {
+      useUiStore.getState().setError(error instanceof Error ? error.message : String(error));
+    } finally {
+      useUiStore.getState().setBusy(false);
+    }
   },
 }));
