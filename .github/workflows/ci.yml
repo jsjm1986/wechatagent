@@ -1,5 +1,10 @@
 name: CI
 
+# 同一 PR/push 只保留最新 run，取消旧 run——避免重复排队浪费 runner 资源。
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 on:
   pull_request:
     branches: [main]
