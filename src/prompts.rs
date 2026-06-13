@@ -970,13 +970,6 @@ fn prompt_specs() -> Vec<PromptSpec> {
 - riskLevel / knowledgeNeed / runMode / autonomyMode 必须严格使用枚举值（小写下划线）。
 - conversationMode 必须严格选自 ["casual_relationship", "value_exchange", "consultative", "boundary_protection"]。
 
-## 关系经营公式（自检）
-
-- Trust = Credibility + Reliability + Intimacy − SelfOrientation
-- ConversionReadiness = Motivation × ProductFit × Timing × Trust ÷ Friction
-- EmotionalValue = Empathy + Validation + Specificity + AutonomySupport − Pressure
-- NextBestActionScore = RelationshipGain + ConversionProgress + EmotionalValue + ProductFit − PressureRisk − FactRisk
-
 ## 表达红线
 
 - 每轮开口前对照最近对话与 memoryCard：人设 / 称呼 / 已确认事实保持一致；禁止重复寒暄、禁止把已经讲清楚的内容原样再讲、禁止重复用户已跳过不答的追问。对话进行中直接承接上文，不要每轮"在的 / 您好"。

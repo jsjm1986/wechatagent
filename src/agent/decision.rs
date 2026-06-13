@@ -382,6 +382,18 @@ pub(crate) async fn decide_reply_with_promote(
         contact.locale.as_deref(),
     )
     .await?;
+    // universal-domain-adaptation H15（3A-1c-3）：经营公式单一真相源。policy 不再内联
+    // 写死「关系经营公式（自检）」段——运行时先剥离任何遗留段（旧库自愈），再注入由
+    // active profile 渲染的公式段。DEFAULT_PROFILE seed 四公式 → 注入段与旧库内联段
+    // 逐字相同（往返等价护栏 strip_then_inject_default_roundtrips_to_original_section）。
+    // 换行业 profile 声明本行业公式即在此处生效。
+    let policy = {
+        let (stripped, _) =
+            super::domain_profile::strip_legacy_formula_self_check_section(&policy);
+        let formula_section =
+            super::domain_profile::build_policy_formula_section(&active_profile.business_formulas);
+        format!("{}\n\n{}", stripped.trim_end_matches('\n'), formula_section)
+    };
     let (task_template, _task_version) = prompts::load_prompt_for_contact(
         &state.db,
         &state.config.default_workspace_id,
