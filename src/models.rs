@@ -1292,6 +1292,13 @@ pub struct DomainProfile {
     /// 回落内置销售公式常量，逐字等价。不进任何硬闸。
     #[serde(default)]
     pub business_formulas: Vec<BusinessFormula>,
+    /// universal-domain-adaptation C3：引导层「运营方法生成器」（playbook.generator /
+    /// optimizer）的领域专属 system 引导语。`None` 时回落内置**领域中性**生成器引导语
+    /// （C3 清理后 `PLAYBOOK_METHODOLOGY_SYSTEM` 已去除「消费心理学/顾问式销售/异议/
+    /// 顾问朋友」等销售偏见词——§7 护栏：引导层 prompt 不得写死行业词，否则会污染 AI
+    /// 给非销售行业生成的 profile）。`Some` 时整体替换，让特定行业声明自己的生成偏好。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub methodology_generator_preamble: Option<String>,
     /// E5-T1 多版本灰度：同 `(workspace_id, profile_id)` 下 `version` 单调递增。
     #[serde(default = "default_version_one")]
     pub version: i32,

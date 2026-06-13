@@ -248,6 +248,19 @@ pub(super) async fn generate_operation_playbook(
         "playbook.generator.system",
     )
     .await?;
+    // C3：active profile 可声明行业专属生成器引导语,覆盖领域中性 DEFAULT(去销售偏见)。
+    let active_profile =
+        agent::domain_profile::load_active_domain_profile(&state.db, &admin.current_workspace)
+            .await;
+    let system = match active_profile
+        .methodology_generator_preamble
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        Some(p) => p.to_string(),
+        None => system,
+    };
     let user = build_playbook_generation_prompt(&payload.description);
     let generated = agent::generate_agent_json(
         &state,
@@ -336,6 +349,19 @@ pub(super) async fn optimize_operation_playbook(
         "playbook.generator.system",
     )
     .await?;
+    // C3：active profile 可声明行业专属生成器引导语,覆盖领域中性 DEFAULT(去销售偏见)。
+    let active_profile =
+        agent::domain_profile::load_active_domain_profile(&state.db, &admin.current_workspace)
+            .await;
+    let system = match active_profile
+        .methodology_generator_preamble
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        Some(p) => p.to_string(),
+        None => system,
+    };
     let user = build_playbook_optimization_prompt(&existing, &payload.instruction);
     let generated = agent::generate_agent_json(
         &state,
