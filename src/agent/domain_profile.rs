@@ -141,6 +141,59 @@ pub fn default_business_formulas() -> Vec<BusinessFormula> {
     ]
 }
 
+/// 把 camelCase formula key 转成 policy 自检段用的 PascalCase 名（首字母大写）。
+/// `trust`→`Trust`、`conversionReadiness`→`ConversionReadiness`，与原 policy 散文逐字对齐。
+fn formula_key_pascal(key: &str) -> String {
+    let mut chars = key.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+        None => String::new(),
+    }
+}
+
+/// universal-domain-adaptation H15（3A-1c）：把经营公式渲染成 policy「关系经营公式
+/// （自检）」散文段的 markdown bullet 列表。**单一真相源**——policy prompt 不再内联
+/// 写死公式，改由 decision.rs 运行时注入本函数输出。空集回落 [`default_business_formulas`]，
+/// 故 DEFAULT_PROFILE 渲染出的 4 行与改造前 policy 散文逐字相同（PascalCase 名 +
+/// expression 逐字）。
+pub fn render_business_formulas_self_check(formulas: &[BusinessFormula]) -> String {
+    let seed;
+    let effective = if formulas.is_empty() {
+        seed = default_business_formulas();
+        &seed[..]
+    } else {
+        formulas
+    };
+    effective
+        .iter()
+        .map(|f| format!("- {} = {}", formula_key_pascal(&f.key), f.expression))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// universal-domain-adaptation H15（3A-1c）：把经营公式渲染成 reviewer prompt
+/// `formulaBreakdown` JSON 示例的内层行（`"key": "expression",` 逐行，最后一行无逗号）。
+/// 同一单一真相源；空集回落 [`default_business_formulas`]。
+pub fn render_business_formulas_json_example(formulas: &[BusinessFormula]) -> String {
+    let seed;
+    let effective = if formulas.is_empty() {
+        seed = default_business_formulas();
+        &seed[..]
+    } else {
+        formulas
+    };
+    let n = effective.len();
+    effective
+        .iter()
+        .enumerate()
+        .map(|(i, f)| {
+            let comma = if i + 1 < n { "," } else { "" };
+            format!("    \"{}\": \"{}\"{}", f.key, f.expression, comma)
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// 构造内置 DEFAULT_PROFILE。内容逐字等价当前源码写死的销售域行为。
 ///
 /// 注意：这里复刻的常量与以下源码点**必须保持同步**，Phase 1 切换消费点后由
@@ -610,6 +663,46 @@ mod tests {
             "RelationshipGain + ConversionProgress + EmotionalValue + ProductFit − PressureRisk − FactRisk"
         );
         assert_eq!(f[3].eval_score_key.as_deref(), Some("relationshipProgress"));
+    }
+
+    #[test]
+    fn render_self_check_default_matches_policy_prose_verbatim() {
+        // 3A-1c 单一真相源护栏:DEFAULT 渲染的自检段 == 原 policy「关系经营公式（自检）」
+        // 4 行逐字(PascalCase 名 + expression + Unicode 减号 −)。policy 剥离公式后由
+        // decision.rs 运行时注入本输出,此快照锁住等价。
+        let rendered = render_business_formulas_self_check(&default_business_formulas());
+        let expected = "- Trust = Credibility + Reliability + Intimacy − SelfOrientation\n\
+            - ConversionReadiness = Motivation × ProductFit × Timing × Trust ÷ Friction\n\
+            - EmotionalValue = Empathy + Validation + Specificity + AutonomySupport − Pressure\n\
+            - NextBestActionScore = RelationshipGain + ConversionProgress + EmotionalValue + ProductFit − PressureRisk − FactRisk";
+        assert_eq!(rendered, expected);
+        // 空集回落同源:空 slice 渲染 == seed 渲染。
+        assert_eq!(render_business_formulas_self_check(&[]), rendered);
+    }
+
+    #[test]
+    fn render_json_example_default_shape() {
+        // reviewer formulaBreakdown 示例:每行 `    "key": "expression"`,最后一行无逗号。
+        let rendered = render_business_formulas_json_example(&default_business_formulas());
+        let lines: Vec<&str> = rendered.lines().collect();
+        assert_eq!(lines.len(), 4);
+        assert_eq!(
+            lines[0],
+            "    \"trust\": \"Credibility + Reliability + Intimacy − SelfOrientation\","
+        );
+        // 末行无逗号。
+        assert!(lines[3].ends_with('"'));
+        assert!(lines[3].starts_with("    \"nextBestActionScore\":"));
+        // 空集回落同源。
+        assert_eq!(render_business_formulas_json_example(&[]), rendered);
+    }
+
+    #[test]
+    fn formula_key_pascal_capitalizes_first() {
+        assert_eq!(formula_key_pascal("trust"), "Trust");
+        assert_eq!(formula_key_pascal("conversionReadiness"), "ConversionReadiness");
+        assert_eq!(formula_key_pascal("nextBestActionScore"), "NextBestActionScore");
+        assert_eq!(formula_key_pascal(""), "");
     }
 
     // ── 1G-c：DomainProfileCache TTL / 命中 / 回落 / 失效（无 Docker 纯内存）──
