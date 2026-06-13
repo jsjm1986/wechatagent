@@ -578,8 +578,8 @@ casual 模式的"收紧压力门"会与"热烈推进"打架（非误杀，是模
 
 ### Phase 3：引导层（核心想法，价值兑现）+ H15 + 清 C3
 - AI 对话 + 文档 → 生成候选配置 → 审核 UI → publish。
-- **H15**：经营公式（ConversionReadiness/ProductFit）+ reviewer rubric 锚点从 profile 注入；`/evaluations` 的 formulas 数组随 profile 动态化。
-- **清 C3**：`PLAYBOOK_METHODOLOGY_SYSTEM` 引导层 system prompt 去"顾问式销售"偏见（违反 §7 护栏）。
+- **H15** ✅**已完成（3A-1，拆 a/b/c）**：经营公式从 profile 注入。`DomainProfile.business_formulas: Vec<BusinessFormula{key,expression,display_name,eval_score_key}>`（3A-1a，纯 additive + seed 四公式逐字）；`/evaluations` 的 formulas 数组 + `score_key_for` 映射走 profile（3A-1b，会跨行业坏的真消费方）；公式散文**单一真相源**——建 `render_business_formulas_self_check`/`_json_example` 渲染函数（3A-1c-1），reviewer formulaBreakdown 走渲染（3A-1c-2），policy 内联公式段退役改运行时 `strip_legacy_formula_self_check_section`+`build_policy_formula_section` 自愈注入（3A-1c-3a/3b，**不 bump PROMPT_PACK_VERSION、不清运营编辑**）。playbook 中文公式段归 H12 `methodology_override` 已覆盖。护栏从「字节等价」放宽为「公式内容快照等价 + 全基线绿」。
+- **清 C3** ✅**已完成（3A-2）**：`PLAYBOOK_METHODOLOGY_SYSTEM` 改写为**领域中性**（删「消费心理学/顾问式销售/异议/顾问朋友/机械营销」销售偏见词，加「不预设行业、行业语义来自运营输入」第 7 条）；`DomainProfile.methodology_generator_preamble: Option<String>` 让特定行业声明生成偏好，generate/optimize 两端点 None 回落中性 DEFAULT。C3 是引导层生成器（不在运行时决策路径），去偏见不影响现有销售运营行为。
 - 前端向导。
 - 端到端验证：用**两个非销售行业**跑通——(a) 一个有转化目标的行业（如教培）；(b) **情感陪伴**（"像男朋友一样"指令 → intimate_companion 模式 → 主动情绪价值触达 → 不被 PressureRisk 压制 → 优质回复能拿到正反馈进自学习）。
 
