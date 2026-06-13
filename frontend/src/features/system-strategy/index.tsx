@@ -1069,7 +1069,7 @@ function DomainProfilePanel({ busy }: { busy: boolean }) {
               className={styles.textarea}
               value={gen_business_description}
               onChange={(e) => setGen_business_description(e.target.value)}
-              placeholder={"我们是一家情感陪伴服务工作室，主要服务有孤独感、需要情感支持的成年人（25-45岁）。\n客户痛点：孤独、缺乏倾诉对象、生活压力大。\n运营目标：建立信任、持续陪伴、提供情绪价值。\n对话风格：温暖、真诚、平等、不居高临下。"}
+              placeholder={"我是做K12辅导的，主要接触的是家长。\n说实话，这些家长比孩子更焦虑。他们不是来「了解课程」的，是来「找一个人帮他们解决一个问题」的。\n孩子成绩上不去，在家里说话都没底气。找到我的时候，其实是在找一个出口。\n我最怕说错话是：承诺「一个月提多少分」——家长一听就知道是假的，反而更不信任。\n真正打动家长的，是我愿意听他把孩子的具体情况说完，然后给一个真实、可落地的判断。"}
               rows={8}
             />
           </label>
