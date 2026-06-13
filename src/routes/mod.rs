@@ -35,7 +35,7 @@ mod domains;
 mod evaluations;
 mod events;
 mod evolution;
-mod guide_profile;
+pub mod guide_profile;
 mod guides;
 mod health;
 pub(crate) mod knowledge;
@@ -145,7 +145,7 @@ use evolution::{
     rollback_evolution_proposal,
 };
 use guides::{apply_user_operation_guide, preview_user_operation_guide};
-use guide_profile::generate_domain_profile_candidate;
+use guide_profile::{generate_domain_profile_candidate, GenerateProfileRequest};
 use health::health;
 use llm_providers::{
     activate_provider, create_provider, delete_provider, list_providers, set_vision_active,

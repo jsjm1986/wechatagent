@@ -31,14 +31,14 @@ use super::AppState;
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct GenerateProfileRequest {
+pub struct GenerateProfileRequest {
     /// 运营对业务的自然语言描述（行业/产品/客户/经营目标/对话风格等）。
-    business_description: String,
+    pub business_description: String,
     /// 目标 profile slug（如 `dental-implant-private`）；落候选时作 `profile_id`。
-    profile_id: String,
+    pub profile_id: String,
     /// 可选展示名；缺省用 profile_id。
     #[serde(default)]
-    display_name: Option<String>,
+    pub display_name: Option<String>,
 }
 
 /// 拉本 workspace 最近若干条已导入知识切片的标题，作为生成器的「行业文档线索」上下文。
@@ -139,7 +139,7 @@ fn build_profile_generation_prompt(
     )
 }
 
-pub(super) async fn generate_domain_profile_candidate(
+pub async fn generate_domain_profile_candidate(
     State(state): State<AppState>,
     Extension(admin): Extension<AuthenticatedAdmin>,
     Json(payload): Json<GenerateProfileRequest>,

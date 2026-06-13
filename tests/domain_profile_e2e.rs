@@ -31,15 +31,21 @@
 
 mod common;
 
+use futures::TryStreamExt;
 use std::sync::Arc;
 use mongodb::bson::{doc, oid::ObjectId, DateTime, Document};
 use mongodb::options::FindOptions;
 use serde_json::Value;
+use axum::extract::{Extension, Json, State};
 use wechatagent::auth::AuthenticatedAdmin;
 use wechatagent::db::Database;
 use wechatagent::llm::LlmClient;
-use wechatagent::models::DomainProfile;
+use wechatagent::models::{
+    BusinessFormula, ChunkRole, CommitmentMarkers, CoverageDimension, DomainProfile, OperationMode,
+    OutcomePolarity, ProfileDimension,
+};
 use wechatagent::routes::guide_profile::GenerateProfileRequest;
+use wechatagent::routes::guide_profile::generate_domain_profile_candidate;
 use wechatagent::APP_STARTED_AT;
 
 /// 构造测试 admin auth context。
@@ -60,27 +66,36 @@ async fn db_create_profile(
     description: &str,
     seeded_by: &str,
 ) -> ObjectId {
-    let now = DateTime::now();
-    let doc = doc! {
-        "profile_id": profile_id,
-        "workspace_id": workspace_id,
-        "display_name": display_name,
-        "description": description,
-        "profile_dimensions": [],
-        "prompt_fragment": null,
-        "commitment_markers": { "product_effect": [], "tone_only": [] },
-        "coverage_dimensions": [],
-        "conversation_modes": [],
-        "business_formulas": [],
-        "version": 1,
-        "current_version": false,
-        "previous_version": null,
-        "is_active": false,
-        "seeded_by": seeded_by,
-        "created_at": now,
-        "updated_at": now,
+    let profile = DomainProfile {
+        id: None,
+        profile_id: profile_id.to_string(),
+        workspace_id: workspace_id.to_string(),
+        display_name: display_name.to_string(),
+        description: description.to_string(),
+        profile_dimensions: vec![],
+        domain_schema_id: None,
+        prompt_fragment: None,
+        soul_override: None,
+        methodology_override: None,
+        commitment_markers: CommitmentMarkers { product_effect: vec![], tone_only: vec![] },
+        coverage_dimensions: vec![],
+        stagnation_dimension: None,
+        conversation_modes: vec![],
+        operation_mode: OperationMode::default(),
+        grounding_gate_bypass_without_claim: false,
+        chunk_roles: vec![],
+        outcome_polarity: OutcomePolarity::default(),
+        methodology_generator_preamble: None,
+        business_formulas: vec![],
+        current_version: false,
+        previous_version: None,
+        is_active: false,
+        seeded_by: Some(seeded_by.to_string()),
+        created_at: DateTime::now(),
+        updated_at: DateTime::now(),
+        version: 1,
     };
-    let result = db.domain_profiles().insert_one(&doc, None).await.expect("insert");
+    let result = db.domain_profiles().insert_one(&profile, None).await.expect("insert");
     result.inserted_id.as_object_id().expect("ObjectId")
 }
 
@@ -365,14 +380,14 @@ async fn e2e_generate_candidate_is_draft() {
         common::rebuild_app_state_with_real_llm(&app, Arc::new(llm), "http://test-mcp.invalid".to_string());
 
     let payload = GenerateProfileRequest {
-        business_description: concat!(
+        business_description: String::from(concat!(
             "我的客户是那种……怎么说呢，生活中缺少真正能说话的人。不是不开心，是那种安静的空。\n",
             "他们可能刚换了一座城市，或者刚结束一段关系，或者就是一个人久了。\n",
             "来找我的人，其实不需要我教他们什么，他们只是需要一个「被听见」的地方。\n",
             "我不太喜欢说那种「我理解你」的套话，反而是那种平等、真诚、不评判的态度，客户最买单。\n",
             "我最怕说错话是：给人虚假的希望，比如「你一定能走出来」这种。\n",
             "对这些人来说，被认真倾听一次，比任何建议都值钱。"
-        ),
+        )),
         profile_id: "emotional-companion-care".to_string(),
         display_name: Some("情感陪伴 · 深度关怀".to_string()),
     };
@@ -442,14 +457,14 @@ async fn e2e_generate_second_industry_profile() {
         common::rebuild_app_state_with_real_llm(&app, Arc::new(llm), "http://test-mcp.invalid".to_string());
 
     let payload = GenerateProfileRequest {
-        business_description: concat!(
+        business_description: String::from(concat!(
             "我是做K12辅导的，主要接触的是家长。\n",
             "说实话，这些家长比孩子更焦虑。他们不是来「了解课程」的，是来「找一个人帮他们解决一个问题」的。\n",
             "孩子成绩上不去，在家里说话都没底气。找到我的时候，其实是在找一个出口。\n",
             "我最怕说错话是：承诺「一个月提多少分」——家长一听就知道是假的，反而更不信任。\n",
             "真正打动家长的，是我愿意听他把孩子的具体情况说完，然后给一个真实、可落地的判断。\n",
             "孩子成绩不好，原因可能有一百种。我需要知道是哪种，才能帮到他。"
-        ),
+        )),
         profile_id: "edu-k12-tuition".to_string(),
         display_name: Some("K12 教育 · 课外辅导".to_string()),
     };
