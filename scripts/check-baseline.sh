@@ -64,12 +64,19 @@ if [ "$LIB_PASSED" -lt "$LIB_BASELINE" ]; then
 fi
 
 echo ""
-echo "[baseline] step 2/2: cargo test 4 PBT files ..."
-cargo test \
-    --test state_transition_pbt \
-    --test memory_card_invariants \
-    --test wiki_chunk_revision_pbt \
-    --test llm_retry_jitter 2>&1 | tee "$PBT_LOG" || true
+echo "[baseline] step 2/2: cargo test 4 PBT files (run individually to isolate failures) ..."
+PBT_PASSED=0
+PBT_FAILED=0
+PBT_LOG=$(mktemp)
+for test_file in state_transition_pbt memory_card_invariants wiki_chunk_revision_pbt llm_retry_jitter; do
+    echo ""
+    echo "[baseline] running --test $test_file ..."
+    if cargo test --test "$test_file" 2>&1 | tee -a "$PBT_LOG" | tail -3; then
+        :
+    else
+        echo "[baseline] WARNING: $test_file had non-zero exit, continuing to next..."
+    fi
+done
 PBT_PASSED=$(parse_passed "$PBT_LOG")
 PBT_FAILED=$(parse_failed "$PBT_LOG")
 echo "[baseline] pbt summary: passed=$PBT_PASSED failed=$PBT_FAILED (need >= $PBT_BASELINE passed, 0 failed)"
