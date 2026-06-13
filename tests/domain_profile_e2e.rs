@@ -44,8 +44,7 @@ use wechatagent::models::{
     BusinessFormula, ChunkRole, CommitmentMarkers, CoverageDimension, DomainProfile, OperationMode,
     OutcomePolarity, ProfileDimension,
 };
-use wechatagent::routes::guide_profile::GenerateProfileRequest;
-use wechatagent::routes::guide_profile::generate_domain_profile_candidate;
+use wechatagent::routes::guide_profile::{generate_domain_profile_candidate, GenerateProfileRequest};
 use wechatagent::APP_STARTED_AT;
 
 /// 构造测试 admin auth context。
