@@ -233,6 +233,13 @@ pub(crate) async fn review_decision(
     // 这里只暴露候选回复事实面：是否回复、回复文本、知识引用、状态/阶段、tool-loop
     // 协议字段；其余字段（含 reasoning）不进 reviewer 上下文。
     let decision_view_text = build_reviewer_decision_view(decision);
+    // H15（3A-1c-2）：reviewer formulaBreakdown 示例由 active profile 的经营公式渲染
+    // （单一真相源），替代写死的三行。DEFAULT_PROFILE seed 四公式 → 渲染出四行，与原
+    // 写死三行内容同源（原示例漏列 nextBestActionScore，本渲染补全；公式内容等价）。
+    let formula_breakdown_lines =
+        crate::agent::domain_profile::render_business_formulas_json_example(
+            &active_profile.business_formulas,
+        );
     let user = format!(
         r#"请评审候选回复。
 Review 模式: {}
@@ -249,9 +256,7 @@ Review 模式: {}
     "factRisk": 1
   }},
   "formulaBreakdown": {{
-    "trust": "Credibility + Reliability + Intimacy - SelfOrientation",
-    "conversionReadiness": "Motivation × ProductFit × Timing × Trust ÷ Friction",
-    "emotionalValue": "Empathy + Validation + Specificity + AutonomySupport - Pressure"
+{}
   }},
   "claimAnalysis": {{
     "hasProductClaim": false,
@@ -314,6 +319,7 @@ Review 模式: {}
 知识路由:
 {}"#,
         review_mode,
+        formula_breakdown_lines,
         crate::agent::prompt_isolation::isolate_untrusted(&inbound.content),
         decision.reply_text,
         decision_view_text,
