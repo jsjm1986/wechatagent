@@ -171,6 +171,48 @@ pub fn render_business_formulas_self_check(formulas: &[BusinessFormula]) -> Stri
         .join("\n")
 }
 
+/// universal-domain-adaptation H15（3A-1c-3）：policy prompt 里「关系经营公式（自检）」
+/// 段的固定标题。运行时归一/注入都以它为锚。
+pub const POLICY_FORMULA_SECTION_HEADING: &str = "## 关系经营公式（自检）";
+
+/// 运行时自愈归一：从已加载的 policy 文本里剥离任何遗留的「关系经营公式（自检）」段
+/// （`## 关系经营公式（自检）` 标题起，到下一个 `## ` 二级标题前为止）。对旧库
+/// （seed 时内联写死公式段）→ 剥离；对新库（公式段已不在 seed 里）→ 原样返回。
+/// 幂等：剥离后再调一次无变化。返回 (剥离后的文本, 是否剥离过)。
+///
+/// 这是「单一真相源 + 不 bump PROMPT_PACK_VERSION、不清运营编辑」方案的核心——
+/// 公式块改由 [`render_business_formulas_self_check`] 运行时注入，本函数确保旧库不会
+/// 出现「内联公式 + 注入公式」双份。
+pub fn strip_legacy_formula_self_check_section(policy: &str) -> (String, bool) {
+    let Some(start) = policy.find(POLICY_FORMULA_SECTION_HEADING) else {
+        return (policy.to_string(), false);
+    };
+    // 从标题之后找下一个二级标题 `\n## `。
+    let after = &policy[start..];
+    let rest_offset = after
+        .match_indices("\n## ")
+        .find(|(i, _)| *i > 0)
+        .map(|(i, _)| start + i + 1) // +1 跳过该换行，保留下一段的 `## `
+        .unwrap_or(policy.len());
+    let mut out = String::with_capacity(policy.len());
+    out.push_str(policy[..start].trim_end_matches('\n'));
+    if rest_offset < policy.len() {
+        out.push_str("\n\n");
+        out.push_str(&policy[rest_offset..]);
+    }
+    (out, true)
+}
+
+/// universal-domain-adaptation H15（3A-1c-3）：构造运行时注入 policy 的「关系经营
+/// 公式（自检）」整段（标题 + 渲染的公式 bullet 列表）。空集回落 DEFAULT 四公式，
+/// 故 DEFAULT_PROFILE 注入出的整段与旧库内联段逐字相同。
+pub fn build_policy_formula_section(formulas: &[BusinessFormula]) -> String {
+    format!(
+        "{POLICY_FORMULA_SECTION_HEADING}\n\n{}",
+        render_business_formulas_self_check(formulas)
+    )
+}
+
 /// universal-domain-adaptation H15（3A-1c）：把经营公式渲染成 reviewer prompt
 /// `formulaBreakdown` JSON 示例的内层行（`"key": "expression",` 逐行，最后一行无逗号）。
 /// 同一单一真相源；空集回落 [`default_business_formulas`]。
@@ -703,6 +745,48 @@ mod tests {
         assert_eq!(formula_key_pascal("conversionReadiness"), "ConversionReadiness");
         assert_eq!(formula_key_pascal("nextBestActionScore"), "NextBestActionScore");
         assert_eq!(formula_key_pascal(""), "");
+    }
+
+    #[test]
+    fn strip_legacy_formula_section_removes_inline_block() {
+        // 模拟旧库 policy:公式段夹在两段之间。
+        let policy = "## conversationMode\n\n- 必须严格选自 [...].\n\n## 关系经营公式（自检）\n\n\
+            - Trust = Credibility + Reliability + Intimacy − SelfOrientation\n\
+            - ConversionReadiness = Motivation × ProductFit × Timing × Trust ÷ Friction\n\n\
+            ## 表达红线\n\n- 每轮开口前对照最近对话。";
+        let (stripped, did) = strip_legacy_formula_self_check_section(policy);
+        assert!(did);
+        assert!(!stripped.contains("关系经营公式"));
+        assert!(!stripped.contains("Trust = Credibility"));
+        // 前后两段保留。
+        assert!(stripped.contains("## conversationMode"));
+        assert!(stripped.contains("## 表达红线"));
+        assert!(stripped.contains("每轮开口前"));
+        // 幂等:再剥一次无变化、did=false。
+        let (again, did2) = strip_legacy_formula_self_check_section(&stripped);
+        assert!(!did2);
+        assert_eq!(again, stripped);
+    }
+
+    #[test]
+    fn strip_legacy_formula_section_noop_when_absent() {
+        let policy = "## conversationMode\n\n- 选自 [...].\n\n## 表达红线\n\n- 每轮开口。";
+        let (out, did) = strip_legacy_formula_self_check_section(policy);
+        assert!(!did);
+        assert_eq!(out, policy);
+    }
+
+    #[test]
+    fn strip_then_inject_default_roundtrips_to_original_section() {
+        // 单一真相源往返:旧库内联段 == 剥离后 + DEFAULT 注入段。锁「不 bump 版本、
+        // 运行时自愈」方案的等价护栏。
+        let injected = build_policy_formula_section(&default_business_formulas());
+        let expected_section = "## 关系经营公式（自检）\n\n\
+            - Trust = Credibility + Reliability + Intimacy − SelfOrientation\n\
+            - ConversionReadiness = Motivation × ProductFit × Timing × Trust ÷ Friction\n\
+            - EmotionalValue = Empathy + Validation + Specificity + AutonomySupport − Pressure\n\
+            - NextBestActionScore = RelationshipGain + ConversionProgress + EmotionalValue + ProductFit − PressureRisk − FactRisk";
+        assert_eq!(injected, expected_section);
     }
 
     // ── 1G-c：DomainProfileCache TTL / 命中 / 回落 / 失效（无 Docker 纯内存）──
