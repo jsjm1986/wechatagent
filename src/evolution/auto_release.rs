@@ -79,6 +79,24 @@ pub async fn auto_release_eligible_thresholds(state: &AppState) -> Result<usize,
     let hit_rates = compute_window_gate_hit_rates(state, &workspace_id, &account_id, window_start)
         .await?;
 
+    // 2.5-main-4：负反应强制门。仅当开关开启时算一次当前窗口的**绝对**负反应率
+    // （per-tick 复用给所有候选，与 hit_rates 同窗口 [window_start, now) 同口径、
+    // 同极性源——复用 post_release 的 compute_negative_reaction_rate）。门关时跳过
+    // 计算，零额外开销、字节等价。
+    let neg_gate_enabled = state.config.evolution_auto_release_negative_reaction_gate_enabled;
+    let negative_reaction_rate = if neg_gate_enabled {
+        super::post_release::compute_negative_reaction_rate(
+            state,
+            &workspace_id,
+            &account_id,
+            window_start,
+            now,
+        )
+        .await?
+    } else {
+        None
+    };
+
     // 3. 顺序处理候选；命中 cap 后跳过余下。
     let mut released = 0_usize;
     for proposal in proposals {
@@ -116,6 +134,17 @@ pub async fn auto_release_eligible_thresholds(state: &AppState) -> Result<usize,
         let observed = hit_rates.get(gate_key).copied();
         let decision = decide_auto_release(observed, lower, upper);
 
+        // 2.5-main-4：放行判定为 true 时，再过负反应强制门——命中则强制改判 SKIP，
+        // 拒绝自动放行、退回 admin 显式判断（非回滚，不触碰 Req 9.7）。门关时 forced_skip
+        // 恒为 false，final_decision == decision，字节等价。
+        let forced_skip = decision
+            && decide_negative_reaction_block(
+                neg_gate_enabled,
+                negative_reaction_rate,
+                state.config.evolution_auto_release_max_negative_reaction_rate,
+            );
+        let final_decision = decision && !forced_skip;
+
         // 决策事件先写——无论 release 成功失败都留审计。
         let _ = write_auto_release_decision_event(
             state,
@@ -126,11 +155,13 @@ pub async fn auto_release_eligible_thresholds(state: &AppState) -> Result<usize,
             observed,
             lower,
             upper,
-            decision,
+            final_decision,
+            forced_skip,
+            negative_reaction_rate,
         )
         .await;
 
-        if !decision {
+        if !final_decision {
             continue;
         }
 
@@ -158,6 +189,32 @@ pub fn decide_auto_release(observed: Option<f64>, target_lower: f64, target_uppe
     match observed {
         None => false,
         Some(rate) => rate < target_lower || rate > target_upper,
+    }
+}
+
+/// universal-domain-adaptation 2.5-main-4：客户负反应强制门的纯决策核心。
+///
+/// 在 [`decide_auto_release`] 已判定放行（true）之后追加这道闸：返回 `true` 表示
+/// **强制 SKIP**（拒绝自动放行、退回 admin），`false` 表示放行不受本门干预。
+///
+/// - `enabled=false` → 永远 `false`（字节等价：门关时 auto_release 行为与 main-4 前一致）。
+/// - `observed=None`（窗口内无已分类客户反应）→ `false`：无信号不强制 skip（保守，与
+///   [`decide_auto_release`] 的「无信号不盲动」一致）。
+/// - `observed > max_rate` → `true`：当前绝对负反应率过高，拒绝自动放行阈值放松。
+///
+/// 注意阈值是**绝对值**（当前窗口负反应率），不是 pre-3 的前/后窗口升幅 delta ——
+/// auto_release 在 release 前决策，没有「后窗口」可比。
+pub fn decide_negative_reaction_block(
+    enabled: bool,
+    observed: Option<f64>,
+    max_rate: f64,
+) -> bool {
+    if !enabled {
+        return false;
+    }
+    match observed {
+        None => false,
+        Some(rate) => rate > max_rate,
     }
 }
 
@@ -234,6 +291,8 @@ async fn write_auto_release_decision_event(
     target_lower: f64,
     target_upper: f64,
     decision: bool,
+    forced_skip: bool,
+    negative_reaction_rate: Option<f64>,
 ) -> Result<(), EvolutionError> {
     let mut details = doc! {
         "proposal_id": proposal_id,
@@ -245,6 +304,14 @@ async fn write_auto_release_decision_event(
     if let Some(rate) = observed {
         details.insert("hit_rate_observed", rate);
     }
+    // 2.5-main-4：负反应强制门命中时落审计标记 + 观测值，供 admin 区分「命中率回正的
+    // 自然 skip」与「负反应过高的强制 skip」。门关或未命中时不写这两个字段（天然空缺）。
+    if forced_skip {
+        details.insert("negative_reaction_forced_skip", true);
+    }
+    if let Some(rate) = negative_reaction_rate {
+        details.insert("negative_reaction_rate_observed", rate);
+    }
     let event = crate::models::AgentEvent {
         id: None,
         workspace_id: workspace_id.to_string(),
@@ -253,11 +320,19 @@ async fn write_auto_release_decision_event(
         kind: "evolution_auto_release_decision".to_string(),
         status: if decision { "release" } else { "skip" }.to_string(),
         summary: format!(
-            "auto_release decision for {gate_key}: {} (observed={:?}, band=[{:.3},{:.3}])",
+            "auto_release decision for {gate_key}: {} (observed={:?}, band=[{:.3},{:.3}]){}",
             if decision { "RELEASE" } else { "SKIP" },
             observed,
             target_lower,
-            target_upper
+            target_upper,
+            if forced_skip {
+                format!(
+                    " [negative_reaction_forced_skip rate={:?}]",
+                    negative_reaction_rate
+                )
+            } else {
+                String::new()
+            }
         ),
         details: Some(details),
         created_at: DateTime::now(),
@@ -314,5 +389,37 @@ mod tests {
     fn auto_release_event_details_serializes_count() {
         let d = auto_release_event_details(3);
         assert_eq!(d.get_i32("auto_released_count").unwrap(), 3);
+    }
+
+    // ── 2.5-main-4：负反应强制门纯函数测 ──
+
+    #[test]
+    fn negative_reaction_block_disabled_never_blocks() {
+        // 门关：任何负反应率（哪怕 1.0）都不强制 skip——字节等价于 main-4 前。
+        assert!(!decide_negative_reaction_block(false, Some(1.0), 0.30));
+        assert!(!decide_negative_reaction_block(false, Some(0.0), 0.30));
+        assert!(!decide_negative_reaction_block(false, None, 0.30));
+    }
+
+    #[test]
+    fn negative_reaction_block_above_threshold_blocks() {
+        // 门开 + 当前绝对负反应率高于阈值 → 强制 skip。
+        assert!(decide_negative_reaction_block(true, Some(0.50), 0.30));
+        assert!(decide_negative_reaction_block(true, Some(0.31), 0.30));
+    }
+
+    #[test]
+    fn negative_reaction_block_at_or_below_threshold_allows() {
+        // 门开 + 负反应率正常（≤ 阈值）→ 不干预放行。边界相等不算超阈。
+        assert!(!decide_negative_reaction_block(true, Some(0.30), 0.30));
+        assert!(!decide_negative_reaction_block(true, Some(0.10), 0.30));
+        assert!(!decide_negative_reaction_block(true, Some(0.0), 0.30));
+    }
+
+    #[test]
+    fn negative_reaction_block_no_signal_allows() {
+        // 门开但窗口内无已分类客户反应（None）→ 不强制 skip：无信号不盲动，
+        // 与 decide_auto_release 的保守口径一致。
+        assert!(!decide_negative_reaction_block(true, None, 0.30));
     }
 }

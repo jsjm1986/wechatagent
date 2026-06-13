@@ -128,6 +128,8 @@ mod tests {
             evolution_auto_release_enabled: false,
             evolution_auto_release_window_hours: 336,
             evolution_auto_release_per_tick_cap: 1,
+            evolution_auto_release_negative_reaction_gate_enabled: false,
+            evolution_auto_release_max_negative_reaction_rate: 0.30,
             knowledge_digest_enabled: false,
             knowledge_digest_run_hour: 9,
             knowledge_digest_run_token_budget: 24000,

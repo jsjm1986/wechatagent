@@ -573,6 +573,9 @@ casual 模式的"收紧压力门"会与"热烈推进"打架（非误杀，是模
 - H17：memoryCard 结构化字段集 + memoryCandidate type 集 + intent_trajectory 维度从 profile 读（情感域可声明情绪史/纪念日槽）。
 - **强护栏**：三条回路（dynamic_confidence 召回排序 / negative_example 入队 / escalation 卡死）各自加等价性测试；DEFAULT 下知识召回排序回归基线逐条不变；先补一个"业务结果兜底指标"避免静默污染无告警。
 
+> **进度（2026-06-13 更新）**：Phase 2.5 设计硬交付**已全部落地**——三回路等价测（pre-2 / main-1~3）+ DEFAULT 逐字等价 + 业务结果兜底**观测**指标 `negative_reaction_rate`（pre-3，写 post_release 事件 details 供 admin 察觉错配，仅观测不判决）。
+> **main-4（additive 增强，非设计硬交付）已落地**：在 C5 `auto_release` 在线决策路径加**默认关闭**的「客户负反应强制门」（`evolution_auto_release_negative_reaction_gate_enabled` / `evolution_auto_release_max_negative_reaction_rate`，默认 0.30 绝对阈值）。开启后 auto_release 判定放行**之后、实际 release 之前**，若回看窗口当前绝对负反应率超阈 → 强制 SKIP、退回 admin（拒绝自动放行，**非回滚**，不触碰 Req 9.7）。复用 pre-3 的 `compute_negative_reaction_rate`（同窗口、同极性源）。门关时字节等价。原计划落点 `significance`/shadow 被 pre-3 证伪（`ShadowReplay` 无 `outcome_status`），故改落 `auto_release`。
+
 ### Phase 3：引导层（核心想法，价值兑现）+ H15 + 清 C3
 - AI 对话 + 文档 → 生成候选配置 → 审核 UI → publish。
 - **H15**：经营公式（ConversionReadiness/ProductFit）+ reviewer rubric 锚点从 profile 注入；`/evaluations` 的 formulas 数组随 profile 动态化。
