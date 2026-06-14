@@ -31,6 +31,14 @@ use super::AppState;
 
 /// 递归地将 camelCase 字符串转换为 snake_case。
 /// `displayName` → `display_name`, `profileDimensions` → `profile_dimensions`
+///
+/// **已知限制**:本实现仅在「当前字符大写 ∧ 前一字符是字母/数字 ∧ 后一字符是小写字母」
+/// 时插下划线,因此对**末尾连续大写**(如 `v2API` → `v2api` 而非 `v2_api`、
+/// `profileID` → `profileid` 而非 `profile_id`)不插下划线。连续大写后跟小写的场景
+/// (如 `HTTPServer` → `http_server`)能正确处理。当前仅用于归一化 LLM 输出的典型
+/// camelCase key(`displayName` / `profileDimensions` / `profileId` 等),不触发此限制。
+/// 若未来 LLM 输出末尾缩略词 key,需替换为支持末尾连续大写的实现(例如引入 `heck`)。
+/// 已知限制由 `tests::to_snake_case_known_limitation_trailing_uppercase` 锁定。
 fn to_snake_case(s: &str) -> String {
     let mut result = String::with_capacity(s.len());
     for (i, c) in s.chars().enumerate() {
@@ -294,4 +302,64 @@ async fn next_candidate_version(
         0
     };
     Ok(max + 1)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{normalize_json_keys, to_snake_case};
+    use serde_json::json;
+
+    /// 生产输入的正确性基线:LLM 实际输出的典型 camelCase key 必须正确归一化。
+    /// 若此测失败,说明 to_snake_case 退化,会直接污染 domain_profile 候选落库。
+    #[test]
+    fn to_snake_case_typical_camelcase() {
+        assert_eq!(to_snake_case("displayName"), "display_name");
+        assert_eq!(to_snake_case("profileDimensions"), "profile_dimensions");
+        assert_eq!(to_snake_case("profileId"), "profile_id");
+        assert_eq!(to_snake_case("commitmentMarkers"), "commitment_markers");
+        assert_eq!(to_snake_case("coverageDimensions"), "coverage_dimensions");
+        assert_eq!(to_snake_case("businessFormulas"), "business_formulas");
+    }
+
+    /// 连续大写后跟小写:当前实现能正确识别缩略词边界。
+    /// 锁定此正向行为,防止回归。
+    #[test]
+    fn to_snake_case_consecutive_uppercase_followed_by_lower() {
+        // HTTPServer → http_server(S 后跟 e,在 S 前插下划线)。
+        assert_eq!(to_snake_case("HTTPServer"), "http_server");
+        // APIKey → api_key(K 后跟 e,在 K 前插下划线)。
+        assert_eq!(to_snake_case("APIKey"), "api_key");
+    }
+
+    /// 已知限制锁定:末尾连续大写不插下划线(后面没有小写字母触发分隔)。
+    /// 这是 to_snake_case 当前实现的**预期行为**,不是 bug —— 改实现时必须同步
+    /// 更新本断言。
+    #[test]
+    fn to_snake_case_known_limitation_trailing_uppercase() {
+        // v2API → v2api(末尾 API 后无小写,不分隔)。
+        assert_eq!(to_snake_case("v2API"), "v2api");
+        // profileID → profileid(末尾 ID 后无小写,被压平)。
+        assert_eq!(to_snake_case("profileID"), "profileid");
+    }
+
+    /// normalize_json_keys 必须递归处理嵌套 object 与 array,把所有层级的
+    /// camelCase key 归一化为 snake_case。
+    #[test]
+    fn normalize_json_keys_recurses_object_and_array() {
+        let input = json!({
+            "displayName": "教培",
+            "profileDimensions": [
+                { "kind": "stage", "displayName": "学段" }
+            ],
+            "nested": { "coverageDimensions": [] }
+        });
+        let out = normalize_json_keys(input);
+        assert_eq!(out["display_name"], json!("教培"));
+        assert_eq!(out["profile_dimensions"][0]["kind"], json!("stage"));
+        assert_eq!(out["profile_dimensions"][0]["display_name"], json!("学段"));
+        assert!(out["nested"]["coverage_dimensions"].is_array());
+        // 原始 camelCase key 不应残留。
+        assert!(out.get("displayName").is_none());
+        assert!(out["nested"].get("coverageDimensions").is_none());
+    }
 }
