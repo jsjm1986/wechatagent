@@ -512,7 +512,7 @@ pub struct FinalizeOutcome {
 pub fn finalize_review_for_send(
     review: DecisionReviewResult,
     decision: &mut AgentDecision,
-    _runtime: &UserRuntimeParameters,
+    runtime: &UserRuntimeParameters,
     _contact: &crate::models::Contact,
     knowledge_chunks: &[crate::models::OperationKnowledgeChunk],
     promote_risks: Vec<String>,
@@ -550,6 +550,39 @@ pub fn finalize_review_for_send(
             status: GatewayStatusFinal::BlockedByRequiredField,
             pending_events,
         };
+    }
+
+    // R1.5 长度违规（关键轮推理字段偏短）→ single-shot revision，**不**硬 block。
+    //
+    // spec R1.5 只要求 `review.approved = false`；它不是结构性协议违规（字段已输出、
+    // 只是 < 20 字 / 回复理由 < 30 字），靠一次改写即可补全。历史代码把它和
+    // missing_required_field 一起塞进 blocked_by_required_field 硬门 + 直接 return，
+    // 连 revision 都不给——t15 跌单弧 6 轮因此全程哑火（0 轮 approved < 下限 2）。
+    //
+    // 这里改为：当 promote_risks 只含 insufficient_detail（结构性硬违规已在上方
+    // return）、reply-agent 本就要回复（should_reply）、且**硬安全闸通过**时，标记
+    // needs_revision + 给出"补全推理痕迹"方向，让 finalize 末尾把 approved 矫正回
+    // true → 进 decide_revision 的 Proceed 通道改写一次。
+    //
+    // 硬闸守卫（关键安全不变量）：仅当 classify_dual_gate 非 HardGateFailure 时才降级。
+    // 若该轮同时撞 hallucination / grounding 硬闸，route_dual_gate 已写 approved=false
+    // 且不设 needs_revision；此处绝不能把 needs_revision 抬成 true，否则 finalize 末尾
+    // 756 行分支会把硬闸失败的危险回复矫正成 approved 发出去。R5.4 verified-claim 硬门
+    // / should_hold / budget 各自在下方 return，本降级既不绕过它们、也不改 should_reply。
+    let hard_gate_failed = matches!(
+        classify_dual_gate(&review, runtime),
+        DualGateClassification::HardGateFailure { .. }
+    );
+    if has_insufficient_detail_only(&promote_risks) && decision.should_reply && !hard_gate_failed {
+        review.needs_revision = true;
+        if review.revision_direction.trim().is_empty() {
+            review.revision_direction =
+                "本轮被判定为关键变化轮，但部分推理字段（用户理解 / 关系判断 / 运营目标 / \
+                 知识需求理由 / 记忆更新理由 / 自我批判 / 风险自检，或回复理由）过短，缺乏可审计的\
+                 因果链。请在保持回复正文自然口语的同时，把这些自治协议字段补写充分（每个 ≥ 20 字\
+                 的实质内容、回复理由 ≥ 30 字含足量中文），不要用 \"unchanged\" 占位。"
+                    .to_string();
+        }
     }
 
     // R3.7：预算超额 + needs_review=true → blocked_by_budget
@@ -779,18 +812,43 @@ pub fn finalize_review_for_send(
     }
 }
 
-/// 判断 `risks` 中是否包含任何"自治协议违规"标签（R3.5 / R3.6 / R1.5 / R1.10）。
+/// 判断 `risks` 中是否包含任何"自治协议违规"标签（R3.5 / R3.6）。
 fn has_protocol_violation(risks: &[String]) -> bool {
     risks.iter().any(|r| is_protocol_violation_tag(r))
 }
 
-/// 单个 risk 标签是否属于"自治协议违规"语义。
+/// 单个 risk 标签是否属于"自治协议**硬**违规"语义 → `blocked_by_required_field`。
+///
+/// spec R3.5 / R3.6 的硬门只针对**结构性**违规：必填字段缺失（字段根本没输出）、
+/// 枚举非法、类型错误、decision_phase 非法。这些是 Agent 没遵守输出契约，无法靠
+/// 一次改写补救，故直接 block。
+///
+/// 刻意**不含** `insufficient_detail_in_critical_turn:*`：那是字段**已输出但偏短**
+/// （推理痕迹 < 20 字 / 回复理由 < 30 字）——spec R1.5 只要求 `review.approved =
+/// false`，从未要求升级成 `blocked_by_required_field` 硬门。把它当硬门会让一条
+/// 安全/质量闸全过、仅推理说明少几个字的回复被不可恢复地枪毙、连一次 revision 都
+/// 不给，正是 t15 跌单弧暴露的"闸门系统性过度拦截/全程哑火"真 bug。它改由
+/// [`is_insufficient_detail_tag`] 识别、走 single-shot revision 通道（与软闸失败同路）。
 fn is_protocol_violation_tag(risk: &str) -> bool {
     risk.starts_with("missing_required_field:")
         || risk.starts_with("invalid_enum_value:")
         || risk.starts_with("invalid_type:")
         || risk.starts_with("decision_phase_invalid:")
-        || risk.starts_with("insufficient_detail_in_critical_turn:")
+}
+
+/// 单个 risk 标签是否属于"关键轮推理字段偏短"语义（spec R1.5 长度违规）。
+/// 不是结构性协议违规，按软失败处理：触发 single-shot revision 补全，而非硬 block。
+fn is_insufficient_detail_tag(risk: &str) -> bool {
+    risk.starts_with("insufficient_detail_in_critical_turn:")
+}
+
+/// `promote_risks` 中存在 ≥1 个 insufficient_detail 标签、且**不含**任何结构性硬
+/// 违规（[`is_protocol_violation_tag`]）。用于 finalize 判定"是否只需 revision 补全"。
+/// 调用点在硬协议门 return 之后，故此处只要 has_protocol_violation 已为 false 即可，
+/// 但仍显式双判以防调用顺序变动时回归。
+fn has_insufficient_detail_only(promote_risks: &[String]) -> bool {
+    promote_risks.iter().any(|r| is_insufficient_detail_tag(r))
+        && !promote_risks.iter().any(|r| is_protocol_violation_tag(r))
 }
 
 /// 把新 risks 追加到 `risks` 末尾，跳过已存在的字面量（保序去重）。
@@ -1981,6 +2039,149 @@ mod dual_gate_classification_tests {
         );
         assert_eq!(outcome.status, GatewayStatusFinal::Approved);
         assert!(decision.should_reply);
+    }
+
+    // ── R1.5 insufficient_detail 降级为 single-shot revision（t15 跌单弧根因修复）──
+    //
+    // 历史 bug：关键轮推理字段偏短（insufficient_detail_in_critical_turn:*）被
+    // is_protocol_violation_tag 当成结构性硬违规 → blocked_by_required_field 直接
+    // return、revision_applied=false，连一次改写都不给。t15 6 轮成交弧因此 0 轮
+    // approved（< 下限 2）全程哑火。修复后它走软失败路径：标 needs_revision + 方向 →
+    // finalize 矫正 approved=true → decide_revision Proceed。
+
+    #[test]
+    fn finalize_insufficient_detail_only_routes_to_revision_not_hard_block() {
+        // 安全/质量闸全过，promote_risks 只含 insufficient_detail → Approved + needs_revision。
+        let runtime = UserRuntimeParameters::default();
+        let review = full_pass_review();
+        let mut decision = shouldreply_decision();
+        let contact = finalize_contact();
+        let promote_risks = vec![
+            "insufficient_detail_in_critical_turn:operation_goal".to_string(),
+            "insufficient_detail_in_critical_turn:relationship_read".to_string(),
+        ];
+        let outcome = finalize_review_for_send(
+            review,
+            &mut decision,
+            &runtime,
+            &contact,
+            &[],
+            promote_risks,
+            "用户最新消息",
+            &crate::models::CommitmentMarkers::default(),
+        );
+        let FinalizeOutcome {
+            review: finalized,
+            status,
+            ..
+        } = outcome;
+        assert_eq!(
+            status,
+            GatewayStatusFinal::Approved,
+            "insufficient_detail-only 必须矫正为 Approved（进 revision 通道），而非 blocked_by_required_field"
+        );
+        assert!(finalized.approved);
+        assert!(finalized.needs_revision, "应标记 needs_revision 触发 single-shot revision");
+        assert!(
+            !finalized.revision_direction.trim().is_empty(),
+            "应写补全推理痕迹的 revision_direction"
+        );
+        // 矫正后的 Approved + needs_revision 必须让 decide_revision 进 Proceed。
+        assert_eq!(
+            decide_revision(&status, &finalized, false),
+            RevisionDecision::Proceed,
+            "矫正后必须能触发 single-shot revision"
+        );
+    }
+
+    #[test]
+    fn finalize_insufficient_detail_with_hard_gate_still_held_not_sent() {
+        // 关键安全不变量：insufficient_detail + hallucination 硬闸失败 → 仍 Held，
+        // 绝不能被降级矫正成 Approved 发出去。
+        let runtime = UserRuntimeParameters::default();
+        let mut review = full_pass_review();
+        review.scores.hallucination_score = runtime.fact_risk_block_at + 1; // 硬闸失败
+        route_dual_gate(&mut review, &runtime, "好的，我来想想看"); // 硬闸 → approved=false，不设 needs_revision
+        let mut decision = shouldreply_decision();
+        let contact = finalize_contact();
+        let promote_risks =
+            vec!["insufficient_detail_in_critical_turn:operation_goal".to_string()];
+        let outcome = finalize_review_for_send(
+            review,
+            &mut decision,
+            &runtime,
+            &contact,
+            &[],
+            promote_risks,
+            "用户最新消息",
+            &crate::models::CommitmentMarkers::default(),
+        );
+        let FinalizeOutcome {
+            review: finalized,
+            status,
+            ..
+        } = outcome;
+        match status {
+            GatewayStatusFinal::Held(category) => {
+                assert_eq!(category, HOLD_CATEGORY_HELD_BY_AI_POLICY);
+            }
+            other => panic!("硬闸失败时必须 Held，绝不放行；got {:?}", other),
+        }
+        assert!(!finalized.approved, "硬闸失败的回复绝不能被矫正成 approved");
+    }
+
+    #[test]
+    fn finalize_structural_violation_still_hard_blocks() {
+        // 真正的结构性协议违规（missing_required_field）仍走 blocked_by_required_field 硬门。
+        let runtime = UserRuntimeParameters::default();
+        let review = full_pass_review();
+        let mut decision = shouldreply_decision();
+        let contact = finalize_contact();
+        let promote_risks = vec!["missing_required_field:why_should_reply".to_string()];
+        let outcome = finalize_review_for_send(
+            review,
+            &mut decision,
+            &runtime,
+            &contact,
+            &[],
+            promote_risks,
+            "用户最新消息",
+            &crate::models::CommitmentMarkers::default(),
+        );
+        assert_eq!(
+            outcome.status,
+            GatewayStatusFinal::BlockedByRequiredField,
+            "结构性必填缺失仍必须硬 block"
+        );
+        assert!(!decision.should_reply);
+    }
+
+    #[test]
+    fn finalize_mixed_structural_and_insufficient_detail_prefers_hard_block() {
+        // 同时含结构性违规 + insufficient_detail → 结构性硬门优先 return（不降级）。
+        let runtime = UserRuntimeParameters::default();
+        let review = full_pass_review();
+        let mut decision = shouldreply_decision();
+        let contact = finalize_contact();
+        let promote_risks = vec![
+            "insufficient_detail_in_critical_turn:operation_goal".to_string(),
+            "invalid_enum_value:operation_state:nonsense".to_string(),
+        ];
+        let outcome = finalize_review_for_send(
+            review,
+            &mut decision,
+            &runtime,
+            &contact,
+            &[],
+            promote_risks,
+            "用户最新消息",
+            &crate::models::CommitmentMarkers::default(),
+        );
+        assert_eq!(
+            outcome.status,
+            GatewayStatusFinal::BlockedByRequiredField,
+            "混合违规时结构性硬门优先，不走 revision 降级"
+        );
     }
 }
 
