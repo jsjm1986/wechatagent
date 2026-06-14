@@ -1292,6 +1292,17 @@ pub struct DomainProfile {
     /// 回落内置销售公式常量，逐字等价。不进任何硬闸。
     #[serde(default)]
     pub business_formulas: Vec<BusinessFormula>,
+    /// universal-domain-adaptation H17：本行业 memoryCard 的「记忆维度」声明（替代
+    /// 写死的销售域记忆槽位——preferences/doNotDo/commitments/objections/openLoops/
+    /// openQuestions/confirmedFacts/conflicts 八槽 + 各自 cap + consolidator prompt
+    /// 骨架 + memoryCandidate.type 合法集）。空集（`Vec::default()`，DEFAULT_PROFILE 下
+    /// 由 seed 显式填回销售八槽 + 原 cap）时各消费方回落内置销售维度，逐字等价。
+    /// 情感/陪伴域可声明「情绪史 / 纪念日 / 重要事件」等专属记忆槽。
+    /// 注：coreFacts/recentFacts/deprecatedFacts 三 typed 数组是 memoryCard 结构骨架
+    /// （固定 cap 6/10/20），coreProfile/relationshipState 是固定对象结构——均**不**
+    /// 纳入本字段，只有 `extra` 容器里的业务数组槽位走 memory_dimensions。
+    #[serde(default)]
+    pub memory_dimensions: Vec<MemoryDimension>,
     /// universal-domain-adaptation C3：引导层「运营方法生成器」（playbook.generator /
     /// optimizer）的领域专属 system 引导语。`None` 时回落内置**领域中性**生成器引导语
     /// （C3 清理后 `PLAYBOOK_METHODOLOGY_SYSTEM` 已去除「消费心理学/顾问式销售/异议/
@@ -1481,6 +1492,40 @@ pub struct ChunkRole {
     /// DEFAULT 销售域 = `product_fact`（逐字复刻原「缺省/任意其它值→product_fact」）。
     #[serde(default)]
     pub is_fallback: bool,
+}
+
+/// universal-domain-adaptation H17：memoryCard 的「记忆维度」（替代 `memory.rs` 写死的
+/// 销售域记忆槽位 + cap + consolidator prompt 骨架 + memoryCandidate.type 合法集）。
+/// 一个 `MemoryDimension` 声明：本行业某类记忆的 `extra` 容器数组键名 `key`、
+/// consolidator prompt 里的人类标签 `display_name`、数组上限 `cap`（无界增长唯一闸口）、
+/// 是否核心维度 `is_core`、consolidator 填写指引 `prompt_hint`、是否作为
+/// memoryCandidate.type 合法值 `candidate_type`。DEFAULT_PROFILE 逐字复刻销售八槽
+/// （preferences/doNotDo/commitments/objections/openLoops/openQuestions/confirmedFacts/
+/// conflicts）+ 各自原 cap → 渲染/cap 字节等价；换行业=另一份 memory_dimensions（如
+/// 情感域「情绪史 emotionHistory / 纪念日 anniversaries / 重要事件 importantEvents」）。
+/// 注：coreFacts/recentFacts/deprecatedFacts 是 memoryCard typed 骨架（固定 cap 6/10/20），
+/// coreProfile/relationshipState 是固定对象结构——均**不**纳入本字段。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MemoryDimension {
+    /// `MemoryCardTyped.extra` 容器里的数组键名（camelCase，如 "objections" /
+    /// "emotionHistory"），同时是 consolidator prompt JSON 骨架里的字段名。
+    pub key: String,
+    /// consolidator prompt limit 散文 / 骨架注释里的人类标签。
+    pub display_name: String,
+    /// 该槽位数组上限（替代 `compact_memory_card_with_previous` 写死的 cap）。
+    pub cap: usize,
+    /// 是否核心维度（保留位，供 prompt 注入优先级 / 未来分层；DEFAULT 不区分）。
+    #[serde(default)]
+    pub is_core: bool,
+    /// consolidator prompt 里该维度的填写指引（None 时不产出额外指引行；
+    /// DEFAULT 销售八槽的 limit 散文经渲染函数生成，保持 prompt 字节等价）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_hint: Option<String>,
+    /// 是否作为 Reply Agent `memoryCandidates[].type` 的合法枚举值。DEFAULT 下
+    /// preference/doNotDo/commitment/objection/openLoop 五槽为 true（对齐当前 type
+    /// 枚举），fact/conflict 由系统固定派生不依赖本字段。
+    #[serde(default)]
+    pub candidate_type: bool,
 }
 
 /// universal-domain-adaptation H11：本行业「自学习极性」= 声明哪些 outcome_status
