@@ -638,18 +638,11 @@ pub fn finalize_review_for_send(
             if verified.is_empty() {
                 match class {
                     crate::agent::guards::CommitmentClass::ProductEffect => {
-                        // 兜底硬闸：reviewer 漏判效果/数据类承诺且无 verified 背书 → block。
-                        review.approved = false;
-                        review.scores.hallucination_score =
-                            review.scores.hallucination_score.max(6);
-                        extend_risks_unique(
-                            &mut review.risks,
-                            std::iter::once(
-                                "product_claim_without_verified_knowledge".to_string(),
-                            ),
-                        );
-                        decision.should_reply = false;
-                        decision.autonomy_mode = "blocked".to_string();
+                        // 语气类：维持现状，仅观测不拦（避免误杀情感承诺）。
+                        // 注意：ProductEffect 原为兜底硬闸（H4 universal-domain-adaptation 分支引入），
+                        // 2026-06-14 回退为观测——成交弧中"保证"/"效果"类词汇高频出现，
+                        // 在知识稀缺场景下新闸导致全程哑火。先观测漏判率，有统计意义证据后
+                        // 由用户决策是否抬闸（对应注释"先观测后判罚"设计意图）。
                         let mut details = Document::new();
                         details.insert(
                             "reply_excerpt",
@@ -658,20 +651,13 @@ pub fn finalize_review_for_send(
                         details.insert("used_knowledge_ids", decision.used_knowledge_ids.clone());
                         details.insert("knowledge_chunk_total", knowledge_chunks.len() as i64);
                         pending_events.push(PendingFinalizeEvent {
-                            kind: "product_claim_blocked_by_probe_fallback".to_string(),
-                            status: "blocked".to_string(),
+                            kind: "grounding_probe_reviewer_missed".to_string(),
+                            status: "observe".to_string(),
                             summary:
-                                "兜底硬闸：reviewer 漏判，回复含效果/数据类承诺且无 verified 背书，强制 blocked"
+                                "观测：回复含效果/数据类承诺且无 verified 背书，但 reviewer 未标 requiresProductKnowledge"
                                     .to_string(),
                             details,
                         });
-                        review.final_review_status =
-                            "blocked_unverified_product_claim".to_string();
-                        return FinalizeOutcome {
-                            review,
-                            status: GatewayStatusFinal::BlockedUnverifiedProductClaim,
-                            pending_events,
-                        };
                     }
                     crate::agent::guards::CommitmentClass::ToneOnly => {
                         // 语气类：维持现状，仅观测不拦（避免误杀情感承诺）。
@@ -1908,8 +1894,8 @@ mod dual_gate_classification_tests {
     // ── A2：grounding 漏判兜底硬闸（词类型切分）单测 ──
 
     #[test]
-    fn finalize_blocks_on_product_effect_claim_when_reviewer_missed() {
-        // reviewer 漏判 + 回复含效果词「回款」+ 无 verified → 兜底硬闸 block。
+    fn finalize_only_observes_on_product_effect_claim_when_reviewer_missed() {
+        // reviewer 漏判 + 回复含效果词「回款」+ 无 verified → 仅观测不拦（2026-06-14 回退硬闸为观测）。
         let runtime = UserRuntimeParameters::default();
         let mut review = full_pass_review();
         review.claim_analysis = mongodb::bson::doc! { "requiresProductKnowledge": false };
@@ -1926,17 +1912,18 @@ mod dual_gate_classification_tests {
             "你们能保证回款吗",
             &crate::models::CommitmentMarkers::default(),
         );
-        assert_eq!(
-            outcome.status,
-            GatewayStatusFinal::BlockedUnverifiedProductClaim
-        );
-        assert!(!outcome.review.approved);
-        assert!(!decision.should_reply);
+        // 新行为：仅观测，回复放行
+        assert_eq!(outcome.status, GatewayStatusFinal::Approved);
+        assert!(outcome.review.approved);
+        assert!(decision.should_reply);
         assert!(outcome
             .pending_events
             .iter()
-            .any(|e| e.kind == "product_claim_blocked_by_probe_fallback"
-                && e.status == "blocked"));
+            .any(|e| e.kind == "grounding_probe_reviewer_missed" && e.status == "observe"));
+        assert!(!outcome
+            .pending_events
+            .iter()
+            .any(|e| e.kind == "product_claim_blocked_by_probe_fallback"));
     }
 
     #[test]
