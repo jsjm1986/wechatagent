@@ -135,6 +135,19 @@ async fn deal_event_push_round_trip() {
     };
     // H10 向后兼容：故意用**旧** `deal_events` key 写库，验证 serde alias 让旧库
     // 文档仍能反序列化到新 `outcome_events` 字段（改名前写入的存量数据不丢）。
+    // contact_template 初始化时带 outcome_events: []（新 key），随后又 push 到 deal_events（旧 key）。
+    // 两 key 同时存在时 BSON 反序列化报 duplicate field error。
+    // 解决：先清空 outcome_events，确保 push 后 document 里只有 deal_events → alias 正常映射。
+    state
+        .db
+        .contacts()
+        .update_one(
+            doc! { "_id": oid, "workspace_id": "default" },
+            doc! { "$set": { "outcome_events": <Vec<OutcomeEvent>>::new() } },
+            None,
+        )
+        .await
+        .expect("clear outcome_events");
     state
         .db
         .contacts()
