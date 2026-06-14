@@ -143,7 +143,7 @@ async fn deal_event_push_round_trip() {
         .contacts()
         .update_one(
             doc! { "_id": oid, "workspace_id": "default" },
-            doc! { "$set": { "outcome_events": <Vec<OutcomeEvent>>::new() } },
+            doc! { "$set": { "outcome_events": mongodb::bson::to_bson(&Vec::<OutcomeEvent>::new()).unwrap() } },
             None,
         )
         .await
