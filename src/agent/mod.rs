@@ -155,6 +155,8 @@ pub use taxonomy::init_global_taxonomy_cache;
 // universal-domain-adaptation 1G-c：active DomainProfile 进程级缓存预热入口；
 // main.rs 在 taxonomy 预热之后调用。
 pub use domain_profile::init_global_domain_profile_cache;
+// H17：记忆维度通用化的两个 pub 渲染/seed 函数，供 tests/ 端到端验证情感 profile。
+pub use domain_profile::{default_memory_dimensions, render_memory_candidate_types_guidance};
 
 // agent-autonomy-loop W3 / Task 4.5：P7 工具循环性质测试入口。
 //
