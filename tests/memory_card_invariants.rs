@@ -328,6 +328,63 @@ fn custom_memory_dimension_caps_are_enforced() {
     );
 }
 
+/// H17-e：情感陪伴 profile 端到端——声明情绪史/纪念日/重要事件三槽后，验证记忆维度
+/// 通用化在「cap 截断」与「candidate type 派生」两条 pub 路径协同生效（consolidator
+/// prompt 指引由 memory.rs 内联测试覆盖）。证明 memoryCard 记忆维度真正"随 profile"：
+/// 情感记忆不再被销售槽挤占、不无界增长、能作为候选写出。
+#[test]
+fn emotional_companion_profile_memory_dimensions_end_to_end() {
+    use wechatagent::agent::render_memory_candidate_types_guidance;
+
+    // 情感陪伴 profile 的记忆维度声明（情绪史 / 纪念日 / 重要事件）。
+    let emotional_dims = vec![
+        MemoryDimension {
+            key: "emotionHistory".to_string(),
+            display_name: "情绪史".to_string(),
+            cap: 10,
+            is_core: true,
+            prompt_hint: Some("记录 ta 近期情绪起伏与触发事件，供下次主动关心".to_string()),
+            candidate_type: true,
+        },
+        MemoryDimension {
+            key: "anniversaries".to_string(),
+            display_name: "纪念日".to_string(),
+            cap: 5,
+            is_core: true,
+            prompt_hint: Some("生日 / 相识纪念 / 重要日子".to_string()),
+            candidate_type: false,
+        },
+        MemoryDimension {
+            key: "importantEvents".to_string(),
+            display_name: "重要事件".to_string(),
+            cap: 8,
+            is_core: false,
+            prompt_hint: None,
+            candidate_type: true,
+        },
+    ];
+
+    // ① cap 截断：三槽各按自己的 cap 截留（防无界增长）。
+    let mut extra = mongodb::bson::Document::new();
+    extra.insert("emotionHistory", (0..30).map(|i| format!("e{i}")).collect::<Vec<_>>());
+    extra.insert("anniversaries", (0..30).map(|i| format!("a{i}")).collect::<Vec<_>>());
+    extra.insert("importantEvents", (0..30).map(|i| format!("v{i}")).collect::<Vec<_>>());
+    let card = MemoryCardTyped { extra, ..Default::default() };
+    let compacted = compact_memory_card_with_dimensions(&card, None, &[], &emotional_dims);
+    assert_eq!(compacted.extra.get_array("emotionHistory").unwrap().len(), 10);
+    assert_eq!(compacted.extra.get_array("anniversaries").unwrap().len(), 5);
+    assert_eq!(compacted.extra.get_array("importantEvents").unwrap().len(), 8);
+
+    // ② candidate type 派生：candidate_type=true 的情绪史/重要事件进合法集，
+    // 纪念日（false）不进；fact/conflict 固定派生；销售槽（preferences 等）不出现。
+    let guidance = render_memory_candidate_types_guidance(&emotional_dims);
+    assert!(guidance.contains("emotionHistory"));
+    assert!(guidance.contains("importantEvents"));
+    assert!(guidance.contains("fact") && guidance.contains("conflict"));
+    assert!(!guidance.contains("anniversaries"), "candidate_type=false 不进候选 type");
+    assert!(!guidance.contains("objection"), "销售槽不应出现在情感 profile 候选 type");
+}
+
 
 // ── agent-autonomy-loop W5 / Task 6.8 扩展 ─────────────────────────────
 
