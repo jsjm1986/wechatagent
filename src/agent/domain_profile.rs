@@ -35,7 +35,7 @@ use crate::db::Database;
 use crate::error::AppResult;
 use crate::models::{
     BusinessFormula, ChunkRole, CommitmentMarkers, CoverageDimension, DomainProfile,
-    OutcomePolarity, ProfileDimension,
+    MemoryDimension, OutcomePolarity, ProfileDimension,
 };
 
 /// 内置默认 profile 的 `profile_id`。运行时无 active profile 时使用。
@@ -73,6 +73,40 @@ pub fn default_chunk_roles() -> Vec<ChunkRole> {
             is_fallback: false,
         },
     ]
+}
+
+/// universal-domain-adaptation H17：DEFAULT_PROFILE 的销售域记忆维度 seed。逐字复刻
+/// `memory.rs::compact_memory_card_with_previous` 写死的八个 `extra` 业务槽位 cap
+/// （行 424-434 的 `limit_extra_array` 调用）+ Reply Agent memoryCandidates[].type
+/// 当前枚举（preference/doNotDo/commitment/objection/openLoop）。作为 DEFAULT 等价的
+/// 单一真相源：cap 接线后各消费方在空集时回落这同一组维度，故声明值与回落值字节相等，
+/// 不因手抄漂移。等价性测试 `default_profile_memory_dimensions_match_hardcoded_verbatim`
+/// 锁死。注：coreFacts(6)/recentFacts(10)/deprecatedFacts(20) 是 typed 骨架固定 cap，
+/// 不在此表；confirmedFacts/conflicts 是 extra 槽但非 candidate 类型（candidate_type=false）。
+pub fn default_memory_dimensions() -> Vec<MemoryDimension> {
+    // (key, display_name, cap, candidate_type)：cap 逐字对齐 memory.rs limit_extra_array；
+    // candidate_type 对齐 prompts.rs Reply Agent memoryCandidates[].type 枚举。
+    let specs: &[(&str, &str, usize, bool)] = &[
+        ("preferences", "偏好", 8, true),
+        ("doNotDo", "禁忌/不要做", 10, true),
+        ("commitments", "承诺", 8, true),
+        ("objections", "异议", 8, true),
+        ("openLoops", "未闭合事项", 8, true),
+        ("openQuestions", "待解答问题", 8, false),
+        ("confirmedFacts", "已确认事实", 12, false),
+        ("conflicts", "冲突", 6, false),
+    ];
+    specs
+        .iter()
+        .map(|(key, name, cap, cand)| MemoryDimension {
+            key: key.to_string(),
+            display_name: name.to_string(),
+            cap: *cap,
+            is_core: false,
+            prompt_hint: None,
+            candidate_type: *cand,
+        })
+        .collect()
 }
 
 /// universal-domain-adaptation H11：内置默认自学习极性，逐字复刻回路① 的 fallback
@@ -317,6 +351,10 @@ pub fn default_domain_profile(workspace_id: &str) -> DomainProfile {
         // NextBestActionScore）。空集时各消费方回落内置销售公式常量，故 seed 与回落同源、
         // 字节等价。
         business_formulas: default_business_formulas(),
+        // H17：DEFAULT 销售域 = 显式填回八个记忆维度（preferences/doNotDo/commitments/
+        // objections/openLoops/openQuestions/confirmedFacts/conflicts）+ 原 cap。空集时
+        // 消费方回落同一组维度，故 seed 与回落同源、cap/prompt 字节等价。
+        memory_dimensions: default_memory_dimensions(),
         // C3：DEFAULT 不声明行业专属生成器引导语 → 回落领域中性 PLAYBOOK_METHODOLOGY_SYSTEM
         // （已去销售偏见）。换行业可在引导层声明自己的生成偏好。
         methodology_generator_preamble: None,
@@ -670,6 +708,52 @@ mod tests {
         assert_eq!(parsed.outcome_polarity.negative, p.outcome_polarity.negative);
         // H15：business_formulas 经 BSON 往返不丢（camelCase key/expression/displayName/evalScoreKey）。
         assert_eq!(parsed.business_formulas, p.business_formulas);
+        // H17：memory_dimensions 经 BSON 往返不丢（camelCase key/displayName/cap/isCore/promptHint/candidateType）。
+        assert_eq!(parsed.memory_dimensions, p.memory_dimensions);
+    }
+
+    // ── H17：记忆维度 seed 等价 ──
+
+    #[test]
+    fn default_memory_dimensions_default_is_empty_not_sales() {
+        // DomainProfile.memory_dimensions 的 serde 默认是空 Vec（非销售八槽）——
+        // 销售记忆维度由 seed 显式填回。这是消费方"空集→回落内置维度"契约的前提：
+        // default 不能预埋销售槽，否则换行业 profile 漏配会静默继承销售记忆维度。
+        let dims: Vec<crate::models::MemoryDimension> = Vec::default();
+        assert!(dims.is_empty());
+    }
+
+    #[test]
+    fn default_profile_memory_dimensions_match_hardcoded_verbatim() {
+        // 锁死 DEFAULT 八个记忆维度的 key + cap + candidate_type，逐字对齐
+        // memory.rs::compact_memory_card_with_previous 写死的 limit_extra_array cap 表
+        // 与 prompts.rs Reply Agent memoryCandidates[].type 枚举。cap 接线（H17-b）/
+        // candidate type 派生（H17-d）后，此测试是"seed 与消费方回落同源"的护栏：
+        // 任一处漂移→本测试红。
+        let dims = default_memory_dimensions();
+        let got: Vec<(&str, usize, bool)> = dims
+            .iter()
+            .map(|d| (d.key.as_str(), d.cap, d.candidate_type))
+            .collect();
+        let expected: Vec<(&str, usize, bool)> = vec![
+            ("preferences", 8, true),
+            ("doNotDo", 10, true),
+            ("commitments", 8, true),
+            ("objections", 8, true),
+            ("openLoops", 8, true),
+            ("openQuestions", 8, false),
+            ("confirmedFacts", 12, false),
+            ("conflicts", 6, false),
+        ];
+        assert_eq!(got, expected, "DEFAULT 记忆维度 key/cap/candidate_type 必须逐字锁死");
+        // coreFacts/recentFacts/deprecatedFacts 是 typed 骨架固定 cap，不得混进 memory_dimensions。
+        assert!(
+            !dims.iter().any(|d| matches!(
+                d.key.as_str(),
+                "coreFacts" | "recentFacts" | "deprecatedFacts"
+            )),
+            "typed 骨架数组不应出现在 memory_dimensions"
+        );
     }
 
     // ── 3A-1a H15：经营公式 seed 等价 ──
