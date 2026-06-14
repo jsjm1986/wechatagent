@@ -95,7 +95,11 @@ RunBudget 超限                        终止本 run，落 fallback (enforce_ru
 > 是 2026-05-25 知识库清理前的旧函数名，现已不存在。真实入口是
 > `src/agent/review.rs::review_passed`（评分硬门）、`review::classify_dual_gate` /
 > `review::route_dual_gate`（双闸分类 / 改写路由）、`review::finalize_review_for_send`
-> （verified 产品声明结构化兜底，写 `blocked_unverified_product_claim`）。
+> （verified 产品声明结构化兜底）。**2026-06-14 修订**：R5.4 reviewer 自报
+> `requiresProductKnowledge=true` 路径仍写 `blocked_unverified_product_claim`（强约束不变）；
+> finalize 漏判探针（ProductEffect 分支，reviewer 未自报 ∧ 含硬承诺 ∧ 无 verified 背书）
+> 从强制 block 改为**仅观测**（落 `grounding_probe_reviewer_missed` 事件，不改发送判定），
+> 因成交弧承诺词高频、知识稀缺场景下硬闸导致全程哑火；先观测漏判率再决策是否抬回硬闸。
 > 阈值字段也有历史别名：`UserRuntimeParameters.fact_risk_block_at` 实际承载
 > **hallucination** block 阈值（由 `hallucination_block_at` 映射而来），
 > `product_accuracy_block_below` 实际承载 **knowledge_grounding** 阈值（由
@@ -318,6 +322,7 @@ WechatAgent 自第二阶段起内置可选的"自我演化"后台 worker（`src/
 - 显著性门槛：`EVOLUTION_MIN_SEND_SUCCESS_DELTA`（默认 0.05）+ `EVOLUTION_MIN_SELF_CRITIQUE_DELTA`（默认 0.10）+ `EVOLUTION_MAX_5GATE_HIT_INCREASE`（默认 0.10，即新版本不得让任何闸命中率上升超过 10%）。
 - **安全回归门**（#152）：放松安全闸（`fact_risk_block` / `pressure_risk_block` / `product_accuracy_score_block`）的 threshold 候选，额外计算「安全回归率」= shadow 中"原配置被该安全闸拦下（`held_by_ai_policy` / `blocked_by_safety_guard` / `blocked_unverified_product_claim`）、新配置却放行（`approved` / `approved_after_revision`）"的 run 占全部 completed replay 的比例。超过 `EVOLUTION_MAX_SAFETY_REGRESSION_RATE`（默认 `0.0`，零容忍）即判 `safety_gate_regression_above_threshold`、转 `rejected_below_threshold`。这条门是"放松必须用数据证明不漏风险"的硬约束，凌驾于 send_success 提升之上。
 - 三项任一不达标（含安全回归门）→ 候选直接转 `rejected_below_threshold`，不进入 `eligible_for_release`。
+- **注（2026-06-14）**：`blocked_unverified_product_claim` 作为安全回归门的被拦状态之一，其来源是 R5.4 reviewer 自报路径（强约束不变）；finalize 漏判探针（ProductEffect 分支）现已转为观测期，不再产生该 block 状态，故演化器统计窗口内该状态的样本量会下降。观测期结束后若抬回硬闸，本统计语义无需改动。
 
 ### Release / Rollback
 
