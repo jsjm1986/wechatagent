@@ -23,6 +23,16 @@ on:
       - 'frontend/**'
       - 'docs/**'
       - '**/*.md'
+  # 手动触发：单独跑某一个 real_llm_ops_smoke 测试，**绕过** real-llm / recall 前置链，
+  # 立即起跑——用于快速验证单测修复（如 t15），不必等全套串行排队 1+ 小时。
+  # 在 Actions 页选 CI workflow → Run workflow → 填测试名（默认 t15）。
+  workflow_dispatch:
+    inputs:
+      ops_test:
+        description: '单独跑的 real_llm_ops_smoke 测试名（如 t15_real_multiturn_deal_arc）'
+        required: true
+        default: 't15_real_multiturn_deal_arc'
+        type: string
 
 env:
   CARGO_TERM_COLOR: always
@@ -32,6 +42,7 @@ jobs:
   baseline:
     name: Baseline gate (R11.6)
     runs-on: ubuntu-latest
+    if: ${{ github.event_name != 'workflow_dispatch' }}
     timeout-minutes: 30
     steps:
       - name: Checkout (with full history for diff)
@@ -84,6 +95,7 @@ jobs:
   integration:
     name: Integration tests (Docker / testcontainers)
     runs-on: ubuntu-latest
+    if: ${{ github.event_name != 'workflow_dispatch' }}
     # 首次接入：101 个 #[ignore] 集成测试从未在 CI 跑过，bit-rot 几乎必然。
     # 先 continue-on-error 拿到真实绿/红体检报告，不阻塞合并；逐个修复后
     # 再视情况抬升为硬门（与 baseline 同级）。
@@ -134,6 +146,7 @@ jobs:
   real-llm:
     name: Real-LLM smoke (真实大模型 / MCP 桩)
     runs-on: ubuntu-latest
+    if: ${{ github.event_name != 'workflow_dispatch' }}
     # 用**真实大模型**（MiMo mimo-v2.5 / OpenAI 兼容端点）跑 T1 文本决策+审查 / T2 知识
     # tool-loop / T3 多模态 vision 抽取，验证 mock 测不到的真实 schema/闸门/收敛。
     # MCP 永远是 wiremock 桩（绝不真发微信）。real-LLM 限流/抖动不该阻塞合并，
@@ -250,6 +263,7 @@ jobs:
   real-llm-recall:
     name: Real-LLM knowledge recall benchmark (${{ matrix.t }} / MCP 桩)
     runs-on: ubuntu-latest
+    if: ${{ github.event_name != 'workflow_dispatch' }}
     # NVIDIA integrate 免费层 RPM 硬墙：5 个 real-LLM job-group 并行时瞬时 ~9 runner 同打
     # 一把 key 必爆 429（实测 retry 6 次仍全 skip 假绿）。max-parallel 只在单 matrix 内限并发、
     # 不能跨 group 协调，故用 needs 链把 5 个 group 串行化（smoke→recall→ops→quality→adversarial），
@@ -333,6 +347,7 @@ jobs:
   real-llm-ops:
     name: Real-LLM ops smoke (${{ matrix.t }} / MCP 桩)
     runs-on: ubuntu-latest
+    if: ${{ github.event_name != 'workflow_dispatch' }}
     # 串行链第 3 环（见 real-llm-recall 注释：跨 group 串行根治 NVIDIA 429）。
     needs: real-llm-recall
     continue-on-error: true
@@ -410,6 +425,55 @@ jobs:
           REAL_LLM_FAILOVER_MODELS: z-ai/glm-5.1,stepfun-ai/step-3.7-flash,qwen/qwen3-next-80b-a3b-instruct
         run: cargo test --no-fail-fast --test real_llm_ops_smoke ${{ matrix.t }} -- --ignored --nocapture
 
+  # 手动单跑：只跑 workflow_dispatch input 指定的**单个** real_llm_ops_smoke 测试，
+  # **无 needs 前置链**，触发后立即起跑——用于快速验证单测修复（如 t15），不必等
+  # real-llm → recall → ops 串行排队 1+ 小时。env 与 real-llm-ops 完全同口径（同主模型
+  # kimi-k2.6 / 同异族 judge llama-3.3-70b / 同 failover 备胎链），保证单跑结果与全套
+  # 一致、可直接采信。仅 workflow_dispatch 事件触发；正常 PR/push 跑全套矩阵不受影响。
+  # MCP 仍是桩（绝不真发微信）。
+  real-llm-ops-single:
+    name: Real-LLM ops single (${{ github.event.inputs.ops_test }} / 手动单跑)
+    runs-on: ubuntu-latest
+    if: ${{ github.event_name == 'workflow_dispatch' }}
+    timeout-minutes: 90
+    env:
+      REAL_LLM_API_KEY: ${{ secrets.REAL_LLM_CODERELAY_API_KEY || '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' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Free disk space
+        if: ${{ env.REAL_LLM_API_KEY != '' }}
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android \
+            /usr/local/share/boost /usr/local/share/powershell \
+            /usr/lib/jvm "$AGENT_TOOLSDIRECTORY" || true
+          sudo docker image prune --all --force || true
+          df -h
+
+      - name: Install Rust toolchain
+        if: ${{ env.REAL_LLM_API_KEY != '' }}
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry / target
+        if: ${{ env.REAL_LLM_API_KEY != '' }}
+        uses: Swatinem/rust-cache@v2
+
+      - name: cargo test --test real_llm_ops_smoke ${{ github.event.inputs.ops_test }}
+        if: ${{ env.REAL_LLM_API_KEY != '' }}
+        env:
+          RUSTFLAGS: ""
+          REAL_LLM_BASE_URL: https://integrate.api.nvidia.com/v1
+          REAL_LLM_MODEL: moonshotai/kimi-k2.6
+          REAL_LLM_JUDGE: "1"
+          REAL_LLM_JUDGE_API_KEY: ${{ secrets.REAL_LLM_GPT55_API_KEY || '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' }}
+          REAL_LLM_JUDGE_BASE_URL: https://integrate.api.nvidia.com/v1
+          REAL_LLM_JUDGE_MODEL: meta/llama-3.3-70b-instruct
+          REAL_LLM_FAILOVER_API_KEY: ${{ secrets.REAL_LLM_VISION_BACKUP_API_KEY || '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' }}
+          REAL_LLM_FAILOVER_BASE_URL: https://integrate.api.nvidia.com/v1
+          REAL_LLM_FAILOVER_MODELS: z-ai/glm-5.1,stepfun-ai/step-3.7-flash,qwen/qwen3-next-80b-a3b-instruct
+        run: cargo test --no-fail-fast --test real_llm_ops_smoke ${{ github.event.inputs.ops_test }} -- --ignored --nocapture
+
   # 知识库内容质量套件（real_llm_knowledge_quality.rs Q1–Q7）——「裁判校准层」重构后
   # 升级为跨家族裁判团（MiMo 双 checkpoint mimo-v2.5-pro + mimo-v2.5，外加**异族** Qwen
   # via DashScope，#618 最高 ROI 杠杆兑现）+ 跨裁判分歧效度门 + 每 Q 金标 good/bad 校准锚
@@ -433,6 +497,7 @@ jobs:
   real-llm-quality:
     name: Real-LLM knowledge quality (${{ matrix.q }} 双裁判 / MCP 桩)
     runs-on: ubuntu-latest
+    if: ${{ github.event_name != 'workflow_dispatch' }}
     # 串行链第 4 环（见 real-llm-recall 注释：跨 group 串行根治 NVIDIA 429）。
     needs: real-llm-ops
     continue-on-error: true
@@ -556,6 +621,7 @@ jobs:
   real-llm-adversarial:
     name: Real-LLM adversarial (${{ matrix.arc }})
     runs-on: ubuntu-latest
+    if: ${{ github.event_name != 'workflow_dispatch' }}
     # 串行链末环（见 real-llm-recall 注释：跨 group 串行根治 NVIDIA 429）。
     needs: real-llm-quality
     continue-on-error: true
