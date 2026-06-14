@@ -274,6 +274,10 @@ impl LlmClient {
                 // (HTTP/1.1) 17s 就能拿到完整 9980 bytes。改用 HTTP/1.1 后
                 // 整条链路稳定。
                 .http1_only()
+                // Windows 上 reqwest 默认自动读 WinHTTP 系统代理（自动检测），
+                // 绕过 VPN/浏览器插件的 198.18.x.x 内部地址，导致 LLM 请求 404。
+                // 用 .no_proxy() 强制所有连接直连。
+                .no_proxy()
                 .build()?,
             max_retries: max_retries.max(1),
             retry_base_ms: retry_base_ms.max(100),

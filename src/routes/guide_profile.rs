@@ -29,6 +29,46 @@ use crate::{
 
 use super::AppState;
 
+/// 递归地将 camelCase 字符串转换为 snake_case。
+/// `displayName` → `display_name`, `profileDimensions` → `profile_dimensions`
+fn to_snake_case(s: &str) -> String {
+    let mut result = String::with_capacity(s.len());
+    for (i, c) in s.chars().enumerate() {
+        if c.is_ascii_uppercase() && i > 0 {
+            // 检查是否需要在前面插入 _：前一个字符是字母/数字，后一个字符是字母
+            let prev = s[..i].chars().last();
+            let next = s[i..].chars().nth(1);
+            let prev_is_letter_or_digit = prev.map_or(false, |p| p.is_alphanumeric());
+            let next_is_lower = next.map_or(false, |n| n.is_ascii_lowercase());
+            if prev_is_letter_or_digit && next_is_lower {
+                result.push('_');
+            }
+        }
+        result.push(c.to_ascii_lowercase());
+    }
+    result
+}
+
+/// 递归归一化：处理所有层级的 camelCase keys → snake_case。
+fn normalize_json_keys(value: Value) -> Value {
+    match value {
+        Value::Object(map) => {
+            let normalized: serde_json::Map<String, Value> = map
+                .into_iter()
+                .map(|(k, v)| {
+                    let new_key = to_snake_case(&k);
+                    (new_key, normalize_json_keys(v))
+                })
+                .collect();
+            Value::Object(normalized)
+        }
+        Value::Array(arr) => {
+            Value::Array(arr.into_iter().map(normalize_json_keys).collect())
+        }
+        other => other,
+    }
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GenerateProfileRequest {
@@ -188,23 +228,33 @@ pub async fn generate_domain_profile_candidate(
     )
     .await?;
 
-    // 用生成的 JSON 反序列化成 DomainProfile,强制后端管理字段为草稿态。
-    let mut doc: Document = mongodb::bson::to_document(&generated)
+    let normalized = normalize_json_keys(generated);
+    let mut doc: Document = mongodb::bson::to_document(&normalized)
         .map_err(|e| AppError::External(format!("LLM 输出非对象: {e}")))?;
     doc.insert("profile_id", &payload.profile_id);
     doc.insert("workspace_id", &workspace_id);
-    if !doc.contains_key("display_name") && !doc.contains_key("displayName") {
-        doc.insert("display_name", &display_name);
-    }
+    doc.insert("display_name", &display_name);
+    // is_active / current_version / created_at / updated_at 在 struct 层面强制覆盖，
+    // 不依赖 LLM 输出（它们无 #[serde(default)]，必须存在才能反序列化）。
+    let now = DateTime::now();
+    doc.insert("is_active", false);
+    doc.insert("current_version", false);
+    doc.insert("created_at", now);
+    doc.insert("updated_at", now);
     let mut profile: DomainProfile = mongodb::bson::from_document(doc).map_err(|e| {
         AppError::External(format!("AI 生成的 profile 字段不合法,请重试或手填: {e}"))
     })?;
-    let now = DateTime::now();
     profile.id = None;
     profile.profile_id = payload.profile_id.clone();
     profile.workspace_id = workspace_id.clone();
     profile.display_name = display_name;
     profile.version = next_candidate_version(&state, &workspace_id, &payload.profile_id).await?;
+    profile.current_version = false; // 候选草稿:需人审 → publish → activate
+    profile.previous_version = None;
+    profile.is_active = false;
+    profile.seeded_by = Some("generated_by_ai".to_string());
+    profile.created_at = now;
+    profile.updated_at = now;
     profile.current_version = false; // 候选草稿:需人审 → publish → activate
     profile.previous_version = None;
     profile.is_active = false;
