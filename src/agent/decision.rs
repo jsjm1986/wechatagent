@@ -402,6 +402,15 @@ pub(crate) async fn decide_reply_with_promote(
         contact.locale.as_deref(),
     )
     .await?;
+    // universal-domain-adaptation H17：在静态 task prompt 后追加本行业 memoryCandidates
+    // 合法 type 指引（DEFAULT 销售八维→空串、Reply Agent prompt 字节不变、销售零扰动；
+    // 情感等非销售 profile→告知 LLM 本行业候选类型，让情感记忆能作为 candidate 写出）。
+    let task_template = format!(
+        "{task_template}{}",
+        super::domain_profile::render_memory_candidate_types_guidance(
+            &active_profile.memory_dimensions
+        )
+    );
     // R-prompt-v3：Operator Instruction 层（最高优先级）。运营人员可在后台对
     // 单个联系人写一段 ≤ 1000 字的特别指令，覆盖 Soul + Policy 的默认人格判定
     // （如"老客户已签约，不要主动推销"、"这个客户技术背景，可以多用术语"）。

@@ -109,6 +109,36 @@ pub fn default_memory_dimensions() -> Vec<MemoryDimension> {
         .collect()
 }
 
+/// H17：把 active profile 的记忆维度渲染成一段 Reply Agent 任务指引，告知本行业
+/// `memoryCandidates[].type` 的合法值（candidate_type=true 的维度 key + 固定的
+/// fact/conflict）。
+///
+/// 与 consolidator 指引同款门控——**只在维度偏离 DEFAULT 销售八维时才追加**：
+/// `user.reply.task` 静态 prompt 的 memoryCandidates schema 已写死销售 type 枚举
+/// （fact|preference|doNotDo|commitment|objection|openLoop|conflict），DEFAULT profile 下
+/// 它准确，追加冗余且扰动调好的销售行为 → DEFAULT 返回空串、Reply Agent prompt 逐字
+/// 不变。换非销售行业（情感域声明情绪史/纪念日为 candidate_type）时，这段告知 LLM
+/// 本行业真实可用的候选类型，让情感记忆能作为 candidate 写出（否则 LLM 只认骨架的
+/// 销售 type）。`fact` / `conflict` 是系统固定派生（不依赖 candidate_type 字段）。
+pub fn render_memory_candidate_types_guidance(
+    dimensions: &[crate::models::MemoryDimension],
+) -> String {
+    if dimensions.is_empty() || dimensions == default_memory_dimensions().as_slice() {
+        return String::new();
+    }
+    let mut types: Vec<String> = vec!["fact".to_string()];
+    for dim in dimensions {
+        if dim.candidate_type {
+            types.push(dim.key.clone());
+        }
+    }
+    types.push("conflict".to_string());
+    format!(
+        "\n\n# 本行业 memoryCandidates 合法 type（覆盖上面 schema 示例里的销售默认枚举）\n本行业可用的候选记忆 type 为：{}。请只用这些 type，按语义归类，不要沿用与本行业无关的销售字段。",
+        types.join(" | ")
+    )
+}
+
 /// universal-domain-adaptation H11：内置默认自学习极性，逐字复刻回路① 的 fallback
 /// 常量（`gap_signals::DEFAULT_POSITIVE_OUTCOMES` + `DEFAULT_NEGATIVE_OUTCOMES`，
 /// 后者同 `reaction.rs::DEFAULT_NEGATIVE_OUTCOMES` 5 词）。**与回落同源**：seed 直接
@@ -753,6 +783,48 @@ mod tests {
                 "coreFacts" | "recentFacts" | "deprecatedFacts"
             )),
             "typed 骨架数组不应出现在 memory_dimensions"
+        );
+    }
+
+    #[test]
+    fn memory_candidate_types_guidance_empty_for_default() {
+        // DEFAULT 销售八维 + 空维度 → 不追加（Reply Agent prompt 字节等价、销售零扰动）。
+        assert_eq!(
+            render_memory_candidate_types_guidance(&default_memory_dimensions()),
+            ""
+        );
+        assert_eq!(render_memory_candidate_types_guidance(&[]), "");
+    }
+
+    #[test]
+    fn memory_candidate_types_guidance_lists_emotional_types() {
+        // 情感 profile：candidate_type=true 的维度进合法 type，fact/conflict 固定派生；
+        // candidate_type=false 的维度（如纪念日）不作为 candidate type。
+        let dims = vec![
+            crate::models::MemoryDimension {
+                key: "emotionHistory".to_string(),
+                display_name: "情绪史".to_string(),
+                cap: 12,
+                is_core: true,
+                prompt_hint: None,
+                candidate_type: true,
+            },
+            crate::models::MemoryDimension {
+                key: "anniversaries".to_string(),
+                display_name: "纪念日".to_string(),
+                cap: 6,
+                is_core: false,
+                prompt_hint: None,
+                candidate_type: false,
+            },
+        ];
+        let out = render_memory_candidate_types_guidance(&dims);
+        assert!(out.contains("fact"), "fact 固定派生");
+        assert!(out.contains("emotionHistory"), "candidate_type=true 进合法集");
+        assert!(out.contains("conflict"), "conflict 固定派生");
+        assert!(
+            !out.contains("anniversaries"),
+            "candidate_type=false 不作为候选 type"
         );
     }
 
