@@ -33,7 +33,7 @@ mod common;
 
 use futures::TryStreamExt;
 use std::sync::Arc;
-use mongodb::bson::{doc, oid::ObjectId, DateTime, Document};
+use mongodb::bson::{doc, oid::ObjectId, DateTime};
 use mongodb::options::FindOptions;
 use serde_json::Value;
 use axum::extract::{Extension, Json, State};
@@ -41,11 +41,9 @@ use wechatagent::auth::AuthenticatedAdmin;
 use wechatagent::db::Database;
 use wechatagent::llm::LlmClient;
 use wechatagent::models::{
-    BusinessFormula, ChunkRole, CommitmentMarkers, CoverageDimension, DomainProfile, OperationMode,
-    OutcomePolarity, ProfileDimension,
+    CommitmentMarkers, DomainProfile, OperationMode, OutcomePolarity,
 };
-use wechatagent::routes::guide_profile::{generate_domain_profile_candidate, GenerateProfileRequest};
-use wechatagent::APP_STARTED_AT;
+use wechatagent::routes::guide_profile::GenerateProfileRequest;
 
 /// 构造测试 admin auth context。
 fn test_admin(workspace_id: &str) -> AuthenticatedAdmin {
