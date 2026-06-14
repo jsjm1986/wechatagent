@@ -126,7 +126,7 @@ pub(crate) use knowledge_tools::{AnchorMatchFn, ALLOWED_CHAT_TOOL_NAMES};
 
 // Task 24：测试可用的 PBT 入口（pure functions，无副作用）。
 pub use guards::check_state_transition;
-pub use memory::compact_memory_card_with_previous;
+pub use memory::{compact_memory_card_with_dimensions, compact_memory_card_with_previous};
 
 // agent-autonomy-loop W3 / Tasks 4.11-4.15：性质测试 P1-P7 入口。
 //

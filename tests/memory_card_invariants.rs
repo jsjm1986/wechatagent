@@ -19,7 +19,8 @@ use proptest::prelude::*;
 #[allow(deprecated)] // task 6.3：保留兼容别名调用以验证语义等价性。
 use wechatagent::agent::compact_memory_card_typed;
 use wechatagent::agent::compact_memory_card_with_previous;
-use wechatagent::models::{MemoryCardTyped, MemoryFactRepr};
+use wechatagent::agent::compact_memory_card_with_dimensions;
+use wechatagent::models::{MemoryCardTyped, MemoryDimension, MemoryFactRepr};
 
 /// 用 `Vec<String>` 构造 typed 形态的 memoryCard（core / recent 各自）。
 fn typed_card_with_core_recent(core: &[String], recent: &[String]) -> MemoryCardTyped {
@@ -277,6 +278,54 @@ fn extra_array_caps_are_enforced() {
     let donts = result.extra.get_array("doNotDo").unwrap();
     assert_eq!(prefs.len(), 8, "preferences cap 8");
     assert_eq!(donts.len(), 10, "doNotDo cap 10");
+}
+
+/// H17：自定义记忆维度（如情感域情绪史/纪念日）的 cap 经 memory_dimensions 驱动生效——
+/// 防无界增长闸口对非销售槽位同样有效。追加断言，不改既有销售维度 cap 测试。
+#[test]
+fn custom_memory_dimension_caps_are_enforced() {
+    let mut extra = mongodb::bson::Document::new();
+    extra.insert(
+        "emotionHistory",
+        (0..30).map(|i| format!("e{i}")).collect::<Vec<_>>(),
+    );
+    extra.insert(
+        "anniversaries",
+        (0..30).map(|i| format!("a{i}")).collect::<Vec<_>>(),
+    );
+    let card = MemoryCardTyped {
+        extra,
+        ..Default::default()
+    };
+    let dims = vec![
+        MemoryDimension {
+            key: "emotionHistory".to_string(),
+            display_name: "情绪史".to_string(),
+            cap: 5,
+            is_core: false,
+            prompt_hint: None,
+            candidate_type: true,
+        },
+        MemoryDimension {
+            key: "anniversaries".to_string(),
+            display_name: "纪念日".to_string(),
+            cap: 3,
+            is_core: false,
+            prompt_hint: None,
+            candidate_type: false,
+        },
+    ];
+    let result = compact_memory_card_with_dimensions(&card, None, &[], &dims);
+    assert_eq!(
+        result.extra.get_array("emotionHistory").unwrap().len(),
+        5,
+        "情绪史 cap 5 生效"
+    );
+    assert_eq!(
+        result.extra.get_array("anniversaries").unwrap().len(),
+        3,
+        "纪念日 cap 3 生效"
+    );
 }
 
 

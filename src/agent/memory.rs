@@ -347,6 +347,23 @@ pub fn compact_memory_card_with_previous(
     previous: Option<&MemoryCardTyped>,
     discarded: &[String],
 ) -> MemoryCardTyped {
+    // H17：现有签名保持不变（所有既有调用点 / PBT 零改动），内部用 DEFAULT 销售
+    // 八维度 cap——与改造前写死的 cap 表逐字等价。需按 active profile cap 截断的
+    // 生产合并点（consolidate_contact_memory）改调 _with_dimensions 传入 profile 维度。
+    let default_dims = crate::agent::domain_profile::default_memory_dimensions();
+    compact_memory_card_with_dimensions(card, previous, discarded, &default_dims)
+}
+
+/// H17：[`compact_memory_card_with_previous`] 的维度可配版。`dimensions` 驱动 `extra`
+/// 业务槽位的 cap（替代写死的 8 行 `limit_extra_array`）。typed 三数组（core/recent/
+/// deprecated_facts）与其 extra 镜像的固定 cap 不受 `dimensions` 影响。DEFAULT 维度
+/// 下与写死 cap 表字节等价；情感 profile 声明的额外槽在此被各自 cap 截断。
+pub fn compact_memory_card_with_dimensions(
+    card: &MemoryCardTyped,
+    previous: Option<&MemoryCardTyped>,
+    discarded: &[String],
+    dimensions: &[crate::models::MemoryDimension],
+) -> MemoryCardTyped {
     let mut compact = card.clone();
 
     // discarded 是全局黑名单：无论 fact 来自 incoming card 还是上一版 previous，
@@ -421,17 +438,17 @@ pub fn compact_memory_card_with_previous(
         }
     }
 
+    // H17：typed 骨架数组在 extra 里的历史镜像 cap 保持写死（coreFacts 6 /
+    // recentFacts 10 / deprecatedFacts 6——与 typed 三数组固定 cap 6/10/20 的 wire
+    // 兼容形态，不属业务维度）。业务记忆维度（preferences/doNotDo/... 八槽）的 cap
+    // 改由 memory_dimensions 驱动：DEFAULT 维度逐字复刻原 cap 表，故字节等价；情感
+    // profile 声明的额外槽（情绪史/纪念日）也在此被各自 cap 截断（防无界增长）。
     limit_extra_array(&mut compact.extra, "coreFacts", 6);
     limit_extra_array(&mut compact.extra, "recentFacts", 10);
-    limit_extra_array(&mut compact.extra, "confirmedFacts", 12);
-    limit_extra_array(&mut compact.extra, "preferences", 8);
-    limit_extra_array(&mut compact.extra, "doNotDo", 10);
-    limit_extra_array(&mut compact.extra, "commitments", 8);
-    limit_extra_array(&mut compact.extra, "objections", 8);
-    limit_extra_array(&mut compact.extra, "openLoops", 8);
-    limit_extra_array(&mut compact.extra, "openQuestions", 8);
     limit_extra_array(&mut compact.extra, "deprecatedFacts", 6);
-    limit_extra_array(&mut compact.extra, "conflicts", 6);
+    for dim in dimensions {
+        limit_extra_array(&mut compact.extra, &dim.key, dim.cap);
+    }
     compact
 }
 
@@ -977,8 +994,17 @@ async fn consolidate_contact_memory_inner(
         })
         .unwrap_or_default();
     let previous_card = effective_memory_card(&memory);
-    let mut compact =
-        compact_memory_card_with_previous(&card_typed, Some(&previous_card), &discarded_list);
+    // H17：用 active profile 的记忆维度驱动 cap（DEFAULT 销售八维与写死表等价；
+    // 情感 profile 声明的情绪史/纪念日槽在此按各自 cap 截断，防无界增长）。
+    let active_profile =
+        crate::agent::domain_profile::load_active_domain_profile(&state.db, &contact.workspace_id)
+            .await;
+    let mut compact = compact_memory_card_with_dimensions(
+        &card_typed,
+        Some(&previous_card),
+        &discarded_list,
+        &active_profile.memory_dimensions,
+    );
     // agent-autonomy-loop W5 / Task 6.4：把 consolidator 输出的 deprecatedFacts /
     // conflicts 应用到合并后的 typed card；warnings 写入 agent_run_logs。
     let mut consolidator_warnings =
