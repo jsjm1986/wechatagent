@@ -255,12 +255,6 @@ pub async fn generate_domain_profile_candidate(
     profile.seeded_by = Some("generated_by_ai".to_string());
     profile.created_at = now;
     profile.updated_at = now;
-    profile.current_version = false; // 候选草稿:需人审 → publish → activate
-    profile.previous_version = None;
-    profile.is_active = false;
-    profile.seeded_by = Some("generated_by_ai".to_string());
-    profile.created_at = now;
-    profile.updated_at = now;
 
     let inserted = state.db.domain_profiles().insert_one(&profile, None).await?;
     let hex = inserted
