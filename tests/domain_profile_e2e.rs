@@ -80,6 +80,7 @@ async fn db_create_profile(
         conversation_modes: vec![],
         operation_mode: OperationMode::default(),
         grounding_gate_bypass_without_claim: false,
+        distrust_self_reported_low_risk: false,
         chunk_roles: vec![],
         outcome_polarity: OutcomePolarity::default(),
         methodology_generator_preamble: None,
