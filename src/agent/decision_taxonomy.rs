@@ -27,28 +27,14 @@ use crate::agent::taxonomy::{
 use crate::agent::types::AgentDecision;
 use crate::db::Database;
 
-/// Reply Agent 决策内需要校验的标签字段。新增维度仅扩展本表。
+/// universal-domain-adaptation H2：参与决策校验的维度集合不再写死，由调用方传入
+/// `decision_dimension_kinds(active_profile)`。DEFAULT 销售域返回
+/// `["customer_stage","intent_level"]`，逐字等价改造前的 `TAGGED_FIELDS` const。
 ///
-/// 元组：`(kind 名称, getter, setter)`。`getter` 取当前值；`setter` 在 alias 命中
-/// 时写回 canonical id。`kind` 必须与 `system_taxonomies.kind` 中的 snake_case
-/// 字段名一致（`customer_stage` / `intent_level` / 后续 `objection_type`）。
-type Getter = fn(&AgentDecision) -> Option<&str>;
-type Setter = fn(&mut AgentDecision, String);
+/// 取值读写经 [`super::domain_signals::get_dimension`] / `set_dimension`：销售域两维
+/// 走 typed 字段，其它行业维度走 `domain_signals` 容器。
 
-const TAGGED_FIELDS: &[(&str, Getter, Setter)] = &[
-    (
-        "customer_stage",
-        |d| d.customer_stage.as_deref(),
-        |d, v| d.customer_stage = Some(v),
-    ),
-    (
-        "intent_level",
-        |d| d.intent_level.as_deref(),
-        |d, v| d.intent_level = Some(v),
-    ),
-];
-
-/// 纯函数：对 [`AgentDecision`] 中标签字段做 4 路分支。
+/// 纯函数：对 [`AgentDecision`] 中 `dimension_kinds` 列出的每个维度做 4 路分支。
 ///
 /// - `Active` → 不动；
 /// - `AliasActive(canonical)` → 写回 canonical id（reviewer 看到 canonical）；
@@ -59,13 +45,14 @@ const TAGGED_FIELDS: &[(&str, Getter, Setter)] = &[
 /// 返回 `(risks, candidates)`。**不**触发 review fail —— 候选偏离是软门。
 pub(crate) fn classify_decision_tags(
     decision: &mut AgentDecision,
+    dimension_kinds: &[String],
     scope_account_id: &str,
     cache: &TaxonomyCache,
 ) -> (Vec<String>, Vec<(String, String)>) {
     let mut risks: Vec<String> = Vec::new();
     let mut candidates: Vec<(String, String)> = Vec::new();
-    for (kind, get, set) in TAGGED_FIELDS {
-        let raw = match get(decision) {
+    for kind in dimension_kinds {
+        let raw = match super::domain_signals::get_dimension(decision, kind) {
             Some(v) if !v.trim().is_empty() => v.to_string(),
             _ => continue,
         };
@@ -73,7 +60,7 @@ pub(crate) fn classify_decision_tags(
             TaxonomyMatch::Active => {}
             TaxonomyMatch::AliasActive(canonical) => {
                 if canonical != raw {
-                    set(decision, canonical);
+                    super::domain_signals::set_dimension(decision, kind, canonical);
                 }
             }
             TaxonomyMatch::Deprecated => {
@@ -81,7 +68,7 @@ pub(crate) fn classify_decision_tags(
             }
             TaxonomyMatch::CandidateNew => {
                 risks.push(format!("taxonomy_candidate:{kind}:{raw}"));
-                candidates.push(((*kind).to_string(), raw));
+                candidates.push((kind.clone(), raw));
             }
         }
     }
@@ -91,15 +78,18 @@ pub(crate) fn classify_decision_tags(
 /// 生产入口：调 [`classify_decision_tags`] 拿 risks/candidates，candidate 列表
 /// 通过 `tokio::spawn` 异步 upsert（best-effort，失败仅 warn）。
 ///
+/// `dimension_kinds` 由调用方从 active DomainProfile 取（`decision_dimension_kinds`）。
 /// 仅要求 tokio runtime 在场（webhook / worker 入口都满足）。返回 risks 由调用方
 /// append 到 `promote_risks`。
 pub(crate) fn validate_and_normalize_decision(
     db: &Database,
     decision: &mut AgentDecision,
+    dimension_kinds: &[String],
     scope_account_id: &str,
 ) -> Vec<String> {
     let cache = global_taxonomy_cache();
-    let (risks, candidates) = classify_decision_tags(decision, scope_account_id, &cache);
+    let (risks, candidates) =
+        classify_decision_tags(decision, dimension_kinds, scope_account_id, &cache);
     spawn_candidate_upserts(db, scope_account_id, candidates);
     risks
 }
@@ -133,13 +123,15 @@ fn spawn_candidate_upserts(
 }
 
 /// 测试入口：手动注入 cache（绕过全局单例 + db），便于 PBT。
+/// 默认用销售域两维（与 DEFAULT profile 的 `decision_dimension_kinds` 一致）。
 #[cfg(test)]
 pub(crate) fn classify_with_cache_for_tests(
     decision: &mut AgentDecision,
     scope_account_id: &str,
     cache: &std::sync::Arc<TaxonomyCache>,
 ) -> (Vec<String>, Vec<(String, String)>) {
-    classify_decision_tags(decision, scope_account_id, cache)
+    let dims = vec!["customer_stage".to_string(), "intent_level".to_string()];
+    classify_decision_tags(decision, &dims, scope_account_id, cache)
 }
 
 #[cfg(test)]
@@ -175,6 +167,8 @@ mod tests {
                 description: String::new(),
                 aliases: aliases.iter().map(|s| s.to_string()).collect(),
                 status: status.to_string(),
+                priority_weight: None,
+                is_terminal: false,
             },
             updated_at: DateTime::now(),
             version: 1,
@@ -334,6 +328,55 @@ mod tests {
         assert_eq!(
             cands,
             vec![("intent_level".to_string(), "unicorn_tier".to_string())]
+        );
+    }
+
+    #[test]
+    fn non_sales_dimension_from_container_is_classified_and_rewritten() {
+        // universal-domain-adaptation H2：非销售域维度（如陪伴域 relationship_closeness）
+        // 不是 typed 字段，取值落在 domain_signals 容器。传入含该维度的 dimension_kinds
+        // 后，classify 应能从容器读取、命中 alias 时改写回容器。
+        let cache = mk_cache(vec![mk_entry(
+            "global",
+            "relationship_closeness",
+            "intimate",
+            "active",
+            &["亲密期", "热恋"],
+        )]);
+        let mut d = AgentDecision::default();
+        d.domain_signals
+            .insert("relationship_closeness".to_string(), "热恋".to_string());
+        let dims = vec!["relationship_closeness".to_string()];
+        let (risks, cands) = classify_decision_tags(&mut d, &dims, "acct-x", &cache);
+
+        assert_eq!(
+            d.domain_signals.get_str("relationship_closeness").ok(),
+            Some("intimate"),
+            "容器维度的 alias 应被改写为 canonical id"
+        );
+        assert!(risks.is_empty() && cands.is_empty());
+    }
+
+    #[test]
+    fn non_sales_dimension_unknown_emits_candidate() {
+        // 容器维度的未知值也应进候选队列（与 typed 维度一致的软门语义）。
+        let cache = mk_cache(vec![mk_entry(
+            "global",
+            "emotional_state",
+            "calm",
+            "active",
+            &[],
+        )]);
+        let mut d = AgentDecision::default();
+        d.domain_signals
+            .insert("emotional_state".to_string(), "焦虑不安".to_string());
+        let dims = vec!["emotional_state".to_string()];
+        let (risks, cands) = classify_decision_tags(&mut d, &dims, "acct-x", &cache);
+
+        assert_eq!(risks, vec!["taxonomy_candidate:emotional_state:焦虑不安"]);
+        assert_eq!(
+            cands,
+            vec![("emotional_state".to_string(), "焦虑不安".to_string())]
         );
     }
 }

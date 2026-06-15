@@ -143,6 +143,13 @@ pub struct Contact {
     /// 上限 1000 字符，由 `PUT /api/contacts/:id/custom-agent-instructions` 维护。
     #[serde(default)]
     pub custom_agent_instructions: Option<String>,
+    /// universal-domain-adaptation H8：单客户运营范式覆盖（优先级高于
+    /// `DomainProfile.operation_mode`，承接「因用户而异」）。`None` → 用 profile 范式。
+    /// 例：某老客户「只维护不推进」→ 设 `operation_mode_override.funnel.enabled=false`，
+    /// 单独对他关漏斗，不影响同号其他客户。解析见
+    /// [`resolve_operation_mode`](crate::planner::resolve_operation_mode)。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation_mode_override: Option<OperationMode>,
     pub agent_profile: Option<AgentProfile>,
     pub memory_summary: Option<String>,
     pub playbook_id: Option<ObjectId>,
@@ -191,12 +198,14 @@ pub struct Contact {
     /// 缺字段时反序列化为空 Vec，向前兼容历史 contact 文档。
     #[serde(default)]
     pub intent_trajectory: Vec<IntentTrajectoryEntry>,
-    /// 自学习采集管道 S5：admin 手动标记的成交事件（正例-only，稀疏 + 延迟）。
-    /// 成交（T0 硬事件）不可从 WeChat 文字入站观测，只能由运营人员手动登记；
-    /// 本字段是未来 PU-learning / 延迟反馈归因的唯一正例来源。本阶段只采集、
-    /// 不参与任何评分或置信反推。缺字段时反序列化为空 Vec，向前兼容历史文档。
-    #[serde(default)]
-    pub deal_events: Vec<DealEvent>,
+    /// 自学习采集管道 S5：admin 手动标记的**结果/成效事件**（正例-only，稀疏 + 延迟）。
+    /// 业务结果（T0 硬事件，如成交 / 报名 / 转化 / 履约完成——具体语义因行业而定）
+    /// 不可从 WeChat 文字入站观测，只能由运营人员事后登记；本字段是未来 PU-learning /
+    /// 延迟反馈归因的唯一正例来源。本阶段只采集、不参与任何评分或置信反推。缺字段时
+    /// 反序列化为空 Vec，向前兼容历史文档；`alias = "deal_events"` 让改名前写入的旧库
+    /// 文档继续可读（universal-domain-adaptation H10：从销售域 `deal_events` 泛化）。
+    #[serde(default, alias = "deal_events")]
+    pub outcome_events: Vec<OutcomeEvent>,
     /// Phase E / E3：联系人语种（BCP-47 短形式，如 `zh-CN` / `en-US`）。
     /// `load_prompt_for_contact` 在 prompt_templates 多 locale 并存时按本字段
     /// 选最匹配版本；缺字段时反序列化为 None，由 `contact_locale_or_default`
@@ -207,21 +216,24 @@ pub struct Contact {
     pub updated_at: DateTime,
 }
 
-/// 自学习采集管道 S5：单条成交事件（admin 手动标记）。
+/// 自学习采集管道 S5：单条**结果/成效事件**（admin 手动标记）。
 ///
-/// 设计取舍——成交是 T0 硬事件，但 WeChat 私聊入站只有文字，系统无法自动观测
-/// 支付/下单；唯一可信来源是运营人员事后登记。因此该结构刻意只承载"被标记的
-/// 客观事实"（标记时间、可选实际发生时间、可选金额），不含任何 LLM 解释或
+/// 设计取舍——业务结果是 T0 硬事件，但 WeChat 私聊入站只有文字，系统无法自动观测
+/// 支付/下单/报名/履约；唯一可信来源是运营人员事后登记。因此该结构刻意只承载
+/// "被标记的客观事实"（标记时间、可选实际发生时间、可选金额），不含任何 LLM 解释或
 /// 置信度反推。本阶段仅落库，作为未来归因/PU-learning 的正例。
+///
+/// universal-domain-adaptation H10：从销售域 `DealEvent`（"成交"）泛化为行业中性的
+/// `OutcomeEvent`（"成效"）。`amount`/`currency` 字段对无金额语义的行业可留空。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
-pub struct DealEvent {
-    /// admin 在后台点击"标记成交"的时间。
+pub struct OutcomeEvent {
+    /// admin 在后台点击"标记成效"的时间。
     pub marked_at: DateTime,
-    /// 成交实际发生时间（admin 可回填；缺省时下游用 `marked_at` 近似）。
+    /// 结果实际发生时间（admin 可回填；缺省时下游用 `marked_at` 近似）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub occurred_at: Option<DateTime>,
-    /// 成交金额（可选，业务自行决定是否登记）。
+    /// 金额（可选，业务自行决定是否登记；无金额语义的行业留空）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub amount: Option<f64>,
     /// 金额币种（ISO-4217 短码，如 `CNY`）；与 `amount` 配套。
@@ -668,6 +680,12 @@ pub struct OperationDomainConfig {
 
 fn default_version_one() -> i32 {
     1
+}
+
+/// universal-domain-adaptation H8：`OperationMode` 三驱动力 `enabled` 字段的
+/// serde 默认值 = `true`（缺字段 / 旧文档 → 驱动力默认开启 = 当前销售域行为）。
+fn default_true() -> bool {
+    true
 }
 
 /// Phase B / B4：`operation_state_policies` collection 行结构。
@@ -1169,6 +1187,412 @@ pub struct DomainField {
     pub alias_of: Option<String>,
 }
 
+/// universal-domain-adaptation Phase 0：行业/产品「总装配单」。
+///
+/// 让系统对行业**零假设**：一个 `DomainProfile` 声明本行业「参与决策的画像维度
+/// + 关联 chunk 字段表 + prompt 片段 + 承诺词表 + completeness 维度」，由引导层 AI
+/// 对话生成候选 → 人审 → publish。运行时按 `is_active=true` 加载（每 workspace 一条）；
+/// 无 active 时 fallback 到内置 `DEFAULT_PROFILE`（等价当前销售域写死行为，保证零配置
+/// 启动与历史一致）。
+///
+/// 维度的**取值字典**仍存 `system_taxonomies`（按 `kind` 关联，复用 `check_value`
+/// 的 alias 归一/候选发现）；本结构只声明「本行业有哪些维度、哪些进决策校验」。
+/// 版本灰度 4 字段与 [`TaxonomyEntry`] / `DomainSchema` 对齐（E5-T1）。
+///
+/// Phase 0 仅落存储 + 加载器，运行时**暂不消费**（并行加载、零行为变化）；
+/// 消费解耦在 Phase 1。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DomainProfile {
+    #[serde(rename = "_id", skip_serializing_if = "Option::is_none")]
+    pub id: Option<ObjectId>,
+    pub profile_id: String,
+    pub workspace_id: String,
+    pub display_name: String,
+    #[serde(default)]
+    pub description: String,
+    /// 参与/不参与决策的画像维度声明（替代 `decision_taxonomy::TAGGED_FIELDS` const 表）。
+    #[serde(default)]
+    pub profile_dimensions: Vec<ProfileDimension>,
+    /// 关联的 chunk 字段表（引用 `DomainSchema.schema_id`）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub domain_schema_id: Option<String>,
+    /// 行业 prompt 片段（注入决策 prompt，替代写死的销售域维度语义文案）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_fragment: Option<String>,
+    /// universal-domain-adaptation H12：本行业「出厂人格本体」覆盖（替代 `prompts.rs`
+    /// 写死的销售顾问 user soul）。`Some` 时整体替换决策系统提示的 Soul 层；`None`
+    /// 时回落 DB published soul + 内置销售域兜底（DEFAULT_PROFILE 即 `None`，逐字等价）。
+    /// 与 [`Self::prompt_fragment`] 区别：fragment 是**叠加**的业务上下文层，本字段是
+    /// **替换**的人格本体。**红线**：boundary_protection 边界保护硬规则不在此字段、
+    /// 继续由 `user.reply.policy` 写死，本字段只换人格口吻不放宽边界守护。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub soul_override: Option<String>,
+    /// universal-domain-adaptation H12：本行业「运营方法论本体」覆盖（替代
+    /// `prompts.rs::default_playbook` 写死的成交准备度/复购方法论）。`Some` 时整体
+    /// 替换拼进 user message 的「当前运营方法」段；`None` 时回落 contact 绑定的
+    /// playbook + 内置销售域兜底（DEFAULT_PROFILE 即 `None`，逐字等价）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub methodology_override: Option<String>,
+    /// 本行业绝对化承诺词表（替代 `guards.rs` 写死的中文销售词）。
+    #[serde(default)]
+    pub commitment_markers: CommitmentMarkers,
+    /// completeness 审计维度（替代 `catalog.rs` 写死的五维 coverage）。
+    #[serde(default)]
+    pub coverage_dimensions: Vec<CoverageDimension>,
+    /// universal-domain-adaptation H6：声明哪个画像维度驱动 planner 停滞计时
+    /// （替代写死的 `customer_stage`）。`None` 时 planner fallback 到内置默认
+    /// `customer_stage`（DEFAULT_PROFILE 下即如此，零行为变化）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stagnation_dimension: Option<String>,
+    /// universal-domain-adaptation H9：本行业允许的 conversationMode 取值集合
+    /// （替代 `agent::types::CONVERSATION_MODE_VALUES` 写死的四模式枚举）。空 Vec
+    /// 时 `validate_and_promote` fallback 到内置默认四模式（DEFAULT_PROFILE 即声明
+    /// 这四个，零行为变化）。情感陪伴等行业可声明 `intimate_companion` 等额外模式。
+    /// **红线**：`boundary_protection` 反接管语义无论本集合是否含它都继续由 prompt
+    /// 写死守护，本字段只放宽"用哪些模式"，不放宽"反人工接管"。
+    #[serde(default)]
+    pub conversation_modes: Vec<String>,
+    /// universal-domain-adaptation H8：本行业默认运营范式（三驱动力开关 + 阈值）。
+    /// `OperationMode::default()` = 三全开 + 阈值 None 回落全局 config（DEFAULT_PROFILE
+    /// 即如此，planner 金标零变化）。陪伴/维护型行业可声明 `funnel.enabled=false`。
+    /// 单客户覆盖见 [`Contact::operation_mode_override`]。
+    #[serde(default)]
+    pub operation_mode: OperationMode,
+    /// universal-domain-adaptation H14：本域是否在「无产品声明」时旁路 grounding
+    /// 软分数硬闸（review `classify_dual_gate` 里 `knowledge_grounding_score <
+    /// product_accuracy_block_below` 的判罚）。`false`（DEFAULT/老库 serde 默认）=
+    /// 不旁路 = 每条回复都判 grounding 硬闸（销售域字节等价）；`true` = 纯关系/情感
+    /// 域，仅当本条 `claim_analysis.requiresProductKnowledge=true` 时才纳入闸，
+    /// 纯情感回复不再被 grounding 低分误拦。**红线**：旁路仅作用于 grounding 软分数
+    /// 硬闸，`blocked_unverified_product_claim`（R5.4 verified 强约束 + 漏判探针）
+    /// 任何取值下都不变。运行时经 `UserRuntimeParameters` 同名字段消费。
+    #[serde(default)]
+    pub grounding_gate_bypass_without_claim: bool,
+    /// universal-domain-adaptation H16：本行业知识切片的「用途角色」表（替代
+    /// `knowledge_router.rs` 写死的销售四态分桶 + header）。空 Vec 时
+    /// `format_operation_knowledge_for_prompt` 回落内置销售四态（DEFAULT_PROFILE 即
+    /// 声明这四态，逐字等价）。换行业可声明任意角色（如情感域情绪记忆/纪念日）。
+    #[serde(default)]
+    pub chunk_roles: Vec<ChunkRole>,
+    /// universal-domain-adaptation H11：本行业「自学习极性」声明（替代写死的销售域
+    /// 正/负极 outcome 词表——正极 `user_replied_buying_signal`、负极 objection/
+    /// stop_requested/unsubscribed/negative/complaint 五词）。极性是横向渗透三条自学习
+    /// 回路（① dynamic_confidence 召回排序、② negative_example 反向训练、
+    /// ③ escalation 卡死请示）的单一真相源。空集（`OutcomePolarity::default()`，
+    /// DEFAULT_PROFILE 下由 seed 显式填回 5+1 销售词）时各消费方回落内置销售极性，
+    /// 逐字等价。情感/陪伴域可声明「示弱/倾诉/情绪表达」为正极，让优质回复被学习。
+    /// **红线**：删失语义不可配（Iron Law ②）——沉默/pending/未分类一律 Censored、
+    /// 绝不臆测为负；本字段只声明正/负集，不声明"沉默算什么"。
+    #[serde(default)]
+    pub outcome_polarity: OutcomePolarity,
+    /// universal-domain-adaptation H15：本行业「经营公式」声明（替代写死的销售域
+    /// 四公式 Trust / ConversionReadiness / EmotionalValue / NextBestActionScore）。
+    /// reviewer 自检维度 + `/evaluations` ground-truth 度量的锚点。空集
+    /// （`Vec::default()`，DEFAULT_PROFILE 下由 seed 显式填回销售四公式）时各消费方
+    /// 回落内置销售公式常量，逐字等价。不进任何硬闸。
+    #[serde(default)]
+    pub business_formulas: Vec<BusinessFormula>,
+    /// universal-domain-adaptation H17：本行业 memoryCard 的「记忆维度」声明（替代
+    /// 写死的销售域记忆槽位——preferences/doNotDo/commitments/objections/openLoops/
+    /// openQuestions/confirmedFacts/conflicts 八槽 + 各自 cap + consolidator prompt
+    /// 骨架 + memoryCandidate.type 合法集）。空集（`Vec::default()`，DEFAULT_PROFILE 下
+    /// 由 seed 显式填回销售八槽 + 原 cap）时各消费方回落内置销售维度，逐字等价。
+    /// 情感/陪伴域可声明「情绪史 / 纪念日 / 重要事件」等专属记忆槽。
+    /// 注：coreFacts/recentFacts/deprecatedFacts 三 typed 数组是 memoryCard 结构骨架
+    /// （固定 cap 6/10/20），coreProfile/relationshipState 是固定对象结构——均**不**
+    /// 纳入本字段，只有 `extra` 容器里的业务数组槽位走 memory_dimensions。
+    #[serde(default)]
+    pub memory_dimensions: Vec<MemoryDimension>,
+    /// universal-domain-adaptation C3：引导层「运营方法生成器」（playbook.generator /
+    /// optimizer）的领域专属 system 引导语。`None` 时回落内置**领域中性**生成器引导语
+    /// （C3 清理后 `PLAYBOOK_METHODOLOGY_SYSTEM` 已去除「消费心理学/顾问式销售/异议/
+    /// 顾问朋友」等销售偏见词——§7 护栏：引导层 prompt 不得写死行业词，否则会污染 AI
+    /// 给非销售行业生成的 profile）。`Some` 时整体替换，让特定行业声明自己的生成偏好。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub methodology_generator_preamble: Option<String>,
+    /// E5-T1 多版本灰度：同 `(workspace_id, profile_id)` 下 `version` 单调递增。
+    #[serde(default = "default_version_one")]
+    pub version: i32,
+    #[serde(default)]
+    pub current_version: bool,
+    #[serde(default)]
+    pub previous_version: Option<i32>,
+    /// 写入来源：`generated_by_ai` / `manual` / `default`。
+    #[serde(default)]
+    pub seeded_by: Option<String>,
+    pub is_active: bool,
+    pub created_at: DateTime,
+    pub updated_at: DateTime,
+}
+
+/// universal-domain-adaptation H8：运营范式 = 声明启用哪些「主动触达驱动力」
+/// + 各自阈值。三驱动力对应 planner 三扫描器（funnel→`scan_stage_stagnation`、
+/// silence→`scan_silent`、commitment→`scan_commitments`）。
+///
+/// 全字段 `#[serde(default)]`，**缺省即「沿用全局 config」**——`OperationMode::default()`
+/// = 三驱动力 `enabled=true` + 所有阈值 `None`（回落 `AppConfig`），故 DEFAULT_PROFILE
+/// 与无 override 的 contact 下 planner 行为与改造前**逐字等价**（金标零变化）。
+///
+/// 两级声明：`DomainProfile.operation_mode`（行业默认范式）+
+/// `Contact.operation_mode_override`（单客户覆盖，承接「因用户而异」，优先级更高）。
+/// 解析走 [`resolve_operation_mode`](crate::planner::resolve_operation_mode)：
+/// `contact override ?? profile ?? OperationMode::default()`。
+///
+/// 范式落法：销售型 = 三全开（DEFAULT）；陪伴/情绪型 = `funnel.enabled=false`
+/// （不推进阶段、不被 stagnation 催）；关系维护型 = funnel 关、silence+commitment 开。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct OperationMode {
+    /// 沙漏推进驱动力（`scan_stage_stagnation`）。陪伴/维护型关掉它。
+    #[serde(default)]
+    pub funnel: FunnelMode,
+    /// 沉默唤醒驱动力（`scan_silent`）。跨范式通用。
+    #[serde(default)]
+    pub silence: SilenceMode,
+    /// 承诺到期驱动力（`scan_commitments`）。跨范式通用。
+    #[serde(default)]
+    pub commitment: CommitmentMode,
+    /// universal-domain-adaptation H19：作息门控覆盖。情感陪伴「晚上是黄金时段」
+    /// 可在此关掉静默时段抑制，让夜间主动/被动发送不被 22→8 压制。
+    #[serde(default)]
+    pub quiet_hours: QuietHoursMode,
+}
+
+impl Default for OperationMode {
+    fn default() -> Self {
+        Self {
+            funnel: FunnelMode::default(),
+            silence: SilenceMode::default(),
+            commitment: CommitmentMode::default(),
+            quiet_hours: QuietHoursMode::default(),
+        }
+    }
+}
+
+/// H8 漏斗推进驱动力。`enabled=false` → `scan_stage_stagnation` 对该 contact 短路。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct FunnelMode {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// 停滞推进阈值（天）。`None` → 回落 `strategic_planner_stage_stagnation_threshold_days`。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stagnation_threshold_days: Option<i64>,
+}
+
+impl Default for FunnelMode {
+    fn default() -> Self {
+        Self { enabled: true, stagnation_threshold_days: None }
+    }
+}
+
+/// H8 沉默唤醒驱动力。`enabled=false` → `scan_silent` 对该 contact 短路。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SilenceMode {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// 静默唤醒阈值（小时）。`None` → 回落 `strategic_planner_silent_threshold_hours`。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub threshold_hours: Option<i64>,
+}
+
+impl Default for SilenceMode {
+    fn default() -> Self {
+        Self { enabled: true, threshold_hours: None }
+    }
+}
+
+/// H8 承诺到期驱动力。`enabled=false` → `scan_commitments` 对该 contact 短路。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CommitmentMode {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// 承诺临近窗口（小时）。`None` → 回落
+    /// `strategic_planner_commitment_imminent_window_hours`。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub imminent_window_hours: Option<i64>,
+}
+
+impl Default for CommitmentMode {
+    fn default() -> Self {
+        Self { enabled: true, imminent_window_hours: None }
+    }
+}
+
+/// H19 作息门控覆盖。`enabled_override`：
+/// - `None`（默认）→ 沿用全局 `runtime.quiet_hours_enabled`（DEFAULT 逐字等价）；
+/// - `Some(false)` → 本 contact/范式**关闭**静默时段抑制（情感陪伴夜间黄金时段不被压制）；
+/// - `Some(true)` → 强制开启（即便全局关）。
+///
+/// 仅覆盖「是否启用静默」；起止小时 / 时区偏移继续走全局 runtime（避免在 contact
+/// 上重复一套作息参数；本阶段需求只是「陪伴型整段关掉作息门」）。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct QuietHoursMode {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled_override: Option<bool>,
+}
+
+impl Default for QuietHoursMode {
+    fn default() -> Self {
+        Self { enabled_override: None }
+    }
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProfileDimension {
+    pub kind: String,
+    pub display_name: String,
+    /// 是否进 Reply Agent 决策的 taxonomy 校验（对应旧 `TAGGED_FIELDS` 成员）。
+    #[serde(default)]
+    pub participates_in_decision: bool,
+    /// 注入 prompt 的语义说明（如「就诊阶段：初诊/复诊/方案确认/已治疗」）。
+    #[serde(default)]
+    pub description: String,
+}
+
+/// 绝对化承诺词表，按 `commitment_claim_class` 分两类（替代 `guards.rs` 写死词表）。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct CommitmentMarkers {
+    /// 产品效果类（如销售域「成功率/见效/回款」，医疗域「根治率」，教培域「保过」）。
+    #[serde(default)]
+    pub product_effect: Vec<String>,
+    /// 纯语气类（如「保证/一定能/绝对」）。
+    #[serde(default)]
+    pub tone_only: Vec<String>,
+}
+
+/// completeness 审计的一个 coverage 维度（替代 `catalog.rs` 写死的五维）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CoverageDimension {
+    pub key: String,
+    pub display_name: String,
+    #[serde(default)]
+    pub required: bool,
+    /// universal-domain-adaptation H5-b：本维度判 `verifiedFact=true` 的命中锚点
+    /// 语义（注入 completeness 审计 prompt 的「命中锚点」段，替代 `catalog.rs` 写死的
+    /// 销售五维锚点散文）。`None` 时该维度不产出锚点行（DEFAULT_PROFILE 五维逐字
+    /// 复刻原 prompt 锚点 → 销售域 prompt 字节等价）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anchor_hint: Option<String>,
+}
+
+/// universal-domain-adaptation H16：知识切片的「用途角色」（替代 `knowledge_router.rs`
+/// 写死的 product_fact/style_template/peer_case/negative_example 销售四态分桶 + header
+/// 文案）。一个 `ChunkRole` 声明：本行业某类 chunk 的 `chunk_type` key、注入 prompt 的
+/// 分段 header（含使用指令）、输出顺序、是否为 fallback 桶（未匹配任何 key 的 chunk
+/// 归入此桶）。DEFAULT_PROFILE 逐字复刻销售四态 → 渲染结果字节等价；换行业=另一份
+/// chunk_roles（如情感域「情绪记忆/纪念日」角色）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChunkRole {
+    /// 与 `OperationKnowledgeChunk.chunk_type` 字面量对齐的 key。
+    pub key: String,
+    /// 注入 prompt 的分段标题 + 使用指令（如「【产品事实 product_fact】仅 verified…」）。
+    pub header: String,
+    /// 输出顺序（升序）；DEFAULT 销售四态 0..3 复刻原 `order[]` 固定顺序。
+    #[serde(default)]
+    pub order: i32,
+    /// 是否为 fallback 桶：`chunk_type` 未命中任何 role.key 的切片归入此桶。
+    /// DEFAULT 销售域 = `product_fact`（逐字复刻原「缺省/任意其它值→product_fact」）。
+    #[serde(default)]
+    pub is_fallback: bool,
+}
+
+/// universal-domain-adaptation H17：memoryCard 的「记忆维度」（替代 `memory.rs` 写死的
+/// 销售域记忆槽位 + cap + consolidator prompt 骨架 + memoryCandidate.type 合法集）。
+/// 一个 `MemoryDimension` 声明：本行业某类记忆的 `extra` 容器数组键名 `key`、
+/// consolidator prompt 里的人类标签 `display_name`、数组上限 `cap`（无界增长唯一闸口）、
+/// 是否核心维度 `is_core`、consolidator 填写指引 `prompt_hint`、是否作为
+/// memoryCandidate.type 合法值 `candidate_type`。DEFAULT_PROFILE 逐字复刻销售八槽
+/// （preferences/doNotDo/commitments/objections/openLoops/openQuestions/confirmedFacts/
+/// conflicts）+ 各自原 cap → 渲染/cap 字节等价；换行业=另一份 memory_dimensions（如
+/// 情感域「情绪史 emotionHistory / 纪念日 anniversaries / 重要事件 importantEvents」）。
+/// 注：coreFacts/recentFacts/deprecatedFacts 是 memoryCard typed 骨架（固定 cap 6/10/20），
+/// coreProfile/relationshipState 是固定对象结构——均**不**纳入本字段。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MemoryDimension {
+    /// `MemoryCardTyped.extra` 容器里的数组键名（camelCase，如 "objections" /
+    /// "emotionHistory"），同时是 consolidator prompt JSON 骨架里的字段名。
+    pub key: String,
+    /// consolidator prompt limit 散文 / 骨架注释里的人类标签。
+    pub display_name: String,
+    /// 该槽位数组上限（替代 `compact_memory_card_with_previous` 写死的 cap）。
+    pub cap: usize,
+    /// 是否核心维度（保留位，供 prompt 注入优先级 / 未来分层；DEFAULT 不区分）。
+    #[serde(default)]
+    pub is_core: bool,
+    /// consolidator prompt 里该维度的填写指引（None 时不产出额外指引行；
+    /// DEFAULT 销售八槽的 limit 散文经渲染函数生成，保持 prompt 字节等价）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_hint: Option<String>,
+    /// 是否作为 Reply Agent `memoryCandidates[].type` 的合法枚举值。DEFAULT 下
+    /// preference/doNotDo/commitment/objection/openLoop 五槽为 true（对齐当前 type
+    /// 枚举），fact/conflict 由系统固定派生不依赖本字段。
+    #[serde(default)]
+    pub candidate_type: bool,
+}
+
+/// universal-domain-adaptation H11：本行业「自学习极性」= 声明哪些 outcome_status
+/// 算正极（Hit，强化学习/优质示范）、哪些算负极（Block，反向训练/请示卡死）。
+///
+/// 这是横向渗透三条已落地自学习回路的**单一真相源**：
+/// - 回路① `gap_signals::classify_outcome_label` → dynamic_confidence 召回排序；
+/// - 回路② `reaction::compute_reviewer_misjudge_signal_with_polarity` → negative_example 反向训练；
+/// - 回路③ `escalation::logic` 末轮负面判定 → 连续未推进时卡死请示。
+///
+/// **删失语义不可配（Iron Law ②）**：不在正/负集里的一切（含沉默/pending/空/
+/// 未分类/未知）一律 **Censored**，绝不臆测为负。本结构只声明正/负集，不声明
+/// "沉默算什么"。正极优先于负极（同一 outcome 同时被两集声明时取 Hit，防误配把
+/// 购买信号当负例）。
+///
+/// 全字段 `#[serde(default)]`。**注意**：`OutcomePolarity::default()` 是**空集**
+/// （非销售词）——DEFAULT_PROFILE 的销售极性由 `domain_profile.rs` 的 seed **显式**
+/// 填回 `["user_replied_buying_signal"]` + 5 负词。各消费方在收到空集时回落内置
+/// 销售极性常量（`gap_signals::DEFAULT_POSITIVE_OUTCOMES` /
+/// `DEFAULT_NEGATIVE_OUTCOMES`），故 DEFAULT 与老库（无 outcome_polarity 字段）下
+/// 三回路行为逐字等价。换行业 = 另一份 profile 声明本行业正/负极。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct OutcomePolarity {
+    /// 正极 outcome_status 集（→ Hit）。DEFAULT seed = `["user_replied_buying_signal"]`。
+    #[serde(default)]
+    pub positive: Vec<String>,
+    /// 负极 outcome_status 集（→ Block）。DEFAULT seed = objection/stop_requested/
+    /// unsubscribed/negative/complaint 五词。
+    #[serde(default)]
+    pub negative: Vec<String>,
+}
+
+/// universal-domain-adaptation H15：本行业「经营公式」声明 = 一组可读的自检公式
+/// （`key` + 人类可读展开式 `expression` + 中文 `display_name`），替代写死在
+/// prompt 散文/reviewer rubric/`/evaluations` 里的销售域四公式（Trust /
+/// ConversionReadiness / EmotionalValue / NextBestActionScore）。
+///
+/// 公式是 reviewer 自检维度 + `/evaluations` ground-truth 度量的锚点，横跨四处副本
+/// （policy prompt 英文式、playbook method_prompt 中文式、reviewer formulaBreakdown、
+/// evaluations 硬编码 formulas 数组）。本结构是其**单一真相源**——空集
+/// （`Vec::default()`，DEFAULT_PROFILE 下由 `domain_profile.rs` 的 seed 显式填回
+/// 销售四公式）时各消费方回落内置销售公式常量，逐字等价。情感/陪伴域可声明
+/// 「情绪价值 / 陪伴深度」类公式，让 reviewer 自检与度量贴合本行业经营目标。
+///
+/// **不进任何硬闸**：公式只占 reviewer 注意力 + 被 `/evaluations` 当度量基准，
+/// 不参与 send/block 判决（与 §7 护栏一致——引导层不得写死行业词，但 DEFAULT
+/// 逐字复刻销售域以保证零行为变化）。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct BusinessFormula {
+    /// 公式 key，与 reviewer `formulaBreakdown` / `/evaluations` formulas 数组对齐
+    /// （如 `trust` / `conversionReadiness` / `emotionalValue` / `nextBestActionScore`）。
+    pub key: String,
+    /// 人类可读的公式展开式（如 `Motivation × ProductFit × Timing × Trust ÷ Friction`）。
+    /// 注入 prompt 自检段 + reviewer formulaBreakdown 模板。
+    pub expression: String,
+    /// 中文展示名（如「成交准备度」）。playbook 中文公式段用。
+    #[serde(default)]
+    pub display_name: String,
+    /// `/evaluations` 把该公式当 ground-truth 度量时，预测值缺失则回落到哪个
+    /// reviewer score key（替代写死的 `score_key_for` 映射）。DEFAULT 四公式分别
+    /// 回落 humanLike / conversionReadiness / emotionalValue / relationshipProgress。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub eval_score_key: Option<String>,
+}
+
 /// catalog 重建队列：`apply_chunk_revision` 写完即 enqueue；catalog_rebuild_worker
 /// 每 200ms 取一批 status=queued 落库 `documents.catalog_summary_persisted`。
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1520,6 +1944,15 @@ pub struct TaxonomyValue {
     pub aliases: Vec<String>,
     /// `"active"` | `"deprecated"`。
     pub status: String,
+    /// universal-domain-adaptation H6：该取值的跟进优先级权重。planner 排序读它替代
+    /// 写死的 `stage_priority_weight` / `intent_level_weight` match 分支。`None` 时
+    /// planner fallback 到内置默认（保持旧库零行为变化）。
+    #[serde(default)]
+    pub priority_weight: Option<i32>,
+    /// universal-domain-adaptation H6：是否终态（成交后维护 / 冷却 / 沉默等）。planner
+    /// stagnation 段读它替代写死的 `TERMINAL_STAGES` 常量。旧库默认 `false`。
+    #[serde(default)]
+    pub is_terminal: bool,
 }
 
 /// agent-autonomy-loop W0：`taxonomy_candidates` 集合占位结构。
@@ -2051,6 +2484,12 @@ mod typed {
         pub cooldown_after_no_reply_hours: i64,
         #[serde(default = "defaults::hallucination_block_at")]
         pub hallucination_block_at: i32,
+        /// universal-domain-adaptation C1：压力风险 block 阈值（`PressureRisk ≥ 此值`
+        /// 则 block）。默认 7。此前是五闸里**唯一**写死在 `UserRuntimeParameters`
+        /// （= 7）而不走 typed 配置的阈值；typed 化后 H9 情感/陪伴场景可经运营域配置
+        /// 放宽（如调到 9，允许更主动的情感推进而不被压力门拦）。DEFAULT = 7 逐字等价。
+        #[serde(default = "defaults::pressure_risk_block_at")]
+        pub pressure_risk_block_at: i32,
         #[serde(default = "defaults::knowledge_grounding_block_below")]
         pub knowledge_grounding_block_below: i32,
         #[serde(default = "defaults::human_like_rewrite_below")]
@@ -2131,6 +2570,7 @@ mod typed {
                 follow_up_expires_hours: defaults::follow_up_expires_hours(),
                 cooldown_after_no_reply_hours: defaults::cooldown_after_no_reply_hours(),
                 hallucination_block_at: defaults::hallucination_block_at(),
+                pressure_risk_block_at: defaults::pressure_risk_block_at(),
                 knowledge_grounding_block_below: defaults::knowledge_grounding_block_below(),
                 human_like_rewrite_below: defaults::human_like_rewrite_below(),
                 emotional_value_rewrite_below: defaults::emotional_value_rewrite_below(),
@@ -2184,6 +2624,9 @@ mod typed {
         }
         pub fn hallucination_block_at() -> i32 {
             6
+        }
+        pub fn pressure_risk_block_at() -> i32 {
+            7
         }
         pub fn knowledge_grounding_block_below() -> i32 {
             7
@@ -2749,6 +3192,14 @@ mod typed {
         pub allowed_from: Vec<String>,
         #[serde(default)]
         pub allow_from_any: bool,
+        /// H13：是否初始态（空 from 唯一合法迁入目标）。替代引擎 / planner 写死的
+        /// `"new_contact"` 字面量。DEFAULT 状态机仅 new_contact=true。camelCase=`initial`。
+        #[serde(default)]
+        pub initial: bool,
+        /// H13：是否禁止主动触达（planner 不主动 emit + policy 禁 reply）。替代写死的
+        /// `state_key=="cooldown"` 特例。DEFAULT 状态机仅 cooldown=true。camelCase=`forbidsProactive`。
+        #[serde(default)]
+        pub forbids_proactive: bool,
         #[serde(default)]
         pub advance_signals: Vec<String>,
         #[serde(default)]
@@ -3176,6 +3627,8 @@ mod typed_tests {
             mongodb::bson::from_document(doc! {}).expect("default deserialize");
         assert_eq!(p.recent_message_limit, 12);
         assert_eq!(p.hallucination_block_at, 6);
+        // C1：pressure_risk_block_at 缺字段默认 7（DEFAULT 逐字等价旧写死值）。
+        assert_eq!(p.pressure_risk_block_at, 7);
         assert_eq!(p.run_token_budget, 30000);
         assert_eq!(p.run_max_llm_calls, 6);
     }
@@ -3185,11 +3638,14 @@ mod typed_tests {
         let doc = doc! {
             "recentMessageLimit": 24,
             "hallucinationBlockAt": 8,
+            "pressureRiskBlockAt": 9,
             "runTokenBudget": 50000_i64
         };
         let p: RuntimeParametersTyped = mongodb::bson::from_document(doc).expect("deserialize");
         assert_eq!(p.recent_message_limit, 24);
         assert_eq!(p.hallucination_block_at, 8);
+        // C1：H9 情感场景可经运营域配置放宽压力阈值（如 9）。
+        assert_eq!(p.pressure_risk_block_at, 9);
         assert_eq!(p.run_token_budget, 50000);
         // 其它字段 fallback 默认值。
         assert_eq!(p.knowledge_grounding_block_below, 7);
@@ -3624,6 +4080,20 @@ mod typed_tests {
             .find(|s| s.key == "new_contact")
             .expect("new_contact state");
         assert!(new_contact.allowed_from.iter().any(|s| s == "new_contact"));
+        // H13：DEFAULT 状态机的标志位经 camelCase 键正确反序列化——仅 new_contact 初始态、
+        // 仅 cooldown 禁主动触达，其余 state 两标志均 false（逐字等价护栏）。
+        assert!(new_contact.initial, "new_contact 必须是初始态");
+        assert!(!new_contact.forbids_proactive);
+        assert!(cooldown.forbids_proactive, "cooldown 必须禁主动触达");
+        assert!(!cooldown.initial);
+        for s in &typed.states {
+            if s.key != "new_contact" {
+                assert!(!s.initial, "{} 不应是初始态", s.key);
+            }
+            if s.key != "cooldown" {
+                assert!(!s.forbids_proactive, "{} 不应禁主动触达", s.key);
+            }
+        }
     }
 
     // ── agent-autonomy-loop W0 (Task 1.6) ──
@@ -3715,6 +4185,8 @@ mod typed_tests {
                 description: "首次建立联系，尚未深入沟通".to_string(),
                 aliases: vec!["新客".to_string(), "first-contact".to_string()],
                 status: "active".to_string(),
+                priority_weight: None,
+                is_terminal: false,
             },
             updated_at: now,
             version: 1,

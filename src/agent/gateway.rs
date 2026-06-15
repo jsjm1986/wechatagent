@@ -42,8 +42,9 @@ use super::decision::{
 use super::domain::USER_OPS_DOMAIN_ID;
 use super::escalation;
 use super::guards::{
-    classify_decision_action, enforce_state_action_policy, normalize_decision_runtime,
-    normalize_decision_state, planner_from_decision,
+    check_state_transition, classify_decision_action, enforce_state_action_policy,
+    initial_operation_state_key, normalize_decision_runtime, normalize_decision_state,
+    planner_from_decision,
 };
 use super::knowledge_router::{
     empty_knowledge_route, load_operation_knowledge,
@@ -194,7 +195,12 @@ pub async fn send_contact_message_gateway(
     let context_messages = load_context_messages(state, &contact, &runtime).await?;
     // task 6.3：边界处把 typed 转为 Document wire shape，下游 prompt 注入
     // 路径不变。
-    let context_pack = effective_memory_card_for_contact(&memory, &contact).to_document();
+    let context_pack = effective_memory_card_for_contact(
+        &memory,
+        &contact,
+        &initial_operation_state_key(domain_config.as_ref()),
+    )
+    .to_document();
     let knowledge_route = route_operation_knowledge(
         state,
         &contact,
@@ -605,7 +611,7 @@ async fn run_user_operation_gateway_inner(
     run_id: String,
     inbound: ConversationMessage,
     domain_config: Option<OperationDomainConfig>,
-    runtime: UserRuntimeParameters,
+    mut runtime: UserRuntimeParameters,
     should_abort_send: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
 ) -> AppResult<()> {
     // S1.1 (Phase 0)：派生 R0.1 envelope 的 (source_event_id, source_kind)，
@@ -655,6 +661,20 @@ async fn run_user_operation_gateway_inner(
 
     let recent_messages =
         load_recent_messages(state, &contact, runtime.recent_message_limit).await?;
+    // universal-domain-adaptation H4/H14：本 run 的 active DomainProfile 提前加载
+    // 一次（30s TTL 进程缓存，命中即廉价），供 finalize 阶段的承诺词表
+    // commitment_markers（H4）+ runtime grounding 闸开关（H14）消费。DEFAULT 销售域
+    // 词表逐字复刻 guards const、bypass=false → 行为字节等价。
+    let active_profile = crate::agent::domain_profile::load_active_domain_profile(
+        &state.db,
+        &contact.workspace_id,
+    )
+    .await;
+    // H14：用 active profile 覆盖 runtime 的 grounding 闸开关，让下游
+    // classify_dual_gate / finalize 据本域配置判 grounding 软分数硬闸是否条件化。
+    // DEFAULT profile = false → 与改造前逐字等价（无条件硬闸）。
+    runtime.grounding_gate_bypass_without_claim =
+        active_profile.grounding_gate_bypass_without_claim;
     let pending_tasks = load_pending_tasks(state, &contact).await?;
     let playbook = load_operation_playbook_for_contact(state, &contact).await?;
     let memory = load_or_create_operating_memory(state, &contact).await?;
@@ -663,7 +683,12 @@ async fn run_user_operation_gateway_inner(
     let _ = maybe_emit_unverified_warning(state, &contact).await;
     // task 6.3：边界处把 typed 转为 Document wire shape，下游 prompt 注入
     // 路径不变。
-    let memory_card = effective_memory_card_for_contact(&memory, &contact).to_document();
+    let memory_card = effective_memory_card_for_contact(
+        &memory,
+        &contact,
+        &initial_operation_state_key(domain_config.as_ref()),
+    )
+    .to_document();
     let should_refresh_context = false;
     let context_pack = memory_card;
     let initial_planner = RunPlannerResult {
@@ -899,6 +924,7 @@ async fn run_user_operation_gateway_inner(
         &selected_chunks,
         promote_risks.clone(),
         inbound.content.as_str(),
+        &active_profile.commitment_markers,
     );
     let FinalizeOutcome {
         review: finalized_review,
@@ -968,17 +994,23 @@ async fn run_user_operation_gateway_inner(
         // 30s 后 find_or_load 自动 reload，防 cache 永远 stale。任何 IO 故障被
         // find_or_load 内部 log 后吞掉。
         cache.find_or_load(&state.db).await;
+        // universal-domain-adaptation H7：校验维度集合改读 active DomainProfile。
+        // DEFAULT 销售域返回 ["customer_stage","intent_level"] 逐字等价。
+        // （复用本 run 顶部已加载的 active_profile，避免重复 load。）
+        let dimension_kinds =
+            crate::agent::domain_profile::decision_dimension_kinds(&active_profile);
         let outcome = compute_taxonomy_guard_outcome(
-            final_decision.customer_stage.as_deref(),
-            final_decision.intent_level.as_deref(),
+            &final_decision,
+            &dimension_kinds,
             &contact.account_id,
             &cache,
         );
-        if let Some(canonical) = outcome.customer_stage_rewrite.clone() {
-            final_decision.customer_stage = Some(canonical);
-        }
-        if let Some(canonical) = outcome.intent_level_rewrite.clone() {
-            final_decision.intent_level = Some(canonical);
+        for (kind, canonical) in &outcome.rewrites {
+            crate::agent::domain_signals::set_dimension(
+                &mut final_decision,
+                kind,
+                canonical.clone(),
+            );
         }
         for risk in &outcome.risks {
             if !review.risks.iter().any(|r| r == risk) {
@@ -1165,6 +1197,7 @@ async fn run_user_operation_gateway_inner(
                         &selected_chunks,
                         promote_risks.clone(),
                         inbound.content.as_str(),
+                        &active_profile.commitment_markers,
                     );
                     let FinalizeOutcome {
                         review: second_finalized_review,
@@ -1531,7 +1564,7 @@ async fn run_user_operation_gateway_inner(
         }
     }
 
-    apply_agent_updates(state, &contact, &final_decision, &runtime).await?;
+    apply_agent_updates(state, &contact, &final_decision, &runtime, domain_config.as_ref()).await?;
     apply_operating_memory_update(
         state,
         &contact,
@@ -1923,7 +1956,10 @@ pub(crate) async fn precheck_send_gateway(
         // - 醒来任务（is_deferred_wake）恰恰在醒来时刻跑，不应被自己触发的静默门挡回。
         if matches!(trigger, AgentTrigger::FollowUp(_))
             && !is_deferred_wake
-            && runtime.quiet_hours_enabled
+            && crate::agent::quiet_hours::effective_quiet_hours_enabled(
+                contact,
+                runtime.quiet_hours_enabled,
+            )
             && crate::agent::quiet_hours::is_quiet_now(
                 runtime.quiet_hours_start,
                 runtime.quiet_hours_end,
@@ -2435,6 +2471,7 @@ async fn apply_agent_updates(
     contact: &Contact,
     decision: &AgentDecision,
     runtime: &UserRuntimeParameters,
+    domain_config: Option<&OperationDomainConfig>,
 ) -> AppResult<()> {
     let mut set_doc = doc! {
         "updated_at": DateTime::now(),
@@ -2454,25 +2491,27 @@ async fn apply_agent_updates(
         let merged = merge_tags_union_capped(&contact.tags, &decision.tags, TAGS_PER_MESSAGE_CAP);
         set_doc.insert("tags", to_bson_array(&merged));
     }
-    if let Some(value) = non_empty_option(&decision.customer_stage) {
-        // 旧 customer_stage 字段已删除，统一写入 domain_attributes 容器。用 dotted-key
-        // 字段级更新（不 clone 整个子文档再整体替换），避免与下方 intent_level /
-        // escalation 段互相覆盖，也避免 admin 写与 AI 写并发时整体替换丢 key。
-        // stage 变化时刷新 customer_stage_updated_at（planner stagnation 计时器依赖）。
+    // universal-domain-adaptation H1 / 1D：先把 typed 维度镜像进 domain_signals
+    // 容器（销售域 = customer_stage/intent_level，陪伴域可带任意维度），再经统一写入
+    // 内核落库。stage_changed 仍按「新 stage vs contact 现有 stage」判定，刷新
+    // planner stagnation 计时器。decision 是 &，本地 clone 一份做 normalize。
+    let mut signals_decision = decision.clone();
+    crate::agent::domain_signals::normalize_domain_signals(&mut signals_decision);
+    if !signals_decision.domain_signals.is_empty() {
         let prev_stage = contact
             .domain_attributes
             .as_ref()
             .and_then(|d| d.get_str("customer_stage").ok());
-        let stage_changed = prev_stage != Some(value.as_str());
-        set_doc.insert("domain_attributes.customer_stage", value);
-        if stage_changed {
-            set_doc.insert("domain_attributes.customer_stage_updated_at", DateTime::now());
+        let new_stage = signals_decision.domain_signals.get_str("customer_stage").ok();
+        let stage_changed = new_stage.is_some() && prev_stage != new_stage;
+        let wrote = crate::agent::domain_signals::insert_domain_signal_values(
+            &mut set_doc,
+            &signals_decision.domain_signals,
+            stage_changed,
+        );
+        if wrote {
+            set_doc.insert("domain_attributes_updated_at", DateTime::now());
         }
-        set_doc.insert("domain_attributes_updated_at", DateTime::now());
-    }
-    if let Some(value) = non_empty_option(&decision.intent_level) {
-        set_doc.insert("domain_attributes.intent_level", value);
-        set_doc.insert("domain_attributes_updated_at", DateTime::now());
     }
     // 请示触发：把"等待领导决策"标记写进客户 domain_attributes（admin 可观测）。
     // key 用 AWAITING_PRINCIPAL_DECISION_ATTR 常量，与 relay 完成时 clear_awaiting_principal_state 的 $unset 同一字符串。
@@ -2516,9 +2555,44 @@ async fn apply_agent_updates(
     if let Some(value) = non_empty_option(&decision.follow_up_policy) {
         set_doc.insert("follow_up_policy", value);
     }
-    if let Some(value) = non_empty_option(&decision.operation_state) {
-        set_doc.insert("operation_state", value);
-        set_doc.insert("operation_state_updated_at", DateTime::now());
+    // C2：operation_state 与 customer_stage 强制同步——二者取值同属一套 canonical id
+    // 空间（m006 一一对应），历史上各写各、会漂移。这里令 operation_state 派生自
+    // **归一后的** customer_stage（signals_decision.domain_signals，已过 taxonomy
+    // canonical 改写），保两字段一致、消除双轨漂移。customer_stage 缺失时（决策只给
+    // state 不给 stage，如部分 mock / 纯状态推进）回落 decision.operation_state，
+    // 行为与改造前一致。
+    // rejected = check_state_transition 判非法时记 (旧 state, 拟写 state, reason)，
+    // DB 写库后据此补一条审计事件（fail-soft，见下方写入分支）。
+    // applied = 实际写入的 operation_state（被拒/缺失时为 None）；下方 transitioned
+    // 事件据**实际写入值**而非 decision.operation_state 判迁移，保事件与库一致（C2
+    // 单一真值：金标里 customer_stage 缺失 → applied==decision.operation_state，逐字等价）。
+    let mut rejected_state_transition: Option<(String, String, String)> = None;
+    let mut applied_operation_state: Option<String> = None;
+    let synced_state = signals_decision
+        .domain_signals
+        .get_str("customer_stage")
+        .ok()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(ToString::to_string)
+        .or_else(|| non_empty_option(&decision.operation_state));
+    if let Some(value) = synced_state {
+        // C2-2：接回 check_state_transition 校验闸（H13-2 已把引擎 initial/allowFromAny
+        // 泛化为状态机标志驱动）。fail-soft：非法迁移**不阻断 reply**（reply 已在本函数
+        // 之前下发，本函数只做画像/状态落库），仅 (a) 拒绝本次 operation_state 写入、保留
+        // 旧 state；(b) 写一条审计事件。domain_config=None（simulation/老调用）时
+        // check_state_transition 返回 None → fail-open 照常写，行为与改造前一致。
+        match check_state_transition(domain_config, contact.operation_state.as_deref(), &value) {
+            None => {
+                applied_operation_state = Some(value.clone());
+                set_doc.insert("operation_state", value);
+                set_doc.insert("operation_state_updated_at", DateTime::now());
+            }
+            Some(reason) => {
+                rejected_state_transition =
+                    Some((contact.operation_state.clone().unwrap_or_default(), value, reason));
+            }
+        }
     }
     if let Some(value) = non_empty_option(&decision.operation_state_reason) {
         set_doc.insert("operation_state_reason", value);
@@ -2630,9 +2704,28 @@ async fn apply_agent_updates(
 
     // P2-4：operation_state 发生迁移时写一条 stage event，便于 staleness /
     // funnel / dashboard 复盘。同状态或新状态为空时不发，避免噪声。
-    if let Some((prior, next)) = detect_state_transition(
+    // C2-2：非法迁移被 check_state_transition 拒绝时，改写一条 rejected 审计事件
+    // （保留旧 state、reply 已照常下发），并**不**发 transitioned 事件——二者互斥，
+    // 避免对一次被拒迁移既报"已迁移"又报"被拒"。domain_config=None 时不会进 rejected
+    // 分支（fail-open），detect_state_transition 行为与改造前逐字一致。
+    if let Some((prior, attempted, reason)) = &rejected_state_transition {
+        write_event_for_account(
+            state,
+            &contact.account_id,
+            Some(&contact.wxid),
+            "agent.operation_state_transition_rejected",
+            "rejected",
+            &format!("operation_state 拒绝迁移 {prior} → {attempted}：{reason}"),
+            Some(doc! {
+                "prior_state": prior,
+                "attempted_state": attempted,
+                "reason": reason,
+            }),
+        )
+        .await?;
+    } else if let Some((prior, next)) = detect_state_transition(
         contact.operation_state.as_deref(),
-        decision.operation_state.as_deref(),
+        applied_operation_state.as_deref(),
     ) {
         write_event_for_account(
             state,
@@ -2735,9 +2828,11 @@ async fn apply_operating_memory_update(
     let mut set_doc = doc! { "updated_at": DateTime::now() };
     if !memory_card_has_signal(&effective_memory_card(memory)) {
         // task 6.3：把 typed memoryCard 在写入边界一次性转为 Document 落库。
+        // H13：无 operation_state 时回落状态机初始态。
+        let initial_state = super::decision::initial_operation_state_for_contact(state, contact).await?;
         set_doc.insert(
             "memory_card",
-            mongodb::bson::to_document(&effective_memory_card_for_contact(memory, contact))
+            mongodb::bson::to_document(&effective_memory_card_for_contact(memory, contact, &initial_state))
                 .unwrap_or_default(),
         );
         set_doc.insert("memory_card_version", next_memory_card_version(memory));
@@ -3237,40 +3332,43 @@ pub(crate) fn follow_up_trigger_message_text(kind: &str, task_content: &str) -> 
     }
 }
 
-/// Phase A / A3：taxonomy 软闸的纯逻辑——给定 LLM 输出的 customer_stage / intent_level
-/// 与 [`TaxonomyCache`]，决定要做的字段改写、要附加的 risks 和要 upsert 的候选。
+/// Phase A / A3：taxonomy 软闸的纯逻辑——给定 active profile 的决策维度集合、LLM
+/// 输出的 [`AgentDecision`] 与 [`TaxonomyCache`]，决定要做的字段改写、要附加的 risks
+/// 和要 upsert 的候选。
 ///
 /// gateway 主路径只负责把 outcome 应用到 `final_decision` / `review.risks` 并执行
 /// `upsert_candidate` 的 IO；判定本身可以在 lib-level 测，避免靠 #[ignore] 集成测试
 /// 来保证"未知值真的进了候选 + 不阻塞 run"的硬契约。
+///
+/// universal-domain-adaptation H7：维度集合不再写死两维，由调用方从 active
+/// DomainProfile 取（`decision_dimension_kinds`），读写经 `domain_signals` 访问器。
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(crate) struct TaxonomyGuardOutcome {
-    pub customer_stage_rewrite: Option<String>,
-    pub intent_level_rewrite: Option<String>,
+    /// alias 命中需写回的 `(kind, canonical)` 对。调用方按 kind 应用到对应维度。
+    pub rewrites: Vec<(String, String)>,
     pub risks: Vec<String>,
     /// 待写入 `taxonomy_candidates` 的 `(kind, raw_value)` 对。空 / 仅空格的 raw 已被过滤。
     pub candidate_writes: Vec<(String, String)>,
 }
 
 pub(crate) fn compute_taxonomy_guard_outcome(
-    customer_stage: Option<&str>,
-    intent_level: Option<&str>,
+    decision: &AgentDecision,
+    dimension_kinds: &[String],
     scope_account_id: &str,
     cache: &super::taxonomy::TaxonomyCache,
 ) -> TaxonomyGuardOutcome {
     let mut outcome = TaxonomyGuardOutcome::default();
-    for (kind, raw_opt) in [("customer_stage", customer_stage), ("intent_level", intent_level)] {
-        let Some(raw) = raw_opt.map(str::trim).filter(|s| !s.is_empty()) else {
+    for kind in dimension_kinds {
+        let Some(raw) = super::domain_signals::get_dimension(decision, kind)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        else {
             continue;
         };
         match taxonomy_check_value(kind, raw, scope_account_id, cache) {
             TaxonomyMatch::Active => {}
             TaxonomyMatch::AliasActive(canonical) => {
-                if kind == "customer_stage" {
-                    outcome.customer_stage_rewrite = Some(canonical);
-                } else if kind == "intent_level" {
-                    outcome.intent_level_rewrite = Some(canonical);
-                }
+                outcome.rewrites.push((kind.clone(), canonical));
                 outcome.risks.push(format!("taxonomy_alias_rewritten:{kind}"));
             }
             TaxonomyMatch::Deprecated => {
@@ -3280,7 +3378,7 @@ pub(crate) fn compute_taxonomy_guard_outcome(
                 outcome.risks.push(format!("taxonomy_candidate_new:{kind}"));
                 outcome
                     .candidate_writes
-                    .push((kind.to_string(), raw.to_string()));
+                    .push((kind.clone(), raw.to_string()));
             }
         }
     }
@@ -3427,6 +3525,8 @@ mod tests {
                 description: String::new(),
                 aliases: aliases.iter().map(|s| s.to_string()).collect(),
                 status: status.to_string(),
+                priority_weight: None,
+                is_terminal: false,
             },
             updated_at: mongodb::bson::DateTime::now(),
             version: 1,
@@ -3440,13 +3540,42 @@ mod tests {
         taxonomy_cache_for_tests(entries)
     }
 
+    /// 测试桥：保留旧两维调用风格（customer_stage / intent_level），内部构造
+    /// AgentDecision + 销售域两维 dimension_kinds 后调新签名。等价护栏：DEFAULT
+    /// 销售域行为不变。
+    fn guard(
+        customer_stage: Option<&str>,
+        intent_level: Option<&str>,
+        scope: &str,
+        cache: &TaxonomyCache,
+    ) -> TaxonomyGuardOutcome {
+        let mut decision = AgentDecision::default();
+        if let Some(s) = customer_stage {
+            decision.customer_stage = Some(s.to_string());
+        }
+        if let Some(i) = intent_level {
+            decision.intent_level = Some(i.to_string());
+        }
+        let dims = vec!["customer_stage".to_string(), "intent_level".to_string()];
+        compute_taxonomy_guard_outcome(&decision, &dims, scope, cache)
+    }
+
+    /// 取某维度的 rewrite canonical（替代旧的 customer_stage_rewrite/intent_level_rewrite 字段）。
+    fn rewrite_of<'a>(outcome: &'a TaxonomyGuardOutcome, kind: &str) -> Option<&'a str> {
+        outcome
+            .rewrites
+            .iter()
+            .find(|(k, _)| k == kind)
+            .map(|(_, v)| v.as_str())
+    }
+
     #[test]
     fn taxonomy_outcome_empty_when_both_kinds_missing() {
         // 无任何 LLM 维度输出 → outcome 完全为空，不会乱写候选。
         let cache = cache_with(vec![]);
-        let out = compute_taxonomy_guard_outcome(None, None, "acct-1", &cache);
-        assert!(out.customer_stage_rewrite.is_none());
-        assert!(out.intent_level_rewrite.is_none());
+        let out = guard(None, None, "acct-1", &cache);
+        assert!(rewrite_of(&out, "customer_stage").is_none());
+        assert!(rewrite_of(&out, "intent_level").is_none());
         assert!(out.risks.is_empty());
         assert!(out.candidate_writes.is_empty());
     }
@@ -3455,7 +3584,7 @@ mod tests {
     fn taxonomy_outcome_skips_blank_inputs() {
         // 空白字符串 trim 后等同于 None，不应触发 CandidateNew。
         let cache = cache_with(vec![]);
-        let out = compute_taxonomy_guard_outcome(Some("   "), Some(""), "acct-1", &cache);
+        let out = guard(Some("   "), Some(""), "acct-1", &cache);
         assert!(out.candidate_writes.is_empty());
         assert!(out.risks.is_empty());
     }
@@ -3471,8 +3600,8 @@ mod tests {
             "active",
         )]);
         let out =
-            compute_taxonomy_guard_outcome(Some("first_contact"), None, "acct-1", &cache);
-        assert!(out.customer_stage_rewrite.is_none());
+            guard(Some("first_contact"), None, "acct-1", &cache);
+        assert!(rewrite_of(&out, "customer_stage").is_none());
         assert!(out.risks.is_empty());
         assert!(out.candidate_writes.is_empty());
     }
@@ -3487,9 +3616,9 @@ mod tests {
             &["新客", "刚加好友"],
             "active",
         )]);
-        let out = compute_taxonomy_guard_outcome(Some("新客"), None, "acct-1", &cache);
+        let out = guard(Some("新客"), None, "acct-1", &cache);
         assert_eq!(
-            out.customer_stage_rewrite.as_deref(),
+            rewrite_of(&out, "customer_stage"),
             Some("first_contact"),
             "alias 应被重写为 canonical_id"
         );
@@ -3517,8 +3646,8 @@ mod tests {
             &[],
             "deprecated",
         )]);
-        let out = compute_taxonomy_guard_outcome(None, Some("lukewarm"), "acct-1", &cache);
-        assert!(out.intent_level_rewrite.is_none());
+        let out = guard(None, Some("lukewarm"), "acct-1", &cache);
+        assert!(rewrite_of(&out, "intent_level").is_none());
         assert!(out
             .risks
             .iter()
@@ -3540,7 +3669,7 @@ mod tests {
             &[],
             "active",
         )]);
-        let out = compute_taxonomy_guard_outcome(
+        let out = guard(
             Some("完全没听过的阶段"),
             None,
             "acct-1",
@@ -3557,7 +3686,7 @@ mod tests {
             vec![("customer_stage".to_string(), "完全没听过的阶段".to_string())],
             "未知值必须进 candidate_writes，admin 才能在后台审核"
         );
-        assert!(out.customer_stage_rewrite.is_none());
+        assert!(rewrite_of(&out, "customer_stage").is_none());
     }
 
     #[test]
@@ -3572,17 +3701,17 @@ mod tests {
             &["新客"],
             "active",
         )]);
-        let out = compute_taxonomy_guard_outcome(
+        let out = guard(
             Some("新客"),
             Some("never_seen_intent"),
             "acct-1",
             &cache,
         );
         assert_eq!(
-            out.customer_stage_rewrite.as_deref(),
+            rewrite_of(&out, "customer_stage"),
             Some("first_contact")
         );
-        assert!(out.intent_level_rewrite.is_none());
+        assert!(rewrite_of(&out, "intent_level").is_none());
         let risks: Vec<&str> = out.risks.iter().map(String::as_str).collect();
         assert!(risks.contains(&"taxonomy_alias_rewritten:customer_stage"));
         assert!(risks.contains(&"taxonomy_candidate_new:intent_level"));
@@ -3612,9 +3741,9 @@ mod tests {
             ),
         ]);
         let out =
-            compute_taxonomy_guard_outcome(Some("首单 VIP"), None, "acct-1", &cache);
+            guard(Some("首单 VIP"), None, "acct-1", &cache);
         assert_eq!(
-            out.customer_stage_rewrite.as_deref(),
+            rewrite_of(&out, "customer_stage"),
             Some("premium_first_contact"),
             "应命中 account scope 的 alias，而非回落 global"
         );

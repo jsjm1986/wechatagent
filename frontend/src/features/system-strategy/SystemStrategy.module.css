@@ -195,3 +195,58 @@
 .promoteForm { display: grid; gap: 8px; }
 .codeChip { font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 11px; margin-right: 6px; opacity: .85; color: var(--ink-2); }
 .countTag { margin-left: 8px; font-weight: 400; opacity: .7; font-size: 12px; }
+
+/* ── DomainProfile 行业配置向导 ─────────────────────────────────────────── */
+.profileActiveBanner {
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  padding: 8px 12px; border-radius: var(--r-sm);
+  background: var(--fill-running); border: 1px solid rgba(48, 209, 88, .3);
+  font-size: 12.5px; margin-bottom: 12px;
+}
+.profileActiveLabel { font-weight: 600; color: var(--color-running); }
+.profileActiveBanner strong { font-size: 13px; font-weight: 700; color: var(--ink-1); }
+.profileActiveMeta { font-size: 11.5px; color: var(--ink-3); }
+
+.profileTabBar { display: flex; gap: 4px; margin-bottom: 14px; }
+.profileTab {
+  font: inherit; font-size: 12.5px; font-weight: 600;
+  padding: 7px 14px; border-radius: var(--r-sm); cursor: pointer;
+  background: transparent; border: 1px solid var(--hairline); color: var(--ink-2);
+  transition: background .18s, color .18s, border-color .18s;
+}
+.profileTab:hover { background: rgba(0,0,0,.03); color: var(--ink-1); border-color: rgba(0,0,0,.14); }
+.profileTabActive {
+  background: var(--color-brand); border-color: var(--color-brand); color: #fff;
+}
+.profileTabActive:hover { filter: brightness(1.06); }
+
+.profileGenerateSection { display: grid; gap: 12px; }
+.profileGenerateSuccess {
+  padding: 10px 13px; border-radius: var(--r-sm); font-size: 12.5px;
+  color: var(--color-running); background: var(--fill-running); border: 1px solid rgba(48, 209, 88, .3);
+}
+
+.profileListLayout {
+  display: grid; gap: 16px; grid-template-columns: minmax(0, 1fr) minmax(0, 1.1fr);
+}
+@media (max-width: 960px) { .profileListLayout { grid-template-columns: 1fr; } }
+
+.profileList { display: grid; gap: 8px; align-content: start; }
+
+.profileListMeta { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; margin-top: 4px; }
+
+.profileEditor { display: grid; gap: 12px; }
+.profileEditorHead { display: flex; flex-direction: column; gap: 2px; }
+.profileEditorHead .formHeadEyebrow { font-size: 11px; font-weight: 600; letter-spacing: .2px; text-transform: uppercase; color: var(--ink-3); }
+.profileEditorHead .formHeadTitle { font-size: 13.5px; font-weight: 700; color: var(--ink-1); letter-spacing: -.2px; }
+
+.profileDimensionsSection { display: grid; gap: 8px; padding: 0 12px 12px; }
+.profileDimensionRow { display: grid; gap: 6px; }
+@media (min-width: 600px) { .profileDimensionRow { grid-template-columns: 1fr 1fr 1fr auto; } }
+
+.profileEditorPlaceholder {
+  display: grid; gap: 8px; justify-items: center; padding: 40px 16px;
+  color: var(--ink-3); font-size: 12.5px; text-align: center;
+  border-radius: var(--r-md); border: 1px dashed var(--hairline);
+}
+.profileEditorPlaceholder p { max-width: 240px; line-height: 1.6; }

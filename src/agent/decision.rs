@@ -19,7 +19,7 @@ use crate::prompts;
 use crate::routes::AppState;
 
 use super::generate_agent_json;
-use super::knowledge_router::format_operation_knowledge_for_prompt;
+use super::knowledge_router::format_operation_knowledge_for_prompt_with_roles;
 use super::memory::{format_operator_memory_for_reply_prompt, load_operator_memory};
 use super::reaction::format_reaction_hint;
 use super::runtime::UserRuntimeParameters;
@@ -264,13 +264,31 @@ pub(crate) async fn decide_reply_with_promote(
     rewrite_instruction: Option<&str>,
     run_id: Option<&str>,
 ) -> AppResult<(AgentDecision, Vec<String>)> {
-    let soul = load_published_soul(state, "user").await?.unwrap_or_else(|| {
-        "你是长期运行的微信私域运营 AI Agent。你只为已纳管好友服务，目标是自然、克制、持续推进关系和业务目标。".to_string()
-    });
+    // universal-domain-adaptation H2 + H9 + H3 + H12：加载本 workspace 当前生效的
+    // DomainProfile（无配置时 = DEFAULT 销售域兜底，逐字等价历史行为）。一次加载、
+    // 多处复用：① H3 prompt_fragment 注入系统提示的「业务上下文」层；② H9
+    // conversationMode 允许集合覆盖 runtime；③ H2 维度校验 decision_dimension_kinds；
+    // ④ H12 soul_override / methodology_override 替换出厂人格 / 方法论本体。
+    let active_profile =
+        super::domain_profile::load_active_domain_profile(&state.db, &contact.workspace_id).await;
+    // H12：Soul 层回落链 = profile.soul_override ?? DB published soul ?? 内置销售域兜底。
+    // DEFAULT_PROFILE 的 soul_override=None → 走 DB published + 兜底，与改造前逐字等价。
+    let soul = match non_empty_override(active_profile.soul_override.as_deref()) {
+        Some(s) => s,
+        None => load_published_soul(state, "user").await?.unwrap_or_else(|| {
+            "你是长期运行的微信私域运营 AI Agent。你只为已纳管好友服务，目标是自然、克制、持续推进关系和业务目标。".to_string()
+        }),
+    };
     let assets = load_context_assets(state, &contact.account_id).await?;
-    let playbook_text = playbook.map(format_playbook_for_prompt).unwrap_or_else(|| {
-        "未配置运营方法。按用户备注、聊天上下文和内容资产自由判断。".to_string()
-    });
+    // H12：运营方法论本体回落链 = profile.methodology_override(非空白) ?? contact 绑定
+    // playbook ?? 内置兜底。DEFAULT_PROFILE 的 methodology_override=None → 走 playbook +
+    // 兜底，与改造前逐字等价。methodology_override 为 Some 时整体替换「当前运营方法」段。
+    let playbook_text = match non_empty_override(active_profile.methodology_override.as_deref()) {
+        Some(text) => text,
+        None => playbook.map(format_playbook_for_prompt).unwrap_or_else(|| {
+            "未配置运营方法。按用户备注、聊天上下文和内容资产自由判断。".to_string()
+        }),
+    };
     let domain_text = domain_config
         .map(format_operation_domain_config_for_prompt)
         .unwrap_or_default();
@@ -279,7 +297,7 @@ pub(crate) async fn decide_reply_with_promote(
         .unwrap_or_default();
     let runtime_text = serde_json::to_string(&runtime.as_document()).unwrap_or_default();
     let knowledge_text =
-        format_operation_knowledge_for_prompt(knowledge_chunks);
+        format_operation_knowledge_for_prompt_with_roles(knowledge_chunks, &active_profile.chunk_roles);
     let knowledge_route_text = serde_json::to_string(knowledge_route).unwrap_or_default();
     // agent-autonomy-loop W5 / Task 6.5：注入最近 K=5 条 deprecated_facts，
     // 让 Reply Agent 知道哪些事实已过期，避免再次引用。仅传 id / text /
@@ -364,6 +382,18 @@ pub(crate) async fn decide_reply_with_promote(
         contact.locale.as_deref(),
     )
     .await?;
+    // universal-domain-adaptation H15（3A-1c-3）：经营公式单一真相源。policy 不再内联
+    // 写死「关系经营公式（自检）」段——运行时先剥离任何遗留段（旧库自愈），再注入由
+    // active profile 渲染的公式段。DEFAULT_PROFILE seed 四公式 → 注入段与旧库内联段
+    // 逐字相同（往返等价护栏 strip_then_inject_default_roundtrips_to_original_section）。
+    // 换行业 profile 声明本行业公式即在此处生效。
+    let policy = {
+        let (stripped, _) =
+            super::domain_profile::strip_legacy_formula_self_check_section(&policy);
+        let formula_section =
+            super::domain_profile::build_policy_formula_section(&active_profile.business_formulas);
+        format!("{}\n\n{}", stripped.trim_end_matches('\n'), formula_section)
+    };
     let (task_template, _task_version) = prompts::load_prompt_for_contact(
         &state.db,
         &state.config.default_workspace_id,
@@ -372,6 +402,15 @@ pub(crate) async fn decide_reply_with_promote(
         contact.locale.as_deref(),
     )
     .await?;
+    // universal-domain-adaptation H17：在静态 task prompt 后追加本行业 memoryCandidates
+    // 合法 type 指引（DEFAULT 销售八维→空串、Reply Agent prompt 字节不变、销售零扰动；
+    // 情感等非销售 profile→告知 LLM 本行业候选类型，让情感记忆能作为 candidate 写出）。
+    let task_template = format!(
+        "{task_template}{}",
+        super::domain_profile::render_memory_candidate_types_guidance(
+            &active_profile.memory_dimensions
+        )
+    );
     // R-prompt-v3：Operator Instruction 层（最高优先级）。运营人员可在后台对
     // 单个联系人写一段 ≤ 1000 字的特别指令，覆盖 Soul + Policy 的默认人格判定
     // （如"老客户已签约，不要主动推销"、"这个客户技术背景，可以多用术语"）。
@@ -389,9 +428,23 @@ pub(crate) async fn decide_reply_with_promote(
             )
         })
         .unwrap_or_default();
+    // universal-domain-adaptation H3：行业业务上下文片段（profile.prompt_fragment）。
+    // 由「行业配置向导」与 AI 对话生成、人审后落 DomainProfile；运行时把它作为
+    // 独立的「业务上下文」层注入系统提示（介于 Policy 与 Operator Instruction 之间），
+    // 让通用 Soul/Policy 之上叠加本行业语义。DEFAULT 销售域 prompt_fragment = None
+    // → 空串，系统提示与改造前逐字等价（反过拟合护栏）。
+    // **红线**：boundary_protection 边界保护硬规则继续由 user.reply.policy 写死守护，
+    // 不进 prompt_fragment、不可被行业配置覆盖。
+    let business_context = active_profile
+        .prompt_fragment
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| format!("\n\n# 本行业业务上下文（运营配置，补充 Soul + Policy）\n{}", s))
+        .unwrap_or_default();
     let system = format!(
-        "{}\n\n{}\n\n{}{}",
-        soul, system_contract, policy, operator_instruction
+        "{}\n\n{}\n\n{}{}{}",
+        soul, system_contract, policy, business_context, operator_instruction
     );
     let history = recent_messages
         .iter()
@@ -492,7 +545,11 @@ pub(crate) async fn decide_reply_with_promote(
         knowledge_route_text,
         intent_trajectory_text,
         reaction_hint_text,
-        crate::agent::escalation::build_decision_signals_text(contact, domain_config),
+        crate::agent::escalation::build_decision_signals_text(
+            contact,
+            domain_config,
+            &crate::agent::reaction::effective_negative_outcomes(&active_profile.outcome_polarity),
+        ),
         operator_memory_text,
         rewrite_text,
         contact.wxid,
@@ -542,19 +599,39 @@ pub(crate) async fn decide_reply_with_promote(
     // insufficient_detail_in_critical_turn:*`）。risks 由调用方在
     // `finalize_review_for_send` 阶段消费。
     let raw: RawAgentDecision = serde_json::from_value(value).map_err(AppError::from)?;
-    let (mut decision, mut promote_risks) = raw.validate_and_promote(runtime);
-    // Phase A / A3 收口：把 LLM 输出的 customer_stage / intent_level 与
-    // `system_taxonomies` 严格字典对照（4 路分支：Active 通过 / AliasActive
-    // 改写为 canonical / Deprecated 加 risk / CandidateNew 加 risk + 异步
-    // upsert candidate）。reviewer 在本函数 return 之后才被调用，因此 alias
-    // 改写发生在评审之前，reviewer 看到的是 canonical id。候选 SHALL NOT
-    // 阻塞 Reply Agent —— upsert 是 fire-and-forget。
+    // universal-domain-adaptation H9：active_profile 已在函数顶部加载。`runtime` 由
+    // from_config 给的内置默认四模式；这里用 profile.conversation_modes 覆盖（非空时），
+    // 让 validate_and_promote 按本行业声明的模式集合做严格枚举校验。DEFAULT 销售域
+    // profile 声明四模式 → 与改造前 const 校验逐字等价。
+    let runtime_for_promote = if active_profile.conversation_modes.is_empty() {
+        runtime.clone()
+    } else {
+        let mut r = runtime.clone();
+        r.allowed_conversation_modes = active_profile.conversation_modes.clone();
+        r
+    };
+    let (mut decision, mut promote_risks) = raw.validate_and_promote(&runtime_for_promote);
+    // Phase A / A3 收口：把 LLM 输出的维度取值与 `system_taxonomies` 严格字典对照
+    // （4 路分支：Active 通过 / AliasActive 改写为 canonical / Deprecated 加 risk /
+    // CandidateNew 加 risk + 异步 upsert candidate）。reviewer 在本函数 return 之后才
+    // 被调用，因此 alias 改写发生在评审之前，reviewer 看到的是 canonical id。候选
+    // SHALL NOT 阻塞 Reply Agent —— upsert 是 fire-and-forget。
+    //
+    // universal-domain-adaptation H2：校验哪些维度不再写死，改读 active DomainProfile
+    // 的 `decision_dimension_kinds`。DEFAULT 销售域返回 ["customer_stage","intent_level"]
+    // 逐字等价改造前。
+    let dimension_kinds = super::domain_profile::decision_dimension_kinds(&active_profile);
     let taxonomy_risks = super::decision_taxonomy::validate_and_normalize_decision(
         &state.db,
         &mut decision,
+        &dimension_kinds,
         &contact.account_id,
     );
     promote_risks.extend(taxonomy_risks);
+    // universal-domain-adaptation H1 / 1D：taxonomy 已把 typed 维度改写为 canonical
+    // id，此处把 typed 维度镜像进 domain_signals 容器（反之容器有值而 typed 缺失时回填
+    // typed），使两侧一致。DEFAULT 销售域里 LLM 只输出 typed，故仅 typed→容器 生效。
+    super::domain_signals::normalize_domain_signals(&mut decision);
     Ok((decision, promote_risks))
 }
 
@@ -603,6 +680,23 @@ pub(crate) async fn load_user_operation_domain_config(
     workspace_id: &str,
 ) -> AppResult<Option<OperationDomainConfig>> {
     load_user_operation_domain_config_for_contact(state, workspace_id, "").await
+}
+
+/// H13：取某 contact 所属 workspace 的 active 状态机初始态 key（标 `initial:true`）。
+/// 各读侧兜底（memory 卡 / context_pack）在无 operation_state 时回落它，替代写死的
+/// `"new_contact"`。DEFAULT 销售域状态机仅 new_contact 标 initial → 恒返 "new_contact"，
+/// 逐字等价；旧库未跑 m019 迁移 / 无 config 时 helper 自身回落 "new_contact"。
+pub(crate) async fn initial_operation_state_for_contact(
+    state: &AppState,
+    contact: &Contact,
+) -> AppResult<String> {
+    let domain_config = load_user_operation_domain_config_for_contact(
+        state,
+        &contact.workspace_id,
+        &contact.wxid,
+    )
+    .await?;
+    Ok(super::guards::initial_operation_state_key(domain_config.as_ref()))
 }
 
 /// Phase E5-T1：active_versions 灰度感知 loader。
@@ -771,6 +865,19 @@ pub(crate) fn format_playbook_for_prompt(playbook: &OperationPlaybook) -> String
     )
 }
 
+/// H12：把 profile 的 `soul_override` / `methodology_override` 规整为「有效覆盖」——
+/// `Some(非空白)` 才算覆盖，`None` / 空串 / 纯空白都视为「不覆盖」返回 `None`，让调用方
+/// 回落原有出厂本体（DB published soul / contact 绑定 playbook）。
+///
+/// 抽成纯函数让 lib 单测无需构造完整 `decide_reply_with_promote` 即可锁住回落语义：
+/// DEFAULT_PROFILE(两 override 均 None) → `None` → 回落链与 H12 改造前逐字等价。
+fn non_empty_override(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+}
+
 pub(crate) async fn load_published_soul(
     state: &AppState,
     agent_kind: &str,
@@ -934,5 +1041,51 @@ mod reaction_hint_loader_tests {
         assert!(hint.contains("user_replied_objection"));
         assert!(hint.contains("user_replied_buying_signal"));
         assert!(hint.contains("摘要=对价格有顾虑"));
+    }
+}
+
+#[cfg(test)]
+mod persona_override_tests {
+    //! H12-2 / H12-3：Soul 与运营方法论的回落链契约。`non_empty_override` 决定决策
+    //! 系统提示的 Soul 层 / user message 的「当前运营方法」段是「用 profile 覆盖」还是
+    //! 「回落原出厂本体」。DEFAULT_PROFILE 两 override 均 None 必须返回 None（回落），
+    //! 保证销售域字节不变。
+
+    use super::non_empty_override;
+
+    #[test]
+    fn none_override_falls_back() {
+        // DEFAULT_PROFILE：soul_override / methodology_override=None → 回落（逐字等价）。
+        assert_eq!(non_empty_override(None), None);
+    }
+
+    #[test]
+    fn empty_or_whitespace_override_falls_back() {
+        // 空串 / 纯空白不算有效覆盖 → 回落，避免误把空 profile 字段当本体清空。
+        assert_eq!(non_empty_override(Some("")), None);
+        assert_eq!(non_empty_override(Some("   ")), None);
+        assert_eq!(non_empty_override(Some("\n\t ")), None);
+    }
+
+    #[test]
+    fn non_empty_soul_override_replaces() {
+        // 非空白 soul_override → 整体替换 Soul 层（换行业人格本体）。trim 边界空白。
+        assert_eq!(
+            non_empty_override(Some("你是一个温暖的情感陪伴 AI。")),
+            Some("你是一个温暖的情感陪伴 AI。".to_string())
+        );
+        assert_eq!(
+            non_empty_override(Some("  带空白的人格  ")),
+            Some("带空白的人格".to_string())
+        );
+    }
+
+    #[test]
+    fn non_empty_methodology_override_replaces() {
+        // 非空白 methodology_override → 整体替换「当前运营方法」段（换行业方法论本体）。
+        assert_eq!(
+            non_empty_override(Some("陪伴方法论：每日问候、情绪回应、纪念日提醒。")),
+            Some("陪伴方法论：每日问候、情绪回应、纪念日提醒。".to_string())
+        );
     }
 }

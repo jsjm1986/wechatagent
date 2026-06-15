@@ -4,7 +4,7 @@ import { Settings2, Inbox } from "lucide-react";
 import { api } from "../../lib/api";
 import { useUiStore } from "../../stores/uiStore";
 import { useStrategyStore } from "../../stores/strategyStore";
-import type { AgentSoul, PromptTemplate, PromptTemplateDraft } from "../../types";
+import type { AgentSoul, PromptTemplate, PromptTemplateDraft, DomainProfile, DomainProfileDraft } from "../../types";
 import styles from "./SystemStrategy.module.css";
 
 // 系统策略频道：全局总控 Prompt（人格/任务）+ 状态机灰度 + 双层标签字典 + 跨用户教训。
@@ -684,6 +684,505 @@ function TaxonomiesAdmin({ busy }: { busy: boolean }) {
   );
 }
 
+// ── DomainProfile 面板（行业配置向导）───────────────────────────────────────
+
+function ProfileStatusBadge({ profile }: { profile: DomainProfile }) {
+  if (profile.is_active) {
+    return <span className={styles.badgeOk}>生效中</span>;
+  }
+  if (profile.current_version) {
+    return <span className={styles.badgeWarn}>待激活</span>;
+  }
+  return <span className={styles.badge}>草稿</span>;
+}
+
+function ProfileTabBar({ tab, onSelect }: { tab: "list" | "generate"; onSelect: (t: "list" | "generate") => void }) {
+  return (
+    <div className={styles.profileTabBar}>
+      <button
+        type="button"
+        className={`${styles.profileTab} ${tab === "list" ? styles.profileTabActive : ""}`}
+        onClick={() => onSelect("list")}
+      >
+        已有配置
+      </button>
+      <button
+        type="button"
+        className={`${styles.profileTab} ${tab === "generate" ? styles.profileTabActive : ""}`}
+        onClick={() => onSelect("generate")}
+      >
+        AI 生成新配置
+      </button>
+    </div>
+  );
+}
+
+function ProfileEditor({
+  profile,
+  draft,
+  onChange,
+  onSave,
+  onDelete,
+  onPublish,
+  onActivate,
+  busy,
+}: {
+  profile: DomainProfile | null;
+  draft: DomainProfileDraft;
+  onChange: (d: DomainProfileDraft) => void;
+  onSave: () => void;
+  onDelete: () => void;
+  onPublish: (id: string) => void;
+  onActivate: (id: string) => void;
+  busy: boolean;
+}) {
+  const update = (patch: Partial<DomainProfileDraft>) => onChange({ ...draft, ...patch });
+
+  return (
+    <div className={styles.profileEditor}>
+      <div className={styles.profileEditorHead}>
+        <span className={styles.formHeadEyebrow}>{profile ? "编辑" : "新增"}</span>
+        <span className={styles.formHeadTitle}>
+          {profile ? `行业配置：${profile.display_name || profile.profile_id}` : "新建行业配置"}
+        </span>
+      </div>
+
+      <div className={styles.formGrid}>
+        <label className={styles.field}>
+          <span>Profile ID（唯一标识）</span>
+          <input
+            className={styles.input}
+            value={draft.profile_id ?? ""}
+            onChange={(e) => update({ profile_id: e.target.value })}
+            placeholder="如 dental-implant-private"
+            disabled={!!profile}
+          />
+        </label>
+        <label className={styles.field}>
+          <span>展示名</span>
+          <input
+            className={styles.input}
+            value={draft.display_name ?? ""}
+            onChange={(e) => update({ display_name: e.target.value })}
+            placeholder="如 牙科种植 · 私立诊所"
+          />
+        </label>
+      </div>
+
+      <label className={styles.field}>
+        <span>行业说明</span>
+        <input
+          className={styles.input}
+          value={draft.description ?? ""}
+          onChange={(e) => update({ description: e.target.value })}
+          placeholder="本行业画像说明（人可读，一两句）"
+        />
+      </label>
+
+      <label className={styles.field}>
+        <span>Prompt 片段（注入决策提示）</span>
+        <textarea
+          className={styles.textarea}
+          value={draft.prompt_fragment ?? ""}
+          onChange={(e) => update({ prompt_fragment: e.target.value })}
+          placeholder="本行业业务上下文片段（解释维度如何理解，不要写死与本行业无关的销售套路）"
+          rows={4}
+        />
+      </label>
+
+      <label className={styles.field}>
+        <span>对话模式（逗号分隔，缺省四模式可不填）</span>
+        <input
+          className={styles.input}
+          value={(draft.conversation_modes ?? []).join(", ")}
+          onChange={(e) =>
+            update({
+              conversation_modes: e.target.value
+                .split(",")
+                .map((s) => s.trim())
+                .filter(Boolean),
+            })
+          }
+          placeholder="friendly, informative, persuasive, supportive"
+        />
+      </label>
+
+      <details className={styles.advanced}>
+        <summary>维度配置</summary>
+        <div className={styles.profileDimensionsSection}>
+          {(draft.profile_dimensions ?? []).map((dim, i) => (
+            <div key={i} className={styles.profileDimensionRow}>
+              <input
+                className={styles.input}
+                value={dim.kind}
+                placeholder="维度 key (snake_case)"
+                onChange={(e) => {
+                  const dims = [...(draft.profile_dimensions ?? [])];
+                  dims[i] = { ...dim, kind: e.target.value };
+                  update({ profile_dimensions: dims });
+                }}
+              />
+              <input
+                className={styles.input}
+                value={dim.display_name}
+                placeholder="中文维度名"
+                onChange={(e) => {
+                  const dims = [...(draft.profile_dimensions ?? [])];
+                  dims[i] = { ...dim, display_name: e.target.value };
+                  update({ profile_dimensions: dims });
+                }}
+              />
+              <input
+                className={styles.input}
+                value={dim.description}
+                placeholder="维度含义"
+                onChange={(e) => {
+                  const dims = [...(draft.profile_dimensions ?? [])];
+                  dims[i] = { ...dim, description: e.target.value };
+                  update({ profile_dimensions: dims });
+                }}
+              />
+              <button
+                type="button"
+                className={styles.btnGhost}
+                onClick={() => {
+                  const dims = [...(draft.profile_dimensions ?? [])];
+                  dims.splice(i, 1);
+                  update({ profile_dimensions: dims });
+                }}
+              >
+                删除
+              </button>
+            </div>
+          ))}
+          <button
+            type="button"
+            className={styles.btnGhost}
+            onClick={() =>
+              update({
+                profile_dimensions: [
+                  ...(draft.profile_dimensions ?? []),
+                  { kind: "", display_name: "", participates_in_decision: true, description: "" },
+                ],
+              })
+            }
+          >
+            + 添加维度
+          </button>
+        </div>
+      </details>
+
+      <details className={styles.advanced}>
+        <summary>承诺标记词</summary>
+        <div className={styles.formGrid}>
+          <label className={styles.field}>
+            <span>绝对化效果承诺词（逗号分隔）</span>
+            <textarea
+              className={styles.textarea}
+              value={(draft.commitment_markers?.product_effect ?? []).join(", ")}
+              onChange={(e) =>
+                update({
+                  commitment_markers: {
+                    ...(draft.commitment_markers ?? { product_effect: [], tone_only: [] }),
+                    product_effect: e.target.value.split(",").map((s) => s.trim()).filter(Boolean),
+                  },
+                })
+              }
+              placeholder="保证 100%, 绝对有效, 一定能看到效果"
+              rows={2}
+            />
+          </label>
+          <label className={styles.field}>
+            <span>语气类夸大词（逗号分隔）</span>
+            <textarea
+              className={styles.textarea}
+              value={(draft.commitment_markers?.tone_only ?? []).join(", ")}
+              onChange={(e) =>
+                update({
+                  commitment_markers: {
+                    ...(draft.commitment_markers ?? { product_effect: [], tone_only: [] }),
+                    tone_only: e.target.value.split(",").map((s) => s.trim()).filter(Boolean),
+                  },
+                })
+              }
+              placeholder="太棒了, 绝对值, 超级划算"
+              rows={2}
+            />
+          </label>
+        </div>
+      </details>
+
+      <details className={styles.advanced}>
+        <summary>方法论生成器引导语（可选）</summary>
+        <label className={styles.field}>
+          <span>methodologyGeneratorPreamble</span>
+          <textarea
+            className={styles.textarea}
+            value={draft.methodology_generator_preamble ?? ""}
+            onChange={(e) => update({ methodology_generator_preamble: e.target.value })}
+            placeholder="领域中性引导语，覆盖默认值。留空则用系统内置的领域中性引导语。"
+            rows={4}
+          />
+        </label>
+      </details>
+
+      <div className={styles.buttonRow}>
+        <button
+          type="button"
+          className={styles.btnPrimary}
+          onClick={onSave}
+          disabled={busy || !draft.profile_id?.trim()}
+        >
+          {profile ? "保存修改" : "创建草稿"}
+        </button>
+        {profile && !profile.is_active && (
+          <>
+            {!profile.current_version && (
+              <button
+                type="button"
+                className={styles.btnGhost}
+                onClick={() => onPublish(profile.id)}
+                disabled={busy}
+              >
+                发布
+              </button>
+            )}
+            {profile.current_version && (
+              <button
+                type="button"
+                className={styles.btnPrimary}
+                onClick={() => onActivate(profile.id)}
+                disabled={busy}
+              >
+                激活生效
+              </button>
+            )}
+            <button
+              type="button"
+              className={styles.btnGhost}
+              onClick={onDelete}
+              disabled={busy}
+            >
+              删除
+            </button>
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function DomainProfilePanel({ busy }: { busy: boolean }) {
+  const {
+    domainProfiles,
+    editingProfile,
+    profileDraft,
+    profileTab,
+    generating,
+    generateError,
+    generateResult,
+    loadDomainProfiles,
+    selectProfileTab,
+    editDomainProfile,
+    newDomainProfileDraft,
+    setProfileDraft,
+    saveDomainProfile,
+    publishDomainProfile,
+    activateDomainProfile,
+    deleteDomainProfile,
+    generateDomainProfile,
+  } = useStrategyStore();
+
+  const [gen_pid, setGen_pid] = useState("");
+  const [gen_display_name, setGen_display_name] = useState("");
+  const [gen_business_description, setGen_business_description] = useState("");
+
+  useEffect(() => {
+    void loadDomainProfiles();
+  }, [loadDomainProfiles]);
+
+  const activeProfile = domainProfiles.find((p) => p.is_active);
+  const editing = editingProfile !== null;
+
+  function handleProfileClick(profile: DomainProfile) {
+    editDomainProfile(profile);
+  }
+
+  async function handlePublish(id: string) {
+    if (!window.confirm("确认发布此版本？发布后需再点击「激活」才会生效。")) return;
+    await publishDomainProfile(id);
+  }
+
+  async function handleActivate(id: string) {
+    if (!window.confirm("确认激活此行业配置？激活后所有 AI 对话将使用此配置。")) return;
+    await activateDomainProfile(id);
+  }
+
+  return (
+    <section className={styles.panel}>
+      <div className={styles.panelHead}>
+        <div className={styles.panelHeadL}>
+          <span className={styles.eyebrow}>Domain Profile</span>
+          <span className={styles.title}>行业配置管理</span>
+        </div>
+      </div>
+
+      {activeProfile && (
+        <div className={styles.profileActiveBanner}>
+          <span className={styles.profileActiveLabel}>当前生效：</span>
+          <strong>{activeProfile.display_name || activeProfile.profile_id}</strong>
+          <span className={styles.profileActiveMeta}>
+            v{activeProfile.version} · {activeProfile.profile_id}
+          </span>
+        </div>
+      )}
+
+      <ProfileTabBar tab={profileTab} onSelect={selectProfileTab} />
+
+      {profileTab === "generate" && (
+        <div className={styles.profileGenerateSection}>
+          <p className={styles.panelHint}>
+            描述你的业务（行业/产品/客户/经营目标/对话风格），AI 将生成一份候选行业配置。
+            候选需要你审核确认后 publish + activate 才会生效。
+          </p>
+          <label className={styles.field}>
+            <span>Profile ID（英文唯一标识，生成后不可改）</span>
+            <input
+              className={styles.input}
+              value={gen_pid}
+              onChange={(e) => setGen_pid(e.target.value)}
+              placeholder="如 emotional-companion-care 或 edu-k12-tuition"
+            />
+          </label>
+          <label className={styles.field}>
+            <span>展示名（可选）</span>
+            <input
+              className={styles.input}
+              value={gen_display_name}
+              onChange={(e) => setGen_display_name(e.target.value)}
+              placeholder="如未填则用 profileId"
+            />
+          </label>
+          <label className={styles.field}>
+            <span>业务描述（请详细描述你的行业/产品/客户特征/运营目标）</span>
+            <textarea
+              className={styles.textarea}
+              value={gen_business_description}
+              onChange={(e) => setGen_business_description(e.target.value)}
+              placeholder={"我是做K12辅导的，主要接触的是家长。\n说实话，这些家长比孩子更焦虑。他们不是来「了解课程」的，是来「找一个人帮他们解决一个问题」的。\n孩子成绩上不去，在家里说话都没底气。找到我的时候，其实是在找一个出口。\n我最怕说错话是：承诺「一个月提多少分」——家长一听就知道是假的，反而更不信任。\n真正打动家长的，是我愿意听他把孩子的具体情况说完，然后给一个真实、可落地的判断。"}
+              rows={8}
+            />
+          </label>
+          {generateError && <div className={styles.inlineError}>{generateError}</div>}
+          {generateResult && (
+            <div className={styles.profileGenerateSuccess}>
+              ✅ 候选配置已生成！可在「已有配置」列表中找到 v1 草稿，逐项审核后 publish + activate。
+            </div>
+          )}
+          <div className={styles.buttonRow}>
+            <button
+              type="button"
+              className={styles.btnPrimary}
+              onClick={() => void generateDomainProfile(gen_business_description, gen_pid, gen_display_name || undefined)}
+              disabled={generating || !gen_business_description.trim() || !gen_pid.trim()}
+            >
+              {generating ? "生成中…" : "🚀 AI 生成候选配置"}
+            </button>
+            <button
+              type="button"
+              className={styles.btnGhost}
+              onClick={() => {
+                setGen_business_description("");
+                setGen_pid("");
+                setGen_display_name("");
+                selectProfileTab("list");
+              }}
+              disabled={generating}
+            >
+              取消
+            </button>
+          </div>
+        </div>
+      )}
+
+      {profileTab === "list" && (
+        <div className={styles.profileListLayout}>
+          {/* 左侧列表 */}
+          <div className={styles.profileList}>
+            {domainProfiles.length === 0 && !busy ? (
+              <Empty text="暂无行业配置，请先 AI 生成或手动创建" />
+            ) : (
+              domainProfiles.map((profile) => (
+                <button
+                  key={profile.id}
+                  type="button"
+                  className={editingProfile?.id === profile.id ? styles.assetRowSelected : styles.assetRow}
+                  onClick={() => handleProfileClick(profile)}
+                >
+                  <strong>
+                    {profile.display_name || profile.profile_id}
+                    {profile.seeded_by === "generated_by_ai" && (
+                      <span className={styles.statusBadge}>AI 候选</span>
+                    )}
+                  </strong>
+                  <span>
+                    {profile.profile_id} · v{profile.version}
+                    {profile.previous_version != null ? ` (← v${profile.previous_version})` : ""}
+                  </span>
+                  <p>{profile.description || "—"}</p>
+                  <div className={styles.profileListMeta}>
+                    <ProfileStatusBadge profile={profile} />
+                    {profile.seeded_by && (
+                      <span className={styles.activeVersionsSeeded}>{profile.seeded_by}</span>
+                    )}
+                    {profile.updated_at && (
+                      <span className={styles.activeVersionsTimestamp}>{profile.updated_at}</span>
+                    )}
+                  </div>
+                </button>
+              ))
+            )}
+            <button
+              type="button"
+              className={styles.btnGhost}
+              onClick={() => {
+                newDomainProfileDraft();
+                selectProfileTab("list");
+              }}
+              style={{ width: "100%", justifyContent: "center" }}
+            >
+              + 手动创建空白配置
+            </button>
+          </div>
+
+          {/* 右侧编辑区 */}
+          {editing ? (
+            <ProfileEditor
+              profile={editingProfile}
+              draft={profileDraft}
+              onChange={setProfileDraft}
+              onSave={() => {
+                if (editingProfile) void saveDomainProfile(editingProfile.id);
+              }}
+              onDelete={() => {
+                if (editingProfile) void deleteDomainProfile(editingProfile.id);
+              }}
+              onPublish={handlePublish}
+              onActivate={handleActivate}
+              busy={busy}
+            />
+          ) : (
+            <div className={styles.profileEditorPlaceholder}>
+              <Inbox size={24} />
+              <p>选择左侧一项配置进行编辑，或点击「AI 生成新配置」创建新的候选配置</p>
+            </div>
+          )}
+        </div>
+      )}
+    </section>
+  );
+}
+
 function LessonsLearnedAdmin({ busy }: { busy: boolean }) {
   const [items, setItems] = useState<LessonLearnedEntry[]>([]);
   const [loading, setLoading] = useState(false);
@@ -1020,6 +1519,7 @@ export default function SystemStrategyFeature() {
       <StatePolicyAdmin busy={busy} />
       <TaxonomiesAdmin busy={busy} />
       <LessonsLearnedAdmin busy={busy} />
+      <DomainProfilePanel busy={busy} />
     </div>
   );
 }

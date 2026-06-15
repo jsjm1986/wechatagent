@@ -8,7 +8,7 @@
 
 use mongodb::bson::Document;
 
-use crate::models::{OperationDomainConfig, OperationKnowledgeChunk, OperationStatePolicy};
+use crate::models::{CommitmentMarkers, OperationDomainConfig, OperationKnowledgeChunk, OperationStatePolicy};
 
 use super::types::{doc_bool, AgentDecision, RunPlannerResult};
 
@@ -114,6 +114,21 @@ pub(crate) fn operation_states(domain_config: Option<&OperationDomainConfig>) ->
         .unwrap_or_default()
 }
 
+/// H13：取状态机声明的初始态 key（标 `initial:true` 的 state）。替代散落的写死
+/// `"new_contact"` 字面量——onboarding 写侧设定 contact 初始 operation_state、各类
+/// 展示兜底都从这里取。
+///
+/// 回落 `"new_contact"`：domain_config 缺失 / 状态机无 state 标 initial（旧库未跑
+/// m019 迁移）时，与改造前逐字等价。DEFAULT 销售域状态机仅 new_contact 标 initial，
+/// 故 DEFAULT 下恒返 `"new_contact"`，金标零变化；换行业的 profile 可标别的初始态。
+pub fn initial_operation_state_key(domain_config: Option<&OperationDomainConfig>) -> String {
+    operation_states(domain_config)
+        .into_iter()
+        .find(|state| state.get_bool("initial").unwrap_or(false))
+        .and_then(|state| state.get_str("key").ok().map(ToString::to_string))
+        .unwrap_or_else(|| "new_contact".to_string())
+}
+
 /// 状态机迁移合法性校验。
 ///
 /// 规则：
@@ -156,7 +171,10 @@ pub fn check_state_transition(
     let from = from.map(str::trim).filter(|s| !s.is_empty());
     match from {
         None => {
-            if to == "new_contact" {
+            // H13：空 from 唯一合法迁入目标 = 标 `initial:true` 的 state（替代写死的
+            // `to=="new_contact"`）。DEFAULT 状态机仅 new_contact 标 initial，逐字等价；
+            // 换行业的 profile 可把别的 state 标初始态。
+            if target.get_bool("initial").unwrap_or(false) {
                 None
             } else {
                 Some(format!("state_transition_invalid: from=<empty> to={to}"))
@@ -328,7 +346,15 @@ pub(crate) enum CommitmentClass {
 /// 把候选回复按承诺词类型分类。ProductEffect 优先（同时命中两类时取更危险者）。
 /// 词表与 `prompts.rs` 既有 `user.review.product_claim_markers` 模板同源，切分两类
 /// 以控制误杀：效果/数据类几乎只出现在可验证产品断言；语气类大量出现在情感/口语承诺。
-pub(crate) fn commitment_claim_class(reply_text: &str) -> CommitmentClass {
+///
+/// universal-domain-adaptation H4：词表从写死 const 改为读 `markers`（来自 active
+/// DomainProfile.commitment_markers）。`markers` 两组皆空时回落内置销售域 const——
+/// 防御老库/异常 profile，且 DEFAULT_PROFILE 的词表逐字复刻 const（等价护栏锁死），
+/// 故 DEFAULT 下行为字节等价。换行业=另一份 profile 声明本行业的绝对化承诺词。
+pub(crate) fn commitment_claim_class(
+    reply_text: &str,
+    markers: &CommitmentMarkers,
+) -> CommitmentClass {
     const PRODUCT_EFFECT_MARKERS: [&str; 5] =
         ["成功率", "见效", "回款", "百分之", "百分百"];
     const TONE_ONLY_MARKERS: [&str; 3] = ["保证", "一定能", "绝对"];
@@ -336,10 +362,23 @@ pub(crate) fn commitment_claim_class(reply_text: &str) -> CommitmentClass {
     if text.is_empty() {
         return CommitmentClass::None;
     }
-    if PRODUCT_EFFECT_MARKERS.iter().any(|m| text.contains(m)) {
+    // 空 profile 词表回落内置 const（向后兼容 + 防御）。
+    let fallback_product: Vec<&str> = PRODUCT_EFFECT_MARKERS.to_vec();
+    let fallback_tone: Vec<&str> = TONE_ONLY_MARKERS.to_vec();
+    let product_effect: Vec<&str> = if markers.product_effect.is_empty() {
+        fallback_product
+    } else {
+        markers.product_effect.iter().map(String::as_str).collect()
+    };
+    let tone_only: Vec<&str> = if markers.tone_only.is_empty() {
+        fallback_tone
+    } else {
+        markers.tone_only.iter().map(String::as_str).collect()
+    };
+    if product_effect.iter().any(|m| text.contains(m)) {
         return CommitmentClass::ProductEffect;
     }
-    if TONE_ONLY_MARKERS.iter().any(|m| text.contains(m)) {
+    if tone_only.iter().any(|m| text.contains(m)) {
         return CommitmentClass::ToneOnly;
     }
     CommitmentClass::None
@@ -467,27 +506,53 @@ mod policy_tests {
 
     #[test]
     fn commitment_class_product_effect_on_data_words() {
-        assert_eq!(commitment_claim_class("我们的成功率高达95%"), CommitmentClass::ProductEffect);
-        assert_eq!(commitment_claim_class("三天就见效"), CommitmentClass::ProductEffect);
-        assert_eq!(commitment_claim_class("保证按时回款"), CommitmentClass::ProductEffect);
+        let m = crate::agent::domain_profile::default_domain_profile("ws").commitment_markers;
+        assert_eq!(commitment_claim_class("我们的成功率高达95%", &m), CommitmentClass::ProductEffect);
+        assert_eq!(commitment_claim_class("三天就见效", &m), CommitmentClass::ProductEffect);
+        assert_eq!(commitment_claim_class("保证按时回款", &m), CommitmentClass::ProductEffect);
     }
 
     #[test]
     fn commitment_class_tone_only_on_soft_words() {
-        assert_eq!(commitment_claim_class("我保证认真对待您的问题"), CommitmentClass::ToneOnly);
-        assert_eq!(commitment_claim_class("这事绝对不怪你"), CommitmentClass::ToneOnly);
-        assert_eq!(commitment_claim_class("这个方案一定能帮到你"), CommitmentClass::ToneOnly);
+        let m = crate::agent::domain_profile::default_domain_profile("ws").commitment_markers;
+        assert_eq!(commitment_claim_class("我保证认真对待您的问题", &m), CommitmentClass::ToneOnly);
+        assert_eq!(commitment_claim_class("这事绝对不怪你", &m), CommitmentClass::ToneOnly);
+        assert_eq!(commitment_claim_class("这个方案一定能帮到你", &m), CommitmentClass::ToneOnly);
     }
 
     #[test]
     fn commitment_class_product_effect_wins_when_both_present() {
         // 同时含语气词「一定能」和效果词「成功率」→ 取更危险的 ProductEffect
-        assert_eq!(commitment_claim_class("一定能把成功率做上去"), CommitmentClass::ProductEffect);
+        let m = crate::agent::domain_profile::default_domain_profile("ws").commitment_markers;
+        assert_eq!(commitment_claim_class("一定能把成功率做上去", &m), CommitmentClass::ProductEffect);
     }
 
     #[test]
     fn commitment_class_none_on_plain_reply() {
-        assert_eq!(commitment_claim_class("好的，我先了解下你的具体情况"), CommitmentClass::None);
+        let m = crate::agent::domain_profile::default_domain_profile("ws").commitment_markers;
+        assert_eq!(commitment_claim_class("好的，我先了解下你的具体情况", &m), CommitmentClass::None);
+    }
+
+    #[test]
+    fn commitment_class_empty_markers_falls_back_to_const() {
+        // H4：profile 词表两组皆空 → 回落内置销售域 const（向后兼容/防御）。
+        let empty = CommitmentMarkers::default();
+        assert_eq!(commitment_claim_class("我们的成功率高达95%", &empty), CommitmentClass::ProductEffect);
+        assert_eq!(commitment_claim_class("我保证认真对待", &empty), CommitmentClass::ToneOnly);
+        assert_eq!(commitment_claim_class("好的，我先了解下", &empty), CommitmentClass::None);
+    }
+
+    #[test]
+    fn commitment_class_custom_industry_markers_honored() {
+        // H4：换行业=另一份词表。医疗域「根治率/包好」效果词、「一定治好」语气词。
+        let medical = CommitmentMarkers {
+            product_effect: vec!["根治率".to_string(), "包好".to_string()],
+            tone_only: vec!["一定治好".to_string()],
+        };
+        assert_eq!(commitment_claim_class("我们根治率很高", &medical), CommitmentClass::ProductEffect);
+        assert_eq!(commitment_claim_class("这病一定治好", &medical), CommitmentClass::ToneOnly);
+        // 销售域 const 词在医疗 profile 下不再命中（词表已替换，非叠加）。
+        assert_eq!(commitment_claim_class("三天就见效", &medical), CommitmentClass::None);
     }
 }
 

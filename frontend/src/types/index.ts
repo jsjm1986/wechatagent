@@ -386,3 +386,79 @@ export type OperationDomainDraft = {
   runtimeParameters: string;
   stateMachine: string;
 };
+
+// ── DomainProfile（行业配置）────────────────────────────────────────────────
+// 后端 DomainProfile 用 serde_json::to_value 序列化 → snake_case JSON。
+
+export type ProfileDimension = {
+  kind: string;
+  display_name: string;
+  participates_in_decision: boolean;
+  description: string;
+};
+
+export type BusinessFormula = {
+  key: string;
+  expression: string;
+  display_name: string;
+};
+
+export type CommitmentMarkers = {
+  product_effect: string[];
+  tone_only: string[];
+};
+
+export type CoverageDimension = {
+  key: string;
+  display_name: string;
+  required: boolean;
+};
+
+export type DomainProfile = {
+  id: string;
+  profile_id: string;
+  workspace_id: string;
+  display_name: string;
+  description: string;
+  profile_dimensions: ProfileDimension[];
+  prompt_fragment: string;
+  conversation_modes: string[];
+  business_formulas: BusinessFormula[];
+  commitment_markers: CommitmentMarkers;
+  coverage_dimensions: CoverageDimension[];
+  version: number;
+  current_version: boolean;
+  previous_version: number | null;
+  is_active: boolean;
+  seeded_by: string | null;
+  methodology_generator_preamble?: string | null;
+  created_at?: string;
+  updated_at?: string;
+};
+
+export type DomainProfileDraft = {
+  profile_id?: string;
+  display_name?: string;
+  description?: string;
+  profile_dimensions?: ProfileDimension[];
+  prompt_fragment?: string;
+  conversation_modes?: string[];
+  business_formulas?: BusinessFormula[];
+  commitment_markers?: CommitmentMarkers;
+  coverage_dimensions?: CoverageDimension[];
+  methodology_generator_preamble?: string;
+};
+
+export type GenerateProfileRequest = {
+  businessDescription: string;
+  profileId: string;
+  displayName?: string;
+};
+
+export type GenerateProfileResponse = {
+  ok: boolean;
+  id: string;
+  profileId: string;
+  status: string;
+  note: string;
+};

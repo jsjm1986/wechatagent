@@ -29,11 +29,13 @@ mod behavior_signal_metrics;
 pub mod chunk_locks;
 mod contacts;
 mod conversations;
-mod domain_schemas;
+pub(crate) mod domain_profiles;
+pub(crate) mod domain_schemas;
 mod domains;
 mod evaluations;
 mod events;
 mod evolution;
+pub mod guide_profile;
 mod guides;
 mod health;
 pub(crate) mod knowledge;
@@ -123,6 +125,11 @@ use domain_schemas::{
     activate_domain_schema, create_domain_schema, delete_domain_schema, list_domain_schemas,
     update_domain_schema,
 };
+use domain_profiles::{
+    activate_domain_profile, create_domain_profile, delete_domain_profile, get_domain_profile,
+    list_domain_profiles, publish_domain_profile, rollback_domain_profile, rollout_domain_profile,
+    update_domain_profile,
+};
 use domains::{
     get_operation_domain, get_operation_domain_state_machine, list_operation_domains,
     reset_operation_domain, update_operation_domain, update_operation_domain_state_machine,
@@ -138,6 +145,7 @@ use evolution::{
     rollback_evolution_proposal,
 };
 use guides::{apply_user_operation_guide, preview_user_operation_guide};
+use guide_profile::generate_domain_profile_candidate;
 use health::health;
 use llm_providers::{
     activate_provider, create_provider, delete_provider, list_providers, set_vision_active,
@@ -772,6 +780,38 @@ pub fn api_router(state: AppState) -> Router<AppState> {
             "/admin/domain-schemas/:id/activate",
             post(activate_domain_schema),
         )
+        // ── universal-domain-adaptation Phase 3：行业总装配单 DomainProfile admin 路由 ──
+        .route(
+            "/admin/domain-profiles",
+            get(list_domain_profiles).post(create_domain_profile),
+        )
+        .route(
+            "/admin/domain-profiles/:id",
+            get(get_domain_profile)
+                .put(update_domain_profile)
+                .delete(delete_domain_profile),
+        )
+        .route(
+            "/admin/domain-profiles/:id/publish",
+            post(publish_domain_profile),
+        )
+        .route(
+            "/admin/domain-profiles/:id/rollout",
+            post(rollout_domain_profile),
+        )
+        .route(
+            "/admin/domain-profiles/:id/rollback",
+            post(rollback_domain_profile),
+        )
+        .route(
+            "/admin/domain-profiles/:id/activate",
+            post(activate_domain_profile),
+        )
+        // ── 引导层（3A-4）：AI 对话生成候选 DomainProfile ──
+        .route(
+            "/admin/domain-profiles/generate",
+            post(generate_domain_profile_candidate),
+        )
         // ── agent-self-evolution M4 W4 / Task 5.5：evolution admin 路由 ──────
         .route("/evolution/experiments", get(list_evolution_experiments))
         .route(
@@ -876,6 +916,9 @@ mod tests {
             // knowledge.rs：完整度审计内核 helper，被 get/refresh completeness 两个 handler
             // 复用、不直接绑 HTTP；real_llm_knowledge.rs K11 通过 `pub use` 直调真模型审计。
             "build_operation_knowledge_completeness",
+            // domain_schemas.rs：D1-b active schema 加载 helper，被 chunk 写侧
+            // （apply_chunk_revision）复用做 domain_attributes 校验，不直接绑 HTTP。
+            "load_active_domain_schema",
         ];
 
         let mut handlers: Vec<&str> = Vec::new();

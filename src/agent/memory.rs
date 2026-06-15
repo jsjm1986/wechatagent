@@ -118,12 +118,13 @@ pub(crate) fn effective_memory_card(memory: &OperatingMemory) -> MemoryCardTyped
 pub(crate) fn effective_memory_card_for_contact(
     memory: &OperatingMemory,
     contact: &Contact,
+    initial_state: &str,
 ) -> MemoryCardTyped {
     let card = effective_memory_card(memory);
     let mut compact = if memory_card_has_signal(&card) {
         compact_memory_card_with_previous(&card, None, &[])
     } else {
-        compact_memory_card_with_previous(&memory_card_from_contact(contact, memory), None, &[])
+        compact_memory_card_with_previous(&memory_card_from_contact(contact, memory, initial_state), None, &[])
     };
     compact
         .extra
@@ -189,6 +190,7 @@ pub(crate) fn memory_card_has_signal(card: &MemoryCardTyped) -> bool {
 pub(crate) fn memory_card_from_contact(
     contact: &Contact,
     memory: &OperatingMemory,
+    initial_state: &str,
 ) -> MemoryCardTyped {
     let profile: Option<&AgentProfile> = contact.agent_profile.as_ref();
     let identity = contact
@@ -245,7 +247,8 @@ pub(crate) fn memory_card_from_contact(
                 .as_ref()
                 .and_then(|d| d.get_str("customer_stage").ok().map(|s| s.to_string()))
                 .or_else(|| contact.operation_state.clone())
-                .unwrap_or_else(|| "new_contact".to_string()),
+                // H13：回落状态机初始态（替代写死 "new_contact"）。
+                .unwrap_or_else(|| initial_state.to_string()),
             "trustLevel": doc_string(&memory.relationship_state, "trustLevel")
                 .unwrap_or_else(|| "unknown".to_string()),
             "temperature": doc_string(&memory.relationship_state, "temperature")
@@ -344,6 +347,23 @@ pub fn compact_memory_card_with_previous(
     previous: Option<&MemoryCardTyped>,
     discarded: &[String],
 ) -> MemoryCardTyped {
+    // H17：现有签名保持不变（所有既有调用点 / PBT 零改动），内部用 DEFAULT 销售
+    // 八维度 cap——与改造前写死的 cap 表逐字等价。需按 active profile cap 截断的
+    // 生产合并点（consolidate_contact_memory）改调 _with_dimensions 传入 profile 维度。
+    let default_dims = crate::agent::domain_profile::default_memory_dimensions();
+    compact_memory_card_with_dimensions(card, previous, discarded, &default_dims)
+}
+
+/// H17：[`compact_memory_card_with_previous`] 的维度可配版。`dimensions` 驱动 `extra`
+/// 业务槽位的 cap（替代写死的 8 行 `limit_extra_array`）。typed 三数组（core/recent/
+/// deprecated_facts）与其 extra 镜像的固定 cap 不受 `dimensions` 影响。DEFAULT 维度
+/// 下与写死 cap 表字节等价；情感 profile 声明的额外槽在此被各自 cap 截断。
+pub fn compact_memory_card_with_dimensions(
+    card: &MemoryCardTyped,
+    previous: Option<&MemoryCardTyped>,
+    discarded: &[String],
+    dimensions: &[crate::models::MemoryDimension],
+) -> MemoryCardTyped {
     let mut compact = card.clone();
 
     // discarded 是全局黑名单：无论 fact 来自 incoming card 还是上一版 previous，
@@ -418,17 +438,17 @@ pub fn compact_memory_card_with_previous(
         }
     }
 
+    // H17：typed 骨架数组在 extra 里的历史镜像 cap 保持写死（coreFacts 6 /
+    // recentFacts 10 / deprecatedFacts 6——与 typed 三数组固定 cap 6/10/20 的 wire
+    // 兼容形态，不属业务维度）。业务记忆维度（preferences/doNotDo/... 八槽）的 cap
+    // 改由 memory_dimensions 驱动：DEFAULT 维度逐字复刻原 cap 表，故字节等价；情感
+    // profile 声明的额外槽（情绪史/纪念日）也在此被各自 cap 截断（防无界增长）。
     limit_extra_array(&mut compact.extra, "coreFacts", 6);
     limit_extra_array(&mut compact.extra, "recentFacts", 10);
-    limit_extra_array(&mut compact.extra, "confirmedFacts", 12);
-    limit_extra_array(&mut compact.extra, "preferences", 8);
-    limit_extra_array(&mut compact.extra, "doNotDo", 10);
-    limit_extra_array(&mut compact.extra, "commitments", 8);
-    limit_extra_array(&mut compact.extra, "objections", 8);
-    limit_extra_array(&mut compact.extra, "openLoops", 8);
-    limit_extra_array(&mut compact.extra, "openQuestions", 8);
     limit_extra_array(&mut compact.extra, "deprecatedFacts", 6);
-    limit_extra_array(&mut compact.extra, "conflicts", 6);
+    for dim in dimensions {
+        limit_extra_array(&mut compact.extra, &dim.key, dim.cap);
+    }
     compact
 }
 
@@ -619,6 +639,15 @@ pub(crate) async fn load_or_create_operating_memory(
     state: &AppState,
     contact: &Contact,
 ) -> AppResult<OperatingMemory> {
+    // H13：种子记忆卡 / 新建记忆的初始 operation_state 从 active 状态机取（替代写死
+    // "new_contact"）。load 一次复用于本函数内 memory_card_from_contact + 新建分支。
+    let domain_config = super::decision::load_user_operation_domain_config_for_contact(
+        state,
+        &contact.workspace_id,
+        &contact.wxid,
+    )
+    .await?;
+    let initial_state = super::guards::initial_operation_state_key(domain_config.as_ref());
     if let Some(mut memory) = state
         .db
         .operating_memories()
@@ -633,7 +662,7 @@ pub(crate) async fn load_or_create_operating_memory(
         .await?
     {
         if !memory_card_has_signal(&effective_memory_card(&memory)) {
-            let seeded = memory_card_from_contact(contact, &memory);
+            let seeded = memory_card_from_contact(contact, &memory, &initial_state);
             if memory_card_has_signal(&seeded) {
                 let updated_at = DateTime::now();
                 let prev_version = memory.memory_card_version;
@@ -729,7 +758,7 @@ pub(crate) async fn load_or_create_operating_memory(
             "unknowns": Vec::<String>::new()
         },
         next_action: doc! {
-            "currentState": contact.operation_state.clone().unwrap_or_else(|| "new_contact".to_string()),
+            "currentState": contact.operation_state.clone().unwrap_or_else(|| initial_state.clone()),
             "nextBestAction": "",
             "goal": "",
             "recommendedMove": "",
@@ -748,7 +777,7 @@ pub(crate) async fn load_or_create_operating_memory(
         created_at: DateTime::now(),
         updated_at: DateTime::now(),
     };
-    let mut seeded = memory_card_from_contact(contact, &memory);
+    let mut seeded = memory_card_from_contact(contact, &memory, &initial_state);
     let has_signal = memory_card_has_signal(&seeded);
     memory.memory_card_version = if has_signal { 1 } else { 0 };
     seeded.extra.insert("version", memory.memory_card_version);
@@ -796,6 +825,39 @@ pub async fn handle_memory_consolidation_task(state: &AppState, task: AgentTask)
         .await?
         .ok_or_else(|| AppError::NotFound("memory consolidation contact not found".to_string()))?;
     consolidate_contact_memory(state, &contact, Some(task_id)).await
+}
+
+/// H17：把 active profile 的记忆维度渲染成一段 consolidator prompt 指引，让整理 Agent
+/// 知道**本行业**有哪些记忆槽位、各自上限、填写指引。
+///
+/// 关键设计——**只在维度偏离 DEFAULT 销售八维时才追加**：静态 task prompt 的 JSON 骨架
+/// 已写死销售八槽（preferences/objections/...），DEFAULT profile 下它就是准确的，追加
+/// 指引纯属冗余且会扰动调好的销售行为（破坏字节等价）→ 故 DEFAULT 返回空串、prompt
+/// 逐字不变。换非销售行业（如情感域声明情绪史/纪念日）时，静态骨架的销售槽与本行业
+/// 不符，这段指引显式列出本行业真实槽位 + cap，引导 LLM 把候选记忆归入新槽（否则 LLM
+/// 只认静态骨架的销售字段，情感记忆无处落）。这是"memoryCard 记忆维度随 profile"的
+/// prompt 侧落点：DEFAULT 零扰动，非 DEFAULT 才生效。
+fn render_memory_dimensions_guidance(dimensions: &[crate::models::MemoryDimension]) -> String {
+    // DEFAULT 销售八维 → 静态骨架已覆盖，不追加（保持 prompt 字节等价、销售行为零扰动）。
+    if dimensions.is_empty()
+        || dimensions == crate::agent::domain_profile::default_memory_dimensions().as_slice()
+    {
+        return String::new();
+    }
+    let mut lines = String::from("\n本行业记忆维度（请把候选记忆按语义归入对应槽位，不要为填字段而猜测；以下槽位优先于上面 JSON 示例中的销售默认字段）：");
+    for dim in dimensions {
+        lines.push_str(&format!(
+            "\n- {key}（{name}，最多 {cap} 条）",
+            key = dim.key,
+            name = dim.display_name,
+            cap = dim.cap
+        ));
+        if let Some(hint) = dim.prompt_hint.as_deref().filter(|h| !h.trim().is_empty()) {
+            lines.push_str("：");
+            lines.push_str(hint);
+        }
+    }
+    lines
 }
 
 pub async fn consolidate_contact_memory(
@@ -873,6 +935,12 @@ async fn consolidate_contact_memory_inner(
         }
         return Ok(());
     }
+    // H17：一次加载 active profile，供 ① consolidator prompt 注入记忆维度说明（让 LLM
+    // 知道本行业有哪些记忆槽，DEFAULT=销售八槽，情感域=情绪史/纪念日）② 合并时按维度 cap
+    // 截断。两处复用同一份，避免重复 IO。
+    let active_profile =
+        crate::agent::domain_profile::load_active_domain_profile(&state.db, &contact.workspace_id)
+            .await;
     let system = prompts::load_prompt(
         &state.db,
         &state.config.default_workspace_id,
@@ -891,6 +959,12 @@ async fn consolidate_contact_memory_inner(
     .unwrap_or_else(|_| {
         r#"请输出 JSON：{ "memoryCard": {}, "summary": "", "discarded": [] }。只保留影响未来运营决策的信息，合并重复，最新明确表达优先，所有数组必须克制。"#.to_string()
     });
+    // H17：在静态 task prompt 后追加本行业记忆维度指引（DEFAULT 销售八维与静态骨架呼应；
+    // 情感 profile 在此显式列出情绪史/纪念日槽，引导 LLM 往新槽填内容）。空维度→空串不追加。
+    let task_prompt = format!(
+        "{task_prompt}{}",
+        render_memory_dimensions_guidance(&active_profile.memory_dimensions)
+    );
     let user = format!(
         r#"{}
 
@@ -965,8 +1039,15 @@ async fn consolidate_contact_memory_inner(
         })
         .unwrap_or_default();
     let previous_card = effective_memory_card(&memory);
-    let mut compact =
-        compact_memory_card_with_previous(&card_typed, Some(&previous_card), &discarded_list);
+    // H17：用 active profile 的记忆维度驱动 cap（DEFAULT 销售八维与写死表等价；
+    // 情感 profile 声明的情绪史/纪念日槽在此按各自 cap 截断，防无界增长）。
+    // active_profile 已在函数头部加载（consolidator prompt 注入复用同一份）。
+    let mut compact = compact_memory_card_with_dimensions(
+        &card_typed,
+        Some(&previous_card),
+        &discarded_list,
+        &active_profile.memory_dimensions,
+    );
     // agent-autonomy-loop W5 / Task 6.4：把 consolidator 输出的 deprecatedFacts /
     // conflicts 应用到合并后的 typed card；warnings 写入 agent_run_logs。
     let mut consolidator_warnings =
@@ -1841,5 +1922,50 @@ mod p1_5_occ_tests {
         assert_ne!(base, occ_memory_filter("ws", "acct2", "u_a", 0));
         assert_ne!(base, occ_memory_filter("ws", "acct", "u_b", 0));
         assert_ne!(base, occ_memory_filter("ws", "acct", "u_a", 1));
+    }
+
+    // ── H17：consolidator prompt 记忆维度指引渲染 ──
+
+    #[test]
+    fn memory_dimensions_guidance_empty_for_default_sales() {
+        // DEFAULT 销售八维 → 静态骨架已覆盖，渲染返回空串（prompt 字节等价、销售零扰动）。
+        let default_dims = crate::agent::domain_profile::default_memory_dimensions();
+        assert_eq!(
+            super::render_memory_dimensions_guidance(&default_dims),
+            "",
+            "DEFAULT 销售维度不得追加指引（保持 prompt 字节等价）"
+        );
+        // 空维度列表同样不追加。
+        assert_eq!(super::render_memory_dimensions_guidance(&[]), "");
+    }
+
+    #[test]
+    fn memory_dimensions_guidance_lists_custom_emotional_slots() {
+        // 情感 profile 声明情绪史/纪念日 → 指引显式列出槽位 key/标签/cap + hint。
+        let dims = vec![
+            crate::models::MemoryDimension {
+                key: "emotionHistory".to_string(),
+                display_name: "情绪史".to_string(),
+                cap: 12,
+                is_core: true,
+                prompt_hint: Some("记录 ta 近期的情绪起伏与触发事件".to_string()),
+                candidate_type: true,
+            },
+            crate::models::MemoryDimension {
+                key: "anniversaries".to_string(),
+                display_name: "纪念日".to_string(),
+                cap: 6,
+                is_core: false,
+                prompt_hint: None,
+                candidate_type: false,
+            },
+        ];
+        let out = super::render_memory_dimensions_guidance(&dims);
+        assert!(out.contains("emotionHistory"), "应列出情绪史槽 key");
+        assert!(out.contains("情绪史"), "应含中文标签");
+        assert!(out.contains("最多 12 条"), "应含 cap");
+        assert!(out.contains("记录 ta 近期的情绪起伏"), "应含 prompt_hint");
+        assert!(out.contains("anniversaries"), "应列出纪念日槽");
+        assert!(out.contains("最多 6 条"));
     }
 }

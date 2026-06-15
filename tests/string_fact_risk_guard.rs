@@ -48,7 +48,9 @@ fn minimal_state_machine_config() -> OperationDomainConfig {
         doc! { "key": "A", "allowedFrom": [] },
         doc! { "key": "B", "allowedFrom": ["A"] },
         doc! { "key": "C", "allowedFrom": [], "allowFromAny": true },
-        doc! { "key": "new_contact", "allowedFrom": [] },
+        // H13：new_contact 标 initial:true —— 引擎从写死的 `to=="new_contact"` 改读
+        // initial 标志后，空 from 唯一合法目标由本标志声明（与生产 DEFAULT 状态机一致）。
+        doc! { "key": "new_contact", "allowedFrom": [], "initial": true },
     ];
     OperationDomainConfig {
         id: None,

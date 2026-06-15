@@ -176,28 +176,62 @@ fn today_start_millis() -> i64 {
     now - (now.rem_euclid(day_ms))
 }
 
+/// 渲染本 run 已打开的知识切片为 prompt 文本。**DEFAULT 入口**：用内置销售四态角色
+/// （`default_chunk_roles`）；生产路径应优先用 [`format_operation_knowledge_for_prompt_with_roles`]
+/// 传入 active DomainProfile.chunk_roles。本 wrapper 保留供单测 / PBT / 无 profile 入口
+/// 调用，行为 = DEFAULT 销售四态（字节等价）。
 pub fn format_operation_knowledge_for_prompt(
     chunks: &[OperationKnowledgeChunk],
+) -> String {
+    let roles = crate::agent::domain_profile::default_chunk_roles();
+    format_operation_knowledge_for_prompt_with_roles(chunks, &roles)
+}
+
+/// universal-domain-adaptation H16-b：按 active DomainProfile 的 `chunk_roles` 把已打开
+/// 切片分段渲染（替代写死的销售四态分桶 + header）。分桶规则：chunk_type 命中某
+/// `role.key` → 该桶；未命中任何 key → `is_fallback=true` 的桶（DEFAULT=product_fact）。
+/// 输出顺序按 `role.order` 升序，header 用 `role.header`。`roles` 为空时回落内置销售四态
+/// （防御 / 老库）。DEFAULT 四态 → 与改造前逐字等价（PBT chunk_type_routing 锁死）。
+pub fn format_operation_knowledge_for_prompt_with_roles(
+    chunks: &[OperationKnowledgeChunk],
+    roles: &[crate::models::ChunkRole],
 ) -> String {
     if chunks.is_empty() {
         return "已打开知识切片:\n（空）".to_string();
     }
-    // Phase B / B3：按 `chunk_type` 分段输出 + 每段带不同的 prompt 指令。
-    // - product_fact：仅 `verified` 状态可作产品声明背书；
-    // - style_template：作为 few-shot 模板供 reply-agent 参考语气；
-    // - negative_example：作为 don't-do 示例（来自 reviewer 误判反馈队列）；
-    // - peer_case：作为同行案例 reference，不作产品承诺背书。
-    let mut by_type: std::collections::BTreeMap<&'static str, Vec<&OperationKnowledgeChunk>> =
-        std::collections::BTreeMap::new();
+    // roles 为空（老库 / 异常 profile）→ 回落内置销售四态。
+    let fallback_roles;
+    let roles: &[crate::models::ChunkRole] = if roles.is_empty() {
+        fallback_roles = crate::agent::domain_profile::default_chunk_roles();
+        &fallback_roles
+    } else {
+        roles
+    };
+    // fallback 桶 key：第一个 is_fallback=true 的 role；都没有则取第一个 role 兜底。
+    let fallback_key: &str = roles
+        .iter()
+        .find(|r| r.is_fallback)
+        .or_else(|| roles.first())
+        .map(|r| r.key.as_str())
+        .unwrap_or("");
+    let known_keys: std::collections::HashSet<&str> =
+        roles.iter().map(|r| r.key.as_str()).collect();
+    // 分桶：命中 role.key → 该桶；未命中 → fallback 桶。
+    let mut by_key: std::collections::HashMap<&str, Vec<&OperationKnowledgeChunk>> =
+        std::collections::HashMap::new();
     for c in chunks {
-        let bucket = match c.chunk_type.as_str() {
-            "style_template" => "style_template",
-            "negative_example" => "negative_example",
-            "peer_case" => "peer_case",
-            // 缺省 / "product_fact" / 任意其它值 → 走最保守的 product_fact 路径。
-            _ => "product_fact",
+        let bucket: &str = if known_keys.contains(c.chunk_type.as_str()) {
+            c.chunk_type.as_str()
+        } else {
+            fallback_key
         };
-        by_type.entry(bucket).or_default().push(c);
+        // 把 bucket 收敛到 roles 里实际存在的 key（&'static lifetime 借自 roles）。
+        let role_key = roles
+            .iter()
+            .find(|r| r.key == bucket)
+            .map(|r| r.key.as_str())
+            .unwrap_or(fallback_key);
+        by_key.entry(role_key).or_default().push(c);
     }
     let render_chunk = |item: &OperationKnowledgeChunk| -> String {
         format!(
@@ -215,20 +249,15 @@ pub fn format_operation_knowledge_for_prompt(
             item.source_quote.clone().unwrap_or_default()
         )
     };
-    // 固定输出顺序：product_fact → style_template → peer_case → negative_example。
-    // BTreeMap 顺序与"运营优先级"不一致，这里强制顺序，确保 prompt 稳定。
-    let order = [
-        ("product_fact", "【产品事实 product_fact】仅 verified 切片可用作产品声明背书；needs_review/rejected 不作背书。"),
-        ("style_template", "【语气模板 style_template】作为 few-shot 参考；不直接复制内容，仅借鉴节奏与措辞。"),
-        ("peer_case", "【同行案例 peer_case】仅作 reference，不作我方产品承诺；引用必须显式标注「行业经验/同行案例」。"),
-        ("negative_example", "【反例 negative_example】don't-do 列表；候选回复语气/结构若与本段相似，必须改写。"),
-    ];
-    let sections = order
+    // 按 role.order 升序输出，仅产出有 chunk 的桶（空桶不留 header）。
+    let mut ordered: Vec<&crate::models::ChunkRole> = roles.iter().collect();
+    ordered.sort_by_key(|r| r.order);
+    let sections = ordered
         .iter()
-        .filter_map(|(key, header)| {
-            by_type.get(key).map(|items| {
+        .filter_map(|role| {
+            by_key.get(role.key.as_str()).map(|items| {
                 let body = items.iter().map(|c| render_chunk(c)).collect::<Vec<_>>().join("\n");
-                format!("{}\n{}", header, body)
+                format!("{}\n{}", role.header, body)
             })
         })
         .collect::<Vec<_>>();
@@ -242,6 +271,18 @@ pub async fn test_knowledge_route_for_contact(
     message: &str,
 ) -> AppResult<Document> {
     let has_persisted_contact = contact.is_some();
+    // H13：合成预览 contact 的初始 operation_state 从 active 状态机取（替代写死 "new_contact"）。
+    let preview_initial_state = if contact.is_none() {
+        let domain_config = super::decision::load_user_operation_domain_config(
+            state,
+            &state.config.default_workspace_id,
+        )
+        .await?;
+        super::guards::initial_operation_state_key(domain_config.as_ref())
+    } else {
+        // 有真实 contact 时不构造合成默认，此值不被使用。
+        String::new()
+    };
     let contact = contact.unwrap_or_else(|| Contact {
         id: None,
         workspace_id: state.config.default_workspace_id.clone(),
@@ -253,6 +294,7 @@ pub async fn test_knowledge_route_for_contact(
         agent_status: AgentStatus::Managed,
         human_profile_note: None,
         custom_agent_instructions: None,
+        operation_mode_override: None,
         agent_profile: None,
         memory_summary: None,
         playbook_id: None,
@@ -262,7 +304,7 @@ pub async fn test_knowledge_route_for_contact(
         domain_attributes_updated_at: None,
         commitments: Vec::new(),
         follow_up_policy: None,
-        operation_state: Some("new_contact".to_string()),
+        operation_state: Some(preview_initial_state),
         operation_state_reason: None,
         operation_state_confidence: None,
         operation_state_updated_at: None,
@@ -276,7 +318,7 @@ pub async fn test_knowledge_route_for_contact(
         last_agent_run_at: None,
         last_outbound_style: None,
         intent_trajectory: Vec::new(),
-        deal_events: Vec::new(),
+        outcome_events: Vec::new(),
         locale: None,
         created_at: DateTime::now(),
         updated_at: DateTime::now(),
@@ -338,7 +380,10 @@ pub async fn test_knowledge_route_for_contact(
     };
     let knowledge = load_operation_knowledge(state, &contact).await?;
     // task 6.3：边界处把 typed 转为 Document wire shape，下游 prompt 注入路径不变。
-    let memory_card = effective_memory_card_for_contact(&memory, &contact).to_document();
+    // H13：无 operation_state 时回落状态机初始态。
+    let initial_state = super::decision::initial_operation_state_for_contact(state, &contact).await?;
+    let memory_card =
+        effective_memory_card_for_contact(&memory, &contact, &initial_state).to_document();
     let route = route_operation_knowledge(
         state,
         &contact,
@@ -915,6 +960,50 @@ mod tests {
         assert!(!s.contains("【产品事实 product_fact】"));
         assert!(!s.contains("【同行案例 peer_case】"));
         assert!(!s.contains("【反例 negative_example】"));
+    }
+
+    // ---- H16-b：自定义 chunk_roles（换行业）路径 ----
+
+    #[test]
+    fn custom_roles_render_with_their_headers_order_and_fallback() {
+        use crate::models::ChunkRole;
+        // 情感/陪伴域角色：emotion_memory（fallback）+ anniversary。
+        let roles = vec![
+            ChunkRole { key: "emotion_memory".to_string(), header: "【情绪记忆】".to_string(), order: 1, is_fallback: true },
+            ChunkRole { key: "anniversary".to_string(), header: "【纪念日】".to_string(), order: 0, is_fallback: false },
+        ];
+        let chunks = vec![
+            mk_chunk("她最近压力大", "emotion_memory"),
+            mk_chunk("下周生日", "anniversary"),
+            mk_chunk("未知类型落 fallback", "product_fact"), // 非本域 key → fallback(emotion_memory)
+        ];
+        let s = format_operation_knowledge_for_prompt_with_roles(&chunks, &roles);
+        // 两个角色 header 都出现；销售四态 header 不出现（已被替换）。
+        assert!(s.contains("【情绪记忆】"));
+        assert!(s.contains("【纪念日】"));
+        assert!(!s.contains("【产品事实 product_fact】"));
+        // order 升序：纪念日(0) 在 情绪记忆(1) 之前。
+        let pos_anniv = s.find("【纪念日】").unwrap();
+        let pos_emotion = s.find("【情绪记忆】").unwrap();
+        assert!(pos_anniv < pos_emotion, "应按 order 升序：纪念日先于情绪记忆\n{s}");
+        // 未命中本域 key 的 chunk（chunkType=product_fact）落 fallback 桶（emotion_memory）。
+        // mk_chunk 把 title 同时写进 title= 和 summary=摘要 两处，故 title 子串出现 2 次。
+        assert_eq!(s.matches("未知类型落 fallback").count(), 2);
+        // 该 fallback chunk 渲染在 emotion_memory 段内（在【情绪记忆】header 之后）。
+        let pos_fallback_chunk = s.find("title=未知类型落 fallback").unwrap();
+        assert!(pos_fallback_chunk > pos_emotion, "fallback chunk 应渲染在情绪记忆段内");
+        assert!(s.contains("她最近压力大"));
+        assert!(s.contains("下周生日"));
+    }
+
+    #[test]
+    fn empty_roles_falls_back_to_default_sales_four() {
+        // roles 为空（老库 / 异常 profile）→ 回落内置销售四态，与无参 wrapper 等价。
+        let chunks = vec![mk_chunk("产品事实", "product_fact")];
+        let with_empty = format_operation_knowledge_for_prompt_with_roles(&chunks, &[]);
+        let with_default = format_operation_knowledge_for_prompt(&chunks);
+        assert_eq!(with_empty, with_default);
+        assert!(with_empty.contains("【产品事实 product_fact】"));
     }
 
     // ---- P4 探索注入：softmax + 不放回抽样 + propensity 记录 ----

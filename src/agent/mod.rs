@@ -28,6 +28,8 @@ mod chat_tool_loop;
 mod decision;
 mod decision_taxonomy;
 pub mod domain;
+pub(crate) mod domain_profile;
+pub(crate) mod domain_signals;
 pub mod escalation;
 mod gateway;
 mod guards;
@@ -65,6 +67,11 @@ pub(crate) use self::budget::{current_run_budget, RUN_BUDGET};
 // 入口函数 / 类型重新导出，保持与拆分前 `crate::agent::xxx` 完全一致。
 pub use decision::{build_initial_operation_profile, load_operation_playbook_for_contact};
 pub(crate) use decision::load_user_operation_domain_config_for_contact;
+// H13：onboarding 写侧（routes/contacts、routes/management）取状态机初始态 key +
+// 按 workspace 加载 active domain_config（替代写死 "new_contact"）。
+pub(crate) use decision::load_user_operation_domain_config;
+pub(crate) use decision::initial_operation_state_for_contact;
+pub(crate) use guards::initial_operation_state_key;
 pub use gateway::{
     handle_follow_up_task, handle_managed_message, handle_managed_message_aggregated,
     send_contact_message_gateway, write_event_for_account,
@@ -79,7 +86,11 @@ pub use knowledge_agent::{
 // Phase B / B3 / B6：`tests/chunk_type_routing_pbt.rs` 需要直接驱动
 // `format_operation_knowledge_for_prompt`，因此对外 re-export。生产路径调用方
 // 仍走 `agent/knowledge_router.rs` 内部，不应跨越 mod 边界使用此符号。
-pub use knowledge_router::format_operation_knowledge_for_prompt;
+// H16-b：`_with_roles` 是生产路径入口（decision / review 传 active profile.chunk_roles），
+// 无参 wrapper 保留供 PBT / 无 profile 入口 = DEFAULT 销售四态。
+pub use knowledge_router::{
+    format_operation_knowledge_for_prompt, format_operation_knowledge_for_prompt_with_roles,
+};
 pub use memory::{consolidate_contact_memory, handle_memory_consolidation_task};
 pub use outbox_dispatcher::run_outbox_dispatcher;
 
@@ -95,7 +106,6 @@ pub use outbox::{
     cancel_for_contact_on_user_reaction, enqueue, EnqueueOutcome, EnqueueRequest, OutboxStatus,
 };
 pub use reaction::{cap_intent_trajectory, record_user_reaction};
-pub(crate) use reaction::is_negative_outcome;
 pub use simulation::simulate_user_dialogue;
 pub use types::{
     AgentDecision, ContactSendResult, FollowUpDecision, GeneratedOperationProfile,
@@ -116,7 +126,7 @@ pub(crate) use knowledge_tools::{AnchorMatchFn, ALLOWED_CHAT_TOOL_NAMES};
 
 // Task 24：测试可用的 PBT 入口（pure functions，无副作用）。
 pub use guards::check_state_transition;
-pub use memory::compact_memory_card_with_previous;
+pub use memory::{compact_memory_card_with_dimensions, compact_memory_card_with_previous};
 
 // agent-autonomy-loop W3 / Tasks 4.11-4.15：性质测试 P1-P7 入口。
 //
@@ -141,6 +151,16 @@ pub use taxonomy::{taxonomy_cache_for_tests, TaxonomyCache};
 
 // Phase A / A3：启动期预热入口；main.rs 在 ensure_indexes 后调用。
 pub use taxonomy::init_global_taxonomy_cache;
+
+// universal-domain-adaptation 1G-c：active DomainProfile 进程级缓存预热入口；
+// main.rs 在 taxonomy 预热之后调用。
+pub use domain_profile::init_global_domain_profile_cache;
+// H17：记忆维度通用化的两个 pub 渲染/seed 函数，供 tests/ 端到端验证情感 profile。
+pub use domain_profile::{default_memory_dimensions, render_memory_candidate_types_guidance};
+// roleplay-fuzz P0：集成测试 seed/读回 active DomainProfile + 失效进程级缓存所需入口。
+pub use domain_profile::{
+    default_domain_profile, invalidate_global_domain_profile_cache, load_active_domain_profile,
+};
 
 // agent-autonomy-loop W3 / Task 4.5：P7 工具循环性质测试入口。
 //
@@ -510,6 +530,8 @@ mod tests {
             quiet_hours_start: 22,
             quiet_hours_end: 8,
             quiet_hours_tz_offset_hours: 8,
+            allowed_conversation_modes: crate::agent::runtime::default_conversation_modes(),
+            grounding_gate_bypass_without_claim: false,
         }
     }
 
@@ -606,9 +628,10 @@ mod tests {
             last_outbound_at: None,
             last_agent_run_at: None,
             custom_agent_instructions: None,
+            operation_mode_override: None,
             last_outbound_style: None,
             intent_trajectory: Vec::new(),
-            deal_events: Vec::new(),
+            outcome_events: Vec::new(),
             locale: None,
             created_at: DateTime::now(),
             updated_at: DateTime::now(),

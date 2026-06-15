@@ -180,6 +180,8 @@ pub(super) async fn approve_taxonomy_candidate(
                 aliases
             },
             status: "active".to_string(),
+            priority_weight: None,
+            is_terminal: false,
         },
         updated_at: now,
         version: 1,

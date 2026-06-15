@@ -81,6 +81,9 @@ async fn async_main() -> anyhow::Result<()> {
     // Phase A / A3：启动期预热 system_taxonomies 进程级 cache。失败被静默
     // （`init_global_taxonomy_cache` 内部 log warning），下一次 check_value 触发懒加载。
     wechatagent::agent::init_global_taxonomy_cache(&db).await;
+    // universal-domain-adaptation 1G-c：同款预热 active DomainProfile 进程级 cache，
+    // 治理"每决策 / 每 planner tick 都查 domain_profiles"的 N+1。失败静默。
+    wechatagent::agent::init_global_domain_profile_cache(&db).await;
     // LLM 配置：DB 优先，缺则用 .env 当种子。
     // 启动时若 `llm_provider_configs` 没有 active 记录，写一条来自 .env 的
     // openai 形态默认记录；之后每次启动都按当前 active 记录构造 LlmClient。

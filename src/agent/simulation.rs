@@ -115,7 +115,11 @@ async fn simulate_user_dialogue_inner(
         // task 6.3：`effective_memory_card_for_contact` 现在返回
         // `MemoryCardTyped`；prompt 注入仍走 Document wire shape，故在边界
         // `to_document()` 一次性转换。
-        let context_pack_typed = effective_memory_card_for_contact(&memory, &contact);
+        let context_pack_typed = effective_memory_card_for_contact(
+            &memory,
+            &contact,
+            &super::guards::initial_operation_state_key(domain_config.as_ref()),
+        );
         let context_pack = context_pack_typed.to_document();
         let initial_planner = RunPlannerResult {
             risk_level: "medium".to_string(),
@@ -209,7 +213,8 @@ async fn simulate_user_dialogue_inner(
         let current_state = contact
             .operation_state
             .clone()
-            .unwrap_or_else(|| "new_contact".to_string());
+            // H13：无 operation_state 时回落状态机初始态（替代写死 "new_contact"）。
+            .unwrap_or_else(|| super::guards::initial_operation_state_key(domain_config.as_ref()));
         let next_state = decision
             .operation_state
             .clone()

@@ -1,5 +1,10 @@
 name: CI
 
+# 同一 PR/push 只保留最新 run，取消旧 run——避免重复排队浪费 runner 资源。
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 on:
   pull_request:
     branches: [main]
@@ -18,6 +23,27 @@ on:
       - 'frontend/**'
       - 'docs/**'
       - '**/*.md'
+  # 手动触发：**绕过**所有 needs 前置链立即起跑，用于快速验证单测修复。两个互斥目标：
+  # - dispatch_target=ops（默认）：单独跑某一个 real_llm_ops_smoke 测试（填 ops_test，默认 t15），
+  #   不必等 real-llm → recall → ops 串行排队 1+ 小时。
+  # - dispatch_target=roleplay_docker：只跑 roleplay-fuzz P0 那几个需要 Docker（testcontainers
+  #   MongoDB）的 #[ignore] 夹具自验证测试（无需任何 LLM key），不跑完整 CI、不烧真模型配额。
+  # 在 Actions 页选 CI workflow → Run workflow → 选 target（+ 必要时填 ops_test）。
+  workflow_dispatch:
+    inputs:
+      dispatch_target:
+        description: '手动单跑目标（ops=单个 real_llm_ops_smoke / roleplay_docker=roleplay P0 Docker 夹具）'
+        required: true
+        default: 'ops'
+        type: choice
+        options:
+          - ops
+          - roleplay_docker
+      ops_test:
+        description: '当 target=ops 时单独跑的 real_llm_ops_smoke 测试名（如 t15_real_multiturn_deal_arc）'
+        required: false
+        default: 't15_real_multiturn_deal_arc'
+        type: string
 
 env:
   CARGO_TERM_COLOR: always
@@ -27,6 +53,7 @@ jobs:
   baseline:
     name: Baseline gate (R11.6)
     runs-on: ubuntu-latest
+    if: ${{ github.event_name != 'workflow_dispatch' }}
     timeout-minutes: 30
     steps:
       - name: Checkout (with full history for diff)
@@ -79,6 +106,7 @@ jobs:
   integration:
     name: Integration tests (Docker / testcontainers)
     runs-on: ubuntu-latest
+    if: ${{ github.event_name != 'workflow_dispatch' }}
     # 首次接入：101 个 #[ignore] 集成测试从未在 CI 跑过，bit-rot 几乎必然。
     # 先 continue-on-error 拿到真实绿/红体检报告，不阻塞合并；逐个修复后
     # 再视情况抬升为硬门（与 baseline 同级）。
@@ -129,6 +157,7 @@ jobs:
   real-llm:
     name: Real-LLM smoke (真实大模型 / MCP 桩)
     runs-on: ubuntu-latest
+    if: ${{ github.event_name != 'workflow_dispatch' }}
     # 用**真实大模型**（MiMo mimo-v2.5 / OpenAI 兼容端点）跑 T1 文本决策+审查 / T2 知识
     # tool-loop / T3 多模态 vision 抽取，验证 mock 测不到的真实 schema/闸门/收敛。
     # MCP 永远是 wiremock 桩（绝不真发微信）。real-LLM 限流/抖动不该阻塞合并，
@@ -186,6 +215,18 @@ jobs:
           REAL_LLM_VISION_MODEL: nvidia/nemotron-nano-12b-v2-vl
         run: cargo test --no-fail-fast --test real_llm_smoke -- --ignored --nocapture
 
+      # ════════════════════════════════════════════════════════════════════════════
+      # universal-domain-adaptation 3C：DomainProfile 端到端（AI 生成候选 → publish
+      # → activate → 运行时加载）。走 step-3.7-flash（Flash 模型成本低、JSON 稳定，足够
+      # 验证 profile 生成链路）。与 real_llm_smoke 同 env/key/guard。
+      - name: cargo test --test domain_profile_e2e -- --ignored --nocapture
+        if: ${{ env.REAL_LLM_API_KEY != '' }}
+        env:
+          RUSTFLAGS: ""
+          REAL_LLM_BASE_URL: https://integrate.api.nvidia.com/v1/chat/completions
+          REAL_LLM_MODEL: stepfun-ai/step-3.7-flash
+        run: cargo test --test domain_profile_e2e -- --ignored --nocapture
+
       # 知识库全能力 smoke（real_llm_knowledge.rs K1–K9）：渐进式披露检索
       # （open_chunk 深检索 / follow_relations 关系跳转 / 无幻觉 / 未审定不上桌）
       # + 抽取全能力（文章抽取 / 多模态图片抽取 / 自动审定 provenance 闸门 /
@@ -233,6 +274,7 @@ jobs:
   real-llm-recall:
     name: Real-LLM knowledge recall benchmark (${{ matrix.t }} / MCP 桩)
     runs-on: ubuntu-latest
+    if: ${{ github.event_name != 'workflow_dispatch' }}
     # NVIDIA integrate 免费层 RPM 硬墙：5 个 real-LLM job-group 并行时瞬时 ~9 runner 同打
     # 一把 key 必爆 429（实测 retry 6 次仍全 skip 假绿）。max-parallel 只在单 matrix 内限并发、
     # 不能跨 group 协调，故用 needs 链把 5 个 group 串行化（smoke→recall→ops→quality→adversarial），
@@ -316,6 +358,7 @@ jobs:
   real-llm-ops:
     name: Real-LLM ops smoke (${{ matrix.t }} / MCP 桩)
     runs-on: ubuntu-latest
+    if: ${{ github.event_name != 'workflow_dispatch' }}
     # 串行链第 3 环（见 real-llm-recall 注释：跨 group 串行根治 NVIDIA 429）。
     needs: real-llm-recall
     continue-on-error: true
@@ -393,6 +436,55 @@ jobs:
           REAL_LLM_FAILOVER_MODELS: z-ai/glm-5.1,stepfun-ai/step-3.7-flash,qwen/qwen3-next-80b-a3b-instruct
         run: cargo test --no-fail-fast --test real_llm_ops_smoke ${{ matrix.t }} -- --ignored --nocapture
 
+  # 手动单跑：只跑 workflow_dispatch input 指定的**单个** real_llm_ops_smoke 测试，
+  # **无 needs 前置链**，触发后立即起跑——用于快速验证单测修复（如 t15），不必等
+  # real-llm → recall → ops 串行排队 1+ 小时。env 与 real-llm-ops 完全同口径（同主模型
+  # kimi-k2.6 / 同异族 judge llama-3.3-70b / 同 failover 备胎链），保证单跑结果与全套
+  # 一致、可直接采信。仅 workflow_dispatch 事件触发；正常 PR/push 跑全套矩阵不受影响。
+  # MCP 仍是桩（绝不真发微信）。
+  real-llm-ops-single:
+    name: Real-LLM ops single (${{ github.event.inputs.ops_test }} / 手动单跑)
+    runs-on: ubuntu-latest
+    if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.dispatch_target == 'ops' }}
+    timeout-minutes: 90
+    env:
+      REAL_LLM_API_KEY: ${{ secrets.REAL_LLM_CODERELAY_API_KEY || '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' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Free disk space
+        if: ${{ env.REAL_LLM_API_KEY != '' }}
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android \
+            /usr/local/share/boost /usr/local/share/powershell \
+            /usr/lib/jvm "$AGENT_TOOLSDIRECTORY" || true
+          sudo docker image prune --all --force || true
+          df -h
+
+      - name: Install Rust toolchain
+        if: ${{ env.REAL_LLM_API_KEY != '' }}
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry / target
+        if: ${{ env.REAL_LLM_API_KEY != '' }}
+        uses: Swatinem/rust-cache@v2
+
+      - name: cargo test --test real_llm_ops_smoke ${{ github.event.inputs.ops_test }}
+        if: ${{ env.REAL_LLM_API_KEY != '' }}
+        env:
+          RUSTFLAGS: ""
+          REAL_LLM_BASE_URL: https://integrate.api.nvidia.com/v1
+          REAL_LLM_MODEL: moonshotai/kimi-k2.6
+          REAL_LLM_JUDGE: "1"
+          REAL_LLM_JUDGE_API_KEY: ${{ secrets.REAL_LLM_GPT55_API_KEY || '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' }}
+          REAL_LLM_JUDGE_BASE_URL: https://integrate.api.nvidia.com/v1
+          REAL_LLM_JUDGE_MODEL: meta/llama-3.3-70b-instruct
+          REAL_LLM_FAILOVER_API_KEY: ${{ secrets.REAL_LLM_VISION_BACKUP_API_KEY || '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' }}
+          REAL_LLM_FAILOVER_BASE_URL: https://integrate.api.nvidia.com/v1
+          REAL_LLM_FAILOVER_MODELS: z-ai/glm-5.1,stepfun-ai/step-3.7-flash,qwen/qwen3-next-80b-a3b-instruct
+        run: cargo test --no-fail-fast --test real_llm_ops_smoke ${{ github.event.inputs.ops_test }} -- --ignored --nocapture
+
   # 知识库内容质量套件（real_llm_knowledge_quality.rs Q1–Q7）——「裁判校准层」重构后
   # 升级为跨家族裁判团（MiMo 双 checkpoint mimo-v2.5-pro + mimo-v2.5，外加**异族** Qwen
   # via DashScope，#618 最高 ROI 杠杆兑现）+ 跨裁判分歧效度门 + 每 Q 金标 good/bad 校准锚
@@ -416,6 +508,7 @@ jobs:
   real-llm-quality:
     name: Real-LLM knowledge quality (${{ matrix.q }} 双裁判 / MCP 桩)
     runs-on: ubuntu-latest
+    if: ${{ github.event_name != 'workflow_dispatch' }}
     # 串行链第 4 环（见 real-llm-recall 注释：跨 group 串行根治 NVIDIA 429）。
     needs: real-llm-ops
     continue-on-error: true
@@ -539,6 +632,7 @@ jobs:
   real-llm-adversarial:
     name: Real-LLM adversarial (${{ matrix.arc }})
     runs-on: ubuntu-latest
+    if: ${{ github.event_name != 'workflow_dispatch' }}
     # 串行链末环（见 real-llm-recall 注释：跨 group 串行根治 NVIDIA 429）。
     needs: real-llm-quality
     continue-on-error: true
@@ -645,3 +739,43 @@ jobs:
           path: target/real_llm_ledger/
           if-no-files-found: ignore
           retention-days: 30
+
+  # 手动单跑：roleplay-fuzz P0 那几个需要 Docker（testcontainers MongoDB）的 #[ignore]
+  # 夹具自验证测试。**无 needs 前置链、无任何 LLM key**——只验夹具本身（seed active
+  # DomainProfile 经缓存失效后能读回 / 默认 ws 仍回落 DEFAULT / reviewer prompt 覆写在
+  # ensure_prompt_pack_v2 之后胜出 / verified chunk 能写入），不调真模型、不烧配额。
+  # 仅 workflow_dispatch + dispatch_target=roleplay_docker 触发；正常 PR/push 跑全套不受
+  # 影响（这些测试在 integration job 的全量 --ignored 里本就会被一起跑到，本 job 只是给
+  # 一个轻量、即时、单独的验证入口）。
+  roleplay-docker:
+    name: Roleplay P0 Docker fixtures (手动单跑 / 无 LLM)
+    runs-on: ubuntu-latest
+    if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.dispatch_target == 'roleplay_docker' }}
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # 同 integration job：清预装 SDK 腾 ~30GB，否则 target + mongo 镜像撑爆磁盘。
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android \
+            /usr/local/share/boost /usr/local/share/powershell \
+            /usr/lib/jvm "$AGENT_TOOLSDIRECTORY" || true
+          sudo docker image prune --all --force || true
+          df -h
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry / target
+        uses: Swatinem/rust-cache@v2
+
+      # ubuntu-latest runner 预装 Docker daemon；testcontainers 自动拉起临时 MongoDB
+      # 容器。关 -Dwarnings 同 integration job 理由（测试文件陈年 warning 不阻断真实跑测）。
+      # --include-ignored 同时跑 #[ignore]（4 个需 Docker）与非 ignore 的 ledger 单测，
+      # 一次拿全 5 个 P0 自验证结果。--nocapture 让诊断行进 CI 日志。
+      - name: cargo test --test roleplay_fixtures_smoke (testcontainers MongoDB)
+        env:
+          RUSTFLAGS: ""
+        run: cargo test --no-fail-fast --test roleplay_fixtures_smoke -- --include-ignored --nocapture

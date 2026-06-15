@@ -77,6 +77,35 @@ pub struct UserRuntimeParameters {
     /// #69 作息门控：运营方时区相对 UTC 的小时偏移（中国 +8）。默认 8。
     /// 固定偏移使作息判定不依赖部署宿主时区；loader clamp 到 `[-12, 14]`。
     pub quiet_hours_tz_offset_hours: i32,
+    /// universal-domain-adaptation H9：本轮允许的 conversationMode 取值集合
+    /// （替代 `agent::types::CONVERSATION_MODE_VALUES` 写死四模式）。`from_config`
+    /// 给内置默认四模式；gateway 在加载 active DomainProfile 后用
+    /// `profile.conversation_modes` 覆盖（非空时）。`validate_and_promote` 读它做
+    /// conversationMode 严格枚举校验。DEFAULT 销售域 = 四模式逐字等价。
+    pub allowed_conversation_modes: Vec<String>,
+    /// universal-domain-adaptation H14：本域是否在「无产品声明」时旁路 grounding
+    /// 软分数硬闸（`classify_dual_gate` 里 `knowledge_grounding_score <
+    /// product_accuracy_block_below` 的判罚）。`false`（DEFAULT/老库/`from_config`/
+    /// `Default`）= 不旁路 = 每条回复都判 grounding 硬闸（销售域字节等价）；`true`
+    /// = 纯关系/情感域，仅当本条回复 `claim_analysis.requiresProductKnowledge=true`
+    /// 时才纳入 grounding 硬闸，纯情感回复不再被 grounding 低分误拦。
+    /// 由 active DomainProfile.grounding_gate_bypass_without_claim 派生，gateway
+    /// 加载 profile 后覆盖。**红线**：本旁路仅作用于 grounding 软分数硬闸，
+    /// `blocked_unverified_product_claim`（R5.4 verified 强约束 + 漏判探针）任何
+    /// 取值下都不变。
+    pub grounding_gate_bypass_without_claim: bool,
+}
+
+/// H9：内置默认 conversationMode 四模式（逐字复刻 `types::CONVERSATION_MODE_VALUES`）。
+/// `from_config` / `Default` 用它；active profile 声明了 `conversation_modes` 时由
+/// gateway 覆盖。
+pub(crate) fn default_conversation_modes() -> Vec<String> {
+    vec![
+        "casual_relationship".to_string(),
+        "value_exchange".to_string(),
+        "consultative".to_string(),
+        "boundary_protection".to_string(),
+    ]
 }
 
 impl UserRuntimeParameters {
@@ -110,7 +139,7 @@ impl UserRuntimeParameters {
             follow_up_expires_hours: typed.follow_up_expires_hours,
             cooldown_after_no_reply_hours: typed.cooldown_after_no_reply_hours,
             fact_risk_block_at: typed.hallucination_block_at,
-            pressure_risk_block_at: 7,
+            pressure_risk_block_at: typed.pressure_risk_block_at,
             human_like_rewrite_below: typed.human_like_rewrite_below,
             emotional_value_rewrite_below: typed.emotional_value_rewrite_below,
             product_accuracy_block_below: typed.knowledge_grounding_block_below,
@@ -133,6 +162,12 @@ impl UserRuntimeParameters {
             quiet_hours_start: typed.quiet_hours_start.min(23),
             quiet_hours_end: typed.quiet_hours_end.min(23),
             quiet_hours_tz_offset_hours: typed.quiet_hours_tz_offset_hours.clamp(-12, 14),
+            // H9：from_config 不接 DomainProfile，给内置默认四模式；gateway 在
+            // 加载 active profile 后用 profile.conversation_modes 覆盖（非空时）。
+            allowed_conversation_modes: default_conversation_modes(),
+            // H14：from_config 不接 DomainProfile，默认 false=无条件 grounding 硬闸
+            // （销售域字节等价）；gateway 加载 active profile 后覆盖。
+            grounding_gate_bypass_without_claim: false,
         }
     }
 
@@ -166,7 +201,8 @@ impl UserRuntimeParameters {
             "quietHoursEnabled": self.quiet_hours_enabled,
             "quietHoursStart": self.quiet_hours_start as i32,
             "quietHoursEnd": self.quiet_hours_end as i32,
-            "quietHoursTzOffsetHours": self.quiet_hours_tz_offset_hours
+            "quietHoursTzOffsetHours": self.quiet_hours_tz_offset_hours,
+            "groundingGateBypassWithoutClaim": self.grounding_gate_bypass_without_claim
         }
     }
 }
@@ -208,7 +244,7 @@ impl Default for UserRuntimeParameters {
             follow_up_expires_hours: typed.follow_up_expires_hours,
             cooldown_after_no_reply_hours: typed.cooldown_after_no_reply_hours,
             fact_risk_block_at: typed.hallucination_block_at,
-            pressure_risk_block_at: 7,
+            pressure_risk_block_at: typed.pressure_risk_block_at,
             human_like_rewrite_below: typed.human_like_rewrite_below,
             emotional_value_rewrite_below: typed.emotional_value_rewrite_below,
             product_accuracy_block_below: typed.knowledge_grounding_block_below,
@@ -231,6 +267,10 @@ impl Default for UserRuntimeParameters {
             quiet_hours_start: typed.quiet_hours_start.min(23),
             quiet_hours_end: typed.quiet_hours_end.min(23),
             quiet_hours_tz_offset_hours: typed.quiet_hours_tz_offset_hours.clamp(-12, 14),
+            // H9：PBT / 无 profile 入口的默认四模式，与销售域逐字等价。
+            allowed_conversation_modes: default_conversation_modes(),
+            // H14：PBT / 无 profile 入口默认 false=无条件 grounding 硬闸（销售域等价）。
+            grounding_gate_bypass_without_claim: false,
         }
     }
 }
@@ -495,6 +535,8 @@ mod tests {
             quiet_hours_start: 22,
             quiet_hours_end: 8,
             quiet_hours_tz_offset_hours: 8,
+            allowed_conversation_modes: default_conversation_modes(),
+            grounding_gate_bypass_without_claim: false,
         };
         let doc = runtime.as_document();
         assert_eq!(doc.get_i64("reactionTokenBudget").ok(), Some(8000));

@@ -47,7 +47,7 @@ use crate::routes::AppState;
 use super::budget::RunBudget;
 use super::decision::{format_operation_domain_config_for_prompt, format_playbook_for_prompt};
 use super::generate_agent_json;
-use super::knowledge_router::format_operation_knowledge_for_prompt;
+use super::knowledge_router::format_operation_knowledge_for_prompt_with_roles;
 use super::runtime::UserRuntimeParameters;
 use super::types::{
     AgentDecision, DecisionReviewResult, KnowledgeRouteResult, ReviewScores, RunPlannerResult,
@@ -207,6 +207,13 @@ pub(crate) async fn review_decision(
     };
     let system =
         prompts::load_prompt(&state.db, &state.config.default_workspace_id, prompt_key).await?;
+    // universal-domain-adaptation H16-b：reviewer 的产品知识段也按 active profile 的
+    // chunk_roles 渲染（与 Reply Agent 同源）。缓存命中即廉价；DEFAULT 销售四态字节等价。
+    let active_profile = crate::agent::domain_profile::load_active_domain_profile(
+        &state.db,
+        &contact.workspace_id,
+    )
+    .await;
     let runtime_text = serde_json::to_string(&runtime.as_document()).unwrap_or_default();
     let memory_card_text = serde_json::to_string(context_pack).unwrap_or_default();
     let memory_text = serde_json::to_string(&mongodb::bson::doc! {
@@ -226,6 +233,13 @@ pub(crate) async fn review_decision(
     // 这里只暴露候选回复事实面：是否回复、回复文本、知识引用、状态/阶段、tool-loop
     // 协议字段；其余字段（含 reasoning）不进 reviewer 上下文。
     let decision_view_text = build_reviewer_decision_view(decision);
+    // H15（3A-1c-2）：reviewer formulaBreakdown 示例由 active profile 的经营公式渲染
+    // （单一真相源），替代写死的三行。DEFAULT_PROFILE seed 四公式 → 渲染出四行，与原
+    // 写死三行内容同源（原示例漏列 nextBestActionScore，本渲染补全；公式内容等价）。
+    let formula_breakdown_lines =
+        crate::agent::domain_profile::render_business_formulas_json_example(
+            &active_profile.business_formulas,
+        );
     let user = format!(
         r#"请评审候选回复。
 Review 模式: {}
@@ -242,9 +256,7 @@ Review 模式: {}
     "factRisk": 1
   }},
   "formulaBreakdown": {{
-    "trust": "Credibility + Reliability + Intimacy - SelfOrientation",
-    "conversionReadiness": "Motivation × ProductFit × Timing × Trust ÷ Friction",
-    "emotionalValue": "Empathy + Validation + Specificity + AutonomySupport - Pressure"
+{}
   }},
   "claimAnalysis": {{
     "hasProductClaim": false,
@@ -307,6 +319,7 @@ Review 模式: {}
 知识路由:
 {}"#,
         review_mode,
+        formula_breakdown_lines,
         crate::agent::prompt_isolation::isolate_untrusted(&inbound.content),
         decision.reply_text,
         decision_view_text,
@@ -317,7 +330,7 @@ Review 模式: {}
             .map(format_operation_domain_config_for_prompt)
             .unwrap_or_default(),
         runtime_text,
-        format_operation_knowledge_for_prompt(knowledge_chunks),
+        format_operation_knowledge_for_prompt_with_roles(knowledge_chunks, &active_profile.chunk_roles),
         knowledge_route_text
     );
     // S2 (Phase 0)：reviewer 双模真并行——主 reviewer 走 generate_agent_json

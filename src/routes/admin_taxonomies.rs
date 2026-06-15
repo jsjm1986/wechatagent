@@ -148,6 +148,8 @@ pub(super) async fn create_taxonomy(
                 .filter(|alias| !alias.is_empty())
                 .collect(),
             status: "active".to_string(),
+            priority_weight: None,
+            is_terminal: false,
         },
         updated_at: now,
         version: 1,
@@ -319,6 +321,8 @@ mod tests {
                 description: "刚加上微信、还没业务对话".to_string(),
                 aliases: vec!["new_lead".to_string()],
                 status: "active".to_string(),
+                priority_weight: None,
+                is_terminal: false,
             },
             updated_at: DateTime::now(),
             version: 1,
