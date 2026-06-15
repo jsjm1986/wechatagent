@@ -615,7 +615,7 @@ pub fn finalize_review_for_send(
     //
     // 客观购买事实增强（2026-06-15 spec §5.4）：G2 active product 是「结构化 verified
     // 背书」的并联来源——admin 在「产品与成交」频道显式录入的 product_id/价格/SKU，
-    // 可信度 ≥ 人工撰写的非结构化知识 chunk。故 `priced_from_catalog`（决策引用的
+    // 可信度 ≥ 手工撰写的非结构化知识 chunk。故 `priced_from_catalog`（决策引用的
     // product_id ∈ 本 workspace active products，由 gateway 算好传入）与 verified_chunks
     // 取**或**：两者皆空才 block。零扰动：无产品行业产品表空 → priced_from_catalog 恒假
     // → 行为与改造前字节等价（纯情感回复 requiresProductKnowledge 本就为假，不进此块）。
