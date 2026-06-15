@@ -85,7 +85,8 @@ pub(crate) fn should_run_review(
             || decision.risk_level == "high"
             || planner.risk_level == "high"
             || planner.knowledge_required
-            || confidence < runtime.operation_state_confidence_full_review_below)
+            || confidence < runtime.operation_state_confidence_full_review_below
+            || runtime.distrust_self_reported_low_risk)
 }
 
 /// agent-autonomy-loop W2 / Task 3.1：`local_decision_review` 二态语义。
@@ -112,7 +113,22 @@ pub(crate) fn should_run_review(
 pub fn local_decision_review(
     decision: &AgentDecision,
     budget: &RunBudget,
+    runtime: &UserRuntimeParameters,
 ) -> DecisionReviewResult {
+    // reviewer 优化：本域声明「不信任自报低风险」时，本地兜底无法独立评估压迫感，
+    // 把 pressure_risk 从乐观 0 改为保守 `pressure_risk_block_at`（达关注线）。这是
+    // 「无法评估时从乐观转保守」的通用安全化，对任何高敏域一视同仁，不针对单一特征。
+    // DEFAULT（distrust=false）→ 0，与改造前逐字等价。
+    let fallback_pressure_risk = if runtime.distrust_self_reported_low_risk {
+        runtime.pressure_risk_block_at
+    } else {
+        0
+    };
+    let fallback_summary_suffix = if runtime.distrust_self_reported_low_risk {
+        "（本域高敏：本地兜底保守置 pressure_risk，未走 LLM）"
+    } else {
+        ""
+    };
     if budget.is_exceeded() {
         if decision.needs_review {
             // R3.7：高风险路径 — 不放行，由 finalize 阶段补 autonomy_mode=blocked。
@@ -137,6 +153,7 @@ pub fn local_decision_review(
             scores: ReviewScores {
                 human_like: 8,
                 emotional_value: 7,
+                pressure_risk: fallback_pressure_risk,
                 hallucination_score: 0,
                 knowledge_grounding_score: if decision.knowledge_need == "required" {
                     7
@@ -146,7 +163,9 @@ pub fn local_decision_review(
                 ..Default::default()
             },
             risks: vec!["local_review_low_risk_only".to_string()],
-            review_summary: "预算超额但 needs_review=false：本地低风险快速通道放行".to_string(),
+            review_summary: format!(
+                "预算超额但 needs_review=false：本地低风险快速通道放行{fallback_summary_suffix}"
+            ),
             ..Default::default()
         };
     }
@@ -157,6 +176,7 @@ pub fn local_decision_review(
         scores: ReviewScores {
             human_like: 8,
             emotional_value: 7,
+            pressure_risk: fallback_pressure_risk,
             hallucination_score: 0,
             knowledge_grounding_score: if decision.knowledge_need == "required" {
                 7
@@ -165,7 +185,7 @@ pub fn local_decision_review(
             },
             ..Default::default()
         },
-        review_summary: "低风险 fast_chat 本地轻量审核通过".to_string(),
+        review_summary: format!("低风险 fast_chat 本地轻量审核通过{fallback_summary_suffix}"),
         ..Default::default()
     }
 }
@@ -405,4 +425,72 @@ Review 模式: {}
     route_dual_gate(&mut review, runtime, &decision.reply_text);
 
     Ok(review)
+}
+
+#[cfg(test)]
+mod distrust_low_risk_tests {
+    use super::*;
+    use crate::agent::budget::RunBudget;
+
+    /// 自报低风险的回复：DEFAULT runtime（distrust=false）下 should_run_review 不触发，
+    /// 高敏 runtime（distrust=true）下强制走 LLM review。
+    fn low_risk_decision() -> AgentDecision {
+        let mut d = AgentDecision::default();
+        d.should_reply = true;
+        d.needs_review = false;
+        d.risk_level = "low".to_string();
+        d.operation_state_confidence = Some(10);
+        d
+    }
+
+    #[test]
+    fn should_run_review_forces_full_when_distrust_set() {
+        let decision = low_risk_decision();
+        let planner = RunPlannerResult::default();
+        let mut runtime = UserRuntimeParameters::default();
+        runtime.distrust_self_reported_low_risk = true;
+        assert!(
+            should_run_review(&decision, &planner, &runtime),
+            "高敏域应强制走 LLM review，即使 Reply Agent 自报低风险"
+        );
+    }
+
+    #[test]
+    fn should_run_review_unchanged_when_distrust_false() {
+        // 零扰动：DEFAULT 销售域自报低风险回复仍跳过 LLM review（与改造前一致）。
+        let decision = low_risk_decision();
+        let planner = RunPlannerResult::default();
+        let runtime = UserRuntimeParameters::default();
+        assert!(!runtime.distrust_self_reported_low_risk);
+        assert!(
+            !should_run_review(&decision, &planner, &runtime),
+            "DEFAULT 域自报低风险回复应沿用既有判定（跳过 LLM review）"
+        );
+    }
+
+    #[test]
+    fn local_decision_review_distrust_emits_nonzero_pressure() {
+        let decision = low_risk_decision();
+        let budget = RunBudget::new("run_distrust_test", i64::MAX, i32::MAX, i32::MAX);
+        assert!(!budget.is_exceeded(), "未注入用量时不应超额");
+
+        // 高敏域兜底：pressure_risk 从乐观 0 抬到保守 block_at。
+        let mut high_sensitivity = UserRuntimeParameters::default();
+        high_sensitivity.distrust_self_reported_low_risk = true;
+        let result = local_decision_review(&decision, &budget, &high_sensitivity);
+        assert_eq!(
+            result.scores.pressure_risk, high_sensitivity.pressure_risk_block_at,
+            "高敏域本地兜底应保守置 pressure_risk = block_at，而非乐观 0"
+        );
+        assert_ne!(result.scores.pressure_risk, 0);
+
+        // 零扰动：DEFAULT 域兜底仍是 pressure_risk=0 + fast_chat summary。
+        let default_runtime = UserRuntimeParameters::default();
+        let baseline = local_decision_review(&decision, &budget, &default_runtime);
+        assert_eq!(baseline.scores.pressure_risk, 0);
+        assert!(
+            baseline.review_summary.contains("低风险 fast_chat"),
+            "DEFAULT 域兜底 summary 应逐字保留 fast_chat 文案"
+        );
+    }
 }

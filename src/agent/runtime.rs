@@ -94,6 +94,14 @@ pub struct UserRuntimeParameters {
     /// `blocked_unverified_product_claim`（R5.4 verified 强约束 + 漏判探针）任何
     /// 取值下都不变。
     pub grounding_gate_bypass_without_claim: bool,
+    /// reviewer 优化第一步：本域是否「不信任被审查者自报的低风险」。`false`
+    /// （DEFAULT/`from_config`/`Default`）= 沿用 `should_run_review` 既有判定（销售域
+    /// 字节等价）；`true` = 高敏域，should_reply 的回复一律强制走独立 LLM review，
+    /// 不再因 Reply Agent 自报 `needs_review=false` 走本地轻量兜底。由 active
+    /// DomainProfile.distrust_self_reported_low_risk 派生，gateway 加载 profile 后覆盖。
+    /// 配套：预算超额仍只能本地兜底时，`local_decision_review` 在本标志为真时把
+    /// pressure_risk 从乐观 0 改为保守 `pressure_risk_block_at`（安全化，非点对点修补）。
+    pub distrust_self_reported_low_risk: bool,
 }
 
 /// H9：内置默认 conversationMode 四模式（逐字复刻 `types::CONVERSATION_MODE_VALUES`）。
@@ -168,6 +176,9 @@ impl UserRuntimeParameters {
             // H14：from_config 不接 DomainProfile，默认 false=无条件 grounding 硬闸
             // （销售域字节等价）；gateway 加载 active profile 后覆盖。
             grounding_gate_bypass_without_claim: false,
+            // reviewer 优化：from_config 不接 DomainProfile，默认 false=沿用既有
+            // should_run_review 判定（销售域字节等价）；gateway 加载 active profile 后覆盖。
+            distrust_self_reported_low_risk: false,
         }
     }
 
@@ -202,7 +213,8 @@ impl UserRuntimeParameters {
             "quietHoursStart": self.quiet_hours_start as i32,
             "quietHoursEnd": self.quiet_hours_end as i32,
             "quietHoursTzOffsetHours": self.quiet_hours_tz_offset_hours,
-            "groundingGateBypassWithoutClaim": self.grounding_gate_bypass_without_claim
+            "groundingGateBypassWithoutClaim": self.grounding_gate_bypass_without_claim,
+            "distrustSelfReportedLowRisk": self.distrust_self_reported_low_risk
         }
     }
 
@@ -297,6 +309,9 @@ impl Default for UserRuntimeParameters {
             allowed_conversation_modes: default_conversation_modes(),
             // H14：PBT / 无 profile 入口默认 false=无条件 grounding 硬闸（销售域等价）。
             grounding_gate_bypass_without_claim: false,
+            // reviewer 优化：PBT / 无 profile 入口默认 false=沿用既有 should_run_review
+            // 判定（销售域等价）。
+            distrust_self_reported_low_risk: false,
         }
     }
 }
@@ -543,6 +558,7 @@ mod tests {
             human_like_rewrite_below: 6,
             emotional_value_rewrite_below: 6,
             product_accuracy_block_below: 7,
+            distrust_self_reported_low_risk: false,
             operation_state_confidence_full_review_below: 4,
             run_token_budget: 30000,
             run_max_llm_calls: 6,

@@ -121,6 +121,9 @@ pub async fn seed_emotional_companion_profile_in_workspace(
             ];
             // H14：纯情感回复不应因无产品知识被 grounding 软分硬闸误拦。
             p.grounding_gate_bypass_without_claim = true;
+            // reviewer 优化：情感陪伴高敏域不信任自报低风险，强制走 LLM review
+            // （否则情感追问回复被 should_run_review 判低风险走本地兜底、写死 pressure=0）。
+            p.distrust_self_reported_low_risk = true;
             // H8：关闭漏斗推进（陪伴不催进成交）。
             p.operation_mode.funnel.enabled = false;
             // H3：行业业务上下文。
