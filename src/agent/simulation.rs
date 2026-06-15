@@ -181,7 +181,7 @@ async fn simulate_user_dialogue_inner(
         decision.used_knowledge_ids = route_used_knowledge_ids(&knowledge_route);
         let review = if budget.is_exceeded() {
             budget.mark_degraded("simulation_review_skipped_budget_exceeded");
-            local_decision_review(&decision, &budget)
+            local_decision_review(&decision, &budget, &runtime)
         } else {
             review_decision(
                 state,

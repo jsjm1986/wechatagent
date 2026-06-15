@@ -372,6 +372,9 @@ pub fn default_domain_profile(workspace_id: &str) -> DomainProfile {
         operation_mode: crate::models::OperationMode::default(),
         // H14：DEFAULT 销售域 = false → grounding 软分数硬闸无条件生效（字节等价）。
         grounding_gate_bypass_without_claim: false,
+        // reviewer 优化：DEFAULT 销售域 = false → 沿用既有 should_run_review 判定
+        // （字节等价）；高敏域（情感陪伴）seed 时显式置 true 强制走 LLM review。
+        distrust_self_reported_low_risk: false,
         // H16：DEFAULT 销售域 = 逐字复刻 knowledge_router 写死的四态角色（字节等价）。
         chunk_roles: default_chunk_roles(),
         // H11：DEFAULT 销售极性 = 显式填回回路① fallback 常量（正极 buying_signal +
@@ -726,6 +729,9 @@ mod tests {
         // 换行业 = 情感/关系 profile 置 true 旁路。
         let p = default_domain_profile("ws-1");
         assert!(!p.grounding_gate_bypass_without_claim);
+        // reviewer 优化逐字等价护栏：DEFAULT_PROFILE = false → 沿用既有
+        // should_run_review 判定（销售域字节等价）；高敏域 seed 时才置 true。
+        assert!(!p.distrust_self_reported_low_risk);
     }
 
     #[test]

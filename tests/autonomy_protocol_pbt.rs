@@ -219,7 +219,9 @@ proptest! {
 
         let mut decision = AgentDecision::default();
         decision.needs_review = needs_review;
-        let result = local_decision_review(&decision, &budget);
+        // distrust=false 的 DEFAULT runtime：保持 PBT 三态语义字节等价。
+        let runtime = UserRuntimeParameters::default();
+        let result = local_decision_review(&decision, &budget, &runtime);
 
         if force_exceeded && needs_review {
             // R3.7：高风险路径，必须拒绝放行且唯一 risk 是 budget_exceeded_no_review。

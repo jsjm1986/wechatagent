@@ -116,7 +116,11 @@ pub(super) async fn post_management_message(
         .db
         .management_sessions()
         .find_one(
-            doc! { "_id": session_id, "account_id": &payload.account_id },
+            doc! {
+                "_id": session_id,
+                "workspace_id": &admin.current_workspace,
+                "account_id": &payload.account_id,
+            },
             None,
         )
         .await?

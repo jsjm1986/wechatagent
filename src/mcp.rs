@@ -21,7 +21,13 @@ impl McpClient {
         Ok(Self {
             base_url: base_url.trim_end_matches('/').to_string(),
             api_key,
-            client: reqwest::Client::builder().build()?,
+            // 客户端级硬超时，防非 dispatcher 路径（推 principal 卡 / relay 转述等
+            // 直接 logged_call_for_account 的调用）在 MCP 挂起时无限阻塞。
+            // 取 60s（> dispatcher 自身的 30s tokio::time::timeout，两者不冲突，
+            // 本超时仅作那些无外层 timeout 路径的兜底上限）。
+            client: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(60))
+                .build()?,
         })
     }
 

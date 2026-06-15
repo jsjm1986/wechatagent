@@ -1368,6 +1368,15 @@ pub struct DomainProfile {
     /// 任何取值下都不变。运行时经 `UserRuntimeParameters` 同名字段消费。
     #[serde(default)]
     pub grounding_gate_bypass_without_claim: bool,
+    /// reviewer 优化第一步：本域是否「不信任被审查者自报的低风险」。`false`
+    /// （DEFAULT/老库 serde 默认）= 沿用 `should_run_review` 既有判定（销售域字节
+    /// 等价），Reply Agent 自报 `needs_review=false` 且 confidence 高的回复走本地
+    /// 轻量兜底；`true` = 纯关系/情感等高敏域，should_reply 的回复一律强制走独立
+    /// LLM review（`review_decision`），不再因自报低风险被本地兜底无脑放行。
+    /// 依据：情感追问回复被自我豁免门挡在 reviewer 之外、本地兜底写死 pressure_risk=0
+    /// 的盲区。运行时经 `UserRuntimeParameters` 同名字段消费。
+    #[serde(default)]
+    pub distrust_self_reported_low_risk: bool,
     /// universal-domain-adaptation H16：本行业知识切片的「用途角色」表（替代
     /// `knowledge_router.rs` 写死的销售四态分桶 + header）。空 Vec 时
     /// `format_operation_knowledge_for_prompt` 回落内置销售四态（DEFAULT_PROFILE 即

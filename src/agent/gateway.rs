@@ -679,6 +679,10 @@ async fn run_user_operation_gateway_inner(
     // DEFAULT profile = false → 与改造前逐字等价（无条件硬闸）。
     runtime.grounding_gate_bypass_without_claim =
         active_profile.grounding_gate_bypass_without_claim;
+    // reviewer 优化：用 active profile 的 distrust_self_reported_low_risk 派生。
+    // DEFAULT profile = false → should_run_review 判定逐字等价；高敏域 = true →
+    // should_reply 的回复强制走独立 LLM review。
+    runtime.distrust_self_reported_low_risk = active_profile.distrust_self_reported_low_risk;
     // M2：用 active profile 的 threshold_overrides 覆盖五闸阈值。DEFAULT profile
     // threshold_overrides=None → 不改任何阈值、沿用 from_config 的 domain_config 值
     // （销售域字节等价）；情感陪伴等域可声明放宽 pressure_risk / 提高 emotional_value
@@ -807,7 +811,7 @@ async fn run_user_operation_gateway_inner(
             Some(doc! { "stage": "review", "run_id": &run_id }),
         )
         .await?;
-        local_decision_review(&decision, local_budget_ref)
+        local_decision_review(&decision, local_budget_ref, &runtime)
     } else if should_run_review(&decision, &planner, &runtime) {
         review_decision(
             state,
@@ -826,7 +830,7 @@ async fn run_user_operation_gateway_inner(
         )
         .await?
     } else {
-        local_decision_review(&decision, local_budget_ref)
+        local_decision_review(&decision, local_budget_ref, &runtime)
     };
     let mut final_decision = decision;
 
@@ -1749,6 +1753,11 @@ async fn run_user_operation_gateway_inner(
             state.config.agent_reply_max_segments,
         );
         let total = segments.len();
+        // 多段消息：单段 enqueue 失败时**不立即中断**——否则前面已入队的段会发出、
+        // 后续段永远不发，客户收到半截回复（webhook 路径无重算补发）。每段幂等 key
+        // 独立（`#seg{idx}`），故继续尝试剩余段、最大化发完能发的；循环后若有任何段
+        // 失败再整体返 Err 让上层可观测。
+        let mut enqueue_errors: Vec<(usize, AppError)> = Vec::new();
         for (idx, segment) in segments.into_iter().enumerate() {
             let seg_source_event_id = if total > 1 {
                 format!("{source_event_id}#seg{idx}")
@@ -1797,9 +1806,30 @@ async fn run_user_operation_gateway_inner(
                 }
                 Err(err) => {
                     tracing::error!(?err, %run_id, segment_index = idx, "outbox enqueue failed");
-                    return Err(err.into());
+                    enqueue_errors.push((idx, err.into()));
                 }
             }
+        }
+        if !enqueue_errors.is_empty() {
+            let failed_indices: Vec<i64> =
+                enqueue_errors.iter().map(|(idx, _)| *idx as i64).collect();
+            write_event_for_account(
+                state,
+                &contact.account_id,
+                Some(&contact.wxid),
+                "outbox_enqueue_partial_failure",
+                "error",
+                "多段回复部分段入队失败——已入队段照常发出，失败段缺失，需人工核对",
+                Some(doc! {
+                    "run_id": &run_id,
+                    "segment_total": total as i64,
+                    "failed_segment_indices": failed_indices,
+                }),
+            )
+            .await
+            .ok();
+            // 返回首个失败错误供上层观测（已入队段不回滚，照常发出）。
+            return Err(enqueue_errors.into_iter().next().map(|(_, e)| e).unwrap());
         }
     }
     // 决策请示触发（统一占位模型）：占位 reply 已入 outbox 正常发给客户，
@@ -1849,7 +1879,11 @@ pub(crate) async fn send_outbound_message(
         raw.insert("wechatagent", Bson::Document(extra_raw));
     }
     let now = DateTime::now();
-    state
+    // MCP 已成功 = 消息已送达客户，这是既成事实。此后任何 DB 写失败都**不得**
+    // 让本函数返 Err——否则 dispatcher 会走 retry 在下一轮重新 MCP 发送，给客户
+    // 发重复消息（Ok(Err) 分支不做 post-hoc 核对）。故落库失败降级为审计事件，
+    // 保留"已发"语义；代价是极端 DB 故障下该 outbound 记录缺失（可由审计事件追溯）。
+    if let Err(err) = state
         .db
         .messages()
         .insert_one(
@@ -1867,7 +1901,26 @@ pub(crate) async fn send_outbound_message(
             },
             None,
         )
-        .await?;
+        .await
+    {
+        tracing::error!(
+            account_id = %contact.account_id,
+            contact_wxid = %contact.wxid,
+            error = %err,
+            "MCP send succeeded but persisting outbound conversation_messages failed; message was delivered but record is missing",
+        );
+        write_event_for_account(
+            state,
+            &contact.account_id,
+            Some(&contact.wxid),
+            "outbound_record_persist_failed",
+            "warn",
+            "消息已通过 MCP 发出，但落库 conversation_messages 失败——记录缺失，需人工核对",
+            Some(doc! { "content_len": content.len() as i64 }),
+        )
+        .await
+        .ok();
+    }
     // 用 aggregation pipeline 把 last_outbound_at / last_agent_run_at / updated_at
     // 设为 now，并把 last_message_at 设成 max(last_inbound_at, now)，
     // 不改 last_inbound_at（出站不应推进"用户最后一次说话"的时间）。
@@ -1886,11 +1939,20 @@ pub(crate) async fn send_outbound_message(
             "last_outbound_style": style_fingerprint,
         }
     }];
-    state
+    // 同上：MCP 已发成功后，contact 时间戳更新失败也只记审计、不返 Err。
+    if let Err(err) = state
         .db
         .contacts()
         .update_one(doc! { "_id": contact.id }, pipeline, None)
-        .await?;
+        .await
+    {
+        tracing::error!(
+            account_id = %contact.account_id,
+            contact_wxid = %contact.wxid,
+            error = %err,
+            "MCP send succeeded but updating contact timestamps failed",
+        );
+    }
     Ok(response)
 }
 
