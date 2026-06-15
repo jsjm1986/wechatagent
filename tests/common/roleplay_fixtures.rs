@@ -92,9 +92,22 @@ where
 /// 情感陪伴最小 fixture：在 [`EMOTIONAL_COMPANION_WORKSPACE`] seed 一条 active
 /// DomainProfile，覆盖设计 §5.2 要求的关键字段。
 pub async fn seed_emotional_companion_profile(app: &TestApp) -> ObjectId {
+    seed_emotional_companion_profile_in_workspace(app, EMOTIONAL_COMPANION_WORKSPACE).await
+}
+
+/// 同 [`seed_emotional_companion_profile`]，但可指定 workspace。
+///
+/// P2 全链 E2E 需把情感陪伴 profile seed 到 **"default"** workspace——Reply Agent /
+/// Reviewer 加载 prompt 固定走 `default_workspace_id`，而 profile 按 `contact.workspace_id`
+/// 加载；只有 contact（默认 "default" ws）与 profile 同在 "default" ws，prompt 与 profile
+/// 才同源，否则 profile 静默回落 DEFAULT 销售域（设计 §5.2 / roleplay-fuzz P2 接线坑）。
+pub async fn seed_emotional_companion_profile_in_workspace(
+    app: &TestApp,
+    workspace_id: &str,
+) -> ObjectId {
     seed_active_domain_profile(
         app,
-        EMOTIONAL_COMPANION_WORKSPACE,
+        workspace_id,
         "emotional_companion_minimal",
         |p| {
             p.display_name = "情感陪伴".to_string();
