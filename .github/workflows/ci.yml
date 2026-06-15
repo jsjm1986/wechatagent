@@ -32,13 +32,14 @@ on:
   workflow_dispatch:
     inputs:
       dispatch_target:
-        description: '手动单跑目标（ops=单个 real_llm_ops_smoke / roleplay_docker=roleplay P0 Docker 夹具）'
+        description: '手动单跑目标（ops=单个 real_llm_ops_smoke / roleplay_docker=roleplay P0 Docker 夹具 / roleplay_p2=情感陪伴全链 E2E 真模型）'
         required: true
         default: 'ops'
         type: choice
         options:
           - ops
           - roleplay_docker
+          - roleplay_p2
       ops_test:
         description: '当 target=ops 时单独跑的 real_llm_ops_smoke 测试名（如 t15_real_multiturn_deal_arc）'
         required: false
@@ -779,3 +780,64 @@ jobs:
         env:
           RUSTFLAGS: ""
         run: cargo test --no-fail-fast --test roleplay_fixtures_smoke -- --include-ignored --nocapture
+
+  # 手动单跑：roleplay-fuzz P2 情感陪伴固定场景全链 E2E（真模型 + testcontainers MongoDB）。
+  # 在「default」ws seed 一个情感陪伴 active DomainProfile（非销售域），跑设计 §6.2 的夜间
+  # 情绪低落 4 轮固定台词，走真实 handle_managed_message 全链（Reply Agent→Reviewer→gateway），
+  # 硬断言确定性契约（status 闭集 / 不复读 / 无第三方承接），情感陪伴中性 judge 只观测不拦。
+  # **无 needs 前置链**——立即起跑，不必等 real-llm 串行链。env 与 real-llm-ops-single 同口径
+  # （主模型 kimi / 异族裁判 llama-3.3-70b / NVIDIA failover 链 + REAL_LLM_JUDGE=1）。
+  # 仅 workflow_dispatch + dispatch_target=roleplay_p2 触发；正常 PR/push 不受影响（P2 测试
+  # #[ignore]，在 integration job 全量 --ignored 里本就会被跑到，本 job 只给即时单独入口）。
+  roleplay-p2:
+    name: Roleplay P2 情感陪伴全链 E2E (手动单跑 / 真模型)
+    runs-on: ubuntu-latest
+    if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.dispatch_target == 'roleplay_p2' }}
+    timeout-minutes: 90
+    env:
+      REAL_LLM_API_KEY: ${{ secrets.REAL_LLM_CODERELAY_API_KEY || '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' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # 同 integration job：清预装 SDK 腾 ~30GB，否则 target + mongo 镜像撑爆磁盘。
+      - name: Free disk space
+        if: ${{ env.REAL_LLM_API_KEY != '' }}
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android \
+            /usr/local/share/boost /usr/local/share/powershell \
+            /usr/lib/jvm "$AGENT_TOOLSDIRECTORY" || true
+          sudo docker image prune --all --force || true
+          df -h
+
+      - name: Install Rust toolchain
+        if: ${{ env.REAL_LLM_API_KEY != '' }}
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry / target
+        if: ${{ env.REAL_LLM_API_KEY != '' }}
+        uses: Swatinem/rust-cache@v2
+
+      - name: cargo test --test roleplay_emotional_companion_e2e (real LLM + testcontainers)
+        if: ${{ env.REAL_LLM_API_KEY != '' }}
+        env:
+          RUSTFLAGS: ""
+          REAL_LLM_BASE_URL: https://integrate.api.nvidia.com/v1
+          REAL_LLM_MODEL: moonshotai/kimi-k2.6
+          REAL_LLM_JUDGE: "1"
+          REAL_LLM_JUDGE_API_KEY: ${{ secrets.REAL_LLM_GPT55_API_KEY || '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' }}
+          REAL_LLM_JUDGE_BASE_URL: https://integrate.api.nvidia.com/v1
+          REAL_LLM_JUDGE_MODEL: meta/llama-3.3-70b-instruct
+          REAL_LLM_FAILOVER_API_KEY: ${{ secrets.REAL_LLM_VISION_BACKUP_API_KEY || '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' }}
+          REAL_LLM_FAILOVER_BASE_URL: https://integrate.api.nvidia.com/v1
+          REAL_LLM_FAILOVER_MODELS: z-ai/glm-5.1,stepfun-ai/step-3.7-flash,qwen/qwen3-next-80b-a3b-instruct
+        run: cargo test --no-fail-fast --test roleplay_emotional_companion_e2e -- --ignored --nocapture
+
+      - name: Upload roleplay ledger
+        if: ${{ always() && env.REAL_LLM_API_KEY != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: roleplay-p2-ledger
+          path: target/real_llm_ledger/
+          if-no-files-found: ignore
+          retention-days: 30
