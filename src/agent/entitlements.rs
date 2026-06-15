@@ -294,6 +294,67 @@ pub(crate) fn priced_from_active_catalog(
     })
 }
 
+/// 客观购买事实增强 spec §6（G4 当 G1 的客观锚）：G1「购买生命周期」维度的
+/// **canonical 取值集合**。与 m020 seed 进 `system_taxonomies`（kind=`purchase_lifecycle`）
+/// 的 value.id 逐字一致——纠偏逻辑产出的覆盖值必须落在该集合内，否则下游 taxonomy
+/// 校验会把它当 CandidateNew。
+pub(crate) const G1_DIMENSION_KIND: &str = "purchase_lifecycle";
+pub(crate) const G1_NOT_PURCHASED: &str = "not_purchased";
+pub(crate) const G1_PURCHASED: &str = "purchased";
+pub(crate) const G1_AFTERCARE: &str = "aftercare";
+pub(crate) const G1_REPURCHASE: &str = "repurchase";
+
+/// spec §6：复用 C2「客观事实约束主观标签」模式，把 G4 持有投影当 G1 的客观锚。
+///
+/// G1 是 LLM 从聊天推断的「购买生命周期」维度（profile dimension）；G4 是从已核实
+/// `outcome_events` 派生的**客观硬事实**。两者是同一件事的主客观两面。本纯函数判定
+/// LLM 推断的 G1 标签是否与 G4 客观态冲突，冲突时**以 G4 为准**（客观锚优先）：
+///
+/// - G4 投影非空（有 staff_confirmed/payment_verified 持有）但 LLM 把 G1 推断成
+///   `not_purchased`（未购买）→ 冲突 → 纠偏：
+///     - 任一持有 `in_aftercare == Some(true)` → 覆盖为 `aftercare`（售后期内）；
+///     - 否则 → 覆盖为 `purchased`（已购买）。
+/// - G4 投影为空（无任何已核实持有）→ **不**纠偏：返回 `None`。spec §2.1 红线——
+///   `conversation_inferred` 疑似线索绝不进 G4 投影，故"投影空"不代表"一定没买"，
+///   只代表"无客观证据"，此时尊重 LLM 推断（可能是 not_purchased，也可能 repurchase
+///   等纯对话信号），不臆测覆盖。
+/// - `repurchase`（复购期）是含购买语义的标签，与"已购买"客观态不冲突 → 不纠偏。
+/// - LLM 未给 G1（`llm_g1` 为空）但 G4 有持有 → 补一个客观锚值（同上 aftercare/purchased
+///   二选一），让维度不因 LLM 漏报而空缺。
+///
+/// 返回 `Some((corrected_value, llm_original))`：需要覆盖时给出 canonical 纠偏值与
+/// LLM 原值（供 gateway emit fail-soft 审计事件，类比 operation_state_transition_rejected）；
+/// 无需纠偏时 `None`。
+///
+/// **零扰动**：销售域 DEFAULT profile 不含 purchase_lifecycle 维度 → 调用方不会对其
+/// 调用本函数（仅当 profile 声明了 G1 维度且 G4 有持有时才进），情感域产品表空 →
+/// 投影恒空 → 恒返回 `None`。
+pub(crate) fn reconcile_g1_with_entitlements(
+    llm_g1: Option<&str>,
+    entitlements: &[Entitlement],
+) -> Option<(String, String)> {
+    // G4 投影空 → 无客观证据 → 尊重 LLM 推断，不纠偏。
+    if entitlements.is_empty() {
+        return None;
+    }
+    let objective = if entitlements.iter().any(|e| e.in_aftercare == Some(true)) {
+        G1_AFTERCARE
+    } else {
+        G1_PURCHASED
+    };
+    let llm = llm_g1.map(str::trim).filter(|s| !s.is_empty());
+    match llm {
+        // LLM 漏报 → 补客观锚。
+        None => Some((objective.to_string(), String::new())),
+        // 含购买语义的标签（purchased/aftercare/repurchase）与"已购买"客观态不冲突。
+        Some(G1_PURCHASED) | Some(G1_AFTERCARE) | Some(G1_REPURCHASE) => None,
+        // 明确冲突：LLM 说未购买，但客观有已核实持有 → 以 G4 为准。
+        Some(G1_NOT_PURCHASED) => Some((objective.to_string(), G1_NOT_PURCHASED.to_string())),
+        // 其它未知 G1 取值：尊重 LLM（交给 taxonomy 候选通道），不强行覆盖。
+        Some(_) => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -560,4 +621,90 @@ mod tests {
             project_entitlements(&[ev], &[], DateTime::from_millis(1_000_000), 10);
         assert_eq!(ents.len(), 1, "旧正向成交照常进投影");
     }
+
+    // ── spec §6：G4→G1 客观锚纠偏 ──
+
+    fn entitlement(in_aftercare: Option<bool>) -> Entitlement {
+        Entitlement {
+            product_id: "p1".to_string(),
+            name: "课程".to_string(),
+            owned_since: DateTime::from_millis(100),
+            quantity: 1,
+            in_aftercare,
+            expires_at: None,
+        }
+    }
+
+    #[test]
+    fn reconcile_empty_projection_never_corrects() {
+        // G4 投影空 → 无客观证据 → 尊重 LLM 推断（含 not_purchased），不纠偏。
+        assert_eq!(reconcile_g1_with_entitlements(Some(G1_NOT_PURCHASED), &[]), None);
+        assert_eq!(reconcile_g1_with_entitlements(None, &[]), None);
+        assert_eq!(reconcile_g1_with_entitlements(Some(G1_REPURCHASE), &[]), None);
+    }
+
+    #[test]
+    fn reconcile_conflict_not_purchased_overridden_by_objective() {
+        // LLM 说未购买，但客观有已核实持有（无售后时效）→ 覆盖为 purchased。
+        let ents = vec![entitlement(None)];
+        assert_eq!(
+            reconcile_g1_with_entitlements(Some(G1_NOT_PURCHASED), &ents),
+            Some((G1_PURCHASED.to_string(), G1_NOT_PURCHASED.to_string()))
+        );
+    }
+
+    #[test]
+    fn reconcile_conflict_prefers_aftercare_when_in_window() {
+        // 任一持有在售后期内 → 覆盖为 aftercare（更具体的客观态优先于 purchased）。
+        let ents = vec![entitlement(Some(true))];
+        assert_eq!(
+            reconcile_g1_with_entitlements(Some(G1_NOT_PURCHASED), &ents),
+            Some((G1_AFTERCARE.to_string(), G1_NOT_PURCHASED.to_string()))
+        );
+    }
+
+    #[test]
+    fn reconcile_expired_aftercare_falls_back_to_purchased() {
+        // 持有但售后期已过（in_aftercare=Some(false)）→ 仍是"已购买"，不是 aftercare。
+        let ents = vec![entitlement(Some(false))];
+        assert_eq!(
+            reconcile_g1_with_entitlements(Some(G1_NOT_PURCHASED), &ents),
+            Some((G1_PURCHASED.to_string(), G1_NOT_PURCHASED.to_string()))
+        );
+    }
+
+    #[test]
+    fn reconcile_purchase_semantic_labels_not_corrected() {
+        // 含购买语义的标签与"已购买"客观态不冲突 → 不纠偏。
+        let ents = vec![entitlement(Some(true))];
+        assert_eq!(reconcile_g1_with_entitlements(Some(G1_PURCHASED), &ents), None);
+        assert_eq!(reconcile_g1_with_entitlements(Some(G1_AFTERCARE), &ents), None);
+        assert_eq!(reconcile_g1_with_entitlements(Some(G1_REPURCHASE), &ents), None);
+    }
+
+    #[test]
+    fn reconcile_missing_g1_backfills_objective_anchor() {
+        // LLM 漏报 G1 但客观有持有 → 补客观锚，让维度不空缺。llm_original 为空串。
+        let ents = vec![entitlement(Some(true))];
+        assert_eq!(
+            reconcile_g1_with_entitlements(None, &ents),
+            Some((G1_AFTERCARE.to_string(), String::new()))
+        );
+        assert_eq!(
+            reconcile_g1_with_entitlements(Some("  "), &ents),
+            Some((G1_AFTERCARE.to_string(), String::new())),
+            "空白 G1 视同漏报"
+        );
+    }
+
+    #[test]
+    fn reconcile_unknown_g1_value_respected() {
+        // 未知 G1 取值（非 canonical 集合）→ 尊重 LLM，交 taxonomy 候选通道，不覆盖。
+        let ents = vec![entitlement(Some(true))];
+        assert_eq!(
+            reconcile_g1_with_entitlements(Some("某种自造阶段"), &ents),
+            None
+        );
+    }
 }
+

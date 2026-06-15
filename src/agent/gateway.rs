@@ -2516,6 +2516,50 @@ async fn apply_agent_updates(
     // planner stagnation 计时器。decision 是 &，本地 clone 一份做 normalize。
     let mut signals_decision = decision.clone();
     crate::agent::domain_signals::normalize_domain_signals(&mut signals_decision);
+    // 客观购买事实 spec §6（G4 当 G1 的客观锚）：仅当 active profile 声明了
+    // purchase_lifecycle「参与决策」维度时，用 G4 持有投影纠偏 LLM 推断的 G1 标签
+    // （客观锚优先，类比 C2 operation_state 的 fail-soft）。销售域 DEFAULT profile
+    // 不含该维度 → 整段跳过、零扰动；情感域产品表空 → 投影空 → reconcile 恒返回
+    // None。冲突纠偏时覆盖 domain_signals 容器值 + 记一条审计事件（reply 已照常下发，
+    // 这里只改画像写入，不阻塞、不回滚）。
+    let mut g1_correction: Option<(String, String)> = None;
+    {
+        let active_profile = crate::agent::domain_profile::load_active_domain_profile(
+            &state.db,
+            &contact.workspace_id,
+        )
+        .await;
+        let g1_participates = active_profile.profile_dimensions.iter().any(|d| {
+            d.participates_in_decision
+                && d.kind == crate::agent::entitlements::G1_DIMENSION_KIND
+        });
+        if g1_participates {
+            let active_products = crate::agent::entitlements::load_active_products(
+                &state.db,
+                &contact.workspace_id,
+            )
+            .await;
+            let (entitlements, _total) = crate::agent::entitlements::project_entitlements(
+                &contact.outcome_events,
+                &active_products,
+                DateTime::now(),
+                crate::agent::entitlements::ENTITLEMENTS_PROMPT_CAP,
+            );
+            let llm_g1 = signals_decision
+                .domain_signals
+                .get_str(crate::agent::entitlements::G1_DIMENSION_KIND)
+                .ok();
+            if let Some((corrected, llm_original)) =
+                crate::agent::entitlements::reconcile_g1_with_entitlements(llm_g1, &entitlements)
+            {
+                signals_decision.domain_signals.insert(
+                    crate::agent::entitlements::G1_DIMENSION_KIND,
+                    corrected.clone(),
+                );
+                g1_correction = Some((llm_original, corrected));
+            }
+        }
+    }
     if !signals_decision.domain_signals.is_empty() {
         let prev_stage = contact
             .domain_attributes
@@ -2657,6 +2701,30 @@ async fn apply_agent_updates(
         .contacts()
         .update_one(doc! { "_id": contact.id }, doc! { "$set": set_doc }, None)
         .await?;
+
+    // 客观购买事实 spec §6：G4→G1 纠偏命中时记一条 fail-soft 审计事件（类比
+    // operation_state_transition_rejected）。reply 已照常下发、纠偏值已写入画像，
+    // 这里只留可观测痕迹，不阻塞、不回滚。llm_original 为空表示 LLM 漏报 G1（补客观锚），
+    // 非空表示 LLM 推断与客观态冲突被覆盖。
+    if let Some((llm_original, corrected)) = &g1_correction {
+        write_event_for_account(
+            state,
+            &contact.account_id,
+            Some(&contact.wxid),
+            "agent.purchase_lifecycle_corrected_by_objective",
+            "observed",
+            &format!(
+                "G1 购买生命周期纠偏：LLM[{}] → G4客观[{}]",
+                if llm_original.is_empty() { "缺失" } else { llm_original.as_str() },
+                corrected
+            ),
+            Some(doc! {
+                "llm_inferred": llm_original,
+                "objective_value": corrected,
+            }),
+        )
+        .await?;
+    }
 
     // 画像写侧抖动观测（第一轮：体检量化，不改写库逻辑）。
     // 用 contact 写库前的现状 vs 本轮 decision 计算 churn，仅在 notable（丢标签 /

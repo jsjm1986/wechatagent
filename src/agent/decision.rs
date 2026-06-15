@@ -437,6 +437,17 @@ pub(crate) async fn decide_reply_with_promote(
         "{task_template}{}",
         super::entitlements::render_suspected_deal_guidance(&active_products)
     );
+    // universal-domain-adaptation G1：在 task prompt 末尾追加本行业「参与决策」的
+    // 非销售 typed 维度指引（告知 LLM 走 domainSignals 容器输出）。DEFAULT 销售域
+    // 只有 customer_stage/intent_level 两维（typed）→ 空串、prompt 字节等价；
+    // 换非销售行业（含本专题的 purchase_lifecycle）→ 注入维度语义 + domainSignals
+    // 输出位置，让维度值能真正从 LLM 流到 AgentDecision.domain_signals。
+    let task_template = format!(
+        "{task_template}{}",
+        super::domain_profile::render_decision_dimensions_guidance(
+            &active_profile.profile_dimensions
+        )
+    );
     // R-prompt-v3：Operator Instruction 层（最高优先级）。运营人员可在后台对
     // 单个联系人写一段 ≤ 1000 字的特别指令，覆盖 Soul + Policy 的默认人格判定
     // （如"老客户已签约，不要主动推销"、"这个客户技术背景，可以多用术语"）。
