@@ -205,6 +205,32 @@ impl UserRuntimeParameters {
             "groundingGateBypassWithoutClaim": self.grounding_gate_bypass_without_claim
         }
     }
+
+    /// M2：用 active profile 的 `threshold_overrides` 逐字段覆盖五闸阈值。
+    /// `None`（DEFAULT profile）→ 不改任何字段（销售域字节等价）；`Some` 时字段内
+    /// `Some(n)` 覆盖、`None` 保留 `from_config` 现值（逐字段独立回落）。抽成纯方法
+    /// 便于无 DB 单测覆盖语义。
+    pub(crate) fn apply_profile_threshold_overrides(
+        &mut self,
+        overrides: Option<&crate::models::ProfileThresholds>,
+    ) {
+        let Some(th) = overrides else { return };
+        if let Some(v) = th.fact_risk_block_at {
+            self.fact_risk_block_at = v;
+        }
+        if let Some(v) = th.pressure_risk_block_at {
+            self.pressure_risk_block_at = v;
+        }
+        if let Some(v) = th.human_like_rewrite_below {
+            self.human_like_rewrite_below = v;
+        }
+        if let Some(v) = th.emotional_value_rewrite_below {
+            self.emotional_value_rewrite_below = v;
+        }
+        if let Some(v) = th.product_accuracy_block_below {
+            self.product_accuracy_block_below = v;
+        }
+    }
 }
 
 /// agent-autonomy-loop W0 / Task 1.3：把任意整数 value clamp 到 `[min, max]`，
@@ -685,5 +711,72 @@ mod tests {
         ] {
             assert!(RESOLVED_GATE_KEYS.contains(&k), "missing gate_key: {k}");
         }
+    }
+
+    // ── M2：五闸阈值 profile 覆盖 ──
+
+    #[test]
+    fn threshold_overrides_none_is_byte_equivalent() {
+        // DEFAULT profile threshold_overrides=None → 不改任何阈值（销售域字节等价）。
+        let mut rt = UserRuntimeParameters::default();
+        let before = (
+            rt.fact_risk_block_at,
+            rt.pressure_risk_block_at,
+            rt.human_like_rewrite_below,
+            rt.emotional_value_rewrite_below,
+            rt.product_accuracy_block_below,
+        );
+        rt.apply_profile_threshold_overrides(None);
+        assert_eq!(
+            (
+                rt.fact_risk_block_at,
+                rt.pressure_risk_block_at,
+                rt.human_like_rewrite_below,
+                rt.emotional_value_rewrite_below,
+                rt.product_accuracy_block_below,
+            ),
+            before,
+            "None override 不得改变任何阈值"
+        );
+    }
+
+    #[test]
+    fn threshold_overrides_partial_only_touches_some_fields() {
+        // 情感域只放宽 pressure、提高 emotional_value 改写线，其余字段 None → 保留原值。
+        let mut rt = UserRuntimeParameters::default();
+        let orig_fact = rt.fact_risk_block_at;
+        let orig_human = rt.human_like_rewrite_below;
+        let orig_grounding = rt.product_accuracy_block_below;
+        let th = crate::models::ProfileThresholds {
+            pressure_risk_block_at: Some(9),
+            emotional_value_rewrite_below: Some(8),
+            ..Default::default()
+        };
+        rt.apply_profile_threshold_overrides(Some(&th));
+        // 被覆盖的两个。
+        assert_eq!(rt.pressure_risk_block_at, 9);
+        assert_eq!(rt.emotional_value_rewrite_below, 8);
+        // None 字段保留原值（逐字段独立回落）。
+        assert_eq!(rt.fact_risk_block_at, orig_fact);
+        assert_eq!(rt.human_like_rewrite_below, orig_human);
+        assert_eq!(rt.product_accuracy_block_below, orig_grounding);
+    }
+
+    #[test]
+    fn threshold_overrides_full_override_all_five() {
+        let mut rt = UserRuntimeParameters::default();
+        let th = crate::models::ProfileThresholds {
+            fact_risk_block_at: Some(8),
+            pressure_risk_block_at: Some(9),
+            human_like_rewrite_below: Some(4),
+            emotional_value_rewrite_below: Some(7),
+            product_accuracy_block_below: Some(5),
+        };
+        rt.apply_profile_threshold_overrides(Some(&th));
+        assert_eq!(rt.fact_risk_block_at, 8);
+        assert_eq!(rt.pressure_risk_block_at, 9);
+        assert_eq!(rt.human_like_rewrite_below, 4);
+        assert_eq!(rt.emotional_value_rewrite_below, 7);
+        assert_eq!(rt.product_accuracy_block_below, 5);
     }
 }

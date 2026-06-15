@@ -388,6 +388,9 @@ pub fn default_domain_profile(workspace_id: &str) -> DomainProfile {
         // C3：DEFAULT 不声明行业专属生成器引导语 → 回落领域中性 PLAYBOOK_METHODOLOGY_SYSTEM
         // （已去销售偏见）。换行业可在引导层声明自己的生成偏好。
         methodology_generator_preamble: None,
+        // M2：DEFAULT 不覆盖五闸阈值 → gateway 沿用 domain_config 解析的销售域阈值
+        // （字节等价）。换行业可声明自己的阈值（如情感域放宽 pressure_risk）。
+        threshold_overrides: None,
         version: 1,
         current_version: true,
         previous_version: None,
@@ -805,6 +808,35 @@ mod tests {
         assert_eq!(parsed.business_formulas, p.business_formulas);
         // H17：memory_dimensions 经 BSON 往返不丢（camelCase key/displayName/cap/isCore/promptHint/candidateType）。
         assert_eq!(parsed.memory_dimensions, p.memory_dimensions);
+        // M2：DEFAULT threshold_overrides=None 经 BSON 往返仍 None（不覆盖五闸、零扰动）。
+        assert!(parsed.threshold_overrides.is_none());
+    }
+
+    #[test]
+    fn default_profile_threshold_overrides_is_none() {
+        // M2 零扰动护栏：DEFAULT_PROFILE 不声明阈值覆盖 → gateway 沿用 domain_config
+        // 阈值，销售域行为字节等价。换行业才声明 threshold_overrides。
+        let p = default_domain_profile("ws-1");
+        assert!(p.threshold_overrides.is_none());
+    }
+
+    #[test]
+    fn profile_thresholds_partial_override_bson_round_trip() {
+        // 非销售域只覆盖部分闸（如情感域放宽 pressure、提高 emotional_value 改写线），
+        // 其余字段 None 经 BSON 往返保持 None（逐字段独立回落 config）。
+        let th = crate::models::ProfileThresholds {
+            pressure_risk_block_at: Some(9),
+            emotional_value_rewrite_below: Some(8),
+            ..Default::default()
+        };
+        let doc = mongodb::bson::to_document(&th).expect("serialize");
+        let parsed: crate::models::ProfileThresholds =
+            mongodb::bson::from_document(doc).expect("deserialize");
+        assert_eq!(parsed.pressure_risk_block_at, Some(9));
+        assert_eq!(parsed.emotional_value_rewrite_below, Some(8));
+        assert_eq!(parsed.fact_risk_block_at, None);
+        assert_eq!(parsed.human_like_rewrite_below, None);
+        assert_eq!(parsed.product_accuracy_block_below, None);
     }
 
     // ── H17：记忆维度 seed 等价 ──
