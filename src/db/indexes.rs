@@ -287,6 +287,25 @@ pub(super) async fn ensure_all(db: &Database) -> anyhow::Result<()> {
             None,
         )
         .await?;
+    // 回路①（gap_signals::refresh_usage_stats_and_confidence）每 600s 把该 workspace
+    // 30d（gap_signals.rs:813 的 30*24h 窗口）全部 usage log try_collect 进内存。该集合
+    // 是每次知识命中/拦截都 append 的高写入诊断日志，无 TTL 会从根上无界增长 → 最终
+    // 拖垮 feedback_worker 内存。TTL=35d 略大于回路①的 30d 滑窗，只清窗口外历史、
+    // 不影响窗口内统计；与 llm_call_logs/agent_run_logs 等诊断日志的 TTL 策略同构。
+    db.knowledge_usage_logs()
+        .create_index(
+            IndexModel::builder()
+                .keys(doc! { "created_at": 1 })
+                .options(
+                    IndexOptions::builder()
+                        .expire_after(std::time::Duration::from_secs(35 * 24 * 60 * 60))
+                        .name("ttl_knowledge_usage_logs_created_at".to_string())
+                        .build(),
+                )
+                .build(),
+            None,
+        )
+        .await?;
     db.knowledge_chat_turns()
         .create_index(
             IndexModel::builder()
@@ -1456,6 +1475,27 @@ async fn ensure_evolution_indexes(db: &Database) -> anyhow::Result<()> {
                     IndexOptions::builder()
                         .unique(true)
                         .name("uniq_principal_escalation_short_code".to_string())
+                        .build(),
+                )
+                .build(),
+            None,
+        )
+        .await?;
+    // 同客户同类别只允许一条 pending 请示：escalate_held_decision / trigger_principal_escalation
+    // 此前用 has_pending_for_contact (count) 后再 insert_pending_escalation，存在 TOCTOU——
+    // follow-up worker 与 webhook debounce runner 是两个独立 tokio 任务，可并发跑同一 contact，
+    // 各 count 到 0 → 各插一条 → 领导被推两张卡。partial filter 限定 status=pending 否则会
+    // 误伤 resolved 历史（同客户同类别本就可多次历史请示）。insert 侧捕获本索引的 11000
+    // dup-key 当作"已存在 pending"静默跳过推卡（见 ledger::insert_pending_escalation）。
+    db.agent_principal_escalations()
+        .create_index(
+            IndexModel::builder()
+                .keys(doc! { "workspace_id": 1, "contact_wxid": 1, "category": 1 })
+                .options(
+                    IndexOptions::builder()
+                        .unique(true)
+                        .partial_filter_expression(doc! { "status": "pending" })
+                        .name("uniq_principal_escalation_pending_ws_contact_category".to_string())
                         .build(),
                 )
                 .build(),

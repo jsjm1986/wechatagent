@@ -1,7 +1,7 @@
 //! 决策请示通道——台账 CRUD 层（pending 台账增删查改 / 知识缺口提案 / relay task 入队）。
 //! 全部 async + db 访问。
 
-use super::logic::{is_duplicate_key_error, short_code_from_seed};
+use super::logic::{is_duplicate_key_error, is_pending_dedupe_conflict, short_code_from_seed};
 use crate::error::{AppError, AppResult};
 use crate::models::{
     AgentPrincipalEscalation, AgentTask, OperationKnowledgeChunk, PrincipalDecision,
@@ -28,7 +28,11 @@ pub(crate) async fn principal_decider_wxid(
     Ok(cfg.and_then(|c| c.principal_decider))
 }
 
-/// 插入一条 pending 台账。短码碰撞（唯一索引报错）时重试至多 5 次。
+/// 插入一条 pending 台账。短码碰撞（短码唯一索引报错）时换种子重试至多 5 次。
+///
+/// 返回 `Ok(Some(entry))` = 成功插入；`Ok(None)` = 同客户同类别已有 pending
+/// （并发漏过 `has_pending_for_contact` 预检，被 pending 去重唯一索引兜住），
+/// 调用方据此跳过后续推卡（与 `has_pending_for_contact` 命中早返回同效）。
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn insert_pending_escalation(
     state: &AppState,
@@ -40,7 +44,7 @@ pub(crate) async fn insert_pending_escalation(
     question_for_principal: &str,
     principal_wxid: &str,
     is_generalizable: bool,
-) -> AppResult<AgentPrincipalEscalation> {
+) -> AppResult<Option<AgentPrincipalEscalation>> {
     debug_assert!(
         ALLOWED_ESCALATION_CATEGORY.contains(&category),
         "category 必须在闭集内"
@@ -78,9 +82,14 @@ pub(crate) async fn insert_pending_escalation(
             Ok(res) => {
                 let mut saved = entry;
                 saved.id = res.inserted_id.as_object_id();
-                return Ok(saved);
+                return Ok(Some(saved));
             }
             Err(e) => {
+                // pending 去重唯一索引冲突：并发已插入同客户同类别 pending → 静默"已存在"。
+                if is_pending_dedupe_conflict(&e) {
+                    return Ok(None);
+                }
+                // 短码唯一索引冲突：换种子重试。
                 if is_duplicate_key_error(&e) {
                     continue;
                 }

@@ -79,7 +79,7 @@ pub(crate) async fn escalate_held_decision(
         "该客户议题触发高风险闸门（{}），AI 暂不自行答复。拟答风险等级：{}。请领导定夺该如何回复。",
         blocked_status, final_decision.risk_level
     );
-    let entry = insert_pending_escalation(
+    let Some(entry) = insert_pending_escalation(
         state,
         &contact.workspace_id,
         &contact.account_id,
@@ -90,7 +90,11 @@ pub(crate) async fn escalate_held_decision(
         &principal_wxid,
         false, // 高风险硬闸件默认不泛化（领导裁决可能是个案）
     )
-    .await?;
+    .await?
+    else {
+        // 并发已插入同客户同类别 pending（pending 去重索引兜住）→ 不重复推卡。
+        return Ok(());
+    };
     let customer_label = contact
         .remark
         .clone()

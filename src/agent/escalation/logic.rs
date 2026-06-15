@@ -271,6 +271,30 @@ pub(crate) fn is_duplicate_key_error(e: &mongodb::error::Error) -> bool {
     )
 }
 
+/// pending 去重唯一索引的名字（与 db/indexes.rs 的 partial unique 索引同名）。
+/// insert 侧据此区分两类 11000：短码碰撞（换种子重试）vs 同客户同类别已有 pending
+/// （并发漏过 has_pending 预检，静默当作"已存在"，不再重试、不报错）。
+pub(crate) const PENDING_DEDUPE_INDEX_NAME: &str =
+    "uniq_principal_escalation_pending_ws_contact_category";
+
+/// 据 dup-key 错误的 (code, message) 判定是否命中 pending 去重唯一索引。
+/// dup-key 错误 message 形如 `E11000 ... index: <name> dup key: ...`，据索引名识别。
+/// 抽成纯函数（输入基本类型）以便单测——mongodb::error::WriteError 是 `#[non_exhaustive]`，
+/// 无法在测试里构造，故把核心判定与错误提取解耦。
+pub(crate) fn dedupe_conflict_matches_pending_index(code: i32, message: &str) -> bool {
+    code == 11000 && message.contains(PENDING_DEDUPE_INDEX_NAME)
+}
+
+/// 该 mongodb 错误是否为 pending 去重唯一索引的 11000 冲突。
+/// 仅从错误里提取 (code, message)，核心判定委托 [`dedupe_conflict_matches_pending_index`]。
+pub(crate) fn is_pending_dedupe_conflict(e: &mongodb::error::Error) -> bool {
+    matches!(
+        *e.kind,
+        mongodb::error::ErrorKind::Write(mongodb::error::WriteFailure::WriteError(ref we))
+            if dedupe_conflict_matches_pending_index(we.code, &we.message)
+    )
+}
+
 /// 校验 verdict，越界回落 deferred（纯函数，便于单测）。
 pub(crate) fn sanitize_verdict(decision: PrincipalDecision) -> PrincipalDecision {
     if ALLOWED_PRINCIPAL_VERDICT.contains(&decision.verdict.as_str()) {
@@ -810,5 +834,31 @@ mod tests {
                 "{s} 不应升级"
             );
         }
+    }
+
+    // ---- fix C：pending 去重唯一索引冲突判定（区分两类 11000）----
+
+    #[test]
+    fn dedupe_conflict_hits_only_pending_index_message() {
+        // 11000 且 message 含 pending 去重索引名 → 命中（并发已插 pending，静默"已存在"）。
+        let msg = format!(
+            "E11000 duplicate key error collection: db.agent_principal_escalations index: {} dup key: {{ workspace_id: \"ws1\", contact_wxid: \"c1\", category: \"high_risk_gated\" }}",
+            PENDING_DEDUPE_INDEX_NAME
+        );
+        assert!(dedupe_conflict_matches_pending_index(11000, &msg));
+    }
+
+    #[test]
+    fn dedupe_conflict_misses_short_code_index() {
+        // 短码唯一索引的 11000 → 不命中（应换种子重试，而非当"已存在"）。
+        let msg = "E11000 duplicate key error collection: db.agent_principal_escalations index: uniq_principal_escalation_short_code dup key: { short_code: \"E1A2\" }";
+        assert!(!dedupe_conflict_matches_pending_index(11000, msg));
+    }
+
+    #[test]
+    fn dedupe_conflict_misses_non_11000() {
+        // 非 11000（即便 message 巧合含索引名）→ 不命中。
+        let msg = format!("some other write error mentioning {}", PENDING_DEDUPE_INDEX_NAME);
+        assert!(!dedupe_conflict_matches_pending_index(121, &msg));
     }
 }
