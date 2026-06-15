@@ -1819,7 +1819,7 @@ async fn run_user_operation_gateway_inner(
                 Some(&contact.wxid),
                 "outbox_enqueue_partial_failure",
                 "error",
-                "多段回复部分段入队失败——已入队段照常发出，失败段缺失，需人工核对",
+                "多段回复部分段入队失败——已入队段照常发出，失败段缺失，需管理员核对",
                 Some(doc! {
                     "run_id": &run_id,
                     "segment_total": total as i64,
@@ -1915,7 +1915,7 @@ pub(crate) async fn send_outbound_message(
             Some(&contact.wxid),
             "outbound_record_persist_failed",
             "warn",
-            "消息已通过 MCP 发出，但落库 conversation_messages 失败——记录缺失，需人工核对",
+            "消息已通过 MCP 发出，但落库 conversation_messages 失败——记录缺失，需管理员核对",
             Some(doc! { "content_len": content.len() as i64 }),
         )
         .await
