@@ -417,7 +417,7 @@ entitlements(contact, products, profile)  =  fold over
 6. **G4 投影 read 端点** + **频道·客户持有 Tab / 成交记录 Tab**（依赖 #4、#5）。**端点强制 §3.5 workspace 过滤不变量**（产品按当前 workspace + active 加载，只 fold 当前 contact 的 outcome_events，进 IDOR 隔离测试）。
 7. **退款/逆转事件**结构定稿（§4.5）。**[已完成]** `OutcomeEvent.event_kind`（deal|reversal，serde 缺省 deal）+ G4 投影按 product_id 抵消净件数（净 ≤ 0 退出持有）+ `add_deal_event` 接 `eventKind`（reversal 必须带 product_id、放宽到任意 status）+ 前端成交记录 Tab 显示退款标记。
 8. **G4→G1 纠偏**：随 G1 profile 维度落地一起做（§6）。
-9. **（独立，H11-linkage）成交事实接入自学习正向循环**：当前正向循环只读 LLM `buyingSignal` 反应信号（`reaction.rs`），与客观 outcome_events 脱节。若要让"已核实成交"也强化正向方法论，必须**过 `active_profile.outcome_polarity.positive`**（销售域 `user_replied_buying_signal`、情感域无成交语义不接），属 H11 范畴、不在本轮 schema。
+9. **（独立，H11-linkage）成交事实接入自学习正向循环**。**[已完成]** 当前正向循环只读 LLM `buyingSignal` 反应信号（`reaction.rs`），与客观 outcome_events 脱节。实现：回路①（`gap_signals::refresh_usage_stats_and_confidence`）统计循环新增「成交追认」旁路——已核实成交（`staff_confirmed`/`payment_verified`，经 `entitlements::confirmed_deal_timestamps` 排除 `conversation_inferred`）回溯其发生前最近 N=3 轮 `knowledge_usage_logs`（`attributed_log_indices` 滑窗），把那些 chunk 额外计为正向 Hit。gating：仅 `real_outcome_enabled` 且 `active_profile.outcome_polarity.positive` 非空时启用（销售域接、情感域无成交事件天然不接）；不改 `decision_reviews.outcome_status`（保 reaction 单一写者）、不开新表/worker（30d 全量重算天然幂等）。`UsageStatsReport.deal_attributed_hits` 供审计观测。
 10. **支付闭环**（§7，可行性 + 资质先行）：`/webhooks/payment` + 支付链接发送 + payment_verified 自动成交。**强制 §7.3 安全三件套**（验签 / 订单幂等 / workspace 归属解析）。
 
 ### 测试预案（落码阶段，遵循"只增量叠加"）

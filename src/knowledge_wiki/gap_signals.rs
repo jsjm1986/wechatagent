@@ -711,6 +711,50 @@ pub enum OutcomeLabel {
     Censored,
 }
 
+/// H11-linkage（spec §9 #9）：成交追认的归因窗口——一笔已核实成交，往前追认其
+/// 发生时刻**之前**最近 N 条 `knowledge_usage_log`（即"成交前最近 N 轮对话用过的
+/// 知识"）。N=3 与项目既有 `take(5)` / `take(3)`（reaction_hint / deprecated_facts）
+/// 量级一致；"成交前最后几轮用的知识最可能促成成交"是稳健的弱归因假设。
+pub(crate) const DEAL_ATTRIBUTION_WINDOW_TURNS: usize = 3;
+
+/// H11-linkage：纯函数——给定**单个 contact** 的 usage-log 时刻列表与已核实成交
+/// 时刻列表，返回被成交追认（应翻为正向 Hit）的 log 下标集合。
+///
+/// 归因规则：对每笔成交时刻 `T`，取所有 `created_at <= T` 的 log（成交不能追认它
+/// 之后才用的知识），按 created_at 升序后**最后 N 条**（成交前最近 N 轮）标记为追认。
+/// 多笔成交的追认集合取并集（一条 log 落入任一成交的窗口即被追认）。
+///
+/// `log_times_ms`：该 contact 的 usage-log created_at（毫秒），**任意顺序**（内部按
+/// 时序处理，返回的是相对输入下标）。`deal_times_ms`：该 contact 的已核实成交时刻。
+/// 入参为空任一 → 空集（零扰动）。纯函数无 IO，便于单测窗口边界。
+pub(crate) fn attributed_log_indices(
+    log_times_ms: &[i64],
+    deal_times_ms: &[i64],
+) -> std::collections::HashSet<usize> {
+    use std::collections::HashSet;
+    let mut attributed: HashSet<usize> = HashSet::new();
+    if log_times_ms.is_empty() || deal_times_ms.is_empty() {
+        return attributed;
+    }
+    // 按时刻升序排原始下标。
+    let mut order: Vec<usize> = (0..log_times_ms.len()).collect();
+    order.sort_by_key(|&i| log_times_ms[i]);
+    for &deal_t in deal_times_ms {
+        // 成交前序列（created_at <= 成交时刻），保持升序。
+        let before: Vec<usize> = order
+            .iter()
+            .copied()
+            .filter(|&i| log_times_ms[i] <= deal_t)
+            .collect();
+        // 取最后 N 条（成交前最近 N 轮）。
+        let start = before.len().saturating_sub(DEAL_ATTRIBUTION_WINDOW_TURNS);
+        for &i in &before[start..] {
+            attributed.insert(i);
+        }
+    }
+    attributed
+}
+
 /// 2.5-main-2：把 active DomainProfile 的 [`OutcomePolarity`](crate::models::OutcomePolarity)
 /// 解析成「有效极性」字符串向量对（正极, 负极）。
 ///
@@ -825,15 +869,30 @@ pub async fn refresh_usage_stats_and_confidence(
         HashMap::new()
     };
 
+    // H11-linkage（spec §9 #9）：成交追认——把"已核实成交前最近 N 轮用过的知识"
+    // 额外计为正向 Hit，让客观成交事实（而非仅 LLM buyingSignal）也强化召回置信度。
+    // gating：仅 real_outcome_enabled 且本 workspace 正极非空（= 销售类域）时启用；
+    // 情感陪伴域无产品 → 无已核实成交 → 追认集天然为空。红线：成交时刻来自
+    // entitlements::confirmed_deal_timestamps，已用 staff_confirmed/payment_verified
+    // 闭集排除 conversation_inferred。产出 attributed_log_idx = 被追认的 log 在 logs
+    // Vec 里的下标集合（与下方 enumerate 循环对齐）。
+    let attributed_log_idx: std::collections::HashSet<usize> =
+        if real_outcome_enabled && !positive_outcomes.is_empty() {
+            compute_deal_attributed_log_indices(db, workspace_id, &logs).await?
+        } else {
+            std::collections::HashSet::new()
+        };
+
     let mut hit: HashMap<String, u32> = HashMap::new();
     let mut blocked: HashMap<String, u32> = HashMap::new();
     let mut last_used: HashMap<String, DateTime> = HashMap::new();
     let mut last_block_reason: HashMap<String, String> = HashMap::new();
+    let mut deal_attributed_hits: u64 = 0;
 
-    for log in logs {
+    for (log_idx, log) in logs.iter().enumerate() {
         // 换血：真实用户反应三态；删失（Censored）整条 log 跳过 hit/block 统计，
         // 但仍参与 last_used 记账（chunk 确实被召回过）。回滚时退回 reviewer 自评。
-        let label = if real_outcome_enabled {
+        let base_label = if real_outcome_enabled {
             let outcome = outcome_by_run
                 .get(&log.run_id)
                 .and_then(|o| o.as_deref());
@@ -844,6 +903,18 @@ pub async fn refresh_usage_stats_and_confidence(
             ))
         } else {
             None
+        };
+        // H11-linkage：成交追认取较优——被已核实成交追认的 log 翻为 Hit（本就是 Hit
+        // 不重复加；Censored/Block/None 翻成 Hit）。仅在 real_outcome 路径生效（回滚
+        // 路径 attributed 集恒空）。统计 deal_attributed_hits 供审计观测翻转量。
+        let deal_attributed = attributed_log_idx.contains(&log_idx);
+        let label = if deal_attributed {
+            if base_label != Some(OutcomeLabel::Hit) {
+                deal_attributed_hits += 1;
+            }
+            Some(OutcomeLabel::Hit)
+        } else {
+            base_label
         };
         for oid in &log.knowledge_ids {
             let key = oid.to_hex();
@@ -938,7 +1009,71 @@ pub async fn refresh_usage_stats_and_confidence(
         report.updated += 1;
     }
 
+    report.deal_attributed_hits = deal_attributed_hits;
     Ok(report)
+}
+
+/// H11-linkage（spec §9 #9）：算出本批 usage logs 里被「已核实成交」追认的 log 下标。
+///
+/// 按 `contact_wxid` 分组（无 contact_wxid 的 log 不参与——无成交归属），批量拉这些
+/// contact 的 `outcome_events`（一次 `find`，IDOR：filter 必含 workspace_id），对每个
+/// contact 用 [`crate::agent::entitlements::confirmed_deal_timestamps`] 取已核实正向
+/// 成交时刻，再用 [`attributed_log_indices`] 算"成交前最近 N 轮" log，映射回全局下标。
+///
+/// best-effort 边界：无 contact_wxid 的 log、无成交的 contact → 不贡献追认。空批/全无
+/// 成交 → 返回空集（零扰动）。
+async fn compute_deal_attributed_log_indices(
+    db: &Database,
+    workspace_id: &str,
+    logs: &[crate::models::KnowledgeUsageLog],
+) -> Result<HashSet<usize>, AppError> {
+    // contact_wxid → 该 contact 名下 (全局下标, created_at_ms) 列表。
+    let mut by_contact: HashMap<String, Vec<(usize, i64)>> = HashMap::new();
+    for (idx, log) in logs.iter().enumerate() {
+        if let Some(wxid) = log.contact_wxid.as_deref().filter(|w| !w.is_empty()) {
+            by_contact
+                .entry(wxid.to_string())
+                .or_default()
+                .push((idx, log.created_at.timestamp_millis()));
+        }
+    }
+    if by_contact.is_empty() {
+        return Ok(HashSet::new());
+    }
+
+    // 批量拉这些 contact 的 outcome_events（IDOR：filter 含 workspace_id）。
+    let wxids: Vec<&String> = by_contact.keys().collect();
+    let cursor = db
+        .contacts()
+        .find(
+            doc! { "workspace_id": workspace_id, "wxid": { "$in": &wxids } },
+            None,
+        )
+        .await
+        .map_err(AppError::from)?;
+    let contacts: Vec<crate::models::Contact> =
+        cursor.try_collect().await.map_err(AppError::from)?;
+
+    let mut attributed: HashSet<usize> = HashSet::new();
+    for contact in &contacts {
+        let Some(entries) = by_contact.get(&contact.wxid) else {
+            continue;
+        };
+        let deal_times: Vec<i64> =
+            crate::agent::entitlements::confirmed_deal_timestamps(&contact.outcome_events)
+                .iter()
+                .map(|t| t.timestamp_millis())
+                .collect();
+        if deal_times.is_empty() {
+            continue;
+        }
+        // entries 的局部下标 → 用 attributed_log_indices 算窗口 → 映射回全局下标。
+        let log_times: Vec<i64> = entries.iter().map(|(_, ms)| *ms).collect();
+        for local_idx in attributed_log_indices(&log_times, &deal_times) {
+            attributed.insert(entries[local_idx].0);
+        }
+    }
+    Ok(attributed)
 }
 
 /// S7 止血：dynamic_confidence 计算的纯函数（无 IO，可单测）。
@@ -981,6 +1116,9 @@ pub fn compute_dynamic_confidence(
 #[derive(Debug, Default, Clone)]
 pub struct UsageStatsReport {
     pub updated: i64,
+    /// H11-linkage：本轮有多少 chunk-hit 来自「成交追认」（已核实成交回溯加分），
+    /// 而非 LLM 反应信号。供 worker 日志 / CI 观察成交追认是否生效、是否过度加分。
+    pub deal_attributed_hits: u64,
 }
 
 /// chunk 命中实时回写 hook —— 由 `agent::knowledge_router::tool_loop` 调用。
@@ -1902,5 +2040,66 @@ mod tests {
             DEFAULT_POSITIVE_OUTCOMES.iter().map(|s| s.to_string()).collect::<Vec<_>>()
         );
         assert_eq!(neg2, vec!["user_went_cold"]);
+    }
+
+    // ── H11-linkage：attributed_log_indices 成交追认窗口 ──
+
+    #[test]
+    fn attributed_empty_when_no_deals_or_no_logs() {
+        assert!(attributed_log_indices(&[100, 200], &[]).is_empty());
+        assert!(attributed_log_indices(&[], &[150]).is_empty());
+    }
+
+    #[test]
+    fn attributed_takes_last_n_before_deal() {
+        // 5 条 log 时刻 10/20/30/40/50，成交在 35 → 成交前序列 [10,20,30]，
+        // 取最近 N=3 条 → 全部 {0,1,2}；40/50 在成交后不追认。
+        let logs = vec![10, 20, 30, 40, 50];
+        let got = attributed_log_indices(&logs, &[35]);
+        let mut v: Vec<usize> = got.into_iter().collect();
+        v.sort();
+        assert_eq!(v, vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn attributed_window_caps_at_n() {
+        // 6 条 log 全在成交前 → 只追认最近 N=3 条（下标 3,4,5）。
+        let logs = vec![10, 20, 30, 40, 50, 60];
+        let got = attributed_log_indices(&logs, &[100]);
+        let mut v: Vec<usize> = got.into_iter().collect();
+        v.sort();
+        assert_eq!(v, vec![3, 4, 5], "窗口封顶 N=3，取最近 3 条");
+    }
+
+    #[test]
+    fn attributed_excludes_logs_after_deal() {
+        // log 在成交之后 → 不追认（成交不能追认它之后才用的知识）。
+        let logs = vec![10, 20, 200, 300];
+        let got = attributed_log_indices(&logs, &[50]);
+        let mut v: Vec<usize> = got.into_iter().collect();
+        v.sort();
+        assert_eq!(v, vec![0, 1], "仅成交前的 log 被追认");
+    }
+
+    #[test]
+    fn attributed_multiple_deals_union() {
+        // 两笔成交：T=25 追认 [10,20]；T=55 追认成交前最近 3 条 [20,30,50]。
+        // 并集 = {0(10),1(20),2(30),3(50)}。
+        let logs = vec![10, 20, 30, 50, 80];
+        let got = attributed_log_indices(&logs, &[25, 55]);
+        let mut v: Vec<usize> = got.into_iter().collect();
+        v.sort();
+        assert_eq!(v, vec![0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn attributed_handles_unsorted_input() {
+        // 输入乱序，内部按时刻排，返回相对原始下标。
+        // 时刻：idx0=50, idx1=10, idx2=30；成交 35 → 成交前 [10(idx1),30(idx2)] → {1,2}。
+        let logs = vec![50, 10, 30];
+        let got = attributed_log_indices(&logs, &[35]);
+        let mut v: Vec<usize> = got.into_iter().collect();
+        v.sort();
+        assert_eq!(v, vec![1, 2]);
     }
 }

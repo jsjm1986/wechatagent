@@ -355,6 +355,30 @@ pub(crate) fn reconcile_g1_with_entitlements(
     }
 }
 
+/// H11-linkage（spec §9 #9）：从 contact 的 `outcome_events` 抽取**已核实正向成交**
+/// 的发生时刻，供自学习正向循环（回路① 召回置信度）的「成交追认」归因使用。
+///
+/// **红线守点（§2.1 AI 永不自断成交）**：复用 [`verification_drives_entitlement`]
+/// 闭集——只有 `staff_confirmed` / `payment_verified` 进，`conversation_inferred`
+/// （AI 推断的疑似成交）在此被物理排除，绝不借成交追认通道混进正向循环。
+///
+/// 只取**正向** deal（`event_kind != "reversal"`）：退款/撤单不产生正向追认（也不
+/// 反向扣分——负向训练是回路② 的职责，不在本通道）。时刻取 `occurred_at ?? marked_at`
+/// （与 G4 投影 [`project_entitlements`] 同口径）。返回升序时刻列表。
+///
+/// **零扰动**：空 outcome_events / 无已核实成交（情感陪伴域无产品 → 无带 product_ref
+/// 的成交）→ 空 Vec → 上游成交追认天然不触发。
+pub(crate) fn confirmed_deal_timestamps(outcome_events: &[OutcomeEvent]) -> Vec<DateTime> {
+    let mut times: Vec<DateTime> = outcome_events
+        .iter()
+        .filter(|ev| verification_drives_entitlement(&ev.verification))
+        .filter(|ev| ev.event_kind != "reversal")
+        .map(|ev| ev.occurred_at.unwrap_or(ev.marked_at))
+        .collect();
+    times.sort_by_key(|t| t.timestamp_millis());
+    times
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -705,6 +729,58 @@ mod tests {
             reconcile_g1_with_entitlements(Some("某种自造阶段"), &ents),
             None
         );
+    }
+
+    // ── H11-linkage：confirmed_deal_timestamps ──
+
+    #[test]
+    fn confirmed_deals_only_verified_positive() {
+        // staff_confirmed / payment_verified 进；conversation_inferred 排除（红线）；
+        // reversal 排除（退款不产生正向追认）。
+        let events = vec![
+            ev("staff_confirmed", Some(("p1", "课程", 1)), 100),
+            ev("payment_verified", Some(("p2", "会员", 1)), 200),
+            ev("conversation_inferred", Some(("p3", "疑似", 1)), 300),
+            {
+                let mut r = ev("staff_confirmed", Some(("p1", "课程", 1)), 400);
+                r.event_kind = "reversal".to_string();
+                r
+            },
+        ];
+        let times = confirmed_deal_timestamps(&events);
+        let ms: Vec<i64> = times.iter().map(|t| t.timestamp_millis()).collect();
+        assert_eq!(ms, vec![100, 200], "只取 staff_confirmed/payment_verified 的正向成交");
+    }
+
+    #[test]
+    fn confirmed_deals_uses_occurred_at_then_marked_at() {
+        // occurred_at 优先；缺省回落 marked_at。
+        let mut e = ev("staff_confirmed", Some(("p", "x", 1)), 500);
+        e.occurred_at = None; // marked_at = 500（ev 里 marked_at=occurred_ms）
+        let times = confirmed_deal_timestamps(&[e]);
+        assert_eq!(times[0].timestamp_millis(), 500);
+    }
+
+    #[test]
+    fn confirmed_deals_empty_zero_perturbation() {
+        assert!(confirmed_deal_timestamps(&[]).is_empty());
+        // 全是 conversation_inferred → 空（情感域/疑似线索不产追认）。
+        let only_inferred = vec![ev("conversation_inferred", Some(("p", "x", 1)), 1)];
+        assert!(confirmed_deal_timestamps(&only_inferred).is_empty());
+    }
+
+    #[test]
+    fn confirmed_deals_sorted_ascending() {
+        let events = vec![
+            ev("staff_confirmed", Some(("p1", "a", 1)), 300),
+            ev("payment_verified", Some(("p2", "b", 1)), 100),
+            ev("staff_confirmed", Some(("p3", "c", 1)), 200),
+        ];
+        let ms: Vec<i64> = confirmed_deal_timestamps(&events)
+            .iter()
+            .map(|t| t.timestamp_millis())
+            .collect();
+        assert_eq!(ms, vec![100, 200, 300], "时刻升序");
     }
 }
 
