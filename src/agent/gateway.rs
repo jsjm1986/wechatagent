@@ -2519,16 +2519,16 @@ async fn apply_agent_updates(
     // 客观购买事实 spec §6（G4 当 G1 的客观锚）：仅当 active profile 声明了
     // purchase_lifecycle「参与决策」维度时，用 G4 持有投影纠偏 LLM 推断的 G1 标签
     // （客观锚优先，类比 C2 operation_state 的 fail-soft）。销售域 DEFAULT profile
-    // 不含该维度 → 整段跳过、零扰动；情感域产品表空 → 投影空 → reconcile 恒返回
-    // None。冲突纠偏时覆盖 domain_signals 容器值 + 记一条审计事件（reply 已照常下发，
-    // 这里只改画像写入，不阻塞、不回滚）。
+    // 不含该维度 → 不纠偏、零扰动；情感域产品表空 → 投影空 → reconcile 恒返回
+    // None。冲突纠偏时覆盖 domain_signals 容器值 + 记一条审计事件（reply 走异步
+    // outbox，这里只改画像写入，不阻塞、不回滚）。active_profile 同时供写侧白名单复用。
+    let active_profile = crate::agent::domain_profile::load_active_domain_profile(
+        &state.db,
+        &contact.workspace_id,
+    )
+    .await;
     let mut g1_correction: Option<(String, String)> = None;
     {
-        let active_profile = crate::agent::domain_profile::load_active_domain_profile(
-            &state.db,
-            &contact.workspace_id,
-        )
-        .await;
         let g1_participates = active_profile.profile_dimensions.iter().any(|d| {
             d.participates_in_decision
                 && d.kind == crate::agent::entitlements::G1_DIMENSION_KIND
@@ -2560,6 +2560,15 @@ async fn apply_agent_updates(
             }
         }
     }
+    // G1 写侧白名单：把 domain_signals 容器收敛到 active profile 声明的「参与决策」
+    // 维度集合内，剔除 LLM 在 domainSignals 里臆造的未声明键（防穿透落库污染画像，
+    // 「写侧须保守」纪律）。销售域 = [customer_stage, intent_level]，容器本就只含
+    // 这两维（typed 镜像）→ 过滤后字节不变、零扰动。
+    let declared_dims = crate::agent::domain_profile::decision_dimension_kinds(&active_profile);
+    crate::agent::domain_signals::retain_declared_dimensions(
+        &mut signals_decision.domain_signals,
+        &declared_dims,
+    );
     if !signals_decision.domain_signals.is_empty() {
         let prev_stage = contact
             .domain_attributes

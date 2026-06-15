@@ -144,6 +144,32 @@ pub(crate) fn insert_domain_signal_values(
     wrote_any
 }
 
+/// universal-domain-adaptation G1 写侧白名单：剔除 `signals` 容器里**未在 active
+/// profile 声明**的维度键，只保留 `allowed`（= `decision_dimension_kinds(profile)`，
+/// 即 `participates_in_decision=true` 的维度）。
+///
+/// 背景：G1 打通了「LLM 经 `domainSignals` 容器输出非销售维度」的通道。LLM 可能
+/// 在容器里臆造/发散出 profile 未声明的键，它们既不被 `decision_taxonomy` 校验
+/// （那只遍历声明过的维度），也会被 [`insert_domain_signal_values`] 原样写进
+/// `domain_attributes`，污染画像、绕过软门（违反「画像更新须保守」写侧纪律）。本
+/// 过滤器在落库前把容器收敛到声明集合内——未声明键最多经 `agent_generated_signals`
+/// / `taxonomy_candidates` 软通道进后台审核，不直接落画像。
+///
+/// **零扰动**：销售域 DEFAULT profile 的 `decision_dimension_kinds` =
+/// `[customer_stage, intent_level]`，而销售域容器本就只含这两维（由 typed 镜像），
+/// 过滤后字节不变。`allowed` 为空（异常态/未声明任何决策维度）时清空容器（保守：
+/// 宁可不写，不误写）。
+pub(crate) fn retain_declared_dimensions(signals: &mut Document, allowed: &[String]) {
+    let drop_keys: Vec<String> = signals
+        .keys()
+        .filter(|k| !allowed.iter().any(|a| a == *k))
+        .cloned()
+        .collect();
+    for k in drop_keys {
+        signals.remove(&k);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -328,4 +354,47 @@ mod tests {
             Some("first_contact")
         );
     }
+
+    // ── G1 写侧白名单：retain_declared_dimensions ──
+
+    #[test]
+    fn retain_drops_undeclared_keys() {
+        // LLM 在 domainSignals 里臆造的未声明键应被剔除，声明的保留。
+        let mut signals = doc! {
+            "purchase_lifecycle": "purchased",
+            "customer_stage": "solution_fit",
+            "llm_hallucinated_key": "乱写的",
+        };
+        let allowed = vec![
+            "customer_stage".to_string(),
+            "purchase_lifecycle".to_string(),
+        ];
+        retain_declared_dimensions(&mut signals, &allowed);
+        assert_eq!(signals.get_str("purchase_lifecycle").ok(), Some("purchased"));
+        assert_eq!(signals.get_str("customer_stage").ok(), Some("solution_fit"));
+        assert!(
+            !signals.contains_key("llm_hallucinated_key"),
+            "未声明键必须被剔除：{:?}",
+            signals
+        );
+    }
+
+    #[test]
+    fn retain_sales_dims_zero_perturbation() {
+        // 销售域容器只含 customer_stage/intent_level，allowed 也是这两维 → 字节不变。
+        let mut signals = doc! { "customer_stage": "first_contact", "intent_level": "high" };
+        let before = signals.clone();
+        let allowed = vec!["customer_stage".to_string(), "intent_level".to_string()];
+        retain_declared_dimensions(&mut signals, &allowed);
+        assert_eq!(signals, before, "销售域两维过滤后应字节等价");
+    }
+
+    #[test]
+    fn retain_empty_allowed_clears_container() {
+        // allowed 为空（异常态）→ 清空容器（保守：宁可不写，不误写）。
+        let mut signals = doc! { "purchase_lifecycle": "purchased" };
+        retain_declared_dimensions(&mut signals, &[]);
+        assert!(signals.is_empty(), "无声明维度时容器应被清空");
+    }
 }
+
