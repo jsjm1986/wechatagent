@@ -675,6 +675,11 @@ async fn run_user_operation_gateway_inner(
     // DEFAULT profile = false → 与改造前逐字等价（无条件硬闸）。
     runtime.grounding_gate_bypass_without_claim =
         active_profile.grounding_gate_bypass_without_claim;
+    // M2：用 active profile 的 threshold_overrides 覆盖五闸阈值。DEFAULT profile
+    // threshold_overrides=None → 不改任何阈值、沿用 from_config 的 domain_config 值
+    // （销售域字节等价）；情感陪伴等域可声明放宽 pressure_risk / 提高 emotional_value
+    // 改写线。逐字段独立回落见 apply_profile_threshold_overrides。
+    runtime.apply_profile_threshold_overrides(active_profile.threshold_overrides.as_ref());
     let pending_tasks = load_pending_tasks(state, &contact).await?;
     let playbook = load_operation_playbook_for_contact(state, &contact).await?;
     let memory = load_or_create_operating_memory(state, &contact).await?;

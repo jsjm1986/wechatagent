@@ -1410,6 +1410,16 @@ pub struct DomainProfile {
     /// 给非销售行业生成的 profile）。`Some` 时整体替换，让特定行业声明自己的生成偏好。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub methodology_generator_preamble: Option<String>,
+    /// universal-domain-adaptation M2：本行业「五闸风险阈值」覆盖（替代写死在
+    /// `OperationDomainConfig.runtime_parameters` 的销售域阈值）。`None`（DEFAULT/老库
+    /// serde 默认）→ 不覆盖，gateway 沿用 `UserRuntimeParameters::from_config` 解析的
+    /// domain_config 阈值（销售域字节等价）。`Some` 时 gateway 加载 active profile 后
+    /// 逐字段覆盖 runtime（字段内 `None` 仍回落 config 值）——让情感陪伴等域可声明
+    /// 自己的 PressureRisk/EmotionalValue 阈值（如放宽压迫闸、提高情绪价值改写线），
+    /// 而非沿用销售域 6/7/6/6/7。**红线**：阈值只调软/硬闸触发线，不改闸的语义与
+    /// 「AI 永不自断成交 / 永不自动 verify」等结构红线。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub threshold_overrides: Option<ProfileThresholds>,
     /// E5-T1 多版本灰度：同 `(workspace_id, profile_id)` 下 `version` 单调递增。
     #[serde(default = "default_version_one")]
     pub version: i32,
@@ -1425,7 +1435,35 @@ pub struct DomainProfile {
     pub updated_at: DateTime,
 }
 
-/// universal-domain-adaptation H8：运营范式 = 声明启用哪些「主动触达驱动力」
+/// universal-domain-adaptation M2：五闸风险阈值的 per-profile 覆盖。
+///
+/// 每字段 `Option<i32>`：`None` = 该闸不覆盖，gateway 回落
+/// `UserRuntimeParameters::from_config` 解析的 domain_config 阈值（销售域字节等价）；
+/// `Some(n)` = 用 n 覆盖该闸触发线。字段语义与 `UserRuntimeParameters` 同名字段一致
+/// （均为 0-10 档评分阈值，与 reviewer scores 同档）：
+/// - `fact_risk_block_at` / `pressure_risk_block_at`：≥ 阈值拦截（越高越宽松）；
+/// - `human_like_rewrite_below` / `emotional_value_rewrite_below`：< 阈值触发改写（越高越严）；
+/// - `product_accuracy_block_below`（= knowledge_grounding）：< 阈值拦截产品声明。
+///
+/// 典型用途：情感陪伴域放宽 `pressure_risk_block_at`（主动关心不算施压）、提高
+/// `emotional_value_rewrite_below`（情绪价值不足更积极改写）。全 `None` 时整体等价
+/// 不声明（DEFAULT_PROFILE 即如此）。
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ProfileThresholds {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fact_risk_block_at: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pressure_risk_block_at: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub human_like_rewrite_below: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub emotional_value_rewrite_below: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub product_accuracy_block_below: Option<i32>,
+}
+
+
 /// + 各自阈值。三驱动力对应 planner 三扫描器（funnel→`scan_stage_stagnation`、
 /// silence→`scan_silent`、commitment→`scan_commitments`）。
 ///
