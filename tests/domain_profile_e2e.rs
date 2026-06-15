@@ -84,6 +84,7 @@ async fn db_create_profile(
         outcome_polarity: OutcomePolarity::default(),
         methodology_generator_preamble: None,
         business_formulas: vec![],
+        memory_dimensions: vec![],
         current_version: false,
         previous_version: None,
         is_active: false,

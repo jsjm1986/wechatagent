@@ -27,6 +27,7 @@ mod budget;
 mod chat_tool_loop;
 mod decision;
 mod decision_taxonomy;
+mod entitlements;
 pub mod domain;
 pub(crate) mod domain_profile;
 pub(crate) mod domain_signals;
@@ -157,6 +158,10 @@ pub use taxonomy::init_global_taxonomy_cache;
 pub use domain_profile::init_global_domain_profile_cache;
 // H17：记忆维度通用化的两个 pub 渲染/seed 函数，供 tests/ 端到端验证情感 profile。
 pub use domain_profile::{default_memory_dimensions, render_memory_candidate_types_guidance};
+// roleplay-fuzz P0：集成测试 seed/读回 active DomainProfile + 失效进程级缓存所需入口。
+pub use domain_profile::{
+    default_domain_profile, invalidate_global_domain_profile_cache, load_active_domain_profile,
+};
 
 // agent-autonomy-loop W3 / Task 4.5：P7 工具循环性质测试入口。
 //
