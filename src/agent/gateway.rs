@@ -512,7 +512,7 @@ pub(crate) async fn trigger_principal_escalation(
     }
     let reason = req.reason.clone().unwrap_or_default();
     let question = req.question_for_principal.clone().unwrap_or_default();
-    let entry = escalation::insert_pending_escalation(
+    let Some(entry) = escalation::insert_pending_escalation(
         state,
         &contact.workspace_id,
         &contact.account_id,
@@ -523,7 +523,11 @@ pub(crate) async fn trigger_principal_escalation(
         &principal_wxid,
         req.is_generalizable,
     )
-    .await?;
+    .await?
+    else {
+        // 并发已插入同客户同类别 pending（pending 去重索引兜住）→ 不重复推卡。
+        return Ok(());
+    };
     let customer_label = contact
         .remark
         .clone()

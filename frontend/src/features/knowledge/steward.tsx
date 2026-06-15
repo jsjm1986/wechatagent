@@ -1775,6 +1775,20 @@ export function ObservabilityDashboard() {
     revisionReasons?: Array<{ reason: string; count: number }>;
     reviewerMisjudge?: Array<{ kind: string; count: number }>;
     negativeExamplePending?: number;
+    reviewerStats?: {
+      windowDays?: number;
+      considered?: number;
+      approved?: number;
+      approvedButUserNegative?: number;
+      passRate?: number;
+      misjudgeRate?: number;
+    };
+    principalEscalations?: {
+      byStatus?: Array<{ status: string; count: number; outOfClosedSet?: boolean }>;
+      pendingAgeBuckets?: Array<{ bucket: string; count: number }>;
+      oldestPendingAgeMs?: number;
+      relayDeliveryFailed?: number;
+    };
   } | null>(null);
   const [workerHealth, setWorkerHealth] = useState<{
     chatTasks?: {
@@ -2024,6 +2038,20 @@ function PhaseRollupPanel({
     revisionReasons?: Array<{ reason: string; count: number }>;
     reviewerMisjudge?: Array<{ kind: string; count: number }>;
     negativeExamplePending?: number;
+    reviewerStats?: {
+      windowDays?: number;
+      considered?: number;
+      approved?: number;
+      approvedButUserNegative?: number;
+      passRate?: number;
+      misjudgeRate?: number;
+    };
+    principalEscalations?: {
+      byStatus?: Array<{ status: string; count: number; outOfClosedSet?: boolean }>;
+      pendingAgeBuckets?: Array<{ bucket: string; count: number }>;
+      oldestPendingAgeMs?: number;
+      relayDeliveryFailed?: number;
+    };
   } | null;
 }) {
   if (!data) {
@@ -2035,6 +2063,18 @@ function PhaseRollupPanel({
   const reviewerMisjudge = data.reviewerMisjudge ?? [];
   const negativeExamplePending = data.negativeExamplePending ?? 0;
   const windowHours = data.windowHours ?? 24;
+  const reviewerStats = data.reviewerStats ?? null;
+  const reviewerStatsHasData =
+    reviewerStats != null && (reviewerStats.considered ?? 0) > 0;
+  const escalation = data.principalEscalations ?? null;
+  const escByStatus = escalation?.byStatus ?? [];
+  const escPending =
+    escByStatus.find((r) => r.status === "pending")?.count ?? 0;
+  const escAgeBuckets = escalation?.pendingAgeBuckets ?? [];
+  const escAgeOver24h =
+    escAgeBuckets.find((r) => r.bucket === "gt_24h")?.count ?? 0;
+  const relayFailed = escalation?.relayDeliveryFailed ?? 0;
+  const escHasData = escalation != null && escByStatus.length > 0;
 
   return (
     <section className="wikiObservabilityPhaseRollup">
@@ -2120,6 +2160,70 @@ function PhaseRollupPanel({
               {negativeExamplePending}
             </dd>
           </dl>
+        </article>
+
+        <article className="wikiObservabilityCard">
+          <header className="wikiObservabilityCardHead">
+            <span className="wikiArchiveTag">reviewer-stats</span>
+            <h4>reviewer 双脑表现</h4>
+          </header>
+          {reviewerStatsHasData ? (
+            <dl className="wikiArchiveMeta">
+              <dt>样本数</dt>
+              <dd>{reviewerStats?.considered ?? 0}</dd>
+              <dt>通过</dt>
+              <dd>{reviewerStats?.approved ?? 0}</dd>
+              <dt>通过率</dt>
+              <dd>
+                {typeof reviewerStats?.passRate === "number"
+                  ? `${(reviewerStats.passRate * 100).toFixed(1)}%`
+                  : "—"}
+              </dd>
+              <dt>误判率</dt>
+              <dd
+                className={
+                  (reviewerStats?.misjudgeRate ?? 0) > 0
+                    ? "wikiObservabilityDrift"
+                    : undefined
+                }
+              >
+                {typeof reviewerStats?.misjudgeRate === "number"
+                  ? `${(reviewerStats.misjudgeRate * 100).toFixed(1)}%`
+                  : "—"}
+              </dd>
+              <dt>窗口</dt>
+              <dd>{reviewerStats?.windowDays ?? 0}d</dd>
+            </dl>
+          ) : (
+            <div className="wikiEmpty">暂无 reviewer 统计</div>
+          )}
+        </article>
+
+        <article className="wikiObservabilityCard">
+          <header className="wikiObservabilityCardHead">
+            <span className="wikiArchiveTag">escalation</span>
+            <h4>请示通道（领导决策）</h4>
+          </header>
+          {escHasData ? (
+            <dl className="wikiArchiveMeta">
+              <dt>待领导裁决</dt>
+              <dd className={escPending > 0 ? "wikiObservabilityDrift" : undefined}>
+                {escPending}
+              </dd>
+              <dt>超 24h 未回</dt>
+              <dd
+                className={escAgeOver24h > 0 ? "wikiObservabilityDrift" : undefined}
+              >
+                {escAgeOver24h}
+              </dd>
+              <dt>裁决投递失败</dt>
+              <dd className={relayFailed > 0 ? "wikiObservabilityDrift" : undefined}>
+                {relayFailed}
+              </dd>
+            </dl>
+          ) : (
+            <div className="wikiEmpty">该工作区暂无请示记录</div>
+          )}
         </article>
       </div>
     </section>
