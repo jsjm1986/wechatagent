@@ -556,6 +556,8 @@ pub(super) async fn ensure_all(db: &Database) -> anyhow::Result<()> {
     // LLM 服务商配置：(workspace_id, provider_id) 唯一；is_active 部分索引便于
     // 启动时快速取出当前 active 记录。
     ensure_llm_provider_indexes(db).await?;
+    // objective-purchase-facts G2：商品库索引。
+    ensure_products_indexes(db).await?;
     Ok(())
 }
 
@@ -584,6 +586,34 @@ async fn ensure_llm_provider_indexes(db: &Database) -> anyhow::Result<()> {
         .create_index(
             IndexModel::builder()
                 .keys(doc! { "workspaceId": 1, "isActive": 1 })
+                .build(),
+            None,
+        )
+        .await?;
+    Ok(())
+}
+
+/// objective-purchase-facts G2：`products` 商品库索引。
+///
+/// - `(workspace_id, product_id)` 唯一：商品业务主键在租户内唯一，CRUD upsert
+///   的幂等门，DuplicateKey 视为「product_id 已存在」。
+/// - `(workspace_id, status)`：前端商品列表按 status（active/archived）筛选。
+///
+/// 字段为 snake_case：`Product` 结构未加 `#[serde(rename_all)]`，BSON 层即 snake_case。
+async fn ensure_products_indexes(db: &Database) -> anyhow::Result<()> {
+    db.products()
+        .create_index(
+            IndexModel::builder()
+                .keys(doc! { "workspace_id": 1, "product_id": 1 })
+                .options(IndexOptions::builder().unique(true).build())
+                .build(),
+            None,
+        )
+        .await?;
+    db.products()
+        .create_index(
+            IndexModel::builder()
+                .keys(doc! { "workspace_id": 1, "status": 1 })
                 .build(),
             None,
         )

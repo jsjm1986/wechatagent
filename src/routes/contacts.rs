@@ -19,7 +19,8 @@ use crate::{
     mcp::{self},
     models::{
         ApiContact, ContactQuery, CustomAgentInstructionsRequest, EnableAgentRequest,
-        ImportContactsRequest, OutcomeEvent, ProfileNoteRequest, SearchImportRequest,
+        ImportContactsRequest, OutcomeEvent, OutcomeProductRef, ProfileNoteRequest,
+        SearchImportRequest,
     },
 };
 
@@ -75,6 +76,45 @@ pub(super) struct DealEventRequest {
     amount: Option<f64>,
     currency: Option<String>,
     note: Option<String>,
+    /// 成交真相源可信度（G3 §2）。admin 后台登记缺省 `staff_confirmed`（admin 登记即
+    /// 高可信，§4.4）。仅接受闭集 `staff_confirmed` | `payment_verified`——
+    /// `conversation_inferred` 是 AI 疑似线索，绝不走 admin 直登通道（§5.5：疑似线索
+    /// 经审核才落 staff_confirmed），传入即 400。
+    verification: Option<String>,
+    /// 关联产品 product_id（可选）。给定时从本 workspace active 产品表解引用，按
+    /// 成交当时拷贝名/价/SKU 落 `OutcomeProductRef` 快照（§4.3 订单式冻结，非活引用）。
+    product_id: Option<String>,
+    /// 件数（可选，默认 1）。
+    quantity: Option<u32>,
+    /// 事件方向（§4.5）：`deal`（正向成交，缺省）| `reversal`（退款/撤单）。
+    /// reversal 不删原成交（审计完整性），append 一条反向事件由 G4 投影按 product_id
+    /// 抵消净件数；reversal 必须给 product_id（无产品的退款没有可抵消标的，无意义）。
+    event_kind: Option<String>,
+}
+
+/// admin 直登成交允许的事件方向闭集（§4.5）。
+fn validate_event_kind(input: Option<&str>) -> AppResult<String> {
+    match input.map(str::trim) {
+        None | Some("") | Some("deal") => Ok("deal".to_string()),
+        Some("reversal") => Ok("reversal".to_string()),
+        Some(other) => Err(AppError::BadRequest(format!(
+            "eventKind 仅接受 deal | reversal（收到 {other:?}）"
+        ))),
+    }
+}
+
+/// admin 直登成交允许的可信度闭集（§4.4 + §5.5）。`conversation_inferred` 是 AI 侧
+/// 疑似线索，绝不经 admin 直登写入——它只能由 §5.5 疑似线索通道产出，经核实后转
+/// `staff_confirmed`。
+fn validate_deal_verification(input: Option<&str>) -> AppResult<String> {
+    match input.map(str::trim) {
+        None | Some("") | Some("staff_confirmed") => Ok("staff_confirmed".to_string()),
+        Some("payment_verified") => Ok("payment_verified".to_string()),
+        Some(other) => Err(AppError::BadRequest(format!(
+            "verification 仅接受 staff_confirmed | payment_verified（收到 {other:?}）；\
+             conversation_inferred 疑似线索须经核实后才落成交，不走直登通道"
+        ))),
+    }
 }
 
 pub(super) async fn list_contacts(
@@ -269,6 +309,71 @@ pub(super) async fn get_contact(
 ) -> AppResult<Json<Value>> {
     let contact = find_contact_by_id(&state, &admin.current_workspace, &id).await?;
     Ok(Json(json!({ "item": ApiContact::from(contact) })))
+}
+
+/// `GET /api/contacts/:id/outcome-events`
+///
+/// G3 成交记录读端点（spec §8.5.3「成交记录」Tab）。返回本 contact 的全部
+/// `outcome_events`，每条带 `verification` 徽标 + `productRef` 快照 + 金额。
+/// OutcomeEvent 已是 camelCase serde，直接序列化即含新字段（旧记录缺字段 → serde
+/// 缺省 verification=staff_confirmed / productRef 省略）。
+///
+/// IDOR（§3.5）：经 `find_contact_by_id` 锁 workspace；不接受请求体 workspace。
+/// 按 occurred_at ?? marked_at 倒序（最近成交在前），不 cap（admin 审阅全量）。
+pub(super) async fn list_outcome_events(
+    State(state): State<AppState>,
+    Extension(admin): Extension<AuthenticatedAdmin>,
+    Path(id): Path<String>,
+) -> AppResult<Json<Value>> {
+    let contact = find_contact_by_id(&state, &admin.current_workspace, &id).await?;
+    let mut events = contact.outcome_events;
+    // 倒序：实际发生时间优先，缺省回落标记时间（与 G4 投影 occurred_at ?? marked_at 一致）。
+    events.sort_by(|a, b| {
+        let bk = b.occurred_at.unwrap_or(b.marked_at).timestamp_millis();
+        let ak = a.occurred_at.unwrap_or(a.marked_at).timestamp_millis();
+        bk.cmp(&ak)
+    });
+    Ok(Json(json!({ "items": events })))
+}
+
+/// `GET /api/contacts/:id/entitlements`
+///
+/// G4 持有投影读端点（spec §8.5.3「客户持有」Tab + §9 #6）。派生视图不落库，运行时
+/// 对本 contact 的 outcome_events 跑 `project_entitlements`。read 端点不受 prompt 软上限
+/// 约束（cap_n = usize::MAX，§5.1 注释明确「read 端点不受此限」）。
+///
+/// IDOR（§3.5）：经 `find_contact_by_id` 锁 contact workspace；active 产品按同一
+/// workspace + status=active 加载（`load_active_products` filter 含 workspace_id）。
+/// 零扰动：无产品域/无成交 → entitlements 空数组。
+pub(super) async fn list_entitlements(
+    State(state): State<AppState>,
+    Extension(admin): Extension<AuthenticatedAdmin>,
+    Path(id): Path<String>,
+) -> AppResult<Json<Value>> {
+    let contact = find_contact_by_id(&state, &admin.current_workspace, &id).await?;
+    let active_products =
+        agent::entitlements::load_active_products(&state.db, &contact.workspace_id).await;
+    // read 端点全量，不 cap（§5.1：read 端点不受 ENTITLEMENTS_PROMPT_CAP 限）。
+    let (entitlements, total) = agent::entitlements::project_entitlements(
+        &contact.outcome_events,
+        &active_products,
+        DateTime::now(),
+        usize::MAX,
+    );
+    let items: Vec<Value> = entitlements
+        .iter()
+        .map(|e| {
+            json!({
+                "productId": e.product_id,
+                "name": e.name,
+                "ownedSince": e.owned_since.timestamp_millis(),
+                "quantity": e.quantity,
+                "inAftercare": e.in_aftercare,
+                "expiresAt": e.expires_at.map(|d| d.timestamp_millis()),
+            })
+        })
+        .collect();
+    Ok(Json(json!({ "items": items, "total": total })))
 }
 
 pub(super) async fn enable_agent(
@@ -579,6 +684,57 @@ pub(super) async fn add_deal_event(
             ));
         }
     }
+    let verification = validate_deal_verification(payload.verification.as_deref())?;
+    let event_kind = validate_event_kind(payload.event_kind.as_deref())?;
+    let trimmed_pid = payload
+        .product_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    // reversal 必须关联 product_id：无产品标的的退款没有可抵消对象，G4 投影无从下手（§4.5）。
+    if event_kind == "reversal" && trimmed_pid.is_none() {
+        return Err(AppError::BadRequest(
+            "reversal 退款事件必须关联 product_id（指明抵消哪个产品的持有）".to_string(),
+        ));
+    }
+    // 给定 product_id 时，从本 workspace 产品表解引用，冻结成交当时快照（§4.3）。
+    // IDOR（§3.5）：filter 必含 workspace_id；正向成交只认 active（archived 不可新成交），
+    // 但 reversal 要能抵消"成交后才被下架"的产品，故退款放宽到任意 status。
+    let product_ref = match trimmed_pid {
+        Some(pid) => {
+            let mut filter = doc! {
+                "workspace_id": &admin.current_workspace,
+                "product_id": pid,
+            };
+            if event_kind != "reversal" {
+                filter.insert("status", "active");
+            }
+            let product = state
+                .db
+                .products()
+                .find_one(filter, None)
+                .await?
+                .ok_or_else(|| {
+                    if event_kind == "reversal" {
+                        AppError::BadRequest(format!(
+                            "product_id {pid:?} 不存在于本工作区，无法登记退款"
+                        ))
+                    } else {
+                        AppError::BadRequest(format!(
+                            "product_id {pid:?} 不是本工作区的 active 产品，无法关联成交"
+                        ))
+                    }
+                })?;
+            Some(OutcomeProductRef {
+                product_id: product.product_id.clone(),
+                name: product.name.clone(),
+                unit_price: product.price,
+                sku: product.sku.clone(),
+                quantity: payload.quantity.unwrap_or(1).max(1),
+            })
+        }
+        None => None,
+    };
     let now = DateTime::now();
     let outcome_event = OutcomeEvent {
         marked_at: now,
@@ -588,6 +744,9 @@ pub(super) async fn add_deal_event(
         source: "manual".to_string(),
         marked_by: admin.username.clone(),
         note: normalize_optional(payload.note),
+        verification: verification.clone(),
+        product_ref: product_ref.clone(),
+        event_kind: event_kind.clone(),
     };
     state
         .db
@@ -613,6 +772,9 @@ pub(super) async fn add_deal_event(
             "markedBy": &admin.username,
             "amount": payload.amount,
             "hasOccurredAt": payload.occurred_at_ms.is_some(),
+            "verification": &verification,
+            "eventKind": &event_kind,
+            "productId": product_ref.as_ref().map(|p| p.product_id.clone()),
         }),
     )
     .await?;

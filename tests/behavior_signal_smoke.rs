@@ -132,6 +132,9 @@ async fn deal_event_push_round_trip() {
         source: "manual".to_string(),
         marked_by: "admin_smoke".to_string(),
         note: Some("首单".to_string()),
+        verification: "staff_confirmed".to_string(),
+        product_ref: None,
+        event_kind: "deal".to_string(),
     };
     // H10 向后兼容：故意用**旧** `deal_events` key 写库，验证 serde alias 让旧库
     // 文档仍能反序列化到新 `outcome_events` 字段（改名前写入的存量数据不丢）。

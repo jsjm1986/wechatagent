@@ -584,7 +584,7 @@ casual 模式的"收紧压力门"会与"热烈推进"打架（非误杀，是模
 - 端到端验证：用**两个非销售行业**跑通——(a) 一个有转化目标的行业（如教培）；(b) **情感陪伴**（"像男朋友一样"指令 → intimate_companion 模式 → 主动情绪价值触达 → 不被 PressureRisk 压制 → 优质回复能拿到正反馈进自学习）。
 
 ### Phase 3 后（客观事实增强 + 新驱动力，做加法专题）
-- CRM 客观事实（§1.6 G2/G3/G4）：产品目录实体、订单关联 product_id、持有状态。
+- CRM 客观事实（§1.6 G2/G3/G4）：产品目录实体、订单关联 product_id、持有状态。**设计评审稿已出**：`2026-06-15-objective-purchase-facts-design.md`（成交真相源三级可信度 conversation_inferred/staff_confirmed/payment_verified + AI 永不自断成交红线；G2 独立 products collection；G3 OutcomeEvent +verification +product_ref 订单式快照；G4 派生视图防 drift；G4↔G1 客观锚纠偏；支付闭环预留 /webhooks/payment）。本轮只定数据模型与 spec，未落码。
 - 数字分身新驱动力（§3.7）：日历祝福 scan_calendar、社交钩子 scan_external_hook（先摸清 MCP 能力边界）。
 
 ### Phase 4（可选）：清理 D2/D3 审计与图谱缺陷。

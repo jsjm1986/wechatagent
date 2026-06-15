@@ -145,6 +145,13 @@ pub struct AgentDecision {
     pub consolidation_needed: bool,
     #[serde(default, deserialize_with = "string_or_vec")]
     pub used_knowledge_ids: Vec<String>,
+    /// 客观购买事实增强 G2（2026-06-15 spec §5.4）：本轮回复**报价/推荐时引用的
+    /// 产品 product_id**（来自注入的「产品目录」段）。R5.4 据此判 `priced_from_catalog`：
+    /// 引用的 product_id ∈ 本 workspace active products → 视为结构化 verified 背书，
+    /// 与 verified_chunks 取或，避免 G2 准确报价被 `blocked_unverified_product_claim` 错杀。
+    /// 空（无报价 / 情感域）→ 不触发并联背书，行为与改造前等价。
+    #[serde(default, deserialize_with = "string_or_vec")]
+    pub quoted_product_ids: Vec<String>,
     #[serde(default)]
     pub memory_update: String,
     pub context_pack_version: Option<i32>,
@@ -252,6 +259,7 @@ impl Default for AgentDecision {
             memory_write_score: 0,
             consolidation_needed: false,
             used_knowledge_ids: Vec::new(),
+            quoted_product_ids: Vec::new(),
             memory_update: String::new(),
             context_pack_version: None,
             follow_up: None,
@@ -332,6 +340,8 @@ pub struct RawAgentDecision {
     pub reply_text: Option<String>,
     pub should_reply: Option<bool>,
     pub used_knowledge_ids: Option<Vec<String>>,
+    /// G2 报价引用的 product_id（spec §5.4，R5.4 priced_from_catalog 判定用）。
+    pub quoted_product_ids: Option<Vec<String>>,
     pub safe_claims_used: Option<Vec<String>>,
     pub knowledge_route: Option<KnowledgeRouteResult>,
     pub profile_update: Option<AgentProfile>,
@@ -826,6 +836,9 @@ fn build_minimal_decision(raw: RawAgentDecision) -> AgentDecision {
 fn carry_through_fields(raw: RawAgentDecision, decision: &mut AgentDecision) {
     if let Some(v) = raw.used_knowledge_ids {
         decision.used_knowledge_ids = v;
+    }
+    if let Some(v) = raw.quoted_product_ids {
+        decision.quoted_product_ids = v;
     }
     if let Some(v) = raw.safe_claims_used {
         decision.safe_claims_used = v;

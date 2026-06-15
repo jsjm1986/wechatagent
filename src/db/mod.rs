@@ -24,7 +24,7 @@ use crate::models::{
     KnowledgeOperatorMemory, KnowledgeUsageLog, LlmCallLog, LlmProviderConfig,
     ManagementAgentMessage, ManagementAgentSession, McpCallLog, MemoryCandidate, MigrationRecord,
     OperatingMemory, OperationDomainConfig, OperationKnowledgeChunk, OperationKnowledgeDocument,
-    OperationPlaybook, OutboxEntry, PostReleaseReview, PromptTemplate,
+    OperationPlaybook, OutboxEntry, PostReleaseReview, Product, PromptTemplate,
     Proposal, ShadowReplay, TaxonomyCandidate, TaxonomyEntry, ThresholdOverride,
     ThresholdOverrideAudit, UserOperationGuidePreview, WechatAccount,
 };
@@ -347,5 +347,13 @@ impl Database {
     /// `ingest_chunked_text` 落 chunks（`integrity_status="needs_review"`）。
     pub fn ingest_sources(&self) -> Collection<IngestSource> {
         self.db.collection("ingest_sources")
+    }
+
+    /// objective-purchase-facts G2：商品库 typed accessor。运营在前端录入的
+    /// 结构化商品实体（product_id / name / price / sku / status）。成交事件
+    /// 的 `product_ref` 是下单时刻的快照拷贝（订单式），不实时引用此表。
+    /// 索引（`(workspace_id, product_id)` unique + `(workspace_id, status)`）见 `db/indexes.rs`。
+    pub fn products(&self) -> Collection<Product> {
+        self.db.collection("products")
     }
 }
