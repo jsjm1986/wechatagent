@@ -91,6 +91,7 @@ async fn db_create_profile(
         seeded_by: Some(seeded_by.to_string()),
         created_at: DateTime::now(),
         updated_at: DateTime::now(),
+        threshold_overrides: None,
         version: 1,
     };
     let result = db.domain_profiles().insert_one(&profile, None).await.expect("insert");
