@@ -23,14 +23,25 @@ on:
       - 'frontend/**'
       - 'docs/**'
       - '**/*.md'
-  # 手动触发：单独跑某一个 real_llm_ops_smoke 测试，**绕过** real-llm / recall 前置链，
-  # 立即起跑——用于快速验证单测修复（如 t15），不必等全套串行排队 1+ 小时。
-  # 在 Actions 页选 CI workflow → Run workflow → 填测试名（默认 t15）。
+  # 手动触发：**绕过**所有 needs 前置链立即起跑，用于快速验证单测修复。两个互斥目标：
+  # - dispatch_target=ops（默认）：单独跑某一个 real_llm_ops_smoke 测试（填 ops_test，默认 t15），
+  #   不必等 real-llm → recall → ops 串行排队 1+ 小时。
+  # - dispatch_target=roleplay_docker：只跑 roleplay-fuzz P0 那几个需要 Docker（testcontainers
+  #   MongoDB）的 #[ignore] 夹具自验证测试（无需任何 LLM key），不跑完整 CI、不烧真模型配额。
+  # 在 Actions 页选 CI workflow → Run workflow → 选 target（+ 必要时填 ops_test）。
   workflow_dispatch:
     inputs:
-      ops_test:
-        description: '单独跑的 real_llm_ops_smoke 测试名（如 t15_real_multiturn_deal_arc）'
+      dispatch_target:
+        description: '手动单跑目标（ops=单个 real_llm_ops_smoke / roleplay_docker=roleplay P0 Docker 夹具）'
         required: true
+        default: 'ops'
+        type: choice
+        options:
+          - ops
+          - roleplay_docker
+      ops_test:
+        description: '当 target=ops 时单独跑的 real_llm_ops_smoke 测试名（如 t15_real_multiturn_deal_arc）'
+        required: false
         default: 't15_real_multiturn_deal_arc'
         type: string
 
@@ -434,7 +445,7 @@ jobs:
   real-llm-ops-single:
     name: Real-LLM ops single (${{ github.event.inputs.ops_test }} / 手动单跑)
     runs-on: ubuntu-latest
-    if: ${{ github.event_name == 'workflow_dispatch' }}
+    if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.dispatch_target == 'ops' }}
     timeout-minutes: 90
     env:
       REAL_LLM_API_KEY: ${{ secrets.REAL_LLM_CODERELAY_API_KEY || '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' }}
@@ -728,3 +739,43 @@ jobs:
           path: target/real_llm_ledger/
           if-no-files-found: ignore
           retention-days: 30
+
+  # 手动单跑：roleplay-fuzz P0 那几个需要 Docker（testcontainers MongoDB）的 #[ignore]
+  # 夹具自验证测试。**无 needs 前置链、无任何 LLM key**——只验夹具本身（seed active
+  # DomainProfile 经缓存失效后能读回 / 默认 ws 仍回落 DEFAULT / reviewer prompt 覆写在
+  # ensure_prompt_pack_v2 之后胜出 / verified chunk 能写入），不调真模型、不烧配额。
+  # 仅 workflow_dispatch + dispatch_target=roleplay_docker 触发；正常 PR/push 跑全套不受
+  # 影响（这些测试在 integration job 的全量 --ignored 里本就会被一起跑到，本 job 只是给
+  # 一个轻量、即时、单独的验证入口）。
+  roleplay-docker:
+    name: Roleplay P0 Docker fixtures (手动单跑 / 无 LLM)
+    runs-on: ubuntu-latest
+    if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.dispatch_target == 'roleplay_docker' }}
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # 同 integration job：清预装 SDK 腾 ~30GB，否则 target + mongo 镜像撑爆磁盘。
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android \
+            /usr/local/share/boost /usr/local/share/powershell \
+            /usr/lib/jvm "$AGENT_TOOLSDIRECTORY" || true
+          sudo docker image prune --all --force || true
+          df -h
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry / target
+        uses: Swatinem/rust-cache@v2
+
+      # ubuntu-latest runner 预装 Docker daemon；testcontainers 自动拉起临时 MongoDB
+      # 容器。关 -Dwarnings 同 integration job 理由（测试文件陈年 warning 不阻断真实跑测）。
+      # --include-ignored 同时跑 #[ignore]（4 个需 Docker）与非 ignore 的 ledger 单测，
+      # 一次拿全 5 个 P0 自验证结果。--nocapture 让诊断行进 CI 日志。
+      - name: cargo test --test roleplay_fixtures_smoke (testcontainers MongoDB)
+        env:
+          RUSTFLAGS: ""
+        run: cargo test --no-fail-fast --test roleplay_fixtures_smoke -- --include-ignored --nocapture

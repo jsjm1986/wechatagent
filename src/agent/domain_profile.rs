@@ -561,7 +561,12 @@ pub async fn init_global_domain_profile_cache(db: &Database) {
 }
 
 /// 引导层 publish/激活 profile 后调用以让缓存立即失效（Phase 3 接线）。
-pub(crate) fn invalidate_global_domain_profile_cache() {
+///
+/// `pub`（非 `pub(crate)`）：集成测试 seed active DomainProfile 后必须能强制失效
+/// 进程级缓存，否则 30s TTL 窗口内 `load_active_domain_profile` 仍返回 seed 前的
+/// 旧值（roleplay-fuzz P0 fixture 落地依赖此入口）。生产语义不变——引导层 publish
+/// profile 后本就应调用它。
+pub fn invalidate_global_domain_profile_cache() {
     GLOBAL_DOMAIN_PROFILE_CACHE.invalidate();
 }
 

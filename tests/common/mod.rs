@@ -10,6 +10,7 @@
 #![allow(dead_code)]
 
 pub mod generalization;
+pub mod roleplay_fixtures;
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
