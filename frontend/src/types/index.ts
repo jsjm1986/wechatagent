@@ -415,6 +415,16 @@ export type CoverageDimension = {
   required: boolean;
 };
 
+// 五闸阈值覆盖。对齐后端 ProfileThresholds（#[serde(rename_all = "camelCase")]）。
+// 字段为 undefined/缺省 = 不覆盖该闸，沿用该域默认（销售域 6/7/6/6/7）。
+export type ProfileThresholds = {
+  factRiskBlockAt?: number | null;
+  pressureRiskBlockAt?: number | null;
+  humanLikeRewriteBelow?: number | null;
+  emotionalValueRewriteBelow?: number | null;
+  productAccuracyBlockBelow?: number | null;
+};
+
 export type DomainProfile = {
   id: string;
   profile_id: string;
@@ -427,6 +437,7 @@ export type DomainProfile = {
   business_formulas: BusinessFormula[];
   commitment_markers: CommitmentMarkers;
   coverage_dimensions: CoverageDimension[];
+  threshold_overrides?: ProfileThresholds | null;
   version: number;
   current_version: boolean;
   previous_version: number | null;
@@ -447,6 +458,7 @@ export type DomainProfileDraft = {
   business_formulas?: BusinessFormula[];
   commitment_markers?: CommitmentMarkers;
   coverage_dimensions?: CoverageDimension[];
+  threshold_overrides?: ProfileThresholds;
   methodology_generator_preamble?: string;
 };
 

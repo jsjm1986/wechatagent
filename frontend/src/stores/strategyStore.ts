@@ -312,6 +312,7 @@ export const useStrategyStore = create<StrategyState & StrategyActions>((set, ge
         business_formulas: profile.business_formulas,
         commitment_markers: profile.commitment_markers,
         coverage_dimensions: profile.coverage_dimensions,
+        threshold_overrides: profile.threshold_overrides ?? undefined,
         methodology_generator_preamble: profile.methodology_generator_preamble ?? undefined,
       }
     });

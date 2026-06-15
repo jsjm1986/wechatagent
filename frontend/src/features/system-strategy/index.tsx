@@ -1044,6 +1044,21 @@ function ProfileEditor({
 }) {
   const update = (patch: Partial<DomainProfileDraft>) => onChange({ ...draft, ...patch });
 
+  // 五闸阈值覆盖：改某个 camelCase 子字段。空串 → 删该 key；若改后整个对象再无任何
+  // 数值，则把 threshold_overrides 设为 undefined（= 不声明，DEFAULT 零扰动，不发空对象）。
+  const setThreshold = (key: keyof NonNullable<DomainProfileDraft["threshold_overrides"]>, raw: string) => {
+    const next: NonNullable<DomainProfileDraft["threshold_overrides"]> = {
+      ...(draft.threshold_overrides ?? {}),
+    };
+    if (raw.trim() === "") {
+      delete next[key];
+    } else {
+      next[key] = Number(raw);
+    }
+    const hasAny = Object.values(next).some((v) => v != null);
+    update({ threshold_overrides: hasAny ? next : undefined });
+  };
+
   return (
     <div className={styles.profileEditor}>
       <div className={styles.profileEditorHead}>
@@ -1230,6 +1245,71 @@ function ProfileEditor({
             rows={4}
           />
         </label>
+      </details>
+
+      <details className={styles.advanced}>
+        <summary>五闸阈值覆盖（可选）</summary>
+        <p className={styles.panelHint}>
+          留空 = 沿用该域默认（销售域 6/7/6/6/7）。仅调软/硬闸的触发分数线，不改闸的语义与
+          「AI 永不自断成交 / 永不自动 verify」结构红线。0-10 分制。
+        </p>
+        <div className={styles.formGrid}>
+          <label className={styles.field}>
+            <span>事实风险拦截线（≥ 拦截，默认 6）</span>
+            <input
+              className={styles.input}
+              type="number"
+              min={0}
+              max={10}
+              value={draft.threshold_overrides?.factRiskBlockAt ?? ""}
+              onChange={(e) => setThreshold("factRiskBlockAt", e.target.value)}
+            />
+          </label>
+          <label className={styles.field}>
+            <span>压迫感拦截线（≥ 拦截，默认 7）</span>
+            <input
+              className={styles.input}
+              type="number"
+              min={0}
+              max={10}
+              value={draft.threshold_overrides?.pressureRiskBlockAt ?? ""}
+              onChange={(e) => setThreshold("pressureRiskBlockAt", e.target.value)}
+            />
+          </label>
+          <label className={styles.field}>
+            <span>拟人度改写线（&lt; 改写一次，默认 6）</span>
+            <input
+              className={styles.input}
+              type="number"
+              min={0}
+              max={10}
+              value={draft.threshold_overrides?.humanLikeRewriteBelow ?? ""}
+              onChange={(e) => setThreshold("humanLikeRewriteBelow", e.target.value)}
+            />
+          </label>
+          <label className={styles.field}>
+            <span>情绪价值改写线（&lt; 改写一次，默认 6）</span>
+            <input
+              className={styles.input}
+              type="number"
+              min={0}
+              max={10}
+              value={draft.threshold_overrides?.emotionalValueRewriteBelow ?? ""}
+              onChange={(e) => setThreshold("emotionalValueRewriteBelow", e.target.value)}
+            />
+          </label>
+          <label className={styles.field}>
+            <span>产品准确度拦截线（&lt; 拦截产品声明，默认 7）</span>
+            <input
+              className={styles.input}
+              type="number"
+              min={0}
+              max={10}
+              value={draft.threshold_overrides?.productAccuracyBlockBelow ?? ""}
+              onChange={(e) => setThreshold("productAccuracyBlockBelow", e.target.value)}
+            />
+          </label>
+        </div>
       </details>
 
       <div className={styles.buttonRow}>
