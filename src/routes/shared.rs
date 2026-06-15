@@ -552,12 +552,39 @@ pub(super) async fn apply_contact_changes(
         set_doc.insert("tags", to_bson(&value)?);
     }
     if let Some(value) = doc_get_string(changes, "customerStage") {
+        // M1：admin 手填值经 taxonomy alias→canonical 归一，与 LLM 决策路径同口径，
+        // 杜绝同一字段 canonical/alias 漂移污染下游派生。
+        let value = agent::taxonomy::normalize_dimension_value(
+            &state.db,
+            "customer_stage",
+            &value,
+            &contact.account_id,
+        )
+        .await;
         // M2：customer_stage 实际变化时同步刷新 customer_stage_updated_at。
         let prev = contact_domain_str(contact, "customer_stage");
         let stage_changed = prev.as_deref().map(|s| s != value.as_str()).unwrap_or(true);
-        let intent = doc_get_string(changes, "intentLevel");
+        let intent = match doc_get_string(changes, "intentLevel") {
+            Some(v) => Some(
+                agent::taxonomy::normalize_dimension_value(
+                    &state.db,
+                    "intent_level",
+                    &v,
+                    &contact.account_id,
+                )
+                .await,
+            ),
+            None => None,
+        };
         insert_domain_stage_fields(&mut set_doc, Some(&value), intent.as_deref(), stage_changed);
     } else if let Some(value) = doc_get_string(changes, "intentLevel") {
+        let value = agent::taxonomy::normalize_dimension_value(
+            &state.db,
+            "intent_level",
+            &value,
+            &contact.account_id,
+        )
+        .await;
         insert_domain_stage_fields(&mut set_doc, None, Some(&value), false);
     }
     if let Some(value) = doc_get_string(changes, "followUpPolicy") {

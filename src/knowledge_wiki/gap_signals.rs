@@ -852,7 +852,12 @@ pub async fn refresh_usage_stats_and_confidence(
         } else {
             let review_cursor = db
                 .decision_reviews()
-                .find(doc! { "run_id": { "$in": &run_ids } }, None)
+                // IDOR 防御深度：run_id 虽全局唯一，仍按 workspace_id 收口（与项目
+                // "filter 必含 workspace_id"纪律一致）。run_id 索引提供选择性。
+                .find(
+                    doc! { "workspace_id": workspace_id, "run_id": { "$in": &run_ids } },
+                    None,
+                )
                 .await
                 .map_err(AppError::from)?;
             let reviews: Vec<crate::models::AgentDecisionReview> =
