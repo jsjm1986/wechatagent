@@ -684,6 +684,312 @@ function TaxonomiesAdmin({ busy }: { busy: boolean }) {
   );
 }
 
+interface TaxonomyCandidate {
+  id: string;
+  scope: string;
+  kind: string;
+  rawValue: string;
+  evidence: string | null;
+  confidence: number;
+  occurrences: number;
+  status: string;
+  firstSeenAt: string | null;
+  lastSeenAt: string | null;
+  reviewedAt: string | null;
+  reviewedBy: string | null;
+}
+
+interface ApproveDraft {
+  id: string;
+  label: string;
+  aliases: string;
+  description: string;
+}
+
+const CANDIDATE_STATUS_FILTERS = ["pending", "approved", "rejected", "all"] as const;
+type CandidateStatusFilter = (typeof CANDIDATE_STATUS_FILTERS)[number];
+
+const CANDIDATE_STATUS_LABEL: Record<CandidateStatusFilter, string> = {
+  pending: "待审核",
+  approved: "已采纳",
+  rejected: "已驳回",
+  all: "全部",
+};
+
+function candidateStatusBadgeClass(status: string): string {
+  if (status === "approved") return styles.badgeOk;
+  if (status === "rejected") return styles.badgeDegraded;
+  return styles.badgeWarn;
+}
+
+function TaxonomyCandidatesAdmin({ busy }: { busy: boolean }) {
+  const [items, setItems] = useState<TaxonomyCandidate[]>([]);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [info, setInfo] = useState<string | null>(null);
+  const [statusFilter, setStatusFilter] = useState<CandidateStatusFilter>("pending");
+  const [expandedId, setExpandedId] = useState<string | null>(null);
+  const [approveDraft, setApproveDraft] = useState<ApproveDraft>({
+    id: "",
+    label: "",
+    aliases: "",
+    description: "",
+  });
+  const [rejectingId, setRejectingId] = useState<string | null>(null);
+  const [rejectReason, setRejectReason] = useState("");
+  const [acting, setActing] = useState(false);
+
+  async function reload() {
+    setLoading(true);
+    setError(null);
+    try {
+      const data = await api.get<{ items: TaxonomyCandidate[] }>(
+        `/api/admin/taxonomy-candidates?status=${encodeURIComponent(statusFilter)}`
+      );
+      setItems(data.items ?? []);
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  useEffect(() => {
+    void reload();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [statusFilter]);
+
+  function openApprove(item: TaxonomyCandidate) {
+    setRejectingId(null);
+    setInfo(null);
+    setError(null);
+    setExpandedId(item.id);
+    setApproveDraft({
+      id: item.rawValue,
+      label: item.rawValue,
+      aliases: "",
+      description: item.evidence ?? "",
+    });
+  }
+
+  function openReject(item: TaxonomyCandidate) {
+    setExpandedId(null);
+    setInfo(null);
+    setError(null);
+    setRejectingId(item.id);
+    setRejectReason("");
+  }
+
+  async function submitApprove(candidateId: string) {
+    if (!approveDraft.id.trim() || !approveDraft.label.trim()) {
+      setError("canonical id 与显示名不能为空。");
+      return;
+    }
+    setActing(true);
+    setError(null);
+    setInfo(null);
+    try {
+      const aliases = approveDraft.aliases
+        .split(/[,，]/)
+        .map((a) => a.trim())
+        .filter((a) => a.length > 0);
+      const res = await api.postRaw<{ error?: string; message?: string }>(
+        `/api/admin/taxonomy-candidates/${candidateId}/approve`,
+        {
+          canonicalValue: {
+            id: approveDraft.id.trim(),
+            label: approveDraft.label.trim(),
+            aliases,
+            description: approveDraft.description.trim() || undefined,
+          },
+        }
+      );
+      if (res.status === 409) {
+        // 409 不是错误：该 canonical 已在字典里，候选已被标记采纳。
+        setInfo(res.data?.message ?? "该字典条目已存在，候选已标记采纳。");
+      } else if (!res.ok) {
+        setError(res.data?.message ?? res.data?.error ?? `HTTP ${res.status}`);
+        return;
+      } else {
+        setInfo(`已采纳：${approveDraft.id.trim()}`);
+      }
+      setExpandedId(null);
+      await reload();
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setActing(false);
+    }
+  }
+
+  async function submitReject(candidateId: string) {
+    if (!rejectReason.trim()) {
+      setError("驳回原因不能为空。");
+      return;
+    }
+    setActing(true);
+    setError(null);
+    setInfo(null);
+    try {
+      await api.post(`/api/admin/taxonomy-candidates/${candidateId}/reject`, {
+        reason: rejectReason.trim(),
+      });
+      setInfo("已驳回该候选。");
+      setRejectingId(null);
+      await reload();
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setActing(false);
+    }
+  }
+
+  return (
+    <section className={styles.panel}>
+      <div className={styles.panelHead}>
+        <div className={styles.panelHeadL}>
+          <span className={styles.eyebrow}>Taxonomy Candidates</span>
+          <span className={styles.title}>新词候选审核</span>
+        </div>
+        <div className={styles.buttonRow}>
+          {CANDIDATE_STATUS_FILTERS.map((s) => (
+            <button
+              key={s}
+              type="button"
+              className={`${styles.profileTab} ${statusFilter === s ? styles.profileTabActive : ""}`}
+              onClick={() => setStatusFilter(s)}
+            >
+              {CANDIDATE_STATUS_LABEL[s]}
+            </button>
+          ))}
+          <button type="button" className={styles.btnGhost} onClick={() => void reload()} disabled={busy || loading}>
+            刷新
+          </button>
+        </div>
+      </div>
+      <p className={styles.panelHint}>
+        AI 在对话中遇到字典外的新词会落为候选；采纳后并入 system_taxonomies 字典，驳回则不进字典。
+      </p>
+      {error && <div className={styles.inlineError}>{error}</div>}
+      {info && <div className={styles.badgeOk} style={{ display: "inline-block", marginBottom: 8 }}>{info}</div>}
+      {!loading && items.length === 0 && <Empty text="暂无候选" />}
+      <div className={styles.versionedList}>
+        {items.map((item) => (
+          <div key={item.id} className={styles.versionedListItem}>
+            <div className={styles.versionedListHead}>
+              <div>
+                <span className={styles.versionedListScope}>
+                  {item.scope} · {item.kind}
+                </span>
+                <h3>{item.rawValue}</h3>
+              </div>
+              <span className={candidateStatusBadgeClass(item.status)}>{item.status}</span>
+            </div>
+            <div className={styles.versionedListBody}>
+              <div className={styles.versionedListChunk}>
+                <span>confidence / 出现次数</span>
+                <p>
+                  {item.confidence} · {item.occurrences} 次
+                </p>
+              </div>
+              {item.evidence && (
+                <div className={styles.versionedListChunk}>
+                  <span>evidence</span>
+                  <p>{item.evidence}</p>
+                </div>
+              )}
+              {item.reviewedBy && (
+                <div className={styles.versionedListChunk}>
+                  <span>审核人</span>
+                  <p>{item.reviewedBy}</p>
+                </div>
+              )}
+            </div>
+
+            {item.status === "pending" && expandedId !== item.id && rejectingId !== item.id && (
+              <div className={styles.buttonRow}>
+                <button type="button" className={styles.btnPrimary} onClick={() => openApprove(item)} disabled={busy || acting}>
+                  采纳
+                </button>
+                <button type="button" className={styles.btnGhost} onClick={() => openReject(item)} disabled={busy || acting}>
+                  驳回
+                </button>
+              </div>
+            )}
+
+            {expandedId === item.id && (
+              <div className={styles.form} style={{ marginTop: 12 }}>
+                <label className={styles.field}>
+                  <span>canonical id（建议英文 slug，如 price_objection）</span>
+                  <input
+                    className={styles.input}
+                    value={approveDraft.id}
+                    onChange={(e) => setApproveDraft({ ...approveDraft, id: e.target.value })}
+                  />
+                </label>
+                <label className={styles.field}>
+                  <span>显示名</span>
+                  <input
+                    className={styles.input}
+                    value={approveDraft.label}
+                    onChange={(e) => setApproveDraft({ ...approveDraft, label: e.target.value })}
+                  />
+                </label>
+                <label className={styles.field}>
+                  <span>别名（逗号分隔，可空；rawValue 会自动并入）</span>
+                  <input
+                    className={styles.input}
+                    value={approveDraft.aliases}
+                    onChange={(e) => setApproveDraft({ ...approveDraft, aliases: e.target.value })}
+                  />
+                </label>
+                <label className={styles.field}>
+                  <span>描述（可空）</span>
+                  <textarea
+                    className={styles.textarea}
+                    value={approveDraft.description}
+                    onChange={(e) => setApproveDraft({ ...approveDraft, description: e.target.value })}
+                  />
+                </label>
+                <div className={styles.buttonRow}>
+                  <button type="button" className={styles.btnPrimary} onClick={() => void submitApprove(item.id)} disabled={acting}>
+                    确认采纳
+                  </button>
+                  <button type="button" className={styles.btnGhost} onClick={() => setExpandedId(null)} disabled={acting}>
+                    取消
+                  </button>
+                </div>
+              </div>
+            )}
+
+            {rejectingId === item.id && (
+              <div className={styles.form} style={{ marginTop: 12 }}>
+                <label className={styles.field}>
+                  <span>驳回原因</span>
+                  <input
+                    className={styles.input}
+                    value={rejectReason}
+                    placeholder="如：无业务相关性 / 与现有条目重复"
+                    onChange={(e) => setRejectReason(e.target.value)}
+                  />
+                </label>
+                <div className={styles.buttonRow}>
+                  <button type="button" className={styles.btnPrimary} onClick={() => void submitReject(item.id)} disabled={acting}>
+                    确认驳回
+                  </button>
+                  <button type="button" className={styles.btnGhost} onClick={() => setRejectingId(null)} disabled={acting}>
+                    取消
+                  </button>
+                </div>
+              </div>
+            )}
+          </div>
+        ))}
+      </div>
+    </section>
+  );
+}
+
 // ── DomainProfile 面板（行业配置向导）───────────────────────────────────────
 
 function ProfileStatusBadge({ profile }: { profile: DomainProfile }) {
@@ -1518,6 +1824,7 @@ export default function SystemStrategyFeature() {
 
       <StatePolicyAdmin busy={busy} />
       <TaxonomiesAdmin busy={busy} />
+      <TaxonomyCandidatesAdmin busy={busy} />
       <LessonsLearnedAdmin busy={busy} />
       <DomainProfilePanel busy={busy} />
     </div>
