@@ -581,6 +581,66 @@ pub fn decision_dimension_kinds(profile: &DomainProfile) -> Vec<String> {
         .collect()
 }
 
+/// universal-domain-adaptation G1：销售域两维 kind 集合（`customer_stage` /
+/// `intent_level`）——它们由 LLM 以 typed JSON 键（`customerStage`/`intentLevel`）
+/// 输出，prompt schema 已写死，**不**走 `domainSignals` 容器。其余「参与决策」维度
+/// （购买生命周期 / 关系亲密度 / 情绪状态等）才需要本模块的 prompt 指引告知 LLM 走
+/// `domainSignals` 容器输出。
+const SALES_TYPED_DIMENSION_KINDS: &[&str] = &["customer_stage", "intent_level"];
+
+/// G1：把 active profile 里**非销售 typed**的「参与决策」维度渲染成一段决策任务
+/// 指引，告知 Reply Agent 这些维度要写进 `domainSignals` 容器（而非 schema 里写死的
+/// 销售 typed 键）。
+///
+/// 与 H17 [`render_memory_candidate_types_guidance`] 同款门控——**只在存在非销售
+/// typed 维度时才追加**：
+/// - DEFAULT 销售域只有 `customer_stage` / `intent_level` 两维（均为 typed），过滤后
+///   为空 → 返回空串 → Reply Agent / 初始画像 prompt **字节不变、销售零扰动**；
+/// - 换非销售行业（陪伴域声明 `relationship_closeness`、本专题的 `purchase_lifecycle`
+///   等）时，本段告知 LLM 这些维度的合法语义与输出位置，让维度值能真正从 LLM 流到
+///   `AgentDecision.domain_signals`（否则 prompt 从不提 `domainSignals`，LLM 不会输出，
+///   维度永远空）。
+///
+/// `dimensions` 传 `profile.profile_dimensions`；只取 `participates_in_decision=true`
+/// 且 kind 不在销售 typed 集合里的维度。`description` 非空时一并注入语义提示。
+pub fn render_decision_dimensions_guidance(dimensions: &[ProfileDimension]) -> String {
+    let extra: Vec<&ProfileDimension> = dimensions
+        .iter()
+        .filter(|d| {
+            d.participates_in_decision
+                && !SALES_TYPED_DIMENSION_KINDS.contains(&d.kind.as_str())
+        })
+        .collect();
+    if extra.is_empty() {
+        return String::new();
+    }
+    let mut lines: Vec<String> = Vec::with_capacity(extra.len());
+    for d in &extra {
+        if d.description.trim().is_empty() {
+            lines.push(format!("- {}（{}）", d.kind, d.display_name));
+        } else {
+            lines.push(format!(
+                "- {}（{}）：{}",
+                d.kind,
+                d.display_name,
+                d.description.trim()
+            ));
+        }
+    }
+    format!(
+        "\n\n# 本行业参与决策的画像维度（写进 domainSignals 容器）\n\
+         除上面 schema 里的字段外，本行业还要在 JSON 顶层输出一个 \"domainSignals\" 对象，\
+         为下列每个维度给出当前取值（取值用简短词，能从对话或画像中解释）：\n{}\n\
+         示例：\"domainSignals\": {{ {} }}。维度取值无法判断时该键留空或省略，不要臆测。",
+        lines.join("\n"),
+        extra
+            .iter()
+            .map(|d| format!("\"{}\": \"...\"", d.kind))
+            .collect::<Vec<_>>()
+            .join(", ")
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -989,20 +1049,67 @@ mod tests {
     fn cache_miss_workspace_falls_back_to_default_verbatim() {
         // 缓存里有 ws-A 的真实 profile，但查 ws-B（未配置）→ 回落 default，
         // 与接缓存前 load_active_domain_profile 的 Ok(None) 分支逐字等价。
-        // 直接断言 get_or_load 复用的 lookup_or_default，避免测试内联逻辑漂移。
         let cache = DomainProfileCache::new();
         let mut seeded = default_domain_profile("ws-A");
         seeded.display_name = "行业A".to_string();
         seeded.profile_id = "profile-a".to_string();
         cache.seed_for_test(seeded);
 
-        // 未命中 workspace → 回落 default（profile_id=__default__，workspace 透传）。
         let fallback = cache.lookup_or_default("ws-B");
         assert_eq!(fallback.profile_id, DEFAULT_PROFILE_ID);
         assert_eq!(fallback.workspace_id, "ws-B");
-        // 命中 ws-A → 真实 profile（非 default）。
         let hit = cache.lookup_or_default("ws-A");
         assert_eq!(hit.profile_id, "profile-a");
         assert_eq!(hit.display_name, "行业A");
+    }
+
+    // ── G1：render_decision_dimensions_guidance 维度指引 ──
+
+    #[test]
+    fn decision_dimensions_guidance_empty_for_default_sales() {
+        // DEFAULT 销售域只有 customer_stage/intent_level（均为 typed）→ 过滤后空 →
+        // 空串、Reply Agent / 初始画像 prompt 字节不变、销售零扰动。
+        let p = default_domain_profile("ws-1");
+        assert_eq!(render_decision_dimensions_guidance(&p.profile_dimensions), "");
+        assert_eq!(render_decision_dimensions_guidance(&[]), "");
+    }
+
+    #[test]
+    fn decision_dimensions_guidance_lists_non_sales_dimensions() {
+        // 非销售「参与决策」维度 → 进指引 + 提示走 domainSignals 容器；
+        // participates_in_decision=false 的维度不进；销售 typed 两维即便在场也不进。
+        let dims = vec![
+            ProfileDimension {
+                kind: "customer_stage".to_string(),
+                display_name: "客户阶段".to_string(),
+                participates_in_decision: true,
+                description: String::new(),
+            },
+            ProfileDimension {
+                kind: "purchase_lifecycle".to_string(),
+                display_name: "购买生命周期".to_string(),
+                participates_in_decision: true,
+                description: "未购买/已购买/售后期/复购期。".to_string(),
+            },
+            ProfileDimension {
+                kind: "anniversaries".to_string(),
+                display_name: "纪念日".to_string(),
+                participates_in_decision: false,
+                description: String::new(),
+            },
+        ];
+        let out = render_decision_dimensions_guidance(&dims);
+        assert!(out.contains("domainSignals"), "应告知 LLM 走 domainSignals 容器");
+        assert!(out.contains("purchase_lifecycle"), "非销售参与决策维度进指引");
+        assert!(out.contains("购买生命周期"), "带 display_name");
+        assert!(out.contains("未购买/已购买"), "带 description 语义");
+        assert!(
+            !out.contains("customer_stage"),
+            "销售 typed 维度不进 domainSignals 指引（仍走 typed schema 键）"
+        );
+        assert!(
+            !out.contains("anniversaries"),
+            "participates_in_decision=false 的维度不进决策指引"
+        );
     }
 }

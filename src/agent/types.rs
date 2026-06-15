@@ -348,6 +348,13 @@ pub struct RawAgentDecision {
     pub tags: Option<Vec<String>>,
     pub customer_stage: Option<String>,
     pub intent_level: Option<String>,
+    /// universal-domain-adaptation G1：对维度名零假设的开放画像信号容器。非销售
+    /// 行业（陪伴/同行等）的「参与决策」维度（如 `purchase_lifecycle` /
+    /// `relationship_closeness`）由 LLM 写进这里。销售域 LLM 只输出 typed
+    /// `customerStage`/`intentLevel`，本字段缺省 → promote 后容器空、由
+    /// `normalize_domain_signals` 从 typed 镜像，行为与改造前逐字等价。
+    #[serde(default)]
+    pub domain_signals: Option<Document>,
     pub last_commitment: Option<String>,
     /// PR-D：结构化承诺（带可选 dueAt）。缺失时回落 last_commitment。
     pub commitment: Option<CommitmentDecision>,
@@ -860,6 +867,13 @@ fn carry_through_fields(raw: RawAgentDecision, decision: &mut AgentDecision) {
     }
     if raw.intent_level.is_some() {
         decision.intent_level = raw.intent_level;
+    }
+    if let Some(v) = raw.domain_signals {
+        // G1：非销售维度的开放容器从 LLM JSON `domainSignals` 透传。销售域 LLM
+        // 不输出该键 → None → 不触；典型行业由 normalize_domain_signals 再镜像 typed。
+        if !v.is_empty() {
+            decision.domain_signals = v;
+        }
     }
     if raw.last_commitment.is_some() {
         decision.last_commitment = raw.last_commitment;
