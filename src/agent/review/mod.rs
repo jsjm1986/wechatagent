@@ -273,8 +273,9 @@ Review 模式: {}
 - 转化平衡：既允许适度推进，也不能伤害信任。
 - 禁止虚假稀缺、恐惧营销、编造案例、编造价格、编造承诺。
 - humanLike 与 pressureRisk 是 **硬评分** 软闸（Phase B / B1）：humanLike 低于阈值
-  或 pressureRisk 高于等于阈值，会触发 single-shot revision；reviewer 必须给 0-100
-  的具体分数，并在 `needsRevision` / `revisionDirection` 里给出可执行的改写方向。
+  或 pressureRisk 高于等于阈值，会触发 single-shot revision；reviewer 必须给 0-10
+  的具体分数（与上面 scores 示例同档：humanLike/emotionalValue 越高越好、pressureRisk/factRisk
+  越高越危险），并在 `rewriteInstruction` 里给出可执行的改写方向。
 - 如果不像微信真人、太模板、太销售，要降低 humanLike 或提高 pressureRisk。
 - 如果没有基于产品知识却做了产品承诺，要提高 factRisk 和降低 productAccuracy。
 - 产品知识为空时，允许关系维护、测试消息和轻量澄清；但任何具体价格、案例、效果保证、产品能力承诺都必须视为事实风险。

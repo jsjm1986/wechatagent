@@ -995,9 +995,9 @@ pub struct ReviewScores {
     /// 反序列化兼容：reviewer prompt 历史上以 `productAccuracy` 命名该评分键。
     #[serde(default, deserialize_with = "number_i32", alias = "productAccuracy")]
     pub knowledge_grounding_score: i32,
-    /// Phase B / B1：恢复 `pressure_risk` 软闸评分（0-100）。Reviewer 输出，
-    /// `review_passed` 与 single-shot revision 通道判定时使用。R11 兼容：
-    /// 缺省 `0`，旧 review JSON 反序列化不破坏。
+    /// Phase B / B1：恢复 `pressure_risk` 软闸评分（0-10，越高压迫感越强）。Reviewer 输出，
+    /// `review_passed` 与 single-shot revision 通道判定时使用（与 `pressure_risk_block_at`
+    /// 等个位数阈值同档比较）。R11 兼容：缺省 `0`，旧 review JSON 反序列化不破坏。
     #[serde(default, deserialize_with = "number_i32")]
     pub pressure_risk: i32,
 }

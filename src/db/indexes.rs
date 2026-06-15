@@ -341,6 +341,17 @@ pub(super) async fn ensure_all(db: &Database) -> anyhow::Result<()> {
             None,
         )
         .await?;
+    // H11-linkage：回路① 成交追认 / outcome join 按 run_id 批量拉 decision_reviews
+    // （gap_signals::refresh_usage_stats_and_confidence 的 outcome_by_run）。无此索引
+    // 会全表扫高写入量的 decision_reviews。非 unique：不假设一 run 一 review。
+    db.decision_reviews()
+        .create_index(
+            IndexModel::builder()
+                .keys(doc! { "run_id": 1 })
+                .build(),
+            None,
+        )
+        .await?;
     db.agent_run_logs()
         .create_index(
             IndexModel::builder()

@@ -618,7 +618,21 @@ pub(super) async fn update_operation_profile(
 ) -> AppResult<Json<Value>> {
     let object_id = parse_object_id(&id)?;
     let current = find_contact_by_id(&state, &admin.current_workspace, &id).await?;
-    let new_stage = normalize_optional(payload.customer_stage);
+    // M1：admin 手填 stage/intent 经 taxonomy alias→canonical 归一（与 LLM 决策路径
+    // 同口径），杜绝同一字段 canonical/alias 漂移污染下游派生。归一在 stage_changed
+    // 判定之前，避免"admin 写 alias、库里是 canonical"被误判为变化。
+    let new_stage = match normalize_optional(payload.customer_stage) {
+        Some(v) => Some(
+            agent::taxonomy::normalize_dimension_value(
+                &state.db,
+                "customer_stage",
+                &v,
+                &current.account_id,
+            )
+            .await,
+        ),
+        None => None,
+    };
     let prev_stage = current
         .domain_attributes
         .as_ref()
@@ -636,7 +650,18 @@ pub(super) async fn update_operation_profile(
         "profile_updated_at": DateTime::now(),
         "updated_at": DateTime::now(),
     };
-    let intent_level = normalize_optional(payload.intent_level);
+    let intent_level = match normalize_optional(payload.intent_level) {
+        Some(v) => Some(
+            agent::taxonomy::normalize_dimension_value(
+                &state.db,
+                "intent_level",
+                &v,
+                &current.account_id,
+            )
+            .await,
+        ),
+        None => None,
+    };
     insert_domain_stage_fields(
         &mut set_doc,
         new_stage.as_deref(),
