@@ -13,6 +13,7 @@ import {
   ShieldCheck,
   Workflow,
   FileBox,
+  PackageSearch,
   type LucideIcon,
 } from "lucide-react";
 import type { Channel } from "../types";
@@ -28,6 +29,7 @@ const EvolutionFeature = lazy(() => import("../features/evolution"));
 const QualityFeature = lazy(() => import("../features/quality"));
 const LlmProvidersFeature = lazy(() => import("../features/llm-providers"));
 const KnowledgeFeature = lazy(() => import("../features/knowledge"));
+const ProductsDealsFeature = lazy(() => import("../features/products-deals"));
 
 export interface ChannelDef {
   id: Channel;
@@ -110,6 +112,17 @@ export const CHANNELS: ChannelDef[] = [
     title: "内容资产",
     subtitle: "维护产品资料、FAQ、话术、禁用表达、品牌语气和朋友圈素材。",
     Component: ContentAssetsFeature,
+  },
+  {
+    id: "productsDeals",
+    group: "运营",
+    label: "产品与成交",
+    caption: "Products & Deals",
+    icon: PackageSearch,
+    eyebrow: "Products & Deals",
+    title: "产品与成交",
+    subtitle: "维护产品目录与价格，登记核实成交，查看客户当前持有与售后状态。",
+    Component: ProductsDealsFeature,
   },
   {
     id: "knowledgeWiki",

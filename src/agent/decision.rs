@@ -8,7 +8,7 @@
 //! 所有 prompt 加载、上下文格式化、调用 LLM 都集中在这里；其它子模块
 //! 通过 `pub(crate)` 调用 `decide_reply` 复用同一份 prompt 渲染逻辑。
 
-use mongodb::bson::{doc, to_document, Document};
+use mongodb::bson::{doc, to_document, DateTime, Document};
 
 use crate::error::{AppError, AppResult};
 use crate::models::{
@@ -345,6 +345,24 @@ pub(crate) async fn decide_reply_with_promote(
     // 落入 `intent_trajectory_text == ""` 路径，向前兼容。
     let intent_trajectory_text =
         super::reaction::format_intent_trajectory_hint(&contact.intent_trajectory);
+    // 客观购买事实增强 G2/G4（2026-06-15 spec §5）：产品目录 + 当前持有投影。
+    // 一次加载、两处复用：① 产品目录段供 agent 报准确价（区别于知识 chunk 模糊描述）；
+    // ② G4 持有投影段让 agent 识别已购/售后期客户、切关怀而非拉新（破 H10「只写不读」诅咒）。
+    // IDOR：只取本 contact 所属 workspace 的 active 产品（§3.5 横切不变量）。
+    // 零扰动：产品表空（情感域/未配置）→ 两段皆空串，与改造前字节等价。
+    // best-effort：DB 故障 → 空，不阻塞决策（同 operator_memory / reaction_hint）。
+    let active_products =
+        super::entitlements::load_active_products(&state.db, &contact.workspace_id).await;
+    let product_catalog_text =
+        super::entitlements::format_product_catalog_for_prompt(&active_products);
+    let (entitlements, entitlements_total) = super::entitlements::project_entitlements(
+        &contact.outcome_events,
+        &active_products,
+        DateTime::now(),
+        super::entitlements::ENTITLEMENTS_PROMPT_CAP,
+    );
+    let entitlements_text =
+        super::entitlements::format_entitlements_hint(&entitlements, entitlements_total);
     // Phase A / A1：reaction_hint 段（最近 3 轮 reaction_analysis）。
     // 查 decision_reviews 同 (workspace, account, contact_wxid) 下 created_at 倒序
     // 前 3 条；任意 IO 错误回落空串（best-effort，不阻塞决策）。
@@ -410,6 +428,14 @@ pub(crate) async fn decide_reply_with_promote(
         super::domain_profile::render_memory_candidate_types_guidance(
             &active_profile.memory_dimensions
         )
+    );
+    // 客观购买事实 §5.5：疑似成交线索的 agent 侧落点。仅在本 workspace 有 active
+    // 产品时追加（同 product_catalog_text / entitlements_text 的隐式开关）——无产品域
+    // （情感陪伴）空串、task prompt 字节等价。指引 LLM 走弱信号通道（agentGeneratedSignals
+    // kind=suspected_deal）+ 主动求证话术，绝不直写 outcome_events（§2.1 红线）。
+    let task_template = format!(
+        "{task_template}{}",
+        super::entitlements::render_suspected_deal_guidance(&active_products)
     );
     // R-prompt-v3：Operator Instruction 层（最高优先级）。运营人员可在后台对
     // 单个联系人写一段 ≤ 1000 字的特别指令，覆盖 Soul + Policy 的默认人格判定
@@ -497,6 +523,12 @@ pub(crate) async fn decide_reply_with_promote(
 知识路由:
 {}
 
+产品目录（当前在售，报价以此为准）:
+{}
+
+客户当前持有（已核实成交派生，售后/续费判断依据）:
+{}
+
 意图轨迹:
 {}
 
@@ -543,6 +575,8 @@ pub(crate) async fn decide_reply_with_promote(
         serde_json::to_string(&deprecated_facts_recent).unwrap_or_default(),
         knowledge_text,
         knowledge_route_text,
+        product_catalog_text,
+        entitlements_text,
         intent_trajectory_text,
         reaction_hint_text,
         crate::agent::escalation::build_decision_signals_text(

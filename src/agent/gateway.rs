@@ -916,6 +916,16 @@ async fn run_user_operation_gateway_inner(
     // `final_decision.should_reply=false` 且 `final_decision.autonomy_mode="blocked"`，
     // 并产出待写 `agent_events`（由 [`persist_finalize_pending_events`] 持久化）。
     // 任何上游 `approved=true` SHALL NOT 绕过本调用（详见 design.md §4.5 / N3）。
+    // 客观购买事实增强 G2（spec §5.4）：R5.4 priced_from_catalog 并联背书。
+    // 加载本 workspace active 产品（IDOR：只取本 workspace），判定本轮 decision 报价
+    // 引用的 product_id 是否命中 active 目录 → 与 verified_chunks 取或，避免 G2 准确
+    // 报价被 blocked_unverified_product_claim 错杀。零扰动：产品表空 → 恒假。
+    let active_products =
+        super::entitlements::load_active_products(&state.db, &contact.workspace_id).await;
+    let priced_from_catalog = super::entitlements::priced_from_active_catalog(
+        &final_decision.quoted_product_ids,
+        &active_products,
+    );
     let outcome = finalize_review_for_send(
         review,
         &mut final_decision,
@@ -925,6 +935,7 @@ async fn run_user_operation_gateway_inner(
         promote_risks.clone(),
         inbound.content.as_str(),
         &active_profile.commitment_markers,
+        priced_from_catalog,
     );
     let FinalizeOutcome {
         review: finalized_review,
@@ -1189,6 +1200,13 @@ async fn run_user_operation_gateway_inner(
                     final_decision = revised_decision;
                     promote_risks = revised_promote_risks;
 
+                    // 改写后的 decision 可能换了 quoted_product_ids，重算 priced_from_catalog
+                    // （复用上面已加载的 active_products，同 run 同 workspace）。
+                    let second_priced_from_catalog =
+                        super::entitlements::priced_from_active_catalog(
+                            &final_decision.quoted_product_ids,
+                            &active_products,
+                        );
                     let second_outcome = finalize_review_for_send(
                         second_review,
                         &mut final_decision,
@@ -1198,6 +1216,7 @@ async fn run_user_operation_gateway_inner(
                         promote_risks.clone(),
                         inbound.content.as_str(),
                         &active_profile.commitment_markers,
+                        second_priced_from_catalog,
                     );
                     let FinalizeOutcome {
                         review: second_finalized_review,

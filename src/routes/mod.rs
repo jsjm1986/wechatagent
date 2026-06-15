@@ -46,6 +46,7 @@ mod observability;
 mod outcome_metrics;
 mod outcomes_autonomy;
 mod playbooks;
+mod products;
 mod prompt_templates;
 mod reviews;
 mod shared;
@@ -116,9 +117,10 @@ use assets::{create_content_asset, list_content_assets};
 use contacts::{
     analyze_contact_profile, add_deal_event, disable_agent, enable_agent, get_contact,
     get_contact_memory_card, get_operating_memory, get_operation_health, import_contacts_endpoint,
-    list_contact_memory_candidates, list_contacts, run_contact_memory_consolidation,
-    search_contacts_endpoint, search_import_contacts, update_operating_memory,
-    update_operation_profile, update_profile_note, update_custom_agent_instructions,
+    list_contact_memory_candidates, list_contacts, list_entitlements, list_outcome_events,
+    run_contact_memory_consolidation, search_contacts_endpoint, search_import_contacts,
+    update_operating_memory, update_operation_profile, update_profile_note,
+    update_custom_agent_instructions,
 };
 use conversations::list_messages;
 use domain_schemas::{
@@ -208,6 +210,9 @@ use prompt_templates::{
     create_prompt_template, list_prompt_templates, publish_prompt_template,
     reset_system_prompt_pack, update_prompt_template,
 };
+use products::{
+    archive_product, create_product, list_products, restore_product, update_product,
+};
 use reviews::{get_decision_review, list_decision_reviews};
 use simulations::{run_user_operation_evaluation, simulate_user_operation_dialogue};
 use souls::{create_agent_soul, list_agent_souls, publish_agent_soul, update_agent_soul};
@@ -286,6 +291,8 @@ pub fn api_router(state: AppState) -> Router<AppState> {
             put(update_operation_profile),
         )
         .route("/contacts/:id/deal-events", post(add_deal_event))
+        .route("/contacts/:id/outcome-events", get(list_outcome_events))
+        .route("/contacts/:id/entitlements", get(list_entitlements))
         .route(
             "/contacts/:id/analyze-profile",
             post(analyze_contact_profile),
@@ -649,6 +656,11 @@ pub fn api_router(state: AppState) -> Router<AppState> {
             "/operation-playbooks/:id/set-default",
             post(set_default_operation_playbook),
         )
+        // ── objective-purchase-facts G2：产品目录 CRUD ────────────────────────
+        .route("/products", get(list_products).post(create_product))
+        .route("/products/:product_id", put(update_product))
+        .route("/products/:product_id/archive", post(archive_product))
+        .route("/products/:product_id/restore", post(restore_product))
         .route(
             "/management-agent/sessions",
             post(create_management_session),
@@ -897,6 +909,7 @@ mod tests {
             include_str!("outcome_metrics.rs"),
             include_str!("outcomes_autonomy.rs"),
             include_str!("playbooks.rs"),
+            include_str!("products.rs"),
             include_str!("prompt_templates.rs"),
             include_str!("reviews.rs"),
             include_str!("shared.rs"),

@@ -518,6 +518,7 @@ pub fn finalize_review_for_send(
     promote_risks: Vec<String>,
     _inbound_text: &str,
     commitment_markers: &crate::models::CommitmentMarkers,
+    priced_from_catalog: bool,
 ) -> FinalizeOutcome {
     let mut review = review;
     let mut pending_events: Vec<PendingFinalizeEvent> = Vec::new();
@@ -612,6 +613,13 @@ pub fn finalize_review_for_send(
     // 仅当 reviewer 的 claim_analysis 显式声明 requiresProductKnowledge=true 时
     // 触发；此时若本 run 引用的知识切片里没有任何 verified chunk，强制 block。
     //
+    // 客观购买事实增强（2026-06-15 spec §5.4）：G2 active product 是「结构化 verified
+    // 背书」的并联来源——admin 在「产品与成交」频道显式录入的 product_id/价格/SKU，
+    // 可信度 ≥ 人工撰写的非结构化知识 chunk。故 `priced_from_catalog`（决策引用的
+    // product_id ∈ 本 workspace active products，由 gateway 算好传入）与 verified_chunks
+    // 取**或**：两者皆空才 block。零扰动：无产品行业产品表空 → priced_from_catalog 恒假
+    // → 行为与改造前字节等价（纯情感回复 requiresProductKnowledge 本就为假，不进此块）。
+    //
     // 注：2026-05-25 知识库清理删除了 chunk.safe_claims / ProductClaimMarkers，
     // 故 R5.7 safe_claims 反向门 / R5.3 claim_analysis 缺失 fail-closed 推断不在
     // 本次恢复范围；claim_analysis 缺失时按"非产品声明"放行（reviewer 软闸 +
@@ -621,7 +629,7 @@ pub fn finalize_review_for_send(
             &decision.used_knowledge_ids,
             knowledge_chunks,
         );
-        if verified_chunks.is_empty() {
+        if verified_chunks.is_empty() && !priced_from_catalog {
             review.approved = false;
             review.scores.hallucination_score = review.scores.hallucination_score.max(6);
             extend_risks_unique(
@@ -1529,6 +1537,7 @@ mod dual_gate_classification_tests {
             Vec::new(),
             "用户最新消息",
             &crate::models::CommitmentMarkers::default(),
+            false,
         );
         let FinalizeOutcome {
             review: finalized,
@@ -1563,6 +1572,7 @@ mod dual_gate_classification_tests {
             Vec::new(),
             "用户最新消息",
             &crate::models::CommitmentMarkers::default(),
+            false,
         );
         let FinalizeOutcome {
             review: finalized,
@@ -1605,6 +1615,7 @@ mod dual_gate_classification_tests {
             Vec::new(),
             "收到，谢谢",
             &crate::models::CommitmentMarkers::default(),
+            false,
         );
         assert_eq!(
             outcome.status,
@@ -1648,6 +1659,7 @@ mod dual_gate_classification_tests {
             Vec::new(),
             "用户最新消息",
             &crate::models::CommitmentMarkers::default(),
+            false,
         );
         match outcome.status {
             GatewayStatusFinal::Held(category) => {
@@ -1681,6 +1693,7 @@ mod dual_gate_classification_tests {
             Vec::new(),
             "用户最新消息",
             &crate::models::CommitmentMarkers::default(),
+            false,
         );
         let FinalizeOutcome {
             review: finalized,
@@ -1713,6 +1726,7 @@ mod dual_gate_classification_tests {
             Vec::new(),
             "用户最新消息",
             &crate::models::CommitmentMarkers::default(),
+            false,
         );
         let FinalizeOutcome {
             review: finalized,
@@ -1792,6 +1806,7 @@ mod dual_gate_classification_tests {
             Vec::new(),
             "我们的产品一定能帮您",
             &crate::models::CommitmentMarkers::default(),
+            false,
         );
         assert_eq!(
             outcome.status,
@@ -1809,6 +1824,35 @@ mod dual_gate_classification_tests {
             .pending_events
             .iter()
             .any(|e| e.kind == "product_claim_blocked"));
+    }
+
+    #[test]
+    fn finalize_allows_product_claim_when_priced_from_catalog() {
+        // R5.4 G2 并联背书：无 verified chunk，但报价命中 active 产品目录
+        // （priced_from_catalog=true）→ 结构化报价视为已背书，不触发红线。
+        let runtime = UserRuntimeParameters::default();
+        let mut review = full_pass_review();
+        review.claim_analysis = mongodb::bson::doc! { "requiresProductKnowledge": true };
+        let mut decision = shouldreply_decision();
+        // 没引用任何 verified chunk（used_knowledge_ids 空 / 无 verified）
+        let contact = finalize_contact();
+        let outcome = finalize_review_for_send(
+            review,
+            &mut decision,
+            &runtime,
+            &contact,
+            &[],
+            Vec::new(),
+            "这款年度会员是 199 元",
+            &crate::models::CommitmentMarkers::default(),
+            true, // priced_from_catalog：报价 product_id 命中 active 产品目录
+        );
+        assert_eq!(
+            outcome.status,
+            GatewayStatusFinal::Approved,
+            "目录报价背书应放行，不被 blocked_unverified_product_claim 错杀"
+        );
+        assert!(outcome.review.approved);
     }
 
     #[test]
@@ -1830,6 +1874,7 @@ mod dual_gate_classification_tests {
             Vec::new(),
             "用户最新消息",
             &crate::models::CommitmentMarkers::default(),
+            false,
         );
         assert_eq!(outcome.status, GatewayStatusFinal::Approved);
         assert!(outcome.review.approved);
@@ -1852,6 +1897,7 @@ mod dual_gate_classification_tests {
             Vec::new(),
             "今天天气不错",
             &crate::models::CommitmentMarkers::default(),
+            false,
         );
         assert_eq!(outcome.status, GatewayStatusFinal::Approved);
         assert!(outcome.review.approved);
@@ -1879,6 +1925,7 @@ mod dual_gate_classification_tests {
             Vec::new(),
             "你们能解决我的问题吗",
             &crate::models::CommitmentMarkers::default(),
+            false,
         );
         // 零拦截：判定不变。
         assert_eq!(outcome.status, GatewayStatusFinal::Approved);
@@ -1910,6 +1957,7 @@ mod dual_gate_classification_tests {
             Vec::new(),
             "你们能解决我的问题吗",
             &crate::models::CommitmentMarkers::default(),
+            false,
         );
         // R5.4 硬闸生效。
         assert_eq!(
@@ -1941,6 +1989,7 @@ mod dual_gate_classification_tests {
             Vec::new(),
             "你们能解决我的问题吗",
             &crate::models::CommitmentMarkers::default(),
+            false,
         );
         assert_eq!(outcome.status, GatewayStatusFinal::Approved);
         assert!(!outcome
@@ -1969,6 +2018,7 @@ mod dual_gate_classification_tests {
             Vec::new(),
             "你们能保证回款吗",
             &crate::models::CommitmentMarkers::default(),
+            false,
         );
         // 新行为：仅观测，回复放行
         assert_eq!(outcome.status, GatewayStatusFinal::Approved);
@@ -2002,6 +2052,7 @@ mod dual_gate_classification_tests {
             Vec::new(),
             "你会上心吗",
             &crate::models::CommitmentMarkers::default(),
+            false,
         );
         assert_eq!(outcome.status, GatewayStatusFinal::Approved);
         assert!(outcome.review.approved);
@@ -2036,6 +2087,7 @@ mod dual_gate_classification_tests {
             Vec::new(),
             "成功率怎么样",
             &crate::models::CommitmentMarkers::default(),
+            false,
         );
         assert_eq!(outcome.status, GatewayStatusFinal::Approved);
         assert!(decision.should_reply);
@@ -2069,6 +2121,7 @@ mod dual_gate_classification_tests {
             promote_risks,
             "用户最新消息",
             &crate::models::CommitmentMarkers::default(),
+            false,
         );
         let FinalizeOutcome {
             review: finalized,
@@ -2115,6 +2168,7 @@ mod dual_gate_classification_tests {
             promote_risks,
             "用户最新消息",
             &crate::models::CommitmentMarkers::default(),
+            false,
         );
         let FinalizeOutcome {
             review: finalized,
@@ -2147,6 +2201,7 @@ mod dual_gate_classification_tests {
             promote_risks,
             "用户最新消息",
             &crate::models::CommitmentMarkers::default(),
+            false,
         );
         assert_eq!(
             outcome.status,
@@ -2176,6 +2231,7 @@ mod dual_gate_classification_tests {
             promote_risks,
             "用户最新消息",
             &crate::models::CommitmentMarkers::default(),
+            false,
         );
         assert_eq!(
             outcome.status,

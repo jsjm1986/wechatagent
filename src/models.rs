@@ -248,6 +248,106 @@ pub struct OutcomeEvent {
     /// 备注（可选）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
+
+    // ── 客观购买事实增强 G3（2026-06-15 spec）新增 ──
+    /// 成交真相源可信度：`conversation_inferred` | `staff_confirmed` | `payment_verified`。
+    /// 缺省 `staff_confirmed`：历史 outcome_events 全是 admin 手动登记的高可信成交，
+    /// 缺字段即视为已核实。新写入的 `conversation_inferred` 必须显式标注，绝不依赖缺省。
+    /// `#[serde(default)]` 只作用于反序列化；Rust 字面量构造点须显式补此字段。
+    #[serde(default = "default_outcome_verification")]
+    pub verification: String,
+    /// 关联产品的**订单式快照**（成交当时拷贝 product 名/价/sku），而非活引用——
+    /// product 后续改名/下架不污染历史成交正确性。`None` = 无产品语义的成交或旧记录。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub product_ref: Option<OutcomeProductRef>,
+
+    // ── 退款/逆转 §4.5（2026-06-15 spec）新增 ──
+    /// 事件方向：`deal`（正向成交，缺省）| `reversal`（退款/撤单）。
+    /// 逆转**不删原 deal**（审计完整性红线，§4.5），而是 append 一条带 `product_ref` 的
+    /// 反向事件；G4 投影按 `product_id` 抵消件数（净件数 ≤ 0 → 不再持有，退出投影）。
+    /// `amount` 在 reversal 下表示**退款金额的正向量级**（方向由 `event_kind` 承载，
+    /// 故 amount 仍走非负校验）。缺字段 → `deal`：旧记录全是正向成交，语义零变。
+    #[serde(default = "default_outcome_kind")]
+    pub event_kind: String,
+}
+
+fn default_outcome_kind() -> String {
+    "deal".to_string()
+}
+
+fn default_outcome_verification() -> String {
+    "staff_confirmed".to_string()
+}
+
+/// 客观购买事实增强 G3：成交事件上的产品快照（不是活引用）。
+///
+/// 嵌入 [`OutcomeEvent`]（camelCase）的子文档、无独立索引，故保留 `camelCase` 与容器
+/// 一致即可——G4 投影是运行时对反序列化后的 outcome_events 做内存 fold，不按裸 key 查 Mongo。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct OutcomeProductRef {
+    /// 软引用 [`Product::product_id`]；product 被删也保留，仅无法再解引用到活实体。
+    pub product_id: String,
+    /// 成交当时的产品名快照。
+    pub name: String,
+    /// 成交当时单价快照（与 `OutcomeEvent.amount` 可不等：折扣/多件）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unit_price: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sku: Option<String>,
+    /// 件数（默认 1）。
+    #[serde(default = "default_quantity")]
+    pub quantity: u32,
+}
+
+fn default_quantity() -> u32 {
+    1
+}
+
+/// 客观购买事实增强 G2：workspace 级产品目录实体（2026-06-15 spec §3）。
+///
+/// admin 录入，agent 报价从此读结构化价格，不再靠知识 chunk 的非结构化描述。
+/// [`OutcomeEvent::product_ref`] 以快照方式引用本表，故 product 改名/下架不污染历史成交。
+///
+/// 通用化：无产品概念的行业（情感陪伴/朋友陪伴）该 workspace 产品表为空 →
+/// 决策层零注入、零扰动（同 H17 memory_dimensions 空集套路）。
+///
+/// 命名约定：**不加 `#[serde(rename_all="camelCase")]`**——存储键须与索引
+/// （`workspace_id` / `product_id` / `status`，见 `db/indexes.rs`）逐字一致；
+/// camelCase 会让索引建在不存在的字段上。沿用 [`BehaviorSignal`] 的纯 snake_case 约定。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Product {
+    #[serde(rename = "_id", skip_serializing_if = "Option::is_none")]
+    pub id: Option<ObjectId>,
+    pub workspace_id: String,
+    /// 业务可读稳定标识（workspace 内唯一，admin 录入或自动生成）。
+    /// [`OutcomeProductRef::product_id`] 软引用此值。
+    pub product_id: String,
+    pub name: String,
+    /// 单价（可选——定制报价等无固定单价的行业可留空）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub price: Option<f64>,
+    /// 币种（ISO-4217 短码，如 `CNY`）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub currency: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sku: Option<String>,
+    /// `active` / `archived`。archived 不再进 agent 可报价集合，但历史成交仍可解引用。
+    #[serde(default = "default_product_status")]
+    pub status: String,
+    /// 简短描述（agent 报价时可引用；区别于知识库长文 chunk）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+    /// 行业可变字段容器（规格/疗程数/有效期天数/续费周期…）。
+    /// G4 售后期/有效期投影规则可读此处的 `entitlement_days` 等键。
+    #[serde(default)]
+    pub attributes: Document,
+    pub created_at: DateTime,
+    pub updated_at: DateTime,
+}
+
+fn default_product_status() -> String {
+    "active".to_string()
 }
 
 /// 自学习采集管道 S1–S3：行为信号（append-only 事件日志）。
@@ -4761,5 +4861,92 @@ mod principal_escalation_model_tests {
         let req: EscalationRequest =
             serde_json::from_str("{}").expect("empty object should deserialize");
         assert!(!req.needed);
+    }
+}
+
+#[cfg(test)]
+mod objective_purchase_facts_model_tests {
+    use super::*;
+
+    /// 向后兼容红线：旧库 outcome_events 文档没有 `verification` / `productRef` 两键，
+    /// 反序列化必须填缺省（verification=staff_confirmed，product_ref=None），
+    /// 不得报 missing field。历史成交全是 admin 手动登记的高可信记录。
+    #[test]
+    fn outcome_event_legacy_doc_without_g3_fields_defaults_to_staff_confirmed() {
+        let legacy = r#"{
+            "markedAt": {"$date": {"$numberLong": "1700000000000"}},
+            "amount": 199.0,
+            "currency": "CNY",
+            "source": "manual",
+            "markedBy": "admin",
+            "note": "首单"
+        }"#;
+        let ev: OutcomeEvent = serde_json::from_str(legacy).expect("legacy doc should deserialize");
+        assert_eq!(ev.verification, "staff_confirmed");
+        assert!(ev.product_ref.is_none());
+        // §4.5：旧文档无 event_kind → 缺省 deal（正向成交），退款逆转语义不影响存量。
+        assert_eq!(ev.event_kind, "deal");
+    }
+
+    /// §4.5：reversal 退款事件按显式值读出，缺省 deal 不得覆盖。
+    #[test]
+    fn outcome_event_reversal_kind_is_preserved() {
+        let doc = r#"{
+            "markedAt": {"$date": {"$numberLong": "1700000000000"}},
+            "source": "manual",
+            "markedBy": "admin",
+            "eventKind": "reversal",
+            "productRef": {"productId": "sku-1", "name": "年度会员", "quantity": 1}
+        }"#;
+        let ev: OutcomeEvent = serde_json::from_str(doc).expect("should deserialize");
+        assert_eq!(ev.event_kind, "reversal");
+    }
+
+    /// 新写入的 `conversation_inferred`（AI 推断的低可信成交）必须按显式值读出，
+    /// 绝不被缺省覆盖——成交真相源分级是「AI 永不自断成交」红线的载体。
+    #[test]
+    fn outcome_event_explicit_verification_is_preserved() {
+        let doc = r#"{
+            "markedAt": {"$date": {"$numberLong": "1700000000000"}},
+            "source": "manual",
+            "markedBy": "agent",
+            "verification": "conversation_inferred"
+        }"#;
+        let ev: OutcomeEvent = serde_json::from_str(doc).expect("should deserialize");
+        assert_eq!(ev.verification, "conversation_inferred");
+    }
+
+    /// product_ref 快照子文档：`quantity` 缺省为 1（与默认下单件数一致）。
+    #[test]
+    fn outcome_product_ref_quantity_defaults_to_one() {
+        let doc = r#"{"productId": "sku-1", "name": "年度会员"}"#;
+        let pr: OutcomeProductRef = serde_json::from_str(doc).expect("should deserialize");
+        assert_eq!(pr.quantity, 1);
+        assert!(pr.unit_price.is_none());
+    }
+
+    /// Product 是纯 snake_case（无 camelCase rename）——存储键须与 db/indexes.rs
+    /// 的索引字段逐字一致。锁死序列化键名防回归（camelCase 会让索引建在空字段上）。
+    #[test]
+    fn product_serializes_with_snake_case_keys() {
+        let p = Product {
+            id: None,
+            workspace_id: "ws1".to_string(),
+            product_id: "sku-1".to_string(),
+            name: "年度会员".to_string(),
+            price: Some(199.0),
+            currency: Some("CNY".to_string()),
+            sku: None,
+            status: "active".to_string(),
+            summary: None,
+            attributes: Document::new(),
+            created_at: DateTime::now(),
+            updated_at: DateTime::now(),
+        };
+        let json = serde_json::to_value(&p).expect("serialize");
+        assert!(json.get("workspace_id").is_some());
+        assert!(json.get("product_id").is_some());
+        assert!(json.get("workspaceId").is_none());
+        assert!(json.get("productId").is_none());
     }
 }
