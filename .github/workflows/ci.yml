@@ -160,12 +160,10 @@ jobs:
     name: Real-LLM smoke (真实大模型 / MCP 桩)
     runs-on: ubuntu-latest
     if: ${{ github.event_name != 'workflow_dispatch' }}
-    # 并发治理：与 recall/ops/quality/adversarial 共用同一 concurrency group `rsxermu-real-llm`
-    # → 全局任意时刻仅 1 个 real-llm job 跑 → 守 rsxermu 并发上限 2（详见 real-llm-recall 注释）。
-    concurrency:
-      group: rsxermu-real-llm
-      cancel-in-progress: false
-    # 用**真实大模型**（MiMo mimo-v2.5 / OpenAI 兼容端点）跑 T1 文本决策+审查 / T2 知识
+    # 并发治理：作为 5 个 real-llm group 串行链的链头（smoke→recall→ops→quality→adversarial，
+    # 各组 max-parallel:1）→ 全局任意时刻仅 1 matrix 实例打 rsxermu → 守并发上限 2。
+    # （GitHub job-level concurrency group 不能串行化同 run 内 matrix，会 cancel 而非排队，故用 needs 链。）
+    # 用**真实大模型**（rsxermu claude-opus-4-8 / gpt-5.4）跑 T1 文本决策+审查 / T2 知识
     # tool-loop / T3 多模态 vision 抽取，验证 mock 测不到的真实 schema/闸门/收敛。
     # MCP 永远是 wiremock 桩（绝不真发微信）。real-LLM 限流/抖动不该阻塞合并，
     # 故 continue-on-error；conclusion 恒 success，必看 job 日志拿真实绿/红。
@@ -290,13 +288,11 @@ jobs:
     # 各 group 内 max-parallel:1 → 全局任意时刻仅 1 runner 打 NVIDIA，根治跨 group 429 风暴。
     # continue-on-error:true 使 conclusion 恒 success，needs 链不会因前置假失败中断。
     # 并发治理（2026-06-16 迁 rsxermu 后）：rsxermu666.cn 允许并发 2，但单个 real-llm job 内部
-    # judge panel 已可能瞬时打 2 路（judge1 + judge4 各 1）。故 5 个 real-llm job 共用同一
-    # concurrency group `rsxermu-real-llm` → 全局任意时刻仅 1 job 跑、该 job 内并发 ≤2 → 全局 ≤2。
-    # 取代原 needs 串行链（那是为防 NVIDIA 429 设的，rsxermu 不限流只敏感并发）。
-    # cancel-in-progress:false → 排队不取消（保住已起跑的 job 拿真分）。
-    concurrency:
-      group: rsxermu-real-llm
-      cancel-in-progress: false
+    # judge panel 已可能瞬时打 2 路。GitHub job-level concurrency group 不能串行化同一 run 内的
+    # matrix/jobs（同 group 并行成员会被 cancel 而非排队），故仍用 needs 链把 5 个 group 串行化
+    # （smoke→recall→ops→quality→adversarial）+ 各组 max-parallel:1 → 全局任意时刻仅 1 matrix 实例
+    # 在跑 → 守 rsxermu 并发上限 2。continue-on-error:true 使 conclusion 恒 success，needs 链不中断。
+    needs: real-llm
     continue-on-error: true
     timeout-minutes: 90
     strategy:
@@ -376,10 +372,8 @@ jobs:
     name: Real-LLM ops smoke (${{ matrix.t }} / MCP 桩)
     runs-on: ubuntu-latest
     if: ${{ github.event_name != 'workflow_dispatch' }}
-    # 共用 concurrency group `rsxermu-real-llm` 守 rsxermu 并发 ≤2（取代原 needs 串行链）。
-    concurrency:
-      group: rsxermu-real-llm
-      cancel-in-progress: false
+    # 串行链第 3 环（见 real-llm-recall 注释：跨 group 串行守 rsxermu 并发 2）。
+    needs: real-llm-recall
     continue-on-error: true
     timeout-minutes: 90
     strategy:
@@ -525,10 +519,8 @@ jobs:
     name: Real-LLM knowledge quality (${{ matrix.q }} 双裁判 / MCP 桩)
     runs-on: ubuntu-latest
     if: ${{ github.event_name != 'workflow_dispatch' }}
-    # 共用 concurrency group `rsxermu-real-llm` 守 rsxermu 并发 ≤2（取代原 needs 串行链）。
-    concurrency:
-      group: rsxermu-real-llm
-      cancel-in-progress: false
+    # 串行链第 4 环（见 real-llm-recall 注释：跨 group 串行守 rsxermu 并发 2）。
+    needs: real-llm-ops
     continue-on-error: true
     timeout-minutes: 90
     strategy:
@@ -632,10 +624,8 @@ jobs:
     name: Real-LLM adversarial (${{ matrix.arc }})
     runs-on: ubuntu-latest
     if: ${{ github.event_name != 'workflow_dispatch' }}
-    # 共用 concurrency group `rsxermu-real-llm` 守 rsxermu 并发 ≤2（取代原 needs 串行链）。
-    concurrency:
-      group: rsxermu-real-llm
-      cancel-in-progress: false
+    # 串行链末环（见 real-llm-recall 注释：跨 group 串行守 rsxermu 并发 2）。
+    needs: real-llm-quality
     continue-on-error: true
     # 每弧独享墙。t_judge_calibration 是仪器最重的一片——20 金标 × 4 裁判 × K=3 = 240 次真模型调用，
     # Round 9 硬日志实测 ~208s/金标 × 20 ≈ 70min（GLM 单调 ~17s × K=3 同端点串行 + 偶发 json_decode
