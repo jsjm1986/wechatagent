@@ -367,9 +367,20 @@ pub fn render_business_formulas_json_example(formulas: &[BusinessFormula]) -> St
 /// （排除 5 个硬闸键），渲染成 scores 块中段的若干行（每行 `"key": 6,`，带行尾换行）。
 /// DEFAULT_PROFILE 的四公式 eval_score_key = [humanLike, conversionReadiness,
 /// emotionalValue, relationshipProgress]，排除硬闸后 → conversionReadiness +
-/// relationshipProgress 两行（与改造前两行**语义等价**：键集相同、值同为 6、均被丢弃；
-/// 沿用 H15 既有"render 后语义等价、非逐字节"标准）。非销售 profile 未声明这些
-/// eval_score_key → 返回空串，scores 块只剩 5 个硬闸维度。
+/// relationshipProgress 两行。非销售 profile 未声明这些 eval_score_key → 返回空串，
+/// scores 块只剩 5 个硬闸维度。
+///
+/// **字节等价豁免点（2026-06-16 审查 D2-1 复核批准，非疏漏）**：改造前 prompt 这两行
+/// 手写顺序是 `relationshipProgress` 在前、`conversionReadiness` 在后；本函数按
+/// `default_business_formulas` 声明序产出，得 `conversionReadiness` 在前、
+/// `relationshipProgress` 在后——**两行换序**，故 DEFAULT 销售域 reviewer prompt
+/// 并非逐字节等于改造前。判定**可接受**：①这两键不在 [`crate::agent::types::ReviewScores`]、
+/// 反序列化即被 serde 丢弃（已由 types.rs `legacy_review_json` 等测试旁证无消费方）；
+/// ②两行值同为 6；③不修是因为「改 default_business_formulas 声明序」会破坏更大的字节锁
+/// （`render_self_check_default_matches_policy_prose_verbatim` 锁的 policy 自检段 +
+/// `render_json_example_default_shape` 锁的 formulaBreakdown，二者依赖现声明序对齐原
+/// policy 英文式），「render 内对销售键特排」又会往通用化函数塞销售特例。两害取轻，
+/// 登记为「render 后语义等价、非逐字节」豁免（沿用 H15 既有标准）。
 pub fn render_reviewer_extra_score_lines(formulas: &[BusinessFormula]) -> String {
     const HARD_GATES: [&str; 5] = [
         "humanLike",
@@ -1144,7 +1155,12 @@ mod tests {
     fn reviewer_extra_score_lines_default_yields_two_sales_dims() {
         // 第 19 点：DEFAULT 四公式 eval_score_key=[humanLike, conversionReadiness,
         // emotionalValue, relationshipProgress]，排除 5 硬闸后 → 仅 conversionReadiness
-        // + relationshipProgress 两行（语义等价旧写死的两行销售软维度，值同为 6）。
+        // + relationshipProgress 两行（值同为 6）。
+        // 注意：此顺序（conversionReadiness 在前）与改造前 prompt 手写顺序
+        // （relationshipProgress 在前）相反——这是 D2-1 审查批准的字节等价豁免点
+        // （详见 render_reviewer_extra_score_lines 文档注释），**不是回归**。本断言锁死
+        // 当前顺序，防止豁免点进一步漂移；若未来要恢复原序，须连带评估 policy 自检段/
+        // formulaBreakdown 的字节锁。
         let rendered = render_reviewer_extra_score_lines(&default_business_formulas());
         let lines: Vec<&str> = rendered.lines().collect();
         assert_eq!(lines.len(), 2);
