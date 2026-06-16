@@ -19,6 +19,8 @@ export interface ReviewChatChunk {
   distortionRisks?: string[] | null;
   lockedFields?: string[] | null;
   usageStats?: { hitCount30d?: number; blockedCount30d?: number } | null;
+  confidenceScore?: number | null;
+  dynamicConfidence?: number | null;
   validFrom?: string | null;
   validTo?: string | null;
 }
@@ -63,10 +65,12 @@ export function ReviewChat({ chunk, onResolved }: ReviewChatProps) {
   const usage = chunk.usageStats;
   const hasUsage =
     !!usage && (usage.hitCount30d != null || usage.blockedCount30d != null);
+  const hasConfidence =
+    chunk.dynamicConfidence != null || chunk.confidenceScore != null;
   const risks = (chunk.distortionRisks ?? []).filter((r) => !!r?.trim());
   const locks = (chunk.lockedFields ?? []).filter((f) => !!f?.trim());
   const hasValidity = !!chunk.validFrom || !!chunk.validTo;
-  const hasMore = hasUsage || risks.length > 0 || locks.length > 0 || hasValidity;
+  const hasMore = hasUsage || hasConfidence || risks.length > 0 || locks.length > 0 || hasValidity;
 
   const hasQuote = !!chunk.sourceQuote?.trim();
   const hasAnchor = (chunk.sourceAnchors?.length ?? 0) > 0;
@@ -223,6 +227,18 @@ export function ReviewChat({ chunk, onResolved }: ReviewChatProps) {
                 <p className={styles.moreText}>
                   AI 用了 {usage?.hitCount30d ?? 0} 次,被安全闸拦下{" "}
                   {usage?.blockedCount30d ?? 0} 次
+                </p>
+              </div>
+            )}
+
+            {hasConfidence && (
+              <div className={styles.moreItem}>
+                <span className={styles.blockLabel}>召回置信度</span>
+                <p className={styles.moreText}>
+                  {chunk.dynamicConfidence != null
+                    ? `动态置信度 ${Math.round(chunk.dynamicConfidence * 100)}%`
+                    : "动态置信度 —"}
+                  {chunk.confidenceScore != null ? ` · 基线 ${chunk.confidenceScore}/10` : ""}
                 </p>
               </div>
             )}

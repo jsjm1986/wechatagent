@@ -1434,6 +1434,26 @@ async fn ensure_evolution_indexes(db: &Database) -> anyhow::Result<()> {
         )
         .await?;
 
+    // ── D（自学习可观测）deal_attribution_stats ───────────────────────────
+    // 同 reviewer_stats：feedback_worker 每 workspace 一行滚动统计，upsert 落点按
+    // stat_id (`<workspace_id>::deal_attribution`) 定位，存最近一轮 30d 窗口成交追认
+    // 强化的命中数（H11-linkage 效果观测）。
+    db.raw()
+        .collection::<mongodb::bson::Document>("deal_attribution_stats")
+        .create_index(
+            IndexModel::builder()
+                .keys(doc! { "stat_id": 1 })
+                .options(
+                    IndexOptions::builder()
+                        .name("deal_attribution_stats_stat_id_unique".to_string())
+                        .unique(true)
+                        .build(),
+                )
+                .build(),
+            None,
+        )
+        .await?;
+
     // ── Phase G / P2 lessons_learned ──────────────────────────────────────
     // lessons_learned 经 raw collection 读写（无 typed accessor）；list 查询按
     // {workspace_id} 过滤 + {updated_at:-1} 排序（lessons_learned.rs:60,76），
