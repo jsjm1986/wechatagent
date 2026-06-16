@@ -463,14 +463,23 @@ impl LlmClient {
         system: &str,
         user: &str,
     ) -> AppResult<(LlmJsonResult, Option<u64>)> {
+        // assistant prefill 内容：预填 `{` 强制 claude 从合法 JSON 开头续写。
+        const ANTHROPIC_JSON_PREFILL: &str = "{";
         let started_at = Instant::now();
+        // claude（尤其 opus 经中转）倾向先输出自然语言推理再给 JSON，复杂 prompt 下常只回
+        // 推理散文、JSON 缺失或被 max_tokens 截断（rsxermu CI 实测 domain_profile/knowledge
+        // 大面积 json_decode）。用 Anthropic 官方 **assistant prefill** 技巧：预填 assistant
+        // turn 为 `{`，强制 claude 从 `{` 续写合法 JSON、不再写"我需要先 open_chunk…"。
+        // 响应不含 prefill 的 `{`，故解析时补回（见下方 ANTHROPIC_JSON_PREFILL 拼接）。
+        // max_tokens 提到 8192 给结构化输出留足空间。
         let body = json!({
             "model": self.model,
-            "max_tokens": 4096,
+            "max_tokens": 8192,
             "temperature": 0.2,
             "system": system,
             "messages": [
-                {"role": "user", "content": user}
+                {"role": "user", "content": user},
+                {"role": "assistant", "content": ANTHROPIC_JSON_PREFILL}
             ]
         });
 
@@ -535,12 +544,23 @@ impl LlmClient {
             })
             .unwrap_or_default();
         let cleaned = strip_reasoning_prefix(content);
-        let value = match parse_json_content(&cleaned) {
+        // 补回 prefill 的 `{`：claude 从预填的 `{` 续写，响应 content 不含该 `{`。若 claude 无视
+        // prefill 仍自带 `{`/```（中转网关偶发不透传 prefill），则不重复补。
+        let trimmed_lead = cleaned.trim_start();
+        let candidate = if trimmed_lead.starts_with('{')
+            || trimmed_lead.starts_with('[')
+            || trimmed_lead.starts_with("```")
+        {
+            cleaned.clone()
+        } else {
+            format!("{ANTHROPIC_JSON_PREFILL}{cleaned}")
+        };
+        let value = match parse_json_content(&candidate) {
             Ok(v) => v,
             Err(e) => {
-                // 临时诊断：content block 拿到了但非 JSON，打印前缀确认 claude 实际输出形态。定位后移除。
-                let head: String = cleaned.chars().take(300).collect();
-                eprintln!("[anthropic-diag] parse_json_content 失败: {e}; content_head={head:?}");
+                // 临时诊断：prefill 补回后仍非 JSON，打印前缀确认 claude 实际输出形态。定位后移除。
+                let head: String = candidate.chars().take(300).collect();
+                eprintln!("[anthropic-diag] parse_json_content 失败: {e}; candidate_head={head:?}");
                 return Err(e);
             }
         };
