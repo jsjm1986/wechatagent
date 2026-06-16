@@ -776,3 +776,243 @@ async fn e2e_update_handler_drops_unknown_and_managed_keys() {
     assert!(!p.is_active, "is_active 不可经 PUT 篡改");
     assert_eq!(p.version, 1, "version 不可经 PUT 篡改");
 }
+
+// ── 分级二次确认：危险开关变更 publish 走旁路稿 + 确认 ──────────────────────
+// publish 已生效血缘时若危险字段有变更，落旁路稿（current=false）不即时生效，返回
+// pendingActivation；旧版本继续 current+active（零窗口）；经 rollout 二次确认才生效。
+
+/// 危险变更 publish → pendingActivation=true，旁路稿 current=false，旧 v1 仍 current+active。
+#[tokio::test]
+#[ignore]
+async fn e2e_publish_risky_returns_pending_no_current_shift() {
+    let app = common::TestApp::start().await;
+    let db = app.state.db.clone();
+    let ws = app.state.config.default_workspace_id.clone();
+
+    // v1：已生效（current+active），grounding 开关 = false（销售域默认）。
+    let v1 = db_create_profile(&db, &ws, "risky-live", "零售", "零售运营", "manual").await;
+    db.domain_profiles()
+        .update_one(
+            doc! { "_id": v1 },
+            doc! { "$set": { "current_version": true, "is_active": true } },
+            None,
+        )
+        .await
+        .expect("make v1 live");
+
+    // v2 草稿：同血缘，但改了危险字段（grounding_gate_bypass_without_claim=true +
+    // distrust_self_reported_low_risk=true）。这是运营 create→update 出来的待发布稿。
+    let v2_src = db_create_profile(&db, &ws, "risky-live", "零售v2", "改风控开关", "manual").await;
+    db.domain_profiles()
+        .update_one(
+            doc! { "_id": v2_src },
+            doc! { "$set": {
+                "grounding_gate_bypass_without_claim": true,
+                "distrust_self_reported_low_risk": true,
+                "version": 2_i32,
+            } },
+            None,
+        )
+        .await
+        .expect("preset risky v2 draft");
+
+    // publish v2_src → 危险分支。
+    let resp = wechatagent::routes::domain_profiles::publish_domain_profile(
+        State(app.state.clone()),
+        Extension(test_admin(&ws)),
+        Path(v2_src.to_hex()),
+    )
+    .await
+    .expect("publish handler ok");
+    let body: Value = resp.0;
+    assert_eq!(
+        body.get("pendingActivation").and_then(|v| v.as_bool()),
+        Some(true),
+        "危险变更 → pendingActivation=true"
+    );
+    let risky: Vec<String> = body
+        .get("riskyFields")
+        .and_then(|v| v.as_array())
+        .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+        .expect("riskyFields array");
+    assert!(
+        risky.contains(&"grounding_gate_bypass_without_claim".to_string())
+            && risky.contains(&"distrust_self_reported_low_risk".to_string()),
+        "riskyFields 列出两个变更的危险字段，实际={risky:?}"
+    );
+
+    // 旁路稿（新版本 v3）current=false、is_active=false。
+    let new_hex = body.get("id").and_then(|v| v.as_str()).expect("new id");
+    let new_id = ObjectId::parse_str(new_hex).expect("oid");
+    let sideline = db_get_profile(&db, new_id).await;
+    assert!(!sideline.current_version, "旁路稿不占 current");
+    assert!(!sideline.is_active, "旁路稿不生效");
+
+    // 关键：旧 v1 仍唯一 current+active（零窗口期，运行时继续加载旧版本）。
+    let v1_doc = db_get_profile(&db, v1).await;
+    assert!(v1_doc.current_version && v1_doc.is_active, "v1 仍 current+active");
+    let loadable = db
+        .domain_profiles()
+        .count_documents(
+            doc! { "workspace_id": &ws, "profile_id": "risky-live", "is_active": true, "current_version": true },
+            None,
+        )
+        .await
+        .expect("count loadable");
+    assert_eq!(loadable, 1, "危险 publish 后仍恰一行可加载（旧版本，无窗口期回落）");
+}
+
+/// 二次确认：对旁路稿调 rollout → 推 current+demote+realign，新版本生效、单活。
+#[tokio::test]
+#[ignore]
+async fn e2e_confirm_activation_promotes_risky_draft() {
+    let app = common::TestApp::start().await;
+    let db = app.state.db.clone();
+    let ws = app.state.config.default_workspace_id.clone();
+
+    let v1 = db_create_profile(&db, &ws, "risky-confirm", "教培", "教培运营", "manual").await;
+    db.domain_profiles()
+        .update_one(
+            doc! { "_id": v1 },
+            doc! { "$set": { "current_version": true, "is_active": true } },
+            None,
+        )
+        .await
+        .expect("make v1 live");
+    let v2_src = db_create_profile(&db, &ws, "risky-confirm", "教培v2", "改人格", "manual").await;
+    db.domain_profiles()
+        .update_one(
+            doc! { "_id": v2_src },
+            doc! { "$set": { "soul_override": "新人格本体", "version": 2_i32 } },
+            None,
+        )
+        .await
+        .expect("preset risky v2");
+    let pub_resp = wechatagent::routes::domain_profiles::publish_domain_profile(
+        State(app.state.clone()),
+        Extension(test_admin(&ws)),
+        Path(v2_src.to_hex()),
+    )
+    .await
+    .expect("publish risky");
+    let sideline_hex = pub_resp.0.get("id").and_then(|v| v.as_str()).expect("id").to_string();
+    let sideline_id = ObjectId::parse_str(&sideline_hex).expect("oid");
+
+    // 运营二次确认 → rollout 旁路稿（confirm-path 复用 rollout）。
+    let _ = wechatagent::routes::domain_profiles::rollout_domain_profile(
+        State(app.state.clone()),
+        Extension(test_admin(&ws)),
+        Path(sideline_hex),
+    )
+    .await
+    .expect("rollout (confirm) ok");
+
+    // 确认后旁路稿既 current 又 active，旧 v1 都让出。
+    let sideline = db_get_profile(&db, sideline_id).await;
+    assert!(sideline.current_version && sideline.is_active, "确认后旁路稿 current+active");
+    let v1_doc = db_get_profile(&db, v1).await;
+    assert!(!v1_doc.current_version && !v1_doc.is_active, "v1 让出 current+active");
+    let loadable = db
+        .domain_profiles()
+        .count_documents(
+            doc! { "workspace_id": &ws, "profile_id": "risky-confirm", "is_active": true, "current_version": true },
+            None,
+        )
+        .await
+        .expect("count");
+    assert_eq!(loadable, 1, "确认后恰一行可加载（新版本）");
+}
+
+/// 普通字段变更（非危险）在已生效血缘上仍走即时生效（与 realign 基线等价），不触发分级。
+#[tokio::test]
+#[ignore]
+async fn e2e_publish_nonrisky_live_lineage_still_realigns() {
+    let app = common::TestApp::start().await;
+    let db = app.state.db.clone();
+    let ws = app.state.config.default_workspace_id.clone();
+
+    let v1 = db_create_profile(&db, &ws, "nonrisky-live", "美业", "美业运营", "manual").await;
+    db.domain_profiles()
+        .update_one(
+            doc! { "_id": v1 },
+            doc! { "$set": { "current_version": true, "is_active": true } },
+            None,
+        )
+        .await
+        .expect("make v1 live");
+    // v2 草稿只改普通字段（display_name / description / prompt_fragment），无危险变更。
+    let v2_src = db_create_profile(&db, &ws, "nonrisky-live", "美业v2", "只改简介", "manual").await;
+    db.domain_profiles()
+        .update_one(
+            doc! { "_id": v2_src },
+            doc! { "$set": { "prompt_fragment": "叠加业务上下文", "version": 2_i32 } },
+            None,
+        )
+        .await
+        .expect("preset nonrisky v2");
+
+    let resp = wechatagent::routes::domain_profiles::publish_domain_profile(
+        State(app.state.clone()),
+        Extension(test_admin(&ws)),
+        Path(v2_src.to_hex()),
+    )
+    .await
+    .expect("publish handler ok");
+    let body: Value = resp.0;
+    // 普通分支：返回体不含 pendingActivation 键。
+    assert!(
+        body.get("pendingActivation").is_none(),
+        "普通字段变更不触发分级（无 pendingActivation）"
+    );
+    let new_id = ObjectId::parse_str(body.get("id").and_then(|v| v.as_str()).expect("id")).expect("oid");
+    // 即时生效：realign 把 active 迁到新版本。
+    let new_doc = db_get_profile(&db, new_id).await;
+    assert!(new_doc.current_version && new_doc.is_active, "普通变更即时生效（v2 current+active）");
+    let loadable = db
+        .domain_profiles()
+        .count_documents(
+            doc! { "workspace_id": &ws, "profile_id": "nonrisky-live", "is_active": true, "current_version": true },
+            None,
+        )
+        .await
+        .expect("count");
+    assert_eq!(loadable, 1, "即时生效后恰一行可加载（新版本）");
+}
+
+/// 红线：纯草稿血缘（从未 active）即便改了危险字段，publish 也不触发分级（active_base=None）
+/// → 走普通分支 + realign noop → 仍须人审 activate。
+#[tokio::test]
+#[ignore]
+async fn e2e_publish_risky_on_draft_lineage_no_pending() {
+    let app = common::TestApp::start().await;
+    let db = app.state.db.clone();
+    let ws = app.state.config.default_workspace_id.clone();
+
+    // 纯草稿血缘：current_version=true 但从未 activate（is_active=false），且带危险字段。
+    let v1 = db_create_profile(&db, &ws, "risky-draft", "AI候选", "纯草稿", "generated_by_ai").await;
+    db.domain_profiles()
+        .update_one(
+            doc! { "_id": v1 },
+            doc! { "$set": { "current_version": true, "soul_override": "AI 生成的人格" } },
+            None,
+        )
+        .await
+        .expect("make v1 current draft with risky field");
+
+    let resp = wechatagent::routes::domain_profiles::publish_domain_profile(
+        State(app.state.clone()),
+        Extension(test_admin(&ws)),
+        Path(v1.to_hex()),
+    )
+    .await
+    .expect("publish handler ok");
+    let body: Value = resp.0;
+    // 血缘从未 active → active_base=None → 不触发分级。
+    assert!(
+        body.get("pendingActivation").is_none(),
+        "草稿血缘不触发分级（active_base=None）"
+    );
+    // 红线：realign noop → 仍 0 个 active（须人审 activate）。
+    let active = db_active_count(&db, &ws).await;
+    assert_eq!(active, 0, "草稿血缘 publish 后仍 0 个 active（守人审红线）");
+}

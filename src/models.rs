@@ -1608,7 +1608,7 @@ pub struct ProfileDimension {
 }
 
 /// 绝对化承诺词表，按 `commitment_claim_class` 分两类（替代 `guards.rs` 写死词表）。
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct CommitmentMarkers {
     /// 产品效果类（如销售域「成功率/见效/回款」，医疗域「根治率」，教培域「保过」）。
     #[serde(default)]
