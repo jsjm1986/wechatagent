@@ -129,7 +129,7 @@ pub(super) async fn get_domain_profile(
 /// 因 serde flatten 缺字段而 422，使 $set 部分更新逻辑根本不可达。create 路径仍由
 /// `create_domain_profile` 里的显式空值校验（profileId 不能为空）兜底，行为不变。
 #[derive(Debug, Deserialize)]
-pub(super) struct UpsertRequest {
+pub struct UpsertRequest {
     #[serde(rename = "workspaceId", default)]
     workspace_id: Option<String>,
     #[serde(rename = "profileId", default)]
@@ -138,7 +138,7 @@ pub(super) struct UpsertRequest {
     profile: Document,
 }
 
-pub(super) async fn create_domain_profile(
+pub async fn create_domain_profile(
     State(state): State<AppState>,
     Extension(admin): Extension<AuthenticatedAdmin>,
     Json(body): Json<UpsertRequest>,
@@ -177,7 +177,7 @@ pub(super) async fn create_domain_profile(
 /// update：在指定 `_id`（必须是当前 current_version 草稿）上原地改字段。已 publish
 /// 定稿的版本不应原地改（应 create 新版本再 publish），故 update 只允许改
 /// `current_version=false` 的草稿行；改 active 行直接拒绝（须走 create→publish→activate）。
-pub(super) async fn update_domain_profile(
+pub async fn update_domain_profile(
     State(state): State<AppState>,
     Extension(admin): Extension<AuthenticatedAdmin>,
     Path(id): Path<String>,
@@ -262,7 +262,7 @@ pub(super) async fn delete_domain_profile(
 /// publish：在 scope=(workspace_id, profile_id) 下取 max(version)+1,写新文档
 /// current_version=true + previous_version=Some(source.version),soft-demote 同 scope
 /// 其他 row 的 current_version。**不动 is_active**(publish 只定稿版本)。
-pub(super) async fn publish_domain_profile(
+pub async fn publish_domain_profile(
     State(state): State<AppState>,
     Extension(admin): Extension<AuthenticatedAdmin>,
     Path(id): Path<String>,
@@ -316,7 +316,7 @@ pub(super) async fn publish_domain_profile(
 }
 
 /// rollout：把指定 row promote 到 current_version=true,demote 同 scope 其他 row。
-pub(super) async fn rollout_domain_profile(
+pub async fn rollout_domain_profile(
     State(state): State<AppState>,
     Extension(admin): Extension<AuthenticatedAdmin>,
     Path(id): Path<String>,
@@ -356,7 +356,7 @@ pub(super) async fn rollout_domain_profile(
 }
 
 /// rollback：以 target.previous_version 找回上一版本 promote 到 current,demote 当前。
-pub(super) async fn rollback_domain_profile(
+pub async fn rollback_domain_profile(
     State(state): State<AppState>,
     Extension(admin): Extension<AuthenticatedAdmin>,
     Path(id): Path<String>,
@@ -416,7 +416,7 @@ pub(super) async fn rollback_domain_profile(
 /// activate：把指定 row is_active=true,同 workspace 其他 profile is_active=false
 /// （每 workspace 至多一条 active）。运行时缓存查 is_active+current_version,故只有
 /// 既 current 又 active 的 row 会被加载——activate 前应已 publish 定稿。
-pub(super) async fn activate_domain_profile(
+pub async fn activate_domain_profile(
     State(state): State<AppState>,
     Extension(admin): Extension<AuthenticatedAdmin>,
     Path(id): Path<String>,

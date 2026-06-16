@@ -2,7 +2,7 @@
 //!
 //! 测试覆盖（全部 `#[ignore]`，需要 Docker）：
 //!
-//! **Part A：DB 层 CRUD + publish/activate 版本灰度逻辑**
+//! **Part A：DB 层 CRUD + publish/activate 版本灰度逻辑（手动复刻 DB，非真 handler）**
 //! - create → 落草稿态（current_version=false, is_active=false）
 //! - update → 只许改草稿行
 //! - publish → current_version=true + 同 scope 其他行 soft demote
@@ -13,6 +13,12 @@
 //! **Part B：Real LLM 引导层 AI 生成候选**
 //! - POST /admin/domain-profiles/generate → 调用 generate_agent_json → 候选落草稿
 //! - 候选状态正确：current_version=false, is_active=false, seeded_by="generated_by_ai"
+//!
+//! **Part C：真 route handler 集成（publish/rollout/rollback/update 直调）**
+//! - publish 已生效血缘 → realign 把 is_active 迁到新版本（即时生效，无回落 DEFAULT）
+//! - publish 纯草稿血缘 → realign noop（守人审红线）
+//! - rollback → active 迁回上一版本
+//! - update → $set 部分更新不清零未触碰字段 + 未知/托管键白名单过滤
 //!
 //! ## 运行
 //! ```sh
@@ -25,8 +31,10 @@
 //! ```
 //!
 //! ## 红线
-//! - **AI 永不自动 activate**：候选落草稿态，必须人审才能 publish+activate。
-//! - **两步语义**：publish 定稿（current_version），activate 才让运行时切换。
+//! - **AI 永不自动 activate**：AI 生成候选落草稿态（is_active=false、血缘从未 active），
+//!   必须人审 activate 才生效；真 publish handler 对这种血缘 realign noop（Part C 覆盖）。
+//! - **publish 语义**：草稿血缘 publish 定稿后须 activate；**已生效血缘** publish 新版本
+//!   则 realign 即时切换（运营改已生效配置即时生效，见 domain_profiles.rs 文件头）。
 //! - **单活**：同 workspace 至多一条 is_active=true。
 
 mod common;
@@ -36,7 +44,7 @@ use std::sync::Arc;
 use mongodb::bson::{doc, oid::ObjectId, DateTime};
 use mongodb::options::FindOptions;
 use serde_json::Value;
-use axum::extract::{Extension, Json, State};
+use axum::extract::{Extension, Json, Path, State};
 use wechatagent::auth::AuthenticatedAdmin;
 use wechatagent::db::Database;
 use wechatagent::llm::LlmClient;
@@ -250,16 +258,24 @@ async fn e2e_update_only_edits_draft() {
     assert_eq!(p.is_active, false);
 }
 
+/// 纯草稿血缘的 DB 两步语义（手动复刻 DB 操作，**非真 handler**）：草稿 publish 定稿
+/// 后仍 is_active=false，须显式 activate 才生效。这里 publish 用 `$set current_version`
+/// 手动模拟，对「从未 active 的草稿血缘」而言 is_active 保持 false 是正确预期。
+///
+/// 注意：真 `publish_domain_profile` handler 对「**已生效血缘**」会调 realign 把
+/// is_active 迁到新版本（即时生效）——那条语义由 Part C 的
+/// `e2e_publish_handler_realigns_active_on_live_lineage` 覆盖。本测试只锁草稿两步流程，
+/// 勿据此断言「真 handler publish 永不动 is_active」（那是旧设计，已被 realign 取代）。
 #[tokio::test]
 #[ignore]
-async fn e2e_publish_then_activate_two_step() {
+async fn e2e_draft_lineage_publish_then_activate_two_step() {
     let app = common::TestApp::start().await;
     let db = app.state.db.clone();
     let ws = &app.state.config.default_workspace_id;
 
     let id = db_create_profile(&db, ws, "edu-k12-tuition", "K12 教育", "K12", "manual").await;
 
-    // Step 1: publish —— current_version=true, is_active=false
+    // Step 1: publish（手动复刻 DB 操作）—— current_version=true, is_active=false
     db.domain_profiles()
         .update_one(
             doc! { "_id": id },
@@ -271,7 +287,7 @@ async fn e2e_publish_then_activate_two_step() {
 
     let published = db_get_profile(&db, id).await;
     assert_eq!(published.current_version, true, "publish 后 current_version=true");
-    assert_eq!(published.is_active, false, "publish 不动 is_active");
+    assert_eq!(published.is_active, false, "草稿血缘手动 publish 不动 is_active（须 activate）");
     assert_eq!(published.version, 1);
 
     // Step 2: activate —— is_active=true, current_version 保持 true
@@ -530,4 +546,233 @@ async fn e2e_generate_second_industry_profile() {
         all.len() >= 1,
         "列表应至少包含刚生成的 profile"
     );
+}
+
+// ── Part C：真 route handler 集成（TEST-2/TEST-6 缺口）─────────────────────
+// 上面 Part A 的 publish/activate 是 db_* helper 手动复刻 DB 操作，**不调真 handler**，
+// 故 realign_active_to_current 真函数（Mongo filter/字段名/$ne）与 #2 的 $set 部分更新
+// merge 校验/白名单过滤全无集成覆盖。Part C 直调真 handler 补这块。
+
+/// TEST-2 缺口：publish 一个**已生效血缘**的新版本 → 真 handler 的 realign 应把
+/// is_active 迁到新 current 行，使运行时充要条件 (is_active=true AND current_version=true)
+/// 恰好命中一行（新版本），不回落 DEFAULT。
+#[tokio::test]
+#[ignore]
+async fn e2e_publish_handler_realigns_active_on_live_lineage() {
+    let app = common::TestApp::start().await;
+    let db = app.state.db.clone();
+    let ws = app.state.config.default_workspace_id.clone();
+
+    // v1：建草稿 → 手动置为已生效（current+active），模拟「这个 profile 正在线上跑」。
+    let v1 = db_create_profile(&db, &ws, "retail-live", "零售", "零售运营", "manual").await;
+    db.domain_profiles()
+        .update_one(
+            doc! { "_id": v1 },
+            doc! { "$set": { "current_version": true, "is_active": true } },
+            None,
+        )
+        .await
+        .expect("make v1 live");
+
+    // 调真 publish handler（基于 v1 发布 v2）。
+    let resp = wechatagent::routes::domain_profiles::publish_domain_profile(
+        State(app.state.clone()),
+        Extension(test_admin(&ws)),
+        Path(v1.to_hex()),
+    )
+    .await
+    .expect("publish handler ok");
+    let body: Value = resp.0;
+    let v2_hex = body.get("id").and_then(|v| v.as_str()).expect("v2 id");
+    let v2 = ObjectId::parse_str(v2_hex).expect("v2 oid");
+
+    // 不变量：血缘内 (is_active AND current_version) 恰好一行，且是 v2。
+    let loadable = db
+        .domain_profiles()
+        .count_documents(
+            doc! { "workspace_id": &ws, "profile_id": "retail-live", "is_active": true, "current_version": true },
+            None,
+        )
+        .await
+        .expect("count loadable");
+    assert_eq!(loadable, 1, "publish 后恰一行可被运行时加载（无回落 DEFAULT）");
+
+    let v2_doc = db_get_profile(&db, v2).await;
+    assert!(v2_doc.is_active && v2_doc.current_version, "v2 既 active 又 current");
+    let v1_doc = db_get_profile(&db, v1).await;
+    assert!(!v1_doc.current_version, "v1 不再是 current");
+    assert!(!v1_doc.is_active, "realign 把 active 迁走，v1 不再 active");
+}
+
+/// TEST-2 缺口：publish 一个**从未 active**的纯草稿血缘 → realign noop，新版本仍
+/// is_active=false（守住「AI 生成候选须人审 activate」红线）。
+#[tokio::test]
+#[ignore]
+async fn e2e_publish_handler_noop_on_never_active_lineage() {
+    let app = common::TestApp::start().await;
+    let db = app.state.db.clone();
+    let ws = app.state.config.default_workspace_id.clone();
+
+    // 纯草稿：current_version=true 但从未 activate（is_active=false）。
+    let v1 = db_create_profile(&db, &ws, "draft-only", "草稿", "纯草稿血缘", "generated_by_ai").await;
+    db.domain_profiles()
+        .update_one(
+            doc! { "_id": v1 },
+            doc! { "$set": { "current_version": true } },
+            None,
+        )
+        .await
+        .expect("make v1 current draft");
+
+    let _ = wechatagent::routes::domain_profiles::publish_domain_profile(
+        State(app.state.clone()),
+        Extension(test_admin(&ws)),
+        Path(v1.to_hex()),
+    )
+    .await
+    .expect("publish handler ok");
+
+    // 红线：血缘从未 active → publish 后仍无任何 active 行。
+    let active = db_active_count(&db, &ws).await;
+    assert_eq!(active, 0, "草稿血缘 publish 后仍 0 个 active（须人审 activate）");
+}
+
+/// TEST-2 缺口：rollback 真 handler 在已生效血缘上把 active 迁回上一版本。
+#[tokio::test]
+#[ignore]
+async fn e2e_rollback_handler_realigns_active() {
+    let app = common::TestApp::start().await;
+    let db = app.state.db.clone();
+    let ws = app.state.config.default_workspace_id.clone();
+
+    // v1 已生效，publish v2（realign 后 v2 生效）。
+    let v1 = db_create_profile(&db, &ws, "svc-rollback", "服务", "服务运营", "manual").await;
+    db.domain_profiles()
+        .update_one(
+            doc! { "_id": v1 },
+            doc! { "$set": { "current_version": true, "is_active": true } },
+            None,
+        )
+        .await
+        .expect("make v1 live");
+    let pub_resp = wechatagent::routes::domain_profiles::publish_domain_profile(
+        State(app.state.clone()),
+        Extension(test_admin(&ws)),
+        Path(v1.to_hex()),
+    )
+    .await
+    .expect("publish v2");
+    let v2_hex = pub_resp.0.get("id").and_then(|v| v.as_str()).expect("v2 id").to_string();
+
+    // rollback v2 → 回到 v1（previous_version）。
+    let _ = wechatagent::routes::domain_profiles::rollback_domain_profile(
+        State(app.state.clone()),
+        Extension(test_admin(&ws)),
+        Path(v2_hex),
+    )
+    .await
+    .expect("rollback handler ok");
+
+    // 不变量：回退后 v1 既 current 又 active，恰一行可加载。
+    let v1_doc = db_get_profile(&db, v1).await;
+    assert!(v1_doc.current_version && v1_doc.is_active, "rollback 后 v1 既 current 又 active");
+    let loadable = db
+        .domain_profiles()
+        .count_documents(
+            doc! { "workspace_id": &ws, "profile_id": "svc-rollback", "is_active": true, "current_version": true },
+            None,
+        )
+        .await
+        .expect("count");
+    assert_eq!(loadable, 1, "rollback 后恰一行可加载");
+}
+
+/// TEST-6 缺口：PUT update 真 handler 只 $set body 带来的字段，未触碰字段保持原值
+/// （验证 #2「不再整行 replace 清零」）。
+#[tokio::test]
+#[ignore]
+async fn e2e_update_handler_partial_set_preserves_untouched_fields() {
+    let app = common::TestApp::start().await;
+    let db = app.state.db.clone();
+    let ws = app.state.config.default_workspace_id.clone();
+
+    // 建草稿并预置多个内容字段（draft 行可被 update）。
+    let id = db_create_profile(&db, &ws, "edit-target", "原名", "原简介", "manual").await;
+    db.domain_profiles()
+        .update_one(
+            doc! { "_id": id },
+            doc! { "$set": {
+                "prompt_fragment": "原始业务上下文",
+                "grounding_gate_bypass_without_claim": true,
+            } },
+            None,
+        )
+        .await
+        .expect("preset fields");
+
+    // PUT 只带 display_name（snake_case，无 profileId —— 验 D4-1 契约）。
+    let body: wechatagent::routes::domain_profiles::UpsertRequest =
+        serde_json::from_value(serde_json::json!({ "display_name": "新名" }))
+            .expect("deserialize UpsertRequest without profileId");
+    let _ = wechatagent::routes::domain_profiles::update_domain_profile(
+        State(app.state.clone()),
+        Extension(test_admin(&ws)),
+        Path(id.to_hex()),
+        Json(body),
+    )
+    .await
+    .expect("update handler ok");
+
+    let p = db_get_profile(&db, id).await;
+    assert_eq!(p.display_name, "新名", "display_name 被更新");
+    // 未触碰字段保持原值（核心：不再整行清零）。
+    assert_eq!(p.description, "原简介", "未带的 description 保持原值");
+    assert_eq!(p.prompt_fragment.as_deref(), Some("原始业务上下文"), "未带的 prompt_fragment 保持原值");
+    assert!(p.grounding_gate_bypass_without_claim, "未带的 grounding 开关保持原值");
+}
+
+/// TEST-6 缺口 + CORRECT-1：PUT update 带未知键 → 白名单过滤，未知键不落库（防文档污染）；
+/// 且托管字段（is_active/version）经 strip 不被篡改。
+#[tokio::test]
+#[ignore]
+async fn e2e_update_handler_drops_unknown_and_managed_keys() {
+    let app = common::TestApp::start().await;
+    let db = app.state.db.clone();
+    let ws = app.state.config.default_workspace_id.clone();
+
+    let id = db_create_profile(&db, &ws, "filter-target", "原名", "原简介", "manual").await;
+
+    // body 含：合法内容键 + 未知键 + 试图篡改的托管键。
+    let body: wechatagent::routes::domain_profiles::UpsertRequest = serde_json::from_value(
+        serde_json::json!({
+            "display_name": "新名",
+            "totally_unknown_field": "should_not_persist",
+            "is_active": true,
+            "version": 99,
+        }),
+    )
+    .expect("deserialize");
+    let _ = wechatagent::routes::domain_profiles::update_domain_profile(
+        State(app.state.clone()),
+        Extension(test_admin(&ws)),
+        Path(id.to_hex()),
+        Json(body),
+    )
+    .await
+    .expect("update handler ok");
+
+    // 用裸 Document 读，检查未知键是否落库。
+    let raw = db
+        .domain_profiles()
+        .clone_with_type::<mongodb::bson::Document>()
+        .find_one(doc! { "_id": id }, None)
+        .await
+        .expect("find")
+        .expect("doc");
+    assert_eq!(raw.get_str("display_name").ok(), Some("新名"), "合法内容键更新");
+    assert!(raw.get("totally_unknown_field").is_none(), "未知键不落库（CORRECT-1 白名单过滤）");
+    // 托管字段未被篡改（strip_backend_managed_keys 剥离）。
+    let p = db_get_profile(&db, id).await;
+    assert!(!p.is_active, "is_active 不可经 PUT 篡改");
+    assert_eq!(p.version, 1, "version 不可经 PUT 篡改");
 }

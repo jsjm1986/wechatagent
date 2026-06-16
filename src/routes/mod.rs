@@ -29,7 +29,10 @@ mod behavior_signal_metrics;
 pub mod chunk_locks;
 mod contacts;
 mod conversations;
-pub(crate) mod domain_profiles;
+// pub（非 pub(crate)）：domain_profile_e2e.rs 集成测试需从 tests/ crate 直调
+// publish/update/rollout/rollback handler 真函数（覆盖 realign + $set 部分更新），仿
+// guide_profile 已有先例。生产路由注册仍走下方 use。
+pub mod domain_profiles;
 pub(crate) mod domain_schemas;
 mod domains;
 mod evaluations;
