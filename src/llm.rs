@@ -464,15 +464,18 @@ impl LlmClient {
         user: &str,
     ) -> AppResult<(LlmJsonResult, Option<u64>)> {
         let started_at = Instant::now();
-        // claude（尤其 opus 经中转）常输出"自然语言推理 + JSON"混合体，JSON 可能在推理之后
-        // （rsxermu CI 实测：`我看到候选 catalog…\n\n{"action":"open_chunk",...}`）。不用 prefill
-        // 强制（实测 claude 无视、在 `{` 后继续写推理），改由下游 parse_json_content 的
-        // extract_first_json_block 从混合文本里提取首个可解析 JSON 块。max_tokens 8192 留足空间。
+        // claude（尤其 opus）对话遵从性强，遇到口语化/对话式 prompt（"你好，我需要你帮我…"）
+        // 容易"入戏"先写共情散文再给 JSON，甚至 JSON 被 max_tokens 截断（rsxermu CI 实测
+        // domain_profile/knowledge 大面积 json_decode：content 全是"我理解你的需求…让我生成"）。
+        // 在 system 末尾追加**强制 JSON 输出约束**（通用、不改各调用方 prompt），逼 claude 第一
+        // 字符即 `{`、禁任何前导/解释/收尾。下游 parse_json_content 仍有 extract 兜底防漏网。
+        const ANTHROPIC_JSON_GUARD: &str = "\n\n[OUTPUT FORMAT — STRICT] 你必须只输出一个 JSON 对象，不要任何前导说明、寒暄、共情、思考过程或代码块围栏。第一个字符必须是 `{`，最后一个字符必须是 `}`。禁止在 JSON 前后写任何自然语言（包括「好的」「我理解」「让我」「希望有帮助」之类）。";
+        let guarded_system = format!("{system}{ANTHROPIC_JSON_GUARD}");
         let body = json!({
             "model": self.model,
             "max_tokens": 8192,
             "temperature": 0.2,
-            "system": system,
+            "system": guarded_system,
             "messages": [
                 {"role": "user", "content": user}
             ]
