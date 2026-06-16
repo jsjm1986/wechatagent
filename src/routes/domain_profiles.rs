@@ -6,12 +6,21 @@
 //! rollback 行为照搬 [`crate::routes::admin_ops_versions`] 的 soft-demote 语义，scope =
 //! `(workspace_id, profile_id)`。
 //!
-//! **publish / activate 两步**（设计文档 §4.1 step 6-7）：
+//! **publish / activate 语义**（设计文档 §4.1 step 6-7，+ #1 不变量对齐修订）：
 //! - `publish`：在 scope 下写新 `version+1`、`current_version=true`、soft-demote 同
-//!   scope 其他 row 的 `current_version`。**不动 `is_active`**——publish 只定稿版本，
-//!   尚未让运行时切换。
+//!   scope 其他 row 的 `current_version`；随后调 `realign_active_to_current`：
+//!   - 若该 `(workspace_id, profile_id)` 血缘**原本有 active 行**（已被人审 activate 过、
+//!     正在生效）→ 把 `is_active` 一并迁到新版本行 → 新版本**即时生效**（运营编辑已生效
+//!     配置后无需再 activate；与 ops 三表 publish 即生效一致）。
+//!   - 若血缘**从未 active**（纯草稿/AI 生成候选，`is_active=false`）→ realign **noop** →
+//!     新版本仍 `is_active=false`，**必须经人审 `activate` 才生效**（守住「AI 生成候选须
+//!     人审」红线）。
 //! - `activate`：把指定 row 的 `is_active=true`，并把同 workspace 其他 profile 的
 //!   `is_active=false`（每 workspace 至多一条 active）。运行时下一轮决策即用它。
+//!
+//! > 注：未来若要对「危险开关变更」加二次确认（即便已生效血缘也强制走 publish→activate
+//! > 两步），在 publish 的 realign 调用前按字段 diff 分级即可——本文件头描述的是当前
+//! > 「已生效血缘 publish 即时生效」基线行为。
 //!
 //! 运行时缓存查询要求 `is_active=true AND current_version=true`（见
 //! [`crate::agent::domain_profile::DomainProfileCache`]），故任何改这两个标记的写入
@@ -562,7 +571,10 @@ mod tests {
     //! publish/activate 两步语义的纯函数不变量(DB 端 update_many 行为的可单测抽离)。
     //! 完整 DB-backed 端到端流程由 CI 集成套件覆盖(本地磁盘纪律:重套件走 CI)。
 
-    /// publish：scope 内除新版本外全部 demote current_version；is_active **不动**。
+    /// publish 的 **demote 子步**：scope 内除新版本外全部 demote current_version；
+    /// is_active 不动。**完整 publish = 本子步 + realign 子步**（见 handler line296-299）：
+    /// realign 才负责把 is_active 迁到新版本（对已生效血缘）。单测把两子步分开锁，便于
+    /// 各自验证；勿把本子步当成完整 publish 语义（历史上这里的注释曾误导）。
     fn publish_demote_current(rows: &mut [(i32, bool, bool)], new_version: i32) {
         // 元组 = (version, current_version, is_active)
         for (v, cur, _active) in rows.iter_mut() {
@@ -591,17 +603,20 @@ mod tests {
     }
 
     #[test]
-    fn publish_demotes_current_but_leaves_is_active_untouched() {
-        // 版本 1 当前 current+active;publish 版本 2 后只 demote current,active 不变。
+    fn publish_demote_current_substep_leaves_is_active_untouched() {
+        // 仅测 publish 的 **demote 子步**（`publish_demote_current`）：它只把 current_version
+        // 收敛到新版本，不碰 is_active。**这不是完整 publish 语义**——真 `publish_domain_profile`
+        // 在 demote 之后还会调 `realign_active_to_current`（见 `realign_*_when_lineage_was_active`
+        // 测试 + handler line296-299），对「已生效血缘」会把 is_active 迁到新版本（即时生效）。
+        // 本测试只锁 demote 子步自身的不变量：demote 不应有副作用地改动 is_active。
         let mut rows = vec![(1, true, true), (2, true, false)];
         publish_demote_current(&mut rows, 2);
         let current: Vec<_> = rows.iter().filter(|(_, c, _)| *c).collect();
-        assert_eq!(current.len(), 1, "publish 后只一条 current_version");
+        assert_eq!(current.len(), 1, "demote 后只一条 current_version");
         assert_eq!(current[0].0, 2);
-        // 关键:publish 不动 is_active —— 版本 1 仍 active(运行时缓存要 active+current,
-        // 故此刻版本 1 既非 current 也就不会被加载,需后续 activate 版本 2 才生效)。
-        assert!(rows[0].2, "publish 不改 is_active:版本1仍标 active");
-        assert!(!rows[1].2, "版本2 publish 后尚未 activate");
+        // demote 子步本身不动 is_active（is_active 的迁移由后续 realign 子步负责）。
+        assert!(rows[0].2, "demote 子步不改 is_active：版本1 此刻仍标 active");
+        assert!(!rows[1].2, "demote 子步不激活版本2（realign 才迁移）");
     }
 
     #[test]
@@ -650,6 +665,33 @@ mod tests {
         publish_demote_current(&mut rows, 2);
         realign_active_to_current_sim(&mut rows, 2);
         assert!(rows.iter().all(|(_, _, a)| !*a), "血缘从未 active → realign 不动 is_active");
+    }
+
+    /// 红线钉死：AI 生成候选（`guide_profile::generate_domain_profile_candidate` 落库
+    /// 强制 `is_active=false`+`current_version=false`，见该文件 :248-249）的整个生命周期，
+    /// 在被人审 `activate` 之前**始终 is_active=false**——publish 定稿子步 + realign 子步
+    /// 都不会让它生效。这是「AI 永不自动 verify / AI 生成候选须人审」红线在版本机制层的
+    /// 护栏：blocked 场景下哪怕有人 publish 了 AI 草稿，realign 命中「血缘从未 active」→
+    /// noop → 仍须显式 activate。
+    #[test]
+    fn ai_candidate_stays_inactive_until_human_activate() {
+        // AI 生成候选落库态：单条草稿，既非 current 也非 active。
+        let mut rows = vec![(1, false, false)];
+        // 有人对它 publish（定稿一个新版本 v2）：demote 子步把 current 收敛到 v2。
+        rows.push((2, true, false));
+        publish_demote_current(&mut rows, 2);
+        // realign 子步：血缘从未 active → noop。
+        realign_active_to_current_sim(&mut rows, 2);
+        assert!(
+            rows.iter().all(|(_, _, a)| !*a),
+            "AI 候选血缘从未 active → publish 后仍无任何 active 行（守住人审红线）"
+        );
+        // 必须显式 activate v2 才生效。
+        activate_single(&mut rows, 2);
+        let active: Vec<_> = rows.iter().filter(|(_, _, a)| *a).map(|(v, _, _)| *v).collect();
+        assert_eq!(active, vec![2], "人审 activate 后 v2 才生效");
+        // 此刻 v2 既 current 又 active → 运行时可加载。
+        assert_eq!(rows.iter().filter(|(_, c, a)| *c && *a).count(), 1);
     }
 
     #[test]
