@@ -34,8 +34,8 @@ use std::time::{Duration, Instant};
 use crate::db::Database;
 use crate::error::AppResult;
 use crate::models::{
-    BusinessFormula, ChunkRole, CommitmentMarkers, CoverageDimension, DomainProfile,
-    MemoryDimension, OutcomePolarity, ProfileDimension,
+    AnsweringModeProfile, BusinessFormula, ChunkRole, CommitmentMarkers, CoverageDimension,
+    DomainProfile, MemoryDimension, OutcomePolarity, ProfileDimension,
 };
 
 /// 内置默认 profile 的 `profile_id`。运行时无 active profile 时使用。
@@ -471,6 +471,127 @@ pub fn render_reviewer_extra_score_lines(formulas: &[BusinessFormula]) -> String
     }
 }
 
+/// universal-domain-adaptation D：reviewer system prompt 里写死的「评审重点」取向描述
+/// （冒号后那串）。`apply_reviewer_review_focus` 以它为锚做精确整行替换。
+pub const REVIEWER_REVIEW_FOCUS_LABEL: &str = "评审重点：";
+pub const DEFAULT_REVIEWER_REVIEW_FOCUS: &str =
+    "事实准确、像真人微信、情绪价值、低压推进、产品知识一致性、没有操控营销。";
+
+/// universal-domain-adaptation D：reviewer user prompt 评审原则里写死的「转化平衡」整条
+/// bullet（`- ` 之后的整句）。`apply_reviewer_balance_principle` 以它为锚做精确替换。
+pub const DEFAULT_REVIEWER_BALANCE_PRINCIPLE: &str =
+    "转化平衡：既允许适度推进，也不能伤害信任。";
+
+/// universal-domain-adaptation D：把 active profile 的 `reviewer_orientation.review_focus`
+/// 应用到 reviewer **system** prompt。`None`（DEFAULT/老库）→ 原样返回（销售取向逐字保留、
+/// 销售域字节等价）。`Some` → 把「评审重点：<销售取向>。」整行替换成「评审重点：<本域取向>」
+/// （标签「评审重点」域中性故保留，只换冒号后的取向描述）。
+///
+/// 锚 = `评审重点：` + [`DEFAULT_REVIEWER_REVIEW_FOCUS`]。找不到锚（prompt 被运营改写过）→
+/// 原样返回不强插，避免污染。与 [`apply_conversation_mode_enum_list`] 同构（精确子串替换、
+/// 幂等、空覆盖即 no-op）。
+pub fn apply_reviewer_review_focus(system: &str, override_text: Option<&str>) -> String {
+    let Some(focus) = override_text.map(str::trim).filter(|s| !s.is_empty()) else {
+        return system.to_string();
+    };
+    let old_line = format!("{REVIEWER_REVIEW_FOCUS_LABEL}{DEFAULT_REVIEWER_REVIEW_FOCUS}");
+    let new_line = format!("{REVIEWER_REVIEW_FOCUS_LABEL}{focus}");
+    if new_line == old_line {
+        return system.to_string();
+    }
+    system.replace(&old_line, &new_line)
+}
+
+/// universal-domain-adaptation D：把 active profile 的
+/// `reviewer_orientation.balance_principle` 应用到 reviewer **user** prompt 评审原则。
+/// `None`（DEFAULT/老库）→ 原样返回（销售域字节等价）。`Some` → 把「转化平衡：既允许适度
+/// 推进，也不能伤害信任。」整条替换成本域取向（标签「转化平衡」含销售「转化」语义，故整条
+/// 含标签一并替换）。锚找不到 → 原样返回。空覆盖即 no-op、幂等。
+pub fn apply_reviewer_balance_principle(user: &str, override_text: Option<&str>) -> String {
+    let Some(principle) = override_text.map(str::trim).filter(|s| !s.is_empty()) else {
+        return user.to_string();
+    };
+    if principle == DEFAULT_REVIEWER_BALANCE_PRINCIPLE {
+        return user.to_string();
+    }
+    user.replace(DEFAULT_REVIEWER_BALANCE_PRINCIPLE, principle)
+}
+
+/// universal-domain-adaptation I：completeness `answeringMode` 三档的写死销售释义
+/// （喂 LLM 的「判断规则」段，逐字复刻 catalog.rs 原文）。三档 key 是域无关认知阶梯，
+/// 恒定；释义可被 `AnsweringModeProfile` 按行业覆盖。
+pub const DEFAULT_ANSWERING_RULE_RELATIONSHIP_ONLY: &str =
+    "没有足够 verified 知识支撑产品/服务事实，只能关系维护、澄清需求、收集信息。";
+pub const DEFAULT_ANSWERING_RULE_PRODUCT_SAFE: &str =
+    "可回答部分产品/服务能力，但报价、案例、效果或交付边界仍不足。";
+pub const DEFAULT_ANSWERING_RULE_FULLY_SUPPORTED: &str =
+    "能力、边界、证据类内容足够支撑常见产品事实问题。";
+
+/// I：三档前端中文标签的写死销售文案（逐字复刻 `AnsweringModeGauge.tsx` MODE_MAP）。
+pub const DEFAULT_ANSWERING_LABEL_RELATIONSHIP_ONLY: &str = "仅关系维护";
+pub const DEFAULT_ANSWERING_LABEL_PRODUCT_SAFE: &str = "可安全讲产品";
+pub const DEFAULT_ANSWERING_LABEL_FULLY_SUPPORTED: &str = "完全支撑";
+
+/// I：渲染 completeness 审计 prompt「判断规则」段开头的三档释义 bullet。
+///
+/// 每档释义按 `AnsweringModeProfile.{档}.rule` 覆盖，`None`（DEFAULT/老库 / 该档未声明）
+/// 回落写死销售释义。三档 key 恒定（`relationship_only` / `product_safe` /
+/// `fully_supported`）。DEFAULT_PROFILE（answering_mode_profile=None）→ 三行与改造前
+/// prompt 字面量逐字一致 → completeness prompt 字节等价。
+pub fn render_answering_mode_rules(profile: Option<&AnsweringModeProfile>) -> String {
+    let pick = |descriptor: Option<&crate::models::AnsweringModeDescriptor>, default: &str| {
+        descriptor
+            .and_then(|d| d.rule.as_deref())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or(default)
+            .to_string()
+    };
+    let r = pick(
+        profile.and_then(|p| p.relationship_only.as_ref()),
+        DEFAULT_ANSWERING_RULE_RELATIONSHIP_ONLY,
+    );
+    let p_safe = pick(
+        profile.and_then(|p| p.product_safe.as_ref()),
+        DEFAULT_ANSWERING_RULE_PRODUCT_SAFE,
+    );
+    let f = pick(
+        profile.and_then(|p| p.fully_supported.as_ref()),
+        DEFAULT_ANSWERING_RULE_FULLY_SUPPORTED,
+    );
+    format!(
+        "- relationship_only: {r}\n- product_safe: {p_safe}\n- fully_supported: {f}"
+    )
+}
+
+/// I：三档前端标签（label）解析，按 `AnsweringModeProfile.{档}.label` 覆盖、`None` 回落
+/// 写死销售标签。回传 `(relationship_only, product_safe, fully_supported)` 标签三元组，
+/// 由 completeness 响应带给前端 `AnsweringModeGauge`（前端不再硬编码销售标签）。
+pub fn answering_mode_labels(profile: Option<&AnsweringModeProfile>) -> (String, String, String) {
+    let pick = |descriptor: Option<&crate::models::AnsweringModeDescriptor>, default: &str| {
+        descriptor
+            .and_then(|d| d.label.as_deref())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or(default)
+            .to_string()
+    };
+    (
+        pick(
+            profile.and_then(|p| p.relationship_only.as_ref()),
+            DEFAULT_ANSWERING_LABEL_RELATIONSHIP_ONLY,
+        ),
+        pick(
+            profile.and_then(|p| p.product_safe.as_ref()),
+            DEFAULT_ANSWERING_LABEL_PRODUCT_SAFE,
+        ),
+        pick(
+            profile.and_then(|p| p.fully_supported.as_ref()),
+            DEFAULT_ANSWERING_LABEL_FULLY_SUPPORTED,
+        ),
+    )
+}
+
 /// 构造内置 DEFAULT_PROFILE。内容逐字等价当前源码写死的销售域行为。
 ///
 /// 注意：这里复刻的常量与以下源码点**必须保持同步**，Phase 1 切换消费点后由
@@ -527,11 +648,11 @@ pub fn default_domain_profile(workspace_id: &str) -> DomainProfile {
         },
         coverage_dimensions: vec![
             // 逐字复刻 catalog.rs 五维 + 命中锚点散文（H5-b：anchor_hint 注入审计 prompt）。
-            CoverageDimension { key: "capability".to_string(), display_name: "能力".to_string(), required: false, anchor_hint: Some("有 verified 切片陈述产品/服务\"能做什么\"的具体能力或功能事实。".to_string()) },
-            CoverageDimension { key: "pricing".to_string(), display_name: "报价".to_string(), required: false, anchor_hint: Some("有 verified 切片含具体报价/计费/套餐金额（注意：仅 needs_review 草稿里的报价不计入 verifiedFact，而应置 pendingDraft=true 并入 gap）。".to_string()) },
-            CoverageDimension { key: "caseEvidence".to_string(), display_name: "案例证据".to_string(), required: false, anchor_hint: Some("有 verified 切片描述**具体客户案例/实施成效**（含可核验的主体、场景或落地结果），即判 true。".to_string()) },
-            CoverageDimension { key: "effectClaims".to_string(), display_name: "效果声明".to_string(), required: false, anchor_hint: Some("有 verified 切片含**可核验的效果数据/量化成果**（如转化率提升、响应时长变化等具体数字），即判 true。".to_string()) },
-            CoverageDimension { key: "deliveryBoundary".to_string(), display_name: "交付边界".to_string(), required: false, anchor_hint: Some("有 verified 切片陈述交付方式/SLA/可用性/部署边界等具体条款。".to_string()) },
+            CoverageDimension { key: "capability".to_string(), display_name: "能力".to_string(), required: false, anchor_hint: Some("有 verified 切片陈述产品/服务\"能做什么\"的具体能力或功能事实。".to_string()), initial_signal: Some("verified".to_string()) },
+            CoverageDimension { key: "pricing".to_string(), display_name: "报价".to_string(), required: false, anchor_hint: Some("有 verified 切片含具体报价/计费/套餐金额（注意：仅 needs_review 草稿里的报价不计入 verifiedFact，而应置 pendingDraft=true 并入 gap）。".to_string()), initial_signal: None },
+            CoverageDimension { key: "caseEvidence".to_string(), display_name: "案例证据".to_string(), required: false, anchor_hint: Some("有 verified 切片描述**具体客户案例/实施成效**（含可核验的主体、场景或落地结果），即判 true。".to_string()), initial_signal: Some("evidence".to_string()) },
+            CoverageDimension { key: "effectClaims".to_string(), display_name: "效果声明".to_string(), required: false, anchor_hint: Some("有 verified 切片含**可核验的效果数据/量化成果**（如转化率提升、响应时长变化等具体数字），即判 true。".to_string()), initial_signal: Some("evidence".to_string()) },
+            CoverageDimension { key: "deliveryBoundary".to_string(), display_name: "交付边界".to_string(), required: false, anchor_hint: Some("有 verified 切片陈述交付方式/SLA/可用性/部署边界等具体条款。".to_string()), initial_signal: Some("verified".to_string()) },
         ],
         // 逐字复刻 planner 写死的停滞计时维度（customer_stage）。
         stagnation_dimension: Some("customer_stage".to_string()),
@@ -568,6 +689,12 @@ pub fn default_domain_profile(workspace_id: &str) -> DomainProfile {
         // M2：DEFAULT 不覆盖五闸阈值 → gateway 沿用 domain_config 解析的销售域阈值
         // （字节等价）。换行业可声明自己的阈值（如情感域放宽 pressure_risk）。
         threshold_overrides: None,
+        // D：DEFAULT 不覆盖评审取向 → reviewer prompt 的「评审重点 / 转化平衡」两句保留
+        // 写死销售取向（字节等价）。换行业可声明中性 / 本域取向。
+        reviewer_orientation: None,
+        // I：DEFAULT 不覆盖 answeringMode 三档释义/标签 → completeness prompt 三档释义
+        // 与前端档位标签保留写死销售文案（prompt 字节等价、UI 标签不变）。
+        answering_mode_profile: None,
         version: 1,
         current_version: true,
         previous_version: None,
@@ -870,15 +997,21 @@ mod tests {
 
     #[test]
     fn default_profile_commitment_markers_match_guards_verbatim() {
-        // 逐字等价护栏：与 guards.rs::commitment_claim_class 的两组词表一致。
+        // 跨模块等价护栏（修复 G）：DEFAULT seed 必须逐字等于 guards 的 fallback const
+        // 单一真相源——直接引用 guards::{PRODUCT_EFFECT_MARKERS, TONE_ONLY_MARKERS}，
+        // 而非各自抄一份字面量。此前本测试只断言 seed==内联字面量、从不引用 guards const，
+        // 故 guards const 若被改，seed 与 fallback 漂移也照样绿（与 outcome_polarity 的
+        // 引用式同源相比缺一层保护）。现升级为真交叉引用，锁死两侧任一漂移。
         let p = default_domain_profile("ws-1");
         assert_eq!(
             p.commitment_markers.product_effect,
-            vec!["成功率", "见效", "回款", "百分之", "百分百"]
+            crate::agent::guards::PRODUCT_EFFECT_MARKERS.to_vec(),
+            "DEFAULT seed product_effect 必须与 guards::PRODUCT_EFFECT_MARKERS 逐字一致"
         );
         assert_eq!(
             p.commitment_markers.tone_only,
-            vec!["保证", "一定能", "绝对"]
+            crate::agent::guards::TONE_ONLY_MARKERS.to_vec(),
+            "DEFAULT seed tone_only 必须与 guards::TONE_ONLY_MARKERS 逐字一致"
         );
     }
 
@@ -1032,6 +1165,35 @@ mod tests {
         // 阈值，销售域行为字节等价。换行业才声明 threshold_overrides。
         let p = default_domain_profile("ws-1");
         assert!(p.threshold_overrides.is_none());
+    }
+
+    #[test]
+    fn default_profile_reviewer_orientation_is_none() {
+        // D 零扰动护栏：DEFAULT_PROFILE 不声明评审取向覆盖 → reviewer prompt 的
+        // 「评审重点 / 转化平衡」两句保留写死销售取向、字节等价。
+        let p = default_domain_profile("ws-1");
+        assert!(p.reviewer_orientation.is_none());
+    }
+
+    #[test]
+    fn default_profile_coverage_initial_signal_reproduces_legacy_rule() {
+        // H 等价护栏：completeness degraded fallback 初值规则原写死按维度名分派
+        // （capability/deliveryBoundary→verified、caseEvidence/effectClaims→evidence、
+        // pricing→恒缺）。规则下放 DomainProfile.coverage_dimensions.initial_signal 后，
+        // DEFAULT 五维必须 seed 出与原规则逐项一致的 signal，否则销售域 fallback 行为漂移。
+        let p = default_domain_profile("ws-1");
+        let sig = |key: &str| -> Option<String> {
+            p.coverage_dimensions
+                .iter()
+                .find(|d| d.key == key)
+                .and_then(|d| d.initial_signal.clone())
+        };
+        assert_eq!(sig("capability").as_deref(), Some("verified"));
+        assert_eq!(sig("deliveryBoundary").as_deref(), Some("verified"));
+        assert_eq!(sig("caseEvidence").as_deref(), Some("evidence"));
+        assert_eq!(sig("effectClaims").as_deref(), Some("evidence"));
+        // pricing 原规则恒缺（落 else 分支）→ 不声明 signal。
+        assert_eq!(sig("pricing"), None);
     }
 
     #[test]
@@ -1457,6 +1619,142 @@ mod tests {
         let out = apply_conversation_mode_enum_list(prose, &modes);
         // 散文逐字保留（无数组/竖线枚举列表子串可匹配 → 不动）。
         assert_eq!(out, prose, "散文描述段不应被触碰");
+    }
+
+    // ── D：reviewer 评审取向随 profile 渲染（去销售取向）──
+
+    const SAMPLE_REVIEW_SYSTEM: &str = "评分范围 0-10，risk 越高越危险。\n\
+        评审重点：事实准确、像真人微信、情绪价值、低压推进、产品知识一致性、没有操控营销。\n\
+        判 HumanLikeScore 时……";
+    const SAMPLE_REVIEW_USER: &str = "评审原则：\n\
+        - 转化平衡：既允许适度推进，也不能伤害信任。\n\
+        - 禁止虚假稀缺、恐惧营销、编造案例、编造价格、编造承诺。";
+
+    /// DEFAULT / None / 空白覆盖 → reviewer system「评审重点」行逐字保留、字节等价。
+    #[test]
+    fn apply_reviewer_review_focus_none_is_byte_identical() {
+        assert_eq!(apply_reviewer_review_focus(SAMPLE_REVIEW_SYSTEM, None), SAMPLE_REVIEW_SYSTEM);
+        assert_eq!(apply_reviewer_review_focus(SAMPLE_REVIEW_SYSTEM, Some("   ")), SAMPLE_REVIEW_SYSTEM);
+        // 覆盖文本恰等于写死销售取向 → 也不替换（幂等、无扰动）。
+        assert_eq!(
+            apply_reviewer_review_focus(SAMPLE_REVIEW_SYSTEM, Some(DEFAULT_REVIEWER_REVIEW_FOCUS)),
+            SAMPLE_REVIEW_SYSTEM
+        );
+    }
+
+    /// Some → 替换「评审重点：」冒号后的销售取向描述为本域取向，保留中性标签前缀。
+    #[test]
+    fn apply_reviewer_review_focus_replaces_sales_orientation() {
+        let out = apply_reviewer_review_focus(
+            SAMPLE_REVIEW_SYSTEM,
+            Some("真诚陪伴、像真人微信、情绪价值、尊重边界、不越界承诺。"),
+        );
+        assert!(out.contains("评审重点：真诚陪伴、像真人微信、情绪价值、尊重边界、不越界承诺。"));
+        // 销售漏斗措辞已不再残留。
+        assert!(!out.contains("低压推进"), "销售取向残留：{out}");
+        assert!(!out.contains("产品知识一致性"), "销售取向残留：{out}");
+        // 其余写死内容（前后行）逐字保留。
+        assert!(out.contains("评分范围 0-10，risk 越高越危险。"));
+        assert!(out.contains("判 HumanLikeScore 时……"));
+    }
+
+    /// 锚找不到（运营改写过 prompt）→ 原样返回，不强插污染。
+    #[test]
+    fn apply_reviewer_review_focus_no_anchor_is_noop() {
+        let custom = "评分范围 0-10。\n判 HumanLikeScore 时……";
+        assert_eq!(apply_reviewer_review_focus(custom, Some("本域取向。")), custom);
+    }
+
+    /// DEFAULT / None / 空白覆盖 → reviewer user「转化平衡」条逐字保留、字节等价。
+    #[test]
+    fn apply_reviewer_balance_principle_none_is_byte_identical() {
+        assert_eq!(apply_reviewer_balance_principle(SAMPLE_REVIEW_USER, None), SAMPLE_REVIEW_USER);
+        assert_eq!(apply_reviewer_balance_principle(SAMPLE_REVIEW_USER, Some("  ")), SAMPLE_REVIEW_USER);
+        assert_eq!(
+            apply_reviewer_balance_principle(SAMPLE_REVIEW_USER, Some(DEFAULT_REVIEWER_BALANCE_PRINCIPLE)),
+            SAMPLE_REVIEW_USER
+        );
+    }
+
+    /// Some → 整条「转化平衡：…」替换为本域取向（含标签，去掉销售「转化」语义）。
+    #[test]
+    fn apply_reviewer_balance_principle_replaces_conversion_framing() {
+        let out = apply_reviewer_balance_principle(
+            SAMPLE_REVIEW_USER,
+            Some("关系平衡：既允许真诚靠近，也不能制造依赖或越界。"),
+        );
+        assert!(out.contains("- 关系平衡：既允许真诚靠近，也不能制造依赖或越界。"));
+        assert!(!out.contains("转化平衡"), "销售「转化」标签残留：{out}");
+        assert!(!out.contains("适度推进"), "销售取向残留：{out}");
+        // 同段其余写死原则逐字保留。
+        assert!(out.contains("禁止虚假稀缺、恐惧营销、编造案例、编造价格、编造承诺。"));
+    }
+
+    /// 两字段独立回落：只覆盖其一时，另一处保持写死。
+    #[test]
+    fn apply_reviewer_orientation_fields_fall_back_independently() {
+        // 只覆盖 balance_principle，review_focus=None → system 仍为销售取向。
+        assert_eq!(apply_reviewer_review_focus(SAMPLE_REVIEW_SYSTEM, None), SAMPLE_REVIEW_SYSTEM);
+        let user_out = apply_reviewer_balance_principle(SAMPLE_REVIEW_USER, Some("关系平衡：真诚靠近、不制造依赖。"));
+        assert!(user_out.contains("关系平衡："));
+    }
+
+    // ── I：answeringMode 三档释义/标签随 profile 渲染 ──
+
+    /// DEFAULT（None）→ 三档释义 bullet 与改造前写死 prompt 字面量逐字一致（字节等价）。
+    #[test]
+    fn render_answering_mode_rules_none_is_byte_equivalent() {
+        let got = render_answering_mode_rules(None);
+        let expected = "- relationship_only: 没有足够 verified 知识支撑产品/服务事实，只能关系维护、澄清需求、收集信息。\n\
+            - product_safe: 可回答部分产品/服务能力，但报价、案例、效果或交付边界仍不足。\n\
+            - fully_supported: 能力、边界、证据类内容足够支撑常见产品事实问题。";
+        assert_eq!(got, expected);
+    }
+
+    /// 换行业声明本域释义 → 三档 key 恒定、释义替换；缺的档逐档回落写死销售释义。
+    #[test]
+    fn render_answering_mode_rules_overrides_per_state() {
+        use crate::models::{AnsweringModeDescriptor, AnsweringModeProfile};
+        let profile = AnsweringModeProfile {
+            relationship_only: Some(AnsweringModeDescriptor {
+                rule: Some("只能纯倾听陪伴，不触及任何专业判断。".to_string()),
+                label: None,
+            }),
+            product_safe: None, // 逐档回落
+            fully_supported: Some(AnsweringModeDescriptor {
+                rule: Some("可在已验证边界内深入交流。".to_string()),
+                label: None,
+            }),
+        };
+        let got = render_answering_mode_rules(Some(&profile));
+        assert!(got.contains("- relationship_only: 只能纯倾听陪伴，不触及任何专业判断。"));
+        // product_safe 未声明 → 回落写死销售释义。
+        assert!(got.contains("- product_safe: 可回答部分产品/服务能力，但报价、案例、效果或交付边界仍不足。"));
+        assert!(got.contains("- fully_supported: 可在已验证边界内深入交流。"));
+        // key 恒定（认知阶梯），三档齐全。
+        assert_eq!(got.matches("- relationship_only:").count(), 1);
+        assert_eq!(got.matches("- product_safe:").count(), 1);
+        assert_eq!(got.matches("- fully_supported:").count(), 1);
+    }
+
+    /// 标签解析：DEFAULT/None → 内置销售标签；Some 逐档覆盖、缺的档回落。
+    #[test]
+    fn answering_mode_labels_fall_back_per_state() {
+        use crate::models::{AnsweringModeDescriptor, AnsweringModeProfile};
+        // None → 三档写死销售标签。
+        assert_eq!(
+            answering_mode_labels(None),
+            ("仅关系维护".to_string(), "可安全讲产品".to_string(), "完全支撑".to_string())
+        );
+        let profile = AnsweringModeProfile {
+            relationship_only: Some(AnsweringModeDescriptor { rule: None, label: Some("纯陪伴倾听".to_string()) }),
+            product_safe: None,
+            fully_supported: None,
+        };
+        let (r, p, f) = answering_mode_labels(Some(&profile));
+        assert_eq!(r, "纯陪伴倾听");
+        assert_eq!(p, "可安全讲产品"); // 逐档回落
+        assert_eq!(f, "完全支撑");
     }
 
     // ── 1G-c：DomainProfileCache TTL / 命中 / 回落 / 失效（无 Docker 纯内存）──

@@ -1,20 +1,25 @@
-import type { AnsweringMode } from "../trustTypes";
+import type { AnsweringMode, AnsweringModeLabels } from "../trustTypes";
+import { DEFAULT_ANSWERING_MODE_LABELS } from "../trustTypes";
 import styles from "./AnsweringModeGauge.module.css";
 
 interface AnsweringModeGaugeProps {
   mode: AnsweringMode;
   needsReviewChunks: number;
   summary: string;
+  // I：档位标签随 active DomainProfile 而来（非销售域换掉销售标签）。缺省回落内置销售标签。
+  labels?: AnsweringModeLabels;
 }
 
-const MODE_MAP: Record<AnsweringMode, { label: string; level: number }> = {
-  relationship_only: { label: "仅关系维护", level: 1 },
-  product_safe: { label: "可安全讲产品", level: 2 },
-  fully_supported: { label: "完全支撑", level: 3 },
+// 档位深度（1/2/3）是域无关的认知阶梯，恒定写死；档位中文标签由 profile 决定。
+const MODE_LEVEL: Record<AnsweringMode, number> = {
+  relationship_only: 1,
+  product_safe: 2,
+  fully_supported: 3,
 };
 
-export function AnsweringModeGauge({ mode, needsReviewChunks, summary }: AnsweringModeGaugeProps) {
-  const { label, level } = MODE_MAP[mode];
+export function AnsweringModeGauge({ mode, needsReviewChunks, summary, labels }: AnsweringModeGaugeProps) {
+  const label = (labels ?? DEFAULT_ANSWERING_MODE_LABELS)[mode];
+  const level = MODE_LEVEL[mode];
   const fillPct = (level / 3) * 100;
 
   let reading = "";

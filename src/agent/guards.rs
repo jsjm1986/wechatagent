@@ -357,21 +357,30 @@ pub(crate) enum CommitmentClass {
     None,
 }
 
+/// universal-domain-adaptation H4：DEFAULT 销售域绝对化承诺词表 fallback const。
+///
+/// `commitment_claim_class` 在 active profile 的 `commitment_markers` 为空时回落到这两组
+/// （向后兼容 + 防御老库/异常 profile）。**单一真相源**：`default_domain_profile` 的
+/// `commitment_markers` seed 逐字复刻这两组，由 `default_profile_commitment_markers_match_guards_const`
+/// 跨模块等价测试锁死（防 seed 与 fallback 漂移）。提到模块级 `pub(crate)` 即为供该测试引用。
+pub(crate) const PRODUCT_EFFECT_MARKERS: [&str; 5] =
+    ["成功率", "见效", "回款", "百分之", "百分百"];
+/// 见 [`PRODUCT_EFFECT_MARKERS`]：纯语气类绝对化承诺 fallback const。
+pub(crate) const TONE_ONLY_MARKERS: [&str; 3] = ["保证", "一定能", "绝对"];
+
 /// 把候选回复按承诺词类型分类。ProductEffect 优先（同时命中两类时取更危险者）。
 /// 词表与 `prompts.rs` 既有 `user.review.product_claim_markers` 模板同源，切分两类
 /// 以控制误杀：效果/数据类几乎只出现在可验证产品断言；语气类大量出现在情感/口语承诺。
 ///
 /// universal-domain-adaptation H4：词表从写死 const 改为读 `markers`（来自 active
-/// DomainProfile.commitment_markers）。`markers` 两组皆空时回落内置销售域 const——
-/// 防御老库/异常 profile，且 DEFAULT_PROFILE 的词表逐字复刻 const（等价护栏锁死），
-/// 故 DEFAULT 下行为字节等价。换行业=另一份 profile 声明本行业的绝对化承诺词。
+/// DomainProfile.commitment_markers）。`markers` 两组皆空时回落内置销售域 const
+/// （[`PRODUCT_EFFECT_MARKERS`] / [`TONE_ONLY_MARKERS`]）——防御老库/异常 profile，且
+/// DEFAULT_PROFILE 的词表逐字复刻 const（等价护栏锁死），故 DEFAULT 下行为字节等价。
+/// 换行业=另一份 profile 声明本行业的绝对化承诺词。
 pub(crate) fn commitment_claim_class(
     reply_text: &str,
     markers: &CommitmentMarkers,
 ) -> CommitmentClass {
-    const PRODUCT_EFFECT_MARKERS: [&str; 5] =
-        ["成功率", "见效", "回款", "百分之", "百分百"];
-    const TONE_ONLY_MARKERS: [&str; 3] = ["保证", "一定能", "绝对"];
     let text = reply_text.trim();
     if text.is_empty() {
         return CommitmentClass::None;
