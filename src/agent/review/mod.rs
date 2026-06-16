@@ -436,7 +436,7 @@ Review 模式: {}
         // 软闸失败时保持 approved=false（review_passed 行为）但同时写
         // needs_revision=true / revision_direction，让 finalize 在硬门未命中时
         // 把 soft-gate-only 失败矫正为 Approved，以触发 single-shot revision。
-        route_dual_gate(&mut review, runtime, &decision.reply_text);
+        route_dual_gate(&mut review, runtime, &decision.reply_text, &inbound.content);
 
         // Phase E / E2：reviewer 双脑并行——若 AppState 注入了第二 provider，再跑
         // 一份独立评分，与主 reviewer 走 [`detect_dual_reviewer_disagreement`]
@@ -446,7 +446,7 @@ Review 模式: {}
             Ok(second_value) => match serde_json::from_value::<DecisionReviewResult>(second_value)
             {
                 Ok(mut second_review) => {
-                    route_dual_gate(&mut second_review, runtime, &decision.reply_text);
+                    route_dual_gate(&mut second_review, runtime, &decision.reply_text, &inbound.content);
                     if let Some(disagreement) =
                         detect_dual_reviewer_disagreement(&review, &second_review, runtime)
                     {
@@ -481,7 +481,7 @@ Review 模式: {}
     };
     let mut review: DecisionReviewResult = serde_json::from_value(value)?;
     let _ = (decision, domain_config, knowledge_chunks, contact);
-    route_dual_gate(&mut review, runtime, &decision.reply_text);
+    route_dual_gate(&mut review, runtime, &decision.reply_text, &inbound.content);
 
     Ok(review)
 }

@@ -103,6 +103,7 @@ pub(crate) enum DualGateClassification {
 pub(crate) fn classify_dual_gate(
     review: &DecisionReviewResult,
     runtime: &UserRuntimeParameters,
+    refused_probing: bool,
 ) -> DualGateClassification {
     let mut hard_risks: Vec<String> = Vec::new();
     if review.scores.hallucination_score >= runtime.fact_risk_block_at {
@@ -152,12 +153,22 @@ pub(crate) fn classify_dual_gate(
             "pressure_risk_{}_ge_{}",
             review.scores.pressure_risk, runtime.pressure_risk_block_at
         ));
-        direction_parts.push(format!(
-            "pressureRisk 评分 {} 高于等于阈值 {}：去掉催促、紧迫、稀缺感、\
-             连环追问；改为承接对方顾虑 + 1 个轻量澄清问题或 1 个具体小建议，\
-             留出对方思考空间。",
-            review.scores.pressure_risk, runtime.pressure_risk_block_at
-        ));
+        let pressure_direction = if refused_probing {
+            format!(
+                "pressureRisk 评分 {} 高于等于阈值 {}：去掉催促、紧迫、稀缺感、\
+                 连环追问；用户本轮已明确表示不想被追问，改为纯陈述句承接对方顾虑、\
+                 给足空间，本轮不要提任何问题。",
+                review.scores.pressure_risk, runtime.pressure_risk_block_at
+            )
+        } else {
+            format!(
+                "pressureRisk 评分 {} 高于等于阈值 {}：去掉催促、紧迫、稀缺感、\
+                 连环追问；改为承接对方顾虑 + 1 个轻量澄清问题或 1 个具体小建议，\
+                 留出对方思考空间。",
+                review.scores.pressure_risk, runtime.pressure_risk_block_at
+            )
+        };
+        direction_parts.push(pressure_direction);
     }
     if review.scores.emotional_value < runtime.emotional_value_rewrite_below {
         soft_risks.push(format!(
@@ -198,8 +209,10 @@ pub(crate) fn route_dual_gate(
     review: &mut DecisionReviewResult,
     runtime: &UserRuntimeParameters,
     reply_text: &str,
+    inbound_text: &str,
 ) {
-    let classification = classify_dual_gate(review, runtime);
+    let refused_probing = user_refused_probing(inbound_text);
+    let classification = classify_dual_gate(review, runtime, refused_probing);
     // 先按 review_passed 写一遍 approved（保持现有 PBT / 老调用点的语义不
     // 变；soft-gate 路径下 finalize 会再矫正回 true）。
     let baseline_approved = review_passed(review, runtime);
@@ -219,7 +232,7 @@ pub(crate) fn route_dual_gate(
             // item ②：把本次回复的客观特征（问句数 / 字数 / 共情词密度）追加到
             // 改写方向后，让单次改写有的放矢，而非只给机械模板。对 reviewer 自带
             // 方向同样追加（事实标注不冲突，只补充客观信息）。
-            let features = reply_objective_features(reply_text);
+            let features = reply_objective_features(reply_text, refused_probing);
             if !features.is_empty() {
                 if !review.revision_direction.is_empty() {
                     review.revision_direction.push(' ');
@@ -236,13 +249,47 @@ pub(crate) fn route_dual_gate(
     }
 }
 
+/// 用户本轮是否**明确针对「被提问」这一行为**表达拒绝（语义指向"别再问我问题"）。
+///
+/// 命中时，软闸改写方向里「问句过少可加反问」这条通用建议会反向引导（用户
+/// 刚说别问、改写却被劝加问句 → 改写两次都改不掉问句 → revision_failed）。
+/// 据此把加问句的引导反转为「本轮避免问句」。仿 [`reply_objective_features`]
+/// 的 EMPATHY_WORDS 惯例，用确定性中文词表匹配，不引 LLM。
+///
+/// **刻意只收语义明确指向"停止提问"的短语**，剔除情绪化但歧义大的表达：
+/// 在情感陪伴 / 亲密关系语境里「烦死了」「别管我」「不想说」常是撒娇、闹情绪、
+/// 欲拒还迎，并非真的请勿打扰——若据此让 AI 改成「纯陈述、不提任何问题」反而
+/// 误读情绪、显得冷淡。故词表只保留「别问/别再问/不要问我」这类把"问"作为
+/// 拒绝对象、几乎无歧义的短语；歧义情绪词交给 reviewer 的 LLM 语义判断，不在
+/// 这层确定性词表里硬判（宁可漏判退化为现状，不误伤撒娇）。
+const REFUSE_PROBING_WORDS: [&str; 8] = [
+    "别问",
+    "别一直问",
+    "别再问",
+    "不要问",
+    "不要再问",
+    "别追问",
+    "不想被问",
+    "别问了",
+];
+
+fn user_refused_probing(inbound_text: &str) -> bool {
+    REFUSE_PROBING_WORDS
+        .iter()
+        .any(|w| inbound_text.contains(w))
+}
+
 /// item ②：从候选回复正文提取廉价客观特征，供软闸改写指令使用。
 ///
 /// 不做任何判罚——只把「问句数 / 字数 / 共情词命中数」这三个真模型自己难以
 /// 准确自测的客观量算出来，拼成一句中文提示追加到 revision_direction，让单次
 /// 改写有具体抓手（如"0 个问句、58 字、共情词 0"→ 加自然反问 / 精简 / 补共情）。
 /// 空回复返回空串（不追加）。
-fn reply_objective_features(reply_text: &str) -> String {
+///
+/// `refused_probing=true`（用户本轮明确拒绝追问）时，问句那条引导从「可加反问」
+/// 反转为「本轮避免问句」——否则会与用户「别问」的诉求冲突，改写反复加问句导致
+/// revision_failed。`false` 时输出与历史字节等价（零扰动）。
+fn reply_objective_features(reply_text: &str, refused_probing: bool) -> String {
     let text = reply_text.trim();
     if text.is_empty() {
         return String::new();
@@ -253,9 +300,14 @@ fn reply_objective_features(reply_text: &str) -> String {
         "理解", "明白", "辛苦", "不容易", "感受", "确实", "懂", "体会", "替你", "为你",
     ];
     let empathy: usize = EMPATHY_WORDS.iter().map(|w| text.matches(w).count()).sum();
+    let question_hint = if refused_probing {
+        "用户本轮已明确表示不想被追问，本轮务必避免任何问句，改用陈述句承接对方的陪伴与情绪"
+    } else {
+        "问句过少可加 1 个自然反问以推进对话"
+    };
     format!(
         "【本次回复客观特征】问句 {questions} 个、{chars} 字、共情词约 {empathy} 处——\
-         改写时据此调整：问句过少可加 1 个自然反问以推进对话；篇幅过长可精简到口语节奏；\
+         改写时据此调整：{question_hint}；篇幅过长可精简到口语节奏；\
          共情词偏少可先承接对方处境再给信息。"
     )
 }
@@ -324,8 +376,8 @@ pub(crate) fn detect_dual_reviewer_disagreement(
     if primary_approved != second_approved {
         return Some(DualReviewerDisagreement::ApprovedMismatch);
     }
-    let primary_class = classify_dual_gate(primary, runtime);
-    let second_class = classify_dual_gate(second, runtime);
+    let primary_class = classify_dual_gate(primary, runtime, false);
+    let second_class = classify_dual_gate(second, runtime, false);
     match (&primary_class, &second_class) {
         (DualGateClassification::AllPass, DualGateClassification::AllPass) => None,
         (
@@ -571,7 +623,7 @@ pub fn finalize_review_for_send(
     // 756 行分支会把硬闸失败的危险回复矫正成 approved 发出去。R5.4 verified-claim 硬门
     // / should_hold / budget 各自在下方 return，本降级既不绕过它们、也不改 should_reply。
     let hard_gate_failed = matches!(
-        classify_dual_gate(&review, runtime),
+        classify_dual_gate(&review, runtime, false),
         DualGateClassification::HardGateFailure { .. }
     );
     if has_insufficient_detail_only(&promote_risks) && decision.should_reply && !hard_gate_failed {
@@ -1224,8 +1276,9 @@ mod dual_gate_classification_tests {
         AgentDecision, DecisionReviewResult, ReviewScores, HOLD_CATEGORY_HELD_BY_AI_POLICY,
     };
     use super::{
-        classify_dual_gate, decide_revision, finalize_review_for_send, route_dual_gate,
-        DualGateClassification, FinalizeOutcome, GatewayStatusFinal, RevisionDecision,
+        classify_dual_gate, decide_revision, finalize_review_for_send, reply_objective_features,
+        route_dual_gate, user_refused_probing, DualGateClassification, FinalizeOutcome,
+        GatewayStatusFinal, RevisionDecision,
     };
     use crate::models::{AgentStatus, Contact};
     use mongodb::bson::{DateTime, Document};
@@ -1300,7 +1353,7 @@ mod dual_gate_classification_tests {
         let runtime = UserRuntimeParameters::default();
         let review = full_pass_review();
         assert_eq!(
-            classify_dual_gate(&review, &runtime),
+            classify_dual_gate(&review, &runtime, false),
             DualGateClassification::AllPass
         );
     }
@@ -1310,7 +1363,7 @@ mod dual_gate_classification_tests {
         let runtime = UserRuntimeParameters::default();
         let mut review = full_pass_review();
         review.scores.hallucination_score = runtime.fact_risk_block_at + 1;
-        match classify_dual_gate(&review, &runtime) {
+        match classify_dual_gate(&review, &runtime, false) {
             DualGateClassification::HardGateFailure { risks } => {
                 assert!(risks.iter().any(|r| r.starts_with("hallucination_score_")));
             }
@@ -1323,7 +1376,7 @@ mod dual_gate_classification_tests {
         let runtime = UserRuntimeParameters::default();
         let mut review = full_pass_review();
         review.scores.knowledge_grounding_score = runtime.product_accuracy_block_below - 1;
-        match classify_dual_gate(&review, &runtime) {
+        match classify_dual_gate(&review, &runtime, false) {
             DualGateClassification::HardGateFailure { risks } => {
                 assert!(risks
                     .iter()
@@ -1343,7 +1396,7 @@ mod dual_gate_classification_tests {
         review.scores.knowledge_grounding_score = runtime.product_accuracy_block_below - 1;
         // claim_analysis 默认空 → claim_requires_product_knowledge=false。
         assert_eq!(
-            classify_dual_gate(&review, &runtime),
+            classify_dual_gate(&review, &runtime, false),
             DualGateClassification::AllPass
         );
     }
@@ -1357,7 +1410,7 @@ mod dual_gate_classification_tests {
         let mut review = full_pass_review();
         review.scores.knowledge_grounding_score = runtime.product_accuracy_block_below - 1;
         review.claim_analysis = mongodb::bson::doc! { "requiresProductKnowledge": true };
-        match classify_dual_gate(&review, &runtime) {
+        match classify_dual_gate(&review, &runtime, false) {
             DualGateClassification::HardGateFailure { risks } => {
                 assert!(risks.iter().any(|r| r.starts_with("knowledge_grounding_")));
             }
@@ -1373,7 +1426,7 @@ mod dual_gate_classification_tests {
         assert!(!runtime.grounding_gate_bypass_without_claim);
         let mut review = full_pass_review();
         review.scores.knowledge_grounding_score = runtime.product_accuracy_block_below - 1;
-        match classify_dual_gate(&review, &runtime) {
+        match classify_dual_gate(&review, &runtime, false) {
             DualGateClassification::HardGateFailure { risks } => {
                 assert!(risks.iter().any(|r| r.starts_with("knowledge_grounding_")));
             }
@@ -1386,7 +1439,7 @@ mod dual_gate_classification_tests {
         let runtime = UserRuntimeParameters::default();
         let mut review = full_pass_review();
         review.scores.human_like = runtime.human_like_rewrite_below - 1;
-        match classify_dual_gate(&review, &runtime) {
+        match classify_dual_gate(&review, &runtime, false) {
             DualGateClassification::SoftGateFailure { direction, risks } => {
                 assert!(direction.contains("humanLike"));
                 assert!(!direction.trim().is_empty());
@@ -1401,7 +1454,7 @@ mod dual_gate_classification_tests {
         let runtime = UserRuntimeParameters::default();
         let mut review = full_pass_review();
         review.scores.pressure_risk = runtime.pressure_risk_block_at;
-        match classify_dual_gate(&review, &runtime) {
+        match classify_dual_gate(&review, &runtime, false) {
             DualGateClassification::SoftGateFailure { direction, risks } => {
                 assert!(direction.contains("pressureRisk"));
                 assert!(risks.iter().any(|r| r.starts_with("pressure_risk_")));
@@ -1417,9 +1470,63 @@ mod dual_gate_classification_tests {
         let mut review = full_pass_review();
         review.scores.pressure_risk = 0;
         assert_eq!(
-            classify_dual_gate(&review, &runtime),
+            classify_dual_gate(&review, &runtime, false),
             DualGateClassification::AllPass
         );
+    }
+
+    #[test]
+    fn user_refused_probing_detects_boundary_phrases() {
+        // 命中：语义明确指向"停止提问"。
+        assert!(user_refused_probing("别问了好吗"));
+        assert!(user_refused_probing("你别一直问我"));
+        assert!(user_refused_probing("不要再问这个了"));
+        assert!(user_refused_probing("我不想被问这些"));
+        // 不命中：情感陪伴语境里歧义大的撒娇/闹情绪，交给 reviewer LLM 语义判断，
+        // 词表不硬判（宁可漏判退化为现状，不误伤撒娇）。
+        assert!(!user_refused_probing("烦死了"));
+        assert!(!user_refused_probing("别管我啦"));
+        assert!(!user_refused_probing("不想说"));
+        assert!(!user_refused_probing("今天好累"));
+        assert!(!user_refused_probing(""));
+    }
+
+    #[test]
+    fn reply_objective_features_unchanged_when_not_refused() {
+        // refused=false 时输出与历史版本字节等价（锁回归，零扰动）。
+        let out = reply_objective_features("好的，我来想想看", false);
+        assert!(out.contains("问句过少可加 1 个自然反问以推进对话"));
+        assert!(!out.contains("避免任何问句"));
+    }
+
+    #[test]
+    fn reply_objective_features_avoids_question_when_refused() {
+        // refused=true 时问句引导反转为"本轮避免问句"。
+        let out = reply_objective_features("好的，我来想想看", true);
+        assert!(out.contains("避免任何问句"));
+        assert!(!out.contains("可加 1 个自然反问"));
+    }
+
+    #[test]
+    fn classify_dual_gate_pressure_direction_drops_question_when_refused() {
+        // 高 pressureRisk + 用户拒绝追问 → 改写方向不再鼓励加澄清问题。
+        let runtime = UserRuntimeParameters::default();
+        let mut review = full_pass_review();
+        review.scores.pressure_risk = runtime.pressure_risk_block_at;
+        match classify_dual_gate(&review, &runtime, true) {
+            DualGateClassification::SoftGateFailure { direction, .. } => {
+                assert!(direction.contains("本轮不要提任何问题"));
+                assert!(!direction.contains("1 个轻量澄清问题"));
+            }
+            other => panic!("expected SoftGateFailure, got {:?}", other),
+        }
+        // 对照：refused=false 时保留原措辞。
+        match classify_dual_gate(&review, &runtime, false) {
+            DualGateClassification::SoftGateFailure { direction, .. } => {
+                assert!(direction.contains("1 个轻量澄清问题"));
+            }
+            other => panic!("expected SoftGateFailure, got {:?}", other),
+        }
     }
 
     #[test]
@@ -1427,7 +1534,7 @@ mod dual_gate_classification_tests {
         let runtime = UserRuntimeParameters::default();
         let mut review = full_pass_review();
         review.scores.emotional_value = runtime.emotional_value_rewrite_below - 1;
-        match classify_dual_gate(&review, &runtime) {
+        match classify_dual_gate(&review, &runtime, false) {
             DualGateClassification::SoftGateFailure { direction, risks } => {
                 assert!(direction.contains("emotionalValue"));
                 assert!(risks.iter().any(|r| r.starts_with("emotional_value_")));
@@ -1442,7 +1549,7 @@ mod dual_gate_classification_tests {
         let mut review = full_pass_review();
         review.scores.human_like = runtime.human_like_rewrite_below - 1;
         review.scores.pressure_risk = runtime.pressure_risk_block_at + 1;
-        match classify_dual_gate(&review, &runtime) {
+        match classify_dual_gate(&review, &runtime, false) {
             DualGateClassification::SoftGateFailure { direction, risks } => {
                 assert!(direction.contains("humanLike"));
                 assert!(direction.contains("pressureRisk"));
@@ -1460,7 +1567,7 @@ mod dual_gate_classification_tests {
         let mut review = full_pass_review();
         review.scores.hallucination_score = runtime.fact_risk_block_at + 1;
         review.scores.human_like = runtime.human_like_rewrite_below - 1;
-        match classify_dual_gate(&review, &runtime) {
+        match classify_dual_gate(&review, &runtime, false) {
             DualGateClassification::HardGateFailure { .. } => {}
             other => panic!("expected HardGateFailure, got {:?}", other),
         }
@@ -1471,7 +1578,7 @@ mod dual_gate_classification_tests {
         let runtime = UserRuntimeParameters::default();
         let mut review = full_pass_review();
         review.scores.human_like = runtime.human_like_rewrite_below - 1;
-        route_dual_gate(&mut review, &runtime, "好的，我来想想看");
+        route_dual_gate(&mut review, &runtime, "好的，我来想想看", "");
         assert!(review.needs_revision, "软闸失败必须写 needs_revision");
         assert!(
             !review.revision_direction.trim().is_empty(),
@@ -1487,7 +1594,7 @@ mod dual_gate_classification_tests {
         let mut review = full_pass_review();
         review.scores.human_like = runtime.human_like_rewrite_below - 1;
         review.revision_direction = "reviewer 自己写的明确方向".to_string();
-        route_dual_gate(&mut review, &runtime, "好的，我来想想看");
+        route_dual_gate(&mut review, &runtime, "好的，我来想想看", "");
         assert!(
             review
                 .revision_direction
@@ -1503,7 +1610,7 @@ mod dual_gate_classification_tests {
         let mut review = full_pass_review();
         review.scores.hallucination_score = runtime.fact_risk_block_at + 1;
         let prev_dir = review.revision_direction.clone();
-        route_dual_gate(&mut review, &runtime, "好的，我来想想看");
+        route_dual_gate(&mut review, &runtime, "好的，我来想想看", "");
         assert!(!review.needs_revision, "硬闸失败不能触发 revision");
         assert_eq!(review.revision_direction, prev_dir);
         assert!(!review.approved);
@@ -1513,7 +1620,7 @@ mod dual_gate_classification_tests {
     fn route_dual_gate_keeps_all_pass_approved_true() {
         let runtime = UserRuntimeParameters::default();
         let mut review = full_pass_review();
-        route_dual_gate(&mut review, &runtime, "好的，我来想想看");
+        route_dual_gate(&mut review, &runtime, "好的，我来想想看", "");
         assert!(review.approved);
         assert!(!review.needs_revision);
     }
@@ -1525,7 +1632,7 @@ mod dual_gate_classification_tests {
         let runtime = UserRuntimeParameters::default();
         let mut review = full_pass_review();
         review.scores.pressure_risk = runtime.pressure_risk_block_at + 2;
-        route_dual_gate(&mut review, &runtime, "好的，我来想想看");
+        route_dual_gate(&mut review, &runtime, "好的，我来想想看", "");
         let mut decision = shouldreply_decision();
         let contact = finalize_contact();
         let outcome = finalize_review_for_send(
@@ -1560,7 +1667,7 @@ mod dual_gate_classification_tests {
         let runtime = UserRuntimeParameters::default();
         let mut review = full_pass_review();
         review.scores.hallucination_score = runtime.fact_risk_block_at + 1;
-        route_dual_gate(&mut review, &runtime, "好的，我来想想看");
+        route_dual_gate(&mut review, &runtime, "好的，我来想想看", "");
         let mut decision = shouldreply_decision();
         let contact = finalize_contact();
         let outcome = finalize_review_for_send(
@@ -1681,7 +1788,7 @@ mod dual_gate_classification_tests {
         let runtime = UserRuntimeParameters::default();
         let mut review = full_pass_review();
         review.scores.human_like = runtime.human_like_rewrite_below - 2;
-        route_dual_gate(&mut review, &runtime, "好的，我来想想看");
+        route_dual_gate(&mut review, &runtime, "好的，我来想想看", "");
         let mut decision = shouldreply_decision();
         let contact = finalize_contact();
         let outcome = finalize_review_for_send(
@@ -1714,7 +1821,7 @@ mod dual_gate_classification_tests {
         let runtime = UserRuntimeParameters::default();
         let mut review = full_pass_review();
         review.scores.knowledge_grounding_score = runtime.product_accuracy_block_below - 1;
-        route_dual_gate(&mut review, &runtime, "好的，我来想想看");
+        route_dual_gate(&mut review, &runtime, "好的，我来想想看", "");
         let mut decision = shouldreply_decision();
         let contact = finalize_contact();
         let outcome = finalize_review_for_send(
@@ -2154,7 +2261,7 @@ mod dual_gate_classification_tests {
         let runtime = UserRuntimeParameters::default();
         let mut review = full_pass_review();
         review.scores.hallucination_score = runtime.fact_risk_block_at + 1; // 硬闸失败
-        route_dual_gate(&mut review, &runtime, "好的，我来想想看"); // 硬闸 → approved=false，不设 needs_revision
+        route_dual_gate(&mut review, &runtime, "好的，我来想想看", ""); // 硬闸 → approved=false，不设 needs_revision
         let mut decision = shouldreply_decision();
         let contact = finalize_contact();
         let promote_risks =
