@@ -463,23 +463,18 @@ impl LlmClient {
         system: &str,
         user: &str,
     ) -> AppResult<(LlmJsonResult, Option<u64>)> {
-        // assistant prefill 内容：预填 `{` 强制 claude 从合法 JSON 开头续写。
-        const ANTHROPIC_JSON_PREFILL: &str = "{";
         let started_at = Instant::now();
-        // claude（尤其 opus 经中转）倾向先输出自然语言推理再给 JSON，复杂 prompt 下常只回
-        // 推理散文、JSON 缺失或被 max_tokens 截断（rsxermu CI 实测 domain_profile/knowledge
-        // 大面积 json_decode）。用 Anthropic 官方 **assistant prefill** 技巧：预填 assistant
-        // turn 为 `{`，强制 claude 从 `{` 续写合法 JSON、不再写"我需要先 open_chunk…"。
-        // 响应不含 prefill 的 `{`，故解析时补回（见下方 ANTHROPIC_JSON_PREFILL 拼接）。
-        // max_tokens 提到 8192 给结构化输出留足空间。
+        // claude（尤其 opus 经中转）常输出"自然语言推理 + JSON"混合体，JSON 可能在推理之后
+        // （rsxermu CI 实测：`我看到候选 catalog…\n\n{"action":"open_chunk",...}`）。不用 prefill
+        // 强制（实测 claude 无视、在 `{` 后继续写推理），改由下游 parse_json_content 的
+        // extract_first_json_block 从混合文本里提取首个可解析 JSON 块。max_tokens 8192 留足空间。
         let body = json!({
             "model": self.model,
             "max_tokens": 8192,
             "temperature": 0.2,
             "system": system,
             "messages": [
-                {"role": "user", "content": user},
-                {"role": "assistant", "content": ANTHROPIC_JSON_PREFILL}
+                {"role": "user", "content": user}
             ]
         });
 
@@ -544,23 +539,12 @@ impl LlmClient {
             })
             .unwrap_or_default();
         let cleaned = strip_reasoning_prefix(content);
-        // 补回 prefill 的 `{`：claude 从预填的 `{` 续写，响应 content 不含该 `{`。若 claude 无视
-        // prefill 仍自带 `{`/```（中转网关偶发不透传 prefill），则不重复补。
-        let trimmed_lead = cleaned.trim_start();
-        let candidate = if trimmed_lead.starts_with('{')
-            || trimmed_lead.starts_with('[')
-            || trimmed_lead.starts_with("```")
-        {
-            cleaned.clone()
-        } else {
-            format!("{ANTHROPIC_JSON_PREFILL}{cleaned}")
-        };
-        let value = match parse_json_content(&candidate) {
+        let value = match parse_json_content(&cleaned) {
             Ok(v) => v,
             Err(e) => {
-                // 临时诊断：prefill 补回后仍非 JSON，打印前缀确认 claude 实际输出形态。定位后移除。
-                let head: String = candidate.chars().take(300).collect();
-                eprintln!("[anthropic-diag] parse_json_content 失败: {e}; candidate_head={head:?}");
+                // 临时诊断：提取后仍非 JSON，打印前缀确认 claude 实际输出形态。定位后移除。
+                let head: String = cleaned.chars().take(300).collect();
+                eprintln!("[anthropic-diag] parse_json_content 失败: {e}; content_head={head:?}");
                 return Err(e);
             }
         };
@@ -998,30 +982,85 @@ fn parse_json_content(content: &str) -> AppResult<Value> {
     } else {
         trimmed
     };
-    // 部分模型（实测 rsxermu claude-opus-4-8 在复杂结构化输出 prompt 下）会在 JSON 前后加
-    // 自然语言（"Here is the profile:\n{...}\n希望有帮助"），剥 ``` 后首字符仍非 `{`/`[`。
-    // 严格解析前先尝试截取首个平衡的 JSON 对象/数组；截不出则原样走严格解析。非包裹场景零影响。
-    let json_text = if json_text.starts_with('{') || json_text.starts_with('[') {
-        json_text
-    } else {
-        extract_first_json_block(json_text).unwrap_or(json_text)
-    };
-    match serde_json::from_str::<Value>(json_text) {
-        Ok(value) => Ok(value),
-        Err(strict_err) => {
-            // R15 / ISSUE-006：DeepSeek 偶发输出含 trailing comma 或末尾未闭合
-            // 的 JSON（实测 user.reply.task / knowledge.import.preview 都中过）。
-            // 严格解析失败时做一次有限容错：去掉 `,` 后跟空白/换行+`}` 或 `]`、
-            // 自动补足末尾未闭合的 `]` / `}`。仍失败就把原始严格错误抛出去，
-            // 不允许把非 JSON 文本当成 JSON。
-            if let Some(repaired) = repair_loose_json(json_text) {
-                if let Ok(value) = serde_json::from_str::<Value>(&repaired) {
-                    return Ok(value);
-                }
-            }
-            Err(AppError::from(strict_err))
+    // 快路径：整体就是合法 JSON（绝大多数 provider 的纯 JSON 输出）。
+    if let Ok(value) = serde_json::from_str::<Value>(json_text) {
+        return Ok(value);
+    }
+    // 容错 1：trailing comma / 末尾未闭合（R15 / ISSUE-006，DeepSeek 偶发）。
+    if let Some(repaired) = repair_loose_json(json_text) {
+        if let Ok(value) = serde_json::from_str::<Value>(&repaired) {
+            return Ok(value);
         }
     }
+    // 容错 2：claude-opus 经中转常输出"自然语言推理 + JSON"混合体，JSON 可能夹在推理后
+    // （rsxermu CI 实测：`我看到候选 catalog…\n\n{"action":"open_chunk",...}`）。遍历所有
+    // `{`/`[` 起点，对每个配平块尝试严格解析 + repair，返回**首个解析成功**的块——推理里的
+    // 伪括号截出来解析失败会被跳过，命中真正的 JSON。纯 JSON 场景走不到这里（已快路径返回）。
+    if let Some(value) = extract_embedded_json(json_text) {
+        return Ok(value);
+    }
+    // 全部失败：抛严格错误，不把非 JSON 文本当数据吞下。
+    Err(AppError::from(
+        serde_json::from_str::<Value>(json_text).unwrap_err(),
+    ))
+}
+
+/// 从混合文本中提取**首个可解析**的 JSON 对象/数组：遍历每个 `{`/`[` 起点配平截块，
+/// 逐个尝试严格解析（失败再试 repair）。返回首个成功的 Value；全不成功返回 None。
+/// 用于 claude "推理 + JSON" 混合输出——推理里的伪括号块解析失败被跳过，命中真 JSON。
+fn extract_embedded_json(text: &str) -> Option<Value> {
+    let bytes = text.as_bytes();
+    for start in 0..bytes.len() {
+        if bytes[start] != b'{' && bytes[start] != b'[' {
+            continue;
+        }
+        if let Some(block) = balanced_block(text, start) {
+            if let Ok(v) = serde_json::from_str::<Value>(block) {
+                return Some(v);
+            }
+            if let Some(repaired) = repair_loose_json(block) {
+                if let Ok(v) = serde_json::from_str::<Value>(&repaired) {
+                    return Some(v);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// 从 `start`（须是 `{` 或 `[`）按括号配平扫描（跳过字符串字面量内括号与转义），返回到
+/// 配对闭合符的子串。未闭合返回 None。
+fn balanced_block(text: &str, start: usize) -> Option<&str> {
+    let bytes = text.as_bytes();
+    let open = bytes[start];
+    let close = if open == b'{' { b'}' } else { b']' };
+    let mut depth: i32 = 0;
+    let mut in_string = false;
+    let mut escape = false;
+    for (i, &b) in bytes.iter().enumerate().skip(start) {
+        if in_string {
+            if escape {
+                escape = false;
+            } else if b == b'\\' {
+                escape = true;
+            } else if b == b'"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match b {
+            b'"' => in_string = true,
+            x if x == open => depth += 1,
+            x if x == close => {
+                depth -= 1;
+                if depth == 0 {
+                    return text.get(start..=i);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 /// 从含自然语言前导/后缀的文本中截取**第一个平衡的** JSON 对象 `{...}` 或数组 `[...]`。
@@ -1422,6 +1461,28 @@ mod tests {
         let v = parse_json_content(raw).expect("前后自然语言包裹的 JSON 必须被截取解析");
         assert_eq!(v.get("profile_id").and_then(|x| x.as_str()), Some("x"));
         assert_eq!(v.get("display_name").and_then(|x| x.as_str()), Some("陪伴"));
+    }
+
+    #[test]
+    fn parse_json_content_extracts_json_after_reasoning_prose() {
+        // rsxermu claude-opus 真实形态：先长篇推理（可能含中文「」括号噪声），JSON 在末尾。
+        // parse_json_content SHALL 遍历候选块命中真 JSON（domain_profile/knowledge 真模型实测）。
+        let raw = "我看到候选 catalog 中有一条高度相关：「私有化部署」。需要先 open_chunk 展开正文。\n\n{\"action\":\"open_chunk\",\"ids\":[\"abc123\"]}";
+        let v = parse_json_content(raw).expect("推理后的 JSON 必须被提取");
+        assert_eq!(v.get("action").and_then(|x| x.as_str()), Some("open_chunk"));
+        assert_eq!(
+            v.get("ids").and_then(|x| x.as_array()).map(|a| a.len()),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn parse_json_content_skips_unparseable_brace_block_picks_real_json() {
+        // 推理里出现「伪 JSON」块（截出来解析失败），须跳过命中后面真正可解析的 JSON。
+        let raw = "分析 {不是合法json的片段} 然后给出结果：{\"ok\":true,\"n\":2}";
+        let v = parse_json_content(raw).expect("应跳过伪块命中真 JSON");
+        assert_eq!(v.get("ok").and_then(|x| x.as_bool()), Some(true));
+        assert_eq!(v.get("n").and_then(|x| x.as_i64()), Some(2));
     }
 
     #[test]
