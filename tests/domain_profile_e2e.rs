@@ -540,7 +540,7 @@ async fn e2e_generate_second_industry_profile() {
 
     let resp_val: Value = serde_json::from_value(resp.0).expect("valid json");
     assert_eq!(resp_val["ok"], true);
-    assert_eq!(resp_val["profile_id"], "edu-k12-tuition");
+    assert_eq!(resp_val["profileId"], "edu-k12-tuition");
 
     let id_hex = resp_val.get("id").and_then(|v| v.as_str()).expect("id");
     let id = ObjectId::parse_str(id_hex).expect("valid ObjectId");
