@@ -425,15 +425,30 @@ impl LlmClient {
         if !status.is_success() {
             return Err(AppError::External(format!("LLM HTTP {status}: {text}")));
         }
-        let parsed: ChatCompletionResponse = serde_json::from_str(&text)?;
-        let content = parsed
-            .choices
-            .first()
-            .map(|choice| choice.message.content.as_str())
-            .ok_or_else(|| AppError::External("LLM returned no choices".to_string()))?;
+        // 与文本路径 generate_json_once_openai 同口径：兼容标准非流式 JSON 与强制
+        // 流式 SSE（部分中转网关即使不传 stream 也只回 `data: {chunk}`，如 rsxermu
+        // gpt-5.4）。检测到 SSE 帧则聚合 delta.content；否则按原 ChatCompletionResponse
+        // 解析。非 SSE 响应零行为变化。
+        let (content, usage) = if is_openai_sse_body(&text) {
+            let (acc, sse_usage) = aggregate_openai_sse(&text);
+            if acc.trim().is_empty() {
+                return Err(AppError::External(
+                    "LLM SSE body 聚合后内容为空".to_string(),
+                ));
+            }
+            (acc, sse_usage.unwrap_or_default())
+        } else {
+            let parsed: ChatCompletionResponse = serde_json::from_str(&text)?;
+            let c = parsed
+                .choices
+                .first()
+                .map(|choice| choice.message.content.clone())
+                .ok_or_else(|| AppError::External("LLM returned no choices".to_string()))?;
+            (c, parsed.usage.unwrap_or_default())
+        };
         Ok(LlmJsonResult {
-            value: parse_json_content(content)?,
-            usage: parsed.usage.unwrap_or_default(),
+            value: parse_json_content(&strip_reasoning_prefix(&content))?,
+            usage,
             latency_ms: started_at.elapsed().as_millis() as i64,
             model: self.model.clone(),
             retry_count: 0,

@@ -56,7 +56,7 @@ use mongodb::options::FindOneOptions;
 use wechatagent::agent::handle_managed_message;
 use wechatagent::agent::run_envelope::{FINAL_REVIEW_STATUS_VALUES, GATEWAY_STATUS_VALUES};
 use wechatagent::error::{AppError, AppResult};
-use wechatagent::llm::{LlmClient, LlmJsonResult, LlmProvider};
+use wechatagent::llm::{LlmClient, LlmFormat, LlmJsonResult, LlmProvider};
 use wechatagent::models::{
     AgentStatus, Contact, ConversationMessage, MessageDirection,
 };
@@ -81,9 +81,27 @@ fn real_llm_from_env() -> Option<Arc<LlmClient>> {
     let base_url = std::env::var("REAL_LLM_BASE_URL")
         .unwrap_or_else(|_| "https://token-plan-cn.xiaomimimo.com/v1".to_string());
     let model = std::env::var("REAL_LLM_MODEL").unwrap_or_else(|_| "mimo-v2.5-pro".to_string());
-    let client = LlmClient::new(base_url, api_key, model, 180, primary_max_retries(), 2500)
-        .expect("构造真实 LlmClient");
+    let client = build_real_client(base_url, api_key, model, "REAL_LLM_FORMAT", primary_max_retries());
     Some(Arc::new(client))
+}
+
+/// 按 `<format_env>`（openai/anthropic，缺省 openai）构造 LlmClient。claude 系走
+/// Anthropic `/v1/messages`（非流式）；gpt/其它走 OpenAI `/v1/chat/completions`。
+/// 与 `real_llm_ops_smoke.rs::build_real_client` 同口径——rsxermu666.cn 主 claude-opus-4-8
+/// 走 Anthropic、judge gpt-5.4 走 OpenAI，按各自格式走对路径，避免 4xx 假绿。
+fn build_real_client(
+    base_url: String,
+    api_key: String,
+    model: String,
+    format_env: &str,
+    retries: u32,
+) -> LlmClient {
+    let fmt = match std::env::var(format_env).ok().as_deref() {
+        Some("anthropic") | Some("messages") | Some("claude") => LlmFormat::Anthropic,
+        _ => LlmFormat::Openai,
+    };
+    LlmClient::with_format(base_url, api_key, model, fmt, 180, retries, 2500)
+        .expect("构造真实 LlmClient")
 }
 
 /// 该错误是否值得切下一个备胎（端点侧抖动 / 账户级 4xx）。
@@ -160,7 +178,7 @@ fn strongest_model_client() -> Option<Arc<LlmClient>> {
         .unwrap_or_else(|_| "https://integrate.api.nvidia.com/v1".to_string());
     let model = std::env::var("REAL_LLM_JUDGE_MODEL")
         .unwrap_or_else(|_| "meta/llama-3.3-70b-instruct".to_string());
-    LlmClient::new(base, key, model, 180, 5, 2500).ok().map(Arc::new)
+    Some(Arc::new(build_real_client(base, key, model, "REAL_LLM_JUDGE_FORMAT", 5)))
 }
 
 fn failover_model_list() -> Vec<String> {
