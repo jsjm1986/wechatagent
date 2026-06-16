@@ -450,7 +450,7 @@ jobs:
     if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.dispatch_target == 'ops' }}
     timeout-minutes: 90
     env:
-      REAL_LLM_API_KEY: ${{ secrets.REAL_LLM_CODERELAY_API_KEY || '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' }}
+      REAL_LLM_API_KEY: ${{ secrets.RSXERMU_KEY }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -476,15 +476,18 @@ jobs:
         if: ${{ env.REAL_LLM_API_KEY != '' }}
         env:
           RUSTFLAGS: ""
-          REAL_LLM_BASE_URL: https://integrate.api.nvidia.com/v1
-          REAL_LLM_MODEL: moonshotai/kimi-k2.6
+          # 手动单跑切 rsxermu666.cn 不限流端点（主 claude-opus-4-8 走 Anthropic 非
+          # 流式；judge gpt-5.4 走 OpenAI，端点强制流式 SSE 由 LlmClient 聚合兜底），
+          # 避免 NVIDIA 429 让多轮弧 turn-1 即 skip 出假绿。仅影响手动单跑入口。
+          REAL_LLM_BASE_URL: https://rsxermu666.cn
+          REAL_LLM_MODEL: claude-opus-4-8
+          REAL_LLM_FORMAT: anthropic
           REAL_LLM_JUDGE: "1"
-          REAL_LLM_JUDGE_API_KEY: ${{ secrets.REAL_LLM_GPT55_API_KEY || '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' }}
-          REAL_LLM_JUDGE_BASE_URL: https://integrate.api.nvidia.com/v1
-          REAL_LLM_JUDGE_MODEL: meta/llama-3.3-70b-instruct
-          REAL_LLM_FAILOVER_API_KEY: ${{ secrets.REAL_LLM_VISION_BACKUP_API_KEY || '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' }}
-          REAL_LLM_FAILOVER_BASE_URL: https://integrate.api.nvidia.com/v1
-          REAL_LLM_FAILOVER_MODELS: z-ai/glm-5.1,stepfun-ai/step-3.7-flash,qwen/qwen3-next-80b-a3b-instruct
+          JUDGE_SAMPLES: "1"
+          REAL_LLM_JUDGE_API_KEY: ${{ secrets.RSXERMU_KEY }}
+          REAL_LLM_JUDGE_BASE_URL: https://rsxermu666.cn/v1
+          REAL_LLM_JUDGE_MODEL: gpt-5.4
+          REAL_LLM_JUDGE_FORMAT: openai
         run: cargo test --no-fail-fast --test real_llm_ops_smoke ${{ github.event.inputs.ops_test }} -- --ignored --nocapture
 
   # 知识库内容质量套件（real_llm_knowledge_quality.rs Q1–Q7）——「裁判校准层」重构后
