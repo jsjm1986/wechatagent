@@ -162,17 +162,21 @@ pub fn default_outcome_polarity() -> OutcomePolarity {
     }
 }
 
-/// universal-domain-adaptation H15：DEFAULT_PROFILE 的销售域四公式 seed。逐字复刻
-/// 散落在四处副本的销售经营公式，作为 DEFAULT 等价的单一真相源：
-/// - `prompts.rs` policy「关系经营公式（自检）」英文展开式；
-/// - `prompts.rs` default_playbook method_prompt「核心公式」中文展开式；
-/// - `agent/review/mod.rs` reviewer prompt 的 `formulaBreakdown` 模板；
-/// - `routes/evaluations.rs` 硬编码 `formulas` 数组 + `score_key_for` 映射。
+/// universal-domain-adaptation H15：DEFAULT_PROFILE 的销售域四公式 seed，作为 DEFAULT
+/// 等价的单一真相源。各字段对应散落副本的不同投影（**非逐字全等**，按字段对齐）：
+/// - `expression`（英文式，Unicode 减号 `−`）= `prompts.rs` policy「关系经营公式
+///   （自检）」段逐字。该段已由 decision.rs 运行时剥离+注入本函数渲染值，护栏
+///   `strip_then_inject_default_roundtrips_to_original_section` 锁死。
+/// - `key` + `expression` = `agent/review/mod.rs` reviewer `formulaBreakdown` 模板逐字
+///   （`render_business_formulas_json_example`，护栏 `render_json_example_default_shape`）。
+/// - `key` + `eval_score_key` = `routes/evaluations.rs` `formulas` 数组 + `score_key_for`
+///   fallback 映射，护栏 `score_key_for_matches_default_formula_eval_keys`（第 77 点补盲）。
+/// - `display_name`（中文名）= `prompts.rs` default_playbook method_prompt「核心公式」段
+///   的中文公式名。**注意**：playbook 段是 H12 methodology 层的方法论叙述（用中文运算符 +
+///   多一条「学习深度」非 5 闸公式），与本 seed **不逐字对齐、不强制同数量**——它走
+///   methodology_override 路径自定，本 seed 只保证 4 个经营公式的中文名与之一致。
 ///
-/// `expression` = policy 英文式逐字；`display_name` = playbook 中文名；
-/// `eval_score_key` = `score_key_for` 映射逐字（trust→humanLike /
-/// conversionReadiness→conversionReadiness / emotionalValue→emotionalValue /
-/// nextBestActionScore→relationshipProgress）。空集时各消费方回落本函数同源常量。
+/// 空集时各消费方回落本函数同源常量（DEFAULT_PROFILE 即显式 seed 这四条，seed 与回落同源）。
 pub fn default_business_formulas() -> Vec<BusinessFormula> {
     vec![
         BusinessFormula {
@@ -277,6 +281,56 @@ pub fn build_policy_formula_section(formulas: &[BusinessFormula]) -> String {
     )
 }
 
+/// universal-domain-adaptation H9（第 20 点）：policy 里「## 对话模式判定」段的固定标题。
+/// 运行时注入 `conversation_mode_policy` 覆盖时以它为锚剥离原销售判定段。
+pub const POLICY_CONVERSATION_MODE_SECTION_HEADING: &str = "## 对话模式判定";
+
+/// universal-domain-adaptation H9（第 20 点）：剥离 policy 里「## 对话模式判定」整段
+/// （标题起，到下一个 `## ` 二级标题前为止）。仅当 active profile 声明了
+/// `conversation_mode_policy` 覆盖时调用——把写死销售世界观的判定规则段剥掉，由
+/// [`apply_conversation_mode_policy`] 注入本行业判定规则。下一段「## 模式与 5 闸的关系」
+/// （含 boundary_protection 不放宽边界保护红线）不在剥离范围、继续写死守护。
+///
+/// 剥离逻辑与 [`strip_legacy_formula_self_check_section`] 同构（不同的只是 heading），
+/// 幂等：剥离后再调一次无变化。返回 (剥离后的文本, 是否剥离过)。
+pub fn strip_conversation_mode_section(policy: &str) -> (String, bool) {
+    let Some(start) = policy.find(POLICY_CONVERSATION_MODE_SECTION_HEADING) else {
+        return (policy.to_string(), false);
+    };
+    let after = &policy[start..];
+    let rest_offset = after
+        .match_indices("\n## ")
+        .find(|(i, _)| *i > 0)
+        .map(|(i, _)| start + i + 1) // +1 跳过该换行，保留下一段的 `## `
+        .unwrap_or(policy.len());
+    let mut out = String::with_capacity(policy.len());
+    out.push_str(policy[..start].trim_end_matches('\n'));
+    if rest_offset < policy.len() {
+        out.push_str("\n\n");
+        out.push_str(&policy[rest_offset..]);
+    }
+    (out, true)
+}
+
+/// universal-domain-adaptation H9（第 20 点）：把 active profile 的对话模式判定规则
+/// 应用到 policy 文本。`None`（DEFAULT_PROFILE / 老库）→ 原样返回，销售判定段逐字保留、
+/// 销售域零变化。`Some` → 剥离写死的「## 对话模式判定」段并在原位注入本行业规则
+/// （注入文本应自带 `## 对话模式判定` 标题；若运营漏写标题，这里补一个锚，保证下游
+/// 「## 模式与 5 闸的关系」段衔接）。
+pub fn apply_conversation_mode_policy(policy: &str, override_text: Option<&str>) -> String {
+    let Some(raw) = override_text.map(str::trim).filter(|s| !s.is_empty()) else {
+        return policy.to_string();
+    };
+    let (stripped, _) = strip_conversation_mode_section(policy);
+    let injected = if raw.starts_with(POLICY_CONVERSATION_MODE_SECTION_HEADING) {
+        raw.to_string()
+    } else {
+        format!("{POLICY_CONVERSATION_MODE_SECTION_HEADING}\n\n{raw}")
+    };
+    // 注入到剥离后文本的最前（原判定段就在 policy 开头），与下文以空行分隔。
+    format!("{injected}\n\n{}", stripped.trim_start_matches('\n'))
+}
+
 /// universal-domain-adaptation H15（3A-1c）：把经营公式渲染成 reviewer prompt
 /// `formulaBreakdown` JSON 示例的内层行（`"key": "expression",` 逐行，最后一行无逗号）。
 /// 同一单一真相源；空集回落 [`default_business_formulas`]。
@@ -298,6 +352,54 @@ pub fn render_business_formulas_json_example(formulas: &[BusinessFormula]) -> St
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// universal-domain-adaptation 第 19 点：reviewer `scores` 示例块里**销售专属软维度**
+/// （`relationshipProgress` / `conversionReadiness`）条件化。
+///
+/// reviewer 实际消费（[`crate::agent::types::ReviewScores`]）的只有 5 个硬闸维度
+/// （humanLike / emotionalValue / productAccuracy / pressureRisk / factRisk）——它们
+/// 写死在 scores 示例上下半段、域无关、始终保留。`relationshipProgress` /
+/// `conversionReadiness` 这类**软观测维度**反序列化时被丢弃（不在 ReviewScores 里），
+/// 纯属示例装饰；销售域才有"成交准备度/关系推进"语义，情感陪伴/同行/朋友域不该被强塞。
+///
+/// 本函数从 active profile 的 `business_formulas.eval_score_key` 派生这些额外软维度
+/// （排除 5 个硬闸键），渲染成 scores 块中段的若干行（每行 `"key": 6,`，带行尾换行）。
+/// DEFAULT_PROFILE 的四公式 eval_score_key = [humanLike, conversionReadiness,
+/// emotionalValue, relationshipProgress]，排除硬闸后 → conversionReadiness +
+/// relationshipProgress 两行（与改造前两行**语义等价**：键集相同、值同为 6、均被丢弃；
+/// 沿用 H15 既有"render 后语义等价、非逐字节"标准）。非销售 profile 未声明这些
+/// eval_score_key → 返回空串，scores 块只剩 5 个硬闸维度。
+pub fn render_reviewer_extra_score_lines(formulas: &[BusinessFormula]) -> String {
+    const HARD_GATES: [&str; 5] = [
+        "humanLike",
+        "emotionalValue",
+        "productAccuracy",
+        "pressureRisk",
+        "factRisk",
+    ];
+    let seed;
+    let effective = if formulas.is_empty() {
+        seed = default_business_formulas();
+        &seed[..]
+    } else {
+        formulas
+    };
+    let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    let mut lines = Vec::new();
+    for f in effective {
+        if let Some(key) = f.eval_score_key.as_deref() {
+            if HARD_GATES.contains(&key) || !seen.insert(key) {
+                continue;
+            }
+            lines.push(format!("    \"{key}\": 6,"));
+        }
+    }
+    if lines.is_empty() {
+        String::new()
+    } else {
+        format!("{}\n", lines.join("\n"))
+    }
 }
 
 /// 构造内置 DEFAULT_PROFILE。内容逐字等价当前源码写死的销售域行为。
@@ -336,6 +438,9 @@ pub fn default_domain_profile(workspace_id: &str) -> DomainProfile {
         // H12：DEFAULT 出厂人格/方法论 = None → 回落内置销售域 soul + playbook（逐字等价）。
         soul_override: None,
         methodology_override: None,
+        // H9（第 20 点）：DEFAULT 对话模式判定规则 = None → 保留 policy 写死的销售判定段
+        // （逐字等价、销售域零变化）。换行业声明本字段即整段替换判定规则。
+        conversation_mode_policy: None,
         commitment_markers: CommitmentMarkers {
             // 逐字复刻 guards.rs::commitment_claim_class
             product_effect: vec![
@@ -402,6 +507,40 @@ pub fn default_domain_profile(workspace_id: &str) -> DomainProfile {
         created_at: now,
         updated_at: now,
     }
+}
+
+/// universal-domain-adaptation 第 78 点：情感陪伴行业的最小示例 DomainProfile
+/// 构造器——**非销售价值契约的单一真相源**。以 [`default_domain_profile`] 为基底，
+/// 仅覆盖体现"长期陪伴、情绪承接、尊重边界、不做成交推进"价值观的关键字段。
+///
+/// 既供 lib 单测做纯内存端到端价值断言（profile → runtime → 下游 gate 行为），也供
+/// `tests/common/roleplay_fixtures.rs` 的 seed helper 复用（单一真相源，避免两份漂移）。
+///
+/// 价值契约（与设计 §5.2 对齐）：
+/// - `conversation_modes` 含 `intimate_companion`（H9：不只销售四模式）；
+/// - `grounding_gate_bypass_without_claim = true`（H14：纯情感回复不被 grounding 误拦）；
+/// - `distrust_self_reported_low_risk = true`（高敏域强制走 LLM review）；
+/// - `operation_mode.funnel.enabled = false`（H8：陪伴不催进成交）。
+pub fn example_emotional_companion_profile(workspace_id: &str) -> DomainProfile {
+    let mut profile = default_domain_profile(workspace_id);
+    profile.profile_id = "emotional_companion_minimal".to_string();
+    profile.display_name = "情感陪伴".to_string();
+    profile.description = "长期陪伴、情绪承接、尊重边界，不做成交推进".to_string();
+    profile.conversation_modes = vec![
+        "intimate_companion".to_string(),
+        "casual_relationship".to_string(),
+        "value_exchange".to_string(),
+        "boundary_protection".to_string(),
+    ];
+    profile.grounding_gate_bypass_without_claim = true;
+    profile.distrust_self_reported_low_risk = true;
+    profile.operation_mode.funnel.enabled = false;
+    profile.prompt_fragment = Some(
+        "本行业目标是长期陪伴、情绪承接、尊重对方节奏与边界，不是成交推进。\
+         主动关心、轻量追问本身是正当行为，不等于施压。"
+            .to_string(),
+    );
+    profile
 }
 
 /// 加载某 workspace 当前生效的 DomainProfile。
@@ -1002,6 +1141,65 @@ mod tests {
     }
 
     #[test]
+    fn reviewer_extra_score_lines_default_yields_two_sales_dims() {
+        // 第 19 点：DEFAULT 四公式 eval_score_key=[humanLike, conversionReadiness,
+        // emotionalValue, relationshipProgress]，排除 5 硬闸后 → 仅 conversionReadiness
+        // + relationshipProgress 两行（语义等价旧写死的两行销售软维度，值同为 6）。
+        let rendered = render_reviewer_extra_score_lines(&default_business_formulas());
+        let lines: Vec<&str> = rendered.lines().collect();
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0], "    \"conversionReadiness\": 6,");
+        assert_eq!(lines[1], "    \"relationshipProgress\": 6,");
+        // 末尾带换行，便于直接拼进 scores 块。
+        assert!(rendered.ends_with('\n'));
+        // 空集回落 DEFAULT 同源。
+        assert_eq!(render_reviewer_extra_score_lines(&[]), rendered);
+    }
+
+    #[test]
+    fn reviewer_extra_score_lines_empty_for_non_sales_profile() {
+        // 非销售 profile：要么不声明 eval_score_key，要么只映射到硬闸维度 → 无额外软维度，
+        // scores 块只剩 5 个硬闸维度，不再被强塞销售「成交准备度/关系推进」。
+        let formulas = vec![
+            BusinessFormula {
+                key: "warmth".to_string(),
+                expression: "Empathy + Presence".to_string(),
+                display_name: "陪伴温度".to_string(),
+                eval_score_key: None,
+            },
+            BusinessFormula {
+                key: "comfort".to_string(),
+                expression: "Validation + Safety".to_string(),
+                display_name: "情绪安抚".to_string(),
+                // 映射到硬闸 emotionalValue → 不产生额外软维度行。
+                eval_score_key: Some("emotionalValue".to_string()),
+            },
+        ];
+        assert_eq!(render_reviewer_extra_score_lines(&formulas), "");
+    }
+
+    #[test]
+    fn reviewer_extra_score_lines_dedupes_and_renders_custom_dims() {
+        // 自定义非硬闸 eval_score_key 渲染为额外软维度行；重复键去重。
+        let formulas = vec![
+            BusinessFormula {
+                key: "a".to_string(),
+                expression: "x".to_string(),
+                display_name: "甲".to_string(),
+                eval_score_key: Some("companionDepth".to_string()),
+            },
+            BusinessFormula {
+                key: "b".to_string(),
+                expression: "y".to_string(),
+                display_name: "乙".to_string(),
+                eval_score_key: Some("companionDepth".to_string()),
+            },
+        ];
+        let rendered = render_reviewer_extra_score_lines(&formulas);
+        assert_eq!(rendered, "    \"companionDepth\": 6,\n");
+    }
+
+    #[test]
     fn formula_key_pascal_capitalizes_first() {
         assert_eq!(formula_key_pascal("trust"), "Trust");
         assert_eq!(formula_key_pascal("conversionReadiness"), "ConversionReadiness");
@@ -1049,6 +1247,89 @@ mod tests {
             - EmotionalValue = Empathy + Validation + Specificity + AutonomySupport − Pressure\n\
             - NextBestActionScore = RelationshipGain + ConversionProgress + EmotionalValue + ProductFit − PressureRisk − FactRisk";
         assert_eq!(injected, expected_section);
+    }
+
+    /// 第 77 点护栏补盲区：default_playbook「核心公式」段（H12 methodology 中文叙述）
+    /// 的 4 个经营公式中文名应与 single-source 的 display_name 一致。playbook 用中文
+    /// 运算符 + 多一条「学习深度」非 5 闸公式，不逐字对齐，但 4 个经营公式名必须同步——
+    /// 改了 single-source display_name 却忘改 playbook（或反之）时本测试即红。
+    #[test]
+    fn playbook_core_formula_names_match_single_source_display_names() {
+        let playbook = crate::prompts::default_playbook("ws-test", "acct-test");
+        let method = playbook.method_prompt;
+        for f in default_business_formulas() {
+            assert!(
+                method.contains(&f.display_name),
+                "playbook 核心公式段缺少 single-source 公式中文名「{}」（display_name 漂移）",
+                f.display_name
+            );
+        }
+    }
+
+    // ── H9 第 20 点：对话模式判定规则覆盖 ──
+
+    /// 模拟真实 policy 结构：「## 对话模式判定」段后接「## 模式与 5 闸的关系」（红线段）。
+    const SAMPLE_POLICY: &str = "## 对话模式判定（必须输出 conversationMode 字段）\n\n\
+        2. customer_stage ∈ {方案匹配, 异议处理} → consultative。\n\
+        3. 用户问产品/价格 → consultative。\n\n\
+        ## 模式与 5 闸的关系\n\n\
+        - boundary_protection：严禁承诺真人/上级/转交。\n\n\
+        ## 表达红线\n\n- 每轮开口前对照。";
+
+    #[test]
+    fn strip_conversation_mode_section_removes_only_decision_block() {
+        let (stripped, did) = strip_conversation_mode_section(SAMPLE_POLICY);
+        assert!(did);
+        // 销售判定条款被剥离。
+        assert!(!stripped.contains("customer_stage ∈"));
+        assert!(!stripped.contains("用户问产品/价格"));
+        // 红线段 + 后续段保留。
+        assert!(stripped.contains("## 模式与 5 闸的关系"));
+        assert!(stripped.contains("boundary_protection：严禁承诺真人"));
+        assert!(stripped.contains("## 表达红线"));
+        // 幂等。
+        let (again, did2) = strip_conversation_mode_section(&stripped);
+        assert!(!did2);
+        assert_eq!(again, stripped);
+    }
+
+    #[test]
+    fn strip_conversation_mode_section_noop_when_absent() {
+        let policy = "## 模式与 5 闸的关系\n\n- boundary_protection。";
+        let (out, did) = strip_conversation_mode_section(policy);
+        assert!(!did);
+        assert_eq!(out, policy);
+    }
+
+    #[test]
+    fn apply_conversation_mode_policy_none_is_byte_identical() {
+        // DEFAULT_PROFILE / 老库 = None → 原样返回，销售判定段逐字保留、零变化。
+        assert_eq!(apply_conversation_mode_policy(SAMPLE_POLICY, None), SAMPLE_POLICY);
+        // 空串 / 纯空白同样视为未覆盖。
+        assert_eq!(apply_conversation_mode_policy(SAMPLE_POLICY, Some("   ")), SAMPLE_POLICY);
+    }
+
+    #[test]
+    fn apply_conversation_mode_policy_replaces_decision_keeps_redline() {
+        let override_text = "## 对话模式判定\n\n用户表达情绪 → empathetic_support。";
+        let out = apply_conversation_mode_policy(SAMPLE_POLICY, Some(override_text));
+        // 本行业规则注入。
+        assert!(out.contains("empathetic_support"));
+        // 销售判定条款已被替换掉。
+        assert!(!out.contains("customer_stage ∈"));
+        assert!(!out.contains("用户问产品/价格"));
+        // 红线段继续守护（不可配）。
+        assert!(out.contains("## 模式与 5 闸的关系"));
+        assert!(out.contains("boundary_protection：严禁承诺真人"));
+    }
+
+    #[test]
+    fn apply_conversation_mode_policy_adds_heading_when_missing() {
+        // 运营漏写标题时补锚，保证下游段衔接。
+        let out = apply_conversation_mode_policy(SAMPLE_POLICY, Some("用户表达情绪 → empathetic_support。"));
+        assert!(out.starts_with(POLICY_CONVERSATION_MODE_SECTION_HEADING));
+        assert!(out.contains("empathetic_support"));
+        assert!(out.contains("## 模式与 5 闸的关系"));
     }
 
     // ── 1G-c：DomainProfileCache TTL / 命中 / 回落 / 失效（无 Docker 纯内存）──

@@ -162,7 +162,8 @@ pub use domain_profile::init_global_domain_profile_cache;
 pub use domain_profile::{default_memory_dimensions, render_memory_candidate_types_guidance};
 // roleplay-fuzz P0：集成测试 seed/读回 active DomainProfile + 失效进程级缓存所需入口。
 pub use domain_profile::{
-    default_domain_profile, invalidate_global_domain_profile_cache, load_active_domain_profile,
+    default_domain_profile, example_emotional_companion_profile,
+    invalidate_global_domain_profile_cache, load_active_domain_profile,
 };
 
 // agent-autonomy-loop W3 / Task 4.5：P7 工具循环性质测试入口。

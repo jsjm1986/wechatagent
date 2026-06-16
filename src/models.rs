@@ -1333,6 +1333,19 @@ pub struct DomainProfile {
     /// playbook + 内置销售域兜底（DEFAULT_PROFILE 即 `None`，逐字等价）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub methodology_override: Option<String>,
+    /// universal-domain-adaptation H9（第 20 点）：本行业「对话模式判定规则」覆盖
+    /// （替代 `user.reply.policy` 里写死销售世界观的「## 对话模式判定」整段——
+    /// customer_stage∈{方案匹配/异议处理/承诺跟进}→consultative、用户问产品/价格→
+    /// consultative 等销售语义判定条款）。`Some` 时运行时剥离 policy 的判定段并注入
+    /// 本字段（应自带 `## 对话模式判定` 标题，仿 H15 经营公式段的"剥离+注入"模式）；
+    /// `None`（DEFAULT_PROFILE / 老库 serde 默认）时保留 policy 原写死的销售判定段，
+    /// 逐字等价、销售域零变化。情感陪伴等行业可声明自己的模式判定优先级
+    /// （如「用户表达情绪→empathetic_support」）。
+    /// **红线**：与 [`Self::conversation_modes`] 同——`boundary_protection` 反接管语义
+    /// 无论本字段是否覆盖都继续由 policy 后续段（## 模式与 5 闸的关系）写死守护，
+    /// 本字段只换"用什么规则选模式"，不放宽"反人工接管"硬规则。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conversation_mode_policy: Option<String>,
     /// 本行业绝对化承诺词表（替代 `guards.rs` 写死的中文销售词）。
     #[serde(default)]
     pub commitment_markers: CommitmentMarkers,

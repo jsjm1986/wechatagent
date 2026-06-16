@@ -1312,6 +1312,475 @@ function ProfileEditor({
         </div>
       </details>
 
+      <details className={styles.advanced}>
+        <summary>人格 / 方法论本体覆盖（可选）</summary>
+        <p className={styles.panelHint}>
+          留空 = 回落 DB published soul/playbook + 内置销售域兜底（DEFAULT 逐字等价）。
+          只换人格口吻与方法论叙述，<strong>不放宽边界保护红线</strong>（边界硬规则始终由系统 prompt 守护）。
+        </p>
+        <label className={styles.field}>
+          <span>人格本体覆盖 soulOverride</span>
+          <textarea
+            className={styles.textarea}
+            value={draft.soul_override ?? ""}
+            onChange={(e) => update({ soul_override: e.target.value || undefined })}
+            placeholder="整体替换决策系统提示的 Soul 层（人格本体）。留空回落默认。"
+            rows={4}
+          />
+        </label>
+        <label className={styles.field}>
+          <span>方法论本体覆盖 methodologyOverride</span>
+          <textarea
+            className={styles.textarea}
+            value={draft.methodology_override ?? ""}
+            onChange={(e) => update({ methodology_override: e.target.value || undefined })}
+            placeholder="整体替换拼进 user message 的「当前运营方法」段。留空回落 contact 绑定 playbook + 默认。"
+            rows={4}
+          />
+        </label>
+        <label className={styles.field}>
+          <span>对话模式判定规则覆盖 conversationModePolicy</span>
+          <textarea
+            className={styles.textarea}
+            value={draft.conversation_mode_policy ?? ""}
+            onChange={(e) => update({ conversation_mode_policy: e.target.value || undefined })}
+            placeholder="整体替换 policy「## 对话模式判定」段（写死销售世界观的判定规则）。建议以 ## 对话模式判定 开头，按本行业声明各 conversationMode 的命中优先级。留空回落默认销售判定。注意：模式与 5 闸关系、边界保护红线由系统写死守护，不受本字段影响。"
+            rows={5}
+          />
+        </label>
+      </details>
+
+      <details className={styles.advanced}>
+        <summary>自学习极性（H11）</summary>
+        <p className={styles.panelHint}>
+          正/负极 outcome 词集驱动召回排序 + 反向训练 + 卡死请示。留空回落内置销售极性。沉默/未分类一律删失（绝不臆测为负），本字段只声明正/负集。
+        </p>
+        <div className={styles.formGrid}>
+          <label className={styles.field}>
+            <span>正极 outcome（→ 强化，逗号分隔）</span>
+            <textarea
+              className={styles.textarea}
+              value={(draft.outcome_polarity?.positive ?? []).join(", ")}
+              onChange={(e) => {
+                const positive = e.target.value.split(",").map((s) => s.trim()).filter(Boolean);
+                const negative = draft.outcome_polarity?.negative ?? [];
+                update({
+                  outcome_polarity: positive.length || negative.length ? { positive, negative } : undefined,
+                });
+              }}
+              placeholder="user_replied_buying_signal"
+              rows={2}
+            />
+          </label>
+          <label className={styles.field}>
+            <span>负极 outcome（→ 反向，逗号分隔）</span>
+            <textarea
+              className={styles.textarea}
+              value={(draft.outcome_polarity?.negative ?? []).join(", ")}
+              onChange={(e) => {
+                const negative = e.target.value.split(",").map((s) => s.trim()).filter(Boolean);
+                const positive = draft.outcome_polarity?.positive ?? [];
+                update({
+                  outcome_polarity: positive.length || negative.length ? { positive, negative } : undefined,
+                });
+              }}
+              placeholder="objection, stop_requested, unsubscribed, negative, complaint"
+              rows={2}
+            />
+          </label>
+        </div>
+      </details>
+
+      <details className={styles.advanced}>
+        <summary>completeness 审计维度</summary>
+        <div className={styles.profileDimensionsSection}>
+          {(draft.coverage_dimensions ?? []).map((cov, i) => (
+            <div key={i} className={styles.profileDimensionRow}>
+              <input
+                className={styles.input}
+                value={cov.key}
+                placeholder="维度 key"
+                onChange={(e) => {
+                  const arr = [...(draft.coverage_dimensions ?? [])];
+                  arr[i] = { ...cov, key: e.target.value };
+                  update({ coverage_dimensions: arr });
+                }}
+              />
+              <input
+                className={styles.input}
+                value={cov.display_name}
+                placeholder="中文维度名"
+                onChange={(e) => {
+                  const arr = [...(draft.coverage_dimensions ?? [])];
+                  arr[i] = { ...cov, display_name: e.target.value };
+                  update({ coverage_dimensions: arr });
+                }}
+              />
+              <label className={styles.inlineCheckbox}>
+                <input
+                  type="checkbox"
+                  checked={cov.required}
+                  onChange={(e) => {
+                    const arr = [...(draft.coverage_dimensions ?? [])];
+                    arr[i] = { ...cov, required: e.target.checked };
+                    update({ coverage_dimensions: arr });
+                  }}
+                />
+                必备
+              </label>
+              <button
+                type="button"
+                className={styles.btnGhost}
+                onClick={() => {
+                  const arr = [...(draft.coverage_dimensions ?? [])];
+                  arr.splice(i, 1);
+                  update({ coverage_dimensions: arr });
+                }}
+              >
+                删除
+              </button>
+            </div>
+          ))}
+          <button
+            type="button"
+            className={styles.btnGhost}
+            onClick={() =>
+              update({
+                coverage_dimensions: [
+                  ...(draft.coverage_dimensions ?? []),
+                  { key: "", display_name: "", required: false },
+                ],
+              })
+            }
+          >
+            + 添加 completeness 维度
+          </button>
+        </div>
+      </details>
+
+      <details className={styles.advanced}>
+        <summary>经营公式（H15）</summary>
+        <p className={styles.panelHint}>reviewer 自检 + /evaluations 度量锚点，不进硬闸。留空回落销售四公式。</p>
+        <div className={styles.profileDimensionsSection}>
+          {(draft.business_formulas ?? []).map((f, i) => (
+            <div key={i} className={styles.profileDimensionRow}>
+              <input
+                className={styles.input}
+                value={f.key}
+                placeholder="公式 key"
+                onChange={(e) => {
+                  const arr = [...(draft.business_formulas ?? [])];
+                  arr[i] = { ...f, key: e.target.value };
+                  update({ business_formulas: arr });
+                }}
+              />
+              <input
+                className={styles.input}
+                value={f.display_name}
+                placeholder="中文名"
+                onChange={(e) => {
+                  const arr = [...(draft.business_formulas ?? [])];
+                  arr[i] = { ...f, display_name: e.target.value };
+                  update({ business_formulas: arr });
+                }}
+              />
+              <input
+                className={styles.input}
+                value={f.expression}
+                placeholder="可读展开式"
+                onChange={(e) => {
+                  const arr = [...(draft.business_formulas ?? [])];
+                  arr[i] = { ...f, expression: e.target.value };
+                  update({ business_formulas: arr });
+                }}
+              />
+              <button
+                type="button"
+                className={styles.btnGhost}
+                onClick={() => {
+                  const arr = [...(draft.business_formulas ?? [])];
+                  arr.splice(i, 1);
+                  update({ business_formulas: arr });
+                }}
+              >
+                删除
+              </button>
+            </div>
+          ))}
+          <button
+            type="button"
+            className={styles.btnGhost}
+            onClick={() =>
+              update({
+                business_formulas: [
+                  ...(draft.business_formulas ?? []),
+                  { key: "", expression: "", display_name: "" },
+                ],
+              })
+            }
+          >
+            + 添加公式
+          </button>
+        </div>
+      </details>
+
+      <details className={styles.advanced}>
+        <summary>知识切片用途角色（H16）</summary>
+        <p className={styles.panelHint}>替代写死的销售四态分桶。留空回落内置销售四态。</p>
+        <div className={styles.profileDimensionsSection}>
+          {(draft.chunk_roles ?? []).map((role, i) => (
+            <div key={i} className={styles.profileDimensionRow}>
+              <input
+                className={styles.input}
+                value={role.key}
+                placeholder="chunk_type key"
+                onChange={(e) => {
+                  const arr = [...(draft.chunk_roles ?? [])];
+                  arr[i] = { ...role, key: e.target.value };
+                  update({ chunk_roles: arr });
+                }}
+              />
+              <input
+                className={styles.input}
+                value={role.header}
+                placeholder="分段标题 + 使用指令"
+                onChange={(e) => {
+                  const arr = [...(draft.chunk_roles ?? [])];
+                  arr[i] = { ...role, header: e.target.value };
+                  update({ chunk_roles: arr });
+                }}
+              />
+              <input
+                className={styles.input}
+                type="number"
+                value={role.order}
+                placeholder="顺序"
+                onChange={(e) => {
+                  const arr = [...(draft.chunk_roles ?? [])];
+                  arr[i] = { ...role, order: Number(e.target.value) || 0 };
+                  update({ chunk_roles: arr });
+                }}
+              />
+              <label className={styles.inlineCheckbox}>
+                <input
+                  type="checkbox"
+                  checked={role.is_fallback}
+                  onChange={(e) => {
+                    const arr = [...(draft.chunk_roles ?? [])];
+                    arr[i] = { ...role, is_fallback: e.target.checked };
+                    update({ chunk_roles: arr });
+                  }}
+                />
+                兜底桶
+              </label>
+              <button
+                type="button"
+                className={styles.btnGhost}
+                onClick={() => {
+                  const arr = [...(draft.chunk_roles ?? [])];
+                  arr.splice(i, 1);
+                  update({ chunk_roles: arr });
+                }}
+              >
+                删除
+              </button>
+            </div>
+          ))}
+          <button
+            type="button"
+            className={styles.btnGhost}
+            onClick={() =>
+              update({
+                chunk_roles: [
+                  ...(draft.chunk_roles ?? []),
+                  { key: "", header: "", order: (draft.chunk_roles ?? []).length, is_fallback: false },
+                ],
+              })
+            }
+          >
+            + 添加切片角色
+          </button>
+        </div>
+      </details>
+
+      <details className={styles.advanced}>
+        <summary>记忆维度（H17）</summary>
+        <p className={styles.panelHint}>memoryCard.extra 容器里的业务数组槽位。留空回落销售八槽。</p>
+        <div className={styles.profileDimensionsSection}>
+          {(draft.memory_dimensions ?? []).map((m, i) => (
+            <div key={i} className={styles.profileDimensionRow}>
+              <input
+                className={styles.input}
+                value={m.key}
+                placeholder="槽位 key (camelCase)"
+                onChange={(e) => {
+                  const arr = [...(draft.memory_dimensions ?? [])];
+                  arr[i] = { ...m, key: e.target.value };
+                  update({ memory_dimensions: arr });
+                }}
+              />
+              <input
+                className={styles.input}
+                value={m.display_name}
+                placeholder="中文标签"
+                onChange={(e) => {
+                  const arr = [...(draft.memory_dimensions ?? [])];
+                  arr[i] = { ...m, display_name: e.target.value };
+                  update({ memory_dimensions: arr });
+                }}
+              />
+              <input
+                className={styles.input}
+                type="number"
+                min={1}
+                value={m.cap}
+                placeholder="上限"
+                onChange={(e) => {
+                  const arr = [...(draft.memory_dimensions ?? [])];
+                  arr[i] = { ...m, cap: Math.max(1, Number(e.target.value) || 1) };
+                  update({ memory_dimensions: arr });
+                }}
+              />
+              <label className={styles.inlineCheckbox}>
+                <input
+                  type="checkbox"
+                  checked={m.candidate_type}
+                  onChange={(e) => {
+                    const arr = [...(draft.memory_dimensions ?? [])];
+                    arr[i] = { ...m, candidate_type: e.target.checked };
+                    update({ memory_dimensions: arr });
+                  }}
+                />
+                候选类型
+              </label>
+              <button
+                type="button"
+                className={styles.btnGhost}
+                onClick={() => {
+                  const arr = [...(draft.memory_dimensions ?? [])];
+                  arr.splice(i, 1);
+                  update({ memory_dimensions: arr });
+                }}
+              >
+                删除
+              </button>
+            </div>
+          ))}
+          <button
+            type="button"
+            className={styles.btnGhost}
+            onClick={() =>
+              update({
+                memory_dimensions: [
+                  ...(draft.memory_dimensions ?? []),
+                  { key: "", display_name: "", cap: 8, is_core: false, candidate_type: false },
+                ],
+              })
+            }
+          >
+            + 添加记忆维度
+          </button>
+        </div>
+      </details>
+
+      <details className={styles.advanced}>
+        <summary>运营范式（H8/H19 三驱动力 + 作息门控）</summary>
+        <p className={styles.panelHint}>关掉某驱动力 → 对应 planner 扫描短路（陪伴型常关 funnel）。</p>
+        <div className={styles.formGrid}>
+          <label className={styles.inlineCheckbox}>
+            <input
+              type="checkbox"
+              checked={draft.operation_mode?.funnel?.enabled ?? true}
+              onChange={(e) =>
+                update({
+                  operation_mode: {
+                    funnel: { ...(draft.operation_mode?.funnel ?? { enabled: true }), enabled: e.target.checked },
+                    silence: draft.operation_mode?.silence ?? { enabled: true },
+                    commitment: draft.operation_mode?.commitment ?? { enabled: true },
+                    quiet_hours: draft.operation_mode?.quiet_hours ?? {},
+                  },
+                })
+              }
+            />
+            漏斗推进 funnel（停滞催进）
+          </label>
+          <label className={styles.inlineCheckbox}>
+            <input
+              type="checkbox"
+              checked={draft.operation_mode?.silence?.enabled ?? true}
+              onChange={(e) =>
+                update({
+                  operation_mode: {
+                    funnel: draft.operation_mode?.funnel ?? { enabled: true },
+                    silence: { ...(draft.operation_mode?.silence ?? { enabled: true }), enabled: e.target.checked },
+                    commitment: draft.operation_mode?.commitment ?? { enabled: true },
+                    quiet_hours: draft.operation_mode?.quiet_hours ?? {},
+                  },
+                })
+              }
+            />
+            沉默唤醒 silence
+          </label>
+          <label className={styles.inlineCheckbox}>
+            <input
+              type="checkbox"
+              checked={draft.operation_mode?.commitment?.enabled ?? true}
+              onChange={(e) =>
+                update({
+                  operation_mode: {
+                    funnel: draft.operation_mode?.funnel ?? { enabled: true },
+                    silence: draft.operation_mode?.silence ?? { enabled: true },
+                    commitment: { ...(draft.operation_mode?.commitment ?? { enabled: true }), enabled: e.target.checked },
+                    quiet_hours: draft.operation_mode?.quiet_hours ?? {},
+                  },
+                })
+              }
+            />
+            承诺到期 commitment
+          </label>
+        </div>
+      </details>
+
+      <details className={styles.advanced}>
+        <summary>领域标志位（高敏域可选）</summary>
+        <div className={styles.formGrid}>
+          <label className={styles.field}>
+            <span>停滞计时驱动维度 stagnationDimension</span>
+            <input
+              className={styles.input}
+              value={draft.stagnation_dimension ?? ""}
+              onChange={(e) => update({ stagnation_dimension: e.target.value || undefined })}
+              placeholder="留空回落 customer_stage"
+            />
+          </label>
+          <label className={styles.field}>
+            <span>关联 DomainSchema ID</span>
+            <input
+              className={styles.input}
+              value={draft.domain_schema_id ?? ""}
+              onChange={(e) => update({ domain_schema_id: e.target.value || undefined })}
+              placeholder="chunk 字段表 schema_id（可选）"
+            />
+          </label>
+          <label className={styles.inlineCheckbox}>
+            <input
+              type="checkbox"
+              checked={draft.grounding_gate_bypass_without_claim ?? false}
+              onChange={(e) => update({ grounding_gate_bypass_without_claim: e.target.checked })}
+            />
+            无产品声明时旁路 grounding 软闸（纯情感/关系域）
+          </label>
+          <label className={styles.inlineCheckbox}>
+            <input
+              type="checkbox"
+              checked={draft.distrust_self_reported_low_risk ?? false}
+              onChange={(e) => update({ distrust_self_reported_low_risk: e.target.checked })}
+            />
+            不信任自报低风险（强制走独立 review，高敏域）
+          </label>
+        </div>
+      </details>
+
       <div className={styles.buttonRow}>
         <button
           type="button"

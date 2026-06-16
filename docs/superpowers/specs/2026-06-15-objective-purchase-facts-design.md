@@ -2,6 +2,8 @@
 
 > 状态：**设计评审稿**（2026-06-15）。本轮范围**只定数据模型与 spec**，不写消费侧实现、不写迁移、不实现支付闭环。先评审形态，通过后再分阶段落码。
 >
+> **落码追记（2026-06-16，commit `fa1215f`）**：本 spec 的 §2-§5 **已落码**（评审稿已转实现）——G2 产品目录 CRUD（`/api/products`、`agent/entitlements.rs`）、G3 成交关联 `product_id` + `event_kind`(deal|reversal)、G4 持有投影 `project_entitlements` + decision.rs 持有段注入、§5.5 疑似线索通道（agentGeneratedSignals→admin 核实）均已实现并进 lib 门。**未落**：§4 DB 迁移脚本独立化、§6 支付闭环、G5 售后/续费时间。下文「不写实现 / 仅预留」等措辞为评审时点表述，按上述追记理解当前状态。
+>
 > 上游依据：`2026-06-11-universal-domain-adaptation-design.md` §1.6（CRM 客观业务事实缺口）。本文是该节 G2/G3/G4 的落地专题。
 
 ## 1. 背景与范围

@@ -319,6 +319,13 @@ pub(crate) async fn review_decision(
         crate::agent::domain_profile::render_business_formulas_json_example(
             &active_profile.business_formulas,
         );
+    // 第 19 点：scores 块里 relationshipProgress / conversionReadiness 这类销售专属软
+    // 观测维度由 active profile 的 business_formulas.eval_score_key 派生（排除 5 个硬闸）。
+    // DEFAULT 四公式 → conversionReadiness + relationshipProgress 两行（语义等价旧写死）；
+    // 非销售 profile 未声明这些 key → 空串，scores 只剩 5 个硬闸维度。
+    let extra_score_lines = crate::agent::domain_profile::render_reviewer_extra_score_lines(
+        &active_profile.business_formulas,
+    );
     let user = format!(
         r#"请评审候选回复。
 Review 模式: {}
@@ -329,9 +336,7 @@ Review 模式: {}
     "humanLike": 8,
     "emotionalValue": 7,
     "productAccuracy": 9,
-    "relationshipProgress": 6,
-    "conversionReadiness": 6,
-    "pressureRisk": 2,
+{}    "pressureRisk": 2,
     "factRisk": 1
   }},
   "formulaBreakdown": {{
@@ -399,6 +404,7 @@ Review 模式: {}
 知识路由:
 {}"#,
         review_mode,
+        extra_score_lines,
         formula_breakdown_lines,
         crate::agent::prompt_isolation::isolate_untrusted(&inbound.content),
         decision.reply_text,

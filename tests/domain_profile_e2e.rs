@@ -74,6 +74,7 @@ async fn db_create_profile(
         prompt_fragment: None,
         soul_override: None,
         methodology_override: None,
+        conversation_mode_policy: None,
         commitment_markers: CommitmentMarkers { product_effect: vec![], tone_only: vec![] },
         coverage_dimensions: vec![],
         stagnation_dimension: None,
