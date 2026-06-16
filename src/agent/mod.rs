@@ -139,6 +139,8 @@ pub use review::{finalize_review_for_send, local_decision_review, FinalizeOutcom
 // (`tests/human_like_threshold_pbt.rs` / `tests/pressure_risk_threshold_pbt.rs`)
 // 直接断言"双闸阈值穿越是否拦截"——契约性测试的最小暴露面。
 pub use review::review_passed;
+// roleplay-fuzz reviewer 校准：固定候选回复直喂真 reviewer 的测试入口。
+pub use review::review_fixed_candidate_for_test;
 pub use runtime::UserRuntimeParameters;
 pub use runtime::{resolve_thresholds, ResolvedThresholds};
 pub use types::{DecisionReviewResult, RawAgentDecision, ReviewScores};

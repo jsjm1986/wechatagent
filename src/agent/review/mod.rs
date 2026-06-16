@@ -190,6 +190,65 @@ pub fn local_decision_review(
     }
 }
 
+/// 仅供集成测试用：用一条**固定候选回复**直接跑真实 reviewer，绕过 Reply Agent，
+/// 拿到 reviewer 对该候选的真实 ReviewScores。用于 roleplay-fuzz reviewer 校准
+/// （验证情感 profile 下 reviewer 既不误杀合理关心、也不漏判控制式高压）。
+///
+/// 内部构造 `review_decision` 不关心的默认参数（空 memory / 无 playbook / 无知识），
+/// 只暴露测试关心的输入。**不测发送链路**（无 gateway precheck / outbox / finalize），
+/// 只隔离 reviewer LLM 评分这一个变量。
+#[doc(hidden)]
+pub async fn review_fixed_candidate_for_test(
+    state: &AppState,
+    contact: &Contact,
+    inbound: &ConversationMessage,
+    candidate_reply: &str,
+    runtime: &UserRuntimeParameters,
+    review_mode: &str,
+) -> AppResult<DecisionReviewResult> {
+    let decision = AgentDecision {
+        should_reply: true,
+        reply_text: candidate_reply.to_string(),
+        ..Default::default()
+    };
+    let empty_memory = OperatingMemory {
+        id: None,
+        workspace_id: contact.workspace_id.clone(),
+        account_id: contact.account_id.clone(),
+        contact_wxid: contact.wxid.clone(),
+        user_understanding: Document::new(),
+        relationship_state: Document::new(),
+        product_fit: Document::new(),
+        next_action: Document::new(),
+        context_pack: Document::new(),
+        context_pack_version: 0,
+        context_pack_updated_at: None,
+        memory_card: crate::models::MemoryCardTyped::default(),
+        memory_card_version: 0,
+        memory_card_updated_at: None,
+        created_at: mongodb::bson::DateTime::from_millis(0),
+        updated_at: mongodb::bson::DateTime::from_millis(0),
+    };
+    let context_pack = Document::new();
+    let knowledge_route = KnowledgeRouteResult::default();
+    review_decision(
+        state,
+        contact,
+        inbound,
+        &decision,
+        None,
+        None,
+        runtime,
+        &empty_memory,
+        &context_pack,
+        &[],
+        &knowledge_route,
+        review_mode,
+        None,
+    )
+    .await
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn review_decision(
     state: &AppState,
