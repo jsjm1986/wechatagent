@@ -1,0 +1,60 @@
+name: Probe LLM Endpoint
+
+# 一次性探测：在 GitHub runner 上确认 rsxermu666.cn 是否公网可达、何种 API 格式、可用模型。
+# key 通过 workflow_dispatch input 运行时传入，不写入仓库。用完即删此文件。
+on:
+  workflow_dispatch:
+    inputs:
+      probe_key:
+        description: 'API key（运行时传入，不入仓）'
+        required: true
+        type: string
+      base_url:
+        description: 'base url'
+        required: true
+        default: 'https://rsxermu666.cn'
+        type: string
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: DNS + 连通性 + 格式探测
+        env:
+          PROBE_KEY: ${{ github.event.inputs.probe_key }}
+          BASE_URL: ${{ github.event.inputs.base_url }}
+        run: |
+          HOST=$(echo "$BASE_URL" | sed -E 's#https?://##; s#/.*##')
+          echo "===== 1. DNS 解析 $HOST ====="
+          getent hosts "$HOST" || echo "(DNS 解析失败)"
+          nslookup "$HOST" || true
+
+          echo ""
+          echo "===== 2. TLS 握手（HEAD /） ====="
+          curl -sS --max-time 20 -I "$BASE_URL/" 2>&1 | head -20 || echo "(根路径请求失败)"
+
+          echo ""
+          echo "===== 3. OpenAI 格式 /v1/models ====="
+          curl -sS --max-time 30 "$BASE_URL/v1/models" \
+            -H "Authorization: Bearer $PROBE_KEY" 2>&1 | head -c 3000 || echo "(models 失败)"
+
+          echo ""
+          echo "===== 4. OpenAI 格式 /v1/chat/completions (claude-opus-4.8) ====="
+          curl -sS --max-time 60 "$BASE_URL/v1/chat/completions" \
+            -H "Authorization: Bearer $PROBE_KEY" \
+            -H "content-type: application/json" \
+            -d '{"model":"claude-opus-4.8","messages":[{"role":"user","content":"reply with just: OK"}],"max_tokens":20}' \
+            2>&1 | head -c 1500 || echo "(chat 失败)"
+
+          echo ""
+          echo "===== 5. Anthropic 格式 /v1/messages (claude-opus-4.8) ====="
+          curl -sS --max-time 60 "$BASE_URL/v1/messages" \
+            -H "x-api-key: $PROBE_KEY" \
+            -H "anthropic-version: 2023-06-01" \
+            -H "content-type: application/json" \
+            -d '{"model":"claude-opus-4.8","max_tokens":20,"messages":[{"role":"user","content":"reply with just: OK"}]}' \
+            2>&1 | head -c 1500 || echo "(messages 失败)"
+
+          echo ""
+          echo "===== 探测完成 ====="
