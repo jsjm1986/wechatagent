@@ -331,6 +331,64 @@ pub fn apply_conversation_mode_policy(policy: &str, override_text: Option<&str>)
     format!("{injected}\n\n{}", stripped.trim_start_matches('\n'))
 }
 
+/// 把模式集合渲染成 policy `## 决策协议字段` 里的 JSON 数组枚举形：
+/// `["casual_relationship", "value_exchange", ...]`（与写死文本逐字同形）。
+fn render_modes_json_array(modes: &[String]) -> String {
+    let inner = modes
+        .iter()
+        .map(|m| format!("\"{m}\""))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("[{inner}]")
+}
+
+/// 把模式集合渲染成 task final 形态契约里的竖线枚举形：
+/// `casual_relationship | value_exchange | ...`（与写死文本逐字同形）。
+fn render_modes_pipe(modes: &[String]) -> String {
+    modes.join(" | ")
+}
+
+/// universal-domain-adaptation H9 修复（问题 A）：把 prompt 里**写死的 conversationMode
+/// 四模式枚举列表**替换为 active profile 声明的模式集合。
+///
+/// 背景：`user.reply.policy` 的「## 决策协议字段」段（JSON 数组形）与 `user.reply.task`
+/// 的 final 形态契约（竖线形）都写死了销售四模式 `[casual_relationship / value_exchange /
+/// consultative / boundary_protection]`，**无条件注入**、不随 profile 变。而运行时
+/// `validate_and_promote`（types.rs）用的是 `runtime.allowed_conversation_modes`
+/// （= active profile.conversation_modes 覆盖）做严格枚举校验。二者一旦不一致：非销售
+/// 行业（声明 `intimate_companion` 等）的 LLM 被 prompt 带偏输出销售模式、或输出本行业
+/// 模式但 prompt 压它选销售模式造成漂移 → `invalid_enum_value:conversation_mode:*` →
+/// **硬协议违规**（gates.rs `is_protocol_violation_tag`）→ reply 被硬 block、不给改写。
+///
+/// 本函数以「单一真相源」`runtime::default_conversation_modes()`（四模式）构造**旧串**，
+/// 以 active profile 的 `modes`（空集回落同一默认）构造**新串**，在 `text` 里做精确子串
+/// 替换。**DEFAULT_PROFILE / 老库**（modes 为空或恰为默认四模式）→ 旧串==新串 → 不替换
+/// → prompt 字节等价、销售域零变化。换行业声明非默认模式集 → policy/task 的枚举列表与
+/// runtime 校验集合对齐，消除矛盾指令。
+///
+/// 只替换精确的枚举列表子串（数组形 + 竖线形），不触碰「## 模式与 5 闸的关系」段里
+/// 各模式的散文描述（boundary_protection 反接管红线段继续写死守护）。
+pub fn apply_conversation_mode_enum_list(text: &str, modes: &[String]) -> String {
+    let default_modes = crate::agent::runtime::default_conversation_modes();
+    let effective: Vec<String> = if modes.is_empty() {
+        default_modes.clone()
+    } else {
+        modes.to_vec()
+    };
+    let mut out = text.to_string();
+    let old_array = render_modes_json_array(&default_modes);
+    let new_array = render_modes_json_array(&effective);
+    if new_array != old_array {
+        out = out.replace(&old_array, &new_array);
+    }
+    let old_pipe = render_modes_pipe(&default_modes);
+    let new_pipe = render_modes_pipe(&effective);
+    if new_pipe != old_pipe {
+        out = out.replace(&old_pipe, &new_pipe);
+    }
+    out
+}
+
 /// universal-domain-adaptation H15（3A-1c）：把经营公式渲染成 reviewer prompt
 /// `formulaBreakdown` JSON 示例的内层行（`"key": "expression",` 逐行，最后一行无逗号）。
 /// 同一单一真相源；空集回落 [`default_business_formulas`]。
@@ -1346,6 +1404,59 @@ mod tests {
         assert!(out.starts_with(POLICY_CONVERSATION_MODE_SECTION_HEADING));
         assert!(out.contains("empathetic_support"));
         assert!(out.contains("## 模式与 5 闸的关系"));
+    }
+
+    // ── H9 修复（问题 A）：conversationMode 枚举列表随 profile 渲染 ──
+
+    /// DEFAULT / 空集 / 恰为默认四模式 → 旧串==新串 → 不替换 → 字节等价（数组形 + 竖线形）。
+    #[test]
+    fn apply_conversation_mode_enum_list_default_is_byte_identical() {
+        // policy 数组形 + task 竖线形各一段，模拟两处写死枚举列表。
+        let text = "- conversationMode 必须严格选自 [\"casual_relationship\", \"value_exchange\", \"consultative\", \"boundary_protection\"]。\n\
+                    \"conversationMode\": \"casual_relationship | value_exchange | consultative | boundary_protection\",";
+        // 空集 → 回落默认四模式 → 字节等价。
+        assert_eq!(apply_conversation_mode_enum_list(text, &[]), text);
+        // 显式默认四模式 → 同样字节等价。
+        let default_modes = crate::agent::runtime::default_conversation_modes();
+        assert_eq!(apply_conversation_mode_enum_list(text, &default_modes), text);
+    }
+
+    /// 非销售模式集 → 数组形与竖线形两处枚举列表都被替换为本行业模式。
+    #[test]
+    fn apply_conversation_mode_enum_list_replaces_both_forms_for_custom_modes() {
+        let text = "- conversationMode 必须严格选自 [\"casual_relationship\", \"value_exchange\", \"consultative\", \"boundary_protection\"]。\n\
+                    \"conversationMode\": \"casual_relationship | value_exchange | consultative | boundary_protection\",";
+        let modes = vec![
+            "intimate_companion".to_string(),
+            "casual_relationship".to_string(),
+            "boundary_protection".to_string(),
+        ];
+        let out = apply_conversation_mode_enum_list(text, &modes);
+        // 数组形替换为本行业三模式。
+        assert!(
+            out.contains("[\"intimate_companion\", \"casual_relationship\", \"boundary_protection\"]"),
+            "数组形未按 profile 替换：{out}"
+        );
+        // 竖线形替换为本行业三模式。
+        assert!(
+            out.contains("intimate_companion | casual_relationship | boundary_protection"),
+            "竖线形未按 profile 替换：{out}"
+        );
+        // 写死的销售四模式列表不再残留（消除矛盾指令）。
+        assert!(!out.contains("\"value_exchange\", \"consultative\""), "销售数组形残留：{out}");
+        assert!(!out.contains("value_exchange | consultative"), "销售竖线形残留：{out}");
+    }
+
+    /// 只替换精确的枚举列表子串，不触碰各模式的散文描述（boundary_protection 红线段保留）。
+    #[test]
+    fn apply_conversation_mode_enum_list_keeps_mode_prose_descriptions() {
+        // 模拟「## 模式与 5 闸的关系」段里逐模式散文 + 红线（不含枚举列表子串形态）。
+        let prose = "- **boundary_protection**：禁止任何主动话术；严禁承诺真人。\n\
+                     - **consultative**：所有产品声明必须由 verified_chunks 支撑。";
+        let modes = vec!["intimate_companion".to_string(), "boundary_protection".to_string()];
+        let out = apply_conversation_mode_enum_list(prose, &modes);
+        // 散文逐字保留（无数组/竖线枚举列表子串可匹配 → 不动）。
+        assert_eq!(out, prose, "散文描述段不应被触碰");
     }
 
     // ── 1G-c：DomainProfileCache TTL / 命中 / 回落 / 失效（无 Docker 纯内存）──

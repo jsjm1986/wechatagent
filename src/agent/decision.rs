@@ -421,6 +421,16 @@ pub(crate) async fn decide_reply_with_promote(
         &policy,
         active_profile.conversation_mode_policy.as_deref(),
     );
+    // universal-domain-adaptation H9 修复（问题 A）：policy「## 决策协议字段」段写死的
+    // conversationMode 四模式枚举列表替换为 active profile 声明的模式集合，与下游
+    // validate_and_promote 的 runtime.allowed_conversation_modes 校验集合对齐，消除
+    // 「prompt 说选销售四模式、校验却按本行业模式集」的矛盾指令（否则非销售域 LLM 漂移
+    // 触发 invalid_enum_value 硬协议违规 → reply 被硬 block）。DEFAULT/老库（空或默认
+    // 四模式）→ 旧串==新串、不替换、字节等价。
+    let policy = super::domain_profile::apply_conversation_mode_enum_list(
+        &policy,
+        &active_profile.conversation_modes,
+    );
     let (task_template, _task_version) = prompts::load_prompt_for_contact(
         &state.db,
         &state.config.default_workspace_id,
@@ -456,6 +466,13 @@ pub(crate) async fn decide_reply_with_promote(
         super::domain_profile::render_decision_dimensions_guidance(
             &active_profile.profile_dimensions
         )
+    );
+    // universal-domain-adaptation H9 修复（问题 A）：task final 形态契约写死的
+    // conversationMode 竖线枚举列表（`a | b | c | d`）同样替换为 active profile 模式集合，
+    // 与 policy 侧（上方）+ runtime 校验集合三处对齐。DEFAULT/老库 → 字节等价。
+    let task_template = super::domain_profile::apply_conversation_mode_enum_list(
+        &task_template,
+        &active_profile.conversation_modes,
     );
     // R-prompt-v3：Operator Instruction 层（最高优先级）。运营人员可在后台对
     // 单个联系人写一段 ≤ 1000 字的特别指令，覆盖 Soul + Policy 的默认人格判定

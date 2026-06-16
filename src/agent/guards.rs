@@ -162,9 +162,23 @@ pub fn check_state_transition(
                 .unwrap_or("<unknown>"),
         ));
     }
-    let target = states
+    let Some(target) = states
         .iter()
-        .find(|state| state.get_str("key").ok() == Some(to))?;
+        .find(|state| state.get_str("key").ok() == Some(to))
+    else {
+        // 修复（问题 E）：目标 state 不在状态机 = 非法迁移目标，**fail-closed 拒绝**。
+        // 此前用 `?` 在 target-miss 时提前返 None（=放行），与上方 state_machine_empty
+        // 已 fail-closed 的设计自相矛盾：LLM 输出一个 system_taxonomies 里没有的
+        // customer_stage（CandidateNew）经 C2 同步进 operation_state 后，会写入一个状态机
+        // 里不存在的「幻影态」，且下游 load_operation_state_policy 查不到该 key → 返回 None
+        // → enforce_state_action_policy 整段放行（action 门禁失效）。改为拒绝后，gateway
+        // C2 走 rejected 分支：保留旧 operation_state + 写审计事件，reply 不受影响（fail-soft）。
+        // customer_stage 的 CandidateNew 仍按既有 taxonomy candidate 流程落库待人审，二者解耦。
+        // DEFAULT 销售域 9 态均在状态机内，合法 to 恒命中，不受影响。
+        return Some(format!(
+            "state_transition_invalid: unknown_target to={to}"
+        ));
+    };
     if target.get_bool("allowFromAny").unwrap_or(false) {
         return None;
     }
