@@ -56,6 +56,11 @@ async fn run_one_round(state: &AppState) -> anyhow::Result<()> {
                         "H11-linkage: 成交追认强化了召回置信度"
                     );
                 }
+                // D（可观测）：把本轮成交追认命中数 upsert 到滚动统计 doc，供
+                // phase_rollup 读出展示。为 0 也写（稳定锚点）。失败只 warn 不阻断本轮。
+                if let Err(err) = upsert_deal_attribution_stats(state, &ws, report.deal_attributed_hits).await {
+                    tracing::warn!(workspace_id = %ws, ?err, "upsert deal_attribution_stats failed");
+                }
             }
             Err(err) => {
                 tracing::warn!(workspace_id = %ws, ?err, "refresh_usage_stats failed");
@@ -127,6 +132,40 @@ async fn run_one_round(state: &AppState) -> anyhow::Result<()> {
             }
         }
     }
+    Ok(())
+}
+
+/// D（可观测）：把本轮 30d 窗口成交追认强化的命中数 upsert 到滚动统计 doc。
+/// 仿 reviewer_stats：每 workspace 一行，stat_id = `<ws>::deal_attribution`，`$set`
+/// 覆盖（瞬时值非累加），为 0 也写锚点。phase_rollup 读出展示 H11-linkage 效果。
+async fn upsert_deal_attribution_stats(
+    state: &AppState,
+    workspace_id: &str,
+    deal_attributed_hits: u64,
+) -> anyhow::Result<()> {
+    use mongodb::bson::{doc, DateTime};
+    let now = DateTime::now();
+    let stat_id = format!("{workspace_id}::deal_attribution");
+    state
+        .db
+        .raw()
+        .collection::<mongodb::bson::Document>("deal_attribution_stats")
+        .update_one(
+            doc! { "stat_id": &stat_id },
+            doc! {
+                "$set": {
+                    "workspace_id": workspace_id,
+                    "deal_attributed_hits": deal_attributed_hits as i64,
+                    "updated_at": now,
+                },
+                "$setOnInsert": {
+                    "stat_id": &stat_id,
+                    "created_at": now,
+                },
+            },
+            mongodb::options::UpdateOptions::builder().upsert(true).build(),
+        )
+        .await?;
     Ok(())
 }
 

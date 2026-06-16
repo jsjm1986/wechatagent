@@ -1789,6 +1789,7 @@ export function ObservabilityDashboard() {
       oldestPendingAgeMs?: number;
       relayDeliveryFailed?: number;
     };
+    dealAttribution?: { dealAttributedHits?: number; updatedAt?: string | null };
   } | null>(null);
   const [workerHealth, setWorkerHealth] = useState<{
     chatTasks?: {
@@ -1808,6 +1809,15 @@ export function ObservabilityDashboard() {
       patternTop?: Array<{ pattern: string; count: number; outOfClosedSet?: boolean }>;
       blockedTotal?: number;
     };
+  } | null>(null);
+  const [behaviorMetrics, setBehaviorMetrics] = useState<{
+    items?: Array<{
+      date?: string;
+      persisted?: number;
+      dedupeSkipped?: number;
+      errors?: number;
+      lastSuccessAt?: string | null;
+    }>;
   } | null>(null);
   const [pending, setPending] = useState(false);
   const [sweeping, setSweeping] = useState(false);
@@ -1829,7 +1839,7 @@ export function ObservabilityDashboard() {
       }
     }
     try {
-      const [a, b, c, d, e, f, g, h] = await Promise.allSettled([
+      const [a, b, c, d, e, f, g, h, i] = await Promise.allSettled([
         safe<CatalogPersistedView>("/api/operation-knowledge/catalog/persisted"),
         safe<{ total?: number }>("/api/operation-knowledge/catalog"),
         safe<unknown>("/api/operation-knowledge/completeness"),
@@ -1838,6 +1848,7 @@ export function ObservabilityDashboard() {
         safe<{ answerCache?: typeof cacheStats }>("/api/knowledge/metrics"),
         safe<typeof phaseRollup>("/api/admin/observability/phase-rollup"),
         safe<typeof workerHealth>("/api/admin/observability/worker-health"),
+        safe<typeof behaviorMetrics>("/api/behavior-signal-metrics?limit=14"),
       ]).then((rs) => rs.map((r) => (r.status === "fulfilled" ? r.value : null)));
       if (a) setCatalog(a as CatalogPersistedView);
       if (b) setCatalogLive(b as { total?: number });
@@ -1847,7 +1858,8 @@ export function ObservabilityDashboard() {
       if (f) setCacheStats((f as { answerCache?: typeof cacheStats })?.answerCache ?? null);
       if (g) setPhaseRollup(g as typeof phaseRollup);
       if (h) setWorkerHealth(h as typeof workerHealth);
-      const failed = [a, b, c, d, e, f, g, h].filter((x) => x === null).length;
+      if (i) setBehaviorMetrics(i as typeof behaviorMetrics);
+      const failed = [a, b, c, d, e, f, g, h, i].filter((x) => x === null).length;
       if (failed > 0) setError(`${failed} 项诊断数据加载失败，其余正常显示`);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
@@ -2018,6 +2030,34 @@ export function ObservabilityDashboard() {
             );
           })()}
         </article>
+
+        <article className="wikiObservabilityCard">
+          <header className="wikiObservabilityCardHead">
+            <span className="wikiArchiveTag">behavior-signals</span>
+            <h4>采集健康度</h4>
+          </header>
+          {(() => {
+            const latest = behaviorMetrics?.items?.[0];
+            if (!latest) {
+              return <div className="wikiEmpty">暂无采集数据</div>;
+            }
+            const errs = latest.errors ?? 0;
+            return (
+              <dl className="wikiArchiveMeta">
+                <dt>日期</dt>
+                <dd>{latest.date ?? "—"}</dd>
+                <dt>已入库</dt>
+                <dd>{latest.persisted ?? 0}</dd>
+                <dt>去重跳过</dt>
+                <dd>{latest.dedupeSkipped ?? 0}</dd>
+                <dt>错误</dt>
+                <dd className={errs > 0 ? "wikiObservabilityDrift" : undefined}>{errs}</dd>
+                <dt>最近成功</dt>
+                <dd>{latest.lastSuccessAt ? latest.lastSuccessAt.slice(0, 10) : "—"}</dd>
+              </dl>
+            );
+          })()}
+        </article>
       </div>
 
       <PhaseRollupPanel data={phaseRollup} />
@@ -2052,6 +2092,7 @@ function PhaseRollupPanel({
       oldestPendingAgeMs?: number;
       relayDeliveryFailed?: number;
     };
+    dealAttribution?: { dealAttributedHits?: number; updatedAt?: string | null };
   } | null;
 }) {
   if (!data) {
@@ -2075,6 +2116,8 @@ function PhaseRollupPanel({
     escAgeBuckets.find((r) => r.bucket === "gt_24h")?.count ?? 0;
   const relayFailed = escalation?.relayDeliveryFailed ?? 0;
   const escHasData = escalation != null && escByStatus.length > 0;
+  const dealAttribution = data.dealAttribution ?? null;
+  const dealAttributedHits = dealAttribution?.dealAttributedHits ?? 0;
 
   return (
     <section className="wikiObservabilityPhaseRollup">
@@ -2223,6 +2266,25 @@ function PhaseRollupPanel({
             </dl>
           ) : (
             <div className="wikiEmpty">该工作区暂无请示记录</div>
+          )}
+        </article>
+
+        <article className="wikiObservabilityCard">
+          <header className="wikiObservabilityCardHead">
+            <span className="wikiArchiveTag">deal-attribution</span>
+            <h4>成交追认强化命中</h4>
+          </header>
+          {dealAttribution != null ? (
+            <dl className="wikiArchiveMeta">
+              <dt>命中数（30d 窗口）</dt>
+              <dd className={dealAttributedHits > 0 ? "wikiObservabilityHit" : undefined}>
+                {dealAttributedHits}
+              </dd>
+              <dt>更新于</dt>
+              <dd>{dealAttribution.updatedAt ?? "—"}</dd>
+            </dl>
+          ) : (
+            <div className="wikiEmpty">该工作区暂无成交追认记录</div>
           )}
         </article>
       </div>

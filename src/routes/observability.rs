@@ -61,6 +61,7 @@ pub(super) async fn phase_rollup(
     let reviewer_stats = read_reviewer_stats(&state, &workspace).await?;
     let negative_example_pending = count_negative_example_pending(&state, &workspace).await?;
     let principal_escalations = aggregate_escalation_health(&state, &workspace).await?;
+    let deal_attribution = read_deal_attribution_stats(&state, &workspace).await?;
 
     Ok(Json(json!({
         "windowHours": 24,
@@ -71,6 +72,7 @@ pub(super) async fn phase_rollup(
         "reviewerStats": reviewer_stats,
         "negativeExamplePending": negative_example_pending,
         "principalEscalations": principal_escalations,
+        "dealAttribution": deal_attribution,
     })))
 }
 
@@ -265,6 +267,23 @@ async fn read_reviewer_stats(
         "approvedButUserNegative": doc.get_i64("approved_but_user_negative").unwrap_or(0),
         "passRate": doc.get_f64("pass_rate").unwrap_or(0.0),
         "misjudgeRate": doc.get_f64("misjudge_rate").unwrap_or(0.0),
+    }))
+}
+
+/// D（可观测）：读 deal_attribution_stats 滚动统计 doc（H11-linkage 成交追认效果）。
+/// 无（feedback_worker 未跑过 / 无成交数据）则返回空对象，前端按缺省渲染。
+async fn read_deal_attribution_stats(state: &AppState, workspace: &str) -> AppResult<Value> {
+    let stat_id = format!("{workspace}::deal_attribution");
+    let coll = state
+        .db
+        .raw()
+        .collection::<Document>("deal_attribution_stats");
+    let Some(doc) = coll.find_one(doc! { "stat_id": &stat_id }, None).await? else {
+        return Ok(json!({}));
+    };
+    Ok(json!({
+        "dealAttributedHits": doc.get_i64("deal_attributed_hits").unwrap_or(0),
+        "updatedAt": doc.get_datetime("updated_at").ok().and_then(|d| crate::models::dt_to_string(*d)),
     }))
 }
 
