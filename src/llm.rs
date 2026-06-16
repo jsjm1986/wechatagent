@@ -504,7 +504,16 @@ impl LlmClient {
             return Err(err);
         }
 
-        let parsed: AnthropicMessageResponse = serde_json::from_str(&text)?;
+        let parsed: AnthropicMessageResponse = match serde_json::from_str(&text) {
+            Ok(p) => p,
+            Err(e) => {
+                // 临时诊断（rsxermu claude json_decode 定位）：打印原始 body 前缀，确认是否
+                // SSE / 空 / 非 JSON。定位后移除。
+                let head: String = text.chars().take(300).collect();
+                eprintln!("[anthropic-diag] parse AnthropicMessageResponse 失败: {e}; body_head={head:?}");
+                return Err(AppError::from(e));
+            }
+        };
         let content = parsed
             .content
             .iter()
@@ -525,9 +534,19 @@ impl LlmClient {
                 ..Default::default()
             })
             .unwrap_or_default();
+        let cleaned = strip_reasoning_prefix(content);
+        let value = match parse_json_content(&cleaned) {
+            Ok(v) => v,
+            Err(e) => {
+                // 临时诊断：content block 拿到了但非 JSON，打印前缀确认 claude 实际输出形态。定位后移除。
+                let head: String = cleaned.chars().take(300).collect();
+                eprintln!("[anthropic-diag] parse_json_content 失败: {e}; content_head={head:?}");
+                return Err(e);
+            }
+        };
         Ok((
             LlmJsonResult {
-                value: parse_json_content(&strip_reasoning_prefix(content))?,
+                value,
                 usage,
                 latency_ms: started_at.elapsed().as_millis() as i64,
                 model: self.model.clone(),
