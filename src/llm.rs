@@ -527,7 +527,7 @@ impl LlmClient {
             .unwrap_or_default();
         Ok((
             LlmJsonResult {
-                value: parse_json_content(content)?,
+                value: parse_json_content(&strip_reasoning_prefix(content))?,
                 usage,
                 latency_ms: started_at.elapsed().as_millis() as i64,
                 model: self.model.clone(),
@@ -959,6 +959,14 @@ fn parse_json_content(content: &str) -> AppResult<Value> {
     } else {
         trimmed
     };
+    // 部分模型（实测 rsxermu claude-opus-4-8 在复杂结构化输出 prompt 下）会在 JSON 前后加
+    // 自然语言（"Here is the profile:\n{...}\n希望有帮助"），剥 ``` 后首字符仍非 `{`/`[`。
+    // 严格解析前先尝试截取首个平衡的 JSON 对象/数组；截不出则原样走严格解析。非包裹场景零影响。
+    let json_text = if json_text.starts_with('{') || json_text.starts_with('[') {
+        json_text
+    } else {
+        extract_first_json_block(json_text).unwrap_or(json_text)
+    };
     match serde_json::from_str::<Value>(json_text) {
         Ok(value) => Ok(value),
         Err(strict_err) => {
@@ -975,6 +983,43 @@ fn parse_json_content(content: &str) -> AppResult<Value> {
             Err(AppError::from(strict_err))
         }
     }
+}
+
+/// 从含自然语言前导/后缀的文本中截取**第一个平衡的** JSON 对象 `{...}` 或数组 `[...]`。
+/// 按括号配平扫描（跳过字符串字面量内的括号与转义），找到第一个 `{`/`[` 到其配对闭合符
+/// 的子串。截不出返回 None（调用方回退原文本走严格解析，保持非包裹场景零行为变化）。
+fn extract_first_json_block(text: &str) -> Option<&str> {
+    let bytes = text.as_bytes();
+    let start = bytes.iter().position(|&b| b == b'{' || b == b'[')?;
+    let open = bytes[start];
+    let close = if open == b'{' { b'}' } else { b']' };
+    let mut depth: i32 = 0;
+    let mut in_string = false;
+    let mut escape = false;
+    for (i, &b) in bytes.iter().enumerate().skip(start) {
+        if in_string {
+            if escape {
+                escape = false;
+            } else if b == b'\\' {
+                escape = true;
+            } else if b == b'"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match b {
+            b'"' => in_string = true,
+            x if x == open => depth += 1,
+            x if x == close => {
+                depth -= 1;
+                if depth == 0 {
+                    return text.get(start..=i);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 /// 修复 LLM 偶发输出的非严格 JSON。只做两类局部修复：
@@ -1327,5 +1372,39 @@ mod tests {
         let repaired = repair_loose_json(raw).expect("含 \\u0001 应触发修复");
         let v: Value = serde_json::from_str(&repaired).expect("修复后必须是合法 JSON");
         assert_eq!(v.get("x").and_then(|x| x.as_str()), Some("a\u{0001}b"));
+    }
+
+    #[test]
+    fn parse_json_content_extracts_json_with_natural_language_wrapper() {
+        // rsxermu claude-opus-4-8 在复杂结构化 prompt 下偶发前后加自然语言包裹 JSON。
+        // parse_json_content SHALL 截取首个平衡 JSON 对象后解析成功，不再 expected value at
+        // line 1 column 1（domain_profile_e2e 真模型实测命中）。
+        let raw = "好的，以下是生成的画像：\n{\"profile_id\": \"x\", \"display_name\": \"陪伴\"}\n希望对你有帮助。";
+        let v = parse_json_content(raw).expect("前后自然语言包裹的 JSON 必须被截取解析");
+        assert_eq!(v.get("profile_id").and_then(|x| x.as_str()), Some("x"));
+        assert_eq!(v.get("display_name").and_then(|x| x.as_str()), Some("陪伴"));
+    }
+
+    #[test]
+    fn extract_first_json_block_handles_braces_inside_strings() {
+        // 字符串字面量内的 `}` 不应被当成对象闭合（配平扫描须跳过字符串内括号）。
+        let raw = "前言 {\"text\": \"a } b { c\", \"n\": 1} 后缀";
+        let block = extract_first_json_block(raw).expect("应截出平衡对象");
+        let v: Value = serde_json::from_str(block).expect("截出的块必须是合法 JSON");
+        assert_eq!(v.get("text").and_then(|x| x.as_str()), Some("a } b { c"));
+        assert_eq!(v.get("n").and_then(|x| x.as_i64()), Some(1));
+    }
+
+    #[test]
+    fn extract_first_json_block_returns_none_without_json() {
+        // 纯自然语言无 JSON → None（调用方回退原文走严格解析报错，不伪造数据）。
+        assert!(extract_first_json_block("这里完全没有 JSON 对象").is_none());
+    }
+
+    #[test]
+    fn parse_json_content_plain_object_unchanged() {
+        // 非包裹的纯 JSON 对象：extract 分支不介入（首字符是 `{`），行为零变化。
+        let v = parse_json_content(r#"{"a": 1}"#).expect("纯 JSON 必须直接解析");
+        assert_eq!(v.get("a").and_then(|x| x.as_i64()), Some(1));
     }
 }
