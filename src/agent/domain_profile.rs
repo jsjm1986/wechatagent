@@ -367,7 +367,7 @@ fn render_modes_pipe(modes: &[String]) -> String {
 /// runtime 校验集合对齐，消除矛盾指令。
 ///
 /// 只替换精确的枚举列表子串（数组形 + 竖线形），不触碰「## 模式与 5 闸的关系」段里
-/// 各模式的散文描述（boundary_protection 反接管红线段继续写死守护）。
+/// 各模式的散文描述（boundary_protection 边界保护红线段继续写死守护）。
 pub fn apply_conversation_mode_enum_list(text: &str, modes: &[String]) -> String {
     let default_modes = crate::agent::runtime::default_conversation_modes();
     let effective: Vec<String> = if modes.is_empty() {
