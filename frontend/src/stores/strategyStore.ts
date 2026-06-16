@@ -43,7 +43,8 @@ interface StrategyActions {
   newDomainProfileDraft: () => void;
   setProfileDraft: (draft: DomainProfileDraft) => void;
   saveDomainProfile: (id: string) => Promise<void>;
-  publishDomainProfile: (id: string) => Promise<void>;
+  publishDomainProfile: (id: string) => Promise<{ id: string; riskyFields: string[] } | null>;
+  confirmRiskyActivation: (id: string) => Promise<void>;
   activateDomainProfile: (id: string) => Promise<void>;
   deleteDomainProfile: (id: string) => Promise<void>;
 }
@@ -354,7 +355,33 @@ export const useStrategyStore = create<StrategyState & StrategyActions>((set, ge
   publishDomainProfile: async (id: string) => {
     useUiStore.getState().setBusy(true);
     try {
-      await api.post(`/api/admin/domain-profiles/${id}/publish`, {});
+      const resp = await api.post<{
+        ok: boolean;
+        pendingActivation?: boolean;
+        riskyFields?: string[];
+        id: string;
+      }>(`/api/admin/domain-profiles/${id}/publish`, {});
+      await get().loadDomainProfiles();
+      // 危险开关变更：后端落旁路稿不即时生效，返回 pendingActivation + 变更字段，
+      // 交调用方二次确认后调 confirmRiskyActivation 才生效。普通变更返回 null。
+      if (resp.pendingActivation) {
+        return { id: resp.id, riskyFields: resp.riskyFields ?? [] };
+      }
+      return null;
+    } catch (error) {
+      useUiStore.getState().setError(error instanceof Error ? error.message : String(error));
+      return null;
+    } finally {
+      useUiStore.getState().setBusy(false);
+    }
+  },
+
+  // 危险开关二次确认：对 publish 落的旁路稿调 rollout（推 current + demote + realign），
+  // 让新版本真正生效。复用 rollout 端点（无前置状态校验，旁路稿 current=false 适用）。
+  confirmRiskyActivation: async (id: string) => {
+    useUiStore.getState().setBusy(true);
+    try {
+      await api.post(`/api/admin/domain-profiles/${id}/rollout`, {});
       await get().loadDomainProfiles();
     } catch (error) {
       useUiStore.getState().setError(error instanceof Error ? error.message : String(error));

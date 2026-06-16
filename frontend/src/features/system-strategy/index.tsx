@@ -1843,6 +1843,7 @@ function DomainProfilePanel({ busy }: { busy: boolean }) {
     setProfileDraft,
     saveDomainProfile,
     publishDomainProfile,
+    confirmRiskyActivation,
     activateDomainProfile,
     deleteDomainProfile,
     generateDomainProfile,
@@ -1864,8 +1865,21 @@ function DomainProfilePanel({ busy }: { busy: boolean }) {
   }
 
   async function handlePublish(id: string) {
-    if (!window.confirm("确认发布此版本？发布后需再点击「激活」才会生效。")) return;
-    await publishDomainProfile(id);
+    if (!window.confirm(
+      "确认发布此版本？\n\n普通字段（名称/简介/业务上下文等）发布后即时生效；" +
+      "若改动了高风险开关（人格本体/方法论/风控阈值/自学习极性等），会要求二次确认后才生效。"
+    )) return;
+    const pending = await publishDomainProfile(id);
+    // 危险开关变更：后端落旁路稿未即时生效，二次确认后经 rollout 才生效。
+    if (pending) {
+      const fields = pending.riskyFields.length > 0 ? pending.riskyFields.join("、") : "（未知字段）";
+      if (window.confirm(
+        `本次改动涉及高风险字段：${fields}。\n\n` +
+        "新版本已定稿但尚未生效，当前仍运行旧版本。确认这些改动无误并立即生效？"
+      )) {
+        await confirmRiskyActivation(pending.id);
+      }
+    }
   }
 
   async function handleActivate(id: string) {

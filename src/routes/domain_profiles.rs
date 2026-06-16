@@ -259,9 +259,17 @@ pub(super) async fn delete_domain_profile(
     Ok(Json(json!({ "ok": true })))
 }
 
-/// publish：在 scope=(workspace_id, profile_id) 下取 max(version)+1,写新文档
-/// current_version=true + previous_version=Some(source.version),soft-demote 同 scope
-/// 其他 row 的 current_version。**不动 is_active**(publish 只定稿版本)。
+/// publish：在 scope=(workspace_id, profile_id) 下取 max(version)+1,写新文档。
+///
+/// **分级生效**（危险开关二次确认）：先取该血缘当前 active 版本作 diff 基准，比对
+/// [`risky_fields_changed`] 的 10 个危险字段——
+/// - **危险分支**（血缘已生效 **且** 危险字段有变更）：新版本落「旁路稿」
+///   `current_version=false`、`is_active=false`，**不 demote、不 realign、不动旧 active
+///   版本**——旧版继续 current+active 生效（零窗口期回落 DEFAULT）。返回 `pendingActivation:true`
+///   + `riskyFields`，前端二次确认后经 `rollout`（推 current+demote+realign）才真正生效。
+/// - **普通分支**（无危险变更，或血缘从未 active：纯草稿/AI 候选/DEFAULT）：与改造前
+///   逐字节等价——新版本 `current_version=true`、soft-demote 其他、`realign_active_to_current`
+///   据血缘决定是否继承生效态。
 pub async fn publish_domain_profile(
     State(state): State<AppState>,
     Extension(admin): Extension<AuthenticatedAdmin>,
@@ -276,17 +284,52 @@ pub async fn publish_domain_profile(
         )
         .await?
         .ok_or_else(|| AppError::NotFound("domain profile not found".to_string()))?;
+    // diff 基准 = 该血缘当前正在生效（is_active）的版本。无 active（纯草稿/AI 候选/
+    // DEFAULT 血缘）时为 None → 危险分支不触发，走与改造前等价的普通分支。
+    let active_base = coll
+        .find_one(
+            doc! {
+                "workspace_id": &source.workspace_id,
+                "profile_id": &source.profile_id,
+                "is_active": true,
+            },
+            None,
+        )
+        .await?;
+    let risky_changed: Vec<&'static str> = active_base
+        .as_ref()
+        .map(|base| risky_fields_changed(base, &source))
+        .unwrap_or_default();
     let next_version =
         next_version_for_profile(&state, &source.workspace_id, &source.profile_id).await?;
     let now = DateTime::now();
     let mut published = source.clone();
     published.id = None;
     published.version = next_version;
-    published.current_version = true;
     published.previous_version = Some(source.version);
     published.seeded_by = Some("manual".to_string());
-    published.is_active = false; // 先落非 active,下方 realign 据血缘决定是否继承生效态
+    published.is_active = false;
     published.updated_at = now;
+
+    if active_base.is_some() && !risky_changed.is_empty() {
+        // 危险分支：落旁路稿（非 current），不动正在生效的旧版本。等运营二次确认后
+        // 经 rollout 才推 current+生效——给手滑改错风控/人格/自学习方向留缓冲。
+        published.current_version = false;
+        let inserted = coll.insert_one(&published, None).await?;
+        let new_id = inserted.inserted_id.as_object_id();
+        invalidate_global_domain_profile_cache();
+        return Ok(Json(json!({
+            "ok": true,
+            "pendingActivation": true,
+            "riskyFields": risky_changed,
+            "id": new_id.map(|i| i.to_hex()).unwrap_or_default(),
+            "version": next_version,
+            "previousVersion": source.version,
+        })));
+    }
+
+    // 普通分支（无危险变更，或血缘从未 active）——与改造前逐字节等价。
+    published.current_version = true;
     let inserted = coll.insert_one(&published, None).await?;
     let new_id = inserted.inserted_id.as_object_id();
     coll.update_many(
@@ -506,6 +549,66 @@ async fn realign_active_to_current(
     )
     .await?;
     Ok(())
+}
+
+/// 「危险开关」字段集：直接左右 AI 能否瞎编产品 / 自学习方向 / 人格本体 / 风控阈值
+/// 的 10 个字段。运营手动编辑**已生效**血缘并 publish 时，这些字段一旦相对当前 active
+/// 版本发生变化，就不即时生效（落旁路稿等二次确认），避免手滑改错立即污染线上。
+/// 黑名单外字段（display_name/description/profile_dimensions/coverage_dimensions/
+/// business_formulas/memory_dimensions/chunk_roles/prompt_fragment/stagnation_dimension/
+/// domain_schema_id/methodology_generator_preamble）视为普通字段，照旧即时生效。
+const RISKY_FIELD_NAMES: [&str; 10] = [
+    "soul_override",
+    "methodology_override",
+    "conversation_mode_policy",
+    "commitment_markers",
+    "conversation_modes",
+    "operation_mode",
+    "grounding_gate_bypass_without_claim",
+    "distrust_self_reported_low_risk",
+    "outcome_polarity",
+    "threshold_overrides",
+];
+
+/// 比对两份 profile 的 10 个危险字段，返回**发生变化**的字段名列表（顺序与
+/// [`RISKY_FIELD_NAMES`] 一致）。整体相等比较（逐字段 `!=`，偏保守：宁可多一次确认也
+/// 不漏判）。`commitment_markers` / `operation_mode` / `outcome_polarity` /
+/// `threshold_overrides` 依赖各自类型的 `PartialEq`（见 `models.rs`）。
+///
+/// 纯函数、无 IO，供 `publish_domain_profile` 分级判定 + 单测共用。空 Vec = 无危险变更。
+pub fn risky_fields_changed(old: &DomainProfile, new: &DomainProfile) -> Vec<&'static str> {
+    let mut changed = Vec::new();
+    if old.soul_override != new.soul_override {
+        changed.push(RISKY_FIELD_NAMES[0]);
+    }
+    if old.methodology_override != new.methodology_override {
+        changed.push(RISKY_FIELD_NAMES[1]);
+    }
+    if old.conversation_mode_policy != new.conversation_mode_policy {
+        changed.push(RISKY_FIELD_NAMES[2]);
+    }
+    if old.commitment_markers != new.commitment_markers {
+        changed.push(RISKY_FIELD_NAMES[3]);
+    }
+    if old.conversation_modes != new.conversation_modes {
+        changed.push(RISKY_FIELD_NAMES[4]);
+    }
+    if old.operation_mode != new.operation_mode {
+        changed.push(RISKY_FIELD_NAMES[5]);
+    }
+    if old.grounding_gate_bypass_without_claim != new.grounding_gate_bypass_without_claim {
+        changed.push(RISKY_FIELD_NAMES[6]);
+    }
+    if old.distrust_self_reported_low_risk != new.distrust_self_reported_low_risk {
+        changed.push(RISKY_FIELD_NAMES[7]);
+    }
+    if old.outcome_polarity != new.outcome_polarity {
+        changed.push(RISKY_FIELD_NAMES[8]);
+    }
+    if old.threshold_overrides != new.threshold_overrides {
+        changed.push(RISKY_FIELD_NAMES[9]);
+    }
+    changed
 }
 
 /// PUT 部分更新：从请求 body 文档剥离后端管理键,返回只含可改内容键的 `$set` 文档。
@@ -773,5 +876,165 @@ mod tests {
         let set_doc = super::strip_backend_managed_keys(&req.profile);
         assert_eq!(set_doc.get_str("display_name").unwrap(), "情感陪伴");
         assert!(set_doc.get_str("conversation_mode_policy").is_ok());
+    }
+
+    // ───────────────────────────────────────────────────────────────
+    // 分级二次确认：risky_fields_changed 纯函数 + 旁路稿/确认 sim。
+    // 真 DomainProfile 夹具复用 lib 侧单一真相源（销售 DEFAULT vs 情感陪伴 example），
+    // 直接验证真函数逻辑而非 sim 复刻。
+    // ───────────────────────────────────────────────────────────────
+
+    use crate::agent::{default_domain_profile, example_emotional_companion_profile};
+    use crate::routes::domain_profiles::risky_fields_changed;
+
+    #[test]
+    fn risky_fields_changed_all_equal_empty() {
+        // 同一份 profile 自比 → 无危险变更。
+        let p = default_domain_profile("ws");
+        assert!(risky_fields_changed(&p, &p).is_empty(), "完全相同 → 空");
+        let q = p.clone();
+        assert!(risky_fields_changed(&p, &q).is_empty(), "clone 自比 → 空");
+    }
+
+    #[test]
+    fn risky_fields_changed_nonrisky_field_returns_empty() {
+        // 只改黑名单外字段（display_name / description / prompt_fragment）→ 不算危险。
+        let base = default_domain_profile("ws");
+        let mut edited = base.clone();
+        edited.display_name = "改个名字".to_string();
+        edited.description = "改个简介".to_string();
+        edited.prompt_fragment = Some("叠加业务上下文，不换人格本体".to_string());
+        assert!(
+            risky_fields_changed(&base, &edited).is_empty(),
+            "纯普通字段变更不触发分级"
+        );
+    }
+
+    #[test]
+    fn risky_fields_changed_detects_emotional_companion_diff() {
+        // 销售 DEFAULT → 情感陪伴 example：example 相对 default 恰好改了 4 个危险字段
+        // （conversation_modes / operation_mode / grounding_gate_bypass_without_claim /
+        // distrust_self_reported_low_risk，见 example_emotional_companion_profile）。
+        let base = default_domain_profile("ws");
+        let edited = example_emotional_companion_profile("ws");
+        let changed = risky_fields_changed(&base, &edited);
+        // 返回顺序与 RISKY_FIELD_NAMES 声明序一致。
+        assert_eq!(
+            changed,
+            vec![
+                "conversation_modes",
+                "operation_mode",
+                "grounding_gate_bypass_without_claim",
+                "distrust_self_reported_low_risk",
+            ],
+            "恰好这 4 个危险字段（profile_id/display_name/prompt_fragment 等普通字段不计）"
+        );
+    }
+
+    #[test]
+    fn risky_fields_changed_single_diff_each_field() {
+        // 逐个危险字段单改，确认每个都被独立检出（覆盖 10 字段比较分支）。
+        let base = default_domain_profile("ws");
+
+        let mut p = base.clone();
+        p.soul_override = Some("换人格本体".to_string());
+        assert_eq!(risky_fields_changed(&base, &p), vec!["soul_override"]);
+
+        let mut p = base.clone();
+        p.methodology_override = Some("换方法论".to_string());
+        assert_eq!(risky_fields_changed(&base, &p), vec!["methodology_override"]);
+
+        let mut p = base.clone();
+        p.conversation_mode_policy = Some("## 对话模式判定\n换判定规则".to_string());
+        assert_eq!(risky_fields_changed(&base, &p), vec!["conversation_mode_policy"]);
+
+        let mut p = base.clone();
+        p.grounding_gate_bypass_without_claim = !base.grounding_gate_bypass_without_claim;
+        assert_eq!(
+            risky_fields_changed(&base, &p),
+            vec!["grounding_gate_bypass_without_claim"]
+        );
+
+        let mut p = base.clone();
+        p.distrust_self_reported_low_risk = !base.distrust_self_reported_low_risk;
+        assert_eq!(
+            risky_fields_changed(&base, &p),
+            vec!["distrust_self_reported_low_risk"]
+        );
+
+        let mut p = base.clone();
+        p.threshold_overrides = Some(crate::models::ProfileThresholds {
+            pressure_risk_block_at: Some(9),
+            ..Default::default()
+        });
+        assert_eq!(risky_fields_changed(&base, &p), vec!["threshold_overrides"]);
+    }
+
+    #[test]
+    fn risky_fields_changed_commitment_markers_uses_partial_eq() {
+        // 钉死 CommitmentMarkers 的 PartialEq derive 生效：改其内 Vec 即被检出。
+        let base = default_domain_profile("ws");
+        let mut edited = base.clone();
+        edited
+            .commitment_markers
+            .product_effect
+            .push("根治率".to_string());
+        assert_eq!(
+            risky_fields_changed(&base, &edited),
+            vec!["commitment_markers"],
+            "CommitmentMarkers 内层 Vec 变更经 PartialEq 检出"
+        );
+    }
+
+    #[test]
+    fn risky_fields_changed_outcome_polarity_diff() {
+        // outcome_polarity 经 PartialEq 检出（H11 自学习极性，高危）。
+        let base = default_domain_profile("ws");
+        let mut edited = base.clone();
+        edited
+            .outcome_polarity
+            .positive
+            .push("emotional_disclosure".to_string());
+        assert_eq!(risky_fields_changed(&base, &edited), vec!["outcome_polarity"]);
+    }
+
+    /// publish 危险分支：落「旁路稿」(current=false)，不动正在生效的旧版本。
+    /// 旧 v1 保持唯一 current+active（零窗口期回落 DEFAULT）。
+    /// 对应 handler 危险分支：insert published(current=false)，不 demote / 不 realign。
+    #[test]
+    fn risky_publish_keeps_v1_current_active_via_sideline_draft() {
+        // 元组 = (version, current_version, is_active)。v1 当前 current+active 生效。
+        let mut rows = vec![(1, true, true)];
+        // 危险 publish：插入 v2 旁路稿 current=false、is_active=false；**不** demote v1。
+        rows.push((2, false, false));
+        // 危险分支既不 demote 也不 realign：rows 保持原样。
+        let current: Vec<_> = rows.iter().filter(|(_, c, _)| *c).map(|(v, _, _)| *v).collect();
+        let active: Vec<_> = rows.iter().filter(|(_, _, a)| *a).map(|(v, _, _)| *v).collect();
+        assert_eq!(current, vec![1], "旁路稿不占 current，v1 仍唯一 current（零窗口）");
+        assert_eq!(active, vec![1], "v1 仍唯一 active，运行时不回落 DEFAULT");
+        // 充要条件：v1 既 current 又 active，运行时继续加载旧版本。
+        assert_eq!(rows.iter().filter(|(_, c, a)| *c && *a).count(), 1);
+    }
+
+    /// 二次确认经 rollout 把旁路稿推成 current+active（rollout = 推 current + demote +
+    /// realign）。对应 confirm-path 复用 `rollout_domain_profile`。
+    #[test]
+    fn confirm_via_rollout_migrates_current_and_active_to_sideline_draft() {
+        // v1 current+active 生效中，v2 是危险 publish 落的旁路稿。
+        let mut rows = vec![(1, true, true), (2, false, false)];
+        // rollout(v2)：推 v2 current=true，demote 其他 current。
+        for (v, cur, _) in rows.iter_mut() {
+            *cur = *v == 2;
+        }
+        // realign：血缘原本有 active（v1）→ 把 is_active 迁到新 current（v2）。
+        realign_active_to_current_sim(&mut rows, 2);
+        let loadable: Vec<_> = rows
+            .iter()
+            .filter(|(_, c, a)| *c && *a)
+            .map(|(v, _, _)| *v)
+            .collect();
+        assert_eq!(loadable, vec![2], "确认后 v2 既 current 又 active，唯一可加载");
+        // 单 current 不变量保持。
+        assert_eq!(rows.iter().filter(|(_, c, _)| *c).count(), 1);
     }
 }
