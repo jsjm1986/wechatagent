@@ -412,6 +412,15 @@ pub(crate) async fn decide_reply_with_promote(
             super::domain_profile::build_policy_formula_section(&active_profile.business_formulas);
         format!("{}\n\n{}", stripped.trim_end_matches('\n'), formula_section)
     };
+    // universal-domain-adaptation H9（第 20 点）：对话模式判定规则单一真相源。active
+    // profile 声明 conversation_mode_policy 时，剥离 policy 写死销售世界观的「## 对话
+    // 模式判定」段并注入本行业规则；DEFAULT_PROFILE / 老库为 None → 原样返回、销售判定
+    // 段逐字保留、销售域零变化。**红线**：下文「## 模式与 5 闸的关系」段（含
+    // boundary_protection 不放宽边界保护硬规则）不在剥离范围、任何行业都继续写死守护。
+    let policy = super::domain_profile::apply_conversation_mode_policy(
+        &policy,
+        active_profile.conversation_mode_policy.as_deref(),
+    );
     let (task_template, _task_version) = prompts::load_prompt_for_contact(
         &state.db,
         &state.config.default_workspace_id,

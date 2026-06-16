@@ -71,7 +71,7 @@
 
 ### 1.5 顺带发现的非通用化缺陷（独立问题，本设计标注但不混入）
 
-- **D1** ✅**Phase 2 已解（写侧）**：`enforce_domain_attributes` 纯函数（required/enum/alias）+ `apply_chunk_revision` 第 6.5 步接线（有 active schema 才校验，无则 no-op）。文档宣称的"写入侧按 active schema 校验"已落地。注：其余写入站点（chat/lessons_learned/reaction/escalation）留后续分批接入。原性质：`DomainSchema` 运行时零消费——CRUD/版本/校验都建了但无运行时读取。
+- **D1** ✅**已正确收口（2026-06-16 逐行核实结论）**：`enforce_domain_attributes` 纯函数（required/enum/alias）+ `apply_chunk_revision` 第 6.5 步接线（有 active schema 才校验，无则 no-op）已覆盖**运营/AI 录入行业知识的唯一正道**。早前"其余写入站点（chat/lessons_learned/reaction/escalation）留后续分批接入"的 TODO 经核实是**基于错误前提**——逐行验证：(1) `chat`（`routes/knowledge/chat.rs` apply_create/update_chunk）的 chunk 请求字段清单**根本不含 domain_attributes**；(2) `lessons_learned`（`routes/lessons_learned.rs:221`）显式 `domain_attributes: None`；(3) `escalation` 两处——`escalation/mod.rs:121` 写的是 **contacts 集合**不是 chunk，`escalation/ledger.rs:206` 构造 chunk 用 `..default()`（attrs=None）；(4) `reaction`（`reaction.rs:457` enqueue_negative_example_chunk）是唯一真写 chunk domain_attributes 的站点，但装的是**系统审计元数据**（source_review_id/source/user_reaction_outcome/contact_wxid）**而非行业语义属性**——若强接 enforce，配了 required 字段的行业 schema 会把这条 AI 自动入队负例 reject，而调用点是 best-effort（失败仅 warn），结果是 reviewer 误判反馈链路在配了 schema 的行业里**静默失效**=引入 bug。故 reaction 负例 chunk **不纳入** D1 行业 schema 校验范围（审计副产物不是领域知识）。**D1 写侧接线无需再扩**。
 - **D2**：verify/reject/auto_verify/PUT/chat 五类写入**绕过** `apply_chunk_revision`，verify 这个关键状态转移**不写 chunk_revisions 历史、不更新 provenance**——审计链在"升级为 verified"处断裂。
 - **D3**：关系图谱 BFS 遍历忽略 `relation_kind`，contradicts 与 references 无差别扩散；superseded_by 不做版本 redirect。
 
@@ -99,6 +99,14 @@
 - G3 成交关联产品（DealEvent 无 product_id）——真缺失
 - G4 当前产品持有状态（entitlement，区别于历史成交事件）——真缺失
 - G5 售后/续费/保修时间与状态——真缺失
+
+> **落码追记（2026-06-16，commit `fa1215f`）**：上表 G2/G3/G4 与 H10「只写不读」诊断**已在该 commit 兑现，不再是缺口**——以专题 `2026-06-15-objective-purchase-facts-design.md` 落地：
+> - **G2 结构化产品目录**：`/api/products` CRUD + `ProductView`（workspace 隔离），前端「产品与成交」频道。
+> - **G3 成交关联产品**：`OutcomeEvent` 增 `product_id` + `event_kind`(deal|reversal)；报价并联背书 `decision.quoted_product_ids`。
+> - **G4 持有投影**：`agent/entitlements.rs::project_entitlements` 折叠 `outcome_events`（仅 staff_confirmed/payment_verified 入账）派生持有视图，decision.rs 注入持有段——**这就是 H10 的「读端」消费者，「只写不读」诅咒已破**。
+> - **G5**（售后/续费时间）仍未落，留待后续。
+>
+> 上面的「真缺失 / 只写不读」措辞保留为**诊断时点（2026-06-11）的历史记录**，勿据此再判 G2/G3/G4 为缺口。
 - G6 客户价值分层（LTV/RFM/tier；`product_fit_score` 是易失单轮 LLM 评分，不在 Contact 上）——真缺失
 
 **与通用化内核的关系（决定为什么"先做内核"是对的）**：缺口分两类，处理方式相反——
@@ -114,7 +122,7 @@ H1–H9 是顺对话场景"碰"出来的；为穷尽，按六层（状态机/rev
 
 | # | 硬编码点 | 位置 | 风险/性质 |
 | --- | --- | --- | --- |
-| **H10** | **成功事件写死成成交**（deal_events 带 amount，注释自陈"PU-learning 唯一正例"） | `models.rs:194-239`、`routes/contacts.rs:556` | **假锚点·改它零风险**：深挖证实全库**只写不读**，PU-learning 纯注释零实现，连 `ApiContact` 都不映射。非紧急 |
+| **H10** | **成功事件写死成成交**（deal_events 带 amount，注释自陈"PU-learning 唯一正例"） | `models.rs:194-239`、`routes/contacts.rs:556` | ✅**已解（2026-06-16，commit `fa1215f`）**：原诊断为「假锚点·全库只写不读」；专题 `2026-06-15-objective-purchase-facts-design.md` 落地 G2 产品目录 + G3 成交关联 product_id + G4 持有投影后，`agent/entitlements.rs::project_entitlements` 折叠 outcome_events 派生持有视图 + decision.rs 注入持有段，**已是真实「读端」消费者，「只写不读」诅咒已破**。三级可信度(conversation_inferred<staff_confirmed<payment_verified)守「AI 永不自断成交」；AI 疑似线索走 agentGeneratedSignals 弱信号→admin 核实。原「假锚点」措辞为诊断时点历史记录 |
 | **H11** | **负反应/极性词表写死销售**（objection/unsubscribed/complaint） | `reaction.rs:310-359`(`is_negative_outcome`/`reaction_outcome_status`) | **真锚点·改它高风险**：单一真相源，横向渗透**三条已落地回路**（见下）。情感域优质回复永远判不出 Hit→自学习失效 |
 | **H12** | **出厂人格=销售人设**（默认 soul 76 行顾问灵魂 + playbook"成交准备度/复购转介绍"方法论） | `prompts.rs:743-818`、`443-480` | ✅**Phase 1.5 已解**：DomainProfile 加 `soul_override`/`methodology_override`，decision 层 Some 替换 / None 回落硬编码兜底，DEFAULT 销售人格逐字不变。原性质：H3 被严重低估的真身，人格主体是编译期 `&'static str` |
 | **H13** | **状态机 9 态定义本体写死**（goal/信号/风险全锚定异议/成交/复购） | `prompts.rs:585-690` + 初始态 `new_contact` 字面量散落 6 处 + `cooldown` 特例 `m013` | ✅**Phase 1.5 已解**：state 加 `initial`/`forbidsProactive` 标志，引擎+两份 PBT 闭式参考三方原子泛化，写侧 4 处/读侧 5 处走 `initial_operation_state_key`，cooldown 特例改读标志；配套 C2 令 operation_state 派生自 customer_stage + 接回 check_state_transition(fail-soft)。状态机本体随 profile 选属 Phase 3 引导层（仍活 operation_domain_configs） |
@@ -564,7 +572,7 @@ casual 模式的"收紧压力门"会与"热烈推进"打架（非误杀，是模
 - **H14** ✅：`classify_dual_gate` 的 grounding 软分数硬闸条件化——`grounding_gate_applies = !runtime.grounding_gate_bypass_without_claim || claim_requires_product_knowledge(review.claim_analysis)`。新 profile/runtime 字段 `grounding_gate_bypass_without_claim`（default false=DEFAULT 无条件硬闸字节等价），gateway 加载 profile 后覆盖。**红线（2026-06-14 修订）**：R5.4 verified 强约束（reviewer 自报 `requiresProductKnowledge=true` 路径）不变；**finalize 漏判探针（ProductEffect 分支）从强制 block 改为仅观测**——成交弧高频承诺词在知识稀缺场景下导致全程哑火，先观测漏判率积累统计证据。落 `kind="grounding_probe_reviewer_missed" / status="observe"` 事件，不改发送判定。
 - **H5** ✅（拆 a/b）：completeness coverage 五维从写死改读 `profile.coverage_dimensions`。a=结构化骨架（fallback 对象 + prompt JSON 骨架由维度动态生成，`build_coverage_skeleton` 对齐规则逐字复刻）；b=命中锚点散文（`CoverageDimension` 加 `anchor_hint`，`build_coverage_anchors` 按维度生成）。两份 byte-equivalence 快照测试锁死 DEFAULT 五维 prompt 字节不变。
 - **H16** ✅（拆 a/b）：chunk 分段从写死销售四态抽象为「用途角色」。a=`ChunkRole{key,header,order,is_fallback}` 模型 + `DomainProfile.chunk_roles` + `default_chunk_roles()` seed（逐字复刻四态）；b=`format_operation_knowledge_for_prompt_with_roles` 按角色分桶/排序/渲染，decision+reviewer 传 `profile.chunk_roles`，无参 wrapper 委托 DEFAULT 供 PBT。`chunk_type_routing_pbt` 1024 cases 全绿。
-- **修 D1** ✅（拆 a/b）：DomainSchema 运行时接回写侧。a=`enforce_domain_attributes(schema, attrs)` 纯函数（required 缺失/enum 越界 reject、alias→canonical rewrite，无 IO）；b=`apply_chunk_revision` 第 6.5 步当且仅当存在 active schema 时校验 domain_attributes，无 active schema（DEFAULT/`domain_schema_id=None`）→ no-op 直通零行为变化。其余写入站点（chat/lessons_learned/reaction/escalation）留后续分批。
+- **修 D1** ✅（拆 a/b）：DomainSchema 运行时接回写侧。a=`enforce_domain_attributes(schema, attrs)` 纯函数（required 缺失/enum 越界 reject、alias→canonical rewrite，无 IO）；b=`apply_chunk_revision` 第 6.5 步当且仅当存在 active schema 时校验 domain_attributes，无 active schema（DEFAULT/`domain_schema_id=None`）→ no-op 直通零行为变化。**2026-06-16 复核：早前"chat/lessons_learned/reaction/escalation 留后续分批"的 TODO 经逐行核实为误判，D1 写侧接线已正确收口（详见 §1.2 D1 条）——chat/lessons_learned/escalation 均不写 chunk domain_attributes，reaction 负例 chunk 的 domain_attributes 是审计元数据非行业语义、不纳入校验范围。**
 - 验证：lib 1007→1026/0（每步递增等价/行为测试）；4 baseline PBT + chunk_type_routing_pbt 全绿；RUSTFLAGS=-D warnings 净；禁词/model-hint 双闸净。**Phase 2（H4/H14/H5/H16/D1）全部完成。**
 
 ### Phase 2.5：自学习回路极性配置化（H11，最深命门·最高护栏·独立 Phase）
@@ -585,7 +593,38 @@ casual 模式的"收紧压力门"会与"热烈推进"打架（非误杀，是模
 
 ### Phase 3 后（客观事实增强 + 新驱动力，做加法专题）
 - CRM 客观事实（§1.6 G2/G3/G4）：产品目录实体、订单关联 product_id、持有状态。**设计评审稿已出**：`2026-06-15-objective-purchase-facts-design.md`（成交真相源三级可信度 conversation_inferred/staff_confirmed/payment_verified + AI 永不自断成交红线；G2 独立 products collection；G3 OutcomeEvent +verification +product_ref 订单式快照；G4 派生视图防 drift；G4↔G1 客观锚纠偏；支付闭环预留 /webhooks/payment）。本轮只定数据模型与 spec，未落码。
-- 数字分身新驱动力（§3.7）：日历祝福 scan_calendar、社交钩子 scan_external_hook（先摸清 MCP 能力边界）。
+- 数字分身新驱动力（§3.7）：日历祝福 `scan_calendar`、社交钩子 `scan_external_hook`。**2026-06-16 MCP 能力勘察 + 实施方案见下方「§3.7 主动情绪关怀扫描器实施方案」**。
+
+#### §3.7 主动情绪关怀扫描器实施方案（2026-06-16 调研定稿，待拍板落码）
+
+**MCP 能力勘察结论（区分「服务器能力」与「客户端封装」）**：`src/mcp.rs` 是通用 JSON-RPC `tools/call` 封装，全仓**客户端已封装调用**的 MCP 工具只有三个——`message_send_text`（发文本，唯一发送能力）、`contacts_search`（按关键词搜联系人，不返回结构化生日/纪念日）、`account_list`。**注意**：这只反映「客户端代码里已封装的」，不是 MCP 服务器的真实能力上限。**朋友圈/群能力 MCP 服务器侧实际可用**（2026-06-16 用户确认），只是 `src/mcp.rs` 尚未封装对应 moments/chatroom 工具调用。生日/纪念日仍建议走记忆维度（对话抽取）而非依赖 MCP 资料字段。
+
+| 扫描器 | 可行性 | 结论 |
+| --- | --- | --- |
+| `scan_calendar`（纪念日/节奏关怀） | ✅ **可行** | 发送能力具备；日期数据从 H17 记忆维度取，不依赖 MCP |
+| `scan_external_hook`（朋友圈/群互动） | ✅ **能力具备，暂缓** | **MCP 服务器侧朋友圈/群能力实际可用**（2026-06-16 用户确认）；当前只是 `src/mcp.rs` 客户端尚未封装对应 moments/chatroom 工具调用。待做时先在 `src/mcp.rs` 加封装（参照 `message_send_text`/`contacts_search` 的 `logged_call` 模式）即可，无服务器侧阻塞。用户拍板**暂不着急做**，本轮不落码。 |
+
+**`scan_calendar` 设计（照现有扫描器骨架，DEFAULT 零扰动）**：
+
+- **数据来源**：情感陪伴 profile 的 H17 记忆维度已支持 `anniversaries`/`importantEvents` 槽位（存于 `memory_card.extra` 容器，`domain_profile.rs` 测试已有纪念日维度样例）。扫描器从这里解析带日期语义的条目做「今日/临近匹配」。`Contact`（`models.rs`）**无** birthday/anniversary 顶层字段——日期只能来自记忆维度，不是 contact 字段。DEFAULT 销售 profile 的 `memory_dimensions` 为空 → 扫描器对销售域天然 no-op（金标零变化）。
+- **链路（完全复刻 `scan_silent`，planner 绝不直接调 MCP）**：
+  ```
+  run_strategic_planner 串入新段 scan_calendar
+    → load_active_domain_profile 取 operation_mode
+    → if !mode.calendar.enabled { return }  // 默认关，仅情感 profile 开
+    → 遍历 contacts → resolve_operation_mode → 读 memory_card.extra 纪念日
+    → 今日匹配 + has_pending_follow_up 去重 + daily cap + quiet_hours
+    → emit_planner_follow_up(kind="calendar_care", reason=...)
+    → tasks.rs worker → handle_follow_up_task → gateway → message_send_text
+  ```
+- **需动的结构（全 additive）**：
+  1. `models.rs`：新增 `CalendarMode{ enabled: bool, lookahead_days, ... }` 挂进 `OperationMode` 第 5 个子结构（`#[serde(default)]`）。**关键差异**：funnel/silence/commitment 默认 `true`，但 `calendar` 默认 **`false`**——主动情绪触达是情感域专属，绝不让销售域默认开。
+  2. `planner/mod.rs`：新 `scan_calendar` 段 + 加入 `EMIT_EVENT_KINDS` + 串进 `run_strategic_planner`/`tick`。`resolve_operation_mode` 无需改（透传整组）。
+  3. `domain_profile.rs`：情感陪伴 profile seed 时 `calendar.enabled=true`；等价测试断言 DEFAULT `calendar` 关。
+  4. `AppConfig`：全局阈值回落（lookahead 天数、独立低频 daily cap）。
+  - `Contact.operation_mode_override` 复用同一 `OperationMode` 结构，加字段后单客户覆盖自动可用。
+- **护栏**：DEFAULT `calendar` 默认关 → 销售域所有现有 planner 金标 + real-LLM 套件零变化；仅情感域激活。
+- **风险点（落码前注意）**：(1) **纪念日日期解析**——记忆维度里日期是 LLM 从对话抽的自由文本（"她生日下个月 15 号"），需稳健的日期归一 + 今日匹配，是新扫描器唯一有实质复杂度处；(2) **触达节奏**——早安晚安类高频关怀需比 silence/commitment 更克制的 cap，建议 `calendar` 走独立低频 cap，否则情感陪伴变骚扰。
 
 ### Phase 4（可选）：清理 D2/D3 审计与图谱缺陷。
 

@@ -674,20 +674,12 @@ async fn run_user_operation_gateway_inner(
         &contact.workspace_id,
     )
     .await;
-    // H14：用 active profile 覆盖 runtime 的 grounding 闸开关，让下游
-    // classify_dual_gate / finalize 据本域配置判 grounding 软分数硬闸是否条件化。
-    // DEFAULT profile = false → 与改造前逐字等价（无条件硬闸）。
-    runtime.grounding_gate_bypass_without_claim =
-        active_profile.grounding_gate_bypass_without_claim;
-    // reviewer 优化：用 active profile 的 distrust_self_reported_low_risk 派生。
-    // DEFAULT profile = false → should_run_review 判定逐字等价；高敏域 = true →
-    // should_reply 的回复强制走独立 LLM review。
-    runtime.distrust_self_reported_low_risk = active_profile.distrust_self_reported_low_risk;
-    // M2：用 active profile 的 threshold_overrides 覆盖五闸阈值。DEFAULT profile
-    // threshold_overrides=None → 不改任何阈值、沿用 from_config 的 domain_config 值
-    // （销售域字节等价）；情感陪伴等域可声明放宽 pressure_risk / 提高 emotional_value
-    // 改写线。逐字段独立回落见 apply_profile_threshold_overrides。
-    runtime.apply_profile_threshold_overrides(active_profile.threshold_overrides.as_ref());
+    // universal-domain-adaptation 第 78 点：用单一入口 apply_active_profile 把 active
+    // profile 的运行期价值开关（H14 grounding bypass + reviewer distrust + M2 五闸阈值
+    // 覆盖）一次性派生进 runtime，替代此处散落的手工赋值。DEFAULT 销售 profile →
+    // 三项均无扰动、字节等价；情感陪伴等非销售域 → runtime 带上本域非销售行为。
+    // 该派生链由 lib 单测 runtime::tests::emotional_companion_profile_* 纯内存端到端断言。
+    runtime.apply_active_profile(&active_profile);
     let pending_tasks = load_pending_tasks(state, &contact).await?;
     let playbook = load_operation_playbook_for_contact(state, &contact).await?;
     let memory = load_or_create_operating_memory(state, &contact).await?;

@@ -314,6 +314,17 @@ export const useStrategyStore = create<StrategyState & StrategyActions>((set, ge
         coverage_dimensions: profile.coverage_dimensions,
         threshold_overrides: profile.threshold_overrides ?? undefined,
         methodology_generator_preamble: profile.methodology_generator_preamble ?? undefined,
+        soul_override: profile.soul_override ?? undefined,
+        methodology_override: profile.methodology_override ?? undefined,
+        conversation_mode_policy: profile.conversation_mode_policy ?? undefined,
+        stagnation_dimension: profile.stagnation_dimension ?? undefined,
+        domain_schema_id: profile.domain_schema_id ?? undefined,
+        grounding_gate_bypass_without_claim: profile.grounding_gate_bypass_without_claim ?? undefined,
+        distrust_self_reported_low_risk: profile.distrust_self_reported_low_risk ?? undefined,
+        chunk_roles: profile.chunk_roles ?? undefined,
+        memory_dimensions: profile.memory_dimensions ?? undefined,
+        outcome_polarity: profile.outcome_polarity ?? undefined,
+        operation_mode: profile.operation_mode ?? undefined,
       }
     });
   },

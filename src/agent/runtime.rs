@@ -243,6 +243,26 @@ impl UserRuntimeParameters {
             self.product_accuracy_block_below = v;
         }
     }
+
+    /// universal-domain-adaptation 第 78 点：把 active DomainProfile 的运行期价值开关
+    /// 一次性派生进本 runtime（gateway 在加载 profile 后调用，替代散落在 inner 里的三
+    /// 行手工赋值）。封装为单一入口后，「情感陪伴等非销售 profile → runtime 非销售行为」
+    /// 这条价值链可在 lib 单测里纯内存端到端断言（无需 Docker/LLM）。
+    ///
+    /// 派生三项：
+    /// - `grounding_gate_bypass_without_claim`（H14）：纯情感回复无产品声明时旁路
+    ///   grounding 软分硬闸。
+    /// - `distrust_self_reported_low_risk`（reviewer 优化）：高敏域强制走 LLM review。
+    /// - `threshold_overrides`（M2）：逐字段覆盖五闸阈值（None 回落不动）。
+    ///
+    /// DEFAULT 销售 profile（bypass=false/distrust=false/overrides=None）→ 三项均无扰动，
+    /// 销售域字节等价。**红线**：conversation_modes 的派生在 decision.rs 的
+    /// validate_and_promote 处（与 prompt 注入同源），不并入本函数。
+    pub(crate) fn apply_active_profile(&mut self, profile: &crate::models::DomainProfile) {
+        self.grounding_gate_bypass_without_claim = profile.grounding_gate_bypass_without_claim;
+        self.distrust_self_reported_low_risk = profile.distrust_self_reported_low_risk;
+        self.apply_profile_threshold_overrides(profile.threshold_overrides.as_ref());
+    }
 }
 
 /// agent-autonomy-loop W0 / Task 1.3：把任意整数 value clamp 到 `[min, max]`，
@@ -644,6 +664,72 @@ mod tests {
         let too_small = make_domain_config(doc! { "quietHoursTzOffsetHours": -99_i64 });
         let typed2 = too_small.runtime_parameters_typed();
         assert_eq!(typed2.quiet_hours_tz_offset_hours.clamp(-12, 14), -12);
+    }
+
+    // ── 第 78 点：非销售（情感陪伴）价值断言进常规门（纯内存，无 Docker/LLM）──
+    // gateway 的 profile→runtime 派生封装进 apply_active_profile 后，这条价值链可在 lib
+    // 门里端到端断言：example 情感 profile → apply → runtime 带非销售开关 → 驱动下游
+    // should_run_review（review/mod.rs::should_run_review_forces_full_when_distrust_set）
+    // 与 grounding 闸（review/gates.rs::h14_grounding_gate_bypassed_when_no_claim_*）。
+
+    /// 第 78 点：apply_active_profile(情感 profile) → runtime 带上全部非销售价值开关。
+    #[test]
+    fn emotional_companion_profile_drives_non_sales_runtime() {
+        let profile = crate::agent::domain_profile::example_emotional_companion_profile("ws-e");
+        let mut runtime = baseline_runtime();
+        // 派生前 = 销售默认（零扰动锚点）。
+        assert!(!runtime.grounding_gate_bypass_without_claim);
+        assert!(!runtime.distrust_self_reported_low_risk);
+        runtime.apply_active_profile(&profile);
+        // H14：纯情感回复旁路 grounding 软分硬闸。
+        assert!(runtime.grounding_gate_bypass_without_claim, "情感陪伴应旁路 grounding 软闸");
+        // reviewer：高敏域强制走 LLM review。
+        assert!(runtime.distrust_self_reported_low_risk, "情感陪伴高敏域应不信任自报低风险");
+    }
+
+    /// 第 78 点：DEFAULT 销售 profile → apply_active_profile 零扰动（字节等价护栏）。
+    #[test]
+    fn apply_active_profile_default_is_zero_perturbation() {
+        let profile = crate::agent::domain_profile::default_domain_profile("ws-d");
+        let mut runtime = baseline_runtime();
+        let before_fact = runtime.fact_risk_block_at;
+        let before_pressure = runtime.pressure_risk_block_at;
+        let before_human = runtime.human_like_rewrite_below;
+        let before_emotional = runtime.emotional_value_rewrite_below;
+        let before_product = runtime.product_accuracy_block_below;
+
+        runtime.apply_active_profile(&profile);
+        // DEFAULT profile: bypass=false / distrust=false / overrides=None → 三项无扰动。
+        assert!(!runtime.grounding_gate_bypass_without_claim);
+        assert!(!runtime.distrust_self_reported_low_risk);
+        assert_eq!(runtime.fact_risk_block_at, before_fact);
+        assert_eq!(runtime.pressure_risk_block_at, before_pressure);
+        assert_eq!(runtime.human_like_rewrite_below, before_human);
+        assert_eq!(runtime.emotional_value_rewrite_below, before_emotional);
+        assert_eq!(runtime.product_accuracy_block_below, before_product);
+    }
+
+    /// 第 78 点：情感 profile 声明 threshold_overrides 时，apply 逐字段覆盖五闸阈值。
+    #[test]
+    fn apply_active_profile_applies_threshold_overrides() {
+        let mut profile =
+            crate::agent::domain_profile::example_emotional_companion_profile("ws-t");
+        // 情感域放宽压力闸（主动关心不该被高 pressure 拦）、提高情绪价值改写线。
+        profile.threshold_overrides = Some(crate::models::ProfileThresholds {
+            fact_risk_block_at: None,
+            pressure_risk_block_at: Some(9),
+            human_like_rewrite_below: None,
+            emotional_value_rewrite_below: Some(8),
+            product_accuracy_block_below: None,
+        });
+        let mut runtime = baseline_runtime();
+        let before_fact = runtime.fact_risk_block_at;
+        runtime.apply_active_profile(&profile);
+        // 声明的两项被覆盖。
+        assert_eq!(runtime.pressure_risk_block_at, 9);
+        assert_eq!(runtime.emotional_value_rewrite_below, 8);
+        // 未声明项（None）保持不动。
+        assert_eq!(runtime.fact_risk_block_at, before_fact);
     }
 
     fn baseline_runtime() -> UserRuntimeParameters {

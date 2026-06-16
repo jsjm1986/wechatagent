@@ -105,35 +105,18 @@ pub async fn seed_emotional_companion_profile_in_workspace(
     app: &TestApp,
     workspace_id: &str,
 ) -> ObjectId {
-    seed_active_domain_profile(
-        app,
-        workspace_id,
-        "emotional_companion_minimal",
-        |p| {
-            p.display_name = "情感陪伴".to_string();
-            p.description = "长期陪伴、情绪承接、尊重边界，不做成交推进".to_string();
-            // H9：允许亲密陪伴模式（不只销售四模式）。
-            p.conversation_modes = vec![
-                "intimate_companion".to_string(),
-                "casual_relationship".to_string(),
-                "value_exchange".to_string(),
-                "boundary_protection".to_string(),
-            ];
-            // H14：纯情感回复不应因无产品知识被 grounding 软分硬闸误拦。
-            p.grounding_gate_bypass_without_claim = true;
-            // reviewer 优化：情感陪伴高敏域不信任自报低风险，强制走 LLM review
-            // （否则情感追问回复被 should_run_review 判低风险走本地兜底、写死 pressure=0）。
-            p.distrust_self_reported_low_risk = true;
-            // H8：关闭漏斗推进（陪伴不催进成交）。
-            p.operation_mode.funnel.enabled = false;
-            // H3：行业业务上下文。
-            p.prompt_fragment = Some(
-                "本行业目标是长期陪伴、情绪承接、尊重对方节奏与边界，不是成交推进。\
-                 主动关心、轻量追问本身是正当行为，不等于施压。"
-                    .to_string(),
-            );
-        },
-    )
+    // 第 78 点：价值字段从 lib 侧单一真相源 example_emotional_companion_profile 取，
+    // 避免 fixture 与 lib 单测两份情感陪伴契约漂移。seed helper 只负责单活/插入/缓存失效。
+    let template = wechatagent::agent::example_emotional_companion_profile(workspace_id);
+    seed_active_domain_profile(app, workspace_id, "emotional_companion_minimal", move |p| {
+        p.display_name = template.display_name;
+        p.description = template.description;
+        p.conversation_modes = template.conversation_modes;
+        p.grounding_gate_bypass_without_claim = template.grounding_gate_bypass_without_claim;
+        p.distrust_self_reported_low_risk = template.distrust_self_reported_low_risk;
+        p.operation_mode = template.operation_mode;
+        p.prompt_fragment = template.prompt_fragment;
+    })
     .await
 }
 

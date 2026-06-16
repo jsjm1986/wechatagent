@@ -653,4 +653,24 @@ mod tests {
         assert_eq!(score_key_for("nextBestActionScore"), "relationshipProgress");
         assert_eq!(score_key_for("unknown"), "humanLike");
     }
+
+    /// 第 77 点护栏补盲区：`score_key_for`（evaluations fallback 映射）与
+    /// `default_business_formulas` 的 `eval_score_key`（单一真相源）是手工维护的两份
+    /// 映射。本测试锁死二者一致——改了 single source 的 eval_score_key 却忘改 fallback
+    /// （或反之）时测试即红，防止两份 DEFAULT 销售映射静默漂移。
+    #[test]
+    fn score_key_for_matches_default_formula_eval_keys() {
+        for f in crate::agent::domain_profile::default_business_formulas() {
+            let eval_key = f
+                .eval_score_key
+                .as_deref()
+                .expect("DEFAULT 四公式都应显式声明 eval_score_key");
+            assert_eq!(
+                score_key_for(&f.key),
+                eval_key,
+                "公式 {} 的 fallback score_key_for 与 single-source eval_score_key 漂移",
+                f.key
+            );
+        }
+    }
 }
