@@ -1066,43 +1066,6 @@ fn balanced_block(text: &str, start: usize) -> Option<&str> {
     None
 }
 
-/// 从含自然语言前导/后缀的文本中截取**第一个平衡的** JSON 对象 `{...}` 或数组 `[...]`。
-/// 按括号配平扫描（跳过字符串字面量内的括号与转义），找到第一个 `{`/`[` 到其配对闭合符
-/// 的子串。截不出返回 None（调用方回退原文本走严格解析，保持非包裹场景零行为变化）。
-fn extract_first_json_block(text: &str) -> Option<&str> {
-    let bytes = text.as_bytes();
-    let start = bytes.iter().position(|&b| b == b'{' || b == b'[')?;
-    let open = bytes[start];
-    let close = if open == b'{' { b'}' } else { b']' };
-    let mut depth: i32 = 0;
-    let mut in_string = false;
-    let mut escape = false;
-    for (i, &b) in bytes.iter().enumerate().skip(start) {
-        if in_string {
-            if escape {
-                escape = false;
-            } else if b == b'\\' {
-                escape = true;
-            } else if b == b'"' {
-                in_string = false;
-            }
-            continue;
-        }
-        match b {
-            b'"' => in_string = true,
-            x if x == open => depth += 1,
-            x if x == close => {
-                depth -= 1;
-                if depth == 0 {
-                    return text.get(start..=i);
-                }
-            }
-            _ => {}
-        }
-    }
-    None
-}
-
 /// 修复 LLM 偶发输出的非严格 JSON。只做两类局部修复：
 /// 1. trailing comma（`,]` / `,}`）→ 删掉 `,`。
 /// 2. 末尾少 `]` / `}` → 按 brackets 计数补足。
@@ -1489,19 +1452,18 @@ mod tests {
     }
 
     #[test]
-    fn extract_first_json_block_handles_braces_inside_strings() {
+    fn extract_embedded_json_handles_braces_inside_strings() {
         // 字符串字面量内的 `}` 不应被当成对象闭合（配平扫描须跳过字符串内括号）。
         let raw = "前言 {\"text\": \"a } b { c\", \"n\": 1} 后缀";
-        let block = extract_first_json_block(raw).expect("应截出平衡对象");
-        let v: Value = serde_json::from_str(block).expect("截出的块必须是合法 JSON");
+        let v = extract_embedded_json(raw).expect("应提取出平衡对象");
         assert_eq!(v.get("text").and_then(|x| x.as_str()), Some("a } b { c"));
         assert_eq!(v.get("n").and_then(|x| x.as_i64()), Some(1));
     }
 
     #[test]
-    fn extract_first_json_block_returns_none_without_json() {
+    fn extract_embedded_json_returns_none_without_json() {
         // 纯自然语言无 JSON → None（调用方回退原文走严格解析报错，不伪造数据）。
-        assert!(extract_first_json_block("这里完全没有 JSON 对象").is_none());
+        assert!(extract_embedded_json("这里完全没有 JSON 对象").is_none());
     }
 
     #[test]
