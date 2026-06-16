@@ -32,7 +32,7 @@ on:
   workflow_dispatch:
     inputs:
       dispatch_target:
-        description: '手动单跑目标（ops=单个 real_llm_ops_smoke / roleplay_docker=roleplay P0 Docker 夹具 / roleplay_p2=情感陪伴全链 E2E 真模型）'
+        description: '手动单跑目标（ops=单个 real_llm_ops_smoke / roleplay_docker=roleplay P0 Docker 夹具 / roleplay_p2=情感陪伴全链 E2E 真模型 / reviewer_calibration=reviewer 高压识别校准）'
         required: true
         default: 'ops'
         type: choice
@@ -40,6 +40,7 @@ on:
           - ops
           - roleplay_docker
           - roleplay_p2
+          - reviewer_calibration
       ops_test:
         description: '当 target=ops 时单独跑的 real_llm_ops_smoke 测试名（如 t15_real_multiturn_deal_arc）'
         required: false
@@ -838,6 +839,62 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: roleplay-p2-ledger
+          path: target/real_llm_ledger/
+          if-no-files-found: ignore
+          retention-days: 30
+
+  # 手动单跑：reviewer 高压识别校准（固定候选回复直喂真 reviewer + 异族 judge 交叉）。
+  # 验证情感 profile 下 reviewer 既不误杀合理关心、也不漏判控制式高压。无 needs，立即起跑。
+  # 仅 workflow_dispatch + dispatch_target=reviewer_calibration 触发。env 与 roleplay-p2 同口径。
+  reviewer-calibration:
+    name: Reviewer 高压识别校准 (手动单跑 / 真模型)
+    runs-on: ubuntu-latest
+    if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.dispatch_target == 'reviewer_calibration' }}
+    timeout-minutes: 90
+    env:
+      REAL_LLM_API_KEY: ${{ secrets.REAL_LLM_CODERELAY_API_KEY || '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' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # 同 integration job：清预装 SDK 腾 ~30GB，否则 target + mongo 镜像撑爆磁盘。
+      - name: Free disk space
+        if: ${{ env.REAL_LLM_API_KEY != '' }}
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android \
+            /usr/local/share/boost /usr/local/share/powershell \
+            /usr/lib/jvm "$AGENT_TOOLSDIRECTORY" || true
+          sudo docker image prune --all --force || true
+          df -h
+
+      - name: Install Rust toolchain
+        if: ${{ env.REAL_LLM_API_KEY != '' }}
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry / target
+        if: ${{ env.REAL_LLM_API_KEY != '' }}
+        uses: Swatinem/rust-cache@v2
+
+      - name: cargo test --test roleplay_reviewer_pressure_calibration (real LLM + testcontainers)
+        if: ${{ env.REAL_LLM_API_KEY != '' }}
+        env:
+          RUSTFLAGS: ""
+          REAL_LLM_BASE_URL: https://integrate.api.nvidia.com/v1
+          REAL_LLM_MODEL: moonshotai/kimi-k2.6
+          REAL_LLM_JUDGE: "1"
+          REAL_LLM_JUDGE_API_KEY: ${{ secrets.REAL_LLM_GPT55_API_KEY || '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' }}
+          REAL_LLM_JUDGE_BASE_URL: https://integrate.api.nvidia.com/v1
+          REAL_LLM_JUDGE_MODEL: meta/llama-3.3-70b-instruct
+          REAL_LLM_FAILOVER_API_KEY: ${{ secrets.REAL_LLM_VISION_BACKUP_API_KEY || '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' }}
+          REAL_LLM_FAILOVER_BASE_URL: https://integrate.api.nvidia.com/v1
+          REAL_LLM_FAILOVER_MODELS: z-ai/glm-5.1,stepfun-ai/step-3.7-flash,qwen/qwen3-next-80b-a3b-instruct
+        run: cargo test --no-fail-fast --test roleplay_reviewer_pressure_calibration -- --ignored --nocapture
+
+      - name: Upload calibration ledger
+        if: ${{ always() && env.REAL_LLM_API_KEY != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: reviewer-calibration-ledger
           path: target/real_llm_ledger/
           if-no-files-found: ignore
           retention-days: 30
