@@ -852,7 +852,7 @@ jobs:
     if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.dispatch_target == 'reviewer_calibration' }}
     timeout-minutes: 90
     env:
-      REAL_LLM_API_KEY: ${{ secrets.REAL_LLM_CODERELAY_API_KEY || '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' }}
+      REAL_LLM_API_KEY: ${{ secrets.RSXERMU_KEY }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -875,19 +875,22 @@ jobs:
         if: ${{ env.REAL_LLM_API_KEY != '' }}
         uses: Swatinem/rust-cache@v2
 
+      # 端点 rsxermu666.cn 不限流（仅并发敏感）：主模型 claude-opus-4-8 走 Anthropic
+      # 非流式；judge gpt-5.4 走 OpenAI（该端点强制流式 SSE，LlmClient 已支持聚合 +
+      # 剥离 <think> 前缀）。异厂商天然异族。JUDGE_SAMPLES=1 + 不配 failover 控并发。
       - name: cargo test --test roleplay_reviewer_pressure_calibration (real LLM + testcontainers)
         if: ${{ env.REAL_LLM_API_KEY != '' }}
         env:
           RUSTFLAGS: ""
-          REAL_LLM_BASE_URL: https://integrate.api.nvidia.com/v1
-          REAL_LLM_MODEL: moonshotai/kimi-k2.6
+          REAL_LLM_BASE_URL: https://rsxermu666.cn
+          REAL_LLM_MODEL: claude-opus-4-8
+          REAL_LLM_FORMAT: anthropic
           REAL_LLM_JUDGE: "1"
-          REAL_LLM_JUDGE_API_KEY: ${{ secrets.REAL_LLM_GPT55_API_KEY || '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' }}
-          REAL_LLM_JUDGE_BASE_URL: https://integrate.api.nvidia.com/v1
-          REAL_LLM_JUDGE_MODEL: meta/llama-3.3-70b-instruct
-          REAL_LLM_FAILOVER_API_KEY: ${{ secrets.REAL_LLM_VISION_BACKUP_API_KEY || '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' }}
-          REAL_LLM_FAILOVER_BASE_URL: https://integrate.api.nvidia.com/v1
-          REAL_LLM_FAILOVER_MODELS: z-ai/glm-5.1,stepfun-ai/step-3.7-flash,qwen/qwen3-next-80b-a3b-instruct
+          JUDGE_SAMPLES: "1"
+          REAL_LLM_JUDGE_API_KEY: ${{ secrets.RSXERMU_KEY }}
+          REAL_LLM_JUDGE_BASE_URL: https://rsxermu666.cn
+          REAL_LLM_JUDGE_MODEL: gpt-5.4
+          REAL_LLM_JUDGE_FORMAT: openai
         run: cargo test --no-fail-fast --test roleplay_reviewer_pressure_calibration -- --ignored --nocapture
 
       - name: Upload calibration ledger
