@@ -979,6 +979,21 @@ fn strip_reasoning_prefix(content: &str) -> String {
     content.to_string()
 }
 
+/// 把 claude 偶发的"单元素对象数组" `[{...}]` 拆成内部对象——generate_json 的契约是 JSON
+/// 对象（下游 to_document 拒收顶层数组），claude-opus 经中转有时把唯一对象包进数组。仅拆
+/// `len==1 且元素为对象` 的数组，其它（多元素数组 / 元素非对象 / 非数组）原样返回，避免误伤
+/// 真正期望数组的场景。
+fn normalize_singleton_array(value: Value) -> Value {
+    if let Value::Array(arr) = &value {
+        if arr.len() == 1 && arr[0].is_object() {
+            if let Value::Array(mut arr) = value {
+                return arr.remove(0);
+            }
+        }
+    }
+    value
+}
+
 fn parse_json_content(content: &str) -> AppResult<Value> {
     let trimmed = content.trim();
     let json_text = if trimmed.starts_with("```") {
@@ -992,12 +1007,12 @@ fn parse_json_content(content: &str) -> AppResult<Value> {
     };
     // 快路径：整体就是合法 JSON（绝大多数 provider 的纯 JSON 输出）。
     if let Ok(value) = serde_json::from_str::<Value>(json_text) {
-        return Ok(value);
+        return Ok(normalize_singleton_array(value));
     }
     // 容错 1：trailing comma / 末尾未闭合（R15 / ISSUE-006，DeepSeek 偶发）。
     if let Some(repaired) = repair_loose_json(json_text) {
         if let Ok(value) = serde_json::from_str::<Value>(&repaired) {
-            return Ok(value);
+            return Ok(normalize_singleton_array(value));
         }
     }
     // 容错 2：claude-opus 经中转常输出"自然语言推理 + JSON"混合体，JSON 可能夹在推理后
@@ -1014,26 +1029,37 @@ fn parse_json_content(content: &str) -> AppResult<Value> {
 }
 
 /// 从混合文本中提取**首个可解析**的 JSON 对象/数组：遍历每个 `{`/`[` 起点配平截块，
-/// 逐个尝试严格解析（失败再试 repair）。返回首个成功的 Value；全不成功返回 None。
+/// 逐个尝试严格解析（失败再试 repair）。**优先返回对象**——generate_json 的契约是 JSON
+/// 对象，claude 偶发把对象包成单元素数组 `[{...}]` 或先输出推理里的伪数组，故对象命中即返；
+/// 仅当全程没有对象、只有数组时才返数组（且单元素对象数组拆出内部对象，对齐 to_document）。
 /// 用于 claude "推理 + JSON" 混合输出——推理里的伪括号块解析失败被跳过，命中真 JSON。
 fn extract_embedded_json(text: &str) -> Option<Value> {
     let bytes = text.as_bytes();
+    let mut array_fallback: Option<Value> = None;
     for start in 0..bytes.len() {
         if bytes[start] != b'{' && bytes[start] != b'[' {
             continue;
         }
-        if let Some(block) = balanced_block(text, start) {
-            if let Ok(v) = serde_json::from_str::<Value>(block) {
-                return Some(v);
-            }
-            if let Some(repaired) = repair_loose_json(block) {
-                if let Ok(v) = serde_json::from_str::<Value>(&repaired) {
-                    return Some(v);
+        let Some(block) = balanced_block(text, start) else {
+            continue;
+        };
+        let parsed = serde_json::from_str::<Value>(block)
+            .ok()
+            .or_else(|| repair_loose_json(block).and_then(|r| serde_json::from_str::<Value>(&r).ok()));
+        match parsed {
+            // 对象：generate_json 期望形态，立即返回。
+            Some(v @ Value::Object(_)) => return Some(v),
+            // 数组：暂存作兜底；若是 `[{...}]` 单对象数组，拆出内部对象优先（claude 常见包法）。
+            Some(Value::Array(arr)) if array_fallback.is_none() => {
+                if arr.len() == 1 && arr[0].is_object() {
+                    return Some(arr.into_iter().next().unwrap());
                 }
+                array_fallback = Some(Value::Array(arr));
             }
+            _ => {}
         }
     }
-    None
+    array_fallback
 }
 
 /// 从 `start`（须是 `{` 或 `[`）按括号配平扫描（跳过字符串字面量内括号与转义），返回到
@@ -1490,5 +1516,32 @@ mod tests {
         // 非包裹的纯 JSON 对象：extract 分支不介入（首字符是 `{`），行为零变化。
         let v = parse_json_content(r#"{"a": 1}"#).expect("纯 JSON 必须直接解析");
         assert_eq!(v.get("a").and_then(|x| x.as_i64()), Some(1));
+    }
+
+    #[test]
+    fn parse_json_content_unwraps_singleton_object_array() {
+        // claude 偶发把唯一 profile 对象包成 `[{...}]`（domain_profile_e2e 真模型实测 got Array）。
+        // 快路径解析成功是数组 → normalize 拆出内部对象，下游 to_document 不再报 got Array。
+        let v = parse_json_content(r#"[{"displayName": "陪伴", "ok": true}]"#)
+            .expect("单元素对象数组必须拆成对象");
+        assert!(v.is_object(), "应拆成对象而非数组");
+        assert_eq!(v.get("displayName").and_then(|x| x.as_str()), Some("陪伴"));
+    }
+
+    #[test]
+    fn parse_json_content_keeps_multi_element_array() {
+        // 多元素数组不拆（避免误伤真正期望数组的场景），原样返回。
+        let v = parse_json_content(r#"[{"a":1},{"b":2}]"#).expect("多元素数组解析");
+        assert!(v.is_array(), "多元素数组不应被拆");
+        assert_eq!(v.as_array().map(|a| a.len()), Some(2));
+    }
+
+    #[test]
+    fn extract_embedded_json_prefers_object_over_array() {
+        // 推理里先出现伪数组、真 JSON 对象在后：应优先返回对象（generate_json 契约）。
+        let raw = "分析候选 [1, 2, 3] 后得出结论：\n{\"action\":\"answer\",\"ok\":true}";
+        let v = extract_embedded_json(raw).expect("应提取对象");
+        assert!(v.is_object());
+        assert_eq!(v.get("action").and_then(|x| x.as_str()), Some("answer"));
     }
 }
