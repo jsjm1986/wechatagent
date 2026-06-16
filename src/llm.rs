@@ -880,10 +880,15 @@ pub fn is_retryable_llm_error(error: &AppError) -> bool {
 
 /// 指数退避带 jitter，并尊重 Retry-After。
 pub fn compute_backoff(attempt: u32, base_ms: u64, retry_after_secs: Option<u64>) -> Duration {
+    // 单次退避封顶 60s：指数退避 base*2^(attempt-1) 在高 attempt 下会爆到几百秒
+    // （2500*2^10≈42min），rsxermu 单点 503/超时需要"加大重试次数 + 每次封顶"才能在合理
+    // 总时长内熬过端点抖动拿真分，而非单次 sleep 几十分钟撞 job 墙。Retry-After 头若更长则
+    // 尊重它（端点明确要求等多久就等多久）。
+    const MAX_BACKOFF_MS: u64 = 60_000;
     let shift = attempt.saturating_sub(1).min(10);
     let exp_ms = base_ms.saturating_mul(1u64 << shift);
     let jitter = fastrand_jitter(base_ms);
-    let backoff_ms = exp_ms.saturating_add(jitter);
+    let backoff_ms = exp_ms.saturating_add(jitter).min(MAX_BACKOFF_MS);
     let final_ms = match retry_after_secs {
         Some(s) => backoff_ms.max(s.saturating_mul(1000)),
         None => backoff_ms,
@@ -1343,6 +1348,20 @@ mod tests {
         assert_eq!(compute_backoff(1, 1000, Some(5)).as_millis(), 5000);
         // 当指数退避更长时使用指数退避。
         assert_eq!(compute_backoff(4, 1000, Some(2)).as_millis(), 8000);
+    }
+
+    #[test]
+    fn backoff_caps_at_60s_for_high_attempts() {
+        // 单次退避封顶 60s：高 attempt 下指数退避（base*2^(attempt-1)）不再无界增长，
+        // 防止 rsxermu 重试加码（10 次）时单次 sleep 几十分钟撞 job 墙。jitter=0（test-only）。
+        // base=2500, attempt=10 → 2500*512=1_280_000ms，封顶到 60_000ms。
+        assert_eq!(compute_backoff(10, 2500, None).as_millis(), 60_000);
+        // attempt=6 → 2500*32=80_000ms 也已超顶 → 60_000ms。
+        assert_eq!(compute_backoff(6, 2500, None).as_millis(), 60_000);
+        // attempt=5 → 2500*16=40_000ms 未触顶，保持指数值。
+        assert_eq!(compute_backoff(5, 2500, None).as_millis(), 40_000);
+        // Retry-After 更长时仍尊重它（端点明确要求），不被 60s 顶压低。
+        assert_eq!(compute_backoff(1, 2500, Some(120)).as_millis(), 120_000);
     }
 
     #[test]

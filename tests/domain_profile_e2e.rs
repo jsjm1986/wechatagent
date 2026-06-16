@@ -396,7 +396,7 @@ async fn e2e_generate_candidate_is_draft() {
         model.unwrap_or_else(|| "deepseek-chat".to_string()),
         real_llm_format(),
         180,
-        6,
+        10,
         2500,
     ) {
         Ok(l) => Arc::new(l),
@@ -433,10 +433,23 @@ async fn e2e_generate_candidate_is_draft() {
         Ok(r) => r,
         Err(e) => {
             let msg = e.to_string();
-            if msg.contains("endpoint_not_found") || msg.contains("404") {
-                eprintln!("[SKIP] LLM endpoint 不可达 (404); 跳过: {msg}");
+            // 端点不可达 / 瞬时抖动（rsxermu 单点无 failover，偶发 503/5xx/超时/限流）→ skip 而非
+            // panic。重试已加码（10 次 + 单次退避封顶 60s ≈ 5min 窗口）尽量熬过；真耗尽仍瞬时
+            // 不可用则跳过（不假绿：skip 原因进日志，端点恢复后即真跑）。与 smoke/knowledge 的
+            // unwrap_or_skip_transient 同口径。
+            let transient = msg.contains("endpoint_not_found")
+                || msg.contains("404")
+                || msg.contains("503")
+                || msg.contains("http_5xx")
+                || msg.contains("Service Unavailable")
+                || msg.contains("rate_limited")
+                || msg.contains("timeout")
+                || msg.contains("LlmUnavailable")
+                || msg.contains("llm unavailable");
+            if transient {
+                eprintln!("[SKIP] LLM 端点不可达/瞬时抖动，跳过（非能力失败）: {msg}");
             } else {
-                panic!("generate failed (非 endpoint 问题): {e}");
+                panic!("generate failed (非端点/非瞬时问题): {e}");
             }
             return;
         }
@@ -492,7 +505,7 @@ async fn e2e_generate_second_industry_profile() {
         model.unwrap_or_else(|| "deepseek-chat".to_string()),
         real_llm_format(),
         180,
-        6,
+        10,
         2500,
     ) {
         Ok(l) => Arc::new(l),
@@ -529,10 +542,23 @@ async fn e2e_generate_second_industry_profile() {
         Ok(r) => r,
         Err(e) => {
             let msg = e.to_string();
-            if msg.contains("endpoint_not_found") || msg.contains("404") {
-                eprintln!("[SKIP] LLM endpoint 不可达 (404); 跳过: {msg}");
+            // 端点不可达 / 瞬时抖动（rsxermu 单点无 failover，偶发 503/5xx/超时/限流）→ skip 而非
+            // panic。重试已加码（10 次 + 单次退避封顶 60s ≈ 5min 窗口）尽量熬过；真耗尽仍瞬时
+            // 不可用则跳过（不假绿：skip 原因进日志，端点恢复后即真跑）。与 smoke/knowledge 的
+            // unwrap_or_skip_transient 同口径。
+            let transient = msg.contains("endpoint_not_found")
+                || msg.contains("404")
+                || msg.contains("503")
+                || msg.contains("http_5xx")
+                || msg.contains("Service Unavailable")
+                || msg.contains("rate_limited")
+                || msg.contains("timeout")
+                || msg.contains("LlmUnavailable")
+                || msg.contains("llm unavailable");
+            if transient {
+                eprintln!("[SKIP] LLM 端点不可达/瞬时抖动，跳过（非能力失败）: {msg}");
             } else {
-                panic!("generate failed (非 endpoint 问题): {e}");
+                panic!("generate failed (非端点/非瞬时问题): {e}");
             }
             return;
         }
