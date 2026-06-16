@@ -349,16 +349,31 @@ impl LlmClient {
             return Err(err);
         }
 
-        let parsed: ChatCompletionResponse = serde_json::from_str(&text)?;
-        let content = parsed
-            .choices
-            .first()
-            .map(|choice| choice.message.content.as_str())
-            .ok_or_else(|| AppError::External("LLM returned no choices".to_string()))?;
+        // 兼容两种 OpenAI 响应：标准非流式 JSON（NVIDIA/deepseek 等）与强制
+        // 流式 SSE（部分中转网关即使不传 stream 也只回 `data: {chunk}`）。
+        // 检测到 SSE 帧则聚合 delta.content；否则按原 ChatCompletionResponse 解析。
+        // 非 SSE 响应零行为变化。
+        let (content, usage) = if is_openai_sse_body(&text) {
+            let (acc, sse_usage) = aggregate_openai_sse(&text);
+            if acc.trim().is_empty() {
+                return Err(AppError::External(
+                    "LLM SSE body 聚合后内容为空".to_string(),
+                ));
+            }
+            (acc, sse_usage.unwrap_or_default())
+        } else {
+            let parsed: ChatCompletionResponse = serde_json::from_str(&text)?;
+            let c = parsed
+                .choices
+                .first()
+                .map(|choice| choice.message.content.clone())
+                .ok_or_else(|| AppError::External("LLM returned no choices".to_string()))?;
+            (c, parsed.usage.unwrap_or_default())
+        };
         Ok((
             LlmJsonResult {
-                value: parse_json_content(content)?,
-                usage: parsed.usage.unwrap_or_default(),
+                value: parse_json_content(&strip_reasoning_prefix(&content))?,
+                usage,
                 latency_ms: started_at.elapsed().as_millis() as i64,
                 model: self.model.clone(),
                 retry_count: 0,
@@ -869,6 +884,55 @@ fn parse_retry_after_from_error(error: &AppError) -> Option<u64> {
     None
 }
 
+/// 检测 OpenAI 响应体是否是 SSE 流式（`data: {...}` 帧）而非标准 JSON。
+/// 部分中转网关即使请求不带 stream 也强制回流式，需聚合后才能解析。
+fn is_openai_sse_body(text: &str) -> bool {
+    text.lines()
+        .find(|l| !l.trim().is_empty())
+        .map(|l| l.trim_start().starts_with("data:"))
+        .unwrap_or(false)
+}
+
+/// 聚合 OpenAI SSE 帧的 `choices[0].delta.content`，返回拼接内容 + usage。
+/// 复用 [`StreamChunkResponse`]（与 token 级 streaming 同结构）。单帧解析失败跳过。
+fn aggregate_openai_sse(text: &str) -> (String, Option<ChatUsage>) {
+    let mut acc = String::new();
+    let mut usage: Option<ChatUsage> = None;
+    for line in text.lines() {
+        let line = line.trim();
+        let data = match line.strip_prefix("data:") {
+            Some(rest) => rest.trim(),
+            None => continue,
+        };
+        if data.is_empty() || data == "[DONE]" {
+            continue;
+        }
+        let parsed: StreamChunkResponse = match serde_json::from_str(data) {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+        if let Some(u) = parsed.usage {
+            usage = Some(u);
+        }
+        if let Some(c) = parsed.choices.first().and_then(|ch| ch.delta.content.as_ref()) {
+            acc.push_str(c);
+        }
+    }
+    (acc, usage)
+}
+
+/// 剥离部分模型在 JSON 前输出的 `<think>...</think>` 推理前缀（如此端点的 gpt 系）。
+/// 无前缀时原样返回，对其它模型零影响。
+fn strip_reasoning_prefix(content: &str) -> String {
+    let trimmed = content.trim_start();
+    if let Some(rest) = trimmed.strip_prefix("<think>") {
+        if let Some(end) = rest.find("</think>") {
+            return rest[end + "</think>".len()..].trim_start().to_string();
+        }
+    }
+    content.to_string()
+}
+
 fn parse_json_content(content: &str) -> AppResult<Value> {
     let trimmed = content.trim();
     let json_text = if trimmed.starts_with("```") {
@@ -1074,6 +1138,56 @@ impl LlmProvider for LlmRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn detects_sse_body_vs_plain_json() {
+        assert!(is_openai_sse_body("data: {\"choices\":[]}\n\ndata: [DONE]"));
+        assert!(is_openai_sse_body("\n  data: {\"x\":1}"));
+        assert!(!is_openai_sse_body("{\"choices\":[{\"message\":{\"content\":\"hi\"}}]}"));
+        assert!(!is_openai_sse_body(""));
+    }
+
+    #[test]
+    fn aggregates_sse_delta_content() {
+        let body = "data: {\"choices\":[{\"delta\":{\"content\":\"{\\\"a\\\"\"}}]}\n\
+                    data: {\"choices\":[{\"delta\":{\"content\":\":1}\"}}]}\n\
+                    data: [DONE]";
+        let (acc, _usage) = aggregate_openai_sse(body);
+        assert_eq!(acc, "{\"a\":1}");
+    }
+
+    #[test]
+    fn aggregates_sse_skips_unparseable_frames() {
+        // keepalive 注释行 / 非法帧应被跳过，不污染聚合。
+        let body = ": keepalive\n\
+                    data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\
+                    data: garbage-not-json\n";
+        let (acc, _) = aggregate_openai_sse(body);
+        assert_eq!(acc, "ok");
+    }
+
+    #[test]
+    fn strips_think_prefix_only_when_present() {
+        assert_eq!(
+            strip_reasoning_prefix("<think>reasoning here</think>{\"k\":1}"),
+            "{\"k\":1}"
+        );
+        // 无 think 前缀原样返回。
+        assert_eq!(strip_reasoning_prefix("{\"k\":1}"), "{\"k\":1}");
+        // think 未闭合则不剥离（避免吞掉正文）。
+        assert_eq!(strip_reasoning_prefix("<think>unclosed"), "<think>unclosed");
+    }
+
+    #[test]
+    fn sse_with_think_prefix_parses_to_json() {
+        // 端到端：gpt 风格 SSE（带 <think> 前缀）聚合后能被 parse_json_content 解析。
+        let body = "data: {\"choices\":[{\"delta\":{\"content\":\"<think>hmm</think>{\\\"ok\\\"\"}}]}\n\
+                    data: {\"choices\":[{\"delta\":{\"content\":\":true}\"}}]}\n\
+                    data: [DONE]";
+        let (acc, _) = aggregate_openai_sse(body);
+        let value = parse_json_content(&strip_reasoning_prefix(&acc)).unwrap();
+        assert_eq!(value["ok"], serde_json::json!(true));
+    }
 
     #[test]
     fn json_error_is_not_retryable() {
