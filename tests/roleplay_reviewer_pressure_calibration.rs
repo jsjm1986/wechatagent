@@ -407,15 +407,20 @@ async fn run_emotional_judge(
     let mut first_value: Option<serde_json::Value> = None;
     let mut ok_calls = 0usize;
     for r in results {
-        if let Ok(res) = r {
-            ok_calls += 1;
-            for d in EMOTIONAL_JUDGE_DIMS {
-                if let Some(s) = judge_score(&res.value, d) {
-                    samples.entry(d.to_string()).or_default().push(s);
+        match r {
+            Ok(res) => {
+                ok_calls += 1;
+                for d in EMOTIONAL_JUDGE_DIMS {
+                    if let Some(s) = judge_score(&res.value, d) {
+                        samples.entry(d.to_string()).or_default().push(s);
+                    }
+                }
+                if first_value.is_none() {
+                    first_value = Some(res.value);
                 }
             }
-            if first_value.is_none() {
-                first_value = Some(res.value);
+            Err(e) => {
+                eprintln!("[裁判][{scene_id}] judge 调用失败: {e}");
             }
         }
     }
