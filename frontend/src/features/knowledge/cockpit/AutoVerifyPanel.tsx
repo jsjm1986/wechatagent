@@ -52,7 +52,9 @@ export function AutoVerifyPanel(_props: { onClose?: () => void }) {
         headers: { "content-type": "application/json" },
         body: JSON.stringify({
           confidence_threshold: THRESHOLD[tightness],
-          human_audit_sample_rate: keepReview ? 0.1 : 0,
+          // 勾选「留一批复查」→ 30% 抽审；取消 → 仍保留 5% 硬下限（后端不允许 0：
+          // 产品声明类已全量强制人审，其余类也始终留一批抽看，红线姿态不可被关掉）。
+          human_audit_sample_rate: keepReview ? 0.3 : 0.05,
           limit: count,
         }),
       });
@@ -120,7 +122,8 @@ export function AutoVerifyPanel(_props: { onClose?: () => void }) {
           <span className={styles.toggleText}>
             <span className={styles.toggleTitle}>留一批我复查</span>
             <span className={styles.toggleSub}>
-              即使 AI 标了通过，也随机留 10% 让我再看一眼（更保险）
+              即使 AI 标了通过，也随机留 30% 让我再看一眼（更保险）。
+              关掉也仍会留一小批抽查——产品报价类一律必须我亲自把关，AI 不替你放行。
             </span>
           </span>
         </label>

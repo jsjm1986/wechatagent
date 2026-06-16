@@ -22,6 +22,13 @@ use super::super::shared::*;
 use super::super::AppState;
 use super::*;
 
+/// auto-verify 人审抽样率**硬下限**（修复 C-①）：即便请求传 0（前端取消「留一批
+/// 我复查」），也按此下限抽样——禁止 100% 无人审落 verified。product_fact 类已由
+/// C-② 全量强制人审，本抽样主要覆盖其他三类，故下限取温和的 5%。
+const AUTO_VERIFY_MIN_SAMPLE_RATE: f64 = 0.05;
+/// auto-verify 人审抽样率默认值（修复 C-①：从 0.1 抬到 0.3，更积极抽审）。
+const AUTO_VERIFY_DEFAULT_SAMPLE_RATE: f64 = 0.3;
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct KnowledgeVerifyRequest {
@@ -35,7 +42,8 @@ pub struct KnowledgeAutoVerifyRequest {
     /// 模型置信度阈值（0-10），≥ 该值才算 verified；默认 7。
     #[serde(default)]
     confidence_threshold: Option<i32>,
-    /// 运营抽样概率，0.0-1.0；默认 0.1。
+    /// 运营抽样概率，0.0-1.0；默认 [`AUTO_VERIFY_DEFAULT_SAMPLE_RATE`]，且被 clamp 到
+    /// 硬下限 [`AUTO_VERIFY_MIN_SAMPLE_RATE`]（传 0 也不允许 100% 无人审）。
     #[serde(default)]
     human_audit_sample_rate: Option<f64>,
     /// 单次最多处理多少条 chunks，默认 50。
@@ -144,10 +152,15 @@ pub async fn auto_verify_operation_knowledge_chunks(
         .clone()
         .unwrap_or_else(|| state.config.default_account_id.clone());
     let threshold = payload.confidence_threshold.unwrap_or(7).clamp(0, 10);
+    // 修复（问题 C-①）：human_audit_sample_rate 设**硬下限** AUTO_VERIFY_MIN_SAMPLE_RATE，
+    // 不再允许 0——前端「留一批我复查」取消勾选会传 0，此前 clamp(0.0,1.0) 放行 0 =
+    // 100% 无人审落 verified。下限保证「永远有一批被抽出人审」这条红线姿态不可被关掉。
+    // 默认从 0.1 抬到 0.3（更积极抽审）。注：product_fact 类已由 C-② 全量强制人审，本抽样
+    // 主要覆盖其他三类（不进产品报价链路、风险较低），故下限取温和的 5%。
     let sample_rate = payload
         .human_audit_sample_rate
-        .unwrap_or(0.1)
-        .clamp(0.0, 1.0);
+        .unwrap_or(AUTO_VERIFY_DEFAULT_SAMPLE_RATE)
+        .clamp(AUTO_VERIFY_MIN_SAMPLE_RATE, 1.0);
     let limit = payload.limit.unwrap_or(50).clamp(1, 500);
 
     let (token_budget, max_llm_calls) =
@@ -368,6 +381,13 @@ source_anchors: {}
         if final_status == "verified" && sample_rate > 0.0 && fastrand::f64() < sample_rate {
             final_status = "needs_human_audit".to_string();
         }
+        // 修复（问题 C-②）：product_fact 是唯一经 R5.4 成为**产品声明背书**的 chunk 类
+        // （models.rs chunk_type 文档：仅 verified product_fact 可用作产品声明）。auto-verify
+        // 让它仅凭 LLM 自评直接 verified → agent 会据 AI 自己背书的 chunk 对客户报价/承诺，
+        // 实质架空「verified 需人把关」红线。故 product_fact 类一律强制 needs_human_audit，
+        // 绝不经 auto-verify 直 verified（无论抽样是否命中）。其他三类（style_template /
+        // peer_case / negative_example）不进产品报价链路，不受影响。
+        final_status = enforce_product_claim_human_audit(final_status, &chunk.chunk_type);
 
         match final_status.as_str() {
             "verified" => verified += 1,
@@ -504,9 +524,54 @@ pub fn decide_auto_verify_status(
     "needs_review".to_string()
 }
 
+/// 修复（问题 C-②）：产品声明类（`product_fact`）chunk 的 auto-verify **不得直 verified**，
+/// 强制降级 `needs_human_audit` 等人审。
+///
+/// 性质：仅当 `final_status == "verified"` 且 `chunk_type == "product_fact"` 时降级为
+/// `needs_human_audit`；其它一律原样返回。
+///
+/// 依据：`product_fact` 是 4 类 chunk_type 里**唯一**经 R5.4（gates 产品声明背书闸）
+/// 成为产品报价/承诺合法背书的类型（见 `models::OperationKnowledgeChunk::chunk_type`
+/// 文档）。auto-verify 让它仅凭 LLM 自评 + provenance 地板就直 verified，会让 agent 据
+/// AI 自己背书的 chunk 对客户报价——实质架空「AI 永不自动 verify / verified 需人把关」
+/// 红线。其他三类（`style_template` / `peer_case` / `negative_example`）不进产品报价
+/// 链路，auto-verify 直 verified 无报错价风险，故不降级。
+pub fn enforce_product_claim_human_audit(final_status: String, chunk_type: &str) -> String {
+    if final_status == "verified" && chunk_type == "product_fact" {
+        return "needs_human_audit".to_string();
+    }
+    final_status
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 修复 C-②：product_fact 的 verified 被强制降级 needs_human_audit（堵报错价链路）。
+    #[test]
+    fn product_fact_verified_forced_to_human_audit() {
+        let s = enforce_product_claim_human_audit("verified".to_string(), "product_fact");
+        assert_eq!(s, "needs_human_audit", "product_fact 不得经 auto-verify 直 verified");
+    }
+
+    /// 修复 C-②：非 product_fact 类的 verified 不降级（不进产品报价链路，无报错价风险）。
+    #[test]
+    fn non_product_fact_verified_kept() {
+        for ct in ["style_template", "peer_case", "negative_example"] {
+            let s = enforce_product_claim_human_audit("verified".to_string(), ct);
+            assert_eq!(s, "verified", "{ct} 不应被降级");
+        }
+    }
+
+    /// 修复 C-②：非 verified 终态（needs_review / rejected / needs_human_audit）原样透传，
+    /// 即便是 product_fact——只拦"verified"这一档，不影响 reject/缺证据降级。
+    #[test]
+    fn product_fact_non_verified_passthrough() {
+        for st in ["needs_review", "rejected", "needs_human_audit"] {
+            let s = enforce_product_claim_human_audit(st.to_string(), "product_fact");
+            assert_eq!(s, st, "非 verified 终态应原样透传");
+        }
+    }
 
     /// 波 D2：4 项证据齐 → verified。
     #[test]
