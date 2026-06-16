@@ -111,6 +111,8 @@ async fn db_create_profile(
         created_at: DateTime::now(),
         updated_at: DateTime::now(),
         threshold_overrides: None,
+        reviewer_orientation: None,
+        answering_mode_profile: None,
         version: 1,
     };
     let result = db.domain_profiles().insert_one(&profile, None).await.expect("insert");
