@@ -33,7 +33,7 @@ use wechatagent::agent::{
     atomic_claim_pending, handle_managed_message, process_entry, OutboxStatus,
 };
 use wechatagent::agent::knowledge_agent::{answer, AnswerRequest, CatalogFilter};
-use wechatagent::llm::LlmClient;
+use wechatagent::llm::{LlmClient, LlmFormat};
 use wechatagent::models::{
     AgentStatus, Contact, ConversationMessage, LlmProviderConfig, MessageDirection,
     OperationKnowledgeChunk,
@@ -59,9 +59,28 @@ fn real_llm_from_env() -> Option<Arc<LlmClient>> {
         .unwrap_or_else(|_| "https://api.supxh.xin/v1".to_string());
     let model =
         std::env::var("REAL_LLM_MODEL").unwrap_or_else(|_| "deepseek-v4-pro".to_string());
-    let client = LlmClient::new(base_url, api_key, model, 180, 6, 2500)
-        .expect("构造真实 LlmClient");
+    let client = build_real_client(base_url, api_key, model, "REAL_LLM_FORMAT", 6);
     Some(Arc::new(client))
+}
+
+/// 按 `<format_env>`（openai/anthropic，缺省 openai）构造 LlmClient。claude 系走
+/// Anthropic `/v1/messages`（非流式）；gpt/其它走 OpenAI `/v1/chat/completions`。
+/// 与 `real_llm_ops_smoke.rs::build_real_client` 同口径——端点切到 rsxermu666.cn
+/// （主 claude-opus-4-8）时主模型走 Anthropic，避免被当 OpenAI 走错路径返回 4xx 后被
+/// `unwrap_or_skip_transient!` 跳过出假绿。
+fn build_real_client(
+    base_url: String,
+    api_key: String,
+    model: String,
+    format_env: &str,
+    retries: u32,
+) -> LlmClient {
+    let fmt = match std::env::var(format_env).ok().as_deref() {
+        Some("anthropic") | Some("messages") | Some("claude") => LlmFormat::Anthropic,
+        _ => LlmFormat::Openai,
+    };
+    LlmClient::with_format(base_url, api_key, model, fmt, 180, retries, 2500)
+        .expect("构造真实 LlmClient")
 }
 
 /// vision 副模型名：`REAL_LLM_VISION_MODEL`，缺省默认专职视觉 provider 模型 `nemotron-nano-12b-v2-vl`。

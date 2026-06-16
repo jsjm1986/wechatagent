@@ -47,11 +47,20 @@ use serde_json::Value;
 use axum::extract::{Extension, Json, Path, State};
 use wechatagent::auth::AuthenticatedAdmin;
 use wechatagent::db::Database;
-use wechatagent::llm::LlmClient;
+use wechatagent::llm::{LlmClient, LlmFormat};
 use wechatagent::models::{
     CommitmentMarkers, DomainProfile, OperationMode, OutcomePolarity,
 };
 use wechatagent::routes::guide_profile::GenerateProfileRequest;
+
+/// 按 `REAL_LLM_FORMAT`（openai/anthropic，缺省 openai）解析 LlmFormat。端点切到
+/// rsxermu666.cn 主 claude-opus-4-8 时走 Anthropic，避免被当 OpenAI 走错路径 4xx panic。
+fn real_llm_format() -> LlmFormat {
+    match std::env::var("REAL_LLM_FORMAT").ok().as_deref() {
+        Some("anthropic") | Some("messages") | Some("claude") => LlmFormat::Anthropic,
+        _ => LlmFormat::Openai,
+    }
+}
 
 /// 构造测试 admin auth context。
 fn test_admin(workspace_id: &str) -> AuthenticatedAdmin {
@@ -379,10 +388,11 @@ async fn e2e_generate_candidate_is_draft() {
     let admin = test_admin(&app.state.config.default_workspace_id);
 
     // LlmClient::new 不发网络请求，只存配置。万一构造失败（格式错误），skip。
-    let llm = match LlmClient::new(
+    let llm = match LlmClient::with_format(
         base_url.clone().unwrap(),
         api_key.unwrap(),
         model.unwrap_or_else(|| "deepseek-chat".to_string()),
+        real_llm_format(),
         180,
         6,
         2500,
@@ -474,10 +484,11 @@ async fn e2e_generate_second_industry_profile() {
     let app = common::TestApp::start().await;
     let admin = test_admin(&app.state.config.default_workspace_id);
 
-    let llm = match LlmClient::new(
+    let llm = match LlmClient::with_format(
         base_url.clone().unwrap(),
         api_key.unwrap(),
         model.unwrap_or_else(|| "deepseek-chat".to_string()),
+        real_llm_format(),
         180,
         6,
         2500,

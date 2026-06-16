@@ -43,7 +43,7 @@ use wechatagent::agent::{
     consolidate_contact_memory, handle_follow_up_task, handle_managed_message, record_user_reaction,
 };
 use wechatagent::error::{AppError, AppResult};
-use wechatagent::llm::{LlmClient, LlmJsonResult, LlmProvider};
+use wechatagent::llm::{LlmClient, LlmFormat, LlmJsonResult, LlmProvider};
 use wechatagent::models::{
     AgentProfile, AgentStatus, AgentTask, Contact, ConversationMessage, MemoryCandidate,
     MessageDirection,
@@ -71,9 +71,28 @@ fn real_llm_from_env() -> Option<Arc<LlmClient>> {
     // （gpt-5.5 曾频发 HTTP 503 `auth_unavailable`，是端点后端 provider 间歇性鉴权/配额不可用，
     // 非速率限制）；无备胎时旧 3/1500（窗口 ~4.5s）对鉴权恢复偏短 → Round 5 有 3/7 弧 turn-1
     // 即被 503 收弧，故缺备胎仍保 5。本轮起主模型 = deepseek-v4-pro（api.supxh.xin，HTTPS）。
-    let client = LlmClient::new(base_url, api_key, model, 180, primary_max_retries(), 2500)
-        .expect("构造真实 LlmClient");
+    let client = build_real_client(base_url, api_key, model, "REAL_LLM_FORMAT", primary_max_retries());
     Some(Arc::new(client))
+}
+
+/// 按 `<format_env>`（openai/anthropic，缺省 openai）构造 LlmClient。claude 系走
+/// Anthropic `/v1/messages`（非流式）；gpt/其它走 OpenAI `/v1/chat/completions`。
+/// 与 `real_llm_ops_smoke.rs::build_real_client` 同口径——端点切到 rsxermu666.cn
+/// （主 claude-opus-4-8 走 Anthropic / judge gpt-5.4 走 OpenAI）时按各自格式走对路径，
+/// 避免被当 OpenAI 走错路径返回 4xx 后被 `unwrap_or_skip_transient!` 跳过出假绿。
+fn build_real_client(
+    base_url: String,
+    api_key: String,
+    model: String,
+    format_env: &str,
+    retries: u32,
+) -> LlmClient {
+    let fmt = match std::env::var(format_env).ok().as_deref() {
+        Some("anthropic") | Some("messages") | Some("claude") => LlmFormat::Anthropic,
+        _ => LlmFormat::Openai,
+    };
+    LlmClient::with_format(base_url, api_key, model, fmt, 180, retries, 2500)
+        .expect("构造真实 LlmClient")
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -535,21 +554,30 @@ fn judge_panel() -> Option<Vec<Judge>> {
     let api_key = std::env::var("REAL_LLM_API_KEY").ok().filter(|k| !k.trim().is_empty())?;
     let base_url = std::env::var("REAL_LLM_BASE_URL")
         .unwrap_or_else(|_| "https://token-plan-cn.xiaomimimo.com/v1".to_string());
-    // judge1 模型 = REAL_LLM_JUDGE1_MODEL（缺则回落 REAL_LLM_MODEL）。本轮起被测 agent 与 judge1
-    // 解耦：agent 走 deepseek-v4-pro（REAL_LLM_MODEL），judge1 走 deepseek-v4-flash（同厂不同
-    // checkpoint）——比上轮 gpt-5.5 自评（agent 与 judge1 同模型）干净，judge1≠agent 避免逐字
-    // 自我背书。跨家族效度仍靠 judge2 Qwen，三裁判 = deepseek-flash + qwen-max 判 deepseek-pro。
-    let judge1_model =
-        std::env::var("REAL_LLM_JUDGE1_MODEL").unwrap_or_else(|_| {
+    // judge1 端点与被测 agent **解耦**：走独立 REAL_LLM_JUDGE_BASE_URL / _API_KEY / _FORMAT
+    // （缺则回落主端点/主 key/openai）。rsxermu 下主端点=claude-opus-4-8(anthropic 无 /v1)、
+    // judge=gpt-5.4(openai /v1)，两者端点串/格式皆异，judge1 必须独立接线否则被当 OpenAI 走错
+    // 路径 4xx 假绿。NVIDIA 单端点形态下不配 JUDGE_BASE_URL 即回落主 base，行为零退化。
+    let judge_base = std::env::var("REAL_LLM_JUDGE_BASE_URL").unwrap_or_else(|_| base_url.clone());
+    let judge_key = std::env::var("REAL_LLM_JUDGE_API_KEY")
+        .ok()
+        .filter(|k| !k.trim().is_empty())
+        .unwrap_or_else(|| api_key.clone());
+    // judge1 模型 = REAL_LLM_JUDGE1_MODEL（缺则回落 REAL_LLM_JUDGE_MODEL，再回落 REAL_LLM_MODEL）。
+    // 被测 agent 与 judge1 解耦：judge1≠agent 避免逐字自我背书；rsxermu 下 judge1=gpt-5.4 与
+    // 被测 claude 天然跨家族，跨家族效度更强。
+    let judge1_model = std::env::var("REAL_LLM_JUDGE1_MODEL").unwrap_or_else(|_| {
+        std::env::var("REAL_LLM_JUDGE_MODEL").unwrap_or_else(|_| {
             std::env::var("REAL_LLM_MODEL").unwrap_or_else(|_| "mimo-v2.5-pro".to_string())
-        });
+        })
+    });
     // judge1 的 label 从真实 model 名派生（leak 成 &'static str，测试二进制内一次性、有界）。
     // 台账 `judge` 字段须如实反映裁判模型，否则跨轮读账串味。
     let label1: &'static str = Box::leak(judge1_model.clone().into_boxed_str());
     // 重试参数 base_ms=2500，max_retries 走 `primary_max_retries()`（有备胎 1 / 无备胎 5）：
     // 判分调用也走 deepseek/Qwen 端点，有备胎时 fail-fast 快速切 kimi 兜底判分、无备胎时保 ~37s
     // 恢复窗防判分丢采样（Round 10 解 429 风暴下重试税撞 45min 墙）。
-    let c1 = LlmClient::new(base_url.clone(), api_key.clone(), judge1_model, 180, primary_max_retries(), 2500).ok()?;
+    let c1 = build_real_client(judge_base.clone(), judge_key, judge1_model, "REAL_LLM_JUDGE_FORMAT", primary_max_retries());
 
     // 第二裁判：优先跨家族 Qwen（REAL_LLM_JUDGE2_API_KEY）；缺则退化回同家族 MiMo lite。
     let (label2, label2_endpoint, c2) = match std::env::var("REAL_LLM_JUDGE2_API_KEY")
@@ -566,15 +594,22 @@ fn judge_panel() -> Option<Vec<Judge>> {
             ("qwen-max", j2_base, c)
         }
         None => {
-            let lite =
-                std::env::var("REAL_LLM_VISION_MODEL").unwrap_or_else(|_| "mimo-v2.5".to_string());
-            let c = LlmClient::new(base_url.clone(), api_key.clone(), lite, 180, primary_max_retries(), 2500).ok()?;
-            ("mimo-lite", base_url.clone(), c)
+            // 缺独立异族 key 时回落：用 judge 端点（rsxermu 下 = gpt-5.4 openai/v1，与 judge1 同
+            // 端点同组串行不增并发）凑第二裁判。NVIDIA 单端点形态下 judge_base 回落主 base、
+            // 用 VISION_MODEL 作 lite checkpoint，行为与迁移前一致。跨家族效度此时退化（同模型），
+            // 靠可选第三族 judge3 承担——故 CI 建议至少配一个异族 judge2/judge3 key。
+            let lite = std::env::var("REAL_LLM_VISION_MODEL")
+                .ok()
+                .filter(|m| !m.trim().is_empty())
+                .or_else(|| std::env::var("REAL_LLM_JUDGE_MODEL").ok())
+                .unwrap_or_else(|| "mimo-v2.5".to_string());
+            let c = build_real_client(judge_base.clone(), api_key.clone(), lite, "REAL_LLM_JUDGE_FORMAT", primary_max_retries());
+            ("mimo-lite", judge_base.clone(), c)
         }
     };
 
     let mut panel = vec![
-        Judge { label: label1, endpoint: base_url.clone(), client: wrap_with_failover(label1.to_string(), Arc::new(c1)) },
+        Judge { label: label1, endpoint: judge_base.clone(), client: wrap_with_failover(label1.to_string(), Arc::new(c1)) },
         Judge { label: label2, endpoint: label2_endpoint, client: wrap_with_failover(label2.to_string(), Arc::new(c2)) },
     ];
 
@@ -595,18 +630,18 @@ fn judge_panel() -> Option<Vec<Judge>> {
         }
     }
 
-    // 第四裁判 = 旗舰自评 deepseek-v4-pro（REAL_LLM_MODEL，与被测 agent 同 checkpoint）。
-    // 它的逐字自我背书风险用「跨家族 qwen/glm 的 median 分歧」照出——四裁判 = deepseek-flash +
-    // qwen-max + glm-5.1 + deepseek-pro，跨家族信号取 |deepseek 双 checkpoint median − 异族 median|，
-    // 自评偏高会被两异族压回保守裁决。缺 REAL_LLM_MODEL 时跳过（不致失效）。
-    // 注意：judge4 与 judge1 共用同一 deepseek 端点（base_url）+ 同把 key——endpoint 标成同值，
-    // run_panel 按端点分组让这两路 deepseek 调用**串行错峰**，避免同端点瞬时并发翻倍触发 429。
+    // 第四裁判 = 旗舰自评（REAL_LLM_MODEL，与被测 agent 同 checkpoint，走 REAL_LLM_FORMAT）。
+    // 它的逐字自我背书风险用「跨家族 judge1/qwen/glm 的 median 分歧」照出——自评偏高会被异族压回
+    // 保守裁决。缺 REAL_LLM_MODEL 时跳过（不致失效）。rsxermu 下被测=claude-opus-4-8(anthropic)，
+    // 故 judge4 走 anthropic 自评；它复用主 base（endpoint=主端点，judge 调用时被测 agent 已空闲，
+    // 不与 agent 并发）。**并发审查**：judge4(主 base/anthropic) 与 judge1(JUDGE_BASE_URL/openai)
+    // 端点串不同→run_panel 分到不同组并发；JUDGE_SAMPLES=1 时二者各 1 路 = 瞬时 2 路 rsxermu，
+    // 恰守端点并发上限 2（故 adversarial CI 必须 JUDGE_SAMPLES=1，勿调大）。
     if let Ok(j4_model) = std::env::var("REAL_LLM_MODEL") {
         if !j4_model.trim().is_empty() {
             let label4: &'static str = Box::leak(format!("{j4_model}-selfeval").into_boxed_str());
-            if let Ok(c4) = LlmClient::new(base_url.clone(), api_key, j4_model, 180, primary_max_retries(), 2500) {
-                panel.push(Judge { label: label4, endpoint: base_url, client: wrap_with_failover(label4.to_string(), Arc::new(c4)) });
-            }
+            let c4 = build_real_client(base_url.clone(), api_key, j4_model, "REAL_LLM_FORMAT", primary_max_retries());
+            panel.push(Judge { label: label4, endpoint: base_url, client: wrap_with_failover(label4.to_string(), Arc::new(c4)) });
         }
     }
 

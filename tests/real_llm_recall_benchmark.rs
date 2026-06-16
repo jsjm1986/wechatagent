@@ -27,7 +27,7 @@ use futures::TryStreamExt;
 use mongodb::bson::{doc, oid::ObjectId, DateTime};
 use wechatagent::agent::knowledge_agent::{answer, AnswerRequest, AnswerResult, CatalogFilter, SourceQuoteCitation};
 use wechatagent::auth::AuthenticatedAdmin;
-use wechatagent::llm::LlmClient;
+use wechatagent::llm::{LlmClient, LlmFormat};
 use wechatagent::models::{KnowledgeGapSignal, OperationKnowledgeChunk, RelatedRef};
 use wechatagent::routes::AppState;
 use wechatagent::routes::ext_knowledge::{chat_apply, chat_turn, verify_operation_knowledge_chunk, ChatApplyRequest, ChatTurnRequest, KnowledgeVerifyRequest};
@@ -45,9 +45,28 @@ fn real_llm_from_env() -> Option<Arc<LlmClient>> {
     let base_url = std::env::var("REAL_LLM_BASE_URL")
         .unwrap_or_else(|_| "https://api.supxh.xin/v1".to_string());
     let model = std::env::var("REAL_LLM_MODEL").unwrap_or_else(|_| "deepseek-v4-pro".to_string());
-    let client =
-        LlmClient::new(base_url, api_key, model, 180, 6, 2500).expect("构造真实 LlmClient");
+    let client = build_real_client(base_url, api_key, model, "REAL_LLM_FORMAT", 6);
     Some(Arc::new(client))
+}
+
+/// 按 `<format_env>`（openai/anthropic，缺省 openai）构造 LlmClient。claude 系走
+/// Anthropic `/v1/messages`（非流式）；gpt/其它走 OpenAI `/v1/chat/completions`。
+/// 与 `real_llm_ops_smoke.rs::build_real_client` 同口径——端点切到 rsxermu666.cn
+/// （主 claude-opus-4-8）时主模型走 Anthropic，避免被当 OpenAI 走错路径返回 4xx 后被
+/// `unwrap_or_skip_transient!` 跳过出假绿。
+fn build_real_client(
+    base_url: String,
+    api_key: String,
+    model: String,
+    format_env: &str,
+    retries: u32,
+) -> LlmClient {
+    let fmt = match std::env::var(format_env).ok().as_deref() {
+        Some("anthropic") | Some("messages") | Some("claude") => LlmFormat::Anthropic,
+        _ => LlmFormat::Openai,
+    };
+    LlmClient::with_format(base_url, api_key, model, fmt, 180, retries, 2500)
+        .expect("构造真实 LlmClient")
 }
 
 /// 跳过宏：无 key 时打印一行 skip 并 `return`（不 panic、不算失败）。
