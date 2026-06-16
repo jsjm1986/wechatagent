@@ -293,6 +293,15 @@ pub(crate) async fn review_decision(
         &contact.workspace_id,
     )
     .await;
+    // universal-domain-adaptation D：reviewer system prompt 的「评审重点：…」取向行按 active
+    // profile 的 reviewer_orientation.review_focus 渲染。None（DEFAULT/老库）→ 字节等价。
+    let system = crate::agent::domain_profile::apply_reviewer_review_focus(
+        &system,
+        active_profile
+            .reviewer_orientation
+            .as_ref()
+            .and_then(|o| o.review_focus.as_deref()),
+    );
     let runtime_text = serde_json::to_string(&runtime.as_document()).unwrap_or_default();
     let memory_card_text = serde_json::to_string(context_pack).unwrap_or_default();
     let memory_text = serde_json::to_string(&mongodb::bson::doc! {
@@ -418,6 +427,16 @@ Review 模式: {}
         runtime_text,
         format_operation_knowledge_for_prompt_with_roles(knowledge_chunks, &active_profile.chunk_roles),
         knowledge_route_text
+    );
+    // universal-domain-adaptation D：reviewer user prompt 评审原则里的「转化平衡」取向条按
+    // active profile 的 reviewer_orientation.balance_principle 渲染。None（DEFAULT/老库）→
+    // 字节等价。
+    let user = crate::agent::domain_profile::apply_reviewer_balance_principle(
+        &user,
+        active_profile
+            .reviewer_orientation
+            .as_ref()
+            .and_then(|o| o.balance_principle.as_deref()),
     );
     // S2 (Phase 0)：reviewer 双模真并行——主 reviewer 走 generate_agent_json
     // （含 LRU cache + llm_call_logs），第二 reviewer 走纯 LlmProvider。

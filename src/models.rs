@@ -1442,6 +1442,24 @@ pub struct DomainProfile {
     /// 「AI 永不自断成交 / 永不自动 verify」等结构红线。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub threshold_overrides: Option<ProfileThresholds>,
+    /// universal-domain-adaptation D（reviewer 去销售取向）：本行业评审取向覆盖。
+    /// `None`（DEFAULT/老库 serde 默认）→ reviewer system/user prompt 里的「评审重点」与
+    /// 「转化平衡」两句保留写死销售取向，销售域字节等价。`Some` 时 review/mod.rs 用本字段
+    /// 渲染替换这两句，让情感陪伴/同行/朋友域声明自己的评审取向（不含「低压推进 / 产品知识
+    /// 一致性 / 转化」等销售漏斗措辞）。仅替换取向性散文，不动五闸阈值 / grounding /
+    /// 「AI 永不自断成交 / 永不自动 verify」结构红线。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reviewer_orientation: Option<ReviewerOrientation>,
+    /// universal-domain-adaptation I：completeness `answeringMode` 三档**释义/标签**覆盖。
+    /// 三个档位 key（relationship_only / product_safe / fully_supported）是**域无关的
+    /// 认知阶梯**（无 / 部分 / 完全 verified 支撑），被 `clamp_answering_mode`「永不自动
+    /// verify」红线、CI 闭集、前端类型、real-LLM 测试共同锁定 → key 恒定不可配。带销售
+    /// 世界观的只是**喂给 LLM 的三档释义散文**（catalog.rs 写死「产品/服务事实、报价、
+    /// 案例、交付边界」）和**前端档位标签**（「可安全讲产品」）。`None`（DEFAULT/老库）→
+    /// 回落写死销售释义 + 标签（prompt 字节等价、UI 标签不变）；`Some` 时按本行业释义
+    /// 渲染 completeness prompt 的判断规则段、并回传前端档位标签。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub answering_mode_profile: Option<AnsweringModeProfile>,
     /// E5-T1 多版本灰度：同 `(workspace_id, profile_id)` 下 `version` 单调递增。
     #[serde(default = "default_version_one")]
     pub version: i32,
@@ -1483,6 +1501,63 @@ pub struct ProfileThresholds {
     pub emotional_value_rewrite_below: Option<i32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub product_accuracy_block_below: Option<i32>,
+}
+
+/// universal-domain-adaptation D：reviewer 评审取向的 per-profile 覆盖。
+///
+/// reviewer 的 system prompt（`user.review.system`）有一句「评审重点：事实准确、像真人微信、
+/// 情绪价值、低压推进、产品知识一致性、没有操控营销。」、user prompt 有一句「转化平衡：既允许
+/// 适度推进，也不能伤害信任。」——两句把**销售漏斗取向**（低压推进 / 产品知识一致性 / 转化 /
+/// 推进）写死进了通用评审 Agent。情感陪伴 / 同行 / 朋友域并无「转化」语义，这两句会把销售取向
+/// 强加给本应中性的评审。
+///
+/// 每字段 `Option<String>`：`None` = 该句保留写死原文（销售域字节等价）；`Some(s)` = 用 s
+/// 整句替换。两字段独立回落，可只覆盖其一。**红线**：只换取向性散文，五闸阈值、grounding、
+/// 「AI 永不自断成交 / 永不自动 verify」结构红线不在此变。
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ReviewerOrientation {
+    /// 替换 system prompt 的「评审重点：…」整行。标签「评审重点」本身域中性，故消费方
+    /// 保留「评审重点：」前缀，本字段只承载冒号后的取向描述（替换写死的销售取向描述）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review_focus: Option<String>,
+    /// 替换 user prompt 评审原则里的「- 转化平衡：既允许适度推进，也不能伤害信任。」整条。
+    /// 标签「转化平衡」本身含销售「转化」语义，故本字段承载 bullet「- 」之后的**整句**
+    /// （含自定标签），让非销售域换掉「转化」标签本身。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub balance_principle: Option<String>,
+}
+
+/// universal-domain-adaptation I：completeness `answeringMode` 三档释义/标签的 per-profile
+/// 覆盖。三档 key（认知阶梯）恒定，本结构只承载**喂 LLM 的判断释义**与**前端档位标签**。
+///
+/// 每档 `Option<AnsweringModeDescriptor>`：`None` = 该档回落写死销售释义/标签（字节等价）；
+/// `Some` = 用本行业释义/标签替换。三档独立回落。
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AnsweringModeProfile {
+    /// `relationship_only` 档（无足够 verified 支撑，只能关系维护/澄清/收集信息）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relationship_only: Option<AnsweringModeDescriptor>,
+    /// `product_safe` 档（可在 verified 证据边界内部分作答，仍有维度不足）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub product_safe: Option<AnsweringModeDescriptor>,
+    /// `fully_supported` 档（关键维度都有 verified 客观事实支撑）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fully_supported: Option<AnsweringModeDescriptor>,
+}
+
+/// universal-domain-adaptation I：单档 answeringMode 的释义与标签。
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AnsweringModeDescriptor {
+    /// 注入 completeness 审计 prompt「判断规则」段的该档释义（冒号后那句，替代写死的
+    /// 销售释义）。`None` → 该档释义回落写死销售文案。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rule: Option<String>,
+    /// 前端档位中文标签（如销售域「可安全讲产品」）。`None` → 前端回落内置标签。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
 }
 
 
@@ -1631,6 +1706,17 @@ pub struct CoverageDimension {
     /// 复刻原 prompt 锚点 → 销售域 prompt 字节等价）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub anchor_hint: Option<String>,
+    /// universal-domain-adaptation H：completeness **degraded/fallback** 初值规则——LLM
+    /// 审计不可用时，本维度的初始 coverage 由哪个客观计数驱动。`catalog.rs` 原写死按
+    /// 销售维度名分派（capability/deliveryBoundary 跟 verified、caseEvidence/effectClaims
+    /// 跟 evidence、其余恒 missing），换行业新维全落 `false`、拿不到合理初值。本字段把
+    /// 规则下放到维度声明：
+    /// - `Some("verified")` → 有 verified 切片即判该维 verified（否则 missing）；
+    /// - `Some("evidence")` → 有 evidence 切片即判 verified；
+    /// - `None` / 未知值 → 恒 missing（保守缺失，原 `pricing` 与未知维度行为）。
+    /// DEFAULT_PROFILE 五维按原规则 seed 对应 signal → fallback 初值字节等价。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub initial_signal: Option<String>,
 }
 
 /// universal-domain-adaptation H16：知识切片的「用途角色」（替代 `knowledge_router.rs`

@@ -43,6 +43,21 @@ pub async fn build_initial_operation_profile(
         .as_ref()
         .map(format_operation_domain_config_for_prompt)
         .unwrap_or_default();
+    // universal-domain-adaptation：初始画像生成此前是唯一漏接 active DomainProfile 的
+    // prompt 构造点——它只载 domain_config，从不载 profile，于是非销售域（情感陪伴/同行/
+    // 朋友）的首屏画像也被 user.initial_profile.task 的销售 schema（budget/decisionRole/
+    // painPoints/「下一阶段运营目标」）强行框住，且无任何本行业语境。这里镜像 H3
+    // （decide_reply_with_promote 的 prompt_fragment 业务上下文层）注入本行业语义。
+    // DEFAULT 销售域 prompt_fragment=None → 空串、prompt 字节等价（反过拟合护栏）。
+    let active_profile = super::domain_profile::load_active_domain_profile(
+        &state.db,
+        &state.config.default_workspace_id,
+    )
+    .await;
+    let business_context = render_business_context_fragment(
+        active_profile.prompt_fragment.as_deref(),
+        "本行业业务上下文（运营配置，补充运营方法与域策略）：",
+    );
     let system = prompts::load_prompt(
         &state.db,
         &state.config.default_workspace_id,
@@ -62,11 +77,11 @@ pub async fn build_initial_operation_profile(
 {}
 
 用户运营域策略：
-{}
+{}{}
 
 运营人员描述：
 {}"#,
-        task_template, playbook_text, domain_text, note
+        task_template, playbook_text, domain_text, business_context, note
     );
     let value = generate_agent_json(
         state,
@@ -498,16 +513,16 @@ pub(crate) async fn decide_reply_with_promote(
     // → 空串，系统提示与改造前逐字等价（反过拟合护栏）。
     // **红线**：boundary_protection 边界保护硬规则继续由 user.reply.policy 写死守护，
     // 不进 prompt_fragment、不可被行业配置覆盖。
-    let business_context = active_profile
-        .prompt_fragment
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(|s| format!("\n\n# 本行业业务上下文（运营配置，补充 Soul + Policy）\n{}", s))
-        .unwrap_or_default();
-    let system = format!(
-        "{}\n\n{}\n\n{}{}{}",
-        soul, system_contract, policy, business_context, operator_instruction
+    let business_context = render_business_context_fragment(
+        active_profile.prompt_fragment.as_deref(),
+        "# 本行业业务上下文（运营配置，补充 Soul + Policy）",
+    );
+    let system = assemble_system_prompt(
+        &soul,
+        &system_contract,
+        &policy,
+        &business_context,
+        &operator_instruction,
     );
     let history = recent_messages
         .iter()
@@ -936,9 +951,41 @@ pub(crate) fn format_playbook_for_prompt(playbook: &OperationPlaybook) -> String
     )
 }
 
-/// H12：把 profile 的 `soul_override` / `methodology_override` 规整为「有效覆盖」——
-/// `Some(非空白)` 才算覆盖，`None` / 空串 / 纯空白都视为「不覆盖」返回 `None`，让调用方
-/// 回落原有出厂本体（DB published soul / contact 绑定 playbook）。
+/// 把分层 prompt 的五段拼装成最终系统提示串（Soul → System Contract → Policy →
+/// Business Context → Operator Instruction）。
+///
+/// 抽成纯函数（修复 J）让 lib 单测能锁住**层间拼接顺序与分隔符**——此前拼装内联在
+/// `decide_reply_with_promote` 里，各段虽有 _verbatim/快照等价测试，但没有任何测试锁定
+/// 最终整串拼装，改分隔符/插新层会静默改变层序而不被发现。`business_context` /
+/// `operator_instruction` 为条件空串（DEFAULT 域均空 → 退化为 `soul\n\ncontract\n\npolicy`）。
+fn assemble_system_prompt(
+    soul: &str,
+    system_contract: &str,
+    policy: &str,
+    business_context: &str,
+    operator_instruction: &str,
+) -> String {
+    format!("{soul}\n\n{system_contract}\n\n{policy}{business_context}{operator_instruction}")
+}
+
+/// universal-domain-adaptation H3：把 active profile 的 `prompt_fragment`（本行业业务
+/// 上下文）渲染成一段带 `header` 前缀的注入文本；`None` / 空 / 纯空白 → 空串。
+///
+/// 抽成纯函数（修复 #104）让 reply 决策路径（decide_reply_with_promote）与初始画像
+/// 生成路径（build_initial_operation_profile）共用同一渲染语义并锁住**字节等价护栏**：
+/// DEFAULT_PROFILE `prompt_fragment=None` → 空串 → 注入点退化为原始 prompt（逐字等价）。
+/// 两路径 header 文案不同（reply 补 Soul+Policy、初始画像补运营方法与域策略），故 header
+/// 由调用方传入。
+fn render_business_context_fragment(fragment: Option<&str>, header: &str) -> String {
+    fragment
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| format!("\n\n{header}\n{s}"))
+        .unwrap_or_default()
+}
+
+/// universal-domain-adaptation H12：把 `Option<&str>` 的 override 文本归一——trim 后空
+/// 视为 `None`（不覆盖、回落内置默认）。
 ///
 /// 抽成纯函数让 lib 单测无需构造完整 `decide_reply_with_promote` 即可锁住回落语义：
 /// DEFAULT_PROFILE(两 override 均 None) → `None` → 回落链与 H12 改造前逐字等价。
@@ -1122,7 +1169,7 @@ mod persona_override_tests {
     //! 「回落原出厂本体」。DEFAULT_PROFILE 两 override 均 None 必须返回 None（回落），
     //! 保证销售域字节不变。
 
-    use super::non_empty_override;
+    use super::{assemble_system_prompt, non_empty_override, render_business_context_fragment};
 
     #[test]
     fn none_override_falls_back() {
@@ -1157,6 +1204,58 @@ mod persona_override_tests {
         assert_eq!(
             non_empty_override(Some("陪伴方法论：每日问候、情绪回应、纪念日提醒。")),
             Some("陪伴方法论：每日问候、情绪回应、纪念日提醒。".to_string())
+        );
+    }
+
+    /// 修复 J：锁定分层 prompt 五段拼装的**层间顺序与分隔符**。改 assemble_system_prompt
+    /// 的分隔符或插新层会改变整串形态 → 本测试变红，防静默改坏层序。
+    #[test]
+    fn assemble_system_prompt_layers_order_and_separators() {
+        // 全段非空：Soul \n\n Contract \n\n Policy + BusinessContext + OperatorInstruction
+        // （后两段自带前导 \n\n，故拼装处不再加分隔符——直接紧贴）。
+        let out = assemble_system_prompt(
+            "SOUL",
+            "CONTRACT",
+            "POLICY",
+            "\n\nBUSINESS",
+            "\n\nOPERATOR",
+        );
+        assert_eq!(out, "SOUL\n\nCONTRACT\n\nPOLICY\n\nBUSINESS\n\nOPERATOR");
+    }
+
+    /// 修复 J：DEFAULT 域退化形态——business_context / operator_instruction 均空串
+    /// （DEFAULT profile prompt_fragment=None、无 operator 指令）→ 三段拼装、无尾随分隔符。
+    #[test]
+    fn assemble_system_prompt_default_degenerates_to_three_layers() {
+        let out = assemble_system_prompt("SOUL", "CONTRACT", "POLICY", "", "");
+        assert_eq!(out, "SOUL\n\nCONTRACT\n\nPOLICY", "DEFAULT 域应退化为三层、无多余分隔符");
+    }
+
+    /// 修复 #104：DEFAULT_PROFILE prompt_fragment=None → business_context 空串。
+    /// 这是初始画像 / reply 两路径共用的字节等价护栏：DEFAULT 域注入点退化为空，
+    /// prompt 与改造前逐字一致。空串 / 纯空白同样回落空（不误把空字段当上下文）。
+    #[test]
+    fn render_business_context_fragment_none_or_empty_is_blank() {
+        assert_eq!(render_business_context_fragment(None, "# H"), "");
+        assert_eq!(render_business_context_fragment(Some(""), "# H"), "");
+        assert_eq!(render_business_context_fragment(Some("   \n\t"), "# H"), "");
+    }
+
+    /// 修复 #104：非空 prompt_fragment → 注入「\n\n{header}\n{fragment}」（trim 边界空白）。
+    /// 换行业（情感陪伴等）首屏画像与 reply 决策都能拿到本行业语境。
+    #[test]
+    fn render_business_context_fragment_injects_with_header() {
+        assert_eq!(
+            render_business_context_fragment(
+                Some("本行业是情感陪伴，关注用户情绪与陪伴质量。"),
+                "本行业业务上下文（运营配置，补充运营方法与域策略）：",
+            ),
+            "\n\n本行业业务上下文（运营配置，补充运营方法与域策略）：\n本行业是情感陪伴，关注用户情绪与陪伴质量。"
+        );
+        // 边界空白被 trim。
+        assert_eq!(
+            render_business_context_fragment(Some("  含空白  "), "# H"),
+            "\n\n# H\n含空白"
         );
     }
 }

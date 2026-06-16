@@ -592,19 +592,20 @@ pub async fn build_operation_knowledge_completeness(
     // 行为字节等价（命中初值规则 + prompt JSON 骨架下方按同序生成）。
     let active_profile =
         crate::agent::domain_profile::load_active_domain_profile(&state.db, workspace_id).await;
-    // 维度初值规则（DEFAULT 销售域逐字复刻原 fallback）：capability / deliveryBoundary
-    // 跟随「有 verified」、caseEvidence / effectClaims 跟随「有 evidence」、pricing 恒
-    // false（报价默认缺）、未知维度（换行业新维）默认 false（保守缺失）。
-    let dim_initial_verified = |key: &str| -> bool {
-        match key {
-            "capability" | "deliveryBoundary" => verified > 0,
-            "caseEvidence" | "effectClaims" => evidence > 0,
+    // 维度初值规则（DEFAULT 销售域逐字复刻原 fallback）：维度声明的 initial_signal
+    // 决定初值由哪个客观计数驱动——"verified" 跟随「有 verified 切片」、"evidence" 跟随
+    // 「有 evidence 切片」、None/未知 → 恒 false（保守缺失，原 pricing + 未知维度行为）。
+    // 规则下放到 DomainProfile.coverage_dimensions，换行业新维可自带初值语义而非全落 false。
+    let dim_initial_verified = |dim: &crate::models::CoverageDimension| -> bool {
+        match dim.initial_signal.as_deref() {
+            Some("verified") => verified > 0,
+            Some("evidence") => evidence > 0,
             _ => false,
         }
     };
     let mut fallback_coverage = serde_json::Map::new();
     for dim in &active_profile.coverage_dimensions {
-        fallback_coverage.insert(dim.key.clone(), cov_state(dim_initial_verified(&dim.key)));
+        fallback_coverage.insert(dim.key.clone(), cov_state(dim_initial_verified(dim)));
     }
     let fallback = json!({
         "answeringMode": fallback_mode,
@@ -621,6 +622,12 @@ pub async fn build_operation_knowledge_completeness(
     // 见 [`build_coverage_anchors`]：DEFAULT 五维 anchor_hint 逐字复刻原 prompt 锚点 →
     // 销售域 prompt 字节等价；anchor_hint=None 的维度不产出锚点行。
     let coverage_anchors = build_coverage_anchors(&active_profile.coverage_dimensions);
+    // I：completeness prompt 三档 answeringMode 释义按 active profile 渲染（替代写死销售
+    // 释义）。三档 key 恒定（认知阶梯）；DEFAULT（answering_mode_profile=None）→ 三行与
+    // 改造前 prompt 字面量逐字一致 → 字节等价。
+    let answering_mode_rules = crate::agent::domain_profile::render_answering_mode_rules(
+        active_profile.answering_mode_profile.as_ref(),
+    );
     let user = format!(
         r#"请基于已验证知识切片与待审定切片输出 JSON：
 {{
@@ -633,9 +640,7 @@ pub async fn build_operation_knowledge_completeness(
 }}
 
 判断规则：
-- relationship_only: 没有足够 verified 知识支撑产品/服务事实，只能关系维护、澄清需求、收集信息。
-- product_safe: 可回答部分产品/服务能力，但报价、案例、效果或交付边界仍不足。
-- fully_supported: 能力、边界、证据类内容足够支撑常见产品事实问题。
+{answering_mode_rules}
 - 不要按固定标签硬判，必须从每条切片的 title / knowledgeType / businessContext / summary / body 的真实语义判断它到底覆盖了什么事实，不要只看标题里的关键词。**body 是切片正文，可验证的具体事实（数字/条款/能力陈述）通常住在 body 而非 summary——summary 读着像方法论不代表该切片没有客观事实，务必读 body 判断。**
 - 认知状态分类（对所有维度一视同仁，不偏向任何单一维度）：把每条切片对某业务维度的支撑程度归为四类之一——
   1. 已验证客观事实：verified 切片含可直接对客的具体事实（确定的数字/条款/边界/案例数据/效果数字等可被核验的客观信息）；
@@ -684,6 +689,12 @@ pub async fn build_operation_knowledge_completeness(
     // gaps 确定性下界：服务端已知客观缺口恒在，LLM 返回空 gaps 不得抹掉（见 [`merge_completeness_gaps`]）。
     let llm_gaps = json_string_list(&audit, "gaps").unwrap_or_default();
     let gaps = merge_completeness_gaps(fallback_gaps, llm_gaps);
+    // I：三档 answeringMode 中文标签随 active profile 回传（前端 AnsweringModeGauge 不再
+    // 硬编码销售标签）。DEFAULT → 写死销售标签，UI 不变。
+    let (am_label_relationship, am_label_product, am_label_full) =
+        crate::agent::domain_profile::answering_mode_labels(
+            active_profile.answering_mode_profile.as_ref(),
+        );
     Ok(json!({
         "totalChunks": total,
         "verifiedChunks": verified,
@@ -692,6 +703,11 @@ pub async fn build_operation_knowledge_completeness(
         "needsReviewChunks": needs_review,
         "pendingReview": pending,
         "answeringMode": answering_mode,
+        "answeringModeLabels": {
+            "relationship_only": am_label_relationship,
+            "product_safe": am_label_product,
+            "fully_supported": am_label_full
+        },
         "summary": json_string(&audit, "summary").unwrap_or_default(),
         "coverage": audit.get("coverage").cloned().unwrap_or_else(|| json!({})),
         "gaps": gaps
@@ -717,8 +733,8 @@ mod tests {
     #[test]
     fn coverage_skeleton_custom_dims_align_to_longest() {
         let dims = vec![
-            crate::models::CoverageDimension { key: "symptom".to_string(), display_name: "症状".to_string(), required: false, anchor_hint: None },
-            crate::models::CoverageDimension { key: "treatmentPlan".to_string(), display_name: "治疗方案".to_string(), required: false, anchor_hint: None },
+            crate::models::CoverageDimension { key: "symptom".to_string(), display_name: "症状".to_string(), required: false, anchor_hint: None, initial_signal: None },
+            crate::models::CoverageDimension { key: "treatmentPlan".to_string(), display_name: "治疗方案".to_string(), required: false, anchor_hint: None, initial_signal: None },
         ];
         let got = build_coverage_skeleton(&dims);
         // 最长 key = "treatmentPlan":（15 字符），symptom 行补到同宽。
@@ -741,9 +757,9 @@ mod tests {
     #[test]
     fn coverage_anchors_skips_none_hint() {
         let dims = vec![
-            crate::models::CoverageDimension { key: "a".to_string(), display_name: "A".to_string(), required: false, anchor_hint: Some("锚点A".to_string()) },
-            crate::models::CoverageDimension { key: "b".to_string(), display_name: "B".to_string(), required: false, anchor_hint: None },
-            crate::models::CoverageDimension { key: "c".to_string(), display_name: "C".to_string(), required: false, anchor_hint: Some("锚点C".to_string()) },
+            crate::models::CoverageDimension { key: "a".to_string(), display_name: "A".to_string(), required: false, anchor_hint: Some("锚点A".to_string()), initial_signal: None },
+            crate::models::CoverageDimension { key: "b".to_string(), display_name: "B".to_string(), required: false, anchor_hint: None, initial_signal: None },
+            crate::models::CoverageDimension { key: "c".to_string(), display_name: "C".to_string(), required: false, anchor_hint: Some("锚点C".to_string()), initial_signal: None },
         ];
         let got = build_coverage_anchors(&dims);
         assert_eq!(got, "  - a：锚点A\n  - c：锚点C");

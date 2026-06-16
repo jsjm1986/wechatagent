@@ -40,6 +40,27 @@ describe("parseCompleteness", () => {
     ]);
     expect(dims[0].label).toBe("能力");
   });
+
+  it("I：缺 answeringModeLabels 时三档回落内置销售标签", () => {
+    const v = parseCompleteness({});
+    expect(v.answeringModeLabels.relationship_only).toBe("仅关系维护");
+    expect(v.answeringModeLabels.product_safe).toBe("可安全讲产品");
+    expect(v.answeringModeLabels.fully_supported).toBe("完全支撑");
+  });
+
+  it("I：有 answeringModeLabels 时用本行业标签,缺的档逐档回落", () => {
+    const v = parseCompleteness({
+      answeringMode: "relationship_only",
+      answeringModeLabels: {
+        relationship_only: "纯陪伴倾听",
+        // product_safe 缺省 → 回落
+        fully_supported: "可深聊任何话题",
+      },
+    });
+    expect(v.answeringModeLabels.relationship_only).toBe("纯陪伴倾听");
+    expect(v.answeringModeLabels.product_safe).toBe("可安全讲产品"); // 逐档回落
+    expect(v.answeringModeLabels.fully_supported).toBe("可深聊任何话题");
+  });
 });
 
 describe("parseIntegrityReport", () => {

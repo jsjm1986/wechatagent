@@ -63,6 +63,7 @@ export function CockpitView({ onOpenReview, onOpenAutoVerify }: CockpitViewProps
           mode={completeness.answeringMode}
           needsReviewChunks={completeness.needsReviewChunks}
           summary={completeness.summary}
+          labels={completeness.answeringModeLabels}
         />
       </section>
 
