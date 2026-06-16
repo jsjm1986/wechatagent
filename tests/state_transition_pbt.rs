@@ -66,9 +66,13 @@ fn expected_allow(from: Option<&str>, to: &str) -> bool {
         .filter_map(|item| item.as_document())
         .find(|state| state.get_str("key").ok() == Some(to));
     let Some(target) = target else {
-        // 目标不存在：check_state_transition 返回 None（target 取不到也直接 None）。
-        // 真实实现里 `find` 失败时函数 early-return None，等同于"允许"。
-        return true;
+        // 修复（问题 E）：目标不存在 = 非法迁移目标，引擎 fail-closed 拦截（返回
+        // Some），故闭式参考此处返回 false（不允许）。此前 `?` 在 target-miss 时
+        // early-return None（=允许）是 fail-open 漏放，会让 LLM 输出的未知 customer_stage
+        // 经 C2 写入「幻影 operation_state」并旁路 policy enforcement。注：本 PBT 主性质
+        // 的 `to` 只从 STATE_KEYS 取（已知态），不会命中本分支；保持与引擎一致以防未来
+        // 扩展 to 取值域。
+        return false;
     };
     if target.get_bool("allowFromAny").unwrap_or(false) {
         return true;

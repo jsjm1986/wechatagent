@@ -837,6 +837,17 @@ impl PlannerStageConfig {
             self.terminal_stages.contains(stage)
         }
     }
+
+    /// 有效终态集合（供 MongoDB 端 `$nin` 预筛）：字典非空用字典，否则回落写死
+    /// [`TERMINAL_STAGES`]。与 [`Self::is_terminal_stage`] 同源，保证 DB 预筛的终态
+    /// 排除与内存判定一致（换行业声明了不同终态时 DB 不再按销售终态误筛）。
+    fn effective_terminal_stages(&self) -> Vec<String> {
+        if self.terminal_stages.is_empty() {
+            TERMINAL_STAGES.iter().map(|s| s.to_string()).collect()
+        } else {
+            self.terminal_stages.iter().cloned().collect()
+        }
+    }
 }
 
 /// universal-domain-adaptation H8：从**已加载的** profile + taxonomy 缓存构造
@@ -901,26 +912,56 @@ pub(crate) fn resolve_operation_mode(
         .unwrap_or_else(|| profile_mode.clone())
 }
 
-/// MongoDB 端筛 managed + 非冷却 + 非终状态 + customer_stage_updated_at 老于阈值
+/// MongoDB 端筛 managed + 非冷却 + 非终状态 + 停滞维度计时戳老于阈值
 /// + last_inbound_at 不太近（avoid 与 silent 段重叠）。
+///
+/// universal-domain-adaptation 修复（问题 B）：**计时维度 dotted-key 动态化**。
+/// 此前 DB 预筛写死 `domain_attributes.customer_stage_updated_at`，而内存判定
+/// （[`stage_stagnation_passes_in_memory`] / [`contact_stagnation_updated_at`]）已按可配
+/// `stagnation_dimension` 计时并对缺失回落旧 `customer_stage_updated_at`。二者不一致时：
+/// 换了 `stagnation_dimension` 的行业，存量 contact（新维度计时戳新鲜、但 customer_stage
+/// 计时戳老）会被 DB `$lt` 预筛**静默排除**，主动触达冻结——内存回落救不了被预筛剔除的
+/// 对象。修复：①计时字段按 `stagnation_dimension` 拼 `<dim>_updated_at`，并以 `$or` 回落
+/// `customer_stage_updated_at < before`（镜像内存层 57-64 回落，覆盖存量无新字段的 contact）；
+/// ②终态 `$nin` 用 [`PlannerStageConfig::effective_terminal_stages`]（换行业终态集不同也对齐）。
+/// DEFAULT（dim=customer_stage、终态=销售三态）→ `<dim>_updated_at`==`customer_stage_updated_at`
+/// 且 `$or` 两支同字段、终态集逐字等价 → 与改造前预筛行为字节等价。
+/// `customer_stage: {$exists}` 保留：funnel 段语义上要求 contact 有阶段（内存层 936 同款要求），
+/// 纯非阶段行业经 `funnel.enabled=false` 关闭本段，不依赖此预筛排除。
 pub(crate) fn stage_stagnation_candidate_filter(
     workspace_id: &str,
     account_id: &str,
     stage_updated_before: DateTime,
     inbound_before: DateTime,
+    stage_config: &PlannerStageConfig,
 ) -> Document {
+    let terminal_stages = stage_config.effective_terminal_stages();
+    let dim = stage_config.stagnation_dimension.as_str();
+    let dim_updated_key = format!("domain_attributes.{dim}_updated_at");
+    // 计时戳老于阈值：优先按配置维度的 <dim>_updated_at；该字段缺失（换维度后存量
+    // contact 尚无新字段）时回落旧 customer_stage_updated_at < before，与内存回落对齐，
+    // 避免存量 contact 被预筛静默剔除。DEFAULT dim=customer_stage 时两支同字段、等价。
+    let stagnation_timing_or = vec![
+        doc! { dim_updated_key.as_str(): { "$lt": stage_updated_before } },
+        doc! {
+            dim_updated_key.as_str(): { "$exists": false },
+            "domain_attributes.customer_stage_updated_at": { "$lt": stage_updated_before },
+        },
+    ];
     doc! {
         "workspace_id": workspace_id,
         "account_id": account_id,
         "agent_status": "managed",
-        "domain_attributes.customer_stage": { "$exists": true, "$ne": null, "$nin": TERMINAL_STAGES },
-        "domain_attributes.customer_stage_updated_at": { "$lt": stage_updated_before },
-        "last_inbound_at": { "$lt": inbound_before },
-        "$or": [
-            { "cooldown_until": { "$exists": false } },
-            { "cooldown_until": null },
-            { "cooldown_until": { "$lt": DateTime::now() } },
+        "domain_attributes.customer_stage": { "$exists": true, "$ne": null, "$nin": &terminal_stages },
+        "$and": [
+            { "$or": stagnation_timing_or },
+            { "$or": [
+                { "cooldown_until": { "$exists": false } },
+                { "cooldown_until": null },
+                { "cooldown_until": { "$lt": DateTime::now() } },
+            ]},
         ],
+        "last_inbound_at": { "$lt": inbound_before },
     }
 }
 
@@ -1196,6 +1237,7 @@ async fn scan_stage_stagnation(state: &AppState) -> anyhow::Result<()> {
         &account_id,
         stage_updated_before,
         inbound_before,
+        &stage_config,
     );
     let mut cursor = state.db.contacts().find(filter, None).await?;
 
@@ -1748,17 +1790,64 @@ mod tests {
 
     #[test]
     fn stage_stagnation_filter_includes_expected_keys() {
-        let filter = stage_stagnation_candidate_filter("ws", "acc", dt(1_000), dt(2_000));
+        let filter = stage_stagnation_candidate_filter("ws", "acc", dt(1_000), dt(2_000), &cfg());
         assert!(filter.contains_key("workspace_id"));
         assert!(filter.contains_key("agent_status"));
-        // customer_stage / customer_stage_updated_at 存在于 domain_attributes 容器，
-        // 不在文档顶层。过滤器必须用 dotted-key 查 domain_attributes.*，否则真实库
-        // 筛空、stage_stagnation 段整段空转。
+        // customer_stage 存在于 domain_attributes 容器，不在文档顶层。过滤器必须用
+        // dotted-key 查 domain_attributes.*，否则真实库筛空、stage_stagnation 段整段空转。
         assert!(filter.contains_key("domain_attributes.customer_stage"));
-        assert!(filter.contains_key("domain_attributes.customer_stage_updated_at"));
         assert!(!filter.contains_key("customer_stage"));
         assert!(!filter.contains_key("customer_stage_updated_at"));
         assert!(filter.contains_key("last_inbound_at"));
+        // DEFAULT dim=customer_stage：计时字段经动态拼接仍是 customer_stage_updated_at，
+        // 现位于 $and→$or 内（与 cooldown $or 组合）。
+        let dbg = format!("{filter:?}");
+        assert!(
+            dbg.contains("domain_attributes.customer_stage_updated_at"),
+            "DEFAULT 计时字段应仍为 customer_stage_updated_at：{dbg}"
+        );
+    }
+
+    /// 修复 B：换 stagnation_dimension 的行业，DB 预筛计时字段动态拼为 <dim>_updated_at，
+    /// 并以 $or 回落 customer_stage_updated_at（覆盖存量无新字段的 contact），避免被静默剔除。
+    #[test]
+    fn stage_stagnation_filter_uses_configured_stagnation_dimension() {
+        let c = PlannerStageConfig {
+            stage_weights: std::collections::HashMap::new(),
+            intent_weights: std::collections::HashMap::new(),
+            terminal_stages: std::collections::HashSet::new(),
+            stagnation_dimension: "relationship_closeness".to_string(),
+        };
+        let filter = stage_stagnation_candidate_filter("ws", "acc", dt(1_000), dt(2_000), &c);
+        let dbg = format!("{filter:?}");
+        // 计时字段按配置维度拼接。
+        assert!(
+            dbg.contains("domain_attributes.relationship_closeness_updated_at"),
+            "计时字段未按配置维度拼接：{dbg}"
+        );
+        // $or 回落到旧 customer_stage_updated_at（镜像内存层回落，救存量 contact）。
+        assert!(
+            dbg.contains("domain_attributes.customer_stage_updated_at"),
+            "缺 customer_stage_updated_at 回落支：{dbg}"
+        );
+    }
+
+    /// 修复 B：换行业声明了不同终态集时，DB 预筛 $nin 用配置终态集，不再按销售三态误筛。
+    #[test]
+    fn stage_stagnation_filter_uses_configured_terminal_stages() {
+        let mut terminal = std::collections::HashSet::new();
+        terminal.insert("relationship_ended".to_string());
+        let c = PlannerStageConfig {
+            stage_weights: std::collections::HashMap::new(),
+            intent_weights: std::collections::HashMap::new(),
+            terminal_stages: terminal,
+            stagnation_dimension: "customer_stage".to_string(),
+        };
+        let filter = stage_stagnation_candidate_filter("ws", "acc", dt(1_000), dt(2_000), &c);
+        let dbg = format!("{filter:?}");
+        assert!(dbg.contains("relationship_ended"), "终态集未用配置值：{dbg}");
+        // 销售默认终态不再写死出现。
+        assert!(!dbg.contains("customer_success"), "不应残留写死销售终态：{dbg}");
     }
 
     #[test]

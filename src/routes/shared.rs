@@ -591,6 +591,28 @@ pub(super) async fn apply_contact_changes(
         set_doc.insert("follow_up_policy", value);
     }
     if let Some(value) = doc_get_string(changes, "operationState") {
+        // 修复（问题 F）：admin 手改 operation_state 也必须过状态机迁移闸，与 AI 决策
+        // 路径（gateway C2）同一道 check_state_transition。此前 admin 直写不校验，可置入
+        // 与 customer_stage / 状态机矛盾的值（甚至状态机里不存在的态），造成 planner（读
+        // customer_stage）与 policy enforcement（读 operation_state）口径漂移，且休眠
+        // contact 无 AI 消息触发 C2 自愈时漂移无限期。admin 是交互操作 → 非法迁移**硬拒**
+        // （BadRequest），让操作者立即看到而非静默吞。domain_config=None（未配状态机）时
+        // check_state_transition fail-open，行为不变。
+        let domain_config = agent::load_user_operation_domain_config_for_contact(
+            state,
+            &contact.workspace_id,
+            &contact.wxid,
+        )
+        .await?;
+        if let Some(reason) = agent::check_state_transition(
+            domain_config.as_ref(),
+            contact.operation_state.as_deref(),
+            &value,
+        ) {
+            return Err(AppError::BadRequest(format!(
+                "非法的 operation_state 迁移：{reason}（admin 手改也须符合状态机；如需任意设值请先调整状态机定义）"
+            )));
+        }
         set_doc.insert("operation_state", value);
         set_doc.insert("operation_state_updated_at", DateTime::now());
     }
