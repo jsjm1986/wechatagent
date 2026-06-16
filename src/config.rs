@@ -70,6 +70,18 @@ pub struct AppConfig {
     /// M2 Strategic Planner：比此值更近的 inbound 跳过 stage_stagnation emit。
     /// 默认 24 小时——避免用户刚说过话还没轮到推进就被 Planner 强催。
     pub strategic_planner_stage_stagnation_recent_inbound_hours: i64,
+    /// §3.7 Strategic Planner：`scan_calendar` 主动关怀的临近窗口（天）。纪念日/生日
+    /// 前几天起就允许触达。默认 1（当天 ± 提前 1 天）。`CalendarMode.lookahead_days`
+    /// 可 per-profile 覆盖。
+    pub strategic_planner_calendar_lookahead_days: i64,
+    /// §3.7 Strategic Planner：`scan_calendar` 的独立每日 emit 上限（比常规
+    /// `strategic_planner_daily_emit_cap` 更克制，防早安晚安/纪念日触达变骚扰）。
+    /// 默认 3。`CalendarMode.daily_cap` 可 per-profile 覆盖。
+    pub strategic_planner_calendar_daily_cap: i64,
+    /// §3.7 Strategic Planner：`scan_calendar` 计算「今日」用的运营方时区固定偏移（小时）。
+    /// planner 是 workspace 全局扫描、不构造 per-contact runtime，故在此取全局偏移（与
+    /// `quiet_hours` 同款固定偏移哲学，不依赖部署宿主时区）。默认 +8（中国）。
+    pub strategic_planner_calendar_tz_offset_hours: i32,
     /// M3 Strategic Planner：反馈环回看窗口小时数。
     /// 在此窗口内反查该 contact 的 `agent_run_logs.final_review_status`，
     /// 计算 block-rate；默认 24。
@@ -403,6 +415,21 @@ impl AppConfig {
             strategic_planner_stage_stagnation_recent_inbound_hours: env_or(
                 "STRATEGIC_PLANNER_STAGE_STAGNATION_RECENT_INBOUND_HOURS",
                 "24",
+            )
+            .parse()?,
+            strategic_planner_calendar_lookahead_days: env_or(
+                "STRATEGIC_PLANNER_CALENDAR_LOOKAHEAD_DAYS",
+                "1",
+            )
+            .parse()?,
+            strategic_planner_calendar_daily_cap: env_or(
+                "STRATEGIC_PLANNER_CALENDAR_DAILY_CAP",
+                "3",
+            )
+            .parse()?,
+            strategic_planner_calendar_tz_offset_hours: env_or(
+                "STRATEGIC_PLANNER_CALENDAR_TZ_OFFSET_HOURS",
+                "8",
             )
             .parse()?,
             strategic_planner_block_rate_window_hours: env_or(

@@ -19,7 +19,7 @@ use futures::TryStreamExt;
 use mongodb::bson::{doc, DateTime, Document};
 use tokio::time::sleep;
 
-use crate::models::{AgentTask, CommitmentRepr, Contact};
+use crate::models::{AgentTask, AnniversaryEntry, CommitmentRepr, Contact};
 use crate::routes::AppState;
 
 /// 旧 `customer_stage` 字段已迁入 `Contact.domain_attributes`。这两个 helper 把
@@ -94,6 +94,9 @@ pub async fn run_strategic_planner(state: AppState) {
         if let Err(error) = scan_stage_stagnation(&state).await {
             tracing::error!(error = %error, "strategic planner stage_stagnation scan failed");
         }
+        if let Err(error) = scan_calendar(&state).await {
+            tracing::error!(error = %error, "strategic planner calendar scan failed");
+        }
         sleep(Duration::from_secs(
             state.config.strategic_planner_interval_seconds,
         ))
@@ -109,6 +112,7 @@ pub async fn tick(state: &AppState) -> anyhow::Result<()> {
     scan_silent(state).await?;
     scan_commitments(state).await?;
     scan_stage_stagnation(state).await?;
+    scan_calendar(state).await?;
     Ok(())
 }
 
@@ -122,6 +126,7 @@ const EMIT_EVENT_KINDS: &[&str] = &[
     "strategic_planner_commitment_overdue",
     "strategic_planner_commitment_imminent",
     "strategic_planner_stage_stagnation",
+    "strategic_planner_calendar_care",
 ];
 
 /// 当日已 emit 计数（跨三段汇总）。daily cap 在 tick 开始时一次性算余额。
@@ -1356,6 +1361,291 @@ async fn scan_stage_stagnation(state: &AppState) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// ---------------------------------------------------------------------------
+/// 段 4：calendar（§3.7 主动情绪关怀）
+/// ---------------------------------------------------------------------------
+
+/// 判定一条结构化纪念日是否落在「今日 ~ 今日+lookahead」窗口内（含两端）。
+///
+/// **纯函数、零文本解析**（agent-first：日期由 consolidator LLM 产出结构化字段，
+/// 这里只做客观数值比较）。入参 `today_year/today_month/today_day` 为运营方时区下的
+/// 今日；`lookahead_days >= 0`。
+///
+/// - `recurring=true`（"MM-DD"）：只比月日，逐日向后看 lookahead 天，任一天命中即 true；
+///   跨年（12-31 + lookahead 落到次年 01-01）与闰年 02-29 由"按月日集合匹配"自然覆盖。
+/// - `recurring=false`（"YYYY-MM-DD"）：比完整年月日，落在 [today, today+lookahead] 内即 true。
+/// - 解析失败（旧库纯字符串条目 / 非法日期）→ false（向后兼容，不 panic）。
+pub(crate) fn anniversary_due_today(
+    entry: &AnniversaryEntry,
+    today_year: i32,
+    today_month: u32,
+    today_day: u32,
+    lookahead_days: i64,
+) -> bool {
+    let lookahead = lookahead_days.max(0);
+    if entry.recurring {
+        let Some((m, d)) = parse_month_day(&entry.date) else {
+            return false;
+        };
+        // 逐日向后看：把今日起 lookahead+1 天的 (月,日) 集合算出来，命中即 true。
+        // 用 epoch 天推进，自然跨月/跨年；闰年 02-29 仅在该日真实存在时落入集合。
+        (0..=lookahead).any(|offset| {
+            let (_, om, od) = civil_from_offset(today_year, today_month, today_day, offset);
+            om == m && od == d
+        })
+    } else {
+        let Some((y, m, d)) = parse_full_date(&entry.date) else {
+            return false;
+        };
+        (0..=lookahead).any(|offset| {
+            let (oy, om, od) = civil_from_offset(today_year, today_month, today_day, offset);
+            oy == y && om == m && od == d
+        })
+    }
+}
+
+/// 解析 "MM-DD" → (month, day)，范围合法才返回。
+fn parse_month_day(s: &str) -> Option<(u32, u32)> {
+    let parts: Vec<&str> = s.trim().split('-').collect();
+    if parts.len() != 2 {
+        return None;
+    }
+    let m: u32 = parts[0].parse().ok()?;
+    let d: u32 = parts[1].parse().ok()?;
+    if (1..=12).contains(&m) && (1..=31).contains(&d) {
+        Some((m, d))
+    } else {
+        None
+    }
+}
+
+/// 解析 "YYYY-MM-DD" → (year, month, day)，范围合法才返回。
+fn parse_full_date(s: &str) -> Option<(i32, u32, u32)> {
+    let parts: Vec<&str> = s.trim().split('-').collect();
+    if parts.len() != 3 {
+        return None;
+    }
+    let y: i32 = parts[0].parse().ok()?;
+    let m: u32 = parts[1].parse().ok()?;
+    let d: u32 = parts[2].parse().ok()?;
+    if (1..=12).contains(&m) && (1..=31).contains(&d) {
+        Some((y, m, d))
+    } else {
+        None
+    }
+}
+
+/// 把 (year, month, day) 加上 `offset` 天，返回结果的 (year, month, day)。
+/// 经 `chrono::NaiveDate` 做日历推进（正确处理月长 / 闰年 / 跨年）；非法起始日回退原值。
+fn civil_from_offset(year: i32, month: u32, day: u32, offset: i64) -> (i32, u32, u32) {
+    use chrono::Datelike;
+    match chrono::NaiveDate::from_ymd_opt(year, month, day) {
+        Some(date) => {
+            let shifted = date + chrono::Duration::days(offset);
+            (shifted.year(), shifted.month(), shifted.day())
+        }
+        None => (year, month, day),
+    }
+}
+
+/// 运营方时区（固定偏移）下的今日 (year, month, day)。与 quiet_hours 同款：用 epoch
+/// 毫秒 + 偏移的整数运算，不依赖部署宿主时区。
+fn today_in_offset(now_utc_ms: i64, tz_offset_hours: i32) -> (i32, u32, u32) {
+    use chrono::Datelike;
+    let shifted_ms = now_utc_ms + (tz_offset_hours as i64) * 3_600_000;
+    let secs = shifted_ms.div_euclid(1000);
+    let date = chrono::DateTime::<chrono::Utc>::from_timestamp(secs, 0)
+        .map(|dt| dt.date_naive())
+        .unwrap_or_else(|| chrono::Utc::now().date_naive());
+    (date.year(), date.month(), date.day())
+}
+
+/// §3.7：从一条 contact 的 memory_card.extra 里某个 date_dimension 槽解析出结构化
+/// 纪念日列表。解析失败 / 旧字符串条目逐个跳过（向后兼容），不报错。
+fn anniversaries_from_extra(extra: &Document, key: &str) -> Vec<AnniversaryEntry> {
+    let Ok(arr) = extra.get_array(key) else {
+        return Vec::new();
+    };
+    arr.iter()
+        .filter_map(|item| {
+            mongodb::bson::from_bson::<AnniversaryEntry>(item.clone()).ok()
+        })
+        .filter(|e| !e.date.trim().is_empty())
+        .collect()
+}
+
+async fn scan_calendar(state: &AppState) -> anyhow::Result<()> {
+    let workspace_id = state.config.default_workspace_id.clone();
+    let account_id = state.config.default_account_id.clone();
+    let now = DateTime::now();
+    // §3.7：每 tick 加载一次 active profile，取行业默认范式 + date_dimension 维度。
+    let profile =
+        crate::agent::domain_profile::load_active_domain_profile(&state.db, &workspace_id).await;
+    let profile_mode = profile.operation_mode.clone();
+    // 行业默认 calendar 关 → 整段对该行业 no-op（销售域天然跳过，零 DB 扫描）。
+    // contact override 仍可在下方逐个开启，故这里只在「行业默认关 且 无任何 contact
+    // override 开」时整体短路——但 override 在 contact 上、需逐条看，故不在此提前 return；
+    // 改为下方逐 contact resolve 后 enabled 判定。仅当行业默认关时，仍遍历是为了尊重
+    // contact override；但这违背"销售域零扰动"——销售域 contact 默认无 override → enabled
+    // 恒 false → 不 emit。为避免销售域无谓全表扫描，这里若行业默认关 **且** 该 workspace
+    // 无 date_dimension 维度，直接短路（销售 DEFAULT 命中此短路 → 完全零扰动）。
+    let date_dims: Vec<String> = profile
+        .memory_dimensions
+        .iter()
+        .filter(|d| d.date_dimension)
+        .map(|d| d.key.clone())
+        .collect();
+    if date_dims.is_empty() {
+        // 无任何带日期语义的记忆维度 → 没有数据源，整段 no-op（DEFAULT 销售域命中）。
+        return Ok(());
+    }
+
+    let tz_offset = state.config.strategic_planner_calendar_tz_offset_hours;
+    let (today_y, today_m, today_d) = today_in_offset(now.timestamp_millis(), tz_offset);
+    let global_lookahead = state.config.strategic_planner_calendar_lookahead_days;
+    let global_calendar_cap = state.config.strategic_planner_calendar_daily_cap;
+
+    let filter = calendar_candidate_filter(&workspace_id, &account_id);
+    let mut cursor = state.db.contacts().find(filter, None).await?;
+
+    // calendar 走独立低频 cap（与常规 daily cap 不同口径）；但 emit 事件仍计入
+    // EMIT_EVENT_KINDS，故跨段汇总的 daily cap 也是上界。这里取两者更紧的约束。
+    let regular_cap = state.config.strategic_planner_daily_emit_cap;
+    let already_emitted_today =
+        count_today_emit_events(state, &workspace_id, &account_id, now).await?;
+    let mut counters = ScanCounters::default();
+    let mut calendar_emitted_today: i64 = 0;
+
+    while let Some(contact) = cursor.try_next().await? {
+        counters.scanned += 1;
+        let mode = resolve_operation_mode(&contact, &profile_mode);
+        // calendar 关（DEFAULT / 销售 contact）→ 跳过。仅情感等开了 calendar 的范式继续。
+        if !mode.calendar.enabled {
+            continue;
+        }
+        let effective_lookahead = mode.calendar.lookahead_days.unwrap_or(global_lookahead);
+        let effective_cap = mode.calendar.daily_cap.unwrap_or(global_calendar_cap);
+        // 该 contact 的 memory_card（只读，不 seed / 不写）。无记忆 → 跳过。
+        let Some(memory) = state
+            .db
+            .operating_memories()
+            .find_one(
+                doc! {
+                    "workspace_id": &contact.workspace_id,
+                    "account_id": &contact.account_id,
+                    "contact_wxid": &contact.wxid,
+                },
+                None,
+            )
+            .await?
+        else {
+            continue;
+        };
+        let card = crate::agent::effective_memory_card(&memory);
+        // 收集本 contact 今日/临近命中的纪念日（跨所有 date_dimension 槽）。
+        let mut due_labels: Vec<String> = Vec::new();
+        for key in &date_dims {
+            for entry in anniversaries_from_extra(&card.extra, key) {
+                if anniversary_due_today(&entry, today_y, today_m, today_d, effective_lookahead) {
+                    due_labels.push(entry.label.clone());
+                }
+            }
+        }
+        if due_labels.is_empty() {
+            continue;
+        }
+        if has_pending_follow_up(state, &contact).await? {
+            continue;
+        }
+        // 双重 cap：calendar 专属低频 cap + 跨段汇总 daily cap（取更紧的）。
+        if calendar_emitted_today >= effective_cap
+            || already_emitted_today + calendar_emitted_today >= regular_cap
+        {
+            write_event(
+                state,
+                &account_id,
+                None,
+                "strategic_planner_calendar_capped",
+                "capped",
+                &format!(
+                    "calendar care 触达达上限（calendar_cap={effective_cap}, daily_cap={regular_cap}）"
+                ),
+                Some(doc! {
+                    "scanned": counters.scanned,
+                    "emitted": counters.emitted,
+                    "calendarCap": effective_cap,
+                    "dailyEmitCap": regular_cap,
+                }),
+            )
+            .await?;
+            break;
+        }
+        if let Some(payload) = should_skip_for_block_rate(state, &contact, now).await? {
+            write_backoff_event(state, "calendar", &contact, payload).await?;
+            continue;
+        }
+        let labels_joined = due_labels.join("、");
+        emit_planner_follow_up(
+            state,
+            &contact,
+            format!("Planner: calendar_care 今日/临近纪念日：{labels_joined}"),
+            now,
+        )
+        .await?;
+        write_event(
+            state,
+            &contact.account_id,
+            Some(&contact.wxid),
+            "strategic_planner_calendar_care",
+            "emitted",
+            &format!("Planner: calendar_care emitted（{labels_joined}）"),
+            Some(doc! {
+                "source": "strategic_planner",
+                "labels": &due_labels,
+                "lookaheadDays": effective_lookahead,
+            }),
+        )
+        .await?;
+        counters.emitted += 1;
+        calendar_emitted_today += 1;
+    }
+
+    write_event(
+        state,
+        &account_id,
+        None,
+        "strategic_planner_calendar_tick",
+        "ok",
+        &format!(
+            "strategic planner calendar tick: scanned {}, emitted {}",
+            counters.scanned, counters.emitted
+        ),
+        Some(doc! {
+            "scanned": counters.scanned,
+            "emitted": counters.emitted,
+            "calendarDailyCap": global_calendar_cap,
+            "calendarLookaheadDays": global_lookahead,
+        }),
+    )
+    .await?;
+    Ok(())
+}
+
+/// MongoDB 端粗筛：workspace + account + managed + 非冷却。逐 contact 的 calendar.enabled
+/// 短路 + 纪念日今日匹配在 Rust 侧做（与其它扫描器同款"DB 粗筛 + 内存精筛"）。
+pub(crate) fn calendar_candidate_filter(workspace_id: &str, account_id: &str) -> Document {
+    doc! {
+        "workspace_id": workspace_id,
+        "account_id": account_id,
+        "agent_status": "managed",
+        "$or": [
+            { "cooldown_until": { "$exists": false } },
+            { "cooldown_until": null },
+            { "cooldown_until": { "$lt": DateTime::now() } },
+        ],
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2259,5 +2549,111 @@ mod tests {
             crate::models::OperationMode::default().quiet_hours.enabled_override,
             None
         );
+    }
+
+    // ── §3.7 scan_calendar：CalendarMode 默认 + anniversary_due_today 纯函数 ──
+
+    fn anni(label: &str, date: &str, recurring: bool) -> AnniversaryEntry {
+        AnniversaryEntry { label: label.to_string(), date: date.to_string(), recurring }
+    }
+
+    /// 根护栏：CalendarMode 默认 enabled=false（主动情绪触达销售域绝不默认开）。
+    #[test]
+    fn calendar_mode_default_disabled() {
+        assert!(!crate::models::CalendarMode::default().enabled);
+        assert_eq!(crate::models::CalendarMode::default().lookahead_days, None);
+        assert_eq!(crate::models::CalendarMode::default().daily_cap, None);
+        // OperationMode::default() 内含的 calendar 也是关的（DEFAULT 销售域零扰动）。
+        assert!(!crate::models::OperationMode::default().calendar.enabled);
+    }
+
+    /// recurring 纪念日：今日命中（lookahead=0 当天）。
+    #[test]
+    fn anniversary_recurring_hits_today() {
+        // 今日 2026-03-15，生日 03-15，lookahead 0 → 命中。
+        assert!(anniversary_due_today(&anni("她生日", "03-15", true), 2026, 3, 15, 0));
+        // 非今日（03-16）→ 不命中。
+        assert!(!anniversary_due_today(&anni("她生日", "03-16", true), 2026, 3, 15, 0));
+    }
+
+    /// recurring 纪念日：lookahead 窗口内命中（提前 N 天）。
+    #[test]
+    fn anniversary_recurring_hits_within_lookahead() {
+        // 今日 03-13，生日 03-15，lookahead 2 → 命中（03-13→03-15 含端点）。
+        assert!(anniversary_due_today(&anni("她生日", "03-15", true), 2026, 3, 13, 2));
+        // lookahead 1 → 03-15 超出 [03-13, 03-14] → 不命中。
+        assert!(!anniversary_due_today(&anni("她生日", "03-15", true), 2026, 3, 13, 1));
+    }
+
+    /// recurring 跨年边界：今日 12-31，lookahead 让窗口跨到次年 01-01。
+    #[test]
+    fn anniversary_recurring_crosses_year_boundary() {
+        // 今日 2026-12-31，纪念日 01-01，lookahead 1 → 窗口 {12-31, 01-01} 含 01-01 → 命中。
+        assert!(anniversary_due_today(&anni("元旦纪念", "01-01", true), 2026, 12, 31, 1));
+        // lookahead 0 → 只看 12-31 → 不命中 01-01。
+        assert!(!anniversary_due_today(&anni("元旦纪念", "01-01", true), 2026, 12, 31, 0));
+    }
+
+    /// recurring 闰年 02-29：闰年当天命中。
+    #[test]
+    fn anniversary_recurring_leap_day() {
+        // 2024 是闰年，今日 02-29、纪念日 02-29 → 命中。
+        assert!(anniversary_due_today(&anni("特殊日", "02-29", true), 2024, 2, 29, 0));
+    }
+
+    /// one-off 完整日期：年月日全等才命中，往年同月日不命中。
+    #[test]
+    fn anniversary_one_off_matches_full_date() {
+        // 一次性事件 2026-03-15，今日 2026-03-15 → 命中。
+        assert!(anniversary_due_today(&anni("签约一周年", "2026-03-15", false), 2026, 3, 15, 0));
+        // 次年同月日（2027-03-15）→ one-off 不循环 → 不命中。
+        assert!(!anniversary_due_today(&anni("签约一周年", "2026-03-15", false), 2027, 3, 15, 0));
+    }
+
+    /// 向后兼容 / 容错：非法或旧纯文本日期 → 不命中（不 panic）。
+    #[test]
+    fn anniversary_malformed_date_is_not_due() {
+        assert!(!anniversary_due_today(&anni("旧条目", "下个月15号", true), 2026, 3, 15, 5));
+        assert!(!anniversary_due_today(&anni("空", "", true), 2026, 3, 15, 5));
+        assert!(!anniversary_due_today(&anni("越界月", "13-40", true), 2026, 3, 15, 5));
+    }
+
+    /// extra 容器解析：结构化对象被读出，旧纯字符串条目被跳过（向后兼容）。
+    #[test]
+    fn anniversaries_from_extra_parses_objects_skips_strings() {
+        let mut extra = Document::new();
+        extra.insert(
+            "anniversaries",
+            mongodb::bson::bson!([
+                { "label": "她生日", "date": "03-15", "recurring": true },
+                "旧的自由文本纪念日条目",
+                { "label": "相识纪念", "date": "2025-06-01", "recurring": false },
+            ]),
+        );
+        let parsed = anniversaries_from_extra(&extra, "anniversaries");
+        assert_eq!(parsed.len(), 2, "两个结构化对象被读出，纯字符串跳过");
+        assert_eq!(parsed[0].label, "她生日");
+        assert_eq!(parsed[1].date, "2025-06-01");
+        // 槽不存在 → 空。
+        assert!(anniversaries_from_extra(&extra, "nonexistent").is_empty());
+    }
+
+    /// AnniversaryEntry BSON round-trip（consolidator 写 ↔ scan_calendar 读 契约稳定）。
+    #[test]
+    fn anniversary_entry_bson_round_trip() {
+        let entry = anni("结婚纪念日", "10-01", true);
+        let bson = mongodb::bson::to_bson(&entry).unwrap();
+        let back: AnniversaryEntry = mongodb::bson::from_bson(bson).unwrap();
+        assert_eq!(entry, back);
+    }
+
+    /// today_in_offset：+8 时区换算（UTC 16:00 → 北京次日 00:00）。
+    #[test]
+    fn today_in_offset_china_plus8() {
+        let utc_ms = mongodb::bson::DateTime::parse_rfc3339_str("2026-03-14T16:00:00Z")
+            .unwrap()
+            .timestamp_millis();
+        // UTC 03-14 16:00 + 8h = 北京 03-15 00:00 → 今日 03-15。
+        assert_eq!(today_in_offset(utc_ms, 8), (2026, 3, 15));
     }
 }

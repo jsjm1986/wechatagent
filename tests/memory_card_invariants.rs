@@ -305,6 +305,7 @@ fn custom_memory_dimension_caps_are_enforced() {
             is_core: false,
             prompt_hint: None,
             candidate_type: true,
+            date_dimension: false,
         },
         MemoryDimension {
             key: "anniversaries".to_string(),
@@ -313,6 +314,7 @@ fn custom_memory_dimension_caps_are_enforced() {
             is_core: false,
             prompt_hint: None,
             candidate_type: false,
+            date_dimension: true,
         },
     ];
     let result = compact_memory_card_with_dimensions(&card, None, &[], &dims);
@@ -345,6 +347,7 @@ fn emotional_companion_profile_memory_dimensions_end_to_end() {
             is_core: true,
             prompt_hint: Some("记录 ta 近期情绪起伏与触发事件，供下次主动关心".to_string()),
             candidate_type: true,
+            date_dimension: false,
         },
         MemoryDimension {
             key: "anniversaries".to_string(),
@@ -353,6 +356,7 @@ fn emotional_companion_profile_memory_dimensions_end_to_end() {
             is_core: true,
             prompt_hint: Some("生日 / 相识纪念 / 重要日子".to_string()),
             candidate_type: false,
+            date_dimension: true,
         },
         MemoryDimension {
             key: "importantEvents".to_string(),
@@ -361,6 +365,7 @@ fn emotional_companion_profile_memory_dimensions_end_to_end() {
             is_core: false,
             prompt_hint: None,
             candidate_type: true,
+            date_dimension: false,
         },
     ];
 
