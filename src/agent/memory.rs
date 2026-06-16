@@ -856,6 +856,14 @@ fn render_memory_dimensions_guidance(dimensions: &[crate::models::MemoryDimensio
             lines.push_str("：");
             lines.push_str(hint);
         }
+        // §3.7：带日期语义的槽要求 LLM 输出**结构化对象**而非纯文本，供 scan_calendar 做
+        // 客观日期匹配（agent-first：日期由你结构化抽取，系统不解析"下个月15号"这类文本）。
+        if dim.date_dimension {
+            lines.push_str(&format!(
+                "。**该槽每条必须是结构化对象** {{\"label\": \"事件名（如 她生日 / 相识纪念日）\", \"date\": \"每年循环填 MM-DD（如 03-15），一次性事件填完整 YYYY-MM-DD\", \"recurring\": true/false}}，不要写成自由文本；日期只填你从对话里确认到的、能定位到具体月日的信息，拿不准月日的不要塞进 {key}。",
+                key = dim.key
+            ));
+        }
     }
     lines
 }
@@ -1950,6 +1958,7 @@ mod p1_5_occ_tests {
                 is_core: true,
                 prompt_hint: Some("记录 ta 近期的情绪起伏与触发事件".to_string()),
                 candidate_type: true,
+                date_dimension: false,
             },
             crate::models::MemoryDimension {
                 key: "anniversaries".to_string(),
@@ -1958,6 +1967,7 @@ mod p1_5_occ_tests {
                 is_core: false,
                 prompt_hint: None,
                 candidate_type: false,
+                date_dimension: true,
             },
         ];
         let out = super::render_memory_dimensions_guidance(&dims);

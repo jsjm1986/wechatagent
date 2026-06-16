@@ -1590,6 +1590,12 @@ pub struct OperationMode {
     /// 可在此关掉静默时段抑制，让夜间主动/被动发送不被 22→8 压制。
     #[serde(default)]
     pub quiet_hours: QuietHoursMode,
+    /// universal-domain-adaptation §3.7：主动情绪关怀驱动力（`scan_calendar`）。
+    /// 在纪念日/生日当天及临近主动发起关怀触达。**与 funnel/silence/commitment 的
+    /// 关键差异：默认 `enabled=false`**——主动情绪触达是情感陪伴域专属，绝不让销售域
+    /// 默认开（DEFAULT_PROFILE / 无 override → scan_calendar 天然 no-op，金标零变化）。
+    #[serde(default)]
+    pub calendar: CalendarMode,
 }
 
 impl Default for OperationMode {
@@ -1599,6 +1605,7 @@ impl Default for OperationMode {
             silence: SilenceMode::default(),
             commitment: CommitmentMode::default(),
             quiet_hours: QuietHoursMode::default(),
+            calendar: CalendarMode::default(),
         }
     }
 }
@@ -1668,6 +1675,32 @@ pub struct QuietHoursMode {
 impl Default for QuietHoursMode {
     fn default() -> Self {
         Self { enabled_override: None }
+    }
+}
+
+/// universal-domain-adaptation §3.7 主动情绪关怀驱动力。`scan_calendar` 在纪念日/生日
+/// 当天及临近窗口主动发起关怀触达（早安晚安、纪念日祝福）。
+///
+/// **`enabled` 默认 `false`**（区别于 funnel/silence/commitment 默认 true）：主动情绪
+/// 触达是情感陪伴域专属，销售域开了会变骚扰；DEFAULT_PROFILE calendar 关 → scan_calendar
+/// 对销售域天然 no-op，所有 planner 金标零变化。仅情感 profile seed 时显式开。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CalendarMode {
+    #[serde(default)]
+    pub enabled: bool,
+    /// 临近窗口（天）：纪念日前几天起就允许触达。`None` → 回落
+    /// `strategic_planner_calendar_lookahead_days`（默认 1）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lookahead_days: Option<i64>,
+    /// 本驱动力的独立每日 emit 上限（比常规 daily_emit_cap 更克制，防早安晚安骚扰）。
+    /// `None` → 回落 `strategic_planner_calendar_daily_cap`（默认 3）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub daily_cap: Option<i64>,
+}
+
+impl Default for CalendarMode {
+    fn default() -> Self {
+        Self { enabled: false, lookahead_days: None, daily_cap: None }
     }
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1740,6 +1773,27 @@ pub struct ChunkRole {
     pub is_fallback: bool,
 }
 
+/// universal-domain-adaptation §3.7：`scan_calendar` 主动关怀扫描的**结构化纪念日条目**。
+///
+/// 存于 `MemoryCardTyped.extra.<date_dimension槽>` 的数组元素。**日期由 consolidator
+/// LLM 抽取时直接产出结构化字段**（agent-first：机器不解析"她生日下个月15号"这类中文
+/// 自由文本，只比较结构化数值），复刻 commitments `dueAt` RFC3339 既有模式。
+///
+/// `date` 两种形态：`"MM-DD"`（每年循环的生日/纪念日，`recurring=true`）或
+/// `"YYYY-MM-DD"`（一次性事件，`recurring=false`）。`scan_calendar` 对其做今日/临近
+/// 的数值比较。旧库里该槽若仍是纯字符串条目，scan_calendar 解析失败即跳过（向后兼容）。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AnniversaryEntry {
+    /// 人类可读标签（"她生日" / "相识纪念日"）。供 emit 的 follow_up content 用。
+    pub label: String,
+    /// `"MM-DD"`（recurring）或 `"YYYY-MM-DD"`（one-off）。
+    pub date: String,
+    /// 是否每年循环（true=只比月日；false=比完整年月日）。
+    #[serde(default)]
+    pub recurring: bool,
+}
+
 /// universal-domain-adaptation H17：memoryCard 的「记忆维度」（替代 `memory.rs` 写死的
 /// 销售域记忆槽位 + cap + consolidator prompt 骨架 + memoryCandidate.type 合法集）。
 /// 一个 `MemoryDimension` 声明：本行业某类记忆的 `extra` 容器数组键名 `key`、
@@ -1772,6 +1826,12 @@ pub struct MemoryDimension {
     /// 枚举），fact/conflict 由系统固定派生不依赖本字段。
     #[serde(default)]
     pub candidate_type: bool,
+    /// universal-domain-adaptation §3.7：该槽是否承载**带日期语义的结构化条目**
+    /// （[`AnniversaryEntry`]），参与 `scan_calendar` 主动关怀扫描。DEFAULT 销售八槽
+    /// 全 false（serde 默认）→ scan_calendar 对销售域天然 no-op。情感 profile 的
+    /// `anniversaries` 槽设 true，consolidator 据此引导 LLM 输出结构化日期对象。
+    #[serde(default)]
+    pub date_dimension: bool,
 }
 
 /// universal-domain-adaptation H11：本行业「自学习极性」= 声明哪些 outcome_status

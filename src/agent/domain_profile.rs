@@ -105,6 +105,8 @@ pub fn default_memory_dimensions() -> Vec<MemoryDimension> {
             is_core: false,
             prompt_hint: None,
             candidate_type: *cand,
+            // §3.7：DEFAULT 销售八槽均非日期维度 → scan_calendar 对销售域 no-op。
+            date_dimension: false,
         })
         .collect()
 }
@@ -731,6 +733,19 @@ pub fn example_emotional_companion_profile(workspace_id: &str) -> DomainProfile 
     profile.grounding_gate_bypass_without_claim = true;
     profile.distrust_self_reported_low_risk = true;
     profile.operation_mode.funnel.enabled = false;
+    // §3.7：开启主动情绪关怀驱动力（销售域默认关）。纪念日/生日当天主动触达。
+    profile.operation_mode.calendar.enabled = true;
+    // §3.7：声明一个带日期语义的记忆维度 anniversaries，consolidator 据 date_dimension
+    // 引导 LLM 输出结构化日期对象（AnniversaryEntry），scan_calendar 据此做今日匹配。
+    profile.memory_dimensions.push(crate::models::MemoryDimension {
+        key: "anniversaries".to_string(),
+        display_name: "纪念日".to_string(),
+        cap: 8,
+        is_core: true,
+        prompt_hint: Some("生日 / 相识纪念 / 重要日子（含日期）".to_string()),
+        candidate_type: false,
+        date_dimension: true,
+    });
     profile.prompt_fragment = Some(
         "本行业目标是长期陪伴、情绪承接、尊重对方节奏与边界，不是成交推进。\
          主动关心、轻量追问本身是正当行为，不等于施压。"
@@ -1050,6 +1065,34 @@ mod tests {
         assert!(p.operation_mode.funnel.enabled);
         assert!(p.operation_mode.silence.enabled);
         assert!(p.operation_mode.commitment.enabled);
+        // §3.7 护栏：calendar 默认**关**（主动情绪触达销售域绝不默认开）→ scan_calendar
+        // 对销售域 no-op，所有 planner 金标零变化。
+        assert!(!p.operation_mode.calendar.enabled);
+    }
+
+    #[test]
+    fn default_profile_memory_dimensions_have_no_date_dimension() {
+        // §3.7 护栏：DEFAULT 销售八槽均非 date_dimension → scan_calendar 在销售域没有
+        // 数据源、整段 no-op（无任何带日期语义维度时直接短路），字节等价。
+        let p = default_domain_profile("ws-1");
+        assert!(
+            p.memory_dimensions.iter().all(|d| !d.date_dimension),
+            "DEFAULT 八槽不应有 date_dimension=true"
+        );
+    }
+
+    #[test]
+    fn emotional_companion_profile_enables_calendar_with_date_dimension() {
+        // §3.7：情感陪伴 profile 开 calendar + 声明带日期语义的 anniversaries 槽，
+        // scan_calendar 据此对该域生效（与 DEFAULT 销售域形成对照）。
+        let p = example_emotional_companion_profile("ws-e");
+        assert!(p.operation_mode.calendar.enabled, "情感域应开 calendar");
+        let anni = p
+            .memory_dimensions
+            .iter()
+            .find(|d| d.key == "anniversaries")
+            .expect("应声明 anniversaries 维度");
+        assert!(anni.date_dimension, "anniversaries 应标 date_dimension");
     }
 
     #[test]
@@ -1281,6 +1324,7 @@ mod tests {
                 is_core: true,
                 prompt_hint: None,
                 candidate_type: true,
+                date_dimension: false,
             },
             crate::models::MemoryDimension {
                 key: "anniversaries".to_string(),
@@ -1289,6 +1333,7 @@ mod tests {
                 is_core: false,
                 prompt_hint: None,
                 candidate_type: false,
+                date_dimension: true,
             },
         ];
         let out = render_memory_candidate_types_guidance(&dims);
