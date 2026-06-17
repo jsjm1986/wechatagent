@@ -127,7 +127,7 @@ async fn deal_event_push_round_trip() {
     let outcome = OutcomeEvent {
         marked_at: DateTime::now(),
         occurred_at: None,
-        amount: Some(199.0),
+        amount: Some(19900),
         currency: Some("CNY".to_string()),
         source: "manual".to_string(),
         marked_by: "admin_smoke".to_string(),
@@ -171,7 +171,7 @@ async fn deal_event_push_round_trip() {
         .expect("contact exists");
     assert_eq!(reloaded.outcome_events.len(), 1, "旧 deal_events key 经 alias 读入 outcome_events");
     assert_eq!(reloaded.outcome_events[0].source, "manual");
-    assert_eq!(reloaded.outcome_events[0].amount, Some(199.0));
+    assert_eq!(reloaded.outcome_events[0].amount, Some(19900));
     assert_eq!(reloaded.outcome_events[0].marked_by, "admin_smoke");
 }
 

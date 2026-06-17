@@ -50,8 +50,9 @@ pub(super) struct ListQuery {
 pub(super) struct CreateRequest {
     pub product_id: String,
     pub name: String,
+    /// 单价，最小币种单位整数（分，19900=¥199.00）。前端 ×100 转分后传入。
     #[serde(default)]
-    pub price: Option<f64>,
+    pub price: Option<i64>,
     #[serde(default)]
     pub currency: Option<String>,
     #[serde(default)]
@@ -66,8 +67,9 @@ pub(super) struct CreateRequest {
 #[serde(rename_all = "camelCase")]
 pub(super) struct UpdateRequest {
     pub name: String,
+    /// 单价，最小币种单位整数（分）。
     #[serde(default)]
-    pub price: Option<f64>,
+    pub price: Option<i64>,
     #[serde(default)]
     pub currency: Option<String>,
     #[serde(default)]
@@ -84,7 +86,8 @@ struct ProductView {
     product_id: String,
     workspace_id: String,
     name: String,
-    price: Option<f64>,
+    /// 单价，最小币种单位整数（分）；前端展示时 ÷100 转元。
+    price: Option<i64>,
     currency: Option<String>,
     sku: Option<String>,
     status: String,
@@ -114,11 +117,19 @@ impl From<&Product> for ProductView {
     }
 }
 
-/// 价格校验：非负有限数（与 `add_deal_event` 的 amount 校验同形态）。
-fn validate_price(price: Option<f64>) -> AppResult<()> {
-    if let Some(p) = price {
-        if !p.is_finite() || p < 0.0 {
-            return Err(AppError::BadRequest("price 必须是非负有限数".to_string()));
+/// 校验产品金额字段：price 非负（最小币种单位整数，分），currency 符合 ISO-4217 形态。
+/// 复用 models 的纯校验函数，把 false 转成 400。
+fn validate_product_money(price: Option<i64>, currency: Option<&str>) -> AppResult<()> {
+    if !crate::models::is_valid_minor_amount(price) {
+        return Err(AppError::BadRequest(
+            "price 必须是非负整数（最小币种单位，如分）".to_string(),
+        ));
+    }
+    if let Some(cur) = currency.map(str::trim).filter(|s| !s.is_empty()) {
+        if !crate::models::is_valid_currency_code(cur) {
+            return Err(AppError::BadRequest(
+                "currency 必须是 ISO-4217 三位大写字母币种码（如 CNY）".to_string(),
+            ));
         }
     }
     Ok(())
@@ -162,7 +173,7 @@ pub(super) async fn create_product(
     if body.name.trim().is_empty() {
         return Err(AppError::BadRequest("name 不能为空".to_string()));
     }
-    validate_price(body.price)?;
+    validate_product_money(body.price, body.currency.as_deref())?;
     let now = DateTime::now();
     let product = Product {
         id: None,
@@ -204,14 +215,14 @@ pub(super) async fn update_product(
     if body.name.trim().is_empty() {
         return Err(AppError::BadRequest("name 不能为空".to_string()));
     }
-    validate_price(body.price)?;
+    validate_product_money(body.price, body.currency.as_deref())?;
     let now = DateTime::now();
     let mut set = doc! {
         "name": body.name.trim(),
         "attributes": &body.attributes,
         "updated_at": now,
     };
-    insert_opt_f64(&mut set, "price", body.price);
+    insert_opt_i64(&mut set, "price", body.price);
     insert_opt_str(&mut set, "currency", normalize_opt(body.currency));
     insert_opt_str(&mut set, "sku", normalize_opt(body.sku));
     insert_opt_str(&mut set, "summary", normalize_opt(body.summary));
@@ -293,7 +304,7 @@ fn normalize_opt(value: Option<String>) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
-fn insert_opt_f64(doc: &mut Document, key: &str, value: Option<f64>) {
+fn insert_opt_i64(doc: &mut Document, key: &str, value: Option<i64>) {
     match value {
         Some(v) => {
             doc.insert(key, v);
@@ -327,13 +338,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn validate_price_rejects_negative_and_nan() {
-        assert!(validate_price(Some(-1.0)).is_err());
-        assert!(validate_price(Some(f64::NAN)).is_err());
-        assert!(validate_price(Some(f64::INFINITY)).is_err());
-        assert!(validate_price(Some(0.0)).is_ok());
-        assert!(validate_price(Some(199.0)).is_ok());
-        assert!(validate_price(None).is_ok());
+    fn validate_product_money_rejects_negative_and_bad_currency() {
+        // 金额整数化：i64 无 NaN/Inf，只需查非负。
+        assert!(validate_product_money(Some(-1), None).is_err(), "负数金额拒绝");
+        assert!(validate_product_money(Some(0), None).is_ok(), "0 分合法");
+        assert!(validate_product_money(Some(19900), None).is_ok(), "正常金额合法");
+        assert!(validate_product_money(None, None).is_ok(), "未设价合法");
+        // currency ISO-4217 形态校验。
+        assert!(validate_product_money(Some(19900), Some("CNY")).is_ok());
+        assert!(validate_product_money(Some(19900), Some("cny")).is_err(), "小写币种拒绝");
+        assert!(validate_product_money(Some(19900), Some("RMB币")).is_err(), "非法币种拒绝");
+        assert!(validate_product_money(Some(19900), Some("  ")).is_ok(), "空白币种按未设处理");
     }
 
     #[test]
@@ -348,7 +363,7 @@ mod tests {
         let mut d = Document::new();
         insert_opt_str(&mut d, "currency", None);
         assert_eq!(d.get("currency"), Some(&mongodb::bson::Bson::Null));
-        insert_opt_f64(&mut d, "price", Some(9.9));
-        assert_eq!(d.get_f64("price").unwrap(), 9.9);
+        insert_opt_i64(&mut d, "price", Some(19900));
+        assert_eq!(d.get_i64("price").unwrap(), 19900);
     }
 }
