@@ -298,6 +298,12 @@ pub struct OutcomeProductRef {
     /// 件数（默认 1）。
     #[serde(default = "default_quantity")]
     pub quantity: u32,
+    /// G4 #4：成交当时冻结的售后/有效期天数快照（来自 `Product.attributes.entitlement_days`）。
+    /// 投影 `project_entitlements` 优先读它，仅在缺失时回落活产品表——故产品下架（archived）
+    /// 后，售后期内的已购客户仍被正确判为 in_aftercare（不再因解引用失败丢时效）。
+    /// None = 无时效产品 / 成交时产品未配 entitlement_days。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entitlement_days: Option<i64>,
 }
 
 fn default_quantity() -> u32 {
@@ -1390,6 +1396,16 @@ pub struct DomainProfile {
     /// 的盲区。运行时经 `UserRuntimeParameters` 同名字段消费。
     #[serde(default)]
     pub distrust_self_reported_low_risk: bool,
+    /// 客观购买事实增强 G4 #5：本域是否为**交易型域**、决策 prompt 注入产品目录段 +
+    /// 当前持有投影段。`true` = 交易域（销售/电商/课程等），注入产品事实供 agent 报准价、
+    /// 识别已购/售后客户；`false`（serde 默认）= 非交易域（情感陪伴/朋友），即便 admin 误配
+    /// 了产品表也**不注入**交易事实，杜绝"已购买X"裸入情感对话。
+    /// **注意**：与其它 bool 开关不同，默认 `false` **不是**"销售域字节等价"——销售域行为是
+    /// 注入，故 [`default_domain_profile`](crate::agent::domain_profile::default_domain_profile)
+    /// 必须显式设 `true` 才等价（反过拟合护栏）。默认 false 取的是「失败方向安全」：新建 profile
+    /// 忘配则不注入，宁可漏注不可把交易事实错注进非交易域。运行时在 `decision.rs` 注入点消费。
+    #[serde(default)]
+    pub transaction_facts_enabled: bool,
     /// universal-domain-adaptation H16：本行业知识切片的「用途角色」表（替代
     /// `knowledge_router.rs` 写死的销售四态分桶 + header）。空 Vec 时
     /// `format_operation_knowledge_for_prompt` 回落内置销售四态（DEFAULT_PROFILE 即

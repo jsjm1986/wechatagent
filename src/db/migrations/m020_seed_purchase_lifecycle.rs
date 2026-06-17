@@ -143,6 +143,9 @@ pub(super) fn example_profile_with_lifecycle(workspace_id: &str) -> crate::model
                       由对话推断，并以 G4 已核实持有事实为客观锚纠偏。"
             .to_string(),
     });
+    // G4 #5：购买生命周期示例本就是交易域 → 显式声明交易事实注入（继承自 default 的 true，
+    // 此处显式标注语义、防 default 未来改动时静默漂移）。
+    profile.transaction_facts_enabled = true;
     // draft：不自动生效。引导/审核层 publish+activate 时再翻这两个标志。
     profile.is_active = false;
     profile.current_version = false;

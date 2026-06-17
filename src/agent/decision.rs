@@ -364,20 +364,25 @@ pub(crate) async fn decide_reply_with_promote(
     // 一次加载、两处复用：① 产品目录段供 agent 报准确价（区别于知识 chunk 模糊描述）；
     // ② G4 持有投影段让 agent 识别已购/售后期客户、切关怀而非拉新（破 H10「只写不读」诅咒）。
     // IDOR：只取本 contact 所属 workspace 的 active 产品（§3.5 横切不变量）。
-    // 零扰动：产品表空（情感域/未配置）→ 两段皆空串，与改造前字节等价。
+    // G4 #5 交易域显式闸：仅当 profile.transaction_facts_enabled=true（交易型域）才注入。
+    // 非交易域（情感陪伴/朋友）即便 admin 误配产品表也跳过加载、两段空串，杜绝"已购买X"
+    // 裸入情感对话。DEFAULT 销售域 profile 该开关=true，注入行为逐字等价历史。
     // best-effort：DB 故障 → 空，不阻塞决策（同 operator_memory / reaction_hint）。
-    let active_products =
-        super::entitlements::load_active_products(&state.db, &contact.workspace_id).await;
-    let product_catalog_text =
-        super::entitlements::format_product_catalog_for_prompt(&active_products);
-    let (entitlements, entitlements_total) = super::entitlements::project_entitlements(
-        &contact.outcome_events,
-        &active_products,
-        DateTime::now(),
-        super::entitlements::ENTITLEMENTS_PROMPT_CAP,
-    );
-    let entitlements_text =
-        super::entitlements::format_entitlements_hint(&entitlements, entitlements_total);
+    // 三段交易注入（产品目录 / 持有投影 / 疑似成交指引）统一受闸：同源 active_products，
+    // 闸关时一并空串。enabled=false 额外跳过 DB 加载省一次查询；渲染+闸门内聚在
+    // entitlements::render_transaction_facts_sections 纯函数（可单测、双重保险）。
+    let active_products = if active_profile.transaction_facts_enabled {
+        super::entitlements::load_active_products(&state.db, &contact.workspace_id).await
+    } else {
+        Vec::new()
+    };
+    let (product_catalog_text, entitlements_text, suspected_deal_text) =
+        super::entitlements::render_transaction_facts_sections(
+            active_profile.transaction_facts_enabled,
+            &active_products,
+            &contact.outcome_events,
+            DateTime::now(),
+        );
     // Phase A / A1：reaction_hint 段（最近 3 轮 reaction_analysis）。
     // 查 decision_reviews 同 (workspace, account, contact_wxid) 下 created_at 倒序
     // 前 3 条；任意 IO 错误回落空串（best-effort，不阻塞决策）。
@@ -463,14 +468,11 @@ pub(crate) async fn decide_reply_with_promote(
             &active_profile.memory_dimensions
         )
     );
-    // 客观购买事实 §5.5：疑似成交线索的 agent 侧落点。仅在本 workspace 有 active
-    // 产品时追加（同 product_catalog_text / entitlements_text 的隐式开关）——无产品域
+    // 客观购买事实 §5.5：疑似成交线索的 agent 侧落点。仅交易域（transaction_facts_enabled）
+    // 且本 workspace 有 active 产品时非空（上方闸门已算好 suspected_deal_text）——非交易域
     // （情感陪伴）空串、task prompt 字节等价。指引 LLM 走弱信号通道（agentGeneratedSignals
     // kind=suspected_deal）+ 主动求证话术，绝不直写 outcome_events（§2.1 红线）。
-    let task_template = format!(
-        "{task_template}{}",
-        super::entitlements::render_suspected_deal_guidance(&active_products)
-    );
+    let task_template = format!("{task_template}{suspected_deal_text}");
     // universal-domain-adaptation G1：在 task prompt 末尾追加本行业「参与决策」的
     // 非销售 typed 维度指引（告知 LLM 走 domainSignals 容器输出）。DEFAULT 销售域
     // 只有 customer_stage/intent_level 两维（typed）→ 空串、prompt 字节等价；

@@ -551,13 +551,13 @@ async fn realign_active_to_current(
     Ok(())
 }
 
-/// 「危险开关」字段集：直接左右 AI 能否瞎编产品 / 自学习方向 / 人格本体 / 风控阈值
-/// 的 10 个字段。运营手动编辑**已生效**血缘并 publish 时，这些字段一旦相对当前 active
-/// 版本发生变化，就不即时生效（落旁路稿等二次确认），避免手滑改错立即污染线上。
+/// 「危险开关」字段集：直接左右 AI 能否瞎编产品 / 自学习方向 / 人格本体 / 风控阈值 /
+/// 交易事实注入的 11 个字段。运营手动编辑**已生效**血缘并 publish 时，这些字段一旦相对
+/// 当前 active 版本发生变化，就不即时生效（落旁路稿等二次确认），避免手滑改错立即污染线上。
 /// 黑名单外字段（display_name/description/profile_dimensions/coverage_dimensions/
 /// business_formulas/memory_dimensions/chunk_roles/prompt_fragment/stagnation_dimension/
 /// domain_schema_id/methodology_generator_preamble）视为普通字段，照旧即时生效。
-const RISKY_FIELD_NAMES: [&str; 10] = [
+const RISKY_FIELD_NAMES: [&str; 11] = [
     "soul_override",
     "methodology_override",
     "conversation_mode_policy",
@@ -568,6 +568,7 @@ const RISKY_FIELD_NAMES: [&str; 10] = [
     "distrust_self_reported_low_risk",
     "outcome_polarity",
     "threshold_overrides",
+    "transaction_facts_enabled",
 ];
 
 /// 比对两份 profile 的 10 个危险字段，返回**发生变化**的字段名列表（顺序与
@@ -607,6 +608,9 @@ pub fn risky_fields_changed(old: &DomainProfile, new: &DomainProfile) -> Vec<&'s
     }
     if old.threshold_overrides != new.threshold_overrides {
         changed.push(RISKY_FIELD_NAMES[9]);
+    }
+    if old.transaction_facts_enabled != new.transaction_facts_enabled {
+        changed.push(RISKY_FIELD_NAMES[10]);
     }
     changed
 }
@@ -912,9 +916,10 @@ mod tests {
 
     #[test]
     fn risky_fields_changed_detects_emotional_companion_diff() {
-        // 销售 DEFAULT → 情感陪伴 example：example 相对 default 恰好改了 4 个危险字段
+        // 销售 DEFAULT → 情感陪伴 example：example 相对 default 恰好改了 5 个危险字段
         // （conversation_modes / operation_mode / grounding_gate_bypass_without_claim /
-        // distrust_self_reported_low_risk，见 example_emotional_companion_profile）。
+        // distrust_self_reported_low_risk / transaction_facts_enabled，见
+        // example_emotional_companion_profile：交易域 true→非交易域 false）。
         let base = default_domain_profile("ws");
         let edited = example_emotional_companion_profile("ws");
         let changed = risky_fields_changed(&base, &edited);
@@ -926,14 +931,15 @@ mod tests {
                 "operation_mode",
                 "grounding_gate_bypass_without_claim",
                 "distrust_self_reported_low_risk",
+                "transaction_facts_enabled",
             ],
-            "恰好这 4 个危险字段（profile_id/display_name/prompt_fragment 等普通字段不计）"
+            "恰好这 5 个危险字段（profile_id/display_name/prompt_fragment 等普通字段不计）"
         );
     }
 
     #[test]
     fn risky_fields_changed_single_diff_each_field() {
-        // 逐个危险字段单改，确认每个都被独立检出（覆盖 10 字段比较分支）。
+        // 逐个危险字段单改，确认每个都被独立检出（覆盖 11 字段比较分支）。
         let base = default_domain_profile("ws");
 
         let mut p = base.clone();
@@ -968,6 +974,13 @@ mod tests {
             ..Default::default()
         });
         assert_eq!(risky_fields_changed(&base, &p), vec!["threshold_overrides"]);
+
+        let mut p = base.clone();
+        p.transaction_facts_enabled = !base.transaction_facts_enabled;
+        assert_eq!(
+            risky_fields_changed(&base, &p),
+            vec!["transaction_facts_enabled"]
+        );
     }
 
     #[test]

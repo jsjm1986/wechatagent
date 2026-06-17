@@ -119,7 +119,7 @@ fn default_product_status() -> String { "active".to_string() }
 ### 3.4 通用化零扰动
 
 - 空产品表 = 决策层无产品上下文可注入，行为与改造前等价。
-- 是否注入产品目录由"该 workspace 有无 active product"**隐式**决定，**不引入** `product_catalog_enabled` 硬 flag（少一个硬编码点，符合 §1.6 哲学）。
+- 是否注入产品目录由"该 workspace 有无 active product"**隐式**决定（初版设计）——但落码后审查发现隐式开关不足以防"非交易域 admin 误配产品表 + 登记成交 → '已购买X'裸注入情感对话"。**G4 #5 收口（2026-06-17）改为显式交易域闸** `DomainProfile.transaction_facts_enabled`：仅交易型域（销售/电商/课程）置 `true` 才注入三段交易事实（产品目录 / 持有投影 / 疑似成交指引）；非交易域（情感陪伴/朋友）置 `false`，即便误配产品表也跳过加载、一律空串。默认 `false`（失败方向安全：宁可漏注不可错注），`default_domain_profile` 销售兜底显式置 `true` 保历史等价。该开关已纳入 `RISKY_FIELD_NAMES`（手改已生效血缘时不即时生效，落旁路稿二次确认）。
 
 ### 3.5 多租户隔离不变量（IDOR 红线，所有新读写点强制）
 
@@ -190,6 +190,11 @@ pub struct OutcomeProductRef {
     /// 件数（默认 1）。
     #[serde(default = "default_quantity")]
     pub quantity: u32,
+    /// G4 #4（2026-06-17 收口）：成交当时冻结的售后/有效期天数快照（来自
+    /// `Product.attributes.entitlement_days`）。投影 §5.1 优先读它、仅缺失时回落活产品表，
+    /// 故产品 archived 后售后期内的已购客户仍被正确判 in_aftercare。None=无时效/未登记。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entitlement_days: Option<i64>,
 }
 
 fn default_quantity() -> u32 { 1 }
@@ -198,6 +203,8 @@ fn default_quantity() -> u32 { 1 }
 ### 4.3 为什么是快照而非活引用
 
 成交是历史事实。若 `product_ref` 存活引用（仅 product_id，渲染时 join products），则 product 改名/调价/下架会**回溯篡改历史成交记录**——客户半年前买的"基础版 ¥99"会显示成今天的"基础版 ¥199"。订单系统标准做法是**成交即冻结快照**。product_id 仍保留用于"该产品总销量"类聚合查询。
+
+**G4 #4 补充（2026-06-17）**：`entitlement_days`（售后/有效期天数）同属"成交当时口径"，故也纳入冻结快照。初版只快照了 name/price，`entitlement_days` 仍实时读活产品表——产品 archived 后解引用落空 → `in_aftercare=None`，售后期内的已购客户被误判"无时效"（AI 可能拒绝售后/重新推销）。修复后投影优先读快照、仅缺失时回落活表，且改产品配置不再回溯篡改历史客户的售后判定（与"成交即冻结"哲学一致）。
 
 ### 4.4 `verification` 缺省取值的安全性论证
 
@@ -231,7 +238,7 @@ entitlements(contact, products, profile)  =  fold over
       .filter(verification ∈ {staff_confirmed, payment_verified})   // §2.1 红线（conversation_inferred 不进投影）
       .filter(has product_ref)
     → 按 product_id 聚合持有 + 抵消退款（§4.5）
-    → 用 product.attributes.entitlement_days / profile 规则算"是否售后期/有效期内"
+    → 用 entitlement_days（优先成交快照 §4.3，缺失才回落 product.attributes）算"是否售后期/有效期内"
 ```
 
 输出形如：`[{ product_id, name, owned_since, in_aftercare: bool, expires_at: Option }]`，注入决策 prompt。
@@ -251,7 +258,7 @@ entitlements(contact, products, profile)  =  fold over
 
 > 修正：早前稿误写"投影发生在 gateway 装 prompt 时（与 intent_trajectory 拼接同位置）"——把 DB 读取和 prompt 拼接两件事混在了 gateway。实际 intent_trajectory 的**拼接**在 `decision.rs:346`（函数内），gateway 只负责把数据喂进来。G4 同构：gateway 读 + 投影，`build_decision_prompt` 拼。
 
-- "售后期/有效期"判定规则读 `Product.attributes`（如 `entitlement_days`）+ profile；无规则时只输出"已购买 product X"不带时效。
+- "售后期/有效期"判定规则读 `entitlement_days`（G4 #4 起**优先读 `OutcomeProductRef` 成交快照**，缺失才回落 `Product.attributes`）+ profile；无规则时只输出"已购买 product X"不带时效。
 - 具体投影函数签名 / `build_decision_prompt` 新入参 / prompt 文案**落码阶段定**，本 spec 只锁定"派生不存储 + 只认高可信 verification + DB 读在 gateway / 拼接在 decision"三条不变量。
 
 ### 5.3 做到这步 AI 行为立刻变（破"只写不读"诅咒）
