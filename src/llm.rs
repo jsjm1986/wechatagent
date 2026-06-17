@@ -117,6 +117,11 @@ struct AnthropicMessageResponse {
     content: Vec<AnthropicContentBlock>,
     #[serde(default)]
     usage: Option<AnthropicUsage>,
+    /// `end_turn` / `max_tokens` / `tool_use` / `stop_sequence`。长任务实测：claude 偶发
+    /// 决定先调工具（`tool_use`）联网搜资料，真内容跑进 tool_use block，text block 只剩
+    /// 开场白 → 需识别后给明确诊断，而非含糊的 json_decode。
+    #[serde(default)]
+    stop_reason: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -222,6 +227,10 @@ pub trait LlmProvider: Send + Sync {
     }
 }
 
+/// 第三层「回喂 LLM 修复」的最大尝试次数（用户指定 2 次）。前两层（快路径 +
+/// `repair_loose_json` + `extract_embedded_json`）全失败才触发。
+const REPAIR_MAX_ATTEMPTS: u32 = 2;
+
 impl LlmClient {
     pub fn new(
         base_url: String,
@@ -282,6 +291,120 @@ impl LlmClient {
             max_retries: max_retries.max(1),
             retry_base_ms: retry_base_ms.max(100),
         })
+    }
+
+    /// 解析 `cleaned`（已聚合 SSE、已剥 reasoning 前缀的**干净模型文本**）为 JSON；
+    /// 前两层（快路径 / `repair_loose_json` / `extract_embedded_json`）失败后进**第三层**：
+    /// 把整段脏文本回喂 LLM 让其修成合法 JSON，最多 [`REPAIR_MAX_ATTEMPTS`] 次。
+    ///
+    /// 设计依据（本地实测 rsxermu claude-opus）：复杂结构化生成偶发"长度正常、开头合法
+    /// `{`、未截断，却中间夹脏字符"——内容完整可读、但前两层的确定性修复救不回。回喂同族
+    /// 模型让它重写成严格 JSON，成本不是问题（仅前两层全失败才触发，触发率低）。
+    ///
+    /// **红线**：回喂 N 次仍失败 → 抛 json_decode 错（测试该红就红 / 上游 skip），把原始脏文本
+    /// 前缀与各次修复结果写进错误 detail，便于诊断"模型问题 vs 方法问题"。绝不把非 JSON 当数据吞下。
+    async fn parse_or_repair(&self, cleaned: &str) -> AppResult<Value> {
+        // 前三层（快路径 + repair_loose_json + extract_embedded_json）。
+        if let Ok(value) = parse_json_content(cleaned) {
+            return Ok(value);
+        }
+        // 第三层：回喂 LLM 修复。每次修复响应只走 parse_json_content（不再回喂，断递归）。
+        let mut attempts_diag: Vec<String> = Vec::new();
+        for attempt in 1..=REPAIR_MAX_ATTEMPTS {
+            match self.repair_via_llm(cleaned).await {
+                Ok(value) => return Ok(value),
+                Err(e) => attempts_diag.push(format!("repair#{attempt}={e}")),
+            }
+        }
+        // 全部失败：抛严格错误，附原始脏文本前缀 + 各次修复诊断。
+        let head: String = cleaned.chars().take(200).collect();
+        let strict_err = parse_json_content(cleaned).unwrap_err();
+        Err(AppError::External(format!(
+            "json_decode after {REPAIR_MAX_ATTEMPTS} llm-repair attempts failed: {strict_err}; \
+             raw_head={head:?}; {}",
+            attempts_diag.join("; ")
+        )))
+    }
+
+    /// 第三层修复的单次实现：把脏文本作为 user，配固定「JSON 修复器」system 发一次请求，
+    /// 响应只用 `parse_json_content`（**不**再调 `parse_or_repair`，避免无限递归）。
+    async fn repair_via_llm(&self, raw_dirty: &str) -> AppResult<Value> {
+        const REPAIR_SYSTEM: &str = "你是一个 JSON 修复器。用户会给你一段文本，其中**包含**一个 JSON 对象，但格式可能有误（多余的解释、围栏、全角标点、缺引号、尾逗号、截断等）。请理解其语义，只输出**修正后的、严格合法的单个 JSON 对象**。第一个字符必须是 `{`，最后一个字符必须是 `}`，禁止任何前导/收尾说明、禁止代码块围栏。保持原始内容的字段与取值不变，只修复格式。";
+        let cleaned = self.fetch_raw_text(REPAIR_SYSTEM, raw_dirty).await?;
+        parse_json_content(&strip_reasoning_prefix(&cleaned))
+    }
+
+    /// 发一次请求、按当前 format 取出**纯文本 content**（聚合 SSE、解出信封），不做 JSON 解析。
+    /// 专供 [`Self::repair_via_llm`] 复用 HTTP 链路，避免与 `generate_json_once_*` 的递归。
+    async fn fetch_raw_text(&self, system: &str, user: &str) -> AppResult<String> {
+        match self.format {
+            LlmFormat::Openai => {
+                let body = json!({
+                    "model": self.model,
+                    "temperature": 0.0,
+                    "messages": [
+                        ChatMessage { role: "system", content: system },
+                        ChatMessage { role: "user", content: user }
+                    ]
+                });
+                let response = self
+                    .client
+                    .post(format!("{}/chat/completions", self.base_url))
+                    .bearer_auth(&self.api_key)
+                    .json(&body)
+                    .send()
+                    .await?;
+                let status = response.status();
+                let text = String::from_utf8_lossy(&response.bytes().await?).into_owned();
+                if !status.is_success() {
+                    return Err(AppError::External(format!("LLM HTTP {status}: {text}")));
+                }
+                if is_openai_sse_body(&text) {
+                    let (acc, _) = aggregate_openai_sse(&text);
+                    if acc.trim().is_empty() {
+                        return Err(AppError::External("LLM SSE body 聚合后内容为空".to_string()));
+                    }
+                    Ok(acc)
+                } else {
+                    let parsed: ChatCompletionResponse = serde_json::from_str(&text)?;
+                    parsed
+                        .choices
+                        .first()
+                        .map(|choice| choice.message.content.clone())
+                        .ok_or_else(|| AppError::External("LLM returned no choices".to_string()))
+                }
+            }
+            LlmFormat::Anthropic => {
+                let body = json!({
+                    "model": self.model,
+                    "max_tokens": 8192,
+                    "temperature": 0.0,
+                    "system": system,
+                    "messages": [ {"role": "user", "content": user} ]
+                });
+                let response = self
+                    .client
+                    .post(format!("{}/v1/messages", self.base_url))
+                    .header("x-api-key", &self.api_key)
+                    .header("anthropic-version", "2023-06-01")
+                    .json(&body)
+                    .send()
+                    .await?;
+                let status = response.status();
+                let text = String::from_utf8_lossy(&response.bytes().await?).into_owned();
+                if !status.is_success() {
+                    return Err(AppError::External(format!("LLM HTTP {status}: {text}")));
+                }
+                let parsed: AnthropicMessageResponse = serde_json::from_str(&text)?;
+                parsed
+                    .content
+                    .iter()
+                    .find_map(|block| {
+                        (block.kind.as_deref() == Some("text")).then(|| block.text.clone())
+                    })
+                    .ok_or_else(|| AppError::External("LLM returned no choices".to_string()))
+            }
+        }
     }
 
     /// 执行一次实际 HTTP 请求；返回 (result, retry_after_seconds)。
@@ -372,7 +495,9 @@ impl LlmClient {
         };
         Ok((
             LlmJsonResult {
-                value: parse_json_content(&strip_reasoning_prefix(&content))?,
+                value: self
+                    .parse_or_repair(&strip_reasoning_prefix(&content))
+                    .await?,
                 usage,
                 latency_ms: started_at.elapsed().as_millis() as i64,
                 model: self.model.clone(),
@@ -447,7 +572,9 @@ impl LlmClient {
             (c, parsed.usage.unwrap_or_default())
         };
         Ok(LlmJsonResult {
-            value: parse_json_content(&strip_reasoning_prefix(&content))?,
+            value: self
+                .parse_or_repair(&strip_reasoning_prefix(&content))
+                .await?,
             usage,
             latency_ms: started_at.elapsed().as_millis() as i64,
             model: self.model.clone(),
@@ -467,9 +594,14 @@ impl LlmClient {
         // claude（尤其 opus）对话遵从性强，遇到口语化/对话式 prompt（"你好，我需要你帮我…"）
         // 容易"入戏"先写共情散文再给 JSON，甚至 JSON 被 max_tokens 截断（rsxermu CI 实测
         // domain_profile/knowledge 大面积 json_decode：content 全是"我理解你的需求…让我生成"）。
-        // 在 system 末尾追加**强制 JSON 输出约束**（通用、不改各调用方 prompt），逼 claude 第一
-        // 字符即 `{`、禁任何前导/解释/收尾。下游 parse_json_content 仍有 extract 兜底防漏网。
-        const ANTHROPIC_JSON_GUARD: &str = "\n\n[OUTPUT FORMAT — STRICT] 你必须只输出一个 JSON 对象，不要任何前导说明、寒暄、共情、思考过程或代码块围栏。第一个字符必须是 `{`，最后一个字符必须是 `}`。禁止在 JSON 前后写任何自然语言（包括「好的」「我理解」「让我」「希望有帮助」之类）。";
+        // 更严重的长任务坑（2026-06-17 本地实测）：复杂"极其详尽"prompt 会让 claude 触发
+        // **工具调用**（stop_reason=tool_use，如 WebFetch 联网搜资料），真内容跑进 tool_use
+        // block，text block 只剩一句开场白 → 我们只取 text 自然拿不到，json_decode。
+        // 在 system 末尾追加**强制 JSON 输出约束 + 禁工具/对话模式声明**（通用、不改各调用方
+        // prompt），逼 claude 第一字符即 `{`、禁任何前导/解释/收尾、禁 tool_use。实测加禁工具
+        // 声明后 stop_reason 从 tool_use 回到 end_turn、内容回到 text block。下游 parse_json_content
+        // + 第三层回喂修复仍兜底防漏网。
+        const ANTHROPIC_JSON_GUARD: &str = "\n\n[OUTPUT FORMAT — STRICT] 当前是**对话生成模式**，不是 agent / 工具调用模式。禁止调用任何工具（不要 WebFetch、不要联网搜索、不要任何 tool_use），直接基于你已有的知识一次性生成完整内容。你必须只输出一个 JSON 对象，不要任何前导说明、寒暄、共情、思考过程或代码块围栏。第一个字符必须是 `{`，最后一个字符必须是 `}`。禁止在 JSON 前后写任何自然语言（包括「好的」「我理解」「让我」「希望有帮助」之类）。";
         let guarded_system = format!("{system}{ANTHROPIC_JSON_GUARD}");
         let body = json!({
             "model": self.model,
@@ -511,16 +643,13 @@ impl LlmClient {
             return Err(err);
         }
 
-        let parsed: AnthropicMessageResponse = match serde_json::from_str(&text) {
-            Ok(p) => p,
-            Err(e) => {
-                // 临时诊断（rsxermu claude json_decode 定位）：打印原始 body 前缀，确认是否
-                // SSE / 空 / 非 JSON。定位后移除。
-                let head: String = text.chars().take(300).collect();
-                eprintln!("[anthropic-diag] parse AnthropicMessageResponse 失败: {e}; body_head={head:?}");
-                return Err(AppError::from(e));
-            }
-        };
+        let parsed: AnthropicMessageResponse = serde_json::from_str(&text)?;
+        // 长任务防御：claude 偶发无视禁工具约束、决定先 tool_use（如 WebFetch 搜资料），
+        // 真内容跑进 tool_use block，text block 只剩开场白。识别后给**明确诊断**，而非让
+        // 下游对半句开场白做 json_decode/回喂修复（既浪费一轮修复、错误又含糊）。
+        if let Some(diag) = detect_tool_use_hijack(&parsed) {
+            return Err(AppError::External(diag));
+        }
         let content = parsed
             .content
             .iter()
@@ -542,15 +671,7 @@ impl LlmClient {
             })
             .unwrap_or_default();
         let cleaned = strip_reasoning_prefix(content);
-        let value = match parse_json_content(&cleaned) {
-            Ok(v) => v,
-            Err(e) => {
-                // 临时诊断：提取后仍非 JSON，打印前缀确认 claude 实际输出形态。定位后移除。
-                let head: String = cleaned.chars().take(300).collect();
-                eprintln!("[anthropic-diag] parse_json_content 失败: {e}; content_head={head:?}");
-                return Err(e);
-            }
-        };
+        let value = self.parse_or_repair(&cleaned).await?;
         Ok((
             LlmJsonResult {
                 value,
@@ -977,6 +1098,32 @@ fn strip_reasoning_prefix(content: &str) -> String {
         }
     }
     content.to_string()
+}
+
+/// 检测 anthropic 响应是否被**工具调用劫持**：长复杂任务中 claude 偶发决定先 tool_use
+/// （如 WebFetch 联网搜资料），把真内容放进 tool_use block，text block 只剩一句开场白。
+/// 命中（stop_reason=tool_use 或存在 tool_use block）则返回明确诊断字符串，供上层抛错——
+/// 比让下游对半句开场白做 json_decode/回喂修复更清晰，CI 日志一眼可辨。返回 None = 正常。
+fn detect_tool_use_hijack(parsed: &AnthropicMessageResponse) -> Option<String> {
+    let has_tool_use = parsed
+        .content
+        .iter()
+        .any(|b| b.kind.as_deref() == Some("tool_use"));
+    if parsed.stop_reason.as_deref() != Some("tool_use") && !has_tool_use {
+        return None;
+    }
+    let head: String = parsed
+        .content
+        .iter()
+        .find_map(|b| (b.kind.as_deref() == Some("text")).then(|| b.text.clone()))
+        .unwrap_or_default()
+        .chars()
+        .take(120)
+        .collect();
+    Some(format!(
+        "llm_tool_use_instead_of_json: 模型返回 tool_use 而非 JSON（长任务偶发；已在 system \
+         禁工具，仍出现说明该上游/模型未遵从）。text_head={head:?}"
+    ))
 }
 
 /// 把 claude 偶发的"单元素对象数组" `[{...}]` 拆成内部对象——generate_json 的契约是 JSON
@@ -1543,5 +1690,78 @@ mod tests {
         let v = extract_embedded_json(raw).expect("应提取对象");
         assert!(v.is_object());
         assert_eq!(v.get("action").and_then(|x| x.as_str()), Some("answer"));
+    }
+
+    // 第三层「回喂 LLM 修复」由 parse_or_repair 驱动：前两层（快路径/repair/extract）能解的
+    // **不触发**任何网络调用；前两层全失败时才发修复请求，2 次仍失败抛带诊断的 json_decode 错。
+    // 这两条用一个指向不可达端点的 client 验证：可解析输入纯本地命中（即便端点死也成功），
+    // 不可理解噪声最终抛错且不把噪声吞成 Ok（守 does_not_swallow_garbage 的第三层版本）。
+
+    fn unreachable_client() -> LlmClient {
+        // 127.0.0.1:1 必拒连：若 parse_or_repair 误对可解析输入发起 HTTP，测试会因连接失败而红。
+        LlmClient::new(
+            "http://127.0.0.1:1".to_string(),
+            "test-key".to_string(),
+            "test-model".to_string(),
+            2,
+            1,
+            100,
+        )
+        .expect("build client")
+    }
+
+    #[tokio::test]
+    async fn parse_or_repair_returns_first_two_layers_without_network() {
+        // 可被前两层解析的脏输入（尾逗号）→ 不该触达不可达端点，直接成功。
+        let client = unreachable_client();
+        let v = client
+            .parse_or_repair("{\"ok\":true,}")
+            .await
+            .expect("前两层应直接解析尾逗号，不发网络");
+        assert_eq!(v.get("ok").and_then(|x| x.as_bool()), Some(true));
+    }
+
+    #[tokio::test]
+    async fn parse_or_repair_surfaces_error_for_garbage_after_repair_exhausted() {
+        // 纯噪声 + 不可达端点：前两层失败 → 第三层 2 次回喂均因连接失败 → 最终 Err。
+        // 绝不把噪声吞成 Ok；错误信息须带 json_decode 诊断与原始前缀，便于排障。
+        let client = unreachable_client();
+        let err = client
+            .parse_or_repair("这是一段没有任何 JSON 的纯自然语言噪声")
+            .await
+            .expect_err("噪声经修复仍失败，必须抛错而非吞下");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("json_decode") && msg.contains("raw_head"),
+            "错误须含结构化诊断（json_decode + raw_head），实际: {msg}"
+        );
+    }
+
+    // 长任务防御：claude 偶发 tool_use 劫持（真内容跑进 tool_use block，text 只剩开场白）。
+    // detect_tool_use_hijack 应识别并给明确诊断；正常 end_turn 纯 text 不得误判。
+
+    #[test]
+    fn detect_tool_use_hijack_flags_tool_use_block() {
+        let body = r#"{"content":[{"type":"text","text":"我将为您生成完整配置。"},{"type":"tool_use","name":"WebFetch","input":{"url":"https://x"}}],"stop_reason":"tool_use"}"#;
+        let parsed: AnthropicMessageResponse = serde_json::from_str(body).unwrap();
+        let diag = detect_tool_use_hijack(&parsed).expect("应识别 tool_use 劫持");
+        assert!(diag.contains("llm_tool_use_instead_of_json"), "诊断: {diag}");
+        assert!(diag.contains("我将为您生成"), "诊断须含 text 开场白前缀: {diag}");
+    }
+
+    #[test]
+    fn detect_tool_use_hijack_flags_stop_reason_only() {
+        // 即便 content 里暂无 tool_use block，stop_reason=tool_use 也要拦。
+        let body = r#"{"content":[{"type":"text","text":"让我查一下。"}],"stop_reason":"tool_use"}"#;
+        let parsed: AnthropicMessageResponse = serde_json::from_str(body).unwrap();
+        assert!(detect_tool_use_hijack(&parsed).is_some());
+    }
+
+    #[test]
+    fn detect_tool_use_hijack_passes_normal_text_response() {
+        // 正常一次性 JSON 输出（end_turn，纯 text）不得误判。
+        let body = r#"{"content":[{"type":"text","text":"{\"ok\":true}"}],"stop_reason":"end_turn"}"#;
+        let parsed: AnthropicMessageResponse = serde_json::from_str(body).unwrap();
+        assert!(detect_tool_use_hijack(&parsed).is_none());
     }
 }
