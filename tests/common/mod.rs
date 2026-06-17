@@ -10,6 +10,7 @@
 #![allow(dead_code)]
 
 pub mod generalization;
+pub mod dynamic;
 pub mod identity_generator;
 pub mod judge;
 pub mod roleplay_fixtures;
