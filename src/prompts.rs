@@ -688,7 +688,11 @@ pub fn default_user_operation_state_machine() -> Document {
                 "name": "沉默唤醒",
                 "goal": "基于真实价值或明确理由做低频唤醒。",
                 "allowedActions": ["provide_resource", "create_follow_up", "wait", "cooldown"],
+                // G5 阶段2：客户在任何阶段都可能流失/沉默 → 任意态可转入休眠待唤醒
+                // （续费挽留失败、长期无回复等）。allowFromAny 是既有标志位（cooldown 同款），
+                // 与 dormant_reactivation 业务语义吻合。原 allowedFrom 保留作文档参考但 allowFromAny 优先。
                 "allowedFrom": ["cooldown", "dormant_reactivation"],
+                "allowFromAny": true,
                 "advanceSignals": ["重新回复", "领取资料", "表达近况"],
                 "cooldownSignals": ["再次无回复", "拒绝"],
                 "riskRules": ["必须低频", "必须有真实价值"],

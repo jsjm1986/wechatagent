@@ -1636,6 +1636,13 @@ pub struct OperationMode {
     /// no-op，所有 planner 金标零变化。
     #[serde(default)]
     pub renewal: RenewalMode,
+    /// 再激活驱动力（`scan_renewal` 阶段2，`scan_reactivation`）。已流失/休眠老客
+    /// （customer_stage=dormant_reactivation）定期低频唤醒——按流失原因（churn_reason）
+    /// 精准再营销，重回销售环节。**默认 `enabled=false`**（同 renewal）：再激活是交易域行为，
+    /// 需 profile/contact override 显式开；DEFAULT_PROFILE 关 → scan_reactivation 天然 no-op。
+    /// 核心原则：定期再激活、绝不放任老客（有原因则精准、无原因则兜底价值唤醒）。
+    #[serde(default)]
+    pub reactivation: ReactivationMode,
 }
 
 impl Default for OperationMode {
@@ -1647,6 +1654,7 @@ impl Default for OperationMode {
             quiet_hours: QuietHoursMode::default(),
             calendar: CalendarMode::default(),
             renewal: RenewalMode::default(),
+            reactivation: ReactivationMode::default(),
         }
     }
 }
@@ -1770,6 +1778,37 @@ pub struct RenewalMode {
 impl Default for RenewalMode {
     fn default() -> Self {
         Self { enabled: false, lookahead_days: None, grace_days: None, daily_cap: None }
+    }
+}
+
+/// 再激活驱动力（阶段2）。`scan_reactivation` 对已流失/休眠老客
+/// （`customer_stage=dormant_reactivation`）定期低频唤醒：有明确流失原因（`churn_reason`）
+/// 则按原因精准再营销，无原因则兜底价值唤醒，重回销售环节。
+///
+/// **`enabled` 默认 `false`**（同 renewal/calendar）：再激活是交易域行为，需 profile/contact
+/// override 显式开；DEFAULT_PROFILE reactivation 关 → scan_reactivation 对每个 contact 短路、
+/// 天然 no-op，所有 planner 金标零变化。核心原则：定期再激活、绝不放任老客不管。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ReactivationMode {
+    #[serde(default)]
+    pub enabled: bool,
+    /// 进入休眠满 N 天后才开始唤醒（避免刚流失就立刻骚扰）。`None` → 回落
+    /// `strategic_planner_reactivation_dormant_days`（默认 30）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dormant_days: Option<i64>,
+    /// 每次唤醒的最小间隔（天）：定期低频，防每 tick 刷屏。`None` → 回落
+    /// `strategic_planner_reactivation_cadence_days`（默认 30）。这是「定期再激活、绝不放任」
+    /// 的节奏锚——既不放任遗忘，也不高频骚扰。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cadence_days: Option<i64>,
+    /// 本驱动力的独立每日 emit 上限。`None` → 回落 `strategic_planner_reactivation_daily_cap`（默认 3）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub daily_cap: Option<i64>,
+}
+
+impl Default for ReactivationMode {
+    fn default() -> Self {
+        Self { enabled: false, dormant_days: None, cadence_days: None, daily_cap: None }
     }
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -91,6 +91,15 @@ pub struct AppConfig {
     /// G5 Strategic Planner：`scan_renewal` 的独立每日 emit 上限（防续费触达刷屏）。
     /// 默认 3。`RenewalMode.daily_cap` 可 per-profile 覆盖。
     pub strategic_planner_renewal_daily_cap: i64,
+    /// G5 阶段2 Strategic Planner：`scan_reactivation` 进入休眠满 N 天后才开始唤醒（避免刚
+    /// 流失就立刻骚扰）。默认 30。`ReactivationMode.dormant_days` 可 per-profile 覆盖。
+    pub strategic_planner_reactivation_dormant_days: i64,
+    /// G5 阶段2 Strategic Planner：`scan_reactivation` 每次唤醒最小间隔（天）。定期低频再激活、
+    /// 绝不放任老客的节奏锚。默认 30。`ReactivationMode.cadence_days` 可 per-profile 覆盖。
+    pub strategic_planner_reactivation_cadence_days: i64,
+    /// G5 阶段2 Strategic Planner：`scan_reactivation` 的独立每日 emit 上限。默认 3。
+    /// `ReactivationMode.daily_cap` 可 per-profile 覆盖。
+    pub strategic_planner_reactivation_daily_cap: i64,
     /// M3 Strategic Planner：反馈环回看窗口小时数。
     /// 在此窗口内反查该 contact 的 `agent_run_logs.final_review_status`，
     /// 计算 block-rate；默认 24。
@@ -453,6 +462,21 @@ impl AppConfig {
             .parse()?,
             strategic_planner_renewal_daily_cap: env_or(
                 "STRATEGIC_PLANNER_RENEWAL_DAILY_CAP",
+                "3",
+            )
+            .parse()?,
+            strategic_planner_reactivation_dormant_days: env_or(
+                "STRATEGIC_PLANNER_REACTIVATION_DORMANT_DAYS",
+                "30",
+            )
+            .parse()?,
+            strategic_planner_reactivation_cadence_days: env_or(
+                "STRATEGIC_PLANNER_REACTIVATION_CADENCE_DAYS",
+                "30",
+            )
+            .parse()?,
+            strategic_planner_reactivation_daily_cap: env_or(
+                "STRATEGIC_PLANNER_REACTIVATION_DAILY_CAP",
                 "3",
             )
             .parse()?,

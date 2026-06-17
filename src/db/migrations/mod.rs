@@ -47,6 +47,8 @@ mod m017_dedupe_outcome_aggregation;
 pub mod m018_backfill_domain_stage_from_legacy_top;
 mod m019_state_machine_state_flags;
 mod m020_seed_purchase_lifecycle;
+mod m021_seed_churn_reason;
+mod m022_backfill_dormant_allow_from_any;
 
 type MigrationFuture<'a> = Pin<Box<dyn Future<Output = AppResult<()>> + Send + 'a>>;
 pub type MigrationFn = for<'a> fn(&'a Database) -> MigrationFuture<'a>;
@@ -138,6 +140,14 @@ pub const MIGRATIONS: &[Migration] = &[
     Migration {
         id: "2026_06_X4_001_seed_purchase_lifecycle",
         run: |db| Box::pin(m020_seed_purchase_lifecycle::run_step(db)),
+    },
+    Migration {
+        id: "2026_06_X5_001_seed_churn_reason",
+        run: |db| Box::pin(m021_seed_churn_reason::run_step(db)),
+    },
+    Migration {
+        id: "2026_06_X6_001_backfill_dormant_allow_from_any",
+        run: |db| Box::pin(m022_backfill_dormant_allow_from_any::run_step(db)),
     },
 ];
 

@@ -100,6 +100,9 @@ pub async fn run_strategic_planner(state: AppState) {
         if let Err(error) = scan_renewal(&state).await {
             tracing::error!(error = %error, "strategic planner renewal scan failed");
         }
+        if let Err(error) = scan_reactivation(&state).await {
+            tracing::error!(error = %error, "strategic planner reactivation scan failed");
+        }
         sleep(Duration::from_secs(
             state.config.strategic_planner_interval_seconds,
         ))
@@ -117,6 +120,7 @@ pub async fn tick(state: &AppState) -> anyhow::Result<()> {
     scan_stage_stagnation(state).await?;
     scan_calendar(state).await?;
     scan_renewal(state).await?;
+    scan_reactivation(state).await?;
     Ok(())
 }
 
@@ -132,6 +136,7 @@ const EMIT_EVENT_KINDS: &[&str] = &[
     "strategic_planner_stage_stagnation",
     "strategic_planner_calendar_care",
     "strategic_planner_renewal_reminder",
+    "strategic_planner_reactivation",
 ];
 
 /// 当日已 emit 计数（跨三段汇总）。daily cap 在 tick 开始时一次性算余额。
@@ -1202,6 +1207,7 @@ async fn write_backoff_event(
         "commitment" => "strategic_planner_commitment_backoff",
         "stage_stagnation" => "strategic_planner_stage_stagnation_backoff",
         "renewal" => "strategic_planner_renewal_backoff",
+        "reactivation" => "strategic_planner_reactivation_backoff",
         _ => "strategic_planner_backoff",
     };
     let mut details = payload;
@@ -1830,6 +1836,207 @@ async fn scan_renewal(state: &AppState) -> anyhow::Result<()> {
             "renewalDailyCap": global_renewal_cap,
             "renewalLookaheadDays": global_lookahead,
             "renewalGraceDays": global_grace,
+        }),
+    )
+    .await?;
+    Ok(())
+}
+
+/// ---------------------------------------------------------------------------
+/// 段 6：reactivation（G5 阶段2 流失老客定期再激活）
+/// ---------------------------------------------------------------------------
+
+/// 距上次再激活 emit 是否在 cadence_days 窗口内（定期低频节奏门控，照
+/// [`commitment_recently_emitted`] 模式，但按「再激活主题」而非 commitmentId 去重）。
+/// 反查该 contact 的 `strategic_planner_reactivation` emit 事件——cadence 内有过即跳过，
+/// 落实「定期再激活、绝不放任也绝不刷屏」。
+async fn reactivation_recently_emitted(
+    state: &AppState,
+    contact: &Contact,
+    now: DateTime,
+    cadence_days: i64,
+) -> anyhow::Result<bool> {
+    let cadence_ms = cadence_days.max(0).saturating_mul(24 * 60 * 60 * 1000);
+    let since = DateTime::from_millis(now.timestamp_millis() - cadence_ms);
+    let count = state
+        .db
+        .events()
+        .count_documents(
+            doc! {
+                "workspace_id": &contact.workspace_id,
+                "account_id": &contact.account_id,
+                "contact_wxid": &contact.wxid,
+                "kind": "strategic_planner_reactivation",
+                "created_at": { "$gte": since },
+            },
+            None,
+        )
+        .await?;
+    Ok(count > 0)
+}
+
+/// MongoDB 端粗筛：managed + 非冷却 + **customer_stage=dormant_reactivation**（只选休眠态
+/// 老客）。逐 contact 的 reactivation.enabled 短路 + 休眠时长 + cadence 节奏在 Rust 侧做。
+pub(crate) fn reactivation_candidate_filter(workspace_id: &str, account_id: &str) -> Document {
+    doc! {
+        "workspace_id": workspace_id,
+        "account_id": account_id,
+        "agent_status": "managed",
+        "domain_attributes.customer_stage": "dormant_reactivation",
+        "$or": [
+            { "cooldown_until": { "$exists": false } },
+            { "cooldown_until": null },
+            { "cooldown_until": { "$lt": DateTime::now() } },
+        ],
+    }
+}
+
+/// G5 阶段2 再激活扫描器：对已流失/休眠老客（customer_stage=dormant_reactivation）定期低频
+/// 唤醒——有明确流失原因（domain_attributes.churn_reason）则按原因精准再营销，无原因则兜底
+/// 价值唤醒。落实用户核心原则「定期再激活、绝不放任老客」。
+///
+/// 与 scan_silent 边界：silent 是通用沉默唤醒（不分流、跨范式）；reactivation 专扫休眠态老客
+/// （现状被 TERMINAL_STAGES 排除出 stage_stagnation、无任何段唤醒，本扫描器补此空白）。
+/// 零扰动：DEFAULT/销售域 profile reactivation.enabled=false → 整段提前短路。
+async fn scan_reactivation(state: &AppState) -> anyhow::Result<()> {
+    let workspace_id = state.config.default_workspace_id.clone();
+    let account_id = state.config.default_account_id.clone();
+    let now = DateTime::now();
+    let profile =
+        crate::agent::domain_profile::load_active_domain_profile(&state.db, &workspace_id).await;
+    let profile_mode = profile.operation_mode.clone();
+    // 行业默认 reactivation 关 → 整段对该行业 no-op（销售 DEFAULT 命中、零 DB 扫描）。
+    if !profile_mode.reactivation.enabled {
+        return Ok(());
+    }
+
+    let global_dormant_days = state.config.strategic_planner_reactivation_dormant_days;
+    let global_cadence_days = state.config.strategic_planner_reactivation_cadence_days;
+    let global_reactivation_cap = state.config.strategic_planner_reactivation_daily_cap;
+
+    let filter = reactivation_candidate_filter(&workspace_id, &account_id);
+    let mut cursor = state.db.contacts().find(filter, None).await?;
+
+    let regular_cap = state.config.strategic_planner_daily_emit_cap;
+    let already_emitted_today =
+        count_today_emit_events(state, &workspace_id, &account_id, now).await?;
+    let mut counters = ScanCounters::default();
+    let mut reactivation_emitted_today: i64 = 0;
+
+    while let Some(contact) = cursor.try_next().await? {
+        counters.scanned += 1;
+        let mode = resolve_operation_mode(&contact, &profile_mode);
+        if !mode.reactivation.enabled {
+            continue;
+        }
+        let effective_dormant = mode.reactivation.dormant_days.unwrap_or(global_dormant_days);
+        let effective_cadence = mode.reactivation.cadence_days.unwrap_or(global_cadence_days);
+        let effective_cap = mode.reactivation.daily_cap.unwrap_or(global_reactivation_cap);
+        // 休眠时长门控：进入 dormant_reactivation 满 dormant_days 才唤醒（避免刚流失就立刻骚扰）。
+        // 休眠起点 = customer_stage_updated_at（进入休眠态时刷新，C2 同步点写）。
+        let dormant_since = contact_customer_stage_updated_at(&contact);
+        let dormant_enough = match dormant_since {
+            Some(since) => {
+                let elapsed_ms = now.timestamp_millis() - since.timestamp_millis();
+                let dormant_ms = effective_dormant.max(0).saturating_mul(24 * 60 * 60 * 1000);
+                elapsed_ms >= dormant_ms
+            }
+            // 无 stage 计时戳（存量休眠客）→ 视为已休眠足够久，纳入唤醒（绝不放任）。
+            None => true,
+        };
+        if !dormant_enough {
+            continue;
+        }
+        // cadence 节奏门控：cadence_days 内已唤醒过则跳过（定期低频，不刷屏）。
+        if reactivation_recently_emitted(state, &contact, now, effective_cadence).await? {
+            continue;
+        }
+        if has_pending_follow_up(state, &contact).await? {
+            continue;
+        }
+        if reactivation_emitted_today >= effective_cap
+            || already_emitted_today + reactivation_emitted_today >= regular_cap
+        {
+            write_event(
+                state,
+                &account_id,
+                None,
+                "strategic_planner_reactivation_capped",
+                "capped",
+                &format!(
+                    "再激活触达达上限（reactivation_cap={effective_cap}, daily_cap={regular_cap}）"
+                ),
+                Some(doc! {
+                    "scanned": counters.scanned,
+                    "emitted": counters.emitted,
+                    "reactivationCap": effective_cap,
+                    "dailyEmitCap": regular_cap,
+                }),
+            )
+            .await?;
+            break;
+        }
+        if let Some(payload) = should_skip_for_block_rate(state, &contact, now).await? {
+            write_backoff_event(state, "reactivation", &contact, payload).await?;
+            continue;
+        }
+        // 读流失原因标量（domain_attributes.churn_reason）。两层兜底：有原因→精准再营销；
+        // 无原因（只是沉默、AI 未拿到原因）→ 定期价值唤醒（落实「绝不放任」核心原则）。
+        let churn_reason = contact
+            .domain_attributes
+            .as_ref()
+            .and_then(|d| d.get_str("churn_reason").ok())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(ToString::to_string);
+        let content = match &churn_reason {
+            Some(reason) => format!(
+                "Planner: reactivation 休眠老客按流失原因精准再激活（原因={reason}，带历史上下文重回销售环节，低压有价值）"
+            ),
+            None => "Planner: reactivation 休眠老客定期价值唤醒（无明确流失原因，低压重连、绝不放任老客）".to_string(),
+        };
+        emit_planner_follow_up(state, &contact, content, now).await?;
+        let mut details = doc! {
+            "source": "strategic_planner",
+            "dormantDays": effective_dormant,
+            "cadenceDays": effective_cadence,
+        };
+        if let Some(reason) = &churn_reason {
+            details.insert("churnReason", reason);
+        }
+        write_event(
+            state,
+            &contact.account_id,
+            Some(&contact.wxid),
+            "strategic_planner_reactivation",
+            "emitted",
+            &format!(
+                "Planner: reactivation emitted（churn_reason={}）",
+                churn_reason.as_deref().unwrap_or("<none>")
+            ),
+            Some(details),
+        )
+        .await?;
+        counters.emitted += 1;
+        reactivation_emitted_today += 1;
+    }
+
+    write_event(
+        state,
+        &account_id,
+        None,
+        "strategic_planner_reactivation_tick",
+        "ok",
+        &format!(
+            "strategic planner reactivation tick: scanned {}, emitted {}",
+            counters.scanned, counters.emitted
+        ),
+        Some(doc! {
+            "scanned": counters.scanned,
+            "emitted": counters.emitted,
+            "reactivationDailyCap": global_reactivation_cap,
+            "reactivationDormantDays": global_dormant_days,
+            "reactivationCadenceDays": global_cadence_days,
         }),
     )
     .await?;
@@ -2846,6 +3053,65 @@ mod tests {
         assert!(resolved.renewal.enabled, "交易域 profile 开 renewal 生效");
         assert_eq!(resolved.renewal.lookahead_days, Some(30));
         assert_eq!(resolved.renewal.grace_days, Some(10));
+    }
+
+    // ── G5 阶段2 scan_reactivation：ReactivationMode 默认 + filter + resolve 闸 ──
+
+    /// 根护栏：ReactivationMode 默认 enabled=false（再激活销售 DEFAULT 域绝不默认开，零扰动铁律）。
+    #[test]
+    fn reactivation_mode_default_disabled() {
+        assert!(!crate::models::ReactivationMode::default().enabled);
+        assert_eq!(crate::models::ReactivationMode::default().dormant_days, None);
+        assert_eq!(crate::models::ReactivationMode::default().cadence_days, None);
+        assert_eq!(crate::models::ReactivationMode::default().daily_cap, None);
+        // OperationMode::default() 内含的 reactivation 也是关的（DEFAULT 销售域 scan_reactivation no-op）。
+        assert!(!crate::models::OperationMode::default().reactivation.enabled);
+    }
+
+    /// reactivation_candidate_filter 只选休眠态老客（customer_stage=dormant_reactivation）+ managed + 非冷却。
+    #[test]
+    fn reactivation_candidate_filter_includes_dormant_stage() {
+        let f = reactivation_candidate_filter("ws1", "acc1");
+        assert_eq!(f.get_str("workspace_id").unwrap(), "ws1");
+        assert_eq!(f.get_str("account_id").unwrap(), "acc1");
+        assert_eq!(f.get_str("agent_status").unwrap(), "managed");
+        assert_eq!(
+            f.get_str("domain_attributes.customer_stage").unwrap(),
+            "dormant_reactivation",
+            "再激活只扫休眠态老客"
+        );
+        assert!(f.get_array("$or").is_ok(), "含 cooldown 非冷却 $or 粗筛");
+    }
+
+    /// 零扰动：DEFAULT 销售域 profile（reactivation 关）→ resolve 后 reactivation.enabled=false。
+    #[test]
+    fn reactivation_off_default_no_op() {
+        let contact = template();
+        let profile_mode = crate::models::OperationMode::default();
+        let resolved = resolve_operation_mode(&contact, &profile_mode);
+        assert!(
+            !resolved.reactivation.enabled,
+            "DEFAULT 销售域 reactivation 关 → scan_reactivation 对该 contact no-op"
+        );
+    }
+
+    /// 交易域 profile 显式开 reactivation → resolve 后 reactivation.enabled=true。
+    #[test]
+    fn reactivation_on_when_profile_enables() {
+        let contact = template();
+        let profile_mode = crate::models::OperationMode {
+            reactivation: crate::models::ReactivationMode {
+                enabled: true,
+                dormant_days: Some(45),
+                cadence_days: Some(60),
+                daily_cap: Some(2),
+            },
+            ..crate::models::OperationMode::default()
+        };
+        let resolved = resolve_operation_mode(&contact, &profile_mode);
+        assert!(resolved.reactivation.enabled, "交易域 profile 开 reactivation 生效");
+        assert_eq!(resolved.reactivation.dormant_days, Some(45));
+        assert_eq!(resolved.reactivation.cadence_days, Some(60));
     }
 
     /// recurring 纪念日：今日命中（lookahead=0 当天）。
