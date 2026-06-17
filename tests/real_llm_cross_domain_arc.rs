@@ -903,3 +903,142 @@ async fn cross_domain_full_arc_emotional_and_sales() {
     )
     .await;
 }
+
+// ════════════════════════════════════════════════════════════════════════════
+// R2.3 跨域行为差异对照 —— 同一句输入在对立 profile 下行为实质不同。
+//
+// spec R2.3：同输入在销售 vs 陪伴下行为实质不同（业务维度度量，非仅逐字不等）。
+//
+// 与 R2.2（各跑各的多轮 arc）的区别：R2.3 把**同一句模糊压力输入**分别喂销售域和情感
+// 陪伴域，做**直接对照**。
+//
+// ## 契约级硬断言（确定性，不过拟合）
+// 1. **judge 标尺随域翻极性（R1.1 端到端体现）**：销售域 rubric 含 `manipulationRisk`
+//    不含 `pressureRisk`；情感域 rubric 含 `pressureRisk`+`personaConsistency` 不含
+//    `manipulationRisk`。这是「同输入下两域用不同业务尺子衡量」的确定性证据，与具体
+//    reply 措辞无关——不会因真模型波动假红。
+// 2. **两域回复非逐字相同**：同输入下两域 reply 不应字节相同（相同=profile 没起作用）。
+//    宽松断言（只查 != ），不锁"差异在哪"——那留给 judge 观测。
+//
+// ## 降级观测（诚实）
+// - "行为实质不同"的**程度/方向**（销售更推进、陪伴更承接）由 judge 的极性维分数体现，
+//   但单次采样方差大、且"多少分算实质不同"难以非过拟合地定阈值 → 只进 judge ledger 观测，
+//   不做硬断言。硬断言只锁「标尺确实不同 + reply 非逐字相同」这两条确定性契约。
+// ════════════════════════════════════════════════════════════════════════════
+
+/// 给指定 profile 喂同一句输入，返回 (reply_text, 该域 judge rubric)。
+/// seed_emotional=true 时把情感 profile seed 进 default ws；false 用 DEFAULT 销售。
+async fn run_single_input_for_profile(
+    llm: Arc<dyn LlmProvider>,
+    profile: &DomainProfile,
+    wxid_prefix: &str,
+    seed_emotional: bool,
+    inbound_text: &str,
+) -> Option<String> {
+    let app = TestApp::start().await;
+    let mcp = start_mcp_mock_success().await;
+    let state = common::rebuild_app_state_with_real_llm(&app, llm, mcp.uri());
+
+    if seed_emotional {
+        seed_emotional_companion_profile_in_workspace(&app, "default").await;
+    }
+    invalidate_global_domain_profile_cache();
+
+    let contact = fresh_contact(&format!("{wxid_prefix}_user"), "default");
+    state.db.contacts().insert_one(&contact, None).await.expect("insert contact");
+
+    let msg_id = format!("{wxid_prefix}_inbound_1");
+    let inbound = make_inbound(&contact, &msg_id, inbound_text);
+    state.db.messages().insert_one(&inbound, None).await.expect("insert inbound");
+
+    // 端点抖动 → None（调用方按 skip 处理，不假绿）。
+    match handle_managed_message(&state, contact.clone(), &inbound).await {
+        Ok(_) => {}
+        Err(AppError::LlmUnavailable { kind, .. }) => {
+            eprintln!("skip: R2.3 {wxid_prefix} 端点不可达(kind={kind})");
+            return None;
+        }
+        Err(e) => panic!("R2.3 {wxid_prefix} 非端点错误: {e:?}"),
+    }
+
+    let latest = || FindOneOptions::builder().sort(doc! { "created_at": -1 }).build();
+    let reply = state
+        .db
+        .decision_reviews()
+        .find_one(doc! { "contact_wxid": &contact.wxid, "inbound_message_id": &msg_id }, latest())
+        .await
+        .expect("query decision_review")
+        .and_then(|r| r.reply_text.clone())
+        .unwrap_or_default();
+
+    // judge 观测（同输入两域分数对照进 ledger）。
+    let rubric = build_judge_rubric(profile);
+    let ledger = RoleplayLedger::for_fixture(&format!("r2_3_{wxid_prefix}"));
+    run_profile_judge(&state, &rubric, &ledger, wxid_prefix, inbound_text, &reply).await;
+
+    Some(reply)
+}
+
+#[tokio::test]
+#[ignore]
+async fn r2_3_same_input_distinct_behavior_across_domains() {
+    let llm = require_real_llm!();
+
+    // ── 断言 1（确定性，不需真模型）：judge 标尺随域翻极性。先验，不依赖端点。
+    let sales_rubric = build_judge_rubric(&default_domain_profile("default"));
+    let companion_rubric = build_judge_rubric(&example_emotional_companion_profile("default"));
+    assert!(
+        sales_rubric.dims.iter().any(|d| d == "manipulationRisk")
+            && !sales_rubric.dims.iter().any(|d| d == "pressureRisk"),
+        "销售域标尺应含 manipulationRisk、不含 pressureRisk，实际={:?}",
+        sales_rubric.dims
+    );
+    assert!(
+        companion_rubric.dims.iter().any(|d| d == "pressureRisk")
+            && companion_rubric.dims.iter().any(|d| d == "personaConsistency")
+            && !companion_rubric.dims.iter().any(|d| d == "manipulationRisk"),
+        "情感域标尺应含 pressureRisk+personaConsistency、不含 manipulationRisk，实际={:?}",
+        companion_rubric.dims
+    );
+
+    // ── 同一句模糊压力输入，分别喂两域。
+    let shared_input = "最近压力好大，感觉快撑不住了，不知道该怎么办。";
+
+    let companion_reply = run_single_input_for_profile(
+        llm.clone(),
+        &example_emotional_companion_profile("default"),
+        "r2_3_companion",
+        true,
+        shared_input,
+    )
+    .await;
+    let sales_reply = run_single_input_for_profile(
+        llm,
+        &default_domain_profile("default"),
+        "r2_3_sales",
+        false,
+        shared_input,
+    )
+    .await;
+
+    // 任一域端点抖动 → skip（不假绿）。
+    let (Some(companion_reply), Some(sales_reply)) = (companion_reply, sales_reply) else {
+        eprintln!("skip: R2.3 至少一域端点不可达，未取到两域对照回复");
+        return;
+    };
+
+    // ── 断言 2：两域回复非逐字相同（相同=profile 没起作用）。仅当两域都真发出时校验。
+    if !companion_reply.trim().is_empty() && !sales_reply.trim().is_empty() {
+        assert_ne!(
+            companion_reply.trim(),
+            sales_reply.trim(),
+            "同一句输入在情感域与销售域不应产出逐字相同的回复（profile 应实质影响行为）"
+        );
+        eprintln!(
+            "✓ R2.3 同输入跨域差异：\n  [情感]{companion_reply}\n  [销售]{sales_reply}\n  (标尺极性差异已硬断言，行为方向差异见 judge ledger)"
+        );
+    } else {
+        eprintln!("[R2.3] 至少一域未发出 reply（可能被冷启动/频控拦，合法），标尺差异已硬断言");
+    }
+}
+

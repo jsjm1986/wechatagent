@@ -1380,3 +1380,166 @@ async fn k11_real_completeness_audit_closed_mode_never_verifies() {
         after.integrity_status
     );
 }
+
+// ════════════════════════════════════════════════════════════════════════════
+// R4.2 知识问答跨域 —— 非销售（法律咨询）行业知识库下，核心红线仍成立。
+//
+// spec R4.2：知识问答/抽取/完整度在非销售域语义正确。
+//
+// k1-k11 全是销售/电商语料（退款政策/营业时间/会员系统）。R4.2 证明知识子系统的两条
+// 核心红线**域无关**——换成**法律咨询**行业语料，同样：
+// - 无幻觉弃答 + recall_miss 闭环（问知识库没有的法律问题→诚实弃答+留 gap，不编造法条）；
+// - unverified 不上桌（needs_review 的法律草稿永不被 cite，即便它正好答到了问题）。
+//
+// 机制是同一套生产代码（catalog→search→open_chunk + verified-only 闸 + cite⊆seed），
+// 换语料不改机制——但 R4.2 用非销售语料端到端验证，确保红线不是"只在销售域被测过"。
+// 复用 k3/k4 的范式（seed_verified / seed_chunk / answer / cite⊆seed / recall_miss 闭环）。
+// ════════════════════════════════════════════════════════════════════════════
+
+/// R4.2a：法律咨询知识库无幻觉弃答 + recall_miss 闭环（对标 k3，换非销售语料）。
+#[tokio::test]
+#[ignore]
+async fn r4_2_legal_domain_no_hallucination_when_topic_absent() {
+    let llm = require_real_llm!();
+    let app = TestApp::start().await;
+    let mcp = dummy_mcp_server().await;
+    let state = common::rebuild_app_state_with_real_llm(&app, llm, mcp.uri());
+    let ws = state.config.default_workspace_id.clone();
+
+    // 法律咨询行业语料（与销售完全不同的知识域）。
+    let id1 = seed_verified(
+        &app,
+        &ws,
+        "劳动合同解除经济补偿",
+        "用人单位解除劳动合同的经济补偿标准。",
+        "用人单位无过失性辞退劳动者的，按劳动者在本单位工作年限每满一年支付一个月工资的经济补偿；六个月以上不满一年按一年计。",
+    )
+    .await;
+    let id2 = seed_verified(
+        &app,
+        &ws,
+        "工伤认定时限",
+        "工伤认定申请的时限规定。",
+        "用人单位应在事故伤害发生之日起 30 日内提出工伤认定申请；用人单位未申请的，工伤职工可在 1 年内自行申请。",
+    )
+    .await;
+    let seed = [id1, id2];
+
+    // 知识库完全没覆盖的法律主题：跨境离婚财产分割管辖。
+    let original_query = "涉外离婚案件中，境外房产的分割应当适用哪国法律？由哪个法院管辖？";
+    let req = AnswerRequest {
+        workspace_id: ws.clone(),
+        account_id: None,
+        query: original_query.to_string(),
+        filter: CatalogFilter::default(),
+        max_rounds: None,
+    };
+    let result = unwrap_or_skip_transient!(answer(&state, req).await, "R4.2a 法律域 answer");
+
+    eprintln!(
+        "[r4.2a] rounds_used={} cited={:?} answer={:?}",
+        result.rounds_used,
+        result.cited_chunk_ids,
+        result.answer.chars().take(160).collect::<String>(),
+    );
+
+    assert!(result.rounds_used >= 1, "真模型必须至少跑 1 轮");
+    assert!(!result.answer.trim().is_empty(), "answer 不应为空（至少应说明无相关信息）");
+    // 红线（域无关）：cite ⊆ seed，绝不捏造法条 chunk id。
+    for c in &result.cited_chunk_ids {
+        assert!(
+            seed.contains(c),
+            "法律域真模型 cite 了不存在/捏造的 chunk id={c}，seed={seed:?}",
+        );
+    }
+
+    // 闭环红线：诚实弃答（cited 空）→ 必留携带原始 query 的 recall_miss gap（与 k3 同口径）。
+    if result.cited_chunk_ids.is_empty() {
+        let mut found: Option<wechatagent::models::KnowledgeGapSignal> = None;
+        for _ in 0..10 {
+            let mut cursor = state
+                .db
+                .knowledge_gap_signals()
+                .find(
+                    doc! { "workspace_id": &ws, "kind": "recall_miss", "status": "pending" },
+                    None,
+                )
+                .await
+                .expect("query knowledge_gap_signals");
+            use futures::StreamExt;
+            while let Some(next) = cursor.next().await {
+                let sig = next.expect("decode gap signal");
+                if sig.search_queries.iter().any(|q| q == original_query) {
+                    found = Some(sig);
+                    break;
+                }
+            }
+            if found.is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        }
+        let sig = found.expect(
+            "法律域诚实弃答后必须留 recall_miss/pending gap 信号且含原始 query（确定性闭环域无关）",
+        );
+        assert_eq!(sig.kind, "recall_miss");
+        assert_eq!(sig.status, "pending");
+        eprintln!("[r4.2a] 法律域闭环 gap 信号 ✓ search_queries={:?}", sig.search_queries);
+    }
+}
+
+/// R4.2b：法律域 unverified 草稿永不上桌（对标 k4，换非销售语料）。
+#[tokio::test]
+#[ignore]
+async fn r4_2_legal_domain_unverified_chunk_never_served() {
+    let llm = require_real_llm!();
+    let app = TestApp::start().await;
+    let mcp = dummy_mcp_server().await;
+    let state = common::rebuild_app_state_with_real_llm(&app, llm, mcp.uri());
+    let ws = state.config.default_workspace_id.clone();
+
+    // 答案只在一条 needs_review 的法律草稿里（未经律师审定，不能对客）。
+    let id_unverified = seed_chunk(
+        &app,
+        &ws,
+        "民间借贷利率上限（草稿待审）",
+        "民间借贷受法律保护的利率上限。",
+        "民间借贷年利率不超过合同成立时一年期 LPR 的 4 倍部分受法律保护，超过部分法院不予支持。",
+        "needs_review",
+        "active",
+        0.5,
+        Vec::new(),
+    )
+    .await;
+    // 另 seed 一条无关 verified chunk 让 catalog 非空。
+    let _id_other = seed_verified(
+        &app,
+        &ws,
+        "诉讼时效一般规定",
+        "向法院请求保护民事权利的诉讼时效。",
+        "向人民法院请求保护民事权利的诉讼时效期间一般为三年，自权利人知道或应当知道权利受损之日起计算。",
+    )
+    .await;
+
+    let req = AnswerRequest {
+        workspace_id: ws.clone(),
+        account_id: None,
+        query: "民间借贷的利率超过多少就不受法律保护了？".to_string(),
+        filter: CatalogFilter::default(), // include_unverified=false（默认）
+        max_rounds: None,
+    };
+    let result = unwrap_or_skip_transient!(answer(&state, req).await, "R4.2b 法律域 unverified");
+
+    eprintln!(
+        "[r4.2b] cited={:?} answer={:?}",
+        result.cited_chunk_ids,
+        result.answer.chars().take(160).collect::<String>(),
+    );
+
+    // 红线（域无关）：needs_review 的法律草稿永不被 cite（即便它正好答到了问题）。
+    assert!(
+        !result.cited_chunk_ids.contains(&id_unverified),
+        "法律域 unverified 草稿 id={id_unverified} 被 cite——verified-only 闸被击穿（域无关红线）！cited={:?}",
+        result.cited_chunk_ids
+    );
+}
