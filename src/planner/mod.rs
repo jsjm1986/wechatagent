@@ -97,6 +97,9 @@ pub async fn run_strategic_planner(state: AppState) {
         if let Err(error) = scan_calendar(&state).await {
             tracing::error!(error = %error, "strategic planner calendar scan failed");
         }
+        if let Err(error) = scan_renewal(&state).await {
+            tracing::error!(error = %error, "strategic planner renewal scan failed");
+        }
         sleep(Duration::from_secs(
             state.config.strategic_planner_interval_seconds,
         ))
@@ -113,6 +116,7 @@ pub async fn tick(state: &AppState) -> anyhow::Result<()> {
     scan_commitments(state).await?;
     scan_stage_stagnation(state).await?;
     scan_calendar(state).await?;
+    scan_renewal(state).await?;
     Ok(())
 }
 
@@ -127,6 +131,7 @@ const EMIT_EVENT_KINDS: &[&str] = &[
     "strategic_planner_commitment_imminent",
     "strategic_planner_stage_stagnation",
     "strategic_planner_calendar_care",
+    "strategic_planner_renewal_reminder",
 ];
 
 /// 当日已 emit 计数（跨三段汇总）。daily cap 在 tick 开始时一次性算余额。
@@ -1196,6 +1201,7 @@ async fn write_backoff_event(
         "silent" => "strategic_planner_silent_backoff",
         "commitment" => "strategic_planner_commitment_backoff",
         "stage_stagnation" => "strategic_planner_stage_stagnation_backoff",
+        "renewal" => "strategic_planner_renewal_backoff",
         _ => "strategic_planner_backoff",
     };
     let mut details = payload;
@@ -1644,6 +1650,190 @@ pub(crate) fn calendar_candidate_filter(workspace_id: &str, account_id: &str) ->
             { "cooldown_until": { "$lt": DateTime::now() } },
         ],
     }
+}
+
+/// ---------------------------------------------------------------------------
+/// 段 5：renewal（G5 续费推进 / 临场挽留）
+/// ---------------------------------------------------------------------------
+
+/// 判定一个持有产品是否「该续费推进/挽留」：到期时间落在
+/// `[now - grace_days, now + lookahead_days]` 窗口内（含两端）即触发。
+///
+/// **纯函数、客观数值比较**（expires_at 由 G4 投影 `project_entitlements` 产出）。
+/// - `None`（无时效产品，如永久授权）→ false，永不提醒。
+/// - `lookahead_days`：到期前几天起允许主动推进续费（=最高优先级销售）。
+/// - `grace_days`：刚过期 N 天内仍主动挽留；过期超此窗后 expires_at < lo → false，自然收口
+///   （不无限期骚扰流失客户）。`lookahead/grace` 取 `.max(0)` 防负配置。
+pub(crate) fn renewal_due_soon(
+    expires_at: Option<DateTime>,
+    now: DateTime,
+    lookahead_days: i64,
+    grace_days: i64,
+) -> bool {
+    let Some(exp) = expires_at else {
+        return false;
+    };
+    let exp_ms = exp.timestamp_millis();
+    let now_ms = now.timestamp_millis();
+    let day_ms: i64 = 24 * 60 * 60 * 1000;
+    let lo = now_ms - grace_days.max(0) * day_ms;
+    let hi = now_ms + lookahead_days.max(0) * day_ms;
+    (lo..=hi).contains(&exp_ms)
+}
+
+/// MongoDB 端粗筛：与 calendar 同款（managed + 非冷却）。逐 contact 的 renewal.enabled
+/// 短路 + 到期窗口匹配在 Rust 侧做。
+pub(crate) fn renewal_candidate_filter(workspace_id: &str, account_id: &str) -> Document {
+    doc! {
+        "workspace_id": workspace_id,
+        "account_id": account_id,
+        "agent_status": "managed",
+        "$or": [
+            { "cooldown_until": { "$exists": false } },
+            { "cooldown_until": null },
+            { "cooldown_until": { "$lt": DateTime::now() } },
+        ],
+    }
+}
+
+/// G5 续费推进扫描器：客户持有产品临近到期（或刚过期）时，主动 emit follow-up 让 Reply
+/// Agent 按销售链路推进续费（=最高优先级销售）+ 临场挽留。
+///
+/// 零扰动：DEFAULT / 销售域 profile `renewal.enabled=false` → 行业默认关时整段提前短路
+/// （省全表扫描），与 calendar 的 `date_dims.is_empty()` 短路同款权衡——续费是 profile 级
+/// 范式决策（交易域才开），不支持"profile 关但单 contact override 开"的边角场景。
+async fn scan_renewal(state: &AppState) -> anyhow::Result<()> {
+    let workspace_id = state.config.default_workspace_id.clone();
+    let account_id = state.config.default_account_id.clone();
+    let now = DateTime::now();
+    let profile =
+        crate::agent::domain_profile::load_active_domain_profile(&state.db, &workspace_id).await;
+    let profile_mode = profile.operation_mode.clone();
+    // 行业默认 renewal 关 → 整段对该行业 no-op（销售 DEFAULT 命中、零 DB 扫描）。
+    if !profile_mode.renewal.enabled {
+        return Ok(());
+    }
+
+    let global_lookahead = state.config.strategic_planner_renewal_lookahead_days;
+    let global_grace = state.config.strategic_planner_renewal_grace_days;
+    let global_renewal_cap = state.config.strategic_planner_renewal_daily_cap;
+
+    // 续费/持有投影解引用产品：按 workspace 一次性加载 active 产品，循环内复用（避免 N+1）。
+    let active_products =
+        crate::agent::entitlements::load_active_products(&state.db, &workspace_id).await;
+
+    let filter = renewal_candidate_filter(&workspace_id, &account_id);
+    let mut cursor = state.db.contacts().find(filter, None).await?;
+
+    let regular_cap = state.config.strategic_planner_daily_emit_cap;
+    let already_emitted_today =
+        count_today_emit_events(state, &workspace_id, &account_id, now).await?;
+    let mut counters = ScanCounters::default();
+    let mut renewal_emitted_today: i64 = 0;
+
+    while let Some(contact) = cursor.try_next().await? {
+        counters.scanned += 1;
+        let mode = resolve_operation_mode(&contact, &profile_mode);
+        if !mode.renewal.enabled {
+            continue;
+        }
+        let effective_lookahead = mode.renewal.lookahead_days.unwrap_or(global_lookahead);
+        let effective_grace = mode.renewal.grace_days.unwrap_or(global_grace);
+        let effective_cap = mode.renewal.daily_cap.unwrap_or(global_renewal_cap);
+        // G4 投影：该 contact 当前持有（仅已核实成交派生）。read 端语义用 usize::MAX 全量。
+        let (entitlements, _total) = crate::agent::entitlements::project_entitlements(
+            &contact.outcome_events,
+            &active_products,
+            now,
+            usize::MAX,
+        );
+        // 收集临近到期/刚过期的产品名。
+        let due_products: Vec<String> = entitlements
+            .iter()
+            .filter(|e| renewal_due_soon(e.expires_at, now, effective_lookahead, effective_grace))
+            .map(|e| e.name.clone())
+            .collect();
+        if due_products.is_empty() {
+            continue;
+        }
+        if has_pending_follow_up(state, &contact).await? {
+            continue;
+        }
+        if renewal_emitted_today >= effective_cap
+            || already_emitted_today + renewal_emitted_today >= regular_cap
+        {
+            write_event(
+                state,
+                &account_id,
+                None,
+                "strategic_planner_renewal_capped",
+                "capped",
+                &format!(
+                    "续费推进触达达上限（renewal_cap={effective_cap}, daily_cap={regular_cap}）"
+                ),
+                Some(doc! {
+                    "scanned": counters.scanned,
+                    "emitted": counters.emitted,
+                    "renewalCap": effective_cap,
+                    "dailyEmitCap": regular_cap,
+                }),
+            )
+            .await?;
+            break;
+        }
+        if let Some(payload) = should_skip_for_block_rate(state, &contact, now).await? {
+            write_backoff_event(state, "renewal", &contact, payload).await?;
+            continue;
+        }
+        let products_joined = due_products.join("、");
+        emit_planner_follow_up(
+            state,
+            &contact,
+            format!(
+                "Planner: renewal_reminder 客户持有产品临近到期，主动推进续费（续费=最高优先级销售，挽留优先；若客户犹豫则诊断顾虑）：{products_joined}"
+            ),
+            now,
+        )
+        .await?;
+        write_event(
+            state,
+            &contact.account_id,
+            Some(&contact.wxid),
+            "strategic_planner_renewal_reminder",
+            "emitted",
+            &format!("Planner: renewal_reminder emitted（{products_joined}）"),
+            Some(doc! {
+                "source": "strategic_planner",
+                "products": &due_products,
+                "lookaheadDays": effective_lookahead,
+                "graceDays": effective_grace,
+            }),
+        )
+        .await?;
+        counters.emitted += 1;
+        renewal_emitted_today += 1;
+    }
+
+    write_event(
+        state,
+        &account_id,
+        None,
+        "strategic_planner_renewal_tick",
+        "ok",
+        &format!(
+            "strategic planner renewal tick: scanned {}, emitted {}",
+            counters.scanned, counters.emitted
+        ),
+        Some(doc! {
+            "scanned": counters.scanned,
+            "emitted": counters.emitted,
+            "renewalDailyCap": global_renewal_cap,
+            "renewalLookaheadDays": global_lookahead,
+            "renewalGraceDays": global_grace,
+        }),
+    )
+    .await?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -2565,6 +2755,97 @@ mod tests {
         assert_eq!(crate::models::CalendarMode::default().daily_cap, None);
         // OperationMode::default() 内含的 calendar 也是关的（DEFAULT 销售域零扰动）。
         assert!(!crate::models::OperationMode::default().calendar.enabled);
+    }
+
+    // ── G5 scan_renewal：RenewalMode 默认 + renewal_due_soon 纯函数 + resolve 闸 ──
+
+    /// 根护栏：RenewalMode 默认 enabled=false（续费触达销售 DEFAULT 域绝不默认开，零扰动铁律）。
+    #[test]
+    fn renewal_mode_default_disabled() {
+        assert!(!crate::models::RenewalMode::default().enabled);
+        assert_eq!(crate::models::RenewalMode::default().lookahead_days, None);
+        assert_eq!(crate::models::RenewalMode::default().grace_days, None);
+        assert_eq!(crate::models::RenewalMode::default().daily_cap, None);
+        // OperationMode::default() 内含的 renewal 也是关的（DEFAULT 销售域 scan_renewal no-op）。
+        assert!(!crate::models::OperationMode::default().renewal.enabled);
+    }
+
+    /// renewal_due_soon：到期落在 [now-grace, now+lookahead] 窗口内即触发。
+    #[test]
+    fn renewal_due_soon_within_lookahead_window() {
+        let now = DateTime::from_millis(1_000 * 86_400_000); // Day 1000
+        let day = 86_400_000_i64;
+        // 到期 Day 1010（10 天后），lookahead 14 / grace 7 → 命中。
+        let exp = DateTime::from_millis(1_010 * day);
+        assert!(renewal_due_soon(Some(exp), now, 14, 7));
+    }
+
+    /// renewal_due_soon：远未来到期（超 lookahead）→ 不触发。
+    #[test]
+    fn renewal_due_soon_far_future_not_due() {
+        let now = DateTime::from_millis(1_000 * 86_400_000);
+        let day = 86_400_000_i64;
+        // 到期 Day 1100（100 天后），lookahead 14 → 超窗，不命中。
+        let exp = DateTime::from_millis(1_100 * day);
+        assert!(!renewal_due_soon(Some(exp), now, 14, 7));
+    }
+
+    /// renewal_due_soon：无时效产品（expires_at = None）→ 永不触发。
+    #[test]
+    fn renewal_due_soon_none_never_due() {
+        let now = DateTime::from_millis(1_000 * 86_400_000);
+        assert!(!renewal_due_soon(None, now, 14, 7));
+    }
+
+    /// renewal_due_soon：刚过期在 grace 窗内仍触发（挽留）；超 grace 则收口不再触发。
+    #[test]
+    fn renewal_due_soon_recently_expired_in_grace_but_not_beyond() {
+        let now = DateTime::from_millis(1_000 * 86_400_000);
+        let day = 86_400_000_i64;
+        // 过期 3 天（Day 997），grace 7 → 仍命中（挽留）。
+        let just_expired = DateTime::from_millis(997 * day);
+        assert!(renewal_due_soon(Some(just_expired), now, 14, 7));
+        // 过期 30 天（Day 970），grace 7 → 超窗收口，不命中（不无限期骚扰流失客户）。
+        let long_expired = DateTime::from_millis(970 * day);
+        assert!(!renewal_due_soon(Some(long_expired), now, 14, 7));
+    }
+
+    /// renewal_candidate_filter 含 managed + 非冷却粗筛键（与 calendar 同款）。
+    #[test]
+    fn renewal_candidate_filter_includes_expected_keys() {
+        let f = renewal_candidate_filter("ws1", "acc1");
+        assert_eq!(f.get_str("workspace_id").unwrap(), "ws1");
+        assert_eq!(f.get_str("account_id").unwrap(), "acc1");
+        assert_eq!(f.get_str("agent_status").unwrap(), "managed");
+        assert!(f.get_array("$or").is_ok(), "含 cooldown 非冷却 $or 粗筛");
+    }
+
+    /// 零扰动：DEFAULT 销售域 profile（renewal 关）→ resolve 后 renewal.enabled=false。
+    #[test]
+    fn renewal_off_default_no_op() {
+        let contact = template();
+        let profile_mode = crate::models::OperationMode::default();
+        let resolved = resolve_operation_mode(&contact, &profile_mode);
+        assert!(!resolved.renewal.enabled, "DEFAULT 销售域 renewal 关 → scan_renewal 对该 contact no-op");
+    }
+
+    /// 交易域 profile 显式开 renewal → resolve 后 renewal.enabled=true（续费触达启用）。
+    #[test]
+    fn renewal_on_when_profile_enables() {
+        let contact = template();
+        let profile_mode = crate::models::OperationMode {
+            renewal: crate::models::RenewalMode {
+                enabled: true,
+                lookahead_days: Some(30),
+                grace_days: Some(10),
+                daily_cap: Some(5),
+            },
+            ..crate::models::OperationMode::default()
+        };
+        let resolved = resolve_operation_mode(&contact, &profile_mode);
+        assert!(resolved.renewal.enabled, "交易域 profile 开 renewal 生效");
+        assert_eq!(resolved.renewal.lookahead_days, Some(30));
+        assert_eq!(resolved.renewal.grace_days, Some(10));
     }
 
     /// recurring 纪念日：今日命中（lookahead=0 当天）。

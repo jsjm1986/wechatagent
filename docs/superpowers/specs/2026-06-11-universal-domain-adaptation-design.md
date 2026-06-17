@@ -626,6 +626,33 @@ casual 模式的"收紧压力门"会与"热烈推进"打架（非误杀，是模
 - **护栏**：DEFAULT `calendar` 默认关 → 销售域所有现有 planner 金标 + real-LLM 套件零变化；仅情感域激活。
 - **风险点（落码前注意）**：(1) **纪念日日期解析**——记忆维度里日期是 LLM 从对话抽的自由文本（"她生日下个月 15 号"），需稳健的日期归一 + 今日匹配，是新扫描器唯一有实质复杂度处；(2) **触达节奏**——早安晚安类高频关怀需比 silence/commitment 更克制的 cap，建议 `calendar` 走独立低频 cap，否则情感陪伴变骚扰。
 
+> **scan_calendar 落码状态**：✅ 已落码（commit 8cc5ca4）。下方 scan_renewal 是同骨架的第二个主动驱动力。
+
+#### §3.7+ scan_renewal 续费推进扫描器（G5，2026-06-18 落码）
+
+**方向（用户拍板）**：续费消费是**最高优先级的销售**（续费成功 = 首次成交同等的「销售成功」），不是被动提醒。完整业务闭环是个**循环不是终止**：
+
+```
+临近到期 → 续费推进（=一次销售，复用销售全链路）
+  ↓ 客户不续 → 挽留（一套方法论）
+  ↓ 挽留失败 → 诊断 + 结构化记录流失原因（为总结 + 下一步精准营销）
+  ↓ → 按原因再激活营销 → 重回销售环节（带完整历史上下文，AI 记得这个客户）
+```
+
+**分阶段落码**：
+- **阶段 1（✅ 本次落码）**：让 AI 能「主动发起续费推进 + 临场挽留诊断」。系统已有约 70% 能力可复用，**不建第二套状态机**——复用 purchase_lifecycle 维度（repurchase/aftercare 值）+ objection 诊断闭环（objection_type 维度 + memory_card.objections 槽位 + 顾虑回流 prompt）+ reaction 五态识别（stop_requested 即时撤回在途触达）+ planner 节奏控制 + customer_stage 的 dormant_reactivation 终态（=再激活落点）。
+- **阶段 2（待续）**：流失原因结构化记录（churn_reason + 时间）+ 流失/休眠状态落点 + 再激活扫描器（按 churn_reason 精准触达，重回销售环节）。
+
+**`scan_renewal` 设计（照 `scan_calendar` 骨架，DEFAULT 零扰动）**：
+- **数据来源**：G4 投影 `entitlements::project_entitlements` 产出每个持有产品的 `expires_at`/`in_aftercare`（续费续窗逻辑已落，#4-A）。扫描器对每条 entitlement 用纯函数 `renewal_due_soon(expires_at, now, lookahead, grace)` 判「到期落在 `[now-grace, now+lookahead]` 窗口内」。
+- **续费推进/挽留无需新决策逻辑**：`entitlements_text`（decision.rs）已注入「已购买X、售后/有效期内（至Y）、有效期已过」到决策 prompt——AI 收到带「产品快到期」上下文的 follow_up 任务即按销售链路推进；objection 诊断闭环已完整（memory_card.objections 回流）。本次另把 `purchase_lifecycle` 当前值读回决策 prompt（此前只读 customer_stage/intent_level），让 AI 知道客户处于续费窗/售后期。
+- **需动的结构（全 additive）**：
+  1. `models.rs`：新增 `RenewalMode{ enabled: bool, lookahead_days, grace_days, daily_cap }` 挂进 `OperationMode` 第 6 个子结构（`#[serde(default)]`）。**`enabled` 默认 `false`**（同 calendar）——续费触达需交易域 profile/contact override 显式开；DEFAULT 销售域 renewal 关 → scan_renewal no-op，所有 planner 金标零变化。
+  2. `planner/mod.rs`：新纯函数 `renewal_due_soon` + `renewal_candidate_filter` + `scan_renewal` 段 + 加入 `EMIT_EVENT_KINDS`（`strategic_planner_renewal_reminder`）+ 串进 `run_strategic_planner`/`tick` + `write_backoff_event` 加 renewal 分支。零扰动靠「行业默认 renewal 关 → 整段提前短路省全表扫描」（与 calendar 的 `date_dims.is_empty()` 同款权衡：续费是 profile 级范式决策，不支持「profile 关但单 contact override 开」边角场景）。
+  3. `config.rs` + `.env.example`：`strategic_planner_renewal_{lookahead_days=14, grace_days=7, daily_cap=3}`。tz 复用 calendar 的。
+  4. `decision.rs`：prompt「当前画像」段加「购买生命周期」字段（读 `domain_attributes.purchase_lifecycle`，DEFAULT 两维 profile 空串字节等价）。
+- **护栏**：RenewalMode.enabled 默认 false → 销售 DEFAULT 域 scan_renewal no-op，金标零变化（`renewal_mode_default_disabled` 锁死）；grace 有限窗 + has_pending_follow_up 去重 + daily_cap 防刷屏；客户明确拒绝时 reaction 的 stop_requested 即时撤回在途触达（优雅放手）。
+
 ### Phase 4（可选）：清理 D2/D3 审计与图谱缺陷。 ✅**已完成（2026-06-17）**
 
 - **D2**（核验写入接回 apply_chunk_revision 补全审计链）✅ commit 985463a。

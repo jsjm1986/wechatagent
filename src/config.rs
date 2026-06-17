@@ -82,6 +82,15 @@ pub struct AppConfig {
     /// planner 是 workspace 全局扫描、不构造 per-contact runtime，故在此取全局偏移（与
     /// `quiet_hours` 同款固定偏移哲学，不依赖部署宿主时区）。默认 +8（中国）。
     pub strategic_planner_calendar_tz_offset_hours: i32,
+    /// G5 Strategic Planner：`scan_renewal` 续费推进的到期前临近窗口（天）。客户持有产品
+    /// 到期前几天起就允许主动推进续费。默认 14。`RenewalMode.lookahead_days` 可 per-profile 覆盖。
+    pub strategic_planner_renewal_lookahead_days: i64,
+    /// G5 Strategic Planner：`scan_renewal` 已过期回看窗（天）。产品刚过期 N 天内仍主动挽留；
+    /// 过期超此窗后不再触达，自然收口。默认 7。`RenewalMode.grace_days` 可 per-profile 覆盖。
+    pub strategic_planner_renewal_grace_days: i64,
+    /// G5 Strategic Planner：`scan_renewal` 的独立每日 emit 上限（防续费触达刷屏）。
+    /// 默认 3。`RenewalMode.daily_cap` 可 per-profile 覆盖。
+    pub strategic_planner_renewal_daily_cap: i64,
     /// M3 Strategic Planner：反馈环回看窗口小时数。
     /// 在此窗口内反查该 contact 的 `agent_run_logs.final_review_status`，
     /// 计算 block-rate；默认 24。
@@ -430,6 +439,21 @@ impl AppConfig {
             strategic_planner_calendar_tz_offset_hours: env_or(
                 "STRATEGIC_PLANNER_CALENDAR_TZ_OFFSET_HOURS",
                 "8",
+            )
+            .parse()?,
+            strategic_planner_renewal_lookahead_days: env_or(
+                "STRATEGIC_PLANNER_RENEWAL_LOOKAHEAD_DAYS",
+                "14",
+            )
+            .parse()?,
+            strategic_planner_renewal_grace_days: env_or(
+                "STRATEGIC_PLANNER_RENEWAL_GRACE_DAYS",
+                "7",
+            )
+            .parse()?,
+            strategic_planner_renewal_daily_cap: env_or(
+                "STRATEGIC_PLANNER_RENEWAL_DAILY_CAP",
+                "3",
             )
             .parse()?,
             strategic_planner_block_rate_window_hours: env_or(
