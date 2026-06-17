@@ -10,7 +10,9 @@
 #![allow(dead_code)]
 
 pub mod generalization;
+pub mod judge;
 pub mod roleplay_fixtures;
+pub mod roleplayer;
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};

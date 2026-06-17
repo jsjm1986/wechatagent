@@ -64,6 +64,10 @@ pub struct LlmClient {
     client: reqwest::Client,
     max_retries: u32,
     retry_base_ms: u64,
+    /// 采样温度。生产默认 0.2（决策/审查要稳定）。测试侧 roleplayer 用
+    /// [`Self::with_temperature`] 调高到 ~0.8 演客户（要有变化、像真人）。
+    /// JSON 修复路径（fetch_raw_text）仍用 0.0 不受本字段影响——修复要确定性。
+    temperature: f64,
 }
 
 #[derive(Debug, Serialize)]
@@ -290,7 +294,15 @@ impl LlmClient {
                 .build()?,
             max_retries: max_retries.max(1),
             retry_base_ms: retry_base_ms.max(100),
+            temperature: 0.2,
         })
+    }
+
+    /// 链式覆盖采样温度（生产默认 0.2）。测试侧 roleplayer 演客户用 ~0.8。
+    /// JSON 修复路径（fetch_raw_text）固定 0.0，不受此影响。
+    pub fn with_temperature(mut self, temperature: f64) -> Self {
+        self.temperature = temperature;
+        self
     }
 
     /// 解析 `cleaned`（已聚合 SSE、已剥 reasoning 前缀的**干净模型文本**）为 JSON；
@@ -429,7 +441,7 @@ impl LlmClient {
         let started_at = Instant::now();
         let body = json!({
             "model": self.model,
-            "temperature": 0.2,
+            "temperature": self.temperature,
             "messages": [
                 ChatMessage { role: "system", content: system },
                 ChatMessage { role: "user", content: user }
@@ -521,7 +533,7 @@ impl LlmClient {
         let data_uri = format!("data:{mime};base64,{image_base64}");
         let body = json!({
             "model": self.model,
-            "temperature": 0.2,
+            "temperature": self.temperature,
             "messages": [
                 { "role": "system", "content": system },
                 { "role": "user", "content": [
@@ -606,7 +618,7 @@ impl LlmClient {
         let body = json!({
             "model": self.model,
             "max_tokens": 8192,
-            "temperature": 0.2,
+            "temperature": self.temperature,
             "system": guarded_system,
             "messages": [
                 {"role": "user", "content": user}
@@ -705,7 +717,7 @@ impl LlmClient {
         let started_at = Instant::now();
         let body = json!({
             "model": self.model,
-            "temperature": 0.2,
+            "temperature": self.temperature,
             "stream": true,
             "stream_options": {"include_usage": true},
             "messages": [
@@ -1301,7 +1313,7 @@ pub(crate) fn repair_loose_json(input: &str) -> Option<String> {
                     in_string = false;
                 }
                 // 真模型偶发在字符串值里塞**裸控制字符**（未转义的换行/制表符等），
-                // serde 严格模式直接拒收（"control character ( -) found
+                // serde 严格模式直接拒收（"control character (U+0000-U+001F) found
                 // while parsing a string"）。这里把它们转义成合法 JSON 转义序列——
                 // 只改**表示形式**不改字符串语义，符合"只容错等价表达"红线。
                 '\n' => out.push_str("\\n"),
@@ -1616,7 +1628,7 @@ mod tests {
     #[test]
     fn parse_json_content_escapes_bare_control_chars_in_string() {
         // 真模型偶发在字符串值里塞**裸换行/制表符**（未转义），serde 严格模式拒收
-        // （"control character ( -) found while parsing a string"）。
+        // （"control character (U+0000-U+001F) found while parsing a string"）。
         // parse_json_content SHALL 把裸控制字符转义成合法 JSON 转义序列后救回，
         // 只改表示形式不改字符串语义。
         let raw = "{\"reply\": \"第一行\n第二行\t制表\"}";
@@ -1630,7 +1642,7 @@ mod tests {
 
     #[test]
     fn repair_loose_json_escapes_low_control_char_as_unicode() {
-        // 非常见的低位控制字符（如 ）走 \uXXXX 兜底转义。
+        // 非常见的低位控制字符（如 U+0001）走 \uXXXX 兜底转义。
         let raw = "{\"x\":\"a\u{0001}b\"}";
         let repaired = repair_loose_json(raw).expect("含 \\u0001 应触发修复");
         let v: Value = serde_json::from_str(&repaired).expect("修复后必须是合法 JSON");
@@ -1790,5 +1802,22 @@ mod tests {
         let body = r#"{"content":[{"type":"text","text":"{\"ok\":true}"}],"stop_reason":"end_turn"}"#;
         let parsed: AnthropicMessageResponse = serde_json::from_str(body).unwrap();
         assert!(detect_tool_use_hijack(&parsed).is_none());
+    }
+
+    #[test]
+    fn temperature_defaults_to_02_and_setter_overrides() {
+        // 生产构造默认 0.2（决策稳定）；with_temperature 链式覆盖（roleplayer 用 0.8）。
+        let c = LlmClient::new(
+            "http://x".into(),
+            "k".into(),
+            "m".into(),
+            10,
+            1,
+            100,
+        )
+        .unwrap();
+        assert!((c.temperature - 0.2).abs() < f64::EPSILON, "默认应 0.2");
+        let hot = c.with_temperature(0.8);
+        assert!((hot.temperature - 0.8).abs() < f64::EPSILON, "setter 应覆盖到 0.8");
     }
 }
