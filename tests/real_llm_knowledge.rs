@@ -854,6 +854,8 @@ async fn k6_real_vision_article_extraction_keeps_needs_review() {
 // **硬断言（红线）**：调用后该 chunk 的 integrity_status **绝不**变成 verified。
 // 先用纯函数 `decide_auto_verify_status` 锁死闸门契约（确定性，不依赖真模型抖动），
 // 再跑真模型端到端确认落库结果与契约一致。
+// **D2 审计链**：processed≥1 时断言 auto_verify 经 apply_chunk_revision 落了一条
+// op=verify / source=rule / created_by=auto_verify 的 chunk_revisions（不再绕过审计）。
 
 #[tokio::test]
 #[ignore]
@@ -953,6 +955,41 @@ async fn k7_real_auto_verify_provenance_gate_holds() {
         Some("verified"),
         "缺 source_quote/anchor 的 chunk 被自动 verified——provenance 闸门被击穿！"
     );
+
+    // D2 审计链：只要真模型实际处理过这条 chunk（processed≥1），auto_verify 的每条裁决
+    // 都必须接回 apply_chunk_revision，在 chunk_revisions 留一条 op=verify、**source=rule**
+    // （裁决由 LLM 自评+规则闸门做出、admin 仅触发批处理，非人工逐条签字）、
+    // created_by=auto_verify 的不可变历史。此前 auto_verify 直接 update_one 绕过审计链，
+    // 「谁在何时基于什么裁决」查不到。注：单条 LLM 调用 transient 失败时 handler `continue`
+    // 不写 revision，故 gate 在 processed≥1。
+    let processed = resp.0.get("processed").and_then(|v| v.as_i64()).unwrap_or(0);
+    if processed >= 1 {
+        use futures::TryStreamExt;
+        let revs: Vec<wechatagent::models::ChunkRevision> = state
+            .db
+            .chunk_revisions()
+            .find(doc! { "chunk_id": id.to_hex() }, None)
+            .await
+            .expect("query chunk_revisions")
+            .try_collect()
+            .await
+            .expect("collect chunk_revisions");
+        assert!(
+            !revs.is_empty(),
+            "[k7] auto_verify processed={processed} 但未写任何 chunk_revisions——审计链断裂"
+        );
+        let rev = &revs[0];
+        assert_eq!(rev.op, "verify", "[k7] auto_verify revision op 必须为 verify");
+        assert_eq!(
+            rev.source, "rule",
+            "[k7] auto_verify revision source 必须为 rule（LLM 自评+规则闸门，非人工签字）"
+        );
+        assert_eq!(
+            rev.created_by.as_deref(),
+            Some("auto_verify"),
+            "[k7] auto_verify revision created_by 必须为 auto_verify"
+        );
+    }
 }
 
 // ── K8 · AI 修复只产 patch、永不自动落库（propose_chunk_repair）────────────────

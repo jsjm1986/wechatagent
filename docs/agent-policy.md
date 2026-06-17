@@ -593,7 +593,7 @@ WechatAgent 把"销售话术 RAG"升级为"运营知识 Wiki + 检索面"：知�
 
 ### 2. 写入路径三层保护：apply_chunk_revision
 
-所有写入（import / patch / split / merge / archive / restore / rollback）走同一个函数 [`crate::knowledge_wiki::chunk_revisions::apply_chunk_revision`]，三层保护一律生效：
+所有写入（import / patch / split / merge / archive / restore / rollback / verify / reject / auto-verify / batch-verify）走同一个函数 [`crate::knowledge_wiki::chunk_revisions::apply_chunk_revision`]，三层保护一律生效：
 
 1. **锁定字段守门**：patch 试图改 `chunk_id / wiki_type / created_at / source_anchor / verified_at / verified_by / approved_at` 任意一项 → 4xx；
 2. **数组字段 union**：`tags / related_chunks / sources / search_terms / applicable_scenes` 永远应用层 `existing ∪ patch`，0 风险 0 LLM 成本；
@@ -601,7 +601,7 @@ WechatAgent 把"销售话术 RAG"升级为"运营知识 Wiki + 检索面"：知�
 
 写入侧附加规则：
 
-- **AI 写入永不自动 verify**：source=ai 强制 `status="draft" + integrity_status="needs_review"`，verify 仍走现有 `/chunks/:id/verify` + sourceQuote→anchor gate；
+- **AI 写入永不自动 verify**：source=ai 强制 `status="draft" + integrity_status="needs_review"`，verify 仍走现有 `/chunks/:id/verify` + sourceQuote→anchor gate；后者也经 `apply_chunk_revision`（op=verify, source=human）落审计历史——「needs_review→verified」这一最关键状态转移可追溯谁在何时审定；`auto_verify` 批处理（admin 触发、LLM 自评+规则闸门裁决）同样落审计，但 source=rule（非 human）——如实标注"规则化批处理"，避免审计误判有人逐条签字；
 - **双写**：先写 `chunk_revisions`（不可变历史，sha256 before/after hash），后写 `operation_knowledge_chunks`（可变最新版）；万一 chunks 写失败 revisions 仍留下"试图但未成功"的痕迹；
 - **enqueue catalog rebuild**：写完即推 `catalog_rebuild_jobs` 队列，worker 异步落库，写入路径不阻塞。
 

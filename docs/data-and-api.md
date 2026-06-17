@@ -563,6 +563,8 @@ catalog_rebuild_jobs
 
 走同一函数 `apply_chunk_revision`：read-existing → 锁定字段守门 → 数组字段 union → 70% body 长度阈值 → AI 写入强制 draft+needs_review → chunk_revisions + chunks 双写（先 revisions 后 chunks）→ enqueue catalog_rebuild_job。
 
+> verify / reject / auto-verify / batch-verify 这四个核验路由同样经 `apply_chunk_revision` 落 chunk_revisions 审计历史——「needs_review→verified」这一最关键状态转移此前直接 update_one 绕过审计，现已补全。source 标注：单条 verify/reject、batch-verify = `human`（运营手工点击）；auto-verify = `rule`（裁决由 LLM 自评+规则闸门做出、admin 仅触发批处理，标 rule 才如实反映"规则化批处理写入"，避免审计误判"有人逐条审定"）。
+
 ```
 POST   /api/operation-knowledge/chunks/:id/patch                     字段级 patch
 POST   /api/operation-knowledge/chunks/:id/split                     拆分（原 archive + 新建 N 个）
@@ -650,11 +652,11 @@ POST /api/operation-knowledge/chunks/batch-verify            批量 verify（adm
 POST /api/operation-knowledge/chunks/batch-archive           批量 archive
 ```
 
-反向查询走 query path 而非物化双向 link（避免双向写一致性问题，chunk 量级 <5k 时性能足够）。批量动作每条独立写 `chunk_revisions(op=verify_batch / archive_batch)`，单条失败不阻断其它（部分成功语义），返回 `{ verified|archived: [...], skipped: [{id, reason}] }`。
+反向查询走 query path 而非物化双向 link（避免双向写一致性问题，chunk 量级 <5k 时性能足够）。批量动作每条独立经 `apply_chunk_revision` 写 `chunk_revisions(op=verify / archive, source=human)`，单条失败不阻断其它（部分成功语义），返回 `{ verified|archived: [...], skipped: [{id, reason}] }`。
 
 前端 `<ChunkActionsBar/>` 9 按钮（verify / reject / patch / archive / restore / rollback / split / merge / relate）+ `<ChunkRevisionsTimeline/>` + `<ChunkReferrersList/>` 全部嵌进 `<ChunkInspectorPane/>`。Explore mode 列表加批量勾选工具条。
 
-`tests/chunk_batch_ops.rs`（#[ignore] 集成）覆盖：批量 verify 3 条 → 全 verified=true + 3 条 chunk_revisions；批量 archive 含 1 条已 archived → skipped 1 + verified 2。
+`tests/chunk_batch_ops.rs`（#[ignore] 集成）覆盖：批量 verify 3 条 → 全 verified=true + 3 条 chunk_revisions；批量 archive 含 1 条已 archived → skipped 1 + verified 2；D2 审计链——单条 verify/reject/batch_verify 每次写入都在 chunk_revisions 落一条 op/source=human/created_by/hash 正确的不可变历史，且 D2 gate（缺 source_anchor）挡下的 verify 不写 revision。
 
 #### G4 · ChatWorkbench 多轮 + Inbox + ObservabilityDashboard（仅前端）
 

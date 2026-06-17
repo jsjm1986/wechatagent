@@ -1150,15 +1150,15 @@ pub struct UsageStats {
     pub last_blocked_reason: Option<String>,
 }
 
-/// chunk 编辑历史的不可变记录。每次 patch / split / merge / rollback / archive /
-/// restore / verify / unverify 都写一行；revisions 表与 chunks 表双写。
+/// chunk 编辑历史的不可变记录。每次 create / patch / split / merge / rollback /
+/// archive / restore / verify / unverify / reject 都写一行；revisions 表与 chunks 表双写。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChunkRevision {
     #[serde(rename = "_id", skip_serializing_if = "Option::is_none")]
     pub id: Option<ObjectId>,
     pub chunk_id: String,
     pub revision_id: String,
-    /// 操作语义 ∈ {create, patch, split, merge, rollback, archive, restore, verify, unverify}。
+    /// 操作语义 ∈ {create, patch, split, merge, rollback, archive, restore, verify, unverify, reject}。
     pub op: String,
     /// 字段级 diff。AI 回复的 chat-canvas 永远只返 patch 而非整 chunk。
     #[serde(default)]

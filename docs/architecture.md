@@ -264,7 +264,7 @@ chat 流追加 progress / summary turn
 ### 写入路径（同步）
 
 ```text
-[POST /chunks/:id/patch | split | merge | archive | restore | rollback | import-apply ...]
+[POST /chunks/:id/patch | split | merge | archive | restore | rollback | verify | reject | auto-verify | batch-verify | import-apply ...]
   ↓
 apply_chunk_revision (src/knowledge_wiki/chunk_revisions.rs)
   ├─ 1. 锁定字段守门：patch 含 chunk_id / wiki_type / created_at / source_anchor /
