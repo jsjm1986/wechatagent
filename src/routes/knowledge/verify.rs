@@ -404,8 +404,8 @@ source_anchors: {}
         // D2：auto_verify 的每条裁决也接回 apply_chunk_revision，留 chunk_revisions
         // 审计痕迹。**source=Rule**（非 Human）：裁决由 LLM 自评 + 规则闸门
         // （decide_auto_verify_status + enforce_product_claim_human_audit + 抽样）做出，
-        // admin 只触发了批处理、并未逐条人工签字——标 Rule 才如实反映"规则化批处理写入"，
-        // 避免审计按 source 过滤时误判"有人逐条审定了这条"。created_by="auto_verify" 进一步
+        // admin 只触发了批处理、并未逐条审定——标 Rule 才如实反映"规则化批处理写入"，
+        // 避免审计按 source 过滤时误判"运营逐条审定了这条"。created_by="auto_verify" 进一步
         // 标识自动来源。perf：每条多一次 find_one+hash+revision insert+replace_one，但本循环
         // 已逐条串行调 LLM（数十秒级），DB 这点开销可忽略。失败不阻断整体（best-effort，
         // 沿用原 `let _ =` 容错姿态）。

@@ -158,6 +158,11 @@ pub struct ChunkFull {
     pub related_chunks: Vec<RelatedRefView>,
     pub verified: bool,
     pub business_topics: Vec<String>,
+    /// D3(a)：经哪种关系角色被拉入 opened。`None`=agent 直接 open / 正向关系
+    /// 跟随；`Some("contradiction")`=经 `contradicts` 关系拉入，prompt 渲染时附
+    /// 「仅供辨别、勿作支撑引用」话术（见 `build_prompt`）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relation_role: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -885,9 +890,15 @@ async fn answer_inner(
                     }
                     match open_chunk(state, &req.workspace_id, &id).await? {
                         Some(full) => {
-                            opened_seen.insert(id.clone());
-                            opened_now.push(id);
-                            opened.push(full);
+                            // D3(b)：open_chunk 可能把已被取代的旧版 redirect 到现行版本，
+                            // 故 opened_seen / opened_now 记 **full.chunk_id**（现行版 id）而非
+                            // 请求的旧 id——agent prompt 里看到、并据以 cite 的是现行版 id，
+                            // cite⊆opened 不变量靠这条对齐（filter_answer_against_opened 用
+                            // opened_seen 过滤）。redirect 命中已 open 过的现行版时跳过重复 push。
+                            if opened_seen.insert(full.chunk_id.clone()) {
+                                opened_now.push(full.chunk_id.clone());
+                                opened.push(full);
+                            }
                         }
                         None => {
                             not_found.push(id);
@@ -1100,10 +1111,80 @@ pub async fn list_catalog(
     Ok(chunks.into_iter().map(chunk_to_catalog_entry).collect())
 }
 
+/// D3(b)：superseded_by 版本链跟随的最大跳数（防超长链 / 兜底）。
+const MAX_REDIRECT_HOPS: usize = 8;
+
+/// D3(b)：沿 `superseded_by` 链把一个 chunk_id 解析到**现行版本**的 ObjectId。
+///
+/// 语义：一条 chunk 若 `superseded_by` 非空（指向取代它的新版 chunk_id hex），且新版
+/// 存在、同 workspace、`integrity_status="verified"`，就 redirect 到新版；新版自己又被
+/// superseded 时继续跟随，直到链尾 / 命中环 / 达 [`MAX_REDIRECT_HOPS`]。任一跳的新版
+/// 不满足条件（不存在 / 跨 workspace / 未 verified / id 非法）即**停在当前**有效版本，
+/// 绝不跳到一个取不到或未审定的目标。返回最终现行版本的 ObjectId。
+///
+/// 纯 redirect 解析（只读 `_id` + `superseded_by`），不强制 verified 门——起点可能是
+/// 任意 chunk（调用方各自把 verified 门）。防环：visited 集合记录已访问 hex。
+async fn resolve_superseded(
+    state: &AppState,
+    workspace_id: &str,
+    start: ObjectId,
+) -> AppResult<ObjectId> {
+    let mut current = start;
+    let mut visited: HashSet<String> = HashSet::new();
+    visited.insert(current.to_hex());
+    for _ in 0..MAX_REDIRECT_HOPS {
+        let chunk = state
+            .db
+            .operation_knowledge_chunks()
+            .find_one(
+                doc! { "_id": current, "workspace_id": workspace_id },
+                None,
+            )
+            .await?;
+        let Some(chunk) = chunk else { return Ok(current) };
+        // superseded_by 空白 / 缺失 → current 即现行版本。
+        let next_hex = match chunk.superseded_by.as_deref().map(str::trim) {
+            Some(s) if !s.is_empty() => s.to_string(),
+            _ => return Ok(current),
+        };
+        // 防环：已访问过的 id 不再跟随，停在 current。
+        if !visited.insert(next_hex.clone()) {
+            return Ok(current);
+        }
+        let next_oid = match ObjectId::parse_str(&next_hex) {
+            Ok(oid) => oid,
+            Err(_) => return Ok(current),
+        };
+        // 新版必须存在、同 workspace、verified 才 redirect；否则停在 current。
+        let next_ok = state
+            .db
+            .operation_knowledge_chunks()
+            .find_one(
+                doc! {
+                    "_id": next_oid,
+                    "workspace_id": workspace_id,
+                    "integrity_status": "verified",
+                },
+                None,
+            )
+            .await?
+            .is_some();
+        if !next_ok {
+            return Ok(current);
+        }
+        current = next_oid;
+    }
+    Ok(current)
+}
+
 /// 打开单条 chunk 的完整正文 + 引用 + relations。
 ///
 /// 默认只返回 `integrity_status="verified"` 的 chunk；非 verified（draft /
 /// needs_review）静默返回 `None`，避免 agent cite 到未 verify 的内容。
+///
+/// D3(b)：若请求的 chunk 已被 `superseded_by` 取代，先 [`resolve_superseded`] 到
+/// 现行版本再返回——返回的 `ChunkFull.chunk_id` 即新版 id，agent 看到并 cite 的就是
+/// 现行版本，cite⊆opened 不变量天然保持（调用方据此 id 推进 `opened_seen`）。
 pub async fn open_chunk(
     state: &AppState,
     workspace_id: &str,
@@ -1113,12 +1194,14 @@ pub async fn open_chunk(
         Ok(oid) => oid,
         Err(_) => return Ok(None),
     };
+    // D3(b)：先把已被取代的旧版 redirect 到现行版本（新版必须 verified）。
+    let resolved = resolve_superseded(state, workspace_id, oid).await?;
     let result = state
         .db
         .operation_knowledge_chunks()
         .find_one(
             doc! {
-                "_id": oid,
+                "_id": resolved,
                 "workspace_id": workspace_id,
                 "integrity_status": "verified",
             },
@@ -1189,7 +1272,9 @@ pub async fn follow_relations(
     let mut frontier: Vec<String> = vec![chunk_id.to_string()];
     // 按发现顺序收集完整文档：depth-1 在前、depth-2 在后；split_prefetch 取最前
     // FOLLOW_PREFETCH_BODIES 个载正文（即最相关的直接关联），其余转摘要。
-    let mut collected: Vec<OperationKnowledgeChunk> = Vec::new();
+    // D3(a)：每条目标带上它经哪种关系角色拉入（Support / Contradiction），
+    // Contradiction 在转 ChunkFull 时标 relation_role，prompt 警示「勿作支撑引用」。
+    let mut collected: Vec<(OperationKnowledgeChunk, RelationRole)> = Vec::new();
 
     'outer: for _ in 0..depth {
         let mut next: Vec<String> = Vec::new();
@@ -1209,22 +1294,33 @@ pub async fn follow_relations(
             let Some(chunk) = chunk else { continue };
             let related = chunk.related_chunks.unwrap_or_default();
             for rel in related {
-                if !visited.insert(rel.chunk_id.clone()) {
+                // D3(a)：按 relation_kind 的语义角色分流。
+                let role = classify_relation_role(&rel.kind);
+                // Version（superseded_by）是版本指针，不当普通关系扩散——版本 redirect
+                // 由 open_chunk/resolve_superseded 处理，这里跳过避免把旧→新版指针当材料。
+                if role == RelationRole::Version {
                     continue;
                 }
-                if opened_seen.contains(&rel.chunk_id) {
+                if !visited.insert(rel.chunk_id.clone()) {
                     continue;
                 }
                 let target_oid = match ObjectId::parse_str(&rel.chunk_id) {
                     Ok(oid) => oid,
                     Err(_) => continue,
                 };
+                // D3(b)：关系目标若已被取代，redirect 到现行版本再收集，避免旧版正文进 opened。
+                let resolved_oid = resolve_superseded(state, workspace_id, target_oid).await?;
+                let resolved_hex = resolved_oid.to_hex();
+                // redirect 后的现行版可能已被 open / 已收集过 → 去重。
+                if opened_seen.contains(&resolved_hex) || !visited.insert(resolved_hex.clone()) {
+                    continue;
+                }
                 if let Some(target) = state
                     .db
                     .operation_knowledge_chunks()
                     .find_one(
                         doc! {
-                            "_id": target_oid,
+                            "_id": resolved_oid,
                             "workspace_id": workspace_id,
                             "status": "active",
                             "integrity_status": "verified",
@@ -1233,8 +1329,8 @@ pub async fn follow_relations(
                     )
                     .await?
                 {
-                    collected.push(target);
-                    next.push(rel.chunk_id);
+                    collected.push((target, role));
+                    next.push(resolved_hex);
                     if collected.len() >= FOLLOW_RELATIONS_LIMIT {
                         break 'outer;
                     }
@@ -1248,9 +1344,20 @@ pub async fn follow_relations(
     }
 
     let (prefetch_chunks, rest_chunks) = split_prefetch(collected, FOLLOW_PREFETCH_BODIES);
-    let prefetched: Vec<ChunkFull> = prefetch_chunks.into_iter().map(chunk_to_full).collect();
-    let catalog: Vec<CatalogEntry> =
-        rest_chunks.into_iter().map(chunk_to_catalog_entry).collect();
+    let prefetched: Vec<ChunkFull> = prefetch_chunks
+        .into_iter()
+        .map(|(chunk, role)| {
+            let mut full = chunk_to_full(chunk);
+            if role == RelationRole::Contradiction {
+                full.relation_role = Some("contradiction".to_string());
+            }
+            full
+        })
+        .collect();
+    let catalog: Vec<CatalogEntry> = rest_chunks
+        .into_iter()
+        .map(|(chunk, _role)| chunk_to_catalog_entry(chunk))
+        .collect();
     Ok((catalog, prefetched))
 }
 
@@ -1320,6 +1427,36 @@ fn chunk_to_full(chunk: OperationKnowledgeChunk) -> ChunkFull {
         related_chunks,
         verified,
         business_topics: chunk.business_topics,
+        relation_role: None,
+    }
+}
+
+/// D3(a)：`related_chunks` 的 `relation_kind` 在 BFS 遍历时的语义角色。
+///
+/// 6 种 kind（`ALLOWED_RELATION_KINDS`，routes/knowledge/wiki_edit.rs）按检索语义
+/// 分三类——决定 `follow_relations` 该如何对待跳转目标：
+/// - **Support**：references/requires/clarifies/refines——正向支撑材料，照旧跟随、
+///   作为 opened 正文喂给 agent。
+/// - **Contradiction**：contradicts——「与来源 chunk 矛盾的说法」，是警示标记而非
+///   支撑。仍跟随（用户要 agent 能看到做对比辨别），但在 prompt 里标注「仅供辨别、
+///   勿作支撑引用」（见 `ChunkFull.relation_role` + `build_prompt`）。
+/// - **Version**：superseded_by——版本指针，不作为普通关系扩散（旧版指向新版，应由
+///   `resolve_superseded` 在 open/follow 时做版本 redirect，而非当关系材料拉入）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RelationRole {
+    Support,
+    Contradiction,
+    Version,
+}
+
+/// 把 `relation_kind` 字符串映射到 [`RelationRole`]。未知 kind 归 Support（保守：
+/// 宁可当普通支撑跟随，也不静默丢弃——白名单校验在写入侧 `relate` 端点已把关）。
+pub fn classify_relation_role(kind: &str) -> RelationRole {
+    match kind {
+        "contradicts" => RelationRole::Contradiction,
+        "superseded_by" => RelationRole::Version,
+        // references / requires / clarifies / refines + 任何未知 kind
+        _ => RelationRole::Support,
     }
 }
 
@@ -1404,6 +1541,7 @@ fn build_prompt(
                     "relatedChunks": c.related_chunks,
                     "verified": c.verified,
                     "businessTopics": c.business_topics,
+                    "relationRole": c.relation_role,
                 })
             })
             .collect::<Vec<_>>(),
@@ -1452,6 +1590,7 @@ fn build_prompt(
 - follow_relations 会把最相关的关联条目【正文】直接载入上面"已 open 的 chunks"，可当轮直接 cite，无需再 open_chunk。
 - 每个 cited 必须配 sourceQuote；如某 chunk 没有可引用原文，可省略 sourceQuote 但仍可 cite。
 - 候选 catalog 中所有 chunk 都已 integrity_status=verified；遇到 verified=false 是异常，不要 cite。
+- **关系角色（relationRole）**：已 open 的 chunk 若带 `relationRole="contradiction"`，表示它是经 `contradicts` 关系拉入的【与来源 chunk 相矛盾的说法】，**仅供你对比辨别用，绝不可作为支撑材料 cite**；遇到矛盾，应据其余正向（无 relationRole 标记的）chunk 作答，必要时点明"就该点存在不同说法、建议运营核实"，但不要把矛盾说法当确切事实引用。
 - 不要复述 catalog 中的整段 summary；用自然语言总结答复。"#,
         query = query,
         round = round,
@@ -1790,6 +1929,7 @@ pub(crate) mod test_helpers {
             related_chunks: Vec::new(),
             verified: true,
             business_topics: Vec::new(),
+            relation_role: None,
         }
     }
 
@@ -1812,6 +1952,88 @@ pub(crate) mod test_helpers {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn classify_relation_role_maps_all_six_kinds() {
+        // D3(a)：六种合法 relation_kind 的语义分类锁定。
+        assert_eq!(classify_relation_role("references"), RelationRole::Support);
+        assert_eq!(classify_relation_role("requires"), RelationRole::Support);
+        assert_eq!(classify_relation_role("clarifies"), RelationRole::Support);
+        assert_eq!(classify_relation_role("refines"), RelationRole::Support);
+        assert_eq!(
+            classify_relation_role("contradicts"),
+            RelationRole::Contradiction
+        );
+        assert_eq!(
+            classify_relation_role("superseded_by"),
+            RelationRole::Version
+        );
+    }
+
+    #[test]
+    fn classify_relation_role_unknown_falls_back_to_support() {
+        // 未知 kind 保守归 Support（白名单在 relate 写入侧把关；这里不静默丢弃）。
+        assert_eq!(classify_relation_role(""), RelationRole::Support);
+        assert_eq!(classify_relation_role("supersedes"), RelationRole::Support);
+        assert_eq!(classify_relation_role("random_kind"), RelationRole::Support);
+    }
+
+    /// D3(a) 命门：relation_role="contradiction" 的 opened chunk 必须在 build_prompt
+    /// 输出里既带 `relationRole` 字段、又有规则区"勿作支撑引用"警示——否则标记送不到
+    /// agent = 等于没修。锁住字段名拼写 + 警示话术不被误删。
+    #[test]
+    fn build_prompt_surfaces_contradiction_marker_and_warning() {
+        let contra = ChunkFull {
+            chunk_id: "c_contra".to_string(),
+            wiki_type: "methodology".to_string(),
+            chunk_type: "product_fact".to_string(),
+            title: "矛盾说法".to_string(),
+            summary: "s".to_string(),
+            body: "与来源矛盾的正文".to_string(),
+            source_quote: None,
+            source_anchors: Vec::new(),
+            related_chunks: Vec::new(),
+            verified: true,
+            business_topics: Vec::new(),
+            relation_role: Some("contradiction".to_string()),
+        };
+        let prompt = build_prompt("任意查询", &[contra], &[], 1, 4);
+        // 1) opened JSON 必须把 relation_role 渲染成 relationRole 字段（字段名拼写锁）。
+        assert!(
+            prompt.contains("\"relationRole\": \"contradiction\""),
+            "build_prompt 必须把 contradiction 标记渲染进 opened JSON: {prompt}"
+        );
+        // 2) 规则区必须有"勿引用矛盾说法"的警示话术（话术不被误删）。
+        assert!(
+            prompt.contains("关系角色") && prompt.contains("绝不可作为支撑材料 cite"),
+            "build_prompt 规则区必须警示 contradiction 仅供辨别勿作支撑引用: {prompt}"
+        );
+    }
+
+    #[test]
+    fn build_prompt_omits_relation_role_for_normal_opened() {
+        // 无 relation_role 的普通 opened chunk：relationRole 渲染为 null（serde 不 skip，
+        // 但值为 null），不应出现 "contradiction" 字样——DEFAULT 路径无警示污染。
+        let normal = ChunkFull {
+            chunk_id: "c_normal".to_string(),
+            wiki_type: "methodology".to_string(),
+            chunk_type: "product_fact".to_string(),
+            title: "普通".to_string(),
+            summary: "s".to_string(),
+            body: "正文".to_string(),
+            source_quote: None,
+            source_anchors: Vec::new(),
+            related_chunks: Vec::new(),
+            verified: true,
+            business_topics: Vec::new(),
+            relation_role: None,
+        };
+        let prompt = build_prompt("查询", &[normal], &[], 1, 4);
+        assert!(
+            !prompt.contains("\"relationRole\": \"contradiction\""),
+            "普通 chunk 不应带 contradiction 标记"
+        );
+    }
 
     #[test]
     fn split_prefetch_caps_and_preserves_order() {
