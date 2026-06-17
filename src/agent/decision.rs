@@ -606,6 +606,7 @@ pub(crate) async fn decide_reply_with_promote(
 标签: {}
 客户阶段: {}
 意向等级: {}
+购买生命周期: {}
 最近承诺: {}
 跟进策略: {}
 自由画像字段: {}
@@ -655,6 +656,11 @@ pub(crate) async fn decide_reply_with_promote(
             .domain_attributes
             .as_ref()
             .and_then(|doc| doc.get_str("intent_level").ok().map(|s| s.to_string()))
+            .unwrap_or_default(),
+        contact
+            .domain_attributes
+            .as_ref()
+            .and_then(|doc| doc.get_str("purchase_lifecycle").ok().map(|s| s.to_string()))
             .unwrap_or_default(),
         contact
             .commitments

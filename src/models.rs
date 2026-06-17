@@ -1630,6 +1630,12 @@ pub struct OperationMode {
     /// 默认开（DEFAULT_PROFILE / 无 override → scan_calendar 天然 no-op，金标零变化）。
     #[serde(default)]
     pub calendar: CalendarMode,
+    /// 续费推进驱动力（`scan_renewal`）。客户持有产品临近到期时主动推进续费（=最高优先级
+    /// 销售）+ 临场挽留诊断。**默认 `enabled=false`**（同 calendar）：续费触达需运营在
+    /// 交易域 profile / contact override 显式开；DEFAULT_PROFILE 关 → scan_renewal 天然
+    /// no-op，所有 planner 金标零变化。
+    #[serde(default)]
+    pub renewal: RenewalMode,
 }
 
 impl Default for OperationMode {
@@ -1640,6 +1646,7 @@ impl Default for OperationMode {
             commitment: CommitmentMode::default(),
             quiet_hours: QuietHoursMode::default(),
             calendar: CalendarMode::default(),
+            renewal: RenewalMode::default(),
         }
     }
 }
@@ -1735,6 +1742,34 @@ pub struct CalendarMode {
 impl Default for CalendarMode {
     fn default() -> Self {
         Self { enabled: false, lookahead_days: None, daily_cap: None }
+    }
+}
+
+/// 续费推进驱动力。`scan_renewal` 在客户持有产品的售后/有效期临近到期（或刚过期）时主动
+/// 发起 follow-up，让 Reply Agent 按销售链路推进续费（=最高优先级销售）+ 临场挽留。
+///
+/// **`enabled` 默认 `false`**（同 calendar，区别于 funnel/silence/commitment 默认 true）：
+/// 续费触达需交易域 profile / contact override 显式开；DEFAULT_PROFILE renewal 关 →
+/// scan_renewal 对每个 contact 短路、天然 no-op，所有 planner 金标零变化。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RenewalMode {
+    #[serde(default)]
+    pub enabled: bool,
+    /// 到期前几天起允许续费触达。`None` → 回落 `strategic_planner_renewal_lookahead_days`（默认 14）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lookahead_days: Option<i64>,
+    /// 已过期回看窗（天）：刚过期 N 天内仍主动挽留。`None` → 回落
+    /// `strategic_planner_renewal_grace_days`（默认 7）。过期超此窗后不再触达，自然收口。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grace_days: Option<i64>,
+    /// 本驱动力的独立每日 emit 上限。`None` → 回落 `strategic_planner_renewal_daily_cap`（默认 3）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub daily_cap: Option<i64>,
+}
+
+impl Default for RenewalMode {
+    fn default() -> Self {
+        Self { enabled: false, lookahead_days: None, grace_days: None, daily_cap: None }
     }
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
