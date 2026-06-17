@@ -195,7 +195,7 @@ fn strongest_key_present() -> bool {
 /// 失效**：备胎已同源 NVIDIA integrate 同 key（[[reference_llm_backup_gpt55]]），切了照样撞同一
 /// 429，早切反让全链秒耗尽 → 测试全 skip 假绿。timeout 墙已 45→90min 给足，宁可主模型多等拿真分。
 fn primary_max_retries() -> u32 {
-    6
+    10
 }
 
 /// 构造最强模型 client（llama-3.3-70b @ NVIDIA integrate，OpenAI 兼容）。缺 `REAL_LLM_JUDGE_API_KEY` →

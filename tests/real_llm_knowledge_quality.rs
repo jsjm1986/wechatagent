@@ -216,7 +216,7 @@ fn failover_key_present() -> bool {
 /// integrate 同 key（[[reference_llm_backup_gpt55]]），切了照样撞同一 429，早切反让全链秒耗尽 →
 /// 测试全 skip 假绿。timeout 墙已 45→90min 给足，宁可主模型多等也要拿真分。
 fn primary_max_retries() -> u32 {
-    6
+    10
 }
 
 /// 构建异端点备胎链（默认 NVIDIA integrate 端点）。缺 key → 空 vec（退化 primary-only）。
@@ -2116,7 +2116,7 @@ async fn q3_vision_extraction_quality() {
         model: vision_model,
         is_active: false,
         timeout_seconds: Some(180),
-        max_retries: Some(5),
+        max_retries: Some(10),
         retry_base_ms: Some(2500),
         supports_vision: true,
         is_vision_active: true,
@@ -2151,7 +2151,7 @@ async fn q3_vision_extraction_quality() {
             model: backup_model,
             is_active: false,
             timeout_seconds: Some(180),
-            max_retries: Some(5),
+            max_retries: Some(10),
             retry_base_ms: Some(2500),
             supports_vision: true,
             is_vision_active: false,

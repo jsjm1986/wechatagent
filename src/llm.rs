@@ -875,11 +875,38 @@ impl LlmProvider for LlmClient {
         mime: &str,
     ) -> AppResult<Value> {
         match self.format {
-            LlmFormat::Openai => self
-                .generate_json_once_openai_vision(system, user, image_base64, mime)
-                .await
-                .map(|r| r.value)
-                .map_err(|err| classify_llm_error_for_user(&err, 0)),
+            // vision 走与文本同款的重试循环（此前单次调用、retry_count=0，端点偶发
+            // 5xx/524 直接 skip 假绿——CI 实测 T3/K6/Q3 因此从不真跑）。复用
+            // is_retryable_llm_error + compute_backoff，让 vision 也能熬过端点抖动。
+            LlmFormat::Openai => {
+                let mut last_error: Option<AppError> = None;
+                let mut retry_count: u32 = 0;
+                for attempt in 1..=self.max_retries {
+                    match self
+                        .generate_json_once_openai_vision(system, user, image_base64, mime)
+                        .await
+                    {
+                        Ok(r) => return Ok(r.value),
+                        Err(error)
+                            if attempt < self.max_retries && is_retryable_llm_error(&error) =>
+                        {
+                            let retry_after_secs = parse_retry_after_from_error(&error);
+                            let delay =
+                                compute_backoff(attempt, self.retry_base_ms, retry_after_secs);
+                            last_error = Some(error);
+                            sleep(delay).await;
+                            retry_count = retry_count.saturating_add(1);
+                        }
+                        Err(error) => {
+                            return Err(classify_llm_error_for_user(&error, retry_count));
+                        }
+                    }
+                }
+                let final_err = last_error.unwrap_or_else(|| {
+                    AppError::External("vision request failed after retries".to_string())
+                });
+                Err(classify_llm_error_for_user(&final_err, retry_count))
+            }
             // Anthropic 的图片 block 形态（source.type=base64）与 OpenAI 不同，
             // 当前仅支持 OpenAI 兼容视觉端点；Anthropic 视觉留待后续。
             LlmFormat::Anthropic => Err(AppError::External(
