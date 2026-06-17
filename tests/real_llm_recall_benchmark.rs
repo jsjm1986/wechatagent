@@ -45,7 +45,7 @@ fn real_llm_from_env() -> Option<Arc<LlmClient>> {
     let base_url = std::env::var("REAL_LLM_BASE_URL")
         .unwrap_or_else(|_| "https://api.supxh.xin/v1".to_string());
     let model = std::env::var("REAL_LLM_MODEL").unwrap_or_else(|_| "deepseek-v4-pro".to_string());
-    let client = build_real_client(base_url, api_key, model, "REAL_LLM_FORMAT", 6);
+    let client = build_real_client(base_url, api_key, model, "REAL_LLM_FORMAT", 10);
     Some(Arc::new(client))
 }
 

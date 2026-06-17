@@ -137,7 +137,7 @@ fn failover_key_present() -> bool {
 }
 
 fn primary_max_retries() -> u32 {
-    6
+    10
 }
 
 fn strongest_model_client() -> Option<Arc<LlmClient>> {

@@ -167,7 +167,7 @@ fn failover_key_present() -> bool {
 
 /// 主模型重试预算：6 次指数退避（base 2500ms）熬过限流窗。
 fn primary_max_retries() -> u32 {
-    6
+    10
 }
 
 /// 构造最强模型 client（llama-3.3-70b @ NVIDIA integrate）。缺 `REAL_LLM_JUDGE_API_KEY` → None。
