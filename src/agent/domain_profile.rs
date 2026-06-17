@@ -672,6 +672,9 @@ pub fn default_domain_profile(workspace_id: &str) -> DomainProfile {
         // reviewer 优化：DEFAULT 销售域 = false → 沿用既有 should_run_review 判定
         // （字节等价）；高敏域（情感陪伴）seed 时显式置 true 强制走 LLM review。
         distrust_self_reported_low_risk: false,
+        // G4 #5：DEFAULT 是销售域（交易型）= true → 注入产品目录 + 持有投影段（逐字等价
+        // 历史行为，反过拟合护栏）。非交易域 profile 显式置 false 关闭交易事实注入。
+        transaction_facts_enabled: true,
         // H16：DEFAULT 销售域 = 逐字复刻 knowledge_router 写死的四态角色（字节等价）。
         chunk_roles: default_chunk_roles(),
         // H11：DEFAULT 销售极性 = 显式填回回路① fallback 常量（正极 buying_signal +
@@ -718,6 +721,7 @@ pub fn default_domain_profile(workspace_id: &str) -> DomainProfile {
 /// - `conversation_modes` 含 `intimate_companion`（H9：不只销售四模式）；
 /// - `grounding_gate_bypass_without_claim = true`（H14：纯情感回复不被 grounding 误拦）；
 /// - `distrust_self_reported_low_risk = true`（高敏域强制走 LLM review）；
+/// - `transaction_facts_enabled = false`（G4 #5：非交易域不注入产品/持有事实）；
 /// - `operation_mode.funnel.enabled = false`（H8：陪伴不催进成交）。
 pub fn example_emotional_companion_profile(workspace_id: &str) -> DomainProfile {
     let mut profile = default_domain_profile(workspace_id);
@@ -732,6 +736,9 @@ pub fn example_emotional_companion_profile(workspace_id: &str) -> DomainProfile 
     ];
     profile.grounding_gate_bypass_without_claim = true;
     profile.distrust_self_reported_low_risk = true;
+    // G4 #5：情感陪伴是非交易域 → 显式关交易事实注入（派生自 default_domain_profile 的
+    // true，不显式覆盖会继承注入）。即便 admin 误配产品表也不让"已购买X"裸入情感对话。
+    profile.transaction_facts_enabled = false;
     profile.operation_mode.funnel.enabled = false;
     // §3.7：开启主动情绪关怀驱动力（销售域默认关）。纪念日/生日当天主动触达。
     profile.operation_mode.calendar.enabled = true;
@@ -1116,6 +1123,24 @@ mod tests {
         // reviewer 优化逐字等价护栏：DEFAULT_PROFILE = false → 沿用既有
         // should_run_review 判定（销售域字节等价）；高敏域 seed 时才置 true。
         assert!(!p.distrust_self_reported_low_risk);
+        // G4 #5 逐字等价护栏：DEFAULT 是销售域（交易型）→ transaction_facts_enabled=true，
+        // 决策注入产品目录 + 持有投影段，与改造前注入行为字节等价。注意此开关默认 false
+        // 不代表销售等价（销售行为是注入），故 default_domain_profile 必须显式置 true。
+        assert!(
+            p.transaction_facts_enabled,
+            "DEFAULT 销售域必须开交易事实注入（反过拟合护栏）"
+        );
+    }
+
+    #[test]
+    fn emotional_companion_disables_transaction_facts() {
+        // G4 #5：情感陪伴是非交易域 → 显式关交易事实注入，即便 admin 误配产品表也不让
+        // "已购买X"裸入情感对话。派生自 default（true），必须被显式覆盖为 false。
+        let p = example_emotional_companion_profile("ws-1");
+        assert!(
+            !p.transaction_facts_enabled,
+            "情感陪伴域必须关交易事实注入"
+        );
     }
 
     #[test]

@@ -28,6 +28,7 @@ interface OutcomeProductRef {
   unitPrice?: number | null;
   sku?: string | null;
   quantity: number;
+  entitlementDays?: number | null;
 }
 
 interface OutcomeEvent {

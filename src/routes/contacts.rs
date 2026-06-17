@@ -756,6 +756,8 @@ pub(super) async fn add_deal_event(
                 unit_price: product.price,
                 sku: product.sku.clone(),
                 quantity: payload.quantity.unwrap_or(1).max(1),
+                // G4 #4：冻结成交当时的售后期天数，使产品日后 archived 也不丢已购客户的 in_aftercare。
+                entitlement_days: agent::entitlements::entitlement_days_of(&product),
             })
         }
         None => None,
