@@ -94,3 +94,127 @@ fn output_format_lists_dims_as_json_keys() {
         );
     }
 }
+
+// ── R1.2 失败分级（用 mock provider 确定性验证 gate 行为，无需真模型）──────────
+use async_trait::async_trait;
+use common::judge::{run_judge_graded, JudgeGate};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use wechatagent::error::{AppError, AppResult};
+use wechatagent::llm::{ChatUsage, LlmJsonResult, LlmProvider};
+
+/// 永远返回指定错误的 mock judge（测 gate 失败处置）。
+struct FailingJudge {
+    kind: String,
+    detail: String,
+    calls: AtomicUsize,
+}
+#[async_trait]
+impl LlmProvider for FailingJudge {
+    async fn generate_json(&self, _s: &str, _u: &str) -> AppResult<serde_json::Value> {
+        unreachable!()
+    }
+    async fn generate_json_with_usage(&self, _s: &str, _u: &str) -> AppResult<LlmJsonResult> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Err(AppError::LlmUnavailable {
+            kind: self.kind.clone(),
+            retry_count: 0,
+            detail: self.detail.clone(),
+            hint: String::new(),
+        })
+    }
+}
+
+/// 永远返回合法打分的 mock judge（测成功路径）。
+struct ScoringJudge;
+#[async_trait]
+impl LlmProvider for ScoringJudge {
+    async fn generate_json(&self, _s: &str, _u: &str) -> AppResult<serde_json::Value> {
+        unreachable!()
+    }
+    async fn generate_json_with_usage(&self, _s: &str, _u: &str) -> AppResult<LlmJsonResult> {
+        Ok(LlmJsonResult {
+            value: serde_json::json!({
+                "humanLike": {"score": 8, "reason": "x"},
+                "emotionalValue": {"score": 7, "reason": "x"},
+                "overall": {"score": 8, "reason": "x"},
+                "verdict": "ok"
+            }),
+            usage: ChatUsage::default(),
+            latency_ms: 0,
+            model: "mock".into(),
+            retry_count: 0,
+        })
+    }
+}
+
+fn set_judge_env() {
+    std::env::set_var("REAL_LLM_JUDGE", "1");
+}
+
+#[tokio::test]
+async fn observe_only_swallows_transient_failure() {
+    set_judge_env();
+    let r = build_judge_rubric(&default_domain_profile("ws"));
+    let judge = FailingJudge {
+        kind: "http_5xx".into(),
+        detail: "LLM HTTP 503".into(),
+        calls: AtomicUsize::new(0),
+    };
+    // ObserveOnly：端点抖动(5xx)全失败 → 返 None，绝不 panic。
+    let out = run_judge_graded(&judge, &r, "t", "in", "reply", 2, JudgeGate::ObserveOnly).await;
+    assert!(out.is_none(), "ObserveOnly 下抖动失败应返 None 不 panic");
+}
+
+#[tokio::test]
+#[should_panic(expected = "唯一质量门")]
+async fn quality_gate_fails_when_all_samples_fail() {
+    set_judge_env();
+    let r = build_judge_rubric(&default_domain_profile("ws"));
+    let judge = FailingJudge {
+        kind: "http_5xx".into(),
+        detail: "LLM HTTP 503".into(),
+        calls: AtomicUsize::new(0),
+    };
+    // QualityGate：judge 全失败 → panic（不静默绿）。
+    let _ = run_judge_graded(&judge, &r, "t", "in", "reply", 2, JudgeGate::QualityGate).await;
+}
+
+#[tokio::test]
+#[should_panic(expected = "端点配错")]
+async fn endpoint_misconfig_panics_even_observe_only() {
+    set_judge_env();
+    let r = build_judge_rubric(&default_domain_profile("ws"));
+    let judge = FailingJudge {
+        kind: "endpoint_not_found".into(),
+        detail: "LLM HTTP 404".into(),
+        calls: AtomicUsize::new(0),
+    };
+    // R0.3：端点配错(404/405)即便 ObserveOnly 也 panic，堵漏 /v1 假绿。
+    let _ = run_judge_graded(&judge, &r, "t", "in", "reply", 2, JudgeGate::ObserveOnly).await;
+}
+
+#[tokio::test]
+async fn account_level_402_not_misconfig_observe_swallows() {
+    set_judge_env();
+    let r = build_judge_rubric(&default_domain_profile("ws"));
+    let judge = FailingJudge {
+        kind: "http_4xx".into(),
+        detail: "LLM HTTP 402: insufficient balance".into(),
+        calls: AtomicUsize::new(0),
+    };
+    // 账户级 402 不算端点配错 → ObserveOnly 照常吞，返 None 不 panic。
+    let out = run_judge_graded(&judge, &r, "t", "in", "reply", 1, JudgeGate::ObserveOnly).await;
+    assert!(out.is_none(), "402 账户级应按 gate 处置，ObserveOnly 返 None");
+}
+
+#[tokio::test]
+async fn scoring_judge_returns_medians() {
+    set_judge_env();
+    let r = build_judge_rubric(&default_domain_profile("ws"));
+    let out = run_judge_graded(&ScoringJudge, &r, "t", "in", "reply", 3, JudgeGate::QualityGate)
+        .await
+        .expect("成功打分应返 Some");
+    assert_eq!(out.medians.get("humanLike"), Some(&8));
+    assert!(out.attempted >= 1);
+}
+
