@@ -77,6 +77,31 @@ fn normalize_json_keys(value: Value) -> Value {
     }
 }
 
+/// 把 LLM 偶发"该是字符串却给成对象/数组"的标量字段压平成文本——`DomainProfile` 的
+/// `description` / `prompt_fragment` 是 `String` / `Option<String>`，但生成 prompt 把
+/// `promptFragment` 描述成"一段真实的 AI 决策思考"，claude 在复杂域（情感陪伴/教培）
+/// 偶发把它组织成 `{"客户处境":"…","我的思考":"…"}` 这类对象 → `from_document`
+/// 反序列化到 `String` 直接 `invalid type: map, expected a string`（CI run 27678306055
+/// 实测）。这里在 snake_case 归一后、转 Document 前，对**顶层已知标量字段**做类型矫正：
+/// 值是对象/数组则序列化成紧凑 JSON 文本（**内容不丢**，符合"要的是它的内容"），
+/// 是字符串/null 原样。只碰这两个顶层标量字段，不递归、不动数组/嵌套结构。
+fn coerce_scalar_string_fields(value: Value) -> Value {
+    const SCALAR_STRING_KEYS: &[&str] = &["description", "prompt_fragment"];
+    let Value::Object(mut map) = value else {
+        return value;
+    };
+    for key in SCALAR_STRING_KEYS {
+        if let Some(v) = map.get_mut(*key) {
+            if v.is_object() || v.is_array() {
+                // 对象/数组 → 紧凑 JSON 文本；序列化失败（不应发生）则退成空串占位。
+                let text = serde_json::to_string(v).unwrap_or_default();
+                *v = Value::String(text);
+            }
+        }
+    }
+    Value::Object(map)
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GenerateProfileRequest {
@@ -178,8 +203,10 @@ fn build_profile_generation_prompt(
 
 **重要提醒：**
 - profile_id 是唯一标识，固定为「{profile_id}」，不要改动。
-- 如果某个维度或公式在你的行业里没有对应的，不要硬凑——给空数组或空串就好。
-- promptFragment 要写得像一段真实思考，不是产品说明书。"#,
+- 如果某个**公式/承诺词/覆盖维度**在你的行业里没有对应的，不要硬凑——给空数组或空串就好。
+- promptFragment 要写得像一段真实思考，不是产品说明书。
+- **字段类型严格**：`promptFragment`、`description` 必须是**单个纯文本字符串**（哪怕内容很长、包含多段思考，也要写在一个字符串里，用换行分隔），**不要写成 `{{...}}` 对象或数组**。
+- `profileDimensions` **必须**给出至少 3 个维度（这是配置的核心，不能为空数组）；每个维度的 `kind` 和 `displayName` 都必须是非空字符串。"#,
         business_description = business_description,
         knowledge_context = knowledge_context,
         display_name = display_name,
@@ -236,7 +263,7 @@ pub async fn generate_domain_profile_candidate(
     )
     .await?;
 
-    let normalized = normalize_json_keys(generated);
+    let normalized = coerce_scalar_string_fields(normalize_json_keys(generated));
     let mut doc: Document = mongodb::bson::to_document(&normalized)
         .map_err(|e| AppError::External(format!("LLM 输出非对象: {e}")))?;
     doc.insert("profile_id", &payload.profile_id);
@@ -306,7 +333,7 @@ async fn next_candidate_version(
 
 #[cfg(test)]
 mod tests {
-    use super::{normalize_json_keys, to_snake_case};
+    use super::{coerce_scalar_string_fields, normalize_json_keys, to_snake_case};
     use serde_json::json;
 
     /// 生产输入的正确性基线:LLM 实际输出的典型 camelCase key 必须正确归一化。
@@ -361,5 +388,41 @@ mod tests {
         // 原始 camelCase key 不应残留。
         assert!(out.get("displayName").is_none());
         assert!(out["nested"].get("coverageDimensions").is_none());
+    }
+
+    #[test]
+    fn coerce_flattens_object_prompt_fragment_to_text() {
+        // claude 把 prompt_fragment 写成对象（复杂域常见）→ 压平成 JSON 文本，内容不丢。
+        let input = json!({
+            "description": "正常字符串",
+            "prompt_fragment": { "客户处境": "焦虑", "我的思考": "先倾听" }
+        });
+        let out = coerce_scalar_string_fields(input);
+        assert!(out["prompt_fragment"].is_string(), "对象应被压平成字符串");
+        let s = out["prompt_fragment"].as_str().unwrap();
+        assert!(s.contains("客户处境") && s.contains("先倾听"), "内容须保留: {s}");
+        // 本就是字符串的 description 原样不动。
+        assert_eq!(out["description"], json!("正常字符串"));
+    }
+
+    #[test]
+    fn coerce_leaves_valid_strings_and_other_fields_untouched() {
+        // 字符串/数组结构字段（profile_dimensions）不受影响——只矫正已知标量字段的对象/数组值。
+        let input = json!({
+            "description": "一句话描述",
+            "prompt_fragment": "一段纯文本思考",
+            "profile_dimensions": [{ "kind": "stage", "display_name": "学段" }]
+        });
+        let out = coerce_scalar_string_fields(input.clone());
+        assert_eq!(out, input, "全合法输入应原样返回");
+    }
+
+    #[test]
+    fn coerce_flattens_array_description() {
+        // description 偶发被写成数组（分点）→ 压平成 JSON 文本而非反序列化失败。
+        let input = json!({ "description": ["点1", "点2"] });
+        let out = coerce_scalar_string_fields(input);
+        assert!(out["description"].is_string());
+        assert!(out["description"].as_str().unwrap().contains("点1"));
     }
 }
