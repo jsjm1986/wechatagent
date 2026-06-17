@@ -641,7 +641,7 @@ casual 模式的"收紧压力门"会与"热烈推进"打架（非误杀，是模
 
 **分阶段落码**：
 - **阶段 1（✅ 本次落码）**：让 AI 能「主动发起续费推进 + 临场挽留诊断」。系统已有约 70% 能力可复用，**不建第二套状态机**——复用 purchase_lifecycle 维度（repurchase/aftercare 值）+ objection 诊断闭环（objection_type 维度 + memory_card.objections 槽位 + 顾虑回流 prompt）+ reaction 五态识别（stop_requested 即时撤回在途触达）+ planner 节奏控制 + customer_stage 的 dormant_reactivation 终态（=再激活落点）。
-- **阶段 2（待续）**：流失原因结构化记录（churn_reason + 时间）+ 流失/休眠状态落点 + 再激活扫描器（按 churn_reason 精准触达，重回销售环节）。
+- **阶段 2（✅ 已落码）**：流失原因结构化记录（churn_reason）+ 流失/休眠状态落点 + 再激活扫描器（按 churn_reason 精准触达，重回销售环节）。见下「scan_reactivation」段。
 
 **`scan_renewal` 设计（照 `scan_calendar` 骨架，DEFAULT 零扰动）**：
 - **数据来源**：G4 投影 `entitlements::project_entitlements` 产出每个持有产品的 `expires_at`/`in_aftercare`（续费续窗逻辑已落，#4-A）。扫描器对每条 entitlement 用纯函数 `renewal_due_soon(expires_at, now, lookahead, grace)` 判「到期落在 `[now-grace, now+lookahead]` 窗口内」。
@@ -652,6 +652,17 @@ casual 模式的"收紧压力门"会与"热烈推进"打架（非误杀，是模
   3. `config.rs` + `.env.example`：`strategic_planner_renewal_{lookahead_days=14, grace_days=7, daily_cap=3}`。tz 复用 calendar 的。
   4. `decision.rs`：prompt「当前画像」段加「购买生命周期」字段（读 `domain_attributes.purchase_lifecycle`，DEFAULT 两维 profile 空串字节等价）。
 - **护栏**：RenewalMode.enabled 默认 false → 销售 DEFAULT 域 scan_renewal no-op，金标零变化（`renewal_mode_default_disabled` 锁死）；grace 有限窗 + has_pending_follow_up 去重 + daily_cap 防刷屏；客户明确拒绝时 reaction 的 stop_requested 即时撤回在途触达（优雅放手）。
+
+**`scan_reactivation` 设计（阶段2，照 scan_renewal 骨架，DEFAULT 零扰动）**：
+- **核心原则（用户拍板）**：定期再激活、**绝不放任老客不管**。流失不是终点而是循环——挽留失败的老客转入休眠后必须被定期、可靠地重新唤醒，按流失原因重回销售环节。
+- **流失判定走 AI 语义**（agent-first，非规则计数）：Reply Agent 在续费挽留对话中识别客户明确拒绝/流失 → 输出 `customer_stage=dormant_reactivation` + `domainSignals.churn_reason=<原因>`。复用现有 domain_signals 写入内核（`insert_domain_signal_values`）落 `domain_attributes.churn_reason` dotted-key。
+- **流失原因载体**：①`domain_attributes.churn_reason` 标量（扫描器 dotted-key `$match` 精准过滤的地基）②intent_trajectory 逐轮历史（已带 objection_type + recorded_at）。原因分类用**独立 taxonomy kind `churn_reason`**（m021 seed 六值：价格太贵/效果不满意/需求变化/转竞品/时机不合适/其他），区别于 objection_type（对话异议）。
+- **休眠状态**：复用 `customer_stage.dormant_reactivation`（已有终态，**不**给 purchase_lifecycle 加 churned 避免双终态）。状态机给 dormant_reactivation 标 `allowFromAny:true`（任意阶段都可能流失 → 转休眠合法）。
+- **churn_reason 落库门控**：`retain_declared_dimensions` 白名单要求 churn_reason 在交易域 profile `profile_dimensions` 声明（participates_in_decision=true，m021 给示例 profile 草稿态 `$addToSet` 追加）；DEFAULT 销售 profile 不声明 → AI 不输出、不落库、零扰动。
+- **需动的结构（全 additive）**：①models.rs `ReactivationMode`（enabled 默认 false，第 7 子结构）②planner.rs `reactivation_recently_emitted`（cadence 节奏门控）+ `reactivation_candidate_filter`（粗筛 customer_stage=dormant_reactivation）+ `scan_reactivation` + 接线 ③config 三项（dormant_days=30/cadence_days=30/daily_cap=3）④m021 migration。
+- **两层兜底（落实「绝不放任」）**：有明确 churn_reason → 按原因精准再营销 content；无 churn_reason（只是沉默、AI 未拿到原因）→ 定期价值唤醒 content。休眠时长门控（dormant_days）+ cadence 节奏门控（每 cadence_days 唤醒一次，定期不刷屏也不遗忘）。
+- **与 scan_silent 边界**：silent=通用沉默唤醒（不分流、跨范式）；reactivation 专扫休眠态老客（被 TERMINAL_STAGES 排除出 stage_stagnation、现状无任何段唤醒，本扫描器补此空白）。
+- **护栏**：ReactivationMode.enabled 默认 false → DEFAULT 销售域 scan_reactivation no-op（`reactivation_mode_default_disabled` 锁死）；allowFromAny 改动经 state_transition_pbt 闭式参考自动跟随、金标零破坏。验证 lib 1263/0、四 PBT 36/0、no-takeover lint clean。
 
 ### Phase 4（可选）：清理 D2/D3 审计与图谱缺陷。 ✅**已完成（2026-06-17）**
 
