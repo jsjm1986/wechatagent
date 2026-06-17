@@ -1,0 +1,91 @@
+name: Nightly Dynamic Discovery
+
+# 「动态发现线」夜跑（spec R5-T0）。动态线 = LLM 真演客户做多轮动态博弈
+# （tests/real_llm_roleplay_arc.rs：roleplayer 真演客户 × agent 真回应 × 多轮闭合）。
+# 这类测试是**发现性**的、不进合并门——只在 nightly schedule 自动跑，把博弈链
+# 跑通的轨迹/skip 沉淀到 ledger artifact 供事后审。
+#
+# 与 ci.yml 完全独立：本文件不碰 ci.yml（避免并行会话冲突），未来要加新的动态测试
+# 直接在本 workflow 追加 job 即可。
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+on:
+  schedule:
+    # UTC 18:17 每天 = 北京时间 02:17（次日凌晨低峰）。刻意避开整点，错开 runner 高峰。
+    - cron: '17 18 * * *'
+  # 手动也能跑：随时在 Actions 页 Run workflow 触发一次，不必等夜跑。
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # R5.1 LLM 演客户动态博弈链（三族异族 R5.0.1：agent=claude-opus-4-8（RSXERMU/Anthropic）、
+  # roleplayer=NVIDIA llama-3.3-70b（NVIDIA_KEY，第三族，独立端点不占 rsxermu 并发））。
+  roleplay-arc-nightly:
+    name: Roleplay R5.1 动态博弈链 (nightly / 三族真模型)
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      REAL_LLM_API_KEY: ${{ secrets.RSXERMU_KEY }}
+      ROLEPLAYER_API_KEY: ${{ secrets.NVIDIA_KEY }}
+    steps:
+      # ── 缺 key 处理：与 PR 门（ci.yml R0.1「缺 key 必 exit 1 真 fail」）有意不同 ──
+      # 动态线是发现性的、**不进合并门**，且 rsxermu 单点无 failover（端点挂→动态线
+      # skip 进 ledger，不算假绿）。因此 nightly 缺 key/缺端点应 **skip 友好**：缺 key
+      # 只 echo 警告、后续 step 用 `if:` 守住整体跳过，但 **job 不 fail**——不该因
+      # key/端点抖动把发现性的 nightly 染红，污染「真红=真问题」信噪比。
+      - name: Warn if keys missing (nightly skip-friendly，不 fail)
+        if: ${{ env.REAL_LLM_API_KEY == '' || env.ROLEPLAYER_API_KEY == '' }}
+        run: |
+          echo "::warning::REAL_LLM_API_KEY(RSXERMU_KEY) 或 ROLEPLAYER_API_KEY(NVIDIA_KEY) 未配置——nightly 动态线本轮 skip（不 fail）。这是与 PR 门 R0.1『缺 key 必 fail』的有意区别：动态线发现性、不进合并门、单点无 failover，缺 key/端点抖动只 skip 进 ledger 不染红。"
+
+      - name: Checkout
+        if: ${{ env.REAL_LLM_API_KEY != '' && env.ROLEPLAYER_API_KEY != '' }}
+        uses: actions/checkout@v4
+
+      # 同 integration job：清预装 SDK 腾 ~30GB，否则 target + mongo 镜像撑爆磁盘。
+      - name: Free disk space
+        if: ${{ env.REAL_LLM_API_KEY != '' && env.ROLEPLAYER_API_KEY != '' }}
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android \
+            /usr/local/share/boost /usr/local/share/powershell \
+            /usr/lib/jvm "$AGENT_TOOLSDIRECTORY" || true
+          sudo docker image prune --all --force || true
+          df -h
+
+      - name: Install Rust toolchain
+        if: ${{ env.REAL_LLM_API_KEY != '' && env.ROLEPLAYER_API_KEY != '' }}
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry / target
+        if: ${{ env.REAL_LLM_API_KEY != '' && env.ROLEPLAYER_API_KEY != '' }}
+        uses: Swatinem/rust-cache@v2
+
+      # 被测 agent = claude-opus-4-8（rsxermu666.cn / Anthropic 非流式）；roleplayer 走
+      # NVIDIA llama-3.3-70b @ temperature 0.8。两端点异厂商天然异族，且 NVIDIA 异端点
+      # 不占 rsxermu 并发。
+      - name: cargo test --test real_llm_roleplay_arc (3 异族真模型 + testcontainers)
+        if: ${{ env.REAL_LLM_API_KEY != '' && env.ROLEPLAYER_API_KEY != '' }}
+        env:
+          RUSTFLAGS: ""
+          REAL_LLM_BASE_URL: https://rsxermu666.cn
+          REAL_LLM_MODEL: claude-opus-4-8
+          REAL_LLM_FORMAT: anthropic
+          ROLEPLAYER_BASE_URL: https://integrate.api.nvidia.com/v1
+          ROLEPLAYER_MODEL: meta/llama-3.3-70b-instruct
+          ROLEPLAYER_FORMAT: openai
+          ROLEPLAYER_TEMPERATURE: "0.8"
+        run: cargo test --no-fail-fast --test real_llm_roleplay_arc -- --ignored --nocapture
+
+      - name: Upload roleplay arc ledger
+        if: ${{ always() && env.REAL_LLM_API_KEY != '' && env.ROLEPLAYER_API_KEY != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: roleplay-arc-nightly-ledger
+          path: target/real_llm_ledger/
+          if-no-files-found: ignore
+          retention-days: 30

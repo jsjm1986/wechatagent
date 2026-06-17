@@ -821,6 +821,9 @@ async fn recall_benchmark_cross_industry() {
     let mut reach_stable_count = 0;
     let mut adopt_stable_count = 0;
     let mut total_cases = 0;
+    // 硬断言专用累加器（基于现有逐轮数据，不改测试主逻辑）：
+    let mut ran_cases = 0; // 实际产出结果的 case 数（排除全轮瞬时跳过）——硬断言分母
+    let mut per_case_reach_recall_range: Vec<f64> = Vec::new(); // 各 case 跨轮 reach 召回率极差(max-min)
 
     // 逐条 case 测试
     for case in cases {
@@ -895,6 +898,18 @@ async fn recall_benchmark_cross_industry() {
         if reach_stable { reach_stable_count += 1; }
         if adopt_stable { adopt_stable_count += 1; }
 
+        // 本 case 实际产出了结果（results 非空），计入硬断言分母
+        ran_cases += 1;
+
+        // 跨轮 reach 召回率极差(max-min)：漂移率上限断言用。复用已算的逐轮 reach_recalls，
+        // 不重跑、不改主逻辑；单轮(len<=1)极差天然为 0。
+        if let (Some(&mn), Some(&mx)) = (
+            reach_recalls.iter().min_by(|a, b| a.total_cmp(b)),
+            reach_recalls.iter().max_by(|a, b| a.total_cmp(b)),
+        ) {
+            per_case_reach_recall_range.push(mx - mn);
+        }
+
         // 召回率统计（取各轮均值）
         let avg_reach_recall: f64 = reach_recalls.iter().sum::<f64>() / reach_recalls.len() as f64;
         let avg_adopt_recall: f64 = adopt_recalls.iter().sum::<f64>() / adopt_recalls.len() as f64;
@@ -957,7 +972,98 @@ async fn recall_benchmark_cross_industry() {
         adopt_stable_ratio * 100.0, adopt_stable_count, total_cases
     );
 
-    eprintln!("[RECALL] 召回基准测试完成 —— 第一轮仅观测，除⊆seed外无硬断");
+    // ── 契约级硬断言（spec R4.1：消除「自称基准却零硬断言」假绿）──────────────────
+    //
+    // 全部用**相对下限 / 单调契约**，绝不绝对锁分：真模型有非确定性、端点会抖动、
+    // 模型升级会让召回更好——锁死分数会在模型变强时误红。下限留足抖动余量，
+    // 单调契约只断言「组间相对关系」这种结构性事实。⊆seed RED-LINE（loop 内）保持不动。
+    //
+    // 前置：若所有 case 全轮瞬时不可达（ran_cases==0），无任何真模型样本可断言 →
+    // 不硬失败（这是端点抖动，已由 run_query_n_times 的 skip 处理），直接收尾。
+    if ran_cases == 0 {
+        eprintln!("[RECALL] 全部 case 均无成功轮次（端点瞬时不可达），跳过契约硬断言");
+        eprintln!("[RECALL] 召回基准测试完成");
+        return;
+    }
+
+    let overall_reach_mean = calc_mean(&overall_reach_recalls);
+    let lexical_easy_reach_mean = calc_mean(&lexical_easy_reach_recalls);
+    let adversarial_reach_mean = calc_mean(&adversarial_reach_recalls);
+
+    // 断言1 — recall@k 分组相对下限。
+    // 现有代码确有 lexical-easy 分组（adversarial = bigram_overlap < 0.15）：词面强重叠组
+    // 是「检索系统最该召回」的子集，连它都召不回就是真 bug。下限 0.7 留 30% 抖动余量。
+    // 【相对下限/单调契约，非绝对锁分，模型升级只会更好不触误红】
+    if !lexical_easy_reach_recalls.is_empty() {
+        assert!(
+            lexical_easy_reach_mean >= 0.7,
+            "契约违约：lexical-easy（词面强重叠 overlap≥0.15）组 reach 召回均值 {:.3} < 0.7 下限——\
+             词面强重叠都召不回是检索路径真 bug（已留 30% 抖动余量，非绝对锁分）",
+            lexical_easy_reach_mean
+        );
+    } else {
+        // 兜底：本次运行无 lexical-easy 组（理论上不会发生，corpus 固定含强重叠 query），
+        // 退化为对全体 case 设保守下限 0.5。0.5 = 单 expected/case 下「半数 case 召回」的
+        // 极保守底线，远低于健康系统表现，仅拦「检索整体性瘫痪」。
+        // 【相对下限/单调契约，非绝对锁分，模型升级只会更好不触误红】
+        assert!(
+            overall_reach_mean >= 0.5,
+            "契约违约：全体 case reach 召回均值 {:.3} < 0.5 保守下限——检索整体疑似瘫痪",
+            overall_reach_mean
+        );
+    }
+
+    // 断言2 — 单调契约：adversarial 组（词面弱重叠，需语义检索）召回均值不应反超
+    // lexical-easy 组。对抗组反超说明词面/lexical 路径坏了（强信号反而召不回）。
+    // 仅在两组都有样本时断言。
+    // 【相对下限/单调契约，非绝对锁分，模型升级只会更好不触误红】
+    if !lexical_easy_reach_recalls.is_empty() && !adversarial_reach_recalls.is_empty() {
+        assert!(
+            adversarial_reach_mean <= lexical_easy_reach_mean + 1e-9,
+            "契约违约：adversarial 组 reach 召回均值 {:.3} 反超 lexical-easy 组 {:.3}——\
+             词面强重叠反而召不回，lexical 检索路径异常",
+            adversarial_reach_mean, lexical_easy_reach_mean
+        );
+    }
+
+    // 断言3 — 跨轮稳定：reach 召回集跨 N 轮完全一致的 case 占比应 ≥ 0.8。
+    // 复用现成 reach_stable_count；分母用 ran_cases（实际产出结果的 case），
+    // 避免把端点瞬时全跳过的 case 算作「不稳定」。留 20% 给真模型非确定性。
+    // 【相对下限/单调契约，非绝对锁分，模型升级只会更好不触误红】
+    let reach_stable_ratio_ran = reach_stable_count as f64 / ran_cases as f64;
+    assert!(
+        reach_stable_ratio_ran >= 0.8,
+        "契约违约：reach 跨轮完全稳定占比 {:.3} ({}/{}) < 0.8 下限——\
+         真模型召回过度抖动（已留 20% 非确定性余量）",
+        reach_stable_ratio_ran, reach_stable_count, ran_cases
+    );
+
+    // 断言4 — 漂移率上限：任一 case 的跨轮 reach 召回率极差(max-min)应 ≤ 0.34。
+    // 现有逐轮 reach_recalls 支持算出极差（per_case_reach_recall_range）。单 expected/case
+    // 时单轮召回率 ∈ {0,1}，极差 0.34 意味着「最多约 1/3 的轮次召回结果翻转」，
+    // 超过即说明该 query 召回严重不稳定。
+    // 【相对下限/单调契约，非绝对锁分，模型升级只会更好不触误红】
+    if let Some(&max_drift) = per_case_reach_recall_range
+        .iter()
+        .max_by(|a, b| a.total_cmp(b))
+    {
+        assert!(
+            max_drift <= 0.34,
+            "契约违约：某 case 跨轮 reach 召回率极差 {:.3} > 0.34 上限——单条 query 召回严重不稳定",
+            max_drift
+        );
+    }
+
+    eprintln!(
+        "[RECALL] 契约硬断言全部通过：lexical-easy reach 均值={:.3}(≥0.7) overall reach 均值={:.3} \
+         adversarial reach 均值={:.3}(≤lexical) reach 稳定占比={:.3}(≥0.8) 最大跨轮漂移={:.3}(≤0.34)",
+        lexical_easy_reach_mean,
+        overall_reach_mean,
+        adversarial_reach_mean,
+        reach_stable_ratio_ran,
+        per_case_reach_recall_range.iter().cloned().fold(0.0_f64, f64::max),
+    );
+    eprintln!("[RECALL] 召回基准测试完成 —— ⊆seed 红线 + recall@k 分组/单调/稳定/漂移 契约硬断言齐备");
 }
 
 // ── Task5: 真实 agent chat 改库全链路后召回保持 ────────────────────────────────
