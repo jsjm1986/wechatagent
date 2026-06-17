@@ -120,6 +120,7 @@ fn default_product_status() -> String { "active".to_string() }
 
 - 空产品表 = 决策层无产品上下文可注入，行为与改造前等价。
 - 是否注入产品目录由"该 workspace 有无 active product"**隐式**决定（初版设计）——但落码后审查发现隐式开关不足以防"非交易域 admin 误配产品表 + 登记成交 → '已购买X'裸注入情感对话"。**G4 #5 收口（2026-06-17）改为显式交易域闸** `DomainProfile.transaction_facts_enabled`：仅交易型域（销售/电商/课程）置 `true` 才注入三段交易事实（产品目录 / 持有投影 / 疑似成交指引）；非交易域（情感陪伴/朋友）置 `false`，即便误配产品表也跳过加载、一律空串。默认 `false`（失败方向安全：宁可漏注不可错注），`default_domain_profile` 销售兜底显式置 `true` 保历史等价。该开关已纳入 `RISKY_FIELD_NAMES`（手改已生效血缘时不即时生效，落旁路稿二次确认）。
+- **不变量：`transaction_facts_enabled` 是交易事实"所有消费路径"的统一总开关**，不止决策注入一处。交叉审查（2026-06-17）发现 gateway 还有两条旁路曾按旧的隐式信号工作，已一并纳入同一闸：① **G1 `purchase_lifecycle` 纠偏**（gateway 用 G4 持有投影纠正 LLM 推断的购买阶段标签）——此前只看 `purchase_lifecycle` 维度是否「参与决策」，与闸解耦，会造成"非交易域关了注入、却仍用持有事实改写客户阶段"的行为分裂；现追加 `&& transaction_facts_enabled`。② **R5.4 `priced_from_catalog` 报价背书豁免**（命中 active 产品 → 绕过 `blocked_unverified_product_claim`）——此前无条件加载，闸关时强制 `false`（方向更严格、安全）。**新增任何"消费 active 产品 / G4 投影 / 成交事实"的路径，都必须先过此闸**，否则就是新开的分裂口子。注意 `project_entitlements` 的持有投影不只看 active_products、还 fold `outcome_events`（成交快照），故"产品表空→投影恒空"的零扰动论证**不充分**（误录 outcome_events 即可触发），必须靠显式闸而非依赖产品表为空的巧合。
 
 ### 3.5 多租户隔离不变量（IDOR 红线，所有新读写点强制）
 
@@ -204,7 +205,9 @@ fn default_quantity() -> u32 { 1 }
 
 成交是历史事实。若 `product_ref` 存活引用（仅 product_id，渲染时 join products），则 product 改名/调价/下架会**回溯篡改历史成交记录**——客户半年前买的"基础版 ¥99"会显示成今天的"基础版 ¥199"。订单系统标准做法是**成交即冻结快照**。product_id 仍保留用于"该产品总销量"类聚合查询。
 
-**G4 #4 补充（2026-06-17）**：`entitlement_days`（售后/有效期天数）同属"成交当时口径"，故也纳入冻结快照。初版只快照了 name/price，`entitlement_days` 仍实时读活产品表——产品 archived 后解引用落空 → `in_aftercare=None`，售后期内的已购客户被误判"无时效"（AI 可能拒绝售后/重新推销）。修复后投影优先读快照、仅缺失时回落活表，且改产品配置不再回溯篡改历史客户的售后判定（与"成交即冻结"哲学一致）。
+**G4 #4 补充（2026-06-17）**：`entitlement_days`（售后/有效期天数）同属"成交当时口径"，故也纳入冻结快照。初版只快照了 name/price，`entitlement_days` 仍实时读活产品表——产品 archived 后解引用落空 → `in_aftercare=None`，售后期内的已购客户被误判"无时效"（AI 可能拒绝售后/重新推销）。修复后每笔成交各自冻结 days 快照、仅缺失时回落活表，且改产品配置不再回溯篡改历史客户的售后判定（与"成交即冻结"哲学一致）。
+
+**G4 #4-A 续费续窗（2026-06-17 交叉审查补）**：售后到期**不锁死最早一笔**。`owned_since`（取最早正向成交）只承载"客户资历展示"语义；**售后到期 = 各正向成交锚 `max(occurred + 该笔 days)`**——续费/复购同一产品时每笔各续一段窗、取最晚到期。否则刚续费的客户会按首购时刻判过期（如首购 Day0 续费 Day25、各 30 天，错误算法到期 Day30，正确应到 Day55），与本 feature 要消灭的失败模式同形。`reversal` 不是购买时刻 → 不贡献到期锚（只抵消净件数）。该缺陷先于 #4 存在（owned_since 一字段兼顾资历+到期锚），#4-A 把到期锚与资历解耦根治。
 
 ### 4.4 `verification` 缺省取值的安全性论证
 
@@ -238,7 +241,7 @@ entitlements(contact, products, profile)  =  fold over
       .filter(verification ∈ {staff_confirmed, payment_verified})   // §2.1 红线（conversation_inferred 不进投影）
       .filter(has product_ref)
     → 按 product_id 聚合持有 + 抵消退款（§4.5）
-    → 用 entitlement_days（优先成交快照 §4.3，缺失才回落 product.attributes）算"是否售后期/有效期内"
+    → 售后到期 = 各正向成交锚 max(occurred + 该笔 days)；days 优先成交快照 §4.3、缺失回落 product.attributes（续费续窗，§4.3 #4-A）
 ```
 
 输出形如：`[{ product_id, name, owned_since, in_aftercare: bool, expires_at: Option }]`，注入决策 prompt。
@@ -258,7 +261,7 @@ entitlements(contact, products, profile)  =  fold over
 
 > 修正：早前稿误写"投影发生在 gateway 装 prompt 时（与 intent_trajectory 拼接同位置）"——把 DB 读取和 prompt 拼接两件事混在了 gateway。实际 intent_trajectory 的**拼接**在 `decision.rs:346`（函数内），gateway 只负责把数据喂进来。G4 同构：gateway 读 + 投影，`build_decision_prompt` 拼。
 
-- "售后期/有效期"判定规则读 `entitlement_days`（G4 #4 起**优先读 `OutcomeProductRef` 成交快照**，缺失才回落 `Product.attributes`）+ profile；无规则时只输出"已购买 product X"不带时效。
+- "售后期/有效期"判定规则读 `entitlement_days`（G4 #4 起**优先读 `OutcomeProductRef` 成交快照**，缺失才回落 `Product.attributes`；#4-A 起售后到期取**各正向成交 `max(occurred+days)`** 而非锁死首购）+ profile；无规则时只输出"已购买 product X"不带时效。
 - 具体投影函数签名 / `build_decision_prompt` 新入参 / prompt 文案**落码阶段定**，本 spec 只锁定"派生不存储 + 只认高可信 verification + DB 读在 gateway / 拼接在 decision"三条不变量。
 
 ### 5.3 做到这步 AI 行为立刻变（破"只写不读"诅咒）

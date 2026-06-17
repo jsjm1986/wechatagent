@@ -69,8 +69,11 @@ pub(crate) fn project_entitlements(
 ) -> (Vec<Entitlement>, usize) {
     // 按 product_id 聚合：最早 owned_since + 净件数（正向成交累加、reversal 抵消）+ 末次快照名兜底。
     // 用 Vec 保插入序的可重复读，规模小（单 contact 成交数），线性查足够。
-    // owned_since / snapshot_name 只由正向 deal 事件决定（reversal 不是"购买时刻"，§4.5）。
-    let mut agg: Vec<(String, DateTime, i64, String, Option<i64>)> = Vec::new();
+    // owned_since / snapshot_name 取最早正向 deal（reversal 不是"购买时刻"，§4.5）——资历展示语义。
+    // 售后到期则**不**锁死最早笔：每笔正向成交各贡献一个到期锚 (occurred, 该笔快照 days)，
+    // map 阶段取 max(occurred+days)（A 修复：续费/复购各续一段窗、取最晚到期，而非按首购固定）。
+    // agg 元组：(product_id, owned_since, 净件数, 最早笔名兜底, 售后到期锚 Vec<(occurred_ms, days)>)。
+    let mut agg: Vec<(String, DateTime, i64, String, Vec<(i64, Option<i64>)>)> = Vec::new();
     for ev in outcome_events {
         if !verification_drives_entitlement(&ev.verification) {
             continue;
@@ -86,24 +89,33 @@ pub(crate) fn project_entitlements(
             i64::from(pref.quantity.max(1))
         };
         match agg.iter_mut().find(|(pid, ..)| pid == &pref.product_id) {
-            Some((_, owned_since, qty, snapshot_name, snapshot_days)) => {
+            Some((_, owned_since, qty, snapshot_name, expiry_anchors)) => {
                 *qty += signed_qty;
-                // owned_since / 快照名 / 快照售后期只跟随正向成交（reversal 不刷新购买时刻）。
-                if !is_reversal && occurred < *owned_since {
-                    *owned_since = occurred;
-                    *snapshot_name = pref.name.clone();
-                    *snapshot_days = pref.entitlement_days;
+                if !is_reversal {
+                    // 资历：owned_since / 快照名跟随最早一笔正向成交。
+                    if occurred < *owned_since {
+                        *owned_since = occurred;
+                        *snapshot_name = pref.name.clone();
+                    }
+                    // 售后窗：每笔正向成交都追加到期锚（续费/复购各续一段）。
+                    expiry_anchors.push((occurred.timestamp_millis(), pref.entitlement_days));
                 }
             }
             None => {
                 // 首见该 product：reversal 先于 deal 到达时 owned_since 暂记其时间，
                 // 后续 deal 会按更早时间覆盖；净件数 ≤ 0 的最终会被过滤掉。
+                // reversal 不延长售后 → 到期锚仅正向成交贡献（首见即 reversal 时为空）。
+                let anchors = if is_reversal {
+                    Vec::new()
+                } else {
+                    vec![(occurred.timestamp_millis(), pref.entitlement_days)]
+                };
                 agg.push((
                     pref.product_id.clone(),
                     occurred,
                     signed_qty,
                     pref.name.clone(),
-                    pref.entitlement_days,
+                    anchors,
                 ));
             }
         }
@@ -120,23 +132,32 @@ pub(crate) fn project_entitlements(
 
     let entitlements = agg
         .into_iter()
-        .map(|(product_id, owned_since, quantity, snapshot_name, snapshot_days)| {
+        .map(|(product_id, owned_since, quantity, snapshot_name, expiry_anchors)| {
             // 解引用活产品：取活名。下架/改名 → 回落快照名。
             let active = active_products.iter().find(|p| p.product_id == product_id);
             let name = active
                 .map(|p| p.name.clone())
                 .unwrap_or(snapshot_name);
-            // G4 #4：售后期天数优先用成交时冻结的快照，缺失（未登记的老成交）才回落活产品表。
-            // 产品 archived 后活引用解不到，但快照仍在 → 已购客户的 in_aftercare 不再丢。
-            let entitlement_days = snapshot_days.or_else(|| active.and_then(entitlement_days_of));
-            let (in_aftercare, expires_at) = match entitlement_days {
-                Some(days) if days > 0 => {
-                    let expires =
-                        DateTime::from_millis(owned_since.timestamp_millis() + days * 86_400_000);
-                    let within = now.timestamp_millis() <= expires.timestamp_millis();
-                    (Some(within), Some(expires))
+            // G4 #4 + A：售后到期 = 各正向成交锚 max(occurred + 该笔 days)。
+            // 每笔 days 优先用成交时冻结的快照，缺失（老成交未登记）才回落活产品表。
+            // archived 产品活引用解不到，但快照仍在 → in_aftercare 不丢（#4）；
+            // 续费/复购各笔独立续窗、取最晚到期 → 刚续费客户不被按首购判过期（A）。
+            let active_days = active.and_then(entitlement_days_of);
+            let expires_ms = expiry_anchors
+                .iter()
+                .filter_map(|(occurred_ms, snap_days)| {
+                    snap_days
+                        .or(active_days)
+                        .filter(|d| *d > 0)
+                        .map(|d| occurred_ms + d * 86_400_000)
+                })
+                .max();
+            let (in_aftercare, expires_at) = match expires_ms {
+                Some(ms) => {
+                    let within = now.timestamp_millis() <= ms;
+                    (Some(within), Some(DateTime::from_millis(ms)))
                 }
-                _ => (None, None),
+                None => (None, None),
             };
             Entitlement {
                 product_id,
@@ -594,6 +615,123 @@ mod tests {
             ents[0].in_aftercare,
             Some(true),
             "快照缺失时回落活产品表（回落路径不回归）"
+        );
+    }
+
+    #[test]
+    fn renewal_extends_aftercare_window_from_latest_deal() {
+        // A 修复核心：同一产品续费 → 售后窗各笔独立续、取最晚到期，而非锁死首购。
+        let day = 86_400_000i64;
+        // 首购 Day0（30天）+ 续费 Day25（30天）。合理售后应到 Day55（25+30），非 Day30。
+        let events = vec![
+            ev_with_days("course", "训练营", 0, Some(30)),
+            ev_with_days("course", "训练营", 25 * day, Some(30)),
+        ];
+        // owned_since 仍取最早（资历语义不变）。
+        let (ents, _) = project_entitlements(&events, &[], DateTime::from_millis(35 * day), 10);
+        assert_eq!(ents[0].owned_since.timestamp_millis(), 0, "资历仍记首购 Day0");
+        assert_eq!(
+            ents[0].expires_at.map(|d| d.timestamp_millis()),
+            Some(55 * day),
+            "售后到期取最晚锚 = 续费Day25 + 30天"
+        );
+        assert_eq!(
+            ents[0].in_aftercare,
+            Some(true),
+            "Day35 续费客户仍在售后期（修复前会误判 false：按首购Day0+30=Day30 已过）"
+        );
+    }
+
+    #[test]
+    fn renewal_with_different_days_takes_max_expiry() {
+        // 各笔 days 不同（先短后长 / 先长后短）→ 一律取 max(occurred+days)。
+        let day = 86_400_000i64;
+        // 首购 Day0（90天，到Day90）+ 续费 Day10（30天，到Day40）→ max=Day90。
+        let events = vec![
+            ev_with_days("course", "训练营", 0, Some(90)),
+            ev_with_days("course", "训练营", 10 * day, Some(30)),
+        ];
+        let (ents, _) = project_entitlements(&events, &[], DateTime::from_millis(50 * day), 10);
+        assert_eq!(
+            ents[0].expires_at.map(|d| d.timestamp_millis()),
+            Some(90 * day),
+            "取最晚到期锚（首购90天 Day90 > 续费30天 Day40）"
+        );
+    }
+
+    #[test]
+    fn reversal_does_not_extend_aftercare_window() {
+        // reversal 不是购买时刻 → 不贡献售后到期锚（只抵消净件数）。
+        let day = 86_400_000i64;
+        // 买2件 Day0（30天，到Day30）+ 退1件 Day40（净1件仍持有）。
+        // reversal 不延长售后 → 到期仍 Day30，不会因 reversal occurred=Day40 续到 Day70。
+        let deal = {
+            let mut e = ev("staff_confirmed", Some(("course", "训练营", 2)), 0);
+            e.product_ref.as_mut().unwrap().entitlement_days = Some(30);
+            e
+        };
+        let refund = {
+            let mut e = ev("staff_confirmed", Some(("course", "训练营", 1)), 40 * day);
+            e.product_ref.as_mut().unwrap().entitlement_days = Some(30);
+            e.event_kind = "reversal".to_string();
+            e
+        };
+        let (ents, _) =
+            project_entitlements(&[deal, refund], &[], DateTime::from_millis(35 * day), 10);
+        assert_eq!(ents[0].quantity, 1, "净件数 = 2 - 1");
+        assert_eq!(
+            ents[0].expires_at.map(|d| d.timestamp_millis()),
+            Some(30 * day),
+            "reversal 的 occurred 不延长售后窗（到期仍 Day30，非 Day70）"
+        );
+    }
+
+    #[test]
+    fn renewal_anchor_without_days_and_archived_product_drops_that_window() {
+        // 边界（P2 已知降级语义契约）：续费笔快照缺 days 且产品已 archived（active 表查不到）
+        // → 该锚 days 无从确定，被保守丢弃，只剩有快照的首购锚。
+        // "无法确定 days 时不延窗"是安全选择（宁可漏判售后，不可凭空延长）。全新项目新成交
+        // 都带快照，此组合仅理论存在；此测试把该降级行为钉成显式契约，防未来误改成"延窗"。
+        let day = 86_400_000i64;
+        let events = vec![
+            ev_with_days("course", "训练营", 0, Some(30)),       // 首购带快照 30 天 → 到 Day30
+            ev_with_days("course", "训练营", 25 * day, None),    // 续费缺快照
+        ];
+        // active_products 空 = 产品已 archived → 续费锚回落失败、被丢。
+        let (ents, _) = project_entitlements(&events, &[], DateTime::from_millis(20 * day), 10);
+        assert_eq!(
+            ents[0].expires_at.map(|d| d.timestamp_millis()),
+            Some(30 * day),
+            "缺 days 且 archived 的续费锚被丢，到期仅由首购快照锚决定"
+        );
+    }
+
+    #[test]
+    fn reversal_first_then_later_deal_expiry_anchors_only_positive() {
+        // 边界：reversal 早于正向 deal 到达（异常时序，现实中退款不应早于购买）。
+        // owned_since 是旧有行为（可能停在 reversal 时刻），但售后到期只认正向成交锚，
+        // 不受 reversal occurred 影响 → expires 仍由正向 deal 决定。
+        let day = 86_400_000i64;
+        let refund_first = {
+            let mut e = ev("staff_confirmed", Some(("course", "训练营", 1)), 5 * day);
+            e.product_ref.as_mut().unwrap().entitlement_days = Some(30);
+            e.event_kind = "reversal".to_string();
+            e
+        };
+        // 两笔正向 deal（净件数 2-1=1>0 存活），occurred=Day10（到 Day40）。
+        let deal_a = ev_with_days("course", "训练营", 10 * day, Some(30));
+        let deal_b = ev_with_days("course", "训练营", 10 * day, Some(30));
+        let (ents, _) = project_entitlements(
+            &[refund_first, deal_a, deal_b],
+            &[],
+            DateTime::from_millis(20 * day),
+            10,
+        );
+        assert_eq!(ents[0].quantity, 1, "净件数 = -1 + 1 + 1");
+        assert_eq!(
+            ents[0].expires_at.map(|d| d.timestamp_millis()),
+            Some(40 * day),
+            "售后到期只认正向成交锚（Day10+30），不受 reversal occurred=Day5 影响"
         );
     }
 
