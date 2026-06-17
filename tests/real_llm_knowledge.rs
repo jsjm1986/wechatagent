@@ -130,13 +130,47 @@ macro_rules! unwrap_or_skip_transient {
             Err(wechatagent::error::AppError::LlmUnavailable {
                 kind,
                 retry_count,
+                detail,
                 ..
             }) => {
+                let cfg_err_4xx = kind == "endpoint_not_found"
+                    || (kind == "http_4xx"
+                        && !detail.contains("HTTP 401")
+                        && !detail.contains("HTTP 402"));
+                if cfg_err_4xx {
+                    panic!(
+                        "{}：配置错误（kind={kind}），非端点抖动——4xx 多为 baseUrl/model/path 配错，\n                         不当瞬时 skip 假绿（R0.3）。detail={detail}",
+                        $what
+                    );
+                }
                 eprintln!(
                     "skip: {} —— 真模型上游瞬时不可达（kind={kind}, retry_count={retry_count}），\
                      按计划「真模型抖动有限重试+跳过」处理，不算生产级失败",
                     $what
                 );
+                {
+                    use std::io::Write as _;
+                    let dir = std::env::var("REAL_LLM_LEDGER")
+                        .unwrap_or_else(|_| "target/real_llm_ledger".to_string());
+                    let _ = std::fs::create_dir_all(&dir);
+                    if let Ok(mut f) = std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(format!("{dir}/skip_ledger.jsonl"))
+                    {
+                        let _ = writeln!(
+                            f,
+                            "{}",
+                            serde_json::json!({
+                                "test": $what,
+                                "kind": kind,
+                                "retry_count": retry_count,
+                                "file": file!(),
+                                "sha": std::env::var("GITHUB_SHA").unwrap_or_else(|_| "local".into()),
+                            })
+                        );
+                    }
+                }
                 return;
             }
             Err(other) => panic!("{}：{other}", $what),
