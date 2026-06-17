@@ -58,7 +58,8 @@ fn agent_client() -> Option<Arc<LlmClient>> {
         .map(Arc::new)
 }
 
-/// judge client（异族——优先 REAL_LLM_JUDGE_*，缺则与 agent 同源仅作观测兜底）。
+/// judge client（异族——读 REAL_LLM_JUDGE_*；缺 REAL_LLM_JUDGE_API_KEY 返 None，
+/// 不回落同源 agent client——judge 整段缺席而非用同模型自评虚高）。
 fn judge_client() -> Option<Arc<LlmClient>> {
     let api_key = std::env::var("REAL_LLM_JUDGE_API_KEY")
         .ok()
