@@ -453,6 +453,48 @@ fn truncate_chars(text: &str, max_chars: usize) -> String {
 
 // ── knowledge.open_slice ───────────────────────────────────────────────
 
+/// D3(b)：gateway 侧 superseded 版本 redirect（内存版，不查 DB）的最大跳数。
+const OPEN_SLICE_MAX_REDIRECT_HOPS: usize = 8;
+
+/// D3(b)：在**内存 `chunks` 集合内**沿 `superseded_by` 把一个 chunk redirect 到现行
+/// 版本。与 knowledge_agent 的 `resolve_superseded`（查 DB）镜像，但 gateway 侧
+/// `exec_open_slice` 是同步纯函数、只能用预载的 `KnowledgeRuntime.chunks`——预载
+/// （knowledge_router.rs:load_operation_knowledge）已过滤 `status=active`+`verified`，
+/// 故只需在同一内存切片里找新版。
+///
+/// 语义：起点 chunk 若 `superseded_by` 非空且新版**也在本内存集合内**（= 同样
+/// active+verified），redirect 到新版，继续跟链直到链尾 / 命中环 / 达 hop 上限 /
+/// 新版不在集合内。**绝不丢内容**：新版找不到（被 archive 挡在集合外、或链断）即
+/// 停在当前版本返回。借用语义，返回 `&chunks` 中某一条的引用。
+fn resolve_superseded_in_memory<'a>(
+    chunks: &'a [OperationKnowledgeChunk],
+    start: &'a OperationKnowledgeChunk,
+) -> &'a OperationKnowledgeChunk {
+    let mut current = start;
+    let mut visited: std::collections::HashSet<String> = std::collections::HashSet::new();
+    if let Some(id) = current.id {
+        visited.insert(id.to_hex());
+    }
+    for _ in 0..OPEN_SLICE_MAX_REDIRECT_HOPS {
+        let next_hex = match current.superseded_by.as_deref().map(str::trim) {
+            Some(s) if !s.is_empty() => s.to_string(),
+            _ => return current,
+        };
+        if !visited.insert(next_hex.clone()) {
+            return current; // 防环
+        }
+        // 在同一内存集合里找新版（集合本身已 active+verified 过滤）。
+        match chunks
+            .iter()
+            .find(|c| c.id.map(|oid| oid.to_hex()).as_deref() == Some(next_hex.as_str()))
+        {
+            Some(next) => current = next,
+            None => return current, // 新版不在集合内（被挡在 active/verified 外）→ 不丢内容
+        }
+    }
+    current
+}
+
 fn exec_open_slice(
     arguments: &Document,
     knowledge: &KnowledgeRuntime,
@@ -485,7 +527,9 @@ fn exec_open_slice(
             .iter()
             .find(|c| c.id.map(|oid| oid.to_hex()).as_deref() == Some(id.as_str()))
         {
-            Some(chunk) => found.push(chunk),
+            // D3(b)：命中的 chunk 若已被取代，redirect 到内存集合里的现行版本，避免把
+            // 旧版正文喂给 agent 当对客依据。新版不在集合内（被 archive 挡掉）→ 回退原版。
+            Some(chunk) => found.push(resolve_superseded_in_memory(&knowledge.chunks, chunk)),
             None => missing.push(id.clone()),
         }
     }
@@ -1523,6 +1567,68 @@ mod tests {
             &runtime,
         );
         assert_eq!(v.get("error").and_then(|x| x.as_str()), Some("over_limit"));
+    }
+
+    #[test]
+    fn open_slice_redirects_superseded_to_current_version() {
+        // D3(b)：请求已被取代的旧版 id，应返回**现行版本**的正文（gateway 内存 redirect）。
+        let new_chunk = build_chunk("现行版", Some("verified"), Some("new body"), None);
+        let new_hex = new_chunk.id.unwrap().to_hex();
+        let mut old_chunk = build_chunk("旧版", Some("verified"), Some("old body"), None);
+        old_chunk.superseded_by = Some(new_hex.clone());
+        let old_hex = old_chunk.id.unwrap().to_hex();
+        let knowledge = KnowledgeRuntime {
+            documents: vec![],
+            chunks: vec![old_chunk, new_chunk],
+        };
+        let runtime = make_runtime();
+        // 用旧版 id 请求 → 返回的 slice 必须是现行版（chunk_id=新版、body=new body）。
+        let v = exec_open_slice(&doc! {"chunk_ids": [old_hex]}, &knowledge, &runtime);
+        let slice = &v["slices"].as_array().unwrap()[0];
+        assert_eq!(slice["chunk_id"].as_str(), Some(new_hex.as_str()), "应 redirect 到新版 id");
+        assert_eq!(slice["body"].as_str(), Some("new body"), "应返回现行版正文");
+    }
+
+    #[test]
+    fn open_slice_superseded_new_version_absent_falls_back_to_old() {
+        // D3(b)：旧版 superseded_by 指向一个**不在内存集合内**的新版（被 archive 挡掉）
+        // → 不丢内容，回退返回旧版本身。
+        let mut old_chunk = build_chunk("旧版", Some("verified"), Some("old body"), None);
+        old_chunk.superseded_by = Some("ffffffffffffffffffffffff".to_string()); // 不在集合内
+        let old_hex = old_chunk.id.unwrap().to_hex();
+        let knowledge = KnowledgeRuntime {
+            documents: vec![],
+            chunks: vec![old_chunk],
+        };
+        let runtime = make_runtime();
+        let v = exec_open_slice(&doc! {"chunk_ids": [old_hex.clone()]}, &knowledge, &runtime);
+        let slice = &v["slices"].as_array().unwrap()[0];
+        assert_eq!(slice["chunk_id"].as_str(), Some(old_hex.as_str()), "新版缺失应回退旧版");
+        assert_eq!(slice["body"].as_str(), Some("old body"));
+    }
+
+    #[test]
+    fn resolve_superseded_in_memory_handles_chain_and_cycle() {
+        // D3(b)：多跳链跟到链尾；自指环不死循环。
+        let final_chunk = build_chunk("v3", Some("verified"), Some("final"), None);
+        let v3_hex = final_chunk.id.unwrap().to_hex();
+        let mut mid = build_chunk("v2", Some("verified"), Some("mid"), None);
+        mid.superseded_by = Some(v3_hex.clone());
+        let v2_hex = mid.id.unwrap().to_hex();
+        let mut head = build_chunk("v1", Some("verified"), Some("head"), None);
+        head.superseded_by = Some(v2_hex.clone());
+        let chunks = vec![head.clone(), mid, final_chunk];
+        // v1 → v2 → v3（链尾）
+        let resolved = resolve_superseded_in_memory(&chunks, &chunks[0]);
+        assert_eq!(resolved.id.unwrap().to_hex(), v3_hex, "应跟到链尾 v3");
+
+        // 自指环：c 的 superseded_by 指向自己 → 停在自身不死循环。
+        let mut selfie = build_chunk("self", Some("verified"), Some("x"), None);
+        let self_hex = selfie.id.unwrap().to_hex();
+        selfie.superseded_by = Some(self_hex.clone());
+        let cyc = vec![selfie];
+        let r = resolve_superseded_in_memory(&cyc, &cyc[0]);
+        assert_eq!(r.id.unwrap().to_hex(), self_hex, "自指环应停在自身");
     }
 
     // ── dispatch_tool_call (async) ────────────────────────────────

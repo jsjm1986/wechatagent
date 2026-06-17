@@ -73,9 +73,9 @@
 
 - **D1** ✅**已正确收口（2026-06-16 逐行核实结论）**：`enforce_domain_attributes` 纯函数（required/enum/alias）+ `apply_chunk_revision` 第 6.5 步接线（有 active schema 才校验，无则 no-op）已覆盖**运营/AI 录入行业知识的唯一正道**。早前"其余写入站点（chat/lessons_learned/reaction/escalation）留后续分批接入"的 TODO 经核实是**基于错误前提**——逐行验证：(1) `chat`（`routes/knowledge/chat.rs` apply_create/update_chunk）的 chunk 请求字段清单**根本不含 domain_attributes**；(2) `lessons_learned`（`routes/lessons_learned.rs:221`）显式 `domain_attributes: None`；(3) `escalation` 两处——`escalation/mod.rs:121` 写的是 **contacts 集合**不是 chunk，`escalation/ledger.rs:206` 构造 chunk 用 `..default()`（attrs=None）；(4) `reaction`（`reaction.rs:457` enqueue_negative_example_chunk）是唯一真写 chunk domain_attributes 的站点，但装的是**系统审计元数据**（source_review_id/source/user_reaction_outcome/contact_wxid）**而非行业语义属性**——若强接 enforce，配了 required 字段的行业 schema 会把这条 AI 自动入队负例 reject，而调用点是 best-effort（失败仅 warn），结果是 reviewer 误判反馈链路在配了 schema 的行业里**静默失效**=引入 bug。故 reaction 负例 chunk **不纳入** D1 行业 schema 校验范围（审计副产物不是领域知识）。**D1 写侧接线无需再扩**。
 - **D2** ✅**已收口（2026-06-16）**：四个核验写入站点——单条 `verify` / `reject`（`routes/knowledge/verify.rs`）、`auto_verify` 批处理内循环、`batch_verify`（`routes/knowledge/wiki_edit.rs`）——已全部接回 `apply_chunk_revision`，每次写入在 `chunk_revisions` 落一条不可变历史（op=verify|reject、source、created_by、sha256 before/after hash）+ 更新 provenance，补全"needs_review→verified"这一最关键状态转移的审计链。source 选择：单条/批量 verify/reject = `Human`（运营手工点击）；`auto_verify` = `Rule`（裁决由 LLM 自评+规则闸门做出、admin 仅触发批处理，标 Rule 才如实反映"规则化批处理写入"，避免审计误判"有人逐条审定"）。`PUT`（`routes/knowledge/crud.rs` create/update_chunk）与 `chat` apply **不纳入**——经核实它们的 chunk 请求字段清单不含可被 verify 的状态语义，且各自经 `coerce_integrity_against_d2_gate` 守 D2 闸（提交 verified 但缺 quote/anchor → 降级 needs_review），不绕过审计的核心承诺。测试：`tests/chunk_batch_ops.rs`（verify/reject/batch_verify/auto_verify 各断言 revision；auto_verify 用 mock LLM 本地可跑）+ `real_llm_knowledge.rs` K7（真模型端到端）。
-- **D3**：关系图谱 BFS 遍历忽略 `relation_kind`，contradicts 与 references 无差别扩散；superseded_by 不做版本 redirect。
+- **D3** ✅**已收口（2026-06-17）**：(a) `follow_relations`（knowledge_agent.rs）BFS 遍历改按 `classify_relation_role` 分流——references/requires/clarifies/refines=Support 照旧跟随；contradicts=Contradiction 仍跟随但标 `ChunkFull.relation_role="contradiction"`，prompt 警示"仅供辨别、勿作支撑引用"（不再把矛盾说法当支撑 cite）；superseded_by=Version 不当普通关系扩散。(b) superseded 全路径 redirect——新增 `resolve_superseded`（跟 superseded_by 链到现行版本，新版须 verified、防环+8 跳上限），接入 `open_chunk`（redirect 后返回新版 ChunkFull，`opened_seen` 改记 full.chunk_id 保 cite⊆opened）+ `follow_relations`（目标 redirect）；gateway 侧 `exec_open_slice` 走内存版 `resolve_superseded_in_memory`（knowledge_tools.rs）。`rank_key` ×0.1 降权保留为 catalog 层兜底，不动 PBT。测试：knowledge_agent/knowledge_tools 纯函数单测 + `tests/knowledge_ask_e2e.rs` 三个 D3 集成场景。
 
-这三个是已有功能的实现缺陷，**与通用化正交**，列入「后续清理」不进本设计主线（除非 §6 分期里顺手）。
+这两个是已有功能的实现缺陷，**与通用化正交**，列入「后续清理」（D1/D2/D3 现已全部收口）。
 
 ### 1.6 CRM 客观业务事实缺口（2026-06-11 双 Opus 子代理审查结论）
 
@@ -626,7 +626,10 @@ casual 模式的"收紧压力门"会与"热烈推进"打架（非误杀，是模
 - **护栏**：DEFAULT `calendar` 默认关 → 销售域所有现有 planner 金标 + real-LLM 套件零变化；仅情感域激活。
 - **风险点（落码前注意）**：(1) **纪念日日期解析**——记忆维度里日期是 LLM 从对话抽的自由文本（"她生日下个月 15 号"），需稳健的日期归一 + 今日匹配，是新扫描器唯一有实质复杂度处；(2) **触达节奏**——早安晚安类高频关怀需比 silence/commitment 更克制的 cap，建议 `calendar` 走独立低频 cap，否则情感陪伴变骚扰。
 
-### Phase 4（可选）：清理 D2/D3 审计与图谱缺陷。
+### Phase 4（可选）：清理 D2/D3 审计与图谱缺陷。 ✅**已完成（2026-06-17）**
+
+- **D2**（核验写入接回 apply_chunk_revision 补全审计链）✅ commit 985463a。
+- **D3**（关系图谱按 relation_kind 分流 + superseded 全路径 redirect）✅ 见 §1.5 D3 收口记录。
 
 ---
 

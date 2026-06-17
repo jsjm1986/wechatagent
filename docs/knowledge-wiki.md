@@ -182,4 +182,11 @@ stage 2（LLM 批裁决：contradiction / suggestion / 残留信号是否仍适�
 - chunk_revisions 的 git 风格 branch / merge tree —— 本轮仅线性 revision
 - multimodal（图片 / PDF / 表格抽取）
 - 跨 workspace 知识共享 / 联邦
-- chunk 自动 redirect 解析（`superseded_by` 链跳转优先级）—— 写好字段先，召回侧用法下一轮
+- chunk 自动 redirect 解析（`superseded_by` 链跳转优先级）—— ✅ **已落地（D3，2026-06-17）**：召回侧 `open_chunk` / `follow_relations`（`src/agent/knowledge_agent.rs`）命中 `superseded_by` 非空的 chunk 时经 `resolve_superseded` 跟链 redirect 到现行版本（新版须 verified、防环 + 8 跳上限）；gateway 侧 `exec_open_slice`（`src/agent/knowledge_tools.rs`）走内存版 `resolve_superseded_in_memory`。`rank_key` 的 ×0.1 降权保留为 catalog 层兜底。
+
+### 关系图谱按 `relation_kind` 分流遍历（D3，2026-06-17）
+
+`follow_relations` BFS 跟随 `related_chunks` 时按 `classify_relation_role` 区分 6 种 kind 的语义角色：
+- **Support**（references/requires/clarifies/refines）：正向支撑，照旧作 opened 正文喂 agent。
+- **Contradiction**（contradicts）：「与来源 chunk 矛盾的说法」，**仍跟随**（让 agent 能对比辨别）但标 `ChunkFull.relation_role="contradiction"`，prompt 渲染附「仅供辨别、勿作支撑引用」警示——不再把矛盾说法当支撑材料 cite。
+- **Version**（superseded_by）：版本指针，不当普通关系扩散，交由上面的 redirect 处理。
