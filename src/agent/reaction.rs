@@ -822,6 +822,93 @@ mod a6_tests {
         );
     }
 
+    // ---- R3.1：H11 自学习极性跨域（非销售 profile 下正/负/沉默三类完整分类）----
+    // spec R3.1：非销售 profile 下正反应→Hit/负反应→Block/沉默→Censored(删失,不当负例)
+    // 在语义上正确，极性词表随 profile（非写死销售）。极性映射是纯函数（LLM 只判 analysis
+    // 的 flag，正/负/沉默→outcome 字符串全确定性），故确定性测最可靠。
+
+    /// 情感陪伴域极性契约：正极=情绪敞开/倾诉，负极=转冷/退缩（与销售 buying/objection 不同）。
+    fn companion_polarity() -> crate::models::OutcomePolarity {
+        crate::models::OutcomePolarity {
+            positive: vec!["user_emotion_opened_up".to_string()],
+            negative: vec!["user_went_cold".to_string(), "user_withdrew".to_string()],
+        }
+    }
+
+    #[test]
+    fn r3_1_companion_positive_reaction_maps_to_domain_positive_not_sales() {
+        // 正反应(buyingSignal flag)在情感域 → 本域正极 token（Hit），不是销售的 buying_signal。
+        let analysis = doc! { "buyingSignal": true };
+        let status = reaction_outcome_status_with_polarity(&analysis, &companion_polarity());
+        assert_eq!(
+            status, "user_emotion_opened_up",
+            "情感域正反应应映射到本域正极(user_emotion_opened_up)，非销售 buying_signal"
+        );
+        // 该正极在情感负极集里不存在 → 不会被误当负例反向训练。
+        assert!(
+            !companion_polarity().negative.contains(&status),
+            "正极 token 绝不能落在负极集（否则 Hit 被错当 Block）"
+        );
+    }
+
+    #[test]
+    fn r3_1_companion_negative_reaction_triggers_block_only_for_domain_negatives() {
+        // 负反应(本域负词)在情感域 → 触发 misjudge(Block 反向训练)。
+        let neg = companion_polarity().negative;
+        let neg_refs: Vec<&str> = neg.iter().map(|s| s.as_str()).collect();
+        assert_eq!(
+            compute_reviewer_misjudge_signal_with_polarity(true, "user_went_cold", &neg_refs).as_deref(),
+            Some("approved_but_user_negative"),
+            "情感域负反应(转冷)应触发 Block 反向训练"
+        );
+        // 极性错配检出：销售负词 objection 在情感域**不**触发（极性随 profile，非写死销售）。
+        assert!(
+            compute_reviewer_misjudge_signal_with_polarity(true, "user_replied_objection", &neg_refs).is_none(),
+            "销售负词 objection 在情感域不应触发 Block（极性错配须被隔离）"
+        );
+    }
+
+    #[test]
+    fn r3_1_silence_is_censored_never_treated_as_negative() {
+        // Iron Law ②（删失语义不可配）：沉默/未分类一律 Censored，绝不臆测为负。
+        // 无任何 flag 的 analysis（用户沉默/模糊）→ user_replied_unclassified（删失态）。
+        let silent = doc! {};
+        let status = reaction_outcome_status_with_polarity(&silent, &companion_polarity());
+        assert_eq!(
+            status, "user_replied_unclassified",
+            "沉默/无 flag 必须分类为 unclassified(Censored 删失)，不臆测正负"
+        );
+        // 删失态绝不在负极集里 → 不会被当负例反向训练（H11 回路② 红线）。
+        let neg = companion_polarity().negative;
+        let neg_refs: Vec<&str> = neg.iter().map(|s| s.as_str()).collect();
+        assert!(
+            compute_reviewer_misjudge_signal_with_polarity(true, &status, &neg_refs).is_none(),
+            "Censored 删失态(unclassified)绝不能触发 Block（沉默≠负反应，Iron Law ②）"
+        );
+        // 跨域不变量：销售极性下沉默同样是 unclassified（删失语义域无关、不可配）。
+        let sales_status = reaction_outcome_status_with_polarity(&silent, &default_outcome_polarity_for_reaction());
+        assert_eq!(
+            sales_status, "user_replied_unclassified",
+            "删失语义域无关：销售域沉默也是 unclassified"
+        );
+    }
+
+    #[test]
+    fn r3_1_stop_requested_is_domain_invariant() {
+        // stopRequested 是域无关红线（用户明确叫停），任何 profile 下都→stop_requested，
+        // 不受 outcome_polarity 影响（正/负极配置不能覆盖"用户明确要求停"这条硬语义）。
+        let analysis = doc! { "stopRequested": true };
+        assert_eq!(
+            reaction_outcome_status_with_polarity(&analysis, &companion_polarity()),
+            "user_replied_stop_requested",
+            "stopRequested 是域无关红线，情感域也必须识别"
+        );
+        assert_eq!(
+            reaction_outcome_status_with_polarity(&analysis, &default_outcome_polarity_for_reaction()),
+            "user_replied_stop_requested"
+        );
+    }
+
     // ---- 2.5-main-3：reaction_outcome_status 正极配置化 + effective_negative_outcomes ----
 
     #[test]
