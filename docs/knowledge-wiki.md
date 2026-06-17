@@ -83,7 +83,7 @@ LLW 的 community detection (Louvain) / `graph-relevance` / `embedding` / `searc
 
 ## 6. 写入路径三层保护（apply_chunk_revision）
 
-详见 [`src/knowledge_wiki/chunk_revisions.rs`](../src/knowledge_wiki/chunk_revisions.rs) + [`src/knowledge_wiki/page_merge.rs`](../src/knowledge_wiki/page_merge.rs)。所有写入（import / patch / split / merge / archive / restore / rollback）走同一函数，三层保护一律生效：
+详见 [`src/knowledge_wiki/chunk_revisions.rs`](../src/knowledge_wiki/chunk_revisions.rs) + [`src/knowledge_wiki/page_merge.rs`](../src/knowledge_wiki/page_merge.rs)。所有写入（import / patch / split / merge / archive / restore / rollback / verify / reject / auto-verify / batch-verify）走同一函数，三层保护一律生效：
 
 1. **锁定字段守门** — patch 试图改 `chunk_id / wiki_type / created_at / source_anchor / verified_at / verified_by / approved_at` 任意一项 → `400 BadRequest`，错误信息明确指出受锁定字段。
 2. **数组字段 union** — `tags / related_chunks / sources / search_terms / applicable_scenes` 永远 `existing ∪ patch`；即使 LLM 返 `tags: ["仅这一项"]`，应用层 union 后真实落地是并集。0 风险 0 LLM 成本。

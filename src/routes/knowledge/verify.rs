@@ -16,6 +16,9 @@ use std::sync::Arc;
 
 use crate::auth::AuthenticatedAdmin;
 use crate::error::{AppError, AppResult};
+use crate::knowledge_wiki::chunk_revisions::{
+    apply_chunk_revision, ProvenanceSource, RevisionOp, RevisionRequest,
+};
 use crate::{agent, models::KnowledgeUsageLog, prompts};
 
 use super::super::shared::*;
@@ -84,55 +87,57 @@ pub async fn verify_operation_knowledge_chunk(
     }
 
     let verified_claims = payload.verified_claims.unwrap_or_default();
-    state
-        .db
-        .operation_knowledge_chunks()
-        .update_one(
-            doc! {
-                "_id": object_id,
-                "workspace_id": &admin.current_workspace
+    // D2：verify 写入接回 apply_chunk_revision，留 chunk_revisions(op=verify, source=human)
+    // 不可变历史 + provenance（此前直接 update_one 绕过审计链，"needs_review→verified"
+    // 这个最关键状态转移查不到谁在何时审定）。前置 D2 gate（上方 has_quote+has_anchor）
+    // 已校验，apply_chunk_revision 不重复该语义；source=Human 不触发 AI-draft 降级；
+    // 这些字段均不在 DEFAULT_LOCKED_FIELDS，patch 不被锁字段守门拒收。
+    apply_chunk_revision(
+        &state.db,
+        &admin.current_workspace,
+        object_id,
+        RevisionRequest {
+            op: RevisionOp::Verify,
+            source: ProvenanceSource::Human,
+            patch: doc! {
+                "integrity_status": "verified",
+                "confidence_score": 100,
+                "verified_claims": string_bson_array(&verified_claims),
+                "unsupported_claims": Bson::Array(Vec::new()),
+                "status": "active",
             },
-            doc! {
-                "$set": {
-                    "integrity_status": "verified",
-                    "confidence_score": 100,
-                    "verified_claims": string_bson_array(&verified_claims),
-                    "unsupported_claims": Bson::Array(Vec::new()),
-                    "status": "active",
-                    "updated_at": DateTime::now()
-                }
-            },
-            None,
-        )
-        .await?;
+            reason: None,
+            actor: Some(admin.username.clone()),
+        },
+    )
+    .await?;
     Ok(Json(json!({ "ok": true })))
 }
 
-pub(in crate::routes) async fn reject_operation_knowledge_chunk(
+pub async fn reject_operation_knowledge_chunk(
     State(state): State<AppState>,
     Extension(admin): Extension<AuthenticatedAdmin>,
     Path(id): Path<String>,
 ) -> AppResult<Json<Value>> {
     let object_id = parse_object_id(&id)?;
-    state
-        .db
-        .operation_knowledge_chunks()
-        .update_one(
-            doc! {
-                "_id": object_id,
-                "workspace_id": &admin.current_workspace
+    // D2：reject 同样接回 apply_chunk_revision（op=reject, source=human），留审计痕迹。
+    apply_chunk_revision(
+        &state.db,
+        &admin.current_workspace,
+        object_id,
+        RevisionRequest {
+            op: RevisionOp::Reject,
+            source: ProvenanceSource::Human,
+            patch: doc! {
+                "integrity_status": "rejected",
+                "confidence_score": 0,
+                "status": "rejected",
             },
-            doc! {
-                "$set": {
-                    "integrity_status": "rejected",
-                    "confidence_score": 0,
-                    "status": "rejected",
-                    "updated_at": DateTime::now()
-                }
-            },
-            None,
-        )
-        .await?;
+            reason: None,
+            actor: Some(admin.username.clone()),
+        },
+    )
+    .await?;
     Ok(Json(json!({ "ok": true })))
 }
 
@@ -396,23 +401,32 @@ source_anchors: {}
             _ => needs_review += 1,
         }
 
-        let _ = state
-            .db
-            .operation_knowledge_chunks()
-            .update_one(
-                doc! { "_id": chunk_id },
-                doc! {
-                    "$set": {
-                        "integrity_status": &final_status,
-                        "confidence_score": confidence,
-                        "verified_claims": string_bson_array(&verified_claims_json),
-                        "distortion_risks": string_bson_array(&distortion_risks_json),
-                        "updated_at": DateTime::now()
-                    }
+        // D2：auto_verify 的每条裁决也接回 apply_chunk_revision，留 chunk_revisions
+        // 审计痕迹。**source=Rule**（非 Human）：裁决由 LLM 自评 + 规则闸门
+        // （decide_auto_verify_status + enforce_product_claim_human_audit + 抽样）做出，
+        // admin 只触发了批处理、并未逐条人工签字——标 Rule 才如实反映"规则化批处理写入"，
+        // 避免审计按 source 过滤时误判"有人逐条审定了这条"。created_by="auto_verify" 进一步
+        // 标识自动来源。perf：每条多一次 find_one+hash+revision insert+replace_one，但本循环
+        // 已逐条串行调 LLM（数十秒级），DB 这点开销可忽略。失败不阻断整体（best-effort，
+        // 沿用原 `let _ =` 容错姿态）。
+        let _ = apply_chunk_revision(
+            &state.db,
+            &workspace_id,
+            chunk_id,
+            RevisionRequest {
+                op: RevisionOp::Verify,
+                source: ProvenanceSource::Rule,
+                patch: doc! {
+                    "integrity_status": &final_status,
+                    "confidence_score": confidence,
+                    "verified_claims": string_bson_array(&verified_claims_json),
+                    "distortion_risks": string_bson_array(&distortion_risks_json),
                 },
-                None,
-            )
-            .await;
+                reason: Some(format!("auto_verify: model_status={model_status}, final={final_status}")),
+                actor: Some("auto_verify".to_string()),
+            },
+        )
+        .await;
         let _ = state
             .db
             .knowledge_usage_logs()

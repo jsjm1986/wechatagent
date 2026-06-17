@@ -45,6 +45,7 @@ pub enum RevisionOp {
     Restore,
     Verify,
     Unverify,
+    Reject,
 }
 
 impl RevisionOp {
@@ -59,6 +60,7 @@ impl RevisionOp {
             RevisionOp::Restore => "restore",
             RevisionOp::Verify => "verify",
             RevisionOp::Unverify => "unverify",
+            RevisionOp::Reject => "reject",
         }
     }
 }
@@ -456,6 +458,7 @@ mod tests {
             (RevisionOp::Restore, "restore"),
             (RevisionOp::Verify, "verify"),
             (RevisionOp::Unverify, "unverify"),
+            (RevisionOp::Reject, "reject"),
         ] {
             assert_eq!(op.as_str(), s);
         }

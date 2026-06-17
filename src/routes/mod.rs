@@ -80,7 +80,8 @@ pub mod ext_knowledge {
     pub use super::knowledge::{
         auto_verify_operation_knowledge_chunks, decide_auto_verify_status,
         extract_operation_knowledge_tags, import_operation_knowledge_preview,
-        propose_chunk_repair, verify_operation_knowledge_chunk, ExtractKnowledgeTagsRequest,
+        propose_chunk_repair, reject_operation_knowledge_chunk,
+        verify_operation_knowledge_chunk, ExtractKnowledgeTagsRequest,
         KnowledgeAutoVerifyRequest, KnowledgeVerifyRequest, OperationKnowledgeImportRequest,
     };
     // real-LLM 知识库全能力 smoke（real_llm_knowledge.rs K10–K11）：

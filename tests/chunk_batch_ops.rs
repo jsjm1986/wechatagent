@@ -7,20 +7,26 @@
 //! 1. 批量 verify 3 条（含 source_quote + anchor）→ 全部成功；可重复 verify 不出错。
 //! 2. 批量 archive：含 1 条已 archived → skipped 1 / archived 2。
 //! 3. 反向引用 list_chunk_referrers：targetId 命中 1 条 referrer。
+//! 4. D2 审计链：verify / reject / batch_verify 每次写入都在 chunk_revisions 落一条
+//!    op/source/created_by/hash 正确的不可变历史；D2 gate 挡下的 verify 不写 revision。
+//! 5. auto_verify 批处理（mock LLM，本地可跑）：每条 processed chunk 落一条
+//!    op=verify/source=rule/created_by=auto_verify 的 revision，N 条→N 条数量对应。
 //!
 //! 默认 `#[ignore]`，需要 Docker（testcontainers MongoDB）。
 //! AI 永不自动 verify 红线保留：批量入口仍需人工触发，与单条同 auth 路径。
 
 mod common;
 
-use axum::extract::{Query, State};
+use axum::extract::{Path, Query, State};
 use axum::{Extension, Json};
 use mongodb::bson::{oid::ObjectId, DateTime as BsonDt, Document};
 use serde_json::json;
 use wechatagent::auth::AuthenticatedAdmin;
 use wechatagent::models::{OperationKnowledgeChunk, RelatedRef};
 use wechatagent::routes::ext_knowledge::{
-    batch_archive_chunks, batch_verify_chunks, list_chunk_referrers,
+    auto_verify_operation_knowledge_chunks, batch_archive_chunks, batch_verify_chunks,
+    list_chunk_referrers, reject_operation_knowledge_chunk, verify_operation_knowledge_chunk,
+    KnowledgeAutoVerifyRequest, KnowledgeVerifyRequest,
 };
 use wechatagent::routes::{
     ChunkBatchArchiveRequest, ChunkBatchVerifyRequest, ChunkReferrersQuery,
@@ -285,4 +291,270 @@ async fn batch_verify_skips_chunk_without_quote() {
         "skip reason should mention source gate: {body:?}"
     );
     let _ = json!(body); // satisfy import
+}
+
+// ── D2：verify / reject / batch_verify 写入接回 apply_chunk_revision ──────────
+//
+// 补全审计链：「needs_review → verified」这个最关键状态转移此前直接 update_one，
+// 不写 chunk_revisions、不更新 provenance。下列测试断言每次 verify/reject/batch_verify
+// 都在 chunk_revisions 落一条 op/source/created_by/hash 正确的不可变历史。
+
+/// 取某 chunk 的全部 chunk_revisions（按 created_at 升序），供审计断言。
+async fn revisions_for(app: &TestApp, chunk_id_hex: &str) -> Vec<wechatagent::models::ChunkRevision> {
+    use futures::TryStreamExt;
+    app.state
+        .db
+        .chunk_revisions()
+        .find(
+            mongodb::bson::doc! { "chunk_id": chunk_id_hex },
+            mongodb::options::FindOptions::builder()
+                .sort(mongodb::bson::doc! { "created_at": 1 })
+                .build(),
+        )
+        .await
+        .expect("query chunk_revisions")
+        .try_collect()
+        .await
+        .expect("collect chunk_revisions")
+}
+
+#[tokio::test]
+#[ignore]
+async fn verify_writes_chunk_revision_audit_entry() {
+    let app = TestApp::start().await;
+    let ws = app.state.config.default_workspace_id.clone();
+
+    let chunk = verifiable_chunk(&ws, "单条 verify 审计链");
+    let id = chunk.id.unwrap().to_hex();
+    insert(&app, &[chunk]).await;
+
+    // verify 前：零 revision。
+    assert!(
+        revisions_for(&app, &id).await.is_empty(),
+        "verify 前不应有任何 chunk_revisions"
+    );
+
+    let payload: KnowledgeVerifyRequest = serde_json::from_value(json!({
+        "verifiedClaims": ["先共情再说明价值"],
+    }))
+    .expect("build verify request");
+    let _ = verify_operation_knowledge_chunk(
+        State(app.state.clone()),
+        admin(&app),
+        Path(id.clone()),
+        Json(payload),
+    )
+    .await
+    .expect("verify ok");
+
+    // chunk 本体切到 verified。
+    let stored = app
+        .state
+        .db
+        .operation_knowledge_chunks()
+        .find_one(
+            mongodb::bson::doc! { "_id": ObjectId::parse_str(&id).unwrap(), "workspace_id": &ws },
+            None,
+        )
+        .await
+        .unwrap()
+        .expect("chunk exists");
+    assert_eq!(stored.integrity_status.as_deref(), Some("verified"));
+    assert_eq!(stored.status, "active");
+
+    // chunk_revisions 多一条：op=verify、source=human、created_by=actor、hash 变化。
+    let revs = revisions_for(&app, &id).await;
+    assert_eq!(revs.len(), 1, "verify 应恰好写一条 revision: {revs:?}");
+    let rev = &revs[0];
+    assert_eq!(rev.op, "verify");
+    assert_eq!(rev.source, "human");
+    assert_eq!(rev.created_by.as_deref(), Some("test_admin"));
+    assert_ne!(
+        rev.before_hash, rev.after_hash,
+        "needs_review→verified 内容变更，before/after hash 必须不同"
+    );
+    assert!(!rev.before_hash.is_empty() && !rev.after_hash.is_empty());
+}
+
+#[tokio::test]
+#[ignore]
+async fn reject_writes_chunk_revision_with_reject_op() {
+    let app = TestApp::start().await;
+    let ws = app.state.config.default_workspace_id.clone();
+
+    let chunk = verifiable_chunk(&ws, "单条 reject 审计链");
+    let id = chunk.id.unwrap().to_hex();
+    insert(&app, &[chunk]).await;
+
+    let _ = reject_operation_knowledge_chunk(State(app.state.clone()), admin(&app), Path(id.clone()))
+        .await
+        .expect("reject ok");
+
+    let stored = app
+        .state
+        .db
+        .operation_knowledge_chunks()
+        .find_one(
+            mongodb::bson::doc! { "_id": ObjectId::parse_str(&id).unwrap(), "workspace_id": &ws },
+            None,
+        )
+        .await
+        .unwrap()
+        .expect("chunk exists");
+    assert_eq!(stored.integrity_status.as_deref(), Some("rejected"));
+    assert_eq!(stored.status, "rejected");
+
+    let revs = revisions_for(&app, &id).await;
+    assert_eq!(revs.len(), 1, "reject 应恰好写一条 revision: {revs:?}");
+    assert_eq!(revs[0].op, "reject");
+    assert_eq!(revs[0].source, "human");
+    assert_eq!(revs[0].created_by.as_deref(), Some("test_admin"));
+}
+
+#[tokio::test]
+#[ignore]
+async fn batch_verify_writes_one_revision_per_chunk() {
+    let app = TestApp::start().await;
+    let ws = app.state.config.default_workspace_id.clone();
+
+    let c1 = verifiable_chunk(&ws, "批量 A");
+    let c2 = verifiable_chunk(&ws, "批量 B");
+    let c3 = verifiable_chunk(&ws, "批量 C");
+    let id1 = c1.id.unwrap().to_hex();
+    let id2 = c2.id.unwrap().to_hex();
+    let id3 = c3.id.unwrap().to_hex();
+    insert(&app, &[c1, c2, c3]).await;
+
+    let _ = batch_verify_chunks(
+        State(app.state.clone()),
+        admin(&app),
+        Json(ChunkBatchVerifyRequest {
+            ids: vec![id1.clone(), id2.clone(), id3.clone()],
+            note: Some("批量审计链".to_string()),
+        }),
+    )
+    .await
+    .expect("batch verify ok");
+
+    // 每条恰好一条 op=verify revision，且 reason 透传 note。
+    for id_hex in [&id1, &id2, &id3] {
+        let revs = revisions_for(&app, id_hex).await;
+        assert_eq!(revs.len(), 1, "chunk {id_hex} 应恰好一条 revision: {revs:?}");
+        assert_eq!(revs[0].op, "verify");
+        assert_eq!(revs[0].source, "human");
+        assert_eq!(revs[0].created_by.as_deref(), Some("test_admin"));
+        assert_eq!(revs[0].reason.as_deref(), Some("批量审计链"));
+    }
+}
+
+#[tokio::test]
+#[ignore]
+async fn verify_gate_blocks_and_writes_no_revision_without_anchor() {
+    let app = TestApp::start().await;
+    let ws = app.state.config.default_workspace_id.clone();
+
+    // 缺 source_anchors（仅有 quote）→ D2 gate 在 apply_chunk_revision 之前先挡住。
+    let mut chunk = verifiable_chunk(&ws, "无 anchor 不可 verify");
+    chunk.source_anchors = vec![];
+    let id = chunk.id.unwrap().to_hex();
+    insert(&app, &[chunk]).await;
+
+    let payload: KnowledgeVerifyRequest =
+        serde_json::from_value(json!({ "verifiedClaims": [] })).unwrap();
+    let resp = verify_operation_knowledge_chunk(
+        State(app.state.clone()),
+        admin(&app),
+        Path(id.clone()),
+        Json(payload),
+    )
+    .await;
+    assert!(resp.is_err(), "缺 source_anchors 必须 400");
+
+    // gate 在写 revision 之前拒绝 → 不留任何 chunk_revisions 痕迹。
+    assert!(
+        revisions_for(&app, &id).await.is_empty(),
+        "被 D2 gate 挡下的 verify 不应写 revision"
+    );
+    // chunk 本体保持 needs_review，未被改动。
+    let stored = app
+        .state
+        .db
+        .operation_knowledge_chunks()
+        .find_one(
+            mongodb::bson::doc! { "_id": ObjectId::parse_str(&id).unwrap(), "workspace_id": &ws },
+            None,
+        )
+        .await
+        .unwrap()
+        .expect("chunk exists");
+    assert_eq!(stored.integrity_status.as_deref(), Some("needs_review"));
+}
+
+/// D2 + 本地可跑：auto_verify 批处理的每条裁决都接回 apply_chunk_revision，
+/// 在 chunk_revisions 落一条 op=verify / **source=rule**（裁决由 LLM 自评+规则闸门
+/// 做出，非人工逐条签字）/ created_by=auto_verify 的审计行。
+///
+/// 用内置 mock LLM（`app.llm.push_response`）喂确定性自评 JSON，**不依赖真模型**——
+/// 此前 auto_verify 的审计断言只活在 real-LLM 测试里（本地无 key 即 skip = 假绿），
+/// 本测试把这条最关键的批处理审计路径锁进本地 `cargo test --test` 可跑的范围。
+///
+/// 断言"N 条 chunk → N 条 revision"数量对应（real-LLM K7 只 seed 1 条做不到）。
+#[tokio::test]
+#[ignore]
+async fn auto_verify_writes_one_revision_per_processed_chunk() {
+    let app = TestApp::start().await;
+    let ws = app.state.config.default_workspace_id.clone();
+    let account_id = app.state.config.default_account_id.clone();
+
+    // seed 2 条 needs_review、带齐 source_quote + anchor 的 chunk。
+    let c1 = verifiable_chunk(&ws, "自动审定 A");
+    let c2 = verifiable_chunk(&ws, "自动审定 B");
+    let id1 = c1.id.unwrap().to_hex();
+    let id2 = c2.id.unwrap().to_hex();
+    insert(&app, &[c1, c2]).await;
+
+    // 为两条 chunk 各 push 一条 LLM 自评响应（auto_verify 逐条串行调 generate_agent_json）。
+    for _ in 0..2 {
+        app.llm.push_response(json!({
+            "confidenceScore": 9,
+            "integrityStatus": "verified",
+            "verifiedClaims": ["先共情再说明价值"],
+            "distortionRisks": [],
+        }));
+    }
+
+    let req: KnowledgeAutoVerifyRequest = serde_json::from_value(json!({
+        "accountId": account_id,
+        "confidenceThreshold": 7,
+        // 关抽样（clamp 到 5% 硬下限）：终态可能落 verified 或 needs_human_audit，
+        // 但**无论哪种**，每条 processed chunk 都会写一条 revision——这正是被测不变量。
+        "humanAuditSampleRate": 0.0,
+        "limit": 10,
+    }))
+    .expect("build auto_verify request");
+
+    let resp =
+        auto_verify_operation_knowledge_chunks(State(app.state.clone()), admin(&app), Json(req))
+            .await
+            .expect("auto_verify ok");
+    let processed = resp.0["processed"].as_i64().unwrap_or(0);
+    assert_eq!(processed, 2, "两条 chunk 都应被处理: {:?}", resp.0);
+    assert_eq!(app.llm.calls(), 2, "应正好消费 2 条 LLM 响应");
+
+    // 每条 chunk 恰好一条 op=verify / source=rule / created_by=auto_verify 的 revision。
+    for id_hex in [&id1, &id2] {
+        let revs = revisions_for(&app, id_hex).await;
+        assert_eq!(revs.len(), 1, "chunk {id_hex} 应恰好一条 revision: {revs:?}");
+        let rev = &revs[0];
+        assert_eq!(rev.op, "verify", "auto_verify revision op 必须为 verify");
+        assert_eq!(
+            rev.source, "rule",
+            "auto_verify 裁决是 LLM 自评+规则闸门，source 必须为 rule（非 human）"
+        );
+        assert_eq!(rev.created_by.as_deref(), Some("auto_verify"));
+        assert!(
+            !rev.before_hash.is_empty() && !rev.after_hash.is_empty(),
+            "before/after hash 必须落值"
+        );
+    }
 }
