@@ -262,7 +262,7 @@ pub(super) async fn delete_domain_profile(
 /// publish：在 scope=(workspace_id, profile_id) 下取 max(version)+1,写新文档。
 ///
 /// **分级生效**（危险开关二次确认）：先取该血缘当前 active 版本作 diff 基准，比对
-/// [`risky_fields_changed`] 的 10 个危险字段——
+/// [`risky_fields_changed`] 的 11 个危险字段——
 /// - **危险分支**（血缘已生效 **且** 危险字段有变更）：新版本落「旁路稿」
 ///   `current_version=false`、`is_active=false`，**不 demote、不 realign、不动旧 active
 ///   版本**——旧版继续 current+active 生效（零窗口期回落 DEFAULT）。返回 `pendingActivation:true`
@@ -571,7 +571,7 @@ const RISKY_FIELD_NAMES: [&str; 11] = [
     "transaction_facts_enabled",
 ];
 
-/// 比对两份 profile 的 10 个危险字段，返回**发生变化**的字段名列表（顺序与
+/// 比对两份 profile 的 11 个危险字段，返回**发生变化**的字段名列表（顺序与
 /// [`RISKY_FIELD_NAMES`] 一致）。整体相等比较（逐字段 `!=`，偏保守：宁可多一次确认也
 /// 不漏判）。`commitment_markers` / `operation_mode` / `outcome_polarity` /
 /// `threshold_overrides` 依赖各自类型的 `PartialEq`（见 `models.rs`）。

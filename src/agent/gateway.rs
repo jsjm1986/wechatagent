@@ -925,12 +925,19 @@ async fn run_user_operation_gateway_inner(
     // 加载本 workspace active 产品（IDOR：只取本 workspace），判定本轮 decision 报价
     // 引用的 product_id 是否命中 active 目录 → 与 verified_chunks 取或，避免 G2 准确
     // 报价被 blocked_unverified_product_claim 错杀。零扰动：产品表空 → 恒假。
-    let active_products =
-        super::entitlements::load_active_products(&state.db, &contact.workspace_id).await;
-    let priced_from_catalog = super::entitlements::priced_from_active_catalog(
-        &final_decision.quoted_product_ids,
-        &active_products,
-    );
+    // G4 #5 收口：报价背书是交易事实的一种消费，统一受 transaction_facts_enabled 闸。
+    // 非交易域（情感陪伴）即便误配产品表 + LLM 幻觉 quoted_product_ids，也不放行报价
+    // 豁免（方向更严格、安全）。DEFAULT 销售域 = true → 报价背书行为字节等价。
+    let priced_from_catalog = if active_profile.transaction_facts_enabled {
+        let active_products =
+            super::entitlements::load_active_products(&state.db, &contact.workspace_id).await;
+        super::entitlements::priced_from_active_catalog(
+            &final_decision.quoted_product_ids,
+            &active_products,
+        )
+    } else {
+        false
+    };
     let outcome = finalize_review_for_send(
         review,
         &mut final_decision,
@@ -1205,13 +1212,21 @@ async fn run_user_operation_gateway_inner(
                     final_decision = revised_decision;
                     promote_risks = revised_promote_risks;
 
-                    // 改写后的 decision 可能换了 quoted_product_ids，重算 priced_from_catalog
-                    // （复用上面已加载的 active_products，同 run 同 workspace）。
-                    let second_priced_from_catalog =
+                    // 改写后的 decision 可能换了 quoted_product_ids，重算 priced_from_catalog。
+                    // G4 #5 收口：同上受 transaction_facts_enabled 闸；闸关恒 false。
+                    let second_priced_from_catalog = if active_profile.transaction_facts_enabled {
+                        let active_products = super::entitlements::load_active_products(
+                            &state.db,
+                            &contact.workspace_id,
+                        )
+                        .await;
                         super::entitlements::priced_from_active_catalog(
                             &final_decision.quoted_product_ids,
                             &active_products,
-                        );
+                        )
+                    } else {
+                        false
+                    };
                     let second_outcome = finalize_review_for_send(
                         second_review,
                         &mut final_decision,
@@ -2585,6 +2600,10 @@ async fn apply_agent_updates(
     // 不含该维度 → 不纠偏、零扰动；情感域产品表空 → 投影空 → reconcile 恒返回
     // None。冲突纠偏时覆盖 domain_signals 容器值 + 记一条审计事件（reply 走异步
     // outbox，这里只改画像写入，不阻塞、不回滚）。active_profile 同时供写侧白名单复用。
+    // G4 #5 收口：G1 纠偏是交易事实（持有投影）的一种消费，须与决策注入闸同向——
+    // 追加 transaction_facts_enabled 守门，避免"非交易域关了注入、却仍用持有事实改写
+    // 客户阶段标签"的行为分裂（此前靠情感域默认不声明该维度间接挡住，非不变量；且
+    // project_entitlements 还看 outcome_events，产品表空也可能投影非空，巧合不可依赖）。
     let active_profile = crate::agent::domain_profile::load_active_domain_profile(
         &state.db,
         &contact.workspace_id,
@@ -2592,10 +2611,11 @@ async fn apply_agent_updates(
     .await;
     let mut g1_correction: Option<(String, String)> = None;
     {
-        let g1_participates = active_profile.profile_dimensions.iter().any(|d| {
-            d.participates_in_decision
-                && d.kind == crate::agent::entitlements::G1_DIMENSION_KIND
-        });
+        let g1_participates = active_profile.transaction_facts_enabled
+            && active_profile.profile_dimensions.iter().any(|d| {
+                d.participates_in_decision
+                    && d.kind == crate::agent::entitlements::G1_DIMENSION_KIND
+            });
         if g1_participates {
             let active_products = crate::agent::entitlements::load_active_products(
                 &state.db,
