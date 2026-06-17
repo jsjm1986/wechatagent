@@ -246,6 +246,16 @@ pub(crate) async fn load_active_products(
     }
 }
 
+/// 金额整数化命门：把最小币种单位整数（分）渲染成「元」展示字符串（如 19900→"199.00"）。
+/// AI 决策语义是元，若把分值 19900 直接喂给 agent 会报成 100 倍错价。金额已校验非负
+/// （add_deal_event / validate_product_money），故只需处理非负；防御性对负值取绝对值避免
+/// 出现 "-1.-5" 形态。两位小数固定（÷100），与全局"不按币种驱动小数位"约定一致。
+fn fmt_minor_as_major(cents: i64) -> String {
+    let abs = cents.unsigned_abs();
+    let sign = if cents < 0 { "-" } else { "" };
+    format!("{sign}{}.{:02}", abs / 100, abs % 100)
+}
+
 /// 把 active 产品渲染成决策 prompt 的「产品目录」段。空表 → 空串（零扰动）。
 ///
 /// 只输出报价必需的结构化字段（名/价/币种/SKU/简述），不堆砌 attributes 噪声。
@@ -259,8 +269,10 @@ pub(crate) fn format_product_catalog_for_prompt(products: &[Product]) -> String 
         .map(|p| {
             let mut parts = vec![format!("「{}」(id={})", p.name, p.product_id)];
             match (p.price, p.currency.as_deref()) {
-                (Some(price), Some(cur)) => parts.push(format!("{price} {cur}")),
-                (Some(price), None) => parts.push(format!("{price}")),
+                (Some(price), Some(cur)) => {
+                    parts.push(format!("{} {cur}", fmt_minor_as_major(price)))
+                }
+                (Some(price), None) => parts.push(fmt_minor_as_major(price)),
                 _ => parts.push("价格未设".to_string()),
             }
             if let Some(sku) = p.sku.as_deref().filter(|s| !s.is_empty()) {
@@ -439,7 +451,7 @@ mod tests {
         OutcomeEvent {
             marked_at: DateTime::from_millis(occurred_ms),
             occurred_at: Some(DateTime::from_millis(occurred_ms)),
-            amount: Some(199.0),
+            amount: Some(19900),
             currency: Some("CNY".to_string()),
             source: "manual".to_string(),
             marked_by: "admin".to_string(),
@@ -448,7 +460,7 @@ mod tests {
             product_ref: product.map(|(pid, name, qty)| OutcomeProductRef {
                 product_id: pid.to_string(),
                 name: name.to_string(),
-                unit_price: Some(199.0),
+                unit_price: Some(19900),
                 sku: None,
                 quantity: qty,
                 entitlement_days: None,
@@ -470,7 +482,7 @@ mod tests {
             workspace_id: "default".to_string(),
             product_id: pid.to_string(),
             name: name.to_string(),
-            price: Some(199.0),
+            price: Some(19900),
             currency: Some("CNY".to_string()),
             sku: None,
             status: "active".to_string(),
@@ -746,7 +758,7 @@ mod tests {
                 e.product_ref = Some(OutcomeProductRef {
                     product_id: format!("p{i}"),
                     name,
-                    unit_price: Some(199.0),
+                    unit_price: Some(19900),
                     sku: None,
                     quantity: 1,
                     entitlement_days: None,
@@ -828,6 +840,27 @@ mod tests {
                 "疑似成交指引不得含禁词 {forbidden}"
             );
         }
+    }
+
+    #[test]
+    fn fmt_minor_as_major_renders_cents_as_yuan() {
+        // 金额整数化命门：分→元两位小数。
+        assert_eq!(fmt_minor_as_major(19900), "199.00");
+        assert_eq!(fmt_minor_as_major(5), "0.05");
+        assert_eq!(fmt_minor_as_major(0), "0.00");
+        assert_eq!(fmt_minor_as_major(100), "1.00");
+        assert_eq!(fmt_minor_as_major(199), "1.99");
+        assert_eq!(fmt_minor_as_major(1000000), "10000.00");
+    }
+
+    #[test]
+    fn product_catalog_prompt_renders_price_as_yuan_not_cents() {
+        // 命门回归：catalog 注入 AI 的价格必须是「元」(199.00)，绝不能把分值 19900
+        // 直接喂给 agent（否则报成 100 倍错价）。product() helper price=19900。
+        let p = product("vip", "年度会员", Document::new());
+        let catalog = format_product_catalog_for_prompt(&[p]);
+        assert!(catalog.contains("199.00 CNY"), "价格须渲染成元：{catalog}");
+        assert!(!catalog.contains("19900"), "绝不能把分值原样喂给 AI：{catalog}");
     }
 
     #[test]

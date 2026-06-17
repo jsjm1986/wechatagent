@@ -26,7 +26,7 @@ fn ws_product(workspace_id: &str, product_id: &str, name: &str) -> Product {
         workspace_id: workspace_id.to_string(),
         product_id: product_id.to_string(),
         name: name.to_string(),
-        price: Some(199.0),
+        price: Some(19900),
         currency: Some("CNY".to_string()),
         sku: None,
         status: "active".to_string(),

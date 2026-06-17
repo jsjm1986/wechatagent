@@ -73,7 +73,8 @@ pub(super) struct MemoryCandidateQuery {
 pub(super) struct DealEventRequest {
     /// 结果实际发生时间的毫秒时间戳（可选，缺省用服务端 now 作为 marked_at）。
     occurred_at_ms: Option<i64>,
-    amount: Option<f64>,
+    /// 成交金额，最小币种单位整数（分，19900=¥199.00）。前端 ×100 转分后传入。
+    amount: Option<i64>,
     currency: Option<String>,
     note: Option<String>,
     /// 成交真相源可信度（G3 §2）。admin 后台登记缺省 `staff_confirmed`（admin 登记即
@@ -702,10 +703,16 @@ pub(super) async fn add_deal_event(
 ) -> AppResult<Json<Value>> {
     let object_id = parse_object_id(&id)?;
     let contact = find_contact_by_id(&state, &admin.current_workspace, &id).await?;
-    if let Some(amount) = payload.amount {
-        if !amount.is_finite() || amount < 0.0 {
+    // 金额整数化：amount 是最小币种单位整数（分），i64 无 NaN/Inf，只查非负。
+    if !crate::models::is_valid_minor_amount(payload.amount) {
+        return Err(AppError::BadRequest(
+            "amount 必须是非负整数（最小币种单位，如分）".to_string(),
+        ));
+    }
+    if let Some(cur) = payload.currency.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        if !crate::models::is_valid_currency_code(cur) {
             return Err(AppError::BadRequest(
-                "amount 必须是非负有限数".to_string(),
+                "currency 必须是 ISO-4217 三位大写字母币种码（如 CNY）".to_string(),
             ));
         }
     }

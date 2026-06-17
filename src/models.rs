@@ -233,9 +233,11 @@ pub struct OutcomeEvent {
     /// 结果实际发生时间（admin 可回填；缺省时下游用 `marked_at` 近似）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub occurred_at: Option<DateTime>,
-    /// 金额（可选，业务自行决定是否登记；无金额语义的行业留空）。
+    /// 成交金额（可选，业务自行决定是否登记；无金额语义的行业留空）。
+    /// **最小币种单位整数**（如分，19900 = ¥199.00）——金额一律整数防浮点误差，
+    /// 仅前端 fmtPrice / AI prompt 文本两个展示点 ÷100 转「元」。reversal 下表示退款正向量级。
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub amount: Option<f64>,
+    pub amount: Option<i64>,
     /// 金额币种（ISO-4217 短码，如 `CNY`）；与 `amount` 配套。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub currency: Option<String>,
@@ -291,8 +293,9 @@ pub struct OutcomeProductRef {
     /// 成交当时的产品名快照。
     pub name: String,
     /// 成交当时单价快照（与 `OutcomeEvent.amount` 可不等：折扣/多件）。
+    /// **最小币种单位整数**（分，19900 = ¥199.00），同 [`OutcomeEvent::amount`]。
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub unit_price: Option<f64>,
+    pub unit_price: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sku: Option<String>,
     /// 件数（默认 1）。
@@ -331,8 +334,9 @@ pub struct Product {
     pub product_id: String,
     pub name: String,
     /// 单价（可选——定制报价等无固定单价的行业可留空）。
+    /// **最小币种单位整数**（分，19900 = ¥199.00），同 [`OutcomeEvent::amount`]。
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub price: Option<f64>,
+    pub price: Option<i64>,
     /// 币种（ISO-4217 短码，如 `CNY`）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub currency: Option<String>,
@@ -354,6 +358,20 @@ pub struct Product {
 
 fn default_product_status() -> String {
     "active".to_string()
+}
+
+/// 校验币种码是否符合 ISO-4217 形态（3 个大写 ASCII 字母，如 `CNY`/`USD`）。
+/// 仅校验**形态**不查真实币种表；金额整数化固定 ÷100（分），不按币种驱动小数位。
+/// 纯函数，调用方（routes）把 false 转成各自的 `BadRequest` 文案。
+pub(crate) fn is_valid_currency_code(code: &str) -> bool {
+    code.len() == 3 && code.bytes().all(|b| b.is_ascii_uppercase())
+}
+
+/// 校验金额（最小币种单位整数，分）是否合法：`None` 合法（未登记），`Some` 须非负。
+/// i64 无 NaN/Inf，故只需查非负（替代 f64 时代的 `is_finite && >= 0`）。
+/// 纯函数，调用方把 false 转成 `BadRequest`。
+pub(crate) fn is_valid_minor_amount(amount: Option<i64>) -> bool {
+    amount.map_or(true, |v| v >= 0)
 }
 
 /// 自学习采集管道 S1–S3：行为信号（append-only 事件日志）。
@@ -5097,7 +5115,7 @@ mod objective_purchase_facts_model_tests {
     fn outcome_event_legacy_doc_without_g3_fields_defaults_to_staff_confirmed() {
         let legacy = r#"{
             "markedAt": {"$date": {"$numberLong": "1700000000000"}},
-            "amount": 199.0,
+            "amount": 19900,
             "currency": "CNY",
             "source": "manual",
             "markedBy": "admin",
@@ -5105,6 +5123,7 @@ mod objective_purchase_facts_model_tests {
         }"#;
         let ev: OutcomeEvent = serde_json::from_str(legacy).expect("legacy doc should deserialize");
         assert_eq!(ev.verification, "staff_confirmed");
+        assert_eq!(ev.amount, Some(19900), "金额是最小币种单位整数（分），19900=¥199.00");
         assert!(ev.product_ref.is_none());
         // §4.5：旧文档无 event_kind → 缺省 deal（正向成交），退款逆转语义不影响存量。
         assert_eq!(ev.event_kind, "deal");
@@ -5156,7 +5175,7 @@ mod objective_purchase_facts_model_tests {
             workspace_id: "ws1".to_string(),
             product_id: "sku-1".to_string(),
             name: "年度会员".to_string(),
-            price: Some(199.0),
+            price: Some(19900),
             currency: Some("CNY".to_string()),
             sku: None,
             status: "active".to_string(),
@@ -5170,5 +5189,26 @@ mod objective_purchase_facts_model_tests {
         assert!(json.get("product_id").is_some());
         assert!(json.get("workspaceId").is_none());
         assert!(json.get("productId").is_none());
+    }
+
+    /// 金额整数化：ISO-4217 币种码形态校验（3 大写字母）。
+    #[test]
+    fn currency_code_validation_accepts_iso4217_shape_only() {
+        assert!(is_valid_currency_code("CNY"));
+        assert!(is_valid_currency_code("USD"));
+        assert!(!is_valid_currency_code("cny"), "小写不合法");
+        assert!(!is_valid_currency_code("CN"), "两位不合法");
+        assert!(!is_valid_currency_code("CNYY"), "四位不合法");
+        assert!(!is_valid_currency_code("CN1"), "含数字不合法");
+        assert!(!is_valid_currency_code(""), "空不合法");
+    }
+
+    /// 金额整数化：最小币种单位（分）非负校验；None（未登记）合法。
+    #[test]
+    fn minor_amount_validation_rejects_negative_only() {
+        assert!(is_valid_minor_amount(None), "未登记金额合法");
+        assert!(is_valid_minor_amount(Some(0)), "0 分合法");
+        assert!(is_valid_minor_amount(Some(19900)), "正常金额合法");
+        assert!(!is_valid_minor_amount(Some(-1)), "负数非法");
     }
 }

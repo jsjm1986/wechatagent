@@ -12,6 +12,7 @@ interface Product {
   productId: string;
   workspaceId: string;
   name: string;
+  /** 最小币种单位整数（分，19900=¥199.00）；展示用 fmtPrice ÷100。 */
   price: number | null;
   currency: string | null;
   sku: string | null;
@@ -25,6 +26,7 @@ interface Product {
 interface OutcomeProductRef {
   productId: string;
   name: string;
+  /** 最小币种单位整数（分）。 */
   unitPrice?: number | null;
   sku?: string | null;
   quantity: number;
@@ -34,6 +36,7 @@ interface OutcomeProductRef {
 interface OutcomeEvent {
   markedAt: string;
   occurredAt?: string | null;
+  /** 最小币种单位整数（分，19900=¥199.00）；展示用 fmtPrice ÷100。 */
   amount?: number | null;
   currency?: string | null;
   source: string;
@@ -82,9 +85,23 @@ function verificationIcon(verification: string) {
   }
 }
 
-function fmtPrice(amount?: number | null, currency?: string | null): string {
-  if (amount == null) return "—";
-  return currency ? `${amount} ${currency}` : `${amount}`;
+// 金额整数化：后端金额是最小币种单位整数（分，19900=¥199.00），仅在此展示层 ÷100 转元。
+function fmtPrice(amountCents?: number | null, currency?: string | null): string {
+  if (amountCents == null) return "—";
+  const major = (amountCents / 100).toFixed(2);
+  if (!currency) return major;
+  return currency === "CNY" ? `¥${major}` : `${major} ${currency}`;
+}
+
+// 录入边界：用户输入「元」（input step=0.01），提交前 ×100 转「分」整数。
+// Math.round 防 1.1*100=110.00000000000001 之类的浮点误差。空/纯空白/非数返回 null。
+function yuanToCents(input: unknown): number | null {
+  if (input == null) return null;
+  const text = typeof input === "string" ? input.trim() : input;
+  if (text === "") return null;
+  const yuan = Number(text);
+  if (!Number.isFinite(yuan)) return null;
+  return Math.round(yuan * 100);
 }
 
 function fmtDate(ms?: number | null): string {
@@ -173,7 +190,7 @@ function CatalogTab() {
     if (!draft.productId.trim() || !draft.name.trim()) return;
     setBusy(true);
     try {
-      const priceNum = draft.price.trim() === "" ? null : Number(draft.price);
+      const priceNum = yuanToCents(draft.price);
       await api.post("/api/products", {
         productId: draft.productId.trim(),
         name: draft.name.trim(),
@@ -458,8 +475,14 @@ function DealsTab() {
       setFormError("退款/撤单必须选择关联产品（指明抵消哪个产品的持有）。");
       return;
     }
-    const amountNum = draft.amount.trim() === "" ? null : Number(draft.amount);
-    if (amountNum != null && (!Number.isFinite(amountNum) || amountNum < 0)) {
+    // 校验用户输入的「元」值非负，再 ×100 转「分」整数传后端。
+    // 单一入口：yuanToCents 内部已 trim+判空+判有限，避免与校验口径分叉（纯空格曾静默落 0 元）。
+    const amountCents = yuanToCents(draft.amount);
+    if (draft.amount.trim() !== "" && amountCents == null) {
+      setFormError("金额必须是有效数字。");
+      return;
+    }
+    if (amountCents != null && amountCents < 0) {
       setFormError("金额必须是非负数。");
       return;
     }
@@ -473,7 +496,7 @@ function DealsTab() {
       const qtyNum = Number(draft.quantity);
       body.quantity = Number.isFinite(qtyNum) && qtyNum >= 1 ? Math.floor(qtyNum) : 1;
     }
-    if (amountNum != null) body.amount = amountNum;
+    if (amountCents != null) body.amount = amountCents;
     if (draft.currency.trim()) body.currency = draft.currency.trim();
     if (draft.occurredAt.trim()) {
       const ms = new Date(draft.occurredAt).getTime();

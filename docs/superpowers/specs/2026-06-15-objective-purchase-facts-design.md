@@ -86,10 +86,11 @@ pub struct Product {
     pub product_id: String,
     pub name: String,
     /// 单价（可选——无定价/一口价以外的行业，如定制报价，可留空）。
+    /// **最小币种单位整数（分，19900=¥199.00，#6 金额整数化）**——金额全程整数防浮点误差。
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub price: Option<f64>,
+    pub price: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub currency: Option<String>,        // ISO-4217，如 CNY
+    pub currency: Option<String>,        // ISO-4217，如 CNY（写入校验 3 大写字母形态）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sku: Option<String>,
     /// `active` / `archived`。archived 不再出现在 agent 可报价集合，但历史成交仍可解引用。
@@ -122,6 +123,17 @@ fn default_product_status() -> String { "active".to_string() }
 - 是否注入产品目录由"该 workspace 有无 active product"**隐式**决定（初版设计）——但落码后审查发现隐式开关不足以防"非交易域 admin 误配产品表 + 登记成交 → '已购买X'裸注入情感对话"。**G4 #5 收口（2026-06-17）改为显式交易域闸** `DomainProfile.transaction_facts_enabled`：仅交易型域（销售/电商/课程）置 `true` 才注入三段交易事实（产品目录 / 持有投影 / 疑似成交指引）；非交易域（情感陪伴/朋友）置 `false`，即便误配产品表也跳过加载、一律空串。默认 `false`（失败方向安全：宁可漏注不可错注），`default_domain_profile` 销售兜底显式置 `true` 保历史等价。该开关已纳入 `RISKY_FIELD_NAMES`（手改已生效血缘时不即时生效，落旁路稿二次确认）。
 - **不变量：`transaction_facts_enabled` 是交易事实"所有消费路径"的统一总开关**，不止决策注入一处。交叉审查（2026-06-17）发现 gateway 还有两条旁路曾按旧的隐式信号工作，已一并纳入同一闸：① **G1 `purchase_lifecycle` 纠偏**（gateway 用 G4 持有投影纠正 LLM 推断的购买阶段标签）——此前只看 `purchase_lifecycle` 维度是否「参与决策」，与闸解耦，会造成"非交易域关了注入、却仍用持有事实改写客户阶段"的行为分裂；现追加 `&& transaction_facts_enabled`。② **R5.4 `priced_from_catalog` 报价背书豁免**（命中 active 产品 → 绕过 `blocked_unverified_product_claim`）——此前无条件加载，闸关时强制 `false`（方向更严格、安全）。**新增任何"消费 active 产品 / G4 投影 / 成交事实"的路径，都必须先过此闸**，否则就是新开的分裂口子。注意 `project_entitlements` 的持有投影不只看 active_products、还 fold `outcome_events`（成交快照），故"产品表空→投影恒空"的零扰动论证**不充分**（误录 outcome_events 即可触发），必须靠显式闸而非依赖产品表为空的巧合。
 
+### 3.4.1 金额整数化（#6 财务地基，2026-06-17）
+
+所有表示钱的字段（`Product.price` / `OutcomeEvent.amount` / `OutcomeProductRef.unit_price`）是 **`Option<i64>` 最小币种单位整数（分，19900=¥199.00）**，不用 `f64`——浮点不适合表示钱，未来 LTV/业绩聚合相加零误差。约定：
+
+- **边界（方案 A：分贯穿 API）**：后端存储/计算/API 请求响应全程整数分。**只在两个最终展示点 ÷100 转「元」**：① 前端 `fmtPrice`（CNY 加 `¥` 前缀，固定两位小数）；② AI 决策 prompt 文本（`entitlements::fmt_minor_as_major`，**命门**——若把分值原样喂 agent 会报 100 倍错价，有单测守护）。
+- **录入**：前端 input 仍用「元」（`step=0.01`），提交前 `yuanToCents` ×100 + `Math.round`（防 `1.1*100` 浮点）。
+- **小数位**：固定 ÷100（分），**不按币种驱动小数位**（不支持日元 0 位/第纳尔 3 位），保持简单。
+- **校验**：金额非负（i64 无 NaN/Inf，去掉 f64 时代的 `is_finite`）经 `models::is_valid_minor_amount`；currency 加 **ISO-4217 形态校验**（3 大写字母）经 `models::is_valid_currency_code`，所有写入点（products CRUD + add_deal_event）复用。
+- 全新项目无存量 double 文档，无需迁移。
+
+
 ### 3.5 多租户隔离不变量（IDOR 红线，所有新读写点强制）
 
 `Product` 是 workspace 级实体、`outcome_events` 挂在 contact（contact 归属 account 归属 workspace）。项目历史做过 IDOR 扫荡（admin handler 一律按 `current_workspace` 过滤），本专题所有新增读写点**必须延续同一不变量**，否则就是新开的越权口子：
@@ -151,7 +163,7 @@ pub struct OutcomeEvent {
     // ── 现有 7 字段不变 ──
     pub marked_at: DateTime,
     pub occurred_at: Option<DateTime>,
-    pub amount: Option<f64>,
+    pub amount: Option<i64>,             // 最小币种单位整数（分，#6 金额整数化）
     pub currency: Option<String>,
     pub source: String,
     pub marked_by: String,
@@ -184,8 +196,9 @@ pub struct OutcomeProductRef {
     /// 成交当时的产品名快照。
     pub name: String,
     /// 成交当时单价快照（与 OutcomeEvent.amount 可不等：折扣/多件）。
+    /// 最小币种单位整数（分，#6 金额整数化）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub unit_price: Option<f64>,
+    pub unit_price: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sku: Option<String>,
     /// 件数（默认 1）。
