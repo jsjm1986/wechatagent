@@ -32,7 +32,7 @@ on:
   workflow_dispatch:
     inputs:
       dispatch_target:
-        description: '手动单跑目标（ops=单个 real_llm_ops_smoke / roleplay_docker=roleplay P0 Docker 夹具 / roleplay_p2=情感陪伴全链 E2E 真模型 / reviewer_calibration=reviewer 高压识别校准）'
+        description: '手动单跑目标（ops=单个 real_llm_ops_smoke / roleplay_docker=roleplay P0 Docker 夹具 / roleplay_p2=情感陪伴全链 E2E 真模型 / reviewer_calibration=reviewer 高压识别校准 / roleplay_arc=R5.1 LLM 演客户动态博弈链）'
         required: true
         default: 'ops'
         type: choice
@@ -41,6 +41,7 @@ on:
           - roleplay_docker
           - roleplay_p2
           - reviewer_calibration
+          - roleplay_arc
       ops_test:
         description: '当 target=ops 时单独跑的 real_llm_ops_smoke 测试名（如 t15_real_multiturn_deal_arc）'
         required: false
@@ -936,6 +937,76 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: reviewer-calibration-ledger
+          path: target/real_llm_ledger/
+          if-no-files-found: ignore
+          retention-days: 30
+
+  # 手动单跑：R5.1 LLM 演客户动态博弈链（roleplayer 真演客户 × agent 真回应 × 多轮闭合）。
+  # 三族异族（R5.0.1）：agent=claude-opus-4-8（RSXERMU/Anthropic）、roleplayer=NVIDIA
+  # llama-3.3-70b（NVIDIA_KEY，第三族，独立端点不占 rsxermu 并发）。judge 本条不接（R5.2
+  # trajectory judge 后续）——只验博弈链通 + gateway status 闭集硬断言 + roleplayer 不出戏。
+  # 仅 workflow_dispatch + dispatch_target=roleplay_arc 触发。无 needs，立即起跑。
+  roleplay-arc:
+    name: Roleplay R5.1 动态博弈链 (手动单跑 / 三族真模型)
+    runs-on: ubuntu-latest
+    if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.dispatch_target == 'roleplay_arc' }}
+    timeout-minutes: 90
+    env:
+      REAL_LLM_API_KEY: ${{ secrets.RSXERMU_KEY }}
+      ROLEPLAYER_API_KEY: ${{ secrets.NVIDIA_KEY }}
+    steps:
+      - name: Require REAL_LLM_API_KEY (R0.1 缺 key 真 fail，不假绿)
+        if: ${{ env.REAL_LLM_API_KEY == '' }}
+        run: |
+          echo "::error::REAL_LLM_API_KEY 未配置（secrets.RSXERMU_KEY 为空）。被测 agent 必须有 key 才能真跑——缺 key 直接 fail，不静默跳过假绿（R0.1）。"
+          exit 1
+      - name: Require ROLEPLAYER_API_KEY (R0.1 缺第三族 key 真 fail，不假绿)
+        if: ${{ env.ROLEPLAYER_API_KEY == '' }}
+        run: |
+          echo "::error::ROLEPLAYER_API_KEY 未配置（secrets.NVIDIA_KEY 为空）。roleplayer 是第三异族（R5.0.1），缺 key 则博弈链全程 fallback=假绿——直接 fail，不静默跳过。"
+          exit 1
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # 同 integration job：清预装 SDK 腾 ~30GB，否则 target + mongo 镜像撑爆磁盘。
+      - name: Free disk space
+        if: ${{ env.REAL_LLM_API_KEY != '' && env.ROLEPLAYER_API_KEY != '' }}
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android \
+            /usr/local/share/boost /usr/local/share/powershell \
+            /usr/lib/jvm "$AGENT_TOOLSDIRECTORY" || true
+          sudo docker image prune --all --force || true
+          df -h
+
+      - name: Install Rust toolchain
+        if: ${{ env.REAL_LLM_API_KEY != '' && env.ROLEPLAYER_API_KEY != '' }}
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry / target
+        if: ${{ env.REAL_LLM_API_KEY != '' && env.ROLEPLAYER_API_KEY != '' }}
+        uses: Swatinem/rust-cache@v2
+
+      # 被测 agent = claude-opus-4-8（rsxermu666.cn / Anthropic 非流式）；roleplayer 走默认
+      # NVIDIA llama-3.3-70b @ temperature 0.8（with_temperature 覆盖生产默认 0.2）。两端点
+      # 异厂商天然异族，且 NVIDIA 异端点不占 rsxermu 并发。
+      - name: cargo test --test real_llm_roleplay_arc (3 异族真模型 + testcontainers)
+        if: ${{ env.REAL_LLM_API_KEY != '' && env.ROLEPLAYER_API_KEY != '' }}
+        env:
+          RUSTFLAGS: ""
+          REAL_LLM_BASE_URL: https://rsxermu666.cn
+          REAL_LLM_MODEL: claude-opus-4-8
+          REAL_LLM_FORMAT: anthropic
+          ROLEPLAYER_BASE_URL: https://integrate.api.nvidia.com/v1
+          ROLEPLAYER_MODEL: meta/llama-3.3-70b-instruct
+          ROLEPLAYER_FORMAT: openai
+          ROLEPLAYER_TEMPERATURE: "0.8"
+        run: cargo test --no-fail-fast --test real_llm_roleplay_arc -- --ignored --nocapture
+
+      - name: Upload roleplay arc ledger
+        if: ${{ always() && env.REAL_LLM_API_KEY != '' && env.ROLEPLAYER_API_KEY != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: roleplay-arc-ledger
           path: target/real_llm_ledger/
           if-no-files-found: ignore
           retention-days: 30
