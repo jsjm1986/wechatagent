@@ -131,12 +131,52 @@ macro_rules! unwrap_or_skip_transient {
     ($result:expr, $what:expr) => {{
         match $result {
             Ok(value) => value,
-            Err(wechatagent::error::AppError::LlmUnavailable { kind, retry_count, .. }) => {
+            Err(wechatagent::error::AppError::LlmUnavailable { kind, retry_count, detail, .. }) => {
+                // R0.3：配错类 4xx（404 endpoint_not_found / 其它 http_4xx，除账户级 401/402）
+                // **不是端点抖动**，是 baseUrl/model/path 配错（重演 t12 漏 /v1 → 405 被当抖动
+                // skip 假绿的坑）。这类直接 panic 暴露，不 skip、不写 ledger。401/402（未授权/
+                // 欠费）仍按瞬时处理（fork 没 key / 配额临时耗尽，独立端点可救）。
+                let cfg_err_4xx = kind == "endpoint_not_found"
+                    || (kind == "http_4xx"
+                        && !detail.contains("HTTP 401")
+                        && !detail.contains("HTTP 402"));
+                if cfg_err_4xx {
+                    panic!(
+                        "{}：配置错误（kind={kind}），非端点抖动——4xx 多为 baseUrl/model/path 配错，\
+                         不当瞬时 skip 假绿（R0.3）。detail={detail}",
+                        $what
+                    );
+                }
                 eprintln!(
                     "skip: {} —— 真模型上游瞬时不可达（kind={kind}, retry_count={retry_count}），\
                      按计划「真模型抖动有限重试+跳过」处理，不算能力失败",
                     $what
                 );
+                // R0.2：transient-skip 可观测化——每次 skip append 一行到公共 ledger，
+                // CI 跑完按 skip 率校验阈值（高 skip 假绿 → 红）。IO 失败仅诊断不影响 skip。
+                {
+                    use std::io::Write as _;
+                    let dir = std::env::var("REAL_LLM_LEDGER")
+                        .unwrap_or_else(|_| "target/real_llm_ledger".to_string());
+                    let _ = std::fs::create_dir_all(&dir);
+                    if let Ok(mut f) = std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(format!("{dir}/skip_ledger.jsonl"))
+                    {
+                        let _ = writeln!(
+                            f,
+                            "{}",
+                            serde_json::json!({
+                                "test": $what,
+                                "kind": kind,
+                                "retry_count": retry_count,
+                                "file": file!(),
+                                "sha": std::env::var("GITHUB_SHA").unwrap_or_else(|_| "local".into()),
+                            })
+                        );
+                    }
+                }
                 return;
             }
             Err(other) => panic!("{}：{other:?}", $what),

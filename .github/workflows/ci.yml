@@ -179,6 +179,11 @@ jobs:
     env:
       REAL_LLM_API_KEY: ${{ secrets.RSXERMU_KEY }}
     steps:
+      - name: Require REAL_LLM_API_KEY (R0.1 缺 key 真 fail，不假绿)
+        if: ${{ env.REAL_LLM_API_KEY == '' }}
+        run: |
+          echo "::error::REAL_LLM_API_KEY 未配置（secrets.RSXERMU_KEY 为空）。real-llm job 必须有 key 才能真跑——缺 key 直接 fail，不静默跳过假绿（R0.1）。"
+          exit 1
       - name: Checkout
         uses: actions/checkout@v4
 
@@ -257,6 +262,17 @@ jobs:
           REAL_LLM_VISION_MODEL: gpt-5.4
         run: cargo test --no-fail-fast --test real_llm_knowledge -- --ignored --nocapture
 
+      # R0.2：传出 skip ledger（含 unwrap_or_skip_transient! 写的 skip_ledger.jsonl），
+      # 供下游 skip-gate job 汇总校验 skip 率。
+      - name: Upload skip ledger
+        if: ${{ always() && env.REAL_LLM_API_KEY != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: real-llm-skip-ledger-smoke
+          path: target/real_llm_ledger/
+          if-no-files-found: ignore
+          retention-days: 30
+
   # ════════════════════════════════════════════════════════════════════════════
   # 知识库**召回率量化基准**（real_llm_recall_benchmark.rs）——业务闭环核心北极星：
   # 文档抽取入库 → 运营 agent 渐进式披露检索召回 → agent 自然语言维护知识库后召回保持。
@@ -307,6 +323,11 @@ jobs:
     env:
       REAL_LLM_API_KEY: ${{ secrets.RSXERMU_KEY }}
     steps:
+      - name: Require REAL_LLM_API_KEY (R0.1 缺 key 真 fail，不假绿)
+        if: ${{ env.REAL_LLM_API_KEY == '' }}
+        run: |
+          echo "::error::REAL_LLM_API_KEY 未配置（secrets.RSXERMU_KEY 为空）。real-llm job 必须有 key 才能真跑——缺 key 直接 fail，不静默跳过假绿（R0.1）。"
+          exit 1
       - name: Checkout
         uses: actions/checkout@v4
 
@@ -399,6 +420,11 @@ jobs:
     env:
       REAL_LLM_API_KEY: ${{ secrets.RSXERMU_KEY }}
     steps:
+      - name: Require REAL_LLM_API_KEY (R0.1 缺 key 真 fail，不假绿)
+        if: ${{ env.REAL_LLM_API_KEY == '' }}
+        run: |
+          echo "::error::REAL_LLM_API_KEY 未配置（secrets.RSXERMU_KEY 为空）。real-llm job 必须有 key 才能真跑——缺 key 直接 fail，不静默跳过假绿（R0.1）。"
+          exit 1
       - name: Checkout
         uses: actions/checkout@v4
 
@@ -443,6 +469,16 @@ jobs:
           REAL_LLM_JUDGE_FORMAT: openai
         run: cargo test --no-fail-fast --test real_llm_ops_smoke ${{ matrix.t }} -- --ignored --nocapture
 
+      # R0.2：传出 skip ledger 供下游 skip-gate 汇总。
+      - name: Upload skip ledger
+        if: ${{ always() && env.REAL_LLM_API_KEY != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: real-llm-skip-ledger-ops-${{ matrix.t }}
+          path: target/real_llm_ledger/
+          if-no-files-found: ignore
+          retention-days: 30
+
   # 手动单跑：只跑 workflow_dispatch input 指定的**单个** real_llm_ops_smoke 测试，
   # **无 needs 前置链**，触发后立即起跑——用于快速验证单测修复（如 t15），不必等
   # real-llm → recall → ops 串行排队 1+ 小时。env 与 real-llm-ops 完全同口径（同主模型
@@ -457,6 +493,11 @@ jobs:
     env:
       REAL_LLM_API_KEY: ${{ secrets.RSXERMU_KEY }}
     steps:
+      - name: Require REAL_LLM_API_KEY (R0.1 缺 key 真 fail，不假绿)
+        if: ${{ env.REAL_LLM_API_KEY == '' }}
+        run: |
+          echo "::error::REAL_LLM_API_KEY 未配置（secrets.RSXERMU_KEY 为空）。real-llm job 必须有 key 才能真跑——缺 key 直接 fail，不静默跳过假绿（R0.1）。"
+          exit 1
       - name: Checkout
         uses: actions/checkout@v4
 
@@ -541,6 +582,11 @@ jobs:
       # gpt-5.4（OpenAI /v1）。`if:` 守卫读此 job 级 env，空 key 时各步自动跳过。key 走 RSXERMU_KEY。
       REAL_LLM_API_KEY: ${{ secrets.RSXERMU_KEY }}
     steps:
+      - name: Require REAL_LLM_API_KEY (R0.1 缺 key 真 fail，不假绿)
+        if: ${{ env.REAL_LLM_API_KEY == '' }}
+        run: |
+          echo "::error::REAL_LLM_API_KEY 未配置（secrets.RSXERMU_KEY 为空）。real-llm job 必须有 key 才能真跑——缺 key 直接 fail，不静默跳过假绿（R0.1）。"
+          exit 1
       - name: Checkout
         uses: actions/checkout@v4
 
@@ -656,6 +702,11 @@ jobs:
       # `if:` 守卫读 job 级此 env，空 key 时整个 adversarial job 各步自动跳过、不红不耗 CI 分钟。
       REAL_LLM_API_KEY: ${{ secrets.RSXERMU_KEY }}
     steps:
+      - name: Require REAL_LLM_API_KEY (R0.1 缺 key 真 fail，不假绿)
+        if: ${{ env.REAL_LLM_API_KEY == '' }}
+        run: |
+          echo "::error::REAL_LLM_API_KEY 未配置（secrets.RSXERMU_KEY 为空）。real-llm job 必须有 key 才能真跑——缺 key 直接 fail，不静默跳过假绿（R0.1）。"
+          exit 1
       - name: Checkout
         uses: actions/checkout@v4
 
@@ -773,6 +824,11 @@ jobs:
     env:
       REAL_LLM_API_KEY: ${{ secrets.RSXERMU_KEY }}
     steps:
+      - name: Require REAL_LLM_API_KEY (R0.1 缺 key 真 fail，不假绿)
+        if: ${{ env.REAL_LLM_API_KEY == '' }}
+        run: |
+          echo "::error::REAL_LLM_API_KEY 未配置（secrets.RSXERMU_KEY 为空）。real-llm job 必须有 key 才能真跑——缺 key 直接 fail，不静默跳过假绿（R0.1）。"
+          exit 1
       - name: Checkout
         uses: actions/checkout@v4
 
@@ -831,6 +887,11 @@ jobs:
     env:
       REAL_LLM_API_KEY: ${{ secrets.RSXERMU_KEY }}
     steps:
+      - name: Require REAL_LLM_API_KEY (R0.1 缺 key 真 fail，不假绿)
+        if: ${{ env.REAL_LLM_API_KEY == '' }}
+        run: |
+          echo "::error::REAL_LLM_API_KEY 未配置（secrets.RSXERMU_KEY 为空）。real-llm job 必须有 key 才能真跑——缺 key 直接 fail，不静默跳过假绿（R0.1）。"
+          exit 1
       - name: Checkout
         uses: actions/checkout@v4
 
@@ -878,3 +939,35 @@ jobs:
           path: target/real_llm_ledger/
           if-no-files-found: ignore
           retention-days: 30
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # R0.2：skip 率硬门（汇总）。各 real-llm job 是 continue-on-error（conclusion 恒
+  # success，端点抖动不卡合并），但**大面积 transient-skip = 这一轮真模型测试实际
+  # 没验证到能力 = 假绿**。本 job 非 continue-on-error，needs 5 个 PR 门真模型 job，
+  # 汇总它们传出的 skip_ledger.jsonl，skip 总数超阈值即真红卡合并。
+  # 缺 key（fork PR/没配 secret）时 5 个上游 job 在其 fail-gate 已红，本 job 因
+  # needs 失败而 skipped，不会假绿。
+  skip-gate:
+    name: Real-LLM skip 率硬门 (R0.2)
+    runs-on: ubuntu-latest
+    if: ${{ github.event_name != 'workflow_dispatch' }}
+    needs: [real-llm, real-llm-recall, real-llm-ops, real-llm-quality, real-llm-adversarial]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      # 汇总所有真模型 job 传出的 ledger（含 skip_ledger.jsonl）到一个目录。
+      # pattern 覆盖各 job 的命名：real-llm-skip-ledger-* / real-llm-recall-ledger-* /
+      # real-llm-ledger-*（quality/adversarial）。merge-multiple 把多 artifact 合进同目录。
+      - name: Download all skip ledgers
+        uses: actions/download-artifact@v4
+        with:
+          path: target/real_llm_ledger
+          pattern: "*ledger*"
+          merge-multiple: true
+      - name: Check skip rate
+        env:
+          REAL_LLM_LEDGER: target/real_llm_ledger
+          # 5 个 job 汇总，放宽到 12（单 job ~3-16 测试，端点偶发抖动允许少量；
+          # 持续抖动致大面积 skip 才红）。可按实际调。
+          REAL_LLM_MAX_SKIP: "12"
+        run: bash scripts/check-skip-ledger.sh
