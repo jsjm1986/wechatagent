@@ -228,6 +228,164 @@ pub fn build_judge_user(label: &str, inbound: &str, reply: &str) -> String {
     )
 }
 
+// ════════════════════════════════════════════════════════════════════════════
+// R1.2 judge 失败语义分级
+//
+// spec R1.2：以 judge 为**唯一质量门**的测试，judge 失败 → fail（不静默 pass）；
+// 红线类测试（不依赖 judge，judge 只观测）judge 失败仅丢观测可接受。
+//
+// 设计：分级由**调用点传入的 `JudgeGate`** 决定，不是全局开关——现有 t4-t18 与红线
+// roleplay 测试全是「红线硬断言为门、judge 只观测」，传 `ObserveOnly` 即与现状语义
+// 等价（失败 eprintln+返 None，绝不 panic）；只有「judge 是唯一质量信号」的新测试传
+// `QualityGate`，此时 judge 全失败 → assert fail（堵「judge 挂了却静默绿」）。
+//
+// 注意：这是供**新测试**用的统一入口，老测试（ops_smoke/adversarial/emotional_e2e/
+// reviewer_calibration）各自的 run_judge 维持不动——它们的硬编码标尺已是各域正确口径，
+// 且属 t4-t18 零变化红线保护对象（spec「DEFAULT 等价单测是资产不动」）。builder
+// `build_judge_rubric` 已达成「换新域不用再抄 judge」的去重目标。
+// ════════════════════════════════════════════════════════════════════════════
+
+use std::collections::HashMap;
+use wechatagent::error::AppError;
+use wechatagent::llm::LlmProvider;
+
+/// judge 失败处置等级。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JudgeGate {
+    /// judge 是该测试的**唯一质量信号** → K 次全失败时 assert fail（不静默绿）。
+    QualityGate,
+    /// judge 只观测（测试另有红线硬断言为门）→ 失败仅 eprintln + 返 None，绝不 panic。
+    /// 与现有 t4-t18 / 红线 roleplay 的 judge 语义等价。
+    ObserveOnly,
+}
+
+/// judge 一次评测的产出。
+#[derive(Debug, Clone)]
+pub struct JudgeOutcome {
+    /// 各维 median 分（key=维度名）。
+    pub medians: HashMap<String, i64>,
+    /// 成功返回并解析的采样次数。
+    pub attempted: usize,
+    /// 计划采样次数。
+    pub ok_calls: usize,
+}
+
+/// 容错取分：嵌套 `{score,reason}` 取 `.score`，或扁平数字直接取；int/float 兼容。
+fn judge_score(v: &serde_json::Value, key: &str) -> Option<i64> {
+    let field = v.get(key)?;
+    let num = field.get("score").unwrap_or(field);
+    num.as_i64().or_else(|| num.as_f64().map(|f| f as i64))
+}
+
+fn median(samples: &[i64]) -> Option<i64> {
+    if samples.is_empty() {
+        return None;
+    }
+    let mut s = samples.to_vec();
+    s.sort_unstable();
+    Some(s[s.len() / 2])
+}
+
+/// 判定 judge 调用错误是否「端点配错」（4xx 非账户级），即便 ObserveOnly 也应 fail
+/// （堵 R0.3：漏 /v1→405 被当抖动吞的假绿）。账户级 401/402 与端点抖动（5xx/超时/
+/// 限流）不算配错，照常按 gate 处置。
+fn is_endpoint_misconfig(e: &AppError) -> bool {
+    if let AppError::LlmUnavailable { kind, detail, .. } = e {
+        return kind == "endpoint_not_found"
+            || (kind == "http_4xx"
+                && !detail.contains("HTTP 401")
+                && !detail.contains("HTTP 402"));
+    }
+    false
+}
+
+/// R1.2 统一分级 judge：用 profile 派生 rubric 给一条 reply 打分（K 次采样取 median）。
+///
+/// - `judge`：裁判 provider（调用方传入，须与被测 agent 异族——R5.0.1）。
+/// - `rubric`：`build_judge_rubric(profile)` 的产出。
+/// - `gate`：`QualityGate` → K 次全失败 assert fail；`ObserveOnly` → 失败返 None 不 panic。
+/// - 任一采样命中**端点配错 4xx**（非 401/402）→ 无论 gate 都 panic（R0.3）。
+/// - `REAL_LLM_JUDGE` 未设 `=1` → 直接返 None 跳过（本地零成本，与现状一致）。
+///
+/// 返回 `Some(JudgeOutcome)`（至少一次成功采样）或 `None`（跳过/全失败且 ObserveOnly）。
+pub async fn run_judge_graded(
+    judge: &dyn LlmProvider,
+    rubric: &JudgeRubric,
+    label: &str,
+    inbound: &str,
+    reply: &str,
+    samples: usize,
+    gate: JudgeGate,
+) -> Option<JudgeOutcome> {
+    if std::env::var("REAL_LLM_JUDGE").map(|v| v == "1").unwrap_or(false) != true {
+        eprintln!("[裁判:{label}] 跳过（未设 REAL_LLM_JUDGE=1）");
+        return None;
+    }
+    if reply.trim().is_empty() {
+        // 空 reply 不是 judge 的错——是被测链路没产出。QualityGate 下这是真问题。
+        match gate {
+            JudgeGate::QualityGate => {
+                panic!("[裁判:{label}] reply_text 为空，但本测试以 judge 为唯一质量门（QualityGate）——无内容可评 = 链路缺陷")
+            }
+            JudgeGate::ObserveOnly => {
+                eprintln!("[裁判:{label}] reply_text 空，跳过（仅观测）");
+                return None;
+            }
+        }
+    }
+    let k = samples.max(1);
+    let user = build_judge_user(label, inbound, reply);
+
+    let results =
+        futures::future::join_all((0..k).map(|_| judge.generate_json_with_usage(&rubric.system, &user)))
+            .await;
+
+    let mut per_dim: HashMap<String, Vec<i64>> = HashMap::new();
+    let mut ok = 0usize;
+    for (i, r) in results.into_iter().enumerate() {
+        match r {
+            Ok(res) => {
+                ok += 1;
+                for d in &rubric.dims {
+                    if let Some(s) = judge_score(&res.value, d) {
+                        per_dim.entry(d.clone()).or_default().push(s);
+                    }
+                }
+            }
+            Err(e) => {
+                // 端点配错（漏 /v1 等）→ 无论 gate 都 fail，不当抖动吞（R0.3）。
+                if is_endpoint_misconfig(&e) {
+                    panic!("[裁判:{label}] judge 端点配错（4xx 非账户级），非抖动——堵 R0.3 假绿: {e:?}");
+                }
+                eprintln!("[裁判:{label}][sample {}/{k}] 调用失败: {e:?}", i + 1);
+            }
+        }
+    }
+
+    if ok == 0 {
+        match gate {
+            JudgeGate::QualityGate => {
+                panic!("[裁判:{label}] {k} 次采样全失败，但本测试以 judge 为唯一质量门（QualityGate）——judge 不可用即测试不可信，不静默绿")
+            }
+            JudgeGate::ObserveOnly => {
+                eprintln!("[裁判:{label}] {k} 次采样全失败，跳过（仅观测，不 fail）");
+                return None;
+            }
+        }
+    }
+
+    let medians: HashMap<String, i64> = per_dim
+        .iter()
+        .filter_map(|(d, v)| median(v).map(|m| (d.clone(), m)))
+        .collect();
+    eprintln!("[裁判:{label}] {ok}/{k} 次成功，median={medians:?}");
+    Some(JudgeOutcome {
+        medians,
+        attempted: ok,
+        ok_calls: k,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
