@@ -114,6 +114,7 @@ async fn db_create_profile(
         updated_at: DateTime::now(),
         threshold_overrides: None,
         reviewer_orientation: None,
+        mode_gate_policy_override: None,
         answering_mode_profile: None,
         version: 1,
     };

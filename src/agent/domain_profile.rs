@@ -519,6 +519,25 @@ pub fn apply_reviewer_balance_principle(user: &str, override_text: Option<&str>)
     user.replace(DEFAULT_REVIEWER_BALANCE_PRINCIPLE, principle)
 }
 
+/// universal-domain-adaptation A/T1：把 active profile 的 `mode_gate_policy_override`
+/// 应用到 decision/policy prompt 的「## 模式与 5 闸的关系」模式-闸说明段。
+/// `None`（DEFAULT/老库）/ 空白 → 原样返回（销售取向逐字保留、销售域字节等价）。
+/// `Some` 且 != 销售锚 → 把整段 [`crate::prompts::DEFAULT_MODE_GATE_POLICY`] 替换成本域
+/// 模式-闸说明。锚找不到（prompt 被运营改写过）→ 原样返回不强插，避免污染。
+///
+/// 与 [`apply_reviewer_review_focus`] / [`apply_reviewer_balance_principle`] 同构
+/// （精确子串替换、幂等、空覆盖即 no-op）。注意销售锚**不含** boundary_protection
+/// 红线续行——那是跨域恒定红线，不随 profile 替换。本函数只替换模式-闸说明散文。
+pub fn apply_mode_gate_policy(system: &str, override_text: Option<&str>) -> String {
+    let Some(policy) = override_text.map(str::trim).filter(|s| !s.is_empty()) else {
+        return system.to_string();
+    };
+    if policy == crate::prompts::DEFAULT_MODE_GATE_POLICY {
+        return system.to_string();
+    }
+    system.replace(crate::prompts::DEFAULT_MODE_GATE_POLICY, policy)
+}
+
 /// universal-domain-adaptation I：completeness `answeringMode` 三档的写死销售释义
 /// （喂 LLM 的「判断规则」段，逐字复刻 catalog.rs 原文）。三档 key 是域无关认知阶梯，
 /// 恒定；释义可被 `AnsweringModeProfile` 按行业覆盖。
@@ -699,6 +718,9 @@ pub fn default_domain_profile(workspace_id: &str) -> DomainProfile {
         // D：DEFAULT 不覆盖评审取向 → reviewer prompt 的「评审重点 / 转化平衡」两句保留
         // 写死销售取向（字节等价）。换行业可声明中性 / 本域取向。
         reviewer_orientation: None,
+        // A/T1：DEFAULT 不覆盖模式-闸说明 → decision/policy prompt「## 模式与 5 闸的关系」
+        // 保留写死销售说明（prompt 字节等价）。非销售域可声明本域模式-闸尺度。
+        mode_gate_policy_override: None,
         // I：DEFAULT 不覆盖 answeringMode 三档释义/标签 → completeness prompt 三档释义
         // 与前端档位标签保留写死销售文案（prompt 字节等价、UI 标签不变）。
         answering_mode_profile: None,
@@ -1823,6 +1845,40 @@ mod tests {
         assert!(!out.contains("适度推进"), "销售取向残留：{out}");
         // 同段其余写死原则逐字保留。
         assert!(out.contains("禁止虚假稀缺、恐惧营销、编造案例、编造价格、编造承诺。"));
+    }
+
+    // ── A/T1：mode_gate_policy 模式-闸说明段随 profile 替换 ──
+
+    /// None / 空白覆盖 → 原样返回（字节等价）。
+    #[test]
+    fn apply_mode_gate_policy_none_returns_unchanged() {
+        let s = format!("前\n{}\n后", crate::prompts::DEFAULT_MODE_GATE_POLICY);
+        assert_eq!(apply_mode_gate_policy(&s, None), s);
+        assert_eq!(apply_mode_gate_policy(&s, Some("   ")), s);
+        // 覆盖文本恰等于写死销售说明 → 幂等不替换。
+        assert_eq!(
+            apply_mode_gate_policy(&s, Some(crate::prompts::DEFAULT_MODE_GATE_POLICY)),
+            s
+        );
+    }
+
+    /// Some → 把模式-闸说明锚替换为本域说明，销售锚不再残留。
+    #[test]
+    fn apply_mode_gate_policy_some_replaces_anchor() {
+        let s = format!("前\n{}\n后", crate::prompts::DEFAULT_MODE_GATE_POLICY);
+        let out = apply_mode_gate_policy(&s, Some("情感域模式说明"));
+        assert!(out.contains("情感域模式说明"));
+        assert!(!out.contains(crate::prompts::DEFAULT_MODE_GATE_POLICY));
+        // 锚以外的前后文逐字保留。
+        assert!(out.contains("前\n"));
+        assert!(out.contains("\n后"));
+    }
+
+    /// 锚找不到（运营改写过 prompt）→ 原样返回，不强插污染。
+    #[test]
+    fn apply_mode_gate_policy_no_anchor_is_noop() {
+        let custom = "前文\n## 别的标题\nXXX\n后文";
+        assert_eq!(apply_mode_gate_policy(custom, Some("本域说明")), custom);
     }
 
     /// 两字段独立回落：只覆盖其一时，另一处保持写死。

@@ -14,6 +14,25 @@ use crate::{
 
 pub const PROMPT_PACK_VERSION: &str = "wechatagent_prompt_pack_v3_2026_05_22";
 
+/// universal-domain-adaptation A/T1：user.reply.policy prompt「## 模式与 5 闸的关系」
+/// 模式-闸说明段（逐字复刻 prompt pack v3 现文 :958-963：标题 + casual_relationship /
+/// value_exchange / consultative / boundary_protection 四个模式的五闸尺度说明）。
+///
+/// **边界**：只含「模式的五闸尺度说明」，**绝不含** boundary_protection 红线续行
+/// (:964「严禁承诺真人 / 安排同事」等 no-human-takeover 红线)——那是跨域恒定红线，
+/// 对所有行业都要保留，不随 profile 替换。
+///
+/// `apply_mode_gate_policy`（domain_profile.rs）以它为锚做精确子串替换：非销售域
+/// （情感陪伴等）声明本域模式-闸说明时整段替换，销售/DEFAULT/老库 → 原样保留。
+/// 一个字都不能差，否则 `system.replace(锚, new)` 会静默失配——
+/// `default_mode_gate_policy_anchor_matches_pack` 测试充当锚漂移护栏。
+pub const DEFAULT_MODE_GATE_POLICY: &str = r#"## 模式与 5 闸的关系
+
+- **casual_relationship**：FactRisk / ProductAccuracyScore 几乎不参与（不应出现产品声明）；PressureRisk 阈值收紧（≥5 即拦截），杜绝"寒暄里夹推销"。
+- **value_exchange**：常规阈值。可引用安全事实、行业判断、清单、框架；产品声明仍需 verified_chunks 支撑。
+- **consultative**：所有产品声明必须由 verified_chunks.safe_claims 支撑。没有 verified 支撑时，用 AI 自己第一人称承接的表达兜住（如"这块我先把准确口径核对下再回你""具体数字我确认完马上同步你"），或先回答能确定的部分 / 约个时间细聊；绝不编造，也绝不把问题交接给"运营同事 / 真人 / 同事"。ProductAccuracyScore < 7 直接拦截。
+- **boundary_protection**：禁止任何主动话术、营销话术、追问话术；只承接用户最后一句意图，必要时给具体可操作答复（如老客户问售后），不能升档进 consultative。"#;
+
 /// Phase E / E3：默认 locale。Contact / PromptTemplate 缺 `locale` 字段时回落到此。
 /// 选 `zh-CN` 是因为 WeChat 私域运营当前唯一使用语种；新 locale 落地按 BCP-47
 /// 短形式扩展（如 `en-US`、`zh-TW`）。
@@ -2166,6 +2185,45 @@ mod locale_tests {
     #[test]
     fn default_locale_is_zh_cn() {
         assert_eq!(DEFAULT_LOCALE, "zh-CN");
+    }
+}
+
+#[cfg(test)]
+mod mode_gate_policy_anchor_tests {
+    use super::*;
+
+    /// 锚漂移护栏：[`DEFAULT_MODE_GATE_POLICY`] 必须是 user.reply.policy prompt
+    /// 实际「## 模式与 5 闸的关系」那段的**逐字子串**，否则
+    /// `apply_mode_gate_policy` 的 `system.replace` 会静默失配。
+    #[test]
+    fn default_mode_gate_policy_anchor_matches_pack() {
+        let specs = prompt_specs();
+        let policy = specs
+            .iter()
+            .find(|s| s.key == "user.reply.policy")
+            .expect("user.reply.policy prompt spec 存在");
+        assert!(
+            policy.content.contains(DEFAULT_MODE_GATE_POLICY),
+            "DEFAULT_MODE_GATE_POLICY 锚与 prompt pack 不一致，replace 会静默失配"
+        );
+    }
+
+    /// 锚是「模式-闸说明段」(958 标题 + 960-963 四模式 bullet)，
+    /// **绝不含** boundary_protection 红线续行(964「严禁承诺真人 / 安排同事」等
+    /// 跨域恒定红线)——那对所有行业都要保留，不随 profile 替换。
+    #[test]
+    fn default_mode_gate_policy_excludes_human_takeover_redline() {
+        assert!(
+            !DEFAULT_MODE_GATE_POLICY.contains("严禁承诺"),
+            "锚误纳入 boundary 红线段(:964)，会被 profile 替换掉跨域恒定红线"
+        );
+        assert!(!DEFAULT_MODE_GATE_POLICY.contains("安排真人"));
+        assert!(!DEFAULT_MODE_GATE_POLICY.contains("让同事来联系"));
+        // 但模式-闸说明里四个模式的尺度描述都在。
+        assert!(DEFAULT_MODE_GATE_POLICY.contains("casual_relationship"));
+        assert!(DEFAULT_MODE_GATE_POLICY.contains("value_exchange"));
+        assert!(DEFAULT_MODE_GATE_POLICY.contains("consultative"));
+        assert!(DEFAULT_MODE_GATE_POLICY.contains("boundary_protection"));
     }
 }
 
