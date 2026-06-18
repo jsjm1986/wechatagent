@@ -734,6 +734,24 @@ async fn recall_benchmark_smoke() {
         "[RECALL-SMOKE] seeded={} cited={:?} rounds={}",
         id, result.cited_chunk_ids, result.rounds_used
     );
+
+    // 契约硬断言（spec R4.1：smoke 也要 recall@k 下限，消除「只 eprintln 不断言」假绿）。
+    // smoke 是单 query / 单 expected，召回 ∈ {0,1}：唯一的 seeded chunk 就是这条
+    // query（"买错了能退吗" 对 "7天无理由退换"）的正确目标，检索连它自己都翻不到
+    // 即是检索路径真 bug。注意端点瞬时不可达已被上面 unwrap_or_skip_transient! 跳过，
+    // 走到这里说明 answer 成功返回，正常路径才断言、不会因端点抖动假红。
+    // 断 reach（检索翻到过的最宽集）而非 adopt：smoke 只验「管线打通+检索能翻到目标」，
+    // 生成层是否引用留给主基准的 adopt 契约，避免单 query 真模型抖动误红。
+    // 【相对下限/单调契约，非绝对锁分，模型升级只会更好不触误红】
+    let reach = reach_set(&result);
+    let reach_recall = recall_at_k(&reach, &[id.clone()]);
+    assert!(
+        reach_recall >= 1.0,
+        "契约违约：smoke seeded query reach 召回 {:.3} < 1.0——\
+         唯一 seeded chunk({}) 连自己都没被检索翻到，检索路径真 bug",
+        reach_recall, id
+    );
+    eprintln!("[RECALL-SMOKE] 契约硬断言通过：seeded chunk reach 召回=1.0");
 }
 
 // ── Task4: 跨轮稳定性 + 召回率主测 + ⊆seed 红线 ─────────────────────────────
@@ -1053,6 +1071,38 @@ async fn recall_benchmark_cross_industry() {
             max_drift
         );
     }
+
+    // 断言5 — adopt（采纳：仅 cited_chunk_ids，生成层真正引用作答的子集）相对下限。
+    // 此前 4 条契约全锁 reach（检索翻到过的最宽集），adopt 只 eprintln 无硬断言：
+    // 检索翻到了、生成层却从不引用（citation 抽取失效 / 生成侧塌陷）会全程漏过。
+    // adopt ⊆ reach 恒成立（翻到才可能引用），故下限必须比 reach 的 0.7 更宽松——
+    // 取 0.4：reach→adopt 之间天然有「翻到但未引用/改写未标注」的真模型损耗，
+    // 0.4 把这段损耗留出大半余量，仅拦「生成层几乎从不采纳」这种写侧/生成侧整体失效。
+    // 【相对下限/单调契约，非绝对锁分，模型升级只会更好不触误红】
+    let overall_adopt_mean = calc_mean(&overall_adopt_recalls);
+    let lexical_easy_adopt_mean = calc_mean(&lexical_easy_adopt_recalls);
+    if !lexical_easy_adopt_recalls.is_empty() {
+        assert!(
+            lexical_easy_adopt_mean >= 0.4,
+            "契约违约：lexical-easy（词面强重叠 overlap≥0.15）组 adopt 召回均值 {:.3} < 0.4 下限——\
+             检索翻到了却几乎从不引用作答，疑似 citation 抽取/生成层整体失效\
+             （adopt⊆reach，下限已较 reach 的 0.7 大幅放宽留损耗余量，非绝对锁分）",
+            lexical_easy_adopt_mean
+        );
+    } else {
+        // 兜底：本次运行无 lexical-easy 组，退化为对全体 case 设极保守下限 0.25
+        // （adopt 比 reach 的 0.5 兜底更低，仅拦生成层整体塌陷）。
+        // 【相对下限/单调契约，非绝对锁分，模型升级只会更好不触误红】
+        assert!(
+            overall_adopt_mean >= 0.25,
+            "契约违约：全体 case adopt 召回均值 {:.3} < 0.25 保守下限——生成层采纳疑似整体塌陷",
+            overall_adopt_mean
+        );
+    }
+    eprintln!(
+        "[RECALL] adopt 契约硬断言通过：lexical-easy adopt 均值={:.3}(≥0.4) overall adopt 均值={:.3}",
+        lexical_easy_adopt_mean, overall_adopt_mean
+    );
 
     eprintln!(
         "[RECALL] 契约硬断言全部通过：lexical-easy reach 均值={:.3}(≥0.7) overall reach 均值={:.3} \
@@ -1439,7 +1489,60 @@ async fn recall_benchmark_maintenance_stability() {
         if total_cases_c > 0 { drift_count_c as f64 / total_cases_c as f64 * 100.0 } else { 0.0 },
         drift_count_c, total_cases_c);
 
-    eprintln!("[RECALL-MAINT] 真实chat改库全链路召回保持测试完成 —— 三变更后稳定性观测完毕");
+    // 契约硬断言（spec R4.1：maintenance 也要漂移率上限，把 SOFT-WARN 升级成硬断言）。
+    // 上面三段 SOFT-WARN 的 drift_count* 把「端点瞬时不可达→recall_all 记空集」也算成漂移
+    // （空集 != 非空集），直接对它们硬断会被端点抖动假红。故这里**另算一份 flutter-safe
+    // 漂移**：只统计「该 case 在相邻两轮 reach 集都非空」的 case 对（两侧都真出了结果），
+    // 跳过任一侧是 transient 空集的 case；分母也只数这种「双侧均观测到」的对。
+    // 漂移定义沿用既有口径：相邻两轮 reach 排序后不一致即漂移。
+    // 上限 0.5：知识库经历新增/改写/废弃三类真实变更，召回集本就该随之变动，
+    // 漂移本身不是 bug；0.5 仅拦「过半 case 在变更后召回结果翻转」这种检索对变更
+    // 过度敏感/索引重建塌陷。已有 ⊆seed 红线（loop 内）一字不动。
+    // 【相对上限/单调契约，非绝对锁分，留足真模型抖动+变更引发的合理漂移余量】
+    let mut safe_drift = 0usize;
+    let mut safe_total = 0usize;
+    let count_safe_drift = |prev: &std::collections::HashMap<String, (Vec<String>, Vec<String>)>,
+                            cur: &std::collections::HashMap<String, (Vec<String>, Vec<String>)>,
+                            drift: &mut usize,
+                            total: &mut usize| {
+        for case in &cases {
+            if let (Some((p_reach, _)), Some((c_reach, _))) = (prev.get(&case.name), cur.get(&case.name)) {
+                // 任一侧 reach 为空 → 视为 transient 跳过该 case 对，不计入分母（防端点抖动假红）
+                if p_reach.is_empty() || c_reach.is_empty() {
+                    continue;
+                }
+                *total += 1;
+                let mut p_sorted = p_reach.clone();
+                let mut c_sorted = c_reach.clone();
+                p_sorted.sort();
+                c_sorted.sort();
+                if p_sorted != c_sorted {
+                    *drift += 1;
+                }
+            }
+        }
+    };
+    count_safe_drift(&r0, &r1, &mut safe_drift, &mut safe_total);
+    count_safe_drift(&r1, &r2, &mut safe_drift, &mut safe_total);
+    count_safe_drift(&r2, &r3, &mut safe_drift, &mut safe_total);
+
+    if safe_total == 0 {
+        eprintln!("[RECALL-MAINT] 三变更全程 reach 双侧均空（端点瞬时不可达），跳过漂移率上限硬断言");
+    } else {
+        let safe_drift_rate = safe_drift as f64 / safe_total as f64;
+        eprintln!(
+            "[RECALL-MAINT] flutter-safe 跨变更 reach 漂移率={:.1}% ({}/{})",
+            safe_drift_rate * 100.0, safe_drift, safe_total
+        );
+        assert!(
+            safe_drift_rate <= 0.5,
+            "契约违约：跨三变更 reach 漂移率 {:.3} ({}/{}) > 0.5 上限——\
+             过半 case 在知识库变更后召回结果翻转，检索对变更过度敏感（已剔除端点抖动空集，非绝对锁分）",
+            safe_drift_rate, safe_drift, safe_total
+        );
+    }
+
+    eprintln!("[RECALL-MAINT] 真实chat改库全链路召回保持测试完成 —— 三变更后稳定性观测完毕 + 漂移率上限契约硬断言");
 }
 
 // ── Task5: gap→主动提问→对话补库→再问命中 完整闭合轨迹 ─────────────────────────
