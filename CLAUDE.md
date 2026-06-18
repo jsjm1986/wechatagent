@@ -2,6 +2,10 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## Superpowers（最优先）
+
+**最优先使用 superpowers skills。** 任何任务开始前，只要有 ≥1% 可能某个 skill 适用，就必须先通过 Skill 工具调用它，再做其它动作（包括澄清提问、探索代码）。流程类 skill 优先于实现类：要写代码/做非平凡实现的任务，先走 `superpowers:brainstorming`（设计→获批→`writing-plans`）；调试先走 systematic-debugging。skill 一旦适用即非可选。唯一例外：用户的显式指令优先级最高（与 skill 冲突时听用户的）。
+
 ## Communication
 
 Always reply to the user in Chinese (中文). This applies to all conversational responses, explanations, summaries, and status updates. Code, identifiers, commit messages, and file contents follow their existing conventions.
