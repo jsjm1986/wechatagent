@@ -95,6 +95,24 @@ pub(super) fn insert_domain_stage_fields(
     set_doc.insert("domain_attributes_updated_at", DateTime::now());
 }
 
+/// admin 写画像维度：把 [`crate::agent::dimension_registry::validate_dimension_value`]
+/// 的三通道处置映射成写入决策。`Accept(canonical)` → 写入该值；`DropSilently` → 不写
+/// 该键（admin 直写通道理论不触发 Drop，兜底）；`Reject(reason)` → `400 BadRequest`
+/// （越界值不静默落库脏值）。
+///
+/// 单一真相源：guide-preview apply（本模块）与 update_operation_profile（contacts.rs）
+/// 两条 admin 路径共用此 helper，避免逻辑重复漂移。
+pub(super) fn apply_admin_dim_validation(
+    v: crate::agent::dimension_registry::DimValidation,
+) -> AppResult<Option<String>> {
+    use crate::agent::dimension_registry::DimValidation::*;
+    match v {
+        Accept(s) => Ok(Some(s)),
+        DropSilently => Ok(None),
+        Reject(r) => Err(AppError::BadRequest(r)),
+    }
+}
+
 /// 该联系人是否曾被 Agent 运营过（用于"重新启用/重新建档不覆盖历史画像"判定）。
 ///
 /// `Contact` 没有显式的 `first_managed_at` 字段，用 `last_agent_run_at`（跑过 Agent
@@ -553,40 +571,56 @@ pub(super) async fn apply_contact_changes(
         set_doc.insert("tags", to_bson(&value)?);
     }
     if let Some(value) = doc_get_string(changes, "customerStage") {
-        // M1：admin 手填值经 taxonomy alias→canonical 归一，与 LLM 决策路径同口径，
-        // 杜绝同一字段 canonical/alias 漂移污染下游派生。
-        let value = agent::taxonomy::normalize_dimension_value(
-            &state.db,
-            "customer_stage",
-            &value,
-            &contact.account_id,
-        )
-        .await;
-        // M2：customer_stage 实际变化时同步刷新 customer_stage_updated_at。
-        let prev = contact_domain_str(contact, "customer_stage");
-        let stage_changed = prev.as_deref().map(|s| s != value.as_str()).unwrap_or(true);
+        // M1：admin 手填值经 dimension_registry 校验（alias→canonical 归一 + 越界拒绝），
+        // 与 contacts.rs::update_operation_profile 同口径。guide-preview apply 是 admin
+        // 权威写入 → WriteIntent::AdminWrite：越界值 `?` 提前返回 400（不静默落脏值）。
+        // DropSilently（admin 通道理论不触发，仅空串兜底）→ 跳过该维度写入，不影响其它字段。
+        let validated_stage = apply_admin_dim_validation(
+            agent::dimension_registry::validate_dimension_value(
+                &state.db,
+                "customer_stage",
+                &value,
+                &contact.account_id,
+                agent::dimension_registry::WriteIntent::AdminWrite,
+            )
+            .await,
+        )?;
         let intent = match doc_get_string(changes, "intentLevel") {
-            Some(v) => Some(
-                agent::taxonomy::normalize_dimension_value(
+            Some(v) => apply_admin_dim_validation(
+                agent::dimension_registry::validate_dimension_value(
                     &state.db,
                     "intent_level",
                     &v,
                     &contact.account_id,
+                    agent::dimension_registry::WriteIntent::AdminWrite,
                 )
                 .await,
-            ),
+            )?,
             None => None,
         };
-        insert_domain_stage_fields(&mut set_doc, Some(&value), intent.as_deref(), stage_changed);
+        if let Some(value) = validated_stage {
+            // M2：customer_stage 实际变化时同步刷新 customer_stage_updated_at（归一后再比较）。
+            let prev = contact_domain_str(contact, "customer_stage");
+            let stage_changed = prev.as_deref().map(|s| s != value.as_str()).unwrap_or(true);
+            insert_domain_stage_fields(&mut set_doc, Some(&value), intent.as_deref(), stage_changed);
+        } else if intent.is_some() {
+            // stage 被 drop 但 intent 通过：仍写 intent（stage_changed=false，不刷 stage 计时）。
+            insert_domain_stage_fields(&mut set_doc, None, intent.as_deref(), false);
+        }
     } else if let Some(value) = doc_get_string(changes, "intentLevel") {
-        let value = agent::taxonomy::normalize_dimension_value(
-            &state.db,
-            "intent_level",
-            &value,
-            &contact.account_id,
-        )
-        .await;
-        insert_domain_stage_fields(&mut set_doc, None, Some(&value), false);
+        let validated = apply_admin_dim_validation(
+            agent::dimension_registry::validate_dimension_value(
+                &state.db,
+                "intent_level",
+                &value,
+                &contact.account_id,
+                agent::dimension_registry::WriteIntent::AdminWrite,
+            )
+            .await,
+        )?;
+        if let Some(value) = validated {
+            insert_domain_stage_fields(&mut set_doc, None, Some(&value), false);
+        }
     }
     if let Some(value) = doc_get_string(changes, "followUpPolicy") {
         set_doc.insert("follow_up_policy", value);

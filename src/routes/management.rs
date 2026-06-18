@@ -764,10 +764,40 @@ pub(super) async fn execute_management_tool(
                 let domain_config =
                     agent::load_user_operation_domain_config(state, workspace_id).await?;
                 let initial_state = agent::initial_operation_state_key(domain_config.as_ref());
+                // I1：AI 生成的初始画像 stage/intent 经 dimension_registry 校验。AI 产出 →
+                // WriteIntent::MachineWrite：越界值 drop（不阻断建档），不像 admin 那样 reject。
+                let gen_stage = match generated.customer_stage.as_deref() {
+                    Some(v) => apply_admin_dim_validation(
+                        agent::dimension_registry::validate_dimension_value(
+                            &state.db,
+                            "customer_stage",
+                            v,
+                            &contact.account_id,
+                            agent::dimension_registry::WriteIntent::MachineWrite,
+                        )
+                        .await,
+                    )?,
+                    None => None,
+                };
+                let gen_intent = match generated.intent_level.as_deref() {
+                    Some(v) => apply_admin_dim_validation(
+                        agent::dimension_registry::validate_dimension_value(
+                            &state.db,
+                            "intent_level",
+                            v,
+                            &contact.account_id,
+                            agent::dimension_registry::WriteIntent::MachineWrite,
+                        )
+                        .await,
+                    )?,
+                    None => None,
+                };
+                // 建档初始 stage_changed=true（语义正确）；若 gen_stage 被 drop 成 None，
+                // 第②项内核守卫（signals 无 customer_stage 即不刷时间戳）会兜住。
                 insert_domain_stage_fields(
                     &mut set_doc,
-                    generated.customer_stage.as_deref(),
-                    generated.intent_level.as_deref(),
+                    gen_stage.as_deref(),
+                    gen_intent.as_deref(),
                     true,
                 );
                 set_doc.insert("commitments", commitments_bson);
