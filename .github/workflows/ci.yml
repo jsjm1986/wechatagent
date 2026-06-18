@@ -1012,6 +1012,96 @@ jobs:
           retention-days: 30
 
   # ════════════════════════════════════════════════════════════════════════════
+  # 真模型红线门（R2.2 跨域全链 / R2.5.3 请示通道 / R5 动态对抗 / 主动外联）。
+  #
+  # 这 4 个文件过去**无任何带 key 的专用 CI 入口**——只在无 key 的 integration job 里
+  # 被编译，require_real_llm! 取不到 key 即 return（skip=PASS），承载的转真人/泄露身份/
+  # relay 不暴露真人等**确定性红线断言从不在真 LLM 下执行 = 假绿**（深度审查 G1 critical）。
+  # 本 job 给它们补真 key 入口。
+  #
+  # 与其余 real-llm group 不同：**本 job 不设 continue-on-error**（G2）。这 4 个文件经红线
+  # 词表硬化后，主体是确定性红线 panic + unwrap_or_skip_transient!（端点抖动→skip 不 fail）。
+  # 故红线击穿必须真红卡合并，而端点 5xx/超时仍走 skip 不误红。串行链末环（needs adversarial，
+  # 守 rsxermu 并发 ≤2）。matrix 内 max-parallel:1 同理。
+  real-llm-redline:
+    name: Real-LLM 红线门 (${{ matrix.file }} / 确定性硬断言)
+    runs-on: ubuntu-latest
+    if: ${{ github.event_name != 'workflow_dispatch' }}
+    needs: real-llm-adversarial
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        file:
+          - real_llm_cross_domain_arc
+          - real_llm_principal_channel
+          - real_llm_proactive_outreach
+          - real_llm_dynamic_adversarial
+    env:
+      REAL_LLM_API_KEY: ${{ secrets.RSXERMU_KEY }}
+    steps:
+      - name: Require REAL_LLM_API_KEY (R0.1 缺 key 真 fail，不假绿)
+        if: ${{ env.REAL_LLM_API_KEY == '' }}
+        run: |
+          echo "::error::REAL_LLM_API_KEY 未配置（secrets.RSXERMU_KEY 为空）。红线门必须有 key 才能真跑——缺 key 直接 fail，不静默跳过假绿（R0.1）。"
+          exit 1
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Free disk space
+        if: ${{ env.REAL_LLM_API_KEY != '' }}
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android \
+            /usr/local/share/boost /usr/local/share/powershell \
+            /usr/lib/jvm "$AGENT_TOOLSDIRECTORY" || true
+          sudo docker image prune --all --force || true
+          df -h
+
+      - name: Install Rust toolchain
+        if: ${{ env.REAL_LLM_API_KEY != '' }}
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry / target
+        if: ${{ env.REAL_LLM_API_KEY != '' }}
+        uses: Swatinem/rust-cache@v2
+
+      # 被测 agent = claude-opus-4-8（Anthropic）。cross_domain 的 judge / dynamic 的轨迹裁判
+      # 走 gpt-5.4（OpenAI /v1，跨家族）；dynamic 的 roleplayer 第三族用 NVIDIA（异端点，缺则
+      # assert_three_families_distinct 自 skip 不 fail）。红线硬断言不依赖 judge，judge 仅观测。
+      - name: cargo test --test ${{ matrix.file }} (红线硬断言 + skip-on-transient)
+        if: ${{ env.REAL_LLM_API_KEY != '' }}
+        env:
+          RUSTFLAGS: ""
+          REAL_LLM_BASE_URL: https://rsxermu666.cn
+          REAL_LLM_MODEL: claude-opus-4-8
+          REAL_LLM_FORMAT: anthropic
+          REAL_LLM_JUDGE1_MODEL: gpt-5.4
+          REAL_LLM_JUDGE_BASE_URL: https://rsxermu666.cn/v1
+          REAL_LLM_JUDGE_MODEL: gpt-5.4
+          REAL_LLM_JUDGE_FORMAT: openai
+          REAL_LLM_JUDGE: "1"
+          JUDGE_SAMPLES: "1"
+          REAL_LLM_LEDGER: target/real_llm_ledger
+          # dynamic_adversarial 第三族异族 roleplayer/judge（缺则回落两族不 fail）。
+          REAL_LLM_JUDGE2_API_KEY: ${{ secrets.NVIDIA_KEY }}
+          REAL_LLM_JUDGE2_BASE_URL: https://integrate.api.nvidia.com/v1
+          REAL_LLM_JUDGE2_MODEL: qwen/qwen3-next-80b-a3b-instruct
+          ROLEPLAYER_API_KEY: ${{ secrets.NVIDIA_KEY }}
+          ROLEPLAYER_BASE_URL: https://integrate.api.nvidia.com/v1
+          ROLEPLAYER_MODEL: qwen/qwen3-next-80b-a3b-instruct
+        run: cargo test --no-fail-fast --test ${{ matrix.file }} -- --ignored --nocapture
+
+      - name: Upload skip ledger
+        if: ${{ always() && env.REAL_LLM_API_KEY != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: real-llm-ledger-redline-${{ matrix.file }}
+          path: target/real_llm_ledger/
+          if-no-files-found: ignore
+          retention-days: 30
+
+  # ════════════════════════════════════════════════════════════════════════════
   # R0.2：skip 率硬门（汇总）。各 real-llm job 是 continue-on-error（conclusion 恒
   # success，端点抖动不卡合并），但**大面积 transient-skip = 这一轮真模型测试实际
   # 没验证到能力 = 假绿**。本 job 非 continue-on-error，needs 5 个 PR 门真模型 job，
@@ -1022,7 +1112,7 @@ jobs:
     name: Real-LLM skip 率硬门 (R0.2)
     runs-on: ubuntu-latest
     if: ${{ github.event_name != 'workflow_dispatch' }}
-    needs: [real-llm, real-llm-recall, real-llm-ops, real-llm-quality, real-llm-adversarial]
+    needs: [real-llm, real-llm-recall, real-llm-ops, real-llm-quality, real-llm-adversarial, real-llm-redline]
     steps:
       - name: Checkout
         uses: actions/checkout@v4
