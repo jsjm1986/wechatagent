@@ -25,8 +25,8 @@ use crate::models::{
     ManagementAgentMessage, ManagementAgentSession, McpCallLog, MemoryCandidate, MigrationRecord,
     OperatingMemory, OperationDomainConfig, OperationKnowledgeChunk, OperationKnowledgeDocument,
     OperationPlaybook, OutboxEntry, PostReleaseReview, Product, PromptTemplate,
-    Proposal, ShadowReplay, TaxonomyCandidate, TaxonomyEntry, ThresholdOverride,
-    ThresholdOverrideAudit, UserOperationGuidePreview, WechatAccount,
+    Proposal, RelationshipTypeSuggestion, ShadowReplay, TaxonomyCandidate, TaxonomyEntry,
+    ThresholdOverride, ThresholdOverrideAudit, UserOperationGuidePreview, WechatAccount,
 };
 
 #[derive(Clone)]
@@ -243,6 +243,15 @@ impl Database {
     /// agent-autonomy-loop W0：`taxonomy_candidates` 集合 typed accessor（Requirements 8.3）。
     pub fn collection_taxonomy_candidates(&self) -> Collection<TaxonomyCandidate> {
         self.db.collection("taxonomy_candidates")
+    }
+
+    /// 数字分身建议链 T5：`relationship_type_suggestions` 集合 typed accessor。
+    /// 关系类型（customer/peer/friend）识别的「LLM 建议 → 运营审核 → 回写 contact」
+    /// 保守闭环第一步存储；索引见 [`indexes`] 的 `(workspace_id, contact_id)` unique。
+    pub fn collection_relationship_type_suggestions(
+        &self,
+    ) -> Collection<RelationshipTypeSuggestion> {
+        self.db.collection("relationship_type_suggestions")
     }
 
     // ── agent-self-evolution W0 (Task 1.1) ──

@@ -581,6 +581,7 @@ pub(super) async fn ensure_all(db: &Database) -> anyhow::Result<()> {
     ensure_agent_send_outbox_indexes(db).await?;
     ensure_system_taxonomies_indexes(db).await?;
     ensure_taxonomy_candidates_indexes(db).await?;
+    ensure_relationship_type_suggestions_indexes(db).await?;
     // ── agent-self-evolution W0 (Task 1.2) ──
     ensure_evolution_indexes(db).await?;
     // LLM 服务商配置：(workspace_id, provider_id) 唯一；is_active 部分索引便于
@@ -879,6 +880,36 @@ async fn ensure_taxonomy_candidates_indexes(db: &Database) -> anyhow::Result<()>
             IndexModel::builder()
                 .keys(doc! { "scope": 1, "kind": 1, "raw_value": 1 })
                 .options(IndexOptions::builder().unique(true).build())
+                .build(),
+            None,
+        )
+        .await?;
+    Ok(())
+}
+
+/// 数字分身建议链 T5：`relationship_type_suggestions` 索引。
+///
+/// - `(workspace_id, contact_id)` 唯一：幂等 upsert 锚——同一 contact 在租户内只
+///   一条关系类型建议，重复观察累加 `occurrences` / 刷新 `last_seen_at`，
+///   DuplicateKey 视为「建议已存在」。
+/// - `(workspace_id, status)`：后台审核列表按 status（pending/approved/rejected）筛选。
+///
+/// 字段为 snake_case：`RelationshipTypeSuggestion` 未加 `#[serde(rename_all)]`，
+/// BSON 层即 snake_case，须与此处索引字段逐字一致。
+async fn ensure_relationship_type_suggestions_indexes(db: &Database) -> anyhow::Result<()> {
+    db.collection_relationship_type_suggestions()
+        .create_index(
+            IndexModel::builder()
+                .keys(doc! { "workspace_id": 1, "contact_id": 1 })
+                .options(IndexOptions::builder().unique(true).build())
+                .build(),
+            None,
+        )
+        .await?;
+    db.collection_relationship_type_suggestions()
+        .create_index(
+            IndexModel::builder()
+                .keys(doc! { "workspace_id": 1, "status": 1 })
                 .build(),
             None,
         )

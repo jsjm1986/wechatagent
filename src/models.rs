@@ -2420,6 +2420,36 @@ pub struct TaxonomyCandidate {
     pub reviewed_by: Option<String>,
 }
 
+/// 数字分身建议链 T5：`relationship_type_suggestions` 集合结构。
+///
+/// 模块 B「数字分身」识别联系人关系类型（customer / peer / friend）走保守闭环：
+/// LLM 产出建议 → 不直接生效 → 运营审核确认才回写 `contact`（画像保守红线）。
+/// 本结构是该链第一步的存储载体——同一 `(workspace_id, contact_id)` 只一条建议
+/// （索引 unique 幂等锚，重复观察累加 `occurrences` / 刷新 `last_seen_at`）。
+/// 仿 [`TaxonomyCandidate`] 的 snake_case BSON + serde default 形态。T6 写入信号、
+/// T8 建审核路由。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RelationshipTypeSuggestion {
+    #[serde(rename = "_id", skip_serializing_if = "Option::is_none")]
+    pub id: Option<ObjectId>,
+    pub workspace_id: String,
+    pub account_id: String,
+    pub contact_id: String,
+    /// canonical 关系类型：`"customer"` | `"peer"` | `"friend"`。
+    pub suggested_value: String,
+    pub evidence: Option<String>,
+    #[serde(default)]
+    pub confidence: i32,
+    /// `"pending"` | `"approved"` | `"rejected"`。
+    pub status: String,
+    #[serde(default)]
+    pub occurrences: i32,
+    pub first_seen_at: DateTime,
+    pub last_seen_at: DateTime,
+    pub reviewed_at: Option<DateTime>,
+    pub reviewed_by: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LlmCallLog {
     #[serde(rename = "_id", skip_serializing_if = "Option::is_none")]
@@ -5309,5 +5339,43 @@ mod objective_purchase_facts_model_tests {
         assert!(is_valid_minor_amount(Some(0)), "0 分合法");
         assert!(is_valid_minor_amount(Some(19900)), "正常金额合法");
         assert!(!is_valid_minor_amount(Some(-1)), "负数非法");
+    }
+}
+
+#[cfg(test)]
+mod relationship_type_suggestion_tests {
+    use super::*;
+
+    /// 数字分身建议链 T5：`RelationshipTypeSuggestion` BSON round-trip 保真。
+    /// 构造 → to_document → from_document，断言字段不丢失/不被缺省覆盖。
+    #[test]
+    fn relationship_type_suggestion_bson_round_trip() {
+        let s = RelationshipTypeSuggestion {
+            id: None,
+            workspace_id: "w".into(),
+            account_id: "a".into(),
+            contact_id: "c".into(),
+            suggested_value: "peer".into(),
+            evidence: Some("自称同行".into()),
+            confidence: 7,
+            status: "pending".into(),
+            occurrences: 1,
+            first_seen_at: DateTime::now(),
+            last_seen_at: DateTime::now(),
+            reviewed_at: None,
+            reviewed_by: None,
+        };
+        let doc = mongodb::bson::to_document(&s).unwrap();
+        let back: RelationshipTypeSuggestion = mongodb::bson::from_document(doc).unwrap();
+        assert_eq!(back.suggested_value, "peer");
+        assert_eq!(back.status, "pending");
+        assert_eq!(back.workspace_id, "w");
+        assert_eq!(back.account_id, "a");
+        assert_eq!(back.contact_id, "c");
+        assert_eq!(back.evidence.as_deref(), Some("自称同行"));
+        assert_eq!(back.confidence, 7);
+        assert_eq!(back.occurrences, 1);
+        assert!(back.reviewed_at.is_none());
+        assert!(back.reviewed_by.is_none());
     }
 }
