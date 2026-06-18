@@ -173,6 +173,16 @@ impl TestApp {
         // 对齐到自己的 DB；m006 全局 scope 字典在每个测试 DB 内容一致，并发竞争无害。
         wechatagent::agent::init_global_taxonomy_cache(&db).await;
 
+        // 同理预热**第二个**进程级 TTL 单例：active DomainProfile 缓存（domain_profile.rs
+        // 的 GLOBAL_DOMAIN_PROFILE_CACHE，与 taxonomy 缓存同款 LazyLock+30s TTL）。
+        // 与 main.rs:86 对齐。不预热的话，本测试若不 seed 自定义 domain_profiles 行，
+        // load_active_domain_profile 会命中**前一个测试 seed 的 active profile**（同 binary
+        // 内残留），其声明维度可能不含 customer_stage → retain_declared_dimensions 把
+        // customer_stage 从 domain_signals 剔除 → C2 operation_state 派生回落
+        // decision.operation_state。预热到本测试自己的 DB（无 active 行）→ 回落 DEFAULT
+        // profile（声明 customer_stage participates_in_decision=true）→ 维度存活、派生正确。
+        wechatagent::agent::init_global_domain_profile_cache(&db).await;
+
         let mcp = McpClient::new(config.mcp_base_url.clone(), config.mcp_api_key.clone())
             .expect("构造测试 mcp client 失败");
 
