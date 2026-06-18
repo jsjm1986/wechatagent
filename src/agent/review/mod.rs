@@ -302,6 +302,16 @@ pub(crate) async fn review_decision(
             .as_ref()
             .and_then(|o| o.review_focus.as_deref()),
     );
+    // universal-domain-adaptation T3：reviewer system prompt 的「软闸打分锚点（few-shot）」段按
+    // active profile 的 reviewer_orientation.reviewer_fewshot_override 渲染。None（DEFAULT/老库）
+    // → 字节等价（销售逼单高压锚保留）。
+    let system = crate::agent::domain_profile::apply_reviewer_fewshot(
+        &system,
+        active_profile
+            .reviewer_orientation
+            .as_ref()
+            .and_then(|o| o.reviewer_fewshot_override.as_deref()),
+    );
     let runtime_text = serde_json::to_string(&runtime.as_document()).unwrap_or_default();
     let memory_card_text = serde_json::to_string(context_pack).unwrap_or_default();
     let memory_text = serde_json::to_string(&mongodb::bson::doc! {

@@ -38,6 +38,17 @@ pub const DEFAULT_MODE_GATE_POLICY: &str = r#"## 模式与 5 闸的关系
 /// 短形式扩展（如 `en-US`、`zh-TW`）。
 pub const DEFAULT_LOCALE: &str = "zh-CN";
 
+/// universal-domain-adaptation T3：reviewer system prompt 里写死的「软闸打分锚点
+/// （few-shot）」三档示例段。PressureRisk 高压锚为销售逼单（「今天最后一天…现在就定吧」），
+/// 把非销售域（情感陪伴等）的打分尺度带偏。`apply_reviewer_fewshot`（domain_profile.rs）
+/// 以它为锚做精确子串替换：非销售域声明本域 few-shot 时整段替换，销售/DEFAULT/老库 → 原样保留。
+/// 一个字都不能差，否则 `system.replace(锚, new)` 会静默失配——
+/// `default_reviewer_fewshot_anchor_matches_pack` 测试充当锚漂移护栏。
+pub const DEFAULT_REVIEWER_FEWSHOT: &str = r#"软闸打分锚点（few-shot，仅作标尺，理解尺度即可，不要照抄措辞）：
+- HumanLikeScore：8 分例「哈哈那确实，我之前也踩过这坑，你后来咋弄的？」（口语、有来有回、像朋友）；3 分例「您好，关于您咨询的问题，现统一答复如下：……」（书面、单向通知、像客服模板）；另一个 3 分例「关于你的问题，可以分三点：1. ……2. ……3. ……」（顾问报告腔、书面编号罗列，不是微信里一句句聊天的样子）。
+- EmotionalValue：8 分例「这事儿确实挺熬人的，你能扛到现在已经很不容易了」（具体共情、肯定对方处境）；3 分例「建议您理性看待，纠结这些没有意义」（说教、否定情绪、缺乏支持）。
+- PressureRisk：8 分（高压，应拦）例「今天最后一天，错过再等一年，现在就定吧」（制造稀缺、催促、逼单）；1 分（低压）例「你先慢慢看，有想法随时找我」（给空间、不施压、尊重节奏）。"#;
+
 /// 取 contact.locale，缺字段（旧文档）回落到 [`DEFAULT_LOCALE`]。
 pub fn contact_locale_or_default(locale: Option<&str>) -> &str {
     match locale {
@@ -2185,6 +2196,39 @@ mod locale_tests {
     #[test]
     fn default_locale_is_zh_cn() {
         assert_eq!(DEFAULT_LOCALE, "zh-CN");
+    }
+}
+
+#[cfg(test)]
+mod reviewer_fewshot_anchor_tests {
+    use super::*;
+
+    /// 锚漂移护栏：[`DEFAULT_REVIEWER_FEWSHOT`] 必须是 user.review.system prompt
+    /// 实际「软闸打分锚点（few-shot…）」那段的**逐字子串**，否则
+    /// `apply_reviewer_fewshot` 的 `system.replace` 会静默失配（锚改/prompt 改任一即红）。
+    #[test]
+    fn default_reviewer_fewshot_anchor_matches_pack() {
+        let specs = prompt_specs();
+        let review = specs
+            .iter()
+            .find(|s| s.key == "user.review.system")
+            .expect("user.review.system prompt spec 存在");
+        assert!(
+            review.content.contains(DEFAULT_REVIEWER_FEWSHOT),
+            "DEFAULT_REVIEWER_FEWSHOT 锚与 prompt pack 不一致，replace 会静默失配"
+        );
+    }
+
+    /// 锚是「软闸打分锚点 few-shot」三档示例段，PressureRisk 高压锚为销售逼单
+    /// （「今天最后一天…现在就定吧」），正是非销售域要替换掉的尺度。
+    #[test]
+    fn default_reviewer_fewshot_carries_sales_pressure_anchor() {
+        assert!(DEFAULT_REVIEWER_FEWSHOT.contains("软闸打分锚点"));
+        assert!(DEFAULT_REVIEWER_FEWSHOT.contains("HumanLikeScore"));
+        assert!(DEFAULT_REVIEWER_FEWSHOT.contains("EmotionalValue"));
+        assert!(DEFAULT_REVIEWER_FEWSHOT.contains("现在就定吧"));
+        // 锚到 PressureRisk 那条为止，不含其后独立的 EmotionalValue 打分细则。
+        assert!(!DEFAULT_REVIEWER_FEWSHOT.contains("两把尺子"));
     }
 }
 
