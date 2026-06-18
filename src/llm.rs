@@ -1032,6 +1032,13 @@ pub fn is_retryable_llm_error(error: &AppError) -> bool {
                 || message.contains("LLM HTTP 502")
                 || message.contains("LLM HTTP 503")
                 || message.contains("LLM HTTP 504")
+                // Cloudflare 源站层 5xx（520 unknown / 522 connection timed out /
+                // 524 a timeout occurred）：经 CF 的端点（如 rsxermu）在源站慢/抖时回这些，
+                // 属瞬时不可达应重试。此前漏列 524，与下方 classify_llm_error_for_user 把
+                // 任何 "LLM HTTP 5*" 归 http_5xx 的口径不一致——一条 CF 524 不重试直接冒泡。
+                || message.contains("LLM HTTP 520")
+                || message.contains("LLM HTTP 522")
+                || message.contains("LLM HTTP 524")
                 || message.contains("LLM HTTP body_decode_error")
         }
         _ => false,
@@ -1526,6 +1533,19 @@ mod tests {
     fn http_5xx_is_retryable() {
         let err = AppError::External("LLM HTTP 502: bad gateway".to_string());
         assert!(is_retryable_llm_error(&err));
+    }
+
+    #[test]
+    fn cloudflare_5xx_is_retryable() {
+        // 经 Cloudflare 的端点（rsxermu）源站慢/抖时回 520/522/524——属瞬时不可达应重试。
+        // status 段是 reqwest 渲染的 "524 <unknown status code>"，故串里含 "LLM HTTP 524"。
+        for code in ["520", "522", "524"] {
+            let err = AppError::External(format!("LLM HTTP {code} <unknown status code>: origin timeout"));
+            assert!(
+                is_retryable_llm_error(&err),
+                "Cloudflare {code} 应可重试（端点抖动，非配置错）"
+            );
+        }
     }
 
     #[test]
