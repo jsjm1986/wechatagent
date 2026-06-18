@@ -4,9 +4,11 @@
 //! domain_profile.rs `SALES_TYPED_DIMENSION_KINDS`、m020/m021/m023/m024 migration
 //! 散文注释、entitlements kind 常量）到一张 const 表。
 //!
-//! 分工：registry 描述维度的**结构属性**（通道/typed/是否参与决策/取值约束类型）——
+//! 分工：registry 描述维度的**结构属性**（通道/typed/取值约束类型）——
 //! 这是编译期代码契约；维度的**具体合法取值**仍在 system_taxonomies DB 字典
 //! （因行业而异、运营可增删）。registry 只声明"取值要不要查字典校验"。
+//! 「是否参与决策」是运营可经 UI 改的业务属性，真相源在 DB
+//! `ProfileDimension.participates_in_decision`（models.rs），registry 不再固化。
 
 /// 维度写入通道。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -46,7 +48,6 @@ pub(crate) struct DimensionSpec {
     pub kind: &'static str,
     pub channel: DimensionChannel,
     pub typed: bool,
-    pub participates_in_decision: bool,
     pub value_source: ValueSource,
 }
 
@@ -55,13 +56,13 @@ use ValueSource::*;
 
 /// 维度元数据单一真相源。新增维度在此加一行。
 pub(crate) const DIMENSION_REGISTRY: &[DimensionSpec] = &[
-    DimensionSpec { kind: "customer_stage", channel: LlmSignals, typed: true, participates_in_decision: true, value_source: Taxonomy },
-    DimensionSpec { kind: "intent_level", channel: LlmSignals, typed: true, participates_in_decision: true, value_source: Taxonomy },
-    DimensionSpec { kind: "purchase_lifecycle", channel: LlmSignals, typed: false, participates_in_decision: true, value_source: Taxonomy },
-    DimensionSpec { kind: "churn_reason", channel: LlmSignals, typed: false, participates_in_decision: true, value_source: Taxonomy },
-    DimensionSpec { kind: "value_tier", channel: GatewayDerived, typed: false, participates_in_decision: false, value_source: CodeEnum },
-    DimensionSpec { kind: "relationship_type", channel: AdminDirect, typed: false, participates_in_decision: false, value_source: Taxonomy },
-    DimensionSpec { kind: "objection_type", channel: ReactionDerived, typed: false, participates_in_decision: false, value_source: Taxonomy },
+    DimensionSpec { kind: "customer_stage", channel: LlmSignals, typed: true, value_source: Taxonomy },
+    DimensionSpec { kind: "intent_level", channel: LlmSignals, typed: true, value_source: Taxonomy },
+    DimensionSpec { kind: "purchase_lifecycle", channel: LlmSignals, typed: false, value_source: Taxonomy },
+    DimensionSpec { kind: "churn_reason", channel: LlmSignals, typed: false, value_source: Taxonomy },
+    DimensionSpec { kind: "value_tier", channel: GatewayDerived, typed: false, value_source: CodeEnum },
+    DimensionSpec { kind: "relationship_type", channel: AdminDirect, typed: false, value_source: Taxonomy },
+    DimensionSpec { kind: "objection_type", channel: ReactionDerived, typed: false, value_source: Taxonomy },
 ];
 
 /// 查某维度的契约；未知维度返回 None。

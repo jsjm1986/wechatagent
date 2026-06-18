@@ -588,20 +588,6 @@ pub(super) async fn update_custom_agent_instructions(
     Ok(Json(json!({ "item": ApiContact::from(contact) })))
 }
 
-/// admin 写画像维度：把 [`validate_dimension_value`] 的三通道处置映射成写入决策。
-/// `Accept(canonical)` → 写入该值；`DropSilently` → 不写该键（admin 直写通道理论
-/// 不触发 Drop，兜底）；`Reject(reason)` → `400 BadRequest`（越界值不静默落库脏值）。
-fn apply_admin_dim_validation(
-    v: crate::agent::dimension_registry::DimValidation,
-) -> AppResult<Option<String>> {
-    use crate::agent::dimension_registry::DimValidation::*;
-    match v {
-        Accept(s) => Ok(Some(s)),
-        DropSilently => Ok(None),
-        Reject(r) => Err(AppError::BadRequest(r)),
-    }
-}
-
 /// stage 是否算"发生变更"（决定 insert_domain_stage_fields 是否刷 customer_stage_updated_at）。
 /// 红线：stage 未实际写入（`new_stage=None`：空串短路 / DropSilently）时绝不算变更——
 /// 否则会无条件刷 customer_stage_updated_at，错误重置下游 stagnation 计时器（值没改却记

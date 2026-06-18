@@ -113,10 +113,11 @@ pub(crate) fn set_dimension(decision: &mut AgentDecision, kind: &str, value: Str
 /// 统一的画像维度写入内核：把 `signals` 中**每个非空字符串维度**以
 /// `domain_attributes.<key>` dotted-key 写进 `set_doc`。
 ///
-/// - `stage_changed == true`（调用方依「新 stage 取值 vs contact 现有 stage」判定，
-///   仅在 stage 维度真正变化时为真）→ 追加 `domain_attributes.customer_stage_updated_at`
-///   （planner 的 stage stagnation 计时器依赖它；1C 会把停滞维度从写死的
-///   `customer_stage` 改为 `profile.stagnation_dimension`）。
+/// - `stage_changed == true` **且 signals 含 customer_stage 键** → 追加
+///   `domain_attributes.customer_stage_updated_at`（planner 的 stage stagnation 计时器
+///   依赖它；1C 会把停滞维度从写死的 `customer_stage` 改为 `profile.stagnation_dimension`）。
+///   纵深守卫：signals 无 customer_stage 时即便 stage_changed=true 也不刷时间戳——
+///   避免在 stage 实际未写入时错误重置 stagnation 计时。
 /// - 返回是否写入了**任何**维度值。容器级 `domain_attributes_updated_at` 的刷新
 ///   策略由调用方决定（gateway：写了才刷；admin：总是刷，保留其既有契约）——故
 ///   本内核**不**自行写容器级时间戳，避免两条路径的边界行为被强行统一。
@@ -140,7 +141,11 @@ pub(crate) fn insert_domain_signal_values(
             wrote_any = true;
         }
     }
-    if stage_changed {
+    // 纵深守卫：仅当 signals 里**确实有** customer_stage 键时，stage_changed 才生效刷
+    // 时间戳。否则若调用方传 (stage_changed=true, signals 无 customer_stage)，会写"stage
+    // 刚变更"时间戳但 stage 根本没写——错误重置下游 stagnation 计时。根因在内核，故守卫
+    // 加在此处而非各调用方。
+    if stage_changed && signals.get_str("customer_stage").is_ok() {
         set_doc.insert("domain_attributes.customer_stage_updated_at", DateTime::now());
     }
     wrote_any
@@ -223,6 +228,43 @@ mod tests {
         );
         // stage_changed=false → 不刷新计时器（与 legacy 一致）
         assert!(!set_doc.contains_key("domain_attributes.customer_stage_updated_at"));
+    }
+
+    #[test]
+    fn kernel_skips_stage_ts_when_stage_absent_even_if_changed() {
+        // 纵深守卫：调用方传 stage_changed=true 但 signals 无 customer_stage 键时，绝不刷
+        // customer_stage_updated_at——否则会在 stage 实际未写入时错误重置 stagnation 计时。
+        let mut set_doc = Document::new();
+        let signals = doc! { "intent_level": "high" };
+        let wrote = insert_domain_signal_values(&mut set_doc, &signals, true);
+
+        assert!(wrote, "intent_level 写入了，应返回 true");
+        assert_eq!(set_doc.get_str("domain_attributes.intent_level").ok(), Some("high"));
+        assert!(
+            !set_doc.contains_key("domain_attributes.customer_stage_updated_at"),
+            "signals 无 customer_stage 时不应刷 stage 时间戳：{set_doc:?}"
+        );
+    }
+
+    #[test]
+    fn kernel_writes_stage_ts_when_stage_present_and_changed() {
+        // 对照：signals 含 customer_stage + stage_changed=true → 刷时间戳。
+        let mut set_doc = Document::new();
+        let signals = doc! { "customer_stage": "solution_fit" };
+        insert_domain_signal_values(&mut set_doc, &signals, true);
+        assert!(set_doc.contains_key("domain_attributes.customer_stage_updated_at"));
+    }
+
+    #[test]
+    fn kernel_skips_stage_ts_when_empty_signals_even_if_changed() {
+        // 空容器 + stage_changed=true：守卫确保不刷时间戳（也不写任何维度）。
+        let mut set_doc = Document::new();
+        let wrote = insert_domain_signal_values(&mut set_doc, &Document::new(), true);
+        assert!(!wrote);
+        assert!(
+            !set_doc.contains_key("domain_attributes.customer_stage_updated_at"),
+            "空容器即便 stage_changed=true 也不应刷 stage 时间戳：{set_doc:?}"
+        );
     }
 
     #[test]
