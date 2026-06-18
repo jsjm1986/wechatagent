@@ -7,8 +7,8 @@
 //! 与 value_tier 的关键共性：**relationship_type 不经 LLM domainSignals 通道**（运营接入时
 //! 经 admin 手动设入 `contact.domain_attributes.relationship_type`），**不需要 profile 维度
 //! 声明**（retain_declared_dimensions 白名单只管 LLM 输出容器键，admin 直写分支不受约束）。
-//! 故本 migration 只 seed 字典、不追加 profile 维度——字典用于 admin 写侧 alias 软归一
-//! （`normalize_dimension_value`）+ UI 标签 + 校验取值集合。
+//! 故本 migration 只 seed 字典、不追加 profile 维度——字典用于 admin 写侧取值校验
+//! （`dimension_registry::validate_dimension_value`，AdminDirect 通道越界 reject）+ UI 标签。
 //!
 //! 取值命名（已拍板）：英文 id（与 value_tier=high/mid/low、churn_reason 英文 id 惯例一致）
 //! + 中文 label。aliases 补中文别名便于运营随手填中文时软归一到 canonical。运营可经
