@@ -667,6 +667,8 @@ pub fn default_domain_profile(workspace_id: &str) -> DomainProfile {
         ],
         // H8：DEFAULT 范式 = 三驱动力全开 + 阈值 None 回落全局 config（planner 金标零变化）。
         operation_mode: crate::models::OperationMode::default(),
+        // §3.7：DEFAULT 销售 profile 不声明按关系类型的多套范式 → resolve 回落 operation_mode。
+        per_relationship_operation_mode: None,
         // H14：DEFAULT 销售域 = false → grounding 软分数硬闸无条件生效（字节等价）。
         grounding_gate_bypass_without_claim: false,
         // reviewer 优化：DEFAULT 销售域 = false → 沿用既有 should_run_review 判定
@@ -758,6 +760,26 @@ pub fn example_emotional_companion_profile(workspace_id: &str) -> DomainProfile 
          主动关心、轻量追问本身是正当行为，不等于施压。"
             .to_string(),
     );
+    // §3.7 数字分身样例：按关系类型配三套范式（运营接入时给 contact 标 relationship_type
+    // 即按此路由）。customer=漏斗全开追单；peer=漏斗关、低频维护；friend=漏斗关、只留日历
+    // 关怀、口吻最像本人。这是"微信号 AI 化身"托管客户/同行/朋友三层社交的具体兑现。
+    let mut per_relationship = std::collections::BTreeMap::new();
+    // 客户：漏斗 + 沉默 + 承诺 + 日历全开（怕丢单）。
+    let mut customer_mode = crate::models::OperationMode::default();
+    customer_mode.calendar.enabled = true;
+    per_relationship.insert("customer".to_string(), customer_mode);
+    // 同行：漏斗关、低频维护，留承诺与日历（行业节点祝福）。
+    let mut peer_mode = crate::models::OperationMode::default();
+    peer_mode.funnel.enabled = false;
+    peer_mode.calendar.enabled = true;
+    per_relationship.insert("peer".to_string(), peer_mode);
+    // 朋友：漏斗关、承诺关，只留日历个人情感关怀，口吻最像本人。
+    let mut friend_mode = crate::models::OperationMode::default();
+    friend_mode.funnel.enabled = false;
+    friend_mode.commitment.enabled = false;
+    friend_mode.calendar.enabled = true;
+    per_relationship.insert("friend".to_string(), friend_mode);
+    profile.per_relationship_operation_mode = Some(per_relationship);
     profile
 }
 
@@ -1225,6 +1247,46 @@ mod tests {
         assert_eq!(parsed.memory_dimensions, p.memory_dimensions);
         // M2：DEFAULT threshold_overrides=None 经 BSON 往返仍 None（不覆盖五闸、零扰动）。
         assert!(parsed.threshold_overrides.is_none());
+        // §3.7：DEFAULT per_relationship_operation_mode=None 经 BSON 往返仍 None
+        //（销售域不配多套范式，resolve 回落 operation_mode、零扰动）。
+        assert!(parsed.per_relationship_operation_mode.is_none());
+    }
+
+    /// §3.7：per_relationship_operation_mode = Some(多关系 map) 经 BSON 往返不丢，
+    /// 且 BTreeMap 键序稳定。仿 profile_thresholds_partial_override_bson_round_trip。
+    #[test]
+    fn per_relationship_operation_mode_bson_round_trip() {
+        use std::collections::BTreeMap;
+        let mut profile = default_domain_profile("ws-1");
+        let mut map = BTreeMap::new();
+        // customer：默认三全开；friend：关 funnel。
+        map.insert(
+            "customer".to_string(),
+            crate::models::OperationMode::default(),
+        );
+        let mut friend_mode = crate::models::OperationMode::default();
+        friend_mode.funnel.enabled = false;
+        map.insert("friend".to_string(), friend_mode.clone());
+        profile.per_relationship_operation_mode = Some(map);
+
+        let doc = mongodb::bson::to_document(&profile).expect("serialize");
+        let parsed: DomainProfile = mongodb::bson::from_document(doc).expect("deserialize");
+        let parsed_map = parsed
+            .per_relationship_operation_mode
+            .expect("per_relationship 往返不丢");
+        assert_eq!(parsed_map.len(), 2);
+        assert!(
+            parsed_map.get("customer").expect("customer 那套").funnel.enabled,
+            "customer 三全开往返保持"
+        );
+        assert_eq!(
+            parsed_map.get("friend").expect("friend 那套").funnel.enabled,
+            false,
+            "friend 关 funnel 往返保持"
+        );
+        // BTreeMap 键序稳定：customer 在 friend 前（字典序）。
+        let keys: Vec<&String> = parsed_map.keys().collect();
+        assert_eq!(keys, vec!["customer", "friend"]);
     }
 
     #[test]

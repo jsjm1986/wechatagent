@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use mongodb::bson::{oid::ObjectId, DateTime, Document};
 use serde::{Deserialize, Deserializer, Serialize};
 
@@ -1395,6 +1397,17 @@ pub struct DomainProfile {
     /// 单客户覆盖见 [`Contact::operation_mode_override`]。
     #[serde(default)]
     pub operation_mode: OperationMode,
+    /// universal-domain-adaptation §3.7（数字分身）：按关系类型（`relationship_type`）覆盖的
+    /// 运营范式。key = relationship_type 的 canonical 取值（走 system_taxonomies，seed 默认
+    /// `customer`/`peer`/`friend`，因行业而异可增删）；value = 该关系类型专属的一套
+    /// [`OperationMode`]（驱动力组合 + 阈值 + 口吻）。解析见
+    /// [`resolve_operation_mode`](crate::planner::resolve_operation_mode)：
+    /// `contact.operation_mode_override ?? per_relationship_operation_mode[rt] ?? operation_mode`。
+    /// `None` / 空 map（DEFAULT 销售 profile / 老库 serde 默认）→ 全部回落 `operation_mode`，
+    /// 销售域逐字节零变化。用 `BTreeMap` 而非 `HashMap`：关系类型 map 极小，BTreeMap 序列化
+    /// 进 BSON 键序稳定，round-trip 可重复、文档可对账。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub per_relationship_operation_mode: Option<BTreeMap<String, OperationMode>>,
     /// universal-domain-adaptation H14：本域是否在「无产品声明」时旁路 grounding
     /// 软分数硬闸（review `classify_dual_gate` 里 `knowledge_grounding_score <
     /// product_accuracy_block_below` 的判罚）。`false`（DEFAULT/老库 serde 默认）=

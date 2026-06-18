@@ -33,6 +33,9 @@ pub(super) struct OperationProfileRequest {
     tags: Vec<String>,
     customer_stage: Option<String>,
     intent_level: Option<String>,
+    /// §3.7 数字分身：关系类型（customer/peer/friend，走 system_taxonomies）。运营接入时
+    /// 设定，决定 planner 选哪套 OperationMode（驱动力组合）。`None` → 不改动现值。
+    relationship_type: Option<String>,
     last_commitment: Option<String>,
     follow_up_policy: Option<String>,
     #[serde(default)]
@@ -643,6 +646,18 @@ pub(super) async fn update_operation_profile(
         intent_level.as_deref(),
         stage_changed,
     );
+    // §3.7：relationship_type 同口径 alias→canonical 归一后写 domain_attributes（无 stagnation
+    // 计时语义，直接点路径键）。None → 不写键，不覆盖现值。
+    if let Some(v) = normalize_optional(payload.relationship_type) {
+        let canonical = agent::taxonomy::normalize_dimension_value(
+            &state.db,
+            "relationship_type",
+            &v,
+            &current.account_id,
+        )
+        .await;
+        set_doc.insert("domain_attributes.relationship_type", canonical);
+    }
     state
         .db
         .contacts()

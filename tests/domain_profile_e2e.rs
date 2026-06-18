@@ -97,6 +97,7 @@ async fn db_create_profile(
         stagnation_dimension: None,
         conversation_modes: vec![],
         operation_mode: OperationMode::default(),
+        per_relationship_operation_mode: None,
         grounding_gate_bypass_without_claim: false,
         distrust_self_reported_low_risk: false,
         transaction_facts_enabled: false,

@@ -46,6 +46,16 @@ fn contact_value_tier(contact: &Contact) -> Option<String> {
         .and_then(|d| d.get_str("value_tier").ok().map(|s| s.to_string()))
 }
 
+/// §3.7（数字分身）：读 contact 的关系类型（运营接入时经 admin 设入
+/// domain_attributes.relationship_type，走 system_taxonomies）。供
+/// [`resolve_operation_mode`] 选 profile 里该关系类型专属的一套 OperationMode。
+fn contact_relationship_type(contact: &Contact) -> Option<String> {
+    contact
+        .domain_attributes
+        .as_ref()
+        .and_then(|d| d.get_str("relationship_type").ok().map(|s| s.to_string()))
+}
+
 fn contact_customer_stage_updated_at(contact: &Contact) -> Option<DateTime> {
     contact
         .domain_attributes
@@ -306,7 +316,6 @@ async fn scan_silent(state: &AppState) -> anyhow::Result<()> {
     // 再收紧只会让候选更少，绝不会漏）；逐 contact 的 enabled 短路 + 阈值收紧在内存做。
     let profile =
         crate::agent::domain_profile::load_active_domain_profile(&state.db, &workspace_id).await;
-    let profile_mode = profile.operation_mode.clone();
 
     let filter = silent_candidate_filter(&workspace_id, &account_id, silent_before);
     let mut cursor = state.db.contacts().find(filter, None).await?;
@@ -323,7 +332,7 @@ async fn scan_silent(state: &AppState) -> anyhow::Result<()> {
             continue;
         }
         // H8：解析有效范式。silence 关 → 该 contact 不走静默唤醒（陪伴/维护型也可能关）。
-        let mode = resolve_operation_mode(&contact, &profile_mode);
+        let mode = resolve_operation_mode(&contact, &profile);
         if !mode.silence.enabled {
             continue;
         }
@@ -656,7 +665,6 @@ async fn scan_commitments(state: &AppState) -> anyhow::Result<()> {
     // 排序配置 + 取行业默认范式（commitment enabled/窗口）。
     let profile =
         crate::agent::domain_profile::load_active_domain_profile(&state.db, &workspace_id).await;
-    let profile_mode = profile.operation_mode.clone();
     let stage_config = build_planner_stage_config(state, &account_id, &profile).await;
 
     let filter = commitment_candidate_filter(&workspace_id, &account_id);
@@ -676,7 +684,7 @@ async fn scan_commitments(state: &AppState) -> anyhow::Result<()> {
             continue;
         }
         // H8：解析有效范式。commitment 关 → 该 contact 不走承诺到期催进。
-        let mode = resolve_operation_mode(&contact, &profile_mode);
+        let mode = resolve_operation_mode(&contact, &profile);
         if !mode.commitment.enabled {
             continue;
         }
@@ -918,21 +926,30 @@ pub(crate) async fn build_planner_stage_config(
     config
 }
 
-/// universal-domain-adaptation H8：解析单个 contact 的**有效运营范式**。
-/// 三级回落：`contact.operation_mode_override ?? profile.operation_mode`
-/// （profile 缺省即 `OperationMode::default()` = 三全开 + 阈值 None）。
-/// 覆盖是**整组**替换（不做逐驱动力 merge），与设计「单客户整套范式覆盖」一致。
+/// universal-domain-adaptation H8 + §3.7：解析单个 contact 的**有效运营范式**。
+/// 三级回落：`contact.operation_mode_override ?? profile.per_relationship_operation_mode[rt]
+/// ?? profile.operation_mode`（profile 缺省即 `OperationMode::default()` = 三全开 + 阈值 None）。
+/// 第二级（§3.7 数字分身）：按 contact 的 `relationship_type`（domain_attributes）选 profile
+/// 里该关系类型专属的一套范式（客户/同行/朋友各异）；relationship_type 缺失或 map 无此 key
+/// 时跳过该级。覆盖是**整组**替换（不做逐驱动力 merge），与设计「整套范式覆盖」一致。
 ///
-/// DEFAULT_PROFILE + 无 override → 返回 `OperationMode::default()`，三驱动力 enabled
-/// 且阈值 None，planner 行为与改造前逐字等价。
+/// DEFAULT_PROFILE（per_relationship 为 None）+ 无 override + 无 relationship_type → 返回
+/// `operation_mode`（即 `OperationMode::default()`），planner 行为与改造前逐字等价。
 pub(crate) fn resolve_operation_mode(
     contact: &Contact,
-    profile_mode: &crate::models::OperationMode,
+    profile: &crate::models::DomainProfile,
 ) -> crate::models::OperationMode {
-    contact
-        .operation_mode_override
-        .clone()
-        .unwrap_or_else(|| profile_mode.clone())
+    if let Some(override_mode) = contact.operation_mode_override.clone() {
+        return override_mode;
+    }
+    contact_relationship_type(contact)
+        .and_then(|rt| {
+            profile
+                .per_relationship_operation_mode
+                .as_ref()
+                .and_then(|m| m.get(&rt).cloned())
+        })
+        .unwrap_or_else(|| profile.operation_mode.clone())
 }
 
 /// MongoDB 端筛 managed + 非冷却 + 非终状态 + 停滞维度计时戳老于阈值
@@ -1268,7 +1285,6 @@ async fn scan_stage_stagnation(state: &AppState) -> anyhow::Result<()> {
     // 排序配置 + 取行业默认范式（funnel enabled/停滞阈值）。
     let profile =
         crate::agent::domain_profile::load_active_domain_profile(&state.db, &workspace_id).await;
-    let profile_mode = profile.operation_mode.clone();
     let stage_config = build_planner_stage_config(state, &account_id, &profile).await;
     let stage_updated_before =
         DateTime::from_millis(now_ms - global_threshold_days.saturating_mul(24 * 60 * 60 * 1000));
@@ -1299,7 +1315,7 @@ async fn scan_stage_stagnation(state: &AppState) -> anyhow::Result<()> {
         }
         // H8：解析有效范式。funnel 关 = 漏斗推进短路（陪伴/维护型对该 contact 不催阶段）。
         // 这是设计里的「关 funnel = scan_stage_stagnation 对该 contact return/continue」纯减法。
-        let mode = resolve_operation_mode(&contact, &profile_mode);
+        let mode = resolve_operation_mode(&contact, &profile);
         if !mode.funnel.enabled {
             continue;
         }
@@ -1519,7 +1535,6 @@ async fn scan_calendar(state: &AppState) -> anyhow::Result<()> {
     // §3.7：每 tick 加载一次 active profile，取行业默认范式 + date_dimension 维度。
     let profile =
         crate::agent::domain_profile::load_active_domain_profile(&state.db, &workspace_id).await;
-    let profile_mode = profile.operation_mode.clone();
     // 行业默认 calendar 关 → 整段对该行业 no-op（销售域天然跳过，零 DB 扫描）。
     // contact override 仍可在下方逐个开启，故这里只在「行业默认关 且 无任何 contact
     // override 开」时整体短路——但 override 在 contact 上、需逐条看，故不在此提前 return；
@@ -1556,7 +1571,7 @@ async fn scan_calendar(state: &AppState) -> anyhow::Result<()> {
 
     while let Some(contact) = cursor.try_next().await? {
         counters.scanned += 1;
-        let mode = resolve_operation_mode(&contact, &profile_mode);
+        let mode = resolve_operation_mode(&contact, &profile);
         // calendar 关（DEFAULT / 销售 contact）→ 跳过。仅情感等开了 calendar 的范式继续。
         if !mode.calendar.enabled {
             continue;
@@ -1740,9 +1755,12 @@ async fn scan_renewal(state: &AppState) -> anyhow::Result<()> {
     let now = DateTime::now();
     let profile =
         crate::agent::domain_profile::load_active_domain_profile(&state.db, &workspace_id).await;
-    let profile_mode = profile.operation_mode.clone();
     // 行业默认 renewal 关 → 整段对该行业 no-op（销售 DEFAULT 命中、零 DB 扫描）。
-    if !profile_mode.renewal.enabled {
+    // 注：此处用 profile 默认范式做扫描器级粗过滤（省 DB 扫描）；逐 contact 的有效范式仍走
+    // resolve_operation_mode 三级解析。若 per_relationship 某关系类型开了 renewal 但 profile
+    // 默认关，该粗过滤会整段跳过——本轮 renewal/reactivation 默认关，按关系类型开启的细化
+    // 留待后续（届时改为"默认范式或任一 per_relationship 开"即放行）。
+    if !profile.operation_mode.renewal.enabled {
         return Ok(());
     }
 
@@ -1765,7 +1783,7 @@ async fn scan_renewal(state: &AppState) -> anyhow::Result<()> {
 
     while let Some(contact) = cursor.try_next().await? {
         counters.scanned += 1;
-        let mode = resolve_operation_mode(&contact, &profile_mode);
+        let mode = resolve_operation_mode(&contact, &profile);
         if !mode.renewal.enabled {
             continue;
         }
@@ -1930,9 +1948,9 @@ async fn scan_reactivation(state: &AppState) -> anyhow::Result<()> {
     let now = DateTime::now();
     let profile =
         crate::agent::domain_profile::load_active_domain_profile(&state.db, &workspace_id).await;
-    let profile_mode = profile.operation_mode.clone();
     // 行业默认 reactivation 关 → 整段对该行业 no-op（销售 DEFAULT 命中、零 DB 扫描）。
-    if !profile_mode.reactivation.enabled {
+    // 同 scan_renewal：扫描器级粗过滤用 profile 默认范式，逐 contact 走 resolve 三级。
+    if !profile.operation_mode.reactivation.enabled {
         return Ok(());
     }
 
@@ -1951,7 +1969,7 @@ async fn scan_reactivation(state: &AppState) -> anyhow::Result<()> {
 
     while let Some(contact) = cursor.try_next().await? {
         counters.scanned += 1;
-        let mode = resolve_operation_mode(&contact, &profile_mode);
+        let mode = resolve_operation_mode(&contact, &profile);
         if !mode.reactivation.enabled {
             continue;
         }
@@ -2079,6 +2097,34 @@ mod tests {
     /// customer_stage 维度。等价护栏：DEFAULT 行为与改造前逐字一致。
     fn cfg() -> PlannerStageConfig {
         PlannerStageConfig::default()
+    }
+
+    /// 测试 helper：把一套 OperationMode 包成一个 DEFAULT 形态的 DomainProfile（仅替换
+    /// operation_mode，per_relationship_operation_mode=None），供 resolve_operation_mode
+    /// 三级签名的调用——等价旧的"传 profile 默认范式"。
+    fn profile_with_mode(mode: crate::models::OperationMode) -> crate::models::DomainProfile {
+        let mut profile = crate::agent::domain_profile::default_domain_profile("default");
+        profile.operation_mode = mode;
+        profile
+    }
+
+    /// 测试 helper：配一个带 per_relationship_operation_mode 的 DomainProfile。
+    /// `default_mode` = profile 兜底范式；`per_relationship` = 关系类型→范式 map。
+    fn profile_with_relationship_modes(
+        default_mode: crate::models::OperationMode,
+        per_relationship: std::collections::BTreeMap<String, crate::models::OperationMode>,
+    ) -> crate::models::DomainProfile {
+        let mut profile = profile_with_mode(default_mode);
+        profile.per_relationship_operation_mode = Some(per_relationship);
+        profile
+    }
+
+    /// 测试 helper：给 contact 设 relationship_type（写 domain_attributes）。
+    fn with_relationship_type(mut contact: Contact, rt: &str) -> Contact {
+        let mut doc = contact.domain_attributes.unwrap_or_default();
+        doc.insert("relationship_type", rt);
+        contact.domain_attributes = Some(doc);
+        contact
     }
 
     fn template() -> Contact {
@@ -2940,7 +2986,7 @@ mod tests {
             funnel: crate::models::FunnelMode { enabled: false, stagnation_threshold_days: Some(30) },
             ..crate::models::OperationMode::default()
         };
-        let resolved = resolve_operation_mode(&contact, &profile_mode);
+        let resolved = resolve_operation_mode(&contact, &profile_with_mode(profile_mode.clone()));
         assert_eq!(resolved, profile_mode, "无 override → 用 profile 范式");
         assert!(!resolved.funnel.enabled, "profile 关 funnel 生效");
     }
@@ -2957,9 +3003,97 @@ mod tests {
         });
         // profile 范式三全开（销售型）——但 override 优先。
         let profile_mode = crate::models::OperationMode::default();
-        let resolved = resolve_operation_mode(&contact, &profile_mode);
+        let resolved = resolve_operation_mode(&contact, &profile_with_mode(profile_mode.clone()));
         assert!(!resolved.funnel.enabled, "override 关 funnel 覆盖 profile 的开");
         assert_eq!(resolved.silence.threshold_hours, Some(240), "override 自定义静默阈值生效");
+    }
+
+    /// §3.7：contact 有 relationship_type 且 profile per_relationship 命中 → 用该关系类型那套。
+    #[test]
+    fn relationship_type_selects_per_relationship_mode() {
+        let contact = with_relationship_type(template(), "friend");
+        // 默认范式三全开；friend 那套关 funnel（朋友不推进漏斗）。
+        let friend_mode = crate::models::OperationMode {
+            funnel: crate::models::FunnelMode {
+                enabled: false,
+                stagnation_threshold_days: None,
+            },
+            ..crate::models::OperationMode::default()
+        };
+        let mut map = std::collections::BTreeMap::new();
+        map.insert("friend".to_string(), friend_mode.clone());
+        let profile =
+            profile_with_relationship_modes(crate::models::OperationMode::default(), map);
+        let resolved = resolve_operation_mode(&contact, &profile);
+        assert_eq!(resolved, friend_mode, "命中 friend 那套范式");
+        assert!(!resolved.funnel.enabled, "friend 关 funnel 生效");
+    }
+
+    /// §3.7：contact 有 relationship_type 但 profile per_relationship 无此 key → 回落默认范式。
+    #[test]
+    fn relationship_type_unknown_key_falls_back_to_default() {
+        let contact = with_relationship_type(template(), "supplier"); // map 里没有 supplier
+        let mut map = std::collections::BTreeMap::new();
+        map.insert(
+            "friend".to_string(),
+            crate::models::OperationMode {
+                funnel: crate::models::FunnelMode {
+                    enabled: false,
+                    stagnation_threshold_days: None,
+                },
+                ..crate::models::OperationMode::default()
+            },
+        );
+        let default_mode = crate::models::OperationMode::default();
+        let profile = profile_with_relationship_modes(default_mode.clone(), map);
+        let resolved = resolve_operation_mode(&contact, &profile);
+        assert_eq!(resolved, default_mode, "未命中 key → 回落 profile.operation_mode");
+        assert!(resolved.funnel.enabled, "回落默认范式 funnel 仍开");
+    }
+
+    /// §3.7：contact override 优先级高于 relationship_type（override 在第一级）。
+    #[test]
+    fn contact_override_beats_relationship_type() {
+        let mut contact = with_relationship_type(template(), "friend");
+        contact.operation_mode_override = Some(crate::models::OperationMode {
+            silence: crate::models::SilenceMode {
+                enabled: true,
+                threshold_hours: Some(999),
+            },
+            ..crate::models::OperationMode::default()
+        });
+        // profile 给 friend 配了一套（关 funnel），但 contact override 应整组优先。
+        let mut map = std::collections::BTreeMap::new();
+        map.insert(
+            "friend".to_string(),
+            crate::models::OperationMode {
+                funnel: crate::models::FunnelMode {
+                    enabled: false,
+                    stagnation_threshold_days: None,
+                },
+                ..crate::models::OperationMode::default()
+            },
+        );
+        let profile =
+            profile_with_relationship_modes(crate::models::OperationMode::default(), map);
+        let resolved = resolve_operation_mode(&contact, &profile);
+        assert_eq!(
+            resolved.silence.threshold_hours,
+            Some(999),
+            "override 优先于 relationship_type"
+        );
+        assert!(resolved.funnel.enabled, "override 未关 funnel（friend 那套被跳过）");
+    }
+
+    /// §3.7：DEFAULT profile（per_relationship=None）+ contact 有 relationship_type →
+    /// 无 map 可选 → 回落 operation_mode。证明 DEFAULT 销售域加 relationship_type 零扰动。
+    #[test]
+    fn default_profile_none_map_ignores_relationship_type() {
+        let contact = with_relationship_type(template(), "customer");
+        let profile = crate::agent::domain_profile::default_domain_profile("default");
+        assert!(profile.per_relationship_operation_mode.is_none(), "DEFAULT profile 无多套");
+        let resolved = resolve_operation_mode(&contact, &profile);
+        assert_eq!(resolved, profile.operation_mode, "回落默认范式");
     }
 
     /// H8 DEFAULT 等价：默认范式下，三驱动力的有效阈值 == 传入的全局 config 值
@@ -3117,7 +3251,7 @@ mod tests {
     fn renewal_off_default_no_op() {
         let contact = template();
         let profile_mode = crate::models::OperationMode::default();
-        let resolved = resolve_operation_mode(&contact, &profile_mode);
+        let resolved = resolve_operation_mode(&contact, &profile_with_mode(profile_mode.clone()));
         assert!(!resolved.renewal.enabled, "DEFAULT 销售域 renewal 关 → scan_renewal 对该 contact no-op");
     }
 
@@ -3134,7 +3268,7 @@ mod tests {
             },
             ..crate::models::OperationMode::default()
         };
-        let resolved = resolve_operation_mode(&contact, &profile_mode);
+        let resolved = resolve_operation_mode(&contact, &profile_with_mode(profile_mode.clone()));
         assert!(resolved.renewal.enabled, "交易域 profile 开 renewal 生效");
         assert_eq!(resolved.renewal.lookahead_days, Some(30));
         assert_eq!(resolved.renewal.grace_days, Some(10));
@@ -3173,7 +3307,7 @@ mod tests {
     fn reactivation_off_default_no_op() {
         let contact = template();
         let profile_mode = crate::models::OperationMode::default();
-        let resolved = resolve_operation_mode(&contact, &profile_mode);
+        let resolved = resolve_operation_mode(&contact, &profile_with_mode(profile_mode.clone()));
         assert!(
             !resolved.reactivation.enabled,
             "DEFAULT 销售域 reactivation 关 → scan_reactivation 对该 contact no-op"
@@ -3193,7 +3327,7 @@ mod tests {
             },
             ..crate::models::OperationMode::default()
         };
-        let resolved = resolve_operation_mode(&contact, &profile_mode);
+        let resolved = resolve_operation_mode(&contact, &profile_with_mode(profile_mode.clone()));
         assert!(resolved.reactivation.enabled, "交易域 profile 开 reactivation 生效");
         assert_eq!(resolved.reactivation.dormant_days, Some(45));
         assert_eq!(resolved.reactivation.cadence_days, Some(60));
