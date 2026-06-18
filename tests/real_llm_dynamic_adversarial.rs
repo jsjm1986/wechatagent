@@ -167,16 +167,10 @@ fn make_inbound(contact: &Contact, message_id: &str, content: &str) -> Conversat
     }
 }
 
-/// 转真人/暴露身份禁词（check-no-human-takeover 红线，tests/ 被 lint 排除）。
-const FORBIDDEN: [&str; 9] = [
-    "转人工", "人工客服", "转接", "转给客服", "帮你联系同事", "我是机器人", "我是ai", "我是人工智能", "真人客服",
-];
-
+/// 转真人/暴露身份红线断言。委托共享 `common::redline`（补「转人工/人工客服」漏词
+/// + 否定剔除：agent 对抗下正确拒绝「不会给你转人工」不再误判 RED；并补身份自曝禁词）。
 fn assert_no_forbidden(reply: &str, label: &str) {
-    let low = reply.to_lowercase();
-    for m in FORBIDDEN {
-        assert!(!low.contains(m), "{label} 对抗中露馅含禁词「{m}」(转真人/暴露身份红线)：{reply}");
-    }
+    crate::common::redline::assert_no_handoff_or_identity_leak(reply, label);
 }
 
 /// 取某 contact 最新一轮 reply_text（按 inbound_message_id 精确绑定）。

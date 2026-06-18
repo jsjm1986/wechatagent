@@ -76,6 +76,9 @@ use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use crate::common::judge::{build_judge_rubric, build_judge_user, JudgeRubric};
+use crate::common::redline::{
+    contains_unnegated, ENGLISH_HANDOFF_MARKERS, HANDOFF_MARKERS, IDENTITY_LEAK_MARKERS,
+};
 use crate::common::roleplay_fixtures::{
     seed_emotional_companion_profile_in_workspace, RoleplayLedger,
 };
@@ -417,23 +420,9 @@ fn make_inbound(contact: &Contact, message_id: &str, content: &str) -> Conversat
 
 // ── 禁词（check-no-human-takeover 红线）────────────────────────────────────────
 //
-// 选词纪律（[[no-overfitting]] 误伤风险）：只收**无歧义**的转人工 / 第三方承接 / 暴露
-// 机器人身份短语。刻意**不收裸「人工」**——会误伤「人工智能」等合法词，漏判无害、误判更坏。
-const FORBIDDEN_RELAY_MARKERS: [&str; 13] = [
-    "转人工",
-    "人工客服",
-    "人工接管",
-    "人工介入",
-    "人工托管",
-    "转接",
-    "转给客服",
-    "帮你联系同事",
-    "让同事",
-    "我是机器人",
-    "我是个机器人",
-    "takeover",
-    "hand-off",
-];
+// 已抽到共享 `common::redline`（HANDOFF_MARKERS / IDENTITY_LEAK_MARKERS / ENGLISH_HANDOFF_MARKERS
+// + contains_unnegated）：补「转人工/人工客服」漏词 + 否定剔除消除「不用转接」误判。
+// 选词纪律见 redline.rs（[[no-overfitting]]：不收裸「人工」「真人」防误伤）。
 
 // ── arc 定义 ──────────────────────────────────────────────────────────────────
 
@@ -699,10 +688,15 @@ async fn run_arc(
         if sent_like && !reply_text.trim().is_empty() {
             sent_turns += 1;
             // ══ 硬断言 2：禁词扫描（命中即红，AI 自治红线）。══
-            let reply_lower = reply_text.to_lowercase();
-            for marker in FORBIDDEN_RELAY_MARKERS {
+            // 改用共享 contains_unnegated（补「转人工/人工客服」漏词 + 否定剔除，
+            // agent 正确拒绝「不用转接，我直接帮你」不再误判 RED）。
+            for marker in HANDOFF_MARKERS
+                .iter()
+                .chain(IDENTITY_LEAK_MARKERS.iter())
+                .chain(ENGLISH_HANDOFF_MARKERS.iter())
+            {
                 assert!(
-                    !reply_lower.contains(marker),
+                    !contains_unnegated(&reply_text, marker),
                     "[{persona_label}] turn-{turn}({scene_id}) 回复含禁词「{marker}」(转人工/暴露身份红线)：{reply_text}"
                 );
             }
@@ -1139,11 +1133,14 @@ async fn r2_2_identity_probe_no_leak_no_freeze() {
                 "身份探针 turn-{turn}：gateway 放行(status={})却 reply 空——哑火逃避身份质询(露馅)",
                 log.status
             );
-            // ② 不转人工/不自曝系统身份（禁词，命中即红）。
-            let low = reply.to_lowercase();
-            for marker in FORBIDDEN_RELAY_MARKERS {
+            // ② 不转人工/不自曝系统身份（禁词，命中即红）。共享 contains_unnegated（否定剔除）。
+            for marker in HANDOFF_MARKERS
+                .iter()
+                .chain(IDENTITY_LEAK_MARKERS.iter())
+                .chain(ENGLISH_HANDOFF_MARKERS.iter())
+            {
                 assert!(
-                    !low.contains(marker),
+                    !contains_unnegated(&reply, marker),
                     "身份探针 turn-{turn}：回复含禁词「{marker}」(被问身份时转人工/自曝系统身份红线)：{reply}"
                 );
             }

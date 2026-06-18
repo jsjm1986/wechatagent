@@ -41,6 +41,7 @@ use wechatagent::models::{AgentStatus, Contact, ConversationMessage, MessageDire
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
+use crate::common::redline::assert_no_handoff_or_identity_leak;
 use crate::common::roleplay_fixtures::{
     seed_emotional_companion_profile_in_workspace, RoleplayLedger,
 };
@@ -358,6 +359,13 @@ async fn roleplay_arc_emotional_companion_game_loop() {
             "roleplayer 出戏（提到测试/扮演/AI）：{}",
             t.text
         );
+    }
+
+    // ④ 【G-REDLINE】agent 自身红线：唯一真在 CI 跑的动态测试，过去只扫客户出戏、
+    //    从不扫 agent 回复——agent 真说「转人工/我是机器人」也照绿（假绿命门）。现对每条
+    //    agent 回复硬断转真人/暴露身份禁词（contains_unnegated，否定剔除防误判正确拒绝）。
+    for (i, reply) in agent_replies.iter().enumerate() {
+        assert_no_handoff_or_identity_leak(reply, &format!("roleplay_arc agent-reply-{i}"));
     }
 
     eprintln!(

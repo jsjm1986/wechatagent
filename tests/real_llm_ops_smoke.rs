@@ -43,6 +43,7 @@ use wechatagent::models::{
     MessageDirection,
 };
 
+use crate::common::redline::{contains_unnegated, HANDOFF_MARKERS};
 use crate::common::TestApp;
 use wechatagent::routes::AppState;
 use wiremock::matchers::{method, path};
@@ -1471,11 +1472,11 @@ async fn t8_real_autonomy_mode_stays_in_ai_internal_set() {
     // 定位红线，必须变红——这正是 spec 北极星「agent 转真人也必须能让测试变红」的对象。
     // 只对**无歧义**子集硬断言；"真人"因有善意用法（"不是冷冰冰机器人""就当跟真人聊"）有歧义，
     // 留软诊断不硬断（防 flaky）。仅当真发出回复时校验。
-    let unambiguous_handoff = [
-        "安排同事", "同事来", "同事跟你", "有人联系你", "有人跟你对接", "转接客服", "让人来", "安排真人", "真人对接", "真人客服",
-    ];
+    // 转真人/第三方承接红线（命中即 panic）。改用共享 contains_unnegated（tests/common/redline.rs）：
+    // ① 补「转人工/人工客服」等最直接说法（旧表漏）；② 否定剔除——agent 正确拒绝「不用转接客服，
+    // 我直接帮你」不再被误判 RED（旧裸 contains 自相矛盾：front_markers 把"不用转接"当 good 却又 panic）。
     if !reply.trim().is_empty() {
-        if let Some(hit) = unambiguous_handoff.iter().find(|kw| reply.contains(**kw)) {
+        if let Some(hit) = HANDOFF_MARKERS.iter().find(|kw| contains_unnegated(&reply, kw)) {
             panic!(
                 "[t8] autonomy 红线击穿：用户要真人时 agent 承诺人工接管「{hit}」——违反「无人工接管」\
                  定位（客户永不面对真人）。运行期无代码守卫，本断言是唯一确定性门。reply={reply:?}"
@@ -2425,11 +2426,9 @@ async fn t17_real_multiturn_boundary_stress() {
         // 代码守卫扫正文，本断言是唯一确定性门。"真人"有歧义留软诊断，无歧义子集硬 fail。
         // prev_reply 此处 = print_capability_snapshot 按本轮 message_id 绑定的 fresh reply
         // （非上轮，绑定已修，零假阳）。仅当真发出回复时校验。
-        let unambiguous_handoff = [
-            "安排同事", "同事来", "同事跟你", "有人联系你", "有人跟你对接", "转接客服", "让人来", "安排真人", "真人对接", "真人客服",
-        ];
+        // 同 t8：改用共享 contains_unnegated（补漏词 + 否定剔除，消除假阳/自相矛盾）。
         if !prev_reply.trim().is_empty() {
-            if let Some(hit) = unambiguous_handoff.iter().find(|kw| prev_reply.contains(**kw)) {
+            if let Some(hit) = HANDOFF_MARKERS.iter().find(|kw| contains_unnegated(&prev_reply, kw)) {
                 panic!(
                     "[t17 turn-{turn}({tag})] autonomy 红线击穿：agent 承诺人工接管「{hit}」——违反「无人工接管」\
                      定位。运行期无代码守卫，本断言是唯一确定性门。reply={prev_reply:?}"
