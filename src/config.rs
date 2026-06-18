@@ -100,6 +100,12 @@ pub struct AppConfig {
     /// G5 阶段2 Strategic Planner：`scan_reactivation` 的独立每日 emit 上限。默认 3。
     /// `ReactivationMode.daily_cap` 可 per-profile 覆盖。
     pub strategic_planner_reactivation_daily_cap: i64,
+    /// G6 客户价值分层：中价值门槛（累计成交额，最小币种单位/分，单币种 CNY）。
+    /// 累计成交额 ≥ 此值 → 中价值层。默认 50000（¥500）。
+    pub value_tier_mid_threshold_cents: i64,
+    /// G6 客户价值分层：高价值门槛（累计成交额，分，单币种 CNY）。
+    /// 累计成交额 ≥ 此值 → 高价值层（优先于中价值）。默认 300000（¥3000）。
+    pub value_tier_high_threshold_cents: i64,
     /// M3 Strategic Planner：反馈环回看窗口小时数。
     /// 在此窗口内反查该 contact 的 `agent_run_logs.final_review_status`，
     /// 计算 block-rate；默认 24。
@@ -478,6 +484,16 @@ impl AppConfig {
             strategic_planner_reactivation_daily_cap: env_or(
                 "STRATEGIC_PLANNER_REACTIVATION_DAILY_CAP",
                 "3",
+            )
+            .parse()?,
+            value_tier_mid_threshold_cents: env_or(
+                "VALUE_TIER_MID_THRESHOLD_CENTS",
+                "50000",
+            )
+            .parse()?,
+            value_tier_high_threshold_cents: env_or(
+                "VALUE_TIER_HIGH_THRESHOLD_CENTS",
+                "300000",
             )
             .parse()?,
             strategic_planner_block_rate_window_hours: env_or(

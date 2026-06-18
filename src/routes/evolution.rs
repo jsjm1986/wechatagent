@@ -797,6 +797,8 @@ mod tests {
             strategic_planner_reactivation_dormant_days: 30,
             strategic_planner_reactivation_cadence_days: 30,
             strategic_planner_reactivation_daily_cap: 3,
+            value_tier_mid_threshold_cents: 50000,
+            value_tier_high_threshold_cents: 300000,
             strategic_planner_block_rate_window_hours: 24,
             strategic_planner_block_rate_min_runs: 3,
             strategic_planner_block_rate_threshold: 0.6,

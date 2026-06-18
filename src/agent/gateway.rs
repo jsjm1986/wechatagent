@@ -2668,6 +2668,22 @@ async fn apply_agent_updates(
             set_doc.insert("domain_attributes_updated_at", DateTime::now());
         }
     }
+    // G6 客户价值分层：交易域才算（transaction_facts_enabled 守门，与 G1 块同闸；非交易域
+    // 如情感陪伴无产品无成交 → 不写 value_tier，零扰动）。value_tier 是**客观计算派生值**
+    // （累计已核实成交额规则算），走独立写入分支直接 set domain_attributes.value_tier，
+    // **不经 domain_signals 容器**——否则会被上方 retain_declared_dimensions 白名单剔除
+    // （销售域只声明 customer_stage/intent_level）。与 LLM 推断通道彻底分离。
+    if active_profile.transaction_facts_enabled {
+        let value_cents =
+            crate::agent::entitlements::compute_customer_value_cents(&contact.outcome_events);
+        let tier = crate::agent::entitlements::classify_value_tier(
+            value_cents,
+            state.config.value_tier_mid_threshold_cents,
+            state.config.value_tier_high_threshold_cents,
+        );
+        set_doc.insert("domain_attributes.value_tier", tier);
+        set_doc.insert("domain_attributes_updated_at", DateTime::now());
+    }
     // 请示触发：把"等待领导决策"标记写进客户 domain_attributes（admin 可观测）。
     // key 用 AWAITING_PRINCIPAL_DECISION_ATTR 常量，与 relay 完成时 clear_awaiting_principal_state 的 $unset 同一字符串。
     // 注意：这只是可观测布尔标记——本轮 run 是 Approved，占位 reply 已正常发出，不进 Held、不设 hold category、不碰 review。

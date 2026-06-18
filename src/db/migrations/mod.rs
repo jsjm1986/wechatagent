@@ -49,6 +49,7 @@ mod m019_state_machine_state_flags;
 mod m020_seed_purchase_lifecycle;
 mod m021_seed_churn_reason;
 mod m022_backfill_dormant_allow_from_any;
+mod m023_seed_value_tier;
 
 type MigrationFuture<'a> = Pin<Box<dyn Future<Output = AppResult<()>> + Send + 'a>>;
 pub type MigrationFn = for<'a> fn(&'a Database) -> MigrationFuture<'a>;
@@ -148,6 +149,10 @@ pub const MIGRATIONS: &[Migration] = &[
     Migration {
         id: "2026_06_X6_001_backfill_dormant_allow_from_any",
         run: |db| Box::pin(m022_backfill_dormant_allow_from_any::run_step(db)),
+    },
+    Migration {
+        id: "2026_06_X7_001_seed_value_tier",
+        run: |db| Box::pin(m023_seed_value_tier::run_step(db)),
     },
 ];
 

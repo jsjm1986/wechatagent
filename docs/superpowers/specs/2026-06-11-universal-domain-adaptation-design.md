@@ -664,6 +664,19 @@ casual 模式的"收紧压力门"会与"热烈推进"打架（非误杀，是模
 - **与 scan_silent 边界**：silent=通用沉默唤醒（不分流、跨范式）；reactivation 专扫休眠态老客（被 TERMINAL_STAGES 排除出 stage_stagnation、现状无任何段唤醒，本扫描器补此空白）。
 - **护栏**：ReactivationMode.enabled 默认 false → DEFAULT 销售域 scan_reactivation no-op（`reactivation_mode_default_disabled` 锁死）；allowFromAny 改动经 state_transition_pbt 闭式参考自动跟随、金标零破坏。验证 lib 1263/0、四 PBT 36/0、no-takeover lint clean。
 
+#### §3.7+ G6 客户价值分层（LTV tier，2026-06-18 落码）
+
+§1.6 缺口清单（:110）的「G6 客户价值分层 LTV/RFM/tier——真缺失」落地。**用户拍板范围**：单币种 RMB（CNY）+ 纯 LTV 累计成交额分层（不做 RFM/多币种，留后续增强）。
+
+**核心架构定性**：价值分层是**客观计算（规则算）**，不是 LLM 语义推断——累计成交额 ≥ 阈值就是高价值，硬数字。与 churn_reason（LLM 从对话推断）本质不同，更接近 reconcile_g1_with_entitlements（G4→G1 客观锚）的极端形态：纯客观、无需 LLM 先猜。#6 金额整数化（i64 分）是其前置地基，G6 是该地基第一个消费者。
+
+- **LTV 计算**（entitlements.rs）：`compute_customer_value_cents` 复用 `verification_drives_entitlement` 闭集（排除 conversation_inferred §2.1 红线），deal 加 / reversal 减，单币种 CNY 过滤（非 CNY 跳过），超额退款 `.max(0)` clamp。`classify_value_tier`（≥high→high / ≥mid→mid / 否则 low）。
+- **写入**（gateway.rs）：受 `transaction_facts_enabled` 守门（与 G1 块同闸；非交易域如情感陪伴不写、零扰动），规则算 tier 后**走独立写入分支** `set_doc.insert("domain_attributes.value_tier", tier)`——**不经 LLM domain_signals 容器**（否则被 retain_declared_dimensions 白名单剔除），与 LLM 推断通道彻底分离。DEFAULT 销售域 transaction_facts_enabled=true → 会写 value_tier（这是期望行为，价值分层正为销售域设计）。
+- **驱动差异化运营**：①planner `value_tier_weight`（high/mid/low→80/50/20）加进 `commitment_priority_key` + `stage_stagnation_priority_key` 排序键（插 stage_w 之后、不盖过漏斗阶段），高价值客户 daily cap 竞争优先；②decision prompt「当前画像」段加「客户价值层级」让 AI 知道更用心。
+- **配置**：`value_tier_{mid=50000(¥500), high=300000(¥3000)}_threshold_cents`。m023 seed value_tier taxonomy 三值（供 UI/canonical；value_tier 不走 LLM 通道故不需 profile 维度声明）。
+- **零扰动**：非交易域不写 value_tier；存量 contact 无 value_tier → planner weight 10（最低，与无 intent 同档）不改原有相对序；prompt DEFAULT 空串字节等价。subagent 交叉验证确认无任何测试锁 domain_attributes 字段集/prompt 字节/排序元组结构（相对序 .cmp 对元组长度免疫）。
+- **后续增强（未做）**：RFM 多维分层、多币种 LTV 归一（现非 CNY 成交跳过）。
+
 ### Phase 4（可选）：清理 D2/D3 审计与图谱缺陷。 ✅**已完成（2026-06-17）**
 
 - **D2**（核验写入接回 apply_chunk_revision 补全审计链）✅ commit 985463a。
