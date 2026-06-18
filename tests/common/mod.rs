@@ -163,6 +163,16 @@ impl TestApp {
         .await
         .expect("种入默认 prompt pack 失败");
 
+        // 与 main.rs:83 对齐：迁移种入 system_taxonomies（m006）后强制预热进程级
+        // taxonomy 缓存。缓存是 LazyLock 单例 + 30s TTL，跨同一 test binary 内多个
+        // #[tokio::test] 复用；不在此处按**本测试自己的** DB 强制 reload 的话，缓存会
+        // 停留在「最先 find_or_load 的那个测试的 ephemeral testcontainer DB」内容上，
+        // 导致后续测试 check_value 查不到本测试 DB 里的字典项（CandidateNew→DropSilently），
+        // 把经 validate_dimension_value 的维度（如 customer_stage）误判为字典外而丢弃。
+        // warm_up 内部**忽略 TTL** 无条件 reload，故每个 TestApp::start 都会把全局缓存
+        // 对齐到自己的 DB；m006 全局 scope 字典在每个测试 DB 内容一致，并发竞争无害。
+        wechatagent::agent::init_global_taxonomy_cache(&db).await;
+
         let mcp = McpClient::new(config.mcp_base_url.clone(), config.mcp_api_key.clone())
             .expect("构造测试 mcp client 失败");
 
