@@ -20,6 +20,7 @@ use crate::{
 mod accounts;
 mod admin_ops_versions;
 mod admin_outbox;
+mod admin_relationship_suggestions;
 mod admin_state_policies;
 mod admin_taxonomies;
 mod admin_taxonomy_candidates;
@@ -116,6 +117,9 @@ use admin_taxonomies::{
 };
 use admin_taxonomy_candidates::{
     approve_taxonomy_candidate, list_taxonomy_candidates, reject_taxonomy_candidate,
+};
+use admin_relationship_suggestions::{
+    approve_relationship_suggestion, list_relationship_suggestions, reject_relationship_suggestion,
 };
 use assets::{create_content_asset, list_content_assets};
 use contacts::{
@@ -699,6 +703,19 @@ pub fn api_router(state: AppState) -> Router<AppState> {
             "/admin/taxonomy-candidates/:id/reject",
             post(reject_taxonomy_candidate),
         )
+        // ── 数字分身建议链 T8：relationship_type 建议审核路由 ──────────────────
+        .route(
+            "/admin/relationship-type-suggestions",
+            get(list_relationship_suggestions),
+        )
+        .route(
+            "/admin/relationship-type-suggestions/:id/approve",
+            post(approve_relationship_suggestion),
+        )
+        .route(
+            "/admin/relationship-type-suggestions/:id/reject",
+            post(reject_relationship_suggestion),
+        )
         // ── Phase E / E5-T1：ops 三表多版本灰度 admin 路由 ──────────────────────
         // 同一套 publish/rollout/rollback 三动作分别覆盖
         // operation_domain_configs / operation_state_policies / system_taxonomies。
@@ -883,6 +900,7 @@ mod tests {
             include_str!("admin_state_policies.rs"),
             include_str!("admin_taxonomies.rs"),
             include_str!("admin_taxonomy_candidates.rs"),
+            include_str!("admin_relationship_suggestions.rs"),
             include_str!("assets.rs"),
             include_str!("auth.rs"),
             include_str!("behavior_signal_metrics.rs"),
