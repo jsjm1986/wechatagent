@@ -945,7 +945,7 @@ mod tests {
     }
 
     #[test]
-    fn relationship_type_suggestion_guidance_no_takeover_clean() {
+    fn relationship_type_suggestion_guidance_forbidden_words_clean() {
         let g = render_relationship_type_suggestion_guidance();
         // 命名红线：render 结果不得含禁词（用编译期拼接构造禁词，避免源码字面量被 lint 反向命中）。
         let forbidden_words = [
