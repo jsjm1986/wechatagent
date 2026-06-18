@@ -540,36 +540,6 @@ pub async fn init_global_taxonomy_cache(db: &Database) {
     GLOBAL_TAXONOMY_CACHE.warm_up(db).await;
 }
 
-/// admin 写侧画像归一（M1）：把 admin 手填的维度取值经 `system_taxonomies` 做
-/// alias→canonical 归一，与 LLM 决策路径 (`decision_taxonomy::classify_decision_tags`)
-/// 同一口径，杜绝"LLM 侧写 canonical、admin 侧写中文 alias"导致同一字段在两种
-/// 表示间漂移、污染下游派生（planner stagnation / C2 状态机 / G1 纠偏都读这个字段）。
-///
-/// 行为与 LLM 侧 `AliasActive` 分支一致：**仅** alias 命中时归一到 canonical id；
-/// `Active`（已是 canonical）/ `Deprecated`/ `CandidateNew`（admin 有权创造新值）
-/// 一律保留 admin 原值，不拒绝、不阻塞——admin 是可信写入方，这里只做表示归一、
-/// 不做准入控制。cache 冷启动时先 `find_or_load` 兜底（与 LLM 侧共享同一进程级
-/// 缓存）。`scope_account_id` 与 LLM 侧一致传 contact.account_id（account 私有字典
-/// 优先于 global）。
-pub(crate) async fn normalize_dimension_value(
-    db: &Database,
-    kind: &str,
-    raw_value: &str,
-    scope_account_id: &str,
-) -> String {
-    let trimmed = raw_value.trim();
-    if trimmed.is_empty() {
-        return raw_value.to_string();
-    }
-    let cache = global_taxonomy_cache();
-    cache.find_or_load(db).await;
-    match check_value(kind, trimmed, scope_account_id, &cache) {
-        TaxonomyMatch::AliasActive(canonical) => canonical,
-        // Active / Deprecated / CandidateNew：保留 admin 原值。
-        _ => trimmed.to_string(),
-    }
-}
-
 /// 后台 API（admin_taxonomies / admin_taxonomy_candidates）在写后调用以让缓
 /// 存立即失效。
 pub(crate) fn invalidate_global_taxonomy_cache() {

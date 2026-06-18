@@ -141,8 +141,8 @@ fn match_to_dict(m: crate::agent::taxonomy::TaxonomyMatch) -> DictLookup {
     }
 }
 
-/// 字典查询薄壳：抄 normalize_dimension_value(:564-566) 取进程级 cache，
-/// 把 TaxonomyMatch 四变体映射为 DictLookup 三态（映射逻辑见 match_to_dict）。
+/// 字典查询薄壳：取进程级 taxonomy cache（懒加载兜底），把 TaxonomyMatch 四变体
+/// 映射为 DictLookup 三态（映射逻辑见 match_to_dict）。
 async fn lookup_dict(
     db: &crate::db::Database,
     kind: &str,
