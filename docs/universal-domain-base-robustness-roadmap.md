@@ -88,6 +88,10 @@
 
 > **落地进度（2026-06-18）**：主题 1+2 的**核心**已合并为一个 spec 落码——见 `docs/superpowers/specs/2026-06-18-dimension-registry-and-validation-design.md` + 计划 `docs/superpowers/plans/2026-06-18-dimension-registry-and-validation.md`。已交付：维度元数据单一真相源 `src/agent/dimension_registry.rs`（收敛 B1 散落 typed 列表）；Contact 三写入路径接 `validate_dimension_value`（admin reject / LLM drop+审计 / objection_type 归一，补 B2 假字典脱节）；新增 `WriteIntent` 正交轴（admin 写一律 reject）。lib 1308/0、四 PBT 36/0、lint 0。
 > **主题 1/2 仍未做的子项**（本 spec 按 YAGNI 排除，留后续）：C3 profile 字段中央接线点（apply_active_profile 只覆盖 runtime 标量）、driver 框架抽象、五闸数量可配；主题 2 的 key 字面量全面常量化（仅维度 kind 经 registry 收敛，其它高频 key 仍散落）。主题 3（数字分身前端 + D3 LLM 识别）/ 主题 4（规模）未动。
+>
+> **落地进度（2026-06-19，第二轮）**：用户问"业务逻辑是否满足要求"，实证核查（主链路真通用）后补两业务缺口 + C3 轻量——见 `docs/superpowers/specs/2026-06-18-universal-business-gaps-completion-design.md`。已交付：① prompt 话术随 profile 替换（mode_gate_policy_override + reviewer_fewshot_override，非销售域话术不串销售味）；② **数字分身 D3 relationship_type LLM 识别落地**（LLM 产建议→不直接生效→运营 REST approve 写 contact 的保守闭环，结构层红线闭合）；C3 部分兑现（prompt 类 override per-chain 收敛 helper + 4 步约定文档，仍未做全量 25 字段中央接线）。lib 1336/0、四 PBT 36/0、lint 0、终审 Ready to merge。
+> **实证修正**：五闸可配=过度设计（已砍，5 维是审查方法论固定本体）、driver 框架=高风险低收益大重构（已缓，各 scanner 结构不雷同抽 trait 丢类型安全）。
+> **主题 3 仍未做**：relationship_type 识别的**前端审核面板**（本轮只做后端 REST，前端统一后一步）；前端随 profile 动态渲染/频道门控。主题 4（规模/多账号）未动。
 
 | 顺序 | 主题 | 价值 | 风险 | 工作量 | 理由 |
 | --- | --- | --- | --- | --- | --- |

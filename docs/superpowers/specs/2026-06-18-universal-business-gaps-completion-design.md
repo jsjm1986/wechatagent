@@ -6,6 +6,14 @@
 > **流程**：brainstorming（本文）→ writing-plans → 实施。
 > **范围裁决**：实证推翻路线图旧评估——五闸可配=过度设计（砍）、driver 框架=高风险低收益（缓）。本轮 = 两业务缺口 + C3 轻量。
 
+> **实现状态（2026-06-19 已落码）**：实施计划 `docs/superpowers/plans/2026-06-18-universal-business-gaps-completion.md`，子代理逐任务 + 逐任务交叉验证 + 全分支终审（Ready to merge: Yes，无 Critical/Important）。
+> - 模块 A：`DomainProfile.mode_gate_policy_override`（feb8c60/d2b41e9，接 reply.policy 链）+ `ReviewerOrientation.reviewer_fewshot_override`（d6359ac，接 review.system 链）。仿 apply_reviewer_review_focus 子串替换 + 锚漂移护栏 + boundary 红线不纳入。
+> - 模块 C：`apply_reply_policy_prompt_overrides` / `apply_review_system_prompt_overrides` per-chain 收敛 + 字节等价守恒测试 + 模块头 4 步约定文档（16a7689，两链刻意不合并）。
+> - 模块 B：`relationship_type_suggestions` collection（f1aa0ad）→ 决策后 extract+MachineWrite 校验+upsert 写建议（ce9fd57，fail-soft）→ decision prompt 引导（c4dd92f，仿 render_suspected_deal_guidance）→ REST 审核路由 approve/reject（76709e7，AdminWrite 校验写 contact + workspace 隔离）。**保守红线在结构层闭合**：relationship_type 是 AdminDirect 通道，LLM 经 MachineWrite 越界恒 Reject、合法值也只 upsert 进建议表，全代码无一处在决策侧写 contact.relationship_type——approve 是唯一 contact 写点。
+> - **字节等价红线的精确边界**：约束的是 reply.policy + review.system 两条 prompt 链（模块 A/C，DEFAULT None 回落逐字节一致）。模块 B 的 relationship_type 引导是常驻追加在 **task prompt**，DEFAULT 销售域 task prompt 多一段（设计内：「有新证据才产出、无证据零扰动」，行为不变但 token/指令多一段）。
+> - 验证：lib 1336/0、四 PBT 36/0、no-takeover lint 0 violations。
+> - 终审 triage 的 Minor（全部留后续、无一阻断合并）：写建议失败日志分级（E11000 降 debug/其它 warn）、approve mark/contact update 补 workspace+matched_count 一致性、ValueSource::FreeText 旧债（上轮遗留）。
+
 ---
 
 ## Context（为什么做 + 实证依据）
