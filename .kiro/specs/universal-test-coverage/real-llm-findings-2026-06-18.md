@@ -142,6 +142,29 @@
 
 ---
 
+## 分类 R：Reviewer Agent 表现（ops 多轮弧 reviewer↔judge 并排对比）
+
+### R1.【证伪】reviewer 漏判操控风险？—— ❌ 是 judge 单采样噪声，非 reviewer 短板
+- **初看可疑**：ops t15-turn1（job 81921000757）`manipulationRisk(↔pressure): reviewer=Some(2) vs judge[9]`——reviewer 打 2（无压迫）、judge 打 9（操控严重），疑似 reviewer 漏判。
+- **跨 turn 对比证伪**：扫 6-17 ops 约 10 个 turn 的 manipulationRisk judge 值，**除这一条 =9 外全是 1~2**，且 judge 自己这条的**文字依据写"manipulation 风险极低"**——数值 9 与依据自相矛盾。**孤例离群，非系统反转**。
+- **真相 = T1（见下）**：JUDGE_SAMPLES=1 单采样，judge 模型偶发把分值打错（依据对、数值错），无中位数平滑。reviewer 这条 pressureRisk=2 反而**正确**。
+- **reviewer 正向证据**：ops 多轮弧里 reviewer 的 humanLike/emotionalValue/pressureRisk 与 judge **高度吻合**（reviewer 6 vs judge 8、reviewer 2 vs judge 1-2…差 ≤2），说明 reviewer 自评校准与独立 judge 基本对齐——**Reviewer Agent 正向能力**，非短板。
+- **注**：`factualRestraint(↔grounding): reviewer=Some(0)` 不是背离——reviewer 侧打印的是 `knowledgeGroundingScore`（ops_smoke.rs:778），无产品声明轮=0=不适用，与 judge 的 factualRestraint=8 量纲不同，不可比。
+- **reviewer 真短板仍待**：redline/dynamic 新弧的"该拦没拦/该乱改"场景（新 run 链尾）。
+
+---
+
+## 分类 T：测试探针/方法自身缺陷（影响判定可信度，归我可改面）
+
+### T1.【测试方法】judge `manipulationRisk` 单采样偶发离群（数值与依据反向）—— ✅ 真缺陷
+- **现象**：ops t15-turn1 judge manipulationRisk=9，但同一 judge 的文字依据="manipulation 风险极低"。跨 ~10 turn 仅此一例离群（其余 1-2）。
+- **根因**：CI ops 弧 `JUDGE_SAMPLES=1`（单次采样），judge 模型偶发把"风险低"打成高分值，**无多采样中位数平滑**离群点。
+- **影响**：若某硬门用 manipulationRisk judge 数值，单采样离群可能误伤（假阳）。当前 ops 弧 judge 仅诊断不进门（铁律③），暂未致假红，但**削弱判定可信度**。
+- **修复方向（测试 only）**：ops/redline 弧 judge 采样数 K 从 1 提到 3（取中位数）平滑离群；或对"数值 vs 依据极性矛盾"加一致性校验，矛盾丢弃该采样。代价=judge LLM 调用 ×3（配额）。
+- **归属**：测试 judge 配置（ci.yml JUDGE_SAMPLES / real_llm_ops_smoke.rs），我的可改面。**待确认是否值得 ×3 配额。**
+
+---
+
 ## 链路进度
 
 - run `27755319966`（HEAD be1c319，**G14 修复前**）：暴露 B1（profile 列表断言）+ B2（C2 缓存）。
