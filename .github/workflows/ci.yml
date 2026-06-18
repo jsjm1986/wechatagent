@@ -1039,6 +1039,7 @@ jobs:
           - real_llm_proactive_outreach
           - real_llm_dynamic_adversarial
           - real_llm_digital_twin_arc
+          - real_llm_principal_relay
     env:
       REAL_LLM_API_KEY: ${{ secrets.RSXERMU_KEY }}
     steps:
