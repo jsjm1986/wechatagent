@@ -441,6 +441,16 @@ pub(crate) async fn decide_reply_with_promote(
         &policy,
         active_profile.conversation_mode_policy.as_deref(),
     );
+    // universal-domain-adaptation A/T2：紧接 conversation_mode_policy 之后注入本行业
+    // 「## 模式与 5 闸的关系」模式-闸说明。active profile 声明 mode_gate_policy_override
+    // 时，把 policy 里写死销售四模式-闸取向的 DEFAULT_MODE_GATE_POLICY 段整体替换成本域
+    // 说明；DEFAULT / 老库为 None → 原样返回、销售取向逐字保留、销售域字节等价。
+    // **红线**：销售锚**不含** boundary_protection 不放宽边界保护硬规则续行（那是跨域
+    // 恒定红线，由下文 user.reply.policy 继续写死守护），故本替换不会动到边界保护红线。
+    let policy = super::domain_profile::apply_mode_gate_policy(
+        &policy,
+        active_profile.mode_gate_policy_override.as_deref(),
+    );
     // universal-domain-adaptation H9 修复（问题 A）：policy「## 决策协议字段」段写死的
     // conversationMode 四模式枚举列表替换为 active profile 声明的模式集合，与下游
     // validate_and_promote 的 runtime.allowed_conversation_modes 校验集合对齐，消除
@@ -1271,5 +1281,42 @@ mod persona_override_tests {
             render_business_context_fragment(Some("  含空白  "), "# H"),
             "\n\n# H\n含空白"
         );
+    }
+
+    /// A/T2：复刻 decision.rs reply.policy 组装链里 apply_conversation_mode_policy →
+    /// apply_mode_gate_policy 的相对顺序与参数取法（active_profile.mode_gate_policy_override），
+    /// 锁定「mode_gate_policy_override=Some → policy 里写死销售四模式-闸取向被本域说明整体
+    /// 替换」这条接线。生产组装在大 async 函数里不宜直接单测，这里测同构片段，等价证明
+    /// 接线生效（与生产链 :440/:445 同一对函数、同一参数源）。
+    #[test]
+    fn reply_policy_chain_applies_mode_gate_policy_override() {
+        use crate::agent::domain_profile::{
+            apply_conversation_mode_policy, apply_mode_gate_policy,
+        };
+        // 模拟 user.reply.policy prompt：含销售锚段（DEFAULT_MODE_GATE_POLICY 逐字子串）。
+        let policy = format!(
+            "前置内容\n{}\n后置内容",
+            crate::prompts::DEFAULT_MODE_GATE_POLICY
+        );
+
+        // override=Some → 走完整链：conversation_mode_policy(None 这里不替换) 后接
+        // mode_gate_policy(Some) 把销售锚整段替换成本域说明。
+        let after_conv = apply_conversation_mode_policy(&policy, None);
+        let out = apply_mode_gate_policy(&after_conv, Some("情感陪伴域：模式不进 5 闸升档逻辑。"));
+        assert!(
+            out.contains("情感陪伴域：模式不进 5 闸升档逻辑。"),
+            "override 文本应注入：{out}"
+        );
+        assert!(
+            !out.contains(crate::prompts::DEFAULT_MODE_GATE_POLICY),
+            "销售锚段应被整体替换、不残留：{out}"
+        );
+        assert!(out.contains("前置内容") && out.contains("后置内容"), "锚段外文本应原样保留");
+
+        // override=None → 链路对 policy 字节不变（销售域字节等价护栏）。
+        let none_after_conv = apply_conversation_mode_policy(&policy, None);
+        let none_out = apply_mode_gate_policy(&none_after_conv, None);
+        assert_eq!(none_out, policy, "None 覆盖应逐字保留销售锚段");
+        assert!(none_out.contains(crate::prompts::DEFAULT_MODE_GATE_POLICY));
     }
 }
