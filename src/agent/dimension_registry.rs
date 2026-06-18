@@ -78,7 +78,7 @@ pub(crate) enum DimValidation {
 }
 
 /// 字典查询结果（把 taxonomy::check_value 四变体窄化为校验所需三态）。
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum DictLookup {
     /// Active(canonical) 或 Deprecated：字典登记过的合法值。
     Known,
@@ -111,22 +111,30 @@ pub(crate) fn classify_validation(spec: &DimensionSpec, dict: DictLookup, raw: &
     }
 }
 
+/// 纯函数：把 taxonomy::check_value 四变体映射为 DictLookup 三态。
+/// 红线：Active|Deprecated → Known（Deprecated 是字典登记过的合法历史值，不越界）；
+/// 仅 CandidateNew → Miss（字典真无）。无 IO，完全可单测——守护这条映射不被误改。
+fn match_to_dict(m: crate::agent::taxonomy::TaxonomyMatch) -> DictLookup {
+    use crate::agent::taxonomy::TaxonomyMatch;
+    match m {
+        TaxonomyMatch::AliasActive(canonical) => DictLookup::Alias(canonical),
+        TaxonomyMatch::Active | TaxonomyMatch::Deprecated => DictLookup::Known,
+        TaxonomyMatch::CandidateNew => DictLookup::Miss,
+    }
+}
+
 /// 字典查询薄壳：抄 normalize_dimension_value(:564-566) 取进程级 cache，
-/// 把 TaxonomyMatch 四变体映射为 DictLookup 三态。Deprecated 归 Known（合法历史值，不越界）。
+/// 把 TaxonomyMatch 四变体映射为 DictLookup 三态（映射逻辑见 match_to_dict）。
 async fn lookup_dict(
     db: &crate::db::Database,
     kind: &str,
     trimmed: &str,
     scope_account_id: &str,
 ) -> DictLookup {
-    use crate::agent::taxonomy::{check_value, global_taxonomy_cache, TaxonomyMatch};
+    use crate::agent::taxonomy::{check_value, global_taxonomy_cache};
     let cache = global_taxonomy_cache();
     cache.find_or_load(db).await;
-    match check_value(kind, trimmed, scope_account_id, &cache) {
-        TaxonomyMatch::AliasActive(canonical) => DictLookup::Alias(canonical),
-        TaxonomyMatch::Active | TaxonomyMatch::Deprecated => DictLookup::Known,
-        TaxonomyMatch::CandidateNew => DictLookup::Miss,
-    }
+    match_to_dict(check_value(kind, trimmed, scope_account_id, &cache))
 }
 
 /// DB 薄壳：查 registry + 字典，委托 classify_validation。未知 kind → 直通信任。
@@ -139,6 +147,11 @@ pub(crate) async fn validate_dimension_value(
     let Some(spec) = spec_for(kind) else {
         return DimValidation::Accept(raw.trim().to_string());
     };
+    // 空串短路：与 classify_validation 空串语义一致（都是 DropSilently），
+    // 提前返回省掉 Taxonomy 源的 cache 加载 + 字典查询这趟无谓 IO。
+    if raw.trim().is_empty() {
+        return DimValidation::DropSilently;
+    }
     // 非 Taxonomy 源不查字典（Miss 占位，CodeEnum/FreeText 分支不看 dict）。
     let dict = if matches!(spec.value_source, ValueSource::Taxonomy) {
         lookup_dict(db, kind, raw.trim(), scope_account_id).await
@@ -238,5 +251,20 @@ mod tests {
         let spec = spec_for("customer_stage").unwrap();
         let r = classify_validation(spec, DictLookup::Known, "  ");
         assert!(matches!(r, DimValidation::DropSilently));
+    }
+
+    #[test]
+    fn match_to_dict_maps_all_variants() {
+        use crate::agent::taxonomy::TaxonomyMatch;
+        // 红线核心：Deprecated 是字典登记过的合法历史值 → Known，绝不能降为 Miss。
+        assert_eq!(match_to_dict(TaxonomyMatch::Deprecated), DictLookup::Known);
+        assert_eq!(match_to_dict(TaxonomyMatch::Active), DictLookup::Known);
+        // 仅 CandidateNew（字典真无）才算越界 → Miss。
+        assert_eq!(match_to_dict(TaxonomyMatch::CandidateNew), DictLookup::Miss);
+        // AliasActive 归一到 canonical id。
+        assert_eq!(
+            match_to_dict(TaxonomyMatch::AliasActive("x".to_string())),
+            DictLookup::Alias("x".to_string())
+        );
     }
 }
