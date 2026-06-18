@@ -588,6 +588,20 @@ pub(super) async fn update_custom_agent_instructions(
     Ok(Json(json!({ "item": ApiContact::from(contact) })))
 }
 
+/// admin 写画像维度：把 [`validate_dimension_value`] 的三通道处置映射成写入决策。
+/// `Accept(canonical)` → 写入该值；`DropSilently` → 不写该键（admin 直写通道理论
+/// 不触发 Drop，兜底）；`Reject(reason)` → `400 BadRequest`（越界值不静默落库脏值）。
+fn apply_admin_dim_validation(
+    v: crate::agent::dimension_registry::DimValidation,
+) -> AppResult<Option<String>> {
+    use crate::agent::dimension_registry::DimValidation::*;
+    match v {
+        Accept(s) => Ok(Some(s)),
+        DropSilently => Ok(None),
+        Reject(r) => Err(AppError::BadRequest(r)),
+    }
+}
+
 pub(super) async fn update_operation_profile(
     State(state): State<AppState>,
     Extension(admin): Extension<AuthenticatedAdmin>,
@@ -600,15 +614,15 @@ pub(super) async fn update_operation_profile(
     // 同口径），杜绝同一字段 canonical/alias 漂移污染下游派生。归一在 stage_changed
     // 判定之前，避免"admin 写 alias、库里是 canonical"被误判为变化。
     let new_stage = match normalize_optional(payload.customer_stage) {
-        Some(v) => Some(
-            agent::taxonomy::normalize_dimension_value(
+        Some(v) => apply_admin_dim_validation(
+            crate::agent::dimension_registry::validate_dimension_value(
                 &state.db,
                 "customer_stage",
                 &v,
                 &current.account_id,
             )
             .await,
-        ),
+        )?,
         None => None,
     };
     let prev_stage = current
@@ -629,15 +643,15 @@ pub(super) async fn update_operation_profile(
         "updated_at": DateTime::now(),
     };
     let intent_level = match normalize_optional(payload.intent_level) {
-        Some(v) => Some(
-            agent::taxonomy::normalize_dimension_value(
+        Some(v) => apply_admin_dim_validation(
+            crate::agent::dimension_registry::validate_dimension_value(
                 &state.db,
                 "intent_level",
                 &v,
                 &current.account_id,
             )
             .await,
-        ),
+        )?,
         None => None,
     };
     insert_domain_stage_fields(
@@ -646,17 +660,22 @@ pub(super) async fn update_operation_profile(
         intent_level.as_deref(),
         stage_changed,
     );
-    // §3.7：relationship_type 同口径 alias→canonical 归一后写 domain_attributes（无 stagnation
-    // 计时语义，直接点路径键）。None → 不写键，不覆盖现值。
+    // §3.7：relationship_type 走字典校验后写 domain_attributes（无 stagnation 计时语义，
+    // 直接点路径键）。AdminDirect 通道：越界值 → Reject → 400（不静默落脏值）。
+    // None → 不写键，不覆盖现值；alias 命中由 validate 内部归一到 canonical。
     if let Some(v) = normalize_optional(payload.relationship_type) {
-        let canonical = agent::taxonomy::normalize_dimension_value(
-            &state.db,
-            "relationship_type",
-            &v,
-            &current.account_id,
-        )
-        .await;
-        set_doc.insert("domain_attributes.relationship_type", canonical);
+        let validated = apply_admin_dim_validation(
+            crate::agent::dimension_registry::validate_dimension_value(
+                &state.db,
+                "relationship_type",
+                &v,
+                &current.account_id,
+            )
+            .await,
+        )?;
+        if let Some(canonical) = validated {
+            set_doc.insert("domain_attributes.relationship_type", canonical);
+        }
     }
     state
         .db
@@ -906,4 +925,20 @@ pub(super) async fn get_operation_health(
         &memory,
         latest_review.as_ref(),
     )))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn admin_dim_apply_maps_reject_to_bad_request() {
+        use crate::agent::dimension_registry::DimValidation;
+        let r = apply_admin_dim_validation(DimValidation::Reject("x 越界".into()));
+        assert!(matches!(r, Err(AppError::BadRequest(_))));
+        let ok = apply_admin_dim_validation(DimValidation::Accept("customer".into()));
+        assert!(matches!(ok, Ok(Some(ref v)) if v == "customer"));
+        let drop = apply_admin_dim_validation(DimValidation::DropSilently);
+        assert!(matches!(drop, Ok(None)));
+    }
 }

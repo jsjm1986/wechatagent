@@ -27,7 +27,7 @@ mod budget;
 mod chat_tool_loop;
 mod decision;
 mod decision_taxonomy;
-mod dimension_registry;
+pub(crate) mod dimension_registry;
 pub(crate) mod entitlements;
 pub mod domain;
 pub(crate) mod domain_profile;
