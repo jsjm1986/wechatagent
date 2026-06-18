@@ -220,6 +220,23 @@ async fn normal_transition_uses_customer_stage_over_operation_state() {
         "空知识库 happy path：Reply ×1 + Review ×1 = 2 次 LLM 调用"
     );
 
+    // [诊断] 打印落库后的 contact 关键字段，定位 customer_stage 是否进了 domain_attributes
+    // 以及 operation_state 实际值——区分「容器丢键」vs「C2 派生块本身回落」。
+    {
+        let reloaded = app
+            .state
+            .db
+            .contacts()
+            .find_one(doc! { "_id": contact.id }, None)
+            .await
+            .expect("query")
+            .expect("contact");
+        eprintln!(
+            "[C2诊断] operation_state={:?} domain_attributes={:?} tags={:?}",
+            reloaded.operation_state, reloaded.domain_attributes, reloaded.tags
+        );
+    }
+
     // 合法迁移写入 + customer_stage 优先：取 relationship_building 而非 need_discovery。
     assert_eq!(
         reload_operation_state(&app, &contact).await.as_deref(),
