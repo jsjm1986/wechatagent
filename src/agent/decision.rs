@@ -420,47 +420,15 @@ pub(crate) async fn decide_reply_with_promote(
         contact.locale.as_deref(),
     )
     .await?;
-    // universal-domain-adaptation H15（3A-1c-3）：经营公式单一真相源。policy 不再内联
-    // 写死「关系经营公式（自检）」段——运行时先剥离任何遗留段（旧库自愈），再注入由
-    // active profile 渲染的公式段。DEFAULT_PROFILE seed 四公式 → 注入段与旧库内联段
-    // 逐字相同（往返等价护栏 strip_then_inject_default_roundtrips_to_original_section）。
-    // 换行业 profile 声明本行业公式即在此处生效。
-    let policy = {
-        let (stripped, _) =
-            super::domain_profile::strip_legacy_formula_self_check_section(&policy);
-        let formula_section =
-            super::domain_profile::build_policy_formula_section(&active_profile.business_formulas);
-        format!("{}\n\n{}", stripped.trim_end_matches('\n'), formula_section)
-    };
-    // universal-domain-adaptation H9（第 20 点）：对话模式判定规则单一真相源。active
-    // profile 声明 conversation_mode_policy 时，剥离 policy 写死销售世界观的「## 对话
-    // 模式判定」段并注入本行业规则；DEFAULT_PROFILE / 老库为 None → 原样返回、销售判定
-    // 段逐字保留、销售域零变化。**红线**：下文「## 模式与 5 闸的关系」段（含
-    // boundary_protection 不放宽边界保护硬规则）不在剥离范围、任何行业都继续写死守护。
-    let policy = super::domain_profile::apply_conversation_mode_policy(
-        &policy,
-        active_profile.conversation_mode_policy.as_deref(),
-    );
-    // universal-domain-adaptation A/T2：紧接 conversation_mode_policy 之后注入本行业
-    // 「## 模式与 5 闸的关系」模式-闸说明。active profile 声明 mode_gate_policy_override
-    // 时，把 policy 里写死销售四模式-闸取向的 DEFAULT_MODE_GATE_POLICY 段整体替换成本域
-    // 说明；DEFAULT / 老库为 None → 原样返回、销售取向逐字保留、销售域字节等价。
-    // **红线**：销售锚**不含** boundary_protection 不放宽边界保护硬规则续行（那是跨域
-    // 恒定红线，由下文 user.reply.policy 继续写死守护），故本替换不会动到边界保护红线。
-    let policy = super::domain_profile::apply_mode_gate_policy(
-        &policy,
-        active_profile.mode_gate_policy_override.as_deref(),
-    );
-    // universal-domain-adaptation H9 修复（问题 A）：policy「## 决策协议字段」段写死的
-    // conversationMode 四模式枚举列表替换为 active profile 声明的模式集合，与下游
-    // validate_and_promote 的 runtime.allowed_conversation_modes 校验集合对齐，消除
-    // 「prompt 说选销售四模式、校验却按本行业模式集」的矛盾指令（否则非销售域 LLM 漂移
-    // 触发 invalid_enum_value 硬协议违规 → reply 被硬 block）。DEFAULT/老库（空或默认
-    // 四模式）→ 旧串==新串、不替换、字节等价。
-    let policy = super::domain_profile::apply_conversation_mode_enum_list(
-        &policy,
-        &active_profile.conversation_modes,
-    );
+    // universal-domain-adaptation：reply.policy 链的全部 **prompt 类 profile override**
+    // 收敛到 domain_profile.rs 的单一注入点 `apply_reply_policy_prompt_overrides`（C3 轻量
+    // 约定）。它按固定顺序串起：①经营公式段单一真相源（H15，剥离遗留内联段→注入 active
+    // profile 公式段）②对话模式判定段（H9）③模式与 5 闸关系段（A/T2）④conversationMode
+    // 枚举列表（H9 修复 A，对齐 runtime 校验集合）。DEFAULT_PROFILE / 老库 → 每步原样 →
+    // prompt 字节等价、销售域零变化（往返/字节等价护栏见 domain_profile.rs `#[cfg(test)]`）。
+    // **红线**：boundary_protection 不放宽边界保护硬规则段不在任何替换范围、任何行业写死守护。
+    // 新增 reply.policy 类 prompt override 字段时，加进那个 helper（勿在此散接）——见 helper 文档。
+    let policy = super::domain_profile::apply_reply_policy_prompt_overrides(&policy, &active_profile);
     let (task_template, _task_version) = prompts::load_prompt_for_contact(
         &state.db,
         &state.config.default_workspace_id,

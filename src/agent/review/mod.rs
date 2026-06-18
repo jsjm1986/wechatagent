@@ -293,24 +293,15 @@ pub(crate) async fn review_decision(
         &contact.workspace_id,
     )
     .await;
-    // universal-domain-adaptation D：reviewer system prompt 的「评审重点：…」取向行按 active
-    // profile 的 reviewer_orientation.review_focus 渲染。None（DEFAULT/老库）→ 字节等价。
-    let system = crate::agent::domain_profile::apply_reviewer_review_focus(
+    // universal-domain-adaptation：review.system 链的全部 **prompt 类 profile override**
+    // 收敛到 domain_profile.rs 的单一注入点 `apply_review_system_prompt_overrides`（C3 轻量
+    // 约定）。它按固定顺序串起：①评审重点取向行（D）②软闸打分锚点 few-shot 段（T3）。
+    // None（DEFAULT / 老库 reviewer_orientation=None）→ 每步原样 → system prompt 字节等价。
+    // 注意 reviewer **user** prompt 的 balance_principle 注入的是另一份 prompt，不在本 helper。
+    // 新增 review.system 类 prompt override 字段时，加进那个 helper（勿在此散接）——见 helper 文档。
+    let system = crate::agent::domain_profile::apply_review_system_prompt_overrides(
         &system,
-        active_profile
-            .reviewer_orientation
-            .as_ref()
-            .and_then(|o| o.review_focus.as_deref()),
-    );
-    // universal-domain-adaptation T3：reviewer system prompt 的「软闸打分锚点（few-shot）」段按
-    // active profile 的 reviewer_orientation.reviewer_fewshot_override 渲染。None（DEFAULT/老库）
-    // → 字节等价（销售逼单高压锚保留）。
-    let system = crate::agent::domain_profile::apply_reviewer_fewshot(
-        &system,
-        active_profile
-            .reviewer_orientation
-            .as_ref()
-            .and_then(|o| o.reviewer_fewshot_override.as_deref()),
+        &active_profile,
     );
     let runtime_text = serde_json::to_string(&runtime.as_document()).unwrap_or_default();
     let memory_card_text = serde_json::to_string(context_pack).unwrap_or_default();

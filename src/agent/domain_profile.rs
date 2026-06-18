@@ -557,6 +557,91 @@ pub fn apply_mode_gate_policy(system: &str, override_text: Option<&str>) -> Stri
     system.replace(crate::prompts::DEFAULT_MODE_GATE_POLICY, policy)
 }
 
+// =====================================================================================
+// === prompt 类 profile override 注入点约定（C3 轻量）================================
+// =====================================================================================
+//
+// 「prompt 类 override」= 改 prompt **文本**的 profile 字段（区别于只改 runtime 标量阈值
+// 的 `apply_active_profile`，runtime.rs:261）。它们各自是一个 `apply_*` 纯函数，共同遵守
+// **同一约定**：
+//
+//   * 入参 `Option<&str>`/空集 → **原样返回**（DEFAULT_PROFILE / 老库 → prompt 字节等价、
+//     销售域零变化，反过拟合硬护栏）；
+//   * `Some(非空)` 且 != 销售锚 → 在目标 prompt 里做**精确子串替换**（替换写死的 DEFAULT_*
+//     锚常量）；锚找不到（prompt 被运营改写过）→ 原样返回不强插，避免污染；
+//   * **幂等**、空覆盖即 no-op。
+//
+// 这些 `apply_*` 分属**两条互不相交的 prompt 组装链**，**刻意不合并**（不同 prompt、喂不同
+// agent，合一会牺牲清晰度）。每条链的全部 prompt override 在下面**各收敛到一个** helper，
+// 作为「该接哪、按什么顺序接」的**单一文档化落点**：
+//
+//   1. reply.policy 链（decision.rs，喂 Reply Agent）→ [`apply_reply_policy_prompt_overrides`]
+//   2. review.system 链（review/mod.rs，喂 Independent Review Agent）→
+//      [`apply_review_system_prompt_overrides`]
+//
+// **新增一个 prompt 类 override 字段的标准动作**：
+//   (1) 在 `models.rs` 的 `DomainProfile`（或 `ReviewerOrientation` 等子结构）加字段；
+//   (2) 在本模块加 `DEFAULT_*` 锚常量（**逐字复刻**对应 prompt 里那段写死文本），并照现有
+//       `apply_*` 写一个新的 `apply_xxx`（None/空→原样、Some→替换锚、幂等）；
+//   (3) 在**对应那条链的收敛 helper**里按正确顺序追加一行 `s = apply_xxx(&s, ...)`
+//       （reply.policy 加进 `apply_reply_policy_prompt_overrides`，review.system 加进
+//       `apply_review_system_prompt_overrides`）——**不要**回到 decision.rs/review.rs 里散接；
+//   (4) 加锚护栏测试：DEFAULT profile 下收敛 helper 输出 == 原 prompt（字节等价），及 Some
+//       覆盖生效。
+//
+// 收敛 helper 只是把同链各 `apply_*` 串起来，**逐字等价**于收敛前 decision.rs/review.rs 里
+// 的串行调用（见 `*_prompt_overrides_default_is_byte_identical` 测试守恒）。
+
+/// reply.policy 链的 prompt 类 override 单一注入点（喂 Reply Agent，decision.rs 调用）。
+///
+/// 顺序与收敛前 decision.rs 的串行调用逐字一致：
+/// 1. 公式段：剥离遗留「关系经营公式（自检）」段 → 注入 active profile 公式段（H15）；
+/// 2. [`apply_conversation_mode_policy`]：替换「## 对话模式判定」段（H9）；
+/// 3. [`apply_mode_gate_policy`]：替换「## 模式与 5 闸的关系」段（A/T2）；
+/// 4. [`apply_conversation_mode_enum_list`]：替换 conversationMode 枚举列表（H9 修复 A）。
+///
+/// **红线**：boundary_protection 不放宽边界保护硬规则段不在任何替换范围内、任何行业都写死守护。
+/// DEFAULT_PROFILE / 老库 → 每步原样 → 整体 prompt 字节等价、销售域零变化。
+pub fn apply_reply_policy_prompt_overrides(policy: &str, profile: &DomainProfile) -> String {
+    // 1. 经营公式单一真相源（H15）：先剥离遗留内联段（旧库自愈），再注入 profile 公式段。
+    let policy = {
+        let (stripped, _) = strip_legacy_formula_self_check_section(policy);
+        let formula_section = build_policy_formula_section(&profile.business_formulas);
+        format!("{}\n\n{}", stripped.trim_end_matches('\n'), formula_section)
+    };
+    // 2. 对话模式判定段（H9）。
+    let policy =
+        apply_conversation_mode_policy(&policy, profile.conversation_mode_policy.as_deref());
+    // 3. 模式与 5 闸的关系段（A/T2）。
+    let policy = apply_mode_gate_policy(&policy, profile.mode_gate_policy_override.as_deref());
+    // 4. conversationMode 枚举列表（H9 修复 A）。
+    apply_conversation_mode_enum_list(&policy, &profile.conversation_modes)
+}
+
+/// review.system 链的 prompt 类 override 单一注入点（喂 Independent Review Agent，
+/// review/mod.rs 调用）。
+///
+/// 顺序与收敛前 review/mod.rs 的串行调用逐字一致：
+/// 1. [`apply_reviewer_review_focus`]：替换「评审重点：…」取向行（D）；
+/// 2. [`apply_reviewer_fewshot`]：替换「软闸打分锚点（few-shot）」段（T3）。
+///
+/// 注意：reviewer **user** prompt 的 `balance_principle`（[`apply_reviewer_balance_principle`]）
+/// 不在本 helper——它注入的是另一份 prompt（review user，非 system），属另一注入点。
+/// DEFAULT_PROFILE / 老库（`reviewer_orientation = None`）→ 每步原样 → system prompt 字节等价。
+pub fn apply_review_system_prompt_overrides(system: &str, profile: &DomainProfile) -> String {
+    let orientation = profile.reviewer_orientation.as_ref();
+    // 1. 评审重点取向行（D）。
+    let system = apply_reviewer_review_focus(
+        system,
+        orientation.and_then(|o| o.review_focus.as_deref()),
+    );
+    // 2. 软闸打分锚点 few-shot 段（T3）。
+    apply_reviewer_fewshot(
+        &system,
+        orientation.and_then(|o| o.reviewer_fewshot_override.as_deref()),
+    )
+}
+
 /// universal-domain-adaptation I：completeness `answeringMode` 三档的写死销售释义
 /// （喂 LLM 的「判断规则」段，逐字复刻 catalog.rs 原文）。三档 key 是域无关认知阶梯，
 /// 恒定；释义可被 `AnsweringModeProfile` 按行业覆盖。
@@ -1941,6 +2026,72 @@ mod tests {
         assert_eq!(apply_reviewer_review_focus(SAMPLE_REVIEW_SYSTEM, None), SAMPLE_REVIEW_SYSTEM);
         let user_out = apply_reviewer_balance_principle(SAMPLE_REVIEW_USER, Some("关系平衡：真诚靠近、不制造依赖。"));
         assert!(user_out.contains("关系平衡："));
+    }
+
+    // ── C3：prompt 类 override 收敛 helper 与收敛前串行调用字节等价 ──
+
+    /// reply.policy 收敛 helper 的输出 == 收敛前 decision.rs 里逐行串行调用，对**任意** profile
+    /// 字节等价（守恒：收敛不改行为）。这里用 DEFAULT_PROFILE，对齐「销售域零变化」红线。
+    #[test]
+    fn apply_reply_policy_prompt_overrides_default_is_byte_identical_to_serial() {
+        let profile = default_domain_profile("ws-1");
+        // 取一段含公式锚 + 模式判定段的真实 policy 形态。
+        let policy = SAMPLE_POLICY;
+        // 收敛 helper。
+        let via_helper = apply_reply_policy_prompt_overrides(policy, &profile);
+        // 收敛前 decision.rs 的等价串行调用（逐行复刻）。
+        let via_serial = {
+            let p = {
+                let (stripped, _) = strip_legacy_formula_self_check_section(policy);
+                let section = build_policy_formula_section(&profile.business_formulas);
+                format!("{}\n\n{}", stripped.trim_end_matches('\n'), section)
+            };
+            let p = apply_conversation_mode_policy(&p, profile.conversation_mode_policy.as_deref());
+            let p = apply_mode_gate_policy(&p, profile.mode_gate_policy_override.as_deref());
+            apply_conversation_mode_enum_list(&p, &profile.conversation_modes)
+        };
+        assert_eq!(via_helper, via_serial);
+    }
+
+    /// review.system 收敛 helper 的输出 == 收敛前 review/mod.rs 里逐行串行调用，字节等价。
+    /// DEFAULT_PROFILE 的 `reviewer_orientation = None` → 每步原样 → system prompt 不变。
+    #[test]
+    fn apply_review_system_prompt_overrides_default_is_byte_identical_to_serial() {
+        let profile = default_domain_profile("ws-1");
+        let system = SAMPLE_REVIEW_SYSTEM;
+        let via_helper = apply_review_system_prompt_overrides(system, &profile);
+        let via_serial = {
+            let o = profile.reviewer_orientation.as_ref();
+            let s = apply_reviewer_review_focus(system, o.and_then(|x| x.review_focus.as_deref()));
+            apply_reviewer_fewshot(&s, o.and_then(|x| x.reviewer_fewshot_override.as_deref()))
+        };
+        assert_eq!(via_helper, via_serial);
+        // DEFAULT reviewer_orientation=None → system prompt 字节等价（销售域零变化）。
+        assert_eq!(via_helper, system);
+    }
+
+    /// 收敛 helper 仍让每个 prompt 类 override 生效（防「收敛后漏接某字段」回归）。
+    #[test]
+    fn prompt_overrides_apply_via_central_convention() {
+        // reply.policy 链：覆盖 mode_gate_policy_override，注入文本必须出现在结果里。
+        let mut profile = default_domain_profile("ws-1");
+        profile.mode_gate_policy_override = Some("本域模式-闸说明 MGP_MARKER".to_string());
+        let policy = format!("前\n{}\n后", crate::prompts::DEFAULT_MODE_GATE_POLICY);
+        let out = apply_reply_policy_prompt_overrides(&policy, &profile);
+        assert!(out.contains("MGP_MARKER"));
+        assert!(!out.contains(crate::prompts::DEFAULT_MODE_GATE_POLICY));
+
+        // review.system 链：覆盖 reviewer_fewshot_override，注入文本必须出现在结果里。
+        let mut profile2 = default_domain_profile("ws-2");
+        profile2.reviewer_orientation = Some(crate::models::ReviewerOrientation {
+            review_focus: None,
+            balance_principle: None,
+            reviewer_fewshot_override: Some("FEWSHOT_MARKER".to_string()),
+        });
+        let system = format!("前\n{}\n后", crate::prompts::DEFAULT_REVIEWER_FEWSHOT);
+        let out2 = apply_review_system_prompt_overrides(&system, &profile2);
+        assert!(out2.contains("FEWSHOT_MARKER"));
+        assert!(!out2.contains(crate::prompts::DEFAULT_REVIEWER_FEWSHOT));
     }
 
     // ── I：answeringMode 三档释义/标签随 profile 渲染 ──
