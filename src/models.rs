@@ -1497,6 +1497,13 @@ pub struct DomainProfile {
     /// 「AI 永不自断成交 / 永不自动 verify」结构红线。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reviewer_orientation: Option<ReviewerOrientation>,
+    /// universal-domain-adaptation A/T1：decision/policy prompt「## 模式与 5 闸的关系」
+    /// 模式-闸说明段的本行业覆盖。`None`（DEFAULT/老库）→ 回落写死销售模式-闸说明
+    /// （prompt 字节等价）；`Some` 时 `apply_mode_gate_policy` 以
+    /// `DEFAULT_MODE_GATE_POLICY` 为锚整段替换成本域说明。只替换模式-闸尺度散文，
+    /// **不动** boundary_protection 红线续行（跨域恒定 no-human-takeover 红线）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode_gate_policy_override: Option<String>,
     /// universal-domain-adaptation I：completeness `answeringMode` 三档**释义/标签**覆盖。
     /// 三个档位 key（relationship_only / product_safe / fully_supported）是**域无关的
     /// 认知阶梯**（无 / 部分 / 完全 verified 支撑），被 `clamp_answering_mode`「永不自动
