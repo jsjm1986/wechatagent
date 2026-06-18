@@ -231,9 +231,27 @@ async fn normal_transition_uses_customer_stage_over_operation_state() {
             .await
             .expect("query")
             .expect("contact");
+        // [诊断2] gateway 用 load_active_domain_profile 读 active profile 决定 declared_dims；
+        // 若它返回的不是 DEFAULT（不声明 customer_stage participates），retain 会剔除
+        // customer_stage。这里复刻同一读法，打印 profile_id + 声明维度，定位真因。
+        let active = wechatagent::agent::load_active_domain_profile(
+            &app.state.db,
+            &contact.workspace_id,
+        )
+        .await;
+        let declared: Vec<&str> = active
+            .profile_dimensions
+            .iter()
+            .filter(|d| d.participates_in_decision)
+            .map(|d| d.kind.as_str())
+            .collect();
         eprintln!(
             "[C2诊断] operation_state={:?} domain_attributes={:?} tags={:?}",
             reloaded.operation_state, reloaded.domain_attributes, reloaded.tags
+        );
+        eprintln!(
+            "[C2诊断2] active_profile_id={:?} transaction_facts={} declared_dims={:?}",
+            active.profile_id, active.transaction_facts_enabled, declared
         );
     }
 
