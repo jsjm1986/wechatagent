@@ -365,6 +365,14 @@ pub(crate) const G1_PURCHASED: &str = "purchased";
 pub(crate) const G1_AFTERCARE: &str = "aftercare";
 pub(crate) const G1_REPURCHASE: &str = "repurchase";
 
+/// G6 价值分层维度 kind + 三档 canonical 取值（与 m023 seed 的 value.id 逐字一致）。
+/// value_tier 是**客观计算派生值**（累计成交额规则算），不经 LLM domain_signals 通道——
+/// gateway 写侧直接 set domain_attributes.value_tier，与 G1（LLM 推断 + 客观锚纠偏）不同。
+pub(crate) const VALUE_TIER_KIND: &str = "value_tier";
+pub(crate) const VALUE_TIER_HIGH: &str = "high";
+pub(crate) const VALUE_TIER_MID: &str = "mid";
+pub(crate) const VALUE_TIER_LOW: &str = "low";
+
 /// spec §6：复用 C2「客观事实约束主观标签」模式，把 G4 持有投影当 G1 的客观锚。
 ///
 /// G1 是 LLM 从聊天推断的「购买生命周期」维度（profile dimension）；G4 是从已核实
@@ -438,6 +446,50 @@ pub(crate) fn confirmed_deal_timestamps(outcome_events: &[OutcomeEvent]) -> Vec<
         .collect();
     times.sort_by_key(|t| t.timestamp_millis());
     times
+}
+
+/// G6 客户累计价值（LTV）：已核实正向成交 `amount` 之和 - reversal 之和（单币种 CNY，分）。
+///
+/// **红线守点（§2.1）**：复用 [`verification_drives_entitlement`] 闭集——只有
+/// `staff_confirmed` / `payment_verified` 计入，`conversation_inferred`（AI 疑似成交）排除。
+///
+/// 单币种假设（用户拍板 RMB）：只累加 `currency==CNY`（或未设 currency 视为默认 CNY）的
+/// 金额，非 CNY 成交跳过（多币种归一留后续增强）。`amount` 缺失的成交跳过（无金额事件不计）。
+/// reversal（退款/撤单）按反向扣减；超额退款用 `.max(0)` clamp，不出现负价值。
+///
+/// **零扰动**：空 outcome_events / 无已核实成交（情感陪伴域无产品）→ 0。
+pub(crate) fn compute_customer_value_cents(outcome_events: &[OutcomeEvent]) -> i64 {
+    outcome_events
+        .iter()
+        .filter(|ev| verification_drives_entitlement(&ev.verification))
+        .filter(|ev| ev.currency.as_deref().map_or(true, |c| c == "CNY"))
+        .filter_map(|ev| {
+            ev.amount
+                .map(|a| if ev.event_kind == "reversal" { -a } else { a })
+        })
+        .sum::<i64>()
+        .max(0)
+}
+
+/// G6 累计成交额分层：`>= high_threshold` → `high`；`>= mid_threshold` → `mid`；否则 `low`。
+/// 零成交（value==0）→ `low`（与未购买一致，不单列）。canonical 取值与 m023 seed 一致。
+///
+/// 自我保护：若运维误配 `mid > high`，用 min/max 归一（high 门槛恒 ≥ mid 门槛），避免
+/// `>=high` 先判吞掉整个 mid 档（误配时 mid 档静默失效）。正常配置 min/max 是恒等变换。
+pub(crate) fn classify_value_tier(
+    value_cents: i64,
+    mid_threshold: i64,
+    high_threshold: i64,
+) -> &'static str {
+    let lo = mid_threshold.min(high_threshold);
+    let hi = mid_threshold.max(high_threshold);
+    if value_cents >= hi {
+        VALUE_TIER_HIGH
+    } else if value_cents >= lo {
+        VALUE_TIER_MID
+    } else {
+        VALUE_TIER_LOW
+    }
 }
 
 #[cfg(test)]
@@ -1090,6 +1142,100 @@ mod tests {
             .map(|t| t.timestamp_millis())
             .collect();
         assert_eq!(ms, vec![100, 200, 300], "时刻升序");
+    }
+
+    // ── G6 价值分层：compute_customer_value_cents + classify_value_tier ──
+
+    /// 构造带指定金额/币种/事件类型的成交事件（compute_customer_value 测试用）。
+    fn ev_money(
+        verification: &str,
+        amount: Option<i64>,
+        currency: Option<&str>,
+        event_kind: &str,
+    ) -> OutcomeEvent {
+        OutcomeEvent {
+            marked_at: DateTime::from_millis(0),
+            occurred_at: Some(DateTime::from_millis(0)),
+            amount,
+            currency: currency.map(ToString::to_string),
+            source: "manual".to_string(),
+            marked_by: "admin".to_string(),
+            note: None,
+            verification: verification.to_string(),
+            product_ref: None,
+            event_kind: event_kind.to_string(),
+        }
+    }
+
+    #[test]
+    fn customer_value_sums_confirmed_deals_minus_reversals() {
+        let events = vec![
+            ev_money("staff_confirmed", Some(30000), Some("CNY"), "deal"),
+            ev_money("payment_verified", Some(20000), Some("CNY"), "deal"),
+            ev_money("staff_confirmed", Some(10000), Some("CNY"), "reversal"),
+        ];
+        // 30000 + 20000 - 10000 = 40000
+        assert_eq!(compute_customer_value_cents(&events), 40000);
+    }
+
+    #[test]
+    fn customer_value_excludes_conversation_inferred() {
+        let events = vec![
+            ev_money("staff_confirmed", Some(30000), Some("CNY"), "deal"),
+            // conversation_inferred 是 AI 疑似成交，§2.1 红线排除，不计入 LTV。
+            ev_money("conversation_inferred", Some(99999), Some("CNY"), "deal"),
+        ];
+        assert_eq!(compute_customer_value_cents(&events), 30000);
+    }
+
+    #[test]
+    fn customer_value_skips_non_cny_and_missing_amount() {
+        let events = vec![
+            ev_money("staff_confirmed", Some(30000), Some("CNY"), "deal"),
+            // 非 CNY 单币种假设跳过。
+            ev_money("staff_confirmed", Some(50000), Some("USD"), "deal"),
+            // amount 缺失跳过。
+            ev_money("staff_confirmed", None, Some("CNY"), "deal"),
+            // 未设 currency 视为默认 CNY，计入。
+            ev_money("staff_confirmed", Some(5000), None, "deal"),
+        ];
+        assert_eq!(compute_customer_value_cents(&events), 35000);
+    }
+
+    #[test]
+    fn customer_value_clamps_overrefund_to_zero() {
+        let events = vec![
+            ev_money("staff_confirmed", Some(10000), Some("CNY"), "deal"),
+            ev_money("staff_confirmed", Some(30000), Some("CNY"), "reversal"),
+        ];
+        // 10000 - 30000 = -20000 → clamp 0（不出现负价值）。
+        assert_eq!(compute_customer_value_cents(&events), 0);
+    }
+
+    #[test]
+    fn customer_value_empty_is_zero() {
+        assert_eq!(compute_customer_value_cents(&[]), 0);
+    }
+
+    #[test]
+    fn classify_value_tier_boundaries() {
+        let (mid, high) = (50000_i64, 300000_i64);
+        // 边界：< mid → low；== mid → mid；mid<v<high → mid；== high → high；> high → high。
+        assert_eq!(classify_value_tier(0, mid, high), VALUE_TIER_LOW);
+        assert_eq!(classify_value_tier(49999, mid, high), VALUE_TIER_LOW);
+        assert_eq!(classify_value_tier(50000, mid, high), VALUE_TIER_MID);
+        assert_eq!(classify_value_tier(299999, mid, high), VALUE_TIER_MID);
+        assert_eq!(classify_value_tier(300000, mid, high), VALUE_TIER_HIGH);
+        assert_eq!(classify_value_tier(500000, mid, high), VALUE_TIER_HIGH);
+    }
+
+    /// 误配防护：mid > high（运维配反）时用 min/max 归一，mid 档仍可达、不被静默吞掉。
+    #[test]
+    fn classify_value_tier_handles_misconfigured_thresholds() {
+        // 配反：mid=400000 > high=300000。归一后 lo=300000, hi=400000。
+        assert_eq!(classify_value_tier(250000, 400000, 300000), VALUE_TIER_LOW);
+        assert_eq!(classify_value_tier(350000, 400000, 300000), VALUE_TIER_MID, "mid 档仍可达，未被吞");
+        assert_eq!(classify_value_tier(450000, 400000, 300000), VALUE_TIER_HIGH);
     }
 }
 

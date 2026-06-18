@@ -38,6 +38,14 @@ fn contact_intent_level(contact: &Contact) -> Option<String> {
         .and_then(|d| d.get_str("intent_level").ok().map(|s| s.to_string()))
 }
 
+/// G6：读 contact 的客观价值层级（gateway 规则算出后写 domain_attributes.value_tier）。
+fn contact_value_tier(contact: &Contact) -> Option<String> {
+    contact
+        .domain_attributes
+        .as_ref()
+        .and_then(|d| d.get_str("value_tier").ok().map(|s| s.to_string()))
+}
+
 fn contact_customer_stage_updated_at(contact: &Contact) -> Option<DateTime> {
     contact
         .domain_attributes
@@ -1068,43 +1076,61 @@ pub(crate) fn intent_level_weight(level: Option<&str>) -> i32 {
     }
 }
 
+/// G6 `value_tier` 权重：高价值客户在 daily cap 竞争中优先 emit。取值来自 m023 种子
+/// （high / mid / low）。无 tier（存量 contact / 非交易域）→ 10（最低），与无 intent 同档，
+/// 不改变现有相对排序（零扰动）。
+pub(crate) fn value_tier_weight(tier: Option<&str>) -> i32 {
+    match tier {
+        Some("high") => 80,
+        Some("mid") => 50,
+        Some("low") => 20,
+        _ => 10,
+    }
+}
+
 /// commitment 段排序键。返回的元组按 **升序** 排序时，**值越小越优先 emit**。
 ///
 /// 序：
 /// 1. reason 紧迫度：`Overdue=0` < `Imminent=1`（overdue 先于 imminent）；
 /// 2. 客户阶段权重：使用 `-stage_priority_weight`（数值越大→越靠前）；
-/// 3. `intent_level` 权重：`-intent_level_weight`（hot/warm 优先于 cold）；
-/// 4. due_at 早先：`due_at` 毫秒时间戳直接升序（更早 due 越优先）。
+/// 3. G6 价值层权重：`-value_tier_weight`（高价值客户优先；插在 stage 之后、intent 之前，
+///    不盖过漏斗阶段紧迫度。存量无 tier → 同权重，不改原有 stage/intent/due 决胜）；
+/// 4. `intent_level` 权重：`-intent_level_weight`（hot/warm 优先于 cold）；
+/// 5. due_at 早先：`due_at` 毫秒时间戳直接升序（更早 due 越优先）。
 pub(crate) fn commitment_priority_key(
     contact: &Contact,
     target: &CommitmentEmitTarget,
     config: &PlannerStageConfig,
-) -> (i32, i32, i32, i64) {
+) -> (i32, i32, i32, i32, i64) {
     let reason_ord = match target.reason {
         CommitmentReason::Overdue => 0,
         CommitmentReason::Imminent => 1,
     };
     let stage_w = -config.stage_weight(contact_customer_stage(contact).as_deref());
+    let value_w = -value_tier_weight(contact_value_tier(contact).as_deref());
     let intent_w = -config.intent_weight(contact_intent_level(contact).as_deref());
-    (reason_ord, stage_w, intent_w, target.due_at.timestamp_millis())
+    (reason_ord, stage_w, value_w, intent_w, target.due_at.timestamp_millis())
 }
 
 /// stage_stagnation 段排序键。返回的元组按 **升序** 排序时，**值越小越优先 emit**。
 ///
 /// 序：
 /// 1. 客户阶段权重：`-stage_priority_weight`（高价值阶段优先）；
-/// 2. 停滞时长：`-(now_ms - stage_updated_at)`（停滞越久越优先）。
+/// 2. G6 价值层权重：`-value_tier_weight`（高价值客户优先；插在 stage 之后，存量无 tier
+///    → 同权重不改原有决胜）；
+/// 3. 停滞时长：`-(now_ms - stage_updated_at)`（停滞越久越优先）。
 pub(crate) fn stage_stagnation_priority_key(
     contact: &Contact,
     now_ms: i64,
     config: &PlannerStageConfig,
-) -> (i32, i64) {
+) -> (i32, i32, i64) {
     let stage_w = -config.stage_weight(contact_customer_stage(contact).as_deref());
+    let value_w = -value_tier_weight(contact_value_tier(contact).as_deref());
     let stagnation_ms = match contact_stagnation_updated_at(contact, &config.stagnation_dimension) {
         Some(ts) => now_ms.saturating_sub(ts.timestamp_millis()),
         None => 0,
     };
-    (stage_w, -stagnation_ms)
+    (stage_w, value_w, -stagnation_ms)
 }
 
 // ---------------------------------------------------------------------------
@@ -2688,6 +2714,65 @@ mod tests {
         assert_eq!(intent_level_weight(Some("medium")), 50);
         assert_eq!(intent_level_weight(Some("low")), 20);
         assert_eq!(intent_level_weight(Some("nonsense")), 10);
+    }
+
+    /// G6 value_tier_weight：覆盖默认分支 + 三档（high/mid/low）。无 tier → 10（最低）。
+    #[test]
+    fn value_tier_weight_fallback() {
+        assert_eq!(value_tier_weight(None), 10);
+        assert_eq!(value_tier_weight(Some("high")), 80);
+        assert_eq!(value_tier_weight(Some("mid")), 50);
+        assert_eq!(value_tier_weight(Some("low")), 20);
+        assert_eq!(value_tier_weight(Some("nonsense")), 10);
+    }
+
+    /// G6 contact_value_tier：从 domain_attributes 读 value_tier；无则 None。
+    #[test]
+    fn contact_value_tier_reads_domain_attr() {
+        let mut c = template();
+        assert_eq!(contact_value_tier(&c), None, "无 domain_attributes → None");
+        let mut d = Document::new();
+        d.insert("value_tier", "high");
+        c.domain_attributes = Some(d);
+        assert_eq!(contact_value_tier(&c).as_deref(), Some("high"));
+    }
+
+    /// G6：同 stage（权重相同）时，高 value_tier 客户在 stage_stagnation 段排序更优先。
+    /// 验证 value_tier_weight 作为新排序维度生效，且插在 stage_w 之后（不盖过 stage）。
+    #[test]
+    fn stage_stagnation_priority_higher_value_tier_first() {
+        let mut high = template();
+        let mut hd = attrs_with_stage_updated("need_discovery", 0);
+        hd.insert("value_tier", "high");
+        high.domain_attributes = Some(hd);
+        let mut low = template();
+        let mut ld = attrs_with_stage_updated("need_discovery", 0);
+        ld.insert("value_tier", "low");
+        low.domain_attributes = Some(ld);
+        let cfg = PlannerStageConfig::default();
+        // 同 stage、同停滞时长 → 价值层决胜：high 的 key 更小（-80 < -20）→ 更优先。
+        assert!(
+            stage_stagnation_priority_key(&high, 1_000, &cfg)
+                < stage_stagnation_priority_key(&low, 1_000, &cfg),
+            "高价值客户应排在低价值前"
+        );
+    }
+
+    /// G6 零扰动：两个都无 value_tier 的 contact（仅 stage 不同）排序不受新维度影响——
+    /// value_w 相等（都 -10），由 stage_w 决胜（与改造前一致）。
+    #[test]
+    fn stage_stagnation_no_value_tier_preserves_stage_order() {
+        let mut high_stage = template();
+        high_stage.domain_attributes = Some(attrs_with_stage_updated("commitment_followup", 0));
+        let mut low_stage = template();
+        low_stage.domain_attributes = Some(attrs_with_stage_updated("new_contact", 0));
+        let cfg = PlannerStageConfig::default();
+        // 无 value_tier → value_w 相等 → stage_w 决胜：commitment_followup(100) > new_contact(20)。
+        assert!(
+            stage_stagnation_priority_key(&high_stage, 1_000, &cfg)
+                < stage_stagnation_priority_key(&low_stage, 1_000, &cfg),
+            "无 value_tier 时仍按 stage 权重排序（零扰动）"
+        );
     }
 
     /// 1C 等价护栏：空 config（PlannerStageConfig::default）的 stage_weight /
