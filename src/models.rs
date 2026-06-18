@@ -2437,6 +2437,7 @@ pub struct RelationshipTypeSuggestion {
     pub contact_id: String,
     /// canonical 关系类型：`"customer"` | `"peer"` | `"friend"`。
     pub suggested_value: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub evidence: Option<String>,
     #[serde(default)]
     pub confidence: i32,
@@ -2446,7 +2447,9 @@ pub struct RelationshipTypeSuggestion {
     pub occurrences: i32,
     pub first_seen_at: DateTime,
     pub last_seen_at: DateTime,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reviewed_at: Option<DateTime>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reviewed_by: Option<String>,
 }
 
