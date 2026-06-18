@@ -312,6 +312,38 @@ pub(crate) fn render_suspected_deal_guidance(active_products: &[Product]) -> Str
         .to_string()
 }
 
+/// 数字分身 T7：关系性质（relationship_type）建议的 agent 侧落点指引（运行时追加进
+/// task prompt 末尾）。引导 LLM 在嗅到「对方关系性质的明确新证据」时，往
+/// `agentGeneratedSignals` 追加一条 `kind=relationship_type` 弱信号——经 T6 提取 + 字典
+/// 校验后 upsert 进建议 collection，**须运营审核才回写 contact**（不直接生效）。
+///
+/// **与 T6 提取契约对齐**：kind 逐字 `relationship_type`，字段 `value`/`evidence`/
+/// `confidence`（见 `gateway::extract_relationship_type_suggestion`）。`value` 取本账号
+/// `relationship_type` 字典的 canonical id（当前 seed：customer/peer/friend，m024）。
+///
+/// **反过拟合**：引导基于「关系性质新证据」这个通用方法论，不写死任何行业判断规则；
+/// 取值口径指向「本账号字典」，保持行业中性（运营可扩展 supplier 等）。
+///
+/// **稳定属性，不每轮臆测**：relationship_type 是稳定属性，只在本轮出现明确新证据
+/// （对方明确表达身份/关系定位）时才产出，没有新证据就不输出、更不反复改判。
+///
+/// **零扰动**：本段常驻（对所有 profile 一致追加），但它只是「有新证据才产出」的可选
+/// 指引——不强制 LLM 每轮输出，故 DEFAULT 销售域追加本段不改变既有行为（无新证据 →
+/// 不产信号 → 决策与改造前等价）。无参纯函数，供 decision.rs 调用 + lib 单测共用。
+pub(crate) fn render_relationship_type_suggestion_guidance() -> String {
+    "\n\n# 关系性质识别（数字分身，仅在本轮出现关系性质的明确新证据时）\n\
+     关系性质指对方相对本账号机主的关系定位（按本账号 relationship_type 字典的取值，\
+     当前如 customer 客户 / peer 同行 / friend 朋友，运营可扩展）。这是稳定属性，\
+     **不要每轮臆测或反复改判**。\n\
+     仅当本轮对话出现**明确的新证据**（对方明确表达自身身份/关系定位，如自称同行、\
+     以朋友口吻相处、确立或言明客户关系等），才在 agentGeneratedSignals 追加一条 \
+     {\"kind\":\"relationship_type\",\"value\":\"<本账号字典里的取值 id>\",\
+     \"evidence\":\"对方哪句话/哪个行为构成这条新证据\",\"confidence\":0-100}。\n\
+     这条只是供后台高亮待核实的建议，不直接改变对方的关系标签（须经审核才回写）。\n\
+     没有明确新证据时，不要输出该信号。"
+        .to_string()
+}
+
 /// G4 #5：决策 prompt 三段交易事实注入（产品目录 / 当前持有投影 / 疑似成交指引）的统一
 /// 渲染 + 交易域闸。返回 `(product_catalog_text, entitlements_text, suspected_deal_text)`。
 ///
@@ -890,6 +922,44 @@ mod tests {
             assert!(
                 !g.contains(forbidden),
                 "疑似成交指引不得含禁词 {forbidden}"
+            );
+        }
+    }
+
+    #[test]
+    fn relationship_type_suggestion_guidance_present_and_aligns_with_t6_contract() {
+        let g = render_relationship_type_suggestion_guidance();
+        assert!(!g.is_empty(), "引导段常驻，不应为空");
+        // 与 T6 提取契约对齐：kind == relationship_type，字段 value/evidence/confidence。
+        assert!(g.contains("relationship_type"), "kind 名须与 T6 提取一致");
+        assert!(g.contains("agentGeneratedSignals"), "走弱信号通道");
+        assert!(g.contains("\"value\""), "字段 value");
+        assert!(g.contains("\"evidence\""), "字段 evidence");
+        assert!(g.contains("\"confidence\""), "字段 confidence");
+        // 通用方法论锚点：基于"关系性质"+"新证据"，且显式约束不要每轮臆测。
+        assert!(g.contains("关系性质"), "引导基于关系性质新证据");
+        assert!(g.contains("新证据"), "仅在明确新证据时产出");
+        assert!(g.contains("不要每轮"), "关系类型是稳定属性，不每轮改判");
+        // 反过拟合护栏：行业中性，不写死某行业判断规则。
+        assert!(g.contains("字典"), "取值按本账号 relationship_type 字典，保持行业中性");
+    }
+
+    #[test]
+    fn relationship_type_suggestion_guidance_no_takeover_clean() {
+        let g = render_relationship_type_suggestion_guidance();
+        // 命名红线：render 结果不得含禁词（用编译期拼接构造禁词，避免源码字面量被 lint 反向命中）。
+        let forbidden_words = [
+            concat!("人", "工"),
+            concat!("接", "管"),
+            concat!("转", "真人"),
+            concat!("take", "over"),
+            concat!("hand-", "off"),
+            concat!("hand", "off"),
+        ];
+        for forbidden in forbidden_words {
+            assert!(
+                !g.contains(forbidden),
+                "关系类型建议引导不得含禁词 {forbidden}"
             );
         }
     }
