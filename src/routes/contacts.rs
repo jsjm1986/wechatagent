@@ -602,6 +602,14 @@ fn apply_admin_dim_validation(
     }
 }
 
+/// stage 是否算"发生变更"（决定 insert_domain_stage_fields 是否刷 customer_stage_updated_at）。
+/// 红线：stage 未实际写入（`new_stage=None`：空串短路 / DropSilently）时绝不算变更——
+/// 否则会无条件刷 customer_stage_updated_at，错误重置下游 stagnation 计时器（值没改却记
+/// 了一次"刚变更"）。仅当真写了新 stage 且与旧值不同才算变更。
+fn stage_changed(prev_stage: Option<&str>, new_stage: Option<&str>) -> bool {
+    new_stage.is_some() && prev_stage != new_stage
+}
+
 pub(super) async fn update_operation_profile(
     State(state): State<AppState>,
     Extension(admin): Extension<AuthenticatedAdmin>,
@@ -620,6 +628,7 @@ pub(super) async fn update_operation_profile(
                 "customer_stage",
                 &v,
                 &current.account_id,
+                crate::agent::dimension_registry::WriteIntent::AdminWrite,
             )
             .await,
         )?,
@@ -629,7 +638,10 @@ pub(super) async fn update_operation_profile(
         .domain_attributes
         .as_ref()
         .and_then(|d| d.get_str("customer_stage").ok().map(|s| s.to_string()));
-    let stage_changed = prev_stage.as_deref() != new_stage.as_deref();
+    // stage 实际未写入（new_stage=None：空串短路 / DropSilently）时绝不算 stage 变更——
+    // 否则 insert_domain_stage_fields(stage_changed=true) 会无条件刷 customer_stage_updated_at，
+    // 错误重置下游 stagnation（停滞）计时器（stage 值没改却记了一次"刚变更"）。
+    let stage_changed = stage_changed(prev_stage.as_deref(), new_stage.as_deref());
     let commitments_bson = commitments_with_optional_text(
         &current.commitments,
         normalize_optional(payload.last_commitment).as_deref(),
@@ -649,6 +661,7 @@ pub(super) async fn update_operation_profile(
                 "intent_level",
                 &v,
                 &current.account_id,
+                crate::agent::dimension_registry::WriteIntent::AdminWrite,
             )
             .await,
         )?,
@@ -670,6 +683,7 @@ pub(super) async fn update_operation_profile(
                 "relationship_type",
                 &v,
                 &current.account_id,
+                crate::agent::dimension_registry::WriteIntent::AdminWrite,
             )
             .await,
         )?;
@@ -940,5 +954,17 @@ mod tests {
         assert!(matches!(ok, Ok(Some(ref v)) if v == "customer"));
         let drop = apply_admin_dim_validation(DimValidation::DropSilently);
         assert!(matches!(drop, Ok(None)));
+    }
+
+    #[test]
+    fn stage_changed_false_when_stage_not_written() {
+        // 不变式：new_stage=None（stage 未实际写入：空串短路 / DropSilently）时绝不算变更，
+        // 即便旧值非空——否则会误刷 customer_stage_updated_at，错误重置 stagnation 计时。
+        assert!(!stage_changed(Some("need_discovery"), None));
+        assert!(!stage_changed(None, None));
+        // 真写了新值且与旧值不同 → 变更；相同 → 不变。
+        assert!(stage_changed(Some("need_discovery"), Some("solution_fit")));
+        assert!(stage_changed(None, Some("new_contact")));
+        assert!(!stage_changed(Some("solution_fit"), Some("solution_fit")));
     }
 }
