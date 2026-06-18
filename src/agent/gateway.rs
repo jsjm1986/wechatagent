@@ -2652,11 +2652,69 @@ async fn apply_agent_updates(
         &mut signals_decision.domain_signals,
         &declared_dims,
     );
+    // 写侧 value 校验：retain 只做 KEY 过滤（剔除 profile 未声明的维度键），声明过的键
+    // 其 LLM 取值若越界（字典外）此前仍原样落库（脏画像）。这里对每个 ValueSource::Taxonomy
+    // 维度过 validate_dimension_value(MachineWrite)：Accept→用归一值替换（alias→canonical）；
+    // Drop→移除该键不落库 + 写 agent.dimension_dropped 审计（fail-soft：回复已异步发出，
+    // 审计写失败也绝不阻断/回滚主流程）；Reject 在 LLM 通道按 spec 不出现（LlmSignals 越界返
+    // Drop），兜底当 Drop 处理。bson Document 不能边遍历边改 → 先收集 drop/replace 列表再 apply。
+    {
+        let mut to_drop: Vec<(String, String)> = Vec::new(); // (kind, 越界原值) → 移除 + 审计
+        let mut to_replace: Vec<(String, String)> = Vec::new(); // (kind, canonical) → 归一替换
+        for (kind, value) in signals_decision.domain_signals.iter() {
+            let Some(spec) = crate::agent::dimension_registry::spec_for(kind) else {
+                continue; // 未知 kind：保持原样不动
+            };
+            if !matches!(
+                spec.value_source,
+                crate::agent::dimension_registry::ValueSource::Taxonomy
+            ) {
+                continue; // 非 Taxonomy 源（CodeEnum/FreeText）：不查字典、保持原样
+            }
+            let Some(raw) = value.as_str() else {
+                continue; // 非字符串值：不校验、保持原样
+            };
+            let verdict = crate::agent::dimension_registry::validate_dimension_value(
+                &state.db,
+                kind,
+                raw,
+                &contact.account_id,
+                crate::agent::dimension_registry::WriteIntent::MachineWrite,
+            )
+            .await;
+            match llm_signal_apply(verdict) {
+                Some(canonical) => {
+                    if canonical != raw {
+                        to_replace.push((kind.to_string(), canonical));
+                    }
+                }
+                None => to_drop.push((kind.to_string(), raw.to_string())),
+            }
+        }
+        for (kind, canonical) in &to_replace {
+            signals_decision.domain_signals.insert(kind.as_str(), canonical.as_str());
+        }
+        for (kind, raw) in &to_drop {
+            signals_decision.domain_signals.remove(kind.as_str());
+            // fail-soft：审计写失败不阻断主流程（回复已异步发出）。
+            let _ = write_event_for_account(
+                &state,
+                &contact.account_id,
+                Some(&contact.wxid),
+                "agent.dimension_dropped",
+                "dropped",
+                &format!("维度 {} 取值 {:?} 不在字典内，已丢弃不落库", kind, raw),
+                Some(doc! { "kind": kind.as_str(), "value": raw.as_str() }),
+            )
+            .await;
+        }
+    }
     if !signals_decision.domain_signals.is_empty() {
         let prev_stage = contact
             .domain_attributes
             .as_ref()
             .and_then(|d| d.get_str("customer_stage").ok());
+        // value 校验后重取 new_stage：customer_stage 可能因越界被 drop 移除了键。
         let new_stage = signals_decision.domain_signals.get_str("customer_stage").ok();
         let stage_changed = new_stage.is_some() && prev_stage != new_stage;
         let wrote = crate::agent::domain_signals::insert_domain_signal_values(
@@ -3465,6 +3523,19 @@ async fn pending_follow_up_count(state: &AppState, contact: &Contact) -> AppResu
         .map_err(AppError::from)
 }
 
+/// 把 LLM/机器通道维度的 [`DimValidation`] 处置结论映射为写入决策：
+/// `Accept(canonical)` → `Some(canonical)`（用归一值写入）；
+/// `DropSilently | Reject(_)` → `None`（不写该维度键，调用方据此移除 + 写审计）。
+/// Reject 在 LlmSignals 通道按 spec 不会出现（机器路径越界返 Drop），兜底也当 Drop——
+/// 绝不因一个维度越界让整条已发送回复链路报错（fail-soft 红线）。
+pub(crate) fn llm_signal_apply(v: crate::agent::dimension_registry::DimValidation) -> Option<String> {
+    use crate::agent::dimension_registry::DimValidation::*;
+    match v {
+        Accept(s) => Some(s),
+        DropSilently | Reject(_) => None,
+    }
+}
+
 pub async fn write_event_for_account(
     state: &AppState,
     account_id: &str,
@@ -3583,6 +3654,20 @@ pub(crate) fn compute_taxonomy_guard_outcome(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn llm_signal_validation_drops_keep_accept() {
+        use crate::agent::dimension_registry::DimValidation;
+        // Accept → 写归一值
+        assert_eq!(
+            llm_signal_apply(DimValidation::Accept("need_discovery".into())),
+            Some("need_discovery".to_string())
+        );
+        // Drop → 不写（None），调用方据此跳过 + 审计
+        assert_eq!(llm_signal_apply(DimValidation::DropSilently), None);
+        // Reject 兜底当 Drop（LLM 通道不阻断已发送回复）
+        assert_eq!(llm_signal_apply(DimValidation::Reject("x".into())), None);
+    }
 
     #[test]
     fn split_reply_double_newline_into_segments() {
