@@ -2041,6 +2041,18 @@ pub(crate) async fn precheck_send_gateway(
         if daily_touch_count(state, contact).await? >= runtime.max_daily_touches {
             return Ok(blocked("daily_limit", "已达到每日触达上限"));
         }
+        // 过期判定**先于**作息门控：已过期的 FollowUp 是「死任务」，必须直接作废
+        // （expired），不能因为当前撞静默时段而被 quiet_hours_deferred 重排到醒来时刻
+        // ——否则一条本该作废的过期跟进会在次日醒来时被发出，违背「过期即作废」语义
+        // 并造成对客户的过时打扰。（rate_limited / daily_limit 仍先于 expired，沿用既
+        // 有顺序：那两道是「现在不该发」的频控，与任务是否过期正交。）
+        if let AgentTrigger::FollowUp(task) = trigger {
+            if let Some(expires_at) = task.expires_at {
+                if expires_at.timestamp_millis() < DateTime::now().timestamp_millis() {
+                    return Ok(blocked("expired", "跟进任务已过期"));
+                }
+            }
+        }
         // #69 作息门控（双重保险，与 webhook 入站门控配套）：**主动发送**（planner/follow_up
         // 跟进任务）在运营方静默时段到点时不立即发，标记 quiet_hours_deferred 让调用方把任务
         // **重排**到醒来时刻（而非 cancel——避免丢承诺/催进）。
@@ -2070,11 +2082,7 @@ pub(crate) async fn precheck_send_gateway(
         }
     }
     if let AgentTrigger::FollowUp(task) = trigger {
-        if let Some(expires_at) = task.expires_at {
-            if expires_at.timestamp_millis() < DateTime::now().timestamp_millis() {
-                return Ok(blocked("expired", "跟进任务已过期"));
-            }
-        }
+        // expires_at 已在作息门控前判定（见上）；此处只剩 context_changed 检查。
         // 用 last_inbound_at 判定 context_changed；老数据若 last_inbound_at 还没回填
         // （migration 未跑或回填中），降级使用 last_message_at 兼容。
         // 醒来任务豁免：它就是要回 task 创建后累积的那些入站消息（见 is_deferred_wake）。

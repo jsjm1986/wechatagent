@@ -100,7 +100,7 @@
 - **不是测试 bug**：测试断言正确（过期任务就该 expired）。是 gateway 优先级真缺陷——CI 恰好在运营方静默时段（off_hours）跑时必现；非静默时段跑则 expired 正常命中（解释为何不是每次红，但**双 run 复现说明 CI 常撞静默窗**）。
 - **关联**：与记忆 [[project_universalization_residuals]] #6 off_hours UTC 时区 bug 同源区域（quiet_hours 时区/优先级）。
 - **修复方向（系统性根因层，非症状补丁）**：把 expired 判定**移到 quiet_hours 之前**——死任务先丢弃，不进静默重排。改动在 gateway.rs（生产代码），**需用户授权**（铁律：测试 only 不碰 gateway）。
-- **状态**：已坐实根因，待授权修。
+- **状态**：✅ **已修（用户授权）**。expires_at 判定提到作息门控之前（gateway.rs 2072 块上移到 quiet_hours 块之前，保留 rate_limited/daily_limit 在前的既有顺序）。验证：精确追到 caller（gateway:629）—— quiet_hours_deferred 走 reschedule_task（复活到醒来），其余含 expired 走 cancel_task（作废）；修后过期任务正确走 cancel 不再被复活。lib 基线 1324/0 不回归，no-takeover lint clean。t4（Docker 测试）待 CI 复验。
 
 ### D3.【知识库抽取 agent】企业合同条款抽取质量临界不达标（agreed_overall=5.0 < 基线 6）—— ⚠️ 可信度【双 run 复现但裁判同家族】
 - **现象（q2_article_extraction_quality，6-17 + 6-16 双 run FAILED）**：抽取「企业服务合同-违约与赔付条款」，recall=0.80（召回 OK），但双裁判内容质量 `agreed_overall=5.0 < 专业基线 6`。
