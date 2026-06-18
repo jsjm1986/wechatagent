@@ -21,6 +21,14 @@ pub(crate) enum DimensionChannel {
     ReactionDerived,
 }
 
+/// 写入意图：决定 Taxonomy 越界值的处置倾向，与维度的默认通道正交。
+/// admin 是权威人工写入方——越界一律 Reject 当场报错；机器产出按维度通道容错。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WriteIntent {
+    AdminWrite,   // admin 直接写入：越界恒 Reject
+    MachineWrite, // LLM/reaction 等机器产出：按维度通道（LlmSignals/ReactionDerived→Drop）
+}
+
 /// 取值约束来源。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ValueSource {
@@ -88,8 +96,13 @@ pub(crate) enum DictLookup {
     Miss,
 }
 
-/// 纯决策：给定维度契约 + 字典查询结果 + 原始值 → 校验结论。无 IO，完全可单测。
-pub(crate) fn classify_validation(spec: &DimensionSpec, dict: DictLookup, raw: &str) -> DimValidation {
+/// 纯决策：给定维度契约 + 字典查询结果 + 原始值 + 写入意图 → 校验结论。无 IO，完全可单测。
+pub(crate) fn classify_validation(
+    spec: &DimensionSpec,
+    dict: DictLookup,
+    raw: &str,
+    intent: WriteIntent,
+) -> DimValidation {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
         return DimValidation::DropSilently;
@@ -99,14 +112,18 @@ pub(crate) fn classify_validation(spec: &DimensionSpec, dict: DictLookup, raw: &
         ValueSource::Taxonomy => match dict {
             DictLookup::Known => DimValidation::Accept(trimmed.to_string()),
             DictLookup::Alias(canonical) => DimValidation::Accept(canonical),
-            DictLookup::Miss => match spec.channel {
-                // admin 是人，越界当场报错纠正。
-                DimensionChannel::AdminDirect => {
+            DictLookup::Miss => {
+                // admin 是权威人工写入方，任何维度越界都当场报错纠正；
+                // AdminDirect 通道（如 relationship_type）即便机器路径越界也报错。
+                if intent == WriteIntent::AdminWrite
+                    || matches!(spec.channel, DimensionChannel::AdminDirect)
+                {
                     DimValidation::Reject(format!("{} 取值 {:?} 不在字典内", spec.kind, trimmed))
+                } else {
+                    // LLM/reaction 偶发臆造不阻断已发送回复，丢弃 + 留审计（调用方写审计）。
+                    DimValidation::DropSilently
                 }
-                // LLM/reaction 偶发臆造不阻断已发送回复，丢弃 + 留审计（调用方写审计）。
-                _ => DimValidation::DropSilently,
-            },
+            }
         },
     }
 }
@@ -143,6 +160,7 @@ pub(crate) async fn validate_dimension_value(
     kind: &str,
     raw: &str,
     scope_account_id: &str,
+    intent: WriteIntent,
 ) -> DimValidation {
     let Some(spec) = spec_for(kind) else {
         return DimValidation::Accept(raw.trim().to_string());
@@ -158,7 +176,7 @@ pub(crate) async fn validate_dimension_value(
     } else {
         DictLookup::Miss
     };
-    classify_validation(spec, dict, raw)
+    classify_validation(spec, dict, raw, intent)
 }
 
 #[cfg(test)]
@@ -206,23 +224,39 @@ mod tests {
     #[test]
     fn classify_admin_direct_rejects_out_of_dict() {
         // relationship_type=AdminDirect+Taxonomy：字典真无(CandidateNew) → Reject。
+        // 即便是机器路径写（MachineWrite），AdminDirect 通道仍恒 Reject。
         let spec = spec_for("relationship_type").unwrap();
-        let r = classify_validation(spec, DictLookup::Miss, "瞎编关系");
+        let r = classify_validation(spec, DictLookup::Miss, "瞎编关系", WriteIntent::MachineWrite);
         assert!(matches!(r, DimValidation::Reject(_)));
     }
 
     #[test]
     fn classify_llm_signals_drops_out_of_dict() {
-        // customer_stage=LlmSignals+Taxonomy：字典真无(CandidateNew) → DropSilently（不阻断已发送）。
+        // customer_stage=LlmSignals+Taxonomy：机器路径字典真无(CandidateNew) → DropSilently（不阻断已发送）。
         let spec = spec_for("customer_stage").unwrap();
-        let r = classify_validation(spec, DictLookup::Miss, "臆造态");
+        let r = classify_validation(spec, DictLookup::Miss, "臆造态", WriteIntent::MachineWrite);
         assert!(matches!(r, DimValidation::DropSilently));
+    }
+
+    #[test]
+    fn classify_admin_write_rejects_machine_channel() {
+        // 本次新语义守护：customer_stage 主通道是 LlmSignals（机器容错 drop），
+        // 但 admin 是权威写入方——admin 写机器通道维度越界也必须 Reject 当场报错，
+        // 绝不静默丢弃（admin 以为存上了实际没存）。
+        let spec = spec_for("customer_stage").unwrap();
+        let r = classify_validation(spec, DictLookup::Miss, "臆造态", WriteIntent::AdminWrite);
+        assert!(matches!(r, DimValidation::Reject(_)));
     }
 
     #[test]
     fn classify_alias_normalizes() {
         let spec = spec_for("customer_stage").unwrap();
-        let r = classify_validation(spec, DictLookup::Alias("need_discovery".into()), "需求挖掘");
+        let r = classify_validation(
+            spec,
+            DictLookup::Alias("need_discovery".into()),
+            "需求挖掘",
+            WriteIntent::AdminWrite,
+        );
         assert!(matches!(r, DimValidation::Accept(ref c) if c == "need_discovery"));
     }
 
@@ -231,10 +265,10 @@ mod tests {
         // Known 覆盖 Active(canonical) 与 Deprecated：两者都是字典登记过的合法值 → Accept 原值。
         // 红线：deprecated 是历史合法值，admin 通道也必须 Accept 不得 reject。
         let stage = spec_for("customer_stage").unwrap();
-        let r = classify_validation(stage, DictLookup::Known, "need_discovery");
+        let r = classify_validation(stage, DictLookup::Known, "need_discovery", WriteIntent::AdminWrite);
         assert!(matches!(r, DimValidation::Accept(ref c) if c == "need_discovery"));
         let rel = spec_for("relationship_type").unwrap();
-        let r2 = classify_validation(rel, DictLookup::Known, "customer");
+        let r2 = classify_validation(rel, DictLookup::Known, "customer", WriteIntent::AdminWrite);
         assert!(matches!(r2, DimValidation::Accept(ref c) if c == "customer"));
     }
 
@@ -242,14 +276,14 @@ mod tests {
     fn classify_code_enum_trusts() {
         // value_tier=CodeEnum：不查字典直接信任（Miss 占位不影响）。
         let spec = spec_for("value_tier").unwrap();
-        let r = classify_validation(spec, DictLookup::Miss, "high");
+        let r = classify_validation(spec, DictLookup::Miss, "high", WriteIntent::MachineWrite);
         assert!(matches!(r, DimValidation::Accept(ref c) if c == "high"));
     }
 
     #[test]
     fn classify_empty_drops() {
         let spec = spec_for("customer_stage").unwrap();
-        let r = classify_validation(spec, DictLookup::Known, "  ");
+        let r = classify_validation(spec, DictLookup::Known, "  ", WriteIntent::AdminWrite);
         assert!(matches!(r, DimValidation::DropSilently));
     }
 
