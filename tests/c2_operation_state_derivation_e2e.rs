@@ -249,6 +249,24 @@ async fn normal_transition_uses_customer_stage_over_operation_state() {
             "[C2诊断] operation_state={:?} domain_attributes={:?} tags={:?}",
             reloaded.operation_state, reloaded.domain_attributes, reloaded.tags
         );
+        // [诊断3] customer_stage 是 ValueSource::Taxonomy，gateway 写侧对它过
+        // validate_dimension_value：字典 miss → DropSilently → 移除键 + 写一条
+        // agent.dimension_dropped 审计事件。查这条事件是否存在，定位 customer_stage
+        // 是否在网关被字典校验丢弃（retain 已被诊断2 排除）。
+        let dropped_events = app
+            .state
+            .db
+            .events()
+            .count_documents(
+                doc! { "contact_wxid": &contact.wxid, "kind": "agent.dimension_dropped" },
+                None,
+            )
+            .await
+            .expect("count dimension_dropped");
+        eprintln!(
+            "[C2诊断3] agent.dimension_dropped 事件数={} declared_dims={:?}",
+            dropped_events, declared
+        );
         eprintln!(
             "[C2诊断2] active_profile_id={:?} transaction_facts={} declared_dims={:?}",
             active.profile_id, active.transaction_facts_enabled, declared
