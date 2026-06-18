@@ -22,7 +22,7 @@ pub(crate) enum DimensionChannel {
 }
 
 /// 写入意图：决定 Taxonomy 越界值的处置倾向，与维度的默认通道正交。
-/// admin 是权威人工写入方——越界一律 Reject 当场报错；机器产出按维度通道容错。
+/// admin 是权威直接写入方——越界一律 Reject 当场报错；机器产出按维度通道容错。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum WriteIntent {
     AdminWrite,   // admin 直接写入：越界恒 Reject
@@ -113,7 +113,7 @@ pub(crate) fn classify_validation(
             DictLookup::Known => DimValidation::Accept(trimmed.to_string()),
             DictLookup::Alias(canonical) => DimValidation::Accept(canonical),
             DictLookup::Miss => {
-                // admin 是权威人工写入方，任何维度越界都当场报错纠正；
+                // admin 是权威直接写入方，任何维度越界都当场报错纠正；
                 // AdminDirect 通道（如 relationship_type）即便机器路径越界也报错。
                 if intent == WriteIntent::AdminWrite
                     || matches!(spec.channel, DimensionChannel::AdminDirect)
