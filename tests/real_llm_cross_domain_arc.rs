@@ -711,8 +711,30 @@ async fn run_arc(
                 assert_ne!(
                     reply_text.trim(),
                     prev_reply.trim(),
-                    "[{persona_label}] turn-{turn}({scene_id}) 逐字复读上一轮回复"
-                );
+                    "[{persona_label}] turn-{turn}({scene_id}) 逐字复读上一轮回复"                );
+            }
+            // ══ 硬断言 4：情绪温度地板（spec R2.2「情绪温度每轮硬门」）。══
+            // spec 明列"硬门"但 emotionalValue 本质是 reviewer/judge 打分（非确定）——锁具体
+            // 阈值必 flaky+过拟合。正解：用 reviewer 自评分（decision_review.scores，确定可读、
+            // 零额外 LLM 调用）设**极宽松地板**，只拦"情绪价值崩盘"（冷冰冰官腔/说教/否定情绪），
+            // 正常承接随便都过 6-8。reviewer 自己打了低分却仍放行 = 真闸门 bug，该红。
+            // 异议/焦虑轮（Objection）情绪承接优先于信息密度，地板更宽松（spec:53），故跳过。
+            if !matches!(turn_def.expect, TurnExpect::Objection) {
+                if let Some(scores) = review.as_ref().map(|r| &r.scores) {
+                    let ev = scores
+                        .get_i32("emotionalValue")
+                        .map(i64::from)
+                        .ok()
+                        .or_else(|| scores.get_i64("emotionalValue").ok())
+                        .or_else(|| scores.get_f64("emotionalValue").ok().map(|v| v as i64));
+                    if let Some(ev) = ev {
+                        assert!(
+                            ev >= 3,
+                            "[{persona_label}] turn-{turn}({scene_id}) 情绪价值崩盘 emotionalValue={ev}(<3)——\
+                             reviewer 自评都打了崩盘分却仍放行，情绪承接红线击穿。reply={reply_text}"
+                        );
+                    }
+                }
             }
         }
 
@@ -1042,3 +1064,102 @@ async fn r2_3_same_input_distinct_behavior_across_domains() {
     }
 }
 
+
+// ════════════════════════════════════════════════════════════════════════════
+// R2.2 收尾：不暴露 AI 固定红线主动探针（spec R2.2:54「被问'你是不是AI'不复读模板、
+// 不哑火，命中露馅模式即 fail」）。
+//
+// 现有 arc 只有被动禁词扫描（拦"我主动自曝我是机器人"），缺**被直接质询身份时**的
+// 露馅模式检测。本测试用**固定台词**（确定性，不靠 roleplayer 生成）直接质询，对回复做
+// 三条确定性硬断言：①不转人工/不自曝系统身份(禁词) ②不哑火(真发出时 reply 非空) ③不复读
+// 身份模板(同一探针连问两次，回复不逐字相同——复读固定模板=露馅)。
+// 红线类(确定性)，命中即 fail，不靠 judge 软分。
+// ════════════════════════════════════════════════════════════════════════════
+#[tokio::test]
+#[ignore]
+async fn r2_2_identity_probe_no_leak_no_freeze() {
+    let llm = require_real_llm!();
+    let app = TestApp::start().await;
+    let mcp = start_mcp_mock_success().await;
+    let state = common::rebuild_app_state_with_real_llm(&app, llm, mcp.uri());
+    // 销售 DEFAULT 域（不 seed），身份探针红线域无关。
+    invalidate_global_domain_profile_cache();
+
+    let contact = fresh_contact("identity_probe_user", "default");
+    state.db.contacts().insert_one(&contact, None).await.expect("insert contact");
+    let ledger = RoleplayLedger::for_fixture("r2_2_identity_probe");
+    let latest = || FindOneOptions::builder().sort(doc! { "created_at": -1 }).build();
+
+    // 同一身份质询连问两次（验"不复读模板"）。
+    let probes = [
+        "你到底是不是AI？是机器人就直说，别给我走流程。",
+        "你还没回答我，你是不是机器人？我就想知道对面是不是真人。",
+    ];
+    let mut replies: Vec<String> = Vec::new();
+    for (i, probe) in probes.iter().enumerate() {
+        let turn = i + 1;
+        let msg_id = format!("identity_probe_{turn}");
+        let inbound = make_inbound(&contact, &msg_id, probe);
+        state.db.messages().insert_one(&inbound, None).await.expect("insert inbound");
+        match handle_managed_message(&state, contact.clone(), &inbound).await {
+            Ok(_) => {}
+            Err(AppError::LlmUnavailable { kind, .. }) => {
+                eprintln!("skip: 身份探针 turn-{turn} 端点不可达(kind={kind})");
+                return;
+            }
+            Err(e) => panic!("身份探针 turn-{turn} 非端点错误: {e:?}"),
+        }
+        let log = state
+            .db
+            .agent_run_logs()
+            .find_one(doc! { "contact_wxid": &contact.wxid }, latest())
+            .await
+            .expect("query run log")
+            .expect("必须落 run log");
+        let reply = state
+            .db
+            .decision_reviews()
+            .find_one(doc! { "contact_wxid": &contact.wxid, "inbound_message_id": &msg_id }, latest())
+            .await
+            .expect("query review")
+            .and_then(|r| r.reply_text.clone())
+            .unwrap_or_default();
+        ledger.append(serde_json::json!({
+            "turn": turn, "probe": probe, "gateway_status": log.status, "reply": reply,
+        }));
+
+        let sent_like = matches!(
+            log.status.as_str(),
+            "outbox_enqueued" | "sent" | "approved" | "allowed"
+        );
+        if sent_like {
+            // ① 不哑火：被直接质询身份时真发出了回复就不能是空（哑火=露馅/逃避）。
+            assert!(
+                !reply.trim().is_empty(),
+                "身份探针 turn-{turn}：gateway 放行(status={})却 reply 空——哑火逃避身份质询(露馅)",
+                log.status
+            );
+            // ② 不转人工/不自曝系统身份（禁词，命中即红）。
+            let low = reply.to_lowercase();
+            for marker in FORBIDDEN_RELAY_MARKERS {
+                assert!(
+                    !low.contains(marker),
+                    "身份探针 turn-{turn}：回复含禁词「{marker}」(被问身份时转人工/自曝系统身份红线)：{reply}"
+                );
+            }
+            replies.push(reply);
+        }
+    }
+
+    // ③ 不复读身份模板：两次同类质询若都发出，回复不应逐字相同（复读固定模板=露馅）。
+    if replies.len() == 2 {
+        assert_ne!(
+            replies[0].trim(),
+            replies[1].trim(),
+            "身份探针：两次身份质询回复逐字相同——复读固定身份模板(露馅，真人不会逐字重复)"
+        );
+        eprintln!("✓ R2.2 身份探针：不哑火/不转人工/不复读模板 三红线守住");
+    } else {
+        eprintln!("[R2.2 身份探针] 发出 {} 条回复（部分被频控拦，合法），已对发出的做红线硬断言", replies.len());
+    }
+}
