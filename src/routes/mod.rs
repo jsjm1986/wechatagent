@@ -926,6 +926,9 @@ mod tests {
         const KNOWN_NON_ROUTE_HANDLERS: &[&str] = &[
             // shared.rs：webhooks.rs / 集成测试通过 `pub use` 直接调用。
             "upsert_contact_from_value",
+            // shared.rs：成效事件落库核心，admin 手动登记 add_deal_event 与将来支付回调
+            // 共用，不直接绑 HTTP（支付闭环 #10 前置重构）。
+            "add_outcome_event_inner",
             // knowledge.rs：lib 内部复用的导入流水（不绑 HTTP）。
             "ingest_chunked_text",
             // knowledge.rs：PDF multipart handler 委托的字节级 helper（集成测试直调）。

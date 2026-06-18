@@ -12,7 +12,8 @@ use crate::{
     error::{AppError, AppResult},
     models::{
         AgentDecisionReview, AgentRunLog, Contact, LlmCallLog, MemoryCandidate, MemoryCardTyped,
-        OperatingMemory, OperationPlaybook, UserOperationGuidePreview,
+        OperatingMemory, OperationPlaybook, OutcomeEvent, OutcomeProductRef,
+        UserOperationGuidePreview,
     },
 };
 
@@ -1209,10 +1210,194 @@ pub(super) fn commitments_with_optional_text(
     to_bson(&commitments).unwrap_or(Bson::Array(Vec::new()))
 }
 
+/// admin 直登成交允许的事件方向闭集（§4.5）。
+fn validate_event_kind(input: Option<&str>) -> AppResult<String> {
+    match input.map(str::trim) {
+        None | Some("") | Some("deal") => Ok("deal".to_string()),
+        Some("reversal") => Ok("reversal".to_string()),
+        Some(other) => Err(AppError::BadRequest(format!(
+            "eventKind 仅接受 deal | reversal（收到 {other:?}）"
+        ))),
+    }
+}
+
+/// admin 直登成交允许的可信度闭集（§4.4 + §5.5）。`conversation_inferred` 是 AI 侧
+/// 疑似线索，绝不经 admin 直登写入——它只能由 §5.5 疑似线索通道产出，经核实后转
+/// `staff_confirmed`。
+fn validate_deal_verification(input: Option<&str>) -> AppResult<String> {
+    match input.map(str::trim) {
+        None | Some("") | Some("staff_confirmed") => Ok("staff_confirmed".to_string()),
+        Some("payment_verified") => Ok("payment_verified".to_string()),
+        Some(other) => Err(AppError::BadRequest(format!(
+            "verification 仅接受 staff_confirmed | payment_verified（收到 {other:?}）；\
+             conversation_inferred 疑似线索须经核实后才落成交，不走直登通道"
+        ))),
+    }
+}
+
+/// 一条成效事件的落库入参（与触发来源解耦：admin 手动登记 / 将来支付回调共用）。
+///
+/// 校验（amount/currency/verification/event_kind 闭集 + reversal 须带 product）一律在
+/// [`add_outcome_event_inner`] 内完成，故此处字段是「原始意图」而非已校验值。
+pub(crate) struct OutcomeEventInput {
+    /// 事件来源；本阶段 admin 直登恒 `"manual"`，将来支付回调用 `"payment"`。
+    pub source: String,
+    /// 标记人（admin 用户名 / 将来支付单号或网关标识），用于审计。
+    pub marked_by: String,
+    /// 审计事件 summary（参数化原硬编码"admin 手动登记成效事件"）。
+    pub audit_summary: String,
+    pub amount: Option<i64>,
+    pub currency: Option<String>,
+    /// 原始可信度意图；inner 走 [`validate_deal_verification`] 闭集校验。
+    pub verification: Option<String>,
+    /// 原始事件方向意图；inner 走 [`validate_event_kind`] 闭集校验。
+    pub event_kind: Option<String>,
+    pub product_id: Option<String>,
+    pub quantity: Option<u32>,
+    pub note: Option<String>,
+    pub occurred_at_ms: Option<i64>,
+}
+
+/// 往 `contact.outcome_events` append 一条成效事件 + 写一条 `outcome_event_marked` 审计，
+/// 返回构造出的 [`OutcomeEvent`]。
+///
+/// 与触发来源无关：admin 手动登记（`add_deal_event`）/ 将来支付回调共用**同一条落库
+/// 路径**——校验闭集、`product_ref` 订单式快照、`$push`、审计形状单一真相源，绝不让两
+/// 个入口漂移出两套成交写入逻辑。**不重读 contact**（调用方按需重读返回视图）。
+///
+/// IDOR（§3.5）：产品解引用与 update filter 一律用传入 `contact.workspace_id` 收窄，
+/// 等价 admin handler 原先的 `admin.current_workspace`。
+pub(crate) async fn add_outcome_event_inner(
+    state: &AppState,
+    contact: &Contact,
+    input: OutcomeEventInput,
+) -> AppResult<OutcomeEvent> {
+    // find_contact_by_id 必带 `_id` 查回，理论不可能为 None；显式兜底不 silent unwrap。
+    let object_id = contact
+        .id
+        .ok_or_else(|| AppError::External("contact 缺少 _id，无法登记成效事件".to_string()))?;
+    // 金额整数化：amount 是最小币种单位整数（分），i64 无 NaN/Inf，只查非负。
+    if !crate::models::is_valid_minor_amount(input.amount) {
+        return Err(AppError::BadRequest(
+            "amount 必须是非负整数（最小币种单位，如分）".to_string(),
+        ));
+    }
+    if let Some(cur) = input
+        .currency
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        if !crate::models::is_valid_currency_code(cur) {
+            return Err(AppError::BadRequest(
+                "currency 必须是 ISO-4217 三位大写字母币种码（如 CNY）".to_string(),
+            ));
+        }
+    }
+    let verification = validate_deal_verification(input.verification.as_deref())?;
+    let event_kind = validate_event_kind(input.event_kind.as_deref())?;
+    let trimmed_pid = input
+        .product_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    // reversal 必须关联 product_id：无产品标的的退款没有可抵消对象，G4 投影无从下手（§4.5）。
+    if event_kind == "reversal" && trimmed_pid.is_none() {
+        return Err(AppError::BadRequest(
+            "reversal 退款事件必须关联 product_id（指明抵消哪个产品的持有）".to_string(),
+        ));
+    }
+    // 给定 product_id 时，从本 workspace 产品表解引用，冻结成交当时快照（§4.3）。
+    // IDOR（§3.5）：filter 必含 workspace_id；正向成交只认 active（archived 不可新成交），
+    // 但 reversal 要能抵消"成交后才被下架"的产品，故退款放宽到任意 status。
+    let product_ref = match trimmed_pid {
+        Some(pid) => {
+            let mut filter = doc! {
+                "workspace_id": &contact.workspace_id,
+                "product_id": pid,
+            };
+            if event_kind != "reversal" {
+                filter.insert("status", "active");
+            }
+            let product = state
+                .db
+                .products()
+                .find_one(filter, None)
+                .await?
+                .ok_or_else(|| {
+                    if event_kind == "reversal" {
+                        AppError::BadRequest(format!(
+                            "product_id {pid:?} 不存在于本工作区，无法登记退款"
+                        ))
+                    } else {
+                        AppError::BadRequest(format!(
+                            "product_id {pid:?} 不是本工作区的 active 产品，无法关联成交"
+                        ))
+                    }
+                })?;
+            Some(OutcomeProductRef {
+                product_id: product.product_id.clone(),
+                name: product.name.clone(),
+                unit_price: product.price,
+                sku: product.sku.clone(),
+                quantity: input.quantity.unwrap_or(1).max(1),
+                // G4 #4：冻结成交当时的售后期天数，使产品日后 archived 也不丢已购客户的 in_aftercare。
+                entitlement_days: agent::entitlements::entitlement_days_of(&product),
+            })
+        }
+        None => None,
+    };
+    let now = DateTime::now();
+    let outcome_event = OutcomeEvent {
+        marked_at: now,
+        occurred_at: input.occurred_at_ms.map(DateTime::from_millis),
+        amount: input.amount,
+        currency: normalize_optional(input.currency),
+        source: input.source.clone(),
+        marked_by: input.marked_by.clone(),
+        note: normalize_optional(input.note),
+        verification: verification.clone(),
+        product_ref: product_ref.clone(),
+        event_kind: event_kind.clone(),
+    };
+    state
+        .db
+        .contacts()
+        .update_one(
+            doc! { "_id": object_id, "workspace_id": &contact.workspace_id },
+            doc! {
+                "$push": { "outcome_events": to_bson(&outcome_event)? },
+                "$set": { "updated_at": now },
+            },
+            None,
+        )
+        .await?;
+    agent::write_event_for_account(
+        state,
+        &contact.account_id,
+        Some(&contact.wxid),
+        "outcome_event_marked",
+        "ok",
+        &input.audit_summary,
+        Some(doc! {
+            "source": &input.source,
+            "markedBy": &input.marked_by,
+            "amount": input.amount,
+            "hasOccurredAt": input.occurred_at_ms.is_some(),
+            "verification": &verification,
+            "eventKind": &event_kind,
+            "productId": product_ref.as_ref().map(|p| p.product_id.clone()),
+        }),
+    )
+    .await?;
+    Ok(outcome_event)
+}
+
 #[cfg(test)]
 mod tests {
     use super::escape_regex_literal;
     use super::insert_domain_stage_fields;
+    use super::{validate_deal_verification, validate_event_kind};
     use mongodb::bson::Document;
 
     #[test]
@@ -1284,6 +1469,45 @@ mod tests {
         assert!(!set_doc.contains_key("domain_attributes.customer_stage"));
         assert!(!set_doc.contains_key("domain_attributes.intent_level"));
         assert!(set_doc.contains_key("domain_attributes_updated_at"));
+    }
+
+    // ── 支付闭环前置重构：成效事件落库校验闭集（搬移自 contacts.rs，语义须逐字不变）──
+
+    // event_kind 闭集：缺省/空/deal → deal；reversal → reversal；其余 → BadRequest。
+    #[test]
+    fn validate_event_kind_accepts_closed_set_and_rejects_others() {
+        assert_eq!(validate_event_kind(None).unwrap(), "deal");
+        assert_eq!(validate_event_kind(Some("")).unwrap(), "deal");
+        assert_eq!(validate_event_kind(Some("  ")).unwrap(), "deal");
+        assert_eq!(validate_event_kind(Some("deal")).unwrap(), "deal");
+        assert_eq!(validate_event_kind(Some(" reversal ")).unwrap(), "reversal");
+        assert!(validate_event_kind(Some("refund")).is_err());
+        assert!(validate_event_kind(Some("DEAL")).is_err());
+    }
+
+    // verification 闭集：缺省/空/staff_confirmed → staff_confirmed；payment_verified 直通；
+    // conversation_inferred 绝不经直登通道（与 §5.5 红线一致）。
+    #[test]
+    fn validate_deal_verification_rejects_conversation_inferred_via_direct_path() {
+        assert_eq!(
+            validate_deal_verification(None).unwrap(),
+            "staff_confirmed"
+        );
+        assert_eq!(
+            validate_deal_verification(Some("")).unwrap(),
+            "staff_confirmed"
+        );
+        assert_eq!(
+            validate_deal_verification(Some("staff_confirmed")).unwrap(),
+            "staff_confirmed"
+        );
+        assert_eq!(
+            validate_deal_verification(Some(" payment_verified ")).unwrap(),
+            "payment_verified"
+        );
+        // AI 侧疑似线索不得经直登写入。
+        assert!(validate_deal_verification(Some("conversation_inferred")).is_err());
+        assert!(validate_deal_verification(Some("guessed")).is_err());
     }
 }
 
