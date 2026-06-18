@@ -1283,11 +1283,18 @@ mod persona_override_tests {
         );
     }
 
-    /// A/T2：复刻 decision.rs reply.policy 组装链里 apply_conversation_mode_policy →
-    /// apply_mode_gate_policy 的相对顺序与参数取法（active_profile.mode_gate_policy_override），
-    /// 锁定「mode_gate_policy_override=Some → policy 里写死销售四模式-闸取向被本域说明整体
-    /// 替换」这条接线。生产组装在大 async 函数里不宜直接单测，这里测同构片段，等价证明
-    /// 接线生效（与生产链 :440/:445 同一对函数、同一参数源）。
+    /// A/T2：**同构测试**——复刻 decision.rs reply.policy 组装链里
+    /// apply_conversation_mode_policy → apply_mode_gate_policy 的相对顺序与参数取法
+    /// （active_profile.mode_gate_policy_override），锁定「mode_gate_policy_override=Some
+    /// → policy 里写死销售四模式-闸取向被本域说明整体替换」这条接线。生产组装在大 async
+    /// 函数里不宜直接单测，这里测的是与生产链 :440/:451 同一对函数、同一参数源的片段；它
+    /// 证明的是这两函数可按此序组合，**不替代生产组装链本身的端到端验证**（生产链是否确
+    /// 实这样接线，靠 CI 集成测覆盖）。
+    ///
+    /// 注：本用例第一步 apply_conversation_mode_policy 传 None（no-op），只验证
+    /// apply_mode_gate_policy 单独作用 + None 字节等价护栏；「两段 override 同时作用于同一
+    /// policy 互不吞锚」的顺序安全由姊妹用例
+    /// [`reply_policy_chain_both_overrides_preserve_each_others_anchor`] 守护。
     #[test]
     fn reply_policy_chain_applies_mode_gate_policy_override() {
         use crate::agent::domain_profile::{
@@ -1318,5 +1325,83 @@ mod persona_override_tests {
         let none_out = apply_mode_gate_policy(&none_after_conv, None);
         assert_eq!(none_out, policy, "None 覆盖应逐字保留销售锚段");
         assert!(none_out.contains(crate::prompts::DEFAULT_MODE_GATE_POLICY));
+    }
+
+    /// A/T2 加固（顺序安全姊妹用例）：当**两段 override 同时为 Some**时，复刻生产链
+    /// :440 → :451 的顺序，断言两段都成功替换、各自 DEFAULT 原文都不残留，且第一段
+    /// （conversation_mode_policy）替换**没有破坏第二段的锚** DEFAULT_MODE_GATE_POLICY
+    /// ——即第二步仍能命中闸锚做替换。这证明两段锚不相交、链式顺序安全（顺序回归护栏）。
+    ///
+    /// 顺序安全的结构依据：apply_conversation_mode_policy 只剥离「## 对话模式判定」段，
+    /// 剥离边界停在下一个 `## ` 二级标题前（strip_conversation_mode_section）。本样例把
+    /// DEFAULT_MODE_GATE_POLICY（自身以「## 模式与 5 闸的关系」开头）排在对话模式段之后，
+    /// 故第一步剥离止于闸段标题、闸锚整段完好交给第二步。若有人让两段锚相交（如把闸段
+    /// 文本并入对话模式段、或去掉闸段的 `## ` 标题），第一步会连带吃掉闸锚 → 第二步
+    /// `system.replace(DEFAULT_MODE_GATE_POLICY, _)` 失配 → 本测试因 override 文本缺失或
+    /// 闸 DEFAULT 残留而红。
+    #[test]
+    fn reply_policy_chain_both_overrides_preserve_each_others_anchor() {
+        use crate::agent::domain_profile::{
+            apply_conversation_mode_policy, apply_mode_gate_policy,
+        };
+        // 样例 policy：逐字含两段各自的锚——对话模式判定段（POLICY_CONVERSATION_MODE_
+        // SECTION_HEADING 开头）在前，模式-闸说明段（DEFAULT_MODE_GATE_POLICY，以
+        // 「## 模式与 5 闸的关系」开头）紧随其后。两段以空行分隔、各自是独立二级标题段。
+        let policy = format!(
+            "前置内容\n\n{}\n\n销售世界观判定规则正文。\n\n{}\n\n后置内容",
+            crate::agent::domain_profile::POLICY_CONVERSATION_MODE_SECTION_HEADING,
+            crate::prompts::DEFAULT_MODE_GATE_POLICY
+        );
+        // 前置自检：样例确实同时含两段锚原文。
+        assert!(
+            policy.contains(crate::prompts::DEFAULT_MODE_GATE_POLICY),
+            "样例 policy 应逐字含闸锚原文"
+        );
+        assert!(
+            policy.contains("销售世界观判定规则正文。"),
+            "样例 policy 应含对话模式判定段 DEFAULT 正文"
+        );
+
+        let conv_override = "## 对话模式判定\n\n情感陪伴域：按陪伴深度而非成交意向判定模式。";
+        let gate_override = "## 模式与 5 闸的关系\n\n情感陪伴域：模式不进 5 闸升档逻辑。";
+
+        // 复刻生产链顺序：先 conversation_mode_policy，再 mode_gate_policy。同一 policy 变量。
+        let after_conv = apply_conversation_mode_policy(&policy, Some(conv_override));
+        // 关键：第一段替换后，第二段的锚 DEFAULT_MODE_GATE_POLICY 必须仍完整存在，
+        // 否则下一步 replace 会静默失配（顺序安全的核心断言）。
+        assert!(
+            after_conv.contains(crate::prompts::DEFAULT_MODE_GATE_POLICY),
+            "对话模式段替换不得吃掉闸锚——闸锚须完整传给第二步：{after_conv}"
+        );
+        assert!(
+            !after_conv.contains("销售世界观判定规则正文。"),
+            "对话模式段 DEFAULT 正文应被第一段 override 替换掉：{after_conv}"
+        );
+
+        let out = apply_mode_gate_policy(&after_conv, Some(gate_override));
+
+        // 两段 override 新文本都在。
+        assert!(
+            out.contains("情感陪伴域：按陪伴深度而非成交意向判定模式。"),
+            "对话模式 override 文本应注入：{out}"
+        );
+        assert!(
+            out.contains("情感陪伴域：模式不进 5 闸升档逻辑。"),
+            "闸说明 override 文本应注入：{out}"
+        );
+        // 两段各自 DEFAULT 原文都不残留。
+        assert!(
+            !out.contains("销售世界观判定规则正文。"),
+            "对话模式段 DEFAULT 不应残留：{out}"
+        );
+        assert!(
+            !out.contains(crate::prompts::DEFAULT_MODE_GATE_POLICY),
+            "闸段 DEFAULT 不应残留：{out}"
+        );
+        // 锚段外文本原样保留。
+        assert!(
+            out.contains("前置内容") && out.contains("后置内容"),
+            "两锚段外的文本应原样保留：{out}"
+        );
     }
 }
