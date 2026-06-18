@@ -1580,6 +1580,11 @@ pub struct ReviewerOrientation {
     /// （含自定标签），让非销售域换掉「转化」标签本身。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub balance_principle: Option<String>,
+    /// 替换 system prompt 的「软闸打分锚点（few-shot）」三档示例段。销售 few-shot 的
+    /// PressureRisk 高压锚是逼单（「今天最后一天…现在就定吧」），非销售域（情感陪伴等）
+    /// 用本字段换成本域打分尺度。`None`（DEFAULT/老库）→ 回落写死销售 few-shot（字节等价）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reviewer_fewshot_override: Option<String>,
 }
 
 /// universal-domain-adaptation I：completeness `answeringMode` 三档释义/标签的 per-profile

@@ -519,6 +519,25 @@ pub fn apply_reviewer_balance_principle(user: &str, override_text: Option<&str>)
     user.replace(DEFAULT_REVIEWER_BALANCE_PRINCIPLE, principle)
 }
 
+/// universal-domain-adaptation T3：把 active profile 的
+/// `reviewer_orientation.reviewer_fewshot_override` 应用到 reviewer **system** prompt 的
+/// 「软闸打分锚点（few-shot）」三档示例段。`None`（DEFAULT/老库）/ 空白 → 原样返回
+/// （销售 few-shot 逐字保留、销售域字节等价）。`Some` 且 != 销售锚 → 把整段
+/// [`crate::prompts::DEFAULT_REVIEWER_FEWSHOT`] 替换成本域 few-shot（非销售域的打分尺度，
+/// 替换掉销售逼单高压锚）。锚找不到（prompt 被运营改写过）→ 原样返回不强插，避免污染。
+///
+/// 与 [`apply_reviewer_review_focus`] / [`apply_mode_gate_policy`] 同构
+/// （精确子串替换、幂等、空覆盖即 no-op）。
+pub fn apply_reviewer_fewshot(system: &str, override_text: Option<&str>) -> String {
+    let Some(fewshot) = override_text.map(str::trim).filter(|s| !s.is_empty()) else {
+        return system.to_string();
+    };
+    if fewshot == crate::prompts::DEFAULT_REVIEWER_FEWSHOT {
+        return system.to_string();
+    }
+    system.replace(crate::prompts::DEFAULT_REVIEWER_FEWSHOT, fewshot)
+}
+
 /// universal-domain-adaptation A/T1：把 active profile 的 `mode_gate_policy_override`
 /// 应用到 decision/policy prompt 的「## 模式与 5 闸的关系」模式-闸说明段。
 /// `None`（DEFAULT/老库）/ 空白 → 原样返回（销售取向逐字保留、销售域字节等价）。
@@ -1879,6 +1898,40 @@ mod tests {
     fn apply_mode_gate_policy_no_anchor_is_noop() {
         let custom = "前文\n## 别的标题\nXXX\n后文";
         assert_eq!(apply_mode_gate_policy(custom, Some("本域说明")), custom);
+    }
+
+    // ── T3：reviewer 软闸打分锚点 few-shot 段随 profile 替换 ──
+
+    /// None / 空白覆盖 → 原样返回（字节等价）。
+    #[test]
+    fn apply_reviewer_fewshot_none_unchanged() {
+        let s = format!("前\n{}\n后", crate::prompts::DEFAULT_REVIEWER_FEWSHOT);
+        assert_eq!(apply_reviewer_fewshot(&s, None), s);
+        assert_eq!(apply_reviewer_fewshot(&s, Some("   ")), s);
+        // 覆盖文本恰等于写死销售 few-shot → 幂等不替换。
+        assert_eq!(
+            apply_reviewer_fewshot(&s, Some(crate::prompts::DEFAULT_REVIEWER_FEWSHOT)),
+            s
+        );
+    }
+
+    /// Some → 把 few-shot 锚替换为本域打分锚点，销售逼单锚不再残留。
+    #[test]
+    fn apply_reviewer_fewshot_some_replaces() {
+        let s = format!("前\n{}\n后", crate::prompts::DEFAULT_REVIEWER_FEWSHOT);
+        let out = apply_reviewer_fewshot(&s, Some("情感域打分锚点"));
+        assert!(out.contains("情感域打分锚点"));
+        assert!(!out.contains(crate::prompts::DEFAULT_REVIEWER_FEWSHOT));
+        // 锚以外的前后文逐字保留。
+        assert!(out.contains("前\n"));
+        assert!(out.contains("\n后"));
+    }
+
+    /// 锚找不到（运营改写过 prompt）→ 原样返回，不强插污染。
+    #[test]
+    fn apply_reviewer_fewshot_no_anchor_is_noop() {
+        let custom = "前文\n别的打分说明\n后文";
+        assert_eq!(apply_reviewer_fewshot(custom, Some("本域锚点")), custom);
     }
 
     /// 两字段独立回落：只覆盖其一时，另一处保持写死。
