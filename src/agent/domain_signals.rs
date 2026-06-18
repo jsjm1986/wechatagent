@@ -22,9 +22,11 @@ use mongodb::bson::{DateTime, Document};
 use super::types::AgentDecision;
 
 /// 1D 已知的 typed 画像维度（容器键名与 `system_taxonomies.kind` /
-/// `decision_taxonomy::TAGGED_FIELDS` 一致）。1A 会把这份硬编码列表换成
-/// 「读 active profile 的维度集合」，本阶段先逐字复刻当前销售域两维。
-const KNOWN_TYPED_DIMS: &[&str] = &["customer_stage", "intent_level"];
+/// `decision_taxonomy::TAGGED_FIELDS` 一致）——派生自 `dimension_registry`
+/// 单一真相源（收敛历史硬编码列表，零行为变化）。
+fn known_typed_dims() -> Vec<&'static str> {
+    crate::agent::dimension_registry::typed_dimension_kinds()
+}
 
 /// 把 `AgentDecision` 的 typed 维度字段与 `domain_signals` 容器做**双向同步**：
 ///
@@ -38,7 +40,7 @@ const KNOWN_TYPED_DIMS: &[&str] = &["customer_stage", "intent_level"];
 /// 只输出 typed（不输出 `domainSignals`），故只有 typed→容器 方向生效、容器→typed
 /// 为空操作——行为与改造前逐字等价。
 pub(crate) fn normalize_domain_signals(decision: &mut AgentDecision) {
-    for &dim in KNOWN_TYPED_DIMS {
+    for dim in known_typed_dims() {
         let typed = typed_dim(decision, dim)
             .map(str::trim)
             .filter(|v| !v.is_empty())
@@ -174,6 +176,18 @@ pub(crate) fn retain_declared_dimensions(signals: &mut Document, allowed: &[Stri
 mod tests {
     use super::*;
     use mongodb::bson::doc;
+
+    #[test]
+    fn known_typed_dims_equals_registry_derived() {
+        // 收敛护栏：本模块用的 typed 集合必须与 registry 派生逐字一致（字节等价）。
+        let mut from_registry = crate::agent::dimension_registry::typed_dimension_kinds();
+        from_registry.sort_unstable();
+        let mut local: Vec<&str> = known_typed_dims().to_vec();
+        local.sort_unstable();
+        assert_eq!(local, from_registry);
+        // 且仍是历史的销售两维（双向锁）。
+        assert_eq!(local, vec!["customer_stage", "intent_level"]);
+    }
 
     // ── 写入内核等价性：销售域两维场景必须与改造前 gateway 手写块逐字一致 ──
 

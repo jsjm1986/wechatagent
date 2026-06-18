@@ -971,7 +971,9 @@ pub fn decision_dimension_kinds(profile: &DomainProfile) -> Vec<String> {
 /// 输出，prompt schema 已写死，**不**走 `domainSignals` 容器。其余「参与决策」维度
 /// （购买生命周期 / 关系亲密度 / 情绪状态等）才需要本模块的 prompt 指引告知 LLM 走
 /// `domainSignals` 容器输出。
-const SALES_TYPED_DIMENSION_KINDS: &[&str] = &["customer_stage", "intent_level"];
+///
+/// 派生自 `dimension_registry::typed_dimension_kinds()` 单一真相源（收敛历史硬编码
+/// 列表，零行为变化）。
 
 /// G1：把 active profile 里**非销售 typed**的「参与决策」维度渲染成一段决策任务
 /// 指引，告知 Reply Agent 这些维度要写进 `domainSignals` 容器（而非 schema 里写死的
@@ -993,7 +995,8 @@ pub fn render_decision_dimensions_guidance(dimensions: &[ProfileDimension]) -> S
         .iter()
         .filter(|d| {
             d.participates_in_decision
-                && !SALES_TYPED_DIMENSION_KINDS.contains(&d.kind.as_str())
+                && !crate::agent::dimension_registry::typed_dimension_kinds()
+                    .contains(&d.kind.as_str())
         })
         .collect();
     if extra.is_empty() {
