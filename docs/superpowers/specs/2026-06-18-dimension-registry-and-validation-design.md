@@ -6,6 +6,12 @@
 > **方案**：方案 C —— registry 先行（纯收敛声明，证字节等价）→ 校验作为 registry 第一个消费者（新行为，独立测）。两步独立可验证可提交。
 > **流程**：brainstorming（本文）→ writing-plans → 实施。
 
+> **实现状态（2026-06-18 已落码）**：实施计划 `docs/superpowers/plans/2026-06-18-dimension-registry-and-validation.md`，子代理逐任务执行 + 逐任务交叉验证。
+> - 步骤一：Task 1 建 `src/agent/dimension_registry.rs`（7 维度 const 表 + spec_for/typed_dimension_kinds）；Task 2 收敛 `KNOWN_TYPED_DIMS`/`SALES_TYPED_DIMENSION_KINDS` 为 registry 派生（字节等价护栏测试锁）。
+> - 步骤二：Task 3 `validate_dimension_value`（DimValidation/DictLookup/classify_validation 纯函数 + match_to_dict 红线测试守护 Deprecated→Known）；Task 4 admin 路径接 validate（**新增 `WriteIntent{AdminWrite,MachineWrite}` 正交轴**——admin 写一律 reject 越界，与维度默认通道正交）+ 修 stage_changed 误记时间戳 bug；Task 5 gateway domainSignals + reaction objection_type 机器路径接 validate（MachineWrite，越界 drop+`agent.dimension_dropped` 审计，归一替换）。
+> - 设计演进：原 spec 的三通道处置在实施中发现"同一维度 admin 写该 reject、LLM 写该 drop"无法用单一维度通道表达，经用户裁决加 `WriteIntent` 正交轴（详见计划 Task 4 fix 轮）。
+> - 验证：lib 1308/0、四 PBT 36/0、no-takeover lint 0 violations。
+
 ---
 
 ## Context（为什么做）

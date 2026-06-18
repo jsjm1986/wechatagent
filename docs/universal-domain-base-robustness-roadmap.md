@@ -86,6 +86,9 @@
 
 ## 推荐推进顺序
 
+> **落地进度（2026-06-18）**：主题 1+2 的**核心**已合并为一个 spec 落码——见 `docs/superpowers/specs/2026-06-18-dimension-registry-and-validation-design.md` + 计划 `docs/superpowers/plans/2026-06-18-dimension-registry-and-validation.md`。已交付：维度元数据单一真相源 `src/agent/dimension_registry.rs`（收敛 B1 散落 typed 列表）；Contact 三写入路径接 `validate_dimension_value`（admin reject / LLM drop+审计 / objection_type 归一，补 B2 假字典脱节）；新增 `WriteIntent` 正交轴（admin 写一律 reject）。lib 1308/0、四 PBT 36/0、lint 0。
+> **主题 1/2 仍未做的子项**（本 spec 按 YAGNI 排除，留后续）：C3 profile 字段中央接线点（apply_active_profile 只覆盖 runtime 标量）、driver 框架抽象、五闸数量可配；主题 2 的 key 字面量全面常量化（仅维度 kind 经 registry 收敛，其它高频 key 仍散落）。主题 3（数字分身前端 + D3 LLM 识别）/ 主题 4（规模）未动。
+
 | 顺序 | 主题 | 价值 | 风险 | 工作量 | 理由 |
 | --- | --- | --- | --- | --- | --- |
 | **第一** | 主题 1 扩展点收拢 | 最高 | 低-中 | 中-大 | 地基，解锁后续所有扩展，消除 drift 源 |
