@@ -2876,6 +2876,64 @@ async fn apply_agent_updates(
         .update_one(doc! { "_id": contact.id }, doc! { "$set": set_doc }, None)
         .await?;
 
+    // 数字分身 T6：决策后从 agent_generated_signals 提取 relationship_type 建议，
+    // 校验合法后 upsert 写进建议 collection（不直接生效 contact——customer/peer/friend
+    // 须经运营审核才回写）。全程 fail-soft：回复已异步发出，写建议失败绝不阻断主流程。
+    if let Some((value, evidence, confidence)) =
+        extract_relationship_type_suggestion(&decision.agent_generated_signals)
+    {
+        // MachineWrite 通道：与 Task 5（dimension drop）一致——LLM 臆造的非字典值在此
+        // Drop/Reject，不污染审核队列。relationship_type 是 AdminDirect+Taxonomy，越界
+        // 会被 classify_validation 判 Reject（llm_signal_apply 兜底当 None），不写建议。
+        let verdict = crate::agent::dimension_registry::validate_dimension_value(
+            &state.db,
+            "relationship_type",
+            &value,
+            &contact.account_id,
+            crate::agent::dimension_registry::WriteIntent::MachineWrite,
+        )
+        .await;
+        if let Some(canonical) = llm_signal_apply(verdict) {
+            let contact_id = contact.id.map(|id| id.to_hex()).unwrap_or_default();
+            let now = DateTime::now();
+            let mut set_fields = doc! {
+                "suggested_value": &canonical,
+                "confidence": confidence,
+                "last_seen_at": now,
+            };
+            if let Some(ev) = &evidence {
+                set_fields.insert("evidence", ev);
+            }
+            // upsert 锚 (workspace_id, contact_id)（T5 unique 索引）。已审（approved/rejected）
+            // 的不复活——filter 加 status="pending" 约束：仅 pending 或不存在时刷新累加；
+            // 已审记录命中不到 → 不匹配 + $setOnInsert 又因 unique 锚冲突而不新建 → no-op，
+            // 保审核结论不被新一轮建议覆盖回 pending。
+            let filter = doc! {
+                "workspace_id": &contact.workspace_id,
+                "contact_id": &contact_id,
+                "status": "pending",
+            };
+            let update = doc! {
+                "$set": set_fields,
+                "$setOnInsert": {
+                    "workspace_id": &contact.workspace_id,
+                    "account_id": &contact.account_id,
+                    "contact_id": &contact_id,
+                    "status": "pending",
+                    "first_seen_at": now,
+                },
+                "$inc": { "occurrences": 1 },
+            };
+            let opts = mongodb::options::UpdateOptions::builder().upsert(true).build();
+            // fail-soft：写建议失败（含已审记录与 unique 锚的 upsert 竞态 E11000）不阻断主流程。
+            let _ = state
+                .db
+                .collection_relationship_type_suggestions()
+                .update_one(filter, update, opts)
+                .await;
+        }
+    }
+
     // 客观购买事实 spec §6：G4→G1 纠偏命中时记一条 fail-soft 审计事件（类比
     // operation_state_transition_rejected）。reply 已照常下发、纠偏值已写入画像，
     // 这里只留可观测痕迹，不阻塞、不回滚。llm_original 为空表示 LLM 漏报 G1（补客观锚），
@@ -3544,6 +3602,18 @@ pub(crate) fn llm_signal_apply(v: crate::agent::dimension_registry::DimValidatio
     }
 }
 
+/// 数字分身 T6：从 LLM 的 `agent_generated_signals` 提取第一个
+/// `kind == "relationship_type"` 的信号，返回 `(value, evidence, confidence)`。
+/// 无该信号则 None。纯函数无 IO（后续校验/落库由调用方接力），可单测。
+fn extract_relationship_type_suggestion(
+    signals: &[crate::agent::types::AgentSignal],
+) -> Option<(String, Option<String>, i32)> {
+    signals
+        .iter()
+        .find(|s| s.kind == "relationship_type")
+        .map(|s| (s.value.clone(), s.evidence.clone(), s.confidence))
+}
+
 pub async fn write_event_for_account(
     state: &AppState,
     account_id: &str,
@@ -3662,6 +3732,34 @@ pub(crate) fn compute_taxonomy_guard_outcome(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn extract_relationship_type_suggestion_picks_kind() {
+        use crate::agent::types::AgentSignal;
+        let signals = vec![
+            AgentSignal { kind: "other".into(), value: "x".into(), evidence: None, confidence: 5 },
+            AgentSignal {
+                kind: "relationship_type".into(),
+                value: "peer".into(),
+                evidence: Some("自称同行".into()),
+                confidence: 8,
+            },
+        ];
+        let got = extract_relationship_type_suggestion(&signals);
+        assert_eq!(got, Some(("peer".to_string(), Some("自称同行".to_string()), 8)));
+    }
+
+    #[test]
+    fn extract_relationship_type_suggestion_none_when_absent() {
+        use crate::agent::types::AgentSignal;
+        let signals = vec![AgentSignal {
+            kind: "other".into(),
+            value: "x".into(),
+            evidence: None,
+            confidence: 5,
+        }];
+        assert_eq!(extract_relationship_type_suggestion(&signals), None);
+    }
 
     #[test]
     fn llm_signal_validation_drops_keep_accept() {
