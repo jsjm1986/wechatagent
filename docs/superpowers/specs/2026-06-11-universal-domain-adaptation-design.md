@@ -438,6 +438,19 @@ pub struct Contact { /* ...既有... */
 **待澄清（不阻塞内核）**：日历祝福依赖"生日/纪念日"数据从哪来；社交钩子（朋友圈/群）
 依赖 MCP 能否拉到外部事件——这两个新驱动力落地前需先摸清 MCP 能力边界，列入专题。
 
+> **✅ 2026-06-18 后端轴已落码（B 阶段·后端先行）**：relationship_type 关系类型轴后端
+> 落地——① `system_taxonomies` 加 kind `relationship_type` 三 seed 值 `customer`/`peer`/
+> `friend`（migration m024，英文 id + 中文 label，运营可经 admin API 增删如加 `supplier`）；
+> ② `DomainProfile.per_relationship_operation_mode: Option<BTreeMap<String, OperationMode>>`
+> （models.rs，serde 向后兼容，DEFAULT 销售 profile = None 零扰动）；③ `resolve_operation_mode`
+> 升三级 `contact.override ?? per_relationship[rt] ?? operation_mode`（planner/mod.rs，6 个扫描器
+> 调用点 + contact_relationship_type helper）；④ admin 写入 `OperationProfileRequest` 加
+> `relationship_type` 字段，经 normalize_dimension_value 软归一落 domain_attributes；⑤
+> example_emotional_companion_profile 配 customer/peer/friend 三套样例。**前端显形/配置（运营
+> 在 UI 选关系类型、按 profile 门控频道）是下一轮独立专题**。已知后续点：scan_renewal/
+> scan_reactivation 的扫描器级粗过滤仍用 profile 默认范式（若某关系类型开了 renewal 但 profile
+> 默认关会被整段跳过），按关系类型开启这两个驱动力的细化留待后续。
+
 ### 3.8 conversationMode + 模式×5闸阈值写死销售域价值观（H9）
 
 > **2026-06-11 压力测试发现**：用户给"加好友→托管→像男朋友一样对待她、主动提供
