@@ -635,9 +635,27 @@ pub(crate) async fn push_intent_trajectory_entry(
         .await
         .unwrap_or(0) as i32;
 
-    let objection_type = doc_string(reaction_analysis, "objectionType")
+    // objection_type 是 ReactionDerived 通道（字典 Taxonomy 源）。此前 LLM 产出裸写进
+    // 轨迹 entry 不过字典；这里过 validate_dimension_value(MachineWrite) 取归一值：
+    // Accept→落 canonical（alias 归一）；Drop→不落该字段（越界静默丢弃，轨迹是观测数据，
+    // 不进五闸/状态机，丢弃无副作用）。Reject 在机器通道按 spec 不出现，llm_signal_apply 兜底 None。
+    let raw_objection_type = doc_string(reaction_analysis, "objectionType")
         .or_else(|| doc_string(reaction_analysis, "objection_type"))
         .filter(|s| !s.trim().is_empty());
+    let objection_type = match raw_objection_type {
+        Some(raw) => {
+            let verdict = crate::agent::dimension_registry::validate_dimension_value(
+                &state.db,
+                "objection_type",
+                &raw,
+                &contact.account_id,
+                crate::agent::dimension_registry::WriteIntent::MachineWrite,
+            )
+            .await;
+            crate::agent::gateway::llm_signal_apply(verdict)
+        }
+        None => None,
+    };
 
     let mut entry = doc! {
         "turnIndex": turn_index,
