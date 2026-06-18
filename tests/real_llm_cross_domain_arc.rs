@@ -63,10 +63,11 @@ use std::sync::Arc;
 
 use mongodb::bson::{doc, oid::ObjectId, DateTime, Document};
 use mongodb::options::FindOneOptions;
+use std::time::Duration;
 use wechatagent::agent::run_envelope::{FINAL_REVIEW_STATUS_VALUES, GATEWAY_STATUS_VALUES};
 use wechatagent::agent::{
-    default_domain_profile, example_emotional_companion_profile,
-    handle_managed_message, invalidate_global_domain_profile_cache,
+    atomic_claim_pending, default_domain_profile, example_emotional_companion_profile,
+    handle_managed_message, invalidate_global_domain_profile_cache, process_entry, OutboxStatus,
 };
 use wechatagent::error::{AppError, AppResult};
 use wechatagent::llm::{LlmClient, LlmFormat, LlmJsonResult, LlmProvider};
@@ -450,6 +451,9 @@ struct ProfileFingerprint {
     memory_summary_len: usize,
     has_agent_profile: bool,
     domain_attr_keys: usize,
+    /// domain_attributes 键数，但**剔除 gateway 无条件写的键**（value_tier / *_at / 请示标记）。
+    /// arc 级「画像必落地」硬断言用这个，避免被无条件写的 value_tier 撑成永真（G11）。
+    domain_attr_keys_substantive: usize,
     tags_count: usize,
     operation_state: Option<String>,
 }
@@ -462,29 +466,55 @@ async fn capture_fingerprint(state: &AppState, wxid: &str) -> ProfileFingerprint
         .await
         .expect("query contact")
         .expect("contact exists");
+    // domain_attributes 里有些键是 gateway **无条件**写的（与 agent 是否真画像无关）：
+    // value_tier（transaction_facts_enabled=true 的销售域每轮必写 'low'）、各种 *_updated_at
+    // 时间戳、awaiting_principal_decision 标记。统计「真画像键」时必须剔除它们，否则
+    // domain_attr_keys 恒 ≥1、arc 级「画像必落地」断言永真无牙（深度审查 G11）。
+    let domain_attr_keys = contact
+        .domain_attributes
+        .as_ref()
+        .map(|d| d.keys().count())
+        .unwrap_or(0);
+    let domain_attr_keys_substantive = contact
+        .domain_attributes
+        .as_ref()
+        .map(|d| {
+            d.keys()
+                .filter(|k| !is_unconditional_domain_attr_key(k))
+                .count()
+        })
+        .unwrap_or(0);
     ProfileFingerprint {
         memory_summary_len: contact.memory_summary.as_deref().unwrap_or("").trim().chars().count(),
         has_agent_profile: contact.agent_profile.is_some(),
-        domain_attr_keys: contact
-            .domain_attributes
-            .as_ref()
-            .map(|d| d.keys().count())
-            .unwrap_or(0),
+        domain_attr_keys,
+        domain_attr_keys_substantive,
         tags_count: contact.tags.len(),
         operation_state: contact.operation_state.clone(),
     }
 }
 
+/// gateway 无条件写、与 agent 真画像无关的 domain_attributes 键（剔除后才是真画像信号）。
+fn is_unconditional_domain_attr_key(key: &str) -> bool {
+    key == "value_tier"
+        || key == "awaiting_principal_decision"
+        || key.ends_with("_updated_at")
+        || key.ends_with("_at")
+}
+
 /// 指纹是否带「任何一项非空画像信号」——arc 级硬断言用。
+/// 用 `domain_attr_keys_substantive`（剔除 value_tier 等无条件写键），否则销售域永真（G11）。
 fn has_any_profile_signal(fp: &ProfileFingerprint) -> bool {
-    fp.memory_summary_len > 0 || fp.has_agent_profile || fp.domain_attr_keys > 0
+    fp.memory_summary_len > 0 || fp.has_agent_profile || fp.domain_attr_keys_substantive > 0
 }
 
 /// 指纹是否相对基线**实质膨胀**（SmallTalk 反向观测用）。
+/// 用 substantive 键数：否则销售域首轮被 gateway 无条件写的 value_tier 撑成「膨胀」，
+/// 让「纯寒暄不应过度画像」反向观测恒触发噪声。
 fn materially_expanded(before: &ProfileFingerprint, after: &ProfileFingerprint) -> bool {
     after.memory_summary_len > before.memory_summary_len
         || (!before.has_agent_profile && after.has_agent_profile)
-        || after.domain_attr_keys > before.domain_attr_keys
+        || after.domain_attr_keys_substantive > before.domain_attr_keys_substantive
         || after.tags_count > before.tags_count
 }
 
@@ -858,6 +888,75 @@ async fn run_arc(
     eprintln!(
         "[{persona_label}][arc 总结] 发出轮数={sent_turns} 终态画像信号={} final_fp={final_fp:?}",
         has_any_profile_signal(&final_fp)
+    );
+
+    // ══ 硬断言 5（arc 级）：outbox→MCP 真实送达 + 幂等键（深度审查 G12）。══
+    // 过去 arc 把 outbox_enqueued 当"已发送"终态，从不 spawn dispatcher，MCP 桩零请求——
+    // spec R2.2/R2.5 承诺的「gateway→outbox→MCP 送达」最后一段从不被断言。现真正驱动投递：
+    // 逐个 claim+process_entry 排空 pending，断言 MCP 桩确收到 message_send_text + entry
+    // 落 sent 且幂等键非空。守门：仅当确有发出轮才验（全程被拦/skip 时无 entry，跳过）。
+    if sent_turns > 0 {
+        verify_outbox_delivery(&state, &mcp, persona_label).await;
+    }
+}
+
+/// 排空 contact 的 pending outbox 并断言真实送达 + 幂等键（G12）。
+/// 不靠后台 dispatcher（arc 不 spawn），直接复用生产 atomic_claim_pending + process_entry。
+async fn verify_outbox_delivery(state: &AppState, mcp: &MockServer, persona_label: &str) {
+    let outbox = state.db.collection_agent_send_outbox();
+    let pending_before = outbox
+        .count_documents(doc! { "status": "pending" }, None)
+        .await
+        .expect("count pending outbox");
+    assert!(
+        pending_before > 0,
+        "[{persona_label}] 有 sent 轮却无 pending outbox 行——approved 决策必先入 outbox（幂等键）再发 MCP，缺失=送达链断裂"
+    );
+
+    // 逐个 claim + process_entry（生产投递路径），最多排 pending 数 + 余量轮。
+    let mut delivered = 0usize;
+    for _ in 0..(pending_before + 2) {
+        let claimed = atomic_claim_pending(state, "arc_delivery_worker", 60)
+            .await
+            .expect("claim pending outbox");
+        let Some(entry) = claimed else { break };
+        process_entry(state, &entry)
+            .await
+            .expect("process_entry 投递必须 Ok");
+        let processed =
+            common::wait_for_outbox_processed(state, entry.id.expect("entry id"), Duration::from_secs(5))
+                .await;
+        assert_eq!(
+            processed.status,
+            OutboxStatus::Sent.as_str(),
+            "[{persona_label}] outbox entry 投递后必须落 sent（MCP 桩成功），实际={:?}",
+            processed.status
+        );
+        assert!(
+            !processed.idempotency_key.trim().is_empty(),
+            "[{persona_label}] 已送达 entry 的 idempotency_key 不应为空——幂等去重的唯一约束键缺失"
+        );
+        assert!(processed.sent_at.is_some(), "[{persona_label}] sent 后 sent_at 必填");
+        delivered += 1;
+    }
+    assert!(
+        delivered > 0,
+        "[{persona_label}] 无任何 outbox entry 被成功投递——送达链未真正闭合"
+    );
+
+    // MCP 桩侧反向确认：确收到 message_send_text 请求（gateway→outbox→MCP 全链真打到桩）。
+    let mcp_requests = mcp
+        .received_requests()
+        .await
+        .expect("MCP 桩应可读取 received_requests");
+    assert!(
+        mcp_requests.len() >= delivered,
+        "[{persona_label}] MCP 桩收到的请求数({})应 ≥ 成功投递数({delivered})——outbox→MCP 这一段没真打到桩",
+        mcp_requests.len()
+    );
+    eprintln!(
+        "[{persona_label}][outbox→MCP] 真实投递 {delivered} 条，MCP 桩收到 {} 请求，幂等键均非空 ✓",
+        mcp_requests.len()
     );
 }
 
