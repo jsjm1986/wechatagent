@@ -451,6 +451,15 @@ pub(crate) async fn decide_reply_with_promote(
     // （情感陪伴）空串、task prompt 字节等价。指引 LLM 走弱信号通道（agentGeneratedSignals
     // kind=suspected_deal）+ 主动求证话术，绝不直写 outcome_events（§2.1 红线）。
     let task_template = format!("{task_template}{suspected_deal_text}");
+    // 数字分身 T7：关系性质（relationship_type）建议指引。常驻追加——但它只是「有
+    // 明确新证据才产出」的可选指引，DEFAULT 销售域追加本段不改变既有行为（无新证据
+    // → 不产信号）。引导 LLM 走 agentGeneratedSignals 弱信号通道（kind=relationship_type，
+    // 与 gateway::extract_relationship_type_suggestion 提取契约逐字对齐），经字典校验后
+    // upsert 进建议 collection，须运营审核才回写 contact。
+    let task_template = format!(
+        "{task_template}{}",
+        super::entitlements::render_relationship_type_suggestion_guidance()
+    );
     // universal-domain-adaptation G1：在 task prompt 末尾追加本行业「参与决策」的
     // 非销售 typed 维度指引（告知 LLM 走 domainSignals 容器输出）。DEFAULT 销售域
     // 只有 customer_stage/intent_level 两维（typed）→ 空串、prompt 字节等价；
