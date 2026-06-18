@@ -27,7 +27,12 @@
 - **根因（静态追证，CI 无 Docker 不能本地复跑）**：进程级 `GLOBAL_TAXONOMY_CACHE`（`taxonomy.rs:528`，LazyLock 单例 + 30s TTL）跨同一 test binary 内多 `#[tokio::test]` 复用。`TestApp::start` 跑了 m006 迁移种 taxonomy 字典，但**未**像 `main.rs:83` 预热缓存。缓存停留在最先 `find_or_load` 的那个测试 ephemeral testcontainer DB 上 → 后续测试 `check_value` 查不到本测试 DB 字典项 → `CandidateNew` → `validate_dimension_value(MachineWrite)` → `DropSilently`（dimension_registry.rs:236-239）→ `customer_stage` 键被 gateway:2697 移除 → C2 派生（gateway:2802）回落 `decision.operation_state`。
 - **触发时机**：并行会话把 `customer_stage` 接入 `validate_dimension_value`（gateway:2677）后此路径才激活，暴露 TestApp 与 main.rs 启动序列分歧。
 - **不是 agent 短板** —— mock-LLM 测试，被测的是 gateway C2 派生确定性逻辑，agent 不参与。是测试 harness 与生产启动序列不一致。
-- **修复**：`TestApp::start` 加 `init_global_taxonomy_cache(&db)`（commit e3df663，测试 only）。`warm_up` 忽略 TTL 无条件 reload，每个 TestApp 对齐自己 DB；m006 全局 scope 字典各 DB 一致，并发无害。待 CI 复验。
+- **三轮诊断坐实根因（运行期证据，非静态猜测）**：
+  - 诊断1：落库 `domain_attributes={"value_tier"}`——customer_stage 缺失（value_tier 走 CodeEnum 独立路径故在）。
+  - 诊断2：`active_profile_id="__default__"` 且 `declared_dims=["customer_stage","intent_level"]`——**排除 retain 白名单**（DEFAULT 声明了 customer_stage）。
+  - 诊断3：`agent.dimension_dropped 事件数=1`——**坐实是 gateway `validate_dimension_value` 字典校验把 customer_stage 判为字典外 DropSilently 移除**（我先前 grep 日志找不到此事件是因它写 DB 不写 stdout）。
+- **已尝试两修均未中（诚实记录）**：① e3df663 预热 taxonomy 缓存——panic 值完全不变；② 009af1c 预热 domain_profile 缓存——同样不变。两次都没消除 dimension_dropped。说明缓存预热**没有解决字典 miss**，根因比"缓存未预热"更深（warm_up 应已 force-load m006，但 check_value 仍 miss `relationship_building`——疑似并发 c2 双测试抢全局缓存 / warm_up 与 gateway 读时序，未坐实）。
+- **状态**：⚠️ **未修，已达 systematic-debugging 3 次阈值**。按 skill 纪律停止盲打补丁。这是**测试 harness setup bug，非被测 agent/生产逻辑缺陷**——C2 派生的生产正确性另由 `c2_state_transition_cross_domain.rs`（通过）覆盖。决定：标 known-issue，不再烧 CI 周期，待后续要么 (a) 加 `serial_test` 串行化 c2 双测试排除并发抢缓存，要么 (b) 把测试改成显式 seed active profile 而非依赖 DEFAULT 回落+全局缓存。
 
 ---
 
