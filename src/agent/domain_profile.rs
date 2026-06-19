@@ -111,6 +111,15 @@ pub fn default_memory_dimensions() -> Vec<MemoryDimension> {
         .collect()
 }
 
+/// H17 DEFAULT：销售域轨迹维度 = 单维 objection_type，渲染标签"异议类型"。
+/// 与改造前 IntentTrajectoryEntry.objection_type 行为等价（写侧仍走旧字段）。
+pub(crate) fn default_trajectory_dimensions() -> Vec<crate::models::TrajectoryDimension> {
+    vec![crate::models::TrajectoryDimension {
+        kind: "objection_type".to_string(),
+        display_name: "异议类型".to_string(),
+    }]
+}
+
 /// H17：把 active profile 的记忆维度渲染成一段 Reply Agent 任务指引，告知本行业
 /// `memoryCandidates[].type` 的合法值（candidate_type=true 的维度 key + 固定的
 /// fact/conflict）。
@@ -813,6 +822,10 @@ pub fn default_domain_profile(workspace_id: &str) -> DomainProfile {
         // objections/openLoops/openQuestions/confirmedFacts/conflicts）+ 原 cap。空集时
         // 消费方回落同一组维度，故 seed 与回落同源、cap/prompt 字节等价。
         memory_dimensions: default_memory_dimensions(),
+        // H17：DEFAULT 销售域 = 单维 objection_type 轨迹维度（渲染"异议类型"）。空集时
+        // 消费方回落同一组维度；写侧仍走 IntentTrajectoryEntry.objection_type 旧字段、
+        // dimensions 容器留空，故字节等价。
+        trajectory_dimensions: default_trajectory_dimensions(),
         // H18：DEFAULT 不声明去抖窗口覆盖 → webhook 回落全局 config.message_debounce_window_ms
         // （销售域字节等价）。换行业可声明更长/更短窗口。
         debounce_window_ms_override: None,
@@ -1247,6 +1260,14 @@ mod tests {
         // §3.7 护栏：calendar 默认**关**（主动情绪触达销售域绝不默认开）→ scan_calendar
         // 对销售域 no-op，所有 planner 金标零变化。
         assert!(!p.operation_mode.calendar.enabled);
+    }
+
+    #[test]
+    fn default_trajectory_dimensions_is_objection_only() {
+        let dims = default_trajectory_dimensions();
+        assert_eq!(dims.len(), 1);
+        assert_eq!(dims[0].kind, "objection_type");
+        assert_eq!(dims[0].display_name, "异议类型");
     }
 
     #[test]

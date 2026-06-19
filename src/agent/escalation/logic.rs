@@ -650,6 +650,7 @@ mod tests {
             turn_index: 0,
             intent: intent.into(),
             objection_type: None,
+            dimensions: Default::default(),
             recorded_at: mongodb::bson::DateTime::now(),
         }
     }

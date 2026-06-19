@@ -106,6 +106,7 @@ async fn db_create_profile(
         methodology_generator_preamble: None,
         business_formulas: vec![],
         memory_dimensions: vec![],
+        trajectory_dimensions: vec![],
         debounce_window_ms_override: None,
         current_version: false,
         previous_version: None,
