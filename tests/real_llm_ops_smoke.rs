@@ -1356,6 +1356,45 @@ async fn t6_real_unverified_product_claim_is_gated() {
     }
     print_quality_report(&state, &contact.wxid, "t6-product-claim").await;
     run_judge(&state, &contact.wxid, "t6-product-claim").await;
+
+    // 阶段1 J1 验证：用统一内核 + 底料评判，factualRestraint 应能对照（空）知识库判无据承诺。
+    if std::env::var("REAL_LLM_JUDGE").map(|v| v == "1").unwrap_or(false) {
+        use mongodb::options::FindOneOptions;
+        let rubric = crate::common::judge::build_judge_rubric(
+            &wechatagent::agent::load_active_domain_profile(&state.db, &contact.workspace_id).await,
+        );
+        let reply = state
+            .db
+            .decision_reviews()
+            .find_one(
+                doc! { "contact_wxid": &contact.wxid },
+                FindOneOptions::builder().sort(doc! { "created_at": -1 }).build(),
+            )
+            .await
+            .ok()
+            .flatten()
+            .and_then(|r| r.reply_text)
+            .unwrap_or_default();
+        let ctx = crate::common::judge::collect_judge_context(&state, &contact.wxid, None).await;
+        let judge = judge_provider(&state);
+        let outcome = crate::common::judge::run_judge_graded_with_context(
+            judge.as_ref(),
+            &rubric,
+            "t6-grounded",
+            "多少钱能保证效果吗",
+            &reply,
+            &ctx,
+            1,
+            crate::common::judge::JudgeGate::ObserveOnly,
+        )
+        .await;
+        if let Some(o) = outcome {
+            eprintln!(
+                "[t6 J1验证] factualRestraint(对照知识库)={:?}",
+                o.medians.get("factualRestraint")
+            );
+        }
+    }
 }
 
 // ── T7 · 真实多场景通用性（异议 / 咨询 / 闲聊 / 边界）─────────────────────────
