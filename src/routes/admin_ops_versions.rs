@@ -158,9 +158,38 @@ pub(super) async fn publish_operation_domain_version(
 /// 联动是 best-effort；缺底座行属于异常部署态，留给 `ensure_operation_domains` 兜底而非在此
 /// 凭空造一条无 name/goal/methodology 的半残行。
 ///
-/// 事务性：与现有 publish handler 一致——本代码库不使用 MongoDB 多文档事务，沿用
-/// 「先 insert 新 current，再 demote 其余」的 best-effort 顺序，保证「至多一条 current」
-/// 不变量在正常完成时成立。
+/// 一条 `operation_state_policies` 行的 `seeded_by` 是否「机器派生 / 可安全刷新」。
+///
+/// publish 重派生 policy 时用它区分**机器派生行**（安全刷新）与**运营手工调整行**
+/// （保留，绝不 clobber，与 m013 skip-existing 同红线）：
+/// - `None`（无溯源）→ 机器派生（早期未打标的派生行）→ 可刷新
+/// - `"statemachine_publish:*"`（本 publish 路径联动派生）→ 可刷新
+/// - `"legacy_migration"`（m013 从 DEFAULT 机器 seed 的行）→ 可刷新
+/// - 其它任意值（如 `"admin_manual"` / 运营后台手设）→ 手工行 → **保留**
+pub(crate) fn is_refreshable_policy_seeded_by(seeded_by: &Option<String>) -> bool {
+    match seeded_by.as_deref() {
+        None => true,
+        Some(s) => s.starts_with("statemachine_publish:") || s == "legacy_migration",
+    }
+}
+
+/// 事务性 / current-flag 竞态边界（universal/H13 (3)，judgment call 已定）：
+///
+/// 沿用「先 insert 新 current（`current_version=true`），再 demote 同 scope 其余行」的
+/// best-effort 顺序，**不**引入事务、**不**加 `current_version=true` 唯一分区索引。理由：
+/// - 本代码库不使用 MongoDB 多文档事务（显式约定，见 [`insert_new_current_domain_config`]
+///   doc），且 testcontainers mongo 单节点无副本集 → 事务不可用。
+/// - `current_version=true` 唯一分区索引会强制 demote-then-insert 顺序，打开「0 current」窗口：
+///   并发 runtime 读此刻回落 DEFAULT-sales（比「2 条 industry current」更坏的失败方向）；
+///   且 `ensure_indexes` 用 `?` 非 best-effort，存量脏 current 行会**直接 brick 启动**
+///   （prod-117 部署炸雷），无配套清理不可加。
+///
+/// 残留（accepted-and-bounded）：在**真正并发的、本体各不相同**的 publish（admin-only，极罕见）
+/// 下，最终 current flag 可能短暂出现 2 条 current。可接受因为：
+/// (i) `(workspace,domain,version)` 唯一索引已挡住「重复 version」这个危险竞态；
+/// (ii) 下方 no-op 幂等消除了「同机器重复 activate」这个最常见触发器；
+/// (iii) 失败方向良性——多出的也是 industry 机器（非 DEFAULT-sales），且下次 publish 自愈；
+/// (iv) 事务不可用，唯一索引会引入更坏的 0-current 窗口 + 启动炸雷。
 pub(crate) async fn publish_state_machine_version(
     db: &Database,
     workspace_id: &str,
@@ -187,6 +216,20 @@ pub(crate) async fn publish_state_machine_version(
         );
         return Ok(());
     };
+
+    // universal/H13 (1) no-op 幂等：本体与当前 current 行逐字节相等 → 整个
+    // insert+demote+policy 重派生全部跳过，直接 Ok(())。最常见触发器是 admin 重复
+    // 激活同一 profile（或 activate 被重试）——此前每次都往 operation_domain_configs
+    // 灌一版本体完全相同的新行（版本膨胀 + 放大 current-flag 竞态窗口）。本短路让
+    // 「重复激活同机器」成为真正的 no-op，从源头消除最常见的竞态触发器。
+    if new_state_machine == source.state_machine {
+        tracing::debug!(
+            workspace_id,
+            domain,
+            "publish_state_machine_version: state machine unchanged, skip republish (no-op 幂等)"
+        );
+        return Ok(());
+    }
 
     let scope = doc! {
         "workspace_id": workspace_id,
@@ -233,6 +276,11 @@ pub(crate) async fn publish_state_machine_version(
         let Some(state_key) = state.get_str("key").ok().filter(|k| !k.is_empty()) else {
             continue;
         };
+        let forbids_proactive = state.get_bool("forbidsProactive").unwrap_or(false);
+        let (allowed, forbidden) =
+            crate::db::migrations::m013_seed_user_operation_state_policies::derive_state_policy_lists(
+                forbids_proactive,
+            );
         match db
             .operation_state_policies()
             .find_one(
@@ -245,14 +293,43 @@ pub(crate) async fn publish_state_machine_version(
             )
             .await
         {
-            // 已有行 → 跳过保留运营手工调整（与 m013 同语义）。
-            Ok(Some(_)) => continue,
-            Ok(None) => {
-                let forbids_proactive = state.get_bool("forbidsProactive").unwrap_or(false);
-                let (allowed, forbidden) =
-                    crate::db::migrations::m013_seed_user_operation_state_policies::derive_state_policy_lists(
-                        forbids_proactive,
+            // 已有行：区分机器派生行（可安全刷新）与运营手工行（保留，绝不 clobber）。
+            // 机器派生行若新本体的 forbidsProactive 与存量派生的 (allowed, forbidden) 不一致
+            // → in-place update（解决「forbidsProactive 切换后旧 policy 行陈旧、切换静默失效」）；
+            // 一致则不写。手工行（其它 seeded_by）一律 continue，与 m013 skip-existing 同红线。
+            Ok(Some(existing)) => {
+                if !is_refreshable_policy_seeded_by(&existing.seeded_by) {
+                    continue;
+                }
+                if existing.allowed == allowed && existing.forbidden == forbidden {
+                    continue;
+                }
+                if let Err(err) = db
+                    .operation_state_policies()
+                    .update_one(
+                        doc! { "_id": existing.id },
+                        doc! {
+                            "$set": {
+                                "allowed": &allowed,
+                                "forbidden": &forbidden,
+                                "updated_at": now,
+                                "seeded_by": &policy_seeded_by,
+                            }
+                        },
+                        None,
+                    )
+                    .await
+                {
+                    tracing::warn!(
+                        workspace_id,
+                        domain,
+                        state_key,
+                        error = %err,
+                        "publish_state_machine_version: 刷新 operation_state_policy 失败（best-effort，跳过该 state 继续）"
                     );
+                }
+            }
+            Ok(None) => {
                 let policy = OperationStatePolicy {
                     id: None,
                     workspace_id: workspace_id.to_string(),
@@ -765,5 +842,34 @@ mod tests {
     fn rollback_rejects_when_no_previous_version() {
         let target_prev: Option<i32> = None;
         assert!(target_prev.is_none(), "无 previous_version 时 rollback 应被拒绝");
+    }
+
+    /// H13 (2)：`is_refreshable_policy_seeded_by` 区分机器派生行（可刷新）与手工行（保留）。
+    #[test]
+    fn refreshable_seeded_by_classifies_machine_vs_operator() {
+        use super::is_refreshable_policy_seeded_by;
+        // 机器派生 / 可安全刷新
+        assert!(is_refreshable_policy_seeded_by(&None), "None（无溯源）可刷新");
+        assert!(
+            is_refreshable_policy_seeded_by(&Some("legacy_migration".to_string())),
+            "m013 seed tag 可刷新"
+        );
+        assert!(
+            is_refreshable_policy_seeded_by(&Some("statemachine_publish:profile:edu-k12".to_string())),
+            "statemachine_publish:* 可刷新"
+        );
+        assert!(
+            is_refreshable_policy_seeded_by(&Some("statemachine_publish:manual".to_string())),
+            "statemachine_publish:manual 可刷新"
+        );
+        // 运营手工 / 必须保留
+        assert!(
+            !is_refreshable_policy_seeded_by(&Some("admin_manual".to_string())),
+            "admin_manual 是手工行，不可刷新"
+        );
+        assert!(
+            !is_refreshable_policy_seeded_by(&Some("manual".to_string())),
+            "其它任意值视为手工行，不可刷新"
+        );
     }
 }
