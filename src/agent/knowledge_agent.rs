@@ -1301,7 +1301,14 @@ pub async fn follow_relations(
                 if role == RelationRole::Version {
                     continue;
                 }
-                if !visited.insert(rel.chunk_id.clone()) {
+                // 仅**检查**原始关系目标是否已访问，不在此处占位插入——去重的唯一
+                // insert 留给下方 resolved_hex（:1315）。否则未被取代的目标
+                // （resolve_superseded 原样返回，resolved_hex == rel.chunk_id）会在这里
+                // 先占位、到 :1315 二次 insert 必返 false → 被误 continue 丢弃（D3 关系
+                // 图谱预取对所有非 superseded 目标整体失效）。superseded 目标的原始 id
+                // 此处不占位，由 resolved_hex 去重；防环（指回 source / 已收集目标）也
+                // 由 visited 里已有的现行 id 兜住。
+                if visited.contains(&rel.chunk_id) {
                     continue;
                 }
                 let target_oid = match ObjectId::parse_str(&rel.chunk_id) {

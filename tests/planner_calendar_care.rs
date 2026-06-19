@@ -13,6 +13,7 @@
 mod common;
 
 use mongodb::bson::{doc, DateTime, Document};
+use serial_test::serial;
 use wechatagent::agent::{
     default_domain_profile, example_emotional_companion_profile,
     invalidate_global_domain_profile_cache,
@@ -118,6 +119,7 @@ async fn seed_active_profile(db: &wechatagent::db::Database, mut profile: Domain
 
 #[tokio::test]
 #[ignore]
+#[serial]
 async fn calendar_care_emits_for_emotional_profile_today_anniversary() {
     let app = common::TestApp::start().await;
 
@@ -185,6 +187,7 @@ async fn calendar_care_emits_for_emotional_profile_today_anniversary() {
 
 #[tokio::test]
 #[ignore]
+#[serial]
 async fn calendar_care_no_emit_for_default_sales_profile() {
     let app = common::TestApp::start().await;
 
