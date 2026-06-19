@@ -160,6 +160,10 @@ pub(crate) async fn publish_state_machine_version(
     };
     let next_version = next_version_for_scope(db.operation_domain_configs(), scope).await?;
     let now = DateTime::now();
+    // policy 行的溯源标签：在 `seeded_by` 被 move 进 config insert 前先派生一个可区分的
+    // 并行标签（`statemachine_publish:<原 seeded_by>`，如 `statemachine_publish:profile:edu-k12`），
+    // 让 operation_state_policies 里这批联动派生的行能与 config 行/手工行/legacy_migration 行区分。
+    let policy_seeded_by = format!("statemachine_publish:{seeded_by}");
     // 克隆当前 current 行的全部非 state_machine 字段（name/goal/methodology/…一一保留），
     // 只把 state_machine 换成注入的本体——这正是「消费方零改动」的保证。
     let new_entry = OperationDomainConfig {
@@ -195,6 +199,86 @@ pub(crate) async fn publish_state_machine_version(
         None,
     )
     .await?;
+
+    // universal/H13 修补：状态机本体进 operation_domain_configs 不会自动让主动触达门生效。
+    // 主动触达由派生表 operation_state_policies enforce（guards::enforce_state_action_policy
+    // 对缺失 policy 行 fail-open → 不拦），而该表此前仅 m013 从 DEFAULT 机器 seed。这里
+    // 在 publish 新机器后，按机器里每个 state 的 `forbidsProactive` 标志**联动重派生** policy
+    // 行（复用 m013 的 `derive_state_policy_lists` 唯一真相），让非销售 profile 标
+    // `forbidsProactive:true` 的 state 真正拦住主动发。
+    //
+    // best-effort：与本 helper 整体一致（无 current 行时 warn+Ok）——单个 state 的 policy
+    // 派生失败只 `warn!` 并继续下一个，绝不 `?` 传播出去把已成功的 activate/publish 拖垮。
+    // 一个坏 state 不应让后续 state 的 policy 漏派生，故 per-state warn-and-continue。
+    let states = new_entry
+        .state_machine
+        .get_array("states")
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|item| item.as_document().cloned())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    for state in &states {
+        let Some(state_key) = state.get_str("key").ok().filter(|k| !k.is_empty()) else {
+            continue;
+        };
+        match db
+            .operation_state_policies()
+            .find_one(
+                doc! {
+                    "workspace_id": workspace_id,
+                    "domain": domain,
+                    "state_key": state_key,
+                },
+                None,
+            )
+            .await
+        {
+            // 已有行 → 跳过保留运营手工调整（与 m013 同语义）。
+            Ok(Some(_)) => continue,
+            Ok(None) => {
+                let forbids_proactive = state.get_bool("forbidsProactive").unwrap_or(false);
+                let (allowed, forbidden) =
+                    crate::db::migrations::m013_seed_user_operation_state_policies::derive_state_policy_lists(
+                        forbids_proactive,
+                    );
+                let policy = OperationStatePolicy {
+                    id: None,
+                    workspace_id: workspace_id.to_string(),
+                    domain: domain.to_string(),
+                    state_key: state_key.to_string(),
+                    allowed,
+                    forbidden,
+                    recommended_pace: None,
+                    status: "active".to_string(),
+                    updated_at: now,
+                    version: 1,
+                    current_version: true,
+                    previous_version: None,
+                    seeded_by: Some(policy_seeded_by.clone()),
+                };
+                if let Err(err) = db.operation_state_policies().insert_one(&policy, None).await {
+                    tracing::warn!(
+                        workspace_id,
+                        domain,
+                        state_key,
+                        error = %err,
+                        "publish_state_machine_version: 派生 operation_state_policy 失败（best-effort，跳过该 state 继续）"
+                    );
+                }
+            }
+            Err(err) => {
+                tracing::warn!(
+                    workspace_id,
+                    domain,
+                    state_key,
+                    error = %err,
+                    "publish_state_machine_version: 查询 operation_state_policy 失败（best-effort，跳过该 state 继续）"
+                );
+            }
+        }
+    }
     Ok(())
 }
 

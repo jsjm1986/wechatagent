@@ -1236,3 +1236,63 @@ async fn e2e_activate_without_machine_leaves_configs_unchanged() {
         "current 版本号不变"
     );
 }
+
+/// H13 修补：activate 带 `forbidsProactive:true` state 的 generated_state_machine →
+/// publish 联动重派生 operation_state_policies，该 state 拿到 active policy 行且
+/// `forbidden` 含 "reply"（主动触达门真正生效，不再 fail-open 静默忽略）。
+#[tokio::test]
+#[ignore]
+async fn e2e_activate_derives_state_policies_for_forbids_proactive() {
+    let app = common::TestApp::start().await;
+    let db = app.state.db.clone();
+    let ws = app.state.config.default_workspace_id.clone();
+
+    // 底座 current 销售域 config（version=1）。
+    db_seed_base_domain_config(&db, &ws).await;
+
+    // 行业机器：x_intro（initial）+ grieving（哀伤期，forbidsProactive=true，非 cooldown）。
+    let machine = doc! {
+        "states": [
+            { "key": "x_intro", "name": "开场", "initial": true, "allowedFrom": [] },
+            { "key": "grieving", "name": "哀伤期", "allowedFrom": ["x_intro"], "forbidsProactive": true },
+        ]
+    };
+    let pid = db_create_profile(&db, &ws, "grief-care", "哀伤陪伴", "情感陪伴", "generated_by_ai").await;
+    db.domain_profiles()
+        .update_one(
+            doc! { "_id": pid },
+            doc! { "$set": { "current_version": true, "generated_state_machine": &machine } },
+            None,
+        )
+        .await
+        .expect("set current + machine");
+
+    let _ = wechatagent::routes::domain_profiles::activate_domain_profile(
+        State(app.state.clone()),
+        Extension(test_admin(&ws)),
+        Path(pid.to_hex()),
+    )
+    .await
+    .expect("activate handler ok");
+
+    // 断言：grieving state 派生了 active policy 行，forbidden 含 "reply"。
+    let policy = db
+        .operation_state_policies()
+        .find_one(
+            doc! {
+                "workspace_id": &ws,
+                "domain": "user_operations",
+                "state_key": "grieving",
+                "status": "active",
+            },
+            None,
+        )
+        .await
+        .expect("query state policy")
+        .expect("grieving policy row exists");
+    assert!(
+        policy.forbidden.iter().any(|a| a == "reply"),
+        "forbidsProactive=true 的 grieving state policy forbidden 应含 reply: {:?}",
+        policy.forbidden
+    );
+}
