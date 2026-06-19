@@ -1521,6 +1521,12 @@ pub struct DomainProfile {
     /// 渲染 completeness prompt 的判断规则段、并回传前端档位标签。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub answering_mode_profile: Option<AnsweringModeProfile>,
+    /// H13：引导层 AI 生成 profile 时联动产出的状态机本体（draft 暂存料）。
+    /// activate 时取出、过 validate_state_machine、publish 一版新 OperationDomainConfig；
+    /// **发布后运行时只读 operation_domain_configs，不读本字段**（不造双真相源）。
+    /// None = 无生成本体 → activate 不动状态机，运行时回落现有 DEFAULT 销售 9 态。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generated_state_machine: Option<Document>,
     /// E5-T1 多版本灰度：同 `(workspace_id, profile_id)` 下 `version` 单调递增。
     #[serde(default = "default_version_one")]
     pub version: i32,
@@ -5408,5 +5414,21 @@ mod relationship_type_suggestion_tests {
         assert_eq!(back.occurrences, 1);
         assert!(back.reviewed_at.is_none());
         assert!(back.reviewed_by.is_none());
+    }
+}
+
+#[cfg(test)]
+mod generated_state_machine_tests {
+    use super::*;
+    use crate::agent::domain_profile::default_domain_profile;
+
+    /// H13：`DomainProfile.generated_state_machine` 默认 None + BSON round-trip 保真。
+    #[test]
+    fn generated_state_machine_defaults_none_and_round_trips() {
+        let p = default_domain_profile("ws");
+        assert!(p.generated_state_machine.is_none());
+        let d = mongodb::bson::to_document(&p).unwrap();
+        let back: DomainProfile = mongodb::bson::from_document(d).unwrap();
+        assert!(back.generated_state_machine.is_none());
     }
 }
