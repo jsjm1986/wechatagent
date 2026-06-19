@@ -230,11 +230,24 @@
 - **病根**：客户情绪常是**跨轮累积**的（前三轮压抑、第四轮爆发）。孤立看第四轮可能误判情绪强度/性质。与红线同源——情绪也是对话级语义。
 - **影响**：emotionalValue 两尺子选错 → 共情维度判定失真。
 
+### J6.【全套盘点新发现】轨迹裁判已有对话级雏形但未校准 —— ✅ 真缺陷
+- **坐实**：`real_llm_dynamic_adversarial` 已有 **R5.2 轨迹裁判评整段对话**（J4 对话级的雏形！），但注释明示"**校准未达标、只 ledger 不进门**"。
+- **病根**：与 J3 同根——轨迹裁判和 roleplayer 都缺校准锚定。对话级评判已起步却因没校准而不敢进门，价值未兑现。
+- **影响**：J4 的能力部分已存在但悬空。重构阶段 3（对话级）应吸收 R5.2 轨迹裁判、阶段 4 同时给它补校准。
+
+### 全套盘点·更优现成资产（统一内核应吸收，非重造）
+- **`build_judge_rubric(&profile)`（tests/common/judge.rs）**：`principal_channel`/`proactive_outreach`/`cross_domain_arc` 已用它**从 active DomainProfile 派生裁判标尺**（销售域出销售 rubric、情感域出陪伴 rubric、极性自动翻转），比 adversarial 硬编码 `JUDGE_SYSTEM` 先进、可跨域。**它现管"判什么维度"不管"喂什么底料"**——统一内核 `judge_conversation` 应站它肩上：复用它出标尺，叠加 J1/J2 底料注入 + J4 粒度。
+
+### 全套 18 文件评估结论
+- **① 健康（确定性判定，不碰）**：knowledge/recall_benchmark/smoke 的 contains 判 chunk_id/seed/cite⊆seed，确定性事实非语义词表。
+- **② 词表病灶（随 common 重构自动覆盖）**：digital_twin_arc/principal_relay 复用 `assert_no_handoff_or_identity_leak`；principal_relay 另有 `FORBIDDEN_BACKSTAGE_MARKERS`（幕后真人词表）应纳入对话级 LLM 裁判。
+- **③ 更优资产+新失真点**：build_judge_rubric 吸收复用；J6 轨迹裁判并入阶段 3/4。
+
 ### 优先级（待与用户排）
 - **J1 + J3 最伤**：污染所有维度底料（J1=裁判端 grounding 缺失，J3=输入端 roleplayer 失真）。
-- **J4 = jsjm1986 原意的正解**：补"对话级评判"，与转人工红线 spec 的"对话级判定"同方向，可合并设计。
+- **J4/J6 = jsjm1986 原意正解**：补"对话级评判"，J6 雏形已存在待吸收+校准。
 - J2/J5 次之：特定维度（一致性/情绪）的底料补全。
-- **边界**：全是测试层方法学改进，不碰生产。当前转人工红线 spec 仅覆盖 J4 的一部分（红线对话级），J1/J2/J3/J5 是更大的面，需单独设计，**勿急扩当前 spec 范围**。
+- **边界**：全是测试层方法学改进，不碰生产。已升级为统一重构 spec（`docs/superpowers/specs/2026-06-19-evaluation-system-overhaul-design.md`）覆盖 J1-J6+红线+全套 18 文件。
 
 ---
 

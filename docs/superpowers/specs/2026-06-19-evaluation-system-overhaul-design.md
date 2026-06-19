@@ -88,6 +88,23 @@ JudgeInput {
 
 **结论**：t3-t18 不需逐弧单独修。它们通过**共用评判入口**（run_judge / 词表红线 / 多轮无总评）继承同样病灶，统一内核重构在阶段 1-3 自动覆盖全部 8 个调 run_judge 的弧 + 多轮弧。这正是"抽统一内核"相对"逐弧打补丁"的根本价值。
 
+## 四之二、其余 18 个真模型测试文件评估（全套盘点，不漏一个）
+
+逐文件核查判定方式，分三类：
+
+**① 确定性判定（健康，重构不碰）**：
+- `real_llm_knowledge` / `real_llm_recall_benchmark` / `real_llm_smoke`：`contains` 判的是 **chunk_id 命中 / seed 词命中 / cite⊆seed**——确定性事实（召回到没到、引用越没越界），非语义词表，**无评判失真**。recall 另有 reach/adopt 量化指标。保留。
+
+**② 复用红线词表（继承 T2/T3 病灶，重构通过共用 common 函数自动覆盖）**：
+- `digital_twin_arc` / `principal_relay`：`use assert_no_handoff_or_identity_leak`——复用同一词表红线。阶段 2/5 改 `redline.rs` 时**自动覆盖**（共用 common）。
+- `principal_relay` 另有 `FORBIDDEN_BACKSTAGE_MARKERS`（幕后真人词表，判转述是否泄露决策源）——**同类词表硬判**，应一并纳入对话级 LLM 裁判（语义判"转述有没有暴露背后真人"，而非词表）。
+
+**③ 已有更先进资产 + 一个新失真点**：
+- **`build_judge_rubric(&profile)`（common/judge.rs）是现成的更优资产**：`principal_channel` / `proactive_outreach` / `cross_domain_arc` 已用它**从 active DomainProfile 派生裁判标尺**（销售域出销售 rubric、情感域出陪伴 rubric、极性自动翻转）。比 adversarial 硬编码 `JUDGE_SYSTEM` 更先进、可跨域。**统一内核 `judge_conversation` 必须站在它肩上**——复用 `build_judge_rubric` 出"判什么维度"，再叠加本 spec 的"喂什么底料(J1/J2)+什么粒度(J4)"。**不另起炉灶**。它现管标尺不管底料，正是统一内核要补的缺口。
+- **J6【新失真点】轨迹裁判已有雏形但未校准**：`dynamic_adversarial` 已有 **R5.2 轨迹裁判评整段对话**（J4"对话级总评"的雏形！），但**校准未达标、只 ledger 不进门**。与 J3 同根——轨迹裁判和 roleplayer 都缺校准锚定。阶段 3（对话级）应吸收 R5.2 轨迹裁判、阶段 4（roleplayer 校准）应同时给轨迹裁判补校准。
+
+**全套结论**：18 个文件无一漏网。健康的（①）保留；词表病灶（②）随 common 函数重构自动覆盖；更优资产（`build_judge_rubric`）被统一内核吸收复用而非重造；新失真点 J6（轨迹裁判未校准）并入阶段 3/4。**统一内核重构覆盖全部牵扯 LLM 评判的测试，不只 adversarial+ops。**
+
 ## 五、影响面与边界
 
 - **测试 only**：不碰 src/ 生产（prompts/guards/gateway 一律不动）。
