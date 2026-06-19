@@ -1472,6 +1472,10 @@ pub struct DomainProfile {
     /// 纳入本字段，只有 `extra` 容器里的业务数组槽位走 memory_dimensions。
     #[serde(default)]
     pub memory_dimensions: Vec<MemoryDimension>,
+    /// H18：该行业的 webhook 去抖窗口（毫秒）。None 回落全局 config.message_debounce_window_ms。
+    /// 陪伴域可设更长窗口（合并多条情绪表达），销售域用默认。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub debounce_window_ms_override: Option<u64>,
     /// universal-domain-adaptation C3：引导层「运营方法生成器」（playbook.generator /
     /// optimizer）的领域专属 system 引导语。`None` 时回落内置**领域中性**生成器引导语
     /// （C3 清理后 `PLAYBOOK_METHODOLOGY_SYSTEM` 已去除「消费心理学/顾问式销售/异议/

@@ -813,6 +813,9 @@ pub fn default_domain_profile(workspace_id: &str) -> DomainProfile {
         // objections/openLoops/openQuestions/confirmedFacts/conflicts）+ 原 cap。空集时
         // 消费方回落同一组维度，故 seed 与回落同源、cap/prompt 字节等价。
         memory_dimensions: default_memory_dimensions(),
+        // H18：DEFAULT 不声明去抖窗口覆盖 → webhook 回落全局 config.message_debounce_window_ms
+        // （销售域字节等价）。换行业可声明更长/更短窗口。
+        debounce_window_ms_override: None,
         // C3：DEFAULT 不声明行业专属生成器引导语 → 回落领域中性 PLAYBOOK_METHODOLOGY_SYSTEM
         // （已去销售偏见）。换行业可在引导层声明自己的生成偏好。
         methodology_generator_preamble: None,
@@ -1081,6 +1084,11 @@ pub fn invalidate_global_domain_profile_cache() {
     GLOBAL_DOMAIN_PROFILE_CACHE.invalidate();
 }
 
+/// H18：解析该 profile 的去抖窗口，None 回落 config 全局默认。
+pub(crate) fn resolve_debounce_window_ms(profile: &crate::models::DomainProfile, config_default: u64) -> u64 {
+    profile.debounce_window_ms_override.unwrap_or(config_default)
+}
+
 /// 取「参与决策」的维度 kind 列表（对应旧 `TAGGED_FIELDS` 成员集合）。
 /// Phase 1 由 `decision_taxonomy` 消费以替换 const 表。
 pub fn decision_dimension_kinds(profile: &DomainProfile) -> Vec<String> {
@@ -1158,6 +1166,19 @@ pub fn render_decision_dimensions_guidance(dimensions: &[ProfileDimension]) -> S
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn debounce_window_none_falls_back_to_config_default() {
+        let p = default_domain_profile("ws");
+        assert_eq!(resolve_debounce_window_ms(&p, 4000), 4000, "DEFAULT 无 override 回落 env 默认");
+    }
+
+    #[test]
+    fn debounce_window_some_overrides_config() {
+        let mut p = default_domain_profile("ws");
+        p.debounce_window_ms_override = Some(8000);
+        assert_eq!(resolve_debounce_window_ms(&p, 4000), 8000, "Some 覆盖 env 默认");
+    }
 
     #[test]
     fn default_profile_has_sales_domain_dimensions() {
