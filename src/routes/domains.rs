@@ -236,7 +236,10 @@ pub(super) fn validate_operation_domain_input(payload: &OperationDomainRequest) 
     Ok(())
 }
 
-pub(super) fn validate_state_machine(machine: &Document) -> AppResult<()> {
+// pub(crate)（非 pub(super)）：H13 引导层 `guide_profile.rs` 复用本校验，对 LLM 生成的
+// 候选状态机本体做合法性检查（states 是对象数组 / key 非空且唯一 / allowedFrom 只引已知
+// 态）后再落 draft。私有 `mod domains` 下的 pub(crate) 项对 crate 内 sibling 仍可见。
+pub(crate) fn validate_state_machine(machine: &Document) -> AppResult<()> {
     let Ok(states) = machine.get_array("states") else {
         return Ok(());
     };

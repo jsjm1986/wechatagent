@@ -198,15 +198,32 @@ fn build_profile_generation_prompt(
   }},
   "coverageDimensions": [
     {{"key": "covKey", "displayName": "中文名", "required": false}}
-  ]
+  ],
+  "stateMachine": {{
+    "states": [
+      {{
+        "key": "状态英文id(snake_case)",
+        "name": "中文状态名（客户此刻所处的阶段）",
+        "goal": "AI 在这个阶段最该达成的事",
+        "advanceSignals": ["客户说/做了什么，意味着可以往下走"],
+        "riskRules": ["这个阶段绝不能踩的雷（会吓退客户的话/动作）"],
+        "initial": true,
+        "allowedFrom": ["允许从哪些状态迁入本状态（含自身则填本状态key）"],
+        "forbidsProactive": false
+      }}
+    ]
+  }}
 }}
+
+关于 stateMachine，我想说的是：每个行业的客户都会经历一段心理旅程——从陌生、试探，到慢慢信任、最后做决定。你最懂你的客户会经历哪些阶段。请把这段旅程拆成几个「状态」，每个状态写清楚：客户此刻在想什么（name/goal）、什么信号说明他准备好进入下一步（advanceSignals）、这个阶段哪些话千万不能说（riskRules）。`initial: true` 标的是客户刚找上门时所处的第一个状态（至少要有一个状态标 true）；`allowedFrom` 写这个状态可以从哪些状态走过来。
 
 **重要提醒：**
 - profile_id 是唯一标识，固定为「{profile_id}」，不要改动。
 - 如果某个**公式/承诺词/覆盖维度**在你的行业里没有对应的，不要硬凑——给空数组或空串就好。
 - promptFragment 要写得像一段真实思考，不是产品说明书。
 - **字段类型严格**：`promptFragment`、`description` 必须是**单个纯文本字符串**（哪怕内容很长、包含多段思考，也要写在一个字符串里，用换行分隔），**不要写成 `{{...}}` 对象或数组**。
-- `profileDimensions` **必须**给出至少 3 个维度（这是配置的核心，不能为空数组）；每个维度的 `kind` 和 `displayName` 都必须是非空字符串。"#,
+- `profileDimensions` **必须**给出至少 3 个维度（这是配置的核心，不能为空数组）；每个维度的 `kind` 和 `displayName` 都必须是非空字符串。
+- `stateMachine` 是**可选**的——如果你的业务没有清晰的分阶段旅程（客户来了就一锤子买卖、或纯随性陪伴聊天），就省略它或给空的 `states` 数组，AI 运行时会自动回落到一套通用默认阶段。"#,
         business_description = business_description,
         knowledge_context = knowledge_context,
         display_name = display_name,
@@ -263,6 +280,19 @@ pub async fn generate_domain_profile_candidate(
     )
     .await?;
 
+    // H13：把 stateMachine 从顶层抽出，**绕过 normalize_json_keys**。状态机本体由运行时引擎
+    // （guards.rs / migrations）和 prompts.rs 的 DEFAULT 种子消费，内部 key 全是 camelCase
+    // （`states` / `key` / `initial` / `allowedFrom` / `allowFromAny` / `forbidsProactive` /
+    // `advanceSignals` / `riskRules` / `goal` / `name`）。若让它过 normalize_json_keys，
+    // `allowedFrom`→`allowed_from`、`allowFromAny`→`allow_from_any`，引擎 `get_array("allowedFrom")`
+    // / `get_bool("allowFromAny")` 会静默读不到。LLM 按 prompt 输出 camelCase 顶层 key，
+    // 所以这里直接 remove("stateMachine")（DomainProfile struct 无对应 serde 字段，留着也会被
+    // from_document 丢弃，显式抽出更干净且能单独走 validate）。
+    let mut generated = generated;
+    let raw_state_machine = generated
+        .as_object_mut()
+        .and_then(|m| m.remove("stateMachine"));
+
     let normalized = coerce_scalar_string_fields(normalize_json_keys(generated));
     let mut doc: Document = mongodb::bson::to_document(&normalized)
         .map_err(|e| AppError::External(format!("LLM 输出非对象: {e}")))?;
@@ -290,6 +320,41 @@ pub async fn generate_domain_profile_candidate(
     profile.seeded_by = Some("generated_by_ai".to_string());
     profile.created_at = now;
     profile.updated_at = now;
+
+    // H13：把抽出的 camelCase stateMachine 转 Document（**不 snake_case**，保留 camelCase 内层
+    // key 供引擎/validate 读）→ validate。Ok 落 draft；Err 回落 None + warn（状态机校验不过
+    // 不阻断 profile 生成，运行时缺 active 状态机自动回落 DEFAULT）；LLM 没产出或给空对象 →
+    // None（debug 级，非异常）。
+    profile.generated_state_machine = match raw_state_machine {
+        Some(sm) if sm.is_object() => match mongodb::bson::to_document(&sm) {
+            Ok(sm_doc) => match crate::routes::domains::validate_state_machine(&sm_doc) {
+                Ok(()) => Some(sm_doc),
+                Err(e) => {
+                    tracing::warn!(
+                        profile_id = %payload.profile_id,
+                        error = %e,
+                        "AI 生成的 stateMachine 未过校验，候选不落状态机（运行时回落 DEFAULT）"
+                    );
+                    None
+                }
+            },
+            Err(e) => {
+                tracing::warn!(
+                    profile_id = %payload.profile_id,
+                    error = %e,
+                    "AI 生成的 stateMachine 转 Document 失败，候选不落状态机"
+                );
+                None
+            }
+        },
+        _ => {
+            tracing::debug!(
+                profile_id = %payload.profile_id,
+                "AI 未产出 stateMachine，候选 generated_state_machine = None"
+            );
+            None
+        }
+    };
 
     let inserted = state.db.domain_profiles().insert_one(&profile, None).await?;
     let hex = inserted
@@ -424,5 +489,46 @@ mod tests {
         let out = coerce_scalar_string_fields(input);
         assert!(out["description"].is_string());
         assert!(out["description"].as_str().unwrap().contains("点1"));
+    }
+
+    /// H13：生成 prompt 必须含 stateMachine 本体 schema，引导 AI 输出客户旅程状态机。
+    /// 注意 build_profile_generation_prompt 真实签名是 4 参（business_description /
+    /// profile_id / display_name / knowledge_context）。
+    #[test]
+    fn generation_prompt_includes_state_machine_schema() {
+        let prompt = super::build_profile_generation_prompt("卖课的教育机构", "edu-x", "教培", "");
+        assert!(
+            prompt.contains("stateMachine"),
+            "生成 prompt 须含状态机本体 schema"
+        );
+        assert!(prompt.contains("initial"), "状态机须声明 initial 标志");
+    }
+
+    /// H13：allowedFrom 引用未知状态 → validate 拒 → 候选 generated_state_machine 回落 None。
+    /// 注意 validate_state_machine 并**不**强制存在 initial 态；这里被拒是因为 `b` 是未知态
+    /// （allowedFrom references unknown state → reject）。
+    #[test]
+    fn invalid_state_machine_falls_back_to_none() {
+        let bad = mongodb::bson::doc! { "states": [ { "key": "a", "allowedFrom": ["b"] } ] };
+        assert!(
+            crate::routes::domains::validate_state_machine(&bad).is_err(),
+            "allowedFrom 引用未知态 b 应被拒"
+        );
+    }
+
+    /// H13：合法的 camelCase stateMachine（每态 key 非空唯一、allowedFrom 只引已知态）过校验。
+    /// 锁定 camelCase 内层 key 直通 validate（不被 snake_case 化）。
+    #[test]
+    fn valid_camelcase_state_machine_passes_validate() {
+        let good = mongodb::bson::doc! {
+            "states": [
+                { "key": "a", "name": "初识", "initial": true, "allowedFrom": ["a"] },
+                { "key": "b", "name": "深入", "allowedFrom": ["a", "b"], "forbidsProactive": false }
+            ]
+        };
+        assert!(
+            crate::routes::domains::validate_state_machine(&good).is_ok(),
+            "合法 camelCase 状态机应过校验"
+        );
     }
 }
