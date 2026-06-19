@@ -1,7 +1,7 @@
 # 通用化知识库：LLM 对话驱动的行业/产品自适应 — 设计文档
 
 **日期**：2026-06-11
-**状态**：实施中 — **Phase 0 已提交（commit e93cd63）；Phase 1 子步 1B 已提交（557cb38）、1D 已提交（a36164d）、1A 已提交（a40c6ab）、1C 已提交（20288c3）、1E 已提交（1b95d5a）、1F-a 已提交（61eaeaa）、1F-b 已提交（13dfe9b）、1G-a 已提交（fae02a4，C1 pressure_risk typed）、1G-b 已提交（b84de31，H10 deal_events→outcome_events）；1G-c（profile 进程缓存 + 版本切换兼容护栏）已落 working tree 待提交**。**Phase 1（H1–H10 + C1 + 性能/兼容护栏）全部完成，lib 1000/0**；下一步进 Phase 1.5（H12/H13 出厂人格 + 状态机本体 + C2）
+**状态**：**Phase 0/1/1.5/2/3/4 全部完成并已合并 main（PR #27，merge commit 825a0a1，2026-06-19）**。后端业务逻辑通用化基本结束——引擎/契约/知识/记忆/答复闸层 + 引导层（运营对话→AI 生成 DomainProfile→审核→激活，含前端向导）全部闭环；C3 已清（PLAYBOOK_METHODOLOGY_SYSTEM 领域中性，prompts.rs:1987）、H15 已落（reviewer 公式随 business_formulas，review/mod.rs:325）。**剩余残留为非主决策阻断的辅助层小尾巴**（2026-06-19 main 实证核查，见文末「## 残留核查」）：H17 objection_type typed 轴未维度化、H13 状态机语义本体随 profile 选未做（引擎已泛化、本体活 DB operation_domain_configs）、H18 off_hours 时区。引导层前端审核面板已做（system-strategy/DomainProfilePanel）。
 **作者**：运营 agent 侧
 **目标读者**：产品负责人 + 知识库后端维护者
 
@@ -128,7 +128,7 @@ H1–H9 是顺对话场景"碰"出来的；为穷尽，按六层（状态机/rev
 | **H13** | **状态机 9 态定义本体写死**（goal/信号/风险全锚定异议/成交/复购） | `prompts.rs:585-690` + 初始态 `new_contact` 字面量散落 6 处 + `cooldown` 特例 `m013` | ✅**Phase 1.5 已解**：state 加 `initial`/`forbidsProactive` 标志，引擎+两份 PBT 闭式参考三方原子泛化，写侧 4 处/读侧 5 处走 `initial_operation_state_key`，cooldown 特例改读标志；配套 C2 令 operation_state 派生自 customer_stage + 接回 check_state_transition(fail-soft)。状态机本体随 profile 选属 Phase 3 引导层（仍活 operation_domain_configs） |
 | **H14** | **grounding/ProductAccuracy 硬闸无条件**（每条回复都要 grounding≥7） | `gates.rs:28,114` | ✅**Phase 2 已解**：classify_dual_gate grounding 软分数硬闸条件化（profile.grounding_gate_bypass_without_claim + per-msg claim_analysis），DEFAULT bypass=false 字节等价。**blocked_unverified_product_claim 红线（2026-06-14 修订）**：R5.4 reviewer 自报 `requiresProductKnowledge=true` 路径仍强制 block；finalize 漏判探针（ProductEffect 分支，reviewer 未自报 ∧ 含硬承诺 ∧ 无 verified 背书）从强制 block 改为**仅观测**——成交弧"保证/效果"类词高频，知识稀缺场景下硬闸导致全程哑火。先观测漏判率，有统计证据后由运营决策是否抬回硬闸（配置化入口待 H14 配套）。原性质：纯情感回复靠 reviewer 满分兜底脆弱 |
 | **H15** | **经营公式+rubric 销售化**（ConversionReadiness/ProductFit 公式 + 逼单打分锚点） | `prompts.rs:964-969`、`review/mod.rs:244-247` | 不进硬闸但占 reviewer 注意力 + 被 `/evaluations` 当 ground-truth 度量。归 1E |
-| **H16** | **chunk_type+answeringMode 产品框架**（product_fact 分段 prompt、product_safe 三态） | `knowledge_router.rs:190-235`、`catalog.rs:550-581` | ✅**Phase 2 已解（chunk_type 部分）**：抽象为 ChunkRole「用途角色」(key/header/order/is_fallback)，profile.chunk_roles 驱动分桶渲染,DEFAULT 销售四态逐字等价(chunk_type_routing_pbt 1024 cases 绿)。注：answeringMode 三态文案仍写死 catalog.rs,留后续 |
+| **H16** | **chunk_type+answeringMode 产品框架**（product_fact 分段 prompt、product_safe 三态） | `knowledge_router.rs:190-235`、`catalog.rs:550-581` | ✅**Phase 2 已解（chunk_type 部分）**：抽象为 ChunkRole「用途角色」(key/header/order/is_fallback)，profile.chunk_roles 驱动分桶渲染,DEFAULT 销售四态逐字等价(chunk_type_routing_pbt 1024 cases 绿)。answeringMode 三态文案**亦已 profile 化**（2026-06-19 main 实证修正：`render_answering_mode_rules`/`answering_mode_labels` domain_profile.rs:666-718 逐档从 profile.answering_mode_profile 读、None 回落销售默认，catalog.rs:628/695 调用；三档 key 恒定属认知阶梯设计约束，释义/标签随 profile 可配） |
 | **H17** | **memoryCard schema+intent_trajectory 销售化**（objections/businessContext 一等字段；情绪史/纪念日无槽） | `memory.rs:62-97`、`models.rs:2812-2821`(`objection_type` typed) | 情感维度只能挤进泛化文本。记忆维度 schema 应随 profile [**memoryCard 部分 ✅ 2026-06-15**：MemoryDimension+DomainProfile.memory_dimensions / cap 表 / consolidator prompt 指引 / memoryCandidate type 集全部随 profile，DEFAULT 销售八维零扰动；intent_trajectory.objection_type typed 轴未做可单列] |
 | **H18** | **触达节奏全局写死**（debounce 窗口 4s、account off_hours 用 UTC 小时） | `webhooks.rs:582`、`account_scheduler.rs:47` | 去抖/账号作息节奏全行业共用，未随范式可配。归 1F/Phase 2（off_hours 时区错位是 C 类缺陷） |
 | **H19** | **作息门控无关系类型/contact 维度**（quiet_hours 全域单值，默认 22→8 销售作息） | `runtime.rs:72-79,132-135`、`agent/mod.rs:510-513` | 情感陪伴"晚上是黄金时段"会被作息门压制到次日 8 点；H8/H9 做完仍失效。**必须纳入 `resolve_operation_mode` override 链，否则数字分身落地受阻**。归 1F |
@@ -726,3 +726,20 @@ casual 模式的"收紧压力门"会与"热烈推进"打架（非误杀，是模
 - 新增测试只增量叠加，不删改旧维度/旧金标。
 - check-no-human-takeover / check-no-model-hint / check-no-sales-domain 三闸。
 - D2 锚定 quote→anchor verify gate 不削弱。
+
+---
+
+## 残留核查（2026-06-19 main 实证，PR #27 合并后）
+
+用户问"后端业务逻辑通用化是否全部结束"。两个 opus 子代理 + 主会话亲核 main 真实代码（不信本文档自报状态）结论：
+
+**已闭环（主体完成）**：运行时消费层（decision 主决策 / 五闸 / 状态机引擎 / 记忆 / 答复）全从 active DomainProfile 派生；**引导层完整闭环**（`guide_profile.rs:217 generate_domain_profile_candidate` AI 生成 → `domain_profiles.rs` create/publish/activate 两步流转 + 11 危险字段二次确认 → 前端 `system-strategy` DomainProfilePanel → 16 个 e2e 测试含两非销售行业生成）；C3 已清（`prompts.rs:1987` 领域中性）；H15 已落（`review/mod.rs:325` reviewer 公式随 business_formulas）；H16 answeringMode 已 profile 化。
+
+**真实残留（均为非主决策阻断的"分析/排序/轨迹"辅助层，与 [[project_universalization_residuals]] 6 残留路线图吻合）**：
+1. **H17 — `intent_trajectory.objection_type` typed 轴**（`models.rs:3631`）：仍扁平销售化字段，未随 profile 维度化。ledger-only 不进闸，业务阻断小。
+2. **H13 — 状态机语义本体随 profile 选**（`prompts.rs:615-729` 9 态 goal/advanceSignals/riskRules 写死销售）：引擎读标志位已泛化（`guards.rs:121`），但本体活在 DB `operation_domain_configs`，换行业需手动改 DB config（非代码改、但非自动随 profile）。
+3. **H18 — off_hours 时区**（独立 bug，account_scheduler off_hours 用 UTC 小时非运营方时区，已在 commit 80f74b7 部分修）。
+
+> **核查纠偏记录**：子代理曾把 `planner/mod.rs:1074 stage_priority_weight` 报为"无 profile 回落的新硬编码点"，主会话亲核调用点 `PlannerStageConfig::stage_weight`（mod.rs:848-851）证伪——它是 **fallback**：真实路径先查 `stage_weights`（由 `resolve_planner_stage_config` 从 taxonomy 的 `priority_weight` 构造，:892），字典命中用字典值、未命中才回落写死函数。非销售行业在 system_taxonomies 给自己 stage seed priority_weight 即正确排序，属**已配置化**非残留（1C/H6 设计如此，`seeded_weights_match_planner_hardcoded_verbatim` 锁 DEFAULT 等价）。intent_level_weight 同构。**教训：判断"是否硬编码"必看调用点有无 profile/字典回落，只看函数本体会误判。**
+
+**结论**：后端业务逻辑通用化**基本结束**，剩 3-4 个辅助层小尾巴，无主决策阻断残留。是否收口由产品节奏决定。
