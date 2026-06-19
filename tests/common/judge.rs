@@ -390,6 +390,33 @@ pub async fn run_judge_graded(
     samples: usize,
     gate: JudgeGate,
 ) -> Option<JudgeOutcome> {
+    // 薄委托：传空 ctx → build_judge_user_with_context 逐字等于 build_judge_user，行为不变（DRY）。
+    run_judge_graded_with_context(
+        judge,
+        rubric,
+        label,
+        inbound,
+        reply,
+        &JudgeContext::default(),
+        samples,
+        gate,
+    )
+    .await
+}
+
+/// 与 `run_judge_graded` 同口径，但额外接受 `ctx: &JudgeContext` 底料 —— 唯一区别是
+/// user prompt 用 `build_judge_user_with_context` 把对话/知识/记忆/承诺/画像注入裁判。
+/// 空 ctx 时行为与 `run_judge_graded` 逐字等价（向后兼容）。
+pub async fn run_judge_graded_with_context(
+    judge: &dyn LlmProvider,
+    rubric: &JudgeRubric,
+    label: &str,
+    inbound: &str,
+    reply: &str,
+    ctx: &JudgeContext,
+    samples: usize,
+    gate: JudgeGate,
+) -> Option<JudgeOutcome> {
     if std::env::var("REAL_LLM_JUDGE").map(|v| v == "1").unwrap_or(false) != true {
         eprintln!("[裁判:{label}] 跳过（未设 REAL_LLM_JUDGE=1）");
         return None;
@@ -407,7 +434,7 @@ pub async fn run_judge_graded(
         }
     }
     let k = samples.max(1);
-    let user = build_judge_user(label, inbound, reply);
+    let user = build_judge_user_with_context(label, inbound, reply, ctx);
 
     let results =
         futures::future::join_all((0..k).map(|_| judge.generate_json_with_usage(&rubric.system, &user)))
@@ -463,6 +490,17 @@ pub async fn run_judge_graded(
 mod tests {
     use super::*;
     use wechatagent::agent::{default_domain_profile, example_emotional_companion_profile};
+
+    struct NoopJudge;
+    #[async_trait::async_trait]
+    impl wechatagent::llm::LlmProvider for NoopJudge {
+        async fn generate_json(&self, _s: &str, _u: &str) -> wechatagent::error::AppResult<serde_json::Value> {
+            panic!("env 未设时不应调用 judge");
+        }
+        async fn generate_json_with_usage(&self, _s: &str, _u: &str) -> wechatagent::error::AppResult<wechatagent::llm::LlmJsonResult> {
+            panic!("env 未设时不应调用 judge");
+        }
+    }
 
     /// 基准锚定：销售 DEFAULT profile 派生的标尺键集 ⊇ 现有 JUDGE_SYSTEM 6 键。
     /// 契约级（键集 + 极性维存在性），不锁字节排版——基准对照不破。
@@ -580,5 +618,17 @@ mod tests {
         let plain = build_judge_user("t1", "在吗", "在的");
         let with_empty = build_judge_user_with_context("t1", "在吗", "在的", &JudgeContext::default());
         assert_eq!(plain, with_empty, "空底料必须逐字等于老 build_judge_user（向后兼容）");
+    }
+
+    #[tokio::test]
+    async fn graded_with_context_skips_without_env() {
+        // 未设 REAL_LLM_JUDGE=1 → 返 None（与 run_judge_graded 同口径，本地零成本）。
+        std::env::remove_var("REAL_LLM_JUDGE");
+        let rubric = build_judge_rubric(&wechatagent::agent::default_domain_profile("ws"));
+        // judge provider 用一个永远不会被调用的占位（env 未设直接 return None，不触发调用）。
+        let out = run_judge_graded_with_context(
+            &NoopJudge, &rubric, "t", "in", "reply", &JudgeContext::default(), 1, JudgeGate::ObserveOnly,
+        ).await;
+        assert!(out.is_none(), "未设 REAL_LLM_JUDGE 必须跳过返 None");
     }
 }
