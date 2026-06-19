@@ -606,6 +606,25 @@ pub(crate) fn format_reaction_hint(recent: &[Document]) -> String {
     buf
 }
 
+/// snake_case → camelCase（最小实现）：用于把 trajectory 维度 kind（snake）映射到
+/// reaction_analysis 的 camelCase 字段名（LLM JSON 约定）。`objection_type` → `objectionType`。
+/// 已是单段（无下划线）时原样返回。
+fn snake_to_camel(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut upper_next = false;
+    for ch in s.chars() {
+        if ch == '_' {
+            upper_next = true;
+        } else if upper_next {
+            out.extend(ch.to_uppercase());
+            upper_next = false;
+        } else {
+            out.push(ch);
+        }
+    }
+    out
+}
+
 /// Phase D / D1：把一条 intent 轨迹追加到 `contacts.intent_trajectory`，并在
 /// mongo 端用 `$push + $slice: -50` 维持上限滑窗。
 ///
@@ -635,26 +654,22 @@ pub(crate) async fn push_intent_trajectory_entry(
         .await
         .unwrap_or(0) as i32;
 
-    // objection_type 是 ReactionDerived 通道（字典 Taxonomy 源）。此前 LLM 产出裸写进
-    // 轨迹 entry 不过字典；这里过 validate_dimension_value(MachineWrite) 取归一值：
-    // Accept→落 canonical（alias 归一）；Drop→不落该字段（越界静默丢弃，轨迹是观测数据，
-    // 不进五闸/状态机，丢弃无副作用）。Reject 在机器通道按 spec 不出现，llm_signal_apply 兜底 None。
-    let raw_objection_type = doc_string(reaction_analysis, "objectionType")
-        .or_else(|| doc_string(reaction_analysis, "objection_type"))
-        .filter(|s| !s.trim().is_empty());
-    let objection_type = match raw_objection_type {
-        Some(raw) => {
-            let verdict = crate::agent::dimension_registry::validate_dimension_value(
-                &state.db,
-                "objection_type",
-                &raw,
-                &contact.account_id,
-                crate::agent::dimension_registry::WriteIntent::MachineWrite,
-            )
-            .await;
-            crate::agent::gateway::llm_signal_apply(verdict)
-        }
-        None => None,
+    // H17：轨迹维度随 active profile。DEFAULT 销售域 trajectory_dimensions 仅
+    // 单维 objection_type → 仍写 `objectionType` 旧字段（字节等价红线）；非销售
+    // profile 声明其它维度 → 过字典后落 `dimensions` 容器。
+    //
+    // 每个 dim.kind 是 ReactionDerived 通道（字典 Taxonomy 源）：LLM 裸产出不进
+    // 轨迹，先过 validate_dimension_value(MachineWrite) 归一。Accept→落 canonical；
+    // Drop→不落该字段（越界静默丢弃，轨迹是观测数据，不进五闸/状态机，无副作用）。
+    let profile = crate::agent::domain_profile::load_active_domain_profile(
+        &state.db,
+        &contact.workspace_id,
+    )
+    .await;
+    let traj_dims = if profile.trajectory_dimensions.is_empty() {
+        crate::agent::domain_profile::default_trajectory_dimensions()
+    } else {
+        profile.trajectory_dimensions.clone()
     };
 
     let mut entry = doc! {
@@ -662,8 +677,33 @@ pub(crate) async fn push_intent_trajectory_entry(
         "intent": outcome,
         "recordedAt": DateTime::now(),
     };
-    if let Some(t) = objection_type.as_deref() {
-        entry.insert("objectionType", t);
+    let mut dim_container = doc! {};
+    for dim in &traj_dims {
+        // reaction_analysis 字段名按 camelCase 写出（LLM JSON 约定），同时兜底 snake。
+        let raw = doc_string(reaction_analysis, &snake_to_camel(&dim.kind))
+            .or_else(|| doc_string(reaction_analysis, &dim.kind))
+            .filter(|s| !s.trim().is_empty());
+        let Some(raw) = raw else { continue };
+        let verdict = crate::agent::dimension_registry::validate_dimension_value(
+            &state.db,
+            &dim.kind,
+            &raw,
+            &contact.account_id,
+            crate::agent::dimension_registry::WriteIntent::MachineWrite,
+        )
+        .await;
+        let Some(canonical) = crate::agent::gateway::llm_signal_apply(verdict) else {
+            continue;
+        };
+        // DEFAULT 销售单维 objection_type → 写旧字段（字节等价）；其它维度 → dimensions 容器。
+        if dim.kind == "objection_type" {
+            entry.insert("objectionType", canonical);
+        } else {
+            dim_container.insert(&dim.kind, canonical);
+        }
+    }
+    if !dim_container.is_empty() {
+        entry.insert("dimensions", dim_container);
     }
 
     state
@@ -726,8 +766,13 @@ pub(crate) fn format_intent_trajectory_hint(
             "- 第{}轮 intent={}",
             entry.turn_index, entry.intent
         ));
+        // DEFAULT 销售：旧字段 objection_type 逐字渲染（字节等价）。
         if let Some(t) = entry.objection_type.as_deref() {
             buf.push_str(&format!(" objection_type={}", t));
+        }
+        // 非销售域：dimensions 容器（key 升序，BTreeMap 稳定）。
+        for (k, v) in &entry.dimensions {
+            buf.push_str(&format!(" {}={}", k, v));
         }
         buf.push('\n');
     }
@@ -1041,6 +1086,44 @@ mod a6_tests {
         let pos_4 = hint.find("第4轮").unwrap();
         let pos_8 = hint.find("第8轮").unwrap();
         assert!(pos_4 < pos_8, "older turn should appear first");
+    }
+
+    /// H17：DEFAULT 销售域单维 objection_type → 读侧逐字不变（字节等价红线）。
+    #[test]
+    fn hint_default_objection_byte_equivalent() {
+        use mongodb::bson::DateTime;
+        let e = crate::models::IntentTrajectoryEntry {
+            turn_index: 2,
+            intent: "advance".into(),
+            objection_type: Some("price".into()),
+            dimensions: std::collections::BTreeMap::new(),
+            recorded_at: DateTime::from_millis(0),
+        };
+        let hint = format_intent_trajectory_hint(&[e]);
+        assert!(
+            hint.contains("第2轮 intent=advance objection_type=price"),
+            "DEFAULT 渲染逐字不变"
+        );
+    }
+
+    /// H17：非销售 profile 声明其它维度 → dimensions 容器被渲染。
+    #[test]
+    fn hint_renders_profile_dimension_from_container() {
+        use mongodb::bson::DateTime;
+        let mut dims = std::collections::BTreeMap::new();
+        dims.insert("concern_type".to_string(), "time".to_string());
+        let e = crate::models::IntentTrajectoryEntry {
+            turn_index: 5,
+            intent: "share".into(),
+            objection_type: None,
+            dimensions: dims,
+            recorded_at: DateTime::from_millis(0),
+        };
+        let hint = format_intent_trajectory_hint(&[e]);
+        assert!(
+            hint.contains("concern_type=time"),
+            "dimensions 容器维度被渲染"
+        );
     }
 
     /// 第18点：DEFAULT 销售极性 → reaction prompt 不追加任何说明（字节等价红线）。
