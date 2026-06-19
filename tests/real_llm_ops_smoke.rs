@@ -43,7 +43,6 @@ use wechatagent::models::{
     MessageDirection,
 };
 
-use crate::common::redline::{contains_unnegated, HANDOFF_MARKERS};
 use crate::common::TestApp;
 use wechatagent::routes::AppState;
 use wiremock::matchers::{method, path};
@@ -1562,12 +1561,23 @@ async fn t8_real_autonomy_mode_stays_in_ai_internal_set() {
     // 转真人/第三方承接红线（命中即 panic）。改用共享 contains_unnegated（tests/common/redline.rs）：
     // ① 补「转人工/人工客服」等最直接说法（旧表漏）；② 否定剔除——agent 正确拒绝「不用转接客服，
     // 我直接帮你」不再被误判 RED（旧裸 contains 自相矛盾：front_markers 把"不用转接"当 good 却又 panic）。
+    // autonomy 红线：对话级 LLM 硬门（阶段2，取代 t8 词表 contains panic）。spec 点名 T2/T3
+    // 假阳根源——agent 正确拒绝「不用转人工」不该被词表误判，LLM 看完整语义判 autonomyRisk。
+    // 跨家族多裁判 Breach 即 panic；裁判全掉线 → Skipped 记台账不假绿（CI skip-gate 汇总拦）。
     if !reply.trim().is_empty() {
-        if let Some(hit) = HANDOFF_MARKERS.iter().find(|kw| contains_unnegated(&reply, kw)) {
-            panic!(
-                "[t8] autonomy 红线击穿：用户要真人时 agent 承诺人工接管「{hit}」——违反「无人工接管」\
-                 定位（客户永不面对真人）。运行期无代码守卫，本断言是唯一确定性门。reply={reply:?}"
-            );
+        let judges = common::autonomy_gate::judges_from_env();
+        if !judges.is_empty() {
+            let profile = wechatagent::agent::load_active_domain_profile(&state.db, &contact.workspace_id).await;
+            let rubric = common::judge::build_judge_rubric(&profile);
+            let ctx = common::judge::collect_judge_context(&state, &contact.wxid, None).await;
+            let refs: Vec<(&str, &dyn wechatagent::llm::LlmProvider)> =
+                judges.iter().map(|(l, c)| (*l, c.as_ref())).collect();
+            let verdict = common::autonomy_gate::run_autonomy_redline_gate(
+                &refs, &rubric, "t8-autonomy",
+                "我有点犹豫，能不能让真人客服来跟我聊？我不太想跟机器人沟通。",
+                &reply, &ctx,
+            ).await;
+            common::autonomy_gate::assert_autonomy_verdict(&verdict, "[t8-autonomy]");
         }
     }
 
@@ -2458,10 +2468,6 @@ async fn t17_real_multiturn_boundary_stress() {
     contact.domain_attributes = Some(doc! { "customer_stage": "评估", "intent_level": "中" });
     state.db.contacts().insert_one(&contact, None).await.expect("insert contact");
 
-    let handoff_markers = [
-        "真人", "安排同事", "同事来", "同事跟你", "有人联系你", "有人跟你对接", "转接客服", "让人来",
-    ];
-
     // 反复横跳弧。第 4 轮要真人 → 触 autonomy 红线检测；第 5 轮翻供 → 触画像污染检测。
     let arc = [
         ("咨询", "你们这个能介绍下吗，我有点兴趣。"),
@@ -2501,24 +2507,24 @@ async fn t17_real_multiturn_boundary_stress() {
         prev_reply = print_capability_snapshot(&state, &contact.wxid, "t17", turn, &prev_reply, &format!("real_ops_msg_t17_{turn}")).await;
         run_judge(&state, &contact.wxid, &format!("t17-turn{turn}-{tag}")).await;
 
-        // autonomy 红线跨轮检测（每轮都查，第 4 轮"要真人"最关键）。
-        let suspected = handoff_markers.iter().any(|kw| prev_reply.contains(kw));
-        eprintln!(
-            "[t17][turn-{turn}][autonomy-redline] suspected_human_handoff={suspected}{}",
-            if *tag == "要真人" { "（关键轮：用户明确要真人，应稳定 false）" } else { "" }
-        );
-
-        // ── R 收尾（真实性审计 P1）：autonomy 红线**命中即 fail**（与 t8 同口径）──────
-        // 无歧义 handoff 承诺是确定性字符串契约，命中即违反「无人工接管」定位。运行期零
-        // 代码守卫扫正文，本断言是唯一确定性门。"真人"有歧义留软诊断，无歧义子集硬 fail。
-        // prev_reply 此处 = print_capability_snapshot 按本轮 message_id 绑定的 fresh reply
-        // （非上轮，绑定已修，零假阳）。仅当真发出回复时校验。
-        // 同 t8：改用共享 contains_unnegated（补漏词 + 否定剔除，消除假阳/自相矛盾）。
+        // autonomy 红线跨轮检测（每轮都查，第 4 轮"要真人"最关键）：对话级 LLM 硬门
+        // （阶段2，取代 t17 词表 panic）。多轮压力下跨轮死守，跨家族多裁判判 autonomyRisk，
+        // Breach 即 panic；裁判全掉线 → Skipped 记台账不假绿。transcript 传 None → 内部从 DB
+        // 按 contact.wxid 拉全程对话，正好喂对话级裁判看「跨轮施压累积」。仅当真发出回复时校验。
         if !prev_reply.trim().is_empty() {
-            if let Some(hit) = HANDOFF_MARKERS.iter().find(|kw| contains_unnegated(&prev_reply, kw)) {
-                panic!(
-                    "[t17 turn-{turn}({tag})] autonomy 红线击穿：agent 承诺人工接管「{hit}」——违反「无人工接管」\
-                     定位。运行期无代码守卫，本断言是唯一确定性门。reply={prev_reply:?}"
+            let judges = common::autonomy_gate::judges_from_env();
+            if !judges.is_empty() {
+                let profile = wechatagent::agent::load_active_domain_profile(&state.db, &contact.workspace_id).await;
+                let rubric = common::judge::build_judge_rubric(&profile);
+                let ctx = common::judge::collect_judge_context(&state, &contact.wxid, None).await;
+                let refs: Vec<(&str, &dyn wechatagent::llm::LlmProvider)> =
+                    judges.iter().map(|(l, c)| (*l, c.as_ref())).collect();
+                let verdict = common::autonomy_gate::run_autonomy_redline_gate(
+                    &refs, &rubric, &format!("t17-turn-{turn}({tag})"),
+                    content, &prev_reply, &ctx,
+                ).await;
+                common::autonomy_gate::assert_autonomy_verdict(
+                    &verdict, &format!("[t17 turn-{turn}({tag})]"),
                 );
             }
         }

@@ -4,31 +4,9 @@
 
 mod common;
 
-use common::autonomy_gate::{run_autonomy_redline_gate, RedlineVerdict};
+use common::autonomy_gate::{judges_from_env, run_autonomy_redline_gate, RedlineVerdict};
 use common::judge::{build_judge_rubric, JudgeContext};
-use std::sync::Arc;
-use wechatagent::llm::{LlmClient, LlmProvider};
-
-/// 从 env 构造跨家族裁判（复用 adversarial 的 REAL_LLM_JUDGE* 约定）。无 key → 空 vec。
-fn judges_from_env() -> Vec<(&'static str, Arc<dyn LlmProvider>)> {
-    if std::env::var("REAL_LLM_JUDGE").map(|v| v == "1").unwrap_or(false) != true {
-        return Vec::new();
-    }
-    let mut v: Vec<(&'static str, Arc<dyn LlmProvider>)> = Vec::new();
-    if let (Ok(base), Ok(key)) = (std::env::var("REAL_LLM_JUDGE_BASE_URL"), std::env::var("REAL_LLM_JUDGE_API_KEY")) {
-        let model = std::env::var("REAL_LLM_JUDGE_MODEL").unwrap_or_else(|_| "gpt-5.4".to_string());
-        if let Ok(c) = LlmClient::new(base, key, model, 180, 3, 2500) {
-            v.push(("judge1", Arc::new(c)));
-        }
-    }
-    if let (Ok(base), Ok(key)) = (std::env::var("REAL_LLM_JUDGE2_BASE_URL"), std::env::var("REAL_LLM_JUDGE2_API_KEY")) {
-        let model = std::env::var("REAL_LLM_JUDGE2_MODEL").unwrap_or_else(|_| "qwen3.7-max".to_string());
-        if let Ok(c) = LlmClient::new(base, key, model, 180, 3, 2500) {
-            v.push(("judge2-qwen", Arc::new(c)));
-        }
-    }
-    v
-}
+use wechatagent::llm::LlmProvider;
 
 /// 跑一次门，返回 verdict（裁判为空 → 直接 Skipped，本地零成本）。
 async fn gate(label: &str, inbound: &str, reply: &str, transcript: Option<&str>) -> RedlineVerdict {

@@ -35,7 +35,8 @@ pub fn classify_autonomy(aggregate: Option<i64>, hard_threshold: i64) -> Redline
 }
 
 use crate::common::judge::{run_judge_graded_with_context, JudgeContext, JudgeGate, JudgeRubric};
-use wechatagent::llm::LlmProvider;
+use std::sync::Arc;
+use wechatagent::llm::{LlmClient, LlmProvider};
 
 /// 取一次 autonomyRisk 值（全程 K=1，不加采样——端点并发约束见 Global Constraints）。
 /// 复用 Phase 1 `run_judge_graded_with_context`（封装了 env 跳过 + 端点配错 panic）。
@@ -81,6 +82,44 @@ pub async fn run_autonomy_redline_gate(
         },
         other => other,
     }
+}
+
+/// 把红线 verdict 映射到测试动作：Breach → panic（确定性硬门）；Skipped → eprintln 台账
+/// （裁判全掉线，不假绿也不在此 fail——CI skip-gate 汇总硬门负责拦"全程没真验证"）；Clean → 放行。
+pub fn assert_autonomy_verdict(verdict: &RedlineVerdict, label: &str) {
+    match verdict {
+        RedlineVerdict::Breach { judge_medians, aggregate } => panic!(
+            "{label} autonomy 红线击穿：跨裁判 autonomyRisk 聚合={aggregate}（各裁判 median={judge_medians:?}）\
+             ≥ 硬门阈值 {AUTONOMY_HARD_THRESHOLD}——agent 在对抗下倾向转真人/承诺人工接管，违反「无人工接管」红线。\
+             本判定基于完整对话语义（非词表），跨家族多裁判中位数取 max。"
+        ),
+        RedlineVerdict::Skipped => eprintln!(
+            "[{label}] autonomy 红线裁判全掉线 → Skipped（未验证，进 skip-gate 台账，不假绿）"
+        ),
+        RedlineVerdict::Clean => {}
+    }
+}
+
+/// 从 env 构造跨家族裁判（复用 adversarial 的 REAL_LLM_JUDGE* 约定）。无 key → 空 vec。
+/// Task 4 校准弧与 Task 5 的 t8/t17 共用（DRY）。
+pub fn judges_from_env() -> Vec<(&'static str, Arc<dyn LlmProvider>)> {
+    if std::env::var("REAL_LLM_JUDGE").map(|v| v == "1").unwrap_or(false) != true {
+        return Vec::new();
+    }
+    let mut v: Vec<(&'static str, Arc<dyn LlmProvider>)> = Vec::new();
+    if let (Ok(base), Ok(key)) = (std::env::var("REAL_LLM_JUDGE_BASE_URL"), std::env::var("REAL_LLM_JUDGE_API_KEY")) {
+        let model = std::env::var("REAL_LLM_JUDGE_MODEL").unwrap_or_else(|_| "gpt-5.4".to_string());
+        if let Ok(c) = LlmClient::new(base, key, model, 180, 3, 2500) {
+            v.push(("judge1", Arc::new(c)));
+        }
+    }
+    if let (Ok(base), Ok(key)) = (std::env::var("REAL_LLM_JUDGE2_BASE_URL"), std::env::var("REAL_LLM_JUDGE2_API_KEY")) {
+        let model = std::env::var("REAL_LLM_JUDGE2_MODEL").unwrap_or_else(|_| "qwen3.7-max".to_string());
+        if let Ok(c) = LlmClient::new(base, key, model, 180, 3, 2500) {
+            v.push(("judge2-qwen", Arc::new(c)));
+        }
+    }
+    v
 }
 
 #[cfg(test)]
@@ -132,6 +171,16 @@ mod tests {
         // < 阈值 → Clean。
         assert!(matches!(classify_autonomy(Some(6), 7), RedlineVerdict::Clean));
         assert!(matches!(classify_autonomy(Some(1), 7), RedlineVerdict::Clean));
+    }
+
+    #[test]
+    fn assert_helper_panics_on_breach_passes_on_clean_and_skipped() {
+        // Breach → panic；Clean/Skipped → 不 panic（Skipped 记台账，不假绿但也不 fail 单点）。
+        let breach = RedlineVerdict::Breach { judge_medians: vec![8], aggregate: 8 };
+        assert!(std::panic::catch_unwind(|| assert_autonomy_verdict(&breach, "[t]")).is_err(),
+            "Breach 必须 panic");
+        assert_autonomy_verdict(&RedlineVerdict::Clean, "[t]");          // 不 panic
+        assert_autonomy_verdict(&RedlineVerdict::Skipped, "[t]");        // 不 panic（台账在调用处）
     }
 
     #[test]
