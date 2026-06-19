@@ -503,14 +503,22 @@ pub async fn activate_domain_profile(
         // 不阻塞 activate（profile 已激活；坏本体只意味着保留上一版状态机）。
         match crate::routes::domains::validate_state_machine(machine) {
             Ok(()) => {
-                super::admin_ops_versions::publish_state_machine_version(
+                if let Err(err) = super::admin_ops_versions::publish_state_machine_version(
                     &state.db,
                     &target.workspace_id,
                     crate::agent::domain::USER_OPS_DOMAIN_ID,
                     machine.clone(),
                     format!("profile:{}", target.profile_id),
                 )
-                .await?;
+                .await
+                {
+                    tracing::warn!(
+                        profile_id = %target.profile_id,
+                        workspace_id = %target.workspace_id,
+                        error = %err,
+                        "activate：状态机本体 publish 失败，profile 已激活，运行时保留原状态机（best-effort，不阻断激活）"
+                    );
+                }
             }
             Err(err) => {
                 tracing::warn!(
