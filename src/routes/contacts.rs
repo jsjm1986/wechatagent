@@ -18,7 +18,7 @@ use crate::{
     error::{AppError, AppResult},
     mcp::{self},
     models::{
-        ApiContact, ContactQuery, CustomAgentInstructionsRequest, DealEvent, EnableAgentRequest,
+        ApiContact, ContactQuery, CustomAgentInstructionsRequest, EnableAgentRequest,
         ImportContactsRequest, ProfileNoteRequest, SearchImportRequest,
     },
 };
@@ -33,6 +33,9 @@ pub(super) struct OperationProfileRequest {
     tags: Vec<String>,
     customer_stage: Option<String>,
     intent_level: Option<String>,
+    /// §3.7 数字分身：关系类型（customer/peer/friend，走 system_taxonomies）。运营接入时
+    /// 设定，决定 planner 选哪套 OperationMode（驱动力组合）。`None` → 不改动现值。
+    relationship_type: Option<String>,
     last_commitment: Option<String>,
     follow_up_policy: Option<String>,
     #[serde(default)]
@@ -61,17 +64,35 @@ pub(super) struct MemoryCandidateQuery {
 
 /// `POST /api/contacts/:id/deal-events` 请求体。
 ///
-/// S5（自学习采集管道）：admin 手动登记一条成交（T0 硬事件）正例。本阶段
-/// 只 append-only 记录，不反推任何置信、不归因——为将来 PU learning 铺正例池。
-/// 全部字段可选：最小可用只需点一下"标记成交"，金额/币种/发生时间/备注按需回填。
+/// S5（自学习采集管道）：admin 手动登记一条**结果/成效**（T0 硬事件）正例，落
+/// `Contact.outcome_events`（universal-domain-adaptation H10：存储已从销售域
+/// `deal_events` 泛化为行业中性的 `outcome_events`；路由路径 / 请求类型名保持
+/// `deal-events` 不变以维持 API 兼容，无外部消费方依赖具体语义）。本阶段只
+/// append-only 记录，不反推任何置信、不归因——为将来 PU learning 铺正例池。
+/// 全部字段可选：最小可用只需点一下"标记成效"，金额/币种/发生时间/备注按需回填。
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(super) struct DealEventRequest {
-    /// 成交实际发生时间的毫秒时间戳（可选，缺省用服务端 now 作为 marked_at）。
+    /// 结果实际发生时间的毫秒时间戳（可选，缺省用服务端 now 作为 marked_at）。
     occurred_at_ms: Option<i64>,
-    amount: Option<f64>,
+    /// 成交金额，最小币种单位整数（分，19900=¥199.00）。前端 ×100 转分后传入。
+    amount: Option<i64>,
     currency: Option<String>,
     note: Option<String>,
+    /// 成交真相源可信度（G3 §2）。admin 后台登记缺省 `staff_confirmed`（admin 登记即
+    /// 高可信，§4.4）。仅接受闭集 `staff_confirmed` | `payment_verified`——
+    /// `conversation_inferred` 是 AI 疑似线索，绝不走 admin 直登通道（§5.5：疑似线索
+    /// 经审核才落 staff_confirmed），传入即 400。
+    verification: Option<String>,
+    /// 关联产品 product_id（可选）。给定时从本 workspace active 产品表解引用，按
+    /// 成交当时拷贝名/价/SKU 落 `OutcomeProductRef` 快照（§4.3 订单式冻结，非活引用）。
+    product_id: Option<String>,
+    /// 件数（可选，默认 1）。
+    quantity: Option<u32>,
+    /// 事件方向（§4.5）：`deal`（正向成交，缺省）| `reversal`（退款/撤单）。
+    /// reversal 不删原成交（审计完整性），append 一条反向事件由 G4 投影按 product_id
+    /// 抵消净件数；reversal 必须给 product_id（无产品的退款没有可抵消标的，无意义）。
+    event_kind: Option<String>,
 }
 
 pub(super) async fn list_contacts(
@@ -268,6 +289,71 @@ pub(super) async fn get_contact(
     Ok(Json(json!({ "item": ApiContact::from(contact) })))
 }
 
+/// `GET /api/contacts/:id/outcome-events`
+///
+/// G3 成交记录读端点（spec §8.5.3「成交记录」Tab）。返回本 contact 的全部
+/// `outcome_events`，每条带 `verification` 徽标 + `productRef` 快照 + 金额。
+/// OutcomeEvent 已是 camelCase serde，直接序列化即含新字段（旧记录缺字段 → serde
+/// 缺省 verification=staff_confirmed / productRef 省略）。
+///
+/// IDOR（§3.5）：经 `find_contact_by_id` 锁 workspace；不接受请求体 workspace。
+/// 按 occurred_at ?? marked_at 倒序（最近成交在前），不 cap（admin 审阅全量）。
+pub(super) async fn list_outcome_events(
+    State(state): State<AppState>,
+    Extension(admin): Extension<AuthenticatedAdmin>,
+    Path(id): Path<String>,
+) -> AppResult<Json<Value>> {
+    let contact = find_contact_by_id(&state, &admin.current_workspace, &id).await?;
+    let mut events = contact.outcome_events;
+    // 倒序：实际发生时间优先，缺省回落标记时间（与 G4 投影 occurred_at ?? marked_at 一致）。
+    events.sort_by(|a, b| {
+        let bk = b.occurred_at.unwrap_or(b.marked_at).timestamp_millis();
+        let ak = a.occurred_at.unwrap_or(a.marked_at).timestamp_millis();
+        bk.cmp(&ak)
+    });
+    Ok(Json(json!({ "items": events })))
+}
+
+/// `GET /api/contacts/:id/entitlements`
+///
+/// G4 持有投影读端点（spec §8.5.3「客户持有」Tab + §9 #6）。派生视图不落库，运行时
+/// 对本 contact 的 outcome_events 跑 `project_entitlements`。read 端点不受 prompt 软上限
+/// 约束（cap_n = usize::MAX，§5.1 注释明确「read 端点不受此限」）。
+///
+/// IDOR（§3.5）：经 `find_contact_by_id` 锁 contact workspace；active 产品按同一
+/// workspace + status=active 加载（`load_active_products` filter 含 workspace_id）。
+/// 零扰动：无产品域/无成交 → entitlements 空数组。
+pub(super) async fn list_entitlements(
+    State(state): State<AppState>,
+    Extension(admin): Extension<AuthenticatedAdmin>,
+    Path(id): Path<String>,
+) -> AppResult<Json<Value>> {
+    let contact = find_contact_by_id(&state, &admin.current_workspace, &id).await?;
+    let active_products =
+        agent::entitlements::load_active_products(&state.db, &contact.workspace_id).await;
+    // read 端点全量，不 cap（§5.1：read 端点不受 ENTITLEMENTS_PROMPT_CAP 限）。
+    let (entitlements, total) = agent::entitlements::project_entitlements(
+        &contact.outcome_events,
+        &active_products,
+        DateTime::now(),
+        usize::MAX,
+    );
+    let items: Vec<Value> = entitlements
+        .iter()
+        .map(|e| {
+            json!({
+                "productId": e.product_id,
+                "name": e.name,
+                "ownedSince": e.owned_since.timestamp_millis(),
+                "quantity": e.quantity,
+                "inAftercare": e.in_aftercare,
+                "expiresAt": e.expires_at.map(|d| d.timestamp_millis()),
+            })
+        })
+        .collect();
+    Ok(Json(json!({ "items": items, "total": total })))
+}
+
 pub(super) async fn enable_agent(
     State(state): State<AppState>,
     Extension(admin): Extension<AuthenticatedAdmin>,
@@ -329,6 +415,10 @@ pub(super) async fn enable_agent(
     };
     let mut unset_doc = Document::new();
     if !is_previously_operated(&contact) {
+        // H13：初始 operation_state 从 active 状态机的 initial 态取（替代写死 "new_contact"）。
+        let domain_config =
+            agent::load_user_operation_domain_config(&state, &admin.current_workspace).await?;
+        let initial_state = agent::initial_operation_state_key(domain_config.as_ref());
         insert_domain_stage_fields(
             &mut set_doc,
             generated.customer_stage.as_deref(),
@@ -337,7 +427,7 @@ pub(super) async fn enable_agent(
         );
         set_doc.insert("commitments", commitments_bson);
         set_doc.insert("follow_up_policy", generated.follow_up_policy);
-        set_doc.insert("operation_state", "new_contact");
+        set_doc.insert("operation_state", initial_state);
         set_doc.insert(
             "operation_state_reason",
             "初次纳入 Agent 运营，等待后续互动确认阶段",
@@ -414,6 +504,10 @@ pub(super) async fn update_profile_note(
     };
     let mut unset_doc = Document::new();
     if !is_previously_operated(&contact) {
+        // H13：初始 operation_state 从 active 状态机的 initial 态取（替代写死 "new_contact"）。
+        let domain_config =
+            agent::load_user_operation_domain_config(&state, &admin.current_workspace).await?;
+        let initial_state = agent::initial_operation_state_key(domain_config.as_ref());
         insert_domain_stage_fields(
             &mut set_doc,
             generated.customer_stage.as_deref(),
@@ -422,7 +516,7 @@ pub(super) async fn update_profile_note(
         );
         set_doc.insert("commitments", commitments_bson);
         set_doc.insert("follow_up_policy", generated.follow_up_policy);
-        set_doc.insert("operation_state", "new_contact");
+        set_doc.insert("operation_state", initial_state);
         set_doc.insert(
             "operation_state_reason",
             "根据 admin 备注重新生成初始运营状态",
@@ -494,6 +588,14 @@ pub(super) async fn update_custom_agent_instructions(
     Ok(Json(json!({ "item": ApiContact::from(contact) })))
 }
 
+/// stage 是否算"发生变更"（决定 insert_domain_stage_fields 是否刷 customer_stage_updated_at）。
+/// 红线：stage 未实际写入（`new_stage=None`：空串短路 / DropSilently）时绝不算变更——
+/// 否则会无条件刷 customer_stage_updated_at，错误重置下游 stagnation 计时器（值没改却记
+/// 了一次"刚变更"）。仅当真写了新 stage 且与旧值不同才算变更。
+fn stage_changed(prev_stage: Option<&str>, new_stage: Option<&str>) -> bool {
+    new_stage.is_some() && prev_stage != new_stage
+}
+
 pub(super) async fn update_operation_profile(
     State(state): State<AppState>,
     Extension(admin): Extension<AuthenticatedAdmin>,
@@ -502,12 +604,30 @@ pub(super) async fn update_operation_profile(
 ) -> AppResult<Json<Value>> {
     let object_id = parse_object_id(&id)?;
     let current = find_contact_by_id(&state, &admin.current_workspace, &id).await?;
-    let new_stage = normalize_optional(payload.customer_stage);
+    // M1：admin 手填 stage/intent 经 taxonomy alias→canonical 归一（与 LLM 决策路径
+    // 同口径），杜绝同一字段 canonical/alias 漂移污染下游派生。归一在 stage_changed
+    // 判定之前，避免"admin 写 alias、库里是 canonical"被误判为变化。
+    let new_stage = match normalize_optional(payload.customer_stage) {
+        Some(v) => apply_admin_dim_validation(
+            crate::agent::dimension_registry::validate_dimension_value(
+                &state.db,
+                "customer_stage",
+                &v,
+                &current.account_id,
+                crate::agent::dimension_registry::WriteIntent::AdminWrite,
+            )
+            .await,
+        )?,
+        None => None,
+    };
     let prev_stage = current
         .domain_attributes
         .as_ref()
         .and_then(|d| d.get_str("customer_stage").ok().map(|s| s.to_string()));
-    let stage_changed = prev_stage.as_deref() != new_stage.as_deref();
+    // stage 实际未写入（new_stage=None：空串短路 / DropSilently）时绝不算 stage 变更——
+    // 否则 insert_domain_stage_fields(stage_changed=true) 会无条件刷 customer_stage_updated_at，
+    // 错误重置下游 stagnation（停滞）计时器（stage 值没改却记了一次"刚变更"）。
+    let stage_changed = stage_changed(prev_stage.as_deref(), new_stage.as_deref());
     let commitments_bson = commitments_with_optional_text(
         &current.commitments,
         normalize_optional(payload.last_commitment).as_deref(),
@@ -520,13 +640,43 @@ pub(super) async fn update_operation_profile(
         "profile_updated_at": DateTime::now(),
         "updated_at": DateTime::now(),
     };
-    let intent_level = normalize_optional(payload.intent_level);
+    let intent_level = match normalize_optional(payload.intent_level) {
+        Some(v) => apply_admin_dim_validation(
+            crate::agent::dimension_registry::validate_dimension_value(
+                &state.db,
+                "intent_level",
+                &v,
+                &current.account_id,
+                crate::agent::dimension_registry::WriteIntent::AdminWrite,
+            )
+            .await,
+        )?,
+        None => None,
+    };
     insert_domain_stage_fields(
         &mut set_doc,
         new_stage.as_deref(),
         intent_level.as_deref(),
         stage_changed,
     );
+    // §3.7：relationship_type 走字典校验后写 domain_attributes（无 stagnation 计时语义，
+    // 直接点路径键）。AdminDirect 通道：越界值 → Reject → 400（不静默落脏值）。
+    // None → 不写键，不覆盖现值；alias 命中由 validate 内部归一到 canonical。
+    if let Some(v) = normalize_optional(payload.relationship_type) {
+        let validated = apply_admin_dim_validation(
+            crate::agent::dimension_registry::validate_dimension_value(
+                &state.db,
+                "relationship_type",
+                &v,
+                &current.account_id,
+                crate::agent::dimension_registry::WriteIntent::AdminWrite,
+            )
+            .await,
+        )?;
+        if let Some(canonical) = validated {
+            set_doc.insert("domain_attributes.relationship_type", canonical);
+        }
+    }
     state
         .db
         .contacts()
@@ -552,57 +702,31 @@ pub(super) async fn update_operation_profile(
 /// - 不做多触点归因；
 /// - `source` 恒 `"manual"`，`marked_by` 取登录 admin，用于审计。
 ///
-/// 写库走 `$push contact.deal_events` + 一条 `deal_event_marked` 审计事件。
+/// 写库走 `$push contact.outcome_events` + 一条 `outcome_event_marked` 审计事件，
+/// 落库核心委托给 [`add_outcome_event_inner`]（与将来支付回调共用同一路径）。
 pub(super) async fn add_deal_event(
     State(state): State<AppState>,
     Extension(admin): Extension<AuthenticatedAdmin>,
     Path(id): Path<String>,
     Json(payload): Json<DealEventRequest>,
 ) -> AppResult<Json<Value>> {
-    let object_id = parse_object_id(&id)?;
     let contact = find_contact_by_id(&state, &admin.current_workspace, &id).await?;
-    if let Some(amount) = payload.amount {
-        if !amount.is_finite() || amount < 0.0 {
-            return Err(AppError::BadRequest(
-                "amount 必须是非负有限数".to_string(),
-            ));
-        }
-    }
-    let now = DateTime::now();
-    let deal_event = DealEvent {
-        marked_at: now,
-        occurred_at: payload.occurred_at_ms.map(DateTime::from_millis),
-        amount: payload.amount,
-        currency: normalize_optional(payload.currency),
-        source: "manual".to_string(),
-        marked_by: admin.username.clone(),
-        note: normalize_optional(payload.note),
-    };
-    state
-        .db
-        .contacts()
-        .update_one(
-            doc! { "_id": object_id, "workspace_id": &admin.current_workspace },
-            doc! {
-                "$push": { "deal_events": to_bson(&deal_event)? },
-                "$set": { "updated_at": now },
-            },
-            None,
-        )
-        .await?;
-    agent::write_event_for_account(
+    add_outcome_event_inner(
         &state,
-        &contact.account_id,
-        Some(&contact.wxid),
-        "deal_event_marked",
-        "ok",
-        "admin 手动登记成交事件",
-        Some(doc! {
-            "source": "manual",
-            "markedBy": &admin.username,
-            "amount": payload.amount,
-            "hasOccurredAt": payload.occurred_at_ms.is_some(),
-        }),
+        &contact,
+        OutcomeEventInput {
+            source: "manual".to_string(),
+            marked_by: admin.username.clone(),
+            audit_summary: "admin 手动登记成效事件".to_string(),
+            amount: payload.amount,
+            currency: payload.currency,
+            verification: payload.verification,
+            event_kind: payload.event_kind,
+            product_id: payload.product_id,
+            quantity: payload.quantity,
+            note: payload.note,
+            occurred_at_ms: payload.occurred_at_ms,
+        },
     )
     .await?;
     let contact = find_contact_by_id(&state, &admin.current_workspace, &id).await?;
@@ -643,6 +767,10 @@ pub(super) async fn analyze_contact_profile(
     };
     let mut unset_doc = Document::new();
     if !is_previously_operated(&contact) {
+        // H13：初始 operation_state 从 active 状态机的 initial 态取（替代写死 "new_contact"）。
+        let domain_config =
+            agent::load_user_operation_domain_config(&state, &admin.current_workspace).await?;
+        let initial_state = agent::initial_operation_state_key(domain_config.as_ref());
         insert_domain_stage_fields(
             &mut set_doc,
             generated.customer_stage.as_deref(),
@@ -651,7 +779,7 @@ pub(super) async fn analyze_contact_profile(
         );
         set_doc.insert("commitments", commitments_bson);
         set_doc.insert("follow_up_policy", generated.follow_up_policy);
-        set_doc.insert("operation_state", "new_contact");
+        set_doc.insert("operation_state", initial_state);
         set_doc.insert(
             "operation_state_reason",
             "AI 重新分析后等待后续互动确认阶段",
@@ -723,13 +851,15 @@ pub(super) async fn get_contact_memory_card(
 ) -> AppResult<Json<Value>> {
     let contact = find_contact_by_id(&state, &admin.current_workspace, &id).await?;
     let memory = ensure_operating_memory(&state, &contact).await?;
+    // H13：无 operation_state 时回落状态机初始态（替代写死 "new_contact"）。
+    let initial_state = agent::initial_operation_state_for_contact(&state, &contact).await?;
     Ok(Json(json!({
         "item": {
             "contactWxid": contact.wxid,
             // task 6.3：`effective_memory_card_for_contact` 已改为返回
             // `MemoryCardTyped`；路由层 JSON 响应在最末端通过 `to_document()`
             // 转成 Document（保持 wire shape 不变）。
-            "memoryCard": agent::effective_memory_card_for_contact(&memory, &contact).to_document(),
+            "memoryCard": agent::effective_memory_card_for_contact(&memory, &contact, &initial_state).to_document(),
             "memoryCardVersion": memory.memory_card_version,
             "memoryCardUpdatedAt": memory.memory_card_updated_at.and_then(crate::models::dt_to_string)
         }
@@ -795,4 +925,32 @@ pub(super) async fn get_operation_health(
         &memory,
         latest_review.as_ref(),
     )))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn admin_dim_apply_maps_reject_to_bad_request() {
+        use crate::agent::dimension_registry::DimValidation;
+        let r = apply_admin_dim_validation(DimValidation::Reject("x 越界".into()));
+        assert!(matches!(r, Err(AppError::BadRequest(_))));
+        let ok = apply_admin_dim_validation(DimValidation::Accept("customer".into()));
+        assert!(matches!(ok, Ok(Some(ref v)) if v == "customer"));
+        let drop = apply_admin_dim_validation(DimValidation::DropSilently);
+        assert!(matches!(drop, Ok(None)));
+    }
+
+    #[test]
+    fn stage_changed_false_when_stage_not_written() {
+        // 不变式：new_stage=None（stage 未实际写入：空串短路 / DropSilently）时绝不算变更，
+        // 即便旧值非空——否则会误刷 customer_stage_updated_at，错误重置 stagnation 计时。
+        assert!(!stage_changed(Some("need_discovery"), None));
+        assert!(!stage_changed(None, None));
+        // 真写了新值且与旧值不同 → 变更；相同 → 不变。
+        assert!(stage_changed(Some("need_discovery"), Some("solution_fit")));
+        assert!(stage_changed(None, Some("new_contact")));
+        assert!(!stage_changed(Some("solution_fit"), Some("solution_fit")));
+    }
 }

@@ -19,14 +19,14 @@ use crate::models::{
     AgentRunLog, AgentSoul,
     AgentTask, AgentToolCall, BehaviorSignal, BehaviorSignalMetric, CatalogRebuildJob,
     ChunkRevision, Contact,
-    ContentAsset, ConversationMessage, DomainSchema, EvaluationScenario, Experiment, IngestSource,
+    ContentAsset, ConversationMessage, DomainProfile, DomainSchema, EvaluationScenario, Experiment, IngestSource,
     KnowledgeChatTask, KnowledgeChatTurn, KnowledgeDailyReport, KnowledgeGapSignal,
     KnowledgeOperatorMemory, KnowledgeUsageLog, LlmCallLog, LlmProviderConfig,
     ManagementAgentMessage, ManagementAgentSession, McpCallLog, MemoryCandidate, MigrationRecord,
     OperatingMemory, OperationDomainConfig, OperationKnowledgeChunk, OperationKnowledgeDocument,
-    OperationPlaybook, OutboxEntry, PostReleaseReview, PromptTemplate,
-    Proposal, ShadowReplay, TaxonomyCandidate, TaxonomyEntry, ThresholdOverride,
-    ThresholdOverrideAudit, UserOperationGuidePreview, WechatAccount,
+    OperationPlaybook, OutboxEntry, PostReleaseReview, Product, PromptTemplate,
+    Proposal, RelationshipTypeSuggestion, ShadowReplay, TaxonomyCandidate, TaxonomyEntry,
+    ThresholdOverride, ThresholdOverrideAudit, UserOperationGuidePreview, WechatAccount,
 };
 
 #[derive(Clone)]
@@ -245,6 +245,15 @@ impl Database {
         self.db.collection("taxonomy_candidates")
     }
 
+    /// 数字分身建议链 T5：`relationship_type_suggestions` 集合 typed accessor。
+    /// 关系类型（customer/peer/friend）识别的「LLM 建议 → 运营审核 → 回写 contact」
+    /// 保守闭环第一步存储；索引见 [`indexes`] 的 `(workspace_id, contact_id)` unique。
+    pub fn collection_relationship_type_suggestions(
+        &self,
+    ) -> Collection<RelationshipTypeSuggestion> {
+        self.db.collection("relationship_type_suggestions")
+    }
+
     // ── agent-self-evolution W0 (Task 1.1) ──
     //
     // 5 个新增 collection 的 typed accessor。索引创建（`(workspace_id, account_id,
@@ -329,6 +338,13 @@ impl Database {
         self.db.collection("domain_schemas")
     }
 
+    /// universal-domain-adaptation Phase 0：行业「总装配单」。每 workspace 同时
+    /// 1 条 is_active=true；运行时按 active 加载（无则 fallback DEFAULT_PROFILE）。
+    /// 详见 `src/agent/domain_profile.rs`。索引见 `db/indexes.rs`。
+    pub fn domain_profiles(&self) -> Collection<DomainProfile> {
+        self.db.collection("domain_profiles")
+    }
+
     /// catalog 重建队列：apply_chunk_revision 写完即 enqueue；catalog_rebuild_worker
     /// 每 200ms 取一批 status=queued 落库 `documents.catalog_summary_persisted`。
     pub fn catalog_rebuild_jobs(&self) -> Collection<CatalogRebuildJob> {
@@ -340,5 +356,13 @@ impl Database {
     /// `ingest_chunked_text` 落 chunks（`integrity_status="needs_review"`）。
     pub fn ingest_sources(&self) -> Collection<IngestSource> {
         self.db.collection("ingest_sources")
+    }
+
+    /// objective-purchase-facts G2：商品库 typed accessor。运营在前端录入的
+    /// 结构化商品实体（product_id / name / price / sku / status）。成交事件
+    /// 的 `product_ref` 是下单时刻的快照拷贝（订单式），不实时引用此表。
+    /// 索引（`(workspace_id, product_id)` unique + `(workspace_id, status)`）见 `db/indexes.rs`。
+    pub fn products(&self) -> Collection<Product> {
+        self.db.collection("products")
     }
 }

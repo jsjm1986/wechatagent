@@ -48,6 +48,40 @@ pub(crate) fn merge_allowed_from_defaults(
     changed
 }
 
+/// H13 / m019：为 `state_machine.states` 补齐缺失的 `initial` / `forbidsProactive`
+/// 标志位，按 `default_states` 的同 key 默认值回填，**只补缺失、不覆盖**运营人员
+/// 已写过的值（与 [`merge_allowed_from_defaults`] 同精神）。
+///
+/// 仅当默认值为 `true` 且该字段缺失时才写入（false 是 serde 默认，无需落库，省去
+/// 无意义写入）。返回是否发生改动。
+pub(crate) fn merge_state_flag_defaults(
+    state_machine: &mut Document,
+    default_states: &[Document],
+) -> bool {
+    let Ok(states) = state_machine.get_array_mut("states") else {
+        return false;
+    };
+    let mut changed = false;
+    for state in states.iter_mut().filter_map(Bson::as_document_mut) {
+        let Some(key) = state.get_str("key").ok().map(ToString::to_string) else {
+            continue;
+        };
+        let Some(default_state) = default_states
+            .iter()
+            .find(|item| item.get_str("key").ok() == Some(key.as_str()))
+        else {
+            continue;
+        };
+        for flag in ["initial", "forbidsProactive"] {
+            if !state.contains_key(flag) && default_state.get_bool(flag).unwrap_or(false) {
+                state.insert(flag, true);
+                changed = true;
+            }
+        }
+    }
+    changed
+}
+
 /// 把 `Vec<Bson>`（混合 String / Document）升级为全结构化 Document 数组。
 /// 返回 `(new_array, changed)`：`changed=false` 表示数组中所有元素已经是
 /// 结构化（有 `id` 字段），跳过本次写入。
@@ -174,5 +208,50 @@ mod tests {
             !changed,
             "无需改动时返回 false，避免对 mongo 做空 update"
         );
+    }
+
+    /// H13 / m019：补齐 initial / forbidsProactive 标志，只补缺失不覆盖运营人员值，
+    /// 且 false 默认值不落库（避免无意义写入）。
+    #[test]
+    fn merge_state_flag_backfills_only_missing_true_flags() {
+        let defaults = vec![
+            doc! { "key": "new_contact", "initial": true },
+            doc! { "key": "cooldown", "forbidsProactive": true },
+            doc! { "key": "need_discovery" }, // 两标志都默认 false
+        ];
+        let mut machine = doc! {
+            "states": [
+                { "key": "new_contact", "name": "改过名" },
+                { "key": "cooldown" },
+                { "key": "need_discovery" }
+            ]
+        };
+        let changed = merge_state_flag_defaults(&mut machine, &defaults);
+        assert!(changed, "new_contact.initial + cooldown.forbidsProactive 应被补齐");
+
+        let states = machine.get_array("states").unwrap();
+        let nc = states[0].as_document().unwrap();
+        assert_eq!(nc.get_bool("initial").unwrap(), true);
+        assert_eq!(nc.get_str("name").unwrap(), "改过名", "不覆盖运营人员已写字段");
+        assert!(!nc.contains_key("forbidsProactive"), "false 默认不落库");
+        let cd = states[1].as_document().unwrap();
+        assert_eq!(cd.get_bool("forbidsProactive").unwrap(), true);
+        assert!(!cd.contains_key("initial"), "false 默认不落库");
+        let nd = states[2].as_document().unwrap();
+        assert!(!nd.contains_key("initial") && !nd.contains_key("forbidsProactive"));
+    }
+
+    /// H13 / m019：运营人员已显式写过标志（哪怕与默认相反）时不被覆盖。
+    #[test]
+    fn merge_state_flag_does_not_overwrite_existing() {
+        let defaults = vec![doc! { "key": "new_contact", "initial": true }];
+        // 运营人员故意把 new_contact 标成非初始态（如自定义了别的初始态）。
+        let mut machine = doc! {
+            "states": [ { "key": "new_contact", "initial": false } ]
+        };
+        let changed = merge_state_flag_defaults(&mut machine, &defaults);
+        assert!(!changed, "已存在的标志不被覆盖 → 无改动");
+        let nc = machine.get_array("states").unwrap()[0].as_document().unwrap();
+        assert_eq!(nc.get_bool("initial").unwrap(), false);
     }
 }

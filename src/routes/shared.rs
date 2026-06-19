@@ -12,7 +12,8 @@ use crate::{
     error::{AppError, AppResult},
     models::{
         AgentDecisionReview, AgentRunLog, Contact, LlmCallLog, MemoryCandidate, MemoryCardTyped,
-        OperatingMemory, OperationPlaybook, UserOperationGuidePreview,
+        OperatingMemory, OperationPlaybook, OutcomeEvent, OutcomeProductRef,
+        UserOperationGuidePreview,
     },
 };
 
@@ -72,22 +73,44 @@ pub(super) fn contact_domain_str(contact: &Contact, key: &str) -> Option<String>
 /// （planner 的 stage_stagnation 计时器依赖它）。容器级 `domain_attributes_updated_at`
 /// 总是刷新。注意：调用方的同一 `$set` 内不能再出现顶层 `domain_attributes` 键，
 /// 否则 MongoDB 会因 path conflict 报错。
+///
+/// universal-domain-adaptation 1D：dotted-key 写入 + stage 计时器逻辑已收敛到
+/// `agent::domain_signals::insert_domain_signal_values` 单一内核（AI 决策路径与本
+/// admin 路径共用）。本 wrapper 仅负责把两个 typed 维度参数装进 signals 容器、并
+/// 保留 admin 路径「容器时间戳总是刷新」的既有契约（即便无维度写入也刷新）。
 pub(super) fn insert_domain_stage_fields(
     set_doc: &mut Document,
     customer_stage: Option<&str>,
     intent_level: Option<&str>,
     stage_changed: bool,
 ) {
+    let mut signals = Document::new();
     if let Some(stage) = customer_stage {
-        set_doc.insert("domain_attributes.customer_stage", stage);
+        signals.insert("customer_stage", stage);
     }
     if let Some(intent) = intent_level {
-        set_doc.insert("domain_attributes.intent_level", intent);
+        signals.insert("intent_level", intent);
     }
-    if stage_changed {
-        set_doc.insert("domain_attributes.customer_stage_updated_at", DateTime::now());
-    }
+    crate::agent::domain_signals::insert_domain_signal_values(set_doc, &signals, stage_changed);
     set_doc.insert("domain_attributes_updated_at", DateTime::now());
+}
+
+/// admin 写画像维度：把 [`crate::agent::dimension_registry::validate_dimension_value`]
+/// 的三通道处置映射成写入决策。`Accept(canonical)` → 写入该值；`DropSilently` → 不写
+/// 该键（admin 直写通道理论不触发 Drop，兜底）；`Reject(reason)` → `400 BadRequest`
+/// （越界值不静默落库脏值）。
+///
+/// 单一真相源：guide-preview apply（本模块）与 update_operation_profile（contacts.rs）
+/// 两条 admin 路径共用此 helper，避免逻辑重复漂移。
+pub(super) fn apply_admin_dim_validation(
+    v: crate::agent::dimension_registry::DimValidation,
+) -> AppResult<Option<String>> {
+    use crate::agent::dimension_registry::DimValidation::*;
+    match v {
+        Accept(s) => Ok(Some(s)),
+        DropSilently => Ok(None),
+        Reject(r) => Err(AppError::BadRequest(r)),
+    }
 }
 
 /// 该联系人是否曾被 Agent 运营过（用于"重新启用/重新建档不覆盖历史画像"判定）。
@@ -221,6 +244,8 @@ pub(super) async fn ensure_operating_memory(
     state: &AppState,
     contact: &Contact,
 ) -> AppResult<OperatingMemory> {
+    // H13：种子记忆卡无 operation_state 时回落状态机初始态（替代写死 "new_contact"）。
+    let initial_state = agent::initial_operation_state_for_contact(state, contact).await?;
     if let Some(mut memory) = state
         .db
         .operating_memories()
@@ -235,7 +260,7 @@ pub(super) async fn ensure_operating_memory(
         .await?
     {
         if !agent::memory_card_has_signal(&effective_route_memory_card_typed(&memory)) {
-            let seeded = agent::effective_memory_card_for_contact(&memory, contact);
+            let seeded = agent::effective_memory_card_for_contact(&memory, contact, &initial_state);
             if agent::memory_card_has_signal(&seeded) {
                 let updated_at = DateTime::now();
                 memory.memory_card_version = memory.memory_card_version.saturating_add(1);
@@ -333,7 +358,7 @@ pub(super) async fn ensure_operating_memory(
         created_at: DateTime::now(),
         updated_at: DateTime::now(),
     };
-    let mut seeded_typed = agent::effective_memory_card_for_contact(&memory, contact);
+    let mut seeded_typed = agent::effective_memory_card_for_contact(&memory, contact, &initial_state);
     memory.memory_card_version = if agent::memory_card_has_signal(&seeded_typed) {
         1
     } else {
@@ -546,18 +571,83 @@ pub(super) async fn apply_contact_changes(
         set_doc.insert("tags", to_bson(&value)?);
     }
     if let Some(value) = doc_get_string(changes, "customerStage") {
-        // M2：customer_stage 实际变化时同步刷新 customer_stage_updated_at。
-        let prev = contact_domain_str(contact, "customer_stage");
-        let stage_changed = prev.as_deref().map(|s| s != value.as_str()).unwrap_or(true);
-        let intent = doc_get_string(changes, "intentLevel");
-        insert_domain_stage_fields(&mut set_doc, Some(&value), intent.as_deref(), stage_changed);
+        // M1：admin 手填值经 dimension_registry 校验（alias→canonical 归一 + 越界拒绝），
+        // 与 contacts.rs::update_operation_profile 同口径。guide-preview apply 是 admin
+        // 权威写入 → WriteIntent::AdminWrite：越界值 `?` 提前返回 400（不静默落脏值）。
+        // DropSilently（admin 通道理论不触发，仅空串兜底）→ 跳过该维度写入，不影响其它字段。
+        let validated_stage = apply_admin_dim_validation(
+            agent::dimension_registry::validate_dimension_value(
+                &state.db,
+                "customer_stage",
+                &value,
+                &contact.account_id,
+                agent::dimension_registry::WriteIntent::AdminWrite,
+            )
+            .await,
+        )?;
+        let intent = match doc_get_string(changes, "intentLevel") {
+            Some(v) => apply_admin_dim_validation(
+                agent::dimension_registry::validate_dimension_value(
+                    &state.db,
+                    "intent_level",
+                    &v,
+                    &contact.account_id,
+                    agent::dimension_registry::WriteIntent::AdminWrite,
+                )
+                .await,
+            )?,
+            None => None,
+        };
+        if let Some(value) = validated_stage {
+            // M2：customer_stage 实际变化时同步刷新 customer_stage_updated_at（归一后再比较）。
+            let prev = contact_domain_str(contact, "customer_stage");
+            let stage_changed = prev.as_deref().map(|s| s != value.as_str()).unwrap_or(true);
+            insert_domain_stage_fields(&mut set_doc, Some(&value), intent.as_deref(), stage_changed);
+        } else if intent.is_some() {
+            // stage 被 drop 但 intent 通过：仍写 intent（stage_changed=false，不刷 stage 计时）。
+            insert_domain_stage_fields(&mut set_doc, None, intent.as_deref(), false);
+        }
     } else if let Some(value) = doc_get_string(changes, "intentLevel") {
-        insert_domain_stage_fields(&mut set_doc, None, Some(&value), false);
+        let validated = apply_admin_dim_validation(
+            agent::dimension_registry::validate_dimension_value(
+                &state.db,
+                "intent_level",
+                &value,
+                &contact.account_id,
+                agent::dimension_registry::WriteIntent::AdminWrite,
+            )
+            .await,
+        )?;
+        if let Some(value) = validated {
+            insert_domain_stage_fields(&mut set_doc, None, Some(&value), false);
+        }
     }
     if let Some(value) = doc_get_string(changes, "followUpPolicy") {
         set_doc.insert("follow_up_policy", value);
     }
     if let Some(value) = doc_get_string(changes, "operationState") {
+        // 修复（问题 F）：admin 手改 operation_state 也必须过状态机迁移闸，与 AI 决策
+        // 路径（gateway C2）同一道 check_state_transition。此前 admin 直写不校验，可置入
+        // 与 customer_stage / 状态机矛盾的值（甚至状态机里不存在的态），造成 planner（读
+        // customer_stage）与 policy enforcement（读 operation_state）口径漂移，且休眠
+        // contact 无 AI 消息触发 C2 自愈时漂移无限期。admin 是交互操作 → 非法迁移**硬拒**
+        // （BadRequest），让操作者立即看到而非静默吞。domain_config=None（未配状态机）时
+        // check_state_transition fail-open，行为不变。
+        let domain_config = agent::load_user_operation_domain_config_for_contact(
+            state,
+            &contact.workspace_id,
+            &contact.wxid,
+        )
+        .await?;
+        if let Some(reason) = agent::check_state_transition(
+            domain_config.as_ref(),
+            contact.operation_state.as_deref(),
+            &value,
+        ) {
+            return Err(AppError::BadRequest(format!(
+                "非法的 operation_state 迁移：{reason}（admin 手改也须符合状态机；如需任意设值请先调整状态机定义）"
+            )));
+        }
         set_doc.insert("operation_state", value);
         set_doc.insert("operation_state_updated_at", DateTime::now());
     }
@@ -1154,10 +1244,194 @@ pub(super) fn commitments_with_optional_text(
     to_bson(&commitments).unwrap_or(Bson::Array(Vec::new()))
 }
 
+/// admin 直登成交允许的事件方向闭集（§4.5）。
+fn validate_event_kind(input: Option<&str>) -> AppResult<String> {
+    match input.map(str::trim) {
+        None | Some("") | Some("deal") => Ok("deal".to_string()),
+        Some("reversal") => Ok("reversal".to_string()),
+        Some(other) => Err(AppError::BadRequest(format!(
+            "eventKind 仅接受 deal | reversal（收到 {other:?}）"
+        ))),
+    }
+}
+
+/// admin 直登成交允许的可信度闭集（§4.4 + §5.5）。`conversation_inferred` 是 AI 侧
+/// 疑似线索，绝不经 admin 直登写入——它只能由 §5.5 疑似线索通道产出，经核实后转
+/// `staff_confirmed`。
+fn validate_deal_verification(input: Option<&str>) -> AppResult<String> {
+    match input.map(str::trim) {
+        None | Some("") | Some("staff_confirmed") => Ok("staff_confirmed".to_string()),
+        Some("payment_verified") => Ok("payment_verified".to_string()),
+        Some(other) => Err(AppError::BadRequest(format!(
+            "verification 仅接受 staff_confirmed | payment_verified（收到 {other:?}）；\
+             conversation_inferred 疑似线索须经核实后才落成交，不走直登通道"
+        ))),
+    }
+}
+
+/// 一条成效事件的落库入参（与触发来源解耦：admin 手动登记 / 将来支付回调共用）。
+///
+/// 校验（amount/currency/verification/event_kind 闭集 + reversal 须带 product）一律在
+/// [`add_outcome_event_inner`] 内完成，故此处字段是「原始意图」而非已校验值。
+pub(crate) struct OutcomeEventInput {
+    /// 事件来源；本阶段 admin 直登恒 `"manual"`，将来支付回调用 `"payment"`。
+    pub source: String,
+    /// 标记人（admin 用户名 / 将来支付单号或网关标识），用于审计。
+    pub marked_by: String,
+    /// 审计事件 summary（参数化原硬编码"admin 手动登记成效事件"）。
+    pub audit_summary: String,
+    pub amount: Option<i64>,
+    pub currency: Option<String>,
+    /// 原始可信度意图；inner 走 [`validate_deal_verification`] 闭集校验。
+    pub verification: Option<String>,
+    /// 原始事件方向意图；inner 走 [`validate_event_kind`] 闭集校验。
+    pub event_kind: Option<String>,
+    pub product_id: Option<String>,
+    pub quantity: Option<u32>,
+    pub note: Option<String>,
+    pub occurred_at_ms: Option<i64>,
+}
+
+/// 往 `contact.outcome_events` append 一条成效事件 + 写一条 `outcome_event_marked` 审计，
+/// 返回构造出的 [`OutcomeEvent`]。
+///
+/// 与触发来源无关：admin 手动登记（`add_deal_event`）/ 将来支付回调共用**同一条落库
+/// 路径**——校验闭集、`product_ref` 订单式快照、`$push`、审计形状单一真相源，绝不让两
+/// 个入口漂移出两套成交写入逻辑。**不重读 contact**（调用方按需重读返回视图）。
+///
+/// IDOR（§3.5）：产品解引用与 update filter 一律用传入 `contact.workspace_id` 收窄，
+/// 等价 admin handler 原先的 `admin.current_workspace`。
+pub(crate) async fn add_outcome_event_inner(
+    state: &AppState,
+    contact: &Contact,
+    input: OutcomeEventInput,
+) -> AppResult<OutcomeEvent> {
+    // find_contact_by_id 必带 `_id` 查回，理论不可能为 None；显式兜底不 silent unwrap。
+    let object_id = contact
+        .id
+        .ok_or_else(|| AppError::External("contact 缺少 _id，无法登记成效事件".to_string()))?;
+    // 金额整数化：amount 是最小币种单位整数（分），i64 无 NaN/Inf，只查非负。
+    if !crate::models::is_valid_minor_amount(input.amount) {
+        return Err(AppError::BadRequest(
+            "amount 必须是非负整数（最小币种单位，如分）".to_string(),
+        ));
+    }
+    if let Some(cur) = input
+        .currency
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        if !crate::models::is_valid_currency_code(cur) {
+            return Err(AppError::BadRequest(
+                "currency 必须是 ISO-4217 三位大写字母币种码（如 CNY）".to_string(),
+            ));
+        }
+    }
+    let verification = validate_deal_verification(input.verification.as_deref())?;
+    let event_kind = validate_event_kind(input.event_kind.as_deref())?;
+    let trimmed_pid = input
+        .product_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    // reversal 必须关联 product_id：无产品标的的退款没有可抵消对象，G4 投影无从下手（§4.5）。
+    if event_kind == "reversal" && trimmed_pid.is_none() {
+        return Err(AppError::BadRequest(
+            "reversal 退款事件必须关联 product_id（指明抵消哪个产品的持有）".to_string(),
+        ));
+    }
+    // 给定 product_id 时，从本 workspace 产品表解引用，冻结成交当时快照（§4.3）。
+    // IDOR（§3.5）：filter 必含 workspace_id；正向成交只认 active（archived 不可新成交），
+    // 但 reversal 要能抵消"成交后才被下架"的产品，故退款放宽到任意 status。
+    let product_ref = match trimmed_pid {
+        Some(pid) => {
+            let mut filter = doc! {
+                "workspace_id": &contact.workspace_id,
+                "product_id": pid,
+            };
+            if event_kind != "reversal" {
+                filter.insert("status", "active");
+            }
+            let product = state
+                .db
+                .products()
+                .find_one(filter, None)
+                .await?
+                .ok_or_else(|| {
+                    if event_kind == "reversal" {
+                        AppError::BadRequest(format!(
+                            "product_id {pid:?} 不存在于本工作区，无法登记退款"
+                        ))
+                    } else {
+                        AppError::BadRequest(format!(
+                            "product_id {pid:?} 不是本工作区的 active 产品，无法关联成交"
+                        ))
+                    }
+                })?;
+            Some(OutcomeProductRef {
+                product_id: product.product_id.clone(),
+                name: product.name.clone(),
+                unit_price: product.price,
+                sku: product.sku.clone(),
+                quantity: input.quantity.unwrap_or(1).max(1),
+                // G4 #4：冻结成交当时的售后期天数，使产品日后 archived 也不丢已购客户的 in_aftercare。
+                entitlement_days: agent::entitlements::entitlement_days_of(&product),
+            })
+        }
+        None => None,
+    };
+    let now = DateTime::now();
+    let outcome_event = OutcomeEvent {
+        marked_at: now,
+        occurred_at: input.occurred_at_ms.map(DateTime::from_millis),
+        amount: input.amount,
+        currency: normalize_optional(input.currency),
+        source: input.source.clone(),
+        marked_by: input.marked_by.clone(),
+        note: normalize_optional(input.note),
+        verification: verification.clone(),
+        product_ref: product_ref.clone(),
+        event_kind: event_kind.clone(),
+    };
+    state
+        .db
+        .contacts()
+        .update_one(
+            doc! { "_id": object_id, "workspace_id": &contact.workspace_id },
+            doc! {
+                "$push": { "outcome_events": to_bson(&outcome_event)? },
+                "$set": { "updated_at": now },
+            },
+            None,
+        )
+        .await?;
+    agent::write_event_for_account(
+        state,
+        &contact.account_id,
+        Some(&contact.wxid),
+        "outcome_event_marked",
+        "ok",
+        &input.audit_summary,
+        Some(doc! {
+            "source": &input.source,
+            "markedBy": &input.marked_by,
+            "amount": input.amount,
+            "hasOccurredAt": input.occurred_at_ms.is_some(),
+            "verification": &verification,
+            "eventKind": &event_kind,
+            "productId": product_ref.as_ref().map(|p| p.product_id.clone()),
+        }),
+    )
+    .await?;
+    Ok(outcome_event)
+}
+
 #[cfg(test)]
 mod tests {
     use super::escape_regex_literal;
     use super::insert_domain_stage_fields;
+    use super::{validate_deal_verification, validate_event_kind};
     use mongodb::bson::Document;
 
     #[test]
@@ -1229,6 +1503,45 @@ mod tests {
         assert!(!set_doc.contains_key("domain_attributes.customer_stage"));
         assert!(!set_doc.contains_key("domain_attributes.intent_level"));
         assert!(set_doc.contains_key("domain_attributes_updated_at"));
+    }
+
+    // ── 支付闭环前置重构：成效事件落库校验闭集（搬移自 contacts.rs，语义须逐字不变）──
+
+    // event_kind 闭集：缺省/空/deal → deal；reversal → reversal；其余 → BadRequest。
+    #[test]
+    fn validate_event_kind_accepts_closed_set_and_rejects_others() {
+        assert_eq!(validate_event_kind(None).unwrap(), "deal");
+        assert_eq!(validate_event_kind(Some("")).unwrap(), "deal");
+        assert_eq!(validate_event_kind(Some("  ")).unwrap(), "deal");
+        assert_eq!(validate_event_kind(Some("deal")).unwrap(), "deal");
+        assert_eq!(validate_event_kind(Some(" reversal ")).unwrap(), "reversal");
+        assert!(validate_event_kind(Some("refund")).is_err());
+        assert!(validate_event_kind(Some("DEAL")).is_err());
+    }
+
+    // verification 闭集：缺省/空/staff_confirmed → staff_confirmed；payment_verified 直通；
+    // conversation_inferred 绝不经直登通道（与 §5.5 红线一致）。
+    #[test]
+    fn validate_deal_verification_rejects_conversation_inferred_via_direct_path() {
+        assert_eq!(
+            validate_deal_verification(None).unwrap(),
+            "staff_confirmed"
+        );
+        assert_eq!(
+            validate_deal_verification(Some("")).unwrap(),
+            "staff_confirmed"
+        );
+        assert_eq!(
+            validate_deal_verification(Some("staff_confirmed")).unwrap(),
+            "staff_confirmed"
+        );
+        assert_eq!(
+            validate_deal_verification(Some(" payment_verified ")).unwrap(),
+            "payment_verified"
+        );
+        // AI 侧疑似线索不得经直登写入。
+        assert!(validate_deal_verification(Some("conversation_inferred")).is_err());
+        assert!(validate_deal_verification(Some("guessed")).is_err());
     }
 }
 

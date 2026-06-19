@@ -13,6 +13,9 @@
 //! 4. **未 verified 不可见**：corpus 仅 `integrity_status=needs_review` chunk
 //!    → catalog 必为空，行为与场景 2 一致（放在 list_catalog/open_chunk
 //!    的 verified-only 守门上验证）。
+//! 5. **D3 关系图谱**：follow_relations 按 relation_kind 分流（references=支撑、
+//!    contradicts=标记反例跟随）；open_chunk / follow_relations 命中已被
+//!    superseded 的 chunk 时 redirect 到现行版本。
 //!
 //! `#[ignore]` 守门：依赖 testcontainers MongoDB，CI 用 `cargo test -- --ignored`。
 
@@ -21,7 +24,7 @@ mod common;
 use mongodb::bson::{doc, oid::ObjectId, DateTime as BsonDt};
 use serde_json::json;
 use wechatagent::agent::knowledge_agent::{answer, AnswerRequest, CatalogFilter};
-use wechatagent::models::OperationKnowledgeChunk;
+use wechatagent::models::{OperationKnowledgeChunk, RelatedRef};
 
 use crate::common::TestApp;
 
@@ -204,4 +207,244 @@ async fn ask_skips_unverified_chunks_in_catalog() {
     );
     assert_eq!(app.llm.calls(), 0, "catalog 空 → 不调 LLM");
     assert_eq!(result.rounds_used, 0);
+}
+
+// ── D3：关系图谱按 relation_kind 正确遍历 + superseded 版本 redirect ──────────
+//
+// 直接驱动 pub 的 follow_relations / open_chunk（绕过 LLM 循环），对 relation_role
+// 标记与 redirect 后的 chunk_id 做精确断言。
+
+use std::collections::HashSet;
+use wechatagent::agent::knowledge_agent::{follow_relations, open_chunk};
+
+/// D3(a)：follow_relations 经 references 拉入的目标作支撑（relation_role=None），
+/// 经 contradicts 拉入的目标带 relation_role="contradiction"（仅供辨别、prompt 警示
+/// 勿作支撑引用）。
+#[tokio::test]
+#[ignore]
+async fn follow_relations_marks_contradiction_targets() {
+    let app = TestApp::start().await;
+
+    let support = verified_chunk("支撑材料 B", "B 正文：正向支撑");
+    let contra = verified_chunk("矛盾说法 C", "C 正文：与 A 相矛盾的说法");
+    let support_id = support.id.unwrap().to_hex();
+    let contra_id = contra.id.unwrap().to_hex();
+
+    // A 同时 references B、contradicts C。
+    let mut source = verified_chunk("来源 A", "A 正文");
+    source.related_chunks = Some(vec![
+        RelatedRef {
+            chunk_id: support_id.clone(),
+            kind: "references".to_string(),
+            note: None,
+        },
+        RelatedRef {
+            chunk_id: contra_id.clone(),
+            kind: "contradicts".to_string(),
+            note: Some("口径冲突".to_string()),
+        },
+    ]);
+    let source_id = source.id.unwrap().to_hex();
+    insert(&app, &[source, support, contra]).await;
+
+    let (_catalog, prefetched) =
+        follow_relations(&app.state, WS, &source_id, 1, &HashSet::new())
+            .await
+            .expect("follow_relations ok");
+
+    // B 与 C 都被拉入（contradicts 跟随但标记，不是跳过）。
+    let b = prefetched
+        .iter()
+        .find(|c| c.chunk_id == support_id)
+        .expect("B 应被作为支撑拉入");
+    assert_eq!(b.relation_role, None, "references 目标不带 contradiction 标记");
+
+    let c = prefetched
+        .iter()
+        .find(|c| c.chunk_id == contra_id)
+        .expect("C 应被跟随（标记反例，不是跳过）");
+    assert_eq!(
+        c.relation_role.as_deref(),
+        Some("contradiction"),
+        "contradicts 目标必须带 relation_role=contradiction"
+    );
+}
+
+/// D3(b) 问答侧：open_chunk 请求已被取代的旧版 → redirect 到现行版本，返回的
+/// ChunkFull.chunk_id 即新版 id（cite⊆opened 不变量靠此对齐）。
+#[tokio::test]
+#[ignore]
+async fn open_chunk_redirects_superseded_to_current_version() {
+    let app = TestApp::start().await;
+
+    let new_chunk = verified_chunk("现行版", "新版正文");
+    let new_id = new_chunk.id.unwrap().to_hex();
+    let mut old_chunk = verified_chunk("旧版", "旧版正文");
+    old_chunk.superseded_by = Some(new_id.clone());
+    let old_id = old_chunk.id.unwrap().to_hex();
+    insert(&app, &[old_chunk, new_chunk]).await;
+
+    let full = open_chunk(&app.state, WS, &old_id)
+        .await
+        .expect("open_chunk ok")
+        .expect("应返回现行版而非 None");
+    assert_eq!(full.chunk_id, new_id, "open_chunk 应 redirect 到新版 id");
+    assert_eq!(full.body, "新版正文", "应返回现行版正文");
+}
+
+/// D3(b) 问答侧：follow_relations 命中已被取代的目标 → 收集现行版本而非旧版。
+#[tokio::test]
+#[ignore]
+async fn follow_relations_redirects_superseded_target() {
+    let app = TestApp::start().await;
+
+    let new_chunk = verified_chunk("目标现行版", "新版正文");
+    let new_id = new_chunk.id.unwrap().to_hex();
+    let mut old_target = verified_chunk("目标旧版", "旧版正文");
+    old_target.superseded_by = Some(new_id.clone());
+    let old_id = old_target.id.unwrap().to_hex();
+
+    // A references 旧版目标。
+    let mut source = verified_chunk("来源 A", "A 正文");
+    source.related_chunks = Some(vec![RelatedRef {
+        chunk_id: old_id.clone(),
+        kind: "references".to_string(),
+        note: None,
+    }]);
+    let source_id = source.id.unwrap().to_hex();
+    insert(&app, &[source, old_target, new_chunk]).await;
+
+    let (_catalog, prefetched) =
+        follow_relations(&app.state, WS, &source_id, 1, &HashSet::new())
+            .await
+            .expect("follow_relations ok");
+
+    assert!(
+        prefetched.iter().any(|c| c.chunk_id == new_id),
+        "应收集现行版 {new_id}"
+    );
+    assert!(
+        !prefetched.iter().any(|c| c.chunk_id == old_id),
+        "不应收集已被取代的旧版 {old_id}"
+    );
+}
+
+/// D3(b) 端到端（cite⊆opened 关键修复的主循环集成）：agent open 一个已被取代的旧版
+/// id → open_chunk redirect 到新版 → opened_seen 记的是新版 id → agent cite 新版 id →
+/// filter_answer_against_opened 不丢弃 → cited 非空且为新版。
+///
+/// 此前 open_chunk 分支把请求的旧 id 塞进 opened_seen，redirect 后 agent 看到/cite
+/// 新版 id 会被当"未 open"丢掉，cited 变空。本测试守住该回归。
+#[tokio::test]
+#[ignore]
+async fn answer_cites_redirected_current_version_end_to_end() {
+    let app = TestApp::start().await;
+
+    let new_chunk = verified_chunk("现行版", "现行版正文：价格异议三步法");
+    let new_id = new_chunk.id.unwrap().to_hex();
+    let mut old_chunk = verified_chunk("旧版", "旧版正文");
+    old_chunk.superseded_by = Some(new_id.clone());
+    let old_id = old_chunk.id.unwrap().to_hex();
+    insert(&app, &[old_chunk, new_chunk]).await;
+
+    // 轮 1：agent open 旧版 id（catalog 里可能两版都在，agent 选了旧的）。
+    app.llm.push_response(json!({
+        "action": "open_chunk",
+        "ids": [old_id.clone()],
+    }));
+    // 轮 2：agent cite **新版 id**（redirect 后 opened 里就是新版，prompt 里看到的也是新版）。
+    app.llm.push_response(json!({
+        "action": "answer",
+        "answer": "价格异议分三步处理。",
+        "citedChunkIds": [new_id.clone()],
+        "sourceQuotes": [{
+            "chunkId": new_id.clone(),
+            "quote": "现行版正文：价格异议三步法",
+            "sourceAnchorIndex": null,
+        }],
+    }));
+
+    let result = answer(&app.state, req("价格异议"))
+        .await
+        .expect("answer");
+
+    // cite⊆opened 修复成立：cite 新版 id 不被丢，cited 非空且恰为新版。
+    assert_eq!(
+        result.cited_chunk_ids,
+        vec![new_id.clone()],
+        "redirect 后 cite 现行版 id 必须保留（cite⊆opened 不丢）"
+    );
+    assert!(!result.answer.is_empty(), "answer 非空");
+    // 旧版 id 绝不出现在 cited（它从未进 opened_seen——opened_seen 记的是 redirect 后的新版）。
+    assert!(
+        !result.cited_chunk_ids.contains(&old_id),
+        "旧版 id 不应被 cite"
+    );
+}
+
+/// D3(b) DB 版 resolve_superseded 多跳链：v1→v2→v3 全 verified，open(v1) 跟到链尾 v3。
+#[tokio::test]
+#[ignore]
+async fn open_chunk_follows_multi_hop_superseded_chain() {
+    let app = TestApp::start().await;
+
+    let v3 = verified_chunk("v3 终版", "v3 正文");
+    let v3_id = v3.id.unwrap().to_hex();
+    let mut v2 = verified_chunk("v2", "v2 正文");
+    v2.superseded_by = Some(v3_id.clone());
+    let v2_id = v2.id.unwrap().to_hex();
+    let mut v1 = verified_chunk("v1", "v1 正文");
+    v1.superseded_by = Some(v2_id.clone());
+    let v1_id = v1.id.unwrap().to_hex();
+    insert(&app, &[v1, v2, v3]).await;
+
+    let full = open_chunk(&app.state, WS, &v1_id)
+        .await
+        .expect("open_chunk ok")
+        .expect("应跟链返回 v3");
+    assert_eq!(full.chunk_id, v3_id, "多跳链应跟到链尾 v3");
+    assert_eq!(full.body, "v3 正文");
+}
+
+/// D3(b) DB 版 resolve_superseded：新版**非 verified**（draft）时停在旧版，绝不 redirect
+/// 到未审定的新版（verified 门 + redirect 协同）。
+#[tokio::test]
+#[ignore]
+async fn open_chunk_stops_redirect_when_new_version_unverified() {
+    let app = TestApp::start().await;
+
+    let mut draft_new = verified_chunk("未审定新版", "新版正文");
+    draft_new.integrity_status = Some("needs_review".to_string()); // 非 verified
+    let new_id = draft_new.id.unwrap().to_hex();
+    let mut old_chunk = verified_chunk("旧版仍现行", "旧版正文");
+    old_chunk.superseded_by = Some(new_id.clone());
+    let old_id = old_chunk.id.unwrap().to_hex();
+    insert(&app, &[old_chunk, draft_new]).await;
+
+    // 新版未 verified → resolve 停在旧版 → open_chunk 返回旧版（仍 verified）。
+    let full = open_chunk(&app.state, WS, &old_id)
+        .await
+        .expect("open_chunk ok")
+        .expect("新版未审定时应停在旧版");
+    assert_eq!(full.chunk_id, old_id, "不得 redirect 到未 verified 的新版");
+    assert_eq!(full.body, "旧版正文");
+}
+
+/// D3(b) DB 版 resolve_superseded 自指环：chunk.superseded_by 指向自己 → 不死循环，
+/// 停在自身返回。
+#[tokio::test]
+#[ignore]
+async fn open_chunk_self_cycle_superseded_terminates() {
+    let app = TestApp::start().await;
+
+    let mut selfie = verified_chunk("自指环", "正文");
+    let self_id = selfie.id.unwrap().to_hex();
+    selfie.superseded_by = Some(self_id.clone());
+    insert(&app, &[selfie]).await;
+
+    let full = open_chunk(&app.state, WS, &self_id)
+        .await
+        .expect("open_chunk ok")
+        .expect("自指环应停在自身");
+    assert_eq!(full.chunk_id, self_id, "自指环停在自身不死循环");
 }

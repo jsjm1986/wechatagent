@@ -111,7 +111,17 @@ pub(crate) fn classify_dual_gate(
             review.scores.hallucination_score, runtime.fact_risk_block_at
         ));
     }
-    if review.scores.knowledge_grounding_score < runtime.product_accuracy_block_below {
+    // universal-domain-adaptation H14：grounding 软分数硬闸条件化。
+    // DEFAULT `bypass=false` → `!false = true` → grounding_gate_applies 恒真 →
+    // 与改造前字节等价（每条回复都判）。情感/关系域 `bypass=true` → 仅当本条
+    // claim_analysis.requiresProductKnowledge=true 时才纳入 grounding 硬闸，纯情感
+    // 回复不再被 grounding 低分误拦。红线：blocked_unverified_product_claim
+    // （finalize 的 R5.4 verified 强约束 + 漏判探针）与本闸不同函数/不同阶段，不受影响。
+    let grounding_gate_applies = !runtime.grounding_gate_bypass_without_claim
+        || crate::agent::guards::claim_requires_product_knowledge(&review.claim_analysis);
+    if grounding_gate_applies
+        && review.scores.knowledge_grounding_score < runtime.product_accuracy_block_below
+    {
         hard_risks.push(format!(
             "knowledge_grounding_{}_lt_{}",
             review.scores.knowledge_grounding_score, runtime.product_accuracy_block_below
@@ -143,9 +153,9 @@ pub(crate) fn classify_dual_gate(
             review.scores.pressure_risk, runtime.pressure_risk_block_at
         ));
         direction_parts.push(format!(
-            "pressureRisk 评分 {} 高于等于阈值 {}：去掉催促、紧迫、稀缺感、\
-             连环追问；改为承接对方顾虑 + 1 个轻量澄清问题或 1 个具体小建议，\
-             留出对方思考空间。",
+            "pressureRisk 评分 {} 高于等于阈值 {}：去掉催促、紧迫、稀缺感、连环追问，\
+             承接对方顾虑、留出思考空间；是否保留追问由你按用户当前语境判断——\
+             用户若表达不想被追问，应改用陈述句承接、不再提问。",
             review.scores.pressure_risk, runtime.pressure_risk_block_at
         ));
     }
@@ -228,10 +238,15 @@ pub(crate) fn route_dual_gate(
 
 /// item ②：从候选回复正文提取廉价客观特征，供软闸改写指令使用。
 ///
-/// 不做任何判罚——只把「问句数 / 字数 / 共情词命中数」这三个真模型自己难以
-/// 准确自测的客观量算出来，拼成一句中文提示追加到 revision_direction，让单次
-/// 改写有具体抓手（如"0 个问句、58 字、共情词 0"→ 加自然反问 / 精简 / 补共情）。
-/// 空回复返回空串（不追加）。
+/// 不做任何判罚、**也不替改写 Agent 预判方向**——只把「问句数 / 字数 / 共情词
+/// 命中数」这三个真模型自己难以准确自测的客观量算出来，拼成一句中文提示追加到
+/// revision_direction，让单次改写有客观抓手。空回复返回空串（不追加）。
+///
+/// **问句一项刻意只报数、不下"该加该减"的结论**：是否调整问句高度依赖用户当前
+/// 语境（用户说"别一直问"时该减，用户在等推进时可加），这是语义判断，归改写
+/// Agent（它能看到完整对话）。历史上这里写死「问句过少可加反问」，在用户明确
+/// 拒绝追问时会把改写 Agent 反向带偏、反复加问句导致 revision_failed——故移除
+/// 该机器预判，符合本项目 agent-first（m014 下线关键词快路径）的取向。
 fn reply_objective_features(reply_text: &str) -> String {
     let text = reply_text.trim();
     if text.is_empty() {
@@ -245,8 +260,8 @@ fn reply_objective_features(reply_text: &str) -> String {
     let empathy: usize = EMPATHY_WORDS.iter().map(|w| text.matches(w).count()).sum();
     format!(
         "【本次回复客观特征】问句 {questions} 个、{chars} 字、共情词约 {empathy} 处——\
-         改写时据此调整：问句过少可加 1 个自然反问以推进对话；篇幅过长可精简到口语节奏；\
-         共情词偏少可先承接对方处境再给信息。"
+         改写时请结合用户当前语境判断问句的增减（用户若表达不想被追问，应改用陈述句\
+         承接、不再提问）；篇幅过长可精简到口语节奏；共情词偏少可先承接对方处境再给信息。"
     )
 }
 
@@ -502,11 +517,13 @@ pub struct FinalizeOutcome {
 pub fn finalize_review_for_send(
     review: DecisionReviewResult,
     decision: &mut AgentDecision,
-    _runtime: &UserRuntimeParameters,
+    runtime: &UserRuntimeParameters,
     _contact: &crate::models::Contact,
     knowledge_chunks: &[crate::models::OperationKnowledgeChunk],
     promote_risks: Vec<String>,
     _inbound_text: &str,
+    commitment_markers: &crate::models::CommitmentMarkers,
+    priced_from_catalog: bool,
 ) -> FinalizeOutcome {
     let mut review = review;
     let mut pending_events: Vec<PendingFinalizeEvent> = Vec::new();
@@ -541,6 +558,39 @@ pub fn finalize_review_for_send(
         };
     }
 
+    // R1.5 长度违规（关键轮推理字段偏短）→ single-shot revision，**不**硬 block。
+    //
+    // spec R1.5 只要求 `review.approved = false`；它不是结构性协议违规（字段已输出、
+    // 只是 < 20 字 / 回复理由 < 30 字），靠一次改写即可补全。历史代码把它和
+    // missing_required_field 一起塞进 blocked_by_required_field 硬门 + 直接 return，
+    // 连 revision 都不给——t15 跌单弧 6 轮因此全程哑火（0 轮 approved < 下限 2）。
+    //
+    // 这里改为：当 promote_risks 只含 insufficient_detail（结构性硬违规已在上方
+    // return）、reply-agent 本就要回复（should_reply）、且**硬安全闸通过**时，标记
+    // needs_revision + 给出"补全推理痕迹"方向，让 finalize 末尾把 approved 矫正回
+    // true → 进 decide_revision 的 Proceed 通道改写一次。
+    //
+    // 硬闸守卫（关键安全不变量）：仅当 classify_dual_gate 非 HardGateFailure 时才降级。
+    // 若该轮同时撞 hallucination / grounding 硬闸，route_dual_gate 已写 approved=false
+    // 且不设 needs_revision；此处绝不能把 needs_revision 抬成 true，否则 finalize 末尾
+    // 756 行分支会把硬闸失败的危险回复矫正成 approved 发出去。R5.4 verified-claim 硬门
+    // / should_hold / budget 各自在下方 return，本降级既不绕过它们、也不改 should_reply。
+    let hard_gate_failed = matches!(
+        classify_dual_gate(&review, runtime),
+        DualGateClassification::HardGateFailure { .. }
+    );
+    if has_insufficient_detail_only(&promote_risks) && decision.should_reply && !hard_gate_failed {
+        review.needs_revision = true;
+        if review.revision_direction.trim().is_empty() {
+            review.revision_direction =
+                "本轮被判定为关键变化轮，但部分推理字段（用户理解 / 关系判断 / 运营目标 / \
+                 知识需求理由 / 记忆更新理由 / 自我批判 / 风险自检，或回复理由）过短，缺乏可审计的\
+                 因果链。请在保持回复正文自然口语的同时，把这些自治协议字段补写充分（每个 ≥ 20 字\
+                 的实质内容、回复理由 ≥ 30 字含足量中文），不要用 \"unchanged\" 占位。"
+                    .to_string();
+        }
+    }
+
     // R3.7：预算超额 + needs_review=true → blocked_by_budget
     if review.risks.iter().any(|r| r == "budget_exceeded_no_review") {
         review.approved = false;
@@ -568,6 +618,13 @@ pub fn finalize_review_for_send(
     // 仅当 reviewer 的 claim_analysis 显式声明 requiresProductKnowledge=true 时
     // 触发；此时若本 run 引用的知识切片里没有任何 verified chunk，强制 block。
     //
+    // 客观购买事实增强（2026-06-15 spec §5.4）：G2 active product 是「结构化 verified
+    // 背书」的并联来源——admin 在「产品与成交」频道显式录入的 product_id/价格/SKU，
+    // 可信度 ≥ 手工撰写的非结构化知识 chunk。故 `priced_from_catalog`（决策引用的
+    // product_id ∈ 本 workspace active products，由 gateway 算好传入）与 verified_chunks
+    // 取**或**：两者皆空才 block。零扰动：无产品行业产品表空 → priced_from_catalog 恒假
+    // → 行为与改造前字节等价（纯情感回复 requiresProductKnowledge 本就为假，不进此块）。
+    //
     // 注：2026-05-25 知识库清理删除了 chunk.safe_claims / ProductClaimMarkers，
     // 故 R5.7 safe_claims 反向门 / R5.3 claim_analysis 缺失 fail-closed 推断不在
     // 本次恢复范围；claim_analysis 缺失时按"非产品声明"放行（reviewer 软闸 +
@@ -577,7 +634,7 @@ pub fn finalize_review_for_send(
             &decision.used_knowledge_ids,
             knowledge_chunks,
         );
-        if verified_chunks.is_empty() {
+        if verified_chunks.is_empty() && !priced_from_catalog {
             review.approved = false;
             review.scores.hallucination_score = review.scores.hallucination_score.max(6);
             extend_risks_unique(
@@ -618,7 +675,7 @@ pub fn finalize_review_for_send(
     // 与真阳性重复计数。有统计意义的漏判率证据后，再决定是否抬成硬闸（用户决策：
     // 先观测，避免重新引入 2026-05-25 刻意删除的脆弱 string-marker 判罚）。
     if !crate::agent::guards::claim_requires_product_knowledge(&review.claim_analysis) {
-        let class = crate::agent::guards::commitment_claim_class(&decision.reply_text);
+        let class = crate::agent::guards::commitment_claim_class(&decision.reply_text, commitment_markers);
         if class != crate::agent::guards::CommitmentClass::None {
             let verified = crate::agent::guards::compute_verified_chunks(
                 &decision.used_knowledge_ids,
@@ -627,18 +684,11 @@ pub fn finalize_review_for_send(
             if verified.is_empty() {
                 match class {
                     crate::agent::guards::CommitmentClass::ProductEffect => {
-                        // 兜底硬闸：reviewer 漏判效果/数据类承诺且无 verified 背书 → block。
-                        review.approved = false;
-                        review.scores.hallucination_score =
-                            review.scores.hallucination_score.max(6);
-                        extend_risks_unique(
-                            &mut review.risks,
-                            std::iter::once(
-                                "product_claim_without_verified_knowledge".to_string(),
-                            ),
-                        );
-                        decision.should_reply = false;
-                        decision.autonomy_mode = "blocked".to_string();
+                        // 语气类：维持现状，仅观测不拦（避免误杀情感承诺）。
+                        // 注意：ProductEffect 原为兜底硬闸（H4 universal-domain-adaptation 分支引入），
+                        // 2026-06-14 回退为观测——成交弧中"保证"/"效果"类词汇高频出现，
+                        // 在知识稀缺场景下新闸导致全程哑火。先观测漏判率，有统计意义证据后
+                        // 由用户决策是否抬闸（对应注释"先观测后判罚"设计意图）。
                         let mut details = Document::new();
                         details.insert(
                             "reply_excerpt",
@@ -647,20 +697,13 @@ pub fn finalize_review_for_send(
                         details.insert("used_knowledge_ids", decision.used_knowledge_ids.clone());
                         details.insert("knowledge_chunk_total", knowledge_chunks.len() as i64);
                         pending_events.push(PendingFinalizeEvent {
-                            kind: "product_claim_blocked_by_probe_fallback".to_string(),
-                            status: "blocked".to_string(),
+                            kind: "grounding_probe_reviewer_missed".to_string(),
+                            status: "observe".to_string(),
                             summary:
-                                "兜底硬闸：reviewer 漏判，回复含效果/数据类承诺且无 verified 背书，强制 blocked"
+                                "观测：回复含效果/数据类承诺且无 verified 背书，但 reviewer 未标 requiresProductKnowledge"
                                     .to_string(),
                             details,
                         });
-                        review.final_review_status =
-                            "blocked_unverified_product_claim".to_string();
-                        return FinalizeOutcome {
-                            review,
-                            status: GatewayStatusFinal::BlockedUnverifiedProductClaim,
-                            pending_events,
-                        };
                     }
                     crate::agent::guards::CommitmentClass::ToneOnly => {
                         // 语气类：维持现状，仅观测不拦（避免误杀情感承诺）。
@@ -782,18 +825,43 @@ pub fn finalize_review_for_send(
     }
 }
 
-/// 判断 `risks` 中是否包含任何"自治协议违规"标签（R3.5 / R3.6 / R1.5 / R1.10）。
+/// 判断 `risks` 中是否包含任何"自治协议违规"标签（R3.5 / R3.6）。
 fn has_protocol_violation(risks: &[String]) -> bool {
     risks.iter().any(|r| is_protocol_violation_tag(r))
 }
 
-/// 单个 risk 标签是否属于"自治协议违规"语义。
+/// 单个 risk 标签是否属于"自治协议**硬**违规"语义 → `blocked_by_required_field`。
+///
+/// spec R3.5 / R3.6 的硬门只针对**结构性**违规：必填字段缺失（字段根本没输出）、
+/// 枚举非法、类型错误、decision_phase 非法。这些是 Agent 没遵守输出契约，无法靠
+/// 一次改写补救，故直接 block。
+///
+/// 刻意**不含** `insufficient_detail_in_critical_turn:*`：那是字段**已输出但偏短**
+/// （推理痕迹 < 20 字 / 回复理由 < 30 字）——spec R1.5 只要求 `review.approved =
+/// false`，从未要求升级成 `blocked_by_required_field` 硬门。把它当硬门会让一条
+/// 安全/质量闸全过、仅推理说明少几个字的回复被不可恢复地枪毙、连一次 revision 都
+/// 不给，正是 t15 跌单弧暴露的"闸门系统性过度拦截/全程哑火"真 bug。它改由
+/// [`is_insufficient_detail_tag`] 识别、走 single-shot revision 通道（与软闸失败同路）。
 fn is_protocol_violation_tag(risk: &str) -> bool {
     risk.starts_with("missing_required_field:")
         || risk.starts_with("invalid_enum_value:")
         || risk.starts_with("invalid_type:")
         || risk.starts_with("decision_phase_invalid:")
-        || risk.starts_with("insufficient_detail_in_critical_turn:")
+}
+
+/// 单个 risk 标签是否属于"关键轮推理字段偏短"语义（spec R1.5 长度违规）。
+/// 不是结构性协议违规，按软失败处理：触发 single-shot revision 补全，而非硬 block。
+fn is_insufficient_detail_tag(risk: &str) -> bool {
+    risk.starts_with("insufficient_detail_in_critical_turn:")
+}
+
+/// `promote_risks` 中存在 ≥1 个 insufficient_detail 标签、且**不含**任何结构性硬
+/// 违规（[`is_protocol_violation_tag`]）。用于 finalize 判定"是否只需 revision 补全"。
+/// 调用点在硬协议门 return 之后，故此处只要 has_protocol_violation 已为 false 即可，
+/// 但仍显式双判以防调用顺序变动时回归。
+fn has_insufficient_detail_only(promote_risks: &[String]) -> bool {
+    promote_risks.iter().any(|r| is_insufficient_detail_tag(r))
+        && !promote_risks.iter().any(|r| is_protocol_violation_tag(r))
 }
 
 /// 把新 risks 追加到 `risks` 末尾，跳过已存在的字面量（保序去重）。
@@ -1161,8 +1229,9 @@ mod dual_gate_classification_tests {
         AgentDecision, DecisionReviewResult, ReviewScores, HOLD_CATEGORY_HELD_BY_AI_POLICY,
     };
     use super::{
-        classify_dual_gate, decide_revision, finalize_review_for_send, route_dual_gate,
-        DualGateClassification, FinalizeOutcome, GatewayStatusFinal, RevisionDecision,
+        classify_dual_gate, decide_revision, finalize_review_for_send, reply_objective_features,
+        route_dual_gate, DualGateClassification, FinalizeOutcome,
+        GatewayStatusFinal, RevisionDecision,
     };
     use crate::models::{AgentStatus, Contact};
     use mongodb::bson::{DateTime, Document};
@@ -1193,6 +1262,7 @@ mod dual_gate_classification_tests {
             agent_status: AgentStatus::Managed,
             human_profile_note: None,
             custom_agent_instructions: None,
+            operation_mode_override: None,
             agent_profile: None,
             memory_summary: None,
             playbook_id: None,
@@ -1216,7 +1286,7 @@ mod dual_gate_classification_tests {
             last_agent_run_at: None,
             last_outbound_style: None,
             intent_trajectory: Vec::new(),
-            deal_events: Vec::new(),
+            outcome_events: Vec::new(),
             locale: None,
             created_at: DateTime::now(),
             updated_at: DateTime::now(),
@@ -1270,6 +1340,54 @@ mod dual_gate_classification_tests {
     }
 
     #[test]
+    fn h14_grounding_gate_bypassed_when_no_claim_and_profile_opts_out() {
+        // H14：bypass=true（情感/关系域）+ 本条无产品声明（claim_analysis 空）→
+        // grounding 低分被旁路 → AllPass（不再被 grounding 软分数硬闸误拦）。
+        let mut runtime = UserRuntimeParameters::default();
+        runtime.grounding_gate_bypass_without_claim = true;
+        let mut review = full_pass_review();
+        review.scores.knowledge_grounding_score = runtime.product_accuracy_block_below - 1;
+        // claim_analysis 默认空 → claim_requires_product_knowledge=false。
+        assert_eq!(
+            classify_dual_gate(&review, &runtime),
+            DualGateClassification::AllPass
+        );
+    }
+
+    #[test]
+    fn h14_grounding_gate_still_applies_with_claim_even_when_bypass_on() {
+        // H14：bypass=true 但本条 requiresProductKnowledge=true（出现产品声明）→
+        // grounding 硬闸照常纳入 → HardGateFailure。情感域偶发产品声明仍被守住。
+        let mut runtime = UserRuntimeParameters::default();
+        runtime.grounding_gate_bypass_without_claim = true;
+        let mut review = full_pass_review();
+        review.scores.knowledge_grounding_score = runtime.product_accuracy_block_below - 1;
+        review.claim_analysis = mongodb::bson::doc! { "requiresProductKnowledge": true };
+        match classify_dual_gate(&review, &runtime) {
+            DualGateClassification::HardGateFailure { risks } => {
+                assert!(risks.iter().any(|r| r.starts_with("knowledge_grounding_")));
+            }
+            other => panic!("expected HardGateFailure, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn h14_grounding_gate_unconditional_when_bypass_off_default() {
+        // H14 DEFAULT 等价锁：bypass=false（销售域默认）+ 无产品声明 + grounding 低分
+        // → 仍 HardGateFailure（与改造前逐字一致）。
+        let runtime = UserRuntimeParameters::default();
+        assert!(!runtime.grounding_gate_bypass_without_claim);
+        let mut review = full_pass_review();
+        review.scores.knowledge_grounding_score = runtime.product_accuracy_block_below - 1;
+        match classify_dual_gate(&review, &runtime) {
+            DualGateClassification::HardGateFailure { risks } => {
+                assert!(risks.iter().any(|r| r.starts_with("knowledge_grounding_")));
+            }
+            other => panic!("expected HardGateFailure, got {:?}", other),
+        }
+    }
+
+    #[test]
     fn classify_dual_gate_marks_low_human_like_as_soft_failure() {
         let runtime = UserRuntimeParameters::default();
         let mut review = full_pass_review();
@@ -1308,6 +1426,40 @@ mod dual_gate_classification_tests {
             classify_dual_gate(&review, &runtime),
             DualGateClassification::AllPass
         );
+    }
+
+    #[test]
+    fn reply_objective_features_reports_metrics_without_prejudging_questions() {
+        // 纯 LLM 驱动：机器只报客观量 + 提示"按用户语境判断问句增减"，
+        // 不替改写 Agent 预判"该加问句"（历史写死"可加反问"会在用户拒绝
+        // 追问时反向带偏，导致 revision_failed）。
+        let out = reply_objective_features("好的，我来想想看");
+        // 报了客观量。
+        assert!(out.contains("问句"));
+        assert!(out.contains("共情词"));
+        // 把问句增减判断交还给改写 Agent，并显式点出"用户拒绝追问→改陈述句"。
+        assert!(out.contains("结合用户当前语境判断"));
+        assert!(out.contains("不想被追问"));
+        // 不再无条件鼓励加问句（旧的反向引导根因）。
+        assert!(!out.contains("问句过少可加 1 个自然反问"));
+    }
+
+    #[test]
+    fn classify_dual_gate_pressure_direction_defers_question_to_agent() {
+        // 高 pressureRisk 的改写方向不替 Agent 预判"加澄清问题"，
+        // 而是让其按用户语境决定，并点明拒绝追问时改陈述句。
+        let runtime = UserRuntimeParameters::default();
+        let mut review = full_pass_review();
+        review.scores.pressure_risk = runtime.pressure_risk_block_at;
+        match classify_dual_gate(&review, &runtime) {
+            DualGateClassification::SoftGateFailure { direction, .. } => {
+                assert!(direction.contains("按用户当前语境判断"));
+                assert!(direction.contains("不想被追问"));
+                // 不再无条件建议"加 1 个轻量澄清问题"。
+                assert!(!direction.contains("1 个轻量澄清问题"));
+            }
+            other => panic!("expected SoftGateFailure, got {:?}", other),
+        }
     }
 
     #[test]
@@ -1424,6 +1576,8 @@ mod dual_gate_classification_tests {
             &[],
             Vec::new(),
             "用户最新消息",
+            &crate::models::CommitmentMarkers::default(),
+            false,
         );
         let FinalizeOutcome {
             review: finalized,
@@ -1457,6 +1611,8 @@ mod dual_gate_classification_tests {
             &[],
             Vec::new(),
             "用户最新消息",
+            &crate::models::CommitmentMarkers::default(),
+            false,
         );
         let FinalizeOutcome {
             review: finalized,
@@ -1498,6 +1654,8 @@ mod dual_gate_classification_tests {
             &[],
             Vec::new(),
             "收到，谢谢",
+            &crate::models::CommitmentMarkers::default(),
+            false,
         );
         assert_eq!(
             outcome.status,
@@ -1540,6 +1698,8 @@ mod dual_gate_classification_tests {
             &[],
             Vec::new(),
             "用户最新消息",
+            &crate::models::CommitmentMarkers::default(),
+            false,
         );
         match outcome.status {
             GatewayStatusFinal::Held(category) => {
@@ -1572,6 +1732,8 @@ mod dual_gate_classification_tests {
             &[],
             Vec::new(),
             "用户最新消息",
+            &crate::models::CommitmentMarkers::default(),
+            false,
         );
         let FinalizeOutcome {
             review: finalized,
@@ -1603,6 +1765,8 @@ mod dual_gate_classification_tests {
             &[],
             Vec::new(),
             "用户最新消息",
+            &crate::models::CommitmentMarkers::default(),
+            false,
         );
         let FinalizeOutcome {
             review: finalized,
@@ -1681,6 +1845,8 @@ mod dual_gate_classification_tests {
             std::slice::from_ref(&chunk),
             Vec::new(),
             "我们的产品一定能帮您",
+            &crate::models::CommitmentMarkers::default(),
+            false,
         );
         assert_eq!(
             outcome.status,
@@ -1701,6 +1867,35 @@ mod dual_gate_classification_tests {
     }
 
     #[test]
+    fn finalize_allows_product_claim_when_priced_from_catalog() {
+        // R5.4 G2 并联背书：无 verified chunk，但报价命中 active 产品目录
+        // （priced_from_catalog=true）→ 结构化报价视为已背书，不触发红线。
+        let runtime = UserRuntimeParameters::default();
+        let mut review = full_pass_review();
+        review.claim_analysis = mongodb::bson::doc! { "requiresProductKnowledge": true };
+        let mut decision = shouldreply_decision();
+        // 没引用任何 verified chunk（used_knowledge_ids 空 / 无 verified）
+        let contact = finalize_contact();
+        let outcome = finalize_review_for_send(
+            review,
+            &mut decision,
+            &runtime,
+            &contact,
+            &[],
+            Vec::new(),
+            "这款年度会员是 199 元",
+            &crate::models::CommitmentMarkers::default(),
+            true, // priced_from_catalog：报价 product_id 命中 active 产品目录
+        );
+        assert_eq!(
+            outcome.status,
+            GatewayStatusFinal::Approved,
+            "目录报价背书应放行，不被 blocked_unverified_product_claim 错杀"
+        );
+        assert!(outcome.review.approved);
+    }
+
+    #[test]
     fn finalize_allows_product_claim_with_verified_chunk() {
         // R5.4 反向：引用了 verified chunk → 不触发 R5.4，走 Approved。
         let runtime = UserRuntimeParameters::default();
@@ -1718,6 +1913,8 @@ mod dual_gate_classification_tests {
             std::slice::from_ref(&chunk),
             Vec::new(),
             "用户最新消息",
+            &crate::models::CommitmentMarkers::default(),
+            false,
         );
         assert_eq!(outcome.status, GatewayStatusFinal::Approved);
         assert!(outcome.review.approved);
@@ -1739,6 +1936,8 @@ mod dual_gate_classification_tests {
             &[],
             Vec::new(),
             "今天天气不错",
+            &crate::models::CommitmentMarkers::default(),
+            false,
         );
         assert_eq!(outcome.status, GatewayStatusFinal::Approved);
         assert!(outcome.review.approved);
@@ -1765,6 +1964,8 @@ mod dual_gate_classification_tests {
             &[],
             Vec::new(),
             "你们能解决我的问题吗",
+            &crate::models::CommitmentMarkers::default(),
+            false,
         );
         // 零拦截：判定不变。
         assert_eq!(outcome.status, GatewayStatusFinal::Approved);
@@ -1795,6 +1996,8 @@ mod dual_gate_classification_tests {
             &[],
             Vec::new(),
             "你们能解决我的问题吗",
+            &crate::models::CommitmentMarkers::default(),
+            false,
         );
         // R5.4 硬闸生效。
         assert_eq!(
@@ -1825,6 +2028,8 @@ mod dual_gate_classification_tests {
             &[],
             Vec::new(),
             "你们能解决我的问题吗",
+            &crate::models::CommitmentMarkers::default(),
+            false,
         );
         assert_eq!(outcome.status, GatewayStatusFinal::Approved);
         assert!(!outcome
@@ -1836,8 +2041,8 @@ mod dual_gate_classification_tests {
     // ── A2：grounding 漏判兜底硬闸（词类型切分）单测 ──
 
     #[test]
-    fn finalize_blocks_on_product_effect_claim_when_reviewer_missed() {
-        // reviewer 漏判 + 回复含效果词「回款」+ 无 verified → 兜底硬闸 block。
+    fn finalize_only_observes_on_product_effect_claim_when_reviewer_missed() {
+        // reviewer 漏判 + 回复含效果词「回款」+ 无 verified → 仅观测不拦（2026-06-14 回退硬闸为观测）。
         let runtime = UserRuntimeParameters::default();
         let mut review = full_pass_review();
         review.claim_analysis = mongodb::bson::doc! { "requiresProductKnowledge": false };
@@ -1852,18 +2057,21 @@ mod dual_gate_classification_tests {
             &[],
             Vec::new(),
             "你们能保证回款吗",
+            &crate::models::CommitmentMarkers::default(),
+            false,
         );
-        assert_eq!(
-            outcome.status,
-            GatewayStatusFinal::BlockedUnverifiedProductClaim
-        );
-        assert!(!outcome.review.approved);
-        assert!(!decision.should_reply);
+        // 新行为：仅观测，回复放行
+        assert_eq!(outcome.status, GatewayStatusFinal::Approved);
+        assert!(outcome.review.approved);
+        assert!(decision.should_reply);
         assert!(outcome
             .pending_events
             .iter()
-            .any(|e| e.kind == "product_claim_blocked_by_probe_fallback"
-                && e.status == "blocked"));
+            .any(|e| e.kind == "grounding_probe_reviewer_missed" && e.status == "observe"));
+        assert!(!outcome
+            .pending_events
+            .iter()
+            .any(|e| e.kind == "product_claim_blocked_by_probe_fallback"));
     }
 
     #[test]
@@ -1883,6 +2091,8 @@ mod dual_gate_classification_tests {
             &[],
             Vec::new(),
             "你会上心吗",
+            &crate::models::CommitmentMarkers::default(),
+            false,
         );
         assert_eq!(outcome.status, GatewayStatusFinal::Approved);
         assert!(outcome.review.approved);
@@ -1916,9 +2126,158 @@ mod dual_gate_classification_tests {
             std::slice::from_ref(&chunk),
             Vec::new(),
             "成功率怎么样",
+            &crate::models::CommitmentMarkers::default(),
+            false,
         );
         assert_eq!(outcome.status, GatewayStatusFinal::Approved);
         assert!(decision.should_reply);
+    }
+
+    // ── R1.5 insufficient_detail 降级为 single-shot revision（t15 跌单弧根因修复）──
+    //
+    // 历史 bug：关键轮推理字段偏短（insufficient_detail_in_critical_turn:*）被
+    // is_protocol_violation_tag 当成结构性硬违规 → blocked_by_required_field 直接
+    // return、revision_applied=false，连一次改写都不给。t15 6 轮成交弧因此 0 轮
+    // approved（< 下限 2）全程哑火。修复后它走软失败路径：标 needs_revision + 方向 →
+    // finalize 矫正 approved=true → decide_revision Proceed。
+
+    #[test]
+    fn finalize_insufficient_detail_only_routes_to_revision_not_hard_block() {
+        // 安全/质量闸全过，promote_risks 只含 insufficient_detail → Approved + needs_revision。
+        let runtime = UserRuntimeParameters::default();
+        let review = full_pass_review();
+        let mut decision = shouldreply_decision();
+        let contact = finalize_contact();
+        let promote_risks = vec![
+            "insufficient_detail_in_critical_turn:operation_goal".to_string(),
+            "insufficient_detail_in_critical_turn:relationship_read".to_string(),
+        ];
+        let outcome = finalize_review_for_send(
+            review,
+            &mut decision,
+            &runtime,
+            &contact,
+            &[],
+            promote_risks,
+            "用户最新消息",
+            &crate::models::CommitmentMarkers::default(),
+            false,
+        );
+        let FinalizeOutcome {
+            review: finalized,
+            status,
+            ..
+        } = outcome;
+        assert_eq!(
+            status,
+            GatewayStatusFinal::Approved,
+            "insufficient_detail-only 必须矫正为 Approved（进 revision 通道），而非 blocked_by_required_field"
+        );
+        assert!(finalized.approved);
+        assert!(finalized.needs_revision, "应标记 needs_revision 触发 single-shot revision");
+        assert!(
+            !finalized.revision_direction.trim().is_empty(),
+            "应写补全推理痕迹的 revision_direction"
+        );
+        // 矫正后的 Approved + needs_revision 必须让 decide_revision 进 Proceed。
+        assert_eq!(
+            decide_revision(&status, &finalized, false),
+            RevisionDecision::Proceed,
+            "矫正后必须能触发 single-shot revision"
+        );
+    }
+
+    #[test]
+    fn finalize_insufficient_detail_with_hard_gate_still_held_not_sent() {
+        // 关键安全不变量：insufficient_detail + hallucination 硬闸失败 → 仍 Held，
+        // 绝不能被降级矫正成 Approved 发出去。
+        let runtime = UserRuntimeParameters::default();
+        let mut review = full_pass_review();
+        review.scores.hallucination_score = runtime.fact_risk_block_at + 1; // 硬闸失败
+        route_dual_gate(&mut review, &runtime, "好的，我来想想看"); // 硬闸 → approved=false，不设 needs_revision
+        let mut decision = shouldreply_decision();
+        let contact = finalize_contact();
+        let promote_risks =
+            vec!["insufficient_detail_in_critical_turn:operation_goal".to_string()];
+        let outcome = finalize_review_for_send(
+            review,
+            &mut decision,
+            &runtime,
+            &contact,
+            &[],
+            promote_risks,
+            "用户最新消息",
+            &crate::models::CommitmentMarkers::default(),
+            false,
+        );
+        let FinalizeOutcome {
+            review: finalized,
+            status,
+            ..
+        } = outcome;
+        match status {
+            GatewayStatusFinal::Held(category) => {
+                assert_eq!(category, HOLD_CATEGORY_HELD_BY_AI_POLICY);
+            }
+            other => panic!("硬闸失败时必须 Held，绝不放行；got {:?}", other),
+        }
+        assert!(!finalized.approved, "硬闸失败的回复绝不能被矫正成 approved");
+    }
+
+    #[test]
+    fn finalize_structural_violation_still_hard_blocks() {
+        // 真正的结构性协议违规（missing_required_field）仍走 blocked_by_required_field 硬门。
+        let runtime = UserRuntimeParameters::default();
+        let review = full_pass_review();
+        let mut decision = shouldreply_decision();
+        let contact = finalize_contact();
+        let promote_risks = vec!["missing_required_field:why_should_reply".to_string()];
+        let outcome = finalize_review_for_send(
+            review,
+            &mut decision,
+            &runtime,
+            &contact,
+            &[],
+            promote_risks,
+            "用户最新消息",
+            &crate::models::CommitmentMarkers::default(),
+            false,
+        );
+        assert_eq!(
+            outcome.status,
+            GatewayStatusFinal::BlockedByRequiredField,
+            "结构性必填缺失仍必须硬 block"
+        );
+        assert!(!decision.should_reply);
+    }
+
+    #[test]
+    fn finalize_mixed_structural_and_insufficient_detail_prefers_hard_block() {
+        // 同时含结构性违规 + insufficient_detail → 结构性硬门优先 return（不降级）。
+        let runtime = UserRuntimeParameters::default();
+        let review = full_pass_review();
+        let mut decision = shouldreply_decision();
+        let contact = finalize_contact();
+        let promote_risks = vec![
+            "insufficient_detail_in_critical_turn:operation_goal".to_string(),
+            "invalid_enum_value:operation_state:nonsense".to_string(),
+        ];
+        let outcome = finalize_review_for_send(
+            review,
+            &mut decision,
+            &runtime,
+            &contact,
+            &[],
+            promote_risks,
+            "用户最新消息",
+            &crate::models::CommitmentMarkers::default(),
+            false,
+        );
+        assert_eq!(
+            outcome.status,
+            GatewayStatusFinal::BlockedByRequiredField,
+            "混合违规时结构性硬门优先，不走 revision 降级"
+        );
     }
 }
 

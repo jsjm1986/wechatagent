@@ -31,7 +31,12 @@ mod m002_split_active_facts;
 mod m003_state_machine_allowed_from;
 mod m004_outcome_metrics_id;
 mod m005_memory_facts_to_structured;
-mod m006_taxonomy_seed;
+/// `pub`：集成测试需在 `migrations::run` 后直接调用 `m006::run_step` 重新 seed 销售域
+/// 字典——`m012_drop_legacy_taxonomy_seed` 在非 production 环境会删掉 customer_stage /
+/// intent_level / objection_type 的 m006 seed（生产靠 `APP_ENV=production` 守卫跳过），
+/// 测试 DB 跑完全部迁移后这三 kind 字典为空，经 `validate_dimension_value(Taxonomy)`
+/// 的维度会被判越界 drop。测试复用 m006 的 upsert seed（与生产同源，不抄数据）补回。
+pub mod m006_taxonomy_seed;
 mod m007_outbox_indexes;
 mod m008_contact_commitments_reshape;
 mod m009_prompt_template_versioned;
@@ -45,6 +50,12 @@ mod m016_backfill_workspace_id_on_legacy_rows;
 mod m017_dedupe_outcome_aggregation;
 /// `pub`:集成测试需直接调用 `m018::run_step` 对预置顶层残留验证回填语义(详见模块内注释)。
 pub mod m018_backfill_domain_stage_from_legacy_top;
+mod m019_state_machine_state_flags;
+mod m020_seed_purchase_lifecycle;
+mod m021_seed_churn_reason;
+mod m022_backfill_dormant_allow_from_any;
+mod m023_seed_value_tier;
+mod m024_seed_relationship_type;
 
 type MigrationFuture<'a> = Pin<Box<dyn Future<Output = AppResult<()>> + Send + 'a>>;
 pub type MigrationFn = for<'a> fn(&'a Database) -> MigrationFuture<'a>;
@@ -128,6 +139,30 @@ pub const MIGRATIONS: &[Migration] = &[
     Migration {
         id: "2026_06_X2_001_backfill_domain_stage_from_legacy_top",
         run: |db| Box::pin(m018_backfill_domain_stage_from_legacy_top::run_step(db)),
+    },
+    Migration {
+        id: "2026_06_X3_001_state_machine_state_flags",
+        run: |db| Box::pin(m019_state_machine_state_flags::run_step(db)),
+    },
+    Migration {
+        id: "2026_06_X4_001_seed_purchase_lifecycle",
+        run: |db| Box::pin(m020_seed_purchase_lifecycle::run_step(db)),
+    },
+    Migration {
+        id: "2026_06_X5_001_seed_churn_reason",
+        run: |db| Box::pin(m021_seed_churn_reason::run_step(db)),
+    },
+    Migration {
+        id: "2026_06_X6_001_backfill_dormant_allow_from_any",
+        run: |db| Box::pin(m022_backfill_dormant_allow_from_any::run_step(db)),
+    },
+    Migration {
+        id: "2026_06_X7_001_seed_value_tier",
+        run: |db| Box::pin(m023_seed_value_tier::run_step(db)),
+    },
+    Migration {
+        id: "2026_06_X8_001_seed_relationship_type",
+        run: |db| Box::pin(m024_seed_relationship_type::run_step(db)),
     },
 ];
 

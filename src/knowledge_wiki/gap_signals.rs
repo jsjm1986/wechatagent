@@ -652,12 +652,51 @@ pub async fn persist_recall_signal(
 ///   hit 也不进 block —— 分母只含"用户确有明确反应"的样本。
 ///
 /// 负向集合复用 [`crate::agent::is_negative_outcome`]，保持单一真相源。
+///
+/// universal-domain-adaptation 2.5-pre-1：本 wrapper 内联当前写死的 5+1 销售极性
+/// （正极 buying_signal + 负极 5 词），委托 [`classify_outcome_label_with_polarity`]
+/// → 零行为变化。2.5-main-2 把数据源换成 active DomainProfile.outcome_polarity。
 pub fn classify_outcome_label(outcome_status: Option<&str>) -> OutcomeLabel {
-    match outcome_status {
-        Some("user_replied_buying_signal") => OutcomeLabel::Hit,
-        Some(s) if crate::agent::is_negative_outcome(s) => OutcomeLabel::Block,
-        // None / "pending" / "" / user_replied_unclassified / 其它 → 删失（不臆测）。
-        _ => OutcomeLabel::Censored,
+    classify_outcome_label_with_polarity(
+        outcome_status,
+        DEFAULT_POSITIVE_OUTCOMES,
+        DEFAULT_NEGATIVE_OUTCOMES,
+    )
+}
+
+/// 2.5-pre-1：DEFAULT 销售域正极（逐字复刻原 `classify_outcome_label` 的 Hit 字面量）。
+pub(crate) const DEFAULT_POSITIVE_OUTCOMES: &[&str] = &["user_replied_buying_signal"];
+
+/// 2.5-pre-1：DEFAULT 销售域负极（逐字复刻 `reaction.rs::is_negative_outcome` 的 5 词）。
+pub(crate) const DEFAULT_NEGATIVE_OUTCOMES: &[&str] = &[
+    "user_replied_objection",
+    "user_replied_stop_requested",
+    "user_replied_unsubscribed",
+    "user_replied_negative",
+    "user_replied_complaint",
+];
+
+/// universal-domain-adaptation 2.5-pre-1：极性可参数化的 outcome 三态判定核心。
+///
+/// `positive` / `negative` 是本行业声明的正/负极 outcome 集合（来自
+/// DomainProfile.outcome_polarity；DEFAULT 销售域 = `DEFAULT_POSITIVE_OUTCOMES` +
+/// `DEFAULT_NEGATIVE_OUTCOMES`）。**删失语义不可配**（Iron Law ②）：不在正/负集里的
+/// 一切（含沉默/pending/空/未分类/未知）一律 Censored，绝不臆测为负。正极优先于负极
+/// （同一 outcome 同时被两集声明时取 Hit，防误配把购买信号当负例）。
+pub fn classify_outcome_label_with_polarity(
+    outcome_status: Option<&str>,
+    positive: &[impl AsRef<str>],
+    negative: &[impl AsRef<str>],
+) -> OutcomeLabel {
+    let Some(s) = outcome_status else {
+        return OutcomeLabel::Censored;
+    };
+    if positive.iter().any(|p| p.as_ref() == s) {
+        OutcomeLabel::Hit
+    } else if negative.iter().any(|n| n.as_ref() == s) {
+        OutcomeLabel::Block
+    } else {
+        OutcomeLabel::Censored
     }
 }
 
@@ -670,6 +709,71 @@ pub enum OutcomeLabel {
     Block,
     /// 删失：沉默 / 无反应 / pending / 含义不明 → 不进任何分母。
     Censored,
+}
+
+/// H11-linkage（spec §9 #9）：成交追认的归因窗口——一笔已核实成交，往前追认其
+/// 发生时刻**之前**最近 N 条 `knowledge_usage_log`（即"成交前最近 N 轮对话用过的
+/// 知识"）。N=3 与项目既有 `take(5)` / `take(3)`（reaction_hint / deprecated_facts）
+/// 量级一致；"成交前最后几轮用的知识最可能促成成交"是稳健的弱归因假设。
+pub(crate) const DEAL_ATTRIBUTION_WINDOW_TURNS: usize = 3;
+
+/// H11-linkage：纯函数——给定**单个 contact** 的 usage-log 时刻列表与已核实成交
+/// 时刻列表，返回被成交追认（应翻为正向 Hit）的 log 下标集合。
+///
+/// 归因规则：对每笔成交时刻 `T`，取所有 `created_at <= T` 的 log（成交不能追认它
+/// 之后才用的知识），按 created_at 升序后**最后 N 条**（成交前最近 N 轮）标记为追认。
+/// 多笔成交的追认集合取并集（一条 log 落入任一成交的窗口即被追认）。
+///
+/// `log_times_ms`：该 contact 的 usage-log created_at（毫秒），**任意顺序**（内部按
+/// 时序处理，返回的是相对输入下标）。`deal_times_ms`：该 contact 的已核实成交时刻。
+/// 入参为空任一 → 空集（零扰动）。纯函数无 IO，便于单测窗口边界。
+pub(crate) fn attributed_log_indices(
+    log_times_ms: &[i64],
+    deal_times_ms: &[i64],
+) -> std::collections::HashSet<usize> {
+    use std::collections::HashSet;
+    let mut attributed: HashSet<usize> = HashSet::new();
+    if log_times_ms.is_empty() || deal_times_ms.is_empty() {
+        return attributed;
+    }
+    // 按时刻升序排原始下标。
+    let mut order: Vec<usize> = (0..log_times_ms.len()).collect();
+    order.sort_by_key(|&i| log_times_ms[i]);
+    for &deal_t in deal_times_ms {
+        // 成交前序列（created_at <= 成交时刻），保持升序。
+        let before: Vec<usize> = order
+            .iter()
+            .copied()
+            .filter(|&i| log_times_ms[i] <= deal_t)
+            .collect();
+        // 取最后 N 条（成交前最近 N 轮）。
+        let start = before.len().saturating_sub(DEAL_ATTRIBUTION_WINDOW_TURNS);
+        for &i in &before[start..] {
+            attributed.insert(i);
+        }
+    }
+    attributed
+}
+
+/// 2.5-main-2：把 active DomainProfile 的 [`OutcomePolarity`](crate::models::OutcomePolarity)
+/// 解析成「有效极性」字符串向量对（正极, 负极）。
+///
+/// **逐极独立回落**（与 main-1 seed 契约一致）：某一极为空 → 该极回落内置销售常量
+/// （`DEFAULT_POSITIVE_OUTCOMES` / `DEFAULT_NEGATIVE_OUTCOMES`），非空 → 用 profile 声明的。
+/// DEFAULT_PROFILE 的 seed 显式填回这两组常量，故 DEFAULT 下解析结果与回落字节相等
+/// → 回路① 召回排序逐字等价。换行业（声明非空极性）时按本行业极性判定。
+fn resolve_effective_polarity(polarity: &crate::models::OutcomePolarity) -> (Vec<String>, Vec<String>) {
+    let positive = if polarity.positive.is_empty() {
+        DEFAULT_POSITIVE_OUTCOMES.iter().map(|s| s.to_string()).collect()
+    } else {
+        polarity.positive.clone()
+    };
+    let negative = if polarity.negative.is_empty() {
+        DEFAULT_NEGATIVE_OUTCOMES.iter().map(|s| s.to_string()).collect()
+    } else {
+        polarity.negative.clone()
+    };
+    (positive, negative)
 }
 
 /// 30 天滑窗 hit/blocked 统计回写 `usage_stats`，并按朴素公式写 `dynamic_confidence`。
@@ -689,9 +793,15 @@ pub enum OutcomeLabel {
 ///
 /// **换血（P1）**：`real_outcome_enabled=true`（默认）时，hit/block 不再取
 /// reviewer 自评 `review_approved`，而是按 `run_id` join `AgentDecisionReview`
-/// 的真实用户反应 `outcome_status`，经 [`classify_outcome_label`] 三态判定：
+/// 的真实用户反应 `outcome_status`，经 [`classify_outcome_label_with_polarity`] 三态判定：
 /// 正向→hit、负向→block、沉默/pending/无反应→删失排除（不进任何分母）。
 /// `false`（回滚）时逐字节退回旧 `review_approved` 逻辑。公式本体不变。
+///
+/// **2.5-main-2（极性配置化）**：极性来源从写死常量换成 active
+/// `DomainProfile.outcome_polarity`（顶部一次 `load_active_domain_profile`，命中 30s
+/// 缓存），经 [`resolve_effective_polarity`] 逐极回落常量后沿纯函数传入。DEFAULT_PROFILE
+/// 的 seed 与回落同源 → 销售域召回排序字节等价；换行业按本行业极性判定。只换数据源，
+/// 公式 + 删失语义 + rank_key 全不动。
 pub async fn refresh_usage_stats_and_confidence(
     db: &Database,
     workspace_id: &str,
@@ -702,6 +812,16 @@ pub async fn refresh_usage_stats_and_confidence(
     let now = DateTime::now();
     let window_start_ms = now.timestamp_millis() - 30 * 24 * 60 * 60 * 1000;
     let window_start = DateTime::from_millis(window_start_ms);
+
+    // 2.5-main-2：本 workspace 的有效极性（profile 非空极性 ?? 内置销售常量，逐极独立）。
+    // DEFAULT_PROFILE seed 与回落同源 → 销售域字节等价。命中 1G-c 的 30s TTL 缓存。
+    let (positive_outcomes, negative_outcomes) = if real_outcome_enabled {
+        let profile = crate::agent::domain_profile::load_active_domain_profile(db, workspace_id).await;
+        resolve_effective_polarity(&profile.outcome_polarity)
+    } else {
+        // 回滚路径不查极性（走 review_approved），省一次 profile 解析。
+        (Vec::new(), Vec::new())
+    };
 
     let cursor = db
         .knowledge_usage_logs()
@@ -732,7 +852,12 @@ pub async fn refresh_usage_stats_and_confidence(
         } else {
             let review_cursor = db
                 .decision_reviews()
-                .find(doc! { "run_id": { "$in": &run_ids } }, None)
+                // IDOR 防御深度：run_id 虽全局唯一，仍按 workspace_id 收口（与项目
+                // "filter 必含 workspace_id"纪律一致）。run_id 索引提供选择性。
+                .find(
+                    doc! { "workspace_id": workspace_id, "run_id": { "$in": &run_ids } },
+                    None,
+                )
                 .await
                 .map_err(AppError::from)?;
             let reviews: Vec<crate::models::AgentDecisionReview> =
@@ -749,21 +874,52 @@ pub async fn refresh_usage_stats_and_confidence(
         HashMap::new()
     };
 
+    // H11-linkage（spec §9 #9）：成交追认——把"已核实成交前最近 N 轮用过的知识"
+    // 额外计为正向 Hit，让客观成交事实（而非仅 LLM buyingSignal）也强化召回置信度。
+    // gating：仅 real_outcome_enabled 且本 workspace 正极非空（= 销售类域）时启用；
+    // 情感陪伴域无产品 → 无已核实成交 → 追认集天然为空。红线：成交时刻来自
+    // entitlements::confirmed_deal_timestamps，已用 staff_confirmed/payment_verified
+    // 闭集排除 conversation_inferred。产出 attributed_log_idx = 被追认的 log 在 logs
+    // Vec 里的下标集合（与下方 enumerate 循环对齐）。
+    let attributed_log_idx: std::collections::HashSet<usize> =
+        if real_outcome_enabled && !positive_outcomes.is_empty() {
+            compute_deal_attributed_log_indices(db, workspace_id, &logs).await?
+        } else {
+            std::collections::HashSet::new()
+        };
+
     let mut hit: HashMap<String, u32> = HashMap::new();
     let mut blocked: HashMap<String, u32> = HashMap::new();
     let mut last_used: HashMap<String, DateTime> = HashMap::new();
     let mut last_block_reason: HashMap<String, String> = HashMap::new();
+    let mut deal_attributed_hits: u64 = 0;
 
-    for log in logs {
+    for (log_idx, log) in logs.iter().enumerate() {
         // 换血：真实用户反应三态；删失（Censored）整条 log 跳过 hit/block 统计，
         // 但仍参与 last_used 记账（chunk 确实被召回过）。回滚时退回 reviewer 自评。
-        let label = if real_outcome_enabled {
+        let base_label = if real_outcome_enabled {
             let outcome = outcome_by_run
                 .get(&log.run_id)
                 .and_then(|o| o.as_deref());
-            Some(classify_outcome_label(outcome))
+            Some(classify_outcome_label_with_polarity(
+                outcome,
+                &positive_outcomes,
+                &negative_outcomes,
+            ))
         } else {
             None
+        };
+        // H11-linkage：成交追认取较优——被已核实成交追认的 log 翻为 Hit（本就是 Hit
+        // 不重复加；Censored/Block/None 翻成 Hit）。仅在 real_outcome 路径生效（回滚
+        // 路径 attributed 集恒空）。统计 deal_attributed_hits 供审计观测翻转量。
+        let deal_attributed = attributed_log_idx.contains(&log_idx);
+        let label = if deal_attributed {
+            if base_label != Some(OutcomeLabel::Hit) {
+                deal_attributed_hits += 1;
+            }
+            Some(OutcomeLabel::Hit)
+        } else {
+            base_label
         };
         for oid in &log.knowledge_ids {
             let key = oid.to_hex();
@@ -858,7 +1014,71 @@ pub async fn refresh_usage_stats_and_confidence(
         report.updated += 1;
     }
 
+    report.deal_attributed_hits = deal_attributed_hits;
     Ok(report)
+}
+
+/// H11-linkage（spec §9 #9）：算出本批 usage logs 里被「已核实成交」追认的 log 下标。
+///
+/// 按 `contact_wxid` 分组（无 contact_wxid 的 log 不参与——无成交归属），批量拉这些
+/// contact 的 `outcome_events`（一次 `find`，IDOR：filter 必含 workspace_id），对每个
+/// contact 用 [`crate::agent::entitlements::confirmed_deal_timestamps`] 取已核实正向
+/// 成交时刻，再用 [`attributed_log_indices`] 算"成交前最近 N 轮" log，映射回全局下标。
+///
+/// best-effort 边界：无 contact_wxid 的 log、无成交的 contact → 不贡献追认。空批/全无
+/// 成交 → 返回空集（零扰动）。
+async fn compute_deal_attributed_log_indices(
+    db: &Database,
+    workspace_id: &str,
+    logs: &[crate::models::KnowledgeUsageLog],
+) -> Result<HashSet<usize>, AppError> {
+    // contact_wxid → 该 contact 名下 (全局下标, created_at_ms) 列表。
+    let mut by_contact: HashMap<String, Vec<(usize, i64)>> = HashMap::new();
+    for (idx, log) in logs.iter().enumerate() {
+        if let Some(wxid) = log.contact_wxid.as_deref().filter(|w| !w.is_empty()) {
+            by_contact
+                .entry(wxid.to_string())
+                .or_default()
+                .push((idx, log.created_at.timestamp_millis()));
+        }
+    }
+    if by_contact.is_empty() {
+        return Ok(HashSet::new());
+    }
+
+    // 批量拉这些 contact 的 outcome_events（IDOR：filter 含 workspace_id）。
+    let wxids: Vec<&String> = by_contact.keys().collect();
+    let cursor = db
+        .contacts()
+        .find(
+            doc! { "workspace_id": workspace_id, "wxid": { "$in": &wxids } },
+            None,
+        )
+        .await
+        .map_err(AppError::from)?;
+    let contacts: Vec<crate::models::Contact> =
+        cursor.try_collect().await.map_err(AppError::from)?;
+
+    let mut attributed: HashSet<usize> = HashSet::new();
+    for contact in &contacts {
+        let Some(entries) = by_contact.get(&contact.wxid) else {
+            continue;
+        };
+        let deal_times: Vec<i64> =
+            crate::agent::entitlements::confirmed_deal_timestamps(&contact.outcome_events)
+                .iter()
+                .map(|t| t.timestamp_millis())
+                .collect();
+        if deal_times.is_empty() {
+            continue;
+        }
+        // entries 的局部下标 → 用 attributed_log_indices 算窗口 → 映射回全局下标。
+        let log_times: Vec<i64> = entries.iter().map(|(_, ms)| *ms).collect();
+        for local_idx in attributed_log_indices(&log_times, &deal_times) {
+            attributed.insert(entries[local_idx].0);
+        }
+    }
+    Ok(attributed)
 }
 
 /// S7 止血：dynamic_confidence 计算的纯函数（无 IO，可单测）。
@@ -901,6 +1121,9 @@ pub fn compute_dynamic_confidence(
 #[derive(Debug, Default, Clone)]
 pub struct UsageStatsReport {
     pub updated: i64,
+    /// H11-linkage：本轮有多少 chunk-hit 来自「成交追认」（已核实成交回溯加分），
+    /// 而非 LLM 反应信号。供 worker 日志 / CI 观察成交追认是否生效、是否过度加分。
+    pub deal_attributed_hits: u64,
 }
 
 /// chunk 命中实时回写 hook —— 由 `agent::knowledge_router::tool_loop` 调用。
@@ -1654,5 +1877,234 @@ mod tests {
             classify_outcome_label(Some("pending")),
             OutcomeLabel::Block
         );
+    }
+
+    // ---- 2.5-pre-1：classify 极性参数化 等价性 + 召回回归基线 ----
+
+    #[test]
+    fn classify_outcome_label_default_polarity_matches_hardcoded_verbatim() {
+        // 逐字护栏：wrapper(委托默认极性) == 改造前写死真值表,保 2.5-main-2 切 profile
+        // 后销售域字节等价。对标 default_profile_chunk_roles_match_router_verbatim 风格。
+        assert_eq!(
+            classify_outcome_label(Some("user_replied_buying_signal")),
+            OutcomeLabel::Hit
+        );
+        for s in DEFAULT_NEGATIVE_OUTCOMES {
+            assert_eq!(classify_outcome_label(Some(s)), OutcomeLabel::Block, "{s}");
+        }
+        for s in [None, Some(""), Some("pending"), Some("user_replied_unclassified"), Some("x")] {
+            assert_eq!(classify_outcome_label(s), OutcomeLabel::Censored, "{s:?}");
+        }
+        // wrapper 与显式传默认极性的核心函数同结果。
+        for s in ["user_replied_buying_signal", "user_replied_objection", "pending", "x"] {
+            assert_eq!(
+                classify_outcome_label(Some(s)),
+                classify_outcome_label_with_polarity(
+                    Some(s),
+                    DEFAULT_POSITIVE_OUTCOMES,
+                    DEFAULT_NEGATIVE_OUTCOMES
+                ),
+            );
+        }
+    }
+
+    #[test]
+    fn classify_outcome_label_polarity_is_parametric() {
+        // 证明极性来自配置：换一套极性集 → 同一 outcome 的三态翻转,且原销售词落 Censored。
+        let positive = ["user_emotion_opened_up"]; // 情感域：示弱/倾诉=正向
+        let negative = ["user_went_cold"]; // 情感域：转冷=负向
+        assert_eq!(
+            classify_outcome_label_with_polarity(Some("user_emotion_opened_up"), &positive, &negative),
+            OutcomeLabel::Hit
+        );
+        assert_eq!(
+            classify_outcome_label_with_polarity(Some("user_went_cold"), &positive, &negative),
+            OutcomeLabel::Block
+        );
+        // 原销售极性词在情感 profile 下不再被识别 → 删失(不臆测)。
+        assert_eq!(
+            classify_outcome_label_with_polarity(Some("user_replied_buying_signal"), &positive, &negative),
+            OutcomeLabel::Censored
+        );
+        assert_eq!(
+            classify_outcome_label_with_polarity(Some("user_replied_objection"), &positive, &negative),
+            OutcomeLabel::Censored
+        );
+    }
+
+    #[test]
+    fn classify_outcome_label_positive_wins_over_negative_on_overlap() {
+        // 同一 outcome 同时被正负集声明（误配）→ 取 Hit,防把购买信号当负例。
+        let both = ["x"];
+        assert_eq!(
+            classify_outcome_label_with_polarity(Some("x"), &both, &both),
+            OutcomeLabel::Hit
+        );
+    }
+
+    #[test]
+    fn classify_outcome_label_censored_semantics_not_configurable() {
+        // 删失语义红线：不在正/负集的一切（含未知未来值）一律 Censored,与极性集内容无关。
+        let positive = ["pos"];
+        let negative = ["neg"];
+        for s in [None, Some(""), Some("pending"), Some("unknown_future")] {
+            assert_eq!(
+                classify_outcome_label_with_polarity(s, &positive, &negative),
+                OutcomeLabel::Censored,
+                "{s:?} 必删失"
+            );
+        }
+    }
+
+    #[test]
+    fn dynamic_confidence_responds_to_polarity_flip() {
+        // 召回排序回归基线（兑现设计 doc「召回排序回归基线」）：同一 outcome 序列喂两套
+        // 极性,DEFAULT 把销售负词计 Block 压低 dyn_conf;翻转极性把同词计 Hit 抬高 dyn_conf。
+        // 证明「极性是召回排序的因」,2.5-main-2 切 profile 后该因果链不变。
+        let outcomes = [
+            Some("user_replied_objection"),
+            Some("user_replied_objection"),
+            Some("user_replied_buying_signal"),
+        ];
+        let count = |pos: &[&str], neg: &[&str]| -> (u64, u64) {
+            let mut h = 0u64;
+            let mut b = 0u64;
+            for o in outcomes {
+                match classify_outcome_label_with_polarity(o, pos, neg) {
+                    OutcomeLabel::Hit => h += 1,
+                    OutcomeLabel::Block => b += 1,
+                    OutcomeLabel::Censored => {}
+                }
+            }
+            (h, b)
+        };
+        let base = 0.5;
+        let min_samples = 0;
+        // DEFAULT：2 objection=Block + 1 buying=Hit → h=1,b=2 → hit_rate=1/3。
+        let (h_def, b_def) = count(DEFAULT_POSITIVE_OUTCOMES, DEFAULT_NEGATIVE_OUTCOMES);
+        assert_eq!((h_def, b_def), (1, 2));
+        let conf_def = compute_dynamic_confidence(base, h_def, b_def, 0.0, min_samples);
+        // 翻转：把 objection 划为正极 → 3 个都 Hit → h=3,b=0 → hit_rate=1.0。
+        let flipped_pos = ["user_replied_objection", "user_replied_buying_signal"];
+        let (h_flip, b_flip) = count(&flipped_pos, &[]);
+        assert_eq!((h_flip, b_flip), (3, 0));
+        let conf_flip = compute_dynamic_confidence(base, h_flip, b_flip, 0.0, min_samples);
+        // 极性翻转使 dyn_conf 严格升高（召回排序权重随之改变）。
+        assert!(conf_flip > conf_def, "翻转极性应抬高 dyn_conf: {conf_flip} vs {conf_def}");
+    }
+
+    // ---- 2.5-main-2：resolve_effective_polarity 逐极独立回落 ----
+
+    #[test]
+    fn resolve_effective_polarity_empty_falls_back_to_sales_const() {
+        // 空 profile（OutcomePolarity::default()）→ 两极都回落内置销售常量。
+        // 这是 DEFAULT_PROFILE 与老库（无字段）下回路① 字节等价的根据。
+        let (pos, neg) = resolve_effective_polarity(&crate::models::OutcomePolarity::default());
+        assert_eq!(
+            pos,
+            DEFAULT_POSITIVE_OUTCOMES.iter().map(|s| s.to_string()).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            neg,
+            DEFAULT_NEGATIVE_OUTCOMES.iter().map(|s| s.to_string()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn resolve_effective_polarity_seed_equals_fallback_byte_for_byte() {
+        // DEFAULT_PROFILE 的 seed 极性 resolve 后 == 空集 resolve 后（回落常量）。
+        // 锁死「seed 与回落同源」：销售域无论 profile 是否显式 seed 都判一致。
+        let seeded = crate::agent::domain_profile::default_outcome_polarity();
+        let (sp, sn) = resolve_effective_polarity(&seeded);
+        let (ep, en) = resolve_effective_polarity(&crate::models::OutcomePolarity::default());
+        assert_eq!(sp, ep);
+        assert_eq!(sn, en);
+    }
+
+    #[test]
+    fn resolve_effective_polarity_each_pole_independent() {
+        // 逐极独立：只声明正极 → 正极用 profile、负极仍回落销售常量（漏配某极不静默丢失）。
+        let only_pos = crate::models::OutcomePolarity {
+            positive: vec!["user_emotion_opened_up".to_string()],
+            negative: vec![],
+        };
+        let (pos, neg) = resolve_effective_polarity(&only_pos);
+        assert_eq!(pos, vec!["user_emotion_opened_up"]);
+        assert_eq!(
+            neg,
+            DEFAULT_NEGATIVE_OUTCOMES.iter().map(|s| s.to_string()).collect::<Vec<_>>()
+        );
+        // 只声明负极 → 对称。
+        let only_neg = crate::models::OutcomePolarity {
+            positive: vec![],
+            negative: vec!["user_went_cold".to_string()],
+        };
+        let (pos2, neg2) = resolve_effective_polarity(&only_neg);
+        assert_eq!(
+            pos2,
+            DEFAULT_POSITIVE_OUTCOMES.iter().map(|s| s.to_string()).collect::<Vec<_>>()
+        );
+        assert_eq!(neg2, vec!["user_went_cold"]);
+    }
+
+    // ── H11-linkage：attributed_log_indices 成交追认窗口 ──
+
+    #[test]
+    fn attributed_empty_when_no_deals_or_no_logs() {
+        assert!(attributed_log_indices(&[100, 200], &[]).is_empty());
+        assert!(attributed_log_indices(&[], &[150]).is_empty());
+    }
+
+    #[test]
+    fn attributed_takes_last_n_before_deal() {
+        // 5 条 log 时刻 10/20/30/40/50，成交在 35 → 成交前序列 [10,20,30]，
+        // 取最近 N=3 条 → 全部 {0,1,2}；40/50 在成交后不追认。
+        let logs = vec![10, 20, 30, 40, 50];
+        let got = attributed_log_indices(&logs, &[35]);
+        let mut v: Vec<usize> = got.into_iter().collect();
+        v.sort();
+        assert_eq!(v, vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn attributed_window_caps_at_n() {
+        // 6 条 log 全在成交前 → 只追认最近 N=3 条（下标 3,4,5）。
+        let logs = vec![10, 20, 30, 40, 50, 60];
+        let got = attributed_log_indices(&logs, &[100]);
+        let mut v: Vec<usize> = got.into_iter().collect();
+        v.sort();
+        assert_eq!(v, vec![3, 4, 5], "窗口封顶 N=3，取最近 3 条");
+    }
+
+    #[test]
+    fn attributed_excludes_logs_after_deal() {
+        // log 在成交之后 → 不追认（成交不能追认它之后才用的知识）。
+        let logs = vec![10, 20, 200, 300];
+        let got = attributed_log_indices(&logs, &[50]);
+        let mut v: Vec<usize> = got.into_iter().collect();
+        v.sort();
+        assert_eq!(v, vec![0, 1], "仅成交前的 log 被追认");
+    }
+
+    #[test]
+    fn attributed_multiple_deals_union() {
+        // 两笔成交：T=25 追认 [10,20]；T=55 追认成交前最近 3 条 [20,30,50]。
+        // 并集 = {0(10),1(20),2(30),3(50)}。
+        let logs = vec![10, 20, 30, 50, 80];
+        let got = attributed_log_indices(&logs, &[25, 55]);
+        let mut v: Vec<usize> = got.into_iter().collect();
+        v.sort();
+        assert_eq!(v, vec![0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn attributed_handles_unsorted_input() {
+        // 输入乱序，内部按时刻排，返回相对原始下标。
+        // 时刻：idx0=50, idx1=10, idx2=30；成交 35 → 成交前 [10(idx1),30(idx2)] → {1,2}。
+        let logs = vec![50, 10, 30];
+        let got = attributed_log_indices(&logs, &[35]);
+        let mut v: Vec<usize> = got.into_iter().collect();
+        v.sort();
+        assert_eq!(v, vec![1, 2]);
     }
 }

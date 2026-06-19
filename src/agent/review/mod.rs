@@ -47,7 +47,7 @@ use crate::routes::AppState;
 use super::budget::RunBudget;
 use super::decision::{format_operation_domain_config_for_prompt, format_playbook_for_prompt};
 use super::generate_agent_json;
-use super::knowledge_router::format_operation_knowledge_for_prompt;
+use super::knowledge_router::format_operation_knowledge_for_prompt_with_roles;
 use super::runtime::UserRuntimeParameters;
 use super::types::{
     AgentDecision, DecisionReviewResult, KnowledgeRouteResult, ReviewScores, RunPlannerResult,
@@ -85,7 +85,8 @@ pub(crate) fn should_run_review(
             || decision.risk_level == "high"
             || planner.risk_level == "high"
             || planner.knowledge_required
-            || confidence < runtime.operation_state_confidence_full_review_below)
+            || confidence < runtime.operation_state_confidence_full_review_below
+            || runtime.distrust_self_reported_low_risk)
 }
 
 /// agent-autonomy-loop W2 / Task 3.1：`local_decision_review` 二态语义。
@@ -112,7 +113,22 @@ pub(crate) fn should_run_review(
 pub fn local_decision_review(
     decision: &AgentDecision,
     budget: &RunBudget,
+    runtime: &UserRuntimeParameters,
 ) -> DecisionReviewResult {
+    // reviewer 优化：本域声明「不信任自报低风险」时，本地兜底无法独立评估压迫感，
+    // 把 pressure_risk 从乐观 0 改为保守 `pressure_risk_block_at`（达关注线）。这是
+    // 「无法评估时从乐观转保守」的通用安全化，对任何高敏域一视同仁，不针对单一特征。
+    // DEFAULT（distrust=false）→ 0，与改造前逐字等价。
+    let fallback_pressure_risk = if runtime.distrust_self_reported_low_risk {
+        runtime.pressure_risk_block_at
+    } else {
+        0
+    };
+    let fallback_summary_suffix = if runtime.distrust_self_reported_low_risk {
+        "（本域高敏：本地兜底保守置 pressure_risk，未走 LLM）"
+    } else {
+        ""
+    };
     if budget.is_exceeded() {
         if decision.needs_review {
             // R3.7：高风险路径 — 不放行，由 finalize 阶段补 autonomy_mode=blocked。
@@ -137,6 +153,7 @@ pub fn local_decision_review(
             scores: ReviewScores {
                 human_like: 8,
                 emotional_value: 7,
+                pressure_risk: fallback_pressure_risk,
                 hallucination_score: 0,
                 knowledge_grounding_score: if decision.knowledge_need == "required" {
                     7
@@ -146,7 +163,9 @@ pub fn local_decision_review(
                 ..Default::default()
             },
             risks: vec!["local_review_low_risk_only".to_string()],
-            review_summary: "预算超额但 needs_review=false：本地低风险快速通道放行".to_string(),
+            review_summary: format!(
+                "预算超额但 needs_review=false：本地低风险快速通道放行{fallback_summary_suffix}"
+            ),
             ..Default::default()
         };
     }
@@ -157,6 +176,7 @@ pub fn local_decision_review(
         scores: ReviewScores {
             human_like: 8,
             emotional_value: 7,
+            pressure_risk: fallback_pressure_risk,
             hallucination_score: 0,
             knowledge_grounding_score: if decision.knowledge_need == "required" {
                 7
@@ -165,9 +185,68 @@ pub fn local_decision_review(
             },
             ..Default::default()
         },
-        review_summary: "低风险 fast_chat 本地轻量审核通过".to_string(),
+        review_summary: format!("低风险 fast_chat 本地轻量审核通过{fallback_summary_suffix}"),
         ..Default::default()
     }
+}
+
+/// 仅供集成测试用：用一条**固定候选回复**直接跑真实 reviewer，绕过 Reply Agent，
+/// 拿到 reviewer 对该候选的真实 ReviewScores。用于 roleplay-fuzz reviewer 校准
+/// （验证情感 profile 下 reviewer 既不误杀合理关心、也不漏判控制式高压）。
+///
+/// 内部构造 `review_decision` 不关心的默认参数（空 memory / 无 playbook / 无知识），
+/// 只暴露测试关心的输入。**不测发送链路**（无 gateway precheck / outbox / finalize），
+/// 只隔离 reviewer LLM 评分这一个变量。
+#[doc(hidden)]
+pub async fn review_fixed_candidate_for_test(
+    state: &AppState,
+    contact: &Contact,
+    inbound: &ConversationMessage,
+    candidate_reply: &str,
+    runtime: &UserRuntimeParameters,
+    review_mode: &str,
+) -> AppResult<DecisionReviewResult> {
+    let decision = AgentDecision {
+        should_reply: true,
+        reply_text: candidate_reply.to_string(),
+        ..Default::default()
+    };
+    let empty_memory = OperatingMemory {
+        id: None,
+        workspace_id: contact.workspace_id.clone(),
+        account_id: contact.account_id.clone(),
+        contact_wxid: contact.wxid.clone(),
+        user_understanding: Document::new(),
+        relationship_state: Document::new(),
+        product_fit: Document::new(),
+        next_action: Document::new(),
+        context_pack: Document::new(),
+        context_pack_version: 0,
+        context_pack_updated_at: None,
+        memory_card: crate::models::MemoryCardTyped::default(),
+        memory_card_version: 0,
+        memory_card_updated_at: None,
+        created_at: mongodb::bson::DateTime::from_millis(0),
+        updated_at: mongodb::bson::DateTime::from_millis(0),
+    };
+    let context_pack = Document::new();
+    let knowledge_route = KnowledgeRouteResult::default();
+    review_decision(
+        state,
+        contact,
+        inbound,
+        &decision,
+        None,
+        None,
+        runtime,
+        &empty_memory,
+        &context_pack,
+        &[],
+        &knowledge_route,
+        review_mode,
+        None,
+    )
+    .await
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -207,6 +286,23 @@ pub(crate) async fn review_decision(
     };
     let system =
         prompts::load_prompt(&state.db, &state.config.default_workspace_id, prompt_key).await?;
+    // universal-domain-adaptation H16-b：reviewer 的产品知识段也按 active profile 的
+    // chunk_roles 渲染（与 Reply Agent 同源）。缓存命中即廉价；DEFAULT 销售四态字节等价。
+    let active_profile = crate::agent::domain_profile::load_active_domain_profile(
+        &state.db,
+        &contact.workspace_id,
+    )
+    .await;
+    // universal-domain-adaptation：review.system 链的全部 **prompt 类 profile override**
+    // 收敛到 domain_profile.rs 的单一注入点 `apply_review_system_prompt_overrides`（C3 轻量
+    // 约定）。它按固定顺序串起：①评审重点取向行（D）②软闸打分锚点 few-shot 段（T3）。
+    // None（DEFAULT / 老库 reviewer_orientation=None）→ 每步原样 → system prompt 字节等价。
+    // 注意 reviewer **user** prompt 的 balance_principle 注入的是另一份 prompt，不在本 helper。
+    // 新增 review.system 类 prompt override 字段时，加进那个 helper（勿在此散接）——见 helper 文档。
+    let system = crate::agent::domain_profile::apply_review_system_prompt_overrides(
+        &system,
+        &active_profile,
+    );
     let runtime_text = serde_json::to_string(&runtime.as_document()).unwrap_or_default();
     let memory_card_text = serde_json::to_string(context_pack).unwrap_or_default();
     let memory_text = serde_json::to_string(&mongodb::bson::doc! {
@@ -226,6 +322,20 @@ pub(crate) async fn review_decision(
     // 这里只暴露候选回复事实面：是否回复、回复文本、知识引用、状态/阶段、tool-loop
     // 协议字段；其余字段（含 reasoning）不进 reviewer 上下文。
     let decision_view_text = build_reviewer_decision_view(decision);
+    // H15（3A-1c-2）：reviewer formulaBreakdown 示例由 active profile 的经营公式渲染
+    // （单一真相源），替代写死的三行。DEFAULT_PROFILE seed 四公式 → 渲染出四行，与原
+    // 写死三行内容同源（原示例漏列 nextBestActionScore，本渲染补全；公式内容等价）。
+    let formula_breakdown_lines =
+        crate::agent::domain_profile::render_business_formulas_json_example(
+            &active_profile.business_formulas,
+        );
+    // 第 19 点：scores 块里 relationshipProgress / conversionReadiness 这类销售专属软
+    // 观测维度由 active profile 的 business_formulas.eval_score_key 派生（排除 5 个硬闸）。
+    // DEFAULT 四公式 → conversionReadiness + relationshipProgress 两行（语义等价旧写死）；
+    // 非销售 profile 未声明这些 key → 空串，scores 只剩 5 个硬闸维度。
+    let extra_score_lines = crate::agent::domain_profile::render_reviewer_extra_score_lines(
+        &active_profile.business_formulas,
+    );
     let user = format!(
         r#"请评审候选回复。
 Review 模式: {}
@@ -236,15 +346,11 @@ Review 模式: {}
     "humanLike": 8,
     "emotionalValue": 7,
     "productAccuracy": 9,
-    "relationshipProgress": 6,
-    "conversionReadiness": 6,
-    "pressureRisk": 2,
+{}    "pressureRisk": 2,
     "factRisk": 1
   }},
   "formulaBreakdown": {{
-    "trust": "Credibility + Reliability + Intimacy - SelfOrientation",
-    "conversionReadiness": "Motivation × ProductFit × Timing × Trust ÷ Friction",
-    "emotionalValue": "Empathy + Validation + Specificity + AutonomySupport - Pressure"
+{}
   }},
   "claimAnalysis": {{
     "hasProductClaim": false,
@@ -261,8 +367,9 @@ Review 模式: {}
 - 转化平衡：既允许适度推进，也不能伤害信任。
 - 禁止虚假稀缺、恐惧营销、编造案例、编造价格、编造承诺。
 - humanLike 与 pressureRisk 是 **硬评分** 软闸（Phase B / B1）：humanLike 低于阈值
-  或 pressureRisk 高于等于阈值，会触发 single-shot revision；reviewer 必须给 0-100
-  的具体分数，并在 `needsRevision` / `revisionDirection` 里给出可执行的改写方向。
+  或 pressureRisk 高于等于阈值，会触发 single-shot revision；reviewer 必须给 0-10
+  的具体分数（与上面 scores 示例同档：humanLike/emotionalValue 越高越好、pressureRisk/factRisk
+  越高越危险），并在 `rewriteInstruction` 里给出可执行的改写方向。
 - 如果不像微信真人、太模板、太销售，要降低 humanLike 或提高 pressureRisk。
 - 如果没有基于产品知识却做了产品承诺，要提高 factRisk 和降低 productAccuracy。
 - 产品知识为空时，允许关系维护、测试消息和轻量澄清；但任何具体价格、案例、效果保证、产品能力承诺都必须视为事实风险。
@@ -307,6 +414,8 @@ Review 模式: {}
 知识路由:
 {}"#,
         review_mode,
+        extra_score_lines,
+        formula_breakdown_lines,
         crate::agent::prompt_isolation::isolate_untrusted(&inbound.content),
         decision.reply_text,
         decision_view_text,
@@ -317,8 +426,18 @@ Review 模式: {}
             .map(format_operation_domain_config_for_prompt)
             .unwrap_or_default(),
         runtime_text,
-        format_operation_knowledge_for_prompt(knowledge_chunks),
+        format_operation_knowledge_for_prompt_with_roles(knowledge_chunks, &active_profile.chunk_roles),
         knowledge_route_text
+    );
+    // universal-domain-adaptation D：reviewer user prompt 评审原则里的「转化平衡」取向条按
+    // active profile 的 reviewer_orientation.balance_principle 渲染。None（DEFAULT/老库）→
+    // 字节等价。
+    let user = crate::agent::domain_profile::apply_reviewer_balance_principle(
+        &user,
+        active_profile
+            .reviewer_orientation
+            .as_ref()
+            .and_then(|o| o.balance_principle.as_deref()),
     );
     // S2 (Phase 0)：reviewer 双模真并行——主 reviewer 走 generate_agent_json
     // （含 LRU cache + llm_call_logs），第二 reviewer 走纯 LlmProvider。
@@ -391,4 +510,72 @@ Review 模式: {}
     route_dual_gate(&mut review, runtime, &decision.reply_text);
 
     Ok(review)
+}
+
+#[cfg(test)]
+mod distrust_low_risk_tests {
+    use super::*;
+    use crate::agent::budget::RunBudget;
+
+    /// 自报低风险的回复：DEFAULT runtime（distrust=false）下 should_run_review 不触发，
+    /// 高敏 runtime（distrust=true）下强制走 LLM review。
+    fn low_risk_decision() -> AgentDecision {
+        let mut d = AgentDecision::default();
+        d.should_reply = true;
+        d.needs_review = false;
+        d.risk_level = "low".to_string();
+        d.operation_state_confidence = Some(10);
+        d
+    }
+
+    #[test]
+    fn should_run_review_forces_full_when_distrust_set() {
+        let decision = low_risk_decision();
+        let planner = RunPlannerResult::default();
+        let mut runtime = UserRuntimeParameters::default();
+        runtime.distrust_self_reported_low_risk = true;
+        assert!(
+            should_run_review(&decision, &planner, &runtime),
+            "高敏域应强制走 LLM review，即使 Reply Agent 自报低风险"
+        );
+    }
+
+    #[test]
+    fn should_run_review_unchanged_when_distrust_false() {
+        // 零扰动：DEFAULT 销售域自报低风险回复仍跳过 LLM review（与改造前一致）。
+        let decision = low_risk_decision();
+        let planner = RunPlannerResult::default();
+        let runtime = UserRuntimeParameters::default();
+        assert!(!runtime.distrust_self_reported_low_risk);
+        assert!(
+            !should_run_review(&decision, &planner, &runtime),
+            "DEFAULT 域自报低风险回复应沿用既有判定（跳过 LLM review）"
+        );
+    }
+
+    #[test]
+    fn local_decision_review_distrust_emits_nonzero_pressure() {
+        let decision = low_risk_decision();
+        let budget = RunBudget::new("run_distrust_test", i64::MAX, i32::MAX, i32::MAX);
+        assert!(!budget.is_exceeded(), "未注入用量时不应超额");
+
+        // 高敏域兜底：pressure_risk 从乐观 0 抬到保守 block_at。
+        let mut high_sensitivity = UserRuntimeParameters::default();
+        high_sensitivity.distrust_self_reported_low_risk = true;
+        let result = local_decision_review(&decision, &budget, &high_sensitivity);
+        assert_eq!(
+            result.scores.pressure_risk, high_sensitivity.pressure_risk_block_at,
+            "高敏域本地兜底应保守置 pressure_risk = block_at，而非乐观 0"
+        );
+        assert_ne!(result.scores.pressure_risk, 0);
+
+        // 零扰动：DEFAULT 域兜底仍是 pressure_risk=0 + fast_chat summary。
+        let default_runtime = UserRuntimeParameters::default();
+        let baseline = local_decision_review(&decision, &budget, &default_runtime);
+        assert_eq!(baseline.scores.pressure_risk, 0);
+        assert!(
+            baseline.review_summary.contains("低风险 fast_chat"),
+            "DEFAULT 域兜底 summary 应逐字保留 fast_chat 文案"
+        );
+    }
 }

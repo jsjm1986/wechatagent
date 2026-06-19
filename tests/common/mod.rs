@@ -10,6 +10,12 @@
 #![allow(dead_code)]
 
 pub mod generalization;
+pub mod dynamic;
+pub mod identity_generator;
+pub mod judge;
+pub mod redline;
+pub mod roleplay_fixtures;
+pub mod roleplayer;
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -145,6 +151,17 @@ impl TestApp {
             .expect("运行测试 mongo 迁移失败");
         db.ensure_indexes().await.expect("创建测试 mongo 索引失败");
 
+        // 重新 seed 销售域字典（customer_stage / intent_level / objection_type）。
+        // m012_drop_legacy_taxonomy_seed 在非 production 环境会删掉 m006 的这三 kind seed
+        // （生产靠 APP_ENV=production 守卫跳过删除、字典保留），测试 DB 跑完全部迁移后这三
+        // kind 字典为空。经 validate_dimension_value(Taxonomy) 校验的维度（如 customer_stage）
+        // 会因字典 miss 被判 CandidateNew → DropSilently → 键被移除，C2 operation_state 派生
+        // 回落 decision.operation_state。复用 m006 的 upsert seed（与生产同源，不抄数据）补回，
+        // 让测试 DB 字典状态对齐 production 实例。
+        wechatagent::db::migrations::m006_taxonomy_seed::run_step(&db)
+            .await
+            .expect("重新 seed 销售域 taxonomy 失败");
+
         let llm: Arc<TestLlmGenerator> = Arc::new(TestLlmGenerator::default());
 
         let config = test_config(uri, db_name);
@@ -156,6 +173,22 @@ impl TestApp {
         )
         .await
         .expect("种入默认 prompt pack 失败");
+
+        // 预热进程级 taxonomy 缓存（LazyLock 单例 + 30s TTL），与 main.rs:83 对齐。
+        // 上面已 re-seed 销售域字典，这里把缓存对齐到本测试 DB 的字典内容，使后续
+        // check_value / validate_dimension_value 能命中（否则缓存可能停留在空字典或
+        // 别的测试 DB 状态）。warm_up 内部忽略 TTL 无条件 reload。
+        wechatagent::agent::init_global_taxonomy_cache(&db).await;
+
+        // 同理预热**第二个**进程级 TTL 单例：active DomainProfile 缓存（domain_profile.rs
+        // 的 GLOBAL_DOMAIN_PROFILE_CACHE，与 taxonomy 缓存同款 LazyLock+30s TTL）。
+        // 与 main.rs:86 对齐。不预热的话，本测试若不 seed 自定义 domain_profiles 行，
+        // load_active_domain_profile 会命中**前一个测试 seed 的 active profile**（同 binary
+        // 内残留），其声明维度可能不含 customer_stage → retain_declared_dimensions 把
+        // customer_stage 从 domain_signals 剔除 → C2 operation_state 派生回落
+        // decision.operation_state。预热到本测试自己的 DB（无 active 行）→ 回落 DEFAULT
+        // profile（声明 customer_stage participates_in_decision=true）→ 维度存活、派生正确。
+        wechatagent::agent::init_global_domain_profile_cache(&db).await;
 
         let mcp = McpClient::new(config.mcp_base_url.clone(), config.mcp_api_key.clone())
             .expect("构造测试 mcp client 失败");
@@ -227,6 +260,17 @@ fn test_config(mongodb_uri: String, mongodb_database: String) -> AppConfig {
         strategic_planner_commitment_emit_dedup_hours: 24,
         strategic_planner_stage_stagnation_threshold_days: 14,
         strategic_planner_stage_stagnation_recent_inbound_hours: 24,
+        strategic_planner_calendar_lookahead_days: 1,
+        strategic_planner_calendar_daily_cap: 3,
+        strategic_planner_calendar_tz_offset_hours: 8,
+        strategic_planner_renewal_lookahead_days: 14,
+        strategic_planner_renewal_grace_days: 7,
+        strategic_planner_renewal_daily_cap: 3,
+        strategic_planner_reactivation_dormant_days: 30,
+        strategic_planner_reactivation_cadence_days: 30,
+        strategic_planner_reactivation_daily_cap: 3,
+        value_tier_mid_threshold_cents: 50000,
+        value_tier_high_threshold_cents: 300000,
         strategic_planner_block_rate_window_hours: 24,
         strategic_planner_block_rate_min_runs: 3,
         strategic_planner_block_rate_threshold: 0.6,
@@ -260,9 +304,12 @@ fn test_config(mongodb_uri: String, mongodb_database: String) -> AppConfig {
         evolution_threshold_release_cooldown_hours: 24,
         evolution_cohort_per_contact_cap: 3,
         evolution_cohort_sample_per_failure_bucket: 10,
+        evolution_max_negative_reaction_increase: 0.05,
         evolution_auto_release_enabled: false,
         evolution_auto_release_window_hours: 336,
         evolution_auto_release_per_tick_cap: 1,
+        evolution_auto_release_negative_reaction_gate_enabled: false,
+        evolution_auto_release_max_negative_reaction_rate: 0.30,
         knowledge_digest_enabled: false,
         knowledge_digest_run_hour: 9,
         knowledge_digest_run_token_budget: 60_000,

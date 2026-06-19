@@ -103,8 +103,22 @@ impl IntoResponse for AppError {
             | AppError::Json(_)
             | AppError::BsonSer(_)
             | AppError::External(_) => {
-                let msg = self.to_string();
-                (StatusCode::BAD_GATEWAY, Json(json!({ "error": msg }))).into_response()
+                // 原始错误（可能含 DB 连接串 / 上游 URL / 序列化细节）只进日志，
+                // 绝不写进 HTTP body 泄漏给调用方；对外只给稳定的分类码。
+                let kind = match &self {
+                    AppError::Db(_) => "db_error",
+                    AppError::Http(_) => "upstream_error",
+                    AppError::Json(_) => "serialization_error",
+                    AppError::BsonSer(_) => "serialization_error",
+                    AppError::External(_) => "internal_error",
+                    _ => "internal_error",
+                };
+                tracing::error!(error_kind = kind, detail = %self, "request failed with 502");
+                (
+                    StatusCode::BAD_GATEWAY,
+                    Json(json!({ "error": kind })),
+                )
+                    .into_response()
             }
         }
     }

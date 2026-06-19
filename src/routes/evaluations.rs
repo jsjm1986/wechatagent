@@ -232,7 +232,7 @@ pub(super) async fn run_formula_adherence_evaluation(
     // 这里维护一个 evaluation 总预算上限：每个场景跑完后把子 run 实际 token
     // 消耗（从 agent_run_logs 累加）汇总进来；超额就 break 并把 degraded
     // 字段设为 true，items 中只保留已完成场景。
-    let typed_runtime = state
+    let domain_config = state
         .db
         .operation_domain_configs()
         .find_one(
@@ -242,9 +242,13 @@ pub(super) async fn run_formula_adherence_evaluation(
             },
             None,
         )
-        .await?
+        .await?;
+    let typed_runtime = domain_config
+        .as_ref()
         .map(|cfg| cfg.runtime_parameters_typed())
         .unwrap_or_default();
+    // H13：eval 种子 contact 的初始 operation_state 从 active 状态机取（替代写死 "new_contact"）。
+    let seed_initial_state = agent::initial_operation_state_key(domain_config.as_ref());
     let total_token_budget = typed_runtime
         .simulation_token_budget
         .saturating_mul(scenarios.len() as i64);
@@ -260,6 +264,30 @@ pub(super) async fn run_formula_adherence_evaluation(
         "emotionalValue",
         "nextBestActionScore",
     ];
+    // H15：经营公式 + 缺失回落 score key 从 active profile 读（替代写死四公式数组 +
+    // score_key_for 映射）。profile.business_formulas 为空（老库无字段/profile 漏配）时
+    // 回落内置销售四公式 + score_key_for——DEFAULT_PROFILE 已 seed 四公式，故等价。
+    let active_profile =
+        agent::domain_profile::load_active_domain_profile(&state.db, &admin.current_workspace)
+            .await;
+    let formula_specs: Vec<(String, String)> = if active_profile.business_formulas.is_empty() {
+        formulas
+            .iter()
+            .map(|k| (k.to_string(), score_key_for(k).to_string()))
+            .collect()
+    } else {
+        active_profile
+            .business_formulas
+            .iter()
+            .map(|f| {
+                let score_key = f
+                    .eval_score_key
+                    .clone()
+                    .unwrap_or_else(|| score_key_for(&f.key).to_string());
+                (f.key.clone(), score_key)
+            })
+            .collect()
+    };
     let mut items: Vec<Value> = Vec::new();
     let mut total_adherence = 0.0_f64;
     let mut counted = 0usize;
@@ -288,7 +316,12 @@ pub(super) async fn run_formula_adherence_evaluation(
         let contact = base_contact
             .clone()
             .unwrap_or_else(|| {
-                scenario_contact_from_seed(&admin.current_workspace, &payload.account_id, &scenario)
+                scenario_contact_from_seed(
+                    &admin.current_workspace,
+                    &payload.account_id,
+                    &scenario,
+                    &seed_initial_state,
+                )
             });
         let turns = match agent::simulate_user_dialogue(&state, contact, messages).await {
             Ok(t) => t,
@@ -315,13 +348,14 @@ pub(super) async fn run_formula_adherence_evaluation(
         let mut total_delta = 0.0_f64;
         let mut formula_count = 0u32;
         let mut missing_count = 0u32;
-        for formula in formulas {
+        for (formula, score_key) in &formula_specs {
+            let formula = formula.as_str();
             let predicted_value = last
                 .and_then(|t| t.review.get_document("formulaBreakdown").ok())
                 .and_then(|fb| fb.get(formula).cloned())
                 .or_else(|| {
                     last.and_then(|t| t.review.get_document("scores").ok())
-                        .and_then(|s| s.get(score_key_for(formula)).cloned())
+                        .and_then(|s| s.get(score_key.as_str()).cloned())
                 });
             let Some(predicted_value) = predicted_value else {
                 deviations.insert(formula.to_string(), json!("missing"));
@@ -453,6 +487,7 @@ fn scenario_contact_from_seed(
     workspace_id: &str,
     account_id: &str,
     scenario: &EvaluationScenario,
+    initial_state: &str,
 ) -> Contact {
     let now = DateTime::now();
     let seed = &scenario.contact_seed;
@@ -481,6 +516,7 @@ fn scenario_contact_from_seed(
             .or_else(|_| seed.get_str("custom_agent_instructions"))
             .ok()
             .map(ToString::to_string),
+        operation_mode_override: None,
         agent_profile: None,
         memory_summary: seed
             .get_str("memorySummary")
@@ -528,7 +564,8 @@ fn scenario_contact_from_seed(
             .or_else(|_| seed.get_str("operation_state"))
             .ok()
             .map(ToString::to_string)
-            .or_else(|| Some("new_contact".to_string())),
+            // H13：种子未指定时回落状态机初始态（替代写死 "new_contact"）。
+            .or_else(|| Some(initial_state.to_string())),
         operation_state_reason: None,
         operation_state_confidence: Some(8),
         operation_state_updated_at: Some(now),
@@ -546,7 +583,7 @@ fn scenario_contact_from_seed(
         last_agent_run_at: None,
         last_outbound_style: None,
         intent_trajectory: Vec::new(),
-        deal_events: Vec::new(),
+        outcome_events: Vec::new(),
         locale: None,
         created_at: now,
         updated_at: now,
@@ -615,5 +652,25 @@ mod tests {
         assert_eq!(score_key_for("emotionalValue"), "emotionalValue");
         assert_eq!(score_key_for("nextBestActionScore"), "relationshipProgress");
         assert_eq!(score_key_for("unknown"), "humanLike");
+    }
+
+    /// 第 77 点护栏补盲区：`score_key_for`（evaluations fallback 映射）与
+    /// `default_business_formulas` 的 `eval_score_key`（单一真相源）是手工维护的两份
+    /// 映射。本测试锁死二者一致——改了 single source 的 eval_score_key 却忘改 fallback
+    /// （或反之）时测试即红，防止两份 DEFAULT 销售映射静默漂移。
+    #[test]
+    fn score_key_for_matches_default_formula_eval_keys() {
+        for f in crate::agent::domain_profile::default_business_formulas() {
+            let eval_key = f
+                .eval_score_key
+                .as_deref()
+                .expect("DEFAULT 四公式都应显式声明 eval_score_key");
+            assert_eq!(
+                score_key_for(&f.key),
+                eval_key,
+                "公式 {} 的 fallback score_key_for 与 single-source eval_score_key 漂移",
+                f.key
+            );
+        }
     }
 }

@@ -2860,6 +2860,10 @@
     color: var(--color-scheduled);
     font-weight: 600;
   }
+  .knowledgeWiki .wikiObservabilityHit {
+    color: var(--color-running);
+    font-weight: 600;
+  }
   .knowledgeWiki .wikiObservabilityCta {
     margin-top: 8px;
     font-family: var(--font-mono);

@@ -33,7 +33,7 @@ use wechatagent::agent::{
     atomic_claim_pending, handle_managed_message, process_entry, OutboxStatus,
 };
 use wechatagent::agent::knowledge_agent::{answer, AnswerRequest, CatalogFilter};
-use wechatagent::llm::LlmClient;
+use wechatagent::llm::{LlmClient, LlmFormat};
 use wechatagent::models::{
     AgentStatus, Contact, ConversationMessage, LlmProviderConfig, MessageDirection,
     OperationKnowledgeChunk,
@@ -59,9 +59,28 @@ fn real_llm_from_env() -> Option<Arc<LlmClient>> {
         .unwrap_or_else(|_| "https://api.supxh.xin/v1".to_string());
     let model =
         std::env::var("REAL_LLM_MODEL").unwrap_or_else(|_| "deepseek-v4-pro".to_string());
-    let client = LlmClient::new(base_url, api_key, model, 180, 6, 2500)
-        .expect("构造真实 LlmClient");
+    let client = build_real_client(base_url, api_key, model, "REAL_LLM_FORMAT", 10);
     Some(Arc::new(client))
+}
+
+/// 按 `<format_env>`（openai/anthropic，缺省 openai）构造 LlmClient。claude 系走
+/// Anthropic `/v1/messages`（非流式）；gpt/其它走 OpenAI `/v1/chat/completions`。
+/// 与 `real_llm_ops_smoke.rs::build_real_client` 同口径——端点切到 rsxermu666.cn
+/// （主 claude-opus-4-8）时主模型走 Anthropic，避免被当 OpenAI 走错路径返回 4xx 后被
+/// `unwrap_or_skip_transient!` 跳过出假绿。
+fn build_real_client(
+    base_url: String,
+    api_key: String,
+    model: String,
+    format_env: &str,
+    retries: u32,
+) -> LlmClient {
+    let fmt = match std::env::var(format_env).ok().as_deref() {
+        Some("anthropic") | Some("messages") | Some("claude") => LlmFormat::Anthropic,
+        _ => LlmFormat::Openai,
+    };
+    LlmClient::with_format(base_url, api_key, model, fmt, 180, retries, 2500)
+        .expect("构造真实 LlmClient")
 }
 
 /// vision 副模型名：`REAL_LLM_VISION_MODEL`，缺省默认专职视觉 provider 模型 `nemotron-nano-12b-v2-vl`。
@@ -112,12 +131,52 @@ macro_rules! unwrap_or_skip_transient {
     ($result:expr, $what:expr) => {{
         match $result {
             Ok(value) => value,
-            Err(wechatagent::error::AppError::LlmUnavailable { kind, retry_count, .. }) => {
+            Err(wechatagent::error::AppError::LlmUnavailable { kind, retry_count, detail, .. }) => {
+                // R0.3：配错类 4xx（404 endpoint_not_found / 其它 http_4xx，除账户级 401/402）
+                // **不是端点抖动**，是 baseUrl/model/path 配错（重演 t12 漏 /v1 → 405 被当抖动
+                // skip 假绿的坑）。这类直接 panic 暴露，不 skip、不写 ledger。401/402（未授权/
+                // 欠费）仍按瞬时处理（fork 没 key / 配额临时耗尽，独立端点可救）。
+                let cfg_err_4xx = kind == "endpoint_not_found"
+                    || (kind == "http_4xx"
+                        && !detail.contains("HTTP 401")
+                        && !detail.contains("HTTP 402"));
+                if cfg_err_4xx {
+                    panic!(
+                        "{}：配置错误（kind={kind}），非端点抖动——4xx 多为 baseUrl/model/path 配错，\
+                         不当瞬时 skip 假绿（R0.3）。detail={detail}",
+                        $what
+                    );
+                }
                 eprintln!(
                     "skip: {} —— 真模型上游瞬时不可达（kind={kind}, retry_count={retry_count}），\
                      按计划「真模型抖动有限重试+跳过」处理，不算能力失败",
                     $what
                 );
+                // R0.2：transient-skip 可观测化——每次 skip append 一行到公共 ledger，
+                // CI 跑完按 skip 率校验阈值（高 skip 假绿 → 红）。IO 失败仅诊断不影响 skip。
+                {
+                    use std::io::Write as _;
+                    let dir = std::env::var("REAL_LLM_LEDGER")
+                        .unwrap_or_else(|_| "target/real_llm_ledger".to_string());
+                    let _ = std::fs::create_dir_all(&dir);
+                    if let Ok(mut f) = std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(format!("{dir}/skip_ledger.jsonl"))
+                    {
+                        let _ = writeln!(
+                            f,
+                            "{}",
+                            serde_json::json!({
+                                "test": $what,
+                                "kind": kind,
+                                "retry_count": retry_count,
+                                "file": file!(),
+                                "sha": std::env::var("GITHUB_SHA").unwrap_or_else(|_| "local".into()),
+                            })
+                        );
+                    }
+                }
                 return;
             }
             Err(other) => panic!("{}：{other:?}", $what),
@@ -198,10 +257,11 @@ fn managed_contact(wxid: &str) -> Contact {
         last_outbound_at: None,
         last_agent_run_at: None,
         custom_agent_instructions: None,
+        operation_mode_override: None,
         last_outbound_style: None,
         intent_trajectory: Vec::new(),
         locale: None,
-        deal_events: Vec::new(),
+        outcome_events: Vec::new(),
         created_at: now,
         updated_at: now,
     }
@@ -503,7 +563,7 @@ async fn t3_real_vision_extraction_keeps_needs_review() {
         model: real_vision_model(),
         is_active: false,
         timeout_seconds: Some(180),
-        max_retries: Some(6),
+        max_retries: Some(10),
         retry_base_ms: Some(2500),
         supports_vision: true,
         is_vision_active: true,
