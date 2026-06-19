@@ -204,6 +204,7 @@ async fn record_user_reaction_inner(
         contact,
         &outcome_for_outbox,
         &reaction_analysis_for_trajectory,
+        &active_traj_dims,
     )
     .await
     {
@@ -689,6 +690,7 @@ pub(crate) async fn push_intent_trajectory_entry(
     contact: &Contact,
     outcome: &str,
     reaction_analysis: &Document,
+    traj_dims: &[crate::models::TrajectoryDimension],
 ) -> AppResult<()> {
     use mongodb::options::CountOptions;
 
@@ -711,18 +713,19 @@ pub(crate) async fn push_intent_trajectory_entry(
     // 单维 objection_type → 仍写 `objectionType` 旧字段（字节等价红线）；非销售
     // profile 声明其它维度 → 过字典后落 `dimensions` 容器。
     //
+    // 维度由调用方（record_user_reaction_inner）从已加载的 active profile 传入，
+    // 避免在写侧二次 load_active_domain_profile。空集 → 回落 DEFAULT 单维 objection_type
+    // （与 active profile 空 trajectory_dimensions 的回落同源，字节等价）。
+    //
     // 每个 dim.kind 是 ReactionDerived 通道（字典 Taxonomy 源）：LLM 裸产出不进
     // 轨迹，先过 validate_dimension_value(MachineWrite) 归一。Accept→落 canonical；
     // Drop→不落该字段（越界静默丢弃，轨迹是观测数据，不进五闸/状态机，无副作用）。
-    let profile = crate::agent::domain_profile::load_active_domain_profile(
-        &state.db,
-        &contact.workspace_id,
-    )
-    .await;
-    let traj_dims = if profile.trajectory_dimensions.is_empty() {
-        crate::agent::domain_profile::default_trajectory_dimensions()
+    let default_dims;
+    let traj_dims: &[crate::models::TrajectoryDimension] = if traj_dims.is_empty() {
+        default_dims = crate::agent::domain_profile::default_trajectory_dimensions();
+        &default_dims
     } else {
-        profile.trajectory_dimensions.clone()
+        traj_dims
     };
 
     let mut entry = doc! {
@@ -731,7 +734,7 @@ pub(crate) async fn push_intent_trajectory_entry(
         "recordedAt": DateTime::now(),
     };
     let mut dim_container = doc! {};
-    for dim in &traj_dims {
+    for dim in traj_dims {
         // reaction_analysis 字段名按 camelCase 写出（LLM JSON 约定），同时兜底 snake。
         let raw = doc_string(reaction_analysis, &snake_to_camel(&dim.kind))
             .or_else(|| doc_string(reaction_analysis, &dim.kind))
@@ -1229,11 +1232,44 @@ mod a6_tests {
             display_name: "顾虑类型".into(),
         }];
         let add = reaction_trajectory_prompt_addendum(&dims).expect("非销售维度须产 addendum");
+        // H17 命门：addendum 必须列出 writer 实际读取的 camelCase key。
+        // 旧断言带 `|| add.contains("concern_type")` 逃生口——即使 snake_to_camel 完全失效
+        // （原样返回 snake_case），测试仍假绿，反而失去验证 camelCase 转换的唯一锚点。
+        // 收紧为仅断言 camelCase 形态：snake_to_camel 回归即变红。
         assert!(
-            add.contains("concernType") || add.contains("concern_type"),
-            "addendum 须列维度 key"
+            add.contains("concernType"),
+            "addendum 须列出 writer 读取的 camelCase key concernType（不再接受 snake_case 逃生口）"
         );
         assert!(add.contains("顾虑类型"), "addendum 须含 display_name");
+    }
+
+    /// H17 命门直测：`snake_to_camel` 是轨迹 WRITE 路径（`push_intent_trajectory_entry`
+    /// 读 `reaction_analysis[snake_to_camel(dim.kind)]`）与 PROMPT addendum
+    /// （`reaction_trajectory_prompt_addendum` 列 `snake_to_camel(dim.kind)` 告知 LLM 输出哪个键）
+    /// 共同依赖的字节锚点。若它错了，LLM 输出的键 writer 永远不看 → `dimensions` 容器静默空着。
+    /// 本测为 characterization test：锁定当前实现实际行为（含边界），防止静默回归。
+    #[test]
+    fn snake_to_camel_converts_dimension_keys() {
+        // 典型维度键（writer/addendum 真实使用）。
+        assert_eq!(snake_to_camel("objection_type"), "objectionType");
+        assert_eq!(snake_to_camel("concern_type"), "concernType");
+        // 多段。
+        assert_eq!(
+            snake_to_camel("relationship_signal_kind"),
+            "relationshipSignalKind"
+        );
+        // 单段无下划线 → 原样。
+        assert_eq!(snake_to_camel("intent"), "intent");
+
+        // —— 边界 characterization：锁定当前实现实际行为（非理想行为）——
+        // 空串 → 空串。
+        assert_eq!(snake_to_camel(""), "");
+        // 末尾下划线被静默丢弃（upper_next 置位但无后续字符消费）。
+        assert_eq!(snake_to_camel("foo_"), "foo");
+        // 前导下划线会大写首字母（upper_next 在首字符前已置位）。
+        assert_eq!(snake_to_camel("_foo"), "Foo");
+        // 连续双下划线塌缩为一个分隔（第二个 `_` 不重置 upper_next，被静默吞掉）。
+        assert_eq!(snake_to_camel("a__b"), "aB");
     }
 
     /// 漂移 pin（审查 TEST-1/CORRECT-3）：reaction 本地的 `default_outcome_polarity_for_reaction`
