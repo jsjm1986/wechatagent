@@ -166,6 +166,11 @@ pub(super) async fn publish_operation_domain_version(
 /// - `"statemachine_publish:*"`（本 publish 路径联动派生）→ 可刷新
 /// - `"legacy_migration"`（m013 从 DEFAULT 机器 seed 的行）→ 可刷新
 /// - 其它任意值（如 `"admin_manual"` / 运营后台手设）→ 手工行 → **保留**
+///
+/// **不变量（关键）**：运营/admin policy 插入路径**必须**总是写一个不可刷新的 `seeded_by`
+/// （今天 `publish_operation_state_policy_version` 等都写 `"manual"`），因为「`None` →
+/// 可刷新」这条规则静默依赖它——若手工行漏写 `seeded_by`（落 `None`），会被本 publish
+/// 路径误判为机器派生行而 clobber。新增手工 policy 写入点必须守住这条。
 pub(crate) fn is_refreshable_policy_seeded_by(seeded_by: &Option<String>) -> bool {
     match seeded_by.as_deref() {
         None => true,
@@ -179,17 +184,29 @@ pub(crate) fn is_refreshable_policy_seeded_by(seeded_by: &Option<String>) -> boo
 /// best-effort 顺序，**不**引入事务、**不**加 `current_version=true` 唯一分区索引。理由：
 /// - 本代码库不使用 MongoDB 多文档事务（显式约定，见 [`insert_new_current_domain_config`]
 ///   doc），且 testcontainers mongo 单节点无副本集 → 事务不可用。
-/// - `current_version=true` 唯一分区索引会强制 demote-then-insert 顺序，打开「0 current」窗口：
-///   并发 runtime 读此刻回落 DEFAULT-sales（比「2 条 industry current」更坏的失败方向）；
-///   且 `ensure_indexes` 用 `?` 非 best-effort，存量脏 current 行会**直接 brick 启动**
-///   （prod-117 部署炸雷），无配套清理不可加。
+/// - `current_version=true` 唯一分区索引会强制 demote-then-insert 顺序，且 `ensure_indexes`
+///   用 `?` 非 best-effort，存量脏 current 行会**直接 brick 启动**（prod-117 部署炸雷），
+///   无配套清理不可加。
 ///
-/// 残留（accepted-and-bounded）：在**真正并发的、本体各不相同**的 publish（admin-only，极罕见）
-/// 下，最终 current flag 可能短暂出现 2 条 current。可接受因为：
-/// (i) `(workspace,domain,version)` 唯一索引已挡住「重复 version」这个危险竞态；
-/// (ii) 下方 no-op 幂等消除了「同机器重复 activate」这个最常见触发器；
-/// (iii) 失败方向良性——多出的也是 industry 机器（非 DEFAULT-sales），且下次 publish 自愈；
-/// (iv) 事务不可用，唯一索引会引入更坏的 0-current 窗口 + 启动炸雷。
+/// 残留竞态（accepted）——**诚实陈述其最坏端态**：在**真正并发的、本体各不相同**的 publish
+/// 下（同一 workspace 两次不同机器 publish 交错），insert-then-demote 的 demote 用
+/// `_id $ne inserted` 互斥，可走到**持久 0-current 端态**：
+/// ```text
+/// P1 insert vN+1 cur=true
+/// P2 insert vN+2 cur=true
+/// P1 demote (_id != P1) → P2(vN+2) cur=false
+/// P2 demote (_id != P2) → P1(vN+1) cur=false
+/// → 0 行 current，持续到下次 publish；其间 runtime 回落 DEFAULT-sales。
+/// ```
+/// 这**不是**良性方向（早期注释误称 insert-then-demote「避免 0-current 窗口」，错误，已订正）。
+/// 仍接受该残留，基于真实理由：
+/// (i) 极罕见：仅在「同 workspace、不同机器、真并发」publish 时触发，而 publish 是 admin-gated
+///     的低频运维动作；
+/// (ii) 下方 no-op 幂等消除了最常见触发器——「重复激活同一机器」（本体逐字节相等直接短路），
+///     使剩下的触发面只有罕见的「不同机器并发」；
+/// (iii) 自愈：下次任意 publish 会重新插一条 current 行，0-current 端态不会长期固化；
+/// (iv) `(workspace,domain,version)` 唯一索引仍挡住「重复 version」这个更危险的竞态；
+/// (v) 兜底方向（事务 / current 唯一索引）在本部署形态下不可用或会引入更坏故障（启动炸雷）。
 pub(crate) async fn publish_state_machine_version(
     db: &Database,
     workspace_id: &str,
@@ -281,6 +298,12 @@ pub(crate) async fn publish_state_machine_version(
             crate::db::migrations::m013_seed_user_operation_state_policies::derive_state_policy_lists(
                 forbids_proactive,
             );
+        // 只认 current_version=true 行：运行时 reader（agent/decision.rs）严格按
+        // current_version=true 读 policy，且同 (ws,domain,state_key) 下可并存多版本
+        // （admin publish/rollout/rollback 造历史版本，(ws,domain,state_key,version)
+        // 唯一索引证 version 是 key 的一部分）。裸 find_one 会返回任意版本——可能改到
+        // 非 current 的历史行，运行时仍读旧 current（toggle 静默失效，正是本代码要修的
+        // bug），且改写历史行的 allowed/forbidden/seeded_by 会污染 rollback 链。
         match db
             .operation_state_policies()
             .find_one(
@@ -288,6 +311,7 @@ pub(crate) async fn publish_state_machine_version(
                     "workspace_id": workspace_id,
                     "domain": domain,
                     "state_key": state_key,
+                    "current_version": true,
                 },
                 None,
             )
@@ -330,6 +354,21 @@ pub(crate) async fn publish_state_machine_version(
                 }
             }
             Ok(None) => {
+                // current find_one 为 None：通常是该 state 首次派生 → 插 current 行。
+                // EDGE（rollback 中途）：若存在非 current 的历史行但无 current 行，硬插
+                // version 1 会与历史 version 1 撞 (ws,domain,state_key,version) 唯一索引。
+                // 故按该 scope 现存最大 version+1 分配版本（复用 next_version_for_scope，
+                // 与 admin policy publish 同一真相），避开撞索引。
+                let next_policy_version = next_version_for_scope(
+                    db.operation_state_policies(),
+                    doc! {
+                        "workspace_id": workspace_id,
+                        "domain": domain,
+                        "state_key": state_key,
+                    },
+                )
+                .await
+                .unwrap_or(1);
                 let policy = OperationStatePolicy {
                     id: None,
                     workspace_id: workspace_id.to_string(),
@@ -340,7 +379,7 @@ pub(crate) async fn publish_state_machine_version(
                     recommended_pace: None,
                     status: "active".to_string(),
                     updated_at: now,
-                    version: 1,
+                    version: next_policy_version,
                     current_version: true,
                     previous_version: None,
                     seeded_by: Some(policy_seeded_by.clone()),

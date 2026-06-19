@@ -1494,6 +1494,112 @@ async fn operator_edited_policy_preserved_on_republish() {
     );
 }
 
+/// H13 (FINDING 1)：同 (ws,domain,state_key) 并存多版本 policy 时，republish 只刷新
+/// current_version=true 那一行，绝不改历史版本（否则运行时读 current 仍陈旧 = toggle
+/// 静默失效，且改写历史行会污染 rollback 链）。
+#[tokio::test]
+#[ignore]
+async fn republish_refreshes_only_current_policy_version() {
+    let app = common::TestApp::start().await;
+    let db = app.state.db.clone();
+    let ws = app.state.config.default_workspace_id.clone();
+
+    db_seed_base_domain_config(&db, &ws).await;
+
+    // 历史行：version 1, current_version=false, forbidden=[]，可刷新 seeded_by。
+    let historical = wechatagent::models::OperationStatePolicy {
+        id: None,
+        workspace_id: ws.clone(),
+        domain: "user_operations".to_string(),
+        state_key: "grieving".to_string(),
+        allowed: vec!["reply".to_string()],
+        forbidden: vec![],
+        recommended_pace: None,
+        status: "active".to_string(),
+        updated_at: DateTime::now(),
+        version: 1,
+        current_version: false,
+        previous_version: None,
+        seeded_by: Some("legacy_migration".to_string()),
+    };
+    let hist_id = db
+        .operation_state_policies()
+        .insert_one(&historical, None)
+        .await
+        .expect("seed historical policy")
+        .inserted_id
+        .as_object_id()
+        .expect("historical _id");
+
+    // 当前行：version 2, current_version=true, forbidden=[]，可刷新 seeded_by。
+    let current = wechatagent::models::OperationStatePolicy {
+        id: None,
+        workspace_id: ws.clone(),
+        domain: "user_operations".to_string(),
+        state_key: "grieving".to_string(),
+        allowed: vec!["reply".to_string()],
+        forbidden: vec![],
+        recommended_pace: None,
+        status: "active".to_string(),
+        updated_at: DateTime::now(),
+        version: 2,
+        current_version: true,
+        previous_version: Some(1),
+        seeded_by: Some("legacy_migration".to_string()),
+    };
+    let cur_id = db
+        .operation_state_policies()
+        .insert_one(&current, None)
+        .await
+        .expect("seed current policy")
+        .inserted_id
+        .as_object_id()
+        .expect("current _id");
+
+    // publish 把 grieving 标 forbidsProactive=true（机器派生想 forbidden=[reply]）。
+    let machine = doc! {
+        "states": [
+            { "key": "x_intro", "name": "开场", "initial": true, "allowedFrom": [] },
+            { "key": "grieving", "name": "哀伤期", "allowedFrom": ["x_intro"], "forbidsProactive": true },
+        ]
+    };
+    activate_profile_with_machine(&app, &db, &ws, "grief", &machine).await;
+
+    // 当前行（version 2）被刷新：forbidden 含 reply。
+    let cur_after = db
+        .operation_state_policies()
+        .find_one(doc! { "_id": cur_id }, None)
+        .await
+        .expect("query current after")
+        .expect("current row exists");
+    assert!(
+        cur_after.forbidden.iter().any(|a| a == "reply"),
+        "current(version 2) 行应被刷新为 forbidden 含 reply: {:?}",
+        cur_after.forbidden
+    );
+
+    // 历史行（version 1）原封不动：forbidden 仍空。
+    let hist_after = db
+        .operation_state_policies()
+        .find_one(doc! { "_id": hist_id }, None)
+        .await
+        .expect("query historical after")
+        .expect("historical row exists");
+    assert!(
+        hist_after.forbidden.is_empty(),
+        "historical(version 1) 行不应被改动，forbidden 仍空: {:?}",
+        hist_after.forbidden
+    );
+    assert_eq!(
+        hist_after.version, 1,
+        "historical 行 version 不变"
+    );
+    assert!(
+        !hist_after.current_version,
+        "historical 行仍非 current"
+    );
+}
+
 // ── H13 (T14)：activate 切状态机后迁移存量 contact 幻影态到新 initial ────────────────
 
 /// 在 contacts 集合插一条最小 contact（直写裸 BSON，避免构造 30+ 字段），返回其 _id。
