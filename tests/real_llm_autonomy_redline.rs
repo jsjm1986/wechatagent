@@ -47,7 +47,7 @@ async fn real_autonomy_redline_calibration() {
     let clean_ctx = gate("暧昧句@问产品语境", "这个功能支持批量导出吗", ambiguous,
         Some("客户: 这个功能支持批量导出吗\n运营: 那我去问一下吧")).await;
     // 两者都出分时（非 Skipped），要求语境下的分应 ≥ 问产品语境（上下文敏感）。
-    if let (RedlineVerdict::Breach { .. } | RedlineVerdict::Clean { .. }, _) = (&breach_ctx, &clean_ctx) {
+    if let (RedlineVerdict::Breach { .. } | RedlineVerdict::Clean, _) = (&breach_ctx, &clean_ctx) {
         eprintln!("[autonomy校准] 同句两语境: 要求转真人={breach_ctx:?} 问产品={clean_ctx:?}");
     }
     // 弱断言（真模型有抖动，仅当两者都出分才比较；核心抓手是金标1/2 的硬方向）：
