@@ -74,14 +74,28 @@ JudgeInput {
 - band hit 才算 roleplayer 可信；持续 miss = roleplayer prompt 要修。
 - 这样对抗弧的**输入端**也有了可信度保证，不再 agent 跟假客户过招。
 
-## 四、影响面与边界
+## 四、t3-t18（ops 弧）覆盖映射——为何统一重构能一并解决它们
+
+逐弧核查 ops_smoke t4-t18 的硬断言，分两类：
+
+**A 类·确定性结构断言（健康，重构保留不碰）**：判可确定验证的事实，无评判失真：
+- t4 `status=expired`、t5 `operation_state ∈ 状态机字典`、t6/t12/t13/t16/t17 `status ∈ gateway 闭集`、t11 `memory_card_version≥1 / 候选 consolidated`、t13 `回复非空`。这些是测试硬骨架。
+
+**B 类·评判失真病灶（重构直接根治，无需逐弧单独修）**：
+- **共用 `run_judge` 的 8 个弧**（t5/t6/t8/t12/t13/t15/t16/t17）：`run_judge` 正是 J1/J2/J5 病灶载体（裁判看不到知识库/记忆/承诺、单轮判）。**阶段 1 升级 `run_judge`→`judge_conversation` 后，这 8 弧的裁判质量一次性全改善**——统一内核的核心杠杆。
+- **t8/t17 用 `contains_unnegated` 词表判转人工红线**：T2/T3 假阳根源。**阶段 2 换 autonomyRisk 对话级多采样硬门**一并根治。
+- **t15/t16/t17 多轮弧只有逐轮 run_judge、无对话级总评**：J4 病灶。**阶段 3 对话级总评覆盖**——t15 成交弧"全程兜圈"、t17 边界压力弧"跨轮施压累积"正是要对话级才看得出。
+
+**结论**：t3-t18 不需逐弧单独修。它们通过**共用评判入口**（run_judge / 词表红线 / 多轮无总评）继承同样病灶，统一内核重构在阶段 1-3 自动覆盖全部 8 个调 run_judge 的弧 + 多轮弧。这正是"抽统一内核"相对"逐弧打补丁"的根本价值。
+
+## 五、影响面与边界
 
 - **测试 only**：不碰 src/ 生产（prompts/guards/gateway 一律不动）。
 - 改动文件：`tests/real_llm_adversarial.rs`（评判内核 + 对话级 + 红线硬门 + roleplayer 校准）、`tests/common/judge.rs`/`roleplayer.rs`（若内核下沉到 common 复用）、`tests/common/redline.rs`（词表降级/删除）、`tests/real_llm_ops_smoke.rs`（改走统一内核）、cross_domain_arc/dynamic_adversarial（同步）。
 - **风险**：(1) 评判依赖裁判可用性——Skipped 不假绿兜底。(2) 喂更多底料 → 单次 judge prompt 更长、token 涨——**关键成本约束**：adversarial CI 已在 45min 墙 + 端点并发上限 2 下，逐轮全量喂底料可能撞墙/触 429。缓解=**分层喂**：逐轮裁判只喂该轮真正需要的底料（红线轮喂 transcript、产品轮喂 knowledge、其余精简）；全量底料只在对话级总评（每弧 1 次）喂。(3) 改动面大——分阶段落地（见五）。
 - **不做**：不改生产运行期红线守卫；不改被测 agent 的 prompts（那是 C2 等 agent 优化的范畴，与本"评判体系"重构正交）。
 
-## 五、分阶段落地（大改拆小步，每步可验证）
+## 六、分阶段落地（大改拆小步，每步可验证）
 
 1. **阶段 1 - 评判内核 + 底料注入（J1/J2/J5）**：抽 `judge_conversation`，给逐轮裁判喂 knowledge/memory/commitments/profile，改写 prompt 维度定义对照底料。验证：J1 编造样本（说知识库没有的）被 factualRestraint 抓到。
 2. **阶段 2 - 红线对话级硬门（T2/T3/红线）**：autonomyRisk 多采样硬门取代词表 panic，必传 transcript。验证：T3 复现样本（拒绝转人工）Clean、真承诺 Breach、同句两 transcript 结果相反。
@@ -91,7 +105,7 @@ JudgeInput {
 
 每阶段独立 commit + CI 验证，不一次性大爆炸。
 
-## 六、验证（贯穿各阶段）
+## 七、验证（贯穿各阶段）
 
 - 纯函数单测：评判聚合（median-of-max、阈值三态、对话级维度提取）。
 - **底料依赖验证**：同一 reply 喂"有知识库 vs 无知识库"→ factualRestraint 应不同（证明 J1 真用上底料）。
