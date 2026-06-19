@@ -1493,3 +1493,132 @@ async fn operator_edited_policy_preserved_on_republish() {
         "运营手工行 seeded_by 应保持 admin_manual"
     );
 }
+
+// ── H13 (T14)：activate 切状态机后迁移存量 contact 幻影态到新 initial ────────────────
+
+/// 在 contacts 集合插一条最小 contact（直写裸 BSON，避免构造 30+ 字段），返回其 _id。
+/// `operation_state` 为 None 时不写该字段（模拟未设态 contact）。
+async fn db_seed_contact(
+    db: &Database,
+    workspace_id: &str,
+    wxid: &str,
+    operation_state: Option<&str>,
+) -> ObjectId {
+    let oid = ObjectId::new();
+    let mut doc = doc! {
+        "_id": oid,
+        "workspace_id": workspace_id,
+        "account_id": "acct-test",
+        "wxid": wxid,
+        "agent_status": "managed",
+        "created_at": DateTime::now(),
+        "updated_at": DateTime::now(),
+    };
+    if let Some(state_key) = operation_state {
+        doc.insert("operation_state", state_key);
+    }
+    db.raw()
+        .collection::<mongodb::bson::Document>("contacts")
+        .insert_one(doc, None)
+        .await
+        .expect("seed contact");
+    oid
+}
+
+/// 读某 contact 当前 operation_state（裸 BSON，None=未设字段）。
+async fn db_contact_operation_state(db: &Database, id: ObjectId) -> Option<String> {
+    let doc = db
+        .raw()
+        .collection::<mongodb::bson::Document>("contacts")
+        .find_one(doc! { "_id": id }, None)
+        .await
+        .expect("query contact")
+        .expect("contact exists");
+    doc.get_str("operation_state").ok().map(str::to_string)
+}
+
+/// T14：存量 contact 持旧机器的 operation_state（新机器无此 key）→ activate 切新机器后，
+/// 该 contact 被重置到新机器 initial 态（修「换域后老 contact 状态机静默冻结」幻影态）。
+#[tokio::test]
+#[ignore]
+async fn activate_resets_stranded_contact_operation_state() {
+    let app = common::TestApp::start().await;
+    let db = app.state.db.clone();
+    let ws = app.state.config.default_workspace_id.clone();
+
+    db_seed_base_domain_config(&db, &ws).await;
+
+    // 存量 contact 停在旧（销售）机器的 negotiating——新机器里不存在此 key。
+    let cid = db_seed_contact(&db, &ws, "wx-stranded", Some("legacy_negotiating")).await;
+
+    // 新机器：initial=x_intro，另含 x_active（allowedFrom x_intro），均无 legacy_negotiating。
+    let machine = doc! {
+        "states": [
+            { "key": "x_intro", "name": "开场", "initial": true, "allowedFrom": [] },
+            { "key": "x_active", "name": "活跃", "allowedFrom": ["x_intro"] },
+        ]
+    };
+    activate_profile_with_machine(&app, &db, &ws, "edu-domain", &machine).await;
+
+    assert_eq!(
+        db_contact_operation_state(&db, cid).await.as_deref(),
+        Some("x_intro"),
+        "幻影态 contact 应被重置到新机器 initial 态 x_intro"
+    );
+}
+
+/// T14：已处在新机器合法态（x_intro）的 contact 在 activate 后不被重置/clobber。
+#[tokio::test]
+#[ignore]
+async fn activate_preserves_valid_contact_operation_state() {
+    let app = common::TestApp::start().await;
+    let db = app.state.db.clone();
+    let ws = app.state.config.default_workspace_id.clone();
+
+    db_seed_base_domain_config(&db, &ws).await;
+
+    // contact 已在新机器的合法态 x_intro。
+    let cid = db_seed_contact(&db, &ws, "wx-valid", Some("x_intro")).await;
+
+    let machine = doc! {
+        "states": [
+            { "key": "x_intro", "name": "开场", "initial": true, "allowedFrom": [] },
+            { "key": "x_active", "name": "活跃", "allowedFrom": ["x_intro"] },
+        ]
+    };
+    activate_profile_with_machine(&app, &db, &ws, "edu-domain", &machine).await;
+
+    assert_eq!(
+        db_contact_operation_state(&db, cid).await.as_deref(),
+        Some("x_intro"),
+        "合法态 contact 不应被重置（$nin 过滤排除合法态）"
+    );
+}
+
+/// T14：operation_state 未设的 contact 在 activate 后仍未设（$exists:true 过滤排除，
+/// 留待首次运行时补 initial，不被本迁移误写）。
+#[tokio::test]
+#[ignore]
+async fn activate_leaves_unset_operation_state_contact() {
+    let app = common::TestApp::start().await;
+    let db = app.state.db.clone();
+    let ws = app.state.config.default_workspace_id.clone();
+
+    db_seed_base_domain_config(&db, &ws).await;
+
+    let cid = db_seed_contact(&db, &ws, "wx-unset", None).await;
+
+    let machine = doc! {
+        "states": [
+            { "key": "x_intro", "name": "开场", "initial": true, "allowedFrom": [] },
+            { "key": "x_active", "name": "活跃", "allowedFrom": ["x_intro"] },
+        ]
+    };
+    activate_profile_with_machine(&app, &db, &ws, "edu-domain", &machine).await;
+
+    assert_eq!(
+        db_contact_operation_state(&db, cid).await,
+        None,
+        "未设 operation_state 的 contact 不应被本迁移写入（$exists:true,$ne:null 过滤排除）"
+    );
+}
