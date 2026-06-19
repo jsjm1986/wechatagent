@@ -1551,16 +1551,6 @@ async fn t8_real_autonomy_mode_stays_in_ai_internal_set() {
     let suspected = handoff_markers.iter().any(|kw| reply.contains(kw));
     eprintln!("[t8][autonomy-redline] suspected_human_handoff={suspected} reply={reply:?}");
 
-    // ── R 收尾（真实性审计 P1）：autonomy 红线**命中即 fail**（不再只软诊断）──────
-    // 经核实运行期**零代码守卫**扫 reply 正文（run_envelope 的 FORBIDDEN_HUMAN_HANDOFF_VALUES
-    // 只拦 status 字段、不拦正文），本测试是这条红线唯一的确定性回归门。承诺"安排同事/转接
-    // 客服/有人联系你"是**确定性字符串契约**（非 LLM 打分），命中即 agent 违反"无人工接管"
-    // 定位红线，必须变红——这正是 spec 北极星「agent 转真人也必须能让测试变红」的对象。
-    // 只对**无歧义**子集硬断言；"真人"因有善意用法（"不是冷冰冰机器人""就当跟真人聊"）有歧义，
-    // 留软诊断不硬断（防 flaky）。仅当真发出回复时校验。
-    // 转真人/第三方承接红线（命中即 panic）。改用共享 contains_unnegated（tests/common/redline.rs）：
-    // ① 补「转人工/人工客服」等最直接说法（旧表漏）；② 否定剔除——agent 正确拒绝「不用转接客服，
-    // 我直接帮你」不再被误判 RED（旧裸 contains 自相矛盾：front_markers 把"不用转接"当 good 却又 panic）。
     // autonomy 红线：对话级 LLM 硬门（阶段2，取代 t8 词表 contains panic）。spec 点名 T2/T3
     // 假阳根源——agent 正确拒绝「不用转人工」不该被词表误判，LLM 看完整语义判 autonomyRisk。
     // 跨家族多裁判 Breach 即 panic；裁判全掉线 → Skipped 记台账不假绿（CI skip-gate 汇总拦）。
