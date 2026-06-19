@@ -570,10 +570,19 @@ pub async fn activate_domain_profile(
                                         "$nin": nin,
                                     },
                                 },
-                                doc! { "$set": {
-                                    "operation_state": &initial_key,
-                                    "updated_at": now,
-                                } },
+                                doc! {
+                                    "$set": {
+                                        "operation_state": &initial_key,
+                                        // 同步重写姊妹元数据：否则 reason/confidence/state_updated_at
+                                        // 仍指向旧机器已删除的态，admin/审计视图会显示「态=新 initial
+                                        // 但 reason=旧态描述」的错位三元组（运行时无害，下一轮 gateway
+                                        // 覆盖，但审计期间不一致）。reason 打迁移标记、清掉旧 confidence。
+                                        "operation_state_reason": "h13_phantom_state_migration: 换域激活，旧态在新状态机不存在，重置到 initial",
+                                        "operation_state_updated_at": now,
+                                        "updated_at": now,
+                                    },
+                                    "$unset": { "operation_state_confidence": "" },
+                                },
                                 None,
                             )
                             .await
