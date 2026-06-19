@@ -31,7 +31,12 @@ mod m002_split_active_facts;
 mod m003_state_machine_allowed_from;
 mod m004_outcome_metrics_id;
 mod m005_memory_facts_to_structured;
-mod m006_taxonomy_seed;
+/// `pub`：集成测试需在 `migrations::run` 后直接调用 `m006::run_step` 重新 seed 销售域
+/// 字典——`m012_drop_legacy_taxonomy_seed` 在非 production 环境会删掉 customer_stage /
+/// intent_level / objection_type 的 m006 seed（生产靠 `APP_ENV=production` 守卫跳过），
+/// 测试 DB 跑完全部迁移后这三 kind 字典为空，经 `validate_dimension_value(Taxonomy)`
+/// 的维度会被判越界 drop。测试复用 m006 的 upsert seed（与生产同源，不抄数据）补回。
+pub mod m006_taxonomy_seed;
 mod m007_outbox_indexes;
 mod m008_contact_commitments_reshape;
 mod m009_prompt_template_versioned;

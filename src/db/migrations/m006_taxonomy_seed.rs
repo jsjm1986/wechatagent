@@ -25,7 +25,7 @@ use crate::db::Database;
 use crate::error::AppResult;
 use crate::models::{TaxonomyEntry, TaxonomyValue};
 
-pub(super) async fn run_step(db: &Database) -> AppResult<()> {
+pub async fn run_step(db: &Database) -> AppResult<()> {
     let collection = db.collection_system_taxonomies();
     let now = DateTime::now();
     let mut inserted = 0_u64;
