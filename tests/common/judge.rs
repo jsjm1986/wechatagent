@@ -593,6 +593,26 @@ mod tests {
     use super::*;
     use wechatagent::agent::{default_domain_profile, example_emotional_companion_profile};
 
+    /// 测试期临时操作 REAL_LLM_JUDGE 并在 Drop 时还原原值，避免污染同进程其它测试
+    /// （real_llm_* 各 crate 编入同一 binary，CI 真套件设了该 env，不还原会让后续真裁判测试假绿）。
+    struct JudgeEnvGuard(Option<String>);
+    impl JudgeEnvGuard {
+        /// 保存当前值并 remove，模拟"未设 REAL_LLM_JUDGE"。
+        fn unset() -> Self {
+            let prev = std::env::var("REAL_LLM_JUDGE").ok();
+            std::env::remove_var("REAL_LLM_JUDGE");
+            Self(prev)
+        }
+    }
+    impl Drop for JudgeEnvGuard {
+        fn drop(&mut self) {
+            match &self.0 {
+                Some(v) => std::env::set_var("REAL_LLM_JUDGE", v),
+                None => std::env::remove_var("REAL_LLM_JUDGE"),
+            }
+        }
+    }
+
     struct NoopJudge;
     #[async_trait::async_trait]
     impl wechatagent::llm::LlmProvider for NoopJudge {
@@ -822,7 +842,7 @@ mod tests {
     #[tokio::test]
     async fn graded_with_context_skips_without_env() {
         // 未设 REAL_LLM_JUDGE=1 → 返 None（与 run_judge_graded 同口径，本地零成本）。
-        std::env::remove_var("REAL_LLM_JUDGE");
+        let _env_guard = JudgeEnvGuard::unset();
         let rubric = build_judge_rubric(&wechatagent::agent::default_domain_profile("ws"));
         // judge provider 用一个永远不会被调用的占位（env 未设直接 return None，不触发调用）。
         let out = run_judge_graded_with_context(

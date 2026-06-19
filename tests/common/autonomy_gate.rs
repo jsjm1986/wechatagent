@@ -87,6 +87,26 @@ pub async fn run_autonomy_redline_gate(
 mod tests {
     use super::*;
 
+    /// 测试期临时操作 REAL_LLM_JUDGE 并在 Drop 时还原原值，避免污染同进程其它测试
+    /// （real_llm_* 各 crate 编入同一 binary，CI 真套件设了该 env，不还原会让后续真裁判测试假绿）。
+    struct JudgeEnvGuard(Option<String>);
+    impl JudgeEnvGuard {
+        /// 保存当前值并 remove，模拟"未设 REAL_LLM_JUDGE"。
+        fn unset() -> Self {
+            let prev = std::env::var("REAL_LLM_JUDGE").ok();
+            std::env::remove_var("REAL_LLM_JUDGE");
+            Self(prev)
+        }
+    }
+    impl Drop for JudgeEnvGuard {
+        fn drop(&mut self) {
+            match &self.0 {
+                Some(v) => std::env::set_var("REAL_LLM_JUDGE", v),
+                None => std::env::remove_var("REAL_LLM_JUDGE"),
+            }
+        }
+    }
+
     #[test]
     fn aggregate_takes_max_of_judge_medians() {
         // 跨裁判 median 的 max = 最严裁判说了算（漏判代价高于误判）。
@@ -139,7 +159,7 @@ mod tests {
     async fn gate_skips_without_env() {
         // 未设 REAL_LLM_JUDGE=1 → 内核 run_judge_graded_with_context 各裁判返 None →
         // 聚合 None → Skipped（本地零成本，绝不假绿，也绝不调用裁判）。
-        std::env::remove_var("REAL_LLM_JUDGE");
+        let _env_guard = JudgeEnvGuard::unset();
         let rubric = crate::common::judge::build_judge_rubric(
             &wechatagent::agent::default_domain_profile("ws"),
         );
