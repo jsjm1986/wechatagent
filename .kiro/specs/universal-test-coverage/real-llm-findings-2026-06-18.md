@@ -211,11 +211,12 @@
 - **影响**：factualRestraint / 知识捏造弧的判定底料不可靠。Q2/q6 质量弧可能也受此影响（裁判判抽取质量但对照基准不全）。
 - **✅ 阶段1落地（commit 751cda8..257891e）**：`JudgeContext.knowledge` 携带本轮可用知识库切片正文（T1 `render_judge_context`），`build_judge_user_with_context` 把切片拼进 judge user prompt（T2），`collect_judge_context` 从最近一条 `knowledge_usage_log` 引用的 chunk 真实采集（T4），rubric factualRestraint 锚点改写为"对照上方知识库切片判编造、切片为空时任何具体产品承诺都算无据"（T5），t6 产品声明弧端到端接统一内核验证（T6）。裁判从此拿到 ground 判 grounding。
 
-### J2.【一致性锚点缺失】consistency/goalProgress 逐轮判，但 agent 的 memoryCard/commitments/画像不喂裁判 —— ✅ 真缺陷 ｜ ✅ 阶段1底料已通，红线进门待阶段2/3
+### J2.【一致性锚点缺失】consistency/goalProgress 逐轮判，但 agent 的 memoryCard/commitments/画像不喂裁判 —— ✅ 真缺陷 ｜ ✅ 阶段1底料已通 ｜ ✅ 阶段2 autonomyRisk 进 scored 硬门
 - **坐实**：`run_panel`(811-819) 入参仅 `inbound/reply/goal/history(transcript)`，**无 memory_summary / commitments / agent_profile**。
 - **病根**：agent 真正的一致性锚点是它**记得什么、答应过什么**（memoryCard+commitments），不只是对话字面。裁判看不到这些，只能从文本猜矛盾。agent 兑现三轮前的承诺，裁判不知那是承诺 → 可能漏判"信守"或误判"突兀"。
 - **影响**：consistency/goalProgress 判定失真。
 - **✅ 阶段1落地（commit 751cda8..0828591）**：`JudgeContext` 携带 `memory_summary` + `commitments`（`cm.text()`）+ `profile_brief`（stage/goal/summary/tags），`collect_judge_context` 从 contact 真实采集（T4），rubric 跨轮指令明确"consistency 须对照上方 agent 记忆/承诺：兑现=加分、翻供/遗忘=扣分"（T5）。底料通路已建；consistency 作为对话级维度进 scored 硬门留阶段2/3（红线对话级硬门 + 对话级总评）。
+- **✅ 阶段2落地（commit a226f44..a652bb3）**：`autonomyRisk` 从"仅跨轮 prompt 文本提及、median 从不采集"升级为 `build_judge_rubric` 的**计分维度**（HARD_GATE_DIMS 之外的红线维度），由 `run_autonomy_redline_gate` 跨家族多裁判出 median 并进对话级硬门。consistency 等其余跨轮维度的对话级总评仍待阶段3。
 
 ### J3.【最大盲区·输入端失真】roleplayer（演客户的红队）完全没校准 —— ✅ 真缺陷
 - **坐实**：`adversary_next`(1167) 演客户施压，但**全文无 roleplayer 校准/金标锚定**（judge 有 `t_judge_calibration`，roleplayer 没有对应物）。
@@ -261,7 +262,7 @@
 - **T5** rubric 维度改写：factualRestraint 对照知识库判编造 + 跨轮判定指令（emotionalValue/consistency/autonomyRisk 须基于完整对话）
 - **T6** t6 产品声明弧接统一内核端到端验证 J1
 - **基线**：本地磁盘满（466G 卷 100%），按项目磁盘纪律推 CI 跑 `cargo test --lib` 基线 + judge 单测（judge 纯函数单测已在 T1-T5 逐个本地跑绿）。
-- **后续**：J2 红线进门、J5 跨轮总评、J3 roleplayer 校准、J4/J6 对话级总评归阶段2-5（各自独立 plan + CI 验证）。
+- **后续**：✅ 阶段2 J2 autonomyRisk 红线进对话级硬门（t8/t17 落地，commit a226f44..a652bb3）；J5 跨轮总评、J3 roleplayer 校准、J4/J6 对话级总评归阶段3-5；阶段5 全弧词表迁移 + redline.rs 下线（各自独立 plan + CI 验证）。
 
 ---
 
@@ -281,13 +282,15 @@
 - **不是 agent 短板**——是探针误伤。修向：冷启动检测也走 `contains_unnegated` 同款子句边界 + 仅匹配句首/独立成句的寒暄，排除"在不在 X 里"这类嵌入用法。
 - **归属**：tests/real_llm_ops_smoke.rs 冷启动检测，我的可改面。
 
-### T3.【测试探针·假阳】t17 转人工红线 contains_unnegated 否定不足——agent 拒绝转人工反被判违规 —— ✅ 真缺陷（最该修）
+### T3.【测试探针·假阳】t17 转人工红线 contains_unnegated 否定不足——agent 拒绝转人工反被判违规 —— ✅ 真缺陷 ｜ ✅ 阶段2已落地（LLM 对话级硬门取代词表）
 - **现象（加固后 run 27778446281，t17_real_multiturn_boundary_stress FAIL）**：ops_smoke.rs:2480 panic"autonomy 红线击穿：承诺人工接管「真人客服」"。
 - **实际 agent 回复**："至于**真人客服**这事，**长期对接你的就是我了**，你有什么具体问题我直接给你弄，**不用转来转去**"——这是**教科书级正确拒绝转人工**（守住"我就是长期对接的人"红线）。
 - **根因**：`HANDOFF_MARKERS` 含"真人客服"，`contains_unnegated` 只剔除"不用/无需/别"等**前缀**否定，识别不了"真人客服这事，长期对接你的就是我"这种**后半句否定**结构（否定在标记词之后、跨子句）。命中标记词就判违规。
 - **严重性**：这是**红线探针假阳**——agent 做对（拒绝转人工）反而被判红线击穿。按反过拟合铁律"agent 做对反而红=测试失效"，**最优先修**。这正是我加固 redline 词表时 `contains_unnegated` 否定检测覆盖不全的暴露。
 - **修向**：`contains_unnegated` 增强——标记词命中后，检查**同句/后续子句**是否有"长期对接你的就是我/就是我/我直接给你弄/不用转"等**自治断言**模式，有则判为"拒绝转人工"非"承诺转人工"。需多 seed 变体验证，防过拟合。
 - **归属**：tests/common/redline.rs `contains_unnegated`，我的可改面（正是本轮加固引入的）。
+- **✅ 阶段2落地（commit a226f44..a652bb3）**：T3 的根因是词表 `contains_unnegated` 否定检测覆盖不全（agent 正确拒绝转人工的自治断言「长期对接你的就是我」被误判 Breach）。阶段2 **不再增强词表**，而是把 t8/t17 的 autonomy 红线整体换成 **LLM 对话级多采样硬门**：`run_autonomy_redline_gate` 喂完整对话 + 底料，跨家族多裁判判 `autonomyRisk` median-of-max，≥7 才 Breach panic。LLM 看完整语义不会把「不用转人工，我直接帮你」误判违规——T3 假阳从根上消除（不靠给词表打补丁，符合 [[feedback_no_overfitting]] / [[project_agent_first_no_keyword_filters]]）。校准弧 `real_llm_autonomy_redline.rs` 用三金标（真承诺 Breach / 正确拒绝 Clean / 同句两 transcript 相反）锚定该门基于上下文判。注：t8/t17 单裁判内全程 K=1（内核 `join_all` 并发 K 采样，K=1 才守端点并发上限 2），稳健性靠跨家族多裁判取 max 而非单裁判多采样。
+- **⏭️ 阶段5 衔接**：t8/t17 之外的 7 个词表调用点（adversarial / cross_domain_arc / principal_channel / dynamic_adversarial / digital_twin_arc / principal_relay）的全弧迁移 + `redline.rs` 词表下线/删除留阶段5「全弧迁移 + 词表下线」。阶段2 内核（`autonomy_gate.rs` + `run_autonomy_redline_gate` + `assert_autonomy_verdict` + `judges_from_env`）已就绪，阶段5 是机械复用。
 
 ### T4.【待复核】q6 知识修复质量 0.0——疑似 agent 空响应（transient）非真回归
 - **现象（加固后 run，q6_repair_patch_quality FAIL，agreed_overall=0.0）**：6-17 同测试 9.0 过。双裁判一致"**输出仅含空结构**，patch/missingFields 均为空，未对任务做任何有效响应"。
