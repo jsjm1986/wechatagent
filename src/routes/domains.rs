@@ -267,6 +267,20 @@ pub(crate) fn validate_state_machine(machine: &Document) -> AppResult<()> {
         }
         keys.push(key);
     }
+    // H13：非空 states 必须至少有一个 initial:true 态。否则运行时新联系人（from 为空）
+    // 找不到唯一合法迁入目标 → 每次新接触迁移都被 check_state_transition fail-soft 拒绝，
+    // 状态机静默冻结、无报错。满足 spec H13① "缺 initial reject"。空/缺 states 不在此约束
+    // （上方 get_array 缺失即 Ok 早返，空数组是退化机交由 publish/runtime 层处理，逐字保持旧行为）。
+    if !states.is_empty()
+        && !states
+            .iter()
+            .filter_map(|state| state.as_document())
+            .any(|doc| doc.get_bool("initial").unwrap_or(false))
+    {
+        return Err(AppError::BadRequest(
+            "stateMachine must declare at least one initial state (initial:true)".to_string(),
+        ));
+    }
     for state in states {
         let Some(doc) = state.as_document() else {
             continue;
@@ -469,5 +483,38 @@ mod tests {
         };
         let err = validate_state_machine(&machine).unwrap_err();
         assert!(matches!(err, AppError::BadRequest(_)));
+    }
+
+    // H13：非空 states 缺 initial:true → reject（spec H13① "缺 initial reject"）。
+    #[test]
+    fn validate_rejects_state_machine_without_initial() {
+        let machine = doc! {
+            "states": [
+                { "key": "alpha", "allowedFrom": ["alpha"] },
+                { "key": "beta", "allowedFrom": ["alpha", "beta"] }
+            ]
+        };
+        let err = validate_state_machine(&machine).unwrap_err();
+        assert!(matches!(err, AppError::BadRequest(_)));
+    }
+
+    // H13：同样结构但其中一态标 initial:true → 过校验。
+    #[test]
+    fn validate_accepts_state_machine_with_initial() {
+        let machine = doc! {
+            "states": [
+                { "key": "alpha", "initial": true, "allowedFrom": ["alpha"] },
+                { "key": "beta", "allowedFrom": ["alpha", "beta"] }
+            ]
+        };
+        assert!(validate_state_machine(&machine).is_ok());
+    }
+
+    // H13 字节等价红线：DEFAULT 销售状态机（new_contact initial:true）必须仍过校验。
+    #[test]
+    fn validate_accepts_default_sales_machine() {
+        assert!(
+            validate_state_machine(&crate::prompts::default_user_operation_state_machine()).is_ok()
+        );
     }
 }
