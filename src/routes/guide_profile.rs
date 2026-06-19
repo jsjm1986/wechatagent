@@ -531,4 +531,76 @@ mod tests {
             "合法 camelCase 状态机应过校验"
         );
     }
+
+    /// H13 命门 e2e 锁：`generate_domain_profile_candidate` 在 `normalize_json_keys` **之前**
+    /// `as_object_mut().remove("stateMachine")`，让状态机内层 key 保持 camelCase
+    /// （`allowedFrom`，而非 `allowed_from`）。运行期引擎（guards.rs / migrations）读 camelCase
+    /// `allowedFrom`/`allowFromAny`/`initial`；若有人把 remove 挪到 normalize 之后，键会被 snake_case
+    /// 化 → 引擎 `get_array("allowedFrom")` 静默读不到，但 validate_state_machine 仍可能空过
+    /// （它 `let Ok(states) = machine.get_array("states") else { return Ok(()) }`）。
+    /// 本测在单元层钉死该不变量：
+    /// (1) 抽出的 stateMachine 经 `to_document` 后内层仍是 camelCase `allowedFrom`；
+    /// (2) 反证——若 stateMachine 留在 remainder 走 normalize_json_keys，`allowedFrom` 会被
+    ///     mangle 成 `allowed_from`，证明抽取步骤正是防住此 bug 的关键。
+    #[test]
+    fn state_machine_bypasses_snake_casing_via_pre_normalize_extraction() {
+        // 模拟 LLM 顶层输出：camelCase 顶层字段 + camelCase 内层 stateMachine。
+        let mut generated = json!({
+            "displayName": "教培",
+            "stateMachine": {
+                "states": [
+                    { "key": "a", "allowedFrom": ["a"], "initial": true, "allowFromAny": false }
+                ]
+            }
+        });
+
+        // —— 复刻生产抽取顺序：normalize 之前 remove("stateMachine") ——
+        let raw_state_machine = generated
+            .as_object_mut()
+            .and_then(|m| m.remove("stateMachine"))
+            .expect("应抽出 stateMachine");
+
+        // (1) 抽出的 stateMachine 经 to_document 后内层 key 仍是 camelCase。
+        let sm_doc = mongodb::bson::to_document(&raw_state_machine).expect("stateMachine → Document");
+        let states = sm_doc.get_array("states").expect("states 数组应在");
+        let first = states[0].as_document().expect("首态应是 document");
+        assert!(
+            first.get_array("allowedFrom").is_ok(),
+            "抽取绕过 normalize → 内层须保持 camelCase allowedFrom（引擎读这个键）"
+        );
+        assert!(
+            first.get("allowed_from").is_none(),
+            "不应出现 snake_case allowed_from（一旦出现说明被 normalize 误伤）"
+        );
+        assert_eq!(
+            first.get_bool("allowFromAny").ok(),
+            Some(false),
+            "allowFromAny 须保持 camelCase（引擎 get_bool 读这个键）"
+        );
+
+        // remainder（剩余顶层字段）走 normalize：顶层 displayName → display_name（这是期望行为）。
+        let normalized_remainder = normalize_json_keys(generated);
+        assert_eq!(normalized_remainder["display_name"], json!("教培"));
+        assert!(
+            normalized_remainder.get("stateMachine").is_none(),
+            "stateMachine 已被抽出，不应残留在 remainder"
+        );
+
+        // (2) 反证：若 stateMachine 留在 normalize 输入里，内层 allowedFrom 会被 mangle。
+        let mangled = normalize_json_keys(json!({
+            "stateMachine": { "states": [ { "allowedFrom": [] } ] }
+        }));
+        assert!(
+            mangled["state_machine"]["states"][0]
+                .get("allowed_from")
+                .is_some(),
+            "反证：未抽取时 normalize_json_keys 会把 allowedFrom → allowed_from（引擎静默读不到）"
+        );
+        assert!(
+            mangled["state_machine"]["states"][0]
+                .get("allowedFrom")
+                .is_none(),
+            "反证：camelCase allowedFrom 在未抽取路径下消失——这正是抽取步骤要防的 bug"
+        );
+    }
 }
