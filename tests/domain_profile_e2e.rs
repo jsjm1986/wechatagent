@@ -1061,3 +1061,178 @@ async fn e2e_publish_risky_on_draft_lineage_no_pending() {
     let active = db_active_count(&db, &ws).await;
     assert_eq!(active, 0, "草稿血缘 publish 后仍 0 个 active（守人审红线）");
 }
+
+// ── H13：activate 联动 publish 状态机本体到 operation_domain_configs ──────────────
+// 引导层 AI 生成的行业状态机在 activate 时被 publish 成 operation_domain_configs 新 current
+// 版本（消费方零改动）；无本体（DEFAULT 销售域）则 operation_domain_configs 不变（字节等价
+// 回落 DEFAULT）。这两条 Part C 直调真 activate_domain_profile handler 覆盖。
+
+/// 在 `(workspace, user_operations)` 下手插一条 current 底座 config（模拟
+/// `ensure_operation_domains` 已 seed 的默认行；测试 crate 够不到 pub(super) 的
+/// `ensure_operation_domains`，故按 brief 选项 b 手动 insert_one）。
+async fn db_seed_base_domain_config(db: &Database, workspace_id: &str) {
+    let cfg = wechatagent::models::OperationDomainConfig {
+        id: None,
+        workspace_id: workspace_id.to_string(),
+        domain: "user_operations".to_string(),
+        name: "默认销售域".to_string(),
+        goal: "成交".to_string(),
+        methodology: "顾问式".to_string(),
+        workflow: "破冰→挖需→方案→成交".to_string(),
+        tool_policy: "{}".to_string(),
+        automation_policy: "{}".to_string(),
+        review_policy: "{}".to_string(),
+        runtime_parameters: doc! {},
+        state_machine: doc! {
+            "states": [
+                { "key": "new_contact", "name": "初次接触", "initial": true, "allowedFrom": [] },
+            ]
+        },
+        status: "active".to_string(),
+        updated_at: DateTime::now(),
+        version: 1,
+        current_version: true,
+        previous_version: None,
+        seeded_by: Some("test_base".to_string()),
+        principal_decider: None,
+        high_risk_escalation_mode: None,
+    };
+    db.operation_domain_configs()
+        .insert_one(&cfg, None)
+        .await
+        .expect("seed base operation_domain_config");
+}
+
+/// 统计 `(workspace, user_operations)` 下 config 总行数（版本计数）。
+async fn db_domain_config_count(db: &Database, workspace_id: &str) -> u64 {
+    db.operation_domain_configs()
+        .count_documents(
+            doc! { "workspace_id": workspace_id, "domain": "user_operations" },
+            None,
+        )
+        .await
+        .expect("count domain configs")
+}
+
+/// 读 `(workspace, user_operations)` 下 current_version=true 的 config（应至多一条）。
+async fn db_current_domain_config(
+    db: &Database,
+    workspace_id: &str,
+) -> wechatagent::models::OperationDomainConfig {
+    db.operation_domain_configs()
+        .find_one(
+            doc! { "workspace_id": workspace_id, "domain": "user_operations", "current_version": true },
+            None,
+        )
+        .await
+        .expect("find current config")
+        .expect("current config exists")
+}
+
+/// 激活带 generated_state_machine 的 profile → operation_domain_configs publish 一版新
+/// current，其 state_machine 含生成的 state key、版本递增（消费方零改动）。
+#[tokio::test]
+#[ignore]
+async fn e2e_activate_publishes_generated_state_machine() {
+    let app = common::TestApp::start().await;
+    let db = app.state.db.clone();
+    let ws = app.state.config.default_workspace_id.clone();
+
+    // 底座：当前 current 销售域 config（version=1）。
+    db_seed_base_domain_config(&db, &ws).await;
+    let base_count = db_domain_config_count(&db, &ws).await;
+    let base_version = db_current_domain_config(&db, &ws).await.version;
+
+    // 建带本体的 profile，并置 current（activate 要求 current_version=true）。
+    let machine = doc! {
+        "states": [
+            { "key": "x_intro", "name": "开场", "initial": true, "allowedFrom": [] },
+            { "key": "x_deep", "name": "深入", "allowedFrom": ["x_intro"] },
+        ]
+    };
+    let pid = db_create_profile(&db, &ws, "edu-domain", "教育", "教育咨询", "generated_by_ai").await;
+    db.domain_profiles()
+        .update_one(
+            doc! { "_id": pid },
+            doc! { "$set": { "current_version": true, "generated_state_machine": &machine } },
+            None,
+        )
+        .await
+        .expect("set current + machine");
+
+    // 调真 activate handler。
+    let _ = wechatagent::routes::domain_profiles::activate_domain_profile(
+        State(app.state.clone()),
+        Extension(test_admin(&ws)),
+        Path(pid.to_hex()),
+    )
+    .await
+    .expect("activate handler ok");
+
+    // 断言：多出一版 config，新 current 的 state_machine 含 "x_intro"，版本递增。
+    let after_count = db_domain_config_count(&db, &ws).await;
+    assert_eq!(after_count, base_count + 1, "activate 应 publish 一版新 config");
+    let current = db_current_domain_config(&db, &ws).await;
+    assert!(current.version > base_version, "新 current 版本号递增");
+    assert_eq!(current.previous_version, Some(base_version), "previous_version 指向底座版本");
+    let keys: Vec<&str> = current
+        .state_machine
+        .get_array("states")
+        .expect("states array")
+        .iter()
+        .filter_map(|s| s.as_document())
+        .filter_map(|d| d.get_str("key").ok())
+        .collect();
+    assert!(keys.contains(&"x_intro"), "publish 的 state_machine 含生成的 x_intro: {keys:?}");
+    assert!(keys.contains(&"x_deep"), "publish 的 state_machine 含生成的 x_deep: {keys:?}");
+    assert_eq!(
+        current.seeded_by.as_deref(),
+        Some("profile:edu-domain"),
+        "seeded_by 标 profile 溯源"
+    );
+}
+
+/// 激活 generated_state_machine=None 的 profile（如 DEFAULT 销售域）→
+/// operation_domain_configs 不新增版本（字节等价回落 DEFAULT）。
+#[tokio::test]
+#[ignore]
+async fn e2e_activate_without_machine_leaves_configs_unchanged() {
+    let app = common::TestApp::start().await;
+    let db = app.state.db.clone();
+    let ws = app.state.config.default_workspace_id.clone();
+
+    db_seed_base_domain_config(&db, &ws).await;
+    let base_count = db_domain_config_count(&db, &ws).await;
+    let base_version = db_current_domain_config(&db, &ws).await.version;
+
+    // profile 不带本体（generated_state_machine=None，db_create_profile 默认 None）。
+    let pid = db_create_profile(&db, &ws, "no-machine", "默认", "无状态机", "manual").await;
+    db.domain_profiles()
+        .update_one(
+            doc! { "_id": pid },
+            doc! { "$set": { "current_version": true } },
+            None,
+        )
+        .await
+        .expect("set current");
+
+    let _ = wechatagent::routes::domain_profiles::activate_domain_profile(
+        State(app.state.clone()),
+        Extension(test_admin(&ws)),
+        Path(pid.to_hex()),
+    )
+    .await
+    .expect("activate handler ok");
+
+    // 断言：config 表行数、current 版本号均不变（状态机表未被触碰）。
+    assert_eq!(
+        db_domain_config_count(&db, &ws).await,
+        base_count,
+        "无本体 activate 不新增 config 版本（回落 DEFAULT）"
+    );
+    assert_eq!(
+        db_current_domain_config(&db, &ws).await.version,
+        base_version,
+        "current 版本号不变"
+    );
+}

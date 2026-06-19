@@ -957,6 +957,10 @@ mod tests {
             // domain_schemas.rs：D1-b active schema 加载 helper，被 chunk 写侧
             // （apply_chunk_revision）复用做 domain_attributes 校验，不直接绑 HTTP。
             "load_active_domain_schema",
+            // admin_ops_versions.rs：H13 状态机本体 publish helper，被 domain_profiles
+            // 的 activate_domain_profile 复用（profile 激活时联动写 operation_domain_configs
+            // 新 current 版本），不直接绑 HTTP。
+            "publish_state_machine_version",
         ];
 
         let mut handlers: Vec<&str> = Vec::new();

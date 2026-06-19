@@ -33,6 +33,7 @@ use serde_json::{json, Value};
 use crate::{
     agent::taxonomy::invalidate_global_taxonomy_cache,
     auth::AuthenticatedAdmin,
+    db::Database,
     error::{AppError, AppResult},
     models::{OperationDomainConfig, OperationStatePolicy, TaxonomyEntry},
 };
@@ -106,6 +107,95 @@ pub(super) async fn publish_operation_domain_version(
         "version": next_version,
         "previousVersion": source.version,
     })))
+}
+
+/// universal/H13：把一份**新的状态机本体** publish 成 `operation_domain_configs`
+/// 在 `(workspace_id, domain)` 下的新 current 版本——复用 [`publish_operation_domain_version`]
+/// 的「克隆当前 current 行、只换 state_machine、version+1、insert-new-current 后 demote 其余」
+/// 逻辑，但本体由调用方注入（profile activate 联动），而非沿用旧行的 state_machine。
+///
+/// 这是「消费方零改动」的关键：运行时引擎照旧按 `(workspace_id, domain, current_version=true)`
+/// 读 `operation_domain_configs`，本 helper 把行业状态机塞进同一张表的新版本，引擎无感切换。
+///
+/// **edge case（无 current 行）**：正常路径下 `ensure_operation_domains` 会在 workspace
+/// 首次落地时 seed 一条 DEFAULT current 行，所以这里一般能找到。为保持本 helper 无副作用
+/// 且不引入跨模块 seed 依赖，选择**更简单稳健**的方案：找不到 current 行时只
+/// `tracing::warn!` 并 `Ok(())` 返回（不 crash、不阻塞 activate）——activate 已成功，状态机
+/// 联动是 best-effort；缺底座行属于异常部署态，留给 `ensure_operation_domains` 兜底而非在此
+/// 凭空造一条无 name/goal/methodology 的半残行。
+///
+/// 事务性：与现有 publish handler 一致——本代码库不使用 MongoDB 多文档事务，沿用
+/// 「先 insert 新 current，再 demote 其余」的 best-effort 顺序，保证「至多一条 current」
+/// 不变量在正常完成时成立。
+pub(crate) async fn publish_state_machine_version(
+    db: &Database,
+    workspace_id: &str,
+    domain: &str,
+    new_state_machine: Document,
+    seeded_by: String,
+) -> AppResult<()> {
+    let coll = db.operation_domain_configs();
+    let Some(source) = coll
+        .find_one(
+            doc! {
+                "workspace_id": workspace_id,
+                "domain": domain,
+                "current_version": true,
+            },
+            None,
+        )
+        .await?
+    else {
+        tracing::warn!(
+            workspace_id,
+            domain,
+            "publish_state_machine_version: no current operation_domain_config row; skip publish (ensure_operation_domains 未 seed 底座)"
+        );
+        return Ok(());
+    };
+
+    let scope = doc! {
+        "workspace_id": workspace_id,
+        "domain": domain,
+    };
+    let next_version = next_version_for_scope(db.operation_domain_configs(), scope).await?;
+    let now = DateTime::now();
+    // 克隆当前 current 行的全部非 state_machine 字段（name/goal/methodology/…一一保留），
+    // 只把 state_machine 换成注入的本体——这正是「消费方零改动」的保证。
+    let new_entry = OperationDomainConfig {
+        id: None,
+        workspace_id: source.workspace_id.clone(),
+        domain: source.domain.clone(),
+        name: source.name,
+        goal: source.goal,
+        methodology: source.methodology,
+        workflow: source.workflow,
+        tool_policy: source.tool_policy,
+        automation_policy: source.automation_policy,
+        review_policy: source.review_policy,
+        runtime_parameters: source.runtime_parameters,
+        state_machine: new_state_machine,
+        status: "active".to_string(),
+        updated_at: now,
+        version: next_version,
+        current_version: true,
+        previous_version: Some(source.version),
+        seeded_by: Some(seeded_by),
+        principal_decider: source.principal_decider,
+        high_risk_escalation_mode: source.high_risk_escalation_mode,
+    };
+    let inserted = coll.insert_one(&new_entry, None).await?;
+    coll.update_many(
+        doc! {
+            "workspace_id": workspace_id,
+            "domain": domain,
+            "_id": { "$ne": inserted.inserted_id.as_object_id() },
+        },
+        doc! { "$set": { "current_version": false, "updated_at": now } },
+        None,
+    )
+    .await?;
+    Ok(())
 }
 
 pub(super) async fn rollout_operation_domain_version(
