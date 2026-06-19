@@ -494,6 +494,34 @@ pub async fn activate_domain_profile(
         None,
     )
     .await?;
+    // universal/H13：若该 profile 携带 AI 生成的状态机本体，activate 时把它 publish 成
+    // `operation_domain_configs` 在 `(workspace, user_operations)` 下的新 current 版本——
+    // 运行时引擎照旧按 `(workspace, domain, current_version=true)` 读表，零改动即拿到行业
+    // 状态机。`None`（如 DEFAULT 销售域）→ 不动状态机表 → 运行时字节等价回落 DEFAULT。
+    if let Some(machine) = target.generated_state_machine.as_ref() {
+        // 防御性二次校验：profile 草稿在生成后若被手改成非法状态机，这里跳过 publish 而
+        // 不阻塞 activate（profile 已激活；坏本体只意味着保留上一版状态机）。
+        match crate::routes::domains::validate_state_machine(machine) {
+            Ok(()) => {
+                super::admin_ops_versions::publish_state_machine_version(
+                    &state.db,
+                    &target.workspace_id,
+                    crate::agent::domain::USER_OPS_DOMAIN_ID,
+                    machine.clone(),
+                    format!("profile:{}", target.profile_id),
+                )
+                .await?;
+            }
+            Err(err) => {
+                tracing::warn!(
+                    profile_id = %target.profile_id,
+                    workspace_id = %target.workspace_id,
+                    error = %err,
+                    "activate: generated_state_machine 校验失败，跳过 publish（保留上一版状态机）"
+                );
+            }
+        }
+    }
     invalidate_global_domain_profile_cache();
     Ok(Json(json!({ "ok": true, "activated": target.profile_id })))
 }
