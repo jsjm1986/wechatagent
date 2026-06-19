@@ -844,6 +844,9 @@ pub fn default_domain_profile(workspace_id: &str) -> DomainProfile {
         // I：DEFAULT 不覆盖 answeringMode 三档释义/标签 → completeness prompt 三档释义
         // 与前端档位标签保留写死销售文案（prompt 字节等价、UI 标签不变）。
         answering_mode_profile: None,
+        // H13：DEFAULT 不携带生成的状态机本体 → activate 不动状态机，运行时回落现有
+        // DEFAULT 销售 9 态（不造双真相源）。引导层生成 profile 时联动写入本字段。
+        generated_state_machine: None,
         version: 1,
         current_version: true,
         previous_version: None,
