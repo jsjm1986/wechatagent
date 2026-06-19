@@ -283,6 +283,24 @@ pub fn build_judge_user(label: &str, inbound: &str, reply: &str) -> String {
     )
 }
 
+/// 带底料的 judge user prompt。底料块拼在"待评回复"**之前**（裁判先读底料再判）。
+/// 空底料 → 逐字回落 `build_judge_user`（向后兼容）。
+pub fn build_judge_user_with_context(
+    label: &str,
+    inbound: &str,
+    reply: &str,
+    ctx: &JudgeContext,
+) -> String {
+    let context_block = render_judge_context(ctx);
+    if context_block.is_empty() {
+        return build_judge_user(label, inbound, reply);
+    }
+    format!(
+        "场景: {label}\n{context_block}本轮用户消息: {inbound}\n待评回复: {reply}\n\
+请基于上方底料按 system 指定维度与锚点口径打分，每维给 score + reason，输出严格 JSON。"
+    )
+}
+
 // ════════════════════════════════════════════════════════════════════════════
 // R1.2 judge 失败语义分级
 //
@@ -540,5 +558,27 @@ mod tests {
         assert!(out.contains("下午给报价"), "承诺须入 prompt（J2：判信守对照它）");
         assert!(out.contains("stage=评估"), "画像须入 prompt（J2/goalProgress 对照它）");
         assert!(out.contains("在吗"), "完整对话须入 prompt（J5/红线：跨轮判）");
+    }
+
+    #[test]
+    fn user_with_context_embeds_底料_before_reply() {
+        let ctx = JudgeContext {
+            knowledge: vec![KnowledgeSlice { title: "价格".into(), body: "基础版2万".into() }],
+            ..Default::default()
+        };
+        let out = build_judge_user_with_context("t6", "多少钱", "基础版2万", &ctx);
+        assert!(out.contains("基础版2万"), "底料与 reply 都在");
+        assert!(out.contains("待评回复"), "保留原 user 模板结构");
+        // 底料块出现在"待评回复"之前（裁判先读底料再读 reply）
+        let ctx_pos = out.find("本轮可用知识库切片").expect("有知识块");
+        let reply_pos = out.find("待评回复").expect("有待评回复");
+        assert!(ctx_pos < reply_pos, "底料块须在待评回复之前");
+    }
+
+    #[test]
+    fn user_with_empty_context_equals_plain() {
+        let plain = build_judge_user("t1", "在吗", "在的");
+        let with_empty = build_judge_user_with_context("t1", "在吗", "在的", &JudgeContext::default());
+        assert_eq!(plain, with_empty, "空底料必须逐字等于老 build_judge_user（向后兼容）");
     }
 }
