@@ -276,6 +276,25 @@ pub(crate) fn dimension_value_weights(
     out
 }
 
+/// 某 `kind` 在缓存里是否有任何字典条目（account 私有 scope 或 global）。
+///
+/// 用于区分「字典未配置（该 kind 整个为空）」与「字典有条目但此值越界」——前者属
+/// 「未约束」应回退信任原值（与 [`dimension_value_weights`] 空缓存回落 DEFAULT、
+/// `decision_taxonomy::classify_decision_tags` 对 dict-miss 软处理一致），后者是真越界
+/// 按写入通道处置（机器 drop / admin reject）。`check_value` 对两种情况都返回
+/// `CandidateNew`，无法区分，故由调用方（`dimension_registry::lookup_dict`）配合本函数判别。
+///
+/// 调用方负责保证 cache 已加载。读 [scope, "global"] 两层，任一有非空 entries 即 true。
+pub(crate) fn kind_has_entries(kind: &str, scope_account_id: &str, cache: &TaxonomyCache) -> bool {
+    let inner = cache.inner.lock();
+    [scope_account_id, "global"].iter().any(|s| {
+        inner
+            .entries
+            .get(&(s.to_string(), kind.to_string()))
+            .is_some_and(|e| !e.is_empty())
+    })
+}
+
 /// 异步 upsert 候选。
 ///
 /// 行为：
@@ -851,5 +870,45 @@ mod tests {
             cache.is_stale(),
             "invalidate must trigger reload on next find_or_load"
         );
+    }
+
+    /// `kind_has_entries`：该 kind 在缓存里有非空 entries（global 或 account scope）→ true。
+    #[test]
+    fn kind_has_entries_true_when_configured() {
+        let cache = make_cache_with_entries(vec![make_entry(
+            "global",
+            "customer_stage",
+            "first_contact",
+            &[],
+            "active",
+        )]);
+        assert!(kind_has_entries("customer_stage", "acct-1", &cache));
+        // account 私有 scope 也算（命中任一层即 true）。
+        let cache2 = make_cache_with_entries(vec![make_entry(
+            "acct-1",
+            "customer_stage",
+            "first_contact",
+            &[],
+            "active",
+        )]);
+        assert!(kind_has_entries("customer_stage", "acct-1", &cache2));
+    }
+
+    /// `kind_has_entries`：该 kind 字典整个为空（未配置，如 m012 删 seed 后）→ false。
+    /// 这是「字典未配置→回退信任」与「有条目但越界→drop」分流的判据。
+    #[test]
+    fn kind_has_entries_false_when_empty() {
+        // 缓存里只有别的 kind，customer_stage 整个未配置。
+        let cache = make_cache_with_entries(vec![make_entry(
+            "global",
+            "intent_level",
+            "high",
+            &[],
+            "active",
+        )]);
+        assert!(!kind_has_entries("customer_stage", "acct-1", &cache));
+        // 完全空缓存。
+        let empty = make_cache_with_entries(vec![]);
+        assert!(!kind_has_entries("customer_stage", "acct-1", &empty));
     }
 }

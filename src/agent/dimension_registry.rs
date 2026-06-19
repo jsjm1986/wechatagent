@@ -89,15 +89,19 @@ pub(crate) enum DimValidation {
     DropSilently,
 }
 
-/// 字典查询结果（把 taxonomy::check_value 四变体窄化为校验所需三态）。
+/// 字典查询结果（把 taxonomy::check_value 四变体窄化为校验所需四态）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum DictLookup {
     /// Active(canonical) 或 Deprecated：字典登记过的合法值。
     Known,
     /// AliasActive → 归一目标 canonical_id。
     Alias(String),
-    /// CandidateNew：字典真无（越界）。
+    /// CandidateNew **且该 kind 字典有其它条目**：值真越界（字典里没这个值）。
     Miss,
+    /// 该 kind 字典整个为空（未配置）。与 Miss 区分：未配置不是越界，属「未约束」，
+    /// 回退信任原值（对齐 taxonomy::dimension_value_weights 空缓存回落 DEFAULT、
+    /// decision_taxonomy 对 dict-miss 软处理）。由 lookup_dict 配合 kind_has_entries 判别。
+    KindUnconfigured,
 }
 
 /// 纯决策：给定维度契约 + 字典查询结果 + 原始值 + 写入意图 → 校验结论。无 IO，完全可单测。
@@ -116,6 +120,12 @@ pub(crate) fn classify_validation(
         ValueSource::Taxonomy => match dict {
             DictLookup::Known => DimValidation::Accept(trimmed.to_string()),
             DictLookup::Alias(canonical) => DimValidation::Accept(canonical),
+            // 该 kind 字典整个未配置（如 m012 删 seed 后、运营未在 admin 重配）：属「未约束」，
+            // 所有写入意图（含 AdminWrite/AdminDirect）一致回退信任原值——字典未配置不是写入方
+            // 的错，此处 Reject/Drop 会让合法 stage 也写不进，复现 customer_stage 永不落库的回归。
+            // 与 taxonomy::dimension_value_weights 空缓存回落 DEFAULT、decision_taxonomy 对
+            // dict-miss 软处理一致（未配置=不约束）。
+            DictLookup::KindUnconfigured => DimValidation::Accept(trimmed.to_string()),
             DictLookup::Miss => {
                 // admin 是权威直接写入方，任何维度越界都当场报错纠正；
                 // AdminDirect 通道（如 relationship_type）即便机器路径越界也报错。
@@ -145,17 +155,25 @@ fn match_to_dict(m: crate::agent::taxonomy::TaxonomyMatch) -> DictLookup {
 }
 
 /// 字典查询薄壳：取进程级 taxonomy cache（懒加载兜底），把 TaxonomyMatch 四变体
-/// 映射为 DictLookup 三态（映射逻辑见 match_to_dict）。
+/// 映射为 DictLookup（映射逻辑见 match_to_dict）。Miss 再经 kind_has_entries 细分：
+/// 该 kind 字典整个为空 → KindUnconfigured（未配置，回退信任）；有条目仅此值越界 → Miss。
 async fn lookup_dict(
     db: &crate::db::Database,
     kind: &str,
     trimmed: &str,
     scope_account_id: &str,
 ) -> DictLookup {
-    use crate::agent::taxonomy::{check_value, global_taxonomy_cache};
+    use crate::agent::taxonomy::{check_value, global_taxonomy_cache, kind_has_entries};
     let cache = global_taxonomy_cache();
     cache.find_or_load(db).await;
-    match_to_dict(check_value(kind, trimmed, scope_account_id, &cache))
+    match match_to_dict(check_value(kind, trimmed, scope_account_id, &cache)) {
+        // check_value 对「字典空」与「值越界」都回 CandidateNew→Miss，这里用 kind_has_entries
+        // 细分：该 kind 无任何条目 → KindUnconfigured（未配置）。同一 cache，无中途 reload。
+        DictLookup::Miss if !kind_has_entries(kind, scope_account_id, &cache) => {
+            DictLookup::KindUnconfigured
+        }
+        other => other,
+    }
 }
 
 /// DB 薄壳：查 registry + 字典，委托 classify_validation。未知 kind → 直通信任。
@@ -227,7 +245,7 @@ mod tests {
 
     #[test]
     fn classify_admin_direct_rejects_out_of_dict() {
-        // relationship_type=AdminDirect+Taxonomy：字典真无(CandidateNew) → Reject。
+        // relationship_type=AdminDirect+Taxonomy：字典有条目但此值越界(Miss) → Reject。
         // 即便是机器路径写（MachineWrite），AdminDirect 通道仍恒 Reject。
         let spec = spec_for("relationship_type").unwrap();
         let r = classify_validation(spec, DictLookup::Miss, "瞎编关系", WriteIntent::MachineWrite);
@@ -236,10 +254,53 @@ mod tests {
 
     #[test]
     fn classify_llm_signals_drops_out_of_dict() {
-        // customer_stage=LlmSignals+Taxonomy：机器路径字典真无(CandidateNew) → DropSilently（不阻断已发送）。
+        // customer_stage=LlmSignals+Taxonomy：机器路径字典有条目但此值越界(Miss) → DropSilently（不阻断已发送）。
         let spec = spec_for("customer_stage").unwrap();
         let r = classify_validation(spec, DictLookup::Miss, "臆造态", WriteIntent::MachineWrite);
         assert!(matches!(r, DimValidation::DropSilently));
+    }
+
+    #[test]
+    fn classify_kind_unconfigured_accepts_machine() {
+        // 红线①（本次修复核心）：customer_stage 字典整个未配置（m012 删 seed + 运营未重配）时，
+        // 机器路径产出的值回退信任原值，**不 drop**——否则 customer_stage 永不落库、停滞催跟/
+        // 再激活全死。区别于 Miss（字典有条目但越界 → drop）。
+        let spec = spec_for("customer_stage").unwrap();
+        let r = classify_validation(
+            spec,
+            DictLookup::KindUnconfigured,
+            "relationship_building",
+            WriteIntent::MachineWrite,
+        );
+        assert!(matches!(r, DimValidation::Accept(ref c) if c == "relationship_building"));
+    }
+
+    #[test]
+    fn classify_kind_unconfigured_accepts_admin() {
+        // 字典未配置时 admin 直写也回退信任（未配置不是 admin 的错，Reject 会让 admin 也写不进）。
+        let spec = spec_for("customer_stage").unwrap();
+        let r = classify_validation(
+            spec,
+            DictLookup::KindUnconfigured,
+            "need_discovery",
+            WriteIntent::AdminWrite,
+        );
+        assert!(matches!(r, DimValidation::Accept(ref c) if c == "need_discovery"));
+    }
+
+    #[test]
+    fn classify_kind_unconfigured_accepts_admin_direct() {
+        // AdminDirect 通道（relationship_type）在字典未配置时也 Accept（一致回退信任）——
+        // 与 Miss 下 AdminDirect 恒 Reject（classify_admin_direct_rejects_out_of_dict）对照：
+        // 「未配置」与「有条目但越界」是两种语义。
+        let spec = spec_for("relationship_type").unwrap();
+        let r = classify_validation(
+            spec,
+            DictLookup::KindUnconfigured,
+            "customer",
+            WriteIntent::MachineWrite,
+        );
+        assert!(matches!(r, DimValidation::Accept(ref c) if c == "customer"));
     }
 
     #[test]

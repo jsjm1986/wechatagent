@@ -41,7 +41,6 @@ url = "2"
 [dev-dependencies]
 mockall = "0.13"
 proptest = "1.5"
-serial_test = "=3.5.0"
 testcontainers = "0.23"
 testcontainers-modules = { version = "0.11", features = ["mongo"] }
 wiremock = "0.6"

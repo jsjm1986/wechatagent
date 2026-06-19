@@ -151,6 +151,17 @@ impl TestApp {
             .expect("运行测试 mongo 迁移失败");
         db.ensure_indexes().await.expect("创建测试 mongo 索引失败");
 
+        // 重新 seed 销售域字典（customer_stage / intent_level / objection_type）。
+        // m012_drop_legacy_taxonomy_seed 在非 production 环境会删掉 m006 的这三 kind seed
+        // （生产靠 APP_ENV=production 守卫跳过删除、字典保留），测试 DB 跑完全部迁移后这三
+        // kind 字典为空。经 validate_dimension_value(Taxonomy) 校验的维度（如 customer_stage）
+        // 会因字典 miss 被判 CandidateNew → DropSilently → 键被移除，C2 operation_state 派生
+        // 回落 decision.operation_state。复用 m006 的 upsert seed（与生产同源，不抄数据）补回，
+        // 让测试 DB 字典状态对齐 production 实例。
+        wechatagent::db::migrations::m006_taxonomy_seed::run_step(&db)
+            .await
+            .expect("重新 seed 销售域 taxonomy 失败");
+
         let llm: Arc<TestLlmGenerator> = Arc::new(TestLlmGenerator::default());
 
         let config = test_config(uri, db_name);
@@ -163,14 +174,10 @@ impl TestApp {
         .await
         .expect("种入默认 prompt pack 失败");
 
-        // 与 main.rs:83 对齐：迁移种入 system_taxonomies（m006）后强制预热进程级
-        // taxonomy 缓存。缓存是 LazyLock 单例 + 30s TTL，跨同一 test binary 内多个
-        // #[tokio::test] 复用；不在此处按**本测试自己的** DB 强制 reload 的话，缓存会
-        // 停留在「最先 find_or_load 的那个测试的 ephemeral testcontainer DB」内容上，
-        // 导致后续测试 check_value 查不到本测试 DB 里的字典项（CandidateNew→DropSilently），
-        // 把经 validate_dimension_value 的维度（如 customer_stage）误判为字典外而丢弃。
-        // warm_up 内部**忽略 TTL** 无条件 reload，故每个 TestApp::start 都会把全局缓存
-        // 对齐到自己的 DB；m006 全局 scope 字典在每个测试 DB 内容一致，并发竞争无害。
+        // 预热进程级 taxonomy 缓存（LazyLock 单例 + 30s TTL），与 main.rs:83 对齐。
+        // 上面已 re-seed 销售域字典，这里把缓存对齐到本测试 DB 的字典内容，使后续
+        // check_value / validate_dimension_value 能命中（否则缓存可能停留在空字典或
+        // 别的测试 DB 状态）。warm_up 内部忽略 TTL 无条件 reload。
         wechatagent::agent::init_global_taxonomy_cache(&db).await;
 
         // 同理预热**第二个**进程级 TTL 单例：active DomainProfile 缓存（domain_profile.rs
