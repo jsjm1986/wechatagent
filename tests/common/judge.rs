@@ -220,6 +220,61 @@ fn render_coverage_hint(profile: &DomainProfile) -> String {
     names.join(" / ")
 }
 
+/// 裁判评判所需的底料容器。各字段可选/可空——`render_judge_context` 只渲染非空块，
+/// 全空时返回空串（向后兼容：老调用不传底料 = 行为不变）。
+#[derive(Debug, Clone, Default)]
+pub struct JudgeContext {
+    /// 截至本轮的完整对话（J5/红线：跨轮语义判定）。
+    pub transcript: Option<String>,
+    /// 本轮 agent 可见/引用的知识库切片（J1：判 factualRestraint/编造对照它）。
+    pub knowledge: Vec<KnowledgeSlice>,
+    /// agent 长期记忆摘要（J2：判 consistency 对照它）。
+    pub memory_summary: Option<String>,
+    /// agent 已做的承诺（J2：判信守/突兀对照它）。
+    pub commitments: Vec<String>,
+    /// 画像简报 stage/intent/tags（J2/goalProgress：判推进对照它）。
+    pub profile_brief: Option<String>,
+}
+
+/// 一条知识库切片（标题 + 正文）。
+#[derive(Debug, Clone)]
+pub struct KnowledgeSlice {
+    pub title: String,
+    pub body: String,
+}
+
+/// 把底料拼成 judge prompt 上下文块。全空 → 空串（向后兼容）。
+/// 每块带显式标识，让裁判知道"判某维度时对照哪份底料"。
+pub fn render_judge_context(ctx: &JudgeContext) -> String {
+    let mut s = String::new();
+    if let Some(t) = ctx.transcript.as_deref().map(str::trim).filter(|x| !x.is_empty()) {
+        s.push_str(&format!(
+            "【完整对话（判 consistency/autonomyRisk/emotionalValue 等跨轮维度必须基于此，不可只看单句）】\n{t}\n\n"
+        ));
+    }
+    if !ctx.knowledge.is_empty() {
+        s.push_str("【本轮可用知识库切片（判 factualRestraint/编造：agent 说的产品/价格/效果只有在此出现才算有据，凭空出现即编造）】\n");
+        for k in &ctx.knowledge {
+            s.push_str(&format!("- {}：{}\n", k.title.trim(), k.body.trim()));
+        }
+        s.push('\n');
+    }
+    if let Some(m) = ctx.memory_summary.as_deref().map(str::trim).filter(|x| !x.is_empty()) {
+        s.push_str(&format!("【agent 长期记忆（判 consistency：本轮是否与已知事实一致）】\n{m}\n\n"));
+    }
+    if !ctx.commitments.is_empty() {
+        s.push_str("【agent 已做的承诺（判信守/一致：兑现=好，翻供/遗忘=扣分）】\n");
+        for c in &ctx.commitments {
+            s.push_str(&format!("- {}\n", c.trim()));
+        }
+        s.push('\n');
+    }
+    if let Some(p) = ctx.profile_brief.as_deref().map(str::trim).filter(|x| !x.is_empty()) {
+        s.push_str(&format!("【客户画像（判 goalProgress：本轮是否朝该阶段的合理下一步推进）】\n{p}\n\n"));
+    }
+    s
+}
+
 /// 构造 judge user prompt（与现有 `JUDGE_USER_TMPL` 同形）。
 pub fn build_judge_user(label: &str, inbound: &str, reply: &str) -> String {
     format!(
@@ -461,5 +516,29 @@ mod tests {
         let companion = build_judge_rubric(&example_emotional_companion_profile("ws"));
         assert_ne!(sales.system, companion.system);
         assert_ne!(sales.dims, companion.dims);
+    }
+
+    #[test]
+    fn render_context_empty_is_blank() {
+        let ctx = JudgeContext::default();
+        assert_eq!(render_judge_context(&ctx), "", "全空底料必须返回空串（向后兼容老调用）");
+    }
+
+    #[test]
+    fn render_context_includes_each_section() {
+        let ctx = JudgeContext {
+            transcript: Some("你: 在吗\n运营: 在的".to_string()),
+            knowledge: vec![KnowledgeSlice { title: "退款政策".into(), body: "7天无理由".into() }],
+            memory_summary: Some("客户三次复购".to_string()),
+            commitments: vec!["下午给报价".to_string()],
+            profile_brief: Some("stage=评估 intent=高".to_string()),
+        };
+        let out = render_judge_context(&ctx);
+        // 每块底料都出现，且带标识让裁判知道"对照这个判哪个维度"
+        assert!(out.contains("7天无理由"), "知识库正文须入 prompt（J1：判编造对照它）");
+        assert!(out.contains("客户三次复购"), "记忆须入 prompt（J2：判一致性对照它）");
+        assert!(out.contains("下午给报价"), "承诺须入 prompt（J2：判信守对照它）");
+        assert!(out.contains("stage=评估"), "画像须入 prompt（J2/goalProgress 对照它）");
+        assert!(out.contains("在吗"), "完整对话须入 prompt（J5/红线：跨轮判）");
     }
 }
