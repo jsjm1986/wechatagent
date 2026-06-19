@@ -43,6 +43,64 @@ use super::AppState;
 
 /// ── operation_domain_configs ──────────────────────────────────────────────────
 
+/// 插入一版新 current [`OperationDomainConfig`] 并 demote 同 `(workspace_id, domain)`
+/// scope 其余行。复用 [`publish_operation_domain_version`] 与
+/// [`publish_state_machine_version`] 的共同逻辑（构造新行→insert→demote 其余）。
+///
+/// 新行克隆 `source` 的全部字段，**除了** `state_machine`（由参数注入）/ `status`（恒
+/// `"active"`）/ `version`（= `next_version`）/ `current_version`（恒 `true`）/
+/// `previous_version`（= `Some(source.version)`）/ `seeded_by`（由参数注入）/
+/// `updated_at`（= `now`）/ `id`（恒 `None`）。
+///
+/// 事务性：本代码库不使用 MongoDB 多文档事务，沿用「先 insert 新 current，再 demote
+/// 其余」的 best-effort 顺序（与两个原实现逐字一致），保证「至多一条 current」不变量在
+/// 正常完成时成立。返回新插入行的 [`ObjectId`](mongodb::bson::oid::ObjectId)。
+async fn insert_new_current_domain_config(
+    coll: &mongodb::Collection<OperationDomainConfig>,
+    source: &OperationDomainConfig,
+    state_machine: Document,
+    next_version: i32,
+    seeded_by: String,
+    now: DateTime,
+) -> AppResult<mongodb::bson::oid::ObjectId> {
+    let new_entry = OperationDomainConfig {
+        id: None,
+        workspace_id: source.workspace_id.clone(),
+        domain: source.domain.clone(),
+        name: source.name.clone(),
+        goal: source.goal.clone(),
+        methodology: source.methodology.clone(),
+        workflow: source.workflow.clone(),
+        tool_policy: source.tool_policy.clone(),
+        automation_policy: source.automation_policy.clone(),
+        review_policy: source.review_policy.clone(),
+        runtime_parameters: source.runtime_parameters.clone(),
+        state_machine,
+        status: "active".to_string(),
+        updated_at: now,
+        version: next_version,
+        current_version: true,
+        previous_version: Some(source.version),
+        seeded_by: Some(seeded_by),
+        principal_decider: source.principal_decider.clone(),
+        high_risk_escalation_mode: source.high_risk_escalation_mode.clone(),
+    };
+    let inserted = coll.insert_one(&new_entry, None).await?;
+    let inserted_id = inserted.inserted_id.as_object_id();
+    coll.update_many(
+        doc! {
+            "workspace_id": &source.workspace_id,
+            "domain": &source.domain,
+            "_id": { "$ne": inserted_id },
+        },
+        doc! { "$set": { "current_version": false, "updated_at": now } },
+        None,
+    )
+    .await?;
+    inserted_id
+        .ok_or_else(|| AppError::External("inserted operation domain config has no _id".to_string()))
+}
+
 pub(super) async fn publish_operation_domain_version(
     State(state): State<AppState>,
     Extension(admin): Extension<AuthenticatedAdmin>,
@@ -68,42 +126,18 @@ pub(super) async fn publish_operation_domain_version(
     )
     .await?;
     let now = DateTime::now();
-    let new_entry = OperationDomainConfig {
-        id: None,
-        workspace_id: source.workspace_id.clone(),
-        domain: source.domain.clone(),
-        name: source.name,
-        goal: source.goal,
-        methodology: source.methodology,
-        workflow: source.workflow,
-        tool_policy: source.tool_policy,
-        automation_policy: source.automation_policy,
-        review_policy: source.review_policy,
-        runtime_parameters: source.runtime_parameters,
-        state_machine: source.state_machine,
-        status: "active".to_string(),
-        updated_at: now,
-        version: next_version,
-        current_version: true,
-        previous_version: Some(source.version),
-        seeded_by: Some("manual".to_string()),
-        principal_decider: source.principal_decider,
-        high_risk_escalation_mode: source.high_risk_escalation_mode,
-    };
-    let inserted = coll.insert_one(&new_entry, None).await?;
-    coll.update_many(
-        doc! {
-            "workspace_id": &source.workspace_id,
-            "domain": &source.domain,
-            "_id": { "$ne": inserted.inserted_id.as_object_id() },
-        },
-        doc! { "$set": { "current_version": false, "updated_at": now } },
-        None,
+    let inserted_id = insert_new_current_domain_config(
+        &coll,
+        &source,
+        source.state_machine.clone(),
+        next_version,
+        "manual".to_string(),
+        now,
     )
     .await?;
     Ok(Json(json!({
         "ok": true,
-        "id": inserted.inserted_id.as_object_id().map(|i| i.to_hex()).unwrap_or_default(),
+        "id": inserted_id.to_hex(),
         "version": next_version,
         "previousVersion": source.version,
     })))
@@ -166,37 +200,22 @@ pub(crate) async fn publish_state_machine_version(
     let policy_seeded_by = format!("statemachine_publish:{seeded_by}");
     // 克隆当前 current 行的全部非 state_machine 字段（name/goal/methodology/…一一保留），
     // 只把 state_machine 换成注入的本体——这正是「消费方零改动」的保证。
-    let new_entry = OperationDomainConfig {
-        id: None,
-        workspace_id: source.workspace_id.clone(),
-        domain: source.domain.clone(),
-        name: source.name,
-        goal: source.goal,
-        methodology: source.methodology,
-        workflow: source.workflow,
-        tool_policy: source.tool_policy,
-        automation_policy: source.automation_policy,
-        review_policy: source.review_policy,
-        runtime_parameters: source.runtime_parameters,
-        state_machine: new_state_machine,
-        status: "active".to_string(),
-        updated_at: now,
-        version: next_version,
-        current_version: true,
-        previous_version: Some(source.version),
-        seeded_by: Some(seeded_by),
-        principal_decider: source.principal_decider,
-        high_risk_escalation_mode: source.high_risk_escalation_mode,
-    };
-    let inserted = coll.insert_one(&new_entry, None).await?;
-    coll.update_many(
-        doc! {
-            "workspace_id": workspace_id,
-            "domain": domain,
-            "_id": { "$ne": inserted.inserted_id.as_object_id() },
-        },
-        doc! { "$set": { "current_version": false, "updated_at": now } },
-        None,
+    // 派生 policy 时还要读机器里的 states，故先取一份 states 列表再把本体 move 进 helper。
+    let states = new_state_machine
+        .get_array("states")
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|item| item.as_document().cloned())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    insert_new_current_domain_config(
+        &coll,
+        &source,
+        new_state_machine,
+        next_version,
+        seeded_by,
+        now,
     )
     .await?;
 
@@ -210,15 +229,6 @@ pub(crate) async fn publish_state_machine_version(
     // best-effort：与本 helper 整体一致（无 current 行时 warn+Ok）——单个 state 的 policy
     // 派生失败只 `warn!` 并继续下一个，绝不 `?` 传播出去把已成功的 activate/publish 拖垮。
     // 一个坏 state 不应让后续 state 的 policy 漏派生，故 per-state warn-and-continue。
-    let states = new_entry
-        .state_machine
-        .get_array("states")
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|item| item.as_document().cloned())
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
     for state in &states {
         let Some(state_key) = state.get_str("key").ok().filter(|k| !k.is_empty()) else {
             continue;
