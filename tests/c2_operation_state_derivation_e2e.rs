@@ -27,11 +27,24 @@
 //! `c2_state_transition_cross_domain.rs`「命门用确定性测」哲学向全链路的延伸。
 //!
 //! 默认 `#[ignore]`，需要 Docker（testcontainers MongoDB），由 CI integration job 跑。
+//!
+//! ## `#[serial]` 串行化（修 G14 真红根因）
+//! 两测试都 `#[serial]`。根因：`customer_stage` 经 `validate_dimension_value` 查进程级
+//! `GLOBAL_TAXONOMY_CACHE`（LazyLock 单例 + 30s TTL），而本文件每个 `#[tokio::test]` 起
+//! **独立 testcontainer**（各自 ephemeral DB）。并发跑时：测试 A `TestApp::start` 预热缓存
+//! 到 DB-A → 测试 B 预热**整体覆盖**成 DB-B 并刷新 `fetched_at` → 测试 A 跑 gateway 时
+//! `is_stale()` 在 30s 内为 false 跳过 reload，缓存内容与 A 的 DB 错位 → `check_value` 把
+//! 合法的 `customer_stage`（m006 已 seed global active）误判 `CandidateNew` →
+//! `MachineWrite` 判 `DropSilently` → customer_stage 键被移除 → C2 派生（gateway）回落
+//! `decision.operation_state`，断言失败。`init_global_taxonomy_cache` 预热无条件 reload 也
+//! 救不了——并发下两测试互相覆盖单例。`#[serial]` 强制两测试串行，每个测试从预热到 gateway
+//! 之间无并发覆盖窗口，缓存与本测试 DB 始终一致，根治错位。
 
 mod common;
 
 use mongodb::bson::{doc, oid::ObjectId, DateTime, Document};
 use serde_json::json;
+use serial_test::serial;
 use wechatagent::agent::handle_managed_message;
 use wechatagent::models::{AgentStatus, Contact, ConversationMessage, MessageDirection};
 
@@ -187,6 +200,7 @@ async fn reload_operation_state(app: &common::TestApp, contact: &Contact) -> Opt
 ///   不是 need_discovery）→ 同时覆盖「合法迁移写入」与「synced_state 优先级」两段。
 #[tokio::test]
 #[ignore]
+#[serial]
 async fn normal_transition_uses_customer_stage_over_operation_state() {
     let app = common::TestApp::start().await;
     let contact = make_managed_contact("user_c2_legal", "new_contact");
@@ -309,6 +323,7 @@ async fn normal_transition_uses_customer_stage_over_operation_state() {
 ///   ③ reply 仍 approved + outbox 入队（fail-soft 不阻断）。
 #[tokio::test]
 #[ignore]
+#[serial]
 async fn illegal_transition_keeps_old_state_and_audits_failsoft() {
     let app = common::TestApp::start().await;
     let contact = make_managed_contact("user_c2_illegal", "new_contact");
