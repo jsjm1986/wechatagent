@@ -205,15 +205,17 @@
 
 > 起因：jsjm1986 指出"裁判应在长对话中打分、不能脱离上下文一句一句判"。顺完整业务流程（webhook→决策→知识→评审→发送→跨轮）排查同类问题，发现 5 个"评判输入不完整/评判方式失真"缺陷。**全部代码坐实，非猜测。** 共性=判某维度却不给该维度所依赖的底料，导致裁判凭语感猜，评判失真。这比单个 agent 短板更伤——污染的是**所有依赖该裁判的判定**。
 
-### J1.【最伤·grounding 底料缺失】factualRestraint 判"编造"时裁判看不到真实知识库 —— ✅ 真缺陷
+### J1.【最伤·grounding 底料缺失】factualRestraint 判"编造"时裁判看不到真实知识库 —— ✅ 真缺陷 ｜ ✅ 阶段1已落地
 - **坐实**：judge system prompt（adversarial.rs:480 区）判 factualRestraint 纯靠"语气像不像保守/有没有绝对化承诺"。`run_panel`(811) 入参无知识库切片。
 - **病根**："编造"的定义本是"说了 `operation_knowledge_chunks` 里没有的东西"——但裁判**没拿到知识内容**，只能凭语感猜。agent 说"这功能支持 X"，裁判无从知 X 是真有还是编的。**判 grounding 类维度却不给 ground**，与"判红线却不给上下文"完全同构。
 - **影响**：factualRestraint / 知识捏造弧的判定底料不可靠。Q2/q6 质量弧可能也受此影响（裁判判抽取质量但对照基准不全）。
+- **✅ 阶段1落地（commit 751cda8..257891e）**：`JudgeContext.knowledge` 携带本轮可用知识库切片正文（T1 `render_judge_context`），`build_judge_user_with_context` 把切片拼进 judge user prompt（T2），`collect_judge_context` 从最近一条 `knowledge_usage_log` 引用的 chunk 真实采集（T4），rubric factualRestraint 锚点改写为"对照上方知识库切片判编造、切片为空时任何具体产品承诺都算无据"（T5），t6 产品声明弧端到端接统一内核验证（T6）。裁判从此拿到 ground 判 grounding。
 
-### J2.【一致性锚点缺失】consistency/goalProgress 逐轮判，但 agent 的 memoryCard/commitments/画像不喂裁判 —— ✅ 真缺陷
+### J2.【一致性锚点缺失】consistency/goalProgress 逐轮判，但 agent 的 memoryCard/commitments/画像不喂裁判 —— ✅ 真缺陷 ｜ ✅ 阶段1底料已通，红线进门待阶段2/3
 - **坐实**：`run_panel`(811-819) 入参仅 `inbound/reply/goal/history(transcript)`，**无 memory_summary / commitments / agent_profile**。
 - **病根**：agent 真正的一致性锚点是它**记得什么、答应过什么**（memoryCard+commitments），不只是对话字面。裁判看不到这些，只能从文本猜矛盾。agent 兑现三轮前的承诺，裁判不知那是承诺 → 可能漏判"信守"或误判"突兀"。
 - **影响**：consistency/goalProgress 判定失真。
+- **✅ 阶段1落地（commit 751cda8..0828591）**：`JudgeContext` 携带 `memory_summary` + `commitments`（`cm.text()`）+ `profile_brief`（stage/goal/summary/tags），`collect_judge_context` 从 contact 真实采集（T4），rubric 跨轮指令明确"consistency 须对照上方 agent 记忆/承诺：兑现=加分、翻供/遗忘=扣分"（T5）。底料通路已建；consistency 作为对话级维度进 scored 硬门留阶段2/3（红线对话级硬门 + 对话级总评）。
 
 ### J3.【最大盲区·输入端失真】roleplayer（演客户的红队）完全没校准 —— ✅ 真缺陷
 - **坐实**：`adversary_next`(1167) 演客户施压，但**全文无 roleplayer 校准/金标锚定**（judge 有 `t_judge_calibration`，roleplayer 没有对应物）。
@@ -225,10 +227,11 @@
 - **病根**：有些短板**只在整段才显形**——agent 单看每轮都 7 分，但整段 6 轮一直原地兜圈、从未推进（C2 "好东西给得太晚"正是此类）。逐轮分看不出"全程无进展/节奏失衡"。jsjm1986 说的"在长对话中打分"指向这个缺失维度。
 - **影响**：跨轮累积型短板（拖延推进、节奏、关系演进）无评判抓手。
 
-### J5.【情绪强度跨轮失真】emotionalValue 选尺子的前置判定"该轮用户有没有情绪"是单句判 —— ✅ 真缺陷
+### J5.【情绪强度跨轮失真】emotionalValue 选尺子的前置判定"该轮用户有没有情绪"是单句判 —— ✅ 真缺陷 ｜ ✅ 阶段1指令已落，跨轮总评待阶段3
 - **坐实**：judge prompt emotionalValue"按轮型分两把尺子，先判该轮用户有没有显露情绪"——该前置判断基于单轮 inbound。
 - **病根**：客户情绪常是**跨轮累积**的（前三轮压抑、第四轮爆发）。孤立看第四轮可能误判情绪强度/性质。与红线同源——情绪也是对话级语义。
 - **影响**：emotionalValue 两尺子选错 → 共情维度判定失真。
+- **✅ 阶段1落地（commit 751cda8..0828591）**：`JudgeContext.transcript` 携带截至本轮完整对话（T1），rubric 跨轮指令明确"判 emotionalValue（客户情绪强度常跨轮累积，须看完整对话不可只看本轮单句）"（T5）。逐轮裁判从此能基于完整对话选尺子；整段情绪曲线承接的对话级总评（emotional_attunement_arc）留阶段3。
 
 ### J6.【全套盘点新发现】轨迹裁判已有对话级雏形但未校准 —— ✅ 真缺陷
 - **坐实**：`real_llm_dynamic_adversarial` 已有 **R5.2 轨迹裁判评整段对话**（J4 对话级的雏形！），但注释明示"**校准未达标、只 ledger 不进门**"。
@@ -248,6 +251,17 @@
 - **J4/J6 = jsjm1986 原意正解**：补"对话级评判"，J6 雏形已存在待吸收+校准。
 - J2/J5 次之：特定维度（一致性/情绪）的底料补全。
 - **边界**：全是测试层方法学改进，不碰生产。已升级为统一重构 spec（`docs/superpowers/specs/2026-06-19-evaluation-system-overhaul-design.md`）覆盖 J1-J6+红线+全套 18 文件。
+
+#### ✅ 评判重构阶段1 完成（2026-06-19，commit 751cda8..257891e）
+底料注入内核落地，全程**测试 only、零 src 改动、向后兼容**（空底料=老 `run_judge_graded` 逐字行为）：
+- **T1** `JudgeContext`/`KnowledgeSlice`/`render_judge_context`（全空→空串）
+- **T2** `build_judge_user_with_context`（底料拼在待评回复前，空则回落 `build_judge_user`）
+- **T3** `run_judge_graded_with_context`（原 `run_judge_graded` 改薄委托保 DRY）
+- **T4** `collect_judge_context`（从 AppState 真实采集知识/记忆/承诺/画像）
+- **T5** rubric 维度改写：factualRestraint 对照知识库判编造 + 跨轮判定指令（emotionalValue/consistency/autonomyRisk 须基于完整对话）
+- **T6** t6 产品声明弧接统一内核端到端验证 J1
+- **基线**：本地磁盘满（466G 卷 100%），按项目磁盘纪律推 CI 跑 `cargo test --lib` 基线 + judge 单测（judge 纯函数单测已在 T1-T5 逐个本地跑绿）。
+- **后续**：J2 红线进门、J5 跨轮总评、J3 roleplayer 校准、J4/J6 对话级总评归阶段2-5（各自独立 plan + CI 验证）。
 
 ---
 
