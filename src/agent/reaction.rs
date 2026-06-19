@@ -1024,6 +1024,7 @@ mod a6_tests {
                 } else {
                     None
                 },
+                dimensions: Default::default(),
                 recorded_at: DateTime::from_millis(i as i64 * 1000),
             })
             .collect();
