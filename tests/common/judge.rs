@@ -301,6 +301,87 @@ pub fn build_judge_user_with_context(
     )
 }
 
+// ────────────────────────────────────────────────────────────────────────────
+// Task 4：从 AppState + contact 采集裁判底料
+// ────────────────────────────────────────────────────────────────────────────
+
+use mongodb::bson::doc;
+use mongodb::options::FindOneOptions;
+use wechatagent::routes::AppState;
+
+/// 从 AppState + contact 采集裁判底料。知识切片取本 contact 最近一条 knowledge_usage_log
+/// 引用的 chunk（无引用=空，寒暄轮合法）；记忆/承诺/画像从 contact 读。
+/// contact 不存在 → 记忆/承诺/画像全空、知识空，但仍返回带 `transcript` 的 `JudgeContext`。
+pub async fn collect_judge_context(
+    state: &AppState,
+    contact_wxid: &str,
+    transcript: Option<String>,
+) -> JudgeContext {
+    let contact = state
+        .db
+        .contacts()
+        .find_one(doc! { "wxid": contact_wxid }, None)
+        .await
+        .ok()
+        .flatten();
+
+    let (memory_summary, commitments, profile_brief) = match &contact {
+        Some(c) => {
+            // CommitmentRepr 是 enum（Plain/Structured），用 .text() 取正文（models.rs:3519）。
+            let commits: Vec<String> =
+                c.commitments.iter().map(|cm| cm.text().to_string()).collect();
+            // AgentProfile 无 intent_level；用真实字段 operation_goal/summary + stage/tags 拼简报。
+            let brief = format!(
+                "stage={:?} goal={} summary={} tags={:?}",
+                c.operation_state,
+                c.agent_profile
+                    .as_ref()
+                    .map(|p| p.operation_goal.as_str())
+                    .unwrap_or(""),
+                c.agent_profile
+                    .as_ref()
+                    .map(|p| p.summary.as_str())
+                    .unwrap_or(""),
+                c.tags
+            );
+            (c.memory_summary.clone(), commits, Some(brief))
+        }
+        None => (None, Vec::new(), None),
+    };
+
+    // 知识切片：最近一条 usage log 的引用 chunk。
+    let mut knowledge = Vec::new();
+    let latest = FindOneOptions::builder().sort(doc! { "created_at": -1 }).build();
+    if let Ok(Some(log)) = state
+        .db
+        .knowledge_usage_logs()
+        .find_one(doc! { "contact_wxid": contact_wxid }, latest)
+        .await
+    {
+        for id in &log.knowledge_ids {
+            if let Ok(Some(chunk)) = state
+                .db
+                .operation_knowledge_chunks()
+                .find_one(doc! { "_id": id }, None)
+                .await
+            {
+                knowledge.push(KnowledgeSlice {
+                    title: chunk.title.clone(),
+                    body: chunk.body.clone().unwrap_or_default(),
+                });
+            }
+        }
+    }
+
+    JudgeContext {
+        transcript,
+        knowledge,
+        memory_summary,
+        commitments,
+        profile_brief,
+    }
+}
+
 // ════════════════════════════════════════════════════════════════════════════
 // R1.2 judge 失败语义分级
 //
@@ -618,6 +699,66 @@ mod tests {
         let plain = build_judge_user("t1", "在吗", "在的");
         let with_empty = build_judge_user_with_context("t1", "在吗", "在的", &JudgeContext::default());
         assert_eq!(plain, with_empty, "空底料必须逐字等于老 build_judge_user（向后兼容）");
+    }
+
+    /// Task 4：`collect_judge_context` 从 AppState 采集底料。需 Docker（testcontainers），
+    /// 标 `#[ignore]` 与其它集成测试同口径，CI integration job 跑、本地只编译。
+    #[tokio::test]
+    #[ignore]
+    async fn collect_context_pulls_memory_and_commitments() {
+        use mongodb::bson::{oid::ObjectId, DateTime, Document};
+        use wechatagent::models::{AgentStatus, CommitmentRepr, Contact};
+
+        let app = crate::common::TestApp::start().await;
+        let now = DateTime::now();
+        // 带记忆 + 承诺的 contact（字段表对齐 c2_operation_state_derivation_e2e 的 make_managed_contact）。
+        let c = Contact {
+            id: Some(ObjectId::new()),
+            workspace_id: "default".to_string(),
+            account_id: "default".to_string(),
+            wxid: "judge_ctx_wxid".to_string(),
+            nickname: Some("测试客户".to_string()),
+            remark: None,
+            alias: None,
+            agent_status: AgentStatus::Managed,
+            human_profile_note: None,
+            agent_profile: None,
+            memory_summary: Some("三次复购".to_string()),
+            playbook_id: None,
+            playbook_version: None,
+            tags: Vec::new(),
+            domain_attributes: None,
+            domain_attributes_updated_at: None,
+            commitments: vec![CommitmentRepr::Plain("下午报价".to_string())],
+            follow_up_policy: None,
+            operation_state: Some("new_contact".to_string()),
+            operation_state_reason: None,
+            operation_state_confidence: Some(7),
+            operation_state_updated_at: None,
+            cooldown_until: None,
+            operation_policy: Document::new(),
+            profile_attributes: Document::new(),
+            profile_updated_at: None,
+            last_message_at: Some(now),
+            last_inbound_at: Some(now),
+            last_outbound_at: None,
+            last_agent_run_at: None,
+            custom_agent_instructions: None,
+            operation_mode_override: None,
+            last_outbound_style: None,
+            intent_trajectory: Vec::new(),
+            locale: None,
+            outcome_events: Vec::new(),
+            created_at: now,
+            updated_at: now,
+        };
+        app.state.db.contacts().insert_one(&c, None).await.unwrap();
+
+        let ctx = collect_judge_context(&app.state, &c.wxid, Some("你: 在\n运营: 在的".into())).await;
+        assert_eq!(ctx.memory_summary.as_deref(), Some("三次复购"));
+        assert!(ctx.commitments.iter().any(|x| x.contains("下午报价")), "承诺须采集到，commitments={:?}", ctx.commitments);
+        assert!(ctx.profile_brief.is_some(), "画像简报应从 contact 派生");
+        assert_eq!(ctx.transcript.as_deref(), Some("你: 在\n运营: 在的"));
     }
 
     #[tokio::test]
