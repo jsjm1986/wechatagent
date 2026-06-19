@@ -38,7 +38,10 @@ pub(crate) enum ValueSource {
     Taxonomy,
     /// 值由代码产出、信任，不校验（value_tier ← classify_value_tier）。
     CodeEnum,
-    /// 直通无约束。
+    /// 直通无约束。预留第三态：classify_validation 已覆盖（与 CodeEnum 同样 Accept 直通），
+    /// 但当前 DIMENSION_REGISTRY 7 维度无一用 FreeText（全 Taxonomy/CodeEnum），故标 allow——
+    /// 等未来有"自由文本不查字典"的维度声明即构造，无需改 classify。
+    #[allow(dead_code)]
     FreeText,
 }
 
