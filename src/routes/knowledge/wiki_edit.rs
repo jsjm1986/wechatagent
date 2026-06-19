@@ -981,23 +981,26 @@ pub async fn batch_verify_chunks(
             skipped.push(json!({ "id": id, "reason": reason }));
             continue;
         }
-        match state
-            .db
-            .operation_knowledge_chunks()
-            .update_one(
-                doc! { "_id": object_id, "workspace_id": &admin.current_workspace },
-                doc! {
-                    "$set": {
-                        "integrity_status": "verified",
-                        "confidence_score": 100,
-                        "unsupported_claims": Bson::Array(Vec::new()),
-                        "status": "active",
-                        "updated_at": DateTime::now()
-                    }
+        // D2：批量 verify 接回 apply_chunk_revision（op=verify, source=human），与
+        // batch_archive_chunks 同款留痕；部分成功语义保留（单条失败进 skipped）。
+        match apply_chunk_revision(
+            &state.db,
+            &admin.current_workspace,
+            object_id,
+            RevisionRequest {
+                op: RevisionOp::Verify,
+                source: ProvenanceSource::Human,
+                patch: doc! {
+                    "integrity_status": "verified",
+                    "confidence_score": 100,
+                    "unsupported_claims": Bson::Array(Vec::new()),
+                    "status": "active",
                 },
-                None,
-            )
-            .await
+                reason: payload.note.clone(),
+                actor: Some(admin.username.clone()),
+            },
+        )
+        .await
         {
             Ok(_) => verified.push(id.clone()),
             Err(e) => skipped.push(json!({ "id": id, "reason": format!("update_failed: {}", e) })),

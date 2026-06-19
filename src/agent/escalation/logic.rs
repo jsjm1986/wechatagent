@@ -198,9 +198,15 @@ fn consecutive_unprogressed_turns(trajectory: &[crate::models::IntentTrajectoryE
 /// 组装注入 decision prompt 的"请示通道信号"段（纯函数，无 IO）。三信号：
 /// ①等待领导决策中（domain_attributes 布尔标记）②多轮卡死（意图轨迹连续未推进+末轮负面）
 /// ③高风险升级模式（workspace 配置）。三信号全缺返回空串（decision.rs 据此决定是否拼接）。
+///
+/// **2.5-main-3**：`negative_outcomes` = 本行业有效负极集（来自 active
+/// DomainProfile.outcome_polarity，由调用方 decision.rs 经 `effective_negative_outcomes`
+/// 解析后传入；空集回落内置销售 5 词）。末轮负面判定（信号②）据此识别，故跨域时
+/// "卡死请示"按本行业的负反应定义触发，而非写死销售异议词。DEFAULT 字节等价。
 pub(crate) fn build_decision_signals_text(
     contact: &Contact,
     domain_config: Option<&OperationDomainConfig>,
+    negative_outcomes: &[impl AsRef<str>],
 ) -> String {
     let mut lines: Vec<String> = Vec::new();
 
@@ -218,11 +224,10 @@ pub(crate) fn build_decision_signals_text(
 
     // ② 多轮卡死：同一议题连续未推进 + 最近一轮负面反应（两条件 AND）。
     let turns = consecutive_unprogressed_turns(&contact.intent_trajectory);
-    let latest_negative = contact
-        .intent_trajectory
-        .last()
-        .map(|e| crate::agent::reaction::is_negative_outcome(&e.intent))
-        .unwrap_or(false);
+    let latest_negative = latest_reaction_is_negative_with_polarity(
+        &contact.intent_trajectory,
+        negative_outcomes,
+    );
     if is_stuck_or_undelivered(turns, DEFAULT_STUCK_THRESHOLD, latest_negative) {
         lines.push(
             "- 该议题已连续多轮未推进且客户有负面反应：避免硬推同一话术，考虑换个角度，或如实告诉客户你需要向领导确认后再答复。".to_string(),
@@ -266,6 +271,30 @@ pub(crate) fn is_duplicate_key_error(e: &mongodb::error::Error) -> bool {
     )
 }
 
+/// pending 去重唯一索引的名字（与 db/indexes.rs 的 partial unique 索引同名）。
+/// insert 侧据此区分两类 11000：短码碰撞（换种子重试）vs 同客户同类别已有 pending
+/// （并发漏过 has_pending 预检，静默当作"已存在"，不再重试、不报错）。
+pub(crate) const PENDING_DEDUPE_INDEX_NAME: &str =
+    "uniq_principal_escalation_pending_ws_contact_category";
+
+/// 据 dup-key 错误的 (code, message) 判定是否命中 pending 去重唯一索引。
+/// dup-key 错误 message 形如 `E11000 ... index: <name> dup key: ...`，据索引名识别。
+/// 抽成纯函数（输入基本类型）以便单测——mongodb::error::WriteError 是 `#[non_exhaustive]`，
+/// 无法在测试里构造，故把核心判定与错误提取解耦。
+pub(crate) fn dedupe_conflict_matches_pending_index(code: i32, message: &str) -> bool {
+    code == 11000 && message.contains(PENDING_DEDUPE_INDEX_NAME)
+}
+
+/// 该 mongodb 错误是否为 pending 去重唯一索引的 11000 冲突。
+/// 仅从错误里提取 (code, message)，核心判定委托 [`dedupe_conflict_matches_pending_index`]。
+pub(crate) fn is_pending_dedupe_conflict(e: &mongodb::error::Error) -> bool {
+    matches!(
+        *e.kind,
+        mongodb::error::ErrorKind::Write(mongodb::error::WriteFailure::WriteError(ref we))
+            if dedupe_conflict_matches_pending_index(we.code, &we.message)
+    )
+}
+
 /// 校验 verdict，越界回落 deferred（纯函数，便于单测）。
 pub(crate) fn sanitize_verdict(decision: PrincipalDecision) -> PrincipalDecision {
     if ALLOWED_PRINCIPAL_VERDICT.contains(&decision.verdict.as_str()) {
@@ -287,6 +316,20 @@ pub(crate) fn is_stuck_or_undelivered(
     latest_reaction_is_negative: bool,
 ) -> bool {
     consecutive_unprogressed_turns >= threshold && latest_reaction_is_negative
+}
+
+/// universal-domain-adaptation 2.5-pre-2：意图轨迹末轮反应是否落入负极集（极性可参数化）。
+/// `negative` = 本行业负向 outcome 集（DEFAULT 销售域 =
+/// `reaction::DEFAULT_NEGATIVE_OUTCOMES`）。空轨迹返回 false。2.5-main-3 把数据源换成
+/// active profile，使回路③卡死判定随行业极性走。
+pub(crate) fn latest_reaction_is_negative_with_polarity(
+    trajectory: &[crate::models::IntentTrajectoryEntry],
+    negative: &[impl AsRef<str>],
+) -> bool {
+    trajectory
+        .last()
+        .map(|e| negative.iter().any(|n| n.as_ref() == e.intent))
+        .unwrap_or(false)
 }
 
 /// 默认卡死轮阈值（spec：默认 3，可配）。
@@ -516,6 +559,7 @@ mod tests {
             agent_status: AgentStatus::Managed,
             human_profile_note: None,
             custom_agent_instructions: None,
+            operation_mode_override: None,
             agent_profile: None,
             memory_summary: None,
             playbook_id: None,
@@ -539,7 +583,7 @@ mod tests {
             last_agent_run_at: None,
             last_outbound_style: None,
             intent_trajectory: Vec::new(),
-            deal_events: Vec::new(),
+            outcome_events: Vec::new(),
             locale: None,
             created_at: now,
             updated_at: now,
@@ -613,7 +657,7 @@ mod tests {
     #[test]
     fn signals_empty_when_no_signal_present() {
         let contact = make_contact("cust1");
-        assert!(build_decision_signals_text(&contact, None).is_empty());
+        assert!(build_decision_signals_text(&contact, None, crate::agent::reaction::DEFAULT_NEGATIVE_OUTCOMES).is_empty());
     }
 
     #[test]
@@ -622,7 +666,7 @@ mod tests {
         let mut attrs = mongodb::bson::Document::new();
         attrs.insert(AWAITING_PRINCIPAL_DECISION_ATTR, true);
         contact.domain_attributes = Some(attrs);
-        let text = build_decision_signals_text(&contact, None);
+        let text = build_decision_signals_text(&contact, None, crate::agent::reaction::DEFAULT_NEGATIVE_OUTCOMES);
         assert!(text.contains("正在等待裁决"), "应出等待领导信号，实际：{text}");
     }
 
@@ -635,7 +679,7 @@ mod tests {
             traj_entry("user_replied_objection"),
             traj_entry("user_replied_objection"),
         ];
-        let text = build_decision_signals_text(&contact, None);
+        let text = build_decision_signals_text(&contact, None, crate::agent::reaction::DEFAULT_NEGATIVE_OUTCOMES);
         assert!(text.contains("连续多轮未推进"), "应出卡死信号，实际：{text}");
     }
 
@@ -647,7 +691,7 @@ mod tests {
             traj_entry("user_replied_objection"),
             traj_entry("user_replied_objection"),
         ];
-        assert!(!build_decision_signals_text(&contact, None).contains("连续多轮未推进"));
+        assert!(!build_decision_signals_text(&contact, None, crate::agent::reaction::DEFAULT_NEGATIVE_OUTCOMES).contains("连续多轮未推进"));
     }
 
     #[test]
@@ -659,7 +703,30 @@ mod tests {
             traj_entry("user_replied_positive"),
             traj_entry("user_replied_positive"),
         ];
-        assert!(!build_decision_signals_text(&contact, None).contains("连续多轮未推进"));
+        assert!(!build_decision_signals_text(&contact, None, crate::agent::reaction::DEFAULT_NEGATIVE_OUTCOMES).contains("连续多轮未推进"));
+    }
+
+    #[test]
+    fn signals_stuck_polarity_comes_from_passed_negative_set() {
+        // 2.5-main-3：回路③ 末轮负面判定的极性来自传入的 negative 集，非写死销售词。
+        let mut contact = make_contact("cust1");
+        contact.intent_trajectory = vec![
+            traj_entry("user_replied_objection"),
+            traj_entry("user_replied_objection"),
+            traj_entry("user_replied_objection"),
+        ];
+        // 自定义负集不含 objection → 末轮非负 → 不触发卡死（即便连续 3 轮同 intent）。
+        let custom_negative = ["user_went_cold"];
+        assert!(
+            !build_decision_signals_text(&contact, None, &custom_negative).contains("连续多轮未推进"),
+            "自定义负集下 objection 不应判负、不触发卡死"
+        );
+        // 自定义负集含 objection → 恢复触发，证明极性确实来自传入集。
+        let custom_with_objection = ["user_replied_objection"];
+        assert!(
+            build_decision_signals_text(&contact, None, &custom_with_objection).contains("连续多轮未推进"),
+            "自定义负集含 objection 时应触发卡死"
+        );
     }
 
     #[test]
@@ -672,6 +739,30 @@ mod tests {
         ];
         assert_eq!(consecutive_unprogressed_turns(&traj), 3);
         assert_eq!(consecutive_unprogressed_turns(&[]), 0);
+    }
+
+    // ---- 2.5-pre-2：回路③ 末轮负面判定极性参数化 等价性 ----
+
+    #[test]
+    fn latest_reaction_negative_default_polarity_matches_hardcoded() {
+        // 逐字护栏：末轮负面判定走默认负极 == 改造前 is_negative_outcome 真值表。
+        let neg = crate::agent::reaction::DEFAULT_NEGATIVE_OUTCOMES;
+        let traj = vec![traj_entry("user_replied_objection")];
+        assert!(latest_reaction_is_negative_with_polarity(&traj, neg));
+        let traj_pos = vec![traj_entry("user_replied_buying_signal")];
+        assert!(!latest_reaction_is_negative_with_polarity(&traj_pos, neg));
+        // 空轨迹 false。
+        assert!(!latest_reaction_is_negative_with_polarity(&[], neg));
+    }
+
+    #[test]
+    fn latest_reaction_negative_is_parametric() {
+        // 证明极性来自配置：自定义负极下情感域"转冷"判负,原销售 objection 不判负。
+        let negative = ["user_went_cold"];
+        let traj_cold = vec![traj_entry("a"), traj_entry("user_went_cold")];
+        assert!(latest_reaction_is_negative_with_polarity(&traj_cold, &negative));
+        let traj_obj = vec![traj_entry("user_replied_objection")];
+        assert!(!latest_reaction_is_negative_with_polarity(&traj_obj, &negative));
     }
 
     #[test]
@@ -743,5 +834,31 @@ mod tests {
                 "{s} 不应升级"
             );
         }
+    }
+
+    // ---- fix C：pending 去重唯一索引冲突判定（区分两类 11000）----
+
+    #[test]
+    fn dedupe_conflict_hits_only_pending_index_message() {
+        // 11000 且 message 含 pending 去重索引名 → 命中（并发已插 pending，静默"已存在"）。
+        let msg = format!(
+            "E11000 duplicate key error collection: db.agent_principal_escalations index: {} dup key: {{ workspace_id: \"ws1\", contact_wxid: \"c1\", category: \"high_risk_gated\" }}",
+            PENDING_DEDUPE_INDEX_NAME
+        );
+        assert!(dedupe_conflict_matches_pending_index(11000, &msg));
+    }
+
+    #[test]
+    fn dedupe_conflict_misses_short_code_index() {
+        // 短码唯一索引的 11000 → 不命中（应换种子重试，而非当"已存在"）。
+        let msg = "E11000 duplicate key error collection: db.agent_principal_escalations index: uniq_principal_escalation_short_code dup key: { short_code: \"E1A2\" }";
+        assert!(!dedupe_conflict_matches_pending_index(11000, msg));
+    }
+
+    #[test]
+    fn dedupe_conflict_misses_non_11000() {
+        // 非 11000（即便 message 巧合含索引名）→ 不命中。
+        let msg = format!("some other write error mentioning {}", PENDING_DEDUPE_INDEX_NAME);
+        assert!(!dedupe_conflict_matches_pending_index(121, &msg));
     }
 }

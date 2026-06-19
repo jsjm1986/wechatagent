@@ -20,6 +20,7 @@ use crate::{
 mod accounts;
 mod admin_ops_versions;
 mod admin_outbox;
+mod admin_relationship_suggestions;
 mod admin_state_policies;
 mod admin_taxonomies;
 mod admin_taxonomy_candidates;
@@ -29,11 +30,16 @@ mod behavior_signal_metrics;
 pub mod chunk_locks;
 mod contacts;
 mod conversations;
-mod domain_schemas;
+// pub（非 pub(crate)）：domain_profile_e2e.rs 集成测试需从 tests/ crate 直调
+// publish/update/rollout/rollback handler 真函数（覆盖 realign + $set 部分更新），仿
+// guide_profile 已有先例。生产路由注册仍走下方 use。
+pub mod domain_profiles;
+pub(crate) mod domain_schemas;
 mod domains;
 mod evaluations;
 mod events;
 mod evolution;
+pub mod guide_profile;
 mod guides;
 mod health;
 pub(crate) mod knowledge;
@@ -44,6 +50,7 @@ mod observability;
 mod outcome_metrics;
 mod outcomes_autonomy;
 mod playbooks;
+mod products;
 mod prompt_templates;
 mod reviews;
 mod shared;
@@ -74,7 +81,8 @@ pub mod ext_knowledge {
     pub use super::knowledge::{
         auto_verify_operation_knowledge_chunks, decide_auto_verify_status,
         extract_operation_knowledge_tags, import_operation_knowledge_preview,
-        propose_chunk_repair, verify_operation_knowledge_chunk, ExtractKnowledgeTagsRequest,
+        propose_chunk_repair, reject_operation_knowledge_chunk,
+        verify_operation_knowledge_chunk, ExtractKnowledgeTagsRequest,
         KnowledgeAutoVerifyRequest, KnowledgeVerifyRequest, OperationKnowledgeImportRequest,
     };
     // real-LLM 知识库全能力 smoke（real_llm_knowledge.rs K10–K11）：
@@ -110,18 +118,27 @@ use admin_taxonomies::{
 use admin_taxonomy_candidates::{
     approve_taxonomy_candidate, list_taxonomy_candidates, reject_taxonomy_candidate,
 };
+use admin_relationship_suggestions::{
+    approve_relationship_suggestion, list_relationship_suggestions, reject_relationship_suggestion,
+};
 use assets::{create_content_asset, list_content_assets};
 use contacts::{
     analyze_contact_profile, add_deal_event, disable_agent, enable_agent, get_contact,
     get_contact_memory_card, get_operating_memory, get_operation_health, import_contacts_endpoint,
-    list_contact_memory_candidates, list_contacts, run_contact_memory_consolidation,
-    search_contacts_endpoint, search_import_contacts, update_operating_memory,
-    update_operation_profile, update_profile_note, update_custom_agent_instructions,
+    list_contact_memory_candidates, list_contacts, list_entitlements, list_outcome_events,
+    run_contact_memory_consolidation, search_contacts_endpoint, search_import_contacts,
+    update_operating_memory, update_operation_profile, update_profile_note,
+    update_custom_agent_instructions,
 };
 use conversations::list_messages;
 use domain_schemas::{
     activate_domain_schema, create_domain_schema, delete_domain_schema, list_domain_schemas,
     update_domain_schema,
+};
+use domain_profiles::{
+    activate_domain_profile, create_domain_profile, delete_domain_profile, get_domain_profile,
+    list_domain_profiles, publish_domain_profile, rollback_domain_profile, rollout_domain_profile,
+    update_domain_profile,
 };
 use domains::{
     get_operation_domain, get_operation_domain_state_machine, list_operation_domains,
@@ -138,6 +155,7 @@ use evolution::{
     rollback_evolution_proposal,
 };
 use guides::{apply_user_operation_guide, preview_user_operation_guide};
+use guide_profile::generate_domain_profile_candidate;
 use health::health;
 use llm_providers::{
     activate_provider, create_provider, delete_provider, list_providers, set_vision_active,
@@ -199,6 +217,9 @@ use playbooks::{
 use prompt_templates::{
     create_prompt_template, list_prompt_templates, publish_prompt_template,
     reset_system_prompt_pack, update_prompt_template,
+};
+use products::{
+    archive_product, create_product, list_products, restore_product, update_product,
 };
 use reviews::{get_decision_review, list_decision_reviews};
 use simulations::{run_user_operation_evaluation, simulate_user_operation_dialogue};
@@ -278,6 +299,8 @@ pub fn api_router(state: AppState) -> Router<AppState> {
             put(update_operation_profile),
         )
         .route("/contacts/:id/deal-events", post(add_deal_event))
+        .route("/contacts/:id/outcome-events", get(list_outcome_events))
+        .route("/contacts/:id/entitlements", get(list_entitlements))
         .route(
             "/contacts/:id/analyze-profile",
             post(analyze_contact_profile),
@@ -641,6 +664,11 @@ pub fn api_router(state: AppState) -> Router<AppState> {
             "/operation-playbooks/:id/set-default",
             post(set_default_operation_playbook),
         )
+        // ── objective-purchase-facts G2：产品目录 CRUD ────────────────────────
+        .route("/products", get(list_products).post(create_product))
+        .route("/products/:product_id", put(update_product))
+        .route("/products/:product_id/archive", post(archive_product))
+        .route("/products/:product_id/restore", post(restore_product))
         .route(
             "/management-agent/sessions",
             post(create_management_session),
@@ -674,6 +702,19 @@ pub fn api_router(state: AppState) -> Router<AppState> {
         .route(
             "/admin/taxonomy-candidates/:id/reject",
             post(reject_taxonomy_candidate),
+        )
+        // ── 数字分身建议链 T8：relationship_type 建议审核路由 ──────────────────
+        .route(
+            "/admin/relationship-type-suggestions",
+            get(list_relationship_suggestions),
+        )
+        .route(
+            "/admin/relationship-type-suggestions/:id/approve",
+            post(approve_relationship_suggestion),
+        )
+        .route(
+            "/admin/relationship-type-suggestions/:id/reject",
+            post(reject_relationship_suggestion),
         )
         // ── Phase E / E5-T1：ops 三表多版本灰度 admin 路由 ──────────────────────
         // 同一套 publish/rollout/rollback 三动作分别覆盖
@@ -772,6 +813,38 @@ pub fn api_router(state: AppState) -> Router<AppState> {
             "/admin/domain-schemas/:id/activate",
             post(activate_domain_schema),
         )
+        // ── universal-domain-adaptation Phase 3：行业总装配单 DomainProfile admin 路由 ──
+        .route(
+            "/admin/domain-profiles",
+            get(list_domain_profiles).post(create_domain_profile),
+        )
+        .route(
+            "/admin/domain-profiles/:id",
+            get(get_domain_profile)
+                .put(update_domain_profile)
+                .delete(delete_domain_profile),
+        )
+        .route(
+            "/admin/domain-profiles/:id/publish",
+            post(publish_domain_profile),
+        )
+        .route(
+            "/admin/domain-profiles/:id/rollout",
+            post(rollout_domain_profile),
+        )
+        .route(
+            "/admin/domain-profiles/:id/rollback",
+            post(rollback_domain_profile),
+        )
+        .route(
+            "/admin/domain-profiles/:id/activate",
+            post(activate_domain_profile),
+        )
+        // ── 引导层（3A-4）：AI 对话生成候选 DomainProfile ──
+        .route(
+            "/admin/domain-profiles/generate",
+            post(generate_domain_profile_candidate),
+        )
         // ── agent-self-evolution M4 W4 / Task 5.5：evolution admin 路由 ──────
         .route("/evolution/experiments", get(list_evolution_experiments))
         .route(
@@ -827,6 +900,7 @@ mod tests {
             include_str!("admin_state_policies.rs"),
             include_str!("admin_taxonomies.rs"),
             include_str!("admin_taxonomy_candidates.rs"),
+            include_str!("admin_relationship_suggestions.rs"),
             include_str!("assets.rs"),
             include_str!("auth.rs"),
             include_str!("behavior_signal_metrics.rs"),
@@ -857,6 +931,7 @@ mod tests {
             include_str!("outcome_metrics.rs"),
             include_str!("outcomes_autonomy.rs"),
             include_str!("playbooks.rs"),
+            include_str!("products.rs"),
             include_str!("prompt_templates.rs"),
             include_str!("reviews.rs"),
             include_str!("shared.rs"),
@@ -869,6 +944,9 @@ mod tests {
         const KNOWN_NON_ROUTE_HANDLERS: &[&str] = &[
             // shared.rs：webhooks.rs / 集成测试通过 `pub use` 直接调用。
             "upsert_contact_from_value",
+            // shared.rs：成效事件落库核心，admin 手动登记 add_deal_event 与将来支付回调
+            // 共用，不直接绑 HTTP（支付闭环 #10 前置重构）。
+            "add_outcome_event_inner",
             // knowledge.rs：lib 内部复用的导入流水（不绑 HTTP）。
             "ingest_chunked_text",
             // knowledge.rs：PDF multipart handler 委托的字节级 helper（集成测试直调）。
@@ -876,6 +954,9 @@ mod tests {
             // knowledge.rs：完整度审计内核 helper，被 get/refresh completeness 两个 handler
             // 复用、不直接绑 HTTP；real_llm_knowledge.rs K11 通过 `pub use` 直调真模型审计。
             "build_operation_knowledge_completeness",
+            // domain_schemas.rs：D1-b active schema 加载 helper，被 chunk 写侧
+            // （apply_chunk_revision）复用做 domain_attributes 校验，不直接绑 HTTP。
+            "load_active_domain_schema",
         ];
 
         let mut handlers: Vec<&str> = Vec::new();

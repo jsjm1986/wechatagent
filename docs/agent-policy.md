@@ -95,7 +95,11 @@ RunBudget 超限                        终止本 run，落 fallback (enforce_ru
 > 是 2026-05-25 知识库清理前的旧函数名，现已不存在。真实入口是
 > `src/agent/review.rs::review_passed`（评分硬门）、`review::classify_dual_gate` /
 > `review::route_dual_gate`（双闸分类 / 改写路由）、`review::finalize_review_for_send`
-> （verified 产品声明结构化兜底，写 `blocked_unverified_product_claim`）。
+> （verified 产品声明结构化兜底）。**2026-06-14 修订**：R5.4 reviewer 自报
+> `requiresProductKnowledge=true` 路径仍写 `blocked_unverified_product_claim`（强约束不变）；
+> finalize 漏判探针（ProductEffect 分支，reviewer 未自报 ∧ 含硬承诺 ∧ 无 verified 背书）
+> 从强制 block 改为**仅观测**（落 `grounding_probe_reviewer_missed` 事件，不改发送判定），
+> 因成交弧承诺词高频、知识稀缺场景下硬闸导致全程哑火；先观测漏判率再决策是否抬回硬闸。
 > 阈值字段也有历史别名：`UserRuntimeParameters.fact_risk_block_at` 实际承载
 > **hallucination** block 阈值（由 `hallucination_block_at` 映射而来），
 > `product_accuracy_block_below` 实际承载 **knowledge_grounding** 阈值（由
@@ -318,6 +322,7 @@ WechatAgent 自第二阶段起内置可选的"自我演化"后台 worker（`src/
 - 显著性门槛：`EVOLUTION_MIN_SEND_SUCCESS_DELTA`（默认 0.05）+ `EVOLUTION_MIN_SELF_CRITIQUE_DELTA`（默认 0.10）+ `EVOLUTION_MAX_5GATE_HIT_INCREASE`（默认 0.10，即新版本不得让任何闸命中率上升超过 10%）。
 - **安全回归门**（#152）：放松安全闸（`fact_risk_block` / `pressure_risk_block` / `product_accuracy_score_block`）的 threshold 候选，额外计算「安全回归率」= shadow 中"原配置被该安全闸拦下（`held_by_ai_policy` / `blocked_by_safety_guard` / `blocked_unverified_product_claim`）、新配置却放行（`approved` / `approved_after_revision`）"的 run 占全部 completed replay 的比例。超过 `EVOLUTION_MAX_SAFETY_REGRESSION_RATE`（默认 `0.0`，零容忍）即判 `safety_gate_regression_above_threshold`、转 `rejected_below_threshold`。这条门是"放松必须用数据证明不漏风险"的硬约束，凌驾于 send_success 提升之上。
 - 三项任一不达标（含安全回归门）→ 候选直接转 `rejected_below_threshold`，不进入 `eligible_for_release`。
+- **注（2026-06-14）**：`blocked_unverified_product_claim` 作为安全回归门的被拦状态之一，其来源是 R5.4 reviewer 自报路径（强约束不变）；finalize 漏判探针（ProductEffect 分支）现已转为观测期，不再产生该 block 状态，故演化器统计窗口内该状态的样本量会下降。观测期结束后若抬回硬闸，本统计语义无需改动。
 
 ### Release / Rollback
 
@@ -588,7 +593,7 @@ WechatAgent 把"销售话术 RAG"升级为"运营知识 Wiki + 检索面"：知�
 
 ### 2. 写入路径三层保护：apply_chunk_revision
 
-所有写入（import / patch / split / merge / archive / restore / rollback）走同一个函数 [`crate::knowledge_wiki::chunk_revisions::apply_chunk_revision`]，三层保护一律生效：
+所有写入（import / patch / split / merge / archive / restore / rollback / verify / reject / auto-verify / batch-verify）走同一个函数 [`crate::knowledge_wiki::chunk_revisions::apply_chunk_revision`]，三层保护一律生效：
 
 1. **锁定字段守门**：patch 试图改 `chunk_id / wiki_type / created_at / source_anchor / verified_at / verified_by / approved_at` 任意一项 → 4xx；
 2. **数组字段 union**：`tags / related_chunks / sources / search_terms / applicable_scenes` 永远应用层 `existing ∪ patch`，0 风险 0 LLM 成本；
@@ -596,7 +601,7 @@ WechatAgent 把"销售话术 RAG"升级为"运营知识 Wiki + 检索面"：知�
 
 写入侧附加规则：
 
-- **AI 写入永不自动 verify**：source=ai 强制 `status="draft" + integrity_status="needs_review"`，verify 仍走现有 `/chunks/:id/verify` + sourceQuote→anchor gate；
+- **AI 写入永不自动 verify**：source=ai 强制 `status="draft" + integrity_status="needs_review"`，verify 仍走现有 `/chunks/:id/verify` + sourceQuote→anchor gate；后者也经 `apply_chunk_revision`（op=verify, source=human）落审计历史——「needs_review→verified」这一最关键状态转移可追溯谁在何时审定；`auto_verify` 批处理（admin 触发、LLM 自评+规则闸门裁决）同样落审计，但 source=rule（非 human）——如实标注"规则化批处理"，避免审计误判有人逐条签字；
 - **双写**：先写 `chunk_revisions`（不可变历史，sha256 before/after hash），后写 `operation_knowledge_chunks`（可变最新版）；万一 chunks 写失败 revisions 仍留下"试图但未成功"的痕迹；
 - **enqueue catalog rebuild**：写完即推 `catalog_rebuild_jobs` 队列，worker 异步落库，写入路径不阻塞。
 

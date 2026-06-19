@@ -77,6 +77,43 @@ pub struct UserRuntimeParameters {
     /// #69 作息门控：运营方时区相对 UTC 的小时偏移（中国 +8）。默认 8。
     /// 固定偏移使作息判定不依赖部署宿主时区；loader clamp 到 `[-12, 14]`。
     pub quiet_hours_tz_offset_hours: i32,
+    /// universal-domain-adaptation H9：本轮允许的 conversationMode 取值集合
+    /// （替代 `agent::types::CONVERSATION_MODE_VALUES` 写死四模式）。`from_config`
+    /// 给内置默认四模式；gateway 在加载 active DomainProfile 后用
+    /// `profile.conversation_modes` 覆盖（非空时）。`validate_and_promote` 读它做
+    /// conversationMode 严格枚举校验。DEFAULT 销售域 = 四模式逐字等价。
+    pub allowed_conversation_modes: Vec<String>,
+    /// universal-domain-adaptation H14：本域是否在「无产品声明」时旁路 grounding
+    /// 软分数硬闸（`classify_dual_gate` 里 `knowledge_grounding_score <
+    /// product_accuracy_block_below` 的判罚）。`false`（DEFAULT/老库/`from_config`/
+    /// `Default`）= 不旁路 = 每条回复都判 grounding 硬闸（销售域字节等价）；`true`
+    /// = 纯关系/情感域，仅当本条回复 `claim_analysis.requiresProductKnowledge=true`
+    /// 时才纳入 grounding 硬闸，纯情感回复不再被 grounding 低分误拦。
+    /// 由 active DomainProfile.grounding_gate_bypass_without_claim 派生，gateway
+    /// 加载 profile 后覆盖。**红线**：本旁路仅作用于 grounding 软分数硬闸，
+    /// `blocked_unverified_product_claim`（R5.4 verified 强约束 + 漏判探针）任何
+    /// 取值下都不变。
+    pub grounding_gate_bypass_without_claim: bool,
+    /// reviewer 优化第一步：本域是否「不信任被审查者自报的低风险」。`false`
+    /// （DEFAULT/`from_config`/`Default`）= 沿用 `should_run_review` 既有判定（销售域
+    /// 字节等价）；`true` = 高敏域，should_reply 的回复一律强制走独立 LLM review，
+    /// 不再因 Reply Agent 自报 `needs_review=false` 走本地轻量兜底。由 active
+    /// DomainProfile.distrust_self_reported_low_risk 派生，gateway 加载 profile 后覆盖。
+    /// 配套：预算超额仍只能本地兜底时，`local_decision_review` 在本标志为真时把
+    /// pressure_risk 从乐观 0 改为保守 `pressure_risk_block_at`（安全化，非点对点修补）。
+    pub distrust_self_reported_low_risk: bool,
+}
+
+/// H9：内置默认 conversationMode 四模式（逐字复刻 `types::CONVERSATION_MODE_VALUES`）。
+/// `from_config` / `Default` 用它；active profile 声明了 `conversation_modes` 时由
+/// gateway 覆盖。
+pub(crate) fn default_conversation_modes() -> Vec<String> {
+    vec![
+        "casual_relationship".to_string(),
+        "value_exchange".to_string(),
+        "consultative".to_string(),
+        "boundary_protection".to_string(),
+    ]
 }
 
 impl UserRuntimeParameters {
@@ -110,7 +147,7 @@ impl UserRuntimeParameters {
             follow_up_expires_hours: typed.follow_up_expires_hours,
             cooldown_after_no_reply_hours: typed.cooldown_after_no_reply_hours,
             fact_risk_block_at: typed.hallucination_block_at,
-            pressure_risk_block_at: 7,
+            pressure_risk_block_at: typed.pressure_risk_block_at,
             human_like_rewrite_below: typed.human_like_rewrite_below,
             emotional_value_rewrite_below: typed.emotional_value_rewrite_below,
             product_accuracy_block_below: typed.knowledge_grounding_block_below,
@@ -133,6 +170,15 @@ impl UserRuntimeParameters {
             quiet_hours_start: typed.quiet_hours_start.min(23),
             quiet_hours_end: typed.quiet_hours_end.min(23),
             quiet_hours_tz_offset_hours: typed.quiet_hours_tz_offset_hours.clamp(-12, 14),
+            // H9：from_config 不接 DomainProfile，给内置默认四模式；gateway 在
+            // 加载 active profile 后用 profile.conversation_modes 覆盖（非空时）。
+            allowed_conversation_modes: default_conversation_modes(),
+            // H14：from_config 不接 DomainProfile，默认 false=无条件 grounding 硬闸
+            // （销售域字节等价）；gateway 加载 active profile 后覆盖。
+            grounding_gate_bypass_without_claim: false,
+            // reviewer 优化：from_config 不接 DomainProfile，默认 false=沿用既有
+            // should_run_review 判定（销售域字节等价）；gateway 加载 active profile 后覆盖。
+            distrust_self_reported_low_risk: false,
         }
     }
 
@@ -166,8 +212,56 @@ impl UserRuntimeParameters {
             "quietHoursEnabled": self.quiet_hours_enabled,
             "quietHoursStart": self.quiet_hours_start as i32,
             "quietHoursEnd": self.quiet_hours_end as i32,
-            "quietHoursTzOffsetHours": self.quiet_hours_tz_offset_hours
+            "quietHoursTzOffsetHours": self.quiet_hours_tz_offset_hours,
+            "groundingGateBypassWithoutClaim": self.grounding_gate_bypass_without_claim,
+            "distrustSelfReportedLowRisk": self.distrust_self_reported_low_risk
         }
+    }
+
+    /// M2：用 active profile 的 `threshold_overrides` 逐字段覆盖五闸阈值。
+    /// `None`（DEFAULT profile）→ 不改任何字段（销售域字节等价）；`Some` 时字段内
+    /// `Some(n)` 覆盖、`None` 保留 `from_config` 现值（逐字段独立回落）。抽成纯方法
+    /// 便于无 DB 单测覆盖语义。
+    pub(crate) fn apply_profile_threshold_overrides(
+        &mut self,
+        overrides: Option<&crate::models::ProfileThresholds>,
+    ) {
+        let Some(th) = overrides else { return };
+        if let Some(v) = th.fact_risk_block_at {
+            self.fact_risk_block_at = v;
+        }
+        if let Some(v) = th.pressure_risk_block_at {
+            self.pressure_risk_block_at = v;
+        }
+        if let Some(v) = th.human_like_rewrite_below {
+            self.human_like_rewrite_below = v;
+        }
+        if let Some(v) = th.emotional_value_rewrite_below {
+            self.emotional_value_rewrite_below = v;
+        }
+        if let Some(v) = th.product_accuracy_block_below {
+            self.product_accuracy_block_below = v;
+        }
+    }
+
+    /// universal-domain-adaptation 第 78 点：把 active DomainProfile 的运行期价值开关
+    /// 一次性派生进本 runtime（gateway 在加载 profile 后调用，替代散落在 inner 里的三
+    /// 行手工赋值）。封装为单一入口后，「情感陪伴等非销售 profile → runtime 非销售行为」
+    /// 这条价值链可在 lib 单测里纯内存端到端断言（无需 Docker/LLM）。
+    ///
+    /// 派生三项：
+    /// - `grounding_gate_bypass_without_claim`（H14）：纯情感回复无产品声明时旁路
+    ///   grounding 软分硬闸。
+    /// - `distrust_self_reported_low_risk`（reviewer 优化）：高敏域强制走 LLM review。
+    /// - `threshold_overrides`（M2）：逐字段覆盖五闸阈值（None 回落不动）。
+    ///
+    /// DEFAULT 销售 profile（bypass=false/distrust=false/overrides=None）→ 三项均无扰动，
+    /// 销售域字节等价。**红线**：conversation_modes 的派生在 decision.rs 的
+    /// validate_and_promote 处（与 prompt 注入同源），不并入本函数。
+    pub(crate) fn apply_active_profile(&mut self, profile: &crate::models::DomainProfile) {
+        self.grounding_gate_bypass_without_claim = profile.grounding_gate_bypass_without_claim;
+        self.distrust_self_reported_low_risk = profile.distrust_self_reported_low_risk;
+        self.apply_profile_threshold_overrides(profile.threshold_overrides.as_ref());
     }
 }
 
@@ -208,7 +302,7 @@ impl Default for UserRuntimeParameters {
             follow_up_expires_hours: typed.follow_up_expires_hours,
             cooldown_after_no_reply_hours: typed.cooldown_after_no_reply_hours,
             fact_risk_block_at: typed.hallucination_block_at,
-            pressure_risk_block_at: 7,
+            pressure_risk_block_at: typed.pressure_risk_block_at,
             human_like_rewrite_below: typed.human_like_rewrite_below,
             emotional_value_rewrite_below: typed.emotional_value_rewrite_below,
             product_accuracy_block_below: typed.knowledge_grounding_block_below,
@@ -231,6 +325,13 @@ impl Default for UserRuntimeParameters {
             quiet_hours_start: typed.quiet_hours_start.min(23),
             quiet_hours_end: typed.quiet_hours_end.min(23),
             quiet_hours_tz_offset_hours: typed.quiet_hours_tz_offset_hours.clamp(-12, 14),
+            // H9：PBT / 无 profile 入口的默认四模式，与销售域逐字等价。
+            allowed_conversation_modes: default_conversation_modes(),
+            // H14：PBT / 无 profile 入口默认 false=无条件 grounding 硬闸（销售域等价）。
+            grounding_gate_bypass_without_claim: false,
+            // reviewer 优化：PBT / 无 profile 入口默认 false=沿用既有 should_run_review
+            // 判定（销售域等价）。
+            distrust_self_reported_low_risk: false,
         }
     }
 }
@@ -477,6 +578,7 @@ mod tests {
             human_like_rewrite_below: 6,
             emotional_value_rewrite_below: 6,
             product_accuracy_block_below: 7,
+            distrust_self_reported_low_risk: false,
             operation_state_confidence_full_review_below: 4,
             run_token_budget: 30000,
             run_max_llm_calls: 6,
@@ -495,6 +597,8 @@ mod tests {
             quiet_hours_start: 22,
             quiet_hours_end: 8,
             quiet_hours_tz_offset_hours: 8,
+            allowed_conversation_modes: default_conversation_modes(),
+            grounding_gate_bypass_without_claim: false,
         };
         let doc = runtime.as_document();
         assert_eq!(doc.get_i64("reactionTokenBudget").ok(), Some(8000));
@@ -560,6 +664,72 @@ mod tests {
         let too_small = make_domain_config(doc! { "quietHoursTzOffsetHours": -99_i64 });
         let typed2 = too_small.runtime_parameters_typed();
         assert_eq!(typed2.quiet_hours_tz_offset_hours.clamp(-12, 14), -12);
+    }
+
+    // ── 第 78 点：非销售（情感陪伴）价值断言进常规门（纯内存，无 Docker/LLM）──
+    // gateway 的 profile→runtime 派生封装进 apply_active_profile 后，这条价值链可在 lib
+    // 门里端到端断言：example 情感 profile → apply → runtime 带非销售开关 → 驱动下游
+    // should_run_review（review/mod.rs::should_run_review_forces_full_when_distrust_set）
+    // 与 grounding 闸（review/gates.rs::h14_grounding_gate_bypassed_when_no_claim_*）。
+
+    /// 第 78 点：apply_active_profile(情感 profile) → runtime 带上全部非销售价值开关。
+    #[test]
+    fn emotional_companion_profile_drives_non_sales_runtime() {
+        let profile = crate::agent::domain_profile::example_emotional_companion_profile("ws-e");
+        let mut runtime = baseline_runtime();
+        // 派生前 = 销售默认（零扰动锚点）。
+        assert!(!runtime.grounding_gate_bypass_without_claim);
+        assert!(!runtime.distrust_self_reported_low_risk);
+        runtime.apply_active_profile(&profile);
+        // H14：纯情感回复旁路 grounding 软分硬闸。
+        assert!(runtime.grounding_gate_bypass_without_claim, "情感陪伴应旁路 grounding 软闸");
+        // reviewer：高敏域强制走 LLM review。
+        assert!(runtime.distrust_self_reported_low_risk, "情感陪伴高敏域应不信任自报低风险");
+    }
+
+    /// 第 78 点：DEFAULT 销售 profile → apply_active_profile 零扰动（字节等价护栏）。
+    #[test]
+    fn apply_active_profile_default_is_zero_perturbation() {
+        let profile = crate::agent::domain_profile::default_domain_profile("ws-d");
+        let mut runtime = baseline_runtime();
+        let before_fact = runtime.fact_risk_block_at;
+        let before_pressure = runtime.pressure_risk_block_at;
+        let before_human = runtime.human_like_rewrite_below;
+        let before_emotional = runtime.emotional_value_rewrite_below;
+        let before_product = runtime.product_accuracy_block_below;
+
+        runtime.apply_active_profile(&profile);
+        // DEFAULT profile: bypass=false / distrust=false / overrides=None → 三项无扰动。
+        assert!(!runtime.grounding_gate_bypass_without_claim);
+        assert!(!runtime.distrust_self_reported_low_risk);
+        assert_eq!(runtime.fact_risk_block_at, before_fact);
+        assert_eq!(runtime.pressure_risk_block_at, before_pressure);
+        assert_eq!(runtime.human_like_rewrite_below, before_human);
+        assert_eq!(runtime.emotional_value_rewrite_below, before_emotional);
+        assert_eq!(runtime.product_accuracy_block_below, before_product);
+    }
+
+    /// 第 78 点：情感 profile 声明 threshold_overrides 时，apply 逐字段覆盖五闸阈值。
+    #[test]
+    fn apply_active_profile_applies_threshold_overrides() {
+        let mut profile =
+            crate::agent::domain_profile::example_emotional_companion_profile("ws-t");
+        // 情感域放宽压力闸（主动关心不该被高 pressure 拦）、提高情绪价值改写线。
+        profile.threshold_overrides = Some(crate::models::ProfileThresholds {
+            fact_risk_block_at: None,
+            pressure_risk_block_at: Some(9),
+            human_like_rewrite_below: None,
+            emotional_value_rewrite_below: Some(8),
+            product_accuracy_block_below: None,
+        });
+        let mut runtime = baseline_runtime();
+        let before_fact = runtime.fact_risk_block_at;
+        runtime.apply_active_profile(&profile);
+        // 声明的两项被覆盖。
+        assert_eq!(runtime.pressure_risk_block_at, 9);
+        assert_eq!(runtime.emotional_value_rewrite_below, 8);
+        // 未声明项（None）保持不动。
+        assert_eq!(runtime.fact_risk_block_at, before_fact);
     }
 
     fn baseline_runtime() -> UserRuntimeParameters {
@@ -643,5 +813,72 @@ mod tests {
         ] {
             assert!(RESOLVED_GATE_KEYS.contains(&k), "missing gate_key: {k}");
         }
+    }
+
+    // ── M2：五闸阈值 profile 覆盖 ──
+
+    #[test]
+    fn threshold_overrides_none_is_byte_equivalent() {
+        // DEFAULT profile threshold_overrides=None → 不改任何阈值（销售域字节等价）。
+        let mut rt = UserRuntimeParameters::default();
+        let before = (
+            rt.fact_risk_block_at,
+            rt.pressure_risk_block_at,
+            rt.human_like_rewrite_below,
+            rt.emotional_value_rewrite_below,
+            rt.product_accuracy_block_below,
+        );
+        rt.apply_profile_threshold_overrides(None);
+        assert_eq!(
+            (
+                rt.fact_risk_block_at,
+                rt.pressure_risk_block_at,
+                rt.human_like_rewrite_below,
+                rt.emotional_value_rewrite_below,
+                rt.product_accuracy_block_below,
+            ),
+            before,
+            "None override 不得改变任何阈值"
+        );
+    }
+
+    #[test]
+    fn threshold_overrides_partial_only_touches_some_fields() {
+        // 情感域只放宽 pressure、提高 emotional_value 改写线，其余字段 None → 保留原值。
+        let mut rt = UserRuntimeParameters::default();
+        let orig_fact = rt.fact_risk_block_at;
+        let orig_human = rt.human_like_rewrite_below;
+        let orig_grounding = rt.product_accuracy_block_below;
+        let th = crate::models::ProfileThresholds {
+            pressure_risk_block_at: Some(9),
+            emotional_value_rewrite_below: Some(8),
+            ..Default::default()
+        };
+        rt.apply_profile_threshold_overrides(Some(&th));
+        // 被覆盖的两个。
+        assert_eq!(rt.pressure_risk_block_at, 9);
+        assert_eq!(rt.emotional_value_rewrite_below, 8);
+        // None 字段保留原值（逐字段独立回落）。
+        assert_eq!(rt.fact_risk_block_at, orig_fact);
+        assert_eq!(rt.human_like_rewrite_below, orig_human);
+        assert_eq!(rt.product_accuracy_block_below, orig_grounding);
+    }
+
+    #[test]
+    fn threshold_overrides_full_override_all_five() {
+        let mut rt = UserRuntimeParameters::default();
+        let th = crate::models::ProfileThresholds {
+            fact_risk_block_at: Some(8),
+            pressure_risk_block_at: Some(9),
+            human_like_rewrite_below: Some(4),
+            emotional_value_rewrite_below: Some(7),
+            product_accuracy_block_below: Some(5),
+        };
+        rt.apply_profile_threshold_overrides(Some(&th));
+        assert_eq!(rt.fact_risk_block_at, 8);
+        assert_eq!(rt.pressure_risk_block_at, 9);
+        assert_eq!(rt.human_like_rewrite_below, 4);
+        assert_eq!(rt.emotional_value_rewrite_below, 7);
+        assert_eq!(rt.product_accuracy_block_below, 5);
     }
 }

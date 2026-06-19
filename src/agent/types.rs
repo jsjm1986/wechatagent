@@ -98,6 +98,16 @@ pub struct AgentDecision {
     pub tags: Vec<String>,
     pub customer_stage: Option<String>,
     pub intent_level: Option<String>,
+    /// universal-domain-adaptation H1：对维度名零假设的开放画像信号容器。
+    ///
+    /// 销售域只有 `customer_stage` / `intent_level` 两维（仍保留为上面的 typed
+    /// 字段，删了会破 lib 基线 + state_transition_pbt）；陪伴/同行等非销售域可携带
+    /// `relationship_closeness` / `emotional_state` 等任意维度。
+    /// [`super::domain_signals::normalize_domain_signals`] 在 typed 字段与本容器
+    /// 之间做双向同步，落库经由统一写入内核。DEFAULT 销售域里 LLM 只输出 typed、
+    /// 不输出 `domainSignals`，故本容器由 normalize 从 typed 镜像得来——行为不变。
+    #[serde(default)]
+    pub domain_signals: Document,
     pub last_commitment: Option<String>,
     /// PR-D：结构化承诺（带可选 dueAt）。promote 时从 RawAgentDecision.commitment 透传。
     pub commitment: Option<CommitmentDecision>,
@@ -135,6 +145,13 @@ pub struct AgentDecision {
     pub consolidation_needed: bool,
     #[serde(default, deserialize_with = "string_or_vec")]
     pub used_knowledge_ids: Vec<String>,
+    /// 客观购买事实增强 G2（2026-06-15 spec §5.4）：本轮回复**报价/推荐时引用的
+    /// 产品 product_id**（来自注入的「产品目录」段）。R5.4 据此判 `priced_from_catalog`：
+    /// 引用的 product_id ∈ 本 workspace active products → 视为结构化 verified 背书，
+    /// 与 verified_chunks 取或，避免 G2 准确报价被 `blocked_unverified_product_claim` 错杀。
+    /// 空（无报价 / 情感域）→ 不触发并联背书，行为与改造前等价。
+    #[serde(default, deserialize_with = "string_or_vec")]
+    pub quoted_product_ids: Vec<String>,
     #[serde(default)]
     pub memory_update: String,
     pub context_pack_version: Option<i32>,
@@ -220,6 +237,7 @@ impl Default for AgentDecision {
             tags: Vec::new(),
             customer_stage: None,
             intent_level: None,
+            domain_signals: Document::new(),
             last_commitment: None,
             commitment: None,
             follow_up_policy: None,
@@ -241,6 +259,7 @@ impl Default for AgentDecision {
             memory_write_score: 0,
             consolidation_needed: false,
             used_knowledge_ids: Vec::new(),
+            quoted_product_ids: Vec::new(),
             memory_update: String::new(),
             context_pack_version: None,
             follow_up: None,
@@ -321,12 +340,21 @@ pub struct RawAgentDecision {
     pub reply_text: Option<String>,
     pub should_reply: Option<bool>,
     pub used_knowledge_ids: Option<Vec<String>>,
+    /// G2 报价引用的 product_id（spec §5.4，R5.4 priced_from_catalog 判定用）。
+    pub quoted_product_ids: Option<Vec<String>>,
     pub safe_claims_used: Option<Vec<String>>,
     pub knowledge_route: Option<KnowledgeRouteResult>,
     pub profile_update: Option<AgentProfile>,
     pub tags: Option<Vec<String>>,
     pub customer_stage: Option<String>,
     pub intent_level: Option<String>,
+    /// universal-domain-adaptation G1：对维度名零假设的开放画像信号容器。非销售
+    /// 行业（陪伴/同行等）的「参与决策」维度（如 `purchase_lifecycle` /
+    /// `relationship_closeness`）由 LLM 写进这里。销售域 LLM 只输出 typed
+    /// `customerStage`/`intentLevel`，本字段缺省 → promote 后容器空、由
+    /// `normalize_domain_signals` 从 typed 镜像，行为与改造前逐字等价。
+    #[serde(default)]
+    pub domain_signals: Option<Document>,
     pub last_commitment: Option<String>,
     /// PR-D：结构化承诺（带可选 dueAt）。缺失时回落 last_commitment。
     pub commitment: Option<CommitmentDecision>,
@@ -538,10 +566,24 @@ impl RawAgentDecision {
             AUTONOMY_MODE_VALUES,
             &mut risks,
         );
+        // H9 universal-domain-adaptation：conversationMode 允许集合从 runtime
+        // 注入（active DomainProfile.conversation_modes，由 gateway 在加载 profile
+        // 后写入 runtime.allowed_conversation_modes）。空时回落到内置销售域四模式
+        // `CONVERSATION_MODE_VALUES`（DEFAULT 逐字等价 + 兼容 PBT/无 profile 入口）。
+        let conversation_mode_values: Vec<&str> =
+            if runtime.allowed_conversation_modes.is_empty() {
+                CONVERSATION_MODE_VALUES.to_vec()
+            } else {
+                runtime
+                    .allowed_conversation_modes
+                    .iter()
+                    .map(String::as_str)
+                    .collect()
+            };
         let conversation_mode = check_required_enum(
             self.conversation_mode.clone(),
             "conversation_mode",
-            CONVERSATION_MODE_VALUES,
+            &conversation_mode_values,
             &mut risks,
         );
         let needs_review = check_required_bool(self.needs_review, "needs_review", &mut risks);
@@ -802,6 +844,9 @@ fn carry_through_fields(raw: RawAgentDecision, decision: &mut AgentDecision) {
     if let Some(v) = raw.used_knowledge_ids {
         decision.used_knowledge_ids = v;
     }
+    if let Some(v) = raw.quoted_product_ids {
+        decision.quoted_product_ids = v;
+    }
     if let Some(v) = raw.safe_claims_used {
         decision.safe_claims_used = v;
     }
@@ -822,6 +867,13 @@ fn carry_through_fields(raw: RawAgentDecision, decision: &mut AgentDecision) {
     }
     if raw.intent_level.is_some() {
         decision.intent_level = raw.intent_level;
+    }
+    if let Some(v) = raw.domain_signals {
+        // G1：非销售维度的开放容器从 LLM JSON `domainSignals` 透传。销售域 LLM
+        // 不输出该键 → None → 不触；典型行业由 normalize_domain_signals 再镜像 typed。
+        if !v.is_empty() {
+            decision.domain_signals = v;
+        }
     }
     if raw.last_commitment.is_some() {
         decision.last_commitment = raw.last_commitment;
@@ -943,9 +995,9 @@ pub struct ReviewScores {
     /// 反序列化兼容：reviewer prompt 历史上以 `productAccuracy` 命名该评分键。
     #[serde(default, deserialize_with = "number_i32", alias = "productAccuracy")]
     pub knowledge_grounding_score: i32,
-    /// Phase B / B1：恢复 `pressure_risk` 软闸评分（0-100）。Reviewer 输出，
-    /// `review_passed` 与 single-shot revision 通道判定时使用。R11 兼容：
-    /// 缺省 `0`，旧 review JSON 反序列化不破坏。
+    /// Phase B / B1：恢复 `pressure_risk` 软闸评分（0-10，越高压迫感越强）。Reviewer 输出，
+    /// `review_passed` 与 single-shot revision 通道判定时使用（与 `pressure_risk_block_at`
+    /// 等个位数阈值同档比较）。R11 兼容：缺省 `0`，旧 review JSON 反序列化不破坏。
     #[serde(default, deserialize_with = "number_i32")]
     pub pressure_risk: i32,
 }
@@ -1529,6 +1581,9 @@ mod validate_and_promote_tests {
             quiet_hours_start: 22,
             quiet_hours_end: 8,
             quiet_hours_tz_offset_hours: 8,
+            allowed_conversation_modes: crate::agent::runtime::default_conversation_modes(),
+            grounding_gate_bypass_without_claim: false,
+            distrust_self_reported_low_risk: false,
         }
     }
 
@@ -1816,6 +1871,110 @@ mod validate_and_promote_tests {
     fn raw_decision_without_escalation_still_parses() {
         let raw: RawAgentDecision = serde_json::from_str(r#"{}"#).expect("parse empty");
         assert!(raw.escalation_request.is_none());
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // universal-domain-adaptation H9：conversationMode 枚举从 runtime 注入。
+    // 锁死：① DEFAULT 销售域四模式逐字等价（反过拟合护栏）；② runtime 注入的
+    // 行业模式集合生效（情感陪伴可声明 intimate_companion）；③ 注入集合外的值被
+    // 严格拒绝；④ runtime 空集合 fallback 到内置四模式。
+    // 这些是确定性单测，替代此前仅有的概率性 real-LLM 兜底。
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// H9 辅助：构造一个能通过 final 校验、且显式带某个 conversation_mode 的 raw。
+    fn raw_with_conversation_mode(mode: &str) -> RawAgentDecision {
+        let mut raw = make_valid_low_routine_raw();
+        raw.conversation_mode = Some(mode.to_string());
+        raw
+    }
+
+    /// 提取与 conversation_mode 相关的违规标签（missing / invalid_enum）。
+    fn conversation_mode_risks(risks: &[String]) -> Vec<&String> {
+        risks
+            .iter()
+            .filter(|r| r.contains("conversation_mode"))
+            .collect()
+    }
+
+    #[test]
+    fn h9_default_runtime_locks_four_sales_modes_verbatim() {
+        // runtime_default(true) 走 UserRuntimeParameters::default → 内置四模式。
+        // 四个销售域模式逐一通过，无 conversation_mode 相关 risk。
+        let runtime = runtime_default(true);
+        for mode in [
+            "casual_relationship",
+            "value_exchange",
+            "consultative",
+            "boundary_protection",
+        ] {
+            let raw = raw_with_conversation_mode(mode);
+            let (decision, risks) = raw.validate_and_promote(&runtime);
+            assert_eq!(decision.conversation_mode, mode, "mode {mode} 应原样保留");
+            assert!(
+                conversation_mode_risks(&risks).is_empty(),
+                "销售域四模式 {mode} 不应产生 conversation_mode risk，实际：{risks:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn h9_default_runtime_rejects_non_sales_mode() {
+        // 默认四模式集合下，情感陪伴模式 intimate_companion 不在集合内 → 被严格拒绝。
+        let runtime = runtime_default(true);
+        let raw = raw_with_conversation_mode("intimate_companion");
+        let (_decision, risks) = raw.validate_and_promote(&runtime);
+        assert!(
+            risks
+                .iter()
+                .any(|r| r == "invalid_enum_value:conversation_mode:intimate_companion"),
+            "默认四模式集合应拒绝 intimate_companion，实际 risks：{risks:?}"
+        );
+    }
+
+    #[test]
+    fn h9_profile_injected_modes_accept_industry_specific_value() {
+        // 模拟 gateway 用 active DomainProfile.conversation_modes 覆盖 runtime：
+        // 情感陪伴行业声明 intimate_companion + 仍保留 boundary_protection（边界保护红线）。
+        let mut runtime = runtime_default(true);
+        runtime.allowed_conversation_modes = vec![
+            "intimate_companion".to_string(),
+            "boundary_protection".to_string(),
+        ];
+        let raw = raw_with_conversation_mode("intimate_companion");
+        let (decision, risks) = raw.validate_and_promote(&runtime);
+        assert_eq!(decision.conversation_mode, "intimate_companion");
+        assert!(
+            conversation_mode_risks(&risks).is_empty(),
+            "profile 已声明 intimate_companion，不应产生 risk，实际：{risks:?}"
+        );
+        // 注入集合外的销售模式 value_exchange 现在反而被拒绝（集合已切换为情感行业）。
+        let raw2 = raw_with_conversation_mode("value_exchange");
+        let (_d2, risks2) = raw2.validate_and_promote(&runtime);
+        assert!(
+            risks2
+                .iter()
+                .any(|r| r == "invalid_enum_value:conversation_mode:value_exchange"),
+            "情感行业集合应拒绝销售模式 value_exchange，实际：{risks2:?}"
+        );
+    }
+
+    #[test]
+    fn h9_empty_runtime_modes_fall_back_to_four_const() {
+        // runtime.allowed_conversation_modes 为空（防御性：理论上 from_config/Default
+        // 都给了四模式，但显式清空模拟边界）→ fallback 到 const 四模式。
+        let mut runtime = runtime_default(true);
+        runtime.allowed_conversation_modes = Vec::new();
+        // 销售模式通过。
+        let raw = raw_with_conversation_mode("consultative");
+        let (decision, risks) = raw.validate_and_promote(&runtime);
+        assert_eq!(decision.conversation_mode, "consultative");
+        assert!(conversation_mode_risks(&risks).is_empty());
+        // 非销售模式仍被拒（fallback 集合 = 四模式）。
+        let raw2 = raw_with_conversation_mode("intimate_companion");
+        let (_d2, risks2) = raw2.validate_and_promote(&runtime);
+        assert!(risks2
+            .iter()
+            .any(|r| r == "invalid_enum_value:conversation_mode:intimate_companion"));
     }
 }
 

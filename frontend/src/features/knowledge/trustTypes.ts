@@ -4,6 +4,16 @@
 export type AnsweringMode = "relationship_only" | "product_safe" | "fully_supported";
 export type CoverageState = "verified" | "methodology" | "draft" | "missing";
 
+// I：三档 answeringMode 的档位标签随 active DomainProfile 回传（后端
+// answering_mode_labels）。非销售域换掉「可安全讲产品」等销售标签;缺省回落内置销售标签。
+export type AnsweringModeLabels = Record<AnsweringMode, string>;
+
+export const DEFAULT_ANSWERING_MODE_LABELS: AnsweringModeLabels = {
+  relationship_only: "仅关系维护",
+  product_safe: "可安全讲产品",
+  fully_supported: "完全支撑",
+};
+
 export interface CoverageFlags {
   verifiedFact: boolean;
   methodologyOnly: boolean;
@@ -25,6 +35,7 @@ export interface CompletenessView {
   evidenceChunks: number;
   needsReviewChunks: number;
   answeringMode: AnsweringMode;
+  answeringModeLabels: AnsweringModeLabels;
   summary: string;
   coverage: Record<DimKey, CoverageFlags>;
   gaps: string[];
@@ -64,6 +75,16 @@ export function parseCompleteness(raw: unknown): CompletenessView {
   const mode = o.answeringMode;
   const answeringMode: AnsweringMode =
     mode === "product_safe" || mode === "fully_supported" ? mode : "relationship_only";
+  const rawLabels = (o.answeringModeLabels ?? {}) as Record<string, unknown>;
+  const label = (k: AnsweringMode): string =>
+    typeof rawLabels[k] === "string" && (rawLabels[k] as string).trim()
+      ? (rawLabels[k] as string)
+      : DEFAULT_ANSWERING_MODE_LABELS[k];
+  const answeringModeLabels: AnsweringModeLabels = {
+    relationship_only: label("relationship_only"),
+    product_safe: label("product_safe"),
+    fully_supported: label("fully_supported"),
+  };
   return {
     totalChunks: Number(o.totalChunks ?? 0),
     verifiedChunks: Number(o.verifiedChunks ?? 0),
@@ -71,6 +92,7 @@ export function parseCompleteness(raw: unknown): CompletenessView {
     evidenceChunks: Number(o.evidenceChunks ?? 0),
     needsReviewChunks: Number(o.needsReviewChunks ?? 0),
     answeringMode,
+    answeringModeLabels,
     summary: typeof o.summary === "string" ? o.summary : "",
     coverage,
     gaps: Array.isArray(o.gaps) ? o.gaps.filter((g): g is string => typeof g === "string") : [],

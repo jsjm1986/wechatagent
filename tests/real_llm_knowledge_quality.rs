@@ -52,7 +52,7 @@ use serde_json::json;
 use wechatagent::agent::knowledge_agent::{answer, AnswerRequest, CatalogFilter};
 use wechatagent::auth::AuthenticatedAdmin;
 use wechatagent::error::{AppError, AppResult};
-use wechatagent::llm::{LlmClient, LlmJsonResult, LlmProvider};
+use wechatagent::llm::{LlmClient, LlmFormat, LlmJsonResult, LlmProvider};
 use wechatagent::models::{LlmProviderConfig, OperationKnowledgeChunk, RelatedRef};
 use wechatagent::routes::ext_knowledge::{
     build_operation_knowledge_completeness, chat_turn, extract_operation_knowledge_tags,
@@ -76,9 +76,28 @@ fn real_llm_from_env() -> Option<Arc<LlmClient>> {
     // (api.supxh.xin)，并发互撞导致 429/瞬时不可达。max_retries 走 primary_max_retries()：
     // 配了 failover 备胎 key 时取 1（快速失败 ~2.5s 即切备胎，省下重试税，避免拖爆 45min
     // job 墙），无备胎时取 5（自愈窗口，与 adversarial 同形，无备胎场景零退化）。
-    let client = LlmClient::new(base_url, api_key, model, 180, primary_max_retries(), 2500)
-        .expect("构造真实 LlmClient");
+    let client = build_real_client(base_url, api_key, model, "REAL_LLM_FORMAT", primary_max_retries());
     Some(Arc::new(client))
+}
+
+/// 按 `<format_env>`（openai/anthropic，缺省 openai）构造 LlmClient。claude 系走
+/// Anthropic `/v1/messages`（非流式）；gpt/其它走 OpenAI `/v1/chat/completions`。
+/// 与 `real_llm_ops_smoke.rs::build_real_client` 同口径——端点切到 rsxermu666.cn
+/// （主 claude-opus-4-8 走 Anthropic / judge gpt-5.4 走 OpenAI）时按各自格式走对路径，
+/// 避免被当 OpenAI 走错路径返回 4xx 后被 `unwrap_or_skip_transient!` 跳过出假绿。
+fn build_real_client(
+    base_url: String,
+    api_key: String,
+    model: String,
+    format_env: &str,
+    retries: u32,
+) -> LlmClient {
+    let fmt = match std::env::var(format_env).ok().as_deref() {
+        Some("anthropic") | Some("messages") | Some("claude") => LlmFormat::Anthropic,
+        _ => LlmFormat::Openai,
+    };
+    LlmClient::with_format(base_url, api_key, model, fmt, 180, retries, 2500)
+        .expect("构造真实 LlmClient")
 }
 
 // ── 测试仪器级 failover：被测/裁判模型瞬时不可用（429/5xx/超时/连不上）时，自动
@@ -197,7 +216,7 @@ fn failover_key_present() -> bool {
 /// integrate 同 key（[[reference_llm_backup_gpt55]]），切了照样撞同一 429，早切反让全链秒耗尽 →
 /// 测试全 skip 假绿。timeout 墙已 45→90min 给足，宁可主模型多等也要拿真分。
 fn primary_max_retries() -> u32 {
-    6
+    10
 }
 
 /// 构建异端点备胎链（默认 NVIDIA integrate 端点）。缺 key → 空 vec（退化 primary-only）。
@@ -266,13 +285,47 @@ macro_rules! unwrap_or_skip_transient {
             Err(wechatagent::error::AppError::LlmUnavailable {
                 kind,
                 retry_count,
+                detail,
                 ..
             }) => {
+                let cfg_err_4xx = kind == "endpoint_not_found"
+                    || (kind == "http_4xx"
+                        && !detail.contains("HTTP 401")
+                        && !detail.contains("HTTP 402"));
+                if cfg_err_4xx {
+                    panic!(
+                        "{}：配置错误（kind={kind}），非端点抖动——4xx 多为 baseUrl/model/path 配错，\n                         不当瞬时 skip 假绿（R0.3）。detail={detail}",
+                        $what
+                    );
+                }
                 eprintln!(
                     "skip: {} —— 真模型上游瞬时不可达（kind={kind}, retry_count={retry_count}），\
                      按计划「真模型抖动有限重试+跳过」处理，不算质量失败",
                     $what
                 );
+                {
+                    use std::io::Write as _;
+                    let dir = std::env::var("REAL_LLM_LEDGER")
+                        .unwrap_or_else(|_| "target/real_llm_ledger".to_string());
+                    let _ = std::fs::create_dir_all(&dir);
+                    if let Ok(mut f) = std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(format!("{dir}/skip_ledger.jsonl"))
+                    {
+                        let _ = writeln!(
+                            f,
+                            "{}",
+                            serde_json::json!({
+                                "test": $what,
+                                "kind": kind,
+                                "retry_count": retry_count,
+                                "file": file!(),
+                                "sha": std::env::var("GITHUB_SHA").unwrap_or_else(|_| "local".into()),
+                            })
+                        );
+                    }
+                }
                 return;
             }
             Err(other) => panic!("{}：{other}", $what),
@@ -637,21 +690,39 @@ struct QualityJudge {
 /// 构造质量套件跨家族裁判团：deepseek 双 checkpoint（必备）+ 可选异族 Qwen（DashScope）。
 /// 文本裁判 key（REAL_LLM_API_KEY）缺失 → None（调用方 skip）；Qwen key 缺失 → 回落 2 裁判。
 fn quality_judge_panel() -> Option<Vec<QualityJudge>> {
-    let api_key = std::env::var("REAL_LLM_API_KEY")
+    std::env::var("REAL_LLM_API_KEY")
         .ok()
         .filter(|k| !k.trim().is_empty())?;
-    let base_url = std::env::var("REAL_LLM_BASE_URL")
-        .unwrap_or_else(|_| "https://api.supxh.xin/v1".to_string());
-    let pro = std::env::var("REAL_LLM_MODEL").unwrap_or_else(|_| "deepseek-v4-pro".to_string());
-    // judge-lite checkpoint 走**独立** REAL_LLM_JUDGE_LITE_MODEL，与 Q3 vision 的
-    // REAL_LLM_VISION_MODEL 彻底解耦（vision 仍走 MiMo 多模态，judge 走 deepseek 文本）。
+    // 文本裁判端点与被测 agent **解耦**：走独立 REAL_LLM_JUDGE_BASE_URL / _API_KEY / _FORMAT
+    // （缺则回落主端点/主 key/openai）。rsxermu 下主端点=claude-opus-4-8(anthropic 无 /v1)、
+    // judge=gpt-5.4(openai /v1)，端点串/格式皆异，裁判必须独立接线否则被当 OpenAI 走错路径
+    // 4xx 假绿。NVIDIA 单端点形态下不配 JUDGE_BASE_URL 即回落主 base，行为零退化。
+    let judge_base = std::env::var("REAL_LLM_JUDGE_BASE_URL")
+        .ok()
+        .filter(|b| !b.trim().is_empty())
+        .or_else(|| std::env::var("REAL_LLM_BASE_URL").ok())
+        .unwrap_or_else(|| "https://api.supxh.xin/v1".to_string());
+    let judge_key = std::env::var("REAL_LLM_JUDGE_API_KEY")
+        .ok()
+        .filter(|k| !k.trim().is_empty())
+        .or_else(|| std::env::var("REAL_LLM_API_KEY").ok())
+        .filter(|k| !k.trim().is_empty())?;
+    let pro = std::env::var("REAL_LLM_JUDGE_MODEL")
+        .ok()
+        .filter(|m| !m.trim().is_empty())
+        .or_else(|| std::env::var("REAL_LLM_MODEL").ok())
+        .unwrap_or_else(|| "deepseek-v4-pro".to_string());
+    // judge-lite checkpoint 走**独立** REAL_LLM_JUDGE_LITE_MODEL（缺则回落 pro 同模型）。
+    // rsxermu 下 judge 仅 gpt-5.4 一款文本模型，双 checkpoint 塌成同模型；跨家族效度改靠
+    // 异族 Qwen（第三方端点）承担，比同家族双 checkpoint 更强。
     let lite = std::env::var("REAL_LLM_JUDGE_LITE_MODEL")
-        .unwrap_or_else(|_| "deepseek-v4-flash".to_string());
-    // 重试 (180, primary_max_retries(), 2500)：双裁判与被测内容共享 deepseek 端点，对齐
-    // adversarial 套件抗共享端点 429/瞬时抖动（详见 real_llm_from_env 注释）。每个 checkpoint
-    // 再裹 wrap_with_failover：主 deepseek 瞬时不可用时切异端点备胎，让判分流程跑完拿真分。
-    let c1 = LlmClient::new(base_url.clone(), api_key.clone(), pro, 180, primary_max_retries(), 2500).ok()?;
-    let c2 = LlmClient::new(base_url, api_key, lite, 180, primary_max_retries(), 2500).ok()?;
+        .ok()
+        .filter(|m| !m.trim().is_empty())
+        .unwrap_or_else(|| pro.clone());
+    // 重试 (180, primary_max_retries(), 2500)。每个 checkpoint 再裹 wrap_with_failover：
+    // 主裁判瞬时不可用时切异端点备胎，让判分流程跑完拿真分。
+    let c1 = build_real_client(judge_base.clone(), judge_key.clone(), pro, "REAL_LLM_JUDGE_FORMAT", primary_max_retries());
+    let c2 = build_real_client(judge_base, judge_key, lite, "REAL_LLM_JUDGE_FORMAT", primary_max_retries());
     let mut panel = vec![
         QualityJudge {
             label: "deepseek-pro",
@@ -2045,7 +2116,7 @@ async fn q3_vision_extraction_quality() {
         model: vision_model,
         is_active: false,
         timeout_seconds: Some(180),
-        max_retries: Some(5),
+        max_retries: Some(10),
         retry_base_ms: Some(2500),
         supports_vision: true,
         is_vision_active: true,
@@ -2080,7 +2151,7 @@ async fn q3_vision_extraction_quality() {
             model: backup_model,
             is_active: false,
             timeout_seconds: Some(180),
-            max_retries: Some(5),
+            max_retries: Some(10),
             retry_base_ms: Some(2500),
             supports_vision: true,
             is_vision_active: false,

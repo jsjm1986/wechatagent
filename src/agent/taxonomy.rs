@@ -81,6 +81,12 @@ struct CachedEntry {
     aliases: Vec<String>,
     /// `"active"` | `"deprecated"`。
     status: String,
+    /// universal-domain-adaptation 1C：planner 漏斗排序权重（来自 TaxonomyValue，
+    /// 1B 已 seed）。`None` = 该维度不参与漏斗排序（如 objection_type）。
+    priority_weight: Option<i32>,
+    /// universal-domain-adaptation 1C：是否终态（成交后维护 / 冷却 / 沉默等不再被
+    /// stage_stagnation 段催促）。planner 据此构造 terminal 集合替代写死的 TERMINAL_STAGES。
+    is_terminal: bool,
 }
 
 impl Default for TaxonomyCache {
@@ -136,6 +142,8 @@ impl TaxonomyCache {
                     canonical_id: entry.value.id,
                     aliases: entry.value.aliases,
                     status: entry.value.status,
+                    priority_weight: entry.value.priority_weight,
+                    is_terminal: entry.value.is_terminal,
                 });
         }
         let mut inner = self.inner.lock();
@@ -236,6 +244,55 @@ pub(crate) fn check_value(
         }
     }
     TaxonomyMatch::CandidateNew
+}
+
+/// universal-domain-adaptation 1C：取某 `kind` 维度所有取值的 `(canonical_id,
+/// priority_weight, is_terminal)`，供 planner 构造漏斗排序权重表 + 终态集合。
+///
+/// 只读 active + deprecated（与 check_value 同源缓存）；scope 优先 account 私有、
+/// 回落 global。同 canonical_id 跨 scope 命中时 account 优先（先插入者赢，account
+/// 在前）。返回的权重 `None` 表示该取值不参与漏斗排序。
+///
+/// 调用方负责保证 cache 已加载。planner 每个 tick 调一次构造 `PlannerStageConfig`，
+/// 避免 N+1。空缓存（未配置 / 加载失败）返回空 Vec，planner 回落写死的 DEFAULT。
+pub(crate) fn dimension_value_weights(
+    kind: &str,
+    scope_account_id: &str,
+    cache: &TaxonomyCache,
+) -> Vec<(String, Option<i32>, bool)> {
+    let inner = cache.inner.lock();
+    let mut out: Vec<(String, Option<i32>, bool)> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for scope in [scope_account_id, "global"] {
+        let key = (scope.to_string(), kind.to_string());
+        if let Some(entries) = inner.entries.get(&key) {
+            for e in entries {
+                if seen.insert(e.canonical_id.clone()) {
+                    out.push((e.canonical_id.clone(), e.priority_weight, e.is_terminal));
+                }
+            }
+        }
+    }
+    out
+}
+
+/// 某 `kind` 在缓存里是否有任何字典条目（account 私有 scope 或 global）。
+///
+/// 用于区分「字典未配置（该 kind 整个为空）」与「字典有条目但此值越界」——前者属
+/// 「未约束」应回退信任原值（与 [`dimension_value_weights`] 空缓存回落 DEFAULT、
+/// `decision_taxonomy::classify_decision_tags` 对 dict-miss 软处理一致），后者是真越界
+/// 按写入通道处置（机器 drop / admin reject）。`check_value` 对两种情况都返回
+/// `CandidateNew`，无法区分，故由调用方（`dimension_registry::lookup_dict`）配合本函数判别。
+///
+/// 调用方负责保证 cache 已加载。读 [scope, "global"] 两层，任一有非空 entries 即 true。
+pub(crate) fn kind_has_entries(kind: &str, scope_account_id: &str, cache: &TaxonomyCache) -> bool {
+    let inner = cache.inner.lock();
+    [scope_account_id, "global"].iter().any(|s| {
+        inner
+            .entries
+            .get(&(s.to_string(), kind.to_string()))
+            .is_some_and(|e| !e.is_empty())
+    })
 }
 
 /// 异步 upsert 候选。
@@ -397,6 +454,8 @@ pub(crate) async fn approve(
             description: candidate.evidence.clone().unwrap_or_default(),
             aliases: Vec::new(),
             status: "active".to_string(),
+            priority_weight: None,
+            is_terminal: false,
         },
         updated_at: now,
         version: 1,
@@ -521,6 +580,8 @@ pub fn taxonomy_cache_for_tests(entries: Vec<TaxonomyEntry>) -> TaxonomyCache {
             canonical_id: entry.value.id,
             aliases: entry.value.aliases,
             status: entry.value.status,
+            priority_weight: entry.value.priority_weight,
+            is_terminal: entry.value.is_terminal,
         });
     }
     {
@@ -548,6 +609,8 @@ mod tests {
                     canonical_id: entry.value.id,
                     aliases: entry.value.aliases,
                     status: entry.value.status,
+                    priority_weight: entry.value.priority_weight,
+                    is_terminal: entry.value.is_terminal,
                 });
         }
         {
@@ -575,6 +638,8 @@ mod tests {
                 description: String::new(),
                 aliases: aliases.iter().map(|s| s.to_string()).collect(),
                 status: status.to_string(),
+                priority_weight: None,
+                is_terminal: false,
             },
             updated_at: DateTime::now(),
             version: 1,
@@ -805,5 +870,45 @@ mod tests {
             cache.is_stale(),
             "invalidate must trigger reload on next find_or_load"
         );
+    }
+
+    /// `kind_has_entries`：该 kind 在缓存里有非空 entries（global 或 account scope）→ true。
+    #[test]
+    fn kind_has_entries_true_when_configured() {
+        let cache = make_cache_with_entries(vec![make_entry(
+            "global",
+            "customer_stage",
+            "first_contact",
+            &[],
+            "active",
+        )]);
+        assert!(kind_has_entries("customer_stage", "acct-1", &cache));
+        // account 私有 scope 也算（命中任一层即 true）。
+        let cache2 = make_cache_with_entries(vec![make_entry(
+            "acct-1",
+            "customer_stage",
+            "first_contact",
+            &[],
+            "active",
+        )]);
+        assert!(kind_has_entries("customer_stage", "acct-1", &cache2));
+    }
+
+    /// `kind_has_entries`：该 kind 字典整个为空（未配置，如 m012 删 seed 后）→ false。
+    /// 这是「字典未配置→回退信任」与「有条目但越界→drop」分流的判据。
+    #[test]
+    fn kind_has_entries_false_when_empty() {
+        // 缓存里只有别的 kind，customer_stage 整个未配置。
+        let cache = make_cache_with_entries(vec![make_entry(
+            "global",
+            "intent_level",
+            "high",
+            &[],
+            "active",
+        )]);
+        assert!(!kind_has_entries("customer_stage", "acct-1", &cache));
+        // 完全空缓存。
+        let empty = make_cache_with_entries(vec![]);
+        assert!(!kind_has_entries("customer_stage", "acct-1", &empty));
     }
 }

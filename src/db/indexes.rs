@@ -287,6 +287,25 @@ pub(super) async fn ensure_all(db: &Database) -> anyhow::Result<()> {
             None,
         )
         .await?;
+    // 回路①（gap_signals::refresh_usage_stats_and_confidence）每 600s 把该 workspace
+    // 30d（gap_signals.rs:813 的 30*24h 窗口）全部 usage log try_collect 进内存。该集合
+    // 是每次知识命中/拦截都 append 的高写入诊断日志，无 TTL 会从根上无界增长 → 最终
+    // 拖垮 feedback_worker 内存。TTL=35d 略大于回路①的 30d 滑窗，只清窗口外历史、
+    // 不影响窗口内统计；与 llm_call_logs/agent_run_logs 等诊断日志的 TTL 策略同构。
+    db.knowledge_usage_logs()
+        .create_index(
+            IndexModel::builder()
+                .keys(doc! { "created_at": 1 })
+                .options(
+                    IndexOptions::builder()
+                        .expire_after(std::time::Duration::from_secs(35 * 24 * 60 * 60))
+                        .name("ttl_knowledge_usage_logs_created_at".to_string())
+                        .build(),
+                )
+                .build(),
+            None,
+        )
+        .await?;
     db.knowledge_chat_turns()
         .create_index(
             IndexModel::builder()
@@ -337,6 +356,17 @@ pub(super) async fn ensure_all(db: &Database) -> anyhow::Result<()> {
                 // ensure_indexes panic。reaction claim 查询走前缀
                 // (workspace_id, account_id, contact_wxid, status) + outcome_status 等值，
                 // 全键复合索引已能覆盖；放弃"只索引活跃 review"的体积优化以换取合法性。
+                .build(),
+            None,
+        )
+        .await?;
+    // H11-linkage：回路① 成交追认 / outcome join 按 run_id 批量拉 decision_reviews
+    // （gap_signals::refresh_usage_stats_and_confidence 的 outcome_by_run）。无此索引
+    // 会全表扫高写入量的 decision_reviews。非 unique：不假设一 run 一 review。
+    db.decision_reviews()
+        .create_index(
+            IndexModel::builder()
+                .keys(doc! { "run_id": 1 })
                 .build(),
             None,
         )
@@ -551,11 +581,14 @@ pub(super) async fn ensure_all(db: &Database) -> anyhow::Result<()> {
     ensure_agent_send_outbox_indexes(db).await?;
     ensure_system_taxonomies_indexes(db).await?;
     ensure_taxonomy_candidates_indexes(db).await?;
+    ensure_relationship_type_suggestions_indexes(db).await?;
     // ── agent-self-evolution W0 (Task 1.2) ──
     ensure_evolution_indexes(db).await?;
     // LLM 服务商配置：(workspace_id, provider_id) 唯一；is_active 部分索引便于
     // 启动时快速取出当前 active 记录。
     ensure_llm_provider_indexes(db).await?;
+    // objective-purchase-facts G2：商品库索引。
+    ensure_products_indexes(db).await?;
     Ok(())
 }
 
@@ -584,6 +617,34 @@ async fn ensure_llm_provider_indexes(db: &Database) -> anyhow::Result<()> {
         .create_index(
             IndexModel::builder()
                 .keys(doc! { "workspaceId": 1, "isActive": 1 })
+                .build(),
+            None,
+        )
+        .await?;
+    Ok(())
+}
+
+/// objective-purchase-facts G2：`products` 商品库索引。
+///
+/// - `(workspace_id, product_id)` 唯一：商品业务主键在租户内唯一，CRUD upsert
+///   的幂等门，DuplicateKey 视为「product_id 已存在」。
+/// - `(workspace_id, status)`：前端商品列表按 status（active/archived）筛选。
+///
+/// 字段为 snake_case：`Product` 结构未加 `#[serde(rename_all)]`，BSON 层即 snake_case。
+async fn ensure_products_indexes(db: &Database) -> anyhow::Result<()> {
+    db.products()
+        .create_index(
+            IndexModel::builder()
+                .keys(doc! { "workspace_id": 1, "product_id": 1 })
+                .options(IndexOptions::builder().unique(true).build())
+                .build(),
+            None,
+        )
+        .await?;
+    db.products()
+        .create_index(
+            IndexModel::builder()
+                .keys(doc! { "workspace_id": 1, "status": 1 })
                 .build(),
             None,
         )
@@ -819,6 +880,36 @@ async fn ensure_taxonomy_candidates_indexes(db: &Database) -> anyhow::Result<()>
             IndexModel::builder()
                 .keys(doc! { "scope": 1, "kind": 1, "raw_value": 1 })
                 .options(IndexOptions::builder().unique(true).build())
+                .build(),
+            None,
+        )
+        .await?;
+    Ok(())
+}
+
+/// 数字分身建议链 T5：`relationship_type_suggestions` 索引。
+///
+/// - `(workspace_id, contact_id)` 唯一：幂等 upsert 锚——同一 contact 在租户内只
+///   一条关系类型建议，重复观察累加 `occurrences` / 刷新 `last_seen_at`，
+///   DuplicateKey 视为「建议已存在」。
+/// - `(workspace_id, status)`：后台审核列表按 status（pending/approved/rejected）筛选。
+///
+/// 字段为 snake_case：`RelationshipTypeSuggestion` 未加 `#[serde(rename_all)]`，
+/// BSON 层即 snake_case，须与此处索引字段逐字一致。
+async fn ensure_relationship_type_suggestions_indexes(db: &Database) -> anyhow::Result<()> {
+    db.collection_relationship_type_suggestions()
+        .create_index(
+            IndexModel::builder()
+                .keys(doc! { "workspace_id": 1, "contact_id": 1 })
+                .options(IndexOptions::builder().unique(true).build())
+                .build(),
+            None,
+        )
+        .await?;
+    db.collection_relationship_type_suggestions()
+        .create_index(
+            IndexModel::builder()
+                .keys(doc! { "workspace_id": 1, "status": 1 })
                 .build(),
             None,
         )
@@ -1177,6 +1268,32 @@ async fn ensure_evolution_indexes(db: &Database) -> anyhow::Result<()> {
             None,
         )
         .await?;
+    db.domain_profiles()
+        .create_index(
+            IndexModel::builder()
+                .keys(doc! { "workspace_id": 1, "profile_id": 1, "version": -1 })
+                .options(
+                    IndexOptions::builder()
+                        .name("domain_profiles_ws_id_version_idx".to_string())
+                        .build(),
+                )
+                .build(),
+            None,
+        )
+        .await?;
+    db.domain_profiles()
+        .create_index(
+            IndexModel::builder()
+                .keys(doc! { "workspace_id": 1, "is_active": 1 })
+                .options(
+                    IndexOptions::builder()
+                        .name("domain_profiles_ws_active_idx".to_string())
+                        .build(),
+                )
+                .build(),
+            None,
+        )
+        .await?;
     db.catalog_rebuild_jobs()
         .create_index(
             IndexModel::builder()
@@ -1348,6 +1465,26 @@ async fn ensure_evolution_indexes(db: &Database) -> anyhow::Result<()> {
         )
         .await?;
 
+    // ── D（自学习可观测）deal_attribution_stats ───────────────────────────
+    // 同 reviewer_stats：feedback_worker 每 workspace 一行滚动统计，upsert 落点按
+    // stat_id (`<workspace_id>::deal_attribution`) 定位，存最近一轮 30d 窗口成交追认
+    // 强化的命中数（H11-linkage 效果观测）。
+    db.raw()
+        .collection::<mongodb::bson::Document>("deal_attribution_stats")
+        .create_index(
+            IndexModel::builder()
+                .keys(doc! { "stat_id": 1 })
+                .options(
+                    IndexOptions::builder()
+                        .name("deal_attribution_stats_stat_id_unique".to_string())
+                        .unique(true)
+                        .build(),
+                )
+                .build(),
+            None,
+        )
+        .await?;
+
     // ── Phase G / P2 lessons_learned ──────────────────────────────────────
     // lessons_learned 经 raw collection 读写（无 typed accessor）；list 查询按
     // {workspace_id} 过滤 + {updated_at:-1} 排序（lessons_learned.rs:60,76），
@@ -1389,6 +1526,27 @@ async fn ensure_evolution_indexes(db: &Database) -> anyhow::Result<()> {
                     IndexOptions::builder()
                         .unique(true)
                         .name("uniq_principal_escalation_short_code".to_string())
+                        .build(),
+                )
+                .build(),
+            None,
+        )
+        .await?;
+    // 同客户同类别只允许一条 pending 请示：escalate_held_decision / trigger_principal_escalation
+    // 此前用 has_pending_for_contact (count) 后再 insert_pending_escalation，存在 TOCTOU——
+    // follow-up worker 与 webhook debounce runner 是两个独立 tokio 任务，可并发跑同一 contact，
+    // 各 count 到 0 → 各插一条 → 领导被推两张卡。partial filter 限定 status=pending 否则会
+    // 误伤 resolved 历史（同客户同类别本就可多次历史请示）。insert 侧捕获本索引的 11000
+    // dup-key 当作"已存在 pending"静默跳过推卡（见 ledger::insert_pending_escalation）。
+    db.agent_principal_escalations()
+        .create_index(
+            IndexModel::builder()
+                .keys(doc! { "workspace_id": 1, "contact_wxid": 1, "category": 1 })
+                .options(
+                    IndexOptions::builder()
+                        .unique(true)
+                        .partial_filter_expression(doc! { "status": "pending" })
+                        .name("uniq_principal_escalation_pending_ws_contact_category".to_string())
                         .build(),
                 )
                 .build(),

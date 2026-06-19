@@ -14,7 +14,8 @@ export type Channel =
   | "evolution"
   | "quality"
   | "llmProviders"
-  | "knowledgeWiki";
+  | "knowledgeWiki"
+  | "productsDeals";
 export type ContactTab = "all" | "managed" | "normal";
 export type SmartOpsTab = "cockpit" | "adjust" | "profile" | "memory" | "simulation" | "conversation";
 export type TraditionalOpsTab = "playbooks" | "prompts" | "settings" | "audit";
@@ -385,4 +386,166 @@ export type OperationDomainDraft = {
   reviewPolicy: string;
   runtimeParameters: string;
   stateMachine: string;
+};
+
+// ── DomainProfile（行业配置）────────────────────────────────────────────────
+// 后端 DomainProfile 用 serde_json::to_value 序列化 → snake_case JSON。
+
+export type ProfileDimension = {
+  kind: string;
+  display_name: string;
+  participates_in_decision: boolean;
+  description: string;
+};
+
+export type BusinessFormula = {
+  key: string;
+  expression: string;
+  display_name: string;
+  // 后端 Option<String>：映射到 reviewer/evaluations 的 score key（#7 漂移护栏锁此字段）。
+  // 编辑现有公式时须保留，避免对象覆盖丢字段。
+  eval_score_key?: string | null;
+};
+
+export type CommitmentMarkers = {
+  product_effect: string[];
+  tone_only: string[];
+};
+
+export type CoverageDimension = {
+  key: string;
+  display_name: string;
+  required: boolean;
+  anchor_hint?: string | null;
+};
+
+// H16 知识切片用途角色。对齐后端 ChunkRole。
+export type ChunkRole = {
+  key: string;
+  header: string;
+  order: number;
+  is_fallback: boolean;
+};
+
+// H17 memoryCard 记忆维度。对齐后端 MemoryDimension。
+export type MemoryDimension = {
+  key: string;
+  display_name: string;
+  cap: number;
+  is_core: boolean;
+  prompt_hint?: string | null;
+  candidate_type: boolean;
+};
+
+// H11 自学习极性。对齐后端 OutcomePolarity。
+export type OutcomePolarity = {
+  positive: string[];
+  negative: string[];
+};
+
+// H8/H19 运营范式（三驱动力开关 + 阈值 + 作息门控）。对齐后端 OperationMode。
+export type FunnelMode = {
+  enabled: boolean;
+  stagnation_threshold_days?: number | null;
+};
+export type SilenceMode = {
+  enabled: boolean;
+  threshold_hours?: number | null;
+};
+export type CommitmentMode = {
+  enabled: boolean;
+  imminent_window_hours?: number | null;
+};
+export type QuietHoursMode = {
+  enabled_override?: boolean | null;
+};
+export type OperationMode = {
+  funnel: FunnelMode;
+  silence: SilenceMode;
+  commitment: CommitmentMode;
+  quiet_hours: QuietHoursMode;
+};
+
+// 五闸阈值覆盖。对齐后端 ProfileThresholds（#[serde(rename_all = "camelCase")]）。
+// 字段为 undefined/缺省 = 不覆盖该闸，沿用该域默认（销售域 6/7/6/6/7）。
+export type ProfileThresholds = {
+  factRiskBlockAt?: number | null;
+  pressureRiskBlockAt?: number | null;
+  humanLikeRewriteBelow?: number | null;
+  emotionalValueRewriteBelow?: number | null;
+  productAccuracyBlockBelow?: number | null;
+};
+
+export type DomainProfile = {
+  id: string;
+  profile_id: string;
+  workspace_id: string;
+  display_name: string;
+  description: string;
+  profile_dimensions: ProfileDimension[];
+  prompt_fragment: string;
+  conversation_modes: string[];
+  business_formulas: BusinessFormula[];
+  commitment_markers: CommitmentMarkers;
+  coverage_dimensions: CoverageDimension[];
+  threshold_overrides?: ProfileThresholds | null;
+  // universal-domain-adaptation 增量字段（H12/H14/H16/H17/H11/H8 等）。
+  soul_override?: string | null;
+  methodology_override?: string | null;
+  conversation_mode_policy?: string | null;
+  methodology_generator_preamble?: string | null;
+  stagnation_dimension?: string | null;
+  domain_schema_id?: string | null;
+  grounding_gate_bypass_without_claim?: boolean;
+  distrust_self_reported_low_risk?: boolean;
+  chunk_roles?: ChunkRole[];
+  memory_dimensions?: MemoryDimension[];
+  outcome_polarity?: OutcomePolarity;
+  operation_mode?: OperationMode;
+  version: number;
+  current_version: boolean;
+  previous_version: number | null;
+  is_active: boolean;
+  seeded_by: string | null;
+  created_at?: string;
+  updated_at?: string;
+};
+
+export type DomainProfileDraft = {
+  profile_id?: string;
+  display_name?: string;
+  description?: string;
+  profile_dimensions?: ProfileDimension[];
+  prompt_fragment?: string;
+  conversation_modes?: string[];
+  business_formulas?: BusinessFormula[];
+  commitment_markers?: CommitmentMarkers;
+  coverage_dimensions?: CoverageDimension[];
+  threshold_overrides?: ProfileThresholds;
+  methodology_generator_preamble?: string;
+  soul_override?: string;
+  methodology_override?: string;
+  conversation_mode_policy?: string;
+  stagnation_dimension?: string;
+  domain_schema_id?: string;
+  grounding_gate_bypass_without_claim?: boolean;
+  distrust_self_reported_low_risk?: boolean;
+  chunk_roles?: ChunkRole[];
+  memory_dimensions?: MemoryDimension[];
+  outcome_polarity?: OutcomePolarity;
+  operation_mode?: OperationMode;
+};
+
+export type GenerateProfileRequest = {
+  businessDescription: string;
+  profileId: string;
+  displayName?: string;
+};
+
+export type GenerateProfileResponse = {
+  ok: boolean;
+  id: string;
+  profileId: string;
+  status: string;
+  note: string;
 };

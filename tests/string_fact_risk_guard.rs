@@ -48,7 +48,9 @@ fn minimal_state_machine_config() -> OperationDomainConfig {
         doc! { "key": "A", "allowedFrom": [] },
         doc! { "key": "B", "allowedFrom": ["A"] },
         doc! { "key": "C", "allowedFrom": [], "allowFromAny": true },
-        doc! { "key": "new_contact", "allowedFrom": [] },
+        // H13：new_contact 标 initial:true —— 引擎从写死的 `to=="new_contact"` 改读
+        // initial 标志后，空 from 唯一合法目标由本标志声明（与生产 DEFAULT 状态机一致）。
+        doc! { "key": "new_contact", "allowedFrom": [], "initial": true },
     ];
     OperationDomainConfig {
         id: None,
@@ -93,10 +95,17 @@ fn empty_state_machine_fails_closed() {
 }
 
 #[test]
-fn unknown_target_state_returns_none() {
+fn unknown_target_state_fails_closed() {
     let cfg = minimal_state_machine_config();
-    // target 不在 states 列表 → find 失败 → early-return None。
-    assert!(check_state_transition(Some(&cfg), Some("A"), "Z_unknown").is_none());
+    // 修复（问题 E）：target 不在 states 列表 = 非法迁移目标 → fail-closed 拦截。
+    // 此前 `?` 在 find 失败时 early-return None（fail-open），会让未知 customer_stage
+    // 经 C2 写入幻影 operation_state 并旁路 policy enforcement。与 state_machine_empty
+    // 已 fail-closed 的设计一致。
+    let blocked = check_state_transition(Some(&cfg), Some("A"), "Z_unknown");
+    assert!(blocked.is_some(), "未登记 target 必须 fail-closed 拦截");
+    let reason = blocked.unwrap();
+    assert!(reason.contains("state_transition_invalid"));
+    assert!(reason.contains("unknown_target"), "拦截理由应标 unknown_target，实际：{reason}");
 }
 
 #[test]
@@ -164,17 +173,20 @@ proptest! {
             from, result);
     }
 
-    /// PBT：未登记的 target 始终走 fail-open（None）。
+    /// PBT（修复问题 E）：未登记的 target 始终 fail-closed 拦截（Some），
+    /// 不再 fail-open 放行。防止未知 customer_stage 写入幻影 operation_state。
     #[test]
-    fn unknown_target_always_passes(
+    fn unknown_target_always_fails_closed(
         from in "[a-zA-Z_][a-zA-Z0-9_]{0,12}",
         to in "Z_[a-z]{1,8}",
     ) {
         let cfg = minimal_state_machine_config();
         let result = check_state_transition(Some(&cfg), Some(&from), &to);
-        prop_assert!(result.is_none(),
-            "未登记 target={:?} 必须 fail-open，实际拦截 reason={:?}",
-            to, result);
+        prop_assert!(result.is_some(),
+            "未登记 target={:?} 必须 fail-closed 拦截，实际放行",
+            to);
+        prop_assert!(result.as_deref().unwrap().contains("unknown_target"),
+            "拦截理由应标 unknown_target，实际={:?}", result);
     }
 }
 

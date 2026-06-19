@@ -51,7 +51,7 @@ use mongodb::bson::{doc, oid::ObjectId, DateTime};
 use serde_json::json;
 use wechatagent::agent::knowledge_agent::{answer, AnswerRequest, CatalogFilter};
 use wechatagent::auth::AuthenticatedAdmin;
-use wechatagent::llm::LlmClient;
+use wechatagent::llm::{LlmClient, LlmFormat};
 use wechatagent::models::{LlmProviderConfig, OperationKnowledgeChunk, RelatedRef};
 use wechatagent::routes::ext_knowledge::{
     auto_verify_operation_knowledge_chunks, build_operation_knowledge_completeness, chat_turn,
@@ -76,9 +76,28 @@ fn real_llm_from_env() -> Option<Arc<LlmClient>> {
     let base_url = std::env::var("REAL_LLM_BASE_URL")
         .unwrap_or_else(|_| "https://api.supxh.xin/v1".to_string());
     let model = std::env::var("REAL_LLM_MODEL").unwrap_or_else(|_| "deepseek-v4-pro".to_string());
-    let client =
-        LlmClient::new(base_url, api_key, model, 180, 6, 2500).expect("构造真实 LlmClient");
+    let client = build_real_client(base_url, api_key, model, "REAL_LLM_FORMAT", 10);
     Some(Arc::new(client))
+}
+
+/// 按 `<format_env>`（openai/anthropic，缺省 openai）构造 LlmClient。claude 系走
+/// Anthropic `/v1/messages`（非流式）；gpt/其它走 OpenAI `/v1/chat/completions`。
+/// 与 `real_llm_ops_smoke.rs::build_real_client` 同口径——端点切到 rsxermu666.cn
+/// （主 claude-opus-4-8）时主模型走 Anthropic，避免被当 OpenAI 走错路径返回 4xx 后被
+/// `unwrap_or_skip_transient!` 跳过出假绿。
+fn build_real_client(
+    base_url: String,
+    api_key: String,
+    model: String,
+    format_env: &str,
+    retries: u32,
+) -> LlmClient {
+    let fmt = match std::env::var(format_env).ok().as_deref() {
+        Some("anthropic") | Some("messages") | Some("claude") => LlmFormat::Anthropic,
+        _ => LlmFormat::Openai,
+    };
+    LlmClient::with_format(base_url, api_key, model, fmt, 180, retries, 2500)
+        .expect("构造真实 LlmClient")
 }
 
 /// 跳过宏：无 key 时打印一行 skip 并 `return`（不 panic、不算失败）。
@@ -111,13 +130,47 @@ macro_rules! unwrap_or_skip_transient {
             Err(wechatagent::error::AppError::LlmUnavailable {
                 kind,
                 retry_count,
+                detail,
                 ..
             }) => {
+                let cfg_err_4xx = kind == "endpoint_not_found"
+                    || (kind == "http_4xx"
+                        && !detail.contains("HTTP 401")
+                        && !detail.contains("HTTP 402"));
+                if cfg_err_4xx {
+                    panic!(
+                        "{}：配置错误（kind={kind}），非端点抖动——4xx 多为 baseUrl/model/path 配错，\n                         不当瞬时 skip 假绿（R0.3）。detail={detail}",
+                        $what
+                    );
+                }
                 eprintln!(
                     "skip: {} —— 真模型上游瞬时不可达（kind={kind}, retry_count={retry_count}），\
                      按计划「真模型抖动有限重试+跳过」处理，不算生产级失败",
                     $what
                 );
+                {
+                    use std::io::Write as _;
+                    let dir = std::env::var("REAL_LLM_LEDGER")
+                        .unwrap_or_else(|_| "target/real_llm_ledger".to_string());
+                    let _ = std::fs::create_dir_all(&dir);
+                    if let Ok(mut f) = std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(format!("{dir}/skip_ledger.jsonl"))
+                    {
+                        let _ = writeln!(
+                            f,
+                            "{}",
+                            serde_json::json!({
+                                "test": $what,
+                                "kind": kind,
+                                "retry_count": retry_count,
+                                "file": file!(),
+                                "sha": std::env::var("GITHUB_SHA").unwrap_or_else(|_| "local".into()),
+                            })
+                        );
+                    }
+                }
                 return;
             }
             Err(other) => panic!("{}：{other}", $what),
@@ -762,7 +815,7 @@ async fn k6_real_vision_article_extraction_keeps_needs_review() {
         model: vision_model,
         is_active: false,
         timeout_seconds: Some(180),
-        max_retries: Some(6),
+        max_retries: Some(10),
         retry_base_ms: Some(2500),
         supports_vision: true,
         is_vision_active: true,
@@ -835,6 +888,8 @@ async fn k6_real_vision_article_extraction_keeps_needs_review() {
 // **硬断言（红线）**：调用后该 chunk 的 integrity_status **绝不**变成 verified。
 // 先用纯函数 `decide_auto_verify_status` 锁死闸门契约（确定性，不依赖真模型抖动），
 // 再跑真模型端到端确认落库结果与契约一致。
+// **D2 审计链**：processed≥1 时断言 auto_verify 经 apply_chunk_revision 落了一条
+// op=verify / source=rule / created_by=auto_verify 的 chunk_revisions（不再绕过审计）。
 
 #[tokio::test]
 #[ignore]
@@ -934,6 +989,41 @@ async fn k7_real_auto_verify_provenance_gate_holds() {
         Some("verified"),
         "缺 source_quote/anchor 的 chunk 被自动 verified——provenance 闸门被击穿！"
     );
+
+    // D2 审计链：只要真模型实际处理过这条 chunk（processed≥1），auto_verify 的每条裁决
+    // 都必须接回 apply_chunk_revision，在 chunk_revisions 留一条 op=verify、**source=rule**
+    // （裁决由 LLM 自评+规则闸门做出、admin 仅触发批处理，非人工逐条签字）、
+    // created_by=auto_verify 的不可变历史。此前 auto_verify 直接 update_one 绕过审计链，
+    // 「谁在何时基于什么裁决」查不到。注：单条 LLM 调用 transient 失败时 handler `continue`
+    // 不写 revision，故 gate 在 processed≥1。
+    let processed = resp.0.get("processed").and_then(|v| v.as_i64()).unwrap_or(0);
+    if processed >= 1 {
+        use futures::TryStreamExt;
+        let revs: Vec<wechatagent::models::ChunkRevision> = state
+            .db
+            .chunk_revisions()
+            .find(doc! { "chunk_id": id.to_hex() }, None)
+            .await
+            .expect("query chunk_revisions")
+            .try_collect()
+            .await
+            .expect("collect chunk_revisions");
+        assert!(
+            !revs.is_empty(),
+            "[k7] auto_verify processed={processed} 但未写任何 chunk_revisions——审计链断裂"
+        );
+        let rev = &revs[0];
+        assert_eq!(rev.op, "verify", "[k7] auto_verify revision op 必须为 verify");
+        assert_eq!(
+            rev.source, "rule",
+            "[k7] auto_verify revision source 必须为 rule（LLM 自评+规则闸门，非人工签字）"
+        );
+        assert_eq!(
+            rev.created_by.as_deref(),
+            Some("auto_verify"),
+            "[k7] auto_verify revision created_by 必须为 auto_verify"
+        );
+    }
 }
 
 // ── K8 · AI 修复只产 patch、永不自动落库（propose_chunk_repair）────────────────
@@ -1288,5 +1378,168 @@ async fn k11_real_completeness_audit_closed_mode_never_verifies() {
         Some("needs_review"),
         "完整度审计把 needs_review chunk 改成了 {:?}——审计只读红线被击穿（Auditor 绝不 verify）！",
         after.integrity_status
+    );
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// R4.2 知识问答跨域 —— 非销售（法律咨询）行业知识库下，核心红线仍成立。
+//
+// spec R4.2：知识问答/抽取/完整度在非销售域语义正确。
+//
+// k1-k11 全是销售/电商语料（退款政策/营业时间/会员系统）。R4.2 证明知识子系统的两条
+// 核心红线**域无关**——换成**法律咨询**行业语料，同样：
+// - 无幻觉弃答 + recall_miss 闭环（问知识库没有的法律问题→诚实弃答+留 gap，不编造法条）；
+// - unverified 不上桌（needs_review 的法律草稿永不被 cite，即便它正好答到了问题）。
+//
+// 机制是同一套生产代码（catalog→search→open_chunk + verified-only 闸 + cite⊆seed），
+// 换语料不改机制——但 R4.2 用非销售语料端到端验证，确保红线不是"只在销售域被测过"。
+// 复用 k3/k4 的范式（seed_verified / seed_chunk / answer / cite⊆seed / recall_miss 闭环）。
+// ════════════════════════════════════════════════════════════════════════════
+
+/// R4.2a：法律咨询知识库无幻觉弃答 + recall_miss 闭环（对标 k3，换非销售语料）。
+#[tokio::test]
+#[ignore]
+async fn r4_2_legal_domain_no_hallucination_when_topic_absent() {
+    let llm = require_real_llm!();
+    let app = TestApp::start().await;
+    let mcp = dummy_mcp_server().await;
+    let state = common::rebuild_app_state_with_real_llm(&app, llm, mcp.uri());
+    let ws = state.config.default_workspace_id.clone();
+
+    // 法律咨询行业语料（与销售完全不同的知识域）。
+    let id1 = seed_verified(
+        &app,
+        &ws,
+        "劳动合同解除经济补偿",
+        "用人单位解除劳动合同的经济补偿标准。",
+        "用人单位无过失性辞退劳动者的，按劳动者在本单位工作年限每满一年支付一个月工资的经济补偿；六个月以上不满一年按一年计。",
+    )
+    .await;
+    let id2 = seed_verified(
+        &app,
+        &ws,
+        "工伤认定时限",
+        "工伤认定申请的时限规定。",
+        "用人单位应在事故伤害发生之日起 30 日内提出工伤认定申请；用人单位未申请的，工伤职工可在 1 年内自行申请。",
+    )
+    .await;
+    let seed = [id1, id2];
+
+    // 知识库完全没覆盖的法律主题：跨境离婚财产分割管辖。
+    let original_query = "涉外离婚案件中，境外房产的分割应当适用哪国法律？由哪个法院管辖？";
+    let req = AnswerRequest {
+        workspace_id: ws.clone(),
+        account_id: None,
+        query: original_query.to_string(),
+        filter: CatalogFilter::default(),
+        max_rounds: None,
+    };
+    let result = unwrap_or_skip_transient!(answer(&state, req).await, "R4.2a 法律域 answer");
+
+    eprintln!(
+        "[r4.2a] rounds_used={} cited={:?} answer={:?}",
+        result.rounds_used,
+        result.cited_chunk_ids,
+        result.answer.chars().take(160).collect::<String>(),
+    );
+
+    assert!(result.rounds_used >= 1, "真模型必须至少跑 1 轮");
+    assert!(!result.answer.trim().is_empty(), "answer 不应为空（至少应说明无相关信息）");
+    // 红线（域无关）：cite ⊆ seed，绝不捏造法条 chunk id。
+    for c in &result.cited_chunk_ids {
+        assert!(
+            seed.contains(c),
+            "法律域真模型 cite 了不存在/捏造的 chunk id={c}，seed={seed:?}",
+        );
+    }
+
+    // 闭环红线：诚实弃答（cited 空）→ 必留携带原始 query 的 recall_miss gap（与 k3 同口径）。
+    if result.cited_chunk_ids.is_empty() {
+        let mut found: Option<wechatagent::models::KnowledgeGapSignal> = None;
+        for _ in 0..10 {
+            let mut cursor = state
+                .db
+                .knowledge_gap_signals()
+                .find(
+                    doc! { "workspace_id": &ws, "kind": "recall_miss", "status": "pending" },
+                    None,
+                )
+                .await
+                .expect("query knowledge_gap_signals");
+            use futures::StreamExt;
+            while let Some(next) = cursor.next().await {
+                let sig = next.expect("decode gap signal");
+                if sig.search_queries.iter().any(|q| q == original_query) {
+                    found = Some(sig);
+                    break;
+                }
+            }
+            if found.is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        }
+        let sig = found.expect(
+            "法律域诚实弃答后必须留 recall_miss/pending gap 信号且含原始 query（确定性闭环域无关）",
+        );
+        assert_eq!(sig.kind, "recall_miss");
+        assert_eq!(sig.status, "pending");
+        eprintln!("[r4.2a] 法律域闭环 gap 信号 ✓ search_queries={:?}", sig.search_queries);
+    }
+}
+
+/// R4.2b：法律域 unverified 草稿永不上桌（对标 k4，换非销售语料）。
+#[tokio::test]
+#[ignore]
+async fn r4_2_legal_domain_unverified_chunk_never_served() {
+    let llm = require_real_llm!();
+    let app = TestApp::start().await;
+    let mcp = dummy_mcp_server().await;
+    let state = common::rebuild_app_state_with_real_llm(&app, llm, mcp.uri());
+    let ws = state.config.default_workspace_id.clone();
+
+    // 答案只在一条 needs_review 的法律草稿里（未经律师审定，不能对客）。
+    let id_unverified = seed_chunk(
+        &app,
+        &ws,
+        "民间借贷利率上限（草稿待审）",
+        "民间借贷受法律保护的利率上限。",
+        "民间借贷年利率不超过合同成立时一年期 LPR 的 4 倍部分受法律保护，超过部分法院不予支持。",
+        "needs_review",
+        "active",
+        0.5,
+        Vec::new(),
+    )
+    .await;
+    // 另 seed 一条无关 verified chunk 让 catalog 非空。
+    let _id_other = seed_verified(
+        &app,
+        &ws,
+        "诉讼时效一般规定",
+        "向法院请求保护民事权利的诉讼时效。",
+        "向人民法院请求保护民事权利的诉讼时效期间一般为三年，自权利人知道或应当知道权利受损之日起计算。",
+    )
+    .await;
+
+    let req = AnswerRequest {
+        workspace_id: ws.clone(),
+        account_id: None,
+        query: "民间借贷的利率超过多少就不受法律保护了？".to_string(),
+        filter: CatalogFilter::default(), // include_unverified=false（默认）
+        max_rounds: None,
+    };
+    let result = unwrap_or_skip_transient!(answer(&state, req).await, "R4.2b 法律域 unverified");
+
+    eprintln!(
+        "[r4.2b] cited={:?} answer={:?}",
+        result.cited_chunk_ids,
+        result.answer.chars().take(160).collect::<String>(),
+    );
+
+    // 红线（域无关）：needs_review 的法律草稿永不被 cite（即便它正好答到了问题）。
+    assert!(
+        !result.cited_chunk_ids.contains(&id_unverified),
+        "法律域 unverified 草稿 id={id_unverified} 被 cite——verified-only 闸被击穿（域无关红线）！cited={:?}",
+        result.cited_chunk_ids
     );
 }

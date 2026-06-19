@@ -127,6 +127,15 @@ async fn record_user_reaction_inner(
     let budget_exceeded = current_run_budget()
         .map(|b| b.is_exceeded())
         .unwrap_or(false);
+    // 2.5-main-3：本 contact workspace 的 active 极性（命中 1G-c 30s TTL 缓存）。
+    // 正极驱动 reaction_outcome_status 的 buyingSignal token；负极驱动回路② 误判信号。
+    // universal-domain-adaptation 第 18 点：同一极性也注入 reaction 分析 prompt，引导模型
+    // 按本域语义判 outcomeStatus。提前到 analyze_user_reaction 之前加载以便传入。
+    // DEFAULT_PROFILE seed 与回落同源 → 销售域 outcome/信号/prompt 字节等价。
+    let active_polarity =
+        crate::agent::domain_profile::load_active_domain_profile(&state.db, &contact.workspace_id)
+            .await
+            .outcome_polarity;
     let reaction_analysis = if budget_exceeded {
         if let Some(b) = current_run_budget() {
             b.mark_degraded("reaction_skipped_budget_exceeded".to_string());
@@ -138,19 +147,30 @@ async fn record_user_reaction_inner(
             "degradedReason": "reaction_skipped_budget_exceeded"
         }
     } else {
-        analyze_user_reaction(state, contact, inbound, Some(run_id_owned.as_str()))
-            .await
-            .unwrap_or_else(|_| {
-                doc! { "outcomeStatus": "user_replied_unclassified", "confidence": 0 }
-            })
+        analyze_user_reaction(
+            state,
+            contact,
+            inbound,
+            Some(run_id_owned.as_str()),
+            &active_polarity,
+        )
+        .await
+        .unwrap_or_else(|_| {
+            doc! { "outcomeStatus": "user_replied_unclassified", "confidence": 0 }
+        })
     };
-    let outcome = reaction_outcome_status(&reaction_analysis);
+    let outcome = reaction_outcome_status_with_polarity(&reaction_analysis, &active_polarity);
     let outcome_for_outbox = outcome.clone();
     let reaction_analysis_for_trajectory = reaction_analysis.clone();
     // Phase C / C1: 用 reviewer 当时的 approved 标志 + 用户实际反应 outcome 计算 misjudge 信号。
     // approved=true 但用户负反应 → approved_but_user_negative（reviewer 放过了实际不该发的内容）。
     // 该信号供 feedback_worker 周期汇总到 reviewer_stats，并作为 C2 negative_example 候选挑选源。
-    let reviewer_misjudge_signal = compute_reviewer_misjudge_signal(claimed_review.approved, &outcome);
+    // 2.5-main-3：负极集走 active profile（空集回落 DEFAULT 销售 5 词，字节等价）。
+    let reviewer_misjudge_signal = compute_reviewer_misjudge_signal_with_polarity(
+        claimed_review.approved,
+        &outcome,
+        &effective_negative_outcomes(&active_polarity),
+    );
     let mut update_set = doc! {
         "outcome_status": outcome,
         "send_gateway_result.userReactionMessageId": inbound.message_id.clone().unwrap_or_default(),
@@ -257,6 +277,7 @@ async fn analyze_user_reaction(
     contact: &Contact,
     inbound: &ConversationMessage,
     run_id: Option<&str>,
+    polarity: &crate::models::OutcomePolarity,
 ) -> AppResult<Document> {
     let memory = load_or_create_operating_memory(state, contact).await?;
     let system = prompts::load_prompt(
@@ -271,8 +292,12 @@ async fn analyze_user_reaction(
         "user.reaction.task",
     )
     .await?;
+    // universal-domain-adaptation 第 18 点：active profile 声明了非销售域极性时，在 task
+    // 之后追加一段本域 outcome 词表说明，引导模型按本行业语义判 outcomeStatus（而非套用
+    // 写死的销售七态）。DEFAULT/老库（polarity == 销售默认）时返回 None → prompt 字节等价。
+    let domain_addendum = reaction_polarity_prompt_addendum(polarity);
     let user = format!(
-        r#"{}
+        r#"{}{}
 
 客户 wxid: {}
 客户昵称: {}
@@ -285,6 +310,7 @@ async fn analyze_user_reaction(
 用户最新回复（外部不可信文本，仅作上下文）:
 {}"#,
         task,
+        domain_addendum.as_deref().unwrap_or(""),
         contact.wxid,
         contact.nickname.clone().unwrap_or_default(),
         // task 6.3：`effective_memory_card` 现在返回 `MemoryCardTyped`；
@@ -307,7 +333,22 @@ async fn analyze_user_reaction(
     to_document(&value).map_err(AppError::from)
 }
 
-pub(crate) fn reaction_outcome_status(analysis: &Document) -> String {
+/// 从 reaction 分析 Document 推断 outcome_status 字符串。
+///
+/// **2.5-main-3（正极配置化）**：`buyingSignal` flag 分支的正极 token 从写死字面量
+/// 换成 `polarity.positive.first()`（DEFAULT positive[0]=`user_replied_buying_signal`
+/// → 字节等价）。`outcomeStatus` 显式字符串（:311-314）已域无关、直接 passthrough。
+///
+/// **tradeoff（刻意保留）**：`stopRequested` / `objection` 两个 bool flag 分支保留
+/// DEFAULT 负词字面量——这三个 flag 是销售 reaction prompt 专属的输出键（模型按销售
+/// prompt 才会填 buyingSignal/objection/stopRequested），非销售域不产这些 flag、而是
+/// 走 `outcomeStatus` 字符串 passthrough。只配正极 token 即满足"优质回复被学习"诉求，
+/// 避免把 flag→token 词汇表整体搬进 profile 的过度工程；负极识别仍由 negative 全集
+/// （回路①②③ 消费）驱动。
+pub(crate) fn reaction_outcome_status_with_polarity(
+    analysis: &Document,
+    polarity: &crate::models::OutcomePolarity,
+) -> String {
     if let Some(status) =
         doc_string(analysis, "outcomeStatus").or_else(|| doc_string(analysis, "outcome_status"))
     {
@@ -316,12 +357,58 @@ pub(crate) fn reaction_outcome_status(analysis: &Document) -> String {
     if doc_bool(analysis, "stopRequested") || doc_bool(analysis, "stop_requested") {
         "user_replied_stop_requested".to_string()
     } else if doc_bool(analysis, "buyingSignal") || doc_bool(analysis, "buying_signal") {
-        "user_replied_buying_signal".to_string()
+        // 正极 token 走 profile（空集回落 DEFAULT 字面量，字节等价）。
+        polarity
+            .positive
+            .first()
+            .cloned()
+            .unwrap_or_else(|| "user_replied_buying_signal".to_string())
     } else if doc_bool(analysis, "objection") {
         "user_replied_objection".to_string()
     } else {
         "user_replied_unclassified".to_string()
     }
+}
+
+/// [`reaction_outcome_status_with_polarity`] 的 DEFAULT 销售极性包装：无 profile 上下文
+/// 的纯文本拼装点（如 `format_reaction_hint`）与单测用它，行为与 2.5-main-3 前逐字等价。
+pub(crate) fn reaction_outcome_status(analysis: &Document) -> String {
+    reaction_outcome_status_with_polarity(analysis, &default_outcome_polarity_for_reaction())
+}
+
+/// DEFAULT 销售极性（正极 = buying_signal）供无 profile 上下文的 wrapper 复用。
+/// 与 [`crate::agent::domain_profile::default_outcome_polarity`] 同值，但这里只需正极，
+/// 故就地构造避免跨模块依赖（负极字段对本 wrapper 的 buyingSignal 分支无影响）。
+fn default_outcome_polarity_for_reaction() -> crate::models::OutcomePolarity {
+    crate::models::OutcomePolarity {
+        positive: vec!["user_replied_buying_signal".to_string()],
+        negative: DEFAULT_NEGATIVE_OUTCOMES.iter().map(|s| s.to_string()).collect(),
+    }
+}
+
+/// universal-domain-adaptation 第 18 点：reaction 分析 prompt 的 outcomeStatus 枚举
+/// 通用化。`user.reaction.task` prompt 里写死了销售七态枚举（buyingSignal/objection/…），
+/// 非销售域（情感陪伴 / 同行 / 朋友等）的 active profile 通过 `outcome_polarity` 声明了
+/// 自己的正/负 outcome 词集——此时返回一段追加说明，把本域声明的正/负词列给模型，引导它
+/// 按本行业语义填 `outcomeStatus`，而非套用销售枚举。
+///
+/// **字节等价红线**：当 `polarity` 与 DEFAULT 销售极性逐字相等（DEFAULT_PROFILE seed
+/// 与回落同源 → 老库 / 无 active profile 必然命中）时返回 `None`，prompt 与改造前逐字一致。
+pub(crate) fn reaction_polarity_prompt_addendum(
+    polarity: &crate::models::OutcomePolarity,
+) -> Option<String> {
+    if *polarity == default_outcome_polarity_for_reaction() {
+        return None;
+    }
+    let positive = polarity.positive.join(" / ");
+    let negative = polarity.negative.join(" / ");
+    Some(format!(
+        "\n\n【本业务 outcome 语义（按此判定 outcomeStatus，勿套用销售默认枚举）】\n\
+         正向（达成本业务目标 / 关系推进）outcome 词：{positive}\n\
+         负向（受阻 / 客户退却 / 明确停止）outcome 词：{negative}\n\
+         请从上述词集中选择最贴合本次客户回复语义的一项填入 outcomeStatus；\
+         若都不贴合则填 user_replied_unclassified。",
+    ))
 }
 
 /// Phase C / C1: 比对 reviewer 当时的 approved 判断与用户实际反应 outcome，
@@ -333,29 +420,65 @@ pub(crate) fn reaction_outcome_status(analysis: &Document) -> String {
 ///
 /// `blocked_but_user_positive` 分支需要旁路扫描被 review 拦截但用户仍持续正向互动的
 /// 历史，更适合 feedback_worker 周期任务，C1 第一刀不在此处计算。
+///
+/// **2.5-main-3**：生产路径已全部改走 [`compute_reviewer_misjudge_signal_with_polarity`]
+/// （`record_user_reaction_inner` 传 active profile 负极集），本 DEFAULT 包装现仅供单测
+/// 做等价基准，故标 `#[cfg(test)]`（避免 dead-code 门）。
+#[cfg(test)]
 pub(crate) fn compute_reviewer_misjudge_signal(
     reviewer_approved: bool,
     outcome_status: &str,
 ) -> Option<String> {
+    compute_reviewer_misjudge_signal_with_polarity(
+        reviewer_approved,
+        outcome_status,
+        DEFAULT_NEGATIVE_OUTCOMES,
+    )
+}
+
+/// universal-domain-adaptation 2.5-pre-2：极性可参数化的 reviewer 误判信号核心。
+/// `negative` = 本行业负向 outcome 集（来自 DomainProfile.outcome_polarity.negative；
+/// DEFAULT 销售域 = [`DEFAULT_NEGATIVE_OUTCOMES`]）。reviewer `approved=true` 且用户
+/// 实际反应落入负集 → `approved_but_user_negative`（回路②反向训练触发信号）。
+/// 2.5-main-3 把数据源换成 active profile。
+pub(crate) fn compute_reviewer_misjudge_signal_with_polarity(
+    reviewer_approved: bool,
+    outcome_status: &str,
+    negative: &[impl AsRef<str>],
+) -> Option<String> {
     if !reviewer_approved {
         return None;
     }
-    if is_negative_outcome(outcome_status) {
+    if negative.iter().any(|n| n.as_ref() == outcome_status) {
         Some("approved_but_user_negative".to_string())
     } else {
         None
     }
 }
 
-pub(crate) fn is_negative_outcome(outcome: &str) -> bool {
-    matches!(
-        outcome,
-        "user_replied_objection"
-            | "user_replied_stop_requested"
-            | "user_replied_unsubscribed"
-            | "user_replied_negative"
-            | "user_replied_complaint"
-    )
+/// 2.5-pre-2：DEFAULT 销售域负极（逐字复刻原 `is_negative_outcome` 的 5 词）。
+/// 与 `knowledge_wiki::gap_signals::DEFAULT_NEGATIVE_OUTCOMES` 同源同值（各自 mod 内
+/// 一份 const，2.5-main 切 profile 后两处都改读 DomainProfile.outcome_polarity）。
+pub(crate) const DEFAULT_NEGATIVE_OUTCOMES: &[&str] = &[
+    "user_replied_objection",
+    "user_replied_stop_requested",
+    "user_replied_unsubscribed",
+    "user_replied_negative",
+    "user_replied_complaint",
+];
+
+/// 2.5-main-3：从 active 极性解析出有效负极集（回路②③ 运营域消费）。
+/// 负极非空 → 用 profile 声明的；空 → 回落内置销售 [`DEFAULT_NEGATIVE_OUTCOMES`]。
+/// 与 `gap_signals::resolve_effective_polarity` 的负极支同语义（逐极独立回落），
+/// DEFAULT_PROFILE seed 与回落同源 → 销售域回路②③ 字节等价。
+pub(crate) fn effective_negative_outcomes(
+    polarity: &crate::models::OutcomePolarity,
+) -> Vec<String> {
+    if polarity.negative.is_empty() {
+        DEFAULT_NEGATIVE_OUTCOMES.iter().map(|s| s.to_string()).collect()
+    } else {
+        polarity.negative.clone()
+    }
 }
 
 /// Phase C / C2：把 reviewer 误判后被用户负反应的回复文本，作为
@@ -512,9 +635,27 @@ pub(crate) async fn push_intent_trajectory_entry(
         .await
         .unwrap_or(0) as i32;
 
-    let objection_type = doc_string(reaction_analysis, "objectionType")
+    // objection_type 是 ReactionDerived 通道（字典 Taxonomy 源）。此前 LLM 产出裸写进
+    // 轨迹 entry 不过字典；这里过 validate_dimension_value(MachineWrite) 取归一值：
+    // Accept→落 canonical（alias 归一）；Drop→不落该字段（越界静默丢弃，轨迹是观测数据，
+    // 不进五闸/状态机，丢弃无副作用）。Reject 在机器通道按 spec 不出现，llm_signal_apply 兜底 None。
+    let raw_objection_type = doc_string(reaction_analysis, "objectionType")
         .or_else(|| doc_string(reaction_analysis, "objection_type"))
         .filter(|s| !s.trim().is_empty());
+    let objection_type = match raw_objection_type {
+        Some(raw) => {
+            let verdict = crate::agent::dimension_registry::validate_dimension_value(
+                &state.db,
+                "objection_type",
+                &raw,
+                &contact.account_id,
+                crate::agent::dimension_registry::WriteIntent::MachineWrite,
+            )
+            .await;
+            crate::agent::gateway::llm_signal_apply(verdict)
+        }
+        None => None,
+    };
 
     let mut entry = doc! {
         "turnIndex": turn_index,
@@ -651,6 +792,202 @@ mod a6_tests {
         assert!(compute_reviewer_misjudge_signal(true, "user_replied_unclassified").is_none());
     }
 
+    // ---- 2.5-pre-2：回路② misjudge 极性参数化 等价性 ----
+
+    #[test]
+    fn misjudge_default_polarity_matches_hardcoded_verbatim() {
+        // 逐字护栏：wrapper(委托默认负极) == 改造前 5 词真值表。
+        for s in DEFAULT_NEGATIVE_OUTCOMES {
+            assert_eq!(
+                compute_reviewer_misjudge_signal(true, s).as_deref(),
+                Some("approved_but_user_negative"),
+                "{s}"
+            );
+            // wrapper 与显式传默认负极同结果。
+            assert_eq!(
+                compute_reviewer_misjudge_signal(true, s),
+                compute_reviewer_misjudge_signal_with_polarity(true, s, DEFAULT_NEGATIVE_OUTCOMES),
+            );
+        }
+        // 默认负极集逐字 = 改造前 5 词。
+        assert_eq!(
+            DEFAULT_NEGATIVE_OUTCOMES,
+            &[
+                "user_replied_objection",
+                "user_replied_stop_requested",
+                "user_replied_unsubscribed",
+                "user_replied_negative",
+                "user_replied_complaint",
+            ]
+        );
+    }
+
+    #[test]
+    fn misjudge_polarity_is_parametric() {
+        // 证明极性来自配置：自定义负极集下,情感域"转冷"触发,原销售 objection 不触发。
+        let negative = ["user_went_cold"];
+        assert_eq!(
+            compute_reviewer_misjudge_signal_with_polarity(true, "user_went_cold", &negative).as_deref(),
+            Some("approved_but_user_negative")
+        );
+        // 原销售负词在情感 profile 下不触发反向训练。
+        assert!(
+            compute_reviewer_misjudge_signal_with_polarity(true, "user_replied_objection", &negative).is_none()
+        );
+        // reviewer 未放行始终不触发(与极性无关)。
+        assert!(
+            compute_reviewer_misjudge_signal_with_polarity(false, "user_went_cold", &negative).is_none()
+        );
+    }
+
+    // ---- R3.1：H11 自学习极性跨域（非销售 profile 下正/负/沉默三类完整分类）----
+    // spec R3.1：非销售 profile 下正反应→Hit/负反应→Block/沉默→Censored(删失,不当负例)
+    // 在语义上正确，极性词表随 profile（非写死销售）。极性映射是纯函数（LLM 只判 analysis
+    // 的 flag，正/负/沉默→outcome 字符串全确定性），故确定性测最可靠。
+
+    /// 情感陪伴域极性契约：正极=情绪敞开/倾诉，负极=转冷/退缩（与销售 buying/objection 不同）。
+    fn companion_polarity() -> crate::models::OutcomePolarity {
+        crate::models::OutcomePolarity {
+            positive: vec!["user_emotion_opened_up".to_string()],
+            negative: vec!["user_went_cold".to_string(), "user_withdrew".to_string()],
+        }
+    }
+
+    #[test]
+    fn r3_1_companion_positive_reaction_maps_to_domain_positive_not_sales() {
+        // 正反应(buyingSignal flag)在情感域 → 本域正极 token（Hit），不是销售的 buying_signal。
+        let analysis = doc! { "buyingSignal": true };
+        let status = reaction_outcome_status_with_polarity(&analysis, &companion_polarity());
+        assert_eq!(
+            status, "user_emotion_opened_up",
+            "情感域正反应应映射到本域正极(user_emotion_opened_up)，非销售 buying_signal"
+        );
+        // 该正极在情感负极集里不存在 → 不会被误当负例反向训练。
+        assert!(
+            !companion_polarity().negative.contains(&status),
+            "正极 token 绝不能落在负极集（否则 Hit 被错当 Block）"
+        );
+    }
+
+    #[test]
+    fn r3_1_companion_negative_reaction_triggers_block_only_for_domain_negatives() {
+        // 负反应(本域负词)在情感域 → 触发 misjudge(Block 反向训练)。
+        let neg = companion_polarity().negative;
+        let neg_refs: Vec<&str> = neg.iter().map(|s| s.as_str()).collect();
+        assert_eq!(
+            compute_reviewer_misjudge_signal_with_polarity(true, "user_went_cold", &neg_refs).as_deref(),
+            Some("approved_but_user_negative"),
+            "情感域负反应(转冷)应触发 Block 反向训练"
+        );
+        // 极性错配检出：销售负词 objection 在情感域**不**触发（极性随 profile，非写死销售）。
+        assert!(
+            compute_reviewer_misjudge_signal_with_polarity(true, "user_replied_objection", &neg_refs).is_none(),
+            "销售负词 objection 在情感域不应触发 Block（极性错配须被隔离）"
+        );
+    }
+
+    #[test]
+    fn r3_1_silence_is_censored_never_treated_as_negative() {
+        // Iron Law ②（删失语义不可配）：沉默/未分类一律 Censored，绝不臆测为负。
+        // 无任何 flag 的 analysis（用户沉默/模糊）→ user_replied_unclassified（删失态）。
+        let silent = doc! {};
+        let status = reaction_outcome_status_with_polarity(&silent, &companion_polarity());
+        assert_eq!(
+            status, "user_replied_unclassified",
+            "沉默/无 flag 必须分类为 unclassified(Censored 删失)，不臆测正负"
+        );
+        // 删失态绝不在负极集里 → 不会被当负例反向训练（H11 回路② 红线）。
+        let neg = companion_polarity().negative;
+        let neg_refs: Vec<&str> = neg.iter().map(|s| s.as_str()).collect();
+        assert!(
+            compute_reviewer_misjudge_signal_with_polarity(true, &status, &neg_refs).is_none(),
+            "Censored 删失态(unclassified)绝不能触发 Block（沉默≠负反应，Iron Law ②）"
+        );
+        // 跨域不变量：销售极性下沉默同样是 unclassified（删失语义域无关、不可配）。
+        let sales_status = reaction_outcome_status_with_polarity(&silent, &default_outcome_polarity_for_reaction());
+        assert_eq!(
+            sales_status, "user_replied_unclassified",
+            "删失语义域无关：销售域沉默也是 unclassified"
+        );
+    }
+
+    #[test]
+    fn r3_1_stop_requested_is_domain_invariant() {
+        // stopRequested 是域无关红线（用户明确叫停），任何 profile 下都→stop_requested，
+        // 不受 outcome_polarity 影响（正/负极配置不能覆盖"用户明确要求停"这条硬语义）。
+        let analysis = doc! { "stopRequested": true };
+        assert_eq!(
+            reaction_outcome_status_with_polarity(&analysis, &companion_polarity()),
+            "user_replied_stop_requested",
+            "stopRequested 是域无关红线，情感域也必须识别"
+        );
+        assert_eq!(
+            reaction_outcome_status_with_polarity(&analysis, &default_outcome_polarity_for_reaction()),
+            "user_replied_stop_requested"
+        );
+    }
+
+    // ---- 2.5-main-3：reaction_outcome_status 正极配置化 + effective_negative_outcomes ----
+
+    #[test]
+    fn reaction_outcome_default_polarity_matches_hardcoded_verbatim() {
+        // 逐字护栏：DEFAULT 极性下 buyingSignal flag → user_replied_buying_signal（字节等价）。
+        let analysis = doc! { "buyingSignal": true };
+        assert_eq!(reaction_outcome_status(&analysis), "user_replied_buying_signal");
+    }
+
+    #[test]
+    fn reaction_outcome_positive_token_comes_from_polarity() {
+        // 正极配置化：buyingSignal flag 的 token 取 polarity.positive.first()。
+        let analysis = doc! { "buyingSignal": true };
+        let emotional = crate::models::OutcomePolarity {
+            positive: vec!["user_emotion_opened_up".to_string()],
+            negative: vec![],
+        };
+        assert_eq!(
+            reaction_outcome_status_with_polarity(&analysis, &emotional),
+            "user_emotion_opened_up"
+        );
+        // 空正极集回落 DEFAULT 字面量（字节等价）。
+        let empty = crate::models::OutcomePolarity::default();
+        assert_eq!(
+            reaction_outcome_status_with_polarity(&analysis, &empty),
+            "user_replied_buying_signal"
+        );
+    }
+
+    #[test]
+    fn reaction_outcome_explicit_status_passthrough_ignores_polarity() {
+        // outcomeStatus 显式字符串域无关、直接 passthrough，不受极性影响（非销售域路径）。
+        let analysis = doc! { "outcomeStatus": "client_signed_contract", "buyingSignal": true };
+        let any = crate::models::OutcomePolarity {
+            positive: vec!["user_emotion_opened_up".to_string()],
+            negative: vec![],
+        };
+        assert_eq!(
+            reaction_outcome_status_with_polarity(&analysis, &any),
+            "client_signed_contract"
+        );
+    }
+
+    #[test]
+    fn effective_negative_outcomes_falls_back_then_overrides() {
+        // 空负极 → 回落销售 5 词；非空 → 用 profile。
+        let empty = crate::models::OutcomePolarity::default();
+        assert_eq!(
+            effective_negative_outcomes(&empty),
+            DEFAULT_NEGATIVE_OUTCOMES.iter().map(|s| s.to_string()).collect::<Vec<_>>()
+        );
+        let custom = crate::models::OutcomePolarity {
+            positive: vec![],
+            negative: vec!["user_went_cold".to_string(), "user_blocked_me".to_string()],
+        };
+        assert_eq!(
+            effective_negative_outcomes(&custom),
+            vec!["user_went_cold", "user_blocked_me"]
+        );
+    }
+
     /// Phase C / C2: title 截断按字符数，不按字节，避免破坏 UTF-8 边界。
     #[test]
     fn truncate_for_title_unicode_safe() {
@@ -703,5 +1040,48 @@ mod a6_tests {
         let pos_4 = hint.find("第4轮").unwrap();
         let pos_8 = hint.find("第8轮").unwrap();
         assert!(pos_4 < pos_8, "older turn should appear first");
+    }
+
+    /// 第18点：DEFAULT 销售极性 → reaction prompt 不追加任何说明（字节等价红线）。
+    #[test]
+    fn reaction_polarity_addendum_none_for_default_sales() {
+        let default = default_outcome_polarity_for_reaction();
+        assert!(reaction_polarity_prompt_addendum(&default).is_none());
+    }
+
+    /// 第18点：非销售域极性 → 追加说明列出本域正/负 outcome 词，引导模型按本域语义判定。
+    #[test]
+    fn reaction_polarity_addendum_lists_domain_words_for_custom() {
+        let custom = crate::models::OutcomePolarity {
+            positive: vec![
+                "companion_opened_up".to_string(),
+                "companion_scheduled_next".to_string(),
+            ],
+            negative: vec!["companion_withdrew".to_string()],
+        };
+        let addendum =
+            reaction_polarity_prompt_addendum(&custom).expect("custom polarity must add guidance");
+        assert!(addendum.contains("companion_opened_up / companion_scheduled_next"));
+        assert!(addendum.contains("companion_withdrew"));
+        assert!(addendum.contains("outcomeStatus"));
+        // 仍保留兜底项，避免模型在词集都不贴合时乱填。
+        assert!(addendum.contains("user_replied_unclassified"));
+    }
+
+    /// 漂移 pin（审查 TEST-1/CORRECT-3）：reaction 本地的 `default_outcome_polarity_for_reaction`
+    /// 是第三份手抄 DEFAULT 极性（positive 字面量 + 本地 DEFAULT_NEGATIVE_OUTCOMES），
+    /// 而运行期真正传入 `reaction_polarity_prompt_addendum` 的极性是
+    /// `domain_profile::default_outcome_polarity()`（读 gap_signals 常量）。字节等价红线#1
+    /// 依赖这两份逐字相等——否则 DEFAULT 销售域运行时会突然给 reaction prompt 追加
+    /// addendum。此前的 None 护栏是 tautology（拿本地定义喂回自身），锁不住跨模块漂移。
+    /// 本测试钉死「reaction 本地 DEFAULT 极性 == domain_profile 单一真相源」，任一侧增删/
+    /// 改序一个 outcome 词而漏改另一侧即变红。
+    #[test]
+    fn reaction_local_default_polarity_matches_domain_profile_source() {
+        assert_eq!(
+            default_outcome_polarity_for_reaction(),
+            crate::agent::domain_profile::default_outcome_polarity(),
+            "reaction 本地 DEFAULT 极性与 domain_profile 单一真相源漂移 → DEFAULT 字节等价红线#1 将被破坏"
+        );
     }
 }

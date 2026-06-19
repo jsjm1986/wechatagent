@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use mongodb::bson::{oid::ObjectId, DateTime, Document};
 use serde::{Deserialize, Deserializer, Serialize};
 
@@ -143,6 +145,13 @@ pub struct Contact {
     /// 上限 1000 字符，由 `PUT /api/contacts/:id/custom-agent-instructions` 维护。
     #[serde(default)]
     pub custom_agent_instructions: Option<String>,
+    /// universal-domain-adaptation H8：单客户运营范式覆盖（优先级高于
+    /// `DomainProfile.operation_mode`，承接「因用户而异」）。`None` → 用 profile 范式。
+    /// 例：某老客户「只维护不推进」→ 设 `operation_mode_override.funnel.enabled=false`，
+    /// 单独对他关漏斗，不影响同号其他客户。解析见
+    /// [`resolve_operation_mode`](crate::planner::resolve_operation_mode)。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation_mode_override: Option<OperationMode>,
     pub agent_profile: Option<AgentProfile>,
     pub memory_summary: Option<String>,
     pub playbook_id: Option<ObjectId>,
@@ -191,12 +200,14 @@ pub struct Contact {
     /// 缺字段时反序列化为空 Vec，向前兼容历史 contact 文档。
     #[serde(default)]
     pub intent_trajectory: Vec<IntentTrajectoryEntry>,
-    /// 自学习采集管道 S5：admin 手动标记的成交事件（正例-only，稀疏 + 延迟）。
-    /// 成交（T0 硬事件）不可从 WeChat 文字入站观测，只能由运营人员手动登记；
-    /// 本字段是未来 PU-learning / 延迟反馈归因的唯一正例来源。本阶段只采集、
-    /// 不参与任何评分或置信反推。缺字段时反序列化为空 Vec，向前兼容历史文档。
-    #[serde(default)]
-    pub deal_events: Vec<DealEvent>,
+    /// 自学习采集管道 S5：admin 手动标记的**结果/成效事件**（正例-only，稀疏 + 延迟）。
+    /// 业务结果（T0 硬事件，如成交 / 报名 / 转化 / 履约完成——具体语义因行业而定）
+    /// 不可从 WeChat 文字入站观测，只能由运营人员事后登记；本字段是未来 PU-learning /
+    /// 延迟反馈归因的唯一正例来源。本阶段只采集、不参与任何评分或置信反推。缺字段时
+    /// 反序列化为空 Vec，向前兼容历史文档；`alias = "deal_events"` 让改名前写入的旧库
+    /// 文档继续可读（universal-domain-adaptation H10：从销售域 `deal_events` 泛化）。
+    #[serde(default, alias = "deal_events")]
+    pub outcome_events: Vec<OutcomeEvent>,
     /// Phase E / E3：联系人语种（BCP-47 短形式，如 `zh-CN` / `en-US`）。
     /// `load_prompt_for_contact` 在 prompt_templates 多 locale 并存时按本字段
     /// 选最匹配版本；缺字段时反序列化为 None，由 `contact_locale_or_default`
@@ -207,23 +218,28 @@ pub struct Contact {
     pub updated_at: DateTime,
 }
 
-/// 自学习采集管道 S5：单条成交事件（admin 手动标记）。
+/// 自学习采集管道 S5：单条**结果/成效事件**（admin 手动标记）。
 ///
-/// 设计取舍——成交是 T0 硬事件，但 WeChat 私聊入站只有文字，系统无法自动观测
-/// 支付/下单；唯一可信来源是运营人员事后登记。因此该结构刻意只承载"被标记的
-/// 客观事实"（标记时间、可选实际发生时间、可选金额），不含任何 LLM 解释或
+/// 设计取舍——业务结果是 T0 硬事件，但 WeChat 私聊入站只有文字，系统无法自动观测
+/// 支付/下单/报名/履约；唯一可信来源是运营人员事后登记。因此该结构刻意只承载
+/// "被标记的客观事实"（标记时间、可选实际发生时间、可选金额），不含任何 LLM 解释或
 /// 置信度反推。本阶段仅落库，作为未来归因/PU-learning 的正例。
+///
+/// universal-domain-adaptation H10：从销售域 `DealEvent`（"成交"）泛化为行业中性的
+/// `OutcomeEvent`（"成效"）。`amount`/`currency` 字段对无金额语义的行业可留空。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
-pub struct DealEvent {
-    /// admin 在后台点击"标记成交"的时间。
+pub struct OutcomeEvent {
+    /// admin 在后台点击"标记成效"的时间。
     pub marked_at: DateTime,
-    /// 成交实际发生时间（admin 可回填；缺省时下游用 `marked_at` 近似）。
+    /// 结果实际发生时间（admin 可回填；缺省时下游用 `marked_at` 近似）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub occurred_at: Option<DateTime>,
-    /// 成交金额（可选，业务自行决定是否登记）。
+    /// 成交金额（可选，业务自行决定是否登记；无金额语义的行业留空）。
+    /// **最小币种单位整数**（如分，19900 = ¥199.00）——金额一律整数防浮点误差，
+    /// 仅前端 fmtPrice / AI prompt 文本两个展示点 ÷100 转「元」。reversal 下表示退款正向量级。
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub amount: Option<f64>,
+    pub amount: Option<i64>,
     /// 金额币种（ISO-4217 短码，如 `CNY`）；与 `amount` 配套。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub currency: Option<String>,
@@ -236,6 +252,128 @@ pub struct DealEvent {
     /// 备注（可选）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
+
+    // ── 客观购买事实增强 G3（2026-06-15 spec）新增 ──
+    /// 成交真相源可信度：`conversation_inferred` | `staff_confirmed` | `payment_verified`。
+    /// 缺省 `staff_confirmed`：历史 outcome_events 全是 admin 手动登记的高可信成交，
+    /// 缺字段即视为已核实。新写入的 `conversation_inferred` 必须显式标注，绝不依赖缺省。
+    /// `#[serde(default)]` 只作用于反序列化；Rust 字面量构造点须显式补此字段。
+    #[serde(default = "default_outcome_verification")]
+    pub verification: String,
+    /// 关联产品的**订单式快照**（成交当时拷贝 product 名/价/sku），而非活引用——
+    /// product 后续改名/下架不污染历史成交正确性。`None` = 无产品语义的成交或旧记录。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub product_ref: Option<OutcomeProductRef>,
+
+    // ── 退款/逆转 §4.5（2026-06-15 spec）新增 ──
+    /// 事件方向：`deal`（正向成交，缺省）| `reversal`（退款/撤单）。
+    /// 逆转**不删原 deal**（审计完整性红线，§4.5），而是 append 一条带 `product_ref` 的
+    /// 反向事件；G4 投影按 `product_id` 抵消件数（净件数 ≤ 0 → 不再持有，退出投影）。
+    /// `amount` 在 reversal 下表示**退款金额的正向量级**（方向由 `event_kind` 承载，
+    /// 故 amount 仍走非负校验）。缺字段 → `deal`：旧记录全是正向成交，语义零变。
+    #[serde(default = "default_outcome_kind")]
+    pub event_kind: String,
+}
+
+fn default_outcome_kind() -> String {
+    "deal".to_string()
+}
+
+fn default_outcome_verification() -> String {
+    "staff_confirmed".to_string()
+}
+
+/// 客观购买事实增强 G3：成交事件上的产品快照（不是活引用）。
+///
+/// 嵌入 [`OutcomeEvent`]（camelCase）的子文档、无独立索引，故保留 `camelCase` 与容器
+/// 一致即可——G4 投影是运行时对反序列化后的 outcome_events 做内存 fold，不按裸 key 查 Mongo。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct OutcomeProductRef {
+    /// 软引用 [`Product::product_id`]；product 被删也保留，仅无法再解引用到活实体。
+    pub product_id: String,
+    /// 成交当时的产品名快照。
+    pub name: String,
+    /// 成交当时单价快照（与 `OutcomeEvent.amount` 可不等：折扣/多件）。
+    /// **最小币种单位整数**（分，19900 = ¥199.00），同 [`OutcomeEvent::amount`]。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unit_price: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sku: Option<String>,
+    /// 件数（默认 1）。
+    #[serde(default = "default_quantity")]
+    pub quantity: u32,
+    /// G4 #4：成交当时冻结的售后/有效期天数快照（来自 `Product.attributes.entitlement_days`）。
+    /// 投影 `project_entitlements` 优先读它，仅在缺失时回落活产品表——故产品下架（archived）
+    /// 后，售后期内的已购客户仍被正确判为 in_aftercare（不再因解引用失败丢时效）。
+    /// None = 无时效产品 / 成交时产品未配 entitlement_days。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entitlement_days: Option<i64>,
+}
+
+fn default_quantity() -> u32 {
+    1
+}
+
+/// 客观购买事实增强 G2：workspace 级产品目录实体（2026-06-15 spec §3）。
+///
+/// admin 录入，agent 报价从此读结构化价格，不再靠知识 chunk 的非结构化描述。
+/// [`OutcomeEvent::product_ref`] 以快照方式引用本表，故 product 改名/下架不污染历史成交。
+///
+/// 通用化：无产品概念的行业（情感陪伴/朋友陪伴）该 workspace 产品表为空 →
+/// 决策层零注入、零扰动（同 H17 memory_dimensions 空集套路）。
+///
+/// 命名约定：**不加 `#[serde(rename_all="camelCase")]`**——存储键须与索引
+/// （`workspace_id` / `product_id` / `status`，见 `db/indexes.rs`）逐字一致；
+/// camelCase 会让索引建在不存在的字段上。沿用 [`BehaviorSignal`] 的纯 snake_case 约定。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Product {
+    #[serde(rename = "_id", skip_serializing_if = "Option::is_none")]
+    pub id: Option<ObjectId>,
+    pub workspace_id: String,
+    /// 业务可读稳定标识（workspace 内唯一，admin 录入或自动生成）。
+    /// [`OutcomeProductRef::product_id`] 软引用此值。
+    pub product_id: String,
+    pub name: String,
+    /// 单价（可选——定制报价等无固定单价的行业可留空）。
+    /// **最小币种单位整数**（分，19900 = ¥199.00），同 [`OutcomeEvent::amount`]。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub price: Option<i64>,
+    /// 币种（ISO-4217 短码，如 `CNY`）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub currency: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sku: Option<String>,
+    /// `active` / `archived`。archived 不再进 agent 可报价集合，但历史成交仍可解引用。
+    #[serde(default = "default_product_status")]
+    pub status: String,
+    /// 简短描述（agent 报价时可引用；区别于知识库长文 chunk）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+    /// 行业可变字段容器（规格/疗程数/有效期天数/续费周期…）。
+    /// G4 售后期/有效期投影规则可读此处的 `entitlement_days` 等键。
+    #[serde(default)]
+    pub attributes: Document,
+    pub created_at: DateTime,
+    pub updated_at: DateTime,
+}
+
+fn default_product_status() -> String {
+    "active".to_string()
+}
+
+/// 校验币种码是否符合 ISO-4217 形态（3 个大写 ASCII 字母，如 `CNY`/`USD`）。
+/// 仅校验**形态**不查真实币种表；金额整数化固定 ÷100（分），不按币种驱动小数位。
+/// 纯函数，调用方（routes）把 false 转成各自的 `BadRequest` 文案。
+pub(crate) fn is_valid_currency_code(code: &str) -> bool {
+    code.len() == 3 && code.bytes().all(|b| b.is_ascii_uppercase())
+}
+
+/// 校验金额（最小币种单位整数，分）是否合法：`None` 合法（未登记），`Some` 须非负。
+/// i64 无 NaN/Inf，故只需查非负（替代 f64 时代的 `is_finite && >= 0`）。
+/// 纯函数，调用方把 false 转成 `BadRequest`。
+pub(crate) fn is_valid_minor_amount(amount: Option<i64>) -> bool {
+    amount.map_or(true, |v| v >= 0)
 }
 
 /// 自学习采集管道 S1–S3：行为信号（append-only 事件日志）。
@@ -670,6 +808,12 @@ fn default_version_one() -> i32 {
     1
 }
 
+/// universal-domain-adaptation H8：`OperationMode` 三驱动力 `enabled` 字段的
+/// serde 默认值 = `true`（缺字段 / 旧文档 → 驱动力默认开启 = 当前销售域行为）。
+fn default_true() -> bool {
+    true
+}
+
 /// Phase B / B4：`operation_state_policies` collection 行结构。
 ///
 /// 目的：把"该状态允许 / 禁止 agent 做哪类动作"从 `OperationDomainConfig.state_machine`
@@ -1032,15 +1176,15 @@ pub struct UsageStats {
     pub last_blocked_reason: Option<String>,
 }
 
-/// chunk 编辑历史的不可变记录。每次 patch / split / merge / rollback / archive /
-/// restore / verify / unverify 都写一行；revisions 表与 chunks 表双写。
+/// chunk 编辑历史的不可变记录。每次 create / patch / split / merge / rollback /
+/// archive / restore / verify / unverify / reject 都写一行；revisions 表与 chunks 表双写。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChunkRevision {
     #[serde(rename = "_id", skip_serializing_if = "Option::is_none")]
     pub id: Option<ObjectId>,
     pub chunk_id: String,
     pub revision_id: String,
-    /// 操作语义 ∈ {create, patch, split, merge, rollback, archive, restore, verify, unverify}。
+    /// 操作语义 ∈ {create, patch, split, merge, rollback, archive, restore, verify, unverify, reject}。
     pub op: String,
     /// 字段级 diff。AI 回复的 chat-canvas 永远只返 patch 而非整 chunk。
     #[serde(default)]
@@ -1167,6 +1311,725 @@ pub struct DomainField {
     pub allowed_values: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub alias_of: Option<String>,
+}
+
+/// universal-domain-adaptation Phase 0：行业/产品「总装配单」。
+///
+/// 让系统对行业**零假设**：一个 `DomainProfile` 声明本行业「参与决策的画像维度
+/// + 关联 chunk 字段表 + prompt 片段 + 承诺词表 + completeness 维度」，由引导层 AI
+/// 对话生成候选 → 人审 → publish。运行时按 `is_active=true` 加载（每 workspace 一条）；
+/// 无 active 时 fallback 到内置 `DEFAULT_PROFILE`（等价当前销售域写死行为，保证零配置
+/// 启动与历史一致）。
+///
+/// 维度的**取值字典**仍存 `system_taxonomies`（按 `kind` 关联，复用 `check_value`
+/// 的 alias 归一/候选发现）；本结构只声明「本行业有哪些维度、哪些进决策校验」。
+/// 版本灰度 4 字段与 [`TaxonomyEntry`] / `DomainSchema` 对齐（E5-T1）。
+///
+/// Phase 0 仅落存储 + 加载器，运行时**暂不消费**（并行加载、零行为变化）；
+/// 消费解耦在 Phase 1。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DomainProfile {
+    #[serde(rename = "_id", skip_serializing_if = "Option::is_none")]
+    pub id: Option<ObjectId>,
+    pub profile_id: String,
+    pub workspace_id: String,
+    pub display_name: String,
+    #[serde(default)]
+    pub description: String,
+    /// 参与/不参与决策的画像维度声明（替代 `decision_taxonomy::TAGGED_FIELDS` const 表）。
+    #[serde(default)]
+    pub profile_dimensions: Vec<ProfileDimension>,
+    /// 关联的 chunk 字段表（引用 `DomainSchema.schema_id`）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub domain_schema_id: Option<String>,
+    /// 行业 prompt 片段（注入决策 prompt，替代写死的销售域维度语义文案）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_fragment: Option<String>,
+    /// universal-domain-adaptation H12：本行业「出厂人格本体」覆盖（替代 `prompts.rs`
+    /// 写死的销售顾问 user soul）。`Some` 时整体替换决策系统提示的 Soul 层；`None`
+    /// 时回落 DB published soul + 内置销售域兜底（DEFAULT_PROFILE 即 `None`，逐字等价）。
+    /// 与 [`Self::prompt_fragment`] 区别：fragment 是**叠加**的业务上下文层，本字段是
+    /// **替换**的人格本体。**红线**：boundary_protection 边界保护硬规则不在此字段、
+    /// 继续由 `user.reply.policy` 写死，本字段只换人格口吻不放宽边界守护。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub soul_override: Option<String>,
+    /// universal-domain-adaptation H12：本行业「运营方法论本体」覆盖（替代
+    /// `prompts.rs::default_playbook` 写死的成交准备度/复购方法论）。`Some` 时整体
+    /// 替换拼进 user message 的「当前运营方法」段；`None` 时回落 contact 绑定的
+    /// playbook + 内置销售域兜底（DEFAULT_PROFILE 即 `None`，逐字等价）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub methodology_override: Option<String>,
+    /// universal-domain-adaptation H9（第 20 点）：本行业「对话模式判定规则」覆盖
+    /// （替代 `user.reply.policy` 里写死销售世界观的「## 对话模式判定」整段——
+    /// customer_stage∈{方案匹配/异议处理/承诺跟进}→consultative、用户问产品/价格→
+    /// consultative 等销售语义判定条款）。`Some` 时运行时剥离 policy 的判定段并注入
+    /// 本字段（应自带 `## 对话模式判定` 标题，仿 H15 经营公式段的"剥离+注入"模式）；
+    /// `None`（DEFAULT_PROFILE / 老库 serde 默认）时保留 policy 原写死的销售判定段，
+    /// 逐字等价、销售域零变化。情感陪伴等行业可声明自己的模式判定优先级
+    /// （如「用户表达情绪→empathetic_support」）。
+    /// **红线**：与 [`Self::conversation_modes`] 同——`boundary_protection` 反接管语义
+    /// 无论本字段是否覆盖都继续由 policy 后续段（## 模式与 5 闸的关系）写死守护，
+    /// 本字段只换"用什么规则选模式"，不放宽"反人工接管"硬规则。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conversation_mode_policy: Option<String>,
+    /// 本行业绝对化承诺词表（替代 `guards.rs` 写死的中文销售词）。
+    #[serde(default)]
+    pub commitment_markers: CommitmentMarkers,
+    /// completeness 审计维度（替代 `catalog.rs` 写死的五维 coverage）。
+    #[serde(default)]
+    pub coverage_dimensions: Vec<CoverageDimension>,
+    /// universal-domain-adaptation H6：声明哪个画像维度驱动 planner 停滞计时
+    /// （替代写死的 `customer_stage`）。`None` 时 planner fallback 到内置默认
+    /// `customer_stage`（DEFAULT_PROFILE 下即如此，零行为变化）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stagnation_dimension: Option<String>,
+    /// universal-domain-adaptation H9：本行业允许的 conversationMode 取值集合
+    /// （替代 `agent::types::CONVERSATION_MODE_VALUES` 写死的四模式枚举）。空 Vec
+    /// 时 `validate_and_promote` fallback 到内置默认四模式（DEFAULT_PROFILE 即声明
+    /// 这四个，零行为变化）。情感陪伴等行业可声明 `intimate_companion` 等额外模式。
+    /// **红线**：`boundary_protection` 反接管语义无论本集合是否含它都继续由 prompt
+    /// 写死守护，本字段只放宽"用哪些模式"，不放宽"反人工接管"。
+    #[serde(default)]
+    pub conversation_modes: Vec<String>,
+    /// universal-domain-adaptation H8：本行业默认运营范式（三驱动力开关 + 阈值）。
+    /// `OperationMode::default()` = 三全开 + 阈值 None 回落全局 config（DEFAULT_PROFILE
+    /// 即如此，planner 金标零变化）。陪伴/维护型行业可声明 `funnel.enabled=false`。
+    /// 单客户覆盖见 [`Contact::operation_mode_override`]。
+    #[serde(default)]
+    pub operation_mode: OperationMode,
+    /// universal-domain-adaptation §3.7（数字分身）：按关系类型（`relationship_type`）覆盖的
+    /// 运营范式。key = relationship_type 的 canonical 取值（走 system_taxonomies，seed 默认
+    /// `customer`/`peer`/`friend`，因行业而异可增删）；value = 该关系类型专属的一套
+    /// [`OperationMode`]（驱动力组合 + 阈值 + 口吻）。解析见
+    /// [`resolve_operation_mode`](crate::planner::resolve_operation_mode)：
+    /// `contact.operation_mode_override ?? per_relationship_operation_mode[rt] ?? operation_mode`。
+    /// `None` / 空 map（DEFAULT 销售 profile / 老库 serde 默认）→ 全部回落 `operation_mode`，
+    /// 销售域逐字节零变化。用 `BTreeMap` 而非 `HashMap`：关系类型 map 极小，BTreeMap 序列化
+    /// 进 BSON 键序稳定，round-trip 可重复、文档可对账。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub per_relationship_operation_mode: Option<BTreeMap<String, OperationMode>>,
+    /// universal-domain-adaptation H14：本域是否在「无产品声明」时旁路 grounding
+    /// 软分数硬闸（review `classify_dual_gate` 里 `knowledge_grounding_score <
+    /// product_accuracy_block_below` 的判罚）。`false`（DEFAULT/老库 serde 默认）=
+    /// 不旁路 = 每条回复都判 grounding 硬闸（销售域字节等价）；`true` = 纯关系/情感
+    /// 域，仅当本条 `claim_analysis.requiresProductKnowledge=true` 时才纳入闸，
+    /// 纯情感回复不再被 grounding 低分误拦。**红线**：旁路仅作用于 grounding 软分数
+    /// 硬闸，`blocked_unverified_product_claim`（R5.4 verified 强约束 + 漏判探针）
+    /// 任何取值下都不变。运行时经 `UserRuntimeParameters` 同名字段消费。
+    #[serde(default)]
+    pub grounding_gate_bypass_without_claim: bool,
+    /// reviewer 优化第一步：本域是否「不信任被审查者自报的低风险」。`false`
+    /// （DEFAULT/老库 serde 默认）= 沿用 `should_run_review` 既有判定（销售域字节
+    /// 等价），Reply Agent 自报 `needs_review=false` 且 confidence 高的回复走本地
+    /// 轻量兜底；`true` = 纯关系/情感等高敏域，should_reply 的回复一律强制走独立
+    /// LLM review（`review_decision`），不再因自报低风险被本地兜底无脑放行。
+    /// 依据：情感追问回复被自我豁免门挡在 reviewer 之外、本地兜底写死 pressure_risk=0
+    /// 的盲区。运行时经 `UserRuntimeParameters` 同名字段消费。
+    #[serde(default)]
+    pub distrust_self_reported_low_risk: bool,
+    /// 客观购买事实增强 G4 #5：本域是否为**交易型域**、决策 prompt 注入产品目录段 +
+    /// 当前持有投影段。`true` = 交易域（销售/电商/课程等），注入产品事实供 agent 报准价、
+    /// 识别已购/售后客户；`false`（serde 默认）= 非交易域（情感陪伴/朋友），即便 admin 误配
+    /// 了产品表也**不注入**交易事实，杜绝"已购买X"裸入情感对话。
+    /// **注意**：与其它 bool 开关不同，默认 `false` **不是**"销售域字节等价"——销售域行为是
+    /// 注入，故 [`default_domain_profile`](crate::agent::domain_profile::default_domain_profile)
+    /// 必须显式设 `true` 才等价（反过拟合护栏）。默认 false 取的是「失败方向安全」：新建 profile
+    /// 忘配则不注入，宁可漏注不可把交易事实错注进非交易域。运行时在 `decision.rs` 注入点消费。
+    #[serde(default)]
+    pub transaction_facts_enabled: bool,
+    /// universal-domain-adaptation H16：本行业知识切片的「用途角色」表（替代
+    /// `knowledge_router.rs` 写死的销售四态分桶 + header）。空 Vec 时
+    /// `format_operation_knowledge_for_prompt` 回落内置销售四态（DEFAULT_PROFILE 即
+    /// 声明这四态，逐字等价）。换行业可声明任意角色（如情感域情绪记忆/纪念日）。
+    #[serde(default)]
+    pub chunk_roles: Vec<ChunkRole>,
+    /// universal-domain-adaptation H11：本行业「自学习极性」声明（替代写死的销售域
+    /// 正/负极 outcome 词表——正极 `user_replied_buying_signal`、负极 objection/
+    /// stop_requested/unsubscribed/negative/complaint 五词）。极性是横向渗透三条自学习
+    /// 回路（① dynamic_confidence 召回排序、② negative_example 反向训练、
+    /// ③ escalation 卡死请示）的单一真相源。空集（`OutcomePolarity::default()`，
+    /// DEFAULT_PROFILE 下由 seed 显式填回 5+1 销售词）时各消费方回落内置销售极性，
+    /// 逐字等价。情感/陪伴域可声明「示弱/倾诉/情绪表达」为正极，让优质回复被学习。
+    /// **红线**：删失语义不可配（Iron Law ②）——沉默/pending/未分类一律 Censored、
+    /// 绝不臆测为负；本字段只声明正/负集，不声明"沉默算什么"。
+    #[serde(default)]
+    pub outcome_polarity: OutcomePolarity,
+    /// universal-domain-adaptation H15：本行业「经营公式」声明（替代写死的销售域
+    /// 四公式 Trust / ConversionReadiness / EmotionalValue / NextBestActionScore）。
+    /// reviewer 自检维度 + `/evaluations` ground-truth 度量的锚点。空集
+    /// （`Vec::default()`，DEFAULT_PROFILE 下由 seed 显式填回销售四公式）时各消费方
+    /// 回落内置销售公式常量，逐字等价。不进任何硬闸。
+    #[serde(default)]
+    pub business_formulas: Vec<BusinessFormula>,
+    /// universal-domain-adaptation H17：本行业 memoryCard 的「记忆维度」声明（替代
+    /// 写死的销售域记忆槽位——preferences/doNotDo/commitments/objections/openLoops/
+    /// openQuestions/confirmedFacts/conflicts 八槽 + 各自 cap + consolidator prompt
+    /// 骨架 + memoryCandidate.type 合法集）。空集（`Vec::default()`，DEFAULT_PROFILE 下
+    /// 由 seed 显式填回销售八槽 + 原 cap）时各消费方回落内置销售维度，逐字等价。
+    /// 情感/陪伴域可声明「情绪史 / 纪念日 / 重要事件」等专属记忆槽。
+    /// 注：coreFacts/recentFacts/deprecatedFacts 三 typed 数组是 memoryCard 结构骨架
+    /// （固定 cap 6/10/20），coreProfile/relationshipState 是固定对象结构——均**不**
+    /// 纳入本字段，只有 `extra` 容器里的业务数组槽位走 memory_dimensions。
+    #[serde(default)]
+    pub memory_dimensions: Vec<MemoryDimension>,
+    /// universal-domain-adaptation C3：引导层「运营方法生成器」（playbook.generator /
+    /// optimizer）的领域专属 system 引导语。`None` 时回落内置**领域中性**生成器引导语
+    /// （C3 清理后 `PLAYBOOK_METHODOLOGY_SYSTEM` 已去除「消费心理学/顾问式销售/异议/
+    /// 顾问朋友」等销售偏见词——§7 护栏：引导层 prompt 不得写死行业词，否则会污染 AI
+    /// 给非销售行业生成的 profile）。`Some` 时整体替换，让特定行业声明自己的生成偏好。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub methodology_generator_preamble: Option<String>,
+    /// universal-domain-adaptation M2：本行业「五闸风险阈值」覆盖（替代写死在
+    /// `OperationDomainConfig.runtime_parameters` 的销售域阈值）。`None`（DEFAULT/老库
+    /// serde 默认）→ 不覆盖，gateway 沿用 `UserRuntimeParameters::from_config` 解析的
+    /// domain_config 阈值（销售域字节等价）。`Some` 时 gateway 加载 active profile 后
+    /// 逐字段覆盖 runtime（字段内 `None` 仍回落 config 值）——让情感陪伴等域可声明
+    /// 自己的 PressureRisk/EmotionalValue 阈值（如放宽压迫闸、提高情绪价值改写线），
+    /// 而非沿用销售域 6/7/6/6/7。**红线**：阈值只调软/硬闸触发线，不改闸的语义与
+    /// 「AI 永不自断成交 / 永不自动 verify」等结构红线。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub threshold_overrides: Option<ProfileThresholds>,
+    /// universal-domain-adaptation D（reviewer 去销售取向）：本行业评审取向覆盖。
+    /// `None`（DEFAULT/老库 serde 默认）→ reviewer system/user prompt 里的「评审重点」与
+    /// 「转化平衡」两句保留写死销售取向，销售域字节等价。`Some` 时 review/mod.rs 用本字段
+    /// 渲染替换这两句，让情感陪伴/同行/朋友域声明自己的评审取向（不含「低压推进 / 产品知识
+    /// 一致性 / 转化」等销售漏斗措辞）。仅替换取向性散文，不动五闸阈值 / grounding /
+    /// 「AI 永不自断成交 / 永不自动 verify」结构红线。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reviewer_orientation: Option<ReviewerOrientation>,
+    /// universal-domain-adaptation A/T1：decision/policy prompt「## 模式与 5 闸的关系」
+    /// 模式-闸说明段的本行业覆盖。`None`（DEFAULT/老库）→ 回落写死销售模式-闸说明
+    /// （prompt 字节等价）；`Some` 时 `apply_mode_gate_policy` 以
+    /// `DEFAULT_MODE_GATE_POLICY` 为锚整段替换成本域说明。只替换模式-闸尺度散文，
+    /// **不动** boundary_protection 红线续行（跨域恒定 no-human-takeover 红线）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode_gate_policy_override: Option<String>,
+    /// universal-domain-adaptation I：completeness `answeringMode` 三档**释义/标签**覆盖。
+    /// 三个档位 key（relationship_only / product_safe / fully_supported）是**域无关的
+    /// 认知阶梯**（无 / 部分 / 完全 verified 支撑），被 `clamp_answering_mode`「永不自动
+    /// verify」红线、CI 闭集、前端类型、real-LLM 测试共同锁定 → key 恒定不可配。带销售
+    /// 世界观的只是**喂给 LLM 的三档释义散文**（catalog.rs 写死「产品/服务事实、报价、
+    /// 案例、交付边界」）和**前端档位标签**（「可安全讲产品」）。`None`（DEFAULT/老库）→
+    /// 回落写死销售释义 + 标签（prompt 字节等价、UI 标签不变）；`Some` 时按本行业释义
+    /// 渲染 completeness prompt 的判断规则段、并回传前端档位标签。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub answering_mode_profile: Option<AnsweringModeProfile>,
+    /// E5-T1 多版本灰度：同 `(workspace_id, profile_id)` 下 `version` 单调递增。
+    #[serde(default = "default_version_one")]
+    pub version: i32,
+    #[serde(default)]
+    pub current_version: bool,
+    #[serde(default)]
+    pub previous_version: Option<i32>,
+    /// 写入来源：`generated_by_ai` / `manual` / `default`。
+    #[serde(default)]
+    pub seeded_by: Option<String>,
+    pub is_active: bool,
+    pub created_at: DateTime,
+    pub updated_at: DateTime,
+}
+
+/// universal-domain-adaptation M2：五闸风险阈值的 per-profile 覆盖。
+///
+/// 每字段 `Option<i32>`：`None` = 该闸不覆盖，gateway 回落
+/// `UserRuntimeParameters::from_config` 解析的 domain_config 阈值（销售域字节等价）；
+/// `Some(n)` = 用 n 覆盖该闸触发线。字段语义与 `UserRuntimeParameters` 同名字段一致
+/// （均为 0-10 档评分阈值，与 reviewer scores 同档）：
+/// - `fact_risk_block_at` / `pressure_risk_block_at`：≥ 阈值拦截（越高越宽松）；
+/// - `human_like_rewrite_below` / `emotional_value_rewrite_below`：< 阈值触发改写（越高越严）；
+/// - `product_accuracy_block_below`（= knowledge_grounding）：< 阈值拦截产品声明。
+///
+/// 典型用途：情感陪伴域放宽 `pressure_risk_block_at`（主动关心不算施压）、提高
+/// `emotional_value_rewrite_below`（情绪价值不足更积极改写）。全 `None` 时整体等价
+/// 不声明（DEFAULT_PROFILE 即如此）。
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ProfileThresholds {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fact_risk_block_at: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pressure_risk_block_at: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub human_like_rewrite_below: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub emotional_value_rewrite_below: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub product_accuracy_block_below: Option<i32>,
+}
+
+/// universal-domain-adaptation D：reviewer 评审取向的 per-profile 覆盖。
+///
+/// reviewer 的 system prompt（`user.review.system`）有一句「评审重点：事实准确、像真人微信、
+/// 情绪价值、低压推进、产品知识一致性、没有操控营销。」、user prompt 有一句「转化平衡：既允许
+/// 适度推进，也不能伤害信任。」——两句把**销售漏斗取向**（低压推进 / 产品知识一致性 / 转化 /
+/// 推进）写死进了通用评审 Agent。情感陪伴 / 同行 / 朋友域并无「转化」语义，这两句会把销售取向
+/// 强加给本应中性的评审。
+///
+/// 每字段 `Option<String>`：`None` = 该句保留写死原文（销售域字节等价）；`Some(s)` = 用 s
+/// 整句替换。两字段独立回落，可只覆盖其一。**红线**：只换取向性散文，五闸阈值、grounding、
+/// 「AI 永不自断成交 / 永不自动 verify」结构红线不在此变。
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ReviewerOrientation {
+    /// 替换 system prompt 的「评审重点：…」整行。标签「评审重点」本身域中性，故消费方
+    /// 保留「评审重点：」前缀，本字段只承载冒号后的取向描述（替换写死的销售取向描述）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review_focus: Option<String>,
+    /// 替换 user prompt 评审原则里的「- 转化平衡：既允许适度推进，也不能伤害信任。」整条。
+    /// 标签「转化平衡」本身含销售「转化」语义，故本字段承载 bullet「- 」之后的**整句**
+    /// （含自定标签），让非销售域换掉「转化」标签本身。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub balance_principle: Option<String>,
+    /// 替换 system prompt 的「软闸打分锚点（few-shot）」三档示例段。销售 few-shot 的
+    /// PressureRisk 高压锚是逼单（「今天最后一天…现在就定吧」），非销售域（情感陪伴等）
+    /// 用本字段换成本域打分尺度。`None`（DEFAULT/老库）→ 回落写死销售 few-shot（字节等价）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reviewer_fewshot_override: Option<String>,
+}
+
+/// universal-domain-adaptation I：completeness `answeringMode` 三档释义/标签的 per-profile
+/// 覆盖。三档 key（认知阶梯）恒定，本结构只承载**喂 LLM 的判断释义**与**前端档位标签**。
+///
+/// 每档 `Option<AnsweringModeDescriptor>`：`None` = 该档回落写死销售释义/标签（字节等价）；
+/// `Some` = 用本行业释义/标签替换。三档独立回落。
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AnsweringModeProfile {
+    /// `relationship_only` 档（无足够 verified 支撑，只能关系维护/澄清/收集信息）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relationship_only: Option<AnsweringModeDescriptor>,
+    /// `product_safe` 档（可在 verified 证据边界内部分作答，仍有维度不足）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub product_safe: Option<AnsweringModeDescriptor>,
+    /// `fully_supported` 档（关键维度都有 verified 客观事实支撑）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fully_supported: Option<AnsweringModeDescriptor>,
+}
+
+/// universal-domain-adaptation I：单档 answeringMode 的释义与标签。
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AnsweringModeDescriptor {
+    /// 注入 completeness 审计 prompt「判断规则」段的该档释义（冒号后那句，替代写死的
+    /// 销售释义）。`None` → 该档释义回落写死销售文案。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rule: Option<String>,
+    /// 前端档位中文标签（如销售域「可安全讲产品」）。`None` → 前端回落内置标签。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+}
+
+
+/// + 各自阈值。三驱动力对应 planner 三扫描器（funnel→`scan_stage_stagnation`、
+/// silence→`scan_silent`、commitment→`scan_commitments`）。
+///
+/// 全字段 `#[serde(default)]`，**缺省即「沿用全局 config」**——`OperationMode::default()`
+/// = 三驱动力 `enabled=true` + 所有阈值 `None`（回落 `AppConfig`），故 DEFAULT_PROFILE
+/// 与无 override 的 contact 下 planner 行为与改造前**逐字等价**（金标零变化）。
+///
+/// 两级声明：`DomainProfile.operation_mode`（行业默认范式）+
+/// `Contact.operation_mode_override`（单客户覆盖，承接「因用户而异」，优先级更高）。
+/// 解析走 [`resolve_operation_mode`](crate::planner::resolve_operation_mode)：
+/// `contact override ?? profile ?? OperationMode::default()`。
+///
+/// 范式落法：销售型 = 三全开（DEFAULT）；陪伴/情绪型 = `funnel.enabled=false`
+/// （不推进阶段、不被 stagnation 催）；关系维护型 = funnel 关、silence+commitment 开。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct OperationMode {
+    /// 沙漏推进驱动力（`scan_stage_stagnation`）。陪伴/维护型关掉它。
+    #[serde(default)]
+    pub funnel: FunnelMode,
+    /// 沉默唤醒驱动力（`scan_silent`）。跨范式通用。
+    #[serde(default)]
+    pub silence: SilenceMode,
+    /// 承诺到期驱动力（`scan_commitments`）。跨范式通用。
+    #[serde(default)]
+    pub commitment: CommitmentMode,
+    /// universal-domain-adaptation H19：作息门控覆盖。情感陪伴「晚上是黄金时段」
+    /// 可在此关掉静默时段抑制，让夜间主动/被动发送不被 22→8 压制。
+    #[serde(default)]
+    pub quiet_hours: QuietHoursMode,
+    /// universal-domain-adaptation §3.7：主动情绪关怀驱动力（`scan_calendar`）。
+    /// 在纪念日/生日当天及临近主动发起关怀触达。**与 funnel/silence/commitment 的
+    /// 关键差异：默认 `enabled=false`**——主动情绪触达是情感陪伴域专属，绝不让销售域
+    /// 默认开（DEFAULT_PROFILE / 无 override → scan_calendar 天然 no-op，金标零变化）。
+    #[serde(default)]
+    pub calendar: CalendarMode,
+    /// 续费推进驱动力（`scan_renewal`）。客户持有产品临近到期时主动推进续费（=最高优先级
+    /// 销售）+ 临场挽留诊断。**默认 `enabled=false`**（同 calendar）：续费触达需运营在
+    /// 交易域 profile / contact override 显式开；DEFAULT_PROFILE 关 → scan_renewal 天然
+    /// no-op，所有 planner 金标零变化。
+    #[serde(default)]
+    pub renewal: RenewalMode,
+    /// 再激活驱动力（`scan_renewal` 阶段2，`scan_reactivation`）。已流失/休眠老客
+    /// （customer_stage=dormant_reactivation）定期低频唤醒——按流失原因（churn_reason）
+    /// 精准再营销，重回销售环节。**默认 `enabled=false`**（同 renewal）：再激活是交易域行为，
+    /// 需 profile/contact override 显式开；DEFAULT_PROFILE 关 → scan_reactivation 天然 no-op。
+    /// 核心原则：定期再激活、绝不放任老客（有原因则精准、无原因则兜底价值唤醒）。
+    #[serde(default)]
+    pub reactivation: ReactivationMode,
+}
+
+impl Default for OperationMode {
+    fn default() -> Self {
+        Self {
+            funnel: FunnelMode::default(),
+            silence: SilenceMode::default(),
+            commitment: CommitmentMode::default(),
+            quiet_hours: QuietHoursMode::default(),
+            calendar: CalendarMode::default(),
+            renewal: RenewalMode::default(),
+            reactivation: ReactivationMode::default(),
+        }
+    }
+}
+
+/// H8 漏斗推进驱动力。`enabled=false` → `scan_stage_stagnation` 对该 contact 短路。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct FunnelMode {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// 停滞推进阈值（天）。`None` → 回落 `strategic_planner_stage_stagnation_threshold_days`。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stagnation_threshold_days: Option<i64>,
+}
+
+impl Default for FunnelMode {
+    fn default() -> Self {
+        Self { enabled: true, stagnation_threshold_days: None }
+    }
+}
+
+/// H8 沉默唤醒驱动力。`enabled=false` → `scan_silent` 对该 contact 短路。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SilenceMode {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// 静默唤醒阈值（小时）。`None` → 回落 `strategic_planner_silent_threshold_hours`。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub threshold_hours: Option<i64>,
+}
+
+impl Default for SilenceMode {
+    fn default() -> Self {
+        Self { enabled: true, threshold_hours: None }
+    }
+}
+
+/// H8 承诺到期驱动力。`enabled=false` → `scan_commitments` 对该 contact 短路。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CommitmentMode {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// 承诺临近窗口（小时）。`None` → 回落
+    /// `strategic_planner_commitment_imminent_window_hours`。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub imminent_window_hours: Option<i64>,
+}
+
+impl Default for CommitmentMode {
+    fn default() -> Self {
+        Self { enabled: true, imminent_window_hours: None }
+    }
+}
+
+/// H19 作息门控覆盖。`enabled_override`：
+/// - `None`（默认）→ 沿用全局 `runtime.quiet_hours_enabled`（DEFAULT 逐字等价）；
+/// - `Some(false)` → 本 contact/范式**关闭**静默时段抑制（情感陪伴夜间黄金时段不被压制）；
+/// - `Some(true)` → 强制开启（即便全局关）。
+///
+/// 仅覆盖「是否启用静默」；起止小时 / 时区偏移继续走全局 runtime（避免在 contact
+/// 上重复一套作息参数；本阶段需求只是「陪伴型整段关掉作息门」）。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct QuietHoursMode {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled_override: Option<bool>,
+}
+
+impl Default for QuietHoursMode {
+    fn default() -> Self {
+        Self { enabled_override: None }
+    }
+}
+
+/// universal-domain-adaptation §3.7 主动情绪关怀驱动力。`scan_calendar` 在纪念日/生日
+/// 当天及临近窗口主动发起关怀触达（早安晚安、纪念日祝福）。
+///
+/// **`enabled` 默认 `false`**（区别于 funnel/silence/commitment 默认 true）：主动情绪
+/// 触达是情感陪伴域专属，销售域开了会变骚扰；DEFAULT_PROFILE calendar 关 → scan_calendar
+/// 对销售域天然 no-op，所有 planner 金标零变化。仅情感 profile seed 时显式开。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CalendarMode {
+    #[serde(default)]
+    pub enabled: bool,
+    /// 临近窗口（天）：纪念日前几天起就允许触达。`None` → 回落
+    /// `strategic_planner_calendar_lookahead_days`（默认 1）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lookahead_days: Option<i64>,
+    /// 本驱动力的独立每日 emit 上限（比常规 daily_emit_cap 更克制，防早安晚安骚扰）。
+    /// `None` → 回落 `strategic_planner_calendar_daily_cap`（默认 3）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub daily_cap: Option<i64>,
+}
+
+impl Default for CalendarMode {
+    fn default() -> Self {
+        Self { enabled: false, lookahead_days: None, daily_cap: None }
+    }
+}
+
+/// 续费推进驱动力。`scan_renewal` 在客户持有产品的售后/有效期临近到期（或刚过期）时主动
+/// 发起 follow-up，让 Reply Agent 按销售链路推进续费（=最高优先级销售）+ 临场挽留。
+///
+/// **`enabled` 默认 `false`**（同 calendar，区别于 funnel/silence/commitment 默认 true）：
+/// 续费触达需交易域 profile / contact override 显式开；DEFAULT_PROFILE renewal 关 →
+/// scan_renewal 对每个 contact 短路、天然 no-op，所有 planner 金标零变化。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RenewalMode {
+    #[serde(default)]
+    pub enabled: bool,
+    /// 到期前几天起允许续费触达。`None` → 回落 `strategic_planner_renewal_lookahead_days`（默认 14）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lookahead_days: Option<i64>,
+    /// 已过期回看窗（天）：刚过期 N 天内仍主动挽留。`None` → 回落
+    /// `strategic_planner_renewal_grace_days`（默认 7）。过期超此窗后不再触达，自然收口。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grace_days: Option<i64>,
+    /// 本驱动力的独立每日 emit 上限。`None` → 回落 `strategic_planner_renewal_daily_cap`（默认 3）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub daily_cap: Option<i64>,
+}
+
+impl Default for RenewalMode {
+    fn default() -> Self {
+        Self { enabled: false, lookahead_days: None, grace_days: None, daily_cap: None }
+    }
+}
+
+/// 再激活驱动力（阶段2）。`scan_reactivation` 对已流失/休眠老客
+/// （`customer_stage=dormant_reactivation`）定期低频唤醒：有明确流失原因（`churn_reason`）
+/// 则按原因精准再营销，无原因则兜底价值唤醒，重回销售环节。
+///
+/// **`enabled` 默认 `false`**（同 renewal/calendar）：再激活是交易域行为，需 profile/contact
+/// override 显式开；DEFAULT_PROFILE reactivation 关 → scan_reactivation 对每个 contact 短路、
+/// 天然 no-op，所有 planner 金标零变化。核心原则：定期再激活、绝不放任老客不管。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ReactivationMode {
+    #[serde(default)]
+    pub enabled: bool,
+    /// 进入休眠满 N 天后才开始唤醒（避免刚流失就立刻骚扰）。`None` → 回落
+    /// `strategic_planner_reactivation_dormant_days`（默认 30）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dormant_days: Option<i64>,
+    /// 每次唤醒的最小间隔（天）：定期低频，防每 tick 刷屏。`None` → 回落
+    /// `strategic_planner_reactivation_cadence_days`（默认 30）。这是「定期再激活、绝不放任」
+    /// 的节奏锚——既不放任遗忘，也不高频骚扰。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cadence_days: Option<i64>,
+    /// 本驱动力的独立每日 emit 上限。`None` → 回落 `strategic_planner_reactivation_daily_cap`（默认 3）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub daily_cap: Option<i64>,
+}
+
+impl Default for ReactivationMode {
+    fn default() -> Self {
+        Self { enabled: false, dormant_days: None, cadence_days: None, daily_cap: None }
+    }
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProfileDimension {
+    pub kind: String,
+    pub display_name: String,
+    /// 是否进 Reply Agent 决策的 taxonomy 校验（对应旧 `TAGGED_FIELDS` 成员）。
+    #[serde(default)]
+    pub participates_in_decision: bool,
+    /// 注入 prompt 的语义说明（如「就诊阶段：初诊/复诊/方案确认/已治疗」）。
+    #[serde(default)]
+    pub description: String,
+}
+
+/// 绝对化承诺词表，按 `commitment_claim_class` 分两类（替代 `guards.rs` 写死词表）。
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct CommitmentMarkers {
+    /// 产品效果类（如销售域「成功率/见效/回款」，医疗域「根治率」，教培域「保过」）。
+    #[serde(default)]
+    pub product_effect: Vec<String>,
+    /// 纯语气类（如「保证/一定能/绝对」）。
+    #[serde(default)]
+    pub tone_only: Vec<String>,
+}
+
+/// completeness 审计的一个 coverage 维度（替代 `catalog.rs` 写死的五维）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CoverageDimension {
+    pub key: String,
+    pub display_name: String,
+    #[serde(default)]
+    pub required: bool,
+    /// universal-domain-adaptation H5-b：本维度判 `verifiedFact=true` 的命中锚点
+    /// 语义（注入 completeness 审计 prompt 的「命中锚点」段，替代 `catalog.rs` 写死的
+    /// 销售五维锚点散文）。`None` 时该维度不产出锚点行（DEFAULT_PROFILE 五维逐字
+    /// 复刻原 prompt 锚点 → 销售域 prompt 字节等价）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anchor_hint: Option<String>,
+    /// universal-domain-adaptation H：completeness **degraded/fallback** 初值规则——LLM
+    /// 审计不可用时，本维度的初始 coverage 由哪个客观计数驱动。`catalog.rs` 原写死按
+    /// 销售维度名分派（capability/deliveryBoundary 跟 verified、caseEvidence/effectClaims
+    /// 跟 evidence、其余恒 missing），换行业新维全落 `false`、拿不到合理初值。本字段把
+    /// 规则下放到维度声明：
+    /// - `Some("verified")` → 有 verified 切片即判该维 verified（否则 missing）；
+    /// - `Some("evidence")` → 有 evidence 切片即判 verified；
+    /// - `None` / 未知值 → 恒 missing（保守缺失，原 `pricing` 与未知维度行为）。
+    /// DEFAULT_PROFILE 五维按原规则 seed 对应 signal → fallback 初值字节等价。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub initial_signal: Option<String>,
+}
+
+/// universal-domain-adaptation H16：知识切片的「用途角色」（替代 `knowledge_router.rs`
+/// 写死的 product_fact/style_template/peer_case/negative_example 销售四态分桶 + header
+/// 文案）。一个 `ChunkRole` 声明：本行业某类 chunk 的 `chunk_type` key、注入 prompt 的
+/// 分段 header（含使用指令）、输出顺序、是否为 fallback 桶（未匹配任何 key 的 chunk
+/// 归入此桶）。DEFAULT_PROFILE 逐字复刻销售四态 → 渲染结果字节等价；换行业=另一份
+/// chunk_roles（如情感域「情绪记忆/纪念日」角色）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChunkRole {
+    /// 与 `OperationKnowledgeChunk.chunk_type` 字面量对齐的 key。
+    pub key: String,
+    /// 注入 prompt 的分段标题 + 使用指令（如「【产品事实 product_fact】仅 verified…」）。
+    pub header: String,
+    /// 输出顺序（升序）；DEFAULT 销售四态 0..3 复刻原 `order[]` 固定顺序。
+    #[serde(default)]
+    pub order: i32,
+    /// 是否为 fallback 桶：`chunk_type` 未命中任何 role.key 的切片归入此桶。
+    /// DEFAULT 销售域 = `product_fact`（逐字复刻原「缺省/任意其它值→product_fact」）。
+    #[serde(default)]
+    pub is_fallback: bool,
+}
+
+/// universal-domain-adaptation §3.7：`scan_calendar` 主动关怀扫描的**结构化纪念日条目**。
+///
+/// 存于 `MemoryCardTyped.extra.<date_dimension槽>` 的数组元素。**日期由 consolidator
+/// LLM 抽取时直接产出结构化字段**（agent-first：机器不解析"她生日下个月15号"这类中文
+/// 自由文本，只比较结构化数值），复刻 commitments `dueAt` RFC3339 既有模式。
+///
+/// `date` 两种形态：`"MM-DD"`（每年循环的生日/纪念日，`recurring=true`）或
+/// `"YYYY-MM-DD"`（一次性事件，`recurring=false`）。`scan_calendar` 对其做今日/临近
+/// 的数值比较。旧库里该槽若仍是纯字符串条目，scan_calendar 解析失败即跳过（向后兼容）。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AnniversaryEntry {
+    /// 人类可读标签（"她生日" / "相识纪念日"）。供 emit 的 follow_up content 用。
+    pub label: String,
+    /// `"MM-DD"`（recurring）或 `"YYYY-MM-DD"`（one-off）。
+    pub date: String,
+    /// 是否每年循环（true=只比月日；false=比完整年月日）。
+    #[serde(default)]
+    pub recurring: bool,
+}
+
+/// universal-domain-adaptation H17：memoryCard 的「记忆维度」（替代 `memory.rs` 写死的
+/// 销售域记忆槽位 + cap + consolidator prompt 骨架 + memoryCandidate.type 合法集）。
+/// 一个 `MemoryDimension` 声明：本行业某类记忆的 `extra` 容器数组键名 `key`、
+/// consolidator prompt 里的人类标签 `display_name`、数组上限 `cap`（无界增长唯一闸口）、
+/// 是否核心维度 `is_core`、consolidator 填写指引 `prompt_hint`、是否作为
+/// memoryCandidate.type 合法值 `candidate_type`。DEFAULT_PROFILE 逐字复刻销售八槽
+/// （preferences/doNotDo/commitments/objections/openLoops/openQuestions/confirmedFacts/
+/// conflicts）+ 各自原 cap → 渲染/cap 字节等价；换行业=另一份 memory_dimensions（如
+/// 情感域「情绪史 emotionHistory / 纪念日 anniversaries / 重要事件 importantEvents」）。
+/// 注：coreFacts/recentFacts/deprecatedFacts 是 memoryCard typed 骨架（固定 cap 6/10/20），
+/// coreProfile/relationshipState 是固定对象结构——均**不**纳入本字段。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MemoryDimension {
+    /// `MemoryCardTyped.extra` 容器里的数组键名（camelCase，如 "objections" /
+    /// "emotionHistory"），同时是 consolidator prompt JSON 骨架里的字段名。
+    pub key: String,
+    /// consolidator prompt limit 散文 / 骨架注释里的人类标签。
+    pub display_name: String,
+    /// 该槽位数组上限（替代 `compact_memory_card_with_previous` 写死的 cap）。
+    pub cap: usize,
+    /// 是否核心维度（保留位，供 prompt 注入优先级 / 未来分层；DEFAULT 不区分）。
+    #[serde(default)]
+    pub is_core: bool,
+    /// consolidator prompt 里该维度的填写指引（None 时不产出额外指引行；
+    /// DEFAULT 销售八槽的 limit 散文经渲染函数生成，保持 prompt 字节等价）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_hint: Option<String>,
+    /// 是否作为 Reply Agent `memoryCandidates[].type` 的合法枚举值。DEFAULT 下
+    /// preference/doNotDo/commitment/objection/openLoop 五槽为 true（对齐当前 type
+    /// 枚举），fact/conflict 由系统固定派生不依赖本字段。
+    #[serde(default)]
+    pub candidate_type: bool,
+    /// universal-domain-adaptation §3.7：该槽是否承载**带日期语义的结构化条目**
+    /// （[`AnniversaryEntry`]），参与 `scan_calendar` 主动关怀扫描。DEFAULT 销售八槽
+    /// 全 false（serde 默认）→ scan_calendar 对销售域天然 no-op。情感 profile 的
+    /// `anniversaries` 槽设 true，consolidator 据此引导 LLM 输出结构化日期对象。
+    #[serde(default)]
+    pub date_dimension: bool,
+}
+
+/// universal-domain-adaptation H11：本行业「自学习极性」= 声明哪些 outcome_status
+/// 算正极（Hit，强化学习/优质示范）、哪些算负极（Block，反向训练/请示卡死）。
+///
+/// 这是横向渗透三条已落地自学习回路的**单一真相源**：
+/// - 回路① `gap_signals::classify_outcome_label` → dynamic_confidence 召回排序；
+/// - 回路② `reaction::compute_reviewer_misjudge_signal_with_polarity` → negative_example 反向训练；
+/// - 回路③ `escalation::logic` 末轮负面判定 → 连续未推进时卡死请示。
+///
+/// **删失语义不可配（Iron Law ②）**：不在正/负集里的一切（含沉默/pending/空/
+/// 未分类/未知）一律 **Censored**，绝不臆测为负。本结构只声明正/负集，不声明
+/// "沉默算什么"。正极优先于负极（同一 outcome 同时被两集声明时取 Hit，防误配把
+/// 购买信号当负例）。
+///
+/// 全字段 `#[serde(default)]`。**注意**：`OutcomePolarity::default()` 是**空集**
+/// （非销售词）——DEFAULT_PROFILE 的销售极性由 `domain_profile.rs` 的 seed **显式**
+/// 填回 `["user_replied_buying_signal"]` + 5 负词。各消费方在收到空集时回落内置
+/// 销售极性常量（`gap_signals::DEFAULT_POSITIVE_OUTCOMES` /
+/// `DEFAULT_NEGATIVE_OUTCOMES`），故 DEFAULT 与老库（无 outcome_polarity 字段）下
+/// 三回路行为逐字等价。换行业 = 另一份 profile 声明本行业正/负极。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct OutcomePolarity {
+    /// 正极 outcome_status 集（→ Hit）。DEFAULT seed = `["user_replied_buying_signal"]`。
+    #[serde(default)]
+    pub positive: Vec<String>,
+    /// 负极 outcome_status 集（→ Block）。DEFAULT seed = objection/stop_requested/
+    /// unsubscribed/negative/complaint 五词。
+    #[serde(default)]
+    pub negative: Vec<String>,
+}
+
+/// universal-domain-adaptation H15：本行业「经营公式」声明 = 一组可读的自检公式
+/// （`key` + 人类可读展开式 `expression` + 中文 `display_name`），替代写死在
+/// prompt 散文/reviewer rubric/`/evaluations` 里的销售域四公式（Trust /
+/// ConversionReadiness / EmotionalValue / NextBestActionScore）。
+///
+/// 公式是 reviewer 自检维度 + `/evaluations` ground-truth 度量的锚点，横跨四处副本
+/// （policy prompt 英文式、playbook method_prompt 中文式、reviewer formulaBreakdown、
+/// evaluations 硬编码 formulas 数组）。本结构是其**单一真相源**——空集
+/// （`Vec::default()`，DEFAULT_PROFILE 下由 `domain_profile.rs` 的 seed 显式填回
+/// 销售四公式）时各消费方回落内置销售公式常量，逐字等价。情感/陪伴域可声明
+/// 「情绪价值 / 陪伴深度」类公式，让 reviewer 自检与度量贴合本行业经营目标。
+///
+/// **不进任何硬闸**：公式只占 reviewer 注意力 + 被 `/evaluations` 当度量基准，
+/// 不参与 send/block 判决（与 §7 护栏一致——引导层不得写死行业词，但 DEFAULT
+/// 逐字复刻销售域以保证零行为变化）。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct BusinessFormula {
+    /// 公式 key，与 reviewer `formulaBreakdown` / `/evaluations` formulas 数组对齐
+    /// （如 `trust` / `conversionReadiness` / `emotionalValue` / `nextBestActionScore`）。
+    pub key: String,
+    /// 人类可读的公式展开式（如 `Motivation × ProductFit × Timing × Trust ÷ Friction`）。
+    /// 注入 prompt 自检段 + reviewer formulaBreakdown 模板。
+    pub expression: String,
+    /// 中文展示名（如「成交准备度」）。playbook 中文公式段用。
+    #[serde(default)]
+    pub display_name: String,
+    /// `/evaluations` 把该公式当 ground-truth 度量时，预测值缺失则回落到哪个
+    /// reviewer score key（替代写死的 `score_key_for` 映射）。DEFAULT 四公式分别
+    /// 回落 humanLike / conversionReadiness / emotionalValue / relationshipProgress。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub eval_score_key: Option<String>,
 }
 
 /// catalog 重建队列：`apply_chunk_revision` 写完即 enqueue；catalog_rebuild_worker
@@ -1520,6 +2383,15 @@ pub struct TaxonomyValue {
     pub aliases: Vec<String>,
     /// `"active"` | `"deprecated"`。
     pub status: String,
+    /// universal-domain-adaptation H6：该取值的跟进优先级权重。planner 排序读它替代
+    /// 写死的 `stage_priority_weight` / `intent_level_weight` match 分支。`None` 时
+    /// planner fallback 到内置默认（保持旧库零行为变化）。
+    #[serde(default)]
+    pub priority_weight: Option<i32>,
+    /// universal-domain-adaptation H6：是否终态（成交后维护 / 冷却 / 沉默等）。planner
+    /// stagnation 段读它替代写死的 `TERMINAL_STAGES` 常量。旧库默认 `false`。
+    #[serde(default)]
+    pub is_terminal: bool,
 }
 
 /// agent-autonomy-loop W0：`taxonomy_candidates` 集合占位结构。
@@ -1545,6 +2417,39 @@ pub struct TaxonomyCandidate {
     /// `"pending"` | `"approved"` | `"rejected"`。
     pub status: String,
     pub reviewed_at: Option<DateTime>,
+    pub reviewed_by: Option<String>,
+}
+
+/// 数字分身建议链 T5：`relationship_type_suggestions` 集合结构。
+///
+/// 模块 B「数字分身」识别联系人关系类型（customer / peer / friend）走保守闭环：
+/// LLM 产出建议 → 不直接生效 → 运营审核确认才回写 `contact`（画像保守红线）。
+/// 本结构是该链第一步的存储载体——同一 `(workspace_id, contact_id)` 只一条建议
+/// （索引 unique 幂等锚，重复观察累加 `occurrences` / 刷新 `last_seen_at`）。
+/// 仿 [`TaxonomyCandidate`] 的 snake_case BSON + serde default 形态。T6 写入信号、
+/// T8 建审核路由。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RelationshipTypeSuggestion {
+    #[serde(rename = "_id", skip_serializing_if = "Option::is_none")]
+    pub id: Option<ObjectId>,
+    pub workspace_id: String,
+    pub account_id: String,
+    pub contact_id: String,
+    /// canonical 关系类型：`"customer"` | `"peer"` | `"friend"`。
+    pub suggested_value: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence: Option<String>,
+    #[serde(default)]
+    pub confidence: i32,
+    /// `"pending"` | `"approved"` | `"rejected"`。
+    pub status: String,
+    #[serde(default)]
+    pub occurrences: i32,
+    pub first_seen_at: DateTime,
+    pub last_seen_at: DateTime,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reviewed_at: Option<DateTime>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reviewed_by: Option<String>,
 }
 
@@ -2051,6 +2956,12 @@ mod typed {
         pub cooldown_after_no_reply_hours: i64,
         #[serde(default = "defaults::hallucination_block_at")]
         pub hallucination_block_at: i32,
+        /// universal-domain-adaptation C1：压力风险 block 阈值（`PressureRisk ≥ 此值`
+        /// 则 block）。默认 7。此前是五闸里**唯一**写死在 `UserRuntimeParameters`
+        /// （= 7）而不走 typed 配置的阈值；typed 化后 H9 情感/陪伴场景可经运营域配置
+        /// 放宽（如调到 9，允许更主动的情感推进而不被压力门拦）。DEFAULT = 7 逐字等价。
+        #[serde(default = "defaults::pressure_risk_block_at")]
+        pub pressure_risk_block_at: i32,
         #[serde(default = "defaults::knowledge_grounding_block_below")]
         pub knowledge_grounding_block_below: i32,
         #[serde(default = "defaults::human_like_rewrite_below")]
@@ -2131,6 +3042,7 @@ mod typed {
                 follow_up_expires_hours: defaults::follow_up_expires_hours(),
                 cooldown_after_no_reply_hours: defaults::cooldown_after_no_reply_hours(),
                 hallucination_block_at: defaults::hallucination_block_at(),
+                pressure_risk_block_at: defaults::pressure_risk_block_at(),
                 knowledge_grounding_block_below: defaults::knowledge_grounding_block_below(),
                 human_like_rewrite_below: defaults::human_like_rewrite_below(),
                 emotional_value_rewrite_below: defaults::emotional_value_rewrite_below(),
@@ -2184,6 +3096,9 @@ mod typed {
         }
         pub fn hallucination_block_at() -> i32 {
             6
+        }
+        pub fn pressure_risk_block_at() -> i32 {
+            7
         }
         pub fn knowledge_grounding_block_below() -> i32 {
             7
@@ -2749,6 +3664,14 @@ mod typed {
         pub allowed_from: Vec<String>,
         #[serde(default)]
         pub allow_from_any: bool,
+        /// H13：是否初始态（空 from 唯一合法迁入目标）。替代引擎 / planner 写死的
+        /// `"new_contact"` 字面量。DEFAULT 状态机仅 new_contact=true。camelCase=`initial`。
+        #[serde(default)]
+        pub initial: bool,
+        /// H13：是否禁止主动触达（planner 不主动 emit + policy 禁 reply）。替代写死的
+        /// `state_key=="cooldown"` 特例。DEFAULT 状态机仅 cooldown=true。camelCase=`forbidsProactive`。
+        #[serde(default)]
+        pub forbids_proactive: bool,
         #[serde(default)]
         pub advance_signals: Vec<String>,
         #[serde(default)]
@@ -3176,6 +4099,8 @@ mod typed_tests {
             mongodb::bson::from_document(doc! {}).expect("default deserialize");
         assert_eq!(p.recent_message_limit, 12);
         assert_eq!(p.hallucination_block_at, 6);
+        // C1：pressure_risk_block_at 缺字段默认 7（DEFAULT 逐字等价旧写死值）。
+        assert_eq!(p.pressure_risk_block_at, 7);
         assert_eq!(p.run_token_budget, 30000);
         assert_eq!(p.run_max_llm_calls, 6);
     }
@@ -3185,11 +4110,14 @@ mod typed_tests {
         let doc = doc! {
             "recentMessageLimit": 24,
             "hallucinationBlockAt": 8,
+            "pressureRiskBlockAt": 9,
             "runTokenBudget": 50000_i64
         };
         let p: RuntimeParametersTyped = mongodb::bson::from_document(doc).expect("deserialize");
         assert_eq!(p.recent_message_limit, 24);
         assert_eq!(p.hallucination_block_at, 8);
+        // C1：H9 情感场景可经运营域配置放宽压力阈值（如 9）。
+        assert_eq!(p.pressure_risk_block_at, 9);
         assert_eq!(p.run_token_budget, 50000);
         // 其它字段 fallback 默认值。
         assert_eq!(p.knowledge_grounding_block_below, 7);
@@ -3624,6 +4552,20 @@ mod typed_tests {
             .find(|s| s.key == "new_contact")
             .expect("new_contact state");
         assert!(new_contact.allowed_from.iter().any(|s| s == "new_contact"));
+        // H13：DEFAULT 状态机的标志位经 camelCase 键正确反序列化——仅 new_contact 初始态、
+        // 仅 cooldown 禁主动触达，其余 state 两标志均 false（逐字等价护栏）。
+        assert!(new_contact.initial, "new_contact 必须是初始态");
+        assert!(!new_contact.forbids_proactive);
+        assert!(cooldown.forbids_proactive, "cooldown 必须禁主动触达");
+        assert!(!cooldown.initial);
+        for s in &typed.states {
+            if s.key != "new_contact" {
+                assert!(!s.initial, "{} 不应是初始态", s.key);
+            }
+            if s.key != "cooldown" {
+                assert!(!s.forbids_proactive, "{} 不应禁主动触达", s.key);
+            }
+        }
     }
 
     // ── agent-autonomy-loop W0 (Task 1.6) ──
@@ -3715,6 +4657,8 @@ mod typed_tests {
                 description: "首次建立联系，尚未深入沟通".to_string(),
                 aliases: vec!["新客".to_string(), "first-contact".to_string()],
                 status: "active".to_string(),
+                priority_weight: None,
+                is_terminal: false,
             },
             updated_at: now,
             version: 1,
@@ -4289,5 +5233,152 @@ mod principal_escalation_model_tests {
         let req: EscalationRequest =
             serde_json::from_str("{}").expect("empty object should deserialize");
         assert!(!req.needed);
+    }
+}
+
+#[cfg(test)]
+mod objective_purchase_facts_model_tests {
+    use super::*;
+
+    /// 向后兼容红线：旧库 outcome_events 文档没有 `verification` / `productRef` 两键，
+    /// 反序列化必须填缺省（verification=staff_confirmed，product_ref=None），
+    /// 不得报 missing field。历史成交全是 admin 手动登记的高可信记录。
+    #[test]
+    fn outcome_event_legacy_doc_without_g3_fields_defaults_to_staff_confirmed() {
+        let legacy = r#"{
+            "markedAt": {"$date": {"$numberLong": "1700000000000"}},
+            "amount": 19900,
+            "currency": "CNY",
+            "source": "manual",
+            "markedBy": "admin",
+            "note": "首单"
+        }"#;
+        let ev: OutcomeEvent = serde_json::from_str(legacy).expect("legacy doc should deserialize");
+        assert_eq!(ev.verification, "staff_confirmed");
+        assert_eq!(ev.amount, Some(19900), "金额是最小币种单位整数（分），19900=¥199.00");
+        assert!(ev.product_ref.is_none());
+        // §4.5：旧文档无 event_kind → 缺省 deal（正向成交），退款逆转语义不影响存量。
+        assert_eq!(ev.event_kind, "deal");
+    }
+
+    /// §4.5：reversal 退款事件按显式值读出，缺省 deal 不得覆盖。
+    #[test]
+    fn outcome_event_reversal_kind_is_preserved() {
+        let doc = r#"{
+            "markedAt": {"$date": {"$numberLong": "1700000000000"}},
+            "source": "manual",
+            "markedBy": "admin",
+            "eventKind": "reversal",
+            "productRef": {"productId": "sku-1", "name": "年度会员", "quantity": 1}
+        }"#;
+        let ev: OutcomeEvent = serde_json::from_str(doc).expect("should deserialize");
+        assert_eq!(ev.event_kind, "reversal");
+    }
+
+    /// 新写入的 `conversation_inferred`（AI 推断的低可信成交）必须按显式值读出，
+    /// 绝不被缺省覆盖——成交真相源分级是「AI 永不自断成交」红线的载体。
+    #[test]
+    fn outcome_event_explicit_verification_is_preserved() {
+        let doc = r#"{
+            "markedAt": {"$date": {"$numberLong": "1700000000000"}},
+            "source": "manual",
+            "markedBy": "agent",
+            "verification": "conversation_inferred"
+        }"#;
+        let ev: OutcomeEvent = serde_json::from_str(doc).expect("should deserialize");
+        assert_eq!(ev.verification, "conversation_inferred");
+    }
+
+    /// product_ref 快照子文档：`quantity` 缺省为 1（与默认下单件数一致）。
+    #[test]
+    fn outcome_product_ref_quantity_defaults_to_one() {
+        let doc = r#"{"productId": "sku-1", "name": "年度会员"}"#;
+        let pr: OutcomeProductRef = serde_json::from_str(doc).expect("should deserialize");
+        assert_eq!(pr.quantity, 1);
+        assert!(pr.unit_price.is_none());
+    }
+
+    /// Product 是纯 snake_case（无 camelCase rename）——存储键须与 db/indexes.rs
+    /// 的索引字段逐字一致。锁死序列化键名防回归（camelCase 会让索引建在空字段上）。
+    #[test]
+    fn product_serializes_with_snake_case_keys() {
+        let p = Product {
+            id: None,
+            workspace_id: "ws1".to_string(),
+            product_id: "sku-1".to_string(),
+            name: "年度会员".to_string(),
+            price: Some(19900),
+            currency: Some("CNY".to_string()),
+            sku: None,
+            status: "active".to_string(),
+            summary: None,
+            attributes: Document::new(),
+            created_at: DateTime::now(),
+            updated_at: DateTime::now(),
+        };
+        let json = serde_json::to_value(&p).expect("serialize");
+        assert!(json.get("workspace_id").is_some());
+        assert!(json.get("product_id").is_some());
+        assert!(json.get("workspaceId").is_none());
+        assert!(json.get("productId").is_none());
+    }
+
+    /// 金额整数化：ISO-4217 币种码形态校验（3 大写字母）。
+    #[test]
+    fn currency_code_validation_accepts_iso4217_shape_only() {
+        assert!(is_valid_currency_code("CNY"));
+        assert!(is_valid_currency_code("USD"));
+        assert!(!is_valid_currency_code("cny"), "小写不合法");
+        assert!(!is_valid_currency_code("CN"), "两位不合法");
+        assert!(!is_valid_currency_code("CNYY"), "四位不合法");
+        assert!(!is_valid_currency_code("CN1"), "含数字不合法");
+        assert!(!is_valid_currency_code(""), "空不合法");
+    }
+
+    /// 金额整数化：最小币种单位（分）非负校验；None（未登记）合法。
+    #[test]
+    fn minor_amount_validation_rejects_negative_only() {
+        assert!(is_valid_minor_amount(None), "未登记金额合法");
+        assert!(is_valid_minor_amount(Some(0)), "0 分合法");
+        assert!(is_valid_minor_amount(Some(19900)), "正常金额合法");
+        assert!(!is_valid_minor_amount(Some(-1)), "负数非法");
+    }
+}
+
+#[cfg(test)]
+mod relationship_type_suggestion_tests {
+    use super::*;
+
+    /// 数字分身建议链 T5：`RelationshipTypeSuggestion` BSON round-trip 保真。
+    /// 构造 → to_document → from_document，断言字段不丢失/不被缺省覆盖。
+    #[test]
+    fn relationship_type_suggestion_bson_round_trip() {
+        let s = RelationshipTypeSuggestion {
+            id: None,
+            workspace_id: "w".into(),
+            account_id: "a".into(),
+            contact_id: "c".into(),
+            suggested_value: "peer".into(),
+            evidence: Some("自称同行".into()),
+            confidence: 7,
+            status: "pending".into(),
+            occurrences: 1,
+            first_seen_at: DateTime::now(),
+            last_seen_at: DateTime::now(),
+            reviewed_at: None,
+            reviewed_by: None,
+        };
+        let doc = mongodb::bson::to_document(&s).unwrap();
+        let back: RelationshipTypeSuggestion = mongodb::bson::from_document(doc).unwrap();
+        assert_eq!(back.suggested_value, "peer");
+        assert_eq!(back.status, "pending");
+        assert_eq!(back.workspace_id, "w");
+        assert_eq!(back.account_id, "a");
+        assert_eq!(back.contact_id, "c");
+        assert_eq!(back.evidence.as_deref(), Some("自称同行"));
+        assert_eq!(back.confidence, 7);
+        assert_eq!(back.occurrences, 1);
+        assert!(back.reviewed_at.is_none());
+        assert!(back.reviewed_by.is_none());
     }
 }

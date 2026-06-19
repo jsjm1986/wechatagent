@@ -2,9 +2,17 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## Superpowers（最优先）
+
+**最优先使用 superpowers skills。** 任何任务开始前，只要有 ≥1% 可能某个 skill 适用，就必须先通过 Skill 工具调用它，再做其它动作（包括澄清提问、探索代码）。流程类 skill 优先于实现类：要写代码/做非平凡实现的任务，先走 `superpowers:brainstorming`（设计→获批→`writing-plans`）；调试先走 systematic-debugging。skill 一旦适用即非可选。唯一例外：用户的显式指令优先级最高（与 skill 冲突时听用户的）。
+
 ## Communication
 
 Always reply to the user in Chinese (中文). This applies to all conversational responses, explanations, summaries, and status updates. Code, identifiers, commit messages, and file contents follow their existing conventions.
+
+## Subagents
+
+When spawning subagents (the Agent / Task tool), ALWAYS pass `model: "opus"`. Subagents must run on the same Opus-tier model as the main session — never let them fall back to a smaller/cheaper model. This applies to every agent type (Explore, general-purpose, etc.) without exception.
 
 ## Project
 
@@ -127,7 +135,7 @@ These are enforced by `guards/`, `review/`, and the gateway. Removing any of the
 
 - Auto-send is gated by methodology thresholds — current rules: `FactRisk ≥ 6` block, `PressureRisk ≥ 7` block, `HumanLikeScore < 6` rewrite once, `EmotionalValue < 5` rewrite once, `ProductAccuracyScore < 7` block product-claim sends.
 - Product claims must be backed by **verified knowledge** in `operation_knowledge_chunks`; otherwise `blocked_unverified_product_claim`.
-- `operation_state` transitions go through `check_state_transition` against the state-machine dictionary (`operation_domain_configs`). Agents do not invent new state keys.
+- `operation_state` is **derived from the normalized `customer_stage`** at the gateway write site (C2 — same canonical id space, m006), so the two fields never drift; it falls back to the decision's own `operation_state` only when no `customer_stage` is present. The synced value goes through `check_state_transition` against the state-machine dictionary (`operation_domain_configs`). This is **fail-soft**: an illegal transition does NOT block the reply (already sent) — it skips the `operation_state` write (keeps the old state) and emits an `agent.operation_state_transition_rejected` audit event. Agents do not invent new state keys. The engine reads `initial` / `allowFromAny` / `allowedFrom` flags from the state machine, so it is industry-agnostic (DEFAULT sales profile marks only `new_contact` as `initial`).
 - **Dual-layer tagging**: `customer_stage` / `intent_level` / `objection_type` must come from `system_taxonomies`. Free-form ideas go to `agent_generated_signals` and `taxonomy_candidates` for admin review; unreviewed candidates **must not** block runs.
 - Each run has a token/call budget (`RunBudget`). Exceeding it returns `AppError::BudgetExceeded` and the gateway falls back (e.g. `local_decision_review`, skip rewrite). Don't surface this as a 5xx to webhook callers.
 - Gateway/finalReview status enums are closed sets (R9.10.e in the autonomy-loop spec). Writing an unknown status must be rejected at the DB write site, not silently coerced.

@@ -1,5 +1,10 @@
 name: CI
 
+# 同一 PR/push 只保留最新 run，取消旧 run——避免重复排队浪费 runner 资源。
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 on:
   pull_request:
     branches: [main]
@@ -18,6 +23,30 @@ on:
       - 'frontend/**'
       - 'docs/**'
       - '**/*.md'
+  # 手动触发：**绕过**所有 needs 前置链立即起跑，用于快速验证单测修复。两个互斥目标：
+  # - dispatch_target=ops（默认）：单独跑某一个 real_llm_ops_smoke 测试（填 ops_test，默认 t15），
+  #   不必等 real-llm → recall → ops 串行排队 1+ 小时。
+  # - dispatch_target=roleplay_docker：只跑 roleplay-fuzz P0 那几个需要 Docker（testcontainers
+  #   MongoDB）的 #[ignore] 夹具自验证测试（无需任何 LLM key），不跑完整 CI、不烧真模型配额。
+  # 在 Actions 页选 CI workflow → Run workflow → 选 target（+ 必要时填 ops_test）。
+  workflow_dispatch:
+    inputs:
+      dispatch_target:
+        description: '手动单跑目标（ops=单个 real_llm_ops_smoke / roleplay_docker=roleplay P0 Docker 夹具 / roleplay_p2=情感陪伴全链 E2E 真模型 / reviewer_calibration=reviewer 高压识别校准 / roleplay_arc=R5.1 LLM 演客户动态博弈链）'
+        required: true
+        default: 'ops'
+        type: choice
+        options:
+          - ops
+          - roleplay_docker
+          - roleplay_p2
+          - reviewer_calibration
+          - roleplay_arc
+      ops_test:
+        description: '当 target=ops 时单独跑的 real_llm_ops_smoke 测试名（如 t15_real_multiturn_deal_arc）'
+        required: false
+        default: 't15_real_multiturn_deal_arc'
+        type: string
 
 env:
   CARGO_TERM_COLOR: always
@@ -27,6 +56,7 @@ jobs:
   baseline:
     name: Baseline gate (R11.6)
     runs-on: ubuntu-latest
+    if: ${{ github.event_name != 'workflow_dispatch' }}
     timeout-minutes: 30
     steps:
       - name: Checkout (with full history for diff)
@@ -79,6 +109,7 @@ jobs:
   integration:
     name: Integration tests (Docker / testcontainers)
     runs-on: ubuntu-latest
+    if: ${{ github.event_name != 'workflow_dispatch' }}
     # 首次接入：101 个 #[ignore] 集成测试从未在 CI 跑过，bit-rot 几乎必然。
     # 先 continue-on-error 拿到真实绿/红体检报告，不阻塞合并；逐个修复后
     # 再视情况抬升为硬门（与 baseline 同级）。
@@ -129,7 +160,11 @@ jobs:
   real-llm:
     name: Real-LLM smoke (真实大模型 / MCP 桩)
     runs-on: ubuntu-latest
-    # 用**真实大模型**（MiMo mimo-v2.5 / OpenAI 兼容端点）跑 T1 文本决策+审查 / T2 知识
+    if: ${{ github.event_name != 'workflow_dispatch' }}
+    # 并发治理：作为 5 个 real-llm group 串行链的链头（smoke→recall→ops→quality→adversarial，
+    # 各组 max-parallel:1）→ 全局任意时刻仅 1 matrix 实例打 rsxermu → 守并发上限 2。
+    # （GitHub job-level concurrency group 不能串行化同 run 内 matrix，会 cancel 而非排队，故用 needs 链。）
+    # 用**真实大模型**（rsxermu claude-opus-4-8 / gpt-5.4）跑 T1 文本决策+审查 / T2 知识
     # tool-loop / T3 多模态 vision 抽取，验证 mock 测不到的真实 schema/闸门/收敛。
     # MCP 永远是 wiremock 桩（绝不真发微信）。real-LLM 限流/抖动不该阻塞合并，
     # 故 continue-on-error；conclusion 恒 success，必看 job 日志拿真实绿/红。
@@ -138,12 +173,18 @@ jobs:
     # 密钥提到 job 级 env：GitHub Actions 的 job 级 `if:` 读不到 secrets 上下文，
     # 但 step 级 `if:` 能读 env，故下方各重步用 `if: env.REAL_LLM_API_KEY != ''`
     # 守卫——未配 secret（fork PR / 没配）时直接跳过编译/跑测，不浪费 CI 分钟、不红。
-    # provider 沿革（2026-06-03）：MiMo 配额耗尽 → deepseek-v4（令牌 2026-06-03 过期/无效）
-    # → 文本切回 MiMo mimo-v2.5（用户指定 api.xiaomimimo.com，key 走 secret
-    # REAL_LLM_MIMO_API_KEY，缺则回落字面量），与 ops/adversarial/quality 套件同源。
+    # provider 沿革（2026-06-16）：全部真模型 job 迁到 rsxermu666.cn 不限流端点——被测主模型
+    # claude-opus-4-8（Anthropic 格式 /v1/messages）、judge/vision gpt-5.4（OpenAI /v1，端点强制
+    # 流式 SSE 由 LlmClient 聚合兜底）。NVIDIA 仅作可选第三异族裁判（独立 NVIDIA_KEY，缺则回落
+    # claude+gpt 两族，不 fail）。key 走 secret RSXERMU_KEY，删除原 17 处明文 nvapi 字面量回落。
     env:
-      REAL_LLM_API_KEY: ${{ secrets.REAL_LLM_CODERELAY_API_KEY || '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' }}
+      REAL_LLM_API_KEY: ${{ secrets.RSXERMU_KEY }}
     steps:
+      - name: Require REAL_LLM_API_KEY (R0.1 缺 key 真 fail，不假绿)
+        if: ${{ env.REAL_LLM_API_KEY == '' }}
+        run: |
+          echo "::error::REAL_LLM_API_KEY 未配置（secrets.RSXERMU_KEY 为空）。real-llm job 必须有 key 才能真跑——缺 key 直接 fail，不静默跳过假绿（R0.1）。"
+          exit 1
       - name: Checkout
         uses: actions/checkout@v4
 
@@ -174,17 +215,30 @@ jobs:
         if: ${{ env.REAL_LLM_API_KEY != '' }}
         env:
           RUSTFLAGS: ""
-          # 文本主链路（T1/T2）走 kimi-k2.6（NVIDIA integrate，OpenAI 兼容；naxtclaude 503 不可用切此）。
-          REAL_LLM_BASE_URL: https://integrate.api.nvidia.com/v1
-          REAL_LLM_MODEL: moonshotai/kimi-k2.6
-          # vision（T3）：文本 checkpoint 不复用多模态，故指向专职视觉 provider
-          # nemotron-nano-12b-v2-vl（NVIDIA integrate，OpenAI 兼容 /v1）。key 优先 secret，缺则回落字面量
-          # （与 quality 套件同纪律：tests/CI 豁免 model-hint lint）。偶发 5xx/524 走
-          # LlmUnavailable→skip 不 fail。
-          REAL_LLM_VISION_API_KEY: ${{ secrets.REAL_LLM_VISION_API_KEY || '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' }}
-          REAL_LLM_VISION_BASE_URL: https://integrate.api.nvidia.com/v1
-          REAL_LLM_VISION_MODEL: nvidia/nemotron-nano-12b-v2-vl
+          # 文本主链路（T1/T2）走 claude-opus-4-8（rsxermu666.cn，Anthropic /v1/messages，非流式）。
+          REAL_LLM_BASE_URL: https://rsxermu666.cn
+          REAL_LLM_MODEL: claude-opus-4-8
+          REAL_LLM_FORMAT: anthropic
+          # vision（T3）：claude 的 Anthropic 图片 block 未实现（generate_json_with_image Anthropic
+          # 分支返 Err），故 vision 走 gpt-5.4（rsxermu OpenAI /v1，多模态 image_url）。端点强制流式
+          # SSE 由 generate_json_once_openai_vision 的聚合兜底处理（0a）。偶发 5xx/524 走 skip 不 fail。
+          REAL_LLM_VISION_API_KEY: ${{ secrets.RSXERMU_KEY }}
+          REAL_LLM_VISION_BASE_URL: https://rsxermu666.cn/v1
+          REAL_LLM_VISION_MODEL: gpt-5.4
         run: cargo test --no-fail-fast --test real_llm_smoke -- --ignored --nocapture
+
+      # ════════════════════════════════════════════════════════════════════════════
+      # universal-domain-adaptation 3C：DomainProfile 端到端（AI 生成候选 → publish
+      # → activate → 运行时加载）。走 claude-opus-4-8（rsxermu，Anthropic）验证 profile 生成链路。
+      # 与 real_llm_smoke 同 env/key/guard。
+      - name: cargo test --test domain_profile_e2e -- --ignored --nocapture
+        if: ${{ env.REAL_LLM_API_KEY != '' }}
+        env:
+          RUSTFLAGS: ""
+          REAL_LLM_BASE_URL: https://rsxermu666.cn
+          REAL_LLM_MODEL: claude-opus-4-8
+          REAL_LLM_FORMAT: anthropic
+        run: cargo test --test domain_profile_e2e -- --ignored --nocapture
 
       # 知识库全能力 smoke（real_llm_knowledge.rs K1–K9）：渐进式披露检索
       # （open_chunk 深检索 / follow_relations 关系跳转 / 无幻觉 / 未审定不上桌）
@@ -198,16 +252,27 @@ jobs:
         if: ${{ !cancelled() && env.REAL_LLM_API_KEY != '' }}
         env:
           RUSTFLAGS: ""
-          # 文本知识链路（K1–K5/K7–K11）走 kimi-k2.6（NVIDIA integrate；naxtclaude 503 不可用切此）。
-          REAL_LLM_BASE_URL: https://integrate.api.nvidia.com/v1
-          REAL_LLM_MODEL: moonshotai/kimi-k2.6
-          # vision（K6）：文本 checkpoint 不复用多模态，故指向专职视觉 provider
-          # nemotron-nano-12b-v2-vl（NVIDIA integrate）。key 优先 secret，缺则回落字面量（与 quality 套件
-          # 同纪律：tests/CI 豁免 model-hint lint）。偶发 5xx/524 走 LlmUnavailable→skip。
-          REAL_LLM_VISION_API_KEY: ${{ secrets.REAL_LLM_VISION_API_KEY || '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' }}
-          REAL_LLM_VISION_BASE_URL: https://integrate.api.nvidia.com/v1
-          REAL_LLM_VISION_MODEL: nvidia/nemotron-nano-12b-v2-vl
+          # 文本知识链路（K1–K5/K7–K11）走 claude-opus-4-8（rsxermu，Anthropic /v1/messages）。
+          REAL_LLM_BASE_URL: https://rsxermu666.cn
+          REAL_LLM_MODEL: claude-opus-4-8
+          REAL_LLM_FORMAT: anthropic
+          # vision（K6）：claude Anthropic 图片 block 未实现，故走 gpt-5.4（rsxermu OpenAI /v1，多模态）。
+          # 端点强制流式 SSE 由 vision 路径聚合兜底（0a）。偶发 5xx/524 走 LlmUnavailable→skip。
+          REAL_LLM_VISION_API_KEY: ${{ secrets.RSXERMU_KEY }}
+          REAL_LLM_VISION_BASE_URL: https://rsxermu666.cn/v1
+          REAL_LLM_VISION_MODEL: gpt-5.4
         run: cargo test --no-fail-fast --test real_llm_knowledge -- --ignored --nocapture
+
+      # R0.2：传出 skip ledger（含 unwrap_or_skip_transient! 写的 skip_ledger.jsonl），
+      # 供下游 skip-gate job 汇总校验 skip 率。
+      - name: Upload skip ledger
+        if: ${{ always() && env.REAL_LLM_API_KEY != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: real-llm-skip-ledger-smoke
+          path: target/real_llm_ledger/
+          if-no-files-found: ignore
+          retention-days: 30
 
   # ════════════════════════════════════════════════════════════════════════════
   # 知识库**召回率量化基准**（real_llm_recall_benchmark.rs）——业务闭环核心北极星：
@@ -233,11 +298,17 @@ jobs:
   real-llm-recall:
     name: Real-LLM knowledge recall benchmark (${{ matrix.t }} / MCP 桩)
     runs-on: ubuntu-latest
+    if: ${{ github.event_name != 'workflow_dispatch' }}
     # NVIDIA integrate 免费层 RPM 硬墙：5 个 real-LLM job-group 并行时瞬时 ~9 runner 同打
     # 一把 key 必爆 429（实测 retry 6 次仍全 skip 假绿）。max-parallel 只在单 matrix 内限并发、
     # 不能跨 group 协调，故用 needs 链把 5 个 group 串行化（smoke→recall→ops→quality→adversarial），
     # 各 group 内 max-parallel:1 → 全局任意时刻仅 1 runner 打 NVIDIA，根治跨 group 429 风暴。
     # continue-on-error:true 使 conclusion 恒 success，needs 链不会因前置假失败中断。
+    # 并发治理（2026-06-16 迁 rsxermu 后）：rsxermu666.cn 允许并发 2，但单个 real-llm job 内部
+    # judge panel 已可能瞬时打 2 路。GitHub job-level concurrency group 不能串行化同一 run 内的
+    # matrix/jobs（同 group 并行成员会被 cancel 而非排队），故仍用 needs 链把 5 个 group 串行化
+    # （smoke→recall→ops→quality→adversarial）+ 各组 max-parallel:1 → 全局任意时刻仅 1 matrix 实例
+    # 在跑 → 守 rsxermu 并发上限 2。continue-on-error:true 使 conclusion 恒 success，needs 链不中断。
     needs: real-llm
     continue-on-error: true
     timeout-minutes: 90
@@ -251,8 +322,13 @@ jobs:
           - recall_benchmark_maintenance_stability
           - recall_benchmark_gap_closed_loop_trajectory
     env:
-      REAL_LLM_API_KEY: ${{ secrets.REAL_LLM_CODERELAY_API_KEY || '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' }}
+      REAL_LLM_API_KEY: ${{ secrets.RSXERMU_KEY }}
     steps:
+      - name: Require REAL_LLM_API_KEY (R0.1 缺 key 真 fail，不假绿)
+        if: ${{ env.REAL_LLM_API_KEY == '' }}
+        run: |
+          echo "::error::REAL_LLM_API_KEY 未配置（secrets.RSXERMU_KEY 为空）。real-llm job 必须有 key 才能真跑——缺 key 直接 fail，不静默跳过假绿（R0.1）。"
+          exit 1
       - name: Checkout
         uses: actions/checkout@v4
 
@@ -282,8 +358,9 @@ jobs:
         if: ${{ !cancelled() && env.REAL_LLM_API_KEY != '' }}
         env:
           RUSTFLAGS: ""
-          REAL_LLM_BASE_URL: https://integrate.api.nvidia.com/v1
-          REAL_LLM_MODEL: moonshotai/kimi-k2.6
+          REAL_LLM_BASE_URL: https://rsxermu666.cn
+          REAL_LLM_MODEL: claude-opus-4-8
+          REAL_LLM_FORMAT: anthropic
           RECALL_STABILITY_RUNS: "3"
         run: cargo test --no-fail-fast --test real_llm_recall_benchmark ${{ matrix.t }} -- --ignored --nocapture
 
@@ -316,7 +393,8 @@ jobs:
   real-llm-ops:
     name: Real-LLM ops smoke (${{ matrix.t }} / MCP 桩)
     runs-on: ubuntu-latest
-    # 串行链第 3 环（见 real-llm-recall 注释：跨 group 串行根治 NVIDIA 429）。
+    if: ${{ github.event_name != 'workflow_dispatch' }}
+    # 串行链第 3 环（见 real-llm-recall 注释：跨 group 串行守 rsxermu 并发 2）。
     needs: real-llm-recall
     continue-on-error: true
     timeout-minutes: 90
@@ -341,8 +419,13 @@ jobs:
           - t17_real_multiturn_boundary_stress
           - t18_real_warm_start_operator_seeded_arc
     env:
-      REAL_LLM_API_KEY: ${{ secrets.REAL_LLM_CODERELAY_API_KEY || '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' }}
+      REAL_LLM_API_KEY: ${{ secrets.RSXERMU_KEY }}
     steps:
+      - name: Require REAL_LLM_API_KEY (R0.1 缺 key 真 fail，不假绿)
+        if: ${{ env.REAL_LLM_API_KEY == '' }}
+        run: |
+          echo "::error::REAL_LLM_API_KEY 未配置（secrets.RSXERMU_KEY 为空）。real-llm job 必须有 key 才能真跑——缺 key 直接 fail，不静默跳过假绿（R0.1）。"
+          exit 1
       - name: Checkout
         uses: actions/checkout@v4
 
@@ -367,31 +450,92 @@ jobs:
       # 多场景通用性 / autonomy 闭集 / 用户反应 outcome 闭集 / 冷启动初始画像 / 长期
       # 记忆整理 / 可操控性 / 千人千面 / 画像写侧弱信号体检（t14）/ 多轮深弧 + 边界
       # 压测（t15/t16/t17）/ 暖启动种子弧（t18）+ K=3 采样并发 judge + 全能力逐轮快照。
-      # REAL_LLM_JUDGE=1 打开 judge 诊断。端点用 MiMo mimo-v2.5（api.xiaomimimo.com），与
-      # adversarial 被测 agent 同模型（deepseek 令牌 2026-06-03 过期，切回 MiMo）。
+      # REAL_LLM_JUDGE=1 打开 judge 诊断。被测主模型 claude-opus-4-8（rsxermu，Anthropic）；
       # MCP 仍是桩（绝不真发微信）。
       - name: cargo test --test real_llm_ops_smoke ${{ matrix.t }}
         if: ${{ env.REAL_LLM_API_KEY != '' }}
         env:
           RUSTFLAGS: ""
-          REAL_LLM_BASE_URL: https://integrate.api.nvidia.com/v1
-          REAL_LLM_MODEL: moonshotai/kimi-k2.6
+          REAL_LLM_BASE_URL: https://rsxermu666.cn
+          REAL_LLM_MODEL: claude-opus-4-8
+          REAL_LLM_FORMAT: anthropic
           REAL_LLM_JUDGE: "1"
-          # 裁判用异族强模型 llama-3.3-70b（@ NVIDIA integrate，meta 家族）——G-Eval/MT-Bench 方法论：
-          # 裁判须异于被测（被测 kimi/moonshot），跨家族判分更可信、不自我背书。
-          # 裁判换异族只抬高评分可信度、不抬高被测分（零过拟合）。缺 key 时裁判回落主模型 failover（无回归）。
-          REAL_LLM_JUDGE_API_KEY: ${{ secrets.REAL_LLM_GPT55_API_KEY || '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' }}
-          REAL_LLM_JUDGE_BASE_URL: https://integrate.api.nvidia.com/v1
-          REAL_LLM_JUDGE_MODEL: meta/llama-3.3-70b-instruct
-          # 跨模型 failover 备胎链（与 adversarial / integration job 同口径）：主端点
-          # 429/5xx 重试耗尽时，被测 agent 自动切到备胎链续跑——被测是 kimi，故备胎用**异款**
-          # ①glm-5.1(z-ai) → ②step-3.7-flash(stepfun) → ③qwen3-next-80b(qwen)，三级互异族且全避开
-          # 被测 kimi 与主裁判 llama-3.3-70b（本账户实测 minimax-m2.7 稳定超时不可用，故剔除）。把端点限流
-          # 与能力测评解耦，让 t11/t13/t15/t16/t18 多轮弧不再 turn-1 即被 skip，产出真分。缺 key 退化为「只主模型」。
-          REAL_LLM_FAILOVER_API_KEY: ${{ secrets.REAL_LLM_VISION_BACKUP_API_KEY || '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' }}
-          REAL_LLM_FAILOVER_BASE_URL: https://integrate.api.nvidia.com/v1
-          REAL_LLM_FAILOVER_MODELS: z-ai/glm-5.1,stepfun-ai/step-3.7-flash,qwen/qwen3-next-80b-a3b-instruct
+          JUDGE_SAMPLES: "1"
+          # 裁判用异族 gpt-5.4（rsxermu OpenAI /v1，端点强制流式 SSE 由 LlmClient 聚合兜底）——被测
+          # claude 与裁判 gpt 天然跨家族，G-Eval/MT-Bench 方法论判分更可信。judge 走独立 JUDGE_*
+          # 端点（claude 走 /v1/messages、gpt 走 /v1/chat/completions，端点串异故必须独立接线）。
+          REAL_LLM_JUDGE_API_KEY: ${{ secrets.RSXERMU_KEY }}
+          REAL_LLM_JUDGE_BASE_URL: https://rsxermu666.cn/v1
+          REAL_LLM_JUDGE_MODEL: gpt-5.4
+          REAL_LLM_JUDGE_FORMAT: openai
         run: cargo test --no-fail-fast --test real_llm_ops_smoke ${{ matrix.t }} -- --ignored --nocapture
+
+      # R0.2：传出 skip ledger 供下游 skip-gate 汇总。
+      - name: Upload skip ledger
+        if: ${{ always() && env.REAL_LLM_API_KEY != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: real-llm-skip-ledger-ops-${{ matrix.t }}
+          path: target/real_llm_ledger/
+          if-no-files-found: ignore
+          retention-days: 30
+
+  # 手动单跑：只跑 workflow_dispatch input 指定的**单个** real_llm_ops_smoke 测试，
+  # **无 needs 前置链**，触发后立即起跑——用于快速验证单测修复（如 t15），不必等
+  # real-llm → recall → ops 串行排队 1+ 小时。env 与 real-llm-ops 完全同口径（同主模型
+  # kimi-k2.6 / 同异族 judge llama-3.3-70b / 同 failover 备胎链），保证单跑结果与全套
+  # 一致、可直接采信。仅 workflow_dispatch 事件触发；正常 PR/push 跑全套矩阵不受影响。
+  # MCP 仍是桩（绝不真发微信）。
+  real-llm-ops-single:
+    name: Real-LLM ops single (${{ github.event.inputs.ops_test }} / 手动单跑)
+    runs-on: ubuntu-latest
+    if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.dispatch_target == 'ops' }}
+    timeout-minutes: 90
+    env:
+      REAL_LLM_API_KEY: ${{ secrets.RSXERMU_KEY }}
+    steps:
+      - name: Require REAL_LLM_API_KEY (R0.1 缺 key 真 fail，不假绿)
+        if: ${{ env.REAL_LLM_API_KEY == '' }}
+        run: |
+          echo "::error::REAL_LLM_API_KEY 未配置（secrets.RSXERMU_KEY 为空）。real-llm job 必须有 key 才能真跑——缺 key 直接 fail，不静默跳过假绿（R0.1）。"
+          exit 1
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Free disk space
+        if: ${{ env.REAL_LLM_API_KEY != '' }}
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android \
+            /usr/local/share/boost /usr/local/share/powershell \
+            /usr/lib/jvm "$AGENT_TOOLSDIRECTORY" || true
+          sudo docker image prune --all --force || true
+          df -h
+
+      - name: Install Rust toolchain
+        if: ${{ env.REAL_LLM_API_KEY != '' }}
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry / target
+        if: ${{ env.REAL_LLM_API_KEY != '' }}
+        uses: Swatinem/rust-cache@v2
+
+      - name: cargo test --test real_llm_ops_smoke ${{ github.event.inputs.ops_test }}
+        if: ${{ env.REAL_LLM_API_KEY != '' }}
+        env:
+          RUSTFLAGS: ""
+          # 手动单跑切 rsxermu666.cn 不限流端点（主 claude-opus-4-8 走 Anthropic 非
+          # 流式；judge gpt-5.4 走 OpenAI，端点强制流式 SSE 由 LlmClient 聚合兜底），
+          # 避免 NVIDIA 429 让多轮弧 turn-1 即 skip 出假绿。仅影响手动单跑入口。
+          REAL_LLM_BASE_URL: https://rsxermu666.cn
+          REAL_LLM_MODEL: claude-opus-4-8
+          REAL_LLM_FORMAT: anthropic
+          REAL_LLM_JUDGE: "1"
+          JUDGE_SAMPLES: "1"
+          REAL_LLM_JUDGE_API_KEY: ${{ secrets.RSXERMU_KEY }}
+          REAL_LLM_JUDGE_BASE_URL: https://rsxermu666.cn/v1
+          REAL_LLM_JUDGE_MODEL: gpt-5.4
+          REAL_LLM_JUDGE_FORMAT: openai
+        run: cargo test --no-fail-fast --test real_llm_ops_smoke ${{ github.event.inputs.ops_test }} -- --ignored --nocapture
 
   # 知识库内容质量套件（real_llm_knowledge_quality.rs Q1–Q7）——「裁判校准层」重构后
   # 升级为跨家族裁判团（MiMo 双 checkpoint mimo-v2.5-pro + mimo-v2.5，外加**异族** Qwen
@@ -416,7 +560,8 @@ jobs:
   real-llm-quality:
     name: Real-LLM knowledge quality (${{ matrix.q }} 双裁判 / MCP 桩)
     runs-on: ubuntu-latest
-    # 串行链第 4 环（见 real-llm-recall 注释：跨 group 串行根治 NVIDIA 429）。
+    if: ${{ github.event_name != 'workflow_dispatch' }}
+    # 串行链第 4 环（见 real-llm-recall 注释：跨 group 串行守 rsxermu 并发 2）。
     needs: real-llm-ops
     continue-on-error: true
     timeout-minutes: 90
@@ -434,11 +579,15 @@ jobs:
           - q7_tag_extraction_quality
           - q8_honest_abstention_quality
     env:
-      # 被测内容生成走 kimi-k2.6 + 文本双裁判走异族（OpenAI 兼容，NVIDIA integrate）。naxtclaude
-      # 503 不可用 → 切 NVIDIA（kimi 被测 + llama-3.3-70b 主裁判 + qwen3-next-80b 轻裁判，实测文本+json_object
-      # 可用）。`if:` 守卫读此 job 级 env，空 key 时各步自动跳过。key 走 secret，缺则回落字面量。
-      REAL_LLM_API_KEY: ${{ secrets.REAL_LLM_CODERELAY_API_KEY || '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' }}
+      # 被测内容生成 + 文本双裁判全迁 rsxermu666.cn：被测 claude-opus-4-8（Anthropic）、裁判
+      # gpt-5.4（OpenAI /v1）。`if:` 守卫读此 job 级 env，空 key 时各步自动跳过。key 走 RSXERMU_KEY。
+      REAL_LLM_API_KEY: ${{ secrets.RSXERMU_KEY }}
     steps:
+      - name: Require REAL_LLM_API_KEY (R0.1 缺 key 真 fail，不假绿)
+        if: ${{ env.REAL_LLM_API_KEY == '' }}
+        run: |
+          echo "::error::REAL_LLM_API_KEY 未配置（secrets.RSXERMU_KEY 为空）。real-llm job 必须有 key 才能真跑——缺 key 直接 fail，不静默跳过假绿（R0.1）。"
+          exit 1
       - name: Checkout
         uses: actions/checkout@v4
 
@@ -463,56 +612,38 @@ jobs:
         if: ${{ env.REAL_LLM_API_KEY != '' }}
         env:
           RUSTFLAGS: ""
-          # 被测内容生成 + 文本双裁判：NVIDIA integrate（kimi 被测 + llama-3.3-70b 主裁判 + qwen3-next-80b 轻裁判），
-          # 被测/主裁判/轻裁判三方跨家族（moonshot/meta/qwen），跨家族分歧暴露 rubric 歧义。（naxtclaude 503 不可用，切 NVIDIA。）
-          # 下方异族第三裁判 + NVIDIA failover/vision 备胎链作退守保证循环跑完。
-          REAL_LLM_BASE_URL: https://integrate.api.nvidia.com/v1
-          REAL_LLM_MODEL: moonshotai/kimi-k2.6
-          REAL_LLM_JUDGE_LITE_MODEL: qwen/qwen3-next-80b-a3b-instruct
-          # vision 链路（Q3）：文本 checkpoint 不复用多模态，故指向专职视觉 provider
-          # nemotron-nano-12b-v2-vl（NVIDIA integrate，OpenAI 兼容 /v1，image_url data-URI）。实测真 fixture
-          # HTTP 200 抽取成功；偶发 5xx/524 走 LlmUnavailable→skip 不 fail。key 优先 secret，
-          # 缺则回落字面量（与下方 Qwen free key 同纪律：tests/CI 豁免 model-hint lint）。
-          REAL_LLM_VISION_API_KEY: ${{ secrets.REAL_LLM_VISION_API_KEY || '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' }}
-          REAL_LLM_VISION_BASE_URL: https://integrate.api.nvidia.com/v1
-          REAL_LLM_VISION_MODEL: nvidia/nemotron-nano-12b-v2-vl
-          # 备用视觉模型（异族多模态，NVIDIA 托管 llama-3.2-90b-vision，meta 家族）：被测
-          # nemotron-vl 瞬时不可达时生产候选链自动切换到它（supports_vision=true / is_vision_active=false 排其后）。
-          # backup 走 nemotron-nano-vl-8b（nvidia 家族，与主 nemotron-12b 同族无妨——backup 只是主挂时应急），
-          # 关键是回退后被测(nvidia) vs vision 裁判(meta llama-vision)仍跨家族，G-Eval 独立性不破。
-          # （本账户实测 phi-3-vision/llama-4-maverick/llama-3.2-11b-vision 均 404/500/超时不可用，故 backup 选 nemotron-nano-vl。）
-          # 缺 BACKUP key 时 Q3 测试不插备用配置，链退化为单主模型，CI 不退化。
-          # key 优先 secret，缺则回落字面量（与上方同纪律：tests/CI 豁免 model-hint lint）。
-          REAL_LLM_VISION_BACKUP_API_KEY: ${{ secrets.REAL_LLM_VISION_BACKUP_API_KEY || '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' }}
-          REAL_LLM_VISION_BACKUP_BASE_URL: https://integrate.api.nvidia.com/v1
-          REAL_LLM_VISION_BACKUP_MODEL: nvidia/llama-3.1-nemotron-nano-vl-8b-v1
-          # Q3 vision **裁判团**（区别于上方 vision 被测抽取）：让裁判真看图判「图 vs 抽取文本」，
-          # 是 Q3 永久 SKIP(divergent) 的根本修法——纯文本裁判看不到图、据文本 truth 误判捏造。
-          # 跨家族多模态裁判：① llama-3.2-90b-vision @ NVIDIA（VISION_JUDGE_*，meta 家族）+ ② 复用上方
-          # NVIDIA llama-3.2-90b-vision。被测抽取走 nemotron-vl(nvidia)、裁判走 llama-vision(meta 异家族)，
-          # 与被测不同家族，跨裁判分歧门保留不退回自评。key 只走 secret（已 gh
-          # secret set，明文绝不入库）；缺此 key → vision_judge_panel 返回 None → Q3 skip 不 fail。
+          # 被测内容生成 + 文本裁判全迁 rsxermu666.cn：被测 claude-opus-4-8（Anthropic /v1/messages）、
+          # 文本裁判 gpt-5.4（OpenAI /v1，端点强制流式 SSE 由 LlmClient 聚合兜底）。被测/裁判跨家族
+          # （anthropic/openai），跨家族分歧暴露 rubric 歧义。可选第三族 Qwen（NVIDIA）再加一层。
+          REAL_LLM_BASE_URL: https://rsxermu666.cn
+          REAL_LLM_MODEL: claude-opus-4-8
+          REAL_LLM_FORMAT: anthropic
+          JUDGE_SAMPLES: "1"
+          # 文本裁判端点（quality_judge_panel 读独立 REAL_LLM_JUDGE_* / 缺则回落主 base）。rsxermu 下
+          # judge 仅 gpt-5.4 一款文本模型，双 checkpoint 塌成同模型；跨家族效度靠下方可选异族 Qwen 承担。
+          REAL_LLM_JUDGE_BASE_URL: https://rsxermu666.cn/v1
+          REAL_LLM_JUDGE_MODEL: gpt-5.4
+          REAL_LLM_JUDGE_FORMAT: openai
+          REAL_LLM_JUDGE_LITE_MODEL: gpt-5.4
+          # vision 链路（Q3）：claude 的 Anthropic 图片 block 未实现，故 vision 抽取走 gpt-5.4
+          # （rsxermu OpenAI /v1，多模态 image_url；端点强制流式 SSE 由 vision 路径聚合兜底，0a）。
+          # 偶发 5xx/524 走 LlmUnavailable→skip 不 fail。
+          REAL_LLM_VISION_API_KEY: ${{ secrets.RSXERMU_KEY }}
+          REAL_LLM_VISION_BASE_URL: https://rsxermu666.cn/v1
+          REAL_LLM_VISION_MODEL: gpt-5.4
+          # Q3 vision **裁判团**（真看图判「图 vs 抽取文本」）：被测抽取走 gpt-5.4(openai)，vision 裁判
+          # 用可选 NVIDIA llama-3.2-90b-vision（meta 家族，与被测 gpt 跨家族）。独立 VISION_JUDGE_API_KEY
+          # （无字面量回落）；缺此 key → vision_judge_panel 返回 None → Q3 skip 不 fail。
           VISION_JUDGE_API_KEY: ${{ secrets.VISION_JUDGE_API_KEY }}
           VISION_JUDGE_BASE_URL: https://integrate.api.nvidia.com/v1
           VISION_JUDGE_MODEL: meta/llama-3.2-90b-vision-instruct
           REAL_LLM_LEDGER: target/real_llm_ledger
-          # 跨家族第三裁判：NVIDIA 托管 qwen3-next-80b（qwen 家族）——与被测 kimi（moonshot）、
-          # 主裁判 llama（meta）三方跨家族，照出同家族双 checkpoint 的家族级盲区（#618 最高 ROI 杠杆）。
-          # 沿用 QWEN_JUDGE_* 三元组 env（代码 hetero 裁判纯读 env，零改动）；该 env 缺失时自动
-          # 回落同家族双 checkpoint，CI 不退化。
-          QWEN_JUDGE_API_KEY: ${{ secrets.REAL_LLM_VISION_BACKUP_API_KEY || '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' }}
+          # 可选第三异族裁判：NVIDIA 托管 qwen3-next-80b（qwen 家族）——与被测 claude（anthropic）、
+          # 主裁判 gpt（openai）三方跨家族，照出家族级盲区（#618）。独立 NVIDIA_KEY（无字面量回落，
+          # 用户清理 NVIDIA key 后自动回落 claude+gpt 两族，CI 不 fail）。NVIDIA 异端点不占 rsxermu 并发。
+          QWEN_JUDGE_API_KEY: ${{ secrets.NVIDIA_KEY }}
           QWEN_JUDGE_BASE_URL: https://integrate.api.nvidia.com/v1
           QWEN_JUDGE_MODEL: qwen/qwen3-next-80b-a3b-instruct
-          # 文本侧 failover 备胎链（替换/重试机制）：被测内容生成 + 文本双裁判共享 NVIDIA integrate
-          # 端点，并发互撞偶发 429/5xx/瞬时不可达。配此 key 后主模型遇
-          # **可转移**故障（429/5xx/timeout/connect/网络）即快速切到 NVIDIA integrate 上的
-          # 异族文本模型（glm/step/nemotron-super，避开被测 kimi 及主裁判 llama-3.3-70b/qwen 同源；
-          # 本账户实测 minimax-m2.7 稳定超时不可用，故剔除）兜底，让 Q 判分流程**跑完拿真分**而非 skip。
-          # 复用 vision 备用的 NVIDIA key（同端点托管文本模型）。缺此 key 时退回单主模型 +
-          # max_retries=5 自愈窗口，CI 不退化。tests/CI 豁免 model-hint lint。
-          REAL_LLM_FAILOVER_API_KEY: ${{ secrets.REAL_LLM_VISION_BACKUP_API_KEY || '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' }}
-          REAL_LLM_FAILOVER_BASE_URL: https://integrate.api.nvidia.com/v1
-          REAL_LLM_FAILOVER_MODELS: z-ai/glm-5.1,stepfun-ai/step-3.7-flash,nvidia/llama-3.3-nemotron-super-49b-v1.5
         run: cargo test --no-fail-fast --test real_llm_knowledge_quality ${{ matrix.q }} -- --ignored --nocapture
 
       - name: Upload score ledger
@@ -539,7 +670,8 @@ jobs:
   real-llm-adversarial:
     name: Real-LLM adversarial (${{ matrix.arc }})
     runs-on: ubuntu-latest
-    # 串行链末环（见 real-llm-recall 注释：跨 group 串行根治 NVIDIA 429）。
+    if: ${{ github.event_name != 'workflow_dispatch' }}
+    # 串行链末环（见 real-llm-recall 注释：跨 group 串行守 rsxermu 并发 2）。
     needs: real-llm-quality
     continue-on-error: true
     # 每弧独享墙。t_judge_calibration 是仪器最重的一片——20 金标 × 4 裁判 × K=3 = 240 次真模型调用，
@@ -566,14 +698,16 @@ jobs:
           - t_adv_prompt_injection
           - t_longrun_capability
     env:
-      # 模型沿革：MiMo → gpt-5.5 → deepseek-v4 → MiMo → naxtclaude gpt-5.x（2026-06-07）→
-      # **切 NVIDIA integrate（2026-06-08，naxtclaude chat completions 稳定 503 不可用）**。
-      # 被测 agent = kimi-k2.6（moonshot），主裁判 judge1 = llama-3.3-70b（meta 家族，见下方 step env
-      # REAL_LLM_JUDGE1_MODEL，跨家族），第二裁判 = 跨家族 Qwen。key 走 secret（缺则
-      # 回落字面量 nvapi），端点 HTTPS（integrate.api.nvidia.com）。
-      # `if:` 守卫读 job 级此 env，故空 key 时整个 adversarial job 各步自动跳过、不红不耗 CI 分钟。
-      REAL_LLM_API_KEY: ${{ secrets.REAL_LLM_CODERELAY_API_KEY || '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' }}
+      # 全迁 rsxermu666.cn（2026-06-16）：被测 agent = claude-opus-4-8（Anthropic），judge1 = gpt-5.4
+      # （OpenAI /v1，跨家族），可选第二/三裁判 = NVIDIA Qwen/GLM（异端点不占 rsxermu 并发）。
+      # `if:` 守卫读 job 级此 env，空 key 时整个 adversarial job 各步自动跳过、不红不耗 CI 分钟。
+      REAL_LLM_API_KEY: ${{ secrets.RSXERMU_KEY }}
     steps:
+      - name: Require REAL_LLM_API_KEY (R0.1 缺 key 真 fail，不假绿)
+        if: ${{ env.REAL_LLM_API_KEY == '' }}
+        run: |
+          echo "::error::REAL_LLM_API_KEY 未配置（secrets.RSXERMU_KEY 为空）。real-llm job 必须有 key 才能真跑——缺 key 直接 fail，不静默跳过假绿（R0.1）。"
+          exit 1
       - name: Checkout
         uses: actions/checkout@v4
 
@@ -598,43 +732,32 @@ jobs:
         if: ${{ env.REAL_LLM_API_KEY != '' }}
         env:
           RUSTFLAGS: ""
-          # 被测 agent = kimi-k2.6（REAL_LLM_MODEL，moonshot）；主裁判 judge1 = llama-3.3-70b（REAL_LLM_JUDGE1_MODEL，
-          # meta 家族，judge1≠agent 跨家族，自评干净不逐字自我背书）。端点 NVIDIA integrate
-          # （naxtclaude 503 不可用，切 NVIDIA）。台账 judge label 从各 model 名派生。
-          REAL_LLM_BASE_URL: https://integrate.api.nvidia.com/v1
-          REAL_LLM_MODEL: moonshotai/kimi-k2.6
-          REAL_LLM_JUDGE1_MODEL: meta/llama-3.3-70b-instruct
-          REAL_LLM_VISION_MODEL: nvidia/nemotron-nano-12b-v2-vl
+          # 被测 agent = claude-opus-4-8（REAL_LLM_MODEL，Anthropic）；主裁判 judge1 = gpt-5.4
+          # （REAL_LLM_JUDGE1_MODEL，OpenAI /v1，与被测 claude 跨家族，自评干净不逐字背书）。
+          # judge1 走独立 REAL_LLM_JUDGE_BASE_URL/_FORMAT（claude /v1/messages、gpt /v1/chat/completions
+          # 端点串异故必须独立接线）。**不配 REAL_LLM_JUDGE_API_KEY**：judge1 的 key 经 judge_key 回落
+          # 取主 RSXERMU_KEY；这样 strongest_model_client（读 JUDGE_API_KEY）返 None，agent failover 不被
+          # 激活，被测纯度保住（被测恒 claude，不会抖动时切成 gpt）。
+          REAL_LLM_BASE_URL: https://rsxermu666.cn
+          REAL_LLM_MODEL: claude-opus-4-8
+          REAL_LLM_FORMAT: anthropic
+          REAL_LLM_JUDGE1_MODEL: gpt-5.4
+          REAL_LLM_JUDGE_BASE_URL: https://rsxermu666.cn/v1
+          REAL_LLM_JUDGE_MODEL: gpt-5.4
+          REAL_LLM_JUDGE_FORMAT: openai
+          REAL_LLM_VISION_MODEL: gpt-5.4
           REAL_LLM_JUDGE: "1"
+          JUDGE_SAMPLES: "1"
           REAL_LLM_LEDGER: target/real_llm_ledger
-          # 异族强模型 llama-3.3-70b（@ NVIDIA integrate，meta）作 agent/红队/判官备胎链**首选**：
-          # 主端点 402 欠费 / 429 限流 / 5xx 时优先切它续跑（is_failover_worthy 对
-          # 402/401 也切备胎 + 此 key 接上 llama 兜底）。key 优先 secret，缺则回落字面量
-          # （tests/CI 豁免 model-hint lint）。缺此 key 时备胎链退回 NVIDIA 链/空，CI 不退化。
-          REAL_LLM_JUDGE_API_KEY: ${{ secrets.REAL_LLM_GPT55_API_KEY || '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' }}
-          REAL_LLM_JUDGE_BASE_URL: https://integrate.api.nvidia.com/v1
-          REAL_LLM_JUDGE_MODEL: meta/llama-3.3-70b-instruct
-          # 第二裁判 = 跨家族 Qwen（阿里 DashScope，OpenAI 兼容）。被测 kimi(moonshot)/judge1 llama(meta)
-          # 已跨家族，再加这一路 Qwen 形成三族交叉——读账以 |judge1−qwen| 为家族盲区代理。
-          # 缺该 secret 时 judge_panel() 退化回 lite 第二裁判（用 VISION_MODEL）。
-          REAL_LLM_JUDGE2_API_KEY: ${{ secrets.REAL_LLM_JUDGE2_API_KEY }}
-          REAL_LLM_JUDGE2_BASE_URL: https://dashscope.aliyuncs.com/compatible-mode/v1
-          REAL_LLM_JUDGE2_MODEL: qwen3.7-max
-          # 第三裁判 = 跨家族 GLM（智谱 BigModel，OpenAI 兼容端点）——与 kimi/llama/qwen 再隔一族，
-          # 凑齐「4 模型交叉验证一致性」。读账以 kimi / llama / qwen / glm 多族 median 的两两
-          # 分歧为家族盲区代理（任一族孤立偏离 = 该族盲区或 rubric 歧义）。缺该 secret 时
-          # judge_panel() 不 push judge3，自动回落（kimi被测 + llama/qwen 裁判），CI 不退化。
-          REAL_LLM_JUDGE3_API_KEY: ${{ secrets.REAL_LLM_JUDGE3_API_KEY }}
-          REAL_LLM_JUDGE3_BASE_URL: https://open.bigmodel.cn/api/coding/paas/v4
-          REAL_LLM_JUDGE3_MODEL: GLM-5.1
-          # 跨模型 failover 备胎链（NVIDIA 托管，OpenAI 兼容 /v1）：被测 agent / 红队对手 /
-          # 裁判团任一调用主端点重试耗尽仍 429/503/超时 时，自动切到下列备胎（异族链
-          # glm-5.1 → step-3.7-flash → qwen3-next-80b，全避开被测 kimi 与主裁判 llama-3.3-70b；
-          # 本账户实测 minimax-m2.7 稳定超时不可用，故剔除），保「全程跑完」。台账记 actual_model +
-          # fallback 标记区分主模型原生分与备胎兜底分。缺该 secret 时备胎链空 = 与今天行为一致。
-          REAL_LLM_FAILOVER_API_KEY: ${{ secrets.REAL_LLM_FAILOVER_API_KEY }}
-          REAL_LLM_FAILOVER_BASE_URL: https://integrate.api.nvidia.com/v1
-          REAL_LLM_FAILOVER_MODELS: z-ai/glm-5.1,stepfun-ai/step-3.7-flash,qwen/qwen3-next-80b-a3b-instruct
+          # 可选第二/三异族裁判 = NVIDIA Qwen / GLM（异端点不占 rsxermu 并发）。独立 NVIDIA_KEY
+          # （无字面量回落，用户清理 NVIDIA key 后自动回落 claude+gpt 两族，judge_panel 退回 2 裁判不 fail）。
+          # 被测 claude(anthropic) + judge1 gpt(openai) + 可选 qwen/glm 多族交叉，照出家族盲区（#618）。
+          REAL_LLM_JUDGE2_API_KEY: ${{ secrets.NVIDIA_KEY }}
+          REAL_LLM_JUDGE2_BASE_URL: https://integrate.api.nvidia.com/v1
+          REAL_LLM_JUDGE2_MODEL: qwen/qwen3-next-80b-a3b-instruct
+          REAL_LLM_JUDGE3_API_KEY: ${{ secrets.NVIDIA_KEY }}
+          REAL_LLM_JUDGE3_BASE_URL: https://integrate.api.nvidia.com/v1
+          REAL_LLM_JUDGE3_MODEL: z-ai/glm-5.1
         run: cargo test --no-fail-fast --test real_llm_adversarial ${{ matrix.arc }} -- --ignored --nocapture
 
       - name: Upload score ledger
@@ -645,3 +768,369 @@ jobs:
           path: target/real_llm_ledger/
           if-no-files-found: ignore
           retention-days: 30
+
+  # 手动单跑：roleplay-fuzz P0 那几个需要 Docker（testcontainers MongoDB）的 #[ignore]
+  # 夹具自验证测试。**无 needs 前置链、无任何 LLM key**——只验夹具本身（seed active
+  # DomainProfile 经缓存失效后能读回 / 默认 ws 仍回落 DEFAULT / reviewer prompt 覆写在
+  # ensure_prompt_pack_v2 之后胜出 / verified chunk 能写入），不调真模型、不烧配额。
+  # 仅 workflow_dispatch + dispatch_target=roleplay_docker 触发；正常 PR/push 跑全套不受
+  # 影响（这些测试在 integration job 的全量 --ignored 里本就会被一起跑到，本 job 只是给
+  # 一个轻量、即时、单独的验证入口）。
+  roleplay-docker:
+    name: Roleplay P0 Docker fixtures (手动单跑 / 无 LLM)
+    runs-on: ubuntu-latest
+    if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.dispatch_target == 'roleplay_docker' }}
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # 同 integration job：清预装 SDK 腾 ~30GB，否则 target + mongo 镜像撑爆磁盘。
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android \
+            /usr/local/share/boost /usr/local/share/powershell \
+            /usr/lib/jvm "$AGENT_TOOLSDIRECTORY" || true
+          sudo docker image prune --all --force || true
+          df -h
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry / target
+        uses: Swatinem/rust-cache@v2
+
+      # ubuntu-latest runner 预装 Docker daemon；testcontainers 自动拉起临时 MongoDB
+      # 容器。关 -Dwarnings 同 integration job 理由（测试文件陈年 warning 不阻断真实跑测）。
+      # --include-ignored 同时跑 #[ignore]（4 个需 Docker）与非 ignore 的 ledger 单测，
+      # 一次拿全 5 个 P0 自验证结果。--nocapture 让诊断行进 CI 日志。
+      - name: cargo test --test roleplay_fixtures_smoke (testcontainers MongoDB)
+        env:
+          RUSTFLAGS: ""
+        run: cargo test --no-fail-fast --test roleplay_fixtures_smoke -- --include-ignored --nocapture
+
+  # 手动单跑：roleplay-fuzz P2 情感陪伴固定场景全链 E2E（真模型 + testcontainers MongoDB）。
+  # 在「default」ws seed 一个情感陪伴 active DomainProfile（非销售域），跑设计 §6.2 的夜间
+  # 情绪低落 4 轮固定台词，走真实 handle_managed_message 全链（Reply Agent→Reviewer→gateway），
+  # 硬断言确定性契约（status 闭集 / 不复读 / 无第三方承接），情感陪伴中性 judge 只观测不拦。
+  # **无 needs 前置链**——立即起跑，不必等 real-llm 串行链。env 与 real-llm-ops-single 同口径
+  # （主模型 kimi / 异族裁判 llama-3.3-70b / NVIDIA failover 链 + REAL_LLM_JUDGE=1）。
+  # 仅 workflow_dispatch + dispatch_target=roleplay_p2 触发；正常 PR/push 不受影响（P2 测试
+  # #[ignore]，在 integration job 全量 --ignored 里本就会被跑到，本 job 只给即时单独入口）。
+  roleplay-p2:
+    name: Roleplay P2 情感陪伴全链 E2E (手动单跑 / 真模型)
+    runs-on: ubuntu-latest
+    if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.dispatch_target == 'roleplay_p2' }}
+    timeout-minutes: 90
+    env:
+      REAL_LLM_API_KEY: ${{ secrets.RSXERMU_KEY }}
+    steps:
+      - name: Require REAL_LLM_API_KEY (R0.1 缺 key 真 fail，不假绿)
+        if: ${{ env.REAL_LLM_API_KEY == '' }}
+        run: |
+          echo "::error::REAL_LLM_API_KEY 未配置（secrets.RSXERMU_KEY 为空）。real-llm job 必须有 key 才能真跑——缺 key 直接 fail，不静默跳过假绿（R0.1）。"
+          exit 1
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # 同 integration job：清预装 SDK 腾 ~30GB，否则 target + mongo 镜像撑爆磁盘。
+      - name: Free disk space
+        if: ${{ env.REAL_LLM_API_KEY != '' }}
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android \
+            /usr/local/share/boost /usr/local/share/powershell \
+            /usr/lib/jvm "$AGENT_TOOLSDIRECTORY" || true
+          sudo docker image prune --all --force || true
+          df -h
+
+      - name: Install Rust toolchain
+        if: ${{ env.REAL_LLM_API_KEY != '' }}
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry / target
+        if: ${{ env.REAL_LLM_API_KEY != '' }}
+        uses: Swatinem/rust-cache@v2
+
+      # 全迁 rsxermu666.cn：被测 claude-opus-4-8（Anthropic）、judge gpt-5.4（OpenAI /v1，端点强制
+      # 流式 SSE 由 LlmClient 聚合兜底）。情感陪伴中性 judge 只观测不拦。JUDGE_SAMPLES=1 控并发。
+      - name: cargo test --test roleplay_emotional_companion_e2e (real LLM + testcontainers)
+        if: ${{ env.REAL_LLM_API_KEY != '' }}
+        env:
+          RUSTFLAGS: ""
+          REAL_LLM_BASE_URL: https://rsxermu666.cn
+          REAL_LLM_MODEL: claude-opus-4-8
+          REAL_LLM_FORMAT: anthropic
+          REAL_LLM_JUDGE: "1"
+          JUDGE_SAMPLES: "1"
+          REAL_LLM_JUDGE_API_KEY: ${{ secrets.RSXERMU_KEY }}
+          REAL_LLM_JUDGE_BASE_URL: https://rsxermu666.cn/v1
+          REAL_LLM_JUDGE_MODEL: gpt-5.4
+          REAL_LLM_JUDGE_FORMAT: openai
+        run: cargo test --no-fail-fast --test roleplay_emotional_companion_e2e -- --ignored --nocapture
+
+      - name: Upload roleplay ledger
+        if: ${{ always() && env.REAL_LLM_API_KEY != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: roleplay-p2-ledger
+          path: target/real_llm_ledger/
+          if-no-files-found: ignore
+          retention-days: 30
+
+  # 手动单跑：reviewer 高压识别校准（固定候选回复直喂真 reviewer + 异族 judge 交叉）。
+  # 验证情感 profile 下 reviewer 既不误杀合理关心、也不漏判控制式高压。无 needs，立即起跑。
+  # 仅 workflow_dispatch + dispatch_target=reviewer_calibration 触发。env 与 roleplay-p2 同口径。
+  reviewer-calibration:
+    name: Reviewer 高压识别校准 (手动单跑 / 真模型)
+    runs-on: ubuntu-latest
+    if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.dispatch_target == 'reviewer_calibration' }}
+    timeout-minutes: 90
+    env:
+      REAL_LLM_API_KEY: ${{ secrets.RSXERMU_KEY }}
+    steps:
+      - name: Require REAL_LLM_API_KEY (R0.1 缺 key 真 fail，不假绿)
+        if: ${{ env.REAL_LLM_API_KEY == '' }}
+        run: |
+          echo "::error::REAL_LLM_API_KEY 未配置（secrets.RSXERMU_KEY 为空）。real-llm job 必须有 key 才能真跑——缺 key 直接 fail，不静默跳过假绿（R0.1）。"
+          exit 1
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # 同 integration job：清预装 SDK 腾 ~30GB，否则 target + mongo 镜像撑爆磁盘。
+      - name: Free disk space
+        if: ${{ env.REAL_LLM_API_KEY != '' }}
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android \
+            /usr/local/share/boost /usr/local/share/powershell \
+            /usr/lib/jvm "$AGENT_TOOLSDIRECTORY" || true
+          sudo docker image prune --all --force || true
+          df -h
+
+      - name: Install Rust toolchain
+        if: ${{ env.REAL_LLM_API_KEY != '' }}
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry / target
+        if: ${{ env.REAL_LLM_API_KEY != '' }}
+        uses: Swatinem/rust-cache@v2
+
+      # 端点 rsxermu666.cn 不限流（仅并发敏感）：主模型 claude-opus-4-8 走 Anthropic
+      # 非流式；judge gpt-5.4 走 OpenAI（该端点强制流式 SSE，LlmClient 已支持聚合 +
+      # 剥离 <think> 前缀）。异厂商天然异族。JUDGE_SAMPLES=1 + 不配 failover 控并发。
+      - name: cargo test --test roleplay_reviewer_pressure_calibration (real LLM + testcontainers)
+        if: ${{ env.REAL_LLM_API_KEY != '' }}
+        env:
+          RUSTFLAGS: ""
+          REAL_LLM_BASE_URL: https://rsxermu666.cn
+          REAL_LLM_MODEL: claude-opus-4-8
+          REAL_LLM_FORMAT: anthropic
+          REAL_LLM_JUDGE: "1"
+          JUDGE_SAMPLES: "1"
+          REAL_LLM_JUDGE_API_KEY: ${{ secrets.RSXERMU_KEY }}
+          REAL_LLM_JUDGE_BASE_URL: https://rsxermu666.cn/v1
+          REAL_LLM_JUDGE_MODEL: gpt-5.4
+          REAL_LLM_JUDGE_FORMAT: openai
+        run: cargo test --no-fail-fast --test roleplay_reviewer_pressure_calibration -- --ignored --nocapture
+
+      - name: Upload calibration ledger
+        if: ${{ always() && env.REAL_LLM_API_KEY != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: reviewer-calibration-ledger
+          path: target/real_llm_ledger/
+          if-no-files-found: ignore
+          retention-days: 30
+
+  # 手动单跑：R5.1 LLM 演客户动态博弈链（roleplayer 真演客户 × agent 真回应 × 多轮闭合）。
+  # 三族异族（R5.0.1）：agent=claude-opus-4-8（RSXERMU/Anthropic）、roleplayer=NVIDIA
+  # llama-3.3-70b（NVIDIA_KEY，第三族，独立端点不占 rsxermu 并发）。judge 本条不接（R5.2
+  # trajectory judge 后续）——只验博弈链通 + gateway status 闭集硬断言 + roleplayer 不出戏。
+  # 仅 workflow_dispatch + dispatch_target=roleplay_arc 触发。无 needs，立即起跑。
+  roleplay-arc:
+    name: Roleplay R5.1 动态博弈链 (手动单跑 / 三族真模型)
+    runs-on: ubuntu-latest
+    if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.dispatch_target == 'roleplay_arc' }}
+    timeout-minutes: 90
+    env:
+      REAL_LLM_API_KEY: ${{ secrets.RSXERMU_KEY }}
+      ROLEPLAYER_API_KEY: ${{ secrets.NVIDIA_KEY }}
+    steps:
+      - name: Require REAL_LLM_API_KEY (R0.1 缺 key 真 fail，不假绿)
+        if: ${{ env.REAL_LLM_API_KEY == '' }}
+        run: |
+          echo "::error::REAL_LLM_API_KEY 未配置（secrets.RSXERMU_KEY 为空）。被测 agent 必须有 key 才能真跑——缺 key 直接 fail，不静默跳过假绿（R0.1）。"
+          exit 1
+      - name: Require ROLEPLAYER_API_KEY (R0.1 缺第三族 key 真 fail，不假绿)
+        if: ${{ env.ROLEPLAYER_API_KEY == '' }}
+        run: |
+          echo "::error::ROLEPLAYER_API_KEY 未配置（secrets.NVIDIA_KEY 为空）。roleplayer 是第三异族（R5.0.1），缺 key 则博弈链全程 fallback=假绿——直接 fail，不静默跳过。"
+          exit 1
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # 同 integration job：清预装 SDK 腾 ~30GB，否则 target + mongo 镜像撑爆磁盘。
+      - name: Free disk space
+        if: ${{ env.REAL_LLM_API_KEY != '' && env.ROLEPLAYER_API_KEY != '' }}
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android \
+            /usr/local/share/boost /usr/local/share/powershell \
+            /usr/lib/jvm "$AGENT_TOOLSDIRECTORY" || true
+          sudo docker image prune --all --force || true
+          df -h
+
+      - name: Install Rust toolchain
+        if: ${{ env.REAL_LLM_API_KEY != '' && env.ROLEPLAYER_API_KEY != '' }}
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry / target
+        if: ${{ env.REAL_LLM_API_KEY != '' && env.ROLEPLAYER_API_KEY != '' }}
+        uses: Swatinem/rust-cache@v2
+
+      # 被测 agent = claude-opus-4-8（rsxermu666.cn / Anthropic 非流式）；roleplayer 走默认
+      # NVIDIA llama-3.3-70b @ temperature 0.8（with_temperature 覆盖生产默认 0.2）。两端点
+      # 异厂商天然异族，且 NVIDIA 异端点不占 rsxermu 并发。
+      - name: cargo test --test real_llm_roleplay_arc (3 异族真模型 + testcontainers)
+        if: ${{ env.REAL_LLM_API_KEY != '' && env.ROLEPLAYER_API_KEY != '' }}
+        env:
+          RUSTFLAGS: ""
+          REAL_LLM_BASE_URL: https://rsxermu666.cn
+          REAL_LLM_MODEL: claude-opus-4-8
+          REAL_LLM_FORMAT: anthropic
+          ROLEPLAYER_BASE_URL: https://integrate.api.nvidia.com/v1
+          ROLEPLAYER_MODEL: meta/llama-3.3-70b-instruct
+          ROLEPLAYER_FORMAT: openai
+          ROLEPLAYER_TEMPERATURE: "0.8"
+        run: cargo test --no-fail-fast --test real_llm_roleplay_arc -- --ignored --nocapture
+
+      - name: Upload roleplay arc ledger
+        if: ${{ always() && env.REAL_LLM_API_KEY != '' && env.ROLEPLAYER_API_KEY != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: roleplay-arc-ledger
+          path: target/real_llm_ledger/
+          if-no-files-found: ignore
+          retention-days: 30
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # 真模型红线门（R2.2 跨域全链 / R2.5.3 请示通道 / R5 动态对抗 / 主动外联）。
+  #
+  # 这 4 个文件过去**无任何带 key 的专用 CI 入口**——只在无 key 的 integration job 里
+  # 被编译，require_real_llm! 取不到 key 即 return（skip=PASS），承载的转真人/泄露身份/
+  # relay 不暴露真人等**确定性红线断言从不在真 LLM 下执行 = 假绿**（深度审查 G1 critical）。
+  # 本 job 给它们补真 key 入口。
+  #
+  # 与其余 real-llm group 不同：**本 job 不设 continue-on-error**（G2）。这 4 个文件经红线
+  # 词表硬化后，主体是确定性红线 panic + unwrap_or_skip_transient!（端点抖动→skip 不 fail）。
+  # 故红线击穿必须真红卡合并，而端点 5xx/超时仍走 skip 不误红。串行链末环（needs adversarial，
+  # 守 rsxermu 并发 ≤2）。matrix 内 max-parallel:1 同理。
+  real-llm-redline:
+    name: Real-LLM 红线门 (${{ matrix.file }} / 确定性硬断言)
+    runs-on: ubuntu-latest
+    if: ${{ github.event_name != 'workflow_dispatch' }}
+    needs: real-llm-adversarial
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        file:
+          - real_llm_cross_domain_arc
+          - real_llm_principal_channel
+          - real_llm_proactive_outreach
+          - real_llm_dynamic_adversarial
+          - real_llm_digital_twin_arc
+          - real_llm_principal_relay
+    env:
+      REAL_LLM_API_KEY: ${{ secrets.RSXERMU_KEY }}
+    steps:
+      - name: Require REAL_LLM_API_KEY (R0.1 缺 key 真 fail，不假绿)
+        if: ${{ env.REAL_LLM_API_KEY == '' }}
+        run: |
+          echo "::error::REAL_LLM_API_KEY 未配置（secrets.RSXERMU_KEY 为空）。红线门必须有 key 才能真跑——缺 key 直接 fail，不静默跳过假绿（R0.1）。"
+          exit 1
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Free disk space
+        if: ${{ env.REAL_LLM_API_KEY != '' }}
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android \
+            /usr/local/share/boost /usr/local/share/powershell \
+            /usr/lib/jvm "$AGENT_TOOLSDIRECTORY" || true
+          sudo docker image prune --all --force || true
+          df -h
+
+      - name: Install Rust toolchain
+        if: ${{ env.REAL_LLM_API_KEY != '' }}
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry / target
+        if: ${{ env.REAL_LLM_API_KEY != '' }}
+        uses: Swatinem/rust-cache@v2
+
+      # 被测 agent = claude-opus-4-8（Anthropic）。cross_domain 的 judge / dynamic 的轨迹裁判
+      # 走 gpt-5.4（OpenAI /v1，跨家族）；dynamic 的 roleplayer 第三族用 NVIDIA（异端点，缺则
+      # assert_three_families_distinct 自 skip 不 fail）。红线硬断言不依赖 judge，judge 仅观测。
+      - name: cargo test --test ${{ matrix.file }} (红线硬断言 + skip-on-transient)
+        if: ${{ env.REAL_LLM_API_KEY != '' }}
+        env:
+          RUSTFLAGS: ""
+          REAL_LLM_BASE_URL: https://rsxermu666.cn
+          REAL_LLM_MODEL: claude-opus-4-8
+          REAL_LLM_FORMAT: anthropic
+          REAL_LLM_JUDGE1_MODEL: gpt-5.4
+          REAL_LLM_JUDGE_BASE_URL: https://rsxermu666.cn/v1
+          REAL_LLM_JUDGE_MODEL: gpt-5.4
+          REAL_LLM_JUDGE_FORMAT: openai
+          REAL_LLM_JUDGE: "1"
+          JUDGE_SAMPLES: "1"
+          REAL_LLM_LEDGER: target/real_llm_ledger
+          # dynamic_adversarial 第三族异族 roleplayer/judge（缺则回落两族不 fail）。
+          REAL_LLM_JUDGE2_API_KEY: ${{ secrets.NVIDIA_KEY }}
+          REAL_LLM_JUDGE2_BASE_URL: https://integrate.api.nvidia.com/v1
+          REAL_LLM_JUDGE2_MODEL: qwen/qwen3-next-80b-a3b-instruct
+          ROLEPLAYER_API_KEY: ${{ secrets.NVIDIA_KEY }}
+          ROLEPLAYER_BASE_URL: https://integrate.api.nvidia.com/v1
+          ROLEPLAYER_MODEL: qwen/qwen3-next-80b-a3b-instruct
+        run: cargo test --no-fail-fast --test ${{ matrix.file }} -- --ignored --nocapture
+
+      - name: Upload skip ledger
+        if: ${{ always() && env.REAL_LLM_API_KEY != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: real-llm-ledger-redline-${{ matrix.file }}
+          path: target/real_llm_ledger/
+          if-no-files-found: ignore
+          retention-days: 30
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # R0.2：skip 率硬门（汇总）。各 real-llm job 是 continue-on-error（conclusion 恒
+  # success，端点抖动不卡合并），但**大面积 transient-skip = 这一轮真模型测试实际
+  # 没验证到能力 = 假绿**。本 job 非 continue-on-error，needs 5 个 PR 门真模型 job，
+  # 汇总它们传出的 skip_ledger.jsonl，skip 总数超阈值即真红卡合并。
+  # 缺 key（fork PR/没配 secret）时 5 个上游 job 在其 fail-gate 已红，本 job 因
+  # needs 失败而 skipped，不会假绿。
+  skip-gate:
+    name: Real-LLM skip 率硬门 (R0.2)
+    runs-on: ubuntu-latest
+    if: ${{ github.event_name != 'workflow_dispatch' }}
+    needs: [real-llm, real-llm-recall, real-llm-ops, real-llm-quality, real-llm-adversarial, real-llm-redline]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      # 汇总所有真模型 job 传出的 ledger（含 skip_ledger.jsonl）到一个目录。
+      # pattern 覆盖各 job 的命名：real-llm-skip-ledger-* / real-llm-recall-ledger-* /
+      # real-llm-ledger-*（quality/adversarial）。merge-multiple 把多 artifact 合进同目录。
+      - name: Download all skip ledgers
+        uses: actions/download-artifact@v4
+        with:
+          path: target/real_llm_ledger
+          pattern: "*ledger*"
+          merge-multiple: true
+      - name: Check skip rate
+        env:
+          REAL_LLM_LEDGER: target/real_llm_ledger
+          # 5 个 job 汇总，放宽到 12（单 job ~3-16 测试，端点偶发抖动允许少量；
+          # 持续抖动致大面积 skip 才红）。可按实际调。
+          REAL_LLM_MAX_SKIP: "12"
+        run: bash scripts/check-skip-ledger.sh

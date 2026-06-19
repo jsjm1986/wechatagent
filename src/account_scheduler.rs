@@ -23,7 +23,7 @@
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 
-use chrono::{Datelike, Timelike};
+use chrono::Datelike;
 use futures::TryStreamExt;
 use mongodb::bson::doc;
 
@@ -55,7 +55,14 @@ pub async fn assign_account(
         .await
         .unwrap_or_default();
 
-    let cur_hour = now.hour();
+    // off_hours 判定按运营方时区小时,不能用 UTC 小时——容器默认 UTC 会让"22:00 off"
+    // 在 UTC 22:00 触发、偏 8 小时(quiet_hours.rs 模块注释同款警告)。复用 quiet_hours
+    // 的固定偏移哲学 + 全局 calendar 时区偏移(此处与 planner 同为"无 per-contact runtime"
+    // 的处境,故取全局偏移而非 per-contact 的 quiet_hours_tz_offset_hours)。
+    let cur_hour = crate::agent::quiet_hours::hour_in_offset(
+        now.timestamp_millis(),
+        state.config.strategic_planner_calendar_tz_offset_hours,
+    );
     let mut eligible: Vec<&WechatAccount> = accounts
         .iter()
         .filter(|a| a.online)
@@ -320,6 +327,32 @@ mod tests {
         assert!(is_in_off_hours(&ranges, 3));
         assert!(is_in_off_hours(&ranges, 23));
         assert!(!is_in_off_hours(&ranges, 12));
+    }
+
+    // 回归：off_hours 判定须用运营方时区小时,不能用 UTC 小时。
+    // UTC 00:00 在 +8 时区是本地 08:00——本该"已醒来、不在 22..24 off 区间";
+    // 若误用 UTC 小时(0)则会落进 0..6 区间被错误判为 off。锁住时区偏移生效。
+    #[test]
+    fn off_hours_uses_operator_tz_not_utc_hour() {
+        use crate::agent::quiet_hours::hour_in_offset;
+        let ranges = vec![
+            HourRange {
+                start_hour: 0,
+                end_hour: 6,
+            },
+            HourRange {
+                start_hour: 22,
+                end_hour: 24,
+            },
+        ];
+        // UTC 2026-01-01T00:00:00Z = 1_767_225_600_000 ms。
+        let utc_midnight_ms: i64 = 1_767_225_600_000;
+        // 误用 UTC 小时(0)：落进 0..6,被判 off（旧 bug 行为）。
+        assert_eq!(hour_in_offset(utc_midnight_ms, 0), 0);
+        assert!(is_in_off_hours(&ranges, hour_in_offset(utc_midnight_ms, 0)));
+        // 正确用 +8 偏移：本地 08:00,不在任何 off 区间（修复后行为）。
+        assert_eq!(hour_in_offset(utc_midnight_ms, 8), 8);
+        assert!(!is_in_off_hours(&ranges, hour_in_offset(utc_midnight_ms, 8)));
     }
 
     #[test]

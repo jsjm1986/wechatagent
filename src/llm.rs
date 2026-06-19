@@ -64,6 +64,10 @@ pub struct LlmClient {
     client: reqwest::Client,
     max_retries: u32,
     retry_base_ms: u64,
+    /// 采样温度。生产默认 0.2（决策/审查要稳定）。测试侧 roleplayer 用
+    /// [`Self::with_temperature`] 调高到 ~0.8 演客户（要有变化、像真人）。
+    /// JSON 修复路径（fetch_raw_text）仍用 0.0 不受本字段影响——修复要确定性。
+    temperature: f64,
 }
 
 #[derive(Debug, Serialize)]
@@ -117,6 +121,11 @@ struct AnthropicMessageResponse {
     content: Vec<AnthropicContentBlock>,
     #[serde(default)]
     usage: Option<AnthropicUsage>,
+    /// `end_turn` / `max_tokens` / `tool_use` / `stop_sequence`。长任务实测：claude 偶发
+    /// 决定先调工具（`tool_use`）联网搜资料，真内容跑进 tool_use block，text block 只剩
+    /// 开场白 → 需识别后给明确诊断，而非含糊的 json_decode。
+    #[serde(default)]
+    stop_reason: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -222,6 +231,10 @@ pub trait LlmProvider: Send + Sync {
     }
 }
 
+/// 第三层「回喂 LLM 修复」的最大尝试次数（用户指定 2 次）。前两层（快路径 +
+/// `repair_loose_json` + `extract_embedded_json`）全失败才触发。
+const REPAIR_MAX_ATTEMPTS: u32 = 2;
+
 impl LlmClient {
     pub fn new(
         base_url: String,
@@ -274,10 +287,136 @@ impl LlmClient {
                 // (HTTP/1.1) 17s 就能拿到完整 9980 bytes。改用 HTTP/1.1 后
                 // 整条链路稳定。
                 .http1_only()
+                // Windows 上 reqwest 默认自动读 WinHTTP 系统代理（自动检测），
+                // 绕过 VPN/浏览器插件的 198.18.x.x 内部地址，导致 LLM 请求 404。
+                // 用 .no_proxy() 强制所有连接直连。
+                .no_proxy()
                 .build()?,
             max_retries: max_retries.max(1),
             retry_base_ms: retry_base_ms.max(100),
+            temperature: 0.2,
         })
+    }
+
+    /// 链式覆盖采样温度（生产默认 0.2）。测试侧 roleplayer 演客户用 ~0.8。
+    /// JSON 修复路径（fetch_raw_text）固定 0.0，不受此影响。
+    pub fn with_temperature(mut self, temperature: f64) -> Self {
+        self.temperature = temperature;
+        self
+    }
+
+    /// 解析 `cleaned`（已聚合 SSE、已剥 reasoning 前缀的**干净模型文本**）为 JSON；
+    /// 前两层（快路径 / `repair_loose_json` / `extract_embedded_json`）失败后进**第三层**：
+    /// 把整段脏文本回喂 LLM 让其修成合法 JSON，最多 [`REPAIR_MAX_ATTEMPTS`] 次。
+    ///
+    /// 设计依据（本地实测 rsxermu claude-opus）：复杂结构化生成偶发"长度正常、开头合法
+    /// `{`、未截断，却中间夹脏字符"——内容完整可读、但前两层的确定性修复救不回。回喂同族
+    /// 模型让它重写成严格 JSON，成本不是问题（仅前两层全失败才触发，触发率低）。
+    ///
+    /// **红线**：回喂 N 次仍失败 → 抛 json_decode 错（测试该红就红 / 上游 skip），把原始脏文本
+    /// 前缀与各次修复结果写进错误 detail，便于诊断"模型问题 vs 方法问题"。绝不把非 JSON 当数据吞下。
+    async fn parse_or_repair(&self, cleaned: &str) -> AppResult<Value> {
+        // 前三层（快路径 + repair_loose_json + extract_embedded_json）。
+        if let Ok(value) = parse_json_content(cleaned) {
+            return Ok(value);
+        }
+        // 第三层：回喂 LLM 修复。每次修复响应只走 parse_json_content（不再回喂，断递归）。
+        let mut attempts_diag: Vec<String> = Vec::new();
+        for attempt in 1..=REPAIR_MAX_ATTEMPTS {
+            match self.repair_via_llm(cleaned).await {
+                Ok(value) => return Ok(value),
+                Err(e) => attempts_diag.push(format!("repair#{attempt}={e}")),
+            }
+        }
+        // 全部失败：抛严格错误，附原始脏文本前缀 + 各次修复诊断。
+        let head: String = cleaned.chars().take(200).collect();
+        let strict_err = parse_json_content(cleaned).unwrap_err();
+        Err(AppError::External(format!(
+            "json_decode after {REPAIR_MAX_ATTEMPTS} llm-repair attempts failed: {strict_err}; \
+             raw_head={head:?}; {}",
+            attempts_diag.join("; ")
+        )))
+    }
+
+    /// 第三层修复的单次实现：把脏文本作为 user，配固定「JSON 修复器」system 发一次请求，
+    /// 响应只用 `parse_json_content`（**不**再调 `parse_or_repair`，避免无限递归）。
+    async fn repair_via_llm(&self, raw_dirty: &str) -> AppResult<Value> {
+        const REPAIR_SYSTEM: &str = "你是一个 JSON 修复器。用户会给你一段文本，其中**包含**一个 JSON 对象，但格式可能有误（多余的解释、围栏、全角标点、缺引号、尾逗号、截断等）。请理解其语义，只输出**修正后的、严格合法的单个 JSON 对象**。第一个字符必须是 `{`，最后一个字符必须是 `}`，禁止任何前导/收尾说明、禁止代码块围栏。保持原始内容的字段与取值不变，只修复格式。";
+        let cleaned = self.fetch_raw_text(REPAIR_SYSTEM, raw_dirty).await?;
+        parse_json_content(&strip_reasoning_prefix(&cleaned))
+    }
+
+    /// 发一次请求、按当前 format 取出**纯文本 content**（聚合 SSE、解出信封），不做 JSON 解析。
+    /// 专供 [`Self::repair_via_llm`] 复用 HTTP 链路，避免与 `generate_json_once_*` 的递归。
+    async fn fetch_raw_text(&self, system: &str, user: &str) -> AppResult<String> {
+        match self.format {
+            LlmFormat::Openai => {
+                let body = json!({
+                    "model": self.model,
+                    "temperature": 0.0,
+                    "messages": [
+                        ChatMessage { role: "system", content: system },
+                        ChatMessage { role: "user", content: user }
+                    ]
+                });
+                let response = self
+                    .client
+                    .post(format!("{}/chat/completions", self.base_url))
+                    .bearer_auth(&self.api_key)
+                    .json(&body)
+                    .send()
+                    .await?;
+                let status = response.status();
+                let text = String::from_utf8_lossy(&response.bytes().await?).into_owned();
+                if !status.is_success() {
+                    return Err(AppError::External(format!("LLM HTTP {status}: {text}")));
+                }
+                if is_openai_sse_body(&text) {
+                    let (acc, _) = aggregate_openai_sse(&text);
+                    if acc.trim().is_empty() {
+                        return Err(AppError::External("LLM SSE body 聚合后内容为空".to_string()));
+                    }
+                    Ok(acc)
+                } else {
+                    let parsed: ChatCompletionResponse = serde_json::from_str(&text)?;
+                    parsed
+                        .choices
+                        .first()
+                        .map(|choice| choice.message.content.clone())
+                        .ok_or_else(|| AppError::External("LLM returned no choices".to_string()))
+                }
+            }
+            LlmFormat::Anthropic => {
+                let body = json!({
+                    "model": self.model,
+                    "max_tokens": 8192,
+                    "temperature": 0.0,
+                    "system": system,
+                    "messages": [ {"role": "user", "content": user} ]
+                });
+                let response = self
+                    .client
+                    .post(format!("{}/v1/messages", self.base_url))
+                    .header("x-api-key", &self.api_key)
+                    .header("anthropic-version", "2023-06-01")
+                    .json(&body)
+                    .send()
+                    .await?;
+                let status = response.status();
+                let text = String::from_utf8_lossy(&response.bytes().await?).into_owned();
+                if !status.is_success() {
+                    return Err(AppError::External(format!("LLM HTTP {status}: {text}")));
+                }
+                let parsed: AnthropicMessageResponse = serde_json::from_str(&text)?;
+                parsed
+                    .content
+                    .iter()
+                    .find_map(|block| {
+                        (block.kind.as_deref() == Some("text")).then(|| block.text.clone())
+                    })
+                    .ok_or_else(|| AppError::External("LLM returned no choices".to_string()))
+            }
+        }
     }
 
     /// 执行一次实际 HTTP 请求；返回 (result, retry_after_seconds)。
@@ -302,7 +441,7 @@ impl LlmClient {
         let started_at = Instant::now();
         let body = json!({
             "model": self.model,
-            "temperature": 0.2,
+            "temperature": self.temperature,
             "messages": [
                 ChatMessage { role: "system", content: system },
                 ChatMessage { role: "user", content: user }
@@ -345,16 +484,33 @@ impl LlmClient {
             return Err(err);
         }
 
-        let parsed: ChatCompletionResponse = serde_json::from_str(&text)?;
-        let content = parsed
-            .choices
-            .first()
-            .map(|choice| choice.message.content.as_str())
-            .ok_or_else(|| AppError::External("LLM returned no choices".to_string()))?;
+        // 兼容两种 OpenAI 响应：标准非流式 JSON（NVIDIA/deepseek 等）与强制
+        // 流式 SSE（部分中转网关即使不传 stream 也只回 `data: {chunk}`）。
+        // 检测到 SSE 帧则聚合 delta.content；否则按原 ChatCompletionResponse 解析。
+        // 非 SSE 响应零行为变化。
+        let (content, usage) = if is_openai_sse_body(&text) {
+            let (acc, sse_usage) = aggregate_openai_sse(&text);
+            if acc.trim().is_empty() {
+                return Err(AppError::External(
+                    "LLM SSE body 聚合后内容为空".to_string(),
+                ));
+            }
+            (acc, sse_usage.unwrap_or_default())
+        } else {
+            let parsed: ChatCompletionResponse = serde_json::from_str(&text)?;
+            let c = parsed
+                .choices
+                .first()
+                .map(|choice| choice.message.content.clone())
+                .ok_or_else(|| AppError::External("LLM returned no choices".to_string()))?;
+            (c, parsed.usage.unwrap_or_default())
+        };
         Ok((
             LlmJsonResult {
-                value: parse_json_content(content)?,
-                usage: parsed.usage.unwrap_or_default(),
+                value: self
+                    .parse_or_repair(&strip_reasoning_prefix(&content))
+                    .await?,
+                usage,
                 latency_ms: started_at.elapsed().as_millis() as i64,
                 model: self.model.clone(),
                 retry_count: 0,
@@ -377,7 +533,7 @@ impl LlmClient {
         let data_uri = format!("data:{mime};base64,{image_base64}");
         let body = json!({
             "model": self.model,
-            "temperature": 0.2,
+            "temperature": self.temperature,
             "messages": [
                 { "role": "system", "content": system },
                 { "role": "user", "content": [
@@ -406,15 +562,32 @@ impl LlmClient {
         if !status.is_success() {
             return Err(AppError::External(format!("LLM HTTP {status}: {text}")));
         }
-        let parsed: ChatCompletionResponse = serde_json::from_str(&text)?;
-        let content = parsed
-            .choices
-            .first()
-            .map(|choice| choice.message.content.as_str())
-            .ok_or_else(|| AppError::External("LLM returned no choices".to_string()))?;
+        // 与文本路径 generate_json_once_openai 同口径：兼容标准非流式 JSON 与强制
+        // 流式 SSE（部分中转网关即使不传 stream 也只回 `data: {chunk}`，如 rsxermu
+        // gpt-5.4）。检测到 SSE 帧则聚合 delta.content；否则按原 ChatCompletionResponse
+        // 解析。非 SSE 响应零行为变化。
+        let (content, usage) = if is_openai_sse_body(&text) {
+            let (acc, sse_usage) = aggregate_openai_sse(&text);
+            if acc.trim().is_empty() {
+                return Err(AppError::External(
+                    "LLM SSE body 聚合后内容为空".to_string(),
+                ));
+            }
+            (acc, sse_usage.unwrap_or_default())
+        } else {
+            let parsed: ChatCompletionResponse = serde_json::from_str(&text)?;
+            let c = parsed
+                .choices
+                .first()
+                .map(|choice| choice.message.content.clone())
+                .ok_or_else(|| AppError::External("LLM returned no choices".to_string()))?;
+            (c, parsed.usage.unwrap_or_default())
+        };
         Ok(LlmJsonResult {
-            value: parse_json_content(content)?,
-            usage: parsed.usage.unwrap_or_default(),
+            value: self
+                .parse_or_repair(&strip_reasoning_prefix(&content))
+                .await?,
+            usage,
             latency_ms: started_at.elapsed().as_millis() as i64,
             model: self.model.clone(),
             retry_count: 0,
@@ -430,11 +603,23 @@ impl LlmClient {
         user: &str,
     ) -> AppResult<(LlmJsonResult, Option<u64>)> {
         let started_at = Instant::now();
+        // claude（尤其 opus）对话遵从性强，遇到口语化/对话式 prompt（"你好，我需要你帮我…"）
+        // 容易"入戏"先写共情散文再给 JSON，甚至 JSON 被 max_tokens 截断（rsxermu CI 实测
+        // domain_profile/knowledge 大面积 json_decode：content 全是"我理解你的需求…让我生成"）。
+        // 更严重的长任务坑（2026-06-17 本地实测）：复杂"极其详尽"prompt 会让 claude 触发
+        // **工具调用**（stop_reason=tool_use，如 WebFetch 联网搜资料），真内容跑进 tool_use
+        // block，text block 只剩一句开场白 → 我们只取 text 自然拿不到，json_decode。
+        // 在 system 末尾追加**强制 JSON 输出约束 + 禁工具/对话模式声明**（通用、不改各调用方
+        // prompt），逼 claude 第一字符即 `{`、禁任何前导/解释/收尾、禁 tool_use。实测加禁工具
+        // 声明后 stop_reason 从 tool_use 回到 end_turn、内容回到 text block。下游 parse_json_content
+        // + 第三层回喂修复仍兜底防漏网。
+        const ANTHROPIC_JSON_GUARD: &str = "\n\n[OUTPUT FORMAT — STRICT] 当前是**对话生成模式**，不是 agent / 工具调用模式。禁止调用任何工具（不要 WebFetch、不要联网搜索、不要任何 tool_use），直接基于你已有的知识一次性生成完整内容。你必须只输出一个 JSON 对象，不要任何前导说明、寒暄、共情、思考过程或代码块围栏。第一个字符必须是 `{`，最后一个字符必须是 `}`。禁止在 JSON 前后写任何自然语言（包括「好的」「我理解」「让我」「希望有帮助」之类）。";
+        let guarded_system = format!("{system}{ANTHROPIC_JSON_GUARD}");
         let body = json!({
             "model": self.model,
-            "max_tokens": 4096,
-            "temperature": 0.2,
-            "system": system,
+            "max_tokens": 8192,
+            "temperature": self.temperature,
+            "system": guarded_system,
             "messages": [
                 {"role": "user", "content": user}
             ]
@@ -471,6 +656,12 @@ impl LlmClient {
         }
 
         let parsed: AnthropicMessageResponse = serde_json::from_str(&text)?;
+        // 长任务防御：claude 偶发无视禁工具约束、决定先 tool_use（如 WebFetch 搜资料），
+        // 真内容跑进 tool_use block，text block 只剩开场白。识别后给**明确诊断**，而非让
+        // 下游对半句开场白做 json_decode/回喂修复（既浪费一轮修复、错误又含糊）。
+        if let Some(diag) = detect_tool_use_hijack(&parsed) {
+            return Err(AppError::External(diag));
+        }
         let content = parsed
             .content
             .iter()
@@ -491,9 +682,11 @@ impl LlmClient {
                 ..Default::default()
             })
             .unwrap_or_default();
+        let cleaned = strip_reasoning_prefix(content);
+        let value = self.parse_or_repair(&cleaned).await?;
         Ok((
             LlmJsonResult {
-                value: parse_json_content(content)?,
+                value,
                 usage,
                 latency_ms: started_at.elapsed().as_millis() as i64,
                 model: self.model.clone(),
@@ -524,7 +717,7 @@ impl LlmClient {
         let started_at = Instant::now();
         let body = json!({
             "model": self.model,
-            "temperature": 0.2,
+            "temperature": self.temperature,
             "stream": true,
             "stream_options": {"include_usage": true},
             "messages": [
@@ -694,11 +887,38 @@ impl LlmProvider for LlmClient {
         mime: &str,
     ) -> AppResult<Value> {
         match self.format {
-            LlmFormat::Openai => self
-                .generate_json_once_openai_vision(system, user, image_base64, mime)
-                .await
-                .map(|r| r.value)
-                .map_err(|err| classify_llm_error_for_user(&err, 0)),
+            // vision 走与文本同款的重试循环（此前单次调用、retry_count=0，端点偶发
+            // 5xx/524 直接 skip 假绿——CI 实测 T3/K6/Q3 因此从不真跑）。复用
+            // is_retryable_llm_error + compute_backoff，让 vision 也能熬过端点抖动。
+            LlmFormat::Openai => {
+                let mut last_error: Option<AppError> = None;
+                let mut retry_count: u32 = 0;
+                for attempt in 1..=self.max_retries {
+                    match self
+                        .generate_json_once_openai_vision(system, user, image_base64, mime)
+                        .await
+                    {
+                        Ok(r) => return Ok(r.value),
+                        Err(error)
+                            if attempt < self.max_retries && is_retryable_llm_error(&error) =>
+                        {
+                            let retry_after_secs = parse_retry_after_from_error(&error);
+                            let delay =
+                                compute_backoff(attempt, self.retry_base_ms, retry_after_secs);
+                            last_error = Some(error);
+                            sleep(delay).await;
+                            retry_count = retry_count.saturating_add(1);
+                        }
+                        Err(error) => {
+                            return Err(classify_llm_error_for_user(&error, retry_count));
+                        }
+                    }
+                }
+                let final_err = last_error.unwrap_or_else(|| {
+                    AppError::External("vision request failed after retries".to_string())
+                });
+                Err(classify_llm_error_for_user(&final_err, retry_count))
+            }
             // Anthropic 的图片 block 形态（source.type=base64）与 OpenAI 不同，
             // 当前仅支持 OpenAI 兼容视觉端点；Anthropic 视觉留待后续。
             LlmFormat::Anthropic => Err(AppError::External(
@@ -812,6 +1032,13 @@ pub fn is_retryable_llm_error(error: &AppError) -> bool {
                 || message.contains("LLM HTTP 502")
                 || message.contains("LLM HTTP 503")
                 || message.contains("LLM HTTP 504")
+                // Cloudflare 源站层 5xx（520 unknown / 522 connection timed out /
+                // 524 a timeout occurred）：经 CF 的端点（如 rsxermu）在源站慢/抖时回这些，
+                // 属瞬时不可达应重试。此前漏列 524，与下方 classify_llm_error_for_user 把
+                // 任何 "LLM HTTP 5*" 归 http_5xx 的口径不一致——一条 CF 524 不重试直接冒泡。
+                || message.contains("LLM HTTP 520")
+                || message.contains("LLM HTTP 522")
+                || message.contains("LLM HTTP 524")
                 || message.contains("LLM HTTP body_decode_error")
         }
         _ => false,
@@ -820,10 +1047,15 @@ pub fn is_retryable_llm_error(error: &AppError) -> bool {
 
 /// 指数退避带 jitter，并尊重 Retry-After。
 pub fn compute_backoff(attempt: u32, base_ms: u64, retry_after_secs: Option<u64>) -> Duration {
+    // 单次退避封顶 60s：指数退避 base*2^(attempt-1) 在高 attempt 下会爆到几百秒
+    // （2500*2^10≈42min），rsxermu 单点 503/超时需要"加大重试次数 + 每次封顶"才能在合理
+    // 总时长内熬过端点抖动拿真分，而非单次 sleep 几十分钟撞 job 墙。Retry-After 头若更长则
+    // 尊重它（端点明确要求等多久就等多久）。
+    const MAX_BACKOFF_MS: u64 = 60_000;
     let shift = attempt.saturating_sub(1).min(10);
     let exp_ms = base_ms.saturating_mul(1u64 << shift);
     let jitter = fastrand_jitter(base_ms);
-    let backoff_ms = exp_ms.saturating_add(jitter);
+    let backoff_ms = exp_ms.saturating_add(jitter).min(MAX_BACKOFF_MS);
     let final_ms = match retry_after_secs {
         Some(s) => backoff_ms.max(s.saturating_mul(1000)),
         None => backoff_ms,
@@ -865,6 +1097,96 @@ fn parse_retry_after_from_error(error: &AppError) -> Option<u64> {
     None
 }
 
+/// 检测 OpenAI 响应体是否是 SSE 流式（`data: {...}` 帧）而非标准 JSON。
+/// 部分中转网关即使请求不带 stream 也强制回流式，需聚合后才能解析。
+fn is_openai_sse_body(text: &str) -> bool {
+    text.lines()
+        .find(|l| !l.trim().is_empty())
+        .map(|l| l.trim_start().starts_with("data:"))
+        .unwrap_or(false)
+}
+
+/// 聚合 OpenAI SSE 帧的 `choices[0].delta.content`，返回拼接内容 + usage。
+/// 复用 [`StreamChunkResponse`]（与 token 级 streaming 同结构）。单帧解析失败跳过。
+fn aggregate_openai_sse(text: &str) -> (String, Option<ChatUsage>) {
+    let mut acc = String::new();
+    let mut usage: Option<ChatUsage> = None;
+    for line in text.lines() {
+        let line = line.trim();
+        let data = match line.strip_prefix("data:") {
+            Some(rest) => rest.trim(),
+            None => continue,
+        };
+        if data.is_empty() || data == "[DONE]" {
+            continue;
+        }
+        let parsed: StreamChunkResponse = match serde_json::from_str(data) {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+        if let Some(u) = parsed.usage {
+            usage = Some(u);
+        }
+        if let Some(c) = parsed.choices.first().and_then(|ch| ch.delta.content.as_ref()) {
+            acc.push_str(c);
+        }
+    }
+    (acc, usage)
+}
+
+/// 剥离部分模型在 JSON 前输出的 `<think>...</think>` 推理前缀（如此端点的 gpt 系）。
+/// 无前缀时原样返回，对其它模型零影响。
+fn strip_reasoning_prefix(content: &str) -> String {
+    let trimmed = content.trim_start();
+    if let Some(rest) = trimmed.strip_prefix("<think>") {
+        if let Some(end) = rest.find("</think>") {
+            return rest[end + "</think>".len()..].trim_start().to_string();
+        }
+    }
+    content.to_string()
+}
+
+/// 检测 anthropic 响应是否被**工具调用劫持**：长复杂任务中 claude 偶发决定先 tool_use
+/// （如 WebFetch 联网搜资料），把真内容放进 tool_use block，text block 只剩一句开场白。
+/// 命中（stop_reason=tool_use 或存在 tool_use block）则返回明确诊断字符串，供上层抛错——
+/// 比让下游对半句开场白做 json_decode/回喂修复更清晰，CI 日志一眼可辨。返回 None = 正常。
+fn detect_tool_use_hijack(parsed: &AnthropicMessageResponse) -> Option<String> {
+    let has_tool_use = parsed
+        .content
+        .iter()
+        .any(|b| b.kind.as_deref() == Some("tool_use"));
+    if parsed.stop_reason.as_deref() != Some("tool_use") && !has_tool_use {
+        return None;
+    }
+    let head: String = parsed
+        .content
+        .iter()
+        .find_map(|b| (b.kind.as_deref() == Some("text")).then(|| b.text.clone()))
+        .unwrap_or_default()
+        .chars()
+        .take(120)
+        .collect();
+    Some(format!(
+        "llm_tool_use_instead_of_json: 模型返回 tool_use 而非 JSON（长任务偶发；已在 system \
+         禁工具，仍出现说明该上游/模型未遵从）。text_head={head:?}"
+    ))
+}
+
+/// 把 claude 偶发的"单元素对象数组" `[{...}]` 拆成内部对象——generate_json 的契约是 JSON
+/// 对象（下游 to_document 拒收顶层数组），claude-opus 经中转有时把唯一对象包进数组。仅拆
+/// `len==1 且元素为对象` 的数组，其它（多元素数组 / 元素非对象 / 非数组）原样返回，避免误伤
+/// 真正期望数组的场景。
+fn normalize_singleton_array(value: Value) -> Value {
+    if let Value::Array(arr) = &value {
+        if arr.len() == 1 && arr[0].is_object() {
+            if let Value::Array(mut arr) = value {
+                return arr.remove(0);
+            }
+        }
+    }
+    value
+}
+
 fn parse_json_content(content: &str) -> AppResult<Value> {
     let trimmed = content.trim();
     let json_text = if trimmed.starts_with("```") {
@@ -876,22 +1198,96 @@ fn parse_json_content(content: &str) -> AppResult<Value> {
     } else {
         trimmed
     };
-    match serde_json::from_str::<Value>(json_text) {
-        Ok(value) => Ok(value),
-        Err(strict_err) => {
-            // R15 / ISSUE-006：DeepSeek 偶发输出含 trailing comma 或末尾未闭合
-            // 的 JSON（实测 user.reply.task / knowledge.import.preview 都中过）。
-            // 严格解析失败时做一次有限容错：去掉 `,` 后跟空白/换行+`}` 或 `]`、
-            // 自动补足末尾未闭合的 `]` / `}`。仍失败就把原始严格错误抛出去，
-            // 不允许把非 JSON 文本当成 JSON。
-            if let Some(repaired) = repair_loose_json(json_text) {
-                if let Ok(value) = serde_json::from_str::<Value>(&repaired) {
-                    return Ok(value);
-                }
-            }
-            Err(AppError::from(strict_err))
+    // 快路径：整体就是合法 JSON（绝大多数 provider 的纯 JSON 输出）。
+    if let Ok(value) = serde_json::from_str::<Value>(json_text) {
+        return Ok(normalize_singleton_array(value));
+    }
+    // 容错 1：trailing comma / 末尾未闭合（R15 / ISSUE-006，DeepSeek 偶发）。
+    if let Some(repaired) = repair_loose_json(json_text) {
+        if let Ok(value) = serde_json::from_str::<Value>(&repaired) {
+            return Ok(normalize_singleton_array(value));
         }
     }
+    // 容错 2：claude-opus 经中转常输出"自然语言推理 + JSON"混合体，JSON 可能夹在推理后
+    // （rsxermu CI 实测：`我看到候选 catalog…\n\n{"action":"open_chunk",...}`）。遍历所有
+    // `{`/`[` 起点，对每个配平块尝试严格解析 + repair，返回**首个解析成功**的块——推理里的
+    // 伪括号截出来解析失败会被跳过，命中真正的 JSON。纯 JSON 场景走不到这里（已快路径返回）。
+    if let Some(value) = extract_embedded_json(json_text) {
+        return Ok(value);
+    }
+    // 全部失败：抛严格错误，不把非 JSON 文本当数据吞下。
+    Err(AppError::from(
+        serde_json::from_str::<Value>(json_text).unwrap_err(),
+    ))
+}
+
+/// 从混合文本中提取**首个可解析**的 JSON 对象/数组：遍历每个 `{`/`[` 起点配平截块，
+/// 逐个尝试严格解析（失败再试 repair）。**优先返回对象**——generate_json 的契约是 JSON
+/// 对象，claude 偶发把对象包成单元素数组 `[{...}]` 或先输出推理里的伪数组，故对象命中即返；
+/// 仅当全程没有对象、只有数组时才返数组（且单元素对象数组拆出内部对象，对齐 to_document）。
+/// 用于 claude "推理 + JSON" 混合输出——推理里的伪括号块解析失败被跳过，命中真 JSON。
+fn extract_embedded_json(text: &str) -> Option<Value> {
+    let bytes = text.as_bytes();
+    let mut array_fallback: Option<Value> = None;
+    for start in 0..bytes.len() {
+        if bytes[start] != b'{' && bytes[start] != b'[' {
+            continue;
+        }
+        let Some(block) = balanced_block(text, start) else {
+            continue;
+        };
+        let parsed = serde_json::from_str::<Value>(block)
+            .ok()
+            .or_else(|| repair_loose_json(block).and_then(|r| serde_json::from_str::<Value>(&r).ok()));
+        match parsed {
+            // 对象：generate_json 期望形态，立即返回。
+            Some(v @ Value::Object(_)) => return Some(v),
+            // 数组：暂存作兜底；若是 `[{...}]` 单对象数组，拆出内部对象优先（claude 常见包法）。
+            Some(Value::Array(arr)) if array_fallback.is_none() => {
+                if arr.len() == 1 && arr[0].is_object() {
+                    return Some(arr.into_iter().next().unwrap());
+                }
+                array_fallback = Some(Value::Array(arr));
+            }
+            _ => {}
+        }
+    }
+    array_fallback
+}
+
+/// 从 `start`（须是 `{` 或 `[`）按括号配平扫描（跳过字符串字面量内括号与转义），返回到
+/// 配对闭合符的子串。未闭合返回 None。
+fn balanced_block(text: &str, start: usize) -> Option<&str> {
+    let bytes = text.as_bytes();
+    let open = bytes[start];
+    let close = if open == b'{' { b'}' } else { b']' };
+    let mut depth: i32 = 0;
+    let mut in_string = false;
+    let mut escape = false;
+    for (i, &b) in bytes.iter().enumerate().skip(start) {
+        if in_string {
+            if escape {
+                escape = false;
+            } else if b == b'\\' {
+                escape = true;
+            } else if b == b'"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match b {
+            b'"' => in_string = true,
+            x if x == open => depth += 1,
+            x if x == close => {
+                depth -= 1;
+                if depth == 0 {
+                    return text.get(start..=i);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 /// 修复 LLM 偶发输出的非严格 JSON。只做两类局部修复：
@@ -924,7 +1320,7 @@ pub(crate) fn repair_loose_json(input: &str) -> Option<String> {
                     in_string = false;
                 }
                 // 真模型偶发在字符串值里塞**裸控制字符**（未转义的换行/制表符等），
-                // serde 严格模式直接拒收（"control character ( -) found
+                // serde 严格模式直接拒收（"control character (U+0000-U+001F) found
                 // while parsing a string"）。这里把它们转义成合法 JSON 转义序列——
                 // 只改**表示形式**不改字符串语义，符合"只容错等价表达"红线。
                 '\n' => out.push_str("\\n"),
@@ -1072,6 +1468,56 @@ mod tests {
     use super::*;
 
     #[test]
+    fn detects_sse_body_vs_plain_json() {
+        assert!(is_openai_sse_body("data: {\"choices\":[]}\n\ndata: [DONE]"));
+        assert!(is_openai_sse_body("\n  data: {\"x\":1}"));
+        assert!(!is_openai_sse_body("{\"choices\":[{\"message\":{\"content\":\"hi\"}}]}"));
+        assert!(!is_openai_sse_body(""));
+    }
+
+    #[test]
+    fn aggregates_sse_delta_content() {
+        let body = "data: {\"choices\":[{\"delta\":{\"content\":\"{\\\"a\\\"\"}}]}\n\
+                    data: {\"choices\":[{\"delta\":{\"content\":\":1}\"}}]}\n\
+                    data: [DONE]";
+        let (acc, _usage) = aggregate_openai_sse(body);
+        assert_eq!(acc, "{\"a\":1}");
+    }
+
+    #[test]
+    fn aggregates_sse_skips_unparseable_frames() {
+        // keepalive 注释行 / 非法帧应被跳过，不污染聚合。
+        let body = ": keepalive\n\
+                    data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\
+                    data: garbage-not-json\n";
+        let (acc, _) = aggregate_openai_sse(body);
+        assert_eq!(acc, "ok");
+    }
+
+    #[test]
+    fn strips_think_prefix_only_when_present() {
+        assert_eq!(
+            strip_reasoning_prefix("<think>reasoning here</think>{\"k\":1}"),
+            "{\"k\":1}"
+        );
+        // 无 think 前缀原样返回。
+        assert_eq!(strip_reasoning_prefix("{\"k\":1}"), "{\"k\":1}");
+        // think 未闭合则不剥离（避免吞掉正文）。
+        assert_eq!(strip_reasoning_prefix("<think>unclosed"), "<think>unclosed");
+    }
+
+    #[test]
+    fn sse_with_think_prefix_parses_to_json() {
+        // 端到端：gpt 风格 SSE（带 <think> 前缀）聚合后能被 parse_json_content 解析。
+        let body = "data: {\"choices\":[{\"delta\":{\"content\":\"<think>hmm</think>{\\\"ok\\\"\"}}]}\n\
+                    data: {\"choices\":[{\"delta\":{\"content\":\":true}\"}}]}\n\
+                    data: [DONE]";
+        let (acc, _) = aggregate_openai_sse(body);
+        let value = parse_json_content(&strip_reasoning_prefix(&acc)).unwrap();
+        assert_eq!(value["ok"], serde_json::json!(true));
+    }
+
+    #[test]
     fn json_error_is_not_retryable() {
         let err = AppError::Json(serde_json::from_str::<Value>("not json").unwrap_err());
         assert!(!is_retryable_llm_error(&err));
@@ -1087,6 +1533,19 @@ mod tests {
     fn http_5xx_is_retryable() {
         let err = AppError::External("LLM HTTP 502: bad gateway".to_string());
         assert!(is_retryable_llm_error(&err));
+    }
+
+    #[test]
+    fn cloudflare_5xx_is_retryable() {
+        // 经 Cloudflare 的端点（rsxermu）源站慢/抖时回 520/522/524——属瞬时不可达应重试。
+        // status 段是 reqwest 渲染的 "524 <unknown status code>"，故串里含 "LLM HTTP 524"。
+        for code in ["520", "522", "524"] {
+            let err = AppError::External(format!("LLM HTTP {code} <unknown status code>: origin timeout"));
+            assert!(
+                is_retryable_llm_error(&err),
+                "Cloudflare {code} 应可重试（端点抖动，非配置错）"
+            );
+        }
     }
 
     #[test]
@@ -1121,6 +1580,20 @@ mod tests {
         assert_eq!(compute_backoff(1, 1000, Some(5)).as_millis(), 5000);
         // 当指数退避更长时使用指数退避。
         assert_eq!(compute_backoff(4, 1000, Some(2)).as_millis(), 8000);
+    }
+
+    #[test]
+    fn backoff_caps_at_60s_for_high_attempts() {
+        // 单次退避封顶 60s：高 attempt 下指数退避（base*2^(attempt-1)）不再无界增长，
+        // 防止 rsxermu 重试加码（10 次）时单次 sleep 几十分钟撞 job 墙。jitter=0（test-only）。
+        // base=2500, attempt=10 → 2500*512=1_280_000ms，封顶到 60_000ms。
+        assert_eq!(compute_backoff(10, 2500, None).as_millis(), 60_000);
+        // attempt=6 → 2500*32=80_000ms 也已超顶 → 60_000ms。
+        assert_eq!(compute_backoff(6, 2500, None).as_millis(), 60_000);
+        // attempt=5 → 2500*16=40_000ms 未触顶，保持指数值。
+        assert_eq!(compute_backoff(5, 2500, None).as_millis(), 40_000);
+        // Retry-After 更长时仍尊重它（端点明确要求），不被 60s 顶压低。
+        assert_eq!(compute_backoff(1, 2500, Some(120)).as_millis(), 120_000);
     }
 
     #[test]
@@ -1175,7 +1648,7 @@ mod tests {
     #[test]
     fn parse_json_content_escapes_bare_control_chars_in_string() {
         // 真模型偶发在字符串值里塞**裸换行/制表符**（未转义），serde 严格模式拒收
-        // （"control character ( -) found while parsing a string"）。
+        // （"control character (U+0000-U+001F) found while parsing a string"）。
         // parse_json_content SHALL 把裸控制字符转义成合法 JSON 转义序列后救回，
         // 只改表示形式不改字符串语义。
         let raw = "{\"reply\": \"第一行\n第二行\t制表\"}";
@@ -1189,10 +1662,182 @@ mod tests {
 
     #[test]
     fn repair_loose_json_escapes_low_control_char_as_unicode() {
-        // 非常见的低位控制字符（如 ）走 \uXXXX 兜底转义。
+        // 非常见的低位控制字符（如 U+0001）走 \uXXXX 兜底转义。
         let raw = "{\"x\":\"a\u{0001}b\"}";
         let repaired = repair_loose_json(raw).expect("含 \\u0001 应触发修复");
         let v: Value = serde_json::from_str(&repaired).expect("修复后必须是合法 JSON");
         assert_eq!(v.get("x").and_then(|x| x.as_str()), Some("a\u{0001}b"));
+    }
+
+    #[test]
+    fn parse_json_content_extracts_json_with_natural_language_wrapper() {
+        // rsxermu claude-opus-4-8 在复杂结构化 prompt 下偶发前后加自然语言包裹 JSON。
+        // parse_json_content SHALL 截取首个平衡 JSON 对象后解析成功，不再 expected value at
+        // line 1 column 1（domain_profile_e2e 真模型实测命中）。
+        let raw = "好的，以下是生成的画像：\n{\"profile_id\": \"x\", \"display_name\": \"陪伴\"}\n希望对你有帮助。";
+        let v = parse_json_content(raw).expect("前后自然语言包裹的 JSON 必须被截取解析");
+        assert_eq!(v.get("profile_id").and_then(|x| x.as_str()), Some("x"));
+        assert_eq!(v.get("display_name").and_then(|x| x.as_str()), Some("陪伴"));
+    }
+
+    #[test]
+    fn parse_json_content_extracts_json_after_reasoning_prose() {
+        // rsxermu claude-opus 真实形态：先长篇推理（可能含中文「」括号噪声），JSON 在末尾。
+        // parse_json_content SHALL 遍历候选块命中真 JSON（domain_profile/knowledge 真模型实测）。
+        let raw = "我看到候选 catalog 中有一条高度相关：「私有化部署」。需要先 open_chunk 展开正文。\n\n{\"action\":\"open_chunk\",\"ids\":[\"abc123\"]}";
+        let v = parse_json_content(raw).expect("推理后的 JSON 必须被提取");
+        assert_eq!(v.get("action").and_then(|x| x.as_str()), Some("open_chunk"));
+        assert_eq!(
+            v.get("ids").and_then(|x| x.as_array()).map(|a| a.len()),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn parse_json_content_skips_unparseable_brace_block_picks_real_json() {
+        // 推理里出现「伪 JSON」块（截出来解析失败），须跳过命中后面真正可解析的 JSON。
+        let raw = "分析 {不是合法json的片段} 然后给出结果：{\"ok\":true,\"n\":2}";
+        let v = parse_json_content(raw).expect("应跳过伪块命中真 JSON");
+        assert_eq!(v.get("ok").and_then(|x| x.as_bool()), Some(true));
+        assert_eq!(v.get("n").and_then(|x| x.as_i64()), Some(2));
+    }
+
+    #[test]
+    fn extract_embedded_json_handles_braces_inside_strings() {
+        // 字符串字面量内的 `}` 不应被当成对象闭合（配平扫描须跳过字符串内括号）。
+        let raw = "前言 {\"text\": \"a } b { c\", \"n\": 1} 后缀";
+        let v = extract_embedded_json(raw).expect("应提取出平衡对象");
+        assert_eq!(v.get("text").and_then(|x| x.as_str()), Some("a } b { c"));
+        assert_eq!(v.get("n").and_then(|x| x.as_i64()), Some(1));
+    }
+
+    #[test]
+    fn extract_embedded_json_returns_none_without_json() {
+        // 纯自然语言无 JSON → None（调用方回退原文走严格解析报错，不伪造数据）。
+        assert!(extract_embedded_json("这里完全没有 JSON 对象").is_none());
+    }
+
+    #[test]
+    fn parse_json_content_plain_object_unchanged() {
+        // 非包裹的纯 JSON 对象：extract 分支不介入（首字符是 `{`），行为零变化。
+        let v = parse_json_content(r#"{"a": 1}"#).expect("纯 JSON 必须直接解析");
+        assert_eq!(v.get("a").and_then(|x| x.as_i64()), Some(1));
+    }
+
+    #[test]
+    fn parse_json_content_unwraps_singleton_object_array() {
+        // claude 偶发把唯一 profile 对象包成 `[{...}]`（domain_profile_e2e 真模型实测 got Array）。
+        // 快路径解析成功是数组 → normalize 拆出内部对象，下游 to_document 不再报 got Array。
+        let v = parse_json_content(r#"[{"displayName": "陪伴", "ok": true}]"#)
+            .expect("单元素对象数组必须拆成对象");
+        assert!(v.is_object(), "应拆成对象而非数组");
+        assert_eq!(v.get("displayName").and_then(|x| x.as_str()), Some("陪伴"));
+    }
+
+    #[test]
+    fn parse_json_content_keeps_multi_element_array() {
+        // 多元素数组不拆（避免误伤真正期望数组的场景），原样返回。
+        let v = parse_json_content(r#"[{"a":1},{"b":2}]"#).expect("多元素数组解析");
+        assert!(v.is_array(), "多元素数组不应被拆");
+        assert_eq!(v.as_array().map(|a| a.len()), Some(2));
+    }
+
+    #[test]
+    fn extract_embedded_json_prefers_object_over_array() {
+        // 推理里先出现伪数组、真 JSON 对象在后：应优先返回对象（generate_json 契约）。
+        let raw = "分析候选 [1, 2, 3] 后得出结论：\n{\"action\":\"answer\",\"ok\":true}";
+        let v = extract_embedded_json(raw).expect("应提取对象");
+        assert!(v.is_object());
+        assert_eq!(v.get("action").and_then(|x| x.as_str()), Some("answer"));
+    }
+
+    // 第三层「回喂 LLM 修复」由 parse_or_repair 驱动：前两层（快路径/repair/extract）能解的
+    // **不触发**任何网络调用；前两层全失败时才发修复请求，2 次仍失败抛带诊断的 json_decode 错。
+    // 这两条用一个指向不可达端点的 client 验证：可解析输入纯本地命中（即便端点死也成功），
+    // 不可理解噪声最终抛错且不把噪声吞成 Ok（守 does_not_swallow_garbage 的第三层版本）。
+
+    fn unreachable_client() -> LlmClient {
+        // 127.0.0.1:1 必拒连：若 parse_or_repair 误对可解析输入发起 HTTP，测试会因连接失败而红。
+        LlmClient::new(
+            "http://127.0.0.1:1".to_string(),
+            "test-key".to_string(),
+            "test-model".to_string(),
+            2,
+            1,
+            100,
+        )
+        .expect("build client")
+    }
+
+    #[tokio::test]
+    async fn parse_or_repair_returns_first_two_layers_without_network() {
+        // 可被前两层解析的脏输入（尾逗号）→ 不该触达不可达端点，直接成功。
+        let client = unreachable_client();
+        let v = client
+            .parse_or_repair("{\"ok\":true,}")
+            .await
+            .expect("前两层应直接解析尾逗号，不发网络");
+        assert_eq!(v.get("ok").and_then(|x| x.as_bool()), Some(true));
+    }
+
+    #[tokio::test]
+    async fn parse_or_repair_surfaces_error_for_garbage_after_repair_exhausted() {
+        // 纯噪声 + 不可达端点：前两层失败 → 第三层 2 次回喂均因连接失败 → 最终 Err。
+        // 绝不把噪声吞成 Ok；错误信息须带 json_decode 诊断与原始前缀，便于排障。
+        let client = unreachable_client();
+        let err = client
+            .parse_or_repair("这是一段没有任何 JSON 的纯自然语言噪声")
+            .await
+            .expect_err("噪声经修复仍失败，必须抛错而非吞下");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("json_decode") && msg.contains("raw_head"),
+            "错误须含结构化诊断（json_decode + raw_head），实际: {msg}"
+        );
+    }
+
+    // 长任务防御：claude 偶发 tool_use 劫持（真内容跑进 tool_use block，text 只剩开场白）。
+    // detect_tool_use_hijack 应识别并给明确诊断；正常 end_turn 纯 text 不得误判。
+
+    #[test]
+    fn detect_tool_use_hijack_flags_tool_use_block() {
+        let body = r#"{"content":[{"type":"text","text":"我将为您生成完整配置。"},{"type":"tool_use","name":"WebFetch","input":{"url":"https://x"}}],"stop_reason":"tool_use"}"#;
+        let parsed: AnthropicMessageResponse = serde_json::from_str(body).unwrap();
+        let diag = detect_tool_use_hijack(&parsed).expect("应识别 tool_use 劫持");
+        assert!(diag.contains("llm_tool_use_instead_of_json"), "诊断: {diag}");
+        assert!(diag.contains("我将为您生成"), "诊断须含 text 开场白前缀: {diag}");
+    }
+
+    #[test]
+    fn detect_tool_use_hijack_flags_stop_reason_only() {
+        // 即便 content 里暂无 tool_use block，stop_reason=tool_use 也要拦。
+        let body = r#"{"content":[{"type":"text","text":"让我查一下。"}],"stop_reason":"tool_use"}"#;
+        let parsed: AnthropicMessageResponse = serde_json::from_str(body).unwrap();
+        assert!(detect_tool_use_hijack(&parsed).is_some());
+    }
+
+    #[test]
+    fn detect_tool_use_hijack_passes_normal_text_response() {
+        // 正常一次性 JSON 输出（end_turn，纯 text）不得误判。
+        let body = r#"{"content":[{"type":"text","text":"{\"ok\":true}"}],"stop_reason":"end_turn"}"#;
+        let parsed: AnthropicMessageResponse = serde_json::from_str(body).unwrap();
+        assert!(detect_tool_use_hijack(&parsed).is_none());
+    }
+
+    #[test]
+    fn temperature_defaults_to_02_and_setter_overrides() {
+        // 生产构造默认 0.2（决策稳定）；with_temperature 链式覆盖（roleplayer 用 0.8）。
+        let c = LlmClient::new(
+            "http://x".into(),
+            "k".into(),
+            "m".into(),
+            10,
+            1,
+            100,
+        )
+        .unwrap();
+        assert!((c.temperature - 0.2).abs() < f64::EPSILON, "默认应 0.2");
+        let hot = c.with_temperature(0.8);
+        assert!((hot.temperature - 0.8).abs() < f64::EPSILON, "setter 应覆盖到 0.8");
     }
 }
