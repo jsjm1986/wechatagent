@@ -279,7 +279,6 @@ pub(crate) async fn enqueue_relay_task(state: &AppState, entry: &AgentPrincipalE
 }
 
 /// 按 workspace + status 列请示台账（admin 收件箱/SLA 看板用），created_at 升序。
-#[allow(dead_code)] // Task 7 接线后移除（REST handler 消费）
 pub(crate) async fn list_escalations_by_workspace(
     state: &AppState,
     workspace_id: &str,
@@ -300,7 +299,6 @@ pub(crate) async fn list_escalations_by_workspace(
 }
 
 /// 改派 pending 请示到另一位决策人（仅 pending 可改派；workspace 约束防 IDOR）。
-#[allow(dead_code)] // Task 7 接线后移除（REST handler 消费）
 pub(crate) async fn reassign_escalation(
     state: &AppState,
     workspace_id: &str,
