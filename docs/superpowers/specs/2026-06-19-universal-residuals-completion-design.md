@@ -65,7 +65,7 @@ PR #27 合并后实证核查 main：运行时主链路（decision/五闸/状态�
 - **H13**：① `validate_state_machine` 对 AI 生成本体的结构校验（缺 initial/非法 allowedFrom 引用 reject）；② activate 联动 publish 后 `operation_domain_configs` 新版本 current_version 切换正确（集成测试，testcontainers）；③ profile 无状态机本体 → 回落 DEFAULT 销售 9 态字节等价（纯函数/单测）；④ 引导层生成 prompt 含状态机 schema（e2e，复用 domain_profile_e2e 模式）；⑤ AI 生成状态机落 draft 不自动生效（红线测试）。
 - **H17**：① 老 objection_type 数据 round-trip 兼容（serde）；② DEFAULT 销售域 trajectory 写入字节等价；③ profile 声明陪伴维度时按新维度产出（纯函数）；④越界值 drop（复用 validate 链）。
 - **H18**：① None 回落 env 默认逐字等价；② Some override 真生效；③ 缓存命中不新增 DB 查询。
-- 全程守基线：lib ≥350/0、四 PBT ≥33/0、`check-no-human-takeover` / `check-no-sales-domain` clean。
+- 全程守基线：lib ≥350/0、四 PBT ≥33/0、`check-no-human-takeover` clean（`check-no-sales-domain` 已于 2026-06-20 退役）。
 
 ## 护栏（本项目铁律）
 

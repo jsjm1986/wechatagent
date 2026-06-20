@@ -28,7 +28,7 @@
 | --- | --- | --- |
 | chunk 主表 | 30+ 跨行业稳定字段 + 单一 `domain_attributes` 可变子文档 | `models.rs:854-944` |
 | 9 类 wiki_type | 认知类型（非销售类型），跨行业举例 | `knowledge-wiki.md §3` |
-| 去销售域 CI 闸 | `check-no-sales-domain.sh` 主动禁止销售域命名爬回 src/ | 脚本存在 |
+| ~~去销售域 CI 闸~~ | ~~`check-no-sales-domain.sh`~~ 已退役（2026-06-20）：通用化后 customer_stage/objection_type 等为合法 canonical 维度 id，该闸前提作废且从未接入 CI | 脚本已删 |
 | 写入三层保护 | 锁定字段/数组union/70%阈值，PBT 覆盖 | `chunk_revisions.rs` + `page_merge.rs` |
 | AI 永不自动 verify | 6 重冗余兜死，无漏网 | `chunk_revisions.rs:207-210` 等 |
 | grounding 主硬闸 | verified-ID 精确交集，行业无关、不可被幻觉绕过 | `review/gates.rs:563-606` |
@@ -724,7 +724,7 @@ casual 模式的"收紧压力门"会与"热烈推进"打架（非误杀，是模
 - AI 永不自动 verify（新知识/配置候选都需人审）。
 - 画像更新须保守、禁止过拟合、系统性思维找最优杠杆。
 - 新增测试只增量叠加，不删改旧维度/旧金标。
-- check-no-human-takeover / check-no-model-hint / check-no-sales-domain 三闸。
+- check-no-human-takeover / check-no-model-hint 闸（注：`check-no-sales-domain.sh` 已于 2026-06-20 退役——通用化后 customer_stage/objection_type 等是合法 canonical 维度 id，该脚本前提作废且从未接入 CI/baseline）。
 - D2 锚定 quote→anchor verify gate 不削弱。
 
 ---
