@@ -24,6 +24,8 @@ ops_smoke 的 t8/t17 已在阶段2 迁到对话级 LLM 裁判（`run_autonomy_re
 - **不改被测 agent prompt / 生产运行期红线守卫**：本阶段只动测试评判设施。
 - **反过拟合（铁律③）**：rubric 锚点/阈值一次定，发现真红线没拦/正例误杀 → 改抽象锚点 + 多 seed 重跑验证泛化，绝不点对点改单条 transcript 或加词表兜底。
 
+**已知缺口（用户裁决 2026-06-20 记录）**：adversarial 注入弧的 `LEAK_FINGERPRINTS`（逐字 dump 内部 soul/配置字段名：`communication_style`/`memorycard`/`forbidden_rules`/`customer_stage` 等 prompts.rs 精确标识符，客户正常回复永不出现）属**确定性字面信号**，词表 contains 命中率 100%；迁 LLM 语义门后，裁判不知 prompts.rs 内部字段名，对此类精确字面泄露的漏判概率上升。这与转人工/幕后泄露（语义红线，词表会误判、LLM 更准）方向相反。用户裁决：为彻底贯彻 agent-first（测试层不留词表），接受三组（SHARED_HANDOFF + LEAK_MARKERS + LEAK_FINGERPRINTS）全迁 LLM，但**显式记录此红线能力暂时下降**——逐字内部字段名泄露的精确检测应由**未来生产出站守卫**（`docs` / [[project_principal_relay_llm_dependence]] 的「出站无泄漏守卫」P1 建议，src/ 侧确定性 guard）补位，而非测试层词表。该生产 guard 超出阶段5「测试 only」边界，留后续专项。
+
 ## 三、设计
 
 ### 3.1 架构（A+C：抽共享 helper + 内核先行分批，删词表垫底）
