@@ -41,7 +41,6 @@ use wechatagent::models::{AgentStatus, Contact, ConversationMessage, MessageDire
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-use crate::common::redline::assert_no_handoff_or_identity_leak;
 use crate::common::roleplay_fixtures::{
     seed_emotional_companion_profile_in_workspace, RoleplayLedger,
 };
@@ -322,6 +321,28 @@ async fn roleplay_arc_emotional_companion_game_loop() {
                 text: reply_text.clone(),
             });
             agent_replies.push(reply_text.clone());
+            // ══ 逐轮 autonomy 红线对话级 LLM 硬门（阶段5，取代词表 contains 扫描）。══
+            // agent 真说「转人工/我是机器人」即 autonomyRisk≥7 panic；LLM 看完整语义判定
+            // （正确拒绝「不用转人工」不被误判），裁判全掉线 → Skipped 记台账不假绿。
+            let judges = common::autonomy_gate::judges_from_env();
+            if !judges.is_empty() {
+                let profile =
+                    wechatagent::agent::load_active_domain_profile(&state.db, &contact.workspace_id)
+                        .await;
+                let rubric = common::judge::build_judge_rubric(&profile);
+                let ctx = common::judge::collect_judge_context(&state, &contact.wxid, None).await;
+                let refs: Vec<(&str, &dyn wechatagent::llm::LlmProvider)> =
+                    judges.iter().map(|(l, c)| (*l, c.as_ref())).collect();
+                common::redline_arc::assert_turn_redline(
+                    &refs,
+                    &rubric,
+                    &ctx,
+                    &format!("roleplay_arc/turn-{turn}"),
+                    &customer_line,
+                    &reply_text,
+                )
+                .await;
+            }
         }
         ledger.append(serde_json::json!({
             "turn": turn, "role": "agent", "gateway_status": log.status, "reply_text": reply_text,
@@ -361,11 +382,36 @@ async fn roleplay_arc_emotional_companion_game_loop() {
         );
     }
 
-    // ④ 【G-REDLINE】agent 自身红线：唯一真在 CI 跑的动态测试，过去只扫客户出戏、
-    //    从不扫 agent 回复——agent 真说「转人工/我是机器人」也照绿（假绿命门）。现对每条
-    //    agent 回复硬断转真人/暴露身份禁词（contains_unnegated，否定剔除防误判正确拒绝）。
-    for (i, reply) in agent_replies.iter().enumerate() {
-        assert_no_handoff_or_identity_leak(reply, &format!("roleplay_arc agent-reply-{i}"));
+    // ④ 【G-REDLINE】弧末整段 autonomy 红线对话级 LLM 硬门（阶段5，取代逐条词表扫描）。
+    //    唯一真在 CI 跑的动态博弈测试，过去只扫客户出戏、从不扫 agent 回复——agent 真说
+    //    「转人工/我是机器人」也照绿（假绿命门）。现把完整 transcript 喂裁判读 redlineHeld
+    //    维（跨轮才显形的红线退化也能钉），跨裁判取 min < 阈值 panic，裁判全掉线 → Skipped。
+    let judges = common::conversation_gate::judges_from_env();
+    if !judges.is_empty() {
+        let transcript: String = history
+            .iter()
+            .map(|t| {
+                let who = match t.speaker {
+                    Speaker::Customer => "客户",
+                    Speaker::Agent => "助理",
+                };
+                format!("{who}: {}\n", t.text)
+            })
+            .collect();
+        if !transcript.trim().is_empty() {
+            let arc_profile =
+                wechatagent::agent::load_active_domain_profile(&state.db, &contact.workspace_id)
+                    .await;
+            let refs: Vec<(&str, &dyn wechatagent::llm::LlmProvider)> =
+                judges.iter().map(|(l, c)| (*l, c.as_ref())).collect();
+            common::redline_arc::assert_arc_redline_held(
+                &refs,
+                &arc_profile,
+                "roleplay_arc-弧末",
+                &transcript,
+            )
+            .await;
+        }
     }
 
     eprintln!(

@@ -44,7 +44,6 @@ use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use crate::common::identity_generator::{generate_identity, GeneratedIdentity, IdentityCategory};
-use crate::common::redline::assert_no_handoff_or_identity_leak;
 use crate::common::roleplay_fixtures::{seed_active_domain_profile, RoleplayLedger};
 use crate::common::roleplayer::{
     roleplay_user_turn, roleplayer_client, DialogueTurn, RoleplaySource, Speaker,
@@ -335,11 +334,28 @@ async fn run_twin_arc(
                 text: reply_text.clone(),
             });
             agent_replies.push(reply_text.clone());
-            // 转真人 / 身份暴露红线（任何域都不该转真人）——共享 contains_unnegated（否定剔除）。
-            assert_no_handoff_or_identity_leak(
-                &reply_text,
-                &format!("digital-twin[{category_label}] turn-{turn}"),
-            );
+            // 逐轮 autonomy 红线对话级 LLM 硬门（阶段5，取代词表 contains）——任何域都不该
+            // 转真人/暴露身份/泄露幕后决策源。LLM 看完整语义判 autonomyRisk≥7 panic，裁判
+            // 全掉线 → Skipped 记台账不假绿。数字分身的活跃 profile 自动派生该域标尺。
+            let judges = common::autonomy_gate::judges_from_env();
+            if !judges.is_empty() {
+                let profile =
+                    wechatagent::agent::load_active_domain_profile(&state.db, &contact.workspace_id)
+                        .await;
+                let rubric = common::judge::build_judge_rubric(&profile);
+                let ctx = common::judge::collect_judge_context(&state, &contact.wxid, None).await;
+                let refs: Vec<(&str, &dyn wechatagent::llm::LlmProvider)> =
+                    judges.iter().map(|(l, c)| (*l, c.as_ref())).collect();
+                common::redline_arc::assert_turn_redline(
+                    &refs,
+                    &rubric,
+                    &ctx,
+                    &format!("digital-twin[{category_label}] turn-{turn}"),
+                    &customer_line,
+                    &reply_text,
+                )
+                .await;
+            }
         }
         ledger.append(serde_json::json!({
             "turn": turn, "role": "agent", "category": category_label,
@@ -371,6 +387,37 @@ async fn run_twin_arc(
             has_signal,
             "[{category_label}] arc 跑完（发出 {sent_turns} 轮回复）后 contact 无任何画像信号——数字分身对吐露信息的对话方零记录"
         );
+    }
+
+    // 弧末整段 autonomy 红线对话级 LLM 硬门（阶段5）：完整 transcript 喂裁判读 redlineHeld
+    // 维（跨轮才显形的红线退化也能钉——某轮转真人/暴露身份/泄露幕后决策源/编造/越界承诺），
+    // 跨裁判取 min < 阈值 panic，裁判全掉线 → Skipped 记台账不假绿。
+    let judges = common::conversation_gate::judges_from_env();
+    if !judges.is_empty() {
+        let transcript: String = history
+            .iter()
+            .map(|t| {
+                let who = match t.speaker {
+                    Speaker::Customer => "客户",
+                    Speaker::Agent => "助理",
+                };
+                format!("{who}: {}\n", t.text)
+            })
+            .collect();
+        if !transcript.trim().is_empty() {
+            let arc_profile =
+                wechatagent::agent::load_active_domain_profile(&state.db, &contact.workspace_id)
+                    .await;
+            let refs: Vec<(&str, &dyn wechatagent::llm::LlmProvider)> =
+                judges.iter().map(|(l, c)| (*l, c.as_ref())).collect();
+            common::redline_arc::assert_arc_redline_held(
+                &refs,
+                &arc_profile,
+                &format!("digital_twin[{category_label}]-弧末"),
+                &transcript,
+            )
+            .await;
+        }
     }
 
     eprintln!(
