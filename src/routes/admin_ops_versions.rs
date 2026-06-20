@@ -33,6 +33,7 @@ use serde_json::{json, Value};
 use crate::{
     agent::taxonomy::invalidate_global_taxonomy_cache,
     auth::AuthenticatedAdmin,
+    db::Database,
     error::{AppError, AppResult},
     models::{OperationDomainConfig, OperationStatePolicy, TaxonomyEntry},
 };
@@ -41,6 +42,64 @@ use super::shared::parse_object_id;
 use super::AppState;
 
 /// ── operation_domain_configs ──────────────────────────────────────────────────
+
+/// 插入一版新 current [`OperationDomainConfig`] 并 demote 同 `(workspace_id, domain)`
+/// scope 其余行。复用 [`publish_operation_domain_version`] 与
+/// [`publish_state_machine_version`] 的共同逻辑（构造新行→insert→demote 其余）。
+///
+/// 新行克隆 `source` 的全部字段，**除了** `state_machine`（由参数注入）/ `status`（恒
+/// `"active"`）/ `version`（= `next_version`）/ `current_version`（恒 `true`）/
+/// `previous_version`（= `Some(source.version)`）/ `seeded_by`（由参数注入）/
+/// `updated_at`（= `now`）/ `id`（恒 `None`）。
+///
+/// 事务性：本代码库不使用 MongoDB 多文档事务，沿用「先 insert 新 current，再 demote
+/// 其余」的 best-effort 顺序（与两个原实现逐字一致），保证「至多一条 current」不变量在
+/// 正常完成时成立。返回新插入行的 [`ObjectId`](mongodb::bson::oid::ObjectId)。
+async fn insert_new_current_domain_config(
+    coll: &mongodb::Collection<OperationDomainConfig>,
+    source: &OperationDomainConfig,
+    state_machine: Document,
+    next_version: i32,
+    seeded_by: String,
+    now: DateTime,
+) -> AppResult<mongodb::bson::oid::ObjectId> {
+    let new_entry = OperationDomainConfig {
+        id: None,
+        workspace_id: source.workspace_id.clone(),
+        domain: source.domain.clone(),
+        name: source.name.clone(),
+        goal: source.goal.clone(),
+        methodology: source.methodology.clone(),
+        workflow: source.workflow.clone(),
+        tool_policy: source.tool_policy.clone(),
+        automation_policy: source.automation_policy.clone(),
+        review_policy: source.review_policy.clone(),
+        runtime_parameters: source.runtime_parameters.clone(),
+        state_machine,
+        status: "active".to_string(),
+        updated_at: now,
+        version: next_version,
+        current_version: true,
+        previous_version: Some(source.version),
+        seeded_by: Some(seeded_by),
+        principal_decider: source.principal_decider.clone(),
+        high_risk_escalation_mode: source.high_risk_escalation_mode.clone(),
+    };
+    let inserted = coll.insert_one(&new_entry, None).await?;
+    let inserted_id = inserted.inserted_id.as_object_id();
+    coll.update_many(
+        doc! {
+            "workspace_id": &source.workspace_id,
+            "domain": &source.domain,
+            "_id": { "$ne": inserted_id },
+        },
+        doc! { "$set": { "current_version": false, "updated_at": now } },
+        None,
+    )
+    .await?;
+    inserted_id
+        .ok_or_else(|| AppError::External("inserted operation domain config has no _id".to_string()))
+}
 
 pub(super) async fn publish_operation_domain_version(
     State(state): State<AppState>,
@@ -67,45 +126,286 @@ pub(super) async fn publish_operation_domain_version(
     )
     .await?;
     let now = DateTime::now();
-    let new_entry = OperationDomainConfig {
-        id: None,
-        workspace_id: source.workspace_id.clone(),
-        domain: source.domain.clone(),
-        name: source.name,
-        goal: source.goal,
-        methodology: source.methodology,
-        workflow: source.workflow,
-        tool_policy: source.tool_policy,
-        automation_policy: source.automation_policy,
-        review_policy: source.review_policy,
-        runtime_parameters: source.runtime_parameters,
-        state_machine: source.state_machine,
-        status: "active".to_string(),
-        updated_at: now,
-        version: next_version,
-        current_version: true,
-        previous_version: Some(source.version),
-        seeded_by: Some("manual".to_string()),
-        principal_decider: source.principal_decider,
-        high_risk_escalation_mode: source.high_risk_escalation_mode,
-    };
-    let inserted = coll.insert_one(&new_entry, None).await?;
-    coll.update_many(
-        doc! {
-            "workspace_id": &source.workspace_id,
-            "domain": &source.domain,
-            "_id": { "$ne": inserted.inserted_id.as_object_id() },
-        },
-        doc! { "$set": { "current_version": false, "updated_at": now } },
-        None,
+    let inserted_id = insert_new_current_domain_config(
+        &coll,
+        &source,
+        source.state_machine.clone(),
+        next_version,
+        "manual".to_string(),
+        now,
     )
     .await?;
     Ok(Json(json!({
         "ok": true,
-        "id": inserted.inserted_id.as_object_id().map(|i| i.to_hex()).unwrap_or_default(),
+        "id": inserted_id.to_hex(),
         "version": next_version,
         "previousVersion": source.version,
     })))
+}
+
+/// universal/H13：把一份**新的状态机本体** publish 成 `operation_domain_configs`
+/// 在 `(workspace_id, domain)` 下的新 current 版本——复用 [`publish_operation_domain_version`]
+/// 的「克隆当前 current 行、只换 state_machine、version+1、insert-new-current 后 demote 其余」
+/// 逻辑，但本体由调用方注入（profile activate 联动），而非沿用旧行的 state_machine。
+///
+/// 这是「消费方零改动」的关键：运行时引擎照旧按 `(workspace_id, domain, current_version=true)`
+/// 读 `operation_domain_configs`，本 helper 把行业状态机塞进同一张表的新版本，引擎无感切换。
+///
+/// **edge case（无 current 行）**：正常路径下 `ensure_operation_domains` 会在 workspace
+/// 首次落地时 seed 一条 DEFAULT current 行，所以这里一般能找到。为保持本 helper 无副作用
+/// 且不引入跨模块 seed 依赖，选择**更简单稳健**的方案：找不到 current 行时只
+/// `tracing::warn!` 并 `Ok(())` 返回（不 crash、不阻塞 activate）——activate 已成功，状态机
+/// 联动是 best-effort；缺底座行属于异常部署态，留给 `ensure_operation_domains` 兜底而非在此
+/// 凭空造一条无 name/goal/methodology 的半残行。
+///
+/// 一条 `operation_state_policies` 行的 `seeded_by` 是否「机器派生 / 可安全刷新」。
+///
+/// publish 重派生 policy 时用它区分**机器派生行**（安全刷新）与**运营手工调整行**
+/// （保留，绝不 clobber，与 m013 skip-existing 同红线）：
+/// - `None`（无溯源）→ 机器派生（早期未打标的派生行）→ 可刷新
+/// - `"statemachine_publish:*"`（本 publish 路径联动派生）→ 可刷新
+/// - `"legacy_migration"`（m013 从 DEFAULT 机器 seed 的行）→ 可刷新
+/// - 其它任意值（如 `"admin_manual"` / 运营后台手设）→ 手工行 → **保留**
+///
+/// **不变量（关键）**：运营/admin policy 插入路径**必须**总是写一个不可刷新的 `seeded_by`
+/// （今天 `publish_operation_state_policy_version` 等都写 `"manual"`），因为「`None` →
+/// 可刷新」这条规则静默依赖它——若手工行漏写 `seeded_by`（落 `None`），会被本 publish
+/// 路径误判为机器派生行而 clobber。新增手工 policy 写入点必须守住这条。
+pub(crate) fn is_refreshable_policy_seeded_by(seeded_by: &Option<String>) -> bool {
+    match seeded_by.as_deref() {
+        None => true,
+        Some(s) => s.starts_with("statemachine_publish:") || s == "legacy_migration",
+    }
+}
+
+/// 事务性 / current-flag 竞态边界（universal/H13 (3)，judgment call 已定）：
+///
+/// 沿用「先 insert 新 current（`current_version=true`），再 demote 同 scope 其余行」的
+/// best-effort 顺序，**不**引入事务、**不**加 `current_version=true` 唯一分区索引。理由：
+/// - 本代码库不使用 MongoDB 多文档事务（显式约定，见 [`insert_new_current_domain_config`]
+///   doc），且 testcontainers mongo 单节点无副本集 → 事务不可用。
+/// - `current_version=true` 唯一分区索引会强制 demote-then-insert 顺序，且 `ensure_indexes`
+///   用 `?` 非 best-effort，存量脏 current 行会**直接 brick 启动**（prod-117 部署炸雷），
+///   无配套清理不可加。
+///
+/// 残留竞态（accepted）——**诚实陈述其最坏端态**：在**真正并发的、本体各不相同**的 publish
+/// 下（同一 workspace 两次不同机器 publish 交错），insert-then-demote 的 demote 用
+/// `_id $ne inserted` 互斥，可走到**持久 0-current 端态**：
+/// ```text
+/// P1 insert vN+1 cur=true
+/// P2 insert vN+2 cur=true
+/// P1 demote (_id != P1) → P2(vN+2) cur=false
+/// P2 demote (_id != P2) → P1(vN+1) cur=false
+/// → 0 行 current，持续到下次 publish；其间 runtime 回落 DEFAULT-sales。
+/// ```
+/// 这**不是**良性方向（早期注释误称 insert-then-demote「避免 0-current 窗口」，错误，已订正）。
+/// 仍接受该残留，基于真实理由：
+/// (i) 极罕见：仅在「同 workspace、不同机器、真并发」publish 时触发，而 publish 是 admin-gated
+///     的低频运维动作；
+/// (ii) 下方 no-op 幂等消除了最常见触发器——「重复激活同一机器」（本体逐字节相等直接短路），
+///     使剩下的触发面只有罕见的「不同机器并发」；
+/// (iii) 自愈：下次任意 publish 会重新插一条 current 行，0-current 端态不会长期固化；
+/// (iv) `(workspace,domain,version)` 唯一索引仍挡住「重复 version」这个更危险的竞态；
+/// (v) 兜底方向（事务 / current 唯一索引）在本部署形态下不可用或会引入更坏故障（启动炸雷）。
+pub(crate) async fn publish_state_machine_version(
+    db: &Database,
+    workspace_id: &str,
+    domain: &str,
+    new_state_machine: Document,
+    seeded_by: String,
+) -> AppResult<()> {
+    let coll = db.operation_domain_configs();
+    let Some(source) = coll
+        .find_one(
+            doc! {
+                "workspace_id": workspace_id,
+                "domain": domain,
+                "current_version": true,
+            },
+            None,
+        )
+        .await?
+    else {
+        tracing::warn!(
+            workspace_id,
+            domain,
+            "publish_state_machine_version: no current operation_domain_config row; skip publish (ensure_operation_domains 未 seed 底座)"
+        );
+        return Ok(());
+    };
+
+    // universal/H13 (1) no-op 幂等：本体与当前 current 行逐字节相等 → 整个
+    // insert+demote+policy 重派生全部跳过，直接 Ok(())。最常见触发器是 admin 重复
+    // 激活同一 profile（或 activate 被重试）——此前每次都往 operation_domain_configs
+    // 灌一版本体完全相同的新行（版本膨胀 + 放大 current-flag 竞态窗口）。本短路让
+    // 「重复激活同机器」成为真正的 no-op，从源头消除最常见的竞态触发器。
+    if new_state_machine == source.state_machine {
+        tracing::debug!(
+            workspace_id,
+            domain,
+            "publish_state_machine_version: state machine unchanged, skip republish (no-op 幂等)"
+        );
+        return Ok(());
+    }
+
+    let scope = doc! {
+        "workspace_id": workspace_id,
+        "domain": domain,
+    };
+    let next_version = next_version_for_scope(db.operation_domain_configs(), scope).await?;
+    let now = DateTime::now();
+    // policy 行的溯源标签：在 `seeded_by` 被 move 进 config insert 前先派生一个可区分的
+    // 并行标签（`statemachine_publish:<原 seeded_by>`，如 `statemachine_publish:profile:edu-k12`），
+    // 让 operation_state_policies 里这批联动派生的行能与 config 行/手工行/legacy_migration 行区分。
+    let policy_seeded_by = format!("statemachine_publish:{seeded_by}");
+    // 克隆当前 current 行的全部非 state_machine 字段（name/goal/methodology/…一一保留），
+    // 只把 state_machine 换成注入的本体——这正是「消费方零改动」的保证。
+    // 派生 policy 时还要读机器里的 states，故先取一份 states 列表再把本体 move 进 helper。
+    let states = new_state_machine
+        .get_array("states")
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|item| item.as_document().cloned())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    insert_new_current_domain_config(
+        &coll,
+        &source,
+        new_state_machine,
+        next_version,
+        seeded_by,
+        now,
+    )
+    .await?;
+
+    // universal/H13 修补：状态机本体进 operation_domain_configs 不会自动让主动触达门生效。
+    // 主动触达由派生表 operation_state_policies enforce（guards::enforce_state_action_policy
+    // 对缺失 policy 行 fail-open → 不拦），而该表此前仅 m013 从 DEFAULT 机器 seed。这里
+    // 在 publish 新机器后，按机器里每个 state 的 `forbidsProactive` 标志**联动重派生** policy
+    // 行（复用 m013 的 `derive_state_policy_lists` 唯一真相），让非销售 profile 标
+    // `forbidsProactive:true` 的 state 真正拦住主动发。
+    //
+    // best-effort：与本 helper 整体一致（无 current 行时 warn+Ok）——单个 state 的 policy
+    // 派生失败只 `warn!` 并继续下一个，绝不 `?` 传播出去把已成功的 activate/publish 拖垮。
+    // 一个坏 state 不应让后续 state 的 policy 漏派生，故 per-state warn-and-continue。
+    for state in &states {
+        let Some(state_key) = state.get_str("key").ok().filter(|k| !k.is_empty()) else {
+            continue;
+        };
+        let forbids_proactive = state.get_bool("forbidsProactive").unwrap_or(false);
+        let (allowed, forbidden) =
+            crate::db::migrations::m013_seed_user_operation_state_policies::derive_state_policy_lists(
+                forbids_proactive,
+            );
+        // 只认 current_version=true 行：运行时 reader（agent/decision.rs）严格按
+        // current_version=true 读 policy，且同 (ws,domain,state_key) 下可并存多版本
+        // （admin publish/rollout/rollback 造历史版本，(ws,domain,state_key,version)
+        // 唯一索引证 version 是 key 的一部分）。裸 find_one 会返回任意版本——可能改到
+        // 非 current 的历史行，运行时仍读旧 current（toggle 静默失效，正是本代码要修的
+        // bug），且改写历史行的 allowed/forbidden/seeded_by 会污染 rollback 链。
+        match db
+            .operation_state_policies()
+            .find_one(
+                doc! {
+                    "workspace_id": workspace_id,
+                    "domain": domain,
+                    "state_key": state_key,
+                    "current_version": true,
+                },
+                None,
+            )
+            .await
+        {
+            // 已有行：区分机器派生行（可安全刷新）与运营手工行（保留，绝不 clobber）。
+            // 机器派生行若新本体的 forbidsProactive 与存量派生的 (allowed, forbidden) 不一致
+            // → in-place update（解决「forbidsProactive 切换后旧 policy 行陈旧、切换静默失效」）；
+            // 一致则不写。手工行（其它 seeded_by）一律 continue，与 m013 skip-existing 同红线。
+            Ok(Some(existing)) => {
+                if !is_refreshable_policy_seeded_by(&existing.seeded_by) {
+                    continue;
+                }
+                if existing.allowed == allowed && existing.forbidden == forbidden {
+                    continue;
+                }
+                if let Err(err) = db
+                    .operation_state_policies()
+                    .update_one(
+                        doc! { "_id": existing.id },
+                        doc! {
+                            "$set": {
+                                "allowed": &allowed,
+                                "forbidden": &forbidden,
+                                "updated_at": now,
+                                "seeded_by": &policy_seeded_by,
+                            }
+                        },
+                        None,
+                    )
+                    .await
+                {
+                    tracing::warn!(
+                        workspace_id,
+                        domain,
+                        state_key,
+                        error = %err,
+                        "publish_state_machine_version: 刷新 operation_state_policy 失败（best-effort，跳过该 state 继续）"
+                    );
+                }
+            }
+            Ok(None) => {
+                // current find_one 为 None：通常是该 state 首次派生 → 插 current 行。
+                // EDGE（rollback 中途）：若存在非 current 的历史行但无 current 行，硬插
+                // version 1 会与历史 version 1 撞 (ws,domain,state_key,version) 唯一索引。
+                // 故按该 scope 现存最大 version+1 分配版本（复用 next_version_for_scope，
+                // 与 admin policy publish 同一真相），避开撞索引。
+                let next_policy_version = next_version_for_scope(
+                    db.operation_state_policies(),
+                    doc! {
+                        "workspace_id": workspace_id,
+                        "domain": domain,
+                        "state_key": state_key,
+                    },
+                )
+                .await
+                .unwrap_or(1);
+                let policy = OperationStatePolicy {
+                    id: None,
+                    workspace_id: workspace_id.to_string(),
+                    domain: domain.to_string(),
+                    state_key: state_key.to_string(),
+                    allowed,
+                    forbidden,
+                    recommended_pace: None,
+                    status: "active".to_string(),
+                    updated_at: now,
+                    version: next_policy_version,
+                    current_version: true,
+                    previous_version: None,
+                    seeded_by: Some(policy_seeded_by.clone()),
+                };
+                if let Err(err) = db.operation_state_policies().insert_one(&policy, None).await {
+                    tracing::warn!(
+                        workspace_id,
+                        domain,
+                        state_key,
+                        error = %err,
+                        "publish_state_machine_version: 派生 operation_state_policy 失败（best-effort，跳过该 state 继续）"
+                    );
+                }
+            }
+            Err(err) => {
+                tracing::warn!(
+                    workspace_id,
+                    domain,
+                    state_key,
+                    error = %err,
+                    "publish_state_machine_version: 查询 operation_state_policy 失败（best-effort，跳过该 state 继续）"
+                );
+            }
+        }
+    }
+    Ok(())
 }
 
 pub(super) async fn rollout_operation_domain_version(
@@ -581,5 +881,34 @@ mod tests {
     fn rollback_rejects_when_no_previous_version() {
         let target_prev: Option<i32> = None;
         assert!(target_prev.is_none(), "无 previous_version 时 rollback 应被拒绝");
+    }
+
+    /// H13 (2)：`is_refreshable_policy_seeded_by` 区分机器派生行（可刷新）与手工行（保留）。
+    #[test]
+    fn refreshable_seeded_by_classifies_machine_vs_operator() {
+        use super::is_refreshable_policy_seeded_by;
+        // 机器派生 / 可安全刷新
+        assert!(is_refreshable_policy_seeded_by(&None), "None（无溯源）可刷新");
+        assert!(
+            is_refreshable_policy_seeded_by(&Some("legacy_migration".to_string())),
+            "m013 seed tag 可刷新"
+        );
+        assert!(
+            is_refreshable_policy_seeded_by(&Some("statemachine_publish:profile:edu-k12".to_string())),
+            "statemachine_publish:* 可刷新"
+        );
+        assert!(
+            is_refreshable_policy_seeded_by(&Some("statemachine_publish:manual".to_string())),
+            "statemachine_publish:manual 可刷新"
+        );
+        // 运营手工 / 必须保留
+        assert!(
+            !is_refreshable_policy_seeded_by(&Some("admin_manual".to_string())),
+            "admin_manual 是手工行，不可刷新"
+        );
+        assert!(
+            !is_refreshable_policy_seeded_by(&Some("manual".to_string())),
+            "其它任意值视为手工行，不可刷新"
+        );
     }
 }

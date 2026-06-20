@@ -106,6 +106,8 @@ async fn db_create_profile(
         methodology_generator_preamble: None,
         business_formulas: vec![],
         memory_dimensions: vec![],
+        trajectory_dimensions: vec![],
+        debounce_window_ms_override: None,
         current_version: false,
         previous_version: None,
         is_active: false,
@@ -116,6 +118,7 @@ async fn db_create_profile(
         reviewer_orientation: None,
         mode_gate_policy_override: None,
         answering_mode_profile: None,
+        generated_state_machine: None,
         version: 1,
     };
     let result = db.domain_profiles().insert_one(&profile, None).await.expect("insert");
@@ -1057,4 +1060,671 @@ async fn e2e_publish_risky_on_draft_lineage_no_pending() {
     // 红线：realign noop → 仍 0 个 active（须人审 activate）。
     let active = db_active_count(&db, &ws).await;
     assert_eq!(active, 0, "草稿血缘 publish 后仍 0 个 active（守人审红线）");
+}
+
+// ── H13：activate 联动 publish 状态机本体到 operation_domain_configs ──────────────
+// 引导层 AI 生成的行业状态机在 activate 时被 publish 成 operation_domain_configs 新 current
+// 版本（消费方零改动）；无本体（DEFAULT 销售域）则 operation_domain_configs 不变（字节等价
+// 回落 DEFAULT）。这两条 Part C 直调真 activate_domain_profile handler 覆盖。
+
+/// 在 `(workspace, user_operations)` 下手插一条 current 底座 config（模拟
+/// `ensure_operation_domains` 已 seed 的默认行；测试 crate 够不到 pub(super) 的
+/// `ensure_operation_domains`，故按 brief 选项 b 手动 insert_one）。
+async fn db_seed_base_domain_config(db: &Database, workspace_id: &str) {
+    let cfg = wechatagent::models::OperationDomainConfig {
+        id: None,
+        workspace_id: workspace_id.to_string(),
+        domain: "user_operations".to_string(),
+        name: "默认销售域".to_string(),
+        goal: "成交".to_string(),
+        methodology: "顾问式".to_string(),
+        workflow: "破冰→挖需→方案→成交".to_string(),
+        tool_policy: "{}".to_string(),
+        automation_policy: "{}".to_string(),
+        review_policy: "{}".to_string(),
+        runtime_parameters: doc! {},
+        state_machine: doc! {
+            "states": [
+                { "key": "new_contact", "name": "初次接触", "initial": true, "allowedFrom": [] },
+            ]
+        },
+        status: "active".to_string(),
+        updated_at: DateTime::now(),
+        version: 1,
+        current_version: true,
+        previous_version: None,
+        seeded_by: Some("test_base".to_string()),
+        principal_decider: None,
+        high_risk_escalation_mode: None,
+    };
+    db.operation_domain_configs()
+        .insert_one(&cfg, None)
+        .await
+        .expect("seed base operation_domain_config");
+}
+
+/// 统计 `(workspace, user_operations)` 下 config 总行数（版本计数）。
+async fn db_domain_config_count(db: &Database, workspace_id: &str) -> u64 {
+    db.operation_domain_configs()
+        .count_documents(
+            doc! { "workspace_id": workspace_id, "domain": "user_operations" },
+            None,
+        )
+        .await
+        .expect("count domain configs")
+}
+
+/// 读 `(workspace, user_operations)` 下 current_version=true 的 config（应至多一条）。
+async fn db_current_domain_config(
+    db: &Database,
+    workspace_id: &str,
+) -> wechatagent::models::OperationDomainConfig {
+    db.operation_domain_configs()
+        .find_one(
+            doc! { "workspace_id": workspace_id, "domain": "user_operations", "current_version": true },
+            None,
+        )
+        .await
+        .expect("find current config")
+        .expect("current config exists")
+}
+
+/// 激活带 generated_state_machine 的 profile → operation_domain_configs publish 一版新
+/// current，其 state_machine 含生成的 state key、版本递增（消费方零改动）。
+#[tokio::test]
+#[ignore]
+async fn e2e_activate_publishes_generated_state_machine() {
+    let app = common::TestApp::start().await;
+    let db = app.state.db.clone();
+    let ws = app.state.config.default_workspace_id.clone();
+
+    // 底座：当前 current 销售域 config（version=1）。
+    db_seed_base_domain_config(&db, &ws).await;
+    let base_count = db_domain_config_count(&db, &ws).await;
+    let base_version = db_current_domain_config(&db, &ws).await.version;
+
+    // 建带本体的 profile，并置 current（activate 要求 current_version=true）。
+    let machine = doc! {
+        "states": [
+            { "key": "x_intro", "name": "开场", "initial": true, "allowedFrom": [] },
+            { "key": "x_deep", "name": "深入", "allowedFrom": ["x_intro"] },
+        ]
+    };
+    let pid = db_create_profile(&db, &ws, "edu-domain", "教育", "教育咨询", "generated_by_ai").await;
+    db.domain_profiles()
+        .update_one(
+            doc! { "_id": pid },
+            doc! { "$set": { "current_version": true, "generated_state_machine": &machine } },
+            None,
+        )
+        .await
+        .expect("set current + machine");
+
+    // 调真 activate handler。
+    let _ = wechatagent::routes::domain_profiles::activate_domain_profile(
+        State(app.state.clone()),
+        Extension(test_admin(&ws)),
+        Path(pid.to_hex()),
+    )
+    .await
+    .expect("activate handler ok");
+
+    // 断言：多出一版 config，新 current 的 state_machine 含 "x_intro"，版本递增。
+    let after_count = db_domain_config_count(&db, &ws).await;
+    assert_eq!(after_count, base_count + 1, "activate 应 publish 一版新 config");
+    let current = db_current_domain_config(&db, &ws).await;
+    assert!(current.version > base_version, "新 current 版本号递增");
+    assert_eq!(current.previous_version, Some(base_version), "previous_version 指向底座版本");
+    let keys: Vec<&str> = current
+        .state_machine
+        .get_array("states")
+        .expect("states array")
+        .iter()
+        .filter_map(|s| s.as_document())
+        .filter_map(|d| d.get_str("key").ok())
+        .collect();
+    assert!(keys.contains(&"x_intro"), "publish 的 state_machine 含生成的 x_intro: {keys:?}");
+    assert!(keys.contains(&"x_deep"), "publish 的 state_machine 含生成的 x_deep: {keys:?}");
+    assert_eq!(
+        current.seeded_by.as_deref(),
+        Some("profile:edu-domain"),
+        "seeded_by 标 profile 溯源"
+    );
+}
+
+/// 激活 generated_state_machine=None 的 profile（如 DEFAULT 销售域）→
+/// operation_domain_configs 不新增版本（字节等价回落 DEFAULT）。
+#[tokio::test]
+#[ignore]
+async fn e2e_activate_without_machine_leaves_configs_unchanged() {
+    let app = common::TestApp::start().await;
+    let db = app.state.db.clone();
+    let ws = app.state.config.default_workspace_id.clone();
+
+    db_seed_base_domain_config(&db, &ws).await;
+    let base_count = db_domain_config_count(&db, &ws).await;
+    let base_version = db_current_domain_config(&db, &ws).await.version;
+
+    // profile 不带本体（generated_state_machine=None，db_create_profile 默认 None）。
+    let pid = db_create_profile(&db, &ws, "no-machine", "默认", "无状态机", "manual").await;
+    db.domain_profiles()
+        .update_one(
+            doc! { "_id": pid },
+            doc! { "$set": { "current_version": true } },
+            None,
+        )
+        .await
+        .expect("set current");
+
+    let _ = wechatagent::routes::domain_profiles::activate_domain_profile(
+        State(app.state.clone()),
+        Extension(test_admin(&ws)),
+        Path(pid.to_hex()),
+    )
+    .await
+    .expect("activate handler ok");
+
+    // 断言：config 表行数、current 版本号均不变（状态机表未被触碰）。
+    assert_eq!(
+        db_domain_config_count(&db, &ws).await,
+        base_count,
+        "无本体 activate 不新增 config 版本（回落 DEFAULT）"
+    );
+    assert_eq!(
+        db_current_domain_config(&db, &ws).await.version,
+        base_version,
+        "current 版本号不变"
+    );
+}
+
+/// H13 修补：activate 带 `forbidsProactive:true` state 的 generated_state_machine →
+/// publish 联动重派生 operation_state_policies，该 state 拿到 active policy 行且
+/// `forbidden` 含 "reply"（主动触达门真正生效，不再 fail-open 静默忽略）。
+#[tokio::test]
+#[ignore]
+async fn e2e_activate_derives_state_policies_for_forbids_proactive() {
+    let app = common::TestApp::start().await;
+    let db = app.state.db.clone();
+    let ws = app.state.config.default_workspace_id.clone();
+
+    // 底座 current 销售域 config（version=1）。
+    db_seed_base_domain_config(&db, &ws).await;
+
+    // 行业机器：x_intro（initial）+ grieving（哀伤期，forbidsProactive=true，非 cooldown）。
+    let machine = doc! {
+        "states": [
+            { "key": "x_intro", "name": "开场", "initial": true, "allowedFrom": [] },
+            { "key": "grieving", "name": "哀伤期", "allowedFrom": ["x_intro"], "forbidsProactive": true },
+        ]
+    };
+    let pid = db_create_profile(&db, &ws, "grief-care", "哀伤陪伴", "情感陪伴", "generated_by_ai").await;
+    db.domain_profiles()
+        .update_one(
+            doc! { "_id": pid },
+            doc! { "$set": { "current_version": true, "generated_state_machine": &machine } },
+            None,
+        )
+        .await
+        .expect("set current + machine");
+
+    let _ = wechatagent::routes::domain_profiles::activate_domain_profile(
+        State(app.state.clone()),
+        Extension(test_admin(&ws)),
+        Path(pid.to_hex()),
+    )
+    .await
+    .expect("activate handler ok");
+
+    // 断言：grieving state 派生了 active policy 行，forbidden 含 "reply"。
+    let policy = db
+        .operation_state_policies()
+        .find_one(
+            doc! {
+                "workspace_id": &ws,
+                "domain": "user_operations",
+                "state_key": "grieving",
+                "status": "active",
+            },
+            None,
+        )
+        .await
+        .expect("query state policy")
+        .expect("grieving policy row exists");
+    assert!(
+        policy.forbidden.iter().any(|a| a == "reply"),
+        "forbidsProactive=true 的 grieving state policy forbidden 应含 reply: {:?}",
+        policy.forbidden
+    );
+}
+
+// ── H13 (1)(2)：publish 幂等 + policy 按 seeded_by 区分手工/派生行刷新 ──────────────
+
+/// 建一条带 generated_state_machine 的 current profile 并调真 activate handler，
+/// 触发 publish_state_machine_version（消费方零改动路径，与生产 activate 联动一致）。
+async fn activate_profile_with_machine(
+    app: &common::TestApp,
+    db: &Database,
+    ws: &str,
+    profile_id: &str,
+    machine: &mongodb::bson::Document,
+) {
+    let existing = db
+        .domain_profiles()
+        .find_one(doc! { "workspace_id": ws, "profile_id": profile_id }, None)
+        .await
+        .expect("query profile");
+    let pid = match existing {
+        Some(p) => p.id.expect("profile _id"),
+        None => db_create_profile(db, ws, profile_id, "测试域", "测试", "generated_by_ai").await,
+    };
+    db.domain_profiles()
+        .update_one(
+            doc! { "_id": pid },
+            doc! { "$set": { "current_version": true, "generated_state_machine": machine } },
+            None,
+        )
+        .await
+        .expect("set current + machine");
+    let _ = wechatagent::routes::domain_profiles::activate_domain_profile(
+        State(app.state.clone()),
+        Extension(test_admin(ws)),
+        Path(pid.to_hex()),
+    )
+    .await
+    .expect("activate handler ok");
+}
+
+/// (workspace, user_operations) 下 current config 的 version（版本最大值）。
+async fn db_current_config_version(db: &Database, workspace_id: &str) -> i32 {
+    db_current_domain_config(db, workspace_id).await.version
+}
+
+/// 读某 state 的 policy 行（应至多一条 current）。
+async fn db_state_policy(
+    db: &Database,
+    workspace_id: &str,
+    state_key: &str,
+) -> Option<wechatagent::models::OperationStatePolicy> {
+    db.operation_state_policies()
+        .find_one(
+            doc! {
+                "workspace_id": workspace_id,
+                "domain": "user_operations",
+                "state_key": state_key,
+            },
+            None,
+        )
+        .await
+        .expect("query state policy")
+}
+
+/// H13 (1)：重复激活同一份本体逐字节相同的机器 → operation_domain_configs 行数与
+/// max version 都不变（no-op 幂等，消除「重复激活同机器」版本膨胀 + 竞态触发器）。
+#[tokio::test]
+#[ignore]
+async fn republish_same_machine_is_noop() {
+    let app = common::TestApp::start().await;
+    let db = app.state.db.clone();
+    let ws = app.state.config.default_workspace_id.clone();
+
+    db_seed_base_domain_config(&db, &ws).await;
+
+    let machine = doc! {
+        "states": [
+            { "key": "x_intro", "name": "开场", "initial": true, "allowedFrom": [] },
+            { "key": "x_deep", "name": "深入", "allowedFrom": ["x_intro"] },
+        ]
+    };
+    // 首次 activate：本体与底座不同 → 新增一版。
+    activate_profile_with_machine(&app, &db, &ws, "edu-domain", &machine).await;
+    let count_after_first = db_domain_config_count(&db, &ws).await;
+    let version_after_first = db_current_config_version(&db, &ws).await;
+
+    // 重复 activate 同一 profile（本体逐字节相同）→ no-op：行数 + max version 不变。
+    activate_profile_with_machine(&app, &db, &ws, "edu-domain", &machine).await;
+    activate_profile_with_machine(&app, &db, &ws, "edu-domain", &machine).await;
+
+    assert_eq!(
+        db_domain_config_count(&db, &ws).await,
+        count_after_first,
+        "重复 publish 同机器不应新增 config 版本（no-op 幂等）"
+    );
+    assert_eq!(
+        db_current_config_version(&db, &ws).await,
+        version_after_first,
+        "max version 不变（no-op 幂等）"
+    );
+}
+
+/// H13 (2)：把某 state 的 forbidsProactive false→true 切换后 republish → 该 state 的
+/// 机器派生 policy 行被 in-place 刷新，forbidden 从不含 reply 变为含 reply。
+/// 因 (1) 幂等，切换 forbidsProactive 改变了本体 → 不是 no-op，版本递增、loop 跑。
+#[tokio::test]
+#[ignore]
+async fn republish_toggled_forbids_proactive_refreshes_policy() {
+    let app = common::TestApp::start().await;
+    let db = app.state.db.clone();
+    let ws = app.state.config.default_workspace_id.clone();
+
+    db_seed_base_domain_config(&db, &ws).await;
+
+    // v1：grieving forbidsProactive=false → 派生 policy forbidden 不含 reply。
+    let machine_allow = doc! {
+        "states": [
+            { "key": "x_intro", "name": "开场", "initial": true, "allowedFrom": [] },
+            { "key": "grieving", "name": "哀伤期", "allowedFrom": ["x_intro"], "forbidsProactive": false },
+        ]
+    };
+    activate_profile_with_machine(&app, &db, &ws, "grief", &machine_allow).await;
+    let p1 = db_state_policy(&db, &ws, "grieving").await.expect("grieving policy after v1");
+    assert!(
+        !p1.forbidden.iter().any(|a| a == "reply"),
+        "forbidsProactive=false 时 forbidden 不应含 reply: {:?}",
+        p1.forbidden
+    );
+
+    // v2：同机器但 grieving 切 forbidsProactive=true → 本体变 → 非 no-op → 刷新 policy。
+    let machine_forbid = doc! {
+        "states": [
+            { "key": "x_intro", "name": "开场", "initial": true, "allowedFrom": [] },
+            { "key": "grieving", "name": "哀伤期", "allowedFrom": ["x_intro"], "forbidsProactive": true },
+        ]
+    };
+    activate_profile_with_machine(&app, &db, &ws, "grief", &machine_forbid).await;
+    let p2 = db_state_policy(&db, &ws, "grieving").await.expect("grieving policy after v2");
+    assert!(
+        p2.forbidden.iter().any(|a| a == "reply"),
+        "forbidsProactive 切 true 后机器派生 policy forbidden 应含 reply（in-place 刷新）: {:?}",
+        p2.forbidden
+    );
+}
+
+/// H13 (2)：运营手工 policy 行（非派生 seeded_by）在 republish 时被保留，绝不 clobber。
+#[tokio::test]
+#[ignore]
+async fn operator_edited_policy_preserved_on_republish() {
+    let app = common::TestApp::start().await;
+    let db = app.state.db.clone();
+    let ws = app.state.config.default_workspace_id.clone();
+
+    db_seed_base_domain_config(&db, &ws).await;
+
+    // 预插一条运营手工调整的 policy 行：grieving 上 admin 主动放开 reply（forbidden 空），
+    // seeded_by="admin_manual" → 非派生行，republish 必须保留。
+    let operator_row = wechatagent::models::OperationStatePolicy {
+        id: None,
+        workspace_id: ws.clone(),
+        domain: "user_operations".to_string(),
+        state_key: "grieving".to_string(),
+        allowed: vec!["reply".to_string(), "silent".to_string(), "follow_up".to_string()],
+        forbidden: vec![],
+        recommended_pace: None,
+        status: "active".to_string(),
+        updated_at: DateTime::now(),
+        version: 1,
+        current_version: true,
+        previous_version: None,
+        seeded_by: Some("admin_manual".to_string()),
+    };
+    db.operation_state_policies()
+        .insert_one(&operator_row, None)
+        .await
+        .expect("seed operator-edited policy");
+
+    // activate 一份把 grieving 标 forbidsProactive=true 的机器（机器派生想 forbidden=[reply]）。
+    let machine = doc! {
+        "states": [
+            { "key": "x_intro", "name": "开场", "initial": true, "allowedFrom": [] },
+            { "key": "grieving", "name": "哀伤期", "allowedFrom": ["x_intro"], "forbidsProactive": true },
+        ]
+    };
+    activate_profile_with_machine(&app, &db, &ws, "grief", &machine).await;
+
+    // 断言：运营手工行未被覆盖——forbidden 仍空、seeded_by 仍 admin_manual。
+    let after = db_state_policy(&db, &ws, "grieving").await.expect("grieving policy preserved");
+    assert!(
+        after.forbidden.is_empty(),
+        "运营手工行 forbidden 应保持空（不被机器派生 clobber）: {:?}",
+        after.forbidden
+    );
+    assert_eq!(
+        after.seeded_by.as_deref(),
+        Some("admin_manual"),
+        "运营手工行 seeded_by 应保持 admin_manual"
+    );
+}
+
+/// H13 (FINDING 1)：同 (ws,domain,state_key) 并存多版本 policy 时，republish 只刷新
+/// current_version=true 那一行，绝不改历史版本（否则运行时读 current 仍陈旧 = toggle
+/// 静默失效，且改写历史行会污染 rollback 链）。
+#[tokio::test]
+#[ignore]
+async fn republish_refreshes_only_current_policy_version() {
+    let app = common::TestApp::start().await;
+    let db = app.state.db.clone();
+    let ws = app.state.config.default_workspace_id.clone();
+
+    db_seed_base_domain_config(&db, &ws).await;
+
+    // 历史行：version 1, current_version=false, forbidden=[]，可刷新 seeded_by。
+    let historical = wechatagent::models::OperationStatePolicy {
+        id: None,
+        workspace_id: ws.clone(),
+        domain: "user_operations".to_string(),
+        state_key: "grieving".to_string(),
+        allowed: vec!["reply".to_string()],
+        forbidden: vec![],
+        recommended_pace: None,
+        status: "active".to_string(),
+        updated_at: DateTime::now(),
+        version: 1,
+        current_version: false,
+        previous_version: None,
+        seeded_by: Some("legacy_migration".to_string()),
+    };
+    let hist_id = db
+        .operation_state_policies()
+        .insert_one(&historical, None)
+        .await
+        .expect("seed historical policy")
+        .inserted_id
+        .as_object_id()
+        .expect("historical _id");
+
+    // 当前行：version 2, current_version=true, forbidden=[]，可刷新 seeded_by。
+    let current = wechatagent::models::OperationStatePolicy {
+        id: None,
+        workspace_id: ws.clone(),
+        domain: "user_operations".to_string(),
+        state_key: "grieving".to_string(),
+        allowed: vec!["reply".to_string()],
+        forbidden: vec![],
+        recommended_pace: None,
+        status: "active".to_string(),
+        updated_at: DateTime::now(),
+        version: 2,
+        current_version: true,
+        previous_version: Some(1),
+        seeded_by: Some("legacy_migration".to_string()),
+    };
+    let cur_id = db
+        .operation_state_policies()
+        .insert_one(&current, None)
+        .await
+        .expect("seed current policy")
+        .inserted_id
+        .as_object_id()
+        .expect("current _id");
+
+    // publish 把 grieving 标 forbidsProactive=true（机器派生想 forbidden=[reply]）。
+    let machine = doc! {
+        "states": [
+            { "key": "x_intro", "name": "开场", "initial": true, "allowedFrom": [] },
+            { "key": "grieving", "name": "哀伤期", "allowedFrom": ["x_intro"], "forbidsProactive": true },
+        ]
+    };
+    activate_profile_with_machine(&app, &db, &ws, "grief", &machine).await;
+
+    // 当前行（version 2）被刷新：forbidden 含 reply。
+    let cur_after = db
+        .operation_state_policies()
+        .find_one(doc! { "_id": cur_id }, None)
+        .await
+        .expect("query current after")
+        .expect("current row exists");
+    assert!(
+        cur_after.forbidden.iter().any(|a| a == "reply"),
+        "current(version 2) 行应被刷新为 forbidden 含 reply: {:?}",
+        cur_after.forbidden
+    );
+
+    // 历史行（version 1）原封不动：forbidden 仍空。
+    let hist_after = db
+        .operation_state_policies()
+        .find_one(doc! { "_id": hist_id }, None)
+        .await
+        .expect("query historical after")
+        .expect("historical row exists");
+    assert!(
+        hist_after.forbidden.is_empty(),
+        "historical(version 1) 行不应被改动，forbidden 仍空: {:?}",
+        hist_after.forbidden
+    );
+    assert_eq!(
+        hist_after.version, 1,
+        "historical 行 version 不变"
+    );
+    assert!(
+        !hist_after.current_version,
+        "historical 行仍非 current"
+    );
+}
+
+// ── H13 (T14)：activate 切状态机后迁移存量 contact 幻影态到新 initial ────────────────
+
+/// 在 contacts 集合插一条最小 contact（直写裸 BSON，避免构造 30+ 字段），返回其 _id。
+/// `operation_state` 为 None 时不写该字段（模拟未设态 contact）。
+async fn db_seed_contact(
+    db: &Database,
+    workspace_id: &str,
+    wxid: &str,
+    operation_state: Option<&str>,
+) -> ObjectId {
+    let oid = ObjectId::new();
+    let mut doc = doc! {
+        "_id": oid,
+        "workspace_id": workspace_id,
+        "account_id": "acct-test",
+        "wxid": wxid,
+        "agent_status": "managed",
+        "created_at": DateTime::now(),
+        "updated_at": DateTime::now(),
+    };
+    if let Some(state_key) = operation_state {
+        doc.insert("operation_state", state_key);
+    }
+    db.raw()
+        .collection::<mongodb::bson::Document>("contacts")
+        .insert_one(doc, None)
+        .await
+        .expect("seed contact");
+    oid
+}
+
+/// 读某 contact 当前 operation_state（裸 BSON，None=未设字段）。
+async fn db_contact_operation_state(db: &Database, id: ObjectId) -> Option<String> {
+    let doc = db
+        .raw()
+        .collection::<mongodb::bson::Document>("contacts")
+        .find_one(doc! { "_id": id }, None)
+        .await
+        .expect("query contact")
+        .expect("contact exists");
+    doc.get_str("operation_state").ok().map(str::to_string)
+}
+
+/// T14：存量 contact 持旧机器的 operation_state（新机器无此 key）→ activate 切新机器后，
+/// 该 contact 被重置到新机器 initial 态（修「换域后老 contact 状态机静默冻结」幻影态）。
+#[tokio::test]
+#[ignore]
+async fn activate_resets_stranded_contact_operation_state() {
+    let app = common::TestApp::start().await;
+    let db = app.state.db.clone();
+    let ws = app.state.config.default_workspace_id.clone();
+
+    db_seed_base_domain_config(&db, &ws).await;
+
+    // 存量 contact 停在旧（销售）机器的 negotiating——新机器里不存在此 key。
+    let cid = db_seed_contact(&db, &ws, "wx-stranded", Some("legacy_negotiating")).await;
+
+    // 新机器：initial=x_intro，另含 x_active（allowedFrom x_intro），均无 legacy_negotiating。
+    let machine = doc! {
+        "states": [
+            { "key": "x_intro", "name": "开场", "initial": true, "allowedFrom": [] },
+            { "key": "x_active", "name": "活跃", "allowedFrom": ["x_intro"] },
+        ]
+    };
+    activate_profile_with_machine(&app, &db, &ws, "edu-domain", &machine).await;
+
+    assert_eq!(
+        db_contact_operation_state(&db, cid).await.as_deref(),
+        Some("x_intro"),
+        "幻影态 contact 应被重置到新机器 initial 态 x_intro"
+    );
+}
+
+/// T14：已处在新机器合法态（x_intro）的 contact 在 activate 后不被重置/clobber。
+#[tokio::test]
+#[ignore]
+async fn activate_preserves_valid_contact_operation_state() {
+    let app = common::TestApp::start().await;
+    let db = app.state.db.clone();
+    let ws = app.state.config.default_workspace_id.clone();
+
+    db_seed_base_domain_config(&db, &ws).await;
+
+    // contact 已在新机器的合法态 x_intro。
+    let cid = db_seed_contact(&db, &ws, "wx-valid", Some("x_intro")).await;
+
+    let machine = doc! {
+        "states": [
+            { "key": "x_intro", "name": "开场", "initial": true, "allowedFrom": [] },
+            { "key": "x_active", "name": "活跃", "allowedFrom": ["x_intro"] },
+        ]
+    };
+    activate_profile_with_machine(&app, &db, &ws, "edu-domain", &machine).await;
+
+    assert_eq!(
+        db_contact_operation_state(&db, cid).await.as_deref(),
+        Some("x_intro"),
+        "合法态 contact 不应被重置（$nin 过滤排除合法态）"
+    );
+}
+
+/// T14：operation_state 未设的 contact 在 activate 后仍未设（$exists:true 过滤排除，
+/// 留待首次运行时补 initial，不被本迁移误写）。
+#[tokio::test]
+#[ignore]
+async fn activate_leaves_unset_operation_state_contact() {
+    let app = common::TestApp::start().await;
+    let db = app.state.db.clone();
+    let ws = app.state.config.default_workspace_id.clone();
+
+    db_seed_base_domain_config(&db, &ws).await;
+
+    let cid = db_seed_contact(&db, &ws, "wx-unset", None).await;
+
+    let machine = doc! {
+        "states": [
+            { "key": "x_intro", "name": "开场", "initial": true, "allowedFrom": [] },
+            { "key": "x_active", "name": "活跃", "allowedFrom": ["x_intro"] },
+        ]
+    };
+    activate_profile_with_machine(&app, &db, &ws, "edu-domain", &machine).await;
+
+    assert_eq!(
+        db_contact_operation_state(&db, cid).await,
+        None,
+        "未设 operation_state 的 contact 不应被本迁移写入（$exists:true,$ne:null 过滤排除）"
+    );
 }

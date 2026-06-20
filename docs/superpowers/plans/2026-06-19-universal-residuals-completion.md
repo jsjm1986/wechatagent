@@ -496,6 +496,106 @@ git commit -m "docs(universal): 三残留 H13/H17/H18 收口完成，更新残�
 
 ---
 
+## 终审追加（2026-06-20，whole-branch review 发现 + 用户拍板"彻底做"）
+
+全分支终审 READY TO MERGE、六红线全 PASS，但发现两项非销售边的 incompleteness：plumbing 对、DEFAULT 字节等价，但非销售 profile 实战拿不到承诺的能力。用户选「彻底做」。
+
+### Task 8: activate publish 状态机时联动重派生 operation_state_policies（修 forbidsProactive 静默失效）
+
+**Files:**
+- Modify: `src/routes/admin_ops_versions.rs`（`publish_state_machine_version` 后联动派生 policies）
+- Modify: `src/db/migrations/m013_seed_user_operation_state_policies.rs`（抽派生纯函数复用）或新建 helper
+- Test: `tests/domain_profile_e2e.rs`（#[ignore]，testcontainers）
+
+**Interfaces:**
+- Consumes: `OperationStatePolicy`（models.rs）；m013 的"forbidsProactive→(allowed,forbidden)"派生规则
+- Produces: publish 新状态机后，新机器里每个 state（按 `forbidsProactive` 标志）在 `operation_state_policies` 有对应 active policy 行；已存在 (workspace,domain,state_key) 行**跳过保留运营手工调整**（与 m013 同语义）
+
+**根因**：主动触达门由派生表 `operation_state_policies` enforce（`enforce_state_action_policy(None)=Ok` fail-open，guards.rs:263），该表仅 m013 从 DEFAULT 机器 seed。H13 `publish_state_machine_version` 写新机器到 `operation_domain_configs` 时不联动派生 policies → 非销售 profile 标 `forbidsProactive:true` 的 state 不真拦主动发。生成 prompt(guide_profile.rs:212)却邀运营声明此旗标 = 承诺了静默忽略的能力。
+
+- [ ] **Step 1: 抽派生规则为可复用纯函数**
+
+把 m013 的 `forbidsProactive` → `(allowed, forbidden)` 映射抽成纯函数（如 `derive_state_policy_lists(forbids_proactive: bool) -> (Vec<String>, Vec<String>)`），m013 与新 publish 联动共用，杜绝两处漂移。`(true)→(["silent","follow_up"],["reply"])`；`(false)→(["reply","silent","follow_up"],[])`。加纯函数单测锁两分支。
+
+- [ ] **Step 2: publish 后联动派生**
+
+在 `publish_state_machine_version`（admin_ops_versions.rs）insert 新 config + demote 之后，遍历新机器 `state_machine.states[]`：对每个 `(workspace_id, "user_operations", state_key)`，若 `operation_state_policies` 已有行 → 跳过（保留运营手工调整，与 m013 一致）；否则按 `forbidsProactive` 标志用 Step 1 纯函数派生 allowed/forbidden，insert 一行 `status="active"`、`seeded_by=Some(format!("statemachine_publish:{profile_id}"))`。best-effort：派生失败 warn 不阻断（与 publish 自身 best-effort 一致——状态机已 publish，policy 缺失只是 fail-open 回到改造前行为）。注意 seeded_by 需把 profile_id 传进 helper（现签名 `seeded_by: String` 已有）。
+
+- [ ] **Step 3: 集成测试（#[ignore]）**
+
+`tests/domain_profile_e2e.rs` 加：activate 带 `generated_state_machine`（含一个 `forbidsProactive:true` 的非 cooldown state，如 `{"key":"grieving","name":"哀伤期","initial":false,"allowedFrom":["x_intro"],"forbidsProactive":true}`）→ 断言 `operation_state_policies` 在 `(workspace,"user_operations","grieving")` 有 active 行且 `forbidden` 含 `"reply"`。
+
+- [ ] **Step 4: 基线**
+
+Run: `rm -rf target/debug/incremental && RUSTFLAGS="-Dwarnings" CARGO_INCREMENTAL=0 cargo test --lib 2>&1 | tail -5 && CARGO_INCREMENTAL=0 cargo test --test domain_profile_e2e --no-run 2>&1 | tail`
+Expected: lib ≥350/0；e2e 编译过
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add src/routes/admin_ops_versions.rs src/db/migrations/m013_seed_user_operation_state_policies.rs tests/domain_profile_e2e.rs
+git commit -m "feat(universal/H13): publish 状态机联动重派生 operation_state_policies（修 forbidsProactive 对生成机器静默失效）"
+```
+
+### Task 9: reaction 分析 prompt 随 profile 声明轨迹维度（让非销售 dimensions 真填充）
+
+**Files:**
+- Modify: `src/agent/reaction.rs`（`analyze_user_reaction` 加轨迹维度 prompt addendum；caller 传 trajectory_dimensions）
+- Test: `src/agent/reaction.rs` tests mod
+
+**Interfaces:**
+- Consumes: `DomainProfile.trajectory_dimensions`、`default_trajectory_dimensions()`（Task 2）
+- Produces: 非销售 profile 声明轨迹维度时，reaction 分析 prompt 追加一段指示 LLM 产出每维 camelCase key；DEFAULT（单维 objection_type）返回 None → prompt 字节等价
+
+**根因**：H17 写侧读 `reaction_analysis[camelCase(dim.kind)]`（reaction.rs:683），但 `analyze_user_reaction` 的 `user.reaction.task` prompt 从没指示 LLM 产非 `objectionType` 维度 key → 非销售 profile 的 `dimensions` 容器实战恒空。spec H17.4 列了"reaction prompt 维度名随 profile"，本批漏做。
+
+**范式**：仿现成 `reaction_polarity_prompt_addendum`（reaction.rs:397，profile 非默认极性时追加 prompt 段、DEFAULT 返 None 字节等价）。caller（reaction.rs:135）已 load active profile（取 outcome_polarity），同处也取 trajectory_dimensions 传入 `analyze_user_reaction`，避免二次 load。
+
+- [ ] **Step 1: 写失败测试（DEFAULT None 字节等价 + 非销售域产 addendum）**
+
+```rust
+#[test]
+fn trajectory_addendum_none_for_default() {
+    let dims = crate::agent::domain_profile::default_trajectory_dimensions();
+    assert!(reaction_trajectory_prompt_addendum(&dims).is_none(), "DEFAULT 单维 objection_type → None 字节等价");
+}
+
+#[test]
+fn trajectory_addendum_lists_profile_dimensions() {
+    let dims = vec![crate::models::TrajectoryDimension {
+        kind: "concern_type".into(), display_name: "顾虑类型".into(),
+    }];
+    let add = reaction_trajectory_prompt_addendum(&dims).expect("非销售维度须产 addendum");
+    assert!(add.contains("concernType") || add.contains("concern_type"), "addendum 须列维度 key");
+    assert!(add.contains("顾虑类型"), "addendum 须含 display_name 帮模型理解");
+}
+```
+
+- [ ] **Step 2: 运行验证失败**
+
+Run: `cargo test --lib trajectory_addendum 2>&1 | tail`
+Expected: FAIL（函数未定义）
+
+- [ ] **Step 3: 实现 addendum 函数 + 接入 prompt**
+
+`src/agent/reaction.rs`：新增 `pub(crate) fn reaction_trajectory_prompt_addendum(dims: &[TrajectoryDimension]) -> Option<String>`。规则：若 `dims` 为空，或恰为 DEFAULT 单维（`len==1 && dims[0].kind=="objection_type"`）→ 返回 `None`（DEFAULT 字节等价红线，对齐 `reaction_polarity_prompt_addendum` 的 None 路径）。否则产一段中文说明，列出每个非 objection_type 维度的 camelCase key + display_name，指示 LLM 在 JSON 里额外输出这些字段（语气与现有 prompt 一致，**抽象机制非点对点话术**，守反过拟合）。在 `analyze_user_reaction`（reaction.rs:299 user 拼装）把该 addendum 追加到 `domain_addendum` 之后（与极性 addendum 同位）。caller（reaction.rs:135-138）把已 load profile 的 `trajectory_dimensions` 一并取出传入 `analyze_user_reaction`（改其签名加一参，或传整个 profile）。
+
+> 注意：复用 caller 已 load 的 profile，**不新增 load_active_domain_profile 调用**（reviewer Minor 已指出写侧重复 load 走缓存，不要再加第三次）。
+
+- [ ] **Step 4: 运行验证通过 + 基线**
+
+Run: `cargo test --lib trajectory_addendum 2>&1 | tail && rm -rf target/debug/incremental && RUSTFLAGS="-Dwarnings" CARGO_INCREMENTAL=0 cargo test --lib 2>&1 | tail -5`
+Expected: PASS（含新 2 测试，≥350/0）
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add src/agent/reaction.rs
+git commit -m "feat(universal/H17): reaction 分析 prompt 随 profile 声明轨迹维度（DEFAULT None 字节等价）"
+```
+
+---
+
 ## Self-Review
 
 **Spec coverage**：H18（Task1）✓ / H17（Task2 结构 + Task3 读写）✓ / H13（Task4 draft 字段 + Task5 生成+校验 + Task6 activate publish）✓ / 收尾验证（Task7）✓。spec 三模块全覆盖。

@@ -74,6 +74,7 @@ pub(crate) use decision::load_user_operation_domain_config_for_contact;
 pub(crate) use decision::load_user_operation_domain_config;
 pub(crate) use decision::initial_operation_state_for_contact;
 pub(crate) use guards::initial_operation_state_key;
+pub(crate) use guards::initial_operation_state_key_in_machine;
 pub use gateway::{
     handle_follow_up_task, handle_managed_message, handle_managed_message_aggregated,
     send_contact_message_gateway, write_event_for_account,

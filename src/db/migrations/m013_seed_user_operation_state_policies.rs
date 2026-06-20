@@ -11,6 +11,33 @@ use crate::db::Database;
 use crate::error::AppResult;
 use crate::models::OperationStatePolicy;
 
+/// H13：把 `forbidsProactive` 标志映射成 `(allowed, forbidden)` action 列表的**唯一真相**。
+///
+/// 抽成纯函数后被两条派生路径共用——本迁移（从 DEFAULT 机器 seed）与
+/// [`crate::routes::admin_ops_versions::publish_state_machine_version`]（profile activate
+/// 联动 publish 行业状态机时重派生）。两处共用一份逻辑，杜绝「m013 与 publish 路径漂移」。
+///
+/// 返回向量的**顺序与内容**与改造前 m013 内联逻辑逐字等价（DEFAULT 字节等价红线）：
+/// - `true`  → allowed `["silent","follow_up"]`、forbidden `["reply"]`
+/// - `false` → allowed `["reply","silent","follow_up"]`、forbidden `[]`
+pub(crate) fn derive_state_policy_lists(forbids_proactive: bool) -> (Vec<String>, Vec<String>) {
+    if forbids_proactive {
+        (
+            vec!["silent".to_string(), "follow_up".to_string()],
+            vec!["reply".to_string()],
+        )
+    } else {
+        (
+            vec![
+                "reply".to_string(),
+                "silent".to_string(),
+                "follow_up".to_string(),
+            ],
+            Vec::new(),
+        )
+    }
+}
+
 pub(super) async fn run_step(db: &Database) -> AppResult<()> {
     let mut cursor = db
         .operation_domain_configs()
@@ -51,21 +78,8 @@ pub(super) async fn run_step(db: &Database) -> AppResult<()> {
             // `state_key == "cooldown"`）。DEFAULT 状态机仅 cooldown 标 forbidsProactive
             // → 与改造前逐字等价；换行业的 profile 可标别的 state 禁回复。
             let forbids_proactive = state.get_bool("forbidsProactive").unwrap_or(false);
-            let (allowed, forbidden): (Vec<String>, Vec<String>) = if forbids_proactive {
-                (
-                    vec!["silent".to_string(), "follow_up".to_string()],
-                    vec!["reply".to_string()],
-                )
-            } else {
-                (
-                    vec![
-                        "reply".to_string(),
-                        "silent".to_string(),
-                        "follow_up".to_string(),
-                    ],
-                    Vec::new(),
-                )
-            };
+            let (allowed, forbidden): (Vec<String>, Vec<String>) =
+                derive_state_policy_lists(forbids_proactive);
             let policy = OperationStatePolicy {
                 id: None,
                 workspace_id: config.workspace_id.clone(),
@@ -94,4 +108,33 @@ pub(super) async fn run_step(db: &Database) -> AppResult<()> {
         "seeded operation_state_policies for user_operations"
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::derive_state_policy_lists;
+
+    /// `forbidsProactive=true`：禁主动回复——allowed=["silent","follow_up"]、forbidden=["reply"]。
+    /// 顺序与内容锁死（DEFAULT 字节等价红线：与改造前 m013 内联逻辑逐字一致）。
+    #[test]
+    fn derive_forbids_proactive_blocks_reply() {
+        let (allowed, forbidden) = derive_state_policy_lists(true);
+        assert_eq!(allowed, vec!["silent".to_string(), "follow_up".to_string()]);
+        assert_eq!(forbidden, vec!["reply".to_string()]);
+    }
+
+    /// `forbidsProactive=false`：宽允许——allowed=["reply","silent","follow_up"]、forbidden=[]。
+    #[test]
+    fn derive_allows_all_when_not_forbidden() {
+        let (allowed, forbidden) = derive_state_policy_lists(false);
+        assert_eq!(
+            allowed,
+            vec![
+                "reply".to_string(),
+                "silent".to_string(),
+                "follow_up".to_string(),
+            ]
+        );
+        assert!(forbidden.is_empty());
+    }
 }

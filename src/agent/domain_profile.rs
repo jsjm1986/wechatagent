@@ -111,6 +111,15 @@ pub fn default_memory_dimensions() -> Vec<MemoryDimension> {
         .collect()
 }
 
+/// H17 DEFAULT：销售域轨迹维度 = 单维 objection_type，渲染标签"异议类型"。
+/// 与改造前 IntentTrajectoryEntry.objection_type 行为等价（写侧仍走旧字段）。
+pub(crate) fn default_trajectory_dimensions() -> Vec<crate::models::TrajectoryDimension> {
+    vec![crate::models::TrajectoryDimension {
+        kind: "objection_type".to_string(),
+        display_name: "异议类型".to_string(),
+    }]
+}
+
 /// H17：把 active profile 的记忆维度渲染成一段 Reply Agent 任务指引，告知本行业
 /// `memoryCandidates[].type` 的合法值（candidate_type=true 的维度 key + 固定的
 /// fact/conflict）。
@@ -813,6 +822,13 @@ pub fn default_domain_profile(workspace_id: &str) -> DomainProfile {
         // objections/openLoops/openQuestions/confirmedFacts/conflicts）+ 原 cap。空集时
         // 消费方回落同一组维度，故 seed 与回落同源、cap/prompt 字节等价。
         memory_dimensions: default_memory_dimensions(),
+        // H17：DEFAULT 销售域 = 单维 objection_type 轨迹维度（渲染"异议类型"）。空集时
+        // 消费方回落同一组维度；写侧仍走 IntentTrajectoryEntry.objection_type 旧字段、
+        // dimensions 容器留空，故字节等价。
+        trajectory_dimensions: default_trajectory_dimensions(),
+        // H18：DEFAULT 不声明去抖窗口覆盖 → webhook 回落全局 config.message_debounce_window_ms
+        // （销售域字节等价）。换行业可声明更长/更短窗口。
+        debounce_window_ms_override: None,
         // C3：DEFAULT 不声明行业专属生成器引导语 → 回落领域中性 PLAYBOOK_METHODOLOGY_SYSTEM
         // （已去销售偏见）。换行业可在引导层声明自己的生成偏好。
         methodology_generator_preamble: None,
@@ -828,6 +844,9 @@ pub fn default_domain_profile(workspace_id: &str) -> DomainProfile {
         // I：DEFAULT 不覆盖 answeringMode 三档释义/标签 → completeness prompt 三档释义
         // 与前端档位标签保留写死销售文案（prompt 字节等价、UI 标签不变）。
         answering_mode_profile: None,
+        // H13：DEFAULT 不携带生成的状态机本体 → activate 不动状态机，运行时回落现有
+        // DEFAULT 销售 9 态（不造双真相源）。引导层生成 profile 时联动写入本字段。
+        generated_state_machine: None,
         version: 1,
         current_version: true,
         previous_version: None,
@@ -1081,6 +1100,11 @@ pub fn invalidate_global_domain_profile_cache() {
     GLOBAL_DOMAIN_PROFILE_CACHE.invalidate();
 }
 
+/// H18：解析该 profile 的去抖窗口，None 回落 config 全局默认。
+pub(crate) fn resolve_debounce_window_ms(profile: &crate::models::DomainProfile, config_default: u64) -> u64 {
+    profile.debounce_window_ms_override.unwrap_or(config_default)
+}
+
 /// 取「参与决策」的维度 kind 列表（对应旧 `TAGGED_FIELDS` 成员集合）。
 /// Phase 1 由 `decision_taxonomy` 消费以替换 const 表。
 pub fn decision_dimension_kinds(profile: &DomainProfile) -> Vec<String> {
@@ -1160,6 +1184,19 @@ mod tests {
     use super::*;
 
     #[test]
+    fn debounce_window_none_falls_back_to_config_default() {
+        let p = default_domain_profile("ws");
+        assert_eq!(resolve_debounce_window_ms(&p, 4000), 4000, "DEFAULT 无 override 回落 env 默认");
+    }
+
+    #[test]
+    fn debounce_window_some_overrides_config() {
+        let mut p = default_domain_profile("ws");
+        p.debounce_window_ms_override = Some(8000);
+        assert_eq!(resolve_debounce_window_ms(&p, 4000), 8000, "Some 覆盖 env 默认");
+    }
+
+    #[test]
     fn default_profile_has_sales_domain_dimensions() {
         let p = default_domain_profile("ws-1");
         let kinds = decision_dimension_kinds(&p);
@@ -1226,6 +1263,14 @@ mod tests {
         // §3.7 护栏：calendar 默认**关**（主动情绪触达销售域绝不默认开）→ scan_calendar
         // 对销售域 no-op，所有 planner 金标零变化。
         assert!(!p.operation_mode.calendar.enabled);
+    }
+
+    #[test]
+    fn default_trajectory_dimensions_is_objection_only() {
+        let dims = default_trajectory_dimensions();
+        assert_eq!(dims.len(), 1);
+        assert_eq!(dims[0].kind, "objection_type");
+        assert_eq!(dims[0].display_name, "异议类型");
     }
 
     #[test]
