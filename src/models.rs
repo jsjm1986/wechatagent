@@ -680,6 +680,39 @@ pub struct ContentAsset {
     pub url: Option<String>,
     pub media_id: Option<String>,
     pub usage_scene: Option<String>,
+
+    // ===== 销售素材文件发送：文件资产本体 =====
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub media_type: Option<String>, // "image"|"file"|"video"
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_path: Option<String>, // MEDIA_STORAGE_DIR 下相对路径
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_size: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mime_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_sha256: Option<String>,
+
+    // ===== 发送标注（人类上传时填）=====
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sendable: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub send_trigger_hint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_stages: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expression_pref: Option<String>, // "file_primary"|"file_support"
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requires_principal_approval: Option<bool>,
+
+    // ===== 审核状态 =====
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review_status: Option<String>, // "draft"|"approved"
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review_note: Option<String>,
+
     pub created_at: DateTime,
     pub updated_at: DateTime,
 }
@@ -5483,5 +5516,67 @@ mod generated_state_machine_tests {
         let d = mongodb::bson::to_document(&p).unwrap();
         let back: DomainProfile = mongodb::bson::from_document(d).unwrap();
         assert!(back.generated_state_machine.is_none());
+    }
+}
+
+#[cfg(test)]
+mod content_asset_compat_tests {
+    use super::ContentAsset;
+    use mongodb::bson::{doc, DateTime};
+
+    #[test]
+    fn legacy_asset_without_new_fields_deserializes_with_none() {
+        // 模拟现有朋友圈素材行：只有老字段
+        let legacy = doc! {
+            "workspace_id": "ws1",
+            "kind": "text",
+            "title": "朋友圈文案A",
+            "tags": ["promo"],
+            "created_at": DateTime::now(),
+            "updated_at": DateTime::now(),
+        };
+        let asset: ContentAsset = mongodb::bson::from_document(legacy)
+            .expect("legacy content_assets row must still deserialize");
+        // 关键：旧行不被误判为可发送素材
+        assert_eq!(asset.sendable, None);
+        assert_eq!(asset.media_type, None);
+        assert_eq!(asset.review_status, None);
+        assert_eq!(asset.file_path, None);
+    }
+
+    #[test]
+    fn sendable_asset_roundtrips_all_new_fields() {
+        let asset = ContentAsset {
+            id: None,
+            workspace_id: "ws1".into(),
+            account_id: None,
+            kind: "media".into(),
+            title: "产品报价单.xlsx".into(),
+            body: None,
+            tags: vec![],
+            url: None,
+            media_id: None,
+            usage_scene: None,
+            media_type: Some("file".into()),
+            file_path: Some("ws1/ab/abcd.xlsx".into()),
+            file_name: Some("产品报价单.xlsx".into()),
+            file_size: Some(20480),
+            mime_type: Some("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet".into()),
+            file_sha256: Some("abcd".into()),
+            sendable: Some(true),
+            send_trigger_hint: Some("客户问价格时发".into()),
+            target_stages: Some(vec!["意向".into(), "未成交".into()]),
+            expression_pref: Some("file_primary".into()),
+            requires_principal_approval: Some(false),
+            review_status: Some("approved".into()),
+            review_note: None,
+            created_at: DateTime::now(),
+            updated_at: DateTime::now(),
+        };
+        let doc = mongodb::bson::to_document(&asset).unwrap();
+        let back: ContentAsset = mongodb::bson::from_document(doc).unwrap();
+        assert_eq!(back.media_type.as_deref(), Some("file"));
+        assert_eq!(back.expression_pref.as_deref(), Some("file_primary"));
+        assert_eq!(back.target_stages.unwrap().len(), 2);
     }
 }
