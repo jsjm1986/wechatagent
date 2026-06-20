@@ -332,6 +332,8 @@ pub async fn test_knowledge_route_for_contact(
         dedupe_key: None,
         direction: MessageDirection::Inbound,
         content: message.trim().to_string(),
+        msg_type: None,
+        media_ref: None,
         raw: Some(doc! { "runMode": "knowledge_test" }),
         created_at: DateTime::now(),
     };
