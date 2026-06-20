@@ -2200,6 +2200,33 @@ mod locale_tests {
 }
 
 #[cfg(test)]
+mod reviewer_orientation_anchor_tests {
+    use super::*;
+    use crate::agent::domain_profile::{DEFAULT_REVIEWER_REVIEW_FOCUS, REVIEWER_REVIEW_FOCUS_LABEL};
+
+    /// G31 锚漂移护栏：reviewer **system** prompt（`user.review.system`，运行时由
+    /// `load_prompt` → `default_prompt_content` → `prompt_specs()` 供给）实际「评审重点：…」
+    /// 整行，必须**逐字**等于锚 `REVIEWER_REVIEW_FOCUS_LABEL` + `DEFAULT_REVIEWER_REVIEW_FOCUS`，
+    /// 否则 `apply_reviewer_review_focus` 的 `system.replace(old_line, …)` 静默失配——active
+    /// profile 的 `reviewer_orientation.review_focus` 取向覆盖永远找不到锚、静默不替换。
+    /// 与 `default_reviewer_fewshot_anchor_matches_pack` 同构（断真 prompt pack，不是断
+    /// 手抄样例 → 任一侧漂移即红）。
+    #[test]
+    fn default_reviewer_review_focus_anchor_matches_pack() {
+        let specs = prompt_specs();
+        let review = specs
+            .iter()
+            .find(|s| s.key == "user.review.system")
+            .expect("user.review.system prompt spec 存在");
+        let anchor_line = format!("{REVIEWER_REVIEW_FOCUS_LABEL}{DEFAULT_REVIEWER_REVIEW_FOCUS}");
+        assert!(
+            review.content.contains(&anchor_line),
+            "评审重点锚（标签+默认取向）与 prompt pack 不一致，apply_reviewer_review_focus 会静默失配：{anchor_line}"
+        );
+    }
+}
+
+#[cfg(test)]
 mod reviewer_fewshot_anchor_tests {
     use super::*;
 
