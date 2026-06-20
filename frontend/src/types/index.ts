@@ -92,6 +92,8 @@ export type Message = {
   direction: "inbound" | "outbound";
   content: string;
   createdAt?: string;
+  msgType?: "text" | "media";
+  mediaRef?: string;
 };
 
 export type EventItem = {
