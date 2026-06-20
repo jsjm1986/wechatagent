@@ -3016,6 +3016,9 @@ pub struct AgentPrincipalEscalation {
     pub updated_at: DateTime,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resolved_at: Option<DateTime>,
+    /// 裁决来源审计："wechat"（领导微信回复）/ "admin"（管理员在后台直接裁决）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_via: Option<String>,
 }
 
 // LP-12 / Task 21：核心 Document 字段的强类型版本。

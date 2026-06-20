@@ -72,6 +72,7 @@ pub(crate) async fn insert_pending_escalation(
             created_at: now,
             updated_at: now,
             resolved_at: None,
+            resolved_via: None,
         };
         match state
             .db
@@ -155,6 +156,7 @@ pub(crate) async fn resolve_escalation(
     short_code: &str,
     decision: &PrincipalDecision,
     authorization_expires_at: Option<DateTime>,
+    resolved_via: &str,
 ) -> AppResult<Option<AgentPrincipalEscalation>> {
     let now = DateTime::now();
     let decision_bson = mongodb::bson::to_bson(decision)?;
@@ -163,6 +165,7 @@ pub(crate) async fn resolve_escalation(
         "decision": decision_bson,
         "updated_at": now,
         "resolved_at": now,
+        "resolved_via": resolved_via,
     };
     if let Some(exp) = authorization_expires_at {
         set.insert("authorization_expires_at", exp);
