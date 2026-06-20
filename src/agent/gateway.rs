@@ -2067,6 +2067,11 @@ pub(crate) async fn precheck_send_gateway(
             && !is_deferred_wake
             && crate::agent::quiet_hours::effective_quiet_hours_enabled(
                 contact,
+                &crate::agent::domain_profile::load_active_domain_profile(
+                    &state.db,
+                    &contact.workspace_id,
+                )
+                .await,
                 runtime.quiet_hours_enabled,
             )
             && crate::agent::quiet_hours::is_quiet_now(
