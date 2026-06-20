@@ -10,6 +10,7 @@
 #![allow(dead_code)]
 
 pub mod autonomy_gate;
+pub mod conversation_gate;
 pub mod generalization;
 pub mod dynamic;
 pub mod identity_generator;
