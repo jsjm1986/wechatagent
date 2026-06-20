@@ -17,7 +17,6 @@ pub mod generalization;
 pub mod dynamic;
 pub mod identity_generator;
 pub mod judge;
-pub mod redline;
 pub mod roleplay_fixtures;
 pub mod roleplayer;
 
