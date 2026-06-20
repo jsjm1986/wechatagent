@@ -1097,6 +1097,27 @@ async fn db_seed_base_domain_config(db: &Database, workspace_id: &str) {
         principal_decider: None,
         high_risk_escalation_mode: None,
     };
+    // DIAGNOSTIC(临时): E11000 根因排查——insert 前 dump 现有行,确认是否已有行预存及其
+    // 来源(seeded_by/version)与当前 DB 名(验证隔离)。CI 跑一次据证据定位真因再删本段+定修法。
+    let pre_existing: Vec<wechatagent::models::OperationDomainConfig> = db
+        .operation_domain_configs()
+        .find(doc! { "workspace_id": workspace_id, "domain": "user_operations" }, None)
+        .await
+        .expect("diag: query pre-existing configs")
+        .try_collect()
+        .await
+        .expect("diag: collect pre-existing configs");
+    eprintln!(
+        "DIAG db_seed_base_domain_config: ws={workspace_id} db={} insert 前已存在 {} 行 user_operations config",
+        db.raw().name(),
+        pre_existing.len()
+    );
+    for c in &pre_existing {
+        eprintln!(
+            "DIAG   - version={} current_version={} seeded_by={:?} name={}",
+            c.version, c.current_version, c.seeded_by, c.name
+        );
+    }
     db.operation_domain_configs()
         .insert_one(&cfg, None)
         .await
