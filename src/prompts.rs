@@ -12,7 +12,7 @@ use crate::{
     models::{AgentSoul, OperationDomainConfig, OperationPlaybook, PromptTemplate},
 };
 
-pub const PROMPT_PACK_VERSION: &str = "wechatagent_prompt_pack_v3_2026_05_22";
+pub const PROMPT_PACK_VERSION: &str = "wechatagent_prompt_pack_v3_2026_06_21_media";
 
 /// universal-domain-adaptation A/T1：user.reply.policy prompt「## 模式与 5 闸的关系」
 /// 模式-闸说明段（逐字复刻 prompt pack v3 现文 :958-963：标题 + casual_relationship /
@@ -1179,6 +1179,13 @@ fn prompt_specs() -> Vec<PromptSpec> {
     "content": ""
   },
 
+  // ── 素材文件发送（assetsToSend，可选；没有契合素材就整个字段省略或留空数组） ──
+  // 当上下文「可发送素材」清单里有契合当前客户阶段与问题的文件时，可在此选择发给客户。
+  // 每项 = { "assetId": "清单里列出的 id", "reason": "为什么这一刻发这份素材" }。
+  "assetsToSend": [
+    { "assetId": "只能填上方「可发送素材」清单里出现的 id，禁止编造", "reason": "选这份素材的运营理由" }
+  ],
+
   // ── 决策墙请示（escalationRequest，可选；不需要时整个字段省略） ──
   // escalationRequest：仅当你判断本轮遇到"决策墙"（超出你的职权/能力，需要幕后领导拍板）时输出；否则整个字段省略或 needed=false。
   // 判定按"事项实质"，不是客户嘴上"要换人对接"——客户嘴上要换人但事项你能处理，就继续自己处理，不要 escalate。
@@ -1207,6 +1214,11 @@ fn prompt_specs() -> Vec<PromptSpec> {
 - riskLevel/knowledgeNeed/runMode/autonomyMode 必须严格使用上面列出的枚举值（小写，下划线）。
 - consolidationNeeded=true 或 riskLevel=high 或 knowledgeNeed in [required, insufficient] 视为关键变化轮，R1.3 七字段每个 ≥ 20 unicode 字符且不得使用 'unchanged'；whyShouldReply/whySkipReply 命中那一个 ≥ 30 unicode 字符 + ≥ 12 汉字。
 - riskLevel=low + knowledgeNeed=not_required + consolidationNeeded=false 视为低风险常规轮，R1.3 七字段允许 'unchanged' 短形式，但 knowledgeNeedReason / selfCritique 仍需 ≥ 6 unicode 字符。
+- 【素材文件发送】上下文若给出「可发送素材」清单，你可按需选择文件发给客户，写进 assetsToSend（[{assetId, reason}]）。规则：
+  - 没有契合当前客户阶段与问题的素材，就不发（assetsToSend 留空数组或省略），不要为发而发。
+  - 选了「表达:file_primary（文件为主）」的素材：replyText 只做一句简短引导（如"给您发份报价单"），不要把文件内容用文字再复述一遍。
+  - 选了「表达:file_support（文件佐证）」的素材：replyText 正常回答，文件作为佐证补充。
+  - 只能选清单里列出的 assetId，禁止编造；清单外的 id 会被系统丢弃。
 上下文由系统在本模板后注入。你必须只输出上述 JSON。"#,
         },
         PromptSpec {

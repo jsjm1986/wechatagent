@@ -626,6 +626,18 @@ async fn clear_awaiting_principal_state(state: &AppState, contact: &Contact) -> 
     Ok(())
 }
 
+/// media-asset Task 8：素材发送相对文本回复的定序。当前两种 expression_pref
+/// （file_primary / file_support）都先发一句文字引导、文件随后（先文字后文件）；
+/// 抽成纯函数留扩展点——若后续想让 file_primary 改成先发文件，只改这一处。
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum SendOrder {
+    TextThenMedia,
+}
+
+pub(crate) fn media_send_order(_expression_pref: &str) -> SendOrder {
+    SendOrder::TextThenMedia
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_user_operation_gateway_inner(
     state: &AppState,
@@ -1858,6 +1870,150 @@ async fn run_user_operation_gateway_inner(
             .ok();
             // 返回首个失败错误供上层观测（已入队段不回滚，照常发出）。
             return Err(enqueue_errors.into_iter().next().map(|(_, e)| e).unwrap());
+        }
+    }
+    // media-asset Task 8：素材文件发送。文本回复已在上方先入 outbox（先文字后文件），
+    // 这里把 final_decision.assets_to_send 逐个转成独立媒体 outbox 条目。仅在决策达到
+    // approved 终态时执行（与文本 outbox_eligible 同源的 final_status 门）；每条做
+    // approved+sendable+合法 media_type 二次准入校验（防 AI 幻觉出未审素材），非法
+    // assetId 跳过 + 审计；requires_principal_approval=true 的不直接发，走现有 escalation
+    // 请示通道（拿回结论后由领导决策路径决定是否发）。
+    let media_eligible = final_status == "approved" || final_status == "revision_applied_approved";
+    if media_eligible && !final_decision.assets_to_send.is_empty() {
+        let media_source_event_id = match &trigger {
+            AgentTrigger::Inbound(msg) => msg.message_id.clone().unwrap_or_default(),
+            AgentTrigger::FollowUp(task) => task.id.map(|id| id.to_hex()).unwrap_or_default(),
+        };
+        for directive in &final_decision.assets_to_send {
+            // 准入二次校验：必须是合法 ObjectId + approved + sendable + 合法 media_type。
+            let oid = match ObjectId::parse_str(&directive.asset_id) {
+                Ok(o) => o,
+                Err(_) => {
+                    write_event_for_account(
+                        state,
+                        &contact.account_id,
+                        Some(&contact.wxid),
+                        "media_asset_id_invalid",
+                        "warning",
+                        "AI 选材给出非法 assetId（非 ObjectId），已跳过不发",
+                        Some(doc! { "run_id": &run_id, "asset_id": &directive.asset_id }),
+                    )
+                    .await
+                    .ok();
+                    continue;
+                }
+            };
+            let asset = state
+                .db
+                .content_assets()
+                .find_one(doc! { "_id": oid }, None)
+                .await?;
+            let asset = match asset {
+                Some(a) if super::media_send::validate_asset_sendable(&a) => a,
+                _ => {
+                    write_event_for_account(
+                        state,
+                        &contact.account_id,
+                        Some(&contact.wxid),
+                        "media_asset_rejected",
+                        "warning",
+                        "AI 选材指向不存在/未审/不可发素材，已跳过不发（防幻觉）",
+                        Some(doc! { "run_id": &run_id, "asset_id": &directive.asset_id }),
+                    )
+                    .await
+                    .ok();
+                    continue;
+                }
+            };
+            // requires_principal_approval=true 的素材不直接发：走现有 escalation 请示通道，
+            // 由领导拿回结论后的决策路径决定是否发。此处仅入请示 + 审计，不入 outbox。
+            if asset.requires_principal_approval == Some(true) {
+                let escalation_req = crate::models::EscalationRequest {
+                    needed: true,
+                    category: Some(
+                        crate::models::ESCALATION_CATEGORY_OUT_OF_SCOPE.to_string(),
+                    ),
+                    reason: Some(format!(
+                        "素材《{}》标记为需领导核准后才能发送给客户",
+                        asset.title
+                    )),
+                    question_for_principal: Some(format!(
+                        "是否同意把素材《{}》发给该客户？",
+                        asset.title
+                    )),
+                    self_serviceable_part: None,
+                    is_generalizable: false,
+                };
+                if let Err(err) =
+                    trigger_principal_escalation(state, &contact, &escalation_req).await
+                {
+                    tracing::warn!(
+                        contact_wxid = %contact.wxid,
+                        asset_id = %directive.asset_id,
+                        error = %err,
+                        "媒体素材请示推送失败（降级不阻断 run）"
+                    );
+                }
+                write_event_for_account(
+                    state,
+                    &contact.account_id,
+                    Some(&contact.wxid),
+                    "media_asset_escalated",
+                    "info",
+                    "素材需领导核准，已入请示通道（未直接发）",
+                    Some(doc! { "run_id": &run_id, "asset_id": &directive.asset_id }),
+                )
+                .await
+                .ok();
+                continue;
+            }
+            // 定序：当前所有 expression_pref 都「先文字后文件」（媒体追加在文本之后）。
+            let _ = media_send_order(asset.expression_pref.as_deref().unwrap_or("file_support"));
+            let enqueue_req = EnqueueRequest {
+                workspace_id: contact.workspace_id.clone(),
+                account_id: contact.account_id.clone(),
+                contact_wxid: contact.wxid.clone(),
+                run_id: run_id.clone(),
+                decision_id: Some(decision_review_id),
+                source_event_id: media_source_event_id.clone(),
+                source_kind: trigger.kind().to_string(),
+                content: String::new(), // 媒体条目允许空 content
+                media_asset_id: Some(directive.asset_id.clone()),
+                max_attempts: 3,
+            };
+            match outbox_enqueue(state, enqueue_req).await {
+                Ok(EnqueueOutcome::Created { outbox_id, .. }) => {
+                    tracing::info!(
+                        %run_id,
+                        %outbox_id,
+                        contact_wxid = %contact.wxid,
+                        asset_id = %directive.asset_id,
+                        "media outbox enqueued"
+                    );
+                }
+                Ok(EnqueueOutcome::IdempotentSkip { idempotency_key }) => {
+                    tracing::info!(
+                        %run_id,
+                        %idempotency_key,
+                        asset_id = %directive.asset_id,
+                        "media outbox enqueue idempotent skip"
+                    );
+                }
+                Err(err) => {
+                    tracing::error!(?err, %run_id, asset_id = %directive.asset_id, "media outbox enqueue failed");
+                    write_event_for_account(
+                        state,
+                        &contact.account_id,
+                        Some(&contact.wxid),
+                        "media_outbox_enqueue_failed",
+                        "error",
+                        "素材入 outbox 失败（文本已照常发出，素材缺失需管理员核对）",
+                        Some(doc! { "run_id": &run_id, "asset_id": &directive.asset_id }),
+                    )
+                    .await
+                    .ok();
+                }
+            }
         }
     }
     // 决策请示触发（统一占位模型）：占位 reply 已入 outbox 正常发给客户，
@@ -3762,6 +3918,20 @@ pub(crate) fn compute_taxonomy_guard_outcome(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // media-asset Task 8：素材发送定序纯函数。当前两种 expression_pref 都「先文字后文件」。
+    #[test]
+    fn file_primary_sends_text_then_file() {
+        assert_eq!(media_send_order("file_primary"), SendOrder::TextThenMedia);
+    }
+    #[test]
+    fn file_support_sends_text_then_file() {
+        assert_eq!(media_send_order("file_support"), SendOrder::TextThenMedia);
+    }
+    #[test]
+    fn media_send_order_unknown_pref_defaults_text_then_media() {
+        assert_eq!(media_send_order(""), SendOrder::TextThenMedia);
+    }
 
     #[test]
     fn extract_relationship_type_suggestion_picks_kind() {

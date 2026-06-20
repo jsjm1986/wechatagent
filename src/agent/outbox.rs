@@ -187,7 +187,15 @@ pub async fn enqueue(state: &AppState, req: EnqueueRequest) -> Result<EnqueueOut
     // 24h 内只发一次（足以避免双击 + 不挡明天的合理重发）。其他 source_kind
     // 仍用 run_id 兜底，保持既有契约。
     let day_bucket = now.timestamp_millis() / (24 * 60 * 60 * 1000);
-    let (idempotency_key, used_synthetic) = if req.source_event_id.trim().is_empty() {
+    // media-asset Task 8（硬伤③ 方案甲）：媒体条目（media_asset_id 有值）**一律**走
+    // synthetic_media 形态，忽略 source_event_id 分支。否则 webhook 入站触发时
+    // source_event_id 非空 → 走 `{source_event_id}:{contact}:{content_hash}` 分支，
+    // 媒体 content 为空 → content_hash=sha256("") 对所有素材相同 → 同一入站发两个
+    // 不同文件会撞键、第二个被误去重漏发。media_routes_synthetic 把该判定抽成纯函数。
+    let (idempotency_key, used_synthetic) = if media_routes_synthetic(
+        &req.media_asset_id,
+        &req.source_event_id,
+    ) {
         let key = compute_synthetic_key(
             &req.source_kind,
             &req.account_id,
@@ -409,6 +417,19 @@ pub(crate) fn compute_synthetic_key(
 /// 纯文本条目仍要求 content 非空。
 pub(crate) fn content_required_for(media_asset_id: &Option<String>) -> bool {
     media_asset_id.is_none()
+}
+
+/// media-asset Task 8（硬伤③ 方案甲）：判定本条 enqueue 是否应走 synthetic 路径。
+///
+/// - 媒体条目（`media_asset_id` 有值）：**一律** synthetic（key 含 asset_id），
+///   与 `source_event_id` 是否为空无关。否则非空 source_event_id 路径的 key 不含
+///   asset_id、媒体 content 为空 → 同一入站发两个不同文件撞键漏发第二个。
+/// - 纯文本条目：仅在 `source_event_id` 为空时走 synthetic（保持旧契约）。
+pub(crate) fn media_routes_synthetic(
+    media_asset_id: &Option<String>,
+    source_event_id: &str,
+) -> bool {
+    media_asset_id.is_some() || source_event_id.trim().is_empty()
 }
 
 /// 重试 backoff 计算（R13.5）。
@@ -737,6 +758,72 @@ mod tests {
     fn media_entry_allows_empty_content() {
         assert!(content_required_for(&None)); // 纯文本 → 需要 content
         assert!(!content_required_for(&Some("aid".to_string()))); // 媒体 → 不需要
+    }
+
+    /// media-asset Task 8（硬伤③ 方案甲）：媒体条目无论 source_event_id 是否为空都走
+    /// synthetic；纯文本条目仅在 source_event_id 为空时走 synthetic。
+    #[test]
+    fn media_routes_synthetic_ignores_source_event_id() {
+        // 媒体条目：非空 source_event_id 也走 synthetic（key 才会含 asset_id）。
+        assert!(media_routes_synthetic(&Some("aid".to_string()), "evt_1"));
+        assert!(media_routes_synthetic(&Some("aid".to_string()), ""));
+        // 纯文本条目：非空 source_event_id 走非 synthetic；空才 synthetic。
+        assert!(!media_routes_synthetic(&None, "evt_1"));
+        assert!(media_routes_synthetic(&None, ""));
+    }
+
+    /// media-asset Task 8（硬伤③ 关键回归）：同一**非空** source_event_id + 同 run +
+    /// 两个不同 asset_id，最终 idempotency_key 必须不同（两条都能入队、不被误去重），
+    /// 且同 asset_id 仍共享 key（防双发同一文件）。
+    ///
+    /// 这里复刻 `enqueue` 计算 idempotency_key 的完整路径（media_routes_synthetic →
+    /// compute_synthetic_key → sha256_hex），不依赖 mongo testcontainers；
+    /// 端到端"两条都真的写进集合"留给 #[ignore] 集成测试（Task 11）。
+    #[test]
+    fn media_entries_same_source_event_distinct_assets_do_not_collide() {
+        let source_event_id = "evt_inbound_42"; // 非空：webhook 入站触发
+        let run_id = "run_x";
+        let contact = "wxid_alice";
+        let media_content_hash = sha256_hex(b""); // 媒体条目 content 为空
+
+        let key_for = |asset_id: &str| -> String {
+            let media_asset_id = Some(asset_id.to_string());
+            assert!(
+                media_routes_synthetic(&media_asset_id, source_event_id),
+                "媒体条目必须走 synthetic 路径"
+            );
+            let synthetic = compute_synthetic_key(
+                "wechat_inbound",
+                "acct_1",
+                contact,
+                run_id,
+                &media_content_hash,
+                12345,
+                media_asset_id.as_deref(),
+            );
+            sha256_hex(synthetic.as_bytes())
+        };
+
+        let key_a = key_for("asset_a");
+        let key_b = key_for("asset_b");
+        assert_ne!(
+            key_a, key_b,
+            "同一非空 source_event_id 下两个不同 asset_id 必须产生不同 idempotency_key，否则第二个文件被误去重漏发"
+        );
+        // 同 asset_id 仍共享 key（幂等防双发同一文件）。
+        assert_eq!(key_a, key_for("asset_a"));
+
+        // 对照：若错误地走了非 synthetic 分支（旧 bug），两个素材会撞键。
+        let buggy_key_a = sha256_hex(
+            format!("{}:{}:{}", source_event_id, contact, media_content_hash).as_bytes(),
+        );
+        let buggy_key_b = sha256_hex(
+            format!("{}:{}:{}", source_event_id, contact, media_content_hash).as_bytes(),
+        );
+        assert_eq!(
+            buggy_key_a, buggy_key_b,
+            "证伪：非 synthetic 分支两个不同素材会撞键——方案甲正是为绕开此分支"
+        );
     }
 
     /// Task 6（幂等硬伤③）：媒体条目 content 为空 → `sha256("")` 对所有素材相同，

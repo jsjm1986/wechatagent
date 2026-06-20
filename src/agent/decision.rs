@@ -296,6 +296,24 @@ pub(crate) async fn decide_reply_with_promote(
         }),
     };
     let assets = load_context_assets(state, &contact.account_id).await?;
+    // media-asset Task 8：加载可发送素材（sendable+approved）→ 按当前客户阶段过滤候选
+    // → 渲染成清单注入 prompt，供 Reply Agent 选材输出 assetsToSend。best-effort：DB
+    // 故障 → 空清单（不发素材、不阻塞决策，同 reaction_hint / operator_memory 路径）。
+    // customer_stage 取 contact.domain_attributes（与下方画像段同源），缺失 = None →
+    // 只命中 target_stages 为空/全阶段的素材。
+    let sendable_assets = load_sendable_assets(state, &contact.account_id)
+        .await
+        .unwrap_or_default();
+    let current_customer_stage = contact
+        .domain_attributes
+        .as_ref()
+        .and_then(|doc| doc.get_str("customer_stage").ok())
+        .map(|s| s.to_string());
+    let sendable_candidates = super::media_send::filter_sendable_candidates(
+        &sendable_assets,
+        current_customer_stage.as_deref(),
+    );
+    let sendable_candidates_text = super::media_send::render_candidate_lines(&sendable_candidates);
     // H12：运营方法论本体回落链 = profile.methodology_override(非空白) ?? contact 绑定
     // playbook ?? 内置兜底。DEFAULT_PROFILE 的 methodology_override=None → 走 playbook +
     // 兜底，与改造前逐字等价。methodology_override 为 Some 时整体替换「当前运营方法」段。
@@ -602,6 +620,7 @@ pub(crate) async fn decide_reply_with_promote(
 自由画像字段: {}
 可引用内容资产:
 {}
+{}
 未完成跟进:
 {}
 
@@ -665,6 +684,7 @@ pub(crate) async fn decide_reply_with_promote(
         contact.follow_up_policy.clone().unwrap_or_default(),
         serde_json::to_string(&contact.profile_attributes).unwrap_or_default(),
         assets,
+        sendable_candidates_text,
         task_text,
         history,
         crate::agent::prompt_isolation::isolate_untrusted(&inbound.content)
@@ -1020,6 +1040,43 @@ pub(crate) async fn load_published_soul(
         )
         .await?;
     Ok(soul.map(|item| item.content))
+}
+
+/// media-asset Task 8：加载本 workspace + account 下「可发送素材」（sendable +
+/// approved 的媒体资产），供 Reply Agent 选材。与 [`load_context_assets`] 的 query
+/// 风格一致，但过滤条件是发送准入硬门（draft / 不可发 / 老朋友圈行不会进候选）。
+/// best-effort 由调用方处理（DB 故障时空清单 → 不发素材，不阻塞决策）。
+pub(crate) async fn load_sendable_assets(
+    state: &AppState,
+    account_id: &str,
+) -> AppResult<Vec<crate::models::ContentAsset>> {
+    use futures::TryStreamExt;
+    use mongodb::bson::doc;
+    use mongodb::options::FindOptions;
+    let mut cursor = state
+        .db
+        .content_assets()
+        .find(
+            doc! {
+                "workspace_id": &state.config.default_workspace_id,
+                "$or": [
+                    { "account_id": null },
+                    { "account_id": account_id }
+                ],
+                "sendable": true,
+                "review_status": "approved",
+            },
+            FindOptions::builder()
+                .sort(doc! { "updated_at": -1 })
+                .limit(30)
+                .build(),
+        )
+        .await?;
+    let mut out = Vec::new();
+    while let Some(asset) = cursor.try_next().await? {
+        out.push(asset);
+    }
+    Ok(out)
 }
 
 pub(crate) async fn load_context_assets(state: &AppState, account_id: &str) -> AppResult<String> {
