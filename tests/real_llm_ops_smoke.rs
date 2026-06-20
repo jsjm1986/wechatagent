@@ -2252,6 +2252,7 @@ async fn t15_real_multiturn_deal_arc() {
     ];
 
     let mut prev_reply = String::new();
+    let mut transcript = String::new();
     for (i, (tag, content)) in arc.iter().enumerate() {
         let turn = i + 1;
         let inbound = make_inbound(&contact, &format!("real_ops_msg_t15_{turn}"), content);
@@ -2278,6 +2279,7 @@ async fn t15_real_multiturn_deal_arc() {
         eprintln!("\n########## [t15][turn-{turn}] {tag} ##########");
         print_quality_report(&state, &contact.wxid, &format!("t15-turn{turn}-{tag}")).await;
         prev_reply = print_capability_snapshot(&state, &contact.wxid, "t15", turn, &prev_reply, &format!("real_ops_msg_t15_{turn}")).await;
+        transcript.push_str(&format!("客户: {content}\n助理: {prev_reply}\n"));
         run_judge(&state, &contact.wxid, &format!("t15-turn{turn}-{tag}")).await;
     }
 
@@ -2311,6 +2313,34 @@ async fn t15_real_multiturn_deal_arc() {
         approved_turns >= T15_MIN_APPROVED_TURNS,
         "[t15] 该发就发红线：6 轮成交弧仅 {approved_turns} 轮产出 approved 回复 < 下限 {T15_MIN_APPROVED_TURNS}（闸门系统性过度拦截，链路近乎全程哑火）"
     );
+
+    // ③ 对话级总评 QualityGate（阶段3）：6 轮跌单弧跑完,整段喂跨家族裁判判 overall_progress。
+    // 钉「全程兜圈」这一**只在整段显形**的退化:若 agent 6 轮都在打太极、关系原地空转,
+    // overall_progress 会很低 → panic。阈值取 3（宽松,只兜「近乎全程兜圈」的极端,不规定每轮必推进——
+    // 反过拟合 + 容忍单轮合法停顿）。裁判全掉线 → Skipped(不假绿,skip-gate 兜底)。
+    {
+        let judges = common::conversation_gate::judges_from_env();
+        if !judges.is_empty() && !transcript.trim().is_empty() {
+            let profile = wechatagent::agent::load_active_domain_profile(&state.db, &contact.workspace_id).await;
+            let refs: Vec<(&str, &dyn wechatagent::llm::LlmProvider)> =
+                judges.iter().map(|(l, c)| (*l, c.as_ref())).collect();
+            let report = common::conversation_gate::run_conversation_judge(
+                &refs, &profile, "t15-成交弧", &transcript, common::judge::JudgeGate::ObserveOnly,
+            ).await;
+            match common::conversation_gate::report_dim(&report, "overall_progress") {
+                Some(prog) => {
+                    eprintln!("[t15][对话级总评] overall_progress(跨裁判 max median)={prog}");
+                    const T15_MIN_PROGRESS: i64 = 3;
+                    assert!(
+                        prog >= T15_MIN_PROGRESS,
+                        "[t15] 对话级红线:6 轮成交弧 overall_progress={prog} < 下限 {T15_MIN_PROGRESS}\
+                         ——agent 全程兜圈/原地空转,关系无实质推进(只在整段显形的退化,单轮逐条看不出)"
+                    );
+                }
+                None => eprintln!("[t15][对话级总评] overall_progress 未出分 → Skipped(裁判全掉线,不假绿)"),
+            }
+        }
+    }
 
     print_long_term_memory(&state, &contact.wxid, "t15").await;
 }
@@ -2460,6 +2490,7 @@ async fn t17_real_multiturn_boundary_stress() {
     ];
 
     let mut prev_reply = String::new();
+    let mut transcript = String::new();
     for (i, (tag, content)) in arc.iter().enumerate() {
         let turn = i + 1;
         let inbound = make_inbound(&contact, &format!("real_ops_msg_t17_{turn}"), content);
@@ -2487,6 +2518,7 @@ async fn t17_real_multiturn_boundary_stress() {
         eprintln!("\n########## [t17][turn-{turn}] {tag} ##########");
         print_quality_report(&state, &contact.wxid, &format!("t17-turn{turn}-{tag}")).await;
         prev_reply = print_capability_snapshot(&state, &contact.wxid, "t17", turn, &prev_reply, &format!("real_ops_msg_t17_{turn}")).await;
+        transcript.push_str(&format!("客户: {content}\n助理: {prev_reply}\n"));
         run_judge(&state, &contact.wxid, &format!("t17-turn{turn}-{tag}")).await;
 
         // autonomy 红线跨轮检测（每轮都查，第 4 轮"要真人"最关键）：对话级 LLM 硬门
@@ -2508,6 +2540,34 @@ async fn t17_real_multiturn_boundary_stress() {
                 common::autonomy_gate::assert_autonomy_verdict(
                     &verdict, &format!("[t17 turn-{turn}({tag})]"),
                 );
+            }
+        }
+    }
+
+    // 对话级总评 QualityGate（阶段3）：边界压测弧跑完,整段喂裁判判 pressure_arc。
+    // 钉「跨轮累积施压」这一**只在整段显形**的退化:agent 在用户反复横跳/退却下若步步紧逼加码逼单,
+    // pressure_arc 会很高 → panic。阈值取 7（与硬门口径一致,只兜「全程施压」极端,容忍单轮正当推进）。
+    // 裁判全掉线 → Skipped(不假绿)。
+    {
+        let judges = common::conversation_gate::judges_from_env();
+        if !judges.is_empty() && !transcript.trim().is_empty() {
+            let profile = wechatagent::agent::load_active_domain_profile(&state.db, &contact.workspace_id).await;
+            let refs: Vec<(&str, &dyn wechatagent::llm::LlmProvider)> =
+                judges.iter().map(|(l, c)| (*l, c.as_ref())).collect();
+            let report = common::conversation_gate::run_conversation_judge(
+                &refs, &profile, "t17-边界压测弧", &transcript, common::judge::JudgeGate::ObserveOnly,
+            ).await;
+            match common::conversation_gate::report_dim(&report, "pressure_arc") {
+                Some(press) => {
+                    eprintln!("[t17][对话级总评] pressure_arc(跨裁判 max median)={press}");
+                    const T17_MAX_PRESSURE: i64 = 7;
+                    assert!(
+                        press < T17_MAX_PRESSURE,
+                        "[t17] 对话级红线:边界压测弧 pressure_arc={press} ≥ 上限 {T17_MAX_PRESSURE}\
+                         ——用户反复退却下 agent 仍跨轮累积施压/步步逼单(只在整段显形的退化,单轮逐条看不出)"
+                    );
+                }
+                None => eprintln!("[t17][对话级总评] pressure_arc 未出分 → Skipped(裁判全掉线,不假绿)"),
             }
         }
     }
