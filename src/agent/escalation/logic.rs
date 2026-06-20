@@ -246,17 +246,21 @@ pub(crate) fn build_decision_signals_text(
     lines.join("\n")
 }
 
-/// 被风险闸门 hold 的件是否要升级请示领导（纯函数，业务判定，便于单测）。
-/// `blocked_status` 是网关 hold 分支算出的终态字面量（见 review::GatewayStatusFinal::gateway_status_str）。
-/// 取舍（已拍板）：安全门/未验证产品声明无条件升级（这两类是"不敢答"的硬风险，领导必须知道）；
-/// ai_policy 仅 All 模式升级（保守默认 DecisionOnly 下，策略性暂缓不打扰领导）；
-/// 等待更多上下文 / 必填缺失 / 预算超额 / context_changed 一律不升级（不是决策墙，是 AI 自身可恢复的状态）。
-pub(crate) fn should_escalate_held(blocked_status: &str, mode: HighRiskEscalationMode) -> bool {
+/// 被风险闸门 hold 的件是否要升级请示领导。由 ResolvedAskHumanPolicy 的逐类别开关驱动。
+/// 取舍：安全门/未验证产品声明默认升级（escalate_safety_guard/escalate_unverified_product，
+/// 默认 true）；ai_policy 仅 escalate_ai_policy_hold=true 时升级；其它终态（等待上下文/必填
+/// 缺失/预算/context_changed）一律不升级（非决策墙）。
+pub(crate) fn should_escalate_held(
+    blocked_status: &str,
+    policy: &crate::agent::escalation::ResolvedAskHumanPolicy,
+) -> bool {
     match blocked_status {
-        s if s == crate::agent::types::HOLD_CATEGORY_BLOCKED_BY_SAFETY_GUARD => true,
-        "blocked_unverified_product_claim" => true,
+        s if s == crate::agent::types::HOLD_CATEGORY_BLOCKED_BY_SAFETY_GUARD => {
+            policy.escalate_safety_guard
+        }
+        "blocked_unverified_product_claim" => policy.escalate_unverified_product,
         s if s == crate::agent::types::HOLD_CATEGORY_HELD_BY_AI_POLICY => {
-            mode == HighRiskEscalationMode::All
+            policy.escalate_ai_policy_hold
         }
         _ => false,
     }
@@ -645,6 +649,20 @@ mod tests {
         assert!(relay_output_leaks_internal_payload("constraints=本周付款"));
     }
 
+    fn policy_with(ai_policy: bool) -> crate::agent::escalation::ResolvedAskHumanPolicy {
+        crate::agent::escalation::ResolvedAskHumanPolicy {
+            decider_chain: vec![],
+            escalate_safety_guard: true,
+            escalate_unverified_product: true,
+            escalate_ai_policy_hold: ai_policy,
+            escalate_stuck: true,
+            dedupe_window_hours: None,
+            daily_push_cap: None,
+            quiet_hours: None,
+            timeout_hours: None,
+        }
+    }
+
     fn traj_entry(intent: &str) -> crate::models::IntentTrajectoryEntry {
         crate::models::IntentTrajectoryEntry {
             turn_index: 0,
@@ -769,56 +787,28 @@ mod tests {
     #[test]
     fn should_escalate_held_safety_guard_unconditional() {
         use crate::agent::types::HOLD_CATEGORY_BLOCKED_BY_SAFETY_GUARD;
-        // 安全门：两种模式都升级。
-        assert!(should_escalate_held(
-            HOLD_CATEGORY_BLOCKED_BY_SAFETY_GUARD,
-            HighRiskEscalationMode::DecisionOnly
-        ));
-        assert!(should_escalate_held(
-            HOLD_CATEGORY_BLOCKED_BY_SAFETY_GUARD,
-            HighRiskEscalationMode::All
-        ));
+        assert!(should_escalate_held(HOLD_CATEGORY_BLOCKED_BY_SAFETY_GUARD, &policy_with(false)));
+        assert!(should_escalate_held(HOLD_CATEGORY_BLOCKED_BY_SAFETY_GUARD, &policy_with(true)));
     }
 
     #[test]
     fn should_escalate_held_unverified_product_unconditional() {
-        // 未验证产品声明：两种模式都升级。
-        assert!(should_escalate_held(
-            "blocked_unverified_product_claim",
-            HighRiskEscalationMode::DecisionOnly
-        ));
-        assert!(should_escalate_held(
-            "blocked_unverified_product_claim",
-            HighRiskEscalationMode::All
-        ));
+        assert!(should_escalate_held("blocked_unverified_product_claim", &policy_with(false)));
+        assert!(should_escalate_held("blocked_unverified_product_claim", &policy_with(true)));
     }
 
     #[test]
-    fn should_escalate_held_ai_policy_only_in_all_mode() {
+    fn should_escalate_held_ai_policy_only_when_enabled() {
         use crate::agent::types::HOLD_CATEGORY_HELD_BY_AI_POLICY;
-        // 策略性暂缓：仅 All 模式升级，保守 DecisionOnly 不打扰领导。
-        assert!(should_escalate_held(
-            HOLD_CATEGORY_HELD_BY_AI_POLICY,
-            HighRiskEscalationMode::All
-        ));
-        assert!(!should_escalate_held(
-            HOLD_CATEGORY_HELD_BY_AI_POLICY,
-            HighRiskEscalationMode::DecisionOnly
-        ));
+        assert!(should_escalate_held(HOLD_CATEGORY_HELD_BY_AI_POLICY, &policy_with(true)));
+        assert!(!should_escalate_held(HOLD_CATEGORY_HELD_BY_AI_POLICY, &policy_with(false)));
     }
 
     #[test]
     fn should_escalate_held_waiting_context_never() {
         use crate::agent::types::HOLD_CATEGORY_AI_WAITING_FOR_MORE_CONTEXT;
-        // 等待更多上下文：不是决策墙，是 AI 自身可恢复状态，永不升级。
-        assert!(!should_escalate_held(
-            HOLD_CATEGORY_AI_WAITING_FOR_MORE_CONTEXT,
-            HighRiskEscalationMode::All
-        ));
-        assert!(!should_escalate_held(
-            HOLD_CATEGORY_AI_WAITING_FOR_MORE_CONTEXT,
-            HighRiskEscalationMode::DecisionOnly
-        ));
+        assert!(!should_escalate_held(HOLD_CATEGORY_AI_WAITING_FOR_MORE_CONTEXT, &policy_with(true)));
+        assert!(!should_escalate_held(HOLD_CATEGORY_AI_WAITING_FOR_MORE_CONTEXT, &policy_with(false)));
     }
 
     #[test]
@@ -829,11 +819,8 @@ mod tests {
             "blocked_by_budget",
             "context_changed",
         ] {
-            assert!(!should_escalate_held(s, HighRiskEscalationMode::All), "{s} 不应升级");
-            assert!(
-                !should_escalate_held(s, HighRiskEscalationMode::DecisionOnly),
-                "{s} 不应升级"
-            );
+            assert!(!should_escalate_held(s, &policy_with(true)), "{s} 不应升级");
+            assert!(!should_escalate_held(s, &policy_with(false)), "{s} 不应升级");
         }
     }
 

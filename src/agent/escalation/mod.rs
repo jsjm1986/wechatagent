@@ -45,9 +45,24 @@ pub(crate) async fn escalate_held_decision(
     domain_config: Option<&OperationDomainConfig>,
     blocked_status: &str,
 ) -> AppResult<()> {
-    let mode =
-        parse_high_risk_mode(domain_config.and_then(|c| c.high_risk_escalation_mode.as_deref()));
-    if !should_escalate_held(blocked_status, mode) {
+    let policy = match domain_config {
+        Some(cfg) => crate::agent::escalation::resolve_ask_human_policy(cfg),
+        // domain_config 缺省时保持旧行为字节等价：parse_high_risk_mode(None)=DecisionOnly,
+        // 即 safety/product/stuck 升级、ai_policy 不升级。真正的「是否启用请示」由下方
+        // principal_decider_wxid 的 DB 查询兜住(无决策人则 return Ok)。故此处不可短路 return。
+        None => crate::agent::escalation::ResolvedAskHumanPolicy {
+            decider_chain: vec![],
+            escalate_safety_guard: true,
+            escalate_unverified_product: true,
+            escalate_ai_policy_hold: false,
+            escalate_stuck: true,
+            dedupe_window_hours: None,
+            daily_push_cap: None,
+            quiet_hours: None,
+            timeout_hours: None,
+        },
+    };
+    if !should_escalate_held(blocked_status, &policy) {
         return Ok(());
     }
     let Some(principal_wxid) =
