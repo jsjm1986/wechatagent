@@ -122,9 +122,13 @@ async fn ensure_media_uploaded(state: &AppState, asset: &ContentAsset) -> AppRes
         .ok_or_else(|| AppError::External("media_upload_base64 no mediaId".into()))?
         .to_string();
 
-    // 回写缓存（best-effort：失败不阻断发送，下次仍可命中重传分支）。
+    // 回写缓存：**失败即传播错误、绝不继续发送**。崩溃恢复 (`media_already_succeeded`)
+    // 依赖不变式「asset.media_id == None ⇒ 从未发出过 ⇒ 可放行重发」。若此处 best-effort
+    // 吞掉回写失败，则会出现「MCP send 成功(文件已送达) 但 media_id 没存上」的状态：
+    // 重试时 recovery 读到 media_id 仍为 None → 误判没发过 → 重发，客户收到重复文件。
+    // 故宁可这次不发（下次重试会重新上传+回写），也不让「已发未存」状态出现。
     if let Some(oid) = asset.id {
-        let _ = state
+        state
             .db
             .content_assets()
             .update_one(
@@ -132,7 +136,10 @@ async fn ensure_media_uploaded(state: &AppState, asset: &ContentAsset) -> AppRes
                 doc! { "$set": { "media_id": &media_id, "updated_at": now } },
                 None,
             )
-            .await;
+            .await
+            .map_err(|e| {
+                AppError::External(format!("persist media_id failed (abort send to avoid dup): {e}"))
+            })?;
     }
     Ok(media_id)
 }
