@@ -31,6 +31,7 @@ use crate::models::AgentTask;
 
 pub async fn build_initial_operation_profile(
     state: &AppState,
+    workspace_id: &str,
     note: &str,
     playbook: Option<&OperationPlaybook>,
 ) -> AppResult<GeneratedOperationProfile> {
@@ -38,7 +39,7 @@ pub async fn build_initial_operation_profile(
         "未配置运营方法。请根据运营备注自由生成克制、真实、可执行的运营画像。".to_string()
     });
     let domain_config =
-        load_user_operation_domain_config(state, &state.config.default_workspace_id).await?;
+        load_user_operation_domain_config(state, workspace_id).await?;
     let domain_text = domain_config
         .as_ref()
         .map(format_operation_domain_config_for_prompt)
@@ -51,7 +52,7 @@ pub async fn build_initial_operation_profile(
     // DEFAULT 销售域 prompt_fragment=None → 空串、prompt 字节等价（反过拟合护栏）。
     let active_profile = super::domain_profile::load_active_domain_profile(
         &state.db,
-        &state.config.default_workspace_id,
+        workspace_id,
     )
     .await;
     let business_context = render_business_context_fragment(
@@ -60,13 +61,13 @@ pub async fn build_initial_operation_profile(
     );
     let system = prompts::load_prompt(
         &state.db,
-        &state.config.default_workspace_id,
+        workspace_id,
         "user.initial_profile.system",
     )
     .await?;
     let task_template = prompts::load_prompt(
         &state.db,
-        &state.config.default_workspace_id,
+        workspace_id,
         "user.initial_profile.task",
     )
     .await?;

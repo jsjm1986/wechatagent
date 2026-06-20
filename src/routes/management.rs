@@ -741,7 +741,7 @@ pub(super) async fn execute_management_tool(
             let playbook_id = planned.arguments.get("playbookId").and_then(Value::as_str);
             let playbook = resolve_playbook_for_contact(state, workspace_id, account_id, playbook_id).await?;
             let generated =
-                agent::build_initial_operation_profile(state, &note, Some(&playbook)).await?;
+                agent::build_initial_operation_profile(state, workspace_id, &note, Some(&playbook)).await?;
             let commitments_bson = commitments_with_optional_text(
                 &contact.commitments,
                 generated.last_commitment.as_deref(),
