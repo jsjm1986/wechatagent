@@ -1283,17 +1283,23 @@ jobs:
     timeout-minutes: 90
     env:
       REAL_LLM_API_KEY: ${{ secrets.RSXERMU_KEY }}
+      ROLEPLAYER_API_KEY: ${{ secrets.NVIDIA_KEY }}
     steps:
       - name: Require REAL_LLM_API_KEY (R0.1 缺 key 真 fail，不假绿)
         if: ${{ env.REAL_LLM_API_KEY == '' }}
         run: |
           echo "::error::REAL_LLM_API_KEY 未配置（secrets.RSXERMU_KEY 为空）。roleplayer 校准弧的 realism 裁判必须有 key 才能真跑——缺 key 直接 fail，不静默跳过假绿（R0.1）。"
           exit 1
+      - name: Require ROLEPLAYER_API_KEY (R0.1 缺第三族 key 真 fail，不假绿)
+        if: ${{ env.ROLEPLAYER_API_KEY == '' }}
+        run: |
+          echo "::error::ROLEPLAYER_API_KEY 未配置（secrets.NVIDIA_KEY 为空）。roleplayer 是第三异族（R5.0.1），缺 key 则 J3 校准弧 roleplayer 生成全 fallback=假绿——直接 fail，不静默跳过。"
+          exit 1
       - name: Checkout
         uses: actions/checkout@v4
 
       - name: Free disk space
-        if: ${{ env.REAL_LLM_API_KEY != '' }}
+        if: ${{ env.REAL_LLM_API_KEY != '' && env.ROLEPLAYER_API_KEY != '' }}
         run: |
           sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android \
             /usr/local/share/boost /usr/local/share/powershell \
@@ -1302,18 +1308,18 @@ jobs:
           df -h
 
       - name: Install Rust toolchain
-        if: ${{ env.REAL_LLM_API_KEY != '' }}
+        if: ${{ env.REAL_LLM_API_KEY != '' && env.ROLEPLAYER_API_KEY != '' }}
         uses: dtolnay/rust-toolchain@stable
 
       - name: Cache cargo registry / target
-        if: ${{ env.REAL_LLM_API_KEY != '' }}
+        if: ${{ env.REAL_LLM_API_KEY != '' && env.ROLEPLAYER_API_KEY != '' }}
         uses: Swatinem/rust-cache@v2
 
       # 裁判 = gpt-5.4（rsxermu /v1，judges_from_env 读 REAL_LLM_JUDGE_*）；roleplayer = NVIDIA
       # qwen（ROLEPLAYER_*，异端点不占 rsxermu 并发）。JUDGE_SAMPLES=1 守端点上限 2（realism
       # 裁判单裁判内 K=1，靠跨裁判 median-of-median）。roleplayer 生成三手法串行不并发。
       - name: cargo test --test real_llm_roleplayer_calibration (J3 校准)
-        if: ${{ env.REAL_LLM_API_KEY != '' }}
+        if: ${{ env.REAL_LLM_API_KEY != '' && env.ROLEPLAYER_API_KEY != '' }}
         env:
           RUSTFLAGS: ""
           REAL_LLM_JUDGE: "1"
@@ -1322,14 +1328,13 @@ jobs:
           REAL_LLM_JUDGE_BASE_URL: https://rsxermu666.cn/v1
           REAL_LLM_JUDGE_MODEL: gpt-5.4
           REAL_LLM_JUDGE_FORMAT: openai
-          ROLEPLAYER_API_KEY: ${{ secrets.NVIDIA_KEY }}
           ROLEPLAYER_BASE_URL: https://integrate.api.nvidia.com/v1
           ROLEPLAYER_MODEL: qwen/qwen3-next-80b-a3b-instruct
           REAL_LLM_LEDGER: target/real_llm_ledger/roleplayer-calibration
         run: cargo test --no-fail-fast --test real_llm_roleplayer_calibration -- --ignored --nocapture
 
       - name: Upload skip ledger
-        if: ${{ always() && env.REAL_LLM_API_KEY != '' }}
+        if: ${{ always() && env.REAL_LLM_API_KEY != '' && env.ROLEPLAYER_API_KEY != '' }}
         uses: actions/upload-artifact@v4
         with:
           name: real-llm-ledger-roleplayer-calibration
