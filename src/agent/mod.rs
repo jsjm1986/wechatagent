@@ -38,6 +38,7 @@ mod guards;
 pub mod knowledge_agent;
 mod knowledge_router;
 mod knowledge_tools;
+mod media_send;
 mod memory;
 pub(crate) mod prompt_isolation;
 pub(crate) mod quiet_hours;
