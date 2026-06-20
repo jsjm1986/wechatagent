@@ -121,7 +121,7 @@ pub fn assert_three_families_distinct() -> Vec<ProviderFingerprint> {
 /// 轨迹裁判的一次评分（整段对话）。
 #[derive(Debug, Clone)]
 pub struct TrajectoryVerdict {
-    /// 各轨迹维度分（trustTrajectory/relationshipProgress/redlineHeld/personaConsistency/overall）。
+    /// 各 arc 维度分（overall_progress/pressure_arc/consistency_arc/emotional_attunement_arc/redlineHeld/trustTrajectory/overall）。
     pub scores: std::collections::HashMap<String, i64>,
     /// 一句总评。
     pub verdict: String,
