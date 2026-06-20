@@ -394,6 +394,7 @@ mod tests {
             created_at: mongodb::bson::DateTime::now(),
             updated_at: mongodb::bson::DateTime::now(),
             resolved_at: None,
+            resolved_via: None,
         }
     }
 

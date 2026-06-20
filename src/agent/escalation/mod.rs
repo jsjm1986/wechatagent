@@ -299,7 +299,7 @@ pub(crate) async fn handle_principal_reply(
                     None
                 }
             });
-            let resolved = resolve_escalation(state, &short_code, &decision, expires).await?;
+            let resolved = resolve_escalation(state, &short_code, &decision, expires, "wechat").await?;
             if resolved.is_none() {
                 return Ok(true); // 已被并发 resolve；幂等。
             }
