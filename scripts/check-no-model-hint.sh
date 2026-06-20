@@ -48,6 +48,12 @@ SCAN_DIRS=(
 # - knowledge-wiki 设计文档（design.md）允许提及 LLW 等借鉴来源。
 SKIP_PATHS_REGEX='(^|/)((\.env\.example)|(config\.rs)|(llm\.rs)|(error\.rs)|tests/|.*/tests\.rs|.*\.test\.(ts|tsx|js|jsx)|llm-config\.md|llm-providers\.md|README\.md|real-task-.*\.md|.*-design\.md)$'
 
+# superpowers 开发过程文档（specs/plans/findings）整目录豁免：plan/spec/审查报告
+# 需逐字引用 ci.yml 的真实 env（含 *_MODEL: gpt-5.4 / qwen 等）才有执行/复盘价值，
+# 改中性词反降准确性。与上面已豁免的 *-design.md 同类（design 即 specs/ 下文档）。
+# 命中即跳过（在 SKIP_PATHS_REGEX 之外单独判，避免把上面那条正则改得过长难读）。
+SKIP_SUPERPOWERS_REGEX='(^|/)docs/superpowers/(specs|plans|findings)/'
+
 # 严禁字面量（大小写不敏感）。
 # 注意：
 # - 用单词边界减少误伤；
@@ -73,6 +79,10 @@ trap 'rm -f "$TMP"' EXIT
 for FILE in "${CHANGED[@]}"; do
     # 跳过白名单
     if echo "$FILE" | grep -qE "$SKIP_PATHS_REGEX"; then
+        continue
+    fi
+    # 跳过 superpowers 开发过程文档（specs/plans/findings 整目录）
+    if echo "$FILE" | grep -qE "$SKIP_SUPERPOWERS_REGEX"; then
         continue
     fi
     # 仅扫 + 行（新增）；剥掉 +++ 头部
