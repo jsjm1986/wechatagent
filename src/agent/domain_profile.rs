@@ -907,7 +907,10 @@ pub fn example_emotional_companion_profile(workspace_id: &str) -> DomainProfile 
     );
     // §3.7 数字分身样例：按关系类型配三套范式（运营接入时给 contact 标 relationship_type
     // 即按此路由）。customer=漏斗全开追单；peer=漏斗关、低频维护；friend=漏斗关、只留日历
-    // 关怀、口吻最像本人。这是"微信号 AI 化身"托管客户/同行/朋友三层社交的具体兑现。
+    // 关怀。**注**：per_relationship 当前仅切换 OperationMode 各驱动（漏斗/承诺/日历开关），
+    // 不含口吻分化——OperationMode 无 voice/tone/soul 字段、decision.rs soul 注入不读
+    // relationship_type，故各关系"口吻最像本人"的承诺当前不可达；数字分身口吻分化是独立
+    // 未启动专题（见审查终审报告第 5 节）。
     let mut per_relationship = std::collections::BTreeMap::new();
     // 客户：漏斗 + 沉默 + 承诺 + 日历全开（怕丢单）。
     let mut customer_mode = crate::models::OperationMode::default();
@@ -918,7 +921,7 @@ pub fn example_emotional_companion_profile(workspace_id: &str) -> DomainProfile 
     peer_mode.funnel.enabled = false;
     peer_mode.calendar.enabled = true;
     per_relationship.insert("peer".to_string(), peer_mode);
-    // 朋友：漏斗关、承诺关，只留日历个人情感关怀，口吻最像本人。
+    // 朋友：漏斗关、承诺关，只留日历个人情感关怀（口吻分化未实现，见上方 §3.7 注）。
     let mut friend_mode = crate::models::OperationMode::default();
     friend_mode.funnel.enabled = false;
     friend_mode.commitment.enabled = false;

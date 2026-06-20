@@ -677,12 +677,16 @@ async fn realign_active_to_current(
 }
 
 /// 「危险开关」字段集：直接左右 AI 能否瞎编产品 / 自学习方向 / 人格本体 / 风控阈值 /
-/// 交易事实注入的 11 个字段。运营手动编辑**已生效**血缘并 publish 时，这些字段一旦相对
-/// 当前 active 版本发生变化，就不即时生效（落旁路稿等二次确认），避免手滑改错立即污染线上。
+/// 交易事实注入 / 评审取向 / 模式-闸说明的 13 个字段。运营手动编辑**已生效**血缘并 publish
+/// 时，这些字段一旦相对当前 active 版本发生变化，就不即时生效（落旁路稿等二次确认），避免
+/// 手滑改错立即污染线上。
+/// `reviewer_orientation`（评审重点取向 / 转化平衡 / few-shot 打分锚）与
+/// `mode_gate_policy_override`（模式与 5 闸说明散文）直接改写喂给 Review/Reply Agent 的
+/// 取向 prompt，G31 起一并纳入危险字段——改已生效取向不再即时生效，须二次确认。
 /// 黑名单外字段（display_name/description/profile_dimensions/coverage_dimensions/
 /// business_formulas/memory_dimensions/chunk_roles/prompt_fragment/stagnation_dimension/
 /// domain_schema_id/methodology_generator_preamble）视为普通字段，照旧即时生效。
-const RISKY_FIELD_NAMES: [&str; 11] = [
+const RISKY_FIELD_NAMES: [&str; 13] = [
     "soul_override",
     "methodology_override",
     "conversation_mode_policy",
@@ -694,12 +698,14 @@ const RISKY_FIELD_NAMES: [&str; 11] = [
     "outcome_polarity",
     "threshold_overrides",
     "transaction_facts_enabled",
+    "reviewer_orientation",
+    "mode_gate_policy_override",
 ];
 
-/// 比对两份 profile 的 11 个危险字段，返回**发生变化**的字段名列表（顺序与
+/// 比对两份 profile 的 13 个危险字段，返回**发生变化**的字段名列表（顺序与
 /// [`RISKY_FIELD_NAMES`] 一致）。整体相等比较（逐字段 `!=`，偏保守：宁可多一次确认也
 /// 不漏判）。`commitment_markers` / `operation_mode` / `outcome_polarity` /
-/// `threshold_overrides` 依赖各自类型的 `PartialEq`（见 `models.rs`）。
+/// `threshold_overrides` / `reviewer_orientation` 依赖各自类型的 `PartialEq`（见 `models.rs`）。
 ///
 /// 纯函数、无 IO，供 `publish_domain_profile` 分级判定 + 单测共用。空 Vec = 无危险变更。
 pub fn risky_fields_changed(old: &DomainProfile, new: &DomainProfile) -> Vec<&'static str> {
@@ -736,6 +742,12 @@ pub fn risky_fields_changed(old: &DomainProfile, new: &DomainProfile) -> Vec<&'s
     }
     if old.transaction_facts_enabled != new.transaction_facts_enabled {
         changed.push(RISKY_FIELD_NAMES[10]);
+    }
+    if old.reviewer_orientation != new.reviewer_orientation {
+        changed.push(RISKY_FIELD_NAMES[11]);
+    }
+    if old.mode_gate_policy_override != new.mode_gate_policy_override {
+        changed.push(RISKY_FIELD_NAMES[12]);
     }
     changed
 }
@@ -1105,6 +1117,33 @@ mod tests {
         assert_eq!(
             risky_fields_changed(&base, &p),
             vec!["transaction_facts_enabled"]
+        );
+    }
+
+    #[test]
+    fn risky_fields_detects_reviewer_orientation_and_mode_gate() {
+        // G31：reviewer 取向 / 模式-闸说明覆盖是「已生效血缘即时生效则可绕过二次确认」的
+        // 漏网危险字段。改 reviewer_orientation（评审取向/转化平衡/few-shot 锚）或
+        // mode_gate_policy_override（模式-闸说明）必须落旁路稿二次确认，不可手滑即时污染线上。
+        let base = default_domain_profile("ws");
+
+        let mut changed_ro = base.clone();
+        changed_ro.reviewer_orientation = Some(crate::models::ReviewerOrientation {
+            review_focus: Some("真诚陪伴、尊重边界、不越界承诺。".to_string()),
+            ..Default::default()
+        });
+        assert_eq!(
+            risky_fields_changed(&base, &changed_ro),
+            vec!["reviewer_orientation"],
+            "reviewer_orientation 变更须被列为危险字段"
+        );
+
+        let mut changed_mg = base.clone();
+        changed_mg.mode_gate_policy_override = Some("本域模式-闸说明".to_string());
+        assert_eq!(
+            risky_fields_changed(&base, &changed_mg),
+            vec!["mode_gate_policy_override"],
+            "mode_gate_policy_override 变更须被列为危险字段"
         );
     }
 

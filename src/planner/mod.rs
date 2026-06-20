@@ -952,6 +952,30 @@ pub(crate) fn resolve_operation_mode(
         .unwrap_or_else(|| profile.operation_mode.clone())
 }
 
+/// G03 扫描器级粗过滤：`scan_renewal` 是否值得整段扫表。
+/// 放行条件 = profile 默认范式开 renewal **或** `per_relationship_operation_mode` 任一
+/// 关系类型开 renewal。纯函数、便于单测；逐 contact 的有效范式仍由 [`resolve_operation_mode`]
+/// 三级解析兜底（contact 级 override 单独开的边缘不在此粗过滤层全表扫描，与"省 DB 扫描"
+/// 初衷一致——见 scan_renewal 注释）。
+/// **红线**：DEFAULT（profile 默认关 + per_relationship 为 None）→ `false` → 零 DB 扫描、字节等价。
+fn renewal_scan_should_run(profile: &crate::models::DomainProfile) -> bool {
+    profile.operation_mode.renewal.enabled
+        || profile
+            .per_relationship_operation_mode
+            .as_ref()
+            .is_some_and(|m| m.values().any(|om| om.renewal.enabled))
+}
+
+/// G03 扫描器级粗过滤：`scan_reactivation` 是否值得整段扫表。语义同
+/// [`renewal_scan_should_run`]，判 `reactivation.enabled`。
+fn reactivation_scan_should_run(profile: &crate::models::DomainProfile) -> bool {
+    profile.operation_mode.reactivation.enabled
+        || profile
+            .per_relationship_operation_mode
+            .as_ref()
+            .is_some_and(|m| m.values().any(|om| om.reactivation.enabled))
+}
+
 /// MongoDB 端筛 managed + 非冷却 + 非终状态 + 停滞维度计时戳老于阈值
 /// + last_inbound_at 不太近（avoid 与 silent 段重叠）。
 ///
@@ -1746,21 +1770,22 @@ pub(crate) fn renewal_candidate_filter(workspace_id: &str, account_id: &str) -> 
 /// G5 续费推进扫描器：客户持有产品临近到期（或刚过期）时，主动 emit follow-up 让 Reply
 /// Agent 按销售链路推进续费（=最高优先级销售）+ 临场挽留。
 ///
-/// 零扰动：DEFAULT / 销售域 profile `renewal.enabled=false` → 行业默认关时整段提前短路
-/// （省全表扫描），与 calendar 的 `date_dims.is_empty()` 短路同款权衡——续费是 profile 级
-/// 范式决策（交易域才开），不支持"profile 关但单 contact override 开"的边角场景。
+/// 零扰动：DEFAULT / 销售域 profile `renewal.enabled=false` 且无 per_relationship 开 renewal
+/// → 整段提前短路（省全表扫描），与 calendar 的 `date_dims.is_empty()` 短路同款权衡。粗过滤
+/// 放宽到「profile 默认开或 per_relationship 任一关系类型开」（见 [`renewal_scan_should_run`]），
+/// 故数字分身按关系类型开启的续费范式不再被默认层吞掉。
 async fn scan_renewal(state: &AppState) -> anyhow::Result<()> {
     let workspace_id = state.config.default_workspace_id.clone();
     let account_id = state.config.default_account_id.clone();
     let now = DateTime::now();
     let profile =
         crate::agent::domain_profile::load_active_domain_profile(&state.db, &workspace_id).await;
-    // 行业默认 renewal 关 → 整段对该行业 no-op（销售 DEFAULT 命中、零 DB 扫描）。
-    // 注：此处用 profile 默认范式做扫描器级粗过滤（省 DB 扫描）；逐 contact 的有效范式仍走
-    // resolve_operation_mode 三级解析。若 per_relationship 某关系类型开了 renewal 但 profile
-    // 默认关，该粗过滤会整段跳过——本轮 renewal/reactivation 默认关，按关系类型开启的细化
-    // 留待后续（届时改为"默认范式或任一 per_relationship 开"即放行）。
-    if !profile.operation_mode.renewal.enabled {
+    // 扫描器级粗过滤（省 DB 扫描）：profile 默认范式开 renewal 或 per_relationship 任一
+    // 关系类型开 renewal 即放行整段扫描；逐 contact 的有效范式仍由 resolve_operation_mode
+    // 三级解析兜底。contact 级 override 单独开（profile 默认关 + per_relationship 也无）的
+    // 边缘不在此层覆盖——全表扫每个 contact 的 override 与"省 DB 扫描"初衷冲突，故只放宽到
+    // profile/per_relationship 两层。DEFAULT（默认关 + 无 per_relationship）→ 零扫描、字节等价。
+    if !renewal_scan_should_run(&profile) {
         return Ok(());
     }
 
@@ -1941,16 +1966,18 @@ pub(crate) fn reactivation_candidate_filter(workspace_id: &str, account_id: &str
 ///
 /// 与 scan_silent 边界：silent 是通用沉默唤醒（不分流、跨范式）；reactivation 专扫休眠态老客
 /// （现状被 TERMINAL_STAGES 排除出 stage_stagnation、无任何段唤醒，本扫描器补此空白）。
-/// 零扰动：DEFAULT/销售域 profile reactivation.enabled=false → 整段提前短路。
+/// 零扰动：DEFAULT/销售域 profile reactivation.enabled=false 且无 per_relationship 开
+/// reactivation → 整段提前短路。粗过滤同 scan_renewal 放宽到 per_relationship 任一开。
 async fn scan_reactivation(state: &AppState) -> anyhow::Result<()> {
     let workspace_id = state.config.default_workspace_id.clone();
     let account_id = state.config.default_account_id.clone();
     let now = DateTime::now();
     let profile =
         crate::agent::domain_profile::load_active_domain_profile(&state.db, &workspace_id).await;
-    // 行业默认 reactivation 关 → 整段对该行业 no-op（销售 DEFAULT 命中、零 DB 扫描）。
-    // 同 scan_renewal：扫描器级粗过滤用 profile 默认范式，逐 contact 走 resolve 三级。
-    if !profile.operation_mode.reactivation.enabled {
+    // 扫描器级粗过滤：profile 默认范式开 reactivation 或 per_relationship 任一开即放行；
+    // 逐 contact 走 resolve_operation_mode 三级解析。contact 级 override 单独开的边缘不在此层
+    // 覆盖（同 scan_renewal，省 DB 扫描）。DEFAULT（默认关 + 无 per_relationship）→ 零扫描、字节等价。
+    if !reactivation_scan_should_run(&profile) {
         return Ok(());
     }
 
@@ -3096,6 +3123,105 @@ mod tests {
         assert_eq!(resolved, profile.operation_mode, "回落默认范式");
     }
 
+    // ── G03 扫描器级粗过滤：renewal/reactivation 短路放宽到 per_relationship 任一开 ──
+
+    /// G03：DEFAULT（profile 默认 renewal 关 + 无 per_relationship）→ 不扫（字节等价）；
+    /// per_relationship 某关系类型开 renewal → 应扫（数字分身续费范式不再被默认层吞掉）。
+    #[test]
+    fn renewal_scan_runs_when_per_relationship_enables_it() {
+        // DEFAULT 销售 profile：renewal 默认关 + per_relationship=None。
+        let default_profile = crate::agent::domain_profile::default_domain_profile("default");
+        assert!(
+            !default_profile.operation_mode.renewal.enabled,
+            "前提：销售 DEFAULT renewal 默认关"
+        );
+        assert!(default_profile.per_relationship_operation_mode.is_none());
+        assert!(
+            !renewal_scan_should_run(&default_profile),
+            "DEFAULT: profile 默认关 + 无 per_relationship → 不扫(字节等价)"
+        );
+
+        // profile 默认仍关，但 per_relationship customer 那套开 renewal。
+        let mut customer = crate::models::OperationMode::default();
+        customer.renewal.enabled = true;
+        let mut map = std::collections::BTreeMap::new();
+        map.insert("customer".to_string(), customer);
+        let profile = profile_with_relationship_modes(
+            crate::models::OperationMode::default(),
+            map,
+        );
+        assert!(
+            !profile.operation_mode.renewal.enabled,
+            "profile 默认层仍关（只 per_relationship 开）"
+        );
+        assert!(
+            renewal_scan_should_run(&profile),
+            "per_relationship customer 开 renewal → 应扫"
+        );
+    }
+
+    /// G03：profile 默认层开 renewal → 应扫（与原行为一致，不退化）。
+    #[test]
+    fn renewal_scan_runs_when_profile_default_enables_it() {
+        let mut mode = crate::models::OperationMode::default();
+        mode.renewal.enabled = true;
+        let profile = profile_with_mode(mode);
+        assert!(profile.per_relationship_operation_mode.is_none());
+        assert!(renewal_scan_should_run(&profile), "profile 默认开 renewal → 应扫");
+    }
+
+    /// G03 reactivation 同 renewal：DEFAULT → 不扫；per_relationship 任一开 → 应扫。
+    #[test]
+    fn reactivation_scan_runs_when_per_relationship_enables_it() {
+        let default_profile = crate::agent::domain_profile::default_domain_profile("default");
+        assert!(
+            !default_profile.operation_mode.reactivation.enabled,
+            "前提：销售 DEFAULT reactivation 默认关"
+        );
+        assert!(
+            !reactivation_scan_should_run(&default_profile),
+            "DEFAULT: 默认关 + 无 per_relationship → 不扫(字节等价)"
+        );
+
+        let mut customer = crate::models::OperationMode::default();
+        customer.reactivation.enabled = true;
+        let mut map = std::collections::BTreeMap::new();
+        map.insert("customer".to_string(), customer);
+        let profile = profile_with_relationship_modes(
+            crate::models::OperationMode::default(),
+            map,
+        );
+        assert!(
+            !profile.operation_mode.reactivation.enabled,
+            "profile 默认层仍关（只 per_relationship 开）"
+        );
+        assert!(
+            reactivation_scan_should_run(&profile),
+            "per_relationship customer 开 reactivation → 应扫"
+        );
+    }
+
+    /// G03：per_relationship 存在但所有关系类型都关 renewal/reactivation + profile 默认关
+    /// → 仍不扫（不因 map 非空就误放行）。
+    #[test]
+    fn scan_should_not_run_when_per_relationship_all_disabled() {
+        // per_relationship 有 friend 那套，但 renewal/reactivation 都关（默认）。
+        let mut map = std::collections::BTreeMap::new();
+        map.insert("friend".to_string(), crate::models::OperationMode::default());
+        let profile = profile_with_relationship_modes(
+            crate::models::OperationMode::default(),
+            map,
+        );
+        assert!(
+            !renewal_scan_should_run(&profile),
+            "per_relationship 全关 renewal + 默认关 → 不扫"
+        );
+        assert!(
+            !reactivation_scan_should_run(&profile),
+            "per_relationship 全关 reactivation + 默认关 → 不扫"
+        );
+    }
+
     /// H8 DEFAULT 等价：默认范式下，三驱动力的有效阈值 == 传入的全局 config 值
     /// （None → unwrap_or(global)），证明无配置时 planner 用的还是全局 config。
     #[test]
@@ -3122,15 +3248,19 @@ mod tests {
     // ─────────────────────────────────────────────────────────────────────
 
     /// H19：无 override → effective == 全局 enabled（两种全局取值都验证）。
+    /// G04：现经 resolve_operation_mode 三级链，传 DEFAULT profile（quiet_hours
+    /// enabled_override=None）→ contact override=None → 回落 global，语义不变。
     #[test]
     fn h19_no_override_follows_global() {
         let contact = template();
         assert!(contact.operation_mode_override.is_none());
-        assert!(crate::agent::quiet_hours::effective_quiet_hours_enabled(&contact, true));
-        assert!(!crate::agent::quiet_hours::effective_quiet_hours_enabled(&contact, false));
+        let profile = crate::agent::domain_profile::default_domain_profile("default");
+        assert!(crate::agent::quiet_hours::effective_quiet_hours_enabled(&contact, &profile, true));
+        assert!(!crate::agent::quiet_hours::effective_quiet_hours_enabled(&contact, &profile, false));
     }
 
     /// H19：override Some(false) → 关闭静默（即便全局开），夜间不被压制。
+    /// G04：contact override 在 resolve 第一级优先，profile 传 DEFAULT 不影响结论。
     #[test]
     fn h19_override_false_disables_quiet_hours() {
         let mut contact = template();
@@ -3138,8 +3268,9 @@ mod tests {
             quiet_hours: crate::models::QuietHoursMode { enabled_override: Some(false) },
             ..crate::models::OperationMode::default()
         });
+        let profile = crate::agent::domain_profile::default_domain_profile("default");
         // 全局开，但 contact 范式关 → 有效为关。
-        assert!(!crate::agent::quiet_hours::effective_quiet_hours_enabled(&contact, true));
+        assert!(!crate::agent::quiet_hours::effective_quiet_hours_enabled(&contact, &profile, true));
     }
 
     /// H19：override Some(true) → 强制开启（即便全局关）。
@@ -3150,7 +3281,8 @@ mod tests {
             quiet_hours: crate::models::QuietHoursMode { enabled_override: Some(true) },
             ..crate::models::OperationMode::default()
         });
-        assert!(crate::agent::quiet_hours::effective_quiet_hours_enabled(&contact, false));
+        let profile = crate::agent::domain_profile::default_domain_profile("default");
+        assert!(crate::agent::quiet_hours::effective_quiet_hours_enabled(&contact, &profile, false));
     }
 
     /// H19：QuietHoursMode 默认 enabled_override = None（DEFAULT 等价根护栏）。

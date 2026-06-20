@@ -343,8 +343,12 @@ async fn compute_window_metrics(
 /// (Σ(Hit)+Σ(Block))`；删失（沉默/pending/未分类）不进分子也不进分母。已分类反应
 /// 为 0 时返回 `None`（避免 0/0 NaN 落库）。
 ///
-/// **复用回路① 的 classify**：2.5-main-2 把 classify 的极性源换成 active
-/// DomainProfile.outcome_polarity 后，本观测指标自动跟随同一极性，无需二次接线。
+/// **G07 修复**：本函数加载 active profile 的 `outcome_polarity`，经
+/// [`crate::knowledge_wiki::gap_signals::resolve_effective_polarity`] 解析后传入
+/// 参数化分类器 `classify_outcome_label_with_polarity`——与回路①
+/// （`refresh_usage_stats`）同源同极性。空极性逐极回落内置销售 const
+/// （DEFAULT_PROFILE 字节等价），故 DEFAULT 销售域下行为与旧
+/// `classify_outcome_label` 逐字相同；换行业时按本行业声明的极性判定。
 ///
 /// 2.5-main-4：提升为 `pub(crate)` 供 `auto_release` 的负反应强制门复用（同一口径、
 /// 同一极性源），避免两处算法 drift。
@@ -355,7 +359,9 @@ pub(crate) async fn compute_negative_reaction_rate(
     start: BsonDateTime,
     end: BsonDateTime,
 ) -> Result<Option<f64>, EvolutionError> {
-    use crate::knowledge_wiki::gap_signals::{classify_outcome_label, OutcomeLabel};
+    use crate::knowledge_wiki::gap_signals::{
+        classify_outcome_label_with_polarity, resolve_effective_polarity, OutcomeLabel,
+    };
     use futures::TryStreamExt;
 
     let pipeline = vec![
@@ -374,12 +380,16 @@ pub(crate) async fn compute_negative_reaction_rate(
         .await
         .map_err(EvolutionError::from)?;
 
+    let profile =
+        crate::agent::domain_profile::load_active_domain_profile(&state.db, workspace_id).await;
+    let (positive, negative) = resolve_effective_polarity(&profile.outcome_polarity);
+
     let mut hits: i64 = 0;
     let mut blocks: i64 = 0;
     while let Some(row) = cursor.try_next().await.map_err(EvolutionError::from)? {
         let n = row.get_i64("n").unwrap_or(0);
         let status = row.get_str("_id").ok();
-        match classify_outcome_label(status) {
+        match classify_outcome_label_with_polarity(status, &positive, &negative) {
             OutcomeLabel::Hit => hits += n,
             OutcomeLabel::Block => blocks += n,
             OutcomeLabel::Censored => {}

@@ -1042,11 +1042,17 @@ jobs:
           - real_llm_principal_relay
     env:
       REAL_LLM_API_KEY: ${{ secrets.RSXERMU_KEY }}
+      ROLEPLAYER_API_KEY: ${{ secrets.NVIDIA_KEY }}
     steps:
       - name: Require REAL_LLM_API_KEY (R0.1 缺 key 真 fail，不假绿)
         if: ${{ env.REAL_LLM_API_KEY == '' }}
         run: |
           echo "::error::REAL_LLM_API_KEY 未配置（secrets.RSXERMU_KEY 为空）。红线门必须有 key 才能真跑——缺 key 直接 fail，不静默跳过假绿（R0.1）。"
+          exit 1
+      - name: Require ROLEPLAYER_API_KEY (R0.1 缺第三族 key 真 fail，不假绿)
+        if: ${{ env.ROLEPLAYER_API_KEY == '' }}
+        run: |
+          echo "::error::ROLEPLAYER_API_KEY 未配置（secrets.NVIDIA_KEY 为空）。roleplayer 是第三异族（R5.0.1），缺 key 则数字分身 redline arc turn-0 静默 skip=假绿——直接 fail，不静默跳过。"
           exit 1
       - name: Checkout
         uses: actions/checkout@v4

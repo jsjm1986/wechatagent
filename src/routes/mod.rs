@@ -35,7 +35,7 @@ mod conversations;
 // guide_profile 已有先例。生产路由注册仍走下方 use。
 pub mod domain_profiles;
 pub(crate) mod domain_schemas;
-mod domains;
+pub mod domains;
 mod evaluations;
 mod events;
 mod evolution;
@@ -961,6 +961,10 @@ mod tests {
             // 的 activate_domain_profile 复用（profile 激活时联动写 operation_domain_configs
             // 新 current 版本），不直接绑 HTTP。
             "publish_state_machine_version",
+            // admin_ops_versions.rs：G06+G11+G12 共享 policy 重派 helper，被
+            // publish_state_machine_version / rollout / rollback / domains.rs 直编路由复用，
+            // 不直接绑 HTTP。
+            "reconcile_state_policies_for_machine",
         ];
 
         let mut handlers: Vec<&str> = Vec::new();

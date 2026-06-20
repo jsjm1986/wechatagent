@@ -391,6 +391,7 @@ pub(super) async fn enable_agent(
     .await?;
     let generated = agent::build_initial_operation_profile(
         &state,
+        &admin.current_workspace,
         &payload.human_profile_note,
         Some(&playbook),
     )
@@ -484,6 +485,7 @@ pub(super) async fn update_profile_note(
     let playbook = agent::load_operation_playbook_for_contact(&state, &contact).await?;
     let generated = agent::build_initial_operation_profile(
         &state,
+        &admin.current_workspace,
         &payload.human_profile_note,
         playbook.as_ref(),
     )
@@ -751,7 +753,8 @@ pub(super) async fn analyze_contact_profile(
         )
     });
     let generated =
-        agent::build_initial_operation_profile(&state, &note, playbook.as_ref()).await?;
+        agent::build_initial_operation_profile(&state, &admin.current_workspace, &note, playbook.as_ref())
+            .await?;
     let commitments_bson = commitments_with_optional_text(
         &contact.commitments,
         generated.last_commitment.as_deref(),
