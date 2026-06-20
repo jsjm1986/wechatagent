@@ -11,6 +11,7 @@
 
 pub mod autonomy_gate;
 pub mod conversation_gate;
+pub mod roleplayer_calibration;
 pub mod generalization;
 pub mod dynamic;
 pub mod identity_generator;
