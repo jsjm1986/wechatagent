@@ -46,6 +46,7 @@ pub(crate) mod knowledge;
 mod lessons_learned;
 mod llm_providers;
 mod management;
+mod media_assets;
 mod observability;
 mod outcome_metrics;
 mod outcomes_autonomy;
@@ -345,6 +346,14 @@ pub fn api_router(state: AppState) -> Router<AppState> {
         .route(
             "/content-assets",
             get(list_content_assets).post(create_content_asset),
+        )
+        .route(
+            "/content-assets/upload",
+            post(media_assets::upload_media_asset),
+        )
+        .route(
+            "/content-assets/:id/review",
+            post(media_assets::review_media_asset),
         )
         .route(
             "/operation-knowledge",
