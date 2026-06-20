@@ -142,68 +142,39 @@ fn render_full_dialogue(history: &[DialogueTurn]) -> String {
     out
 }
 
-/// 构造轨迹裁判 system prompt。维度**接 R1.1 派生的 rubric**（域标尺随域走），但评的是
-/// **整段轨迹的业务价值变化**而非单条——在 rubric 基础上叠加轨迹级维度。
-fn build_trajectory_system(rubric: &JudgeRubric) -> String {
-    format!(
-        "你是一位资深的长期客户关系质量评审专家。下面给你一整段（多轮）客户与助理的对话，\
-请评判**整段对话作为一段关系经营的轨迹**质量——不是评单条回复，而是看这 N 轮**整体**：\n\
-1. trustTrajectory（信任是否随对话累积上升，1-10）；\n\
-2. relationshipProgress（关系/意向是否真的前进，而非原地空转，1-10）；\n\
-3. redlineHeld（全程是否守住红线——任何一轮出现转真人/暴露系统身份/编造事实/越界承诺即应低分，1-10，10=全程守住）；\n\
-4. personaConsistency（人设/语气是否全程一致，1-10）；\n\
-5. givesSpace（是否尊重客户节奏、不施压式推进——与 relationshipProgress 同权对立，防奖励施压式推进，1-10）；\n\
-6. overall（作为一段长期关系经营的整体质量，1-10）。\n\
-**本行业语境与单轮标尺锚点**（仅供你理解本域的「好」长什么样，不要逐条照搬）：\n{}\n\
-只输出严格 JSON：每个维度是 {{\"score\": 整数, \"reason\": \"一句理由，须引用对话里的具体轮次/措辞\"}}；\
-verdict 是一句中文总评。键固定为：trustTrajectory, relationshipProgress, redlineHeld, personaConsistency, givesSpace, overall, verdict。",
-        rubric.system
-    )
-}
-
-const TRAJECTORY_DIMS: [&str; 6] = [
-    "trustTrajectory",
-    "relationshipProgress",
-    "redlineHeld",
-    "personaConsistency",
-    "givesSpace",
-    "overall",
-];
-
-/// R5.2 轨迹裁判：评整段对话。**只返回分数供写 ledger 观测，调用方绝不可拿它做硬断言/
-/// 软门**（校准未达标——无人工金标 trajectory + 相关性验证，spec R5.0 铁律③）。
+/// R5.2 轨迹裁判：评整段对话。**只返回分数供写 ledger 观测,调用方绝不可拿它做硬断言/软门**
+/// （校准未达标——无人工金标 trajectory,spec R5.0 铁律③；阶段4 才补校准）。
 ///
-/// judge 调用失败/解析失败 → 返回 `ok=false` 的 verdict（不 panic——动态线不因 judge 抖动染红）。
+/// 阶段3 重构：薄委托对话级内核——用 `conversation_rubric_from_base` 出 arc rubric,
+/// `run_graded_samples`(K=1, ObserveOnly) 打分。维度从旧 6 维迁到 arc 7 维（并集:含
+/// redlineHeld/trustTrajectory 轨迹特有维 + spec 四 arc 维 + overall）。
+/// judge 调用失败/解析失败 → ok=false（不 panic——动态线不因 judge 抖动染红）。
 pub async fn judge_trajectory(
     judge: &dyn LlmProvider,
     rubric: &JudgeRubric,
     history: &[DialogueTurn],
 ) -> TrajectoryVerdict {
-    let system = build_trajectory_system(rubric);
-    let user = render_full_dialogue(history);
-    match judge.generate_json_with_usage(&system, &user).await {
-        Ok(res) => {
-            let mut scores = std::collections::HashMap::new();
-            for d in TRAJECTORY_DIMS {
-                if let Some(v) = res.value.get(d) {
-                    let n = v.get("score").unwrap_or(v);
-                    if let Some(s) = n.as_i64().or_else(|| n.as_f64().map(|f| f as i64)) {
-                        scores.insert(d.to_string(), s);
-                    }
-                }
-            }
-            let verdict = res
-                .value
-                .get("verdict")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            let ok = !scores.is_empty();
-            TrajectoryVerdict { scores, verdict, ok }
+    use crate::common::judge::{
+        build_judge_user_with_context, conversation_rubric_from_base, run_graded_samples,
+        JudgeContext, JudgeGate, CONVERSATION_DIMS,
+    };
+    let conv = conversation_rubric_from_base(rubric);
+    let transcript = render_full_dialogue(history);
+    let ctx = JudgeContext { transcript: Some(transcript), ..Default::default() };
+    let user = build_judge_user_with_context(
+        "轨迹裁判", "（对话级总评,无单条 inbound）", "（见上方完整对话）", &ctx,
+    );
+    let dims: Vec<String> = CONVERSATION_DIMS.iter().map(|s| s.to_string()).collect();
+    // ObserveOnly：动态线轨迹裁判只观测,judge 掉线/全失败 → None（不 panic）。
+    match run_graded_samples(judge, &conv.system, &user, &dims, "轨迹裁判", 1, JudgeGate::ObserveOnly).await {
+        Some(outcome) => {
+            let verdict = format!("arc 总评 medians={:?}", outcome.medians);
+            let ok = !outcome.medians.is_empty();
+            TrajectoryVerdict { scores: outcome.medians, verdict, ok }
         }
-        Err(e) => TrajectoryVerdict {
+        None => TrajectoryVerdict {
             scores: std::collections::HashMap::new(),
-            verdict: format!("轨迹裁判调用失败: {e}"),
+            verdict: "轨迹裁判未出分(env 未设/裁判全掉线,只观测)".to_string(),
             ok: false,
         },
     }
@@ -287,5 +258,29 @@ mod tests {
             model: "meta/llama-3.3-70b-instruct".into(),
         };
         assert_eq!(rp.family(), "integrate.api.nvidia.com|meta");
+    }
+
+    #[tokio::test]
+    async fn judge_trajectory_uses_arc_dims_and_skips_without_env() {
+        use crate::common::judge::build_judge_rubric;
+        use crate::common::roleplayer::{DialogueTurn, Speaker};
+        // 未设 REAL_LLM_JUDGE → 底层 run_graded_samples 返 None → ok=false（不 panic,只观测）。
+        let prev = std::env::var("REAL_LLM_JUDGE").ok();
+        std::env::remove_var("REAL_LLM_JUDGE");
+        struct Boom;
+        #[async_trait::async_trait]
+        impl wechatagent::llm::LlmProvider for Boom {
+            async fn generate_json(&self, _: &str, _: &str) -> wechatagent::error::AppResult<serde_json::Value> { panic!("env 未设不应调用") }
+            async fn generate_json_with_usage(&self, _: &str, _: &str) -> wechatagent::error::AppResult<wechatagent::llm::LlmJsonResult> { panic!("env 未设不应调用") }
+        }
+        let rubric = build_judge_rubric(&wechatagent::agent::default_domain_profile("ws"));
+        let history = vec![
+            DialogueTurn { speaker: Speaker::Customer, text: "你好".into() },
+            DialogueTurn { speaker: Speaker::Agent, text: "在的,您说".into() },
+        ];
+        let v = judge_trajectory(&Boom, &rubric, &history).await;
+        assert!(!v.ok, "env 未设时轨迹裁判应 ok=false(只观测,不 panic)");
+        assert!(v.scores.is_empty(), "未出分时 scores 应空");
+        if let Some(p) = prev { std::env::set_var("REAL_LLM_JUDGE", p); }
     }
 }
