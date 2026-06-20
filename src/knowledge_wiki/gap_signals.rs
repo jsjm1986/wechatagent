@@ -762,7 +762,7 @@ pub(crate) fn attributed_log_indices(
 /// （`DEFAULT_POSITIVE_OUTCOMES` / `DEFAULT_NEGATIVE_OUTCOMES`），非空 → 用 profile 声明的。
 /// DEFAULT_PROFILE 的 seed 显式填回这两组常量，故 DEFAULT 下解析结果与回落字节相等
 /// → 回路① 召回排序逐字等价。换行业（声明非空极性）时按本行业极性判定。
-fn resolve_effective_polarity(polarity: &crate::models::OutcomePolarity) -> (Vec<String>, Vec<String>) {
+pub(crate) fn resolve_effective_polarity(polarity: &crate::models::OutcomePolarity) -> (Vec<String>, Vec<String>) {
     let positive = if polarity.positive.is_empty() {
         DEFAULT_POSITIVE_OUTCOMES.iter().map(|s| s.to_string()).collect()
     } else {

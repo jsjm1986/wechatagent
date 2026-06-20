@@ -562,8 +562,11 @@ pub async fn wechat_webhook(
         .await?;
         let runtime =
             crate::agent::UserRuntimeParameters::from_config(domain_config.as_ref(), &state);
+        let active_profile =
+            agent::domain_profile::load_active_domain_profile(&state.db, &workspace_id).await;
         let quiet = agent::quiet_hours::effective_quiet_hours_enabled(
             &contact,
+            &active_profile,
             runtime.quiet_hours_enabled,
         ) && agent::quiet_hours::is_quiet_now(
             runtime.quiet_hours_start,

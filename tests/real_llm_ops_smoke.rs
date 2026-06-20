@@ -1685,7 +1685,7 @@ async fn t10_real_initial_profile_generation() {
 
     // playbook 传 None：handler 内部回退到"自由生成克制画像"提示，不依赖额外 seed。
     let profile = unwrap_or_skip_transient!(
-        build_initial_operation_profile(&state, note, None).await,
+        build_initial_operation_profile(&state, &state.config.default_workspace_id, note, None).await,
         "真实初始画像生成必须 Ok（不崩、JSON 可解析）"
     );
 
@@ -2520,7 +2520,7 @@ async fn t18_real_warm_start_operator_seeded_arc() {
 
     // ② 用人工录入备注走生产暖启动入口，真模型生成结构化初始画像（与 enable_agent 同路径）。
     let generated = unwrap_or_skip_transient!(
-        build_initial_operation_profile(&state, human_profile_note, None).await,
+        build_initial_operation_profile(&state, &state.config.default_workspace_id, human_profile_note, None).await,
         "暖启动初始画像生成必须 Ok（不崩、JSON 可解析）"
     );
     eprintln!(

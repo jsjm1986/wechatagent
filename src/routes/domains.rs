@@ -94,6 +94,9 @@ pub(super) async fn update_operation_domain(
     validate_state_machine(&payload.state_machine)?;
     normalize_state_machine_allow_from_any(&mut payload.state_machine);
     ensure_operation_domains(&state, &admin.current_workspace).await?;
+    // G06：直编路由改状态机本体后联动重派 policy（否则 forbidsProactive 新增 state 主动触达门
+    // fail-open 静默失效）。$set 会 move payload.state_machine，故先 clone 出本体喂 reconcile。
+    let state_machine_for_policy = payload.state_machine.clone();
     state
         .db
         .operation_domain_configs()
@@ -124,6 +127,18 @@ pub(super) async fn update_operation_domain(
             None,
         )
         .await?;
+    // G06：$set 成功后按新本体重派 policy current 行（statemachine_edit: 溯源标，
+    // 通过 is_refreshable_policy_seeded_by 判定为机器派生行，下次 publish 可刷新）。
+    let policy_seeded_by = format!("statemachine_edit:{}", &domain);
+    crate::routes::admin_ops_versions::reconcile_state_policies_for_machine(
+        &state.db,
+        &admin.current_workspace,
+        &domain,
+        &state_machine_for_policy,
+        &policy_seeded_by,
+        DateTime::now(),
+    )
+    .await;
     Ok(Json(json!({ "ok": true })))
 }
 
@@ -137,7 +152,7 @@ pub(super) async fn get_operation_domain_state_machine(
     Ok(Json(json!({ "item": config.state_machine })))
 }
 
-pub(super) async fn update_operation_domain_state_machine(
+pub async fn update_operation_domain_state_machine(
     State(state): State<AppState>,
     Extension(admin): Extension<AuthenticatedAdmin>,
     Path(domain): Path<String>,
@@ -146,6 +161,8 @@ pub(super) async fn update_operation_domain_state_machine(
     ensure_operation_domains(&state, &admin.current_workspace).await?;
     validate_state_machine(&payload)?;
     normalize_state_machine_allow_from_any(&mut payload);
+    // G06：$set 会 move payload（payload 本身即 state_machine Document），先 clone 喂 reconcile。
+    let state_machine_for_policy = payload.clone();
     state
         .db
         .operation_domain_configs()
@@ -164,6 +181,18 @@ pub(super) async fn update_operation_domain_state_machine(
             None,
         )
         .await?;
+    // G06：直编状态机本体后联动重派 policy（否则 forbidsProactive 新增 state 主动触达门
+    // fail-open 静默失效）。statemachine_edit: 溯源标可被 is_refreshable_policy_seeded_by 识别。
+    let policy_seeded_by = format!("statemachine_edit:{}", &domain);
+    crate::routes::admin_ops_versions::reconcile_state_policies_for_machine(
+        &state.db,
+        &admin.current_workspace,
+        &domain,
+        &state_machine_for_policy,
+        &policy_seeded_by,
+        DateTime::now(),
+    )
+    .await;
     Ok(Json(json!({ "ok": true })))
 }
 

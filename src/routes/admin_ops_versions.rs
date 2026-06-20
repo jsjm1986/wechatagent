@@ -174,7 +174,165 @@ pub(super) async fn publish_operation_domain_version(
 pub(crate) fn is_refreshable_policy_seeded_by(seeded_by: &Option<String>) -> bool {
     match seeded_by.as_deref() {
         None => true,
-        Some(s) => s.starts_with("statemachine_publish:") || s == "legacy_migration",
+        Some(s) => {
+            s.starts_with("statemachine_publish:")
+                || s.starts_with("statemachine_edit:")
+                || s == "legacy_migration"
+        }
+    }
+}
+
+/// universal/G06+G11+G12：按一份状态机本体 `state_machine` 里每个 state 的
+/// `forbidsProactive` 标志，**幂等地**重派生 `operation_state_policies` 的 current 行。
+///
+/// 这是从原 [`publish_state_machine_version`] 体内（取 states + per-state policy 派生 loop）
+/// 逐字提取的共享 helper，让三条「切换 current 机器但不走 publish loop」的路径都能联动重派 policy：
+/// - **G06**：`domains.rs` 两个直编路由（`update_operation_domain` /
+///   `update_operation_domain_state_machine`）直接 `$set state_machine`，此前不派生 policy →
+///   新增 `forbidsProactive:true` state 主动触达门 fail-open 静默失效。
+/// - **G11**：`publish_state_machine_version` no-op 幂等短路在 policy loop **之前** return，
+///   首次 activate best-effort 失败遗漏的行永不补 → 短路前调一次本 helper 幂等补齐。
+/// - **G12**：`rollout` / `rollback` 切 `operation_domain_configs` 的 current 版本但不碰 policy
+///   → policy current 行与机器 `forbidsProactive` 漂移；切 current 后调本 helper 重对齐。
+///
+/// **best-effort（关键）**：返回 `()` 而非 `Result`——per-state warn-and-continue，
+/// 单个 state 的查询/写入失败只 `warn!` 并继续下一个，绝不 `?` 向外传播把已成功提交的
+/// activate/publish/直编/rollback 主操作拖垮（与原 loop 及本模块整体哲学一致）。
+///
+/// 幂等：只刷新「机器派生 / 可安全刷新」行（[`is_refreshable_policy_seeded_by`]），运营手工行
+/// 一律保留；已存在且 `(allowed, forbidden)` 一致的行内部 `continue` 不写；缺失行用
+/// [`next_version_for_scope`] 分配版本（避开 `(ws,domain,state_key,version)` 唯一索引冲突）。
+pub(crate) async fn reconcile_state_policies_for_machine(
+    db: &Database,
+    workspace_id: &str,
+    domain: &str,
+    state_machine: &Document,
+    policy_seeded_by: &str,
+    now: DateTime,
+) {
+    let states = state_machine
+        .get_array("states")
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|item| item.as_document().cloned())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    for state in &states {
+        let Some(state_key) = state.get_str("key").ok().filter(|k| !k.is_empty()) else {
+            continue;
+        };
+        let forbids_proactive = state.get_bool("forbidsProactive").unwrap_or(false);
+        let (allowed, forbidden) =
+            crate::db::migrations::m013_seed_user_operation_state_policies::derive_state_policy_lists(
+                forbids_proactive,
+            );
+        // 只认 current_version=true 行：运行时 reader（agent/decision.rs）严格按
+        // current_version=true 读 policy，且同 (ws,domain,state_key) 下可并存多版本
+        // （admin publish/rollout/rollback 造历史版本，(ws,domain,state_key,version)
+        // 唯一索引证 version 是 key 的一部分）。裸 find_one 会返回任意版本——可能改到
+        // 非 current 的历史行，运行时仍读旧 current（toggle 静默失效，正是本代码要修的
+        // bug），且改写历史行的 allowed/forbidden/seeded_by 会污染 rollback 链。
+        match db
+            .operation_state_policies()
+            .find_one(
+                doc! {
+                    "workspace_id": workspace_id,
+                    "domain": domain,
+                    "state_key": state_key,
+                    "current_version": true,
+                },
+                None,
+            )
+            .await
+        {
+            // 已有行：区分机器派生行（可安全刷新）与运营手工行（保留，绝不 clobber）。
+            // 机器派生行若新本体的 forbidsProactive 与存量派生的 (allowed, forbidden) 不一致
+            // → in-place update（解决「forbidsProactive 切换后旧 policy 行陈旧、切换静默失效」）；
+            // 一致则不写。手工行（其它 seeded_by）一律 continue，与 m013 skip-existing 同红线。
+            Ok(Some(existing)) => {
+                if !is_refreshable_policy_seeded_by(&existing.seeded_by) {
+                    continue;
+                }
+                if existing.allowed == allowed && existing.forbidden == forbidden {
+                    continue;
+                }
+                if let Err(err) = db
+                    .operation_state_policies()
+                    .update_one(
+                        doc! { "_id": existing.id },
+                        doc! {
+                            "$set": {
+                                "allowed": &allowed,
+                                "forbidden": &forbidden,
+                                "updated_at": now,
+                                "seeded_by": policy_seeded_by,
+                            }
+                        },
+                        None,
+                    )
+                    .await
+                {
+                    tracing::warn!(
+                        workspace_id,
+                        domain,
+                        state_key,
+                        error = %err,
+                        "reconcile_state_policies_for_machine: 刷新 operation_state_policy 失败（best-effort，跳过该 state 继续）"
+                    );
+                }
+            }
+            Ok(None) => {
+                // current find_one 为 None：通常是该 state 首次派生 → 插 current 行。
+                // EDGE（rollback 中途）：若存在非 current 的历史行但无 current 行，硬插
+                // version 1 会与历史 version 1 撞 (ws,domain,state_key,version) 唯一索引。
+                // 故按该 scope 现存最大 version+1 分配版本（复用 next_version_for_scope，
+                // 与 admin policy publish 同一真相），避开撞索引。
+                let next_policy_version = next_version_for_scope(
+                    db.operation_state_policies(),
+                    doc! {
+                        "workspace_id": workspace_id,
+                        "domain": domain,
+                        "state_key": state_key,
+                    },
+                )
+                .await
+                .unwrap_or(1);
+                let policy = OperationStatePolicy {
+                    id: None,
+                    workspace_id: workspace_id.to_string(),
+                    domain: domain.to_string(),
+                    state_key: state_key.to_string(),
+                    allowed,
+                    forbidden,
+                    recommended_pace: None,
+                    status: "active".to_string(),
+                    updated_at: now,
+                    version: next_policy_version,
+                    current_version: true,
+                    previous_version: None,
+                    seeded_by: Some(policy_seeded_by.to_string()),
+                };
+                if let Err(err) = db.operation_state_policies().insert_one(&policy, None).await {
+                    tracing::warn!(
+                        workspace_id,
+                        domain,
+                        state_key,
+                        error = %err,
+                        "reconcile_state_policies_for_machine: 派生 operation_state_policy 失败（best-effort，跳过该 state 继续）"
+                    );
+                }
+            }
+            Err(err) => {
+                tracing::warn!(
+                    workspace_id,
+                    domain,
+                    state_key,
+                    error = %err,
+                    "reconcile_state_policies_for_machine: 查询 operation_state_policy 失败（best-effort，跳过该 state 继续）"
+                );
+            }
+        }
     }
 }
 
@@ -240,10 +398,24 @@ pub(crate) async fn publish_state_machine_version(
     // 灌一版本体完全相同的新行（版本膨胀 + 放大 current-flag 竞态窗口）。本短路让
     // 「重复激活同机器」成为真正的 no-op，从源头消除最常见的竞态触发器。
     if new_state_machine == source.state_machine {
+        // G11：本体未变仍 reconcile 一次——首次 activate 若某 state 的 policy 派生
+        // best-effort 失败（warn 跳过），之后重激活同本体走此 no-op 短路，遗漏的 policy 行
+        // 永不补。此处幂等 reconcile 补齐（已存在且一致的行内部 continue 不写，只补缺失/
+        // 刷新陈旧机器派生行），再走原 no-op 短路。
+        let policy_seeded_by = format!("statemachine_publish:{seeded_by}");
+        reconcile_state_policies_for_machine(
+            db,
+            workspace_id,
+            domain,
+            &source.state_machine,
+            &policy_seeded_by,
+            DateTime::now(),
+        )
+        .await;
         tracing::debug!(
             workspace_id,
             domain,
-            "publish_state_machine_version: state machine unchanged, skip republish (no-op 幂等)"
+            "publish_state_machine_version: state machine unchanged, skip republish (no-op 幂等; policy 已 reconcile)"
         );
         return Ok(());
     }
@@ -260,15 +432,9 @@ pub(crate) async fn publish_state_machine_version(
     let policy_seeded_by = format!("statemachine_publish:{seeded_by}");
     // 克隆当前 current 行的全部非 state_machine 字段（name/goal/methodology/…一一保留），
     // 只把 state_machine 换成注入的本体——这正是「消费方零改动」的保证。
-    // 派生 policy 时还要读机器里的 states，故先取一份 states 列表再把本体 move 进 helper。
-    let states = new_state_machine
-        .get_array("states")
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|item| item.as_document().cloned())
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
+    // 派生 policy 时还要读机器里的 states，故先 clone 一份本体，再把本体 move 进 insert helper，
+    // clone 后用 `&states_doc` 喂 reconcile（admin 低频 publish 路径 clone 一次本体可接受）。
+    let states_doc = new_state_machine.clone();
     insert_new_current_domain_config(
         &coll,
         &source,
@@ -284,127 +450,16 @@ pub(crate) async fn publish_state_machine_version(
     // 对缺失 policy 行 fail-open → 不拦），而该表此前仅 m013 从 DEFAULT 机器 seed。这里
     // 在 publish 新机器后，按机器里每个 state 的 `forbidsProactive` 标志**联动重派生** policy
     // 行（复用 m013 的 `derive_state_policy_lists` 唯一真相），让非销售 profile 标
-    // `forbidsProactive:true` 的 state 真正拦住主动发。
-    //
-    // best-effort：与本 helper 整体一致（无 current 行时 warn+Ok）——单个 state 的 policy
-    // 派生失败只 `warn!` 并继续下一个，绝不 `?` 传播出去把已成功的 activate/publish 拖垮。
-    // 一个坏 state 不应让后续 state 的 policy 漏派生，故 per-state warn-and-continue。
-    for state in &states {
-        let Some(state_key) = state.get_str("key").ok().filter(|k| !k.is_empty()) else {
-            continue;
-        };
-        let forbids_proactive = state.get_bool("forbidsProactive").unwrap_or(false);
-        let (allowed, forbidden) =
-            crate::db::migrations::m013_seed_user_operation_state_policies::derive_state_policy_lists(
-                forbids_proactive,
-            );
-        // 只认 current_version=true 行：运行时 reader（agent/decision.rs）严格按
-        // current_version=true 读 policy，且同 (ws,domain,state_key) 下可并存多版本
-        // （admin publish/rollout/rollback 造历史版本，(ws,domain,state_key,version)
-        // 唯一索引证 version 是 key 的一部分）。裸 find_one 会返回任意版本——可能改到
-        // 非 current 的历史行，运行时仍读旧 current（toggle 静默失效，正是本代码要修的
-        // bug），且改写历史行的 allowed/forbidden/seeded_by 会污染 rollback 链。
-        match db
-            .operation_state_policies()
-            .find_one(
-                doc! {
-                    "workspace_id": workspace_id,
-                    "domain": domain,
-                    "state_key": state_key,
-                    "current_version": true,
-                },
-                None,
-            )
-            .await
-        {
-            // 已有行：区分机器派生行（可安全刷新）与运营手工行（保留，绝不 clobber）。
-            // 机器派生行若新本体的 forbidsProactive 与存量派生的 (allowed, forbidden) 不一致
-            // → in-place update（解决「forbidsProactive 切换后旧 policy 行陈旧、切换静默失效」）；
-            // 一致则不写。手工行（其它 seeded_by）一律 continue，与 m013 skip-existing 同红线。
-            Ok(Some(existing)) => {
-                if !is_refreshable_policy_seeded_by(&existing.seeded_by) {
-                    continue;
-                }
-                if existing.allowed == allowed && existing.forbidden == forbidden {
-                    continue;
-                }
-                if let Err(err) = db
-                    .operation_state_policies()
-                    .update_one(
-                        doc! { "_id": existing.id },
-                        doc! {
-                            "$set": {
-                                "allowed": &allowed,
-                                "forbidden": &forbidden,
-                                "updated_at": now,
-                                "seeded_by": &policy_seeded_by,
-                            }
-                        },
-                        None,
-                    )
-                    .await
-                {
-                    tracing::warn!(
-                        workspace_id,
-                        domain,
-                        state_key,
-                        error = %err,
-                        "publish_state_machine_version: 刷新 operation_state_policy 失败（best-effort，跳过该 state 继续）"
-                    );
-                }
-            }
-            Ok(None) => {
-                // current find_one 为 None：通常是该 state 首次派生 → 插 current 行。
-                // EDGE（rollback 中途）：若存在非 current 的历史行但无 current 行，硬插
-                // version 1 会与历史 version 1 撞 (ws,domain,state_key,version) 唯一索引。
-                // 故按该 scope 现存最大 version+1 分配版本（复用 next_version_for_scope，
-                // 与 admin policy publish 同一真相），避开撞索引。
-                let next_policy_version = next_version_for_scope(
-                    db.operation_state_policies(),
-                    doc! {
-                        "workspace_id": workspace_id,
-                        "domain": domain,
-                        "state_key": state_key,
-                    },
-                )
-                .await
-                .unwrap_or(1);
-                let policy = OperationStatePolicy {
-                    id: None,
-                    workspace_id: workspace_id.to_string(),
-                    domain: domain.to_string(),
-                    state_key: state_key.to_string(),
-                    allowed,
-                    forbidden,
-                    recommended_pace: None,
-                    status: "active".to_string(),
-                    updated_at: now,
-                    version: next_policy_version,
-                    current_version: true,
-                    previous_version: None,
-                    seeded_by: Some(policy_seeded_by.clone()),
-                };
-                if let Err(err) = db.operation_state_policies().insert_one(&policy, None).await {
-                    tracing::warn!(
-                        workspace_id,
-                        domain,
-                        state_key,
-                        error = %err,
-                        "publish_state_machine_version: 派生 operation_state_policy 失败（best-effort，跳过该 state 继续）"
-                    );
-                }
-            }
-            Err(err) => {
-                tracing::warn!(
-                    workspace_id,
-                    domain,
-                    state_key,
-                    error = %err,
-                    "publish_state_machine_version: 查询 operation_state_policy 失败（best-effort，跳过该 state 继续）"
-                );
-            }
-        }
-    }
+    // `forbidsProactive:true` 的 state 真正拦住主动发。best-effort，per-state warn-and-continue。
+    reconcile_state_policies_for_machine(
+        db,
+        workspace_id,
+        domain,
+        &states_doc,
+        &policy_seeded_by,
+        now,
+    )
+    .await;
     Ok(())
 }
 
@@ -439,6 +494,22 @@ pub(super) async fn rollout_operation_domain_version(
         None,
     )
     .await?;
+    // G12：切 current 配置版本后按新 current 机器（target.state_machine）重派 policy，
+    // 否则 operation_state_policies 的 current 行与机器 forbidsProactive 漂移（下次 publish 才自愈）。
+    // best-effort，只刷新机器派生行 + 补缺失；reconcile 幂等（一致行不写）。
+    let policy_seeded_by = format!(
+        "statemachine_publish:{}",
+        target.seeded_by.clone().unwrap_or_default()
+    );
+    reconcile_state_policies_for_machine(
+        &state.db,
+        &target.workspace_id,
+        &target.domain,
+        &target.state_machine,
+        &policy_seeded_by,
+        now,
+    )
+    .await;
     Ok(Json(json!({ "ok": true, "version": target.version })))
 }
 
@@ -494,6 +565,22 @@ pub(super) async fn rollback_operation_domain_version(
         None,
     )
     .await?;
+    // G12：rollback 切回历史版本 `prev` 后按其机器（prev.state_machine）重派 policy，
+    // 把 policy current 行重新对齐到回退目标机器的 forbidsProactive（否则与切到的版本漂移）。
+    // best-effort，只刷新机器派生行 + 补缺失；reconcile 幂等（一致行不写）。
+    let policy_seeded_by = format!(
+        "statemachine_publish:{}",
+        prev.seeded_by.clone().unwrap_or_default()
+    );
+    reconcile_state_policies_for_machine(
+        &state.db,
+        &prev.workspace_id,
+        &prev.domain,
+        &prev.state_machine,
+        &policy_seeded_by,
+        now,
+    )
+    .await;
     Ok(Json(json!({ "ok": true, "rolledBackTo": prev_version })))
 }
 

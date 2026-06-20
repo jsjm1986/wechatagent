@@ -84,7 +84,12 @@ fn normalize_json_keys(value: Value) -> Value {
 /// 反序列化到 `String` 直接 `invalid type: map, expected a string`（CI run 27678306055
 /// 实测）。这里在 snake_case 归一后、转 Document 前，对**顶层已知标量字段**做类型矫正：
 /// 值是对象/数组则序列化成紧凑 JSON 文本（**内容不丢**，符合"要的是它的内容"），
-/// 是字符串/null 原样。只碰这两个顶层标量字段，不递归、不动数组/嵌套结构。
+/// 是字符串/null 原样。
+///
+/// G32：嵌套 `profileDimensions[].description`（`ProfileDimension.description` 是 `String`
+/// 非 `Option`，models.rs）同样可能被 LLM 给成对象/数组 → `from_document` 失败。因此除顶层
+/// 标量字段外，再对 `profile_dimensions`（normalize 后是 snake key）数组每个元素的
+/// `description` 做同样压平。其余数组/嵌套结构不动。
 fn coerce_scalar_string_fields(value: Value) -> Value {
     const SCALAR_STRING_KEYS: &[&str] = &["description", "prompt_fragment"];
     let Value::Object(mut map) = value else {
@@ -96,6 +101,18 @@ fn coerce_scalar_string_fields(value: Value) -> Value {
                 // 对象/数组 → 紧凑 JSON 文本；序列化失败（不应发生）则退成空串占位。
                 let text = serde_json::to_string(v).unwrap_or_default();
                 *v = Value::String(text);
+            }
+        }
+    }
+    // G32: profileDimensions[].description 是 String(models.rs ProfileDimension),LLM 偶发给对象 → 压平。
+    if let Some(Value::Array(dims)) = map.get_mut("profile_dimensions") {
+        for dim in dims.iter_mut() {
+            if let Value::Object(dim_map) = dim {
+                if let Some(d) = dim_map.get_mut("description") {
+                    if d.is_object() || d.is_array() {
+                        *d = Value::String(serde_json::to_string(d).unwrap_or_default());
+                    }
+                }
             }
         }
     }
@@ -489,6 +506,64 @@ mod tests {
         let out = coerce_scalar_string_fields(input);
         assert!(out["description"].is_string());
         assert!(out["description"].as_str().unwrap().contains("点1"));
+    }
+
+    /// 把 brief 给的「裁剪版」LLM 输出补齐成 `from_document` 可反序列化的完整 doc：注入
+    /// `DomainProfile` 那几个无 `#[serde(default)]` 的必填字段（profile_id / workspace_id /
+    /// is_active / created_at / updated_at），复刻生产 `generate_domain_profile_candidate`
+    /// 在 from_document 前的注入步骤。这样测试若失败，只会因被测的 G08/G32 缺陷，而不是
+    /// 无关的「缺必填字段」错误。
+    fn to_profile_doc(normalized: serde_json::Value) -> mongodb::bson::Document {
+        let mut doc = mongodb::bson::to_document(&normalized).expect("normalized → Document");
+        doc.insert("profile_id", "test-profile");
+        doc.insert("workspace_id", "test-ws");
+        if !doc.contains_key("display_name") {
+            doc.insert("display_name", "测试画像");
+        }
+        doc.insert("is_active", false);
+        let now = mongodb::bson::DateTime::now();
+        doc.insert("created_at", now);
+        doc.insert("updated_at", now);
+        doc
+    }
+
+    /// G08：`businessFormulas[].displayName` 经 `normalize_json_keys` 被 snake 化成
+    /// `display_name`，因 `BusinessFormula` 是 `rename_all="camelCase"`，老代码只认 wire key
+    /// `displayName` → 反序列化匹配不上 → 落 `#[serde(default)]` 空串（静默 data-loss）。
+    /// 加 `#[serde(default, alias = "display_name")]` 后，snake 化的 key 也被接受 → 值保留。
+    #[test]
+    fn business_formula_display_name_survives_normalize() {
+        let generated = json!({
+            "profileDimensions": [{"kind":"trust","displayName":"信任","description":"x"}],
+            "businessFormulas": [{"key":"trust","expression":"A×B","displayName":"信任度"}]
+        });
+        let normalized = coerce_scalar_string_fields(normalize_json_keys(generated));
+        let doc = to_profile_doc(normalized);
+        let profile: crate::models::DomainProfile =
+            mongodb::bson::from_document(doc).expect("补齐必填字段后应能反序列化");
+        assert_eq!(
+            profile.business_formulas[0].display_name, "信任度",
+            "displayName 经 normalize→snake 后不应丢(G08)"
+        );
+    }
+
+    /// G32：嵌套 `profileDimensions[].description`（`ProfileDimension.description` 是 `String`）
+    /// 若 LLM 偶发给成对象/数组，`coerce_scalar_string_fields` 老实现只护顶层标量字段 →
+    /// 嵌套对象原样进 doc → `from_document` 到 `String` 报 `invalid type: map`。扩 coerce 到
+    /// 嵌套后应被压平成 JSON 文本，反序列化成功且内容非空。
+    #[test]
+    fn profile_dimension_description_object_coerced() {
+        let generated = json!({
+            "profileDimensions": [{"kind":"stage","displayName":"阶段","description":{"a":"b"}}]
+        });
+        let normalized = coerce_scalar_string_fields(normalize_json_keys(generated));
+        let doc = to_profile_doc(normalized);
+        let profile: crate::models::DomainProfile = mongodb::bson::from_document(doc)
+            .expect("嵌套 description 对象应被 coerce 压平(G32)");
+        assert!(
+            !profile.profile_dimensions[0].description.is_empty(),
+            "压平后的 description 须保留内容"
+        );
     }
 
     /// H13：生成 prompt 必须含 stateMachine 本体 schema，引导 AI 输出客户旅程状态机。

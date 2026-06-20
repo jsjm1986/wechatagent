@@ -83,22 +83,28 @@ pub(crate) fn next_wake_at(end: u32, tz_offset_hours: i32) -> mongodb::bson::Dat
     ))
 }
 
-/// universal-domain-adaptation H19：解析某 contact 的**有效作息门控开关**。
+/// universal-domain-adaptation H19 / G04：解析某 contact 的**有效作息门控开关**。
 ///
-/// `contact.operation_mode_override.quiet_hours.enabled_override` 优先，缺省回落
-/// 全局 `global_enabled`（即 `runtime.quiet_hours_enabled`）。纯函数、不查 DB——
-/// 覆盖来自 contact 已加载字段，不在热路径引入额外 IO。
+/// 经 [`resolve_operation_mode`](crate::planner::resolve_operation_mode) 三级链
+/// （contact override → profile.per_relationship → profile 默认范式）取
+/// `quiet_hours.enabled_override`，缺省回落全局 `global_enabled`（即
+/// `runtime.quiet_hours_enabled`）。与其余 6 个 OperationMode 驱动力解析路径一致——
+/// 此前只读 `contact.operation_mode_override`、绕过 resolve，导致 profile/per_relationship
+/// 级的 `quiet_hours.enabled_override` 是运行时死字段（G04）。纯函数、不查 DB
+/// （profile 由调用方传入已加载值）。
 ///
-/// DEFAULT 等价：无 override（`enabled_override = None`）→ 返回 `global_enabled`，
-/// 与改造前逐字一致；情感陪伴 contact 设 `Some(false)` → 夜间不被静默门压制。
+/// DEFAULT 字节等价：contact override=None + profile 默认范式 `enabled_override=None`
+/// → resolve 回落 `OperationMode::default()`（`enabled_override=None`）→ `.unwrap_or`
+/// 返回 `global_enabled`，与改造前逐字一致；情感陪伴 profile/contact 设 `Some(false)`
+/// → 夜间不被静默门压制。
 pub(crate) fn effective_quiet_hours_enabled(
     contact: &crate::models::Contact,
+    profile: &crate::models::DomainProfile,
     global_enabled: bool,
 ) -> bool {
-    contact
-        .operation_mode_override
-        .as_ref()
-        .and_then(|m| m.quiet_hours.enabled_override)
+    crate::planner::resolve_operation_mode(contact, profile)
+        .quiet_hours
+        .enabled_override
         .unwrap_or(global_enabled)
 }
 
@@ -207,5 +213,83 @@ mod tests {
     #[test]
     fn deferred_kind_constant_stable() {
         assert_eq!(DEFERRED_INBOUND_REPLY_KIND, "deferred_inbound_reply");
+    }
+
+    /// G04：构造一个 managed、无 operation_mode_override 的最小 Contact，便于断言
+    /// `effective_quiet_hours_enabled` 走 resolve_operation_mode 三级链回落 profile 级。
+    fn contact_no_override() -> crate::models::Contact {
+        crate::models::Contact {
+            id: None,
+            workspace_id: "default".to_string(),
+            account_id: "default".to_string(),
+            wxid: "quiet_hours_test".to_string(),
+            nickname: None,
+            remark: None,
+            alias: None,
+            agent_status: crate::models::AgentStatus::Managed,
+            human_profile_note: None,
+            agent_profile: None,
+            memory_summary: None,
+            playbook_id: None,
+            playbook_version: None,
+            tags: Vec::new(),
+            commitments: Vec::new(),
+            follow_up_policy: None,
+            operation_state: None,
+            operation_state_reason: None,
+            operation_state_confidence: None,
+            operation_state_updated_at: None,
+            cooldown_until: None,
+            operation_policy: mongodb::bson::Document::new(),
+            profile_attributes: mongodb::bson::Document::new(),
+            profile_updated_at: None,
+            domain_attributes: None,
+            domain_attributes_updated_at: None,
+            last_message_at: None,
+            last_inbound_at: None,
+            last_outbound_at: None,
+            last_agent_run_at: None,
+            custom_agent_instructions: None,
+            operation_mode_override: None,
+            last_outbound_style: None,
+            intent_trajectory: Vec::new(),
+            outcome_events: Vec::new(),
+            locale: None,
+            created_at: mongodb::bson::DateTime::now(),
+            updated_at: mongodb::bson::DateTime::now(),
+        }
+    }
+
+    /// G04：profile 级 `quiet_hours.enabled_override=Some(false)`（contact override=None）
+    /// → 经 resolve_operation_mode 回落 profile 默认范式 → 关静默门，即便 global=true。
+    #[test]
+    fn quiet_hours_honors_profile_level_override() {
+        let contact = contact_no_override();
+
+        // profile 级显式关静默门：把 operation_mode.quiet_hours.enabled_override 设 Some(false)。
+        let mut profile = crate::agent::domain_profile::default_domain_profile("default");
+        let mut om = crate::models::OperationMode::default();
+        om.quiet_hours.enabled_override = Some(false);
+        profile.operation_mode = om;
+        assert!(
+            !effective_quiet_hours_enabled(&contact, &profile, true),
+            "profile 级 Some(false) 应关静默门（即便 global=true）"
+        );
+
+        // 对照：DEFAULT profile（quiet_hours.enabled_override=None）+ contact override=None
+        // → 回落 global(true)，与改造前逐字等价（字节等价红线）。
+        let default_profile = crate::agent::domain_profile::default_domain_profile("default");
+        assert_eq!(
+            default_profile.operation_mode.quiet_hours.enabled_override, None,
+            "DEFAULT profile quiet_hours.enabled_override 必须是 None（字节等价铰链）"
+        );
+        assert!(
+            effective_quiet_hours_enabled(&contact, &default_profile, true),
+            "DEFAULT 全 None → 回落 global=true（字节等价）"
+        );
+        assert!(
+            !effective_quiet_hours_enabled(&contact, &default_profile, false),
+            "DEFAULT 全 None → 回落 global=false（字节等价）"
+        );
     }
 }

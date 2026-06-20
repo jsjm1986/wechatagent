@@ -31,6 +31,7 @@ use crate::models::AgentTask;
 
 pub async fn build_initial_operation_profile(
     state: &AppState,
+    workspace_id: &str,
     note: &str,
     playbook: Option<&OperationPlaybook>,
 ) -> AppResult<GeneratedOperationProfile> {
@@ -38,7 +39,7 @@ pub async fn build_initial_operation_profile(
         "未配置运营方法。请根据运营备注自由生成克制、真实、可执行的运营画像。".to_string()
     });
     let domain_config =
-        load_user_operation_domain_config(state, &state.config.default_workspace_id).await?;
+        load_user_operation_domain_config(state, workspace_id).await?;
     let domain_text = domain_config
         .as_ref()
         .map(format_operation_domain_config_for_prompt)
@@ -51,7 +52,7 @@ pub async fn build_initial_operation_profile(
     // DEFAULT 销售域 prompt_fragment=None → 空串、prompt 字节等价（反过拟合护栏）。
     let active_profile = super::domain_profile::load_active_domain_profile(
         &state.db,
-        &state.config.default_workspace_id,
+        workspace_id,
     )
     .await;
     let business_context = render_business_context_fragment(
@@ -60,13 +61,13 @@ pub async fn build_initial_operation_profile(
     );
     let system = prompts::load_prompt(
         &state.db,
-        &state.config.default_workspace_id,
+        workspace_id,
         "user.initial_profile.system",
     )
     .await?;
     let task_template = prompts::load_prompt(
         &state.db,
-        &state.config.default_workspace_id,
+        workspace_id,
         "user.initial_profile.task",
     )
     .await?;
@@ -425,7 +426,8 @@ pub(crate) async fn decide_reply_with_promote(
     // 约定）。它按固定顺序串起：①经营公式段单一真相源（H15，剥离遗留内联段→注入 active
     // profile 公式段）②对话模式判定段（H9）③模式与 5 闸关系段（A/T2）④conversationMode
     // 枚举列表（H9 修复 A，对齐 runtime 校验集合）。DEFAULT_PROFILE / 老库 → 每步原样 →
-    // prompt 字节等价、销售域零变化（往返/字节等价护栏见 domain_profile.rs `#[cfg(test)]`）。
+    // 内容/语义等价（经营公式段从 policy 中部移至末尾，内容逐字保留、仅位置变；LLM 见到的
+    // 内容完全一致，零运行时影响）、销售域零行为变化（语义等价护栏见 domain_profile.rs `#[cfg(test)]`）。
     // **红线**：boundary_protection 不放宽边界保护硬规则段不在任何替换范围、任何行业写死守护。
     // 新增 reply.policy 类 prompt override 字段时，加进那个 helper（勿在此散接）——见 helper 文档。
     let policy = super::domain_profile::apply_reply_policy_prompt_overrides(&policy, &active_profile);

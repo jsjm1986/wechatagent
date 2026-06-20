@@ -227,20 +227,21 @@ impl UserRuntimeParameters {
         overrides: Option<&crate::models::ProfileThresholds>,
     ) {
         let Some(th) = overrides else { return };
+        // G13: clamp 到 1..=10 防 admin 误配极值禁用安全硬闸（与 evolution THRESHOLD_REASONABLE_BANDS 同口径，此处独立写路径需自守）
         if let Some(v) = th.fact_risk_block_at {
-            self.fact_risk_block_at = v;
+            self.fact_risk_block_at = v.clamp(1, 10);
         }
         if let Some(v) = th.pressure_risk_block_at {
-            self.pressure_risk_block_at = v;
+            self.pressure_risk_block_at = v.clamp(1, 10);
         }
         if let Some(v) = th.human_like_rewrite_below {
-            self.human_like_rewrite_below = v;
+            self.human_like_rewrite_below = v.clamp(1, 10);
         }
         if let Some(v) = th.emotional_value_rewrite_below {
-            self.emotional_value_rewrite_below = v;
+            self.emotional_value_rewrite_below = v.clamp(1, 10);
         }
         if let Some(v) = th.product_accuracy_block_below {
-            self.product_accuracy_block_below = v;
+            self.product_accuracy_block_below = v.clamp(1, 10);
         }
     }
 
@@ -880,5 +881,26 @@ mod tests {
         assert_eq!(rt.human_like_rewrite_below, 4);
         assert_eq!(rt.emotional_value_rewrite_below, 7);
         assert_eq!(rt.product_accuracy_block_below, 5);
+    }
+
+    #[test]
+    fn apply_threshold_overrides_clamps_out_of_range() {
+        // G13：admin 误配越界值（如 fact_risk_block_at=100 → score<100 恒真 → 幻觉硬闸禁用）
+        // 须被 clamp 到 1..=10；None 字段不动。
+        let mut rt = UserRuntimeParameters::default();
+        let overrides = crate::models::ProfileThresholds {
+            fact_risk_block_at: Some(100),           // 越界高 → clamp 10
+            pressure_risk_block_at: Some(0),         // 越界低 → clamp 1
+            human_like_rewrite_below: Some(-5),      // 越界低 → clamp 1
+            emotional_value_rewrite_below: Some(50), // 越界高 → clamp 10
+            product_accuracy_block_below: None,      // None → 不动
+        };
+        let before_product = rt.product_accuracy_block_below;
+        rt.apply_profile_threshold_overrides(Some(&overrides));
+        assert_eq!(rt.fact_risk_block_at, 10);
+        assert_eq!(rt.pressure_risk_block_at, 1);
+        assert_eq!(rt.human_like_rewrite_below, 1);
+        assert_eq!(rt.emotional_value_rewrite_below, 10);
+        assert_eq!(rt.product_accuracy_block_below, before_product); // None 回落不动
     }
 }
