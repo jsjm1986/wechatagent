@@ -359,6 +359,7 @@ pub async fn send_contact_message_gateway(
         source_event_id: String::new(),
         source_kind: SOURCE_KIND_MANUAL_SEND.to_string(),
         content: content.clone(),
+        media_asset_id: None,
         max_attempts: 3,
     };
     match outbox_enqueue(state, enqueue_req).await {
@@ -1780,6 +1781,7 @@ async fn run_user_operation_gateway_inner(
                 source_event_id: seg_source_event_id,
                 source_kind: trigger.kind().to_string(),
                 content: segment,
+                media_asset_id: None,
                 max_attempts: 3,
             };
             match outbox_enqueue(state, enqueue_req).await {

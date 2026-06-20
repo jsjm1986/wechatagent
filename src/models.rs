@@ -2413,6 +2413,10 @@ pub struct OutboxEntry {
     pub content: String,
     pub content_hash: String,
     pub idempotency_key: String,
+    /// 销售素材发送条目：非空表示这条 outbox 发的是 ContentAsset 文件而非文本。
+    /// dispatcher 据此走 send_outbound_media。`#[serde(default)]` 兼容旧文档。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub media_asset_id: Option<String>,
     #[serde(default)]
     pub attempt: i32,
     #[serde(default)]
@@ -4718,6 +4722,7 @@ mod typed_tests {
             content: "你好，欢迎咨询".to_string(),
             content_hash: "sha256:abcdef".to_string(),
             idempotency_key: "evt-source-001:wxid_test_001:sha256:abcdef".to_string(),
+            media_asset_id: None,
             attempt: 0,
             max_attempts: 3,
             status: "pending".to_string(),
