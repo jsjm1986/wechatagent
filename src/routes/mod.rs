@@ -24,7 +24,9 @@ mod admin_relationship_suggestions;
 mod admin_state_policies;
 mod admin_taxonomies;
 mod admin_taxonomy_candidates;
-mod ask_human_inbox;
+// pub（非 pub(crate)）：ask_human_phase1_e2e.rs 集成测试需从 tests/ crate 直调
+// ask_human_inbox / ask_human_summary handler 真函数，仿 domain_profiles 已有先例。
+pub mod ask_human_inbox;
 mod assets;
 mod auth;
 mod behavior_signal_metrics;
@@ -52,7 +54,9 @@ mod observability;
 mod outcome_metrics;
 mod outcomes_autonomy;
 mod playbooks;
-mod principal_escalations;
+// pub（非默认私有）：ask_human_phase1_e2e.rs 集成测试需从 tests/ crate 直调
+// resolve / reassign / list handler 真函数及其请求体结构，仿 domain_profiles 先例。
+pub mod principal_escalations;
 mod products;
 mod prompt_templates;
 mod reviews;
