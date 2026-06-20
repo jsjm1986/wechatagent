@@ -95,6 +95,224 @@ async fn collect_knowledge_review(
         .collect())
 }
 
+/// 标签候选 pending → inline。隔离键是 scope（account_id 或 "global"），无 workspace_id；
+/// 仅暴露 scope="global" 的共享候选，避免泄漏账户私有候选（IDOR 安全）。
+async fn collect_taxonomy_candidates(
+    state: &AppState,
+    _ws: &str,
+    now_ms: i64,
+) -> AppResult<Vec<InboxItem>> {
+    use futures::TryStreamExt;
+    let cursor = state
+        .db
+        .collection_taxonomy_candidates()
+        .find(
+            doc! { "scope": "global", "status": "pending" },
+            mongodb::options::FindOptions::builder().limit(100).build(),
+        )
+        .await?;
+    let rows: Vec<crate::models::TaxonomyCandidate> = cursor.try_collect().await?;
+    Ok(rows
+        .into_iter()
+        .map(|c| {
+            let id = c.id.map(|o| o.to_hex()).unwrap_or_default();
+            InboxItem {
+                source: "taxonomy_candidate".into(),
+                id,
+                title: format!("标签候选：{}", c.kind),
+                summary: c.raw_value.clone(),
+                severity: "low".into(),
+                created_at: Some(c.last_seen_at),
+                age_hours: age_hours_of(Some(c.last_seen_at), now_ms),
+                action_kind: "inline".into(),
+                rich_component: None,
+                rich_params: None,
+            }
+        })
+        .collect())
+}
+
+/// 关系类型建议 pending → inline。无 created_at，用 last_seen_at。
+async fn collect_relationship_suggestions(
+    state: &AppState,
+    ws: &str,
+    now_ms: i64,
+) -> AppResult<Vec<InboxItem>> {
+    use futures::TryStreamExt;
+    let cursor = state
+        .db
+        .collection_relationship_type_suggestions()
+        .find(
+            doc! { "workspace_id": ws, "status": "pending" },
+            mongodb::options::FindOptions::builder().limit(100).build(),
+        )
+        .await?;
+    let rows: Vec<crate::models::RelationshipTypeSuggestion> = cursor.try_collect().await?;
+    Ok(rows
+        .into_iter()
+        .map(|r| {
+            let id = r.id.map(|o| o.to_hex()).unwrap_or_default();
+            InboxItem {
+                source: "relationship_suggestion".into(),
+                id,
+                title: format!("关系类型建议：{}", r.suggested_value),
+                summary: r.suggested_value.clone(),
+                severity: "low".into(),
+                created_at: Some(r.last_seen_at),
+                age_hours: age_hours_of(Some(r.last_seen_at), now_ms),
+                action_kind: "inline".into(),
+                rich_component: None,
+                rich_params: None,
+            }
+        })
+        .collect())
+}
+
+/// 知识缺口信号 pending → inline。
+async fn collect_gap_signals(
+    state: &AppState,
+    ws: &str,
+    now_ms: i64,
+) -> AppResult<Vec<InboxItem>> {
+    use futures::TryStreamExt;
+    let cursor = state
+        .db
+        .knowledge_gap_signals()
+        .find(
+            doc! { "workspace_id": ws, "status": "pending" },
+            mongodb::options::FindOptions::builder().limit(100).build(),
+        )
+        .await?;
+    let rows: Vec<crate::models::KnowledgeGapSignal> = cursor.try_collect().await?;
+    Ok(rows
+        .into_iter()
+        .map(|g| {
+            let id = g.id.map(|o| o.to_hex()).unwrap_or_default();
+            InboxItem {
+                source: "gap_signal".into(),
+                id,
+                title: g.title.clone(),
+                summary: g.description.clone(),
+                severity: "medium".into(),
+                created_at: Some(g.created_at),
+                age_hours: age_hours_of(Some(g.created_at), now_ms),
+                action_kind: "inline".into(),
+                rich_component: None,
+                rich_params: None,
+            }
+        })
+        .collect())
+}
+
+/// profile 待激活草稿(current_version=true && is_active=false) → rich。
+async fn collect_profile_drafts(
+    state: &AppState,
+    ws: &str,
+    now_ms: i64,
+) -> AppResult<Vec<InboxItem>> {
+    use futures::TryStreamExt;
+    let cursor = state
+        .db
+        .domain_profiles()
+        .find(
+            doc! { "workspace_id": ws, "current_version": true, "is_active": false },
+            mongodb::options::FindOptions::builder().limit(50).build(),
+        )
+        .await?;
+    let rows: Vec<crate::models::DomainProfile> = cursor.try_collect().await?;
+    Ok(rows
+        .into_iter()
+        .map(|p| {
+            let id = p.id.map(|o| o.to_hex()).unwrap_or_default();
+            InboxItem {
+                source: "profile_risky".into(),
+                id: id.clone(),
+                title: format!("待激活画像：{}", p.display_name),
+                summary: "AI 生成的运营画像草稿待人审激活".into(),
+                severity: "high".into(),
+                created_at: Some(p.created_at),
+                age_hours: age_hours_of(Some(p.created_at), now_ms),
+                action_kind: "rich".into(),
+                rich_component: Some("profilePublish".into()),
+                rich_params: Some(doc! { "profileId": id }),
+            }
+        })
+        .collect())
+}
+
+/// 进化候选 eligible_for_release → rich。
+async fn collect_evolution_proposals(
+    state: &AppState,
+    ws: &str,
+    now_ms: i64,
+) -> AppResult<Vec<InboxItem>> {
+    use futures::TryStreamExt;
+    let cursor = state
+        .db
+        .proposals()
+        .find(
+            doc! { "workspace_id": ws, "status": "eligible_for_release" },
+            mongodb::options::FindOptions::builder().limit(50).build(),
+        )
+        .await?;
+    let rows: Vec<crate::models::Proposal> = cursor.try_collect().await?;
+    Ok(rows
+        .into_iter()
+        .map(|p| {
+            let id = p.id.map(|o| o.to_hex()).unwrap_or_default();
+            InboxItem {
+                source: "evolution_proposal".into(),
+                id: id.clone(),
+                title: format!("进化候选：{}", p.proposal_kind),
+                summary: p.diff_summary.clone().unwrap_or_default(),
+                severity: "medium".into(),
+                created_at: Some(p.created_at),
+                age_hours: age_hours_of(Some(p.created_at), now_ms),
+                action_kind: "rich".into(),
+                rich_component: Some("evolutionRelease".into()),
+                rich_params: Some(doc! { "proposalId": id }),
+            }
+        })
+        .collect())
+}
+
+/// lessons_learned pending_review → rich。裸 Document（无 typed accessor）。
+async fn collect_lessons_learned(
+    state: &AppState,
+    ws: &str,
+    now_ms: i64,
+) -> AppResult<Vec<InboxItem>> {
+    use futures::TryStreamExt;
+    let coll = state.db.raw().collection::<Document>("lessons_learned");
+    let cursor = coll
+        .find(
+            doc! { "workspace_id": ws, "review_status": "pending_review" },
+            mongodb::options::FindOptions::builder().limit(50).build(),
+        )
+        .await?;
+    let rows: Vec<Document> = cursor.try_collect().await?;
+    Ok(rows
+        .into_iter()
+        .map(|d| {
+            let id = d.get_object_id("_id").map(|o| o.to_hex()).unwrap_or_default();
+            let kind = d.get_str("pattern_kind").unwrap_or("").to_string();
+            let created = d.get_datetime("created_at").ok().copied();
+            InboxItem {
+                source: "lessons_learned".into(),
+                id,
+                title: format!("经验晋升：{kind}"),
+                summary: "AI 总结的经验待人审晋升为案例".into(),
+                severity: "low".into(),
+                created_at: created,
+                age_hours: age_hours_of(created, now_ms),
+                action_kind: "rich".into(),
+                rich_component: Some("lessonsPromote".into()),
+                rich_params: None,
+            }
+        })
+        .collect())
+}
+
 #[derive(Debug, Deserialize)]
 pub struct InboxQuery {
     #[serde(default)]
@@ -126,7 +344,12 @@ pub async fn ask_human_inbox(
 
     collect_source!("principal_escalation", collect_escalations(&state, ws, now_ms));
     collect_source!("knowledge_review", collect_knowledge_review(&state, ws, now_ms));
-    // Task 12 在此追加其余 source。
+    collect_source!("taxonomy_candidate", collect_taxonomy_candidates(&state, ws, now_ms));
+    collect_source!("relationship_suggestion", collect_relationship_suggestions(&state, ws, now_ms));
+    collect_source!("gap_signal", collect_gap_signals(&state, ws, now_ms));
+    collect_source!("profile_risky", collect_profile_drafts(&state, ws, now_ms));
+    collect_source!("evolution_proposal", collect_evolution_proposals(&state, ws, now_ms));
+    collect_source!("lessons_learned", collect_lessons_learned(&state, ws, now_ms));
 
     Ok(Json(json!({ "items": items, "errors": errors })))
 }
@@ -149,9 +372,57 @@ pub async fn ask_human_summary(
         .count_documents(doc! { "workspace_id": ws, "integrity_status": "needs_review" }, None)
         .await
         .unwrap_or(0);
-    // Task 12 追加其余 source 计数。
+    let taxonomy_candidate = state
+        .db
+        .collection_taxonomy_candidates()
+        .count_documents(doc! { "scope": "global", "status": "pending" }, None)
+        .await
+        .unwrap_or(0);
+    let relationship_suggestion = state
+        .db
+        .collection_relationship_type_suggestions()
+        .count_documents(doc! { "workspace_id": ws, "status": "pending" }, None)
+        .await
+        .unwrap_or(0);
+    let gap_signal = state
+        .db
+        .knowledge_gap_signals()
+        .count_documents(doc! { "workspace_id": ws, "status": "pending" }, None)
+        .await
+        .unwrap_or(0);
+    let profile_risky = state
+        .db
+        .domain_profiles()
+        .count_documents(
+            doc! { "workspace_id": ws, "current_version": true, "is_active": false },
+            None,
+        )
+        .await
+        .unwrap_or(0);
+    let evolution_proposal = state
+        .db
+        .proposals()
+        .count_documents(doc! { "workspace_id": ws, "status": "eligible_for_release" }, None)
+        .await
+        .unwrap_or(0);
+    let lessons_learned = state
+        .db
+        .raw()
+        .collection::<Document>("lessons_learned")
+        .count_documents(
+            doc! { "workspace_id": ws, "review_status": "pending_review" },
+            None,
+        )
+        .await
+        .unwrap_or(0);
     Ok(Json(json!({
         "principalEscalation": escalations,
         "knowledgeReview": knowledge,
+        "taxonomyCandidate": taxonomy_candidate,
+        "relationshipSuggestion": relationship_suggestion,
+        "gapSignal": gap_signal,
+        "profileRisky": profile_risky,
+        "evolutionProposal": evolution_proposal,
+        "lessonsLearned": lessons_learned,
     })))
 }
