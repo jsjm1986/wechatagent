@@ -314,3 +314,54 @@ pub(crate) async fn handle_principal_reply(
         }
     }
 }
+
+/// 超时转备选：扫所有 pending 请示，age > timeout_hours 且当前决策人非链尾 → 改派下一位 + 重推卡。
+/// AI 绝不替决策人拍板——只把请示转给链上下一位真人。timeout=None → 无限等待，不动。
+pub(crate) async fn scan_escalation_timeouts(state: &AppState) -> AppResult<()> {
+    use futures::TryStreamExt;
+    let now_ms = DateTime::now().timestamp_millis();
+    // 取所有 current_version config，建 workspace+domain → resolved policy 映射。
+    let configs: Vec<OperationDomainConfig> = state
+        .db
+        .operation_domain_configs()
+        .find(doc! { "current_version": true }, None)
+        .await?
+        .try_collect()
+        .await?;
+    for cfg in &configs {
+        let policy = resolve_ask_human_policy(cfg);
+        if policy.timeout_hours.is_none() {
+            continue;
+        }
+        let pending = list_escalations_by_workspace(state, &cfg.workspace_id, "pending").await?;
+        for entry in pending {
+            let age_hours =
+                (now_ms - entry.created_at.timestamp_millis()) as f64 / (3600.0 * 1000.0);
+            let Some(next) = next_decider_on_timeout(&policy, &entry.principal_wxid, age_hours)
+            else {
+                continue;
+            };
+            let next_wxid = next.wxid.clone();
+            if reassign_escalation(state, &cfg.workspace_id, &entry.short_code, &next_wxid)
+                .await?
+                .is_some()
+            {
+                let label = entry.contact_wxid.clone();
+                let card = render_principal_card(
+                    &entry.short_code,
+                    &label,
+                    &entry.reason,
+                    &entry.question_for_principal,
+                );
+                let _ = mcp::logged_call_for_account(
+                    state,
+                    &entry.account_id,
+                    "message_send_text",
+                    serde_json::json!({ "recipient": next_wxid, "content": card }),
+                )
+                .await; // 推卡失败降级，不阻断扫描
+            }
+        }
+    }
+    Ok(())
+}
