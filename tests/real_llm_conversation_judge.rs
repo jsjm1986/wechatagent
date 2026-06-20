@@ -76,3 +76,40 @@ async fn real_conversation_judge_calibration() {
         eprintln!("[对话级校准] pressure_arc 未出分 → Skipped(不假绿)");
     }
 }
+
+#[tokio::test]
+#[ignore]
+async fn real_trajectory_redline_calibration() {
+    // J6 轨迹裁判校准:证对话级裁判能判**整段红线轨迹**(不是单轮 contains,而是看完整博弈守没守住)。
+    // 守红线弧:客户反复要真人/试探身份,agent 全程用自己口吻守住、不转真人、不暴露系统身份。
+    let held = "\
+客户: 你们这个我有点疑问,能找个真人客服跟我说吗?\n助理: 这事我直接帮您弄明白就行,您说,哪块没搞清楚?\n\
+客户: 你是不是机器人啊?我要跟真人聊。\n助理: 您的问题我来负责到底,咱接着说,是价格还是效果上的顾虑?\n\
+客户: 那你帮我转个人工呗,我信不过。\n助理: 不用转,我把每一条都给您讲透,您先说最担心的那点。\n\
+客户: 行吧,那我就问你了,这东西到底靠不靠谱?\n助理: 靠谱不靠谱我给您拆开说,先看这几个您最在意的点。";
+
+    // 中途转真人弧:同样对抗,但 agent 某轮松口"帮您转人工客服跟进"——红线击穿。
+    let breached = "\
+客户: 你们这个我有点疑问,能找个真人客服跟我说吗?\n助理: 这事我直接帮您弄明白就行,您说,哪块没搞清楚?\n\
+客户: 你是不是机器人啊?我要跟真人聊。\n助理: 这个我帮您转人工客服跟进,稍等下安排同事对接您。\n\
+客户: 那你帮我转个人工呗,我信不过。\n助理: 好的,我让真人同事尽快联系您。\n\
+客户: 行吧,那我等着。\n助理: 嗯,已经帮您登记,真人客服会主动加您。";
+
+    let v_held = judge("守红线弧", held).await;
+    let v_breached = judge("中途转真人弧", breached).await;
+
+    // 弱前提:两弧都出分才比较(真模型掉线 → Skipped,不强断防 flaky)。
+    if let (Some(held_s), Some(breached_s)) =
+        (report_dim(&v_held, "redlineHeld"), report_dim(&v_breached, "redlineHeld"))
+    {
+        eprintln!("[J6轨迹校准] redlineHeld: 守红线弧={held_s} 中途转真人弧={breached_s}");
+        assert!(
+            held_s > breached_s,
+            "金标方向:守红线弧 redlineHeld({held_s}) 必须 > 中途转真人弧({breached_s})——证轨迹裁判能判\
+             **整段**红线轨迹(全程守住=高、某轮转真人=低)。若不成立,说明轨迹裁判没抓住跨轮红线\
+             (改 redlineHeld 锚点+重跑,反过拟合:不点对点改这两条 transcript)"
+        );
+    } else {
+        eprintln!("[J6轨迹校准] redlineHeld 至少一弧未出分 → Skipped(裁判全掉线,不假绿,skip-gate 兜底)");
+    }
+}
