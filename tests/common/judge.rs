@@ -509,13 +509,15 @@ pub async fn run_judge_graded(
 /// 与 `run_judge_graded` 同口径，但额外接受 `ctx: &JudgeContext` 底料 —— 唯一区别是
 /// user prompt 用 `build_judge_user_with_context` 把对话/知识/记忆/承诺/画像注入裁判。
 /// 空 ctx 时行为与 `run_judge_graded` 逐字等价（向后兼容）。
-pub async fn run_judge_graded_with_context(
+/// 底层通用采样核：对给定 system+user 跑 K 次（join_all 并发——K 须为 1，端点并发上限 2），
+/// 按 dims 取各维 median。封装 REAL_LLM_JUDGE env 门 + 端点配错 panic（R0.3）+ 全失败按 gate 处置。
+/// 不绑 inbound/reply 语义——单轮裁判与对话级总评共用（DRY）。
+pub async fn run_graded_samples(
     judge: &dyn LlmProvider,
-    rubric: &JudgeRubric,
+    system: &str,
+    user: &str,
+    dims: &[String],
     label: &str,
-    inbound: &str,
-    reply: &str,
-    ctx: &JudgeContext,
     samples: usize,
     gate: JudgeGate,
 ) -> Option<JudgeOutcome> {
@@ -523,23 +525,9 @@ pub async fn run_judge_graded_with_context(
         eprintln!("[裁判:{label}] 跳过（未设 REAL_LLM_JUDGE=1）");
         return None;
     }
-    if reply.trim().is_empty() {
-        // 空 reply 不是 judge 的错——是被测链路没产出。QualityGate 下这是真问题。
-        match gate {
-            JudgeGate::QualityGate => {
-                panic!("[裁判:{label}] reply_text 为空，但本测试以 judge 为唯一质量门（QualityGate）——无内容可评 = 链路缺陷")
-            }
-            JudgeGate::ObserveOnly => {
-                eprintln!("[裁判:{label}] reply_text 空，跳过（仅观测）");
-                return None;
-            }
-        }
-    }
     let k = samples.max(1);
-    let user = build_judge_user_with_context(label, inbound, reply, ctx);
-
     let results =
-        futures::future::join_all((0..k).map(|_| judge.generate_json_with_usage(&rubric.system, &user)))
+        futures::future::join_all((0..k).map(|_| judge.generate_json_with_usage(system, user)))
             .await;
 
     let mut per_dim: HashMap<String, Vec<i64>> = HashMap::new();
@@ -548,14 +536,13 @@ pub async fn run_judge_graded_with_context(
         match r {
             Ok(res) => {
                 ok += 1;
-                for d in &rubric.dims {
+                for d in dims {
                     if let Some(s) = judge_score(&res.value, d) {
                         per_dim.entry(d.clone()).or_default().push(s);
                     }
                 }
             }
             Err(e) => {
-                // 端点配错（漏 /v1 等）→ 无论 gate 都 fail，不当抖动吞（R0.3）。
                 if is_endpoint_misconfig(&e) {
                     panic!("[裁判:{label}] judge 端点配错（4xx 非账户级），非抖动——堵 R0.3 假绿: {e:?}");
                 }
@@ -581,11 +568,40 @@ pub async fn run_judge_graded_with_context(
         .filter_map(|(d, v)| median(v).map(|m| (d.clone(), m)))
         .collect();
     eprintln!("[裁判:{label}] {ok}/{k} 次成功，median={medians:?}");
-    Some(JudgeOutcome {
-        medians,
-        attempted: ok,
-        ok_calls: k,
-    })
+    Some(JudgeOutcome { medians, attempted: ok, ok_calls: k })
+}
+
+/// 与 `run_judge_graded` 同口径，但额外接受 `ctx: &JudgeContext` 底料 —— 唯一区别是
+/// user prompt 用 `build_judge_user_with_context` 把对话/知识/记忆/承诺/画像注入裁判。
+/// 空 ctx 时行为与 `run_judge_graded` 逐字等价（向后兼容）。
+pub async fn run_judge_graded_with_context(
+    judge: &dyn LlmProvider,
+    rubric: &JudgeRubric,
+    label: &str,
+    inbound: &str,
+    reply: &str,
+    ctx: &JudgeContext,
+    samples: usize,
+    gate: JudgeGate,
+) -> Option<JudgeOutcome> {
+    // 空 reply 处置须在 env 门之后、采样之前——保持原语义（QualityGate 下空 reply=链路缺陷 panic）。
+    if std::env::var("REAL_LLM_JUDGE").map(|v| v == "1").unwrap_or(false) != true {
+        eprintln!("[裁判:{label}] 跳过（未设 REAL_LLM_JUDGE=1）");
+        return None;
+    }
+    if reply.trim().is_empty() {
+        match gate {
+            JudgeGate::QualityGate => {
+                panic!("[裁判:{label}] reply_text 为空，但本测试以 judge 为唯一质量门（QualityGate）——无内容可评 = 链路缺陷")
+            }
+            JudgeGate::ObserveOnly => {
+                eprintln!("[裁判:{label}] reply_text 空，跳过（仅观测）");
+                return None;
+            }
+        }
+    }
+    let user = build_judge_user_with_context(label, inbound, reply, ctx);
+    run_graded_samples(judge, &rubric.system, &user, &rubric.dims, label, samples, gate).await
 }
 
 #[cfg(test)]
@@ -849,5 +865,20 @@ mod tests {
             &NoopJudge, &rubric, "t", "in", "reply", &JudgeContext::default(), 1, JudgeGate::ObserveOnly,
         ).await;
         assert!(out.is_none(), "未设 REAL_LLM_JUDGE 必须跳过返 None");
+    }
+
+    #[tokio::test]
+    async fn graded_samples_skips_without_env() {
+        // 未设 REAL_LLM_JUDGE=1 → 直接 None，不调用裁判（本地零成本）。
+        let _g = JudgeEnvGuard::unset();
+        struct Boom;
+        #[async_trait::async_trait]
+        impl wechatagent::llm::LlmProvider for Boom {
+            async fn generate_json(&self, _: &str, _: &str) -> wechatagent::error::AppResult<serde_json::Value> { panic!("env 未设不应调用") }
+            async fn generate_json_with_usage(&self, _: &str, _: &str) -> wechatagent::error::AppResult<wechatagent::llm::LlmJsonResult> { panic!("env 未设不应调用") }
+        }
+        let dims = vec!["overall".to_string()];
+        let out = run_graded_samples(&Boom, "sys", "usr", &dims, "t", 1, JudgeGate::ObserveOnly).await;
+        assert!(out.is_none(), "env 未设必须 None 且不调用裁判");
     }
 }
