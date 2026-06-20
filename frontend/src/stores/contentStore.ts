@@ -26,6 +26,13 @@ interface ContentActions {
   }) => void;
   loadAssets: (accountId?: string) => Promise<void>;
   createAsset: (accountId?: string) => Promise<void>;
+  uploadMediaAsset: (form: FormData, accountId?: string) => Promise<boolean>;
+  reviewMediaAsset: (
+    id: string,
+    status: "approved" | "draft",
+    note?: string,
+    accountId?: string
+  ) => Promise<void>;
 }
 
 export const useContentStore = create<ContentState & ContentActions>((set, get) => ({
@@ -82,6 +89,39 @@ export const useContentStore = create<ContentState & ContentActions>((set, get) 
       });
 
       // 重新加载 assets
+      await get().loadAssets(accountId);
+    } catch (error) {
+      useUiStore.getState().setError(error instanceof Error ? error.message : String(error));
+    } finally {
+      useUiStore.getState().setBusy(false);
+    }
+  },
+
+  uploadMediaAsset: async (form: FormData, accountId?: string) => {
+    useUiStore.getState().setBusy(true);
+    useUiStore.getState().setError("");
+    try {
+      await api.postForm<{ id: string }>("/api/content-assets/upload", form);
+      await get().loadAssets(accountId);
+      return true;
+    } catch (error) {
+      useUiStore.getState().setError(error instanceof Error ? error.message : String(error));
+      return false;
+    } finally {
+      useUiStore.getState().setBusy(false);
+    }
+  },
+
+  reviewMediaAsset: async (
+    id: string,
+    status: "approved" | "draft",
+    note?: string,
+    accountId?: string
+  ) => {
+    useUiStore.getState().setBusy(true);
+    useUiStore.getState().setError("");
+    try {
+      await api.post(`/api/content-assets/${id}/review`, { status, note });
       await get().loadAssets(accountId);
     } catch (error) {
       useUiStore.getState().setError(error instanceof Error ? error.message : String(error));

@@ -126,6 +126,17 @@ export type ContentAsset = {
   url?: string;
   mediaId?: string;
   usageScene?: string;
+  // 销售素材文件字段
+  mediaType?: "image" | "file" | "video";
+  fileName?: string;
+  fileSize?: number;
+  mimeType?: string;
+  sendTriggerHint?: string;
+  targetStages?: string[];
+  expressionPref?: "file_primary" | "file_support";
+  requiresPrincipalApproval?: boolean;
+  reviewStatus?: "draft" | "approved";
+  reviewNote?: string;
 };
 
 export type AgentSoul = {

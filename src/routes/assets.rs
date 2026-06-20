@@ -85,6 +85,17 @@ pub(super) async fn list_content_assets(
             "url": asset.url,
             "mediaId": asset.media_id,
             "usageScene": asset.usage_scene,
+            // 销售素材文件字段（前端预览/审核用）
+            "mediaType": asset.media_type,
+            "fileName": asset.file_name,
+            "fileSize": asset.file_size,
+            "mimeType": asset.mime_type,
+            "sendTriggerHint": asset.send_trigger_hint,
+            "targetStages": asset.target_stages,
+            "expressionPref": asset.expression_pref,
+            "requiresPrincipalApproval": asset.requires_principal_approval,
+            "reviewStatus": asset.review_status,
+            "reviewNote": asset.review_note,
             "updatedAt": crate::models::dt_to_string(asset.updated_at)
         }));
     }
