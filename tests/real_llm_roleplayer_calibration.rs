@@ -5,8 +5,6 @@
 
 mod common;
 
-use std::sync::Arc;
-
 use common::conversation_gate::judges_from_env;
 use common::roleplayer_calibration::{realism_dim, run_realism_judge};
 use common::roleplayer::{
