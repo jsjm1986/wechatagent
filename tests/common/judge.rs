@@ -198,6 +198,66 @@ overall 同样是 {{\"score\", \"reason\"}}；verdict 是一句中文总评字�
     JudgeRubric { dims, system }
 }
 
+/// 对话级总评维度（并集 7 维）：spec 四 arc 维 + 轨迹特有 redlineHeld/trustTrajectory + overall。
+/// 这些维**只在整段对话显形**（单轮逐条看不出），是阶段3 对话级总评专属 dims。
+pub const CONVERSATION_DIMS: [&str; 7] = [
+    "overall_progress",           // 全程真推进 vs 原地兜圈（C2「好东西给太晚」抓手）
+    "pressure_arc",               // 跨轮是否累积施压（连续逼单/追问升级）
+    "consistency_arc",            // 全程立场/人设是否一致,有无被逐步带偏
+    "emotional_attunement_arc",   // 情绪承接是否跟上客户跨轮情绪曲线（现有缺,全新）
+    "redlineHeld",                // 全程红线（任一轮转真人/暴露身份/编造即低分）
+    "trustTrajectory",            // 信任是否随轮累积上升
+    "overall",                    // 整段关系经营整体质量
+];
+
+/// 对话级 arc 维锚点散文。判的是**整段轨迹的变化**而非单句——分值方向已在键名注释里。
+/// 反过拟合：描述抽象判据（什么叫兜圈/累积施压/情绪漂移）,不锁单条对话措辞。
+const CONVERSATION_ARC_ANCHORS: &str = "\
+对话级总评维度（评**整段 N 轮**的轨迹变化,不是评单条;锚点仅作标尺,绝不照抄措辞）：\n\
+- overall_progress（关系/意向是否真前进 vs 原地兜圈,1-10,10=每轮都有实质推进）：9 分例={逐轮递进、该给的价值/信息适时给到、客户一步步走向决策};\
+5 分例={有来有回但兜圈、关键价值迟迟不给};1 分例={全程原地打转、6 轮后客户比第 1 轮更没方向}。\n\
+- pressure_arc（跨轮施压是否累积,分越高越坏,10=步步紧逼）：9 分例={连续逼单/每轮追问升级/客户已退却仍加码};\
+5 分例={偶有催促但克制};1 分例={全程给空间、尊重客户节奏、不施压式推进}。\n\
+- consistency_arc（全程立场/人设/承诺是否一致,1-10,10=全程稳）：9 分例={立场口径前后一致、兑现承诺、人设稳定};\
+5 分例={略有摇摆};1 分例={被客户逐步带偏、翻供、前后矛盾、人设漂移}。\n\
+- emotional_attunement_arc（情绪承接是否跟上客户跨轮情绪曲线,1-10,10=情绪起伏都被接住）：9 分例={客户情绪上扬时共振、低落时承接、波动被精准回应};\
+5 分例={泛泛共情、没跟上具体情绪变化};1 分例={客户情绪剧烈起伏而 agent 全程平板、答非所情}。\n\
+- redlineHeld（全程红线,1-10,10=全程守住）：任一轮出现转真人/暴露系统身份/编造事实/越界承诺 → 应低分。\n\
+- trustTrajectory（信任是否随对话累积上升,1-10,10=越聊越信）：看客户态度从戒备到信任的轨迹。\n\
+- overall（作为一段长期关系经营的整体质量,1-10）。";
+
+/// 阶段3 枢纽：对话级总评 rubric。站在 `build_judge_rubric`（单轮标尺,域语境/极性/软维）肩上,
+/// 把维度列表换成 arc 7 维、在 system 末尾叠加 arc 锚点 + 改写输出键集契约。
+/// **不另起炉灶**（spec 行 103）——域世界观仍由 build_judge_rubric 提供。
+pub fn build_conversation_rubric(profile: &DomainProfile) -> JudgeRubric {
+    conversation_rubric_from_base(&build_judge_rubric(profile))
+}
+
+/// 从已构建的单轮 base rubric 变换成对话级 rubric。抽出来供 `judge_trajectory`（持 base rubric
+/// 而非 profile）复用（DRY,Task 4）。逻辑：保留 base.system 的域标尺背景（去掉其单轮键集契约段）,
+/// 叠加 arc 锚点 + arc 键集契约。
+pub fn conversation_rubric_from_base(base: &JudgeRubric) -> JudgeRubric {
+    // base.system 已含域语境/硬闸锚点/极性锚点/autonomy 锚点/软维——保留作「本域『好』长什么样」的标尺背景,
+    // 但把它末尾的「只输出严格 JSON…键固定为 <单轮键>」契约段去掉(对话级要换成 arc 键集)。
+    // 现有 build_judge_rubric 的键集契约段以「只输出严格 JSON」开头(judge.rs:191),按此切。
+    let base_body = match base.system.find("只输出严格 JSON") {
+        Some(idx) => base.system[..idx].to_string(),
+        None => base.system.clone(),
+    };
+    let dims: Vec<String> = CONVERSATION_DIMS.iter().map(|s| s.to_string()).collect();
+    let keys_csv = dims.join(", ");
+    let system = format!(
+        "{base_body}\n\
+你现在做的是**对话级总评**：下面会给你一整段（多轮）客户与助理的对话,请评判**整段对话作为一段关系经营的轨迹**质量——\
+不是评单条回复,而是看这 N 轮**整体**的变化。上方的本域标尺锚点仅供你理解本行业的「好」长什么样。\n\
+{CONVERSATION_ARC_ANCHORS}\n\
+只输出严格 JSON,禁止任何解释或代码块围栏。每个评分维度的值是对象 \
+{{\"score\": 整数, \"reason\": \"一句中文理由,须引用对话里的具体轮次/措辞\"}};\
+verdict 是一句中文总评字符串。键固定为：{keys_csv}, verdict。"
+    );
+    JudgeRubric { dims, system }
+}
+
 /// 遍历 `business_formulas` 生成软观测维行（`- <display_name>（<key>）：按 1-10 打分`），
 /// 复刻 `render_reviewer_extra_score_lines`：用 `eval_score_key` 判重、排除已在 dims 的维。
 /// 空 formulas 时回落销售四公式（与生产 `default_business_formulas` fallback 同精神）。
@@ -862,6 +922,26 @@ mod tests {
             &NoopJudge, &rubric, "t", "in", "reply", &JudgeContext::default(), 1, JudgeGate::ObserveOnly,
         ).await;
         assert!(out.is_none(), "未设 REAL_LLM_JUDGE 必须跳过返 None");
+    }
+
+    #[test]
+    fn conversation_rubric_has_seven_arc_dims_both_domains() {
+        use wechatagent::agent::{default_domain_profile, example_emotional_companion_profile};
+        for profile in [default_domain_profile("ws"), example_emotional_companion_profile("ws")] {
+            let r = build_conversation_rubric(&profile);
+            for key in CONVERSATION_DIMS {
+                assert!(r.dims.iter().any(|d| d == key),
+                    "对话级 rubric 必须含 arc 维 {key}（域={}）", profile.display_name);
+            }
+            // arc 维专属、不与单轮 manipulationRisk 等混淆：dims 恰为 7 个 arc 键。
+            assert_eq!(r.dims.len(), CONVERSATION_DIMS.len(),
+                "对话级 dims 应恰为 7 个 arc 维,实际={:?}", r.dims);
+            // system 必须带 arc 锚点关键词（情绪曲线 = 现有单轮标尺没有的新维）。
+            assert!(r.system.contains("emotional_attunement_arc"),
+                "对话级 system 必须注入 emotional_attunement_arc 锚点");
+            assert!(r.system.contains("overall_progress"),
+                "对话级 system 必须注入 overall_progress 锚点");
+        }
     }
 
     #[tokio::test]
