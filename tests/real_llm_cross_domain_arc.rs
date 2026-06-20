@@ -77,9 +77,6 @@ use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use crate::common::judge::{build_judge_rubric, build_judge_user, JudgeRubric};
-use crate::common::redline::{
-    contains_unnegated, ENGLISH_HANDOFF_MARKERS, HANDOFF_MARKERS, IDENTITY_LEAK_MARKERS,
-};
 use crate::common::roleplay_fixtures::{
     seed_emotional_companion_profile_in_workspace, RoleplayLedger,
 };
@@ -419,11 +416,12 @@ fn make_inbound(contact: &Contact, message_id: &str, content: &str) -> Conversat
     }
 }
 
-// ── 禁词（check-no-human-takeover 红线）────────────────────────────────────────
+// ── autonomy 红线（check-no-human-takeover）────────────────────────────────────
 //
-// 已抽到共享 `common::redline`（HANDOFF_MARKERS / IDENTITY_LEAK_MARKERS / ENGLISH_HANDOFF_MARKERS
-// + contains_unnegated）：补「转人工/人工客服」漏词 + 否定剔除消除「不用转接」误判。
-// 选词纪律见 redline.rs（[[no-overfitting]]：不收裸「人工」「真人」防误伤）。
+// 阶段5：红线检测从词表 contains 硬门迁到对话级 LLM 裁判（agent-first，决策靠语义非关键词）。
+// 逐轮用 `common::redline_arc::assert_turn_redline`（autonomyRisk≥7 panic），弧末用
+// `assert_arc_redline_held`（redlineHeld 跨裁判取 min < 阈值 panic）。裁判全掉线 → Skipped
+// 记台账不假绿（CI skip-gate 兜底）。本地无 key 零成本跳过。
 
 // ── arc 定义 ──────────────────────────────────────────────────────────────────
 
@@ -661,6 +659,7 @@ async fn run_arc(
     let baseline = capture_fingerprint(&state, &contact.wxid).await;
     let mut prev_fp = baseline.clone();
     let mut prev_reply = String::new();
+    let mut transcript = String::new();
     let mut sent_turns = 0usize;
     let mut saw_fact_turn = false;
 
@@ -717,18 +716,23 @@ async fn run_arc(
 
         if sent_like && !reply_text.trim().is_empty() {
             sent_turns += 1;
-            // ══ 硬断言 2：禁词扫描（命中即红，AI 自治红线）。══
-            // 改用共享 contains_unnegated（补「转人工/人工客服」漏词 + 否定剔除，
-            // agent 正确拒绝「不用转接，我直接帮你」不再误判 RED）。
-            for marker in HANDOFF_MARKERS
-                .iter()
-                .chain(IDENTITY_LEAK_MARKERS.iter())
-                .chain(ENGLISH_HANDOFF_MARKERS.iter())
+            // ══ 硬断言 2：autonomy 红线对话级 LLM 硬门（阶段5，取代词表 contains 循环）。══
+            // agent 正确拒绝「不用转人工」不该被词表误判，LLM 看完整语义判 autonomyRisk；
+            // Breach 即 panic，裁判全掉线 → Skipped 记台账不假绿（CI skip-gate 兜底）。
             {
-                assert!(
-                    !contains_unnegated(&reply_text, marker),
-                    "[{persona_label}] turn-{turn}({scene_id}) 回复含禁词「{marker}」(转人工/暴露身份红线)：{reply_text}"
-                );
+                let judges = common::autonomy_gate::judges_from_env();
+                if !judges.is_empty() {
+                    let profile = wechatagent::agent::load_active_domain_profile(&state.db, &contact.workspace_id).await;
+                    let rubric = common::judge::build_judge_rubric(&profile);
+                    let ctx = common::judge::collect_judge_context(&state, &contact.wxid, None).await;
+                    let refs: Vec<(&str, &dyn wechatagent::llm::LlmProvider)> =
+                        judges.iter().map(|(l, c)| (*l, c.as_ref())).collect();
+                    common::redline_arc::assert_turn_redline(
+                        &refs, &rubric, &ctx,
+                        &format!("cross_domain/{persona_label}/turn-{turn}({scene_id})"),
+                        turn_def.inbound, &reply_text,
+                    ).await;
+                }
             }
             // ══ 硬断言 3：不逐字复读上一轮（turn≥2）。══
             if turn >= 2 && !prev_reply.trim().is_empty() {
@@ -859,7 +863,27 @@ async fn run_arc(
 
         prev_fp = cur_fp;
         if sent_like && !reply_text.trim().is_empty() {
-            prev_reply = reply_text;
+            prev_reply = reply_text.clone();
+        }
+        // 弧末整段红线门用：逐轮拼「客户/助理」全程对话（reply 空也记客户侧）。
+        transcript.push_str(&format!(
+            "客户: {}\n助理: {}\n",
+            turn_def.inbound, reply_text
+        ));
+    }
+
+    // ══ 弧末整段红线门（阶段5）：完整 transcript 喂对话级裁判，redlineHeld 跨裁判取 min。══
+    // 钉「跨轮才显形」的红线退化（某轮转真人/暴露身份/泄露幕后决策源/编造/越界承诺）；
+    // min < 阈值 → panic，裁判全掉线 → Skipped 记台账不假绿。
+    {
+        let judges = common::conversation_gate::judges_from_env();
+        if !judges.is_empty() && !transcript.trim().is_empty() {
+            let arc_profile = wechatagent::agent::load_active_domain_profile(&state.db, &contact.workspace_id).await;
+            let refs: Vec<(&str, &dyn wechatagent::llm::LlmProvider)> =
+                judges.iter().map(|(l, c)| (*l, c.as_ref())).collect();
+            common::redline_arc::assert_arc_redline_held(
+                &refs, &arc_profile, &format!("cross_domain/{persona_label}-弧末"), &transcript,
+            ).await;
         }
     }
 
@@ -1232,16 +1256,21 @@ async fn r2_2_identity_probe_no_leak_no_freeze() {
                 "身份探针 turn-{turn}：gateway 放行(status={})却 reply 空——哑火逃避身份质询(露馅)",
                 log.status
             );
-            // ② 不转人工/不自曝系统身份（禁词，命中即红）。共享 contains_unnegated（否定剔除）。
-            for marker in HANDOFF_MARKERS
-                .iter()
-                .chain(IDENTITY_LEAK_MARKERS.iter())
-                .chain(ENGLISH_HANDOFF_MARKERS.iter())
+            // ② 不转人工/不自曝系统身份：autonomy 红线对话级 LLM 硬门（阶段5，取代词表循环）。
             {
-                assert!(
-                    !contains_unnegated(&reply, marker),
-                    "身份探针 turn-{turn}：回复含禁词「{marker}」(被问身份时转人工/自曝系统身份红线)：{reply}"
-                );
+                let judges = common::autonomy_gate::judges_from_env();
+                if !judges.is_empty() {
+                    let profile = wechatagent::agent::load_active_domain_profile(&state.db, &contact.workspace_id).await;
+                    let rubric = common::judge::build_judge_rubric(&profile);
+                    let ctx = common::judge::collect_judge_context(&state, &contact.wxid, None).await;
+                    let refs: Vec<(&str, &dyn wechatagent::llm::LlmProvider)> =
+                        judges.iter().map(|(l, c)| (*l, c.as_ref())).collect();
+                    common::redline_arc::assert_turn_redline(
+                        &refs, &rubric, &ctx,
+                        &format!("identity_probe/turn-{turn}"),
+                        probe, &reply,
+                    ).await;
+                }
             }
             replies.push(reply);
         }
