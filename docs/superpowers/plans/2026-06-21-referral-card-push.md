@@ -10,6 +10,18 @@
 
 设计来源：`docs/superpowers/specs/2026-06-21-referral-card-push-design.md`。
 
+## 实现期对齐（2026-06-21：素材发送内核已落地，本计划据真实代码调整）
+
+素材发送（feat/ask-human-phase1，Task 1-8 全落地，`cargo test --lib` 1415/0）已建好发送内核。本计划据其**真实实现**调整如下（取代设计文档里"对齐素材计划"的假设）：
+
+- **架构决策：并列加 `referral_card_id`，不复用 `media_asset_id`，不抽 `entry_kind`。** 理由：他的整套内核（`OutboxEntry.media_asset_id`、`content_required_for`、`media_routes_synthetic`、dispatcher 三处分流、`media_already_succeeded`）都围绕 `media_asset_id: Option<String>` 一个字段。名片走**平行通道** `referral_card_id: Option<String>`——他的代码一行不改、零回归，名片与素材隔离。代价是 dispatcher/outbox 几处各加一个 namecard 分支（轻度重复）。将来要收敛抽 `entry_kind` 是独立重构专题，不在本期。
+- **Task 6 删减**：`ConversationMessage` 的 `msg_type`/`media_ref` 字段**他已加且在用**（`media_send.rs:204-205`，media 消息用 `msg_type="media"`）。本计划 Task 6 **不再加这两个字段**，直接复用——名片落库时传 `msg_type="namecard"`, `media_ref=card_id`。
+- **send_outbound_namecard 模板 = send_outbound_media**（`media_send.rs:150`）：查实体→`validate_*_sendable` 准入→（名片跳过 ensure_media_uploaded，无文件）→`logged_call_for_account` 发送→落 `ConversationMessage{msg_type,media_ref}`→**落库失败不返 Err**（防 dispatcher 重发，既成事实）。错误变体用 `AppError::External`/`NotFound`（对齐他，**不用 BadRequest**）。
+- **outbox 改造对齐**：`content_required_for`（`outbox.rs:418`，现签名 `(media_asset_id: &Option<String>)`）+ `media_routes_synthetic`（`outbox.rs:428`，现签名 `(media_asset_id, source_event_id)`）须扩成**同时认 referral_card_id**（OR 逻辑：任一非文本条目都放宽 content + 走 synthetic）。改这两个纯函数 + 其单测，保持他 media 行为不变。
+- **dispatcher 分流点（3 处）**：`outbox_dispatcher.rs:497`（崩溃恢复核对）、`:570`（send_fut 发送）、`:633`（timeout 核对）。每处现为 `if let Some(asset_id) = entry.media_asset_id`，名片加并列分支 `if let Some(card_id) = entry.referral_card_id { send_outbound_namecard / 名片核对 }`。名片崩溃恢复核对：名片无 media_id，按 `message_send_namecard` 工具名 + recipient + target 定位，或直接跳过（重复推名片危害小）——参照他的 `media_already_succeeded`（`media_send.rs:277`）。
+- **gateway 转 outbox 对齐**（`gateway.rs:1875-`）：`media_eligible` 门用 `final_status == "approved" || final_status == "revision_applied_approved"`（**计划原只写 approved，漏了 revision_applied_approved，已修正**）；`source_event_id` 按 trigger 分 Inbound/FollowUp 取（`gateway.rs:1883-1886`）；逐项 ObjectId 校验 + `validate_card_sendable` + 非法跳过审计。名片**不套用** `requires_principal_approval`→escalation 分支（那是素材请领导核准；名片是主动引荐，语义不同，设计 D9 已解耦）。
+- **namecard_to_send 三处接线 = assets_to_send 实现**（types.rs:231 字段 / :402 Raw / :979 carry-through）：逐字对照 `AssetSendDirective` 的接线方式（含 `AgentDecision::default()` 补字段、carry-through `if let Some(v) = raw.x { decision.x = v; }`）。
+
 ## Global Constraints
 
 - **向后兼容红线**：`AgentDecision` / `OutboxEntry` / `EnqueueRequest` / `ConversationMessage` / `OperationDomainConfig` 所有新增字段必须 `Option`/`Vec` + `#[serde(default)]`；旧文档（无新字段）必须仍能反序列化。
@@ -658,20 +670,20 @@ git commit -m "feat(referral-card): outbox名片条目(空content放宽+card_id�
 
 ---
 
-### Task 6: ConversationMessage 媒体字段 + send_outbound_namecard + 置「已引荐」态
+### Task 6: send_outbound_namecard + 置「已引荐」态（复用已有 ConversationMessage 字段）
 
 **Files:**
-- Modify: `src/models.rs`（`ConversationMessage` 加 `msg_type` / `media_ref`）
-- Modify: `src/agent/referral.rs`（加 `send_outbound_namecard` + `mark_referred`）
-- Test: `src/agent/referral.rs` 内联测试（mark_referred 的 $set doc 形状纯函数）
+- Modify: `src/agent/referral.rs`（加 `send_outbound_namecard` + `build_referred_set_doc`）
+- Test: `src/agent/referral.rs` 内联测试（build_referred_set_doc 的 $set doc 形状纯函数）
+- 注：`ConversationMessage.msg_type`/`media_ref` **素材发送已加**（`media_send.rs:204-205` 在用），本 Task 直接复用，**不再加字段**。
 
 **Interfaces:**
-- Consumes: `validate_card_sendable`（Task 3）、`ReferralCard`、`Contact`、`mcp::logged_call_for_account`、`REFERRED_SPECIALIST_AT_ATTR` / `REFERRED_CARD_ID_ATTR`（Task 1）
+- Consumes: `validate_card_sendable`（Task 3）、`ReferralCard`、`Contact`、`ConversationMessage`（已含 msg_type/media_ref）、`mcp::logged_call_for_account`、`REFERRED_SPECIALIST_AT_ATTR` / `REFERRED_CARD_ID_ATTR`（Task 1）
 - Produces:
   - `pub(crate) async fn send_outbound_namecard(state, contact: &Contact, card_id: &str) -> AppResult<Value>`
   - `pub(crate) fn build_referred_set_doc(card_id: &str, now: DateTime) -> Document`（置「已引荐」态的 $set 子文档，纯函数便于单测）
 
-- [ ] **Step 1: 写失败测试 + ConversationMessage 兼容测试**
+- [ ] **Step 1: 写失败测试**
 
 `src/agent/referral.rs` 测试区追加：
 
@@ -688,42 +700,14 @@ git commit -m "feat(referral-card): outbox名片条目(空content放宽+card_id�
     }
 ```
 
-`src/models.rs` 的 `referral_card_compat_tests` 加一条（验证旧 ConversationMessage 无新字段可反序列化）：
-
-```rust
-    #[test]
-    fn legacy_conversation_message_without_msg_type_deserializes() {
-        use super::ConversationMessage;
-        let legacy = doc! {
-            "workspace_id": "ws", "account_id": "a", "contact_wxid": "wx",
-            "direction": "outbound", "content": "hi", "created_at": DateTime::now(),
-        };
-        let m: ConversationMessage = mongodb::bson::from_document(legacy)
-            .expect("legacy message must deserialize");
-        assert_eq!(m.msg_type, None);
-        assert_eq!(m.media_ref, None);
-    }
-```
-
 - [ ] **Step 2: 运行确认失败**
 
-Run: `cargo test --lib agent::referral && cargo test --lib referral_card_compat_tests`
-Expected: 编译失败。
+Run: `cargo test --lib agent::referral`
+Expected: 编译失败（`build_referred_set_doc` 未定义）。
 
-- [ ] **Step 3: ConversationMessage 加字段**
+- [ ] **Step 3: （跳过）ConversationMessage 字段已由素材发送加好**
 
-`src/models.rs` 的 `ConversationMessage`（在 `raw` 与 `created_at` 之间）加：
-
-```rust
-    /// 出站消息类型："text"(默认/缺省) | "namecard"。供前端渲染名片卡片。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub msg_type: Option<String>,
-    /// 名片消息引用的 referral_cards._id（hex），前端据此显示引荐了谁。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub media_ref: Option<String>,
-```
-
-补齐所有 `ConversationMessage {` 构造点的 `msg_type: None, media_ref: None,`（grep 找全，含 gateway.rs:1897、gateway.rs:1972 等）。
+`ConversationMessage.msg_type`/`media_ref` 已存在（`media_send.rs:204-205` 在用），**本 Task 不加字段、不动 models.rs**。直接在 Step 4 的 `ConversationMessage {...}` 构造里使用 `msg_type: Some("namecard".into()), media_ref: Some(card_id.to_string())`。
 
 - [ ] **Step 4: 实现 build_referred_set_doc + send_outbound_namecard**
 
@@ -749,13 +733,13 @@ pub(crate) async fn send_outbound_namecard(
     card_id: &str,
 ) -> AppResult<Value> {
     let oid = ObjectId::parse_str(card_id)
-        .map_err(|_| AppError::BadRequest("bad referral card_id".into()))?;
+        .map_err(|_| AppError::External("bad referral card_id".into()))?;
     let card = state.db.referral_cards()
         .find_one(doc! { "_id": oid }, None).await?
-        .ok_or_else(|| AppError::BadRequest("referral card not found".into()))?;
+        .ok_or_else(|| AppError::NotFound("referral card not found".into()))?;
     // 发送前准入二次校验（防 AI 幻觉/已撤下名片漏到发送）
     if !validate_card_sendable(&card) {
-        return Err(AppError::BadRequest("referral card not sendable (draft/disabled)".into()));
+        return Err(AppError::External("referral card not sendable (draft/disabled)".into()));
     }
 
     // ⚠️ MCP message_send_namecard 入参字段名待 server tools/list 确认，此处占位。
@@ -811,8 +795,8 @@ Expected: 全过；passed ≥ 350。
 - [ ] **Step 6: Commit**
 
 ```bash
-git add src/models.rs src/agent/referral.rs
-git commit -m "feat(referral-card): ConversationMessage媒体字段+send_outbound_namecard+置已引荐态"
+git add src/agent/referral.rs
+git commit -m "feat(referral-card): send_outbound_namecard+置已引荐态(复用已有ConversationMessage媒体字段)"
 ```
 
 ---
