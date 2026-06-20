@@ -25,6 +25,7 @@ fn mk_entry(turn: i32, intent: &str) -> IntentTrajectoryEntry {
         intent: intent.to_string(),
         objection_type: None,
         recorded_at: DateTime::from_millis(turn as i64 * 1000),
+        dimensions: Default::default(),
     }
 }
 

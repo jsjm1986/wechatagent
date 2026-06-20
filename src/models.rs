@@ -1472,6 +1472,13 @@ pub struct DomainProfile {
     /// 纳入本字段，只有 `extra` 容器里的业务数组槽位走 memory_dimensions。
     #[serde(default)]
     pub memory_dimensions: Vec<MemoryDimension>,
+    /// H17：该行业的 intent 轨迹维度声明。空 = DEFAULT 销售（仅 objection_type 旧字段）。
+    #[serde(default)]
+    pub trajectory_dimensions: Vec<TrajectoryDimension>,
+    /// H18：该行业的 webhook 去抖窗口（毫秒）。None 回落全局 config.message_debounce_window_ms。
+    /// 陪伴域可设更长窗口（合并多条情绪表达），销售域用默认。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub debounce_window_ms_override: Option<u64>,
     /// universal-domain-adaptation C3：引导层「运营方法生成器」（playbook.generator /
     /// optimizer）的领域专属 system 引导语。`None` 时回落内置**领域中性**生成器引导语
     /// （C3 清理后 `PLAYBOOK_METHODOLOGY_SYSTEM` 已去除「消费心理学/顾问式销售/异议/
@@ -1514,6 +1521,12 @@ pub struct DomainProfile {
     /// 渲染 completeness prompt 的判断规则段、并回传前端档位标签。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub answering_mode_profile: Option<AnsweringModeProfile>,
+    /// H13：引导层 AI 生成 profile 时联动产出的状态机本体（draft 暂存料）。
+    /// activate 时取出、过 validate_state_machine、publish 一版新 OperationDomainConfig；
+    /// **发布后运行时只读 operation_domain_configs，不读本字段**（不造双真相源）。
+    /// None = 无生成本体 → activate 不动状态机，运行时回落现有 DEFAULT 销售 9 态。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generated_state_machine: Option<Document>,
     /// E5-T1 多版本灰度：同 `(workspace_id, profile_id)` 下 `version` 单调递增。
     #[serde(default = "default_version_one")]
     pub version: i32,
@@ -3611,6 +3624,14 @@ mod typed {
         }
     }
 
+    /// H17：通用轨迹维度声明（仿 MemoryDimension）。kind 走 system_taxonomies 字典，
+    /// display_name 是渲染给 prompt/人看的标签（销售"异议类型"/陪伴"顾虑类型"）。
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+    pub struct TrajectoryDimension {
+        pub kind: String,
+        pub display_name: String,
+    }
+
     /// Phase D / D1：intent 轨迹元素。每次 `record_user_reaction` 完成后追加一条，
     /// 上限 50 项滑窗（最早条目滚出）。`turn_index` 是该 contact 的回合序号
     /// （从已有 `conversation_messages` 行数估算或调用方递增）；`intent` 是
@@ -3629,6 +3650,10 @@ mod typed {
         pub intent: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub objection_type: Option<String>,
+        /// H17：通用轨迹维度容器（key=profile 声明的 kind，value=canonical 取值）。
+        /// 老数据无此字段→空 map。DEFAULT 销售域只写 objection_type 旧字段、此容器留空（字节等价）。
+        #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+        pub dimensions: std::collections::BTreeMap<String, String>,
         #[serde(default = "default_epoch_dt")]
         pub recorded_at: DateTime,
     }
@@ -3692,6 +3717,7 @@ mod typed {
 pub use typed::{
     CommitmentEntry, CommitmentRepr, IntentTrajectoryEntry, MemoryCardTyped, MemoryFact,
     MemoryFactRepr, OperationStateMachineTyped, OperationStateTyped, RuntimeParametersTyped,
+    TrajectoryDimension,
 };
 
 impl OperationDomainConfig {
@@ -4092,6 +4118,14 @@ impl std::fmt::Debug for LlmProviderConfig {
 mod typed_tests {
     use super::*;
     use mongodb::bson::doc;
+
+    #[test]
+    fn intent_trajectory_entry_legacy_objection_round_trips() {
+        let legacy = mongodb::bson::doc! { "turnIndex": 3, "intent": "advance", "objectionType": "price" };
+        let e: IntentTrajectoryEntry = mongodb::bson::from_document(legacy).unwrap();
+        assert_eq!(e.objection_type.as_deref(), Some("price"));
+        assert!(e.dimensions.is_empty(), "老数据 dimensions 默认空");
+    }
 
     #[test]
     fn runtime_parameters_typed_defaults_apply_when_missing() {
@@ -5380,5 +5414,21 @@ mod relationship_type_suggestion_tests {
         assert_eq!(back.occurrences, 1);
         assert!(back.reviewed_at.is_none());
         assert!(back.reviewed_by.is_none());
+    }
+}
+
+#[cfg(test)]
+mod generated_state_machine_tests {
+    use super::*;
+    use crate::agent::domain_profile::default_domain_profile;
+
+    /// H13：`DomainProfile.generated_state_machine` 默认 None + BSON round-trip 保真。
+    #[test]
+    fn generated_state_machine_defaults_none_and_round_trips() {
+        let p = default_domain_profile("ws");
+        assert!(p.generated_state_machine.is_none());
+        let d = mongodb::bson::to_document(&p).unwrap();
+        let back: DomainProfile = mongodb::bson::from_document(d).unwrap();
+        assert!(back.generated_state_machine.is_none());
     }
 }

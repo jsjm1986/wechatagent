@@ -35,7 +35,7 @@ use axum::{
     Extension, Json,
 };
 use futures::TryStreamExt;
-use mongodb::bson::{doc, oid::ObjectId, DateTime, Document};
+use mongodb::bson::{doc, oid::ObjectId, Bson, DateTime, Document};
 use mongodb::options::FindOptions;
 use mongodb::Collection;
 use serde::Deserialize;
@@ -494,6 +494,131 @@ pub async fn activate_domain_profile(
         None,
     )
     .await?;
+    // universal/H13：若该 profile 携带 AI 生成的状态机本体，activate 时把它 publish 成
+    // `operation_domain_configs` 在 `(workspace, user_operations)` 下的新 current 版本——
+    // 运行时引擎照旧按 `(workspace, domain, current_version=true)` 读表，零改动即拿到行业
+    // 状态机。`None`（如 DEFAULT 销售域）→ 不动状态机表 → 运行时字节等价回落 DEFAULT。
+    if let Some(machine) = target.generated_state_machine.as_ref() {
+        // 防御性二次校验：profile 草稿在生成后若被手改成非法状态机，这里跳过 publish 而
+        // 不阻塞 activate（profile 已激活；坏本体只意味着保留上一版状态机）。
+        match crate::routes::domains::validate_state_machine(machine) {
+            Ok(()) => {
+                if let Err(err) = super::admin_ops_versions::publish_state_machine_version(
+                    &state.db,
+                    &target.workspace_id,
+                    crate::agent::domain::USER_OPS_DOMAIN_ID,
+                    machine.clone(),
+                    format!("profile:{}", target.profile_id),
+                )
+                .await
+                {
+                    tracing::warn!(
+                        profile_id = %target.profile_id,
+                        workspace_id = %target.workspace_id,
+                        error = %err,
+                        "activate：状态机本体 publish 失败，profile 已激活，运行时保留原状态机（best-effort，不阻断激活）"
+                    );
+                } else {
+                    // universal/H13 幻影态修复：状态机已成功切到新行业机器，但本 workspace 的
+                    // **存量** contact 的 `operation_state` 仍是旧机器的 key（如 sales 的
+                    // `"negotiating"`）。这些 key 在新机器里不存在 → 运行时 `check_state_transition`
+                    // 找不到 `from` 态 → 该 contact 的状态机 fail-soft 静默冻结永不推进（幻影态）。
+                    // 新建 contact 不受影响（从新机器 initial 起步）；只有切域前已存在的 contact 受困。
+                    //
+                    // 修复：把「`operation_state` 已设且不在新机器 key 集合里」的存量 contact
+                    // 批量重置到新机器声明的 initial 态（T10 保证 publish 通过的机器必有 initial:true，
+                    // 这里用 guards 同一抽取逻辑取 initial key，不引第二份事实源）。
+                    // 精确 scope（红线：这是一次破坏性批量改客户数据）：
+                    //   - 只本 workspace；
+                    //   - 只 `operation_state` 已设且 `$nin` 新 key 集（真正非法态）；
+                    //   - `None`/未设的 contact 被 `$exists:true,$ne:null` 排除 → 首次运行时再补 initial；
+                    //   - 仍合法的态被 `$nin` 排除 → 不被误重置。
+                    let new_keys: std::collections::HashSet<String> = machine
+                        .get_array("states")
+                        .map(|states| {
+                            states
+                                .iter()
+                                .filter_map(|item| item.as_document())
+                                .filter_map(|state| state.get_str("key").ok().map(str::to_string))
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    // 防御：new_keys 为空时 `$nin:[]` 会匹配所有 contact → 误重置全量。T10 后
+                    // 不应发生（机器必有 state），但仍硬守：空集时跳过迁移。
+                    if new_keys.is_empty() {
+                        tracing::warn!(
+                            profile_id = %target.profile_id,
+                            workspace_id = %target.workspace_id,
+                            "activate：新状态机 key 集为空，跳过存量 contact 幻影态迁移（防止 $nin:[] 误重置全量）"
+                        );
+                    } else {
+                        let initial_key =
+                            crate::agent::initial_operation_state_key_in_machine(Some(
+                                machine,
+                            ));
+                        let nin: Vec<Bson> =
+                            new_keys.iter().cloned().map(Bson::String).collect();
+                        match state
+                            .db
+                            .contacts()
+                            .update_many(
+                                doc! {
+                                    "workspace_id": &target.workspace_id,
+                                    "operation_state": {
+                                        "$exists": true,
+                                        "$ne": Bson::Null,
+                                        "$nin": nin,
+                                    },
+                                },
+                                doc! {
+                                    "$set": {
+                                        "operation_state": &initial_key,
+                                        // 同步重写姊妹元数据：否则 reason/confidence/state_updated_at
+                                        // 仍指向旧机器已删除的态，admin/审计视图会显示「态=新 initial
+                                        // 但 reason=旧态描述」的错位三元组（运行时无害，下一轮 gateway
+                                        // 覆盖，但审计期间不一致）。reason 打迁移标记、清掉旧 confidence。
+                                        "operation_state_reason": "h13_phantom_state_migration: 换域激活，旧态在新状态机不存在，重置到 initial",
+                                        "operation_state_updated_at": now,
+                                        "updated_at": now,
+                                    },
+                                    "$unset": { "operation_state_confidence": "" },
+                                },
+                                None,
+                            )
+                            .await
+                        {
+                            Ok(result) => {
+                                tracing::info!(
+                                    profile_id = %target.profile_id,
+                                    workspace_id = %target.workspace_id,
+                                    initial_key = %initial_key,
+                                    matched = result.matched_count,
+                                    modified = result.modified_count,
+                                    "activate：存量 contact 幻影态已迁移到新状态机 initial 态"
+                                );
+                            }
+                            Err(err) => {
+                                tracing::warn!(
+                                    profile_id = %target.profile_id,
+                                    workspace_id = %target.workspace_id,
+                                    error = %err,
+                                    "activate：存量 contact 幻影态迁移失败（best-effort，状态机已切换，不阻断激活；受困 contact 将在下次运行时补 initial）"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+            Err(err) => {
+                tracing::warn!(
+                    profile_id = %target.profile_id,
+                    workspace_id = %target.workspace_id,
+                    error = %err,
+                    "activate: generated_state_machine 校验失败，跳过 publish（保留上一版状态机）"
+                );
+            }
+        }
+    }
     invalidate_global_domain_profile_cache();
     Ok(Json(json!({ "ok": true, "activated": target.profile_id })))
 }

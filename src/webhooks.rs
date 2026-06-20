@@ -581,7 +581,12 @@ pub async fn wechat_webhook(
             deferred = true;
         } else {
             let key = contact_key(&workspace_id, &account_id, &from_wxid);
-            let window_ms = state.config.message_debounce_window_ms;
+            let active_profile = crate::agent::domain_profile::load_active_domain_profile(
+                &state.db, &workspace_id,
+            ).await;
+            let window_ms = crate::agent::domain_profile::resolve_debounce_window_ms(
+                &active_profile, state.config.message_debounce_window_ms,
+            );
             let (st, spawned_now) = register_inbound(key.clone(), inbound.clone(), window_ms);
             if spawned_now {
                 let bg_state = state.clone();

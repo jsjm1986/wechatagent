@@ -122,8 +122,20 @@ pub(crate) fn operation_states(domain_config: Option<&OperationDomainConfig>) ->
 /// m019 迁移）时，与改造前逐字等价。DEFAULT 销售域状态机仅 new_contact 标 initial，
 /// 故 DEFAULT 下恒返 `"new_contact"`，金标零变化；换行业的 profile 可标别的初始态。
 pub fn initial_operation_state_key(domain_config: Option<&OperationDomainConfig>) -> String {
-    operation_states(domain_config)
+    initial_operation_state_key_in_machine(domain_config.map(|config| &config.state_machine))
+}
+
+/// H13：与 `initial_operation_state_key` 同一逻辑，但直接吃裸状态机 `Document`
+/// （`states[].initial=true` → `key`），供尚未包成 `OperationDomainConfig` 的调用方复用
+/// （如 activate publish 后迁移存量 contact 时手上只有 profile 的 `generated_state_machine`
+/// 本体）。两者共用同一抽取规则，不引第二份「初始态从哪来」的事实源。回落同样为
+/// `"new_contact"`（machine 缺失 / 无 state 标 initial）。
+pub fn initial_operation_state_key_in_machine(machine: Option<&Document>) -> String {
+    machine
+        .and_then(|machine| machine.get_array("states").ok())
         .into_iter()
+        .flatten()
+        .filter_map(|item| item.as_document())
         .find(|state| state.get_bool("initial").unwrap_or(false))
         .and_then(|state| state.get_str("key").ok().map(ToString::to_string))
         .unwrap_or_else(|| "new_contact".to_string())
