@@ -26,6 +26,8 @@ ops_smoke 的 t8/t17 已在阶段2 迁到对话级 LLM 裁判（`run_autonomy_re
 
 **已知缺口（用户裁决 2026-06-20 记录）**：adversarial 注入弧的 `LEAK_FINGERPRINTS`（逐字 dump 内部 soul/配置字段名：`communication_style`/`memorycard`/`forbidden_rules`/`customer_stage` 等 prompts.rs 精确标识符，客户正常回复永不出现）属**确定性字面信号**，词表 contains 命中率 100%；迁 LLM 语义门后，裁判不知 prompts.rs 内部字段名，对此类精确字面泄露的漏判概率上升。这与转人工/幕后泄露（语义红线，词表会误判、LLM 更准）方向相反。用户裁决：为彻底贯彻 agent-first（测试层不留词表），接受三组（SHARED_HANDOFF + LEAK_MARKERS + LEAK_FINGERPRINTS）全迁 LLM，但**显式记录此红线能力暂时下降**——逐字内部字段名泄露的精确检测应由**未来生产出站守卫**（`docs` / [[project_principal_relay_llm_dependence]] 的「出站无泄漏守卫」P1 建议，src/ 侧确定性 guard）补位，而非测试层词表。该生产 guard 超出阶段5「测试 only」边界，留后续专项。
 
+**已知缺口（终审 2026-06-21 发现，用户裁决留后续专项）**：本阶段迁移表（§3.4）锁定 ops_smoke/cross_domain/dynamic/roleplay_arc/digital_twin/principal_relay/principal_channel/adversarial 这批红线弧。终审全树扫描另发现 **2 处不在迁移表内的同病灶词表硬门**仍在用裸 `.contains` panic 判转人工/暴露身份：`real_llm_proactive_outreach.rs`（`FORBIDDEN_RELAY_MARKERS`(10) + `assert_no_forbidden_markers`，主动触达弧）与 `roleplay_emotional_companion_e2e.rs`（`FORBIDDEN_RELAY_MARKERS`(12)，情感陪伴弧）。它们带着本阶段要根治的同款词表假阳/漏词病灶，但**不在本阶段已批准的 7 弧范围内**。用户裁决（2026-06-21）：本阶段范围锁定 7 弧不扩，这 2 弧的词表→LLM 迁移留**后续专项**（与上述 LEAK_FINGERPRINTS 同等记录），避免临时扩范围让本阶段 10 Task 边界漂移。注：`roleplay_emotional_companion_e2e.rs` 的 `OFFLINE_PROMISE_MARKERS`(8) 是**软观测**（命中记 ledger 供 judge 交叉，非硬门），不属此缺口；`knowledge_operator_memory_isolation.rs::FORBIDDEN_WORDS`（知识/记忆隔离）与 `real_llm_ops_smoke.rs::SUPERLATIVE_MARKERS`（夸大用语，FactRisk 系）是**不同关注点**（非转人工红线），不在词表下线范围。
+
 ## 三、设计
 
 ### 3.1 架构（A+C：抽共享 helper + 内核先行分批，删词表垫底）

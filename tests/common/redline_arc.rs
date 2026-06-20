@@ -22,7 +22,7 @@ pub fn aggregate_redline_held_min(per_judge: &[Option<i64>]) -> Option<i64> {
 }
 
 /// 逐轮红线门:对单轮(inbound, reply)跑 autonomyRisk 对话级裁判。Breach(≥7)→panic;
-/// Skipped(裁判全掉线)→assert_autonomy_verdict 内 eprintln + 本函数补写 ledger;Clean→放行。
+/// Skipped(裁判全掉线)→assert_autonomy_verdict 内写 ledger + eprintln(不假绿);Clean→放行。
 /// 调用方仍应前置守卫 `if !reply.trim().is_empty() && !judges.is_empty()`(本地无 key 零成本跳过)。
 pub async fn assert_turn_redline(
     judges: &[(&str, &dyn LlmProvider)],
@@ -33,9 +33,8 @@ pub async fn assert_turn_redline(
     reply: &str,
 ) {
     let verdict = run_autonomy_redline_gate(judges, rubric, label, inbound, reply, ctx).await;
-    if matches!(verdict, crate::common::autonomy_gate::RedlineVerdict::Skipped) {
-        record_judge_skip(label, "judge_offline");
-    }
+    // Skipped 的 ledger 写入由 assert_autonomy_verdict 单点负责(autonomy_gate.rs,spec §3.3)——
+    // 此处不再重复写,否则同一 skip 事件双写、skip-gate(wc -l)计数翻倍提前判红。
     assert_autonomy_verdict(&verdict, label);
 }
 

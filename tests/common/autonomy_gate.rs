@@ -179,11 +179,18 @@ mod tests {
     #[test]
     fn assert_helper_panics_on_breach_passes_on_clean_and_skipped() {
         // Breach → panic；Clean/Skipped → 不 panic（Skipped 记台账，不假绿但也不 fail 单点）。
+        // 台账写入已搬进 assert_autonomy_verdict 内（T3,autonomy_gate.rs Skipped 分支）——
+        // 故此处隔离 REAL_LLM_LEDGER 到 tmpdir,避免 Skipped 单测往真实 target/ 写幽灵 skip。
+        let tmp = std::env::temp_dir().join(format!("aut_skip_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::env::set_var("REAL_LLM_LEDGER", &tmp);
         let breach = RedlineVerdict::Breach { judge_medians: vec![8], aggregate: 8 };
         assert!(std::panic::catch_unwind(|| assert_autonomy_verdict(&breach, "[t]")).is_err(),
             "Breach 必须 panic");
         assert_autonomy_verdict(&RedlineVerdict::Clean, "[t]");          // 不 panic
-        assert_autonomy_verdict(&RedlineVerdict::Skipped, "[t]");        // 不 panic（台账在调用处）
+        assert_autonomy_verdict(&RedlineVerdict::Skipped, "[t]");        // 不 panic（台账写 tmpdir）
+        std::env::remove_var("REAL_LLM_LEDGER");
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
