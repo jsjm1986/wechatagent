@@ -24,6 +24,7 @@ mod admin_relationship_suggestions;
 mod admin_state_policies;
 mod admin_taxonomies;
 mod admin_taxonomy_candidates;
+mod ask_human_inbox;
 mod assets;
 mod auth;
 mod behavior_signal_metrics;
@@ -124,6 +125,7 @@ use admin_relationship_suggestions::{
     approve_relationship_suggestion, list_relationship_suggestions, reject_relationship_suggestion,
 };
 use assets::{create_content_asset, list_content_assets};
+use ask_human_inbox::{ask_human_inbox, ask_human_summary};
 use contacts::{
     analyze_contact_profile, add_deal_event, disable_agent, enable_agent, get_contact,
     get_contact_memory_card, get_operating_memory, get_operation_health, import_contacts_endpoint,
@@ -770,6 +772,9 @@ pub fn api_router(state: AppState) -> Router<AppState> {
             "/admin/principal-escalations/:short_code/reassign",
             post(reassign_principal_escalation),
         )
+        // ── Ask-Human Phase 1 / Task 11：只读聚合器 inbox/summary ──────────
+        .route("/admin/ask-human/inbox", get(ask_human_inbox))
+        .route("/admin/ask-human/summary", get(ask_human_summary))
         .route(
             "/admin/operation-state-policies/:id/publish",
             post(publish_operation_state_policy_version),
