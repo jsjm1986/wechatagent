@@ -661,6 +661,32 @@ pub async fn run_judge_graded_with_context(
     run_graded_samples(judge, &rubric.system, &user, &rubric.dims, label, samples, gate).await
 }
 
+/// 裁判掉线/未出分时记一条 skip 台账——与 `unwrap_or_skip_transient!` 宏同 schema，
+/// 让 skip-gate（scripts/check-skip-ledger.sh，wc -l 计数）数得到。阶段5 删确定性词表
+/// panic 后，「agent 链路成功 + 红线裁判端点全掉线」必须写此行，否则静默假绿（spec 行 67）。
+pub fn record_judge_skip(test_label: &str, kind: &str) {
+    use std::io::Write as _;
+    let dir = std::env::var("REAL_LLM_LEDGER")
+        .unwrap_or_else(|_| "target/real_llm_ledger".to_string());
+    let _ = std::fs::create_dir_all(&dir);
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(format!("{dir}/skip_ledger.jsonl"))
+    {
+        let _ = writeln!(
+            f,
+            "{}",
+            serde_json::json!({
+                "test": test_label,
+                "kind": kind,
+                "file": file!(),
+                "sha": std::env::var("GITHUB_SHA").unwrap_or_else(|_| "local".into()),
+            })
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -942,6 +968,29 @@ mod tests {
             assert!(r.system.contains("overall_progress"),
                 "对话级 system 必须注入 overall_progress 锚点");
         }
+    }
+
+    #[test]
+    fn record_judge_skip_appends_line_with_schema() {
+        use std::io::Read as _;
+        // 用临时目录隔离 ledger，避免污染真实 target/。
+        let tmp = std::env::temp_dir().join(format!("rj_skip_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::env::set_var("REAL_LLM_LEDGER", &tmp);
+        record_judge_skip("t-demo", "judge_offline");
+        record_judge_skip("t-demo2", "judge_offline");
+        let ledger = tmp.join("skip_ledger.jsonl");
+        let mut s = String::new();
+        std::fs::File::open(&ledger).unwrap().read_to_string(&mut s).unwrap();
+        let lines: Vec<&str> = s.trim().lines().collect();
+        assert_eq!(lines.len(), 2, "两次调用应 append 两行");
+        let v: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+        assert_eq!(v["test"], "t-demo");
+        assert_eq!(v["kind"], "judge_offline");
+        assert!(v["file"].is_string(), "应含 file 字段");
+        assert!(v["sha"].is_string(), "应含 sha 字段");
+        std::env::remove_var("REAL_LLM_LEDGER");
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[tokio::test]
