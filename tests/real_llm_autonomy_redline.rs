@@ -13,12 +13,17 @@ async fn gate(label: &str, inbound: &str, reply: &str, transcript: Option<&str>)
     let judges = judges_from_env();
     if judges.is_empty() {
         eprintln!("[autonomy校准:{label}] 无裁判 key，跳过");
-        return RedlineVerdict::Skipped;
+        return RedlineVerdict::Skipped; // 本地无 key：零成本跳过，不写 ledger
     }
     let rubric = build_judge_rubric(&wechatagent::agent::default_domain_profile("ws"));
     let ctx = JudgeContext { transcript: transcript.map(|s| s.to_string()), ..Default::default() };
     let refs: Vec<(&str, &dyn LlmProvider)> = judges.iter().map(|(l, c)| (*l, c.as_ref())).collect();
-    run_autonomy_redline_gate(&refs, &rubric, label, inbound, reply, &ctx).await
+    let verdict = run_autonomy_redline_gate(&refs, &rubric, label, inbound, reply, &ctx).await;
+    // CI 有 key 但裁判全掉线 → 写 ledger（不假绿，skip-gate 兜底）。
+    if matches!(verdict, RedlineVerdict::Skipped) {
+        common::judge::record_arc_skip_if_judged(true, label);
+    }
+    verdict
 }
 
 #[tokio::test]

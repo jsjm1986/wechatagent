@@ -689,6 +689,15 @@ pub fn record_judge_skip(test_label: &str, kind: &str) {
     }
 }
 
+/// 仅当 judged==true（有 key、真跑了裁判但全掉线）时写 skip 台账；judged==false
+/// （本地无 key，零成本设计跳过）不写——否则本地跑测试污染 target/real_llm_ledger + 误报。
+/// 调用方在能取到 judges 处传 `!judges.is_empty()`；封装了 judges 的函数自己回传「真跑了」。
+pub fn record_arc_skip_if_judged(judged: bool, label: &str) {
+    if judged {
+        record_judge_skip(label, "judge_offline");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -991,6 +1000,29 @@ mod tests {
         assert_eq!(v["kind"], "judge_offline");
         assert!(v["file"].is_string(), "应含 file 字段");
         assert!(v["sha"].is_string(), "应含 sha 字段");
+        std::env::remove_var("REAL_LLM_LEDGER");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn record_arc_skip_if_judged_writes_only_when_judged() {
+        use std::io::Read as _;
+        let tmp = std::env::temp_dir().join(format!("arc_skip_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::env::set_var("REAL_LLM_LEDGER", &tmp);
+        // judged=false（本地无 key）→ 不写
+        record_arc_skip_if_judged(false, "t-local-nokey");
+        let ledger = tmp.join("skip_ledger.jsonl");
+        assert!(!ledger.exists(), "judged=false 不该写 ledger（本地无 key 零成本跳过）");
+        // judged=true（CI 有 key 但裁判掉线）→ 写一行
+        record_arc_skip_if_judged(true, "t-ci-offline");
+        let mut s = String::new();
+        std::fs::File::open(&ledger).unwrap().read_to_string(&mut s).unwrap();
+        let lines: Vec<&str> = s.trim().lines().collect();
+        assert_eq!(lines.len(), 1, "judged=true 应写恰一行");
+        let v: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+        assert_eq!(v["test"], "t-ci-offline");
+        assert_eq!(v["kind"], "judge_offline");
         std::env::remove_var("REAL_LLM_LEDGER");
         let _ = std::fs::remove_dir_all(&tmp);
     }

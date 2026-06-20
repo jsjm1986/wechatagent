@@ -70,6 +70,7 @@ async fn real_roleplayer_calibration() {
     }
     if all_fallback {
         eprintln!("[roleplayer校准] roleplayer 全程 fallback(第三族端点挂) → Skipped(未验到真生成,不假绿)");
+        common::judge::record_arc_skip_if_judged(true, "roleplayer校准-生成全fallback");
         return;
     }
 
@@ -104,6 +105,9 @@ async fn real_roleplayer_calibration() {
                  (本阶段只发现,修 roleplayer prompt 留后续——反过拟合:不点对点改这些固定文本)"
             );
         }
-        _ => eprintln!("[roleplayer校准] 至少一组未出分 → Skipped(裁判全掉线,不假绿,skip-gate 兜底)"),
+        _ => {
+            eprintln!("[roleplayer校准] 至少一组未出分 → Skipped(裁判全掉线,不假绿,skip-gate 兜底)");
+            common::judge::record_arc_skip_if_judged(true, "roleplayer校准-realism裁判掉线");
+        }
     }
 }

@@ -261,6 +261,7 @@ jobs:
           REAL_LLM_VISION_API_KEY: ${{ secrets.RSXERMU_KEY }}
           REAL_LLM_VISION_BASE_URL: https://rsxermu666.cn/v1
           REAL_LLM_VISION_MODEL: gpt-5.4
+          REAL_LLM_LEDGER: target/real_llm_ledger/smoke
         run: cargo test --no-fail-fast --test real_llm_knowledge -- --ignored --nocapture
 
       # R0.2：传出 skip ledger（含 unwrap_or_skip_transient! 写的 skip_ledger.jsonl），
@@ -362,6 +363,7 @@ jobs:
           REAL_LLM_MODEL: claude-opus-4-8
           REAL_LLM_FORMAT: anthropic
           RECALL_STABILITY_RUNS: "3"
+          REAL_LLM_LEDGER: target/real_llm_ledger/recall-${{ matrix.t }}
         run: cargo test --no-fail-fast --test real_llm_recall_benchmark ${{ matrix.t }} -- --ignored --nocapture
 
       - name: Upload recall ledger
@@ -468,6 +470,7 @@ jobs:
           REAL_LLM_JUDGE_BASE_URL: https://rsxermu666.cn/v1
           REAL_LLM_JUDGE_MODEL: gpt-5.4
           REAL_LLM_JUDGE_FORMAT: openai
+          REAL_LLM_LEDGER: target/real_llm_ledger/ops-${{ matrix.t }}
         run: cargo test --no-fail-fast --test real_llm_ops_smoke ${{ matrix.t }} -- --ignored --nocapture
 
       # R0.2：传出 skip ledger 供下游 skip-gate 汇总。
@@ -637,7 +640,7 @@ jobs:
           VISION_JUDGE_API_KEY: ${{ secrets.VISION_JUDGE_API_KEY }}
           VISION_JUDGE_BASE_URL: https://integrate.api.nvidia.com/v1
           VISION_JUDGE_MODEL: meta/llama-3.2-90b-vision-instruct
-          REAL_LLM_LEDGER: target/real_llm_ledger
+          REAL_LLM_LEDGER: target/real_llm_ledger/quality-${{ matrix.q }}
           # 可选第三异族裁判：NVIDIA 托管 qwen3-next-80b（qwen 家族）——与被测 claude（anthropic）、
           # 主裁判 gpt（openai）三方跨家族，照出家族级盲区（#618）。独立 NVIDIA_KEY（无字面量回落，
           # 用户清理 NVIDIA key 后自动回落 claude+gpt 两族，CI 不 fail）。NVIDIA 异端点不占 rsxermu 并发。
@@ -748,7 +751,7 @@ jobs:
           REAL_LLM_VISION_MODEL: gpt-5.4
           REAL_LLM_JUDGE: "1"
           JUDGE_SAMPLES: "1"
-          REAL_LLM_LEDGER: target/real_llm_ledger
+          REAL_LLM_LEDGER: target/real_llm_ledger/adversarial-${{ matrix.arc }}
           # 可选第二/三异族裁判 = NVIDIA Qwen / GLM（异端点不占 rsxermu 并发）。独立 NVIDIA_KEY
           # （无字面量回落，用户清理 NVIDIA key 后自动回落 claude+gpt 两族，judge_panel 退回 2 裁判不 fail）。
           # 被测 claude(anthropic) + judge1 gpt(openai) + 可选 qwen/glm 多族交叉，照出家族盲区（#618）。
@@ -1102,7 +1105,7 @@ jobs:
           REAL_LLM_JUDGE_FORMAT: openai
           REAL_LLM_JUDGE: "1"
           JUDGE_SAMPLES: "1"
-          REAL_LLM_LEDGER: target/real_llm_ledger
+          REAL_LLM_LEDGER: target/real_llm_ledger/redline-${{ matrix.file }}
           # dynamic_adversarial 第三族异族 roleplayer/judge（缺则回落两族不 fail）。
           REAL_LLM_JUDGE2_API_KEY: ${{ secrets.NVIDIA_KEY }}
           REAL_LLM_JUDGE2_BASE_URL: https://integrate.api.nvidia.com/v1
@@ -1181,7 +1184,7 @@ jobs:
           REAL_LLM_JUDGE_BASE_URL: https://rsxermu666.cn/v1
           REAL_LLM_JUDGE_MODEL: gpt-5.4
           REAL_LLM_JUDGE_FORMAT: openai
-          REAL_LLM_LEDGER: target/real_llm_ledger
+          REAL_LLM_LEDGER: target/real_llm_ledger/autonomy-redline
         run: cargo test --no-fail-fast --test real_llm_autonomy_redline -- --ignored --nocapture
 
       - name: Upload skip ledger
@@ -1251,7 +1254,7 @@ jobs:
           REAL_LLM_JUDGE_BASE_URL: https://rsxermu666.cn/v1
           REAL_LLM_JUDGE_MODEL: gpt-5.4
           REAL_LLM_JUDGE_FORMAT: openai
-          REAL_LLM_LEDGER: target/real_llm_ledger
+          REAL_LLM_LEDGER: target/real_llm_ledger/conversation-judge
         run: cargo test --no-fail-fast --test real_llm_conversation_judge -- --ignored --nocapture
 
       - name: Upload skip ledger
@@ -1322,7 +1325,7 @@ jobs:
           ROLEPLAYER_API_KEY: ${{ secrets.NVIDIA_KEY }}
           ROLEPLAYER_BASE_URL: https://integrate.api.nvidia.com/v1
           ROLEPLAYER_MODEL: qwen/qwen3-next-80b-a3b-instruct
-          REAL_LLM_LEDGER: target/real_llm_ledger
+          REAL_LLM_LEDGER: target/real_llm_ledger/roleplayer-calibration
         run: cargo test --no-fail-fast --test real_llm_roleplayer_calibration -- --ignored --nocapture
 
       - name: Upload skip ledger
@@ -1337,7 +1340,7 @@ jobs:
   # ════════════════════════════════════════════════════════════════════════════
   # R0.2：skip 率硬门（汇总）。各 real-llm job 是 continue-on-error（conclusion 恒
   # success，端点抖动不卡合并），但**大面积 transient-skip = 这一轮真模型测试实际
-  # 没验证到能力 = 假绿**。本 job 非 continue-on-error，needs 6 个 PR 门真模型 job，
+  # 没验证到能力 = 假绿**。本 job 非 continue-on-error，needs 9 个 PR 门真模型 job，
   # 汇总它们传出的 skip_ledger.jsonl，skip 总数超阈值即真红卡合并。
   # 缺 key（fork PR/没配 secret）时上游 job 在其 fail-gate 已红，本 job 因
   # needs 失败而 skipped，不会假绿。
@@ -1361,7 +1364,6 @@ jobs:
       - name: Check skip rate
         env:
           REAL_LLM_LEDGER: target/real_llm_ledger
-          # 5 个 job 汇总，放宽到 12（单 job ~3-16 测试，端点偶发抖动允许少量；
-          # 持续抖动致大面积 skip 才红）。可按实际调。
-          REAL_LLM_MAX_SKIP: "12"
+          # 9 个 PR 门真模型 job 汇总（各写独立子目录、find 递归求和），放宽到 20（单 job ~3-16 测试，端点偶发抖动允许少量；持续抖动致大面积 skip 才红）。
+          REAL_LLM_MAX_SKIP: "20"
         run: bash scripts/check-skip-ledger.sh

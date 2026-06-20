@@ -2314,7 +2314,7 @@ async fn t15_real_multiturn_deal_arc() {
         "[t15] 该发就发红线：6 轮成交弧仅 {approved_turns} 轮产出 approved 回复 < 下限 {T15_MIN_APPROVED_TURNS}（闸门系统性过度拦截，链路近乎全程哑火）"
     );
 
-    // ③ 对话级总评 QualityGate（阶段3）：6 轮跌单弧跑完,整段喂跨家族裁判判 overall_progress。
+    // ③ 对话级总评 ObserveOnly（阶段3）：6 轮跌单弧跑完,整段喂跨家族裁判判 overall_progress。
     // 钉「全程兜圈」这一**只在整段显形**的退化:若 agent 6 轮都在打太极、关系原地空转,
     // overall_progress 会很低 → panic。阈值取 3（宽松,只兜「近乎全程兜圈」的极端,不规定每轮必推进——
     // 反过拟合 + 容忍单轮合法停顿）。裁判全掉线 → Skipped(不假绿,skip-gate 兜底)。
@@ -2337,7 +2337,10 @@ async fn t15_real_multiturn_deal_arc() {
                          ——agent 全程兜圈/原地空转,关系无实质推进(只在整段显形的退化,单轮逐条看不出)"
                     );
                 }
-                None => eprintln!("[t15][对话级总评] overall_progress 未出分 → Skipped(裁判全掉线,不假绿)"),
+                None => {
+                    eprintln!("[t15][对话级总评] overall_progress 未出分 → Skipped(裁判全掉线,不假绿)");
+                    common::judge::record_arc_skip_if_judged(!judges.is_empty(), "t15-成交弧");
+                }
             }
         }
     }

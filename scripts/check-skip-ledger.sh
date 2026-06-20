@@ -19,22 +19,43 @@
 
 set -euo pipefail
 
+# G1 回归自检：造两个 job 子目录各写 N 行 skip，断言跨分片求和数到 2N（而非被覆盖只数到 N）。
+# 用法：bash scripts/check-skip-ledger.sh --self-test
+if [ "${1:-}" = "--self-test" ]; then
+    TDIR=$(mktemp -d)
+    mkdir -p "$TDIR/job-a" "$TDIR/job-b"
+    printf '{"test":"a1","kind":"judge_offline"}\n{"test":"a2","kind":"http_5xx"}\n' > "$TDIR/job-a/skip_ledger.jsonl"
+    printf '{"test":"b1","kind":"judge_offline"}\n{"test":"b2","kind":"http_5xx"}\n' > "$TDIR/job-b/skip_ledger.jsonl"
+    GOT=$(find "$TDIR" -name 'skip_ledger*.jsonl' -exec cat {} + 2>/dev/null | grep -c . || true)
+    rm -rf "$TDIR"
+    if [ "$GOT" -eq 4 ]; then
+        echo "[skip-ledger][self-test] OK：跨 2 子目录各 2 行 → 求和 4（未被覆盖）。"
+        exit 0
+    else
+        echo "[skip-ledger][self-test] FAIL：期望 4，实得 $GOT（G1 跨分片求和退化，又变回单文件覆盖）。"
+        exit 1
+    fi
+fi
+
 LEDGER_DIR="${REAL_LLM_LEDGER:-target/real_llm_ledger}"
-LEDGER="$LEDGER_DIR/skip_ledger.jsonl"
 MAX_SKIP="${REAL_LLM_MAX_SKIP:-6}"
 
-if [ ! -f "$LEDGER" ]; then
-    echo "[skip-ledger] 无 skip 记录（$LEDGER 不存在）——本轮 0 skip，全部真跑。OK"
+# 跨所有 job 子目录的 skip_ledger*.jsonl 求和（G1 修复：各 job 写独立子目录，
+# 不再同名覆盖；此处递归 cat 全部分片，而非只数单一固定路径）。
+ALL_SKIPS=$(find "$LEDGER_DIR" -name 'skip_ledger*.jsonl' -exec cat {} + 2>/dev/null || true)
+SKIP_COUNT=$(printf '%s' "$ALL_SKIPS" | grep -c . || true)
+SKIP_COUNT=${SKIP_COUNT:-0}
+
+if [ "$SKIP_COUNT" -eq 0 ]; then
+    echo "[skip-ledger] 无 skip 记录（$LEDGER_DIR 下无 skip_ledger*.jsonl 或全空）——本轮 0 skip，全部真跑。OK"
     exit 0
 fi
 
-SKIP_COUNT=$(wc -l < "$LEDGER" | tr -d ' ')
 echo "[skip-ledger] 本轮 transient-skip 总数：$SKIP_COUNT（上限 $MAX_SKIP）"
 echo "[skip-ledger] 按 kind 分布："
-# 抽每行的 "kind":"xxx" 统计
-grep -oE '"kind":"[a-z_0-9]+"' "$LEDGER" | sort | uniq -c || true
+printf '%s\n' "$ALL_SKIPS" | grep -oE '"kind":"[a-z_0-9]+"' | sort | uniq -c || true
 echo "[skip-ledger] 按 test 分布："
-grep -oE '"test":"[^"]*"' "$LEDGER" | sort | uniq -c || true
+printf '%s\n' "$ALL_SKIPS" | grep -oE '"test":"[^"]*"' | sort | uniq -c || true
 
 if [ "$SKIP_COUNT" -gt "$MAX_SKIP" ]; then
     echo "[skip-ledger] FAIL：skip 数 $SKIP_COUNT > 上限 $MAX_SKIP。"

@@ -13,12 +13,17 @@ use wechatagent::llm::LlmProvider;
 async fn judge(label: &str, transcript: &str) -> ConversationReport {
     let judges = judges_from_env();
     if judges.is_empty() {
-        eprintln!("[对话级校准:{label}] 无裁判 key,跳过");
+        eprintln!("[对话级校准:{label}] 无裁判 key,跳过"); // 本地：不写 ledger
         return ConversationReport { per_dim: Vec::new(), any_scored: false };
     }
     let profile = wechatagent::agent::default_domain_profile("ws");
     let refs: Vec<(&str, &dyn LlmProvider)> = judges.iter().map(|(l, c)| (*l, c.as_ref())).collect();
-    run_conversation_judge(&refs, &profile, label, transcript, JudgeGate::ObserveOnly).await
+    let report = run_conversation_judge(&refs, &profile, label, transcript, JudgeGate::ObserveOnly).await;
+    // CI 有 key 但裁判全掉线（无一维出分）→ 写 ledger。三处 else 的 eprintln 保留（人类可读）。
+    if !report.any_scored {
+        common::judge::record_arc_skip_if_judged(true, label);
+    }
+    report
 }
 
 #[tokio::test]
