@@ -318,6 +318,14 @@ pub struct AppConfig {
     pub jwt_private_key_pem: Option<String>,
     /// RS256 公钥 PEM。`jwt_enabled=true` 时必填，用于 verify。
     pub jwt_public_key_pem: Option<String>,
+
+    // ── 销售素材文件发送 ──
+    /// 销售素材文件本地存储根目录。默认 "./media"；生产 117 为 "/opt/wechatagent/media"。
+    pub media_storage_dir: String,
+    /// 单个素材上传大小上限（MB）。默认 50。
+    pub media_max_file_size_mb: u64,
+    /// MCP media_id 缓存有效期（小时），过期重传。默认 24。
+    pub media_id_cache_ttl_hours: i64,
 }
 
 /// 手写 `Debug` 实现：把所有 secret 字段过 [`mask_secret`]，避免日志/panic
@@ -660,6 +668,9 @@ impl AppConfig {
             jwt_public_key_pem: env::var("JWT_PUBLIC_KEY_PEM")
                 .ok()
                 .filter(|s| !s.trim().is_empty()),
+            media_storage_dir: env_or("MEDIA_STORAGE_DIR", "./media"),
+            media_max_file_size_mb: env_or("MEDIA_MAX_FILE_SIZE_MB", "50").parse()?,
+            media_id_cache_ttl_hours: env_or("MEDIA_ID_CACHE_TTL_HOURS", "24").parse()?,
         })
     }
 }
@@ -677,4 +688,28 @@ fn parse_bool(value: &str) -> bool {
         value.trim().to_ascii_lowercase().as_str(),
         "1" | "true" | "yes" | "on"
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 销售素材三配置的默认值（与 `.env.example` / brief 约定一致）。
+    /// 直接断言 `from_env` 用的同款 `env_or(key, default)` 默认串解析结果，
+    /// 避免改动进程全局 env（并行测试下会互相污染）。
+    #[test]
+    fn media_config_defaults() {
+        // MEDIA_STORAGE_DIR：未设时默认 "./media"。
+        assert_eq!(env_or("MEDIA_STORAGE_DIR_UNSET_XYZ", "./media"), "./media");
+        // MEDIA_MAX_FILE_SIZE_MB：默认 50，解析为 u64。
+        let max_mb: u64 = env_or("MEDIA_MAX_FILE_SIZE_MB_UNSET_XYZ", "50")
+            .parse()
+            .expect("default media max file size must parse as u64");
+        assert_eq!(max_mb, 50);
+        // MEDIA_ID_CACHE_TTL_HOURS：默认 24，解析为 i64。
+        let ttl_hours: i64 = env_or("MEDIA_ID_CACHE_TTL_HOURS_UNSET_XYZ", "24")
+            .parse()
+            .expect("default media id cache ttl must parse as i64");
+        assert_eq!(ttl_hours, 24);
+    }
 }
