@@ -426,7 +426,8 @@ pub(crate) async fn decide_reply_with_promote(
     // 约定）。它按固定顺序串起：①经营公式段单一真相源（H15，剥离遗留内联段→注入 active
     // profile 公式段）②对话模式判定段（H9）③模式与 5 闸关系段（A/T2）④conversationMode
     // 枚举列表（H9 修复 A，对齐 runtime 校验集合）。DEFAULT_PROFILE / 老库 → 每步原样 →
-    // prompt 字节等价、销售域零变化（往返/字节等价护栏见 domain_profile.rs `#[cfg(test)]`）。
+    // 内容/语义等价（经营公式段从 policy 中部移至末尾，内容逐字保留、仅位置变；LLM 见到的
+    // 内容完全一致，零运行时影响）、销售域零行为变化（语义等价护栏见 domain_profile.rs `#[cfg(test)]`）。
     // **红线**：boundary_protection 不放宽边界保护硬规则段不在任何替换范围、任何行业写死守护。
     // 新增 reply.policy 类 prompt override 字段时，加进那个 helper（勿在此散接）——见 helper 文档。
     let policy = super::domain_profile::apply_reply_policy_prompt_overrides(&policy, &active_profile);
