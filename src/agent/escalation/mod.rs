@@ -49,7 +49,7 @@ pub(crate) async fn escalate_held_decision(
         Some(cfg) => crate::agent::escalation::resolve_ask_human_policy(cfg),
         // domain_config 缺省时保持旧行为字节等价：parse_high_risk_mode(None)=DecisionOnly,
         // 即 safety/product/stuck 升级、ai_policy 不升级。真正的「是否启用请示」由下方
-        // principal_decider_wxid 的 DB 查询兜住(无决策人则 return Ok)。故此处不可短路 return。
+        // decider_chain 是否为空兜住(链空则 return Ok)。故此处不可短路 return。
         None => crate::agent::escalation::ResolvedAskHumanPolicy {
             decider_chain: vec![],
             escalate_safety_guard: true,
@@ -65,16 +65,22 @@ pub(crate) async fn escalate_held_decision(
     if !should_escalate_held(blocked_status, &policy) {
         return Ok(());
     }
-    let Some(principal_wxid) =
-        principal_decider_wxid(state, &contact.workspace_id, super::domain::USER_OPS_DOMAIN_ID)
-            .await?
-    else {
-        return Ok(()); // 未配置领导 = 本 workspace 未启用请示通道
+    let Some(decider) = policy.decider_chain.first() else {
+        return Ok(()); // 决策人链空 = 本 workspace 未启用请示通道
     };
+    let principal_wxid = decider.wxid.clone();
     if principal_wxid == contact.wxid {
         return Err(AppError::BadRequest(
-            "principal_decider 配置等于客户 wxid，拒绝触发请示".into(),
+            "决策人配置等于客户 wxid，拒绝触发请示".into(),
         ));
+    }
+    // 骚扰门：daily_push_cap / quiet_hours（None 配置全放行，字节等价）。
+    let now_ms = mongodb::bson::DateTime::now().timestamp_millis();
+    let since_ms = now_ms - 24 * 3600 * 1000;
+    let today =
+        count_pushes_today(state, &contact.workspace_id, &principal_wxid, since_ms).await?;
+    if !crate::agent::escalation::push_allowed(&policy, today, None, now_ms) {
+        return Ok(()); // 骚扰门关：跳过推卡（pending 台账可由 admin 在收件箱处置）
     }
     // 去重：同客户同类别已有 pending → 不重复推卡骚扰领导。
     if has_pending_for_contact(

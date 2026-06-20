@@ -244,4 +244,23 @@ mod tests {
         // timeout_hours=None → 无限等待，永不转
         assert_eq!(next_decider_on_timeout(&p, "a", 9999.0), None);
     }
+
+    #[test]
+    fn in_quiet_hours_cross_midnight_and_tz() {
+        use crate::models::AskHumanQuietHours;
+        // 跨午夜窗 22:00–06:00, tz=0（UTC）。now=23:00 → 窗内；now=12:00 → 窗外。
+        let qh = AskHumanQuietHours { start_hour: 22, end_hour: 6, tz_offset_hours: 0 };
+        let h23 = 23 * 3600 * 1000i64;       // 23:00 UTC
+        let h12 = 12 * 3600 * 1000i64;       // 12:00 UTC
+        assert!(in_quiet_hours(&qh, h23));   // 跨午夜窗内
+        assert!(!in_quiet_hours(&qh, h12));  // 窗外
+        // tz=+8：UTC 18:00 → 本地 02:00（在 22–06 窗内）。
+        let qh8 = AskHumanQuietHours { start_hour: 22, end_hour: 6, tz_offset_hours: 8 };
+        let utc18 = 18 * 3600 * 1000i64;     // UTC 18:00 → 本地 02:00
+        assert!(in_quiet_hours(&qh8, utc18));
+        // 非跨午夜窗 09:00–17:00, tz=0：now=12:00 窗内、now=20:00 窗外。
+        let day = AskHumanQuietHours { start_hour: 9, end_hour: 17, tz_offset_hours: 0 };
+        assert!(in_quiet_hours(&day, h12));
+        assert!(!in_quiet_hours(&day, 20 * 3600 * 1000i64));
+    }
 }
