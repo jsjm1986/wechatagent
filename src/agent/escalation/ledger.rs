@@ -277,3 +277,74 @@ pub(crate) async fn enqueue_relay_task(state: &AppState, entry: &AgentPrincipalE
     state.db.tasks().insert_one(&task, None).await?;
     Ok(())
 }
+
+/// 按 workspace + status 列请示台账（admin 收件箱/SLA 看板用），created_at 升序。
+#[allow(dead_code)] // Task 7 接线后移除（REST handler 消费）
+pub(crate) async fn list_escalations_by_workspace(
+    state: &AppState,
+    workspace_id: &str,
+    status: &str,
+) -> AppResult<Vec<AgentPrincipalEscalation>> {
+    use futures::TryStreamExt;
+    let cursor = state
+        .db
+        .agent_principal_escalations()
+        .find(
+            doc! { "workspace_id": workspace_id, "status": status },
+            mongodb::options::FindOptions::builder()
+                .sort(doc! { "created_at": 1 })
+                .build(),
+        )
+        .await?;
+    Ok(cursor.try_collect().await?)
+}
+
+/// 改派 pending 请示到另一位决策人（仅 pending 可改派；workspace 约束防 IDOR）。
+#[allow(dead_code)] // Task 7 接线后移除（REST handler 消费）
+pub(crate) async fn reassign_escalation(
+    state: &AppState,
+    workspace_id: &str,
+    short_code: &str,
+    to_wxid: &str,
+) -> AppResult<Option<AgentPrincipalEscalation>> {
+    let updated = state
+        .db
+        .agent_principal_escalations()
+        .find_one_and_update(
+            doc! {
+                "workspace_id": workspace_id,
+                "short_code": short_code,
+                "status": PRINCIPAL_ESCALATION_STATUS_PENDING,
+            },
+            doc! { "$set": { "principal_wxid": to_wxid, "updated_at": DateTime::now() } },
+            mongodb::options::FindOneAndUpdateOptions::builder()
+                .return_document(mongodb::options::ReturnDocument::After)
+                .build(),
+        )
+        .await?;
+    Ok(updated)
+}
+
+/// 统计某决策人当日（since_ms 起）已被推送的请示卡数（骚扰门 daily_push_cap 用）。
+/// 以 pending 台账 created_at 作为推送时刻近似（每条 pending = 一次推卡）。
+#[allow(dead_code)] // Task 9 接线后移除（骚扰门消费）
+pub(crate) async fn count_pushes_today(
+    state: &AppState,
+    workspace_id: &str,
+    principal_wxid: &str,
+    since_ms: i64,
+) -> AppResult<u32> {
+    let count = state
+        .db
+        .agent_principal_escalations()
+        .count_documents(
+            doc! {
+                "workspace_id": workspace_id,
+                "principal_wxid": principal_wxid,
+                "created_at": { "$gte": DateTime::from_millis(since_ms) },
+            },
+            None,
+        )
+        .await?;
+    Ok(count as u32)
+}
