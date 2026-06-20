@@ -22,8 +22,10 @@
 **判断一：收件箱用「只读聚合器」，不建物化待办总表。**
 全系统约 11 类触点散在十几个 collection。建统一待办物化表需改每个产生方的写路径（侵入大、违反 additive-only）。改为做一个只读聚合端点：后端扇出查各现有 collection，归一成统一 `InboxItem` 返前端。零侵入、不动任何写路径、红线零风险。
 
-**判断二：「永不跳转」用「共享组件内嵌」实现，不重写。**（Phase 2 落地，此处仅记录）
-用户要求处置 UI 全在收件箱、永不跳转。直接重写会与 `steward.tsx`（逐条核验+WebSocket 软锁+锚点）、`system-strategy`（profile 发布二次确认）产生重复逻辑。做法：把现有复杂处置组件抽成共享组件，在收件箱内嵌复用同一实例。效果上永不跳转，代码只一份。Phase 1 的聚合端点用 `action_kind` 标记轻重，为这个策略铺路。
+**判断二：统一频道是交互主场（canonical home），交互逻辑抽成中立共享组件；老页面并存不动。**（Phase 2 落地，此处仅记录）
+用户最终愿景：统一频道成为「一页解决全部 ask-human」的交互主场，rich 项也在频道内打开、不往外跳。实现上把现有复杂处置交互（`steward.tsx` 的逐条核验+WebSocket 软锁+锚点、`system-strategy` 的 profile 发布二次确认）抽到**中立的共享位置**（不归属任何单一频道），统一频道作为主入口消费它们——一份代码、零重复。归属方向：不是「收件箱内嵌老页组件」，而是「组件中立化、统一频道是主场」。
+**老页面本期并存、导航不弱化**：新频道证明价值前老页面是安全网，零删除风险。「逐步优化掉其他页面」是将来的独立决策，**本系列不做、不写进计划**（这是 strangler 模式的最终态，但退役节奏单独定）。
+Phase 1 的聚合端点用 `action_kind`（`inline` 简单内联 / `rich` 需完整交互组件，**两者都在统一频道内打开**）标记轻重，为这个策略铺路。
 
 **判断三：拆 3 个独立可交付子项目，各自 spec→plan→实现循环。** 交付顺序（用户拍板）：P1 后端 → P2 收件箱前端 → P3 配置页。
 
@@ -164,13 +166,13 @@ ask_human_policy = None → 回落旧字段（decider_chain = [principal_decider
 | source 枚举 | 查询来源 collection | 关键 status | action_kind |
 |---|---|---|---|
 | `principal_escalation` | agent_principal_escalations | status=pending | inline |
-| `knowledge_review` | operation_knowledge_chunks | integrity_status=needs_review | deep_link |
+| `knowledge_review` | operation_knowledge_chunks | integrity_status=needs_review | rich |
 | `taxonomy_candidate` | taxonomy_candidates | review_status=pending | inline |
 | `relationship_suggestion` | admin_relationship_suggestions | pending | inline |
 | `gap_signal` | knowledge gap signals | 未处置 | inline |
-| `profile_risky` | domain_profiles 草稿 | 待发布(带 risky_fields) | deep_link |
-| `evolution_proposal` | evolution proposals | eligible_for_release | deep_link |
-| `lessons_learned` | lessons_learned | review_status=pending_review | deep_link |
+| `profile_risky` | domain_profiles 草稿 | 待发布(带 risky_fields) | rich |
+| `evolution_proposal` | evolution proposals | eligible_for_release | rich |
+| `lessons_learned` | lessons_learned | review_status=pending_review | rich |
 
 统一 `InboxItem`（聚合器返回，不落库）：
 ```rust
@@ -182,9 +184,9 @@ struct InboxItem {
     severity: String,        // high|medium|low|info（各 source 归一映射）
     created_at: DateTime,
     age_hours: f64,
-    action_kind: String,     // "inline" | "deep_link"
-    deep_link_channel: Option<String>,  // deep_link 项跳哪个频道
-    deep_link_params: Option<Document>, // 带什么参数
+    action_kind: String,     // "inline"（简单内联处置）| "rich"（需完整交互组件）；两者都在统一频道内打开
+    rich_component: Option<String>,  // rich 项在统一频道内挂载哪个共享交互组件
+    rich_params: Option<Document>,   // 该组件需要的定位参数（如 chunk_id / profile_id）
 }
 ```
 
@@ -192,7 +194,7 @@ struct InboxItem {
 - 只返回各 source 的 pending 计数（`count_documents`，不拉明细）。供频道徽标 / 总览卡。
 
 ### C.3 设计要点
-- **action_kind 由后端打标**：简单项标 `inline`（前端内联处置），复杂项标 `deep_link`（Phase 2 用共享组件内嵌实现，非真跳走）。后端标记两种前端策略通用。
+- **action_kind 由后端打标**：简单项标 `inline`（前端内联处置），复杂项标 `rich`（Phase 2 在统一频道内挂载中立共享交互组件，**不往外跳老页**）。后端标记 + rich_component/rich_params 为「统一频道是主场」铺路。
 - **聚合失败降级**：每个 source 独立 `try`，失败的标 `error` 状态返回，其余正常显示（类比前端 operationsStore 兜底）。一个 source 查询异常绝不让整个收件箱崩。
 
 ---
@@ -247,12 +249,13 @@ struct InboxItem {
 
 # Phase 2 / 3 接口骨架（不在本轮 plan，仅预留）
 
-## Phase 2：统一收件箱前端
+## Phase 2：统一收件箱（交互主场）
 - 新频道：`types/index.ts` Channel union 加 `"askHuman"`；`app/channels.ts` 加 ChannelDef（group 选「系统」或「运营」，lucide 图标如 Inbox/ShieldQuestion）；`Shell.tsx` 自动渲染。
 - feature 目录 `features/ask-human/index.tsx`，包 ConfirmProvider/ToastProvider，sub-tab 切各 source。
-- 消费 C 的 `/inbox` + `/summary`；inline 项内联处置（调 B 的 resolve/reassign + 各拉取型现有 approve/reject 端点）；deep_link 项用**共享组件内嵌**（把 steward 的 ReviewView、system-strategy 的 profile 发布抽成共享组件复用）。
+- 消费 C 的 `/inbox` + `/summary`；inline 项内联处置（调 B 的 resolve/reassign + 各拉取型现有 approve/reject 端点）；**rich 项在统一频道内挂载中立共享交互组件**（把 steward 的 ReviewView、system-strategy 的 profile 发布抽到中立共享位置），按 `rich_component`/`rich_params` 渲染——**不往外跳老页**，统一频道是 canonical 主场。
+- **老页面并存不动**：把交互组件中立化后，老页面（steward/system-strategy）改为复用同一共享组件的薄壳，**导航保持原样、不弱化**。退役老页是将来独立决策，本系列不做。
 - 手动刷新（无轮询/无 WebSocket），与 steward/system-strategy 一致。
-- 范例文件：抄 `features/knowledge/index.tsx`（外壳+provider+sub-tab）、`features/knowledge/steward.tsx` 的 ReviewView/LintView（审核列表+处置+重拉）。
+- 范例文件：抄 `features/knowledge/index.tsx`（外壳+provider+sub-tab）、`features/knowledge/steward.tsx` 的 ReviewView/LintView（审核列表+处置+重拉）作为待中立化的组件来源。
 
 ## Phase 3：ask_human 配置页
 - 消费 A 的 `PUT .../ask-human-policy`。
