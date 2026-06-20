@@ -144,7 +144,8 @@ use domain_profiles::{
 };
 use domains::{
     get_operation_domain, get_operation_domain_state_machine, list_operation_domains,
-    reset_operation_domain, update_operation_domain, update_operation_domain_state_machine,
+    put_ask_human_policy, reset_operation_domain, update_operation_domain,
+    update_operation_domain_state_machine,
 };
 use evaluations::{
     create_evaluation_scenario, delete_evaluation_scenario, list_evaluation_scenarios,
@@ -646,6 +647,10 @@ pub fn api_router(state: AppState) -> Router<AppState> {
         .route(
             "/operation-domains/:domain/reset",
             post(reset_operation_domain),
+        )
+        .route(
+            "/operation-domains/:domain/ask-human-policy",
+            put(put_ask_human_policy),
         )
         .route(
             "/prompt-templates",
