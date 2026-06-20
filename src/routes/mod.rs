@@ -360,7 +360,14 @@ pub fn api_router(state: AppState) -> Router<AppState> {
         )
         .route(
             "/content-assets/upload",
-            post(media_assets::upload_media_asset),
+            // 真实销售素材（PDF/海报/视频）常 >2MB：axum 全局默认 body limit 2MB 会先于
+            // handler 内的 media_max_file_size_mb 校验生效，>2MB 直接 413。仅给本上传路由
+            // 单独抬高 body limit 到配置上限，其它路由保留默认 2MB 保护。
+            post(media_assets::upload_media_asset).layer(
+                axum::extract::DefaultBodyLimit::max(
+                    state.config.media_max_file_size_mb as usize * 1024 * 1024,
+                ),
+            ),
         )
         .route(
             "/content-assets/:id/review",
