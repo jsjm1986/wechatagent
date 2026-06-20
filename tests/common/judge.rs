@@ -664,7 +664,7 @@ pub async fn run_judge_graded_with_context(
 }
 
 /// 裁判掉线/未出分时记一条 skip 台账——与 `unwrap_or_skip_transient!` 宏同 schema，
-/// 让 skip-gate（scripts/check-skip-ledger.sh，wc -l 计数）数得到。阶段5 删确定性词表
+/// 让 skip-gate（scripts/check-skip-ledger.sh，find 递归 cat + grep -c 计数）数得到。阶段5 删确定性词表
 /// panic 后，「agent 链路成功 + 红线裁判端点全掉线」必须写此行，否则静默假绿（spec 行 67）。
 pub fn record_judge_skip(test_label: &str, kind: &str) {
     use std::io::Write as _;
@@ -692,6 +692,8 @@ pub fn record_judge_skip(test_label: &str, kind: &str) {
 /// 仅当 judged==true（有 key、真跑了裁判但全掉线）时写 skip 台账；judged==false
 /// （本地无 key，零成本设计跳过）不写——否则本地跑测试污染 target/real_llm_ledger + 误报。
 /// 调用方在能取到 judges 处传 `!judges.is_empty()`；封装了 judges 的函数自己回传「真跑了」。
+/// 与 `assert_autonomy_verdict`（autonomy_gate.rs 内部 Skipped 分支已写 ledger）互斥：调用方若已走
+/// `assert_autonomy_verdict`，勿再调本 helper，避免对同一 skip 事件双写。
 pub fn record_arc_skip_if_judged(judged: bool, label: &str) {
     if judged {
         record_judge_skip(label, "judge_offline");

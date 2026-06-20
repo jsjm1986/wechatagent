@@ -2339,7 +2339,7 @@ async fn t15_real_multiturn_deal_arc() {
                 }
                 None => {
                     eprintln!("[t15][对话级总评] overall_progress 未出分 → Skipped(裁判全掉线,不假绿)");
-                    common::judge::record_arc_skip_if_judged(!judges.is_empty(), "t15-成交弧");
+                    common::judge::record_arc_skip_if_judged(true, "t15-成交弧");
                 }
             }
         }
