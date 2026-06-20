@@ -40,7 +40,10 @@
 - 读侧（`scripts/check-skip-ledger.sh:23-25`）：`LEDGER="$LEDGER_DIR/skip_ledger.jsonl"` + `wc -l < "$LEDGER"` 只数单一固定路径。
 
 **修法**：
-1. **写侧给每 job 独立子目录**（`ci.yml` 各 real-llm job 的 test step `env`）：把 `REAL_LLM_LEDGER: target/real_llm_ledger` 改为 `REAL_LLM_LEDGER: target/real_llm_ledger/<job-id>`。matrix job 再分片，如 redline 用 `target/real_llm_ledger/redline-${{ matrix.file }}`、quality/recall 用 `.../<job>-${{ matrix.q }}`。各 job artifact 解包后落不同子目录，`merge-multiple` 不再覆盖。各 job 的 `upload-artifact` 的 `path` 仍上传 `target/real_llm_ledger/`（含子目录），artifact 名不变。
+1. **写侧给每 job 独立子目录**（`ci.yml` 各 real-llm job 的 test step `env`）：把 `REAL_LLM_LEDGER` 设为带 job/matrix 后缀的子目录。**注意现状不一致**（已亲验）：
+   - 已显式设 `REAL_LLM_LEDGER: target/real_llm_ledger` 的 6 处：quality（:640）、adversarial（:751）、redline（:1105）、autonomy-redline（:1184）、conversation-judge（:1254）、roleplayer-calibration（:1325）→ 改为带后缀子目录。
+   - **当前未显式设、走脚本默认值的 3 个 job**：smoke（real-llm，test step :255-264 无 `REAL_LLM_LEDGER`）、recall（:359-365）、ops（:457-466）→ **需新增** `REAL_LLM_LEDGER` env 指向各自子目录（否则它们仍写默认根目录、互相覆盖）。
+   - 子目录命名：单 job 用 job 名（如 `target/real_llm_ledger/autonomy-redline`）；matrix job 用 `<job>-${{ matrix.x }}`（redline=`redline-${{ matrix.file }}`、ops=`ops-${{ matrix.t }}`、recall=`recall-${{ matrix.t }}`、quality=`quality-${{ matrix.q }}`、adversarial=`adversarial-${{ matrix.arc }}`）。各 job `upload-artifact` 的 `path` 仍传 `target/real_llm_ledger/`（含子目录），artifact 名不变。同一 matrix 的多分片各自子目录互不覆盖。
 2. **读侧跨所有分片求和**（`check-skip-ledger.sh`）：
    ```sh
    SKIP_COUNT=$(find "$LEDGER_DIR" -name 'skip_ledger*.jsonl' -exec cat {} + 2>/dev/null | wc -l | tr -d ' ')
@@ -60,23 +63,29 @@
 - `tests/real_llm_roleplayer_calibration.rs:41,73,107`：三出口只打印。
 
 **关键区分**（避免误修，主控核出的设计要点）：
-- **本地无 key**（`judges.is_empty()`，零成本设计跳过）→ **不写 ledger**。本地跑测试不该污染 `target/real_llm_ledger`。
-- **CI 有 key 但端点掉线**（judges 非空、裁判返 None/Skipped）→ **真缝，必写 ledger**。
+- **本地无 key**（裁判工厂返空，零成本设计跳过）→ **不写 ledger**。本地跑测试不该污染 `target/real_llm_ledger`。
+- **CI 有 key 但端点掉线**（裁判真跑了但全掉线/没出分）→ **真缝，必写 ledger**。
 
-**修法**：抽统一 helper（放 `tests/common/judge.rs`，与 `record_judge_skip` 同模块、同文件，调用方多已 import judge）：
-```rust
-/// 仅当 judges 非空(有 key、真跑了裁判)但全掉线时写 skip ledger;
-/// 本地无 key(judges 空)是零成本设计跳过,不写(否则本地跑测试污染 ledger + 误报)。
-pub fn record_arc_skip_if_judged(judges: &[(&str, &dyn LlmProvider)], label: &str) {
-    if !judges.is_empty() {
-        crate::common::judge::record_judge_skip(label, "judge_offline");
-    }
-}
-```
-四处调用点在「裁判全掉线」分支补调 `record_arc_skip_if_judged(&judges, label)`：
-- autonomy_redline.rs：`gate()` 返回前——但要区分 :14 本地早返（judges 空，不写）vs 真跑后掉线。最干净做法：`gate()` 内部保留 `judges.is_empty()` 早返不写；调用方拿到 Skipped 后无法区分来源，故让 `gate()` 在「judges 非空但 verdict==Skipped」时自己调 helper（或返回前判定）。实施时在 `gate()` 里：`judges` 非空且 `run_autonomy_redline_gate` 返 Skipped → `record_arc_skip_if_judged`。
-- ops_smoke.rs:2340 None 分支、conversation_judge.rs 三处 else、roleplayer_calibration.rs 三出口：同样在「本地有 key 但裁判没出分」处补调（这些点的 `judges` 在上文已取，helper 内的 `is_empty` 判定天然区分本地）。
-- 顺手修 ops_smoke.rs:2317 注释（QualityGate→ObserveOnly，与 2328 实参 `JudgeGate::ObserveOnly` 一致）。
+**难点（已亲验，spec 第一版假设有误，此处修正）**：各文件「全掉线」分支结构不同，且**多数分支拿不到 `judges`**：
+- `autonomy_redline.rs`：判定在 `gate()` **内部**（:13 取 `judges`），但 `judges.is_empty()` :14-16 早返 Skipped（本地）、CI 掉线 `run_autonomy_redline_gate` 也返 Skipped——**调用方无法区分两种 Skipped**。
+- `conversation_judge.rs`：`judge()`（:13-22）本地无 key 返 `ConversationReport{any_scored:false}`（空 report，**非 Skipped 枚举**）；三处 else（:55,:75,:112）触发于 `report_dim` 返 None，None **混合**「本地空 report」与「CI 裁判掉线」两源，且 `judges` 是 `judge()` 局部变量、外层 else 拿不到。
+- `roleplayer_calibration.rs`：`judges`/`rp` 在测试函数作用域（:37-38）；:39-42 早返（本地无 key/缺第三族）、:71-74 `all_fallback`（CI 有 key 但 roleplayer 端点全挂）、:96 `_=>`（CI 裁判掉线）——后两处 `judges` 在作用域内可直接判。
+
+**修法（按真实结构分治，记账下沉到能区分本地 vs CI 的那一层）**：
+1. **统一 helper**（放 `tests/common/judge.rs`，与 `record_judge_skip` 同文件）。签名用 `bool` 而非 `&[...]`——调用方在能取到 judges 处传 `!judges.is_empty()`，封装了 judges 的函数自己回传「真跑了裁判」：
+   ```rust
+   /// 仅当 judged==true(有 key、真跑了裁判)但全掉线时写 skip ledger;
+   /// 本地无 key 不写(否则本地跑测试污染 ledger + 误报)。
+   pub fn record_arc_skip_if_judged(judged: bool, label: &str) {
+       if judged {
+           record_judge_skip(label, "judge_offline");
+       }
+   }
+   ```
+2. **conversation_judge.rs**（关键修正）：三处 else 拿不到 judges，故记账下沉进 `judge()`：本地无 key 早返（:15-17）保持不写；CI 有 key 但 `run_conversation_judge` 回来 `any_scored==false` 时，在 `judge()` 内部（`judges` 在作用域）调 `record_arc_skip_if_judged(true, label)`。三处 else 无需改、eprintln 保留（人类可读）。
+3. **autonomy_redline.rs**：`gate()` 内 :14 本地早返保持不写；CI 路径 `run_autonomy_redline_gate` 返 Skipped 时，在 `gate()` 内（judges 非空已知）调 `record_arc_skip_if_judged(true, label)` 再返回。调用方金标 `!matches!` 守卫不变。
+4. **roleplayer_calibration.rs**：:39-42 早返不写；:71-74 `all_fallback`、:96 `_=>` 两处补 `record_arc_skip_if_judged(true, label)`（此处已知 judges 非空、真跑了）。
+5. **ops_smoke.rs t15**（:2340 None 分支）：`judges` 在作用域（:2322），补 `record_arc_skip_if_judged(!judges.is_empty(), "t15-成交弧")`。顺手修 :2317 注释（QualityGate→ObserveOnly，与 :2328 实参一致）。
 
 **与 G1 同 Task**：G2 写了 ledger，若 G1 未修则被同名覆盖、skip-gate 仍数不到——必须同 Task 一起验证才有意义。
 
@@ -124,12 +133,12 @@ pub fn record_arc_skip_if_judged(judges: &[(&str, &dyn LlmProvider)], label: &st
 |---|---|
 | `scripts/check-skip-ledger.sh`（改） | 读侧 `find ... -exec cat {} + | wc -l` 跨分片求和 + kind/test 分布改 find；加 `--self-test` 回归 fixture（两子目录各 N 行断言 2N） |
 | `.github/workflows/ci.yml`（改） | 各 real-llm job test step `REAL_LLM_LEDGER` 加 job/matrix 子目录；`REAL_LLM_MAX_SKIP` 重估 + 注释更新；roleplayer-calibration job 提 `ROLEPLAYER_API_KEY` 到 job 级 env + 补 `Require` step + step 守卫加 `&& ROLEPLAYER_API_KEY != ''` |
-| `tests/common/judge.rs`（改） | 加 `record_arc_skip_if_judged(judges, label)` helper（仅 judges 非空写 ledger，与 `record_judge_skip` 同文件）+ 纯函数/语义单测 |
+| `tests/common/judge.rs`（改） | 加 `record_arc_skip_if_judged(judged: bool, label)` helper（judged=真跑了裁判才写 ledger，与 `record_judge_skip` 同文件）+ 纯函数/语义单测 |
 | `tests/common/conversation_gate.rs`（改） | 加 `report_dim_min(report, dim)`（取 min）+ 单测；`aggregate_dim_medians` 补「仅越高越坏维」注释 |
-| `tests/real_llm_autonomy_redline.rs`（改） | `gate()` CI 掉线 Skipped 路径补 `record_arc_skip_if_judged`（区分本地无 key 早返不写） |
-| `tests/real_llm_ops_smoke.rs`（改） | t15 overall_progress 改读 `report_dim_min` + None 分支补 helper；:2317 注释修正 |
-| `tests/real_llm_conversation_judge.rs`（改） | 三处 else 补 `record_arc_skip_if_judged` |
-| `tests/real_llm_roleplayer_calibration.rs`（改） | 三出口补 `record_arc_skip_if_judged` |
+| `tests/real_llm_autonomy_redline.rs`（改） | `gate()` 内 CI 掉线（judges 非空且返 Skipped）补 `record_arc_skip_if_judged(true,..)`；:14 本地早返不写 |
+| `tests/real_llm_ops_smoke.rs`（改） | t15 overall_progress 改读 `report_dim_min` + None 分支补 `record_arc_skip_if_judged(!judges.is_empty(),..)`；:2317 注释修正 |
+| `tests/real_llm_conversation_judge.rs`（改） | 记账下沉进 `judge()`（CI 有 key 但 `any_scored==false` 写 ledger，本地无 key 早返不写）；三处 else 不改、eprintln 保留 |
+| `tests/real_llm_roleplayer_calibration.rs`（改） | :71 `all_fallback` 与 :96 裁判全掉线两处补 `record_arc_skip_if_judged(true,..)`；:39 本地早返不写 |
 | `tests/real_llm_cross_domain_arc.rs`（改） | 身份探针末补 `assert_arc_redline_held` 弧末门 + transcript 累积 + :1259 注释修正 |
 
 ## 五、验证（spec「真红线仍拦、无假阳、假绿缝堵住、基线不回退」）
