@@ -241,9 +241,20 @@ struct InboxItem {
 - 幂等、可重跑（已有 ask_human_policy 的行跳过）。
 - **不删旧字段**（向后兼容 + 兜底）。
 
+## D. 执行层接线（让配置真生效，避免死字段）
+
+配置存了但不读 = 死字段（正是项目反复批评的反模式）。Phase 1 把 `ask_human_policy` 接进推送路径，全部经纯函数门、可单测：
+
+- **D.1 升级范围生效**：`escalate_held_decision`（`mod.rs:38`）与 `build_decision_signals_text`（`logic.rs:206`）当前读 `high_risk_escalation_mode`（经 `parse_high_risk_mode`）。改为先 `resolve_ask_human_policy(config)`，用解析出的四 `escalate_*` 布尔驱动 `should_escalate_held` 的新签名 `should_escalate_held(blocked_status, &resolved_policy)`。旧 `parse_high_risk_mode`/`HighRiskEscalationMode` 保留供回落映射，不删。
+- **D.2 决策人取 chain[0]**：`escalate_held_decision` / `trigger_principal_escalation`（`gateway.rs:485`）当前调 `principal_decider_wxid()` 取单个 wxid。改为取 `resolve_ask_human_policy(config).decider_chain` 的首位；chain 空 → 回落旧 `principal_decider`（None 则不启用，行为不变）。
+- **D.3 骚扰门**：推卡前（`insert_pending_escalation` 调用前）加纯函数门 `push_allowed(policy, recent_pushes, now) -> bool`：判 `dedupe_window_hours`（超窗才允许同客户同类别再推，比现有 pending 去重更细）、`daily_push_cap`（查当日该决策人推送计数）、`quiet_hours`（复用 `quiet_hours::hour_in_offset`）。门关 → 跳过推卡（台账仍记 pending，等下次窗口或人工在 admin 处置）。None 配置 → 全放行（字节等价）。
+- **D.4 超时扫描**：见 B.4（已属 B 块，此处不重复）。
+
+**红线**：D.1-D.3 全部 `None/缺省 → 现有行为字节等价`（纯函数测试逐条锁）。不引入任何降低安全门的开关——`escalate_safety_guard` 即便配 false，也只是「不额外请示领导」，安全门本身（`blocked_by_safety_guard` 仍拦截不发）不受影响。
+
 ## Phase 1 交付边界
 
-后端三块：A 配置模型+写入端点 / B escalation 三端点+超时扫描 / C 聚合器二端点 + 红线/测试/迁移。**不含任何前端**。交付后：请示通道可在 admin 用 API 处置，请示策略可写、超时转备选生效，收件箱聚合数据就绪。
+后端四块：A 配置模型+写入端点 / B escalation 三端点+超时扫描 / C 聚合器二端点 / D 执行层接线 + 红线/测试/迁移。**不含任何前端**。交付后：请示通道可在 admin 用 API 处置，请示策略可写**且真生效**（升级范围/骚扰频率/超时转备选全部接进推送路径），收件箱聚合数据就绪。
 
 ---
 
