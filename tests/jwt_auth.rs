@@ -133,6 +133,9 @@ fn base_cfg() -> AppConfig {
         jwt_ttl_minutes: 60,
         jwt_private_key_pem: None,
         jwt_public_key_pem: None,
+        media_storage_dir: "./media".to_string(),
+        media_max_file_size_mb: 50,
+        media_id_cache_ttl_hours: 24,
     }
 }
 

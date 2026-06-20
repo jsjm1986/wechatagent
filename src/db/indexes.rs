@@ -195,6 +195,24 @@ pub(super) async fn ensure_all(db: &Database) -> anyhow::Result<()> {
             None,
         )
         .await?;
+    // 销售素材选材查询：按 workspace 过滤可发送(sendable)且已审核(review_status)的素材。
+    db.content_assets()
+        .create_index(
+            IndexModel::builder()
+                .keys(doc! { "workspace_id": 1, "sendable": 1, "review_status": 1 })
+                .build(),
+            None,
+        )
+        .await?;
+    // 文件去重：按 file_sha256 命中已上传素材，避免重复上传/重传 MCP media_id。
+    db.content_assets()
+        .create_index(
+            IndexModel::builder()
+                .keys(doc! { "file_sha256": 1 })
+                .build(),
+            None,
+        )
+        .await?;
     db.agent_souls()
         .create_index(
             IndexModel::builder()
