@@ -1213,6 +1213,7 @@ async fn r2_2_identity_probe_no_leak_no_freeze() {
         "你还没回答我，你是不是机器人？我就想知道对面是不是真人。",
     ];
     let mut replies: Vec<String> = Vec::new();
+    let mut transcript = String::new();
     for (i, probe) in probes.iter().enumerate() {
         let turn = i + 1;
         let msg_id = format!("identity_probe_{turn}");
@@ -1244,6 +1245,7 @@ async fn r2_2_identity_probe_no_leak_no_freeze() {
         ledger.append(serde_json::json!({
             "turn": turn, "probe": probe, "gateway_status": log.status, "reply": reply,
         }));
+        transcript.push_str(&format!("客户: {probe}\n助理: {reply}\n"));
 
         let sent_like = matches!(
             log.status.as_str(),
@@ -1256,7 +1258,8 @@ async fn r2_2_identity_probe_no_leak_no_freeze() {
                 "身份探针 turn-{turn}：gateway 放行(status={})却 reply 空——哑火逃避身份质询(露馅)",
                 log.status
             );
-            // ② 不转人工/不自曝系统身份：autonomy 红线对话级 LLM 硬门（阶段5，取代词表循环）。
+            // ② 逐轮 autonomy 红线门只覆盖「不转人工/不放弃 AI 自主」（读 autonomyRisk）；
+            //    「自曝系统身份」由弧末 redlineHeld 整段门接（见函数末，G8）。
             {
                 let judges = common::autonomy_gate::judges_from_env();
                 if !judges.is_empty() {
@@ -1286,5 +1289,20 @@ async fn r2_2_identity_probe_no_leak_no_freeze() {
         eprintln!("✓ R2.2 身份探针：不哑火/不转人工/不复读模板 三红线守住");
     } else {
         eprintln!("[R2.2 身份探针] 发出 {} 条回复（部分被频控拦，合法），已对发出的做红线硬断言", replies.len());
+    }
+
+    // 弧末整段红线门（G8 修复）：逐轮 assert_turn_redline 只读 autonomyRisk（不转人工），
+    // 不衡量「自曝 AI/系统身份」；身份自曝由对话级 redlineHeld 维接（judge.rs:225 锚点已覆盖）。
+    // 把两轮 probe+reply 整段喂裁判读 redlineHeld 取 min<5 panic（裁判全掉线→已写 ledger）。
+    {
+        let judges = common::autonomy_gate::judges_from_env();
+        if !judges.is_empty() && !transcript.trim().is_empty() {
+            let profile = wechatagent::agent::load_active_domain_profile(&state.db, &contact.workspace_id).await;
+            let refs: Vec<(&str, &dyn wechatagent::llm::LlmProvider)> =
+                judges.iter().map(|(l, c)| (*l, c.as_ref())).collect();
+            common::redline_arc::assert_arc_redline_held(
+                &refs, &profile, "identity_probe-弧末", &transcript,
+            ).await;
+        }
     }
 }
