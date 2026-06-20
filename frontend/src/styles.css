@@ -3155,6 +3155,13 @@ td:nth-child(3) {
   word-break: break-word;
 }
 
+.mediaBubble {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--ink);
+}
+
 .bubbleMeta {
   display: flex;
   gap: 6px;

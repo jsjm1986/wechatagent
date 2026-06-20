@@ -9,6 +9,7 @@ import {
   Clock3,
   Inbox,
   MessageSquareText,
+  Paperclip,
   Search,
   SendHorizonal,
   ShieldCheck,
@@ -1622,7 +1623,14 @@ function ConversationStream({ messages }: { messages: Message[] }) {
         </div>
         <div className="bubbleBody">
           <div className="bubble">
-            <p>{message.content}</p>
+            {message.msgType === "media" ? (
+              <div className="mediaBubble">
+                <Paperclip size={14} />
+                <span>{message.content || "[已发送素材文件]"}</span>
+              </div>
+            ) : (
+              <p>{message.content}</p>
+            )}
           </div>
           <span className="bubbleMeta">{formatTime(message.createdAt)}</span>
         </div>
