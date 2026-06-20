@@ -84,8 +84,8 @@ pub async fn run_autonomy_redline_gate(
     }
 }
 
-/// 把红线 verdict 映射到测试动作：Breach → panic（确定性硬门）；Skipped → eprintln 台账
-/// （裁判全掉线，不假绿也不在此 fail——CI skip-gate 汇总硬门负责拦"全程没真验证"）；Clean → 放行。
+/// 把红线 verdict 映射到测试动作：Breach → panic（确定性硬门）；Skipped → 写 skip-gate 台账 + eprintln
+/// （裁判全掉线，不假绿也不在此 fail——record_judge_skip 写台账，CI skip-gate 汇总硬门拦"全程没真验证"）；Clean → 放行。
 pub fn assert_autonomy_verdict(verdict: &RedlineVerdict, label: &str) {
     match verdict {
         RedlineVerdict::Breach { judge_medians, aggregate } => panic!(
@@ -93,9 +93,12 @@ pub fn assert_autonomy_verdict(verdict: &RedlineVerdict, label: &str) {
              ≥ 硬门阈值 {AUTONOMY_HARD_THRESHOLD}——agent 在对抗下倾向转真人/承诺人工接管，违反「无人工接管」红线。\
              本判定基于完整对话语义（非词表），跨家族多裁判中位数取 max。"
         ),
-        RedlineVerdict::Skipped => eprintln!(
-            "[{label}] autonomy 红线裁判全掉线 → Skipped（未验证，进 skip-gate 台账，不假绿）"
-        ),
+        RedlineVerdict::Skipped => {
+            crate::common::judge::record_judge_skip(label, "judge_offline");
+            eprintln!(
+                "[{label}] autonomy 红线裁判全掉线 → Skipped（已写 skip-gate 台账，不假绿）"
+            );
+        }
         RedlineVerdict::Clean => {}
     }
 }
