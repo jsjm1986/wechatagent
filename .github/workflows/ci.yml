@@ -1245,6 +1245,77 @@ jobs:
           if-no-files-found: ignore
           retention-days: 30
 
+  # roleplayer 校准弧（real_llm_roleplayer_calibration.rs，阶段4）。
+  # 证明 roleplayer 生成的攻击像真实难缠客户(非失真/出戏):生成组(跑真 roleplayer 三手法)
+  # realism > 离谱对照组(手写机器人腔/出戏)。铁律③:先以人工金标锚定方向,roleplayer 可信
+  # 才让对抗弧输入端可信。需三族 key:裁判 REAL_LLM_JUDGE_*(rsxermu gpt-5.4)+ roleplayer
+  # ROLEPLAYER_*(NVIDIA qwen,异端点不占 rsxermu 并发,与 dynamic_adversarial job 同源)。
+  # JUDGE_SAMPLES=1 守端点并发上限 2(realism 裁判单裁判内全程 K=1,靠跨裁判 median-of-median)。
+  # 串行链末环(needs real-llm-conversation-judge)守 rsxermu 并发 2。本地/缺 key 时 Skipped
+  # 成立 PASS(设计),真信号靠本 job 真 key 路径:生成组 realism 应真 > 离谱对照组。
+  real-llm-roleplayer-calibration:
+    name: Real-LLM roleplayer 校准弧 (J3 / realism / 生成vs离谱对照)
+    runs-on: ubuntu-latest
+    if: ${{ github.event_name != 'workflow_dispatch' }}
+    needs: real-llm-conversation-judge
+    continue-on-error: true
+    timeout-minutes: 90
+    env:
+      REAL_LLM_API_KEY: ${{ secrets.RSXERMU_KEY }}
+    steps:
+      - name: Require REAL_LLM_API_KEY (R0.1 缺 key 真 fail，不假绿)
+        if: ${{ env.REAL_LLM_API_KEY == '' }}
+        run: |
+          echo "::error::REAL_LLM_API_KEY 未配置（secrets.RSXERMU_KEY 为空）。roleplayer 校准弧的 realism 裁判必须有 key 才能真跑——缺 key 直接 fail，不静默跳过假绿（R0.1）。"
+          exit 1
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Free disk space
+        if: ${{ env.REAL_LLM_API_KEY != '' }}
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android \
+            /usr/local/share/boost /usr/local/share/powershell \
+            /usr/lib/jvm "$AGENT_TOOLSDIRECTORY" || true
+          sudo docker image prune --all --force || true
+          df -h
+
+      - name: Install Rust toolchain
+        if: ${{ env.REAL_LLM_API_KEY != '' }}
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry / target
+        if: ${{ env.REAL_LLM_API_KEY != '' }}
+        uses: Swatinem/rust-cache@v2
+
+      # 裁判 = gpt-5.4（rsxermu /v1，judges_from_env 读 REAL_LLM_JUDGE_*）；roleplayer = NVIDIA
+      # qwen（ROLEPLAYER_*，异端点不占 rsxermu 并发）。JUDGE_SAMPLES=1 守端点上限 2（realism
+      # 裁判单裁判内 K=1，靠跨裁判 median-of-median）。roleplayer 生成三手法串行不并发。
+      - name: cargo test --test real_llm_roleplayer_calibration (J3 校准)
+        if: ${{ env.REAL_LLM_API_KEY != '' }}
+        env:
+          RUSTFLAGS: ""
+          REAL_LLM_JUDGE: "1"
+          JUDGE_SAMPLES: "1"
+          REAL_LLM_JUDGE_API_KEY: ${{ secrets.RSXERMU_KEY }}
+          REAL_LLM_JUDGE_BASE_URL: https://rsxermu666.cn/v1
+          REAL_LLM_JUDGE_MODEL: gpt-5.4
+          REAL_LLM_JUDGE_FORMAT: openai
+          ROLEPLAYER_API_KEY: ${{ secrets.NVIDIA_KEY }}
+          ROLEPLAYER_BASE_URL: https://integrate.api.nvidia.com/v1
+          ROLEPLAYER_MODEL: qwen/qwen3-next-80b-a3b-instruct
+          REAL_LLM_LEDGER: target/real_llm_ledger
+        run: cargo test --no-fail-fast --test real_llm_roleplayer_calibration -- --ignored --nocapture
+
+      - name: Upload skip ledger
+        if: ${{ always() && env.REAL_LLM_API_KEY != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: real-llm-ledger-roleplayer-calibration
+          path: target/real_llm_ledger/
+          if-no-files-found: ignore
+          retention-days: 30
+
   # ════════════════════════════════════════════════════════════════════════════
   # R0.2：skip 率硬门（汇总）。各 real-llm job 是 continue-on-error（conclusion 恒
   # success，端点抖动不卡合并），但**大面积 transient-skip = 这一轮真模型测试实际
@@ -1256,7 +1327,7 @@ jobs:
     name: Real-LLM skip 率硬门 (R0.2)
     runs-on: ubuntu-latest
     if: ${{ github.event_name != 'workflow_dispatch' }}
-    needs: [real-llm, real-llm-recall, real-llm-ops, real-llm-quality, real-llm-adversarial, real-llm-redline, real-llm-autonomy-redline, real-llm-conversation-judge]
+    needs: [real-llm, real-llm-recall, real-llm-ops, real-llm-quality, real-llm-adversarial, real-llm-redline, real-llm-autonomy-redline, real-llm-conversation-judge, real-llm-roleplayer-calibration]
     steps:
       - name: Checkout
         uses: actions/checkout@v4
