@@ -84,6 +84,7 @@ async fn insert_new_current_domain_config(
         seeded_by: Some(seeded_by),
         principal_decider: source.principal_decider.clone(),
         high_risk_escalation_mode: source.high_risk_escalation_mode.clone(),
+        ask_human_policy: source.ask_human_policy.clone(),
     };
     let inserted = coll.insert_one(&new_entry, None).await?;
     let inserted_id = inserted.inserted_id.as_object_id();
