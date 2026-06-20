@@ -196,6 +196,45 @@ pub async fn update_operation_domain_state_machine(
     Ok(Json(json!({ "ok": true })))
 }
 
+/// PUT /api/admin/operation-domains/:domain/ask-human-policy
+/// $set ask_human_policy 到 current_version 行（不 bump 版本，贴生产 admin 编辑语义）。
+pub async fn put_ask_human_policy(
+    State(state): State<AppState>,
+    Extension(admin): Extension<AuthenticatedAdmin>,
+    Path(domain): Path<String>,
+    Json(policy): Json<crate::models::AskHumanPolicy>,
+) -> AppResult<Json<Value>> {
+    // 校验：decider_chain wxid 非空；quiet_hours 小时范围。
+    for d in &policy.decider_chain {
+        if d.wxid.trim().is_empty() {
+            return Err(AppError::BadRequest("decider_chain wxid 不能为空".into()));
+        }
+    }
+    if let Some(qh) = &policy.quiet_hours {
+        if qh.start_hour > 23 || qh.end_hour > 23 {
+            return Err(AppError::BadRequest("quiet_hours 小时须 0-23".into()));
+        }
+    }
+    let policy_bson = mongodb::bson::to_bson(&policy)?;
+    let res = state
+        .db
+        .operation_domain_configs()
+        .update_one(
+            doc! {
+                "workspace_id": &admin.current_workspace,
+                "domain": &domain,
+                "current_version": true,
+            },
+            doc! { "$set": { "ask_human_policy": policy_bson, "updated_at": DateTime::now() } },
+            None,
+        )
+        .await?;
+    if res.matched_count == 0 {
+        return Err(AppError::NotFound("operation domain 当前版本不存在".into()));
+    }
+    Ok(Json(json!({ "ok": true })))
+}
+
 pub(super) async fn reset_operation_domain(
     State(state): State<AppState>,
     Extension(admin): Extension<AuthenticatedAdmin>,
