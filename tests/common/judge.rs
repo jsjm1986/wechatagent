@@ -506,9 +506,6 @@ pub async fn run_judge_graded(
     .await
 }
 
-/// 与 `run_judge_graded` 同口径，但额外接受 `ctx: &JudgeContext` 底料 —— 唯一区别是
-/// user prompt 用 `build_judge_user_with_context` 把对话/知识/记忆/承诺/画像注入裁判。
-/// 空 ctx 时行为与 `run_judge_graded` 逐字等价（向后兼容）。
 /// 底层通用采样核：对给定 system+user 跑 K 次（join_all 并发——K 须为 1，端点并发上限 2），
 /// 按 dims 取各维 median。封装 REAL_LLM_JUDGE env 门 + 端点配错 panic（R0.3）+ 全失败按 gate 处置。
 /// 不绑 inbound/reply 语义——单轮裁判与对话级总评共用（DRY）。
