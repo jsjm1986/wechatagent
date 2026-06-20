@@ -158,6 +158,8 @@ pub async fn send_contact_message_gateway(
         dedupe_key: None,
         direction: MessageDirection::Inbound,
         content: "后台管理 Agent 请求发送私聊，请按生产发送网关进行频控和审查。".to_string(),
+        msg_type: None,
+        media_ref: None,
         raw: Some(request.source.clone()),
         created_at: DateTime::now(),
     };
@@ -1922,6 +1924,8 @@ pub(crate) async fn send_outbound_message(
                 dedupe_key: None,
                 direction: MessageDirection::Outbound,
                 content: content.to_string(),
+                msg_type: None,
+                media_ref: None,
                 raw: Some(raw),
                 created_at: now,
             },
@@ -2001,6 +2005,8 @@ pub(crate) fn trigger_message(
             // 没话找话。客户的真实消息已在 load_recent_messages 里，这里只需把"现在醒来、
             // 基于完整对话回复"的语境交给它。普通 follow_up 仍是"主动触达"判断。
             content: follow_up_trigger_message_text(&task.kind, &task.content),
+            msg_type: None,
+            media_ref: None,
             raw: Some(doc! {
                 "trigger": "follow_up_task",
                 "taskId": task.id.map(|id| id.to_hex()).unwrap_or_default(),

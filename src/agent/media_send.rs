@@ -1,6 +1,11 @@
 //! 销售素材选材：媒体类型→MCP 工具名映射、候选过滤（纯函数）。
-//! 发送执行逻辑（ensure_media_uploaded / send_outbound_media）属于后续任务。
-use crate::models::ContentAsset;
+//! 发送执行逻辑（ensure_media_uploaded / send_outbound_media）+ 崩溃恢复防重发核对。
+use crate::error::{AppError, AppResult};
+use crate::media_storage;
+use crate::models::{ContentAsset, ConversationMessage, MessageDirection};
+use crate::routes::AppState;
+use mongodb::bson::{doc, oid::ObjectId, to_document, DateTime};
+use serde_json::{json, Value};
 
 /// 媒体类型 → MCP 私聊发送工具名。不写死在调用处，集中此表。
 /// 链接卡片/小程序：MCP 私聊侧确认工具名后在此加一行即可，不改调用方。
@@ -62,11 +67,239 @@ pub(crate) fn render_candidate_lines(candidates: &[&ContentAsset]) -> String {
     out
 }
 
+/// media_id 缓存有效性（纯函数）：`updated_at` 距 `now` 不超过 `ttl_hours`，
+/// 且非未来时间（时钟回拨 / 脏数据 → 视为无效，强制重传）。
+/// 不依赖"media_id 永久有效"——超 TTL 即过期重传。
+pub(crate) fn media_id_cache_valid(updated_at: DateTime, ttl_hours: i64, now: DateTime) -> bool {
+    let age_ms = now.timestamp_millis() - updated_at.timestamp_millis();
+    age_ms >= 0 && age_ms < ttl_hours * 3600 * 1000
+}
+
+/// 媒体发送工具集——崩溃恢复核对时用来圈定"这条记录是一次素材发送"。
+const MEDIA_SEND_TOOLS: [&str; 3] =
+    ["message_send_image", "message_send_file", "message_send_video"];
+
+/// 确保 asset 在 MCP 侧有有效 media_id：缓存命中（media_id 存在且未过 TTL）直接用，
+/// 否则读盘 base64 → `media_upload_base64` → 回写 media_id + updated_at。
+/// **不依赖"media_id 永久有效"假设**——TTL 过期即重传。
+async fn ensure_media_uploaded(state: &AppState, asset: &ContentAsset) -> AppResult<String> {
+    let now = DateTime::now();
+    if let Some(mid) = asset.media_id.as_ref() {
+        if media_id_cache_valid(asset.updated_at, state.config.media_id_cache_ttl_hours, now) {
+            return Ok(mid.clone());
+        }
+    }
+    let rel = asset
+        .file_path
+        .as_ref()
+        .ok_or_else(|| AppError::External("asset has no file_path".into()))?;
+    let root = std::path::Path::new(&state.config.media_storage_dir);
+    let bytes = media_storage::read_bytes(root, rel)
+        .await
+        .map_err(|e| AppError::External(format!("read media failed: {e}")))?;
+    use base64::Engine;
+    let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+
+    // MCP 入参字段名以 server tools/list 为准；这里用占位形态，集成时对齐。
+    let account_id = asset
+        .account_id
+        .as_deref()
+        .unwrap_or(&state.config.default_account_id);
+    let resp = crate::mcp::logged_call_for_account(
+        state,
+        account_id,
+        "media_upload_base64",
+        json!({
+            "fileName": asset.file_name,
+            "mediaType": asset.media_type,
+            "base64": b64,
+        }),
+    )
+    .await?;
+    let media_id = resp
+        .get("mediaId")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| AppError::External("media_upload_base64 no mediaId".into()))?
+        .to_string();
+
+    // 回写缓存（best-effort：失败不阻断发送，下次仍可命中重传分支）。
+    if let Some(oid) = asset.id {
+        let _ = state
+            .db
+            .content_assets()
+            .update_one(
+                doc! { "_id": oid },
+                doc! { "$set": { "media_id": &media_id, "updated_at": now } },
+                None,
+            )
+            .await;
+    }
+    Ok(media_id)
+}
+
+/// 发送一个素材文件给客户。调用方（dispatcher）已确保经 outbox 幂等。
+/// 流程：查 asset → 准入二次校验（防 AI 幻觉出未审素材）→ 媒体类型映射工具名
+/// → ensure_media_uploaded → MCP 发送 → 落出站 `ConversationMessage`（带 media 标注）。
+pub(crate) async fn send_outbound_media(
+    state: &AppState,
+    contact: &crate::models::Contact,
+    asset_id: &str,
+) -> AppResult<Value> {
+    let oid = ObjectId::parse_str(asset_id)
+        .map_err(|_| AppError::External("bad asset_id".into()))?;
+    let asset = state
+        .db
+        .content_assets()
+        .find_one(doc! { "_id": oid }, None)
+        .await?
+        .ok_or_else(|| AppError::NotFound("asset not found".into()))?;
+
+    // 发送前准入二次校验（防 AI 幻觉出未审/不可发素材一路漏到发送）。
+    if !validate_asset_sendable(&asset) {
+        return Err(AppError::External(
+            "asset not sendable (draft/disabled/bad type)".into(),
+        ));
+    }
+    let tool = mcp_tool_for_media_type(asset.media_type.as_deref().unwrap_or(""))
+        .ok_or_else(|| AppError::External("unsupported media_type".into()))?;
+    let media_id = ensure_media_uploaded(state, &asset).await?;
+
+    let resp = crate::mcp::logged_call_for_account(
+        state,
+        &contact.account_id,
+        tool,
+        json!({ "recipient": contact.wxid, "mediaId": media_id }),
+    )
+    .await?;
+
+    // MCP 已成功 = 文件已送达客户，既成事实。此后落库失败**绝不**返 Err——
+    // 否则 dispatcher 会 retry 重发，客户收到重复文件（与 send_outbound_message 对称）。
+    let message_id = resp
+        .get("newMsgId")
+        .and_then(|v| v.as_str())
+        .map(ToString::to_string);
+    let mut raw = to_document(&resp).unwrap_or_default();
+    raw.insert("mediaAssetId", asset_id);
+    let now = DateTime::now();
+    if let Err(err) = state
+        .db
+        .messages()
+        .insert_one(
+            ConversationMessage {
+                id: None,
+                workspace_id: contact.workspace_id.clone(),
+                account_id: contact.account_id.clone(),
+                contact_wxid: contact.wxid.clone(),
+                message_id,
+                dedupe_key: None,
+                direction: MessageDirection::Outbound,
+                content: asset.title.clone(),
+                msg_type: Some("media".to_string()),
+                media_ref: Some(asset_id.to_string()),
+                raw: Some(raw),
+                created_at: now,
+            },
+            None,
+        )
+        .await
+    {
+        tracing::error!(
+            account_id = %contact.account_id,
+            contact_wxid = %contact.wxid,
+            error = %err,
+            "MCP media send succeeded but persisting outbound conversation_messages failed; file delivered but record missing",
+        );
+    }
+    Ok(resp)
+}
+
+/// 媒体条目崩溃恢复核对（硬伤④）：`mcp_already_succeeded` 写死 text 工具 + 按
+/// content 匹配，对媒体条目（content 空、tool 为 message_send_*）会查不到 → 误判
+/// 没发过 → 重发文件骚扰客户。本函数按 **media_id** 定位该 asset 的成功发送记录。
+///
+/// 可靠性依据：素材发送前必走 `ensure_media_uploaded`，它在 send 之前把 media_id
+/// 回写到 `content_assets`，且 MCP send 请求体携带 `request.mediaId`。故：
+/// - asset.media_id 为 None ⇒ 从未上传 ⇒ 不可能发出过 ⇒ 返回 false（放行发送）；
+/// - asset.media_id 为 Some ⇒ 查 `mcp_call_logs` 里 tool ∈ 媒体工具集 + 同 recipient
+///   + `request.mediaId` == 该 media_id + `error=null` + 时间窗内的成功记录。
+async fn mcp_media_already_succeeded(
+    state: &AppState,
+    account_id: &str,
+    contact_wxid: &str,
+    asset_id: &str,
+    entry_created_at: DateTime,
+) -> AppResult<bool> {
+    let oid = match ObjectId::parse_str(asset_id) {
+        Ok(o) => o,
+        Err(_) => return Ok(false),
+    };
+    let asset = state
+        .db
+        .content_assets()
+        .find_one(doc! { "_id": oid }, None)
+        .await?;
+    // media_id 缺失 ⇒ 不可能发出过（send 必先 upload 回写 media_id）⇒ 安全放行。
+    let media_id = match asset.and_then(|a| a.media_id) {
+        Some(m) => m,
+        None => return Ok(false),
+    };
+    let lower_bound_millis = entry_created_at
+        .timestamp_millis()
+        .saturating_sub(5 * 60 * 1000);
+    let lower_bound = DateTime::from_millis(lower_bound_millis);
+    let count = state
+        .db
+        .mcp_logs()
+        .count_documents(
+            doc! {
+                "account_id": account_id,
+                "tool_name": { "$in": MEDIA_SEND_TOOLS.to_vec() },
+                "request.recipient": contact_wxid,
+                "request.mediaId": &media_id,
+                "error": null,
+                "created_at": { "$gte": lower_bound },
+            },
+            None,
+        )
+        .await?;
+    Ok(count > 0)
+}
+
+/// dispatcher 在媒体条目崩溃恢复 / timeout 分支调用：核对该素材是否已发出。
+/// 见 [`mcp_media_already_succeeded`] 的可靠性依据。
+pub(crate) async fn media_already_succeeded(
+    state: &AppState,
+    account_id: &str,
+    contact_wxid: &str,
+    asset_id: &str,
+    entry_created_at: DateTime,
+) -> AppResult<bool> {
+    mcp_media_already_succeeded(state, account_id, contact_wxid, asset_id, entry_created_at).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::models::ContentAsset;
     use mongodb::bson::DateTime;
+
+    #[test]
+    fn media_id_cache_respects_ttl() {
+        let now_ms = 1_000_000_000_000i64;
+        let now = DateTime::from_millis(now_ms);
+        let fresh = DateTime::from_millis(now_ms - 1000 * 60 * 60); // 1h 前
+        let stale = DateTime::from_millis(now_ms - 1000 * 60 * 60 * 48); // 48h 前
+        assert!(media_id_cache_valid(fresh, 24, now)); // 24h TTL 内
+        assert!(!media_id_cache_valid(stale, 24, now)); // 超 TTL
+    }
+
+    #[test]
+    fn media_id_cache_future_timestamp_is_invalid() {
+        // 时钟回拨 / 脏数据：updated_at 在 now 之后 → 视为无效，强制重传。
+        let now = DateTime::from_millis(1_000_000_000_000);
+        let future = DateTime::from_millis(1_000_000_000_000 + 5000);
+        assert!(!media_id_cache_valid(future, 24, now));
+    }
 
     fn asset(sendable: Option<bool>, review: Option<&str>, mt: Option<&str>, stages: Option<Vec<&str>>) -> ContentAsset {
         ContentAsset {

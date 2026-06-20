@@ -100,6 +100,8 @@ async fn simulate_user_dialogue_inner(
             dedupe_key: None,
             direction: MessageDirection::Inbound,
             content: text.trim().to_string(),
+            msg_type: None,
+            media_ref: None,
             raw: Some(doc! { "runMode": "shadow" }),
             created_at: DateTime::now(),
         };
@@ -248,6 +250,8 @@ async fn simulate_user_dialogue_inner(
                 dedupe_key: None,
                 direction: MessageDirection::Outbound,
                 content: decision.reply_text,
+                msg_type: None,
+                media_ref: None,
                 raw: Some(doc! { "runMode": "shadow" }),
                 created_at: DateTime::now(),
             });

@@ -493,6 +493,12 @@ pub struct ConversationMessage {
     pub dedupe_key: Option<String>,
     pub direction: MessageDirection,
     pub content: String,
+    /// 出站消息类型："text"(默认/缺省) | "media"。媒体消息供前端渲染文件卡片。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub msg_type: Option<String>,
+    /// 媒体消息的 content_assets._id（hex），前端据此取缩略图/文件名。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub media_ref: Option<String>,
     pub raw: Option<Document>,
     pub created_at: DateTime,
 }
@@ -526,6 +532,8 @@ impl ConversationMessage {
             dedupe_key: None,
             direction: MessageDirection::Inbound,
             content: payload,
+            msg_type: None,
+            media_ref: None,
             raw: None,
             created_at: DateTime::now(),
         }

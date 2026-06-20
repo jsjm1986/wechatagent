@@ -470,6 +470,8 @@ pub async fn wechat_webhook(
         dedupe_key: Some(dedupe_key.clone()),
         direction: MessageDirection::Inbound,
         content,
+        msg_type: None,
+        media_ref: None,
         raw,
         created_at: DateTime::now(),
     };
@@ -1140,6 +1142,8 @@ mod debounce_tests {
             dedupe_key: None,
             direction: MessageDirection::Inbound,
             content: "hi".to_string(),
+            msg_type: None,
+            media_ref: None,
             raw: None,
             created_at: DateTime::now(),
         };
@@ -1170,6 +1174,8 @@ mod debounce_tests {
             dedupe_key: None,
             direction: MessageDirection::Inbound,
             content: content.to_string(),
+            msg_type: None,
+            media_ref: None,
             raw: None,
             created_at: DateTime::now(),
         }
