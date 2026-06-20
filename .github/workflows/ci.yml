@@ -943,9 +943,12 @@ jobs:
 
   # 手动单跑：R5.1 LLM 演客户动态博弈链（roleplayer 真演客户 × agent 真回应 × 多轮闭合）。
   # 三族异族（R5.0.1）：agent=claude-opus-4-8（RSXERMU/Anthropic）、roleplayer=NVIDIA
-  # llama-3.3-70b（NVIDIA_KEY，第三族，独立端点不占 rsxermu 并发）。judge 本条不接（R5.2
-  # trajectory judge 后续）——只验博弈链通 + gateway status 闭集硬断言 + roleplayer 不出戏。
-  # 仅 workflow_dispatch + dispatch_target=roleplay_arc 触发。无 needs，立即起跑。
+  # llama-3.3-70b（NVIDIA_KEY，第三族，独立端点不占 rsxermu 并发）。
+  # 阶段5 迁移后：本弧逐轮/弧末转真人·暴露身份红线从词表门迁到对话级 LLM 裁判
+  # （redline_arc::assert_turn_redline + assert_arc_redline_held 经 judges_from_env 装配），
+  # 故必须配裁判 key（REAL_LLM_JUDGE*），否则 judges 空→红线全 Skipped=假绿。裁判=跨家族
+  # gpt-5.4（rsxermu OpenAI /v1）。R5.2 trajectory judge 仍后续。其余仍验博弈链通 + gateway
+  # status 闭集硬断言 + roleplayer 不出戏。仅 workflow_dispatch + dispatch_target=roleplay_arc 触发。无 needs，立即起跑。
   roleplay-arc:
     name: Roleplay R5.1 动态博弈链 (手动单跑 / 三族真模型)
     runs-on: ubuntu-latest
@@ -1000,6 +1003,21 @@ jobs:
           ROLEPLAYER_MODEL: meta/llama-3.3-70b-instruct
           ROLEPLAYER_FORMAT: openai
           ROLEPLAYER_TEMPERATURE: "0.8"
+          # 阶段5 迁移后红线门走对话级 LLM 裁判（judges_from_env 读 REAL_LLM_JUDGE_API_KEY/
+          # _BASE_URL/_MODEL + REAL_LLM_JUDGE=1）。被测 claude + 跨家族裁判 gpt-5.4（rsxermu /v1）。
+          # 缺这组 key → judges 空 → 逐轮/弧末红线全 Skipped=假绿。本弧无 strongest_model_client/
+          # failover，配 JUDGE_API_KEY 不激活 agent 备胎（被测纯度不受影响）。JUDGE_SAMPLES=1 守
+          # rsxermu 并发上限 2（全程 K=1，靠跨家族裁判取严）。可选 judge2=NVIDIA qwen（异端点不占并发）。
+          REAL_LLM_JUDGE: "1"
+          JUDGE_SAMPLES: "1"
+          REAL_LLM_JUDGE_API_KEY: ${{ secrets.RSXERMU_KEY }}
+          REAL_LLM_JUDGE_BASE_URL: https://rsxermu666.cn/v1
+          REAL_LLM_JUDGE_MODEL: gpt-5.4
+          REAL_LLM_JUDGE_FORMAT: openai
+          REAL_LLM_JUDGE2_API_KEY: ${{ secrets.NVIDIA_KEY }}
+          REAL_LLM_JUDGE2_BASE_URL: https://integrate.api.nvidia.com/v1
+          REAL_LLM_JUDGE2_MODEL: qwen/qwen3-next-80b-a3b-instruct
+          REAL_LLM_LEDGER: target/real_llm_ledger
         run: cargo test --no-fail-fast --test real_llm_roleplay_arc -- --ignored --nocapture
 
       - name: Upload roleplay arc ledger
