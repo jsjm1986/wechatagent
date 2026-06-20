@@ -1728,3 +1728,72 @@ async fn activate_leaves_unset_operation_state_contact() {
         "未设 operation_state 的 contact 不应被本迁移写入（$exists:true,$ne:null 过滤排除）"
     );
 }
+
+/// G06：直编状态机本体路由 `update_operation_domain_state_machine` 改本体后必须联动重派
+/// `operation_state_policies`。此前直编路由不走 publish loop、不派生 policy → 新增
+/// `forbidsProactive:true` state 的主动触达门 fail-open 静默失效（guards 对缺失 policy 行放行）。
+///
+/// 场景：底座机器 grieving forbidsProactive=false（policy forbidden 不含 reply）→ 直编路由
+/// 把同名 state 切 forbidsProactive=true → 断言该 state 的 current policy 行 forbidden 含 reply
+/// （reconcile 生效，主动触达门真正拦得住）。
+#[tokio::test]
+#[ignore]
+async fn direct_edit_state_machine_rederives_policy() {
+    let app = common::TestApp::start().await;
+    let db = app.state.db.clone();
+    let ws = app.state.config.default_workspace_id.clone();
+
+    db_seed_base_domain_config(&db, &ws).await;
+
+    // 先把底座 current 机器改成含 grieving(forbidsProactive=false) 的本体，并经直编路由
+    // 让 reconcile 派一行 grieving policy（forbidden 不含 reply）。
+    let machine_allow = doc! {
+        "states": [
+            { "key": "x_intro", "name": "开场", "initial": true, "allowedFrom": [] },
+            { "key": "grieving", "name": "哀伤期", "allowedFrom": ["x_intro"], "forbidsProactive": false },
+        ]
+    };
+    let _ = wechatagent::routes::domains::update_operation_domain_state_machine(
+        State(app.state.clone()),
+        Extension(test_admin(&ws)),
+        Path("user_operations".to_string()),
+        Json(machine_allow),
+    )
+    .await
+    .expect("direct edit (allow) handler ok");
+    let p1 = db_state_policy(&db, &ws, "grieving")
+        .await
+        .expect("grieving policy after allow edit");
+    assert!(
+        !p1.forbidden.iter().any(|a| a == "reply"),
+        "forbidsProactive=false 时直编派生 policy forbidden 不应含 reply: {:?}",
+        p1.forbidden
+    );
+
+    // 直编路由把 grieving 切 forbidsProactive=true → reconcile in-place 刷新机器派生行。
+    let machine_forbid = doc! {
+        "states": [
+            { "key": "x_intro", "name": "开场", "initial": true, "allowedFrom": [] },
+            { "key": "grieving", "name": "哀伤期", "allowedFrom": ["x_intro"], "forbidsProactive": true },
+        ]
+    };
+    let _ = wechatagent::routes::domains::update_operation_domain_state_machine(
+        State(app.state.clone()),
+        Extension(test_admin(&ws)),
+        Path("user_operations".to_string()),
+        Json(machine_forbid),
+    )
+    .await
+    .expect("direct edit (forbid) handler ok");
+
+    // 断言：grieving 的 current policy 行 forbidden 已含 reply（直编联动重派生生效，
+    // 不再 fail-open 静默忽略主动触达门）。
+    let p2 = db_state_policy(&db, &ws, "grieving")
+        .await
+        .expect("grieving policy after forbid edit");
+    assert!(
+        p2.forbidden.iter().any(|a| a == "reply"),
+        "直编 forbidsProactive 切 true 后 policy forbidden 应含 reply（reconcile 生效）: {:?}",
+        p2.forbidden
+    );
+}
