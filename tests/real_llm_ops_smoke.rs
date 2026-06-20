@@ -2327,9 +2327,9 @@ async fn t15_real_multiturn_deal_arc() {
             let report = common::conversation_gate::run_conversation_judge(
                 &refs, &profile, "t15-成交弧", &transcript, common::judge::JudgeGate::ObserveOnly,
             ).await;
-            match common::conversation_gate::report_dim(&report, "overall_progress") {
+            match common::conversation_gate::report_dim_min(&report, "overall_progress") {
                 Some(prog) => {
-                    eprintln!("[t15][对话级总评] overall_progress(跨裁判 max median)={prog}");
+                    eprintln!("[t15][对话级总评] overall_progress(跨裁判 min median)={prog}");
                     const T15_MIN_PROGRESS: i64 = 3;
                     assert!(
                         prog >= T15_MIN_PROGRESS,

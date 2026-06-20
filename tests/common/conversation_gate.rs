@@ -28,7 +28,9 @@ pub struct ConversationReport {
     pub any_scored: bool,
 }
 
-/// 跨裁判同一维 median 取 max（最严裁判说了算）。全 None → None。
+/// 跨裁判同一维 median 取 max（最严裁判说了算）。**仅用于「越高越坏/抓高端」维**
+/// （如 pressure_arc 上限门）；「越高越好/抓低端」维须用 report_dim_min（取 min），
+/// 否则一个宽松裁判给高分即掩盖低端退化=漏判。参见 redline_arc.rs:17-22。全 None → None。
 pub fn aggregate_dim_medians(per_judge: &[Option<i64>]) -> Option<i64> {
     per_judge.iter().filter_map(|m| *m).max()
 }
@@ -36,6 +38,15 @@ pub fn aggregate_dim_medians(per_judge: &[Option<i64>]) -> Option<i64> {
 /// 从 report 取某维聚合分（不存在/未出分 → None）。
 pub fn report_dim(report: &ConversationReport, dim: &str) -> Option<i64> {
     report.per_dim.iter().find(|v| v.dim == dim).and_then(|v| v.aggregate)
+}
+
+/// 从 report 取某维跨裁判 median 的 **min**（最严裁判=给最低分者）。用于「越高越好+抓低端」
+/// 的维（如 overall_progress 地板门）——取 min 才「宁可误判不可漏判」，与 redline_arc.rs:17-22
+/// 对 redlineHeld 取 min 同理。**不要**对这类维用走 max 的 report_dim/aggregate_dim_medians（漏判）。
+/// 维不存在/judge_medians 空 → None。
+pub fn report_dim_min(report: &ConversationReport, dim: &str) -> Option<i64> {
+    report.per_dim.iter().find(|v| v.dim == dim)
+        .and_then(|v| v.judge_medians.iter().copied().min())
 }
 
 /// 对话级总评：跨家族多裁判各对整段 transcript 打 7 arc 维分（全程 K=1,单裁判内单采样）,
@@ -116,5 +127,22 @@ mod tests {
         assert_eq!(report_dim(&report, "overall_progress"), Some(3));
         assert_eq!(report_dim(&report, "pressure_arc"), None);
         assert_eq!(report_dim(&report, "不存在"), None);
+    }
+
+    #[test]
+    fn report_dim_min_takes_min_across_judges() {
+        let report = ConversationReport {
+            per_dim: vec![
+                ConversationVerdict { dim: "overall_progress".into(), aggregate: Some(8), judge_medians: vec![8, 3, 6] },
+                ConversationVerdict { dim: "pressure_arc".into(), aggregate: None, judge_medians: vec![] },
+            ],
+            any_scored: true,
+        };
+        // 越高越好维取 min（最严裁判）——与 report_dim 走 max 相反。
+        assert_eq!(report_dim_min(&report, "overall_progress"), Some(3));
+        // 空 judge_medians → None。
+        assert_eq!(report_dim_min(&report, "pressure_arc"), None);
+        // 不存在的维 → None。
+        assert_eq!(report_dim_min(&report, "nonexistent"), None);
     }
 }
