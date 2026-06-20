@@ -39,7 +39,6 @@ use super::decision::{
     decide_reply_with_promote, load_operation_playbook_for_contact,
     load_operation_state_policy_for_contact, load_user_operation_domain_config_for_contact,
 };
-use super::domain::USER_OPS_DOMAIN_ID;
 use super::escalation;
 use super::guards::{
     check_state_transition, classify_decision_action, enforce_state_action_policy,
@@ -491,15 +490,33 @@ pub(crate) async fn trigger_principal_escalation(
     if !req.needed {
         return Ok(());
     }
-    let Some(principal_wxid) =
-        escalation::principal_decider_wxid(state, &contact.workspace_id, USER_OPS_DOMAIN_ID).await?
+    let Some(cfg) = super::decision::load_user_operation_domain_config_for_contact(
+        state,
+        &contact.workspace_id,
+        &contact.wxid,
+    )
+    .await?
     else {
-        return Ok(()); // 未配置领导 = 本 workspace 未启用请示通道
+        return Ok(()); // 无 config = 请示通道未配置
     };
+    let policy = escalation::resolve_ask_human_policy(&cfg);
+    let Some(decider) = policy.decider_chain.first() else {
+        return Ok(()); // 决策人链空 = 本 workspace 未启用请示通道
+    };
+    let principal_wxid = decider.wxid.clone();
     if principal_wxid == contact.wxid {
         return Err(AppError::BadRequest(
-            "principal_decider 配置等于客户 wxid，拒绝触发请示".into(),
+            "决策人配置等于客户 wxid，拒绝触发请示".into(),
         ));
+    }
+    // 骚扰门：daily_push_cap / quiet_hours（None 配置全放行，字节等价）。
+    let now_ms = mongodb::bson::DateTime::now().timestamp_millis();
+    let since_ms = now_ms - 24 * 3600 * 1000;
+    let today =
+        escalation::count_pushes_today(state, &contact.workspace_id, &principal_wxid, since_ms)
+            .await?;
+    if !escalation::push_allowed(&policy, today, None, now_ms) {
+        return Ok(()); // 骚扰门关：跳过推卡
     }
     let category = req
         .category

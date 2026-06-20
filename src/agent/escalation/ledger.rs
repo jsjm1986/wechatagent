@@ -11,23 +11,6 @@ use crate::models::{
 use crate::routes::AppState;
 use mongodb::bson::{doc, DateTime};
 
-/// 读取该 workspace+domain 的领导 wxid。未配置返回 None（= 请示通道未启用）。
-pub(crate) async fn principal_decider_wxid(
-    state: &AppState,
-    workspace_id: &str,
-    domain: &str,
-) -> AppResult<Option<String>> {
-    let cfg = state
-        .db
-        .operation_domain_configs()
-        .find_one(
-            doc! { "workspace_id": workspace_id, "domain": domain, "current_version": true },
-            None,
-        )
-        .await?;
-    Ok(cfg.and_then(|c| c.principal_decider))
-}
-
 /// 插入一条 pending 台账。短码碰撞（短码唯一索引报错）时换种子重试至多 5 次。
 ///
 /// 返回 `Ok(Some(entry))` = 成功插入；`Ok(None)` = 同客户同类别已有 pending
@@ -325,7 +308,6 @@ pub(crate) async fn reassign_escalation(
 
 /// 统计某决策人当日（since_ms 起）已被推送的请示卡数（骚扰门 daily_push_cap 用）。
 /// 以 pending 台账 created_at 作为推送时刻近似（每条 pending = 一次推卡）。
-#[allow(dead_code)] // Task 9 接线后移除（骚扰门消费）
 pub(crate) async fn count_pushes_today(
     state: &AppState,
     workspace_id: &str,

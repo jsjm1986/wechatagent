@@ -133,7 +133,7 @@ pub(crate) fn parse_high_risk_mode(raw: Option<&str>) -> HighRiskEscalationMode 
 /// 用于推请示卡前，杜绝把内部请示卡误发给客户。
 ///
 /// 当前所有请示卡发送路径（`trigger_principal_escalation` / `escalate_held_decision`）
-/// 的目标 wxid 都直接取自 `principal_decider_wxid()` 这一权威配置查询，故无需再调本守卫
+/// 的目标 wxid 都直接取自 `resolve_ask_human_policy(...).decider_chain` 这一权威策略解析，故无需再调本守卫
 /// （调了也是同源恒真）。保留本函数作为「目标 vs 配置」不同源场景的防御 API + 其不变量单测；
 /// `#[allow(dead_code)]` 标注当前无生产调用点。
 #[allow(dead_code)]
