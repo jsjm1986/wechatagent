@@ -15,7 +15,7 @@
 
 ### 1.1 能力底座核查（已实证）
 
-- **MCP 工具**：MCP server（GeWe，自有服务器）私聊侧提供 `message_send_namecard`（向联系人/群发送名片消息）。这是名片推送的发送原语。本仓 `src/mcp.rs` 是通用 JSON-RPC client（工具名是字符串参数），目前只封装使用了 `message_send_text` / `contacts_search` / `account_list`，**尚未使用 `message_send_namecard`**——这是本设计要新增的发送动作。
+- **MCP 工具**：MCP server（GeWe，自有服务器）私聊侧据用户口头确认提供 `message_send_namecard`（向联系人/群发送名片消息），作为名片推送的发送原语。**注意：本仓内目前无任何书面依据**（源码、MCP 工具清单文档、tools/list 缓存均未出现 `message_send_namecard`）——仅用户口头确认。本仓 `src/mcp.rs` 是通用 JSON-RPC client（工具名是字符串参数），目前只封装使用了 `message_send_text` / `contacts_search` / `account_list`。**实现前应先打 server `tools/list` 确认该工具存在性与入参 schema**（见 §12）。
 - **MCP 精确入参字段名**以 server 侧 `tools/list` 实际 schema 为准（用户负责 MCP 侧）；本设计用占位形态，集成时对齐。
 - **高价值识别底座**：decision 阶段已输出 `ConversionReadiness` / `NextBestActionScore` 等公式分，reaction 模块已分析购买信号/反对/停止。"谁是高价值客户"无需从零造——但本设计的触发**不直接读这些分数**，而是走"人类标注 + 提示词注入 + LLM 语义判断"（见 §5）。
 
@@ -98,15 +98,16 @@ pub struct ReferralCard {
 
 复用现有挂载点，不新建配置集合：
 
-- **账号级**：`OperationDomainConfig`（`src/models.rs:764`，已有 `principal_decider`/`high_risk_escalation_mode` 先例）新增：
+- **账号级**：`OperationDomainConfig`（`src/models.rs:807`，已有 `principal_decider`/`high_risk_escalation_mode` 先例；结构体无 `rename_all`，字段按 snake_case 原样落库）新增：
   ```rust
   #[serde(default, skip_serializing_if = "Option::is_none")]
   pub assist_mode_enabled: Option<bool>,   // None/false=纯全自治(默认)
   ```
-- **客户级覆盖**：`Contact.domain_attributes`（`src/models.rs:164`，已是 `Option<Document>`，dotted-key `$set` 不覆盖其它键），新增常量键：
+- **客户级覆盖**：`Contact.domain_attributes`（`src/models.rs:164`，已是 `Option<Document>`，dotted-key `$set` 不覆盖其它键；范例见 `escalation/mod.rs:124`），新增常量键：
   - `assist_mode_override`：`"force_on"|"force_off"`（单客户强制开/关）
   - `referred_specialist_at`：已引荐时间戳（§6.3「已引荐」态标记）
   - `referred_card_id`：已引荐推了哪张名片（防重推上下文 + 可观测）
+  - 写这些键时**必须同步 `$set` `domain_attributes_updated_at`**（现有所有 dotted-key 范例都这么做：`escalation/mod.rs:124`、`gateway.rs:2768`、`domain_signals.rs:140`）。常量名仿 `AWAITING_PRINCIPAL_DECISION_ATTR`（`src/models.rs:2890`）定义在 models.rs。
 
 **判定优先级**：客户级 override > 账号级 enabled > 默认关。抽成纯函数 `assist_mode_active(account_cfg, contact_attrs) -> bool` 便于单测。
 
@@ -131,6 +132,13 @@ pub struct NamecardDirective {
 
 AI 在主决策那一次同时输出 `reply_text`（含铺垫话术）+ `namecard_to_send`，不多跑 LLM 轮次。
 
+**⚠️ 必须接线 3 处，漏任一则 LLM 输出被静默丢弃**（实证自现有 `escalation_request` 接线方式）：
+1. `AgentDecision` 加 `namecard_to_send` 字段（`types.rs:224` 旁）；
+2. `RawAgentDecision` 加同名字段（`types.rs:380` 旁，camelCase `namecardToSend`）；
+3. `validate_and_promote` 的 **carry-through** 加透传分支（`types.rs:952` 模式：`if raw.namecard_to_send.is_some() { decision.namecard_to_send = raw.namecard_to_send; }`）——promote 主路径不自动透传 Option 字段，**这步最易漏**。
+
+reply 解析走 `generate_agent_json → RawAgentDecision → validate_and_promote → AgentDecision`，三处缺一不可。
+
 ### 4.4 outbox 条目扩展（对齐素材计划 Task 6）
 
 `OutboxEntry`（`src/models.rs:2370`）与 `EnqueueRequest`（`src/agent/outbox.rs:126`）：
@@ -141,8 +149,9 @@ AI 在主决策那一次同时输出 `reply_text`（含铺垫话术）+ `namecar
   pub referral_card_id: Option<String>,   // 非空=这条 outbox 发的是名片
   ```
   与素材的 `media_asset_id` 是**两个语义独立的可选字段**（名片发 wxid、素材发文件，二者互斥不同时有值）。dispatcher 分流按"哪个字段有值"判定（见 §6.1）。名片先建本字段；素材落地时新增 `media_asset_id`，两字段共存、各管一类，零冲突。**收敛说明**：若将来发送类型变多，再抽 `entry_kind: text|media|namecard` 枚举统一收口（本期两字段足够，不提前抽象——YAGNI）。
-- **空 content 放宽**：名片条目 content 可空（名片不带正文）。`enqueue` 校验改为"仅纯文本条目要求 content 非空"，抽纯函数 `content_required_for(referral_card_id) -> bool`（素材落地时扩参为 `(referral_card_id, media_asset_id)`）。
-- **幂等键含 card_id**：名片条目 idempotency_key 走 `synthetic:run_id:contact_wxid:referral_card_id` 形态（参照 `outbox.rs:186` synthetic 兜底），否则同 run content 都空会 hash 撞键误去重。
+- **空 content 放宽**：名片条目 content 可空（名片不带正文）。现有 `enqueue` 在 `outbox.rs:164-166` 硬校验 `content.trim().is_empty()` → 报错，**会拦死名片条目**。改为"仅纯文本条目要求 content 非空"，抽纯函数 `content_required_for(referral_card_id) -> bool`（素材落地时扩参为 `(referral_card_id, media_asset_id)`）。
+- **幂等键含 card_id**：名片条目空 content 会让多张不同名片 hash 撞键被误去重。幂等键的 synthetic 兜底**实际在 `compute_synthetic_key`（`outbox.rs:379`）**，逻辑比"字符串拼接"复杂——非 manual 走 `synthetic:{run_id}:{contact_wxid}:{content_hash}`，manual_send 另有特例，且最终 key 再过一次 `sha256_hex`（`outbox.rs:195`）。让幂等键含 `referral_card_id` 须**改 `compute_synthetic_key` 入参/逻辑**，不是 §改前描述的简单拼接。
+- **dispatcher 崩溃恢复适配**：`outbox_dispatcher.rs` 的 `mcp_already_succeeded` post-hoc 核对（reclaim 路径，:547 前）按 `message_send_text` 形态匹配已发记录。名片分支须同步适配该核对，否则崩溃重发会重复发名片。
 
 ## 5. AI 决策选材（提示词注入落地）
 
@@ -182,9 +191,11 @@ pub(crate) fn render_referral_lines(
 
 `AlreadyReferred` 上下文实现 D4 防重推（语义判断，非硬上限）。
 
+注：参照的 `load_context_assets`（`decision.rs:1025`）query **本身不含阶段过滤**（filter 仅 workspace+account+kind，sort updated_at，limit 12）；`filter_referral_candidates` 的按 `customer_stage` 过滤是**新增的 Rust 侧逻辑**，不是从该函数继承的 query 条件。customer_stage 在 prompt 组装处可读到（`decision.rs:640` 从 `contact.domain_attributes` 读 `customer_stage`）。
+
 ### 5.2 prompt 选材指引（agent-first 柔性，无禁词）
 
-`src/prompts.rs` Reply Agent operator/policy 层加（确保不含 no-human-takeover 禁词）：
+`src/prompts.rs` Reply Agent operator/policy 层加（确保不含 no-human-takeover 禁词）。该 prompt（key `user.reply.task`）是 `prompts.rs` 内**硬编码 `PromptSpec` 字面量**，escalation 指引文案在 `prompts.rs:1182-1200` 附近——名片指引仿其形态加入：
 
 ```
 【专属顾问引荐】仅当本账号启用辅助模式时，你可在候选「可引荐的专属顾问」中按需选择引荐给客户，输出到 namecardToSend（{cardId, reason}）。规则：
@@ -193,6 +204,8 @@ pub(crate) fn render_referral_lines(
 - 只能选候选清单里列出的 cardId，不要编造。
 - 已引荐过的客户：除非出现与上次不同的新需求场景，否则不重复引荐；客户再问就正常答疑，不再主动推进成交。
 ```
+
+**⚠️ prompt 改动需 bump 版本才生效**：`ensure_prompt_pack_v2`（`prompts.rs:85`）按 `PROMPT_PACK_VERSION`（`prompts.rs:15`）版本门控——已存在则只补缺失模板、**不覆盖既有**。改了 `user.reply.task` 字面量后，必须 bump `PROMPT_PACK_VERSION` 或走 `reset-system-pack` 路由重种，否则 DB 里旧 prompt 不更新、改动不生效。
 
 ## 6. 发送链路与闸门
 
@@ -212,6 +225,11 @@ pub(crate) fn render_referral_lines(
   → send_outbound_namecard 调 MCP message_send_namecard({recipient:客户wxid, 目标真人:target_wxid})
   → 成功后: 落 conversation_messages(msg_type=namecard, media_ref=card_id) + 置「已引荐」态
 ```
+
+接线注记（实证）：
+- `send_outbound_message`（`gateway.rs:1864`，签名 `(state, contact, content, extra_raw)`）**自身负责落 `conversation_messages`**（:1893-1911）+ 发送成功后回写 contact（:1950-1954）。新增的 `send_outbound_namecard` 应对称——名片落库 + 置「已引荐」态都在该函数内完成，dispatcher 层不另写 contact。
+- **`ConversationMessage` 当前无 `msg_type`/`media_ref` 字段**（现仅 direction/content/raw）。要落 namecard 标记须先给 `ConversationMessage` 加这两个 Option 字段（与素材计划同款，复用同一字段）。
+- dispatcher 分流点 `outbox_dispatcher.rs:556` 当前写死 `send_outbound_message(.., &entry.content, ..)`；改为按"哪个 Option 字段有值"的 match 分流（text/namecard）。
 
 ### 6.2 发送前闸门（治"该不该推"）
 
