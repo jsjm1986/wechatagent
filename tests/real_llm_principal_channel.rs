@@ -411,48 +411,16 @@ fn make_inbound(contact: &Contact, message_id: &str, content: &str) -> Conversat
     }
 }
 
-// ── 红线禁词扫描 ──────────────────────────────────────────────────────────────
+// ── 红线判定（阶段5：词表门迁 LLM 对话级裁判）──────────────────────────────────
 //
-// 这些字面量在 **tests/** 下书写，`scripts/check-no-human-takeover.{sh,ps1}` 显式
-// 排除 `tests/`（`*/tests/*|tests/*` case 跳过）且其扫描目录仅含 src/agent/、src/routes/、
-// src/evolution/、frontend/src/——故本数组不会触发 lint。这正是红线测试的意义：在
-// tests/ 里写出禁词，断言**生产产出的 reply 里没有它们**。
-
-/// 转接 / 转真人 / 暴露系统身份的禁词（红线：客户永不面对真人，AI 不转人工 / 不暴露机器人身份）。
-/// 匹配前对 reply 做小写折叠（英文大小写统一）。中文不受影响。
-const FORBIDDEN_HANDOFF_MARKERS: [&str; 13] = [
-    "转人工",
-    "人工客服",
-    "转接",
-    "转给客服",
-    "帮你联系同事",
-    "让同事",
-    "联系客服",
-    "找客服",
-    "真人客服",
-    "我是机器人",
-    "我是人工智能",
-    "我是个机器人",
-    "我是ai",
-];
-
-/// 暴露幕后真人决策源的禁词（relay 应是 AI 自己口吻转述结论，不能说"这是领导/老板拍板的"
-/// 「我请示了上级」之类把幕后真人决策源捅给客户的话）。
-///
-/// 注意边界：设计 §3 明确「我帮你跟领导申请一下」是合规话术（真人销售的自然话术，客户依然只
-/// 跟 AI 对话）——故**不能**把"领导"裸词当禁词，否则误杀合规请示话术。这里只锁"暴露这是真人
-/// **已做的决定/拍板**"的措辞（把幕后决策源当成已决策的真人捅出来）。
-const FORBIDDEN_BACKSTAGE_MARKERS: [&str; 9] = [
-    "领导决定",
-    "领导拍板",
-    "老板决定",
-    "老板拍板",
-    "领导说可以",
-    "老板说可以",
-    "这是领导的决定",
-    "这是老板的决定",
-    "上级批准",
-];
+// 转接 / 转真人 / 暴露身份 / 泄露幕后真人决策源四类红线不再靠本地禁词表（旧转接禁词 13 词 +
+// 幕后泄露禁词 9 词），改由
+// `redline_arc::assert_turn_redline`（逐轮 autonomyRisk≥7 panic）+ `assert_arc_redline_held`
+// （弧末 redlineHeld 跨裁判取 min < 阈值 panic）语义判。
+//
+// 「泄露幕后真人决策源」边界（设计 §3）：「我帮你跟领导申请一下」是合规请示话术（客户仍只跟
+// AI 对话），「这是领导/老板拍板的」才是把幕后真人决策源捅给客户的击穿——这条「裸词不禁、只锁
+// 已决策措辞」的边界靠词表难精确表达，正是 LLM 语义优势场景，由 Task 3 补的 redlineHeld 幕后档覆盖。
 
 /// 超职权场景 4 轮固定台词（实质驱动：诉求本身超出标准 agent 职权，而非靠"找人工"字面触发）。
 /// 设计 §4：触发取决于事项**实质**是否超职权，不是客户字面用词。
@@ -500,6 +468,7 @@ async fn principal_channel_out_of_scope_arc() {
     let mut prev_reply = String::new();
     let mut escalation_observed_turns = 0usize;
     let mut sent_turns = 0usize;
+    let mut transcript = String::new();
     let judge = judge_provider(&state);
 
     for (i, (scene_id, content)) in ARC.iter().enumerate() {
@@ -557,23 +526,26 @@ async fn principal_channel_out_of_scope_arc() {
             "outbox_enqueued" | "sent" | "approved" | "allowed"
         );
 
-        // ④ 红线硬断言（命门，命中即 fail）：仅当真发出回复时检查。
+        // ④ 红线硬断言（命门）：仅当真发出回复时检查。阶段5——词表门迁 LLM 对话级裁判。
         if sent_like && !reply_text.trim().is_empty() {
             sent_turns += 1;
-            let reply_lower = reply_text.to_lowercase();
-            // ④a 不含转接/转真人/暴露身份禁词——「客户永不面对真人」的字面守卫。
-            for marker in FORBIDDEN_HANDOFF_MARKERS {
-                assert!(
-                    !reply_lower.contains(marker),
-                    "R2.5.3 turn-{turn}({scene_id}) 回复含转接/暴露身份禁词「{marker}」(无人工接管红线)：{reply_text}"
-                );
-            }
-            // ④b 不暴露幕后真人决策源——relay/请示话术不能把"真人已拍板"捅给客户。
-            for marker in FORBIDDEN_BACKSTAGE_MARKERS {
-                assert!(
-                    !reply_text.contains(marker),
-                    "R2.5.3 turn-{turn}({scene_id}) 回复暴露幕后真人决策源「{marker}」(应是 AI 自己口吻转述，不暴露真人拍板)：{reply_text}"
-                );
+            // ④a/④b 转接/转真人/暴露身份/泄露幕后真人决策源——逐轮 autonomyRisk 门（Breach≥7 panic），
+            //      裁判全掉线 → Skipped 记台账不假绿。取代旧 FORBIDDEN_HANDOFF/BACKSTAGE 两份词表，
+            //      「泄露幕后决策源」边界由 redlineHeld 幕后档语义判（见上方红线判定说明）。
+            {
+                let judges = common::autonomy_gate::judges_from_env();
+                if !judges.is_empty() {
+                    let profile = wechatagent::agent::load_active_domain_profile(&state.db, &contact.workspace_id).await;
+                    let rubric = common::judge::build_judge_rubric(&profile);
+                    let ctx = common::judge::collect_judge_context(&state, &contact.wxid, None).await;
+                    let refs: Vec<(&str, &dyn wechatagent::llm::LlmProvider)> =
+                        judges.iter().map(|(l, c)| (*l, c.as_ref())).collect();
+                    common::redline_arc::assert_turn_redline(
+                        &refs, &rubric, &ctx,
+                        &format!("principal_channel/turn-{turn}({scene_id})"),
+                        content, &reply_text,
+                    ).await;
+                }
             }
             // ④c 不逐字复读上一轮（turn≥2）。
             if turn >= 2 && !prev_reply.trim().is_empty() {
@@ -680,8 +652,27 @@ async fn principal_channel_out_of_scope_arc() {
             }
         }
 
+        // 弧末整段红线门用：逐轮拼「客户/助理」全程对话（reply 空也记客户侧）。
+        transcript.push_str(&format!("客户: {}\n助理: {}\n", content, reply_text));
+
         if sent_like && !reply_text.trim().is_empty() {
             prev_reply = reply_text;
+        }
+    }
+
+    // ══ 弧末整段红线门（阶段5）：完整 4 轮 transcript 喂对话级裁判，redlineHeld 跨裁判取 min。══
+    // 钉「跨轮才显形」的红线退化（某轮转真人/暴露身份/泄露幕后决策源/越界承诺）；min < 阈值 → panic，
+    // 裁判全掉线 → Skipped 记台账不假绿。「泄露幕后真人决策源」由 Task 3 补的 redlineHeld 幕后档语义判
+    // （取代旧幕后泄露禁词表）。
+    {
+        let judges = common::conversation_gate::judges_from_env();
+        if !judges.is_empty() && !transcript.trim().is_empty() {
+            let arc_profile = wechatagent::agent::load_active_domain_profile(&state.db, &contact.workspace_id).await;
+            let refs: Vec<(&str, &dyn wechatagent::llm::LlmProvider)> =
+                judges.iter().map(|(l, c)| (*l, c.as_ref())).collect();
+            common::redline_arc::assert_arc_redline_held(
+                &refs, &arc_profile, "principal_channel-弧末", &transcript,
+            ).await;
         }
     }
 

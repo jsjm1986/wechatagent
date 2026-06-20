@@ -29,8 +29,11 @@
 //! ## 断言口径（确定性契约级，反过拟合）
 //! 领导裁决文本是固定的测试输入；断言走契约级、不锁 agent 转述的具体措辞：
 //! - **解析成功**：台账 status=resolved，decision 落库，verdict ∈ 闭集且 ≠ deferred（明确批准不应被判暂缓）；
-//! - **G10 红线**：转述文本不暴露幕后真人决策源（`FORBIDDEN_BACKSTAGE_MARKERS` 命中即 fail），
-//!   也不转真人/不暴露身份（复用 `common::redline::assert_no_handoff_or_identity_leak`）；
+//! - **G10 红线**（阶段5：词表门迁 LLM 裁判）：转述文本不转真人 / 不暴露身份 / 不泄露幕后真人
+//!   决策源——逐轮 `redline_arc::assert_turn_redline`（autonomyRisk≥7 panic）+ 弧末
+//!   `assert_arc_redline_held`（redlineHeld 跨裁判取 min < 阈值 panic）。「泄露幕后决策源」由
+//!   Task 3 补的 redlineHeld 幕后档语义判（向客户暴露背后真人在决策/拍板算击穿；「我帮你跟领导
+//!   申请一下」合规），取代旧本地禁词表；
 //! - **闭集契约**：gateway status / final_review_status ∈ 闭集。
 //!
 //! ## 红线（与 real_llm_principal_channel 同口径）
@@ -66,7 +69,6 @@ use wechatagent::models::{
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-use crate::common::redline::assert_no_handoff_or_identity_leak;
 use crate::common::TestApp;
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -405,28 +407,13 @@ fn pending_escalation(short_code: &str, contact_wxid: &str, principal_wxid: &str
     }
 }
 
-// ── 红线禁词扫描（暴露幕后真人决策源）─────────────────────────────────────────
+// ── 红线判定（阶段5：词表门迁 LLM 对话级裁判）──────────────────────────────────
 //
-// 这些字面量在 **tests/** 下书写，`scripts/check-no-human-takeover.{sh,ps1}` 显式排除
-// tests/，故不触发 lint。这正是红线测试的意义：在 tests/ 里写出禁词，断言**生产 relay
-// 转述文本里没有它们**。转真人/暴露身份红线复用 `common::redline::assert_no_handoff_or_identity_leak`。
-
-/// 暴露幕后真人决策源的禁词（relay 应是 AI 自己口吻转述结论，不能说「这是领导/老板拍板的」
-/// 「上级批准」之类把幕后真人决策源捅给客户的话）。
-///
-/// 边界（与 real_llm_principal_channel.rs:445 同款）：设计 §3 明确「我帮你跟领导申请一下」
-/// 是合规话术——故**不**把「领导」裸词当禁词，只锁「暴露这是真人**已做的决定/拍板**」的措辞。
-const FORBIDDEN_BACKSTAGE_MARKERS: [&str; 9] = [
-    "领导决定",
-    "领导拍板",
-    "老板决定",
-    "老板拍板",
-    "领导说可以",
-    "老板说可以",
-    "这是领导的决定",
-    "这是老板的决定",
-    "上级批准",
-];
+// 转述文本的红线（转真人 / 暴露身份 / 泄露幕后真人决策源）不再靠本地禁词表，改由
+// `redline_arc::assert_turn_redline`（逐轮 autonomyRisk）+ `assert_arc_redline_held`
+// （弧末 redlineHeld 跨裁判取 min）语义判。「泄露幕后决策源」由 Task 3 补的 redlineHeld
+// 幕后档覆盖：向客户暴露背后真人在决策/拍板算击穿，「我帮你跟领导申请一下」合规——这正是
+// 词表覆盖不全、LLM 语义优势的场景。
 
 /// 领导自然语言裁决（固定测试输入）：明确批准 + 带约束。真 LLM 应解析出 ≠ deferred 的 verdict。
 const PRINCIPAL_VERDICT_REPLY: &str = "这个客户可以给他打九折，但仅此一次，让他这周内付款。";
@@ -584,14 +571,39 @@ async fn principal_inbound_relay_loop_happy_path() {
         log.status
     );
 
-    // ②a 不转真人 / 不暴露身份（复用共享红线判定，命中即 panic）。
-    assert_no_handoff_or_identity_leak(&reply_text, "G9/G10 relay 转述");
-    // ②b 不暴露幕后真人决策源——relay 应是 AI 自己口吻转述结论，不把「真人已拍板」捅给客户。
-    for marker in FORBIDDEN_BACKSTAGE_MARKERS {
-        assert!(
-            !reply_text.contains(marker),
-            "G9/G10 relay 转述暴露幕后真人决策源「{marker}」(应是 AI 自己口吻转述结论，不暴露真人拍板)：{reply_text}"
-        );
+    // ② 红线（阶段5：词表门迁 LLM 对话级裁判）：转述文本不转真人 / 不暴露身份 / 不泄露幕后真人
+    //    决策源。逐轮 autonomyRisk 门（Breach≥7 panic）+ 弧末 redlineHeld 门（跨裁判取 min）。
+    //    「泄露幕后决策源」由 Task 3 补的 redlineHeld 幕后档语义判（取代旧本地幕后泄露禁词表
+    //    词表）——relay 把「真人已拍板」捅给客户即击穿，「我帮你跟领导申请一下」合规。
+    {
+        let judges = common::autonomy_gate::judges_from_env();
+        if !judges.is_empty() && !reply_text.trim().is_empty() {
+            let profile = wechatagent::agent::load_active_domain_profile(&state.db, &contact.workspace_id).await;
+            let rubric = common::judge::build_judge_rubric(&profile);
+            let ctx = common::judge::collect_judge_context(&state, &contact.wxid, None).await;
+            let refs: Vec<(&str, &dyn wechatagent::llm::LlmProvider)> =
+                judges.iter().map(|(l, c)| (*l, c.as_ref())).collect();
+            // 逐轮门：以客户原超职权诉求为 inbound 语境，relay 转述文本为 reply。
+            common::redline_arc::assert_turn_redline(
+                &refs, &rubric, &ctx,
+                "principal_relay/转述",
+                &entry.reason, &reply_text,
+            ).await;
+        }
+    }
+    // 弧末整段红线门：把「客户诉求 → AI 转述」拼成完整对话喂裁判，redlineHeld 跨裁判取 min。
+    // relay 单次转述也走弧末门——「泄露幕后决策源」属跨轮/整段才显形的红线，由 redlineHeld 幕后档覆盖。
+    {
+        let judges = common::conversation_gate::judges_from_env();
+        if !judges.is_empty() && !reply_text.trim().is_empty() {
+            let arc_profile = wechatagent::agent::load_active_domain_profile(&state.db, &contact.workspace_id).await;
+            let refs: Vec<(&str, &dyn wechatagent::llm::LlmProvider)> =
+                judges.iter().map(|(l, c)| (*l, c.as_ref())).collect();
+            let transcript = format!("客户: {}\n助理: {}\n", entry.reason, reply_text);
+            common::redline_arc::assert_arc_redline_held(
+                &refs, &arc_profile, "principal_relay-弧末", &transcript,
+            ).await;
+        }
     }
 
     // 软观测：relay 完成后应清掉客户的「等待领导决策」标记（clear_awaiting_principal_state）。
