@@ -51,6 +51,7 @@ mod observability;
 mod outcome_metrics;
 mod outcomes_autonomy;
 mod playbooks;
+mod principal_escalations;
 mod products;
 mod prompt_templates;
 mod reviews;
@@ -221,6 +222,9 @@ use prompt_templates::{
 };
 use products::{
     archive_product, create_product, list_products, restore_product, update_product,
+};
+use principal_escalations::{
+    list_principal_escalations, reassign_principal_escalation, resolve_principal_escalation,
 };
 use reviews::{get_decision_review, list_decision_reviews};
 use simulations::{run_user_operation_evaluation, simulate_user_operation_dialogue};
@@ -749,6 +753,17 @@ pub fn api_router(state: AppState) -> Router<AppState> {
         .route(
             "/admin/operation-domains/:id/rollback",
             post(rollback_operation_domain_version),
+        )
+        // ── Ask-Human Phase 1 / Task 7：决策请示通道 admin REST 端点 ──────────
+        // 列表 / admin 直接裁决（复用 relay 下游）/ 改派决策人。
+        .route("/admin/principal-escalations", get(list_principal_escalations))
+        .route(
+            "/admin/principal-escalations/:short_code/resolve",
+            post(resolve_principal_escalation),
+        )
+        .route(
+            "/admin/principal-escalations/:short_code/reassign",
+            post(reassign_principal_escalation),
         )
         .route(
             "/admin/operation-state-policies/:id/publish",
