@@ -137,6 +137,10 @@ pub struct EnqueueRequest {
     pub source_kind: String,
     /// 实际要发出的文本内容（已经过 review + finalize）。
     pub content: String,
+    /// 销售素材发送条目：非空表示这条 outbox 发的是 ContentAsset 文件而非文本。
+    /// 媒体条目允许空 content（文件可不带文字），幂等键由 asset_id 参与（见
+    /// [`compute_synthetic_key`]）。纯文本路径传 `None`。
+    pub media_asset_id: Option<String>,
     /// 默认 3，由 runtime 控制是否调高（R13.5）。
     pub max_attempts: i32,
 }
@@ -161,7 +165,7 @@ pub async fn enqueue(state: &AppState, req: EnqueueRequest) -> Result<EnqueueOut
     if req.contact_wxid.trim().is_empty() {
         return Err(OutboxError::Invalid("contact_wxid is empty".to_string()));
     }
-    if req.content.trim().is_empty() {
+    if content_required_for(&req.media_asset_id) && req.content.trim().is_empty() {
         return Err(OutboxError::Invalid("content is empty".to_string()));
     }
     if req.run_id.trim().is_empty() {
@@ -191,6 +195,7 @@ pub async fn enqueue(state: &AppState, req: EnqueueRequest) -> Result<EnqueueOut
             &req.run_id,
             &content_hash,
             day_bucket,
+            req.media_asset_id.as_deref(),
         );
         (sha256_hex(key.as_bytes()), true)
     } else {
@@ -241,6 +246,7 @@ pub async fn enqueue(state: &AppState, req: EnqueueRequest) -> Result<EnqueueOut
         content: req.content.clone(),
         content_hash: content_hash.clone(),
         idempotency_key: idempotency_key.clone(),
+        media_asset_id: req.media_asset_id.clone(),
         attempt: 0,
         max_attempts,
         status: OutboxStatus::Pending.as_str().to_string(),
@@ -383,7 +389,13 @@ pub(crate) fn compute_synthetic_key(
     run_id: &str,
     content_hash: &str,
     day_bucket: i64,
+    media_asset_id: Option<&str>,
 ) -> String {
+    // 媒体条目：content 可空 → content_hash 对所有素材相同（sha256("")），
+    // 必须靠 asset_id 区分同 run 的不同文件，否则两个文件会撞键被误去重。
+    if let Some(aid) = media_asset_id {
+        return format!("synthetic_media:{run_id}:{contact_wxid}:{aid}");
+    }
     if source_kind == SOURCE_KIND_MANUAL_SEND {
         format!(
             "synthetic_manual:{account_id}:{contact_wxid}:{content_hash}:{day_bucket}"
@@ -391,6 +403,12 @@ pub(crate) fn compute_synthetic_key(
     } else {
         format!("synthetic:{run_id}:{contact_wxid}:{content_hash}")
     }
+}
+
+/// Task 6：媒体条目（`media_asset_id` 有值）允许空 content（文件可不带文字）；
+/// 纯文本条目仍要求 content 非空。
+pub(crate) fn content_required_for(media_asset_id: &Option<String>) -> bool {
+    media_asset_id.is_none()
 }
 
 /// 重试 backoff 计算（R13.5）。
@@ -643,6 +661,7 @@ mod tests {
             "run_a",
             "abcd",
             12345,
+            None,
         );
         let key_b = compute_synthetic_key(
             SOURCE_KIND_MANUAL_SEND,
@@ -651,6 +670,7 @@ mod tests {
             "run_b",
             "abcd",
             12345,
+            None,
         );
         assert_eq!(
             key_a, key_b,
@@ -669,6 +689,7 @@ mod tests {
             "run_a",
             "abcd",
             12345,
+            None,
         );
         let day2 = compute_synthetic_key(
             SOURCE_KIND_MANUAL_SEND,
@@ -677,6 +698,7 @@ mod tests {
             "run_a",
             "abcd",
             12346,
+            None,
         );
         assert_ne!(day1, day2, "day_bucket 不同应得到不同 key");
     }
@@ -692,6 +714,7 @@ mod tests {
             "run_a",
             "abcd",
             12345,
+            None,
         );
         let key_run_b = compute_synthetic_key(
             "wechat_inbound",
@@ -700,12 +723,66 @@ mod tests {
             "run_b",
             "abcd",
             12345,
+            None,
         );
         assert_ne!(
             key_run_a, key_run_b,
             "非 manual_send 路径必须保留 run_id 维度，避免改动旧契约"
         );
         assert_eq!(key_run_a, "synthetic:run_a:wxid_alice:abcd");
+    }
+
+    /// Task 6：媒体条目（`media_asset_id` 有值）允许空 content；纯文本条目仍要求非空。
+    #[test]
+    fn media_entry_allows_empty_content() {
+        assert!(content_required_for(&None)); // 纯文本 → 需要 content
+        assert!(!content_required_for(&Some("aid".to_string()))); // 媒体 → 不需要
+    }
+
+    /// Task 6（幂等硬伤③）：媒体条目 content 为空 → `sha256("")` 对所有素材相同，
+    /// 若不把 asset_id 拌进 key，同一 run 发两个不同文件会撞键被误去重成一个。
+    /// 必须验证：同 run 不同 media_asset_id → key 不同；同 run 同 media_asset_id → key 相同。
+    #[test]
+    fn compute_synthetic_key_media_segregates_by_asset_id() {
+        let empty_hash = sha256_hex(b""); // 媒体条目 content 为空时的 content_hash
+        let key_asset_a = compute_synthetic_key(
+            "wechat_inbound",
+            "acct_1",
+            "wxid_alice",
+            "run_a",
+            &empty_hash,
+            12345,
+            Some("asset_a"),
+        );
+        let key_asset_b = compute_synthetic_key(
+            "wechat_inbound",
+            "acct_1",
+            "wxid_alice",
+            "run_a",
+            &empty_hash,
+            12345,
+            Some("asset_b"),
+        );
+        assert_ne!(
+            key_asset_a, key_asset_b,
+            "同 run 发两个不同 media_asset_id 必须产生不同 key，否则两个文件会被误去重"
+        );
+
+        // 同 run 同 asset_id → 同 key（幂等仍生效，防双发同一文件）。
+        let key_asset_a_again = compute_synthetic_key(
+            "wechat_inbound",
+            "acct_1",
+            "wxid_alice",
+            "run_a",
+            &empty_hash,
+            12345,
+            Some("asset_a"),
+        );
+        assert_eq!(
+            key_asset_a, key_asset_a_again,
+            "同 run 同 media_asset_id 必须共享 key，保证同一文件不重发"
+        );
+        assert_eq!(key_asset_a, "synthetic_media:run_a:wxid_alice:asset_a");
     }
 
     /// R13.10 item 5：相同 `source_event_id` + `contact_wxid` + `content` 在不同
