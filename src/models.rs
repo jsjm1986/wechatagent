@@ -760,6 +760,49 @@ pub struct OperationPlaybook {
     pub updated_at: DateTime,
 }
 
+/// 请示通道决策人引用：wxid + 可选展示名（前端选好友时填）。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct DeciderRef {
+    pub wxid: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+}
+
+/// 请示推送静默时段（领导休息时间不推卡）。tz_offset_hours 复用运营时区偏移。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct AskHumanQuietHours {
+    pub start_hour: u8,
+    pub end_hour: u8,
+    pub tz_offset_hours: i8,
+}
+
+/// 请示通道策略。None/缺省 = 沿用旧 principal_decider/high_risk_escalation_mode 行为（红线②字节等价）。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct AskHumanPolicy {
+    /// 有序决策人链：主 -> 备选1 -> 备选2…。空 = 未启用请示通道。
+    #[serde(default)]
+    pub decider_chain: Vec<DeciderRef>,
+    #[serde(default = "default_true")]
+    pub escalate_safety_guard: bool,
+    #[serde(default = "default_true")]
+    pub escalate_unverified_product: bool,
+    #[serde(default)]
+    pub escalate_ai_policy_hold: bool,
+    #[serde(default = "default_true")]
+    pub escalate_stuck: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dedupe_window_hours: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub daily_push_cap: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quiet_hours: Option<AskHumanQuietHours>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_hours: Option<f64>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OperationDomainConfig {
     #[serde(rename = "_id", skip_serializing_if = "Option::is_none")]
@@ -802,6 +845,9 @@ pub struct OperationDomainConfig {
     /// "decision_only"=只升级实质需决策/授权的件。None/缺省 = "decision_only"（保守）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub high_risk_escalation_mode: Option<String>,
+    /// 请示通道策略（决策人链/升级范围/骚扰频率/超时）。None = 回落旧 principal_decider/high_risk_escalation_mode。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ask_human_policy: Option<AskHumanPolicy>,
 }
 
 fn default_version_one() -> i32 {
@@ -4480,6 +4526,7 @@ mod typed_tests {
             seeded_by: None,
             principal_decider: None,
             high_risk_escalation_mode: None,
+            ask_human_policy: None,
         };
         let typed = cfg.runtime_parameters_typed();
         assert_eq!(typed.recent_message_limit, 16);
@@ -4574,6 +4621,7 @@ mod typed_tests {
             seeded_by: None,
             principal_decider: None,
             high_risk_escalation_mode: None,
+            ask_human_policy: None,
         };
         let typed = cfg.state_machine_typed();
         assert!(!typed.states.is_empty());

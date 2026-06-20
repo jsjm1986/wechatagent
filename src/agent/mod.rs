@@ -596,6 +596,7 @@ mod tests {
             seeded_by: None,
             principal_decider: None,
             high_risk_escalation_mode: None,
+            ask_human_policy: None,
         };
         let mut decision = AgentDecision {
             operation_state: Some("需求探索".to_string()),
@@ -808,6 +809,7 @@ mod tests {
             seeded_by: None,
             principal_decider: None,
             high_risk_escalation_mode: None,
+            ask_human_policy: None,
         }
     }
 
