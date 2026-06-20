@@ -2036,7 +2036,12 @@ pub struct BusinessFormula {
     /// 注入 prompt 自检段 + reviewer formulaBreakdown 模板。
     pub expression: String,
     /// 中文展示名（如「成交准备度」）。playbook 中文公式段用。
-    #[serde(default)]
+    /// `alias = "display_name"`：引导层 `normalize_json_keys` 把 LLM 输出的 camelCase
+    /// `displayName` 递归 snake 化成 `display_name`，而本结构是 `rename_all="camelCase"`
+    /// 默认只认 wire key `displayName` → 不加 alias 会反序列化匹配不上、静默落 default 空串
+    /// （G08 data-loss）。alias 是**叠加**的：老库 camelCase `displayName` 仍认，新增 snake
+    /// alias 额外接受 normalize 后的 key，向后兼容不破坏既有 wire 格式。
+    #[serde(default, alias = "display_name")]
     pub display_name: String,
     /// `/evaluations` 把该公式当 ground-truth 度量时，预测值缺失则回落到哪个
     /// reviewer score key（替代写死的 `score_key_for` 映射）。DEFAULT 四公式分别
