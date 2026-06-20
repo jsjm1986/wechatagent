@@ -1067,9 +1067,15 @@ async fn e2e_publish_risky_on_draft_lineage_no_pending() {
 // 版本（消费方零改动）；无本体（DEFAULT 销售域）则 operation_domain_configs 不变（字节等价
 // 回落 DEFAULT）。这两条 Part C 直调真 activate_domain_profile handler 覆盖。
 
-/// 在 `(workspace, user_operations)` 下手插一条 current 底座 config（模拟
-/// `ensure_operation_domains` 已 seed 的默认行；测试 crate 够不到 pub(super) 的
-/// `ensure_operation_domains`，故按 brief 选项 b 手动 insert_one）。
+/// 在 `(workspace, user_operations)` 下确保一条 current 底座 config 为测试期望的形态。
+///
+/// 注意：`TestApp::start()` 会调 `prompts::ensure_prompt_pack_v2`,后者**已经** seed 了一条
+/// `(default, user_operations, version:1, current_version:true, seeded_by:"system")` 底座
+/// config(完整 DEFAULT 销售状态机)。故本 helper 不能再 `insert_one`——会撞
+/// `op_domain_ws_domain_version_unique` 的 E11000 dup key(workspace_id,domain,version)。
+/// 改用 `replace_one(..., upsert)` 把 version:1 那行就地替换成测试想要的简化底座(单 initial
+/// 态 new_contact),既容忍预存的 system 行、又保持「(ws,domain) 下恰一条 v1 current」语义,
+/// 与原 `insert_one`(假设 DB 初始无此行)的测试意图等价。
 async fn db_seed_base_domain_config(db: &Database, workspace_id: &str) {
     let cfg = wechatagent::models::OperationDomainConfig {
         id: None,
@@ -1097,29 +1103,12 @@ async fn db_seed_base_domain_config(db: &Database, workspace_id: &str) {
         principal_decider: None,
         high_risk_escalation_mode: None,
     };
-    // DIAGNOSTIC(临时): E11000 根因排查——insert 前 dump 现有行,确认是否已有行预存及其
-    // 来源(seeded_by/version)与当前 DB 名(验证隔离)。CI 跑一次据证据定位真因再删本段+定修法。
-    let pre_existing: Vec<wechatagent::models::OperationDomainConfig> = db
-        .operation_domain_configs()
-        .find(doc! { "workspace_id": workspace_id, "domain": "user_operations" }, None)
-        .await
-        .expect("diag: query pre-existing configs")
-        .try_collect()
-        .await
-        .expect("diag: collect pre-existing configs");
-    eprintln!(
-        "DIAG db_seed_base_domain_config: ws={workspace_id} db={} insert 前已存在 {} 行 user_operations config",
-        db.raw().name(),
-        pre_existing.len()
-    );
-    for c in &pre_existing {
-        eprintln!(
-            "DIAG   - version={} current_version={} seeded_by={:?} name={}",
-            c.version, c.current_version, c.seeded_by, c.name
-        );
-    }
     db.operation_domain_configs()
-        .insert_one(&cfg, None)
+        .replace_one(
+            doc! { "workspace_id": workspace_id, "domain": "user_operations", "version": 1_i32 },
+            &cfg,
+            mongodb::options::ReplaceOptions::builder().upsert(true).build(),
+        )
         .await
         .expect("seed base operation_domain_config");
 }
