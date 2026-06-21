@@ -440,6 +440,36 @@ pub(super) async fn replace_content_asset_file(
     Ok(Json(json!({ "ok": true })))
 }
 
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct ToggleSendableRequest {
+    sendable: bool,
+}
+
+/// POST /content-assets/:id/toggle —— 启停（写 sendable）。
+/// 与 review_status 正交：停用不动审核态，重启不必重审。workspace 隔离。
+pub(super) async fn toggle_content_asset_sendable(
+    State(state): State<AppState>,
+    Extension(admin): Extension<AuthenticatedAdmin>,
+    Path(id): Path<String>,
+    Json(payload): Json<ToggleSendableRequest>,
+) -> AppResult<Json<Value>> {
+    let oid = ObjectId::parse_str(&id).map_err(|_| AppError::BadRequest("bad id".into()))?;
+    let res = state
+        .db
+        .content_assets()
+        .update_one(
+            doc! { "_id": oid, "workspace_id": &admin.current_workspace },
+            doc! { "$set": { "sendable": payload.sendable, "updated_at": DateTime::now() } },
+            None,
+        )
+        .await?;
+    if res.matched_count == 0 {
+        return Err(AppError::NotFound("asset not found".into()));
+    }
+    Ok(Json(json!({ "ok": true, "sendable": payload.sendable })))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
