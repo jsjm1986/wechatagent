@@ -32,7 +32,7 @@ on:
   workflow_dispatch:
     inputs:
       dispatch_target:
-        description: '手动单跑目标（ops=单个 real_llm_ops_smoke / roleplay_docker=roleplay P0 Docker 夹具 / roleplay_p2=情感陪伴全链 E2E 真模型 / reviewer_calibration=reviewer 高压识别校准 / roleplay_arc=R5.1 LLM 演客户动态博弈链）'
+        description: '手动单跑目标（ops=单个 real_llm_ops_smoke / roleplay_docker=roleplay P0 Docker 夹具 / roleplay_p2=情感陪伴全链 E2E 真模型 / reviewer_calibration=reviewer 高压识别校准 / roleplay_arc=R5.1 LLM 演客户动态博弈链；*_single=单跑对应真模型 job，绕开串行链，matrix 类配套 recall_test/quality_test/adv_arc/redline_file 指定分片）'
         required: true
         default: 'ops'
         type: choice
@@ -42,11 +42,69 @@ on:
           - roleplay_p2
           - reviewer_calibration
           - roleplay_arc
+          - smoke_single
+          - recall_single
+          - quality_single
+          - adversarial_single
+          - redline_single
+          - autonomy_redline_single
+          - conversation_judge_single
+          - roleplayer_calibration_single
       ops_test:
         description: '当 target=ops 时单独跑的 real_llm_ops_smoke 测试名（如 t15_real_multiturn_deal_arc）'
         required: false
         default: 't15_real_multiturn_deal_arc'
         type: string
+      recall_test:
+        description: '当 target=recall_single 时单跑的 recall benchmark 测试名'
+        required: false
+        default: 'recall_benchmark_smoke'
+        type: choice
+        options:
+          - recall_benchmark_smoke
+          - recall_benchmark_cross_industry
+          - recall_benchmark_maintenance_stability
+          - recall_benchmark_gap_closed_loop_trajectory
+      quality_test:
+        description: '当 target=quality_single 时单跑的 knowledge quality 测试名'
+        required: false
+        default: 'q1_retrieval_price_objection_quality'
+        type: choice
+        options:
+          - q1_retrieval_price_objection_quality
+          - q2_article_extraction_quality
+          - q3_vision_extraction_quality
+          - q4_chat_workstation_quality
+          - q5_completeness_audit_quality
+          - q6_repair_patch_quality
+          - q7_tag_extraction_quality
+          - q8_honest_abstention_quality
+      adv_arc:
+        description: '当 target=adversarial_single 时单跑的 adversarial 弧（t_judge_calibration 最慢 70-120min）'
+        required: false
+        default: 't_adv_human_takeover_bait'
+        type: choice
+        options:
+          - t_adv_human_takeover_bait
+          - t_judge_calibration
+          - t_adv_price_objection
+          - t_adv_contradiction_trap
+          - t_adv_fake_emotion_bait
+          - t_adv_knowledge_fabrication_bait
+          - t_adv_prompt_injection
+          - t_longrun_capability
+      redline_file:
+        description: '当 target=redline_single 时单跑的红线门测试文件（cross_domain_arc=G8 身份探针）'
+        required: false
+        default: 'real_llm_cross_domain_arc'
+        type: choice
+        options:
+          - real_llm_cross_domain_arc
+          - real_llm_principal_channel
+          - real_llm_proactive_outreach
+          - real_llm_dynamic_adversarial
+          - real_llm_digital_twin_arc
+          - real_llm_principal_relay
 
 env:
   CARGO_TERM_COLOR: always
