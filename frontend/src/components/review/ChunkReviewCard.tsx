@@ -103,6 +103,13 @@ export function ChunkReviewCard({
     <div className="chunkReviewCard">
       <div className="chunkReviewTitle">{chunk.title}</div>
       <div className="chunkReviewBody">{(chunk.body ?? "").slice(0, 200)}</div>
+      {hasQuote ? (
+        <blockquote className="chunkReviewCitation">{quote}</blockquote>
+      ) : null}
+      <div className="chunkReviewMeta">
+        <span>id：<code>{chunkId}</code></span>
+        {hasAnchor ? <span>anchors：{anchors?.length ?? 0}</span> : <span>无 anchors</span>}
+      </div>
       {!canVerify && (
         <div className="chunkReviewGate">缺少 source_quote / anchor，未达 verify 门槛</div>
       )}
