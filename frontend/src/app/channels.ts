@@ -17,6 +17,7 @@ import {
   PackageSearch,
   Contact,
   SlidersHorizontal,
+  BarChart3,
   type LucideIcon,
 } from "lucide-react";
 import type { Channel } from "../types";
@@ -36,6 +37,7 @@ const ProductsDealsFeature = lazy(() => import("../features/products-deals"));
 const ReferralCardsFeature = lazy(() => import("../features/referral-cards"));
 const AskHumanFeature = lazy(() => import("../features/ask-human"));
 const AskHumanConfigFeature = lazy(() => import("../features/ask-human-config"));
+const SendAnalyticsFeature = lazy(() => import("../features/send-analytics"));
 
 export interface ChannelDef {
   id: Channel;
@@ -239,5 +241,16 @@ export const CHANNELS: ChannelDef[] = [
     title: "运营成效",
     subtitle: "用户回复率、对话深度等长期指标，知识切片自动校验，公式遵守度评测，产品声明兜底标记词管理。",
     Component: QualityFeature,
+  },
+  {
+    id: "sendAnalytics",
+    group: "系统",
+    label: "发送成效",
+    caption: "Send Analytics",
+    icon: BarChart3,
+    eyebrow: "Send Analytics",
+    title: "发送成效",
+    subtitle: "查看 AI 主动发送的素材与专属顾问名片的使用次数、覆盖客户数、响应率与阶段推进率。",
+    Component: SendAnalyticsFeature,
   },
 ];

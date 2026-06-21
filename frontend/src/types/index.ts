@@ -9,6 +9,7 @@ export type Channel =
   | "momentOps"
   | "content"
   | "referralCards"
+  | "sendAnalytics"
   | "systemStrategy"
   | "operations"
   | "autonomy"
