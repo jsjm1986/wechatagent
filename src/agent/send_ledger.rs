@@ -250,6 +250,54 @@ async fn load_user_ops_stage_order(state: &AppState, workspace_id: &str) -> Vec<
         .unwrap_or_default()
 }
 
+/// 取该客户近期某类发送记录（按 sent_at 倒序）。best-effort：故障返空。
+pub(crate) async fn recent_sends_for_contact(
+    state: &AppState,
+    workspace_id: &str,
+    contact_wxid: &str,
+    send_kind: &str,
+    limit: i64,
+) -> Vec<AgentSendLedger> {
+    use futures::TryStreamExt;
+    use mongodb::options::FindOptions;
+    let res = state
+        .db
+        .agent_send_ledger()
+        .find(
+            doc! { "workspace_id": workspace_id, "contact_wxid": contact_wxid, "send_kind": send_kind },
+            FindOptions::builder().sort(doc! { "sent_at": -1 }).limit(limit).build(),
+        )
+        .await;
+    match res {
+        Ok(mut cursor) => {
+            let mut out = Vec::new();
+            while let Ok(Some(r)) = cursor.try_next().await {
+                out.push(r);
+            }
+            out
+        }
+        Err(_) => Vec::new(),
+    }
+}
+
+/// 渲染"已发素材历史"段。空返空串（prompt 不多余段）。供 Reply Agent 判重：
+/// 不重复给同一客户硬发同一素材（软约束，非硬门——agent-first）。
+pub(crate) fn render_recent_media_lines(rows: &[AgentSendLedger]) -> String {
+    if rows.is_empty() {
+        return String::new();
+    }
+    let mut out = String::from("【近期已发素材】你近期已给该客户发过以下素材，除非客户明确再次需要，否则不要重复发送同一素材：\n");
+    for r in rows {
+        let title = if r.target_title.is_empty() {
+            r.target_id.as_str()
+        } else {
+            r.target_title.as_str()
+        };
+        out.push_str(&format!("- {title}\n"));
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -331,6 +379,23 @@ mod tests {
     #[test]
     fn response_rate_basic() {
         assert_eq!(response_rate(4, 1), 0.25);
+    }
+
+    #[test]
+    fn render_recent_media_empty_when_no_rows() {
+        assert_eq!(render_recent_media_lines(&[]), "");
+    }
+
+    #[test]
+    fn render_recent_media_lists_titles() {
+        use mongodb::bson::DateTime;
+        let row = build_ledger_entry(
+            "ws", "acct", "wx", "media", "a1", "报价单 2026", "run1", None, DateTime::now(),
+        );
+        let out = render_recent_media_lines(&[row]);
+        assert!(out.contains("报价单 2026"));
+        // 含"已发"语义提示，供 Reply Agent 判重（不强发同素材）
+        assert!(out.contains("已"));
     }
 
     #[test]
