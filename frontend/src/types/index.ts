@@ -592,3 +592,27 @@ export type GenerateProfileResponse = {
   status: string;
   note: string;
 };
+
+// 请示通道策略（对齐后端 models.rs AskHumanPolicy，camelCase serde）。P3 配置页 + P2 收件箱共用。
+export type DeciderRef = {
+  wxid: string;
+  displayName?: string;
+};
+
+export type AskHumanQuietHours = {
+  startHour: number;   // 0-23
+  endHour: number;     // 0-23
+  tzOffsetHours: number;
+};
+
+export type AskHumanPolicy = {
+  deciderChain: DeciderRef[];
+  escalateSafetyGuard: boolean;
+  escalateUnverifiedProduct: boolean;
+  escalateAiPolicyHold: boolean;
+  escalateStuck: boolean;
+  dedupeWindowHours?: number;
+  dailyPushCap?: number;
+  quietHours?: AskHumanQuietHours;
+  timeoutHours?: number;
+};
