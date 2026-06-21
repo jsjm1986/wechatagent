@@ -1,4 +1,4 @@
-import { useEffect } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { ConfirmProvider } from "../../components/ui/ConfirmDialog";
 import { ToastProvider } from "../../components/ui/Toast";
 import { useInboxStore } from "../../stores/inboxStore";
@@ -11,6 +11,19 @@ import { ProfilePublishCard } from "../../components/review/ProfilePublishCard";
 import { ProposalReleaseCard } from "../../components/review/ProposalReleaseCard";
 import { LessonPromoteCard } from "../../components/review/LessonPromoteCard";
 import "./AskHuman.css";
+
+// summary 端点下发 camelCase key，inbox ?source= 过滤认 snake_case source id（两者由后端 ask_human_inbox.rs 定义）。
+// 单一事实来源：summaryKey ↔ source ↔ 中文标签。chip 用它渲染并把 activeSource 统一存 snake_case source。
+const SOURCE_META: { summaryKey: string; source: string; label: string }[] = [
+  { summaryKey: "principalEscalation", source: "principal_escalation", label: "请示裁决" },
+  { summaryKey: "knowledgeReview", source: "knowledge_review", label: "知识核验" },
+  { summaryKey: "taxonomyCandidate", source: "taxonomy_candidate", label: "标签候选" },
+  { summaryKey: "relationshipSuggestion", source: "relationship_suggestion", label: "关系建议" },
+  { summaryKey: "gapSignal", source: "gap_signal", label: "知识缺口" },
+  { summaryKey: "profileRisky", source: "profile_risky", label: "画像发布" },
+  { summaryKey: "evolutionProposal", source: "evolution_proposal", label: "进化发布" },
+  { summaryKey: "lessonsLearned", source: "lessons_learned", label: "经验晋升" },
+];
 
 // rich 分派：richComponent → 卡片。richParams 提供 id（key 已对齐 ask_human_inbox.rs 实证）。
 function renderRich(item: InboxItem, onDone: () => void) {
@@ -76,6 +89,15 @@ function renderInline(item: InboxItem, ctx: RowCtx) {
 function AskHumanView() {
   const { errors, summary, loading, fatalError, activeSource, setActiveSource, load } =
     useInboxStore();
+  const [refreshNonce, setRefreshNonce] = useState(0);
+
+  const refreshAll = useCallback(
+    (source?: string) => {
+      setRefreshNonce((n) => n + 1);
+      void load(source);
+    },
+    [load],
+  );
 
   useEffect(() => {
     void load();
@@ -85,7 +107,7 @@ function AskHumanView() {
     <div className="askHumanChannel">
       <header className="askHumanHeader">
         <h1>统一收件箱</h1>
-        <button type="button" onClick={() => void load()} disabled={loading}>
+        <button type="button" onClick={() => refreshAll()} disabled={loading}>
           刷新
         </button>
       </header>
@@ -101,33 +123,36 @@ function AskHumanView() {
 
       <div className="askHumanSummary">
         {summary &&
-          Object.entries(summary).map(([k, v]) => (
+          SOURCE_META.map(({ summaryKey, source, label }) => (
             <button
-              key={k}
+              key={source}
               type="button"
               className={
-                activeSource === k
+                activeSource === source
                   ? "askHumanSummaryChip askHumanSummaryChip--active"
                   : "askHumanSummaryChip"
               }
               onClick={() => {
-                const next = activeSource === k ? null : k;
+                const next = activeSource === source ? null : source;
                 setActiveSource(next);
-                void load(next ?? undefined);
+                refreshAll(next ?? undefined);
               }}
             >
-              {k}: {v}
+              {label}: {summary[summaryKey] ?? 0}
             </button>
           ))}
       </div>
 
       <ReviewQueue<InboxItem>
         key={activeSource ?? "all"}
+        refreshToken={refreshNonce}
         fetchItems={async () => (await fetchInbox(activeSource ?? undefined)).items}
         getId={(i) => `${i.source}:${i.id}`}
         renderItem={(item, ctx) =>
           item.actionKind === "rich" ? (
-            <div className="askHumanRichRow">{renderRich(item, () => void load())}</div>
+            <div className="askHumanRichRow">
+              {renderRich(item, () => refreshAll(activeSource ?? undefined))}
+            </div>
           ) : (
             <div className="askHumanInlineRow">{renderInline(item, ctx)}</div>
           )
