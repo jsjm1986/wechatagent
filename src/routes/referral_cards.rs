@@ -30,6 +30,8 @@ pub(super) struct ReferralCardRequest {
     send_trigger_hint: String,
     #[serde(default)]
     target_stages: Vec<String>,
+    #[serde(default)]
+    tags: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -74,6 +76,7 @@ pub(super) async fn create_referral_card(
         display_name: payload.display_name,
         send_trigger_hint: payload.send_trigger_hint,
         target_stages,
+        tags: payload.tags,
         // 红线：创建即草稿且禁用，必须管理员审核+启用后 AI 才可引荐。
         enabled: false,
         review_status: "draft".to_string(),
@@ -104,6 +107,7 @@ pub(super) async fn list_referral_cards(
             "displayName": card.display_name,
             "sendTriggerHint": card.send_trigger_hint,
             "targetStages": card.target_stages,
+            "tags": card.tags,
             "enabled": card.enabled,
             "reviewStatus": card.review_status,
             "reviewNote": card.review_note,
