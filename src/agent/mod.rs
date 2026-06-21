@@ -107,8 +107,8 @@ pub use outbox_dispatcher::run_outbox_dispatcher;
 // `tests/outbox_integration.rs` 集成测试驱动；不应在生产代码中绕过 `tick`
 // / `process_entry` 直接调用这些 helper。
 pub use outbox_dispatcher::{
-    atomic_claim_pending, cancel_entry, process_entry, reclaim_expired_leases,
-    schedule_retry_or_terminal, second_safety_gate,
+    atomic_claim_pending, cancel_entry, defer_account_offline, process_entry,
+    reclaim_expired_leases, schedule_retry_or_terminal, second_safety_gate,
 };
 // outbox 公共 API（enqueue + 取消通道 + 类型）的对外重导出，集成测试需要。
 pub use outbox::{
