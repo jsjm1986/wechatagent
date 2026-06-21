@@ -680,3 +680,47 @@ async fn get_single_chunk_by_id_scoped_to_workspace() {
     let body: serde_json::Value = resp.0;
     assert_eq!(body["item"]["title"], serde_json::json!("测试切片"));
 }
+
+#[tokio::test]
+#[ignore]
+async fn operation_domain_json_includes_ask_human_policy() {
+    let app = common::TestApp::start().await;
+    let ws = &app.state.config.default_workspace_id;
+    // 给 user_operations 当前版本写一条 ask_human_policy。
+    let policy = wechatagent::models::AskHumanPolicy {
+        decider_chain: vec![wechatagent::models::DeciderRef {
+            wxid: "wxid_boss".into(),
+            display_name: Some("老板".into()),
+        }],
+        escalate_safety_guard: true,
+        escalate_unverified_product: true,
+        escalate_ai_policy_hold: false,
+        escalate_stuck: true,
+        dedupe_window_hours: Some(6.0),
+        daily_push_cap: Some(3),
+        quiet_hours: None,
+        timeout_hours: Some(24.0),
+    };
+    let policy_bson = mongodb::bson::to_bson(&policy).unwrap();
+    app.state
+        .db
+        .operation_domain_configs()
+        .update_one(
+            mongodb::bson::doc! { "workspace_id": ws, "domain": "user_operations", "current_version": true },
+            mongodb::bson::doc! { "$set": { "ask_human_policy": policy_bson } },
+            None,
+        )
+        .await
+        .unwrap();
+    let resp = wechatagent::routes::domains::get_operation_domain(
+        axum::extract::State(app.state.clone()),
+        axum::Extension(test_admin(ws)),
+        axum::extract::Path("user_operations".to_string()),
+    )
+    .await
+    .unwrap();
+    let body: serde_json::Value = resp.0;
+    assert_eq!(body["item"]["askHumanPolicy"]["deciderChain"][0]["wxid"], serde_json::json!("wxid_boss"));
+    assert_eq!(body["item"]["askHumanPolicy"]["timeoutHours"], serde_json::json!(24.0));
+    assert_eq!(body["item"]["askHumanPolicy"]["dailyPushCap"], serde_json::json!(3));
+}
