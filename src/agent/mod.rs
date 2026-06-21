@@ -46,6 +46,7 @@ mod tool_loop;
 pub(crate) mod outbox;
 pub(crate) mod outbox_dispatcher;
 mod reaction;
+mod referral;
 mod review;
 pub(crate) mod runtime;
 pub mod run_envelope;
