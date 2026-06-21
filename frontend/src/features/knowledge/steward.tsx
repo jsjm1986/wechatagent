@@ -1351,8 +1351,9 @@ export function ReviewView({ initialDimFilter }: { initialDimFilter?: string | n
                       title="选中以批量 verify / archive"
                     />
                     {/* 单 chunk 处置（展示 + verify-gate + verify/reject）走中立化共享卡片。
-                        onDone=load：处置成功后刷新列表/分类。 */}
-                    <ChunkReviewCard chunkId={c.id} onDone={() => void load()} />
+                        chunk={c}：传入列表已 pre-fetch 的整行，卡片不再发 GET-by-id（消除 N+1）。
+                        onDone=load：处置成功后刷新列表/分类，重渲染本行拿到新数据。 */}
+                    <ChunkReviewCard chunkId={c.id} chunk={c} onDone={() => void load()} />
                     <div className="wikiSignalActions">
                       <button
                         type="button"

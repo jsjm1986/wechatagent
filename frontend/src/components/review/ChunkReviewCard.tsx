@@ -7,35 +7,52 @@
 // verify-gate 是内联布尔逻辑（hasQuote && hasAnchor），无需借 steward 的 label/类型；
 // 所以本任务无需提升任何原语到中立家。
 //
-// 字段命名实证：本卡片消费 Task 2 新增的 GET /api/operation-knowledge/chunks/:id，
-// 该路由下发的是 **原始序列化的 OperationKnowledgeChunk**（src/routes/knowledge/crud.rs
-// get_operation_knowledge_chunk → json!({ "item": item })），结构体无 rename_all，
-// 因此字段是 **snake_case**（source_quote / source_anchors / integrity_status）。
-// 这与 steward 列表（走 operation_knowledge_chunk_json 整形成 camelCase 的 sourceQuote/
-// sourceAnchors）**形状不同**——卡片读 GET 拿到的 raw {item}，故必须用 snake_case。
+// 字段命名实证：本卡片可消费两种来源，字段形状不同——
+//   ① 频道 deep-link：走 Task 2 新增的 GET /api/operation-knowledge/chunks/:id，
+//      下发 **原始序列化的 OperationKnowledgeChunk**（src/routes/knowledge/crud.rs
+//      get_operation_knowledge_chunk → json!({ "item": item })），结构体无 rename_all，
+//      因此字段是 **snake_case**（source_quote / source_anchors / integrity_status）。
+//   ② steward 列表（pre-fetched）：列表已走 GET /operation-knowledge/chunks（经
+//      operation_knowledge_chunk_json 整形成 **camelCase** 的 sourceQuote/sourceAnchors），
+//      steward 把已取到的整行 chunk 直接传进来，避免每行再发一次 GET-by-id（N+1）。
+// 故 verify-gate 必须对两种拼写都容忍：读到哪种用哪种，门槛逻辑不变。
+//
+// pre-fetched 模式（传入 chunk prop）：挂载不自取，处置后只回调 onDone（由父刷新列表，
+// 重渲染本行拿到新数据）；deep-link 模式（无 chunk prop）：挂载自取，处置后自刷新。
 //
 // verify-gate 与 steward 逐字一致，红线不放宽：
-//   hasQuote  = source_quote 非空且去空白后有内容
-//   hasAnchor = source_anchors 长度 > 0
+//   hasQuote  = (source_quote ?? sourceQuote) 非空且去空白后有内容
+//   hasAnchor = (source_anchors ?? sourceAnchors) 长度 > 0
 //   canVerify = hasQuote && hasAnchor（缺其一则 verify 按钮硬挡）
 // AI 永不自动 verify：verify/reject 都是显式管理员维护动作。
 
 import { useCallback, useEffect, useState } from "react";
 import { api } from "../../lib/api";
 
-// 字段子集，对齐 Task 2 GET /chunks/:id 下发的 raw OperationKnowledgeChunk（snake_case）。
-// 只取卡片渲染 + verify-gate 需要的字段。
+// 字段子集：同时容忍 GET /chunks/:id 的 raw（snake_case）与 steward 列表的整形（camelCase）。
+// 只取卡片渲染 + verify-gate 需要的字段，两种拼写都设为可选。
 interface ChunkItem {
   _id?: unknown;
-  title: string;
+  title?: string;
   body?: string | null;
   source_quote?: string | null;
+  sourceQuote?: string | null;
   source_anchors?: unknown[] | null;
+  sourceAnchors?: unknown[] | null;
   integrity_status?: string | null;
+  integrityStatus?: string | null;
 }
 
-export function ChunkReviewCard({ chunkId, onDone }: { chunkId: string; onDone?: () => void }) {
-  const [chunk, setChunk] = useState<ChunkItem | null>(null);
+export function ChunkReviewCard({
+  chunkId,
+  chunk: prefetched,
+  onDone,
+}: {
+  chunkId: string;
+  chunk?: ChunkItem;
+  onDone?: () => void;
+}) {
+  const [chunk, setChunk] = useState<ChunkItem | null>(prefetched ?? null);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
 
@@ -52,8 +69,10 @@ export function ChunkReviewCard({ chunkId, onDone }: { chunkId: string; onDone?:
   }, [chunkId]);
 
   useEffect(() => {
-    void load();
-  }, [load]);
+    // pre-fetched 模式：父已取到整行，不再发 GET-by-id（消除 steward 列表 N+1）。
+    // deep-link 模式：无 chunk prop，挂载时自取。
+    if (!prefetched) void load();
+  }, [load, prefetched]);
 
   async function act(verb: "verify" | "reject") {
     setBusy(true);
@@ -61,7 +80,8 @@ export function ChunkReviewCard({ chunkId, onDone }: { chunkId: string; onDone?:
     try {
       await api.post(`/api/operation-knowledge/chunks/${encodeURIComponent(chunkId)}/${verb}`, {});
       onDone?.();
-      await load();
+      // pre-fetched 模式靠父 onDone→load() 重渲染本行；仅 deep-link 模式自刷新。
+      if (!prefetched) await load();
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -72,9 +92,11 @@ export function ChunkReviewCard({ chunkId, onDone }: { chunkId: string; onDone?:
   if (error) return <div className="chunkReviewError">加载失败：{error}</div>;
   if (!chunk) return <div className="chunkReviewLoading">加载中…</div>;
 
-  // verify-gate：与 steward ReviewView 逐字一致，不放宽红线。
-  const hasQuote = !!chunk.source_quote && chunk.source_quote.trim().length > 0;
-  const hasAnchor = (chunk.source_anchors?.length ?? 0) > 0;
+  // verify-gate：与 steward ReviewView 逐字一致，不放宽红线。两种字段拼写都容忍，门槛逻辑不变。
+  const quote = chunk.source_quote ?? chunk.sourceQuote;
+  const anchors = chunk.source_anchors ?? chunk.sourceAnchors;
+  const hasQuote = !!quote && quote.trim().length > 0;
+  const hasAnchor = (anchors?.length ?? 0) > 0;
   const canVerify = hasQuote && hasAnchor;
 
   return (
