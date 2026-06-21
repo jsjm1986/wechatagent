@@ -316,8 +316,8 @@ pub async fn wechat_webhook(
     //
     // 三类 short-circuit：
     // (a) `testMsg` 探活：GeWe 控制台「测试回调」按钮使用，直接 ack。
-    // (b) `TypeName=Offline`：账号离线事件，本期版本不在 webhook 入口处理（账号在线
-    //     状态走 SSE `account_status`），直接 ack。
+    // (b) `TypeName=Offline/Online`：账号在线状态事件，落库 `online` 建状态源后 ack
+    //     （供 outbox dispatcher 发送前 gate，掉线 defer 不盲发）。
     // (c) MCP envelope `_mcp.event` 非 wechat.message.created 的事件（如未来扩展），
     //     谨慎放行：除显式消息事件外一律 ack ignored。
     if let Some(test_msg) = find_string(&payload, &["testMsg", "TestMsg"]) {
@@ -327,12 +327,35 @@ pub async fn wechat_webhook(
             "echo": test_msg
         })));
     }
+    // (b) `TypeName=Offline`：账号离线事件。落库 `online=false` 建状态源（供 outbox
+    //     dispatcher 发送前 gate 判断，掉线时 defer 不盲发），然后直接 ack。此前直接
+    //     丢弃 → online 字段长期陈旧、掉线期间盲发。上线事件（Online）对称落 true。
     if let Some(type_name) = find_string(&payload, &["TypeName", "typeName"]) {
         let lower = type_name.to_ascii_lowercase();
-        if lower == "offline" {
+        if lower == "offline" || lower == "online" {
+            let online = lower == "online";
+            let app_id = find_string(
+                &payload,
+                &["appId", "app_id", "appid", "Appid", "AppId", "APPID"],
+            );
+            if let Some(app_id) = app_id.as_deref() {
+                // fail-soft：状态落库失败不应让 MCP 侧收不到 ack（会触发重推）。
+                let res = state
+                    .db
+                    .accounts()
+                    .update_one(
+                        doc! { "app_id": app_id },
+                        doc! { "$set": { "online": online, "last_sync_at": DateTime::now() } },
+                        None,
+                    )
+                    .await;
+                if let Err(err) = res {
+                    tracing::warn!(?err, app_id, online, "persist account online state failed");
+                }
+            }
             return Ok(Json(serde_json::json!({
                 "ok": true,
-                "ignored": "offline_event",
+                "ignored": if online { "online_event" } else { "offline_event" },
                 "type": type_name
             })));
         }
