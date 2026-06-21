@@ -33,6 +33,10 @@ interface ContentActions {
     note?: string,
     accountId?: string
   ) => Promise<void>;
+  editAssetMeta: (id: string, fields: Record<string, unknown>, accountId?: string) => Promise<void>;
+  replaceAssetFile: (id: string, form: FormData, accountId?: string) => Promise<boolean>;
+  toggleAssetSendable: (id: string, sendable: boolean, accountId?: string) => Promise<void>;
+  deleteAsset: (id: string, accountId?: string) => Promise<void>;
 }
 
 export const useContentStore = create<ContentState & ContentActions>((set, get) => ({
@@ -122,6 +126,60 @@ export const useContentStore = create<ContentState & ContentActions>((set, get) 
     useUiStore.getState().setError("");
     try {
       await api.post(`/api/content-assets/${id}/review`, { status, note });
+      await get().loadAssets(accountId);
+    } catch (error) {
+      useUiStore.getState().setError(error instanceof Error ? error.message : String(error));
+    } finally {
+      useUiStore.getState().setBusy(false);
+    }
+  },
+
+  editAssetMeta: async (id, fields, accountId) => {
+    useUiStore.getState().setBusy(true);
+    useUiStore.getState().setError("");
+    try {
+      await api.put(`/api/content-assets/${id}`, fields);
+      await get().loadAssets(accountId);
+    } catch (error) {
+      useUiStore.getState().setError(error instanceof Error ? error.message : String(error));
+    } finally {
+      useUiStore.getState().setBusy(false);
+    }
+  },
+
+  replaceAssetFile: async (id, form, accountId) => {
+    useUiStore.getState().setBusy(true);
+    useUiStore.getState().setError("");
+    try {
+      await api.postForm(`/api/content-assets/${id}/file`, form);
+      await get().loadAssets(accountId);
+      return true;
+    } catch (error) {
+      useUiStore.getState().setError(error instanceof Error ? error.message : String(error));
+      return false;
+    } finally {
+      useUiStore.getState().setBusy(false);
+    }
+  },
+
+  toggleAssetSendable: async (id, sendable, accountId) => {
+    useUiStore.getState().setBusy(true);
+    useUiStore.getState().setError("");
+    try {
+      await api.post(`/api/content-assets/${id}/toggle`, { sendable });
+      await get().loadAssets(accountId);
+    } catch (error) {
+      useUiStore.getState().setError(error instanceof Error ? error.message : String(error));
+    } finally {
+      useUiStore.getState().setBusy(false);
+    }
+  },
+
+  deleteAsset: async (id, accountId) => {
+    useUiStore.getState().setBusy(true);
+    useUiStore.getState().setError("");
+    try {
+      await api.delete(`/api/content-assets/${id}`);
       await get().loadAssets(accountId);
     } catch (error) {
       useUiStore.getState().setError(error instanceof Error ? error.message : String(error));

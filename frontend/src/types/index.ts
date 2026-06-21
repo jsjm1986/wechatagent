@@ -181,6 +181,7 @@ export type ContentAsset = {
   requiresPrincipalApproval?: boolean;
   reviewStatus?: "draft" | "approved";
   reviewNote?: string;
+  sendable?: boolean;
 };
 
 export type AgentSoul = {
