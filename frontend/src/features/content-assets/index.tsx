@@ -38,7 +38,11 @@ export default function ContentAssetsFeature() {
     loadAssets,
     createAsset,
     uploadMediaAsset,
-    reviewMediaAsset
+    reviewMediaAsset,
+    editAssetMeta,
+    replaceAssetFile,
+    toggleAssetSendable,
+    deleteAsset
   } = useContentStore();
 
   // 素材上传表单本地态
@@ -131,6 +135,16 @@ export default function ContentAssetsFeature() {
                         busy={busy}
                         onApprove={() =>
                           void reviewMediaAsset(asset.id, "approved", undefined, currentAccountId)
+                        }
+                        onToggleSendable={(sendable) =>
+                          void toggleAssetSendable(asset.id, sendable, currentAccountId)
+                        }
+                        onDelete={() => void deleteAsset(asset.id, currentAccountId)}
+                        onEditMeta={(fields) =>
+                          void editAssetMeta(asset.id, fields, currentAccountId)
+                        }
+                        onReplaceFile={(form) =>
+                          void replaceAssetFile(asset.id, form, currentAccountId)
                         }
                       />
                     ))}
@@ -307,14 +321,71 @@ export default function ContentAssetsFeature() {
 function MediaAssetRow({
   asset,
   busy,
-  onApprove
+  onApprove,
+  onToggleSendable,
+  onDelete,
+  onEditMeta,
+  onReplaceFile
 }: {
   asset: ContentAsset;
   busy: boolean;
   onApprove: () => void;
+  onToggleSendable: (sendable: boolean) => void;
+  onDelete: () => void;
+  onEditMeta: (fields: Record<string, unknown>) => void;
+  onReplaceFile: (form: FormData) => void;
 }) {
   const isApproved = asset.reviewStatus === "approved";
+  // 旧数据 / 缺省 sendable 视为可发送（true）
+  const isSendable = asset.sendable !== false;
   const Icon = asset.mediaType === "image" ? ImageIcon : asset.mediaType === "video" ? Film : FileText;
+
+  const [editing, setEditing] = useState(false);
+  const [editTitle, setEditTitle] = useState(asset.title);
+  const [editHint, setEditHint] = useState(asset.sendTriggerHint ?? "");
+  const [editStages, setEditStages] = useState((asset.targetStages ?? []).join(","));
+  const [editFile, setEditFile] = useState<File | null>(null);
+  const [editMediaType, setEditMediaType] = useState<"image" | "file" | "video">(
+    asset.mediaType ?? "file"
+  );
+
+  const openEdit = () => {
+    setEditTitle(asset.title);
+    setEditHint(asset.sendTriggerHint ?? "");
+    setEditStages((asset.targetStages ?? []).join(","));
+    setEditMediaType(asset.mediaType ?? "file");
+    setEditFile(null);
+    setEditing(true);
+  };
+
+  const handleSaveMeta = () => {
+    const targetStages = editStages
+      .split(",")
+      .map((s) => s.trim())
+      .filter(Boolean);
+    onEditMeta({
+      title: editTitle.trim(),
+      sendTriggerHint: editHint,
+      targetStages
+    });
+    setEditing(false);
+  };
+
+  const handleReplace = () => {
+    if (!editFile) return;
+    const fd = new FormData();
+    fd.append("file", editFile);
+    fd.append("mediaType", editMediaType);
+    onReplaceFile(fd);
+    setEditFile(null);
+  };
+
+  const handleDelete = () => {
+    if (window.confirm("确认删除该素材？此操作不可撤销。")) {
+      onDelete();
+    }
+  };
+
   return (
     <div className={styles.row}>
       <div className={styles.mediaRow}>
@@ -334,10 +405,109 @@ function MediaAssetRow({
           {asset.sendTriggerHint && (
             <p className={styles.metaLine}>时机：{asset.sendTriggerHint}</p>
           )}
-          {!isApproved && (
-            <button className={styles.reviewBtn} type="button" disabled={busy} onClick={onApprove}>
-              标记为可发送
+          <div style={{ display: "flex", flexWrap: "wrap", gap: 8, marginTop: 8 }}>
+            {!isApproved && (
+              <button className={styles.reviewBtn} type="button" disabled={busy} onClick={onApprove} style={{ marginTop: 0 }}>
+                标记为可发送
+              </button>
+            )}
+            <button
+              className={styles.reviewBtn}
+              type="button"
+              disabled={busy}
+              onClick={() => onToggleSendable(!isSendable)}
+              style={{ marginTop: 0 }}
+            >
+              {isSendable ? "停用" : "启用"}
             </button>
+            <button
+              className={styles.reviewBtn}
+              type="button"
+              disabled={busy}
+              onClick={() => (editing ? setEditing(false) : openEdit())}
+              style={{ marginTop: 0 }}
+            >
+              编辑
+            </button>
+            <button
+              className={styles.reviewBtn}
+              type="button"
+              disabled={busy}
+              onClick={handleDelete}
+              style={{ marginTop: 0 }}
+            >
+              删除
+            </button>
+          </div>
+
+          {editing && (
+            <div className={styles.form} style={{ marginTop: 12 }}>
+              <label className={styles.field}>
+                <span className={styles.fieldLabel}>标题</span>
+                <input
+                  className={styles.input}
+                  value={editTitle}
+                  onChange={(event) => setEditTitle(event.target.value)}
+                />
+              </label>
+              <label className={styles.field}>
+                <span className={styles.fieldLabel}>发送时机提示</span>
+                <textarea
+                  className={styles.textarea}
+                  value={editHint}
+                  onChange={(event) => setEditHint(event.target.value)}
+                />
+              </label>
+              <label className={styles.field}>
+                <span className={styles.fieldLabel}>目标阶段（逗号分隔）</span>
+                <input
+                  className={styles.input}
+                  placeholder="例如：意向,未成交"
+                  value={editStages}
+                  onChange={(event) => setEditStages(event.target.value)}
+                />
+              </label>
+              <button
+                className={styles.reviewBtn}
+                type="button"
+                disabled={busy || !editTitle.trim()}
+                onClick={handleSaveMeta}
+                style={{ marginTop: 0 }}
+              >
+                保存
+              </button>
+
+              <label className={styles.field}>
+                <span className={styles.fieldLabel}>换文件</span>
+                <input
+                  className={styles.fileInput}
+                  type="file"
+                  accept={ACCEPT}
+                  onChange={(event) => setEditFile(event.target.files?.[0] ?? null)}
+                />
+              </label>
+              <label className={styles.field}>
+                <span className={styles.fieldLabel}>素材类型</span>
+                <select
+                  className={styles.select}
+                  value={editMediaType}
+                  onChange={(event) => setEditMediaType(event.target.value as typeof editMediaType)}
+                >
+                  <option value="image">图片</option>
+                  <option value="file">文件</option>
+                  <option value="video">视频</option>
+                </select>
+              </label>
+              <button
+                className={styles.reviewBtn}
+                type="button"
+                disabled={busy || !editFile}
+                onClick={handleReplace}
+                style={{ marginTop: 0 }}
+              >
+                换文件
+              </button>
+            </div>
           )}
         </div>
       </div>
