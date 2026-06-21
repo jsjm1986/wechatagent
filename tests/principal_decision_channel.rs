@@ -19,7 +19,7 @@ mod common;
 
 use mongodb::bson::{doc, oid::ObjectId, DateTime, Document};
 use wechatagent::models::{
-    AgentPrincipalEscalation, AgentStatus, AskHumanPolicy, AskHumanQuietHours, Contact,
+    AgentPrincipalEscalation, AgentStatus, AgentTask, AskHumanPolicy, AskHumanQuietHours, Contact,
     ConversationMessage, DeciderRef, OperationKnowledgeChunk, PrincipalDecision,
     AWAITING_PRINCIPAL_DECISION_ATTR, ESCALATION_CATEGORY_OUT_OF_SCOPE,
     PRINCIPAL_ESCALATION_STATUS_PENDING, PRINCIPAL_ESCALATION_STATUS_RESOLVED,
@@ -691,6 +691,140 @@ async fn t_timeout_reassign_push_failure_retries_same_next_on_next_tick() {
     assert!(
         after_ok.updated_at.timestamp_millis() > two_hours_ago.timestamp_millis(),
         "重推成功 + 改派 → updated_at 应刷新"
+    );
+}
+
+// ───────────────────── §14.11（②授权过期闭环，#[ignore]，CI 跑） ─────────────────────
+
+/// 插一条 resolved 台账：decision 带 substance，但 authorization_expires_at 已过期（now-1h）。
+/// 镜像 enqueue_relay_task 触发前的台账形状（领导已裁决但授权时效已过）。增量叠加，不改旧 helper。
+async fn insert_resolved_expired_escalation(
+    app: &common::TestApp,
+    short_code: &str,
+    contact_wxid: &str,
+) {
+    let mut entry = minimal_pending_escalation(short_code, contact_wxid);
+    entry.status = PRINCIPAL_ESCALATION_STATUS_RESOLVED.to_string();
+    let now = DateTime::now();
+    let one_hour_ago = DateTime::from_millis(now.timestamp_millis() - 3600 * 1000);
+    entry.decision = Some(PrincipalDecision {
+        verdict: PRINCIPAL_VERDICT_CONDITIONAL.to_string(),
+        substance: "可以给 8 折".to_string(),
+        constraints: vec!["本周内付款".to_string()],
+        authorization_window_hours: Some(1.0),
+    });
+    entry.authorization_expires_at = Some(one_hour_ago);
+    entry.resolved_at = Some(one_hour_ago);
+    entry.updated_at = one_hour_ago;
+    app.state
+        .db
+        .agent_principal_escalations()
+        .insert_one(&entry, None)
+        .await
+        .expect("insert resolved+expired escalation");
+}
+
+/// 按 wxid 读回 contact（断言 awaiting 标记态）。增量 helper。
+async fn find_contact(app: &common::TestApp, wxid: &str) -> Contact {
+    app.state
+        .db
+        .contacts()
+        .find_one(doc! { "wxid": wxid, "workspace_id": "default", "account_id": "default" }, None)
+        .await
+        .expect("query contact")
+        .expect("contact must exist")
+}
+
+/// 构造一条立即可执行的 principal_decision_relay task（content=short_code），镜像 enqueue_relay_task。
+fn relay_task_for(short_code: &str, contact_wxid: &str) -> AgentTask {
+    let now = DateTime::now();
+    AgentTask {
+        id: None,
+        workspace_id: "default".to_string(),
+        account_id: "default".to_string(),
+        contact_wxid: contact_wxid.to_string(),
+        kind: "principal_decision_relay".to_string(),
+        run_at: now,
+        expires_at: None,
+        content: short_code.to_string(),
+        status: "pending".to_string(),
+        source_decision_id: None,
+        review_required: false,
+        attempt_count: 0,
+        max_attempts: 3,
+        next_retry_at: None,
+        gateway_status: None,
+        cancel_reason: None,
+        error: None,
+        claimed_at: None,
+        claim_recovery_count: 0,
+        created_at: now,
+        updated_at: now,
+    }
+}
+
+/// §14.11（②授权过期闭环）：relay task 跑时领导授权已过期 → 不发过期承诺，但必须
+/// ①清客户 awaiting 标记 ②发一条不含 substance 的中性收尾话术。否则客户零反馈 +
+/// awaiting 永挂、永久压制对该议题的自主回复。
+#[tokio::test]
+#[ignore]
+async fn t_relay_expired_authorization_clears_awaiting_and_sends_neutral() {
+    let app = common::TestApp::start().await;
+    let mcp = start_mcp_mock_success().await;
+    let state = common::rebuild_app_state_with_mcp_url(&app, mcp.uri());
+
+    let wxid = "cust_expired";
+
+    // 客户带 awaiting 标记（镜像请示触发时 apply_agent_updates 写入的可观测标记）。
+    let mut contact = minimal_contact(wxid);
+    let mut attrs = Document::new();
+    attrs.insert(AWAITING_PRINCIPAL_DECISION_ATTR, true);
+    contact.domain_attributes = Some(attrs);
+    app.state
+        .db
+        .contacts()
+        .insert_one(&contact, None)
+        .await
+        .expect("insert contact with awaiting marker");
+
+    // resolved + decision.substance + 授权已过期（now-1h）。
+    insert_resolved_expired_escalation(&app, "X11A", wxid).await;
+
+    // 触发 relay task 处理（经公共入口 handle_follow_up_task → handle_principal_decision_relay）。
+    wechatagent::agent::handle_follow_up_task(&state, relay_task_for("X11A", wxid))
+        .await
+        .expect("handle relay task (expired authorization)");
+
+    // 断言①：客户 awaiting 标记已清（授权过期早退也必须清，否则永久压制自主回复）。
+    let after = find_contact(&app, wxid).await;
+    let awaiting = after
+        .domain_attributes
+        .as_ref()
+        .and_then(|d| d.get_bool(AWAITING_PRINCIPAL_DECISION_ATTR).ok())
+        .unwrap_or(false);
+    assert!(!awaiting, "授权过期早退也必须清 awaiting 标记");
+
+    // 断言②：客户收到一条中性收尾话术（MCP 桩收到 message_send_text），且不复述过期 substance。
+    let recv = mcp
+        .received_requests()
+        .await
+        .expect("MCP 桩应可读取 received_requests");
+    let bodies: Vec<String> = recv
+        .iter()
+        .map(|r| String::from_utf8_lossy(&r.body).to_string())
+        .collect();
+    assert!(
+        !bodies.is_empty(),
+        "授权过期早退必须给客户发一条中性收尾，不能零反馈（客户被晾死）"
+    );
+    let all = bodies.join("\n");
+    assert!(
+        all.contains("继续") || all.contains("核实") || all.contains("同步"),
+        "应发中性收尾话术（会继续跟进），实际：{all}"
+    );
+    assert!(
+        !all.contains("8 折") && !all.contains("8折"),
+        "中性收尾绝不复述过期 substance 的具体承诺/数字，实际：{all}"
     );
 }
 

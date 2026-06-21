@@ -616,7 +616,11 @@ pub(crate) async fn relay_principal_decision_to_customer(
 }
 
 /// 清掉客户 state 上的"等待领导决策"标记（key 用 AWAITING_PRINCIPAL_DECISION_ATTR 常量）。
-async fn clear_awaiting_principal_state(state: &AppState, contact: &Contact) -> AppResult<()> {
+/// `pub(crate)`：escalation 模块授权过期早退分支也需清此标记，避免 awaiting 永久残留。
+pub(crate) async fn clear_awaiting_principal_state(
+    state: &AppState,
+    contact: &Contact,
+) -> AppResult<()> {
     let unset_key = format!(
         "domain_attributes.{}",
         crate::models::AWAITING_PRINCIPAL_DECISION_ATTR

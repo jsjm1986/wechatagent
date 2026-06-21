@@ -180,7 +180,35 @@ pub(crate) async fn handle_principal_decision_relay(
 
     let now = mongodb::bson::DateTime::now();
     if relay_substance_if_usable(&decision, entry.authorization_expires_at, now).is_none() {
-        // 授权过期：不拿过期授权乱承诺，结束。
+        // 授权过期：不拿过期授权乱承诺，但议题已被领导处理过——必须清 awaiting 标记
+        // （否则下一轮 build_decision_signals_text 仍读到"等待裁决"，永久压制对该议题的自主回复）
+        // + 发一条不含 substance 的中性收尾话术（否则客户零反馈、被晾死）。
+        // 下一轮客户来消息正常对话接管。fail-soft：发话术失败不 return Err（清标记已成功）。
+        let contact = state
+            .db
+            .contacts()
+            .find_one(
+                doc! {
+                    "workspace_id": &entry.workspace_id,
+                    "account_id": &entry.account_id,
+                    "wxid": &entry.contact_wxid
+                },
+                None,
+            )
+            .await?;
+        if let Some(contact) = contact {
+            crate::agent::gateway::clear_awaiting_principal_state(state, &contact).await?;
+            let _ = mcp::logged_call_for_account(
+                state,
+                &contact.account_id,
+                "message_send_text",
+                serde_json::json!({
+                    "recipient": &contact.wxid,
+                    "content": expired_authorization_neutral_reply()
+                }),
+            )
+            .await;
+        }
         return Ok(());
     }
 
