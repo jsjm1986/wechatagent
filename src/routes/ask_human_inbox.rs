@@ -294,7 +294,10 @@ async fn collect_lessons_learned(
     Ok(rows
         .into_iter()
         .map(|d| {
-            let id = d.get_object_id("_id").map(|o| o.to_hex()).unwrap_or_default();
+            // lessonId 必须用文档的 lesson_id 字段（{workspace}::{pattern_kind}），
+            // 与 list/promote 端点（routes/lessons_learned.rs 按 lesson_id 寻址）一致；
+            // 不可用 _id hex，否则深链卡片加载/晋升均 NotFound。
+            let id = d.get_str("lesson_id").unwrap_or_default().to_string();
             let kind = d.get_str("pattern_kind").unwrap_or("").to_string();
             let created = d.get_datetime("created_at").ok().copied();
             InboxItem {
