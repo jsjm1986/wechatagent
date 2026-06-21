@@ -82,6 +82,23 @@ pub async fn read_bytes(root: &Path, rel: &str) -> std::io::Result<Vec<u8>> {
     tokio::fs::read(root.join(rel)).await
 }
 
+/// 物理删除素材文件。文件不存在（已被删/从未落盘）视为成功——幂等。
+/// 调用方须先确认无其它 content_asset 记录引用同 rel（见 should_delete_physical_file）。
+pub async fn delete_bytes(root: &Path, rel: &str) -> std::io::Result<()> {
+    match tokio::fs::remove_file(root.join(rel)).await {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
+/// 纯决策：物理删文件前，给定"删本记录后同 file_path 的剩余引用数"，
+/// 仅当剩余引用为 0（无兄弟记录共享该物理文件）才可物理删。
+/// upload 不去重，同文件多次上传 = 多条记录共享一个 file_path，故必须查引用计数。
+pub fn should_delete_physical_file(remaining_refs: u64) -> bool {
+    remaining_refs == 0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -122,5 +139,27 @@ mod tests {
         // 危险/未知扩展名拒绝
         assert_eq!(sanitize_ext("evil.exe", "application/octet-stream"), None);
         assert_eq!(sanitize_ext("evil.sh", "text/x-sh"), None);
+    }
+
+    #[test]
+    fn should_delete_only_when_no_refs() {
+        assert!(should_delete_physical_file(0));
+        assert!(!should_delete_physical_file(1));
+        assert!(!should_delete_physical_file(5));
+    }
+
+    #[tokio::test]
+    async fn delete_bytes_removes_file_and_is_idempotent() {
+        let dir = std::env::temp_dir().join(format!("mediadel_{}", sha256_hex(format!("{:?}", std::time::SystemTime::now()).as_bytes())));
+        let rel = "ws/ab/abcd.pdf";
+        store_bytes(&dir, rel, b"hi").await.unwrap();
+        assert!(dir.join(rel).exists());
+        // 第一次删：成功，文件消失
+        delete_bytes(&dir, rel).await.unwrap();
+        assert!(!dir.join(rel).exists());
+        // 第二次删（文件已不存在）：幂等，仍 Ok
+        delete_bytes(&dir, rel).await.unwrap();
+        // 清理
+        let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 }
