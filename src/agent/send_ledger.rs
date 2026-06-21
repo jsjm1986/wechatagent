@@ -1,9 +1,10 @@
 //! 主动发送台账：转化判定纯函数（responded 窗口 / stage_advanced 推进）、
 //! 聚合率计算。写入 / 回扫的 DB 逻辑在 gateway/tasks 调用侧，这里只放可单测的纯逻辑。
 
+use crate::error::AppResult;
 use crate::models::AgentSendLedger;
 use crate::routes::AppState;
-use mongodb::bson::{doc, oid::ObjectId, DateTime};
+use mongodb::bson::{doc, oid::ObjectId, DateTime, Document};
 
 /// 构造一条待写台账。转化字段一律留空（回扫填）。
 pub(crate) fn build_ledger_entry(
@@ -119,6 +120,133 @@ pub(crate) fn response_rate(total: u64, responded: u64) -> f64 {
     (raw * 10_000.0).round() / 10_000.0
 }
 
+/// 从状态机 states 数组按出现顺序抽 key（作为粗略"阶段序"，供 stage_advanced 判定）。
+pub(crate) fn ordered_stages_from_machine(state_machine: &Document) -> Vec<String> {
+    state_machine
+        .get_array("states")
+        .map(|states| {
+            states
+                .iter()
+                .filter_map(|s| s.as_document())
+                .filter_map(|d| d.get_str("key").ok())
+                .map(ToString::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// 回扫一批 outcome_evaluated_at 缺失且已过响应窗口的台账条目，回填转化字段。
+/// 纯读 + 回写自己表，不调 LLM、不发消息（无副作用红线）。返回处理条数。
+pub(crate) async fn scan_send_ledger_outcomes(state: &AppState) -> AppResult<usize> {
+    use futures::TryStreamExt;
+    use mongodb::options::FindOptions;
+
+    let default_window_hours: i32 = 24;
+    let now = DateTime::now();
+    let now_ms = now.timestamp_millis();
+
+    // 待评估：outcome_evaluated_at 缺失。窗口是否已过在内存里按每条 sent_at 判断
+    // （避免对 response_window_hours 可空字段做复杂 mongo 时间运算）。
+    let filter = doc! { "outcome_evaluated_at": { "$exists": false } };
+    let mut cursor = state
+        .db
+        .agent_send_ledger()
+        .find(
+            filter,
+            FindOptions::builder()
+                .limit(200) // 一次限量，防积压时单 tick 过重
+                .sort(doc! { "sent_at": 1 })
+                .build(),
+        )
+        .await?;
+
+    let mut processed = 0usize;
+    while let Some(row) = cursor.try_next().await? {
+        let Some(row_id) = row.id else { continue };
+        let window_hours = row.response_window_hours.unwrap_or(default_window_hours);
+        let sent_ms = row.sent_at.timestamp_millis();
+        let window_end_ms = sent_ms + (window_hours.max(0) as i64) * 3_600_000;
+        // 窗口未过 → 跳过本轮（下个 tick 再看）。
+        if now_ms < window_end_ms {
+            continue;
+        }
+
+        // responded：查该 contact 在 (sent, sent+窗口] 内的入站消息时间戳。
+        let inbound_filter = doc! {
+            "workspace_id": &row.workspace_id,
+            "contact_wxid": &row.contact_wxid,
+            "direction": "inbound",
+            "created_at": {
+                "$gt": row.sent_at,
+                "$lte": DateTime::from_millis(window_end_ms),
+            },
+        };
+        let inbound_count = state
+            .db
+            .messages()
+            .count_documents(inbound_filter, None)
+            .await
+            .unwrap_or(0);
+        let responded = inbound_count > 0;
+
+        // stage_advanced：取当前 contact.customer_stage vs 发送时快照，按状态机序判断。
+        let current_stage = state
+            .db
+            .contacts()
+            .find_one(
+                doc! { "workspace_id": &row.workspace_id, "wxid": &row.contact_wxid },
+                None,
+            )
+            .await
+            .ok()
+            .flatten()
+            .and_then(|c| {
+                c.domain_attributes
+                    .as_ref()
+                    .and_then(|d| d.get_str("customer_stage").ok().map(ToString::to_string))
+            });
+        let ordered = load_user_ops_stage_order(state, &row.workspace_id).await;
+        let advanced = stage_advanced(
+            row.customer_stage_at_send.as_deref(),
+            current_stage.as_deref(),
+            &ordered,
+        );
+
+        let _ = state
+            .db
+            .agent_send_ledger()
+            .update_one(
+                doc! { "_id": row_id },
+                doc! { "$set": {
+                    "responded": responded,
+                    "response_window_hours": window_hours,
+                    "stage_advanced": advanced,
+                    "outcome_evaluated_at": now,
+                }},
+                None,
+            )
+            .await;
+        processed += 1;
+    }
+    Ok(processed)
+}
+
+/// 取 user_operations 域当前状态机的阶段序。查不到返空（stage_advanced 保守判 false）。
+async fn load_user_ops_stage_order(state: &AppState, workspace_id: &str) -> Vec<String> {
+    state
+        .db
+        .operation_domain_configs()
+        .find_one(
+            doc! { "workspace_id": workspace_id, "domain": "user_operations", "current_version": true },
+            None,
+        )
+        .await
+        .ok()
+        .flatten()
+        .map(|c| ordered_stages_from_machine(&c.state_machine))
+        .unwrap_or_default()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -170,6 +298,26 @@ mod tests {
         // 任一阶段不在有序表 → 保守判 false（不算推进）
         assert!(!stage_advanced(Some("意向"), Some("不存在"), &order));
         assert!(!stage_advanced(None, Some("意向"), &order));
+    }
+
+    #[test]
+    fn ordered_stages_extracts_keys_in_order() {
+        use mongodb::bson::doc;
+        let machine = doc! {
+            "states": [
+                { "key": "new_contact", "initial": true },
+                { "key": "意向" },
+                { "key": "待成交" },
+            ]
+        };
+        let order = ordered_stages_from_machine(&machine);
+        assert_eq!(order, vec!["new_contact", "意向", "待成交"]);
+    }
+
+    #[test]
+    fn ordered_stages_empty_when_no_states() {
+        use mongodb::bson::doc;
+        assert!(ordered_stages_from_machine(&doc! {}).is_empty());
     }
 
     #[test]

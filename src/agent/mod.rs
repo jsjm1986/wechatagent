@@ -49,7 +49,7 @@ mod reaction;
 mod referral;
 mod review;
 pub(crate) mod runtime;
-mod send_ledger;
+pub(crate) mod send_ledger;
 pub mod run_envelope;
 mod simulation;
 pub(crate) mod taxonomy;

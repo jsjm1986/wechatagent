@@ -164,6 +164,8 @@ async fn tick(state: &AppState) -> anyhow::Result<()> {
     let _ = ensure_today_outcome_aggregation_tasks(state).await;
     // Ask-Human Phase 1 / Task 10：超时未答的请示改派链上下一位真人并重推卡。
     let _ = crate::agent::escalation::scan_escalation_timeouts(state).await;
+    // 主动发送台账：回扫已过响应窗口的条目，回填转化（响应率/阶段推进）。
+    let _ = crate::agent::send_ledger::scan_send_ledger_outcomes(state).await;
     let mut cursor = state
         .db
         .tasks()
