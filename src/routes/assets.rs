@@ -25,6 +25,7 @@ use super::AppState;
 pub(super) struct ContentAssetQuery {
     account_id: Option<String>,
     kind: Option<String>,
+    tag: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -59,6 +60,12 @@ pub(super) async fn list_content_assets(
     if let Some(kind) = query.kind {
         if !kind.is_empty() {
             filter.insert("kind", kind);
+        }
+    }
+    // 按 tag 检索：MongoDB 数组字段等值匹配命中 tags 数组含该元素的文档（workspace scope 保留）。
+    if let Some(tag) = query.tag {
+        if !tag.is_empty() {
+            filter.insert("tags", tag);
         }
     }
     let mut cursor = state
