@@ -136,6 +136,7 @@ export function UserOperationCockpit({
   playbooks,
   profileNote,
   customAgentInstructions,
+  assistOverride,
   selected,
   selectedPlaybookId,
   simulationBusy,
@@ -149,10 +150,12 @@ export function UserOperationCockpit({
   onPreviewGuide,
   onProfileNote,
   onCustomAgentInstructions,
+  onAssistOverride,
   onRunMemoryConsolidation,
   onRunSimulation,
   onSaveProfileNote,
   onSaveCustomAgentInstructions,
+  onSaveAssistOverride,
   onSelectedPlaybook,
   onSimulationInput,
   onTab
@@ -171,6 +174,7 @@ export function UserOperationCockpit({
   playbooks: OperationPlaybook[];
   profileNote: string;
   customAgentInstructions: string;
+  assistOverride: string;
   selected: Contact | null;
   selectedPlaybookId: string;
   simulationBusy: boolean;
@@ -184,10 +188,12 @@ export function UserOperationCockpit({
   onPreviewGuide: (instruction: string) => void;
   onProfileNote: (value: string) => void;
   onCustomAgentInstructions: (value: string) => void;
+  onAssistOverride: (mode: string) => void;
   onRunMemoryConsolidation: () => void;
   onRunSimulation: () => void;
   onSaveProfileNote: () => void;
   onSaveCustomAgentInstructions: () => void;
+  onSaveAssistOverride: () => void;
   onSelectedPlaybook: (value: string) => void;
   onSimulationInput: (value: string) => void;
   onTab: (tab: SmartOpsTab) => void;
@@ -393,6 +399,24 @@ export function UserOperationCockpit({
               </button>
             )}
           </label>
+          {selected.agentStatus === "managed" && (
+            <label>
+              <span>辅助模式（本客户）</span>
+              <small>覆盖账号级默认：跟随账号 / 强制为本客户引荐专属顾问 / 强制不引荐。</small>
+              <select
+                value={assistOverride}
+                onChange={(event) => onAssistOverride(event.target.value)}
+              >
+                <option value="default">跟随账号默认</option>
+                <option value="force_on">强制开启引荐</option>
+                <option value="force_off">强制关闭引荐</option>
+              </select>
+              <button className="secondary" onClick={onSaveAssistOverride} disabled={busy} type="button">
+                <SquarePen size={16} />
+                保存辅助模式
+              </button>
+            </label>
+          )}
           <div className="buttonRow">
             {selected.agentStatus === "managed" ? (
               <>
