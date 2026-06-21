@@ -12,7 +12,7 @@ use crate::{
     models::{AgentSoul, OperationDomainConfig, OperationPlaybook, PromptTemplate},
 };
 
-pub const PROMPT_PACK_VERSION: &str = "wechatagent_prompt_pack_v4_2026_06_21_referral";
+pub const PROMPT_PACK_VERSION: &str = "wechatagent_prompt_pack_v5_2026_06_22_commitment";
 
 /// universal-domain-adaptation A/T1：user.reply.policy prompt「## 模式与 5 闸的关系」
 /// 模式-闸说明段（逐字复刻 prompt pack v3 现文 :958-963：标题 + casual_relationship /
@@ -1219,6 +1219,7 @@ fn prompt_specs() -> Vec<PromptSpec> {
 - 如果产品知识区为空或知识路由显示 missing/weak，涉及产品事实时只做关系维护、澄清需求或说明需要进一步确认。
 - memoryCandidates 只写会影响未来运营的高价值信息，必须有用户原话或行为作为 evidence；普通寒暄不要写入。
 - memoryWriteScore 0-10，6 以上才代表需要异步整理长期记忆。
+- 【承诺必填】凡你在 replyText 里向客户做了任何与时间相关的承诺或待办（如"明天发您资料""下周给您答复""稍后整理好发您"），必须同时填写 lastCommitment（描述该承诺）以及可选的结构化 commitment.dueAt（到期时间，RFC3339）；否则系统无法在到期时提醒你跟进，承诺会落空、关系受损。没有任何时间承诺时才留空。
 - riskLevel/knowledgeNeed/runMode/autonomyMode 必须严格使用上面列出的枚举值（小写，下划线）。
 - consolidationNeeded=true 或 riskLevel=high 或 knowledgeNeed in [required, insufficient] 视为关键变化轮，R1.3 七字段每个 ≥ 20 unicode 字符且不得使用 'unchanged'；whyShouldReply/whySkipReply 命中那一个 ≥ 30 unicode 字符 + ≥ 12 汉字。
 - riskLevel=low + knowledgeNeed=not_required + consolidationNeeded=false 视为低风险常规轮，R1.3 七字段允许 'unchanged' 短形式，但 knowledgeNeedReason / selfCritique 仍需 ≥ 6 unicode 字符。

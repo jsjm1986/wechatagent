@@ -77,6 +77,14 @@ use super::taxonomy::{
     TaxonomyMatch,
 };
 
+/// 弱启发：reply 是否含"时间相关承诺"特征。仅用于 ⑥ 观测覆盖率，不进任何门、
+/// 不改变发送判定。非红线护栏（"是否做了承诺"是语义判断，交 LLM + prompt）。
+/// 明确接受可能误报/漏报——这正是它只观测不拦的原因。
+fn reply_has_time_commitment_feature(reply: &str) -> bool {
+    const MARKERS: [&str; 8] = ["明天", "后天", "下周", "下个月", "稍后", "晚点", "回头", "马上"];
+    MARKERS.iter().any(|m| reply.contains(m))
+}
+
 pub async fn handle_managed_message(
     state: &AppState,
     contact: Contact,
@@ -3247,6 +3255,19 @@ async fn apply_agent_updates(
         }
         let bson_commitments = mongodb::bson::to_bson(&commitments).unwrap_or(mongodb::bson::Bson::Array(Vec::new()));
         set_doc.insert("commitments", bson_commitments);
+    } else if reply_has_time_commitment_feature(&decision.reply_text) {
+        // ⑥观测：reply 像做了时间承诺但 LLM 没填 commitment 字段 → 无 follow-up。
+        // 仅观测 prompt 强化是否生效，不阻断、不改写、不进任何门。
+        let _ = write_event_for_account(
+            &state,
+            &contact.account_id,
+            Some(&contact.wxid),
+            "agent.commitment_field_missing",
+            "observed",
+            "回复疑似含时间承诺但未填 commitment 字段（观测，未拦截）",
+            None,
+        )
+        .await;
     }
     if let Some(value) = non_empty_option(&decision.follow_up_policy) {
         set_doc.insert("follow_up_policy", value);
@@ -4204,6 +4225,21 @@ mod tests {
     #[test]
     fn media_send_order_unknown_pref_defaults_text_then_media() {
         assert_eq!(media_send_order(""), SendOrder::TextThenMedia);
+    }
+
+    // ⑥ 承诺兑现观测：reply 时间承诺特征检测（弱启发，仅观测覆盖率）。
+    #[test]
+    fn reply_has_time_commitment_feature_detects_relative_dates() {
+        assert!(reply_has_time_commitment_feature("我明天发您资料"));
+        assert!(reply_has_time_commitment_feature("下周给您答复"));
+        assert!(reply_has_time_commitment_feature("稍后整理好发您"));
+        assert!(reply_has_time_commitment_feature("我马上处理"));
+    }
+    #[test]
+    fn reply_has_time_commitment_feature_negative() {
+        assert!(!reply_has_time_commitment_feature("好的，我了解了"));
+        assert!(!reply_has_time_commitment_feature(""));
+        assert!(!reply_has_time_commitment_feature("这个产品确实不错"));
     }
 
     // 终审 Important#1：媒体发送门与文本同源。
