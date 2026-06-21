@@ -44,6 +44,7 @@ pub(super) async fn upload_media_asset(
     let mut send_trigger_hint: Option<String> = None;
     let mut expression_pref: Option<String> = None;
     let mut target_stages: Vec<String> = vec![];
+    let mut tags: Vec<String> = vec![];
     let mut requires_principal_approval = false;
     let mut account_id: Option<String> = None;
 
@@ -77,6 +78,18 @@ pub(super) async fn upload_media_asset(
             "targetStages" => {
                 // 逗号分隔
                 target_stages = field
+                    .text()
+                    .await
+                    .unwrap_or_default()
+                    .split(',')
+                    .map(|s| s.trim())
+                    .filter(|s| !s.is_empty())
+                    .map(|s| s.to_string())
+                    .collect();
+            }
+            "tags" => {
+                // 逗号分隔（与 targetStages 同款解析），供候选清单注入 + list 按 tag 检索。
+                tags = field
                     .text()
                     .await
                     .unwrap_or_default()
@@ -149,7 +162,7 @@ pub(super) async fn upload_media_asset(
         kind: "media".into(),
         title,
         body: None,
-        tags: vec![],
+        tags,
         url: None,
         media_id: None,
         usage_scene: None,

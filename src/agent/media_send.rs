@@ -59,8 +59,14 @@ pub(crate) fn render_candidate_lines(candidates: &[&ContentAsset]) -> String {
         let stages = a.target_stages.as_ref().map(|v| v.join(",")).unwrap_or_default();
         let pref = a.expression_pref.as_deref().unwrap_or("file_support");
         let hint = a.send_trigger_hint.as_deref().unwrap_or("");
+        // tags 非空才渲染标签段（旧素材 tags 空则跳过，向后兼容）。
+        let tags_seg = if a.tags.is_empty() {
+            String::new()
+        } else {
+            format!(" | 标签:{}", a.tags.join(","))
+        };
         out.push_str(&format!(
-            "- [id:{id}] {} | 阶段:{stages} | 表达:{pref}\n  触发提示:{hint}\n",
+            "- [id:{id}] {} | 阶段:{stages} | 表达:{pref}{tags_seg}\n  触发提示:{hint}\n",
             a.title
         ));
     }
@@ -366,5 +372,24 @@ mod tests {
         let line = render_candidate_lines(&[&a]);
         assert!(line.contains("file_primary") || line.contains("文件为主"));
         assert!(line.contains("问价时发"));
+    }
+
+    #[test]
+    fn render_candidate_includes_tags() {
+        let mut a = asset(Some(true), Some("approved"), Some("file"), None);
+        a.title = "报价单".to_string();
+        a.tags = vec!["报价类".to_string(), "价格".to_string()];
+        let out = render_candidate_lines(&[&a]);
+        assert!(out.contains("报价类"), "候选清单应渲染 tags");
+    }
+
+    #[test]
+    fn render_candidate_skips_empty_tags() {
+        let mut a = asset(Some(true), Some("approved"), Some("file"), None);
+        a.title = "无标签素材".to_string();
+        // tags 留空
+        a.tags = vec![];
+        let out = render_candidate_lines(&[&a]);
+        assert!(!out.contains("标签:"), "空 tags 不渲染标签段");
     }
 }
