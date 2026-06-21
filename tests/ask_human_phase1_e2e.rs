@@ -655,3 +655,28 @@ async fn inbox_lessons_item_carries_lesson_id() {
         "lessons 收件项应带 richParams.lessonId={lesson_hex}"
     );
 }
+
+#[tokio::test]
+#[ignore]
+async fn get_single_chunk_by_id_scoped_to_workspace() {
+    let app = common::TestApp::start().await;
+    let ws = &app.state.config.default_workspace_id;
+    let chunk = wechatagent::models::OperationKnowledgeChunk {
+        id: None,
+        workspace_id: ws.to_string(),
+        title: "测试切片".into(),
+        body: Some("正文".into()),
+        ..Default::default()
+    };
+    let inserted = app.state.db.operation_knowledge_chunks().insert_one(&chunk, None).await.unwrap();
+    let hex = inserted.inserted_id.as_object_id().unwrap().to_hex();
+    let resp = wechatagent::routes::knowledge::crud::get_operation_knowledge_chunk(
+        axum::extract::State(app.state.clone()),
+        axum::Extension(test_admin(ws)),
+        axum::extract::Path(hex.clone()),
+    )
+    .await
+    .unwrap();
+    let body: serde_json::Value = resp.0;
+    assert_eq!(body["item"]["title"], serde_json::json!("测试切片"));
+}

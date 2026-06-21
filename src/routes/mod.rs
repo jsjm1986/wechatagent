@@ -45,7 +45,7 @@ mod evolution;
 pub mod guide_profile;
 mod guides;
 mod health;
-pub(crate) mod knowledge;
+pub mod knowledge;
 mod lessons_learned;
 mod llm_providers;
 mod management;
@@ -186,7 +186,8 @@ use knowledge::{
     delete_operation_knowledge_document, digest_dismiss_card, digest_regenerate, digest_today,
     dismiss_knowledge_gap_signal,
     get_operation_knowledge_catalog, get_operation_knowledge_catalog_persisted,
-    get_operation_knowledge_chunk_source, get_operation_knowledge_completeness,
+    get_operation_knowledge_chunk, get_operation_knowledge_chunk_source,
+    get_operation_knowledge_completeness,
     get_operation_knowledge_document, get_operation_knowledge_integrity_report,
     extract_operation_knowledge_tags, import_operation_knowledge_apply,
     import_operation_knowledge_apply_image, import_operation_knowledge_apply_pdf,
@@ -414,7 +415,9 @@ pub fn api_router(state: AppState) -> Router<AppState> {
         )
         .route(
             "/operation-knowledge/chunks/:id",
-            put(update_operation_knowledge_chunk).delete(delete_operation_knowledge_chunk),
+            get(get_operation_knowledge_chunk)
+                .put(update_operation_knowledge_chunk)
+                .delete(delete_operation_knowledge_chunk),
         )
         .route(
             "/operation-knowledge/chunks/:id/source",
