@@ -242,7 +242,7 @@ pub async fn review_media_asset(
 
 #[derive(Debug, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub(super) struct UpdateMetaRequest {
+pub struct UpdateMetaRequest {
     title: Option<String>,
     body: Option<String>,
     tags: Option<Vec<String>>,
@@ -257,7 +257,7 @@ pub(super) struct UpdateMetaRequest {
 /// PUT /content-assets/:id —— 改元数据（JSON，部分更新）。
 /// 只 $set 客户端提供的字段；不动 file_*/media_id/review_status/sendable。
 /// target_stages 复用簇 B normalize_target_stages 归一，越界 400。
-pub(super) async fn update_content_asset_meta(
+pub async fn update_content_asset_meta(
     State(state): State<AppState>,
     Extension(admin): Extension<AuthenticatedAdmin>,
     Path(id): Path<String>,
@@ -442,13 +442,13 @@ pub(super) async fn replace_content_asset_file(
 
 #[derive(Debug, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub(super) struct ToggleSendableRequest {
+pub struct ToggleSendableRequest {
     sendable: bool,
 }
 
 /// POST /content-assets/:id/toggle —— 启停（写 sendable）。
 /// 与 review_status 正交：停用不动审核态，重启不必重审。workspace 隔离。
-pub(super) async fn toggle_content_asset_sendable(
+pub async fn toggle_content_asset_sendable(
     State(state): State<AppState>,
     Extension(admin): Extension<AuthenticatedAdmin>,
     Path(id): Path<String>,
@@ -473,7 +473,7 @@ pub(super) async fn toggle_content_asset_sendable(
 /// DELETE /content-assets/:id —— 删除。
 /// 先删 DB 记录,再查同 file_path 剩余引用,无引用才物理删文件(防误删兄弟共享文件)。
 /// 物理删 fail-soft(DB 已删=既成事实,残留文件无害)。workspace 隔离。
-pub(super) async fn delete_content_asset(
+pub async fn delete_content_asset(
     State(state): State<AppState>,
     Extension(admin): Extension<AuthenticatedAdmin>,
     Path(id): Path<String>,
