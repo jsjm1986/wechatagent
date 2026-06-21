@@ -16,7 +16,7 @@ use mongodb::{options::ClientOptions, Client, Collection, Database as MongoDatab
 
 use crate::models::{
     AgentCommandRun, AgentDecisionReview, AgentEvent, AgentOutcomeMetric, AgentPrincipalEscalation,
-    AgentRunLog, AgentSoul,
+    AgentRunLog, AgentSendLedger, AgentSoul,
     AgentTask, AgentToolCall, BehaviorSignal, BehaviorSignalMetric, CatalogRebuildJob,
     ChunkRevision, Contact,
     ContentAsset, ConversationMessage, DomainProfile, DomainSchema, EvaluationScenario, Experiment, IngestSource,
@@ -186,6 +186,10 @@ impl Database {
 
     pub fn referral_cards(&self) -> Collection<ReferralCard> {
         self.db.collection("referral_cards")
+    }
+
+    pub fn agent_send_ledger(&self) -> Collection<AgentSendLedger> {
+        self.db.collection("agent_send_ledger")
     }
 
     pub fn llm_call_logs(&self) -> Collection<LlmCallLog> {

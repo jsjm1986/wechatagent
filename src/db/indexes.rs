@@ -227,6 +227,33 @@ pub(super) async fn ensure_all(db: &Database) -> anyhow::Result<()> {
             None,
         )
         .await?;
+    // 主动发送台账：单客户发送历史（按时间倒序）。
+    db.agent_send_ledger()
+        .create_index(
+            IndexModel::builder()
+                .keys(doc! { "workspace_id": 1, "contact_wxid": 1, "sent_at": -1 })
+                .build(),
+            None,
+        )
+        .await?;
+    // 主动发送台账：素材/名片维度聚合。
+    db.agent_send_ledger()
+        .create_index(
+            IndexModel::builder()
+                .keys(doc! { "workspace_id": 1, "send_kind": 1, "target_id": 1 })
+                .build(),
+            None,
+        )
+        .await?;
+    // 主动发送台账：回扫待处理（找 outcome_evaluated_at 缺失的条目）。
+    db.agent_send_ledger()
+        .create_index(
+            IndexModel::builder()
+                .keys(doc! { "workspace_id": 1, "outcome_evaluated_at": 1 })
+                .build(),
+            None,
+        )
+        .await?;
     db.agent_souls()
         .create_index(
             IndexModel::builder()
