@@ -1,0 +1,35 @@
+/* 请示通道配置页样式。一律走 components/ui/tokens.css 变量，禁裸色值/魔数。 */
+.chainEditor { display: flex; flex-direction: column; gap: 8px; }
+.chainEmpty { font-size: 12px; color: var(--ink-3); padding: 6px 0; }
+.chainRow {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 8px 12px; border: 1px solid var(--hairline); border-radius: var(--r-sm);
+  background: var(--surface-card);
+}
+.chainName { font-size: 13px; color: var(--ink-1); display: flex; align-items: center; gap: 8px; min-width: 0; }
+.chainWxid { font-size: 11px; color: var(--ink-3); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.chainActions { display: flex; gap: 4px; flex-shrink: 0; }
+.chainActions button {
+  min-width: 28px; height: 28px; border: 1px solid var(--hairline); border-radius: var(--r-sm);
+  background: var(--surface-card); color: var(--ink-2); cursor: pointer;
+}
+.chainActions button:disabled { opacity: .4; cursor: not-allowed; }
+.chainHint { font-size: 11px; color: var(--ink-3); }
+.linkBtn {
+  align-self: flex-start; padding: 6px 12px; border: 1px solid var(--hairline);
+  border-radius: var(--r-sm); background: var(--surface-card); color: var(--color-scheduled); cursor: pointer; font-size: 12px;
+}
+.pickerPanel { display: flex; flex-direction: column; gap: 8px; padding: 12px; border: 1px solid var(--hairline); border-radius: var(--r-md); background: var(--surface-card); }
+.pickerList { display: flex; flex-direction: column; gap: 4px; max-height: 220px; overflow-y: auto; }
+.pickerItem {
+  display: flex; align-items: center; justify-content: space-between; gap: 8px;
+  padding: 8px 10px; border: 1px solid var(--hairline); border-radius: var(--r-sm);
+  background: var(--surface-card); color: var(--ink-1); cursor: pointer; font-size: 13px; text-align: left;
+}
+.pickerItem:hover { background: var(--fill-scheduled); }
+.input {
+  width: 100%; height: var(--control-h, 38px); padding: 0 12px;
+  border: 1px solid var(--hairline); border-radius: var(--r-sm); background: var(--surface-card);
+  color: var(--ink-1); font-size: 13px;
+}
+.input:focus { outline: none; box-shadow: var(--focus-ring); }
