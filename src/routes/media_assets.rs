@@ -121,6 +121,18 @@ pub(super) async fn upload_media_asset(
     let ext = media_storage::sanitize_ext(&file_name, &mime)
         .ok_or_else(|| AppError::BadRequest("file type not allowed".into()))?;
 
+    // 缺口 6：归一 target_stages 到 canonical（与 contact.customer_stage 同空间），
+    // 越界即 400。account_id 缺失 → 空串走 global scope。
+    // 前移到 store_bytes 之前：越界 stage 时不落盘、不入库，避免留下孤儿文件。
+    let scope = account_id.as_deref().unwrap_or("");
+    let target_stages = crate::agent::dimension_registry::normalize_target_stages(
+        &state.db,
+        scope,
+        &target_stages,
+    )
+    .await
+    .map_err(|reason| AppError::BadRequest(format!("target_stages 校验未通过：{reason}")))?;
+
     // 落盘：路径只由 workspace+sha+ext 产出，user 的 file_name 不进磁盘路径。
     let sha = media_storage::sha256_hex(&bytes);
     let rel = media_storage::safe_relative_path(&admin.current_workspace, &sha, &ext)
