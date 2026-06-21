@@ -1,6 +1,6 @@
-// Ask-Human Phase 2 Task 6：演化候选「发布/回滚」卡，从 features/evolution/EvolutionCenterTab.tsx
+// Ask-Human Phase 2 Task 6：演化候选「发布/回滚」卡。源自演化中心 Tab
 // 物理迁入（原 ProposalDetailView + 它依赖的 ConfirmModal/ThresholdDiffView/PromptDiffView/
-// ShadowEvalReport）。中立化到 components/review/ 后，老页（EvolutionCenterTab）与统一收件箱频道
+// ShadowEvalReport）。中立化到 components/review/ 后，老页（演化中心 Tab）与统一收件箱频道
 // 都从这里 import，不再各持一份定义。
 //
 // 渲染/确认逻辑逐行保留：threshold 类 = current vs proposed 数值条 + hit_rate；prompt 类 = 双栏
@@ -18,16 +18,15 @@
 
 import { useEffect, useState } from "react";
 import { api } from "../../lib/api";
-// 共享视觉与原语仍由 evolution feature 持有；卡片复用，避免重复定义（参见报告 Concerns）。
-import styles from "../../features/evolution/EvolutionCenterTab.module.css";
-import {
-  StatusBadge,
-  formatNumber,
-  formatPercent,
-  type ProposalDetail,
-  type ProposalDetailResponse,
-  type ShadowReplaysSummary,
-} from "../../features/evolution/EvolutionCenterTab";
+// 零跨feature import（用户裁定 B）：原语/类型/CSS 均已提升到 components/review/ 中立家，
+// 卡片不再反向依赖任一 feature 模块；老页同源 import 同一套定义，渲染字节级一致。
+import styles from "./ProposalReleaseCard.module.css";
+import { StatusBadge, formatNumber, formatPercent } from "./proposalPrimitives";
+import type {
+  ProposalDetail,
+  ProposalDetailResponse,
+  ShadowReplaysSummary,
+} from "./proposalTypes";
 
 export function ProposalReleaseCard({
   proposalId,
