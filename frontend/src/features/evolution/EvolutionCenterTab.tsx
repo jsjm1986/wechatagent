@@ -27,9 +27,43 @@ import styles from "./EvolutionCenterTab.module.css";
 // 候选「发布/回滚」卡已中立化迁入 components/review/（Ask-Human Phase 2 Task 6）。
 // 老页改薄壳：只持列表/选中逻辑 + 共享原语（StatusBadge/formatNumber/...），详情卡复用迁出件。
 import { ProposalReleaseCard } from "../../components/review/ProposalReleaseCard";
-// 保留既有 re-export 路径（root src/EvolutionCenterTab.tsx → 此处 → 卡）：单测 import { ConfirmModal }
-// from "../EvolutionCenterTab" 不受迁移影响。
+// 共享原语/类型已提升到 components/review/ 中立家（零跨feature修订，用户裁定 B）：
+// 老页与卡片同源 import 同一套定义；老页继续以原签名使用，渲染字节级不变。
+import {
+  StatusBadge,
+  statusLabel,
+  statusTone,
+  formatNumber,
+  formatPercent,
+} from "../../components/review/proposalPrimitives";
+import type {
+  ProposalStatus,
+  ProposalKind,
+  ExperimentEnvelope,
+  ProposalSummary,
+  ExperimentItem,
+  ExperimentsResponse,
+  ShadowReplaySample,
+  ShadowReplaysSummary,
+  ProposalDetail,
+  ProposalDetailResponse,
+} from "../../components/review/proposalTypes";
+// 保留既有 re-export 路径（root src/EvolutionCenterTab.tsx → 此处 → 卡/中立家）：
+// 单测 import { ConfirmModal, StatusBadge, ... } from "../EvolutionCenterTab" 不受迁移影响。
 export { ConfirmModal } from "../../components/review/ProposalReleaseCard";
+export { StatusBadge, statusLabel, statusTone, formatNumber, formatPercent };
+export type {
+  ProposalStatus,
+  ProposalKind,
+  ExperimentEnvelope,
+  ProposalSummary,
+  ExperimentItem,
+  ExperimentsResponse,
+  ShadowReplaySample,
+  ShadowReplaysSummary,
+  ProposalDetail,
+  ProposalDetailResponse,
+};
 
 // ── API helper（不复用 App.tsx 的 module-scoped 实例，方便单测局部 mock fetch） ──
 
@@ -37,172 +71,6 @@ async function apiGet<T>(url: string): Promise<T> {
   const r = await fetch(url);
   if (!r.ok) throw new Error(await r.text());
   return r.json();
-}
-
-// ── 类型镜像后端 src/routes/evolution.rs 返回 schema ──
-
-export type ProposalStatus =
-  | "pending_eval"
-  | "evaluating"
-  | "eligible_for_release"
-  | "rejected_below_threshold"
-  | "released"
-  | "rolled_back";
-
-export type ProposalKind = "threshold" | "prompt";
-
-export interface ExperimentEnvelope {
-  experimentId: string;
-  workspaceId: string;
-  accountId: string;
-  status: string;
-  windowHours: number;
-  startedAt: string;
-  updatedAt: string;
-  finishedAt: string | null;
-  cohortThresholdSize: number;
-  cohortPromptSize: number;
-  budgetUsedTokens: number;
-  budgetUsedCalls: number;
-  proposalsCount: number;
-  proposalsEligibleCount: number;
-}
-
-export interface ProposalSummary {
-  id: string | null;
-  kind: ProposalKind;
-  status: ProposalStatus | string;
-  gateKey: string | null;
-  proposedTemplateKey: string | null;
-  proposedSection: string | null;
-  currentValue: number | null;
-  proposedValue: number | null;
-  significancePassed: boolean | null;
-  evalReplaysCompleted: number | null;
-  evalReplaysFailed: number | null;
-  failureReason: string | null;
-  createdAt: string;
-  updatedAt: string;
-}
-
-export interface ExperimentItem {
-  experiment: ExperimentEnvelope;
-  proposalsCounts: Record<string, number>;
-  proposals: ProposalSummary[];
-}
-
-export interface ExperimentsResponse {
-  items: ExperimentItem[];
-}
-
-export interface ShadowReplaySample {
-  id: string | null;
-  sourceRunId: string;
-  status: string;
-  failureReason: string | null;
-  originalFinalReviewStatus: string | null;
-  newFinalReviewStatus: string | null;
-  newReviewRisks: unknown;
-  newTokenCost: number | null;
-  new5gateHit: Record<string, unknown>;
-  newSelfCritiqueAddressed: boolean | null;
-  similarityToOriginalText: number | null;
-  startedAt: string;
-  finishedAt: string | null;
-}
-
-export interface ShadowReplaysSummary {
-  totalCompleted: number;
-  totalFailed: number;
-  samples: ShadowReplaySample[];
-}
-
-export interface ProposalDetail {
-  id: string | null;
-  experimentId: string;
-  workspaceId: string;
-  accountId: string;
-  kind: ProposalKind;
-  status: ProposalStatus | string;
-  gateKey: string | null;
-  currentValue: number | null;
-  proposedValue: number | null;
-  cohortNotes: Record<string, unknown>;
-  proposedTemplateKey: string | null;
-  proposedSection: string | null;
-  diffSummary: string | null;
-  diffSnippet: string | null;
-  criticReasoning: string | null;
-  expectedImprovementOn: string[] | null;
-  riskNote: string | null;
-  previousPromptVersion: string | null;
-  evalMetrics: Record<string, unknown>;
-  evalReplaysCompleted: number | null;
-  evalReplaysFailed: number | null;
-  significancePassed: boolean | null;
-  failureReason: string | null;
-  releasedAt: string | null;
-  releasedBy: string | null;
-  rolledBackAt: string | null;
-  rolledBackBy: string | null;
-  createdAt: string;
-  updatedAt: string;
-}
-
-export interface ProposalDetailResponse {
-  proposal: ProposalDetail;
-  experiment: ExperimentEnvelope | null;
-  cohortRunIds: string[];
-  shadowReplays: ShadowReplaysSummary;
-  currentState: Record<string, unknown>;
-}
-
-// ── 工具函数 ──
-
-const STATUS_LABELS: Record<string, string> = {
-  pending_eval: "待评测",
-  evaluating: "评测中",
-  eligible_for_release: "可发布",
-  rejected_below_threshold: "未达标",
-  released: "已发布",
-  rolled_back: "已回滚",
-};
-
-const STATUS_TONES: Record<string, string> = {
-  pending_eval: "neutral",
-  evaluating: "info",
-  eligible_for_release: "success",
-  rejected_below_threshold: "warn",
-  released: "primary",
-  rolled_back: "danger",
-};
-
-// tone → CSS Module 徽章类（保留 data-tone 原值供测试断言；class 走局部化）。
-const TONE_CLASS: Record<string, string> = {
-  neutral: styles.badgeNeutral,
-  info: styles.badgeInfo,
-  success: styles.badgeSuccess,
-  warn: styles.badgeWarn,
-  primary: styles.badgePrimary,
-  danger: styles.badgeDanger,
-};
-
-export function statusLabel(s: string): string {
-  return STATUS_LABELS[s] ?? s;
-}
-
-export function statusTone(s: string): string {
-  return STATUS_TONES[s] ?? "neutral";
-}
-
-export function formatNumber(v: number | null | undefined, digits = 2): string {
-  if (v === null || v === undefined || Number.isNaN(v)) return "—";
-  return Number(v).toFixed(digits);
-}
-
-export function formatPercent(v: number | null | undefined): string {
-  if (v === null || v === undefined || Number.isNaN(v)) return "—";
-  return `${(v * 100).toFixed(1)}%`;
 }
 
 /// 7 天聚合（client 端从 experiments[] 推算 — 不打额外请求；后端尚未提供专用聚合 endpoint）。
@@ -402,15 +270,3 @@ function ProposalList({
   );
 }
 
-export function StatusBadge({ status }: { status: string }) {
-  const tone = statusTone(status);
-  return (
-    <span
-      className={`${styles.badge} ${TONE_CLASS[tone] ?? styles.badgeNeutral}`}
-      data-testid={`status-badge-${status}`}
-      data-tone={tone}
-    >
-      {statusLabel(status)}
-    </span>
-  );
-}
