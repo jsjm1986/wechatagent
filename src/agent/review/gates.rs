@@ -637,9 +637,11 @@ pub fn finalize_review_for_send(
     // 本次恢复范围；claim_analysis 缺失时按"非产品声明"放行（reviewer 软闸 +
     // knowledge_router verified-only corpus 仍在兜底）。
     if crate::agent::guards::claim_requires_product_knowledge(&review.claim_analysis) {
+        let now = mongodb::bson::DateTime::now();
         let verified_chunks = crate::agent::guards::compute_verified_chunks(
             &decision.used_knowledge_ids,
             knowledge_chunks,
+            now,
         );
         if verified_chunks.is_empty() && !priced_from_catalog {
             review.approved = false;
@@ -684,9 +686,11 @@ pub fn finalize_review_for_send(
     if !crate::agent::guards::claim_requires_product_knowledge(&review.claim_analysis) {
         let class = crate::agent::guards::commitment_claim_class(&decision.reply_text, commitment_markers);
         if class != crate::agent::guards::CommitmentClass::None {
+            let now = mongodb::bson::DateTime::now();
             let verified = crate::agent::guards::compute_verified_chunks(
                 &decision.used_knowledge_ids,
                 knowledge_chunks,
+                now,
             );
             if verified.is_empty() {
                 match class {
