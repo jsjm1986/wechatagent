@@ -860,6 +860,9 @@ pub struct ReferralCard {
     pub send_trigger_hint: String,
     #[serde(default)]
     pub target_stages: Vec<String>,
+    /// 维度标签（与素材侧对称）：仅注入引荐候选清单供 AI 参考，不作硬过滤门（agent-first）。
+    #[serde(default)]
+    pub tags: Vec<String>,
     #[serde(default)]
     pub enabled: bool,
     #[serde(default)]
@@ -5694,6 +5697,7 @@ mod referral_card_compat_tests {
             display_name: "销售总监-老王".into(),
             send_trigger_hint: "客户明确要签约或要来公司参观时引荐".into(),
             target_stages: vec!["意向".into()],
+            tags: vec!["高客单".into()],
             enabled: true,
             review_status: "approved".into(),
             review_note: None,
@@ -5705,6 +5709,24 @@ mod referral_card_compat_tests {
         assert_eq!(back.target_wxid, "wxid_boss");
         assert_eq!(back.target_stages.len(), 1);
         assert!(back.enabled);
+    }
+
+    #[test]
+    fn referral_card_without_tags_deserializes_to_empty() {
+        // 旧名片文档无 tags 字段 → #[serde(default)] 回落空 Vec。
+        let doc = mongodb::bson::doc! {
+            "workspace_id": "ws1",
+            "target_wxid": "wxid_boss",
+            "display_name": "老王",
+            "send_trigger_hint": "签约时引荐",
+            "target_stages": ["意向"],
+            "enabled": true,
+            "review_status": "approved",
+            "created_at": DateTime::now(),
+            "updated_at": DateTime::now(),
+        };
+        let card: ReferralCard = mongodb::bson::from_document(doc).unwrap();
+        assert!(card.tags.is_empty(), "旧名片无 tags 字段应回落空 Vec");
     }
 
     #[test]

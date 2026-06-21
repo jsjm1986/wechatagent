@@ -54,8 +54,14 @@ pub(crate) fn render_referral_lines(
     for c in candidates {
         let id = c.id.map(|i| i.to_hex()).unwrap_or_default();
         let stages = c.target_stages.join(",");
+        // 维度标签（与素材侧对称）：仅供 AI 参考的候选清单注入，非空才渲染，不作硬过滤门。
+        let tags_seg = if c.tags.is_empty() {
+            String::new()
+        } else {
+            format!(" | 标签:{}", c.tags.join(","))
+        };
         out.push_str(&format!(
-            "- [card:{id}] {} | 阶段:{stages} | 触发提示:{}\n",
+            "- [card:{id}] {} | 阶段:{stages}{tags_seg} | 触发提示:{}\n",
             c.display_name, c.send_trigger_hint
         ));
     }
@@ -190,9 +196,27 @@ mod tests {
             target_wxid: "wxid_boss".into(), display_name: "老王".into(),
             send_trigger_hint: "要签约时引荐".into(),
             target_stages: stages.into_iter().map(|s| s.to_string()).collect(),
+            tags: vec![],
             enabled, review_status: review.into(), review_note: None,
             created_at: DateTime::now(), updated_at: DateTime::now(),
         }
+    }
+
+    #[test]
+    fn render_referral_includes_tags() {
+        let mut card = ReferralCard {
+            id: None, workspace_id: "ws".into(), account_id: None,
+            target_wxid: "wxid_boss".into(), display_name: "老王".into(),
+            send_trigger_hint: "签约时引荐".into(), target_stages: vec!["意向".into()],
+            tags: vec!["高客单".into()],
+            enabled: true, review_status: "approved".into(), review_note: None,
+            created_at: DateTime::now(), updated_at: DateTime::now(),
+        };
+        let out = render_referral_lines(&[&card], None);
+        assert!(out.contains("高客单"), "引荐候选应渲染 tags");
+        card.tags.clear();
+        let out2 = render_referral_lines(&[&card], None);
+        assert!(!out2.contains("标签:"), "空 tags 不渲染标签段");
     }
 
     #[test]

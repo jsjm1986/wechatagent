@@ -43,6 +43,7 @@ fn make_card(
         display_name: display_name.to_string(),
         send_trigger_hint: "客户要签约/到店时引荐".to_string(),
         target_stages: target_stages.iter().map(|s| s.to_string()).collect(),
+        tags: vec![],
         enabled,
         review_status: review_status.to_string(),
         review_note: None,
