@@ -499,6 +499,11 @@ async fn illegal_stage_jump_keeps_old_stage_and_audits_failsoft() {
         "非法 stage 跳转应跳写 customer_stage、保留旧值 new_contact，实际 domain_attributes={:?}",
         reloaded.domain_attributes
     );
+    assert_eq!(
+        reloaded.operation_state.as_deref(),
+        Some("new_contact"),
+        "非法 stage 跳转时 operation_state 也应留旧值,与 customer_stage 一致(两字段不漂移)"
+    );
 
     // ② 审计事件：恰好一条 stage_transition_rejected，details 含 from/to/reason。
     let event = app
