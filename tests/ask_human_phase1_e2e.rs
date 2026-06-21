@@ -604,3 +604,54 @@ async fn timeout_reassign_gives_each_decider_full_window() {
         "age 自 updated_at 起算 → b 应拿到完整 24h 窗，第二次 scan 仍是 b（NOT c）"
     );
 }
+
+/// P2 Task 1: lessons_learned 收件项必须带 richParams.lessonId（前端 LessonPromoteCard
+/// 深链前提）。修复前 `rich_params: None` → `richParams` 被 skip_serializing_if 省略，
+/// 断言取 `["richParams"]["lessonId"]` 为 Null ≠ 期望 hex，会 FAIL。
+#[tokio::test]
+#[ignore]
+async fn inbox_lessons_item_carries_lesson_id() {
+    let app = common::TestApp::start().await;
+    let ws = app.state.config.default_workspace_id.clone();
+    // seed 一条 pending_review lessons_learned（裸 Document，无 typed accessor）
+    let coll = app
+        .state
+        .db
+        .raw()
+        .collection::<mongodb::bson::Document>("lessons_learned");
+    let inserted = coll
+        .insert_one(
+            doc! {
+                "workspace_id": &ws,
+                "review_status": "pending_review",
+                "pattern_kind": "objection_handling",
+                "created_at": DateTime::now(),
+            },
+            None,
+        )
+        .await
+        .unwrap();
+    let lesson_hex = inserted.inserted_id.as_object_id().unwrap().to_hex();
+    // 调 inbox handler，过滤 lessons_learned 源
+    let resp = wechatagent::routes::ask_human_inbox::ask_human_inbox(
+        State(app.state.clone()),
+        Extension(test_admin(&ws)),
+        Query(
+            serde_json::from_value(serde_json::json!({ "source": "lessons_learned" }))
+                .expect("deserialize InboxQuery"),
+        ),
+    )
+    .await
+    .expect("inbox ok");
+    let body: Value = resp.0;
+    let items = body["items"].as_array().expect("items array");
+    let lesson = items
+        .iter()
+        .find(|i| i["source"] == "lessons_learned")
+        .expect("应含 lessons_learned item");
+    assert_eq!(
+        lesson["richParams"]["lessonId"],
+        serde_json::json!(lesson_hex),
+        "lessons 收件项应带 richParams.lessonId={lesson_hex}"
+    );
+}
