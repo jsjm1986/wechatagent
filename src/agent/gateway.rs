@@ -2068,6 +2068,95 @@ async fn run_user_operation_gateway_inner(
             }
         }
     }
+    // 名片引荐：辅助模式开启 + AI 输出 namecard_to_send + 准入校验通过 → 入队名片 outbox 条目。
+    // 追加在素材/文本之后 = 先发铺垫话术、后发名片（D5）。错误不阻断已入队的文本。
+    // 名片是主动引荐，不走素材的 requires_principal_approval→escalation 分支（D9 已解耦：
+    // 被推真人 = 台前专属顾问，≠ 幕后 principal_decider）。
+    if media_eligible {
+        if let Some(directive) = final_decision.namecard_to_send.as_ref() {
+            let assist_override = contact
+                .domain_attributes
+                .as_ref()
+                .and_then(|d| d.get_str(crate::models::ASSIST_MODE_OVERRIDE_ATTR).ok());
+            let assist_on = super::referral::assist_mode_active(
+                domain_config.as_ref().and_then(|c| c.assist_mode_enabled),
+                assist_override,
+            );
+            if assist_on {
+                // 准入二次校验：card 必须真实存在 + enabled + approved（防 AI 幻觉 card_id）
+                let card = match ObjectId::parse_str(&directive.card_id) {
+                    Ok(oid) => state
+                        .db
+                        .referral_cards()
+                        .find_one(doc! { "_id": oid }, None)
+                        .await
+                        .ok()
+                        .flatten(),
+                    Err(_) => None,
+                };
+                match card {
+                    Some(c) if super::referral::validate_card_sendable(&c) => {
+                        let namecard_source_event_id = match &trigger {
+                            AgentTrigger::Inbound(msg) => {
+                                msg.message_id.clone().unwrap_or_default()
+                            }
+                            AgentTrigger::FollowUp(task) => {
+                                task.id.map(|id| id.to_hex()).unwrap_or_default()
+                            }
+                        };
+                        let enqueue_req = EnqueueRequest {
+                            workspace_id: contact.workspace_id.clone(),
+                            account_id: contact.account_id.clone(),
+                            contact_wxid: contact.wxid.clone(),
+                            run_id: run_id.clone(),
+                            decision_id: Some(decision_review_id),
+                            source_event_id: format!("{}#namecard", namecard_source_event_id),
+                            source_kind: trigger.kind().to_string(),
+                            content: String::new(),
+                            media_asset_id: None,
+                            referral_card_id: Some(directive.card_id.clone()),
+                            max_attempts: 3,
+                        };
+                        match outbox_enqueue(state, enqueue_req).await {
+                            Ok(EnqueueOutcome::Created { outbox_id, .. }) => {
+                                tracing::info!(%run_id, %outbox_id, contact_wxid = %contact.wxid, card_id = %directive.card_id, "namecard outbox enqueued");
+                            }
+                            Ok(EnqueueOutcome::IdempotentSkip { idempotency_key }) => {
+                                tracing::info!(%run_id, %idempotency_key, card_id = %directive.card_id, "namecard outbox enqueue idempotent skip");
+                            }
+                            Err(err) => {
+                                tracing::error!(?err, %run_id, card_id = %directive.card_id, "namecard outbox enqueue failed");
+                                write_event_for_account(
+                                    state,
+                                    &contact.account_id,
+                                    Some(&contact.wxid),
+                                    "namecard_outbox_enqueue_failed",
+                                    "error",
+                                    "名片入 outbox 失败（文本已照常发出，名片缺失需管理员核对）",
+                                    Some(doc! { "run_id": &run_id, "card_id": &directive.card_id }),
+                                )
+                                .await
+                                .ok();
+                            }
+                        }
+                    }
+                    _ => {
+                        write_event_for_account(
+                            state,
+                            &contact.account_id,
+                            Some(&contact.wxid),
+                            "referral_card_rejected",
+                            "warning",
+                            "AI 选的名片不存在/未审/已停用，已跳过引荐（防幻觉）",
+                            Some(doc! { "run_id": &run_id, "card_id": &directive.card_id }),
+                        )
+                        .await
+                        .ok();
+                    }
+                }
+            }
+        }
+    }
     // 决策请示触发（统一占位模型）：占位 reply 已入 outbox 正常发给客户，
     // 这里只做不面向客户的副作用——推请示卡给领导 + 落台账 pending。
     // 失败不回滚已发占位、不让 run 失败：仅 warn 降级。
