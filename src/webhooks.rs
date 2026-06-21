@@ -484,25 +484,8 @@ pub async fn wechat_webhook(
     // db/indexes.rs:55-63 的 partial unique index `workspace_id+account_id+dedupe_key`），
     // 让 MongoDB 在写入时原子去重。
     let raw = to_document(&payload).ok();
-    // F1：解析入站消息类型 + 媒体引用，不再写死 None。raw 类型字段优先 GeWe 大写驼峰
-    // `MsgType`（微信数字码），兼容手工/自测 payload 的小写别名；payload 无类型字段时
-    // 默认按 text（runbook W1-W3 等纯文本自测 payload 不带类型字段，行为不变）。
-    let raw_msg_type = find_string(
-        &payload,
-        &[
-            // 小写驼峰（自测/手工）
-            "msgType",
-            "msg_type",
-            "type",
-            // GeWe 大写驼峰（MCP 透传的真实推送）
-            "MsgType",
-            "Type",
-        ],
-    );
-    let msg_type = match raw_msg_type.as_deref() {
-        Some(raw_type) => classify_inbound_msg_type(raw_type),
-        None => "text",
-    };
+    // F1：解析入站消息类型 + 媒体引用，不再写死 None。
+    let msg_type = parse_inbound_msg_type(&payload);
     let media_ref = extract_inbound_media_ref(&payload, msg_type);
     let inbound = ConversationMessage {
         id: None,
@@ -872,6 +855,24 @@ fn value_to_string(value: &Value) -> Option<String> {
     }
 }
 
+/// F1 评审 I1：从入站 payload 解析归一化的消息类型。候选键**仅限“消息类型”语义
+/// 专用键**——GeWe 大写驼峰 `MsgType`（微信数字码真实字段）+ 手工/自测 payload 的
+/// 小写别名 `msgType`/`msg_type`。**刻意不收泛化裸键 `type`/`Type`**：`find_string`
+/// 深度递归整棵 JSON（含 `_mcp` envelope 及任意嵌套对象），而 webhook envelope 里
+/// 与消息类型无关的 `{"type":"event",...}` 极常见，泛化键会被误命中、把本应默认
+/// `text` 的纯文本消息误标为非文本，破坏 text 主链路。真实字段就是 `MsgType`，删掉
+/// `type`/`Type` 既消除误伤面又不漏真实字段。
+///
+/// payload 无任何类型字段时默认 `"text"`（runbook W1-W3 等纯文本自测 payload 不带
+/// 类型字段，行为不变）；有则交给 `classify_inbound_msg_type` 归一（未知码 → `"unknown"`）。
+fn parse_inbound_msg_type(payload: &Value) -> &'static str {
+    let raw_msg_type = find_string(payload, &["msgType", "msg_type", "MsgType"]);
+    match raw_msg_type.as_deref() {
+        Some(raw_type) => classify_inbound_msg_type(raw_type),
+        None => "text",
+    }
+}
+
 /// 把 webhook payload 里的原始消息类型（GeWe 透传的微信 `MsgType` 数字码，或
 /// 手工/自测 payload 的字符串别名）归一化为稳定的 `msg_type` 字符串。F1 地基：
 /// 让非文本入站可被识别（图片/语音/视频/名片/链接卡片等），不再被当空文本硬答。
@@ -1210,6 +1211,42 @@ mod inbound_msg_type_tests {
         // 非文本但 payload 无任何已知媒体引用字段 → None（不造假）
         let payload = json!({ "fromWxid": "wx1", "content": "" });
         assert_eq!(extract_inbound_media_ref(&payload, "image"), None);
+    }
+
+    #[test]
+    fn parse_inbound_msg_type_uses_dedicated_keys() {
+        // a. 专用键正常生效（回归不破）：顶层 MsgType 数字码 + 小写别名
+        assert_eq!(parse_inbound_msg_type(&json!({ "MsgType": "3" })), "image");
+        assert_eq!(parse_inbound_msg_type(&json!({ "msgType": "voice" })), "voice");
+        assert_eq!(parse_inbound_msg_type(&json!({ "msg_type": "43" })), "video");
+    }
+
+    #[test]
+    fn parse_inbound_msg_type_ignores_unrelated_nested_type_fields() {
+        // b. 核心回归（I1）：payload 无任何类型字段，但嵌套对象带与消息类型无关的
+        // type/Type（webhook envelope 极常见，如 {"type":"event"}）。泛化键已删，
+        // find_string 深度递归不再误命中 → 仍按 text 处理，text 主链路一字不变。
+        let payload = json!({
+            "fromWxid": "wx1",
+            "content": "你好，在吗",
+            "_mcp": { "type": "event", "meta": { "Type": "callback" } },
+        });
+        assert_eq!(parse_inbound_msg_type(&payload), "text");
+
+        // 顶层直接带无关 type 也不被误命中
+        let payload2 = json!({ "type": "event", "content": "纯文本" });
+        assert_eq!(parse_inbound_msg_type(&payload2), "text");
+    }
+
+    #[test]
+    fn parse_inbound_msg_type_defaults_text_for_plain_payload() {
+        // c. 仿 runbook 自测纯文本 payload（不带任何类型字段）→ text（主链路不变）
+        let payload = json!({
+            "appId": "wx_app_1",
+            "fromWxid": "wxid_customer",
+            "content": "我想了解一下你们的产品",
+        });
+        assert_eq!(parse_inbound_msg_type(&payload), "text");
     }
 }
 
