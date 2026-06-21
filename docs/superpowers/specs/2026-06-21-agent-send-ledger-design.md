@@ -142,19 +142,40 @@ GET /api/send-ledger/overview
 
 ## 6. 前端
 
-遵循 `docs/frontend-design-system.md` 企业白色基调。**1 个新频道 + 1 处嵌入 + 1 处后端机制**。
+**1 个新频道 + 1 处嵌入 + 1 处后端机制**。
 
-1. **新增「发送成效」频道**（`features/send-analytics/`，`channels.ts` 加一项，归"系统"组，对齐现有"运营成效/quality"定位）：
-   - 顶部总览卡：总主动发送数、整体响应率、阶段推进率
-   - 两个 tab：**素材效果** / **名片效果**
-   - 每 tab 一张排行榜表：target_title · 已发次数 · 覆盖客户数 · 响应率 · 阶段推进率，按发送次数倒序
-   - 是运营/老板看"哪份素材有效、哪位顾问引荐转化好"的主场
+### 6.0 设计语言约束（硬要求，不得另起炉灶）
 
-2. **单客户发送历史** — 嵌用户运营的客户对话/画像页：一个"AI 已发送"只读小面板，列出发过哪些素材/引荐过哪些顾问 + 时间 + 是否响应。补齐现状素材侧零可见性。属于"理解这个客户"的纵向上下文，留客户页内。
+新增前端必须严格遵循现有设计系统 `docs/frontend-design-system.md`，与最新同类页（`features/referral-cards/`、`features/content-assets/`）**视觉与代码风格一致**。具体落地锚点：
 
-3. **prompt 历史注入**（后端机制，无 UI）：在 `decision.rs` 组装 prompt 处，查该客户近期 ledger 渲染"已发过的素材/已引荐的顾问 + 时间"注入候选清单上下文，支撑防重发软约束（缺口 5）。素材侧此前完全没有，本设计补齐；名片侧已有 `AlreadyReferred`，统一改从 ledger 取（单一事实源）。
+- **白色企业控制台基调**：实色白卡（`var(--surface-card)`）、冷灰工作区、石墨字、单一蓝（`--accent`/`--color-brand`）作主操作色、克制的青色（`--ai`）作 AI 状态色。无暗色导航、无装饰性渐变、无霓虹/科幻效果、无大面积着色背景。
+- **CSS Modules + tokens 变量**：新建 `SendAnalytics.module.css`，**禁止硬编码色值/间距**，全部走 `tokens.css` / `styles.css` 既有变量（`--r-lg`/`--r-md`/`--hairline`/`--ink-1..3`/`--surface-card`/`--fill-brand`/`--page-x`/`--row-h` 等）。控件（button/select）全量重置，规避全局裸控件规则污染——直接参照 `ReferralCards.module.css` 顶部注释的同款做法。
+- **四级层级**：app shell → 频道头（标题 + eyebrow + 图标，复用 `.head/.headL/.eyebrow/.title/.headIcon` 模式）→ 面板/总览卡 → 表格行。**不嵌套卡片**、**不加第三级持久导航**。
+- **面板=一个操作职责**；**表格不套额外卡片**（设计系统明令 "Do not wrap tables in extra cards"）；行高走 `--row-h`，长文本截断/换行。
+- **排行榜用表格**而非卡片网格（表格是 logs/status/排行的既定载体）。
+- **字号**：页标题 28-40px、面板标题 18px（实现取 15px 对齐现有 `.title`）、表格/正文 13px、元数据 10.5-12px；普通文本 letter-spacing 0。
+- **响应式**：≤1080px 双栏塌单栏（参照 `.workbench` 的 `@media`），≤860px 频道导航横向滚动。
+- **AI 表达只通过状态语言与精确系统行为**（如响应率/推进率的青色状态点），不靠装饰。
+- **中性命名守 no-human-takeover 禁词**（"发送成效/响应率/引荐/已发送"，绝不出现禁词）。
 
-频道接线沿用现有模式（`App.tsx` channel state，无路由库）。命名暂记「发送成效」（caption: Send Analytics）。
+### 6.1 新增「发送成效」频道
+
+`features/send-analytics/`，`channels.ts` 加一项，归"系统"组，对齐现有"运营成效/quality"定位（icon 取 lucide 既有，如 `BarChart3`）：
+
+- 顶部总览卡：总主动发送数、整体响应率、阶段推进率（复用现有 summary card 模式，可点击/传达关键状态）
+- 两个 sub-tab：**素材效果** / **名片效果**（第二级 workflow 状态，不引第三级导航）
+- 每 tab 一张排行榜表：target_title · 已发次数 · 覆盖客户数 · 响应率 · 阶段推进率，按发送次数倒序，行高 `--row-h`、紧凑可扫读
+- 是运营/老板看"哪份素材有效、哪位顾问引荐转化好"的主场
+
+### 6.2 单客户发送历史
+
+嵌用户运营的客户对话/画像页：一个"AI 已发送"只读小面板，列出发过哪些素材/引荐过哪些顾问 + 时间 + 是否响应。补齐现状素材侧零可见性。属于"理解这个客户"的纵向上下文，留客户页内，视觉沿用 user-ops 页既有面板/行样式（`styles.css` 既有类名，不新造风格）。
+
+### 6.3 prompt 历史注入（后端机制，无 UI）
+
+在 `decision.rs` 组装 prompt 处，查该客户近期 ledger 渲染"已发过的素材/已引荐的顾问 + 时间"注入候选清单上下文，支撑防重发软约束（缺口 5）。素材侧此前完全没有，本设计补齐；名片侧已有 `AlreadyReferred`，统一改从 ledger 取（单一事实源）。
+
+频道接线沿用现有模式（`App.tsx` channel state + `channels.ts` 数组 + Shell 查表，无路由库）。命名暂记「发送成效」（caption: Send Analytics）。
 
 ## 7. 测试策略
 
@@ -168,6 +189,7 @@ GET /api/send-ledger/overview
 | 向后兼容 | `AgentSendLedger` roundtrip；转化字段全 None 的条目能反序列化 | lib 单测 |
 | 回填幂等 | 同条目被回扫两次不重复改写（outcome_evaluated_at 非空即跳过） | lib 单测 |
 | 集成（CI / `#[ignore]`） | 发送成功→ledger 落一条；worker tick 回填 responded/stage_advanced；API workspace scope 防 IDOR | testcontainers |
+| 前端 | `npm run build` 通过、无 TS 错误；新页用 CSS Modules + tokens 变量（无硬编码色值）、表格不套卡片、无第三级导航——与 referral-cards/content-assets 视觉一致 | 构建 + 人工对照设计系统清单 |
 
 ## 8. 边界 / 不做（YAGNI）
 
