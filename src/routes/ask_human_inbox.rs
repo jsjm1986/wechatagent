@@ -299,7 +299,7 @@ async fn collect_lessons_learned(
             let created = d.get_datetime("created_at").ok().copied();
             InboxItem {
                 source: "lessons_learned".into(),
-                id,
+                id: id.clone(),
                 title: format!("经验晋升：{kind}"),
                 summary: "AI 总结的经验待人审晋升为案例".into(),
                 severity: "low".into(),
@@ -307,7 +307,7 @@ async fn collect_lessons_learned(
                 age_hours: age_hours_of(created, now_ms),
                 action_kind: "rich".into(),
                 rich_component: Some("lessonsPromote".into()),
-                rich_params: None,
+                rich_params: Some(doc! { "lessonId": id }),
             }
         })
         .collect())
