@@ -209,6 +209,34 @@ pub(super) async fn review_media_asset(
     if res.matched_count == 0 {
         return Err(AppError::NotFound("asset not found".into()));
     }
+    // 缺口 3：审计审核动作（谁把哪份素材改成什么状态）。回查拿 account_id/title。
+    // fail-soft：审计写失败只 warn，不回滚 review（review 已生效=既成事实）。
+    if let Ok(Some(asset)) = state
+        .db
+        .content_assets()
+        .find_one(doc! { "_id": oid, "workspace_id": &admin.current_workspace }, None)
+        .await
+    {
+        let account_id = asset.account_id.clone().unwrap_or_default();
+        let details = doc! {
+            "asset_id": oid.to_hex(),
+            "review_note": payload.note.clone().unwrap_or_default(),
+            "reviewed_by": admin.username.clone(),
+        };
+        if let Err(e) = crate::agent::write_event_for_account(
+            &state,
+            &account_id,
+            None,
+            "media_asset.reviewed",
+            &payload.status,
+            &format!("管理员审核素材：{} → {}", asset.title, payload.status),
+            Some(details),
+        )
+        .await
+        {
+            tracing::warn!("media_asset.reviewed 审计写入失败（不影响审核）: {e}");
+        }
+    }
     Ok(Json(json!({ "ok": true })))
 }
 
