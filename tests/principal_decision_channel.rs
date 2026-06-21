@@ -19,11 +19,14 @@ mod common;
 
 use mongodb::bson::{doc, oid::ObjectId, DateTime, Document};
 use wechatagent::models::{
-    AgentPrincipalEscalation, AgentStatus, Contact, ConversationMessage,
-    OperationKnowledgeChunk, PrincipalDecision, AWAITING_PRINCIPAL_DECISION_ATTR,
-    ESCALATION_CATEGORY_OUT_OF_SCOPE, PRINCIPAL_ESCALATION_STATUS_PENDING,
-    PRINCIPAL_ESCALATION_STATUS_RESOLVED, PRINCIPAL_RELAY_SENTINEL, PRINCIPAL_VERDICT_CONDITIONAL,
+    AgentPrincipalEscalation, AgentStatus, AskHumanPolicy, AskHumanQuietHours, Contact,
+    ConversationMessage, DeciderRef, OperationKnowledgeChunk, PrincipalDecision,
+    AWAITING_PRINCIPAL_DECISION_ATTR, ESCALATION_CATEGORY_OUT_OF_SCOPE,
+    PRINCIPAL_ESCALATION_STATUS_PENDING, PRINCIPAL_ESCALATION_STATUS_RESOLVED,
+    PRINCIPAL_RELAY_SENTINEL, PRINCIPAL_VERDICT_CONDITIONAL,
 };
+use wiremock::matchers::{method, path};
+use wiremock::{Mock, MockServer, ResponseTemplate};
 
 // ───────────────────────────── 测试夹具构造 ─────────────────────────────
 
@@ -93,6 +96,7 @@ fn minimal_pending_escalation(short_code: &str, contact_wxid: &str) -> AgentPrin
         created_at: now,
         updated_at: now,
         resolved_at: None,
+        resolved_via: None,
     }
 }
 
@@ -338,6 +342,238 @@ async fn t_awaiting_marker_set_and_clear_roundtrip() {
         .map(|d| d.contains_key(AWAITING_PRINCIPAL_DECISION_ATTR))
         .unwrap_or(false);
     assert!(!cleared, "等待标记应在 $unset 后消失");
+}
+
+// ─────────── §14.10 超时改派骚扰门 / 非原子修复（#4 #5 #6，#[ignore]，CI 跑） ───────────
+//
+// 这三条覆盖的生产函数（latest_push_ms / touch_escalation_updated_at / reassign_escalation +
+// scan_escalation_timeouts 内的骚扰门接线）都是 pub(crate)，crate 外不可直达。遵循本文件既定
+// 约定（见文件头 §：通过公共表面切片断言而非放开可见性），下列测试一律经**唯一 pub 入口**
+// `scan_escalation_timeouts` 驱动，并用公共 typed accessor 断言台账 DB 终态。
+
+/// 写一行 user_operations domain config，带 ask_human_policy（决策人链 + 可选骚扰门字段）。
+/// 镜像生产 admin `$set` 到 seeded current 行的写法（不另插版本，避 op_domain unique 索引）。
+async fn set_ask_human_policy(app: &common::TestApp, policy: &AskHumanPolicy) {
+    let policy_bson = mongodb::bson::to_bson(policy).expect("serialize ask_human_policy");
+    app.state
+        .db
+        .operation_domain_configs()
+        .update_one(
+            doc! { "workspace_id": "default", "domain": "user_operations", "current_version": true },
+            doc! { "$set": { "askHumanPolicy": policy_bson, "updated_at": DateTime::now() } },
+            None,
+        )
+        .await
+        .expect("set ask_human_policy on seeded domain config");
+}
+
+/// 启 wiremock，POST /mcp 返回 MCP tools/call 成功 envelope（推卡成功路径）。
+async fn start_mcp_mock_success() -> MockServer {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/mcp"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": { "structuredContent": { "newMsgId": "mock_card_msg", "content": [] } }
+        })))
+        .mount(&server)
+        .await;
+    server
+}
+
+/// 启 wiremock，POST /mcp 一律 500（推卡失败路径，验 #6：updated_at 不刷新）。
+async fn start_mcp_mock_failure() -> MockServer {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/mcp"))
+        .respond_with(ResponseTemplate::new(500).set_body_string("simulated mcp failure"))
+        .mount(&server)
+        .await;
+    server
+}
+
+/// 插一条 principal_wxid=`principal`、updated_at=`updated_at` 的 pending 台账。
+async fn insert_pending_with_updated_at(
+    app: &common::TestApp,
+    short_code: &str,
+    principal: &str,
+    updated_at: DateTime,
+) {
+    let mut entry = minimal_pending_escalation(short_code, "cust_timeout");
+    entry.principal_wxid = principal.to_string();
+    entry.created_at = updated_at;
+    entry.updated_at = updated_at;
+    app.state
+        .db
+        .agent_principal_escalations()
+        .insert_one(&entry, None)
+        .await
+        .expect("insert pending escalation");
+}
+
+async fn find_escalation(app: &common::TestApp, short_code: &str) -> AgentPrincipalEscalation {
+    app.state
+        .db
+        .agent_principal_escalations()
+        .find_one(doc! { "short_code": short_code }, None)
+        .await
+        .expect("query escalation")
+        .expect("escalation must exist")
+}
+
+/// §14.10a（#5 + #6 成功路径）：主决策人超时 → 改派下一位 + 推卡成功 → 台账 principal_wxid
+/// 改为下一位，且 updated_at 被刷新（age 自推卡成功起算）。验证超时改派主链路在补了骚扰门
+/// 检查后仍正常工作。
+#[tokio::test]
+#[ignore]
+async fn t_timeout_reassign_pushes_and_touches_updated_at() {
+    let app = common::TestApp::start().await;
+    let mcp = start_mcp_mock_success().await;
+    let state = common::rebuild_app_state_with_mcp_url(&app, mcp.uri());
+
+    // 决策人链 boss → backup，timeout 1h。无骚扰门字段（全 None → 全放行）。
+    set_ask_human_policy(
+        &app,
+        &AskHumanPolicy {
+            decider_chain: vec![
+                DeciderRef { wxid: "boss".into(), display_name: None },
+                DeciderRef { wxid: "backup".into(), display_name: None },
+            ],
+            escalate_safety_guard: true,
+            escalate_unverified_product: true,
+            escalate_ai_policy_hold: false,
+            escalate_stuck: true,
+            dedupe_window_hours: None,
+            daily_push_cap: None,
+            quiet_hours: None,
+            timeout_hours: Some(1.0),
+        },
+    )
+    .await;
+
+    // pending 由 boss 持有，updated_at 在 2 小时前（已超 1h timeout）。
+    let two_hours_ago = DateTime::from_millis(DateTime::now().timestamp_millis() - 2 * 3600 * 1000);
+    insert_pending_with_updated_at(&app, "T10A", "boss", two_hours_ago).await;
+
+    wechatagent::agent::escalation::scan_escalation_timeouts(&state)
+        .await
+        .expect("scan timeouts");
+
+    let after = find_escalation(&app, "T10A").await;
+    assert_eq!(
+        after.principal_wxid, "backup",
+        "超时应改派给链中下一位决策人"
+    );
+    assert!(
+        after.updated_at.timestamp_millis() > two_hours_ago.timestamp_millis(),
+        "推卡成功后 updated_at 应被刷新（age 自推卡成功起算）"
+    );
+}
+
+/// §14.10b（#6 方案A 核心）：改派后推卡 MCP **失败** → updated_at **不刷新**（保持旧值），
+/// 下一 tick age 仍超时可重试。这是非原子修复的命门：旧实现 reassign 立即刷 updated_at 致
+/// age 归零，MCP 失败时备选人整个 timeout 窗收不到通知。
+#[tokio::test]
+#[ignore]
+async fn t_timeout_reassign_push_failure_does_not_touch_updated_at() {
+    let app = common::TestApp::start().await;
+    let mcp = start_mcp_mock_failure().await;
+    let state = common::rebuild_app_state_with_mcp_url(&app, mcp.uri());
+
+    set_ask_human_policy(
+        &app,
+        &AskHumanPolicy {
+            decider_chain: vec![
+                DeciderRef { wxid: "boss".into(), display_name: None },
+                DeciderRef { wxid: "backup".into(), display_name: None },
+            ],
+            escalate_safety_guard: true,
+            escalate_unverified_product: true,
+            escalate_ai_policy_hold: false,
+            escalate_stuck: true,
+            dedupe_window_hours: None,
+            daily_push_cap: None,
+            quiet_hours: None,
+            timeout_hours: Some(1.0),
+        },
+    )
+    .await;
+
+    let two_hours_ago = DateTime::from_millis(DateTime::now().timestamp_millis() - 2 * 3600 * 1000);
+    insert_pending_with_updated_at(&app, "T10B", "boss", two_hours_ago).await;
+
+    wechatagent::agent::escalation::scan_escalation_timeouts(&state)
+        .await
+        .expect("scan timeouts");
+
+    let after = find_escalation(&app, "T10B").await;
+    // 改派本身落库（principal_wxid 已改）——reassign 不依赖 MCP。
+    assert_eq!(after.principal_wxid, "backup", "改派应已落库");
+    // 但推卡失败 → updated_at 必须保持旧值（#6 方案A）。
+    assert_eq!(
+        after.updated_at.timestamp_millis(),
+        two_hours_ago.timestamp_millis(),
+        "推卡失败时 updated_at 不得刷新，否则 age 归零、下一 tick 不再重试改派"
+    );
+}
+
+/// §14.10c（#5 骚扰门接线）：改派目标落在 quiet_hours → scan 跳过本 tick 推卡，
+/// 但改派已落库（principal_wxid 改为下一位），updated_at 不刷新 → 待下一 tick 重试。
+/// 验证超时改派重推卡同样过骚扰门（与首推路径一致），备选决策人不在静默时段被惊扰。
+#[tokio::test]
+#[ignore]
+async fn t_timeout_reassign_blocked_by_quiet_hours_skips_push() {
+    let app = common::TestApp::start().await;
+    // 用 success mock：若 quiet_hours 未拦住，推卡会成功 → updated_at 被刷新；
+    // 拦住则不推 → updated_at 保持旧值。故 updated_at 断言能干净区分两种行为。
+    let mcp = start_mcp_mock_success().await;
+    let state = common::rebuild_app_state_with_mcp_url(&app, mcp.uri());
+
+    // 构造一个**确定性命中当前小时**的静默窗：[now_hour, (now_hour+23)%24)。
+    // in_quiet_hours 对该窗（除「下一小时」外覆盖全部 23 小时）判定当前小时恒为 true，
+    // 与 CI 容器时区无关（tz_offset=0，按 UTC 算）。
+    let now_hour = ((DateTime::now().timestamp_millis() / (3600 * 1000)) % 24) as u8;
+    set_ask_human_policy(
+        &app,
+        &AskHumanPolicy {
+            decider_chain: vec![
+                DeciderRef { wxid: "boss".into(), display_name: None },
+                DeciderRef { wxid: "backup".into(), display_name: None },
+            ],
+            escalate_safety_guard: true,
+            escalate_unverified_product: true,
+            escalate_ai_policy_hold: false,
+            escalate_stuck: true,
+            dedupe_window_hours: None,
+            daily_push_cap: None,
+            quiet_hours: Some(AskHumanQuietHours {
+                start_hour: now_hour,
+                end_hour: (now_hour + 23) % 24,
+                tz_offset_hours: 0,
+            }),
+            timeout_hours: Some(1.0),
+        },
+    )
+    .await;
+
+    let two_hours_ago = DateTime::from_millis(DateTime::now().timestamp_millis() - 2 * 3600 * 1000);
+    insert_pending_with_updated_at(&app, "T10C", "boss", two_hours_ago).await;
+
+    wechatagent::agent::escalation::scan_escalation_timeouts(&state)
+        .await
+        .expect("scan timeouts");
+
+    let after = find_escalation(&app, "T10C").await;
+    assert_eq!(
+        after.principal_wxid, "backup",
+        "改派先于骚扰门发生，principal_wxid 应已改"
+    );
+    assert_eq!(
+        after.updated_at.timestamp_millis(),
+        two_hours_ago.timestamp_millis(),
+        "quiet_hours 命中应跳过推卡且不刷新 updated_at，待下一 tick 重试"
+    );
 }
 
 // ───────────────────── §14 纯函数测试（不标 ignore，本地即跑） ─────────────────────

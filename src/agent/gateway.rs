@@ -518,7 +518,9 @@ pub(crate) async fn trigger_principal_escalation(
     let today =
         escalation::count_pushes_today(state, &contact.workspace_id, &principal_wxid, since_ms)
             .await?;
-    if !escalation::push_allowed(&policy, today, None, now_ms) {
+    let last_push =
+        escalation::latest_push_ms(state, &contact.workspace_id, &principal_wxid).await?;
+    if !escalation::push_allowed(&policy, today, last_push, now_ms) {
         return Ok(()); // 骚扰门关：跳过推卡
     }
     let category = req
