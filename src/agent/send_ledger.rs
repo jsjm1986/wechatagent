@@ -2,7 +2,7 @@
 //! 聚合率计算。写入 / 回扫的 DB 逻辑在 gateway/tasks 调用侧，这里只放可单测的纯逻辑。
 
 use crate::error::AppResult;
-use crate::models::AgentSendLedger;
+use crate::models::{AgentSendLedger, Contact, OutboxEntry};
 use crate::routes::AppState;
 use mongodb::bson::{doc, oid::ObjectId, DateTime, Document};
 
@@ -52,6 +52,45 @@ pub(crate) async fn record_send(state: &AppState, entry: &AgentSendLedger) {
     }
 }
 
+/// 为一条已确认送达的 outbox 条目写台账（素材/名片才记，纯文本不记）。
+/// 实时成功分支与 post-hoc 确认分支（崩溃 reclaim / 超时核对）三处复用，
+/// 避免 send_kind/target_id 分流 + 标题快照 + stage 快照逻辑重复。fail-soft。
+pub(crate) async fn record_send_for_entry(
+    state: &AppState,
+    entry: &OutboxEntry,
+    contact: &Contact,
+    now: DateTime,
+) {
+    let send_kind_target = entry
+        .referral_card_id
+        .as_deref()
+        .map(|id| ("namecard", id))
+        .or_else(|| entry.media_asset_id.as_deref().map(|id| ("media", id)));
+    let Some((send_kind, target_id)) = send_kind_target else {
+        return; // 纯文本发送不记台账
+    };
+    // target_title 冗余快照：回查实体标题，查不到留空（不阻断）。
+    let target_title = lookup_target_title(state, &entry.workspace_id, send_kind, target_id).await;
+    // 发送瞬间客户阶段快照：从 contact.domain_attributes 读 customer_stage。
+    let stage_at_send = contact
+        .domain_attributes
+        .as_ref()
+        .and_then(|d| d.get_str("customer_stage").ok())
+        .map(ToString::to_string);
+    let ledger_row = build_ledger_entry(
+        &entry.workspace_id,
+        &entry.account_id,
+        &entry.contact_wxid,
+        send_kind,
+        target_id,
+        &target_title,
+        &entry.run_id,
+        stage_at_send,
+        now,
+    );
+    record_send(state, &ledger_row).await;
+}
+
 /// 回查发送物标题做冗余快照。查不到/解析失败返空串（不阻断写台账）。
 pub(crate) async fn lookup_target_title(
     state: &AppState,
@@ -85,13 +124,10 @@ pub(crate) async fn lookup_target_title(
     }
 }
 
-/// 任一入站时间戳落在 (sent_at, sent_at + window_hours] 内 → 已响应。
-/// 早于/等于发送时刻的入站（历史消息）不算。
-pub(crate) fn responded_within_window(sent_at_ms: i64, window_hours: i32, inbound_ms: &[i64]) -> bool {
-    let window_end = sent_at_ms + (window_hours.max(0) as i64) * 3_600_000;
-    inbound_ms
-        .iter()
-        .any(|&ms| ms > sent_at_ms && ms <= window_end)
+/// 响应窗口结束时刻：sent_at + window_hours（负值钳到 sent_at）。
+/// 抽出供回扫 scan 与潜在调用方共用，保护这处时间算式的边界语义。
+pub(crate) fn response_window_end_ms(sent_at_ms: i64, window_hours: i32) -> i64 {
+    sent_at_ms + (window_hours.max(0) as i64) * 3_600_000
 }
 
 /// 当前阶段在 ordered_stages 里严格靠后于发送时阶段 → 推进。
@@ -165,7 +201,7 @@ pub(crate) async fn scan_send_ledger_outcomes(state: &AppState) -> AppResult<usi
         let Some(row_id) = row.id else { continue };
         let window_hours = row.response_window_hours.unwrap_or(default_window_hours);
         let sent_ms = row.sent_at.timestamp_millis();
-        let window_end_ms = sent_ms + (window_hours.max(0) as i64) * 3_600_000;
+        let window_end_ms = response_window_end_ms(sent_ms, window_hours);
         // 窗口未过 → 跳过本轮（下个 tick 再看）。
         if now_ms < window_end_ms {
             continue;
@@ -305,32 +341,18 @@ mod tests {
     const HOUR_MS: i64 = 3_600_000;
 
     #[test]
-    fn responded_true_when_inbound_in_window() {
+    fn response_window_end_basic_24h() {
         let sent = 1_000_000_000_000;
-        // 窗口 24h，入站在 sent 后 2h → 命中
-        assert!(responded_within_window(sent, 24, &[sent + 2 * HOUR_MS]));
+        // 窗口 24h → 结束时刻 = sent + 24h
+        assert_eq!(response_window_end_ms(sent, 24), sent + 24 * HOUR_MS);
     }
 
     #[test]
-    fn responded_false_when_inbound_after_window() {
+    fn response_window_end_negative_clamped_to_sent() {
         let sent = 1_000_000_000_000;
-        // 入站在 sent 后 25h，窗口 24h → 不命中
-        assert!(!responded_within_window(sent, 24, &[sent + 25 * HOUR_MS]));
-    }
-
-    #[test]
-    fn responded_false_when_inbound_before_send() {
-        let sent = 1_000_000_000_000;
-        // 入站早于发送（历史消息）→ 不算响应
-        assert!(!responded_within_window(sent, 24, &[sent - HOUR_MS]));
-    }
-
-    #[test]
-    fn responded_false_when_no_inbound() {
-        assert!(!responded_within_window(1_000_000_000_000, 24, &[]));
-    }
-
-    #[test]
+        // 负窗口钳到 0 → 结束时刻 = sent（无窗口）
+        assert_eq!(response_window_end_ms(sent, -5), sent);
+    }    #[test]
     fn stage_advanced_true_when_moves_forward() {
         let order = vec!["new_contact".to_string(), "意向".to_string(), "待成交".to_string()];
         assert!(stage_advanced(Some("意向"), Some("待成交"), &order));

@@ -245,11 +245,13 @@ pub(super) async fn ensure_all(db: &Database) -> anyhow::Result<()> {
             None,
         )
         .await?;
-    // 主动发送台账：回扫待处理（找 outcome_evaluated_at 缺失的条目）。
+    // 主动发送台账：回扫服务索引。匹配 scan 查询形状
+    // （filter { outcome_evaluated_at: { $exists: false } } + sort { sent_at: 1 }，
+    // 全局扫不带 workspace_id），前缀 outcome_evaluated_at 命中过滤、sent_at 命中排序。
     db.agent_send_ledger()
         .create_index(
             IndexModel::builder()
-                .keys(doc! { "workspace_id": 1, "outcome_evaluated_at": 1 })
+                .keys(doc! { "outcome_evaluated_at": 1, "sent_at": 1 })
                 .build(),
             None,
         )
