@@ -549,6 +549,7 @@ pub fn default_domain_configs(workspace_id: &str) -> Vec<OperationDomainConfig> 
             principal_decider: None,
             high_risk_escalation_mode: None,
             ask_human_policy: None,
+            assist_mode_enabled: None,
         },
         OperationDomainConfig {
             id: None,
@@ -581,6 +582,7 @@ pub fn default_domain_configs(workspace_id: &str) -> Vec<OperationDomainConfig> 
             principal_decider: None,
             high_risk_escalation_mode: None,
             ask_human_policy: None,
+            assist_mode_enabled: None,
         },
         OperationDomainConfig {
             id: None,
@@ -611,6 +613,7 @@ pub fn default_domain_configs(workspace_id: &str) -> Vec<OperationDomainConfig> 
             principal_decider: None,
             high_risk_escalation_mode: None,
             ask_human_policy: None,
+            assist_mode_enabled: None,
         },
     ]
 }

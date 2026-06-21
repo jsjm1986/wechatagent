@@ -641,6 +641,7 @@ mod cross_domain_state_machine_tests {
             principal_decider: None,
             high_risk_escalation_mode: None,
             ask_human_policy: None,
+            assist_mode_enabled: None,
         }
     }
 
