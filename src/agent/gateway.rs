@@ -1542,6 +1542,36 @@ async fn run_user_operation_gateway_inner(
         {
             tracing::warn!(error = %e, contact = %contact.wxid, "hold→升级请示失败（不阻断 run）");
         }
+
+        // ⑨ 产品宣称被拦 → 写 recall_miss 知识缺口信号（收件箱可见，闭环不再纯人工）。
+        //
+        // R5.4 硬闸只发了瞬时 `product_claim_blocked` 事件（details 仅 used_knowledge_ids），
+        // 运营无法据此知道「缺什么、补什么」。这里把客户当前问句（inbound.content）落成一条
+        // recall_miss 缺口信号——统一收件箱已展示 source=gap_signal，运营据 search_queries
+        // 里的客户问句对话式补录 / verify 相关知识。
+        //
+        // fail-soft：gap_signal 写失败只记 warn、不阻断 run（回复路径已决，与上方
+        // escalate_held / `agent.dimension_dropped` 的 let _ 同纪律）。落点选在此 async
+        // 上游而非 finalize_review_for_send 内——后者是纯同步 finalize 逻辑、不持有 db。
+        if matches!(finalize_status, GatewayStatusFinal::BlockedUnverifiedProductClaim) {
+            let candidate =
+                crate::knowledge_wiki::gap_signals::GapSignalCandidate::recall_miss_from_product_block(
+                    inbound.content.clone(),
+                );
+            if let Err(e) = crate::knowledge_wiki::gap_signals::persist_recall_signal(
+                &state.db,
+                &contact.workspace_id,
+                candidate,
+            )
+            .await
+            {
+                tracing::warn!(
+                    error = %e,
+                    contact = %contact.wxid,
+                    "产品宣称被拦写 recall_miss 缺口信号失败（不阻断 run）"
+                );
+            }
+        }
         return Ok(());
     }
 
