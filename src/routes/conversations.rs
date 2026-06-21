@@ -42,6 +42,8 @@ pub(super) async fn list_messages(
             "direction": message.direction,
             "content": message.content,
             "messageId": message.message_id,
+            "msgType": message.msg_type,
+            "mediaRef": message.media_ref,
             "createdAt": crate::models::dt_to_string(message.created_at)
         }));
     }
