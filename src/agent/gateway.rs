@@ -524,6 +524,10 @@ pub(crate) async fn trigger_principal_escalation(
         .category
         .clone()
         .unwrap_or_else(|| crate::models::ESCALATION_CATEGORY_OUT_OF_SCOPE.to_string());
+    // escalate_stuck=false → 本 workspace 关闭"卡死"类请示（默认 true 字节等价）。
+    if escalation::stuck_suppressed(&category, &policy) {
+        return Ok(());
+    }
     // 去重：同客户同类别已有 pending → 不重复推卡。
     if escalation::has_pending_for_contact(state, &contact.workspace_id, &contact.wxid, &category)
         .await?

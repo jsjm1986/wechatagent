@@ -266,6 +266,16 @@ pub(crate) fn should_escalate_held(
     }
 }
 
+/// STUCK（卡死/未送达）类请示是否被本 workspace 的 escalate_stuck 开关压制。
+/// 纯函数：仅对 STUCK 类生效，escalate_stuck=false 时压制；其它类别一律不压制。
+/// 默认 escalate_stuck=true（policy.rs None-path + AskHumanPolicy）→ 字节等价放行。
+pub(crate) fn stuck_suppressed(
+    category: &str,
+    policy: &crate::agent::escalation::ResolvedAskHumanPolicy,
+) -> bool {
+    category == crate::models::ESCALATION_CATEGORY_STUCK && !policy.escalate_stuck
+}
+
 /// 判断 mongodb 错误是否为唯一键冲突（短码碰撞）。
 pub(crate) fn is_duplicate_key_error(e: &mongodb::error::Error) -> bool {
     matches!(
@@ -662,6 +672,29 @@ mod tests {
             quiet_hours: None,
             timeout_hours: None,
         }
+    }
+
+    #[test]
+    fn stuck_suppressed_only_gates_stuck_category() {
+        let mut policy = policy_with(false);
+        // STUCK + escalate_stuck=false → 压制。
+        policy.escalate_stuck = false;
+        assert!(stuck_suppressed(
+            crate::models::ESCALATION_CATEGORY_STUCK,
+            &policy
+        ));
+        // STUCK + escalate_stuck=true → 不压制（默认字节等价）。
+        policy.escalate_stuck = true;
+        assert!(!stuck_suppressed(
+            crate::models::ESCALATION_CATEGORY_STUCK,
+            &policy
+        ));
+        // 其它类别（out_of_scope）即便 escalate_stuck=false 也绝不压制。
+        policy.escalate_stuck = false;
+        assert!(!stuck_suppressed(
+            crate::models::ESCALATION_CATEGORY_OUT_OF_SCOPE,
+            &policy
+        ));
     }
 
     fn traj_entry(intent: &str) -> crate::models::IntentTrajectoryEntry {
