@@ -91,7 +91,8 @@ export function domainPayload(draft: OperationDomainDraft) {
     automationPolicy: draft.automationPolicy,
     reviewPolicy: draft.reviewPolicy,
     runtimeParameters: runtimeParametersFromText(draft.runtimeParameters),
-    stateMachine: jsonFromText(draft.stateMachine)
+    stateMachine: jsonFromText(draft.stateMachine),
+    assistModeEnabled: draft.assistModeEnabled
   };
 }
 
@@ -109,6 +110,7 @@ export function domainDraftFromConfig(config: OperationDomainConfig): OperationD
     automationPolicy: config.automationPolicy,
     reviewPolicy: config.reviewPolicy,
     runtimeParameters: runtimeParametersText(config.runtimeParameters),
-    stateMachine: jsonText(config.stateMachine)
+    stateMachine: jsonText(config.stateMachine),
+    assistModeEnabled: config.assistModeEnabled ?? false
   };
 }

@@ -8,6 +8,7 @@ export type Channel =
   | "groupOps"
   | "momentOps"
   | "content"
+  | "referralCards"
   | "systemStrategy"
   | "operations"
   | "autonomy"
@@ -92,8 +93,34 @@ export type Message = {
   direction: "inbound" | "outbound";
   content: string;
   createdAt?: string;
-  msgType?: "text" | "media";
+  /** 出站消息类型："text"(默认/缺省) | "media" | "namecard"。
+   *  对齐后端 ConversationMessage.msg_type（list_messages 以 camelCase 序列化）。 */
+  msgType?: string;
+  /** 媒体/名片消息引用的资源 id（media=content_assets._id，namecard=referral_cards._id）。 */
   mediaRef?: string;
+};
+
+/** 专属顾问名片：对齐后端 ReferralCard 的 list 序列化（camelCase）。 */
+export type ReferralCard = {
+  id: string;
+  workspaceId: string;
+  accountId?: string | null;
+  targetWxid: string;
+  displayName: string;
+  sendTriggerHint: string;
+  targetStages: string[];
+  enabled: boolean;
+  reviewStatus: "draft" | "approved";
+  reviewNote?: string | null;
+  createdAt?: string;
+  updatedAt?: string;
+};
+
+export type ReferralCardDraft = {
+  displayName: string;
+  targetWxid: string;
+  sendTriggerHint: string;
+  targetStages: string;
 };
 
 export type EventItem = {
@@ -381,6 +408,7 @@ export type OperationDomainConfig = {
   reviewPolicy: string;
   runtimeParameters: Record<string, unknown>;
   stateMachine: Record<string, unknown>;
+  assistModeEnabled?: boolean | null;
   status: string;
   updatedAt?: string;
   version?: number;
@@ -399,6 +427,7 @@ export type OperationDomainDraft = {
   reviewPolicy: string;
   runtimeParameters: string;
   stateMachine: string;
+  assistModeEnabled: boolean;
 };
 
 // ── DomainProfile（行业配置）────────────────────────────────────────────────

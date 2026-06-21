@@ -46,6 +46,7 @@ mod tool_loop;
 pub(crate) mod outbox;
 pub(crate) mod outbox_dispatcher;
 mod reaction;
+mod referral;
 mod review;
 pub(crate) mod runtime;
 pub mod run_envelope;
@@ -598,6 +599,7 @@ mod tests {
             principal_decider: None,
             high_risk_escalation_mode: None,
             ask_human_policy: None,
+            assist_mode_enabled: None,
         };
         let mut decision = AgentDecision {
             operation_state: Some("需求探索".to_string()),
@@ -811,6 +813,7 @@ mod tests {
             principal_decider: None,
             high_risk_escalation_mode: None,
             ask_human_policy: None,
+            assist_mode_enabled: None,
         }
     }
 

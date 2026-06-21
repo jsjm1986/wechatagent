@@ -283,6 +283,7 @@ mod tests {
             content_hash: "abc".to_string(),
             idempotency_key: "key-1".to_string(),
             media_asset_id: None,
+            referral_card_id: None,
             attempt: 0,
             max_attempts: 3,
             status: status.to_string(),
