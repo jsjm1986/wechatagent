@@ -5,6 +5,9 @@ import { api } from "../../lib/api";
 import { useUiStore } from "../../stores/uiStore";
 import { useStrategyStore } from "../../stores/strategyStore";
 import type { AgentSoul, PromptTemplate, PromptTemplateDraft, DomainProfile, DomainProfileDraft } from "../../types";
+import { ProfilePublishCard } from "../../components/review/ProfilePublishCard";
+import { ConfirmProvider } from "../../components/ui/ConfirmDialog";
+import { ToastProvider } from "../../components/ui/Toast";
 import styles from "./SystemStrategy.module.css";
 
 // 系统策略频道：全局总控 Prompt（人格/任务）+ 状态机灰度 + 双层标签字典 + 跨用户教训。
@@ -1029,8 +1032,7 @@ function ProfileEditor({
   onChange,
   onSave,
   onDelete,
-  onPublish,
-  onActivate,
+  onRefresh,
   busy,
 }: {
   profile: DomainProfile | null;
@@ -1038,8 +1040,7 @@ function ProfileEditor({
   onChange: (d: DomainProfileDraft) => void;
   onSave: () => void;
   onDelete: () => void;
-  onPublish: (id: string) => void;
-  onActivate: (id: string) => void;
+  onRefresh: () => void;
   busy: boolean;
 }) {
   const update = (patch: Partial<DomainProfileDraft>) => onChange({ ...draft, ...patch });
@@ -1792,26 +1793,7 @@ function ProfileEditor({
         </button>
         {profile && !profile.is_active && (
           <>
-            {!profile.current_version && (
-              <button
-                type="button"
-                className={styles.btnGhost}
-                onClick={() => onPublish(profile.id)}
-                disabled={busy}
-              >
-                发布
-              </button>
-            )}
-            {profile.current_version && (
-              <button
-                type="button"
-                className={styles.btnPrimary}
-                onClick={() => onActivate(profile.id)}
-                disabled={busy}
-              >
-                激活生效
-              </button>
-            )}
+            <ProfilePublishCard profileId={profile.id} onDone={onRefresh} />
             <button
               type="button"
               className={styles.btnGhost}
@@ -1842,9 +1824,6 @@ function DomainProfilePanel({ busy }: { busy: boolean }) {
     newDomainProfileDraft,
     setProfileDraft,
     saveDomainProfile,
-    publishDomainProfile,
-    confirmRiskyActivation,
-    activateDomainProfile,
     deleteDomainProfile,
     generateDomainProfile,
   } = useStrategyStore();
@@ -1862,29 +1841,6 @@ function DomainProfilePanel({ busy }: { busy: boolean }) {
 
   function handleProfileClick(profile: DomainProfile) {
     editDomainProfile(profile);
-  }
-
-  async function handlePublish(id: string) {
-    if (!window.confirm(
-      "确认发布此版本？\n\n普通字段（名称/简介/业务上下文等）发布后即时生效；" +
-      "若改动了高风险开关（人格本体/方法论/风控阈值/自学习极性等），会要求二次确认后才生效。"
-    )) return;
-    const pending = await publishDomainProfile(id);
-    // 危险开关变更：后端落旁路稿未即时生效，二次确认后经 rollout 才生效。
-    if (pending) {
-      const fields = pending.riskyFields.length > 0 ? pending.riskyFields.join("、") : "（未知字段）";
-      if (window.confirm(
-        `本次改动涉及高风险字段：${fields}。\n\n` +
-        "新版本已定稿但尚未生效，当前仍运行旧版本。确认这些改动无误并立即生效？"
-      )) {
-        await confirmRiskyActivation(pending.id);
-      }
-    }
-  }
-
-  async function handleActivate(id: string) {
-    if (!window.confirm("确认激活此行业配置？激活后所有 AI 对话将使用此配置。")) return;
-    await activateDomainProfile(id);
   }
 
   return (
@@ -2036,8 +1992,7 @@ function DomainProfilePanel({ busy }: { busy: boolean }) {
               onDelete={() => {
                 if (editingProfile) void deleteDomainProfile(editingProfile.id);
               }}
-              onPublish={handlePublish}
-              onActivate={handleActivate}
+              onRefresh={() => void loadDomainProfiles()}
               busy={busy}
             />
           ) : (
@@ -2277,6 +2232,18 @@ function LessonsLearnedAdmin({ busy }: { busy: boolean }) {
 }
 
 export default function SystemStrategyFeature() {
+  // 卡片（ProfilePublishCard 等中立化处置卡）用 useConfirm/useToast，必须有 Provider 祖先，
+  // 否则运行时抛错。原 body 原封不动搬进 SystemStrategyInner，此处只加外层 Provider 包裹。
+  return (
+    <ConfirmProvider>
+      <ToastProvider>
+        <SystemStrategyInner />
+      </ToastProvider>
+    </ConfirmProvider>
+  );
+}
+
+function SystemStrategyInner() {
   const busy = useUiStore((s) => s.busy);
   const {
     souls,
