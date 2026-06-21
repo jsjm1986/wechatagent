@@ -314,6 +314,45 @@ pub(crate) async fn decide_reply_with_promote(
         current_customer_stage.as_deref(),
     );
     let sendable_candidates_text = super::media_send::render_candidate_lines(&sendable_candidates);
+    // referral-card Task 8：名片引荐——仅辅助模式开启才加载/过滤/渲染候选名片注入
+    // prompt（默认关 = 空串，对现有全自治账号 prompt 仅多一个空段，字节近等价）。
+    // 辅助模式判定：客户级 override（domain_attributes）> 账号级 assist_mode_enabled。
+    // best-effort：DB 故障 → 空清单 → 不引荐、不阻塞决策（同 sendable 路径）。
+    let assist_override = contact
+        .domain_attributes
+        .as_ref()
+        .and_then(|d| d.get_str(crate::models::ASSIST_MODE_OVERRIDE_ATTR).ok());
+    let assist_on = super::referral::assist_mode_active(
+        domain_config.and_then(|c| c.assist_mode_enabled),
+        assist_override,
+    );
+    let referral_block = if assist_on {
+        let cards = load_referral_cards(state, &contact.account_id)
+            .await
+            .unwrap_or_default();
+        let candidates = super::referral::filter_referral_candidates(
+            &cards,
+            current_customer_stage.as_deref(),
+        );
+        // 「已引荐」上下文：从已加载名片中按 referred_card_id 反查 display_name，
+        // 给 Reply Agent 防重推依据（找不到对应名片则不展示历史）。
+        let already = contact
+            .domain_attributes
+            .as_ref()
+            .and_then(|d| d.get_str(crate::models::REFERRED_CARD_ID_ATTR).ok())
+            .and_then(|cid| {
+                cards
+                    .iter()
+                    .find(|c| c.id.map(|i| i.to_hex()).as_deref() == Some(cid))
+                    .map(|c| super::referral::AlreadyReferred {
+                        display_name: c.display_name.clone(),
+                        card_id: cid.to_string(),
+                    })
+            });
+        super::referral::render_referral_lines(&candidates, already.as_ref())
+    } else {
+        String::new()
+    };
     // H12：运营方法论本体回落链 = profile.methodology_override(非空白) ?? contact 绑定
     // playbook ?? 内置兜底。DEFAULT_PROFILE 的 methodology_override=None → 走 playbook +
     // 兜底，与改造前逐字等价。methodology_override 为 Some 时整体替换「当前运营方法」段。
@@ -621,6 +660,8 @@ pub(crate) async fn decide_reply_with_promote(
 可引用内容资产:
 {}
 {}
+可引荐的专属顾问:
+{}
 未完成跟进:
 {}
 
@@ -685,6 +726,7 @@ pub(crate) async fn decide_reply_with_promote(
         serde_json::to_string(&contact.profile_attributes).unwrap_or_default(),
         assets,
         sendable_candidates_text,
+        referral_block,
         task_text,
         history,
         crate::agent::prompt_isolation::isolate_untrusted(&inbound.content)
@@ -1079,6 +1121,52 @@ pub(crate) async fn load_sendable_assets(
     Ok(out)
 }
 
+/// referral-card Task 8：名片候选 query 形状（与 [`load_sendable_assets`] 同构）。
+/// 仅取本 workspace、本账号（或账号无关 account_id=null）、enabled 且 approved 的名片。
+pub(crate) fn build_referral_cards_filter(
+    workspace_id: &str,
+    account_id: &str,
+) -> mongodb::bson::Document {
+    use mongodb::bson::doc;
+    doc! {
+        "workspace_id": workspace_id,
+        "$or": [
+            { "account_id": null },
+            { "account_id": account_id }
+        ],
+        "enabled": true,
+        "review_status": "approved",
+    }
+}
+
+/// referral-card Task 8：加载本 workspace + account 下「可引荐名片」（enabled +
+/// approved）。仅在辅助模式开启时调用。best-effort 由调用方处理（DB 故障 → 空清单 →
+/// 不引荐、不阻塞决策，同 load_sendable_assets 路径）。
+pub(crate) async fn load_referral_cards(
+    state: &AppState,
+    account_id: &str,
+) -> AppResult<Vec<crate::models::ReferralCard>> {
+    use futures::TryStreamExt;
+    use mongodb::options::FindOptions;
+    let filter = build_referral_cards_filter(&state.config.default_workspace_id, account_id);
+    let mut cursor = state
+        .db
+        .referral_cards()
+        .find(
+            filter,
+            FindOptions::builder()
+                .sort(mongodb::bson::doc! { "updated_at": -1 })
+                .limit(20)
+                .build(),
+        )
+        .await?;
+    let mut out = Vec::new();
+    while let Some(c) = cursor.try_next().await? {
+        out.push(c);
+    }
+    Ok(out)
+}
+
 pub(crate) async fn load_context_assets(state: &AppState, account_id: &str) -> AppResult<String> {
     use futures::TryStreamExt;
     use mongodb::bson::doc;
@@ -1219,6 +1307,24 @@ mod reaction_hint_loader_tests {
         assert!(hint.contains("user_replied_objection"));
         assert!(hint.contains("user_replied_buying_signal"));
         assert!(hint.contains("摘要=对价格有顾虑"));
+    }
+}
+
+#[cfg(test)]
+mod referral_loader_tests {
+    //! referral-card Task 8：名片候选 query 形状契约。与 reaction_hint / sendable
+    //! 同构——避免 filter 被静默改坏（漏 enabled/approved 闸 → 草稿名片漏到 prompt，
+    //! 或漏 workspace pin → 跨租户名片泄漏）。
+
+    use super::*;
+
+    #[test]
+    fn referral_filter_pins_workspace_account_enabled_approved() {
+        let f = build_referral_cards_filter("ws", "acct");
+        assert_eq!(f.get_str("workspace_id").ok(), Some("ws"));
+        assert_eq!(f.get_bool("enabled").ok(), Some(true));
+        assert_eq!(f.get_str("review_status").ok(), Some("approved"));
+        assert!(f.contains_key("$or"));
     }
 }
 
