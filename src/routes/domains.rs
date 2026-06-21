@@ -76,7 +76,7 @@ pub(super) async fn list_operation_domains(
     Ok(Json(json!({ "items": items })))
 }
 
-pub(super) async fn get_operation_domain(
+pub async fn get_operation_domain(
     State(state): State<AppState>,
     Extension(admin): Extension<AuthenticatedAdmin>,
     Path(domain): Path<String>,
@@ -291,6 +291,7 @@ pub(super) fn operation_domain_json(config: OperationDomainConfig) -> Value {
         "currentVersion": config.current_version,
         "previousVersion": config.previous_version,
         "seededBy": config.seeded_by,
+        "askHumanPolicy": config.ask_human_policy,
     })
 }
 
