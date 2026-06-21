@@ -33,3 +33,43 @@
   color: var(--ink-1); font-size: 13px;
 }
 .input:focus { outline: none; box-shadow: var(--focus-ring); }
+.page { padding: var(--page-y, 24px) var(--page-x, 32px); display: flex; flex-direction: column; gap: var(--section-gap, 18px); }
+.header { display: flex; align-items: center; justify-content: space-between; }
+.title { font-size: 28px; font-weight: 600; color: var(--ink-1); letter-spacing: 0; margin: 0; }
+.saveBtn {
+  height: var(--control-h, 38px); padding: 0 20px; border: none; border-radius: var(--r-sm);
+  background: var(--color-scheduled); color: #fff; font-size: 13px; cursor: pointer;
+}
+.saveBtn:disabled { opacity: .5; cursor: not-allowed; }
+.loadError {
+  padding: 10px 14px; border-radius: var(--r-sm); font-size: 12.5px;
+  color: var(--color-blocked); background: var(--fill-blocked); border: 1px solid var(--hairline);
+}
+.section {
+  display: flex; flex-direction: column; gap: 10px;
+  padding: var(--panel-pad, 18px); border: 1px solid var(--hairline);
+  border-radius: var(--r-lg); background: var(--surface-card);
+}
+.sectionTitle { font-size: 18px; font-weight: 600; color: var(--ink-1); margin: 0; }
+.toggleRow { display: grid; grid-template-columns: auto auto 1fr; align-items: center; gap: 10px; cursor: pointer; }
+.toggleLabel { font-size: 13px; color: var(--ink-1); }
+.toggleHint { font-size: 11.5px; color: var(--ink-3); }
+.fieldRow { display: flex; align-items: center; gap: 8px; }
+.fieldLabel { font-size: 13px; color: var(--ink-2); min-width: 64px; }
+.fieldUnit { font-size: 12px; color: var(--ink-3); }
+.numInput {
+  width: 120px; height: var(--control-h, 38px); padding: 0 12px;
+  border: 1px solid var(--hairline); border-radius: var(--r-sm); background: var(--surface-card);
+  color: var(--ink-1); font-size: 13px;
+}
+.numInput:focus, .numInputSm:focus { outline: none; box-shadow: var(--focus-ring); }
+.numInputSm {
+  width: 64px; height: var(--control-h, 38px); padding: 0 10px;
+  border: 1px solid var(--hairline); border-radius: var(--r-sm); background: var(--surface-card);
+  color: var(--ink-1); font-size: 13px;
+}
+.advanced {
+  padding: var(--panel-pad, 18px); border: 1px solid var(--hairline);
+  border-radius: var(--r-lg); background: var(--surface-card); display: flex; flex-direction: column; gap: 10px;
+}
+.advancedSummary { font-size: 13px; color: var(--ink-2); cursor: pointer; user-select: none; }
