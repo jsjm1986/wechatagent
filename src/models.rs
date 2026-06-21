@@ -3099,6 +3099,10 @@ pub struct AgentPrincipalEscalation {
     /// 是否已据此发过知识缺口提案（防重复）。
     #[serde(default)]
     pub knowledge_proposal_emitted: bool,
+    /// 链尾失联时最近一次给客户发安抚话术的时刻（epoch ms）。去重用：每
+    /// holding_reply_min_interval_hours 最多发一条，防 worker tick 刷屏。`#[serde(default)]` 兼容旧文档。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_holding_reply_ms: Option<i64>,
     pub created_at: DateTime,
     pub updated_at: DateTime,
     #[serde(default, skip_serializing_if = "Option::is_none")]

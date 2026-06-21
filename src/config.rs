@@ -132,6 +132,9 @@ pub struct AppConfig {
     /// Phase D / D3：单 account 当日最多 emit 多少条冷重激活 follow_up；
     /// 与 strategic_planner_daily_emit_cap 解耦，避免拖累常规 follow_up。默认 5。
     pub cold_contact_daily_emit_cap: i64,
+    /// 决策请示通道：领导链尾失联（无更多决策人可改派）时，给客户发 AI 延期安抚
+    /// 话术的最小间隔（小时）。去重用——每 worker tick 都可能命中链尾超时，限频防刷屏。默认 6.0。
+    pub holding_reply_min_interval_hours: f64,
 
     // ── 自学习采集管道（第一阶段）：行为信号 + 沉默删失 + 止血 ──
     //
@@ -529,6 +532,8 @@ impl AppConfig {
             )),
             cold_contact_threshold_hours: env_or("COLD_CONTACT_THRESHOLD_HOURS", "168").parse()?,
             cold_contact_daily_emit_cap: env_or("COLD_CONTACT_DAILY_EMIT_CAP", "5").parse()?,
+            holding_reply_min_interval_hours: env_or("HOLDING_REPLY_MIN_INTERVAL_HOURS", "6.0")
+                .parse()?,
             // ── 自学习采集管道（第一阶段） ──
             silence_signal_worker_enabled: parse_bool(&env_or(
                 "SILENCE_SIGNAL_WORKER_ENABLED",
