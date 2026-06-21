@@ -1,8 +1,8 @@
-// Ask-Human Phase 2 Task 9：单条 lessons-learned「晋升为 peer_case」处置卡（含人工填表单）。
+// Ask-Human Phase 2 Task 9：单条 lessons-learned「晋升为 peer_case」处置卡（含 admin 填写表单）。
 // 源自 system-strategy LessonsLearnedAdmin 的单条晋升内联表单。中立化到 components/review/
 // 后，老页与统一收件箱频道都从这里 import。深链 lessonId 由 Task 1 的 richParams.lessonId 提供。
 //
-// 零跨 feature import：只依赖 react/lib/api/ui Toast。晋升需人工填 title/body（非一键，设计要求）。
+// 零跨 feature import：只依赖 react/lib/api/ui Toast。晋升需 admin 填 title/body（非一键，设计要求）。
 // 晋升产出的 peer_case 是候选 chunk，仍需 admin 在知识审核队列二次 verify（已有后端行为，不改）。
 import { useCallback, useEffect, useState } from "react";
 import { api } from "../../lib/api";
