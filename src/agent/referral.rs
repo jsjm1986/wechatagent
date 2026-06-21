@@ -1,6 +1,10 @@
 //! 专属顾问名片引荐：辅助模式判定、候选过滤/渲染（纯函数）、
 //! send_outbound_namecard、置「已引荐」态。
-use crate::models::ReferralCard;
+use crate::error::{AppError, AppResult};
+use crate::models::{ConversationMessage, MessageDirection, ReferralCard};
+use crate::routes::AppState;
+use mongodb::bson::{doc, oid::ObjectId, to_document, DateTime};
+use serde_json::{json, Value};
 
 /// 辅助模式是否对本客户生效。客户级 override > 账号级 enabled > 默认关。
 pub(crate) fn assist_mode_active(account_enabled: Option<bool>, override_attr: Option<&str>) -> bool {
@@ -63,6 +67,111 @@ pub(crate) fn render_referral_lines(
         None => out.push_str("（本客户引荐历史：尚未引荐）\n"),
     }
     out
+}
+
+/// 置「已引荐」态的 $set 子文档（dotted-key，不覆盖其它 domain_attributes）。
+pub(crate) fn build_referred_set_doc(card_id: &str, now: DateTime) -> mongodb::bson::Document {
+    doc! {
+        format!("domain_attributes.{}", crate::models::REFERRED_SPECIALIST_AT_ATTR): now,
+        format!("domain_attributes.{}", crate::models::REFERRED_CARD_ID_ATTR): card_id,
+        "domain_attributes_updated_at": now,
+        "updated_at": now,
+    }
+}
+
+/// 发送名片给客户。调用方（dispatcher）已确保经 outbox 幂等。
+/// 流程：parse + 查名片 → 准入二次校验（防 AI 幻觉/已撤下名片漏到发送）
+/// → MCP message_send_namecard → 落出站 `ConversationMessage`（msg_type=namecard）
+/// → 置「已引荐」态。
+pub(crate) async fn send_outbound_namecard(
+    state: &AppState,
+    contact: &crate::models::Contact,
+    card_id: &str,
+) -> AppResult<Value> {
+    let oid = ObjectId::parse_str(card_id)
+        .map_err(|_| AppError::External("bad card_id".into()))?;
+    let card = state
+        .db
+        .referral_cards()
+        .find_one(doc! { "_id": oid }, None)
+        .await?
+        .ok_or_else(|| AppError::NotFound("referral card not found".into()))?;
+
+    // 发送前准入二次校验（防 AI 幻觉/已撤下名片一路漏到发送）。
+    if !validate_card_sendable(&card) {
+        return Err(AppError::External(
+            "referral card not sendable (draft/disabled)".into(),
+        ));
+    }
+
+    // ⚠️ MCP message_send_namecard 入参字段名待 server tools/list 确认，此处占位
+    let resp = crate::mcp::logged_call_for_account(
+        state,
+        &contact.account_id,
+        "message_send_namecard",
+        json!({ "recipient": contact.wxid, "targetWxid": card.target_wxid }),
+    )
+    .await?;
+
+    // MCP 已成功 = 名片已送达客户，既成事实。此后落库/置态失败**绝不**返 Err——
+    // 否则 dispatcher 会 retry 重发，客户收到重复名片（与 send_outbound_media 对称）。
+    let message_id = resp
+        .get("newMsgId")
+        .and_then(|v| v.as_str())
+        .map(ToString::to_string);
+    let mut raw = to_document(&resp).unwrap_or_default();
+    raw.insert("referralCardId", card_id);
+    let now = DateTime::now();
+    if let Err(err) = state
+        .db
+        .messages()
+        .insert_one(
+            ConversationMessage {
+                id: None,
+                workspace_id: contact.workspace_id.clone(),
+                account_id: contact.account_id.clone(),
+                contact_wxid: contact.wxid.clone(),
+                message_id,
+                dedupe_key: None,
+                direction: MessageDirection::Outbound,
+                content: card.display_name.clone(),
+                msg_type: Some("namecard".to_string()),
+                media_ref: Some(card_id.to_string()),
+                raw: Some(raw),
+                created_at: now,
+            },
+            None,
+        )
+        .await
+    {
+        tracing::error!(
+            account_id = %contact.account_id,
+            contact_wxid = %contact.wxid,
+            error = %err,
+            "MCP namecard send succeeded but persisting outbound conversation_messages failed; card delivered but record missing",
+        );
+    }
+
+    // 置「已引荐」态。同样：MCP 已成功，update 失败不传播（防重发）。
+    if let Err(err) = state
+        .db
+        .contacts()
+        .update_one(
+            doc! { "_id": contact.id },
+            doc! { "$set": build_referred_set_doc(card_id, now) },
+            None,
+        )
+        .await
+    {
+        tracing::error!(
+            account_id = %contact.account_id,
+            contact_wxid = %contact.wxid,
+            error = %err,
+            "MCP namecard send succeeded but updating referred-state failed; card delivered but state not marked",
+        );
+    }
+
+    Ok(resp)
 }
 
 #[cfg(test)]
@@ -130,5 +239,15 @@ mod tests {
     #[test]
     fn render_empty_candidates_is_empty() {
         assert_eq!(render_referral_lines(&[], None), "");
+    }
+
+    #[test]
+    fn referred_set_doc_has_dotted_keys_and_updated_at() {
+        let now = DateTime::now();
+        let d = build_referred_set_doc("c1", now);
+        assert!(d.contains_key("domain_attributes.referred_specialist_at"));
+        assert!(d.contains_key("domain_attributes.referred_card_id"));
+        assert!(d.contains_key("domain_attributes_updated_at"));
+        assert_eq!(d.get_str("domain_attributes.referred_card_id").ok(), Some("c1"));
     }
 }
