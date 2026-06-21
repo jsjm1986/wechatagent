@@ -40,6 +40,7 @@ mod knowledge_router;
 mod knowledge_tools;
 mod media_send;
 mod memory;
+pub(crate) mod multimodal;
 pub(crate) mod prompt_isolation;
 pub(crate) mod quiet_hours;
 mod tool_loop;

@@ -1054,6 +1054,10 @@ mod tests {
             "add_outcome_event_inner",
             // knowledge.rs：lib 内部复用的导入流水（不绑 HTTP）。
             "ingest_chunked_text",
+            // knowledge/import.rs：F2 抽出的视觉模型选择 + 调用 helper，被图像导入
+            // handler 与运营 Agent 入站图片理解（agent::multimodal）复用，不直接绑 HTTP。
+            "select_vision_provider",
+            "vision_generate_json",
             // knowledge.rs：PDF multipart handler 委托的字节级 helper（集成测试直调）。
             "import_pdf_bytes",
             // knowledge.rs：完整度审计内核 helper，被 get/refresh completeness 两个 handler

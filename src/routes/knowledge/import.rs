@@ -530,104 +530,92 @@ pub struct ImportApplyImageRequest {
 /// 一次性 client 列表（专职视觉模型在前，其余支持视觉的备用模型在后），主模型瞬时
 /// 不可达时依次自动切换到下一候选，全部失败才向上游报错。`String` 是该候选的 model
 /// 名，仅用于切换日志（运行时 DB 值，非源码字面量）。
-enum VisionProvider {
+pub(crate) enum VisionProvider {
     Runtime,
     Dedicated(Vec<(String, crate::llm::LlmClient)>),
 }
 
-pub async fn import_operation_knowledge_apply_image(
-    State(state): State<AppState>,
-    Extension(admin): Extension<AuthenticatedAdmin>,
-    Json(req): Json<ImportApplyImageRequest>,
-) -> AppResult<Json<Value>> {
-    if req.image_base64.trim().is_empty() {
-        return Err(AppError::BadRequest("imageBase64 不能为空".to_string()));
-    }
-    // 1) 解析视觉模型：
-    //    a. 若 active 文字主模型本身 supports_vision → 直接用运行时 state.llm。
-    //    b. 否则收集本 workspace 所有支持视觉的副模型（supports_vision=true），
-    //       专职视觉模型（is_vision_active=true）排在最前，其余按 updated_at 倒序
-    //       作为自动切换备用，构造候选 client 链。
-    //    c. 一条都没有 → 502 visionNotSupported，让运营去模型设置里配视觉模型。
+/// 解析本 workspace 的视觉模型 provider（供知识库导入与运营 Agent 入站图片理解
+/// 复用，避免两处各写一套选择逻辑）：
+/// a. active 文字主模型本身 supports_vision → 直接用运行时 `state.llm`；
+/// b. 否则收集本 workspace 所有 supports_vision 的副模型，专职视觉模型
+///    （is_vision_active）排在最前，其余按 updated_at 倒序作为自动切换备用；
+/// c. 一条都没有 → `visionNotSupported` 错误。
+pub(crate) async fn select_vision_provider(
+    state: &AppState,
+    workspace_id: &str,
+) -> AppResult<VisionProvider> {
     let active = state
         .db
         .llm_provider_configs()
         .find_one(
-            doc! { "workspaceId": &admin.current_workspace, "isActive": true },
+            doc! { "workspaceId": workspace_id, "isActive": true },
             None,
         )
         .await?;
-    let vision_provider: VisionProvider = if active
-        .as_ref()
-        .map(|c| c.supports_vision)
-        .unwrap_or(false)
-    {
+    if active.as_ref().map(|c| c.supports_vision).unwrap_or(false) {
         // active 文字模型即视觉模型：复用运行时 provider（含热切换 / registry 语义）。
-        VisionProvider::Runtime
-    } else {
-        // 收集所有支持视觉的副模型，专职视觉模型在前、其余备用在后，组成切换候选链。
-        // 排序键：is_vision_active 倒序（专职优先），其次 updated_at 倒序（新配置优先）。
-        let cursor = state
-            .db
-            .llm_provider_configs()
-            .find(
-                doc! {
-                    "workspaceId": &admin.current_workspace,
-                    "supportsVision": true,
-                },
-                FindOptions::builder()
-                    .sort(doc! { "isVisionActive": -1, "updatedAt": -1 })
-                    .build(),
-            )
-            .await?;
-        let vision_cfgs: Vec<_> = cursor.try_collect().await?;
-        if vision_cfgs.is_empty() {
-            return Err(AppError::External(
-                "visionNotSupported: 当前文字模型不支持图片，且未在模型设置中指派专职视觉模型".to_string(),
-            ));
-        }
-        let mut candidates = Vec::with_capacity(vision_cfgs.len());
-        for vision_cfg in &vision_cfgs {
-            let fmt = crate::llm::LlmFormat::parse(&vision_cfg.format)?;
-            let client = crate::llm::LlmClient::with_format(
-                vision_cfg.base_url.clone(),
-                vision_cfg.api_key.clone(),
-                vision_cfg.model.clone(),
-                fmt,
-                vision_cfg
-                    .timeout_seconds
-                    .unwrap_or(state.config.llm_timeout_seconds),
-                vision_cfg.max_retries.unwrap_or(state.config.llm_max_retries),
-                vision_cfg
-                    .retry_base_ms
-                    .unwrap_or(state.config.llm_retry_base_ms),
-            )
-            .map_err(|e| AppError::External(format!("构造视觉模型 client 失败: {e}")))?;
-            candidates.push((vision_cfg.model.clone(), client));
-        }
-        VisionProvider::Dedicated(candidates)
-    };
-    // 2) 拼 vision prompt：约束 LLM 输出 JSON {"fence": "..." }，让我们直接走 chunked_text 流程。
-    let mime = req.mime.as_deref().unwrap_or("image/png");
-    let hint = req.hint.as_deref().unwrap_or("无特定领域 hint");
-    let system_prompt = "你是知识库 chunk 抽取助手。任务：把图片中的可读文本结构化为 fence 块。每块前后用 `---CHUNK: <短安全 id，仅字母数字和连字符>---` 与 `---END CHUNK---` 包裹（结束符必须是 `---END CHUNK---`，不要写 `---END---`）。块体必须是单个 JSON 对象，至少含 `title` 字段，且 `body`/`summary`/`answer` 中至少一个非空字符串，例如 {\"title\":\"小节标题\",\"body\":\"完整正文\"}。\n\
-抽取方法（原子信息单元召回，对任何图片一视同仁，不针对特定主题）：\n\
-1. 先把图片内容在脑中拆解为一组**原子信息单元**——每个单元是一条可独立成立、不可再拆的事实/条目/字段/陈述（一行表格、一个标题下的一段说明、一条编号项、一组「字段名:值」都各算一个单元）。\n\
-2. **穷尽枚举**这些单元：逐个落成 chunk，覆盖图中出现的每一个单元，不要只挑你觉得重要的几条；宁可多分几个 chunk，也不要遗漏。划分以图片自身的视觉/语义边界（标题、分栏、表格行、列表项）为准，而不是以任何预设的主题清单为准。\n\
-3. **保留原文 token 粒度**：body 照搬原文的关键表述、专有名词与具体数值（数字、比例、金额、期限、单位、阈值都要原样保留），不要概括、改写或压缩成一句话。\n\
-4. **只抽真实存在的文字**：绝不编造、补全、推断或脑补图中没有的内容；图里没写的就不写，看不清的标注为不确定而非猜测。\n\
-所有 chunk 默认 needs_review，不要写 verified。返回严格 JSON：{\"fence\": <字符串，全部 fence 文本>}。如果图片无文本可抽取，返回 {\"fence\": \"\"}。".to_string();
-    let user_prompt = format!(
-        "请按 fence 格式抽取下面这张图片中的知识 chunk。hint：{hint}"
-    );
-    // 3) 调视觉模型一次：图片以真正的多模态 image_url content block 发送
-    //    （generate_json_with_image），而不是把 base64 当文本塞进 prompt——后者
-    //    会让纯文字模型"看不到"图片。LlmProvider 默认实现对不支持视觉的 provider
-    //    直接报错，这里 VisionProvider 解析阶段已保证选中的是 supports_vision 的模型。
-    let raw_value = match &vision_provider {
+        return Ok(VisionProvider::Runtime);
+    }
+    // 收集所有支持视觉的副模型，专职视觉模型在前、其余备用在后，组成切换候选链。
+    // 排序键：is_vision_active 倒序（专职优先），其次 updated_at 倒序（新配置优先）。
+    let cursor = state
+        .db
+        .llm_provider_configs()
+        .find(
+            doc! {
+                "workspaceId": workspace_id,
+                "supportsVision": true,
+            },
+            FindOptions::builder()
+                .sort(doc! { "isVisionActive": -1, "updatedAt": -1 })
+                .build(),
+        )
+        .await?;
+    let vision_cfgs: Vec<_> = cursor.try_collect().await?;
+    if vision_cfgs.is_empty() {
+        return Err(AppError::External(
+            "visionNotSupported: 当前文字模型不支持图片，且未在模型设置中指派专职视觉模型".to_string(),
+        ));
+    }
+    let mut candidates = Vec::with_capacity(vision_cfgs.len());
+    for vision_cfg in &vision_cfgs {
+        let fmt = crate::llm::LlmFormat::parse(&vision_cfg.format)?;
+        let client = crate::llm::LlmClient::with_format(
+            vision_cfg.base_url.clone(),
+            vision_cfg.api_key.clone(),
+            vision_cfg.model.clone(),
+            fmt,
+            vision_cfg
+                .timeout_seconds
+                .unwrap_or(state.config.llm_timeout_seconds),
+            vision_cfg.max_retries.unwrap_or(state.config.llm_max_retries),
+            vision_cfg
+                .retry_base_ms
+                .unwrap_or(state.config.llm_retry_base_ms),
+        )
+        .map_err(|e| AppError::External(format!("构造视觉模型 client 失败: {e}")))?;
+        candidates.push((vision_cfg.model.clone(), client));
+    }
+    Ok(VisionProvider::Dedicated(candidates))
+}
+
+/// 用已解析的 [`VisionProvider`] 调一次视觉模型，返回结构化 JSON。主视觉模型瞬时
+/// 不可达时在候选链上自动切换到下一备用；非瞬时错误立即失败（换模型也救不了）；
+/// 全部候选都瞬时不可达才上抛最后一个瞬时变体，让上游按瞬时态处理而非当成内容失败。
+/// 供知识库导入与运营 Agent 入站图片理解复用同一条调用/容错逻辑。
+pub(crate) async fn vision_generate_json(
+    provider: &VisionProvider,
+    state: &AppState,
+    system_prompt: &str,
+    user_prompt: &str,
+    image_base64: &str,
+    mime: &str,
+) -> AppResult<Value> {
+    match provider {
         VisionProvider::Runtime => state
             .llm
-            .generate_json_with_image(&system_prompt, &user_prompt, &req.image_base64, mime)
+            .generate_json_with_image(system_prompt, user_prompt, image_base64, mime)
             .await
             .map_err(|e| match e {
                 // 瞬时不可达（429/限流/配额耗尽/网关超时）原样透传结构化变体，
@@ -635,15 +623,12 @@ pub async fn import_operation_knowledge_apply_image(
                 AppError::LlmUnavailable { .. } => e,
                 other => AppError::External(format!("LLM vision 抽取失败: {other}")),
             }),
-        // 候选链：主视觉模型瞬时不可达时自动切到下一备用模型；非瞬时错误立即失败
-        // （内容/请求问题换模型也救不了）；全部候选都瞬时不可达才把最后一个瞬时变体
-        // 上抛，让上游按瞬时态 skip 而非当成内容失败。
         VisionProvider::Dedicated(candidates) => {
             let mut last_transient: Option<AppError> = None;
             let mut result: Option<AppResult<Value>> = None;
             for (idx, (model, client)) in candidates.iter().enumerate() {
                 match client
-                    .generate_json_with_image(&system_prompt, &user_prompt, &req.image_base64, mime)
+                    .generate_json_with_image(system_prompt, user_prompt, image_base64, mime)
                     .await
                 {
                     Ok(v) => {
@@ -651,7 +636,6 @@ pub async fn import_operation_knowledge_apply_image(
                         break;
                     }
                     Err(e @ AppError::LlmUnavailable { .. }) => {
-                        // 当前候选瞬时不可达，记录并切换到下一候选（若有）。
                         if idx + 1 < candidates.len() {
                             tracing::warn!(
                                 model = %model,
@@ -669,7 +653,6 @@ pub async fn import_operation_knowledge_apply_image(
                         last_transient = Some(e);
                     }
                     Err(other) => {
-                        // 非瞬时错误（内容/请求/格式问题）：换模型也无济于事，立即失败。
                         result = Some(Err(AppError::External(format!(
                             "LLM vision 抽取失败: {other}"
                         ))));
@@ -678,14 +661,53 @@ pub async fn import_operation_knowledge_apply_image(
                 }
             }
             result.unwrap_or_else(|| {
-                // 全部候选都瞬时不可达：上抛最后一个瞬时变体，让上游按瞬时态处理。
                 Err(last_transient.unwrap_or_else(|| {
                     AppError::External("LLM vision 抽取失败: 无可用视觉模型候选".to_string())
                 }))
             })
         }
-    };
-    let value = raw_value?;
+    }
+}
+
+pub async fn import_operation_knowledge_apply_image(
+    State(state): State<AppState>,
+    Extension(admin): Extension<AuthenticatedAdmin>,
+    Json(req): Json<ImportApplyImageRequest>,
+) -> AppResult<Json<Value>> {
+    if req.image_base64.trim().is_empty() {
+        return Err(AppError::BadRequest("imageBase64 不能为空".to_string()));
+    }
+    // 1) 解析视觉模型（抽到 select_vision_provider 复用）：
+    //    a. 若 active 文字主模型本身 supports_vision → 直接用运行时 state.llm。
+    //    b. 否则收集本 workspace 所有支持视觉的副模型，专职视觉模型排前、其余备用，构造候选链。
+    //    c. 一条都没有 → 502 visionNotSupported，让运营去模型设置里配视觉模型。
+    let vision_provider = select_vision_provider(&state, &admin.current_workspace).await?;
+    // 2) 拼 vision prompt：约束 LLM 输出 JSON {"fence": "..." }，让我们直接走 chunked_text 流程。
+    let mime = req.mime.as_deref().unwrap_or("image/png");
+    let hint = req.hint.as_deref().unwrap_or("无特定领域 hint");
+    let system_prompt = "你是知识库 chunk 抽取助手。任务：把图片中的可读文本结构化为 fence 块。每块前后用 `---CHUNK: <短安全 id，仅字母数字和连字符>---` 与 `---END CHUNK---` 包裹（结束符必须是 `---END CHUNK---`，不要写 `---END---`）。块体必须是单个 JSON 对象，至少含 `title` 字段，且 `body`/`summary`/`answer` 中至少一个非空字符串，例如 {\"title\":\"小节标题\",\"body\":\"完整正文\"}。\n\
+抽取方法（原子信息单元召回，对任何图片一视同仁，不针对特定主题）：\n\
+1. 先把图片内容在脑中拆解为一组**原子信息单元**——每个单元是一条可独立成立、不可再拆的事实/条目/字段/陈述（一行表格、一个标题下的一段说明、一条编号项、一组「字段名:值」都各算一个单元）。\n\
+2. **穷尽枚举**这些单元：逐个落成 chunk，覆盖图中出现的每一个单元，不要只挑你觉得重要的几条；宁可多分几个 chunk，也不要遗漏。划分以图片自身的视觉/语义边界（标题、分栏、表格行、列表项）为准，而不是以任何预设的主题清单为准。\n\
+3. **保留原文 token 粒度**：body 照搬原文的关键表述、专有名词与具体数值（数字、比例、金额、期限、单位、阈值都要原样保留），不要概括、改写或压缩成一句话。\n\
+4. **只抽真实存在的文字**：绝不编造、补全、推断或脑补图中没有的内容；图里没写的就不写，看不清的标注为不确定而非猜测。\n\
+所有 chunk 默认 needs_review，不要写 verified。返回严格 JSON：{\"fence\": <字符串，全部 fence 文本>}。如果图片无文本可抽取，返回 {\"fence\": \"\"}。".to_string();
+    let user_prompt = format!(
+        "请按 fence 格式抽取下面这张图片中的知识 chunk。hint：{hint}"
+    );
+    // 3) 调视觉模型一次（抽到 vision_generate_json 复用容错/候选切换逻辑）：图片以真正的
+    //    多模态 image_url content block 发送（generate_json_with_image），而不是把 base64 当
+    //    文本塞进 prompt——后者会让纯文字模型"看不到"图片。VisionProvider 解析阶段已保证
+    //    选中的是 supports_vision 的模型。
+    let value = vision_generate_json(
+        &vision_provider,
+        &state,
+        &system_prompt,
+        &user_prompt,
+        &req.image_base64,
+        mime,
+    )
+    .await?;
     let raw = value
         .get("fence")
         .and_then(|v| v.as_str())

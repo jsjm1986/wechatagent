@@ -55,6 +55,7 @@ use super::memory::{
     memory_card_has_signal, next_memory_card_version, schedule_memory_consolidation_task,
     write_memory_candidates,
 };
+use super::multimodal;
 use super::review::{
     decide_revision, derive_revision_failure, effective_review_mode, finalize_review_for_send,
     local_decision_review, review_decision, review_passed, should_run_review, FinalizeOutcome,
@@ -443,6 +444,114 @@ fn trigger_envelope_source(trigger: &AgentTrigger<'_>) -> (String, &'static str)
     }
 }
 
+/// F2（多模态入站地基）：判定本次触发是否为"非文本入站消息"，若是则发过渡话术并
+/// 返回 `Ok(true)`（调用方据此 early-return，**不进决策 Agent**）；否则返回
+/// `Ok(false)` 让主链路照常处理。
+///
+/// 拦截条件（全满足才拦）：
+/// * 触发是 `Inbound`（FollowUp 主动触达没有真实媒体消息，不拦）；
+/// * `msg_type` 存在且既非 `"text"`、`None` 也兼容为文本（旧数据 msg_type 缺失视作文本）；
+/// * 媒体理解链路未接通——当前 [`multimodal::fetch_inbound_media`] 打桩恒 `None`，
+///   故所有非文本消息此刻都走过渡话术（图片下载/语音 ASR 接通后再分流）。
+///
+/// 过渡话术经 outbox 发送（保留幂等键 + 出站记录），尊重 precheck（调用方已在本函数
+/// 前过完 precheck，managed/频控等门都已通过）。绝不硬答空串/原始 XML、绝不 panic。
+async fn maybe_handle_non_text_transition(
+    state: &AppState,
+    contact: &Contact,
+    trigger: &AgentTrigger<'_>,
+    run_id: &str,
+    source_event_id: &str,
+    source_kind: &str,
+) -> AppResult<bool> {
+    let AgentTrigger::Inbound(inbound) = trigger else {
+        return Ok(false);
+    };
+    let msg_type = match inbound.msg_type.as_deref() {
+        // msg_type 缺失（旧数据）视作文本，主链路照常；"text" 显式文本同理。
+        None | Some("text") => return Ok(false),
+        Some(other) if other.trim().is_empty() => return Ok(false),
+        Some(other) => other.to_string(),
+    };
+
+    // 媒体理解链路（下载 → 图片理解 / 语音 ASR）当前打桩未接通：拉取恒 None。
+    // 接通后这里改为对 image 走 describe_inbound_image，其它类型继续过渡话术。
+    let media = if let Some(media_ref) = inbound.media_ref.as_deref() {
+        multimodal::fetch_inbound_media(state, media_ref).await?
+    } else {
+        None
+    };
+    if media.is_some() {
+        // 地基阶段不会到达：fetch_inbound_media 恒 None。接通后在此分流图片理解，
+        // 暂保守地仍走过渡话术（不为"让它跑起来"硬接尚未立项的下游）。
+        tracing::debug!(
+            contact_wxid = %contact.wxid,
+            %msg_type,
+            "F2: 媒体已拉取但理解链路尚未立项，暂走过渡话术兜底"
+        );
+    }
+
+    let reply = multimodal::non_text_transition_reply(&msg_type);
+    let enqueue_req = EnqueueRequest {
+        workspace_id: contact.workspace_id.clone(),
+        account_id: contact.account_id.clone(),
+        contact_wxid: contact.wxid.clone(),
+        run_id: run_id.to_string(),
+        decision_id: None,
+        source_event_id: source_event_id.to_string(),
+        source_kind: source_kind.to_string(),
+        content: reply.clone(),
+        media_asset_id: None,
+        referral_card_id: None,
+        max_attempts: 3,
+    };
+    match outbox_enqueue(state, enqueue_req).await {
+        Ok(EnqueueOutcome::Created { outbox_id, .. }) => {
+            tracing::info!(%run_id, %outbox_id, contact_wxid = %contact.wxid, %msg_type,
+                "F2: 非文本入站过渡话术已入队 outbox");
+        }
+        Ok(EnqueueOutcome::IdempotentSkip { idempotency_key }) => {
+            tracing::info!(%run_id, %idempotency_key, contact_wxid = %contact.wxid, %msg_type,
+                "F2: 非文本入站过渡话术 outbox 幂等 skip");
+        }
+        Err(err) => {
+            tracing::error!(?err, %run_id, "F2: 非文本入站过渡话术 outbox 入队失败");
+            return Err(err.into());
+        }
+    }
+
+    write_event_for_account(
+        state,
+        &contact.account_id,
+        Some(&contact.wxid),
+        "non_text_inbound_transition",
+        "enqueued",
+        "非文本入站消息：理解链路未接通，已发过渡话术请客户文字补充",
+        Some(doc! { "msgType": &msg_type, "runId": run_id }),
+    )
+    .await?;
+
+    write_agent_run_log(
+        state,
+        contact,
+        run_id,
+        trigger.kind(),
+        "outbox_enqueued",
+        &RunPlannerResult::default(),
+        doc! { "refreshed": false, "reason": "non_text_inbound_transition" },
+        &KnowledgeRouteResult::default(),
+        doc! { "msgType": &msg_type, "replyKind": "non_text_transition" },
+        Document::new(),
+        doc! { "gatewayStatus": "outbox_enqueued", "msgType": &msg_type },
+        None,
+        source_event_id,
+        source_kind,
+    )
+    .await?;
+
+    Ok(true)
+}
+
 pub(crate) async fn run_user_operation_gateway(
     state: &AppState,
     contact: Contact,
@@ -728,6 +837,24 @@ async fn run_user_operation_gateway_inner(
             &envelope_source_kind,
         )
         .await?;
+        return Ok(());
+    }
+
+    // F2（多模态入站地基）：非文本入站消息（image/voice/link/miniprogram/file/unknown）
+    // 在进决策 Agent 之前先拦一道——决策链路只会把空串/原始 XML 当文本硬答。媒体
+    // 理解链路当前未接通（fetch_inbound_media 打桩恒 None），故发一条 AI 自治口吻的
+    // 过渡话术请客户文字补充，走 outbox 保留幂等/记录，绝不硬答空串/XML、绝不崩。
+    // text 消息（msg_type=="text" 或 None 兼容旧数据）一字不变继续走主链路。
+    if maybe_handle_non_text_transition(
+        state,
+        &contact,
+        &trigger,
+        &run_id,
+        &envelope_source_event_id,
+        &envelope_source_kind,
+    )
+    .await?
+    {
         return Ok(());
     }
 
