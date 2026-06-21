@@ -333,6 +333,110 @@ jobs:
           if-no-files-found: ignore
           retention-days: 30
 
+  real-llm-smoke-single:
+    name: Real-LLM smoke (真实大模型 / MCP 桩) (手动单跑)
+    runs-on: ubuntu-latest
+    if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.dispatch_target == 'smoke_single' }}
+    continue-on-error: true
+    timeout-minutes: 90
+    env:
+      REAL_LLM_API_KEY: ${{ secrets.RSXERMU_KEY }}
+    steps:
+      - name: Require REAL_LLM_API_KEY (R0.1 缺 key 真 fail，不假绿)
+        if: ${{ env.REAL_LLM_API_KEY == '' }}
+        run: |
+          echo "::error::REAL_LLM_API_KEY 未配置（secrets.RSXERMU_KEY 为空）。real-llm job 必须有 key 才能真跑——缺 key 直接 fail，不静默跳过假绿（R0.1）。"
+          exit 1
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # 同 integration job：清预装 SDK 腾 ~30GB，否则 target + mongo 镜像撑爆磁盘。
+      - name: Free disk space
+        if: ${{ env.REAL_LLM_API_KEY != '' }}
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android \
+            /usr/local/share/boost /usr/local/share/powershell \
+            /usr/lib/jvm "$AGENT_TOOLSDIRECTORY" || true
+          sudo docker image prune --all --force || true
+          df -h
+
+      - name: Install Rust toolchain
+        if: ${{ env.REAL_LLM_API_KEY != '' }}
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry / target
+        if: ${{ env.REAL_LLM_API_KEY != '' }}
+        uses: Swatinem/rust-cache@v2
+
+      # 真实大模型 smoke：T1/T2/T3 默认 #[ignore]，靠 --ignored 触发。
+      # 密钥只走 GitHub Secrets（REAL_LLM_API_KEY），永不进代码/日志；
+      # 端点 / 模型名是非密钥，可硬写。--nocapture 让 eprintln! 的 skip/诊断
+      # 行进 CI 日志。关 -Dwarnings 同 integration job 理由（测试文件陈年
+      # warning 不该阻断真实跑测）。
+      - name: cargo test --test real_llm_smoke -- --ignored --nocapture
+        if: ${{ env.REAL_LLM_API_KEY != '' }}
+        env:
+          RUSTFLAGS: ""
+          # 文本主链路（T1/T2）走 claude-opus-4-8（rsxermu666.cn，Anthropic /v1/messages，非流式）。
+          REAL_LLM_BASE_URL: https://rsxermu666.cn
+          REAL_LLM_MODEL: claude-opus-4-8
+          REAL_LLM_FORMAT: anthropic
+          # vision（T3）：claude 的 Anthropic 图片 block 未实现（generate_json_with_image Anthropic
+          # 分支返 Err），故 vision 走 gpt-5.4（rsxermu OpenAI /v1，多模态 image_url）。端点强制流式
+          # SSE 由 generate_json_once_openai_vision 的聚合兜底处理（0a）。偶发 5xx/524 走 skip 不 fail。
+          REAL_LLM_VISION_API_KEY: ${{ secrets.RSXERMU_KEY }}
+          REAL_LLM_VISION_BASE_URL: https://rsxermu666.cn/v1
+          REAL_LLM_VISION_MODEL: gpt-5.4
+        run: cargo test --no-fail-fast --test real_llm_smoke -- --ignored --nocapture
+
+      # ════════════════════════════════════════════════════════════════════════════
+      # universal-domain-adaptation 3C：DomainProfile 端到端（AI 生成候选 → publish
+      # → activate → 运行时加载）。走 claude-opus-4-8（rsxermu，Anthropic）验证 profile 生成链路。
+      # 与 real_llm_smoke 同 env/key/guard。
+      - name: cargo test --test domain_profile_e2e -- --ignored --nocapture
+        if: ${{ env.REAL_LLM_API_KEY != '' }}
+        env:
+          RUSTFLAGS: ""
+          REAL_LLM_BASE_URL: https://rsxermu666.cn
+          REAL_LLM_MODEL: claude-opus-4-8
+          REAL_LLM_FORMAT: anthropic
+        run: cargo test --test domain_profile_e2e -- --ignored --nocapture
+
+      # 知识库全能力 smoke（real_llm_knowledge.rs K1–K9）：渐进式披露检索
+      # （open_chunk 深检索 / follow_relations 关系跳转 / 无幻觉 / 未审定不上桌）
+      # + 抽取全能力（文章抽取 / 多模态图片抽取 / 自动审定 provenance 闸门 /
+      # AI 修复只产 patch / 标签抽取）。与 T1–T3 同环境，MCP 仍是桩；
+      # 红线：抽取/落库 chunk 恒 draft+needs_review，AI 永不自动 verify。
+      # !cancelled()：本步不依赖前面 real_llm_smoke 步的绿/红。GitHub Actions 默认
+      # 前一步 fail 就跳过后续步（real_llm_smoke 由另一 agent 维护，其偶发失败
+      # 不该把知识库 K1–K9 套件一并跳过，否则知识库永远拿不到真实绿/红体检）。
+      - name: cargo test --test real_llm_knowledge -- --ignored --nocapture
+        if: ${{ !cancelled() && env.REAL_LLM_API_KEY != '' }}
+        env:
+          RUSTFLAGS: ""
+          # 文本知识链路（K1–K5/K7–K11）走 claude-opus-4-8（rsxermu，Anthropic /v1/messages）。
+          REAL_LLM_BASE_URL: https://rsxermu666.cn
+          REAL_LLM_MODEL: claude-opus-4-8
+          REAL_LLM_FORMAT: anthropic
+          # vision（K6）：claude Anthropic 图片 block 未实现，故走 gpt-5.4（rsxermu OpenAI /v1，多模态）。
+          # 端点强制流式 SSE 由 vision 路径聚合兜底（0a）。偶发 5xx/524 走 LlmUnavailable→skip。
+          REAL_LLM_VISION_API_KEY: ${{ secrets.RSXERMU_KEY }}
+          REAL_LLM_VISION_BASE_URL: https://rsxermu666.cn/v1
+          REAL_LLM_VISION_MODEL: gpt-5.4
+          REAL_LLM_LEDGER: target/real_llm_ledger/smoke
+        run: cargo test --no-fail-fast --test real_llm_knowledge -- --ignored --nocapture
+
+      # R0.2：传出 skip ledger（含 unwrap_or_skip_transient! 写的 skip_ledger.jsonl），
+      # 供下游 skip-gate job 汇总校验 skip 率。
+      - name: Upload skip ledger
+        if: ${{ always() && env.REAL_LLM_API_KEY != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: real-llm-skip-ledger-smoke
+          path: target/real_llm_ledger/
+          if-no-files-found: ignore
+          retention-days: 30
+
   # ════════════════════════════════════════════════════════════════════════════
   # 知识库**召回率量化基准**（real_llm_recall_benchmark.rs）——业务闭环核心北极星：
   # 文档抽取入库 → 运营 agent 渐进式披露检索召回 → agent 自然语言维护知识库后召回保持。
@@ -1254,6 +1358,68 @@ jobs:
           if-no-files-found: ignore
           retention-days: 30
 
+  real-llm-autonomy-redline-single:
+    name: Real-LLM autonomy 红线门校准弧 (对话级 LLM 硬门 / 上下文依赖) (手动单跑)
+    runs-on: ubuntu-latest
+    if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.dispatch_target == 'autonomy_redline_single' }}
+    continue-on-error: true
+    timeout-minutes: 90
+    env:
+      REAL_LLM_API_KEY: ${{ secrets.RSXERMU_KEY }}
+    steps:
+      - name: Require REAL_LLM_API_KEY (R0.1 缺 key 真 fail，不假绿)
+        if: ${{ env.REAL_LLM_API_KEY == '' }}
+        run: |
+          echo "::error::REAL_LLM_API_KEY 未配置（secrets.RSXERMU_KEY 为空）。autonomy 红线校准弧必须有 key 才能真跑——缺 key 直接 fail，不静默跳过假绿（R0.1）。"
+          exit 1
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Free disk space
+        if: ${{ env.REAL_LLM_API_KEY != '' }}
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android \
+            /usr/local/share/boost /usr/local/share/powershell \
+            /usr/lib/jvm "$AGENT_TOOLSDIRECTORY" || true
+          sudo docker image prune --all --force || true
+          df -h
+
+      - name: Install Rust toolchain
+        if: ${{ env.REAL_LLM_API_KEY != '' }}
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry / target
+        if: ${{ env.REAL_LLM_API_KEY != '' }}
+        uses: Swatinem/rust-cache@v2
+
+      # 被测 agent = claude-opus-4-8（Anthropic）；裁判 = 跨家族 gpt-5.4（rsxermu OpenAI /v1）。
+      # judges_from_env 读 REAL_LLM_JUDGE_API_KEY/_BASE_URL/_MODEL 装配裁判团；JUDGE_SAMPLES=1
+      # 守端点并发上限 2（run_autonomy_redline_gate 单裁判内全程 K=1，靠跨家族多裁判取 max）。
+      - name: cargo test --test real_llm_autonomy_redline (三金标校准)
+        if: ${{ env.REAL_LLM_API_KEY != '' }}
+        env:
+          RUSTFLAGS: ""
+          REAL_LLM_BASE_URL: https://rsxermu666.cn
+          REAL_LLM_MODEL: claude-opus-4-8
+          REAL_LLM_FORMAT: anthropic
+          REAL_LLM_JUDGE: "1"
+          JUDGE_SAMPLES: "1"
+          REAL_LLM_JUDGE_API_KEY: ${{ secrets.RSXERMU_KEY }}
+          REAL_LLM_JUDGE_BASE_URL: https://rsxermu666.cn/v1
+          REAL_LLM_JUDGE_MODEL: gpt-5.4
+          REAL_LLM_JUDGE_FORMAT: openai
+          REAL_LLM_LEDGER: target/real_llm_ledger/autonomy-redline
+        run: cargo test --no-fail-fast --test real_llm_autonomy_redline -- --ignored --nocapture
+
+      - name: Upload skip ledger
+        if: ${{ always() && env.REAL_LLM_API_KEY != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: real-llm-ledger-autonomy-redline
+          path: target/real_llm_ledger/
+          if-no-files-found: ignore
+          retention-days: 30
+
   # 对话级总评校准弧（real_llm_conversation_judge.rs，阶段3）。
   # 证明对话级裁判按整段轨迹语义判（非单句）：兜圈弧 overall_progress 低 < 推进弧高、
   # 跨轮累积施压弧 pressure_arc 偏高。铁律③：先以人工金标锚定方向,t15/t17 进门才可信。
@@ -1266,6 +1432,68 @@ jobs:
     runs-on: ubuntu-latest
     if: ${{ github.event_name != 'workflow_dispatch' }}
     needs: real-llm-autonomy-redline
+    continue-on-error: true
+    timeout-minutes: 90
+    env:
+      REAL_LLM_API_KEY: ${{ secrets.RSXERMU_KEY }}
+    steps:
+      - name: Require REAL_LLM_API_KEY (R0.1 缺 key 真 fail，不假绿)
+        if: ${{ env.REAL_LLM_API_KEY == '' }}
+        run: |
+          echo "::error::REAL_LLM_API_KEY 未配置（secrets.RSXERMU_KEY 为空）。对话级总评校准弧必须有 key 才能真跑——缺 key 直接 fail，不静默跳过假绿（R0.1）。"
+          exit 1
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Free disk space
+        if: ${{ env.REAL_LLM_API_KEY != '' }}
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android \
+            /usr/local/share/boost /usr/local/share/powershell \
+            /usr/lib/jvm "$AGENT_TOOLSDIRECTORY" || true
+          sudo docker image prune --all --force || true
+          df -h
+
+      - name: Install Rust toolchain
+        if: ${{ env.REAL_LLM_API_KEY != '' }}
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry / target
+        if: ${{ env.REAL_LLM_API_KEY != '' }}
+        uses: Swatinem/rust-cache@v2
+
+      # 被测 agent = claude-opus-4-8；裁判 = 跨家族 gpt-5.4（rsxermu OpenAI /v1）。
+      # judges_from_env 读 REAL_LLM_JUDGE_API_KEY/_BASE_URL/_MODEL；JUDGE_SAMPLES=1 守端点并发
+      # 上限 2（run_conversation_judge 单裁判内全程 K=1，靠跨家族多裁判取 max）。
+      - name: cargo test --test real_llm_conversation_judge (对话级校准)
+        if: ${{ env.REAL_LLM_API_KEY != '' }}
+        env:
+          RUSTFLAGS: ""
+          REAL_LLM_BASE_URL: https://rsxermu666.cn
+          REAL_LLM_MODEL: claude-opus-4-8
+          REAL_LLM_FORMAT: anthropic
+          REAL_LLM_JUDGE: "1"
+          JUDGE_SAMPLES: "1"
+          REAL_LLM_JUDGE_API_KEY: ${{ secrets.RSXERMU_KEY }}
+          REAL_LLM_JUDGE_BASE_URL: https://rsxermu666.cn/v1
+          REAL_LLM_JUDGE_MODEL: gpt-5.4
+          REAL_LLM_JUDGE_FORMAT: openai
+          REAL_LLM_LEDGER: target/real_llm_ledger/conversation-judge
+        run: cargo test --no-fail-fast --test real_llm_conversation_judge -- --ignored --nocapture
+
+      - name: Upload skip ledger
+        if: ${{ always() && env.REAL_LLM_API_KEY != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: real-llm-ledger-conversation-judge
+          path: target/real_llm_ledger/
+          if-no-files-found: ignore
+          retention-days: 30
+
+  real-llm-conversation-judge-single:
+    name: Real-LLM 对话级总评校准弧 (whole-arc / 兜圈vs推进 / 跨轮施压) (手动单跑)
+    runs-on: ubuntu-latest
+    if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.dispatch_target == 'conversation_judge_single' }}
     continue-on-error: true
     timeout-minutes: 90
     env:
@@ -1337,6 +1565,73 @@ jobs:
     runs-on: ubuntu-latest
     if: ${{ github.event_name != 'workflow_dispatch' }}
     needs: real-llm-conversation-judge
+    continue-on-error: true
+    timeout-minutes: 90
+    env:
+      REAL_LLM_API_KEY: ${{ secrets.RSXERMU_KEY }}
+      ROLEPLAYER_API_KEY: ${{ secrets.NVIDIA_KEY }}
+    steps:
+      - name: Require REAL_LLM_API_KEY (R0.1 缺 key 真 fail，不假绿)
+        if: ${{ env.REAL_LLM_API_KEY == '' }}
+        run: |
+          echo "::error::REAL_LLM_API_KEY 未配置（secrets.RSXERMU_KEY 为空）。roleplayer 校准弧的 realism 裁判必须有 key 才能真跑——缺 key 直接 fail，不静默跳过假绿（R0.1）。"
+          exit 1
+      - name: Require ROLEPLAYER_API_KEY (R0.1 缺第三族 key 真 fail，不假绿)
+        if: ${{ env.ROLEPLAYER_API_KEY == '' }}
+        run: |
+          echo "::error::ROLEPLAYER_API_KEY 未配置（secrets.NVIDIA_KEY 为空）。roleplayer 是第三异族（R5.0.1），缺 key 则 J3 校准弧 roleplayer 生成全 fallback=假绿——直接 fail，不静默跳过。"
+          exit 1
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Free disk space
+        if: ${{ env.REAL_LLM_API_KEY != '' && env.ROLEPLAYER_API_KEY != '' }}
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android \
+            /usr/local/share/boost /usr/local/share/powershell \
+            /usr/lib/jvm "$AGENT_TOOLSDIRECTORY" || true
+          sudo docker image prune --all --force || true
+          df -h
+
+      - name: Install Rust toolchain
+        if: ${{ env.REAL_LLM_API_KEY != '' && env.ROLEPLAYER_API_KEY != '' }}
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry / target
+        if: ${{ env.REAL_LLM_API_KEY != '' && env.ROLEPLAYER_API_KEY != '' }}
+        uses: Swatinem/rust-cache@v2
+
+      # 裁判 = gpt-5.4（rsxermu /v1，judges_from_env 读 REAL_LLM_JUDGE_*）；roleplayer = NVIDIA
+      # qwen（ROLEPLAYER_*，异端点不占 rsxermu 并发）。JUDGE_SAMPLES=1 守端点上限 2（realism
+      # 裁判单裁判内 K=1，靠跨裁判 median-of-median）。roleplayer 生成三手法串行不并发。
+      - name: cargo test --test real_llm_roleplayer_calibration (J3 校准)
+        if: ${{ env.REAL_LLM_API_KEY != '' && env.ROLEPLAYER_API_KEY != '' }}
+        env:
+          RUSTFLAGS: ""
+          REAL_LLM_JUDGE: "1"
+          JUDGE_SAMPLES: "1"
+          REAL_LLM_JUDGE_API_KEY: ${{ secrets.RSXERMU_KEY }}
+          REAL_LLM_JUDGE_BASE_URL: https://rsxermu666.cn/v1
+          REAL_LLM_JUDGE_MODEL: gpt-5.4
+          REAL_LLM_JUDGE_FORMAT: openai
+          ROLEPLAYER_BASE_URL: https://integrate.api.nvidia.com/v1
+          ROLEPLAYER_MODEL: qwen/qwen3-next-80b-a3b-instruct
+          REAL_LLM_LEDGER: target/real_llm_ledger/roleplayer-calibration
+        run: cargo test --no-fail-fast --test real_llm_roleplayer_calibration -- --ignored --nocapture
+
+      - name: Upload skip ledger
+        if: ${{ always() && env.REAL_LLM_API_KEY != '' && env.ROLEPLAYER_API_KEY != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: real-llm-ledger-roleplayer-calibration
+          path: target/real_llm_ledger/
+          if-no-files-found: ignore
+          retention-days: 30
+
+  real-llm-roleplayer-calibration-single:
+    name: Real-LLM roleplayer 校准弧 (J3 / realism / 生成vs离谱对照) (手动单跑)
+    runs-on: ubuntu-latest
+    if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.dispatch_target == 'roleplayer_calibration_single' }}
     continue-on-error: true
     timeout-minutes: 90
     env:
