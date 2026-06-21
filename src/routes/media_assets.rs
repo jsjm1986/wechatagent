@@ -9,7 +9,7 @@ use axum::{
     extract::{Multipart, Path, State},
     Extension, Json,
 };
-use mongodb::bson::{doc, oid::ObjectId, DateTime};
+use mongodb::bson::{doc, oid::ObjectId, DateTime, Document};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
@@ -237,6 +237,90 @@ pub async fn review_media_asset(
             tracing::warn!("media_asset.reviewed 审计写入失败（不影响审核）: {e}");
         }
     }
+    Ok(Json(json!({ "ok": true })))
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct UpdateMetaRequest {
+    title: Option<String>,
+    body: Option<String>,
+    tags: Option<Vec<String>>,
+    url: Option<String>,
+    usage_scene: Option<String>,
+    send_trigger_hint: Option<String>,
+    expression_pref: Option<String>,
+    target_stages: Option<Vec<String>>,
+    requires_principal_approval: Option<bool>,
+}
+
+/// PUT /content-assets/:id —— 改元数据（JSON，部分更新）。
+/// 只 $set 客户端提供的字段；不动 file_*/media_id/review_status/sendable。
+/// target_stages 复用簇 B normalize_target_stages 归一，越界 400。
+pub(super) async fn update_content_asset_meta(
+    State(state): State<AppState>,
+    Extension(admin): Extension<AuthenticatedAdmin>,
+    Path(id): Path<String>,
+    Json(payload): Json<UpdateMetaRequest>,
+) -> AppResult<Json<Value>> {
+    let oid = ObjectId::parse_str(&id).map_err(|_| AppError::BadRequest("bad id".into()))?;
+    // 回查 asset（workspace 隔离）拿 account_id 做归一 scope。
+    let asset = state
+        .db
+        .content_assets()
+        .find_one(doc! { "_id": oid, "workspace_id": &admin.current_workspace }, None)
+        .await?
+        .ok_or_else(|| AppError::NotFound("asset not found".into()))?;
+
+    // 部分更新：字段 Some → $set；None（JSON 缺失或 null）→ 不动。
+    // serde 不区分缺失与 null，故不支持显式清成 null；清空走传 ""/[]。
+    let mut set = Document::new();
+    if let Some(v) = payload.title {
+        set.insert("title", v);
+    }
+    if let Some(v) = payload.body {
+        set.insert("body", v);
+    }
+    if let Some(v) = payload.tags {
+        set.insert("tags", v);
+    }
+    if let Some(v) = payload.url {
+        set.insert("url", v);
+    }
+    if let Some(v) = payload.usage_scene {
+        set.insert("usage_scene", v);
+    }
+    if let Some(v) = payload.send_trigger_hint {
+        set.insert("send_trigger_hint", v);
+    }
+    if let Some(v) = payload.expression_pref {
+        set.insert("expression_pref", v);
+    }
+    if let Some(v) = payload.requires_principal_approval {
+        set.insert("requires_principal_approval", v);
+    }
+    if let Some(stages) = payload.target_stages {
+        // 复用簇 B 归一；scope 取被编辑 asset 自身 account_id，缺失走空串。
+        let scope = asset.account_id.as_deref().unwrap_or("");
+        let normalized =
+            crate::agent::dimension_registry::normalize_target_stages(&state.db, scope, &stages)
+                .await
+                .map_err(|reason| {
+                    AppError::BadRequest(format!("target_stages 校验未通过：{reason}"))
+                })?;
+        set.insert("target_stages", normalized);
+    }
+    set.insert("updated_at", DateTime::now());
+
+    state
+        .db
+        .content_assets()
+        .update_one(
+            doc! { "_id": oid, "workspace_id": &admin.current_workspace },
+            doc! { "$set": set },
+            None,
+        )
+        .await?;
     Ok(Json(json!({ "ok": true })))
 }
 
