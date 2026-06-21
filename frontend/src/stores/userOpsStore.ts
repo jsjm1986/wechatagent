@@ -43,6 +43,7 @@ interface UserOpsState {
   searchQuery: string;
   profileNote: string;
   customAgentInstructions: string;
+  assistOverride: string; // "default" | "force_on" | "force_off"
   guideInstruction: string;
   guidePreview: UserOperationGuidePreview | null;
   simulationInput: string;
@@ -72,6 +73,7 @@ interface UserOpsActions {
   setTraditionalOpsTab: (tab: TraditionalOpsTab) => void;
   setProfileNote: (note: string) => void;
   setCustomAgentInstructions: (instructions: string) => void;
+  setAssistOverride: (mode: string) => void;
   setGuideInstruction: (instruction: string) => void;
   setSimulationInput: (input: string) => void;
   setSelectedPlaybookId: (id: string) => void;
@@ -98,6 +100,7 @@ interface UserOpsActions {
   disableAgent: () => Promise<void>;
   saveProfileNote: () => Promise<void>;
   saveCustomAgentInstructions: () => Promise<void>;
+  saveAssistOverride: () => Promise<void>;
   analyzeProfile: () => Promise<void>;
   previewGuideInstruction: (instruction: string) => Promise<void>;
   applyGuidePreview: () => Promise<void>;
@@ -248,6 +251,7 @@ export const useUserOpsStore = create<UserOpsState & UserOpsActions>((set, get) 
 
   profileNote: "",
   customAgentInstructions: "",
+  assistOverride: "default",
   importQuery: "",
   searchQuery: "",
   guideInstruction: "",
@@ -275,6 +279,7 @@ export const useUserOpsStore = create<UserOpsState & UserOpsActions>((set, get) 
   setTraditionalOpsTab: (tab) => set({ traditionalOpsTab: tab }),
   setProfileNote: (note) => set({ profileNote: note }),
   setCustomAgentInstructions: (instructions) => set({ customAgentInstructions: instructions }),
+  setAssistOverride: (mode) => set({ assistOverride: mode }),
   setGuideInstruction: (instruction) => set({ guideInstruction: instruction }),
   setSimulationInput: (input) => set({ simulationInput: input }),
   setSelectedPlaybookId: (id) => set({ selectedPlaybookId: id }),
@@ -293,6 +298,10 @@ export const useUserOpsStore = create<UserOpsState & UserOpsActions>((set, get) 
     set({
       profileNote: contact.humanProfileNote || "",
       customAgentInstructions: contact.customAgentInstructions || "",
+      assistOverride:
+        ((contact.domainAttributes as Record<string, unknown> | undefined)?.[
+          "assist_mode_override"
+        ] as string) || "default",
       selectedPlaybookId: contact.playbookId || "",
       guidePreview: null
     });
@@ -464,6 +473,28 @@ export const useUserOpsStore = create<UserOpsState & UserOpsActions>((set, get) 
     try {
       await api.put(`/api/contacts/${selected.id}/custom-agent-instructions`, {
         customAgentInstructions: customAgentInstructions || undefined
+      });
+      await refreshContacts(currentAccountId);
+    } catch (error) {
+      useUiStore.getState().setError(error instanceof Error ? error.message : String(error));
+    } finally {
+      useUiStore.getState().setBusy(false);
+    }
+  },
+
+  saveAssistOverride: async () => {
+    const selected = useContactStore.getState().selected;
+    const currentAccountId = useAccountStore.getState().currentAccountId();
+    const { assistOverride } = get();
+
+    if (!selected) return;
+
+    useUiStore.getState().setBusy(true);
+    useUiStore.getState().setError("");
+
+    try {
+      await api.put(`/api/contacts/${selected.id}/assist-override`, {
+        mode: assistOverride
       });
       await refreshContacts(currentAccountId);
     } catch (error) {
