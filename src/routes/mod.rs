@@ -387,6 +387,23 @@ pub fn api_router(state: AppState) -> Router<AppState> {
             post(media_assets::review_media_asset),
         )
         .route(
+            "/content-assets/:id",
+            axum::routing::put(media_assets::update_content_asset_meta)
+                .delete(media_assets::delete_content_asset),
+        )
+        .route(
+            "/content-assets/:id/file",
+            post(media_assets::replace_content_asset_file).layer(
+                axum::extract::DefaultBodyLimit::max(
+                    state.config.media_max_file_size_mb as usize * 1024 * 1024,
+                ),
+            ),
+        )
+        .route(
+            "/content-assets/:id/toggle",
+            post(media_assets::toggle_content_asset_sendable),
+        )
+        .route(
             "/referral-cards",
             post(referral_cards::create_referral_card).get(referral_cards::list_referral_cards),
         )

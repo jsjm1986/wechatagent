@@ -95,6 +95,7 @@ pub(super) async fn list_content_assets(
             "expressionPref": asset.expression_pref,
             "requiresPrincipalApproval": asset.requires_principal_approval,
             "reviewStatus": asset.review_status,
+            "sendable": asset.sendable,
             "reviewNote": asset.review_note,
             "updatedAt": crate::models::dt_to_string(asset.updated_at)
         }));
