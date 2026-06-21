@@ -56,6 +56,16 @@ pub(super) async fn create_referral_card(
             "targetWxid and displayName are required".to_string(),
         ));
     }
+    // 缺口 6：归一 target_stages 到 canonical（与 contact.customer_stage 同空间），
+    // 越界即 400。account_id 缺失 → 空串走 global scope。
+    let scope = payload.account_id.as_deref().unwrap_or("");
+    let target_stages = crate::agent::dimension_registry::normalize_target_stages(
+        &state.db,
+        scope,
+        &payload.target_stages,
+    )
+    .await
+    .map_err(|reason| AppError::BadRequest(format!("target_stages 校验未通过：{reason}")))?;
     let card = ReferralCard {
         id: None,
         workspace_id: admin.current_workspace.clone(),
@@ -63,7 +73,7 @@ pub(super) async fn create_referral_card(
         target_wxid: payload.target_wxid,
         display_name: payload.display_name,
         send_trigger_hint: payload.send_trigger_hint,
-        target_stages: payload.target_stages,
+        target_stages,
         // 红线：创建即草稿且禁用，必须管理员审核+启用后 AI 才可引荐。
         enabled: false,
         review_status: "draft".to_string(),
