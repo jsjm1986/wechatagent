@@ -90,10 +90,14 @@ pub(crate) async fn send_outbound_namecard(
 ) -> AppResult<Value> {
     let oid = ObjectId::parse_str(card_id)
         .map_err(|_| AppError::External("bad card_id".into()))?;
+    // 查询带 workspace_id scope（防跨租户读名片，与 send_outbound_media 的 IDOR 防御对齐）。
     let card = state
         .db
         .referral_cards()
-        .find_one(doc! { "_id": oid }, None)
+        .find_one(
+            doc! { "_id": oid, "workspace_id": &contact.workspace_id },
+            None,
+        )
         .await?
         .ok_or_else(|| AppError::NotFound("referral card not found".into()))?;
 

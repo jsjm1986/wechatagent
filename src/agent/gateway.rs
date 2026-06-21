@@ -943,8 +943,13 @@ async fn run_user_operation_gateway_inner(
                 Some(&run_id),
             )
             .await?;
+            let prior_namecard = final_decision.namecard_to_send.clone();
             final_decision = rewritten;
             promote_risks = rewrite_promote_risks;
+            // 名片引荐是业务决策，不应因 tone-polish 改写而丢失：改写若未重新输出引荐则沿用改写前意图
+            if final_decision.namecard_to_send.is_none() {
+                final_decision.namecard_to_send = prior_namecard;
+            }
             normalize_decision_state(&mut final_decision, domain_config.as_ref());
             normalize_decision_runtime(&mut final_decision, &planner);
             final_decision.context_pack_version = Some(next_memory_card_version(&memory));
@@ -1263,8 +1268,13 @@ async fn run_user_operation_gateway_inner(
                     )
                     .await?;
 
+                    let prior_namecard = final_decision.namecard_to_send.clone();
                     final_decision = revised_decision;
                     promote_risks = revised_promote_risks;
+                    // 名片引荐是业务决策，不应因 revision 改写而丢失：改写若未重新输出引荐则沿用改写前意图
+                    if final_decision.namecard_to_send.is_none() {
+                        final_decision.namecard_to_send = prior_namecard;
+                    }
 
                     // 改写后的 decision 可能换了 quoted_product_ids，重算 priced_from_catalog。
                     // G4 #5 收口：同上受 transaction_facts_enabled 闸；闸关恒 false。
@@ -1789,8 +1799,9 @@ async fn run_user_operation_gateway_inner(
     // 终审 Important#1：去抖须同时覆盖文本与媒体——只要本 run 会发任何东西就该被
     // 取代保护。media_pending 用 final_status 终态门判断（与文本无媒体时字节等价：
     // has_assets=false 时 media_pending=false，条件退化为纯 outbox_eligible）。
+    // 名片引荐同理纳入：本 run 若会发名片，superseded 时也要一并中止（缺口③同源）。
     let media_pending = (final_status == "approved" || final_status == "revision_applied_approved")
-        && !final_decision.assets_to_send.is_empty();
+        && (!final_decision.assets_to_send.is_empty() || final_decision.namecard_to_send.is_some());
     if should_run_send(outbox_eligible, media_pending) {
         if let Some(guard) = &should_abort_send {
             if guard() {
@@ -2072,7 +2083,10 @@ async fn run_user_operation_gateway_inner(
     // 追加在素材/文本之后 = 先发铺垫话术、后发名片（D5）。错误不阻断已入队的文本。
     // 名片是主动引荐，不走素材的 requires_principal_approval→escalation 分支（D9 已解耦：
     // 被推真人 = 台前专属顾问，≠ 幕后 principal_decider）。
-    if media_eligible {
+    // 发送门与素材/文本同源（media_send_allowed → outbox_eligible）：含 should_reply +
+    // reply_text 非空 + 终态 + relay 泄漏 fail-closed。杜绝 ①should_reply=false/reply 空时
+    // 发孤立名片（无铺垫话术）②relay 泄漏守卫置 outbox_eligible=false 时仍发名片。
+    if media_send_allowed(outbox_eligible, final_decision.namecard_to_send.is_some()) {
         if let Some(directive) = final_decision.namecard_to_send.as_ref() {
             let assist_override = contact
                 .domain_attributes
@@ -2083,12 +2097,17 @@ async fn run_user_operation_gateway_inner(
                 assist_override,
             );
             if assist_on {
-                // 准入二次校验：card 必须真实存在 + enabled + approved（防 AI 幻觉 card_id）
+                // 准入二次校验：card 必须真实存在 + enabled + approved（防 AI 幻觉 card_id）。
+                // 查询带 workspace_id scope（防 AI 幻觉跨租户 ObjectId 命中他 workspace 的名片，
+                // 与素材 send_outbound_media 的 IDOR 防御对齐）。
                 let card = match ObjectId::parse_str(&directive.card_id) {
                     Ok(oid) => state
                         .db
                         .referral_cards()
-                        .find_one(doc! { "_id": oid }, None)
+                        .find_one(
+                            doc! { "_id": oid, "workspace_id": &contact.workspace_id },
+                            None,
+                        )
                         .await
                         .ok()
                         .flatten(),
