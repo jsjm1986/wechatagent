@@ -408,6 +408,7 @@ export type OperationDomainConfig = {
   reviewPolicy: string;
   runtimeParameters: Record<string, unknown>;
   stateMachine: Record<string, unknown>;
+  assistModeEnabled?: boolean | null;
   status: string;
   updatedAt?: string;
   version?: number;
@@ -426,6 +427,7 @@ export type OperationDomainDraft = {
   reviewPolicy: string;
   runtimeParameters: string;
   stateMachine: string;
+  assistModeEnabled: boolean;
 };
 
 // ── DomainProfile（行业配置）────────────────────────────────────────────────

@@ -41,6 +41,8 @@ pub(super) async fn list_messages(
             "id": message.id.map(|id| id.to_hex()).unwrap_or_default(),
             "direction": message.direction,
             "content": message.content,
+            "msgType": message.msg_type,
+            "mediaRef": message.media_ref,
             "messageId": message.message_id,
             "msgType": message.msg_type,
             "mediaRef": message.media_ref,

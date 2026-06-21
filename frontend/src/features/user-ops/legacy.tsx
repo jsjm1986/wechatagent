@@ -1074,6 +1074,17 @@ export function DomainConfigEditor({
               <span>复盘规则</span>
               <textarea value={draft.reviewPolicy} onChange={(event) => onDraft({ ...draft, reviewPolicy: event.target.value })} />
             </label>
+            <label>
+              <span>辅助模式（专属顾问名片引荐）</span>
+              <small>开启后，AI 会在客户契合引荐条件时主动把专属顾问名片推送给客户（辅助模式）。</small>
+              <select
+                value={draft.assistModeEnabled ? "true" : "false"}
+                onChange={(event) => onDraft({ ...draft, assistModeEnabled: event.target.value === "true" })}
+              >
+                <option value="false">关闭</option>
+                <option value="true">开启</option>
+              </select>
+            </label>
           </div>
         </section>
 
