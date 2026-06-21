@@ -224,7 +224,7 @@ pub(crate) fn fold_stage_validations(
 /// 字典未配置 fail-soft 放行原值（KindUnconfigured → Accept）。空串项跳过。
 /// scope_account_id 为空串时 taxonomy 查询走 global scope（account 维度缺失时的回退）。
 /// 聚合逻辑委托纯内核 fold_stage_validations（可单测）；本函数只做 DB 查询。
-pub(crate) async fn normalize_target_stages(
+pub async fn normalize_target_stages(
     db: &crate::db::Database,
     scope_account_id: &str,
     raw_stages: &[String],

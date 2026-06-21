@@ -57,7 +57,7 @@ pub(super) struct OperatingMemoryRequest {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub(super) struct AssistOverrideRequest {
+pub struct AssistOverrideRequest {
     mode: String,
 }
 
@@ -559,7 +559,7 @@ pub(super) fn is_valid_assist_mode(mode: &str) -> bool {
 /// PUT /api/contacts/:id/assist-override：写客户级辅助模式 override。
 /// default → $unset（回落账号级 assist_mode_enabled）；force_on/force_off → $set。
 /// workspace 隔离防 IDOR。
-pub(super) async fn update_assist_override(
+pub async fn update_assist_override(
     State(state): State<AppState>,
     Extension(admin): Extension<AuthenticatedAdmin>,
     Path(id): Path<String>,
