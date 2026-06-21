@@ -3126,12 +3126,67 @@ async fn apply_agent_updates(
             .domain_attributes
             .as_ref()
             .and_then(|d| d.get_str("customer_stage").ok());
-        // value 校验后重取 new_stage：customer_stage 可能因越界被 drop 移除了键。
-        let new_stage = signals_decision.domain_signals.get_str("customer_stage").ok();
+        // ⑧ customer_stage 状态机校验：customer_stage 与 operation_state 同属一套 canonical
+        // id 空间（m006），下游 C2 派生（:3252 起）令 operation_state 派生自 customer_stage 且
+        // 已过 check_state_transition——非法跳转时拒写 operation_state、保留旧 state。但
+        // domain_attributes.customer_stage 自身的写入此前不过状态机 → LLM 可让 stage 任意跳转
+        // （如 new_contact 直跳 customer_success），operation_state 被拒留旧值、customer_stage
+        // 却跟着 LLM 跳走 → 两字段漂移。这里复用本函数已持有的 domain_config 过同一状态机，
+        // 非法时 fail-soft 跳过 customer_stage 字段写入（保持旧值）+ 记 agent.stage_transition_rejected
+        // 审计，与 operation_state_transition_rejected 对称。reply 已异步发出，校验/审计失败均不阻断。
+        //
+        // 注意：**不**从共享的 signals_decision.domain_signals 容器移除 customer_stage——
+        // 下游 C2 派生块（:3252）读同一容器，移除会令 synced_state 回落 decision.operation_state
+        // 并写入一个**不同**的合法态（违反"保持旧值"语义、破坏 C2 既有 rejected 行为）。故仅对
+        // domain_attributes 写入用一份剔除 customer_stage 的过滤副本，容器本身保持原样供 C2 拒迁移。
+        // 先把判定收敛成 owned 数据：避免 to_stage 的不可变借用与后续可变借用冲突。
+        let stage_rejection: Option<(Option<String>, String, String)> =
+            match signals_decision.domain_signals.get_str("customer_stage").ok() {
+                Some(to_stage) if prev_stage != Some(to_stage) => {
+                    crate::agent::guards::check_state_transition(domain_config, prev_stage, to_stage)
+                        .map(|reason| (prev_stage.map(str::to_string), to_stage.to_string(), reason))
+                }
+                _ => None,
+            };
+        if let Some((from, to, reason)) = &stage_rejection {
+            // fail-soft：审计写失败不阻断主流程（回复已异步发出），与 dimension_dropped 同风格。
+            let _ = write_event_for_account(
+                state,
+                &contact.account_id,
+                Some(&contact.wxid),
+                "agent.stage_transition_rejected",
+                "rejected",
+                &format!(
+                    "customer_stage 拒绝迁移 {} → {}：{}",
+                    from.as_deref().unwrap_or("<empty>"),
+                    to,
+                    reason
+                ),
+                Some(doc! {
+                    "from": from.clone().unwrap_or_default(),
+                    "to": to.as_str(),
+                    "reason": reason.as_str(),
+                }),
+            )
+            .await;
+        }
+        // domain_attributes 写入用的 signals：非法跳转时剔除 customer_stage（保持旧值），其余维度
+        // 照常写；合法/无 stage 时零拷贝直接借用原容器，字节级等价于改造前。
+        let signals_for_attrs: std::borrow::Cow<'_, mongodb::bson::Document> =
+            if stage_rejection.is_some() {
+                let mut filtered = signals_decision.domain_signals.clone();
+                filtered.remove("customer_stage");
+                std::borrow::Cow::Owned(filtered)
+            } else {
+                std::borrow::Cow::Borrowed(&signals_decision.domain_signals)
+            };
+        // 状态机校验后重算 stage_changed：customer_stage 可能因非法跳转被过滤副本移除，须读
+        // 过滤后的 signals 再算（移除后 new_stage=None → stage_changed=false，不刷 stage 时间戳）。
+        let new_stage = signals_for_attrs.get_str("customer_stage").ok();
         let stage_changed = new_stage.is_some() && prev_stage != new_stage;
         let wrote = crate::agent::domain_signals::insert_domain_signal_values(
             &mut set_doc,
-            &signals_decision.domain_signals,
+            &signals_for_attrs,
             stage_changed,
         );
         if wrote {

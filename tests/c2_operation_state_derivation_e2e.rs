@@ -421,3 +421,143 @@ async fn illegal_transition_keeps_old_state_and_audits_failsoft() {
         outbox
     );
 }
+
+/// 构造一个 managed 状态、带初始 `operation_state` 且 `domain_attributes.customer_stage`
+/// 已置为指定旧态的 Contact（C1 ⑧ 测试用：customer_stage 字段自身的状态机校验需要"旧 stage"）。
+fn make_managed_contact_with_stage(
+    wxid: &str,
+    initial_state: &str,
+    initial_stage: &str,
+) -> Contact {
+    let mut c = make_managed_contact(wxid, initial_state);
+    c.domain_attributes = Some(doc! { "customer_stage": initial_stage });
+    c.domain_attributes_updated_at = Some(DateTime::now());
+    c
+}
+
+/// 用例 3（C1 ⑧）：**customer_stage 字段自身过状态机 + 非法跳转 fail-soft 跳写 + 审计**。
+///
+/// 此前 C2 只令派生的 `operation_state` 过 `check_state_transition`，而
+/// `domain_attributes.customer_stage` 字段本身的写入**不过**状态机 → LLM 可让 stage 任意
+/// 跳转（如 new_contact 直跳 customer_success），operation_state 被拒留旧值、customer_stage
+/// 却跟着 LLM 跳走 → 两字段漂移。C1 给 stage 写入也接同一状态机：
+///
+/// - 旧 stage `new_contact`（写在 domain_attributes.customer_stage）；
+/// - 决策 `customerStage = "customer_success"`（**非法**：customer_success.allowedFrom =
+///   ["commitment_followup", "customer_success"]，不含 new_contact）；
+/// - 断言：① `domain_attributes.customer_stage` 保留旧值 `new_contact`（未被写成 customer_success）；
+///   ② 落一条 `agent.stage_transition_rejected` 审计事件（details 含 from/to/reason）；
+///   ③ reply 仍照常下发（fail-soft，approved 类终态）。
+///
+/// 与 `illegal_transition_keeps_old_state_and_audits_failsoft`（operation_state 轴）对称：
+/// 同一次非法跳转两个字段都被各自的闸拒绝、都保留旧值、各记一条对称审计。
+#[tokio::test]
+#[ignore]
+async fn illegal_stage_jump_keeps_old_stage_and_audits_failsoft() {
+    let app = common::TestApp::start().await;
+    let contact =
+        make_managed_contact_with_stage("user_c1_stage_illegal", "new_contact", "new_contact");
+    app.state
+        .db
+        .contacts()
+        .insert_one(&contact, None)
+        .await
+        .expect("insert managed contact");
+    let inbound = make_inbound(&contact, "msg_c1_stage_illegal_001", "你好，先随便了解下。");
+    app.state
+        .db
+        .messages()
+        .insert_one(&inbound, None)
+        .await
+        .expect("insert inbound");
+
+    // customerStage 取从 new_contact 非法的终态 customer_success；operationState 给一个合法值
+    // need_discovery（证明被拒后 stage 不会改用别的来源、也不漂移）。
+    app.llm
+        .push_response(reply_decision_json("customer_success", "need_discovery"));
+    app.llm.push_response(review_pass_json());
+
+    handle_managed_message(&app.state, contact.clone(), &inbound)
+        .await
+        .expect("handle_managed_message ok（fail-soft：非法 stage 跳转不返回 Err）");
+
+    // ① domain_attributes.customer_stage 保留旧值 new_contact（未被写成 customer_success）。
+    let reloaded = app
+        .state
+        .db
+        .contacts()
+        .find_one(doc! { "_id": contact.id }, None)
+        .await
+        .expect("query contact")
+        .expect("contact present");
+    assert_eq!(
+        reloaded
+            .domain_attributes
+            .as_ref()
+            .and_then(|d| d.get_str("customer_stage").ok()),
+        Some("new_contact"),
+        "非法 stage 跳转应跳写 customer_stage、保留旧值 new_contact，实际 domain_attributes={:?}",
+        reloaded.domain_attributes
+    );
+
+    // ② 审计事件：恰好一条 stage_transition_rejected，details 含 from/to/reason。
+    let event = app
+        .state
+        .db
+        .events()
+        .find_one(
+            doc! {
+                "contact_wxid": &contact.wxid,
+                "kind": "agent.stage_transition_rejected",
+            },
+            None,
+        )
+        .await
+        .expect("query stage_transition_rejected event")
+        .expect("非法 stage 跳转必须落一条 agent.stage_transition_rejected 审计事件");
+    assert_eq!(event.status, "rejected", "审计事件 status 应为 rejected");
+    let details = event.details.expect("rejected 事件应带 details");
+    assert_eq!(
+        details.get_str("from").ok(),
+        Some("new_contact"),
+        "details.from 应为旧 stage"
+    );
+    assert_eq!(
+        details.get_str("to").ok(),
+        Some("customer_success"),
+        "details.to 应为被拒的目标 stage"
+    );
+    assert!(
+        details
+            .get_str("reason")
+            .map(|r| r.contains("state_transition_invalid"))
+            .unwrap_or(false),
+        "details.reason 应含 state_transition_invalid，实际 {:?}",
+        details.get_str("reason")
+    );
+
+    // ③ reply 照常下发（fail-soft 不阻断）：终态 approved 类。
+    let log = app
+        .state
+        .db
+        .agent_run_logs()
+        .find_one(
+            doc! {
+                "workspace_id": &contact.workspace_id,
+                "account_id": &contact.account_id,
+                "contact_wxid": &contact.wxid,
+            },
+            None,
+        )
+        .await
+        .expect("query agent_run_logs")
+        .expect("agent_run_logs row exists");
+    assert!(
+        matches!(
+            log.final_review_status.as_str(),
+            "approved" | "revision_applied_approved"
+        ),
+        "非法 stage 跳转属 fail-soft：reply 仍应放行（approved 类终态），实际 {:?}",
+        log.final_review_status
+    );
+}
