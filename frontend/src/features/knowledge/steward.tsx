@@ -1358,6 +1358,15 @@ export function ReviewView({ initialDimFilter }: { initialDimFilter?: string | n
                       <button
                         type="button"
                         className="wikiReviewActionBtn"
+                        onClick={() => focusChunk(c.id)}
+                        title="在 Inspector 中打开"
+                      >
+                        <Search size={14} />
+                        Inspector
+                      </button>
+                      <button
+                        type="button"
+                        className="wikiReviewActionBtn"
                         onClick={() => setChatChunk(c)}
                         title="打开审核+对话双栏：让 AI 改这条草稿，改完一键放行"
                       >
