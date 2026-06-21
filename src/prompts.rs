@@ -12,7 +12,7 @@ use crate::{
     models::{AgentSoul, OperationDomainConfig, OperationPlaybook, PromptTemplate},
 };
 
-pub const PROMPT_PACK_VERSION: &str = "wechatagent_prompt_pack_v3_2026_06_21_media";
+pub const PROMPT_PACK_VERSION: &str = "wechatagent_prompt_pack_v4_2026_06_21_referral";
 
 /// universal-domain-adaptation A/T1：user.reply.policy prompt「## 模式与 5 闸的关系」
 /// 模式-闸说明段（逐字复刻 prompt pack v3 现文 :958-963：标题 + casual_relationship /
@@ -1189,6 +1189,11 @@ fn prompt_specs() -> Vec<PromptSpec> {
     { "assetId": "只能填上方「可发送素材」清单里出现的 id，禁止编造", "reason": "选这份素材的运营理由" }
   ],
 
+  // ── 专属顾问名片引荐（namecardToSend，可选；没有契合的顾问就整个字段省略） ──
+  // 仅当上下文出现「可引荐的专属顾问」候选清单时（=本账号已开启辅助模式）才可能用到。
+  // 当客户明确契合某顾问的触发提示（如要签约/要到店参观/需要深入对接）时，可选一位引荐。
+  "namecardToSend": { "cardId": "只能填上方「可引荐的专属顾问」清单里出现的 cardId，禁止编造", "reason": "为什么这一刻把这位顾问引荐给客户" },
+
   // ── 决策墙请示（escalationRequest，可选；不需要时整个字段省略） ──
   // escalationRequest：仅当你判断本轮遇到"决策墙"（超出你的职权/能力，需要幕后领导拍板）时输出；否则整个字段省略或 needed=false。
   // 判定按"事项实质"，不是客户嘴上"要换人对接"——客户嘴上要换人但事项你能处理，就继续自己处理，不要 escalate。
@@ -1222,6 +1227,11 @@ fn prompt_specs() -> Vec<PromptSpec> {
   - 选了「表达:file_primary（文件为主）」的素材：replyText 只做一句简短引导（如"给您发份报价单"），不要把文件内容用文字再复述一遍。
   - 选了「表达:file_support（文件佐证）」的素材：replyText 正常回答，文件作为佐证补充。
   - 只能选清单里列出的 assetId，禁止编造；清单外的 id 会被系统丢弃。
+- 【专属顾问引荐】上下文若给出「可引荐的专属顾问」清单，你可按需把某位顾问引荐给客户，写进 namecardToSend（{cardId, reason}）。规则：
+  - 只在客户真正契合某顾问的触发提示时引荐（如明确要签约/要到店参观/需要深入技术对接），没有契合的就不引荐（namecardToSend 省略），不要为引荐而引荐。
+  - 引荐时 replyText 先用你自己的口吻做一句自然铺垫（如"这块我请我们负责人直接跟您对接，更高效"），名片会随后自动附上——不要在 replyText 里粘任何联系方式或二维码。
+  - 只能选清单里列出的 cardId，禁止编造；清单外的 id 会被系统丢弃。
+  - 看到「已引荐」信号时：客户已引荐过，你退为辅助答疑，正常回答客户问题即可，不再主动推进成交、不重复引荐（除非客户出现与上次完全不同的新需求场景）。
 上下文由系统在本模板后注入。你必须只输出上述 JSON。"#,
         },
         PromptSpec {
