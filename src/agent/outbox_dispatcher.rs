@@ -494,7 +494,12 @@ pub async fn process_entry(state: &AppState, entry: &OutboxEntry) -> AppResult<(
     // 它可能已把消息送达 MCP/微信。重发前先 post-hoc 核对 mcp_call_logs；命中即
     // 标 sent 不重发，避免客户收到重复消息（与 timeout 分支同一核对函数）。
     if entry.reclaimed_in_flight {
-        let already = if let Some(asset_id) = entry.media_asset_id.as_deref() {
+        let already = if entry.referral_card_id.is_some() {
+            // 名片无 media_id、tool 不同，text/media 版 post-hoc 核对都不适用。
+            // reclaimed 是边缘场景且重复推名片危害小（客户最多多收一张名片），
+            // 故跳过核对、放行重发（保守取 false = 视为未发过）。
+            Ok(false)
+        } else if let Some(asset_id) = entry.media_asset_id.as_deref() {
             // 硬伤④：媒体条目 content 为空、tool 为 message_send_*，text 版核对查不到
             // → 误判没发过 → 重发文件。改用 media_id 定位该素材的成功发送记录。
             super::media_send::media_already_succeeded(
@@ -567,7 +572,9 @@ pub async fn process_entry(state: &AppState, entry: &OutboxEntry) -> AppResult<(
     });
 
     let send_fut = async {
-        if let Some(asset_id) = entry.media_asset_id.as_deref() {
+        if let Some(card_id) = entry.referral_card_id.as_deref() {
+            super::referral::send_outbound_namecard(state, &contact, card_id).await
+        } else if let Some(asset_id) = entry.media_asset_id.as_deref() {
             super::media_send::send_outbound_media(state, &contact, asset_id).await
         } else {
             super::gateway::send_outbound_message(state, &contact, &entry.content, extra_raw).await
@@ -630,7 +637,12 @@ pub async fn process_entry(state: &AppState, entry: &OutboxEntry) -> AppResult<(
             // 微信协议（response 慢于 30s 的极端情况），此时 mcp_call_logs 已写入
             // tool_name + recipient + 定位字段（text=content / media=mediaId）且
             // error=null。命中即视为已送达，不再重发，避免给客户重复消息/重复文件。
-            let already = if let Some(asset_id) = entry.media_asset_id.as_deref() {
+            let already = if entry.referral_card_id.is_some() {
+                // 名片无 media_id、tool 不同，text/media 版 post-hoc 核对都不适用。
+                // timeout 是边缘场景且重复推名片危害小（客户最多多收一张名片），
+                // 故跳过核对、放行重发（保守取 false = 视为未发过）。
+                Ok(false)
+            } else if let Some(asset_id) = entry.media_asset_id.as_deref() {
                 super::media_send::media_already_succeeded(
                     state,
                     &entry.account_id,
