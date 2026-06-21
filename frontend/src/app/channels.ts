@@ -16,6 +16,7 @@ import {
   Inbox,
   PackageSearch,
   Contact,
+  SlidersHorizontal,
   type LucideIcon,
 } from "lucide-react";
 import type { Channel } from "../types";
@@ -34,6 +35,7 @@ const KnowledgeFeature = lazy(() => import("../features/knowledge"));
 const ProductsDealsFeature = lazy(() => import("../features/products-deals"));
 const ReferralCardsFeature = lazy(() => import("../features/referral-cards"));
 const AskHumanFeature = lazy(() => import("../features/ask-human"));
+const AskHumanConfigFeature = lazy(() => import("../features/ask-human-config"));
 
 export interface ChannelDef {
   id: Channel;
@@ -138,6 +140,17 @@ export const CHANNELS: ChannelDef[] = [
     title: "统一收件箱",
     subtitle: "所有需要决策/审核的事项收口在此：请示裁决、知识核验、画像发布、经验晋升。",
     Component: AskHumanFeature,
+  },
+  {
+    id: "askHumanConfig",
+    group: "运营",
+    label: "请示通道配置",
+    caption: "Ask-Human Policy",
+    icon: SlidersHorizontal,
+    eyebrow: "Ask-Human Policy",
+    title: "请示通道配置",
+    subtitle: "配置决策人链、触发请示的情形、超时转备选与推送频控；保存后即时生效于私聊运营域。",
+    Component: AskHumanConfigFeature,
   },
   {
     id: "productsDeals",
