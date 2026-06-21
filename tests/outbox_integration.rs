@@ -137,6 +137,7 @@ fn enqueue_request(run_id: &str, source_event_id: &str, contact_wxid: &str) -> E
         source_kind: "inbound_message".to_string(),
         content: "你好，这是集成测试投递的内容。".to_string(),
         media_asset_id: None,
+        referral_card_id: None,
         max_attempts: 3,
     }
 }
@@ -531,6 +532,152 @@ async fn idempotency_key_yields_at_most_one_mcp_send() {
         .await
         .expect("count");
     assert_eq!(total, 2, "two outbox rows: one per unique idempotency_key");
+}
+
+// ── Case 7: ④ 账号当日发送量超软上限 → warning 事件（仅告警不拦截）──────────
+//
+// 软上限是账号级总量告警（防封号观测先行）：发送主路径 send_outbound_message 在
+// MCP 成功后查该账号当日 `agent_send_outbox` status=sent 的总量，达到 cap 即记
+// `agent.account_daily_send_soft_cap_exceeded` warning 事件，但**绝不**拦截发送。
+//
+// 本地无 Docker，待 CI（`cargo test --test outbox_integration -- --ignored`）。
+#[tokio::test]
+#[ignore]
+async fn over_soft_cap_emits_warning_event() {
+    let app = common::TestApp::start().await;
+    let mcp_server = start_mcp_mock_success().await;
+    let mut state = common::rebuild_app_state_with_mcp_url(&app, mcp_server.uri());
+    // cap=1：预置 1 条 sent 后再发一条即达上限，触发 warning。
+    state.config.account_daily_send_soft_cap = 1;
+
+    let contact = make_contact("user_softcap_over");
+    state
+        .db
+        .contacts()
+        .insert_one(&contact, None)
+        .await
+        .expect("insert contact");
+
+    // 预置一条「今天已 sent」的 outbox，使当日总量已达 cap。
+    // 用 raw 无类型集合插入，便于只填计数关心的字段。
+    state
+        .db
+        .raw()
+        .collection::<Document>("agent_send_outbox")
+        .insert_one(
+            doc! {
+                "workspace_id": "default",
+                "account_id": "default",
+                "contact_wxid": &contact.wxid,
+                "status": "sent",
+                "sent_at": DateTime::now(),
+                "content": "已发历史一条",
+                "idempotency_key": format!("seed_{}", ObjectId::new()),
+            },
+            None,
+        )
+        .await
+        .expect("seed sent outbox");
+
+    // 真正发一条（走 enqueue → claim → process_entry → send_outbound_message）。
+    let outcome = enqueue(
+        &state,
+        enqueue_request("run_softcap", "evt_softcap", &contact.wxid),
+    )
+    .await
+    .expect("enqueue ok");
+    let outbox_id = match outcome {
+        EnqueueOutcome::Created { outbox_id, .. } => outbox_id,
+        other => panic!("expected Created, got {other:?}"),
+    };
+    let claimed = atomic_claim_pending(&state, "worker_softcap", 60)
+        .await
+        .expect("claim ok")
+        .expect("claimed entry");
+    process_entry(&state, &claimed)
+        .await
+        .expect("process entry ok");
+
+    // 发送未被拦截：本条仍成功 sent。
+    let entry = common::wait_for_outbox_processed(&state, outbox_id, Duration::from_secs(5)).await;
+    assert_eq!(
+        entry.status,
+        OutboxStatus::Sent.as_str(),
+        "软上限只告警，发送绝不被拦截: {:?}",
+        entry
+    );
+
+    // warning 事件已记录。
+    let warns = state
+        .db
+        .events()
+        .count_documents(
+            doc! {
+                "account_id": "default",
+                "kind": "agent.account_daily_send_soft_cap_exceeded",
+                "status": "warning",
+            },
+            None,
+        )
+        .await
+        .expect("count events");
+    assert!(
+        warns >= 1,
+        "当日发送量达软上限应记 warning 事件，实际 count={warns}"
+    );
+}
+
+// ── Case 8: ④ 账号当日发送量未达软上限 → 无 warning 事件 ────────────────────
+#[tokio::test]
+#[ignore]
+async fn under_soft_cap_emits_no_warning_event() {
+    let app = common::TestApp::start().await;
+    let mcp_server = start_mcp_mock_success().await;
+    let state = common::rebuild_app_state_with_mcp_url(&app, mcp_server.uri());
+    // 默认 cap=500，一条发送远未达上限。
+
+    let contact = make_contact("user_softcap_under");
+    state
+        .db
+        .contacts()
+        .insert_one(&contact, None)
+        .await
+        .expect("insert contact");
+
+    let outcome = enqueue(
+        &state,
+        enqueue_request("run_softcap_under", "evt_softcap_under", &contact.wxid),
+    )
+    .await
+    .expect("enqueue ok");
+    let outbox_id = match outcome {
+        EnqueueOutcome::Created { outbox_id, .. } => outbox_id,
+        other => panic!("expected Created, got {other:?}"),
+    };
+    let claimed = atomic_claim_pending(&state, "worker_softcap_under", 60)
+        .await
+        .expect("claim ok")
+        .expect("claimed entry");
+    process_entry(&state, &claimed)
+        .await
+        .expect("process entry ok");
+
+    let entry = common::wait_for_outbox_processed(&state, outbox_id, Duration::from_secs(5)).await;
+    assert_eq!(entry.status, OutboxStatus::Sent.as_str(), "{:?}", entry);
+
+    let warns = state
+        .db
+        .events()
+        .count_documents(
+            doc! {
+                "account_id": "default",
+                "kind": "agent.account_daily_send_soft_cap_exceeded",
+            },
+            None,
+        )
+        .await
+        .expect("count events");
+    assert_eq!(warns, 0, "未达软上限不应记 warning 事件，实际 count={warns}");
 }
 
 // ── helpers ──────────────────────────────────────────────────────────────

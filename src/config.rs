@@ -135,6 +135,11 @@ pub struct AppConfig {
     /// 决策请示通道：领导链尾失联（无更多决策人可改派）时，给客户发 AI 延期安抚
     /// 话术的最小间隔（小时）。去重用——每 worker tick 都可能命中链尾超时，限频防刷屏。默认 6.0。
     pub holding_reply_min_interval_hours: f64,
+    /// ④ 账号级发送软上限：单账号当日（UTC 日界起）`agent_send_outbox`
+    /// `status=sent` 的总发送量达到该值时，发送主路径记一条 warning 审计事件
+    /// （`agent.account_daily_send_soft_cap_exceeded`）告警防封号。**仅告警，
+    /// 不拦截、不排队、不改变发送行为**——观测先行。默认 500（保守高值）。
+    pub account_daily_send_soft_cap: i64,
 
     // ── 自学习采集管道（第一阶段）：行为信号 + 沉默删失 + 止血 ──
     //
@@ -539,6 +544,7 @@ impl AppConfig {
             cold_contact_daily_emit_cap: env_or("COLD_CONTACT_DAILY_EMIT_CAP", "5").parse()?,
             holding_reply_min_interval_hours: env_or("HOLDING_REPLY_MIN_INTERVAL_HOURS", "6.0")
                 .parse()?,
+            account_daily_send_soft_cap: env_or("ACCOUNT_DAILY_SEND_SOFT_CAP", "500").parse()?,
             // ── 自学习采集管道（第一阶段） ──
             silence_signal_worker_enabled: parse_bool(&env_or(
                 "SILENCE_SIGNAL_WORKER_ENABLED",

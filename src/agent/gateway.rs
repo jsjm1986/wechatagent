@@ -2289,6 +2289,31 @@ pub(crate) async fn send_outbound_message(
         raw.insert("wechatagent", Bson::Document(extra_raw));
     }
     let now = DateTime::now();
+    // ④ 账号级发送软上限告警（仅告警，绝不拦截/排队/改变发送行为——观测先行防封号）。
+    // 查该账号当日（UTC 日界起）`agent_send_outbox` 已 `sent` 的总量，达到软上限即
+    // 记一条 warning 审计事件。fail-soft：查询/写事件失败都不影响"已发"语义。
+    if let Ok(sent) =
+        account_daily_sent_count(state, &contact.account_id, utc_today_start_millis()).await
+    {
+        if sent >= state.config.account_daily_send_soft_cap {
+            let _ = write_event_for_account(
+                state,
+                &contact.account_id,
+                Some(&contact.wxid),
+                "agent.account_daily_send_soft_cap_exceeded",
+                "warning",
+                &format!(
+                    "账号当日发送量 {} 已达软上限 {}（仅告警，未拦截）",
+                    sent, state.config.account_daily_send_soft_cap
+                ),
+                Some(doc! {
+                    "sent": sent,
+                    "cap": state.config.account_daily_send_soft_cap,
+                }),
+            )
+            .await;
+        }
+    }
     // MCP 已成功 = 消息已送达客户，这是既成事实。此后任何 DB 写失败都**不得**
     // 让本函数返 Err——否则 dispatcher 会走 retry 在下一轮重新 MCP 发送，给客户
     // 发重复消息（Ok(Err) 分支不做 post-hoc 核对）。故落库失败降级为审计事件，
@@ -2710,6 +2735,37 @@ async fn daily_touch_count(state: &AppState, contact: &Contact) -> AppResult<i64
         .await
         .map(|count| count as i64)
         .map_err(AppError::from)
+}
+
+/// ④ 账号当日已发送总量：`agent_send_outbox` 里该账号 `status=sent`、
+/// `sent_at >= since_ms` 的条目数。软上限告警用——与 [`daily_touch_count`]
+/// 不同，这里**不按 contact 过滤**，是账号级总量（防封号观测）。
+async fn account_daily_sent_count(
+    state: &AppState,
+    account_id: &str,
+    since_ms: i64,
+) -> AppResult<i64> {
+    state
+        .db
+        .collection_agent_send_outbox()
+        .count_documents(
+            doc! {
+                "account_id": account_id,
+                "status": "sent",
+                "sent_at": { "$gte": DateTime::from_millis(since_ms) },
+            },
+            None,
+        )
+        .await
+        .map(|count| count as i64)
+        .map_err(AppError::from)
+}
+
+/// UTC 当日 0 点的毫秒时间戳（对齐 knowledge_router / cold_contact_worker 的日界惯例）。
+fn utc_today_start_millis() -> i64 {
+    let now = DateTime::now().timestamp_millis();
+    let day_ms: i64 = 24 * 60 * 60 * 1000;
+    now - now.rem_euclid(day_ms)
 }
 
 async fn cancel_task(
