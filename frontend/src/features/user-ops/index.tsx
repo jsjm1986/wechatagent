@@ -34,7 +34,8 @@ function emptyDomainDraft(): OperationDomainDraft {
     automationPolicy: "",
     reviewPolicy: "",
     runtimeParameters: "",
-    stateMachine: ""
+    stateMachine: "",
+    assistModeEnabled: false
   };
 }
 

@@ -213,6 +213,20 @@ pub(super) async fn ensure_all(db: &Database) -> anyhow::Result<()> {
             None,
         )
         .await?;
+    // 专属顾问名片引荐选材：按 workspace/account 过滤已启用(enabled)且已审核(review_status)的名片。
+    db.referral_cards()
+        .create_index(
+            IndexModel::builder()
+                .keys(doc! {
+                    "workspace_id": 1,
+                    "account_id": 1,
+                    "enabled": 1,
+                    "review_status": 1,
+                })
+                .build(),
+            None,
+        )
+        .await?;
     db.agent_souls()
         .create_index(
             IndexModel::builder()

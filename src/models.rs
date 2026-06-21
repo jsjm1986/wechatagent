@@ -844,6 +844,32 @@ pub struct AskHumanPolicy {
     pub timeout_hours: Option<f64>,
 }
 
+/// 专属顾问名片：人类标注的真人顾问微信名片 + 触发提示。辅助模式下注入 decision prompt，
+/// AI 在客户契合 send_trigger_hint 时主动引荐给客户。snake_case 落库（与 OperationDomainConfig 同款，
+/// 不加 rename_all）。AI 不自我核验红线——必须人类标 review_status="approved" 且 enabled=true 才可被选。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReferralCard {
+    #[serde(rename = "_id", skip_serializing_if = "Option::is_none")]
+    pub id: Option<ObjectId>,
+    pub workspace_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_id: Option<String>,
+    pub target_wxid: String,
+    pub display_name: String,
+    #[serde(default)]
+    pub send_trigger_hint: String,
+    #[serde(default)]
+    pub target_stages: Vec<String>,
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub review_status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review_note: Option<String>,
+    pub created_at: DateTime,
+    pub updated_at: DateTime,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OperationDomainConfig {
     #[serde(rename = "_id", skip_serializing_if = "Option::is_none")]
@@ -889,6 +915,9 @@ pub struct OperationDomainConfig {
     /// 请示通道策略（决策人链/升级范围/骚扰频率/超时）。None = 回落旧 principal_decider/high_risk_escalation_mode。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ask_human_policy: Option<AskHumanPolicy>,
+    /// 辅助模式开关：true=本账号启用专属顾问名片引荐。None/false=纯全自治(默认)。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assist_mode_enabled: Option<bool>,
 }
 
 fn default_version_one() -> i32 {
@@ -2425,6 +2454,9 @@ pub struct OutboxEntry {
     /// dispatcher 据此走 send_outbound_media。`#[serde(default)]` 兼容旧文档。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub media_asset_id: Option<String>,
+    /// 名片引荐条目：非空表示发专属顾问名片而非文本/素材。`#[serde(default)]` 兼容旧文档。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub referral_card_id: Option<String>,
     #[serde(default)]
     pub attempt: i32,
     #[serde(default)]
@@ -2933,6 +2965,13 @@ pub const ALLOWED_ESCALATION_CATEGORY: &[&str] = &[
 /// admin 看板据此显示「等待中」；等待期 pre-check 据此识别。统一占位模型下这只是可观测标记，
 /// 不是 hold category——触发请示的 run 本身是 Approved，占位已正常发出。
 pub const AWAITING_PRINCIPAL_DECISION_ATTR: &str = "awaiting_principal_decision";
+
+/// 「已引荐」态：发送名片成功后写入 Contact.domain_attributes 的时间戳键。
+pub const REFERRED_SPECIALIST_AT_ATTR: &str = "referred_specialist_at";
+/// 已引荐推了哪张名片（card_id hex）。
+pub const REFERRED_CARD_ID_ATTR: &str = "referred_card_id";
+/// 客户级辅助模式覆盖："force_on" | "force_off"。
+pub const ASSIST_MODE_OVERRIDE_ATTR: &str = "assist_mode_override";
 
 /// 真人裁决口径闭集。
 pub const PRINCIPAL_VERDICT_APPROVED: &str = "approved";
@@ -4575,6 +4614,7 @@ mod typed_tests {
             principal_decider: None,
             high_risk_escalation_mode: None,
             ask_human_policy: None,
+            assist_mode_enabled: None,
         };
         let typed = cfg.runtime_parameters_typed();
         assert_eq!(typed.recent_message_limit, 16);
@@ -4670,6 +4710,7 @@ mod typed_tests {
             principal_decider: None,
             high_risk_escalation_mode: None,
             ask_human_policy: None,
+            assist_mode_enabled: None,
         };
         let typed = cfg.state_machine_typed();
         assert!(!typed.states.is_empty());
@@ -4731,6 +4772,7 @@ mod typed_tests {
             content_hash: "sha256:abcdef".to_string(),
             idempotency_key: "evt-source-001:wxid_test_001:sha256:abcdef".to_string(),
             media_asset_id: None,
+            referral_card_id: None,
             attempt: 0,
             max_attempts: 3,
             status: "pending".to_string(),
@@ -5594,5 +5636,48 @@ mod content_asset_compat_tests {
         assert_eq!(back.media_type.as_deref(), Some("file"));
         assert_eq!(back.expression_pref.as_deref(), Some("file_primary"));
         assert_eq!(back.target_stages.unwrap().len(), 2);
+    }
+}
+
+#[cfg(test)]
+mod referral_card_compat_tests {
+    use super::{ReferralCard, OperationDomainConfig};
+    use mongodb::bson::{doc, DateTime};
+
+    #[test]
+    fn referral_card_roundtrips() {
+        let card = ReferralCard {
+            id: None,
+            workspace_id: "ws1".into(),
+            account_id: None,
+            target_wxid: "wxid_boss".into(),
+            display_name: "销售总监-老王".into(),
+            send_trigger_hint: "客户明确要签约或要来公司参观时引荐".into(),
+            target_stages: vec!["意向".into()],
+            enabled: true,
+            review_status: "approved".into(),
+            review_note: None,
+            created_at: DateTime::now(),
+            updated_at: DateTime::now(),
+        };
+        let d = mongodb::bson::to_document(&card).unwrap();
+        let back: ReferralCard = mongodb::bson::from_document(d).unwrap();
+        assert_eq!(back.target_wxid, "wxid_boss");
+        assert_eq!(back.target_stages.len(), 1);
+        assert!(back.enabled);
+    }
+
+    #[test]
+    fn legacy_domain_config_without_assist_flag_deserializes_none() {
+        // 旧 OperationDomainConfig 行无 assist_mode_enabled
+        let legacy = doc! {
+            "workspace_id": "ws1", "domain": "user_operations", "name": "x",
+            "goal": "g", "methodology": "m", "workflow": "w",
+            "tool_policy": "t", "automation_policy": "a", "review_policy": "r",
+            "status": "active", "updated_at": DateTime::now(),
+        };
+        let cfg: OperationDomainConfig = mongodb::bson::from_document(legacy)
+            .expect("legacy domain config must still deserialize");
+        assert_eq!(cfg.assist_mode_enabled, None);
     }
 }

@@ -25,7 +25,7 @@ use crate::models::{
     ManagementAgentMessage, ManagementAgentSession, McpCallLog, MemoryCandidate, MigrationRecord,
     OperatingMemory, OperationDomainConfig, OperationKnowledgeChunk, OperationKnowledgeDocument,
     OperationPlaybook, OutboxEntry, PostReleaseReview, Product, PromptTemplate,
-    Proposal, RelationshipTypeSuggestion, ShadowReplay, TaxonomyCandidate, TaxonomyEntry,
+    Proposal, ReferralCard, RelationshipTypeSuggestion, ShadowReplay, TaxonomyCandidate, TaxonomyEntry,
     ThresholdOverride, ThresholdOverrideAudit, UserOperationGuidePreview, WechatAccount,
 };
 
@@ -182,6 +182,10 @@ impl Database {
 
     pub fn agent_principal_escalations(&self) -> Collection<AgentPrincipalEscalation> {
         self.db.collection("agent_principal_escalations")
+    }
+
+    pub fn referral_cards(&self) -> Collection<ReferralCard> {
+        self.db.collection("referral_cards")
     }
 
     pub fn llm_call_logs(&self) -> Collection<LlmCallLog> {

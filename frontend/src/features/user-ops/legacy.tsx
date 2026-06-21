@@ -7,6 +7,7 @@ import {
   BrainCircuit,
   CheckCircle2,
   Clock3,
+  Contact as ContactIcon,
   Inbox,
   MessageSquareText,
   Paperclip,
@@ -1073,6 +1074,17 @@ export function DomainConfigEditor({
               <span>复盘规则</span>
               <textarea value={draft.reviewPolicy} onChange={(event) => onDraft({ ...draft, reviewPolicy: event.target.value })} />
             </label>
+            <label>
+              <span>辅助模式（专属顾问名片引荐）</span>
+              <small>开启后，AI 会在客户契合引荐条件时主动把专属顾问名片推送给客户（辅助模式）。</small>
+              <select
+                value={draft.assistModeEnabled ? "true" : "false"}
+                onChange={(event) => onDraft({ ...draft, assistModeEnabled: event.target.value === "true" })}
+              >
+                <option value="false">关闭</option>
+                <option value="true">开启</option>
+              </select>
+            </label>
           </div>
         </section>
 
@@ -1616,6 +1628,7 @@ function ConversationStream({ messages }: { messages: Message[] }) {
     }
     if (!Number.isNaN(ts)) lastTime = ts;
     const isInbound = message.direction === "inbound";
+    const isNamecard = message.msgType === "namecard";
     items.push(
       <div key={message.id} className={`bubbleRow ${isInbound ? "inbound" : "outbound"}`}>
         <div className="bubbleAvatar">
@@ -1623,7 +1636,12 @@ function ConversationStream({ messages }: { messages: Message[] }) {
         </div>
         <div className="bubbleBody">
           <div className="bubble">
-            {message.msgType === "media" ? (
+            {isNamecard ? (
+              <span className="namecardBubble">
+                <ContactIcon size={15} />
+                <span>已为客户引荐专属顾问{message.content ? `：${message.content}` : ""}</span>
+              </span>
+            ) : message.msgType === "media" ? (
               <div className="mediaBubble">
                 <Paperclip size={14} />
                 <span>{message.content || "[已发送素材文件]"}</span>

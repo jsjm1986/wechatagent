@@ -243,6 +243,18 @@ pub(crate) fn build_decision_signals_text(
         );
     }
 
+    // ④ 已引荐态：本客户已引荐给专属顾问，AI 退为辅助答疑、不再主动推进成交/重复引荐。
+    if contact
+        .domain_attributes
+        .as_ref()
+        .map(|d| d.contains_key(crate::models::REFERRED_SPECIALIST_AT_ATTR))
+        .unwrap_or(false)
+    {
+        lines.push(
+            "- 本客户已引荐给专属顾问，你退为辅助：客户再问就正常答疑，不再主动推进成交、不重复引荐（除非客户出现与上次完全不同的新需求场景）。".to_string(),
+        );
+    }
+
     lines.join("\n")
 }
 

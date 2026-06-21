@@ -141,6 +141,9 @@ pub struct EnqueueRequest {
     /// 媒体条目允许空 content（文件可不带文字），幂等键由 asset_id 参与（见
     /// [`compute_synthetic_key`]）。纯文本路径传 `None`。
     pub media_asset_id: Option<String>,
+    /// 名片引荐条目：非空表示这条 outbox 发的是专属顾问名片而非文本/素材。
+    /// dispatcher 据此走 send_outbound_namecard。与 media_asset_id 互斥。
+    pub referral_card_id: Option<String>,
     /// 默认 3，由 runtime 控制是否调高（R13.5）。
     pub max_attempts: i32,
 }
@@ -165,7 +168,7 @@ pub async fn enqueue(state: &AppState, req: EnqueueRequest) -> Result<EnqueueOut
     if req.contact_wxid.trim().is_empty() {
         return Err(OutboxError::Invalid("contact_wxid is empty".to_string()));
     }
-    if content_required_for(&req.media_asset_id) && req.content.trim().is_empty() {
+    if content_required_for(&req.media_asset_id, &req.referral_card_id) && req.content.trim().is_empty() {
         return Err(OutboxError::Invalid("content is empty".to_string()));
     }
     if req.run_id.trim().is_empty() {
@@ -194,6 +197,7 @@ pub async fn enqueue(state: &AppState, req: EnqueueRequest) -> Result<EnqueueOut
     // 不同文件会撞键、第二个被误去重漏发。media_routes_synthetic 把该判定抽成纯函数。
     let (idempotency_key, used_synthetic) = if media_routes_synthetic(
         &req.media_asset_id,
+        &req.referral_card_id,
         &req.source_event_id,
     ) {
         let key = compute_synthetic_key(
@@ -204,6 +208,7 @@ pub async fn enqueue(state: &AppState, req: EnqueueRequest) -> Result<EnqueueOut
             &content_hash,
             day_bucket,
             req.media_asset_id.as_deref(),
+            req.referral_card_id.as_deref(),
         );
         (sha256_hex(key.as_bytes()), true)
     } else {
@@ -255,6 +260,7 @@ pub async fn enqueue(state: &AppState, req: EnqueueRequest) -> Result<EnqueueOut
         content_hash: content_hash.clone(),
         idempotency_key: idempotency_key.clone(),
         media_asset_id: req.media_asset_id.clone(),
+        referral_card_id: req.referral_card_id.clone(),
         attempt: 0,
         max_attempts,
         status: OutboxStatus::Pending.as_str().to_string(),
@@ -398,7 +404,13 @@ pub(crate) fn compute_synthetic_key(
     content_hash: &str,
     day_bucket: i64,
     media_asset_id: Option<&str>,
+    referral_card_id: Option<&str>,
 ) -> String {
+    // 名片引荐条目：与媒体条目同理，content 可空 → 必须靠 card_id 区分同 run 的
+    // 不同名片，否则撞键被误去重。与 media_asset_id 互斥。
+    if let Some(cid) = referral_card_id {
+        return format!("synthetic_namecard:{run_id}:{contact_wxid}:{cid}");
+    }
     // 媒体条目：content 可空 → content_hash 对所有素材相同（sha256("")），
     // 必须靠 asset_id 区分同 run 的不同文件，否则两个文件会撞键被误去重。
     if let Some(aid) = media_asset_id {
@@ -414,9 +426,12 @@ pub(crate) fn compute_synthetic_key(
 }
 
 /// Task 6：媒体条目（`media_asset_id` 有值）允许空 content（文件可不带文字）；
-/// 纯文本条目仍要求 content 非空。
-pub(crate) fn content_required_for(media_asset_id: &Option<String>) -> bool {
-    media_asset_id.is_none()
+/// 名片引荐条目（`referral_card_id` 有值）同理允许空 content；纯文本条目仍要求 content 非空。
+pub(crate) fn content_required_for(
+    media_asset_id: &Option<String>,
+    referral_card_id: &Option<String>,
+) -> bool {
+    media_asset_id.is_none() && referral_card_id.is_none()
 }
 
 /// media-asset Task 8（硬伤③ 方案甲）：判定本条 enqueue 是否应走 synthetic 路径。
@@ -424,12 +439,14 @@ pub(crate) fn content_required_for(media_asset_id: &Option<String>) -> bool {
 /// - 媒体条目（`media_asset_id` 有值）：**一律** synthetic（key 含 asset_id），
 ///   与 `source_event_id` 是否为空无关。否则非空 source_event_id 路径的 key 不含
 ///   asset_id、媒体 content 为空 → 同一入站发两个不同文件撞键漏发第二个。
+/// - 名片引荐条目（`referral_card_id` 有值）：同理一律 synthetic（key 含 card_id）。
 /// - 纯文本条目：仅在 `source_event_id` 为空时走 synthetic（保持旧契约）。
 pub(crate) fn media_routes_synthetic(
     media_asset_id: &Option<String>,
+    referral_card_id: &Option<String>,
     source_event_id: &str,
 ) -> bool {
-    media_asset_id.is_some() || source_event_id.trim().is_empty()
+    media_asset_id.is_some() || referral_card_id.is_some() || source_event_id.trim().is_empty()
 }
 
 /// 重试 backoff 计算（R13.5）。
@@ -683,6 +700,7 @@ mod tests {
             "abcd",
             12345,
             None,
+            None,
         );
         let key_b = compute_synthetic_key(
             SOURCE_KIND_MANUAL_SEND,
@@ -691,6 +709,7 @@ mod tests {
             "run_b",
             "abcd",
             12345,
+            None,
             None,
         );
         assert_eq!(
@@ -711,6 +730,7 @@ mod tests {
             "abcd",
             12345,
             None,
+            None,
         );
         let day2 = compute_synthetic_key(
             SOURCE_KIND_MANUAL_SEND,
@@ -719,6 +739,7 @@ mod tests {
             "run_a",
             "abcd",
             12346,
+            None,
             None,
         );
         assert_ne!(day1, day2, "day_bucket 不同应得到不同 key");
@@ -736,6 +757,7 @@ mod tests {
             "abcd",
             12345,
             None,
+            None,
         );
         let key_run_b = compute_synthetic_key(
             "wechat_inbound",
@@ -744,6 +766,7 @@ mod tests {
             "run_b",
             "abcd",
             12345,
+            None,
             None,
         );
         assert_ne!(
@@ -756,8 +779,8 @@ mod tests {
     /// Task 6：媒体条目（`media_asset_id` 有值）允许空 content；纯文本条目仍要求非空。
     #[test]
     fn media_entry_allows_empty_content() {
-        assert!(content_required_for(&None)); // 纯文本 → 需要 content
-        assert!(!content_required_for(&Some("aid".to_string()))); // 媒体 → 不需要
+        assert!(content_required_for(&None, &None)); // 纯文本 → 需要 content
+        assert!(!content_required_for(&Some("aid".to_string()), &None)); // 媒体 → 不需要
     }
 
     /// media-asset Task 8（硬伤③ 方案甲）：媒体条目无论 source_event_id 是否为空都走
@@ -765,11 +788,11 @@ mod tests {
     #[test]
     fn media_routes_synthetic_ignores_source_event_id() {
         // 媒体条目：非空 source_event_id 也走 synthetic（key 才会含 asset_id）。
-        assert!(media_routes_synthetic(&Some("aid".to_string()), "evt_1"));
-        assert!(media_routes_synthetic(&Some("aid".to_string()), ""));
+        assert!(media_routes_synthetic(&Some("aid".to_string()), &None, "evt_1"));
+        assert!(media_routes_synthetic(&Some("aid".to_string()), &None, ""));
         // 纯文本条目：非空 source_event_id 走非 synthetic；空才 synthetic。
-        assert!(!media_routes_synthetic(&None, "evt_1"));
-        assert!(media_routes_synthetic(&None, ""));
+        assert!(!media_routes_synthetic(&None, &None, "evt_1"));
+        assert!(media_routes_synthetic(&None, &None, ""));
     }
 
     /// media-asset Task 8（硬伤③ 关键回归）：同一**非空** source_event_id + 同 run +
@@ -789,7 +812,7 @@ mod tests {
         let key_for = |asset_id: &str| -> String {
             let media_asset_id = Some(asset_id.to_string());
             assert!(
-                media_routes_synthetic(&media_asset_id, source_event_id),
+                media_routes_synthetic(&media_asset_id, &None, source_event_id),
                 "媒体条目必须走 synthetic 路径"
             );
             let synthetic = compute_synthetic_key(
@@ -800,6 +823,7 @@ mod tests {
                 &media_content_hash,
                 12345,
                 media_asset_id.as_deref(),
+                None,
             );
             sha256_hex(synthetic.as_bytes())
         };
@@ -840,6 +864,7 @@ mod tests {
             &empty_hash,
             12345,
             Some("asset_a"),
+            None,
         );
         let key_asset_b = compute_synthetic_key(
             "wechat_inbound",
@@ -849,6 +874,7 @@ mod tests {
             &empty_hash,
             12345,
             Some("asset_b"),
+            None,
         );
         assert_ne!(
             key_asset_a, key_asset_b,
@@ -864,6 +890,7 @@ mod tests {
             &empty_hash,
             12345,
             Some("asset_a"),
+            None,
         );
         assert_eq!(
             key_asset_a, key_asset_a_again,
@@ -1203,5 +1230,38 @@ mod tests {
             STALE_MS,
         );
         assert!(res.is_none());
+    }
+}
+
+#[cfg(test)]
+mod referral_outbox_tests {
+    use super::*;
+
+    #[test]
+    fn namecard_entry_allows_empty_content() {
+        // 纯文本（两者都 None）→ 需 content
+        assert!(content_required_for(&None, &None));
+        // 名片条目 → 不需 content
+        assert!(!content_required_for(&None, &Some("card1".to_string())));
+        // 素材条目 → 不需 content（保持原行为）
+        assert!(!content_required_for(&Some("asset1".to_string()), &None));
+    }
+
+    #[test]
+    fn namecard_routes_synthetic_regardless_of_source_event() {
+        // 名片条目即使 source_event_id 非空也走 synthetic
+        assert!(media_routes_synthetic(&None, &Some("c1".to_string()), "evt123"));
+        // 纯文本 + 非空 source_event → 不走 synthetic
+        assert!(!media_routes_synthetic(&None, &None, "evt123"));
+    }
+
+    #[test]
+    fn synthetic_key_differs_per_card() {
+        // 同 run/contact、空 content、不同 card → key 必须不同（防撞键误去重）
+        let k1 = compute_synthetic_key("inbound_message", "acct", "wx", "run1", "H", 0, None, Some("c1"));
+        let k2 = compute_synthetic_key("inbound_message", "acct", "wx", "run1", "H", 0, None, Some("c2"));
+        assert_ne!(k1, k2);
+        // 名片 key 形态稳定可识别
+        assert!(k1.contains("c1"));
     }
 }
