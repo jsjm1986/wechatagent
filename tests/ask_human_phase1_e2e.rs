@@ -605,24 +605,28 @@ async fn timeout_reassign_gives_each_decider_full_window() {
     );
 }
 
-/// P2 Task 1: lessons_learned 收件项必须带 richParams.lessonId（前端 LessonPromoteCard
-/// 深链前提）。修复前 `rich_params: None` → `richParams` 被 skip_serializing_if 省略，
-/// 断言取 `["richParams"]["lessonId"]` 为 Null ≠ 期望 hex，会 FAIL。
+/// P2 Task 1 + 终审修复: lessons_learned 收件项必须带 richParams.lessonId（前端
+/// LessonPromoteCard 深链前提）。lessonId 必须是文档的 `lesson_id` 字段
+/// （`{workspace}::{pattern_kind}`，由 aggregate_lessons_for_workspace 写入），
+/// 而非 `_id` hex——list/promote 端点按 `lesson_id` 寻址，用 _id 会 NotFound。
 #[tokio::test]
 #[ignore]
 async fn inbox_lessons_item_carries_lesson_id() {
     let app = common::TestApp::start().await;
     let ws = app.state.config.default_workspace_id.clone();
-    // seed 一条 pending_review lessons_learned（裸 Document，无 typed accessor）
+    // seed 一条 pending_review lessons_learned（裸 Document，无 typed accessor）。
+    // 带真实 lesson_id 字段（生产由 aggregate_lessons_for_workspace 写 {ws}::{kind}）。
+    let lesson_id = format!("{ws}::objection_handling");
     let coll = app
         .state
         .db
         .raw()
         .collection::<mongodb::bson::Document>("lessons_learned");
-    let inserted = coll
+    coll
         .insert_one(
             doc! {
                 "workspace_id": &ws,
+                "lesson_id": &lesson_id,
                 "review_status": "pending_review",
                 "pattern_kind": "objection_handling",
                 "created_at": DateTime::now(),
@@ -631,7 +635,6 @@ async fn inbox_lessons_item_carries_lesson_id() {
         )
         .await
         .unwrap();
-    let lesson_hex = inserted.inserted_id.as_object_id().unwrap().to_hex();
     // 调 inbox handler，过滤 lessons_learned 源
     let resp = wechatagent::routes::ask_human_inbox::ask_human_inbox(
         State(app.state.clone()),
@@ -651,8 +654,8 @@ async fn inbox_lessons_item_carries_lesson_id() {
         .expect("应含 lessons_learned item");
     assert_eq!(
         lesson["richParams"]["lessonId"],
-        serde_json::json!(lesson_hex),
-        "lessons 收件项应带 richParams.lessonId={lesson_hex}"
+        serde_json::json!(lesson_id),
+        "lessons 收件项应带 richParams.lessonId={lesson_id}（lesson_id 字段，非 _id hex）"
     );
 }
 
@@ -679,6 +682,20 @@ async fn get_single_chunk_by_id_scoped_to_workspace() {
     .unwrap();
     let body: serde_json::Value = resp.0;
     assert_eq!(body["item"]["title"], serde_json::json!("测试切片"));
+
+    // 反向断言（IDOR 隔离命门）：另一个 workspace 的 admin 读 default ws 的 chunk
+    // → 守卫（crud.rs find_one 带 workspace_id 条件）拒绝 → NotFound。
+    // 没有这条，测试名声称的 *_scoped_to_workspace 隔离属性从未被真正验证（假绿）。
+    let foreign = wechatagent::routes::knowledge::crud::get_operation_knowledge_chunk(
+        axum::extract::State(app.state.clone()),
+        axum::Extension(test_admin("other_ws")),
+        axum::extract::Path(hex.clone()),
+    )
+    .await;
+    assert!(
+        matches!(foreign, Err(wechatagent::error::AppError::NotFound(_))),
+        "跨 workspace 读 chunk 必须 NotFound（IDOR 守卫），实际: {foreign:?}"
+    );
 }
 
 #[tokio::test]
