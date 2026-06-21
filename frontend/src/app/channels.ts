@@ -14,6 +14,7 @@ import {
   Workflow,
   FileBox,
   PackageSearch,
+  Contact,
   type LucideIcon,
 } from "lucide-react";
 import type { Channel } from "../types";
@@ -30,6 +31,7 @@ const QualityFeature = lazy(() => import("../features/quality"));
 const LlmProvidersFeature = lazy(() => import("../features/llm-providers"));
 const KnowledgeFeature = lazy(() => import("../features/knowledge"));
 const ProductsDealsFeature = lazy(() => import("../features/products-deals"));
+const ReferralCardsFeature = lazy(() => import("../features/referral-cards"));
 
 export interface ChannelDef {
   id: Channel;
@@ -112,6 +114,17 @@ export const CHANNELS: ChannelDef[] = [
     title: "内容资产",
     subtitle: "维护产品资料、FAQ、话术、禁用表达、品牌语气和朋友圈素材。",
     Component: ContentAssetsFeature,
+  },
+  {
+    id: "referralCards",
+    group: "知识",
+    label: "专属顾问",
+    caption: "名片引荐库",
+    icon: Contact,
+    eyebrow: "Referral Cards",
+    title: "专属顾问名片库",
+    subtitle: "维护可由 AI 主动引荐给客户的真人专属顾问名片，录入引荐条件、审核与启停（辅助模式）。",
+    Component: ReferralCardsFeature,
   },
   {
     id: "productsDeals",
