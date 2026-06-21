@@ -60,6 +60,7 @@ pub mod principal_escalations;
 mod products;
 mod prompt_templates;
 mod referral_cards;
+mod send_ledger;
 mod reviews;
 mod shared;
 mod simulations;
@@ -390,6 +391,15 @@ pub fn api_router(state: AppState) -> Router<AppState> {
         .route(
             "/referral-cards/:id",
             axum::routing::delete(referral_cards::delete_referral_card),
+        )
+        .route(
+            "/contacts/:wxid/send-history",
+            get(send_ledger::contact_send_history),
+        )
+        .route("/send-ledger/stats", get(send_ledger::send_ledger_stats))
+        .route(
+            "/send-ledger/overview",
+            get(send_ledger::send_ledger_overview),
         )
         .route(
             "/operation-knowledge",
