@@ -963,6 +963,25 @@ mod tests {
         assert!(!relay_introduces_unauthorized_number("可以9折", substance));
     }
 
+    #[test]
+    fn relay_unauthorized_number_handles_decimal_discount() {
+        // 小数变体：领导授权"9.5折"，转述改成授权外的"9折"（整数）→ 引入授权外数字 → 拦。
+        // 覆盖 normalize_number_token 的 split_once('.') frac_part 分支：
+        // 授权集 = {"9.5"}，"9折"归一化为 token "9" ∉ 集 → true。
+        let substance = "可以给客户9.5折";
+        assert!(relay_introduces_unauthorized_number("我帮您申请到9折了", substance));
+        // 另一变体：转述编成不同小数"8.5折"（"8.5" ∉ {"9.5"}）→ 拦。
+        assert!(relay_introduces_unauthorized_number("帮您争取到8.5折", substance));
+    }
+
+    #[test]
+    fn relay_unauthorized_number_allows_same_decimal() {
+        // 小数变体：授权"9.5折"，转述用同一小数"9.5折" → 归一化后 token "9.5" 命中授权集 → 放行。
+        // 验证小数 token 经 normalize_number_token 后能在授权集内正确匹配（frac_part 往返一致）。
+        let substance = "可以给客户9.5折优惠";
+        assert!(!relay_introduces_unauthorized_number("给您9.5折，很划算", substance));
+    }
+
     // ---- fix C：pending 去重唯一索引冲突判定（区分两类 11000）----
 
     #[test]
