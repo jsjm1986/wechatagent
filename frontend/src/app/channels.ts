@@ -13,6 +13,7 @@ import {
   ShieldCheck,
   Workflow,
   FileBox,
+  Inbox,
   PackageSearch,
   Contact,
   type LucideIcon,
@@ -32,6 +33,7 @@ const LlmProvidersFeature = lazy(() => import("../features/llm-providers"));
 const KnowledgeFeature = lazy(() => import("../features/knowledge"));
 const ProductsDealsFeature = lazy(() => import("../features/products-deals"));
 const ReferralCardsFeature = lazy(() => import("../features/referral-cards"));
+const AskHumanFeature = lazy(() => import("../features/ask-human"));
 
 export interface ChannelDef {
   id: Channel;
@@ -125,6 +127,17 @@ export const CHANNELS: ChannelDef[] = [
     title: "专属顾问名片库",
     subtitle: "维护可由 AI 主动引荐给客户的真人专属顾问名片，录入引荐条件、审核与启停（辅助模式）。",
     Component: ReferralCardsFeature,
+  },
+  {
+    id: "askHuman",
+    group: "运营",
+    label: "统一收件箱",
+    caption: "Ask-Human Inbox",
+    icon: Inbox,
+    eyebrow: "Ask-Human",
+    title: "统一收件箱",
+    subtitle: "所有需要决策/审核的事项收口在此：请示裁决、知识核验、画像发布、经验晋升。",
+    Component: AskHumanFeature,
   },
   {
     id: "productsDeals",

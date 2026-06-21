@@ -16,7 +16,8 @@ export type Channel =
   | "quality"
   | "llmProviders"
   | "knowledgeWiki"
-  | "productsDeals";
+  | "productsDeals"
+  | "askHuman";
 export type ContactTab = "all" | "managed" | "normal";
 export type SmartOpsTab = "cockpit" | "adjust" | "profile" | "memory" | "simulation" | "conversation";
 export type TraditionalOpsTab = "playbooks" | "prompts" | "settings" | "audit";
