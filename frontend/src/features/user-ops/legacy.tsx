@@ -7,6 +7,7 @@ import {
   BrainCircuit,
   CheckCircle2,
   Clock3,
+  Contact as ContactIcon,
   Inbox,
   MessageSquareText,
   Paperclip,
@@ -1616,6 +1617,7 @@ function ConversationStream({ messages }: { messages: Message[] }) {
     }
     if (!Number.isNaN(ts)) lastTime = ts;
     const isInbound = message.direction === "inbound";
+    const isNamecard = message.msgType === "namecard";
     items.push(
       <div key={message.id} className={`bubbleRow ${isInbound ? "inbound" : "outbound"}`}>
         <div className="bubbleAvatar">
@@ -1623,7 +1625,12 @@ function ConversationStream({ messages }: { messages: Message[] }) {
         </div>
         <div className="bubbleBody">
           <div className="bubble">
-            {message.msgType === "media" ? (
+            {isNamecard ? (
+              <span className="namecardBubble">
+                <ContactIcon size={15} />
+                <span>已为客户引荐专属顾问{message.content ? `：${message.content}` : ""}</span>
+              </span>
+            ) : message.msgType === "media" ? (
               <div className="mediaBubble">
                 <Paperclip size={14} />
                 <span>{message.content || "[已发送素材文件]"}</span>
