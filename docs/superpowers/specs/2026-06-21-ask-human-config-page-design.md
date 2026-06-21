@@ -55,7 +55,7 @@ DeciderRef { wxid: string, displayName?: string }  // displayName 省略可
   │                          + AskHumanConfigView（读现状→编辑本地草稿→整体保存）
   ├── DeciderChainEditor.tsx 决策人链受控子组件：ContactPicker 选人加链 + 上下移/删
   ├── policyForm.ts          纯函数：defaultPolicy / extractPolicy / validatePolicy（最高价值测试层）
-  └── AskHumanConfig.css     plain CSS（非 .module.css，规避 Rollup tree-shake 坑）
+  └── AskHumanConfig.module.css  CSS module（`import styles from`，对齐主流 8 个频道；非裸副作用导入）
 
 复用（不新建）：
   ├── lib/api.ts             api.get<{item}>(读 domain) / api.put(存 policy)
@@ -172,7 +172,7 @@ export default function AskHumanConfigFeature() {
 - **组件冒烟**：DeciderChainEditor 增（选 contact append）/删/上移/下移/首末行按钮禁用 + 已在链中 wxid 排除（mock api.get contacts）。落 `src/__tests__/features/ask-human-config/DeciderChainEditor.test.tsx`。
 - **后端补缺**：operation_domain_json 序列化 askHumanPolicy 走 Rust 单测（构造带 policy 的 config → json 含 askHumanPolicy.deciderChain）+ 并入 P1 `ask_human_phase1_e2e` 同源集成测试（`#[ignore]`，CI 跑）。
 - **测试位置铁律**：vitest.config include 锁 `src/__tests__/**`，测试必须落该目录镜像路径，否则 CI 静默跳过=假绿（P2 Task3/10 踩过）。
-- **UI 真验**：起 dev server 浏览器走 golden path（进频道→读现状回显→加决策人→改开关→存→重进确认持久化）+ 校验路径（空链存被挡）+ 后端补缺回显。无法在浏览器验证的部分明确标注，不假称成功。
+- **UI 真验**：起 dev server 浏览器走 golden path（进频道→读现状回显→加决策人→改开关→存→重进确认持久化）+ 校验路径（空链存被挡）+ 后端补缺回显。同时核对视觉与现有频道一致（白通道 / tokens 变量 / 字号层级 / 选中 soft blue），不引入风格漂移。无法在浏览器验证的部分明确标注，不假称成功。
 
 ## 交付边界
 
@@ -182,7 +182,14 @@ export default function AskHumanConfigFeature() {
 ## 红线与约束
 
 - **no-takeover lint**（扫 `frontend/src/` 新增行）：开关/引导文案一律 AI 内部口径——「安全门拦截 / 产品声明未核验 / AI 策略主动暂缓 / 对话停滞 / 决策人 / 请示通道」，**绝不**出现 `转人工 / 人工接管 / 人工介入 / 接管 / takeover / hand-off`。
-- **CSS plain 不 tree-shake**：用 `AskHumanConfig.css` + `import "./AskHumanConfig.css"`，不命名 `.module.css` 做副作用全局导入。
+- **遵守现有设计系统与语言（用户硬要求）**：P3 前端必须对齐项目现有设计风格，不自由发挥。基准见 `docs/frontend-design-system.md` + 真实 token `frontend/src/components/ui/tokens.css`（main.tsx 引入）：
+  - **CSS 方式**：用 `AskHumanConfig.module.css` + `import styles from "./AskHumanConfig.module.css"` + `className={styles.xxx}`（局部作用域绑定导入，对齐 evolution/products-deals/operations 等 8 个主流频道）。**不用** plain CSS 全局 className，也**绝不**用裸副作用导入 `import "./x.module.css"`（无绑定+全局 className 才会触发 Rollup tree-shake 整份丢失——见 [前端 CSS module tree-shake 坑]；`import styles from` 有绑定永不中招）。
+  - **设计 token（一律走 tokens.css 变量，禁裸色值/魔数）**：文字 `--ink-1`(主#1d1d1f)/`--ink-2`/`--ink-3`/`--ink-4`；面 `--surface-card`(#fff)/`--surface-page`/`--hairline`(描边)；圆角 `--r-sm:11px`/`--r-md:18px`/`--r-lg:24px`；焦点统一 `--focus-ring`。
+  - **颜色纪律**：`--color-scheduled`(#0A84FF 蓝)仅用于关键数据/可点击/选中；`--color-brand`(#5E5CE6)仅 AI 身份不表达状态；`--color-held`(待核验/暂缓)/`--color-blocked`(风险/失败)/`--color-inactive`(停用)按语义；状态填充用对应 `--fill-*`。禁暗色导航/紫渐变/霓虹/大块染色。
+  - **层级 4 级 + panel 规范**：app shell → 频道 header（标题 + 主操作「保存」按钮右上）→ panel（一个 panel=一个操作任务，配置页线性单栏；**避免嵌套 panel、禁 panel 内塞 card、禁第三级持久导航**）→ rows/forms。决策人链行用固定行高思路、长 wxid/displayName 截断；选中用 soft blue fill 非重边框。
+  - **表单规范**：input 全宽、focus 统一 accent ring、textarea 只给有意义操作输入。
+  - **字号**：page title 28-40px / panel title 18px / body 13px / metadata 10.5-12px、letter-spacing 0（不随视口缩放）。
+  - 实现前读 `docs/frontend-design-system.md` 全文 + 参照一个现有 `.module.css`（如 `features/products-deals/ProductsDeals.module.css`）的真实 token 引用写法。
 - **后端补缺向后兼容**：序列化 askHumanPolicy 是加字段（`config.ask_human_policy` 本就是 `Option`，None 时序列化为 null 或 skip，前端 extractPolicy 回落 default），不动既有 operation_domain_json 其他字段。
 - **测试基线不回归**：后端补缺的 Rust 单测进 `cargo test --lib`（≥350/0）；四 PBT 累计 ≥33/0。
 - **磁盘纪律**：后端编译前 `rm -rf target/debug/incremental` + `CARGO_INCREMENTAL=0`；本地只 `cargo test --lib` + 单 PBT，集成测试 `#[ignore]` 靠 CI。
