@@ -622,6 +622,38 @@ pub async fn process_entry(state: &AppState, entry: &OutboxEntry) -> AppResult<(
             )
             .await;
             update_run_log_outbox_status(state, &entry.run_id, "sent").await;
+
+            // 主动发送台账：素材/名片条目记一条（纯文本不记）。fail-soft，不影响已成发送。
+            let send_kind_target = entry
+                .referral_card_id
+                .as_deref()
+                .map(|id| ("namecard", id))
+                .or_else(|| entry.media_asset_id.as_deref().map(|id| ("media", id)));
+            if let Some((send_kind, target_id)) = send_kind_target {
+                // target_title 冗余快照：回查实体标题，查不到留空（不阻断）。
+                let target_title = super::send_ledger::lookup_target_title(
+                    state, &entry.workspace_id, send_kind, target_id,
+                )
+                .await;
+                // 发送瞬间客户阶段快照：从 contact.domain_attributes 读 customer_stage。
+                let stage_at_send = contact
+                    .domain_attributes
+                    .as_ref()
+                    .and_then(|d| d.get_str("customer_stage").ok())
+                    .map(ToString::to_string);
+                let ledger_row = super::send_ledger::build_ledger_entry(
+                    &entry.workspace_id,
+                    &entry.account_id,
+                    &entry.contact_wxid,
+                    send_kind,
+                    target_id,
+                    &target_title,
+                    &entry.run_id,
+                    stage_at_send,
+                    now,
+                );
+                super::send_ledger::record_send(state, &ledger_row).await;
+            }
         }
         Ok(Err(err)) => {
             schedule_retry_or_terminal(
