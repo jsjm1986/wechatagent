@@ -1,0 +1,374 @@
+// Ask-Human Phase 2 Task 6：演化候选「发布/回滚」卡，从 features/evolution/EvolutionCenterTab.tsx
+// 物理迁入（原 ProposalDetailView + 它依赖的 ConfirmModal/ThresholdDiffView/PromptDiffView/
+// ShadowEvalReport）。中立化到 components/review/ 后，老页（EvolutionCenterTab）与统一收件箱频道
+// 都从这里 import，不再各持一份定义。
+//
+// 渲染/确认逻辑逐行保留：threshold 类 = current vs proposed 数值条 + hit_rate；prompt 类 = 双栏
+// diff + Critic reasoning + expectedImprovementOn 标签 + shadow eval 报告卡；[发布]/[回滚] 按 status
+// 启用/置灰；ConfirmModal 必须输入 "RELEASE"/"ROLLBACK" 才启用确认。
+//
+// 数据获取统一走 lib/api 的 api.get/api.post（非 2xx 抛 parseApiError），替换原私有 apiGet/apiPost。
+//
+// 文案严守 AI 自主语义。仓库根 scripts/ 下的 CI lint 会在 PR 阻断任何回归到非 AI 自主表达的文案。
+//
+// 后端路由：
+//   GET  /api/evolution/proposals/:id
+//   POST /api/evolution/proposals/:id/release   body { confirmation: "RELEASE"  }
+//   POST /api/evolution/proposals/:id/rollback  body { confirmation: "ROLLBACK" }
+
+import { useEffect, useState } from "react";
+import { api } from "../../lib/api";
+// 共享视觉与原语仍由 evolution feature 持有；卡片复用，避免重复定义（参见报告 Concerns）。
+import styles from "../../features/evolution/EvolutionCenterTab.module.css";
+import {
+  StatusBadge,
+  formatNumber,
+  formatPercent,
+  type ProposalDetail,
+  type ProposalDetailResponse,
+  type ShadowReplaysSummary,
+} from "../../features/evolution/EvolutionCenterTab";
+
+export function ProposalReleaseCard({
+  proposalId,
+  onClose,
+  onDone,
+}: {
+  proposalId: string;
+  onClose?: () => void;
+  onDone?: () => void;
+}) {
+  const [data, setData] = useState<ProposalDetailResponse | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string>("");
+  const [modal, setModal] = useState<null | "release" | "rollback">(null);
+
+  async function load() {
+    setLoading(true);
+    setError("");
+    try {
+      const d = await api.get<ProposalDetailResponse>(`/api/evolution/proposals/${proposalId}`);
+      setData(d);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  useEffect(() => {
+    void load();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [proposalId]);
+
+  if (loading) {
+    return (
+      <aside className={styles.detail} data-testid="proposal-detail-loading">
+        <div className={styles.loading}>加载中…</div>
+      </aside>
+    );
+  }
+  if (error) {
+    return (
+      <aside className={styles.detail} data-testid="proposal-detail-error">
+        <div className={styles.error} role="alert">
+          {error}
+        </div>
+        <button className={styles.btnQuiet} onClick={onClose}>关闭</button>
+      </aside>
+    );
+  }
+  if (!data) return null;
+
+  const { proposal, shadowReplays } = data;
+  const releaseEnabled = proposal.status === "eligible_for_release";
+  const rollbackEnabled = proposal.status === "released";
+
+  return (
+    <aside className={styles.detail} data-testid="proposal-detail">
+      <header className={styles.detailHead}>
+        <h3>{proposal.kind === "threshold" ? "阈值候选" : "Prompt 候选"} 详情</h3>
+        <button className={styles.btnQuiet} onClick={onClose}>关闭</button>
+      </header>
+
+      <div className={styles.detailStatusRow}>
+        <StatusBadge status={proposal.status} />
+        {proposal.failureReason && (
+          <p className={styles.failureReason} data-testid="failure-reason">
+            未通过原因：{proposal.failureReason}
+          </p>
+        )}
+      </div>
+
+      {proposal.kind === "threshold" ? (
+        <ThresholdDiffView proposal={proposal} currentState={data.currentState} />
+      ) : (
+        <PromptDiffView proposal={proposal} currentState={data.currentState} />
+      )}
+
+      <ShadowEvalReport summary={shadowReplays} proposal={proposal} />
+
+      <footer className={styles.detailActions}>
+        <button
+          className={styles.btnPrimary}
+          onClick={() => setModal("release")}
+          disabled={!releaseEnabled}
+          data-testid="release-button"
+        >
+          发布
+        </button>
+        <button
+          className={styles.btnDanger}
+          onClick={() => setModal("rollback")}
+          disabled={!rollbackEnabled}
+          data-testid="rollback-button"
+        >
+          回滚
+        </button>
+      </footer>
+
+      {modal === "release" && (
+        <ConfirmModal
+          kind="release"
+          proposalId={proposal.id ?? proposalId}
+          onClose={() => setModal(null)}
+          onDone={() => {
+            setModal(null);
+            onDone?.();
+          }}
+        />
+      )}
+      {modal === "rollback" && (
+        <ConfirmModal
+          kind="rollback"
+          proposalId={proposal.id ?? proposalId}
+          onClose={() => setModal(null)}
+          onDone={() => {
+            setModal(null);
+            onDone?.();
+          }}
+        />
+      )}
+    </aside>
+  );
+}
+
+function ThresholdDiffView({
+  proposal,
+  currentState,
+}: {
+  proposal: ProposalDetail;
+  currentState: Record<string, unknown>;
+}) {
+  const cur = (currentState["currentValue"] ?? null) as number | null;
+  const proposed = proposal.proposedValue;
+  const cohort = (proposal.cohortNotes ?? {}) as Record<string, unknown>;
+  const hitRate = (cohort["hit_rate_observed"] ?? cohort["hitRateObserved"] ?? null) as
+    | number
+    | null;
+  return (
+    <section className={styles.thresholdDiff} data-testid="threshold-diff">
+      <table className={styles.thresholdTable}>
+        <tbody>
+          <tr>
+            <th>Gate Key</th>
+            <td data-testid="threshold-gate-key">{proposal.gateKey ?? "—"}</td>
+          </tr>
+          <tr>
+            <th>当前生效值</th>
+            <td data-testid="threshold-current">{formatNumber(cur)}</td>
+          </tr>
+          <tr>
+            <th>候选值</th>
+            <td data-testid="threshold-proposed">{formatNumber(proposed)}</td>
+          </tr>
+          <tr>
+            <th>cohort 命中率</th>
+            <td data-testid="threshold-hit-rate">{formatPercent(hitRate)}</td>
+          </tr>
+        </tbody>
+      </table>
+    </section>
+  );
+}
+
+function PromptDiffView({
+  proposal,
+  currentState,
+}: {
+  proposal: ProposalDetail;
+  currentState: Record<string, unknown>;
+}) {
+  const currentText = (currentState["currentSectionText"] ??
+    currentState["current_section_text"] ??
+    "") as string;
+  const proposedText = proposal.diffSnippet ?? "";
+  const expected = proposal.expectedImprovementOn ?? [];
+  return (
+    <section className={styles.promptDiff} data-testid="prompt-diff">
+      <div className={styles.promptDiffPanes}>
+        <div data-testid="prompt-diff-current">
+          <h4>当前内容</h4>
+          <pre>{currentText || "(空)"}</pre>
+        </div>
+        <div data-testid="prompt-diff-proposed">
+          <h4>候选内容</h4>
+          <pre>{proposedText || "(空)"}</pre>
+        </div>
+      </div>
+      {proposal.criticReasoning && (
+        <div className={styles.criticReasoning} data-testid="critic-reasoning">
+          <h4>Critic 推理</h4>
+          <p>{proposal.criticReasoning}</p>
+        </div>
+      )}
+      {expected.length > 0 && (
+        <div className={styles.expectedTags} data-testid="expected-improvement">
+          {expected.map((tag) => (
+            <span key={tag} className={styles.tag}>
+              {tag}
+            </span>
+          ))}
+        </div>
+      )}
+    </section>
+  );
+}
+
+function ShadowEvalReport({
+  summary,
+  proposal,
+}: {
+  summary: ShadowReplaysSummary;
+  proposal: ProposalDetail;
+}) {
+  return (
+    <section className={styles.shadowEval} data-testid="shadow-eval">
+      <h4>Shadow 评测</h4>
+      <div className={styles.shadowGrid}>
+        <div data-testid="shadow-completed">
+          <span>完成</span>
+          <strong>{summary.totalCompleted}</strong>
+        </div>
+        <div data-testid="shadow-failed">
+          <span>失败</span>
+          <strong>{summary.totalFailed}</strong>
+        </div>
+        <div data-testid="shadow-significance">
+          <span>显著性</span>
+          <strong>
+            {proposal.significancePassed === null
+              ? "—"
+              : proposal.significancePassed
+              ? "通过"
+              : "未通过"}
+          </strong>
+        </div>
+      </div>
+      {summary.samples.length > 0 && (
+        <details>
+          <summary>样本（前 5 条）</summary>
+          <table>
+            <thead>
+              <tr>
+                <th>source_run_id</th>
+                <th>原 final_review</th>
+                <th>新 final_review</th>
+                <th>tokens</th>
+              </tr>
+            </thead>
+            <tbody>
+              {summary.samples.map((s) => (
+                <tr key={s.id ?? s.sourceRunId}>
+                  <td>{s.sourceRunId}</td>
+                  <td>{s.originalFinalReviewStatus ?? "—"}</td>
+                  <td>{s.newFinalReviewStatus ?? "—"}</td>
+                  <td>{s.newTokenCost ?? "—"}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </details>
+      )}
+    </section>
+  );
+}
+
+// ── 确认弹窗 ──
+
+const RELEASE_LITERAL = "RELEASE";
+const ROLLBACK_LITERAL = "ROLLBACK";
+
+export function ConfirmModal({
+  kind,
+  proposalId,
+  onClose,
+  onDone,
+}: {
+  kind: "release" | "rollback";
+  proposalId: string;
+  onClose: () => void;
+  onDone: () => void;
+}) {
+  const literal = kind === "release" ? RELEASE_LITERAL : ROLLBACK_LITERAL;
+  const verb = kind === "release" ? "发布" : "回滚";
+  const [text, setText] = useState("");
+  const [submitting, setSubmitting] = useState(false);
+  const [err, setErr] = useState<string>("");
+
+  const matches = text === literal;
+
+  async function submit() {
+    if (!matches || submitting) return;
+    setSubmitting(true);
+    setErr("");
+    try {
+      await api.post(`/api/evolution/proposals/${proposalId}/${kind}`, {
+        confirmation: literal,
+      });
+      onDone();
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : String(e));
+    } finally {
+      setSubmitting(false);
+    }
+  }
+
+  return (
+    <div className={styles.modalOverlay} data-testid={`confirm-modal-${kind}`}>
+      <div className={styles.modal}>
+        <h3>确认{verb}候选？</h3>
+        <p>
+          请输入 <code>{literal}</code> 以确认。任何不完全匹配的输入都会阻止提交。
+        </p>
+        <input
+          className={styles.modalInput}
+          type="text"
+          value={text}
+          onChange={(e) => setText(e.target.value)}
+          placeholder={literal}
+          data-testid={`confirm-input-${kind}`}
+          autoFocus
+        />
+        {err && (
+          <div className={styles.error} role="alert">
+            {err}
+          </div>
+        )}
+        <footer className={styles.modalFoot}>
+          <button className={styles.btnQuiet} onClick={onClose} disabled={submitting}>
+            取消
+          </button>
+          <button
+            className={styles.btnPrimary}
+            onClick={() => void submit()}
+            disabled={!matches || submitting}
+            data-testid={`confirm-submit-${kind}`}
+          >
+            {submitting ? `${verb}中…` : `确认${verb}`}
+          </button>
+        </footer>
+      </div>
+    </div>
+  );
+}
