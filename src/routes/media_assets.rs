@@ -470,6 +470,50 @@ pub(super) async fn toggle_content_asset_sendable(
     Ok(Json(json!({ "ok": true, "sendable": payload.sendable })))
 }
 
+/// DELETE /content-assets/:id —— 删除。
+/// 先删 DB 记录,再查同 file_path 剩余引用,无引用才物理删文件(防误删兄弟共享文件)。
+/// 物理删 fail-soft(DB 已删=既成事实,残留文件无害)。workspace 隔离。
+pub(super) async fn delete_content_asset(
+    State(state): State<AppState>,
+    Extension(admin): Extension<AuthenticatedAdmin>,
+    Path(id): Path<String>,
+) -> AppResult<Json<Value>> {
+    let oid = ObjectId::parse_str(&id).map_err(|_| AppError::BadRequest("bad id".into()))?;
+    // 回查拿 file_path（workspace 隔离）。
+    let asset = state
+        .db
+        .content_assets()
+        .find_one(doc! { "_id": oid, "workspace_id": &admin.current_workspace }, None)
+        .await?
+        .ok_or_else(|| AppError::NotFound("asset not found".into()))?;
+
+    let res = state
+        .db
+        .content_assets()
+        .delete_one(doc! { "_id": oid, "workspace_id": &admin.current_workspace }, None)
+        .await?;
+    if res.deleted_count == 0 {
+        return Err(AppError::NotFound("asset not found".into()));
+    }
+
+    // 引用计数清理：本记录已删,count 同 file_path 剩余引用,为 0 才物理删。
+    if let Some(rel) = asset.file_path {
+        let refs = state
+            .db
+            .content_assets()
+            .count_documents(doc! { "workspace_id": &admin.current_workspace, "file_path": &rel }, None)
+            .await
+            .unwrap_or(1); // 查询失败 → 视为有引用,保守不删
+        if media_storage::should_delete_physical_file(refs) {
+            let root = std::path::Path::new(&state.config.media_storage_dir);
+            if let Err(e) = media_storage::delete_bytes(root, &rel).await {
+                tracing::warn!("删除素材后物理文件删除失败（不影响删除）: {e}");
+            }
+        }
+    }
+    Ok(Json(json!({ "ok": true })))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
