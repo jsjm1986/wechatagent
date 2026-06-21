@@ -253,6 +253,11 @@ async fn offline_account_defers_without_consuming_attempt() {
         .expect("claimed entry");
     assert_eq!(claimed.attempt, 0, "首次抢占 attempt=0");
 
+    // 基准：defer 调用前的时刻。defer 会把 next_retry_at 推后
+    // ACCOUNT_OFFLINE_DEFER_SECONDS(60s)，故 defer 后的 next_retry_at 必然 > 此刻；
+    // 而 enqueue 时 next_retry_at=None——以此坐实"推后"语义（去永真断言）。
+    let before_defer = DateTime::now();
+
     process_entry(&state, &claimed)
         .await
         .expect("process entry ok");
@@ -277,9 +282,14 @@ async fn offline_account_defers_without_consuming_attempt() {
         entry.attempt
     );
     assert!(entry.sent_at.is_none(), "defer 不应标记 sent_at");
+    let next_retry_at = entry
+        .next_retry_at
+        .expect("defer 应推后 next_retry_at 等账号恢复");
     assert!(
-        entry.next_retry_at.is_some(),
-        "defer 应推后 next_retry_at 等账号恢复"
+        next_retry_at > before_defer,
+        "defer 必须把 next_retry_at 推后到 defer 时刻之后（推后 60s），got next_retry_at={:?} before_defer={:?}",
+        next_retry_at,
+        before_defer
     );
 
     // 写了 defer 审计事件（AI 自治措辞）。
