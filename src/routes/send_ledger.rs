@@ -12,6 +12,15 @@ use serde_json::{json, Value};
 use super::AppState;
 use crate::{auth::AuthenticatedAdmin, error::AppResult};
 
+/// 读聚合 $sum 计数：兼容 mongo 返回 i32 或 i64（$sum:1 的运行时类型随版本/数据量变）。
+/// 否则 i64 时 get_i32 返 Err → unwrap_or(0) 会静默把计数清零，整页统计显示 0。
+fn agg_count(d: &Document, key: &str) -> u64 {
+    d.get_i64(key)
+        .map(|v| v.max(0) as u64)
+        .or_else(|_| d.get_i32(key).map(|v| v.max(0) as u64))
+        .unwrap_or(0)
+}
+
 /// 聚合 $match：固定 workspace，可选 kind。
 pub(super) fn build_stats_match(workspace_id: &str, kind: Option<&str>) -> Document {
     let mut m = doc! { "workspace_id": workspace_id };
@@ -84,10 +93,10 @@ pub(super) async fn send_ledger_stats(
     let mut cursor = state.db.agent_send_ledger().aggregate(pipeline, None).await?;
     let mut items = Vec::new();
     while let Some(d) = cursor.try_next().await? {
-        let sent = d.get_i32("sentCount").unwrap_or(0).max(0) as u64;
-        let responded = d.get_i32("respondedCount").unwrap_or(0).max(0) as u64;
-        let advanced = d.get_i32("stageAdvancedCount").unwrap_or(0).max(0) as u64;
-        let evaluated = d.get_i32("evaluatedCount").unwrap_or(0).max(0) as u64;
+        let sent = agg_count(&d, "sentCount");
+        let responded = agg_count(&d, "respondedCount");
+        let advanced = agg_count(&d, "stageAdvancedCount");
+        let evaluated = agg_count(&d, "evaluatedCount");
         let contact_count = d.get_array("contacts").map(|a| a.len()).unwrap_or(0);
         items.push(json!({
             "targetId": d.get_str("_id").unwrap_or_default(),
@@ -120,10 +129,10 @@ pub(super) async fn send_ledger_overview(
     let mut cursor = state.db.agent_send_ledger().aggregate(pipeline, None).await?;
     let (mut total, mut responded, mut advanced, mut evaluated) = (0u64, 0u64, 0u64, 0u64);
     if let Some(d) = cursor.try_next().await? {
-        total = d.get_i32("total").unwrap_or(0).max(0) as u64;
-        responded = d.get_i32("respondedCount").unwrap_or(0).max(0) as u64;
-        advanced = d.get_i32("stageAdvancedCount").unwrap_or(0).max(0) as u64;
-        evaluated = d.get_i32("evaluatedCount").unwrap_or(0).max(0) as u64;
+        total = agg_count(&d, "total");
+        responded = agg_count(&d, "respondedCount");
+        advanced = agg_count(&d, "stageAdvancedCount");
+        evaluated = agg_count(&d, "evaluatedCount");
     }
     Ok(Json(json!({
         "totalSends": total,
@@ -148,5 +157,24 @@ mod tests {
         let m = build_stats_match("ws1", None);
         assert_eq!(m.get_str("workspace_id").ok(), Some("ws1"));
         assert!(!m.contains_key("send_kind"));
+    }
+
+    #[test]
+    fn agg_count_reads_both_i32_and_i64() {
+        let d = doc! {
+            "asI32": 7i32,
+            "asI64": 42i64,
+            "negI64": -3i64,
+            "negI32": -5i32,
+        };
+        // i32 路径
+        assert_eq!(agg_count(&d, "asI32"), 7);
+        // i64 路径（mongo $sum:1 在大数据量/新版本可能返 i64）
+        assert_eq!(agg_count(&d, "asI64"), 42);
+        // 负值钳制为 0（保持原 .max(0) 语义）
+        assert_eq!(agg_count(&d, "negI64"), 0);
+        assert_eq!(agg_count(&d, "negI32"), 0);
+        // 缺失字段返 0
+        assert_eq!(agg_count(&d, "missing"), 0);
     }
 }
