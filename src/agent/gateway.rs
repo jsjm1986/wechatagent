@@ -361,6 +361,7 @@ pub async fn send_contact_message_gateway(
         source_kind: SOURCE_KIND_MANUAL_SEND.to_string(),
         content: content.clone(),
         media_asset_id: None,
+        referral_card_id: None,
         max_attempts: 3,
     };
     match outbox_enqueue(state, enqueue_req).await {
@@ -1839,6 +1840,7 @@ async fn run_user_operation_gateway_inner(
                 source_kind: trigger.kind().to_string(),
                 content: segment,
                 media_asset_id: None,
+                referral_card_id: None,
                 max_attempts: 3,
             };
             match outbox_enqueue(state, enqueue_req).await {
@@ -2028,6 +2030,7 @@ async fn run_user_operation_gateway_inner(
                 source_kind: trigger.kind().to_string(),
                 content: String::new(), // 媒体条目允许空 content
                 media_asset_id: Some(directive.asset_id.clone()),
+                referral_card_id: None,
                 max_attempts: 3,
             };
             match outbox_enqueue(state, enqueue_req).await {

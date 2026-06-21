@@ -2454,6 +2454,9 @@ pub struct OutboxEntry {
     /// dispatcher 据此走 send_outbound_media。`#[serde(default)]` 兼容旧文档。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub media_asset_id: Option<String>,
+    /// 名片引荐条目：非空表示发专属顾问名片而非文本/素材。`#[serde(default)]` 兼容旧文档。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub referral_card_id: Option<String>,
     #[serde(default)]
     pub attempt: i32,
     #[serde(default)]
@@ -4769,6 +4772,7 @@ mod typed_tests {
             content_hash: "sha256:abcdef".to_string(),
             idempotency_key: "evt-source-001:wxid_test_001:sha256:abcdef".to_string(),
             media_asset_id: None,
+            referral_card_id: None,
             attempt: 0,
             max_attempts: 3,
             status: "pending".to_string(),
