@@ -870,6 +870,42 @@ pub struct ReferralCard {
     pub updated_at: DateTime,
 }
 
+/// 主动发送台账：每次 AI 主动发素材/名片成功后落一条。素材与名片共用
+/// （send_kind 区分），供单客户历史 / 维度聚合统计 / prompt 已发历史注入。
+/// 转化字段（responded/stage_advanced）发送时留空，由 tasks worker 回扫填充。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentSendLedger {
+    #[serde(rename = "_id", skip_serializing_if = "Option::is_none")]
+    pub id: Option<ObjectId>,
+    pub workspace_id: String,
+    pub account_id: String,
+    pub contact_wxid: String,
+    /// "media" | "namecard"
+    pub send_kind: String,
+    /// asset_id 或 card_id（hex）
+    pub target_id: String,
+    /// 冗余快照：素材标题 / 顾问名（统计展示不回表，原实体改名/删除后历史仍可读）
+    #[serde(default)]
+    pub target_title: String,
+    pub run_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trigger_reason: Option<String>,
+    /// 发送瞬间客户阶段快照（阶段推进判断的"前值"）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub customer_stage_at_send: Option<String>,
+    pub sent_at: DateTime,
+    /// sent_at 后 response_window_hours 小时内是否有入站消息（回扫填）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub responded: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_window_hours: Option<i32>,
+    /// 发送后 customer_stage 是否前进（回扫填）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stage_advanced: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outcome_evaluated_at: Option<DateTime>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OperationDomainConfig {
     #[serde(rename = "_id", skip_serializing_if = "Option::is_none")]
@@ -5679,5 +5715,52 @@ mod referral_card_compat_tests {
         let cfg: OperationDomainConfig = mongodb::bson::from_document(legacy)
             .expect("legacy domain config must still deserialize");
         assert_eq!(cfg.assist_mode_enabled, None);
+    }
+}
+
+#[cfg(test)]
+mod send_ledger_compat_tests {
+    use super::AgentSendLedger;
+    use mongodb::bson::{doc, DateTime};
+
+    #[test]
+    fn ledger_roundtrips() {
+        let row = AgentSendLedger {
+            id: None,
+            workspace_id: "ws1".into(),
+            account_id: "acct1".into(),
+            contact_wxid: "wxid_cust".into(),
+            send_kind: "media".into(),
+            target_id: "asset1".into(),
+            target_title: "报价单 2026".into(),
+            run_id: "run1".into(),
+            trigger_reason: Some("客户问报价".into()),
+            customer_stage_at_send: Some("意向".into()),
+            sent_at: DateTime::now(),
+            responded: None,
+            response_window_hours: None,
+            stage_advanced: None,
+            outcome_evaluated_at: None,
+        };
+        let d = mongodb::bson::to_document(&row).unwrap();
+        let back: AgentSendLedger = mongodb::bson::from_document(d).unwrap();
+        assert_eq!(back.send_kind, "media");
+        assert_eq!(back.target_id, "asset1");
+        assert!(back.responded.is_none());
+    }
+
+    #[test]
+    fn legacy_row_without_outcome_fields_deserializes() {
+        // 转化字段全缺的早期条目必须仍能反序列化（向后兼容红线）
+        let legacy = doc! {
+            "workspace_id": "ws1", "account_id": "a", "contact_wxid": "w",
+            "send_kind": "namecard", "target_id": "c1", "target_title": "张顾问",
+            "run_id": "r1", "sent_at": DateTime::now(),
+        };
+        let row: AgentSendLedger = mongodb::bson::from_document(legacy)
+            .expect("legacy ledger row must deserialize");
+        assert_eq!(row.send_kind, "namecard");
+        assert!(row.responded.is_none());
+        assert!(row.outcome_evaluated_at.is_none());
     }
 }
