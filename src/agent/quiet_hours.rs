@@ -49,10 +49,29 @@ pub(crate) fn hour_in_offset(now_utc_ms: i64, tz_offset_hours: i32) -> u32 {
     shifted.div_euclid(3_600_000).rem_euclid(24) as u32
 }
 
-/// 给定 UTC 毫秒、醒来小时 `end`、时区偏移，返回下一次"运营方本地 `end`:00"对应的
-/// UTC 毫秒。严格在 `now` 之后（恰好命中 `end`:00 也取次日，保证 wake 落在未来，
-/// 与旧 `next_wake_instant` 的"严格大于"语义一致）。
-pub(crate) fn next_wake_utc_ms(now_utc_ms: i64, end: u32, tz_offset_hours: i32) -> i64 {
+/// 从 contact 标识派生确定性 jitter（毫秒），落在 [0, max_seconds*1000]。同一 seed
+/// 恒定（可复现、可测），不同 contact 散开，把整点唤醒打散避免齐发。max_seconds=0 → 恒 0。
+///
+/// 用 FNV-1a 而非 `DefaultHasher`：后者哈希算法跨 Rust 版本不保证稳定，会让 jitter
+/// 不可复现；FNV-1a 是固定常量算法，同一 seed 在任何版本恒定。
+pub(crate) fn jitter_ms_for_seed(seed: &str, max_seconds: u32) -> i64 {
+    if max_seconds == 0 {
+        return 0;
+    }
+    let mut h: u64 = 0xcbf29ce484222325; // FNV-1a offset basis
+    for b in seed.bytes() {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x100000001b3); // FNV prime
+    }
+    let max_ms = (max_seconds as u64) * 1000;
+    (h % (max_ms + 1)) as i64
+}
+
+/// 给定 UTC 毫秒、醒来小时 `end`、时区偏移、jitter 毫秒，返回下一次"运营方本地
+/// `end`:00 + jitter"对应的 UTC 毫秒。严格在 `now` 之后（恰好命中 `end`:00 也取次日，
+/// 保证 wake 落在未来，与旧 `next_wake_instant` 的"严格大于"语义一致）。jitter 把同一
+/// workspace 多客户的整点唤醒散开（per-contact 确定性偏移，见 [`jitter_ms_for_seed`]）。
+pub(crate) fn next_wake_utc_ms(now_utc_ms: i64, end: u32, tz_offset_hours: i32, jitter_ms: i64) -> i64 {
     let off = (tz_offset_hours as i64) * 3_600_000;
     let local_ms = now_utc_ms + off;
     let day = local_ms.div_euclid(86_400_000); // 本地"第几天"
@@ -62,7 +81,7 @@ pub(crate) fn next_wake_utc_ms(now_utc_ms: i64, end: u32, tz_offset_hours: i32) 
     } else {
         end_ms_today + 86_400_000
     };
-    local_target - off // 回到 UTC
+    (local_target - off) + jitter_ms // 回到 UTC 并叠加 per-contact jitter
 }
 
 /// 薄包装：当前真实时刻（按运营方偏移换算）是否在静默时段。生产判定入口。
@@ -74,12 +93,21 @@ pub(crate) fn is_quiet_now(start: u32, end: u32, tz_offset_hours: i32) -> bool {
     )
 }
 
-/// 薄包装：从现在算下一次醒来时刻（UTC），转成 BSON `DateTime` 供 task `run_at` 用。
-pub(crate) fn next_wake_at(end: u32, tz_offset_hours: i32) -> mongodb::bson::DateTime {
+/// 薄包装：从现在算下一次醒来时刻（UTC）+ per-contact jitter，转成 BSON `DateTime`
+/// 供 task `run_at` 用。`jitter_seed` 通常传 `contact.wxid`（同 contact 恒定偏移、
+/// 不同 contact 散开），`jitter_max_seconds` 来自 `config.wake_jitter_max_seconds`。
+pub(crate) fn next_wake_at(
+    end: u32,
+    tz_offset_hours: i32,
+    jitter_seed: &str,
+    jitter_max_seconds: u32,
+) -> mongodb::bson::DateTime {
+    let jitter = jitter_ms_for_seed(jitter_seed, jitter_max_seconds);
     mongodb::bson::DateTime::from_millis(next_wake_utc_ms(
         Utc::now().timestamp_millis(),
         end,
         tz_offset_hours,
+        jitter,
     ))
 }
 
@@ -181,7 +209,7 @@ mod tests {
     fn wake_same_day_when_end_still_ahead() {
         // 北京 02:30（= UTC 前一日 18:30），end=8 → 北京当天 08:00（= UTC 00:00）。
         let now = utc_ms("2026-06-08T18:30:00Z");
-        let wake = next_wake_utc_ms(now, 8, 8);
+        let wake = next_wake_utc_ms(now, 8, 8, 0);
         assert_eq!(wake, utc_ms("2026-06-09T00:00:00Z"));
     }
 
@@ -189,7 +217,7 @@ mod tests {
     fn wake_next_day_when_end_already_passed() {
         // 北京 23:00（= UTC 15:00），end=8 → 北京次日 08:00（= 次日 UTC 00:00）。
         let now = utc_ms("2026-06-09T15:00:00Z");
-        let wake = next_wake_utc_ms(now, 8, 8);
+        let wake = next_wake_utc_ms(now, 8, 8, 0);
         assert_eq!(wake, utc_ms("2026-06-10T00:00:00Z"));
     }
 
@@ -197,7 +225,7 @@ mod tests {
     fn wake_strictly_after_now_at_exact_hour() {
         // 恰好北京 08:00（= UTC 00:00）命中 end → 不取当天，取次日，保证 wake 严格在未来。
         let now = utc_ms("2026-06-09T00:00:00Z");
-        let wake = next_wake_utc_ms(now, 8, 8);
+        let wake = next_wake_utc_ms(now, 8, 8, 0);
         assert_eq!(wake, utc_ms("2026-06-10T00:00:00Z"));
         assert!(wake > now, "wake 必须严格在 now 之后");
     }
@@ -206,13 +234,39 @@ mod tests {
     fn wake_respects_negative_offset() {
         // 西五区 -5：UTC 12:00 = 当地 07:00，end=8 → 当地当天 08:00 = UTC 13:00。
         let now = utc_ms("2026-06-09T12:00:00Z");
-        let wake = next_wake_utc_ms(now, 8, -5);
+        let wake = next_wake_utc_ms(now, 8, -5, 0);
         assert_eq!(wake, utc_ms("2026-06-09T13:00:00Z"));
     }
 
     #[test]
     fn deferred_kind_constant_stable() {
         assert_eq!(DEFERRED_INBOUND_REPLY_KIND, "deferred_inbound_reply");
+    }
+
+    #[test]
+    fn jitter_is_deterministic_per_seed() {
+        let now = 1_700_000_000_000;
+        let a = next_wake_utc_ms(now, 8, 8, jitter_ms_for_seed("wxid_alice", 900));
+        let b = next_wake_utc_ms(now, 8, 8, jitter_ms_for_seed("wxid_alice", 900));
+        assert_eq!(a, b);
+    }
+    #[test]
+    fn jitter_differs_across_seeds() {
+        assert_ne!(
+            jitter_ms_for_seed("wxid_alice", 900),
+            jitter_ms_for_seed("wxid_bob", 900)
+        );
+    }
+    #[test]
+    fn jitter_within_bounds() {
+        for seed in ["a", "b", "c", "xyz", "wxid_123456"] {
+            let j = jitter_ms_for_seed(seed, 900);
+            assert!(j >= 0 && j <= 900 * 1000, "jitter 越界: {}", j);
+        }
+    }
+    #[test]
+    fn jitter_zero_max_is_noop() {
+        assert_eq!(jitter_ms_for_seed("anything", 0), 0);
     }
 
     /// G04：构造一个 managed、无 operation_mode_override 的最小 Contact，便于断言

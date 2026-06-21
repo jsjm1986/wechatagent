@@ -137,6 +137,7 @@ fn base_cfg() -> AppConfig {
         media_storage_dir: "./media".to_string(),
         media_max_file_size_mb: 50,
         media_id_cache_ttl_hours: 24,
+        wake_jitter_max_seconds: 900,
     }
 }
 
