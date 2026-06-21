@@ -44,7 +44,7 @@
 
 - **缺口 6**：`src/routes/media_assets.rs`（upload）+ `src/routes/referral_cards.rs`（create）各调归一；新增 `normalize_target_stages` 壳函数放 `src/agent/dimension_registry.rs`（校验逻辑同源，两端点共用一份避免漂移）。
 - **缺口 3**：`src/routes/media_assets.rs`（review）+ `src/routes/referral_cards.rs`（review）各加一行 fail-soft 审计。
-- **缺口 2**：在 `src/routes/contacts.rs` 新增 `PATCH /api/contacts/:id/assist-override` 端点（含 `is_valid_assist_mode` 闭集校验纯函数）+ 在 `src/routes/mod.rs` 挂载路由 + 前端 `frontend/src/features/user-ops/legacy.tsx` 单客户视图三态下拉。`:id` = contact ObjectId，对齐既有 `/contacts/:id/enable-agent`、`/contacts/:id/profile-note` 等 contact 写入端点主流（**不用 `:wxid`**——仅簇 A 新加的 send-history 用 wxid）。
+- **缺口 2**：在 `src/routes/contacts.rs` 新增 `PUT /api/contacts/:id/assist-override` 端点（含 `is_valid_assist_mode` 闭集校验纯函数）+ 在 `src/routes/mod.rs` 挂载路由 + 前端 `frontend/src/features/user-ops/legacy.tsx` 单客户视图三态下拉。`:id` = contact ObjectId，对齐既有 `/contacts/:id/enable-agent`、`/contacts/:id/profile-note` 等 contact 写入端点主流（**不用 `:wxid`**——仅簇 A 新加的 send-history 用 wxid）。用 PUT 对齐前端 `api.put`（helper 无 patch）。
 
 ## 4. 缺口 6：target_stages 归一校验
 
@@ -131,7 +131,7 @@ review_media_asset / review_referral_card
 
 ```
 前端单客户视图三态下拉：跟随账号默认 / 强制开 / 强制关
-  → PATCH /api/contacts/:id/assist-override  { mode: "default"|"force_on"|"force_off" }
+  → PUT /api/contacts/:id/assist-override  { mode: "default"|"force_on"|"force_off" }
   → 后端校验 mode ∈ 闭集，否则 400
   → parse_object_id(:id) + find_contact_by_id(workspace, id)（跨 workspace / 不存在 → 404，复用既有 helper）
   → "default"  → $unset domain_attributes.assist_mode_override（清键回落账号级）
@@ -143,8 +143,8 @@ review_media_asset / review_referral_card
 
 1. **三态映射**：`default` 走 `$unset`（不是写空串），让 `assist_mode_active` 的 `_ => account_enabled` 分支干净回落。
 2. **闭集校验**：mode 只接受三个字面量，守 gateway 状态枚举闭集纪律。新增纯函数 `is_valid_assist_mode(&str) -> bool`。
-3. **路由位置**：在 `contacts.rs` 新建 `PATCH /api/contacts/:id/assist-override`，`:id` = contact ObjectId（对齐 enable-agent / profile-note 等既有 contact 写入端点，复用 `parse_object_id` + `find_contact_by_id` + workspace 隔离）。
-4. **前端**：`legacy.tsx` 单客户视图（已渲染 domainAttributes，1951 行附近）加三态下拉 + 当前值回显；读取走现有 contact 详情（`domainAttributes.assist_mode_override`）。设计语言遵现有 user-ops 页表单样式，不新造风格。
+3. **路由位置 + HTTP 方法**：在 `contacts.rs` 新建 `PUT /api/contacts/:id/assist-override`，`:id` = contact ObjectId（对齐 enable-agent / profile-note 等既有 contact 写入端点，复用 `parse_object_id` + `find_contact_by_id` + workspace 隔离）。**用 PUT 而非 PATCH**——前端 `api` helper（`frontend/src/lib/api.ts`）有 `put` 无 `patch`，沿用 PUT 省掉给 helper 加方法（profile-note 也是 PUT）。
+4. **前端**：`legacy.tsx` 单客户操作区（`SmartWorkspace`，customAgentInstructions / profile-note 所在 section）加三态下拉 + 保存按钮。**回显坑**：保存成功后统一调 `refreshContacts` 只重拉列表、**不刷新 `selected`**（`contactStore` 独立对象）。所以下拉用**本地受控 state**（照 `customAgentInstructions` 链路：store state + setter + `hydrateSelected` 从 contact 注入初值 `assist_mode_override`），不直接从 `selected.domainAttributes` 派生（会回显旧值）。`store action saveAssistOverride` 照 `saveProfileNote`（`userOpsStore.ts:432`）写：`api.put('/api/contacts/${id}/assist-override', { mode })` + `setBusy` + `refreshContacts`。
 
 ### 6.3 红线
 
