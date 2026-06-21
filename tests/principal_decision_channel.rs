@@ -344,11 +344,11 @@ async fn t_awaiting_marker_set_and_clear_roundtrip() {
     assert!(!cleared, "等待标记应在 $unset 后消失");
 }
 
-// ─────────── §14.10 超时改派骚扰门 / 非原子修复（#4 #5 #6，#[ignore]，CI 跑） ───────────
+// ─────────── §14.10 超时改派骚扰门 / 重构（#4 #5 #6 + 链尾困死/自我命中，#[ignore]，CI 跑） ───────────
 //
-// 这三条覆盖的生产函数（latest_push_ms / touch_escalation_updated_at / reassign_escalation +
-// scan_escalation_timeouts 内的骚扰门接线）都是 pub(crate)，crate 外不可直达。遵循本文件既定
-// 约定（见文件头 §：通过公共表面切片断言而非放开可见性），下列测试一律经**唯一 pub 入口**
+// 这些测试覆盖的生产函数（latest_push_ms / reassign_escalation +
+// scan_escalation_timeouts 内的 gate→push→推成功才 reassign 接线）都是 pub(crate)，crate 外不可直达。
+// 遵循本文件既定约定（见文件头 §：通过公共表面切片断言而非放开可见性），下列测试一律经**唯一 pub 入口**
 // `scan_escalation_timeouts` 驱动，并用公共 typed accessor 断言台账 DB 终态。
 
 /// 写一行 user_operations domain config，带 ask_human_policy（决策人链 + 可选骚扰门字段）。
