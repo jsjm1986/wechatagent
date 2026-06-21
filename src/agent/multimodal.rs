@@ -105,8 +105,8 @@ pub async fn describe_inbound_image(
 /// 既不硬答空串/原始 XML、也不崩。
 ///
 /// 话术对所有已知非文本类型（image/voice/link/miniprogram/file 及 unknown 兜底）
-/// 都返回非空、自然、AI 自治口吻的文案——客户始终只跟 AI 对话。**绝不**出现暗示
-/// 人工接管的措辞（由 `check-no-human-takeover` lint 在 diff 层兜底）。
+/// 都返回非空、自然、AI 自治口吻的文案——全程保持 AI 自治：AI 看、AI 帮客户处理，
+/// 客户始终只跟 AI 对话。措辞合规由 CI 文本门（scripts/check-no-* 系列）在 diff 层兜底。
 pub fn non_text_transition_reply(msg_type: &str) -> String {
     match msg_type {
         "image" => "我看到您发的图片啦～方便简单文字描述下您想了解什么吗？这样我能更准确帮您看～".to_string(),
@@ -125,7 +125,7 @@ mod tests {
     use super::*;
 
     /// 反过拟合：覆盖多类型（含 unknown 兜底），每类都返回非空话术。
-    /// 禁词（人工/接管等）由 check-no-human-takeover lint 在 diff 层兜底。
+    /// 话术合规（AI 自治口吻）由 CI 文本门（scripts/check-no-* 系列）在 diff 层兜底。
     #[test]
     fn non_text_transition_reply_covers_types_non_empty() {
         for t in [
@@ -152,4 +152,10 @@ mod tests {
         assert_eq!(fallback, non_text_transition_reply("some_future_type"));
         assert_ne!(fallback, non_text_transition_reply("image"));
     }
+
+    // `fetch_inbound_media` 桩当前恒 `Ok(None)`（未接通，见函数 doc）。它需要
+    // `&AppState`（内含活的 `Database`/`McpClient`/`LlmProvider`），纯 lib 单测无法
+    // 在不接 Mongo / 不引入脆弱 mock 的前提下构造，故此处不为它造桩单测——其"恒
+    // 返回 None"的语义已由编译期类型 + doc 固定，真实下载接通后的行为由 ⑤完整
+    // feature 立项时的集成测试覆盖（待 server tools/list 确认媒体下载 tool 后）。
 }
