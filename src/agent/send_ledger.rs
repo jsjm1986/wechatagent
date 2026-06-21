@@ -1,6 +1,89 @@
 //! 主动发送台账：转化判定纯函数（responded 窗口 / stage_advanced 推进）、
 //! 聚合率计算。写入 / 回扫的 DB 逻辑在 gateway/tasks 调用侧，这里只放可单测的纯逻辑。
 
+use crate::models::AgentSendLedger;
+use crate::routes::AppState;
+use mongodb::bson::{doc, oid::ObjectId, DateTime};
+
+/// 构造一条待写台账。转化字段一律留空（回扫填）。
+pub(crate) fn build_ledger_entry(
+    workspace_id: &str,
+    account_id: &str,
+    contact_wxid: &str,
+    send_kind: &str,
+    target_id: &str,
+    target_title: &str,
+    run_id: &str,
+    customer_stage_at_send: Option<String>,
+    now: DateTime,
+) -> AgentSendLedger {
+    AgentSendLedger {
+        id: None,
+        workspace_id: workspace_id.to_string(),
+        account_id: account_id.to_string(),
+        contact_wxid: contact_wxid.to_string(),
+        send_kind: send_kind.to_string(),
+        target_id: target_id.to_string(),
+        target_title: target_title.to_string(),
+        run_id: run_id.to_string(),
+        trigger_reason: None,
+        customer_stage_at_send,
+        sent_at: now,
+        responded: None,
+        response_window_hours: None,
+        stage_advanced: None,
+        outcome_evaluated_at: None,
+    }
+}
+
+/// fail-soft 写台账：失败只 log，绝不返 Err（既成事实纪律——发送已成，
+/// 台账缺一条不该影响发送结果，更不能让上游误判为失败而重发）。
+pub(crate) async fn record_send(state: &AppState, entry: &AgentSendLedger) {
+    if let Err(err) = state.db.agent_send_ledger().insert_one(entry, None).await {
+        tracing::error!(
+            workspace_id = %entry.workspace_id,
+            contact_wxid = %entry.contact_wxid,
+            send_kind = %entry.send_kind,
+            target_id = %entry.target_id,
+            error = %err,
+            "send succeeded but persisting agent_send_ledger failed; metrics will miss this send",
+        );
+    }
+}
+
+/// 回查发送物标题做冗余快照。查不到/解析失败返空串（不阻断写台账）。
+pub(crate) async fn lookup_target_title(
+    state: &AppState,
+    workspace_id: &str,
+    send_kind: &str,
+    target_id: &str,
+) -> String {
+    let Ok(oid) = ObjectId::parse_str(target_id) else {
+        return String::new();
+    };
+    let filter = doc! { "_id": oid, "workspace_id": workspace_id };
+    match send_kind {
+        "namecard" => state
+            .db
+            .referral_cards()
+            .find_one(filter, None)
+            .await
+            .ok()
+            .flatten()
+            .map(|c| c.display_name)
+            .unwrap_or_default(),
+        _ => state
+            .db
+            .content_assets()
+            .find_one(filter, None)
+            .await
+            .ok()
+            .flatten()
+            .map(|a| a.title)
+            .unwrap_or_default(),
+    }
+}
+
 /// 任一入站时间戳落在 (sent_at, sent_at + window_hours] 内 → 已响应。
 /// 早于/等于发送时刻的入站（历史消息）不算。
 pub(crate) fn responded_within_window(sent_at_ms: i64, window_hours: i32, inbound_ms: &[i64]) -> bool {
@@ -97,5 +180,22 @@ mod tests {
     #[test]
     fn response_rate_basic() {
         assert_eq!(response_rate(4, 1), 0.25);
+    }
+
+    #[test]
+    fn build_ledger_entry_sets_kind_and_leaves_outcome_none() {
+        use mongodb::bson::DateTime;
+        let row = build_ledger_entry(
+            "ws", "acct", "wx", "media", "asset1", "报价单", "run1",
+            Some("意向".to_string()), DateTime::now(),
+        );
+        assert_eq!(row.send_kind, "media");
+        assert_eq!(row.target_id, "asset1");
+        assert_eq!(row.target_title, "报价单");
+        assert_eq!(row.customer_stage_at_send.as_deref(), Some("意向"));
+        // 转化字段发送时必须留空（回扫才填）
+        assert!(row.responded.is_none());
+        assert!(row.stage_advanced.is_none());
+        assert!(row.outcome_evaluated_at.is_none());
     }
 }
