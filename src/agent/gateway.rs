@@ -642,6 +642,23 @@ pub(crate) fn media_send_order(_expression_pref: &str) -> SendOrder {
     SendOrder::TextThenMedia
 }
 
+/// media-asset 终审 Important#1：媒体发送资格 = 文本发送资格（同源）。
+/// `outbox_eligible` 已综合 should_reply + reply_text 非空 + final_status 终态
+/// + relay 泄漏 fail-closed 守卫四项。媒体复用它，杜绝三个缺口：
+/// ①should_reply=false/文本空时只发孤立文件（违背"文件配引导话术"设计）；
+/// ②relay 守卫置 false 时媒体仍照发。设计文档 §6.2 规定 file_primary 也总有
+/// 简短引导文本，故复用要求非空文本的 outbox_eligible 是正确的、不会过严。
+pub(crate) fn media_send_allowed(outbox_eligible: bool, has_assets: bool) -> bool {
+    outbox_eligible && has_assets
+}
+
+/// media-asset 终审 Important#1：并发去抖中止应覆盖文本与媒体两条轨道——只要本
+/// run 会发任何东西（文本或媒体）就该被"已被更新入站取代"的去抖拦截，否则一个
+/// superseded 的 run 仍会发出孤立文件（媒体去抖失效）。
+pub(crate) fn should_run_send(outbox_eligible: bool, media_pending: bool) -> bool {
+    outbox_eligible || media_pending
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_user_operation_gateway_inner(
     state: &AppState,
@@ -1768,7 +1785,12 @@ async fn run_user_operation_gateway_inner(
     // 绝大多数；这里再查一次，接住 apply / memory / decision-review 写入期间到达的
     // 更新入站，避免发出一条已过时的回复。此前的画像 / 记忆写入已落库（幂等、
     // last-write-wins），重算会再覆盖一遍，不丢正确性；唯一保证是"不入队过时回复"。
-    if outbox_eligible {
+    // 终审 Important#1：去抖须同时覆盖文本与媒体——只要本 run 会发任何东西就该被
+    // 取代保护。media_pending 用 final_status 终态门判断（与文本无媒体时字节等价：
+    // has_assets=false 时 media_pending=false，条件退化为纯 outbox_eligible）。
+    let media_pending = (final_status == "approved" || final_status == "revision_applied_approved")
+        && !final_decision.assets_to_send.is_empty();
+    if should_run_send(outbox_eligible, media_pending) {
         if let Some(guard) = &should_abort_send {
             if guard() {
                 tracing::info!(
@@ -1877,13 +1899,14 @@ async fn run_user_operation_gateway_inner(
         }
     }
     // media-asset Task 8：素材文件发送。文本回复已在上方先入 outbox（先文字后文件），
-    // 这里把 final_decision.assets_to_send 逐个转成独立媒体 outbox 条目。仅在决策达到
-    // approved 终态时执行（与文本 outbox_eligible 同源的 final_status 门）；每条做
-    // approved+sendable+合法 media_type 二次准入校验（防 AI 幻觉出未审素材），非法
-    // assetId 跳过 + 审计；requires_principal_approval=true 的不直接发，走现有 escalation
-    // 请示通道（拿回结论后由领导决策路径决定是否发）。
-    let media_eligible = final_status == "approved" || final_status == "revision_applied_approved";
-    if media_eligible && !final_decision.assets_to_send.is_empty() {
+    // 这里把 final_decision.assets_to_send 逐个转成独立媒体 outbox 条目。
+    // 终审 Important#1：媒体门改为复用 outbox_eligible（含 should_reply + reply 非空
+    // + final_status 终态 + relay 泄漏 fail-closed），与文本发送门同源。后果：当 reply_text
+    // 为空但有素材时会被挡掉——这是**期望行为**（设计要求文件必须配引导话术，不发孤立文件）。
+    // 每条仍做 approved+sendable+合法 media_type 二次准入校验（防 AI 幻觉出未审素材），
+    // 非法 assetId 跳过 + 审计；requires_principal_approval=true 的不直接发，走现有
+    // escalation 请示通道（拿回结论后由领导决策路径决定是否发）。
+    if media_send_allowed(outbox_eligible, !final_decision.assets_to_send.is_empty()) {
         let media_source_event_id = match &trigger {
             AgentTrigger::Inbound(msg) => msg.message_id.clone().unwrap_or_default(),
             AgentTrigger::FollowUp(task) => task.id.map(|id| id.to_hex()).unwrap_or_default(),
@@ -1907,11 +1930,33 @@ async fn run_user_operation_gateway_inner(
                     continue;
                 }
             };
-            let asset = state
+            // 修复2（纵深防御）：按 _id + workspace_id 双条件查，杜绝跨租户 IDOR。
+            // 修复3（一致性）：DB 瞬时故障降级为"记审计 + 跳过该素材（continue）"，与同块
+            // 的 media_outbox_enqueue_failed 对齐；不再用 `?` 传播——否则会跳过函数末尾的
+            // escalation_request 推送（文本早已入 outbox）。
+            let asset = match state
                 .db
                 .content_assets()
-                .find_one(doc! { "_id": oid }, None)
-                .await?;
+                .find_one(doc! { "_id": oid, "workspace_id": &contact.workspace_id }, None)
+                .await
+            {
+                Ok(a) => a,
+                Err(err) => {
+                    tracing::error!(?err, %run_id, asset_id = %directive.asset_id, "media asset 查询失败（降级跳过该素材，不阻断 run）");
+                    write_event_for_account(
+                        state,
+                        &contact.account_id,
+                        Some(&contact.wxid),
+                        "media_asset_lookup_failed",
+                        "error",
+                        "素材查询失败（文本已照常发出，素材缺失需管理员核对）",
+                        Some(doc! { "run_id": &run_id, "asset_id": &directive.asset_id }),
+                    )
+                    .await
+                    .ok();
+                    continue;
+                }
+            };
             let asset = match asset {
                 Some(a) if super::media_send::validate_asset_sendable(&a) => a,
                 _ => {
@@ -3935,6 +3980,39 @@ mod tests {
     #[test]
     fn media_send_order_unknown_pref_defaults_text_then_media() {
         assert_eq!(media_send_order(""), SendOrder::TextThenMedia);
+    }
+
+    // 终审 Important#1：媒体发送门与文本同源。
+    #[test]
+    fn media_send_blocked_when_text_ineligible() {
+        // 核心修复：文本不合格（should_reply=false / reply 空 / relay 守卫拦截）则不发孤立文件。
+        assert!(!media_send_allowed(false, true));
+    }
+    #[test]
+    fn media_send_allowed_when_eligible_and_has_assets() {
+        assert!(media_send_allowed(true, true));
+    }
+    #[test]
+    fn media_send_no_assets_yields_false() {
+        // 文本合格但无素材：不进媒体块（与既有行为一致）。
+        assert!(!media_send_allowed(true, false));
+    }
+
+    // 终审 Important#1：去抖中止须覆盖文本与媒体两条轨道。
+    #[test]
+    fn should_run_send_covers_text_only() {
+        // 仅文本、无媒体：行为与旧版字节等价（media_pending=false → 退化为纯 outbox_eligible）。
+        assert!(should_run_send(true, false));
+        assert!(!should_run_send(false, false));
+    }
+    #[test]
+    fn should_run_send_covers_media_when_text_ineligible() {
+        // 文本不合格但有媒体待发：仍须过去抖中止，否则 superseded run 会发孤立文件。
+        assert!(should_run_send(false, true));
+    }
+    #[test]
+    fn should_run_send_false_when_nothing_pending() {
+        assert!(!should_run_send(false, false));
     }
 
     #[test]

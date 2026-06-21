@@ -24,7 +24,7 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
     format!("{:x}", h.finalize())
 }
 
-/// 仅允许 [a-z0-9] 的 segment（workspace_id / sha 都应满足；含 . / 或其它即拒）。
+/// 仅允许 [A-Za-z0-9_-] 的 segment（workspace_id / sha 都应满足；含 . / 或其它即拒）。
 fn is_safe_segment(s: &str) -> bool {
     !s.is_empty()
         && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')

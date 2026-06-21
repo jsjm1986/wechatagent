@@ -157,7 +157,8 @@ pub(crate) async fn send_outbound_media(
     let asset = state
         .db
         .content_assets()
-        .find_one(doc! { "_id": oid }, None)
+        // 纵深防御：按 _id + workspace_id 双条件查，杜绝跨租户 IDOR（asset_id 来自 outbox）。
+        .find_one(doc! { "_id": oid, "workspace_id": &contact.workspace_id }, None)
         .await?
         .ok_or_else(|| AppError::NotFound("asset not found".into()))?;
 
