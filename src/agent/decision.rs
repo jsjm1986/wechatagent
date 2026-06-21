@@ -314,6 +314,17 @@ pub(crate) async fn decide_reply_with_promote(
         current_customer_stage.as_deref(),
     );
     let sendable_candidates_text = super::media_send::render_candidate_lines(&sendable_candidates);
+    // 已发素材历史注入（防重发软约束，缺口 5）：查该客户近期已发素材，
+    // 渲染成提示段供 Reply Agent 判重。best-effort，空 = 不加段。
+    let recent_media_sent = super::send_ledger::recent_sends_for_contact(
+        state,
+        &contact.workspace_id,
+        &contact.wxid,
+        "media",
+        10,
+    )
+    .await;
+    let recent_media_text = super::send_ledger::render_recent_media_lines(&recent_media_sent);
     // referral-card Task 8：名片引荐——仅辅助模式开启才加载/过滤/渲染候选名片注入
     // prompt（默认关 = 空串，对现有全自治账号 prompt 仅多一个空段，字节近等价）。
     // 辅助模式判定：客户级 override（domain_attributes）> 账号级 assist_mode_enabled。
@@ -660,6 +671,7 @@ pub(crate) async fn decide_reply_with_promote(
 可引用内容资产:
 {}
 {}
+{}
 可引荐的专属顾问:
 {}
 未完成跟进:
@@ -726,6 +738,7 @@ pub(crate) async fn decide_reply_with_promote(
         serde_json::to_string(&contact.profile_attributes).unwrap_or_default(),
         assets,
         sendable_candidates_text,
+        recent_media_text,
         referral_block,
         task_text,
         history,
