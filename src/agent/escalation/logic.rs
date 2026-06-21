@@ -178,6 +178,55 @@ pub(crate) fn relay_output_leaks_internal_payload(reply_text: &str) -> bool {
         || reply_text.contains("constraints=")
 }
 
+/// 提取文本中的"数量事实" token：阿拉伯数字串（含小数点）。归一化为去前导零的数字字符串。
+/// 用于 relay 转述的数字白名单核验——只看客观数量，不碰措辞。
+fn extract_number_tokens(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    for ch in text.chars() {
+        if ch.is_ascii_digit() || (ch == '.' && !cur.is_empty()) {
+            cur.push(ch);
+        } else if !cur.is_empty() {
+            out.push(normalize_number_token(&cur));
+            cur.clear();
+        }
+    }
+    if !cur.is_empty() {
+        out.push(normalize_number_token(&cur));
+    }
+    out
+}
+
+/// 归一化数字 token：去尾随小数点、去多余前导零（保留至少一位）。
+fn normalize_number_token(s: &str) -> String {
+    let trimmed = s.trim_end_matches('.');
+    let (int_part, frac_part) = match trimmed.split_once('.') {
+        Some((i, f)) => (i, Some(f)),
+        None => (trimmed, None),
+    };
+    let int_norm = int_part.trim_start_matches('0');
+    let int_norm = if int_norm.is_empty() { "0" } else { int_norm };
+    match frac_part {
+        Some(f) => format!("{}.{}", int_norm, f),
+        None => int_norm.to_string(),
+    }
+}
+
+/// relay 转述数字护栏：转述文本若出现授权 substance 里没有的数量事实（数字/百分比/
+/// 金额）→ 返回 true（fail-closed，网关据此不发该转述）。领导授权"9折"，转述编成
+/// "8折"或追加授权外的"95%成功率"都会命中。只兜客观数量，不判断措辞语义。
+/// 纯函数，反过拟合（测多种数字形态变体）。
+pub(crate) fn relay_introduces_unauthorized_number(
+    reply_text: &str,
+    authorized_substance: &str,
+) -> bool {
+    let authorized: std::collections::HashSet<String> =
+        extract_number_tokens(authorized_substance).into_iter().collect();
+    extract_number_tokens(reply_text)
+        .into_iter()
+        .any(|tok| !authorized.contains(&tok))
+}
+
 /// 从意图轨迹尾部数"连续未推进"轮数：未推进 = 相邻条目 `intent` 相同（含都为空串）。
 /// 例：轨迹 [A,B,B,B] → 末三条 intent 相同 → 返回 3。空轨迹返回 0。
 fn consecutive_unprogressed_turns(trajectory: &[crate::models::IntentTrajectoryEntry]) -> u32 {
@@ -868,6 +917,50 @@ mod tests {
             assert!(!should_escalate_held(s, &policy_with(true)), "{s} 不应升级");
             assert!(!should_escalate_held(s, &policy_with(false)), "{s} 不应升级");
         }
+    }
+
+    // ---- ⑩ relay 转述编造授权外数字护栏 ----
+
+    #[test]
+    fn relay_unauthorized_number_detects_fabricated_discount() {
+        // 领导授权"9折"，转述说"8折" → 引入授权外数字 → 拦。
+        let substance = "可以给客户9折优惠";
+        assert!(relay_introduces_unauthorized_number("我帮您申请到8折了", substance));
+    }
+
+    #[test]
+    fn relay_unauthorized_number_allows_authorized_number() {
+        // 转述里的数字都在授权 substance 内 → 放行。
+        let substance = "可以给客户9折，质保2年";
+        assert!(!relay_introduces_unauthorized_number("给您9折，质保2年", substance));
+    }
+
+    #[test]
+    fn relay_unauthorized_number_allows_no_numbers() {
+        // 转述无任何数字 → 放行（纯定性转述）。
+        let substance = "可以适当让利";
+        assert!(!relay_introduces_unauthorized_number("我帮您争取了一些优惠", substance));
+    }
+
+    #[test]
+    fn relay_unauthorized_number_detects_added_percentage() {
+        // 授权无百分比，转述编造"95%成功率" → 拦。
+        let substance = "这个方案可行";
+        assert!(relay_introduces_unauthorized_number("成功率有95%", substance));
+    }
+
+    #[test]
+    fn relay_unauthorized_number_allows_substance_superset() {
+        // 转述只用了授权数字的子集 → 放行。
+        let substance = "9折，满3000减500，质保2年";
+        assert!(!relay_introduces_unauthorized_number("给您9折优惠", substance));
+    }
+
+    #[test]
+    fn relay_unauthorized_number_ignores_non_quantitative_digits() {
+        // 边界：授权含"9折"，转述复述"9折"但措辞不同 → 同一数字 token → 放行。
+        let substance = "9折";
+        assert!(!relay_introduces_unauthorized_number("可以9折", substance));
     }
 
     // ---- fix C：pending 去重唯一索引冲突判定（区分两类 11000）----
