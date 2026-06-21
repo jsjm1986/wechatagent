@@ -178,12 +178,12 @@ pub(super) async fn upload_media_asset(
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub(super) struct ReviewRequest {
+pub struct ReviewRequest {
     status: String,
     note: Option<String>,
 }
 
-pub(super) async fn review_media_asset(
+pub async fn review_media_asset(
     State(state): State<AppState>,
     Extension(admin): Extension<AuthenticatedAdmin>,
     Path(id): Path<String>,

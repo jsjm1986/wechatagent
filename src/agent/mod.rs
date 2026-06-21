@@ -151,6 +151,11 @@ pub use review::review_passed;
 pub use review::review_fixed_candidate_for_test;
 pub use runtime::UserRuntimeParameters;
 pub use runtime::{resolve_thresholds, ResolvedThresholds};
+// 簇 B 缺口 6：把 target_stages 归一/校验函数暴露给 tests crate，使
+// annotation_quality_gate_integration.rs 能直驱「alias→canonical 真归一」与
+// 「字典越界 → Err」端到端校验（upload handler 取 Multipart extractor，tests 无法
+// 手工构造，故直驱本函数验证落库前的归一语义）。
+pub use dimension_registry::normalize_target_stages;
 pub use types::{DecisionReviewResult, RawAgentDecision, ReviewScores};
 
 // agent-autonomy-loop W3 / Task 4.14：P4 PBT 已随销售域守卫一起删除（2026-05-25

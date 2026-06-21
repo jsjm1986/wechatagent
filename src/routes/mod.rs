@@ -31,7 +31,10 @@ mod assets;
 mod auth;
 mod behavior_signal_metrics;
 pub mod chunk_locks;
-mod contacts;
+// pub（非默认私有）：annotation_quality_gate_integration.rs 集成测试需从 tests/
+// crate 直调 update_assist_override handler 真函数（缺口 2 override + IDOR），仿
+// domain_profiles / ask_human_inbox 先例。生产路由注册仍走下方 use。
+pub mod contacts;
 mod conversations;
 // pub（非 pub(crate)）：domain_profile_e2e.rs 集成测试需从 tests/ crate 直调
 // publish/update/rollout/rollback handler 真函数（覆盖 realign + $set 部分更新），仿
@@ -49,7 +52,10 @@ pub mod knowledge;
 mod lessons_learned;
 mod llm_providers;
 mod management;
-mod media_assets;
+// pub（非默认私有）：annotation_quality_gate_integration.rs 集成测试需从 tests/
+// crate 直调 review_media_asset handler 真函数（缺口 3 审核审计落库），仿
+// domain_profiles / ask_human_inbox 先例。生产路由注册仍走下方 use。
+pub mod media_assets;
 mod observability;
 mod outcome_metrics;
 mod outcomes_autonomy;
