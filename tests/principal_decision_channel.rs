@@ -471,12 +471,12 @@ async fn t_timeout_reassign_pushes_and_touches_updated_at() {
     );
 }
 
-/// §14.10b（#6 方案A 核心）：改派后推卡 MCP **失败** → updated_at **不刷新**（保持旧值），
-/// 下一 tick age 仍超时可重试。这是非原子修复的命门：旧实现 reassign 立即刷 updated_at 致
-/// age 归零，MCP 失败时备选人整个 timeout 窗收不到通知。
+/// §14.10b（推失败不改派，命门）：gate 过 → 推卡 MCP **失败** → **不改派**（principal_wxid
+/// 仍是 boss 原值，updated_at 保持旧值）。原 principal age 仍超时，下一 tick 会重新算出同一个
+/// next 重推。重构后改派只发生在卡确实送达 next 之后，故推失败绝不把台账推进到链尾。
 #[tokio::test]
 #[ignore]
-async fn t_timeout_reassign_push_failure_does_not_touch_updated_at() {
+async fn t_timeout_reassign_push_failure_does_not_reassign() {
     let app = common::TestApp::start().await;
     let mcp = start_mcp_mock_failure().await;
     let state = common::rebuild_app_state_with_mcp_url(&app, mcp.uri());
@@ -508,25 +508,28 @@ async fn t_timeout_reassign_push_failure_does_not_touch_updated_at() {
         .expect("scan timeouts");
 
     let after = find_escalation(&app, "T10B").await;
-    // 改派本身落库（principal_wxid 已改）——reassign 不依赖 MCP。
-    assert_eq!(after.principal_wxid, "backup", "改派应已落库");
-    // 但推卡失败 → updated_at 必须保持旧值（#6 方案A）。
+    // 推卡失败 → 不改派：principal_wxid 仍是 boss（未推进到链尾）。
+    assert_eq!(
+        after.principal_wxid, "boss",
+        "推卡失败不得改派，principal_wxid 应保持原值"
+    );
+    // 未改派 → updated_at 保持旧值，下一 tick age 仍超时会重推同一个 next。
     assert_eq!(
         after.updated_at.timestamp_millis(),
         two_hours_ago.timestamp_millis(),
-        "推卡失败时 updated_at 不得刷新，否则 age 归零、下一 tick 不再重试改派"
+        "推卡失败不改派时 updated_at 不得刷新，否则 age 归零、下一 tick 不再重试"
     );
 }
 
-/// §14.10c（#5 骚扰门接线）：改派目标落在 quiet_hours → scan 跳过本 tick 推卡，
-/// 但改派已落库（principal_wxid 改为下一位），updated_at 不刷新 → 待下一 tick 重试。
-/// 验证超时改派重推卡同样过骚扰门（与首推路径一致），备选决策人不在静默时段被惊扰。
+/// §14.10c（#5 骚扰门接线，gate 先于改派）：next 落在 quiet_hours → gate 拦 → **不改派、不推**
+/// （principal_wxid 仍是 boss 原值，updated_at 旧值）。备选决策人不在静默时段被惊扰；原 principal
+/// age 仍超时，待下一 tick 重试。验证超时改派重推卡同样过骚扰门（与首推路径一致）。
 #[tokio::test]
 #[ignore]
 async fn t_timeout_reassign_blocked_by_quiet_hours_skips_push() {
     let app = common::TestApp::start().await;
-    // 用 success mock：若 quiet_hours 未拦住，推卡会成功 → updated_at 被刷新；
-    // 拦住则不推 → updated_at 保持旧值。故 updated_at 断言能干净区分两种行为。
+    // 用 success mock：若 quiet_hours 未拦住，会推卡成功 + 改派；
+    // 拦住则不改派 → principal_wxid 保持 boss。故断言能干净区分两种行为。
     let mcp = start_mcp_mock_success().await;
     let state = common::rebuild_app_state_with_mcp_url(&app, mcp.uri());
 
@@ -566,13 +569,128 @@ async fn t_timeout_reassign_blocked_by_quiet_hours_skips_push() {
 
     let after = find_escalation(&app, "T10C").await;
     assert_eq!(
-        after.principal_wxid, "backup",
-        "改派先于骚扰门发生，principal_wxid 应已改"
+        after.principal_wxid, "boss",
+        "gate 先于改派，quiet_hours 命中应不改派，principal_wxid 保持原值"
     );
     assert_eq!(
         after.updated_at.timestamp_millis(),
         two_hours_ago.timestamp_millis(),
-        "quiet_hours 命中应跳过推卡且不刷新 updated_at，待下一 tick 重试"
+        "quiet_hours 命中应跳过且不刷新 updated_at，待下一 tick 重试"
+    );
+}
+
+/// §14.10d（验 #2 自我命中已消除）：链 [boss, backup]，daily_push_cap=1，timeout 1h，无其它
+/// 历史推送。boss 超时 → gate 查 next=backup 的当日推送数。重构后 gate 先于改派，此刻台账仍挂
+/// boss，count_pushes_today(backup) 不含本条 = 0 < cap → 放行 → 推成功 → 改派到 backup。
+/// 旧实现 reassign 先于 gate，本条改派后自己被算成 backup 的 1 次推送 → 1>=1 误拦，backup 永远
+/// 收不到卡。本测试断言 backup 确实收到（principal_wxid=backup + updated_at 刷新）。
+#[tokio::test]
+#[ignore]
+async fn t_timeout_reassign_cap_one_not_self_blocked() {
+    let app = common::TestApp::start().await;
+    let mcp = start_mcp_mock_success().await;
+    let state = common::rebuild_app_state_with_mcp_url(&app, mcp.uri());
+
+    set_ask_human_policy(
+        &app,
+        &AskHumanPolicy {
+            decider_chain: vec![
+                DeciderRef { wxid: "boss".into(), display_name: None },
+                DeciderRef { wxid: "backup".into(), display_name: None },
+            ],
+            escalate_safety_guard: true,
+            escalate_unverified_product: true,
+            escalate_ai_policy_hold: false,
+            escalate_stuck: true,
+            dedupe_window_hours: None,
+            daily_push_cap: Some(1),
+            quiet_hours: None,
+            timeout_hours: Some(1.0),
+        },
+    )
+    .await;
+
+    // 唯一一条 pending（TestApp 每条测试独立 DB，无其它台账污染 cap 计数）。
+    let two_hours_ago = DateTime::from_millis(DateTime::now().timestamp_millis() - 2 * 3600 * 1000);
+    insert_pending_with_updated_at(&app, "T10D", "boss", two_hours_ago).await;
+
+    wechatagent::agent::escalation::scan_escalation_timeouts(&state)
+        .await
+        .expect("scan timeouts");
+
+    let after = find_escalation(&app, "T10D").await;
+    assert_eq!(
+        after.principal_wxid, "backup",
+        "cap=1 不应被改派的这条自己误命中，backup 应收到卡并改派成功"
+    );
+    assert!(
+        after.updated_at.timestamp_millis() > two_hours_ago.timestamp_millis(),
+        "推卡成功 + 改派 → updated_at 应刷新"
+    );
+}
+
+/// §14.10e（验 #1 链尾不困死 + 推失败重试同一 next）：链 [boss, backup]，无骚扰门，timeout 1h。
+/// 第一次 scan 用 failure mock → 推失败 → 不改派（principal 仍 boss）。第二次 scan 换 success mock
+/// → 重新算出同一个 next=backup → 推成功 → 改派到 backup。旧实现第一次就把 principal 改成 backup
+/// （链尾），第二次 next_decider_on_timeout(backup) 返回 None → 永不重推，backup 永久收不到卡。
+#[tokio::test]
+#[ignore]
+async fn t_timeout_reassign_push_failure_retries_same_next_on_next_tick() {
+    let app = common::TestApp::start().await;
+
+    set_ask_human_policy(
+        &app,
+        &AskHumanPolicy {
+            decider_chain: vec![
+                DeciderRef { wxid: "boss".into(), display_name: None },
+                DeciderRef { wxid: "backup".into(), display_name: None },
+            ],
+            escalate_safety_guard: true,
+            escalate_unverified_product: true,
+            escalate_ai_policy_hold: false,
+            escalate_stuck: true,
+            dedupe_window_hours: None,
+            daily_push_cap: None,
+            quiet_hours: None,
+            timeout_hours: Some(1.0),
+        },
+    )
+    .await;
+
+    let two_hours_ago = DateTime::from_millis(DateTime::now().timestamp_millis() - 2 * 3600 * 1000);
+    insert_pending_with_updated_at(&app, "T10E", "boss", two_hours_ago).await;
+
+    // 第一次 tick：推卡失败 → 不改派。
+    let mcp_fail = start_mcp_mock_failure().await;
+    let state_fail = common::rebuild_app_state_with_mcp_url(&app, mcp_fail.uri());
+    wechatagent::agent::escalation::scan_escalation_timeouts(&state_fail)
+        .await
+        .expect("scan timeouts (fail tick)");
+    let after_fail = find_escalation(&app, "T10E").await;
+    assert_eq!(
+        after_fail.principal_wxid, "boss",
+        "首 tick 推失败应不改派，principal 仍是 boss（未推进到链尾）"
+    );
+    assert_eq!(
+        after_fail.updated_at.timestamp_millis(),
+        two_hours_ago.timestamp_millis(),
+        "推失败不改派 → updated_at 不刷新，下 tick age 仍超时"
+    );
+
+    // 第二次 tick：换 success mock（指向另一个 wiremock）→ 重推达同一个 next=backup → 改派。
+    let mcp_ok = start_mcp_mock_success().await;
+    let state_ok = common::rebuild_app_state_with_mcp_url(&app, mcp_ok.uri());
+    wechatagent::agent::escalation::scan_escalation_timeouts(&state_ok)
+        .await
+        .expect("scan timeouts (success tick)");
+    let after_ok = find_escalation(&app, "T10E").await;
+    assert_eq!(
+        after_ok.principal_wxid, "backup",
+        "下一 tick 应重推达同一个 next=backup 并改派（旧实现因链尾 None 永不重推）"
+    );
+    assert!(
+        after_ok.updated_at.timestamp_millis() > two_hours_ago.timestamp_millis(),
+        "重推成功 + 改派 → updated_at 应刷新"
     );
 }
 

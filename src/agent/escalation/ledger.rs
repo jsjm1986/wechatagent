@@ -283,9 +283,8 @@ pub(crate) async fn list_escalations_by_workspace(
 
 /// 改派 pending 请示到另一位决策人（仅 pending 可改派；workspace 约束防 IDOR）。
 ///
-/// #6 方案 A：改派**不刷新 updated_at**——age（scan 用 now-updated_at）须自"推卡成功时刻"
-/// 起算（见 touch_escalation_updated_at），而非"改派落库时刻"。否则 MCP 推卡失败时 age 仍被
-/// 归零，备选决策人整个 timeout 窗收不到通知且不再被改派。改派只改 principal_wxid。
+/// 仅在推卡成功后调用，落库同时刷新 updated_at，使 age（scan 用 now-updated_at）自"改派
+/// 成功时刻"起算——新决策人由此获得完整 timeout 窗。
 pub(crate) async fn reassign_escalation(
     state: &AppState,
     workspace_id: &str,
@@ -301,36 +300,13 @@ pub(crate) async fn reassign_escalation(
                 "short_code": short_code,
                 "status": PRINCIPAL_ESCALATION_STATUS_PENDING,
             },
-            doc! { "$set": { "principal_wxid": to_wxid } },
+            doc! { "$set": { "principal_wxid": to_wxid, "updated_at": DateTime::now() } },
             mongodb::options::FindOneAndUpdateOptions::builder()
                 .return_document(mongodb::options::ReturnDocument::After)
                 .build(),
         )
         .await?;
     Ok(updated)
-}
-
-/// 推卡成功后单独刷新 updated_at（与 reassign_escalation 拆开，使 age 自"推卡成功时刻"起算，
-/// 而非"改派落库时刻"——MCP 推卡失败时 updated_at 不动，下一 tick age 仍超时会重试改派+推卡）。
-pub(crate) async fn touch_escalation_updated_at(
-    state: &AppState,
-    workspace_id: &str,
-    short_code: &str,
-) -> AppResult<()> {
-    state
-        .db
-        .agent_principal_escalations()
-        .update_one(
-            doc! {
-                "workspace_id": workspace_id,
-                "short_code": short_code,
-                "status": PRINCIPAL_ESCALATION_STATUS_PENDING,
-            },
-            doc! { "$set": { "updated_at": DateTime::now() } },
-            None,
-        )
-        .await?;
-    Ok(())
 }
 
 /// 统计某决策人当日（since_ms 起）已被推送的请示卡数（骚扰门 daily_push_cap 用）。
