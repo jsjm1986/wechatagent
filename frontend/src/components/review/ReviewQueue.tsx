@@ -12,9 +12,16 @@ interface ReviewQueueProps<T> {
   getId: (item: T) => string;
   renderItem: (item: T, ctx: RowCtx) => ReactNode;
   emptyText?: string;
+  refreshToken?: number;
 }
 
-export function ReviewQueue<T>({ fetchItems, getId, renderItem, emptyText }: ReviewQueueProps<T>) {
+export function ReviewQueue<T>({
+  fetchItems,
+  getId,
+  renderItem,
+  emptyText,
+  refreshToken,
+}: ReviewQueueProps<T>) {
   const toast = useToast();
   const [items, setItems] = useState<T[]>([]);
   const [loading, setLoading] = useState(false);
@@ -35,7 +42,7 @@ export function ReviewQueue<T>({ fetchItems, getId, renderItem, emptyText }: Rev
 
   useEffect(() => {
     void load();
-  }, [load]);
+  }, [load, refreshToken]);
 
   const makeCtx = (id: string): RowCtx => ({
     busy: busyId === id,
