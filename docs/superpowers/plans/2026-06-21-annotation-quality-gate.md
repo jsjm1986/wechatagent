@@ -29,83 +29,126 @@
 
 **Interfaces:**
 - Consumes: 既有 `validate_dimension_value(db, kind, raw, scope_account_id, intent) -> DimValidation`（同文件 `dimension_registry.rs:180`）；`DimValidation::{Accept(String), Reject(String), DropSilently}`（`dimension_registry.rs:83`）；`WriteIntent::AdminWrite`（`dimension_registry.rs:29`）。
-- Produces: `pub(crate) async fn normalize_target_stages(db: &crate::db::Database, scope_account_id: &str, raw_stages: &[String]) -> Result<Vec<String>, String>`。Task 2（media upload）、Task 3（referral create）消费它。返回 `Ok(归一后的 canonical Vec)` 或 `Err(越界原因字符串)`。
+- Produces:
+  - `pub(crate) fn fold_stage_validations(results: Vec<DimValidation>) -> Result<Vec<String>, String>`——**可纯测内核**：Accept 收集 canonical / Reject 短路返 Err / DropSilently 跳过。无 IO。
+  - `pub(crate) async fn normalize_target_stages(db: &crate::db::Database, scope_account_id: &str, raw_stages: &[String]) -> Result<Vec<String>, String>`——薄壳：逐项 `validate_dimension_value` 收集成 `Vec<DimValidation>` → 调 `fold_stage_validations`。Task 2（media upload）、Task 3（referral create）消费它。
 
-**背景**：`target_stages` 是"进 prompt 候选清单"的软过滤（`media_send.rs:42` / `referral.rs:30` 用 `s == cs` 精确比较）。运营手填的 alias（如"需求挖掘"）若不归一成 canonical（"need_discovery"），与 contact 已归一的 `customer_stage` 永不相等 → 素材静默不发。本函数把每个 stage 走 `validate_dimension_value` 归一。
+**背景**：`target_stages` 是"进 prompt 候选清单"的软过滤（`media_send.rs:42` / `referral.rs:30` 用 `s == cs` 精确比较）。运营手填的 alias（如"需求挖掘"）若不归一成 canonical（"need_discovery"），与 contact 已归一的 `customer_stage` 永不相等 → 素材静默不发。本函数把每个 stage 走 `validate_dimension_value` 归一。**设计要点**：聚合逻辑（遍历 + Accept/Reject/Drop 处置）抽成不依赖 DB 的纯内核 `fold_stage_validations`，lib 真测它；DB 查询（`validate_dimension_value` 异步 + taxonomy cache）留在外层 `normalize_target_stages` 薄壳，端到端真测在 Task 8 集成。
 
-- [ ] **Step 1: 写失败测试**
+- [ ] **Step 1: 写失败测试（纯内核 `fold_stage_validations`）**
 
-加到 `src/agent/dimension_registry.rs` 的 `mod tests` 末尾（`}` 之前）。这些测试需要 DB + 字典，但纯逻辑（Err 聚合、空数组短路）可直接测；归一/字典分支由既有 `classify_validation` 13 个纯函数测覆盖，这里只测壳函数的**组合行为**——空输入短路不碰 DB。
+加到 `src/agent/dimension_registry.rs` 的 `mod tests` 末尾（`}` 之前）。这些测试**真调用被测内核函数**，覆盖 Accept 收集 / Reject 短路 / DropSilently 跳过 / 空输入四种组合行为：
 
 ```rust
-    #[tokio::test]
-    async fn normalize_empty_stages_returns_empty_without_db() {
-        // 空数组短路：不查字典、直接 Ok(空)。传一个不会被使用的 db 句柄即可——
-        // 但为避免起 DB，这里验证「空输入不进循环」的契约由实现保证。
-        // 用 std 断言占位：真正的 DB 集成在 tests/ 覆盖（Task 8）。
-        let raw: Vec<String> = vec![];
-        assert!(raw.is_empty(), "空输入契约：normalize 对空数组应直接 Ok(vec![])");
+    #[test]
+    fn fold_collects_accepted_canonicals() {
+        let r = fold_stage_validations(vec![
+            DimValidation::Accept("need_discovery".into()),
+            DimValidation::Accept("negotiation".into()),
+        ]);
+        assert_eq!(r, Ok(vec!["need_discovery".to_string(), "negotiation".to_string()]));
+    }
+
+    #[test]
+    fn fold_rejects_on_first_reject() {
+        // 任一项 Reject → 整体 Err（短路，返该项原因）。
+        let r = fold_stage_validations(vec![
+            DimValidation::Accept("need_discovery".into()),
+            DimValidation::Reject("customer_stage 取值 \"瞎填\" 不在字典内".into()),
+            DimValidation::Accept("never_reached".into()),
+        ]);
+        assert!(matches!(r, Err(ref msg) if msg.contains("不在字典内")));
+    }
+
+    #[test]
+    fn fold_skips_drop_silently() {
+        // DropSilently（空串项）跳过，不进结果、不报错。
+        let r = fold_stage_validations(vec![
+            DimValidation::Accept("need_discovery".into()),
+            DimValidation::DropSilently,
+        ]);
+        assert_eq!(r, Ok(vec!["need_discovery".to_string()]));
+    }
+
+    #[test]
+    fn fold_empty_is_ok_empty() {
+        let r = fold_stage_validations(vec![]);
+        assert_eq!(r, Ok(vec![]));
     }
 ```
 
-> 注：`normalize_target_stages` 依赖 `validate_dimension_value`（异步 + 进程级 taxonomy cache + DB），lib 单测无法在不起 DB 的情况下走完整字典分支。真正的端到端归一断言放 Task 8 集成测试（testcontainers）。本 Task 的 lib 测试只钉**空数组短路**这一可纯测的契约 + 保证函数签名/编译正确。归一/Reject/未配置三分支的逻辑正确性由被复用的 `classify_validation` 既有测试（`classify_alias_normalizes` / `classify_admin_write_rejects_machine_channel` / `classify_kind_unconfigured_accepts_admin`）保证。
+> `DimValidation` 需 `PartialEq` 才能 `assert_eq!`——它已 `#[derive(Debug, Clone, PartialEq, Eq)]`（`dimension_registry.rs:82`），无需改。归一/Reject/未配置的**字典判定**逻辑由既有 `classify_validation` 13 个纯函数测覆盖；本内核只测**聚合处置**。端到端真归一（alias→canonical 经 DB 字典）在 Task 8 集成测。
 
-- [ ] **Step 2: 跑测试确认编译失败**
+- [ ] **Step 2: 跑测试确认失败**
 
-Run: `cargo test --lib normalize_empty_stages -- --nocapture`
-Expected: 编译通过、测试 PASS（这个占位测试不依赖新函数）。**先确认基线绿**，再加函数。
+Run: `cargo test --lib fold_collects_accepted_canonicals fold_rejects_on_first_reject fold_skips_drop_silently fold_empty_is_ok_empty`
+Expected: FAIL —— `fold_stage_validations` 未定义，编译错误。
 
-> 这个 Task 的 TDD 节奏特殊：壳函数无法纯函数化测试。改为「先确认占位测试绿 → 加函数 → 确认 `cargo build --lib` 编译通过且函数被后续 Task 引用」。函数行为的失败测试在 Task 8（集成）体现。
-
-- [ ] **Step 3: 实现 `normalize_target_stages`**
+- [ ] **Step 3: 实现纯内核 + 异步薄壳**
 
 加到 `src/agent/dimension_registry.rs` 的 `mod tests`（`#[cfg(test)]`）**之前**：
 
 ```rust
+/// 纯内核（簇 B 缺口 6）：把每个 stage 的 DimValidation 聚合成归一结果。
+/// Accept → 收集 canonical；Reject → 短路返 Err（该项原因）；DropSilently（空串）→ 跳过。
+/// 无 IO，完全可单测。
+pub(crate) fn fold_stage_validations(
+    results: Vec<DimValidation>,
+) -> Result<Vec<String>, String> {
+    let mut out = Vec::with_capacity(results.len());
+    for r in results {
+        match r {
+            DimValidation::Accept(canonical) => out.push(canonical),
+            DimValidation::Reject(reason) => return Err(reason),
+            DimValidation::DropSilently => {} // 空串项，跳过
+        }
+    }
+    Ok(out)
+}
+
 /// 归一 + 校验 target_stages（簇 B 缺口 6）：运营手填的客户阶段标注必须与 contact 的
 /// canonical customer_stage 同空间，否则运行时 `s == cs` 永不命中、素材/名片静默不发。
 /// 每项走 AdminWrite：Accept 收集 canonical（alias 归一）、Reject 整体报错、
 /// 字典未配置 fail-soft 放行原值（KindUnconfigured → Accept）。空串项跳过。
 /// scope_account_id 为空串时 taxonomy 查询走 global scope（account 维度缺失时的回退）。
+/// 聚合逻辑委托纯内核 fold_stage_validations（可单测）；本函数只做 DB 查询。
 pub(crate) async fn normalize_target_stages(
     db: &crate::db::Database,
     scope_account_id: &str,
     raw_stages: &[String],
 ) -> Result<Vec<String>, String> {
-    let mut out = Vec::with_capacity(raw_stages.len());
+    let mut results = Vec::with_capacity(raw_stages.len());
     for stage in raw_stages {
-        match validate_dimension_value(
-            db,
-            "customer_stage",
-            stage,
-            scope_account_id,
-            WriteIntent::AdminWrite,
-        )
-        .await
-        {
-            DimValidation::Accept(canonical) => out.push(canonical),
-            DimValidation::Reject(reason) => return Err(reason),
-            DimValidation::DropSilently => {} // 空串项，跳过（split 通常已过滤空）
-        }
+        results.push(
+            validate_dimension_value(
+                db,
+                "customer_stage",
+                stage,
+                scope_account_id,
+                WriteIntent::AdminWrite,
+            )
+            .await,
+        );
     }
-    Ok(out)
+    fold_stage_validations(results)
 }
 ```
 
-- [ ] **Step 4: 跑 lib 编译 + 占位测试**
+- [ ] **Step 4: 跑纯内核测试确认通过**
 
-Run: `cargo test --lib normalize_empty_stages`
-Expected: 编译通过、PASS。再跑 `cargo build --lib` 确认新函数无 warning（未被引用时会有 dead_code warning，Task 2/3 接线后消失——本 Task 接受这个预期 warning，在 commit message 注明）。
+Run: `cargo test --lib fold_collects_accepted_canonicals fold_rejects_on_first_reject fold_skips_drop_silently fold_empty_is_ok_empty`
+Expected: 4 个 PASS。再 `cargo build --lib` 确认编译通过。`normalize_target_stages` 未被引用前有预期 dead_code warning，Task 2/3 接线后消失——本 Task 接受这个预期 warning，在 commit message 注明。
 
 - [ ] **Step 5: 提交**
 
 ```bash
 git add src/agent/dimension_registry.rs
-git commit -m "feat(annotation-quality): normalize_target_stages 归一校验壳函数(缺口6地基)
+git commit -m "feat(annotation-quality): target_stages 归一校验(纯内核+异步薄壳)(缺口6地基)
 
-复用 validate_dimension_value(AdminWrite) 把运营手填 target_stages 归一成
-canonical，治 alias/canonical drift 致素材静默不发。空数组短路。
-未被引用前有预期 dead_code warning，Task 2/3 接线后消失。"
+fold_stage_validations 纯内核(可单测,4测)聚合 Accept/Reject/Drop;
+normalize_target_stages 薄壳逐项 validate_dimension_value(AdminWrite) 归一,
+治 alias/canonical drift 致素材静默不发。
+normalize 未被引用前有预期 dead_code warning,Task 2/3 接线后消失。"
 ```
 
 ---
