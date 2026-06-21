@@ -181,12 +181,15 @@ pub(crate) async fn scan_send_ledger_outcomes(state: &AppState) -> AppResult<usi
                 "$lte": DateTime::from_millis(window_end_ms),
             },
         };
-        let inbound_count = state
+        let inbound_count = match state
             .db
             .messages()
             .count_documents(inbound_filter, None)
             .await
-            .unwrap_or(0);
+        {
+            Ok(n) => n,
+            Err(_) => continue, // 瞬时查询失败：不落 evaluated，下个 tick 重试，避免 responded 假阴性永久化
+        };
         let responded = inbound_count > 0;
 
         // stage_advanced：取当前 contact.customer_stage vs 发送时快照，按状态机序判断。
