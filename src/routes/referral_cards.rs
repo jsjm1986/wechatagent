@@ -144,6 +144,36 @@ pub(super) async fn review_referral_card(
     if result.matched_count == 0 {
         return Err(AppError::BadRequest("card not found".to_string()));
     }
+    // 缺口 3：审计审核动作。回查拿 account_id/display_name。fail-soft：写失败只 warn。
+    if let Ok(Some(card)) = state
+        .db
+        .referral_cards()
+        .find_one(
+            doc! { "_id": oid, "workspace_id": &admin.current_workspace },
+            None,
+        )
+        .await
+    {
+        let account_id = card.account_id.clone().unwrap_or_default();
+        let details = doc! {
+            "card_id": oid.to_hex(),
+            "review_note": payload.note.clone().unwrap_or_default(),
+            "reviewed_by": admin.username.clone(),
+        };
+        if let Err(e) = crate::agent::write_event_for_account(
+            &state,
+            &account_id,
+            None,
+            "referral_card.reviewed",
+            &payload.status,
+            &format!("管理员审核名片：{} → {}", card.display_name, payload.status),
+            Some(details),
+        )
+        .await
+        {
+            tracing::warn!("referral_card.reviewed 审计写入失败（不影响审核）: {e}");
+        }
+    }
     Ok(Json(json!({ "ok": true })))
 }
 
