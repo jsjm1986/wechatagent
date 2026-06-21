@@ -30,7 +30,7 @@ function AskHumanConfigView() {
     setLoading(true);
     setLoadError(null);
     try {
-      const res = await api.get<{ item: unknown }>(`/api/admin/operation-domains/${DOMAIN}`);
+      const res = await api.get<{ item: unknown }>(`/api/operation-domains/${DOMAIN}`);
       setDraft(extractPolicy(res.item));
     } catch (e) {
       setLoadError(e instanceof Error ? e.message : String(e));
@@ -73,7 +73,7 @@ function AskHumanConfigView() {
     }
     setSaving(true);
     try {
-      await api.put(`/api/admin/operation-domains/${DOMAIN}/ask-human-policy`, draft);
+      await api.put(`/api/operation-domains/${DOMAIN}/ask-human-policy`, draft);
       toast.success("已保存");
       await load();
     } catch (e) {
