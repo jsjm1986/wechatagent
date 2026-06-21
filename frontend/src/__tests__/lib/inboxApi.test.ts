@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { sortItems, severityRank, type InboxItem } from "./inboxApi";
+import { sortItems, severityRank, type InboxItem } from "../../lib/inboxApi";
 
 function item(p: Partial<InboxItem>): InboxItem {
   return {
