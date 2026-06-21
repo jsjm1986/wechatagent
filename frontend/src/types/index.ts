@@ -103,6 +103,18 @@ export type Message = {
   mediaRef?: string;
 };
 
+/** 客户画像页「AI 已发送」只读历史项：对齐后端
+ *  GET /api/contacts/:wxid/send-history 的 items 序列化（camelCase）。 */
+export type SendHistoryItem = {
+  sendKind: "media" | "namecard";
+  targetId: string;
+  targetTitle: string;
+  sentAt?: string;
+  triggerReason?: string | null;
+  responded?: boolean | null;
+  stageAdvanced?: boolean | null;
+};
+
 /** 专属顾问名片：对齐后端 ReferralCard 的 list 序列化（camelCase）。 */
 export type ReferralCard = {
   id: string;
