@@ -324,6 +324,22 @@ pub async fn update_content_asset_meta(
     Ok(Json(json!({ "ok": true })))
 }
 
+/// 换文件的副作用语义（簇C 缺口4 红线）：换文件 = 发送物变了，必须
+/// 退回草稿强制人类重审（AI 不自我核验红线）+ 清空 media_id 缓存（防
+/// ensure_media_uploaded 在 TTL 内复用旧 media_id 导致 AI 发旧文件）。
+/// 抽成纯函数让 handler 调用 + lib 测试钉死语义，防未来误改 $set 字面量。
+pub(super) struct FileReplaceEffects {
+    pub review_status: &'static str,
+    pub clear_media_id: bool,
+}
+
+pub(super) fn file_replace_effects() -> FileReplaceEffects {
+    FileReplaceEffects {
+        review_status: "draft",
+        clear_media_id: true,
+    }
+}
+
 /// POST /content-assets/:id/file —— 换文件（multipart）。
 /// 落新文件 → $set file_* + media_id=None（清缓存防发旧文件）+ review_status="draft"（强制重审）。
 /// 旧文件无兄弟引用则物理删（fail-soft）。
@@ -398,6 +414,8 @@ pub(super) async fn replace_content_asset_file(
         .map_err(|e| AppError::External(format!("store file failed: {e}")))?;
 
     // 换文件副作用：清 media_id（防 TTL 内发旧文件）+ 退 draft（强制重审）。
+    // 语义由 file_replace_effects() 纯函数钉死（lib 测试覆盖），勿改回字面量。
+    let effects = file_replace_effects();
     state
         .db
         .content_assets()
@@ -410,8 +428,8 @@ pub(super) async fn replace_content_asset_file(
                 "mime_type": &mime,
                 "file_sha256": &sha,
                 "media_type": &media_type,
-                "media_id": null,
-                "review_status": "draft",
+                "media_id": null, // 由 effects.clear_media_id == true 语义驱动
+                "review_status": effects.review_status,
                 "updated_at": DateTime::now(),
             }},
             None,
@@ -535,5 +553,12 @@ mod tests {
         assert!(!is_valid_review_status("rejected"));
         assert!(!is_valid_review_status(""));
         assert!(!is_valid_review_status("Approved"));
+    }
+
+    #[test]
+    fn file_replace_resets_to_draft_and_clears_media_id() {
+        let e = file_replace_effects();
+        assert_eq!(e.review_status, "draft", "换文件必须退回草稿强制重审");
+        assert!(e.clear_media_id, "换文件必须清 media_id 防发旧文件");
     }
 }
