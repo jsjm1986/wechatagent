@@ -463,3 +463,144 @@ async fn resolve_foreign_workspace_escalation_is_noop() {
     );
     assert!(still.resolved_via.is_none(), "未被裁决 → resolved_via 仍为空");
 }
+
+// ── 测试 8（终审修 #1）：admin deferred 暂缓保持 pending，不 resolve 不 relay ──
+
+/// admin 给出 "deferred" 裁决 → 短路返回 deferred=true；台账仍 pending、resolved_via
+/// 仍空；零 relay task 入队。（修前：deferred 会 resolve 台账却不转述 → 静默关闭，
+/// scan_escalation_timeouts 只扫 pending 永不再 surface。）
+#[tokio::test]
+#[ignore]
+async fn admin_deferred_keeps_escalation_pending() {
+    let app = common::TestApp::start().await;
+    let ws = app.state.config.default_workspace_id.clone();
+
+    let entry = seed_pending_escalation(&app.state, &ws, "cust_def", "boss").await;
+
+    let resp = wechatagent::routes::principal_escalations::resolve_principal_escalation(
+        State(app.state.clone()),
+        Extension(test_admin(&ws)),
+        Path(entry.short_code.clone()),
+        Json(
+            serde_json::from_value(serde_json::json!({
+                "verdict": "deferred",
+                "substance": "再等等",
+            }))
+            .expect("deserialize ResolveBody"),
+        ),
+    )
+    .await
+    .expect("deferred resolve ok");
+    assert_eq!(
+        resp.0.get("deferred").and_then(|v| v.as_bool()),
+        Some(true),
+        "deferred 应短路返回 deferred=true"
+    );
+
+    // 台账仍 pending、未被裁决。
+    let still = app
+        .state
+        .db
+        .agent_principal_escalations()
+        .find_one(doc! { "short_code": &entry.short_code }, None)
+        .await
+        .expect("query escalation")
+        .expect("escalation exists");
+    assert_eq!(
+        still.status, "pending",
+        "deferred 不应 resolve，台账须仍 pending（与 wechat 路径一致）"
+    );
+    assert!(still.resolved_via.is_none(), "deferred 未裁决 → resolved_via 仍空");
+
+    // 零 relay task 入队（deferred 不转述）。
+    let task_count = app
+        .state
+        .db
+        .tasks()
+        .count_documents(
+            doc! { "kind": "principal_decision_relay", "content": &entry.short_code },
+            None,
+        )
+        .await
+        .expect("count relay tasks");
+    assert_eq!(task_count, 0, "deferred 不应起任何 relay task");
+}
+
+// ── 测试 9（终审修 #2）：超时改派后 age 自 updated_at 起算，每位决策人拿到完整窗 ──
+
+/// decider_chain=[a,b,c]、timeout=24h，seed 一条 pending（principal=a），把 created_at
+/// 与 updated_at 都拨回 25h 前模拟超时。第一次 scan → a→b（reassign 把 updated_at 刷新
+/// 到 ~now）。**不再拨钟**直接第二次 scan → 仍是 b（NOT c），因为 b 的 age 此时 ~0 < 24h。
+/// 这证明 age 从 updated_at（最近改派）起算，链≥3 不再级联秒改派。（修前从 created_at
+/// 起算 → 第二次 scan 立刻 b→c，b 只拿到 ~30s。）
+#[tokio::test]
+#[ignore]
+async fn timeout_reassign_gives_each_decider_full_window() {
+    let app = common::TestApp::start().await;
+    let ws = app.state.config.default_workspace_id.clone();
+
+    // PUT 决策人链 [a,b,c] + timeout=24h 到 current config。
+    let policy: wechatagent::models::AskHumanPolicy = serde_json::from_value(serde_json::json!({
+        "deciderChain": [{ "wxid": "a" }, { "wxid": "b" }, { "wxid": "c" }],
+        "timeoutHours": 24.0,
+    }))
+    .expect("deserialize policy");
+    let _ = wechatagent::routes::domains::put_ask_human_policy(
+        State(app.state.clone()),
+        Extension(test_admin(&ws)),
+        Path("user_operations".to_string()),
+        Json(policy),
+    )
+    .await
+    .expect("put policy ok");
+
+    let entry = seed_pending_escalation(&app.state, &ws, "cust_chain", "a").await;
+
+    // 模拟"已过 25h"：把 created_at 与 updated_at 都拨回 25h 前（测试钟操纵，非 config 行）。
+    let twenty_five_h_ago =
+        DateTime::from_millis(DateTime::now().timestamp_millis() - 25 * 3600 * 1000);
+    app.state
+        .db
+        .agent_principal_escalations()
+        .update_one(
+            doc! { "short_code": &entry.short_code },
+            doc! { "$set": { "created_at": twenty_five_h_ago, "updated_at": twenty_five_h_ago } },
+            None,
+        )
+        .await
+        .expect("backdate clock");
+
+    // 第一次 scan：age≈25h ≥ 24h，a 非链尾 → a→b。reassign 把 updated_at 刷新到 ~now。
+    wechatagent::agent::escalation::scan_escalation_timeouts(&app.state)
+        .await
+        .expect("first scan ok");
+    let after_first = app
+        .state
+        .db
+        .agent_principal_escalations()
+        .find_one(doc! { "short_code": &entry.short_code }, None)
+        .await
+        .expect("query")
+        .expect("exists");
+    assert_eq!(
+        after_first.principal_wxid, "b",
+        "第一次超时扫描应 a→b"
+    );
+
+    // 第二次 scan：不再拨钟。b 的 updated_at 刚被 reassign 刷到 ~now → age≈0 < 24h → 不动。
+    wechatagent::agent::escalation::scan_escalation_timeouts(&app.state)
+        .await
+        .expect("second scan ok");
+    let after_second = app
+        .state
+        .db
+        .agent_principal_escalations()
+        .find_one(doc! { "short_code": &entry.short_code }, None)
+        .await
+        .expect("query")
+        .expect("exists");
+    assert_eq!(
+        after_second.principal_wxid, "b",
+        "age 自 updated_at 起算 → b 应拿到完整 24h 窗，第二次 scan 仍是 b（NOT c）"
+    );
+}

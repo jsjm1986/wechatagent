@@ -90,6 +90,10 @@ pub async fn resolve_principal_escalation(
         constraints: body.constraints,
         authorization_window_hours: body.authorization_window_hours,
     });
+    // deferred：领导/admin 暂缓 → 保持 pending 继续等待（与 wechat 路径 mod.rs 一致），不 resolve、不 relay。
+    if decision.verdict == crate::models::PRINCIPAL_VERDICT_DEFERRED {
+        return Ok(Json(json!({ "ok": true, "deferred": true })));
+    }
     let expires = decision.authorization_window_hours.and_then(|hours| {
         if hours > 0.0 {
             Some(DateTime::from_millis(
@@ -103,10 +107,8 @@ pub async fn resolve_principal_escalation(
     if resolved.is_none() {
         return Ok(Json(json!({ "ok": true, "alreadyResolved": true })));
     }
-    // deferred 不转述（领导/admin 暂缓）；其余起 relay task 用 AI 口吻转述客户。
-    if decision.verdict != crate::models::PRINCIPAL_VERDICT_DEFERRED {
-        enqueue_relay_task(&state, &entry).await?;
-    }
+    // 非 deferred（deferred 已在上方短路返回）→ 起 relay task 用 AI 口吻转述客户。
+    enqueue_relay_task(&state, &entry).await?;
     Ok(Json(json!({ "ok": true })))
 }
 

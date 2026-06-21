@@ -317,7 +317,8 @@ pub(crate) async fn handle_principal_reply(
 
 /// 超时转备选：扫所有 pending 请示，age > timeout_hours 且当前决策人非链尾 → 改派下一位 + 重推卡。
 /// AI 绝不替决策人拍板——只把请示转给链上下一位真人。timeout=None → 无限等待，不动。
-pub(crate) async fn scan_escalation_timeouts(state: &AppState) -> AppResult<()> {
+/// （age 自最近一次改派 updated_at 起算，确保每位决策人都拿到完整 timeout 窗）
+pub async fn scan_escalation_timeouts(state: &AppState) -> AppResult<()> {
     use futures::TryStreamExt;
     let now_ms = DateTime::now().timestamp_millis();
     // 取所有 current_version config，建 workspace+domain → resolved policy 映射。
@@ -336,7 +337,7 @@ pub(crate) async fn scan_escalation_timeouts(state: &AppState) -> AppResult<()> 
         let pending = list_escalations_by_workspace(state, &cfg.workspace_id, "pending").await?;
         for entry in pending {
             let age_hours =
-                (now_ms - entry.created_at.timestamp_millis()) as f64 / (3600.0 * 1000.0);
+                (now_ms - entry.updated_at.timestamp_millis()) as f64 / (3600.0 * 1000.0);
             let Some(next) = next_decider_on_timeout(&policy, &entry.principal_wxid, age_hours)
             else {
                 continue;
