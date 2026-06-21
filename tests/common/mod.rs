@@ -278,6 +278,7 @@ fn test_config(mongodb_uri: String, mongodb_database: String) -> AppConfig {
         cold_contact_worker_enabled: false,
         cold_contact_threshold_hours: 168,
         cold_contact_daily_emit_cap: 5,
+        holding_reply_min_interval_hours: 6.0,
         // ── 自学习采集管道（第一阶段）：测试默认全部 disabled / 极小值 ──
         silence_signal_worker_enabled: false,
         silence_threshold_seconds: 86400,

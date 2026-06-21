@@ -183,7 +183,7 @@ pub(crate) async fn handle_principal_decision_relay(
         // 授权过期：不拿过期授权乱承诺，但议题已被领导处理过——必须清 awaiting 标记
         // （否则下一轮 build_decision_signals_text 仍读到"等待裁决"，永久压制对该议题的自主回复）
         // + 发一条不含 substance 的中性收尾话术（否则客户零反馈、被晾死）。
-        // 下一轮客户来消息正常对话接管。fail-soft：发话术失败不 return Err（清标记已成功）。
+        // 下一轮客户来消息由 AI 正常对话延续。fail-soft：发话术失败不 return Err（清标记已成功）。
         let contact = state
             .db
             .contacts()
@@ -371,6 +371,44 @@ pub async fn scan_escalation_timeouts(state: &AppState) -> AppResult<()> {
                 (now_ms - entry.updated_at.timestamp_millis()) as f64 / (3600.0 * 1000.0);
             let Some(next) = next_decider_on_timeout(&policy, &entry.principal_wxid, age_hours)
             else {
+                // next_decider_on_timeout 返回 None 有两种情形：①尚未超时 ②已超时但到链尾。
+                // 仅情形②需安抚客户。policy.timeout_hours 在 :365 已确保 Some，可直接比对区分。
+                let timed_out = policy
+                    .timeout_hours
+                    .map_or(false, |t| age_hours >= t);
+                if timed_out {
+                    // 链尾：无更多决策人可改派。客户不能被永久晾着——发 AI 自主延期安抚话术，
+                    // 台账保持 pending 继续等领导。去重：每 holding_reply_min_interval_hours 最多一条。
+                    // 安抚发给**客户**（非领导推卡），故**不过** push_allowed（quiet_hours 约束打扰领导；
+                    // 客户安抚只受 min_interval 去重约束）。
+                    let min_interval_ms =
+                        (state.config.holding_reply_min_interval_hours * 3600.0 * 1000.0) as i64;
+                    let should_send = entry
+                        .last_holding_reply_ms
+                        .map_or(true, |last| now_ms - last >= min_interval_ms);
+                    if should_send {
+                        let _ = mcp::logged_call_for_account(
+                            state,
+                            &entry.account_id,
+                            "message_send_text",
+                            serde_json::json!({
+                                "recipient": &entry.contact_wxid,
+                                "content": chain_tail_holding_reply()
+                            }),
+                        )
+                        .await;
+                        if let Err(e) = touch_last_holding_reply_ms(
+                            state,
+                            &cfg.workspace_id,
+                            &entry.short_code,
+                            now_ms,
+                        )
+                        .await
+                        {
+                            tracing::warn!(short_code = %entry.short_code, error = ?e, "链尾安抚已发但更新 last_holding_reply_ms 失败");
+                        }
+                    }
+                }
                 continue;
             };
             let next_wxid = next.wxid.clone();

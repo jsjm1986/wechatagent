@@ -694,6 +694,58 @@ async fn t_timeout_reassign_push_failure_retries_same_next_on_next_tick() {
     );
 }
 
+/// §14.12（③链尾失联安抚去重）：单决策人链 [boss]，timeout 1h，boss 一直不回。
+/// 第一次 scan（age 超时、next_decider 返回 None=链尾）→ 发一条安抚话术 + 记
+/// last_holding_reply_ms。紧接第二次 scan（min_interval 未到）→ 不重复发（去重）。
+/// 台账保持 pending。
+#[tokio::test]
+#[ignore]
+async fn t_timeout_chain_tail_sends_holding_reply_once_within_interval() {
+    let app = common::TestApp::start().await;
+    let mcp = start_mcp_mock_success().await;
+    let state = common::rebuild_app_state_with_mcp_url(&app, mcp.uri());
+
+    set_ask_human_policy(
+        &app,
+        &AskHumanPolicy {
+            decider_chain: vec![DeciderRef { wxid: "boss".into(), display_name: None }],
+            escalate_safety_guard: true,
+            escalate_unverified_product: true,
+            escalate_ai_policy_hold: false,
+            escalate_stuck: true,
+            dedupe_window_hours: None,
+            daily_push_cap: None,
+            quiet_hours: None,
+            timeout_hours: Some(1.0),
+        },
+    )
+    .await;
+
+    let two_hours_ago = DateTime::from_millis(DateTime::now().timestamp_millis() - 2 * 3600 * 1000);
+    insert_pending_with_updated_at(&app, "T12", "boss", two_hours_ago).await;
+
+    // 第一次 scan：链尾 → 发安抚 + 记 last_holding_reply_ms。
+    wechatagent::agent::escalation::scan_escalation_timeouts(&state)
+        .await
+        .expect("scan 1");
+    let after1 = find_escalation(&app, "T12").await;
+    assert_eq!(after1.status, "pending", "链尾安抚后台账仍 pending");
+    assert!(
+        after1.last_holding_reply_ms.is_some(),
+        "应记录安抚发送时刻"
+    );
+
+    // 第二次 scan（紧接，min_interval=6h 未到）：不重复发。
+    wechatagent::agent::escalation::scan_escalation_timeouts(&state)
+        .await
+        .expect("scan 2");
+    let after2 = find_escalation(&app, "T12").await;
+    assert_eq!(
+        after2.last_holding_reply_ms, after1.last_holding_reply_ms,
+        "min_interval 内不重复发安抚，时刻不变"
+    );
+}
+
 // ───────────────────── §14.11（②授权过期闭环，#[ignore]，CI 跑） ─────────────────────
 
 /// 插一条 resolved 台账：decision 带 substance，但 authorization_expires_at 已过期（now-1h）。

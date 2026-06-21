@@ -52,6 +52,7 @@ pub(crate) async fn insert_pending_escalation(
             authorization_expires_at: None,
             is_generalizable,
             knowledge_proposal_emitted: false,
+            last_holding_reply_ms: None,
             created_at: now,
             updated_at: now,
             resolved_at: None,
@@ -307,6 +308,29 @@ pub(crate) async fn reassign_escalation(
         )
         .await?;
     Ok(updated)
+}
+
+/// 更新链尾安抚话术发送时刻（去重用）。仅 pending 可更新。
+pub(crate) async fn touch_last_holding_reply_ms(
+    state: &AppState,
+    workspace_id: &str,
+    short_code: &str,
+    now_ms: i64,
+) -> AppResult<()> {
+    state
+        .db
+        .agent_principal_escalations()
+        .update_one(
+            doc! {
+                "workspace_id": workspace_id,
+                "short_code": short_code,
+                "status": PRINCIPAL_ESCALATION_STATUS_PENDING,
+            },
+            doc! { "$set": { "last_holding_reply_ms": now_ms } },
+            None,
+        )
+        .await?;
+    Ok(())
 }
 
 /// 统计某决策人当日（since_ms 起）已被推送的请示卡数（骚扰门 daily_push_cap 用）。

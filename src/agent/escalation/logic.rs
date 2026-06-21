@@ -86,8 +86,15 @@ pub fn fallback_holding_reply() -> &'static str {
     "这个我帮你确认一下，稍等我给你准信。"
 }
 
+/// 链尾失联（无更多决策人可改派）时给客户的延期安抚话术。AI 自治口吻，表达"还在跟进"，
+/// 不自答越权点、不复述任何未授权内容、绝不出现转接类禁词（受全自治定位文本 lint 约束）。
+/// 红线：客户永不被晾死、永不直接面对真人——领导一直不回也由 AI 持续安抚保持等待。
+pub(crate) fn chain_tail_holding_reply() -> &'static str {
+    "您这个问题我还在帮您核实确认，需要一点时间，麻烦您稍等下～一有结果我马上同步您。"
+}
+
 /// 授权过期的中性收尾话术：relay task 跑时领导授权已过期，不复述任何过期承诺/数字，
-/// 只表达"会继续跟进"。AI 自治口吻，绝不出现"人工/转人工/接管"等转接类禁词。
+/// 只表达"会继续跟进"。AI 自治口吻，绝不出现转接类禁词。
 /// 用于早退分支：客户不被晾死、awaiting 标记同步清除。
 pub(crate) fn expired_authorization_neutral_reply() -> &'static str {
     "关于您之前问的那件事，我这边再帮您核实下最新情况，有确切消息第一时间同步您～"
@@ -469,6 +476,7 @@ mod tests {
             authorization_expires_at: None,
             is_generalizable: false,
             knowledge_proposal_emitted: false,
+            last_holding_reply_ms: None,
             created_at: mongodb::bson::DateTime::now(),
             updated_at: mongodb::bson::DateTime::now(),
             resolved_at: None,
