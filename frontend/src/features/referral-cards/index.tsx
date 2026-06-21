@@ -128,6 +128,15 @@ export default function ReferralCardsFeature() {
                 onChange={(event) => setCardDraft({ ...cardDraft, targetStages: event.target.value })}
               />
             </label>
+            <label className={styles.field}>
+              <span className={styles.fieldLabel}>标签（逗号分隔，可留空）</span>
+              <input
+                className={styles.input}
+                placeholder="例如：签约类,到店"
+                value={cardDraft.tags}
+                onChange={(event) => setCardDraft({ ...cardDraft, tags: event.target.value })}
+              />
+            </label>
             <button
               className={styles.submit}
               type="submit"
@@ -177,6 +186,13 @@ function ReferralCardRow({
       )}
       {card.targetStages.length > 0 && (
         <p className={styles.metaLine}>目标阶段：{card.targetStages.join("、")}</p>
+      )}
+      {(card.tags?.length ?? 0) > 0 && (
+        <div className={styles.badges} style={{ marginTop: 6 }}>
+          {card.tags!.map((tag) => (
+            <span key={tag} className={`${styles.badge} ${styles.badgeDraft}`}>{tag}</span>
+          ))}
+        </div>
       )}
       <div className={styles.actions}>
         {isApproved ? (

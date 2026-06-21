@@ -7,7 +7,8 @@ const emptyDraft: ReferralCardDraft = {
   displayName: "",
   targetWxid: "",
   sendTriggerHint: "",
-  targetStages: ""
+  targetStages: "",
+  tags: ""
 };
 
 interface ReferralCardState {
@@ -50,12 +51,17 @@ export const useReferralCardStore = create<ReferralCardState & ReferralCardActio
         .split(",")
         .map((s) => s.trim())
         .filter(Boolean);
+      const tags = cardDraft.tags
+        .split(",")
+        .map((s) => s.trim())
+        .filter(Boolean);
       await api.post("/api/referral-cards", {
         accountId: accountId || undefined,
         displayName: cardDraft.displayName.trim(),
         targetWxid: cardDraft.targetWxid.trim(),
         sendTriggerHint: cardDraft.sendTriggerHint.trim() || undefined,
-        targetStages
+        targetStages,
+        tags
       });
       set({ cardDraft: { ...emptyDraft } });
       await get().loadCards();

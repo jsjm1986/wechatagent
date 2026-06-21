@@ -54,11 +54,20 @@ export default function ContentAssetsFeature() {
     "file_primary"
   );
   const [stages, setStages] = useState("");
+  const [tags, setTags] = useState("");
   const [needsApproval, setNeedsApproval] = useState(false);
+
+  // 列表按标签筛选
+  const [filterTag, setFilterTag] = useState("");
 
   useEffect(() => {
     loadAssets(currentAccountId);
   }, [currentAccountId, loadAssets]);
+
+  const handleFilter = (event: FormEvent) => {
+    event.preventDefault();
+    void loadAssets(currentAccountId, filterTag.trim() || undefined);
+  };
 
   const handleCreateAsset = (event: FormEvent) => {
     event.preventDefault();
@@ -75,6 +84,7 @@ export default function ContentAssetsFeature() {
     fd.append("sendTriggerHint", triggerHint);
     fd.append("expressionPref", expressionPref);
     fd.append("targetStages", stages);
+    fd.append("tags", tags);
     fd.append("requiresPrincipalApproval", String(needsApproval));
     if (currentAccountId) fd.append("accountId", currentAccountId);
     const ok = await uploadMediaAsset(fd, currentAccountId);
@@ -83,6 +93,7 @@ export default function ContentAssetsFeature() {
       setMediaTitle("");
       setTriggerHint("");
       setStages("");
+      setTags("");
       setNeedsApproval(false);
     }
   };
@@ -101,6 +112,35 @@ export default function ContentAssetsFeature() {
             </div>
             <span className={styles.headIcon}><FileText size={17} /></span>
           </div>
+
+          <form className={styles.field} style={{ marginBottom: 14 }} onSubmit={handleFilter}>
+            <span className={styles.fieldLabel}>按标签筛选素材</span>
+            <div style={{ display: "flex", gap: 8 }}>
+              <input
+                className={styles.input}
+                placeholder="输入标签后回车，例如：报价类"
+                value={filterTag}
+                onChange={(event) => setFilterTag(event.target.value)}
+              />
+              <button className={styles.reviewBtn} type="submit" disabled={busy} style={{ marginTop: 0, flexShrink: 0 }}>
+                筛选
+              </button>
+              {filterTag && (
+                <button
+                  className={styles.reviewBtn}
+                  type="button"
+                  disabled={busy}
+                  style={{ marginTop: 0, flexShrink: 0 }}
+                  onClick={() => {
+                    setFilterTag("");
+                    void loadAssets(currentAccountId);
+                  }}
+                >
+                  清除
+                </button>
+              )}
+            </div>
+          </form>
 
           {assets.length === 0 ? (
             <EmptyState title="暂无内容资产" hint="在右侧新增文本、FAQ、话术或品牌语气，供 Agent 自主运营调用。" />
@@ -295,6 +335,15 @@ export default function ContentAssetsFeature() {
                   onChange={(event) => setStages(event.target.value)}
                 />
               </label>
+              <label className={styles.field}>
+                <span className={styles.fieldLabel}>标签（逗号分隔）</span>
+                <input
+                  className={styles.input}
+                  placeholder="例如：报价类,价格"
+                  value={tags}
+                  onChange={(event) => setTags(event.target.value)}
+                />
+              </label>
               <label className={styles.checkboxField}>
                 <input
                   type="checkbox"
@@ -344,6 +393,7 @@ function MediaAssetRow({
   const [editTitle, setEditTitle] = useState(asset.title);
   const [editHint, setEditHint] = useState(asset.sendTriggerHint ?? "");
   const [editStages, setEditStages] = useState((asset.targetStages ?? []).join(","));
+  const [editTags, setEditTags] = useState((asset.tags ?? []).join(","));
   const [editFile, setEditFile] = useState<File | null>(null);
   const [editMediaType, setEditMediaType] = useState<"image" | "file" | "video">(
     asset.mediaType ?? "file"
@@ -353,6 +403,7 @@ function MediaAssetRow({
     setEditTitle(asset.title);
     setEditHint(asset.sendTriggerHint ?? "");
     setEditStages((asset.targetStages ?? []).join(","));
+    setEditTags((asset.tags ?? []).join(","));
     setEditMediaType(asset.mediaType ?? "file");
     setEditFile(null);
     setEditing(true);
@@ -363,10 +414,15 @@ function MediaAssetRow({
       .split(",")
       .map((s) => s.trim())
       .filter(Boolean);
+    const tags = editTags
+      .split(",")
+      .map((s) => s.trim())
+      .filter(Boolean);
     onEditMeta({
       title: editTitle.trim(),
       sendTriggerHint: editHint,
-      targetStages
+      targetStages,
+      tags
     });
     setEditing(false);
   };
@@ -404,6 +460,13 @@ function MediaAssetRow({
           </p>
           {asset.sendTriggerHint && (
             <p className={styles.metaLine}>时机：{asset.sendTriggerHint}</p>
+          )}
+          {(asset.tags?.length ?? 0) > 0 && (
+            <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginTop: 6 }}>
+              {asset.tags!.map((tag) => (
+                <span key={tag} className={styles.kind}>{tag}</span>
+              ))}
+            </div>
           )}
           <div style={{ display: "flex", flexWrap: "wrap", gap: 8, marginTop: 8 }}>
             {!isApproved && (
@@ -465,6 +528,15 @@ function MediaAssetRow({
                   placeholder="例如：意向,未成交"
                   value={editStages}
                   onChange={(event) => setEditStages(event.target.value)}
+                />
+              </label>
+              <label className={styles.field}>
+                <span className={styles.fieldLabel}>标签（逗号分隔）</span>
+                <input
+                  className={styles.input}
+                  placeholder="例如：报价类,价格"
+                  value={editTags}
+                  onChange={(event) => setEditTags(event.target.value)}
                 />
               </label>
               <button
