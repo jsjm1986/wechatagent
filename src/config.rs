@@ -329,6 +329,11 @@ pub struct AppConfig {
     pub media_max_file_size_mb: u64,
     /// MCP media_id 缓存有效期（小时），过期重传。默认 24。
     pub media_id_cache_ttl_hours: i64,
+    /// 唤醒任务 per-contact 确定性 jitter 上限（秒）。静默期延后的发送/入站全部重排到
+    /// 次日 quiet_hours_end（如 8:00），同 workspace 多客户会整点齐发；给 next_wake_at
+    /// 加按 contact.wxid 派生的 [0, 该值] 秒偏移把唤醒散开，避峰且更像真人。默认 900（15min）。
+    /// 设 0 关闭 jitter（恒整点）。env `WAKE_JITTER_MAX_SECONDS`。
+    pub wake_jitter_max_seconds: u32,
 }
 
 /// 手写 `Debug` 实现：把所有 secret 字段过 [`mask_secret`]，避免日志/panic
@@ -676,6 +681,7 @@ impl AppConfig {
             media_storage_dir: env_or("MEDIA_STORAGE_DIR", "./media"),
             media_max_file_size_mb: env_or("MEDIA_MAX_FILE_SIZE_MB", "50").parse()?,
             media_id_cache_ttl_hours: env_or("MEDIA_ID_CACHE_TTL_HOURS", "24").parse()?,
+            wake_jitter_max_seconds: env_or("WAKE_JITTER_MAX_SECONDS", "900").parse()?,
         })
     }
 }

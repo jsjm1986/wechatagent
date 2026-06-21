@@ -658,7 +658,7 @@ pub async fn ensure_wake_followup_task(
         return Ok(());
     }
     let now = DateTime::now();
-    let run_at = agent::quiet_hours::next_wake_at(wake_hour, tz_offset_hours);
+    let run_at = agent::quiet_hours::next_wake_at(wake_hour, tz_offset_hours, &contact.wxid, state.config.wake_jitter_max_seconds);
     // expiry 给 24h 余量（覆盖最长跨午夜窗口 + 醒来后 worker tick 间隔），过期未跑则作废。
     let expires_at = DateTime::from_millis(run_at.timestamp_millis() + 24 * 60 * 60 * 1000);
     let task = AgentTask {
