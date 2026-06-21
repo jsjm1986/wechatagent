@@ -6,6 +6,7 @@ import { useUiStore } from "../../stores/uiStore";
 import { useStrategyStore } from "../../stores/strategyStore";
 import type { AgentSoul, PromptTemplate, PromptTemplateDraft, DomainProfile, DomainProfileDraft } from "../../types";
 import { ProfilePublishCard } from "../../components/review/ProfilePublishCard";
+import { LessonPromoteCard } from "../../components/review/LessonPromoteCard";
 import { ConfirmProvider } from "../../components/ui/ConfirmDialog";
 import { ToastProvider } from "../../components/ui/Toast";
 import styles from "./SystemStrategy.module.css";
@@ -2013,10 +2014,6 @@ function LessonsLearnedAdmin({ busy }: { busy: boolean }) {
   const [error, setError] = useState<string | null>(null);
   const [patternKind, setPatternKind] = useState<string>("");
   const [promoting, setPromoting] = useState<string | null>(null); // lesson_id
-  const [draftTitle, setDraftTitle] = useState("");
-  const [draftBody, setDraftBody] = useState("");
-  const [draftSummary, setDraftSummary] = useState("");
-  const [promoteError, setPromoteError] = useState<string | null>(null);
 
   async function reload() {
     setLoading(true);
@@ -2038,42 +2035,10 @@ function LessonsLearnedAdmin({ busy }: { busy: boolean }) {
 
   function openPromote(lessonId: string) {
     setPromoting(lessonId);
-    setDraftTitle("");
-    setDraftBody("");
-    setDraftSummary("");
-    setPromoteError(null);
   }
 
   function closePromote() {
     setPromoting(null);
-    setDraftTitle("");
-    setDraftBody("");
-    setDraftSummary("");
-    setPromoteError(null);
-  }
-
-  async function submitPromote() {
-    if (!promoting) return;
-    if (!draftTitle.trim() || !draftBody.trim()) {
-      setPromoteError("title 和 body 都不能为空");
-      return;
-    }
-    setPromoteError(null);
-    try {
-      const payload: Record<string, string> = {
-        title: draftTitle.trim(),
-        body: draftBody.trim(),
-      };
-      if (draftSummary.trim()) payload.summary = draftSummary.trim();
-      await api.post(
-        `/api/admin/lessons-learned/${encodeURIComponent(promoting)}/promote-to-peer-case`,
-        payload
-      );
-      closePromote();
-      void reload();
-    } catch (e) {
-      setPromoteError((e as Error).message);
-    }
   }
 
   useEffect(() => {
@@ -2181,46 +2146,13 @@ function LessonsLearnedAdmin({ busy }: { busy: boolean }) {
               )}
               {promoting === item.lessonId && (
                 <div className={styles.versionedListChunk} style={{ gridColumn: "1 / -1" }}>
-                  <span>晋升为 peer_case 候选 chunk（仍需 admin 在知识审核队列 verify）</span>
-                  <div className={styles.promoteForm}>
-                    <input
-                      className={styles.input}
-                      type="text"
-                      placeholder="title（≤ 200 字）"
-                      value={draftTitle}
-                      onChange={(e) => setDraftTitle(e.target.value)}
-                      maxLength={200}
-                    />
-                    <input
-                      className={styles.input}
-                      type="text"
-                      placeholder="summary（一句话，可选）"
-                      value={draftSummary}
-                      onChange={(e) => setDraftSummary(e.target.value)}
-                    />
-                    <textarea
-                      className={styles.textarea}
-                      placeholder="body：案例正文（≤ 4000 字）"
-                      value={draftBody}
-                      onChange={(e) => setDraftBody(e.target.value)}
-                      rows={6}
-                      maxLength={4000}
-                    />
-                    {promoteError && <div className={styles.inlineError}>{promoteError}</div>}
-                    <div className={styles.buttonRow}>
-                      <button
-                        type="button"
-                        className={styles.btnPrimary}
-                        onClick={() => void submitPromote()}
-                        disabled={busy || !draftTitle.trim() || !draftBody.trim()}
-                      >
-                        提交晋升
-                      </button>
-                      <button type="button" className={styles.btnGhost} onClick={closePromote}>
-                        取消
-                      </button>
-                    </div>
-                  </div>
+                  <LessonPromoteCard
+                    lessonId={item.lessonId}
+                    onDone={() => {
+                      closePromote();
+                      void reload();
+                    }}
+                  />
                 </div>
               )}
             </div>
