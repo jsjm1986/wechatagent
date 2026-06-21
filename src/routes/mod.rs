@@ -59,6 +59,7 @@ mod playbooks;
 pub mod principal_escalations;
 mod products;
 mod prompt_templates;
+mod referral_cards;
 mod reviews;
 mod shared;
 mod simulations;
@@ -372,6 +373,22 @@ pub fn api_router(state: AppState) -> Router<AppState> {
         .route(
             "/content-assets/:id/review",
             post(media_assets::review_media_asset),
+        )
+        .route(
+            "/referral-cards",
+            post(referral_cards::create_referral_card).get(referral_cards::list_referral_cards),
+        )
+        .route(
+            "/referral-cards/:id/review",
+            post(referral_cards::review_referral_card),
+        )
+        .route(
+            "/referral-cards/:id/toggle",
+            post(referral_cards::toggle_referral_card),
+        )
+        .route(
+            "/referral-cards/:id",
+            axum::routing::delete(referral_cards::delete_referral_card),
         )
         .route(
             "/operation-knowledge",
