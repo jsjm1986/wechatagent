@@ -136,6 +136,7 @@ fn enqueue_request(run_id: &str, source_event_id: &str, contact_wxid: &str) -> E
         source_event_id: source_event_id.to_string(),
         source_kind: "inbound_message".to_string(),
         content: "你好，这是集成测试投递的内容。".to_string(),
+        media_asset_id: None,
         max_attempts: 3,
     }
 }
