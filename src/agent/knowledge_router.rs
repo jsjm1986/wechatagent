@@ -234,7 +234,7 @@ pub fn format_operation_knowledge_for_prompt_with_roles(
         by_key.entry(role_key).or_default().push(c);
     }
     let render_chunk = |item: &OperationKnowledgeChunk| -> String {
-        format!(
+        let mut s = format!(
             "- chunkId={} type={} chunkType={} context={} title={}\n  integrityStatus={} confidence={}\n  summary={}\n  body={}\n  sourceAnchors={}\n  sourceQuote={}",
             item.id.map(|id| id.to_hex()).unwrap_or_default(),
             item.knowledge_type.clone().unwrap_or_default(),
@@ -247,7 +247,16 @@ pub fn format_operation_knowledge_for_prompt_with_roles(
             item.body.clone().unwrap_or_default(),
             serde_json::to_string(&item.source_anchors).unwrap_or_default(),
             item.source_quote.clone().unwrap_or_default()
-        )
+        );
+        // 缺口7 软增强：非空才追加产品标签 / 业务主题（空 Vec 跳过避免 prompt 噪声），
+        // 让 AI 看到知识切片归属哪些业务议题，与素材 tags 语义对照自主配套。
+        if !item.product_tags.is_empty() {
+            s.push_str(&format!("\n  productTags={}", item.product_tags.join(",")));
+        }
+        if !item.business_topics.is_empty() {
+            s.push_str(&format!("\n  businessTopics={}", item.business_topics.join(",")));
+        }
+        s
     };
     // 按 role.order 升序输出，仅产出有 chunk 的桶（空桶不留 header）。
     let mut ordered: Vec<&crate::models::ChunkRole> = roles.iter().collect();
@@ -951,6 +960,27 @@ mod tests {
         let s = format_operation_knowledge_for_prompt(&chunks);
         assert!(s.contains("chunkType=product_fact"));
         assert!(s.contains("chunkType=style_template"));
+    }
+
+    #[test]
+    fn render_chunk_includes_product_tags_and_business_topics() {
+        // 缺口7 软增强：render_chunk 行尾应注入产品标签 / 业务主题，
+        // 让 AI 看到知识切片归属哪些业务议题，与素材 tags 语义对照配套。
+        let mut chunk = mk_chunk("价格说明", "product_fact");
+        chunk.product_tags = vec!["套餐A".to_string(), "套餐B".to_string()];
+        chunk.business_topics = vec!["价格".to_string()];
+        let out = format_operation_knowledge_for_prompt(&[chunk]);
+        assert!(out.contains("productTags=套餐A,套餐B"), "应渲染 product_tags(join 逗号): {out}");
+        assert!(out.contains("businessTopics=价格"), "应渲染 business_topics: {out}");
+    }
+
+    #[test]
+    fn render_chunk_skips_empty_tags() {
+        // product_tags / business_topics 留空时不渲染该段，避免 prompt 噪声。
+        let chunk = mk_chunk("无标签切片", "product_fact");
+        let out = format_operation_knowledge_for_prompt(&[chunk]);
+        assert!(!out.contains("productTags"), "空 product_tags 不渲染该段: {out}");
+        assert!(!out.contains("businessTopics"), "空 business_topics 不渲染该段: {out}");
     }
 
     #[test]
