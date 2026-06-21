@@ -79,7 +79,8 @@ pub(crate) async fn escalate_held_decision(
     let since_ms = now_ms - 24 * 3600 * 1000;
     let today =
         count_pushes_today(state, &contact.workspace_id, &principal_wxid, since_ms).await?;
-    if !crate::agent::escalation::push_allowed(&policy, today, None, now_ms) {
+    let last_push = latest_push_ms(state, &contact.workspace_id, &principal_wxid).await?;
+    if !crate::agent::escalation::push_allowed(&policy, today, last_push, now_ms) {
         return Ok(()); // 骚扰门关：跳过推卡（pending 台账可由 admin 在收件箱处置）
     }
     // 去重：同客户同类别已有 pending → 不重复推卡骚扰领导。
@@ -347,6 +348,16 @@ pub async fn scan_escalation_timeouts(state: &AppState) -> AppResult<()> {
                 .await?
                 .is_some()
             {
+                // #5 骚扰门：改派重推卡同样过门——备选决策人也不该在静默时段被惊扰 / 超当日上限。
+                // 命中则跳过本 tick 推卡（台账已改派但 updated_at 未刷新，age 仍超时，
+                // 下一 tick 会再尝试推；pending 不丢，admin 收件箱也可见改派后的 pending）。
+                let since_ms = now_ms - 24 * 3600 * 1000;
+                let today =
+                    count_pushes_today(state, &cfg.workspace_id, &next_wxid, since_ms).await?;
+                let last_push = latest_push_ms(state, &cfg.workspace_id, &next_wxid).await?;
+                if !push_allowed(&policy, today, last_push, now_ms) {
+                    continue; // 骚扰门拦：本 tick 跳过推卡（已改派，待下一 tick）
+                }
                 let label = entry.contact_wxid.clone();
                 let card = render_principal_card(
                     &entry.short_code,
@@ -354,13 +365,28 @@ pub async fn scan_escalation_timeouts(state: &AppState) -> AppResult<()> {
                     &entry.reason,
                     &entry.question_for_principal,
                 );
-                let _ = mcp::logged_call_for_account(
+                match mcp::logged_call_for_account(
                     state,
                     &entry.account_id,
                     "message_send_text",
-                    serde_json::json!({ "recipient": next_wxid, "content": card }),
+                    serde_json::json!({ "recipient": &next_wxid, "content": card }),
                 )
-                .await; // 推卡失败降级，不阻断扫描
+                .await
+                {
+                    // #6 方案A：推卡成功后才刷 updated_at（age 自推卡成功起算）。
+                    Ok(_) => {
+                        if let Err(e) =
+                            touch_escalation_updated_at(state, &cfg.workspace_id, &entry.short_code)
+                                .await
+                        {
+                            tracing::warn!(short_code = %entry.short_code, error = ?e, "改派推卡成功但刷新 updated_at 失败");
+                        }
+                    }
+                    // #6：去掉 let _ 吞错，记 warn。updated_at 未刷新→下一 tick age 仍超时会重试。
+                    Err(e) => {
+                        tracing::warn!(short_code = %entry.short_code, next = %next_wxid, error = ?e, "改派后推卡失败，下一 tick 将重试");
+                    }
+                }
             }
         }
     }
