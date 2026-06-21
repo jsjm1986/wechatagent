@@ -484,6 +484,26 @@ pub async fn wechat_webhook(
     // db/indexes.rs:55-63 的 partial unique index `workspace_id+account_id+dedupe_key`），
     // 让 MongoDB 在写入时原子去重。
     let raw = to_document(&payload).ok();
+    // F1：解析入站消息类型 + 媒体引用，不再写死 None。raw 类型字段优先 GeWe 大写驼峰
+    // `MsgType`（微信数字码），兼容手工/自测 payload 的小写别名；payload 无类型字段时
+    // 默认按 text（runbook W1-W3 等纯文本自测 payload 不带类型字段，行为不变）。
+    let raw_msg_type = find_string(
+        &payload,
+        &[
+            // 小写驼峰（自测/手工）
+            "msgType",
+            "msg_type",
+            "type",
+            // GeWe 大写驼峰（MCP 透传的真实推送）
+            "MsgType",
+            "Type",
+        ],
+    );
+    let msg_type = match raw_msg_type.as_deref() {
+        Some(raw_type) => classify_inbound_msg_type(raw_type),
+        None => "text",
+    };
+    let media_ref = extract_inbound_media_ref(&payload, msg_type);
     let inbound = ConversationMessage {
         id: None,
         workspace_id: workspace_id.clone(),
@@ -493,8 +513,8 @@ pub async fn wechat_webhook(
         dedupe_key: Some(dedupe_key.clone()),
         direction: MessageDirection::Inbound,
         content,
-        msg_type: None,
-        media_ref: None,
+        msg_type: Some(msg_type.to_string()),
+        media_ref,
         raw,
         created_at: DateTime::now(),
     };
@@ -852,6 +872,69 @@ fn value_to_string(value: &Value) -> Option<String> {
     }
 }
 
+/// 把 webhook payload 里的原始消息类型（GeWe 透传的微信 `MsgType` 数字码，或
+/// 手工/自测 payload 的字符串别名）归一化为稳定的 `msg_type` 字符串。F1 地基：
+/// 让非文本入站可被识别（图片/语音/视频/名片/链接卡片等），不再被当空文本硬答。
+///
+/// 未知类型一律归 `"unknown"`——**绝不崩、绝不当 text**，下游据此走非文本分支
+/// （F2 才做媒体理解/过渡话术，本函数只负责识别归类）。
+///
+/// 微信协议私聊 MsgType 数字码：1=文本 3=图片 34=语音 43=视频 42=名片
+/// 47=表情 48=位置 49=appmsg(链接/文件/小程序) 50=语音/视频通话 51=状态同步
+/// 10000/10002=系统消息。GeWe 私聊真实非文本入站 payload 仓内暂无确认样例，
+/// 数字码以微信协议为准；新码值落 `"unknown"` 而非误判，安全侧。
+fn classify_inbound_msg_type(raw: &str) -> &'static str {
+    match raw.trim() {
+        "1" | "text" | "Text" => "text",
+        "3" | "image" | "Image" | "img" => "image",
+        "34" | "voice" | "Voice" => "voice",
+        "43" | "video" | "Video" => "video",
+        "42" | "namecard" | "card" => "namecard",
+        "47" | "emoji" | "sticker" => "emoji",
+        "48" | "location" => "location",
+        "49" | "appmsg" | "link" | "file" | "miniprogram" => "appmsg",
+        "50" | "voip" => "voip",
+        "51" => "statussync",
+        "10000" | "10002" | "sysmsg" | "system" => "system",
+        _ => "unknown",
+    }
+}
+
+/// 从入站 payload 提取媒体引用（图片 cdn url / 文件 id / 语音 path 等），供后续
+/// 多模态理解链路（F2）定位媒体内容。`text` 消息恒返回 None。
+///
+/// GeWe 富媒体引用通常嵌在 `Content` 的 XML 里（`cdnurl`/`aeskey`）或独立 media
+/// 字段；仓内暂无确认的非文本入站样例，故此处只从已知候选字段名尽力提取一个可
+/// 定位引用，找不到返回 None（**不崩、不造假**）。F2 接通 MCP 媒体下载后再补全。
+fn extract_inbound_media_ref(payload: &Value, msg_type: &str) -> Option<String> {
+    if msg_type == "text" {
+        return None;
+    }
+    find_string(
+        payload,
+        &[
+            // 小写驼峰（自测/手工）
+            "mediaUrl",
+            "media_url",
+            "fileUrl",
+            "file_url",
+            "cdnUrl",
+            "cdn_url",
+            "cdnurl",
+            "mediaId",
+            "media_id",
+            "fileId",
+            "file_id",
+            // GeWe 大写驼峰
+            "MediaUrl",
+            "FileUrl",
+            "CdnUrl",
+            "MediaId",
+            "FileId",
+        ],
+    )
+}
+
 async fn resolve_account_context(
     state: &AppState,
     app_id: Option<&str>,
@@ -1060,6 +1143,74 @@ fn verify_hmac_sha256(key: &[u8], body: &[u8], provided_hex: &str) -> bool {
     };
     mac.update(body);
     mac.verify_slice(&expected_bytes).is_ok()
+}
+
+#[cfg(test)]
+mod inbound_msg_type_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn classify_inbound_msg_type_maps_known_numeric_codes() {
+        // GeWe 透传的微信 MsgType 数字码
+        assert_eq!(classify_inbound_msg_type("1"), "text");
+        assert_eq!(classify_inbound_msg_type("3"), "image");
+        assert_eq!(classify_inbound_msg_type("34"), "voice");
+        assert_eq!(classify_inbound_msg_type("43"), "video");
+        assert_eq!(classify_inbound_msg_type("42"), "namecard");
+        assert_eq!(classify_inbound_msg_type("49"), "appmsg");
+    }
+
+    #[test]
+    fn classify_inbound_msg_type_maps_string_aliases() {
+        // 手工/自测 payload 的字符串别名
+        assert_eq!(classify_inbound_msg_type("text"), "text");
+        assert_eq!(classify_inbound_msg_type("image"), "image");
+        assert_eq!(classify_inbound_msg_type("voice"), "voice");
+        assert_eq!(classify_inbound_msg_type("video"), "video");
+        assert_eq!(classify_inbound_msg_type("link"), "appmsg");
+    }
+
+    #[test]
+    fn classify_inbound_msg_type_trims_whitespace() {
+        assert_eq!(classify_inbound_msg_type(" 3 "), "image");
+        assert_eq!(classify_inbound_msg_type("\ttext\n"), "text");
+    }
+
+    #[test]
+    fn classify_inbound_msg_type_unknown_never_falls_back_to_text() {
+        // 未知类型归 unknown：不崩、不当 text（下游据此走非文本分支）
+        assert_eq!(classify_inbound_msg_type("某新类型"), "unknown");
+        assert_eq!(classify_inbound_msg_type("9999"), "unknown");
+        assert_eq!(classify_inbound_msg_type(""), "unknown");
+    }
+
+    #[test]
+    fn extract_media_ref_is_none_for_text() {
+        let payload = json!({ "mediaUrl": "http://x/a.jpg", "content": "hi" });
+        assert_eq!(extract_inbound_media_ref(&payload, "text"), None);
+    }
+
+    #[test]
+    fn extract_media_ref_pulls_known_fields_for_media() {
+        let payload = json!({ "fromWxid": "wx1", "cdnUrl": "http://cdn/x.jpg" });
+        assert_eq!(
+            extract_inbound_media_ref(&payload, "image"),
+            Some("http://cdn/x.jpg".to_string())
+        );
+        let payload2 = json!({ "_mcp": { "MediaId": "media-123" } });
+        assert_eq!(
+            extract_inbound_media_ref(&payload2, "voice"),
+            Some("media-123".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_media_ref_none_when_no_reference_present() {
+        // 非文本但 payload 无任何已知媒体引用字段 → None（不造假）
+        let payload = json!({ "fromWxid": "wx1", "content": "" });
+        assert_eq!(extract_inbound_media_ref(&payload, "image"), None);
+    }
 }
 
 #[cfg(test)]
