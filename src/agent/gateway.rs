@@ -1551,7 +1551,7 @@ async fn run_user_operation_gateway_inner(
             tracing::warn!(error = %e, contact = %contact.wxid, "hold→升级请示失败（不阻断 run）");
         }
 
-        // ⑨ 产品宣称被拦 → 写 recall_miss 知识缺口信号（收件箱可见，闭环不再纯人工）。
+        // ⑨ 产品宣称被拦 → 写 recall_miss 知识缺口信号（收件箱可见，缺口可被闭环修复）。
         //
         // R5.4 硬闸只发了瞬时 `product_claim_blocked` 事件（details 仅 used_knowledge_ids），
         // 运营无法据此知道「缺什么、补什么」。这里把客户当前问句（inbound.content）落成一条

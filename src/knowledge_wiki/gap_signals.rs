@@ -445,7 +445,7 @@ impl GapSignalCandidate {
             Some(
                 "产品宣称被 blocked_unverified_product_claim 拦截：本 run 引用的知识\
                  切片里没有任何 verified chunk 背书该产品声明。待运营据 search_queries \
-                 里的客户问句对话式补录 / verify 相关知识，闭环不再纯人工。",
+                 里的客户问句对话式补录 / verify 相关知识，使该缺口可被闭环修复。",
             ),
         );
         if !customer_query.trim().is_empty() {
