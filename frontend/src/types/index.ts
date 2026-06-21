@@ -127,6 +127,7 @@ export type ReferralCard = {
   enabled: boolean;
   reviewStatus: "draft" | "approved";
   reviewNote?: string | null;
+  tags?: string[];
   createdAt?: string;
   updatedAt?: string;
 };
@@ -136,6 +137,7 @@ export type ReferralCardDraft = {
   targetWxid: string;
   sendTriggerHint: string;
   targetStages: string;
+  tags: string;
 };
 
 export type EventItem = {
@@ -182,6 +184,7 @@ export type ContentAsset = {
   reviewStatus?: "draft" | "approved";
   reviewNote?: string;
   sendable?: boolean;
+  tags?: string[];
 };
 
 export type AgentSoul = {

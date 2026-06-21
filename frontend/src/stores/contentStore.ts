@@ -24,7 +24,7 @@ interface ContentActions {
     mediaId: string;
     usageScene: string;
   }) => void;
-  loadAssets: (accountId?: string) => Promise<void>;
+  loadAssets: (accountId?: string, tag?: string) => Promise<void>;
   createAsset: (accountId?: string) => Promise<void>;
   uploadMediaAsset: (form: FormData, accountId?: string) => Promise<boolean>;
   reviewMediaAsset: (
@@ -52,10 +52,15 @@ export const useContentStore = create<ContentState & ContentActions>((set, get) 
 
   setAssetDraft: (draft) => set({ assetDraft: draft }),
 
-  loadAssets: async (accountId?: string) => {
+  loadAssets: async (accountId?: string, tag?: string) => {
     try {
-      const accountParam = accountId ? `?accountId=${accountId}` : "";
-      const response = await api.get<{ items: ContentAsset[] }>(`/api/content-assets${accountParam}`);
+      const params = new URLSearchParams();
+      if (accountId) params.set("accountId", accountId);
+      if (tag) params.set("tag", tag);
+      const query = params.toString();
+      const response = await api.get<{ items: ContentAsset[] }>(
+        `/api/content-assets${query ? `?${query}` : ""}`
+      );
       set({ assets: response.items });
     } catch (error) {
       useUiStore.getState().setError(error instanceof Error ? error.message : String(error));
