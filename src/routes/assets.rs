@@ -22,7 +22,7 @@ use super::AppState;
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub(super) struct ContentAssetQuery {
+pub struct ContentAssetQuery {
     account_id: Option<String>,
     kind: Option<String>,
     tag: Option<String>,
@@ -42,7 +42,7 @@ pub(super) struct ContentAssetRequest {
     usage_scene: Option<String>,
 }
 
-pub(super) async fn list_content_assets(
+pub async fn list_content_assets(
     State(state): State<AppState>,
     Extension(admin): Extension<AuthenticatedAdmin>,
     Query(query): Query<ContentAssetQuery>,

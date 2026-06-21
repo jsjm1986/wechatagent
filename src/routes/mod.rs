@@ -27,7 +27,10 @@ mod admin_taxonomy_candidates;
 // pub（非 pub(crate)）：ask_human_phase1_e2e.rs 集成测试需从 tests/ crate 直调
 // ask_human_inbox / ask_human_summary handler 真函数，仿 domain_profiles 已有先例。
 pub mod ask_human_inbox;
-mod assets;
+// pub（非默认私有）：structured_organization_integration.rs 集成测试需从 tests/
+// crate 直调 list_content_assets handler 真函数（缺口 8 tags 检索 + workspace 隔离），
+// 仿 domain_profiles / ask_human_inbox / contacts 先例。生产路由注册仍走下方 use。
+pub mod assets;
 mod auth;
 mod behavior_signal_metrics;
 pub mod chunk_locks;
