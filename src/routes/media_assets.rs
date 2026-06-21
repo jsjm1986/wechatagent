@@ -324,6 +324,122 @@ pub(super) async fn update_content_asset_meta(
     Ok(Json(json!({ "ok": true })))
 }
 
+/// POST /content-assets/:id/file —— 换文件（multipart）。
+/// 落新文件 → $set file_* + media_id=None（清缓存防发旧文件）+ review_status="draft"（强制重审）。
+/// 旧文件无兄弟引用则物理删（fail-soft）。
+pub(super) async fn replace_content_asset_file(
+    State(state): State<AppState>,
+    Extension(admin): Extension<AuthenticatedAdmin>,
+    Path(id): Path<String>,
+    mut multipart: Multipart,
+) -> AppResult<Json<Value>> {
+    let oid = ObjectId::parse_str(&id).map_err(|_| AppError::BadRequest("bad id".into()))?;
+    // 回查 asset（workspace 隔离）拿旧 file_path。
+    let asset = state
+        .db
+        .content_assets()
+        .find_one(
+            doc! { "_id": oid, "workspace_id": &admin.current_workspace },
+            None,
+        )
+        .await?
+        .ok_or_else(|| AppError::NotFound("asset not found".into()))?;
+    let old_file_path = asset.file_path.clone();
+
+    let mut file_bytes: Option<Vec<u8>> = None;
+    let mut file_name = String::new();
+    let mut mime = String::new();
+    let mut media_type = asset.media_type.clone().unwrap_or_default();
+    while let Some(field) = multipart
+        .next_field()
+        .await
+        .map_err(|e| AppError::BadRequest(format!("multipart error: {e}")))?
+    {
+        match field.name().unwrap_or_default() {
+            "file" => {
+                file_name = field.file_name().unwrap_or_default().to_string();
+                mime = field.content_type().unwrap_or_default().to_string();
+                file_bytes = Some(
+                    field
+                        .bytes()
+                        .await
+                        .map_err(|e| AppError::BadRequest(format!("read file failed: {e}")))?
+                        .to_vec(),
+                );
+            }
+            "mediaType" => media_type = field.text().await.unwrap_or_default(),
+            _ => {
+                let _ = field.bytes().await;
+            }
+        }
+    }
+
+    let bytes = file_bytes.ok_or_else(|| AppError::BadRequest("file field required".into()))?;
+    let max = state.config.media_max_file_size_mb * 1024 * 1024;
+    if bytes.len() as u64 > max {
+        return Err(AppError::BadRequest(format!(
+            "file exceeds {} MB",
+            state.config.media_max_file_size_mb
+        )));
+    }
+    if !is_valid_media_type(&media_type) {
+        return Err(AppError::BadRequest(
+            "mediaType must be image|file|video".into(),
+        ));
+    }
+    let ext = media_storage::sanitize_ext(&file_name, &mime)
+        .ok_or_else(|| AppError::BadRequest("file type not allowed".into()))?;
+    let sha = media_storage::sha256_hex(&bytes);
+    let rel = media_storage::safe_relative_path(&admin.current_workspace, &sha, &ext)
+        .map_err(|e| AppError::BadRequest(e.to_string()))?;
+    let root = std::path::Path::new(&state.config.media_storage_dir);
+    media_storage::store_bytes(root, &rel, &bytes)
+        .await
+        .map_err(|e| AppError::External(format!("store file failed: {e}")))?;
+
+    // 换文件副作用：清 media_id（防 TTL 内发旧文件）+ 退 draft（强制重审）。
+    state
+        .db
+        .content_assets()
+        .update_one(
+            doc! { "_id": oid, "workspace_id": &admin.current_workspace },
+            doc! { "$set": {
+                "file_path": &rel,
+                "file_name": &file_name,
+                "file_size": bytes.len() as i64,
+                "mime_type": &mime,
+                "file_sha256": &sha,
+                "media_type": &media_type,
+                "media_id": null,
+                "review_status": "draft",
+                "updated_at": DateTime::now(),
+            }},
+            None,
+        )
+        .await?;
+
+    // 旧文件清理：仅当旧路径与新路径不同（确实换了文件）且无兄弟引用时物理删。fail-soft。
+    if let Some(old) = old_file_path {
+        if old != rel {
+            let refs = state
+                .db
+                .content_assets()
+                .count_documents(
+                    doc! { "workspace_id": &admin.current_workspace, "file_path": &old },
+                    None,
+                )
+                .await
+                .unwrap_or(1); // 查询失败 → 视为有引用，保守不删
+            if media_storage::should_delete_physical_file(refs) {
+                if let Err(e) = media_storage::delete_bytes(root, &old).await {
+                    tracing::warn!("换文件后旧素材文件删除失败（不影响换文件）: {e}");
+                }
+            }
+        }
+    }
+    Ok(Json(json!({ "ok": true })))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
