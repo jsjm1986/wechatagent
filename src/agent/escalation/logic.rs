@@ -86,6 +86,13 @@ pub fn fallback_holding_reply() -> &'static str {
     "这个我帮你确认一下，稍等我给你准信。"
 }
 
+/// 授权过期的中性收尾话术：relay task 跑时领导授权已过期，不复述任何过期承诺/数字，
+/// 只表达"会继续跟进"。AI 自治口吻，绝不出现"人工/转人工/接管"等转接类禁词。
+/// 用于早退分支：客户不被晾死、awaiting 标记同步清除。
+pub(crate) fn expired_authorization_neutral_reply() -> &'static str {
+    "关于您之前问的那件事，我这边再帮您核实下最新情况，有确切消息第一时间同步您～"
+}
+
 /// 该条已 resolved 的授权当前是否仍可用于转述。
 /// expires=None 视为不过期（如纯拒绝类裁决无时效）。
 pub(crate) fn authorization_is_usable(
