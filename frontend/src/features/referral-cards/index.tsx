@@ -46,9 +46,8 @@ export default function ReferralCardsFeature() {
         随后退为辅助答疑角色。新建名片默认为草稿且停用，须管理员标记为「可引荐」并启用后 AI 才会选用。
       </p>
       <p className={styles.notice}>
-        辅助模式为账号级开关（默认关闭），对应运营域配置的 assist_mode_enabled
-        字段，需在账号/运营域配置开启。当前后端尚未通过运营域接口暴露该字段的读写，前端开关接线留作后续；
-        本页仅维护名片库本身。
+        辅助模式为账号级开关（默认关闭）。本页仅维护名片库本身；要让 AI 真正引荐，还需到「用户运营 → 运营域配置」把
+        user_operations 域的「辅助模式」开关打开（对应 assist_mode_enabled 字段）。
       </p>
 
       <div className={styles.workbench}>
