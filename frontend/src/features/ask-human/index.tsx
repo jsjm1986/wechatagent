@@ -1,9 +1,9 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useState } from "react";
 import { ConfirmProvider } from "../../components/ui/ConfirmDialog";
 import { ToastProvider } from "../../components/ui/Toast";
 import { useInboxStore } from "../../stores/inboxStore";
 import { ReviewQueue, type RowCtx } from "../../components/review/ReviewQueue";
-import { fetchInbox, type InboxItem } from "../../lib/inboxApi";
+import { type InboxItem } from "../../lib/inboxApi";
 import { EscalationInline } from "./inline/EscalationInline";
 import { SimpleApproveReject } from "./inline/SimpleApproveReject";
 import { ChunkReviewCard } from "../../components/review/ChunkReviewCard";
@@ -91,16 +91,18 @@ function AskHumanView() {
     useInboxStore();
   const [refreshNonce, setRefreshNonce] = useState(0);
 
-  const refreshAll = useCallback(
-    (source?: string) => {
-      setRefreshNonce((n) => n + 1);
-      void load(source);
-    },
-    [load],
-  );
+  // 所有刷新统一经 refreshNonce → ReviewQueue refetch → fetchItems → load()。
+  // store 是唯一 fetch 来源，不再在这里额外 void load()（消除单次刷新打两次 /inbox）。
+  const refreshAll = useCallback(() => {
+    setRefreshNonce((n) => n + 1);
+  }, []);
 
-  useEffect(() => {
-    void load();
+  // 必须 memoize：fetchItems 走 load() 会改 store → AskHumanView 重渲染。若每渲染重建此回调，
+  // ReviewQueue 的 load(useCallback deps=[fetchItems]) 身份变 → 其 effect 重跑 → 再 load → 死循环。
+  // load 是 zustand action，身份稳定，故 fetchItems 稳定，ReviewQueue 仅在 refreshToken 变时 refetch。
+  const fetchItems = useCallback(async () => {
+    await load(); // store 唯一 fetch：items(已排序)+errors+summary+降级保留；catch 不 rethrow
+    return useInboxStore.getState().items; // load 成功取新值，失败取保留的旧值（不 throw → 列表显旧数据）
   }, [load]);
 
   return (
@@ -134,8 +136,8 @@ function AskHumanView() {
               }
               onClick={() => {
                 const next = activeSource === source ? null : source;
-                setActiveSource(next);
-                refreshAll(next ?? undefined);
+                setActiveSource(next); // 同步改 store.activeSource，load() 不传参时读它
+                setRefreshNonce((n) => n + 1); // 触发 ReviewQueue 重 fetch（经 load 读新 activeSource）
               }}
             >
               {label}: {summary[summaryKey] ?? 0}
@@ -146,12 +148,12 @@ function AskHumanView() {
       <ReviewQueue<InboxItem>
         key={activeSource ?? "all"}
         refreshToken={refreshNonce}
-        fetchItems={async () => (await fetchInbox(activeSource ?? undefined)).items}
+        fetchItems={fetchItems}
         getId={(i) => `${i.source}:${i.id}`}
         renderItem={(item, ctx) =>
           item.actionKind === "rich" ? (
             <div className="askHumanRichRow">
-              {renderRich(item, () => refreshAll(activeSource ?? undefined))}
+              {renderRich(item, () => refreshAll())}
             </div>
           ) : (
             <div className="askHumanInlineRow">{renderInline(item, ctx)}</div>
