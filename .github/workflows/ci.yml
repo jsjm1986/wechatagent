@@ -1556,6 +1556,7 @@ jobs:
           REAL_LLM_JUDGE_BASE_URL: https://rsxermu666.cn/v1
           REAL_LLM_JUDGE_MODEL: gpt-5.4
           REAL_LLM_JUDGE_FORMAT: openai
+          REAL_LLM_JUDGE_API_KEY: ${{ secrets.RSXERMU_KEY }}
           REAL_LLM_JUDGE: "1"
           JUDGE_SAMPLES: "1"
           REAL_LLM_LEDGER: target/real_llm_ledger/redline-${{ matrix.file }}
