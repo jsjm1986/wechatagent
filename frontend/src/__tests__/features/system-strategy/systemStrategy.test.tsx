@@ -1,6 +1,7 @@
-import { render, screen, waitFor } from "@testing-library/react";
+import { render, screen, waitFor, fireEvent } from "@testing-library/react";
 import { describe, expect, it, beforeEach, vi } from "vitest";
 import SystemStrategyFeature from "../../../features/system-strategy";
+import { api } from "../../../lib/api";
 import { useStrategyStore } from "../../../stores/strategyStore";
 import { useUiStore } from "../../../stores/uiStore";
 
@@ -10,6 +11,7 @@ vi.mock("../../../lib/api", () => ({
     get: vi.fn().mockResolvedValue({ items: [] }),
     post: vi.fn().mockResolvedValue({}),
     put: vi.fn().mockResolvedValue({}),
+    postRaw: vi.fn().mockResolvedValue({ ok: true, status: 200, data: { item: {} } }),
   },
 }));
 
@@ -91,5 +93,37 @@ describe("SystemStrategy Feature", () => {
     });
     expect(screen.getByText("暂无字典条目")).toBeInTheDocument();
     expect(screen.getByText("暂无教训聚合（窗口内无命中样本）")).toBeInTheDocument();
+  });
+});
+
+describe("TaxonomiesAdmin 新增条目", () => {
+  beforeEach(() => {
+    useUiStore.setState({
+      busy: false,
+      error: "",
+      setBusy: vi.fn(),
+      setError: vi.fn(),
+    });
+  });
+
+  it("新增提交 POST /api/admin/taxonomies，body 形态正确，别名中英文逗号都 split", async () => {
+    const postRaw = vi.spyOn(api, "postRaw").mockResolvedValue({ ok: true, status: 200, data: { item: {} } });
+    vi.spyOn(api, "get").mockResolvedValue({ items: [] } as never);
+
+    render(<SystemStrategyFeature />);
+
+    // 与现有用例同款：SystemStrategyFeature 一次渲染全部面板，无需切 tab。
+    fireEvent.click(await screen.findByText("新增条目"));
+    fireEvent.change(screen.getByPlaceholderText(/canonical id/i), { target: { value: "need_discovery" } });
+    fireEvent.change(screen.getByPlaceholderText(/显示名/i), { target: { value: "需求挖掘" } });
+    fireEvent.change(screen.getByPlaceholderText(/别名/i), { target: { value: "挖需求，需求探索, 探需" } });
+    fireEvent.click(screen.getByText("保存"));
+
+    await waitFor(() => expect(postRaw).toHaveBeenCalled());
+    expect(postRaw).toHaveBeenCalledWith("/api/admin/taxonomies", {
+      scope: "global",
+      kind: "customer_stage",
+      value: { id: "need_discovery", label: "需求挖掘", aliases: ["挖需求", "需求探索", "探需"], description: undefined },
+    });
   });
 });

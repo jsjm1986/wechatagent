@@ -47,6 +47,15 @@ type TaxonomyEntry = ActiveVersionMeta & {
   };
 };
 
+type TaxonomyDraft = {
+  scope: string;
+  kind: string;
+  id: string;
+  label: string;
+  aliases: string;
+  description: string;
+};
+
 type LessonLearnedEntry = {
   lessonId: string;
   workspaceId: string;
@@ -594,6 +603,17 @@ function TaxonomiesAdmin({ busy }: { busy: boolean }) {
   const [error, setError] = useState<string | null>(null);
   const [includeAll, setIncludeAll] = useState(true);
   const [includeDeprecated, setIncludeDeprecated] = useState(false);
+  const [showCreate, setShowCreate] = useState(false);
+  const [createDraft, setCreateDraft] = useState<TaxonomyDraft>({
+    scope: "global",
+    kind: "customer_stage",
+    id: "",
+    label: "",
+    aliases: "",
+    description: "",
+  });
+  const [acting, setActing] = useState(false);
+  const [info, setInfo] = useState<string | null>(null);
 
   async function reload() {
     setLoading(true);
@@ -615,6 +635,44 @@ function TaxonomiesAdmin({ busy }: { busy: boolean }) {
     void reload();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [includeAll, includeDeprecated]);
+
+  async function submitCreate() {
+    if (!createDraft.scope.trim() || !createDraft.kind.trim() || !createDraft.id.trim() || !createDraft.label.trim()) {
+      setError("scope / kind / canonical id / 显示名 均不能为空。");
+      return;
+    }
+    setActing(true);
+    setError(null);
+    setInfo(null);
+    try {
+      const aliases = createDraft.aliases.split(/[,，]/).map((a) => a.trim()).filter((a) => a.length > 0);
+      const res = await api.postRaw<{ error?: string; message?: string }>("/api/admin/taxonomies", {
+        scope: createDraft.scope.trim(),
+        kind: createDraft.kind.trim(),
+        value: {
+          id: createDraft.id.trim(),
+          label: createDraft.label.trim(),
+          aliases,
+          description: createDraft.description.trim() || undefined,
+        },
+      });
+      if (res.status === 409) {
+        setInfo(res.data?.message ?? "该字典条目已存在。");
+      } else if (!res.ok) {
+        setError(res.data?.message ?? res.data?.error ?? `HTTP ${res.status}`);
+        return;
+      } else {
+        setInfo(`已新增：${createDraft.id.trim()}`);
+        setShowCreate(false);
+        setCreateDraft({ scope: "global", kind: "customer_stage", id: "", label: "", aliases: "", description: "" });
+      }
+      await reload();
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setActing(false);
+    }
+  }
 
   return (
     <section className={styles.panel}>
@@ -639,9 +697,56 @@ function TaxonomiesAdmin({ busy }: { busy: boolean }) {
           <button type="button" className={styles.btnGhost} onClick={() => void reload()} disabled={busy || loading}>
             刷新
           </button>
+          <button type="button" className={styles.btnGhost} onClick={() => { setShowCreate((v) => !v); setInfo(null); setError(null); }} disabled={busy || loading}>
+            {showCreate ? "收起新增" : "新增条目"}
+          </button>
         </div>
       </div>
       {error && <div className={styles.inlineError}>{error}</div>}
+      {info && <div className={styles.badgeOk} style={{ display: "inline-block", marginBottom: 8 }}>{info}</div>}
+      {showCreate && (
+        <div className={styles.form} style={{ marginBottom: 14 }}>
+          <label className={styles.field}>
+            <span>scope（global = 全局，填 accountId = 仅该账号）</span>
+            <input className={styles.input} placeholder="global" value={createDraft.scope}
+              onChange={(e) => setCreateDraft({ ...createDraft, scope: e.target.value })} />
+          </label>
+          <label className={styles.field}>
+            <span>kind（维度，如 customer_stage / intent_level / objection_type）</span>
+            <input className={styles.input} placeholder="customer_stage" value={createDraft.kind}
+              onChange={(e) => setCreateDraft({ ...createDraft, kind: e.target.value })} />
+          </label>
+          {createDraft.kind.trim() === "customer_stage" && (
+            <p className={styles.panelHint}>
+              新增客户阶段后，需到上方「状态机灰度」面板同步配置对应 state，否则该阶段的 operation_state 流转校验会被跳过。
+            </p>
+          )}
+          <label className={styles.field}>
+            <span>canonical id（建议英文 snake_case，如 need_discovery）</span>
+            <input className={styles.input} placeholder="canonical id（如 need_discovery）" value={createDraft.id}
+              onChange={(e) => setCreateDraft({ ...createDraft, id: e.target.value })} />
+          </label>
+          <label className={styles.field}>
+            <span>显示名</span>
+            <input className={styles.input} placeholder="显示名（如 需求挖掘）" value={createDraft.label}
+              onChange={(e) => setCreateDraft({ ...createDraft, label: e.target.value })} />
+          </label>
+          <label className={styles.field}>
+            <span>别名（逗号分隔，可空）</span>
+            <input className={styles.input} placeholder="别名（逗号分隔，可空）" value={createDraft.aliases}
+              onChange={(e) => setCreateDraft({ ...createDraft, aliases: e.target.value })} />
+          </label>
+          <label className={styles.field}>
+            <span>描述（可空）</span>
+            <textarea className={styles.textarea} value={createDraft.description}
+              onChange={(e) => setCreateDraft({ ...createDraft, description: e.target.value })} />
+          </label>
+          <div className={styles.buttonRow}>
+            <button type="button" className={styles.btnPrimary} onClick={() => void submitCreate()} disabled={acting}>保存</button>
+            <button type="button" className={styles.btnGhost} onClick={() => setShowCreate(false)} disabled={acting}>取消</button>
+          </div>
+        </div>
+      )}
       {!loading && items.length === 0 && <Empty text="暂无字典条目" />}
       <div className={styles.versionedList}>
         {items.map((item) => (
