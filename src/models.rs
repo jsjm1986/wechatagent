@@ -2569,6 +2569,13 @@ pub struct TaxonomyValue {
     /// stagnation 段读它替代写死的 `TERMINAL_STAGES` 常量。旧库默认 `false`。
     #[serde(default)]
     pub is_terminal: bool,
+    /// universal-domain-adaptation #3：该取值是否为「再激活目标」stage（profile 可声明）。
+    /// 与 is_terminal 正交——`dormant_reactivation` 既是终态又是再激活目标，而
+    /// `customer_success` / `cooldown` 是终态但非再激活目标。`#[serde(default)]` 保证旧
+    /// BSON 文档 / 未声明此标记的维度向后兼容（缺省 false）。planner 据此构造 reactivation
+    /// 目标集合替代写死的 `"dormant_reactivation"` 字面量。
+    #[serde(default)]
+    pub is_reactivation_target: bool,
 }
 
 /// agent-autonomy-loop W0：`taxonomy_candidates` 集合占位结构。
@@ -4877,6 +4884,7 @@ mod typed_tests {
                 status: "active".to_string(),
                 priority_weight: None,
                 is_terminal: false,
+                is_reactivation_target: false,
             },
             updated_at: now,
             version: 1,
