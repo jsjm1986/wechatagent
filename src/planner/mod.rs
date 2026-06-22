@@ -3461,6 +3461,37 @@ mod tests {
         assert!(f.get_array("$or").is_ok(), "含 cooldown 非冷却 $or 粗筛");
     }
 
+    /// 审查 #3：换行业声明了不同再激活目标 stage 时，DB 预筛 $in 用配置值，不再焊死
+    /// 销售专有的 dormant_reactivation。镜像 stage_stagnation_filter_uses_configured_terminal_stages。
+    #[test]
+    fn reactivation_candidate_filter_uses_configured_reactivation_stages() {
+        let mut reactivation = std::collections::HashSet::new();
+        reactivation.insert("churned_silent".to_string());
+        let cfg = PlannerStageConfig {
+            stage_weights: std::collections::HashMap::new(),
+            intent_weights: std::collections::HashMap::new(),
+            terminal_stages: std::collections::HashSet::new(),
+            reactivation_stages: reactivation,
+            stagnation_dimension: "customer_stage".to_string(),
+        };
+        let f = reactivation_candidate_filter("ws1", "acc1", &cfg);
+        let stage = f
+            .get_document("domain_attributes.customer_stage")
+            .expect("customer_stage 应为 $in 文档");
+        let targets: Vec<&str> = stage
+            .get_array("$in")
+            .expect("含 $in 数组")
+            .iter()
+            .map(|b| b.as_str().expect("$in 元素为字符串"))
+            .collect();
+        assert_eq!(targets, vec!["churned_silent"], "再激活目标集未用配置值");
+        // 销售默认再激活 stage 不再写死出现（非销售域不被误筛）。
+        assert!(
+            !targets.contains(&"dormant_reactivation"),
+            "不应残留写死销售再激活 stage：{targets:?}"
+        );
+    }
+
     /// 零扰动：DEFAULT 销售域 profile（reactivation 关）→ resolve 后 reactivation.enabled=false。
     #[test]
     fn reactivation_off_default_no_op() {
