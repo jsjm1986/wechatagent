@@ -182,6 +182,7 @@ pub(super) async fn approve_taxonomy_candidate(
             status: "active".to_string(),
             priority_weight: None,
             is_terminal: false,
+            is_reactivation_target: false,
         },
         updated_at: now,
         version: 1,

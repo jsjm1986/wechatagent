@@ -213,6 +213,7 @@ pub(super) fn default_taxonomy_seed_entries(now: DateTime) -> Vec<TaxonomyEntry>
                 status: "active".to_string(),
                 priority_weight: Some(*weight),
                 is_terminal: false,
+                is_reactivation_target: false,
             },
             updated_at: now,
             version: 1,
@@ -281,6 +282,7 @@ pub(super) fn default_taxonomy_seed_entries(now: DateTime) -> Vec<TaxonomyEntry>
                 // objection_type 不参与 planner 漏斗排序，无权重/终态语义。
                 priority_weight: None,
                 is_terminal: false,
+                is_reactivation_target: false,
             },
             updated_at: now,
             version: 1,
