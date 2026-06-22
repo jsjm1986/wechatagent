@@ -1,11 +1,11 @@
 //! MCP knowledge.* 工具派发（agent-autonomy-loop W3 / Task 4.2）。
 //!
-//! Reply Agent 在 `decision_phase == "tool_calling"` 中间轮通过
+//! chat 知识工作站在 `decision_phase == "tool_calling"` 中间轮通过
 //! [`crate::agent::types::ToolCallRequest`] 声明想要调用的工具，本模块的
-//! [`dispatch_tool_call`] 负责按 R4.4 / R4.5 / R4.6 的契约去 `KnowledgeRuntime`
-//! 上检索并返回 JSON 结果（或错误结构）。
+//! [`dispatch_chat_tool_call`] 负责按 R4.4 / R4.5 / R4.6 的契约去
+//! `KnowledgeRuntime` 上检索并返回 JSON 结果（或错误结构）。
 //!
-//! 三个工具的契约（与 requirements.md R4.4–R4.6 / design.md §4 严格对齐）：
+//! 三个核心工具的契约（与 requirements.md R4.4–R4.6 / design.md §4 严格对齐）：
 //!
 //! - `knowledge.list_catalog`：输入 `{ kind?: documents|items|chunks, limit?: 1..=200 }`，
 //!   输出 `{ items: [...], truncated, kind }`，**不返回正文**；同 run 内同 `kind`
@@ -24,7 +24,7 @@
 //!   `{"error":"budget_exceeded"}`（R4.3 / R4.8）；
 //! - 单次 dispatch 5s timeout（`tokio::time::timeout`），超时返回
 //!   `{"error":"tool_timeout"}`（R4.8）；
-//! - 失败结果用 `serde_json::Value` 表达，由 [`reply_with_tools_loop`]
+//! - 失败结果用 `serde_json::Value` 表达，由 chat tool loop
 //!   决定是否计入"失败连击"（连续 ≥3 次失败强制结束循环）。
 
 #![allow(dead_code)]
@@ -75,8 +75,7 @@ pub(crate) const TOOL_SEARCH: &str = "knowledge.search";
 pub(crate) const TOOL_OPEN_SLICE: &str = "knowledge.open_slice";
 
 // knowledge-digest-workstation Phase 5: chat-only async tools。
-// 与 user-ops 三大工具物理隔离：仅在 chat tool loop 内派发，
-// 永不进 user-ops `dispatch_tool_call`（保持 user-ops gateway 路径不变）。
+// 仅在 chat tool loop 内派发（user-ops dispatch 半边已随工具循环下线）。
 pub(crate) const TOOL_AUDIT_COMPLETENESS: &str = "knowledge.audit_completeness";
 pub(crate) const TOOL_SEARCH_CHUNKS: &str = "knowledge.search_chunks";
 pub(crate) const TOOL_PROPOSE_REPAIR: &str = "knowledge.propose_repair";
@@ -88,10 +87,6 @@ pub(crate) const TOOL_ANALYZE_LOGS: &str = "knowledge.analyze_logs";
 //   route 在 dispatch 时注入回调，避免 knowledge_tools 直接依赖 routes）。
 pub(crate) const TOOL_OPEN_DOCUMENT: &str = "knowledge.open_document";
 pub(crate) const TOOL_VERIFY_ANCHOR: &str = "knowledge.verify_anchor";
-
-/// 用于 R4.1 toolCalls schema 校验：合法 tool 名白名单。
-pub(crate) const ALLOWED_TOOL_NAMES: &[&str] =
-    &[TOOL_LIST_CATALOG, TOOL_SEARCH, TOOL_OPEN_SLICE];
 
 /// chat tool loop 的合法 tool 白名单（user-ops 三件套 + 6 个 chat-only 工具）。
 pub(crate) const ALLOWED_CHAT_TOOL_NAMES: &[&str] = &[
@@ -114,10 +109,10 @@ pub(crate) const CHAT_ANALYZE_LOGS_WINDOW_HOURS: i64 = 24;
 /// chat analyze_logs 单次返回的 chunk 上限。
 pub(crate) const CHAT_ANALYZE_LOGS_MAX_CHUNKS: usize = 32;
 
-/// 单 run 内的 tool dispatch 状态（在多轮 [`reply_with_tools_loop`] 之间共享）。
+/// 单 run 内的 tool dispatch 状态（在多轮 chat tool loop 之间共享）。
 ///
 /// 由调用方在工具循环开始前 `Default::default()` 创建，每轮通过 mutable
-/// borrow 传入 [`dispatch_tool_call`]；记录"同 kind list_catalog 调用次数"
+/// borrow 传入 [`dispatch_chat_tool_call`]；记录"同 kind list_catalog 调用次数"
 /// 等需要跨轮判定的状态。
 #[derive(Debug, Default)]
 pub(crate) struct ToolDispatchState {
@@ -160,58 +155,6 @@ struct SearchArgs {
 struct OpenSliceArgs {
     #[serde(default)]
     chunk_ids: Option<Vec<String>>,
-}
-
-// ── 主入口 ──────────────────────────────────────────────────────────────
-
-/// 派发 Reply Agent 的一次工具调用。
-///
-/// 行为概览：
-///
-/// 1. 校验 `call.tool` 在白名单内；非法 → `{"error":"unknown_tool","detail":...}`。
-/// 2. 通过 [`RunBudget::record_tool_call`] 占用 1 次 tool call 槽位 + 估算的
-///    token 数；超额 → `{"error":"budget_exceeded","detail":...}`。
-/// 3. 用 [`tokio::time::timeout`] 包裹具体 tool 实现，5s 内完成 → 返回
-///    JSON；超时 → `{"error":"tool_timeout"}`。
-/// 4. 具体 tool 实现走纯函数（基于内存中的 [`KnowledgeRuntime`]，无 IO）；
-///    返回的 `Value` 由调用方注入下一轮 prompt 的 `[system tool result]` 段。
-///
-/// **注意**：本函数总是返回 `Value`，**不返回 Result**——错误也是合法的工具
-/// 结果，以便 Reply Agent 在下一轮自我修正（R4.8 失败降级）。
-pub(crate) async fn dispatch_tool_call(
-    call: &ToolCallRequest,
-    runtime: &UserRuntimeParameters,
-    knowledge: &KnowledgeRuntime,
-    budget: &Arc<RunBudget>,
-    state: &mut ToolDispatchState,
-) -> Value {
-    let tool = call.tool.trim();
-    if !ALLOWED_TOOL_NAMES.iter().any(|allowed| *allowed == tool) {
-        return tool_error("unknown_tool", &format!("tool name '{tool}' not allowed"));
-    }
-
-    // R4.3：先占预算。tokens_consumed 这里统一用 0，由具体 tool 在成功路径
-    // 上再追加（避免失败也扣 token）。
-    if let Err(err) = budget.record_tool_call(0) {
-        return budget_error_value(&err);
-    }
-
-    // R4.8：5s 单次 timeout。
-    let fut = async move {
-        match tool {
-            TOOL_LIST_CATALOG => exec_list_catalog(&call.arguments, knowledge, state),
-            TOOL_SEARCH => exec_search(&call.arguments, knowledge, runtime),
-            TOOL_OPEN_SLICE => exec_open_slice(&call.arguments, knowledge, runtime),
-            _ => unreachable!("tool whitelist enforced above"),
-        }
-    };
-    match tokio::time::timeout(TOOL_DISPATCH_TIMEOUT, fut).await {
-        Ok(value) => value,
-        Err(_) => tool_error(
-            "tool_timeout",
-            &format!("tool '{tool}' exceeded 5s timeout"),
-        ),
-    }
 }
 
 // ── 错误辅助函数 ───────────────────────────────────────────────────────
@@ -650,8 +593,8 @@ pub(crate) type AnchorMatchFn =
 /// 3. 5s 单次 timeout；
 /// 4. 错误以 Value 返回（不抛异常）。
 ///
-/// 与 sync `dispatch_tool_call` 隔离：本函数在 chat_tool_loop 内调用，永不与
-/// user-ops gateway 共享路径。
+/// 本函数在 chat_tool_loop 内调用，是知识工作站的唯一工具派发入口
+/// （user-ops dispatch 半边已随工具循环下线）。
 pub(crate) async fn dispatch_chat_tool_call(
     call: &ToolCallRequest,
     runtime: &UserRuntimeParameters,
@@ -1273,7 +1216,7 @@ mod tests {
     //! - `knowledge.open_slice`：未知 chunk_id 一票否决（即使其它命中）；非
     //!   verified chunk 的 `body` 替换为 `<redacted_unverified_chunk>` 但
     //!   `integrity_status` 保留原值。
-    //! - `dispatch_tool_call`：未知工具名 → `unknown_tool`；预算耗尽 → `budget_exceeded`。
+    //! - `dispatch_chat_tool_call`：未知工具名 → `unknown_tool`；预算耗尽 → `budget_exceeded`。
     use super::*;
     use crate::agent::budget::RunBudget;
     use crate::agent::runtime::UserRuntimeParameters;
@@ -1590,54 +1533,6 @@ mod tests {
         let cyc = vec![selfie];
         let r = resolve_superseded_in_memory(&cyc, &cyc[0]);
         assert_eq!(r.id.unwrap().to_hex(), self_hex, "自指环应停在自身");
-    }
-
-    // ── dispatch_tool_call (async) ────────────────────────────────
-
-    #[tokio::test]
-    async fn dispatch_unknown_tool_returns_error_value() {
-        // R4.1：未知工具名直接返回 unknown_tool 错误结构（不抛异常）。
-        let knowledge = KnowledgeRuntime::default();
-        let runtime = make_runtime();
-        let budget = make_budget(10_000, 8);
-        let mut state = ToolDispatchState::new();
-        let call = call_with_args("knowledge.delete_all", Document::new());
-        let v = dispatch_tool_call(&call, &runtime, &knowledge, &budget, &mut state).await;
-        assert_eq!(v.get("error").and_then(|x| x.as_str()), Some("unknown_tool"));
-    }
-
-    #[tokio::test]
-    async fn dispatch_returns_budget_exceeded_when_quota_zero() {
-        // R4.3 / R4.8：tool_call_budget 已满 → record_tool_call 失败 → 返回
-        // budget_exceeded；不进入具体 tool 实现。
-        let knowledge = KnowledgeRuntime::default();
-        let runtime = make_runtime();
-        let budget = make_budget(10_000, 0);
-        let mut state = ToolDispatchState::new();
-        let call = call_with_args(TOOL_LIST_CATALOG, doc! {"kind": "chunks"});
-        let v = dispatch_tool_call(&call, &runtime, &knowledge, &budget, &mut state).await;
-        assert_eq!(
-            v.get("error").and_then(|x| x.as_str()),
-            Some("budget_exceeded")
-        );
-    }
-
-    #[tokio::test]
-    async fn dispatch_list_catalog_happy_path_consumes_budget() {
-        // 端到端：合法 list_catalog 调用应成功返回，并消耗 1 次 tool_call 配额。
-        let knowledge = KnowledgeRuntime {
-            documents: vec![],
-            chunks: vec![build_chunk("c1", Some("verified"), None, None)],
-        };
-        let runtime = make_runtime();
-        let budget = make_budget(10_000, 4);
-        let mut state = ToolDispatchState::new();
-        let call = call_with_args(TOOL_LIST_CATALOG, doc! {"kind": "chunks"});
-        let v = dispatch_tool_call(&call, &runtime, &knowledge, &budget, &mut state).await;
-        assert!(v.get("error").is_none(), "expected success: {v}");
-        assert_eq!(v["kind"].as_str(), Some("chunks"));
-        let snap = budget.snapshot();
-        assert_eq!(snap.tool_calls_used, 1);
     }
 
     // P2-11：锁住 7 个 chat-only Args struct 的 camelCase 反序列化契约。
