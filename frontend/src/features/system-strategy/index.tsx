@@ -848,7 +848,7 @@ function TaxonomiesAdmin({ busy }: { busy: boolean }) {
                 </div>
               )}
             </div>
-            {editingId !== item.id && (
+            {editingId !== item.id && item.currentVersion !== false && (
               <div className={styles.buttonRow}>
                 <button type="button" className={styles.btnGhost}
                   onClick={() => { setShowCreate(false); setEditingId(item.id); setEditDraft({ label: item.value.label, aliases: (item.value.aliases ?? []).join("，"), description: item.value.description ?? "" }); setInfo(null); setError(null); }}

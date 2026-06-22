@@ -197,6 +197,19 @@ describe("TaxonomiesAdmin 编辑与废弃恢复", () => {
     fireEvent.click(await screen.findByText("恢复"));
     await waitFor(() => expect(patch).toHaveBeenCalledWith("/api/admin/taxonomies/id_dep", { deprecated: false }));
   });
+  it("历史版本行（currentVersion=false）不挂编辑/废弃按钮", async () => {
+    const historyItem = {
+      id: "id_hist", scope: "global", kind: "customer_stage",
+      value: { id: "need_discovery", label: "需求挖掘(旧版)", aliases: [], description: "", status: "active" },
+      version: 1, currentVersion: false, previousVersion: null, seededBy: "manual", updatedAt: "",
+    };
+    seedTaxonomyGet(historyItem);
+    render(<SystemStrategyFeature />);
+    // 条目本身渲染（标题可见），但写操作按钮对历史版本行隐藏。
+    expect(await screen.findByText("需求挖掘(旧版)")).toBeInTheDocument();
+    expect(screen.queryByText("编辑")).toBeNull();
+    expect(screen.queryByText("废弃")).toBeNull();
+  });
 });
 
 describe("TaxonomiesAdmin 边界", () => {
