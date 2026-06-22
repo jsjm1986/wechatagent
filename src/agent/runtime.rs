@@ -46,13 +46,6 @@ pub struct UserRuntimeParameters {
     /// agent-autonomy-loop W0 / Task 1.3：是否启用自治协议字段校验路径。
     /// 默认 `true`；老 runtime 文档缺该字段时同样视为启用。sunset D+14。
     pub autonomy_protocol_enabled: bool,
-    /// agent-autonomy-loop W0 / Task 1.3：知识路由模式，
-    /// 仅允许 `auto_tool_loop`（默认）或 `classic_router`（灰度回退）。
-    /// 非法 / 空字符串在 loader 中回退到 `auto_tool_loop`。sunset D+14。
-    pub knowledge_routing_mode: String,
-    /// agent-autonomy-loop W0 / Task 1.3：`reply_with_tools_loop` 的最大轮数。
-    /// 默认 3，loader 中 clamp 到 `[1, 5]`。
-    pub knowledge_max_tool_loops: i32,
     /// agent-autonomy-loop W0 / Task 1.3：单 run 内 tool call 总次数上限。
     /// 默认 6，loader 中 clamp 到 `[1, 16]`。
     pub knowledge_max_tool_calls: i32,
@@ -159,8 +152,6 @@ impl UserRuntimeParameters {
             reaction_token_budget: typed.reaction_token_budget,
             reaction_max_llm_calls: typed.reaction_max_llm_calls,
             autonomy_protocol_enabled: typed.autonomy_protocol_enabled,
-            knowledge_routing_mode: clamp_knowledge_routing_mode(&typed.knowledge_routing_mode),
-            knowledge_max_tool_loops: clamp_i32(typed.knowledge_max_tool_loops, 1, 5, 3),
             knowledge_max_tool_calls: clamp_i32(typed.knowledge_max_tool_calls, 1, 16, 6),
             knowledge_open_slice_max_k: clamp_i32(typed.knowledge_open_slice_max_k, 1, 16, 4),
             knowledge_search_top_k: clamp_i32(typed.knowledge_search_top_k, 1, 32, 8),
@@ -202,8 +193,6 @@ impl UserRuntimeParameters {
             "reactionTokenBudget": self.reaction_token_budget,
             "reactionMaxLlmCalls": self.reaction_max_llm_calls,
             "autonomyProtocolEnabled": self.autonomy_protocol_enabled,
-            "knowledgeRoutingMode": self.knowledge_routing_mode.clone(),
-            "knowledgeMaxToolLoops": self.knowledge_max_tool_loops,
             "knowledgeMaxToolCalls": self.knowledge_max_tool_calls,
             "knowledgeOpenSliceMaxK": self.knowledge_open_slice_max_k,
             "knowledgeSearchTopK": self.knowledge_search_top_k,
@@ -277,16 +266,6 @@ fn clamp_i32(value: i32, min: i32, max: i32, default: i32) -> i32 {
     v.min(max)
 }
 
-/// agent-autonomy-loop W0 / Task 1.3：把 `knowledgeRoutingMode` 字符串 clamp
-/// 到允许的集合 `{auto_tool_loop, classic_router}`，其它值（含空字符串）
-/// 回退到默认 `auto_tool_loop`。
-fn clamp_knowledge_routing_mode(raw: &str) -> String {
-    match raw {
-        "auto_tool_loop" | "classic_router" => raw.to_string(),
-        _ => "auto_tool_loop".to_string(),
-    }
-}
-
 impl Default for UserRuntimeParameters {
     /// agent-autonomy-loop W3 / Tasks 4.11-4.15 / 性质测试入口需要：
     ///
@@ -315,8 +294,6 @@ impl Default for UserRuntimeParameters {
             reaction_token_budget: typed.reaction_token_budget,
             reaction_max_llm_calls: typed.reaction_max_llm_calls,
             autonomy_protocol_enabled: typed.autonomy_protocol_enabled,
-            knowledge_routing_mode: clamp_knowledge_routing_mode(&typed.knowledge_routing_mode),
-            knowledge_max_tool_loops: clamp_i32(typed.knowledge_max_tool_loops, 1, 5, 3),
             knowledge_max_tool_calls: clamp_i32(typed.knowledge_max_tool_calls, 1, 16, 6),
             knowledge_open_slice_max_k: clamp_i32(typed.knowledge_open_slice_max_k, 1, 16, 4),
             knowledge_search_top_k: clamp_i32(typed.knowledge_search_top_k, 1, 32, 8),
@@ -589,8 +566,6 @@ mod tests {
             reaction_token_budget: 8000,
             reaction_max_llm_calls: 2,
             autonomy_protocol_enabled: true,
-            knowledge_routing_mode: "auto_tool_loop".to_string(),
-            knowledge_max_tool_loops: 3,
             knowledge_max_tool_calls: 6,
             knowledge_open_slice_max_k: 4,
             knowledge_search_top_k: 8,
