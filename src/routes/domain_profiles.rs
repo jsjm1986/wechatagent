@@ -710,7 +710,7 @@ async fn realign_active_to_current(
 /// 取向 prompt，G31 起一并纳入危险字段——改已生效取向不再即时生效，须二次确认。
 /// 黑名单外字段（display_name/description/profile_dimensions/coverage_dimensions/
 /// business_formulas/memory_dimensions/chunk_roles/prompt_fragment/stagnation_dimension/
-/// domain_schema_id/methodology_generator_preamble）视为普通字段，照旧即时生效。
+/// methodology_generator_preamble）视为普通字段，照旧即时生效。
 const RISKY_FIELD_NAMES: [&str; 13] = [
     "soul_override",
     "methodology_override",
