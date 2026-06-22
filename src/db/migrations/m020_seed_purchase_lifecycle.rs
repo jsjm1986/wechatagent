@@ -81,6 +81,7 @@ pub(super) fn purchase_lifecycle_seed_entries(now: DateTime) -> Vec<TaxonomyEntr
                 // 购买生命周期不参与 planner 漏斗排序，无权重/终态语义。
                 priority_weight: None,
                 is_terminal: false,
+                is_reactivation_target: false,
             },
             updated_at: now,
             version: 1,
