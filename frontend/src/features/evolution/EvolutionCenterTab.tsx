@@ -24,6 +24,46 @@
 
 import { useEffect, useMemo, useState } from "react";
 import styles from "./EvolutionCenterTab.module.css";
+// 候选「发布/回滚」卡已中立化迁入 components/review/（Ask-Human Phase 2 Task 6）。
+// 老页改薄壳：只持列表/选中逻辑 + 共享原语（StatusBadge/formatNumber/...），详情卡复用迁出件。
+import { ProposalReleaseCard } from "../../components/review/ProposalReleaseCard";
+// 共享原语/类型已提升到 components/review/ 中立家（零跨feature修订，用户裁定 B）：
+// 老页与卡片同源 import 同一套定义；老页继续以原签名使用，渲染字节级不变。
+import {
+  StatusBadge,
+  statusLabel,
+  statusTone,
+  formatNumber,
+  formatPercent,
+} from "../../components/review/proposalPrimitives";
+import type {
+  ProposalStatus,
+  ProposalKind,
+  ExperimentEnvelope,
+  ProposalSummary,
+  ExperimentItem,
+  ExperimentsResponse,
+  ShadowReplaySample,
+  ShadowReplaysSummary,
+  ProposalDetail,
+  ProposalDetailResponse,
+} from "../../components/review/proposalTypes";
+// 保留既有 re-export 路径（root src/EvolutionCenterTab.tsx → 此处 → 卡/中立家）：
+// 单测 import { ConfirmModal, StatusBadge, ... } from "../EvolutionCenterTab" 不受迁移影响。
+export { ConfirmModal } from "../../components/review/ProposalReleaseCard";
+export { StatusBadge, statusLabel, statusTone, formatNumber, formatPercent };
+export type {
+  ProposalStatus,
+  ProposalKind,
+  ExperimentEnvelope,
+  ProposalSummary,
+  ExperimentItem,
+  ExperimentsResponse,
+  ShadowReplaySample,
+  ShadowReplaysSummary,
+  ProposalDetail,
+  ProposalDetailResponse,
+};
 
 // ── API helper（不复用 App.tsx 的 module-scoped 实例，方便单测局部 mock fetch） ──
 
@@ -31,182 +71,6 @@ async function apiGet<T>(url: string): Promise<T> {
   const r = await fetch(url);
   if (!r.ok) throw new Error(await r.text());
   return r.json();
-}
-
-async function apiPost<T>(url: string, body?: unknown): Promise<T> {
-  const r = await fetch(url, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: body ? JSON.stringify(body) : undefined,
-  });
-  if (!r.ok) throw new Error(await r.text());
-  return r.json();
-}
-
-// ── 类型镜像后端 src/routes/evolution.rs 返回 schema ──
-
-export type ProposalStatus =
-  | "pending_eval"
-  | "evaluating"
-  | "eligible_for_release"
-  | "rejected_below_threshold"
-  | "released"
-  | "rolled_back";
-
-export type ProposalKind = "threshold" | "prompt";
-
-export interface ExperimentEnvelope {
-  experimentId: string;
-  workspaceId: string;
-  accountId: string;
-  status: string;
-  windowHours: number;
-  startedAt: string;
-  updatedAt: string;
-  finishedAt: string | null;
-  cohortThresholdSize: number;
-  cohortPromptSize: number;
-  budgetUsedTokens: number;
-  budgetUsedCalls: number;
-  proposalsCount: number;
-  proposalsEligibleCount: number;
-}
-
-export interface ProposalSummary {
-  id: string | null;
-  kind: ProposalKind;
-  status: ProposalStatus | string;
-  gateKey: string | null;
-  proposedTemplateKey: string | null;
-  proposedSection: string | null;
-  currentValue: number | null;
-  proposedValue: number | null;
-  significancePassed: boolean | null;
-  evalReplaysCompleted: number | null;
-  evalReplaysFailed: number | null;
-  failureReason: string | null;
-  createdAt: string;
-  updatedAt: string;
-}
-
-export interface ExperimentItem {
-  experiment: ExperimentEnvelope;
-  proposalsCounts: Record<string, number>;
-  proposals: ProposalSummary[];
-}
-
-export interface ExperimentsResponse {
-  items: ExperimentItem[];
-}
-
-export interface ShadowReplaySample {
-  id: string | null;
-  sourceRunId: string;
-  status: string;
-  failureReason: string | null;
-  originalFinalReviewStatus: string | null;
-  newFinalReviewStatus: string | null;
-  newReviewRisks: unknown;
-  newTokenCost: number | null;
-  new5gateHit: Record<string, unknown>;
-  newSelfCritiqueAddressed: boolean | null;
-  similarityToOriginalText: number | null;
-  startedAt: string;
-  finishedAt: string | null;
-}
-
-export interface ShadowReplaysSummary {
-  totalCompleted: number;
-  totalFailed: number;
-  samples: ShadowReplaySample[];
-}
-
-export interface ProposalDetail {
-  id: string | null;
-  experimentId: string;
-  workspaceId: string;
-  accountId: string;
-  kind: ProposalKind;
-  status: ProposalStatus | string;
-  gateKey: string | null;
-  currentValue: number | null;
-  proposedValue: number | null;
-  cohortNotes: Record<string, unknown>;
-  proposedTemplateKey: string | null;
-  proposedSection: string | null;
-  diffSummary: string | null;
-  diffSnippet: string | null;
-  criticReasoning: string | null;
-  expectedImprovementOn: string[] | null;
-  riskNote: string | null;
-  previousPromptVersion: string | null;
-  evalMetrics: Record<string, unknown>;
-  evalReplaysCompleted: number | null;
-  evalReplaysFailed: number | null;
-  significancePassed: boolean | null;
-  failureReason: string | null;
-  releasedAt: string | null;
-  releasedBy: string | null;
-  rolledBackAt: string | null;
-  rolledBackBy: string | null;
-  createdAt: string;
-  updatedAt: string;
-}
-
-export interface ProposalDetailResponse {
-  proposal: ProposalDetail;
-  experiment: ExperimentEnvelope | null;
-  cohortRunIds: string[];
-  shadowReplays: ShadowReplaysSummary;
-  currentState: Record<string, unknown>;
-}
-
-// ── 工具函数 ──
-
-const STATUS_LABELS: Record<string, string> = {
-  pending_eval: "待评测",
-  evaluating: "评测中",
-  eligible_for_release: "可发布",
-  rejected_below_threshold: "未达标",
-  released: "已发布",
-  rolled_back: "已回滚",
-};
-
-const STATUS_TONES: Record<string, string> = {
-  pending_eval: "neutral",
-  evaluating: "info",
-  eligible_for_release: "success",
-  rejected_below_threshold: "warn",
-  released: "primary",
-  rolled_back: "danger",
-};
-
-// tone → CSS Module 徽章类（保留 data-tone 原值供测试断言；class 走局部化）。
-const TONE_CLASS: Record<string, string> = {
-  neutral: styles.badgeNeutral,
-  info: styles.badgeInfo,
-  success: styles.badgeSuccess,
-  warn: styles.badgeWarn,
-  primary: styles.badgePrimary,
-  danger: styles.badgeDanger,
-};
-
-export function statusLabel(s: string): string {
-  return STATUS_LABELS[s] ?? s;
-}
-
-export function statusTone(s: string): string {
-  return STATUS_TONES[s] ?? "neutral";
-}
-
-export function formatNumber(v: number | null | undefined, digits = 2): string {
-  if (v === null || v === undefined || Number.isNaN(v)) return "—";
-  return Number(v).toFixed(digits);
-}
-
-export function formatPercent(v: number | null | undefined): string {
-  if (v === null || v === undefined || Number.isNaN(v)) return "—";
-  return `${(v * 100).toFixed(1)}%`;
 }
 
 /// 7 天聚合（client 端从 experiments[] 推算 — 不打额外请求；后端尚未提供专用聚合 endpoint）。
@@ -322,10 +186,10 @@ export function EvolutionCenterTab({ enabled = true }: { enabled?: boolean }) {
       />
 
       {selectedProposalId && (
-        <ProposalDetailView
+        <ProposalReleaseCard
           proposalId={selectedProposalId}
           onClose={() => setSelectedProposalId(null)}
-          onActionDone={() => {
+          onDone={() => {
             setSelectedProposalId(null);
             void load();
           }}
@@ -406,359 +270,3 @@ function ProposalList({
   );
 }
 
-export function StatusBadge({ status }: { status: string }) {
-  const tone = statusTone(status);
-  return (
-    <span
-      className={`${styles.badge} ${TONE_CLASS[tone] ?? styles.badgeNeutral}`}
-      data-testid={`status-badge-${status}`}
-      data-tone={tone}
-    >
-      {statusLabel(status)}
-    </span>
-  );
-}
-
-function ProposalDetailView({
-  proposalId,
-  onClose,
-  onActionDone,
-}: {
-  proposalId: string;
-  onClose: () => void;
-  onActionDone: () => void;
-}) {
-  const [data, setData] = useState<ProposalDetailResponse | null>(null);
-  const [loading, setLoading] = useState(false);
-  const [error, setError] = useState<string>("");
-  const [modal, setModal] = useState<null | "release" | "rollback">(null);
-
-  async function load() {
-    setLoading(true);
-    setError("");
-    try {
-      const d = await apiGet<ProposalDetailResponse>(`/api/evolution/proposals/${proposalId}`);
-      setData(d);
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
-    } finally {
-      setLoading(false);
-    }
-  }
-
-  useEffect(() => {
-    void load();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [proposalId]);
-
-  if (loading) {
-    return (
-      <aside className={styles.detail} data-testid="proposal-detail-loading">
-        <div className={styles.loading}>加载中…</div>
-      </aside>
-    );
-  }
-  if (error) {
-    return (
-      <aside className={styles.detail} data-testid="proposal-detail-error">
-        <div className={styles.error} role="alert">
-          {error}
-        </div>
-        <button className={styles.btnQuiet} onClick={onClose}>关闭</button>
-      </aside>
-    );
-  }
-  if (!data) return null;
-
-  const { proposal, shadowReplays } = data;
-  const releaseEnabled = proposal.status === "eligible_for_release";
-  const rollbackEnabled = proposal.status === "released";
-
-  return (
-    <aside className={styles.detail} data-testid="proposal-detail">
-      <header className={styles.detailHead}>
-        <h3>{proposal.kind === "threshold" ? "阈值候选" : "Prompt 候选"} 详情</h3>
-        <button className={styles.btnQuiet} onClick={onClose}>关闭</button>
-      </header>
-
-      <div className={styles.detailStatusRow}>
-        <StatusBadge status={proposal.status} />
-        {proposal.failureReason && (
-          <p className={styles.failureReason} data-testid="failure-reason">
-            未通过原因：{proposal.failureReason}
-          </p>
-        )}
-      </div>
-
-      {proposal.kind === "threshold" ? (
-        <ThresholdDiffView proposal={proposal} currentState={data.currentState} />
-      ) : (
-        <PromptDiffView proposal={proposal} currentState={data.currentState} />
-      )}
-
-      <ShadowEvalReport summary={shadowReplays} proposal={proposal} />
-
-      <footer className={styles.detailActions}>
-        <button
-          className={styles.btnPrimary}
-          onClick={() => setModal("release")}
-          disabled={!releaseEnabled}
-          data-testid="release-button"
-        >
-          发布
-        </button>
-        <button
-          className={styles.btnDanger}
-          onClick={() => setModal("rollback")}
-          disabled={!rollbackEnabled}
-          data-testid="rollback-button"
-        >
-          回滚
-        </button>
-      </footer>
-
-      {modal === "release" && (
-        <ConfirmModal
-          kind="release"
-          proposalId={proposal.id ?? proposalId}
-          onClose={() => setModal(null)}
-          onDone={() => {
-            setModal(null);
-            onActionDone();
-          }}
-        />
-      )}
-      {modal === "rollback" && (
-        <ConfirmModal
-          kind="rollback"
-          proposalId={proposal.id ?? proposalId}
-          onClose={() => setModal(null)}
-          onDone={() => {
-            setModal(null);
-            onActionDone();
-          }}
-        />
-      )}
-    </aside>
-  );
-}
-
-function ThresholdDiffView({
-  proposal,
-  currentState,
-}: {
-  proposal: ProposalDetail;
-  currentState: Record<string, unknown>;
-}) {
-  const cur = (currentState["currentValue"] ?? null) as number | null;
-  const proposed = proposal.proposedValue;
-  const cohort = (proposal.cohortNotes ?? {}) as Record<string, unknown>;
-  const hitRate = (cohort["hit_rate_observed"] ?? cohort["hitRateObserved"] ?? null) as
-    | number
-    | null;
-  return (
-    <section className={styles.thresholdDiff} data-testid="threshold-diff">
-      <table className={styles.thresholdTable}>
-        <tbody>
-          <tr>
-            <th>Gate Key</th>
-            <td data-testid="threshold-gate-key">{proposal.gateKey ?? "—"}</td>
-          </tr>
-          <tr>
-            <th>当前生效值</th>
-            <td data-testid="threshold-current">{formatNumber(cur)}</td>
-          </tr>
-          <tr>
-            <th>候选值</th>
-            <td data-testid="threshold-proposed">{formatNumber(proposed)}</td>
-          </tr>
-          <tr>
-            <th>cohort 命中率</th>
-            <td data-testid="threshold-hit-rate">{formatPercent(hitRate)}</td>
-          </tr>
-        </tbody>
-      </table>
-    </section>
-  );
-}
-
-function PromptDiffView({
-  proposal,
-  currentState,
-}: {
-  proposal: ProposalDetail;
-  currentState: Record<string, unknown>;
-}) {
-  const currentText = (currentState["currentSectionText"] ??
-    currentState["current_section_text"] ??
-    "") as string;
-  const proposedText = proposal.diffSnippet ?? "";
-  const expected = proposal.expectedImprovementOn ?? [];
-  return (
-    <section className={styles.promptDiff} data-testid="prompt-diff">
-      <div className={styles.promptDiffPanes}>
-        <div data-testid="prompt-diff-current">
-          <h4>当前内容</h4>
-          <pre>{currentText || "(空)"}</pre>
-        </div>
-        <div data-testid="prompt-diff-proposed">
-          <h4>候选内容</h4>
-          <pre>{proposedText || "(空)"}</pre>
-        </div>
-      </div>
-      {proposal.criticReasoning && (
-        <div className={styles.criticReasoning} data-testid="critic-reasoning">
-          <h4>Critic 推理</h4>
-          <p>{proposal.criticReasoning}</p>
-        </div>
-      )}
-      {expected.length > 0 && (
-        <div className={styles.expectedTags} data-testid="expected-improvement">
-          {expected.map((tag) => (
-            <span key={tag} className={styles.tag}>
-              {tag}
-            </span>
-          ))}
-        </div>
-      )}
-    </section>
-  );
-}
-
-function ShadowEvalReport({
-  summary,
-  proposal,
-}: {
-  summary: ShadowReplaysSummary;
-  proposal: ProposalDetail;
-}) {
-  return (
-    <section className={styles.shadowEval} data-testid="shadow-eval">
-      <h4>Shadow 评测</h4>
-      <div className={styles.shadowGrid}>
-        <div data-testid="shadow-completed">
-          <span>完成</span>
-          <strong>{summary.totalCompleted}</strong>
-        </div>
-        <div data-testid="shadow-failed">
-          <span>失败</span>
-          <strong>{summary.totalFailed}</strong>
-        </div>
-        <div data-testid="shadow-significance">
-          <span>显著性</span>
-          <strong>
-            {proposal.significancePassed === null
-              ? "—"
-              : proposal.significancePassed
-              ? "通过"
-              : "未通过"}
-          </strong>
-        </div>
-      </div>
-      {summary.samples.length > 0 && (
-        <details>
-          <summary>样本（前 5 条）</summary>
-          <table>
-            <thead>
-              <tr>
-                <th>source_run_id</th>
-                <th>原 final_review</th>
-                <th>新 final_review</th>
-                <th>tokens</th>
-              </tr>
-            </thead>
-            <tbody>
-              {summary.samples.map((s) => (
-                <tr key={s.id ?? s.sourceRunId}>
-                  <td>{s.sourceRunId}</td>
-                  <td>{s.originalFinalReviewStatus ?? "—"}</td>
-                  <td>{s.newFinalReviewStatus ?? "—"}</td>
-                  <td>{s.newTokenCost ?? "—"}</td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </details>
-      )}
-    </section>
-  );
-}
-
-// ── 确认弹窗 ──
-
-const RELEASE_LITERAL = "RELEASE";
-const ROLLBACK_LITERAL = "ROLLBACK";
-
-export function ConfirmModal({
-  kind,
-  proposalId,
-  onClose,
-  onDone,
-}: {
-  kind: "release" | "rollback";
-  proposalId: string;
-  onClose: () => void;
-  onDone: () => void;
-}) {
-  const literal = kind === "release" ? RELEASE_LITERAL : ROLLBACK_LITERAL;
-  const verb = kind === "release" ? "发布" : "回滚";
-  const [text, setText] = useState("");
-  const [submitting, setSubmitting] = useState(false);
-  const [err, setErr] = useState<string>("");
-
-  const matches = text === literal;
-
-  async function submit() {
-    if (!matches || submitting) return;
-    setSubmitting(true);
-    setErr("");
-    try {
-      await apiPost(`/api/evolution/proposals/${proposalId}/${kind}`, {
-        confirmation: literal,
-      });
-      onDone();
-    } catch (e) {
-      setErr(e instanceof Error ? e.message : String(e));
-    } finally {
-      setSubmitting(false);
-    }
-  }
-
-  return (
-    <div className={styles.modalOverlay} data-testid={`confirm-modal-${kind}`}>
-      <div className={styles.modal}>
-        <h3>确认{verb}候选？</h3>
-        <p>
-          请输入 <code>{literal}</code> 以确认。任何不完全匹配的输入都会阻止提交。
-        </p>
-        <input
-          className={styles.modalInput}
-          type="text"
-          value={text}
-          onChange={(e) => setText(e.target.value)}
-          placeholder={literal}
-          data-testid={`confirm-input-${kind}`}
-          autoFocus
-        />
-        {err && (
-          <div className={styles.error} role="alert">
-            {err}
-          </div>
-        )}
-        <footer className={styles.modalFoot}>
-          <button className={styles.btnQuiet} onClick={onClose} disabled={submitting}>
-            取消
-          </button>
-          <button
-            className={styles.btnPrimary}
-            onClick={() => void submit()}
-            disabled={!matches || submitting}
-            data-testid={`confirm-submit-${kind}`}
-          >
-            {submitting ? `${verb}中…` : `确认${verb}`}
-          </button>
-        </footer>
-      </div>
-    </div>
-  );
-}

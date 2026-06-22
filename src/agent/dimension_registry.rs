@@ -201,6 +201,50 @@ pub(crate) async fn validate_dimension_value(
     classify_validation(spec, dict, raw, intent)
 }
 
+/// 纯内核（簇 B 缺口 6）：把每个 stage 的 DimValidation 聚合成归一结果。
+/// Accept → 收集 canonical；Reject → 短路返 Err（该项原因）；DropSilently（空串）→ 跳过。
+/// 无 IO，完全可单测。
+pub(crate) fn fold_stage_validations(
+    results: Vec<DimValidation>,
+) -> Result<Vec<String>, String> {
+    let mut out = Vec::with_capacity(results.len());
+    for r in results {
+        match r {
+            DimValidation::Accept(canonical) => out.push(canonical),
+            DimValidation::Reject(reason) => return Err(reason),
+            DimValidation::DropSilently => {} // 空串项，跳过
+        }
+    }
+    Ok(out)
+}
+
+/// 归一 + 校验 target_stages（簇 B 缺口 6）：运营手填的客户阶段标注必须与 contact 的
+/// canonical customer_stage 同空间，否则运行时 `s == cs` 永不命中、素材/名片静默不发。
+/// 每项走 AdminWrite：Accept 收集 canonical（alias 归一）、Reject 整体报错、
+/// 字典未配置 fail-soft 放行原值（KindUnconfigured → Accept）。空串项跳过。
+/// scope_account_id 为空串时 taxonomy 查询走 global scope（account 维度缺失时的回退）。
+/// 聚合逻辑委托纯内核 fold_stage_validations（可单测）；本函数只做 DB 查询。
+pub async fn normalize_target_stages(
+    db: &crate::db::Database,
+    scope_account_id: &str,
+    raw_stages: &[String],
+) -> Result<Vec<String>, String> {
+    let mut results = Vec::with_capacity(raw_stages.len());
+    for stage in raw_stages {
+        results.push(
+            validate_dimension_value(
+                db,
+                "customer_stage",
+                stage,
+                scope_account_id,
+                WriteIntent::AdminWrite,
+            )
+            .await,
+        );
+    }
+    fold_stage_validations(results)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -365,5 +409,41 @@ mod tests {
             match_to_dict(TaxonomyMatch::AliasActive("x".to_string())),
             DictLookup::Alias("x".to_string())
         );
+    }
+
+    #[test]
+    fn fold_collects_accepted_canonicals() {
+        let r = fold_stage_validations(vec![
+            DimValidation::Accept("need_discovery".into()),
+            DimValidation::Accept("negotiation".into()),
+        ]);
+        assert_eq!(r, Ok(vec!["need_discovery".to_string(), "negotiation".to_string()]));
+    }
+
+    #[test]
+    fn fold_rejects_on_first_reject() {
+        // 任一项 Reject → 整体 Err（短路，返该项原因）。
+        let r = fold_stage_validations(vec![
+            DimValidation::Accept("need_discovery".into()),
+            DimValidation::Reject("customer_stage 取值 \"瞎填\" 不在字典内".into()),
+            DimValidation::Accept("never_reached".into()),
+        ]);
+        assert!(matches!(r, Err(ref msg) if msg.contains("不在字典内")));
+    }
+
+    #[test]
+    fn fold_skips_drop_silently() {
+        // DropSilently（空串项）跳过，不进结果、不报错。
+        let r = fold_stage_validations(vec![
+            DimValidation::Accept("need_discovery".into()),
+            DimValidation::DropSilently,
+        ]);
+        assert_eq!(r, Ok(vec!["need_discovery".to_string()]));
+    }
+
+    #[test]
+    fn fold_empty_is_ok_empty() {
+        let r = fold_stage_validations(vec![]);
+        assert_eq!(r, Ok(vec![]));
     }
 }

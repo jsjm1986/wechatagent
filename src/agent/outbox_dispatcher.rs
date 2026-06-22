@@ -51,6 +51,12 @@ pub(crate) const PER_ENTRY_EVENT_CAP: i64 = 20;
 /// 单 tick 处理上限，防止饿死 / 长 tick。
 const PER_TICK_PROCESS_CAP: usize = 16;
 
+/// ⑪：账号掉线时 defer 的推迟间隔（秒）。区别于发送失败重试——掉线不是发送失败，
+/// 不消耗 max_attempts，只把 next_retry_at 推后一个固定间隔，account.online 恢复后
+/// 由 atomic_claim_pending 照常抢占发送。取 60s 与 lease 同档：足够长避免掉线期间
+/// 空转 reclaim，又足够短让恢复后及时补发。
+const ACCOUNT_OFFLINE_DEFER_SECONDS: i64 = 60;
+
 /// 单 worker 的唯一 id：`hostname:pid:uuid`，便于审计哪台机器哪进程占了哪条。
 fn worker_id() -> String {
     let host = std::env::var("COMPUTERNAME")
@@ -382,6 +388,61 @@ pub async fn schedule_retry_or_terminal(
     Ok(())
 }
 
+/// ⑪：账号掉线 defer——区别于发送失败重试。掉线不是发送失败，**不消耗
+/// max_attempts**：只把 `next_retry_at` 推后 [`ACCOUNT_OFFLINE_DEFER_SECONDS`]、
+/// 把 entry 从 `in_flight` 放回 `pending`、attempt 保持不变。account.online
+/// 恢复后由 `atomic_claim_pending` 在 next_retry_at 到点后照常抢占发送。
+/// 这是 AI 自治判断（账号离线则暂不外发、恢复后自行续发），不走 terminal。
+pub async fn defer_account_offline(
+    state: &AppState,
+    entry_id: ObjectId,
+    entry: &OutboxEntry,
+) -> AppResult<()> {
+    let collection = state.db.collection_agent_send_outbox();
+    let now = DateTime::now();
+    let next_retry =
+        DateTime::from_millis(now.timestamp_millis() + ACCOUNT_OFFLINE_DEFER_SECONDS * 1000);
+    collection
+        .update_one(
+            doc! {
+                "_id": entry_id,
+                "status": OutboxStatus::InFlight.as_str(),
+            },
+            doc! {
+                "$set": {
+                    // attempt 刻意不变——掉线非发送失败，不耗重试额度、不走 terminal。
+                    "status": OutboxStatus::Pending.as_str(),
+                    "next_retry_at": next_retry,
+                    "updated_at": now,
+                },
+                "$unset": {
+                    "worker_id": "",
+                    "locked_until": "",
+                }
+            },
+            None,
+        )
+        .await?;
+    let _ = write_event_with_cap(
+        state,
+        entry_id,
+        &entry.account_id,
+        Some(&entry.contact_wxid),
+        "agent.send_deferred_account_offline",
+        "deferred",
+        "账号离线，本条发送已推迟（AI 自治暂缓外发，恢复后自动续发），不消耗重试额度",
+        Some(doc! {
+            "outbox_id": entry_id,
+            "run_id": &entry.run_id,
+            "attempt": entry.attempt,
+            "defer_seconds": ACCOUNT_OFFLINE_DEFER_SECONDS,
+        }),
+    )
+    .await;
+    update_run_log_outbox_status(state, &entry.run_id, "pending").await;
+    Ok(())
+}
+
 /// post-hoc 核对：在 dispatcher timeout 之后，去 `mcp_call_logs` 查 5min 内
 /// 是否已经存在 `tool_name=message_send_text` + 同 recipient + 同 content
 /// 且 `error=null` 的成功记录。命中说明 MCP 实际上已经把消息送出，只是回包
@@ -487,6 +548,26 @@ pub async fn process_entry(state: &AppState, entry: &OutboxEntry) -> AppResult<(
         return Ok(());
     }
 
+    // ⑪：账号掉线时不盲发。webhook 收到 Offline 事件落库 online=false（见 webhooks.rs），
+    // 这里发送前查 account.online——掉线则 defer（推后 next_retry_at、不增 attempt、
+    // 不走 terminal），account.online 恢复后照常抢占发送。account 查不到时保守放行
+    // （默认/历史账号可能未建行），不阻断发送。
+    let account = state
+        .db
+        .accounts()
+        .find_one(
+            doc! {
+                "workspace_id": &entry.workspace_id,
+                "account_id": &entry.account_id,
+            },
+            None,
+        )
+        .await?;
+    if matches!(&account, Some(acc) if !acc.online) {
+        defer_account_offline(state, entry_id, entry).await?;
+        return Ok(());
+    }
+
     let collection = state.db.collection_agent_send_outbox();
     let now = DateTime::now();
 
@@ -494,14 +575,33 @@ pub async fn process_entry(state: &AppState, entry: &OutboxEntry) -> AppResult<(
     // 它可能已把消息送达 MCP/微信。重发前先 post-hoc 核对 mcp_call_logs；命中即
     // 标 sent 不重发，避免客户收到重复消息（与 timeout 分支同一核对函数）。
     if entry.reclaimed_in_flight {
-        if let Ok(true) = mcp_already_succeeded(
-            state,
-            &entry.account_id,
-            &entry.contact_wxid,
-            &entry.content,
-            entry.created_at,
-        )
-        .await
+        let already = if entry.referral_card_id.is_some() {
+            // 名片无 media_id、tool 不同，text/media 版 post-hoc 核对都不适用。
+            // reclaimed 是边缘场景且重复推名片危害小（客户最多多收一张名片），
+            // 故跳过核对、放行重发（保守取 false = 视为未发过）。
+            Ok(false)
+        } else if let Some(asset_id) = entry.media_asset_id.as_deref() {
+            // 硬伤④：媒体条目 content 为空、tool 为 message_send_*，text 版核对查不到
+            // → 误判没发过 → 重发文件。改用 media_id 定位该素材的成功发送记录。
+            super::media_send::media_already_succeeded(
+                state,
+                &entry.account_id,
+                &entry.contact_wxid,
+                asset_id,
+                entry.created_at,
+            )
+            .await
+        } else {
+            mcp_already_succeeded(
+                state,
+                &entry.account_id,
+                &entry.contact_wxid,
+                &entry.content,
+                entry.created_at,
+            )
+            .await
+        };
+        if let Ok(true) = already
         {
             collection
                 .update_one(
@@ -542,6 +642,8 @@ pub async fn process_entry(state: &AppState, entry: &OutboxEntry) -> AppResult<(
             )
             .await;
             update_run_log_outbox_status(state, &entry.run_id, "sent").await;
+            // 主动发送台账：post-hoc 确认送达同样记一条（素材/名片才记）。
+            super::send_ledger::record_send_for_entry(state, entry, &contact, now).await;
             return Ok(());
         }
     }
@@ -552,8 +654,15 @@ pub async fn process_entry(state: &AppState, entry: &OutboxEntry) -> AppResult<(
         "attempt": entry.attempt + 1,
     });
 
-    let send_fut =
-        super::gateway::send_outbound_message(state, &contact, &entry.content, extra_raw);
+    let send_fut = async {
+        if let Some(card_id) = entry.referral_card_id.as_deref() {
+            super::referral::send_outbound_namecard(state, &contact, card_id).await
+        } else if let Some(asset_id) = entry.media_asset_id.as_deref() {
+            super::media_send::send_outbound_media(state, &contact, asset_id).await
+        } else {
+            super::gateway::send_outbound_message(state, &contact, &entry.content, extra_raw).await
+        }
+    };
     let send_result =
         tokio::time::timeout(Duration::from_secs(MCP_SEND_TIMEOUT_SECONDS), send_fut).await;
 
@@ -596,6 +705,9 @@ pub async fn process_entry(state: &AppState, entry: &OutboxEntry) -> AppResult<(
             )
             .await;
             update_run_log_outbox_status(state, &entry.run_id, "sent").await;
+
+            // 主动发送台账：素材/名片条目记一条（纯文本不记）。fail-soft，不影响已成发送。
+            super::send_ledger::record_send_for_entry(state, entry, &contact, now).await;
         }
         Ok(Err(err)) => {
             schedule_retry_or_terminal(
@@ -609,16 +721,33 @@ pub async fn process_entry(state: &AppState, entry: &OutboxEntry) -> AppResult<(
         Err(_) => {
             // post-hoc 核对：MCP 调用本身在 timeout 之前可能已经成功把消息送达
             // 微信协议（response 慢于 30s 的极端情况），此时 mcp_call_logs 已写入
-            // tool_name=message_send_text + recipient=contact + content=entry.content
-            // 且 error=null。命中即视为已送达，不再重发，避免给客户重复消息。
-            if let Ok(true) = mcp_already_succeeded(
-                state,
-                &entry.account_id,
-                &entry.contact_wxid,
-                &entry.content,
-                entry.created_at,
-            )
-            .await
+            // tool_name + recipient + 定位字段（text=content / media=mediaId）且
+            // error=null。命中即视为已送达，不再重发，避免给客户重复消息/重复文件。
+            let already = if entry.referral_card_id.is_some() {
+                // 名片无 media_id、tool 不同，text/media 版 post-hoc 核对都不适用。
+                // timeout 是边缘场景且重复推名片危害小（客户最多多收一张名片），
+                // 故跳过核对、放行重发（保守取 false = 视为未发过）。
+                Ok(false)
+            } else if let Some(asset_id) = entry.media_asset_id.as_deref() {
+                super::media_send::media_already_succeeded(
+                    state,
+                    &entry.account_id,
+                    &entry.contact_wxid,
+                    asset_id,
+                    entry.created_at,
+                )
+                .await
+            } else {
+                mcp_already_succeeded(
+                    state,
+                    &entry.account_id,
+                    &entry.contact_wxid,
+                    &entry.content,
+                    entry.created_at,
+                )
+                .await
+            };
+            if let Ok(true) = already
             {
                 collection
                     .update_one(
@@ -658,6 +787,8 @@ pub async fn process_entry(state: &AppState, entry: &OutboxEntry) -> AppResult<(
                 )
                 .await;
                 update_run_log_outbox_status(state, &entry.run_id, "sent").await;
+                // 主动发送台账：超时 post-hoc 确认送达同样记一条（素材/名片才记）。
+                super::send_ledger::record_send_for_entry(state, entry, &contact, now).await;
             } else {
                 schedule_retry_or_terminal(state, entry_id, entry, "send timeout (30s)").await?;
             }

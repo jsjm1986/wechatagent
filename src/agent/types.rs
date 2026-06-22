@@ -222,6 +222,43 @@ pub struct AgentDecision {
     /// decision Agent emit 的请示意图；None=本轮无需请示真人。
     #[serde(default)]
     pub escalation_request: Option<crate::models::EscalationRequest>,
+
+    /// 销售素材文件发送（media-asset Task 8）：本轮 Reply Agent 决定发给客户的
+    /// 素材清单（每项 = 候选「可发送素材」里的 assetId + 选材理由）。LLM 不选时为
+    /// 空 Vec（默认）。gateway 在文本回复 enqueue 之后，把每项转成一条独立媒体
+    /// outbox 条目（先文字后文件），并做 approved+sendable 二次准入校验。
+    #[serde(default)]
+    pub assets_to_send: Vec<AssetSendDirective>,
+
+    /// 专属顾问名片引荐：AI 识别高价值客户（签约/到店）后，本轮决定推给客户的
+    /// 真人专属顾问名片（候选清单里的 cardId + 选择理由）。LLM 不推时为 None
+    /// （默认）。gateway 在文本回复 enqueue 之后，转成一条 message_send_namecard
+    /// outbox 条目，并做 approved + 候选校验防幻觉；推完 AI 退居辅助。
+    #[serde(default)]
+    pub namecard_to_send: Option<NamecardDirective>,
+}
+
+/// 单条素材发送指令：LLM 从注入的「可发送素材」候选清单里选出的一项。
+/// `asset_id` 必须是候选清单里列出的 ContentAsset `_id`（gateway 二次校验防幻觉）。
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct AssetSendDirective {
+    #[serde(default)]
+    pub asset_id: String,
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+/// 单条名片引荐指令（专属顾问名片引荐）：AI 识别到高价值客户（签约/到店）后，
+/// 从注入的「可发送名片」候选清单里选出的一项。`card_id` 必须是候选清单里列出的
+/// 名片标识（gateway 二次校验防幻觉）。AI 推完名片后退居辅助，客户始终只跟 AI 对话。
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct NamecardDirective {
+    #[serde(default)]
+    pub card_id: String,
+    #[serde(default)]
+    pub reason: Option<String>,
 }
 
 impl Default for AgentDecision {
@@ -285,6 +322,10 @@ impl Default for AgentDecision {
             conversation_mode_reason: None,
             // 请示意图：默认无（本轮不向幕后真人请示）
             escalation_request: None,
+            // 素材发送：默认空（LLM 不选材时不发任何文件）
+            assets_to_send: Vec::new(),
+            // 名片引荐：默认 None（LLM 不推时不发任何名片）
+            namecard_to_send: None,
         }
     }
 }
@@ -378,6 +419,12 @@ pub struct RawAgentDecision {
     pub follow_up: Option<FollowUpDecision>,
     #[serde(default)]
     pub escalation_request: Option<crate::models::EscalationRequest>,
+    /// media-asset Task 8：LLM 输出的素材发送清单（先落 Option 容器，再由
+    /// `carry_through_fields` 透传到 `AgentDecision.assets_to_send`）。
+    pub assets_to_send: Option<Vec<AssetSendDirective>>,
+    /// 专属顾问名片引荐：LLM 输出的名片引荐指令（先落 Option 容器，再由
+    /// carry-through 透传到 `AgentDecision.namecard_to_send`）。
+    pub namecard_to_send: Option<NamecardDirective>,
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -951,6 +998,16 @@ fn carry_through_fields(raw: RawAgentDecision, decision: &mut AgentDecision) {
     }
     if raw.escalation_request.is_some() {
         decision.escalation_request = raw.escalation_request;
+    }
+    // media-asset Task 8（硬伤① carry-through）：LLM 选的素材若不在此透传，promote
+    // 后 assets_to_send 永远为空、素材被静默丢弃。只在 Some 时覆盖，None 保持默认空。
+    if let Some(v) = raw.assets_to_send {
+        decision.assets_to_send = v;
+    }
+    // 名片引荐 carry-through：LLM 选的名片若不在此透传，promote 后 namecard_to_send
+    // 永远为 None、名片被静默丢弃。只在 Some 时覆盖，None 保持默认 None。
+    if let Some(v) = raw.namecard_to_send {
+        decision.namecard_to_send = Some(v);
     }
     // 自治协议 9 字段已在 promote 主路径填好（或在 minimal/tool_calling 分支处理），
     // 此处不再覆盖，避免 final 轮的 trim 后值被原始 Some(空白) 覆盖。
@@ -1550,7 +1607,7 @@ mod validate_and_promote_tests {
     use super::*;
     use crate::agent::runtime::UserRuntimeParameters;
 
-    fn runtime_default(autonomy_protocol_enabled: bool) -> UserRuntimeParameters {
+    pub(super) fn runtime_default(autonomy_protocol_enabled: bool) -> UserRuntimeParameters {
         UserRuntimeParameters {
             recent_message_limit: 12,
             min_reply_interval_seconds: 20,
@@ -1588,7 +1645,7 @@ mod validate_and_promote_tests {
     }
 
     /// 一个能通过 final 轮全部 R1.3/R3.1/R3.2/R3.3 校验的 raw（low_routine）。
-    fn make_valid_low_routine_raw() -> RawAgentDecision {
+    pub(super) fn make_valid_low_routine_raw() -> RawAgentDecision {
         RawAgentDecision {
             decision_phase: Some("final".to_string()),
             risk_level: Some("low".to_string()),
@@ -1975,6 +2032,83 @@ mod validate_and_promote_tests {
         assert!(risks2
             .iter()
             .any(|r| r == "invalid_enum_value:conversation_mode:intimate_companion"));
+    }
+
+    // ── media-asset Task 8：assets_to_send 反序列化 + carry-through ──
+
+    #[test]
+    fn decision_without_assets_field_defaults_empty() {
+        // 旧 LLM 输出（无 assetsToSend）必须仍能反序列化、字段默认空。
+        let json = r#"{"replyText":"你好","shouldReply":true}"#;
+        let d: AgentDecision = serde_json::from_str(json).expect("must deserialize");
+        assert!(d.assets_to_send.is_empty());
+    }
+
+    #[test]
+    fn decision_parses_assets_to_send() {
+        let json =
+            r#"{"replyText":"这是报价单","assetsToSend":[{"assetId":"a1","reason":"客户问价"}]}"#;
+        let d: AgentDecision = serde_json::from_str(json).unwrap();
+        assert_eq!(d.assets_to_send.len(), 1);
+        assert_eq!(d.assets_to_send[0].asset_id, "a1");
+        assert_eq!(d.assets_to_send[0].reason.as_deref(), Some("客户问价"));
+    }
+
+    /// 硬伤① 回归：LLM 输出走 RawAgentDecision → validate_and_promote 后，
+    /// assets_to_send 必须被 carry-through 到最终 AgentDecision，不能被静默丢弃。
+    #[test]
+    fn raw_decision_carries_assets_to_send_through_promote() {
+        let mut raw = make_valid_low_routine_raw();
+        raw.assets_to_send = Some(vec![AssetSendDirective {
+            asset_id: "a1".to_string(),
+            reason: Some("问价".to_string()),
+        }]);
+        let runtime = runtime_default(true);
+        let (decision, _risks) = raw.validate_and_promote(&runtime);
+        assert_eq!(decision.assets_to_send.len(), 1);
+        assert_eq!(decision.assets_to_send[0].asset_id, "a1");
+    }
+
+    /// LLM 没给 assetsToSend（None）时，promote 后保持默认空——不误造素材。
+    #[test]
+    fn raw_decision_without_assets_promotes_empty() {
+        let raw = make_valid_low_routine_raw();
+        let runtime = runtime_default(true);
+        let (decision, _risks) = raw.validate_and_promote(&runtime);
+        assert!(decision.assets_to_send.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod namecard_directive_tests {
+    //! 专属顾问名片引荐 Task 4：`namecard_to_send` 三处接线回归。
+    //! 旧 LLM 输出（无 namecardToSend）必须仍能反序列化、字段默认 None；
+    //! LLM 给出 namecardToSend 时必须被 carry-through 到最终 AgentDecision，
+    //! 不能在 validate_and_promote 后被静默丢弃（防丢字段硬伤）。
+    use super::validate_and_promote_tests::{make_valid_low_routine_raw, runtime_default};
+    use super::*;
+
+    #[test]
+    fn decision_without_namecard_field_defaults_none() {
+        // 旧 LLM 输出（无 namecardToSend）必须仍能反序列化、字段默认 None。
+        let json = r#"{"replyText":"你好","shouldReply":true}"#;
+        let d: AgentDecision = serde_json::from_str(json).expect("must deserialize");
+        assert!(d.namecard_to_send.is_none());
+    }
+
+    /// carry-through 回归：LLM 输出走 RawAgentDecision → validate_and_promote 后，
+    /// namecard_to_send 必须被透传到最终 AgentDecision，不能被静默丢弃。
+    #[test]
+    fn raw_decision_carries_namecard_to_send_through_promote() {
+        let mut raw = make_valid_low_routine_raw();
+        raw.namecard_to_send = Some(NamecardDirective {
+            card_id: "c1".to_string(),
+            reason: Some("已签约转专属顾问".to_string()),
+        });
+        let runtime = runtime_default(true);
+        let (decision, _risks) = raw.validate_and_promote(&runtime);
+        let card = decision.namecard_to_send.expect("namecard must carry through");
+        assert_eq!(card.card_id, "c1");
     }
 }
 

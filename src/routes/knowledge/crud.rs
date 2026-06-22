@@ -317,6 +317,26 @@ pub(in crate::routes) async fn get_operation_knowledge_chunk_source(
     })))
 }
 
+/// `GET /operation-knowledge/chunks/:id` — 取单个 chunk（前端收件箱 rich 深链用）。
+pub async fn get_operation_knowledge_chunk(
+    State(state): State<AppState>,
+    Extension(admin): Extension<AuthenticatedAdmin>,
+    Path(id): Path<String>,
+) -> AppResult<Json<serde_json::Value>> {
+    let oid = mongodb::bson::oid::ObjectId::parse_str(&id)
+        .map_err(|_| AppError::BadRequest("无效 chunk id".into()))?;
+    let item = state
+        .db
+        .operation_knowledge_chunks()
+        .find_one(
+            mongodb::bson::doc! { "_id": oid, "workspace_id": &admin.current_workspace },
+            None,
+        )
+        .await?
+        .ok_or_else(|| AppError::NotFound("无此 chunk 或不属于当前 workspace".into()))?;
+    Ok(Json(serde_json::json!({ "item": item })))
+}
+
 pub(in crate::routes) async fn create_operation_knowledge(
     State(_state): State<AppState>,
     Json(_payload): Json<OperationKnowledgeRequest>,

@@ -80,6 +80,8 @@ fn base_cfg() -> AppConfig {
         cold_contact_worker_enabled: false,
         cold_contact_threshold_hours: 168,
         cold_contact_daily_emit_cap: 5,
+        holding_reply_min_interval_hours: 6.0,
+        account_daily_send_soft_cap: 500,
         silence_signal_worker_enabled: false,
         silence_threshold_seconds: 86400,
         silence_signal_interval_seconds: 0,
@@ -133,6 +135,10 @@ fn base_cfg() -> AppConfig {
         jwt_ttl_minutes: 60,
         jwt_private_key_pem: None,
         jwt_public_key_pem: None,
+        media_storage_dir: "./media".to_string(),
+        media_max_file_size_mb: 50,
+        media_id_cache_ttl_hours: 24,
+        wake_jitter_max_seconds: 900,
     }
 }
 

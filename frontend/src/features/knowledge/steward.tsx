@@ -9,10 +9,10 @@ import {
   Search,
   Undo2,
   Workflow,
-  X,
 } from "lucide-react";
 import { parseApiError } from "../../lib/api";
-import { parseCompleteness, parseIntegrityReport, chunkTypeLabel, type CompletenessView, type IntegrityReportView } from "./trustTypes";
+import { ChunkReviewCard } from "../../components/review/ChunkReviewCard";
+import { parseCompleteness, parseIntegrityReport, type CompletenessView, type IntegrityReportView } from "./trustTypes";
 import { ChunkInspectorPane, classifyChunk, focusChunk, loadChunkOptions, type ReviewChunkItem, type ReviewCategory } from "./shared";
 import { ReviewChat, type ReviewChatChunk } from "./cockpit/ReviewChat";
 import { useConfirm } from "../../components/ui/ConfirmDialog";
@@ -1130,11 +1130,9 @@ export function ReviewView({ initialDimFilter }: { initialDimFilter?: string | n
   const confirm = useConfirm();
   const [items, setItems] = useState<ReviewChunkItem[]>([]);
   const [loading, setLoading] = useState(false);
-  const [busyId, setBusyId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [info, setInfo] = useState<string | null>(null);
   const [activeCategory, setActiveCategory] = useState<ReviewCategory>("needs_review");
-  const [openBody, setOpenBody] = useState<Set<string>>(new Set());
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [batchBusy, setBatchBusy] = useState(false);
   // T9：在主区打开「审核+对话」双栏(ReviewChat)；非空时替代列表。
@@ -1180,53 +1178,6 @@ export function ReviewView({ initialDimFilter }: { initialDimFilter?: string | n
   }, [classified]);
 
   const visible = classified.get(activeCategory) ?? [];
-
-  function toggleBody(id: string) {
-    setOpenBody((prev) => {
-      const next = new Set(prev);
-      if (next.has(id)) next.delete(id);
-      else next.add(id);
-      return next;
-    });
-  }
-
-  async function verify(id: string) {
-    setBusyId(id);
-    setError(null);
-    setInfo(null);
-    try {
-      const r = await fetch(
-        `/api/operation-knowledge/chunks/${encodeURIComponent(id)}/verify`,
-        { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({}) }
-      );
-      if (!r.ok) throw await parseApiError(r);
-      setInfo(`已 verify：${id}`);
-      await load();
-    } catch (e: unknown) {
-      setError(e instanceof Error ? e.message : String(e));
-    } finally {
-      setBusyId(null);
-    }
-  }
-
-  async function reject(id: string) {
-    setBusyId(id);
-    setError(null);
-    setInfo(null);
-    try {
-      const r = await fetch(
-        `/api/operation-knowledge/chunks/${encodeURIComponent(id)}/reject`,
-        { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({}) }
-      );
-      if (!r.ok) throw await parseApiError(r);
-      setInfo(`已 reject：${id}`);
-      await load();
-    } catch (e: unknown) {
-      setError(e instanceof Error ? e.message : String(e));
-    } finally {
-      setBusyId(null);
-    }
-  }
 
   function toggleSelect(id: string) {
     setSelected((prev) => {
@@ -1389,9 +1340,6 @@ export function ReviewView({ initialDimFilter }: { initialDimFilter?: string | n
           ) : null}
           <div className="wikiSignalList">
             {visible.map((c) => {
-              const open = openBody.has(c.id);
-              const hasQuote = !!c.sourceQuote && c.sourceQuote.trim().length > 0;
-              const hasAnchor = (c.sourceAnchors?.length ?? 0) > 0;
               return (
                 <div className="wikiReviewChunkCard" key={c.id}>
                   <div className="wikiSignalHead">
@@ -1402,42 +1350,19 @@ export function ReviewView({ initialDimFilter }: { initialDimFilter?: string | n
                       onChange={() => toggleSelect(c.id)}
                       title="选中以批量 verify / archive"
                     />
-                    <div className="wikiSignalTitle">
-                      <span className={`wikiKind ${c.wikiType ?? "unknown"}`}>{wikiTypeLabel(c.wikiType ?? undefined)}</span>
-                      {chunkTypeLabel(c.chunkType) ? (
-                        <span className="wikiArchiveTag" title="运营用途：这条知识在 AI 回复里怎么用">{chunkTypeLabel(c.chunkType)}</span>
-                      ) : null}
-                      <span className={`wikiSev ${c.integrityStatus === "rejected" ? "error" : "info"}`}>
-                        {integrityStatusLabel(c.integrityStatus ?? undefined)}
-                      </span>
-                      <button
-                        type="button"
-                        className="wikiReviewTitleBtn"
-                        onClick={() => focusChunk(c.id)}
-                        title="在 Inspector 中打开"
-                      >
-                        <strong>{c.title}</strong>
-                      </button>
-                    </div>
+                    {/* 单 chunk 处置（展示 + verify-gate + verify/reject）走中立化共享卡片。
+                        chunk={c}：传入列表已 pre-fetch 的整行，卡片不再发 GET-by-id（消除 N+1）。
+                        onDone=load：处置成功后刷新列表/分类，重渲染本行拿到新数据。 */}
+                    <ChunkReviewCard chunkId={c.id} chunk={c} onDone={() => void load()} />
                     <div className="wikiSignalActions">
                       <button
                         type="button"
-                        className="wikiReviewActionBtn verify"
-                        onClick={() => void verify(c.id)}
-                        disabled={busyId === c.id || !hasQuote || !hasAnchor}
-                        title={!hasQuote || !hasAnchor ? "verify gate：需 sourceQuote + sourceAnchors 全有" : "标记为 verified"}
+                        className="wikiReviewActionBtn"
+                        onClick={() => focusChunk(c.id)}
+                        title="在 Inspector 中打开"
                       >
-                        <CheckCircle2 size={14} />
-                        Verify
-                      </button>
-                      <button
-                        type="button"
-                        className="wikiReviewActionBtn reject"
-                        onClick={() => void reject(c.id)}
-                        disabled={busyId === c.id}
-                      >
-                        <X size={14} />
-                        Reject
+                        <Search size={14} />
+                        Inspector
                       </button>
                       <button
                         type="button"
@@ -1450,35 +1375,6 @@ export function ReviewView({ initialDimFilter }: { initialDimFilter?: string | n
                       </button>
                     </div>
                   </div>
-                  {c.summary ? <p className="wikiSignalDesc">{c.summary}</p> : null}
-                  {hasQuote ? (
-                    <blockquote className="wikiArchiveCitation">
-                      {c.sourceQuote}
-                      <span className="wikiArchiveCitationSource">{c.id}</span>
-                    </blockquote>
-                  ) : (
-                    <div className="wikiHint">未配 source_quote — verify gate 将硬挡。</div>
-                  )}
-                  <div className="wikiReviewMeta">
-                    <span>id：<code>{c.id}</code></span>
-                    {hasAnchor ? (
-                      <span>anchors：{c.sourceAnchors?.length ?? 0}</span>
-                    ) : (
-                      <span className="wikiBadge warn">无 anchors</span>
-                    )}
-                    {c.relatedChunks && c.relatedChunks.length > 0 ? (
-                      <span>related：{c.relatedChunks.length}</span>
-                    ) : null}
-                    <button
-                      type="button"
-                      className="wikiCitedHead"
-                      onClick={() => toggleBody(c.id)}
-                    >
-                      {open ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
-                      {open ? "收起正文" : "展开正文"}
-                    </button>
-                  </div>
-                  {open && c.body ? <pre className="wikiReviewBodyText">{c.body}</pre> : null}
                 </div>
               );
             })}

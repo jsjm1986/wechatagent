@@ -22,6 +22,8 @@ Phase 1 scope is **user (private-chat) operations**. Group and Moments operation
 
 **"无人工接管"的精确含义**：指客户永远只跟 AI 对话、永不直接面对真人。AI 在遇到超出自身职权/能力的事项时，向**幕后决策源（领导）**请示、拿回结论后用自己的口吻向客户转述——这不是人工接管（客户从不面对人、对话始终是 AI 在说）。详见决策请示通道设计 `docs/superpowers/specs/2026-06-05-principal-decision-channel-design.md`。
 
+**辅助模式（账号级可选，默认关）的受控例外**：当账号显式开启「辅助模式」且 AI 判定客户契合人类预先标注的引荐条件（如明确要签约/到店参观/需深入对接）时，AI 会主动把真人专属顾问的微信名片推送给客户，由客户与顾问对接完成临门一脚，此时 AI 退为辅助答疑角色。这是管理员显式配置的业务动作、AI 仍是发起方与辅助方（对话始终是 AI 在说，名片是 AI 主动引荐的"发送物"），不改变全自治模式（默认）下"客户永远只跟 AI 对话"的红线——后者一字不动。被引荐的台前顾问 ≠ 幕后决策源（领导），两者解耦。详见 `docs/superpowers/specs/2026-06-21-referral-card-push-design.md`。
+
 ## Common commands
 
 The toolchain is `cargo` (Rust 2021) for the backend and `npm` + Vite for the frontend. There is no Cargo workspace and no top-level `Makefile`.

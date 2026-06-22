@@ -8,6 +8,8 @@ export type Channel =
   | "groupOps"
   | "momentOps"
   | "content"
+  | "referralCards"
+  | "sendAnalytics"
   | "systemStrategy"
   | "operations"
   | "autonomy"
@@ -15,7 +17,9 @@ export type Channel =
   | "quality"
   | "llmProviders"
   | "knowledgeWiki"
-  | "productsDeals";
+  | "productsDeals"
+  | "askHuman"
+  | "askHumanConfig";
 export type ContactTab = "all" | "managed" | "normal";
 export type SmartOpsTab = "cockpit" | "adjust" | "profile" | "memory" | "simulation" | "conversation";
 export type TraditionalOpsTab = "playbooks" | "prompts" | "settings" | "audit";
@@ -92,6 +96,48 @@ export type Message = {
   direction: "inbound" | "outbound";
   content: string;
   createdAt?: string;
+  /** 出站消息类型："text"(默认/缺省) | "media" | "namecard"。
+   *  对齐后端 ConversationMessage.msg_type（list_messages 以 camelCase 序列化）。 */
+  msgType?: string;
+  /** 媒体/名片消息引用的资源 id（media=content_assets._id，namecard=referral_cards._id）。 */
+  mediaRef?: string;
+};
+
+/** 客户画像页「AI 已发送」只读历史项：对齐后端
+ *  GET /api/contacts/:wxid/send-history 的 items 序列化（camelCase）。 */
+export type SendHistoryItem = {
+  sendKind: "media" | "namecard";
+  targetId: string;
+  targetTitle: string;
+  sentAt?: string;
+  triggerReason?: string | null;
+  responded?: boolean | null;
+  stageAdvanced?: boolean | null;
+};
+
+/** 专属顾问名片：对齐后端 ReferralCard 的 list 序列化（camelCase）。 */
+export type ReferralCard = {
+  id: string;
+  workspaceId: string;
+  accountId?: string | null;
+  targetWxid: string;
+  displayName: string;
+  sendTriggerHint: string;
+  targetStages: string[];
+  enabled: boolean;
+  reviewStatus: "draft" | "approved";
+  reviewNote?: string | null;
+  tags?: string[];
+  createdAt?: string;
+  updatedAt?: string;
+};
+
+export type ReferralCardDraft = {
+  displayName: string;
+  targetWxid: string;
+  sendTriggerHint: string;
+  targetStages: string;
+  tags: string;
 };
 
 export type EventItem = {
@@ -126,6 +172,19 @@ export type ContentAsset = {
   url?: string;
   mediaId?: string;
   usageScene?: string;
+  // 销售素材文件字段
+  mediaType?: "image" | "file" | "video";
+  fileName?: string;
+  fileSize?: number;
+  mimeType?: string;
+  sendTriggerHint?: string;
+  targetStages?: string[];
+  expressionPref?: "file_primary" | "file_support";
+  requiresPrincipalApproval?: boolean;
+  reviewStatus?: "draft" | "approved";
+  reviewNote?: string;
+  sendable?: boolean;
+  tags?: string[];
 };
 
 export type AgentSoul = {
@@ -368,6 +427,7 @@ export type OperationDomainConfig = {
   reviewPolicy: string;
   runtimeParameters: Record<string, unknown>;
   stateMachine: Record<string, unknown>;
+  assistModeEnabled?: boolean | null;
   status: string;
   updatedAt?: string;
   version?: number;
@@ -386,6 +446,7 @@ export type OperationDomainDraft = {
   reviewPolicy: string;
   runtimeParameters: string;
   stateMachine: string;
+  assistModeEnabled: boolean;
 };
 
 // ── DomainProfile（行业配置）────────────────────────────────────────────────
@@ -548,4 +609,28 @@ export type GenerateProfileResponse = {
   profileId: string;
   status: string;
   note: string;
+};
+
+// 请示通道策略（对齐后端 models.rs AskHumanPolicy，camelCase serde）。P3 配置页 + P2 收件箱共用。
+export type DeciderRef = {
+  wxid: string;
+  displayName?: string;
+};
+
+export type AskHumanQuietHours = {
+  startHour: number;   // 0-23
+  endHour: number;     // 0-23
+  tzOffsetHours: number;
+};
+
+export type AskHumanPolicy = {
+  deciderChain: DeciderRef[];
+  escalateSafetyGuard: boolean;
+  escalateUnverifiedProduct: boolean;
+  escalateAiPolicyHold: boolean;
+  escalateStuck: boolean;
+  dedupeWindowHours?: number;
+  dailyPushCap?: number;
+  quietHours?: AskHumanQuietHours;
+  timeoutHours?: number;
 };

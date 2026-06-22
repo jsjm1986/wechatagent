@@ -493,6 +493,12 @@ pub struct ConversationMessage {
     pub dedupe_key: Option<String>,
     pub direction: MessageDirection,
     pub content: String,
+    /// 出站消息类型："text"(默认/缺省) | "media"。媒体消息供前端渲染文件卡片。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub msg_type: Option<String>,
+    /// 媒体消息的 content_assets._id（hex），前端据此取缩略图/文件名。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub media_ref: Option<String>,
     pub raw: Option<Document>,
     pub created_at: DateTime,
 }
@@ -526,6 +532,8 @@ impl ConversationMessage {
             dedupe_key: None,
             direction: MessageDirection::Inbound,
             content: payload,
+            msg_type: None,
+            media_ref: None,
             raw: None,
             created_at: DateTime::now(),
         }
@@ -680,6 +688,39 @@ pub struct ContentAsset {
     pub url: Option<String>,
     pub media_id: Option<String>,
     pub usage_scene: Option<String>,
+
+    // ===== 销售素材文件发送：文件资产本体 =====
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub media_type: Option<String>, // "image"|"file"|"video"
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_path: Option<String>, // MEDIA_STORAGE_DIR 下相对路径
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_size: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mime_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_sha256: Option<String>,
+
+    // ===== 发送标注（人类上传时填）=====
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sendable: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub send_trigger_hint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_stages: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expression_pref: Option<String>, // "file_primary"|"file_support"
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requires_principal_approval: Option<bool>,
+
+    // ===== 审核状态 =====
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review_status: Option<String>, // "draft"|"approved"
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review_note: Option<String>,
+
     pub created_at: DateTime,
     pub updated_at: DateTime,
 }
@@ -760,6 +801,114 @@ pub struct OperationPlaybook {
     pub updated_at: DateTime,
 }
 
+/// 请示通道决策人引用：wxid + 可选展示名（前端选好友时填）。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct DeciderRef {
+    pub wxid: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+}
+
+/// 请示推送静默时段（领导休息时间不推卡）。tz_offset_hours 复用运营时区偏移。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct AskHumanQuietHours {
+    pub start_hour: u8,
+    pub end_hour: u8,
+    pub tz_offset_hours: i8,
+}
+
+/// 请示通道策略。None/缺省 = 沿用旧 principal_decider/high_risk_escalation_mode 行为（红线②字节等价）。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct AskHumanPolicy {
+    /// 有序决策人链：主 -> 备选1 -> 备选2…。空 = 未启用请示通道。
+    #[serde(default)]
+    pub decider_chain: Vec<DeciderRef>,
+    #[serde(default = "default_true")]
+    pub escalate_safety_guard: bool,
+    #[serde(default = "default_true")]
+    pub escalate_unverified_product: bool,
+    #[serde(default)]
+    pub escalate_ai_policy_hold: bool,
+    #[serde(default = "default_true")]
+    pub escalate_stuck: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dedupe_window_hours: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub daily_push_cap: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quiet_hours: Option<AskHumanQuietHours>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_hours: Option<f64>,
+}
+
+/// 专属顾问名片：人类标注的真人顾问微信名片 + 触发提示。辅助模式下注入 decision prompt，
+/// AI 在客户契合 send_trigger_hint 时主动引荐给客户。snake_case 落库（与 OperationDomainConfig 同款，
+/// 不加 rename_all）。AI 不自我核验红线——必须人类标 review_status="approved" 且 enabled=true 才可被选。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReferralCard {
+    #[serde(rename = "_id", skip_serializing_if = "Option::is_none")]
+    pub id: Option<ObjectId>,
+    pub workspace_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_id: Option<String>,
+    pub target_wxid: String,
+    pub display_name: String,
+    #[serde(default)]
+    pub send_trigger_hint: String,
+    #[serde(default)]
+    pub target_stages: Vec<String>,
+    /// 维度标签（与素材侧对称）：仅注入引荐候选清单供 AI 参考，不作硬过滤门（agent-first）。
+    #[serde(default)]
+    pub tags: Vec<String>,
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub review_status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review_note: Option<String>,
+    pub created_at: DateTime,
+    pub updated_at: DateTime,
+}
+
+/// 主动发送台账：每次 AI 主动发素材/名片成功后落一条。素材与名片共用
+/// （send_kind 区分），供单客户历史 / 维度聚合统计 / prompt 已发历史注入。
+/// 转化字段（responded/stage_advanced）发送时留空，由 tasks worker 回扫填充。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentSendLedger {
+    #[serde(rename = "_id", skip_serializing_if = "Option::is_none")]
+    pub id: Option<ObjectId>,
+    pub workspace_id: String,
+    pub account_id: String,
+    pub contact_wxid: String,
+    /// "media" | "namecard"
+    pub send_kind: String,
+    /// asset_id 或 card_id（hex）
+    pub target_id: String,
+    /// 冗余快照：素材标题 / 顾问名（统计展示不回表，原实体改名/删除后历史仍可读）
+    #[serde(default)]
+    pub target_title: String,
+    pub run_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trigger_reason: Option<String>,
+    /// 发送瞬间客户阶段快照（阶段推进判断的"前值"）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub customer_stage_at_send: Option<String>,
+    pub sent_at: DateTime,
+    /// sent_at 后 response_window_hours 小时内是否有入站消息（回扫填）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub responded: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_window_hours: Option<i32>,
+    /// 发送后 customer_stage 是否前进（回扫填）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stage_advanced: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outcome_evaluated_at: Option<DateTime>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OperationDomainConfig {
     #[serde(rename = "_id", skip_serializing_if = "Option::is_none")]
@@ -802,6 +951,12 @@ pub struct OperationDomainConfig {
     /// "decision_only"=只升级实质需决策/授权的件。None/缺省 = "decision_only"（保守）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub high_risk_escalation_mode: Option<String>,
+    /// 请示通道策略（决策人链/升级范围/骚扰频率/超时）。None = 回落旧 principal_decider/high_risk_escalation_mode。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ask_human_policy: Option<AskHumanPolicy>,
+    /// 辅助模式开关：true=本账号启用专属顾问名片引荐。None/false=纯全自治(默认)。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assist_mode_enabled: Option<bool>,
 }
 
 fn default_version_one() -> i32 {
@@ -2334,6 +2489,13 @@ pub struct OutboxEntry {
     pub content: String,
     pub content_hash: String,
     pub idempotency_key: String,
+    /// 销售素材发送条目：非空表示这条 outbox 发的是 ContentAsset 文件而非文本。
+    /// dispatcher 据此走 send_outbound_media。`#[serde(default)]` 兼容旧文档。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub media_asset_id: Option<String>,
+    /// 名片引荐条目：非空表示发专属顾问名片而非文本/素材。`#[serde(default)]` 兼容旧文档。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub referral_card_id: Option<String>,
     #[serde(default)]
     pub attempt: i32,
     #[serde(default)]
@@ -2843,6 +3005,13 @@ pub const ALLOWED_ESCALATION_CATEGORY: &[&str] = &[
 /// 不是 hold category——触发请示的 run 本身是 Approved，占位已正常发出。
 pub const AWAITING_PRINCIPAL_DECISION_ATTR: &str = "awaiting_principal_decision";
 
+/// 「已引荐」态：发送名片成功后写入 Contact.domain_attributes 的时间戳键。
+pub const REFERRED_SPECIALIST_AT_ATTR: &str = "referred_specialist_at";
+/// 已引荐推了哪张名片（card_id hex）。
+pub const REFERRED_CARD_ID_ATTR: &str = "referred_card_id";
+/// 客户级辅助模式覆盖："force_on" | "force_off"。
+pub const ASSIST_MODE_OVERRIDE_ATTR: &str = "assist_mode_override";
+
 /// 真人裁决口径闭集。
 pub const PRINCIPAL_VERDICT_APPROVED: &str = "approved";
 pub const PRINCIPAL_VERDICT_REJECTED: &str = "rejected";
@@ -2933,10 +3102,17 @@ pub struct AgentPrincipalEscalation {
     /// 是否已据此发过知识缺口提案（防重复）。
     #[serde(default)]
     pub knowledge_proposal_emitted: bool,
+    /// 链尾失联时最近一次给客户发安抚话术的时刻（epoch ms）。去重用：每
+    /// holding_reply_min_interval_hours 最多发一条，防 worker tick 刷屏。`#[serde(default)]` 兼容旧文档。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_holding_reply_ms: Option<i64>,
     pub created_at: DateTime,
     pub updated_at: DateTime,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resolved_at: Option<DateTime>,
+    /// 裁决来源审计："wechat"（领导微信回复）/ "admin"（管理员在后台直接裁决）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_via: Option<String>,
 }
 
 // LP-12 / Task 21：核心 Document 字段的强类型版本。
@@ -4480,6 +4656,8 @@ mod typed_tests {
             seeded_by: None,
             principal_decider: None,
             high_risk_escalation_mode: None,
+            ask_human_policy: None,
+            assist_mode_enabled: None,
         };
         let typed = cfg.runtime_parameters_typed();
         assert_eq!(typed.recent_message_limit, 16);
@@ -4574,6 +4752,8 @@ mod typed_tests {
             seeded_by: None,
             principal_decider: None,
             high_risk_escalation_mode: None,
+            ask_human_policy: None,
+            assist_mode_enabled: None,
         };
         let typed = cfg.state_machine_typed();
         assert!(!typed.states.is_empty());
@@ -4634,6 +4814,8 @@ mod typed_tests {
             content: "你好，欢迎咨询".to_string(),
             content_hash: "sha256:abcdef".to_string(),
             idempotency_key: "evt-source-001:wxid_test_001:sha256:abcdef".to_string(),
+            media_asset_id: None,
+            referral_card_id: None,
             attempt: 0,
             max_attempts: 3,
             status: "pending".to_string(),
@@ -5435,5 +5617,176 @@ mod generated_state_machine_tests {
         let d = mongodb::bson::to_document(&p).unwrap();
         let back: DomainProfile = mongodb::bson::from_document(d).unwrap();
         assert!(back.generated_state_machine.is_none());
+    }
+}
+
+#[cfg(test)]
+mod content_asset_compat_tests {
+    use super::ContentAsset;
+    use mongodb::bson::{doc, DateTime};
+
+    #[test]
+    fn legacy_asset_without_new_fields_deserializes_with_none() {
+        // 模拟现有朋友圈素材行：只有老字段
+        let legacy = doc! {
+            "workspace_id": "ws1",
+            "kind": "text",
+            "title": "朋友圈文案A",
+            "tags": ["promo"],
+            "created_at": DateTime::now(),
+            "updated_at": DateTime::now(),
+        };
+        let asset: ContentAsset = mongodb::bson::from_document(legacy)
+            .expect("legacy content_assets row must still deserialize");
+        // 关键：旧行不被误判为可发送素材
+        assert_eq!(asset.sendable, None);
+        assert_eq!(asset.media_type, None);
+        assert_eq!(asset.review_status, None);
+        assert_eq!(asset.file_path, None);
+    }
+
+    #[test]
+    fn sendable_asset_roundtrips_all_new_fields() {
+        let asset = ContentAsset {
+            id: None,
+            workspace_id: "ws1".into(),
+            account_id: None,
+            kind: "media".into(),
+            title: "产品报价单.xlsx".into(),
+            body: None,
+            tags: vec![],
+            url: None,
+            media_id: None,
+            usage_scene: None,
+            media_type: Some("file".into()),
+            file_path: Some("ws1/ab/abcd.xlsx".into()),
+            file_name: Some("产品报价单.xlsx".into()),
+            file_size: Some(20480),
+            mime_type: Some("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet".into()),
+            file_sha256: Some("abcd".into()),
+            sendable: Some(true),
+            send_trigger_hint: Some("客户问价格时发".into()),
+            target_stages: Some(vec!["意向".into(), "未成交".into()]),
+            expression_pref: Some("file_primary".into()),
+            requires_principal_approval: Some(false),
+            review_status: Some("approved".into()),
+            review_note: None,
+            created_at: DateTime::now(),
+            updated_at: DateTime::now(),
+        };
+        let doc = mongodb::bson::to_document(&asset).unwrap();
+        let back: ContentAsset = mongodb::bson::from_document(doc).unwrap();
+        assert_eq!(back.media_type.as_deref(), Some("file"));
+        assert_eq!(back.expression_pref.as_deref(), Some("file_primary"));
+        assert_eq!(back.target_stages.unwrap().len(), 2);
+    }
+}
+
+#[cfg(test)]
+mod referral_card_compat_tests {
+    use super::{ReferralCard, OperationDomainConfig};
+    use mongodb::bson::{doc, DateTime};
+
+    #[test]
+    fn referral_card_roundtrips() {
+        let card = ReferralCard {
+            id: None,
+            workspace_id: "ws1".into(),
+            account_id: None,
+            target_wxid: "wxid_boss".into(),
+            display_name: "销售总监-老王".into(),
+            send_trigger_hint: "客户明确要签约或要来公司参观时引荐".into(),
+            target_stages: vec!["意向".into()],
+            tags: vec!["高客单".into()],
+            enabled: true,
+            review_status: "approved".into(),
+            review_note: None,
+            created_at: DateTime::now(),
+            updated_at: DateTime::now(),
+        };
+        let d = mongodb::bson::to_document(&card).unwrap();
+        let back: ReferralCard = mongodb::bson::from_document(d).unwrap();
+        assert_eq!(back.target_wxid, "wxid_boss");
+        assert_eq!(back.target_stages.len(), 1);
+        assert!(back.enabled);
+    }
+
+    #[test]
+    fn referral_card_without_tags_deserializes_to_empty() {
+        // 旧名片文档无 tags 字段 → #[serde(default)] 回落空 Vec。
+        let doc = mongodb::bson::doc! {
+            "workspace_id": "ws1",
+            "target_wxid": "wxid_boss",
+            "display_name": "老王",
+            "send_trigger_hint": "签约时引荐",
+            "target_stages": ["意向"],
+            "enabled": true,
+            "review_status": "approved",
+            "created_at": DateTime::now(),
+            "updated_at": DateTime::now(),
+        };
+        let card: ReferralCard = mongodb::bson::from_document(doc).unwrap();
+        assert!(card.tags.is_empty(), "旧名片无 tags 字段应回落空 Vec");
+    }
+
+    #[test]
+    fn legacy_domain_config_without_assist_flag_deserializes_none() {
+        // 旧 OperationDomainConfig 行无 assist_mode_enabled
+        let legacy = doc! {
+            "workspace_id": "ws1", "domain": "user_operations", "name": "x",
+            "goal": "g", "methodology": "m", "workflow": "w",
+            "tool_policy": "t", "automation_policy": "a", "review_policy": "r",
+            "status": "active", "updated_at": DateTime::now(),
+        };
+        let cfg: OperationDomainConfig = mongodb::bson::from_document(legacy)
+            .expect("legacy domain config must still deserialize");
+        assert_eq!(cfg.assist_mode_enabled, None);
+    }
+}
+
+#[cfg(test)]
+mod send_ledger_compat_tests {
+    use super::AgentSendLedger;
+    use mongodb::bson::{doc, DateTime};
+
+    #[test]
+    fn ledger_roundtrips() {
+        let row = AgentSendLedger {
+            id: None,
+            workspace_id: "ws1".into(),
+            account_id: "acct1".into(),
+            contact_wxid: "wxid_cust".into(),
+            send_kind: "media".into(),
+            target_id: "asset1".into(),
+            target_title: "报价单 2026".into(),
+            run_id: "run1".into(),
+            trigger_reason: Some("客户问报价".into()),
+            customer_stage_at_send: Some("意向".into()),
+            sent_at: DateTime::now(),
+            responded: None,
+            response_window_hours: None,
+            stage_advanced: None,
+            outcome_evaluated_at: None,
+        };
+        let d = mongodb::bson::to_document(&row).unwrap();
+        let back: AgentSendLedger = mongodb::bson::from_document(d).unwrap();
+        assert_eq!(back.send_kind, "media");
+        assert_eq!(back.target_id, "asset1");
+        assert!(back.responded.is_none());
+    }
+
+    #[test]
+    fn legacy_row_without_outcome_fields_deserializes() {
+        // 转化字段全缺的早期条目必须仍能反序列化（向后兼容红线）
+        let legacy = doc! {
+            "workspace_id": "ws1", "account_id": "a", "contact_wxid": "w",
+            "send_kind": "namecard", "target_id": "c1", "target_title": "张顾问",
+            "run_id": "r1", "sent_at": DateTime::now(),
+        };
+        let row: AgentSendLedger = mongodb::bson::from_document(legacy)
+            .expect("legacy ledger row must deserialize");
+        assert_eq!(row.send_kind, "namecard");
+        assert!(row.responded.is_none());
+        assert!(row.outcome_evaluated_at.is_none());
     }
 }
