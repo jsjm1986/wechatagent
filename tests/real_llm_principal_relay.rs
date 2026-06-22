@@ -170,17 +170,6 @@ fn primary_max_retries() -> u32 {
     10
 }
 
-/// 构造最强模型 client（默认 llama-3.3-70b @ NVIDIA integrate）。缺 `REAL_LLM_JUDGE_API_KEY` → None。
-/// 本套件不打分，仅借它作 agent 备胎链首选。
-fn strongest_model_client() -> Option<Arc<LlmClient>> {
-    let key = std::env::var("REAL_LLM_JUDGE_API_KEY").ok().filter(|k| !k.trim().is_empty())?;
-    let base = std::env::var("REAL_LLM_JUDGE_BASE_URL")
-        .unwrap_or_else(|_| "https://integrate.api.nvidia.com/v1".to_string());
-    let model = std::env::var("REAL_LLM_JUDGE_MODEL")
-        .unwrap_or_else(|_| "meta/llama-3.3-70b-instruct".to_string());
-    Some(Arc::new(build_real_client(base, key, model, "REAL_LLM_JUDGE_FORMAT", 5)))
-}
-
 fn failover_model_list() -> Vec<String> {
     std::env::var("REAL_LLM_FAILOVER_MODELS")
         .unwrap_or_else(|_| {
@@ -194,9 +183,6 @@ fn failover_model_list() -> Vec<String> {
 
 fn failover_backups() -> Vec<Arc<LlmClient>> {
     let mut backups: Vec<Arc<LlmClient>> = Vec::new();
-    if let Some(c) = strongest_model_client() {
-        backups.push(c);
-    }
     if failover_key_present() {
         let key = std::env::var("REAL_LLM_FAILOVER_API_KEY").unwrap_or_default();
         let base = std::env::var("REAL_LLM_FAILOVER_BASE_URL")
