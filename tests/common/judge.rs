@@ -689,6 +689,49 @@ pub fn record_judge_skip(test_label: &str, kind: &str) {
     }
 }
 
+/// Skipped 留痕（带判定快照，供人复核）。写同一 skip_ledger.jsonl，比 record_judge_skip
+/// 多 gate/effective_judges/per_judge_medians/dim 诊断字段。每事件仍只写一行（不双写）。
+pub fn record_judge_skip_detail(
+    test_label: &str,
+    kind: &str,
+    gate: &str,
+    per_judge: &[Option<i64>],
+    dim: Option<&str>,
+) {
+    use std::io::Write as _;
+    let dir = std::env::var("REAL_LLM_LEDGER")
+        .unwrap_or_else(|_| "target/real_llm_ledger".to_string());
+    let _ = std::fs::create_dir_all(&dir);
+    let effective = per_judge.iter().filter(|m| m.is_some()).count();
+    let medians: Vec<serde_json::Value> = per_judge
+        .iter()
+        .map(|m| match m {
+            Some(v) => serde_json::json!(v),
+            None => serde_json::Value::Null,
+        })
+        .collect();
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(format!("{dir}/skip_ledger.jsonl"))
+    {
+        let _ = writeln!(
+            f,
+            "{}",
+            serde_json::json!({
+                "test": test_label,
+                "kind": kind,
+                "gate": gate,
+                "effective_judges": effective,
+                "per_judge_medians": medians,
+                "dim": dim,
+                "file": file!(),
+                "sha": std::env::var("GITHUB_SHA").unwrap_or_else(|_| "local".into()),
+            })
+        );
+    }
+}
+
 /// 仅当 judged==true（有 key、真跑了裁判但全掉线）时写 skip 台账；judged==false
 /// （本地无 key，零成本设计跳过）不写——否则本地跑测试污染 target/real_llm_ledger + 误报。
 /// 调用方在能取到 judges 处传 `!judges.is_empty()`；封装了 judges 的函数自己回传「真跑了」。
@@ -1002,6 +1045,31 @@ mod tests {
         assert_eq!(v["kind"], "judge_offline");
         assert!(v["file"].is_string(), "应含 file 字段");
         assert!(v["sha"].is_string(), "应含 sha 字段");
+        std::env::remove_var("REAL_LLM_LEDGER");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn record_judge_skip_detail_writes_decision_snapshot() {
+        use std::io::Read as _;
+        let tmp = std::env::temp_dir().join(format!("rj_detail_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::env::set_var("REAL_LLM_LEDGER", &tmp);
+        record_judge_skip_detail("pc-弧末", "insufficient_judges", "redline_arc",
+            &[Some(3), None], Some("redlineHeld"));
+        let ledger = tmp.join("skip_ledger.jsonl");
+        let mut s = String::new();
+        std::fs::File::open(&ledger).unwrap().read_to_string(&mut s).unwrap();
+        let lines: Vec<&str> = s.trim().lines().collect();
+        assert_eq!(lines.len(), 1, "一次调用 append 一行（不双写）");
+        let v: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+        assert_eq!(v["test"], "pc-弧末");
+        assert_eq!(v["kind"], "insufficient_judges");
+        assert_eq!(v["gate"], "redline_arc");
+        assert_eq!(v["effective_judges"], 1, "Some 个数 = 1");
+        assert_eq!(v["per_judge_medians"], serde_json::json!([3, null]), "原始分含 null 占位");
+        assert_eq!(v["dim"], "redlineHeld");
+        assert!(v["sha"].is_string());
         std::env::remove_var("REAL_LLM_LEDGER");
         let _ = std::fs::remove_dir_all(&tmp);
     }
