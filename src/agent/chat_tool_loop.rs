@@ -1,6 +1,6 @@
 //! 知识库对话 Agent 的多轮工具循环（knowledge-digest-workstation Phase 5）。
 //!
-//! 与 user-ops 的 [`super::tool_loop::reply_with_tools_loop`] 形态完全对齐：
+//! 多轮工具循环形态：
 //!
 //! - 中间轮 `decision_phase=tool_calling` → 派发 toolCalls →
 //!   `[system tool result]` 段累积到下一轮 prompt；
@@ -83,8 +83,7 @@ pub(crate) type ChatReplyFn<'a> = Box<
 
 /// 知识库对话 Agent 多轮工具循环。
 ///
-/// 与 user-ops `reply_with_tools_loop` 完全同构（同样的失败连击 / 总超时 /
-/// 预算硬门 / final 清空），但通过 `db` 注入异步 dispatch。
+/// 失败连击 / 总超时 / 预算硬门 / final 清空，通过 `db` 注入异步 dispatch。
 pub(crate) async fn chat_reply_with_tools_loop<'a>(
     runtime: &UserRuntimeParameters,
     knowledge: &KnowledgeRuntime,

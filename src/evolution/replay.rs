@@ -6,7 +6,7 @@
 //!   humanLike, emotionalValue, productAccuracy}` 与候选阈值对比，给出 new_5gate_hit
 //!   与 new_final_review_status（不调 LLM、不写 outbox / mcp / conversation_messages
 //!   outbound / agent_run_logs）。
-//! - **Prompt 候选**：W3 不实装完整 LLM 短路（需要 reply_with_tools_loop +
+//! - **Prompt 候选**：W3 不实装完整 LLM 短路（需要知识工具循环 +
 //!   review_decision 双 helper 全栈调用 + 大量上下文重建）；本期写
 //!   `shadow_replays.failed`，`failure_reason="prompt_replay_not_implemented_w3"`。
 //!   W4/W5 在 release 路径上线后再补完整 LLM 重放。
