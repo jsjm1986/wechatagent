@@ -137,6 +137,7 @@ export function UserOperationCockpit({
   profileNote,
   customAgentInstructions,
   assistOverride,
+  relationshipType,
   selected,
   selectedPlaybookId,
   simulationBusy,
@@ -151,11 +152,13 @@ export function UserOperationCockpit({
   onProfileNote,
   onCustomAgentInstructions,
   onAssistOverride,
+  onRelationshipType,
   onRunMemoryConsolidation,
   onRunSimulation,
   onSaveProfileNote,
   onSaveCustomAgentInstructions,
   onSaveAssistOverride,
+  onSaveRelationshipType,
   onSelectedPlaybook,
   onSimulationInput,
   onTab
@@ -175,6 +178,7 @@ export function UserOperationCockpit({
   profileNote: string;
   customAgentInstructions: string;
   assistOverride: string;
+  relationshipType: string;
   selected: Contact | null;
   selectedPlaybookId: string;
   simulationBusy: boolean;
@@ -189,11 +193,13 @@ export function UserOperationCockpit({
   onProfileNote: (value: string) => void;
   onCustomAgentInstructions: (value: string) => void;
   onAssistOverride: (mode: string) => void;
+  onRelationshipType: (value: string) => void;
   onRunMemoryConsolidation: () => void;
   onRunSimulation: () => void;
   onSaveProfileNote: () => void;
   onSaveCustomAgentInstructions: () => void;
   onSaveAssistOverride: () => void;
+  onSaveRelationshipType: () => void;
   onSelectedPlaybook: (value: string) => void;
   onSimulationInput: (value: string) => void;
   onTab: (tab: SmartOpsTab) => void;
@@ -383,13 +389,13 @@ export function UserOperationCockpit({
             />
           </label>
           <label>
-            <span>运营人员特别指令（最高优先级，可空）</span>
+            <span>运营人员特别指令（最高优先级，可空 — 也可描述关系与口吻）</span>
             <textarea
               value={customAgentInstructions}
               maxLength={1000}
               rows={5}
               onChange={(event) => onCustomAgentInstructions(event.target.value)}
-              placeholder="例：这个客户已签约老客户，不要主动推销，只服务问题。Agent 将在每轮对话最末尾读取这段指令。"
+              placeholder="例①：这个客户已签约老客户，不要主动推销，只服务问题。例②：这是我大学同学，他公司可能采购我们产品，但别推销，先用轻松口吻维护关系。Agent 将在每轮对话最末尾读取这段指令，可覆盖默认人格口吻。"
             />
             <span className="counter">{customAgentInstructions.length} / 1000</span>
             {selected.agentStatus === "managed" && (
@@ -417,6 +423,23 @@ export function UserOperationCockpit({
               </button>
             </label>
           )}
+          <label>
+            <span>客户类型</span>
+            <small>影响 AI 的主动触达策略（如：朋友不主动追单、销售对象继续跟进）。</small>
+            <select
+              value={relationshipType}
+              onChange={(event) => onRelationshipType(event.target.value)}
+            >
+              <option value="">未分类</option>
+              <option value="customer">客户（销售型）</option>
+              <option value="peer">同行</option>
+              <option value="friend">朋友</option>
+            </select>
+            <button className="secondary" onClick={onSaveRelationshipType} disabled={busy} type="button">
+              <SquarePen size={16} />
+              保存客户类型
+            </button>
+          </label>
           <div className="buttonRow">
             {selected.agentStatus === "managed" ? (
               <>

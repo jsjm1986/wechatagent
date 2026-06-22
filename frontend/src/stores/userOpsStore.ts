@@ -44,6 +44,7 @@ interface UserOpsState {
   profileNote: string;
   customAgentInstructions: string;
   assistOverride: string; // "default" | "force_on" | "force_off"
+  relationshipType: string; // "" | "customer" | "peer" | "friend"
   guideInstruction: string;
   guidePreview: UserOperationGuidePreview | null;
   simulationInput: string;
@@ -74,6 +75,7 @@ interface UserOpsActions {
   setProfileNote: (note: string) => void;
   setCustomAgentInstructions: (instructions: string) => void;
   setAssistOverride: (mode: string) => void;
+  setRelationshipType: (value: string) => void;
   setGuideInstruction: (instruction: string) => void;
   setSimulationInput: (input: string) => void;
   setSelectedPlaybookId: (id: string) => void;
@@ -101,6 +103,7 @@ interface UserOpsActions {
   saveProfileNote: () => Promise<void>;
   saveCustomAgentInstructions: () => Promise<void>;
   saveAssistOverride: () => Promise<void>;
+  saveRelationshipType: () => Promise<void>;
   analyzeProfile: () => Promise<void>;
   previewGuideInstruction: (instruction: string) => Promise<void>;
   applyGuidePreview: () => Promise<void>;
@@ -252,6 +255,7 @@ export const useUserOpsStore = create<UserOpsState & UserOpsActions>((set, get) 
   profileNote: "",
   customAgentInstructions: "",
   assistOverride: "default",
+  relationshipType: "",
   importQuery: "",
   searchQuery: "",
   guideInstruction: "",
@@ -280,6 +284,7 @@ export const useUserOpsStore = create<UserOpsState & UserOpsActions>((set, get) 
   setProfileNote: (note) => set({ profileNote: note }),
   setCustomAgentInstructions: (instructions) => set({ customAgentInstructions: instructions }),
   setAssistOverride: (mode) => set({ assistOverride: mode }),
+  setRelationshipType: (value) => set({ relationshipType: value }),
   setGuideInstruction: (instruction) => set({ guideInstruction: instruction }),
   setSimulationInput: (input) => set({ simulationInput: input }),
   setSelectedPlaybookId: (id) => set({ selectedPlaybookId: id }),
@@ -302,6 +307,10 @@ export const useUserOpsStore = create<UserOpsState & UserOpsActions>((set, get) 
         ((contact.domainAttributes as Record<string, unknown> | undefined)?.[
           "assist_mode_override"
         ] as string) || "default",
+      relationshipType:
+        ((contact.domainAttributes as Record<string, unknown> | undefined)?.[
+          "relationship_type"
+        ] as string) || "",
       selectedPlaybookId: contact.playbookId || "",
       guidePreview: null
     });
@@ -495,6 +504,28 @@ export const useUserOpsStore = create<UserOpsState & UserOpsActions>((set, get) 
     try {
       await api.put(`/api/contacts/${selected.id}/assist-override`, {
         mode: assistOverride
+      });
+      await refreshContacts(currentAccountId);
+    } catch (error) {
+      useUiStore.getState().setError(error instanceof Error ? error.message : String(error));
+    } finally {
+      useUiStore.getState().setBusy(false);
+    }
+  },
+
+  saveRelationshipType: async () => {
+    const selected = useContactStore.getState().selected;
+    const currentAccountId = useAccountStore.getState().currentAccountId();
+    const { relationshipType } = get();
+
+    if (!selected) return;
+
+    useUiStore.getState().setBusy(true);
+    useUiStore.getState().setError("");
+
+    try {
+      await api.put(`/api/contacts/${selected.id}/operation-profile`, {
+        relationshipType: relationshipType || undefined,
       });
       await refreshContacts(currentAccountId);
     } catch (error) {

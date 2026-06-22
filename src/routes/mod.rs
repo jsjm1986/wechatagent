@@ -155,9 +155,9 @@ use domain_schemas::{
     update_domain_schema,
 };
 use domain_profiles::{
-    activate_domain_profile, create_domain_profile, delete_domain_profile, get_domain_profile,
-    list_domain_profiles, publish_domain_profile, rollback_domain_profile, rollout_domain_profile,
-    update_domain_profile,
+    activate_domain_profile, active_domain_profile, create_domain_profile, delete_domain_profile,
+    get_domain_profile, list_domain_profiles, publish_domain_profile, rollback_domain_profile,
+    rollout_domain_profile, update_domain_profile,
 };
 use domains::{
     get_operation_domain, get_operation_domain_state_machine, list_operation_domains,
@@ -923,6 +923,7 @@ pub fn api_router(state: AppState) -> Router<AppState> {
             "/admin/domain-profiles",
             get(list_domain_profiles).post(create_domain_profile),
         )
+        .route("/admin/domain-profiles/active", get(active_domain_profile))
         .route(
             "/admin/domain-profiles/:id",
             get(get_domain_profile)
