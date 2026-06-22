@@ -1582,7 +1582,7 @@ async fn scan_calendar(state: &AppState) -> anyhow::Result<()> {
     let global_lookahead = state.config.strategic_planner_calendar_lookahead_days;
     let global_calendar_cap = state.config.strategic_planner_calendar_daily_cap;
 
-    let filter = calendar_candidate_filter(&workspace_id, &account_id);
+    let filter = managed_active_candidate_filter(&workspace_id, &account_id);
     let mut cursor = state.db.contacts().find(filter, None).await?;
 
     // calendar 走独立低频 cap（与常规 daily cap 不同口径）；但 emit 事件仍计入
@@ -1708,9 +1708,10 @@ async fn scan_calendar(state: &AppState) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// MongoDB 端粗筛：workspace + account + managed + 非冷却。逐 contact 的 calendar.enabled
-/// 短路 + 纪念日今日匹配在 Rust 侧做（与其它扫描器同款"DB 粗筛 + 内存精筛"）。
-pub(crate) fn calendar_candidate_filter(workspace_id: &str, account_id: &str) -> Document {
+/// MongoDB 端粗筛：workspace + account + managed + 非冷却。calendar / renewal 两个扫描器
+/// 共用此粗筛（二者粗筛条件逐字相同）；逐 contact 的 calendar.enabled / renewal.enabled
+/// 短路 + 纪念日今日匹配 / 到期窗口匹配在 Rust 侧做（与其它扫描器同款"DB 粗筛 + 内存精筛"）。
+pub(crate) fn managed_active_candidate_filter(workspace_id: &str, account_id: &str) -> Document {
     doc! {
         "workspace_id": workspace_id,
         "account_id": account_id,
@@ -1752,21 +1753,6 @@ pub(crate) fn renewal_due_soon(
     (lo..=hi).contains(&exp_ms)
 }
 
-/// MongoDB 端粗筛：与 calendar 同款（managed + 非冷却）。逐 contact 的 renewal.enabled
-/// 短路 + 到期窗口匹配在 Rust 侧做。
-pub(crate) fn renewal_candidate_filter(workspace_id: &str, account_id: &str) -> Document {
-    doc! {
-        "workspace_id": workspace_id,
-        "account_id": account_id,
-        "agent_status": "managed",
-        "$or": [
-            { "cooldown_until": { "$exists": false } },
-            { "cooldown_until": null },
-            { "cooldown_until": { "$lt": DateTime::now() } },
-        ],
-    }
-}
-
 /// G5 续费推进扫描器：客户持有产品临近到期（或刚过期）时，主动 emit follow-up 让 Reply
 /// Agent 按销售链路推进续费（=最高优先级销售）+ 临场挽留。
 ///
@@ -1797,7 +1783,7 @@ async fn scan_renewal(state: &AppState) -> anyhow::Result<()> {
     let active_products =
         crate::agent::entitlements::load_active_products(&state.db, &workspace_id).await;
 
-    let filter = renewal_candidate_filter(&workspace_id, &account_id);
+    let filter = managed_active_candidate_filter(&workspace_id, &account_id);
     let mut cursor = state.db.contacts().find(filter, None).await?;
 
     let regular_cap = state.config.strategic_planner_daily_emit_cap;
@@ -3368,10 +3354,10 @@ mod tests {
         assert!(!renewal_due_soon(Some(long_expired), now, 14, 7));
     }
 
-    /// renewal_candidate_filter 含 managed + 非冷却粗筛键（与 calendar 同款）。
+    /// managed_active_candidate_filter 含 managed + 非冷却粗筛键（calendar / renewal 共用）。
     #[test]
     fn renewal_candidate_filter_includes_expected_keys() {
-        let f = renewal_candidate_filter("ws1", "acc1");
+        let f = managed_active_candidate_filter("ws1", "acc1");
         assert_eq!(f.get_str("workspace_id").unwrap(), "ws1");
         assert_eq!(f.get_str("account_id").unwrap(), "acc1");
         assert_eq!(f.get_str("agent_status").unwrap(), "managed");
