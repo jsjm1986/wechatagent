@@ -61,6 +61,8 @@ fn medical_domain_config() -> OperationDomainConfig {
         seeded_by: None,
         principal_decider: None,
         high_risk_escalation_mode: None,
+        ask_human_policy: None,
+        assist_mode_enabled: None,
     }
 }
 

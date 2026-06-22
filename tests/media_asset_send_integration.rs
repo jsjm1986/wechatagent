@@ -225,6 +225,7 @@ fn media_enqueue_request(run_id: &str, contact_wxid: &str, media_asset_id: &str)
         source_kind: "inbound_message".to_string(),
         content: String::new(), // 媒体条目允许空 content（content_required_for=false）
         media_asset_id: Some(media_asset_id.to_string()),
+        referral_card_id: None,
         max_attempts: 3,
     }
 }

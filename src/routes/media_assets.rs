@@ -429,22 +429,27 @@ pub(super) async fn replace_content_asset_file(
     // 换文件副作用：清 media_id（防 TTL 内发旧文件）+ 退 draft（强制重审）。
     // 语义由 file_replace_effects() 纯函数钉死（lib 测试覆盖），勿改回字面量。
     let effects = file_replace_effects();
+    let mut set_doc = doc! {
+        "file_path": &rel,
+        "file_name": &file_name,
+        "file_size": bytes.len() as i64,
+        "mime_type": &mime,
+        "file_sha256": &sha,
+        "media_type": &media_type,
+        "review_status": effects.review_status,
+        "updated_at": DateTime::now(),
+    };
+    // clear_media_id 语义驱动：清缓存的 media_id（置 null），防 ensure_media_uploaded
+    // 在 TTL 内复用旧 media_id 导致 AI 发旧文件。
+    if effects.clear_media_id {
+        set_doc.insert("media_id", mongodb::bson::Bson::Null);
+    }
     state
         .db
         .content_assets()
         .update_one(
             doc! { "_id": oid, "workspace_id": &admin.current_workspace },
-            doc! { "$set": {
-                "file_path": &rel,
-                "file_name": &file_name,
-                "file_size": bytes.len() as i64,
-                "mime_type": &mime,
-                "file_sha256": &sha,
-                "media_type": &media_type,
-                "media_id": null, // 由 effects.clear_media_id == true 语义驱动
-                "review_status": effects.review_status,
-                "updated_at": DateTime::now(),
-            }},
+            doc! { "$set": set_doc },
             None,
         )
         .await?;
