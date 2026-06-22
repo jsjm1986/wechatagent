@@ -72,3 +72,31 @@ CI redline job 为防 agent failover 污染被测纯度，**故意不配** `REAL
 
 - **单裁判脆弱性兜底**：`aggregate_autonomy_medians` 取 max + 无"跨家族裁判<2 时降观测/Skipped 不硬 panic"逻辑。本次"解耦+补 key"已解决当前 6 分片全部假红；但将来任一裁判族掉线仍可能退化单裁判假红。该健壮性兜底（裁判<2 降观测，与铁律4 同根）记为后续专项，不在本次范围（用户 2026-06-22 裁定）。
 - adversarial / ops_smoke 的 strongest→agent 备胎耦合是软诊断 job 的有意设计，不动。
+
+## 七、实测修正：judge1/judge2 改走 NVIDIA（2026-06-22）
+
+§3.2 落地后 CI 单跑（run 27957338213，commit f925502）**证伪了 §3.2 的核心前提**——"judge1 = gpt-5.4 与 rsxermu 同源 RSXERMU_KEY 可用"：
+
+```
+judge1: HTTP 403 — 该 Key (product_type=copilot) 不支持 codex/GPT 模型 gpt-5.4
+```
+
+**根因（curl 多方式实测确证）**：rsxermu 的 key（无论 CI 的 `RSXERMU_KEY` 还是用户另给的同类 token）`product_type=copilot`，只授权 claude 系，**对全系 GPT（5.2/5.4/5.5）一律 403**；换 `x-api-key` 头 / `/v1/messages` 端点 / 不同 GPT 档位都不解（claude-haiku 同 token 返 200，证明 key 活着、仅无 GPT 权限）。`/v1/models` 虽列出 gpt-5.4，但"列出 ≠ 有调用权限"。故 `gpt-5.4 @ rsxermu` 这个 judge1 组合在 G2/G3/redline 三处**从未真正工作过**，一直被"judge1 缺席"掩盖；§3.2 补 key 让它首次真发请求 → 403 浮现。补 key 后测试体系 `is_endpoint_misconfig` 正确按 R0.3 反假绿 panic——是测试正确拒绝假绿，非缺陷。
+
+**修正（用户 2026-06-22 裁定，被测 claude 不变）**：judge1 与 judge2 双双改走 NVIDIA（`NVIDIA_KEY` 已在 judge2/roleplayer 长期验证可用）。模型经 NVIDIA `/v1/models` 拉真实可调用清单（121 个，key 全有权限）+ 逐个 curl JSON 打分实测延迟选定：
+
+| 角色 | 改前（不可用/旧） | 改后 | family() | 实测 |
+|---|---|---|---|---|
+| 被测 agent | claude-opus-4-8 @ rsxermu | **不变** | `rsxermu666.cn\|claude` | — |
+| judge1 | gpt-5.4 @ rsxermu（403） | `deepseek-ai/deepseek-v4-flash` @ NVIDIA | `…nvidia.com\|deepseek` | 200 / **2.0s** / JSON 干净 |
+| judge2 | qwen3-next-80b @ NVIDIA | `moonshotai/kimi-k2.6` @ NVIDIA | `…nvidia.com\|moonshot` | 200 / **3.1s** / JSON 干净 |
+
+未选 llama（用户排除）、glm-5.1（23.7s）/minimax-m3（28.4s 慢）、qwen3.5-122b（>60s 超时且与旧 judge2 同族）。
+
+**三族异族硬门（`assert_three_families_distinct`，仅 dynamic_adversarial）**：该断言读 agent / roleplayer / **judge1**（`REAL_LLM_JUDGE_MODEL`，非 judge2），`family()=host|vendor`。改后 agent=`rsxermu|claude`、roleplayer=`nvidia|qwen`（redline job 现状不动）、judge1=`nvidia|deepseek` 三者互异 → 通过。judge2 不在该断言内，换 kimi 不影响。autonomy 门双裁判 = deepseek + moonshot 跨家族，被测 claude 第三族，中位数抵噪成立。
+
+**并发（用户提醒 NVIDIA ≈40 RPM 限流）**：`autonomy_gate.rs` 裁判循环为 `for … .await` **串行**（judge1 跑完才 judge2），`JUDGE_SAMPLES=1` 单采样无放大，redline `max-parallel:1` 全局单 matrix 实例 → 单测试瞬时**最多 1 路** NVIDIA。改后 judge1 由 rsxermu（实际 403 没打 NVIDIA）转入 NVIDIA，端点总调用 +1 但峰值并发不变。实测 6 路并发 deepseek-flash 全 200 无 429。速率核算：PR 事件时仅 redline 真跑（其余真模型 job 均 `== schedule`/`== workflow_dispatch`，PR 时 skip），单测试每轮串行 judge1(~2s)+judge2(~3s)≈2 次 NVIDIA 调用、轮间隔被测 claude（rsxermu，不占 NVIDIA 配额）往返 → 峰值粗算 ~6–12 次/分钟，**远低于 40 RPM**。nightly 时 quality/adversarial 等也打 NVIDIA，但 `max-parallel:1` + 串行 `needs` 链保证同一时刻仅 1 job 打 NVIDIA。无需额外限流。
+
+**跨端点冗余的取舍**：judge1（deepseek）+ judge2（kimi）+ roleplayer（qwen）现都落 NVIDIA 端点同 `NVIDIA_KEY`；跨**家族**成立（deepseek≠kimi≠qwen≠claude），但跨**端点**冗余弱于原 rsxermu+NVIDIA 双端点设想。这是 rsxermu copilot key 无法驱动任何非 claude 模型的现实约束下的最优解；NVIDIA 端点本身的并发已按上段守住。
+
+**落地位置**：`real-llm-redline` / `real-llm-autonomy-redline`(G2) / `real-llm-conversation-judge`(G3) 三个 job 的 cargo step env，judge1 组（`REAL_LLM_JUDGE1_MODEL`/`_JUDGE_BASE_URL`/`_JUDGE_MODEL`/`_JUDGE_API_KEY`）改 deepseek@NVIDIA、judge2 组（`_JUDGE2_MODEL`）改 kimi。其余 job（`*_single` 孪生、adversarial、ops_smoke）的 judge 配置本次不动——保持各自既有形态，后续若要统一另立专项。`REAL_LLM_JUDGE_FORMAT` 仍 `openai`（NVIDIA 兼容 OpenAI 格式）。

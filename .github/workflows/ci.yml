@@ -1552,18 +1552,18 @@ jobs:
           REAL_LLM_BASE_URL: https://rsxermu666.cn
           REAL_LLM_MODEL: claude-opus-4-8
           REAL_LLM_FORMAT: anthropic
-          REAL_LLM_JUDGE1_MODEL: gpt-5.4
-          REAL_LLM_JUDGE_BASE_URL: https://rsxermu666.cn/v1
-          REAL_LLM_JUDGE_MODEL: gpt-5.4
+          REAL_LLM_JUDGE1_MODEL: deepseek-ai/deepseek-v4-flash
+          REAL_LLM_JUDGE_BASE_URL: https://integrate.api.nvidia.com/v1
+          REAL_LLM_JUDGE_MODEL: deepseek-ai/deepseek-v4-flash
           REAL_LLM_JUDGE_FORMAT: openai
-          REAL_LLM_JUDGE_API_KEY: ${{ secrets.RSXERMU_KEY }}
+          REAL_LLM_JUDGE_API_KEY: ${{ secrets.NVIDIA_KEY }}
           REAL_LLM_JUDGE: "1"
           JUDGE_SAMPLES: "1"
           REAL_LLM_LEDGER: target/real_llm_ledger/redline-${{ matrix.file }}
-          # dynamic_adversarial 第三族异族 roleplayer/judge（缺则回落两族不 fail）。
+          # judge2 = kimi-k2.6（moonshot 家族）——与 judge1 deepseek、被测 claude 三族跨家族。
           REAL_LLM_JUDGE2_API_KEY: ${{ secrets.NVIDIA_KEY }}
           REAL_LLM_JUDGE2_BASE_URL: https://integrate.api.nvidia.com/v1
-          REAL_LLM_JUDGE2_MODEL: qwen/qwen3-next-80b-a3b-instruct
+          REAL_LLM_JUDGE2_MODEL: moonshotai/kimi-k2.6
           ROLEPLAYER_API_KEY: ${{ secrets.NVIDIA_KEY }}
           ROLEPLAYER_BASE_URL: https://integrate.api.nvidia.com/v1
           ROLEPLAYER_MODEL: qwen/qwen3-next-80b-a3b-instruct
@@ -1707,9 +1707,9 @@ jobs:
         if: ${{ env.REAL_LLM_API_KEY != '' }}
         uses: Swatinem/rust-cache@v2
 
-      # 被测 agent = claude-opus-4-8（Anthropic）；裁判 = 跨家族 gpt-5.4（rsxermu OpenAI /v1）。
-      # judges_from_env 读 REAL_LLM_JUDGE_API_KEY/_BASE_URL/_MODEL 装配裁判团；JUDGE_SAMPLES=1
-      # 守端点并发上限 2（run_autonomy_redline_gate 单裁判内全程 K=1，靠跨家族多裁判取 max）。
+      # 被测 agent = claude-opus-4-8（Anthropic）；跨家族双裁判 judge1=deepseek-v4-flash + judge2=kimi-k2.6
+      # （均 NVIDIA OpenAI /v1，与被测 claude 三族跨家族）。judges_from_env 读 JUDGE/_JUDGE2 装配裁判团；
+      # JUDGE_SAMPLES=1 + 裁判串行 .await + max-parallel:1 守 NVIDIA 速率（≈40 RPM 内）。
       - name: cargo test --test real_llm_autonomy_redline (三金标校准)
         if: ${{ env.REAL_LLM_API_KEY != '' }}
         env:
@@ -1719,10 +1719,13 @@ jobs:
           REAL_LLM_FORMAT: anthropic
           REAL_LLM_JUDGE: "1"
           JUDGE_SAMPLES: "1"
-          REAL_LLM_JUDGE_API_KEY: ${{ secrets.RSXERMU_KEY }}
-          REAL_LLM_JUDGE_BASE_URL: https://rsxermu666.cn/v1
-          REAL_LLM_JUDGE_MODEL: gpt-5.4
+          REAL_LLM_JUDGE_API_KEY: ${{ secrets.NVIDIA_KEY }}
+          REAL_LLM_JUDGE_BASE_URL: https://integrate.api.nvidia.com/v1
+          REAL_LLM_JUDGE_MODEL: deepseek-ai/deepseek-v4-flash
           REAL_LLM_JUDGE_FORMAT: openai
+          REAL_LLM_JUDGE2_API_KEY: ${{ secrets.NVIDIA_KEY }}
+          REAL_LLM_JUDGE2_BASE_URL: https://integrate.api.nvidia.com/v1
+          REAL_LLM_JUDGE2_MODEL: moonshotai/kimi-k2.6
           REAL_LLM_LEDGER: target/real_llm_ledger/autonomy-redline
         run: cargo test --no-fail-fast --test real_llm_autonomy_redline -- --ignored --nocapture
 
@@ -1841,9 +1844,9 @@ jobs:
         if: ${{ env.REAL_LLM_API_KEY != '' }}
         uses: Swatinem/rust-cache@v2
 
-      # 被测 agent = claude-opus-4-8；裁判 = 跨家族 gpt-5.4（rsxermu OpenAI /v1）。
-      # judges_from_env 读 REAL_LLM_JUDGE_API_KEY/_BASE_URL/_MODEL；JUDGE_SAMPLES=1 守端点并发
-      # 上限 2（run_conversation_judge 单裁判内全程 K=1，靠跨家族多裁判取 max）。
+      # 被测 agent = claude-opus-4-8；跨家族双裁判 judge1=deepseek-v4-flash + judge2=kimi-k2.6
+      # （均 NVIDIA OpenAI /v1，与被测 claude 三族跨家族）。judges_from_env 读 JUDGE/_JUDGE2；
+      # JUDGE_SAMPLES=1 + 裁判串行 .await + max-parallel:1 守 NVIDIA 速率（≈40 RPM 内）。
       - name: cargo test --test real_llm_conversation_judge (对话级校准)
         if: ${{ env.REAL_LLM_API_KEY != '' }}
         env:
@@ -1853,10 +1856,13 @@ jobs:
           REAL_LLM_FORMAT: anthropic
           REAL_LLM_JUDGE: "1"
           JUDGE_SAMPLES: "1"
-          REAL_LLM_JUDGE_API_KEY: ${{ secrets.RSXERMU_KEY }}
-          REAL_LLM_JUDGE_BASE_URL: https://rsxermu666.cn/v1
-          REAL_LLM_JUDGE_MODEL: gpt-5.4
+          REAL_LLM_JUDGE_API_KEY: ${{ secrets.NVIDIA_KEY }}
+          REAL_LLM_JUDGE_BASE_URL: https://integrate.api.nvidia.com/v1
+          REAL_LLM_JUDGE_MODEL: deepseek-ai/deepseek-v4-flash
           REAL_LLM_JUDGE_FORMAT: openai
+          REAL_LLM_JUDGE2_API_KEY: ${{ secrets.NVIDIA_KEY }}
+          REAL_LLM_JUDGE2_BASE_URL: https://integrate.api.nvidia.com/v1
+          REAL_LLM_JUDGE2_MODEL: moonshotai/kimi-k2.6
           REAL_LLM_LEDGER: target/real_llm_ledger/conversation-judge
         run: cargo test --no-fail-fast --test real_llm_conversation_judge -- --ignored --nocapture
 
