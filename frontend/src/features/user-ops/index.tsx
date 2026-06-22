@@ -64,6 +64,7 @@ export default function UserOpsFeature() {
     profileNote,
     customAgentInstructions,
     assistOverride,
+    relationshipType,
     importQuery,
     searchQuery,
     guideInstruction,
@@ -88,6 +89,7 @@ export default function UserOpsFeature() {
     setProfileNote,
     setCustomAgentInstructions,
     setAssistOverride,
+    setRelationshipType,
     setGuideInstruction,
     setSimulationInput,
     setSelectedPlaybookId,
@@ -109,6 +111,7 @@ export default function UserOpsFeature() {
     saveProfileNote,
     saveCustomAgentInstructions,
     saveAssistOverride,
+    saveRelationshipType,
     analyzeProfile,
     previewGuideInstruction,
     applyGuidePreview,
@@ -258,6 +261,7 @@ export default function UserOpsFeature() {
             profileNote={profileNote}
             customAgentInstructions={customAgentInstructions}
             assistOverride={assistOverride}
+            relationshipType={relationshipType}
             selected={selected}
             selectedPlaybookId={selectedPlaybookId}
             simulationBusy={simulationBusy}
@@ -272,11 +276,13 @@ export default function UserOpsFeature() {
             onProfileNote={setProfileNote}
             onCustomAgentInstructions={setCustomAgentInstructions}
             onAssistOverride={setAssistOverride}
+            onRelationshipType={setRelationshipType}
             onRunMemoryConsolidation={runMemoryConsolidation}
             onRunSimulation={runDialogueSimulation}
             onSaveProfileNote={saveProfileNote}
             onSaveCustomAgentInstructions={saveCustomAgentInstructions}
             onSaveAssistOverride={saveAssistOverride}
+            onSaveRelationshipType={saveRelationshipType}
             onSelectedPlaybook={setSelectedPlaybookId}
             onSimulationInput={setSimulationInput}
             onTab={setSmartOpsTab}

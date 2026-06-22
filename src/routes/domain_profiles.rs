@@ -120,6 +120,31 @@ pub(super) async fn get_domain_profile(
     Ok(Json(json!({ "item": profile_view(&profile) })))
 }
 
+/// 取当前 workspace 运行时生效的 active profile（只读）。
+///
+/// 查询条件与 [`crate::agent::domain_profile::DomainProfileCache::reload_from_db`]
+/// 逐字一致（`is_active=true AND current_version=true` + 同 workspace），确保前端
+/// 显示的 profile 与 AI 实际加载的是同一行。无 active 时返 `{item: null}`（合法状态：
+/// 运行时此时回落 DEFAULT_PROFILE），不报 404。
+pub(super) async fn active_domain_profile(
+    State(state): State<AppState>,
+    Extension(admin): Extension<AuthenticatedAdmin>,
+) -> AppResult<Json<Value>> {
+    let profile = state
+        .db
+        .domain_profiles()
+        .find_one(
+            doc! {
+                "workspace_id": &admin.current_workspace,
+                "is_active": true,
+                "current_version": true,
+            },
+            None,
+        )
+        .await?;
+    Ok(Json(json!({ "item": profile.map(|p| profile_view(&p)) })))
+}
+
 /// create / update 请求体 = 完整 DomainProfile（引导层 apply 落候选用）。`id` /
 /// 版本灰度字段由后端管理,请求里给的会被忽略/覆盖。
 ///
