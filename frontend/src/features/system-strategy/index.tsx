@@ -756,7 +756,7 @@ function TaxonomiesAdmin({ busy }: { busy: boolean }) {
           <button type="button" className={styles.btnGhost} onClick={() => void reload()} disabled={busy || loading}>
             刷新
           </button>
-          <button type="button" className={styles.btnGhost} onClick={() => { setShowCreate((v) => !v); setInfo(null); setError(null); }} disabled={busy || loading}>
+          <button type="button" className={styles.btnGhost} onClick={() => { setShowCreate((v) => !v); setEditingId(null); setInfo(null); setError(null); }} disabled={busy || loading}>
             {showCreate ? "收起新增" : "新增条目"}
           </button>
         </div>
