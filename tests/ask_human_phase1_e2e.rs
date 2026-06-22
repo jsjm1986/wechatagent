@@ -42,6 +42,8 @@ use wechatagent::models::{
     PRINCIPAL_ESCALATION_STATUS_PENDING,
 };
 use wechatagent::routes::AppState;
+use wiremock::matchers::{method, path};
+use wiremock::{Mock, MockServer, ResponseTemplate};
 
 /// 构造测试 admin auth context（current_workspace 决定 handler 可见范围）。
 fn test_admin(workspace_id: &str) -> AuthenticatedAdmin {
@@ -540,6 +542,21 @@ async fn timeout_reassign_gives_each_decider_full_window() {
     let app = common::TestApp::start().await;
     let ws = app.state.config.default_workspace_id.clone();
 
+    // 改派要先推卡给 next decider（scan_escalation_timeouts 内「推成功才 reassign」红线）。
+    // 默认 app.state 的 mcp_base_url 是 test-mcp.invalid（不可达）→ 推卡 Err → 不改派。
+    // 故起 wiremock 返回 MCP 成功 envelope + rebuild state 指向它，让推卡走通。
+    let mcp = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/mcp"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": { "structuredContent": { "newMsgId": "mock_card_msg", "content": [] } }
+        })))
+        .mount(&mcp)
+        .await;
+    let state = common::rebuild_app_state_with_mcp_url(&app, mcp.uri());
+
     // PUT 决策人链 [a,b,c] + timeout=24h 到 current config。
     let policy: wechatagent::models::AskHumanPolicy = serde_json::from_value(serde_json::json!({
         "deciderChain": [{ "wxid": "a" }, { "wxid": "b" }, { "wxid": "c" }],
@@ -547,7 +564,7 @@ async fn timeout_reassign_gives_each_decider_full_window() {
     }))
     .expect("deserialize policy");
     let _ = wechatagent::routes::domains::put_ask_human_policy(
-        State(app.state.clone()),
+        State(state.clone()),
         Extension(test_admin(&ws)),
         Path("user_operations".to_string()),
         Json(policy),
@@ -555,12 +572,12 @@ async fn timeout_reassign_gives_each_decider_full_window() {
     .await
     .expect("put policy ok");
 
-    let entry = seed_pending_escalation(&app.state, &ws, "cust_chain", "a").await;
+    let entry = seed_pending_escalation(&state, &ws, "cust_chain", "a").await;
 
     // 模拟"已过 25h"：把 created_at 与 updated_at 都拨回 25h 前（测试钟操纵，非 config 行）。
     let twenty_five_h_ago =
         DateTime::from_millis(DateTime::now().timestamp_millis() - 25 * 3600 * 1000);
-    app.state
+    state
         .db
         .agent_principal_escalations()
         .update_one(
@@ -571,12 +588,11 @@ async fn timeout_reassign_gives_each_decider_full_window() {
         .await
         .expect("backdate clock");
 
-    // 第一次 scan：age≈25h ≥ 24h，a 非链尾 → a→b。reassign 把 updated_at 刷新到 ~now。
-    wechatagent::agent::escalation::scan_escalation_timeouts(&app.state)
+    // 第一次 scan：age≈25h ≥ 24h，a 非链尾 → 推卡成功 → a→b。reassign 把 updated_at 刷新到 ~now。
+    wechatagent::agent::escalation::scan_escalation_timeouts(&state)
         .await
         .expect("first scan ok");
-    let after_first = app
-        .state
+    let after_first = state
         .db
         .agent_principal_escalations()
         .find_one(doc! { "short_code": &entry.short_code }, None)
@@ -589,11 +605,10 @@ async fn timeout_reassign_gives_each_decider_full_window() {
     );
 
     // 第二次 scan：不再拨钟。b 的 updated_at 刚被 reassign 刷到 ~now → age≈0 < 24h → 不动。
-    wechatagent::agent::escalation::scan_escalation_timeouts(&app.state)
+    wechatagent::agent::escalation::scan_escalation_timeouts(&state)
         .await
         .expect("second scan ok");
-    let after_second = app
-        .state
+    let after_second = state
         .db
         .agent_principal_escalations()
         .find_one(doc! { "short_code": &entry.short_code }, None)
