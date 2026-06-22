@@ -1218,9 +1218,8 @@ mod tests {
     //!   `integrity_status` 保留原值。
     //! - `dispatch_chat_tool_call`：未知工具名 → `unknown_tool`；预算耗尽 → `budget_exceeded`。
     use super::*;
-    use crate::agent::budget::RunBudget;
     use crate::agent::runtime::UserRuntimeParameters;
-    use crate::agent::types::{KnowledgeRuntime, ToolCallRequest};
+    use crate::agent::types::KnowledgeRuntime;
     use crate::models::{OperationKnowledgeChunk, OperationKnowledgeDocument};
     use mongodb::bson::{doc, oid::ObjectId, DateTime as BsonDt, Document};
 
@@ -1300,17 +1299,6 @@ mod tests {
 
     fn make_runtime() -> UserRuntimeParameters {
         UserRuntimeParameters::default()
-    }
-
-    fn make_budget(token_budget: i64, tool_calls: i32) -> Arc<RunBudget> {
-        Arc::new(RunBudget::new("test-run", token_budget, 32, tool_calls))
-    }
-
-    fn call_with_args(tool: &str, arguments: Document) -> ToolCallRequest {
-        ToolCallRequest {
-            tool: tool.into(),
-            arguments,
-        }
     }
 
     // ── list_catalog ──────────────────────────────────────────────
