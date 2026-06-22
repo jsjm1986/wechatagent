@@ -832,8 +832,7 @@ fn build_tool_calling_decision(raw: RawAgentDecision, phase: String) -> AgentDec
     };
     carry_through_fields(raw, &mut decision);
     // tool_calling 中间轮强制丢弃 reply_text / should_reply（与 R4.1.b 协议一致：
-    // 若 Agent 在中间轮意外填了，由 W3 task 4.3 的 reply_with_tools_loop 在丢弃
-    // 时追加 `tool_calling_phase_with_reply_text` 标签；本函数只保证默认安全）
+    // 中间轮意外填了 reply_text 时本函数只保证默认安全，清空它）
     decision.reply_text = String::new();
     decision.should_reply = false;
     decision
