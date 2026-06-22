@@ -1494,9 +1494,6 @@ pub struct DomainProfile {
     /// 参与/不参与决策的画像维度声明（替代 `decision_taxonomy::TAGGED_FIELDS` const 表）。
     #[serde(default)]
     pub profile_dimensions: Vec<ProfileDimension>,
-    /// 关联的 chunk 字段表（引用 `DomainSchema.schema_id`）。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub domain_schema_id: Option<String>,
     /// 行业 prompt 片段（注入决策 prompt，替代写死的销售域维度语义文案）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt_fragment: Option<String>,

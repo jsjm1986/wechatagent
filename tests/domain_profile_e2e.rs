@@ -87,7 +87,6 @@ async fn db_create_profile(
         display_name: display_name.to_string(),
         description: description.to_string(),
         profile_dimensions: vec![],
-        domain_schema_id: None,
         prompt_fragment: None,
         soul_override: None,
         methodology_override: None,

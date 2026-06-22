@@ -757,7 +757,6 @@ pub fn default_domain_profile(workspace_id: &str) -> DomainProfile {
                 description: "客户当前的意向高低。".to_string(),
             },
         ],
-        domain_schema_id: None,
         prompt_fragment: None,
         // H12：DEFAULT 出厂人格/方法论 = None → 回落内置销售域 soul + playbook（逐字等价）。
         soul_override: None,
