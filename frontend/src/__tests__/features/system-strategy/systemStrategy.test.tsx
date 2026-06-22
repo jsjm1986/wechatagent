@@ -5,6 +5,14 @@ import { api } from "../../../lib/api";
 import { useStrategyStore } from "../../../stores/strategyStore";
 import { useUiStore } from "../../../stores/uiStore";
 
+// CSS module identity mock：vitest 默认 css:false 会把 styles.xxx 解析为 undefined，
+// 导致 className 不落到 DOM、无法按 .inlineError / .badgeOk 定位。这里把 CSS module
+// 改成 identity 代理（styles.badgeOk === "badgeOk"），只影响 className 字符串，不动真实
+// 渲染结构——让 409 用例可以语义化地断言 error 框（inlineError）确实不存在。
+vi.mock("../../../features/system-strategy/SystemStrategy.module.css", () => ({
+  default: new Proxy({}, { get: (_t, key) => String(key) }),
+}));
+
 // Mock API
 vi.mock("../../../lib/api", () => ({
   api: {
@@ -210,13 +218,20 @@ describe("TaxonomiesAdmin 边界", () => {
       status: 409,
       data: { message: "(scope=global, kind=customer_stage, value.id=need_discovery) 已存在" },
     } as never);
-    render(<SystemStrategyFeature />);
+    const { container } = render(<SystemStrategyFeature />);
     fireEvent.click(await screen.findByText("新增条目"));
     fireEvent.change(screen.getByPlaceholderText(/canonical id/i), { target: { value: "need_discovery" } });
     fireEvent.change(screen.getByPlaceholderText(/显示名/i), { target: { value: "需求挖掘" } });
     fireEvent.click(screen.getByText("保存"));
     // 409 走 info（badgeOk），不进 inlineError —— 文案以 message 内的「已存在」断言
-    expect(await screen.findByText(/已存在/)).toBeInTheDocument();
+    const infoBadge = await screen.findByText(/已存在/);
+    expect(infoBadge).toBeInTheDocument();
+    // 反向断言（消半永真）：info 与 error 共用 res.data.message 文案，仅靠文本无法区分 info/error，
+    // 必须按 class 定位 error 框（styles.inlineError，vitest css:false 下为 identity className）。
+    // 若 409 分支被误改成走 setError，则 .inlineError 会出现并命中该「已存在」文案 → 这两条断言才会红。
+    expect(container.querySelector(".inlineError")).toBeNull();
+    // info 徽章本身确实是 badgeOk（info 渲染位），双向锁住「显示 info」。
+    expect(infoBadge.closest(".badgeOk")).not.toBeNull();
   });
 
   it("新增缺 canonical id 时本地校验拦下，不发请求", async () => {
