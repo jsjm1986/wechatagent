@@ -43,7 +43,10 @@ mod m009_prompt_template_versioned;
 mod m010_contact_custom_instructions_and_knowledge_tags;
 mod m011_drop_legacy_sales_collections;
 mod m012_drop_legacy_taxonomy_seed;
-mod m013_seed_user_operation_state_policies;
+/// `pub(crate)`：H13 把 `derive_state_policy_lists` 派生纯函数留在本迁移里作唯一真相，
+/// `routes::admin_ops_versions::publish_state_machine_version` 联动重派生 policies 时
+/// 跨模块复用同一份逻辑（杜绝 m013 与 publish 路径漂移）。
+pub(crate) mod m013_seed_user_operation_state_policies;
 mod m014_drop_trigger_keywords;
 mod m015_ops_tables_active_versions;
 mod m016_backfill_workspace_id_on_legacy_rows;
@@ -56,6 +59,7 @@ mod m021_seed_churn_reason;
 mod m022_backfill_dormant_allow_from_any;
 mod m023_seed_value_tier;
 mod m024_seed_relationship_type;
+mod m025_backfill_ask_human_policy;
 
 type MigrationFuture<'a> = Pin<Box<dyn Future<Output = AppResult<()>> + Send + 'a>>;
 pub type MigrationFn = for<'a> fn(&'a Database) -> MigrationFuture<'a>;
@@ -163,6 +167,10 @@ pub const MIGRATIONS: &[Migration] = &[
     Migration {
         id: "2026_06_X8_001_seed_relationship_type",
         run: |db| Box::pin(m024_seed_relationship_type::run_step(db)),
+    },
+    Migration {
+        id: "2026_06_X9_001_backfill_ask_human_policy",
+        run: |db| Box::pin(m025_backfill_ask_human_policy::run_step(db)),
     },
 ];
 

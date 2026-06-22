@@ -31,6 +31,7 @@ use crate::models::AgentTask;
 
 pub async fn build_initial_operation_profile(
     state: &AppState,
+    workspace_id: &str,
     note: &str,
     playbook: Option<&OperationPlaybook>,
 ) -> AppResult<GeneratedOperationProfile> {
@@ -38,7 +39,7 @@ pub async fn build_initial_operation_profile(
         "未配置运营方法。请根据运营备注自由生成克制、真实、可执行的运营画像。".to_string()
     });
     let domain_config =
-        load_user_operation_domain_config(state, &state.config.default_workspace_id).await?;
+        load_user_operation_domain_config(state, workspace_id).await?;
     let domain_text = domain_config
         .as_ref()
         .map(format_operation_domain_config_for_prompt)
@@ -51,7 +52,7 @@ pub async fn build_initial_operation_profile(
     // DEFAULT 销售域 prompt_fragment=None → 空串、prompt 字节等价（反过拟合护栏）。
     let active_profile = super::domain_profile::load_active_domain_profile(
         &state.db,
-        &state.config.default_workspace_id,
+        workspace_id,
     )
     .await;
     let business_context = render_business_context_fragment(
@@ -60,13 +61,13 @@ pub async fn build_initial_operation_profile(
     );
     let system = prompts::load_prompt(
         &state.db,
-        &state.config.default_workspace_id,
+        workspace_id,
         "user.initial_profile.system",
     )
     .await?;
     let task_template = prompts::load_prompt(
         &state.db,
-        &state.config.default_workspace_id,
+        workspace_id,
         "user.initial_profile.task",
     )
     .await?;
@@ -295,6 +296,74 @@ pub(crate) async fn decide_reply_with_promote(
         }),
     };
     let assets = load_context_assets(state, &contact.account_id).await?;
+    // media-asset Task 8：加载可发送素材（sendable+approved）→ 按当前客户阶段过滤候选
+    // → 渲染成清单注入 prompt，供 Reply Agent 选材输出 assetsToSend。best-effort：DB
+    // 故障 → 空清单（不发素材、不阻塞决策，同 reaction_hint / operator_memory 路径）。
+    // customer_stage 取 contact.domain_attributes（与下方画像段同源），缺失 = None →
+    // 只命中 target_stages 为空/全阶段的素材。
+    let sendable_assets = load_sendable_assets(state, &contact.account_id)
+        .await
+        .unwrap_or_default();
+    let current_customer_stage = contact
+        .domain_attributes
+        .as_ref()
+        .and_then(|doc| doc.get_str("customer_stage").ok())
+        .map(|s| s.to_string());
+    let sendable_candidates = super::media_send::filter_sendable_candidates(
+        &sendable_assets,
+        current_customer_stage.as_deref(),
+    );
+    let sendable_candidates_text = super::media_send::render_candidate_lines(&sendable_candidates);
+    // 已发素材历史注入（防重发软约束，缺口 5）：查该客户近期已发素材，
+    // 渲染成提示段供 Reply Agent 判重。best-effort，空 = 不加段。
+    let recent_media_sent = super::send_ledger::recent_sends_for_contact(
+        state,
+        &contact.workspace_id,
+        &contact.wxid,
+        "media",
+        10,
+    )
+    .await;
+    let recent_media_text = super::send_ledger::render_recent_media_lines(&recent_media_sent);
+    // referral-card Task 8：名片引荐——仅辅助模式开启才加载/过滤/渲染候选名片注入
+    // prompt（默认关 = 空串，对现有全自治账号 prompt 仅多一个空段，字节近等价）。
+    // 辅助模式判定：客户级 override（domain_attributes）> 账号级 assist_mode_enabled。
+    // best-effort：DB 故障 → 空清单 → 不引荐、不阻塞决策（同 sendable 路径）。
+    let assist_override = contact
+        .domain_attributes
+        .as_ref()
+        .and_then(|d| d.get_str(crate::models::ASSIST_MODE_OVERRIDE_ATTR).ok());
+    let assist_on = super::referral::assist_mode_active(
+        domain_config.and_then(|c| c.assist_mode_enabled),
+        assist_override,
+    );
+    let referral_block = if assist_on {
+        let cards = load_referral_cards(state, &contact.account_id)
+            .await
+            .unwrap_or_default();
+        let candidates = super::referral::filter_referral_candidates(
+            &cards,
+            current_customer_stage.as_deref(),
+        );
+        // 「已引荐」上下文：从已加载名片中按 referred_card_id 反查 display_name，
+        // 给 Reply Agent 防重推依据（找不到对应名片则不展示历史）。
+        let already = contact
+            .domain_attributes
+            .as_ref()
+            .and_then(|d| d.get_str(crate::models::REFERRED_CARD_ID_ATTR).ok())
+            .and_then(|cid| {
+                cards
+                    .iter()
+                    .find(|c| c.id.map(|i| i.to_hex()).as_deref() == Some(cid))
+                    .map(|c| super::referral::AlreadyReferred {
+                        display_name: c.display_name.clone(),
+                        card_id: cid.to_string(),
+                    })
+            });
+        super::referral::render_referral_lines(&candidates, already.as_ref())
+    } else {
+        String::new()
+    };
     // H12：运营方法论本体回落链 = profile.methodology_override(非空白) ?? contact 绑定
     // playbook ?? 内置兜底。DEFAULT_PROFILE 的 methodology_override=None → 走 playbook +
     // 兜底，与改造前逐字等价。methodology_override 为 Some 时整体替换「当前运营方法」段。
@@ -425,7 +494,8 @@ pub(crate) async fn decide_reply_with_promote(
     // 约定）。它按固定顺序串起：①经营公式段单一真相源（H15，剥离遗留内联段→注入 active
     // profile 公式段）②对话模式判定段（H9）③模式与 5 闸关系段（A/T2）④conversationMode
     // 枚举列表（H9 修复 A，对齐 runtime 校验集合）。DEFAULT_PROFILE / 老库 → 每步原样 →
-    // prompt 字节等价、销售域零变化（往返/字节等价护栏见 domain_profile.rs `#[cfg(test)]`）。
+    // 内容/语义等价（经营公式段从 policy 中部移至末尾，内容逐字保留、仅位置变；LLM 见到的
+    // 内容完全一致，零运行时影响）、销售域零行为变化（语义等价护栏见 domain_profile.rs `#[cfg(test)]`）。
     // **红线**：boundary_protection 不放宽边界保护硬规则段不在任何替换范围、任何行业写死守护。
     // 新增 reply.policy 类 prompt override 字段时，加进那个 helper（勿在此散接）——见 helper 文档。
     let policy = super::domain_profile::apply_reply_policy_prompt_overrides(&policy, &active_profile);
@@ -600,6 +670,10 @@ pub(crate) async fn decide_reply_with_promote(
 自由画像字段: {}
 可引用内容资产:
 {}
+{}
+{}
+可引荐的专属顾问:
+{}
 未完成跟进:
 {}
 
@@ -663,6 +737,9 @@ pub(crate) async fn decide_reply_with_promote(
         contact.follow_up_policy.clone().unwrap_or_default(),
         serde_json::to_string(&contact.profile_attributes).unwrap_or_default(),
         assets,
+        sendable_candidates_text,
+        recent_media_text,
+        referral_block,
         task_text,
         history,
         crate::agent::prompt_isolation::isolate_untrusted(&inbound.content)
@@ -1020,6 +1097,89 @@ pub(crate) async fn load_published_soul(
     Ok(soul.map(|item| item.content))
 }
 
+/// media-asset Task 8：加载本 workspace + account 下「可发送素材」（sendable +
+/// approved 的媒体资产），供 Reply Agent 选材。与 [`load_context_assets`] 的 query
+/// 风格一致，但过滤条件是发送准入硬门（draft / 不可发 / 老朋友圈行不会进候选）。
+/// best-effort 由调用方处理（DB 故障时空清单 → 不发素材，不阻塞决策）。
+pub(crate) async fn load_sendable_assets(
+    state: &AppState,
+    account_id: &str,
+) -> AppResult<Vec<crate::models::ContentAsset>> {
+    use futures::TryStreamExt;
+    use mongodb::bson::doc;
+    use mongodb::options::FindOptions;
+    let mut cursor = state
+        .db
+        .content_assets()
+        .find(
+            doc! {
+                "workspace_id": &state.config.default_workspace_id,
+                "$or": [
+                    { "account_id": null },
+                    { "account_id": account_id }
+                ],
+                "sendable": true,
+                "review_status": "approved",
+            },
+            FindOptions::builder()
+                .sort(doc! { "updated_at": -1 })
+                .limit(30)
+                .build(),
+        )
+        .await?;
+    let mut out = Vec::new();
+    while let Some(asset) = cursor.try_next().await? {
+        out.push(asset);
+    }
+    Ok(out)
+}
+
+/// referral-card Task 8：名片候选 query 形状（与 [`load_sendable_assets`] 同构）。
+/// 仅取本 workspace、本账号（或账号无关 account_id=null）、enabled 且 approved 的名片。
+pub(crate) fn build_referral_cards_filter(
+    workspace_id: &str,
+    account_id: &str,
+) -> mongodb::bson::Document {
+    use mongodb::bson::doc;
+    doc! {
+        "workspace_id": workspace_id,
+        "$or": [
+            { "account_id": null },
+            { "account_id": account_id }
+        ],
+        "enabled": true,
+        "review_status": "approved",
+    }
+}
+
+/// referral-card Task 8：加载本 workspace + account 下「可引荐名片」（enabled +
+/// approved）。仅在辅助模式开启时调用。best-effort 由调用方处理（DB 故障 → 空清单 →
+/// 不引荐、不阻塞决策，同 load_sendable_assets 路径）。
+pub(crate) async fn load_referral_cards(
+    state: &AppState,
+    account_id: &str,
+) -> AppResult<Vec<crate::models::ReferralCard>> {
+    use futures::TryStreamExt;
+    use mongodb::options::FindOptions;
+    let filter = build_referral_cards_filter(&state.config.default_workspace_id, account_id);
+    let mut cursor = state
+        .db
+        .referral_cards()
+        .find(
+            filter,
+            FindOptions::builder()
+                .sort(mongodb::bson::doc! { "updated_at": -1 })
+                .limit(20)
+                .build(),
+        )
+        .await?;
+    let mut out = Vec::new();
+    while let Some(c) = cursor.try_next().await? {
+        out.push(c);
+    }
+    Ok(out)
+}
+
 pub(crate) async fn load_context_assets(state: &AppState, account_id: &str) -> AppResult<String> {
     use futures::TryStreamExt;
     use mongodb::bson::doc;
@@ -1160,6 +1320,24 @@ mod reaction_hint_loader_tests {
         assert!(hint.contains("user_replied_objection"));
         assert!(hint.contains("user_replied_buying_signal"));
         assert!(hint.contains("摘要=对价格有顾虑"));
+    }
+}
+
+#[cfg(test)]
+mod referral_loader_tests {
+    //! referral-card Task 8：名片候选 query 形状契约。与 reaction_hint / sendable
+    //! 同构——避免 filter 被静默改坏（漏 enabled/approved 闸 → 草稿名片漏到 prompt，
+    //! 或漏 workspace pin → 跨租户名片泄漏）。
+
+    use super::*;
+
+    #[test]
+    fn referral_filter_pins_workspace_account_enabled_approved() {
+        let f = build_referral_cards_filter("ws", "acct");
+        assert_eq!(f.get_str("workspace_id").ok(), Some("ws"));
+        assert_eq!(f.get_bool("enabled").ok(), Some(true));
+        assert_eq!(f.get_str("review_status").ok(), Some("approved"));
+        assert!(f.contains_key("$or"));
     }
 }
 

@@ -49,10 +49,29 @@ pub(crate) fn hour_in_offset(now_utc_ms: i64, tz_offset_hours: i32) -> u32 {
     shifted.div_euclid(3_600_000).rem_euclid(24) as u32
 }
 
-/// 给定 UTC 毫秒、醒来小时 `end`、时区偏移，返回下一次"运营方本地 `end`:00"对应的
-/// UTC 毫秒。严格在 `now` 之后（恰好命中 `end`:00 也取次日，保证 wake 落在未来，
-/// 与旧 `next_wake_instant` 的"严格大于"语义一致）。
-pub(crate) fn next_wake_utc_ms(now_utc_ms: i64, end: u32, tz_offset_hours: i32) -> i64 {
+/// 从 contact 标识派生确定性 jitter（毫秒），落在 [0, max_seconds*1000]。同一 seed
+/// 恒定（可复现、可测），不同 contact 散开，把整点唤醒打散避免齐发。max_seconds=0 → 恒 0。
+///
+/// 用 FNV-1a 而非 `DefaultHasher`：后者哈希算法跨 Rust 版本不保证稳定，会让 jitter
+/// 不可复现；FNV-1a 是固定常量算法，同一 seed 在任何版本恒定。
+pub(crate) fn jitter_ms_for_seed(seed: &str, max_seconds: u32) -> i64 {
+    if max_seconds == 0 {
+        return 0;
+    }
+    let mut h: u64 = 0xcbf29ce484222325; // FNV-1a offset basis
+    for b in seed.bytes() {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x100000001b3); // FNV prime
+    }
+    let max_ms = (max_seconds as u64) * 1000;
+    (h % (max_ms + 1)) as i64
+}
+
+/// 给定 UTC 毫秒、醒来小时 `end`、时区偏移、jitter 毫秒，返回下一次"运营方本地
+/// `end`:00 + jitter"对应的 UTC 毫秒。严格在 `now` 之后（恰好命中 `end`:00 也取次日，
+/// 保证 wake 落在未来，与旧 `next_wake_instant` 的"严格大于"语义一致）。jitter 把同一
+/// workspace 多客户的整点唤醒散开（per-contact 确定性偏移，见 [`jitter_ms_for_seed`]）。
+pub(crate) fn next_wake_utc_ms(now_utc_ms: i64, end: u32, tz_offset_hours: i32, jitter_ms: i64) -> i64 {
     let off = (tz_offset_hours as i64) * 3_600_000;
     let local_ms = now_utc_ms + off;
     let day = local_ms.div_euclid(86_400_000); // 本地"第几天"
@@ -62,7 +81,7 @@ pub(crate) fn next_wake_utc_ms(now_utc_ms: i64, end: u32, tz_offset_hours: i32) 
     } else {
         end_ms_today + 86_400_000
     };
-    local_target - off // 回到 UTC
+    (local_target - off) + jitter_ms // 回到 UTC 并叠加 per-contact jitter
 }
 
 /// 薄包装：当前真实时刻（按运营方偏移换算）是否在静默时段。生产判定入口。
@@ -74,31 +93,46 @@ pub(crate) fn is_quiet_now(start: u32, end: u32, tz_offset_hours: i32) -> bool {
     )
 }
 
-/// 薄包装：从现在算下一次醒来时刻（UTC），转成 BSON `DateTime` 供 task `run_at` 用。
-pub(crate) fn next_wake_at(end: u32, tz_offset_hours: i32) -> mongodb::bson::DateTime {
+/// 薄包装：从现在算下一次醒来时刻（UTC）+ per-contact jitter，转成 BSON `DateTime`
+/// 供 task `run_at` 用。`jitter_seed` 通常传 `contact.wxid`（同 contact 恒定偏移、
+/// 不同 contact 散开），`jitter_max_seconds` 来自 `config.wake_jitter_max_seconds`。
+pub(crate) fn next_wake_at(
+    end: u32,
+    tz_offset_hours: i32,
+    jitter_seed: &str,
+    jitter_max_seconds: u32,
+) -> mongodb::bson::DateTime {
+    let jitter = jitter_ms_for_seed(jitter_seed, jitter_max_seconds);
     mongodb::bson::DateTime::from_millis(next_wake_utc_ms(
         Utc::now().timestamp_millis(),
         end,
         tz_offset_hours,
+        jitter,
     ))
 }
 
-/// universal-domain-adaptation H19：解析某 contact 的**有效作息门控开关**。
+/// universal-domain-adaptation H19 / G04：解析某 contact 的**有效作息门控开关**。
 ///
-/// `contact.operation_mode_override.quiet_hours.enabled_override` 优先，缺省回落
-/// 全局 `global_enabled`（即 `runtime.quiet_hours_enabled`）。纯函数、不查 DB——
-/// 覆盖来自 contact 已加载字段，不在热路径引入额外 IO。
+/// 经 [`resolve_operation_mode`](crate::planner::resolve_operation_mode) 三级链
+/// （contact override → profile.per_relationship → profile 默认范式）取
+/// `quiet_hours.enabled_override`，缺省回落全局 `global_enabled`（即
+/// `runtime.quiet_hours_enabled`）。与其余 6 个 OperationMode 驱动力解析路径一致——
+/// 此前只读 `contact.operation_mode_override`、绕过 resolve，导致 profile/per_relationship
+/// 级的 `quiet_hours.enabled_override` 是运行时死字段（G04）。纯函数、不查 DB
+/// （profile 由调用方传入已加载值）。
 ///
-/// DEFAULT 等价：无 override（`enabled_override = None`）→ 返回 `global_enabled`，
-/// 与改造前逐字一致；情感陪伴 contact 设 `Some(false)` → 夜间不被静默门压制。
+/// DEFAULT 字节等价：contact override=None + profile 默认范式 `enabled_override=None`
+/// → resolve 回落 `OperationMode::default()`（`enabled_override=None`）→ `.unwrap_or`
+/// 返回 `global_enabled`，与改造前逐字一致；情感陪伴 profile/contact 设 `Some(false)`
+/// → 夜间不被静默门压制。
 pub(crate) fn effective_quiet_hours_enabled(
     contact: &crate::models::Contact,
+    profile: &crate::models::DomainProfile,
     global_enabled: bool,
 ) -> bool {
-    contact
-        .operation_mode_override
-        .as_ref()
-        .and_then(|m| m.quiet_hours.enabled_override)
+    crate::planner::resolve_operation_mode(contact, profile)
+        .quiet_hours
+        .enabled_override
         .unwrap_or(global_enabled)
 }
 
@@ -175,7 +209,7 @@ mod tests {
     fn wake_same_day_when_end_still_ahead() {
         // 北京 02:30（= UTC 前一日 18:30），end=8 → 北京当天 08:00（= UTC 00:00）。
         let now = utc_ms("2026-06-08T18:30:00Z");
-        let wake = next_wake_utc_ms(now, 8, 8);
+        let wake = next_wake_utc_ms(now, 8, 8, 0);
         assert_eq!(wake, utc_ms("2026-06-09T00:00:00Z"));
     }
 
@@ -183,7 +217,7 @@ mod tests {
     fn wake_next_day_when_end_already_passed() {
         // 北京 23:00（= UTC 15:00），end=8 → 北京次日 08:00（= 次日 UTC 00:00）。
         let now = utc_ms("2026-06-09T15:00:00Z");
-        let wake = next_wake_utc_ms(now, 8, 8);
+        let wake = next_wake_utc_ms(now, 8, 8, 0);
         assert_eq!(wake, utc_ms("2026-06-10T00:00:00Z"));
     }
 
@@ -191,7 +225,7 @@ mod tests {
     fn wake_strictly_after_now_at_exact_hour() {
         // 恰好北京 08:00（= UTC 00:00）命中 end → 不取当天，取次日，保证 wake 严格在未来。
         let now = utc_ms("2026-06-09T00:00:00Z");
-        let wake = next_wake_utc_ms(now, 8, 8);
+        let wake = next_wake_utc_ms(now, 8, 8, 0);
         assert_eq!(wake, utc_ms("2026-06-10T00:00:00Z"));
         assert!(wake > now, "wake 必须严格在 now 之后");
     }
@@ -200,12 +234,116 @@ mod tests {
     fn wake_respects_negative_offset() {
         // 西五区 -5：UTC 12:00 = 当地 07:00，end=8 → 当地当天 08:00 = UTC 13:00。
         let now = utc_ms("2026-06-09T12:00:00Z");
-        let wake = next_wake_utc_ms(now, 8, -5);
+        let wake = next_wake_utc_ms(now, 8, -5, 0);
         assert_eq!(wake, utc_ms("2026-06-09T13:00:00Z"));
     }
 
     #[test]
     fn deferred_kind_constant_stable() {
         assert_eq!(DEFERRED_INBOUND_REPLY_KIND, "deferred_inbound_reply");
+    }
+
+    #[test]
+    fn jitter_is_deterministic_per_seed() {
+        let now = 1_700_000_000_000;
+        let a = next_wake_utc_ms(now, 8, 8, jitter_ms_for_seed("wxid_alice", 900));
+        let b = next_wake_utc_ms(now, 8, 8, jitter_ms_for_seed("wxid_alice", 900));
+        assert_eq!(a, b);
+    }
+    #[test]
+    fn jitter_differs_across_seeds() {
+        assert_ne!(
+            jitter_ms_for_seed("wxid_alice", 900),
+            jitter_ms_for_seed("wxid_bob", 900)
+        );
+    }
+    #[test]
+    fn jitter_within_bounds() {
+        for seed in ["a", "b", "c", "xyz", "wxid_123456"] {
+            let j = jitter_ms_for_seed(seed, 900);
+            assert!(j >= 0 && j <= 900 * 1000, "jitter 越界: {}", j);
+        }
+    }
+    #[test]
+    fn jitter_zero_max_is_noop() {
+        assert_eq!(jitter_ms_for_seed("anything", 0), 0);
+    }
+
+    /// G04：构造一个 managed、无 operation_mode_override 的最小 Contact，便于断言
+    /// `effective_quiet_hours_enabled` 走 resolve_operation_mode 三级链回落 profile 级。
+    fn contact_no_override() -> crate::models::Contact {
+        crate::models::Contact {
+            id: None,
+            workspace_id: "default".to_string(),
+            account_id: "default".to_string(),
+            wxid: "quiet_hours_test".to_string(),
+            nickname: None,
+            remark: None,
+            alias: None,
+            agent_status: crate::models::AgentStatus::Managed,
+            human_profile_note: None,
+            agent_profile: None,
+            memory_summary: None,
+            playbook_id: None,
+            playbook_version: None,
+            tags: Vec::new(),
+            commitments: Vec::new(),
+            follow_up_policy: None,
+            operation_state: None,
+            operation_state_reason: None,
+            operation_state_confidence: None,
+            operation_state_updated_at: None,
+            cooldown_until: None,
+            operation_policy: mongodb::bson::Document::new(),
+            profile_attributes: mongodb::bson::Document::new(),
+            profile_updated_at: None,
+            domain_attributes: None,
+            domain_attributes_updated_at: None,
+            last_message_at: None,
+            last_inbound_at: None,
+            last_outbound_at: None,
+            last_agent_run_at: None,
+            custom_agent_instructions: None,
+            operation_mode_override: None,
+            last_outbound_style: None,
+            intent_trajectory: Vec::new(),
+            outcome_events: Vec::new(),
+            locale: None,
+            created_at: mongodb::bson::DateTime::now(),
+            updated_at: mongodb::bson::DateTime::now(),
+        }
+    }
+
+    /// G04：profile 级 `quiet_hours.enabled_override=Some(false)`（contact override=None）
+    /// → 经 resolve_operation_mode 回落 profile 默认范式 → 关静默门，即便 global=true。
+    #[test]
+    fn quiet_hours_honors_profile_level_override() {
+        let contact = contact_no_override();
+
+        // profile 级显式关静默门：把 operation_mode.quiet_hours.enabled_override 设 Some(false)。
+        let mut profile = crate::agent::domain_profile::default_domain_profile("default");
+        let mut om = crate::models::OperationMode::default();
+        om.quiet_hours.enabled_override = Some(false);
+        profile.operation_mode = om;
+        assert!(
+            !effective_quiet_hours_enabled(&contact, &profile, true),
+            "profile 级 Some(false) 应关静默门（即便 global=true）"
+        );
+
+        // 对照：DEFAULT profile（quiet_hours.enabled_override=None）+ contact override=None
+        // → 回落 global(true)，与改造前逐字等价（字节等价红线）。
+        let default_profile = crate::agent::domain_profile::default_domain_profile("default");
+        assert_eq!(
+            default_profile.operation_mode.quiet_hours.enabled_override, None,
+            "DEFAULT profile quiet_hours.enabled_override 必须是 None（字节等价铰链）"
+        );
+        assert!(
+            effective_quiet_hours_enabled(&contact, &default_profile, true),
+            "DEFAULT 全 None → 回落 global=true（字节等价）"
+        );
+        assert!(
+            !effective_quiet_hours_enabled(&contact, &default_profile, false),
+            "DEFAULT 全 None → 回落 global=false（字节等价）"
+        );
     }
 }

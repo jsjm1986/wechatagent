@@ -97,3 +97,65 @@
 }
 .submit:hover { background: #0a78ec; box-shadow: 0 10px 24px -12px rgba(10, 132, 255, .8), inset 0 1px 1px rgba(255, 255, 255, .35); }
 .submit:disabled { opacity: .5; cursor: not-allowed; box-shadow: inset 0 1px 1px rgba(255, 255, 255, .35); }
+
+/* ===== 销售素材库 ===== */
+
+/* 冲突提醒条 —— 暖色描边提示两边信息一致 */
+.hint {
+  margin: 0 0 14px; padding: 10px 13px; border-radius: var(--r-sm);
+  font-size: 12px; line-height: 1.55; letter-spacing: -.1px;
+  color: var(--ink-2); background: var(--fill-scheduled, rgba(10, 132, 255, .06));
+  border: 1px solid var(--hairline);
+}
+
+/* 复选行 */
+.checkboxField { display: flex; align-items: center; gap: 8px; }
+.checkboxField input { width: 16px; height: 16px; }
+.checkboxField span { font-size: 12.5px; color: var(--ink-2); }
+
+/* 文件选择行 */
+.fileInput { font-size: 12.5px; color: var(--ink-2); }
+
+/* 素材行：缩略图/文件卡 + 元信息 + 审核 */
+.mediaRow { display: flex; gap: 12px; align-items: flex-start; }
+.thumb {
+  width: 56px; height: 56px; flex-shrink: 0; border-radius: var(--r-sm);
+  object-fit: cover; border: 1px solid var(--hairline); background: var(--fill-inactive);
+}
+.fileCard {
+  width: 56px; height: 56px; flex-shrink: 0; border-radius: var(--r-sm);
+  display: flex; align-items: center; justify-content: center;
+  color: var(--ink-3); background: var(--fill-inactive); border: 1px solid var(--hairline);
+}
+.mediaMeta { flex: 1; min-width: 0; }
+.metaLine {
+  margin: 4px 0 0; font-size: 11.5px; color: var(--ink-3); letter-spacing: -.1px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+
+/* 审核状态徽标 */
+.badge {
+  flex-shrink: 0; font-size: 10.5px; font-weight: 600; letter-spacing: -.1px;
+  padding: 2px 9px; border-radius: 20px; border: 1px solid var(--hairline);
+}
+.badgeDraft { color: var(--ink-3); background: var(--fill-inactive); }
+.badgeApproved { color: var(--color-active, #1a8a4a); background: var(--fill-active, rgba(26, 138, 74, .1)); }
+
+/* 审核按钮 */
+.reviewBtn {
+  font: inherit; font-size: 12px; font-weight: 600; letter-spacing: -.1px;
+  margin-top: 8px; min-height: 0; padding: 7px 14px; border-radius: var(--r-sm); cursor: pointer;
+  display: inline-flex; align-items: center; gap: 6px;
+  color: #fff; background: var(--color-scheduled);
+  border: 1px solid rgba(10, 132, 255, .4);
+  box-shadow: inset 0 1px 1px rgba(255, 255, 255, .35);
+  transition: background .18s, opacity .18s;
+}
+.reviewBtn:hover { background: #0a78ec; }
+.reviewBtn:disabled { opacity: .5; cursor: not-allowed; }
+
+/* 区块分隔标题 */
+.sectionTitle {
+  font-size: 12px; font-weight: 600; color: var(--ink-2); letter-spacing: -.1px;
+  margin: 4px 0 10px;
+}

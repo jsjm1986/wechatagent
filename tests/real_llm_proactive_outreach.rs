@@ -343,6 +343,8 @@ async fn r2_5_1_quiet_hours_wake_reply_real() {
             dedupe_key: None,
             direction: MessageDirection::Inbound,
             content: text.to_string(),
+            msg_type: None,
+            media_ref: None,
             raw: None,
             created_at: DateTime::now(),
         };

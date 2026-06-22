@@ -132,10 +132,13 @@ async fn record_user_reaction_inner(
     // universal-domain-adaptation 第 18 点：同一极性也注入 reaction 分析 prompt，引导模型
     // 按本域语义判 outcomeStatus。提前到 analyze_user_reaction 之前加载以便传入。
     // DEFAULT_PROFILE seed 与回落同源 → 销售域 outcome/信号/prompt 字节等价。
-    let active_polarity =
+    // H17.4：同一次 load 也取出 trajectory_dimensions 传入 analyze_user_reaction，
+    // 让 reaction prompt 随 profile 声明轨迹维度（避免新增第二次 load）。
+    let active_profile =
         crate::agent::domain_profile::load_active_domain_profile(&state.db, &contact.workspace_id)
-            .await
-            .outcome_polarity;
+            .await;
+    let active_polarity = active_profile.outcome_polarity.clone();
+    let active_traj_dims = active_profile.trajectory_dimensions.clone();
     let reaction_analysis = if budget_exceeded {
         if let Some(b) = current_run_budget() {
             b.mark_degraded("reaction_skipped_budget_exceeded".to_string());
@@ -153,6 +156,7 @@ async fn record_user_reaction_inner(
             inbound,
             Some(run_id_owned.as_str()),
             &active_polarity,
+            &active_traj_dims,
         )
         .await
         .unwrap_or_else(|_| {
@@ -200,6 +204,7 @@ async fn record_user_reaction_inner(
         contact,
         &outcome_for_outbox,
         &reaction_analysis_for_trajectory,
+        &active_traj_dims,
     )
     .await
     {
@@ -278,6 +283,7 @@ async fn analyze_user_reaction(
     inbound: &ConversationMessage,
     run_id: Option<&str>,
     polarity: &crate::models::OutcomePolarity,
+    traj_dims: &[crate::models::TrajectoryDimension],
 ) -> AppResult<Document> {
     let memory = load_or_create_operating_memory(state, contact).await?;
     let system = prompts::load_prompt(
@@ -296,8 +302,12 @@ async fn analyze_user_reaction(
     // 之后追加一段本域 outcome 词表说明，引导模型按本行业语义判 outcomeStatus（而非套用
     // 写死的销售七态）。DEFAULT/老库（polarity == 销售默认）时返回 None → prompt 字节等价。
     let domain_addendum = reaction_polarity_prompt_addendum(polarity);
+    // H17.4：active profile 声明了非 objection_type 轨迹维度时，追加一段说明，指示
+    // LLM 在 JSON 里额外输出每维 camelCase key（写侧据此填 dimensions 容器）。
+    // DEFAULT（单维 objection_type / 空）返回 None → prompt 字节等价。
+    let traj_addendum = reaction_trajectory_prompt_addendum(traj_dims);
     let user = format!(
-        r#"{}{}
+        r#"{}{}{}
 
 客户 wxid: {}
 客户昵称: {}
@@ -311,6 +321,7 @@ async fn analyze_user_reaction(
 {}"#,
         task,
         domain_addendum.as_deref().unwrap_or(""),
+        traj_addendum.as_deref().unwrap_or(""),
         contact.wxid,
         contact.nickname.clone().unwrap_or_default(),
         // task 6.3：`effective_memory_card` 现在返回 `MemoryCardTyped`；
@@ -408,6 +419,49 @@ pub(crate) fn reaction_polarity_prompt_addendum(
          负向（受阻 / 客户退却 / 明确停止）outcome 词：{negative}\n\
          请从上述词集中选择最贴合本次客户回复语义的一项填入 outcomeStatus；\
          若都不贴合则填 user_replied_unclassified。",
+    ))
+}
+
+/// H17.4：reaction 分析 prompt 的轨迹维度随 active profile 声明。
+///
+/// 写侧 [`push_intent_trajectory_entry`] 按 active profile 的 `trajectory_dimensions`
+/// 读取 `reaction_analysis[camelCase(dim.kind)]`，但 `user.reaction.task` prompt 只写死
+/// 让 LLM 产 `objectionType`（销售单维）——非销售 profile 声明了其它维度（如
+/// `concern_type` / `relationship_signal`）时，LLM 从不被告知要输出这些 key →
+/// `dimensions` 容器实战恒空。本函数把 profile 声明的**非 objection_type** 维度的
+/// camelCase JSON key + display_name 列给模型，指示它在 JSON 里额外输出这些字段。
+///
+/// **抽象机制（反过拟合红线）**：列表完全由 `dims` 参数化，无任何销售 / 单条对话专属话术，
+/// 对任意 profile 声明的维度通用。camelCase 转换复用与写侧同一个 [`snake_to_camel`]，
+/// 保证 prompt 给出的 key 与写侧读取的 key 逐字一致（否则 LLM 产的 key 写侧找不到）。
+///
+/// **字节等价红线**：`dims` 为空，或恰为 DEFAULT 单维（`len==1 && kind=="objection_type"`，
+/// 即 `default_trajectory_dimensions()` 的形状）时返回 `None` —— DEFAULT/老库的 reaction
+/// prompt 与改造前逐字一致（`objection_type` 走旧 `objectionType` 字段路径，不在此列出）。
+pub(crate) fn reaction_trajectory_prompt_addendum(
+    dims: &[crate::models::TrajectoryDimension],
+) -> Option<String> {
+    // DEFAULT/老库：空集，或仅单维 objection_type（旧字段路径）→ 字节等价，不追加。
+    if dims.is_empty() || (dims.len() == 1 && dims[0].kind == "objection_type") {
+        return None;
+    }
+    // 过滤 objection_type 自身（它走 legacy `objectionType` 字段，不在 dimensions 容器）。
+    let lines: Vec<String> = dims
+        .iter()
+        .filter(|d| d.kind != "objection_type")
+        .map(|d| format!("- {}（{}）", snake_to_camel(&d.kind), d.display_name))
+        .collect();
+    if lines.is_empty() {
+        // 仅含 objection_type（多份重复声明等边界）→ 仍按 DEFAULT 字段路径，不追加。
+        return None;
+    }
+    Some(format!(
+        "\n\n【本业务轨迹维度（请在输出 JSON 中额外提供以下字段）】\n\
+         除既有字段外，若本次客户回复可归类，请额外输出下列轨迹维度字段（JSON 键 = camelCase，\
+         括号内为该维度含义，仅在能明确归类时填写、否则省略该字段）：\n\
+         {}\n\
+         这些字段用于记录本业务的客户互动轨迹，请按本域语义判定填写。",
+        lines.join("\n"),
     ))
 }
 
@@ -606,6 +660,25 @@ pub(crate) fn format_reaction_hint(recent: &[Document]) -> String {
     buf
 }
 
+/// snake_case → camelCase（最小实现）：用于把 trajectory 维度 kind（snake）映射到
+/// reaction_analysis 的 camelCase 字段名（LLM JSON 约定）。`objection_type` → `objectionType`。
+/// 已是单段（无下划线）时原样返回。
+fn snake_to_camel(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut upper_next = false;
+    for ch in s.chars() {
+        if ch == '_' {
+            upper_next = true;
+        } else if upper_next {
+            out.extend(ch.to_uppercase());
+            upper_next = false;
+        } else {
+            out.push(ch);
+        }
+    }
+    out
+}
+
 /// Phase D / D1：把一条 intent 轨迹追加到 `contacts.intent_trajectory`，并在
 /// mongo 端用 `$push + $slice: -50` 维持上限滑窗。
 ///
@@ -617,6 +690,7 @@ pub(crate) async fn push_intent_trajectory_entry(
     contact: &Contact,
     outcome: &str,
     reaction_analysis: &Document,
+    traj_dims: &[crate::models::TrajectoryDimension],
 ) -> AppResult<()> {
     use mongodb::options::CountOptions;
 
@@ -635,26 +709,23 @@ pub(crate) async fn push_intent_trajectory_entry(
         .await
         .unwrap_or(0) as i32;
 
-    // objection_type 是 ReactionDerived 通道（字典 Taxonomy 源）。此前 LLM 产出裸写进
-    // 轨迹 entry 不过字典；这里过 validate_dimension_value(MachineWrite) 取归一值：
-    // Accept→落 canonical（alias 归一）；Drop→不落该字段（越界静默丢弃，轨迹是观测数据，
-    // 不进五闸/状态机，丢弃无副作用）。Reject 在机器通道按 spec 不出现，llm_signal_apply 兜底 None。
-    let raw_objection_type = doc_string(reaction_analysis, "objectionType")
-        .or_else(|| doc_string(reaction_analysis, "objection_type"))
-        .filter(|s| !s.trim().is_empty());
-    let objection_type = match raw_objection_type {
-        Some(raw) => {
-            let verdict = crate::agent::dimension_registry::validate_dimension_value(
-                &state.db,
-                "objection_type",
-                &raw,
-                &contact.account_id,
-                crate::agent::dimension_registry::WriteIntent::MachineWrite,
-            )
-            .await;
-            crate::agent::gateway::llm_signal_apply(verdict)
-        }
-        None => None,
+    // H17：轨迹维度随 active profile。DEFAULT 销售域 trajectory_dimensions 仅
+    // 单维 objection_type → 仍写 `objectionType` 旧字段（字节等价红线）；非销售
+    // profile 声明其它维度 → 过字典后落 `dimensions` 容器。
+    //
+    // 维度由调用方（record_user_reaction_inner）从已加载的 active profile 传入，
+    // 避免在写侧二次 load_active_domain_profile。空集 → 回落 DEFAULT 单维 objection_type
+    // （与 active profile 空 trajectory_dimensions 的回落同源，字节等价）。
+    //
+    // 每个 dim.kind 是 ReactionDerived 通道（字典 Taxonomy 源）：LLM 裸产出不进
+    // 轨迹，先过 validate_dimension_value(MachineWrite) 归一。Accept→落 canonical；
+    // Drop→不落该字段（越界静默丢弃，轨迹是观测数据，不进五闸/状态机，无副作用）。
+    let default_dims;
+    let traj_dims: &[crate::models::TrajectoryDimension] = if traj_dims.is_empty() {
+        default_dims = crate::agent::domain_profile::default_trajectory_dimensions();
+        &default_dims
+    } else {
+        traj_dims
     };
 
     let mut entry = doc! {
@@ -662,8 +733,33 @@ pub(crate) async fn push_intent_trajectory_entry(
         "intent": outcome,
         "recordedAt": DateTime::now(),
     };
-    if let Some(t) = objection_type.as_deref() {
-        entry.insert("objectionType", t);
+    let mut dim_container = doc! {};
+    for dim in traj_dims {
+        // reaction_analysis 字段名按 camelCase 写出（LLM JSON 约定），同时兜底 snake。
+        let raw = doc_string(reaction_analysis, &snake_to_camel(&dim.kind))
+            .or_else(|| doc_string(reaction_analysis, &dim.kind))
+            .filter(|s| !s.trim().is_empty());
+        let Some(raw) = raw else { continue };
+        let verdict = crate::agent::dimension_registry::validate_dimension_value(
+            &state.db,
+            &dim.kind,
+            &raw,
+            &contact.account_id,
+            crate::agent::dimension_registry::WriteIntent::MachineWrite,
+        )
+        .await;
+        let Some(canonical) = crate::agent::gateway::llm_signal_apply(verdict) else {
+            continue;
+        };
+        // DEFAULT 销售单维 objection_type → 写旧字段（字节等价）；其它维度 → dimensions 容器。
+        if dim.kind == "objection_type" {
+            entry.insert("objectionType", canonical);
+        } else {
+            dim_container.insert(&dim.kind, canonical);
+        }
+    }
+    if !dim_container.is_empty() {
+        entry.insert("dimensions", dim_container);
     }
 
     state
@@ -726,8 +822,13 @@ pub(crate) fn format_intent_trajectory_hint(
             "- 第{}轮 intent={}",
             entry.turn_index, entry.intent
         ));
+        // DEFAULT 销售：旧字段 objection_type 逐字渲染（字节等价）。
         if let Some(t) = entry.objection_type.as_deref() {
             buf.push_str(&format!(" objection_type={}", t));
+        }
+        // 非销售域：dimensions 容器（key 升序，BTreeMap 稳定）。
+        for (k, v) in &entry.dimensions {
+            buf.push_str(&format!(" {}={}", k, v));
         }
         buf.push('\n');
     }
@@ -1024,6 +1125,7 @@ mod a6_tests {
                 } else {
                     None
                 },
+                dimensions: Default::default(),
                 recorded_at: DateTime::from_millis(i as i64 * 1000),
             })
             .collect();
@@ -1040,6 +1142,44 @@ mod a6_tests {
         let pos_4 = hint.find("第4轮").unwrap();
         let pos_8 = hint.find("第8轮").unwrap();
         assert!(pos_4 < pos_8, "older turn should appear first");
+    }
+
+    /// H17：DEFAULT 销售域单维 objection_type → 读侧逐字不变（字节等价红线）。
+    #[test]
+    fn hint_default_objection_byte_equivalent() {
+        use mongodb::bson::DateTime;
+        let e = crate::models::IntentTrajectoryEntry {
+            turn_index: 2,
+            intent: "advance".into(),
+            objection_type: Some("price".into()),
+            dimensions: std::collections::BTreeMap::new(),
+            recorded_at: DateTime::from_millis(0),
+        };
+        let hint = format_intent_trajectory_hint(&[e]);
+        assert!(
+            hint.contains("第2轮 intent=advance objection_type=price"),
+            "DEFAULT 渲染逐字不变"
+        );
+    }
+
+    /// H17：非销售 profile 声明其它维度 → dimensions 容器被渲染。
+    #[test]
+    fn hint_renders_profile_dimension_from_container() {
+        use mongodb::bson::DateTime;
+        let mut dims = std::collections::BTreeMap::new();
+        dims.insert("concern_type".to_string(), "time".to_string());
+        let e = crate::models::IntentTrajectoryEntry {
+            turn_index: 5,
+            intent: "share".into(),
+            objection_type: None,
+            dimensions: dims,
+            recorded_at: DateTime::from_millis(0),
+        };
+        let hint = format_intent_trajectory_hint(&[e]);
+        assert!(
+            hint.contains("concern_type=time"),
+            "dimensions 容器维度被渲染"
+        );
     }
 
     /// 第18点：DEFAULT 销售极性 → reaction prompt 不追加任何说明（字节等价红线）。
@@ -1066,6 +1206,70 @@ mod a6_tests {
         assert!(addendum.contains("outcomeStatus"));
         // 仍保留兜底项，避免模型在词集都不贴合时乱填。
         assert!(addendum.contains("user_replied_unclassified"));
+    }
+
+    /// H17.4：DEFAULT 单维 objection_type → None（reaction prompt 字节等价红线）。
+    #[test]
+    fn trajectory_addendum_none_for_default() {
+        let dims = crate::agent::domain_profile::default_trajectory_dimensions();
+        assert!(
+            reaction_trajectory_prompt_addendum(&dims).is_none(),
+            "DEFAULT 单维 objection_type → None 字节等价"
+        );
+    }
+
+    /// H17.4：空轨迹维度集 → None（字节等价）。
+    #[test]
+    fn trajectory_addendum_none_for_empty() {
+        assert!(reaction_trajectory_prompt_addendum(&[]).is_none());
+    }
+
+    /// H17.4：非销售 profile 声明轨迹维度 → 追加 addendum 列 camelCase key + display_name。
+    #[test]
+    fn trajectory_addendum_lists_profile_dimensions() {
+        let dims = vec![crate::models::TrajectoryDimension {
+            kind: "concern_type".into(),
+            display_name: "顾虑类型".into(),
+        }];
+        let add = reaction_trajectory_prompt_addendum(&dims).expect("非销售维度须产 addendum");
+        // H17 命门：addendum 必须列出 writer 实际读取的 camelCase key。
+        // 旧断言带 `|| add.contains("concern_type")` 逃生口——即使 snake_to_camel 完全失效
+        // （原样返回 snake_case），测试仍假绿，反而失去验证 camelCase 转换的唯一锚点。
+        // 收紧为仅断言 camelCase 形态：snake_to_camel 回归即变红。
+        assert!(
+            add.contains("concernType"),
+            "addendum 须列出 writer 读取的 camelCase key concernType（不再接受 snake_case 逃生口）"
+        );
+        assert!(add.contains("顾虑类型"), "addendum 须含 display_name");
+    }
+
+    /// H17 命门直测：`snake_to_camel` 是轨迹 WRITE 路径（`push_intent_trajectory_entry`
+    /// 读 `reaction_analysis[snake_to_camel(dim.kind)]`）与 PROMPT addendum
+    /// （`reaction_trajectory_prompt_addendum` 列 `snake_to_camel(dim.kind)` 告知 LLM 输出哪个键）
+    /// 共同依赖的字节锚点。若它错了，LLM 输出的键 writer 永远不看 → `dimensions` 容器静默空着。
+    /// 本测为 characterization test：锁定当前实现实际行为（含边界），防止静默回归。
+    #[test]
+    fn snake_to_camel_converts_dimension_keys() {
+        // 典型维度键（writer/addendum 真实使用）。
+        assert_eq!(snake_to_camel("objection_type"), "objectionType");
+        assert_eq!(snake_to_camel("concern_type"), "concernType");
+        // 多段。
+        assert_eq!(
+            snake_to_camel("relationship_signal_kind"),
+            "relationshipSignalKind"
+        );
+        // 单段无下划线 → 原样。
+        assert_eq!(snake_to_camel("intent"), "intent");
+
+        // —— 边界 characterization：锁定当前实现实际行为（非理想行为）——
+        // 空串 → 空串。
+        assert_eq!(snake_to_camel(""), "");
+        // 末尾下划线被静默丢弃（upper_next 置位但无后续字符消费）。
+        assert_eq!(snake_to_camel("foo_"), "foo");
+        // 前导下划线会大写首字母（upper_next 在首字符前已置位）。
+        assert_eq!(snake_to_camel("_foo"), "Foo");
+        // 连续双下划线塌缩为一个分隔（第二个 `_` 不重置 upper_next，被静默吞掉）。
+        assert_eq!(snake_to_camel("a__b"), "aB");
     }
 
     /// 漂移 pin（审查 TEST-1/CORRECT-3）：reaction 本地的 `default_outcome_polarity_for_reaction`

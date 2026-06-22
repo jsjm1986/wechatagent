@@ -425,6 +425,35 @@ impl GapSignalCandidate {
         }
     }
 
+    /// 产品宣称被 `blocked_unverified_product_claim` 拦截时构造的缺口信号：
+    /// kind=recall_miss（携带客户问句进 search_queries，给运营对话式补录线索）。
+    ///
+    /// severity 取 `"high"`，与本文件现有 recall_miss 惯例（`knowledge_agent::
+    /// classify_recall_outcome` 召回偽阴性分支）对齐——产品宣称缺背书是会直接
+    /// 卡住成交弧的高优先缺口。dedup 走默认 `(kind, normalized_title)`：同一主题
+    /// 反复被拦时合并到同一条 pending 信号、累积 query 变体（见 `persist_recall_signal`）。
+    pub fn recall_miss_from_product_block(customer_query: String) -> Self {
+        let title = format!(
+            "产品宣称缺 verified 知识背书：{}",
+            customer_query.chars().take(40).collect::<String>()
+        );
+        let mut c = Self::new(
+            "recall_miss",
+            title,
+            "high",
+            Vec::new(),
+            Some(
+                "产品宣称被 blocked_unverified_product_claim 拦截：本 run 引用的知识\
+                 切片里没有任何 verified chunk 背书该产品声明。待运营据 search_queries \
+                 里的客户问句对话式补录 / verify 相关知识，使该缺口可被闭环修复。",
+            ),
+        );
+        if !customer_query.trim().is_empty() {
+            c.search_queries.push(customer_query);
+        }
+        c
+    }
+
     /// 去重键：默认 `(kind, normalized_title)`；但 broken_link / missing_chunk
     /// 是同一对 (from_chunk_id, target_chunk_id) 在 archive↔active 切换下的孪
     /// 生信号，必须把 dedup key 绑到具体的引用对上（用 affected_chunk_ids 前两
@@ -762,7 +791,7 @@ pub(crate) fn attributed_log_indices(
 /// （`DEFAULT_POSITIVE_OUTCOMES` / `DEFAULT_NEGATIVE_OUTCOMES`），非空 → 用 profile 声明的。
 /// DEFAULT_PROFILE 的 seed 显式填回这两组常量，故 DEFAULT 下解析结果与回落字节相等
 /// → 回路① 召回排序逐字等价。换行业（声明非空极性）时按本行业极性判定。
-fn resolve_effective_polarity(polarity: &crate::models::OutcomePolarity) -> (Vec<String>, Vec<String>) {
+pub(crate) fn resolve_effective_polarity(polarity: &crate::models::OutcomePolarity) -> (Vec<String>, Vec<String>) {
     let positive = if polarity.positive.is_empty() {
         DEFAULT_POSITIVE_OUTCOMES.iter().map(|s| s.to_string()).collect()
     } else {
@@ -1822,6 +1851,25 @@ mod tests {
             None::<&str>,
         );
         assert_eq!(a.dedup_key(), b.dedup_key());
+    }
+
+    #[test]
+    fn recall_miss_from_product_block_carries_query() {
+        let c = GapSignalCandidate::recall_miss_from_product_block("你们产品保几年质保".into());
+        assert_eq!(c.kind, "recall_miss");
+        assert!(c.search_queries.iter().any(|q| q.contains("质保")));
+        assert!(!c.dedup_key().is_empty());
+        // severity 与现有 recall_miss 惯例对齐
+        assert_eq!(c.severity, "high");
+    }
+
+    #[test]
+    fn recall_miss_from_product_block_empty_query_no_panic() {
+        // 拿不到客户问句（空串）时不 push 空 query，仍是合法 recall_miss 候选。
+        let c = GapSignalCandidate::recall_miss_from_product_block("   ".into());
+        assert_eq!(c.kind, "recall_miss");
+        assert!(c.search_queries.is_empty());
+        assert!(!c.dedup_key().is_empty());
     }
 
     // ---- P1 换血：classify_outcome_label 三态判定 ----

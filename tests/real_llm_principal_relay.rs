@@ -404,6 +404,8 @@ fn pending_escalation(short_code: &str, contact_wxid: &str, principal_wxid: &str
         created_at: now,
         updated_at: now,
         resolved_at: None,
+        resolved_via: None,
+        last_holding_reply_ms: None,
     }
 }
 

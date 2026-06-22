@@ -21,6 +21,7 @@ pub mod knowledge_task;
 pub mod knowledge_wiki;
 pub mod llm;
 pub mod mcp;
+pub mod media_storage;
 pub mod models;
 pub mod planner;
 pub mod prompts;

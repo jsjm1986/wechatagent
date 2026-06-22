@@ -5,6 +5,10 @@ import { api } from "../../lib/api";
 import { useUiStore } from "../../stores/uiStore";
 import { useStrategyStore } from "../../stores/strategyStore";
 import type { AgentSoul, PromptTemplate, PromptTemplateDraft, DomainProfile, DomainProfileDraft } from "../../types";
+import { ProfilePublishCard } from "../../components/review/ProfilePublishCard";
+import { LessonPromoteCard } from "../../components/review/LessonPromoteCard";
+import { ConfirmProvider } from "../../components/ui/ConfirmDialog";
+import { ToastProvider } from "../../components/ui/Toast";
 import styles from "./SystemStrategy.module.css";
 
 // 系统策略频道：全局总控 Prompt（人格/任务）+ 状态机灰度 + 双层标签字典 + 跨用户教训。
@@ -1029,8 +1033,7 @@ function ProfileEditor({
   onChange,
   onSave,
   onDelete,
-  onPublish,
-  onActivate,
+  onRefresh,
   busy,
 }: {
   profile: DomainProfile | null;
@@ -1038,8 +1041,7 @@ function ProfileEditor({
   onChange: (d: DomainProfileDraft) => void;
   onSave: () => void;
   onDelete: () => void;
-  onPublish: (id: string) => void;
-  onActivate: (id: string) => void;
+  onRefresh: () => void;
   busy: boolean;
 }) {
   const update = (patch: Partial<DomainProfileDraft>) => onChange({ ...draft, ...patch });
@@ -1792,26 +1794,7 @@ function ProfileEditor({
         </button>
         {profile && !profile.is_active && (
           <>
-            {!profile.current_version && (
-              <button
-                type="button"
-                className={styles.btnGhost}
-                onClick={() => onPublish(profile.id)}
-                disabled={busy}
-              >
-                发布
-              </button>
-            )}
-            {profile.current_version && (
-              <button
-                type="button"
-                className={styles.btnPrimary}
-                onClick={() => onActivate(profile.id)}
-                disabled={busy}
-              >
-                激活生效
-              </button>
-            )}
+            <ProfilePublishCard profileId={profile.id} onDone={onRefresh} />
             <button
               type="button"
               className={styles.btnGhost}
@@ -1842,9 +1825,6 @@ function DomainProfilePanel({ busy }: { busy: boolean }) {
     newDomainProfileDraft,
     setProfileDraft,
     saveDomainProfile,
-    publishDomainProfile,
-    confirmRiskyActivation,
-    activateDomainProfile,
     deleteDomainProfile,
     generateDomainProfile,
   } = useStrategyStore();
@@ -1862,29 +1842,6 @@ function DomainProfilePanel({ busy }: { busy: boolean }) {
 
   function handleProfileClick(profile: DomainProfile) {
     editDomainProfile(profile);
-  }
-
-  async function handlePublish(id: string) {
-    if (!window.confirm(
-      "确认发布此版本？\n\n普通字段（名称/简介/业务上下文等）发布后即时生效；" +
-      "若改动了高风险开关（人格本体/方法论/风控阈值/自学习极性等），会要求二次确认后才生效。"
-    )) return;
-    const pending = await publishDomainProfile(id);
-    // 危险开关变更：后端落旁路稿未即时生效，二次确认后经 rollout 才生效。
-    if (pending) {
-      const fields = pending.riskyFields.length > 0 ? pending.riskyFields.join("、") : "（未知字段）";
-      if (window.confirm(
-        `本次改动涉及高风险字段：${fields}。\n\n` +
-        "新版本已定稿但尚未生效，当前仍运行旧版本。确认这些改动无误并立即生效？"
-      )) {
-        await confirmRiskyActivation(pending.id);
-      }
-    }
-  }
-
-  async function handleActivate(id: string) {
-    if (!window.confirm("确认激活此行业配置？激活后所有 AI 对话将使用此配置。")) return;
-    await activateDomainProfile(id);
   }
 
   return (
@@ -2036,8 +1993,7 @@ function DomainProfilePanel({ busy }: { busy: boolean }) {
               onDelete={() => {
                 if (editingProfile) void deleteDomainProfile(editingProfile.id);
               }}
-              onPublish={handlePublish}
-              onActivate={handleActivate}
+              onRefresh={() => void loadDomainProfiles()}
               busy={busy}
             />
           ) : (
@@ -2058,10 +2014,6 @@ function LessonsLearnedAdmin({ busy }: { busy: boolean }) {
   const [error, setError] = useState<string | null>(null);
   const [patternKind, setPatternKind] = useState<string>("");
   const [promoting, setPromoting] = useState<string | null>(null); // lesson_id
-  const [draftTitle, setDraftTitle] = useState("");
-  const [draftBody, setDraftBody] = useState("");
-  const [draftSummary, setDraftSummary] = useState("");
-  const [promoteError, setPromoteError] = useState<string | null>(null);
 
   async function reload() {
     setLoading(true);
@@ -2083,42 +2035,10 @@ function LessonsLearnedAdmin({ busy }: { busy: boolean }) {
 
   function openPromote(lessonId: string) {
     setPromoting(lessonId);
-    setDraftTitle("");
-    setDraftBody("");
-    setDraftSummary("");
-    setPromoteError(null);
   }
 
   function closePromote() {
     setPromoting(null);
-    setDraftTitle("");
-    setDraftBody("");
-    setDraftSummary("");
-    setPromoteError(null);
-  }
-
-  async function submitPromote() {
-    if (!promoting) return;
-    if (!draftTitle.trim() || !draftBody.trim()) {
-      setPromoteError("title 和 body 都不能为空");
-      return;
-    }
-    setPromoteError(null);
-    try {
-      const payload: Record<string, string> = {
-        title: draftTitle.trim(),
-        body: draftBody.trim(),
-      };
-      if (draftSummary.trim()) payload.summary = draftSummary.trim();
-      await api.post(
-        `/api/admin/lessons-learned/${encodeURIComponent(promoting)}/promote-to-peer-case`,
-        payload
-      );
-      closePromote();
-      void reload();
-    } catch (e) {
-      setPromoteError((e as Error).message);
-    }
   }
 
   useEffect(() => {
@@ -2226,46 +2146,13 @@ function LessonsLearnedAdmin({ busy }: { busy: boolean }) {
               )}
               {promoting === item.lessonId && (
                 <div className={styles.versionedListChunk} style={{ gridColumn: "1 / -1" }}>
-                  <span>晋升为 peer_case 候选 chunk（仍需 admin 在知识审核队列 verify）</span>
-                  <div className={styles.promoteForm}>
-                    <input
-                      className={styles.input}
-                      type="text"
-                      placeholder="title（≤ 200 字）"
-                      value={draftTitle}
-                      onChange={(e) => setDraftTitle(e.target.value)}
-                      maxLength={200}
-                    />
-                    <input
-                      className={styles.input}
-                      type="text"
-                      placeholder="summary（一句话，可选）"
-                      value={draftSummary}
-                      onChange={(e) => setDraftSummary(e.target.value)}
-                    />
-                    <textarea
-                      className={styles.textarea}
-                      placeholder="body：案例正文（≤ 4000 字）"
-                      value={draftBody}
-                      onChange={(e) => setDraftBody(e.target.value)}
-                      rows={6}
-                      maxLength={4000}
-                    />
-                    {promoteError && <div className={styles.inlineError}>{promoteError}</div>}
-                    <div className={styles.buttonRow}>
-                      <button
-                        type="button"
-                        className={styles.btnPrimary}
-                        onClick={() => void submitPromote()}
-                        disabled={busy || !draftTitle.trim() || !draftBody.trim()}
-                      >
-                        提交晋升
-                      </button>
-                      <button type="button" className={styles.btnGhost} onClick={closePromote}>
-                        取消
-                      </button>
-                    </div>
-                  </div>
+                  <LessonPromoteCard
+                    lessonId={item.lessonId}
+                    onDone={() => {
+                      closePromote();
+                      void reload();
+                    }}
+                  />
                 </div>
               )}
             </div>
@@ -2277,6 +2164,18 @@ function LessonsLearnedAdmin({ busy }: { busy: boolean }) {
 }
 
 export default function SystemStrategyFeature() {
+  // 卡片（ProfilePublishCard 等中立化处置卡）用 useConfirm/useToast，必须有 Provider 祖先，
+  // 否则运行时抛错。原 body 原封不动搬进 SystemStrategyInner，此处只加外层 Provider 包裹。
+  return (
+    <ConfirmProvider>
+      <ToastProvider>
+        <SystemStrategyInner />
+      </ToastProvider>
+    </ConfirmProvider>
+  );
+}
+
+function SystemStrategyInner() {
   const busy = useUiStore((s) => s.busy);
   const {
     souls,

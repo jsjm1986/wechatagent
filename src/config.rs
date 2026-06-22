@@ -132,6 +132,14 @@ pub struct AppConfig {
     /// Phase D / D3：单 account 当日最多 emit 多少条冷重激活 follow_up；
     /// 与 strategic_planner_daily_emit_cap 解耦，避免拖累常规 follow_up。默认 5。
     pub cold_contact_daily_emit_cap: i64,
+    /// 决策请示通道：领导链尾失联（无更多决策人可改派）时，给客户发 AI 延期安抚
+    /// 话术的最小间隔（小时）。去重用——每 worker tick 都可能命中链尾超时，限频防刷屏。默认 6.0。
+    pub holding_reply_min_interval_hours: f64,
+    /// ④ 账号级发送软上限：单账号当日（UTC 日界起）`agent_send_outbox`
+    /// `status=sent` 的总发送量达到该值时，发送主路径记一条 warning 审计事件
+    /// （`agent.account_daily_send_soft_cap_exceeded`）告警防封号。**仅告警，
+    /// 不拦截、不排队、不改变发送行为**——观测先行。默认 500（保守高值）。
+    pub account_daily_send_soft_cap: i64,
 
     // ── 自学习采集管道（第一阶段）：行为信号 + 沉默删失 + 止血 ──
     //
@@ -318,6 +326,19 @@ pub struct AppConfig {
     pub jwt_private_key_pem: Option<String>,
     /// RS256 公钥 PEM。`jwt_enabled=true` 时必填，用于 verify。
     pub jwt_public_key_pem: Option<String>,
+
+    // ── 销售素材文件发送 ──
+    /// 销售素材文件本地存储根目录。默认 "./media"；生产 117 为 "/opt/wechatagent/media"。
+    pub media_storage_dir: String,
+    /// 单个素材上传大小上限（MB）。默认 50。
+    pub media_max_file_size_mb: u64,
+    /// MCP media_id 缓存有效期（小时），过期重传。默认 24。
+    pub media_id_cache_ttl_hours: i64,
+    /// 唤醒任务 per-contact 确定性 jitter 上限（秒）。静默期延后的发送/入站全部重排到
+    /// 次日 quiet_hours_end（如 8:00），同 workspace 多客户会整点齐发；给 next_wake_at
+    /// 加按 contact.wxid 派生的 [0, 该值] 秒偏移把唤醒散开，避峰且更像真人。默认 900（15min）。
+    /// 设 0 关闭 jitter（恒整点）。env `WAKE_JITTER_MAX_SECONDS`。
+    pub wake_jitter_max_seconds: u32,
 }
 
 /// 手写 `Debug` 实现：把所有 secret 字段过 [`mask_secret`]，避免日志/panic
@@ -521,6 +542,9 @@ impl AppConfig {
             )),
             cold_contact_threshold_hours: env_or("COLD_CONTACT_THRESHOLD_HOURS", "168").parse()?,
             cold_contact_daily_emit_cap: env_or("COLD_CONTACT_DAILY_EMIT_CAP", "5").parse()?,
+            holding_reply_min_interval_hours: env_or("HOLDING_REPLY_MIN_INTERVAL_HOURS", "6.0")
+                .parse()?,
+            account_daily_send_soft_cap: env_or("ACCOUNT_DAILY_SEND_SOFT_CAP", "500").parse()?,
             // ── 自学习采集管道（第一阶段） ──
             silence_signal_worker_enabled: parse_bool(&env_or(
                 "SILENCE_SIGNAL_WORKER_ENABLED",
@@ -660,6 +684,10 @@ impl AppConfig {
             jwt_public_key_pem: env::var("JWT_PUBLIC_KEY_PEM")
                 .ok()
                 .filter(|s| !s.trim().is_empty()),
+            media_storage_dir: env_or("MEDIA_STORAGE_DIR", "./media"),
+            media_max_file_size_mb: env_or("MEDIA_MAX_FILE_SIZE_MB", "50").parse()?,
+            media_id_cache_ttl_hours: env_or("MEDIA_ID_CACHE_TTL_HOURS", "24").parse()?,
+            wake_jitter_max_seconds: env_or("WAKE_JITTER_MAX_SECONDS", "900").parse()?,
         })
     }
 }
@@ -677,4 +705,28 @@ fn parse_bool(value: &str) -> bool {
         value.trim().to_ascii_lowercase().as_str(),
         "1" | "true" | "yes" | "on"
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 销售素材三配置的默认值（与 `.env.example` / brief 约定一致）。
+    /// 直接断言 `from_env` 用的同款 `env_or(key, default)` 默认串解析结果，
+    /// 避免改动进程全局 env（并行测试下会互相污染）。
+    #[test]
+    fn media_config_defaults() {
+        // MEDIA_STORAGE_DIR：未设时默认 "./media"。
+        assert_eq!(env_or("MEDIA_STORAGE_DIR_UNSET_XYZ", "./media"), "./media");
+        // MEDIA_MAX_FILE_SIZE_MB：默认 50，解析为 u64。
+        let max_mb: u64 = env_or("MEDIA_MAX_FILE_SIZE_MB_UNSET_XYZ", "50")
+            .parse()
+            .expect("default media max file size must parse as u64");
+        assert_eq!(max_mb, 50);
+        // MEDIA_ID_CACHE_TTL_HOURS：默认 24，解析为 i64。
+        let ttl_hours: i64 = env_or("MEDIA_ID_CACHE_TTL_HOURS_UNSET_XYZ", "24")
+            .parse()
+            .expect("default media id cache ttl must parse as i64");
+        assert_eq!(ttl_hours, 24);
+    }
 }

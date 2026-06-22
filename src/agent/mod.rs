@@ -38,15 +38,19 @@ mod guards;
 pub mod knowledge_agent;
 mod knowledge_router;
 mod knowledge_tools;
+mod media_send;
 mod memory;
+pub(crate) mod multimodal;
 pub(crate) mod prompt_isolation;
 pub(crate) mod quiet_hours;
 mod tool_loop;
 pub(crate) mod outbox;
 pub(crate) mod outbox_dispatcher;
 mod reaction;
+mod referral;
 mod review;
 pub(crate) mod runtime;
+pub(crate) mod send_ledger;
 pub mod run_envelope;
 mod simulation;
 pub(crate) mod taxonomy;
@@ -74,6 +78,7 @@ pub(crate) use decision::load_user_operation_domain_config_for_contact;
 pub(crate) use decision::load_user_operation_domain_config;
 pub(crate) use decision::initial_operation_state_for_contact;
 pub(crate) use guards::initial_operation_state_key;
+pub(crate) use guards::initial_operation_state_key_in_machine;
 pub use gateway::{
     handle_follow_up_task, handle_managed_message, handle_managed_message_aggregated,
     send_contact_message_gateway, write_event_for_account,
@@ -103,8 +108,8 @@ pub use outbox_dispatcher::run_outbox_dispatcher;
 // `tests/outbox_integration.rs` 集成测试驱动；不应在生产代码中绕过 `tick`
 // / `process_entry` 直接调用这些 helper。
 pub use outbox_dispatcher::{
-    atomic_claim_pending, cancel_entry, process_entry, reclaim_expired_leases,
-    schedule_retry_or_terminal, second_safety_gate,
+    atomic_claim_pending, cancel_entry, defer_account_offline, process_entry,
+    reclaim_expired_leases, schedule_retry_or_terminal, second_safety_gate,
 };
 // outbox 公共 API（enqueue + 取消通道 + 类型）的对外重导出，集成测试需要。
 pub use outbox::{
@@ -147,6 +152,11 @@ pub use review::review_passed;
 pub use review::review_fixed_candidate_for_test;
 pub use runtime::UserRuntimeParameters;
 pub use runtime::{resolve_thresholds, ResolvedThresholds};
+// 簇 B 缺口 6：把 target_stages 归一/校验函数暴露给 tests crate，使
+// annotation_quality_gate_integration.rs 能直驱「alias→canonical 真归一」与
+// 「字典越界 → Err」端到端校验（upload handler 取 Multipart extractor，tests 无法
+// 手工构造，故直驱本函数验证落库前的归一语义）。
+pub use dimension_registry::normalize_target_stages;
 pub use types::{DecisionReviewResult, RawAgentDecision, ReviewScores};
 
 // agent-autonomy-loop W3 / Task 4.14：P4 PBT 已随销售域守卫一起删除（2026-05-25
@@ -595,6 +605,8 @@ mod tests {
             seeded_by: None,
             principal_decider: None,
             high_risk_escalation_mode: None,
+            ask_human_policy: None,
+            assist_mode_enabled: None,
         };
         let mut decision = AgentDecision {
             operation_state: Some("需求探索".to_string()),
@@ -807,6 +819,8 @@ mod tests {
             seeded_by: None,
             principal_decider: None,
             high_risk_escalation_mode: None,
+            ask_human_policy: None,
+            assist_mode_enabled: None,
         }
     }
 

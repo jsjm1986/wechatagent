@@ -386,6 +386,8 @@ fn make_inbound(contact: &Contact, message_id: &str, content: &str) -> Conversat
         dedupe_key: None,
         direction: MessageDirection::Inbound,
         content: content.to_string(),
+        msg_type: None,
+        media_ref: None,
         raw: None,
         created_at: DateTime::now(),
     }
@@ -408,6 +410,8 @@ fn make_dated_message(
         dedupe_key: None,
         direction,
         content: content.to_string(),
+        msg_type: None,
+        media_ref: None,
         raw: None,
         created_at,
     }

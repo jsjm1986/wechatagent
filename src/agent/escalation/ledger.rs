@@ -11,23 +11,6 @@ use crate::models::{
 use crate::routes::AppState;
 use mongodb::bson::{doc, DateTime};
 
-/// 读取该 workspace+domain 的领导 wxid。未配置返回 None（= 请示通道未启用）。
-pub(crate) async fn principal_decider_wxid(
-    state: &AppState,
-    workspace_id: &str,
-    domain: &str,
-) -> AppResult<Option<String>> {
-    let cfg = state
-        .db
-        .operation_domain_configs()
-        .find_one(
-            doc! { "workspace_id": workspace_id, "domain": domain, "current_version": true },
-            None,
-        )
-        .await?;
-    Ok(cfg.and_then(|c| c.principal_decider))
-}
-
 /// 插入一条 pending 台账。短码碰撞（短码唯一索引报错）时换种子重试至多 5 次。
 ///
 /// 返回 `Ok(Some(entry))` = 成功插入；`Ok(None)` = 同客户同类别已有 pending
@@ -69,9 +52,11 @@ pub(crate) async fn insert_pending_escalation(
             authorization_expires_at: None,
             is_generalizable,
             knowledge_proposal_emitted: false,
+            last_holding_reply_ms: None,
             created_at: now,
             updated_at: now,
             resolved_at: None,
+            resolved_via: None,
         };
         match state
             .db
@@ -155,6 +140,7 @@ pub(crate) async fn resolve_escalation(
     short_code: &str,
     decision: &PrincipalDecision,
     authorization_expires_at: Option<DateTime>,
+    resolved_via: &str,
 ) -> AppResult<Option<AgentPrincipalEscalation>> {
     let now = DateTime::now();
     let decision_bson = mongodb::bson::to_bson(decision)?;
@@ -163,6 +149,7 @@ pub(crate) async fn resolve_escalation(
         "decision": decision_bson,
         "updated_at": now,
         "resolved_at": now,
+        "resolved_via": resolved_via,
     };
     if let Some(exp) = authorization_expires_at {
         set.insert("authorization_expires_at", exp);
@@ -273,4 +260,119 @@ pub(crate) async fn enqueue_relay_task(state: &AppState, entry: &AgentPrincipalE
     };
     state.db.tasks().insert_one(&task, None).await?;
     Ok(())
+}
+
+/// 按 workspace + status 列请示台账（admin 收件箱/SLA 看板用），created_at 升序。
+pub(crate) async fn list_escalations_by_workspace(
+    state: &AppState,
+    workspace_id: &str,
+    status: &str,
+) -> AppResult<Vec<AgentPrincipalEscalation>> {
+    use futures::TryStreamExt;
+    let cursor = state
+        .db
+        .agent_principal_escalations()
+        .find(
+            doc! { "workspace_id": workspace_id, "status": status },
+            mongodb::options::FindOptions::builder()
+                .sort(doc! { "created_at": 1 })
+                .build(),
+        )
+        .await?;
+    Ok(cursor.try_collect().await?)
+}
+
+/// 改派 pending 请示到另一位决策人（仅 pending 可改派；workspace 约束防 IDOR）。
+///
+/// 仅在推卡成功后调用，落库同时刷新 updated_at，使 age（scan 用 now-updated_at）自"改派
+/// 成功时刻"起算——新决策人由此获得完整 timeout 窗。
+pub(crate) async fn reassign_escalation(
+    state: &AppState,
+    workspace_id: &str,
+    short_code: &str,
+    to_wxid: &str,
+) -> AppResult<Option<AgentPrincipalEscalation>> {
+    let updated = state
+        .db
+        .agent_principal_escalations()
+        .find_one_and_update(
+            doc! {
+                "workspace_id": workspace_id,
+                "short_code": short_code,
+                "status": PRINCIPAL_ESCALATION_STATUS_PENDING,
+            },
+            doc! { "$set": { "principal_wxid": to_wxid, "updated_at": DateTime::now() } },
+            mongodb::options::FindOneAndUpdateOptions::builder()
+                .return_document(mongodb::options::ReturnDocument::After)
+                .build(),
+        )
+        .await?;
+    Ok(updated)
+}
+
+/// 更新链尾安抚话术发送时刻（去重用）。仅 pending 可更新。
+pub(crate) async fn touch_last_holding_reply_ms(
+    state: &AppState,
+    workspace_id: &str,
+    short_code: &str,
+    now_ms: i64,
+) -> AppResult<()> {
+    state
+        .db
+        .agent_principal_escalations()
+        .update_one(
+            doc! {
+                "workspace_id": workspace_id,
+                "short_code": short_code,
+                "status": PRINCIPAL_ESCALATION_STATUS_PENDING,
+            },
+            doc! { "$set": { "last_holding_reply_ms": now_ms } },
+            None,
+        )
+        .await?;
+    Ok(())
+}
+
+/// 统计某决策人当日（since_ms 起）已被推送的请示卡数（骚扰门 daily_push_cap 用）。
+/// 以 pending 台账 created_at 作为推送时刻近似（每条 pending = 一次推卡）。
+pub(crate) async fn count_pushes_today(
+    state: &AppState,
+    workspace_id: &str,
+    principal_wxid: &str,
+    since_ms: i64,
+) -> AppResult<u32> {
+    let count = state
+        .db
+        .agent_principal_escalations()
+        .count_documents(
+            doc! {
+                "workspace_id": workspace_id,
+                "principal_wxid": principal_wxid,
+                "created_at": { "$gte": DateTime::from_millis(since_ms) },
+            },
+            None,
+        )
+        .await?;
+    Ok(count as u32)
+}
+
+/// 查某决策人最近一次被推卡的时刻（毫秒）——骚扰门 dedupe_window_hours 用。
+/// 以台账 created_at 作推送时刻近似（与 count_pushes_today 同口径，:310）。
+/// 无任何台账 → None（首次推卡，dedupe 不拦）。
+pub(crate) async fn latest_push_ms(
+    state: &AppState,
+    workspace_id: &str,
+    principal_wxid: &str,
+) -> AppResult<Option<i64>> {
+    let latest = state
+        .db
+        .agent_principal_escalations()
+        .find_one(
+            doc! { "workspace_id": workspace_id, "principal_wxid": principal_wxid },
+            mongodb::options::FindOneOptions::builder()
+                .sort(doc! { "created_at": -1 })
+                .build(),
+        )
+        .await?;
+    Ok(latest.map(|e| e.created_at.timestamp_millis()))
 }

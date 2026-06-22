@@ -45,6 +45,8 @@ pub(super) struct OperationDomainRequest {
     runtime_parameters: Document,
     #[serde(default)]
     state_machine: Document,
+    #[serde(default)]
+    assist_mode_enabled: Option<bool>,
 }
 
 pub(super) async fn list_operation_domains(
@@ -74,7 +76,7 @@ pub(super) async fn list_operation_domains(
     Ok(Json(json!({ "items": items })))
 }
 
-pub(super) async fn get_operation_domain(
+pub async fn get_operation_domain(
     State(state): State<AppState>,
     Extension(admin): Extension<AuthenticatedAdmin>,
     Path(domain): Path<String>,
@@ -94,6 +96,26 @@ pub(super) async fn update_operation_domain(
     validate_state_machine(&payload.state_machine)?;
     normalize_state_machine_allow_from_any(&mut payload.state_machine);
     ensure_operation_domains(&state, &admin.current_workspace).await?;
+    // G06：直编路由改状态机本体后联动重派 policy（否则 forbidsProactive 新增 state 主动触达门
+    // fail-open 静默失效）。$set 会 move payload.state_machine，故先 clone 出本体喂 reconcile。
+    let state_machine_for_policy = payload.state_machine.clone();
+    let mut set_doc = doc! {
+        "name": payload.name,
+        "goal": payload.goal,
+        "methodology": payload.methodology,
+        "workflow": payload.workflow,
+        "tool_policy": payload.tool_policy,
+        "automation_policy": payload.automation_policy,
+        "review_policy": payload.review_policy,
+        "runtime_parameters": payload.runtime_parameters,
+        "state_machine": payload.state_machine,
+        "status": "active",
+        "updated_at": DateTime::now(),
+    };
+    // 辅助模式账号级总开关：None 时不写入（保留既有值，避免误覆盖）。
+    if let Some(v) = payload.assist_mode_enabled {
+        set_doc.insert("assist_mode_enabled", v);
+    }
     state
         .db
         .operation_domain_configs()
@@ -106,24 +128,22 @@ pub(super) async fn update_operation_domain(
                 // 老 row（无 current_version 字段）继续被命中。
                 "current_version": { "$ne": false },
             },
-            doc! {
-                "$set": {
-                    "name": payload.name,
-                    "goal": payload.goal,
-                    "methodology": payload.methodology,
-                    "workflow": payload.workflow,
-                    "tool_policy": payload.tool_policy,
-                    "automation_policy": payload.automation_policy,
-                    "review_policy": payload.review_policy,
-                    "runtime_parameters": payload.runtime_parameters,
-                    "state_machine": payload.state_machine,
-                    "status": "active",
-                    "updated_at": DateTime::now()
-                }
-            },
+            doc! { "$set": set_doc },
             None,
         )
         .await?;
+    // G06：$set 成功后按新本体重派 policy current 行（statemachine_edit: 溯源标，
+    // 通过 is_refreshable_policy_seeded_by 判定为机器派生行，下次 publish 可刷新）。
+    let policy_seeded_by = format!("statemachine_edit:{}", &domain);
+    crate::routes::admin_ops_versions::reconcile_state_policies_for_machine(
+        &state.db,
+        &admin.current_workspace,
+        &domain,
+        &state_machine_for_policy,
+        &policy_seeded_by,
+        DateTime::now(),
+    )
+    .await;
     Ok(Json(json!({ "ok": true })))
 }
 
@@ -137,7 +157,7 @@ pub(super) async fn get_operation_domain_state_machine(
     Ok(Json(json!({ "item": config.state_machine })))
 }
 
-pub(super) async fn update_operation_domain_state_machine(
+pub async fn update_operation_domain_state_machine(
     State(state): State<AppState>,
     Extension(admin): Extension<AuthenticatedAdmin>,
     Path(domain): Path<String>,
@@ -146,6 +166,8 @@ pub(super) async fn update_operation_domain_state_machine(
     ensure_operation_domains(&state, &admin.current_workspace).await?;
     validate_state_machine(&payload)?;
     normalize_state_machine_allow_from_any(&mut payload);
+    // G06：$set 会 move payload（payload 本身即 state_machine Document），先 clone 喂 reconcile。
+    let state_machine_for_policy = payload.clone();
     state
         .db
         .operation_domain_configs()
@@ -164,6 +186,57 @@ pub(super) async fn update_operation_domain_state_machine(
             None,
         )
         .await?;
+    // G06：直编状态机本体后联动重派 policy（否则 forbidsProactive 新增 state 主动触达门
+    // fail-open 静默失效）。statemachine_edit: 溯源标可被 is_refreshable_policy_seeded_by 识别。
+    let policy_seeded_by = format!("statemachine_edit:{}", &domain);
+    crate::routes::admin_ops_versions::reconcile_state_policies_for_machine(
+        &state.db,
+        &admin.current_workspace,
+        &domain,
+        &state_machine_for_policy,
+        &policy_seeded_by,
+        DateTime::now(),
+    )
+    .await;
+    Ok(Json(json!({ "ok": true })))
+}
+
+/// PUT /api/admin/operation-domains/:domain/ask-human-policy
+/// $set ask_human_policy 到 current_version 行（不 bump 版本，贴生产 admin 编辑语义）。
+pub async fn put_ask_human_policy(
+    State(state): State<AppState>,
+    Extension(admin): Extension<AuthenticatedAdmin>,
+    Path(domain): Path<String>,
+    Json(policy): Json<crate::models::AskHumanPolicy>,
+) -> AppResult<Json<Value>> {
+    // 校验：decider_chain wxid 非空；quiet_hours 小时范围。
+    for d in &policy.decider_chain {
+        if d.wxid.trim().is_empty() {
+            return Err(AppError::BadRequest("decider_chain wxid 不能为空".into()));
+        }
+    }
+    if let Some(qh) = &policy.quiet_hours {
+        if qh.start_hour > 23 || qh.end_hour > 23 {
+            return Err(AppError::BadRequest("quiet_hours 小时须 0-23".into()));
+        }
+    }
+    let policy_bson = mongodb::bson::to_bson(&policy)?;
+    let res = state
+        .db
+        .operation_domain_configs()
+        .update_one(
+            doc! {
+                "workspace_id": &admin.current_workspace,
+                "domain": &domain,
+                "current_version": true,
+            },
+            doc! { "$set": { "ask_human_policy": policy_bson, "updated_at": DateTime::now() } },
+            None,
+        )
+        .await?;
+    if res.matched_count == 0 {
+        return Err(AppError::NotFound("operation domain 当前版本不存在".into()));
+    }
     Ok(Json(json!({ "ok": true })))
 }
 
@@ -211,12 +284,14 @@ pub(super) fn operation_domain_json(config: OperationDomainConfig) -> Value {
         "reviewPolicy": config.review_policy,
         "runtimeParameters": config.runtime_parameters,
         "stateMachine": config.state_machine,
+        "assistModeEnabled": config.assist_mode_enabled,
         "status": config.status,
         "updatedAt": crate::models::dt_to_string(config.updated_at),
         "version": config.version,
         "currentVersion": config.current_version,
         "previousVersion": config.previous_version,
         "seededBy": config.seeded_by,
+        "askHumanPolicy": config.ask_human_policy,
     })
 }
 
@@ -236,7 +311,10 @@ pub(super) fn validate_operation_domain_input(payload: &OperationDomainRequest) 
     Ok(())
 }
 
-pub(super) fn validate_state_machine(machine: &Document) -> AppResult<()> {
+// pub(crate)（非 pub(super)）：H13 引导层 `guide_profile.rs` 复用本校验，对 LLM 生成的
+// 候选状态机本体做合法性检查（states 是对象数组 / key 非空且唯一 / allowedFrom 只引已知
+// 态）后再落 draft。私有 `mod domains` 下的 pub(crate) 项对 crate 内 sibling 仍可见。
+pub(crate) fn validate_state_machine(machine: &Document) -> AppResult<()> {
     let Ok(states) = machine.get_array("states") else {
         return Ok(());
     };
@@ -263,6 +341,20 @@ pub(super) fn validate_state_machine(machine: &Document) -> AppResult<()> {
             )));
         }
         keys.push(key);
+    }
+    // H13：非空 states 必须至少有一个 initial:true 态。否则运行时新联系人（from 为空）
+    // 找不到唯一合法迁入目标 → 每次新接触迁移都被 check_state_transition fail-soft 拒绝，
+    // 状态机静默冻结、无报错。满足 spec H13① "缺 initial reject"。空/缺 states 不在此约束
+    // （上方 get_array 缺失即 Ok 早返，空数组是退化机交由 publish/runtime 层处理，逐字保持旧行为）。
+    if !states.is_empty()
+        && !states
+            .iter()
+            .filter_map(|state| state.as_document())
+            .any(|doc| doc.get_bool("initial").unwrap_or(false))
+    {
+        return Err(AppError::BadRequest(
+            "stateMachine must declare at least one initial state (initial:true)".to_string(),
+        ));
     }
     for state in states {
         let Some(doc) = state.as_document() else {
@@ -466,5 +558,38 @@ mod tests {
         };
         let err = validate_state_machine(&machine).unwrap_err();
         assert!(matches!(err, AppError::BadRequest(_)));
+    }
+
+    // H13：非空 states 缺 initial:true → reject（spec H13① "缺 initial reject"）。
+    #[test]
+    fn validate_rejects_state_machine_without_initial() {
+        let machine = doc! {
+            "states": [
+                { "key": "alpha", "allowedFrom": ["alpha"] },
+                { "key": "beta", "allowedFrom": ["alpha", "beta"] }
+            ]
+        };
+        let err = validate_state_machine(&machine).unwrap_err();
+        assert!(matches!(err, AppError::BadRequest(_)));
+    }
+
+    // H13：同样结构但其中一态标 initial:true → 过校验。
+    #[test]
+    fn validate_accepts_state_machine_with_initial() {
+        let machine = doc! {
+            "states": [
+                { "key": "alpha", "initial": true, "allowedFrom": ["alpha"] },
+                { "key": "beta", "allowedFrom": ["alpha", "beta"] }
+            ]
+        };
+        assert!(validate_state_machine(&machine).is_ok());
+    }
+
+    // H13 字节等价红线：DEFAULT 销售状态机（new_contact initial:true）必须仍过校验。
+    #[test]
+    fn validate_accepts_default_sales_machine() {
+        assert!(
+            validate_state_machine(&crate::prompts::default_user_operation_state_machine()).is_ok()
+        );
     }
 }

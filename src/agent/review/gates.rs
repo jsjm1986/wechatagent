@@ -25,7 +25,14 @@ pub fn review_passed(
         && review.scores.hallucination_score < runtime.fact_risk_block_at
         && review.scores.human_like >= runtime.human_like_rewrite_below
         && review.scores.emotional_value >= runtime.emotional_value_rewrite_below
-        && review.scores.knowledge_grounding_score >= runtime.product_accuracy_block_below
+        // G01 / H14：grounding 项与 classify_dual_gate:120 同源。classify 算
+        // `grounding_gate_applies = !bypass || claim`；本闸要的是其"通过"对偶：
+        // 闸不适用(bypass=true 且无产品声明) 或 grounding 达标即放行 →
+        // `!grounding_gate_applies || grounding>=阈值` = `(bypass && !claim) || grounding>=阈值`。
+        // DEFAULT bypass=false → `(false && ..)=false` → 整段退化为原 `grounding>=阈值`（字节等价）。
+        && ((runtime.grounding_gate_bypass_without_claim
+                && !crate::agent::guards::claim_requires_product_knowledge(&review.claim_analysis))
+            || review.scores.knowledge_grounding_score >= runtime.product_accuracy_block_below)
         // Phase B / B1：恢复 pressure_risk 软闸 — `>=` 阈值视为压迫感过强，拦截。
         // 0 表示 reviewer 未给分（含老数据反序列化默认），不参与拦截。
         && (review.scores.pressure_risk == 0
@@ -630,9 +637,11 @@ pub fn finalize_review_for_send(
     // 本次恢复范围；claim_analysis 缺失时按"非产品声明"放行（reviewer 软闸 +
     // knowledge_router verified-only corpus 仍在兜底）。
     if crate::agent::guards::claim_requires_product_knowledge(&review.claim_analysis) {
+        let now = mongodb::bson::DateTime::now();
         let verified_chunks = crate::agent::guards::compute_verified_chunks(
             &decision.used_knowledge_ids,
             knowledge_chunks,
+            now,
         );
         if verified_chunks.is_empty() && !priced_from_catalog {
             review.approved = false;
@@ -677,9 +686,11 @@ pub fn finalize_review_for_send(
     if !crate::agent::guards::claim_requires_product_knowledge(&review.claim_analysis) {
         let class = crate::agent::guards::commitment_claim_class(&decision.reply_text, commitment_markers);
         if class != crate::agent::guards::CommitmentClass::None {
+            let now = mongodb::bson::DateTime::now();
             let verified = crate::agent::guards::compute_verified_chunks(
                 &decision.used_knowledge_ids,
                 knowledge_chunks,
+                now,
             );
             if verified.is_empty() {
                 match class {
@@ -1096,6 +1107,38 @@ mod review_passed_dual_gate_tests {
         assert!(
             !review_passed(&review, &runtime),
             "approved=false 必须直接拦截，无视分数"
+        );
+    }
+
+    #[test]
+    fn review_passed_honors_grounding_bypass_for_non_product_reply() {
+        // G01：review_passed 的 grounding 项要与 classify_dual_gate:120 同源。
+        // bypass=true（情感/关系域）+ 本条无产品声明 + grounding 低分 → H14 应放行。
+        let mut runtime = UserRuntimeParameters::default();
+        runtime.grounding_gate_bypass_without_claim = true;
+        runtime.product_accuracy_block_below = 7;
+        let mut review = full_pass_review();
+        review.scores.knowledge_grounding_score = 3; // 低于阈值 7
+        // claim_analysis 空 → claim_requires_product_knowledge=false（无产品声明）
+        review.claim_analysis = mongodb::bson::doc! {};
+        assert!(
+            review_passed(&review, &runtime),
+            "bypass=true + 无产品声明 + 低 grounding 应放行(H14)"
+        );
+
+        // 对照①：DEFAULT bypass=false → 低 grounding 仍拦（字节等价）。
+        runtime.grounding_gate_bypass_without_claim = false;
+        assert!(
+            !review_passed(&review, &runtime),
+            "bypass=false 时低 grounding 必拦(字节等价)"
+        );
+
+        // 对照②：bypass=true 但有产品声明 → 低 grounding 仍拦。
+        runtime.grounding_gate_bypass_without_claim = true;
+        review.claim_analysis = mongodb::bson::doc! { "requiresProductKnowledge": true };
+        assert!(
+            !review_passed(&review, &runtime),
+            "有产品声明时 bypass 不豁免 grounding"
         );
     }
 }

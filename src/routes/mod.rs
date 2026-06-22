@@ -24,34 +24,52 @@ mod admin_relationship_suggestions;
 mod admin_state_policies;
 mod admin_taxonomies;
 mod admin_taxonomy_candidates;
-mod assets;
+// pub（非 pub(crate)）：ask_human_phase1_e2e.rs 集成测试需从 tests/ crate 直调
+// ask_human_inbox / ask_human_summary handler 真函数，仿 domain_profiles 已有先例。
+pub mod ask_human_inbox;
+// pub（非默认私有）：structured_organization_integration.rs 集成测试需从 tests/
+// crate 直调 list_content_assets handler 真函数（缺口 8 tags 检索 + workspace 隔离），
+// 仿 domain_profiles / ask_human_inbox / contacts 先例。生产路由注册仍走下方 use。
+pub mod assets;
 mod auth;
 mod behavior_signal_metrics;
 pub mod chunk_locks;
-mod contacts;
+// pub（非默认私有）：annotation_quality_gate_integration.rs 集成测试需从 tests/
+// crate 直调 update_assist_override handler 真函数（缺口 2 override + IDOR），仿
+// domain_profiles / ask_human_inbox 先例。生产路由注册仍走下方 use。
+pub mod contacts;
 mod conversations;
 // pub（非 pub(crate)）：domain_profile_e2e.rs 集成测试需从 tests/ crate 直调
 // publish/update/rollout/rollback handler 真函数（覆盖 realign + $set 部分更新），仿
 // guide_profile 已有先例。生产路由注册仍走下方 use。
 pub mod domain_profiles;
 pub(crate) mod domain_schemas;
-mod domains;
+pub mod domains;
 mod evaluations;
 mod events;
 mod evolution;
 pub mod guide_profile;
 mod guides;
 mod health;
-pub(crate) mod knowledge;
+pub mod knowledge;
 mod lessons_learned;
 mod llm_providers;
 mod management;
+// pub（非默认私有）：annotation_quality_gate_integration.rs 集成测试需从 tests/
+// crate 直调 review_media_asset handler 真函数（缺口 3 审核审计落库），仿
+// domain_profiles / ask_human_inbox 先例。生产路由注册仍走下方 use。
+pub mod media_assets;
 mod observability;
 mod outcome_metrics;
 mod outcomes_autonomy;
 mod playbooks;
+// pub（非默认私有）：ask_human_phase1_e2e.rs 集成测试需从 tests/ crate 直调
+// resolve / reassign / list handler 真函数及其请求体结构，仿 domain_profiles 先例。
+pub mod principal_escalations;
 mod products;
 mod prompt_templates;
+mod referral_cards;
+mod send_ledger;
 mod reviews;
 mod shared;
 mod simulations;
@@ -122,13 +140,14 @@ use admin_relationship_suggestions::{
     approve_relationship_suggestion, list_relationship_suggestions, reject_relationship_suggestion,
 };
 use assets::{create_content_asset, list_content_assets};
+use ask_human_inbox::{ask_human_inbox, ask_human_summary};
 use contacts::{
     analyze_contact_profile, add_deal_event, disable_agent, enable_agent, get_contact,
     get_contact_memory_card, get_operating_memory, get_operation_health, import_contacts_endpoint,
     list_contact_memory_candidates, list_contacts, list_entitlements, list_outcome_events,
     run_contact_memory_consolidation, search_contacts_endpoint, search_import_contacts,
     update_operating_memory, update_operation_profile, update_profile_note,
-    update_custom_agent_instructions,
+    update_assist_override, update_custom_agent_instructions,
 };
 use conversations::list_messages;
 use domain_schemas::{
@@ -142,7 +161,8 @@ use domain_profiles::{
 };
 use domains::{
     get_operation_domain, get_operation_domain_state_machine, list_operation_domains,
-    reset_operation_domain, update_operation_domain, update_operation_domain_state_machine,
+    put_ask_human_policy, reset_operation_domain, update_operation_domain,
+    update_operation_domain_state_machine,
 };
 use evaluations::{
     create_evaluation_scenario, delete_evaluation_scenario, list_evaluation_scenarios,
@@ -176,7 +196,8 @@ use knowledge::{
     delete_operation_knowledge_document, digest_dismiss_card, digest_regenerate, digest_today,
     dismiss_knowledge_gap_signal,
     get_operation_knowledge_catalog, get_operation_knowledge_catalog_persisted,
-    get_operation_knowledge_chunk_source, get_operation_knowledge_completeness,
+    get_operation_knowledge_chunk, get_operation_knowledge_chunk_source,
+    get_operation_knowledge_completeness,
     get_operation_knowledge_document, get_operation_knowledge_integrity_report,
     extract_operation_knowledge_tags, import_operation_knowledge_apply,
     import_operation_knowledge_apply_image, import_operation_knowledge_apply_pdf,
@@ -220,6 +241,9 @@ use prompt_templates::{
 };
 use products::{
     archive_product, create_product, list_products, restore_product, update_product,
+};
+use principal_escalations::{
+    list_principal_escalations, reassign_principal_escalation, resolve_principal_escalation,
 };
 use reviews::{get_decision_review, list_decision_reviews};
 use simulations::{run_user_operation_evaluation, simulate_user_operation_dialogue};
@@ -291,6 +315,10 @@ pub fn api_router(state: AppState) -> Router<AppState> {
         .route("/contacts/:id/disable-agent", post(disable_agent))
         .route("/contacts/:id/profile-note", put(update_profile_note))
         .route(
+            "/contacts/:id/assist-override",
+            put(update_assist_override),
+        )
+        .route(
             "/contacts/:id/custom-agent-instructions",
             put(update_custom_agent_instructions),
         )
@@ -347,6 +375,63 @@ pub fn api_router(state: AppState) -> Router<AppState> {
             get(list_content_assets).post(create_content_asset),
         )
         .route(
+            "/content-assets/upload",
+            // 真实销售素材（PDF/海报/视频）常 >2MB：axum 全局默认 body limit 2MB 会先于
+            // handler 内的 media_max_file_size_mb 校验生效，>2MB 直接 413。仅给本上传路由
+            // 单独抬高 body limit 到配置上限，其它路由保留默认 2MB 保护。
+            post(media_assets::upload_media_asset).layer(
+                axum::extract::DefaultBodyLimit::max(
+                    state.config.media_max_file_size_mb as usize * 1024 * 1024,
+                ),
+            ),
+        )
+        .route(
+            "/content-assets/:id/review",
+            post(media_assets::review_media_asset),
+        )
+        .route(
+            "/content-assets/:id",
+            axum::routing::put(media_assets::update_content_asset_meta)
+                .delete(media_assets::delete_content_asset),
+        )
+        .route(
+            "/content-assets/:id/file",
+            post(media_assets::replace_content_asset_file).layer(
+                axum::extract::DefaultBodyLimit::max(
+                    state.config.media_max_file_size_mb as usize * 1024 * 1024,
+                ),
+            ),
+        )
+        .route(
+            "/content-assets/:id/toggle",
+            post(media_assets::toggle_content_asset_sendable),
+        )
+        .route(
+            "/referral-cards",
+            post(referral_cards::create_referral_card).get(referral_cards::list_referral_cards),
+        )
+        .route(
+            "/referral-cards/:id/review",
+            post(referral_cards::review_referral_card),
+        )
+        .route(
+            "/referral-cards/:id/toggle",
+            post(referral_cards::toggle_referral_card),
+        )
+        .route(
+            "/referral-cards/:id",
+            axum::routing::delete(referral_cards::delete_referral_card),
+        )
+        .route(
+            "/contacts/:wxid/send-history",
+            get(send_ledger::contact_send_history),
+        )
+        .route("/send-ledger/stats", get(send_ledger::send_ledger_stats))
+        .route(
+            "/send-ledger/overview",
+            get(send_ledger::send_ledger_overview),
+        )
+        .route(
             "/operation-knowledge",
             get(list_operation_knowledge).post(create_operation_knowledge),
         )
@@ -370,7 +455,9 @@ pub fn api_router(state: AppState) -> Router<AppState> {
         )
         .route(
             "/operation-knowledge/chunks/:id",
-            put(update_operation_knowledge_chunk).delete(delete_operation_knowledge_chunk),
+            get(get_operation_knowledge_chunk)
+                .put(update_operation_knowledge_chunk)
+                .delete(delete_operation_knowledge_chunk),
         )
         .route(
             "/operation-knowledge/chunks/:id/source",
@@ -635,6 +722,10 @@ pub fn api_router(state: AppState) -> Router<AppState> {
             post(reset_operation_domain),
         )
         .route(
+            "/operation-domains/:domain/ask-human-policy",
+            put(put_ask_human_policy),
+        )
+        .route(
             "/prompt-templates",
             get(list_prompt_templates).post(create_prompt_template),
         )
@@ -741,6 +832,20 @@ pub fn api_router(state: AppState) -> Router<AppState> {
             "/admin/operation-domains/:id/rollback",
             post(rollback_operation_domain_version),
         )
+        // ── Ask-Human Phase 1 / Task 7：决策请示通道 admin REST 端点 ──────────
+        // 列表 / admin 直接裁决（复用 relay 下游）/ 改派决策人。
+        .route("/admin/principal-escalations", get(list_principal_escalations))
+        .route(
+            "/admin/principal-escalations/:short_code/resolve",
+            post(resolve_principal_escalation),
+        )
+        .route(
+            "/admin/principal-escalations/:short_code/reassign",
+            post(reassign_principal_escalation),
+        )
+        // ── Ask-Human Phase 1 / Task 11：只读聚合器 inbox/summary ──────────
+        .route("/admin/ask-human/inbox", get(ask_human_inbox))
+        .route("/admin/ask-human/summary", get(ask_human_summary))
         .route(
             "/admin/operation-state-policies/:id/publish",
             post(publish_operation_state_policy_version),
@@ -949,6 +1054,10 @@ mod tests {
             "add_outcome_event_inner",
             // knowledge.rs：lib 内部复用的导入流水（不绑 HTTP）。
             "ingest_chunked_text",
+            // knowledge/import.rs：F2 抽出的视觉模型选择 + 调用 helper，被图像导入
+            // handler 与运营 Agent 入站图片理解（agent::multimodal）复用，不直接绑 HTTP。
+            "select_vision_provider",
+            "vision_generate_json",
             // knowledge.rs：PDF multipart handler 委托的字节级 helper（集成测试直调）。
             "import_pdf_bytes",
             // knowledge.rs：完整度审计内核 helper，被 get/refresh completeness 两个 handler
@@ -957,6 +1066,14 @@ mod tests {
             // domain_schemas.rs：D1-b active schema 加载 helper，被 chunk 写侧
             // （apply_chunk_revision）复用做 domain_attributes 校验，不直接绑 HTTP。
             "load_active_domain_schema",
+            // admin_ops_versions.rs：H13 状态机本体 publish helper，被 domain_profiles
+            // 的 activate_domain_profile 复用（profile 激活时联动写 operation_domain_configs
+            // 新 current 版本），不直接绑 HTTP。
+            "publish_state_machine_version",
+            // admin_ops_versions.rs：G06+G11+G12 共享 policy 重派 helper，被
+            // publish_state_machine_version / rollout / rollback / domains.rs 直编路由复用，
+            // 不直接绑 HTTP。
+            "reconcile_state_policies_for_machine",
         ];
 
         let mut handlers: Vec<&str> = Vec::new();

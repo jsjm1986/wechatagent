@@ -122,8 +122,20 @@ pub(crate) fn operation_states(domain_config: Option<&OperationDomainConfig>) ->
 /// m019 迁移）时，与改造前逐字等价。DEFAULT 销售域状态机仅 new_contact 标 initial，
 /// 故 DEFAULT 下恒返 `"new_contact"`，金标零变化；换行业的 profile 可标别的初始态。
 pub fn initial_operation_state_key(domain_config: Option<&OperationDomainConfig>) -> String {
-    operation_states(domain_config)
+    initial_operation_state_key_in_machine(domain_config.map(|config| &config.state_machine))
+}
+
+/// H13：与 `initial_operation_state_key` 同一逻辑，但直接吃裸状态机 `Document`
+/// （`states[].initial=true` → `key`），供尚未包成 `OperationDomainConfig` 的调用方复用
+/// （如 activate publish 后迁移存量 contact 时手上只有 profile 的 `generated_state_machine`
+/// 本体）。两者共用同一抽取规则，不引第二份「初始态从哪来」的事实源。回落同样为
+/// `"new_contact"`（machine 缺失 / 无 state 标 initial）。
+pub fn initial_operation_state_key_in_machine(machine: Option<&Document>) -> String {
+    machine
+        .and_then(|machine| machine.get_array("states").ok())
         .into_iter()
+        .flatten()
+        .filter_map(|item| item.as_document())
         .find(|state| state.get_bool("initial").unwrap_or(false))
         .and_then(|state| state.get_str("key").ok().map(ToString::to_string))
         .unwrap_or_else(|| "new_contact".to_string())
@@ -292,14 +304,17 @@ pub fn enforce_state_action_policy(
 // 不在本次恢复范围）。
 // ─────────────────────────────────────────────────────────────────────────
 
-/// R5.1：chunk 是否 `integrity_status == "verified"`（trim + 大小写不敏感）。
-pub(crate) fn is_verified(chunk: &OperationKnowledgeChunk) -> bool {
-    chunk
+/// R5.1：chunk 是否 `integrity_status == "verified"`（trim + 大小写不敏感）且未过期
+/// （valid_to 为 None=永久有效，或 valid_to >= now）。过期知识不得背书产品声明。
+pub(crate) fn is_verified(chunk: &OperationKnowledgeChunk, now: mongodb::bson::DateTime) -> bool {
+    let status_ok = chunk
         .integrity_status
         .as_deref()
         .map(str::trim)
         .map(|s| s.eq_ignore_ascii_case("verified"))
-        .unwrap_or(false)
+        .unwrap_or(false);
+    let not_expired = chunk.valid_to.map_or(true, |vt| vt >= now);
+    status_ok && not_expired
 }
 
 /// R5.4：reviewer 的 `claim_analysis` 是否显式声明本次候选回复需要产品知识背书。
@@ -318,6 +333,7 @@ pub(crate) fn claim_requires_product_knowledge(claim_analysis: &Document) -> boo
 pub(crate) fn compute_verified_chunks<'a>(
     used_knowledge_ids: &[String],
     chunks: &'a [OperationKnowledgeChunk],
+    now: mongodb::bson::DateTime,
 ) -> Vec<&'a OperationKnowledgeChunk> {
     let used: std::collections::HashSet<&str> = used_knowledge_ids
         .iter()
@@ -330,7 +346,7 @@ pub(crate) fn compute_verified_chunks<'a>(
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut out: Vec<&'a OperationKnowledgeChunk> = Vec::new();
     for chunk in chunks {
-        if !is_verified(chunk) {
+        if !is_verified(chunk, now) {
             continue;
         }
         let Some(hex) = chunk.id.map(|id| id.to_hex()) else {
@@ -576,6 +592,226 @@ mod policy_tests {
         assert_eq!(commitment_claim_class("这病一定治好", &medical), CommitmentClass::ToneOnly);
         // 销售域 const 词在医疗 profile 下不再命中（词表已替换，非叠加）。
         assert_eq!(commitment_claim_class("三天就见效", &medical), CommitmentClass::None);
+    }
+}
+
+#[cfg(test)]
+mod cross_domain_state_machine_tests {
+    //! G09：`check_state_transition` 跨行业（**非销售** FSM）确定性命门。
+    //!
+    //! 与 `tests/c2_state_transition_cross_domain.rs`（`#[ignore]`-free 集成测试，但不在
+    //! baseline 门 = check-baseline.sh 只跑 `cargo test --lib` + 4 固定 PBT）的纯函数断言
+    //! 同构，提进 lib test mod 让它**自动进 baseline 硬门**。原集成测试保留不动（CI 仍跑）。
+    //!
+    //! 为什么不与 `state_transition_pbt` 重复：那个 PBT 只在**销售**
+    //! `default_user_operation_state_machine` 上验；本组在一个**医疗就诊**状态机上验，锁死
+    //! 「同一引擎读 `initial`/`allowFromAny`/`allowedFrom`/`unknown_target` 标志判迁移，
+    //! 行业无关、不写死销售态名」这条命门——PBT 未覆盖的维度。
+    use super::*;
+    use mongodb::bson::{doc, DateTime};
+
+    /// 一个**非销售**（医疗就诊）状态机：状态 key 与销售域完全不同。
+    /// - `initial_consult` 唯一 `initial:true`（空 from 只能迁入它）；
+    /// - 线性推进 initial_consult → follow_up → plan_confirmed → treated；
+    /// - `missed_appointment` 标 `allowFromAny:true`（任何态可失约，类比销售 cooldown）。
+    fn medical_domain_config() -> OperationDomainConfig {
+        OperationDomainConfig {
+            id: None,
+            workspace_id: "ws-medical".to_string(),
+            domain: "medical_consultation".to_string(),
+            name: "医疗就诊".to_string(),
+            goal: String::new(),
+            methodology: String::new(),
+            workflow: String::new(),
+            tool_policy: String::new(),
+            automation_policy: String::new(),
+            review_policy: String::new(),
+            runtime_parameters: doc! {},
+            state_machine: doc! {
+                "states": [
+                    { "key": "initial_consult", "initial": true, "allowedFrom": [] },
+                    { "key": "follow_up", "allowedFrom": ["initial_consult", "plan_confirmed"] },
+                    { "key": "plan_confirmed", "allowedFrom": ["follow_up"] },
+                    { "key": "treated", "allowedFrom": ["plan_confirmed", "follow_up"] },
+                    { "key": "missed_appointment", "allowFromAny": true, "allowedFrom": [] },
+                ]
+            },
+            status: "active".to_string(),
+            updated_at: DateTime::now(),
+            version: 1,
+            current_version: true,
+            previous_version: None,
+            seeded_by: None,
+            principal_decider: None,
+            high_risk_escalation_mode: None,
+            ask_human_policy: None,
+            assist_mode_enabled: None,
+        }
+    }
+
+    /// 合法迁移在非销售 FSM 下放行（返回 None）。
+    #[test]
+    fn cross_domain_legal_transitions_pass() {
+        let cfg = medical_domain_config();
+        assert!(
+            check_state_transition(Some(&cfg), Some("initial_consult"), "follow_up").is_none(),
+            "初诊→复诊应合法"
+        );
+        assert!(
+            check_state_transition(Some(&cfg), Some("follow_up"), "plan_confirmed").is_none(),
+            "复诊→方案确认应合法"
+        );
+        assert!(
+            check_state_transition(Some(&cfg), Some("plan_confirmed"), "treated").is_none(),
+            "方案确认→已治疗应合法"
+        );
+        assert!(
+            check_state_transition(Some(&cfg), Some("follow_up"), "treated").is_none(),
+            "复诊→已治疗应合法（treated.allowedFrom 含 follow_up）"
+        );
+        assert!(
+            check_state_transition(Some(&cfg), Some("plan_confirmed"), "follow_up").is_none(),
+            "方案确认→复诊（回退）应合法"
+        );
+    }
+
+    /// 非法迁移在非销售 FSM 下被拦截（返回 Some，理由含 state_transition_invalid）。
+    #[test]
+    fn cross_domain_illegal_transitions_rejected() {
+        let cfg = medical_domain_config();
+        let reason = check_state_transition(Some(&cfg), Some("initial_consult"), "treated");
+        assert!(reason.is_some(), "初诊直接→已治疗应被拦（跳过方案确认/复诊）");
+        assert!(
+            reason.unwrap().contains("state_transition_invalid"),
+            "拦截理由须含 state_transition_invalid"
+        );
+        assert!(
+            check_state_transition(Some(&cfg), Some("treated"), "initial_consult").is_some(),
+            "已治疗→初诊应被拦（initial 态不接受任何 from 迁入）"
+        );
+        assert!(
+            check_state_transition(Some(&cfg), Some("initial_consult"), "plan_confirmed").is_some(),
+            "初诊→方案确认应被拦（须先复诊）"
+        );
+    }
+
+    /// initial 态语义跨域：空 from 只能迁入标 initial:true 的态（非销售域 initial 不叫 new_contact）。
+    #[test]
+    fn cross_domain_initial_state_semantics() {
+        let cfg = medical_domain_config();
+        assert!(
+            check_state_transition(Some(&cfg), None, "initial_consult").is_none(),
+            "空 from→本域 initial 态(initial_consult)应合法"
+        );
+        assert!(
+            check_state_transition(Some(&cfg), None, "follow_up").is_some(),
+            "空 from→非 initial 态应被拦（引擎不写死 new_contact，读 initial 标志）"
+        );
+        assert!(
+            check_state_transition(Some(&cfg), Some(""), "follow_up").is_some(),
+            "空字符串 from→非 initial 态应被拦"
+        );
+    }
+
+    /// allowFromAny 语义跨域：标 allowFromAny 的态任何 from 都可迁入（医疗失约类比销售 cooldown）。
+    #[test]
+    fn cross_domain_allow_from_any() {
+        let cfg = medical_domain_config();
+        for from in ["initial_consult", "follow_up", "plan_confirmed", "treated"] {
+            assert!(
+                check_state_transition(Some(&cfg), Some(from), "missed_appointment").is_none(),
+                "{from}→失约(allowFromAny)应合法"
+            );
+        }
+        assert!(
+            check_state_transition(Some(&cfg), None, "missed_appointment").is_none(),
+            "空 from→allowFromAny 态应合法"
+        );
+    }
+
+    /// unknown_target 跨域：迁向状态机里不存在的态被 fail-closed 拒绝（防幻影态旁路 policy）。
+    #[test]
+    fn cross_domain_unknown_target_rejected() {
+        let cfg = medical_domain_config();
+        let reason = check_state_transition(Some(&cfg), Some("follow_up"), "nonexistent_stage");
+        assert!(reason.is_some(), "迁向不存在的态应被拒（fail-closed）");
+        assert!(
+            reason.unwrap().contains("unknown_target"),
+            "拦截理由须含 unknown_target"
+        );
+    }
+
+    /// 跨域隔离：销售态名在医疗 FSM 里是 unknown_target（证明两域状态空间不串）。
+    #[test]
+    fn sales_state_keys_are_unknown_in_medical_fsm() {
+        let cfg = medical_domain_config();
+        assert!(
+            check_state_transition(Some(&cfg), Some("follow_up"), "solution_fit")
+                .unwrap()
+                .contains("unknown_target"),
+            "销售态 solution_fit 在医疗 FSM 应是 unknown_target"
+        );
+        assert!(
+            check_state_transition(Some(&cfg), None, "new_contact")
+                .unwrap()
+                .contains("unknown_target"),
+            "销售 initial 态 new_contact 在医疗 FSM 应是 unknown_target（本域 initial 是 initial_consult）"
+        );
+    }
+}
+
+#[cfg(test)]
+mod is_verified_tests {
+    //! R5.1 时效命门：`is_verified` 必须同时满足 `integrity_status==verified`
+    //! **且未过期**（valid_to 为 None=永久有效，或 valid_to >= now）。过期 verified
+    //! 知识不得背书产品宣称。真值表：
+    //! (verified, no valid_to)→有效 / (verified, 未来 valid_to)→有效 /
+    //! (verified, 过去 valid_to)→无效 / (draft, *)→无效。
+    use super::*;
+    use mongodb::bson::DateTime;
+
+    fn make_test_chunk() -> OperationKnowledgeChunk {
+        OperationKnowledgeChunk::default()
+    }
+
+    #[test]
+    fn is_verified_true_when_verified_and_no_valid_to() {
+        let mut c = make_test_chunk();
+        c.integrity_status = Some("verified".into());
+        c.valid_to = None;
+        let now = DateTime::now();
+        assert!(is_verified(&c, now));
+    }
+
+    #[test]
+    fn is_verified_true_when_verified_and_not_expired() {
+        let mut c = make_test_chunk();
+        c.integrity_status = Some("verified".into());
+        c.valid_to = Some(DateTime::from_millis(
+            DateTime::now().timestamp_millis() + 24 * 3600 * 1000,
+        ));
+        let now = DateTime::now();
+        assert!(is_verified(&c, now));
+    }
+
+    #[test]
+    fn is_verified_false_when_verified_but_expired() {
+        let mut c = make_test_chunk();
+        c.integrity_status = Some("verified".into());
+        c.valid_to = Some(DateTime::from_millis(
+            DateTime::now().timestamp_millis() - 24 * 3600 * 1000,
+        ));
+        let now = DateTime::now();
+        assert!(!is_verified(&c, now), "过期 verified 知识不得背书");
+    }
+
+    #[test]
+    fn is_verified_false_when_draft() {
+        let mut c = make_test_chunk();
+        c.integrity_status = Some("draft".into());
+        c.valid_to = None;
+        let now = DateTime::now();
+        assert!(!is_verified(&c, now));
     }
 }
 
