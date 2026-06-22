@@ -537,8 +537,6 @@ mod tests {
             // `RuntimeParametersTyped::default()` 保持一致，方便后续 wave 的
             // gating / clamp 行为复用同一组默认。
             autonomy_protocol_enabled: true,
-            knowledge_routing_mode: "auto_tool_loop".to_string(),
-            knowledge_max_tool_loops: 3,
             knowledge_max_tool_calls: 6,
             knowledge_open_slice_max_k: 4,
             knowledge_search_top_k: 8,
