@@ -931,6 +931,43 @@ pub fn example_emotional_companion_profile(workspace_id: &str) -> DomainProfile 
     profile
 }
 
+/// 数字分身样例（销售框架 + 关系分化）：保留默认销售域人格/状态机/五闸，但按
+/// relationship_type 配三套主动触达范式。运营给 contact 标 relationship_type 后，
+/// planner 经 resolve_operation_mode 路由到对应范式。
+///
+/// 与 [`example_emotional_companion_profile`] 的区别：那是"纯陪伴"框架（关漏斗、
+/// 开日历关怀）；本 profile 是"销售为主、对非客户关系收敛触达"框架。
+///
+/// **注**：per_relationship 仅切 OperationMode 各驱动（漏斗/承诺/日历开关），不含
+/// 口吻分化——口吻走 customAgentInstructions 自然语言通道（见
+/// 2026-06-22-digital-twin-relationship-closure-design 设计文档子项目 1）。
+pub fn example_sales_with_relationships_profile(workspace_id: &str) -> DomainProfile {
+    let mut profile = default_domain_profile(workspace_id);
+    profile.profile_id = "sales_with_relationships".to_string();
+    profile.display_name = "销售 + 关系分化".to_string();
+    profile.description =
+        "销售为主框架；按客户类型分化主动触达：客户追单、同行低频维护、朋友只留情感关怀。"
+            .to_string();
+    let mut per_relationship = std::collections::BTreeMap::new();
+    // 客户（销售型）：沿用销售默认全开 + 日历（怕丢单，主动跟进）。
+    let mut customer_mode = crate::models::OperationMode::default();
+    customer_mode.calendar.enabled = true;
+    per_relationship.insert("customer".to_string(), customer_mode);
+    // 同行：关漏斗（不推单），保留承诺与日历（行业节点维护）。
+    let mut peer_mode = crate::models::OperationMode::default();
+    peer_mode.funnel.enabled = false;
+    peer_mode.calendar.enabled = true;
+    per_relationship.insert("peer".to_string(), peer_mode);
+    // 朋友：关漏斗 + 关承诺催促，只留日历个人关怀（不主动追单/不催进度）。
+    let mut friend_mode = crate::models::OperationMode::default();
+    friend_mode.funnel.enabled = false;
+    friend_mode.commitment.enabled = false;
+    friend_mode.calendar.enabled = true;
+    per_relationship.insert("friend".to_string(), friend_mode);
+    profile.per_relationship_operation_mode = Some(per_relationship);
+    profile
+}
+
 /// 加载某 workspace 当前生效的 DomainProfile。
 ///
 /// 查 `is_active=true` 一条；无则 fallback 到 [`default_domain_profile`]。
@@ -1299,6 +1336,29 @@ mod tests {
             .find(|d| d.key == "anniversaries")
             .expect("应声明 anniversaries 维度");
         assert!(anni.date_dimension, "anniversaries 应标 date_dimension");
+    }
+
+    #[test]
+    fn sales_with_relationships_routes_three_modes() {
+        let p = example_sales_with_relationships_profile("ws-s");
+        let per = p
+            .per_relationship_operation_mode
+            .as_ref()
+            .expect("应配三套 per_relationship 范式");
+        // 客户：漏斗保持开（销售追单）。
+        assert!(per.get("customer").unwrap().funnel.enabled);
+        // 同行：漏斗关。
+        assert!(!per.get("peer").unwrap().funnel.enabled);
+        // 朋友：漏斗关 + 承诺关。
+        assert!(!per.get("friend").unwrap().funnel.enabled);
+        assert!(!per.get("friend").unwrap().commitment.enabled);
+    }
+
+    #[test]
+    fn default_profile_keeps_per_relationship_none() {
+        // 护栏 H8：DEFAULT 永远 None，不被本任务影响。
+        let d = default_domain_profile("ws-d");
+        assert!(d.per_relationship_operation_mode.is_none());
     }
 
     #[test]
