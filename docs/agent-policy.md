@@ -111,6 +111,47 @@ RunBudget 超限                        终止本 run，落 fallback (enforce_ru
 
 用户运营状态由 `user_operations` 状态机约束。Agent 每次决策必须输出 `operationState` 和 `nextBestAction`，并写入决策复盘，供后续审计和优化。
 
+## 辅助模式 / 专属顾问引荐（assist mode）
+
+辅助模式是项目核心红线"客户永远只跟 AI 对话、永不直接面对真人"的**默认关闭的受控例外**。销售场景下，账号开启「辅助模式」后，AI 识别到高价值客户（明确要签约 / 要到店参观 / 需深入对接）时，主动把真人专属顾问的微信名片推给客户，由客户与顾问对接完成临门一脚，AI 退为辅助答疑角色。完整设计见 `docs/superpowers/specs/2026-06-21-referral-card-push-design.md`。
+
+### 与全自治模式的关系
+
+- 全自治模式（默认）下红线**不动**：AI 永不推真人名片，客户永远只跟 AI 对话。
+- 辅助模式是显式开启才生效的受控例外，仅放在辅助答疑场景；红线本体（全自治模式）一字不变。
+
+### 触发依据（提示词注入 + LLM 语义判断，非关键词匹配）
+
+- 人类管理员预先为每张名片标注 `send_trigger_hint`（自然语言触发说明，如"客户明确要签约或要到店参观时引荐"）+ `target_stages`（适用的客户阶段）。
+- 这些候选名片在决策时**注入 decision prompt**，由 Reply Agent 在单次主决策里按语义判断客户当前是否契合，输出 `namecardToSend`。
+- 这**不是**关键词匹配，而是提示词注入 + LLM 语义判断，与项目 agent-first 立场一致——机器只提供候选与人类标注的意图说明，是否引荐由 LLM 语义裁决。
+
+### 开关粒度
+
+- 账号级：`OperationDomainConfig.assist_mode_enabled`（默认 `None` / `false` = 关）。
+- 客户级覆盖：`Contact.domain_attributes` 的 `assist_mode_override`（`ASSIST_MODE_OVERRIDE_ATTR`，取值 `"force_on"` / `"force_off"`），覆盖账号级开关，支持对个别客户单独开 / 关。
+
+### 审核门（AI 不自我核验红线）
+
+- 名片创建默认 `review_status="draft"` + `enabled=false`，必须管理员**显式审核（approved）+ 启用**后 AI 才能选用。AI 永不自我核验，保持"AI 永不自动 verify"红线一致性。
+- AI 选名片时 gateway 做准入二次校验：名片必须同时 `enabled` + `approved` 才放行，防止 AI 幻觉出不存在 / 未审核的 `card_id`。
+
+### 「已引荐」态语义
+
+- 名片发送成功后，客户 `domain_attributes` 写入 `referred_specialist_at`（`REFERRED_SPECIALIST_AT_ATTR`）。
+- 此后 AI 转**被动答疑**：客户再问正常答，但不再主动推进成交、不重复引荐——除非客户出现与上次完全不同的新需求场景。
+
+### 被推真人 ≠ 幕后决策源（principal_decider）
+
+- 被引荐的专属顾问是**台前**直接与客户对接的真人（设计 D9）。
+- 幕后决策源（领导）是 AI 请示拿结论、客户永远看不到的角色。
+- 两者是不同角色，解耦：台前顾问对客户可见并对接，幕后决策源始终隐于 AI 之后。
+
+### 发送形态
+
+- 先发一句 AI 口吻的自然铺垫话术（融进 `replyText`），再附名片（设计 D5），对话始终是 AI 在说。
+- 名片经现有 outbox 幂等通道（幂等键含 `referral_card_id`）发送，dispatcher 分流调 MCP `message_send_namecard`，复用既有出站链路。
+
 ## Group Operations Policy
 
 群运营第一阶段只允许：

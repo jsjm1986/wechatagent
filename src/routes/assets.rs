@@ -22,9 +22,10 @@ use super::AppState;
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub(super) struct ContentAssetQuery {
+pub struct ContentAssetQuery {
     account_id: Option<String>,
     kind: Option<String>,
+    tag: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -41,7 +42,7 @@ pub(super) struct ContentAssetRequest {
     usage_scene: Option<String>,
 }
 
-pub(super) async fn list_content_assets(
+pub async fn list_content_assets(
     State(state): State<AppState>,
     Extension(admin): Extension<AuthenticatedAdmin>,
     Query(query): Query<ContentAssetQuery>,
@@ -59,6 +60,12 @@ pub(super) async fn list_content_assets(
     if let Some(kind) = query.kind {
         if !kind.is_empty() {
             filter.insert("kind", kind);
+        }
+    }
+    // 按 tag 检索：MongoDB 数组字段等值匹配命中 tags 数组含该元素的文档（workspace scope 保留）。
+    if let Some(tag) = query.tag {
+        if !tag.is_empty() {
+            filter.insert("tags", tag);
         }
     }
     let mut cursor = state
@@ -85,6 +92,18 @@ pub(super) async fn list_content_assets(
             "url": asset.url,
             "mediaId": asset.media_id,
             "usageScene": asset.usage_scene,
+            // 销售素材文件字段（前端预览/审核用）
+            "mediaType": asset.media_type,
+            "fileName": asset.file_name,
+            "fileSize": asset.file_size,
+            "mimeType": asset.mime_type,
+            "sendTriggerHint": asset.send_trigger_hint,
+            "targetStages": asset.target_stages,
+            "expressionPref": asset.expression_pref,
+            "requiresPrincipalApproval": asset.requires_principal_approval,
+            "reviewStatus": asset.review_status,
+            "sendable": asset.sendable,
+            "reviewNote": asset.review_note,
             "updatedAt": crate::models::dt_to_string(asset.updated_at)
         }));
     }
@@ -112,6 +131,19 @@ pub(super) async fn create_content_asset(
         url: payload.url,
         media_id: payload.media_id,
         usage_scene: payload.usage_scene,
+        media_type: None,
+        file_path: None,
+        file_name: None,
+        file_size: None,
+        mime_type: None,
+        file_sha256: None,
+        sendable: None,
+        send_trigger_hint: None,
+        target_stages: None,
+        expression_pref: None,
+        requires_principal_approval: None,
+        review_status: None,
+        review_note: None,
         created_at: DateTime::now(),
         updated_at: DateTime::now(),
     };

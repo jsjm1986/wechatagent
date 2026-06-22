@@ -45,6 +45,8 @@ pub(super) struct OperationDomainRequest {
     runtime_parameters: Document,
     #[serde(default)]
     state_machine: Document,
+    #[serde(default)]
+    assist_mode_enabled: Option<bool>,
 }
 
 pub(super) async fn list_operation_domains(
@@ -74,7 +76,7 @@ pub(super) async fn list_operation_domains(
     Ok(Json(json!({ "items": items })))
 }
 
-pub(super) async fn get_operation_domain(
+pub async fn get_operation_domain(
     State(state): State<AppState>,
     Extension(admin): Extension<AuthenticatedAdmin>,
     Path(domain): Path<String>,
@@ -97,6 +99,23 @@ pub(super) async fn update_operation_domain(
     // G06：直编路由改状态机本体后联动重派 policy（否则 forbidsProactive 新增 state 主动触达门
     // fail-open 静默失效）。$set 会 move payload.state_machine，故先 clone 出本体喂 reconcile。
     let state_machine_for_policy = payload.state_machine.clone();
+    let mut set_doc = doc! {
+        "name": payload.name,
+        "goal": payload.goal,
+        "methodology": payload.methodology,
+        "workflow": payload.workflow,
+        "tool_policy": payload.tool_policy,
+        "automation_policy": payload.automation_policy,
+        "review_policy": payload.review_policy,
+        "runtime_parameters": payload.runtime_parameters,
+        "state_machine": payload.state_machine,
+        "status": "active",
+        "updated_at": DateTime::now(),
+    };
+    // 辅助模式账号级总开关：None 时不写入（保留既有值，避免误覆盖）。
+    if let Some(v) = payload.assist_mode_enabled {
+        set_doc.insert("assist_mode_enabled", v);
+    }
     state
         .db
         .operation_domain_configs()
@@ -109,21 +128,7 @@ pub(super) async fn update_operation_domain(
                 // 老 row（无 current_version 字段）继续被命中。
                 "current_version": { "$ne": false },
             },
-            doc! {
-                "$set": {
-                    "name": payload.name,
-                    "goal": payload.goal,
-                    "methodology": payload.methodology,
-                    "workflow": payload.workflow,
-                    "tool_policy": payload.tool_policy,
-                    "automation_policy": payload.automation_policy,
-                    "review_policy": payload.review_policy,
-                    "runtime_parameters": payload.runtime_parameters,
-                    "state_machine": payload.state_machine,
-                    "status": "active",
-                    "updated_at": DateTime::now()
-                }
-            },
+            doc! { "$set": set_doc },
             None,
         )
         .await?;
@@ -196,6 +201,45 @@ pub async fn update_operation_domain_state_machine(
     Ok(Json(json!({ "ok": true })))
 }
 
+/// PUT /api/admin/operation-domains/:domain/ask-human-policy
+/// $set ask_human_policy 到 current_version 行（不 bump 版本，贴生产 admin 编辑语义）。
+pub async fn put_ask_human_policy(
+    State(state): State<AppState>,
+    Extension(admin): Extension<AuthenticatedAdmin>,
+    Path(domain): Path<String>,
+    Json(policy): Json<crate::models::AskHumanPolicy>,
+) -> AppResult<Json<Value>> {
+    // 校验：decider_chain wxid 非空；quiet_hours 小时范围。
+    for d in &policy.decider_chain {
+        if d.wxid.trim().is_empty() {
+            return Err(AppError::BadRequest("decider_chain wxid 不能为空".into()));
+        }
+    }
+    if let Some(qh) = &policy.quiet_hours {
+        if qh.start_hour > 23 || qh.end_hour > 23 {
+            return Err(AppError::BadRequest("quiet_hours 小时须 0-23".into()));
+        }
+    }
+    let policy_bson = mongodb::bson::to_bson(&policy)?;
+    let res = state
+        .db
+        .operation_domain_configs()
+        .update_one(
+            doc! {
+                "workspace_id": &admin.current_workspace,
+                "domain": &domain,
+                "current_version": true,
+            },
+            doc! { "$set": { "ask_human_policy": policy_bson, "updated_at": DateTime::now() } },
+            None,
+        )
+        .await?;
+    if res.matched_count == 0 {
+        return Err(AppError::NotFound("operation domain 当前版本不存在".into()));
+    }
+    Ok(Json(json!({ "ok": true })))
+}
+
 pub(super) async fn reset_operation_domain(
     State(state): State<AppState>,
     Extension(admin): Extension<AuthenticatedAdmin>,
@@ -240,12 +284,14 @@ pub(super) fn operation_domain_json(config: OperationDomainConfig) -> Value {
         "reviewPolicy": config.review_policy,
         "runtimeParameters": config.runtime_parameters,
         "stateMachine": config.state_machine,
+        "assistModeEnabled": config.assist_mode_enabled,
         "status": config.status,
         "updatedAt": crate::models::dt_to_string(config.updated_at),
         "version": config.version,
         "currentVersion": config.current_version,
         "previousVersion": config.previous_version,
         "seededBy": config.seeded_by,
+        "askHumanPolicy": config.ask_human_policy,
     })
 }
 

@@ -7,8 +7,10 @@ import {
   BrainCircuit,
   CheckCircle2,
   Clock3,
+  Contact as ContactIcon,
   Inbox,
   MessageSquareText,
+  Paperclip,
   Search,
   SendHorizonal,
   ShieldCheck,
@@ -19,7 +21,7 @@ import {
   Workflow
 } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
-import { FormEvent, useState } from "react";
+import { FormEvent, useEffect, useState } from "react";
 import type * as React from "react";
 import type {
   ContactTab,
@@ -42,7 +44,8 @@ import type {
   UserOperationGuidePreview,
   SimulationTurn,
   OperationDomainConfig,
-  OperationDomainDraft
+  OperationDomainDraft,
+  SendHistoryItem
 } from "../../types";
 import { api } from "../../lib/api";
 
@@ -133,6 +136,7 @@ export function UserOperationCockpit({
   playbooks,
   profileNote,
   customAgentInstructions,
+  assistOverride,
   selected,
   selectedPlaybookId,
   simulationBusy,
@@ -146,10 +150,12 @@ export function UserOperationCockpit({
   onPreviewGuide,
   onProfileNote,
   onCustomAgentInstructions,
+  onAssistOverride,
   onRunMemoryConsolidation,
   onRunSimulation,
   onSaveProfileNote,
   onSaveCustomAgentInstructions,
+  onSaveAssistOverride,
   onSelectedPlaybook,
   onSimulationInput,
   onTab
@@ -168,6 +174,7 @@ export function UserOperationCockpit({
   playbooks: OperationPlaybook[];
   profileNote: string;
   customAgentInstructions: string;
+  assistOverride: string;
   selected: Contact | null;
   selectedPlaybookId: string;
   simulationBusy: boolean;
@@ -181,10 +188,12 @@ export function UserOperationCockpit({
   onPreviewGuide: (instruction: string) => void;
   onProfileNote: (value: string) => void;
   onCustomAgentInstructions: (value: string) => void;
+  onAssistOverride: (mode: string) => void;
   onRunMemoryConsolidation: () => void;
   onRunSimulation: () => void;
   onSaveProfileNote: () => void;
   onSaveCustomAgentInstructions: () => void;
+  onSaveAssistOverride: () => void;
   onSelectedPlaybook: (value: string) => void;
   onSimulationInput: (value: string) => void;
   onTab: (tab: SmartOpsTab) => void;
@@ -299,6 +308,8 @@ export function UserOperationCockpit({
           </section>
 
           <PlannerViewSection contact={selected} />
+
+          <SendHistorySection wxid={selected.wxid} />
         </section>
       )}
 
@@ -388,6 +399,24 @@ export function UserOperationCockpit({
               </button>
             )}
           </label>
+          {selected.agentStatus === "managed" && (
+            <label>
+              <span>辅助模式（本客户）</span>
+              <small>覆盖账号级默认：跟随账号 / 强制为本客户引荐专属顾问 / 强制不引荐。</small>
+              <select
+                value={assistOverride}
+                onChange={(event) => onAssistOverride(event.target.value)}
+              >
+                <option value="default">跟随账号默认</option>
+                <option value="force_on">强制开启引荐</option>
+                <option value="force_off">强制关闭引荐</option>
+              </select>
+              <button className="secondary" onClick={onSaveAssistOverride} disabled={busy} type="button">
+                <SquarePen size={16} />
+                保存辅助模式
+              </button>
+            </label>
+          )}
           <div className="buttonRow">
             {selected.agentStatus === "managed" ? (
               <>
@@ -1072,6 +1101,17 @@ export function DomainConfigEditor({
               <span>复盘规则</span>
               <textarea value={draft.reviewPolicy} onChange={(event) => onDraft({ ...draft, reviewPolicy: event.target.value })} />
             </label>
+            <label>
+              <span>辅助模式（专属顾问名片引荐）</span>
+              <small>开启后，AI 会在客户契合引荐条件时主动把专属顾问名片推送给客户（辅助模式）。</small>
+              <select
+                value={draft.assistModeEnabled ? "true" : "false"}
+                onChange={(event) => onDraft({ ...draft, assistModeEnabled: event.target.value === "true" })}
+              >
+                <option value="false">关闭</option>
+                <option value="true">开启</option>
+              </select>
+            </label>
           </div>
         </section>
 
@@ -1615,6 +1655,7 @@ function ConversationStream({ messages }: { messages: Message[] }) {
     }
     if (!Number.isNaN(ts)) lastTime = ts;
     const isInbound = message.direction === "inbound";
+    const isNamecard = message.msgType === "namecard";
     items.push(
       <div key={message.id} className={`bubbleRow ${isInbound ? "inbound" : "outbound"}`}>
         <div className="bubbleAvatar">
@@ -1622,7 +1663,19 @@ function ConversationStream({ messages }: { messages: Message[] }) {
         </div>
         <div className="bubbleBody">
           <div className="bubble">
-            <p>{message.content}</p>
+            {isNamecard ? (
+              <span className="namecardBubble">
+                <ContactIcon size={15} />
+                <span>已为客户引荐专属顾问{message.content ? `：${message.content}` : ""}</span>
+              </span>
+            ) : message.msgType === "media" ? (
+              <div className="mediaBubble">
+                <Paperclip size={14} />
+                <span>{message.content || "[已发送素材文件]"}</span>
+              </div>
+            ) : (
+              <p>{message.content}</p>
+            )}
           </div>
           <span className="bubbleMeta">{formatTime(message.createdAt)}</span>
         </div>
@@ -1960,6 +2013,85 @@ export function PlannerViewSection({ contact }: { contact: Contact | null }) {
       )}
     </section>
   );
+}
+
+
+/** 簇 A / Task 9：客户画像 cockpit 内嵌「AI 已发送」只读历史小面板。
+ *  消费 GET /api/contacts/:wxid/send-history，只展示 AI 主动触达过的
+ *  素材 / 名片记录及客户反应信号，纯只读、无操作按钮，符合全自治定位。
+ *  选中客户 wxid 变化时随画像同生命周期重新拉取；客户端故障置空不崩页。 */
+
+function SendHistorySection({ wxid }: { wxid: string }) {
+  const [items, setItems] = useState<SendHistoryItem[]>([]);
+  const [loaded, setLoaded] = useState(false);
+
+  useEffect(() => {
+    let alive = true;
+    setLoaded(false);
+    setItems([]);
+    if (!wxid) {
+      setLoaded(true);
+      return;
+    }
+    api
+      .get<{ items: SendHistoryItem[] }>(`/api/contacts/${wxid}/send-history`)
+      .then((res) => {
+        if (!alive) return;
+        setItems(Array.isArray(res.items) ? res.items : []);
+        setLoaded(true);
+      })
+      .catch(() => {
+        if (!alive) return;
+        setItems([]);
+        setLoaded(true);
+      });
+    return () => {
+      alive = false;
+    };
+  }, [wxid]);
+
+  if (loaded && !items.length) {
+    return (
+      <section className="cockpitSection">
+        <div className="sectionCaption">AI 已发送</div>
+        <EmptyInline text="AI 还没有主动给该客户发送过素材或名片。" />
+      </section>
+    );
+  }
+
+  return (
+    <section className="cockpitSection">
+      <div className="sectionCaption">AI 已发送</div>
+      <div className="contextPackGrid">
+        {items.map((item, index) => (
+          <div key={`${item.targetId}-${index}`}>
+            <span>{item.sendKind === "namecard" ? "名片" : "素材"}</span>
+            <p>{item.targetTitle || item.targetId}</p>
+            <p style={{ color: "var(--muted)" }}>发送时间 {formatTime(item.sentAt)}</p>
+            <SendHistoryResponseTag responded={item.responded} />
+          </div>
+        ))}
+      </div>
+    </section>
+  );
+}
+
+/** 响应信号标记：responded=true 已响应（AI 语义色青）/ false 未响应 / null 待评估。
+ *  颜色取自既有语义 token（--ai / --muted），不硬编码色值。 */
+
+function SendHistoryResponseTag({ responded }: { responded?: boolean | null }) {
+  if (responded === true) {
+    return (
+      <p style={{ display: "inline-flex", alignItems: "center", gap: 6, color: "var(--ai)" }}>
+        <span className="dot managed" />
+        已响应
+      </p>
+    );
+  }
+  if (responded === false) {
+    return <p style={{ color: "var(--muted)" }}>未响应</p>;
+  }
+  return <p style={{ color: "var(--muted-soft)" }}>待评估</p>;
 }
 
 

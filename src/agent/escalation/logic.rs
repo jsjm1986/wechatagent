@@ -86,6 +86,20 @@ pub fn fallback_holding_reply() -> &'static str {
     "这个我帮你确认一下，稍等我给你准信。"
 }
 
+/// 链尾失联（无更多决策人可改派）时给客户的延期安抚话术。AI 自治口吻，表达"还在跟进"，
+/// 不自答越权点、不复述任何未授权内容、绝不出现转接类禁词（受全自治定位文本 lint 约束）。
+/// 红线：客户永不被晾死、永不直接面对真人——领导一直不回也由 AI 持续安抚保持等待。
+pub(crate) fn chain_tail_holding_reply() -> &'static str {
+    "您这个问题我还在帮您核实确认，需要一点时间，麻烦您稍等下～一有结果我马上同步您。"
+}
+
+/// 授权过期的中性收尾话术：relay task 跑时领导授权已过期，不复述任何过期承诺/数字，
+/// 只表达"会继续跟进"。AI 自治口吻，绝不出现转接类禁词。
+/// 用于早退分支：客户不被晾死、awaiting 标记同步清除。
+pub(crate) fn expired_authorization_neutral_reply() -> &'static str {
+    "关于您之前问的那件事，我这边再帮您核实下最新情况，有确切消息第一时间同步您～"
+}
+
 /// 该条已 resolved 的授权当前是否仍可用于转述。
 /// expires=None 视为不过期（如纯拒绝类裁决无时效）。
 pub(crate) fn authorization_is_usable(
@@ -133,7 +147,7 @@ pub(crate) fn parse_high_risk_mode(raw: Option<&str>) -> HighRiskEscalationMode 
 /// 用于推请示卡前，杜绝把内部请示卡误发给客户。
 ///
 /// 当前所有请示卡发送路径（`trigger_principal_escalation` / `escalate_held_decision`）
-/// 的目标 wxid 都直接取自 `principal_decider_wxid()` 这一权威配置查询，故无需再调本守卫
+/// 的目标 wxid 都直接取自 `resolve_ask_human_policy(...).decider_chain` 这一权威策略解析，故无需再调本守卫
 /// （调了也是同源恒真）。保留本函数作为「目标 vs 配置」不同源场景的防御 API + 其不变量单测；
 /// `#[allow(dead_code)]` 标注当前无生产调用点。
 #[allow(dead_code)]
@@ -176,6 +190,55 @@ pub(crate) fn relay_output_leaks_internal_payload(reply_text: &str) -> bool {
         || reply_text.contains("verdict=")
         || reply_text.contains("substance=")
         || reply_text.contains("constraints=")
+}
+
+/// 提取文本中的"数量事实" token：阿拉伯数字串（含小数点）。归一化为去前导零的数字字符串。
+/// 用于 relay 转述的数字白名单核验——只看客观数量，不碰措辞。
+fn extract_number_tokens(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    for ch in text.chars() {
+        if ch.is_ascii_digit() || (ch == '.' && !cur.is_empty()) {
+            cur.push(ch);
+        } else if !cur.is_empty() {
+            out.push(normalize_number_token(&cur));
+            cur.clear();
+        }
+    }
+    if !cur.is_empty() {
+        out.push(normalize_number_token(&cur));
+    }
+    out
+}
+
+/// 归一化数字 token：去尾随小数点、去多余前导零（保留至少一位）。
+fn normalize_number_token(s: &str) -> String {
+    let trimmed = s.trim_end_matches('.');
+    let (int_part, frac_part) = match trimmed.split_once('.') {
+        Some((i, f)) => (i, Some(f)),
+        None => (trimmed, None),
+    };
+    let int_norm = int_part.trim_start_matches('0');
+    let int_norm = if int_norm.is_empty() { "0" } else { int_norm };
+    match frac_part {
+        Some(f) => format!("{}.{}", int_norm, f),
+        None => int_norm.to_string(),
+    }
+}
+
+/// relay 转述数字护栏：转述文本若出现授权 substance 里没有的数量事实（数字/百分比/
+/// 金额）→ 返回 true（fail-closed，网关据此不发该转述）。领导授权"9折"，转述编成
+/// "8折"或追加授权外的"95%成功率"都会命中。只兜客观数量，不判断措辞语义。
+/// 纯函数，反过拟合（测多种数字形态变体）。
+pub(crate) fn relay_introduces_unauthorized_number(
+    reply_text: &str,
+    authorized_substance: &str,
+) -> bool {
+    let authorized: std::collections::HashSet<String> =
+        extract_number_tokens(authorized_substance).into_iter().collect();
+    extract_number_tokens(reply_text)
+        .into_iter()
+        .any(|tok| !authorized.contains(&tok))
 }
 
 /// 从意图轨迹尾部数"连续未推进"轮数：未推进 = 相邻条目 `intent` 相同（含都为空串）。
@@ -243,23 +306,49 @@ pub(crate) fn build_decision_signals_text(
         );
     }
 
+    // ④ 已引荐态：本客户已引荐给专属顾问，AI 退为辅助答疑、不再主动推进成交/重复引荐。
+    if contact
+        .domain_attributes
+        .as_ref()
+        .map(|d| d.contains_key(crate::models::REFERRED_SPECIALIST_AT_ATTR))
+        .unwrap_or(false)
+    {
+        lines.push(
+            "- 本客户已引荐给专属顾问，你退为辅助：客户再问就正常答疑，不再主动推进成交、不重复引荐（除非客户出现与上次完全不同的新需求场景）。".to_string(),
+        );
+    }
+
     lines.join("\n")
 }
 
-/// 被风险闸门 hold 的件是否要升级请示领导（纯函数，业务判定，便于单测）。
-/// `blocked_status` 是网关 hold 分支算出的终态字面量（见 review::GatewayStatusFinal::gateway_status_str）。
-/// 取舍（已拍板）：安全门/未验证产品声明无条件升级（这两类是"不敢答"的硬风险，领导必须知道）；
-/// ai_policy 仅 All 模式升级（保守默认 DecisionOnly 下，策略性暂缓不打扰领导）；
-/// 等待更多上下文 / 必填缺失 / 预算超额 / context_changed 一律不升级（不是决策墙，是 AI 自身可恢复的状态）。
-pub(crate) fn should_escalate_held(blocked_status: &str, mode: HighRiskEscalationMode) -> bool {
+/// 被风险闸门 hold 的件是否要升级请示领导。由 ResolvedAskHumanPolicy 的逐类别开关驱动。
+/// 取舍：安全门/未验证产品声明默认升级（escalate_safety_guard/escalate_unverified_product，
+/// 默认 true）；ai_policy 仅 escalate_ai_policy_hold=true 时升级；其它终态（等待上下文/必填
+/// 缺失/预算/context_changed）一律不升级（非决策墙）。
+pub(crate) fn should_escalate_held(
+    blocked_status: &str,
+    policy: &crate::agent::escalation::ResolvedAskHumanPolicy,
+) -> bool {
     match blocked_status {
-        s if s == crate::agent::types::HOLD_CATEGORY_BLOCKED_BY_SAFETY_GUARD => true,
-        "blocked_unverified_product_claim" => true,
+        s if s == crate::agent::types::HOLD_CATEGORY_BLOCKED_BY_SAFETY_GUARD => {
+            policy.escalate_safety_guard
+        }
+        "blocked_unverified_product_claim" => policy.escalate_unverified_product,
         s if s == crate::agent::types::HOLD_CATEGORY_HELD_BY_AI_POLICY => {
-            mode == HighRiskEscalationMode::All
+            policy.escalate_ai_policy_hold
         }
         _ => false,
     }
+}
+
+/// STUCK（卡死/未送达）类请示是否被本 workspace 的 escalate_stuck 开关压制。
+/// 纯函数：仅对 STUCK 类生效，escalate_stuck=false 时压制；其它类别一律不压制。
+/// 默认 escalate_stuck=true（policy.rs None-path + AskHumanPolicy）→ 字节等价放行。
+pub(crate) fn stuck_suppressed(
+    category: &str,
+    policy: &crate::agent::escalation::ResolvedAskHumanPolicy,
+) -> bool {
+    category == crate::models::ESCALATION_CATEGORY_STUCK && !policy.escalate_stuck
 }
 
 /// 判断 mongodb 错误是否为唯一键冲突（短码碰撞）。
@@ -387,9 +476,11 @@ mod tests {
             authorization_expires_at: None,
             is_generalizable: false,
             knowledge_proposal_emitted: false,
+            last_holding_reply_ms: None,
             created_at: mongodb::bson::DateTime::now(),
             updated_at: mongodb::bson::DateTime::now(),
             resolved_at: None,
+            resolved_via: None,
         }
     }
 
@@ -645,6 +736,43 @@ mod tests {
         assert!(relay_output_leaks_internal_payload("constraints=本周付款"));
     }
 
+    fn policy_with(ai_policy: bool) -> crate::agent::escalation::ResolvedAskHumanPolicy {
+        crate::agent::escalation::ResolvedAskHumanPolicy {
+            decider_chain: vec![],
+            escalate_safety_guard: true,
+            escalate_unverified_product: true,
+            escalate_ai_policy_hold: ai_policy,
+            escalate_stuck: true,
+            dedupe_window_hours: None,
+            daily_push_cap: None,
+            quiet_hours: None,
+            timeout_hours: None,
+        }
+    }
+
+    #[test]
+    fn stuck_suppressed_only_gates_stuck_category() {
+        let mut policy = policy_with(false);
+        // STUCK + escalate_stuck=false → 压制。
+        policy.escalate_stuck = false;
+        assert!(stuck_suppressed(
+            crate::models::ESCALATION_CATEGORY_STUCK,
+            &policy
+        ));
+        // STUCK + escalate_stuck=true → 不压制（默认字节等价）。
+        policy.escalate_stuck = true;
+        assert!(!stuck_suppressed(
+            crate::models::ESCALATION_CATEGORY_STUCK,
+            &policy
+        ));
+        // 其它类别（out_of_scope）即便 escalate_stuck=false 也绝不压制。
+        policy.escalate_stuck = false;
+        assert!(!stuck_suppressed(
+            crate::models::ESCALATION_CATEGORY_OUT_OF_SCOPE,
+            &policy
+        ));
+    }
+
     fn traj_entry(intent: &str) -> crate::models::IntentTrajectoryEntry {
         crate::models::IntentTrajectoryEntry {
             turn_index: 0,
@@ -769,56 +897,28 @@ mod tests {
     #[test]
     fn should_escalate_held_safety_guard_unconditional() {
         use crate::agent::types::HOLD_CATEGORY_BLOCKED_BY_SAFETY_GUARD;
-        // 安全门：两种模式都升级。
-        assert!(should_escalate_held(
-            HOLD_CATEGORY_BLOCKED_BY_SAFETY_GUARD,
-            HighRiskEscalationMode::DecisionOnly
-        ));
-        assert!(should_escalate_held(
-            HOLD_CATEGORY_BLOCKED_BY_SAFETY_GUARD,
-            HighRiskEscalationMode::All
-        ));
+        assert!(should_escalate_held(HOLD_CATEGORY_BLOCKED_BY_SAFETY_GUARD, &policy_with(false)));
+        assert!(should_escalate_held(HOLD_CATEGORY_BLOCKED_BY_SAFETY_GUARD, &policy_with(true)));
     }
 
     #[test]
     fn should_escalate_held_unverified_product_unconditional() {
-        // 未验证产品声明：两种模式都升级。
-        assert!(should_escalate_held(
-            "blocked_unverified_product_claim",
-            HighRiskEscalationMode::DecisionOnly
-        ));
-        assert!(should_escalate_held(
-            "blocked_unverified_product_claim",
-            HighRiskEscalationMode::All
-        ));
+        assert!(should_escalate_held("blocked_unverified_product_claim", &policy_with(false)));
+        assert!(should_escalate_held("blocked_unverified_product_claim", &policy_with(true)));
     }
 
     #[test]
-    fn should_escalate_held_ai_policy_only_in_all_mode() {
+    fn should_escalate_held_ai_policy_only_when_enabled() {
         use crate::agent::types::HOLD_CATEGORY_HELD_BY_AI_POLICY;
-        // 策略性暂缓：仅 All 模式升级，保守 DecisionOnly 不打扰领导。
-        assert!(should_escalate_held(
-            HOLD_CATEGORY_HELD_BY_AI_POLICY,
-            HighRiskEscalationMode::All
-        ));
-        assert!(!should_escalate_held(
-            HOLD_CATEGORY_HELD_BY_AI_POLICY,
-            HighRiskEscalationMode::DecisionOnly
-        ));
+        assert!(should_escalate_held(HOLD_CATEGORY_HELD_BY_AI_POLICY, &policy_with(true)));
+        assert!(!should_escalate_held(HOLD_CATEGORY_HELD_BY_AI_POLICY, &policy_with(false)));
     }
 
     #[test]
     fn should_escalate_held_waiting_context_never() {
         use crate::agent::types::HOLD_CATEGORY_AI_WAITING_FOR_MORE_CONTEXT;
-        // 等待更多上下文：不是决策墙，是 AI 自身可恢复状态，永不升级。
-        assert!(!should_escalate_held(
-            HOLD_CATEGORY_AI_WAITING_FOR_MORE_CONTEXT,
-            HighRiskEscalationMode::All
-        ));
-        assert!(!should_escalate_held(
-            HOLD_CATEGORY_AI_WAITING_FOR_MORE_CONTEXT,
-            HighRiskEscalationMode::DecisionOnly
-        ));
+        assert!(!should_escalate_held(HOLD_CATEGORY_AI_WAITING_FOR_MORE_CONTEXT, &policy_with(true)));
+        assert!(!should_escalate_held(HOLD_CATEGORY_AI_WAITING_FOR_MORE_CONTEXT, &policy_with(false)));
     }
 
     #[test]
@@ -829,12 +929,72 @@ mod tests {
             "blocked_by_budget",
             "context_changed",
         ] {
-            assert!(!should_escalate_held(s, HighRiskEscalationMode::All), "{s} 不应升级");
-            assert!(
-                !should_escalate_held(s, HighRiskEscalationMode::DecisionOnly),
-                "{s} 不应升级"
-            );
+            assert!(!should_escalate_held(s, &policy_with(true)), "{s} 不应升级");
+            assert!(!should_escalate_held(s, &policy_with(false)), "{s} 不应升级");
         }
+    }
+
+    // ---- ⑩ relay 转述编造授权外数字护栏 ----
+
+    #[test]
+    fn relay_unauthorized_number_detects_fabricated_discount() {
+        // 领导授权"9折"，转述说"8折" → 引入授权外数字 → 拦。
+        let substance = "可以给客户9折优惠";
+        assert!(relay_introduces_unauthorized_number("我帮您申请到8折了", substance));
+    }
+
+    #[test]
+    fn relay_unauthorized_number_allows_authorized_number() {
+        // 转述里的数字都在授权 substance 内 → 放行。
+        let substance = "可以给客户9折，质保2年";
+        assert!(!relay_introduces_unauthorized_number("给您9折，质保2年", substance));
+    }
+
+    #[test]
+    fn relay_unauthorized_number_allows_no_numbers() {
+        // 转述无任何数字 → 放行（纯定性转述）。
+        let substance = "可以适当让利";
+        assert!(!relay_introduces_unauthorized_number("我帮您争取了一些优惠", substance));
+    }
+
+    #[test]
+    fn relay_unauthorized_number_detects_added_percentage() {
+        // 授权无百分比，转述编造"95%成功率" → 拦。
+        let substance = "这个方案可行";
+        assert!(relay_introduces_unauthorized_number("成功率有95%", substance));
+    }
+
+    #[test]
+    fn relay_unauthorized_number_allows_substance_superset() {
+        // 转述只用了授权数字的子集 → 放行。
+        let substance = "9折，满3000减500，质保2年";
+        assert!(!relay_introduces_unauthorized_number("给您9折优惠", substance));
+    }
+
+    #[test]
+    fn relay_unauthorized_number_ignores_non_quantitative_digits() {
+        // 边界：授权含"9折"，转述复述"9折"但措辞不同 → 同一数字 token → 放行。
+        let substance = "9折";
+        assert!(!relay_introduces_unauthorized_number("可以9折", substance));
+    }
+
+    #[test]
+    fn relay_unauthorized_number_handles_decimal_discount() {
+        // 小数变体：领导授权"9.5折"，转述改成授权外的"9折"（整数）→ 引入授权外数字 → 拦。
+        // 覆盖 normalize_number_token 的 split_once('.') frac_part 分支：
+        // 授权集 = {"9.5"}，"9折"归一化为 token "9" ∉ 集 → true。
+        let substance = "可以给客户9.5折";
+        assert!(relay_introduces_unauthorized_number("我帮您申请到9折了", substance));
+        // 另一变体：转述编成不同小数"8.5折"（"8.5" ∉ {"9.5"}）→ 拦。
+        assert!(relay_introduces_unauthorized_number("帮您争取到8.5折", substance));
+    }
+
+    #[test]
+    fn relay_unauthorized_number_allows_same_decimal() {
+        // 小数变体：授权"9.5折"，转述用同一小数"9.5折" → 归一化后 token "9.5" 命中授权集 → 放行。
+        // 验证小数 token 经 normalize_number_token 后能在授权集内正确匹配（frac_part 往返一致）。
+        let substance = "可以给客户9.5折优惠";
+        assert!(!relay_introduces_unauthorized_number("给您9.5折，很划算", substance));
     }
 
     // ---- fix C：pending 去重唯一索引冲突判定（区分两类 11000）----

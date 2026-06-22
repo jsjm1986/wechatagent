@@ -13,7 +13,11 @@ import {
   ShieldCheck,
   Workflow,
   FileBox,
+  Inbox,
   PackageSearch,
+  Contact,
+  SlidersHorizontal,
+  BarChart3,
   type LucideIcon,
 } from "lucide-react";
 import type { Channel } from "../types";
@@ -30,6 +34,10 @@ const QualityFeature = lazy(() => import("../features/quality"));
 const LlmProvidersFeature = lazy(() => import("../features/llm-providers"));
 const KnowledgeFeature = lazy(() => import("../features/knowledge"));
 const ProductsDealsFeature = lazy(() => import("../features/products-deals"));
+const ReferralCardsFeature = lazy(() => import("../features/referral-cards"));
+const AskHumanFeature = lazy(() => import("../features/ask-human"));
+const AskHumanConfigFeature = lazy(() => import("../features/ask-human-config"));
+const SendAnalyticsFeature = lazy(() => import("../features/send-analytics"));
 
 export interface ChannelDef {
   id: Channel;
@@ -112,6 +120,39 @@ export const CHANNELS: ChannelDef[] = [
     title: "内容资产",
     subtitle: "维护产品资料、FAQ、话术、禁用表达、品牌语气和朋友圈素材。",
     Component: ContentAssetsFeature,
+  },
+  {
+    id: "referralCards",
+    group: "知识",
+    label: "专属顾问",
+    caption: "名片引荐库",
+    icon: Contact,
+    eyebrow: "Referral Cards",
+    title: "专属顾问名片库",
+    subtitle: "维护可由 AI 主动引荐给客户的真人专属顾问名片，录入引荐条件、审核与启停（辅助模式）。",
+    Component: ReferralCardsFeature,
+  },
+  {
+    id: "askHuman",
+    group: "运营",
+    label: "统一收件箱",
+    caption: "Ask-Human Inbox",
+    icon: Inbox,
+    eyebrow: "Ask-Human",
+    title: "统一收件箱",
+    subtitle: "所有需要决策/审核的事项收口在此：请示裁决、知识核验、画像发布、经验晋升。",
+    Component: AskHumanFeature,
+  },
+  {
+    id: "askHumanConfig",
+    group: "运营",
+    label: "请示通道配置",
+    caption: "Ask-Human Policy",
+    icon: SlidersHorizontal,
+    eyebrow: "Ask-Human Policy",
+    title: "请示通道配置",
+    subtitle: "配置决策人链、触发请示的情形、超时转备选与推送频控；保存后即时生效于私聊运营域。",
+    Component: AskHumanConfigFeature,
   },
   {
     id: "productsDeals",
@@ -200,5 +241,16 @@ export const CHANNELS: ChannelDef[] = [
     title: "运营成效",
     subtitle: "用户回复率、对话深度等长期指标，知识切片自动校验，公式遵守度评测，产品声明兜底标记词管理。",
     Component: QualityFeature,
+  },
+  {
+    id: "sendAnalytics",
+    group: "系统",
+    label: "发送成效",
+    caption: "Send Analytics",
+    icon: BarChart3,
+    eyebrow: "Send Analytics",
+    title: "发送成效",
+    subtitle: "查看 AI 主动发送的素材与专属顾问名片的使用次数、覆盖客户数、响应率与阶段推进率。",
+    Component: SendAnalyticsFeature,
   },
 ];

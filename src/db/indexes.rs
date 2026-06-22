@@ -195,6 +195,67 @@ pub(super) async fn ensure_all(db: &Database) -> anyhow::Result<()> {
             None,
         )
         .await?;
+    // 销售素材选材查询：按 workspace 过滤可发送(sendable)且已审核(review_status)的素材。
+    db.content_assets()
+        .create_index(
+            IndexModel::builder()
+                .keys(doc! { "workspace_id": 1, "sendable": 1, "review_status": 1 })
+                .build(),
+            None,
+        )
+        .await?;
+    // 文件去重：按 file_sha256 命中已上传素材，避免重复上传/重传 MCP media_id。
+    db.content_assets()
+        .create_index(
+            IndexModel::builder()
+                .keys(doc! { "file_sha256": 1 })
+                .build(),
+            None,
+        )
+        .await?;
+    // 专属顾问名片引荐选材：按 workspace/account 过滤已启用(enabled)且已审核(review_status)的名片。
+    db.referral_cards()
+        .create_index(
+            IndexModel::builder()
+                .keys(doc! {
+                    "workspace_id": 1,
+                    "account_id": 1,
+                    "enabled": 1,
+                    "review_status": 1,
+                })
+                .build(),
+            None,
+        )
+        .await?;
+    // 主动发送台账：单客户发送历史（按时间倒序）。
+    db.agent_send_ledger()
+        .create_index(
+            IndexModel::builder()
+                .keys(doc! { "workspace_id": 1, "contact_wxid": 1, "sent_at": -1 })
+                .build(),
+            None,
+        )
+        .await?;
+    // 主动发送台账：素材/名片维度聚合。
+    db.agent_send_ledger()
+        .create_index(
+            IndexModel::builder()
+                .keys(doc! { "workspace_id": 1, "send_kind": 1, "target_id": 1 })
+                .build(),
+            None,
+        )
+        .await?;
+    // 主动发送台账：回扫服务索引。匹配 scan 查询形状
+    // （filter { outcome_evaluated_at: { $exists: false } } + sort { sent_at: 1 }，
+    // 全局扫不带 workspace_id），前缀 outcome_evaluated_at 命中过滤、sent_at 命中排序。
+    db.agent_send_ledger()
+        .create_index(
+            IndexModel::builder()
+                .keys(doc! { "outcome_evaluated_at": 1, "sent_at": 1 })
+                .build(),
+            None,
+        )
+        .await?;
     db.agent_souls()
         .create_index(
             IndexModel::builder()

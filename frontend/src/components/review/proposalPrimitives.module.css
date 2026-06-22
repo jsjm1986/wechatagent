@@ -1,0 +1,18 @@
+/* Ask-Human Phase 2 Task 6（零跨feature修订）：状态徽章原语的中立 CSS。
+   从 features/evolution/EvolutionCenterTab.module.css 逐字复制 .badge + .badge* 规则，
+   使 StatusBadge 在老页与卡片中渲染完全一致，同时切断对 features/evolution 的依赖。
+   色值统一走 tokens.css 变量，禁止硬编码。 */
+
+/* —— 状态徽章（6 态映射语义色；保留 data-tone 供测试断言）—— */
+.badge {
+  display: inline-flex; align-items: center; gap: 5px;
+  font-size: 11px; font-weight: 600; letter-spacing: -.1px;
+  padding: 4px 10px; border-radius: 999px;
+  color: var(--ink-2); background: var(--fill-inactive); border: 1px solid var(--hairline);
+}
+.badgeNeutral { color: var(--ink-2); background: var(--fill-inactive); border-color: var(--hairline); }
+.badgeInfo { color: var(--color-scheduled); background: var(--fill-scheduled); border-color: rgba(10, 132, 255, .26); }
+.badgeSuccess { color: #1a9c45; background: var(--fill-running); border-color: rgba(48, 209, 88, .3); }
+.badgeWarn { color: var(--color-held); background: var(--fill-held); border-color: rgba(255, 159, 10, .3); }
+.badgePrimary { color: var(--color-brand); background: var(--fill-brand); border-color: rgba(94, 92, 230, .26); }
+.badgeDanger { color: var(--color-blocked); background: var(--fill-blocked); border-color: rgba(255, 69, 58, .3); }

@@ -46,7 +46,10 @@ SCAN_DIRS=(
 # - docs/llm-config.md 等运维文档允许出现 OpenAI/DeepSeek 等品牌（中性介绍）；
 # - docs/real-task-* 是运维 runbook，允许提及当前实际使用的 LLM 品牌；
 # - knowledge-wiki 设计文档（design.md）允许提及 LLW 等借鉴来源。
-SKIP_PATHS_REGEX='(^|/)((\.env\.example)|(config\.rs)|(llm\.rs)|(error\.rs)|tests/|.*/tests\.rs|.*\.test\.(ts|tsx|js|jsx)|llm-config\.md|llm-providers\.md|README\.md|real-task-.*\.md|.*-design\.md)$'
+# - docs/superpowers/plans/*.md 是实现计划，task 的 commit step 会粘标准
+#   `Co-Authored-By: Claude <noreply@anthropic.com>` 署名模板（工具固定产物，
+#   非模型选型暗示），与已豁免的 *-design.md 同属 superpowers 流程产物，一并豁免。
+SKIP_PATHS_REGEX='(^|/)((\.env\.example)|(config\.rs)|(llm\.rs)|(error\.rs)|tests/|.*/tests\.rs|.*\.test\.(ts|tsx|js|jsx)|llm-config\.md|llm-providers\.md|README\.md|real-task-.*\.md|.*-design\.md)$|docs/superpowers/plans/.*\.md$'
 
 # 严禁字面量（大小写不敏感）。
 # 注意：

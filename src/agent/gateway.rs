@@ -39,7 +39,6 @@ use super::decision::{
     decide_reply_with_promote, load_operation_playbook_for_contact,
     load_operation_state_policy_for_contact, load_user_operation_domain_config_for_contact,
 };
-use super::domain::USER_OPS_DOMAIN_ID;
 use super::escalation;
 use super::guards::{
     check_state_transition, classify_decision_action, enforce_state_action_policy,
@@ -56,6 +55,7 @@ use super::memory::{
     memory_card_has_signal, next_memory_card_version, schedule_memory_consolidation_task,
     write_memory_candidates,
 };
+use super::multimodal;
 use super::review::{
     decide_revision, derive_revision_failure, effective_review_mode, finalize_review_for_send,
     local_decision_review, review_decision, review_passed, should_run_review, FinalizeOutcome,
@@ -77,6 +77,14 @@ use super::taxonomy::{
     check_value as taxonomy_check_value, global_taxonomy_cache, upsert_candidate as taxonomy_upsert_candidate,
     TaxonomyMatch,
 };
+
+/// 弱启发：reply 是否含"时间相关承诺"特征。仅用于 ⑥ 观测覆盖率，不进任何门、
+/// 不改变发送判定。非红线护栏（"是否做了承诺"是语义判断，交 LLM + prompt）。
+/// 明确接受可能误报/漏报——这正是它只观测不拦的原因。
+fn reply_has_time_commitment_feature(reply: &str) -> bool {
+    const MARKERS: [&str; 8] = ["明天", "后天", "下周", "下个月", "稍后", "晚点", "回头", "马上"];
+    MARKERS.iter().any(|m| reply.contains(m))
+}
 
 pub async fn handle_managed_message(
     state: &AppState,
@@ -159,6 +167,8 @@ pub async fn send_contact_message_gateway(
         dedupe_key: None,
         direction: MessageDirection::Inbound,
         content: "后台管理 Agent 请求发送私聊，请按生产发送网关进行频控和审查。".to_string(),
+        msg_type: None,
+        media_ref: None,
         raw: Some(request.source.clone()),
         created_at: DateTime::now(),
     };
@@ -359,6 +369,8 @@ pub async fn send_contact_message_gateway(
         source_event_id: String::new(),
         source_kind: SOURCE_KIND_MANUAL_SEND.to_string(),
         content: content.clone(),
+        media_asset_id: None,
+        referral_card_id: None,
         max_attempts: 3,
     };
     match outbox_enqueue(state, enqueue_req).await {
@@ -432,6 +444,114 @@ fn trigger_envelope_source(trigger: &AgentTrigger<'_>) -> (String, &'static str)
     }
 }
 
+/// F2（多模态入站地基）：判定本次触发是否为"非文本入站消息"，若是则发过渡话术并
+/// 返回 `Ok(true)`（调用方据此 early-return，**不进决策 Agent**）；否则返回
+/// `Ok(false)` 让主链路照常处理。
+///
+/// 拦截条件（全满足才拦）：
+/// * 触发是 `Inbound`（FollowUp 主动触达没有真实媒体消息，不拦）；
+/// * `msg_type` 存在且既非 `"text"`、`None` 也兼容为文本（旧数据 msg_type 缺失视作文本）；
+/// * 媒体理解链路未接通——当前 [`multimodal::fetch_inbound_media`] 打桩恒 `None`，
+///   故所有非文本消息此刻都走过渡话术（图片下载/语音 ASR 接通后再分流）。
+///
+/// 过渡话术经 outbox 发送（保留幂等键 + 出站记录），尊重 precheck（调用方已在本函数
+/// 前过完 precheck，managed/频控等门都已通过）。绝不硬答空串/原始 XML、绝不 panic。
+async fn maybe_handle_non_text_transition(
+    state: &AppState,
+    contact: &Contact,
+    trigger: &AgentTrigger<'_>,
+    run_id: &str,
+    source_event_id: &str,
+    source_kind: &str,
+) -> AppResult<bool> {
+    let AgentTrigger::Inbound(inbound) = trigger else {
+        return Ok(false);
+    };
+    let msg_type = match inbound.msg_type.as_deref() {
+        // msg_type 缺失（旧数据）视作文本，主链路照常；"text" 显式文本同理。
+        None | Some("text") => return Ok(false),
+        Some(other) if other.trim().is_empty() => return Ok(false),
+        Some(other) => other.to_string(),
+    };
+
+    // 媒体理解链路（下载 → 图片理解 / 语音 ASR）当前打桩未接通：拉取恒 None。
+    // 接通后这里改为对 image 走 describe_inbound_image，其它类型继续过渡话术。
+    let media = if let Some(media_ref) = inbound.media_ref.as_deref() {
+        multimodal::fetch_inbound_media(state, media_ref).await?
+    } else {
+        None
+    };
+    if media.is_some() {
+        // 地基阶段不会到达：fetch_inbound_media 恒 None。接通后在此分流图片理解，
+        // 暂保守地仍走过渡话术（不为"让它跑起来"硬接尚未立项的下游）。
+        tracing::debug!(
+            contact_wxid = %contact.wxid,
+            %msg_type,
+            "F2: 媒体已拉取但理解链路尚未立项，暂走过渡话术兜底"
+        );
+    }
+
+    let reply = multimodal::non_text_transition_reply(&msg_type);
+    let enqueue_req = EnqueueRequest {
+        workspace_id: contact.workspace_id.clone(),
+        account_id: contact.account_id.clone(),
+        contact_wxid: contact.wxid.clone(),
+        run_id: run_id.to_string(),
+        decision_id: None,
+        source_event_id: source_event_id.to_string(),
+        source_kind: source_kind.to_string(),
+        content: reply.clone(),
+        media_asset_id: None,
+        referral_card_id: None,
+        max_attempts: 3,
+    };
+    match outbox_enqueue(state, enqueue_req).await {
+        Ok(EnqueueOutcome::Created { outbox_id, .. }) => {
+            tracing::info!(%run_id, %outbox_id, contact_wxid = %contact.wxid, %msg_type,
+                "F2: 非文本入站过渡话术已入队 outbox");
+        }
+        Ok(EnqueueOutcome::IdempotentSkip { idempotency_key }) => {
+            tracing::info!(%run_id, %idempotency_key, contact_wxid = %contact.wxid, %msg_type,
+                "F2: 非文本入站过渡话术 outbox 幂等 skip");
+        }
+        Err(err) => {
+            tracing::error!(?err, %run_id, "F2: 非文本入站过渡话术 outbox 入队失败");
+            return Err(err.into());
+        }
+    }
+
+    write_event_for_account(
+        state,
+        &contact.account_id,
+        Some(&contact.wxid),
+        "non_text_inbound_transition",
+        "enqueued",
+        "非文本入站消息：理解链路未接通，已发过渡话术请客户文字补充",
+        Some(doc! { "msgType": &msg_type, "runId": run_id }),
+    )
+    .await?;
+
+    write_agent_run_log(
+        state,
+        contact,
+        run_id,
+        trigger.kind(),
+        "outbox_enqueued",
+        &RunPlannerResult::default(),
+        doc! { "refreshed": false, "reason": "non_text_inbound_transition" },
+        &KnowledgeRouteResult::default(),
+        doc! { "msgType": &msg_type, "replyKind": "non_text_transition" },
+        Document::new(),
+        doc! { "gatewayStatus": "outbox_enqueued", "msgType": &msg_type },
+        None,
+        source_event_id,
+        source_kind,
+    )
+    .await?;
+
+    Ok(true)
+}
+
 pub(crate) async fn run_user_operation_gateway(
     state: &AppState,
     contact: Contact,
@@ -490,20 +610,44 @@ pub(crate) async fn trigger_principal_escalation(
     if !req.needed {
         return Ok(());
     }
-    let Some(principal_wxid) =
-        escalation::principal_decider_wxid(state, &contact.workspace_id, USER_OPS_DOMAIN_ID).await?
+    let Some(cfg) = super::decision::load_user_operation_domain_config_for_contact(
+        state,
+        &contact.workspace_id,
+        &contact.wxid,
+    )
+    .await?
     else {
-        return Ok(()); // 未配置领导 = 本 workspace 未启用请示通道
+        return Ok(()); // 无 config = 请示通道未配置
     };
+    let policy = escalation::resolve_ask_human_policy(&cfg);
+    let Some(decider) = policy.decider_chain.first() else {
+        return Ok(()); // 决策人链空 = 本 workspace 未启用请示通道
+    };
+    let principal_wxid = decider.wxid.clone();
     if principal_wxid == contact.wxid {
         return Err(AppError::BadRequest(
-            "principal_decider 配置等于客户 wxid，拒绝触发请示".into(),
+            "决策人配置等于客户 wxid，拒绝触发请示".into(),
         ));
+    }
+    // 骚扰门：daily_push_cap / quiet_hours（None 配置全放行，字节等价）。
+    let now_ms = mongodb::bson::DateTime::now().timestamp_millis();
+    let since_ms = now_ms - 24 * 3600 * 1000;
+    let today =
+        escalation::count_pushes_today(state, &contact.workspace_id, &principal_wxid, since_ms)
+            .await?;
+    let last_push =
+        escalation::latest_push_ms(state, &contact.workspace_id, &principal_wxid).await?;
+    if !escalation::push_allowed(&policy, today, last_push, now_ms) {
+        return Ok(()); // 骚扰门关：跳过推卡
     }
     let category = req
         .category
         .clone()
         .unwrap_or_else(|| crate::models::ESCALATION_CATEGORY_OUT_OF_SCOPE.to_string());
+    // escalate_stuck=false → 本 workspace 关闭"卡死"类请示（默认 true 字节等价）。
+    if escalation::stuck_suppressed(&category, &policy) {
+        return Ok(());
+    }
     // 去重：同客户同类别已有 pending → 不重复推卡。
     if escalation::has_pending_for_contact(state, &contact.workspace_id, &contact.wxid, &category)
         .await?
@@ -589,7 +733,11 @@ pub(crate) async fn relay_principal_decision_to_customer(
 }
 
 /// 清掉客户 state 上的"等待领导决策"标记（key 用 AWAITING_PRINCIPAL_DECISION_ATTR 常量）。
-async fn clear_awaiting_principal_state(state: &AppState, contact: &Contact) -> AppResult<()> {
+/// `pub(crate)`：escalation 模块授权过期早退分支也需清此标记，避免 awaiting 永久残留。
+pub(crate) async fn clear_awaiting_principal_state(
+    state: &AppState,
+    contact: &Contact,
+) -> AppResult<()> {
     let unset_key = format!(
         "domain_attributes.{}",
         crate::models::AWAITING_PRINCIPAL_DECISION_ATTR
@@ -604,6 +752,35 @@ async fn clear_awaiting_principal_state(state: &AppState, contact: &Contact) -> 
         )
         .await?;
     Ok(())
+}
+
+/// media-asset Task 8：素材发送相对文本回复的定序。当前两种 expression_pref
+/// （file_primary / file_support）都先发一句文字引导、文件随后（先文字后文件）；
+/// 抽成纯函数留扩展点——若后续想让 file_primary 改成先发文件，只改这一处。
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum SendOrder {
+    TextThenMedia,
+}
+
+pub(crate) fn media_send_order(_expression_pref: &str) -> SendOrder {
+    SendOrder::TextThenMedia
+}
+
+/// media-asset 终审 Important#1：媒体发送资格 = 文本发送资格（同源）。
+/// `outbox_eligible` 已综合 should_reply + reply_text 非空 + final_status 终态
+/// + relay 泄漏 fail-closed 守卫四项。媒体复用它，杜绝三个缺口：
+/// ①should_reply=false/文本空时只发孤立文件（违背"文件配引导话术"设计）；
+/// ②relay 守卫置 false 时媒体仍照发。设计文档 §6.2 规定 file_primary 也总有
+/// 简短引导文本，故复用要求非空文本的 outbox_eligible 是正确的、不会过严。
+pub(crate) fn media_send_allowed(outbox_eligible: bool, has_assets: bool) -> bool {
+    outbox_eligible && has_assets
+}
+
+/// media-asset 终审 Important#1：并发去抖中止应覆盖文本与媒体两条轨道——只要本
+/// run 会发任何东西（文本或媒体）就该被"已被更新入站取代"的去抖拦截，否则一个
+/// superseded 的 run 仍会发出孤立文件（媒体去抖失效）。
+pub(crate) fn should_run_send(outbox_eligible: bool, media_pending: bool) -> bool {
+    outbox_eligible || media_pending
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -627,7 +804,7 @@ async fn run_user_operation_gateway_inner(
         if let Some(task_id) = task_id {
             // #69：静默时段命中 → 重排到醒来时刻（不取消，避免丢承诺/催进）；其余 block 维持取消。
             if precheck.status == "quiet_hours_deferred" {
-                let wake_at = crate::agent::quiet_hours::next_wake_at(runtime.quiet_hours_end, runtime.quiet_hours_tz_offset_hours);
+                let wake_at = crate::agent::quiet_hours::next_wake_at(runtime.quiet_hours_end, runtime.quiet_hours_tz_offset_hours, &contact.wxid, state.config.wake_jitter_max_seconds);
                 reschedule_task(state, task_id, wake_at, &precheck.reason).await?;
             } else {
                 cancel_task(state, task_id, &precheck.status, &precheck.reason).await?;
@@ -660,6 +837,24 @@ async fn run_user_operation_gateway_inner(
             &envelope_source_kind,
         )
         .await?;
+        return Ok(());
+    }
+
+    // F2（多模态入站地基）：非文本入站消息（image/voice/link/miniprogram/file/unknown）
+    // 在进决策 Agent 之前先拦一道——决策链路只会把空串/原始 XML 当文本硬答。媒体
+    // 理解链路当前未接通（fetch_inbound_media 打桩恒 None），故发一条 AI 自治口吻的
+    // 过渡话术请客户文字补充，走 outbox 保留幂等/记录，绝不硬答空串/XML、绝不崩。
+    // text 消息（msg_type=="text" 或 None 兼容旧数据）一字不变继续走主链路。
+    if maybe_handle_non_text_transition(
+        state,
+        &contact,
+        &trigger,
+        &run_id,
+        &envelope_source_event_id,
+        &envelope_source_kind,
+    )
+    .await?
+    {
         return Ok(());
     }
 
@@ -889,8 +1084,13 @@ async fn run_user_operation_gateway_inner(
                 Some(&run_id),
             )
             .await?;
+            let prior_namecard = final_decision.namecard_to_send.clone();
             final_decision = rewritten;
             promote_risks = rewrite_promote_risks;
+            // 名片引荐是业务决策，不应因 tone-polish 改写而丢失：改写若未重新输出引荐则沿用改写前意图
+            if final_decision.namecard_to_send.is_none() {
+                final_decision.namecard_to_send = prior_namecard;
+            }
             normalize_decision_state(&mut final_decision, domain_config.as_ref());
             normalize_decision_runtime(&mut final_decision, &planner);
             final_decision.context_pack_version = Some(next_memory_card_version(&memory));
@@ -1209,8 +1409,13 @@ async fn run_user_operation_gateway_inner(
                     )
                     .await?;
 
+                    let prior_namecard = final_decision.namecard_to_send.clone();
                     final_decision = revised_decision;
                     promote_risks = revised_promote_risks;
+                    // 名片引荐是业务决策，不应因 revision 改写而丢失：改写若未重新输出引荐则沿用改写前意图
+                    if final_decision.namecard_to_send.is_none() {
+                        final_decision.namecard_to_send = prior_namecard;
+                    }
 
                     // 改写后的 decision 可能换了 quoted_product_ids，重算 priced_from_catalog。
                     // G4 #5 收口：同上受 transaction_facts_enabled 闸；闸关恒 false。
@@ -1472,6 +1677,36 @@ async fn run_user_operation_gateway_inner(
         {
             tracing::warn!(error = %e, contact = %contact.wxid, "hold→升级请示失败（不阻断 run）");
         }
+
+        // ⑨ 产品宣称被拦 → 写 recall_miss 知识缺口信号（收件箱可见，缺口可被闭环修复）。
+        //
+        // R5.4 硬闸只发了瞬时 `product_claim_blocked` 事件（details 仅 used_knowledge_ids），
+        // 运营无法据此知道「缺什么、补什么」。这里把客户当前问句（inbound.content）落成一条
+        // recall_miss 缺口信号——统一收件箱已展示 source=gap_signal，运营据 search_queries
+        // 里的客户问句对话式补录 / verify 相关知识。
+        //
+        // fail-soft：gap_signal 写失败只记 warn、不阻断 run（回复路径已决，与上方
+        // escalate_held / `agent.dimension_dropped` 的 let _ 同纪律）。落点选在此 async
+        // 上游而非 finalize_review_for_send 内——后者是纯同步 finalize 逻辑、不持有 db。
+        if matches!(finalize_status, GatewayStatusFinal::BlockedUnverifiedProductClaim) {
+            let candidate =
+                crate::knowledge_wiki::gap_signals::GapSignalCandidate::recall_miss_from_product_block(
+                    inbound.content.clone(),
+                );
+            if let Err(e) = crate::knowledge_wiki::gap_signals::persist_recall_signal(
+                &state.db,
+                &contact.workspace_id,
+                candidate,
+            )
+            .await
+            {
+                tracing::warn!(
+                    error = %e,
+                    contact = %contact.wxid,
+                    "产品宣称被拦写 recall_miss 缺口信号失败（不阻断 run）"
+                );
+            }
+        }
         return Ok(());
     }
 
@@ -1482,7 +1717,7 @@ async fn run_user_operation_gateway_inner(
             // 第二道在 LLM 决策之后命中（罕见：仅当静默边界恰好落在决策耗时内），
             // 重排即丢弃这次决策、醒来按完整上下文重跑，语义正确。
             if final_precheck.status == "quiet_hours_deferred" {
-                let wake_at = crate::agent::quiet_hours::next_wake_at(runtime.quiet_hours_end, runtime.quiet_hours_tz_offset_hours);
+                let wake_at = crate::agent::quiet_hours::next_wake_at(runtime.quiet_hours_end, runtime.quiet_hours_tz_offset_hours, &contact.wxid, state.config.wake_jitter_max_seconds);
                 reschedule_task(state, task_id, wake_at, &final_precheck.reason).await?;
             } else {
                 cancel_task(
@@ -1703,36 +1938,64 @@ async fn run_user_operation_gateway_inner(
         && !final_decision.reply_text.trim().is_empty()
         && (final_status == "approved" || final_status == "revision_applied_approved");
     // relay 出站红线守卫（代码级兜底）：relay 转述要求 AI 口吻重组、绝不透传内部
-    // 载荷（__PRINCIPAL_RELAY__/verdict=/substance=/constraints=）。此前仅靠 prompt
-    // 约束；这里在入 outbox 前对 relay run 的拟发文本做最后一道纯函数检查，命中即
-    // fail-closed：不入队泄漏文本（宁可客户这轮收不到，也绝不把内部载荷发给客户），
-    // 记 event + warn 供运维定位。非 relay run 不受影响。
-    if outbox_eligible
-        && escalation::is_principal_relay_trigger(&trigger)
-        && escalation::relay_output_leaks_internal_payload(&final_decision.reply_text)
-    {
-        outbox_eligible = false;
-        tracing::warn!(
-            %run_id,
-            contact_wxid = %contact.wxid,
-            "relay 转述拟发文本疑似泄漏内部载荷，已拦截不发（fail-closed）"
+    // 载荷（__PRINCIPAL_RELAY__/verdict=/substance=/constraints=）；同时绝不编造领导
+    // 授权之外的数量事实（授权"9折"不得转成"8折"或加"95%成功率"）。此前仅靠 prompt
+    // 约束；这里在入 outbox 前对 relay run 的拟发文本做最后两道纯函数检查，命中即
+    // fail-closed：不入队该文本（宁可客户这轮收不到，也绝不把内部载荷/编造数字发给
+    // 客户），记 event + warn 供运维定位。非 relay run 不受影响。数字白名单的授权源
+    // 取合成 relay 消息的完整载荷（含 substance + constraints 里领导授权的全部数字）。
+    if outbox_eligible && escalation::is_principal_relay_trigger(&trigger) {
+        let authorized_payload = match &trigger {
+            AgentTrigger::Inbound(m) => m.content.as_str(),
+            AgentTrigger::FollowUp(_) => "",
+        };
+        let leaks_payload =
+            escalation::relay_output_leaks_internal_payload(&final_decision.reply_text);
+        let unauthorized_number = escalation::relay_introduces_unauthorized_number(
+            &final_decision.reply_text,
+            authorized_payload,
         );
-        write_event_for_account(
-            state,
-            &contact.account_id,
-            Some(&contact.wxid),
-            "blocked_review",
-            "blocked_by_safety_guard",
-            "relay 转述输出含内部载荷标记，安全门拦截不发送",
-            None,
-        )
-        .await?;
+        if leaks_payload || unauthorized_number {
+            outbox_eligible = false;
+            let (warn_reason, event_reason) = if leaks_payload {
+                (
+                    "relay 转述拟发文本疑似泄漏内部载荷，已拦截不发（fail-closed）",
+                    "relay 转述输出含内部载荷标记，安全门拦截不发送",
+                )
+            } else {
+                (
+                    "relay 转述拟发文本含授权外数字事实，已拦截不发（fail-closed）",
+                    "relay 转述输出含授权外数字事实，安全门拦截不发送",
+                )
+            };
+            tracing::warn!(
+                %run_id,
+                contact_wxid = %contact.wxid,
+                "{warn_reason}"
+            );
+            write_event_for_account(
+                state,
+                &contact.account_id,
+                Some(&contact.wxid),
+                "blocked_review",
+                "blocked_by_safety_guard",
+                event_reason,
+                None,
+            )
+            .await?;
+        }
     }
     // 并发多消息去抖——兜底中止检查（outbox 入队之前）。主检查在 apply 之前已挡掉
     // 绝大多数；这里再查一次，接住 apply / memory / decision-review 写入期间到达的
     // 更新入站，避免发出一条已过时的回复。此前的画像 / 记忆写入已落库（幂等、
     // last-write-wins），重算会再覆盖一遍，不丢正确性；唯一保证是"不入队过时回复"。
-    if outbox_eligible {
+    // 终审 Important#1：去抖须同时覆盖文本与媒体——只要本 run 会发任何东西就该被
+    // 取代保护。media_pending 用 final_status 终态门判断（与文本无媒体时字节等价：
+    // has_assets=false 时 media_pending=false，条件退化为纯 outbox_eligible）。
+    // 名片引荐同理纳入：本 run 若会发名片，superseded 时也要一并中止（缺口③同源）。
+    let media_pending = (final_status == "approved" || final_status == "revision_applied_approved")
+        && (!final_decision.assets_to_send.is_empty() || final_decision.namecard_to_send.is_some());
+    if should_run_send(outbox_eligible, media_pending) {
         if let Some(guard) = &should_abort_send {
             if guard() {
                 tracing::info!(
@@ -1780,6 +2043,8 @@ async fn run_user_operation_gateway_inner(
                 source_event_id: seg_source_event_id,
                 source_kind: trigger.kind().to_string(),
                 content: segment,
+                media_asset_id: None,
+                referral_card_id: None,
                 max_attempts: 3,
             };
             match outbox_enqueue(state, enqueue_req).await {
@@ -1839,6 +2104,271 @@ async fn run_user_operation_gateway_inner(
             return Err(enqueue_errors.into_iter().next().map(|(_, e)| e).unwrap());
         }
     }
+    // media-asset Task 8：素材文件发送。文本回复已在上方先入 outbox（先文字后文件），
+    // 这里把 final_decision.assets_to_send 逐个转成独立媒体 outbox 条目。
+    // 终审 Important#1：媒体门改为复用 outbox_eligible（含 should_reply + reply 非空
+    // + final_status 终态 + relay 泄漏 fail-closed），与文本发送门同源。后果：当 reply_text
+    // 为空但有素材时会被挡掉——这是**期望行为**（设计要求文件必须配引导话术，不发孤立文件）。
+    // 每条仍做 approved+sendable+合法 media_type 二次准入校验（防 AI 幻觉出未审素材），
+    // 非法 assetId 跳过 + 审计；requires_principal_approval=true 的不直接发，走现有
+    // escalation 请示通道（拿回结论后由领导决策路径决定是否发）。
+    if media_send_allowed(outbox_eligible, !final_decision.assets_to_send.is_empty()) {
+        let media_source_event_id = match &trigger {
+            AgentTrigger::Inbound(msg) => msg.message_id.clone().unwrap_or_default(),
+            AgentTrigger::FollowUp(task) => task.id.map(|id| id.to_hex()).unwrap_or_default(),
+        };
+        for directive in &final_decision.assets_to_send {
+            // 准入二次校验：必须是合法 ObjectId + approved + sendable + 合法 media_type。
+            let oid = match ObjectId::parse_str(&directive.asset_id) {
+                Ok(o) => o,
+                Err(_) => {
+                    write_event_for_account(
+                        state,
+                        &contact.account_id,
+                        Some(&contact.wxid),
+                        "media_asset_id_invalid",
+                        "warning",
+                        "AI 选材给出非法 assetId（非 ObjectId），已跳过不发",
+                        Some(doc! { "run_id": &run_id, "asset_id": &directive.asset_id }),
+                    )
+                    .await
+                    .ok();
+                    continue;
+                }
+            };
+            // 修复2（纵深防御）：按 _id + workspace_id 双条件查，杜绝跨租户 IDOR。
+            // 修复3（一致性）：DB 瞬时故障降级为"记审计 + 跳过该素材（continue）"，与同块
+            // 的 media_outbox_enqueue_failed 对齐；不再用 `?` 传播——否则会跳过函数末尾的
+            // escalation_request 推送（文本早已入 outbox）。
+            let asset = match state
+                .db
+                .content_assets()
+                .find_one(doc! { "_id": oid, "workspace_id": &contact.workspace_id }, None)
+                .await
+            {
+                Ok(a) => a,
+                Err(err) => {
+                    tracing::error!(?err, %run_id, asset_id = %directive.asset_id, "media asset 查询失败（降级跳过该素材，不阻断 run）");
+                    write_event_for_account(
+                        state,
+                        &contact.account_id,
+                        Some(&contact.wxid),
+                        "media_asset_lookup_failed",
+                        "error",
+                        "素材查询失败（文本已照常发出，素材缺失需管理员核对）",
+                        Some(doc! { "run_id": &run_id, "asset_id": &directive.asset_id }),
+                    )
+                    .await
+                    .ok();
+                    continue;
+                }
+            };
+            let asset = match asset {
+                Some(a) if super::media_send::validate_asset_sendable(&a) => a,
+                _ => {
+                    write_event_for_account(
+                        state,
+                        &contact.account_id,
+                        Some(&contact.wxid),
+                        "media_asset_rejected",
+                        "warning",
+                        "AI 选材指向不存在/未审/不可发素材，已跳过不发（防幻觉）",
+                        Some(doc! { "run_id": &run_id, "asset_id": &directive.asset_id }),
+                    )
+                    .await
+                    .ok();
+                    continue;
+                }
+            };
+            // requires_principal_approval=true 的素材不直接发：走现有 escalation 请示通道，
+            // 由领导拿回结论后的决策路径决定是否发。此处仅入请示 + 审计，不入 outbox。
+            if asset.requires_principal_approval == Some(true) {
+                let escalation_req = crate::models::EscalationRequest {
+                    needed: true,
+                    category: Some(
+                        crate::models::ESCALATION_CATEGORY_OUT_OF_SCOPE.to_string(),
+                    ),
+                    reason: Some(format!(
+                        "素材《{}》标记为需领导核准后才能发送给客户",
+                        asset.title
+                    )),
+                    question_for_principal: Some(format!(
+                        "是否同意把素材《{}》发给该客户？",
+                        asset.title
+                    )),
+                    self_serviceable_part: None,
+                    is_generalizable: false,
+                };
+                if let Err(err) =
+                    trigger_principal_escalation(state, &contact, &escalation_req).await
+                {
+                    tracing::warn!(
+                        contact_wxid = %contact.wxid,
+                        asset_id = %directive.asset_id,
+                        error = %err,
+                        "媒体素材请示推送失败（降级不阻断 run）"
+                    );
+                }
+                write_event_for_account(
+                    state,
+                    &contact.account_id,
+                    Some(&contact.wxid),
+                    "media_asset_escalated",
+                    "info",
+                    "素材需领导核准，已入请示通道（未直接发）",
+                    Some(doc! { "run_id": &run_id, "asset_id": &directive.asset_id }),
+                )
+                .await
+                .ok();
+                continue;
+            }
+            // 定序：当前所有 expression_pref 都「先文字后文件」（媒体追加在文本之后）。
+            let _ = media_send_order(asset.expression_pref.as_deref().unwrap_or("file_support"));
+            let enqueue_req = EnqueueRequest {
+                workspace_id: contact.workspace_id.clone(),
+                account_id: contact.account_id.clone(),
+                contact_wxid: contact.wxid.clone(),
+                run_id: run_id.clone(),
+                decision_id: Some(decision_review_id),
+                source_event_id: media_source_event_id.clone(),
+                source_kind: trigger.kind().to_string(),
+                content: String::new(), // 媒体条目允许空 content
+                media_asset_id: Some(directive.asset_id.clone()),
+                referral_card_id: None,
+                max_attempts: 3,
+            };
+            match outbox_enqueue(state, enqueue_req).await {
+                Ok(EnqueueOutcome::Created { outbox_id, .. }) => {
+                    tracing::info!(
+                        %run_id,
+                        %outbox_id,
+                        contact_wxid = %contact.wxid,
+                        asset_id = %directive.asset_id,
+                        "media outbox enqueued"
+                    );
+                }
+                Ok(EnqueueOutcome::IdempotentSkip { idempotency_key }) => {
+                    tracing::info!(
+                        %run_id,
+                        %idempotency_key,
+                        asset_id = %directive.asset_id,
+                        "media outbox enqueue idempotent skip"
+                    );
+                }
+                Err(err) => {
+                    tracing::error!(?err, %run_id, asset_id = %directive.asset_id, "media outbox enqueue failed");
+                    write_event_for_account(
+                        state,
+                        &contact.account_id,
+                        Some(&contact.wxid),
+                        "media_outbox_enqueue_failed",
+                        "error",
+                        "素材入 outbox 失败（文本已照常发出，素材缺失需管理员核对）",
+                        Some(doc! { "run_id": &run_id, "asset_id": &directive.asset_id }),
+                    )
+                    .await
+                    .ok();
+                }
+            }
+        }
+    }
+    // 名片引荐：辅助模式开启 + AI 输出 namecard_to_send + 准入校验通过 → 入队名片 outbox 条目。
+    // 追加在素材/文本之后 = 先发铺垫话术、后发名片（D5）。错误不阻断已入队的文本。
+    // 名片是主动引荐，不走素材的 requires_principal_approval→escalation 分支（D9 已解耦：
+    // 被推真人 = 台前专属顾问，≠ 幕后 principal_decider）。
+    // 发送门与素材/文本同源（media_send_allowed → outbox_eligible）：含 should_reply +
+    // reply_text 非空 + 终态 + relay 泄漏 fail-closed。杜绝 ①should_reply=false/reply 空时
+    // 发孤立名片（无铺垫话术）②relay 泄漏守卫置 outbox_eligible=false 时仍发名片。
+    if media_send_allowed(outbox_eligible, final_decision.namecard_to_send.is_some()) {
+        if let Some(directive) = final_decision.namecard_to_send.as_ref() {
+            let assist_override = contact
+                .domain_attributes
+                .as_ref()
+                .and_then(|d| d.get_str(crate::models::ASSIST_MODE_OVERRIDE_ATTR).ok());
+            let assist_on = super::referral::assist_mode_active(
+                domain_config.as_ref().and_then(|c| c.assist_mode_enabled),
+                assist_override,
+            );
+            if assist_on {
+                // 准入二次校验：card 必须真实存在 + enabled + approved（防 AI 幻觉 card_id）。
+                // 查询带 workspace_id scope（防 AI 幻觉跨租户 ObjectId 命中他 workspace 的名片，
+                // 与素材 send_outbound_media 的 IDOR 防御对齐）。
+                let card = match ObjectId::parse_str(&directive.card_id) {
+                    Ok(oid) => state
+                        .db
+                        .referral_cards()
+                        .find_one(
+                            doc! { "_id": oid, "workspace_id": &contact.workspace_id },
+                            None,
+                        )
+                        .await
+                        .ok()
+                        .flatten(),
+                    Err(_) => None,
+                };
+                match card {
+                    Some(c) if super::referral::validate_card_sendable(&c) => {
+                        let namecard_source_event_id = match &trigger {
+                            AgentTrigger::Inbound(msg) => {
+                                msg.message_id.clone().unwrap_or_default()
+                            }
+                            AgentTrigger::FollowUp(task) => {
+                                task.id.map(|id| id.to_hex()).unwrap_or_default()
+                            }
+                        };
+                        let enqueue_req = EnqueueRequest {
+                            workspace_id: contact.workspace_id.clone(),
+                            account_id: contact.account_id.clone(),
+                            contact_wxid: contact.wxid.clone(),
+                            run_id: run_id.clone(),
+                            decision_id: Some(decision_review_id),
+                            source_event_id: format!("{}#namecard", namecard_source_event_id),
+                            source_kind: trigger.kind().to_string(),
+                            content: String::new(),
+                            media_asset_id: None,
+                            referral_card_id: Some(directive.card_id.clone()),
+                            max_attempts: 3,
+                        };
+                        match outbox_enqueue(state, enqueue_req).await {
+                            Ok(EnqueueOutcome::Created { outbox_id, .. }) => {
+                                tracing::info!(%run_id, %outbox_id, contact_wxid = %contact.wxid, card_id = %directive.card_id, "namecard outbox enqueued");
+                            }
+                            Ok(EnqueueOutcome::IdempotentSkip { idempotency_key }) => {
+                                tracing::info!(%run_id, %idempotency_key, card_id = %directive.card_id, "namecard outbox enqueue idempotent skip");
+                            }
+                            Err(err) => {
+                                tracing::error!(?err, %run_id, card_id = %directive.card_id, "namecard outbox enqueue failed");
+                                write_event_for_account(
+                                    state,
+                                    &contact.account_id,
+                                    Some(&contact.wxid),
+                                    "namecard_outbox_enqueue_failed",
+                                    "error",
+                                    "名片入 outbox 失败（文本已照常发出，名片缺失需管理员核对）",
+                                    Some(doc! { "run_id": &run_id, "card_id": &directive.card_id }),
+                                )
+                                .await
+                                .ok();
+                            }
+                        }
+                    }
+                    _ => {
+                        write_event_for_account(
+                            state,
+                            &contact.account_id,
+                            Some(&contact.wxid),
+                            "referral_card_rejected",
+                            "warning",
+                            "AI 选的名片不存在/未审/已停用，已跳过引荐（防幻觉）",
+                            Some(doc! { "run_id": &run_id, "card_id": &directive.card_id }),
+                        )
+                        .await
+                        .ok();
+                    }
+                }
+            }
+        }
+    }
     // 决策请示触发（统一占位模型）：占位 reply 已入 outbox 正常发给客户，
     // 这里只做不面向客户的副作用——推请示卡给领导 + 落台账 pending。
     // 失败不回滚已发占位、不让 run 失败：仅 warn 降级。
@@ -1886,6 +2416,31 @@ pub(crate) async fn send_outbound_message(
         raw.insert("wechatagent", Bson::Document(extra_raw));
     }
     let now = DateTime::now();
+    // ④ 账号级发送软上限告警（仅告警，绝不拦截/排队/改变发送行为——观测先行防封号）。
+    // 查该账号当日（UTC 日界起）`agent_send_outbox` 已 `sent` 的总量，达到软上限即
+    // 记一条 warning 审计事件。fail-soft：查询/写事件失败都不影响"已发"语义。
+    if let Ok(sent) =
+        account_daily_sent_count(state, &contact.account_id, utc_today_start_millis()).await
+    {
+        if sent >= state.config.account_daily_send_soft_cap {
+            let _ = write_event_for_account(
+                state,
+                &contact.account_id,
+                Some(&contact.wxid),
+                "agent.account_daily_send_soft_cap_exceeded",
+                "warning",
+                &format!(
+                    "账号当日发送量 {} 已达软上限 {}（仅告警，未拦截）",
+                    sent, state.config.account_daily_send_soft_cap
+                ),
+                Some(doc! {
+                    "sent": sent,
+                    "cap": state.config.account_daily_send_soft_cap,
+                }),
+            )
+            .await;
+        }
+    }
     // MCP 已成功 = 消息已送达客户，这是既成事实。此后任何 DB 写失败都**不得**
     // 让本函数返 Err——否则 dispatcher 会走 retry 在下一轮重新 MCP 发送，给客户
     // 发重复消息（Ok(Err) 分支不做 post-hoc 核对）。故落库失败降级为审计事件，
@@ -1903,6 +2458,8 @@ pub(crate) async fn send_outbound_message(
                 dedupe_key: None,
                 direction: MessageDirection::Outbound,
                 content: content.to_string(),
+                msg_type: None,
+                media_ref: None,
                 raw: Some(raw),
                 created_at: now,
             },
@@ -1982,6 +2539,8 @@ pub(crate) fn trigger_message(
             // 没话找话。客户的真实消息已在 load_recent_messages 里，这里只需把"现在醒来、
             // 基于完整对话回复"的语境交给它。普通 follow_up 仍是"主动触达"判断。
             content: follow_up_trigger_message_text(&task.kind, &task.content),
+            msg_type: None,
+            media_ref: None,
             raw: Some(doc! {
                 "trigger": "follow_up_task",
                 "taskId": task.id.map(|id| id.to_hex()).unwrap_or_default(),
@@ -2303,6 +2862,37 @@ async fn daily_touch_count(state: &AppState, contact: &Contact) -> AppResult<i64
         .await
         .map(|count| count as i64)
         .map_err(AppError::from)
+}
+
+/// ④ 账号当日已发送总量：`agent_send_outbox` 里该账号 `status=sent`、
+/// `sent_at >= since_ms` 的条目数。软上限告警用——与 [`daily_touch_count`]
+/// 不同，这里**不按 contact 过滤**，是账号级总量（防封号观测）。
+async fn account_daily_sent_count(
+    state: &AppState,
+    account_id: &str,
+    since_ms: i64,
+) -> AppResult<i64> {
+    state
+        .db
+        .collection_agent_send_outbox()
+        .count_documents(
+            doc! {
+                "account_id": account_id,
+                "status": "sent",
+                "sent_at": { "$gte": DateTime::from_millis(since_ms) },
+            },
+            None,
+        )
+        .await
+        .map(|count| count as i64)
+        .map_err(AppError::from)
+}
+
+/// UTC 当日 0 点的毫秒时间戳（对齐 knowledge_router / cold_contact_worker 的日界惯例）。
+fn utc_today_start_millis() -> i64 {
+    let now = DateTime::now().timestamp_millis();
+    let day_ms: i64 = 24 * 60 * 60 * 1000;
+    now - now.rem_euclid(day_ms)
 }
 
 async fn cancel_task(
@@ -2727,12 +3317,67 @@ async fn apply_agent_updates(
             .domain_attributes
             .as_ref()
             .and_then(|d| d.get_str("customer_stage").ok());
-        // value 校验后重取 new_stage：customer_stage 可能因越界被 drop 移除了键。
-        let new_stage = signals_decision.domain_signals.get_str("customer_stage").ok();
+        // ⑧ customer_stage 状态机校验：customer_stage 与 operation_state 同属一套 canonical
+        // id 空间（m006），下游 C2 派生（:3252 起）令 operation_state 派生自 customer_stage 且
+        // 已过 check_state_transition——非法跳转时拒写 operation_state、保留旧 state。但
+        // domain_attributes.customer_stage 自身的写入此前不过状态机 → LLM 可让 stage 任意跳转
+        // （如 new_contact 直跳 customer_success），operation_state 被拒留旧值、customer_stage
+        // 却跟着 LLM 跳走 → 两字段漂移。这里复用本函数已持有的 domain_config 过同一状态机，
+        // 非法时 fail-soft 跳过 customer_stage 字段写入（保持旧值）+ 记 agent.stage_transition_rejected
+        // 审计，与 operation_state_transition_rejected 对称。reply 已异步发出，校验/审计失败均不阻断。
+        //
+        // 注意：**不**从共享的 signals_decision.domain_signals 容器移除 customer_stage——
+        // 下游 C2 派生块（:3252）读同一容器，移除会令 synced_state 回落 decision.operation_state
+        // 并写入一个**不同**的合法态（违反"保持旧值"语义、破坏 C2 既有 rejected 行为）。故仅对
+        // domain_attributes 写入用一份剔除 customer_stage 的过滤副本，容器本身保持原样供 C2 拒迁移。
+        // 先把判定收敛成 owned 数据：避免 to_stage 的不可变借用与后续可变借用冲突。
+        let stage_rejection: Option<(Option<String>, String, String)> =
+            match signals_decision.domain_signals.get_str("customer_stage").ok() {
+                Some(to_stage) if prev_stage != Some(to_stage) => {
+                    crate::agent::guards::check_state_transition(domain_config, prev_stage, to_stage)
+                        .map(|reason| (prev_stage.map(str::to_string), to_stage.to_string(), reason))
+                }
+                _ => None,
+            };
+        if let Some((from, to, reason)) = &stage_rejection {
+            // fail-soft：审计写失败不阻断主流程（回复已异步发出），与 dimension_dropped 同风格。
+            let _ = write_event_for_account(
+                state,
+                &contact.account_id,
+                Some(&contact.wxid),
+                "agent.stage_transition_rejected",
+                "rejected",
+                &format!(
+                    "customer_stage 拒绝迁移 {} → {}：{}",
+                    from.as_deref().unwrap_or("<empty>"),
+                    to,
+                    reason
+                ),
+                Some(doc! {
+                    "from": from.clone().unwrap_or_default(),
+                    "to": to.as_str(),
+                    "reason": reason.as_str(),
+                }),
+            )
+            .await;
+        }
+        // domain_attributes 写入用的 signals：非法跳转时剔除 customer_stage（保持旧值），其余维度
+        // 照常写；合法/无 stage 时零拷贝直接借用原容器，字节级等价于改造前。
+        let signals_for_attrs: std::borrow::Cow<'_, mongodb::bson::Document> =
+            if stage_rejection.is_some() {
+                let mut filtered = signals_decision.domain_signals.clone();
+                filtered.remove("customer_stage");
+                std::borrow::Cow::Owned(filtered)
+            } else {
+                std::borrow::Cow::Borrowed(&signals_decision.domain_signals)
+            };
+        // 状态机校验后重算 stage_changed：customer_stage 可能因非法跳转被过滤副本移除，须读
+        // 过滤后的 signals 再算（移除后 new_stage=None → stage_changed=false，不刷 stage 时间戳）。
+        let new_stage = signals_for_attrs.get_str("customer_stage").ok();
         let stage_changed = new_stage.is_some() && prev_stage != new_stage;
         let wrote = crate::agent::domain_signals::insert_domain_signal_values(
             &mut set_doc,
-            &signals_decision.domain_signals,
+            &signals_for_attrs,
             stage_changed,
         );
         if wrote {
@@ -2793,6 +3438,19 @@ async fn apply_agent_updates(
         }
         let bson_commitments = mongodb::bson::to_bson(&commitments).unwrap_or(mongodb::bson::Bson::Array(Vec::new()));
         set_doc.insert("commitments", bson_commitments);
+    } else if reply_has_time_commitment_feature(&decision.reply_text) {
+        // ⑥观测：reply 像做了时间承诺但 LLM 没填 commitment 字段 → 无 follow-up。
+        // 仅观测 prompt 强化是否生效，不阻断、不改写、不进任何门。
+        let _ = write_event_for_account(
+            &state,
+            &contact.account_id,
+            Some(&contact.wxid),
+            "agent.commitment_field_missing",
+            "observed",
+            "回复疑似含时间承诺但未填 commitment 字段（观测，未拦截）",
+            None,
+        )
+        .await;
     }
     if let Some(value) = non_empty_option(&decision.follow_up_policy) {
         set_doc.insert("follow_up_policy", value);
@@ -3737,6 +4395,68 @@ pub(crate) fn compute_taxonomy_guard_outcome(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // media-asset Task 8：素材发送定序纯函数。当前两种 expression_pref 都「先文字后文件」。
+    #[test]
+    fn file_primary_sends_text_then_file() {
+        assert_eq!(media_send_order("file_primary"), SendOrder::TextThenMedia);
+    }
+    #[test]
+    fn file_support_sends_text_then_file() {
+        assert_eq!(media_send_order("file_support"), SendOrder::TextThenMedia);
+    }
+    #[test]
+    fn media_send_order_unknown_pref_defaults_text_then_media() {
+        assert_eq!(media_send_order(""), SendOrder::TextThenMedia);
+    }
+
+    // ⑥ 承诺兑现观测：reply 时间承诺特征检测（弱启发，仅观测覆盖率）。
+    #[test]
+    fn reply_has_time_commitment_feature_detects_relative_dates() {
+        assert!(reply_has_time_commitment_feature("我明天发您资料"));
+        assert!(reply_has_time_commitment_feature("下周给您答复"));
+        assert!(reply_has_time_commitment_feature("稍后整理好发您"));
+        assert!(reply_has_time_commitment_feature("我马上处理"));
+    }
+    #[test]
+    fn reply_has_time_commitment_feature_negative() {
+        assert!(!reply_has_time_commitment_feature("好的，我了解了"));
+        assert!(!reply_has_time_commitment_feature(""));
+        assert!(!reply_has_time_commitment_feature("这个产品确实不错"));
+    }
+
+    // 终审 Important#1：媒体发送门与文本同源。
+    #[test]
+    fn media_send_blocked_when_text_ineligible() {
+        // 核心修复：文本不合格（should_reply=false / reply 空 / relay 守卫拦截）则不发孤立文件。
+        assert!(!media_send_allowed(false, true));
+    }
+    #[test]
+    fn media_send_allowed_when_eligible_and_has_assets() {
+        assert!(media_send_allowed(true, true));
+    }
+    #[test]
+    fn media_send_no_assets_yields_false() {
+        // 文本合格但无素材：不进媒体块（与既有行为一致）。
+        assert!(!media_send_allowed(true, false));
+    }
+
+    // 终审 Important#1：去抖中止须覆盖文本与媒体两条轨道。
+    #[test]
+    fn should_run_send_covers_text_only() {
+        // 仅文本、无媒体：行为与旧版字节等价（media_pending=false → 退化为纯 outbox_eligible）。
+        assert!(should_run_send(true, false));
+        assert!(!should_run_send(false, false));
+    }
+    #[test]
+    fn should_run_send_covers_media_when_text_ineligible() {
+        // 文本不合格但有媒体待发：仍须过去抖中止，否则 superseded run 会发孤立文件。
+        assert!(should_run_send(false, true));
+    }
+    #[test]
+    fn should_run_send_false_when_nothing_pending() {
+        assert!(!should_run_send(false, false));
+    }
 
     #[test]
     fn extract_relationship_type_suggestion_picks_kind() {

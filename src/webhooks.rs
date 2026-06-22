@@ -316,8 +316,8 @@ pub async fn wechat_webhook(
     //
     // 三类 short-circuit：
     // (a) `testMsg` 探活：GeWe 控制台「测试回调」按钮使用，直接 ack。
-    // (b) `TypeName=Offline`：账号离线事件，本期版本不在 webhook 入口处理（账号在线
-    //     状态走 SSE `account_status`），直接 ack。
+    // (b) `TypeName=Offline/Online`：账号在线状态事件，落库 `online` 建状态源后 ack
+    //     （供 outbox dispatcher 发送前 gate，掉线 defer 不盲发）。
     // (c) MCP envelope `_mcp.event` 非 wechat.message.created 的事件（如未来扩展），
     //     谨慎放行：除显式消息事件外一律 ack ignored。
     if let Some(test_msg) = find_string(&payload, &["testMsg", "TestMsg"]) {
@@ -327,12 +327,35 @@ pub async fn wechat_webhook(
             "echo": test_msg
         })));
     }
+    // (b) `TypeName=Offline`：账号离线事件。落库 `online=false` 建状态源（供 outbox
+    //     dispatcher 发送前 gate 判断，掉线时 defer 不盲发），然后直接 ack。此前直接
+    //     丢弃 → online 字段长期陈旧、掉线期间盲发。上线事件（Online）对称落 true。
     if let Some(type_name) = find_string(&payload, &["TypeName", "typeName"]) {
         let lower = type_name.to_ascii_lowercase();
-        if lower == "offline" {
+        if lower == "offline" || lower == "online" {
+            let online = lower == "online";
+            let app_id = find_string(
+                &payload,
+                &["appId", "app_id", "appid", "Appid", "AppId", "APPID"],
+            );
+            if let Some(app_id) = app_id.as_deref() {
+                // fail-soft：状态落库失败不应让 MCP 侧收不到 ack（会触发重推）。
+                let res = state
+                    .db
+                    .accounts()
+                    .update_one(
+                        doc! { "app_id": app_id },
+                        doc! { "$set": { "online": online, "last_sync_at": DateTime::now() } },
+                        None,
+                    )
+                    .await;
+                if let Err(err) = res {
+                    tracing::warn!(?err, app_id, online, "persist account online state failed");
+                }
+            }
             return Ok(Json(serde_json::json!({
                 "ok": true,
-                "ignored": "offline_event",
+                "ignored": if online { "online_event" } else { "offline_event" },
                 "type": type_name
             })));
         }
@@ -461,6 +484,9 @@ pub async fn wechat_webhook(
     // db/indexes.rs:55-63 的 partial unique index `workspace_id+account_id+dedupe_key`），
     // 让 MongoDB 在写入时原子去重。
     let raw = to_document(&payload).ok();
+    // F1：解析入站消息类型 + 媒体引用，不再写死 None。
+    let msg_type = parse_inbound_msg_type(&payload);
+    let media_ref = extract_inbound_media_ref(&payload, msg_type);
     let inbound = ConversationMessage {
         id: None,
         workspace_id: workspace_id.clone(),
@@ -470,6 +496,8 @@ pub async fn wechat_webhook(
         dedupe_key: Some(dedupe_key.clone()),
         direction: MessageDirection::Inbound,
         content,
+        msg_type: Some(msg_type.to_string()),
+        media_ref,
         raw,
         created_at: DateTime::now(),
     };
@@ -656,7 +684,7 @@ pub async fn ensure_wake_followup_task(
         return Ok(());
     }
     let now = DateTime::now();
-    let run_at = agent::quiet_hours::next_wake_at(wake_hour, tz_offset_hours);
+    let run_at = agent::quiet_hours::next_wake_at(wake_hour, tz_offset_hours, &contact.wxid, state.config.wake_jitter_max_seconds);
     // expiry 给 24h 余量（覆盖最长跨午夜窗口 + 醒来后 worker tick 间隔），过期未跑则作废。
     let expires_at = DateTime::from_millis(run_at.timestamp_millis() + 24 * 60 * 60 * 1000);
     let task = AgentTask {
@@ -825,6 +853,87 @@ fn value_to_string(value: &Value) -> Option<String> {
         Value::Number(number) => Some(number.to_string()),
         _ => None,
     }
+}
+
+/// F1 评审 I1：从入站 payload 解析归一化的消息类型。候选键**仅限“消息类型”语义
+/// 专用键**——GeWe 大写驼峰 `MsgType`（微信数字码真实字段）+ 手工/自测 payload 的
+/// 小写别名 `msgType`/`msg_type`。**刻意不收泛化裸键 `type`/`Type`**：`find_string`
+/// 深度递归整棵 JSON（含 `_mcp` envelope 及任意嵌套对象），而 webhook envelope 里
+/// 与消息类型无关的 `{"type":"event",...}` 极常见，泛化键会被误命中、把本应默认
+/// `text` 的纯文本消息误标为非文本，破坏 text 主链路。真实字段就是 `MsgType`，删掉
+/// `type`/`Type` 既消除误伤面又不漏真实字段。
+///
+/// payload 无任何类型字段时默认 `"text"`（runbook W1-W3 等纯文本自测 payload 不带
+/// 类型字段，行为不变）；有则交给 `classify_inbound_msg_type` 归一（未知码 → `"unknown"`）。
+fn parse_inbound_msg_type(payload: &Value) -> &'static str {
+    let raw_msg_type = find_string(payload, &["msgType", "msg_type", "MsgType"]);
+    match raw_msg_type.as_deref() {
+        Some(raw_type) => classify_inbound_msg_type(raw_type),
+        None => "text",
+    }
+}
+
+/// 把 webhook payload 里的原始消息类型（GeWe 透传的微信 `MsgType` 数字码，或
+/// 手工/自测 payload 的字符串别名）归一化为稳定的 `msg_type` 字符串。F1 地基：
+/// 让非文本入站可被识别（图片/语音/视频/名片/链接卡片等），不再被当空文本硬答。
+///
+/// 未知类型一律归 `"unknown"`——**绝不崩、绝不当 text**，下游据此走非文本分支
+/// （F2 才做媒体理解/过渡话术，本函数只负责识别归类）。
+///
+/// 微信协议私聊 MsgType 数字码：1=文本 3=图片 34=语音 43=视频 42=名片
+/// 47=表情 48=位置 49=appmsg(链接/文件/小程序) 50=语音/视频通话 51=状态同步
+/// 10000/10002=系统消息。GeWe 私聊真实非文本入站 payload 仓内暂无确认样例，
+/// 数字码以微信协议为准；新码值落 `"unknown"` 而非误判，安全侧。
+fn classify_inbound_msg_type(raw: &str) -> &'static str {
+    match raw.trim() {
+        "1" | "text" | "Text" => "text",
+        "3" | "image" | "Image" | "img" => "image",
+        "34" | "voice" | "Voice" => "voice",
+        "43" | "video" | "Video" => "video",
+        "42" | "namecard" | "card" => "namecard",
+        "47" | "emoji" | "sticker" => "emoji",
+        "48" | "location" => "location",
+        "49" | "appmsg" | "link" | "file" | "miniprogram" => "appmsg",
+        "50" | "voip" => "voip",
+        "51" => "statussync",
+        "10000" | "10002" | "sysmsg" | "system" => "system",
+        _ => "unknown",
+    }
+}
+
+/// 从入站 payload 提取媒体引用（图片 cdn url / 文件 id / 语音 path 等），供后续
+/// 多模态理解链路（F2）定位媒体内容。`text` 消息恒返回 None。
+///
+/// GeWe 富媒体引用通常嵌在 `Content` 的 XML 里（`cdnurl`/`aeskey`）或独立 media
+/// 字段；仓内暂无确认的非文本入站样例，故此处只从已知候选字段名尽力提取一个可
+/// 定位引用，找不到返回 None（**不崩、不造假**）。F2 接通 MCP 媒体下载后再补全。
+fn extract_inbound_media_ref(payload: &Value, msg_type: &str) -> Option<String> {
+    if msg_type == "text" {
+        return None;
+    }
+    find_string(
+        payload,
+        &[
+            // 小写驼峰（自测/手工）
+            "mediaUrl",
+            "media_url",
+            "fileUrl",
+            "file_url",
+            "cdnUrl",
+            "cdn_url",
+            "cdnurl",
+            "mediaId",
+            "media_id",
+            "fileId",
+            "file_id",
+            // GeWe 大写驼峰
+            "MediaUrl",
+            "FileUrl",
+            "CdnUrl",
+            "MediaId",
+            "FileId",
+        ],
+    )
 }
 
 async fn resolve_account_context(
@@ -1038,6 +1147,110 @@ fn verify_hmac_sha256(key: &[u8], body: &[u8], provided_hex: &str) -> bool {
 }
 
 #[cfg(test)]
+mod inbound_msg_type_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn classify_inbound_msg_type_maps_known_numeric_codes() {
+        // GeWe 透传的微信 MsgType 数字码
+        assert_eq!(classify_inbound_msg_type("1"), "text");
+        assert_eq!(classify_inbound_msg_type("3"), "image");
+        assert_eq!(classify_inbound_msg_type("34"), "voice");
+        assert_eq!(classify_inbound_msg_type("43"), "video");
+        assert_eq!(classify_inbound_msg_type("42"), "namecard");
+        assert_eq!(classify_inbound_msg_type("49"), "appmsg");
+    }
+
+    #[test]
+    fn classify_inbound_msg_type_maps_string_aliases() {
+        // 手工/自测 payload 的字符串别名
+        assert_eq!(classify_inbound_msg_type("text"), "text");
+        assert_eq!(classify_inbound_msg_type("image"), "image");
+        assert_eq!(classify_inbound_msg_type("voice"), "voice");
+        assert_eq!(classify_inbound_msg_type("video"), "video");
+        assert_eq!(classify_inbound_msg_type("link"), "appmsg");
+    }
+
+    #[test]
+    fn classify_inbound_msg_type_trims_whitespace() {
+        assert_eq!(classify_inbound_msg_type(" 3 "), "image");
+        assert_eq!(classify_inbound_msg_type("\ttext\n"), "text");
+    }
+
+    #[test]
+    fn classify_inbound_msg_type_unknown_never_falls_back_to_text() {
+        // 未知类型归 unknown：不崩、不当 text（下游据此走非文本分支）
+        assert_eq!(classify_inbound_msg_type("某新类型"), "unknown");
+        assert_eq!(classify_inbound_msg_type("9999"), "unknown");
+        assert_eq!(classify_inbound_msg_type(""), "unknown");
+    }
+
+    #[test]
+    fn extract_media_ref_is_none_for_text() {
+        let payload = json!({ "mediaUrl": "http://x/a.jpg", "content": "hi" });
+        assert_eq!(extract_inbound_media_ref(&payload, "text"), None);
+    }
+
+    #[test]
+    fn extract_media_ref_pulls_known_fields_for_media() {
+        let payload = json!({ "fromWxid": "wx1", "cdnUrl": "http://cdn/x.jpg" });
+        assert_eq!(
+            extract_inbound_media_ref(&payload, "image"),
+            Some("http://cdn/x.jpg".to_string())
+        );
+        let payload2 = json!({ "_mcp": { "MediaId": "media-123" } });
+        assert_eq!(
+            extract_inbound_media_ref(&payload2, "voice"),
+            Some("media-123".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_media_ref_none_when_no_reference_present() {
+        // 非文本但 payload 无任何已知媒体引用字段 → None（不造假）
+        let payload = json!({ "fromWxid": "wx1", "content": "" });
+        assert_eq!(extract_inbound_media_ref(&payload, "image"), None);
+    }
+
+    #[test]
+    fn parse_inbound_msg_type_uses_dedicated_keys() {
+        // a. 专用键正常生效（回归不破）：顶层 MsgType 数字码 + 小写别名
+        assert_eq!(parse_inbound_msg_type(&json!({ "MsgType": "3" })), "image");
+        assert_eq!(parse_inbound_msg_type(&json!({ "msgType": "voice" })), "voice");
+        assert_eq!(parse_inbound_msg_type(&json!({ "msg_type": "43" })), "video");
+    }
+
+    #[test]
+    fn parse_inbound_msg_type_ignores_unrelated_nested_type_fields() {
+        // b. 核心回归（I1）：payload 无任何类型字段，但嵌套对象带与消息类型无关的
+        // type/Type（webhook envelope 极常见，如 {"type":"event"}）。泛化键已删，
+        // find_string 深度递归不再误命中 → 仍按 text 处理，text 主链路一字不变。
+        let payload = json!({
+            "fromWxid": "wx1",
+            "content": "你好，在吗",
+            "_mcp": { "type": "event", "meta": { "Type": "callback" } },
+        });
+        assert_eq!(parse_inbound_msg_type(&payload), "text");
+
+        // 顶层直接带无关 type 也不被误命中
+        let payload2 = json!({ "type": "event", "content": "纯文本" });
+        assert_eq!(parse_inbound_msg_type(&payload2), "text");
+    }
+
+    #[test]
+    fn parse_inbound_msg_type_defaults_text_for_plain_payload() {
+        // c. 仿 runbook 自测纯文本 payload（不带任何类型字段）→ text（主链路不变）
+        let payload = json!({
+            "appId": "wx_app_1",
+            "fromWxid": "wxid_customer",
+            "content": "我想了解一下你们的产品",
+        });
+        assert_eq!(parse_inbound_msg_type(&payload), "text");
+    }
+}
+
+#[cfg(test)]
 mod hmac_tests {
     use super::*;
 
@@ -1140,6 +1353,8 @@ mod debounce_tests {
             dedupe_key: None,
             direction: MessageDirection::Inbound,
             content: "hi".to_string(),
+            msg_type: None,
+            media_ref: None,
             raw: None,
             created_at: DateTime::now(),
         };
@@ -1170,6 +1385,8 @@ mod debounce_tests {
             dedupe_key: None,
             direction: MessageDirection::Inbound,
             content: content.to_string(),
+            msg_type: None,
+            media_ref: None,
             raw: None,
             created_at: DateTime::now(),
         }

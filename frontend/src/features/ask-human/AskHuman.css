@@ -1,0 +1,110 @@
+/* Ask-Human Phase 2 Task 11：统一收件箱频道外壳基础样式（plain CSS，副作用全局导入）。
+   绝不命名为 .module.css 做副作用导入——Rollup tree-shake 会删光，整频道白板。
+   色值/圆角/描边统一走 tokens.css 变量，禁止硬编码主色。基础可用即可，精细视觉留 Task 12。 */
+
+.askHumanChannel {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  padding: 24px 28px 40px;
+}
+
+.askHumanHeader {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+}
+.askHumanHeader h1 {
+  margin: 0;
+  font-size: 19px;
+  font-weight: 650;
+  letter-spacing: -0.2px;
+  color: var(--ink-1);
+}
+.askHumanHeader button {
+  font: inherit;
+  font-size: 12.5px;
+  font-weight: 600;
+  padding: 8px 16px;
+  border-radius: var(--r-sm);
+  cursor: pointer;
+  background: transparent;
+  border: 1px solid var(--hairline);
+  color: var(--ink-2);
+  transition: background 0.18s, color 0.18s, border-color 0.18s;
+}
+.askHumanHeader button:hover:not(:disabled) {
+  background: rgba(0, 0, 0, 0.03);
+  color: var(--ink-1);
+}
+.askHumanHeader button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+/* fatal：请求级失败，红底警示条（保留上次数据） */
+.askHumanFatal {
+  padding: 11px 14px;
+  border-radius: var(--r-sm);
+  font-size: 12.5px;
+  color: var(--color-blocked);
+  background: var(--fill-blocked);
+  border: 1px solid rgba(255, 69, 58, 0.3);
+}
+
+/* source errors：部分来源降级，黄底降级条 */
+.askHumanSourceErrors {
+  padding: 11px 14px;
+  border-radius: var(--r-sm);
+  font-size: 12.5px;
+  color: var(--ink-1);
+  background: rgba(255, 204, 0, 0.12);
+  border: 1px solid rgba(255, 204, 0, 0.4);
+}
+
+/* summary：来源计数 chip 行，点击切源 */
+.askHumanSummary {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.askHumanSummaryChip {
+  font: inherit;
+  font-size: 12px;
+  font-weight: 600;
+  padding: 6px 12px;
+  border-radius: 999px;
+  cursor: pointer;
+  background: var(--surface-1, #fff);
+  border: 1px solid var(--hairline);
+  color: var(--ink-2);
+  transition: background 0.18s, color 0.18s, border-color 0.18s;
+}
+.askHumanSummaryChip:hover {
+  background: rgba(0, 0, 0, 0.03);
+  color: var(--ink-1);
+}
+.askHumanSummaryChip--active {
+  background: var(--ink-1);
+  border-color: var(--ink-1);
+  color: #fff;
+}
+
+/* 行容器：rich 卡片行 / inline 处置行 */
+.askHumanRichRow,
+.askHumanInlineRow {
+  border: 1px solid var(--hairline);
+  border-radius: var(--r-md, 12px);
+  padding: 16px;
+  margin-bottom: 12px;
+  background: var(--surface-1, #fff);
+}
+
+/* 兜底弱化文案 */
+.askHumanUnknownRich,
+.askHumanUnknownInline {
+  font-size: 12.5px;
+  color: var(--ink-3, var(--ink-2));
+  padding: 12px 14px;
+}

@@ -23,6 +23,13 @@ on:
       - 'frontend/**'
       - 'docs/**'
       - '**/*.md'
+  # nightly 全量真模型能力套件回归：smoke/recall/ops/quality/adversarial 这 5 组
+  # （全 continue-on-error，对合并无否决权，纯回归监控）从 PR/push 移到此处，避免每次
+  # 推送都全量跑 1+ 小时真模型串行链 + 烧 API 配额。PR 只留 baseline/integration/红线门/
+  # skip-gate。schedule 不受 paths-ignore 影响（全量跑）。北京时间约 03:17（UTC 19:17），
+  # 避开整点减 GitHub 调度拥塞。
+  schedule:
+    - cron: '17 19 * * *'
   # 手动触发：**绕过**所有 needs 前置链立即起跑，用于快速验证单测修复。两个互斥目标：
   # - dispatch_target=ops（默认）：单独跑某一个 real_llm_ops_smoke 测试（填 ops_test，默认 t15），
   #   不必等 real-llm → recall → ops 串行排队 1+ 小时。
@@ -160,7 +167,7 @@ jobs:
   real-llm:
     name: Real-LLM smoke (真实大模型 / MCP 桩)
     runs-on: ubuntu-latest
-    if: ${{ github.event_name != 'workflow_dispatch' }}
+    if: ${{ github.event_name == 'schedule' }}
     # 并发治理：作为 5 个 real-llm group 串行链的链头（smoke→recall→ops→quality→adversarial，
     # 各组 max-parallel:1）→ 全局任意时刻仅 1 matrix 实例打 rsxermu → 守并发上限 2。
     # （GitHub job-level concurrency group 不能串行化同 run 内 matrix，会 cancel 而非排队，故用 needs 链。）
@@ -298,7 +305,7 @@ jobs:
   real-llm-recall:
     name: Real-LLM knowledge recall benchmark (${{ matrix.t }} / MCP 桩)
     runs-on: ubuntu-latest
-    if: ${{ github.event_name != 'workflow_dispatch' }}
+    if: ${{ github.event_name == 'schedule' }}
     # NVIDIA integrate 免费层 RPM 硬墙：5 个 real-LLM job-group 并行时瞬时 ~9 runner 同打
     # 一把 key 必爆 429（实测 retry 6 次仍全 skip 假绿）。max-parallel 只在单 matrix 内限并发、
     # 不能跨 group 协调，故用 needs 链把 5 个 group 串行化（smoke→recall→ops→quality→adversarial），
@@ -393,7 +400,7 @@ jobs:
   real-llm-ops:
     name: Real-LLM ops smoke (${{ matrix.t }} / MCP 桩)
     runs-on: ubuntu-latest
-    if: ${{ github.event_name != 'workflow_dispatch' }}
+    if: ${{ github.event_name == 'schedule' }}
     # 串行链第 3 环（见 real-llm-recall 注释：跨 group 串行守 rsxermu 并发 2）。
     needs: real-llm-recall
     continue-on-error: true
@@ -560,7 +567,7 @@ jobs:
   real-llm-quality:
     name: Real-LLM knowledge quality (${{ matrix.q }} 双裁判 / MCP 桩)
     runs-on: ubuntu-latest
-    if: ${{ github.event_name != 'workflow_dispatch' }}
+    if: ${{ github.event_name == 'schedule' }}
     # 串行链第 4 环（见 real-llm-recall 注释：跨 group 串行守 rsxermu 并发 2）。
     needs: real-llm-ops
     continue-on-error: true
@@ -670,7 +677,7 @@ jobs:
   real-llm-adversarial:
     name: Real-LLM adversarial (${{ matrix.arc }})
     runs-on: ubuntu-latest
-    if: ${{ github.event_name != 'workflow_dispatch' }}
+    if: ${{ github.event_name == 'schedule' }}
     # 串行链末环（见 real-llm-recall 注释：跨 group 串行守 rsxermu 并发 2）。
     needs: real-llm-quality
     continue-on-error: true
@@ -1026,8 +1033,13 @@ jobs:
   real-llm-redline:
     name: Real-LLM 红线门 (${{ matrix.file }} / 确定性硬断言)
     runs-on: ubuntu-latest
-    if: ${{ github.event_name != 'workflow_dispatch' }}
+    # PR/push/schedule 都跑（红线硬断言是合并门，不能移走）；仅手动单跑事件不跑。
+    # 保留 needs: real-llm-adversarial 是为 schedule(nightly) 时串行守 rsxermu 并发≤2
+    # （排在能力套件链末）。但 PR/push 时 adversarial 被 if 跳过（skipped）——`!cancelled()`
+    # 让本门**不被 skip 的依赖连带跳过**仍照常跑（needs 的 skip ≠ cancel），此时全局仅本组
+    # 真模型在跑，matrix max-parallel:1 → 并发=1，无需串行链也守住。
     needs: real-llm-adversarial
+    if: ${{ !cancelled() && github.event_name != 'workflow_dispatch' }}
     timeout-minutes: 90
     strategy:
       fail-fast: false
@@ -1119,8 +1131,12 @@ jobs:
   skip-gate:
     name: Real-LLM skip 率硬门 (R0.2)
     runs-on: ubuntu-latest
-    if: ${{ github.event_name != 'workflow_dispatch' }}
-    needs: [real-llm, real-llm-recall, real-llm-ops, real-llm-quality, real-llm-adversarial, real-llm-redline]
+    # PR/push/schedule 都跑;仅手动单跑不跑。`!cancelled()`:能力套件 5 组在 PR/push 被 if
+    # 跳过(skipped),needs 只留 real-llm-redline(PR 必跑的唯一真模型组),`!cancelled()`
+    # 保证 redline 失败/跳过时本汇总门仍跑(汇总性质,不应被上游状态连带 skip)。download
+    # pattern `*ledger*` 抓当时已上传的全部 ledger:PR 时汇总 redline 一个、nightly 时尽量多抓。
+    needs: [real-llm-redline]
+    if: ${{ !cancelled() && github.event_name != 'workflow_dispatch' }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4

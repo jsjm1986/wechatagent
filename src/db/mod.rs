@@ -16,7 +16,7 @@ use mongodb::{options::ClientOptions, Client, Collection, Database as MongoDatab
 
 use crate::models::{
     AgentCommandRun, AgentDecisionReview, AgentEvent, AgentOutcomeMetric, AgentPrincipalEscalation,
-    AgentRunLog, AgentSoul,
+    AgentRunLog, AgentSendLedger, AgentSoul,
     AgentTask, AgentToolCall, BehaviorSignal, BehaviorSignalMetric, CatalogRebuildJob,
     ChunkRevision, Contact,
     ContentAsset, ConversationMessage, DomainProfile, DomainSchema, EvaluationScenario, Experiment, IngestSource,
@@ -25,7 +25,7 @@ use crate::models::{
     ManagementAgentMessage, ManagementAgentSession, McpCallLog, MemoryCandidate, MigrationRecord,
     OperatingMemory, OperationDomainConfig, OperationKnowledgeChunk, OperationKnowledgeDocument,
     OperationPlaybook, OutboxEntry, PostReleaseReview, Product, PromptTemplate,
-    Proposal, RelationshipTypeSuggestion, ShadowReplay, TaxonomyCandidate, TaxonomyEntry,
+    Proposal, ReferralCard, RelationshipTypeSuggestion, ShadowReplay, TaxonomyCandidate, TaxonomyEntry,
     ThresholdOverride, ThresholdOverrideAudit, UserOperationGuidePreview, WechatAccount,
 };
 
@@ -182,6 +182,14 @@ impl Database {
 
     pub fn agent_principal_escalations(&self) -> Collection<AgentPrincipalEscalation> {
         self.db.collection("agent_principal_escalations")
+    }
+
+    pub fn referral_cards(&self) -> Collection<ReferralCard> {
+        self.db.collection("referral_cards")
+    }
+
+    pub fn agent_send_ledger(&self) -> Collection<AgentSendLedger> {
+        self.db.collection("agent_send_ledger")
     }
 
     pub fn llm_call_logs(&self) -> Collection<LlmCallLog> {

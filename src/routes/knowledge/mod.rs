@@ -25,7 +25,7 @@ use super::AppState;
 
 // ── 模块化解耦（2026-06-07）：子域逐个搬运，建好一个解开一对 ────────────
 // 见 docs/superpowers/plans/2026-06-07-knowledge-routes-split.md
-mod crud;
+pub mod crud;
 mod verify;
 mod import;
 mod catalog;

@@ -1102,6 +1102,8 @@ async fn db_seed_base_domain_config(db: &Database, workspace_id: &str) {
         seeded_by: Some("test_base".to_string()),
         principal_decider: None,
         high_risk_escalation_mode: None,
+        ask_human_policy: None,
+        assist_mode_enabled: None,
     };
     db.operation_domain_configs()
         .replace_one(

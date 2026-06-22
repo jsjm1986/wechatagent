@@ -57,6 +57,12 @@ pub(super) struct OperatingMemoryRequest {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct AssistOverrideRequest {
+    mode: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub(super) struct MemoryCandidateQuery {
     status: Option<String>,
     limit: Option<i64>,
@@ -544,6 +550,48 @@ pub(super) async fn update_profile_note(
     Ok(Json(json!({ "item": ApiContact::from(contact) })))
 }
 
+/// 客户级辅助模式 override 闭集校验（缺口 2）。三态：default（回落账号级）/
+/// force_on / force_off。守 gateway 状态枚举闭集纪律。
+pub(super) fn is_valid_assist_mode(mode: &str) -> bool {
+    matches!(mode, "default" | "force_on" | "force_off")
+}
+
+/// PUT /api/contacts/:id/assist-override：写客户级辅助模式 override。
+/// default → $unset（回落账号级 assist_mode_enabled）；force_on/force_off → $set。
+/// workspace 隔离防 IDOR。
+pub async fn update_assist_override(
+    State(state): State<AppState>,
+    Extension(admin): Extension<AuthenticatedAdmin>,
+    Path(id): Path<String>,
+    Json(payload): Json<AssistOverrideRequest>,
+) -> AppResult<Json<Value>> {
+    if !is_valid_assist_mode(&payload.mode) {
+        return Err(AppError::BadRequest(
+            "mode must be default|force_on|force_off".to_string(),
+        ));
+    }
+    let object_id = parse_object_id(&id)?;
+    // workspace 隔离：跨 workspace / 不存在均 404（不泄漏存在性）。
+    find_contact_by_id(&state, &admin.current_workspace, &id).await?;
+    let attr = format!("domain_attributes.{}", crate::models::ASSIST_MODE_OVERRIDE_ATTR);
+    let now = DateTime::now();
+    let update = if payload.mode == "default" {
+        doc! { "$unset": { &attr: "" }, "$set": { "updated_at": now } }
+    } else {
+        doc! { "$set": { &attr: &payload.mode, "updated_at": now } }
+    };
+    state
+        .db
+        .contacts()
+        .update_one(
+            doc! { "_id": object_id, "workspace_id": &admin.current_workspace },
+            update,
+            None,
+        )
+        .await?;
+    Ok(Json(json!({ "ok": true, "mode": payload.mode })))
+}
+
 /// `PUT /api/contacts/:id/custom-agent-instructions`
 ///
 /// 维护 per-contact 运营人员特别指令（最高优先级 Operator Instruction 层）。
@@ -943,6 +991,17 @@ mod tests {
         assert!(matches!(ok, Ok(Some(ref v)) if v == "customer"));
         let drop = apply_admin_dim_validation(DimValidation::DropSilently);
         assert!(matches!(drop, Ok(None)));
+    }
+
+    #[test]
+    fn assist_mode_closed_set() {
+        assert!(is_valid_assist_mode("default"));
+        assert!(is_valid_assist_mode("force_on"));
+        assert!(is_valid_assist_mode("force_off"));
+        assert!(!is_valid_assist_mode("on"));
+        assert!(!is_valid_assist_mode("true"));
+        assert!(!is_valid_assist_mode(""));
+        assert!(!is_valid_assist_mode("Force_On"));
     }
 
     #[test]

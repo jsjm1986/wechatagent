@@ -304,14 +304,17 @@ pub fn enforce_state_action_policy(
 // 不在本次恢复范围）。
 // ─────────────────────────────────────────────────────────────────────────
 
-/// R5.1：chunk 是否 `integrity_status == "verified"`（trim + 大小写不敏感）。
-pub(crate) fn is_verified(chunk: &OperationKnowledgeChunk) -> bool {
-    chunk
+/// R5.1：chunk 是否 `integrity_status == "verified"`（trim + 大小写不敏感）且未过期
+/// （valid_to 为 None=永久有效，或 valid_to >= now）。过期知识不得背书产品声明。
+pub(crate) fn is_verified(chunk: &OperationKnowledgeChunk, now: mongodb::bson::DateTime) -> bool {
+    let status_ok = chunk
         .integrity_status
         .as_deref()
         .map(str::trim)
         .map(|s| s.eq_ignore_ascii_case("verified"))
-        .unwrap_or(false)
+        .unwrap_or(false);
+    let not_expired = chunk.valid_to.map_or(true, |vt| vt >= now);
+    status_ok && not_expired
 }
 
 /// R5.4：reviewer 的 `claim_analysis` 是否显式声明本次候选回复需要产品知识背书。
@@ -330,6 +333,7 @@ pub(crate) fn claim_requires_product_knowledge(claim_analysis: &Document) -> boo
 pub(crate) fn compute_verified_chunks<'a>(
     used_knowledge_ids: &[String],
     chunks: &'a [OperationKnowledgeChunk],
+    now: mongodb::bson::DateTime,
 ) -> Vec<&'a OperationKnowledgeChunk> {
     let used: std::collections::HashSet<&str> = used_knowledge_ids
         .iter()
@@ -342,7 +346,7 @@ pub(crate) fn compute_verified_chunks<'a>(
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut out: Vec<&'a OperationKnowledgeChunk> = Vec::new();
     for chunk in chunks {
-        if !is_verified(chunk) {
+        if !is_verified(chunk, now) {
             continue;
         }
         let Some(hex) = chunk.id.map(|id| id.to_hex()) else {
@@ -640,6 +644,8 @@ mod cross_domain_state_machine_tests {
             seeded_by: None,
             principal_decider: None,
             high_risk_escalation_mode: None,
+            ask_human_policy: None,
+            assist_mode_enabled: None,
         }
     }
 
@@ -751,6 +757,61 @@ mod cross_domain_state_machine_tests {
                 .contains("unknown_target"),
             "销售 initial 态 new_contact 在医疗 FSM 应是 unknown_target（本域 initial 是 initial_consult）"
         );
+    }
+}
+
+#[cfg(test)]
+mod is_verified_tests {
+    //! R5.1 时效命门：`is_verified` 必须同时满足 `integrity_status==verified`
+    //! **且未过期**（valid_to 为 None=永久有效，或 valid_to >= now）。过期 verified
+    //! 知识不得背书产品宣称。真值表：
+    //! (verified, no valid_to)→有效 / (verified, 未来 valid_to)→有效 /
+    //! (verified, 过去 valid_to)→无效 / (draft, *)→无效。
+    use super::*;
+    use mongodb::bson::DateTime;
+
+    fn make_test_chunk() -> OperationKnowledgeChunk {
+        OperationKnowledgeChunk::default()
+    }
+
+    #[test]
+    fn is_verified_true_when_verified_and_no_valid_to() {
+        let mut c = make_test_chunk();
+        c.integrity_status = Some("verified".into());
+        c.valid_to = None;
+        let now = DateTime::now();
+        assert!(is_verified(&c, now));
+    }
+
+    #[test]
+    fn is_verified_true_when_verified_and_not_expired() {
+        let mut c = make_test_chunk();
+        c.integrity_status = Some("verified".into());
+        c.valid_to = Some(DateTime::from_millis(
+            DateTime::now().timestamp_millis() + 24 * 3600 * 1000,
+        ));
+        let now = DateTime::now();
+        assert!(is_verified(&c, now));
+    }
+
+    #[test]
+    fn is_verified_false_when_verified_but_expired() {
+        let mut c = make_test_chunk();
+        c.integrity_status = Some("verified".into());
+        c.valid_to = Some(DateTime::from_millis(
+            DateTime::now().timestamp_millis() - 24 * 3600 * 1000,
+        ));
+        let now = DateTime::now();
+        assert!(!is_verified(&c, now), "过期 verified 知识不得背书");
+    }
+
+    #[test]
+    fn is_verified_false_when_draft() {
+        let mut c = make_test_chunk();
+        c.integrity_status = Some("draft".into());
+        c.valid_to = None;
+        let now = DateTime::now();
+        assert!(!is_verified(&c, now));
     }
 }
 
