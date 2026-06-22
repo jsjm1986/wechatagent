@@ -383,13 +383,13 @@ export function UserOperationCockpit({
             />
           </label>
           <label>
-            <span>运营人员特别指令（最高优先级，可空）</span>
+            <span>运营人员特别指令（最高优先级，可空 — 也可描述关系与口吻）</span>
             <textarea
               value={customAgentInstructions}
               maxLength={1000}
               rows={5}
               onChange={(event) => onCustomAgentInstructions(event.target.value)}
-              placeholder="例：这个客户已签约老客户，不要主动推销，只服务问题。Agent 将在每轮对话最末尾读取这段指令。"
+              placeholder="例①：这个客户已签约老客户，不要主动推销，只服务问题。例②：这是我大学同学，他公司可能采购我们产品，但别推销，先用轻松口吻维护关系。Agent 将在每轮对话最末尾读取这段指令，可覆盖默认人格口吻。"
             />
             <span className="counter">{customAgentInstructions.length} / 1000</span>
             {selected.agentStatus === "managed" && (
