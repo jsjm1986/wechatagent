@@ -43,7 +43,6 @@ mod memory;
 pub(crate) mod multimodal;
 pub(crate) mod prompt_isolation;
 pub(crate) mod quiet_hours;
-mod tool_loop;
 pub(crate) mod outbox;
 pub(crate) mod outbox_dispatcher;
 mod reaction;
