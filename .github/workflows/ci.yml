@@ -1033,13 +1033,12 @@ jobs:
   real-llm-redline:
     name: Real-LLM 红线门 (${{ matrix.file }} / 确定性硬断言)
     runs-on: ubuntu-latest
-    # PR/push/schedule 都跑（红线硬断言是合并门，不能移走）；仅手动单跑事件不跑。
-    # 保留 needs: real-llm-adversarial 是为 schedule(nightly) 时串行守 rsxermu 并发≤2
-    # （排在能力套件链末）。但 PR/push 时 adversarial 被 if 跳过（skipped）——`!cancelled()`
-    # 让本门**不被 skip 的依赖连带跳过**仍照常跑（needs 的 skip ≠ cancel），此时全局仅本组
-    # 真模型在跑，matrix max-parallel:1 → 并发=1，无需串行链也守住。
+    # 仅 nightly schedule 跑（真模型红线是评估/优化 agent 行为的，不为每次 PR 变绿而烧
+    # 配额；PR 阶段红线靠 baseline job 内的 check-no-human-takeover / check-no-model-hint
+    # 字符串级 lint 兜底，真模型对话行为红线由 nightly 全量回归 + 手动 workflow_dispatch 单跑）。
+    # 保留 needs: real-llm-adversarial 让 nightly 时排在能力套件链末，串行守 rsxermu 并发≤2。
     needs: real-llm-adversarial
-    if: ${{ !cancelled() && github.event_name != 'workflow_dispatch' }}
+    if: ${{ github.event_name == 'schedule' }}
     timeout-minutes: 90
     strategy:
       fail-fast: false
@@ -1131,12 +1130,11 @@ jobs:
   skip-gate:
     name: Real-LLM skip 率硬门 (R0.2)
     runs-on: ubuntu-latest
-    # PR/push/schedule 都跑;仅手动单跑不跑。`!cancelled()`:能力套件 5 组在 PR/push 被 if
-    # 跳过(skipped),needs 只留 real-llm-redline(PR 必跑的唯一真模型组),`!cancelled()`
-    # 保证 redline 失败/跳过时本汇总门仍跑(汇总性质,不应被上游状态连带 skip)。download
-    # pattern `*ledger*` 抓当时已上传的全部 ledger:PR 时汇总 redline 一个、nightly 时尽量多抓。
+    # 仅 nightly schedule 跑：本门是真模型 job 的 skip 率兜底，PR 阶段已不跑任何真模型
+    # job（redline 也移走），无 ledger 可汇总，故一起移到 schedule。nightly 时 redline
+    # 跑完它汇总（needs 保证顺序），download pattern `*ledger*` 抓能力套件 + redline 全部 ledger。
     needs: [real-llm-redline]
-    if: ${{ !cancelled() && github.event_name != 'workflow_dispatch' }}
+    if: ${{ github.event_name == 'schedule' }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
