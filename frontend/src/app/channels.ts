@@ -20,7 +20,7 @@ import {
   BarChart3,
   type LucideIcon,
 } from "lucide-react";
-import type { Channel } from "../types";
+import type { Channel, DomainProfile } from "../types";
 
 const OverviewFeature = lazy(() => import("../features/overview"));
 const CommandCenterFeature = lazy(() => import("../features/command-center"));
@@ -49,6 +49,9 @@ export interface ChannelDef {
   title: string;
   subtitle: string;
   Component: LazyExoticComponent<ComponentType>;
+  /** 频道可见性谓词：未定义→默认显示（白名单退出）；定义了→按返回值。
+   *  读 active profile 决定该频道是否对当前行业显示。本期无频道使用，留作扩展点。 */
+  visibleWhen?: (profile: DomainProfile | null) => boolean;
 }
 
 // 单一事实来源：合并原 App.tsx 的 channels 数组 + channelTitle/Eyebrow/Subtitle。
