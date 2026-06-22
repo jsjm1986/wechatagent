@@ -4,6 +4,7 @@ import { CHANNELS } from "./channels";
 import { useNavigationStore } from "../stores/navigationStore";
 import { useAuthStore } from "../stores/authStore";
 import { useAccountStore } from "../stores/accountStore";
+import { useProfileStore } from "../stores/profileStore";
 import { api } from "../lib/api";
 import type { Account } from "../types";
 import styles from "./Shell.module.css";
@@ -132,6 +133,7 @@ function AccountSwitcher() {
 export function Shell() {
   const activeChannel = useNavigationStore((s) => s.activeChannel);
   const setChannel = useNavigationStore((s) => s.setChannel);
+  const activeProfile = useProfileStore((s) => s.activeProfile);
   const user = useAuthStore((s) => s.user);
   const onLogout = useAuthStore((s) => s.onLogout);
   const def = CHANNELS.find((c) => c.id === activeChannel) ?? CHANNELS[0];
@@ -156,7 +158,9 @@ export function Shell() {
           {GROUP_ORDER.map((group) => (
             <div key={group} className={styles.group}>
               <div className={styles.groupLabel}>{group}</div>
-              {CHANNELS.filter((c) => c.group === group).map((c) => {
+              {CHANNELS.filter((c) => c.group === group)
+                .filter((c) => (c.visibleWhen ? c.visibleWhen(activeProfile) : true))
+                .map((c) => {
                 const Icon = c.icon;
                 return (
                   <button
