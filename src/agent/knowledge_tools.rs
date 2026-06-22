@@ -81,21 +81,19 @@ pub(crate) const TOOL_AUDIT_COMPLETENESS: &str = "knowledge.audit_completeness";
 pub(crate) const TOOL_SEARCH_CHUNKS: &str = "knowledge.search_chunks";
 pub(crate) const TOOL_PROPOSE_REPAIR: &str = "knowledge.propose_repair";
 pub(crate) const TOOL_ANALYZE_LOGS: &str = "knowledge.analyze_logs";
-// 让 agent 拥有"对整个知识库的完整观察"能力的 3 个补充工具：
+// 让 agent 拥有"对整个知识库的完整观察"能力的补充工具：
 // - open_document：按 documentId 取父文档原文（截断）；
-// - inspect_pack：按 itemId 取知识包完整元数据；
 // - verify_anchor：传 chunkId + 候选 sourceQuote，立即返回是否能在父文档命中
 //   （与 verify gate 同一套 source_anchor_for_quote 模糊 anchor 算法，由 chat
 //   route 在 dispatch 时注入回调，避免 knowledge_tools 直接依赖 routes）。
 pub(crate) const TOOL_OPEN_DOCUMENT: &str = "knowledge.open_document";
-pub(crate) const TOOL_INSPECT_PACK: &str = "knowledge.inspect_pack";
 pub(crate) const TOOL_VERIFY_ANCHOR: &str = "knowledge.verify_anchor";
 
 /// 用于 R4.1 toolCalls schema 校验：合法 tool 名白名单。
 pub(crate) const ALLOWED_TOOL_NAMES: &[&str] =
     &[TOOL_LIST_CATALOG, TOOL_SEARCH, TOOL_OPEN_SLICE];
 
-/// chat tool loop 的合法 tool 白名单（user-ops 三件套 + 7 个 chat-only 工具）。
+/// chat tool loop 的合法 tool 白名单（user-ops 三件套 + 6 个 chat-only 工具）。
 pub(crate) const ALLOWED_CHAT_TOOL_NAMES: &[&str] = &[
     TOOL_LIST_CATALOG,
     TOOL_SEARCH,
@@ -105,7 +103,6 @@ pub(crate) const ALLOWED_CHAT_TOOL_NAMES: &[&str] = &[
     TOOL_PROPOSE_REPAIR,
     TOOL_ANALYZE_LOGS,
     TOOL_OPEN_DOCUMENT,
-    TOOL_INSPECT_PACK,
     TOOL_VERIFY_ANCHOR,
 ];
 
@@ -614,10 +611,6 @@ struct AnalyzeLogsArgs {
 // open_document：让 agent 直接读父文档原文（截断 4000 字），常见用法是
 // update_chunk 之前先看一眼真正的原文段，避免凭 chunk 自身的 sourceQuote 推断；
 //
-// inspect_pack：取整个知识包的完整元数据（routingCard / commonObjections /
-// safeClaims / forbiddenClaims / customerStages 等），让 agent 在 update_pack
-// 前知道当前包到底长什么样、哪些字段还没填；
-//
 // verify_anchor：把 candidate sourceQuote 投到父文档跑一遍 verify gate 的
 // 模糊 anchor 算法，返回 hit/miss + offset；让 agent 在生成 sourceQuote 之前
 // 自己先校验，而不是把无锚草稿直接抛到 chat_apply（apply 也仍会强制 needs_review，
@@ -631,13 +624,6 @@ struct OpenDocumentArgs {
     /// 截断字符数，1..=8000，缺省 4000。超出 → 截到 4000。
     #[serde(default)]
     max_chars: Option<i32>,
-}
-
-#[derive(Debug, Default, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct InspectPackArgs {
-    #[serde(default)]
-    item_id: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -708,9 +694,6 @@ pub(crate) async fn dispatch_chat_tool_call(
             }
             TOOL_OPEN_DOCUMENT => {
                 exec_open_document(&arguments, db, &workspace_id_owned).await
-            }
-            TOOL_INSPECT_PACK => {
-                exec_inspect_pack(&arguments, db, &workspace_id_owned).await
             }
             TOOL_VERIFY_ANCHOR => {
                 exec_verify_anchor(&arguments, db, &workspace_id_owned, anchor_match).await
@@ -1138,28 +1121,6 @@ async fn exec_open_document(
         "max_chars": max_chars as i32,
         "updated_at": doc_record.updated_at.timestamp_millis(),
     })
-}
-
-// ── exec: knowledge.inspect_pack ───────────────────────────────────────
-//
-// 输入：{ item_id }
-// 输出：{ item_id, title, routing_card, summary, customer_stages, intent_levels,
-//        common_questions, common_objections, safe_claims, forbidden_claims,
-//        evidence_items, applicable_scenes, not_applicable_scenes,
-//        product_tags, business_topics, status, updated_at }
-// 错误：invalid_input / unknown_item_id / db_error。
-async fn exec_inspect_pack(
-    arguments: &Document,
-    _db: &Database,
-    _workspace_id: &str,
-) -> Value {
-    // operation_knowledge_items 已删除；inspect_pack 永久返回 unknown_item_id。
-    let args: InspectPackArgs = match parse_arguments(arguments) {
-        Ok(args) => args,
-        Err(detail) => return tool_error("invalid_input", &detail),
-    };
-    let item_id = args.item_id.unwrap_or_default();
-    json!({ "error": "unknown_item_id", "missing": [item_id] })
 }
 
 // ── exec: knowledge.verify_anchor ──────────────────────────────────────
@@ -1724,13 +1685,6 @@ mod tests {
         let a: OpenDocumentArgs = mongodb::bson::from_document(d).expect("camelCase 反序列化必须通过");
         assert_eq!(a.document_id.as_deref(), Some("doc-x"));
         assert_eq!(a.max_chars, Some(4000));
-    }
-
-    #[test]
-    fn inspect_pack_args_accept_camel_case() {
-        let d = doc! { "itemId": "p-7" };
-        let a: InspectPackArgs = mongodb::bson::from_document(d).expect("camelCase 反序列化必须通过");
-        assert_eq!(a.item_id.as_deref(), Some("p-7"));
     }
 
     #[test]

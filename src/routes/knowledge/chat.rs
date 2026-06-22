@@ -463,15 +463,9 @@ pub async fn chat_apply(
                 .join("\n");
             apply_update_chunk(&state, &admin.current_workspace, &account_id, &chunk_id, patch, &operator_statement).await?
         }
-        "update_pack" => {
-            let pack_id = target_pack_id.clone().ok_or_else(|| {
-                AppError::BadRequest("update_pack 需要 attachments.itemId".to_string())
-            })?;
-            apply_update_pack(&state, &account_id, &pack_id, patch).await?
-        }
         other => {
             return Err(AppError::BadRequest(format!(
-                "intent={other} 不可应用为草稿（仅 create_chunk / update_chunk / update_pack 可应用）"
+                "intent={other} 不可应用为草稿（仅 create_chunk / update_chunk 可应用）"
             )));
         }
     };
@@ -877,26 +871,6 @@ async fn run_chat_turn_pipeline(
             v["promptKey"] = json!("knowledge.chat.update_chunk");
             v
         }
-        "update_pack" => {
-            let pack_id = target_pack_id.clone().ok_or_else(|| {
-                AppError::BadRequest(
-                    "update_pack 需要 attachments.itemId 或在对话中明确引用知识包".to_string(),
-                )
-            })?;
-            let mut v = update_pack_for_chat(
-                state,
-                workspace_id,
-                account_id,
-                session_id,
-                user_content,
-                &pack_id,
-                history,
-            )
-            .await?;
-            v["draftKind"] = json!("pack_update");
-            v["promptKey"] = json!("knowledge.chat.update_chunk");
-            v
-        }
         "digest_action" => {
             let mut v = dispatch_digest_action_for_chat(
                 state,
@@ -1001,7 +975,7 @@ fn render_operator_memory_for_prompt(
 // 设计目标：让 chat 三大下游 prompt（draft_chunk / update_chunk / clarify）走真
 // 正的 agent tool loop —— Reply Agent 可以多轮自主调用 knowledge.* 工具去观察
 // 整个知识库（catalog / search / open_slice / audit_completeness / search_chunks /
-// propose_repair / analyze_logs / open_document / inspect_pack / verify_anchor）
+// propose_repair / analyze_logs / open_document / verify_anchor）
 // 再决定最终输出。
 //
 // 强约束（与 user-ops tool_loop 保持同构）：
@@ -1354,7 +1328,7 @@ async fn classify_intent(
 最近历史（最多 6 条）：
 {}
 
-请输出 JSON，intent 必须在 [create_chunk, update_chunk, clarify_chunk, update_pack, digest_action, update_operator_memory, freeform] 中。"#,
+请输出 JSON，intent 必须在 [create_chunk, update_chunk, clarify_chunk, digest_action, update_operator_memory, freeform] 中。"#,
         chunk_attached.unwrap_or("(无)"),
         item_attached.unwrap_or("(无)"),
         render_chat_history_for_prompt(history),
@@ -1516,21 +1490,6 @@ async fn update_chunk_for_chat(
         user,
     )
     .await
-}
-
-async fn update_pack_for_chat(
-    _state: &AppState,
-    _workspace_id: &str,
-    _account_id: &str,
-    _session_id: &str,
-    _user_content: &str,
-    pack_id: &str,
-    _history: &[KnowledgeChatTurn],
-) -> AppResult<Value> {
-    // operation_knowledge_items 已删除；pack-level chat 路径暂时下线。
-    Err(AppError::BadRequest(format!(
-        "operation_knowledge_items has been removed; pack {pack_id} chat update is disabled"
-    )))
 }
 
 async fn clarify_for_chat(
@@ -1834,18 +1793,6 @@ async fn apply_update_chunk(
         "status": "draft",
         "integrityStatus": "needs_review",
     }))
-}
-
-async fn apply_update_pack(
-    _state: &AppState,
-    _account_id: &str,
-    pack_id: &str,
-    _patch: &Document,
-) -> AppResult<Value> {
-    // operation_knowledge_items 已删除；pack-level apply 路径暂时下线。
-    Err(AppError::BadRequest(format!(
-        "operation_knowledge_items has been removed; pack {pack_id} update is disabled"
-    )))
 }
 
 /// 把 chat 产出的 patch（camelCase JSON）转成 OperationKnowledgeChunkRequest。
