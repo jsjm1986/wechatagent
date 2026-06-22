@@ -481,23 +481,15 @@ mod tests {
         assert_eq!(snap.tool_calls_used, 0, "final-only 路径不应消耗 tool_call 配额");
     }
 
-    /// 验证常量与同源模块一致：CHAT_TOOL_CALLS_PER_TURN_CAP=6,
-    /// CHAT_TOOL_LOOP_MAX_LOOPS=4。
+    /// 验证常量与设计金标一致：CHAT_TOOL_CALLS_PER_TURN_CAP=6,
+    /// CHAT_TOOL_LOOP_MAX_LOOPS=4。failure_streak/context/trace 金标与
+    /// user-ops 工具循环下线前同源（3 / 8000 / 32）。
     #[test]
     fn chat_tool_loop_constants_are_aligned_with_design() {
         assert_eq!(super::CHAT_TOOL_LOOP_MAX_LOOPS, 4);
-        assert_eq!(
-            super::CHAT_TOOL_FAILURE_STREAK_LIMIT,
-            crate::agent::tool_loop::TOOL_FAILURE_STREAK_LIMIT
-        );
-        assert_eq!(
-            super::CHAT_TOOL_RESULT_CONTEXT_MAX_CHARS,
-            crate::agent::tool_loop::TOOL_RESULT_CONTEXT_MAX_CHARS
-        );
-        assert_eq!(
-            super::CHAT_TOOL_TRACE_MAX_LEN,
-            crate::agent::tool_loop::TOOL_TRACE_MAX_LEN
-        );
+        assert_eq!(super::CHAT_TOOL_FAILURE_STREAK_LIMIT, 3);
+        assert_eq!(super::CHAT_TOOL_RESULT_CONTEXT_MAX_CHARS, 8000);
+        assert_eq!(super::CHAT_TOOL_TRACE_MAX_LEN, 32);
         assert_eq!(super::CHAT_TOOL_CALLS_PER_TURN_CAP, 6);
     }
 
