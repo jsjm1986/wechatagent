@@ -1,7 +1,7 @@
 //! ask_human 策略解析（纯函数）：ask_human_policy 存在则用它；否则回落旧
 //! principal_decider/high_risk_escalation_mode 字段映射（字节等价红线④）。无 IO。
 
-use crate::models::{AskHumanPolicy, AskHumanQuietHours, DeciderRef, OperationDomainConfig};
+use crate::models::{AskHumanQuietHours, DeciderRef, OperationDomainConfig};
 
 /// 解析后的请示策略（运行时唯一权威；旧字段仅 None 时兜底）。
 #[derive(Debug, Clone, PartialEq)]
@@ -108,7 +108,7 @@ pub(crate) fn next_decider_on_timeout<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::OperationDomainConfig;
+    use crate::models::{AskHumanPolicy, OperationDomainConfig};
 
     fn base_config() -> OperationDomainConfig {
         OperationDomainConfig {
