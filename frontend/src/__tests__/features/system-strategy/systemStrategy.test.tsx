@@ -190,3 +190,53 @@ describe("TaxonomiesAdmin 编辑与废弃恢复", () => {
     await waitFor(() => expect(patch).toHaveBeenCalledWith("/api/admin/taxonomies/id_dep", { deprecated: false }));
   });
 });
+
+describe("TaxonomiesAdmin 边界", () => {
+  beforeEach(() => {
+    // 清理上一个用例累积的 spy 调用计数（postRaw 不发请求断言依赖干净计数）
+    vi.clearAllMocks();
+    useUiStore.setState({
+      busy: false,
+      error: "",
+      setBusy: vi.fn(),
+      setError: vi.fn(),
+    });
+  });
+
+  it("新增重复条目(409) 显示 info 不显示 error", async () => {
+    vi.spyOn(api, "get").mockResolvedValue({ items: [] } as never);
+    vi.spyOn(api, "postRaw").mockResolvedValue({
+      ok: false,
+      status: 409,
+      data: { message: "(scope=global, kind=customer_stage, value.id=need_discovery) 已存在" },
+    } as never);
+    render(<SystemStrategyFeature />);
+    fireEvent.click(await screen.findByText("新增条目"));
+    fireEvent.change(screen.getByPlaceholderText(/canonical id/i), { target: { value: "need_discovery" } });
+    fireEvent.change(screen.getByPlaceholderText(/显示名/i), { target: { value: "需求挖掘" } });
+    fireEvent.click(screen.getByText("保存"));
+    // 409 走 info（badgeOk），不进 inlineError —— 文案以 message 内的「已存在」断言
+    expect(await screen.findByText(/已存在/)).toBeInTheDocument();
+  });
+
+  it("新增缺 canonical id 时本地校验拦下，不发请求", async () => {
+    vi.spyOn(api, "get").mockResolvedValue({ items: [] } as never);
+    const postRaw = vi.spyOn(api, "postRaw");
+    render(<SystemStrategyFeature />);
+    fireEvent.click(await screen.findByText("新增条目"));
+    fireEvent.change(screen.getByPlaceholderText(/显示名/i), { target: { value: "需求挖掘" } });
+    fireEvent.click(screen.getByText("保存"));
+    expect(await screen.findByText(/均不能为空/)).toBeInTheDocument();
+    expect(postRaw).not.toHaveBeenCalled();
+  });
+
+  it("kind=customer_stage 显示状态机软提示，改成 intent_level 后不显示", async () => {
+    vi.spyOn(api, "get").mockResolvedValue({ items: [] } as never);
+    render(<SystemStrategyFeature />);
+    fireEvent.click(await screen.findByText("新增条目"));
+    // 默认 kind=customer_stage → 软提示可见
+    expect(screen.getByText(/状态机灰度.*同步配置/)).toBeInTheDocument();
+    fireEvent.change(screen.getByPlaceholderText("customer_stage"), { target: { value: "intent_level" } });
+    expect(screen.queryByText(/状态机灰度.*同步配置/)).not.toBeInTheDocument();
+  });
+});
