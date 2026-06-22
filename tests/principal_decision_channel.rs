@@ -361,7 +361,7 @@ async fn set_ask_human_policy(app: &common::TestApp, policy: &AskHumanPolicy) {
         .operation_domain_configs()
         .update_one(
             doc! { "workspace_id": "default", "domain": "user_operations", "current_version": true },
-            doc! { "$set": { "askHumanPolicy": policy_bson, "updated_at": DateTime::now() } },
+            doc! { "$set": { "ask_human_policy": policy_bson, "updated_at": DateTime::now() } },
             None,
         )
         .await
