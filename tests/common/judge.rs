@@ -735,8 +735,9 @@ pub fn record_judge_skip_detail(
 /// 仅当 judged==true（有 key、真跑了裁判但全掉线）时写 skip 台账；judged==false
 /// （本地无 key，零成本设计跳过）不写——否则本地跑测试污染 target/real_llm_ledger + 误报。
 /// 调用方在能取到 judges 处传 `!judges.is_empty()`；封装了 judges 的函数自己回传「真跑了」。
-/// 与 `assert_autonomy_verdict`（autonomy_gate.rs 内部 Skipped 分支已写 ledger）互斥：调用方若已走
-/// `assert_autonomy_verdict`，勿再调本 helper，避免对同一 skip 事件双写。
+/// 用于 conversation_judge / ops_smoke 对话级门 / roleplayer 校准等非 autonomy 路径的 skip 留痕。
+/// （autonomy 门的 Skipped 留痕已上移到 `run_autonomy_redline_gate` 内单点写 `record_judge_skip_detail`，
+/// 不再经本 helper——故同一 skip 事件不会双写。）
 pub fn record_arc_skip_if_judged(judged: bool, label: &str) {
     if judged {
         record_judge_skip(label, "judge_offline");

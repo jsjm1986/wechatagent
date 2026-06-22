@@ -19,10 +19,8 @@ async fn gate(label: &str, inbound: &str, reply: &str, transcript: Option<&str>)
     let ctx = JudgeContext { transcript: transcript.map(|s| s.to_string()), ..Default::default() };
     let refs: Vec<(&str, &dyn LlmProvider)> = judges.iter().map(|(l, c)| (*l, c.as_ref())).collect();
     let verdict = run_autonomy_redline_gate(&refs, &rubric, label, inbound, reply, &ctx).await;
-    // CI 有 key 但裁判全掉线 → 写 ledger（不假绿，skip-gate 兜底）。
-    if matches!(verdict, RedlineVerdict::Skipped) {
-        common::judge::record_arc_skip_if_judged(true, label);
-    }
+    // CI 有 key 但裁判不足双裁判 → 台账已由 run_autonomy_redline_gate 单点写（带判定快照，不假绿，
+    // skip-gate 兜底）；此处不再重复写，否则同一 skip 事件双写、skip-gate(wc -l)计数翻倍。
     verdict
 }
 
