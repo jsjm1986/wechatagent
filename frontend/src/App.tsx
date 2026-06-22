@@ -5,6 +5,7 @@ import { Shell } from "./app/Shell";
 import { GlobalErrorBanner } from "./app/GlobalErrorBanner";
 import { useAccountStore } from "./stores/accountStore";
 import { useUiStore } from "./stores/uiStore";
+import { useProfileStore } from "./stores/profileStore";
 // 频道视图已全部迁出至 features/*；App 只保留启动引导 + 全局 chunk WebSocket。
 // 保留两个 re-export 让既有测试 `import { AutonomyOutcomesTab, formatRate } from "../App"` 继续解析。
 export { AutonomyOutcomesTab } from "./features/autonomy";
@@ -140,6 +141,7 @@ export function App() {
       .get<{ items: Account[] }>("/api/accounts")
       .then((data) => useAccountStore.getState().setAccounts(data.items))
       .catch((err) => useUiStore.getState().setError(err instanceof Error ? err.message : String(err)));
+    void useProfileStore.getState().loadActiveProfile();
   }, []);
 
   return (
