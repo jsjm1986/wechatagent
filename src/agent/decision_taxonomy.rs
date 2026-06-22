@@ -169,6 +169,7 @@ mod tests {
                 status: status.to_string(),
                 priority_weight: None,
                 is_terminal: false,
+                is_reactivation_target: false,
             },
             updated_at: DateTime::now(),
             version: 1,

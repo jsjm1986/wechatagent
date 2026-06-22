@@ -63,6 +63,7 @@ pub(super) fn value_tier_seed_entries(now: DateTime) -> Vec<TaxonomyEntry> {
                 // 价值分层不参与 planner 漏斗排序（它走独立 value_tier_weight 排序维度）。
                 priority_weight: None,
                 is_terminal: false,
+                is_reactivation_target: false,
             },
             updated_at: now,
             version: 1,

@@ -73,6 +73,7 @@ pub(super) fn relationship_type_seed_entries(now: DateTime) -> Vec<TaxonomyEntry
                 // 关系类型不参与 planner 漏斗排序（它走 resolve_operation_mode 选范式，非排序权重）。
                 priority_weight: None,
                 is_terminal: false,
+                is_reactivation_target: false,
             },
             updated_at: now,
             version: 1,

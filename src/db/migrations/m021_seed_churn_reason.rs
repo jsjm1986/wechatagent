@@ -91,6 +91,7 @@ pub(super) fn churn_reason_seed_entries(now: DateTime) -> Vec<TaxonomyEntry> {
                 // 流失原因不参与 planner 漏斗排序，无权重/终态语义。
                 priority_weight: None,
                 is_terminal: false,
+                is_reactivation_target: false,
             },
             updated_at: now,
             version: 1,
