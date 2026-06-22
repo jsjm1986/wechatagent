@@ -56,6 +56,8 @@ type TaxonomyDraft = {
   description: string;
 };
 
+type EditDraft = { label: string; aliases: string; description: string };
+
 type LessonLearnedEntry = {
   lessonId: string;
   workspaceId: string;
@@ -614,6 +616,8 @@ function TaxonomiesAdmin({ busy }: { busy: boolean }) {
   });
   const [acting, setActing] = useState(false);
   const [info, setInfo] = useState<string | null>(null);
+  const [editingId, setEditingId] = useState<string | null>(null);
+  const [editDraft, setEditDraft] = useState<EditDraft>({ label: "", aliases: "", description: "" });
 
   async function reload() {
     setLoading(true);
@@ -666,6 +670,61 @@ function TaxonomiesAdmin({ busy }: { busy: boolean }) {
         setShowCreate(false);
         setCreateDraft({ scope: "global", kind: "customer_stage", id: "", label: "", aliases: "", description: "" });
       }
+      await reload();
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setActing(false);
+    }
+  }
+
+  async function submitEdit(id: string) {
+    if (!editDraft.label.trim()) {
+      setError("显示名不能为空。");
+      return;
+    }
+    setActing(true);
+    setError(null);
+    setInfo(null);
+    try {
+      const aliases = editDraft.aliases.split(/[,，]/).map((a) => a.trim()).filter((a) => a.length > 0);
+      await api.patch(`/api/admin/taxonomies/${id}`, {
+        label: editDraft.label.trim(),
+        aliases,
+        description: editDraft.description.trim(),
+      });
+      setInfo("已更新。");
+      setEditingId(null);
+      await reload();
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setActing(false);
+    }
+  }
+
+  async function deprecateEntry(id: string) {
+    setActing(true);
+    setError(null);
+    setInfo(null);
+    try {
+      await api.delete(`/api/admin/taxonomies/${id}`);
+      setInfo(includeDeprecated ? "已废弃。" : "已废弃，勾选「显示已废弃」可查看。");
+      await reload();
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setActing(false);
+    }
+  }
+
+  async function restoreEntry(id: string) {
+    setActing(true);
+    setError(null);
+    setInfo(null);
+    try {
+      await api.patch(`/api/admin/taxonomies/${id}`, { deprecated: false });
+      setInfo("已恢复为启用。");
       await reload();
     } catch (e) {
       setError((e as Error).message);
@@ -786,6 +845,41 @@ function TaxonomiesAdmin({ busy }: { busy: boolean }) {
                 </div>
               )}
             </div>
+            {editingId !== item.id && (
+              <div className={styles.buttonRow}>
+                <button type="button" className={styles.btnGhost}
+                  onClick={() => { setShowCreate(false); setEditingId(item.id); setEditDraft({ label: item.value.label, aliases: (item.value.aliases ?? []).join("，"), description: item.value.description ?? "" }); setInfo(null); setError(null); }}
+                  disabled={busy || acting}>编辑</button>
+                {item.value.status === "active" ? (
+                  <button type="button" className={styles.btnGhost} onClick={() => void deprecateEntry(item.id)} disabled={busy || acting}>废弃</button>
+                ) : (
+                  <button type="button" className={styles.btnGhost} onClick={() => void restoreEntry(item.id)} disabled={busy || acting}>恢复</button>
+                )}
+              </div>
+            )}
+            {editingId === item.id && (
+              <div className={styles.form} style={{ marginTop: 12 }}>
+                <label className={styles.field}>
+                  <span>显示名</span>
+                  <input className={styles.input} value={editDraft.label}
+                    onChange={(e) => setEditDraft({ ...editDraft, label: e.target.value })} />
+                </label>
+                <label className={styles.field}>
+                  <span>别名（逗号分隔，可空）</span>
+                  <input className={styles.input} value={editDraft.aliases}
+                    onChange={(e) => setEditDraft({ ...editDraft, aliases: e.target.value })} />
+                </label>
+                <label className={styles.field}>
+                  <span>描述（可空）</span>
+                  <textarea className={styles.textarea} value={editDraft.description}
+                    onChange={(e) => setEditDraft({ ...editDraft, description: e.target.value })} />
+                </label>
+                <div className={styles.buttonRow}>
+                  <button type="button" className={styles.btnPrimary} onClick={() => void submitEdit(item.id)} disabled={acting}>保存编辑</button>
+                  <button type="button" className={styles.btnGhost} onClick={() => setEditingId(null)} disabled={acting}>取消</button>
+                </div>
+              </div>
+            )}
           </div>
         ))}
       </div>

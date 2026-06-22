@@ -11,6 +11,8 @@ vi.mock("../../../lib/api", () => ({
     get: vi.fn().mockResolvedValue({ items: [] }),
     post: vi.fn().mockResolvedValue({}),
     put: vi.fn().mockResolvedValue({}),
+    patch: vi.fn().mockResolvedValue({}),
+    delete: vi.fn().mockResolvedValue({}),
     postRaw: vi.fn().mockResolvedValue({ ok: true, status: 200, data: { item: {} } }),
   },
 }));
@@ -125,5 +127,66 @@ describe("TaxonomiesAdmin 新增条目", () => {
       kind: "customer_stage",
       value: { id: "need_discovery", label: "需求挖掘", aliases: ["挖需求", "需求探索", "探需"], description: undefined },
     });
+  });
+});
+
+describe("TaxonomiesAdmin 编辑与废弃恢复", () => {
+  beforeEach(() => {
+    useUiStore.setState({
+      busy: false,
+      error: "",
+      setBusy: vi.fn(),
+      setError: vi.fn(),
+    });
+  });
+
+  const activeItem = {
+    id: "id_active", scope: "global", kind: "customer_stage",
+    value: { id: "need_discovery", label: "需求挖掘", aliases: ["挖需求"], description: "", status: "active" },
+    version: 1, currentVersion: true, previousVersion: null, seededBy: "manual", updatedAt: "",
+  };
+  const deprecatedItem = {
+    id: "id_dep", scope: "global", kind: "intent_level",
+    value: { id: "low", label: "低意向", aliases: [], description: "", status: "deprecated" },
+    version: 1, currentVersion: true, previousVersion: null, seededBy: "manual", updatedAt: "",
+  };
+
+  // 多个灰度面板共用 api.get；仅 /taxonomies 端点返回 seed 条目，其余面板（状态机/候选）保持空，
+  // 避免把字典条目喂给 StatePolicyAdmin 触发其 item.allowed.join 崩溃（非本 task 范围）。
+  function seedTaxonomyGet(seed: object) {
+    vi.spyOn(api, "get").mockImplementation((url: string) =>
+      Promise.resolve((url.includes("/api/admin/taxonomies") ? { items: [seed] } : { items: [] }) as never)
+    );
+  }
+
+  it("编辑提交 PATCH /:id，body 仅 label/aliases/description（无 id/scope/kind）", async () => {
+    seedTaxonomyGet(activeItem);
+    const patch = vi.spyOn(api, "patch").mockResolvedValue({ item: activeItem } as never);
+    render(<SystemStrategyFeature />);
+    fireEvent.click(await screen.findByText("编辑"));
+    fireEvent.change(screen.getByDisplayValue("需求挖掘"), { target: { value: "需求探索阶段" } });
+    fireEvent.click(screen.getByText("保存编辑"));
+    await waitFor(() => expect(patch).toHaveBeenCalled());
+    expect(patch).toHaveBeenCalledWith("/api/admin/taxonomies/id_active", {
+      label: "需求探索阶段", aliases: ["挖需求"], description: "",
+    });
+  });
+
+  it("active 条目显示「废弃」，点击调 api.delete", async () => {
+    seedTaxonomyGet(activeItem);
+    const del = vi.spyOn(api, "delete").mockResolvedValue({ ok: true } as never);
+    render(<SystemStrategyFeature />);
+    fireEvent.click(await screen.findByText("废弃"));
+    await waitFor(() => expect(del).toHaveBeenCalledWith("/api/admin/taxonomies/id_active"));
+  });
+
+  it("deprecated 条目显示「恢复」，点击调 api.patch {deprecated:false}", async () => {
+    seedTaxonomyGet(deprecatedItem);
+    const patch = vi.spyOn(api, "patch").mockResolvedValue({ item: deprecatedItem } as never);
+    render(<SystemStrategyFeature />);
+    // deprecated 条目需勾「显示已废弃」才可见（现有 includeDeprecated checkbox）
+    fireEvent.click(screen.getByText("显示已废弃"));
+    fireEvent.click(await screen.findByText("恢复"));
+    await waitFor(() => expect(patch).toHaveBeenCalledWith("/api/admin/taxonomies/id_dep", { deprecated: false }));
   });
 });
