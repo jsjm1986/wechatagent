@@ -243,6 +243,7 @@ pub struct AgentDecision {
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct AssetSendDirective {
+    #[serde(default)]
     pub asset_id: String,
     #[serde(default)]
     pub reason: Option<String>,
@@ -254,6 +255,7 @@ pub struct AssetSendDirective {
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct NamecardDirective {
+    #[serde(default)]
     pub card_id: String,
     #[serde(default)]
     pub reason: Option<String>,
