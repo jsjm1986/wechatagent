@@ -698,6 +698,7 @@ function TaxonomiesAdmin({ busy }: { busy: boolean }) {
       await reload();
     } catch (e) {
       setError((e as Error).message);
+      await reload();
     } finally {
       setActing(false);
     }
@@ -713,6 +714,7 @@ function TaxonomiesAdmin({ busy }: { busy: boolean }) {
       await reload();
     } catch (e) {
       setError((e as Error).message);
+      await reload();
     } finally {
       setActing(false);
     }
@@ -728,6 +730,7 @@ function TaxonomiesAdmin({ busy }: { busy: boolean }) {
       await reload();
     } catch (e) {
       setError((e as Error).message);
+      await reload();
     } finally {
       setActing(false);
     }
