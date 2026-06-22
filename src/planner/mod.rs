@@ -827,6 +827,9 @@ pub(crate) struct PlannerStageConfig {
     intent_weights: std::collections::HashMap<String, i32>,
     /// 终态 stage canonical id 集合（is_terminal=true）。
     terminal_stages: std::collections::HashSet<String>,
+    /// 再激活目标 stage canonical id 集合（is_reactivation_target=true）。供
+    /// reactivation_candidate_filter 的 MongoDB `$in` 预筛。
+    reactivation_stages: std::collections::HashSet<String>,
     /// stage_stagnation 计时维度（DEFAULT="customer_stage"）。
     stagnation_dimension: String,
 }
@@ -838,6 +841,7 @@ impl Default for PlannerStageConfig {
             stage_weights: std::collections::HashMap::new(),
             intent_weights: std::collections::HashMap::new(),
             terminal_stages: std::collections::HashSet::new(),
+            reactivation_stages: std::collections::HashSet::new(),
             stagnation_dimension: "customer_stage".to_string(),
         }
     }
@@ -879,6 +883,17 @@ impl PlannerStageConfig {
             self.terminal_stages.iter().cloned().collect()
         }
     }
+
+    /// 有效再激活目标集合（供 MongoDB 端 `$in` 预筛）：字典非空用字典，否则回落写死
+    /// `["dormant_reactivation"]`（销售域 DEFAULT）。与 [`reactivation_candidate_filter`]
+    /// 同源；单元素回落与原 `== "dormant_reactivation"` 查询字节等价。
+    fn effective_reactivation_stages(&self) -> Vec<String> {
+        if self.reactivation_stages.is_empty() {
+            vec!["dormant_reactivation".to_string()]
+        } else {
+            self.reactivation_stages.iter().cloned().collect()
+        }
+    }
 }
 
 /// universal-domain-adaptation H8：从**已加载的** profile + taxonomy 缓存构造
@@ -904,19 +919,23 @@ pub(crate) async fn build_planner_stage_config(
         stage_weights: std::collections::HashMap::new(),
         intent_weights: std::collections::HashMap::new(),
         terminal_stages: std::collections::HashSet::new(),
+        reactivation_stages: std::collections::HashSet::new(),
         stagnation_dimension,
     };
-    for (id, weight, is_terminal) in
+    for (id, weight, is_terminal, is_reactivation_target) in
         dimension_value_weights("customer_stage", account_id, &cache)
     {
         if let Some(w) = weight {
             config.stage_weights.insert(id.clone(), w);
         }
         if is_terminal {
-            config.terminal_stages.insert(id);
+            config.terminal_stages.insert(id.clone());
+        }
+        if is_reactivation_target {
+            config.reactivation_stages.insert(id);
         }
     }
-    for (id, weight, _is_terminal) in
+    for (id, weight, _is_terminal, _is_reactivation_target) in
         dimension_value_weights("intent_level", account_id, &cache)
     {
         if let Some(w) = weight {
@@ -1930,14 +1949,21 @@ async fn reactivation_recently_emitted(
     Ok(count > 0)
 }
 
-/// MongoDB 端粗筛：managed + 非冷却 + **customer_stage=dormant_reactivation**（只选休眠态
-/// 老客）。逐 contact 的 reactivation.enabled 短路 + 休眠时长 + cadence 节奏在 Rust 侧做。
-pub(crate) fn reactivation_candidate_filter(workspace_id: &str, account_id: &str) -> Document {
+/// MongoDB 端粗筛：managed + 非冷却 + customer_stage ∈ 再激活目标集合（stage_config 派生，
+/// DEFAULT 回落 ["dormant_reactivation"]）。逐 contact 的 reactivation.enabled 短路 + 休眠
+/// 时长 + cadence 节奏在 Rust 侧做。
+pub(crate) fn reactivation_candidate_filter(
+    workspace_id: &str,
+    account_id: &str,
+    stage_config: &PlannerStageConfig,
+) -> Document {
     doc! {
         "workspace_id": workspace_id,
         "account_id": account_id,
         "agent_status": "managed",
-        "domain_attributes.customer_stage": "dormant_reactivation",
+        "domain_attributes.customer_stage": {
+            "$in": stage_config.effective_reactivation_stages()
+        },
         "$or": [
             { "cooldown_until": { "$exists": false } },
             { "cooldown_until": null },
@@ -1971,7 +1997,8 @@ async fn scan_reactivation(state: &AppState) -> anyhow::Result<()> {
     let global_cadence_days = state.config.strategic_planner_reactivation_cadence_days;
     let global_reactivation_cap = state.config.strategic_planner_reactivation_daily_cap;
 
-    let filter = reactivation_candidate_filter(&workspace_id, &account_id);
+    let stage_config = build_planner_stage_config(state, &account_id, &profile).await;
+    let filter = reactivation_candidate_filter(&workspace_id, &account_id, &stage_config);
     let mut cursor = state.db.contacts().find(filter, None).await?;
 
     let regular_cap = state.config.strategic_planner_daily_emit_cap;
@@ -2588,6 +2615,7 @@ mod tests {
             stage_weights: std::collections::HashMap::new(),
             intent_weights: std::collections::HashMap::new(),
             terminal_stages: std::collections::HashSet::new(),
+            reactivation_stages: std::collections::HashSet::new(),
             stagnation_dimension: "relationship_closeness".to_string(),
         };
         let filter = stage_stagnation_candidate_filter("ws", "acc", dt(1_000), dt(2_000), &c);
@@ -2613,6 +2641,7 @@ mod tests {
             stage_weights: std::collections::HashMap::new(),
             intent_weights: std::collections::HashMap::new(),
             terminal_stages: terminal,
+            reactivation_stages: std::collections::HashSet::new(),
             stagnation_dimension: "customer_stage".to_string(),
         };
         let filter = stage_stagnation_candidate_filter("ws", "acc", dt(1_000), dt(2_000), &c);
@@ -2878,6 +2907,7 @@ mod tests {
             stage_weights,
             intent_weights: std::collections::HashMap::new(),
             terminal_stages: terminal,
+            reactivation_stages: std::collections::HashSet::new(),
             stagnation_dimension: "relationship_closeness".to_string(),
         };
         // 字典命中 → 用字典值。
@@ -3405,19 +3435,61 @@ mod tests {
         assert!(!crate::models::OperationMode::default().reactivation.enabled);
     }
 
-    /// reactivation_candidate_filter 只选休眠态老客（customer_stage=dormant_reactivation）+ managed + 非冷却。
+    /// reactivation_candidate_filter 用 stage_config 的再激活目标集合做 $in 预筛
+    /// （DEFAULT 回落 ["dormant_reactivation"]）+ managed + 非冷却。
     #[test]
     fn reactivation_candidate_filter_includes_dormant_stage() {
-        let f = reactivation_candidate_filter("ws1", "acc1");
+        let cfg = PlannerStageConfig::default();
+        let f = reactivation_candidate_filter("ws1", "acc1", &cfg);
         assert_eq!(f.get_str("workspace_id").unwrap(), "ws1");
         assert_eq!(f.get_str("account_id").unwrap(), "acc1");
         assert_eq!(f.get_str("agent_status").unwrap(), "managed");
+        let stage = f
+            .get_document("domain_attributes.customer_stage")
+            .expect("customer_stage 应为 $in 文档");
+        let targets: Vec<&str> = stage
+            .get_array("$in")
+            .expect("含 $in 数组")
+            .iter()
+            .map(|b| b.as_str().expect("$in 元素为字符串"))
+            .collect();
         assert_eq!(
-            f.get_str("domain_attributes.customer_stage").unwrap(),
-            "dormant_reactivation",
-            "再激活只扫休眠态老客"
+            targets,
+            vec!["dormant_reactivation"],
+            "DEFAULT 回落只扫休眠态老客（与原 == 查询字节等价）"
         );
         assert!(f.get_array("$or").is_ok(), "含 cooldown 非冷却 $or 粗筛");
+    }
+
+    /// 审查 #3：换行业声明了不同再激活目标 stage 时，DB 预筛 $in 用配置值，不再焊死
+    /// 销售专有的 dormant_reactivation。镜像 stage_stagnation_filter_uses_configured_terminal_stages。
+    #[test]
+    fn reactivation_candidate_filter_uses_configured_reactivation_stages() {
+        let mut reactivation = std::collections::HashSet::new();
+        reactivation.insert("churned_silent".to_string());
+        let cfg = PlannerStageConfig {
+            stage_weights: std::collections::HashMap::new(),
+            intent_weights: std::collections::HashMap::new(),
+            terminal_stages: std::collections::HashSet::new(),
+            reactivation_stages: reactivation,
+            stagnation_dimension: "customer_stage".to_string(),
+        };
+        let f = reactivation_candidate_filter("ws1", "acc1", &cfg);
+        let stage = f
+            .get_document("domain_attributes.customer_stage")
+            .expect("customer_stage 应为 $in 文档");
+        let targets: Vec<&str> = stage
+            .get_array("$in")
+            .expect("含 $in 数组")
+            .iter()
+            .map(|b| b.as_str().expect("$in 元素为字符串"))
+            .collect();
+        assert_eq!(targets, vec!["churned_silent"], "再激活目标集未用配置值");
+        // 销售默认再激活 stage 不再写死出现（非销售域不被误筛）。
+        assert!(
+            !targets.contains(&"dormant_reactivation"),
+            "不应残留写死销售再激活 stage：{targets:?}"
+        );
     }
 
     /// 零扰动：DEFAULT 销售域 profile（reactivation 关）→ resolve 后 reactivation.enabled=false。

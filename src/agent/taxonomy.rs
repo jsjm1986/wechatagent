@@ -87,6 +87,8 @@ struct CachedEntry {
     /// universal-domain-adaptation 1C：是否终态（成交后维护 / 冷却 / 沉默等不再被
     /// stage_stagnation 段催促）。planner 据此构造 terminal 集合替代写死的 TERMINAL_STAGES。
     is_terminal: bool,
+    /// universal-domain-adaptation #3：是否再激活目标 stage（来自 TaxonomyValue）。
+    is_reactivation_target: bool,
 }
 
 impl Default for TaxonomyCache {
@@ -144,6 +146,7 @@ impl TaxonomyCache {
                     status: entry.value.status,
                     priority_weight: entry.value.priority_weight,
                     is_terminal: entry.value.is_terminal,
+                    is_reactivation_target: entry.value.is_reactivation_target,
                 });
         }
         let mut inner = self.inner.lock();
@@ -247,7 +250,8 @@ pub(crate) fn check_value(
 }
 
 /// universal-domain-adaptation 1C：取某 `kind` 维度所有取值的 `(canonical_id,
-/// priority_weight, is_terminal)`，供 planner 构造漏斗排序权重表 + 终态集合。
+/// priority_weight, is_terminal, is_reactivation_target)`，供 planner 构造漏斗排序
+/// 权重表 + 终态集合 + 再激活目标集合。
 ///
 /// 只读 active + deprecated（与 check_value 同源缓存）；scope 优先 account 私有、
 /// 回落 global。同 canonical_id 跨 scope 命中时 account 优先（先插入者赢，account
@@ -259,16 +263,21 @@ pub(crate) fn dimension_value_weights(
     kind: &str,
     scope_account_id: &str,
     cache: &TaxonomyCache,
-) -> Vec<(String, Option<i32>, bool)> {
+) -> Vec<(String, Option<i32>, bool, bool)> {
     let inner = cache.inner.lock();
-    let mut out: Vec<(String, Option<i32>, bool)> = Vec::new();
+    let mut out: Vec<(String, Option<i32>, bool, bool)> = Vec::new();
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     for scope in [scope_account_id, "global"] {
         let key = (scope.to_string(), kind.to_string());
         if let Some(entries) = inner.entries.get(&key) {
             for e in entries {
                 if seen.insert(e.canonical_id.clone()) {
-                    out.push((e.canonical_id.clone(), e.priority_weight, e.is_terminal));
+                    out.push((
+                        e.canonical_id.clone(),
+                        e.priority_weight,
+                        e.is_terminal,
+                        e.is_reactivation_target,
+                    ));
                 }
             }
         }
@@ -456,6 +465,7 @@ pub(crate) async fn approve(
             status: "active".to_string(),
             priority_weight: None,
             is_terminal: false,
+            is_reactivation_target: false,
         },
         updated_at: now,
         version: 1,
@@ -582,6 +592,7 @@ pub fn taxonomy_cache_for_tests(entries: Vec<TaxonomyEntry>) -> TaxonomyCache {
             status: entry.value.status,
             priority_weight: entry.value.priority_weight,
             is_terminal: entry.value.is_terminal,
+            is_reactivation_target: entry.value.is_reactivation_target,
         });
     }
     {
@@ -611,6 +622,7 @@ mod tests {
                     status: entry.value.status,
                     priority_weight: entry.value.priority_weight,
                     is_terminal: entry.value.is_terminal,
+                    is_reactivation_target: entry.value.is_reactivation_target,
                 });
         }
         {
@@ -640,6 +652,7 @@ mod tests {
                 status: status.to_string(),
                 priority_weight: None,
                 is_terminal: false,
+                is_reactivation_target: false,
             },
             updated_at: DateTime::now(),
             version: 1,

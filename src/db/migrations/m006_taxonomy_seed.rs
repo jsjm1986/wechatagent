@@ -77,15 +77,17 @@ pub(super) fn default_taxonomy_seed_entries(now: DateTime) -> Vec<TaxonomyEntry>
     let mut out = Vec::new();
 
     // ── customer_stage（9 项，对齐 default_user_operation_state_machine）──
-    // 元组末两列 = (priority_weight, is_terminal)，逐字复刻 planner::stage_priority_weight
-    // 的 match 分支与 planner::TERMINAL_STAGES，使 H6 配置化后 DEFAULT 行为零变化。
-    let customer_stages: &[(&str, &str, &str, &[&str], i32, bool)] = &[
+    // 元组末三列 = (priority_weight, is_terminal, is_reactivation_target)，逐字复刻
+    // planner::stage_priority_weight 的 match 分支、planner::TERMINAL_STAGES，
+    // 与 reactivation_candidate_filter DEFAULT 回落，使配置化后 DEFAULT 行为零变化。
+    let customer_stages: &[(&str, &str, &str, &[&str], i32, bool, bool)] = &[
         (
             "new_contact",
             "初始了解",
             "建立基本上下文，避免过早推销。",
             &["陌生接触", "新客", "first_contact", "刚加好友"],
             20,
+            false,
             false,
         ),
         (
@@ -95,6 +97,7 @@ pub(super) fn default_taxonomy_seed_entries(now: DateTime) -> Vec<TaxonomyEntry>
             &["初步信任", "关系培养", "trust_building"],
             40,
             false,
+            false,
         ),
         (
             "need_discovery",
@@ -102,6 +105,7 @@ pub(super) fn default_taxonomy_seed_entries(now: DateTime) -> Vec<TaxonomyEntry>
             "理解真实需求、痛点、动机、阻力和决策方式。",
             &["明确需求", "需求挖掘", "discovery"],
             60,
+            false,
             false,
         ),
         (
@@ -111,6 +115,7 @@ pub(super) fn default_taxonomy_seed_entries(now: DateTime) -> Vec<TaxonomyEntry>
             &["方案评估", "方案推荐", "solution_evaluation"],
             80,
             false,
+            false,
         ),
         (
             "objection_handling",
@@ -118,6 +123,7 @@ pub(super) fn default_taxonomy_seed_entries(now: DateTime) -> Vec<TaxonomyEntry>
             "识别顾虑，降低风险感，不强压成交。",
             &["顾虑处理", "objection"],
             80,
+            false,
             false,
         ),
         (
@@ -127,6 +133,7 @@ pub(super) fn default_taxonomy_seed_entries(now: DateTime) -> Vec<TaxonomyEntry>
             &["成交推进", "推进成交", "closing"],
             100,
             false,
+            false,
         ),
         (
             "customer_success",
@@ -135,6 +142,7 @@ pub(super) fn default_taxonomy_seed_entries(now: DateTime) -> Vec<TaxonomyEntry>
             &["交付维护", "复购转介绍", "post_sale"],
             10,
             true,
+            false,
         ),
         (
             "cooldown",
@@ -143,6 +151,7 @@ pub(super) fn default_taxonomy_seed_entries(now: DateTime) -> Vec<TaxonomyEntry>
             &["冷却", "暂停推进"],
             10,
             true,
+            false,
         ),
         (
             "dormant_reactivation",
@@ -151,9 +160,10 @@ pub(super) fn default_taxonomy_seed_entries(now: DateTime) -> Vec<TaxonomyEntry>
             &["唤醒", "沉默用户唤醒"],
             10,
             true,
+            true,
         ),
     ];
-    for (id, display, desc, aliases, weight, terminal) in customer_stages {
+    for (id, display, desc, aliases, weight, terminal, reactivation_target) in customer_stages {
         out.push(TaxonomyEntry {
             id: None,
             scope: "global".to_string(),
@@ -166,6 +176,7 @@ pub(super) fn default_taxonomy_seed_entries(now: DateTime) -> Vec<TaxonomyEntry>
                 status: "active".to_string(),
                 priority_weight: Some(*weight),
                 is_terminal: *terminal,
+                is_reactivation_target: *reactivation_target,
             },
             updated_at: now,
             version: 1,
@@ -213,6 +224,7 @@ pub(super) fn default_taxonomy_seed_entries(now: DateTime) -> Vec<TaxonomyEntry>
                 status: "active".to_string(),
                 priority_weight: Some(*weight),
                 is_terminal: false,
+                is_reactivation_target: false,
             },
             updated_at: now,
             version: 1,
@@ -281,6 +293,7 @@ pub(super) fn default_taxonomy_seed_entries(now: DateTime) -> Vec<TaxonomyEntry>
                 // objection_type 不参与 planner 漏斗排序，无权重/终态语义。
                 priority_weight: None,
                 is_terminal: false,
+                is_reactivation_target: false,
             },
             updated_at: now,
             version: 1,
@@ -431,6 +444,13 @@ mod tests {
                 entry.value.is_terminal,
                 terminal.contains(&id),
                 "customer_stage \"{}\" 的 is_terminal 必须与 TERMINAL_STAGES 一致",
+                id
+            );
+            assert_eq!(
+                entry.value.is_reactivation_target,
+                id == "dormant_reactivation",
+                "customer_stage \"{}\" 的 is_reactivation_target 仅 dormant_reactivation 应为 true\
+                 （与 reactivation_candidate_filter DEFAULT 回落一致，防字典/回落漂移）",
                 id
             );
         }
