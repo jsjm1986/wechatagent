@@ -209,9 +209,6 @@ fn failover_model_list() -> Vec<String> {
 
 fn failover_backups() -> Vec<Arc<LlmClient>> {
     let mut backups: Vec<Arc<LlmClient>> = Vec::new();
-    if let Some(c) = strongest_model_client() {
-        backups.push(c);
-    }
     if failover_key_present() {
         let key = std::env::var("REAL_LLM_FAILOVER_API_KEY").unwrap_or_default();
         let base = std::env::var("REAL_LLM_FAILOVER_BASE_URL")
