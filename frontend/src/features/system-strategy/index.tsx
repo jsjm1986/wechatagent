@@ -1957,15 +1957,6 @@ function ProfileEditor({
               placeholder="留空回落 customer_stage"
             />
           </label>
-          <label className={styles.field}>
-            <span>关联 DomainSchema ID</span>
-            <input
-              className={styles.input}
-              value={draft.domain_schema_id ?? ""}
-              onChange={(e) => update({ domain_schema_id: e.target.value || undefined })}
-              placeholder="chunk 字段表 schema_id（可选）"
-            />
-          </label>
           <label className={styles.inlineCheckbox}>
             <input
               type="checkbox"

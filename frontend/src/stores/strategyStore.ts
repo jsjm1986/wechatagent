@@ -319,7 +319,6 @@ export const useStrategyStore = create<StrategyState & StrategyActions>((set, ge
         methodology_override: profile.methodology_override ?? undefined,
         conversation_mode_policy: profile.conversation_mode_policy ?? undefined,
         stagnation_dimension: profile.stagnation_dimension ?? undefined,
-        domain_schema_id: profile.domain_schema_id ?? undefined,
         grounding_gate_bypass_without_claim: profile.grounding_gate_bypass_without_claim ?? undefined,
         distrust_self_reported_low_risk: profile.distrust_self_reported_low_risk ?? undefined,
         chunk_roles: profile.chunk_roles ?? undefined,

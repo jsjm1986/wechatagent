@@ -556,7 +556,6 @@ export type DomainProfile = {
   conversation_mode_policy?: string | null;
   methodology_generator_preamble?: string | null;
   stagnation_dimension?: string | null;
-  domain_schema_id?: string | null;
   grounding_gate_bypass_without_claim?: boolean;
   distrust_self_reported_low_risk?: boolean;
   chunk_roles?: ChunkRole[];
@@ -588,7 +587,6 @@ export type DomainProfileDraft = {
   methodology_override?: string;
   conversation_mode_policy?: string;
   stagnation_dimension?: string;
-  domain_schema_id?: string;
   grounding_gate_bypass_without_claim?: boolean;
   distrust_self_reported_low_risk?: boolean;
   chunk_roles?: ChunkRole[];
