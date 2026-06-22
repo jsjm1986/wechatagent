@@ -12,7 +12,7 @@ use crate::{
     models::{AgentSoul, OperationDomainConfig, OperationPlaybook, PromptTemplate},
 };
 
-pub const PROMPT_PACK_VERSION: &str = "wechatagent_prompt_pack_v5_2026_06_22_commitment";
+pub const PROMPT_PACK_VERSION: &str = "wechatagent_prompt_pack_v6_2026_06_23_cleanup";
 
 /// universal-domain-adaptation A/T1：user.reply.policy prompt「## 模式与 5 闸的关系」
 /// 模式-闸说明段（逐字复刻 prompt pack v3 现文 :958-963：标题 + casual_relationship /
@@ -1708,7 +1708,7 @@ EmotionalValue 打分按这一轮用户的状态分两把尺子，避免逼出�
             agent_kind: "knowledge",
             layer: "knowledge_chat",
             title: "知识库对话意图识别",
-            description: "理解运营在对话框输入的诉求，分流到 create_chunk / update_chunk / clarify / update_pack / freeform。",
+            description: "理解运营在对话框输入的诉求，分流到 create_chunk / update_chunk / clarify / freeform。",
             status: "active",
             content: r#"你是知识工程领域的对话 Agent。运营会在对话框里自然语言描述诉求。本轮目标：判断这一句话属于哪种意图，分流到下游子提示词。
 
@@ -1716,13 +1716,12 @@ EmotionalValue 打分按这一轮用户的状态分两把尺子，避免逼出�
 - create_chunk：要新建一条切片（"再加一条 / 补一个 / 写一段 ... 的话术"等表达）。
 - update_chunk：要修改某一条已存在切片（"刚才那条改一下 / 这条只对个人号生效 / 把这条扩到 ..."）。
 - clarify_chunk：在和你澄清概念、不要求落库（"这个 routingCard 字段是什么意思 / 这条和那条有什么区别"）。
-- update_pack：要修改知识包元数据（"这个知识包的 commonObjections 加一条 / 把这个 pack 范围扩大到 ..."）。
 - digest_action：从今日日报（digest 卡片）派工，让 AI 串行处理一组 issue（"把这几张卡片处理掉 / 帮我把这 3 张 fix 了 / 你按建议跑一遍"等）。
 - update_operator_memory：运营给 AI 立长期偏好/红线/上下文（"以后别再起带 100% 回奶 / 我们品牌从不写绝对化承诺 / 默认面向宝妈 / 这个产品别提价格"等）。
 - freeform：意图模糊，需要主动追问。
 
 工作原则：
-- 优先看运营是否已经在 attachments 里引用了 chunkId / itemId；引用了 chunkId → 大概率 update_chunk 或 clarify_chunk；引用了 itemId → 大概率 update_pack。
+- 优先看运营是否已经在 attachments 里引用了 chunkId；引用了 chunkId → 大概率 update_chunk 或 clarify_chunk。
 - 如果运营句子里有"再加 / 新增 / 补一条 / 起草" → create_chunk。
 - 如果没有任何动词、只是问问题（"... 是什么 / ... 怎么填 / 区别是 ..."） → clarify_chunk。
 - 如果运营提到「卡片 / 日报 / 这几张 / 派工 / 一次跑一遍 / 按建议处理」并且引用了 cardIds，→ digest_action。
@@ -1737,7 +1736,7 @@ memoryKind 闭集：
 
 只输出严格 JSON，不输出 markdown / 注释 / 多余文本：
 {
-  "intent": "create_chunk | update_chunk | clarify_chunk | update_pack | digest_action | update_operator_memory | freeform",
+  "intent": "create_chunk | update_chunk | clarify_chunk | digest_action | update_operator_memory | freeform",
   "confidence": 0.0-1.0,
   "targetChunkId": "若引用了 chunkId 则原样回填；否则省略或 null",
   "targetPackId": "若引用了 packId 则原样回填；否则省略或 null",

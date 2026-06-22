@@ -4,6 +4,13 @@
 // 与既有 components/ui/StatusBadge / lib/format 的不同签名共存，保证老页渲染字节级不变）。
 // 老页（EvolutionCenterTab）与卡片都从这里 import。
 import styles from "./proposalPrimitives.module.css";
+// 数值/百分比格式化收口到单一真相源 lib/format（审查#J）。
+// formatNumber 直接复用（lib 版已支持可选 digits + NaN 守卫）；
+// formatPercent 与 lib/format.formatRate 语义等价，按既有名薄封装 re-export，
+// 保持 ProposalReleaseCard / EvolutionCenterTab 现有 import 名不破。
+import { formatNumber, formatRate as formatPercent } from "../../lib/format";
+
+export { formatNumber, formatPercent };
 
 const STATUS_LABELS: Record<string, string> = {
   pending_eval: "待评测",
@@ -39,16 +46,6 @@ export function statusLabel(s: string): string {
 
 export function statusTone(s: string): string {
   return STATUS_TONES[s] ?? "neutral";
-}
-
-export function formatNumber(v: number | null | undefined, digits = 2): string {
-  if (v === null || v === undefined || Number.isNaN(v)) return "—";
-  return Number(v).toFixed(digits);
-}
-
-export function formatPercent(v: number | null | undefined): string {
-  if (v === null || v === undefined || Number.isNaN(v)) return "—";
-  return `${(v * 100).toFixed(1)}%`;
 }
 
 export function StatusBadge({ status }: { status: string }) {
