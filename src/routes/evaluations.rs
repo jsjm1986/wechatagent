@@ -534,6 +534,13 @@ fn scenario_contact_from_seed(
                     .collect()
             })
             .unwrap_or_default(),
+        manual_tags: Vec::new(),
+        manual_tags_updated_at: None,
+        manual_tags_by: None,
+        confirmed_tags: Vec::new(),
+        bayesian_signals: Vec::new(),
+        personality_profile: None,
+        tags_version: 0,
         domain_attributes: {
             let mut doc = Document::new();
             if let Some(value) = seed
