@@ -6014,4 +6014,51 @@ mod tag_trust_tests {
         assert!(c.personality_profile.is_none(), "personality_profile should default to None");
         assert_eq!(c.tags_version, 0, "tags_version should default to 0");
     }
+
+    #[test]
+    fn api_contact_projects_manual_and_confirmed_tags() {
+        // ApiContact::from 把双层标签投影到 API 形态：
+        // - `tags` 合并 manual_tags（在前）+ confirmed_tags.value（去重追加）
+        // - `confirmed_tags` 单独投影
+        // 误删合并 / confirmed 投影逻辑时本测试要变红（真断言，非永真）。
+        use mongodb::bson::{doc, DateTime};
+        let minimal_doc = doc! {
+            "_id": bson::oid::ObjectId::new(),
+            "workspace_id": "ws_test",
+            "account_id": "acc_test",
+            "wxid": "wxid_test",
+            "agent_status": "normal",
+            "created_at": DateTime::now(),
+            "updated_at": DateTime::now(),
+        };
+        let mut c: Contact =
+            bson::from_document(minimal_doc).expect("deserialize minimal contact");
+        c.manual_tags = vec!["VIP".to_string(), "价格敏感".to_string()];
+        c.confirmed_tags = vec![ConfirmedTag {
+            value: "价格敏感".to_string(),
+            evidences: vec![Evidence {
+                turn: 1,
+                msg_id: "m_1".to_string(),
+            }],
+            confirmed_at: DateTime::from_millis(0),
+            confirmed_by: "consolidation".to_string(),
+        }];
+
+        let api = ApiContact::from(c);
+
+        // manual 的 "VIP" 与 confirmed 的 "价格敏感" 都应出现在合并 tags 中。
+        assert!(api.tags.contains(&"VIP".to_string()), "merged tags should include manual VIP");
+        assert!(
+            api.tags.contains(&"价格敏感".to_string()),
+            "merged tags should include confirmed value 价格敏感"
+        );
+        // manual 已含 "价格敏感"，confirmed 同值不应重复 → 合并后只 2 个。
+        assert_eq!(api.tags.len(), 2, "duplicate confirmed value must not be appended twice");
+        // manual 在前，保序。
+        assert_eq!(api.tags[0], "VIP", "manual tags should come first in merged order");
+
+        // confirmed_tags 单独投影：长度 1，value 正确。
+        assert_eq!(api.confirmed_tags.len(), 1, "confirmed_tags should project 1 entry");
+        assert_eq!(api.confirmed_tags[0].value, "价格敏感");
+    }
 }

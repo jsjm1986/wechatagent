@@ -68,7 +68,7 @@ use super::run_envelope::{
 };
 use super::runtime::UserRuntimeParameters;
 use super::types::{
-    doc_bool, doc_i64, doc_string, non_empty_option, to_bson_array,
+    doc_bool, doc_i64, doc_string, non_empty_option,
     AgentDecision, AgentTrigger, ContactSendResult, DecisionReviewResult, KnowledgeRouteResult,
     ManualContactSend, RunPlannerResult, SendGatewayResult,
 };
@@ -3091,11 +3091,6 @@ fn flip_of(old: Option<&str>, new: Option<&str>) -> Option<(String, String)> {
         Some((old_norm.to_string(), new_norm.to_string()))
     }
 }
-
-/// 逐消息自动回复路径的标签累积上限。union 后超过此数时，本轮新增的溢出标签暂不并入
-/// （保留已累积画像），真正的裁剪 / 去重 / 冲突消解交给有版本锁的 memory consolidation
-/// 路径，而非每条消息的写侧——逐消息路径保守优先。
-const TAGS_PER_MESSAGE_CAP: usize = 16;
 
 /// 标签写侧 union + cap（纯函数，无 IO）：把本轮 `new` 标签**只增不减**地并入已累积
 /// `old`，去重保序，封顶 `cap`。取代旧的整体覆盖写法——
