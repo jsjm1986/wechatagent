@@ -3184,14 +3184,6 @@ mod typed {
         /// sunset D+14；老 runtime 文档缺该字段时走 `true`（启用）。
         #[serde(default = "defaults::autonomy_protocol_enabled")]
         pub autonomy_protocol_enabled: bool,
-        /// agent-autonomy-loop W0 / Task 1.3：知识路由模式。
-        /// 取值 `auto_tool_loop`（默认）或 `classic_router`（灰度回退，sunset D+14）。
-        #[serde(default = "defaults::knowledge_routing_mode")]
-        pub knowledge_routing_mode: String,
-        /// agent-autonomy-loop W0 / Task 1.3：`reply_with_tools_loop` 的最大轮数。
-        /// 默认 3，loader 中 clamp 到 [1, 5]。
-        #[serde(default = "defaults::knowledge_max_tool_loops")]
-        pub knowledge_max_tool_loops: i32,
         /// agent-autonomy-loop W0 / Task 1.3：单 run 内 tool call 总次数上限。
         /// 默认 6，loader 中 clamp 到 [1, 16]。
         #[serde(default = "defaults::knowledge_max_tool_calls")]
@@ -3252,8 +3244,6 @@ mod typed {
                 reaction_token_budget: defaults::reaction_token_budget(),
                 reaction_max_llm_calls: defaults::reaction_max_llm_calls(),
                 autonomy_protocol_enabled: defaults::autonomy_protocol_enabled(),
-                knowledge_routing_mode: defaults::knowledge_routing_mode(),
-                knowledge_max_tool_loops: defaults::knowledge_max_tool_loops(),
                 knowledge_max_tool_calls: defaults::knowledge_max_tool_calls(),
                 knowledge_open_slice_max_k: defaults::knowledge_open_slice_max_k(),
                 knowledge_search_top_k: defaults::knowledge_search_top_k(),
@@ -3328,12 +3318,6 @@ mod typed {
         // ── agent-autonomy-loop W0 / Task 1.3 新增默认值 ──
         pub fn autonomy_protocol_enabled() -> bool {
             true
-        }
-        pub fn knowledge_routing_mode() -> String {
-            "auto_tool_loop".to_string()
-        }
-        pub fn knowledge_max_tool_loops() -> i32 {
-            3
         }
         pub fn knowledge_max_tool_calls() -> i32 {
             6
@@ -4340,6 +4324,24 @@ mod typed_tests {
         assert_eq!(p.run_token_budget, 50000);
         // 其它字段 fallback 默认值。
         assert_eq!(p.knowledge_grounding_block_below, 7);
+    }
+
+    /// #1 sunset：删除 knowledgeRoutingMode/knowledgeMaxToolLoops 字段后，旧 run envelope /
+    /// 配置文档里残留这两个字段时，反序列化必须静默忽略（RuntimeParametersTyped 无
+    /// deny_unknown_fields），不破历史数据。
+    #[test]
+    fn runtime_parameters_typed_ignores_dropped_legacy_routing_fields() {
+        let doc = doc! {
+            "recentMessageLimit": 18,
+            "knowledgeRoutingMode": "auto_tool_loop",
+            "knowledgeMaxToolLoops": 3,
+            "knowledgeMaxToolCalls": 6
+        };
+        let p: RuntimeParametersTyped =
+            mongodb::bson::from_document(doc).expect("含已删字段的旧文档仍应反序列化成功");
+        assert_eq!(p.recent_message_limit, 18);
+        // 未删的 _calls 仍正常读取（防误删护栏的反向证明）。
+        assert_eq!(p.knowledge_max_tool_calls, 6);
     }
 
     #[test]

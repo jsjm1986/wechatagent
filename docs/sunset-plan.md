@@ -48,6 +48,14 @@
 | **D+7 起**   | `"prompt_inline"` 触发告警 |
 | **D+21 起**  | 字段删除；任何非空老值在启动期记一次 `legacy_runtime_parameter_dropped` 后等同 `"tool_calling"` |
 
+> **D+21 已兑现（2026-06-23）**：`knowledgeRoutingMode` / `knowledgeMaxToolLoops` 字段及
+> `reply_with_tools_loop`（`src/agent/tool_loop.rs`）、`dispatch_tool_call`（user-ops 半边）已删除；
+> 生产链路统一走 single-pass `route_operation_knowledge` + `knowledge_agent`（gateway.rs）。
+> 兼容手法：`RuntimeParametersTyped` 无 `#[serde(deny_unknown_fields)]`，旧 run envelope /
+> 配置文档残留这两个字段时反序列化静默忽略（回归测试
+> `runtime_parameters_typed_ignores_dropped_legacy_routing_fields` 钉住）。计划设想的
+> `legacy_runtime_parameter_dropped` 启动日志机制未实装——serde 默认忽略已足够，无需补建。
+
 ### 3. `MemoryFactRepr::Plain` 兼容反序列化
 
 `#[serde(untagged)] enum MemoryFactRepr { Plain(String), Structured(MemoryFact) }`，允许 `coreFacts: ["纯字符串"]` 落库。
