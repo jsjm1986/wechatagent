@@ -1586,4 +1586,84 @@ mod tests {
         let a: AuditCompletenessArgs = mongodb::bson::from_document(d).unwrap_or_default();
         assert!(a.chunk_id.is_none(), "snake_case 不应被识别（rename_all=camelCase 单向）");
     }
+
+    // ── score_chunk_for_query 迁移到 relevance_score（TDD 红阶段）──
+
+    #[test]
+    fn score_chunk_chinese_query_recall_improved() {
+        // 核心价值：旧 contains 整串匹配对中文查询「客户怎么退款」只要 chunk body 不逐字
+        // 包含整串就得 0 分（召回差）；新分词算法把查询拆成 bigram 信号（「客户」「户怎」
+        // 「怎么」「么退」「退款」），只要 body 包含部分信号就能得分（召回好）。
+        let chunk = build_chunk(
+            "退款流程",
+            Some("verified"),
+            Some("客户申请退款时需要提供订单号，我们会在3个工作日内处理退款请求。"),
+            None,
+        );
+        let query = "客户怎么退款";
+        let score = score_chunk_for_query(&chunk, query);
+
+        // 新算法下，body 虽然不包含「客户怎么退款」这个整串，但包含「客户」「退款」等信号，
+        // 应得 > 0 分（旧算法会得 0）。具体分值 = relevance_score(query, body) * 1.0（body 权重）。
+        assert!(
+            score > 0.0,
+            "Chinese query with partial signal match should score > 0, got {score}"
+        );
+    }
+
+    #[test]
+    fn score_chunk_field_weighting_preserved() {
+        // 字段加权不变量：title 命中（权重 3.0）> summary 命中（权重 2.0）> body 命中（权重 1.0）。
+        let query = "beta";
+
+        let chunk_title_hit = build_chunk(
+            "beta-feature",  // title 命中
+            Some("verified"),
+            Some("unrelated body"),
+            None,
+        );
+        let chunk_body_hit = build_chunk(
+            "unrelated title",
+            Some("verified"),
+            Some("beta-feature in body"),  // body 命中
+            None,
+        );
+
+        let score_title = score_chunk_for_query(&chunk_title_hit, query);
+        let score_body = score_chunk_for_query(&chunk_body_hit, query);
+
+        // title 命中的分数（约 relevance_score * 3.0）应显著大于 body 命中（relevance_score * 1.0）。
+        assert!(
+            score_title > score_body,
+            "Title hit (weight 3.0) should score higher than body hit (weight 1.0): title={score_title}, body={score_body}"
+        );
+    }
+
+    #[test]
+    fn score_chunk_verified_bonus_preserved() {
+        // verified 加分不变量：其它条件相同时，integrity_status="verified" 的 chunk 比 "draft" 多 0.5 分。
+        let query = "feature";
+
+        let chunk_verified = build_chunk(
+            "feature-doc",
+            Some("verified"),  // verified
+            None,
+            None,
+        );
+        let chunk_draft = build_chunk(
+            "feature-doc",  // 完全相同的 title
+            Some("draft"),  // draft
+            None,
+            None,
+        );
+
+        let score_verified = score_chunk_for_query(&chunk_verified, query);
+        let score_draft = score_chunk_for_query(&chunk_draft, query);
+
+        // verified 应比 draft 多 0.5 分（前提是基础 score > 0）。
+        assert!(
+            (score_verified - score_draft - 0.5).abs() < 0.01,
+            "Verified chunk should score 0.5 higher than draft: verified={score_verified}, draft={score_draft}"
+        );
+    }
 }
