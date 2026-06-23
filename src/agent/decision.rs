@@ -708,7 +708,7 @@ pub(crate) async fn decide_reply_with_promote(
         contact.human_profile_note.clone().unwrap_or_default(),
         serde_json::to_string(&contact.agent_profile).unwrap_or_default(),
         contact.memory_summary.clone().unwrap_or_default(),
-        contact.tags.join(", "),
+        render_tags_for_prompt(&contact.manual_tags, &contact.confirmed_tags),
         contact
             .domain_attributes
             .as_ref()
@@ -1027,6 +1027,23 @@ pub(crate) fn format_playbook_for_prompt(playbook: &OperationPlaybook) -> String
         playbook.success_criteria.clone().unwrap_or_default(),
         playbook.version
     )
+}
+
+/// 把人工层（manual_tags）+ AI 确信层（confirmed_tags）标签渲染成 prompt 文本，
+/// 标注来源让 LLM 自行掂量分量。两层皆空 → 空串（调用点据此决定是否注入该段）。
+pub(crate) fn render_tags_for_prompt(
+    manual: &[String],
+    confirmed: &[crate::models::ConfirmedTag],
+) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if !manual.is_empty() {
+        parts.push(format!("运营确认标签（权威）：{}", manual.join("、")));
+    }
+    if !confirmed.is_empty() {
+        let vals: Vec<&str> = confirmed.iter().map(|c| c.value.as_str()).collect();
+        parts.push(format!("AI 判断标签（可能调整）：{}", vals.join("、")));
+    }
+    parts.join("\n")
 }
 
 /// 把分层 prompt 的五段拼装成最终系统提示串（Soul → System Contract → Policy →
@@ -1558,5 +1575,60 @@ mod persona_override_tests {
             out.contains("前置内容") && out.contains("后置内容"),
             "两锚段外的文本应原样保留：{out}"
         );
+    }
+
+    #[test]
+    fn render_tags_for_prompt_empty_yields_empty() {
+        use super::render_tags_for_prompt;
+        assert_eq!(render_tags_for_prompt(&[], &[]), String::new());
+    }
+
+    #[test]
+    fn render_tags_for_prompt_manual_only() {
+        use super::render_tags_for_prompt;
+        let manual = vec!["VIP".to_string(), "高净值".to_string()];
+        let out = render_tags_for_prompt(&manual, &[]);
+        assert!(out.contains("VIP"));
+        assert!(out.contains("高净值"));
+        assert!(out.contains("运营确认"));
+    }
+
+    #[test]
+    fn render_tags_for_prompt_confirmed_only() {
+        use super::render_tags_for_prompt;
+        use crate::models::ConfirmedTag;
+        use mongodb::bson::DateTime;
+        let confirmed = vec![
+            ConfirmedTag {
+                value: "价格敏感".to_string(),
+                evidences: vec![],
+                confirmed_at: DateTime::from_millis(0),
+                confirmed_by: "consolidation".to_string(),
+            },
+        ];
+        let out = render_tags_for_prompt(&[], &confirmed);
+        assert!(out.contains("价格敏感"));
+        assert!(out.contains("AI 判断"));
+    }
+
+    #[test]
+    fn render_tags_for_prompt_both_layers() {
+        use super::render_tags_for_prompt;
+        use crate::models::ConfirmedTag;
+        use mongodb::bson::DateTime;
+        let manual = vec!["VIP".to_string()];
+        let confirmed = vec![
+            ConfirmedTag {
+                value: "价格敏感".to_string(),
+                evidences: vec![],
+                confirmed_at: DateTime::from_millis(0),
+                confirmed_by: "consolidation".to_string(),
+            },
+        ];
+        let out = render_tags_for_prompt(&manual, &confirmed);
+        assert!(out.contains("VIP"));
+        assert!(out.contains("价格敏感"));
+        assert!(out.contains("运营确认"));
+        assert!(out.contains("AI 判断"));
     }
 }
