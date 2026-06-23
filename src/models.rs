@@ -218,6 +218,88 @@ pub struct Contact {
     pub updated_at: DateTime,
 }
 
+/// 标签可信度改造：单条证据，存对话引用（不拷贝原文），对齐 D2 source_anchors 哲学。
+/// turn = 该 contact 会话内的轮次序号；msg_id = conversation_messages 的消息 id。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct Evidence {
+    pub turn: i32,
+    pub msg_id: String,
+}
+
+/// AI 确信层标签：压缩归并时整体重判（replace）写回，每条必带证据。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ConfirmedTag {
+    pub value: String,
+    #[serde(default)]
+    pub evidences: Vec<Evidence>,
+    pub confirmed_at: DateTime,
+    /// "consolidation"（压缩重判）| "strong_evidence"（强证据快通道）
+    pub confirmed_by: String,
+}
+
+/// 贝叶斯评估旁路：单轮观测点（append-only ledger），供置信度走势图。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct BayesianPoint {
+    pub turn: i32,
+    pub value: String,
+    pub confidence: f64,
+    pub value_changed: bool,
+    pub confidence_changed: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+/// 贝叶斯评估旁路：一个被追踪的维度槽（最多 6 个，见 budget 约束）。
+/// locked=false 为暂定观察、未正式占槽；locked=true 才画走势线。永不驱动行为。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct BayesianSignal {
+    pub dimension: String,
+    pub current_value: String,
+    pub current_confidence: f64,
+    #[serde(default)]
+    pub locked: bool,
+    #[serde(default)]
+    pub history: Vec<BayesianPoint>,
+}
+
+/// 大五人格单维度：分值 + 证据充分度 + 支撑引用。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct PersonalityFacet {
+    pub score: f64,
+    pub confidence: f64,
+    #[serde(default)]
+    pub evidence_refs: Vec<Evidence>,
+}
+
+/// 人格演化快照：每次压缩归并存一份（粒度=压缩周期，非逐轮）。
+/// scores/confidences 顺序固定 [O, C, E, A, N]。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct PersonalitySnapshot {
+    pub consolidated_at: DateTime,
+    pub scores: Vec<f64>,
+    pub confidences: Vec<f64>,
+}
+
+/// 大五 OCEAN 人格画像：只在压缩归并时更新（慢变量），不进逐轮、不驱动行为。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct PersonalityProfile {
+    pub openness: PersonalityFacet,
+    pub conscientiousness: PersonalityFacet,
+    pub extraversion: PersonalityFacet,
+    pub agreeableness: PersonalityFacet,
+    pub neuroticism: PersonalityFacet,
+    pub updated_at: DateTime,
+    #[serde(default)]
+    pub snapshots: Vec<PersonalitySnapshot>,
+}
+
 /// 自学习采集管道 S5：单条**结果/成效事件**（admin 手动标记）。
 ///
 /// 设计取舍——业务结果是 T0 硬事件，但 WeChat 私聊入站只有文字，系统无法自动观测
@@ -5795,5 +5877,78 @@ mod send_ledger_compat_tests {
         assert_eq!(row.send_kind, "namecard");
         assert!(row.responded.is_none());
         assert!(row.outcome_evaluated_at.is_none());
+    }
+}
+
+#[cfg(test)]
+mod tag_trust_tests {
+    use super::*;
+    use mongodb::bson;
+
+    #[test]
+    fn evidence_and_confirmed_tag_roundtrip_bson() {
+        use mongodb::bson::DateTime;
+        let tag = ConfirmedTag {
+            value: "价格敏感".to_string(),
+            evidences: vec![Evidence {
+                turn: 47,
+                msg_id: "m_abc".to_string(),
+            }],
+            confirmed_at: DateTime::from_millis(0),
+            confirmed_by: "consolidation".to_string(),
+        };
+        let doc = mongodb::bson::to_document(&tag).expect("serialize");
+        let back: ConfirmedTag = mongodb::bson::from_document(doc).expect("deserialize");
+        assert_eq!(back, tag);
+    }
+
+    #[test]
+    fn confirmed_tag_missing_evidences_defaults_empty() {
+        // 缺 evidences 字段的旧文档（理论上无存量，仍验证向后兼容）反序列化为空 Vec。
+        let doc = mongodb::bson::doc! { "value": "x", "confirmedAt": mongodb::bson::DateTime::from_millis(0), "confirmedBy": "consolidation" };
+        let back: ConfirmedTag = mongodb::bson::from_document(doc).expect("deserialize");
+        assert!(back.evidences.is_empty());
+    }
+
+    #[test]
+    fn bayesian_signal_roundtrip_and_history_default() {
+        let sig = BayesianSignal {
+            dimension: "价格敏感度".to_string(),
+            current_value: "高".to_string(),
+            current_confidence: 0.7,
+            locked: true,
+            history: vec![BayesianPoint {
+                turn: 3,
+                value: "高".to_string(),
+                confidence: 0.7,
+                value_changed: false,
+                confidence_changed: true,
+                reason: None,
+            }],
+        };
+        let doc = bson::to_document(&sig).expect("ser");
+        let back: BayesianSignal = bson::from_document(doc).expect("de");
+        assert_eq!(back, sig);
+    }
+
+    #[test]
+    fn personality_profile_roundtrip() {
+        let facet = || PersonalityFacet {
+            score: 0.5,
+            confidence: 0.3,
+            evidence_refs: vec![],
+        };
+        let p = PersonalityProfile {
+            openness: facet(),
+            conscientiousness: facet(),
+            extraversion: facet(),
+            agreeableness: facet(),
+            neuroticism: facet(),
+            updated_at: bson::DateTime::from_millis(0),
+            snapshots: vec![],
+        };
+        let doc = bson::to_document(&p).expect("ser");
+        let back: PersonalityProfile = bson::from_document(doc).expect("de");
+        assert_eq!(back, p);
     }
 }
