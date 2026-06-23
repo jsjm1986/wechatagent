@@ -158,6 +158,26 @@ pub struct Contact {
     pub playbook_version: Option<i32>,
     #[serde(default)]
     pub tags: Vec<String>,
+    /// 标签可信度改造 · 人工权威层：运营录入的标签，自由文本，AI 写路径不触达。
+    /// 与 AI 产出的 confirmed_tags 物理分家，压缩重判永不覆盖本字段。
+    #[serde(default)]
+    pub manual_tags: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manual_tags_updated_at: Option<DateTime>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manual_tags_by: Option<String>,
+    /// AI 确信层：压缩归并整体重判写回，每条带证据。取代裸 tags 的 AI 部分。
+    #[serde(default)]
+    pub confirmed_tags: Vec<ConfirmedTag>,
+    /// 贝叶斯评估旁路（最多 6 槽）：纯观测，永不驱动行为。
+    #[serde(default)]
+    pub bayesian_signals: Vec<BayesianSignal>,
+    /// 大五 OCEAN 人格画像：压缩时更新，软提示用，不驱动行为。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub personality_profile: Option<PersonalityProfile>,
+    /// 标签体系版本号：压缩归并时递增，用于追踪更新历史和判定新鲜度。
+    #[serde(default)]
+    pub tags_version: i64,
     /// 业务字段 JSON 容器（由 DomainSchema 在写入时校验）。
     /// 取代旧的销售域硬编码 `customer_stage / intent_level / objection_type`。
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -5950,5 +5970,31 @@ mod tag_trust_tests {
         let doc = bson::to_document(&p).expect("ser");
         let back: PersonalityProfile = bson::from_document(doc).expect("de");
         assert_eq!(back, p);
+    }
+
+    #[test]
+    fn contact_new_trust_fields_default_when_absent() {
+        // 不含新字段的最小 Contact BSON 应反序列化成功，新字段取默认值。
+        // 用最小文档构造，验证 serde(default) 向后兼容。
+        use mongodb::bson::{doc, DateTime};
+        let minimal_doc = doc! {
+            "_id": bson::oid::ObjectId::new(),
+            "workspace_id": "ws_test",
+            "account_id": "acc_test",
+            "wxid": "wxid_test",
+            "agent_status": "normal",
+            "created_at": DateTime::now(),
+            "updated_at": DateTime::now(),
+        };
+        let c: Contact = bson::from_document(minimal_doc).expect("deserialize minimal contact");
+
+        // 验证新字段取默认值
+        assert!(c.manual_tags.is_empty(), "manual_tags should default to empty Vec");
+        assert!(c.manual_tags_updated_at.is_none(), "manual_tags_updated_at should default to None");
+        assert!(c.manual_tags_by.is_none(), "manual_tags_by should default to None");
+        assert!(c.confirmed_tags.is_empty(), "confirmed_tags should default to empty Vec");
+        assert!(c.bayesian_signals.is_empty(), "bayesian_signals should default to empty Vec");
+        assert!(c.personality_profile.is_none(), "personality_profile should default to None");
+        assert_eq!(c.tags_version, 0, "tags_version should default to 0");
     }
 }
