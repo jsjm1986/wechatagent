@@ -213,11 +213,18 @@ pub(crate) fn memory_card_from_contact(
     let mut core_facts: Vec<String> = Vec::new();
     push_unique_text(&mut core_facts, contact.memory_summary.as_deref());
     push_unique_text(&mut core_facts, contact.human_profile_note.as_deref());
-    for tag in &contact.tags {
+    // 标签可信度改造：manual_tags（运营权威）优先，confirmed_tags 补充
+    for tag in &contact.manual_tags {
         if core_facts.len() >= 6 {
             break;
         }
         push_unique_text(&mut core_facts, Some(tag));
+    }
+    for confirmed in &contact.confirmed_tags {
+        if core_facts.len() >= 6 {
+            break;
+        }
+        push_unique_text(&mut core_facts, Some(&confirmed.value));
     }
     let mut preferences = Vec::new();
     push_unique_text(&mut preferences, Some(&communication_style));

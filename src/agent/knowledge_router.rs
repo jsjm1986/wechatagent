@@ -308,7 +308,6 @@ pub async fn test_knowledge_route_for_contact(
         memory_summary: None,
         playbook_id: None,
         playbook_version: None,
-        tags: Vec::new(),
         manual_tags: Vec::new(),
         manual_tags_updated_at: None,
         manual_tags_by: None,

@@ -72,6 +72,7 @@ pub(crate) use self::budget::{current_run_budget, RUN_BUDGET};
 // 入口函数 / 类型重新导出，保持与拆分前 `crate::agent::xxx` 完全一致。
 pub use decision::{build_initial_operation_profile, load_operation_playbook_for_contact};
 pub(crate) use decision::load_user_operation_domain_config_for_contact;
+pub(crate) use decision::render_tags_for_prompt;
 // H13：onboarding 写侧（routes/contacts、routes/management）取状态机初始态 key +
 // 按 workspace 加载 active domain_config（替代写死 "new_contact"）。
 pub(crate) use decision::load_user_operation_domain_config;
@@ -623,7 +624,6 @@ mod tests {
             memory_summary: None,
             playbook_id: None,
             playbook_version: None,
-            tags: Vec::new(),
             manual_tags: Vec::new(),
             manual_tags_updated_at: None,
             manual_tags_by: None,

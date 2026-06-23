@@ -897,7 +897,7 @@ wxid：{}
         contact.nickname.as_deref().unwrap_or(""),
         contact.remark.as_deref().unwrap_or(""),
         contact.human_profile_note.as_deref().unwrap_or(""),
-        contact.tags.join(", "),
+        agent::render_tags_for_prompt(&contact.manual_tags, &contact.confirmed_tags),
         contact_domain_str(contact, "customer_stage").as_deref().unwrap_or(""),
         contact_domain_str(contact, "intent_level").as_deref().unwrap_or(""),
         contact.follow_up_policy.as_deref().unwrap_or(""),

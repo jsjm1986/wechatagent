@@ -156,8 +156,6 @@ pub struct Contact {
     pub memory_summary: Option<String>,
     pub playbook_id: Option<ObjectId>,
     pub playbook_version: Option<i32>,
-    #[serde(default)]
-    pub tags: Vec<String>,
     /// 标签可信度改造 · 人工权威层：运营录入的标签，自由文本，AI 写路径不触达。
     /// 与 AI 产出的 confirmed_tags 物理分家，压缩重判永不覆盖本字段。
     #[serde(default)]
@@ -3060,7 +3058,16 @@ impl From<Contact> for ApiContact {
             memory_summary: contact.memory_summary,
             playbook_id: contact.playbook_id.map(|id| id.to_hex()),
             playbook_version: contact.playbook_version,
-            tags: contact.tags,
+            tags: {
+                // 标签可信度改造：manual_tags（运营权威）+ confirmed_tags 合并展示
+                let mut merged = contact.manual_tags.clone();
+                for confirmed in &contact.confirmed_tags {
+                    if !merged.contains(&confirmed.value) {
+                        merged.push(confirmed.value.clone());
+                    }
+                }
+                merged
+            },
             domain_attributes: contact.domain_attributes,
             domain_attributes_updated_at: contact
                 .domain_attributes_updated_at
