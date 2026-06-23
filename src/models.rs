@@ -3022,6 +3022,10 @@ pub struct ApiContact {
     pub playbook_id: Option<String>,
     pub playbook_version: Option<i32>,
     pub tags: Vec<String>,
+    pub manual_tags_updated_at: Option<String>,
+    pub manual_tags_by: Option<String>,
+    pub bayesian_signals: Vec<BayesianSignal>,
+    pub personality_profile: Option<PersonalityProfile>,
     pub domain_attributes: Option<Document>,
     pub domain_attributes_updated_at: Option<String>,
     pub commitments: Vec<ApiCommitment>,
@@ -3068,6 +3072,10 @@ impl From<Contact> for ApiContact {
                 }
                 merged
             },
+            manual_tags_updated_at: contact.manual_tags_updated_at.and_then(dt_to_string),
+            manual_tags_by: contact.manual_tags_by,
+            bayesian_signals: contact.bayesian_signals,
+            personality_profile: contact.personality_profile,
             domain_attributes: contact.domain_attributes,
             domain_attributes_updated_at: contact
                 .domain_attributes_updated_at
