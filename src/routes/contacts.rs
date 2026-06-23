@@ -511,12 +511,7 @@ pub(super) async fn update_profile_note(
         "profile_updated_at": DateTime::now(),
         "updated_at": DateTime::now(),
     };
-    // $unset 人工标签层（避免 AI 重生成覆盖运营录入）。
-    let mut unset_doc = doc! {
-        "manual_tags": "",
-        "manual_tags_updated_at": "",
-        "manual_tags_by": "",
-    };
+    let mut unset_doc = doc! {};
     if !is_previously_operated(&contact) {
         // H13：初始 operation_state 从 active 状态机的 initial 态取（替代写死 "new_contact"）。
         let domain_config =
@@ -539,7 +534,10 @@ pub(super) async fn update_profile_note(
         set_doc.insert("operation_state_updated_at", DateTime::now());
         unset_doc.insert("last_commitment", "");
     }
-    let update_doc = doc! { "$set": set_doc, "$unset": unset_doc };
+    let mut update_doc = doc! { "$set": set_doc };
+    if !unset_doc.is_empty() {
+        update_doc.insert("$unset", unset_doc);
+    }
     state
         .db
         .contacts()

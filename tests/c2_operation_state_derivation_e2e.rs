@@ -55,7 +55,13 @@ fn make_managed_contact(wxid: &str, initial_state: &str) -> Contact {
         memory_summary: None,
         playbook_id: None,
         playbook_version: None,
-        tags: Vec::new(),
+        manual_tags: Vec::new(),
+        confirmed_tags: Vec::new(),
+        bayesian_signals: Vec::new(),
+        personality_profile: None,
+        manual_tags_updated_at: None,
+        manual_tags_by: None,
+        tags_version: 0,
         domain_attributes: None,
         domain_attributes_updated_at: None,
         commitments: Vec::new(),
@@ -249,7 +255,7 @@ async fn normal_transition_uses_customer_stage_over_operation_state() {
             .collect();
         eprintln!(
             "[C2诊断] operation_state={:?} domain_attributes={:?} tags={:?}",
-            reloaded.operation_state, reloaded.domain_attributes, reloaded.tags
+            reloaded.operation_state, reloaded.domain_attributes, reloaded.manual_tags
         );
         // [诊断3] customer_stage 是 ValueSource::Taxonomy，gateway 写侧对它过
         // validate_dimension_value：字典 miss → DropSilently → 移除键 + 写一条
