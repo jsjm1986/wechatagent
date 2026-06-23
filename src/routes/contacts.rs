@@ -415,7 +415,6 @@ pub(super) async fn enable_agent(
         "agent_profile": to_bson(&generated.agent_profile)?,
         "playbook_id": playbook.id,
         "playbook_version": playbook.version,
-        "tags": generated.tags,
         "profile_attributes": generated.profile_attributes,
         "profile_updated_at": DateTime::now(),
         "updated_at": DateTime::now(),
@@ -860,7 +859,6 @@ pub(super) async fn analyze_contact_profile(
     // 不回退 new_contact；全新客户才完整初始化。
     let mut set_doc = doc! {
         "agent_profile": to_bson(&generated.agent_profile)?,
-        "tags": generated.tags,
         "profile_attributes": generated.profile_attributes,
         "profile_updated_at": DateTime::now(),
         "updated_at": DateTime::now(),

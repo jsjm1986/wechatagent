@@ -1525,14 +1525,6 @@ pub(crate) fn non_empty_option(value: &Option<String>) -> Option<String> {
         .map(ToString::to_string)
 }
 
-pub(crate) fn to_bson_array(values: &[String]) -> Vec<mongodb::bson::Bson> {
-    values
-        .iter()
-        .cloned()
-        .map(mongodb::bson::Bson::String)
-        .collect()
-}
-
 pub(crate) fn parse_rfc3339_to_bson(value: &str) -> Option<mongodb::bson::DateTime> {
     mongodb::bson::DateTime::parse_rfc3339_str(value).ok()
 }
