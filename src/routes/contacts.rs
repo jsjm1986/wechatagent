@@ -638,6 +638,54 @@ pub(super) async fn update_custom_agent_instructions(
     Ok(Json(json!({ "item": ApiContact::from(contact) })))
 }
 
+#[derive(serde::Deserialize)]
+pub(super) struct ManualTagsRequest {
+    pub tags: Vec<String>,
+}
+
+/// `PUT /api/contacts/:id/manual-tags`
+///
+/// 运营录入标签（人工权威层）。自由文本，去空白去重，AI 永不覆盖本字段。
+pub(super) async fn update_manual_tags(
+    State(state): State<AppState>,
+    Extension(admin): Extension<AuthenticatedAdmin>,
+    Path(id): Path<String>,
+    Json(payload): Json<ManualTagsRequest>,
+) -> AppResult<Json<Value>> {
+    let object_id = parse_object_id(&id)?;
+    let _ = find_contact_by_id(&state, &admin.current_workspace, &id).await?; // 存在 + workspace scope 校验
+    let cleaned = normalize_manual_tags(&payload.tags);
+    state
+        .db
+        .contacts()
+        .update_one(
+            doc! { "_id": object_id, "workspace_id": &admin.current_workspace },
+            doc! {
+                "$set": {
+                    "manual_tags": &cleaned,
+                    "manual_tags_updated_at": DateTime::now(),
+                    "manual_tags_by": &admin.username,
+                }
+            },
+            None,
+        )
+        .await?;
+    let contact = find_contact_by_id(&state, &admin.current_workspace, &id).await?;
+    Ok(Json(json!({ "item": ApiContact::from(contact) })))
+}
+
+/// 去首尾空白、去空串、去重保序。自由文本，不查字典（设计选择）。
+pub(crate) fn normalize_manual_tags(raw: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for t in raw {
+        let s = t.trim();
+        if !s.is_empty() && !out.iter().any(|x| x == s) {
+            out.push(s.to_string());
+        }
+    }
+    out
+}
+
 /// stage 是否算"发生变更"（决定 insert_domain_stage_fields 是否刷 customer_stage_updated_at）。
 /// 红线：stage 未实际写入（`new_stage=None`：空串短路 / DropSilently）时绝不算变更——
 /// 否则会无条件刷 customer_stage_updated_at，错误重置下游 stagnation 计时器（值没改却记
@@ -1014,5 +1062,37 @@ mod tests {
         assert!(stage_changed(Some("need_discovery"), Some("solution_fit")));
         assert!(stage_changed(None, Some("new_contact")));
         assert!(!stage_changed(Some("solution_fit"), Some("solution_fit")));
+    }
+
+    #[test]
+    fn normalize_manual_tags_trims_dedups_drops_empty() {
+        let input = vec![
+            "  vip ".to_string(),
+            "vip".to_string(),
+            "".to_string(),
+            "老客户".to_string(),
+        ];
+        assert_eq!(
+            normalize_manual_tags(&input),
+            vec!["vip".to_string(), "老客户".to_string()]
+        );
+    }
+
+    #[test]
+    fn normalize_manual_tags_preserves_order() {
+        let input = vec!["c".to_string(), "a".to_string(), "b".to_string()];
+        assert_eq!(
+            normalize_manual_tags(&input),
+            vec!["c".to_string(), "a".to_string(), "b".to_string()]
+        );
+    }
+
+    #[test]
+    fn normalize_manual_tags_handles_empty() {
+        assert_eq!(normalize_manual_tags(&[]), Vec::<String>::new());
+        assert_eq!(
+            normalize_manual_tags(&["".to_string(), "  ".to_string()]),
+            Vec::<String>::new()
+        );
     }
 }
