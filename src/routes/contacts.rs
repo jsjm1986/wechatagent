@@ -502,15 +502,21 @@ pub(super) async fn update_profile_note(
     );
     // #72：曾运营过的老客户重新生成画像时保留 stage / operation_state / commitments，
     // 不回退 new_contact；全新客户才完整初始化。
+    // 标签可信度改造：note 重生成只写 AI 层（agent_profile/profile_attributes），
+    // 不写 tags（裸字段已废）、不触碰 manual_tags（运营录入层归 manual_tags 端点管理）。
     let mut set_doc = doc! {
         "human_profile_note": payload.human_profile_note,
         "agent_profile": to_bson(&generated.agent_profile)?,
-        "tags": generated.tags,
         "profile_attributes": generated.profile_attributes,
         "profile_updated_at": DateTime::now(),
         "updated_at": DateTime::now(),
     };
-    let mut unset_doc = Document::new();
+    // $unset 人工标签层（避免 AI 重生成覆盖运营录入）。
+    let mut unset_doc = doc! {
+        "manual_tags": "",
+        "manual_tags_updated_at": "",
+        "manual_tags_by": "",
+    };
     if !is_previously_operated(&contact) {
         // H13：初始 operation_state 从 active 状态机的 initial 态取（替代写死 "new_contact"）。
         let domain_config =
@@ -533,10 +539,7 @@ pub(super) async fn update_profile_note(
         set_doc.insert("operation_state_updated_at", DateTime::now());
         unset_doc.insert("last_commitment", "");
     }
-    let mut update_doc = doc! { "$set": set_doc };
-    if !unset_doc.is_empty() {
-        update_doc.insert("$unset", unset_doc);
-    }
+    let update_doc = doc! { "$set": set_doc, "$unset": unset_doc };
     state
         .db
         .contacts()
