@@ -43,7 +43,6 @@ mod memory;
 pub(crate) mod multimodal;
 pub(crate) mod prompt_isolation;
 pub(crate) mod quiet_hours;
-mod tool_loop;
 pub(crate) mod outbox;
 pub(crate) mod outbox_dispatcher;
 mod reaction;
@@ -181,13 +180,7 @@ pub use domain_profile::{
     load_active_domain_profile,
 };
 
-// agent-autonomy-loop W3 / Task 4.5：P7 工具循环性质测试入口。
-//
-// 直接对外暴露 `reply_with_tools_loop` + `ToolCallRequest` 涉及 `pub(crate)`
-// 类型（`RunBudget` / `KnowledgeRuntime`），扩散面太大；本期采用"在 lib
-// `cfg(test)` 中实现 P7"的折衷方案，与 P3/P4 走同一模式。
-//
-// 详见 `src/agent/tool_loop.rs::pbt_tests`。
+
 // task 6.3：`compact_memory_card_typed` 已与 `compact_memory_card_with_previous`
 // 合并，仅作向后兼容别名保留；外部测试仍引用，需要 `#[allow(deprecated)]`
 // 静默重导出告警，使用方应迁移到 `compact_memory_card_with_previous`。
@@ -538,8 +531,6 @@ mod tests {
             // `RuntimeParametersTyped::default()` 保持一致，方便后续 wave 的
             // gating / clamp 行为复用同一组默认。
             autonomy_protocol_enabled: true,
-            knowledge_routing_mode: "auto_tool_loop".to_string(),
-            knowledge_max_tool_loops: 3,
             knowledge_max_tool_calls: 6,
             knowledge_open_slice_max_k: 4,
             knowledge_search_top_k: 8,

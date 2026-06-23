@@ -1,6 +1,6 @@
 //! 知识库对话 Agent 的多轮工具循环（knowledge-digest-workstation Phase 5）。
 //!
-//! 与 user-ops 的 [`super::tool_loop::reply_with_tools_loop`] 形态完全对齐：
+//! 多轮工具循环形态：
 //!
 //! - 中间轮 `decision_phase=tool_calling` → 派发 toolCalls →
 //!   `[system tool result]` 段累积到下一轮 prompt；
@@ -83,8 +83,7 @@ pub(crate) type ChatReplyFn<'a> = Box<
 
 /// 知识库对话 Agent 多轮工具循环。
 ///
-/// 与 user-ops `reply_with_tools_loop` 完全同构（同样的失败连击 / 总超时 /
-/// 预算硬门 / final 清空），但通过 `db` 注入异步 dispatch。
+/// 失败连击 / 总超时 / 预算硬门 / final 清空，通过 `db` 注入异步 dispatch。
 pub(crate) async fn chat_reply_with_tools_loop<'a>(
     runtime: &UserRuntimeParameters,
     knowledge: &KnowledgeRuntime,
@@ -481,23 +480,15 @@ mod tests {
         assert_eq!(snap.tool_calls_used, 0, "final-only 路径不应消耗 tool_call 配额");
     }
 
-    /// 验证常量与同源模块一致：CHAT_TOOL_CALLS_PER_TURN_CAP=6,
-    /// CHAT_TOOL_LOOP_MAX_LOOPS=4。
+    /// 验证常量与设计金标一致：CHAT_TOOL_CALLS_PER_TURN_CAP=6,
+    /// CHAT_TOOL_LOOP_MAX_LOOPS=4。failure_streak/context/trace 金标与
+    /// user-ops 工具循环下线前同源（3 / 8000 / 32）。
     #[test]
     fn chat_tool_loop_constants_are_aligned_with_design() {
         assert_eq!(super::CHAT_TOOL_LOOP_MAX_LOOPS, 4);
-        assert_eq!(
-            super::CHAT_TOOL_FAILURE_STREAK_LIMIT,
-            crate::agent::tool_loop::TOOL_FAILURE_STREAK_LIMIT
-        );
-        assert_eq!(
-            super::CHAT_TOOL_RESULT_CONTEXT_MAX_CHARS,
-            crate::agent::tool_loop::TOOL_RESULT_CONTEXT_MAX_CHARS
-        );
-        assert_eq!(
-            super::CHAT_TOOL_TRACE_MAX_LEN,
-            crate::agent::tool_loop::TOOL_TRACE_MAX_LEN
-        );
+        assert_eq!(super::CHAT_TOOL_FAILURE_STREAK_LIMIT, 3);
+        assert_eq!(super::CHAT_TOOL_RESULT_CONTEXT_MAX_CHARS, 8000);
+        assert_eq!(super::CHAT_TOOL_TRACE_MAX_LEN, 32);
         assert_eq!(super::CHAT_TOOL_CALLS_PER_TURN_CAP, 6);
     }
 

@@ -1556,8 +1556,6 @@ mod protocol_skeleton_tests {
             reaction_token_budget: 8000,
             reaction_max_llm_calls: 2,
             autonomy_protocol_enabled: true,
-            knowledge_routing_mode: "auto_tool_loop".to_string(),
-            knowledge_max_tool_loops: 3,
             knowledge_max_tool_calls: 6,
             knowledge_open_slice_max_k: 4,
             knowledge_search_top_k: 8,
