@@ -41,6 +41,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use super::budget::{BudgetError, RunBudget};
+use super::knowledge_agent::relevance_score;
 use super::runtime::UserRuntimeParameters;
 use super::types::{KnowledgeRuntime, ToolCallRequest};
 use crate::db::Database;
@@ -356,22 +357,22 @@ fn build_search_hit(chunk: &OperationKnowledgeChunk, score: f64) -> Value {
 }
 
 fn score_chunk_for_query(chunk: &OperationKnowledgeChunk, query: &str) -> f64 {
-    let q = query.to_lowercase();
     let mut score = 0.0;
-    let title = chunk.title.to_lowercase();
-    if title.contains(&q) {
-        score += 3.0;
-    }
+
+    // Title 命中（权重 3.0）
+    score += relevance_score(query, &chunk.title) * 3.0;
+
+    // Summary 命中（权重 2.0）
     if let Some(summary) = chunk.summary.as_ref() {
-        if summary.to_lowercase().contains(&q) {
-            score += 2.0;
-        }
+        score += relevance_score(query, summary) * 2.0;
     }
+
+    // Body 命中（权重 1.0）
     if let Some(body) = chunk.body.as_ref() {
-        if body.to_lowercase().contains(&q) {
-            score += 1.0;
-        }
+        score += relevance_score(query, body) * 1.0;
     }
+
+    // Verified 加分（+0.5，前提是基础 score > 0）
     if score > 0.0
         && chunk
             .integrity_status
@@ -381,6 +382,7 @@ fn score_chunk_for_query(chunk: &OperationKnowledgeChunk, query: &str) -> f64 {
     {
         score += 0.5;
     }
+
     score
 }
 
