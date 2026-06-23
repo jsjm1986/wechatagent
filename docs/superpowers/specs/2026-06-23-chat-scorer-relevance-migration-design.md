@@ -116,3 +116,11 @@ fn score_chunk_for_query(chunk: &OperationKnowledgeChunk, query: &str) -> f64 {
   已 `use crate::agent::...` 多处，同模块树内依赖，无循环（relevance_score 不反向依赖
   knowledge_tools）。
 - 回滚：单函数内核替换，`git revert` 即恢复。
+
+## 实现状态
+
+✅ **已实现**（2026-06-24）
+
+- commit: `853ca82` — 新增三个单测（中文召回 / 字段加权 / verified 加分）
+- commit: `9903c23` — scorer 内核迁移到 relevance_score
+- 验证：`cargo test --lib` 1498/0，四 PBT 36/0，现有测试不回归
