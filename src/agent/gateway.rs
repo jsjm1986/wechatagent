@@ -3092,16 +3092,6 @@ fn flip_of(old: Option<&str>, new: Option<&str>) -> Option<(String, String)> {
     }
 }
 
-/// 标签写侧 union + cap（纯函数，无 IO）：把本轮 `new` 标签**只增不减**地并入已累积
-/// `old`，去重保序，封顶 `cap`。取代旧的整体覆盖写法——
-/// [[cautious-profiling]] 红线的**结构层**防御：即使 LLM 单轮 `decision.tags` 漏掉已
-/// 累积标签或贴情景标签，结构层也保证长期画像不被一句弱信号抹平。
-///
-/// 语义：
-/// * 先保留全部 `old`（累积画像优先），再追加 `new` 中 old 未含的标签；
-/// * 封顶时保留靠前（累积）标签、丢弃溢出新增——宁可不更新，不要误抹；删除 / 替换交给
-///   consolidation（有版本锁 / 去重 / 冲突追踪），不在逐消息路径做。
-///
 /// 逐消息短期记忆（memory_summary）的保留行数上限。超过时丢弃最旧的行——记忆偏好"保新"，
 /// 短期 memory_summary 是滚动上下文（旧行已被 consolidation 吸收进 memoryCard，保新更有信息量）。
 const MEMORY_SUMMARY_MAX_LINES: usize = 12;
