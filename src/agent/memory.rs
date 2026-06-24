@@ -26,7 +26,7 @@ use serde_json::json;
 
 use crate::error::{AppError, AppResult};
 use crate::models::{
-    AgentProfile, AgentTask, Contact, ConversationMessage, Evidence, MemoryCandidate,
+    AgentProfile, AgentTask, ConfirmedTag, Contact, ConversationMessage, Evidence, MemoryCandidate,
     MemoryCardTyped, MemoryFact, MemoryFactRepr, OperatingMemory,
 };
 use crate::prompts;
@@ -894,6 +894,53 @@ fn render_window_numbered(window: &[ConversationMessage]) -> String {
         .join("\n")
 }
 
+/// 解析归并 Agent 的 `reconfirmedTags` 输出，整体重判得到新的确信层标签。
+///
+/// 每条 `{value, evidenceTurns}`：trim value（空则跳过）；`evidenceTurns` 是
+/// 压缩宽窗口（升序、0-based）内的序位，经 `resolve_evidence` 映射成 msg_id 锚。
+/// **证据为空（越界 / 空序列）的标签直接丢弃**（fail-closed：无对话佐证不进
+/// 确信层，杜绝脑补）。返回值用于 OCC 写入 replace 整个 `confirmed_tags`。
+pub(crate) fn parse_reconfirmed_tags(
+    value: &serde_json::Value,
+    window: &[ConversationMessage],
+) -> Vec<ConfirmedTag> {
+    let now = DateTime::now();
+    value
+        .get("reconfirmedTags")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|item| {
+                    let val = item.get("value")?.as_str()?.trim().to_string();
+                    if val.is_empty() {
+                        return None;
+                    }
+                    let turns: Vec<i32> = item
+                        .get("evidenceTurns")
+                        .and_then(|t| t.as_array())
+                        .map(|a| {
+                            a.iter()
+                                .filter_map(|x| x.as_i64().map(|n| n as i32))
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    let evidences = crate::agent::tag_evidence::resolve_evidence(window, &turns);
+                    if evidences.is_empty() {
+                        // fail-closed：锚不上对话的标签丢弃，不进确信层。
+                        return None;
+                    }
+                    Some(ConfirmedTag {
+                        value: val,
+                        evidences,
+                        confirmed_at: now,
+                        confirmed_by: "consolidation".to_string(),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 pub async fn consolidate_contact_memory(
     state: &AppState,
     contact: &Contact,
@@ -1189,6 +1236,12 @@ async fn consolidate_contact_memory_inner(
         .extra
         .insert("source", "memory_consolidator_agent");
     let compact_doc = to_document(&compact).unwrap_or_default();
+    // 子计划 3 Task 4：压缩重判产物。归并 Agent 在「压缩宽窗口」（升序、0-based
+    // 序号，与上面 render_window_numbered(&window) 注入 prompt 的窗口同一份）上
+    // 整体重判标签；`parse_reconfirmed_tags` 用同一 `&window` 把 evidenceTurns 序位
+    // 映射成 msg_id 锚——序号对齐由共享窗口保证。证据锚不上的标签 fail-closed 丢弃。
+    // replace 语义：整体覆盖 confirmed_tags，不与旧值合并。
+    let reconfirmed = parse_reconfirmed_tags(&value, &window);
     // P1-5：OCC 写入。consolidator 路径与 load_or_create 的 seeding 路径
     // 共享同一份 OperatingMemory，并发 tick（如 webhook 入站 reload + 后台
     // memory_consolidation 任务并发）都会 read-modify-write memory_card_version。
@@ -1241,6 +1294,25 @@ async fn consolidate_contact_memory_inner(
         }
         return Ok(());
     }
+    // 子计划 3 Task 4：memory_card OCC 写赢后（winner-only，modified_count==1 才到这），
+    // 把压缩重判得到的 confirmed_tags 整体 replace 回 contacts。confirmed_tags 是
+    // Contact 字段（contacts 集合），与 memory_card（operating_memories）物理分家——
+    // 故不能搭 operating_memories 的 $set，否则落到无人读的孤儿键；放在 OCC winner
+    // 分支内即继承「赢家才写」语义。$set 只含 confirmed_tags 一个键：绝不碰 manual_tags
+    // （运营权威人工层）、bayesian_signals / personality_profile（旁路），保持三线隔离。
+    state
+        .db
+        .contacts()
+        .update_one(
+            doc! {
+                "workspace_id": &contact.workspace_id,
+                "account_id": &contact.account_id,
+                "wxid": &contact.wxid,
+            },
+            doc! { "$set": { "confirmed_tags": to_bson(&reconfirmed)? } },
+            None,
+        )
+        .await?;
     if !candidate_ids.is_empty() {
         state
             .db
@@ -2216,5 +2288,49 @@ mod render_window_tests {
     #[test]
     fn empty_window_yields_empty_string() {
         assert!(super::render_window_numbered(&[]).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod parse_reconfirmed_tests {
+    use crate::models::{ConversationMessage, MessageDirection};
+    use mongodb::bson::{oid::ObjectId, DateTime};
+
+    fn msg(dir: MessageDirection, content: &str) -> ConversationMessage {
+        ConversationMessage {
+            id: Some(ObjectId::new()),
+            workspace_id: "w".into(),
+            account_id: "a".into(),
+            contact_wxid: "c".into(),
+            message_id: None,
+            dedupe_key: None,
+            direction: dir,
+            content: content.into(),
+            msg_type: None,
+            media_ref: None,
+            raw: None,
+            created_at: DateTime::from_millis(0),
+        }
+    }
+
+    #[test]
+    fn parse_reconfirmed_drops_tags_without_resolvable_evidence() {
+        // 压缩宽窗口：两条对话，0-based 升序序位。
+        let window = vec![
+            msg(MessageDirection::Inbound, "这个价格能再便宜点吗"),
+            msg(MessageDirection::Outbound, "可以聊聊预算"),
+        ];
+        let v = serde_json::json!({
+            "reconfirmedTags": [
+                { "value": "价格敏感", "evidenceTurns": [0] },   // 有效
+                { "value": "脑补标签", "evidenceTurns": [99] },  // 越界 → 证据空 → 丢弃
+                { "value": "无依据", "evidenceTurns": [] }       // 空 → 丢弃
+            ]
+        });
+        let out = super::parse_reconfirmed_tags(&v, &window);
+        assert_eq!(out.len(), 1, "只有可锚定证据的标签应留下");
+        assert_eq!(out[0].value, "价格敏感");
+        assert!(!out[0].evidences.is_empty());
+        assert_eq!(out[0].confirmed_by, "consolidation");
     }
 }
