@@ -26,8 +26,8 @@ use serde_json::json;
 
 use crate::error::{AppError, AppResult};
 use crate::models::{
-    AgentProfile, AgentTask, Contact, MemoryCandidate, MemoryCardTyped, MemoryFact,
-    MemoryFactRepr, OperatingMemory,
+    AgentProfile, AgentTask, Contact, ConversationMessage, Evidence, MemoryCandidate,
+    MemoryCardTyped, MemoryFact, MemoryFactRepr, OperatingMemory,
 };
 use crate::prompts;
 use crate::routes::AppState;
@@ -1279,6 +1279,70 @@ pub(crate) async fn write_memory_candidates(
     Ok(())
 }
 
+/// 把一轮标签判断转成 tag_observation 候选 docs（纯函数，便于单测）。
+/// 每个标签一条；evidences 由 resolve_evidence 产出（已 fail-closed）。
+/// 标签共享本轮 tag_evidence_turns（设计取舍：不逐标签配对）。
+pub(crate) fn build_tag_observation_docs(
+    tags: &[String],
+    evidences: &[Evidence],
+) -> Vec<Document> {
+    let ev_bson: Vec<Document> = evidences
+        .iter()
+        .map(|e| doc! { "turn": e.turn, "msgId": &e.msg_id })
+        .collect();
+    tags.iter()
+        .map(|t| {
+            doc! {
+                "dimension": "tag",
+                "value": t,
+                "hitCount": 1,
+                "evidences": &ev_bson,
+            }
+        })
+        .collect()
+}
+
+/// 逐轮把标签判断写进 memory_candidates 暂定层（source="tag_observation"）。
+/// 不写 confirmed_tags（那是压缩重判产物）。写库失败不阻断 reply，仅 warn。
+///
+/// 窗口序位约定：`window` 必须按 created_at 升序（最早在前，0-based），与 prompt
+/// 呈现给 LLM 的对话顺序一致——`resolve_evidence` 把 LLM 给的 `tag_evidence_turns`
+/// 当成对该升序窗口的 0-based 下标。调用方负责把降序窗口反转成升序后再传入。
+pub(crate) async fn write_tag_observations(
+    state: &AppState,
+    contact: &Contact,
+    decision: &AgentDecision,
+    window: &[ConversationMessage],
+    run_id: &str,
+) -> AppResult<()> {
+    if decision.tags.is_empty() {
+        return Ok(());
+    }
+    let evidences =
+        crate::agent::tag_evidence::resolve_evidence(window, &decision.tag_evidence_turns);
+    // 无证据的标签判断丢弃（fail-closed：从源头掐脑补，不让无锚标签进暂定层）。
+    if evidences.is_empty() {
+        return Ok(());
+    }
+    let docs = build_tag_observation_docs(&decision.tags, &evidences);
+    let candidate = MemoryCandidate {
+        id: None,
+        workspace_id: contact.workspace_id.clone(),
+        account_id: contact.account_id.clone(),
+        contact_wxid: contact.wxid.clone(),
+        run_id: Some(run_id.to_string()),
+        source: "tag_observation".to_string(),
+        candidates: docs,
+        memory_write_score: 0,
+        status: "pending".to_string(),
+        reason: None,
+        created_at: DateTime::now(),
+        updated_at: DateTime::now(),
+    };
+    state.db.memory_candidates().insert_one(&candidate, None).await?;
+    Ok(())
+}
+
 /// 候选记忆留存状态决策(#73)：write_score 达标 **或** 单条 importance 足够高 → pending;
 /// 否则 ignored_low_score。importance 救援阈值取 8——只有高重要度记忆(承诺/强偏好等)
 /// 才在整体分偏低时被救回,避免噪声涌入待审池。纯函数便于单测。
@@ -1539,6 +1603,28 @@ mod candidate_status_tests {
     fn low_score_low_importance_ignored() {
         assert_eq!(decide_candidate_status(5, 7), "ignored_low_score");
         assert_eq!(decide_candidate_status(0, 0), "ignored_low_score");
+    }
+}
+
+#[cfg(test)]
+mod tag_observation_tests {
+    use super::build_tag_observation_docs;
+    use crate::models::Evidence;
+
+    #[test]
+    fn build_tag_observation_docs_one_per_tag_with_shared_evidence() {
+        let ev = vec![Evidence { turn: 0, msg_id: "deadbeef".into() }];
+        let docs = build_tag_observation_docs(&["价格敏感".into(), "犹豫".into()], &ev);
+        assert_eq!(docs.len(), 2);
+        assert_eq!(docs[0].get_str("dimension").unwrap(), "tag");
+        assert_eq!(docs[0].get_str("value").unwrap(), "价格敏感");
+        assert_eq!(docs[0].get_i32("hitCount").unwrap(), 1);
+        assert!(docs[0].get_array("evidences").is_ok());
+    }
+
+    #[test]
+    fn build_tag_observation_docs_empty_tags_yields_empty() {
+        assert!(build_tag_observation_docs(&[], &[]).is_empty());
     }
 }
 

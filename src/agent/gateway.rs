@@ -53,7 +53,7 @@ use super::knowledge_router::{
 use super::memory::{
     effective_memory_card, effective_memory_card_for_contact, load_or_create_operating_memory,
     memory_card_has_signal, next_memory_card_version, schedule_memory_consolidation_task,
-    write_memory_candidates,
+    write_memory_candidates, write_tag_observations,
 };
 use super::multimodal;
 use super::review::{
@@ -1842,6 +1842,11 @@ async fn run_user_operation_gateway_inner(
     }
 
     apply_agent_updates(state, &contact, &final_decision, &runtime, domain_config.as_ref()).await?;
+    // 子计划2 Task3：tag_observation 证据锚定需要按 created_at 升序（最早在前，0-based）
+    // 的对话窗口——与 prompt 呈现给 LLM 的顺序一致。`recent_messages` 来自
+    // load_recent_messages，按 {created_at:-1} 降序（最新在前），故此处反转成升序后传入。
+    let ascending_window: Vec<ConversationMessage> =
+        recent_messages.iter().rev().cloned().collect();
     apply_operating_memory_update(
         state,
         &contact,
@@ -1849,6 +1854,7 @@ async fn run_user_operation_gateway_inner(
         &final_decision,
         &context_pack,
         should_refresh_context,
+        &ascending_window,
         &run_id,
     )
     .await?;
@@ -3768,9 +3774,22 @@ async fn apply_operating_memory_update(
     decision: &AgentDecision,
     context_pack: &Document,
     _context_refreshed: bool,
+    window: &[ConversationMessage],
     run_id: &str,
 ) -> AppResult<()> {
     write_memory_candidates(state, contact, decision, run_id).await?;
+    // 子计划2 Task3：逐轮标签判断写 tag_observation 暂定层（不写 confirmed_tags）。
+    // 窗口序位约定：`window` 已由调用方反转为 created_at 升序（最早在前，0-based），
+    // 与 prompt 呈现给 LLM 的对话顺序一致——LLM 的 tag_evidence_turns 即对该升序窗口
+    // 的 0-based 下标。既成事实纪律：reply 已经过 outbox 送出，标签观察写库失败只 warn，
+    // 绝不向上抛错阻断（不用 `?`）。
+    if let Err(e) = write_tag_observations(state, contact, decision, window, run_id).await {
+        tracing::warn!(
+            error = %e,
+            contact_wxid = %contact.wxid,
+            "write_tag_observations failed; reply already sent, skipping tag observation write"
+        );
+    }
     if decision.operating_memory_update.is_empty() && context_pack.is_empty() {
         return Ok(());
     }
