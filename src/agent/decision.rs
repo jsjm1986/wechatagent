@@ -466,6 +466,22 @@ pub(crate) async fn decide_reply_with_promote(
             })
             .collect()
     };
+    // §3 恒注入铁律（渐进式三档 2026-06-23）：doNotDo 禁止项 + commitments 已承诺
+    // 属安全/身份类槽位，任何档都不能丢——降档若丢失"已承诺/禁止项"，AI 可能违背
+    // 承诺或踩禁止项，是不可恢复的安全事故。Relational/Full 档下完整 memory_card_text
+    // 已含这两项（context_pack 含 doNotDo/commitments 字段），无需重复注入；仅 Lean
+    // 档 memory_card_text 被跳过，必须单独补一份精简安全子片。整段（含标题/换行）只在
+    // Lean 档非空，Relational/Full 档空串 → Full 逐字等价历史 prompt（零字节差异）。
+    let safety_donts_commitments_text = if !include_relational {
+        let payload = serde_json::to_string(&mongodb::bson::doc! {
+            "doNotDo": context_pack.get_array("doNotDo").cloned().unwrap_or_default(),
+            "commitments": context_pack.get_array("commitments").cloned().unwrap_or_default(),
+        })
+        .unwrap_or_default();
+        format!("\n\n安全约束(禁止项/已承诺，任何档恒注入，绝不可违背):\n{payload}")
+    } else {
+        String::new()
+    };
     // 关系组：完整长期运营记忆 + 记忆卡片。Lean 跳过，空串占位。
     let memory_text = if include_relational {
         serde_json::to_string(&mongodb::bson::doc! {
@@ -777,7 +793,7 @@ pub(crate) async fn decide_reply_with_promote(
 {}
 
 最近 5 条已弃用记忆（不要再引用，仅供识别变化）:
-{}
+{}{}
 
 产品知识:
 {}
@@ -841,6 +857,7 @@ pub(crate) async fn decide_reply_with_promote(
         memory_text,
         memory_card_text,
         serde_json::to_string(&deprecated_facts_recent).unwrap_or_default(),
+        safety_donts_commitments_text,
         knowledge_text,
         knowledge_route_text,
         product_catalog_text,
