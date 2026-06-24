@@ -240,8 +240,14 @@ fn test_config(mongodb_uri: String, mongodb_database: String) -> AppConfig {
         default_account_id: "default".to_string(),
         agent_recent_message_limit: 12,
         agent_min_reply_interval_seconds: 20,
-        account_send_min_interval_ms: 1000,
-        account_send_max_interval_ms: 4000,
+        // 账号级发送间隔闸：测试默认关（0/0 → account_send_interval_ms 恒返 0 →
+        // process_entry 的 `now - last_sent < 0` 永假 → 永不 defer）。与本文件其它
+        // worker「测试默认 disabled / 极小值」约定一致：绝大多数集成测试用同一
+        // account_id="default" 连发多条且不 sleep，若启用 1-4s 拟人间隔会把第二条
+        // 起的发送 reschedule 成 pending 致断言超时。需要验证间隔闸的测试（见
+        // outbox_integration.rs account_pacing_gate_*）自行把 min=max 覆盖为非 0 值。
+        account_send_min_interval_ms: 0,
+        account_send_max_interval_ms: 0,
         agent_reply_max_segment_chars: 120,
         agent_reply_max_segments: 4,
         message_debounce_window_ms: 4000,

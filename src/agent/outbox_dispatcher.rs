@@ -443,6 +443,74 @@ pub async fn defer_account_offline(
     Ok(())
 }
 
+/// 查某账号 `agent_send_outbox` 中 `status=sent` 的最大 `sent_at`（毫秒）。
+/// 无 sent 历史返回 None。靠 (account_id,status,sent_at:-1) 索引取 limit(1)。
+async fn account_last_sent_at_ms(state: &AppState, account_id: &str) -> AppResult<Option<i64>> {
+    use mongodb::options::FindOneOptions;
+    let collection = state.db.collection_agent_send_outbox();
+    let opts = FindOneOptions::builder()
+        .sort(doc! { "sent_at": -1 })
+        .build();
+    let doc = collection
+        .find_one(
+            doc! { "account_id": account_id, "status": OutboxStatus::Sent.as_str() },
+            opts,
+        )
+        .await?;
+    Ok(doc.and_then(|e| e.sent_at).map(|d| d.timestamp_millis()))
+}
+
+/// 账号级发送间隔闸命中：把本条 reschedule 到 `last_sent_at + interval`。
+/// 仿 [`defer_account_offline`]——attempt 不变、不走 terminal、$unset 锁、写事件。
+async fn defer_account_pacing(
+    state: &AppState,
+    entry_id: ObjectId,
+    entry: &OutboxEntry,
+    next_send_at_ms: i64,
+) -> AppResult<()> {
+    let collection = state.db.collection_agent_send_outbox();
+    let now = DateTime::now();
+    let next_retry = DateTime::from_millis(next_send_at_ms);
+    collection
+        .update_one(
+            doc! {
+                "_id": entry_id,
+                "status": OutboxStatus::InFlight.as_str(),
+            },
+            doc! {
+                "$set": {
+                    // attempt 刻意不变——间隔闸非发送失败，不耗重试额度、不走 terminal。
+                    "status": OutboxStatus::Pending.as_str(),
+                    "next_retry_at": next_retry,
+                    "updated_at": now,
+                },
+                "$unset": {
+                    "worker_id": "",
+                    "locked_until": "",
+                }
+            },
+            None,
+        )
+        .await?;
+    let _ = write_event_with_cap(
+        state,
+        entry_id,
+        &entry.account_id,
+        Some(&entry.contact_wxid),
+        "agent.send_deferred_account_pacing",
+        "deferred",
+        "账号发送过于密集，本条已按拟人节奏推迟（AI 自治控制外发频率，稍后自动续发），不消耗重试额度",
+        Some(doc! {
+            "outbox_id": entry_id,
+            "run_id": &entry.run_id,
+            "attempt": entry.attempt,
+        }),
+    )
+    .await;
+    update_run_log_outbox_status(state, &entry.run_id, "pending").await;
+    Ok(())
+}
+
 /// post-hoc 核对：在 dispatcher timeout 之后，去 `mcp_call_logs` 查 5min 内
 /// 是否已经存在 `tool_name=message_send_text` + 同 recipient + 同 content
 /// 且 `error=null` 的成功记录。命中说明 MCP 实际上已经把消息送出，只是回包
@@ -644,6 +712,23 @@ pub async fn process_entry(state: &AppState, entry: &OutboxEntry) -> AppResult<(
             update_run_log_outbox_status(state, &entry.run_id, "sent").await;
             // 主动发送台账：post-hoc 确认送达同样记一条（素材/名片才记）。
             super::send_ledger::record_send_for_entry(state, entry, &contact, now).await;
+            return Ok(());
+        }
+    }
+
+    // 账号级最小发送间隔闸：查该账号上次实发时刻，距今 < 随机间隔则 reschedule。
+    // 防"连珠炮"——单 worker 串行 for 循环里跨客户/多段消息背靠背零间隔发出 = 机器特征。
+    // 位置在 reclaim 幂等门之后（不误拦本该 post-hoc 标 sent 的条目）、发送之前。
+    // 查询失败 fail-soft 放行（宁可漏限一次也不丢消息）。
+    if let Ok(Some(last_sent_ms)) = account_last_sent_at_ms(state, &entry.account_id).await {
+        let interval_ms = super::pacing::account_send_interval_ms(
+            fastrand::f64(),
+            state.config.account_send_min_interval_ms,
+            state.config.account_send_max_interval_ms,
+        );
+        let now_ms = DateTime::now().timestamp_millis();
+        if now_ms - last_sent_ms < interval_ms {
+            defer_account_pacing(state, entry_id, entry, last_sent_ms + interval_ms).await?;
             return Ok(());
         }
     }
