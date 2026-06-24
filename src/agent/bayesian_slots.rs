@@ -14,8 +14,9 @@ use crate::models::{BayesianPoint, BayesianSignal};
 pub const MAX_BAYESIAN_SLOTS: usize = 6;
 /// 单维度走势线历史封顶。
 pub const HISTORY_CAP: usize = 100;
-/// 判定「强证据」的置信下限（apply 路径累积强证据点数时用）。
-const STRONG_EVIDENCE_CONFIDENCE: f64 = 0.6;
+/// 走势线上「强证据点」的标记值（存入 `BayesianPoint.reason`）。
+/// 强证据由代码侧据消息方向客观判定（锚定客户 Inbound 消息），不信 LLM 自报置信。
+const STRONG_POINT_MARKER: &str = "strong";
 
 /// 占槽阈值（可配）。默认要求跨 3 轮命中 + 2 次强证据，杜绝一两句话占槽。
 #[derive(Debug, Clone)]
@@ -44,11 +45,6 @@ pub fn should_promote(hit_count: i32, strong_evidence_count: i32, th: &SlotPromo
     hit_count >= th.min_hits && strong_evidence_count >= th.min_strong_evidence
 }
 
-/// 淘汰门（对称高阈值）：连续缺席多轮 + 当前置信低，才释放槽位。
-pub fn should_evict(signal: &BayesianSignal, turns_absent: i32, max_absent: i32, low_conf: f64) -> bool {
-    turns_absent >= max_absent && signal.current_confidence < low_conf
-}
-
 /// 增量更新贝叶斯信号。已占槽→更新值/置信/history（封顶 HISTORY_CAP）；
 /// 未占槽→累积一条观察线，达阈值且未满 6 槽则 lock 占槽。永不驱动行为，纯观测。
 ///
@@ -58,10 +54,10 @@ pub fn should_evict(signal: &BayesianSignal, turns_absent: i32, max_absent: i32,
 ///
 /// hits/strong 口径（apply 路径）：
 /// - `hits = signal.history.len()`——已观察的轮数（跨轮累积，这才是「多轮命中」的本意）；
-/// - `strong = history 中 confidence >= STRONG_EVIDENCE_CONFIDENCE 的点数`——
-///   从落盘的走势线统计，幂等可复算，无需额外累计字段。
-///   `ObservedDimension.strong_evidence_count` 作为本轮强证据信号也并入当轮 history 点
-///   （高置信即记为强证据点），保持单一可复算口径。
+/// - `strong = history 中被标记为强证据点（reason == STRONG_POINT_MARKER）的点数`——
+///   强证据由代码侧据消息方向客观判定（`ObservedDimension.strong_evidence_count`，
+///   锚定客户 Inbound 消息才算），**不信 LLM 自报 confidence**。本轮观察若
+///   `strong_evidence_count >= 1` 则把当轮 history 点标记为强证据点，跨轮累积可复算。
 pub fn apply_bayesian_update(
     signals: &mut Vec<BayesianSignal>,
     observed: &[ObservedDimension],
@@ -70,6 +66,12 @@ pub fn apply_bayesian_update(
 ) {
     // 第一遍：更新已有信号或新建观察线，并截断 history。
     for obs in observed {
+        // 强证据由代码侧据消息方向客观判定：本轮锚定客户 Inbound 消息的证据 >=1 即标记强证据点。
+        let reason = if obs.strong_evidence_count >= 1 {
+            Some(STRONG_POINT_MARKER.to_string())
+        } else {
+            None
+        };
         if let Some(sig) = signals.iter_mut().find(|s| s.dimension == obs.dimension) {
             let value_changed = sig.current_value != obs.value;
             let confidence_changed = (sig.current_confidence - obs.confidence).abs() > f64::EPSILON;
@@ -81,7 +83,7 @@ pub fn apply_bayesian_update(
                 confidence: obs.confidence,
                 value_changed,
                 confidence_changed,
-                reason: None,
+                reason,
             });
             while sig.history.len() > HISTORY_CAP {
                 sig.history.remove(0);
@@ -98,7 +100,7 @@ pub fn apply_bayesian_update(
                     confidence: obs.confidence,
                     value_changed: false,
                     confidence_changed: false,
-                    reason: None,
+                    reason,
                 }],
             });
         }
@@ -113,10 +115,11 @@ pub fn apply_bayesian_update(
         }
         if !sig.locked {
             let hits = sig.history.len() as i32;
+            // strong 取自代码侧强证据标记点数（跨轮累积），不再从 confidence 反推。
             let strong = sig
                 .history
                 .iter()
-                .filter(|p| p.confidence >= STRONG_EVIDENCE_CONFIDENCE)
+                .filter(|p| p.reason.as_deref() == Some(STRONG_POINT_MARKER))
                 .count() as i32;
             if should_promote(hits, strong, th) {
                 sig.locked = true;
@@ -169,5 +172,31 @@ mod tests {
             }], 0, &th);
         }
         assert!(signals.iter().filter(|s| s.locked).count() <= MAX_BAYESIAN_SLOTS);
+    }
+
+    #[test]
+    fn promotion_uses_code_side_strong_not_confidence() {
+        // Option B：占槽强证据口径取自代码侧（Inbound 锚定数），不信 LLM 自报 confidence。
+        let th = SlotPromotionThreshold { min_hits: 3, min_strong_evidence: 2 };
+
+        // 高置信(0.9)但代码侧强证据=0：跨 5 轮命中达 min_hits，仍不应占槽（strong=0 < 2）。
+        let mut signals = vec![];
+        for turn in 0..5 {
+            apply_bayesian_update(&mut signals, &[ObservedDimension {
+                dimension: "价格敏感度".into(), value: "高".into(), confidence: 0.9, strong_evidence_count: 0,
+            }], turn, &th);
+        }
+        let sig = signals.iter().find(|s| s.dimension == "价格敏感度").unwrap();
+        assert!(!sig.locked, "高置信但代码侧强证据=0 不得占槽（confidence 不再驱动占槽）");
+
+        // 低置信(0.3)但代码侧强证据=1：跨 3 轮累积 hits=3 且 strong=3 >= 2 → 占槽。
+        let mut signals2 = vec![];
+        for turn in 0..3 {
+            apply_bayesian_update(&mut signals2, &[ObservedDimension {
+                dimension: "决策角色".into(), value: "拍板人".into(), confidence: 0.3, strong_evidence_count: 1,
+            }], turn, &th);
+        }
+        let sig2 = signals2.iter().find(|s| s.dimension == "决策角色").unwrap();
+        assert!(sig2.locked, "代码侧强证据累积达标即占槽，与 LLM 低置信无关");
     }
 }
