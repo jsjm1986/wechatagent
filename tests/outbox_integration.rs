@@ -19,10 +19,10 @@ use mongodb::bson::{doc, oid::ObjectId, DateTime, Document};
 use serde_json::json;
 use wechatagent::agent::{
     atomic_claim_pending, cancel_entry, cancel_for_contact_on_user_reaction, enqueue,
-    process_entry, reclaim_expired_leases, second_safety_gate, EnqueueOutcome, EnqueueRequest,
-    OutboxStatus,
+    handle_managed_message, process_entry, reclaim_expired_leases, second_safety_gate,
+    EnqueueOutcome, EnqueueRequest, OutboxStatus,
 };
-use wechatagent::models::Contact;
+use wechatagent::models::{Contact, ConversationMessage, MessageDirection};
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -976,6 +976,234 @@ async fn account_pacing_gate_first_send_not_blocked() {
         "无 sent 历史，第一条不应被拦: {:?}",
         entry
     );
+}
+
+/// 账号闸 · 全链路端到端（gateway → dispatcher 拼接处）：
+/// 同账号背靠背两条消息走**真实链路**，第二条被账号闸拦。
+///
+/// 与上面 4 个 `account_pacing_gate_*` 隔离直调 `process_entry`（手工 `enqueue`
+/// 构造 outbox 条目）不同：本例的第二条 outbox 条目由 gateway
+/// `handle_managed_message` 真实决策 → 审查 → 入队产出（account_id / 字段齐全），
+/// 验证"gateway 真实链路产物能被账号闸正确处理"这个拼接点。
+///
+/// 实现路径：seed 一条"刚发过"(sent_at=now) 的同账号历史（account_id="default"，
+/// 挂在另一个 contact 上——闸只按 account_id 维度查 last sent，不看 contact），
+/// 把账号闸"上一条刚发"的前置条件做实；第二条经真实 gateway 入队后驱动
+/// dispatcher，断言被 `defer_account_pacing` 拦回 pending。
+///
+/// 选这条（"seed 首条历史 + 第二条走真实 gateway 入队"）而非"两条都走真实
+/// gateway 发送"，原因：真实发出第一条需要 dispatcher 在 mock MCP 下成功写
+/// sent_at，再背靠背跑第二条——多一次 mock LLM 决策 + 一次实发，链路更长、更脆；
+/// 而拼接点的核心验证是"第二条 = gateway 真实产出 + 被闸拦"，seed 首条历史既
+/// 等价地满足了闸的前置条件，又把不确定性压到最小。
+#[tokio::test]
+#[ignore]
+async fn account_pacing_gate_end_to_end_via_gateway() {
+    let app = common::TestApp::start().await;
+    let mcp_server = start_mcp_mock_success().await;
+    let mut state = common::rebuild_app_state_with_mcp_url(&app, mcp_server.uri());
+    // 固定间隔 2s（min=max 消除随机性）；默认 0/0 是关的，必须显式覆盖。
+    state.config.account_send_min_interval_ms = 2000;
+    state.config.account_send_max_interval_ms = 2000;
+
+    let contact = make_contact("user_pacing_e2e");
+    state
+        .db
+        .contacts()
+        .insert_one(&contact, None)
+        .await
+        .expect("insert contact");
+
+    // seed 一条同账号(account_id="default")「刚刚 sent」的历史，挂在另一个
+    // contact 上——账号闸 account_last_sent_at_ms 只按 account_id 维度查最近一条
+    // status=sent 的 sent_at，做实"上一条刚发过"的前置条件。
+    state
+        .db
+        .raw()
+        .collection::<Document>("agent_send_outbox")
+        .insert_one(
+            doc! {
+                "workspace_id": "default",
+                "account_id": "default",
+                "contact_wxid": "user_pacing_e2e_prior",
+                "status": "sent",
+                "sent_at": DateTime::now(),
+                "content": "同账号刚发的历史一条",
+                "idempotency_key": format!("seed_{}", ObjectId::new()),
+            },
+            None,
+        )
+        .await
+        .expect("seed sent history");
+
+    // 第二条：经**真实 gateway** 决策 → 审查 → 入队 outbox。
+    // 入站消息须先落库（gateway 读取最近上下文）。
+    let inbound = ConversationMessage {
+        id: Some(ObjectId::new()),
+        workspace_id: contact.workspace_id.clone(),
+        account_id: contact.account_id.clone(),
+        contact_wxid: contact.wxid.clone(),
+        message_id: Some("pacing_e2e_msg_001".to_string()),
+        dedupe_key: None,
+        direction: MessageDirection::Inbound,
+        content: "你们的方案我们大概了解了，下一步想看看怎么落地试点。".to_string(),
+        msg_type: None,
+        media_ref: None,
+        raw: None,
+        created_at: DateTime::now(),
+    };
+    state
+        .db
+        .messages()
+        .insert_one(&inbound, None)
+        .await
+        .expect("insert inbound message");
+
+    // mock LLM：Reply Agent 决策（直发）+ Review Agent 通过 → approved 入队一行。
+    app.llm.push_response(reply_agent_decision_json(
+        "可以，落地试点我们一般先圈一个核心场景跑通，要不要先按你们最急的场景来定试点范围？",
+        "客户主动提出进入试点落地，这是把关系推进到执行阶段的关键时机，回复能直接降低决策摩擦。",
+    ));
+    app.llm.push_response(review_agent_pass_json(
+        "回复承接试点诉求、不越界承诺，语气自然，可直接放行。",
+    ));
+
+    handle_managed_message(&state, contact.clone(), &inbound)
+        .await
+        .expect("handle_managed_message ok");
+
+    // gateway 真实产出的 outbox 条目：approved → 入队一行 pending。
+    let collection = state.db.collection_agent_send_outbox();
+    let enqueued = collection
+        .find_one(
+            doc! { "contact_wxid": &contact.wxid, "status": OutboxStatus::Pending.as_str() },
+            None,
+        )
+        .await
+        .expect("query gateway-enqueued outbox")
+        .expect("approved 路径必须由 gateway 真实入队一行 outbox");
+    let outbox_id = enqueued.id.expect("enqueued outbox has _id");
+    // 这条是 gateway 真实产物：account_id 字段齐全（拼接点的核心前提）。
+    assert_eq!(
+        enqueued.account_id, "default",
+        "gateway 真实产物 account_id 应齐全"
+    );
+    assert_eq!(enqueued.contact_wxid, contact.wxid);
+
+    // 驱动 dispatcher：claim → process_entry，账号闸应在发送前拦下。
+    let claimed = atomic_claim_pending(&state, "worker_pacing_e2e", 60)
+        .await
+        .expect("claim ok")
+        .expect("claimed entry");
+    assert_eq!(claimed.id, Some(outbox_id), "claim 到的应是 gateway 入队那条");
+    process_entry(&state, &claimed)
+        .await
+        .expect("process entry ok");
+
+    // 被账号闸拦：reschedule 回 pending、attempt 不变、next_retry_at 在未来。
+    let entry = collection
+        .find_one(doc! { "_id": outbox_id }, None)
+        .await
+        .expect("query")
+        .expect("entry exists");
+    assert_eq!(
+        entry.status,
+        OutboxStatus::Pending.as_str(),
+        "gateway 真实产物在间隔内应被账号闸 reschedule 回 pending: {:?}",
+        entry
+    );
+    assert_eq!(entry.attempt, 0, "账号闸不消耗重试额度，attempt 保持 0");
+    let next_retry = entry.next_retry_at.expect("next_retry_at must be set");
+    assert!(
+        next_retry.timestamp_millis() > DateTime::now().timestamp_millis(),
+        "next_retry_at 应在未来"
+    );
+    assert!(entry.worker_id.is_none(), "worker_id 应被清空（放回 pending）");
+    assert!(entry.locked_until.is_none(), "locked_until 应被清空");
+
+    // 写了账号闸 deferred 事件。
+    let deferred = state
+        .db
+        .events()
+        .count_documents(doc! { "kind": "agent.send_deferred_account_pacing" }, None)
+        .await
+        .expect("count events");
+    assert!(
+        deferred >= 1,
+        "应写 agent.send_deferred_account_pacing 事件，实际 count={deferred}"
+    );
+
+    // MCP 没有因第二条新增发送调用（被闸拦在发送之前；seed 历史是直接写库未走 MCP）。
+    let recv = mcp_server
+        .received_requests()
+        .await
+        .expect("wiremock recorded requests");
+    assert_eq!(
+        recv.len(),
+        0,
+        "gateway 真实产物被账号闸拦下，MCP 不应收到发送调用"
+    );
+}
+
+// ── gateway 决策 / 审查 mock JSON（端到端用，照搬 full_flow_suite 的最小形态）──
+
+/// Reply Agent 决策 JSON（shouldReply=true，knowledge_need=not_required 直发）。
+fn reply_agent_decision_json(reply_text: &str, why_should_reply: &str) -> serde_json::Value {
+    json!({
+        "decisionPhase": "final",
+        "userUnderstanding": "客户表达明确，正在评估我方方案适配度并提出落地试点诉求。",
+        "relationshipRead": "对话氛围积极，关系处于稳步推进期。",
+        "operationGoal": "帮客户厘清下一步排期，让客户在不被推销压力下感到掌控感。",
+        "knowledgeNeedReason": "本轮只承接节奏，不涉及需核验的具体产品能力。",
+        "memoryUpdateReason": "本轮新增客户进入试点阶段的锚点信息。",
+        "selfCritique": "需收敛信息密度，先确认客户优先级再给出下一步建议。",
+        "whyShouldReply": why_should_reply,
+        "whySkipReply": "",
+        "riskSelfCheck": "本轮回复不涉及未验证的产品能力承诺，不触发安全门阈值。",
+        "riskLevel": "medium",
+        "knowledgeNeed": "not_required",
+        "runMode": "fast_chat",
+        "autonomyMode": "auto",
+        "needsReview": true,
+        "consolidationNeeded": false,
+        "operationState": "need_discovery",
+        "shouldReply": true,
+        "replyText": reply_text,
+        "usedKnowledgeIds": [],
+        "conversationMode": "consultative",
+        "conversationModeReason": "客户进入方案评估阶段，按顾问模式承接。",
+    })
+}
+
+/// Review Agent 通过 JSON（分数全部 ≥ 阈值，不触发 revision）。
+fn review_agent_pass_json(review_summary: &str) -> serde_json::Value {
+    json!({
+        "approved": true,
+        "scores": {
+            "humanLike": 8,
+            "emotionalValue": 8,
+            "productAccuracy": 8,
+            "relationshipProgress": 7,
+            "conversionReadiness": 6,
+            "pressureRisk": 2,
+            "factRisk": 1,
+        },
+        "claimAnalysis": {
+            "hasProductClaim": false,
+            "requiresProductKnowledge": false,
+            "knowledgeSupported": true,
+            "reason": "候选回复仅承接节奏，不涉及具体产品能力承诺。",
+        },
+        "risks": [],
+        "rewriteInstruction": "",
+        "reviewSummary": review_summary,
+        "needsRevision": false,
+        "revisionDirection": "",
+        "shouldHold": false,
+        "holdReason": "",
+        "holdCategory": "",
+        "selfCritiqueAddressed": true,
+    })
 }
 
 // ── helpers ──────────────────────────────────────────────────────────────
