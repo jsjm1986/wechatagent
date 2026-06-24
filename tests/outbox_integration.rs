@@ -680,6 +680,304 @@ async fn under_soft_cap_emits_no_warning_event() {
     assert_eq!(warns, 0, "未达软上限不应记 warning 事件，实际 count={warns}");
 }
 
+// ── Case 9-12: 账号级最小发送间隔闸（防"连珠炮"机器化特征）─────────────────
+//
+// 闸位于 process_entry 的 reclaim 幂等门之后、send 之前：查该账号
+// agent_send_outbox 中 status=sent 的最大 sent_at，距今 < 随机间隔则把本条
+// reschedule 回 pending（attempt 不变、不耗重试额度），稍后 atomic_claim_pending
+// 在 next_retry_at 到点后照常续发。fail-soft：查询失败 / 无 sent 历史均放行。
+//
+// 注：common::TestApp 的 test_config 把间隔默认设为 0/0（闸关），故这些测试
+// 用 rebuild 后的 `let mut state` 把 min=max 覆盖成固定值消除随机性、便于断言。
+// 本地无 Docker，待 CI（`cargo test --test outbox_integration -- --ignored`）。
+
+/// 账号闸：同账号刚发过一条（sent_at=now），紧接的第二条在间隔内 → 被 reschedule
+/// 回 pending、attempt 不变、next_retry_at 在未来、写 pacing deferred 事件、MCP 未发。
+#[tokio::test]
+#[ignore]
+async fn account_pacing_gate_reschedules_back_to_back_send() {
+    let app = common::TestApp::start().await;
+    let mcp_server = start_mcp_mock_success().await;
+    let mut state = common::rebuild_app_state_with_mcp_url(&app, mcp_server.uri());
+    // 固定间隔 2s（min=max 消除随机性）。
+    state.config.account_send_min_interval_ms = 2000;
+    state.config.account_send_max_interval_ms = 2000;
+
+    let contact = make_contact("user_pacing_b2b");
+    state
+        .db
+        .contacts()
+        .insert_one(&contact, None)
+        .await
+        .expect("insert contact");
+
+    // 预置一条「刚刚 sent」(sent_at=now) 的账号历史（account_id="default"）。
+    state
+        .db
+        .raw()
+        .collection::<Document>("agent_send_outbox")
+        .insert_one(
+            doc! {
+                "workspace_id": "default",
+                "account_id": "default",
+                "contact_wxid": &contact.wxid,
+                "status": "sent",
+                "sent_at": DateTime::now(),
+                "content": "刚发的历史一条",
+                "idempotency_key": format!("seed_{}", ObjectId::new()),
+            },
+            None,
+        )
+        .await
+        .expect("seed sent history");
+
+    // enqueue 第二条同账号 pending 条目并 claim。
+    let outcome = enqueue(
+        &state,
+        enqueue_request("run_pacing_b2b", "evt_pacing_b2b", &contact.wxid),
+    )
+    .await
+    .expect("enqueue ok");
+    let outbox_id = match outcome {
+        EnqueueOutcome::Created { outbox_id, .. } => outbox_id,
+        other => panic!("expected Created, got {other:?}"),
+    };
+    let claimed = atomic_claim_pending(&state, "worker_pacing_b2b", 60)
+        .await
+        .expect("claim ok")
+        .expect("claimed entry");
+
+    // process_entry 在 defer 完成后返回 Ok——直接查 DB（pending 非终态，不能用
+    // wait_for_outbox_processed，那只等 sent/failed_terminal/canceled 会超时）。
+    process_entry(&state, &claimed)
+        .await
+        .expect("process entry ok");
+
+    let collection = state.db.collection_agent_send_outbox();
+    let entry = collection
+        .find_one(doc! { "_id": outbox_id }, None)
+        .await
+        .expect("query")
+        .expect("entry exists");
+    assert_eq!(
+        entry.status,
+        OutboxStatus::Pending.as_str(),
+        "间隔内应被 reschedule 回 pending: {:?}",
+        entry
+    );
+    assert_eq!(entry.attempt, 0, "间隔闸不消耗重试额度，attempt 保持 0");
+    let next_retry = entry.next_retry_at.expect("next_retry_at must be set");
+    assert!(
+        next_retry.timestamp_millis() > DateTime::now().timestamp_millis(),
+        "next_retry_at 应在未来"
+    );
+    assert!(entry.worker_id.is_none(), "worker_id 应被清空（放回 pending）");
+    assert!(entry.locked_until.is_none(), "locked_until 应被清空");
+
+    // 写了 pacing deferred 事件。
+    let deferred = state
+        .db
+        .events()
+        .count_documents(
+            doc! { "kind": "agent.send_deferred_account_pacing" },
+            None,
+        )
+        .await
+        .expect("count events");
+    assert!(deferred >= 1, "应写 pacing deferred 事件，实际 count={deferred}");
+
+    // MCP 未收到第二条的发送调用（被闸拦在发送之前）。
+    let recv = mcp_server
+        .received_requests()
+        .await
+        .expect("wiremock recorded requests");
+    assert_eq!(recv.len(), 0, "被间隔闸拦下，MCP 不应收到发送调用");
+}
+
+/// 账号闸：间隔已过（last sent_at 远在 interval 之前）→ 第二条正常发出。
+#[tokio::test]
+#[ignore]
+async fn account_pacing_gate_allows_after_interval() {
+    let app = common::TestApp::start().await;
+    let mcp_server = start_mcp_mock_success().await;
+    let mut state = common::rebuild_app_state_with_mcp_url(&app, mcp_server.uri());
+    state.config.account_send_min_interval_ms = 2000;
+    state.config.account_send_max_interval_ms = 2000;
+
+    let contact = make_contact("user_pacing_after");
+    state
+        .db
+        .contacts()
+        .insert_one(&contact, None)
+        .await
+        .expect("insert contact");
+
+    // 历史 sent 条目 sent_at = now - 10s（远超 2s 间隔）。
+    let ten_s_ago = DateTime::from_millis(DateTime::now().timestamp_millis() - 10_000);
+    state
+        .db
+        .raw()
+        .collection::<Document>("agent_send_outbox")
+        .insert_one(
+            doc! {
+                "workspace_id": "default",
+                "account_id": "default",
+                "contact_wxid": &contact.wxid,
+                "status": "sent",
+                "sent_at": ten_s_ago,
+                "content": "10秒前的历史一条",
+                "idempotency_key": format!("seed_{}", ObjectId::new()),
+            },
+            None,
+        )
+        .await
+        .expect("seed old sent history");
+
+    let outcome = enqueue(
+        &state,
+        enqueue_request("run_pacing_after", "evt_pacing_after", &contact.wxid),
+    )
+    .await
+    .expect("enqueue ok");
+    let outbox_id = match outcome {
+        EnqueueOutcome::Created { outbox_id, .. } => outbox_id,
+        other => panic!("expected Created, got {other:?}"),
+    };
+    let claimed = atomic_claim_pending(&state, "worker_pacing_after", 60)
+        .await
+        .expect("claim ok")
+        .expect("claimed entry");
+    process_entry(&state, &claimed)
+        .await
+        .expect("process entry ok");
+
+    let entry = common::wait_for_outbox_processed(&state, outbox_id, Duration::from_secs(5)).await;
+    assert_eq!(
+        entry.status,
+        OutboxStatus::Sent.as_str(),
+        "间隔已过应正常发出: {:?}",
+        entry
+    );
+    let recv = mcp_server
+        .received_requests()
+        .await
+        .expect("wiremock recorded requests");
+    assert_eq!(recv.len(), 1, "间隔已过，第二条应正常发往 MCP");
+}
+
+/// 账号闸：不同账号互不影响（账号 A 刚发不拦账号 B）。
+#[tokio::test]
+#[ignore]
+async fn account_pacing_gate_isolates_accounts() {
+    let app = common::TestApp::start().await;
+    let mcp_server = start_mcp_mock_success().await;
+    let mut state = common::rebuild_app_state_with_mcp_url(&app, mcp_server.uri());
+    state.config.account_send_min_interval_ms = 2000;
+    state.config.account_send_max_interval_ms = 2000;
+
+    // 账号 B 的 contact（account_id="default" 即测试默认账号 = 这里当作 B）。
+    let contact_b = make_contact("user_pacing_iso_b");
+    state
+        .db
+        .contacts()
+        .insert_one(&contact_b, None)
+        .await
+        .expect("insert contact B");
+
+    // 账号 A（account_id="account_a"）刚发过一条（sent_at=now）——不应拦 B。
+    state
+        .db
+        .raw()
+        .collection::<Document>("agent_send_outbox")
+        .insert_one(
+            doc! {
+                "workspace_id": "default",
+                "account_id": "account_a",
+                "contact_wxid": "user_account_a",
+                "status": "sent",
+                "sent_at": DateTime::now(),
+                "content": "账号A刚发的历史",
+                "idempotency_key": format!("seed_{}", ObjectId::new()),
+            },
+            None,
+        )
+        .await
+        .expect("seed account A sent history");
+
+    // enqueue 账号 B（=default）的 pending 条目。
+    let outcome = enqueue(
+        &state,
+        enqueue_request("run_pacing_iso", "evt_pacing_iso", &contact_b.wxid),
+    )
+    .await
+    .expect("enqueue ok");
+    let outbox_id = match outcome {
+        EnqueueOutcome::Created { outbox_id, .. } => outbox_id,
+        other => panic!("expected Created, got {other:?}"),
+    };
+    let claimed = atomic_claim_pending(&state, "worker_pacing_iso", 60)
+        .await
+        .expect("claim ok")
+        .expect("claimed entry");
+    process_entry(&state, &claimed)
+        .await
+        .expect("process entry ok");
+
+    let entry = common::wait_for_outbox_processed(&state, outbox_id, Duration::from_secs(5)).await;
+    assert_eq!(
+        entry.status,
+        OutboxStatus::Sent.as_str(),
+        "账号 A 的发送历史不应拦截账号 B: {:?}",
+        entry
+    );
+}
+
+/// 账号闸：该账号无 sent 历史 → 第一条不被拦（fail-soft 放行 None）。
+#[tokio::test]
+#[ignore]
+async fn account_pacing_gate_first_send_not_blocked() {
+    let app = common::TestApp::start().await;
+    let mcp_server = start_mcp_mock_success().await;
+    let mut state = common::rebuild_app_state_with_mcp_url(&app, mcp_server.uri());
+    state.config.account_send_min_interval_ms = 2000;
+    state.config.account_send_max_interval_ms = 2000;
+
+    let contact = make_contact("user_pacing_first");
+    state
+        .db
+        .contacts()
+        .insert_one(&contact, None)
+        .await
+        .expect("insert contact");
+
+    // 不预置任何 sent 历史 → account_last_sent_at_ms 返回 None → 放行。
+    let outcome = enqueue(
+        &state,
+        enqueue_request("run_pacing_first", "evt_pacing_first", &contact.wxid),
+    )
+    .await
+    .expect("enqueue ok");
+    let outbox_id = match outcome {
+        EnqueueOutcome::Created { outbox_id, .. } => outbox_id,
+        other => panic!("expected Created, got {other:?}"),
+    };
+    let claimed = atomic_claim_pending(&state, "worker_pacing_first", 60)
+        .await
+        .expect("claim ok")
+        .expect("claimed entry");
+    process_entry(&state, &claimed)
+        .await
+        .expect("process entry ok");
+
+    let entry = common::wait_for_outbox_processed(&state, outbox_id, Duration::from_secs(5)).await;
+    assert_eq!(
+        entry.status,
+        OutboxStatus::Sent.as_str(),
+        "无 sent 历史，第一条不应被拦: {:?}",
+        entry
+    );
+}
+
 // ── helpers ──────────────────────────────────────────────────────────────
 //
 // Visibility regression guard: every dispatcher helper used in this file is
