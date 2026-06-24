@@ -46,6 +46,7 @@ pub(crate) mod prompt_isolation;
 pub(crate) mod quiet_hours;
 pub(crate) mod outbox;
 pub(crate) mod outbox_dispatcher;
+pub(crate) mod pacing;
 mod reaction;
 mod referral;
 mod review;
