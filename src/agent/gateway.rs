@@ -53,7 +53,7 @@ use super::knowledge_router::{
 use super::memory::{
     effective_memory_card, effective_memory_card_for_contact, load_or_create_operating_memory,
     memory_card_has_signal, next_memory_card_version, schedule_memory_consolidation_task,
-    write_memory_candidates, write_tag_observations,
+    write_memory_candidates, write_stage_observation, write_tag_observations,
 };
 use super::multimodal;
 use super::review::{
@@ -1920,6 +1920,7 @@ async fn run_user_operation_gateway_inner(
         &runtime,
         domain_config.as_ref(),
         &ascending_window,
+        &run_id,
     )
     .await?;
     apply_operating_memory_update(
@@ -3234,6 +3235,7 @@ async fn apply_agent_updates(
     runtime: &UserRuntimeParameters,
     domain_config: Option<&OperationDomainConfig>,
     window: &[ConversationMessage],
+    run_id: &str,
 ) -> AppResult<()> {
     let mut set_doc = doc! {
         "updated_at": DateTime::now(),
@@ -3383,8 +3385,13 @@ async fn apply_agent_updates(
         // 并写入一个**不同**的合法态（违反"保持旧值"语义、破坏 C2 既有 rejected 行为）。故仅对
         // domain_attributes 写入用一份剔除 customer_stage 的过滤副本，容器本身保持原样供 C2 拒迁移。
         // 先把判定收敛成 owned 数据：避免 to_stage 的不可变借用与后续可变借用冲突。
+        let proposed_stage: Option<String> = signals_decision
+            .domain_signals
+            .get_str("customer_stage")
+            .ok()
+            .map(str::to_string);
         let stage_rejection: Option<(Option<String>, String, String)> =
-            match signals_decision.domain_signals.get_str("customer_stage").ok() {
+            match proposed_stage.as_deref() {
                 Some(to_stage) if prev_stage != Some(to_stage) => {
                     crate::agent::guards::check_state_transition(domain_config, prev_stage, to_stage)
                         .map(|reason| (prev_stage.map(str::to_string), to_stage.to_string(), reason))
@@ -3413,10 +3420,44 @@ async fn apply_agent_updates(
             )
             .await;
         }
-        // domain_attributes 写入用的 signals：非法跳转时剔除 customer_stage（保持旧值），其余维度
-        // 照常写；合法/无 stage 时零拷贝直接借用原容器，字节级等价于改造前。
+        // 子计划2 Task4：customer_stage 强弱证据门控。强证据放行现有实时写入链路（仍照常
+        // 过上方 check_state_transition——强证据不绕状态机，只绕弱证据丢弃）；弱证据**不写**
+        // domain_attributes.customer_stage（保持旧值），改沉淀 tag_observation 暂定层等压缩
+        // 重判。强弱由 Task1 纯函数客观判定（证据方向 + explicit 标志），不读 LLM 自称置信。
+        // 先 resolve 升序窗口证据 + 判强弱，全程只读 signals/decision，无可变借用冲突。
+        let stage_evidences = crate::agent::tag_evidence::resolve_evidence(
+            window,
+            &decision.stage_evidence_turns,
+        );
+        let weak_stage_drop = proposed_stage.is_some()
+            && !stage_realtime_write_allowed(crate::agent::tag_evidence::evidence_strength(
+                &stage_evidences,
+                window,
+                decision.stage_explicit_intent,
+            ));
+        // 弱证据 + 本轮确有 stage 提案 + 未被状态机先行拒绝 → 落一条 dimension="customer_stage"
+        // 的暂定层 observation（reply 已发，写库失败 fail-soft 仅 warn，不 `?`）。状态机已拒绝
+        // 的提案不再重复落暂定层（已记 stage_transition_rejected 审计，语义是“保持旧值”）。
+        if weak_stage_drop && stage_rejection.is_none() {
+            if let Some(stage) = &proposed_stage {
+                if let Err(e) =
+                    write_stage_observation(state, contact, stage, &stage_evidences, run_id).await
+                {
+                    tracing::warn!(
+                        error = %e,
+                        contact_wxid = %contact.wxid,
+                        stage = %stage,
+                        "写 customer_stage 弱证据暂定层 observation 失败（fail-soft，不阻断）"
+                    );
+                }
+            }
+        }
+        // domain_attributes 写入用的 signals：非法跳转**或**弱证据时剔除 customer_stage
+        // （保持旧值），其余维度照常写；合法且强证据/无 stage 时零拷贝直接借用原容器，字节级
+        // 等价于改造前（Cow::Borrowed 保持）。注意只对 domain_attributes 写入用过滤副本，
+        // signals_decision.domain_signals 容器本身保持原样供下游 C2 派生读同一容器拒迁移。
         let signals_for_attrs: std::borrow::Cow<'_, mongodb::bson::Document> =
-            if stage_rejection.is_some() {
+            if stage_rejection.is_some() || weak_stage_drop {
                 let mut filtered = signals_decision.domain_signals.clone();
                 filtered.remove("customer_stage");
                 std::borrow::Cow::Owned(filtered)
