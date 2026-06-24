@@ -1279,10 +1279,11 @@ pub(crate) async fn write_memory_candidates(
     Ok(())
 }
 
-/// 把一轮标签判断转成 tag_observation 候选 docs（纯函数，便于单测）。
-/// 每个标签一条；evidences 由 resolve_evidence 产出（已 fail-closed）。
-/// 标签共享本轮 tag_evidence_turns（设计取舍：不逐标签配对）。
+/// 把一轮维度判断转成 observation 候选 docs（纯函数，便于单测）。
+/// 每个值一条；`dimension` 为维度名（如 "tag" / "customer_stage"）；evidences 由
+/// resolve_evidence 产出（已 fail-closed）。多值共享本轮证据（设计取舍：不逐值配对）。
 pub(crate) fn build_tag_observation_docs(
+    dimension: &str,
     tags: &[String],
     evidences: &[Evidence],
 ) -> Vec<Document> {
@@ -1293,7 +1294,7 @@ pub(crate) fn build_tag_observation_docs(
     tags.iter()
         .map(|t| {
             doc! {
-                "dimension": "tag",
+                "dimension": dimension,
                 "value": t,
                 "hitCount": 1,
                 "evidences": &ev_bson,
@@ -1324,7 +1325,7 @@ pub(crate) async fn write_tag_observations(
     if evidences.is_empty() {
         return Ok(());
     }
-    let docs = build_tag_observation_docs(&decision.tags, &evidences);
+    let docs = build_tag_observation_docs("tag", &decision.tags, &evidences);
     let candidate = MemoryCandidate {
         id: None,
         workspace_id: contact.workspace_id.clone(),
@@ -1343,7 +1344,39 @@ pub(crate) async fn write_tag_observations(
     Ok(())
 }
 
-/// 候选记忆留存状态决策(#73)：write_score 达标 **或** 单条 importance 足够高 → pending;
+/// 子计划2 Task4：把一条弱证据的 customer_stage 判断写进 memory_candidates 暂定层
+/// （source="tag_observation"，dimension="customer_stage"）。弱证据不实时写
+/// domain_attributes（保持旧 stage），但仍要落暂定层让压缩重判看得到。
+/// `evidences` 由调用方对升序窗口 resolve 后传入；无证据则直接跳过（fail-closed）。
+/// 写库失败不阻断 reply（既成事实），由调用方 fail-soft 处理。
+pub(crate) async fn write_stage_observation(
+    state: &AppState,
+    contact: &Contact,
+    stage: &str,
+    evidences: &[Evidence],
+    run_id: &str,
+) -> AppResult<()> {
+    if evidences.is_empty() {
+        return Ok(());
+    }
+    let docs = build_tag_observation_docs("customer_stage", &[stage.to_string()], evidences);
+    let candidate = MemoryCandidate {
+        id: None,
+        workspace_id: contact.workspace_id.clone(),
+        account_id: contact.account_id.clone(),
+        contact_wxid: contact.wxid.clone(),
+        run_id: Some(run_id.to_string()),
+        source: "tag_observation".to_string(),
+        candidates: docs,
+        memory_write_score: 0,
+        status: "pending".to_string(),
+        reason: None,
+        created_at: DateTime::now(),
+        updated_at: DateTime::now(),
+    };
+    state.db.memory_candidates().insert_one(&candidate, None).await?;
+    Ok(())
+}
 /// 否则 ignored_low_score。importance 救援阈值取 8——只有高重要度记忆(承诺/强偏好等)
 /// 才在整体分偏低时被救回,避免噪声涌入待审池。纯函数便于单测。
 pub(crate) fn decide_candidate_status(write_score: i32, max_importance: i32) -> &'static str {
@@ -1614,7 +1647,7 @@ mod tag_observation_tests {
     #[test]
     fn build_tag_observation_docs_one_per_tag_with_shared_evidence() {
         let ev = vec![Evidence { turn: 0, msg_id: "deadbeef".into() }];
-        let docs = build_tag_observation_docs(&["价格敏感".into(), "犹豫".into()], &ev);
+        let docs = build_tag_observation_docs("tag", &["价格敏感".into(), "犹豫".into()], &ev);
         assert_eq!(docs.len(), 2);
         assert_eq!(docs[0].get_str("dimension").unwrap(), "tag");
         assert_eq!(docs[0].get_str("value").unwrap(), "价格敏感");
@@ -1624,7 +1657,17 @@ mod tag_observation_tests {
 
     #[test]
     fn build_tag_observation_docs_empty_tags_yields_empty() {
-        assert!(build_tag_observation_docs(&[], &[]).is_empty());
+        assert!(build_tag_observation_docs("tag", &[], &[]).is_empty());
+    }
+
+    // 子计划2 Task4：维度参数泛化——customer_stage 暂定层 observation 用同一构造器。
+    #[test]
+    fn build_tag_observation_docs_honors_custom_dimension() {
+        let ev = vec![Evidence { turn: 1, msg_id: "cafef00d".into() }];
+        let docs = build_tag_observation_docs("customer_stage", &["intent_confirmed".into()], &ev);
+        assert_eq!(docs.len(), 1);
+        assert_eq!(docs[0].get_str("dimension").unwrap(), "customer_stage");
+        assert_eq!(docs[0].get_str("value").unwrap(), "intent_confirmed");
     }
 }
 
