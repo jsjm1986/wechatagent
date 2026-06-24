@@ -1299,7 +1299,7 @@ async fn consolidate_contact_memory_inner(
     // Contact 字段（contacts 集合），与 memory_card（operating_memories）物理分家——
     // 故不能搭 operating_memories 的 $set，否则落到无人读的孤儿键；放在 OCC winner
     // 分支内即继承「赢家才写」语义。$set 只含 confirmed_tags 一个键：绝不碰 manual_tags
-    // （运营权威人工层）、bayesian_signals / personality_profile（旁路），保持三线隔离。
+    // （运营录入的权威层）、bayesian_signals / personality_profile（旁路），保持三线隔离。
     state
         .db
         .contacts()
