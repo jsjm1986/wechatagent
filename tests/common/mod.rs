@@ -240,6 +240,8 @@ fn test_config(mongodb_uri: String, mongodb_database: String) -> AppConfig {
         default_account_id: "default".to_string(),
         agent_recent_message_limit: 12,
         agent_min_reply_interval_seconds: 20,
+        account_send_min_interval_ms: 1000,
+        account_send_max_interval_ms: 4000,
         agent_reply_max_segment_chars: 120,
         agent_reply_max_segments: 4,
         message_debounce_window_ms: 4000,
