@@ -935,7 +935,9 @@ async fn run_user_operation_gateway_inner(
     // agent-autonomy-loop W2 / Task 3.4：把 RawAgentDecision::validate_and_promote
     // 的 promote_risks 从 reply 调用一路 thread 到 finalize_review_for_send，
     // 由 finalize 阶段判定是否触发 R3.5/R3.6 blocked_by_required_field。
-    let (mut decision, mut promote_risks) = decide_reply_with_promote(
+    // ── 渐进式三档（2026-06-23）：第一程 Lean 小档 + 充分性自评两程循环 ──
+    // 第一程用 Lean 瘦档（恒注入安全集，不注入业务/产品知识，省 token）。
+    let (decision_first, promote_risks_first) = decide_reply_with_promote(
         state,
         &contact,
         &inbound,
@@ -950,9 +952,72 @@ async fn run_user_operation_gateway_inner(
         &knowledge_route,
         None,
         Some(&run_id),
-        crate::agent::sufficiency::PromptTier::Full,
+        crate::agent::sufficiency::PromptTier::Lean,
     )
     .await?;
+
+    // 充分性自评判定：决定直接进闸 / 升档第二程 / 澄清。
+    let tier_decision = crate::agent::sufficiency::decide_tier_escalation(
+        &decision_first,
+        &knowledge_route.knowledge_coverage,
+    );
+
+    let (mut decision, mut promote_risks) = match tier_decision {
+        crate::agent::sufficiency::TierDecision::Enough => {
+            // 信息够，直接用第一程结果（多数寒暄轮命中此分支）。
+            (decision_first, promote_risks_first)
+        }
+        crate::agent::sufficiency::TierDecision::Escalate(target_tier) => {
+            // 升档重生成（B+）：第二程按 target_tier(Relational/Full) 全量注入对应槽位。
+            // 成本翻倍，但只在 need_more_context 时发生，符合设计预期。
+            write_event_for_account(
+                state,
+                &contact.account_id,
+                Some(&contact.wxid),
+                "ptier_escalated",
+                "info",
+                &format!("第一程小档信息不足，升档重生成: {:?}", target_tier),
+                Some(doc! { "run_id": &run_id, "target_tier": format!("{:?}", target_tier) }),
+            )
+            .await
+            .ok();
+            decide_reply_with_promote(
+                state,
+                &contact,
+                &inbound,
+                &recent_messages,
+                &pending_tasks,
+                playbook.as_ref(),
+                domain_config.as_ref(),
+                &runtime,
+                &memory,
+                &context_pack,
+                &selected_chunks,
+                &knowledge_route,
+                None,
+                Some(&run_id),
+                target_tier,
+            )
+            .await?
+        }
+        crate::agent::sufficiency::TierDecision::Clarify => {
+            // C：信息不足需澄清。第一程已生成澄清向回复，直接用它进后续 review/finalize。
+            // 注：落成 ai_waiting_for_more_context hold 的逻辑在 Task 4/后续 reviewer 改造里接，
+            // 本任务先让澄清回复正常走 review（它本身是合法回复，只是偏澄清）。
+            write_event_for_account(
+                state,
+                &contact.account_id,
+                Some(&contact.wxid),
+                "ptier_clarify",
+                "info",
+                "第一程判定信息不足，输出澄清向回复",
+                Some(doc! { "run_id": &run_id }),
+            )
+            .await
+            .ok();
+            (decision_first, promote_risks_first)
+        }
+    };
     normalize_decision_state(&mut decision, domain_config.as_ref());
     normalize_decision_runtime(&mut decision, &initial_planner);
     let mut planner = planner_from_decision(&decision, "Reply Agent 单轮决策（知识路由前置）");
@@ -1841,12 +1906,22 @@ async fn run_user_operation_gateway_inner(
         }
     }
 
-    apply_agent_updates(state, &contact, &final_decision, &runtime, domain_config.as_ref()).await?;
-    // 子计划2 Task3：tag_observation 证据锚定需要按 created_at 升序（最早在前，0-based）
-    // 的对话窗口——与 prompt 呈现给 LLM 的顺序一致。`recent_messages` 来自
-    // load_recent_messages，按 {created_at:-1} 降序（最新在前），故此处反转成升序后传入。
+    // 子计划2 Task3/Task4：tag_observation 证据锚定 + customer_stage 强弱门控均需按
+    // created_at 升序（最早在前，0-based）的对话窗口——与 prompt 呈现给 LLM 的顺序一致。
+    // `recent_messages` 来自 load_recent_messages，按 {created_at:-1} 降序（最新在前），
+    // 故此处反转成升序后共享给 apply_agent_updates（Task4）与 apply_operating_memory_update
+    // （Task3），只构造一次。
     let ascending_window: Vec<ConversationMessage> =
         recent_messages.iter().rev().cloned().collect();
+    apply_agent_updates(
+        state,
+        &contact,
+        &final_decision,
+        &runtime,
+        domain_config.as_ref(),
+        &ascending_window,
+    )
+    .await?;
     apply_operating_memory_update(
         state,
         &contact,
@@ -3143,12 +3218,22 @@ pub(crate) fn merge_memory_summary_dedup_capped(
     lines.join("\n")
 }
 
+/// 子计划2 Task4：customer_stage 是否允许逐轮实时写入 domain_attributes。
+/// 仅强证据放行；弱证据 → false（不实时写，沉淀 tag_observation 暂定层等压缩重判）。
+/// 强弱由 Task1 纯函数客观判定（证据方向 + explicit 标志），不读 LLM 自称置信。
+pub(crate) fn stage_realtime_write_allowed(
+    strength: crate::agent::tag_evidence::EvidenceStrength,
+) -> bool {
+    matches!(strength, crate::agent::tag_evidence::EvidenceStrength::Strong)
+}
+
 async fn apply_agent_updates(
     state: &AppState,
     contact: &Contact,
     decision: &AgentDecision,
     runtime: &UserRuntimeParameters,
     domain_config: Option<&OperationDomainConfig>,
+    window: &[ConversationMessage],
 ) -> AppResult<()> {
     let mut set_doc = doc! {
         "updated_at": DateTime::now(),
@@ -4394,6 +4479,15 @@ mod tests {
     #[test]
     fn media_send_order_unknown_pref_defaults_text_then_media() {
         assert_eq!(media_send_order(""), SendOrder::TextThenMedia);
+    }
+
+    // 子计划2 Task4：customer_stage 实时写入门控——仅强证据放行逐轮实时写入，
+    // 弱证据沉淀暂定层等压缩重判。
+    #[test]
+    fn stage_realtime_write_only_on_strong() {
+        use crate::agent::tag_evidence::EvidenceStrength;
+        assert!(stage_realtime_write_allowed(EvidenceStrength::Strong));
+        assert!(!stage_realtime_write_allowed(EvidenceStrength::Weak));
     }
 
     // ⑥ 承诺兑现观测：reply 时间承诺特征检测（弱启发，仅观测覆盖率）。
