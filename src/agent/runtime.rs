@@ -102,6 +102,12 @@ pub struct UserRuntimeParameters {
     /// tag-trust 子计划3 Task2：记忆归并宽窗口最大消息条数。`from_config` 把 typed
     /// 值 clamp 到 `[10, 200]`。与 char_budget 共同约束宽窗口规模。默认 60。
     pub consolidation_window_max_messages: i64,
+    /// tag-trust 子计划4 Task2：贝叶斯评估旁路占槽门——跨多轮命中阈值。`from_config`
+    /// 把 typed 值 clamp 到 `[1, 20]`。纯观测旁路，永不驱动决策。默认 3。
+    pub bayesian_slot_min_hits: i32,
+    /// tag-trust 子计划4 Task2：贝叶斯评估旁路占槽门——强证据累积阈值。`from_config`
+    /// 把 typed 值 clamp 到 `[0, 20]`。强证据由代码侧据消息方向算，不信 LLM 自报。默认 2。
+    pub bayesian_slot_min_strong: i32,
 }
 
 /// H9：内置默认 conversationMode 四模式（逐字复刻 `types::CONVERSATION_MODE_VALUES`）。
@@ -184,6 +190,9 @@ impl UserRuntimeParameters {
             consolidation_window_max_messages: typed
                 .consolidation_window_max_messages
                 .clamp(10, 200),
+            // tag-trust 子计划4 Task2：贝叶斯占槽门两阈值走 typed → clamp。
+            bayesian_slot_min_hits: typed.bayesian_slot_min_hits.clamp(1, 20),
+            bayesian_slot_min_strong: typed.bayesian_slot_min_strong.clamp(0, 20),
         }
     }
 
@@ -331,6 +340,9 @@ impl Default for UserRuntimeParameters {
             consolidation_window_max_messages: typed
                 .consolidation_window_max_messages
                 .clamp(10, 200),
+            // tag-trust 子计划4 Task2：与 from_config 同口径 clamp（默认值在带内，结果等价）。
+            bayesian_slot_min_hits: typed.bayesian_slot_min_hits.clamp(1, 20),
+            bayesian_slot_min_strong: typed.bayesian_slot_min_strong.clamp(0, 20),
         }
     }
 }
@@ -600,6 +612,8 @@ mod tests {
             grounding_gate_bypass_without_claim: false,
             consolidation_window_char_budget: 6000,
             consolidation_window_max_messages: 60,
+            bayesian_slot_min_hits: 3,
+            bayesian_slot_min_strong: 2,
         };
         let doc = runtime.as_document();
         assert_eq!(doc.get_i64("reactionTokenBudget").ok(), Some(8000));

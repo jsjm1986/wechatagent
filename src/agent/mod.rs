@@ -551,6 +551,8 @@ mod tests {
             distrust_self_reported_low_risk: false,
             consolidation_window_char_budget: 6000,
             consolidation_window_max_messages: 60,
+            bayesian_slot_min_hits: 3,
+            bayesian_slot_min_strong: 2,
         }
     }
 

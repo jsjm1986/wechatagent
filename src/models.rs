@@ -3348,6 +3348,14 @@ mod typed {
         /// loader 中 clamp 到 [10, 200]。与 char_budget 共同约束宽窗口规模。
         #[serde(default = "defaults::consolidation_window_max_messages")]
         pub consolidation_window_max_messages: i64,
+        /// tag-trust 子计划4 Task2：贝叶斯评估旁路占槽门——跨多轮命中阈值。默认 3，
+        /// runtime 中 clamp 到 [1, 20]。一两句话（hit=1）永不占槽。纯观测，永不驱动决策。
+        #[serde(default = "defaults::bayesian_slot_min_hits")]
+        pub bayesian_slot_min_hits: i32,
+        /// tag-trust 子计划4 Task2：贝叶斯评估旁路占槽门——强证据累积阈值。默认 2，
+        /// runtime 中 clamp 到 [0, 20]。强证据由代码侧据消息方向算，不信 LLM 自报。
+        #[serde(default = "defaults::bayesian_slot_min_strong")]
+        pub bayesian_slot_min_strong: i32,
     }
 
     impl Default for RuntimeParametersTyped {
@@ -3383,6 +3391,8 @@ mod typed {
                 quiet_hours_tz_offset_hours: defaults::quiet_hours_tz_offset_hours(),
                 consolidation_window_char_budget: defaults::consolidation_window_char_budget(),
                 consolidation_window_max_messages: defaults::consolidation_window_max_messages(),
+                bayesian_slot_min_hits: defaults::bayesian_slot_min_hits(),
+                bayesian_slot_min_strong: defaults::bayesian_slot_min_strong(),
             }
         }
     }
@@ -3483,6 +3493,13 @@ mod typed {
         }
         pub fn consolidation_window_max_messages() -> i64 {
             60
+        }
+        // ── tag-trust 子计划4 Task2：贝叶斯评估旁路占槽门默认值 ──
+        pub fn bayesian_slot_min_hits() -> i32 {
+            3
+        }
+        pub fn bayesian_slot_min_strong() -> i32 {
+            2
         }
     }
 
@@ -4455,6 +4472,18 @@ mod typed_tests {
         // defaults:: 函数直接断言（loader clamp 范围的锚点）。
         assert_eq!(typed::defaults::consolidation_window_char_budget(), 6000);
         assert_eq!(typed::defaults::consolidation_window_max_messages(), 60);
+    }
+
+    /// tag-trust 子计划4 Task2：贝叶斯占槽门两阈值缺字段默认 3 / 2。
+    #[test]
+    fn runtime_parameters_typed_bayesian_slot_defaults() {
+        let p: RuntimeParametersTyped =
+            mongodb::bson::from_document(doc! {}).expect("default deserialize");
+        assert_eq!(p.bayesian_slot_min_hits, 3);
+        assert_eq!(p.bayesian_slot_min_strong, 2);
+        // defaults:: 函数直接断言（runtime clamp 范围的锚点）。
+        assert_eq!(typed::defaults::bayesian_slot_min_hits(), 3);
+        assert_eq!(typed::defaults::bayesian_slot_min_strong(), 2);
     }
 
     #[test]
