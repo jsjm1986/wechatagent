@@ -950,6 +950,7 @@ async fn run_user_operation_gateway_inner(
         &knowledge_route,
         None,
         Some(&run_id),
+        crate::agent::sufficiency::PromptTier::Full,
     )
     .await?;
     normalize_decision_state(&mut decision, domain_config.as_ref());
@@ -1082,6 +1083,7 @@ async fn run_user_operation_gateway_inner(
                 &knowledge_route,
                 Some(&review.rewrite_instruction),
                 Some(&run_id),
+                crate::agent::sufficiency::PromptTier::Full,
             )
             .await?;
             let prior_namecard = final_decision.namecard_to_send.clone();
@@ -1383,6 +1385,7 @@ async fn run_user_operation_gateway_inner(
                 &knowledge_route,
                 Some(&revision_direction),
                 Some(&run_id),
+                crate::agent::sufficiency::PromptTier::Full,
             );
             match tokio::time::timeout(std::time::Duration::from_secs(30), revision_future).await {
                 Ok(Ok((mut revised_decision, revised_promote_risks))) => {
