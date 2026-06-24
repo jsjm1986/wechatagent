@@ -645,7 +645,7 @@ pub(super) struct ManualTagsRequest {
 
 /// `PUT /api/contacts/:id/manual-tags`
 ///
-/// 运营录入标签（人工权威层）。自由文本，去空白去重，AI 永不覆盖本字段。
+/// 运营录入标签（运营权威层）。自由文本，去空白去重，AI 永不覆盖本字段。
 pub(super) async fn update_manual_tags(
     State(state): State<AppState>,
     Extension(admin): Extension<AuthenticatedAdmin>,
