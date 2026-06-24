@@ -282,9 +282,19 @@ pub(crate) async fn decide_reply_with_promote(
     run_id: Option<&str>,
     tier: crate::agent::sufficiency::PromptTier,
 ) -> AppResult<(AgentDecision, Vec<String>)> {
-    // 渐进式三档（2026-06-23）：tier 参数已接入，本阶段三档暂同等全量注入
-    // （保持现状行为）；后续任务按 tier 裁剪关系类/业务类槽位。恒注入集恒满注入。
-    let _ = tier; // TODO(Task 2 后续): 按 tier 裁剪槽位分组
+    // 渐进式三档（2026-06-23）：按 tier 真实裁剪槽位三组。
+    // 恒注入组（soul / 各 prompt 层 / task 契约及其 append / history / deprecated_facts /
+    //   请示通道信号 / 客户最新消息 / 客户基础身份字段）——任何档都注入，安全/身份铁律。
+    // 关系组（完整 memory / memory_card / 意图轨迹 / 反应提示 / 运营记忆 / 画像各阶段字段）——
+    //   Relational + Full 才注入；Lean 跳过对应 DB 加载（省查询省 token），用空串/默认占位。
+    // 业务组（知识 / 知识路由 / 产品目录 / 持有投影 / 疑似成交 / 可发素材 / 已发素材 /
+    //   名片引荐 / 运营方法 / 运营域策略 / 状态机 / 硬运行参数 / 可引用内容资产）——仅 Full 注入。
+    // 铁律：Full 档两标志均 true，所有槽位与改造前逐字等价（现有调用点全传 Full）。
+    let include_relational = matches!(
+        tier,
+        crate::agent::sufficiency::PromptTier::Relational | crate::agent::sufficiency::PromptTier::Full
+    );
+    let include_business = matches!(tier, crate::agent::sufficiency::PromptTier::Full);
     // universal-domain-adaptation H2 + H9 + H3 + H12：加载本 workspace 当前生效的
     // DomainProfile（无配置时 = DEFAULT 销售域兜底，逐字等价历史行为）。一次加载、
     // 多处复用：① H3 prompt_fragment 注入系统提示的「业务上下文」层；② H9
@@ -300,15 +310,24 @@ pub(crate) async fn decide_reply_with_promote(
             "你是长期运行的微信私域运营 AI Agent。你只为已纳管好友服务，目标是自然、克制、持续推进关系和业务目标。".to_string()
         }),
     };
-    let assets = load_context_assets(state, &contact.account_id).await?;
+    let assets = if include_business {
+        load_context_assets(state, &contact.account_id).await?
+    } else {
+        String::new()
+    };
     // media-asset Task 8：加载可发送素材（sendable+approved）→ 按当前客户阶段过滤候选
     // → 渲染成清单注入 prompt，供 Reply Agent 选材输出 assetsToSend。best-effort：DB
     // 故障 → 空清单（不发素材、不阻塞决策，同 reaction_hint / operator_memory 路径）。
     // customer_stage 取 contact.domain_attributes（与下方画像段同源），缺失 = None →
     // 只命中 target_stages 为空/全阶段的素材。
-    let sendable_assets = load_sendable_assets(state, &contact.account_id)
-        .await
-        .unwrap_or_default();
+    // 业务组：仅 Full 档加载/渲染；Lean+Relational 跳过 DB 查询、空清单。
+    let sendable_assets = if include_business {
+        load_sendable_assets(state, &contact.account_id)
+            .await
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
     let current_customer_stage = contact
         .domain_attributes
         .as_ref()
@@ -321,14 +340,19 @@ pub(crate) async fn decide_reply_with_promote(
     let sendable_candidates_text = super::media_send::render_candidate_lines(&sendable_candidates);
     // 已发素材历史注入（防重发软约束，缺口 5）：查该客户近期已发素材，
     // 渲染成提示段供 Reply Agent 判重。best-effort，空 = 不加段。
-    let recent_media_sent = super::send_ledger::recent_sends_for_contact(
-        state,
-        &contact.workspace_id,
-        &contact.wxid,
-        "media",
-        10,
-    )
-    .await;
+    // 业务组：仅 Full 档查询；非 Full 跳过 DB、空段。
+    let recent_media_sent = if include_business {
+        super::send_ledger::recent_sends_for_contact(
+            state,
+            &contact.workspace_id,
+            &contact.wxid,
+            "media",
+            10,
+        )
+        .await
+    } else {
+        Vec::new()
+    };
     let recent_media_text = super::send_ledger::render_recent_media_lines(&recent_media_sent);
     // referral-card Task 8：名片引荐——仅辅助模式开启才加载/过滤/渲染候选名片注入
     // prompt（默认关 = 空串，对现有全自治账号 prompt 仅多一个空段，字节近等价）。
@@ -342,7 +366,7 @@ pub(crate) async fn decide_reply_with_promote(
         domain_config.and_then(|c| c.assist_mode_enabled),
         assist_override,
     );
-    let referral_block = if assist_on {
+    let referral_block = if include_business && assist_on {
         let cards = load_referral_cards(state, &contact.account_id)
             .await
             .unwrap_or_default();
@@ -372,22 +396,45 @@ pub(crate) async fn decide_reply_with_promote(
     // H12：运营方法论本体回落链 = profile.methodology_override(非空白) ?? contact 绑定
     // playbook ?? 内置兜底。DEFAULT_PROFILE 的 methodology_override=None → 走 playbook +
     // 兜底，与改造前逐字等价。methodology_override 为 Some 时整体替换「当前运营方法」段。
-    let playbook_text = match non_empty_override(active_profile.methodology_override.as_deref()) {
-        Some(text) => text,
-        None => playbook.map(format_playbook_for_prompt).unwrap_or_else(|| {
-            "未配置运营方法。按用户备注、聊天上下文和内容资产自由判断。".to_string()
-        }),
+    let playbook_text = if include_business {
+        match non_empty_override(active_profile.methodology_override.as_deref()) {
+            Some(text) => text,
+            None => playbook.map(format_playbook_for_prompt).unwrap_or_else(|| {
+                "未配置运营方法。按用户备注、聊天上下文和内容资产自由判断。".to_string()
+            }),
+        }
+    } else {
+        String::new()
     };
-    let domain_text = domain_config
-        .map(format_operation_domain_config_for_prompt)
-        .unwrap_or_default();
-    let state_machine_text = domain_config
-        .map(format_operation_state_machine_for_prompt)
-        .unwrap_or_default();
-    let runtime_text = serde_json::to_string(&runtime.as_document()).unwrap_or_default();
-    let knowledge_text =
-        format_operation_knowledge_for_prompt_with_roles(knowledge_chunks, &active_profile.chunk_roles);
-    let knowledge_route_text = serde_json::to_string(knowledge_route).unwrap_or_default();
+    let domain_text = if include_business {
+        domain_config
+            .map(format_operation_domain_config_for_prompt)
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
+    let state_machine_text = if include_business {
+        domain_config
+            .map(format_operation_state_machine_for_prompt)
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
+    let runtime_text = if include_business {
+        serde_json::to_string(&runtime.as_document()).unwrap_or_default()
+    } else {
+        String::new()
+    };
+    let knowledge_text = if include_business {
+        format_operation_knowledge_for_prompt_with_roles(knowledge_chunks, &active_profile.chunk_roles)
+    } else {
+        String::new()
+    };
+    let knowledge_route_text = if include_business {
+        serde_json::to_string(knowledge_route).unwrap_or_default()
+    } else {
+        String::new()
+    };
     // agent-autonomy-loop W5 / Task 6.5：注入最近 K=5 条 deprecated_facts，
     // 让 Reply Agent 知道哪些事实已过期，避免再次引用。仅传 id / text /
     // deprecation_reason / deprecated_at，按 deprecated_at 降序。
@@ -419,21 +466,34 @@ pub(crate) async fn decide_reply_with_promote(
             })
             .collect()
     };
-    let memory_text = serde_json::to_string(&mongodb::bson::doc! {
-        "memoryCard": context_pack.clone(),
-        "userUnderstanding": memory.user_understanding.clone(),
-        "relationshipState": memory.relationship_state.clone(),
-        "productFit": memory.product_fit.clone(),
-        "nextAction": memory.next_action.clone()
-    })
-    .unwrap_or_default();
-    let memory_card_text = serde_json::to_string(context_pack).unwrap_or_default();
+    // 关系组：完整长期运营记忆 + 记忆卡片。Lean 跳过，空串占位。
+    let memory_text = if include_relational {
+        serde_json::to_string(&mongodb::bson::doc! {
+            "memoryCard": context_pack.clone(),
+            "userUnderstanding": memory.user_understanding.clone(),
+            "relationshipState": memory.relationship_state.clone(),
+            "productFit": memory.product_fit.clone(),
+            "nextAction": memory.next_action.clone()
+        })
+        .unwrap_or_default()
+    } else {
+        String::new()
+    };
+    let memory_card_text = if include_relational {
+        serde_json::to_string(context_pack).unwrap_or_default()
+    } else {
+        String::new()
+    };
     let rewrite_text = rewrite_instruction.unwrap_or("");
     // Phase D / D1：intent_trajectory 段（最近 5 项）。空时为空串；
     // contact 老文档（无 intent_trajectory 字段）反序列化为 default 空 Vec，
     // 落入 `intent_trajectory_text == ""` 路径，向前兼容。
-    let intent_trajectory_text =
-        super::reaction::format_intent_trajectory_hint(&contact.intent_trajectory);
+    // 关系组：Lean 跳过，空串占位。
+    let intent_trajectory_text = if include_relational {
+        super::reaction::format_intent_trajectory_hint(&contact.intent_trajectory)
+    } else {
+        String::new()
+    };
     // 客观购买事实增强 G2/G4（2026-06-15 spec §5）：产品目录 + 当前持有投影。
     // 一次加载、两处复用：① 产品目录段供 agent 报准确价（区别于知识 chunk 模糊描述）；
     // ② G4 持有投影段让 agent 识别已购/售后期客户、切关怀而非拉新（破 H10「只写不读」诅咒）。
@@ -445,36 +505,50 @@ pub(crate) async fn decide_reply_with_promote(
     // 三段交易注入（产品目录 / 持有投影 / 疑似成交指引）统一受闸：同源 active_products，
     // 闸关时一并空串。enabled=false 额外跳过 DB 加载省一次查询；渲染+闸门内聚在
     // entitlements::render_transaction_facts_sections 纯函数（可单测、双重保险）。
-    let active_products = if active_profile.transaction_facts_enabled {
+    // 业务组：仅 Full 档加载产品目录/持有投影/疑似成交。非 Full 跳过 DB、三段空串。
+    let active_products = if include_business && active_profile.transaction_facts_enabled {
         super::entitlements::load_active_products(&state.db, &contact.workspace_id).await
     } else {
         Vec::new()
     };
-    let (product_catalog_text, entitlements_text, suspected_deal_text) =
+    let (product_catalog_text, entitlements_text, suspected_deal_text) = if include_business {
         super::entitlements::render_transaction_facts_sections(
             active_profile.transaction_facts_enabled,
             &active_products,
             &contact.outcome_events,
             DateTime::now(),
-        );
+        )
+    } else {
+        (String::new(), String::new(), String::new())
+    };
     // Phase A / A1：reaction_hint 段（最近 3 轮 reaction_analysis）。
     // 查 decision_reviews 同 (workspace, account, contact_wxid) 下 created_at 倒序
     // 前 3 条；任意 IO 错误回落空串（best-effort，不阻塞决策）。
-    let reaction_hint_text = load_recent_reaction_hint(state, contact).await;
+    // 关系组：Lean 跳过 DB、空串占位。
+    let reaction_hint_text = if include_relational {
+        load_recent_reaction_hint(state, contact).await
+    } else {
+        String::new()
+    };
     // Phase A / A2：operator_memory 段。
     // operator_id 取 account_id —— 在 user-ops 路径下，每个微信号背后是同一个
     // 人格（运营人员）；admin chat 路径走 KnowledgeChatTask.operator_id 不冲突。
     // best-effort：DB 故障 → 空串。
-    let operator_memory_text = load_operator_memory(
-        &state.db,
-        &contact.workspace_id,
-        &contact.account_id,
-        &contact.account_id,
-        5,
-    )
-    .await
-    .map(|items| format_operator_memory_for_reply_prompt(&items))
-    .unwrap_or_default();
+    // 关系组：Lean 跳过 DB、空串占位。
+    let operator_memory_text = if include_relational {
+        load_operator_memory(
+            &state.db,
+            &contact.workspace_id,
+            &contact.account_id,
+            &contact.account_id,
+            5,
+        )
+        .await
+        .map(|items| format_operator_memory_for_reply_prompt(&items))
+        .unwrap_or_default()
+    } else {
+        String::new()
+    };
     // Phase C / C4：prompt A/B 灰度。当 (workspace, prompt_key) 下存在多条
     // status="active" 的版本时，按 hash(contact.wxid) % count 选一份；同一 contact
     // 永远拿同一份 prompt，保证 A/B 一致性。单 active 版本时退化为 load_prompt 行为。
@@ -609,6 +683,78 @@ pub(crate) async fn decide_reply_with_promote(
         .map(|task| format!("{} @ {:?}", task.content, task.run_at))
         .collect::<Vec<_>>()
         .join("\n");
+    // 关系组：user prompt 里的画像字段（agent_profile / memory_summary / tags /
+    // domain_attributes 各阶段字段）。Lean 跳过、空串占位；Relational+Full 与改造前等价。
+    let agent_profile_text = if include_relational {
+        serde_json::to_string(&contact.agent_profile).unwrap_or_default()
+    } else {
+        String::new()
+    };
+    let memory_summary_text = if include_relational {
+        contact.memory_summary.clone().unwrap_or_default()
+    } else {
+        String::new()
+    };
+    let tags_text = if include_relational {
+        render_tags_for_prompt(&contact.manual_tags, &contact.confirmed_tags)
+    } else {
+        String::new()
+    };
+    let customer_stage_text = if include_relational {
+        contact
+            .domain_attributes
+            .as_ref()
+            .and_then(|doc| doc.get_str("customer_stage").ok().map(|s| s.to_string()))
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
+    let intent_level_text = if include_relational {
+        contact
+            .domain_attributes
+            .as_ref()
+            .and_then(|doc| doc.get_str("intent_level").ok().map(|s| s.to_string()))
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
+    let purchase_lifecycle_text = if include_relational {
+        contact
+            .domain_attributes
+            .as_ref()
+            .and_then(|doc| doc.get_str("purchase_lifecycle").ok().map(|s| s.to_string()))
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
+    let value_tier_text = if include_relational {
+        contact
+            .domain_attributes
+            .as_ref()
+            .and_then(|doc| doc.get_str("value_tier").ok().map(|s| s.to_string()))
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
+    let commitments_text = if include_relational {
+        contact
+            .commitments
+            .last()
+            .map(|c| c.text().to_string())
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
+    let follow_up_policy_text = if include_relational {
+        contact.follow_up_policy.clone().unwrap_or_default()
+    } else {
+        String::new()
+    };
+    let profile_attributes_text = if include_relational {
+        serde_json::to_string(&contact.profile_attributes).unwrap_or_default()
+    } else {
+        String::new()
+    };
     let user = format!(
         r#"{}
 
@@ -711,36 +857,16 @@ pub(crate) async fn decide_reply_with_promote(
         contact.wxid,
         contact.nickname.clone().unwrap_or_default(),
         contact.human_profile_note.clone().unwrap_or_default(),
-        serde_json::to_string(&contact.agent_profile).unwrap_or_default(),
-        contact.memory_summary.clone().unwrap_or_default(),
-        render_tags_for_prompt(&contact.manual_tags, &contact.confirmed_tags),
-        contact
-            .domain_attributes
-            .as_ref()
-            .and_then(|doc| doc.get_str("customer_stage").ok().map(|s| s.to_string()))
-            .unwrap_or_default(),
-        contact
-            .domain_attributes
-            .as_ref()
-            .and_then(|doc| doc.get_str("intent_level").ok().map(|s| s.to_string()))
-            .unwrap_or_default(),
-        contact
-            .domain_attributes
-            .as_ref()
-            .and_then(|doc| doc.get_str("purchase_lifecycle").ok().map(|s| s.to_string()))
-            .unwrap_or_default(),
-        contact
-            .domain_attributes
-            .as_ref()
-            .and_then(|doc| doc.get_str("value_tier").ok().map(|s| s.to_string()))
-            .unwrap_or_default(),
-        contact
-            .commitments
-            .last()
-            .map(|c| c.text().to_string())
-            .unwrap_or_default(),
-        contact.follow_up_policy.clone().unwrap_or_default(),
-        serde_json::to_string(&contact.profile_attributes).unwrap_or_default(),
+        agent_profile_text,
+        memory_summary_text,
+        tags_text,
+        customer_stage_text,
+        intent_level_text,
+        purchase_lifecycle_text,
+        value_tier_text,
+        commitments_text,
+        follow_up_policy_text,
+        profile_attributes_text,
         assets,
         sendable_candidates_text,
         recent_media_text,
