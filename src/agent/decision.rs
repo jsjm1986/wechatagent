@@ -472,16 +472,7 @@ pub(crate) async fn decide_reply_with_promote(
     // 已含这两项（context_pack 含 doNotDo/commitments 字段），无需重复注入；仅 Lean
     // 档 memory_card_text 被跳过，必须单独补一份精简安全子片。整段（含标题/换行）只在
     // Lean 档非空，Relational/Full 档空串 → Full 逐字等价历史 prompt（零字节差异）。
-    let safety_donts_commitments_text = if !include_relational {
-        let payload = serde_json::to_string(&mongodb::bson::doc! {
-            "doNotDo": context_pack.get_array("doNotDo").cloned().unwrap_or_default(),
-            "commitments": context_pack.get_array("commitments").cloned().unwrap_or_default(),
-        })
-        .unwrap_or_default();
-        format!("\n\n安全约束(禁止项/已承诺，任何档恒注入，绝不可违背):\n{payload}")
-    } else {
-        String::new()
-    };
+    let safety_donts_commitments_text = render_safety_donts_commitments(tier, context_pack);
     // 关系组：完整长期运营记忆 + 记忆卡片。Lean 跳过，空串占位。
     let memory_text = if include_relational {
         serde_json::to_string(&mongodb::bson::doc! {
@@ -1216,6 +1207,35 @@ fn assemble_system_prompt(
     format!("{soul}\n\n{system_contract}\n\n{policy}{business_context}{operator_instruction}")
 }
 
+/// §3 恒注入铁律（渐进式三档 2026-06-23）：doNotDo 禁止项 + commitments 已承诺是
+/// 安全/身份类槽位，**任何档都不能丢**——降档若丢失"已承诺/禁止项"，AI 可能违背承诺
+/// 或踩禁止项，是不可恢复的安全事故。
+///
+/// 抽成纯函数让 lib 单测能锁住这条安全不变量：Lean 档（不注入完整 memory_card）必须
+/// 单独补一份含 doNotDo/commitments 的安全子片；Relational/Full 档完整 `memory_card_text`
+/// 已含这两项 → 此处返回空串避免重复，且保证 Full 档与改造前 prompt 逐字等价（零字节差异）。
+/// 这段逻辑此前内联在 `decide_reply_with_promote` 里、依赖 AppState/DB，无法单测；抽出后
+/// 恒注入铁律成为可确定性断言的纯函数边界。
+pub(crate) fn render_safety_donts_commitments(
+    tier: crate::agent::sufficiency::PromptTier,
+    context_pack: &Document,
+) -> String {
+    let include_relational = matches!(
+        tier,
+        crate::agent::sufficiency::PromptTier::Relational
+            | crate::agent::sufficiency::PromptTier::Full
+    );
+    if include_relational {
+        return String::new();
+    }
+    let payload = serde_json::to_string(&mongodb::bson::doc! {
+        "doNotDo": context_pack.get_array("doNotDo").cloned().unwrap_or_default(),
+        "commitments": context_pack.get_array("commitments").cloned().unwrap_or_default(),
+    })
+    .unwrap_or_default();
+    format!("\n\n安全约束(禁止项/已承诺，任何档恒注入，绝不可违背):\n{payload}")
+}
+
 /// universal-domain-adaptation H3：把 active profile 的 `prompt_fragment`（本行业业务
 /// 上下文）渲染成一段带 `header` 前缀的注入文本；`None` / 空 / 纯空白 → 空串。
 ///
@@ -1518,7 +1538,8 @@ mod persona_override_tests {
     //! 「回落原出厂本体」。DEFAULT_PROFILE 两 override 均 None 必须返回 None（回落），
     //! 保证销售域字节不变。
 
-    use super::{assemble_system_prompt, non_empty_override, render_business_context_fragment};
+    use super::{assemble_system_prompt, non_empty_override, render_business_context_fragment, render_safety_donts_commitments};
+    use mongodb::bson::doc;
 
     #[test]
     fn none_override_falls_back() {
@@ -1606,6 +1627,56 @@ mod persona_override_tests {
             render_business_context_fragment(Some("  含空白  "), "# H"),
             "\n\n# H\n含空白"
         );
+    }
+
+    /// §3 恒注入铁律（核心安全不变量）：Lean 档不注入完整 memory_card，但 doNotDo /
+    /// commitments 是绝不可丢的安全槽位 → 必须单独补一份安全子片，且必须真的含这两项内容。
+    /// 丢失即不可恢复的安全事故（AI 违背承诺/踩禁止项），故锁死测试。
+    #[test]
+    fn lean_tier_always_injects_donts_and_commitments() {
+        let pack = doc! {
+            "doNotDo": ["不要催单", "不要提竞品"],
+            "commitments": ["周五前发报价单"],
+        };
+        let out =
+            render_safety_donts_commitments(crate::agent::sufficiency::PromptTier::Lean, &pack);
+        assert!(!out.is_empty(), "Lean 档必须注入安全子片，不能为空");
+        assert!(out.contains("doNotDo"), "安全子片必须含 doNotDo 键");
+        assert!(out.contains("commitments"), "安全子片必须含 commitments 键");
+        assert!(out.contains("不要催单"), "doNotDo 实际内容必须随档注入");
+        assert!(out.contains("周五前发报价单"), "commitments 实际内容必须随档注入");
+    }
+
+    /// §3 铁律的另一面：Relational / Full 档完整 memory_card_text 已含 doNotDo /
+    /// commitments，此处返回空串避免重复——这保证 Full 档与改造前 prompt **逐字等价**
+    /// （零字节差异）。若这里非空，Full 档会多出一段、破坏等价护栏。
+    #[test]
+    fn relational_and_full_tiers_emit_empty_to_keep_byte_equivalence() {
+        let pack = doc! {
+            "doNotDo": ["不要催单"],
+            "commitments": ["周五前发报价单"],
+        };
+        assert_eq!(
+            render_safety_donts_commitments(crate::agent::sufficiency::PromptTier::Relational, &pack),
+            "",
+            "Relational 档应空串（完整 memory_card 已含），避免重复注入"
+        );
+        assert_eq!(
+            render_safety_donts_commitments(crate::agent::sufficiency::PromptTier::Full, &pack),
+            "",
+            "Full 档应空串，保证与改造前 prompt 逐字等价"
+        );
+    }
+
+    /// 边界：context_pack 缺 doNotDo / commitments 字段（老数据 / 空画像）时，Lean 档
+    /// 仍注入安全子片骨架（含两个键、空数组），不 panic、不静默吞段——结构恒在，内容可空。
+    #[test]
+    fn lean_tier_safety_skeleton_present_even_when_pack_empty() {
+        let empty = doc! {};
+        let out =
+            render_safety_donts_commitments(crate::agent::sufficiency::PromptTier::Lean, &empty);
+        assert!(out.contains("doNotDo"), "缺字段时仍应有 doNotDo 键骨架");
+        assert!(out.contains("commitments"), "缺字段时仍应有 commitments 键骨架");
     }
 
     /// A/T2：**同构测试**——复刻 decision.rs reply.policy 组装链里
