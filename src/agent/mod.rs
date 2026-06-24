@@ -23,6 +23,7 @@
 //! 访问 [`budget`] 模块的 task-local，而被几乎所有子模块共用，放在 mod.rs
 //! 既能避免循环依赖，也能让 LLM 调用计费/缓存/日志的所有逻辑位于一处。
 
+pub(crate) mod bayesian_slots;
 mod budget;
 mod chat_tool_loop;
 pub(crate) mod consolidation_window;
