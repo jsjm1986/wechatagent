@@ -29,17 +29,10 @@ pub enum TierDecision {
     Clarify,
 }
 
-/// 纯函数：根据充分性自评 + coverage 兜底观测，决定下一步动作。
-pub fn decide_tier_escalation(
-    decision: &AgentDecision,
-    knowledge_coverage: &str,
-) -> TierDecision {
+/// 纯函数：根据充分性自评决定下一步动作。
+pub fn decide_tier_escalation(decision: &AgentDecision) -> TierDecision {
     match decision.sufficiency.as_str() {
-        "enough" => {
-            // TODO: coverage 兜底观测（先观测后判罚，不强拦）
-            let _ = knowledge_coverage;
-            TierDecision::Enough
-        }
+        "enough" => TierDecision::Enough,
         "need_more_context" => {
             let tier = match decision.missing_tier.as_str() {
                 "relational" => PromptTier::Relational,
@@ -51,6 +44,22 @@ pub fn decide_tier_escalation(
         "need_clarification" => TierDecision::Clarify,
         _ => TierDecision::Enough,
     }
+}
+
+/// 纯谓词：本轮是否构成「自评乐观偏差」——Reply Agent 自评信息已足（sufficiency=enough）、
+/// 却同时本轮确实需要产品知识、且知识路由的覆盖度不足（missing/weak）。
+///
+/// 设计 §2.2「先观测后判罚，不强拦」：命中只记一条观测 telemetry 供日后校准自评可靠性，
+/// **不改变档位决策**（仍走 Enough、回复照常发）。抽成纯谓词让这条判据（三个条件 AND +
+/// 正向精确匹配）可被 lib 单测锁死——必须正向匹配 `== "enough"`，**绝不能**用 `!= ...`
+/// 否定匹配（会把 not_required 寒暄轮、_=>Enough 兜底的 unknown/空 误记成乐观偏差）。
+///
+/// coverage 取 `missing` 与 `weak` 两态（`enough`/`not_required` 不算偏差）；
+/// `decision_requires_knowledge` 把 not_required 寒暄轮天然挡掉，双保险。
+pub(crate) fn is_coverage_optimism(decision: &AgentDecision, knowledge_coverage: &str) -> bool {
+    decision.sufficiency.as_str() == "enough"
+        && matches!(knowledge_coverage, "missing" | "weak")
+        && super::guards::decision_requires_knowledge(decision)
 }
 
 #[cfg(test)]
@@ -68,42 +77,94 @@ mod tests {
     #[test]
     fn test_enough_passes_through() {
         let d = make_decision("enough", "");
-        assert_eq!(decide_tier_escalation(&d, "enough"), TierDecision::Enough);
+        assert_eq!(decide_tier_escalation(&d), TierDecision::Enough);
     }
 
     #[test]
     fn test_need_more_context_escalates_to_relational() {
         let d = make_decision("need_more_context", "relational");
-        assert_eq!(decide_tier_escalation(&d, "enough"), TierDecision::Escalate(PromptTier::Relational));
+        assert_eq!(decide_tier_escalation(&d), TierDecision::Escalate(PromptTier::Relational));
     }
 
     #[test]
     fn test_need_more_context_escalates_to_full() {
         let d = make_decision("need_more_context", "full");
-        assert_eq!(decide_tier_escalation(&d, "enough"), TierDecision::Escalate(PromptTier::Full));
+        assert_eq!(decide_tier_escalation(&d), TierDecision::Escalate(PromptTier::Full));
     }
 
     #[test]
     fn test_need_clarification_triggers_clarify() {
         let d = make_decision("need_clarification", "");
-        assert_eq!(decide_tier_escalation(&d, "missing"), TierDecision::Clarify);
+        assert_eq!(decide_tier_escalation(&d), TierDecision::Clarify);
     }
 
     #[test]
     fn test_unknown_sufficiency_defaults_to_enough() {
         let d = make_decision("unknown", "");
-        assert_eq!(decide_tier_escalation(&d, "enough"), TierDecision::Enough);
+        assert_eq!(decide_tier_escalation(&d), TierDecision::Enough);
     }
 
     #[test]
     fn test_empty_sufficiency_defaults_to_enough() {
         let d = make_decision("", "");
-        assert_eq!(decide_tier_escalation(&d, "enough"), TierDecision::Enough);
+        assert_eq!(decide_tier_escalation(&d), TierDecision::Enough);
     }
 
     #[test]
     fn test_need_more_context_invalid_tier_falls_back_to_relational() {
         let d = make_decision("need_more_context", "garbage");
-        assert_eq!(decide_tier_escalation(&d, "enough"), TierDecision::Escalate(PromptTier::Relational));
+        assert_eq!(decide_tier_escalation(&d), TierDecision::Escalate(PromptTier::Relational));
+    }
+
+    fn decision_with_need(sufficiency: &str, knowledge_need: &str) -> AgentDecision {
+        AgentDecision {
+            sufficiency: sufficiency.to_string(),
+            knowledge_need: knowledge_need.to_string(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn coverage_optimism_hits_on_enough_plus_missing_plus_required() {
+        let d = decision_with_need("enough", "required");
+        assert!(is_coverage_optimism(&d, "missing"));
+    }
+
+    #[test]
+    fn coverage_optimism_hits_on_weak_too() {
+        // 你选了 missing+weak 都纳入观测——weak 态同样算乐观偏差。
+        let d = decision_with_need("enough", "insufficient");
+        assert!(is_coverage_optimism(&d, "weak"));
+        let d2 = decision_with_need("enough", "knowledge_required");
+        assert!(is_coverage_optimism(&d2, "weak"));
+    }
+
+    #[test]
+    fn coverage_optimism_skips_when_coverage_adequate() {
+        // enough/not_required 覆盖度不算偏差。
+        let d = decision_with_need("enough", "required");
+        assert!(!is_coverage_optimism(&d, "enough"));
+        assert!(!is_coverage_optimism(&d, "not_required"));
+    }
+
+    #[test]
+    fn coverage_optimism_skips_when_knowledge_not_needed() {
+        // 本轮不需要产品知识（寒暄轮 knowledge_need=not_required）→ 即便 coverage=missing 也不记。
+        let d = decision_with_need("enough", "not_required");
+        assert!(!is_coverage_optimism(&d, "missing"));
+    }
+
+    #[test]
+    fn coverage_optimism_requires_positive_enough_match_not_negation() {
+        // 防御对抗警告的最大陷阱：绝不能用 !=enough 否定匹配。
+        // _=>Enough 兜底的 unknown/空 sufficiency 虽然档位走 Enough，但不是「自评说够了」，
+        // 不能记成乐观偏差。这里用正向 == "enough"，故 unknown/空 不命中。
+        let unknown = decision_with_need("unknown", "required");
+        assert!(!is_coverage_optimism(&unknown, "missing"));
+        let empty = decision_with_need("", "required");
+        assert!(!is_coverage_optimism(&empty, "missing"));
+        // need_more_context / need_clarification 也不是「自评够了」，不记。
+        let more = decision_with_need("need_more_context", "required");
+        assert!(!is_coverage_optimism(&more, "missing"));
     }
 }
