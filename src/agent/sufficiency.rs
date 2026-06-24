@@ -13,90 +13,49 @@
 
 use super::types::AgentDecision;
 
-/// 档位判定结果：Agent 自评后，gateway 应如何响应？
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum TierDecision {
-    /// 信息充足，可直接回复（sufficiency == "enough"）
-    Enough,
-    /// 信息不足，需提升 prompt 档位后重跑（sufficiency == "need_more_context"）
-    Escalate { target_tier: PromptTier },
-    /// 需要向客户澄清（sufficiency == "need_clarification"）
-    Clarify { intent: String },
-}
-
 /// 渐进式三档 prompt 枚举
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PromptTier {
-    /// 基础档（Tier 1）：仅关系上下文 + 画像
-    Basic,
+    /// 精简档（Tier 1）：仅关系上下文 + 画像
+    Lean,
     /// 关系档（Tier 2）：Tier 1 + 关系历史记忆
     Relational,
     /// 完整档（Tier 3）：Tier 2 + 知识库 + 完整 SOP
     Full,
 }
 
-/// 根据 Agent 自评结果，判定档位提升策略。
-///
-/// # 参数
-/// - `decision`: Reply Agent 输出的决策（含 sufficiency / missing_tier / clarification_intent）
-/// - `current_tier`: 本轮运行时的 prompt 档位
-///
-/// # 返回
-/// - `TierDecision::Enough`: 信息充足，可直接回复
-/// - `TierDecision::Escalate { target_tier }`: 需提升到更高档位重跑
-/// - `TierDecision::Clarify { intent }`: 需向客户澄清
-///
-/// # 逻辑
-/// 1. `sufficiency == "enough"` → Enough
-/// 2. `sufficiency == "need_clarification"` → Clarify（无论 missing_tier）
-/// 3. `sufficiency == "need_more_context"` → 解析 missing_tier 并提升档位：
-///    - "relational" → 提升到 Relational（如果当前是 Basic）
-///    - "full" → 提升到 Full（如果当前不是 Full）
-///    - 其他 / 空 / 已在目标档 → Enough（兜底不死循环）
+/// 档位判定结果：Agent 自评后，gateway 应如何响应？
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TierDecision {
+    /// 信息够了，直接进五闸评审
+    Enough,
+    /// 需升档重生成
+    Escalate(PromptTier),
+    /// 信息不足需澄清
+    Clarify,
+}
+
+/// 纯函数：根据充分性自评 + coverage 兜底观测，决定下一步动作。
 pub fn decide_tier_escalation(
     decision: &AgentDecision,
-    current_tier: PromptTier,
+    knowledge_coverage: &str,
 ) -> TierDecision {
-    let sufficiency = decision.sufficiency.trim();
-    let missing_tier = decision.missing_tier.trim();
-
-    match sufficiency {
-        "enough" => TierDecision::Enough,
-        "need_clarification" => TierDecision::Clarify {
-            intent: decision.clarification_intent.clone(),
-        },
-        "need_more_context" => {
-            match missing_tier {
-                "relational" => {
-                    // 需要关系档：如果当前是 Basic，提升到 Relational；否则已满足
-                    if current_tier == PromptTier::Basic {
-                        TierDecision::Escalate {
-                            target_tier: PromptTier::Relational,
-                        }
-                    } else {
-                        TierDecision::Enough
-                    }
-                }
-                "full" => {
-                    // 需要完整档：如果当前不是 Full，提升到 Full；否则已满足
-                    if current_tier != PromptTier::Full {
-                        TierDecision::Escalate {
-                            target_tier: PromptTier::Full,
-                        }
-                    } else {
-                        TierDecision::Enough
-                    }
-                }
-                _ => {
-                    // missing_tier 无效 / 空 / "none" → 兜底为 Enough，避免死循环
-                    TierDecision::Enough
-                }
-            }
-        }
-        _ => {
-            // sufficiency 无效值 → 兜底为 Enough（容错，避免死循环）
+    match decision.sufficiency.as_str() {
+        "enough" => {
+            // TODO: coverage 兜底观测（先观测后判罚，不强拦）
+            let _ = knowledge_coverage;
             TierDecision::Enough
         }
+        "need_more_context" => {
+            let tier = match decision.missing_tier.as_str() {
+                "relational" => PromptTier::Relational,
+                "full" => PromptTier::Full,
+                _ => PromptTier::Relational, // 兜底：默认升中档
+            };
+            TierDecision::Escalate(tier)
+        }
+        "need_clarification" => TierDecision::Clarify,
+        _ => TierDecision::Enough,
     }
 }
 
@@ -104,83 +63,53 @@ pub fn decide_tier_escalation(
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_enough_returns_enough() {
-        let decision = AgentDecision {
-            sufficiency: "enough".to_string(),
+    fn make_decision(sufficiency: &str, missing_tier: &str) -> AgentDecision {
+        AgentDecision {
+            sufficiency: sufficiency.to_string(),
+            missing_tier: missing_tier.to_string(),
             ..Default::default()
-        };
-        let result = decide_tier_escalation(&decision, PromptTier::Basic);
-        assert_eq!(result, TierDecision::Enough);
+        }
     }
 
     #[test]
-    fn test_need_clarification_returns_clarify() {
-        let decision = AgentDecision {
-            sufficiency: "need_clarification".to_string(),
-            clarification_intent: "请问您具体想了解哪方面？".to_string(),
-            ..Default::default()
-        };
-        let result = decide_tier_escalation(&decision, PromptTier::Basic);
-        assert_eq!(
-            result,
-            TierDecision::Clarify {
-                intent: "请问您具体想了解哪方面？".to_string()
-            }
-        );
+    fn test_enough_passes_through() {
+        let d = make_decision("enough", "");
+        assert_eq!(decide_tier_escalation(&d, "enough"), TierDecision::Enough);
     }
 
     #[test]
-    fn test_need_more_context_relational_escalates_from_basic() {
-        let decision = AgentDecision {
-            sufficiency: "need_more_context".to_string(),
-            missing_tier: "relational".to_string(),
-            ..Default::default()
-        };
-        let result = decide_tier_escalation(&decision, PromptTier::Basic);
-        assert_eq!(
-            result,
-            TierDecision::Escalate {
-                target_tier: PromptTier::Relational
-            }
-        );
+    fn test_need_more_context_escalates_to_relational() {
+        let d = make_decision("need_more_context", "relational");
+        assert_eq!(decide_tier_escalation(&d, "enough"), TierDecision::Escalate(PromptTier::Relational));
     }
 
     #[test]
-    fn test_need_more_context_relational_no_escalate_from_relational() {
-        let decision = AgentDecision {
-            sufficiency: "need_more_context".to_string(),
-            missing_tier: "relational".to_string(),
-            ..Default::default()
-        };
-        let result = decide_tier_escalation(&decision, PromptTier::Relational);
-        assert_eq!(result, TierDecision::Enough);
+    fn test_need_more_context_escalates_to_full() {
+        let d = make_decision("need_more_context", "full");
+        assert_eq!(decide_tier_escalation(&d, "enough"), TierDecision::Escalate(PromptTier::Full));
     }
 
     #[test]
-    fn test_need_more_context_full_escalates_from_basic() {
-        let decision = AgentDecision {
-            sufficiency: "need_more_context".to_string(),
-            missing_tier: "full".to_string(),
-            ..Default::default()
-        };
-        let result = decide_tier_escalation(&decision, PromptTier::Basic);
-        assert_eq!(
-            result,
-            TierDecision::Escalate {
-                target_tier: PromptTier::Full
-            }
-        );
+    fn test_need_clarification_triggers_clarify() {
+        let d = make_decision("need_clarification", "");
+        assert_eq!(decide_tier_escalation(&d, "missing"), TierDecision::Clarify);
     }
 
     #[test]
-    fn test_invalid_missing_tier_returns_enough() {
-        let decision = AgentDecision {
-            sufficiency: "need_more_context".to_string(),
-            missing_tier: "invalid_value".to_string(),
-            ..Default::default()
-        };
-        let result = decide_tier_escalation(&decision, PromptTier::Basic);
-        assert_eq!(result, TierDecision::Enough);
+    fn test_unknown_sufficiency_defaults_to_enough() {
+        let d = make_decision("unknown", "");
+        assert_eq!(decide_tier_escalation(&d, "enough"), TierDecision::Enough);
+    }
+
+    #[test]
+    fn test_empty_sufficiency_defaults_to_enough() {
+        let d = make_decision("", "");
+        assert_eq!(decide_tier_escalation(&d, "enough"), TierDecision::Enough);
+    }
+
+    #[test]
+    fn test_need_more_context_invalid_tier_falls_back_to_relational() {
+        let d = make_decision("need_more_context", "garbage");
+        assert_eq!(decide_tier_escalation(&d, "enough"), TierDecision::Escalate(PromptTier::Relational));
     }
 }

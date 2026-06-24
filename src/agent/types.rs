@@ -442,8 +442,11 @@ pub struct RawAgentDecision {
     pub namecard_to_send: Option<NamecardDirective>,
 
     /// 渐进式三档 + 充分性自评（2026-06-23）：Reply Agent 自评本轮信息是否充分。
+    #[serde(default)]
     pub sufficiency: Option<String>,
+    #[serde(default)]
     pub missing_tier: Option<String>,
+    #[serde(default)]
     pub clarification_intent: Option<String>,
 }
 
