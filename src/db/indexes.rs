@@ -753,6 +753,17 @@ async fn ensure_agent_send_outbox_indexes(db: &Database) -> anyhow::Result<()> {
             None,
         )
         .await?;
+    // 账号级发送间隔闸：查某账号 status=sent 的最大 sent_at（pacing guard）。
+    // 现有 (account_id,status,next_retry_at) 排序键不是 sent_at，无法支撑 sent_at 倒序，
+    // 会触发内存 SORT 随历史线性恶化，故单建此索引。
+    db.collection_agent_send_outbox()
+        .create_index(
+            IndexModel::builder()
+                .keys(doc! { "account_id": 1, "status": 1, "sent_at": -1 })
+                .build(),
+            None,
+        )
+        .await?;
     Ok(())
 }
 
