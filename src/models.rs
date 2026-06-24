@@ -3339,6 +3339,15 @@ mod typed {
         /// 用固定偏移而非 `chrono::Local`，使作息判定**不依赖部署宿主时区**。
         #[serde(default = "defaults::quiet_hours_tz_offset_hours")]
         pub quiet_hours_tz_offset_hours: i32,
+        /// tag-trust 子计划3 Task2：记忆归并宽窗口的字符预算。默认 6000，
+        /// loader 中 clamp 到 [1000, 16000]。供 `take_window_by_budget` 在归并
+        /// 重判时决定取多少条历史消息进上下文。
+        #[serde(default = "defaults::consolidation_window_char_budget")]
+        pub consolidation_window_char_budget: i64,
+        /// tag-trust 子计划3 Task2：记忆归并宽窗口的最大消息条数。默认 60，
+        /// loader 中 clamp 到 [10, 200]。与 char_budget 共同约束宽窗口规模。
+        #[serde(default = "defaults::consolidation_window_max_messages")]
+        pub consolidation_window_max_messages: i64,
     }
 
     impl Default for RuntimeParametersTyped {
@@ -3372,6 +3381,8 @@ mod typed {
                 quiet_hours_start: defaults::quiet_hours_start(),
                 quiet_hours_end: defaults::quiet_hours_end(),
                 quiet_hours_tz_offset_hours: defaults::quiet_hours_tz_offset_hours(),
+                consolidation_window_char_budget: defaults::consolidation_window_char_budget(),
+                consolidation_window_max_messages: defaults::consolidation_window_max_messages(),
             }
         }
     }
@@ -3465,6 +3476,13 @@ mod typed {
         }
         pub fn quiet_hours_tz_offset_hours() -> i32 {
             8
+        }
+        // ── tag-trust 子计划3 Task2：记忆归并宽窗口默认值 ──
+        pub fn consolidation_window_char_budget() -> i64 {
+            6000
+        }
+        pub fn consolidation_window_max_messages() -> i64 {
+            60
         }
     }
 
@@ -4425,6 +4443,18 @@ mod typed_tests {
         assert_eq!(p.pressure_risk_block_at, 7);
         assert_eq!(p.run_token_budget, 30000);
         assert_eq!(p.run_max_llm_calls, 6);
+    }
+
+    /// tag-trust 子计划3 Task2：归并宽窗口两参数缺字段默认 6000 / 60。
+    #[test]
+    fn runtime_parameters_typed_consolidation_window_defaults() {
+        let p: RuntimeParametersTyped =
+            mongodb::bson::from_document(doc! {}).expect("default deserialize");
+        assert_eq!(p.consolidation_window_char_budget, 6000);
+        assert_eq!(p.consolidation_window_max_messages, 60);
+        // defaults:: 函数直接断言（loader clamp 范围的锚点）。
+        assert_eq!(typed::defaults::consolidation_window_char_budget(), 6000);
+        assert_eq!(typed::defaults::consolidation_window_max_messages(), 60);
     }
 
     #[test]
