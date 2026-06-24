@@ -52,6 +52,7 @@ pub(crate) mod runtime;
 pub(crate) mod send_ledger;
 pub mod run_envelope;
 mod simulation;
+pub(crate) mod sufficiency;
 pub(crate) mod taxonomy;
 pub(crate) mod types;
 

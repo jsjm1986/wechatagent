@@ -236,6 +236,17 @@ pub struct AgentDecision {
     /// outbox 条目，并做 approved + 候选校验防幻觉；推完 AI 退居辅助。
     #[serde(default)]
     pub namecard_to_send: Option<NamecardDirective>,
+
+    /// 渐进式三档 + 充分性自评（2026-06-23）：Reply Agent 自评本轮信息是否充分。
+    /// - sufficiency: "enough" | "need_more_context" | "need_clarification"
+    /// - missing_tier: "none" | "relational" | "full"
+    /// - clarification_intent: 若 need_clarification，给澄清方向
+    #[serde(default)]
+    pub sufficiency: String,
+    #[serde(default)]
+    pub missing_tier: String,
+    #[serde(default)]
+    pub clarification_intent: String,
 }
 
 /// 单条素材发送指令：LLM 从注入的「可发送素材」候选清单里选出的一项。
@@ -326,6 +337,10 @@ impl Default for AgentDecision {
             assets_to_send: Vec::new(),
             // 名片引荐：默认 None（LLM 不推时不发任何名片）
             namecard_to_send: None,
+            // 渐进式三档 + 充分性自评（2026-06-23）：默认空（LLM 未输出时不触发档位提升）
+            sufficiency: String::new(),
+            missing_tier: String::new(),
+            clarification_intent: String::new(),
         }
     }
 }
@@ -425,6 +440,11 @@ pub struct RawAgentDecision {
     /// 专属顾问名片引荐：LLM 输出的名片引荐指令（先落 Option 容器，再由
     /// carry-through 透传到 `AgentDecision.namecard_to_send`）。
     pub namecard_to_send: Option<NamecardDirective>,
+
+    /// 渐进式三档 + 充分性自评（2026-06-23）：Reply Agent 自评本轮信息是否充分。
+    pub sufficiency: Option<String>,
+    pub missing_tier: Option<String>,
+    pub clarification_intent: Option<String>,
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -1007,6 +1027,17 @@ fn carry_through_fields(raw: RawAgentDecision, decision: &mut AgentDecision) {
     // 永远为 None、名片被静默丢弃。只在 Some 时覆盖，None 保持默认 None。
     if let Some(v) = raw.namecard_to_send {
         decision.namecard_to_send = Some(v);
+    }
+    // 渐进式三档 + 充分性自评（2026-06-23）：LLM 输出的自评字段若不在此透传，
+    // promote 后永远为空字符串、自评结果被静默丢弃。只在 Some 时覆盖，None 保持默认空。
+    if let Some(v) = raw.sufficiency {
+        decision.sufficiency = v;
+    }
+    if let Some(v) = raw.missing_tier {
+        decision.missing_tier = v;
+    }
+    if let Some(v) = raw.clarification_intent {
+        decision.clarification_intent = v;
     }
     // 自治协议 9 字段已在 promote 主路径填好（或在 minimal/tool_calling 分支处理），
     // 此处不再覆盖，避免 final 轮的 trim 后值被原始 Some(空白) 覆盖。
@@ -2382,5 +2413,15 @@ mod decision_review_result_tests {
 
         assert_eq!(scores.hallucination_score, 3);
         assert_eq!(scores.knowledge_grounding_score, 8);
+    }
+
+    #[test]
+    fn test_agent_decision_sufficiency_fields_backward_compat() {
+        // 老 JSON（无新字段）应成功反序列化，新字段取默认
+        let old_json = r#"{"reply_text":"test","conversation_mode":"casual_relationship"}"#;
+        let decision: AgentDecision = serde_json::from_str(old_json).unwrap();
+        assert_eq!(decision.sufficiency, "");
+        assert_eq!(decision.missing_tier, "");
+        assert_eq!(decision.clarification_intent, "");
     }
 }
