@@ -875,6 +875,25 @@ fn render_memory_dimensions_guidance(dimensions: &[crate::models::MemoryDimensio
     lines
 }
 
+/// 子计划 3 Task 3：把宽窗口对话渲染成带 0-based 升序序号的文本，供归并 Agent
+/// 重判标签时按序位指认证据（evidenceTurns）。窗口入参须已按时间升序（旧→新），
+/// 与子计划 2 reply prompt 的序位约定一致（Task 4 的 evidenceTurns 解析对齐此窗口）。
+/// `[0] 客户: ...` / `[1] 你: ...`。
+fn render_window_numbered(window: &[ConversationMessage]) -> String {
+    window
+        .iter()
+        .enumerate()
+        .map(|(i, m)| {
+            let speaker = match m.direction {
+                crate::models::MessageDirection::Inbound => "客户",
+                crate::models::MessageDirection::Outbound => "你",
+            };
+            format!("[{i}] {speaker}: {}", m.content)
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 pub async fn consolidate_contact_memory(
     state: &AppState,
     contact: &Contact,
@@ -899,7 +918,7 @@ pub async fn consolidate_contact_memory(
     RUN_BUDGET
         .scope(
             budget,
-            consolidate_contact_memory_inner(state, contact, task_id, run_id),
+            consolidate_contact_memory_inner(state, contact, task_id, run_id, &runtime),
         )
         .await
 }
@@ -909,6 +928,7 @@ async fn consolidate_contact_memory_inner(
     contact: &Contact,
     task_id: Option<ObjectId>,
     run_id: String,
+    runtime: &super::runtime::UserRuntimeParameters,
 ) -> AppResult<()> {
     let memory = load_or_create_operating_memory(state, contact).await?;
     let mut cursor = state
@@ -980,6 +1000,33 @@ async fn consolidate_contact_memory_inner(
         "{task_prompt}{}",
         render_memory_dimensions_guidance(&active_profile.memory_dimensions)
     );
+    // 子计划 3：标签重判需原始宽窗口对话（不只候选条目），让归并 Agent 在真实对话上
+    // 重新判定标签。按字符预算 + 条数双上限取（runtime 可配，默认 6000 字 / 60 条）。
+    // load_recent_messages 返回 created_at:-1（倒序）→ reverse 成升序，供窗口函数回溯
+    // 与序号渲染（与子计划 2 reply prompt 的 0-based 升序序位一致，Task 4 据此解析）。
+    let recent = crate::agent::gateway::load_recent_messages(
+        state,
+        contact,
+        runtime.consolidation_window_max_messages,
+    )
+    .await?;
+    let mut recent_asc = recent;
+    recent_asc.reverse();
+    let window = crate::agent::consolidation_window::take_window_by_budget(
+        &recent_asc,
+        runtime.consolidation_window_char_budget as usize,
+        runtime.consolidation_window_max_messages as usize,
+    );
+    let convo = render_window_numbered(&window);
+    // 当前 AI 确信标签（带证据），供 Agent 对照对话原文重判 / 推翻。
+    let current_tags = serde_json::to_string(&contact.confirmed_tags).unwrap_or_default();
+    // 本轮待重判的标签观察候选（子计划 2 写入 source="tag_observation"）：只是线索，
+    // 仍需对话原文佐证才能进 reconfirmedTags。从已加载候选里按 source 筛出。
+    let tag_observations: Vec<&Document> = candidates
+        .iter()
+        .filter(|c| c.get_str("source").ok() == Some("tag_observation"))
+        .collect();
+    let tag_observations_json = serde_json::to_string(&tag_observations).unwrap_or_default();
     let user = format!(
         r#"{}
 
@@ -992,6 +1039,15 @@ async fn consolidate_contact_memory_inner(
 客户昵称: {}
 客户阶段: {}
 意向等级: {}
+
+对话原文（0-based 升序序号，重判标签时按序号指认证据）:
+{}
+
+当前确信标签（AI 上一轮结论，可被对话推翻）:
+{}
+
+待重判标签观察（线索，需对话佐证才保留）:
+{}
 "#,
         task_prompt,
         // task 6.3：prompt wire shape 仍是 Document JSON；在最末端通过
@@ -1009,7 +1065,10 @@ async fn consolidate_contact_memory_inner(
             .domain_attributes
             .as_ref()
             .and_then(|d| d.get_str("intent_level").ok().map(|s| s.to_string()))
-            .unwrap_or_default()
+            .unwrap_or_default(),
+        convo,
+        current_tags,
+        tag_observations_json
     );
     let value = generate_agent_json(
         state,
@@ -2113,5 +2172,49 @@ mod p1_5_occ_tests {
         assert!(out.contains("记录 ta 近期的情绪起伏"), "应含 prompt_hint");
         assert!(out.contains("anniversaries"), "应列出纪念日槽");
         assert!(out.contains("最多 6 条"));
+    }
+}
+
+#[cfg(test)]
+mod render_window_tests {
+    use crate::models::{ConversationMessage, MessageDirection};
+    use mongodb::bson::{oid::ObjectId, DateTime};
+
+    fn msg(dir: MessageDirection, content: &str) -> ConversationMessage {
+        ConversationMessage {
+            id: Some(ObjectId::new()),
+            workspace_id: "w".into(),
+            account_id: "a".into(),
+            contact_wxid: "c".into(),
+            message_id: None,
+            dedupe_key: None,
+            direction: dir,
+            content: content.into(),
+            msg_type: None,
+            media_ref: None,
+            raw: None,
+            created_at: DateTime::from_millis(0),
+        }
+    }
+
+    #[test]
+    fn numbers_oldest_first_zero_based() {
+        // 窗口入参已按时间升序（旧→新）；序号 0 必须是最旧那条，方向标签
+        // Inbound=客户 / Outbound=你（与子计划 2 reply prompt 序位约定一致）。
+        let window = vec![
+            msg(MessageDirection::Inbound, "最早的话"),
+            msg(MessageDirection::Outbound, "我方回复"),
+            msg(MessageDirection::Inbound, "客户追问"),
+        ];
+        let rendered = super::render_window_numbered(&window);
+        let lines: Vec<&str> = rendered.lines().collect();
+        assert_eq!(lines[0], "[0] 客户: 最早的话", "序号 0 应是最旧的客户消息");
+        assert_eq!(lines[1], "[1] 你: 我方回复");
+        assert_eq!(lines[2], "[2] 客户: 客户追问");
+    }
+
+    #[test]
+    fn empty_window_yields_empty_string() {
+        assert!(super::render_window_numbered(&[]).is_empty());
     }
 }

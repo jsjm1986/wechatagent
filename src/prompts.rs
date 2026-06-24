@@ -12,7 +12,7 @@ use crate::{
     models::{AgentSoul, OperationDomainConfig, OperationPlaybook, PromptTemplate},
 };
 
-pub const PROMPT_PACK_VERSION: &str = "wechatagent_prompt_pack_v8_2026_06_24_progressive_tier";
+pub const PROMPT_PACK_VERSION: &str = "wechatagent_prompt_pack_v9_2026_06_24_tag_reconfirm";
 
 /// universal-domain-adaptation A/T1：user.reply.policy prompt「## 模式与 5 闸的关系」
 /// 模式-闸说明段（逐字复刻 prompt pack v3 现文 :958-963：标题 + casual_relationship /
@@ -1292,8 +1292,17 @@ fn prompt_specs() -> Vec<PromptSpec> {
     "conflicts": []
   },
   "summary": "本次整理做了什么",
-  "discarded": ["被丢弃的低价值或重复候选；显式 deprecate 上一版 coreFacts 中的某条事实时，必须把原文放进这里"]
+  "discarded": ["被丢弃的低价值或重复候选；显式 deprecate 上一版 coreFacts 中的某条事实时，必须把原文放进这里"],
+  "reconfirmedTags": [
+    { "value": "标签", "evidenceTurns": [对话序号数组] }
+  ],
+  "discardedTags": [ { "value": "被推翻的旧标签", "reason": "为何推翻" } ]
 }
+
+重判标签：基于上面「对话原文」，忘掉「当前确信标签」的旧结论，重新判定该客户的标签。
+- reconfirmedTags：每个保留的标签必须指认对话依据，evidenceTurns 填「对话原文」里支撑该标签的 0-based 序号数组。
+- discardedTags：旧结论里不再被对话支撑、或被对话推翻的标签放这里，写明 reason。
+- 没有对话依据支撑的标签不要保留（宁可少，不要脑补）。「待重判标签观察」只是线索，仍需对话原文佐证才能进 reconfirmedTags。
 
 限制：
 - coreFacts 最多 6 条，必须按 importance（对未来运营决策影响）倒序排列；只放真正长期重要的事实（如身份/角色/预算/决策方式/明确禁忌等）。
@@ -2364,6 +2373,30 @@ mod reply_schema_evidence_tests {
         assert!(
             task.content.contains("stageExplicitIntent"),
             "reply schema 缺 stageExplicitIntent——强弱证据门控无 LLM 输入"
+        );
+    }
+
+    /// 子计划 3 Task 3：归并 Agent 须基于宽窗口对话重判标签，输出 reconfirmedTags /
+    /// discardedTags。Task 4 的解析/写回以这两个 wire key 为输入，缺任一即整条
+    /// 标签重判链断成死代码——故断真 prompt pack 文本，防 schema 漂移。
+    #[test]
+    fn consolidator_schema_requests_tag_reconfirm() {
+        let specs = prompt_specs();
+        let task = specs
+            .iter()
+            .find(|s| s.key == "user.memory_consolidator.task")
+            .expect("user.memory_consolidator.task prompt spec 存在");
+        assert!(
+            task.content.contains("reconfirmedTags"),
+            "consolidator schema 缺 reconfirmedTags——标签重判链无 LLM 输入"
+        );
+        assert!(
+            task.content.contains("discardedTags"),
+            "consolidator schema 缺 discardedTags——被推翻标签无 LLM 输入"
+        );
+        assert!(
+            task.content.contains("evidenceTurns"),
+            "consolidator schema 缺 evidenceTurns——重判标签无证据序位指认"
         );
     }
 }
