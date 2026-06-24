@@ -681,7 +681,8 @@ pub(crate) async fn decide_reply_with_promote(
     let history = recent_messages
         .iter()
         .rev()
-        .map(|message| {
+        .enumerate()
+        .map(|(idx, message)| {
             let speaker = match message.direction {
                 MessageDirection::Inbound => "客户",
                 MessageDirection::Outbound => "我方",
@@ -690,7 +691,11 @@ pub(crate) async fn decide_reply_with_promote(
             // （客户原文 / 我方历史回复），统一过 strip_injection_tags 防止
             // 历史内容里夹带的 tag 关闭模板。
             let safe = crate::agent::prompt_isolation::strip_injection_tags(&message.content);
-            format!("{speaker}: {safe}")
+            // 子计划2 Task5：行首带 0-based 升序「窗口序号」。`recent_messages` 是
+            // created_at 降序（最新在前），此处 .rev() 反成升序（最早=0），与
+            // gateway.rs 反转出的 ascending_window（喂 resolve_evidence）逐位对齐——
+            // LLM 在 tagEvidenceTurns / stageEvidenceTurns 回的序号即这里的 idx。
+            format!("[{idx}] {speaker}: {safe}")
         })
         .collect::<Vec<_>>()
         .join("\n");

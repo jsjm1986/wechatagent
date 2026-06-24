@@ -12,7 +12,7 @@ use crate::{
     models::{AgentSoul, OperationDomainConfig, OperationPlaybook, PromptTemplate},
 };
 
-pub const PROMPT_PACK_VERSION: &str = "wechatagent_prompt_pack_v6_2026_06_23_cleanup";
+pub const PROMPT_PACK_VERSION: &str = "wechatagent_prompt_pack_v7_2026_06_24_tag_evidence";
 
 /// universal-domain-adaptation A/T1：user.reply.policy prompt「## 模式与 5 闸的关系」
 /// 模式-闸说明段（逐字复刻 prompt pack v3 现文 :958-963：标题 + casual_relationship /
@@ -1123,6 +1123,11 @@ fn prompt_specs() -> Vec<PromptSpec> {
   "tags": ["自由标签"],
   "customerStage": "自由生成的客户阶段",
   "intentLevel": "自由生成的意向等级",
+  // ── 标签 / 阶段的对话证据（每个判断都要能指回对话里的依据） ──
+  // 「窗口序号」= 下方「最近聊天」列表里每条消息行首方括号内的编号（从 0 起、最早的消息为 0、依次递增）。
+  "tagEvidenceTurns": [0],         // 支撑上面 tags 的证据消息窗口序号数组；没有对话依据支撑的标签就不要输出。
+  "stageEvidenceTurns": [0],       // 支撑 customerStage 判定的证据消息窗口序号数组。
+  "stageExplicitIntent": false,    // customerStage 是否基于客户自己明确表达的（true）；若只是你结合上下文的推断则填 false。
   "lastCommitment": "最近承诺或待确认事项",
   "commitment": {
     "text": "最近承诺或待确认事项（与 lastCommitment 同义，二选一即可）",
@@ -2323,6 +2328,37 @@ mod mode_gate_policy_anchor_tests {
         assert!(DEFAULT_MODE_GATE_POLICY.contains("value_exchange"));
         assert!(DEFAULT_MODE_GATE_POLICY.contains("consultative"));
         assert!(DEFAULT_MODE_GATE_POLICY.contains("boundary_protection"));
+    }
+}
+
+#[cfg(test)]
+mod reply_schema_evidence_tests {
+    use super::*;
+
+    /// 子计划2 Task5：reply 决策 schema（`user.reply.task` 的 final 形态契约）必须
+    /// 要求 LLM 额外输出标签/阶段的证据窗口序位 + 阶段是否基于客户明确表达。
+    /// 这三个 wire key 是 `RawAgentDecision`（camelCase）反序列化的字段名，下游
+    /// Task1-4（resolve_evidence / tag_observation / customer_stage 强弱门控）的输入。
+    /// 缺任一即整条证据链断成死代码——故断真 prompt pack 文本，防 schema 漂移。
+    #[test]
+    fn reply_schema_requests_evidence_turns() {
+        let specs = prompt_specs();
+        let task = specs
+            .iter()
+            .find(|s| s.key == "user.reply.task")
+            .expect("user.reply.task prompt spec 存在");
+        assert!(
+            task.content.contains("tagEvidenceTurns"),
+            "reply schema 缺 tagEvidenceTurns——标签证据链无 LLM 输入"
+        );
+        assert!(
+            task.content.contains("stageEvidenceTurns"),
+            "reply schema 缺 stageEvidenceTurns——customer_stage 证据链无 LLM 输入"
+        );
+        assert!(
+            task.content.contains("stageExplicitIntent"),
+            "reply schema 缺 stageExplicitIntent——强弱证据门控无 LLM 输入"
+        );
     }
 }
 
