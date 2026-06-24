@@ -25,6 +25,7 @@
 
 mod budget;
 mod chat_tool_loop;
+pub(crate) mod consolidation_window;
 mod decision;
 mod decision_taxonomy;
 pub(crate) mod dimension_registry;
