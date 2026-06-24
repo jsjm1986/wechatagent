@@ -1121,6 +1121,12 @@ pub struct ReviewScores {
     /// 等个位数阈值同档比较）。R11 兼容：缺省 `0`，旧 review JSON 反序列化不破坏。
     #[serde(default, deserialize_with = "number_i32")]
     pub pressure_risk: i32,
+    /// 渐进式三档+隐私维度(2026-06-23)：边界/隐私安全评分(0-10,越高越安全)。
+    /// 判断候选回复是否:(a)泄露对客户的内部画像/评判;(b)暴露AI身份;
+    /// (c)暴露幕后决策源(领导)或内部系统信息。≤3视为失败→触发改写。
+    /// 向后兼容:缺省0(最保守)。
+    #[serde(default, deserialize_with = "number_i32")]
+    pub boundary_privacy_safety: i32,
 }
 
 #[derive(Debug, Serialize, Deserialize, Default, Clone)]
@@ -2462,6 +2468,14 @@ mod decision_review_result_tests {
 
         assert_eq!(scores.hallucination_score, 3);
         assert_eq!(scores.knowledge_grounding_score, 8);
+    }
+
+    #[test]
+    fn test_review_scores_boundary_privacy_dimension_backward_compat() {
+        // 老 JSON 缺 boundaryPrivacySafety 应成功反序列化取默认 0
+        let old_json = r#"{"humanLike":7,"emotionalValue":6}"#;
+        let scores: ReviewScores = serde_json::from_str(old_json).unwrap();
+        assert_eq!(scores.boundary_privacy_safety, 0);
     }
 
     #[test]
