@@ -4,12 +4,6 @@
 //! prompt？需要澄清什么？
 //!
 //! 本模块提供纯函数档位判定逻辑，供 gateway 调用。
-//!
-//! `#![allow(dead_code)]`：本任务（三档计划 Task 1）只落地数据结构 + 纯函数 + 单测，
-//! gateway 接线在后续 Task（2-7）完成，故公开项暂无生产调用点，靠 module 级
-//! allow 静默 dead_code，待接线后移除。
-
-#![allow(dead_code)]
 
 use super::types::AgentDecision;
 
