@@ -96,6 +96,15 @@ pub struct AgentDecision {
     pub profile_update: Option<AgentProfile>,
     #[serde(default, deserialize_with = "string_or_vec")]
     pub tags: Vec<String>,
+    /// 子计划2：LLM 指认的标签证据——窗口内消息序位（0-based）。代码侧映射回 _id 并 fail-closed 校验。
+    #[serde(default)]
+    pub tag_evidence_turns: Vec<i32>,
+    /// customer_stage 判断的证据序位。
+    #[serde(default)]
+    pub stage_evidence_turns: Vec<i32>,
+    /// LLM 标注：customer_stage 是否基于客户明示意图（非 AI 语境推断）。
+    #[serde(default)]
+    pub stage_explicit_intent: bool,
     pub customer_stage: Option<String>,
     pub intent_level: Option<String>,
     /// universal-domain-adaptation H1：对维度名零假设的开放画像信号容器。
@@ -283,6 +292,9 @@ impl Default for AgentDecision {
             reply_text: String::new(),
             profile_update: None,
             tags: Vec::new(),
+            tag_evidence_turns: Vec::new(),
+            stage_evidence_turns: Vec::new(),
+            stage_explicit_intent: false,
             customer_stage: None,
             intent_level: None,
             domain_signals: Document::new(),
@@ -402,6 +414,15 @@ pub struct RawAgentDecision {
     pub knowledge_route: Option<KnowledgeRouteResult>,
     pub profile_update: Option<AgentProfile>,
     pub tags: Option<Vec<String>>,
+    /// 子计划2：LLM 指认的标签证据窗口序位（promote 后透传到 AgentDecision.tag_evidence_turns）。
+    #[serde(default)]
+    pub tag_evidence_turns: Option<Vec<i32>>,
+    /// customer_stage 判断的证据序位。
+    #[serde(default)]
+    pub stage_evidence_turns: Option<Vec<i32>>,
+    /// LLM 标注：customer_stage 是否基于客户明示意图（非 AI 语境推断）。
+    #[serde(default)]
+    pub stage_explicit_intent: Option<bool>,
     pub customer_stage: Option<String>,
     pub intent_level: Option<String>,
     /// universal-domain-adaptation G1：对维度名零假设的开放画像信号容器。非销售
@@ -930,6 +951,16 @@ fn carry_through_fields(raw: RawAgentDecision, decision: &mut AgentDecision) {
     }
     if let Some(v) = raw.tags {
         decision.tags = v;
+    }
+    // 子计划2：标签/stage 证据序位 + 明示意图标志透传。只在 Some 时覆盖，None 保持默认空。
+    if let Some(v) = raw.tag_evidence_turns {
+        decision.tag_evidence_turns = v;
+    }
+    if let Some(v) = raw.stage_evidence_turns {
+        decision.stage_evidence_turns = v;
+    }
+    if let Some(v) = raw.stage_explicit_intent {
+        decision.stage_explicit_intent = v;
     }
     if raw.customer_stage.is_some() {
         decision.customer_stage = raw.customer_stage;
@@ -2099,6 +2130,21 @@ mod validate_and_promote_tests {
         let runtime = runtime_default(true);
         let (decision, _risks) = raw.validate_and_promote(&runtime);
         assert!(decision.assets_to_send.is_empty());
+    }
+
+    /// 子计划2 Task2：carry_through_fields 须把 LLM 指认的标签/stage 证据序位
+    /// + 明示意图标志透传到最终 AgentDecision，不能静默丢失。
+    #[test]
+    fn carry_through_propagates_evidence_fields() {
+        let mut raw = RawAgentDecision::default();
+        raw.tag_evidence_turns = Some(vec![1, 2]);
+        raw.stage_evidence_turns = Some(vec![3]);
+        raw.stage_explicit_intent = Some(true);
+        let mut decision = AgentDecision::default();
+        carry_through_fields(raw, &mut decision);
+        assert_eq!(decision.tag_evidence_turns, vec![1, 2]);
+        assert_eq!(decision.stage_evidence_turns, vec![3]);
+        assert!(decision.stage_explicit_intent);
     }
 }
 
