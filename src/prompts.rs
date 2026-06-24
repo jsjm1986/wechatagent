@@ -12,7 +12,7 @@ use crate::{
     models::{AgentSoul, OperationDomainConfig, OperationPlaybook, PromptTemplate},
 };
 
-pub const PROMPT_PACK_VERSION: &str = "wechatagent_prompt_pack_v9_2026_06_24_tag_reconfirm";
+pub const PROMPT_PACK_VERSION: &str = "wechatagent_prompt_pack_v10_2026_06_24_bayesian_obs";
 
 /// universal-domain-adaptation A/T1：user.reply.policy prompt「## 模式与 5 闸的关系」
 /// 模式-闸说明段（逐字复刻 prompt pack v3 现文 :958-963：标题 + casual_relationship /
@@ -1129,6 +1129,10 @@ fn prompt_specs() -> Vec<PromptSpec> {
   "tagEvidenceTurns": [0],         // 支撑上面 tags 的证据消息窗口序号数组；没有对话依据支撑的标签就不要输出。
   "stageEvidenceTurns": [0],       // 支撑 customerStage 判定的证据消息窗口序号数组。
   "stageExplicitIntent": false,    // customerStage 是否基于客户自己明确表达的（true）；若只是你结合上下文的推断则填 false。
+  // ── 深层评估维度（可选，旁路观测；仅供评估，不影响你本轮的回复决策） ──
+  "bayesianObservations": [
+    { "dimension": "维度名（你自己命名，如 价格敏感度/决策果断度）", "value": "判断值", "confidence": 0.0, "evidenceTurns": [0] }
+  ],                               // 可选：你对该客户的深层评估维度（最多 6 个，开放维度）。confidence=你的把握度 0.0~1.0；evidenceTurns=支撑该判断的对话窗口序号。没有可观察维度时给空数组。
   // ── 信息充分性自评（渐进式三档；判断"本轮拿到的上下文够不够支撑这条回复"） ──
   // 本轮 prompt 可能只注入了精简上下文（寒暄/闲聊够用）。如果你发现要答好客户这条消息其实还缺东西，就如实说，系统会按需补料后让你重答；不要在信息不足时硬编答案。
   "sufficiency": "enough",         // enough=信息已足够，直接定稿；need_more_context=缺我方内部上下文（需要更懂这个人或需要产品/知识资料）；need_clarification=客户没说清，需要先问清楚
@@ -2373,6 +2377,10 @@ mod reply_schema_evidence_tests {
         assert!(
             task.content.contains("stageExplicitIntent"),
             "reply schema 缺 stageExplicitIntent——强弱证据门控无 LLM 输入"
+        );
+        assert!(
+            task.content.contains("bayesianObservations"),
+            "reply schema 缺 bayesianObservations——贝叶斯评估旁路无 LLM 输入"
         );
     }
 

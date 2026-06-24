@@ -3261,6 +3261,38 @@ pub(crate) fn stage_realtime_write_allowed(
     matches!(strength, crate::agent::tag_evidence::EvidenceStrength::Strong)
 }
 
+/// 贝叶斯评估旁路（子计划4 Task2）：把 LLM 输出的维度观察映射成
+/// [`ObservedDimension`]。**强证据数由代码侧据消息方向客观计算**——锚定到客户本人
+/// (Inbound) 消息的证据才计入强证据，不信 LLM 自报的 `confidence`（confidence 仅作
+/// 观察值原样带入）。纯函数，便于单测强证据口径。纯观测，永不驱动决策。
+fn build_observed_dimensions(
+    decision: &AgentDecision,
+    window: &[ConversationMessage],
+) -> Vec<crate::agent::bayesian_slots::ObservedDimension> {
+    decision
+        .bayesian_observations
+        .iter()
+        .map(|o| {
+            let ev = crate::agent::tag_evidence::resolve_evidence(window, &o.evidence_turns);
+            let strong = ev
+                .iter()
+                .filter(|e| {
+                    window
+                        .get(e.turn as usize)
+                        .map(|m| matches!(m.direction, MessageDirection::Inbound))
+                        .unwrap_or(false)
+                })
+                .count() as i32;
+            crate::agent::bayesian_slots::ObservedDimension {
+                dimension: o.dimension.clone(),
+                value: o.value.clone(),
+                confidence: o.confidence,
+                strong_evidence_count: strong,
+            }
+        })
+        .collect()
+}
+
 async fn apply_agent_updates(
     state: &AppState,
     contact: &Contact,
@@ -3664,6 +3696,55 @@ async fn apply_agent_updates(
         .contacts()
         .update_one(doc! { "_id": contact.id }, doc! { "$set": set_doc }, None)
         .await?;
+
+    // 贝叶斯评估旁路（子计划4 Task2）：纯观测侧路，**永不驱动**任何决策/筛选/状态机/
+    // 发送选择。代码侧据消息方向算每个维度的强证据数（不信 LLM 自报置信），增量更新后
+    // **只写回 bayesian_signals 单字段**（与 confirmed_tags/manual_tags/personality_profile/
+    // customer_stage 解耦）。current_turn 口径 = 升序窗口长度（per-call 观察轮计数，与
+    // apply_bayesian_update 内部 history turn 语义一致）。回复已异步发出，写回失败 fail-soft
+    // 仅 warn 不 `?`（既成事实纪律）。
+    if !decision.bayesian_observations.is_empty() {
+        let th = crate::agent::bayesian_slots::SlotPromotionThreshold {
+            min_hits: runtime.bayesian_slot_min_hits,
+            min_strong_evidence: runtime.bayesian_slot_min_strong,
+        };
+        let observed = build_observed_dimensions(decision, window);
+        let mut signals = contact.bayesian_signals.clone();
+        let current_turn = window.len() as i32;
+        crate::agent::bayesian_slots::apply_bayesian_update(
+            &mut signals,
+            &observed,
+            current_turn,
+            &th,
+        );
+        match mongodb::bson::to_bson(&signals) {
+            Ok(bson_signals) => {
+                if let Err(e) = state
+                    .db
+                    .contacts()
+                    .update_one(
+                        doc! { "_id": contact.id },
+                        doc! { "$set": { "bayesian_signals": bson_signals } },
+                        None,
+                    )
+                    .await
+                {
+                    tracing::warn!(
+                        error = %e,
+                        contact_wxid = %contact.wxid,
+                        "写回 bayesian_signals 失败（fail-soft，纯观测旁路，不阻断）"
+                    );
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    contact_wxid = %contact.wxid,
+                    "序列化 bayesian_signals 失败（fail-soft，纯观测旁路，不阻断）"
+                );
+            }
+        }
+    }
 
     // 数字分身 T6：决策后从 agent_generated_signals 提取 relationship_type 建议，
     // 校验合法后 upsert 写进建议 collection（不直接生效 contact——customer/peer/friend
@@ -4562,6 +4643,57 @@ mod tests {
         use crate::agent::tag_evidence::EvidenceStrength;
         assert!(stage_realtime_write_allowed(EvidenceStrength::Strong));
         assert!(!stage_realtime_write_allowed(EvidenceStrength::Weak));
+    }
+
+    // 子计划4 Task2：贝叶斯维度观察映射——强证据数据由代码侧据消息方向算（锚定 Inbound
+    // 客户消息才计入强证据），不信 LLM 自报置信。纯函数口径单测。
+    #[test]
+    fn build_observed_dimensions_counts_inbound_evidence_as_strong() {
+        use crate::agent::types::BayesianObservationRaw;
+        use mongodb::bson::oid::ObjectId;
+
+        fn msg(dir: MessageDirection) -> ConversationMessage {
+            ConversationMessage {
+                id: Some(ObjectId::new()),
+                workspace_id: "ws".into(),
+                account_id: "acc".into(),
+                contact_wxid: "wx".into(),
+                message_id: None,
+                dedupe_key: None,
+                direction: dir,
+                content: "x".into(),
+                msg_type: None,
+                media_ref: None,
+                raw: None,
+                created_at: DateTime::now(),
+            }
+        }
+        // window[0]=客户(Inbound)，window[1]=我方(Outbound)。
+        let window = vec![msg(MessageDirection::Inbound), msg(MessageDirection::Outbound)];
+        let mut decision = AgentDecision::default();
+        decision.bayesian_observations = vec![
+            // 锚定 Inbound → strong=1。
+            BayesianObservationRaw {
+                dimension: "价格敏感度".into(),
+                value: "高".into(),
+                confidence: 0.9,
+                evidence_turns: vec![0],
+            },
+            // 仅锚定 Outbound → strong=0（不信高置信自报）。
+            BayesianObservationRaw {
+                dimension: "决策果断度".into(),
+                value: "低".into(),
+                confidence: 0.95,
+                evidence_turns: vec![1],
+            },
+        ];
+        let observed = build_observed_dimensions(&decision, &window);
+        assert_eq!(observed.len(), 2);
+        assert_eq!(observed[0].dimension, "价格敏感度");
+        assert_eq!(observed[0].strong_evidence_count, 1, "Inbound 证据应计入强证据");
+        assert_eq!(observed[0].confidence, 0.9, "confidence 作为观察值原样带入");
+        assert_eq!(observed[1].dimension, "决策果断度");
+        assert_eq!(observed[1].strong_evidence_count, 0, "Outbound 证据不计入强证据");
     }
 
     // ⑥ 承诺兑现观测：reply 时间承诺特征检测（弱启发，仅观测覆盖率）。

@@ -105,6 +105,11 @@ pub struct AgentDecision {
     /// LLM 标注：customer_stage 是否基于客户明示意图（非 AI 语境推断）。
     #[serde(default)]
     pub stage_explicit_intent: bool,
+    /// 子计划4：贝叶斯评估旁路——LLM 自由发现的客户维度观察（最多 6 个，开放维度）。
+    /// 纯观测侧路，**永不驱动**任何决策/筛选/状态机；gateway 发送后用代码侧证据强度
+    /// 统计 + apply_bayesian_update 增量更新写回 `Contact.bayesian_signals`。
+    #[serde(default)]
+    pub bayesian_observations: Vec<BayesianObservationRaw>,
     pub customer_stage: Option<String>,
     pub intent_level: Option<String>,
     /// universal-domain-adaptation H1：对维度名零假设的开放画像信号容器。
@@ -281,6 +286,22 @@ pub struct NamecardDirective {
     pub reason: Option<String>,
 }
 
+/// 子计划4：贝叶斯评估旁路的单条维度观察（LLM 输出形态）。
+/// `confidence` 是 LLM 自报的观察值；**强证据数不由 LLM 自报**——代码侧用
+/// `evidence_turns` + 消息方向（客户入站消息）在 gateway 计算。纯观测，永不驱动决策。
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct BayesianObservationRaw {
+    #[serde(default)]
+    pub dimension: String,
+    #[serde(default)]
+    pub value: String,
+    #[serde(default)]
+    pub confidence: f64,
+    #[serde(default)]
+    pub evidence_turns: Vec<i32>,
+}
+
 impl Default for AgentDecision {
     fn default() -> Self {
         Self {
@@ -295,6 +316,7 @@ impl Default for AgentDecision {
             tag_evidence_turns: Vec::new(),
             stage_evidence_turns: Vec::new(),
             stage_explicit_intent: false,
+            bayesian_observations: Vec::new(),
             customer_stage: None,
             intent_level: None,
             domain_signals: Document::new(),
@@ -423,6 +445,10 @@ pub struct RawAgentDecision {
     /// LLM 标注：customer_stage 是否基于客户明示意图（非 AI 语境推断）。
     #[serde(default)]
     pub stage_explicit_intent: Option<bool>,
+    /// 子计划4：贝叶斯评估旁路——LLM 自由发现的客户维度观察（promote 后透传到
+    /// AgentDecision.bayesian_observations）。纯观测，永不驱动决策。
+    #[serde(default)]
+    pub bayesian_observations: Option<Vec<BayesianObservationRaw>>,
     pub customer_stage: Option<String>,
     pub intent_level: Option<String>,
     /// universal-domain-adaptation G1：对维度名零假设的开放画像信号容器。非销售
@@ -961,6 +987,10 @@ fn carry_through_fields(raw: RawAgentDecision, decision: &mut AgentDecision) {
     }
     if let Some(v) = raw.stage_explicit_intent {
         decision.stage_explicit_intent = v;
+    }
+    // 子计划4：贝叶斯维度观察透传（纯观测，永不驱动决策）。
+    if let Some(v) = raw.bayesian_observations {
+        decision.bayesian_observations = v;
     }
     if raw.customer_stage.is_some() {
         decision.customer_stage = raw.customer_stage;
@@ -1703,6 +1733,8 @@ mod validate_and_promote_tests {
             distrust_self_reported_low_risk: false,
             consolidation_window_char_budget: 6000,
             consolidation_window_max_messages: 60,
+            bayesian_slot_min_hits: 3,
+            bayesian_slot_min_strong: 2,
         }
     }
 
