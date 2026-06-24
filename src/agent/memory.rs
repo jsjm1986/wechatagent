@@ -27,7 +27,8 @@ use serde_json::json;
 use crate::error::{AppError, AppResult};
 use crate::models::{
     AgentProfile, AgentTask, ConfirmedTag, Contact, ConversationMessage, Evidence, MemoryCandidate,
-    MemoryCardTyped, MemoryFact, MemoryFactRepr, OperatingMemory,
+    MemoryCardTyped, MemoryFact, MemoryFactRepr, OperatingMemory, PersonalityFacet,
+    PersonalityProfile, PersonalitySnapshot,
 };
 use crate::prompts;
 use crate::routes::AppState;
@@ -941,6 +942,57 @@ pub(crate) fn parse_reconfirmed_tags(
         .unwrap_or_default()
 }
 
+/// 子计划 4 Task 3：从压缩归并 LLM 的同一份 `value`（搭车，不额外起 LLM 调用）里
+/// 解析大五 OCEAN 人格画像。OCEAN 是固定五维封闭量表（开放性/尽责性/外向性/宜人性/
+/// 神经质），不允许 LLM 自创维度。
+///
+/// **诚实置信铁律**：每维的证据序位经同一份压缩窗口 `resolve_evidence` 映射成 msg_id 锚，
+/// 证据为空（越界 / 空序列）→ confidence 强制归 0（不许脑补人格，不采信 LLM 自称置信）。
+///
+/// **永不驱动旁路**：返回值只写 `Contact.personality_profile`，绝不进逐轮决策 / 闸门 /
+/// 状态机 / 选择逻辑（与 bayesian_signals 同为只写不读的旁路）。
+fn parse_facet(v: &serde_json::Value, window: &[ConversationMessage]) -> PersonalityFacet {
+    let score = v.get("score").and_then(|x| x.as_f64()).unwrap_or(0.0);
+    let turns: Vec<i32> = v
+        .get("evidenceTurns")
+        .and_then(|t| t.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| x.as_i64().map(|n| n as i32))
+                .collect()
+        })
+        .unwrap_or_default();
+    let evidence_refs = crate::agent::tag_evidence::resolve_evidence(window, &turns);
+    // 诚实置信：无有效证据 → confidence 归 0，不许脑补人格、不采信 LLM 自称置信。
+    let confidence = if evidence_refs.is_empty() {
+        0.0
+    } else {
+        v.get("confidence").and_then(|x| x.as_f64()).unwrap_or(0.0)
+    };
+    PersonalityFacet {
+        score,
+        confidence,
+        evidence_refs,
+    }
+}
+
+pub(crate) fn parse_personality(
+    value: &serde_json::Value,
+    window: &[ConversationMessage],
+) -> Option<PersonalityProfile> {
+    let p = value.get("personality")?;
+    Some(PersonalityProfile {
+        openness: parse_facet(p.get("openness")?, window),
+        conscientiousness: parse_facet(p.get("conscientiousness")?, window),
+        extraversion: parse_facet(p.get("extraversion")?, window),
+        agreeableness: parse_facet(p.get("agreeableness")?, window),
+        neuroticism: parse_facet(p.get("neuroticism")?, window),
+        updated_at: DateTime::now(),
+        // snapshot 在写回时基于旧 profile append（封顶 50），见 OCC winner 分支。
+        snapshots: vec![],
+    })
+}
+
 pub async fn consolidate_contact_memory(
     state: &AppState,
     contact: &Contact,
@@ -1313,6 +1365,74 @@ async fn consolidate_contact_memory_inner(
             None,
         )
         .await?;
+    // 子计划 4 Task 3：大五 OCEAN 人格画像写回（搭车——从同一份归并 `value` 解析，
+    // 不额外起 LLM 调用）。**永不驱动旁路**：只写 personality_profile，绝不进逐轮决策。
+    // **解耦铁律**：$set 只含 personality_profile 一个键，绝不碰 manual_tags（运营权威层）/
+    // bayesian_signals（另一旁路）/ confirmed_tags / customer_stage。放在 OCC winner
+    // 分支内继承「赢家才写」语义。写库失败 fail-soft（warn 不阻断，已无后续发送动作）。
+    if let Some(mut pp) = parse_personality(&value, &window) {
+        // append snapshot：保留旧 snapshots + 本次（封顶 50，超出从头丢最旧）。
+        let mut snaps = contact
+            .personality_profile
+            .as_ref()
+            .map(|x| x.snapshots.clone())
+            .unwrap_or_default();
+        snaps.push(PersonalitySnapshot {
+            consolidated_at: pp.updated_at,
+            // scores/confidences 顺序固定 [O, C, E, A, N]。
+            scores: vec![
+                pp.openness.score,
+                pp.conscientiousness.score,
+                pp.extraversion.score,
+                pp.agreeableness.score,
+                pp.neuroticism.score,
+            ],
+            confidences: vec![
+                pp.openness.confidence,
+                pp.conscientiousness.confidence,
+                pp.extraversion.confidence,
+                pp.agreeableness.confidence,
+                pp.neuroticism.confidence,
+            ],
+        });
+        while snaps.len() > 50 {
+            snaps.remove(0);
+        }
+        pp.snapshots = snaps;
+        match to_bson(&pp) {
+            Ok(pp_bson) => {
+                if let Err(err) = state
+                    .db
+                    .contacts()
+                    .update_one(
+                        doc! {
+                            "workspace_id": &contact.workspace_id,
+                            "account_id": &contact.account_id,
+                            "wxid": &contact.wxid,
+                        },
+                        doc! { "$set": { "personality_profile": pp_bson } },
+                        None,
+                    )
+                    .await
+                {
+                    tracing::warn!(
+                        workspace_id = %contact.workspace_id,
+                        contact_wxid = %contact.wxid,
+                        error = %err,
+                        "personality_profile write-back failed (fail-soft, side-channel)"
+                    );
+                }
+            }
+            Err(err) => {
+                tracing::warn!(
+                    workspace_id = %contact.workspace_id,
+                    contact_wxid = %contact.wxid,
+                    error = %err,
+                    "personality_profile to_bson failed (fail-soft, side-channel)"
+                );
+            }
+        }
+    }
     if !candidate_ids.is_empty() {
         state
             .db
@@ -2332,5 +2452,57 @@ mod parse_reconfirmed_tests {
         assert_eq!(out[0].value, "价格敏感");
         assert!(!out[0].evidences.is_empty());
         assert_eq!(out[0].confirmed_by, "consolidation");
+    }
+}
+
+#[cfg(test)]
+mod parse_personality_tests {
+    use crate::models::{ConversationMessage, MessageDirection};
+    use mongodb::bson::{oid::ObjectId, DateTime};
+
+    fn msg(dir: MessageDirection, content: &str) -> ConversationMessage {
+        ConversationMessage {
+            id: Some(ObjectId::new()),
+            workspace_id: "w".into(),
+            account_id: "a".into(),
+            contact_wxid: "c".into(),
+            message_id: None,
+            dedupe_key: None,
+            direction: dir,
+            content: content.into(),
+            msg_type: None,
+            media_ref: None,
+            raw: None,
+            created_at: DateTime::from_millis(0),
+        }
+    }
+
+    #[test]
+    fn parse_personality_five_facets_with_evidence() {
+        let window = vec![msg(MessageDirection::Inbound, "我喜欢研究各种新东西")];
+        let v = serde_json::json!({
+            "personality": {
+                "openness": { "score": 0.7, "confidence": 0.4, "evidenceTurns": [0] },
+                "conscientiousness": { "score": 0.5, "confidence": 0.9, "evidenceTurns": [] },
+                "extraversion": { "score": 0.6, "confidence": 0.3, "evidenceTurns": [0] },
+                "agreeableness": { "score": 0.8, "confidence": 0.5, "evidenceTurns": [0] },
+                "neuroticism": { "score": 0.3, "confidence": 0.2, "evidenceTurns": [0] }
+            }
+        });
+        let p = super::parse_personality(&v, &window).expect("some");
+        assert!((p.openness.score - 0.7).abs() < 1e-9);
+        // 诚实置信：无证据维度 confidence 归 0（即便 LLM 自称 0.9），evidence_refs 为空。
+        assert_eq!(p.conscientiousness.confidence, 0.0);
+        assert!(p.conscientiousness.evidence_refs.is_empty());
+        // 有证据维度保留 LLM 置信 + 锚定证据。
+        assert!((p.openness.confidence - 0.4).abs() < 1e-9);
+        assert!(!p.openness.evidence_refs.is_empty());
+        // 写回前 snapshots 为空（在 OCC winner 分支基于旧 profile append）。
+        assert!(p.snapshots.is_empty());
+    }
+
+    #[test]
+    fn parse_personality_absent_yields_none() {
+        assert!(super::parse_personality(&serde_json::json!({}), &[]).is_none());
     }
 }

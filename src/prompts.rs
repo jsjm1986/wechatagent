@@ -12,7 +12,7 @@ use crate::{
     models::{AgentSoul, OperationDomainConfig, OperationPlaybook, PromptTemplate},
 };
 
-pub const PROMPT_PACK_VERSION: &str = "wechatagent_prompt_pack_v10_2026_06_24_bayesian_obs";
+pub const PROMPT_PACK_VERSION: &str = "wechatagent_prompt_pack_v11_2026_06_24_ocean_personality";
 
 /// universal-domain-adaptation A/T1：user.reply.policy prompt「## 模式与 5 闸的关系」
 /// 模式-闸说明段（逐字复刻 prompt pack v3 现文 :958-963：标题 + casual_relationship /
@@ -1300,7 +1300,14 @@ fn prompt_specs() -> Vec<PromptSpec> {
   "reconfirmedTags": [
     { "value": "标签", "evidenceTurns": [对话序号数组] }
   ],
-  "discardedTags": [ { "value": "被推翻的旧标签", "reason": "为何推翻" } ]
+  "discardedTags": [ { "value": "被推翻的旧标签", "reason": "为何推翻" } ],
+  "personality": {
+    "openness": {"score": 0~1, "confidence": 0~1, "evidenceTurns": [对话序号数组]},
+    "conscientiousness": {"score": 0~1, "confidence": 0~1, "evidenceTurns": [对话序号数组]},
+    "extraversion": {"score": 0~1, "confidence": 0~1, "evidenceTurns": [对话序号数组]},
+    "agreeableness": {"score": 0~1, "confidence": 0~1, "evidenceTurns": [对话序号数组]},
+    "neuroticism": {"score": 0~1, "confidence": 0~1, "evidenceTurns": [对话序号数组]}
+  }
 }
 
 重判标签：基于上面「对话原文」，忘掉「当前确信标签」的旧结论，重新判定该客户的标签。
@@ -1316,7 +1323,21 @@ fn prompt_specs() -> Vec<PromptSpec> {
 - preferences 最多 8 条，doNotDo 最多 10 条。
 - commitments、objections、openLoops 各最多 8 条。
 - recentEpisodeSummary 用短自然语言，不要流水账。
-- 不要为了填字段而猜测。"#,
+- 不要为了填字段而猜测。
+
+大五人格量表分析（OCEAN，严肃科学量表，与上面的记忆整理搭车一起输出）：
+基于「对话原文」从客户的真实对话行为推断其大五人格，写进 personality 段。五维含义：
+- openness 开放性：好奇/想象/求新 vs 务实/保守
+- conscientiousness 尽责性：条理/自律/可靠 vs 随性/松散
+- extraversion 外向性：健谈/热情/主动 vs 内敛/克制
+- agreeableness 宜人性：友善/合作/体谅 vs 直接/竞争
+- neuroticism 神经质：易焦虑/情绪起伏大 vs 稳定/淡定
+五条硬约束（违反即不合格）：
+① 只输出上述 OCEAN 五维，不许自创任何维度，五维都必须给出。
+② 每一维必须挂 evidenceTurns（指认「对话原文」里支撑该判断的 0-based 序号）；没有对话依据时，evidenceTurns 留空数组 [] 且 confidence 给 0——宁可承认不知道，绝不脑补人格。
+③ 样本不足、信号微弱时给低 confidence（系统会对无证据维度强制把 confidence 归 0）。
+④ 行为锚定：从客户具体说了什么、怎么说的去推断，不要凭一句话贴标签、不要套刻板印象。
+⑤ score / confidence 都是 0~1 浮点；严格 JSON，不输出 markdown。"#,
         },
         PromptSpec {
             key: "user.reaction.system",
@@ -2405,6 +2426,39 @@ mod reply_schema_evidence_tests {
         assert!(
             task.content.contains("evidenceTurns"),
             "consolidator schema 缺 evidenceTurns——重判标签无证据序位指认"
+        );
+    }
+
+    /// 子计划 4 Task 3：大五 OCEAN 人格分析搭车进归并 task（不额外起 LLM 调用）。
+    /// `parse_personality` 解析 value["personality"] 的五维 facet（evidenceTurns 经
+    /// resolve_evidence 锚定，诚实置信）；缺 schema 文本即解析链断成死代码——故断真
+    /// prompt pack 文本，防 schema 漂移。OCEAN 是固定五维封闭量表，不许 LLM 自创维度。
+    #[test]
+    fn consolidator_schema_requests_ocean_personality() {
+        let specs = prompt_specs();
+        let task = specs
+            .iter()
+            .find(|s| s.key == "user.memory_consolidator.task")
+            .expect("user.memory_consolidator.task prompt spec 存在");
+        assert!(
+            task.content.contains("personality"),
+            "consolidator schema 缺 personality 段——OCEAN 人格分析无 LLM 输出"
+        );
+        for facet in [
+            "openness",
+            "conscientiousness",
+            "extraversion",
+            "agreeableness",
+            "neuroticism",
+        ] {
+            assert!(
+                task.content.contains(facet),
+                "consolidator schema 缺 OCEAN 维度 {facet}"
+            );
+        }
+        assert!(
+            task.content.contains("evidenceTurns"),
+            "personality schema 缺 evidenceTurns——人格判断无证据序位指认"
         );
     }
 }
