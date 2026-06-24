@@ -957,14 +957,35 @@ async fn run_user_operation_gateway_inner(
     .await?;
 
     // 充分性自评判定：决定直接进闸 / 升档第二程 / 澄清。
-    let tier_decision = crate::agent::sufficiency::decide_tier_escalation(
-        &decision_first,
-        &knowledge_route.knowledge_coverage,
-    );
+    let tier_decision = crate::agent::sufficiency::decide_tier_escalation(&decision_first);
 
     let (mut decision, mut promote_risks) = match tier_decision {
         crate::agent::sufficiency::TierDecision::Enough => {
             // 信息够，直接用第一程结果（多数寒暄轮命中此分支）。
+            // §2.2 自评乐观偏差观测（先观测后判罚，不强拦）：自评说够了、但本轮确实需要
+            // 产品知识且知识覆盖不足（missing/weak）时，记一条 telemetry 供日后校准自评
+            // 可靠性。**不改变档位决策**（仍走 Enough、回复照常发）；判据是窄正向匹配的纯谓词。
+            if crate::agent::sufficiency::is_coverage_optimism(
+                &decision_first,
+                &knowledge_route.knowledge_coverage,
+            ) {
+                write_event_for_account(
+                    state,
+                    &contact.account_id,
+                    Some(&contact.wxid),
+                    "ptier_coverage_optimism",
+                    "info",
+                    "第一程自评 enough 但知识覆盖不足且本轮需产品知识（观测，不拦截）",
+                    Some(doc! {
+                        "run_id": &run_id,
+                        "sufficiency": &decision_first.sufficiency,
+                        "knowledge_coverage": &knowledge_route.knowledge_coverage,
+                        "knowledge_need": &decision_first.knowledge_need,
+                    }),
+                )
+                .await
+                .ok();
+            }
             (decision_first, promote_risks_first)
         }
         crate::agent::sufficiency::TierDecision::Escalate(target_tier) => {
@@ -1002,8 +1023,15 @@ async fn run_user_operation_gateway_inner(
         }
         crate::agent::sufficiency::TierDecision::Clarify => {
             // C：信息不足需澄清。第一程已生成澄清向回复，直接用它进后续 review/finalize。
-            // 注：落成 ai_waiting_for_more_context hold 的逻辑在 Task 4/后续 reviewer 改造里接，
-            // 本任务先让澄清回复正常走 review（它本身是合法回复，只是偏澄清）。
+            // 注：是否把「need_clarification 时只输出澄清问句、不硬答」用 prompt 契约收紧，
+            // 取决于下面观测信号反映的真实硬答率（设计 §2.2 的取证前置）。本步只增强可观测性，
+            // 不改发送行为——澄清回复仍正常走 review。
+            // 观测信号（客观度量，非语义词表，agent-first）：reply_text 长度 + 是否含问号。
+            // 纯澄清问句通常短且含问号；「硬答+澄清混合」通常更长、问号在大段断言之后或缺失。
+            // 这些客观量供后续机器扫描量化硬答率，语义判断留给取证分析，不在此处用词表硬判。
+            let reply_chars = decision_first.reply_text.chars().count() as i64;
+            let has_question_mark = decision_first.reply_text.contains('?')
+                || decision_first.reply_text.contains('？');
             write_event_for_account(
                 state,
                 &contact.account_id,
@@ -1011,7 +1039,12 @@ async fn run_user_operation_gateway_inner(
                 "ptier_clarify",
                 "info",
                 "第一程判定信息不足，输出澄清向回复",
-                Some(doc! { "run_id": &run_id }),
+                Some(doc! {
+                    "run_id": &run_id,
+                    "clarification_intent": &decision_first.clarification_intent,
+                    "reply_char_count": reply_chars,
+                    "reply_has_question_mark": has_question_mark,
+                }),
             )
             .await
             .ok();

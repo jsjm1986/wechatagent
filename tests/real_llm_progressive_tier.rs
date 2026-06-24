@@ -5,7 +5,7 @@
 //! 现在是「两程循环」——
 //! 1. 第一程用【小档 Lean】瘦 prompt 生成回复候选 + 一个【充分性自评】
 //!    （`AgentDecision.sufficiency` ∈ `enough` / `need_more_context` / `need_clarification`）。
-//! 2. 纯函数 `decide_tier_escalation(&decision, knowledge_coverage)` 读自评分支：
+//! 2. 纯函数 `decide_tier_escalation(&decision)` 读自评分支：
 //!    - `Enough`   → 直接进五闸（多数寒暄轮）；
 //!    - `Escalate(tier)` → 升档第二程重生成，gateway 写一条 `agent_events`，
 //!      `kind="ptier_escalated"`，`details` 含 `run_id` + `target_tier`（gateway.rs:973）；
@@ -557,7 +557,7 @@ fn decide_tier_escalation_branches_via_public_path() {
         ..Default::default()
     };
     assert_eq!(
-        decide_tier_escalation(&enough, "enough"),
+        decide_tier_escalation(&enough),
         TierDecision::Enough,
         "sufficiency=enough 应判 Enough"
     );
@@ -569,7 +569,7 @@ fn decide_tier_escalation_branches_via_public_path() {
         ..Default::default()
     };
     assert_eq!(
-        decide_tier_escalation(&escalate_full, "missing"),
+        decide_tier_escalation(&escalate_full),
         TierDecision::Escalate(PromptTier::Full),
         "need_more_context + missing_tier=full 应判 Escalate(Full)"
     );
@@ -580,7 +580,7 @@ fn decide_tier_escalation_branches_via_public_path() {
         ..Default::default()
     };
     assert_eq!(
-        decide_tier_escalation(&clarify, "missing"),
+        decide_tier_escalation(&clarify),
         TierDecision::Clarify,
         "sufficiency=need_clarification 应判 Clarify"
     );
