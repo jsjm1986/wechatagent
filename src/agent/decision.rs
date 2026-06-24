@@ -1173,7 +1173,7 @@ pub(crate) fn format_playbook_for_prompt(playbook: &OperationPlaybook) -> String
     )
 }
 
-/// 把人工层（manual_tags）+ AI 确信层（confirmed_tags）标签渲染成 prompt 文本，
+/// 把运营录入层（manual_tags）+ AI 确信层（confirmed_tags）标签渲染成 prompt 文本，
 /// 标注来源让 LLM 自行掂量分量。两层皆空 → 空串（调用点据此决定是否注入该段）。
 pub(crate) fn render_tags_for_prompt(
     manual: &[String],
