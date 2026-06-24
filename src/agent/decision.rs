@@ -179,6 +179,7 @@ pub(crate) async fn decide_reply(
         knowledge_route,
         rewrite_instruction,
         run_id,
+        crate::agent::sufficiency::PromptTier::Full,
     )
     .await?;
     Ok(decision)
@@ -279,7 +280,11 @@ pub(crate) async fn decide_reply_with_promote(
     knowledge_route: &KnowledgeRouteResult,
     rewrite_instruction: Option<&str>,
     run_id: Option<&str>,
+    tier: crate::agent::sufficiency::PromptTier,
 ) -> AppResult<(AgentDecision, Vec<String>)> {
+    // 渐进式三档（2026-06-23）：tier 参数已接入，本阶段三档暂同等全量注入
+    // （保持现状行为）；后续任务按 tier 裁剪关系类/业务类槽位。恒注入集恒满注入。
+    let _ = tier; // TODO(Task 2 后续): 按 tier 裁剪槽位分组
     // universal-domain-adaptation H2 + H9 + H3 + H12：加载本 workspace 当前生效的
     // DomainProfile（无配置时 = DEFAULT 销售域兜底，逐字等价历史行为）。一次加载、
     // 多处复用：① H3 prompt_fragment 注入系统提示的「业务上下文」层；② H9
