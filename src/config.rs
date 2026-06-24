@@ -18,6 +18,10 @@ pub struct AppConfig {
     pub default_account_id: String,
     pub agent_recent_message_limit: i64,
     pub agent_min_reply_interval_seconds: i64,
+    /// 账号级最小发送间隔闸：同账号相邻两次发送的最小间隔下界（毫秒）。
+    pub account_send_min_interval_ms: i64,
+    /// 账号级最小发送间隔闸：上界（毫秒）。实际间隔在 [min,max] 间随机。
+    pub account_send_max_interval_ms: i64,
     /// #68：单条出站消息软上限字符数。回复超过此长度时按句末标点就近切分成多条短消息,
     /// 更贴微信即时通讯习惯。默认 120。
     pub agent_reply_max_segment_chars: usize,
@@ -405,6 +409,8 @@ impl AppConfig {
             agent_recent_message_limit: env_or("AGENT_RECENT_MESSAGE_LIMIT", "12").parse()?,
             agent_min_reply_interval_seconds: env_or("AGENT_MIN_REPLY_INTERVAL_SECONDS", "20")
                 .parse()?,
+            account_send_min_interval_ms: env_or("ACCOUNT_SEND_MIN_INTERVAL_MS", "1000").parse()?,
+            account_send_max_interval_ms: env_or("ACCOUNT_SEND_MAX_INTERVAL_MS", "4000").parse()?,
             agent_reply_max_segment_chars: env_or("AGENT_REPLY_MAX_SEGMENT_CHARS", "120")
                 .parse::<usize>()?
                 .max(1),
