@@ -539,6 +539,68 @@ async fn p3_ambiguous_message_may_clarify() {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
+// P4 · 产品问询 + 知识库 missing → 期望强升 Full（ptier_forced_full，软断言 + 观测）
+// ════════════════════════════════════════════════════════════════════════════
+
+/// 客户问产品/价格，但第一程小档自评 `enough`（自以为够了）而知识库无对应切片
+/// （coverage=missing）且本轮需产品知识时，gateway 应**强升 Full** 重生成，写
+/// `ptier_forced_full` 事件（details 含 run_id / knowledge_coverage / knowledge_need）。
+///
+/// 真模型不保证每次都「自评 enough 但 coverage missing」——产品轮更常见是自评
+/// need_more_context（走 ptier_escalated，见 p2）。故本测试**软断言 + eprintln 观测**：
+/// 拿到 ptier_forced_full 则校验形状，没拿到只 warn 不 panic（避免真模型正常抖动假红）。
+#[tokio::test]
+#[ignore]
+async fn p4_product_inquiry_missing_coverage_forces_full() {
+    let llm = require_real_llm!();
+    let app = TestApp::start().await;
+    let mcp_server = start_mcp_mock_success().await;
+    let state = common::rebuild_app_state_with_real_llm(&app, llm, mcp_server.uri());
+
+    let contact = managed_contact("real_ptier_user_forcefull");
+    state.db.contacts().insert_one(&contact, None).await.expect("insert contact");
+
+    let inbound = make_inbound(
+        &contact,
+        "real_ptier_msg_forcefull",
+        "你们这个产品到底能解决什么问题？给我说说就行。",
+    );
+    state.db.messages().insert_one(&inbound, None).await.expect("insert inbound");
+
+    unwrap_or_skip_transient!(
+        handle_managed_message(&state, contact.clone(), &inbound).await,
+        "产品问询强升轮链路必须 Ok"
+    );
+
+    // 软断言：拿到强升事件则校验 details 含非空 run_id；没拿到只 warn——真模型本轮可能
+    // 自评 need_more_context（走 escalate）或 enough+coverage 非 missing，不判罚。
+    match find_ptier_event(&state, &contact.wxid, "ptier_forced_full").await {
+        Some(ev) => {
+            let details = ev.details.unwrap_or_default();
+            let run_id = details.get_str("run_id").unwrap_or("<none>");
+            assert!(
+                !run_id.is_empty() && run_id != "<none>",
+                "ptier_forced_full 事件 details 必须含非空 run_id，实际 details={details:?}"
+            );
+            let coverage = details.get_str("knowledge_coverage").unwrap_or("<none>");
+            eprintln!(
+                "[p4] 强升 Full 命中：run_id={run_id:?} knowledge_coverage={coverage:?}（符合预期）"
+            );
+        }
+        None => {
+            eprintln!(
+                "[p4][观测] 产品问询轮未出现 ptier_forced_full——真模型本轮可能自评 need_more_context\
+                 （走 ptier_escalated）或 coverage 非 missing，强升三条件未同时满足（软断言不判罚）"
+            );
+            // 顺带观测是否走了升档（产品轮更常见路径）。
+            if let Some(ev) = find_ptier_event(&state, &contact.wxid, "ptier_escalated").await {
+                eprintln!("[p4][观测] 本轮改走了 ptier_escalated：details={:?}", ev.details);
+            }
+        }
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
 // 纯函数分支测试（不需要 LLM / Docker，本地 cargo test 即可跑）
 // ════════════════════════════════════════════════════════════════════════════
 
