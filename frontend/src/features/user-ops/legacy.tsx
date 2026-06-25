@@ -2010,7 +2010,7 @@ export function PlannerViewSection({ contact }: { contact: Contact | null }) {
   const stageRaw = (() => {
     const attrs = contact.domainAttributes;
     if (!attrs || typeof attrs !== "object") return "";
-    const stage = (attrs as Record<string, unknown>).stage;
+    const stage = (attrs as Record<string, unknown>).customer_stage;
     return typeof stage === "string" ? stage : "";
   })();
   // 走字典翻译：英文 canonical → 中文 display_name；按 status 分流渲染（见下方 stageNode）。
