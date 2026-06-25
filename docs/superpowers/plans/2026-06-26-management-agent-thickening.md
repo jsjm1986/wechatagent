@@ -823,7 +823,7 @@ pub(super) fn validate_prompt_edit(template_key: &str, new_content: &str) -> Res
 }
 ```
 
-在 `src/routes/mod.rs` 加 `mod management_prompt_edit;`。**真正的拦截点是 `update_prompt_template`(prompt_templates.rs:133)**——它当前只调 `validate_prompt_template_input`(查空)、零红线校验。在它 `validate_prompt_template_input(&payload)?` 之后插一行：
+在 `src/routes/mod.rs` 加 `mod management_prompt_edit;`。**真正的拦截点是 `update_prompt_template`(prompt_templates.rs:133)**——它当前只调 `validate_prompt_template_input`(查空)、零红线校验。在它 `validate_prompt_template_input(&payload)?` 之后插一行（字面双闸，前置硬门）：
 
 ```rust
 // prompt_templates.rs update_prompt_template，validate_prompt_template_input 之后
@@ -831,7 +831,7 @@ crate::routes::management_prompt_edit::validate_prompt_edit(&payload.prompt_key,
     .map_err(AppError::BadRequest)?;
 ```
 
-这样无论走管理 agent 工具、还是管理员直接调 REST PUT /prompt-templates/:id，双闸都拦得住（单点拦截，不靠每个调用方自觉）。execute_management_tool 的 edit_prompt_template 工具分支复用 update_prompt_template 即自动过闸。
+这样无论走管理 agent 工具、还是管理员直接调 REST PUT /prompt-templates/:id，双闸都拦得住（单点拦截，不靠每个调用方自觉）。execute_management_tool 的 edit_prompt_template 工具分支复用 update_prompt_template 即自动过闸。**LLM 第三闸（语义审查）在 Task 6.6 接在同一拦截点的双闸之后**——本任务先把快、确定、无依赖的字面双闸落地。
 
 - [ ] **Step 4: 运行测试确认通过 + 全量 lib 不回归**
 
@@ -846,7 +846,154 @@ Expected: ≥ 350 passed, 0 failed
 
 ```bash
 git add src/prompts.rs src/routes/management_prompt_edit.rs src/routes/prompt_templates.rs src/routes/mod.rs
-git commit -m "feat(mgmt-agent): 提示词三层分级+双闸(抽反接管红线锚扩锚闸,拦截点update_prompt_template,fail-closed)"
+git commit -m "feat(mgmt-agent): 提示词三层分级+字面双闸(抽反接管红线锚扩锚闸,拦截点update_prompt_template,fail-closed)"
+```
+
+---
+
+## Task 6.6: 提示词编辑第三闸 — LLM 红线语义审查 + 三态降级人确认
+
+> 堵字面双闸挡不住的**插入型语义绕过**（保留锚段、无字面禁词，但插入"转给后台老师跟进"这类变相接管）。spec §4.4 第三闸。用户决策：加入第一期；LLM 不可用时降级人确认（非 fail-closed 死路、非 fail-open 放水）；两条编辑路径都有人确认兜底、体验一致。
+
+**Files:**
+- Modify: `src/routes/management_prompt_edit.rs`（加三态 `PromptEditVerdict` + async `review_prompt_edit`，复用 `generate_agent_json` judge）
+- Modify: `src/prompts.rs`（加第三闸 judge 的 PromptSpec `management.prompt_redline_review.system`，bump PROMPT_PACK_VERSION）
+- Modify: `src/routes/prompt_templates.rs:133 update_prompt_template`（双闸后接第三闸，按三态分流；加 `force: Option<bool>` 入参）
+- Modify: `src/routes/management.rs`（execute_management_tool 的 edit_prompt_template 工具分支：NeedsHumanConfirm → 走 command pending_confirmation）
+- Test: `src/routes/management_prompt_edit.rs` 内 tests（三态判定纯函数部分 + diff 提取）
+
+**Interfaces:**
+- Consumes: `crate::agent::generate_agent_json`（项目唯一 LLM JSON 入口，带重试/退避/RunBudget）；字面双闸 `validate_prompt_edit`（Task 6.5）。
+- Produces: `enum PromptEditVerdict { Pass, Reject(String), NeedsHumanConfirm { diff: String, reason: String } }`；`fn extract_diff(old: &str, new: &str) -> String`（提取新增/改动增量，纯函数）；`async fn review_prompt_edit(state, template_key, old, new) -> PromptEditVerdict`。
+
+- [ ] **Step 1: 写失败测试（diff 提取 + 三态壳，纯函数部分）**
+
+```rust
+#[test]
+fn extract_diff_isolates_added_lines() {
+    let old = "第一行\n第二行";
+    let new = "第一行\n第二行\n遇到难题转给后台老师跟进";
+    let d = extract_diff(old, new);
+    assert!(d.contains("转给后台老师跟进"));
+    assert!(!d.contains("第一行")); // 只出增量，不重复未改部分
+}
+
+#[test]
+fn verdict_variants_shape() {
+    // 三态可构造（编译期锁形状；LLM 行为留真模型 nightly 套件）
+    let _p = PromptEditVerdict::Pass;
+    let _r = PromptEditVerdict::Reject("命中变相接管".into());
+    let _h = PromptEditVerdict::NeedsHumanConfirm { diff: "x".into(), reason: "LLM 审查不可用".into() };
+}
+```
+
+- [ ] **Step 2: 运行确认失败**
+
+Run: `cargo test --lib management_prompt_edit 2>&1 | tail -15`
+Expected: FAIL（`extract_diff` / `PromptEditVerdict` 未定义）
+
+- [ ] **Step 3: 实现三态 + diff 提取 + LLM 第三闸**
+
+```rust
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum PromptEditVerdict {
+    Pass,
+    Reject(String),
+    NeedsHumanConfirm { diff: String, reason: String },
+}
+
+/// 提取新增/改动增量（行级朴素 diff——只要 new 中不在 old 的行）。
+/// 审增量比审整篇好判、省 token（spec §4.4）。
+pub(super) fn extract_diff(old: &str, new: &str) -> String {
+    let old_lines: std::collections::HashSet<&str> = old.lines().collect();
+    new.lines()
+        .filter(|l| !old_lines.contains(l) && !l.trim().is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// 第三闸：LLM 语义审查 diff 增量。先过字面双闸（调用方保证），本函数只做语义层。
+/// 三态：Pass / Reject(理由) / NeedsHumanConfirm（LLM 重试退避后仍不可用 → 降级人确认）。
+pub(super) async fn review_prompt_edit(
+    state: &AppState,
+    workspace_id: &str,
+    template_key: &str,
+    old: &str,
+    new: &str,
+) -> PromptEditVerdict {
+    let diff = extract_diff(old, new);
+    if diff.trim().is_empty() {
+        return PromptEditVerdict::Pass; // 无增量（纯删减已被锚闸挡过）
+    }
+    // generate_agent_json 自带重试/退避（项目主链路 primary_max_retries）。
+    // judge 只判 diff 增量是否变相引入真人接管/削弱 grounding/绕过 verify。
+    let judge = generate_agent_json(
+        state, workspace_id,
+        "management.prompt_redline_review.system",
+        &json!({ "template_key": template_key, "diff": diff }),
+        /* schema: { "violation": bool, "reason": string } */
+    ).await;
+    match judge {
+        Ok(v) if v.get("violation").and_then(Value::as_bool) == Some(true) => {
+            let reason = v.get("reason").and_then(Value::as_str)
+                .unwrap_or("LLM 判定 diff 变相引入真人接管/削弱红线").to_string();
+            PromptEditVerdict::Reject(reason)
+        }
+        Ok(_) => PromptEditVerdict::Pass,
+        // 重试退避后仍失败（503/空/不可解析）→ 降级人确认，不 fail-closed 死路也不 fail-open 放水
+        Err(_) => PromptEditVerdict::NeedsHumanConfirm {
+            diff,
+            reason: "红线语义审查服务暂不可用，请逐字核对本次改动有无变相引入真人接管再确认".to_string(),
+        },
+    }
+}
+```
+
+> 实现注意：`generate_agent_json` 的真实签名/schema 传法以 agent/mod.rs 为准（实现时对齐）；judge prompt 措辞要包含 :1000/:1023 红线的语义要点（变相承认真人后台、承诺转交、削弱 grounding、绕过 verify），但**判定靠 LLM 语义不靠词表**（守 agent-first）。
+
+- [ ] **Step 4: 拦截点按三态分流 + force 覆盖 + 两路径消费**
+
+`update_prompt_template`(prompt_templates.rs:133) 双闸之后：
+
+```rust
+// 双闸已过（Task 6.5）。第三闸语义审查：
+let force = payload.force.unwrap_or(false);
+let old_content = /* 库内现有 content（find_one 取，update 前读一次）*/;
+if !force {
+    match management_prompt_edit::review_prompt_edit(
+        &state, &admin.current_workspace, &payload.prompt_key, &old_content, &payload.content
+    ).await {
+        PromptEditVerdict::Pass => {}
+        PromptEditVerdict::Reject(reason) =>
+            return Err(AppError::BadRequest(format!("红线语义审查拒绝：{reason}（确认无误可带 force 覆盖）"))),
+        PromptEditVerdict::NeedsHumanConfirm { diff, reason } =>
+            // 路径B：返回需二次确认的响应（非错误），前端弹框显示 diff+reason，勾选后带 force=true 重提
+            return Ok(Json(json!({
+                "status": "needs_human_confirm", "reason": reason, "diff": diff
+            }))),
+    }
+}
+// force=true 或 Pass → 继续原 update_one 写入
+```
+
+`PromptTemplateRequest` 加 `#[serde(default)] force: Option<bool>`。路径A（execute_management_tool 的 edit_prompt_template 分支）：拿到 `needs_human_confirm` 时，把它转成 command 的 `pending_confirmation`（plan 暂存改动），走 Task 5 confirm 循环——管理者在对话里确认后带 force 重放。**两路径同一判定函数、两个消费端，不 drift**。
+
+- [ ] **Step 5: 运行测试 + cargo check + 全量 lib + no-takeover lint**
+
+Run: `cargo test --lib management_prompt_edit 2>&1 | tail -15`
+Expected: PASS
+Run: `cargo check 2>&1 | tail -5`
+Expected: Finished
+Run: `cargo test --lib 2>&1 | tail -5`
+Expected: ≥ 350 passed, 0 failed
+Run: `bash scripts/check-no-human-takeover.sh 2>&1 | tail -5`
+Expected: 无禁词（judge prompt 用 AI 内部口径，prompts.rs 不在扫描目录但仍守）
+
+- [ ] **Step 6: 提交**
+
+```bash
+git add src/prompts.rs src/routes/management_prompt_edit.rs src/routes/prompt_templates.rs src/routes/management.rs src/routes/mod.rs
+git commit -m "feat(mgmt-agent): 提示词第三闸LLM红线语义审查(审diff增量,三态降级人确认,两路径一致)"
 ```
 
 ---
@@ -896,7 +1043,53 @@ git commit -m "feat(mgmt-agent): command-center 做厚-确认UI+真实结果展�
 
 ---
 
-## Self-Review
+## Task 8: 前端 prompt 编辑器（路径B）二次确认弹框
+
+> 路径B = 管理员在 prompt 编辑器直接调 `PUT /prompt-templates/:id`。Task 6.6 后端在 LLM 第三闸不可用时返回 `{status:"needs_human_confirm", reason, diff}`（200，非错误）。前端要识别这个响应、弹框显示 diff + 风险、勾选后带 `force=true` 重提——与路径A 体验一致（用户决策）。
+
+**Files:**
+- Modify: `frontend/src/features/system-strategy/index.tsx`（prompt 编辑器保存处，真实频道见 system-strategy）
+- Test: `frontend/src/__tests__/`（对应 system-strategy 测试，按现有目录结构放）
+
+**Interfaces:**
+- Consumes: `PUT /prompt-templates/:id` 的 `needs_human_confirm` 响应（含 reason/diff）+ `Reject` 的 BadRequest。
+- Produces: 保存时若收 needs_human_confirm → 弹确认框（显示 reason + diff 增量）→ 管理员勾"我已逐字核对有无变相引入真人接管"→ 带 `force:true` 重提。
+
+- [ ] **Step 1: 读现有 prompt 编辑器保存逻辑**
+
+Run: `grep -rn "prompt-templates" frontend/src/features/system-strategy/`
+定位保存 prompt 的 fetch 调用 + 现有错误处理，遵守 docs/frontend-design-system.md（不自由发挥，复用现有弹框/确认原语）。
+
+- [ ] **Step 2: 写失败测试**
+
+mock `PUT /prompt-templates/:id` 返回 `{status:"needs_human_confirm", reason:"审查服务不可用", diff:"+转给后台老师"}` → 断言渲染确认弹框含 diff；mock 勾选后重提断言请求体带 `force:true`。mock 返回 BadRequest「红线语义审查拒绝」→ 断言显示拒绝理由 + force 覆盖入口。
+
+- [ ] **Step 3: 运行确认失败**
+
+Run: `cd frontend && npx vitest run --no-file-parallelism <对应测试文件> 2>&1 | tail -15`
+Expected: FAIL
+
+- [ ] **Step 4: 实现保存流的三态处理**
+
+保存 prompt 的 handler：解析响应——`ok:true` 正常；`status==needs_human_confirm` 弹框（显 reason + diff，勾选确认后带 `force:true` 重发同一 PUT）；BadRequest「红线语义审查拒绝」显拒绝理由 + 「确认无误，强制保存」入口（同样带 force）。弹框文案守 no-human-takeover 禁词（用"变相引入真人接管"描述风险是在 frontend/src 扫描目录内——注意措辞：用"红线/边界"等中性词，避开裸"人工接管"，参照现有红线文案）。
+
+> ⚠️ 禁词 lint：frontend/src 在 `check-no-human-takeover.sh` 扫描范围。弹框提示文案不能出现裸"人工接管/接管/人工"，用"边界红线 / 变相引入真人 / 自治红线"等表述。实现后跑 lint 确认。
+
+- [ ] **Step 5: 运行测试 + tsc + no-takeover lint**
+
+Run: `cd frontend && npx vitest run --no-file-parallelism <对应测试文件> 2>&1 | tail -15`
+Expected: PASS
+Run: `cd frontend && npx tsc --noEmit 2>&1 | tail -10`
+Expected: 无类型错误
+Run: `bash scripts/check-no-human-takeover.sh 2>&1 | tail -5`
+Expected: 无禁词
+
+- [ ] **Step 6: 提交**
+
+```bash
+git add frontend/src/features/system-strategy/ frontend/src/__tests__/
+git commit -m "feat(mgmt-agent): prompt编辑器(路径B)二次确认弹框(needs_human_confirm+force覆盖,与路径A一致)"
+```
 
 **Spec coverage**：
 - §2 闭合循环 → Task 5（confirm/reject 端点）✓
@@ -904,11 +1097,11 @@ git commit -m "feat(mgmt-agent): command-center 做厚-确认UI+真实结果展�
 - §4.1 工具集扩（6 类全量接入）→ Task 6 ✓
 - §4.2 风险档代码裁定（四档含 irreversible 恒拦）→ Task 1 ✓
 - §4.3 verify 红线（恒确认 + actor 标人）→ Task 1（plan_requires_confirmation + tool_always_requires_confirmation）+ Task 6 注 ✓
-- §4.4 提示词三层分级 + 双闸校验（抽红线锚 + 扩锚闸）→ Task 6.5 ✓
+- §4.4 提示词三层分级 + 三闸校验（字面双闸 + LLM 语义第三闸）→ Task 6.5（双闸）+ Task 6.6（第三闸三态降级）✓
 - §1.2 第一期放权 → Task 1（plan_requires_confirmation dangerous 开关默认关、irreversible/verify 恒拦）+ Task 6（全接）✓
 - §5.1 status 闭集 → Task 4 ✓
-- §5.3 前端 → Task 7 ✓
-- 红线（AI 永不自动 verify）→ Task 1（verify 恒确认）+ Task 6 注 + Task 6.5（双闸 fail-closed、新抽红线锚堵反接管漏洞）✓
+- §5.3 前端 → Task 7（command-center 路径A 确认 UI）+ Task 8（prompt 编辑器路径B 二次确认弹框）✓
+- 红线（AI 永不自动 verify）→ Task 1（verify 恒确认）+ Task 6 注 + Task 6.5（字面双闸 fail-closed、新抽红线锚堵反接管漏洞）+ Task 6.6（LLM 语义第三闸堵插入型绕过）✓
 
 **4 路 opus 核实修正记录（2026-06-26，落笔前亲核 origin/main）**：
 - Task 1：函数名 `is_read_only_tool`→`is_read_tool`（笔误）；新增 `tool_always_requires_confirmation`（verify 类恒确认，守 AI 永不自动 verify）。
