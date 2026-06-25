@@ -2097,6 +2097,8 @@ function DomainProfilePanel({ busy }: { busy: boolean }) {
           {generateResult && (
             <div className={styles.profileGenerateSuccess}>
               ✅ 候选配置已生成！可在「已有配置」列表中找到 v1 草稿，逐项审核后 publish + activate。
+              <br />
+              如本次为新行业，AI 同时生成了取值字典候选（客户阶段 / 意向等级等维度的中文标签），需在本频道「新词候选审核」面板逐条采纳后，运营看板才会把这些维度显示为中文，否则将灰显英文原值。
             </div>
           )}
           <div className={styles.buttonRow}>
