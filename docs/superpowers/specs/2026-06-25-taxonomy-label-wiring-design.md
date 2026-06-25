@@ -69,6 +69,8 @@ generate_domain_profile_candidate 生成维度时
 
 **目标**：决策时把维度的合法取值（带中文名）注入 prompt，让 AI 判得准、命中字典；无字典时明确告知"暂无受控取值"。
 
+**范围**：流 A 只做 **extra 维度**（domainSignals 容器里、`participates_in_decision` 且非 typed 的维度），改 `render_decision_dimensions_guidance` 纯 Rust 函数。**typed 维度**（customer_stage / intent_level 等，取值指引散在 prompts.rs Soul/方法论/对话模式判定散文里）的行业化不在流 A——走 §6.5 的 profile override 生成路径（不改销售散文，复用已有 override 整段替换机制）。
+
 ### 4.1 TaxonomyCache 加 display_name（taxonomy.rs）
 
 - `CachedEntry`（:79）增加 `display_name: String` 字段；reload 填充处（:144 区域）从 `entry.value.display_name` 填入（现在被丢弃）。
@@ -192,11 +194,25 @@ profile 候选落库后，遍历各维度 `suggestedValues`，对每个值调已
 
 取值生成是 profile 生成的**附加产物**：若 AI 没给 `suggestedValues` 或格式不对，profile 照常落库（维度声明仍在），只是没初始候选，运营手配或运行时生长兜底。不因取值生成失败阻断 profile 生成（仿 guide_profile 现有 `coerce_scalar_string_fields` 软化风格）。
 
-### 6.5 测试
+### 6.5 typed 维度行业化：生成 override（不改销售散文）
+
+**问题**：customer_stage / intent_level 等 **typed 维度**的取值指引不在 `render_decision_dimensions_guidance`（那只管 domainSignals 的 extra 维度），而是散落在 `prompts.rs` 的 Soul / 方法论 / 对话模式判定 prompt 模板里，用销售词硬编码（prompts.rs:498 stage_method「陌生接触/需求探索/方案评估…」、:798 Soul 取值举例、:986「customer_stage ∈ {方案匹配,异议处理…} → consultative」）。这些是 **DEFAULT 销售域兜底**，且取值与业务规则焊死——直接改散文换词会破坏 DEFAULT、且治标不治本（类 2/类 3 取值嵌在规则里）。
+
+**更优解（已与用户确认）**：typed 维度行业化**不改 prompts.rs 散文**，而是复用**已存在的 profile override 整段替换机制**，把它并进 AI 生成：
+
+- 已有机制（引擎零改动）：`soul_override`（decision.rs:292 整体替换出厂人格）、`methodology_override`（decision.rs:370 整体替换运营方法论 / stage_method）、`conversation_mode_policy` override（domain_profile.rs:307 `strip_conversation_mode_section` 剥离销售判定段 + :331 `apply_conversation_mode_policy` 注入本行业规则）。
+- 改造：`generate_domain_profile_candidate` 的 prompt schema 增产 `soulOverride` / `methodologyOverride` / `conversationModePolicy` 三段（现状落 serde default → 即不生成）。AI 据行业描述生成本行业的人格本体、阶段方法论、对话模式判定规则——typed 维度的取值语义 + 驱动规则自然包含其中。
+- DEFAULT 销售域：override=None（现有 DEFAULT_PROFILE 行为不变）→ 走 prompts.rs 销售兜底，**字节等价不回归**。
+- 非销售行业：激活自己的 profile → 三个 override 整段替换销售散文 → AI 看到本行业的阶段取值 + 判定规则。
+
+**红线**：这三段 override 仍随 profile 走 `is_active=false` 候选 + 人审 publish/activate（现有红线）。生成是附加产物，缺失则该字段 None 回落销售兜底（软化，§6.4 同款）。
+
+### 6.6 测试
 
 - schema 解析：含 `suggestedValues` 的生成输出能正确解析（仿 guide_profile 现有 coerce 测试 :460 区域）。
 - 候选落库：生成后 `taxonomy_candidate` 有对应条目（集成测试，标 `#[ignore]` 需 Docker）。
 - 软化：缺 `suggestedValues` 时 profile 仍落库不 panic（单测）。
+- override 生成：含 `soulOverride` / `methodologyOverride` / `conversationModePolicy` 的生成输出正确解析落 profile 字段；缺失时落 None（单测）。
 
 ## 7. 代码落点汇总
 
@@ -210,7 +226,7 @@ profile 候选落库后，遍历各维度 `suggestedValues`，对每个值调已
 | `frontend/src/stores/profileStore.ts` | 数据源换运营态端点 + 加 taxonomies/dimensions + `labelFor` | B |
 | `frontend/src/features/user-ops/legacy.tsx` | stageLabel + relationship 下拉走 labelFor | B |
 | `frontend/src/features/knowledge/trustTypes.ts` | completeness 五维走 dimensions | B |
-| `src/routes/guide_profile.rs` | schema 加 suggestedValues + 落候选 | C |
+| `src/routes/guide_profile.rs` | schema 加 suggestedValues + 落候选；schema 加 soulOverride/methodologyOverride/conversationModePolicy 三段生成（typed 维度行业化，§6.5） | C |
 
 ## 8. 错误处理
 
