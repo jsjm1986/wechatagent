@@ -61,6 +61,33 @@ describe("parseCompleteness", () => {
     expect(v.answeringModeLabels.product_safe).toBe("可安全讲产品"); // 逐档回落
     expect(v.answeringModeLabels.fully_supported).toBe("可深聊任何话题");
   });
+
+  it("M4：dimensionList 优先用后端(非写死销售五维)", () => {
+    const raw = {
+      dimensionList: [
+        { key: "consultation_stage", label: "咨询阶段", verifiedFact: true, methodologyOnly: false, pendingDraft: false, state: "verified" },
+      ],
+      coverage: {}, answeringMode: "relationship_only",
+    };
+    const view = parseCompleteness(raw);
+    expect(view.dimensionList.map((d) => d.label)).toEqual(["咨询阶段"]);
+    expect(view.dimensionList[0].key).toBe("consultation_stage");
+    expect(view.dimensionList[0].verifiedFact).toBe(true);
+    expect(view.dimensionList[0].state).toBe("verified");
+  });
+
+  it("M4：后端无 dimensionList 时回落写死五维(DIM_ORDER 兜底)", () => {
+    const view = parseCompleteness({ coverage: {}, answeringMode: "relationship_only" });
+    expect(view.dimensionList.length).toBe(5);
+    expect(view.dimensionList.map((d) => d.key)).toEqual([
+      "capability", "pricing", "caseEvidence", "effectClaims", "deliveryBoundary",
+    ]);
+  });
+
+  it("M4：后端 dimensionList 为空数组时也回落写死五维", () => {
+    const view = parseCompleteness({ dimensionList: [], coverage: {}, answeringMode: "relationship_only" });
+    expect(view.dimensionList.length).toBe(5);
+  });
 });
 
 describe("parseIntegrityReport", () => {
