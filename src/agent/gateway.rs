@@ -965,10 +965,20 @@ async fn run_user_operation_gateway_inner(
     // 充分性自评判定：决定直接进闸 / 升档第二程 / 澄清。
     let tier_decision = crate::agent::sufficiency::decide_tier_escalation(&decision_first);
 
-    // 块B：预求值升档标志(供 match 后 used_knowledge_ids 口径判断,避免 tier_decision 被 match 消费后作用域问题)。
+    // 块B：预求值升档标志(供 match 后 run tier 元信息与 used_knowledge_ids 口径判断,
+    // 避免 tier_decision 被 match 消费后作用域问题)。
+    // escalated=是否升档(含 Relational/Full,供 ptier_run_tier 记档位);
+    // escalated_to_full=是否升到 **Full**(仅 Full 注入业务知识 include_business=matches!(tier,Full),
+    // decision.rs:297)——used_knowledge_ids 口径只认这个,Relational 升档与 Lean 同样没读切片不记 id。
     let escalated = matches!(
         tier_decision,
         crate::agent::sufficiency::TierDecision::Escalate(_)
+    );
+    let escalated_to_full = matches!(
+        tier_decision,
+        crate::agent::sufficiency::TierDecision::Escalate(
+            crate::agent::sufficiency::PromptTier::Full
+        )
     );
 
     // 块B-①对称观测:第一程 sufficiency 落到 _=> 兜底(空/乱值)=静默降级,记一条供发现(不拦)。
@@ -1176,10 +1186,11 @@ async fn run_user_operation_gateway_inner(
     normalize_decision_runtime(&mut decision, &planner);
     decision.context_pack_version = Some(next_memory_card_version(&memory));
     // ⑤口径修正:Lean/Relational 都不注入业务知识(include_business=matches!(tier,Full),decision.rs:297)。
-    // 若 Lean-Enough 决策记了路由命中 id,会架空 grounding 硬闸(取 used∩verified 非空即放行——
-    // 它没读过任何切片却记了路由 id=误当"Agent 读过")。仅当本决策确实经知识档(forced_full=Full,
-    // 或 escalated=升档第二程)时才记路由 id;纯 Lean-Enough / Clarify(Lean)不记。
-    if forced_full || escalated {
+    // 若没读切片的决策记了路由命中 id,会架空 grounding 硬闸(取 used∩verified 非空即放行——
+    // 没读过任何切片却记了路由 id=误当"Agent 读过")。仅当本决策确实经 **Full** 知识档
+    // (forced_full=强升Full,或 escalated_to_full=升档到Full)时才记路由 id;
+    // 纯 Lean-Enough / Clarify(Lean) / 升到 Relational(同样 include_business=false)都不记。
+    if forced_full || escalated_to_full {
         decision.used_knowledge_ids = route_used_knowledge_ids(&knowledge_route);
     }
     let _ = &mut promote_risks;
