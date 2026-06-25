@@ -124,23 +124,51 @@ pub struct TestApp {
 }
 
 impl TestApp {
-    /// 启动一个新的 testcontainers MongoDB + AppState。
+    /// 启动一个新的 testcontainers MongoDB（standalone）+ AppState。
     ///
     /// 每次调用都用独立 database 名（带 UUID），互不干扰。
     pub async fn start() -> Self {
+        Self::start_inner(false).await
+    }
+
+    /// 启动一个 replica-set 模式的 MongoDB + AppState。
+    ///
+    /// 多文档事务（`start_transaction` / `commit_with_session`）只能在 replica set
+    /// 上提交——standalone mongod 会报 "does not support retryable writes"、无法 commit。
+    /// 仅走事务路径的集成测试（如 `evolution::release::rollback_prompt`）需要它；
+    /// 其余测试用启动更快的 standalone [`start`]。
+    pub async fn start_repl_set() -> Self {
+        Self::start_inner(true).await
+    }
+
+    async fn start_inner(repl_set: bool) -> Self {
         use testcontainers::runners::AsyncRunner;
 
         // best-effort 设置 APP_STARTED_AT；多次调用时 set 失败可忽略，因为
         // OnceCell 一旦填充即不可变。
         let _ = wechatagent::APP_STARTED_AT.set(mongodb::bson::DateTime::now());
 
-        let container = Mongo::default().start().await.expect("启动 mongo 容器失败");
+        let container = if repl_set {
+            Mongo::repl_set()
+                .start()
+                .await
+                .expect("启动 mongo replica set 容器失败")
+        } else {
+            Mongo::default().start().await.expect("启动 mongo 容器失败")
+        };
         let host = container.get_host().await.expect("获取容器 host 失败");
         let port = container
             .get_host_port_ipv4(27017)
             .await
             .expect("获取容器端口失败");
-        let uri = format!("mongodb://{host}:{port}");
+        // 单节点 replica set 必须带 directConnection=true：否则驱动会按 RS 拓扑做
+        // server discovery，连到 rs.initiate() 在容器内 advertise 的 hostname（宿主不可达）
+        // → 连接挂起 / 超时。directConnection 强制单服务器直连，事务仍可在 RS 成员上提交。
+        let uri = if repl_set {
+            format!("mongodb://{host}:{port}/?directConnection=true")
+        } else {
+            format!("mongodb://{host}:{port}")
+        };
         let db_name = format!("wechatagent_test_{}", uuid::Uuid::new_v4().simple());
 
         let db = Database::connect(&uri, &db_name)

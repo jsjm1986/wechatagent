@@ -220,6 +220,10 @@ async fn align_skips_keys_with_evolution_release_chain() {
     let mut evo = make_user_template(&workspace, &key, "active");
     evo.seeded_by = Some("evolution_release".to_string());
     evo.current_version = true;
+    // make_user_template 默认 version=1，与该 key 已 seed 的 system 行 version=1 在唯一索引
+    // (workspace_id, prompt_key, version) 上撞 E11000；evolution release 出来的行本就是更高
+    // 版本，这里设 2 避让。align 的 evolution 守卫按 seeded_by 识别、不看 version。
+    evo.version = 2;
     evo.content = "EVOLUTION_TUNED_CONTENT".to_string();
     app.state.db.prompt_templates().insert_one(&evo, None).await.unwrap();
 
