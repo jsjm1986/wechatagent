@@ -11,7 +11,7 @@ use wechatagent::models::PromptTemplate;
 #[tokio::test]
 #[ignore]
 async fn rollback_restores_archived_previous_to_active() {
-    let app = common::TestApp::start().await;
+    let app = common::TestApp::start_repl_set().await;
     let workspace = app.state.config.default_workspace_id.clone();
     let key = "user.rollback.test_key";
 
