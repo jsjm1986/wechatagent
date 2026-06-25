@@ -753,7 +753,8 @@ pub(super) async fn execute_management_tool(
                 "agent_profile": to_bson(&generated.agent_profile)?,
                 "playbook_id": playbook.id,
                 "playbook_version": playbook.version,
-                "tags": generated.tags,
+                // T8：裸 `tags` 字段已废弃（Contact 不再有该字段），不再写孤儿键。
+                // AI 画像标签归 confirmed_tags（子计划2），此处只保留非标签画像字段。
                 "profile_attributes": generated.profile_attributes,
                 "profile_updated_at": DateTime::now(),
                 "updated_at": DateTime::now(),
@@ -901,33 +902,42 @@ pub(super) async fn execute_management_tool(
         }
         "wechatagent.update_contact_profile" => {
             let contact = resolve_contact_arg(state, workspace_id, account_id, &planned.arguments).await?;
-            let tags = planned
-                .arguments
-                .get("tags")
-                .and_then(Value::as_array)
-                .map(|items| {
-                    items
-                        .iter()
-                        .filter_map(Value::as_str)
-                        .map(str::trim)
-                        .filter(|item| !item.is_empty())
-                        .map(ToString::to_string)
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_default();
+            // T8（子计划2 衔接）：旧裸 `tags` 字段已废弃（Contact 不再有该字段），这里
+            // 写 "tags" 是孤儿键、反序列化即丢弃。management Agent 产出的是 AI 画像层标签，
+            // 应进 confirmed_tags（带证据），由子计划2 落地，本任务不顺势改写 AI 标签语义。
             let profile_attributes = planned
                 .arguments
                 .get("profileAttributes")
                 .or_else(|| planned.arguments.get("profile_attributes"))
                 .and_then(|value| to_document(value).ok())
                 .unwrap_or_default();
-            let new_stage = optional_value_arg(&planned.arguments, "customerStage")
+            // T8：management Agent 是 AI/MCP 侧工具（非 admin 直写 UI），stage/intent 写入前
+            // 过 dimension_registry 校验——此前直落 set_doc 是旁路，绕开了维度闸门。
+            // WriteIntent::MachineWrite：越界值 DropSilently（不阻断、不报错，与 LlmSignals
+            // 主通道容错一致）；alias 归一到 canonical；字典未配置回退信任原值。
+            let raw_stage = optional_value_arg(&planned.arguments, "customerStage")
                 .or_else(|| optional_value_arg(&planned.arguments, "customer_stage"));
+            let new_stage = match raw_stage.as_deref() {
+                Some(v) => apply_admin_dim_validation(
+                    agent::dimension_registry::validate_dimension_value(
+                        &state.db,
+                        "customer_stage",
+                        v,
+                        &contact.account_id,
+                        agent::dimension_registry::WriteIntent::MachineWrite,
+                    )
+                    .await,
+                )?,
+                None => None,
+            };
             let prev_stage = contact
                 .domain_attributes
                 .as_ref()
                 .and_then(|d| d.get_str("customer_stage").ok().map(|s| s.to_string()));
-            let stage_changed = prev_stage.as_deref() != new_stage.as_deref();
+            // stage 实际未写入（new_stage=None：缺省 / 空串 / 越界被 drop）时绝不算变更——
+            // 否则 insert_domain_stage_fields(stage_changed=true) 会错误重置 stagnation 计时器。
+            let stage_changed =
+                new_stage.is_some() && prev_stage.as_deref() != new_stage.as_deref();
             let new_commitment_text = optional_value_arg(&planned.arguments, "lastCommitment")
                 .or_else(|| optional_value_arg(&planned.arguments, "last_commitment"));
             let commitments_bson = commitments_with_optional_text(
@@ -935,7 +945,6 @@ pub(super) async fn execute_management_tool(
                 new_commitment_text.as_deref(),
             );
             let mut set_doc = doc! {
-                "tags": tags,
                 "commitments": commitments_bson,
                 "follow_up_policy": optional_value_arg(&planned.arguments, "followUpPolicy")
                     .or_else(|| optional_value_arg(&planned.arguments, "follow_up_policy")),
@@ -943,8 +952,21 @@ pub(super) async fn execute_management_tool(
                 "profile_updated_at": DateTime::now(),
                 "updated_at": DateTime::now(),
             };
-            let new_intent = optional_value_arg(&planned.arguments, "intentLevel")
+            let raw_intent = optional_value_arg(&planned.arguments, "intentLevel")
                 .or_else(|| optional_value_arg(&planned.arguments, "intent_level"));
+            let new_intent = match raw_intent.as_deref() {
+                Some(v) => apply_admin_dim_validation(
+                    agent::dimension_registry::validate_dimension_value(
+                        &state.db,
+                        "intent_level",
+                        v,
+                        &contact.account_id,
+                        agent::dimension_registry::WriteIntent::MachineWrite,
+                    )
+                    .await,
+                )?,
+                None => None,
+            };
             insert_domain_stage_fields(
                 &mut set_doc,
                 new_stage.as_deref(),
@@ -1140,6 +1162,33 @@ pub(super) async fn build_management_plan(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn management_machine_write_drops_out_of_dict_stage_not_reject() {
+        // T8 旁路修复守护：management update_contact_profile 走 AI/MCP 通道 → MachineWrite。
+        // customer_stage 主通道是 LlmSignals（机器容错）：字典有条目但此值越界(Miss) →
+        // classify_validation 判 DropSilently（不阻断、不报错），apply_admin_dim_validation
+        // 再把 DropSilently 映成 None → 该键不写入（越界值不落库脏值，且不像 admin 那样 400）。
+        use crate::agent::dimension_registry::{classify_validation, spec_for, DictLookup, WriteIntent};
+        let stage = spec_for("customer_stage").unwrap();
+        let v = classify_validation(stage, DictLookup::Miss, "臆造态", WriteIntent::MachineWrite);
+        // 旁路修复前：值原样落库；修复后：MachineWrite 越界 → DropSilently → 不写。
+        assert!(matches!(apply_admin_dim_validation(v), Ok(None)));
+
+        // intent_level 同为 LlmSignals 机器通道，越界同样 drop（不写）而非报错。
+        let intent = spec_for("intent_level").unwrap();
+        let vi = classify_validation(intent, DictLookup::Miss, "瞎填意向", WriteIntent::MachineWrite);
+        assert!(matches!(apply_admin_dim_validation(vi), Ok(None)));
+
+        // 合法值（alias 归一后 Accept）仍写入 canonical，证明校验不误杀正常路径。
+        let ok = classify_validation(
+            stage,
+            DictLookup::Alias("need_discovery".into()),
+            "需求挖掘",
+            WriteIntent::MachineWrite,
+        );
+        assert!(matches!(apply_admin_dim_validation(ok), Ok(Some(ref c)) if c == "need_discovery"));
+    }
 
     #[test]
     fn locked_send_content_stops_before_operator_instruction() {

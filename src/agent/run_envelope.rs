@@ -1568,6 +1568,10 @@ mod protocol_skeleton_tests {
             allowed_conversation_modes: crate::agent::runtime::default_conversation_modes(),
             grounding_gate_bypass_without_claim: false,
             distrust_self_reported_low_risk: false,
+            consolidation_window_char_budget: 6000,
+            consolidation_window_max_messages: 60,
+            bayesian_slot_min_hits: 3,
+            bayesian_slot_min_strong: 2,
         }
     }
 

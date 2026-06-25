@@ -26,8 +26,9 @@ use serde_json::json;
 
 use crate::error::{AppError, AppResult};
 use crate::models::{
-    AgentProfile, AgentTask, Contact, MemoryCandidate, MemoryCardTyped, MemoryFact,
-    MemoryFactRepr, OperatingMemory,
+    AgentProfile, AgentTask, ConfirmedTag, Contact, ConversationMessage, Evidence, MemoryCandidate,
+    MemoryCardTyped, MemoryFact, MemoryFactRepr, OperatingMemory, PersonalityFacet,
+    PersonalityProfile, PersonalitySnapshot,
 };
 use crate::prompts;
 use crate::routes::AppState;
@@ -213,11 +214,18 @@ pub(crate) fn memory_card_from_contact(
     let mut core_facts: Vec<String> = Vec::new();
     push_unique_text(&mut core_facts, contact.memory_summary.as_deref());
     push_unique_text(&mut core_facts, contact.human_profile_note.as_deref());
-    for tag in &contact.tags {
+    // 标签可信度改造：manual_tags（运营权威）优先，confirmed_tags 补充
+    for tag in &contact.manual_tags {
         if core_facts.len() >= 6 {
             break;
         }
         push_unique_text(&mut core_facts, Some(tag));
+    }
+    for confirmed in &contact.confirmed_tags {
+        if core_facts.len() >= 6 {
+            break;
+        }
+        push_unique_text(&mut core_facts, Some(&confirmed.value));
     }
     let mut preferences = Vec::new();
     push_unique_text(&mut preferences, Some(&communication_style));
@@ -868,6 +876,123 @@ fn render_memory_dimensions_guidance(dimensions: &[crate::models::MemoryDimensio
     lines
 }
 
+/// 子计划 3 Task 3：把宽窗口对话渲染成带 0-based 升序序号的文本，供归并 Agent
+/// 重判标签时按序位指认证据（evidenceTurns）。窗口入参须已按时间升序（旧→新），
+/// 与子计划 2 reply prompt 的序位约定一致（Task 4 的 evidenceTurns 解析对齐此窗口）。
+/// `[0] 客户: ...` / `[1] 你: ...`。
+fn render_window_numbered(window: &[ConversationMessage]) -> String {
+    window
+        .iter()
+        .enumerate()
+        .map(|(i, m)| {
+            let speaker = match m.direction {
+                crate::models::MessageDirection::Inbound => "客户",
+                crate::models::MessageDirection::Outbound => "你",
+            };
+            format!("[{i}] {speaker}: {}", m.content)
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// 解析归并 Agent 的 `reconfirmedTags` 输出，整体重判得到新的确信层标签。
+///
+/// 每条 `{value, evidenceTurns}`：trim value（空则跳过）；`evidenceTurns` 是
+/// 压缩宽窗口（升序、0-based）内的序位，经 `resolve_evidence` 映射成 msg_id 锚。
+/// **证据为空（越界 / 空序列）的标签直接丢弃**（fail-closed：无对话佐证不进
+/// 确信层，杜绝脑补）。返回值用于 OCC 写入 replace 整个 `confirmed_tags`。
+pub(crate) fn parse_reconfirmed_tags(
+    value: &serde_json::Value,
+    window: &[ConversationMessage],
+) -> Vec<ConfirmedTag> {
+    let now = DateTime::now();
+    value
+        .get("reconfirmedTags")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|item| {
+                    let val = item.get("value")?.as_str()?.trim().to_string();
+                    if val.is_empty() {
+                        return None;
+                    }
+                    let turns: Vec<i32> = item
+                        .get("evidenceTurns")
+                        .and_then(|t| t.as_array())
+                        .map(|a| {
+                            a.iter()
+                                .filter_map(|x| x.as_i64().map(|n| n as i32))
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    let evidences = crate::agent::tag_evidence::resolve_evidence(window, &turns);
+                    if evidences.is_empty() {
+                        // fail-closed：锚不上对话的标签丢弃，不进确信层。
+                        return None;
+                    }
+                    Some(ConfirmedTag {
+                        value: val,
+                        evidences,
+                        confirmed_at: now,
+                        confirmed_by: "consolidation".to_string(),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// 子计划 4 Task 3：从压缩归并 LLM 的同一份 `value`（搭车，不额外起 LLM 调用）里
+/// 解析大五 OCEAN 人格画像。OCEAN 是固定五维封闭量表（开放性/尽责性/外向性/宜人性/
+/// 神经质），不允许 LLM 自创维度。
+///
+/// **诚实置信铁律**：每维的证据序位经同一份压缩窗口 `resolve_evidence` 映射成 msg_id 锚，
+/// 证据为空（越界 / 空序列）→ confidence 强制归 0（不许脑补人格，不采信 LLM 自称置信）。
+///
+/// **永不驱动旁路**：返回值只写 `Contact.personality_profile`，绝不进逐轮决策 / 闸门 /
+/// 状态机 / 选择逻辑（与 bayesian_signals 同为只写不读的旁路）。
+fn parse_facet(v: &serde_json::Value, window: &[ConversationMessage]) -> PersonalityFacet {
+    let score = v.get("score").and_then(|x| x.as_f64()).unwrap_or(0.0);
+    let turns: Vec<i32> = v
+        .get("evidenceTurns")
+        .and_then(|t| t.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| x.as_i64().map(|n| n as i32))
+                .collect()
+        })
+        .unwrap_or_default();
+    let evidence_refs = crate::agent::tag_evidence::resolve_evidence(window, &turns);
+    // 诚实置信：无有效证据 → confidence 归 0，不许脑补人格、不采信 LLM 自称置信。
+    let confidence = if evidence_refs.is_empty() {
+        0.0
+    } else {
+        v.get("confidence").and_then(|x| x.as_f64()).unwrap_or(0.0)
+    };
+    PersonalityFacet {
+        score,
+        confidence,
+        evidence_refs,
+    }
+}
+
+pub(crate) fn parse_personality(
+    value: &serde_json::Value,
+    window: &[ConversationMessage],
+) -> Option<PersonalityProfile> {
+    let p = value.get("personality")?;
+    Some(PersonalityProfile {
+        openness: parse_facet(p.get("openness")?, window),
+        conscientiousness: parse_facet(p.get("conscientiousness")?, window),
+        extraversion: parse_facet(p.get("extraversion")?, window),
+        agreeableness: parse_facet(p.get("agreeableness")?, window),
+        neuroticism: parse_facet(p.get("neuroticism")?, window),
+        updated_at: DateTime::now(),
+        // snapshot 在写回时基于旧 profile append（封顶 50），见 OCC winner 分支。
+        snapshots: vec![],
+    })
+}
+
 pub async fn consolidate_contact_memory(
     state: &AppState,
     contact: &Contact,
@@ -892,7 +1017,7 @@ pub async fn consolidate_contact_memory(
     RUN_BUDGET
         .scope(
             budget,
-            consolidate_contact_memory_inner(state, contact, task_id, run_id),
+            consolidate_contact_memory_inner(state, contact, task_id, run_id, &runtime),
         )
         .await
 }
@@ -902,6 +1027,7 @@ async fn consolidate_contact_memory_inner(
     contact: &Contact,
     task_id: Option<ObjectId>,
     run_id: String,
+    runtime: &super::runtime::UserRuntimeParameters,
 ) -> AppResult<()> {
     let memory = load_or_create_operating_memory(state, contact).await?;
     let mut cursor = state
@@ -973,6 +1099,33 @@ async fn consolidate_contact_memory_inner(
         "{task_prompt}{}",
         render_memory_dimensions_guidance(&active_profile.memory_dimensions)
     );
+    // 子计划 3：标签重判需原始宽窗口对话（不只候选条目），让归并 Agent 在真实对话上
+    // 重新判定标签。按字符预算 + 条数双上限取（runtime 可配，默认 6000 字 / 60 条）。
+    // load_recent_messages 返回 created_at:-1（倒序）→ reverse 成升序，供窗口函数回溯
+    // 与序号渲染（与子计划 2 reply prompt 的 0-based 升序序位一致，Task 4 据此解析）。
+    let recent = crate::agent::gateway::load_recent_messages(
+        state,
+        contact,
+        runtime.consolidation_window_max_messages,
+    )
+    .await?;
+    let mut recent_asc = recent;
+    recent_asc.reverse();
+    let window = crate::agent::consolidation_window::take_window_by_budget(
+        &recent_asc,
+        runtime.consolidation_window_char_budget as usize,
+        runtime.consolidation_window_max_messages as usize,
+    );
+    let convo = render_window_numbered(&window);
+    // 当前 AI 确信标签（带证据），供 Agent 对照对话原文重判 / 推翻。
+    let current_tags = serde_json::to_string(&contact.confirmed_tags).unwrap_or_default();
+    // 本轮待重判的标签观察候选（子计划 2 写入 source="tag_observation"）：只是线索，
+    // 仍需对话原文佐证才能进 reconfirmedTags。从已加载候选里按 source 筛出。
+    let tag_observations: Vec<&Document> = candidates
+        .iter()
+        .filter(|c| c.get_str("source").ok() == Some("tag_observation"))
+        .collect();
+    let tag_observations_json = serde_json::to_string(&tag_observations).unwrap_or_default();
     let user = format!(
         r#"{}
 
@@ -985,6 +1138,15 @@ async fn consolidate_contact_memory_inner(
 客户昵称: {}
 客户阶段: {}
 意向等级: {}
+
+对话原文（0-based 升序序号，重判标签时按序号指认证据）:
+{}
+
+当前确信标签（AI 上一轮结论，可被对话推翻）:
+{}
+
+待重判标签观察（线索，需对话佐证才保留）:
+{}
 "#,
         task_prompt,
         // task 6.3：prompt wire shape 仍是 Document JSON；在最末端通过
@@ -1002,7 +1164,10 @@ async fn consolidate_contact_memory_inner(
             .domain_attributes
             .as_ref()
             .and_then(|d| d.get_str("intent_level").ok().map(|s| s.to_string()))
-            .unwrap_or_default()
+            .unwrap_or_default(),
+        convo,
+        current_tags,
+        tag_observations_json
     );
     let value = generate_agent_json(
         state,
@@ -1123,6 +1288,12 @@ async fn consolidate_contact_memory_inner(
         .extra
         .insert("source", "memory_consolidator_agent");
     let compact_doc = to_document(&compact).unwrap_or_default();
+    // 子计划 3 Task 4：压缩重判产物。归并 Agent 在「压缩宽窗口」（升序、0-based
+    // 序号，与上面 render_window_numbered(&window) 注入 prompt 的窗口同一份）上
+    // 整体重判标签；`parse_reconfirmed_tags` 用同一 `&window` 把 evidenceTurns 序位
+    // 映射成 msg_id 锚——序号对齐由共享窗口保证。证据锚不上的标签 fail-closed 丢弃。
+    // replace 语义：整体覆盖 confirmed_tags，不与旧值合并。
+    let reconfirmed = parse_reconfirmed_tags(&value, &window);
     // P1-5：OCC 写入。consolidator 路径与 load_or_create 的 seeding 路径
     // 共享同一份 OperatingMemory，并发 tick（如 webhook 入站 reload + 后台
     // memory_consolidation 任务并发）都会 read-modify-write memory_card_version。
@@ -1174,6 +1345,93 @@ async fn consolidate_contact_memory_inner(
                 .await?;
         }
         return Ok(());
+    }
+    // 子计划 3 Task 4：memory_card OCC 写赢后（winner-only，modified_count==1 才到这），
+    // 把压缩重判得到的 confirmed_tags 整体 replace 回 contacts。confirmed_tags 是
+    // Contact 字段（contacts 集合），与 memory_card（operating_memories）物理分家——
+    // 故不能搭 operating_memories 的 $set，否则落到无人读的孤儿键；放在 OCC winner
+    // 分支内即继承「赢家才写」语义。$set 只含 confirmed_tags 一个键：绝不碰 manual_tags
+    // （运营录入的权威层）、bayesian_signals / personality_profile（旁路），保持三线隔离。
+    state
+        .db
+        .contacts()
+        .update_one(
+            doc! {
+                "workspace_id": &contact.workspace_id,
+                "account_id": &contact.account_id,
+                "wxid": &contact.wxid,
+            },
+            doc! { "$set": { "confirmed_tags": to_bson(&reconfirmed)? } },
+            None,
+        )
+        .await?;
+    // 子计划 4 Task 3：大五 OCEAN 人格画像写回（搭车——从同一份归并 `value` 解析，
+    // 不额外起 LLM 调用）。**永不驱动旁路**：只写 personality_profile，绝不进逐轮决策。
+    // **解耦铁律**：$set 只含 personality_profile 一个键，绝不碰 manual_tags（运营权威层）/
+    // bayesian_signals（另一旁路）/ confirmed_tags / customer_stage。放在 OCC winner
+    // 分支内继承「赢家才写」语义。写库失败 fail-soft（warn 不阻断，已无后续发送动作）。
+    if let Some(mut pp) = parse_personality(&value, &window) {
+        // append snapshot：保留旧 snapshots + 本次（封顶 50，超出从头丢最旧）。
+        let mut snaps = contact
+            .personality_profile
+            .as_ref()
+            .map(|x| x.snapshots.clone())
+            .unwrap_or_default();
+        snaps.push(PersonalitySnapshot {
+            consolidated_at: pp.updated_at,
+            // scores/confidences 顺序固定 [O, C, E, A, N]。
+            scores: vec![
+                pp.openness.score,
+                pp.conscientiousness.score,
+                pp.extraversion.score,
+                pp.agreeableness.score,
+                pp.neuroticism.score,
+            ],
+            confidences: vec![
+                pp.openness.confidence,
+                pp.conscientiousness.confidence,
+                pp.extraversion.confidence,
+                pp.agreeableness.confidence,
+                pp.neuroticism.confidence,
+            ],
+        });
+        while snaps.len() > 50 {
+            snaps.remove(0);
+        }
+        pp.snapshots = snaps;
+        match to_bson(&pp) {
+            Ok(pp_bson) => {
+                if let Err(err) = state
+                    .db
+                    .contacts()
+                    .update_one(
+                        doc! {
+                            "workspace_id": &contact.workspace_id,
+                            "account_id": &contact.account_id,
+                            "wxid": &contact.wxid,
+                        },
+                        doc! { "$set": { "personality_profile": pp_bson } },
+                        None,
+                    )
+                    .await
+                {
+                    tracing::warn!(
+                        workspace_id = %contact.workspace_id,
+                        contact_wxid = %contact.wxid,
+                        error = %err,
+                        "personality_profile write-back failed (fail-soft, side-channel)"
+                    );
+                }
+            }
+            Err(err) => {
+                tracing::warn!(
+                    workspace_id = %contact.workspace_id,
+                    contact_wxid = %contact.wxid,
+                    error = %err,
+                    "personality_profile to_bson failed (fail-soft, side-channel)"
+                );
+            }
+        }
     }
     if !candidate_ids.is_empty() {
         state
@@ -1272,7 +1530,104 @@ pub(crate) async fn write_memory_candidates(
     Ok(())
 }
 
-/// 候选记忆留存状态决策(#73)：write_score 达标 **或** 单条 importance 足够高 → pending;
+/// 把一轮维度判断转成 observation 候选 docs（纯函数，便于单测）。
+/// 每个值一条；`dimension` 为维度名（如 "tag" / "customer_stage"）；evidences 由
+/// resolve_evidence 产出（已 fail-closed）。多值共享本轮证据（设计取舍：不逐值配对）。
+pub(crate) fn build_tag_observation_docs(
+    dimension: &str,
+    tags: &[String],
+    evidences: &[Evidence],
+) -> Vec<Document> {
+    let ev_bson: Vec<Document> = evidences
+        .iter()
+        .map(|e| doc! { "turn": e.turn, "msgId": &e.msg_id })
+        .collect();
+    tags.iter()
+        .map(|t| {
+            doc! {
+                "dimension": dimension,
+                "value": t,
+                "hitCount": 1,
+                "evidences": &ev_bson,
+            }
+        })
+        .collect()
+}
+
+/// 逐轮把标签判断写进 memory_candidates 暂定层（source="tag_observation"）。
+/// 不写 confirmed_tags（那是压缩重判产物）。写库失败不阻断 reply，仅 warn。
+///
+/// 窗口序位约定：`window` 必须按 created_at 升序（最早在前，0-based），与 prompt
+/// 呈现给 LLM 的对话顺序一致——`resolve_evidence` 把 LLM 给的 `tag_evidence_turns`
+/// 当成对该升序窗口的 0-based 下标。调用方负责把降序窗口反转成升序后再传入。
+pub(crate) async fn write_tag_observations(
+    state: &AppState,
+    contact: &Contact,
+    decision: &AgentDecision,
+    window: &[ConversationMessage],
+    run_id: &str,
+) -> AppResult<()> {
+    if decision.tags.is_empty() {
+        return Ok(());
+    }
+    let evidences =
+        crate::agent::tag_evidence::resolve_evidence(window, &decision.tag_evidence_turns);
+    // 无证据的标签判断丢弃（fail-closed：从源头掐脑补，不让无锚标签进暂定层）。
+    if evidences.is_empty() {
+        return Ok(());
+    }
+    let docs = build_tag_observation_docs("tag", &decision.tags, &evidences);
+    let candidate = MemoryCandidate {
+        id: None,
+        workspace_id: contact.workspace_id.clone(),
+        account_id: contact.account_id.clone(),
+        contact_wxid: contact.wxid.clone(),
+        run_id: Some(run_id.to_string()),
+        source: "tag_observation".to_string(),
+        candidates: docs,
+        memory_write_score: 0,
+        status: "pending".to_string(),
+        reason: None,
+        created_at: DateTime::now(),
+        updated_at: DateTime::now(),
+    };
+    state.db.memory_candidates().insert_one(&candidate, None).await?;
+    Ok(())
+}
+
+/// 子计划2 Task4：把一条弱证据的 customer_stage 判断写进 memory_candidates 暂定层
+/// （source="tag_observation"，dimension="customer_stage"）。弱证据不实时写
+/// domain_attributes（保持旧 stage），但仍要落暂定层让压缩重判看得到。
+/// `evidences` 由调用方对升序窗口 resolve 后传入；无证据则直接跳过（fail-closed）。
+/// 写库失败不阻断 reply（既成事实），由调用方 fail-soft 处理。
+pub(crate) async fn write_stage_observation(
+    state: &AppState,
+    contact: &Contact,
+    stage: &str,
+    evidences: &[Evidence],
+    run_id: &str,
+) -> AppResult<()> {
+    if evidences.is_empty() {
+        return Ok(());
+    }
+    let docs = build_tag_observation_docs("customer_stage", &[stage.to_string()], evidences);
+    let candidate = MemoryCandidate {
+        id: None,
+        workspace_id: contact.workspace_id.clone(),
+        account_id: contact.account_id.clone(),
+        contact_wxid: contact.wxid.clone(),
+        run_id: Some(run_id.to_string()),
+        source: "tag_observation".to_string(),
+        candidates: docs,
+        memory_write_score: 0,
+        status: "pending".to_string(),
+        reason: None,
+        created_at: DateTime::now(),
+        updated_at: DateTime::now(),
+    };
+    state.db.memory_candidates().insert_one(&candidate, None).await?;
+    Ok(())
+}
 /// 否则 ignored_low_score。importance 救援阈值取 8——只有高重要度记忆(承诺/强偏好等)
 /// 才在整体分偏低时被救回,避免噪声涌入待审池。纯函数便于单测。
 pub(crate) fn decide_candidate_status(write_score: i32, max_importance: i32) -> &'static str {
@@ -1532,6 +1887,38 @@ mod candidate_status_tests {
     fn low_score_low_importance_ignored() {
         assert_eq!(decide_candidate_status(5, 7), "ignored_low_score");
         assert_eq!(decide_candidate_status(0, 0), "ignored_low_score");
+    }
+}
+
+#[cfg(test)]
+mod tag_observation_tests {
+    use super::build_tag_observation_docs;
+    use crate::models::Evidence;
+
+    #[test]
+    fn build_tag_observation_docs_one_per_tag_with_shared_evidence() {
+        let ev = vec![Evidence { turn: 0, msg_id: "deadbeef".into() }];
+        let docs = build_tag_observation_docs("tag", &["价格敏感".into(), "犹豫".into()], &ev);
+        assert_eq!(docs.len(), 2);
+        assert_eq!(docs[0].get_str("dimension").unwrap(), "tag");
+        assert_eq!(docs[0].get_str("value").unwrap(), "价格敏感");
+        assert_eq!(docs[0].get_i32("hitCount").unwrap(), 1);
+        assert!(docs[0].get_array("evidences").is_ok());
+    }
+
+    #[test]
+    fn build_tag_observation_docs_empty_tags_yields_empty() {
+        assert!(build_tag_observation_docs("tag", &[], &[]).is_empty());
+    }
+
+    // 子计划2 Task4：维度参数泛化——customer_stage 暂定层 observation 用同一构造器。
+    #[test]
+    fn build_tag_observation_docs_honors_custom_dimension() {
+        let ev = vec![Evidence { turn: 1, msg_id: "cafef00d".into() }];
+        let docs = build_tag_observation_docs("customer_stage", &["intent_confirmed".into()], &ev);
+        assert_eq!(docs.len(), 1);
+        assert_eq!(docs[0].get_str("dimension").unwrap(), "customer_stage");
+        assert_eq!(docs[0].get_str("value").unwrap(), "intent_confirmed");
     }
 }
 
@@ -1977,5 +2364,145 @@ mod p1_5_occ_tests {
         assert!(out.contains("记录 ta 近期的情绪起伏"), "应含 prompt_hint");
         assert!(out.contains("anniversaries"), "应列出纪念日槽");
         assert!(out.contains("最多 6 条"));
+    }
+}
+
+#[cfg(test)]
+mod render_window_tests {
+    use crate::models::{ConversationMessage, MessageDirection};
+    use mongodb::bson::{oid::ObjectId, DateTime};
+
+    fn msg(dir: MessageDirection, content: &str) -> ConversationMessage {
+        ConversationMessage {
+            id: Some(ObjectId::new()),
+            workspace_id: "w".into(),
+            account_id: "a".into(),
+            contact_wxid: "c".into(),
+            message_id: None,
+            dedupe_key: None,
+            direction: dir,
+            content: content.into(),
+            msg_type: None,
+            media_ref: None,
+            raw: None,
+            created_at: DateTime::from_millis(0),
+        }
+    }
+
+    #[test]
+    fn numbers_oldest_first_zero_based() {
+        // 窗口入参已按时间升序（旧→新）；序号 0 必须是最旧那条，方向标签
+        // Inbound=客户 / Outbound=你（与子计划 2 reply prompt 序位约定一致）。
+        let window = vec![
+            msg(MessageDirection::Inbound, "最早的话"),
+            msg(MessageDirection::Outbound, "我方回复"),
+            msg(MessageDirection::Inbound, "客户追问"),
+        ];
+        let rendered = super::render_window_numbered(&window);
+        let lines: Vec<&str> = rendered.lines().collect();
+        assert_eq!(lines[0], "[0] 客户: 最早的话", "序号 0 应是最旧的客户消息");
+        assert_eq!(lines[1], "[1] 你: 我方回复");
+        assert_eq!(lines[2], "[2] 客户: 客户追问");
+    }
+
+    #[test]
+    fn empty_window_yields_empty_string() {
+        assert!(super::render_window_numbered(&[]).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod parse_reconfirmed_tests {
+    use crate::models::{ConversationMessage, MessageDirection};
+    use mongodb::bson::{oid::ObjectId, DateTime};
+
+    fn msg(dir: MessageDirection, content: &str) -> ConversationMessage {
+        ConversationMessage {
+            id: Some(ObjectId::new()),
+            workspace_id: "w".into(),
+            account_id: "a".into(),
+            contact_wxid: "c".into(),
+            message_id: None,
+            dedupe_key: None,
+            direction: dir,
+            content: content.into(),
+            msg_type: None,
+            media_ref: None,
+            raw: None,
+            created_at: DateTime::from_millis(0),
+        }
+    }
+
+    #[test]
+    fn parse_reconfirmed_drops_tags_without_resolvable_evidence() {
+        // 压缩宽窗口：两条对话，0-based 升序序位。
+        let window = vec![
+            msg(MessageDirection::Inbound, "这个价格能再便宜点吗"),
+            msg(MessageDirection::Outbound, "可以聊聊预算"),
+        ];
+        let v = serde_json::json!({
+            "reconfirmedTags": [
+                { "value": "价格敏感", "evidenceTurns": [0] },   // 有效
+                { "value": "脑补标签", "evidenceTurns": [99] },  // 越界 → 证据空 → 丢弃
+                { "value": "无依据", "evidenceTurns": [] }       // 空 → 丢弃
+            ]
+        });
+        let out = super::parse_reconfirmed_tags(&v, &window);
+        assert_eq!(out.len(), 1, "只有可锚定证据的标签应留下");
+        assert_eq!(out[0].value, "价格敏感");
+        assert!(!out[0].evidences.is_empty());
+        assert_eq!(out[0].confirmed_by, "consolidation");
+    }
+}
+
+#[cfg(test)]
+mod parse_personality_tests {
+    use crate::models::{ConversationMessage, MessageDirection};
+    use mongodb::bson::{oid::ObjectId, DateTime};
+
+    fn msg(dir: MessageDirection, content: &str) -> ConversationMessage {
+        ConversationMessage {
+            id: Some(ObjectId::new()),
+            workspace_id: "w".into(),
+            account_id: "a".into(),
+            contact_wxid: "c".into(),
+            message_id: None,
+            dedupe_key: None,
+            direction: dir,
+            content: content.into(),
+            msg_type: None,
+            media_ref: None,
+            raw: None,
+            created_at: DateTime::from_millis(0),
+        }
+    }
+
+    #[test]
+    fn parse_personality_five_facets_with_evidence() {
+        let window = vec![msg(MessageDirection::Inbound, "我喜欢研究各种新东西")];
+        let v = serde_json::json!({
+            "personality": {
+                "openness": { "score": 0.7, "confidence": 0.4, "evidenceTurns": [0] },
+                "conscientiousness": { "score": 0.5, "confidence": 0.9, "evidenceTurns": [] },
+                "extraversion": { "score": 0.6, "confidence": 0.3, "evidenceTurns": [0] },
+                "agreeableness": { "score": 0.8, "confidence": 0.5, "evidenceTurns": [0] },
+                "neuroticism": { "score": 0.3, "confidence": 0.2, "evidenceTurns": [0] }
+            }
+        });
+        let p = super::parse_personality(&v, &window).expect("some");
+        assert!((p.openness.score - 0.7).abs() < 1e-9);
+        // 诚实置信：无证据维度 confidence 归 0（即便 LLM 自称 0.9），evidence_refs 为空。
+        assert_eq!(p.conscientiousness.confidence, 0.0);
+        assert!(p.conscientiousness.evidence_refs.is_empty());
+        // 有证据维度保留 LLM 置信 + 锚定证据。
+        assert!((p.openness.confidence - 0.4).abs() < 1e-9);
+        assert!(!p.openness.evidence_refs.is_empty());
+        // 写回前 snapshots 为空（在 OCC winner 分支基于旧 profile append）。
+        assert!(p.snapshots.is_empty());
+    }
+
+    #[test]
+    fn parse_personality_absent_yields_none() {
+        assert!(super::parse_personality(&serde_json::json!({}), &[]).is_none());
     }
 }

@@ -376,7 +376,13 @@ fn fresh_contact(wxid: &str, workspace_id: &str) -> Contact {
         memory_summary: None,
         playbook_id: None,
         playbook_version: None,
-        tags: Vec::new(),
+        manual_tags: Vec::new(),
+        confirmed_tags: Vec::new(),
+        bayesian_signals: Vec::new(),
+        personality_profile: None,
+        manual_tags_updated_at: None,
+        manual_tags_by: None,
+        tags_version: 0,
         domain_attributes: None,
         domain_attributes_updated_at: None,
         commitments: Vec::new(),
@@ -491,7 +497,7 @@ async fn capture_fingerprint(state: &AppState, wxid: &str) -> ProfileFingerprint
         has_agent_profile: contact.agent_profile.is_some(),
         domain_attr_keys,
         domain_attr_keys_substantive,
-        tags_count: contact.tags.len(),
+        tags_count: contact.manual_tags.len(),
         operation_state: contact.operation_state.clone(),
     }
 }

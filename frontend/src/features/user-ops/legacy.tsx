@@ -48,6 +48,8 @@ import type {
   SendHistoryItem
 } from "../../types";
 import { api } from "../../lib/api";
+import TagTrustPanel from "./TagTrustPanel";
+import PersonalityPanel from "./PersonalityPanel";
 
 type ActiveVersionMeta = {
   id: string;
@@ -159,6 +161,7 @@ export function UserOperationCockpit({
   onSaveCustomAgentInstructions,
   onSaveAssistOverride,
   onSaveRelationshipType,
+  onSaveManualTags,
   onSelectedPlaybook,
   onSimulationInput,
   onTab
@@ -200,6 +203,7 @@ export function UserOperationCockpit({
   onSaveCustomAgentInstructions: () => void;
   onSaveAssistOverride: () => void;
   onSaveRelationshipType: () => void;
+  onSaveManualTags: (tags: string[]) => void;
   onSelectedPlaybook: (value: string) => void;
   onSimulationInput: (value: string) => void;
   onTab: (tab: SmartOpsTab) => void;
@@ -291,6 +295,16 @@ export function UserOperationCockpit({
                 <p>{formatTime(selected.lastOutboundAt) || "无"}</p>
               </div>
             </div>
+          </section>
+
+          <section className="cockpitSection">
+            <div className="sectionCaption">标签可信度</div>
+            <TagTrustPanel contact={selected} onSaveManualTags={onSaveManualTags} />
+          </section>
+
+          <section className="cockpitSection">
+            <div className="sectionCaption">人格画像（OCEAN）</div>
+            <PersonalityPanel profile={selected.personalityProfile} />
           </section>
 
           <section className="cockpitSection">

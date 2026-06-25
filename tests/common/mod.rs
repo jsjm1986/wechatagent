@@ -250,6 +250,8 @@ fn test_config(mongodb_uri: String, mongodb_database: String) -> AppConfig {
         account_send_max_interval_ms: 0,
         agent_reply_max_segment_chars: 120,
         agent_reply_max_segments: 4,
+        // 渐进式三档开关：测试默认 true（与 PROGRESSIVE_TIER_ENABLED 默认一致，走两程循环）。
+        progressive_tier_enabled: true,
         message_debounce_window_ms: 4000,
         task_worker_interval_seconds: 30,
         llm_timeout_seconds: 5,

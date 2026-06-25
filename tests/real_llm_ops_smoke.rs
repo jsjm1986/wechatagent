@@ -494,7 +494,13 @@ fn managed_contact(wxid: &str) -> Contact {
         memory_summary: None,
         playbook_id: None,
         playbook_version: None,
-        tags: Vec::new(),
+        manual_tags: Vec::new(),
+        confirmed_tags: Vec::new(),
+        bayesian_signals: Vec::new(),
+        personality_profile: None,
+        manual_tags_updated_at: None,
+        manual_tags_by: None,
+        tags_version: 0,
         domain_attributes: None,
         domain_attributes_updated_at: None,
         commitments: Vec::new(),
@@ -999,7 +1005,7 @@ async fn print_capability_snapshot(
         .unwrap_or("<none>");
     eprintln!(
         "[cap][turn-{turn}][画像] tags={:?} stage={stage} intent={intent} operation_state={:?}",
-        contact.tags, contact.operation_state
+        contact.manual_tags, contact.operation_state
     );
 
     // ③ 意图轨迹：长度 + 最新一条（由 record_user_reaction 写，非每轮必有）。
@@ -1969,7 +1975,7 @@ async fn t13_real_persona_differentiation() {
         communication_style: "精确理性，偏好术语和直接结论，不需要寒暄铺垫".to_string(),
         operation_goal: "提供可验证的判断依据，推进评估".to_string(),
     });
-    contact_a.tags = vec!["技术".to_string(), "理性决策".to_string()];
+    contact_a.manual_tags = vec!["技术".to_string(), "理性决策".to_string()];
     contact_a.domain_attributes = Some(doc! { "customer_stage": "评估", "intent_level": "中" });
 
     // 画像 B：首次创业、容易焦虑、需要鼓励、处于关注阶段。
@@ -1980,7 +1986,7 @@ async fn t13_real_persona_differentiation() {
         communication_style: "需要鼓励，容易焦虑，希望被理解和一步步带着走".to_string(),
         operation_goal: "先建立信任、稳定情绪，再给最小可执行步骤".to_string(),
     });
-    contact_b.tags = vec!["首次创业".to_string(), "焦虑".to_string()];
+    contact_b.manual_tags = vec!["首次创业".to_string(), "焦虑".to_string()];
     contact_b.domain_attributes = Some(doc! { "customer_stage": "关注", "intent_level": "低" });
 
     state.db.contacts().insert_one(&contact_a, None).await.expect("insert contact a");
@@ -2097,7 +2103,7 @@ async fn t14_real_profile_churn_under_weak_signal() {
         "技术".to_string(),
         "理性决策".to_string(),
     ];
-    contact.tags = established_tags.clone();
+    contact.manual_tags = established_tags.clone();
     contact.domain_attributes = Some(doc! { "customer_stage": "决策", "intent_level": "高" });
     let established_summary =
         "长期合作客户，过去一年三次复购；关注稳定性与 ROI；上次沟通确认了 Q3 扩容意向。".to_string();
@@ -2147,7 +2153,7 @@ async fn t14_real_profile_churn_under_weak_signal() {
         .unwrap_or("<none>");
     let tags_lost: Vec<&String> = established_tags
         .iter()
-        .filter(|t| !after.tags.iter().any(|n| n == *t))
+        .filter(|t| !after.manual_tags.iter().any(|n| n == *t))
         .collect();
     let summary_before = established_summary.len();
     let summary_after = after.memory_summary.as_deref().map(str::len).unwrap_or(0);
@@ -2155,7 +2161,7 @@ async fn t14_real_profile_churn_under_weak_signal() {
         "[t14][profile-churn] 一句弱信号「在吗」后：\
          stage 决策→{new_stage} | intent 高→{new_intent} | \
          tags 建立={:?} 现存={:?} 丢失={:?} | summary {summary_before}→{summary_after}",
-        established_tags, after.tags, tags_lost
+        established_tags, after.manual_tags, tags_lost
     );
 
     // 读 gateway 落库的 churn 审计事件（noise-gated，只在 notable 时发）。
@@ -2208,7 +2214,7 @@ async fn t15_real_multiturn_deal_arc() {
         communication_style: "理性但会被价格和风险劝退，需要被稳住情绪".to_string(),
         operation_goal: "稳健推进评估到成交，全程不施压、不逼单".to_string(),
     });
-    contact.tags = vec!["高意向".to_string(), "预算敏感".to_string()];
+    contact.manual_tags = vec!["高意向".to_string(), "预算敏感".to_string()];
     contact.domain_attributes = Some(doc! { "customer_stage": "评估", "intent_level": "中" });
     state.db.contacts().insert_one(&contact, None).await.expect("insert contact");
 
@@ -2308,7 +2314,7 @@ async fn t16_real_multiturn_persona_cross() {
         communication_style: "精确理性，偏好术语和直接结论，不需要寒暄铺垫".to_string(),
         operation_goal: "提供可验证的判断依据，理性推进评估".to_string(),
     });
-    contact_a.tags = vec!["技术".to_string(), "理性决策".to_string()];
+    contact_a.manual_tags = vec!["技术".to_string(), "理性决策".to_string()];
     contact_a.domain_attributes = Some(doc! { "customer_stage": "评估", "intent_level": "中" });
 
     let mut contact_b = managed_contact("real_ops_user_t16_b");
@@ -2318,7 +2324,7 @@ async fn t16_real_multiturn_persona_cross() {
         communication_style: "需要鼓励，容易焦虑，希望被理解和一步步带着走".to_string(),
         operation_goal: "先建立信任、稳定情绪，再给最小可执行步骤".to_string(),
     });
-    contact_b.tags = vec!["首次创业".to_string(), "焦虑".to_string()];
+    contact_b.manual_tags = vec!["首次创业".to_string(), "焦虑".to_string()];
     contact_b.domain_attributes = Some(doc! { "customer_stage": "关注", "intent_level": "低" });
 
     state.db.contacts().insert_one(&contact_a, None).await.expect("insert contact a");
@@ -2417,7 +2423,7 @@ async fn t17_real_multiturn_boundary_stress() {
     let state = common::rebuild_app_state_with_real_llm(&app, llm, mcp_server.uri());
 
     let mut contact = managed_contact("real_ops_user_t17");
-    contact.tags = vec!["高意向".to_string()];
+    contact.manual_tags = vec!["高意向".to_string()];
     contact.domain_attributes = Some(doc! { "customer_stage": "评估", "intent_level": "中" });
     state.db.contacts().insert_one(&contact, None).await.expect("insert contact");
 
@@ -2542,7 +2548,7 @@ async fn t18_real_warm_start_operator_seeded_arc() {
     let mut contact = managed_contact("real_ops_user_t18");
     contact.human_profile_note = Some(human_profile_note.to_string());
     contact.agent_profile = Some(generated.agent_profile.clone());
-    contact.tags = generated.tags.clone();
+    contact.manual_tags = generated.tags.clone();
     contact.custom_agent_instructions = Some(operator_instruction.to_string());
     if let (Some(stage), Some(intent)) = (&generated.customer_stage, &generated.intent_level) {
         contact.domain_attributes = Some(doc! { "customer_stage": stage, "intent_level": intent });
