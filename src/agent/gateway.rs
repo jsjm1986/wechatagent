@@ -937,6 +937,12 @@ async fn run_user_operation_gateway_inner(
     // 由 finalize 阶段判定是否触发 R3.5/R3.6 blocked_by_required_field。
     // ── 渐进式三档（2026-06-23）：第一程 Lean 小档 + 充分性自评两程循环 ──
     // 第一程用 Lean 瘦档（恒注入安全集，不注入业务/产品知识，省 token）。
+    // PROGRESSIVE_TIER_ENABLED 关 → 第一程直接 Full,退回单程(kill switch)。
+    let first_pass_tier = if state.config.progressive_tier_enabled {
+        crate::agent::sufficiency::PromptTier::Lean
+    } else {
+        crate::agent::sufficiency::PromptTier::Full
+    };
     let (decision_first, promote_risks_first) = decide_reply_with_promote(
         state,
         &contact,
@@ -952,7 +958,7 @@ async fn run_user_operation_gateway_inner(
         &knowledge_route,
         None,
         Some(&run_id),
-        crate::agent::sufficiency::PromptTier::Lean,
+        first_pass_tier,
     )
     .await?;
 
@@ -984,10 +990,12 @@ async fn run_user_operation_gateway_inner(
 
     let (mut decision, mut promote_risks) = match tier_decision {
         crate::agent::sufficiency::TierDecision::Enough => {
-            if crate::agent::sufficiency::should_force_full_on_missing(
-                &decision_first,
-                &knowledge_route.knowledge_coverage,
-            ) {
+            if state.config.progressive_tier_enabled
+                && crate::agent::sufficiency::should_force_full_on_missing(
+                    &decision_first,
+                    &knowledge_route.knowledge_coverage,
+                )
+            {
                 // ②强升:自评 enough 但 coverage=missing 且需知识=确定高危(凭空答产品/事实),
                 // 当场升 Full 重生成。最多一次:Full 结果直接进五闸,不再触发强升(Full 已最高档)。
                 forced_full = true;
