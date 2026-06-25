@@ -73,7 +73,7 @@ pub(crate) fn is_sufficiency_recognized(decision: &AgentDecision) -> bool {
 
 /// 纯谓词：本轮是否构成「需观测的自评乐观灰区」——自评说够了（enough）、本轮需产品知识、
 /// 但知识覆盖只是 `weak`（有弱证据、未硬到 missing）。missing 已由
-/// [`should_force_full_on_missing`] 强升接管，本谓词只盯不硬堵的 weak 灰区。
+/// [`should_force_full_on_missing`] 强升承接，本谓词只盯不硬堵的 weak 灰区。
 ///
 /// 命中只记观测 telemetry（先观测后判罚），不改档位决策。正向 `== "weak"`，绝不用 `!=`。
 pub(crate) fn is_coverage_optimism(decision: &AgentDecision, knowledge_coverage: &str) -> bool {
