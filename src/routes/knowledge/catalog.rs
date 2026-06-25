@@ -205,6 +205,7 @@ pub(in crate::routes) async fn search_operation_knowledge_tool(
     let result = agent::test_knowledge_route_for_contact(
         &state,
         contact,
+        &admin.current_workspace,
         &payload.account_id,
         &payload.query,
     )
@@ -259,6 +260,7 @@ pub(in crate::routes) async fn test_operation_knowledge_match(
     let result = agent::test_knowledge_route_for_contact(
         &state,
         contact,
+        &admin.current_workspace,
         &payload.account_id,
         &payload.message,
     )

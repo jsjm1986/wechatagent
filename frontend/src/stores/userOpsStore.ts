@@ -186,44 +186,6 @@ function playbookPayload(draft: PlaybookDraft) {
   };
 }
 
-function defaultHealthItems() {
-  return [
-    { key: "trust_level", label: "信任度", score: 5, tone: "warn" as const, detail: "与客户的信任关系待加强" },
-    { key: "engagement", label: "参与度", score: 6, tone: "good" as const, detail: "客户参与度良好" },
-    { key: "intent_clarity", label: "意图明确度", score: 4, tone: "warn" as const, detail: "客户意图不够清晰" },
-    { key: "relationship_depth", label: "关系深度", score: 3, tone: "danger" as const, detail: "关系较浅，需要深化" }
-  ];
-}
-
-function healthFromScores(scores: Record<string, unknown>): OperationHealth {
-  const items = defaultHealthItems().map(item => {
-    const score = typeof scores[item.key] === "number" ? scores[item.key] as number : item.score;
-    let tone: "good" | "warn" | "danger";
-    if (score >= 7) tone = "good";
-    else if (score >= 5) tone = "warn";
-    else tone = "danger";
-
-    return {
-      ...item,
-      score,
-      tone
-    };
-  });
-
-  // 确保scores类型正确
-  const numericScores: Record<string, number> = {};
-  for (const [key, value] of Object.entries(scores)) {
-    if (typeof value === "number") {
-      numericScores[key] = value;
-    }
-  }
-
-  return {
-    scores: numericScores,
-    items
-  };
-}
-
 // 辅助函数：刷新联系人列表。透传 searchQuery 作为后端 q= 过滤参数
 // （后端 GET /api/contacts 支持 q 子串过滤已导入好友）。
 async function refreshContacts(currentAccountId: string | null, q?: string) {
@@ -590,9 +552,11 @@ export const useUserOpsStore = create<UserOpsState & UserOpsActions>((set, get) 
       });
 
       const next: Partial<UserOpsState> = { guidePreview: data.item };
-      // 仅当后端确实返回了 healthScores 时才更新健康度（与原逻辑一致，避免用默认值伪造）。
-      if (data.item.healthScores && Object.keys(data.item.healthScores).length > 0) {
-        next.operationHealth = healthFromScores(data.item.healthScores);
+      // FE-1：直接用后端构建好的 health（scores + canonical 7 项 items，与正常加载
+      // 路径 /operation-health 同口径、同形态），不再用前端 healthFromScores 拿
+      // healthScores 重建 4-key 占位分（旧函数 key 与后端零交集，展示伪造分）。
+      if (data.item.health && data.item.health.items.length > 0) {
+        next.operationHealth = data.item.health;
       }
       set(next);
     } catch (error) {
