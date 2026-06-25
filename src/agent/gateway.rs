@@ -4199,22 +4199,51 @@ async fn apply_operating_memory_update(
     if decision.operating_memory_update.is_empty() && context_pack.is_empty() {
         return Ok(());
     }
-    let mut set_doc = doc! { "updated_at": DateTime::now() };
+    if decision.consolidation_needed || decision.memory_write_score >= 6 {
+        schedule_memory_consolidation_task(state, contact, run_id).await?;
+    }
+    // CONC-1：memory_card(+version) 走 OCC 单独写，镜像 memory.rs 的 occ_memory_filter
+    // 模板（filter 含 memory_card_version 谓词，并发只有看到 prev_version 的 writer 命中）。
+    // 门控外的 updated_at 仍走原三键 filter（它不 bump memory_card_version，不能套版本
+    // 谓词，否则永久 lost-race）。reply 已送出，OCC 输者 modified_count!=1 静默跳过——
+    // 既成事实纪律：不覆盖、不报错、不 `?` 透传。
     if !memory_card_has_signal(&effective_memory_card(memory)) {
         // task 6.3：把 typed memoryCard 在写入边界一次性转为 Document 落库。
         // H13：无 operation_state 时回落状态机初始态。
         let initial_state = super::decision::initial_operation_state_for_contact(state, contact).await?;
-        set_doc.insert(
-            "memory_card",
+        let prev_version = memory.memory_card_version;
+        let next_version = next_memory_card_version(memory);
+        let card_doc =
             mongodb::bson::to_document(&effective_memory_card_for_contact(memory, contact, &initial_state))
-                .unwrap_or_default(),
-        );
-        set_doc.insert("memory_card_version", next_memory_card_version(memory));
-        set_doc.insert("memory_card_updated_at", DateTime::now());
+                .unwrap_or_default();
+        let now = DateTime::now();
+        let res = state
+            .db
+            .operating_memories()
+            .update_one(
+                super::memory::occ_memory_filter(
+                    &contact.workspace_id,
+                    &contact.account_id,
+                    &contact.wxid,
+                    prev_version,
+                ),
+                doc! { "$set": {
+                    "memory_card": card_doc,
+                    "memory_card_version": next_version,
+                    "memory_card_updated_at": now,
+                    "updated_at": now,
+                }},
+                None,
+            )
+            .await?;
+        if res.modified_count != 1 {
+            // 输给并发 writer：对方已写入更新版本，本次 memory_card 写跳过（不覆盖、不报错）。
+            // apply_operating_memory_update 末尾无后续消费 memory，无需重读。
+            tracing::debug!(contact_wxid = %contact.wxid, "memory_card OCC lost race; skip");
+        }
     }
-    if decision.consolidation_needed || decision.memory_write_score >= 6 {
-        schedule_memory_consolidation_task(state, contact, run_id).await?;
-    }
+    // 门控外的字段（此函数仅 updated_at）走原三键 filter，不受 OCC 影响。
+    let set_doc = doc! { "updated_at": DateTime::now() };
     state
         .db
         .operating_memories()
