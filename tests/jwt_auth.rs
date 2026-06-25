@@ -93,6 +93,7 @@ fn base_cfg() -> AppConfig {
         behavior_signal_metrics_enabled: false,
         knowledge_exploration_enabled: false,
         knowledge_exploration_temperature: 1.0,
+        progressive_tier_enabled: true,
         evolution_enabled: false,
         evolution_tick_seconds: 600,
         evolution_run_token_budget: 60_000,

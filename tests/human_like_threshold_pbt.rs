@@ -25,6 +25,7 @@ fn full_pass_review(human_like: i32) -> DecisionReviewResult {
             hallucination_score: 1,
             knowledge_grounding_score: 80,
             pressure_risk: 1,
+            boundary_privacy_safety: 10,
         },
         ..Default::default()
     }
@@ -122,6 +123,7 @@ proptest! {
                 hallucination_score: hallucination_noise,
                 knowledge_grounding_score: runtime.product_accuracy_block_below + knowledge_noise,
                 pressure_risk: 1,
+                boundary_privacy_safety: 10,
             },
             ..Default::default()
         };

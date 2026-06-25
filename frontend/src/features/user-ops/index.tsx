@@ -112,6 +112,7 @@ export default function UserOpsFeature() {
     saveCustomAgentInstructions,
     saveAssistOverride,
     saveRelationshipType,
+    saveManualTags,
     analyzeProfile,
     previewGuideInstruction,
     applyGuidePreview,
@@ -283,6 +284,7 @@ export default function UserOpsFeature() {
             onSaveCustomAgentInstructions={saveCustomAgentInstructions}
             onSaveAssistOverride={saveAssistOverride}
             onSaveRelationshipType={saveRelationshipType}
+            onSaveManualTags={saveManualTags}
             onSelectedPlaybook={setSelectedPlaybookId}
             onSimulationInput={setSimulationInput}
             onTab={setSmartOpsTab}

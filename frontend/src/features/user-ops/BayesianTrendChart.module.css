@@ -1,0 +1,51 @@
+/* 标签可信度改造 - 贝叶斯置信度走势图（子计划5 Task3）。
+   设计纪律（tokens.css 变量）：
+   - 贝叶斯是 AI 评估层 → 紫色系（AI 身份）。折线色板见 .tsx 内 PALETTE（紫系，
+     tokens 仅有单一 --color-brand，多线需可区分一组，故就近定义局部色板）。
+   - 网格 / 文字 / 表面只引 tokens：--ink-*、--hairline、--fill-brand、--surface-card。
+   - 空态文字中性 ink-4。 */
+
+.wrap {
+  display: flex; flex-direction: column; gap: 12px;
+  border-radius: var(--r-sm); padding: 12px 14px;
+  background: var(--fill-brand); border: 1px solid rgba(94, 92, 230, .18);
+}
+
+.svg {
+  display: block; width: 100%; height: auto;
+  border-radius: var(--r-sm);
+  background: var(--surface-card);
+  border: 1px solid var(--hairline);
+}
+
+.gridLine {
+  stroke: var(--hairline); stroke-width: 1; stroke-dasharray: 3 3;
+}
+.tickLabel {
+  font-size: 8px; fill: var(--ink-4); font-weight: 500;
+}
+.line {
+  stroke-width: 2; stroke-linecap: round; stroke-linejoin: round;
+}
+
+/* 图例 */
+.legend {
+  display: flex; flex-direction: column; gap: 6px;
+  margin: 0; padding: 0; list-style: none;
+}
+.legendItem {
+  display: flex; align-items: center; gap: 8px;
+  font-size: 11.5px; color: var(--ink-2); letter-spacing: -.1px;
+}
+.swatch {
+  flex: none; width: 12px; height: 3px; border-radius: 2px;
+}
+.legendName { font-weight: 600; color: var(--ink-1); }
+.legendValue { color: var(--ink-3); font-size: 11px; }
+
+/* 空态 */
+.empty {
+  font-size: 12px; color: var(--ink-4); letter-spacing: -.1px;
+  padding: 18px; border-radius: var(--r-sm); text-align: center;
+  background: var(--fill-brand); border: 1px dashed rgba(94, 92, 230, .24);
+}

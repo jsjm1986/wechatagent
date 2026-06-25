@@ -53,7 +53,7 @@ use super::knowledge_router::{
 use super::memory::{
     effective_memory_card, effective_memory_card_for_contact, load_or_create_operating_memory,
     memory_card_has_signal, next_memory_card_version, schedule_memory_consolidation_task,
-    write_memory_candidates,
+    write_memory_candidates, write_stage_observation, write_tag_observations,
 };
 use super::multimodal;
 use super::review::{
@@ -68,7 +68,7 @@ use super::run_envelope::{
 };
 use super::runtime::UserRuntimeParameters;
 use super::types::{
-    doc_bool, doc_i64, doc_string, non_empty_option, to_bson_array,
+    doc_bool, doc_i64, doc_string, non_empty_option,
     AgentDecision, AgentTrigger, ContactSendResult, DecisionReviewResult, KnowledgeRouteResult,
     ManualContactSend, RunPlannerResult, SendGatewayResult,
 };
@@ -935,7 +935,15 @@ async fn run_user_operation_gateway_inner(
     // agent-autonomy-loop W2 / Task 3.4：把 RawAgentDecision::validate_and_promote
     // 的 promote_risks 从 reply 调用一路 thread 到 finalize_review_for_send，
     // 由 finalize 阶段判定是否触发 R3.5/R3.6 blocked_by_required_field。
-    let (mut decision, mut promote_risks) = decide_reply_with_promote(
+    // ── 渐进式三档（2026-06-23）：第一程 Lean 小档 + 充分性自评两程循环 ──
+    // 第一程用 Lean 瘦档（恒注入安全集，不注入业务/产品知识，省 token）。
+    // PROGRESSIVE_TIER_ENABLED 关 → 第一程直接 Full,退回单程(kill switch)。
+    let first_pass_tier = if state.config.progressive_tier_enabled {
+        crate::agent::sufficiency::PromptTier::Lean
+    } else {
+        crate::agent::sufficiency::PromptTier::Full
+    };
+    let (decision_first, promote_risks_first) = decide_reply_with_promote(
         state,
         &contact,
         &inbound,
@@ -950,8 +958,221 @@ async fn run_user_operation_gateway_inner(
         &knowledge_route,
         None,
         Some(&run_id),
+        first_pass_tier,
     )
     .await?;
+
+    // 充分性自评判定：决定直接进闸 / 升档第二程 / 澄清。
+    let tier_decision = crate::agent::sufficiency::decide_tier_escalation(&decision_first);
+
+    // 块B：预求值升档标志(供 match 后 run tier 元信息与 used_knowledge_ids 口径判断,
+    // 避免 tier_decision 被 match 消费后作用域问题)。
+    // escalated=是否升档(含 Relational/Full,供 ptier_run_tier 记档位);
+    // escalated_to_full=是否升到 **Full**(仅 Full 注入业务知识 include_business=matches!(tier,Full),
+    // decision.rs:297)——used_knowledge_ids 口径只认这个,Relational 升档与 Lean 同样没读切片不记 id。
+    let escalated = matches!(
+        tier_decision,
+        crate::agent::sufficiency::TierDecision::Escalate(_)
+    );
+    let escalated_to_full = matches!(
+        tier_decision,
+        crate::agent::sufficiency::TierDecision::Escalate(
+            crate::agent::sufficiency::PromptTier::Full
+        )
+    );
+
+    // 块B-①对称观测:第一程 sufficiency 落到 _=> 兜底(空/乱值)=静默降级,记一条供发现(不拦)。
+    if !crate::agent::sufficiency::is_sufficiency_recognized(&decision_first) {
+        write_event_for_account(
+            state,
+            &contact.account_id,
+            Some(&contact.wxid),
+            "ptier_self_assessment_malformed",
+            "warn",
+            "第一程 sufficiency 非已知三态，decide_tier_escalation 走兜底（静默降级）",
+            Some(doc! { "run_id": &run_id, "sufficiency": &decision_first.sufficiency }),
+        )
+        .await
+        .ok();
+    }
+
+    let mut forced_full = false;
+
+    let (mut decision, mut promote_risks) = match tier_decision {
+        crate::agent::sufficiency::TierDecision::Enough => {
+            if state.config.progressive_tier_enabled
+                && crate::agent::sufficiency::should_force_full_on_missing(
+                    &decision_first,
+                    &knowledge_route.knowledge_coverage,
+                )
+            {
+                // ②强升:自评 enough 但 coverage=missing 且需知识=确定高危(凭空答产品/事实),
+                // 当场升 Full 重生成。最多一次:Full 结果直接进五闸,不再触发强升(Full 已最高档)。
+                forced_full = true;
+                write_event_for_account(
+                    state,
+                    &contact.account_id,
+                    Some(&contact.wxid),
+                    "ptier_forced_full",
+                    "info",
+                    "第一程自评 enough 但 coverage=missing 且需知识，强制升 Full 重生成",
+                    Some(doc! {
+                        "run_id": &run_id,
+                        "knowledge_coverage": &knowledge_route.knowledge_coverage,
+                        "knowledge_need": &decision_first.knowledge_need,
+                    }),
+                )
+                .await
+                .ok();
+                decide_reply_with_promote(
+                    state,
+                    &contact,
+                    &inbound,
+                    &recent_messages,
+                    &pending_tasks,
+                    playbook.as_ref(),
+                    domain_config.as_ref(),
+                    &runtime,
+                    &memory,
+                    &context_pack,
+                    &selected_chunks,
+                    &knowledge_route,
+                    None,
+                    Some(&run_id),
+                    crate::agent::sufficiency::PromptTier::Full,
+                )
+                .await?
+            } else {
+                // ①观测(weak 灰区):未强升时查收窄后的 is_coverage_optimism,只记不拦。
+                if crate::agent::sufficiency::is_coverage_optimism(
+                    &decision_first,
+                    &knowledge_route.knowledge_coverage,
+                ) {
+                    write_event_for_account(
+                        state,
+                        &contact.account_id,
+                        Some(&contact.wxid),
+                        "ptier_coverage_optimism",
+                        "info",
+                        "第一程自评 enough 但知识覆盖 weak 且本轮需产品知识（观测，不拦截）",
+                        Some(doc! {
+                            "run_id": &run_id,
+                            "sufficiency": &decision_first.sufficiency,
+                            "knowledge_coverage": &knowledge_route.knowledge_coverage,
+                            "knowledge_need": &decision_first.knowledge_need,
+                        }),
+                    )
+                    .await
+                    .ok();
+                }
+                // ①对称观测:自评 enough 停 Lean,但本轮触及关系信号(意图轨迹非空)→疑似关系档漏判。
+                if decision_first.sufficiency == "enough" && !contact.intent_trajectory.is_empty() {
+                    write_event_for_account(
+                        state,
+                        &contact.account_id,
+                        Some(&contact.wxid),
+                        "ptier_relational_optimism",
+                        "info",
+                        "第一程自评 enough 停 Lean，但本轮存在意图轨迹（疑似关系档漏判，观测）",
+                        Some(doc! {
+                            "run_id": &run_id,
+                            "intent_trajectory_len": contact.intent_trajectory.len() as i64,
+                        }),
+                    )
+                    .await
+                    .ok();
+                }
+                (decision_first, promote_risks_first)
+            }
+        }
+        crate::agent::sufficiency::TierDecision::Escalate(target_tier) => {
+            // 升档重生成（B+）：第二程按 target_tier(Relational/Full) 全量注入对应槽位。
+            // 成本翻倍，但只在 need_more_context 时发生，符合设计预期。
+            write_event_for_account(
+                state,
+                &contact.account_id,
+                Some(&contact.wxid),
+                "ptier_escalated",
+                "info",
+                &format!("第一程小档信息不足，升档重生成: {:?}", target_tier),
+                Some(doc! { "run_id": &run_id, "target_tier": format!("{:?}", target_tier) }),
+            )
+            .await
+            .ok();
+            decide_reply_with_promote(
+                state,
+                &contact,
+                &inbound,
+                &recent_messages,
+                &pending_tasks,
+                playbook.as_ref(),
+                domain_config.as_ref(),
+                &runtime,
+                &memory,
+                &context_pack,
+                &selected_chunks,
+                &knowledge_route,
+                None,
+                Some(&run_id),
+                target_tier,
+            )
+            .await?
+        }
+        crate::agent::sufficiency::TierDecision::Clarify => {
+            // C：信息不足需澄清。第一程已生成澄清向回复，直接用它进后续 review/finalize。
+            // 注：是否把「need_clarification 时只输出澄清问句、不硬答」用 prompt 契约收紧，
+            // 取决于下面观测信号反映的真实硬答率（设计 §2.2 的取证前置）。本步只增强可观测性，
+            // 不改发送行为——澄清回复仍正常走 review。
+            // 观测信号（客观度量，非语义词表，agent-first）：reply_text 长度 + 是否含问号。
+            // 纯澄清问句通常短且含问号；「硬答+澄清混合」通常更长、问号在大段断言之后或缺失。
+            // 这些客观量供后续机器扫描量化硬答率，语义判断留给取证分析，不在此处用词表硬判。
+            let reply_chars = decision_first.reply_text.chars().count() as i64;
+            let has_question_mark = decision_first.reply_text.contains('?')
+                || decision_first.reply_text.contains('？');
+            write_event_for_account(
+                state,
+                &contact.account_id,
+                Some(&contact.wxid),
+                "ptier_clarify",
+                "info",
+                "第一程判定信息不足，输出澄清向回复",
+                Some(doc! {
+                    "run_id": &run_id,
+                    "clarification_intent": &decision_first.clarification_intent,
+                    "reply_char_count": reply_chars,
+                    "reply_has_question_mark": has_question_mark,
+                }),
+            )
+            .await
+            .ok();
+            (decision_first, promote_risks_first)
+        }
+    };
+    // run tier 元信息(不碰 models.rs,走事件;tier_used: forced_full→full / escalated→escalated / 否则 lean)。
+    let tier_used = if forced_full {
+        "full"
+    } else if escalated {
+        "escalated"
+    } else {
+        "lean"
+    };
+    write_event_for_account(
+        state,
+        &contact.account_id,
+        Some(&contact.wxid),
+        "ptier_run_tier",
+        "info",
+        "渐进式三档本轮档位元信息",
+        Some(doc! {
+            "run_id": &run_id,
+            "tier_used": tier_used,
+            "sufficiency": &decision.sufficiency,
+            "escalated": escalated,
+            "forced_full": forced_full,
+        }),
+    )
+    .await
+    .ok();
     normalize_decision_state(&mut decision, domain_config.as_ref());
     normalize_decision_runtime(&mut decision, &initial_planner);
     let mut planner = planner_from_decision(&decision, "Reply Agent 单轮决策（知识路由前置）");
@@ -964,7 +1185,14 @@ async fn run_user_operation_gateway_inner(
     apply_confidence_override(&mut planner, &decision, &runtime);
     normalize_decision_runtime(&mut decision, &planner);
     decision.context_pack_version = Some(next_memory_card_version(&memory));
-    decision.used_knowledge_ids = route_used_knowledge_ids(&knowledge_route);
+    // ⑤口径修正:Lean/Relational 都不注入业务知识(include_business=matches!(tier,Full),decision.rs:297)。
+    // 若没读切片的决策记了路由命中 id,会架空 grounding 硬闸(取 used∩verified 非空即放行——
+    // 没读过任何切片却记了路由 id=误当"Agent 读过")。仅当本决策确实经 **Full** 知识档
+    // (forced_full=强升Full,或 escalated_to_full=升档到Full)时才记路由 id;
+    // 纯 Lean-Enough / Clarify(Lean) / 升到 Relational(同样 include_business=false)都不记。
+    if forced_full || escalated_to_full {
+        decision.used_knowledge_ids = route_used_knowledge_ids(&knowledge_route);
+    }
     let _ = &mut promote_risks;
     // MP-5 / Task 15：进入 review 前预算超额则降级到 local。
     // agent-autonomy-loop W2 / Task 3.1：`local_decision_review` 改为接受
@@ -1082,6 +1310,7 @@ async fn run_user_operation_gateway_inner(
                 &knowledge_route,
                 Some(&review.rewrite_instruction),
                 Some(&run_id),
+                crate::agent::sufficiency::PromptTier::Full,
             )
             .await?;
             let prior_namecard = final_decision.namecard_to_send.clone();
@@ -1383,6 +1612,7 @@ async fn run_user_operation_gateway_inner(
                 &knowledge_route,
                 Some(&revision_direction),
                 Some(&run_id),
+                crate::agent::sufficiency::PromptTier::Full,
             );
             match tokio::time::timeout(std::time::Duration::from_secs(30), revision_future).await {
                 Ok(Ok((mut revised_decision, revised_promote_risks))) => {
@@ -1838,7 +2068,23 @@ async fn run_user_operation_gateway_inner(
         }
     }
 
-    apply_agent_updates(state, &contact, &final_decision, &runtime, domain_config.as_ref()).await?;
+    // 子计划2 Task3/Task4：tag_observation 证据锚定 + customer_stage 强弱门控均需按
+    // created_at 升序（最早在前，0-based）的对话窗口——与 prompt 呈现给 LLM 的顺序一致。
+    // `recent_messages` 来自 load_recent_messages，按 {created_at:-1} 降序（最新在前），
+    // 故此处反转成升序后共享给 apply_agent_updates（Task4）与 apply_operating_memory_update
+    // （Task3），只构造一次。
+    let ascending_window: Vec<ConversationMessage> =
+        recent_messages.iter().rev().cloned().collect();
+    apply_agent_updates(
+        state,
+        &contact,
+        &final_decision,
+        &runtime,
+        domain_config.as_ref(),
+        &ascending_window,
+        &run_id,
+    )
+    .await?;
     apply_operating_memory_update(
         state,
         &contact,
@@ -1846,6 +2092,7 @@ async fn run_user_operation_gateway_inner(
         &final_decision,
         &context_pack,
         should_refresh_context,
+        &ascending_window,
         &run_id,
     )
     .await?;
@@ -3092,39 +3339,7 @@ fn flip_of(old: Option<&str>, new: Option<&str>) -> Option<(String, String)> {
     }
 }
 
-/// 逐消息自动回复路径的标签累积上限。union 后超过此数时，本轮新增的溢出标签暂不并入
-/// （保留已累积画像），真正的裁剪 / 去重 / 冲突消解交给有版本锁的 memory consolidation
-/// 路径，而非每条消息的写侧——逐消息路径保守优先。
-const TAGS_PER_MESSAGE_CAP: usize = 16;
-
-/// 标签写侧 union + cap（纯函数，无 IO）：把本轮 `new` 标签**只增不减**地并入已累积
-/// `old`，去重保序，封顶 `cap`。取代旧的整体覆盖写法——
-/// [[cautious-profiling]] 红线的**结构层**防御：即使 LLM 单轮 `decision.tags` 漏掉已
-/// 累积标签或贴情景标签，结构层也保证长期画像不被一句弱信号抹平。
-///
-/// 语义：
-/// * 先保留全部 `old`（累积画像优先），再追加 `new` 中 old 未含的标签；
-/// * 封顶时保留靠前（累积）标签、丢弃溢出新增——宁可不更新，不要误抹；删除 / 替换交给
-///   consolidation（有版本锁 / 去重 / 冲突追踪），不在逐消息路径做。
-///
-/// 定位仿 [`compute_profile_churn`]：纯函数、可确定性单测、零副作用。注意 churn 探针仍按
-/// `decision.tags` **原始单轮意图**量化（不看 merge 结果），故结构层修复后 churn 仍能独立
-/// 反映 LLM 单轮是否还想丢标签 / 贴情景标签。
-pub(crate) fn merge_tags_union_capped(old: &[String], new: &[String], cap: usize) -> Vec<String> {
-    let mut merged: Vec<String> = Vec::with_capacity(old.len() + new.len());
-    for tag in old.iter().chain(new.iter()) {
-        if !merged.iter().any(|m| m == tag) {
-            merged.push(tag.clone());
-        }
-    }
-    if merged.len() > cap {
-        merged.truncate(cap);
-    }
-    merged
-}
-
 /// 逐消息短期记忆（memory_summary）的保留行数上限。超过时丢弃最旧的行——记忆偏好"保新"，
-/// 与 [`merge_tags_union_capped`] 的"保已累积"方向相反：标签是长期画像资产（误删代价高，保旧），
 /// 短期 memory_summary 是滚动上下文（旧行已被 consolidation 吸收进 memoryCard，保新更有信息量）。
 const MEMORY_SUMMARY_MAX_LINES: usize = 12;
 /// memory_summary 字节软上限。封顶时从最旧行开始整行丢弃直到落到上限内，避免逐字符截断切碎多字节中文。
@@ -3166,12 +3381,55 @@ pub(crate) fn merge_memory_summary_dedup_capped(
     lines.join("\n")
 }
 
+/// 子计划2 Task4：customer_stage 是否允许逐轮实时写入 domain_attributes。
+/// 仅强证据放行；弱证据 → false（不实时写，沉淀 tag_observation 暂定层等压缩重判）。
+/// 强弱由 Task1 纯函数客观判定（证据方向 + explicit 标志），不读 LLM 自称置信。
+pub(crate) fn stage_realtime_write_allowed(
+    strength: crate::agent::tag_evidence::EvidenceStrength,
+) -> bool {
+    matches!(strength, crate::agent::tag_evidence::EvidenceStrength::Strong)
+}
+
+/// 贝叶斯评估旁路（子计划4 Task2）：把 LLM 输出的维度观察映射成
+/// [`ObservedDimension`]。**强证据数由代码侧据消息方向客观计算**——锚定到客户本人
+/// (Inbound) 消息的证据才计入强证据，不信 LLM 自报的 `confidence`（confidence 仅作
+/// 观察值原样带入）。纯函数，便于单测强证据口径。纯观测，永不驱动决策。
+fn build_observed_dimensions(
+    decision: &AgentDecision,
+    window: &[ConversationMessage],
+) -> Vec<crate::agent::bayesian_slots::ObservedDimension> {
+    decision
+        .bayesian_observations
+        .iter()
+        .map(|o| {
+            let ev = crate::agent::tag_evidence::resolve_evidence(window, &o.evidence_turns);
+            let strong = ev
+                .iter()
+                .filter(|e| {
+                    window
+                        .get(e.turn as usize)
+                        .map(|m| matches!(m.direction, MessageDirection::Inbound))
+                        .unwrap_or(false)
+                })
+                .count() as i32;
+            crate::agent::bayesian_slots::ObservedDimension {
+                dimension: o.dimension.clone(),
+                value: o.value.clone(),
+                confidence: o.confidence,
+                strong_evidence_count: strong,
+            }
+        })
+        .collect()
+}
+
 async fn apply_agent_updates(
     state: &AppState,
     contact: &Contact,
     decision: &AgentDecision,
     runtime: &UserRuntimeParameters,
     domain_config: Option<&OperationDomainConfig>,
+    window: &[ConversationMessage],
+    run_id: &str,
 ) -> AppResult<()> {
     let mut set_doc = doc! {
         "updated_at": DateTime::now(),
@@ -3180,16 +3438,6 @@ async fn apply_agent_updates(
 
     if let Some(profile) = &decision.profile_update {
         set_doc.insert("agent_profile", to_document(profile)?);
-    }
-    if !decision.tags.is_empty() {
-        // [[cautious-profiling]] 结构层修复（Phase B Round 2）：旧写法 `set_doc.insert("tags",
-        // to_bson_array(&decision.tags))` 是**整体覆盖**——LLM 单轮只要给非空 tags 就把累积画像
-        // 整列替换，无 union / 无置信门 / 无情景标签隔离。情景压力下 LLM 倾向输出本轮情景化标签
-        // （实测对抗压力弧贴 "对抗测试"），直接覆写成持久画像。改为 union + cap：只增不减地并入，
-        // 保证一句弱信号无法抹平长期标签。删除 / 替换 / 冲突消解交给有版本锁的 consolidation
-        // 路径，逐消息写侧保守优先（宁可不更新，不要误抹）。churn 探针仍按原始 decision.tags 量化。
-        let merged = merge_tags_union_capped(&contact.tags, &decision.tags, TAGS_PER_MESSAGE_CAP);
-        set_doc.insert("tags", to_bson_array(&merged));
     }
     // universal-domain-adaptation H1 / 1D：先把 typed 维度镜像进 domain_signals
     // 容器（销售域 = customer_stage/intent_level，陪伴域可带任意维度），再经统一写入
@@ -3331,8 +3579,13 @@ async fn apply_agent_updates(
         // 并写入一个**不同**的合法态（违反"保持旧值"语义、破坏 C2 既有 rejected 行为）。故仅对
         // domain_attributes 写入用一份剔除 customer_stage 的过滤副本，容器本身保持原样供 C2 拒迁移。
         // 先把判定收敛成 owned 数据：避免 to_stage 的不可变借用与后续可变借用冲突。
+        let proposed_stage: Option<String> = signals_decision
+            .domain_signals
+            .get_str("customer_stage")
+            .ok()
+            .map(str::to_string);
         let stage_rejection: Option<(Option<String>, String, String)> =
-            match signals_decision.domain_signals.get_str("customer_stage").ok() {
+            match proposed_stage.as_deref() {
                 Some(to_stage) if prev_stage != Some(to_stage) => {
                     crate::agent::guards::check_state_transition(domain_config, prev_stage, to_stage)
                         .map(|reason| (prev_stage.map(str::to_string), to_stage.to_string(), reason))
@@ -3361,10 +3614,44 @@ async fn apply_agent_updates(
             )
             .await;
         }
-        // domain_attributes 写入用的 signals：非法跳转时剔除 customer_stage（保持旧值），其余维度
-        // 照常写；合法/无 stage 时零拷贝直接借用原容器，字节级等价于改造前。
+        // 子计划2 Task4：customer_stage 强弱证据门控。强证据放行现有实时写入链路（仍照常
+        // 过上方 check_state_transition——强证据不绕状态机，只绕弱证据丢弃）；弱证据**不写**
+        // domain_attributes.customer_stage（保持旧值），改沉淀 tag_observation 暂定层等压缩
+        // 重判。强弱由 Task1 纯函数客观判定（证据方向 + explicit 标志），不读 LLM 自称置信。
+        // 先 resolve 升序窗口证据 + 判强弱，全程只读 signals/decision，无可变借用冲突。
+        let stage_evidences = crate::agent::tag_evidence::resolve_evidence(
+            window,
+            &decision.stage_evidence_turns,
+        );
+        let weak_stage_drop = proposed_stage.is_some()
+            && !stage_realtime_write_allowed(crate::agent::tag_evidence::evidence_strength(
+                &stage_evidences,
+                window,
+                decision.stage_explicit_intent,
+            ));
+        // 弱证据 + 本轮确有 stage 提案 + 未被状态机先行拒绝 → 落一条 dimension="customer_stage"
+        // 的暂定层 observation（reply 已发，写库失败 fail-soft 仅 warn，不 `?`）。状态机已拒绝
+        // 的提案不再重复落暂定层（已记 stage_transition_rejected 审计，语义是“保持旧值”）。
+        if weak_stage_drop && stage_rejection.is_none() {
+            if let Some(stage) = &proposed_stage {
+                if let Err(e) =
+                    write_stage_observation(state, contact, stage, &stage_evidences, run_id).await
+                {
+                    tracing::warn!(
+                        error = %e,
+                        contact_wxid = %contact.wxid,
+                        stage = %stage,
+                        "写 customer_stage 弱证据暂定层 observation 失败（fail-soft，不阻断）"
+                    );
+                }
+            }
+        }
+        // domain_attributes 写入用的 signals：非法跳转**或**弱证据时剔除 customer_stage
+        // （保持旧值），其余维度照常写；合法且强证据/无 stage 时零拷贝直接借用原容器，字节级
+        // 等价于改造前（Cow::Borrowed 保持）。注意只对 domain_attributes 写入用过滤副本，
+        // signals_decision.domain_signals 容器本身保持原样供下游 C2 派生读同一容器拒迁移。
         let signals_for_attrs: std::borrow::Cow<'_, mongodb::bson::Document> =
-            if stage_rejection.is_some() {
+            if stage_rejection.is_some() || weak_stage_drop {
                 let mut filtered = signals_decision.domain_signals.clone();
                 filtered.remove("customer_stage");
                 std::borrow::Cow::Owned(filtered)
@@ -3539,6 +3826,55 @@ async fn apply_agent_updates(
         .update_one(doc! { "_id": contact.id }, doc! { "$set": set_doc }, None)
         .await?;
 
+    // 贝叶斯评估旁路（子计划4 Task2）：纯观测侧路，**永不驱动**任何决策/筛选/状态机/
+    // 发送选择。代码侧据消息方向算每个维度的强证据数（不信 LLM 自报置信），增量更新后
+    // **只写回 bayesian_signals 单字段**（与 confirmed_tags/manual_tags/personality_profile/
+    // customer_stage 解耦）。current_turn 口径 = 升序窗口长度（per-call 观察轮计数，与
+    // apply_bayesian_update 内部 history turn 语义一致）。回复已异步发出，写回失败 fail-soft
+    // 仅 warn 不 `?`（既成事实纪律）。
+    if !decision.bayesian_observations.is_empty() {
+        let th = crate::agent::bayesian_slots::SlotPromotionThreshold {
+            min_hits: runtime.bayesian_slot_min_hits,
+            min_strong_evidence: runtime.bayesian_slot_min_strong,
+        };
+        let observed = build_observed_dimensions(decision, window);
+        let mut signals = contact.bayesian_signals.clone();
+        let current_turn = window.len() as i32;
+        crate::agent::bayesian_slots::apply_bayesian_update(
+            &mut signals,
+            &observed,
+            current_turn,
+            &th,
+        );
+        match mongodb::bson::to_bson(&signals) {
+            Ok(bson_signals) => {
+                if let Err(e) = state
+                    .db
+                    .contacts()
+                    .update_one(
+                        doc! { "_id": contact.id },
+                        doc! { "$set": { "bayesian_signals": bson_signals } },
+                        None,
+                    )
+                    .await
+                {
+                    tracing::warn!(
+                        error = %e,
+                        contact_wxid = %contact.wxid,
+                        "写回 bayesian_signals 失败（fail-soft，纯观测旁路，不阻断）"
+                    );
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    contact_wxid = %contact.wxid,
+                    "序列化 bayesian_signals 失败（fail-soft，纯观测旁路，不阻断）"
+                );
+            }
+        }
+    }
+
     // 数字分身 T6：决策后从 agent_generated_signals 提取 relationship_type 建议，
     // 校验合法后 upsert 写进建议 collection（不直接生效 contact——customer/peer/friend
     // 须经运营审核才回写）。全程 fail-soft：回复已异步发出，写建议失败绝不阻断主流程。
@@ -3634,8 +3970,14 @@ async fn apply_agent_updates(
         .domain_attributes
         .as_ref()
         .and_then(|d| d.get_str("intent_level").ok());
+    // 标签可信度改造：churn 探针改读 confirmed_tags 的 value 投影
+    let old_confirmed_values: Vec<String> = contact
+        .confirmed_tags
+        .iter()
+        .map(|c| c.value.clone())
+        .collect();
     let churn = compute_profile_churn(
-        &contact.tags,
+        &old_confirmed_values,
         &decision.tags,
         old_stage,
         decision.customer_stage.as_deref(),
@@ -3801,9 +4143,22 @@ async fn apply_operating_memory_update(
     decision: &AgentDecision,
     context_pack: &Document,
     _context_refreshed: bool,
+    window: &[ConversationMessage],
     run_id: &str,
 ) -> AppResult<()> {
     write_memory_candidates(state, contact, decision, run_id).await?;
+    // 子计划2 Task3：逐轮标签判断写 tag_observation 暂定层（不写 confirmed_tags）。
+    // 窗口序位约定：`window` 已由调用方反转为 created_at 升序（最早在前，0-based），
+    // 与 prompt 呈现给 LLM 的对话顺序一致——LLM 的 tag_evidence_turns 即对该升序窗口
+    // 的 0-based 下标。既成事实纪律：reply 已经过 outbox 送出，标签观察写库失败只 warn，
+    // 绝不向上抛错阻断（不用 `?`）。
+    if let Err(e) = write_tag_observations(state, contact, decision, window, run_id).await {
+        tracing::warn!(
+            error = %e,
+            contact_wxid = %contact.wxid,
+            "write_tag_observations failed; reply already sent, skipping tag observation write"
+        );
+    }
     if decision.operating_memory_update.is_empty() && context_pack.is_empty() {
         return Ok(());
     }
@@ -4408,6 +4763,66 @@ mod tests {
     #[test]
     fn media_send_order_unknown_pref_defaults_text_then_media() {
         assert_eq!(media_send_order(""), SendOrder::TextThenMedia);
+    }
+
+    // 子计划2 Task4：customer_stage 实时写入门控——仅强证据放行逐轮实时写入，
+    // 弱证据沉淀暂定层等压缩重判。
+    #[test]
+    fn stage_realtime_write_only_on_strong() {
+        use crate::agent::tag_evidence::EvidenceStrength;
+        assert!(stage_realtime_write_allowed(EvidenceStrength::Strong));
+        assert!(!stage_realtime_write_allowed(EvidenceStrength::Weak));
+    }
+
+    // 子计划4 Task2：贝叶斯维度观察映射——强证据数据由代码侧据消息方向算（锚定 Inbound
+    // 客户消息才计入强证据），不信 LLM 自报置信。纯函数口径单测。
+    #[test]
+    fn build_observed_dimensions_counts_inbound_evidence_as_strong() {
+        use crate::agent::types::BayesianObservationRaw;
+        use mongodb::bson::oid::ObjectId;
+
+        fn msg(dir: MessageDirection) -> ConversationMessage {
+            ConversationMessage {
+                id: Some(ObjectId::new()),
+                workspace_id: "ws".into(),
+                account_id: "acc".into(),
+                contact_wxid: "wx".into(),
+                message_id: None,
+                dedupe_key: None,
+                direction: dir,
+                content: "x".into(),
+                msg_type: None,
+                media_ref: None,
+                raw: None,
+                created_at: DateTime::now(),
+            }
+        }
+        // window[0]=客户(Inbound)，window[1]=我方(Outbound)。
+        let window = vec![msg(MessageDirection::Inbound), msg(MessageDirection::Outbound)];
+        let mut decision = AgentDecision::default();
+        decision.bayesian_observations = vec![
+            // 锚定 Inbound → strong=1。
+            BayesianObservationRaw {
+                dimension: "价格敏感度".into(),
+                value: "高".into(),
+                confidence: 0.9,
+                evidence_turns: vec![0],
+            },
+            // 仅锚定 Outbound → strong=0（不信高置信自报）。
+            BayesianObservationRaw {
+                dimension: "决策果断度".into(),
+                value: "低".into(),
+                confidence: 0.95,
+                evidence_turns: vec![1],
+            },
+        ];
+        let observed = build_observed_dimensions(&decision, &window);
+        assert_eq!(observed.len(), 2);
+        assert_eq!(observed[0].dimension, "价格敏感度");
+        assert_eq!(observed[0].strong_evidence_count, 1, "Inbound 证据应计入强证据");
+        assert_eq!(observed[0].confidence, 0.9, "confidence 作为观察值原样带入");
+        assert_eq!(observed[1].dimension, "决策果断度");
+        assert_eq!(observed[1].strong_evidence_count, 0, "Outbound 证据不计入强证据");
     }
 
     // ⑥ 承诺兑现观测：reply 时间承诺特征检测（弱启发，仅观测覆盖率）。
@@ -5022,48 +5437,6 @@ mod tests {
         assert_eq!(r.tags_added, 0);
         assert_eq!(r.tags_net, 0);
         assert!(!r.notable);
-    }
-
-    // ---- merge_tags_union_capped 标签写侧结构层防御（纯函数，确定性单测）----
-
-    /// ① 累积画像不被单轮覆盖：old=[A,B,C] new=[A] → 仍含 [A,B,C]（保序，只增不减）。
-    /// 这是 [[cautious-profiling]] 结构层红线——一句弱信号无法抹平长期标签。
-    #[test]
-    fn merge_tags_keeps_accumulated_against_overwrite() {
-        let out = merge_tags_union_capped(
-            &s(&["高LTV老客户", "技术", "理性决策"]),
-            &s(&["高LTV老客户"]),
-            TAGS_PER_MESSAGE_CAP,
-        );
-        assert_eq!(out, s(&["高LTV老客户", "技术", "理性决策"]), "覆盖式单轮不得丢累积标签");
-    }
-
-    /// ② 新增标签 union 进来：old=[A,B] new=[C] → [A,B,C]，old 在前保序。
-    #[test]
-    fn merge_tags_appends_new_in_order() {
-        let out = merge_tags_union_capped(&s(&["A", "B"]), &s(&["C"]), TAGS_PER_MESSAGE_CAP);
-        assert_eq!(out, s(&["A", "B", "C"]));
-    }
-
-    /// ③ 去重：old 与 new 重叠只保留一份，且保 old 的位置。
-    #[test]
-    fn merge_tags_dedups_overlap() {
-        let out = merge_tags_union_capped(&s(&["A", "B"]), &s(&["B", "D"]), TAGS_PER_MESSAGE_CAP);
-        assert_eq!(out, s(&["A", "B", "D"]), "重叠去重，保 old 顺序");
-    }
-
-    /// ④ 封顶保累积、丢溢出新增：cap=2，old=[A,B] new=[C] → [A,B]（宁可不更新）。
-    #[test]
-    fn merge_tags_cap_prefers_accumulated() {
-        let out = merge_tags_union_capped(&s(&["A", "B"]), &s(&["C"]), 2);
-        assert_eq!(out, s(&["A", "B"]), "封顶时丢溢出新增，保累积画像");
-    }
-
-    /// ⑤ old 空：首次画像直接吃 new（去重保序），不受影响。
-    #[test]
-    fn merge_tags_empty_old_takes_new() {
-        let out = merge_tags_union_capped(&[], &s(&["A", "A", "B"]), TAGS_PER_MESSAGE_CAP);
-        assert_eq!(out, s(&["A", "B"]), "首次画像吃 new 并去重");
     }
 
     // ── Phase B Round 3：memory_summary 去重 + cap 写侧严谨化（[[cautious-profiling]] 第3点）──

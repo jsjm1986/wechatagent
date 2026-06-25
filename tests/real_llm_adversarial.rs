@@ -333,7 +333,13 @@ fn managed_contact(wxid: &str) -> Contact {
         memory_summary: None,
         playbook_id: None,
         playbook_version: None,
-        tags: Vec::new(),
+        manual_tags: Vec::new(),
+        confirmed_tags: Vec::new(),
+        bayesian_signals: Vec::new(),
+        personality_profile: None,
+        manual_tags_updated_at: None,
+        manual_tags_by: None,
+        tags_version: 0,
         domain_attributes: None,
         domain_attributes_updated_at: None,
         commitments: Vec::new(),
@@ -1062,7 +1068,7 @@ async fn cap_snapshot(state: &AppState, arc: &str, wxid: &str, turn: usize, prev
         .unwrap_or("<none>");
     eprintln!(
         "[cap][turn-{turn}][画像] tags={:?} stage={stage} intent={intent} operation_state={:?}",
-        contact.tags, contact.operation_state
+        contact.manual_tags, contact.operation_state
     );
 
     let traj = &contact.intent_trajectory;
@@ -1775,7 +1781,7 @@ async fn t_longrun_capability() {
         communication_style: "随性、分散在不同时间聊".to_string(),
         operation_goal: "长期维护，自然推进续费".to_string(),
     });
-    contact.tags = vec!["老客户".to_string()];
+    contact.manual_tags = vec!["老客户".to_string()];
     contact.domain_attributes = Some(doc! { "customer_stage": "维护", "intent_level": "中" });
     state.db.contacts().insert_one(&contact, None).await.expect("insert contact");
 
@@ -1930,7 +1936,7 @@ async fn t_longrun_capability() {
         .unwrap_or("<none>");
     eprintln!(
         "[长程][终态] tags={:?} stage={final_stage} intent={final_intent} intent_trajectory_len={} memory_summary_len={} commitments={}",
-        final_contact.tags,
+        final_contact.manual_tags,
         final_contact.intent_trajectory.len(),
         final_contact.memory_summary.as_deref().map(str::len).unwrap_or(0),
         final_contact.commitments.len()

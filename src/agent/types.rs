@@ -96,6 +96,20 @@ pub struct AgentDecision {
     pub profile_update: Option<AgentProfile>,
     #[serde(default, deserialize_with = "string_or_vec")]
     pub tags: Vec<String>,
+    /// 子计划2：LLM 指认的标签证据——窗口内消息序位（0-based）。代码侧映射回 _id 并 fail-closed 校验。
+    #[serde(default)]
+    pub tag_evidence_turns: Vec<i32>,
+    /// customer_stage 判断的证据序位。
+    #[serde(default)]
+    pub stage_evidence_turns: Vec<i32>,
+    /// LLM 标注：customer_stage 是否基于客户明示意图（非 AI 语境推断）。
+    #[serde(default)]
+    pub stage_explicit_intent: bool,
+    /// 子计划4：贝叶斯评估旁路——LLM 自由发现的客户维度观察（最多 6 个，开放维度）。
+    /// 纯观测侧路，**永不驱动**任何决策/筛选/状态机；gateway 发送后用代码侧证据强度
+    /// 统计 + apply_bayesian_update 增量更新写回 `Contact.bayesian_signals`。
+    #[serde(default)]
+    pub bayesian_observations: Vec<BayesianObservationRaw>,
     pub customer_stage: Option<String>,
     pub intent_level: Option<String>,
     /// universal-domain-adaptation H1：对维度名零假设的开放画像信号容器。
@@ -236,6 +250,17 @@ pub struct AgentDecision {
     /// outbox 条目，并做 approved + 候选校验防幻觉；推完 AI 退居辅助。
     #[serde(default)]
     pub namecard_to_send: Option<NamecardDirective>,
+
+    /// 渐进式三档 + 充分性自评（2026-06-23）：Reply Agent 自评本轮信息是否充分。
+    /// - sufficiency: "enough" | "need_more_context" | "need_clarification"
+    /// - missing_tier: "none" | "relational" | "full"
+    /// - clarification_intent: 若 need_clarification，给澄清方向
+    #[serde(default)]
+    pub sufficiency: String,
+    #[serde(default)]
+    pub missing_tier: String,
+    #[serde(default)]
+    pub clarification_intent: String,
 }
 
 /// 单条素材发送指令：LLM 从注入的「可发送素材」候选清单里选出的一项。
@@ -261,6 +286,22 @@ pub struct NamecardDirective {
     pub reason: Option<String>,
 }
 
+/// 子计划4：贝叶斯评估旁路的单条维度观察（LLM 输出形态）。
+/// `confidence` 是 LLM 自报的观察值；**强证据数不由 LLM 自报**——代码侧用
+/// `evidence_turns` + 消息方向（客户入站消息）在 gateway 计算。纯观测，永不驱动决策。
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct BayesianObservationRaw {
+    #[serde(default)]
+    pub dimension: String,
+    #[serde(default)]
+    pub value: String,
+    #[serde(default)]
+    pub confidence: f64,
+    #[serde(default)]
+    pub evidence_turns: Vec<i32>,
+}
+
 impl Default for AgentDecision {
     fn default() -> Self {
         Self {
@@ -272,6 +313,10 @@ impl Default for AgentDecision {
             reply_text: String::new(),
             profile_update: None,
             tags: Vec::new(),
+            tag_evidence_turns: Vec::new(),
+            stage_evidence_turns: Vec::new(),
+            stage_explicit_intent: false,
+            bayesian_observations: Vec::new(),
             customer_stage: None,
             intent_level: None,
             domain_signals: Document::new(),
@@ -326,6 +371,10 @@ impl Default for AgentDecision {
             assets_to_send: Vec::new(),
             // 名片引荐：默认 None（LLM 不推时不发任何名片）
             namecard_to_send: None,
+            // 渐进式三档 + 充分性自评（2026-06-23）：默认空（LLM 未输出时不触发档位提升）
+            sufficiency: String::new(),
+            missing_tier: String::new(),
+            clarification_intent: String::new(),
         }
     }
 }
@@ -387,6 +436,19 @@ pub struct RawAgentDecision {
     pub knowledge_route: Option<KnowledgeRouteResult>,
     pub profile_update: Option<AgentProfile>,
     pub tags: Option<Vec<String>>,
+    /// 子计划2：LLM 指认的标签证据窗口序位（promote 后透传到 AgentDecision.tag_evidence_turns）。
+    #[serde(default)]
+    pub tag_evidence_turns: Option<Vec<i32>>,
+    /// customer_stage 判断的证据序位。
+    #[serde(default)]
+    pub stage_evidence_turns: Option<Vec<i32>>,
+    /// LLM 标注：customer_stage 是否基于客户明示意图（非 AI 语境推断）。
+    #[serde(default)]
+    pub stage_explicit_intent: Option<bool>,
+    /// 子计划4：贝叶斯评估旁路——LLM 自由发现的客户维度观察（promote 后透传到
+    /// AgentDecision.bayesian_observations）。纯观测，永不驱动决策。
+    #[serde(default)]
+    pub bayesian_observations: Option<Vec<BayesianObservationRaw>>,
     pub customer_stage: Option<String>,
     pub intent_level: Option<String>,
     /// universal-domain-adaptation G1：对维度名零假设的开放画像信号容器。非销售
@@ -425,6 +487,14 @@ pub struct RawAgentDecision {
     /// 专属顾问名片引荐：LLM 输出的名片引荐指令（先落 Option 容器，再由
     /// carry-through 透传到 `AgentDecision.namecard_to_send`）。
     pub namecard_to_send: Option<NamecardDirective>,
+
+    /// 渐进式三档 + 充分性自评（2026-06-23）：Reply Agent 自评本轮信息是否充分。
+    #[serde(default)]
+    pub sufficiency: Option<String>,
+    #[serde(default)]
+    pub missing_tier: Option<String>,
+    #[serde(default)]
+    pub clarification_intent: Option<String>,
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -908,6 +978,20 @@ fn carry_through_fields(raw: RawAgentDecision, decision: &mut AgentDecision) {
     if let Some(v) = raw.tags {
         decision.tags = v;
     }
+    // 子计划2：标签/stage 证据序位 + 明示意图标志透传。只在 Some 时覆盖，None 保持默认空。
+    if let Some(v) = raw.tag_evidence_turns {
+        decision.tag_evidence_turns = v;
+    }
+    if let Some(v) = raw.stage_evidence_turns {
+        decision.stage_evidence_turns = v;
+    }
+    if let Some(v) = raw.stage_explicit_intent {
+        decision.stage_explicit_intent = v;
+    }
+    // 子计划4：贝叶斯维度观察透传（纯观测，永不驱动决策）。
+    if let Some(v) = raw.bayesian_observations {
+        decision.bayesian_observations = v;
+    }
     if raw.customer_stage.is_some() {
         decision.customer_stage = raw.customer_stage;
     }
@@ -1008,6 +1092,17 @@ fn carry_through_fields(raw: RawAgentDecision, decision: &mut AgentDecision) {
     if let Some(v) = raw.namecard_to_send {
         decision.namecard_to_send = Some(v);
     }
+    // 渐进式三档 + 充分性自评（2026-06-23）：LLM 输出的自评字段若不在此透传，
+    // promote 后永远为空字符串、自评结果被静默丢弃。只在 Some 时覆盖，None 保持默认空。
+    if let Some(v) = raw.sufficiency {
+        decision.sufficiency = v;
+    }
+    if let Some(v) = raw.missing_tier {
+        decision.missing_tier = v;
+    }
+    if let Some(v) = raw.clarification_intent {
+        decision.clarification_intent = v;
+    }
     // 自治协议 9 字段已在 promote 主路径填好（或在 minimal/tool_calling 分支处理），
     // 此处不再覆盖，避免 final 轮的 trim 后值被原始 Some(空白) 覆盖。
 }
@@ -1056,6 +1151,12 @@ pub struct ReviewScores {
     /// 等个位数阈值同档比较）。R11 兼容：缺省 `0`，旧 review JSON 反序列化不破坏。
     #[serde(default, deserialize_with = "number_i32")]
     pub pressure_risk: i32,
+    /// 渐进式三档+隐私维度(2026-06-23)：边界/隐私安全评分(0-10,越高越安全)。
+    /// 判断候选回复是否:(a)泄露对客户的内部画像/评判;(b)暴露AI身份;
+    /// (c)暴露幕后决策源(领导)或内部系统信息。≤3视为失败→触发改写。
+    /// 向后兼容:缺省0(最保守)。
+    #[serde(default, deserialize_with = "number_i32")]
+    pub boundary_privacy_safety: i32,
 }
 
 #[derive(Debug, Serialize, Deserialize, Default, Clone)]
@@ -1525,14 +1626,6 @@ pub(crate) fn non_empty_option(value: &Option<String>) -> Option<String> {
         .map(ToString::to_string)
 }
 
-pub(crate) fn to_bson_array(values: &[String]) -> Vec<mongodb::bson::Bson> {
-    values
-        .iter()
-        .cloned()
-        .map(mongodb::bson::Bson::String)
-        .collect()
-}
-
 pub(crate) fn parse_rfc3339_to_bson(value: &str) -> Option<mongodb::bson::DateTime> {
     mongodb::bson::DateTime::parse_rfc3339_str(value).ok()
 }
@@ -1638,6 +1731,10 @@ mod validate_and_promote_tests {
             allowed_conversation_modes: crate::agent::runtime::default_conversation_modes(),
             grounding_gate_bypass_without_claim: false,
             distrust_self_reported_low_risk: false,
+            consolidation_window_char_budget: 6000,
+            consolidation_window_max_messages: 60,
+            bayesian_slot_min_hits: 3,
+            bayesian_slot_min_strong: 2,
         }
     }
 
@@ -2074,6 +2171,21 @@ mod validate_and_promote_tests {
         let (decision, _risks) = raw.validate_and_promote(&runtime);
         assert!(decision.assets_to_send.is_empty());
     }
+
+    /// 子计划2 Task2：carry_through_fields 须把 LLM 指认的标签/stage 证据序位
+    /// + 明示意图标志透传到最终 AgentDecision，不能静默丢失。
+    #[test]
+    fn carry_through_propagates_evidence_fields() {
+        let mut raw = RawAgentDecision::default();
+        raw.tag_evidence_turns = Some(vec![1, 2]);
+        raw.stage_evidence_turns = Some(vec![3]);
+        raw.stage_explicit_intent = Some(true);
+        let mut decision = AgentDecision::default();
+        carry_through_fields(raw, &mut decision);
+        assert_eq!(decision.tag_evidence_turns, vec![1, 2]);
+        assert_eq!(decision.stage_evidence_turns, vec![3]);
+        assert!(decision.stage_explicit_intent);
+    }
 }
 
 #[cfg(test)]
@@ -2390,5 +2502,23 @@ mod decision_review_result_tests {
 
         assert_eq!(scores.hallucination_score, 3);
         assert_eq!(scores.knowledge_grounding_score, 8);
+    }
+
+    #[test]
+    fn test_review_scores_boundary_privacy_dimension_backward_compat() {
+        // 老 JSON 缺 boundaryPrivacySafety 应成功反序列化取默认 0
+        let old_json = r#"{"humanLike":7,"emotionalValue":6}"#;
+        let scores: ReviewScores = serde_json::from_str(old_json).unwrap();
+        assert_eq!(scores.boundary_privacy_safety, 0);
+    }
+
+    #[test]
+    fn test_agent_decision_sufficiency_fields_backward_compat() {
+        // 老 JSON（无新字段）应成功反序列化，新字段取默认
+        let old_json = r#"{"reply_text":"test","conversation_mode":"casual_relationship"}"#;
+        let decision: AgentDecision = serde_json::from_str(old_json).unwrap();
+        assert_eq!(decision.sufficiency, "");
+        assert_eq!(decision.missing_tier, "");
+        assert_eq!(decision.clarification_intent, "");
     }
 }
