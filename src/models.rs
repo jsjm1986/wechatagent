@@ -3022,6 +3022,8 @@ pub struct ApiContact {
     pub playbook_id: Option<String>,
     pub playbook_version: Option<i32>,
     pub tags: Vec<String>,
+    /// 运营录入层：原始 manual_tags（与合并后的 `tags` 区分，供三层标签 UI 单独展示）。
+    pub manual_tags: Vec<String>,
     pub manual_tags_updated_at: Option<String>,
     pub manual_tags_by: Option<String>,
     pub confirmed_tags: Vec<ConfirmedTag>,
@@ -3073,6 +3075,7 @@ impl From<Contact> for ApiContact {
                 }
                 merged
             },
+            manual_tags: contact.manual_tags.clone(),
             manual_tags_updated_at: contact.manual_tags_updated_at.and_then(dt_to_string),
             manual_tags_by: contact.manual_tags_by,
             confirmed_tags: contact.confirmed_tags.clone(),
