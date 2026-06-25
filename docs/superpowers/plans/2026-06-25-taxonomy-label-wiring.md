@@ -39,7 +39,25 @@
 | `frontend/src/features/knowledge/trustTypes.ts` | completeness 维度走后端 dimensionList | B |
 | `src/routes/guide_profile.rs` | schema 加 suggestedValues 落候选 + 加三个 override 生成 | C |
 
-依赖：流 A Task 1（缓存加字段）是流 B 端点（Task 4）的前置；其余流内 Task 顺序见下。流 A/B/C 之间可并行（共享 system_taxonomies，无代码耦合），但 Task 1 必须最先。
+依赖：流 A Task 1（缓存加字段）是流 B 端点（Task 3）的前置；其余流内 Task 顺序见下。流 A/B/C 之间可并行（共享 system_taxonomies，无代码耦合），但 Task 1 必须最先。
+
+---
+
+## ⚠️ 可行性审查必修修正（实现前必读，覆盖下方 Task）
+
+2026-06-25 一次 4-agent 可行性审查（技术/业务/红线/对抗，全判 FEASIBLE_WITH_FIXES）抓出 5 项必修。实现对应 Task 时，**以本节为准**覆盖下方 Task 原文里被修正的部分：
+
+**M1 [blocker] 流 C label 通路必须先贯通（改 Task 8）。** 实测：`upsert_candidate`（taxonomy.rs:319）真实签名 `(db, scope_account_id, kind, raw_value, evidence: Option<&str>, confidence: i32)` **无 label 参数**；`TaxonomyCandidate`（models.rs:2588）**无 label 字段**；`approve`（taxonomy.rs:456）硬编码 `display_name = candidate.raw_value`（英文 id）。不修则 AI 的中文 label 全程丢失、approve 后字典仍是英文 id，**defeat 工程目标**。Task 8 扩为先贯通 label（6 处）：①`TaxonomyCandidate` 加 `suggested_display_name: Option<String>`（serde default 向后兼容）；②`upsert_candidate` 加 `suggested_display_name: Option<&str>` 参数写入候选；③`approve` 改 `display_name = candidate.suggested_display_name.unwrap_or(raw_value)`；④现有 `upsert_candidate` 调用点（decision_taxonomy.rs 等运行时落候选处）同步补 `None` 实参（行为不变）；⑤流 C 落候选调 `upsert_candidate(db,"global",kind,id,Some(label),None,<confidence>)`；⑥approve 路由可选回 suggested_display_name 供预览（本期可省）。
+
+**M2 [blocker] 鉴权用 AuthenticatedAdmin（改 Task 3）。** 实测：本系统**只有一种鉴权角色 `AuthenticatedAdmin`**（auth/middleware.rs:51 require_session 对 cookie/JWT 都注入它），无独立"运营态非 admin"角色；所有 `/api` 运营 handler（contacts.rs:106/160/200）都用 `Extension<AuthenticatedAdmin>`。计划里的 `AuthenticatedUser` **不存在**（编译失败）。Task 3 端点改用 `Extension<AuthenticatedAdmin>` + `admin.current_workspace`，与现有运营 handler 一致；无越权问题（系统无角色区分）。
+
+**M3 [major] 端点 taxonomies 的 kind 来源（改 Task 3）。** 端点**不能只遍历 `profile.profile_dimensions` 取 kind**——`relationship_type` 不是 profile 维度（DEFAULT profile_dimensions 只有 customer_stage/intent_level），只遍历它会导致 Task 6 的 relationship 下拉空。端点要取的 kind 集 = profile 维度 kind ∪ `["relationship_type"]`（前端要翻译的 AdminDirect 维度），逐个 `dimension_values_with_labels` 建 taxonomies。
+
+**M4 [major] completeness 需后端先加 dimensionList（改 Task 7）。** 实测：completeness 响应（catalog.rs:698 区域 `build_operation_knowledge_completeness`）只回 `coverage` + `answeringModeLabels`，**无 dimensionList 字段**；前端类型有、后端没回。且 completeness 维度来自 `DomainProfile.coverage_dimensions`（知识覆盖维度），与 active-view 的 `profile_dimensions`（画像维度）是**两套不同维度，勿混**。Task 7 扩为后端 + 前端两侧：(a) 后端 `build_operation_knowledge_completeness` 增产 `dimensionList`（key + 中文 label，源自 `active_profile.coverage_dimensions.display_name`）；(b) 前端解析优先读 dimensionList，缺省回落写死 DIM_ORDER。
+
+**M5 [major] profileStore 扩展而非替换（改 Task 4）。** 现有 `activeProfile` / `loadActiveProfile` 有真实调用方（Shell.tsx:136/162 频道 visibleWhen 门控、App.tsx:144），删除会断频道可见性。Task 4 **保留** `activeProfile` + `loadActiveProfile`，**新增** `dimensions`/`taxonomies`/`loadActiveView`/`labelFor`，两者并存。
+
+**minor（实现时注意）：** ①测试 helper 真名是 `make_entry`（taxonomy.rs:636，内部硬编码 display_name=canonical_id，需加 display_name 参数）/`make_cache_with_entries`（:611），非计划写的 `mk_entry`；改 helper 签名要同步所有调用点。②流 C 三个 override（M 之外）的 key 加进 `coerce_scalar_string_fields`（guide_profile.rs:93 SCALAR_STRING_KEYS）防 LLM 给对象/数组。③流 C 逐值串行 await upsert_candidate，几十维度×8 取值可能慢——本期维度少（≤3 维×3-8 值）无碍，`let _` 软化失败不阻断。④taxonomy scope 是 account_id，端点传 workspace 概念错位但 global seed 可达（account-first→global 回落），DEFAULT 取值能翻译。
 
 ---
 

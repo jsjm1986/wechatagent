@@ -100,11 +100,12 @@ generate_domain_profile_candidate 生成维度时
 
 **目标**：运营看客户画像时，维度值显示中文行业标签而非英文 canonical；下拉 / 五维卡按当前 profile 字典驱动。
 
-### 5.1 新增运营态只读端点（`src/routes/operation_view.rs`，新文件）
+### 5.1 新增聚合只读端点（`src/routes/operation_view.rs`，新文件）
 
-- `GET /api/operation/active-view`（路径前缀实现时对齐现有运营态惯例，参照 mod.rs 现有 `/operation-knowledge`、`/operation-domains` 命名）。
-- 权限：运营态 `require_session`（**不要** admin）——挂在 `/api` 普通鉴权下。区别于已有 admin-only 的 `active_domain_profile`。
+- `GET /api/operation/active-view`，挂在 `/api` 下（参照 mod.rs 现有 `/operation-knowledge`、`/operation-domains` 命名）。
+- **鉴权（可行性审查修正）**：本系统**只有一种鉴权角色 `AuthenticatedAdmin`**——`require_session`（auth/middleware.rs:51）对 cookie/JWT 都注入它，所有 `/api` 运营 handler（含 contacts.rs:106/160/200 看客户/改画像）统一用 `Extension<AuthenticatedAdmin>`。不存在独立的"运营态非 admin"角色。故本端点用 `Extension<AuthenticatedAdmin>` + `admin.current_workspace`，与现有运营 handler 一致；与 admin-only 的 `active_domain_profile` 同鉴权，区别仅是聚合 taxonomy 取值。原"运营态非 admin"前提删除（系统无此区分，无越权问题）。
 - 实现：`load_active_domain_profile`（已有，30s 缓存）拿维度声明 + 取 taxonomy 取值字典（带 display_name）。**取数走 TaxonomyCache（已在 4.1 补 display_name）**，与流 A 单一取数路径一致；无 active profile 时 `dimensions: []` + `taxonomies: {}`（合法状态，运行时回落 DEFAULT）。
+- **取值字典的 kind 来源（可行性审查修正 major #3）**：端点返回的 `taxonomies` **不能只遍历 `profile.profile_dimensions` 的 kind**——`relationship_type` 是 admin 直写维度，不在 profile_dimensions 里（DEFAULT profile_dimensions 只有 customer_stage/intent_level）。端点要取的 kind 集 = `profile_dimensions 的 kind` ∪ `前端要翻译的固定维度（relationship_type 等 AdminDirect 维度）`。实现时用一个明确的 kind 列表：profile 维度 kind + `["relationship_type"]`（或从 dimension_registry 取 value_source=Taxonomy 的 kind），逐个 `dimension_values_with_labels` 建 taxonomies。
 - 返回结构（camelCase wire）：
 
 ```json
@@ -119,10 +120,11 @@ generate_domain_profile_candidate 生成维度时
 }
 ```
 
+
 ### 5.2 扩展 profileStore（`frontend/src/stores/profileStore.ts`，现有文件）
 
-- 现状：调 `/api/admin/domain-profiles/active`，存 `activeProfile`，有降级。
-- 扩展：数据源改调新运营态端点 `/api/operation/active-view`，新增 `dimensions` + `taxonomies` state；暴露 `labelFor(kind, value): LabelResult`。
+- 现状：调 `/api/admin/domain-profiles/active`，存 `activeProfile` + `loadActiveProfile`，有降级。
+- **扩展而非替换（可行性审查 major #5）**：现有 `activeProfile` / `loadActiveProfile` **有真实调用方**（Shell.tsx:136 读 `s.activeProfile`、:162 频道 `visibleWhen(activeProfile)` 门控、App.tsx:144 调 `loadActiveProfile()`）——若删除会断频道可见性逻辑。所以**保留** `activeProfile` + `loadActiveProfile`，**新增** `dimensions` / `taxonomies` state + `loadActiveView()`（调新端点）+ `labelFor`。两者并存，不互相替换；App.tsx 挂载时除现有 `loadActiveProfile` 外再调一次 `loadActiveView`（或合并为一次加载，实现时确认 active-view 是否已含 profile 全量、能否让 activeProfile 也从它派生以省一次请求）。
 - 保留现有降级语义：拿不到数据时 `labelFor` 一律回落 `no_dict`（前端照常跑，只是没行业化数据）。
 
 ### 5.3 labelFor 三情形分流（核心翻译层）
@@ -146,9 +148,9 @@ labelFor(kind, value):
 
 ### 5.4 三个渲染点改造
 
-- `stageLabel`（legacy.tsx:2011）：`labelFor('customer_stage', stage)` 取代直出 canonical。
-- `relationship_type` 下拉（legacy.tsx:447 区域）：选项来自 `taxonomies.relationship_type`（取代写死枚举），label 走字典。
-- `completeness` 五维（trustTypes.ts:45 区域）：维度来自 `dimensions`（取代写死销售五维）——后端 catalog.rs:606 区域已动态回 profile 维度，前端改成读 `dimensions` 即对齐。
+- `stageLabel`（legacy.tsx:1997 区域，渲染 :2021）：`labelFor('customer_stage', stage)` 取代直出 canonical。
+- `relationship_type` 下拉（legacy.tsx:430 区域，现写死 customer/peer/friend）：选项来自 `taxonomies.relationship_type`（取代写死枚举），label 走字典。
+- `completeness` 维度（trustTypes.ts:45 DIM_ORDER 写死销售五维）：**改前必须先补后端数据源（可行性审查 major #4）**。实测现状：completeness 响应（catalog.rs:698 区域 `build_operation_knowledge_completeness`）只回 `coverage`（无 label）+ `answeringModeLabels`，**没有 dimensionList 字段**；前端 `CompletenessView.dimensionList`（trustTypes.ts:42）类型有、但后端没回。**注意命名空间不同**：completeness 维度来自 `DomainProfile.coverage_dimensions`（知识覆盖维度 capability/pricing/...），与 active-view 端点的 `profile_dimensions`（customer_stage/intent_level 画像维度）是**两套不同的维度**，不能混。所以本项改造 = (a) 后端 `build_operation_knowledge_completeness` 增产 `dimensionList`（key + 中文 label，源自 `active_profile.coverage_dimensions.display_name`）；(b) 前端 trustTypes.ts 解析优先读 `dimensionList`，仅缺省回落写死 DIM_ORDER。这是后端 + 前端两侧改动，不只 trustTypes.ts。
 
 ### 5.5 测试
 
@@ -182,7 +184,19 @@ prompt 指引 AI：`id` 用 snake_case 英文 canonical、`label` 用中文行�
 
 ### 6.2 落候选层（guide_profile.rs 生成流程末尾）
 
-profile 候选落库后，遍历各维度 `suggestedValues`，对每个值调已有 `upsert_candidate`（taxonomy.rs:319）落 `taxonomy_candidate`：scope=global、kind=维度 kind、value 带 id + label。与运行时 AI 跑出的新值进**同一张候选表、同一个 approve 通路**——一套机制。
+profile 候选落库后，遍历各维度 `suggestedValues`，对每个值落 `taxonomy_candidate`，与运行时 AI 跑出的新值进**同一张候选表、同一个 approve 通路**。
+
+**关键：label 通路必须先贯通（可行性审查 blocker #1）。** 实测现状：`upsert_candidate`（taxonomy.rs:319）真实签名是 `(db, scope_account_id, kind, raw_value, evidence: Option<&str>, confidence: i32)`——**没有 label 参数**；`TaxonomyCandidate`（models.rs:2588）**没有 label/display_name 字段**；`approve`（taxonomy.rs:456）硬编码 `display_name = candidate.raw_value.clone()`（即英文 id）。若不改，AI 生成的中文 label 全程丢失，approve 后字典 display_name 还是英文 canonical id——**直接 defeat 本工程"运营看到中文标签"的目标**。
+
+因此实现前必须贯通 label（6 处）：
+1. `TaxonomyCandidate`（models.rs:2588）加 `suggested_display_name: Option<String>`（`#[serde(default, skip_serializing_if=...)]` 向后兼容存量候选）。
+2. `upsert_candidate` 加 `suggested_display_name: Option<&str>` 参数，写入候选文档。
+3. `approve`（taxonomy.rs:456）把 `display_name = candidate.suggested_display_name.unwrap_or(raw_value)`，而非恒取 raw_value。
+4. 现有 `upsert_candidate` 调用点（运行时 AI 落候选处，decision_taxonomy.rs 等）同步加 `None` 实参（运行时不知 label，None 回落 raw_value，行为不变）。
+5. admin approve 路由（admin_taxonomy_candidates.rs）若展示候选，可顺带回 suggested_display_name 供审核者预览（可选，本期可省）。
+6. 流 C 落候选处：`upsert_candidate(db, "global", kind, id, Some(label), None, <confidence>)`。
+
+scope=global、kind=维度 kind、raw_value=AI 给的 id、suggested_display_name=AI 给的中文 label。`confidence` 取一个表示"AI 生成待审"的固定值（实现时与运行时候选的 confidence 口径对齐）。
 
 ### 6.3 红线守护
 
