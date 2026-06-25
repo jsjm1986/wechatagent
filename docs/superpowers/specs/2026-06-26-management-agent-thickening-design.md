@@ -92,25 +92,35 @@
 
 `build_management_plan` 的 LLM 只"选工具 + 填参"；`requires_confirmation` **由代码按档位裁定**（第一期 dangerous 开关默认关、irreversible 建议保留——见 §1.2）。语义判断交 LLM、安全裁定交代码。
 
-### 4.3 两条红线在工具层硬约束
+### 4.3 三条红线在工具层硬约束
 - 知识类**没有 auto-verify 工具**，只有 verify（人确认动作）——"AI 永不自动 verify"在工具集层堵死。
 - 发客户消息 / 改全局 prompt / 切 provider / rollout 放量一律 dangerous；reset/delete 为 irreversible。
+- **verify 工具的红线张力（亲核 verify.rs:101/110 确认，必须处理）**：`verify_operation_knowledge_chunk` 写库时 `source=ProvenanceSource::Human, actor=admin.username`——它假设"调用方=人点了按钮"。把它包成 AI 可调工具，等于"AI 的工具调用被记成人确认了 verified"，与"AI 永不自动 verify"语义冲突。**约束**：verify（及任何把 chunk 推向 verified 的工具）的确认门**恒强制开启、不随第一期 dangerous 开关放行**——即管理者必须人确认后才执行，且执行时 `actor` 标为管理者本人（确认动作=人做的），保留"人确认"的真实语义。这条不进第一期"放权"豁免。
 
 ### 4.4 提示词的自然语言修改边界（三层分级 + 双闸校验）
 
-管理者能用自然语言改提示词，但**不能改"全部"**——提示词里混有安全红线段、字节等价锚常量，随意全改会把红线一起改没。三层分级（用户 2026-06-26 决策）：
+> **本节经 4 路 opus 实证核实重写（2026-06-26）**。原草案有红线漏洞（详见末尾「核实修正」），下表是修正后的设计。
 
-| 层 | 能否对话改 | 内容 | 通路 |
+管理者能用自然语言改提示词，但**不能改"全部"**——提示词正文里**物理混入了安全红线段**（亲核确认：反接管红线就写在 `user.reply.policy` 正文 prompts.rs:1000/1023、`user.reply.task` soul 正文 prompts.rs:846-866），随意全改会把红线一起改没。三层分级（用户 2026-06-26 决策：抽红线为独立锚常量 + 扩锚闸）：
+
+| 层 | 能否对话改 | 内容 | 通路与防线 |
 | --- | --- | --- | --- |
-| ✅ **可自由改** | 能 | 人格(soul)、方法论(playbook + forbidden_rules)、行业话术(*.task)、对话模式判定规则、reviewer 标尺 | 走 soul/playbook/domain_profile override 通路（per-workspace，运行期注入，**改不到红线段**——这是设计上的护城河，decision.rs:307/400、domain_profile.rs override 剥离范围之外） |
-| ⚠️ **可改但需强约束** | 能，落库前过双闸 | user.reply.policy / user.reply.system / user.review.* 的业务措辞 | 直改 prompt_templates DB 副本，但 `DEFAULT_MODE_GATE_POLICY`(prompts.rs:29) / `DEFAULT_REVIEWER_FEWSHOT`(prompts.rs:47) 锚段、grounding 段、隐私段、反接管段**必须逐字保留** |
-| 🔴 **禁止改** | 不能（自然语言入口不触达） | 反真人接管红线续行(prompts.rs:1000/1023/853)、AI 永不自动 verify 判据(prompts.rs:1474)、grounding 硬约束、`DEFAULT_*` 字节等价锚常量、`evolution_critic_v1`、reset-system-pack（销毁性） | —— |
+| ✅ **可自由改** | 能（仍过禁词闸） | 行业话术 `*.task` 业务段、对话模式措辞、reviewer 标尺非锚部分 | 走 `prompt_templates` 业务正文，过禁词闸即可 |
+| ⚠️ **可改但需强约束** | 能，落库前过双闸 | `user.reply.policy` / `user.reply.system` / `user.review.system` / `user.reply.task`（soul 正文同档，因含红线） | 直改 `prompt_templates` DB 副本，但红线锚段（反接管、grounding、隐私、`DEFAULT_*`）**必须逐字保留**，否则拒写 |
+| 🔴 **禁止改** | 不能（自然语言入口不暴露该 key） | `evolution_critic_v1`（PROMPT_EVOLUTION_FORBIDDEN_KEYS, prompts.rs:2138）；`reset-system-pack`（是 route handler `reset_system_prompt_pack` prompt_templates.rs:211，非 prompt_key，靠不接入工具来禁） | —— |
 
-**双闸校验（fail-closed，红线靠机制不靠 LLM 自觉）**：任何经自然语言写回 `prompt_templates`/`agent_souls` 的内容，落库前**强制过两道闸**，命中即拒绝、不写入：
-1. **禁词闸**：复用现有 `passes_forbidden_words`(**定义在 evolution/lint.rs:33**；prompt_critic.rs:396 是其调用点)——扫"接管/人工/takeover/handoff"等禁词。
-2. **锚完整性闸**：校验该 prompt 的红线锚段（反接管段、grounding 段、`DEFAULT_*` 锚）写回后**逐字仍在**；锚段缺失或被改 → 拒绝（防 profile override 的 `system.replace` 静默失配 + 防红线被删）。
+**关键事实修正（原草案错，亲核证伪）**：
+- **soul override 不是"天然安全"**：反接管红线物理写在 `kind="user"` 的 soul 正文（prompts.rs:846-866），而 `profile.soul_override`（decision.rs:307-308）是**整段替换** soul——红线就在被替换的内容里，没有任何"剥离"保护。所以 soul/playbook 编辑**不能**归入"可自由改、天然安全"，含红线的 soul 正文须归⚠️强约束层。
+- **现有 `DEFAULT_MODE_GATE_POLICY` 锚故意不含红线**：亲核 prompts.rs:29-34 该锚只到 boundary_protection 第一句，测试 `default_mode_gate_policy_excludes_human_takeover_redline`(prompts.rs:2361-2367) 明确断言锚里 `!contains("严禁承诺")`。即真正的反接管红线（:1000/:1023）**没有对应锚常量**，旧锚闸根本没在查它 → 必须**新抽红线锚常量**（见下）。
+- **key 命名修正**：`agent_soul`/`operation_playbook` 不是 template_key（soul/playbook 在独立集合 `agent_souls`/`operation_playbooks`，标识字段 `agent_kind`∈user/management/group/moment）；`user.review.policy` 不存在（review 侧只有 `user.review.system`/`user.review.light.system`/`user.review.product_claim_markers`）。tier 判定不能用错 key。
 
-可自由改层走 override 通路天然安全（红线在剥离范围外）；可改层走 prompt_templates 必过双闸；禁止改层的 key 直接不暴露给自然语言工具。`reset-system-pack` 销毁性操作不接入自然语言入口。
+**双闸校验（fail-closed，红线靠机制不靠 LLM 自觉）**：真正的拦截点是 `update_prompt_template`(prompt_templates.rs:133)——它现在**只调 `validate_prompt_template_input` 查空、零红线校验**。双闸插在这里：任何写回 `prompt_templates` 的 content，落库前**强制过两道闸**，命中即拒绝、不写入：
+1. **禁词闸**：复用现有 `passes_forbidden_words`(**定义在 evolution/lint.rs:33**；prompt_critic.rs:396 是其调用点，返回 true=干净)——扫词表 13 条（人工接管/takeover/handoff/人工介入/接管/人工 等）。
+2. **锚完整性闸（须扩）**：先在 prompts.rs **新抽红线锚常量**（如 `DEFAULT_REPLY_REDLINE_ANCHORS: &[&str]`，把 :1000 反接管续行、:1023 表达红线段、:846-866 soul 红线段逐字抽出，配锚漂移护栏测试），再让锚闸按 `template_key` 校验对应红线锚段写回后**逐字仍在**；缺失或被改 → 拒绝。覆盖原 `DEFAULT_MODE_GATE_POLICY`/`DEFAULT_REVIEWER_FEWSHOT` 之外、之前没锚保护的真红线。
+
+**承认的残余风险（诚实标注，第一期接受）**：双闸只查"删没删锚 / 有没有禁词字面量"，挡不住**插入型绕过**（保留锚段原文、在前后插入语义等价的违规内容，如"我把这事交给后台同学跟进"——无字面禁词）。第一期靠"⚠️层默认需确认 + 审计留痕"兜底；彻底堵插入型需加 LLM 红线语义审查（用户已否决本期做，留后续）。
+
+`reset-system-pack` 销毁性操作不接入自然语言入口（靠不把它包成工具来禁，非靠 key 匹配）。
 
 ## 5. 数据结构 + 端点 + 前端 + 测试
 

@@ -65,6 +65,9 @@ fn confirmation_gate_off_by_default_phase1() {
     assert!(!plan_requires_confirmation(&["wechatagent.search_contacts"], true));
     // irreversible 无视开关恒需确认（第一期即便放权也保留，spec §4.2）
     assert!(plan_requires_confirmation(&["wechatagent.reset_domain"], false));
+    // verify 类无视开关恒需确认（spec §4.3：AI 调 verify 会落 source=Human，
+    // 守"AI 永不自动 verify"——确认门不随第一期 dangerous 开关放行）
+    assert!(plan_requires_confirmation(&["wechatagent.verify_knowledge_chunk"], false));
 }
 ```
 
@@ -129,9 +132,16 @@ pub(super) fn tool_effect(tool_name: &str) -> ToolEffect {
     ToolEffect { read_only, risk }
 }
 
+/// verify 类工具：把 chunk 推向 verified 的动作。它写 source=Human（verify.rs:101），
+/// 包成 AI 工具会"AI 调用被记成人确认"——故恒强制确认，不随第一期开关放行（spec §4.3）。
+pub(super) fn tool_always_requires_confirmation(tool_name: &str) -> bool {
+    matches!(tool_name, "wechatagent.verify_knowledge_chunk")
+}
+
 /// 第一期权限放大：dangerous_confirm_enabled 默认 false（见 spec §1.2），
 /// 此时即便有 dangerous 工具也不强制确认，先跑通功能。开关为后续收紧预留。
-/// 但 irreversible（reset/delete/销毁）无视开关恒需确认——第一期即便放权也保留（spec §4.2）。
+/// 但 irreversible（reset/delete/销毁）+ verify 类（AI 永不自动 verify）无视开关
+/// 恒需确认——第一期即便放权也保留（spec §4.2/§4.3）。
 pub(super) fn plan_requires_confirmation(
     tool_names: &[&str],
     dangerous_confirm_enabled: bool,
@@ -139,12 +149,13 @@ pub(super) fn plan_requires_confirmation(
     tool_names.iter().any(|name| {
         let risk = tool_effect(name).risk;
         risk == ToolRisk::Irreversible
+            || tool_always_requires_confirmation(name)
             || (dangerous_confirm_enabled && risk == ToolRisk::Dangerous)
     })
 }
 ```
 
-注意：原 `tool_effect` 的调用点（management.rs:291 `!tool_effect(&c.tool_name).read_only`、:668 `is_read_only_tool`、:671 `should_dry_run_tool`）依赖 `read_only` 字段——保持 `read_only` 字段名不变，已兼容。
+注意：原 `tool_effect` 的调用点（management.rs:291 `!tool_effect(&c.tool_name).read_only`、:667 `is_read_tool`、:671 `should_dry_run_tool`）依赖 `read_only` 字段——保持 `read_only` 字段名不变，已兼容。**实现期真实函数名是 `is_read_tool`（management.rs:667），不是 `is_read_only_tool`**（旧草案笔误，已核实）。ToolEffect 真实区域是 management.rs:648-673（含中间函数 `is_read_tool`:667），替换时勿误删。
 
 - [ ] **Step 4: 运行测试确认通过**
 
@@ -588,12 +599,14 @@ Expected: FAIL（新工具未在 merge_product_tools 声明）
 - **知识维护**：knowledge/*.rs:465-651（verify/reject/archive/patch/split/merge/relate/batch-verify/gap apply|dismiss/import-apply）
 
 > 实现注意：
-> - dangerous/irreversible 工具调用已有写入逻辑复用，**不新建执行端点**——找到对应 routes 模块的写入函数复用其内部逻辑或 DB 写入。
-> - verify_knowledge_chunk 调已有 chunk verify 逻辑（**人确认动作，非 AI auto-verify，守红线**）；知识类不接 auto-verify 工具。
+> - dangerous/irreversible 工具调用已有写入逻辑复用，**不新建执行端点**——找到对应 routes 模块的写入函数复用其内部逻辑或 DB 写入。这些 handler 多为 `pub(super)`，management.rs 同属 `crate::routes` 可直接命名调用（mod.rs 已有大量 `pub use` 直调先例）；`AuthenticatedAdmin`(auth/mod.rs:59 仅 user_id/username/current_workspace 三 String) 可平凡构造，请求体 derive Deserialize 可 `serde_json::from_value` 从工具 arguments 构造。
+> - **需小重构的 3 个 handler**（核实发现）：`cancel_outbox`(admin_outbox.rs:117)、`approve_taxonomy_candidate`(admin_taxonomy_candidates.rs:123)、`approve_relationship_suggestion`(admin_relationship_suggestions.rs:109) 返回的是 `Result<Response>` 而非 `Json<Value>`，execute_management_tool 拿不到结构化 Value 喂 assert_tool_outcome → 需先抽内部 fn 返回 Value。另 `approve_taxonomy_candidate` **没有 `Extension<AuthenticatedAdmin>` 参数**，复用前要先确认它的 workspace 来源。
+> - **import-apply-pdf 包不动**：`import_operation_knowledge_apply_pdf`(import.rs:428) 用 `Multipart` 提取器，无法从 JSON 工具参数构造；改用字节级 helper `import_pdf_bytes`（已是公开 helper）。其余 import-apply / import-apply-image 直接可复用。
+> - **verify_knowledge_chunk 红线（spec §4.3，亲核 verify.rs:101/110）**：该 handler 写 `source=ProvenanceSource::Human, actor=admin.username`，假设调用方=人点按钮。包成工具时 **verify 类恒强制确认**（Task 1 的 plan_requires_confirmation 把 verify 类与 irreversible 同档恒拦，不随 dangerous 开关放行），且执行时 actor 标管理者本人——保留"人确认"真实语义，守"AI 永不自动 verify"。知识类不接 auto-verify 工具。
 > - reset_domain / delete_* / reset_system_pack 标 Irreversible（Task 1），Task 5 confirm 仍可执行但 plan_requires_confirmation 恒拦确认。
 > - 每个新工具执行后，结果交 Task 2 的 assert_tool_outcome 核实。
 
-每个新工具配 build_management_plan 的 prompt（management.rs build_management_plan 内的工具说明）让 LLM 知道何时选它——若 management.plan prompt 走 prompt_versions / PROMPT_PACK_VERSION 机制，按其约定 bump 版本（grep PROMPT_PACK_VERSION 确认；management plan prompt 若是 routes 内联字面量则无需 bump）。
+每个新工具配 build_management_plan 的 prompt 让 LLM 知道何时选它。**核实结论（原草案"内联字面量"判断错）**：build_management_plan(management.rs:1119) 是 LLM 调用(`generate_agent_json`:1146)，其 system/policy prompt 走 `prompts::load_prompt(db,ws,"management.plan.system"/"management.plan.policy")`(:1129/1135) —— 是 **PROMPT_PACK_VERSION 版本化的 PromptSpec**(prompts.rs:1499/1521)，不是 routes 内联字面量。工具清单是**动态序列化进 user 消息**(:1142-1145)、不写在 system/policy 文本里，所以**只加工具、不改这两个 PromptSpec 文本 → 可不 bump**；但若为让 LLM 更好认识新工具去改 system/policy 文本，**必须 bump PROMPT_PACK_VERSION**(prompts.rs:15)。
 
 - [ ] **Step 4: 运行测试 + cargo check + 全量 lib + no-takeover lint**
 
@@ -615,17 +628,40 @@ git commit -m "feat(mgmt-agent): 扩工具集接配置/策略/知识端点(第�
 
 ## Task 6.5: 提示词自然语言编辑 — 三层分级 + 双闸校验（fail-closed）
 
+> **本任务经 4 路 opus 实证核实重写**。原草案有红线漏洞：①key 命名半数错（agent_soul/operation_playbook 不是 template_key，user.review.policy 不存在，reset_system_pack 是 handler）；②锚闸只校验 `DEFAULT_MODE_GATE_POLICY`，而该锚**故意不含反接管红线**（亲核 prompts.rs:29-34 + 测试 `default_mode_gate_policy_excludes_human_takeover_redline` prompts.rs:2361-2367）——真红线在 user.reply.policy 正文 :1000/:1023、soul 正文 :846-866，旧锚闸根本没在查。修正核心：**先抽红线为独立锚常量再扩锚闸**（用户 2026-06-26 决策）。
+
 **Files:**
-- Create: `src/routes/management_prompt_edit.rs`（三层分级纯函数 + 双闸校验，单独文件，避免 management.rs 继续膨胀）
-- Modify: `src/routes/management.rs`（execute_management_tool 加 edit_prompt_template 分支调本模块校验后写入）
+- Modify: `src/prompts.rs`（新增红线锚常量 `DEFAULT_REPLY_REDLINE_ANCHORS` + 锚漂移护栏测试）
+- Create: `src/routes/management_prompt_edit.rs`（三层分级纯函数 + 双闸校验）
+- Modify: `src/routes/prompt_templates.rs:133 update_prompt_template`（真正拦截点：在 `validate_prompt_template_input` 之后插双闸）
 - Modify: `src/routes/mod.rs`（`mod management_prompt_edit;`）
 - Test: `src/routes/management_prompt_edit.rs` 内 `#[cfg(test)] mod tests`
 
 **Interfaces:**
-- Consumes: `crate::evolution::lint::passes_forbidden_words`（**定义在 src/evolution/lint.rs:33**，非 prompt_critic.rs——后者 :396 是调用点）；`crate::prompts::{DEFAULT_MODE_GATE_POLICY, DEFAULT_REVIEWER_FEWSHOT}`（prompts.rs:29/47）；`crate::prompts::PROMPT_EVOLUTION_FORBIDDEN_KEYS`（prompts.rs:2138）。
-- Produces: `enum PromptEditTier { FreelyEditable, ConstrainedEditable, Forbidden }`；`fn prompt_edit_tier(template_key: &str) -> PromptEditTier`；`fn validate_prompt_edit(template_key: &str, new_content: &str) -> Result<(), String>`（双闸，命中即 Err，fail-closed）。
+- Consumes: `crate::evolution::lint::passes_forbidden_words`（**定义在 src/evolution/lint.rs:33**，返回 true=干净；prompt_critic.rs:396 是调用点）；`crate::prompts::{DEFAULT_MODE_GATE_POLICY(:29), DEFAULT_REVIEWER_FEWSHOT(:47), DEFAULT_REPLY_REDLINE_ANCHORS(新增), PROMPT_EVOLUTION_FORBIDDEN_KEYS(:2138)}`。
+- Produces: `enum PromptEditTier { FreelyEditable, ConstrainedEditable, Forbidden }`；`fn prompt_edit_tier(template_key: &str) -> PromptEditTier`；`fn required_anchors(template_key: &str) -> &'static [&'static str]`；`fn validate_prompt_edit(template_key: &str, new_content: &str) -> Result<(), String>`（双闸，命中即 Err，fail-closed）。
 
-> 设计依据 spec §4.4：提示词混有红线段 + 字节等价锚常量，不能"全部"对话改。三层——✅可自由改（soul/playbook/override 通路，红线在剥离范围外，天然安全）；⚠️可改但需强约束（user.reply.policy / user.review.system 等，落 prompt_templates 前过双闸，锚段逐字保留）；🔴禁止改（反接管红线续行、AI 永不自动 verify 判据、DEFAULT_* 锚常量、evolution_critic_v1、reset-system-pack——自然语言入口不暴露这些 key）。
+> 设计依据 spec §4.4（已按核实修正）。三层（按**真实 template_key**）：
+> - 🔴**禁止改**：`evolution_critic_v1`（PROMPT_EVOLUTION_FORBIDDEN_KEYS）。`reset-system-pack` 是 route handler 不是 key，靠不接入工具来禁、不在本函数判。
+> - ⚠️**可改但需强约束**（落库前过双闸，红线锚逐字保留）：`user.reply.policy`（含反接管红线 :1000/:1023）、`user.reply.system`、`user.review.system`、`user.reply.task`（soul 红线 :846-866 注入此层）。
+> - ✅**可自由改**（仍过禁词闸）：其余业务话术 key。
+> 注：soul/playbook 在独立集合（`agent_souls`/`operation_playbooks`，标识字段 `agent_kind`），**不走 prompt_templates 编辑通路**，故不在本函数的 template_key 分类内；它们的编辑若开放，另在 souls/playbooks handler 处接同一套 `validate_prompt_edit`（用 agent_kind 映射到对应红线锚）。本任务先覆盖 prompt_templates 通路。
+
+- [ ] **Step 0: 先在 prompts.rs 抽红线锚常量 + 护栏测试**
+
+亲核确认：反接管红线在 `user.reply.policy` 正文 prompts.rs:1000（"用户要求真人…严禁承诺安排真人…"整段）和 :1023（"用户主动要真人…严禁承诺…"整段）。把这两段**逐字**抽成常量（保持与正文字节一致，正文改为引用或保留副本 + 护栏测试锁死一致性，仿 DEFAULT_MODE_GATE_POLICY 的 `..._anchor_matches_pack` 模式）：
+
+```rust
+// prompts.rs：新增（红线锚——锚闸据此校验写回后红线逐字仍在）
+pub const DEFAULT_REPLY_REDLINE_ANCHORS: &[&str] = &[
+    // :1000 boundary_protection 反接管续行（从"用户要求"到段末）
+    "用户要求\"真人 / 不想跟机器人聊\"时，用 AI 自治语义承接",
+    // :1023 表达红线反接管段（从"用户主动要真人"起的关键判定句）
+    "严禁承诺\"安排真人 / 让同事来联系 / 稍后有人对接你 / 转接客服\"",
+];
+```
+
+> 实现注意：常量值必须是正文里**真实存在的逐字子串**（实现时从 prompts.rs:1000/1023 复制，上面是示意）。加一个护栏测试 `reply_redline_anchors_present_in_pack`：断言 `user.reply.policy` 的 pack content `contains` 每条锚，防正文改动后锚失配（仿 prompts.rs:2344-2355）。
 
 - [ ] **Step 1: 写失败测试**
 
@@ -633,18 +669,19 @@ git commit -m "feat(mgmt-agent): 扩工具集接配置/策略/知识端点(第�
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::prompts::{DEFAULT_MODE_GATE_POLICY, DEFAULT_REVIEWER_FEWSHOT};
+    use crate::prompts::{DEFAULT_MODE_GATE_POLICY, DEFAULT_REVIEWER_FEWSHOT, DEFAULT_REPLY_REDLINE_ANCHORS};
 
     #[test]
     fn tier_classifies_three_layers() {
-        // 可自由改：soul/playbook（走 override 通路）
-        assert_eq!(prompt_edit_tier("agent_soul"), PromptEditTier::FreelyEditable);
-        assert_eq!(prompt_edit_tier("operation_playbook"), PromptEditTier::FreelyEditable);
-        // 可改但需强约束：业务措辞模板
+        // 强约束：含红线/锚的业务模板
         assert_eq!(prompt_edit_tier("user.reply.policy"), PromptEditTier::ConstrainedEditable);
+        assert_eq!(prompt_edit_tier("user.reply.system"), PromptEditTier::ConstrainedEditable);
         assert_eq!(prompt_edit_tier("user.review.system"), PromptEditTier::ConstrainedEditable);
-        // 禁止改：evolution critic + reset-system-pack（PROMPT_EVOLUTION_FORBIDDEN_KEYS）
+        assert_eq!(prompt_edit_tier("user.reply.task"), PromptEditTier::ConstrainedEditable);
+        // 禁止改：evolution critic（PROMPT_EVOLUTION_FORBIDDEN_KEYS）
         assert_eq!(prompt_edit_tier("evolution_critic_v1"), PromptEditTier::Forbidden);
+        // 可自由改：其余业务话术 key
+        assert_eq!(prompt_edit_tier("knowledge.chat.draft_chunk"), PromptEditTier::FreelyEditable);
     }
 
     #[test]
@@ -655,34 +692,44 @@ mod tests {
     }
 
     #[test]
-    fn dual_gate_rejects_anchor_drift() {
-        // 锚完整性闸：写回丢了 DEFAULT_MODE_GATE_POLICY 锚段被拒
+    fn dual_gate_rejects_business_anchor_drift() {
+        // 锚完整性闸：写回丢了 DEFAULT_MODE_GATE_POLICY 业务锚被拒
         let drifted = "## 我自己重写的策略\n随便写点别的".to_string();
         assert!(validate_prompt_edit("user.reply.policy", &drifted).is_err());
-        // review.system 同理
         assert!(validate_prompt_edit("user.review.system", "乱改").is_err());
     }
 
     #[test]
+    fn dual_gate_rejects_redline_anchor_drift() {
+        // 核心修正：保留业务锚 DEFAULT_MODE_GATE_POLICY，但删掉反接管红线段 → 仍须被拒
+        // （旧设计这里会放行 = 红线漏洞）
+        let keeps_business_drops_redline = format!("{DEFAULT_MODE_GATE_POLICY}\n业务措辞随便加");
+        assert!(
+            validate_prompt_edit("user.reply.policy", &keeps_business_drops_redline).is_err(),
+            "保留业务锚但丢红线锚必须被拒"
+        );
+    }
+
+    #[test]
     fn dual_gate_allows_valid_constrained_edit() {
-        // 保留锚段 + 无禁词 + 追加业务措辞 → 放行
-        let ok = format!("{DEFAULT_MODE_GATE_POLICY}\n\n补充：本行业多用专业术语，语气更稳重。");
+        // 保留全部锚（业务锚 + 红线锚）+ 无禁词 + 追加业务措辞 → 放行
+        let redlines: String = DEFAULT_REPLY_REDLINE_ANCHORS.join("\n");
+        let ok = format!("{DEFAULT_MODE_GATE_POLICY}\n{redlines}\n\n补充：本行业语气更稳重。");
         assert!(validate_prompt_edit("user.reply.policy", &ok).is_ok());
-        let ok2 = format!("{DEFAULT_REVIEWER_FEWSHOT}\n\n补充标尺：本域不逼单，EmotionalValue 权重更高。");
+        let ok2 = format!("{DEFAULT_REVIEWER_FEWSHOT}\n\n补充标尺：本域不逼单。");
         assert!(validate_prompt_edit("user.review.system", &ok2).is_ok());
     }
 
     #[test]
     fn forbidden_tier_always_rejected() {
-        // 禁止改层：无论内容如何都拒（自然语言入口不触达）
         assert!(validate_prompt_edit("evolution_critic_v1", "任何内容").is_err());
     }
 
     #[test]
     fn freely_editable_only_checks_forbidden_words() {
-        // 可自由改层：仍过禁词闸（防红线词），但不要求锚段
-        assert!(validate_prompt_edit("agent_soul", "我是一个稳重专业的顾问").is_ok());
-        assert!(validate_prompt_edit("agent_soul", "必要时人工接管").is_err());
+        // 可自由改层：仍过禁词闸，但不要求锚段
+        assert!(validate_prompt_edit("knowledge.chat.draft_chunk", "随便写业务话术").is_ok());
+        assert!(validate_prompt_edit("knowledge.chat.draft_chunk", "必要时人工接管").is_err());
     }
 }
 ```
@@ -703,7 +750,8 @@ Expected: FAIL（模块 / `PromptEditTier` / `prompt_edit_tier` / `validate_prom
 
 use crate::evolution::lint::passes_forbidden_words;
 use crate::prompts::{
-    DEFAULT_MODE_GATE_POLICY, DEFAULT_REVIEWER_FEWSHOT, PROMPT_EVOLUTION_FORBIDDEN_KEYS,
+    DEFAULT_MODE_GATE_POLICY, DEFAULT_REPLY_REDLINE_ANCHORS, DEFAULT_REVIEWER_FEWSHOT,
+    PROMPT_EVOLUTION_FORBIDDEN_KEYS,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -713,32 +761,41 @@ pub(super) enum PromptEditTier {
     Forbidden,
 }
 
-/// 强约束层 key → 必须逐字保留的锚段（写回后锚段缺失即判 drift）。
-fn required_anchor(template_key: &str) -> Option<&'static str> {
+/// 强约束层 key → 写回后必须逐字保留的全部锚段（业务锚 + 红线锚）。
+/// 返回 slice：user.reply.policy 既要保留业务锚 DEFAULT_MODE_GATE_POLICY，
+/// **也要保留反接管红线锚 DEFAULT_REPLY_REDLINE_ANCHORS**（核心修正——
+/// 旧设计只查业务锚，红线被删能放行）。
+fn required_anchors(template_key: &str) -> Vec<&'static str> {
     match template_key {
-        "user.reply.policy" => Some(DEFAULT_MODE_GATE_POLICY),
-        "user.review.system" => Some(DEFAULT_REVIEWER_FEWSHOT),
-        _ => None,
+        "user.reply.policy" => {
+            // 业务锚 + 反接管红线锚（红线在正文 :1000/:1023，旧锚闸漏查）
+            let mut v = vec![DEFAULT_MODE_GATE_POLICY];
+            v.extend_from_slice(DEFAULT_REPLY_REDLINE_ANCHORS);
+            v
+        }
+        "user.review.system" => vec![DEFAULT_REVIEWER_FEWSHOT],
+        // user.reply.system / user.reply.task 含红线但暂无独立 DEFAULT_* 锚常量：
+        // 仍归强约束层（tier 判定里列出），靠禁词闸兜底；如需更硬可后续为其抽锚。
+        _ => Vec::new(),
     }
 }
 
 pub(super) fn prompt_edit_tier(template_key: &str) -> PromptEditTier {
-    // 禁止改：evolution critic 等（与 PROMPT_EVOLUTION_FORBIDDEN_KEYS 同源）+ 销毁性 pack
-    if PROMPT_EVOLUTION_FORBIDDEN_KEYS.contains(&template_key)
-        || template_key == "reset_system_pack"
-    {
+    // 禁止改：evolution critic（与 PROMPT_EVOLUTION_FORBIDDEN_KEYS 同源）。
+    // 注：reset-system-pack 是 route handler 不是 template_key，靠不接入工具来禁，不在此判。
+    if PROMPT_EVOLUTION_FORBIDDEN_KEYS.contains(&template_key) {
         return PromptEditTier::Forbidden;
     }
-    // 可改但需强约束：业务措辞模板（有锚段需保留的）
-    if required_anchor(template_key).is_some()
+    // 可改但需强约束：含红线/锚的业务模板（真实 key，已核实存在）
+    if !required_anchors(template_key).is_empty()
         || matches!(
             template_key,
-            "user.reply.policy" | "user.reply.system" | "user.review.system" | "user.review.policy"
+            "user.reply.policy" | "user.reply.system" | "user.review.system" | "user.reply.task"
         )
     {
         return PromptEditTier::ConstrainedEditable;
     }
-    // 其余（soul/playbook/行业话术）走 override 通路，可自由改
+    // 其余业务话术 key，可自由改（仍过禁词闸）
     PromptEditTier::FreelyEditable
 }
 
@@ -754,11 +811,11 @@ pub(super) fn validate_prompt_edit(template_key: &str, new_content: &str) -> Res
     if !passes_forbidden_words(new_content) {
         return Err("写回内容命中禁用词（接管/人工/takeover/handoff），已拒绝".to_string());
     }
-    // 闸 2：锚完整性闸——强约束层的红线锚段必须逐字仍在
-    if let Some(anchor) = required_anchor(template_key) {
+    // 闸 2：锚完整性闸——强约束层的全部锚段（业务锚 + 红线锚）必须逐字仍在
+    for anchor in required_anchors(template_key) {
         if !new_content.contains(anchor) {
             return Err(format!(
-                "提示词 '{template_key}' 的红线锚段缺失或被改，已拒绝（防 replace 静默失配 + 防红线被删）"
+                "提示词 '{template_key}' 的红线/业务锚段缺失或被改，已拒绝（防 replace 静默失配 + 防红线被删）"
             ));
         }
     }
@@ -766,20 +823,30 @@ pub(super) fn validate_prompt_edit(template_key: &str, new_content: &str) -> Res
 }
 ```
 
-在 `src/routes/mod.rs` 加 `mod management_prompt_edit;`，并在 execute_management_tool 的 edit_prompt_template / edit_soul / edit_playbook 分支里先调 `management_prompt_edit::validate_prompt_edit(key, content)?` 再写入。
+在 `src/routes/mod.rs` 加 `mod management_prompt_edit;`。**真正的拦截点是 `update_prompt_template`(prompt_templates.rs:133)**——它当前只调 `validate_prompt_template_input`(查空)、零红线校验。在它 `validate_prompt_template_input(&payload)?` 之后插一行：
+
+```rust
+// prompt_templates.rs update_prompt_template，validate_prompt_template_input 之后
+crate::routes::management_prompt_edit::validate_prompt_edit(&payload.prompt_key, &payload.content)
+    .map_err(AppError::BadRequest)?;
+```
+
+这样无论走管理 agent 工具、还是管理员直接调 REST PUT /prompt-templates/:id，双闸都拦得住（单点拦截，不靠每个调用方自觉）。execute_management_tool 的 edit_prompt_template 工具分支复用 update_prompt_template 即自动过闸。
 
 - [ ] **Step 4: 运行测试确认通过 + 全量 lib 不回归**
 
 Run: `cargo test --lib management_prompt_edit 2>&1 | tail -20`
-Expected: PASS（6 个用例全绿）
+Expected: PASS（7 个 tier/双闸用例全绿，含 `dual_gate_rejects_redline_anchor_drift` 红线锚漏洞回归锁）
+Run: `cargo test --lib reply_redline_anchors_present_in_pack 2>&1 | tail -10`
+Expected: PASS（红线锚漂移护栏）
 Run: `cargo test --lib 2>&1 | tail -5`
 Expected: ≥ 350 passed, 0 failed
 
 - [ ] **Step 5: 提交**
 
 ```bash
-git add src/routes/management_prompt_edit.rs src/routes/management.rs src/routes/mod.rs
-git commit -m "feat(mgmt-agent): 提示词三层分级+双闸校验(禁词闸+锚完整性闸,fail-closed,禁止改层不暴露)"
+git add src/prompts.rs src/routes/management_prompt_edit.rs src/routes/prompt_templates.rs src/routes/mod.rs
+git commit -m "feat(mgmt-agent): 提示词三层分级+双闸(抽反接管红线锚扩锚闸,拦截点update_prompt_template,fail-closed)"
 ```
 
 ---
@@ -836,13 +903,19 @@ git commit -m "feat(mgmt-agent): command-center 做厚-确认UI+真实结果展�
 - §3 执行结果核实 → Task 2（assert_tool_outcome）+ Task 3（汇报基于真实结果）✓
 - §4.1 工具集扩（6 类全量接入）→ Task 6 ✓
 - §4.2 风险档代码裁定（四档含 irreversible 恒拦）→ Task 1 ✓
-- §4.4 提示词三层分级 + 双闸校验 → Task 6.5 ✓
-- §1.2 第一期放权 → Task 1（plan_requires_confirmation dangerous 开关默认关、irreversible 恒拦）+ Task 6（全接）✓
+- §4.3 verify 红线（恒确认 + actor 标人）→ Task 1（plan_requires_confirmation + tool_always_requires_confirmation）+ Task 6 注 ✓
+- §4.4 提示词三层分级 + 双闸校验（抽红线锚 + 扩锚闸）→ Task 6.5 ✓
+- §1.2 第一期放权 → Task 1（plan_requires_confirmation dangerous 开关默认关、irreversible/verify 恒拦）+ Task 6（全接）✓
 - §5.1 status 闭集 → Task 4 ✓
 - §5.3 前端 → Task 7 ✓
-- 红线（AI 永不自动 verify）→ Task 6 注（verify 是人确认动作，无 auto-verify 工具）+ Task 6.5（禁止改层不暴露、双闸 fail-closed）✓
+- 红线（AI 永不自动 verify）→ Task 1（verify 恒确认）+ Task 6 注 + Task 6.5（双闸 fail-closed、新抽红线锚堵反接管漏洞）✓
 
-**Placeholder scan**：无 TBD/TODO；execute_plan_tool_calls 抽取在 Task 5 明确；新工具分发在 Task 6 指明"复用已有写入函数"（具体函数实现时 grep 定位，因 routes 模块多）。
+**4 路 opus 核实修正记录（2026-06-26，落笔前亲核 origin/main）**：
+- Task 1：函数名 `is_read_only_tool`→`is_read_tool`（笔误）；新增 `tool_always_requires_confirmation`（verify 类恒确认，守 AI 永不自动 verify）。
+- Task 6：build_management_plan 走 PROMPT_PACK_VERSION 版本化 prompt（非"内联字面量"，原判断错）；标出 3 个需小重构 handler（cancel_outbox/approve_taxonomy_candidate/approve_relationship_suggestion 返回 Response 非 Json<Value>，approve_taxonomy_candidate 缺 Extension<Admin>）；import-apply-pdf 用 Multipart 包不动需走 import_pdf_bytes；verify 红线 actor 处理。
+- Task 6.5（改动最大）：原草案 key 命名半数错已修（agent_soul/operation_playbook 不是 template_key→soul/playbook 在独立集合；user.review.policy 不存在；reset_system_pack 是 handler 非 key）；**核心红线漏洞已修**——原锚闸只查 `DEFAULT_MODE_GATE_POLICY`，而该锚故意不含反接管红线（测试 prompts.rs:2361-2367 坐实），真红线在 :1000/:1023 旧闸漏查；现 Step 0 先抽 `DEFAULT_REPLY_REDLINE_ANCHORS` 红线锚 + 护栏测试，`required_anchors` 返回多锚（业务锚+红线锚），新增 `dual_gate_rejects_redline_anchor_drift` 回归锁；拦截点明确为 `update_prompt_template`(prompt_templates.rs:133) 单点拦截；诚实标注插入型绕过残余风险（第一期靠确认+审计兜底，LLM 语义审查留后续）。
+
+**Placeholder scan**：无 TBD/TODO；execute_plan_tool_calls 抽取在 Task 5 明确；新工具分发在 Task 6 指明"复用已有写入函数"（具体函数实现时 grep 定位，因 routes 模块多）；Task 6.5 Step 0 红线锚常量值标注"实现时从 prompts.rs:1000/1023 逐字复制"（示意非占位）。
 
 **Type consistency**：ToolRisk 四档（Task 1，含 Irreversible）/ ToolOutcome（Task 2）/ build_execution_summary（Task 3）/ TOOL_CALL_STATUSES（Task 4）/ build_confirm_filter + execute_plan_tool_calls（Task 5）/ PromptEditTier + validate_prompt_edit（Task 6.5）签名一致；read_only 字段名保留兼容既有调用点；plan_requires_confirmation 的 irreversible 恒拦逻辑与 Task 1 测试一致。
 
