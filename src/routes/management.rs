@@ -645,21 +645,84 @@ pub(super) fn trim_wrapping_quotes(text: &str) -> &str {
     text
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ToolRisk {
+    Readonly,
+    Low,
+    Dangerous,
+    Irreversible,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub(super) struct ToolEffect {
-    read_only: bool,
+    pub read_only: bool,
+    pub risk: ToolRisk,
 }
 
 pub(super) fn tool_effect(tool_name: &str) -> ToolEffect {
-    let read_only = matches!(
-        tool_name,
+    use ToolRisk::*;
+    let risk = match tool_name {
+        // 只读查询
         "account_list"
-            | "contacts_search"
-            | "knowledge.search"
-            | "knowledge.list_catalog"
-            | "wechatagent.search_contacts"
-    ) || tool_name.starts_with("knowledge.open");
-    ToolEffect { read_only }
+        | "contacts_search"
+        | "knowledge.search"
+        | "knowledge.list_catalog"
+        | "wechatagent.search_contacts"
+        | "wechatagent.query_runs"
+        | "wechatagent.query_metrics"
+        | "wechatagent.query_health"
+        | "wechatagent.query_inbox" => Readonly,
+        // 低风险可逆写
+        "wechatagent.import_contacts"
+        | "wechatagent.enable_contact_agent"
+        | "wechatagent.disable_contact_agent"
+        | "wechatagent.create_follow_up_task"
+        | "wechatagent.update_contact_profile"
+        | "wechatagent.update_operation_domain"
+        | "wechatagent.set_assist_mode" => Low,
+        // 高风险/宽影响（立即全量/改全局）
+        "wechatagent.send_contact_message"
+        | "wechatagent.publish_domain_profile"
+        | "wechatagent.activate_domain_profile"
+        | "wechatagent.publish_prompt_template"
+        | "wechatagent.edit_state_machine"
+        | "wechatagent.provider_activate"
+        | "wechatagent.rollout_evolution_proposal"
+        | "wechatagent.verify_knowledge_chunk"
+        | "wechatagent.reject_knowledge_chunk" => Dangerous,
+        // 不可逆（reset/delete/物理销毁）：档位高于 dangerous，第一期即便放权也保留确认
+        "wechatagent.reset_domain"
+        | "wechatagent.delete_knowledge_chunk"
+        | "wechatagent.reset_system_pack" => Irreversible,
+        // 只读前缀工具（knowledge.open*）
+        other if other.starts_with("knowledge.open") => Readonly,
+        // 未知（含 MCP 透传工具）：保守按 Low，read_only=false
+        _ => Low,
+    };
+    let read_only = matches!(risk, Readonly);
+    ToolEffect { read_only, risk }
+}
+
+/// verify 类工具：把 chunk 推向 verified 的动作。它写 source=Human（verify.rs:101），
+/// 包成 AI 工具会"AI 调用被记成人确认"——故恒强制确认，不随第一期开关放行（spec §4.3）。
+pub(super) fn tool_always_requires_confirmation(tool_name: &str) -> bool {
+    matches!(tool_name, "wechatagent.verify_knowledge_chunk")
+}
+
+/// 第一期权限放大：dangerous_confirm_enabled 默认 false（见 spec §1.2），
+/// 此时即便有 dangerous 工具也不强制确认，先跑通功能。开关为后续收紧预留。
+/// 但 irreversible（reset/delete/销毁）+ verify 类（AI 永不自动 verify）无视开关
+/// 恒需确认——第一期即便放权也保留（spec §4.2/§4.3）。
+pub(super) fn plan_requires_confirmation(
+    tool_names: &[&str],
+    dangerous_confirm_enabled: bool,
+) -> bool {
+    tool_names.iter().any(|name| {
+        let risk = tool_effect(name).risk;
+        risk == ToolRisk::Irreversible
+            || tool_always_requires_confirmation(name)
+            || (dangerous_confirm_enabled && risk == ToolRisk::Dangerous)
+    })
 }
 
 /// S-20 / Task 19：判断一个工具是否属于"read 类"豁免列表。
@@ -1162,6 +1225,32 @@ pub(super) async fn build_management_plan(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tool_effect_classifies_risk() {
+        assert_eq!(tool_effect("wechatagent.search_contacts").risk, ToolRisk::Readonly);
+        assert_eq!(tool_effect("wechatagent.create_follow_up_task").risk, ToolRisk::Low);
+        assert_eq!(tool_effect("wechatagent.send_contact_message").risk, ToolRisk::Dangerous);
+        assert_eq!(tool_effect("wechatagent.publish_domain_profile").risk, ToolRisk::Dangerous);
+        assert_eq!(tool_effect("wechatagent.reset_domain").risk, ToolRisk::Irreversible);
+        // 只读工具同时 read_only=true（与既有 dry-run 逻辑兼容）
+        assert!(tool_effect("wechatagent.search_contacts").read_only);
+    }
+
+    #[test]
+    fn confirmation_gate_off_by_default_phase1() {
+        // 第一期权限放大：dangerous_confirm_enabled=false 时即便有 dangerous 工具也不强制确认
+        assert!(!plan_requires_confirmation(&["wechatagent.send_contact_message"], false));
+        // 开关打开后 dangerous 触发确认（为后续阶段预留）
+        assert!(plan_requires_confirmation(&["wechatagent.send_contact_message"], true));
+        // 全 readonly 永不需确认
+        assert!(!plan_requires_confirmation(&["wechatagent.search_contacts"], true));
+        // irreversible 无视开关恒需确认（第一期即便放权也保留，spec §4.2）
+        assert!(plan_requires_confirmation(&["wechatagent.reset_domain"], false));
+        // verify 类无视开关恒需确认（spec §4.3：AI 调 verify 会落 source=Human，
+        // 守"AI 永不自动 verify"——确认门不随第一期 dangerous 开关放行）
+        assert!(plan_requires_confirmation(&["wechatagent.verify_knowledge_chunk"], false));
+    }
 
     #[test]
     fn management_machine_write_drops_out_of_dict_stage_not_reject() {
