@@ -423,6 +423,33 @@ fn build_coverage_anchors(dims: &[crate::models::CoverageDimension]) -> String {
         .join("\n")
 }
 
+/// 取值字典接线 M4：把 active DomainProfile 的 coverage 维度 + 该维度在 `coverage`
+/// 对象里的认知状态 flags 合并成前端看板用的 `dimensionList`——每元素
+/// `{ key, label, verifiedFact, methodologyOnly, pendingDraft, state }`，顺序按维度
+/// 声明序。前端据此动态渲染完整度看板（不再写死销售五维）。某维度在 coverage 对象里
+/// 缺失（LLM 漏返/降级）→ 回落 `state="missing"` 的全 false 默认。纯函数、cfg(test) 锁。
+fn build_dimension_list(
+    dims: &[crate::models::CoverageDimension],
+    coverage: &Value,
+) -> Vec<Value> {
+    dims.iter()
+        .map(|dim| {
+            let flags = coverage.get(dim.key.as_str()).cloned().unwrap_or_else(|| {
+                json!({
+                    "verifiedFact": false,
+                    "methodologyOnly": false,
+                    "pendingDraft": false,
+                    "state": "missing"
+                })
+            });
+            let mut obj = flags.as_object().cloned().unwrap_or_default();
+            obj.insert("key".to_string(), json!(dim.key));
+            obj.insert("label".to_string(), json!(dim.display_name));
+            Value::Object(obj)
+        })
+        .collect()
+}
+
 pub async fn build_operation_knowledge_completeness(
     state: &AppState,
     workspace_id: &str,
@@ -695,6 +722,9 @@ pub async fn build_operation_knowledge_completeness(
         crate::agent::domain_profile::answering_mode_labels(
             active_profile.answering_mode_profile.as_ref(),
         );
+    // M4：coverage 对象提到变量，据此 + active profile 维度声明序构造前端 dimensionList。
+    let coverage_obj = audit.get("coverage").cloned().unwrap_or_else(|| json!({}));
+    let dimension_list = build_dimension_list(&active_profile.coverage_dimensions, &coverage_obj);
     Ok(json!({
         "totalChunks": total,
         "verifiedChunks": verified,
@@ -709,7 +739,8 @@ pub async fn build_operation_knowledge_completeness(
             "fully_supported": am_label_full
         },
         "summary": json_string(&audit, "summary").unwrap_or_default(),
-        "coverage": audit.get("coverage").cloned().unwrap_or_else(|| json!({})),
+        "coverage": coverage_obj,
+        "dimensionList": dimension_list,
         "gaps": gaps
     }))
 }
@@ -763,6 +794,51 @@ mod tests {
         ];
         let got = build_coverage_anchors(&dims);
         assert_eq!(got, "  - a：锚点A\n  - c：锚点C");
+    }
+
+    /// M4：DEFAULT 销售域 → dimensionList 五元素，顺序/key/label 对齐 coverage_dimensions
+    /// 声明序；coverage 里有 flags 的维度透传 flags，缺失维度回落 state="missing" 全 false。
+    #[test]
+    fn dimension_list_default_profile_merges_coverage_and_falls_back_missing() {
+        let p = crate::agent::domain_profile::default_domain_profile("ws-1");
+        // capability 有 verified 事实；pricing 仅给 state（验证缺失维度回落）。
+        let coverage = json!({
+            "capability": { "verifiedFact": true, "methodologyOnly": false, "pendingDraft": false, "state": "verified" }
+            // pricing / caseEvidence / effectClaims / deliveryBoundary 缺失 → 回落 missing
+        });
+        let list = build_dimension_list(&p.coverage_dimensions, &coverage);
+        assert_eq!(list.len(), 5, "DEFAULT 五维 → 5 元素");
+        // 顺序 + key/label 对（label = display_name）。
+        let keys: Vec<&str> = list.iter().map(|d| d["key"].as_str().unwrap()).collect();
+        assert_eq!(
+            keys,
+            vec!["capability", "pricing", "caseEvidence", "effectClaims", "deliveryBoundary"]
+        );
+        for (d, dim) in list.iter().zip(p.coverage_dimensions.iter()) {
+            assert_eq!(d["label"].as_str().unwrap(), dim.display_name);
+        }
+        // capability flags 透传。
+        assert_eq!(list[0]["verifiedFact"].as_bool(), Some(true));
+        assert_eq!(list[0]["state"].as_str(), Some("verified"));
+        // pricing 缺失 → missing 全 false。
+        assert_eq!(list[1]["verifiedFact"].as_bool(), Some(false));
+        assert_eq!(list[1]["methodologyOnly"].as_bool(), Some(false));
+        assert_eq!(list[1]["pendingDraft"].as_bool(), Some(false));
+        assert_eq!(list[1]["state"].as_str(), Some("missing"));
+    }
+
+    /// M4：换行业维度（非销售 key）→ dimensionList 按其声明序与 display_name 渲染。
+    #[test]
+    fn dimension_list_custom_dims_use_own_key_and_label() {
+        let dims = vec![
+            crate::models::CoverageDimension { key: "consultation_stage".to_string(), display_name: "咨询阶段".to_string(), required: false, anchor_hint: None, initial_signal: None },
+        ];
+        let coverage = json!({});
+        let list = build_dimension_list(&dims, &coverage);
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0]["key"].as_str(), Some("consultation_stage"));
+        assert_eq!(list[0]["label"].as_str(), Some("咨询阶段"));
+        assert_eq!(list[0]["state"].as_str(), Some("missing"));
     }
 
     /// 认知状态闸：有任何待审定草稿（needs_review>0）→ fully_supported 必降为

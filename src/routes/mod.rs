@@ -60,6 +60,10 @@ mod management;
 // domain_profiles / ask_human_inbox 先例。生产路由注册仍走下方 use。
 pub mod media_assets;
 mod observability;
+// pub（非默认私有）：operation_view_integration.rs 集成测试需从 tests/ crate 直调
+// active_view handler 真函数（带 State + Extension(test_admin)），仿 domain_profiles /
+// guide_profile 先例。生产路由注册仍走下方 use。
+pub mod operation_view;
 mod outcome_metrics;
 mod outcomes_autonomy;
 mod playbooks;
@@ -428,6 +432,10 @@ pub fn api_router(state: AppState) -> Router<AppState> {
             get(send_ledger::contact_send_history),
         )
         .route("/send-ledger/stats", get(send_ledger::send_ledger_stats))
+        .route(
+            "/operation/active-view",
+            get(operation_view::active_view),
+        )
         .route(
             "/send-ledger/overview",
             get(send_ledger::send_ledger_overview),

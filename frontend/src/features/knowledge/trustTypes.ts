@@ -85,6 +85,17 @@ export function parseCompleteness(raw: unknown): CompletenessView {
     product_safe: label("product_safe"),
     fully_supported: label("fully_supported"),
   };
+  // 取值字典接线 M4：优先用后端 dimensionList(active profile coverage_dimensions 驱动);
+  // 后端没回(老接口/降级) → 回落写死 DIM_ORDER(销售域兜底)。
+  const rawDimList = Array.isArray(o.dimensionList) ? (o.dimensionList as unknown[]) : [];
+  const dimensionList: CoverageDimension[] = rawDimList.length > 0
+    ? rawDimList.map((d) => {
+        const dd = (d ?? {}) as Record<string, unknown>;
+        const key = typeof dd.key === "string" ? dd.key : "";
+        const dimLabel = typeof dd.label === "string" ? dd.label : key;
+        return { key, label: dimLabel, ...flags(dd) };
+      })
+    : DIM_ORDER.map((d) => ({ key: d.key, label: d.label, ...coverage[d.key] }));
   return {
     totalChunks: Number(o.totalChunks ?? 0),
     verifiedChunks: Number(o.verifiedChunks ?? 0),
@@ -96,7 +107,7 @@ export function parseCompleteness(raw: unknown): CompletenessView {
     summary: typeof o.summary === "string" ? o.summary : "",
     coverage,
     gaps: Array.isArray(o.gaps) ? o.gaps.filter((g): g is string => typeof g === "string") : [],
-    dimensionList: DIM_ORDER.map((d) => ({ key: d.key, label: d.label, ...coverage[d.key] })),
+    dimensionList,
   };
 }
 

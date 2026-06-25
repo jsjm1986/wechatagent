@@ -69,6 +69,8 @@ generate_domain_profile_candidate 生成维度时
 
 **目标**：决策时把维度的合法取值（带中文名）注入 prompt，让 AI 判得准、命中字典；无字典时明确告知"暂无受控取值"。
 
+**范围**：流 A 只做 **extra 维度**（domainSignals 容器里、`participates_in_decision` 且非 typed 的维度），改 `render_decision_dimensions_guidance` 纯 Rust 函数。**typed 维度**（customer_stage / intent_level 等，取值指引散在 prompts.rs Soul/方法论/对话模式判定散文里）的行业化不在流 A——走 §6.5 的 profile override 生成路径（不改销售散文，复用已有 override 整段替换机制）。
+
 ### 4.1 TaxonomyCache 加 display_name（taxonomy.rs）
 
 - `CachedEntry`（:79）增加 `display_name: String` 字段；reload 填充处（:144 区域）从 `entry.value.display_name` 填入（现在被丢弃）。
@@ -98,11 +100,12 @@ generate_domain_profile_candidate 生成维度时
 
 **目标**：运营看客户画像时，维度值显示中文行业标签而非英文 canonical；下拉 / 五维卡按当前 profile 字典驱动。
 
-### 5.1 新增运营态只读端点（`src/routes/operation_view.rs`，新文件）
+### 5.1 新增聚合只读端点（`src/routes/operation_view.rs`，新文件）
 
-- `GET /api/operation/active-view`（路径前缀实现时对齐现有运营态惯例，参照 mod.rs 现有 `/operation-knowledge`、`/operation-domains` 命名）。
-- 权限：运营态 `require_session`（**不要** admin）——挂在 `/api` 普通鉴权下。区别于已有 admin-only 的 `active_domain_profile`。
+- `GET /api/operation/active-view`，挂在 `/api` 下（参照 mod.rs 现有 `/operation-knowledge`、`/operation-domains` 命名）。
+- **鉴权（可行性审查修正）**：本系统**只有一种鉴权角色 `AuthenticatedAdmin`**——`require_session`（auth/middleware.rs:51）对 cookie/JWT 都注入它，所有 `/api` 运营 handler（含 contacts.rs:106/160/200 看客户/改画像）统一用 `Extension<AuthenticatedAdmin>`。不存在独立的"运营态非 admin"角色。故本端点用 `Extension<AuthenticatedAdmin>` + `admin.current_workspace`，与现有运营 handler 一致；与 admin-only 的 `active_domain_profile` 同鉴权，区别仅是聚合 taxonomy 取值。原"运营态非 admin"前提删除（系统无此区分，无越权问题）。
 - 实现：`load_active_domain_profile`（已有，30s 缓存）拿维度声明 + 取 taxonomy 取值字典（带 display_name）。**取数走 TaxonomyCache（已在 4.1 补 display_name）**，与流 A 单一取数路径一致；无 active profile 时 `dimensions: []` + `taxonomies: {}`（合法状态，运行时回落 DEFAULT）。
+- **取值字典的 kind 来源（可行性审查修正 major #3）**：端点返回的 `taxonomies` **不能只遍历 `profile.profile_dimensions` 的 kind**——`relationship_type` 是 admin 直写维度，不在 profile_dimensions 里（DEFAULT profile_dimensions 只有 customer_stage/intent_level）。端点要取的 kind 集 = `profile_dimensions 的 kind` ∪ `前端要翻译的固定维度（relationship_type 等 AdminDirect 维度）`。实现时用一个明确的 kind 列表：profile 维度 kind + `["relationship_type"]`（或从 dimension_registry 取 value_source=Taxonomy 的 kind），逐个 `dimension_values_with_labels` 建 taxonomies。
 - 返回结构（camelCase wire）：
 
 ```json
@@ -117,10 +120,11 @@ generate_domain_profile_candidate 生成维度时
 }
 ```
 
+
 ### 5.2 扩展 profileStore（`frontend/src/stores/profileStore.ts`，现有文件）
 
-- 现状：调 `/api/admin/domain-profiles/active`，存 `activeProfile`，有降级。
-- 扩展：数据源改调新运营态端点 `/api/operation/active-view`，新增 `dimensions` + `taxonomies` state；暴露 `labelFor(kind, value): LabelResult`。
+- 现状：调 `/api/admin/domain-profiles/active`，存 `activeProfile` + `loadActiveProfile`，有降级。
+- **扩展而非替换（可行性审查 major #5）**：现有 `activeProfile` / `loadActiveProfile` **有真实调用方**（Shell.tsx:136 读 `s.activeProfile`、:162 频道 `visibleWhen(activeProfile)` 门控、App.tsx:144 调 `loadActiveProfile()`）——若删除会断频道可见性逻辑。所以**保留** `activeProfile` + `loadActiveProfile`，**新增** `dimensions` / `taxonomies` state + `loadActiveView()`（调新端点）+ `labelFor`。两者并存，不互相替换；App.tsx 挂载时除现有 `loadActiveProfile` 外再调一次 `loadActiveView`（或合并为一次加载，实现时确认 active-view 是否已含 profile 全量、能否让 activeProfile 也从它派生以省一次请求）。
 - 保留现有降级语义：拿不到数据时 `labelFor` 一律回落 `no_dict`（前端照常跑，只是没行业化数据）。
 
 ### 5.3 labelFor 三情形分流（核心翻译层）
@@ -144,9 +148,9 @@ labelFor(kind, value):
 
 ### 5.4 三个渲染点改造
 
-- `stageLabel`（legacy.tsx:2011）：`labelFor('customer_stage', stage)` 取代直出 canonical。
-- `relationship_type` 下拉（legacy.tsx:447 区域）：选项来自 `taxonomies.relationship_type`（取代写死枚举），label 走字典。
-- `completeness` 五维（trustTypes.ts:45 区域）：维度来自 `dimensions`（取代写死销售五维）——后端 catalog.rs:606 区域已动态回 profile 维度，前端改成读 `dimensions` 即对齐。
+- `stageLabel`（legacy.tsx:1997 区域，渲染 :2021）：`labelFor('customer_stage', stage)` 取代直出 canonical。
+- `relationship_type` 下拉（legacy.tsx:430 区域，现写死 customer/peer/friend）：选项来自 `taxonomies.relationship_type`（取代写死枚举），label 走字典。
+- `completeness` 维度（trustTypes.ts:45 DIM_ORDER 写死销售五维）：**改前必须先补后端数据源（可行性审查 major #4）**。实测现状：completeness 响应（catalog.rs:698 区域 `build_operation_knowledge_completeness`）只回 `coverage`（无 label）+ `answeringModeLabels`，**没有 dimensionList 字段**；前端 `CompletenessView.dimensionList`（trustTypes.ts:42）类型有、但后端没回。**注意命名空间不同**：completeness 维度来自 `DomainProfile.coverage_dimensions`（知识覆盖维度 capability/pricing/...），与 active-view 端点的 `profile_dimensions`（customer_stage/intent_level 画像维度）是**两套不同的维度**，不能混。所以本项改造 = (a) 后端 `build_operation_knowledge_completeness` 增产 `dimensionList`（key + 中文 label，源自 `active_profile.coverage_dimensions.display_name`）；(b) 前端 trustTypes.ts 解析优先读 `dimensionList`，仅缺省回落写死 DIM_ORDER。这是后端 + 前端两侧改动，不只 trustTypes.ts。
 
 ### 5.5 测试
 
@@ -180,7 +184,19 @@ prompt 指引 AI：`id` 用 snake_case 英文 canonical、`label` 用中文行�
 
 ### 6.2 落候选层（guide_profile.rs 生成流程末尾）
 
-profile 候选落库后，遍历各维度 `suggestedValues`，对每个值调已有 `upsert_candidate`（taxonomy.rs:319）落 `taxonomy_candidate`：scope=global、kind=维度 kind、value 带 id + label。与运行时 AI 跑出的新值进**同一张候选表、同一个 approve 通路**——一套机制。
+profile 候选落库后，遍历各维度 `suggestedValues`，对每个值落 `taxonomy_candidate`，与运行时 AI 跑出的新值进**同一张候选表、同一个 approve 通路**。
+
+**关键：label 通路必须先贯通（可行性审查 blocker #1）。** 实测现状：`upsert_candidate`（taxonomy.rs:319）真实签名是 `(db, scope_account_id, kind, raw_value, evidence: Option<&str>, confidence: i32)`——**没有 label 参数**；`TaxonomyCandidate`（models.rs:2588）**没有 label/display_name 字段**；`approve`（taxonomy.rs:456）硬编码 `display_name = candidate.raw_value.clone()`（即英文 id）。若不改，AI 生成的中文 label 全程丢失，approve 后字典 display_name 还是英文 canonical id——**直接 defeat 本工程"运营看到中文标签"的目标**。
+
+因此实现前必须贯通 label（6 处）：
+1. `TaxonomyCandidate`（models.rs:2588）加 `suggested_display_name: Option<String>`（`#[serde(default, skip_serializing_if=...)]` 向后兼容存量候选）。
+2. `upsert_candidate` 加 `suggested_display_name: Option<&str>` 参数，写入候选文档。
+3. `approve`（taxonomy.rs:456）把 `display_name = candidate.suggested_display_name.unwrap_or(raw_value)`，而非恒取 raw_value。
+4. 现有 `upsert_candidate` 调用点（运行时 AI 落候选处，decision_taxonomy.rs 等）同步加 `None` 实参（运行时不知 label，None 回落 raw_value，行为不变）。
+5. admin approve 路由（admin_taxonomy_candidates.rs）若展示候选，可顺带回 suggested_display_name 供审核者预览（可选，本期可省）。
+6. 流 C 落候选处：`upsert_candidate(db, "global", kind, id, Some(label), None, <confidence>)`。
+
+scope=global、kind=维度 kind、raw_value=AI 给的 id、suggested_display_name=AI 给的中文 label。`confidence` 取一个表示"AI 生成待审"的固定值（实现时与运行时候选的 confidence 口径对齐）。
 
 ### 6.3 红线守护
 
@@ -192,11 +208,25 @@ profile 候选落库后，遍历各维度 `suggestedValues`，对每个值调已
 
 取值生成是 profile 生成的**附加产物**：若 AI 没给 `suggestedValues` 或格式不对，profile 照常落库（维度声明仍在），只是没初始候选，运营手配或运行时生长兜底。不因取值生成失败阻断 profile 生成（仿 guide_profile 现有 `coerce_scalar_string_fields` 软化风格）。
 
-### 6.5 测试
+### 6.5 typed 维度行业化：生成 override（不改销售散文）
+
+**问题**：customer_stage / intent_level 等 **typed 维度**的取值指引不在 `render_decision_dimensions_guidance`（那只管 domainSignals 的 extra 维度），而是散落在 `prompts.rs` 的 Soul / 方法论 / 对话模式判定 prompt 模板里，用销售词硬编码（prompts.rs:498 stage_method「陌生接触/需求探索/方案评估…」、:798 Soul 取值举例、:986「customer_stage ∈ {方案匹配,异议处理…} → consultative」）。这些是 **DEFAULT 销售域兜底**，且取值与业务规则焊死——直接改散文换词会破坏 DEFAULT、且治标不治本（类 2/类 3 取值嵌在规则里）。
+
+**更优解（已与用户确认）**：typed 维度行业化**不改 prompts.rs 散文**，而是复用**已存在的 profile override 整段替换机制**，把它并进 AI 生成：
+
+- 已有机制（引擎零改动）：`soul_override`（decision.rs:292 整体替换出厂人格）、`methodology_override`（decision.rs:370 整体替换运营方法论 / stage_method）、`conversation_mode_policy` override（domain_profile.rs:307 `strip_conversation_mode_section` 剥离销售判定段 + :331 `apply_conversation_mode_policy` 注入本行业规则）。
+- 改造：`generate_domain_profile_candidate` 的 prompt schema 增产 `soulOverride` / `methodologyOverride` / `conversationModePolicy` 三段（现状落 serde default → 即不生成）。AI 据行业描述生成本行业的人格本体、阶段方法论、对话模式判定规则——typed 维度的取值语义 + 驱动规则自然包含其中。
+- DEFAULT 销售域：override=None（现有 DEFAULT_PROFILE 行为不变）→ 走 prompts.rs 销售兜底，**字节等价不回归**。
+- 非销售行业：激活自己的 profile → 三个 override 整段替换销售散文 → AI 看到本行业的阶段取值 + 判定规则。
+
+**红线**：这三段 override 仍随 profile 走 `is_active=false` 候选 + 人审 publish/activate（现有红线）。生成是附加产物，缺失则该字段 None 回落销售兜底（软化，§6.4 同款）。
+
+### 6.6 测试
 
 - schema 解析：含 `suggestedValues` 的生成输出能正确解析（仿 guide_profile 现有 coerce 测试 :460 区域）。
 - 候选落库：生成后 `taxonomy_candidate` 有对应条目（集成测试，标 `#[ignore]` 需 Docker）。
 - 软化：缺 `suggestedValues` 时 profile 仍落库不 panic（单测）。
+- override 生成：含 `soulOverride` / `methodologyOverride` / `conversationModePolicy` 的生成输出正确解析落 profile 字段；缺失时落 None（单测）。
 
 ## 7. 代码落点汇总
 
@@ -210,7 +240,7 @@ profile 候选落库后，遍历各维度 `suggestedValues`，对每个值调已
 | `frontend/src/stores/profileStore.ts` | 数据源换运营态端点 + 加 taxonomies/dimensions + `labelFor` | B |
 | `frontend/src/features/user-ops/legacy.tsx` | stageLabel + relationship 下拉走 labelFor | B |
 | `frontend/src/features/knowledge/trustTypes.ts` | completeness 五维走 dimensions | B |
-| `src/routes/guide_profile.rs` | schema 加 suggestedValues + 落候选 | C |
+| `src/routes/guide_profile.rs` | schema 加 suggestedValues + 落候选；schema 加 soulOverride/methodologyOverride/conversationModePolicy 三段生成（typed 维度行业化，§6.5） | C |
 
 ## 8. 错误处理
 

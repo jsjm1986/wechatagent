@@ -89,6 +89,9 @@ struct CachedEntry {
     is_terminal: bool,
     /// universal-domain-adaptation #3：是否再激活目标 stage（来自 TaxonomyValue）。
     is_reactivation_target: bool,
+    /// 取值字典的人类可读名（来自 TaxonomyValue.display_name）。流 A prompt 取值
+    /// 指引 + 流 B 前端 labelFor 翻译都用它；早期只缓存 planner 排序字段时被丢弃。
+    display_name: String,
 }
 
 impl Default for TaxonomyCache {
@@ -147,6 +150,7 @@ impl TaxonomyCache {
                     priority_weight: entry.value.priority_weight,
                     is_terminal: entry.value.is_terminal,
                     is_reactivation_target: entry.value.is_reactivation_target,
+                    display_name: entry.value.display_name,
                 });
         }
         let mut inner = self.inner.lock();
@@ -285,6 +289,30 @@ pub(crate) fn dimension_value_weights(
     out
 }
 
+/// 查某 `kind` 下所有 status=active 的 `(canonical_id, display_name)` 对。
+/// scope 回落：account 私有 scope 优先，再补 global；按 canonical_id 去重。
+/// 流 A prompt 取值指引 + 流 B 前端字典翻译共用。
+pub(crate) fn dimension_values_with_labels(
+    kind: &str,
+    scope_account_id: &str,
+    cache: &TaxonomyCache,
+) -> Vec<(String, String)> {
+    let inner = cache.inner.lock();
+    let mut out: Vec<(String, String)> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for scope in [scope_account_id, "global"] {
+        let key = (scope.to_string(), kind.to_string());
+        if let Some(entries) = inner.entries.get(&key) {
+            for e in entries {
+                if e.status == "active" && seen.insert(e.canonical_id.clone()) {
+                    out.push((e.canonical_id.clone(), e.display_name.clone()));
+                }
+            }
+        }
+    }
+    out
+}
+
 /// 某 `kind` 在缓存里是否有任何字典条目（account 私有 scope 或 global）。
 ///
 /// 用于区分「字典未配置（该 kind 整个为空）」与「字典有条目但此值越界」——前者属
@@ -323,6 +351,7 @@ pub(crate) async fn upsert_candidate(
     raw_value: &str,
     evidence: Option<&str>,
     confidence: i32,
+    suggested_display_name: Option<&str>,
 ) -> AppResult<()> {
     let now = DateTime::now();
     let collection = db.collection_taxonomy_candidates();
@@ -397,6 +426,7 @@ pub(crate) async fn upsert_candidate(
         status: "pending".to_string(),
         reviewed_at: None,
         reviewed_by: None,
+        suggested_display_name: suggested_display_name.map(|s| s.to_string()),
     };
 
     // unique index 冲突视为竞态：另一个并发 run 已经写入；忽略错误，留给下次累加。
@@ -459,7 +489,12 @@ pub(crate) async fn approve(
         kind: candidate.kind.clone(),
         value: TaxonomyValue {
             id: candidate.raw_value.clone(),
-            display_name: candidate.raw_value.clone(),
+            // 流 C：优先用 AI 生成的中文 label（候选 suggested_display_name），缺省回落
+            // 英文 raw_value id（保持与 admin approve 路径口径一致）。
+            display_name: candidate
+                .suggested_display_name
+                .clone()
+                .unwrap_or_else(|| candidate.raw_value.clone()),
             description: candidate.evidence.clone().unwrap_or_default(),
             aliases: Vec::new(),
             status: "active".to_string(),
@@ -593,6 +628,7 @@ pub fn taxonomy_cache_for_tests(entries: Vec<TaxonomyEntry>) -> TaxonomyCache {
             priority_weight: entry.value.priority_weight,
             is_terminal: entry.value.is_terminal,
             is_reactivation_target: entry.value.is_reactivation_target,
+            display_name: entry.value.display_name,
         });
     }
     {
@@ -623,6 +659,7 @@ mod tests {
                     priority_weight: entry.value.priority_weight,
                     is_terminal: entry.value.is_terminal,
                     is_reactivation_target: entry.value.is_reactivation_target,
+                    display_name: entry.value.display_name,
                 });
         }
         {
@@ -637,6 +674,7 @@ mod tests {
         scope: &str,
         kind: &str,
         canonical_id: &str,
+        display_name: &str,
         aliases: &[&str],
         status: &str,
     ) -> TaxonomyEntry {
@@ -646,7 +684,7 @@ mod tests {
             kind: kind.to_string(),
             value: TaxonomyValue {
                 id: canonical_id.to_string(),
-                display_name: canonical_id.to_string(),
+                display_name: display_name.to_string(),
                 description: String::new(),
                 aliases: aliases.iter().map(|s| s.to_string()).collect(),
                 status: status.to_string(),
@@ -668,6 +706,7 @@ mod tests {
             "global",
             "customer_stage",
             "first_contact",
+            "初次接触",
             &["新客", "刚加好友"],
             "active",
         )]);
@@ -681,6 +720,7 @@ mod tests {
             "global",
             "customer_stage",
             "first_contact",
+            "初次接触",
             &["新客", "刚加好友"],
             "active",
         )]);
@@ -694,6 +734,7 @@ mod tests {
             "global",
             "intent_level",
             "lukewarm",
+            "温意向",
             &[],
             "deprecated",
         )]);
@@ -707,6 +748,7 @@ mod tests {
             "global",
             "objection_type",
             "price",
+            "价格异议",
             &["价格异议"],
             "active",
         )]);
@@ -724,11 +766,12 @@ mod tests {
         // account 私有字典里有 first_contact aliased to acct-special；
         // global 字典里 first_contact 是 active。account scope 优先。
         let cache = make_cache_with_entries(vec![
-            make_entry("global", "customer_stage", "first_contact", &[], "active"),
+            make_entry("global", "customer_stage", "first_contact", "初次接触", &[], "active"),
             make_entry(
                 "acct-1",
                 "customer_stage",
                 "premium_first_contact",
+                "尊享初次接触",
                 &["first_contact"],
                 "active",
             ),
@@ -746,11 +789,12 @@ mod tests {
         // 同一 raw_value 在不同 kind 下相互独立；本案验证 kind 字符串作为查表键
         // 不会被错误共享。
         let cache = make_cache_with_entries(vec![
-            make_entry("global", "customer_stage", "shared_value", &[], "active"),
+            make_entry("global", "customer_stage", "shared_value", "共享值", &[], "active"),
             make_entry(
                 "global",
                 "intent_level",
                 "shared_value",
+                "共享值",
                 &[],
                 "deprecated",
             ),
@@ -768,9 +812,9 @@ mod tests {
     #[test]
     fn taxonomy_candidate_persisted_on_unknown_value() {
         let cache = make_cache_with_entries(vec![
-            make_entry("global", "customer_stage", "first_contact", &["新客"], "active"),
-            make_entry("global", "intent_level", "hot", &["高意向"], "active"),
-            make_entry("global", "objection_type", "price", &["价格异议"], "active"),
+            make_entry("global", "customer_stage", "first_contact", "初次接触", &["新客"], "active"),
+            make_entry("global", "intent_level", "hot", "高意向", &["高意向"], "active"),
+            make_entry("global", "objection_type", "price", "价格异议", &["价格异议"], "active"),
         ]);
 
         // 三类未知值都应判为 CandidateNew（由调用方写入 taxonomy_candidates）。
@@ -831,6 +875,7 @@ mod tests {
             "global",
             "customer_stage",
             "first_contact",
+            "初次接触",
             &[],
             "active",
         )]);
@@ -853,6 +898,7 @@ mod tests {
             "global",
             "customer_stage",
             "first_contact",
+            "初次接触",
             &[],
             "active",
         )]);
@@ -874,6 +920,7 @@ mod tests {
             "global",
             "customer_stage",
             "first_contact",
+            "初次接触",
             &[],
             "active",
         )]);
@@ -892,6 +939,7 @@ mod tests {
             "global",
             "customer_stage",
             "first_contact",
+            "初次接触",
             &[],
             "active",
         )]);
@@ -901,6 +949,7 @@ mod tests {
             "acct-1",
             "customer_stage",
             "first_contact",
+            "初次接触",
             &[],
             "active",
         )]);
@@ -916,6 +965,7 @@ mod tests {
             "global",
             "intent_level",
             "high",
+            "高意向",
             &[],
             "active",
         )]);
@@ -923,5 +973,26 @@ mod tests {
         // 完全空缓存。
         let empty = make_cache_with_entries(vec![]);
         assert!(!kind_has_entries("customer_stage", "acct-1", &empty));
+    }
+
+    /// `dimension_values_with_labels_returns_id_label_pairs`
+    /// 验证：返回该 kind 下 status=active 的 `(canonical_id, display_name)` 对，
+    /// deprecated 条目被滤除（流 A prompt 取值指引 / 流 B 前端翻译只列在用取值）。
+    #[test]
+    fn dimension_values_with_labels_returns_id_label_pairs() {
+        let cache = make_cache_with_entries(vec![
+            make_entry("global", "customer_stage", "first_contact", "初次接触", &[], "active"),
+            make_entry("global", "customer_stage", "qualified", "已确认意向", &[], "active"),
+            make_entry("global", "customer_stage", "old_dep", "废弃", &[], "deprecated"),
+        ]);
+        let mut got = dimension_values_with_labels("customer_stage", "acct1", &cache);
+        got.sort();
+        assert_eq!(
+            got,
+            vec![
+                ("first_contact".to_string(), "初次接触".to_string()),
+                ("qualified".to_string(), "已确认意向".to_string()),
+            ]
+        );
     }
 }
