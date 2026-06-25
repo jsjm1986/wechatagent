@@ -108,7 +108,21 @@ pub async fn ensure_prompt_pack_v2(
             ensure_missing_prompt_templates(db, workspace_id).await?;
             Ok(())
         }
-        Ok(None) => reset_prompt_pack_v2(db, workspace_id, default_account_id).await,
+        Ok(None) => {
+            // 区分全新空库 vs 旧版本库：
+            // - 全新空库（无任何 prompt_templates）→ reset 种四集合（souls/playbook/configs 首次种入）
+            // - 旧版本库（已有 prompt_templates 但版本不匹配）→ align 逐 key 对齐（不破坏 evolution/manual）
+            let any_existing = db
+                .prompt_templates()
+                .find_one(doc! { "workspace_id": workspace_id }, None)
+                .await?
+                .is_some();
+            if any_existing {
+                align_prompt_specs(db, workspace_id, default_account_id).await
+            } else {
+                reset_prompt_pack_v2(db, workspace_id, default_account_id).await
+            }
+        }
         Err(error) => {
             // 查询异常（连接抖动、字段错乱等）时进入兜底：
             // 重新种入默认模板，宁可短暂存在重复条目，也要保证模板始终可用。
@@ -207,6 +221,140 @@ pub(crate) fn is_refreshable_prompt_seeded_by(seeded_by: &Option<String>) -> boo
 /// 只统一换行，**不 trim 行尾**（保留 spec 有意义的尾随空格）。
 pub(crate) fn normalize_prompt_content(s: &str) -> String {
     s.replace("\r\n", "\n")
+}
+
+/// spec 为真相的逐 key 内容对齐（替代旧版本库的破坏性全量 reset）。
+///
+/// 对每个系统 prompt spec：
+/// 1. 若该 key 存在任何 seeded_by="evolution_release" 行（在飞 A/B / release 链）→
+///    跳过 + 写告警事件，交 admin 手动收口，绝不动灰度链。
+/// 2. 取该 key 下「可刷新」(is_refreshable_prompt_seeded_by) 且 current_version=true 的行。
+/// 3. normalize 后内容一致 → 跳过；不一致 / 不存在 → 归档旧可刷新行(status=archived)
+///    + 种 spec 新行(active, current_version=true, seeded_by="system")。
+/// 4. 不可刷新行(manual/evolution)一律不动。
+async fn align_prompt_specs(
+    db: &Database,
+    workspace_id: &str,
+    account_id: &str,
+) -> AppResult<()> {
+    for spec in prompt_specs() {
+        // 1. evolution 灰度链守卫
+        let has_evolution = db
+            .prompt_templates()
+            .find_one(
+                doc! {
+                    "workspace_id": workspace_id,
+                    "prompt_key": spec.key,
+                    "seeded_by": "evolution_release",
+                },
+                None,
+            )
+            .await?
+            .is_some();
+        if has_evolution {
+            let _ = db
+                .events()
+                .insert_one(
+                    crate::models::AgentEvent {
+                        id: None,
+                        workspace_id: workspace_id.to_string(),
+                        account_id: account_id.to_string(),
+                        contact_wxid: None,
+                        kind: "prompt_pack_align_skipped_evolution".to_string(),
+                        status: "warn".to_string(),
+                        summary: format!(
+                            "prompt key={} 存在 evolution 灰度链，启动对齐跳过，交 admin 收口",
+                            spec.key
+                        ),
+                        details: Some(doc! { "prompt_key": spec.key }),
+                        created_at: DateTime::now(),
+                        dedupe_key: None,
+                    },
+                    None,
+                )
+                .await;
+            continue;
+        }
+
+        // 2. 取可刷新的 current 行
+        let current = db
+            .prompt_templates()
+            .find_one(
+                doc! {
+                    "workspace_id": workspace_id,
+                    "prompt_key": spec.key,
+                    "current_version": true,
+                },
+                None,
+            )
+            .await?;
+
+        // 3. 判断是否需要对齐
+        let needs_align = match &current {
+            Some(row) => {
+                // 只刷可刷新脉络；不可刷新(manual等)直接跳过
+                if !is_refreshable_prompt_seeded_by(&row.seeded_by) {
+                    continue;
+                }
+                normalize_prompt_content(&row.content) != normalize_prompt_content(spec.content)
+            }
+            None => true, // 不存在 → 需种入
+        };
+        if !needs_align {
+            continue;
+        }
+
+        // 4a. 归档旧可刷新 current 行（若有）
+        if current.is_some() {
+            db.prompt_templates()
+                .update_many(
+                    doc! {
+                        "workspace_id": workspace_id,
+                        "prompt_key": spec.key,
+                        "current_version": true,
+                        "seeded_by": "system",
+                    },
+                    doc! {
+                        "$set": {
+                            "status": "archived",
+                            "current_version": false,
+                            "updated_at": DateTime::now(),
+                        }
+                    },
+                    None,
+                )
+                .await?;
+        }
+
+        // 4b. 种 spec 新行
+        let version = next_prompt_version(db, workspace_id, spec.key).await?;
+        db.prompt_templates()
+            .insert_one(
+                PromptTemplate {
+                    id: None,
+                    workspace_id: workspace_id.to_string(),
+                    prompt_key: spec.key.to_string(),
+                    agent_kind: spec.agent_kind.to_string(),
+                    layer: spec.layer.to_string(),
+                    title: spec.title.to_string(),
+                    description: Some(spec.description.to_string()),
+                    content: spec.content.to_string(),
+                    status: spec.status.to_string(),
+                    version,
+                    prompt_pack_version: PROMPT_PACK_VERSION.to_string(),
+                    created_by: "system".to_string(),
+                    created_at: DateTime::now(),
+                    updated_at: DateTime::now(),
+                    current_version: true,
+                    previous_version: None,
+                    seeded_by: Some("system".to_string()),
+                    locale: Some(DEFAULT_LOCALE.to_string()),
+                },
+                None,
+            )
+            .await?;
+    }
+    Ok(())
 }
 
 pub async fn reset_prompt_pack_v2(
@@ -921,6 +1069,14 @@ fn soul_specs() -> Vec<SoulSpec> {
 默认只生成草稿和发布计划，自动发布必须由策略显式允许。"#,
         },
     ]
+}
+
+/// 暴露 (key, content) 列表，供集成测试取真实 spec key 做对齐验证。
+pub fn prompt_specs_for_test() -> Vec<(String, String)> {
+    prompt_specs()
+        .into_iter()
+        .map(|s| (s.key.to_string(), s.content.to_string()))
+        .collect()
 }
 
 fn prompt_specs() -> Vec<PromptSpec> {
