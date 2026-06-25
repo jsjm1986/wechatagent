@@ -1,5 +1,6 @@
 import { useState } from "react";
 import type { Contact } from "../../types";
+import BayesianTrendChart from "./BayesianTrendChart";
 import styles from "./TagTrustPanel.module.css";
 
 /**
@@ -111,7 +112,7 @@ export default function TagTrustPanel({
             <span className={styles.layerNote}>持续观测，永不驱动行为</span>
           </div>
         </div>
-        <div className={styles.bayesianPlaceholder}>走势图开发中</div>
+        <BayesianTrendChart signals={contact.bayesianSignals ?? []} />
       </section>
     </section>
   );
