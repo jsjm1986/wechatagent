@@ -86,29 +86,28 @@ pub async fn ensure_prompt_pack_v2(
     db: &Database,
     workspace_id: &str,
     default_account_id: &str,
-) -> AppResult<()> {
-    // 检测当前 workspace 是否已经种入过 v2 prompt pack。
-    // 把 status 为 "active" 或 "draft" 的模板都视为已种入：
-    // group/moment 的默认模板使用 status="draft"，运行时虽然不会注入，
-    // 但不应每次启动都把它们冲掉重新种。
-    let lookup = db
+) -> AppResult<bool> {
+    // spec 为真相的启动对齐：不再用 PROMPT_PACK_VERSION 做"生效闸"，而是按
+    // "库里有无任何 prompt_templates 行"分流——
+    // - 全新空库 → reset_prompt_pack_v2（首次种四集合：souls/playbook/configs/templates）
+    // - 非空库   → delete_redundant（清上一轮 archived）+ align_prompt_specs（逐 key 内容对齐）
+    // 生效判定完全交给 align 的 normalize 内容比对，所以改 spec 重启必生效、不靠版本号。
+    // 顺序铁律：delete_redundant 先、align 后——否则 align 刚归档的行会被立刻物理删除。
+    let any_existing = db
         .prompt_templates()
-        .find_one(
-            doc! {
-                "workspace_id": workspace_id,
-                "prompt_pack_version": PROMPT_PACK_VERSION,
-                "status": { "$in": ["active", "draft"] }
-            },
-            None,
-        )
+        .find_one(doc! { "workspace_id": workspace_id }, None)
         .await;
-    match lookup {
+    match any_existing {
         Ok(Some(_)) => {
+            // 非空库：清理上一轮归档行（GC），再逐 key 内容对齐。
             delete_redundant_prompt_data(db, workspace_id).await?;
-            ensure_missing_prompt_templates(db, workspace_id).await?;
-            Ok(())
+            align_prompt_specs(db, workspace_id, default_account_id).await
         }
-        Ok(None) => reset_prompt_pack_v2(db, workspace_id, default_account_id).await,
+        Ok(None) => {
+            // 全新空库：首次种四集合。reset 总是写入 → 需失效缓存。
+            reset_prompt_pack_v2(db, workspace_id, default_account_id).await?;
+            Ok(true)
+        }
         Err(error) => {
             // 查询异常（连接抖动、字段错乱等）时进入兜底：
             // 重新种入默认模板，宁可短暂存在重复条目，也要保证模板始终可用。
@@ -137,27 +136,138 @@ pub async fn ensure_prompt_pack_v2(
                     None,
                 )
                 .await;
-            reset_prompt_pack_v2(db, workspace_id, default_account_id).await
+            reset_prompt_pack_v2(db, workspace_id, default_account_id).await?;
+            Ok(true)
         }
     }
 }
 
-async fn ensure_missing_prompt_templates(db: &Database, workspace_id: &str) -> AppResult<()> {
+/// 一条 prompt_template 行是否「系统种子脉络 / 可被启动对齐刷新」。
+///
+/// 镜像 `routes::admin_ops_versions::is_refreshable_policy_seeded_by` 的白名单语义，
+/// 但**更保守**：prompt_templates 的系统种子历来都写 `seeded_by="system"`，故只认它；
+/// `evolution_release`（演化灰度）/ `manual`（运营手编）/ `system_evolution_v1`
+/// （critic 单独种）/ `None`（未打标）一律保留，绝不被启动对齐归档。
+/// 正向白名单匹配（agent-first，不用 `!=` 否定）。
+pub(crate) fn is_refreshable_prompt_seeded_by(seeded_by: &Option<String>) -> bool {
+    matches!(seeded_by.as_deref(), Some("system"))
+}
+
+/// 内容比对前归一：统一换行符 `\r\n`→`\n`。
+///
+/// 必要性：spec 是 Windows 工作树里的 `r#"..."#` 多行串，git autocrlf 跨构建
+/// 会 LF↔CRLF 互转，使编译进二进制的 `&str` 字节与 DB 存的不同。裸 `==` 会每次
+/// 重启都判「不一致→归档+重种」，导致版本号无限膨胀 + A/B 轮换抖动。
+/// 只统一换行，**不 trim 行尾**（保留 spec 有意义的尾随空格）。
+pub(crate) fn normalize_prompt_content(s: &str) -> String {
+    s.replace("\r\n", "\n")
+}
+
+/// spec 为真相的逐 key 内容对齐（替代旧版本库的破坏性全量 reset）。
+///
+/// 对每个系统 prompt spec：
+/// 1. 若该 key 存在任何 seeded_by="evolution_release" 行（在飞 A/B / release 链）→
+///    跳过 + 写告警事件，交 admin 手动收口，绝不动灰度链。
+/// 2. 取该 key 下「可刷新」(is_refreshable_prompt_seeded_by) 且 current_version=true 的行。
+/// 3. normalize 后内容一致 → 跳过；不一致 / 不存在 → 归档旧可刷新行(status=archived)
+///    + 种 spec 新行(active, current_version=true, seeded_by="system")。
+/// 4. 不可刷新行(manual/evolution)一律不动。
+async fn align_prompt_specs(
+    db: &Database,
+    workspace_id: &str,
+    account_id: &str,
+) -> AppResult<bool> {
+    let mut wrote = false;
     for spec in prompt_specs() {
-        let existing = db
+        // 1. evolution 灰度链守卫
+        let has_evolution = db
             .prompt_templates()
             .find_one(
                 doc! {
                     "workspace_id": workspace_id,
                     "prompt_key": spec.key,
-                    "status": { "$in": ["active", "draft"] }
+                    "seeded_by": "evolution_release",
+                },
+                None,
+            )
+            .await?
+            .is_some();
+        if has_evolution {
+            let _ = db
+                .events()
+                .insert_one(
+                    crate::models::AgentEvent {
+                        id: None,
+                        workspace_id: workspace_id.to_string(),
+                        account_id: account_id.to_string(),
+                        contact_wxid: None,
+                        kind: "prompt_pack_align_skipped_evolution".to_string(),
+                        status: "warn".to_string(),
+                        summary: format!(
+                            "prompt key={} 存在 evolution 灰度链，启动对齐跳过，交 admin 收口",
+                            spec.key
+                        ),
+                        details: Some(doc! { "prompt_key": spec.key }),
+                        created_at: DateTime::now(),
+                        dedupe_key: None,
+                    },
+                    None,
+                )
+                .await;
+            continue;
+        }
+
+        // 2. 取可刷新的 current 行
+        let current = db
+            .prompt_templates()
+            .find_one(
+                doc! {
+                    "workspace_id": workspace_id,
+                    "prompt_key": spec.key,
+                    "current_version": true,
                 },
                 None,
             )
             .await?;
-        if existing.is_some() {
+
+        // 3. 判断是否需要对齐
+        let needs_align = match &current {
+            Some(row) => {
+                // 只刷可刷新脉络；不可刷新(manual等)直接跳过
+                if !is_refreshable_prompt_seeded_by(&row.seeded_by) {
+                    continue;
+                }
+                normalize_prompt_content(&row.content) != normalize_prompt_content(spec.content)
+            }
+            None => true, // 不存在 → 需种入
+        };
+        if !needs_align {
             continue;
         }
+
+        // 4a. 归档旧可刷新 current 行（若有）
+        if current.is_some() {
+            db.prompt_templates()
+                .update_many(
+                    doc! {
+                        "workspace_id": workspace_id,
+                        "prompt_key": spec.key,
+                        "current_version": true,
+                        "seeded_by": "system",
+                    },
+                    doc! {
+                        "$set": {
+                            "status": "archived",
+                            "current_version": false,
+                            "updated_at": DateTime::now(),
+                        }
+                    },
+                    None,
+                )
+                .await?;
+        }
+
+        // 4b. 种 spec 新行
         let version = next_prompt_version(db, workspace_id, spec.key).await?;
         db.prompt_templates()
             .insert_one(
@@ -184,8 +294,12 @@ async fn ensure_missing_prompt_templates(db: &Database, workspace_id: &str) -> A
                 None,
             )
             .await?;
+
+        // 本 key 真正执行了归档+重种（active 内容已换）→ 标记需失效 LRU 缓存。
+        // evolution 守卫 continue / 内容一致 continue 都在上方提前跳过，不到这里，故不置位。
+        wrote = true;
     }
-    Ok(())
+    Ok(wrote)
 }
 
 pub async fn reset_prompt_pack_v2(
@@ -220,6 +334,7 @@ pub async fn reset_prompt_pack_v2(
                     version,
                     created_at: DateTime::now(),
                     updated_at: DateTime::now(),
+                    seeded_by: Some("system".to_string()),
                 },
                 None,
             )
@@ -900,6 +1015,14 @@ fn soul_specs() -> Vec<SoulSpec> {
 默认只生成草稿和发布计划，自动发布必须由策略显式允许。"#,
         },
     ]
+}
+
+/// 暴露 (key, content) 列表，供集成测试取真实 spec key 做对齐验证。
+pub fn prompt_specs_for_test() -> Vec<(String, String)> {
+    prompt_specs()
+        .into_iter()
+        .map(|s| (s.key.to_string(), s.content.to_string()))
+        .collect()
 }
 
 fn prompt_specs() -> Vec<PromptSpec> {
@@ -2234,6 +2357,31 @@ mod ab_bucket_tests {
             "expected ≥6 distinct buckets out of 8, got {}",
             buckets.len()
         );
+    }
+
+    #[test]
+    fn refreshable_prompt_only_system_true() {
+        assert!(is_refreshable_prompt_seeded_by(&Some("system".to_string())));
+        // 其余脉络一律保留（不可刷新）
+        assert!(!is_refreshable_prompt_seeded_by(&Some("manual".to_string())));
+        assert!(!is_refreshable_prompt_seeded_by(&Some("evolution_release".to_string())));
+        assert!(!is_refreshable_prompt_seeded_by(&Some("system_evolution_v1".to_string())));
+        assert!(!is_refreshable_prompt_seeded_by(&Some("operator".to_string())));
+        // None 保守视为不可刷新（不照搬 domain_configs 的 None→可刷新）
+        assert!(!is_refreshable_prompt_seeded_by(&None));
+    }
+
+    #[test]
+    fn normalize_unifies_crlf_only() {
+        // CRLF 与 LF 视为等价（防 git autocrlf 跨构建版本膨胀）
+        assert_eq!(
+            normalize_prompt_content("a\r\nb\r\n"),
+            normalize_prompt_content("a\nb\n")
+        );
+        // 不 trim 行尾有意义空格：尾随空格被保留，不被吞
+        assert_eq!(normalize_prompt_content("a \n"), "a \n");
+        // 纯 LF 原样
+        assert_eq!(normalize_prompt_content("x\ny"), "x\ny");
     }
 }
 

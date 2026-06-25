@@ -105,6 +105,7 @@ pub(super) async fn list_evolution_experiments(
 /// `GET /api/evolution/proposals/:id` —— 单条详情。
 pub(super) async fn get_evolution_proposal_detail(
     State(state): State<AppState>,
+    Extension(admin): Extension<AuthenticatedAdmin>,
     Path(id): Path<String>,
 ) -> AppResult<Json<Value>> {
     // FORBIDDEN: enqueue agent_send_outbox / mcp call
@@ -112,7 +113,10 @@ pub(super) async fn get_evolution_proposal_detail(
     let proposal = state
         .db
         .proposals()
-        .find_one(doc! { "_id": proposal_id }, None)
+        .find_one(
+            doc! { "_id": proposal_id, "workspace_id": &admin.current_workspace },
+            None,
+        )
         .await?
         .ok_or_else(|| AppError::NotFound(format!("proposal not found: {id}")))?;
 
@@ -137,6 +141,7 @@ pub(super) async fn get_evolution_proposal_detail(
 /// `POST /api/evolution/proposals/:id/release` —— admin 确认串校验 + dispatch。
 pub(super) async fn release_evolution_proposal(
     State(state): State<AppState>,
+    Extension(admin): Extension<AuthenticatedAdmin>,
     Path(id): Path<String>,
     Json(payload): Json<ConfirmationRequest>,
 ) -> AppResult<Json<Value>> {
@@ -150,15 +155,18 @@ pub(super) async fn release_evolution_proposal(
     let proposal = state
         .db
         .proposals()
-        .find_one(doc! { "_id": proposal_id }, None)
+        .find_one(
+            doc! { "_id": proposal_id, "workspace_id": &admin.current_workspace },
+            None,
+        )
         .await?
         .ok_or_else(|| AppError::NotFound(format!("proposal not found: {id}")))?;
 
     match proposal.proposal_kind.as_str() {
-        "threshold" => release_threshold(&state, proposal_id, DEFAULT_RELEASE_ADMIN)
+        "threshold" => release_threshold(&state, proposal_id, &admin.username)
             .await
             .map_err(evolution_error_to_app_error)?,
-        "prompt" => release_prompt(&state, proposal_id, DEFAULT_RELEASE_ADMIN)
+        "prompt" => release_prompt(&state, proposal_id, &admin.username)
             .await
             .map_err(evolution_error_to_app_error)?,
         other => {
@@ -179,6 +187,7 @@ pub(super) async fn release_evolution_proposal(
 /// `POST /api/evolution/proposals/:id/rollback` —— admin 确认串校验 + dispatch。
 pub(super) async fn rollback_evolution_proposal(
     State(state): State<AppState>,
+    Extension(admin): Extension<AuthenticatedAdmin>,
     Path(id): Path<String>,
     Json(payload): Json<ConfirmationRequest>,
 ) -> AppResult<Json<Value>> {
@@ -192,15 +201,18 @@ pub(super) async fn rollback_evolution_proposal(
     let proposal = state
         .db
         .proposals()
-        .find_one(doc! { "_id": proposal_id }, None)
+        .find_one(
+            doc! { "_id": proposal_id, "workspace_id": &admin.current_workspace },
+            None,
+        )
         .await?
         .ok_or_else(|| AppError::NotFound(format!("proposal not found: {id}")))?;
 
     match proposal.proposal_kind.as_str() {
-        "threshold" => rollback_threshold(&state, proposal_id, DEFAULT_RELEASE_ADMIN)
+        "threshold" => rollback_threshold(&state, proposal_id, &admin.username)
             .await
             .map_err(evolution_error_to_app_error)?,
-        "prompt" => rollback_prompt(&state, proposal_id, DEFAULT_RELEASE_ADMIN)
+        "prompt" => rollback_prompt(&state, proposal_id, &admin.username)
             .await
             .map_err(evolution_error_to_app_error)?,
         other => {

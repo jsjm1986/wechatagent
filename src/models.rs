@@ -906,6 +906,10 @@ pub struct AgentSoul {
     pub version: i32,
     pub created_at: DateTime,
     pub updated_at: DateTime,
+    /// 种子脉络标记：种子写 Some("system")、管理端新建写 Some("manual")。
+    /// 为后续 souls 版本化/启动对齐预留（本期对齐逻辑暂不消费）。
+    #[serde(default)]
+    pub seeded_by: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
