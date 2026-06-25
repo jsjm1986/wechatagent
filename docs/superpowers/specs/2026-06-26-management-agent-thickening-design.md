@@ -67,29 +67,57 @@
 
 ## 4. 工具集扩展 + 风险分级
 
-### 4.1 工具集（按 5 类操作面扩，包装已有 REST 端点，不写新执行逻辑）
+### 4.1 工具集（6 类操作面全量接入，包装已有 REST 端点，不写新执行逻辑）
 
-| 类 | 工具（新增除注明已有） | 风险档 | 包装的端点/函数 |
+> 全量接入决策（用户 2026-06-26）：管理者真会想对话操控的写端点尽量都接成工具。下表端点均经 routes/mod.rs 核实存在（行号为 mod.rs 注册行）。
+
+| 类 | 工具 | 风险档 | 包装端点（mod.rs 行） |
 | --- | --- | --- | --- |
-| 观测查询 | query_runs / query_metrics / query_health / query_inbox | readonly | GET /agent-runs、/agent-outcome-metrics、/contacts/:id/operation-health、/admin/ask-human/inbox |
-| 运营态 | （已有）enable/disable/follow-up/update_profile/search/import/send | low（send 为 dangerous） | contacts.rs 现有端点 |
-| 配置 | update_operation_domain / update_runtime_params / set_assist_mode | low→dangerous 视范围 | PUT /operation-domains/:domain 等 |
-| 策略 | publish/activate domain_profile / prompt_template / soul / playbook、taxonomy approve | dangerous | domain_profiles.rs / prompt_templates.rs / souls.rs / playbooks.rs / admin_taxonomies.rs |
-| 知识 | verify / reject / archive chunk、import-apply | dangerous | knowledge/verify.rs 等 |
+| **观测查询** | query_runs / query_metrics / query_health / query_inbox / query_send_ledger | readonly | GET /agent-runs、/agent-outcome-metrics、/contacts/:id/operation-health、/admin/ask-human/inbox、/send-ledger/stats |
+| **运营态（单对象）** | （已有7个）+ update_assist_override / update_custom_instructions / update_manual_tags / write_deal_events / analyze_profile / review_task_now / cancel_task / cancel_outbox / resolve_principal_escalation | low（send=dangerous） | contacts.rs:321/325/329/334/337、agent-tasks:376/377、outbox:884、principal:847 |
+| **运行时调参** | update_operation_domain / update_ask_human_policy / set_assist_mode | low；ask_human_policy=dangerous（立即改全量在跑 agent 行为） | operation-domains PUT:721/733 |
+| **策略编辑** | edit/publish soul / edit/publish/optimize/generate playbook / edit/publish prompt_template / edit state_machine / taxonomy approve / relationship_suggestion approve / lessons promote | dangerous（state_machine、prompt=改全局，强约束） | souls:714/718/719、playbooks:750/754/758/763、prompt-templates:741/746、operation-domains/state-machine:725、taxonomies:824、relationship:848、lessons:889 |
+| **版本与灰度（新增第6类）** | publish_* / rollout_* / rollback_* （domain/state-policy/taxonomy/domain-profile/evolution/chunk 横切）/ activate_domain_profile / provider_activate / provider_test | publish=low（出草稿）；rollout=dangerous（放量）；rollback=dangerous但可逆；reset/delete=irreversible | ops三表:828-878、domain-profiles:936/946/950/954、evolution:965/969、llm-providers:916/926 |
+| **知识维护** | verify / reject / archive / patch / split / merge / relate / batch-verify / gap_signal apply/dismiss / import-apply（含 pdf/image） | verify/gap-apply=dangerous（人确认动作，非auto）；reset/delete类=irreversible | knowledge/*.rs:465-651 |
 
-### 4.2 风险档静态声明、代码裁定（不让 LLM 现场判风险）
-每个工具在 catalog 定义里静态声明 `risk: readonly|low|dangerous`。`build_management_plan` 的 LLM 只负责"选哪个工具 + 填参数"；`requires_confirmation = plan.tool_calls.iter().any(|t| risk_of(t)==dangerous)` **由代码裁定**。LLM 选错工具最多选错，但"高风险必确认"由代码兜底，LLM 绕不过。符合"语义判断交 LLM、安全裁定交代码"的一贯做法。
+> **修正（原草案错误）**：原写的 `update_runtime_params 改五闸阈值` 在 routes 中**无独立端点**——阈值实际走 evolution `/proposals/:id/release`(mod.rs:965) 或 domain_profiles 的 `threshold_overrides`(domain_profiles.rs:724)。工具名相应改为 release_evolution_proposal / set_profile_thresholds（经版本通道或 profile）。
+
+### 4.2 风险档：作用域 × 可逆性，静态声明 + 代码裁定
+
+风险档 = f(作用域, 可逆性)，四档静态声明在工具定义，**不让 LLM 现场判**：
+- `readonly`：只读查询。
+- `low`：可逆 + 单对象/单 domain（单客户跟进、改作息）。
+- `dangerous`：立即全量生效 或 改全局（发消息/改全局prompt/状态机/provider热切/rollout放量）。
+- `irreversible`：不可逆（reset_domain / delete_* / 物理销毁）——档位高于 dangerous，第一期即便放权也建议保留确认。
+
+`build_management_plan` 的 LLM 只"选工具 + 填参"；`requires_confirmation` **由代码按档位裁定**（第一期 dangerous 开关默认关、irreversible 建议保留——见 §1.2）。语义判断交 LLM、安全裁定交代码。
 
 ### 4.3 两条红线在工具层硬约束
 - 知识类**没有 auto-verify 工具**，只有 verify（人确认动作）——"AI 永不自动 verify"在工具集层堵死。
-- 发客户消息 / 改全局 prompt / 切 provider 一律 dangerous，绝不 agent 直接执行。
+- 发客户消息 / 改全局 prompt / 切 provider / rollout 放量一律 dangerous；reset/delete 为 irreversible。
+
+### 4.4 提示词的自然语言修改边界（三层分级 + 双闸校验）
+
+管理者能用自然语言改提示词，但**不能改"全部"**——提示词里混有安全红线段、字节等价锚常量，随意全改会把红线一起改没。三层分级（用户 2026-06-26 决策）：
+
+| 层 | 能否对话改 | 内容 | 通路 |
+| --- | --- | --- | --- |
+| ✅ **可自由改** | 能 | 人格(soul)、方法论(playbook + forbidden_rules)、行业话术(*.task)、对话模式判定规则、reviewer 标尺 | 走 soul/playbook/domain_profile override 通路（per-workspace，运行期注入，**改不到红线段**——这是设计上的护城河，decision.rs:307/400、domain_profile.rs override 剥离范围之外） |
+| ⚠️ **可改但需强约束** | 能，落库前过双闸 | user.reply.policy / user.reply.system / user.review.* 的业务措辞 | 直改 prompt_templates DB 副本，但 `DEFAULT_MODE_GATE_POLICY`(prompts.rs:29) / `DEFAULT_REVIEWER_FEWSHOT`(prompts.rs:47) 锚段、grounding 段、隐私段、反接管段**必须逐字保留** |
+| 🔴 **禁止改** | 不能（自然语言入口不触达） | 反真人接管红线续行(prompts.rs:1000/1023/853)、AI 永不自动 verify 判据(prompts.rs:1474)、grounding 硬约束、`DEFAULT_*` 字节等价锚常量、`evolution_critic_v1`、reset-system-pack（销毁性） | —— |
+
+**双闸校验（fail-closed，红线靠机制不靠 LLM 自觉）**：任何经自然语言写回 `prompt_templates`/`agent_souls` 的内容，落库前**强制过两道闸**，命中即拒绝、不写入：
+1. **禁词闸**：复用现有 `passes_forbidden_words`(**定义在 evolution/lint.rs:33**；prompt_critic.rs:396 是其调用点)——扫"接管/人工/takeover/handoff"等禁词。
+2. **锚完整性闸**：校验该 prompt 的红线锚段（反接管段、grounding 段、`DEFAULT_*` 锚）写回后**逐字仍在**；锚段缺失或被改 → 拒绝（防 profile override 的 `system.replace` 静默失配 + 防红线被删）。
+
+可自由改层走 override 通路天然安全（红线在剥离范围外）；可改层走 prompt_templates 必过双闸；禁止改层的 key 直接不暴露给自然语言工具。`reset-system-pack` 销毁性操作不接入自然语言入口。
 
 ## 5. 数据结构 + 端点 + 前端 + 测试
 
 ### 5.1 数据结构（最小增量，复用现有集合）
 - `AgentToolCall.status` 闭集扩展：`running/dry_run/succeeded/failed` + 新增 `executed_unverified`。DB 写入点校验闭集（项目惯例：未知状态拒写）。
 - `AgentCommandRun.status`：现有 `running/pending_confirmation/succeeded/failed/dry_run` 够用。
-- 工具定义加静态声明：`risk` + `outcome_assertion`，集中在 catalog 定义处，不散落。
+- 工具定义加静态声明：`risk`（四档）+ `outcome_assertion`，集中在 catalog 定义处，不散落。
 - 不新建集合。
 
 ### 5.2 新增端点（闭合循环）
