@@ -313,7 +313,8 @@ pub(super) fn taxonomy_candidate_json(item: TaxonomyCandidate) -> Value {
         "firstSeenAt": crate::models::dt_to_string(item.first_seen_at),
         "lastSeenAt": crate::models::dt_to_string(item.last_seen_at),
         "reviewedAt": item.reviewed_at.and_then(crate::models::dt_to_string),
-        "reviewedBy": item.reviewed_by
+        "reviewedBy": item.reviewed_by,
+        "suggestedDisplayName": item.suggested_display_name
     })
 }
 
@@ -336,6 +337,7 @@ mod tests {
             status: status.to_string(),
             reviewed_at: None,
             reviewed_by: None,
+            suggested_display_name: None,
         }
     }
 

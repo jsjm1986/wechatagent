@@ -903,6 +903,7 @@ interface TaxonomyCandidate {
   lastSeenAt: string | null;
   reviewedAt: string | null;
   reviewedBy: string | null;
+  suggestedDisplayName: string | null;
 }
 
 interface ApproveDraft {
@@ -972,7 +973,7 @@ function TaxonomyCandidatesAdmin({ busy }: { busy: boolean }) {
     setExpandedId(item.id);
     setApproveDraft({
       id: item.rawValue,
-      label: item.rawValue,
+      label: item.suggestedDisplayName || item.rawValue,
       aliases: "",
       description: item.evidence ?? "",
     });

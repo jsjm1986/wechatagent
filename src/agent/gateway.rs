@@ -1248,6 +1248,7 @@ async fn run_user_operation_gateway_inner(
                 raw,
                 Some("user-ops decision path"),
                 50,
+                None,
             )
             .await
             {
