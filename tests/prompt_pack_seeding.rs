@@ -414,3 +414,39 @@ async fn delete_redundant_runs_on_nonempty_db_each_startup() {
         .unwrap();
     assert!(after.is_none(), "archived 孤立行应被 delete_redundant 在非空库路径清除");
 }
+
+/// 终审 Minor #1 回归：ensure_prompt_pack_v2 返回"是否写入",供运行时调用点据此失效 LRU。
+/// spec 漂移→返回 true；spec 一致(幂等)→返回 false。
+#[tokio::test]
+#[ignore]
+async fn ensure_returns_true_on_write_false_on_idempotent() {
+    let app = common::TestApp::start().await;
+    let workspace = app.state.config.default_workspace_id.clone();
+    let account = app.state.config.default_account_id.clone();
+
+    // 第一次重跑(spec 与 DB 一致)应幂等 → 返回 false(无写入)。
+    let wrote_idempotent = wechatagent::prompts::ensure_prompt_pack_v2(&app.state.db, &workspace, &account)
+        .await
+        .expect("rerun ensure");
+    assert!(!wrote_idempotent, "spec 一致时应幂等无写入→false");
+
+    // 制造漂移:把一个 system 行 content 改脏(不改版本号)。
+    let specs = wechatagent::prompts::prompt_specs_for_test();
+    let key = specs.first().expect("spec").0.clone();
+    app.state
+        .db
+        .prompt_templates()
+        .update_one(
+            doc! { "workspace_id": &workspace, "prompt_key": &key, "current_version": true },
+            doc! { "$set": { "content": "DRIFT_FOR_BOOL_RETURN" } },
+            None,
+        )
+        .await
+        .unwrap();
+
+    // 再跑应检测到漂移→对齐写入→返回 true。
+    let wrote_after_drift = wechatagent::prompts::ensure_prompt_pack_v2(&app.state.db, &workspace, &account)
+        .await
+        .expect("rerun ensure");
+    assert!(wrote_after_drift, "spec 漂移时对齐写入→true(供调用点失效LRU)");
+}

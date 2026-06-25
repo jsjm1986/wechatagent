@@ -86,7 +86,7 @@ pub async fn ensure_prompt_pack_v2(
     db: &Database,
     workspace_id: &str,
     default_account_id: &str,
-) -> AppResult<()> {
+) -> AppResult<bool> {
     // spec 为真相的启动对齐：不再用 PROMPT_PACK_VERSION 做"生效闸"，而是按
     // "库里有无任何 prompt_templates 行"分流——
     // - 全新空库 → reset_prompt_pack_v2（首次种四集合：souls/playbook/configs/templates）
@@ -104,8 +104,9 @@ pub async fn ensure_prompt_pack_v2(
             align_prompt_specs(db, workspace_id, default_account_id).await
         }
         Ok(None) => {
-            // 全新空库：首次种四集合。
-            reset_prompt_pack_v2(db, workspace_id, default_account_id).await
+            // 全新空库：首次种四集合。reset 总是写入 → 需失效缓存。
+            reset_prompt_pack_v2(db, workspace_id, default_account_id).await?;
+            Ok(true)
         }
         Err(error) => {
             // 查询异常（连接抖动、字段错乱等）时进入兜底：
@@ -135,7 +136,8 @@ pub async fn ensure_prompt_pack_v2(
                     None,
                 )
                 .await;
-            reset_prompt_pack_v2(db, workspace_id, default_account_id).await
+            reset_prompt_pack_v2(db, workspace_id, default_account_id).await?;
+            Ok(true)
         }
     }
 }
@@ -174,7 +176,8 @@ async fn align_prompt_specs(
     db: &Database,
     workspace_id: &str,
     account_id: &str,
-) -> AppResult<()> {
+) -> AppResult<bool> {
+    let mut wrote = false;
     for spec in prompt_specs() {
         // 1. evolution 灰度链守卫
         let has_evolution = db
@@ -291,8 +294,12 @@ async fn align_prompt_specs(
                 None,
             )
             .await?;
+
+        // 本 key 真正执行了归档+重种（active 内容已换）→ 标记需失效 LRU 缓存。
+        // evolution 守卫 continue / 内容一致 continue 都在上方提前跳过，不到这里，故不置位。
+        wrote = true;
     }
-    Ok(())
+    Ok(wrote)
 }
 
 pub async fn reset_prompt_pack_v2(
