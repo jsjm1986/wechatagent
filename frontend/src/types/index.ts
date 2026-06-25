@@ -435,6 +435,10 @@ export type UserOperationGuidePreview = {
   impactScope: string;
   scopeReason: string;
   readableChanges: string[];
+  // 后端 FE-1 后返回构建好的 health（scores + canonical 7 项 items），
+  // 与正常加载路径 /operation-health 同形态；前端直接消费它。
+  health: OperationHealth;
+  // 旧 healthScores（scores document）保留以兼容尚未迁移读端；前端不再用它重建 items。
   healthScores: Record<string, unknown>;
   suggestedChanges: Record<string, unknown>;
   riskWarnings: string[];
