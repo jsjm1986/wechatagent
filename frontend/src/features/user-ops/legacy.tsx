@@ -49,6 +49,7 @@ import type {
 } from "../../types";
 import { api } from "../../lib/api";
 import TagTrustPanel from "./TagTrustPanel";
+import PersonalityPanel from "./PersonalityPanel";
 
 type ActiveVersionMeta = {
   id: string;
@@ -299,6 +300,11 @@ export function UserOperationCockpit({
           <section className="cockpitSection">
             <div className="sectionCaption">标签可信度</div>
             <TagTrustPanel contact={selected} onSaveManualTags={onSaveManualTags} />
+          </section>
+
+          <section className="cockpitSection">
+            <div className="sectionCaption">人格画像（OCEAN）</div>
+            <PersonalityPanel profile={selected.personalityProfile} />
           </section>
 
           <section className="cockpitSection">
