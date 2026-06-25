@@ -2182,7 +2182,13 @@ mod tests {
             memory_summary: None,
             playbook_id: None,
             playbook_version: None,
-            tags: Vec::new(),
+            manual_tags: Vec::new(),
+            manual_tags_updated_at: None,
+            manual_tags_by: None,
+            confirmed_tags: Vec::new(),
+            bayesian_signals: Vec::new(),
+            personality_profile: None,
+            tags_version: 0,
             commitments: Vec::new(),
             follow_up_policy: None,
             operation_state: None,
@@ -2969,6 +2975,112 @@ mod tests {
         // 故意不写任何 *_updated_at。
         c.domain_attributes = Some(attrs);
         assert_eq!(contact_stagnation_updated_at(&c, "relationship_closeness"), None);
+    }
+
+    /// 永不驱动铁律（子计划4 Task4）的契约守护测试。
+    ///
+    /// `bayesian_signals`（贝叶斯旁路观测槽）与 `personality_profile`（大五慢变量）
+    /// 是**旁路观察字段**——只供走势图 / 画像演化展示，**绝不**进 planner 的硬行为
+    /// （候选过滤谓词 / 优先级排序键）。纯函数层无法直接断言"某字段从未被读"，
+    /// 这里改用契约断言：构造两个**仅** bayesian_signals / personality_profile 不同
+    /// 的 contact（一个空、一个填满真实数据），断言所有吃 `&Contact` 的硬行为纯函数
+    /// 对二者输出**逐字相同**。任何人若把这两个字段接进选择 / 排序逻辑，本测试即红，
+    /// 形成防回归护栏。
+    #[test]
+    fn bayesian_and_personality_do_not_affect_planner_filters() {
+        // base：能通过 silent / stage_stagnation 谓词的真实候选（managed + 久未入站
+        // + need_discovery 阶段且有计时字段），且带 value_tier / intent_level 让优先级键非平凡。
+        let now = DateTime::now();
+        let now_ms = now.timestamp_millis();
+        let mut base = template();
+        base.last_inbound_at = Some(dt(now_ms - 30 * 24 * 60 * 60 * 1000));
+        let mut attrs = attrs_with_stage_updated("need_discovery", now_ms - 30 * 24 * 60 * 60 * 1000);
+        attrs.insert("value_tier", "high");
+        attrs.insert("intent_level", "high");
+        base.domain_attributes = Some(attrs);
+
+        // enriched：克隆 base，**只**填满 bayesian_signals + personality_profile，其余一字不动。
+        let mut enriched = base.clone();
+        enriched.bayesian_signals = vec![
+            crate::models::BayesianSignal {
+                dimension: "decision_authority".to_string(),
+                current_value: "decision_maker".to_string(),
+                current_confidence: 0.82,
+                locked: true,
+                history: vec![crate::models::BayesianPoint {
+                    turn: 3,
+                    value: "decision_maker".to_string(),
+                    confidence: 0.82,
+                    value_changed: true,
+                    confidence_changed: true,
+                    reason: Some("多轮自述拍板".to_string()),
+                }],
+            },
+            crate::models::BayesianSignal {
+                dimension: "budget_sensitivity".to_string(),
+                current_value: "price_sensitive".to_string(),
+                current_confidence: 0.55,
+                locked: false,
+                history: Vec::new(),
+            },
+        ];
+        let facet = |score: f64, confidence: f64| crate::models::PersonalityFacet {
+            score,
+            confidence,
+            evidence_refs: vec![crate::models::Evidence {
+                turn: 5,
+                msg_id: "m-100".to_string(),
+            }],
+        };
+        enriched.personality_profile = Some(crate::models::PersonalityProfile {
+            openness: facet(0.7, 0.6),
+            conscientiousness: facet(0.8, 0.7),
+            extraversion: facet(0.4, 0.5),
+            agreeableness: facet(0.6, 0.65),
+            neuroticism: facet(0.3, 0.55),
+            updated_at: now,
+            snapshots: vec![crate::models::PersonalitySnapshot {
+                consolidated_at: now,
+                scores: vec![0.7, 0.8, 0.4, 0.6, 0.3],
+                confidences: vec![0.6, 0.7, 0.5, 0.65, 0.55],
+            }],
+        });
+
+        let cfg = cfg();
+
+        // 候选谓词（硬行为：决定一个 contact 是否进主动触达候选集）——必须对二者一致。
+        assert_eq!(
+            silent_candidate_passes_in_memory(&base),
+            silent_candidate_passes_in_memory(&enriched),
+            "silent 候选谓词不得受 bayesian/personality 影响"
+        );
+        assert_eq!(
+            stage_stagnation_passes_in_memory(&base, now, &cfg),
+            stage_stagnation_passes_in_memory(&enriched, now, &cfg),
+            "stage_stagnation 候选谓词不得受 bayesian/personality 影响"
+        );
+        // 前置自检：base 确实是个会通过的真实候选，否则上面的相等断言会沦为 false==false 空转。
+        assert!(silent_candidate_passes_in_memory(&base));
+        assert!(stage_stagnation_passes_in_memory(&base, now, &cfg));
+
+        // 优先级排序键（硬行为：daily cap 撞顶时谁先 emit）——必须对二者一致。
+        assert_eq!(
+            stage_stagnation_priority_key(&base, now_ms, &cfg),
+            stage_stagnation_priority_key(&enriched, now_ms, &cfg),
+            "stage_stagnation 排序键不得受 bayesian/personality 影响"
+        );
+        let target = CommitmentEmitTarget {
+            id: "c-1".to_string(),
+            text: "回访".to_string(),
+            reason: CommitmentReason::Overdue,
+            due_at: dt(now_ms - 60 * 60 * 1000),
+            is_fallback_due: false,
+        };
+        assert_eq!(
+            commitment_priority_key(&base, &target, &cfg),
+            commitment_priority_key(&enriched, &target, &cfg),
+            "commitment 排序键不得受 bayesian/personality 影响"
+        );
     }
 
     /// classify_review_status：覆盖 5 闸 + 预算 + ok-like + 未知。

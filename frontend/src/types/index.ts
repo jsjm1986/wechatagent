@@ -45,6 +45,42 @@ export type AgentProfile = {
   operationGoal: string;
 };
 
+/** 标签可信度改造：单条证据，对话引用（不拷贝原文）。后端 `Evidence`（camelCase）。 */
+export type Evidence = { turn: number; msgId: string };
+/** AI 确信层标签：压缩归并时整体重判写回，每条必带证据。后端 `ConfirmedTag`。 */
+export type ConfirmedTag = { value: string; evidences: Evidence[]; confirmedAt: string; confirmedBy: string };
+/** 贝叶斯评估旁路：单轮观测点（append-only ledger）。后端 `BayesianPoint`。 */
+export type BayesianPoint = {
+  turn: number;
+  value: string;
+  confidence: number;
+  valueChanged: boolean;
+  confidenceChanged: boolean;
+  reason?: string;
+};
+/** 贝叶斯评估旁路：一个被追踪的维度槽。后端 `BayesianSignal`。 */
+export type BayesianSignal = {
+  dimension: string;
+  currentValue: string;
+  currentConfidence: number;
+  locked: boolean;
+  history: BayesianPoint[];
+};
+/** 大五人格单维度：分值 + 证据充分度 + 支撑引用。后端 `PersonalityFacet`。 */
+export type PersonalityFacet = { score: number; confidence: number; evidenceRefs: Evidence[] };
+/** 人格演化快照：每次压缩归并存一份。后端 `PersonalitySnapshot`。 */
+export type PersonalitySnapshot = { consolidatedAt: string; scores: number[]; confidences: number[] };
+/** 大五 OCEAN 人格画像：只在压缩归并时更新（慢变量）。后端 `PersonalityProfile`。 */
+export type PersonalityProfile = {
+  openness: PersonalityFacet;
+  conscientiousness: PersonalityFacet;
+  extraversion: PersonalityFacet;
+  agreeableness: PersonalityFacet;
+  neuroticism: PersonalityFacet;
+  updatedAt: string;
+  snapshots: PersonalitySnapshot[];
+};
+
 export type Contact = {
   id: string;
   accountId: string;
@@ -60,6 +96,14 @@ export type Contact = {
   playbookId?: string;
   playbookVersion?: number;
   tags: string[];
+  /** 标签可信度改造 - 运营录入层：原始运营录入标签（与合并后的 `tags` 区分展示）。 */
+  manualTags?: string[];
+  /** 标签可信度改造 - AI 确信层：每条带证据，压缩归并时重判。 */
+  confirmedTags?: ConfirmedTag[];
+  /** 标签可信度改造 - 贝叶斯旁路层：维度槽走势（永不驱动行为）。 */
+  bayesianSignals?: BayesianSignal[];
+  /** 标签可信度改造 - OCEAN 人格画像（慢变量，压缩归并时更新）。 */
+  personalityProfile?: PersonalityProfile;
   domainAttributes?: Record<string, unknown>;
   domainAttributesUpdatedAt?: string | null;
   /** M3 / Task 80：承诺数组（M2 之后由 dialog → contact 同步），cockpit 侧只读展示。 */

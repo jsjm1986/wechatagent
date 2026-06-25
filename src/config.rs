@@ -177,6 +177,10 @@ pub struct AppConfig {
     /// 默认 **false**（保持现状确定性 top-k）。探索只在已验证（verified）池内做，
     /// grounding/FactRisk/ProductAccuracy 硬门照常在其后执行，红线零破坏。
     pub knowledge_exploration_enabled: bool,
+    /// 默认 **true**——渐进式三档机制开关（注意：与多数 *_ENABLED 默认 false 相反）。
+    /// 关时第一程直接传 Full、跳过强升、退回 ptier 前单程行为，等于 kill switch
+    /// （上线初期止损 / 账号灰度 / A-B 对照）。
+    pub progressive_tier_enabled: bool,
     /// P4：探索 softmax 温度。越大越接近均匀抽样、越小越接近确定性 argmax。默认 1.0。
     /// 仅在 `knowledge_exploration_enabled=true` 时生效。
     pub knowledge_exploration_temperature: f64,
@@ -573,6 +577,7 @@ impl AppConfig {
                 "KNOWLEDGE_EXPLORATION_ENABLED",
                 "false",
             )),
+            progressive_tier_enabled: parse_bool(&env_or("PROGRESSIVE_TIER_ENABLED", "true")),
             knowledge_exploration_temperature: env_or("KNOWLEDGE_EXPLORATION_TEMPERATURE", "1.0")
                 .parse()?,
             // ── agent-self-evolution M4 ──

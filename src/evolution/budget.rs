@@ -123,6 +123,7 @@ mod tests {
             dynamic_confidence_real_outcome_enabled: true,
             behavior_signal_metrics_enabled: false,
             knowledge_exploration_enabled: false,
+            progressive_tier_enabled: true,
             knowledge_exploration_temperature: 1.0,
             evolution_enabled: false,
             evolution_tick_seconds: 600,
