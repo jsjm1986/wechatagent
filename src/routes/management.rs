@@ -703,6 +703,57 @@ pub(super) fn tool_effect(tool_name: &str) -> ToolEffect {
     ToolEffect { read_only, risk }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum ToolOutcome {
+    Succeeded,
+    Failed(String),
+    Unverified(String),
+}
+
+/// 核实工具调用的"业务结果"——区别于"调用返回 Ok"。返回 Ok 不等于业务成功
+/// （如 MCP send 返 Ok 但 success=false=账号离线）。无法判定的诚实标 Unverified，
+/// 绝不假报成功（spec §3）。
+pub(super) fn assert_tool_outcome(tool_name: &str, response: &Value) -> ToolOutcome {
+    // MCP 发送类：核实 success + msgId
+    if tool_name == "wechatagent.send_contact_message" {
+        let success = response.get("success").and_then(Value::as_bool);
+        match success {
+            Some(true) => return ToolOutcome::Succeeded,
+            Some(false) => {
+                let err = response
+                    .get("error")
+                    .and_then(Value::as_str)
+                    .unwrap_or("MCP 返回 success=false");
+                return ToolOutcome::Failed(err.to_string());
+            }
+            None => {
+                return ToolOutcome::Unverified(
+                    "MCP 响应无 success 字段，无法确认是否送达".to_string(),
+                )
+            }
+        }
+    }
+    // 写库类：核实 matched/modified
+    if let Some(matched) = response.get("matched").and_then(Value::as_i64) {
+        if matched == 0 {
+            return ToolOutcome::Failed("未命中任何记录，实际没有改动".to_string());
+        }
+        return ToolOutcome::Succeeded;
+    }
+    // 显式 ok:true 的产品工具
+    if response.get("ok").and_then(Value::as_bool) == Some(true) {
+        return ToolOutcome::Succeeded;
+    }
+    // 只读查询：返回了结构即视为成功
+    if matches!(tool_effect(tool_name).risk, ToolRisk::Readonly) {
+        return ToolOutcome::Succeeded;
+    }
+    // 兜底：无法判定 → 诚实标 Unverified
+    ToolOutcome::Unverified(format!(
+        "工具 '{tool_name}' 已执行，但响应结构无法确认业务结果，请核对"
+    ))
+}
+
 /// verify 类工具：把 chunk 推向 verified 的动作。它写 source=Human（verify.rs:101），
 /// 包成 AI 工具会"AI 调用被记成人确认"——故恒强制确认，不随第一期开关放行（spec §4.3）。
 pub(super) fn tool_always_requires_confirmation(tool_name: &str) -> bool {
@@ -1250,6 +1301,29 @@ mod tests {
         // verify 类无视开关恒需确认（spec §4.3：AI 调 verify 会落 source=Human，
         // 守"AI 永不自动 verify"——确认门不随第一期 dangerous 开关放行）
         assert!(plan_requires_confirmation(&["wechatagent.verify_knowledge_chunk"], false));
+    }
+
+    #[test]
+    fn outcome_assertion_detects_business_failure() {
+        use serde_json::json;
+        // send: MCP RPC 返 Ok 但 success=false（账号离线）→ Failed
+        let r = json!({"success": false, "error": "account offline"});
+        assert!(matches!(assert_tool_outcome("wechatagent.send_contact_message", &r), ToolOutcome::Failed(_)));
+        // send: success=true 且有 msgId → Succeeded
+        let r = json!({"success": true, "msgId": "m123"});
+        assert!(matches!(assert_tool_outcome("wechatagent.send_contact_message", &r), ToolOutcome::Succeeded));
+        // update: matched=0 → Failed（未命中、实际没改）
+        let r = json!({"matched": 0, "modified": 0});
+        assert!(matches!(assert_tool_outcome("wechatagent.update_contact_profile", &r), ToolOutcome::Failed(_)));
+        // update: modified>=1 → Succeeded
+        let r = json!({"matched": 1, "modified": 1});
+        assert!(matches!(assert_tool_outcome("wechatagent.update_contact_profile", &r), ToolOutcome::Succeeded));
+        // 无断言规则的工具 + response 无明显信号 → Unverified（诚实暴露）
+        let r = json!({"weird": "shape"});
+        assert!(matches!(assert_tool_outcome("wechatagent.some_unknown_tool", &r), ToolOutcome::Unverified(_)));
+        // readonly 查询：有数据即 Succeeded
+        let r = json!({"items": []});
+        assert!(matches!(assert_tool_outcome("wechatagent.query_runs", &r), ToolOutcome::Succeeded));
     }
 
     #[test]
