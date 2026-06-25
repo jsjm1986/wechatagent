@@ -959,34 +959,113 @@ async fn run_user_operation_gateway_inner(
     // 充分性自评判定：决定直接进闸 / 升档第二程 / 澄清。
     let tier_decision = crate::agent::sufficiency::decide_tier_escalation(&decision_first);
 
+    // 块B：预求值升档标志(供 match 后 used_knowledge_ids 口径判断,避免 tier_decision 被 match 消费后作用域问题)。
+    let escalated = matches!(
+        tier_decision,
+        crate::agent::sufficiency::TierDecision::Escalate(_)
+    );
+
+    // 块B-①对称观测:第一程 sufficiency 落到 _=> 兜底(空/乱值)=静默降级,记一条供发现(不拦)。
+    if !crate::agent::sufficiency::is_sufficiency_recognized(&decision_first) {
+        write_event_for_account(
+            state,
+            &contact.account_id,
+            Some(&contact.wxid),
+            "ptier_self_assessment_malformed",
+            "warn",
+            "第一程 sufficiency 非已知三态，decide_tier_escalation 走兜底（静默降级）",
+            Some(doc! { "run_id": &run_id, "sufficiency": &decision_first.sufficiency }),
+        )
+        .await
+        .ok();
+    }
+
+    let mut forced_full = false;
+
     let (mut decision, mut promote_risks) = match tier_decision {
         crate::agent::sufficiency::TierDecision::Enough => {
-            // 信息够，直接用第一程结果（多数寒暄轮命中此分支）。
-            // §2.2 自评乐观偏差观测（先观测后判罚，不强拦）：自评说够了、但本轮确实需要
-            // 产品知识且知识覆盖不足（missing/weak）时，记一条 telemetry 供日后校准自评
-            // 可靠性。**不改变档位决策**（仍走 Enough、回复照常发）；判据是窄正向匹配的纯谓词。
-            if crate::agent::sufficiency::is_coverage_optimism(
+            if crate::agent::sufficiency::should_force_full_on_missing(
                 &decision_first,
                 &knowledge_route.knowledge_coverage,
             ) {
+                // ②强升:自评 enough 但 coverage=missing 且需知识=确定高危(凭空答产品/事实),
+                // 当场升 Full 重生成。最多一次:Full 结果直接进五闸,不再触发强升(Full 已最高档)。
+                forced_full = true;
                 write_event_for_account(
                     state,
                     &contact.account_id,
                     Some(&contact.wxid),
-                    "ptier_coverage_optimism",
+                    "ptier_forced_full",
                     "info",
-                    "第一程自评 enough 但知识覆盖不足且本轮需产品知识（观测，不拦截）",
+                    "第一程自评 enough 但 coverage=missing 且需知识，强制升 Full 重生成",
                     Some(doc! {
                         "run_id": &run_id,
-                        "sufficiency": &decision_first.sufficiency,
                         "knowledge_coverage": &knowledge_route.knowledge_coverage,
                         "knowledge_need": &decision_first.knowledge_need,
                     }),
                 )
                 .await
                 .ok();
+                decide_reply_with_promote(
+                    state,
+                    &contact,
+                    &inbound,
+                    &recent_messages,
+                    &pending_tasks,
+                    playbook.as_ref(),
+                    domain_config.as_ref(),
+                    &runtime,
+                    &memory,
+                    &context_pack,
+                    &selected_chunks,
+                    &knowledge_route,
+                    None,
+                    Some(&run_id),
+                    crate::agent::sufficiency::PromptTier::Full,
+                )
+                .await?
+            } else {
+                // ①观测(weak 灰区):未强升时查收窄后的 is_coverage_optimism,只记不拦。
+                if crate::agent::sufficiency::is_coverage_optimism(
+                    &decision_first,
+                    &knowledge_route.knowledge_coverage,
+                ) {
+                    write_event_for_account(
+                        state,
+                        &contact.account_id,
+                        Some(&contact.wxid),
+                        "ptier_coverage_optimism",
+                        "info",
+                        "第一程自评 enough 但知识覆盖 weak 且本轮需产品知识（观测，不拦截）",
+                        Some(doc! {
+                            "run_id": &run_id,
+                            "sufficiency": &decision_first.sufficiency,
+                            "knowledge_coverage": &knowledge_route.knowledge_coverage,
+                            "knowledge_need": &decision_first.knowledge_need,
+                        }),
+                    )
+                    .await
+                    .ok();
+                }
+                // ①对称观测:自评 enough 停 Lean,但本轮触及关系信号(意图轨迹非空)→疑似关系档漏判。
+                if decision_first.sufficiency == "enough" && !contact.intent_trajectory.is_empty() {
+                    write_event_for_account(
+                        state,
+                        &contact.account_id,
+                        Some(&contact.wxid),
+                        "ptier_relational_optimism",
+                        "info",
+                        "第一程自评 enough 停 Lean，但本轮存在意图轨迹（疑似关系档漏判，观测）",
+                        Some(doc! {
+                            "run_id": &run_id,
+                            "intent_trajectory_len": contact.intent_trajectory.len() as i64,
+                        }),
+                    )
+                    .await
+                    .ok();
+                }
+                (decision_first, promote_risks_first)
             }
-            (decision_first, promote_risks_first)
         }
         crate::agent::sufficiency::TierDecision::Escalate(target_tier) => {
             // 升档重生成（B+）：第二程按 target_tier(Relational/Full) 全量注入对应槽位。
@@ -1051,6 +1130,31 @@ async fn run_user_operation_gateway_inner(
             (decision_first, promote_risks_first)
         }
     };
+    // run tier 元信息(不碰 models.rs,走事件;tier_used: forced_full→full / escalated→escalated / 否则 lean)。
+    let tier_used = if forced_full {
+        "full"
+    } else if escalated {
+        "escalated"
+    } else {
+        "lean"
+    };
+    write_event_for_account(
+        state,
+        &contact.account_id,
+        Some(&contact.wxid),
+        "ptier_run_tier",
+        "info",
+        "渐进式三档本轮档位元信息",
+        Some(doc! {
+            "run_id": &run_id,
+            "tier_used": tier_used,
+            "sufficiency": &decision.sufficiency,
+            "escalated": escalated,
+            "forced_full": forced_full,
+        }),
+    )
+    .await
+    .ok();
     normalize_decision_state(&mut decision, domain_config.as_ref());
     normalize_decision_runtime(&mut decision, &initial_planner);
     let mut planner = planner_from_decision(&decision, "Reply Agent 单轮决策（知识路由前置）");
@@ -1063,7 +1167,13 @@ async fn run_user_operation_gateway_inner(
     apply_confidence_override(&mut planner, &decision, &runtime);
     normalize_decision_runtime(&mut decision, &planner);
     decision.context_pack_version = Some(next_memory_card_version(&memory));
-    decision.used_knowledge_ids = route_used_knowledge_ids(&knowledge_route);
+    // ⑤口径修正:Lean/Relational 都不注入业务知识(include_business=matches!(tier,Full),decision.rs:297)。
+    // 若 Lean-Enough 决策记了路由命中 id,会架空 grounding 硬闸(取 used∩verified 非空即放行——
+    // 它没读过任何切片却记了路由 id=误当"Agent 读过")。仅当本决策确实经知识档(forced_full=Full,
+    // 或 escalated=升档第二程)时才记路由 id;纯 Lean-Enough / Clarify(Lean)不记。
+    if forced_full || escalated {
+        decision.used_knowledge_ids = route_used_knowledge_ids(&knowledge_route);
+    }
     let _ = &mut promote_risks;
     // MP-5 / Task 15：进入 review 前预算超额则降级到 local。
     // agent-autonomy-loop W2 / Task 3.1：`local_decision_review` 改为接受
