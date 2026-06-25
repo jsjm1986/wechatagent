@@ -151,7 +151,7 @@ use contacts::{
     list_contact_memory_candidates, list_contacts, list_entitlements, list_outcome_events,
     run_contact_memory_consolidation, search_contacts_endpoint, search_import_contacts,
     update_operating_memory, update_operation_profile, update_profile_note,
-    update_assist_override, update_custom_agent_instructions,
+    update_assist_override, update_custom_agent_instructions, update_manual_tags,
 };
 use conversations::list_messages;
 use domain_schemas::{
@@ -326,6 +326,7 @@ pub fn api_router(state: AppState) -> Router<AppState> {
             "/contacts/:id/custom-agent-instructions",
             put(update_custom_agent_instructions),
         )
+        .route("/contacts/:id/manual-tags", put(update_manual_tags))
         .route(
             "/contacts/:id/operation-profile",
             put(update_operation_profile),

@@ -156,8 +156,26 @@ pub struct Contact {
     pub memory_summary: Option<String>,
     pub playbook_id: Option<ObjectId>,
     pub playbook_version: Option<i32>,
+    /// 标签可信度改造 · 人工权威层：运营录入的标签，自由文本，AI 写路径不触达。
+    /// 与 AI 产出的 confirmed_tags 物理分家，压缩重判永不覆盖本字段。
     #[serde(default)]
-    pub tags: Vec<String>,
+    pub manual_tags: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manual_tags_updated_at: Option<DateTime>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manual_tags_by: Option<String>,
+    /// AI 确信层：压缩归并整体重判写回，每条带证据。取代裸 tags 的 AI 部分。
+    #[serde(default)]
+    pub confirmed_tags: Vec<ConfirmedTag>,
+    /// 贝叶斯评估旁路（最多 6 槽）：纯观测，永不驱动行为。
+    #[serde(default)]
+    pub bayesian_signals: Vec<BayesianSignal>,
+    /// 大五 OCEAN 人格画像：压缩时更新，软提示用，不驱动行为。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub personality_profile: Option<PersonalityProfile>,
+    /// 标签体系版本号：压缩归并时递增，用于追踪更新历史和判定新鲜度。
+    #[serde(default)]
+    pub tags_version: i64,
     /// 业务字段 JSON 容器（由 DomainSchema 在写入时校验）。
     /// 取代旧的销售域硬编码 `customer_stage / intent_level / objection_type`。
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -216,6 +234,157 @@ pub struct Contact {
     pub locale: Option<String>,
     pub created_at: DateTime,
     pub updated_at: DateTime,
+}
+
+/// 标签可信度改造：单条证据，存对话引用（不拷贝原文），对齐 D2 source_anchors 哲学。
+/// turn = 该 contact 会话内的轮次序号；msg_id = conversation_messages 的消息 id。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct Evidence {
+    pub turn: i32,
+    pub msg_id: String,
+}
+
+/// AI 确信层标签：压缩归并时整体重判（replace）写回，每条必带证据。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ConfirmedTag {
+    pub value: String,
+    #[serde(default)]
+    pub evidences: Vec<Evidence>,
+    pub confirmed_at: DateTime,
+    /// "consolidation"（压缩重判）| "strong_evidence"（强证据快通道）
+    pub confirmed_by: String,
+}
+
+/// `ConfirmedTag` 的 API 投影：`confirmed_at` 转 RFC3339 字符串（与 ApiContact 顶层
+/// 时间字段一致的 wire 形态，前端 TS 声明为 string）。裸 `bson::DateTime` 经 serde_json
+/// 会序列化成扩展 JSON 对象 `{"$date":...}`，与前端 string 契约不符（D4-F1/D6-F1）。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ApiConfirmedTag {
+    pub value: String,
+    pub evidences: Vec<Evidence>,
+    pub confirmed_at: Option<String>,
+    pub confirmed_by: String,
+}
+
+impl From<ConfirmedTag> for ApiConfirmedTag {
+    fn from(t: ConfirmedTag) -> Self {
+        ApiConfirmedTag {
+            value: t.value,
+            evidences: t.evidences,
+            confirmed_at: dt_to_string(t.confirmed_at),
+            confirmed_by: t.confirmed_by,
+        }
+    }
+}
+
+/// 贝叶斯评估旁路：单轮观测点（append-only ledger），供置信度走势图。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct BayesianPoint {
+    pub turn: i32,
+    pub value: String,
+    pub confidence: f64,
+    pub value_changed: bool,
+    pub confidence_changed: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+/// 贝叶斯评估旁路：一个被追踪的维度槽（最多 6 个，见 budget 约束）。
+/// locked=false 为暂定观察、未正式占槽；locked=true 才画走势线。永不驱动行为。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct BayesianSignal {
+    pub dimension: String,
+    pub current_value: String,
+    pub current_confidence: f64,
+    #[serde(default)]
+    pub locked: bool,
+    #[serde(default)]
+    pub history: Vec<BayesianPoint>,
+}
+
+/// 大五人格单维度：分值 + 证据充分度 + 支撑引用。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct PersonalityFacet {
+    pub score: f64,
+    pub confidence: f64,
+    #[serde(default)]
+    pub evidence_refs: Vec<Evidence>,
+}
+
+/// 人格演化快照：每次压缩归并存一份（粒度=压缩周期，非逐轮）。
+/// scores/confidences 顺序固定 [O, C, E, A, N]。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct PersonalitySnapshot {
+    pub consolidated_at: DateTime,
+    pub scores: Vec<f64>,
+    pub confidences: Vec<f64>,
+}
+
+/// 大五 OCEAN 人格画像：只在压缩归并时更新（慢变量），不进逐轮、不驱动行为。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct PersonalityProfile {
+    pub openness: PersonalityFacet,
+    pub conscientiousness: PersonalityFacet,
+    pub extraversion: PersonalityFacet,
+    pub agreeableness: PersonalityFacet,
+    pub neuroticism: PersonalityFacet,
+    pub updated_at: DateTime,
+    #[serde(default)]
+    pub snapshots: Vec<PersonalitySnapshot>,
+}
+
+/// `PersonalitySnapshot` 的 API 投影：`consolidated_at` 转 RFC3339 字符串（同 D4-F1）。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ApiPersonalitySnapshot {
+    pub consolidated_at: Option<String>,
+    pub scores: Vec<f64>,
+    pub confidences: Vec<f64>,
+}
+
+impl From<PersonalitySnapshot> for ApiPersonalitySnapshot {
+    fn from(s: PersonalitySnapshot) -> Self {
+        ApiPersonalitySnapshot {
+            consolidated_at: dt_to_string(s.consolidated_at),
+            scores: s.scores,
+            confidences: s.confidences,
+        }
+    }
+}
+
+/// `PersonalityProfile` 的 API 投影：`updated_at` 转字符串、snapshots 投影（同 D4-F1）。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ApiPersonalityProfile {
+    pub openness: PersonalityFacet,
+    pub conscientiousness: PersonalityFacet,
+    pub extraversion: PersonalityFacet,
+    pub agreeableness: PersonalityFacet,
+    pub neuroticism: PersonalityFacet,
+    pub updated_at: Option<String>,
+    pub snapshots: Vec<ApiPersonalitySnapshot>,
+}
+
+impl From<PersonalityProfile> for ApiPersonalityProfile {
+    fn from(p: PersonalityProfile) -> Self {
+        ApiPersonalityProfile {
+            openness: p.openness,
+            conscientiousness: p.conscientiousness,
+            extraversion: p.extraversion,
+            agreeableness: p.agreeableness,
+            neuroticism: p.neuroticism,
+            updated_at: dt_to_string(p.updated_at),
+            snapshots: p.snapshots.into_iter().map(ApiPersonalitySnapshot::from).collect(),
+        }
+    }
 }
 
 /// 自学习采集管道 S5：单条**结果/成效事件**（admin 手动标记）。
@@ -2928,6 +3097,13 @@ pub struct ApiContact {
     pub playbook_id: Option<String>,
     pub playbook_version: Option<i32>,
     pub tags: Vec<String>,
+    /// 运营录入层：原始 manual_tags（与合并后的 `tags` 区分，供三层标签 UI 单独展示）。
+    pub manual_tags: Vec<String>,
+    pub manual_tags_updated_at: Option<String>,
+    pub manual_tags_by: Option<String>,
+    pub confirmed_tags: Vec<ApiConfirmedTag>,
+    pub bayesian_signals: Vec<BayesianSignal>,
+    pub personality_profile: Option<ApiPersonalityProfile>,
     pub domain_attributes: Option<Document>,
     pub domain_attributes_updated_at: Option<String>,
     pub commitments: Vec<ApiCommitment>,
@@ -2964,7 +3140,26 @@ impl From<Contact> for ApiContact {
             memory_summary: contact.memory_summary,
             playbook_id: contact.playbook_id.map(|id| id.to_hex()),
             playbook_version: contact.playbook_version,
-            tags: contact.tags,
+            tags: {
+                // 标签可信度改造：manual_tags（运营权威）+ confirmed_tags 合并展示
+                let mut merged = contact.manual_tags.clone();
+                for confirmed in &contact.confirmed_tags {
+                    if !merged.contains(&confirmed.value) {
+                        merged.push(confirmed.value.clone());
+                    }
+                }
+                merged
+            },
+            manual_tags: contact.manual_tags.clone(),
+            manual_tags_updated_at: contact.manual_tags_updated_at.and_then(dt_to_string),
+            manual_tags_by: contact.manual_tags_by,
+            confirmed_tags: contact
+                .confirmed_tags
+                .into_iter()
+                .map(ApiConfirmedTag::from)
+                .collect(),
+            bayesian_signals: contact.bayesian_signals,
+            personality_profile: contact.personality_profile.map(ApiPersonalityProfile::from),
             domain_attributes: contact.domain_attributes,
             domain_attributes_updated_at: contact
                 .domain_attributes_updated_at
@@ -3226,6 +3421,23 @@ mod typed {
         /// 用固定偏移而非 `chrono::Local`，使作息判定**不依赖部署宿主时区**。
         #[serde(default = "defaults::quiet_hours_tz_offset_hours")]
         pub quiet_hours_tz_offset_hours: i32,
+        /// tag-trust 子计划3 Task2：记忆归并宽窗口的字符预算。默认 6000，
+        /// loader 中 clamp 到 [1000, 16000]。供 `take_window_by_budget` 在归并
+        /// 重判时决定取多少条历史消息进上下文。
+        #[serde(default = "defaults::consolidation_window_char_budget")]
+        pub consolidation_window_char_budget: i64,
+        /// tag-trust 子计划3 Task2：记忆归并宽窗口的最大消息条数。默认 60，
+        /// loader 中 clamp 到 [10, 200]。与 char_budget 共同约束宽窗口规模。
+        #[serde(default = "defaults::consolidation_window_max_messages")]
+        pub consolidation_window_max_messages: i64,
+        /// tag-trust 子计划4 Task2：贝叶斯评估旁路占槽门——跨多轮命中阈值。默认 3，
+        /// runtime 中 clamp 到 [1, 20]。一两句话（hit=1）永不占槽。纯观测，永不驱动决策。
+        #[serde(default = "defaults::bayesian_slot_min_hits")]
+        pub bayesian_slot_min_hits: i32,
+        /// tag-trust 子计划4 Task2：贝叶斯评估旁路占槽门——强证据累积阈值。默认 2，
+        /// runtime 中 clamp 到 [0, 20]。强证据由代码侧据消息方向算，不信 LLM 自报。
+        #[serde(default = "defaults::bayesian_slot_min_strong")]
+        pub bayesian_slot_min_strong: i32,
     }
 
     impl Default for RuntimeParametersTyped {
@@ -3259,6 +3471,10 @@ mod typed {
                 quiet_hours_start: defaults::quiet_hours_start(),
                 quiet_hours_end: defaults::quiet_hours_end(),
                 quiet_hours_tz_offset_hours: defaults::quiet_hours_tz_offset_hours(),
+                consolidation_window_char_budget: defaults::consolidation_window_char_budget(),
+                consolidation_window_max_messages: defaults::consolidation_window_max_messages(),
+                bayesian_slot_min_hits: defaults::bayesian_slot_min_hits(),
+                bayesian_slot_min_strong: defaults::bayesian_slot_min_strong(),
             }
         }
     }
@@ -3352,6 +3568,20 @@ mod typed {
         }
         pub fn quiet_hours_tz_offset_hours() -> i32 {
             8
+        }
+        // ── tag-trust 子计划3 Task2：记忆归并宽窗口默认值 ──
+        pub fn consolidation_window_char_budget() -> i64 {
+            6000
+        }
+        pub fn consolidation_window_max_messages() -> i64 {
+            60
+        }
+        // ── tag-trust 子计划4 Task2：贝叶斯评估旁路占槽门默认值 ──
+        pub fn bayesian_slot_min_hits() -> i32 {
+            3
+        }
+        pub fn bayesian_slot_min_strong() -> i32 {
+            2
         }
     }
 
@@ -4312,6 +4542,30 @@ mod typed_tests {
         assert_eq!(p.pressure_risk_block_at, 7);
         assert_eq!(p.run_token_budget, 30000);
         assert_eq!(p.run_max_llm_calls, 6);
+    }
+
+    /// tag-trust 子计划3 Task2：归并宽窗口两参数缺字段默认 6000 / 60。
+    #[test]
+    fn runtime_parameters_typed_consolidation_window_defaults() {
+        let p: RuntimeParametersTyped =
+            mongodb::bson::from_document(doc! {}).expect("default deserialize");
+        assert_eq!(p.consolidation_window_char_budget, 6000);
+        assert_eq!(p.consolidation_window_max_messages, 60);
+        // defaults:: 函数直接断言（loader clamp 范围的锚点）。
+        assert_eq!(typed::defaults::consolidation_window_char_budget(), 6000);
+        assert_eq!(typed::defaults::consolidation_window_max_messages(), 60);
+    }
+
+    /// tag-trust 子计划4 Task2：贝叶斯占槽门两阈值缺字段默认 3 / 2。
+    #[test]
+    fn runtime_parameters_typed_bayesian_slot_defaults() {
+        let p: RuntimeParametersTyped =
+            mongodb::bson::from_document(doc! {}).expect("default deserialize");
+        assert_eq!(p.bayesian_slot_min_hits, 3);
+        assert_eq!(p.bayesian_slot_min_strong, 2);
+        // defaults:: 函数直接断言（runtime clamp 范围的锚点）。
+        assert_eq!(typed::defaults::bayesian_slot_min_hits(), 3);
+        assert_eq!(typed::defaults::bayesian_slot_min_strong(), 2);
     }
 
     #[test]
@@ -5802,5 +6056,240 @@ mod send_ledger_compat_tests {
         assert_eq!(row.send_kind, "namecard");
         assert!(row.responded.is_none());
         assert!(row.outcome_evaluated_at.is_none());
+    }
+}
+
+#[cfg(test)]
+mod tag_trust_tests {
+    use super::*;
+    use mongodb::bson;
+
+    #[test]
+    fn evidence_and_confirmed_tag_roundtrip_bson() {
+        use mongodb::bson::DateTime;
+        let tag = ConfirmedTag {
+            value: "价格敏感".to_string(),
+            evidences: vec![Evidence {
+                turn: 47,
+                msg_id: "m_abc".to_string(),
+            }],
+            confirmed_at: DateTime::from_millis(0),
+            confirmed_by: "consolidation".to_string(),
+        };
+        let doc = mongodb::bson::to_document(&tag).expect("serialize");
+        let back: ConfirmedTag = mongodb::bson::from_document(doc).expect("deserialize");
+        assert_eq!(back, tag);
+    }
+
+    #[test]
+    fn confirmed_tag_missing_evidences_defaults_empty() {
+        // 缺 evidences 字段的旧文档（理论上无存量，仍验证向后兼容）反序列化为空 Vec。
+        let doc = mongodb::bson::doc! { "value": "x", "confirmedAt": mongodb::bson::DateTime::from_millis(0), "confirmedBy": "consolidation" };
+        let back: ConfirmedTag = mongodb::bson::from_document(doc).expect("deserialize");
+        assert!(back.evidences.is_empty());
+    }
+
+    #[test]
+    fn bayesian_signal_roundtrip_and_history_default() {
+        let sig = BayesianSignal {
+            dimension: "价格敏感度".to_string(),
+            current_value: "高".to_string(),
+            current_confidence: 0.7,
+            locked: true,
+            history: vec![BayesianPoint {
+                turn: 3,
+                value: "高".to_string(),
+                confidence: 0.7,
+                value_changed: false,
+                confidence_changed: true,
+                reason: None,
+            }],
+        };
+        let doc = bson::to_document(&sig).expect("ser");
+        let back: BayesianSignal = bson::from_document(doc).expect("de");
+        assert_eq!(back, sig);
+    }
+
+    #[test]
+    fn personality_profile_roundtrip() {
+        let facet = || PersonalityFacet {
+            score: 0.5,
+            confidence: 0.3,
+            evidence_refs: vec![],
+        };
+        let p = PersonalityProfile {
+            openness: facet(),
+            conscientiousness: facet(),
+            extraversion: facet(),
+            agreeableness: facet(),
+            neuroticism: facet(),
+            updated_at: bson::DateTime::from_millis(0),
+            snapshots: vec![],
+        };
+        let doc = bson::to_document(&p).expect("ser");
+        let back: PersonalityProfile = bson::from_document(doc).expect("de");
+        assert_eq!(back, p);
+    }
+
+    #[test]
+    fn contact_new_trust_fields_default_when_absent() {
+        // 不含新字段的最小 Contact BSON 应反序列化成功，新字段取默认值。
+        // 用最小文档构造，验证 serde(default) 向后兼容。
+        use mongodb::bson::{doc, DateTime};
+        let minimal_doc = doc! {
+            "_id": bson::oid::ObjectId::new(),
+            "workspace_id": "ws_test",
+            "account_id": "acc_test",
+            "wxid": "wxid_test",
+            "agent_status": "normal",
+            "created_at": DateTime::now(),
+            "updated_at": DateTime::now(),
+        };
+        let c: Contact = bson::from_document(minimal_doc).expect("deserialize minimal contact");
+
+        // 验证新字段取默认值
+        assert!(c.manual_tags.is_empty(), "manual_tags should default to empty Vec");
+        assert!(c.manual_tags_updated_at.is_none(), "manual_tags_updated_at should default to None");
+        assert!(c.manual_tags_by.is_none(), "manual_tags_by should default to None");
+        assert!(c.confirmed_tags.is_empty(), "confirmed_tags should default to empty Vec");
+        assert!(c.bayesian_signals.is_empty(), "bayesian_signals should default to empty Vec");
+        assert!(c.personality_profile.is_none(), "personality_profile should default to None");
+        assert_eq!(c.tags_version, 0, "tags_version should default to 0");
+    }
+
+    #[test]
+    fn api_contact_projects_manual_and_confirmed_tags() {
+        // ApiContact::from 把双层标签投影到 API 形态：
+        // - `tags` 合并 manual_tags（在前）+ confirmed_tags.value（去重追加）
+        // - `confirmed_tags` 单独投影
+        // 误删合并 / confirmed 投影逻辑时本测试要变红（真断言，非永真）。
+        use mongodb::bson::{doc, DateTime};
+        let minimal_doc = doc! {
+            "_id": bson::oid::ObjectId::new(),
+            "workspace_id": "ws_test",
+            "account_id": "acc_test",
+            "wxid": "wxid_test",
+            "agent_status": "normal",
+            "created_at": DateTime::now(),
+            "updated_at": DateTime::now(),
+        };
+        let mut c: Contact =
+            bson::from_document(minimal_doc).expect("deserialize minimal contact");
+        c.manual_tags = vec!["VIP".to_string(), "价格敏感".to_string()];
+        c.confirmed_tags = vec![ConfirmedTag {
+            value: "价格敏感".to_string(),
+            evidences: vec![Evidence {
+                turn: 1,
+                msg_id: "m_1".to_string(),
+            }],
+            confirmed_at: DateTime::from_millis(0),
+            confirmed_by: "consolidation".to_string(),
+        }];
+
+        let api = ApiContact::from(c);
+
+        // manual 的 "VIP" 与 confirmed 的 "价格敏感" 都应出现在合并 tags 中。
+        assert!(api.tags.contains(&"VIP".to_string()), "merged tags should include manual VIP");
+        assert!(
+            api.tags.contains(&"价格敏感".to_string()),
+            "merged tags should include confirmed value 价格敏感"
+        );
+        // manual 已含 "价格敏感"，confirmed 同值不应重复 → 合并后只 2 个。
+        assert_eq!(api.tags.len(), 2, "duplicate confirmed value must not be appended twice");
+        // manual 在前，保序。
+        assert_eq!(api.tags[0], "VIP", "manual tags should come first in merged order");
+
+        // confirmed_tags 单独投影：长度 1，value 正确。
+        assert_eq!(api.confirmed_tags.len(), 1, "confirmed_tags should project 1 entry");
+        assert_eq!(api.confirmed_tags[0].value, "价格敏感");
+    }
+
+    #[test]
+    fn api_contact_nested_datetime_json_wire_shape() {
+        // D4-F1/D6-F1 交叉发现的定性测试：ApiContact 经 serde_json(axum Json 用的
+        // human-readable serializer)序列化时，嵌套的 confirmed_tags[].confirmedAt /
+        // personalityProfile.updatedAt / snapshots[].consolidatedAt 是 bson::DateTime，
+        // 未走 dt_to_string。前端 types/index.ts 把它们声明为 string。
+        // 本测试断言其真实 wire 形态，判定契约是否撒谎。
+        use mongodb::bson::{doc, DateTime};
+        let minimal_doc = doc! {
+            "_id": bson::oid::ObjectId::new(),
+            "workspace_id": "ws_test",
+            "account_id": "acc_test",
+            "wxid": "wxid_test",
+            "agent_status": "normal",
+            "created_at": DateTime::now(),
+            "updated_at": DateTime::now(),
+        };
+        let mut c: Contact =
+            bson::from_document(minimal_doc).expect("deserialize minimal contact");
+        c.confirmed_tags = vec![ConfirmedTag {
+            value: "价格敏感".to_string(),
+            evidences: vec![],
+            confirmed_at: DateTime::from_millis(0),
+            confirmed_by: "consolidation".to_string(),
+        }];
+
+        let api = ApiContact::from(c);
+        let v = serde_json::to_value(&api).expect("ApiContact serde_json serialize");
+
+        // 顶层 updatedAt 走 dt_to_string → 必是 JSON string(对照基准)。
+        assert!(
+            v.get("updatedAt").map(|x| x.is_string()).unwrap_or(false),
+            "顶层 updatedAt 应是 string(走 dt_to_string),实际={:?}",
+            v.get("updatedAt")
+        );
+
+        // 关键断言（D4-F1 修复后）：嵌套 confirmedAt 必须是 RFC3339 字符串，
+        // 与前端 TS `confirmedAt: string` 契约一致。修复前是 bson 扩展 JSON 对象
+        // {"$date":...}（is_string=false），现经 ApiConfirmedTag 投影走 dt_to_string。
+        let confirmed_at = &v["confirmedTags"][0]["confirmedAt"];
+        assert!(
+            confirmed_at.is_string(),
+            "confirmedAt 必须是 string（D4-F1 修复），实际={confirmed_at}"
+        );
+
+        // personality_profile 的嵌套时间字段同样须是 string。
+        c2_check_personality_datetime_is_string();
+    }
+
+    fn c2_check_personality_datetime_is_string() {
+        use mongodb::bson::{doc, DateTime};
+        let minimal_doc = doc! {
+            "_id": bson::oid::ObjectId::new(),
+            "workspace_id": "ws_test",
+            "account_id": "acc_test",
+            "wxid": "wxid_test",
+            "agent_status": "normal",
+            "created_at": DateTime::now(),
+            "updated_at": DateTime::now(),
+        };
+        let mut c: Contact =
+            bson::from_document(minimal_doc).expect("deserialize minimal contact");
+        let facet = PersonalityFacet { score: 0.5, confidence: 0.3, evidence_refs: vec![] };
+        c.personality_profile = Some(PersonalityProfile {
+            openness: facet.clone(),
+            conscientiousness: facet.clone(),
+            extraversion: facet.clone(),
+            agreeableness: facet.clone(),
+            neuroticism: facet,
+            updated_at: DateTime::from_millis(0),
+            snapshots: vec![PersonalitySnapshot {
+                consolidated_at: DateTime::from_millis(0),
+                scores: vec![0.5; 5],
+                confidences: vec![0.3; 5],
+            }],
+        });
+        let v = serde_json::to_value(ApiContact::from(c)).expect("serialize");
+        assert!(
+            v["personalityProfile"]["updatedAt"].is_string(),
+            "personalityProfile.updatedAt 必须是 string（D4-F1 修复），实际={}",
+            v["personalityProfile"]["updatedAt"]
+        );
+        assert!(
+            v["personalityProfile"]["snapshots"][0]["consolidatedAt"].is_string(),
+            "snapshots[].consolidatedAt 必须是 string（D4-F1 修复），实际={}",
+            v["personalityProfile"]["snapshots"][0]["consolidatedAt"]
+        );
     }
 }

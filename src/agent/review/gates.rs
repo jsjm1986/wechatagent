@@ -177,6 +177,20 @@ pub(crate) fn classify_dual_gate(
             review.scores.emotional_value, runtime.emotional_value_rewrite_below
         ));
     }
+    // 渐进式三档+隐私维度(2026-06-23)：边界/隐私安全软闸。1-3 低分触发改写。
+    // `!= 0` 仿照上方 pressure_risk 的老数据兼容豁免：缺省 0 表示 reviewer 未填
+    // /旧持久化文档无此键，视为未评分不拦截；真低分(1-3)才命中软闸。
+    if review.scores.boundary_privacy_safety != 0 && review.scores.boundary_privacy_safety <= 3 {
+        soft_risks.push(format!(
+            "boundary_privacy_safety_{}_le_3",
+            review.scores.boundary_privacy_safety
+        ));
+        direction_parts.push(
+            "候选回复可能泄露内部画像/评判、暴露AI身份或幕后领导信息——请改写：\
+             移除对客户的内部评判表述，不暴露AI身份与幕后决策来源。"
+                .to_string(),
+        );
+    }
     if soft_risks.is_empty() {
         return DualGateClassification::AllPass;
     }
@@ -1039,6 +1053,7 @@ mod review_passed_dual_gate_tests {
                 hallucination_score: 1,
                 knowledge_grounding_score: 80,
                 pressure_risk: 1,
+                boundary_privacy_safety: 10,
             },
             ..Default::default()
         }
@@ -1288,6 +1303,7 @@ mod dual_gate_classification_tests {
                 hallucination_score: 1,
                 knowledge_grounding_score: 80,
                 pressure_risk: 1,
+                boundary_privacy_safety: 10,
             },
             ..Default::default()
         }
@@ -1310,7 +1326,13 @@ mod dual_gate_classification_tests {
             memory_summary: None,
             playbook_id: None,
             playbook_version: None,
-            tags: Vec::new(),
+            manual_tags: Vec::new(),
+            manual_tags_updated_at: None,
+            manual_tags_by: None,
+            confirmed_tags: Vec::new(),
+            bayesian_signals: Vec::new(),
+            personality_profile: None,
+            tags_version: 0,
             domain_attributes: None,
             domain_attributes_updated_at: None,
             commitments: Vec::new(),
@@ -1517,6 +1539,33 @@ mod dual_gate_classification_tests {
             }
             other => panic!("expected SoftGateFailure, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn classify_dual_gate_marks_low_boundary_privacy_as_soft_failure() {
+        let runtime = UserRuntimeParameters::default();
+        let mut review = full_pass_review();
+        review.scores.boundary_privacy_safety = 2; // 低分(1-3)
+        match classify_dual_gate(&review, &runtime) {
+            DualGateClassification::SoftGateFailure { risks, .. } => {
+                assert!(risks
+                    .iter()
+                    .any(|r| r.starts_with("boundary_privacy_safety_")));
+            }
+            other => panic!("expected SoftGateFailure, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn classify_dual_gate_ignores_boundary_privacy_zero_as_legacy() {
+        let runtime = UserRuntimeParameters::default();
+        let mut review = full_pass_review();
+        review.scores.boundary_privacy_safety = 0; // 未填,豁免
+        // 其它分都满分 → 应 AllPass
+        assert_eq!(
+            classify_dual_gate(&review, &runtime),
+            DualGateClassification::AllPass
+        );
     }
 
     #[test]
@@ -2353,6 +2402,7 @@ mod dual_reviewer_disagreement_tests {
                 hallucination_score: 1,
                 knowledge_grounding_score: 80,
                 pressure_risk: 1,
+                boundary_privacy_safety: 10,
             },
             ..Default::default()
         }

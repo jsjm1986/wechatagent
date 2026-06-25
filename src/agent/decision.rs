@@ -179,6 +179,7 @@ pub(crate) async fn decide_reply(
         knowledge_route,
         rewrite_instruction,
         run_id,
+        crate::agent::sufficiency::PromptTier::Full,
     )
     .await?;
     Ok(decision)
@@ -279,7 +280,21 @@ pub(crate) async fn decide_reply_with_promote(
     knowledge_route: &KnowledgeRouteResult,
     rewrite_instruction: Option<&str>,
     run_id: Option<&str>,
+    tier: crate::agent::sufficiency::PromptTier,
 ) -> AppResult<(AgentDecision, Vec<String>)> {
+    // 渐进式三档（2026-06-23）：按 tier 真实裁剪槽位三组。
+    // 恒注入组（soul / 各 prompt 层 / task 契约及其 append / history / deprecated_facts /
+    //   请示通道信号 / 客户最新消息 / 客户基础身份字段）——任何档都注入，安全/身份铁律。
+    // 关系组（完整 memory / memory_card / 意图轨迹 / 反应提示 / 运营记忆 / 画像各阶段字段）——
+    //   Relational + Full 才注入；Lean 跳过对应 DB 加载（省查询省 token），用空串/默认占位。
+    // 业务组（知识 / 知识路由 / 产品目录 / 持有投影 / 疑似成交 / 可发素材 / 已发素材 /
+    //   名片引荐 / 运营方法 / 运营域策略 / 状态机 / 硬运行参数 / 可引用内容资产）——仅 Full 注入。
+    // 铁律：Full 档两标志均 true，所有槽位与改造前逐字等价（现有调用点全传 Full）。
+    let include_relational = matches!(
+        tier,
+        crate::agent::sufficiency::PromptTier::Relational | crate::agent::sufficiency::PromptTier::Full
+    );
+    let include_business = matches!(tier, crate::agent::sufficiency::PromptTier::Full);
     // universal-domain-adaptation H2 + H9 + H3 + H12：加载本 workspace 当前生效的
     // DomainProfile（无配置时 = DEFAULT 销售域兜底，逐字等价历史行为）。一次加载、
     // 多处复用：① H3 prompt_fragment 注入系统提示的「业务上下文」层；② H9
@@ -295,15 +310,24 @@ pub(crate) async fn decide_reply_with_promote(
             "你是长期运行的微信私域运营 AI Agent。你只为已纳管好友服务，目标是自然、克制、持续推进关系和业务目标。".to_string()
         }),
     };
-    let assets = load_context_assets(state, &contact.account_id).await?;
+    let assets = if include_business {
+        load_context_assets(state, &contact.account_id).await?
+    } else {
+        String::new()
+    };
     // media-asset Task 8：加载可发送素材（sendable+approved）→ 按当前客户阶段过滤候选
     // → 渲染成清单注入 prompt，供 Reply Agent 选材输出 assetsToSend。best-effort：DB
     // 故障 → 空清单（不发素材、不阻塞决策，同 reaction_hint / operator_memory 路径）。
     // customer_stage 取 contact.domain_attributes（与下方画像段同源），缺失 = None →
     // 只命中 target_stages 为空/全阶段的素材。
-    let sendable_assets = load_sendable_assets(state, &contact.account_id)
-        .await
-        .unwrap_or_default();
+    // 业务组：仅 Full 档加载/渲染；Lean+Relational 跳过 DB 查询、空清单。
+    let sendable_assets = if include_business {
+        load_sendable_assets(state, &contact.account_id)
+            .await
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
     let current_customer_stage = contact
         .domain_attributes
         .as_ref()
@@ -316,14 +340,19 @@ pub(crate) async fn decide_reply_with_promote(
     let sendable_candidates_text = super::media_send::render_candidate_lines(&sendable_candidates);
     // 已发素材历史注入（防重发软约束，缺口 5）：查该客户近期已发素材，
     // 渲染成提示段供 Reply Agent 判重。best-effort，空 = 不加段。
-    let recent_media_sent = super::send_ledger::recent_sends_for_contact(
-        state,
-        &contact.workspace_id,
-        &contact.wxid,
-        "media",
-        10,
-    )
-    .await;
+    // 业务组：仅 Full 档查询；非 Full 跳过 DB、空段。
+    let recent_media_sent = if include_business {
+        super::send_ledger::recent_sends_for_contact(
+            state,
+            &contact.workspace_id,
+            &contact.wxid,
+            "media",
+            10,
+        )
+        .await
+    } else {
+        Vec::new()
+    };
     let recent_media_text = super::send_ledger::render_recent_media_lines(&recent_media_sent);
     // referral-card Task 8：名片引荐——仅辅助模式开启才加载/过滤/渲染候选名片注入
     // prompt（默认关 = 空串，对现有全自治账号 prompt 仅多一个空段，字节近等价）。
@@ -337,7 +366,7 @@ pub(crate) async fn decide_reply_with_promote(
         domain_config.and_then(|c| c.assist_mode_enabled),
         assist_override,
     );
-    let referral_block = if assist_on {
+    let referral_block = if include_business && assist_on {
         let cards = load_referral_cards(state, &contact.account_id)
             .await
             .unwrap_or_default();
@@ -367,22 +396,45 @@ pub(crate) async fn decide_reply_with_promote(
     // H12：运营方法论本体回落链 = profile.methodology_override(非空白) ?? contact 绑定
     // playbook ?? 内置兜底。DEFAULT_PROFILE 的 methodology_override=None → 走 playbook +
     // 兜底，与改造前逐字等价。methodology_override 为 Some 时整体替换「当前运营方法」段。
-    let playbook_text = match non_empty_override(active_profile.methodology_override.as_deref()) {
-        Some(text) => text,
-        None => playbook.map(format_playbook_for_prompt).unwrap_or_else(|| {
-            "未配置运营方法。按用户备注、聊天上下文和内容资产自由判断。".to_string()
-        }),
+    let playbook_text = if include_business {
+        match non_empty_override(active_profile.methodology_override.as_deref()) {
+            Some(text) => text,
+            None => playbook.map(format_playbook_for_prompt).unwrap_or_else(|| {
+                "未配置运营方法。按用户备注、聊天上下文和内容资产自由判断。".to_string()
+            }),
+        }
+    } else {
+        String::new()
     };
-    let domain_text = domain_config
-        .map(format_operation_domain_config_for_prompt)
-        .unwrap_or_default();
-    let state_machine_text = domain_config
-        .map(format_operation_state_machine_for_prompt)
-        .unwrap_or_default();
-    let runtime_text = serde_json::to_string(&runtime.as_document()).unwrap_or_default();
-    let knowledge_text =
-        format_operation_knowledge_for_prompt_with_roles(knowledge_chunks, &active_profile.chunk_roles);
-    let knowledge_route_text = serde_json::to_string(knowledge_route).unwrap_or_default();
+    let domain_text = if include_business {
+        domain_config
+            .map(format_operation_domain_config_for_prompt)
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
+    let state_machine_text = if include_business {
+        domain_config
+            .map(format_operation_state_machine_for_prompt)
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
+    let runtime_text = if include_business {
+        serde_json::to_string(&runtime.as_document()).unwrap_or_default()
+    } else {
+        String::new()
+    };
+    let knowledge_text = if include_business {
+        format_operation_knowledge_for_prompt_with_roles(knowledge_chunks, &active_profile.chunk_roles)
+    } else {
+        String::new()
+    };
+    let knowledge_route_text = if include_business {
+        serde_json::to_string(knowledge_route).unwrap_or_default()
+    } else {
+        String::new()
+    };
     // agent-autonomy-loop W5 / Task 6.5：注入最近 K=5 条 deprecated_facts，
     // 让 Reply Agent 知道哪些事实已过期，避免再次引用。仅传 id / text /
     // deprecation_reason / deprecated_at，按 deprecated_at 降序。
@@ -414,21 +466,41 @@ pub(crate) async fn decide_reply_with_promote(
             })
             .collect()
     };
-    let memory_text = serde_json::to_string(&mongodb::bson::doc! {
-        "memoryCard": context_pack.clone(),
-        "userUnderstanding": memory.user_understanding.clone(),
-        "relationshipState": memory.relationship_state.clone(),
-        "productFit": memory.product_fit.clone(),
-        "nextAction": memory.next_action.clone()
-    })
-    .unwrap_or_default();
-    let memory_card_text = serde_json::to_string(context_pack).unwrap_or_default();
+    // §3 恒注入铁律（渐进式三档 2026-06-23）：doNotDo 禁止项 + commitments 已承诺
+    // 属安全/身份类槽位，任何档都不能丢——降档若丢失"已承诺/禁止项"，AI 可能违背
+    // 承诺或踩禁止项，是不可恢复的安全事故。Relational/Full 档下完整 memory_card_text
+    // 已含这两项（context_pack 含 doNotDo/commitments 字段），无需重复注入；仅 Lean
+    // 档 memory_card_text 被跳过，必须单独补一份精简安全子片。整段（含标题/换行）只在
+    // Lean 档非空，Relational/Full 档空串 → Full 逐字等价历史 prompt（零字节差异）。
+    let safety_donts_commitments_text = render_safety_donts_commitments(tier, context_pack);
+    // 关系组：完整长期运营记忆 + 记忆卡片。Lean 跳过，空串占位。
+    let memory_text = if include_relational {
+        serde_json::to_string(&mongodb::bson::doc! {
+            "memoryCard": context_pack.clone(),
+            "userUnderstanding": memory.user_understanding.clone(),
+            "relationshipState": memory.relationship_state.clone(),
+            "productFit": memory.product_fit.clone(),
+            "nextAction": memory.next_action.clone()
+        })
+        .unwrap_or_default()
+    } else {
+        String::new()
+    };
+    let memory_card_text = if include_relational {
+        serde_json::to_string(context_pack).unwrap_or_default()
+    } else {
+        String::new()
+    };
     let rewrite_text = rewrite_instruction.unwrap_or("");
     // Phase D / D1：intent_trajectory 段（最近 5 项）。空时为空串；
     // contact 老文档（无 intent_trajectory 字段）反序列化为 default 空 Vec，
     // 落入 `intent_trajectory_text == ""` 路径，向前兼容。
-    let intent_trajectory_text =
-        super::reaction::format_intent_trajectory_hint(&contact.intent_trajectory);
+    // 关系组：Lean 跳过，空串占位。
+    let intent_trajectory_text = if include_relational {
+        super::reaction::format_intent_trajectory_hint(&contact.intent_trajectory)
+    } else {
+        String::new()
+    };
     // 客观购买事实增强 G2/G4（2026-06-15 spec §5）：产品目录 + 当前持有投影。
     // 一次加载、两处复用：① 产品目录段供 agent 报准确价（区别于知识 chunk 模糊描述）；
     // ② G4 持有投影段让 agent 识别已购/售后期客户、切关怀而非拉新（破 H10「只写不读」诅咒）。
@@ -440,36 +512,50 @@ pub(crate) async fn decide_reply_with_promote(
     // 三段交易注入（产品目录 / 持有投影 / 疑似成交指引）统一受闸：同源 active_products，
     // 闸关时一并空串。enabled=false 额外跳过 DB 加载省一次查询；渲染+闸门内聚在
     // entitlements::render_transaction_facts_sections 纯函数（可单测、双重保险）。
-    let active_products = if active_profile.transaction_facts_enabled {
+    // 业务组：仅 Full 档加载产品目录/持有投影/疑似成交。非 Full 跳过 DB、三段空串。
+    let active_products = if include_business && active_profile.transaction_facts_enabled {
         super::entitlements::load_active_products(&state.db, &contact.workspace_id).await
     } else {
         Vec::new()
     };
-    let (product_catalog_text, entitlements_text, suspected_deal_text) =
+    let (product_catalog_text, entitlements_text, suspected_deal_text) = if include_business {
         super::entitlements::render_transaction_facts_sections(
             active_profile.transaction_facts_enabled,
             &active_products,
             &contact.outcome_events,
             DateTime::now(),
-        );
+        )
+    } else {
+        (String::new(), String::new(), String::new())
+    };
     // Phase A / A1：reaction_hint 段（最近 3 轮 reaction_analysis）。
     // 查 decision_reviews 同 (workspace, account, contact_wxid) 下 created_at 倒序
     // 前 3 条；任意 IO 错误回落空串（best-effort，不阻塞决策）。
-    let reaction_hint_text = load_recent_reaction_hint(state, contact).await;
+    // 关系组：Lean 跳过 DB、空串占位。
+    let reaction_hint_text = if include_relational {
+        load_recent_reaction_hint(state, contact).await
+    } else {
+        String::new()
+    };
     // Phase A / A2：operator_memory 段。
     // operator_id 取 account_id —— 在 user-ops 路径下，每个微信号背后是同一个
     // 人格（运营人员）；admin chat 路径走 KnowledgeChatTask.operator_id 不冲突。
     // best-effort：DB 故障 → 空串。
-    let operator_memory_text = load_operator_memory(
-        &state.db,
-        &contact.workspace_id,
-        &contact.account_id,
-        &contact.account_id,
-        5,
-    )
-    .await
-    .map(|items| format_operator_memory_for_reply_prompt(&items))
-    .unwrap_or_default();
+    // 关系组：Lean 跳过 DB、空串占位。
+    let operator_memory_text = if include_relational {
+        load_operator_memory(
+            &state.db,
+            &contact.workspace_id,
+            &contact.account_id,
+            &contact.account_id,
+            5,
+        )
+        .await
+        .map(|items| format_operator_memory_for_reply_prompt(&items))
+        .unwrap_or_default()
+    } else {
+        String::new()
+    };
     // Phase C / C4：prompt A/B 灰度。当 (workspace, prompt_key) 下存在多条
     // status="active" 的版本时，按 hash(contact.wxid) % count 选一份；同一 contact
     // 永远拿同一份 prompt，保证 A/B 一致性。单 active 版本时退化为 load_prompt 行为。
@@ -590,7 +676,8 @@ pub(crate) async fn decide_reply_with_promote(
     let history = recent_messages
         .iter()
         .rev()
-        .map(|message| {
+        .enumerate()
+        .map(|(idx, message)| {
             let speaker = match message.direction {
                 MessageDirection::Inbound => "客户",
                 MessageDirection::Outbound => "我方",
@@ -599,7 +686,11 @@ pub(crate) async fn decide_reply_with_promote(
             // （客户原文 / 我方历史回复），统一过 strip_injection_tags 防止
             // 历史内容里夹带的 tag 关闭模板。
             let safe = crate::agent::prompt_isolation::strip_injection_tags(&message.content);
-            format!("{speaker}: {safe}")
+            // 子计划2 Task5：行首带 0-based 升序「窗口序号」。`recent_messages` 是
+            // created_at 降序（最新在前），此处 .rev() 反成升序（最早=0），与
+            // gateway.rs 反转出的 ascending_window（喂 resolve_evidence）逐位对齐——
+            // LLM 在 tagEvidenceTurns / stageEvidenceTurns 回的序号即这里的 idx。
+            format!("[{idx}] {speaker}: {safe}")
         })
         .collect::<Vec<_>>()
         .join("\n");
@@ -608,6 +699,78 @@ pub(crate) async fn decide_reply_with_promote(
         .map(|task| format!("{} @ {:?}", task.content, task.run_at))
         .collect::<Vec<_>>()
         .join("\n");
+    // 关系组：user prompt 里的画像字段（agent_profile / memory_summary / tags /
+    // domain_attributes 各阶段字段）。Lean 跳过、空串占位；Relational+Full 与改造前等价。
+    let agent_profile_text = if include_relational {
+        serde_json::to_string(&contact.agent_profile).unwrap_or_default()
+    } else {
+        String::new()
+    };
+    let memory_summary_text = if include_relational {
+        contact.memory_summary.clone().unwrap_or_default()
+    } else {
+        String::new()
+    };
+    let tags_text = if include_relational {
+        render_tags_for_prompt(&contact.manual_tags, &contact.confirmed_tags)
+    } else {
+        String::new()
+    };
+    let customer_stage_text = if include_relational {
+        contact
+            .domain_attributes
+            .as_ref()
+            .and_then(|doc| doc.get_str("customer_stage").ok().map(|s| s.to_string()))
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
+    let intent_level_text = if include_relational {
+        contact
+            .domain_attributes
+            .as_ref()
+            .and_then(|doc| doc.get_str("intent_level").ok().map(|s| s.to_string()))
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
+    let purchase_lifecycle_text = if include_relational {
+        contact
+            .domain_attributes
+            .as_ref()
+            .and_then(|doc| doc.get_str("purchase_lifecycle").ok().map(|s| s.to_string()))
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
+    let value_tier_text = if include_relational {
+        contact
+            .domain_attributes
+            .as_ref()
+            .and_then(|doc| doc.get_str("value_tier").ok().map(|s| s.to_string()))
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
+    let commitments_text = if include_relational {
+        contact
+            .commitments
+            .last()
+            .map(|c| c.text().to_string())
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
+    let follow_up_policy_text = if include_relational {
+        contact.follow_up_policy.clone().unwrap_or_default()
+    } else {
+        String::new()
+    };
+    let profile_attributes_text = if include_relational {
+        serde_json::to_string(&contact.profile_attributes).unwrap_or_default()
+    } else {
+        String::new()
+    };
     let user = format!(
         r#"{}
 
@@ -630,7 +793,7 @@ pub(crate) async fn decide_reply_with_promote(
 {}
 
 最近 5 条已弃用记忆（不要再引用，仅供识别变化）:
-{}
+{}{}
 
 产品知识:
 {}
@@ -694,6 +857,7 @@ pub(crate) async fn decide_reply_with_promote(
         memory_text,
         memory_card_text,
         serde_json::to_string(&deprecated_facts_recent).unwrap_or_default(),
+        safety_donts_commitments_text,
         knowledge_text,
         knowledge_route_text,
         product_catalog_text,
@@ -710,36 +874,16 @@ pub(crate) async fn decide_reply_with_promote(
         contact.wxid,
         contact.nickname.clone().unwrap_or_default(),
         contact.human_profile_note.clone().unwrap_or_default(),
-        serde_json::to_string(&contact.agent_profile).unwrap_or_default(),
-        contact.memory_summary.clone().unwrap_or_default(),
-        contact.tags.join(", "),
-        contact
-            .domain_attributes
-            .as_ref()
-            .and_then(|doc| doc.get_str("customer_stage").ok().map(|s| s.to_string()))
-            .unwrap_or_default(),
-        contact
-            .domain_attributes
-            .as_ref()
-            .and_then(|doc| doc.get_str("intent_level").ok().map(|s| s.to_string()))
-            .unwrap_or_default(),
-        contact
-            .domain_attributes
-            .as_ref()
-            .and_then(|doc| doc.get_str("purchase_lifecycle").ok().map(|s| s.to_string()))
-            .unwrap_or_default(),
-        contact
-            .domain_attributes
-            .as_ref()
-            .and_then(|doc| doc.get_str("value_tier").ok().map(|s| s.to_string()))
-            .unwrap_or_default(),
-        contact
-            .commitments
-            .last()
-            .map(|c| c.text().to_string())
-            .unwrap_or_default(),
-        contact.follow_up_policy.clone().unwrap_or_default(),
-        serde_json::to_string(&contact.profile_attributes).unwrap_or_default(),
+        agent_profile_text,
+        memory_summary_text,
+        tags_text,
+        customer_stage_text,
+        intent_level_text,
+        purchase_lifecycle_text,
+        value_tier_text,
+        commitments_text,
+        follow_up_policy_text,
+        profile_attributes_text,
         assets,
         sendable_candidates_text,
         recent_media_text,
@@ -1033,6 +1177,23 @@ pub(crate) fn format_playbook_for_prompt(playbook: &OperationPlaybook) -> String
     )
 }
 
+/// 把运营录入层（manual_tags）+ AI 确信层（confirmed_tags）标签渲染成 prompt 文本，
+/// 标注来源让 LLM 自行掂量分量。两层皆空 → 空串（调用点据此决定是否注入该段）。
+pub(crate) fn render_tags_for_prompt(
+    manual: &[String],
+    confirmed: &[crate::models::ConfirmedTag],
+) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if !manual.is_empty() {
+        parts.push(format!("运营确认标签（权威）：{}", manual.join("、")));
+    }
+    if !confirmed.is_empty() {
+        let vals: Vec<&str> = confirmed.iter().map(|c| c.value.as_str()).collect();
+        parts.push(format!("AI 判断标签（可能调整）：{}", vals.join("、")));
+    }
+    parts.join("\n")
+}
+
 /// 把分层 prompt 的五段拼装成最终系统提示串（Soul → System Contract → Policy →
 /// Business Context → Operator Instruction）。
 ///
@@ -1048,6 +1209,35 @@ fn assemble_system_prompt(
     operator_instruction: &str,
 ) -> String {
     format!("{soul}\n\n{system_contract}\n\n{policy}{business_context}{operator_instruction}")
+}
+
+/// §3 恒注入铁律（渐进式三档 2026-06-23）：doNotDo 禁止项 + commitments 已承诺是
+/// 安全/身份类槽位，**任何档都不能丢**——降档若丢失"已承诺/禁止项"，AI 可能违背承诺
+/// 或踩禁止项，是不可恢复的安全事故。
+///
+/// 抽成纯函数让 lib 单测能锁住这条安全不变量：Lean 档（不注入完整 memory_card）必须
+/// 单独补一份含 doNotDo/commitments 的安全子片；Relational/Full 档完整 `memory_card_text`
+/// 已含这两项 → 此处返回空串避免重复，且保证 Full 档与改造前 prompt 逐字等价（零字节差异）。
+/// 这段逻辑此前内联在 `decide_reply_with_promote` 里、依赖 AppState/DB，无法单测；抽出后
+/// 恒注入铁律成为可确定性断言的纯函数边界。
+pub(crate) fn render_safety_donts_commitments(
+    tier: crate::agent::sufficiency::PromptTier,
+    context_pack: &Document,
+) -> String {
+    let include_relational = matches!(
+        tier,
+        crate::agent::sufficiency::PromptTier::Relational
+            | crate::agent::sufficiency::PromptTier::Full
+    );
+    if include_relational {
+        return String::new();
+    }
+    let payload = serde_json::to_string(&mongodb::bson::doc! {
+        "doNotDo": context_pack.get_array("doNotDo").cloned().unwrap_or_default(),
+        "commitments": context_pack.get_array("commitments").cloned().unwrap_or_default(),
+    })
+    .unwrap_or_default();
+    format!("\n\n安全约束(禁止项/已承诺，任何档恒注入，绝不可违背):\n{payload}")
 }
 
 /// universal-domain-adaptation H3：把 active profile 的 `prompt_fragment`（本行业业务
@@ -1352,7 +1542,8 @@ mod persona_override_tests {
     //! 「回落原出厂本体」。DEFAULT_PROFILE 两 override 均 None 必须返回 None（回落），
     //! 保证销售域字节不变。
 
-    use super::{assemble_system_prompt, non_empty_override, render_business_context_fragment};
+    use super::{assemble_system_prompt, non_empty_override, render_business_context_fragment, render_safety_donts_commitments};
+    use mongodb::bson::doc;
 
     #[test]
     fn none_override_falls_back() {
@@ -1440,6 +1631,56 @@ mod persona_override_tests {
             render_business_context_fragment(Some("  含空白  "), "# H"),
             "\n\n# H\n含空白"
         );
+    }
+
+    /// §3 恒注入铁律（核心安全不变量）：Lean 档不注入完整 memory_card，但 doNotDo /
+    /// commitments 是绝不可丢的安全槽位 → 必须单独补一份安全子片，且必须真的含这两项内容。
+    /// 丢失即不可恢复的安全事故（AI 违背承诺/踩禁止项），故锁死测试。
+    #[test]
+    fn lean_tier_always_injects_donts_and_commitments() {
+        let pack = doc! {
+            "doNotDo": ["不要催单", "不要提竞品"],
+            "commitments": ["周五前发报价单"],
+        };
+        let out =
+            render_safety_donts_commitments(crate::agent::sufficiency::PromptTier::Lean, &pack);
+        assert!(!out.is_empty(), "Lean 档必须注入安全子片，不能为空");
+        assert!(out.contains("doNotDo"), "安全子片必须含 doNotDo 键");
+        assert!(out.contains("commitments"), "安全子片必须含 commitments 键");
+        assert!(out.contains("不要催单"), "doNotDo 实际内容必须随档注入");
+        assert!(out.contains("周五前发报价单"), "commitments 实际内容必须随档注入");
+    }
+
+    /// §3 铁律的另一面：Relational / Full 档完整 memory_card_text 已含 doNotDo /
+    /// commitments，此处返回空串避免重复——这保证 Full 档与改造前 prompt **逐字等价**
+    /// （零字节差异）。若这里非空，Full 档会多出一段、破坏等价护栏。
+    #[test]
+    fn relational_and_full_tiers_emit_empty_to_keep_byte_equivalence() {
+        let pack = doc! {
+            "doNotDo": ["不要催单"],
+            "commitments": ["周五前发报价单"],
+        };
+        assert_eq!(
+            render_safety_donts_commitments(crate::agent::sufficiency::PromptTier::Relational, &pack),
+            "",
+            "Relational 档应空串（完整 memory_card 已含），避免重复注入"
+        );
+        assert_eq!(
+            render_safety_donts_commitments(crate::agent::sufficiency::PromptTier::Full, &pack),
+            "",
+            "Full 档应空串，保证与改造前 prompt 逐字等价"
+        );
+    }
+
+    /// 边界：context_pack 缺 doNotDo / commitments 字段（老数据 / 空画像）时，Lean 档
+    /// 仍注入安全子片骨架（含两个键、空数组），不 panic、不静默吞段——结构恒在，内容可空。
+    #[test]
+    fn lean_tier_safety_skeleton_present_even_when_pack_empty() {
+        let empty = doc! {};
+        let out =
+            render_safety_donts_commitments(crate::agent::sufficiency::PromptTier::Lean, &empty);
+        assert!(out.contains("doNotDo"), "缺字段时仍应有 doNotDo 键骨架");
+        assert!(out.contains("commitments"), "缺字段时仍应有 commitments 键骨架");
     }
 
     /// A/T2：**同构测试**——复刻 decision.rs reply.policy 组装链里
@@ -1562,5 +1803,60 @@ mod persona_override_tests {
             out.contains("前置内容") && out.contains("后置内容"),
             "两锚段外的文本应原样保留：{out}"
         );
+    }
+
+    #[test]
+    fn render_tags_for_prompt_empty_yields_empty() {
+        use super::render_tags_for_prompt;
+        assert_eq!(render_tags_for_prompt(&[], &[]), String::new());
+    }
+
+    #[test]
+    fn render_tags_for_prompt_manual_only() {
+        use super::render_tags_for_prompt;
+        let manual = vec!["VIP".to_string(), "高净值".to_string()];
+        let out = render_tags_for_prompt(&manual, &[]);
+        assert!(out.contains("VIP"));
+        assert!(out.contains("高净值"));
+        assert!(out.contains("运营确认"));
+    }
+
+    #[test]
+    fn render_tags_for_prompt_confirmed_only() {
+        use super::render_tags_for_prompt;
+        use crate::models::ConfirmedTag;
+        use mongodb::bson::DateTime;
+        let confirmed = vec![
+            ConfirmedTag {
+                value: "价格敏感".to_string(),
+                evidences: vec![],
+                confirmed_at: DateTime::from_millis(0),
+                confirmed_by: "consolidation".to_string(),
+            },
+        ];
+        let out = render_tags_for_prompt(&[], &confirmed);
+        assert!(out.contains("价格敏感"));
+        assert!(out.contains("AI 判断"));
+    }
+
+    #[test]
+    fn render_tags_for_prompt_both_layers() {
+        use super::render_tags_for_prompt;
+        use crate::models::ConfirmedTag;
+        use mongodb::bson::DateTime;
+        let manual = vec!["VIP".to_string()];
+        let confirmed = vec![
+            ConfirmedTag {
+                value: "价格敏感".to_string(),
+                evidences: vec![],
+                confirmed_at: DateTime::from_millis(0),
+                confirmed_by: "consolidation".to_string(),
+            },
+        ];
+        let out = render_tags_for_prompt(&manual, &confirmed);
+        assert!(out.contains("VIP"));
+        assert!(out.contains("价格敏感"));
+        assert!(out.contains("运营确认"));
+        assert!(out.contains("AI 判断"));
     }
 }

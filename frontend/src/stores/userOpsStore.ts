@@ -104,6 +104,7 @@ interface UserOpsActions {
   saveCustomAgentInstructions: () => Promise<void>;
   saveAssistOverride: () => Promise<void>;
   saveRelationshipType: () => Promise<void>;
+  saveManualTags: (tags: string[]) => Promise<void>;
   analyzeProfile: () => Promise<void>;
   previewGuideInstruction: (instruction: string) => Promise<void>;
   applyGuidePreview: () => Promise<void>;
@@ -527,6 +528,25 @@ export const useUserOpsStore = create<UserOpsState & UserOpsActions>((set, get) 
       await api.put(`/api/contacts/${selected.id}/operation-profile`, {
         relationshipType: relationshipType || undefined,
       });
+      await refreshContacts(currentAccountId);
+    } catch (error) {
+      useUiStore.getState().setError(error instanceof Error ? error.message : String(error));
+    } finally {
+      useUiStore.getState().setBusy(false);
+    }
+  },
+
+  saveManualTags: async (tags: string[]) => {
+    // 标签可信度改造 - 运营录入层：保存运营录入标签，后端权威覆盖。
+    const selected = useContactStore.getState().selected;
+    const currentAccountId = useAccountStore.getState().currentAccountId();
+    if (!selected) return;
+
+    useUiStore.getState().setBusy(true);
+    useUiStore.getState().setError("");
+
+    try {
+      await api.put(`/api/contacts/${selected.id}/manual-tags`, { tags });
       await refreshContacts(currentAccountId);
     } catch (error) {
       useUiStore.getState().setError(error instanceof Error ? error.message : String(error));
