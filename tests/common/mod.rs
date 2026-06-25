@@ -22,7 +22,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use mongodb::bson::{doc, oid::ObjectId};
+use mongodb::bson::{doc, oid::ObjectId, DateTime};
 use serde_json::Value;
 use testcontainers::ContainerAsync;
 use testcontainers_modules::mongo::Mongo;
@@ -440,6 +440,41 @@ pub fn rebuild_app_state_with_mcp_url(app: &TestApp, mcp_url: String) -> AppStat
         chunk_event_bus: app.state.chunk_event_bus.clone(),
         jwt_keys: app.state.jwt_keys.clone(),
     }
+}
+
+/// 插入一条 `proposal_kind="prompt"`, `status="released"` 的 proposal，供
+/// `rollback_prompt` 加载使用。直插 raw collection，避开 Proposal 30+ 字段字面量；
+/// 只填 Proposal 反序列化必需的字段 + rollback 实际读取的字段。返回其 `ObjectId`。
+pub async fn insert_released_prompt_proposal(
+    state: &AppState,
+    workspace: &str,
+    key: &str,
+    prev: &str,
+) -> ObjectId {
+    let id = ObjectId::new();
+    let now = DateTime::now();
+    state
+        .db
+        .raw()
+        .collection::<mongodb::bson::Document>("proposals")
+        .insert_one(
+            doc! {
+                "_id": id,
+                "experiment_id": "test-exp",
+                "workspace_id": workspace,
+                "account_id": state.config.default_account_id.clone(),
+                "proposal_kind": "prompt",
+                "status": "released",
+                "proposed_template_key": key,
+                "previous_prompt_version": prev,
+                "created_at": now,
+                "updated_at": now,
+            },
+            None,
+        )
+        .await
+        .expect("insert released prompt proposal");
+    id
 }
 
 /// 同时替换 `llm`（注入真实 [`LlmProvider`]，如 [`wechatagent::llm::LlmClient`]）
