@@ -257,6 +257,29 @@ pub struct ConfirmedTag {
     pub confirmed_by: String,
 }
 
+/// `ConfirmedTag` 的 API 投影：`confirmed_at` 转 RFC3339 字符串（与 ApiContact 顶层
+/// 时间字段一致的 wire 形态，前端 TS 声明为 string）。裸 `bson::DateTime` 经 serde_json
+/// 会序列化成扩展 JSON 对象 `{"$date":...}`，与前端 string 契约不符（D4-F1/D6-F1）。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ApiConfirmedTag {
+    pub value: String,
+    pub evidences: Vec<Evidence>,
+    pub confirmed_at: Option<String>,
+    pub confirmed_by: String,
+}
+
+impl From<ConfirmedTag> for ApiConfirmedTag {
+    fn from(t: ConfirmedTag) -> Self {
+        ApiConfirmedTag {
+            value: t.value,
+            evidences: t.evidences,
+            confirmed_at: dt_to_string(t.confirmed_at),
+            confirmed_by: t.confirmed_by,
+        }
+    }
+}
+
 /// 贝叶斯评估旁路：单轮观测点（append-only ledger），供置信度走势图。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
@@ -316,6 +339,52 @@ pub struct PersonalityProfile {
     pub updated_at: DateTime,
     #[serde(default)]
     pub snapshots: Vec<PersonalitySnapshot>,
+}
+
+/// `PersonalitySnapshot` 的 API 投影：`consolidated_at` 转 RFC3339 字符串（同 D4-F1）。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ApiPersonalitySnapshot {
+    pub consolidated_at: Option<String>,
+    pub scores: Vec<f64>,
+    pub confidences: Vec<f64>,
+}
+
+impl From<PersonalitySnapshot> for ApiPersonalitySnapshot {
+    fn from(s: PersonalitySnapshot) -> Self {
+        ApiPersonalitySnapshot {
+            consolidated_at: dt_to_string(s.consolidated_at),
+            scores: s.scores,
+            confidences: s.confidences,
+        }
+    }
+}
+
+/// `PersonalityProfile` 的 API 投影：`updated_at` 转字符串、snapshots 投影（同 D4-F1）。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ApiPersonalityProfile {
+    pub openness: PersonalityFacet,
+    pub conscientiousness: PersonalityFacet,
+    pub extraversion: PersonalityFacet,
+    pub agreeableness: PersonalityFacet,
+    pub neuroticism: PersonalityFacet,
+    pub updated_at: Option<String>,
+    pub snapshots: Vec<ApiPersonalitySnapshot>,
+}
+
+impl From<PersonalityProfile> for ApiPersonalityProfile {
+    fn from(p: PersonalityProfile) -> Self {
+        ApiPersonalityProfile {
+            openness: p.openness,
+            conscientiousness: p.conscientiousness,
+            extraversion: p.extraversion,
+            agreeableness: p.agreeableness,
+            neuroticism: p.neuroticism,
+            updated_at: dt_to_string(p.updated_at),
+            snapshots: p.snapshots.into_iter().map(ApiPersonalitySnapshot::from).collect(),
+        }
+    }
 }
 
 /// 自学习采集管道 S5：单条**结果/成效事件**（admin 手动标记）。
@@ -3026,9 +3095,9 @@ pub struct ApiContact {
     pub manual_tags: Vec<String>,
     pub manual_tags_updated_at: Option<String>,
     pub manual_tags_by: Option<String>,
-    pub confirmed_tags: Vec<ConfirmedTag>,
+    pub confirmed_tags: Vec<ApiConfirmedTag>,
     pub bayesian_signals: Vec<BayesianSignal>,
-    pub personality_profile: Option<PersonalityProfile>,
+    pub personality_profile: Option<ApiPersonalityProfile>,
     pub domain_attributes: Option<Document>,
     pub domain_attributes_updated_at: Option<String>,
     pub commitments: Vec<ApiCommitment>,
@@ -3078,9 +3147,13 @@ impl From<Contact> for ApiContact {
             manual_tags: contact.manual_tags.clone(),
             manual_tags_updated_at: contact.manual_tags_updated_at.and_then(dt_to_string),
             manual_tags_by: contact.manual_tags_by,
-            confirmed_tags: contact.confirmed_tags.clone(),
+            confirmed_tags: contact
+                .confirmed_tags
+                .into_iter()
+                .map(ApiConfirmedTag::from)
+                .collect(),
             bayesian_signals: contact.bayesian_signals,
-            personality_profile: contact.personality_profile,
+            personality_profile: contact.personality_profile.map(ApiPersonalityProfile::from),
             domain_attributes: contact.domain_attributes,
             domain_attributes_updated_at: contact
                 .domain_attributes_updated_at
@@ -6122,5 +6195,94 @@ mod tag_trust_tests {
         // confirmed_tags 单独投影：长度 1，value 正确。
         assert_eq!(api.confirmed_tags.len(), 1, "confirmed_tags should project 1 entry");
         assert_eq!(api.confirmed_tags[0].value, "价格敏感");
+    }
+
+    #[test]
+    fn api_contact_nested_datetime_json_wire_shape() {
+        // D4-F1/D6-F1 交叉发现的定性测试：ApiContact 经 serde_json(axum Json 用的
+        // human-readable serializer)序列化时，嵌套的 confirmed_tags[].confirmedAt /
+        // personalityProfile.updatedAt / snapshots[].consolidatedAt 是 bson::DateTime，
+        // 未走 dt_to_string。前端 types/index.ts 把它们声明为 string。
+        // 本测试断言其真实 wire 形态，判定契约是否撒谎。
+        use mongodb::bson::{doc, DateTime};
+        let minimal_doc = doc! {
+            "_id": bson::oid::ObjectId::new(),
+            "workspace_id": "ws_test",
+            "account_id": "acc_test",
+            "wxid": "wxid_test",
+            "agent_status": "normal",
+            "created_at": DateTime::now(),
+            "updated_at": DateTime::now(),
+        };
+        let mut c: Contact =
+            bson::from_document(minimal_doc).expect("deserialize minimal contact");
+        c.confirmed_tags = vec![ConfirmedTag {
+            value: "价格敏感".to_string(),
+            evidences: vec![],
+            confirmed_at: DateTime::from_millis(0),
+            confirmed_by: "consolidation".to_string(),
+        }];
+
+        let api = ApiContact::from(c);
+        let v = serde_json::to_value(&api).expect("ApiContact serde_json serialize");
+
+        // 顶层 updatedAt 走 dt_to_string → 必是 JSON string(对照基准)。
+        assert!(
+            v.get("updatedAt").map(|x| x.is_string()).unwrap_or(false),
+            "顶层 updatedAt 应是 string(走 dt_to_string),实际={:?}",
+            v.get("updatedAt")
+        );
+
+        // 关键断言（D4-F1 修复后）：嵌套 confirmedAt 必须是 RFC3339 字符串，
+        // 与前端 TS `confirmedAt: string` 契约一致。修复前是 bson 扩展 JSON 对象
+        // {"$date":...}（is_string=false），现经 ApiConfirmedTag 投影走 dt_to_string。
+        let confirmed_at = &v["confirmedTags"][0]["confirmedAt"];
+        assert!(
+            confirmed_at.is_string(),
+            "confirmedAt 必须是 string（D4-F1 修复），实际={confirmed_at}"
+        );
+
+        // personality_profile 的嵌套时间字段同样须是 string。
+        c2_check_personality_datetime_is_string();
+    }
+
+    fn c2_check_personality_datetime_is_string() {
+        use mongodb::bson::{doc, DateTime};
+        let minimal_doc = doc! {
+            "_id": bson::oid::ObjectId::new(),
+            "workspace_id": "ws_test",
+            "account_id": "acc_test",
+            "wxid": "wxid_test",
+            "agent_status": "normal",
+            "created_at": DateTime::now(),
+            "updated_at": DateTime::now(),
+        };
+        let mut c: Contact =
+            bson::from_document(minimal_doc).expect("deserialize minimal contact");
+        let facet = PersonalityFacet { score: 0.5, confidence: 0.3, evidence_refs: vec![] };
+        c.personality_profile = Some(PersonalityProfile {
+            openness: facet.clone(),
+            conscientiousness: facet.clone(),
+            extraversion: facet.clone(),
+            agreeableness: facet.clone(),
+            neuroticism: facet,
+            updated_at: DateTime::from_millis(0),
+            snapshots: vec![PersonalitySnapshot {
+                consolidated_at: DateTime::from_millis(0),
+                scores: vec![0.5; 5],
+                confidences: vec![0.3; 5],
+            }],
+        });
+        let v = serde_json::to_value(ApiContact::from(c)).expect("serialize");
+        assert!(
+            v["personalityProfile"]["updatedAt"].is_string(),
+            "personalityProfile.updatedAt 必须是 string（D4-F1 修复），实际={}",
+            v["personalityProfile"]["updatedAt"]
+        );
+        assert!(
+            v["personalityProfile"]["snapshots"][0]["consolidatedAt"].is_string(),
+            "snapshots[].consolidatedAt 必须是 string（D4-F1 修复），实际={}",
+            v["personalityProfile"]["snapshots"][0]["consolidatedAt"]
+        );
     }
 }
