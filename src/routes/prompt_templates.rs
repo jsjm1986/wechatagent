@@ -48,12 +48,17 @@ pub(super) async fn list_prompt_templates(
     Extension(admin): Extension<AuthenticatedAdmin>,
     Query(query): Query<PromptTemplateQuery>,
 ) -> AppResult<Json<Value>> {
-    prompts::ensure_prompt_pack_v2(
+    let wrote = prompts::ensure_prompt_pack_v2(
         &state.db,
         &admin.current_workspace,
         &state.config.default_account_id,
     )
     .await?;
+    if wrote {
+        state
+            .prompt_pack_version
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
     let mut filter = doc! { "workspace_id": &admin.current_workspace };
     if let Some(agent_kind) = normalize_optional(query.agent_kind) {
         filter.insert("agent_kind", agent_kind);
