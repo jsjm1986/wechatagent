@@ -609,6 +609,7 @@ pub async fn rollback_prompt(
             doc! {
                 "$set": {
                     "current_version": true,
+                    "status": "active",
                     "updated_at": now,
                 }
             },

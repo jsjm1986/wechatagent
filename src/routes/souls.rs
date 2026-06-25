@@ -94,6 +94,7 @@ pub(super) async fn create_agent_soul(
         version,
         created_at: DateTime::now(),
         updated_at: DateTime::now(),
+        seeded_by: Some("manual".to_string()),
     };
     let result = state.db.agent_souls().insert_one(soul, None).await?;
     Ok(Json(
@@ -178,10 +179,16 @@ pub(super) async fn publish_agent_soul(
 }
 
 pub(super) async fn ensure_default_souls(state: &AppState, workspace_id: &str) -> AppResult<()> {
-    prompts::ensure_prompt_pack_v2(
+    let wrote = prompts::ensure_prompt_pack_v2(
         &state.db,
         workspace_id,
         &state.config.default_account_id,
     )
-    .await
+    .await?;
+    if wrote {
+        state
+            .prompt_pack_version
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+    Ok(())
 }

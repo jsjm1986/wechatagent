@@ -450,19 +450,30 @@ pub(super) fn operation_health_json(
     review: Option<&AgentDecisionReview>,
 ) -> Value {
     let scores = health_scores_document(contact, memory, review);
-    let score = |key: &str| scores.get_i32(key).unwrap_or(0);
+    let items = health_items_from_scores(&scores);
     json!({
         "scores": scores,
-        "items": [
-            health_item("userUnderstanding", "用户理解完整度", score("userUnderstanding"), "身份、痛点、动机、偏好和禁忌是否清楚"),
-            health_item("relationshipQuality", "信任关系质量", score("relationshipQuality"), "当前互动是否适合推进，是否需要先建立信任"),
-            health_item("productFit", "产品匹配清晰度", score("productFit"), "是否知道用户需求与产品价值之间的真实匹配"),
-            health_item("rhythmRisk", "跟进节奏风险", score("rhythmRisk"), "是否存在过度打扰或冷却中的风险"),
-            health_item("knowledgeGrounding", "知识匹配度", score("knowledgeGrounding"), "回应是否被 verified 知识支撑"),
-            health_item("hallucinationRisk", "幻觉风险", score("hallucinationRisk"), "是否可能出现编造案例、承诺结果或产品事实不准确"),
-            health_item("pressureRisk", "销售压迫感风险", score("pressureRisk"), "表达是否可能显得催促、强推或过度营销")
-        ]
+        "items": items
     })
+}
+
+/// 把一个 health scores document 组装成 canonical 7 项 health items 数组（JSON）。
+///
+/// FE-1：原先这 7 行 `health_item` 调用同时出现在 `operation_health_json`（正常加载
+/// 路径）与 guide preview 响应里，量纲/风险反转口径必须一致——抽出单一来源消除重复。
+/// 缺失键 `get_i32` 失败回落 0；tone 方向（风险类高分=坏、非风险类高分=好）由
+/// `health_item` 按 `key.ends_with("Risk")` 自动判定，量纲 0-100。
+pub(super) fn health_items_from_scores(scores: &Document) -> Value {
+    let score = |key: &str| scores.get_i32(key).unwrap_or(0);
+    json!([
+        health_item("userUnderstanding", "用户理解完整度", score("userUnderstanding"), "身份、痛点、动机、偏好和禁忌是否清楚"),
+        health_item("relationshipQuality", "信任关系质量", score("relationshipQuality"), "当前互动是否适合推进，是否需要先建立信任"),
+        health_item("productFit", "产品匹配清晰度", score("productFit"), "是否知道用户需求与产品价值之间的真实匹配"),
+        health_item("rhythmRisk", "跟进节奏风险", score("rhythmRisk"), "是否存在过度打扰或冷却中的风险"),
+        health_item("knowledgeGrounding", "知识匹配度", score("knowledgeGrounding"), "回应是否被 verified 知识支撑"),
+        health_item("hallucinationRisk", "幻觉风险", score("hallucinationRisk"), "是否可能出现编造案例、承诺结果或产品事实不准确"),
+        health_item("pressureRisk", "销售压迫感风险", score("pressureRisk"), "表达是否可能显得催促、强推或过度营销")
+    ])
 }
 
 pub(super) fn health_item(key: &str, label: &str, score: i32, detail: &str) -> Value {
@@ -924,6 +935,11 @@ pub(super) fn playbook_brief(playbook: &OperationPlaybook) -> String {
 }
 
 pub(super) fn guide_preview_json(preview: UserOperationGuidePreview) -> Value {
+    // FE-1：preview.health_scores 是 scores document；这里复用 health_items_from_scores
+    // （与 operation_health_json 正常加载路径同口径）把它组装成构建好的 7 项 items，
+    // 让前端直接消费正确量纲/风险反转的 items，不必自己重建。无论 scores 来自 LLM
+    // 还是 health_scores_document 兜底，都过同一组装。
+    let health_items = health_items_from_scores(&preview.health_scores);
     json!({
         "id": preview.id.map(|id| id.to_hex()).unwrap_or_default(),
         "accountId": preview.account_id,
@@ -936,6 +952,9 @@ pub(super) fn guide_preview_json(preview: UserOperationGuidePreview) -> Value {
         "impactScope": if preview.impact_scope.trim().is_empty() { "current_contact".to_string() } else { preview.impact_scope },
         "scopeReason": if preview.scope_reason.trim().is_empty() { "默认只影响当前好友。".to_string() } else { preview.scope_reason },
         "readableChanges": preview.readable_changes,
+        // 构建好的 health（scores + items 同形态于正常加载路径）。
+        "health": { "scores": &preview.health_scores, "items": health_items },
+        // 旧 `healthScores` 键保留以兼容尚未迁移的读端；前端迁移后可移除。
         "healthScores": preview.health_scores,
         "suggestedChanges": preview.suggested_changes,
         "riskWarnings": preview.risk_warnings,
@@ -1431,8 +1450,111 @@ pub(crate) async fn add_outcome_event_inner(
 mod tests {
     use super::escape_regex_literal;
     use super::insert_domain_stage_fields;
+    use super::{guide_preview_json, health_items_from_scores};
     use super::{validate_deal_verification, validate_event_kind};
-    use mongodb::bson::Document;
+    use crate::models::UserOperationGuidePreview;
+    use mongodb::bson::{doc, oid::ObjectId, DateTime, Document};
+
+    /// 构造一条带指定 health_scores 的 guide preview（其余字段填最小合法值）。
+    fn preview_with_scores(scores: Document) -> UserOperationGuidePreview {
+        UserOperationGuidePreview {
+            id: Some(ObjectId::new()),
+            workspace_id: "default".to_string(),
+            account_id: "default".to_string(),
+            contact_id: ObjectId::new(),
+            contact_wxid: "wxid_guide_preview_test".to_string(),
+            instruction: "更关注客户情绪".to_string(),
+            mode: "tune".to_string(),
+            status: "pending".to_string(),
+            summary: "测试预览".to_string(),
+            impact_scope: "current_contact".to_string(),
+            scope_reason: String::new(),
+            readable_changes: vec![],
+            health_scores: scores,
+            suggested_changes: Document::new(),
+            risk_warnings: vec![],
+            created_at: DateTime::now(),
+            updated_at: DateTime::now(),
+        }
+    }
+
+    /// FE-1 后端回归：guide preview 响应必须含**构建好的** `health.items`（7 项，
+    /// 复用 `health_item` 的量纲/风险反转），而非仅裸 `healthScores`。
+    ///
+    /// 此前 `guide_preview_json` 只输出 `healthScores`（scores document），前端只好
+    /// 用一个坏函数自己重建 items（key 错/量纲错/风险方向反）。本测试钉死后端直接
+    /// 发对的 items：风险类高分 → danger，非风险类高分 → good。
+    #[test]
+    fn guide_preview_json_builds_health_items_with_correct_risk_tone() {
+        // hallucinationRisk=80（风险类高分 → danger）；userUnderstanding=80（非风险高分 → good）。
+        let scores = doc! {
+            "userUnderstanding": 80i32,
+            "relationshipQuality": 50i32,
+            "productFit": 30i32,
+            "rhythmRisk": 20i32,
+            "knowledgeGrounding": 70i32,
+            "hallucinationRisk": 80i32,
+            "pressureRisk": 10i32,
+        };
+        let body = guide_preview_json(preview_with_scores(scores));
+
+        // health.items 是构建好的 canonical 7 项数组。
+        let items = body["health"]["items"]
+            .as_array()
+            .expect("health.items 必须存在且为数组");
+        assert_eq!(items.len(), 7, "health items 必须是 canonical 7 项");
+
+        let keys: Vec<&str> = items.iter().filter_map(|i| i["key"].as_str()).collect();
+        assert!(keys.contains(&"hallucinationRisk"));
+        assert!(keys.contains(&"userUnderstanding"));
+
+        // 风险类高分 → danger（验证 tone 方向：风险维度高分=坏）。
+        let hallucination = items
+            .iter()
+            .find(|i| i["key"] == "hallucinationRisk")
+            .expect("hallucinationRisk item present");
+        assert_eq!(
+            hallucination["tone"], "danger",
+            "风险类 hallucinationRisk=80 应判 danger（高分=坏，量纲 0-100）"
+        );
+        assert_eq!(hallucination["score"], 80);
+
+        // 非风险类高分 → good（验证正常方向：高分=好）。
+        let understanding = items
+            .iter()
+            .find(|i| i["key"] == "userUnderstanding")
+            .expect("userUnderstanding item present");
+        assert_eq!(
+            understanding["tone"], "good",
+            "非风险类 userUnderstanding=80 应判 good（高分=好）"
+        );
+
+        // scores 仍随响应返回；旧 `healthScores` 键保留以兼容现有读端。
+        assert!(body["health"]["scores"].is_object(), "health.scores 应保留 scores document");
+        assert!(body["healthScores"].is_object(), "healthScores 旧键应保留向后兼容");
+    }
+
+    /// DRY 抽出的 `health_items_from_scores` 与组装函数同口径：缺失键回落 0、
+    /// 7 项齐全、风险/非风险 tone 方向正确。
+    #[test]
+    fn health_items_from_scores_is_canonical_seven_items() {
+        // 空 scores：所有键 get_i32 失败回落 0。
+        let items_value = health_items_from_scores(&Document::new());
+        let items = items_value.as_array().expect("items 数组");
+        assert_eq!(items.len(), 7, "缺值时仍输出 canonical 7 项");
+        // 全 0：非风险类 0 → danger（低分=坏）；风险类 0 → good（低分=好）。
+        let understanding = items
+            .iter()
+            .find(|i| i["key"] == "userUnderstanding")
+            .expect("userUnderstanding present");
+        assert_eq!(understanding["score"], 0);
+        assert_eq!(understanding["tone"], "danger", "非风险类 0 分应 danger");
+        let pressure = items
+            .iter()
+            .find(|i| i["key"] == "pressureRisk")
+            .expect("pressureRisk present");
+        assert_eq!(pressure["tone"], "good", "风险类 0 分应 good");
+    }
 
     #[test]
     fn escape_regex_literal_neutralizes_redos_pattern() {
