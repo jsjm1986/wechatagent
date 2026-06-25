@@ -199,6 +199,16 @@ pub(crate) fn is_refreshable_prompt_seeded_by(seeded_by: &Option<String>) -> boo
     matches!(seeded_by.as_deref(), Some("system"))
 }
 
+/// 内容比对前归一：统一换行符 `\r\n`→`\n`。
+///
+/// 必要性：spec 是 Windows 工作树里的 `r#"..."#` 多行串，git autocrlf 跨构建
+/// 会 LF↔CRLF 互转，使编译进二进制的 `&str` 字节与 DB 存的不同。裸 `==` 会每次
+/// 重启都判「不一致→归档+重种」，导致版本号无限膨胀 + A/B 轮换抖动。
+/// 只统一换行，**不 trim 行尾**（保留 spec 有意义的尾随空格）。
+pub(crate) fn normalize_prompt_content(s: &str) -> String {
+    s.replace("\r\n", "\n")
+}
+
 pub async fn reset_prompt_pack_v2(
     db: &Database,
     workspace_id: &str,
@@ -2257,6 +2267,19 @@ mod ab_bucket_tests {
         assert!(!is_refreshable_prompt_seeded_by(&Some("operator".to_string())));
         // None 保守视为不可刷新（不照搬 domain_configs 的 None→可刷新）
         assert!(!is_refreshable_prompt_seeded_by(&None));
+    }
+
+    #[test]
+    fn normalize_unifies_crlf_only() {
+        // CRLF 与 LF 视为等价（防 git autocrlf 跨构建版本膨胀）
+        assert_eq!(
+            normalize_prompt_content("a\r\nb\r\n"),
+            normalize_prompt_content("a\nb\n")
+        );
+        // 不 trim 行尾有意义空格：尾随空格被保留，不被吞
+        assert_eq!(normalize_prompt_content("a \n"), "a \n");
+        // 纯 LF 原样
+        assert_eq!(normalize_prompt_content("x\ny"), "x\ny");
     }
 }
 
