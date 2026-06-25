@@ -441,13 +441,16 @@ git commit -m "fix(guides): guide preview 返回后端构建的 health items(复
 
 ### Task 4: FE-1 前端 — 删坏函数,直接用后端 items
 
+> **基线更新(2026-06-26,PR#40 taxonomy-label-wiring 合入后重核)**:PR#40 已在 `legacy.tsx:1950` 新增一个**本地** `defaultHealthItems(): OperationHealthItem[]`,用**正确的 canonical 3-key**(userUnderstanding/relationshipQuality/productFit,score 0,中性"选择好友后自动诊断")。legacy.tsx:316 渲染兜底用的是这个本地函数(遮蔽了 store import),**已是正确兜底,不动**。FE-1 核心 bug 仍在:`userOpsStore.ts:595` guide preview 仍调坏函数 `healthFromScores`(用 store 内 :189 旧 4-key defaultHealthItems)。所以本任务:改 :595 + 删 healthFromScores + 删 store 内 :189 旧 4-key defaultHealthItems(删 healthFromScores 后它变无引用死函数)。**不碰 legacy.tsx:1950**。
+
 **Files:**
-- Modify: `frontend/src/stores/userOpsStore.ts`(healthFromScores :198-225 删 / defaultHealthItems :189-196 改 / :595 改赋值)
-- Modify: `frontend/src/features/user-ops/legacy.tsx`(:313 兜底,若需要)
-- Test: `frontend/src/__tests__/`(新建 health items 单测)
+- Modify: `frontend/src/stores/userOpsStore.ts`(:595 改赋值为 `data.item.health` / 删 healthFromScores :198-225 / 删旧 4-key defaultHealthItems :189-196)
+- Test: `frontend/src/__tests__/stores/userOpsHealth.test.ts`(新建 health items 单测)
+- **不改** `legacy.tsx`(其 :1950 本地 defaultHealthItems 已是正确 canonical key 兜底,:316 渲染不变)
 
 **Interfaces:**
 - Consumes: 后端 guide preview 响应 `data.item.health.items`(Task 3 产出,7 项 {key,label,score,tone,detail})。
+- 前置确认:store 内 :189 `defaultHealthItems` 删除前,grep 确认它在 store 内除 healthFromScores 外无其他引用(legacy.tsx 用的是它自己的本地 :1950 同名函数,非 store 这个)。
 
 - [ ] **Step 1: 写失败 vitest**
 
@@ -490,15 +493,8 @@ Expected: 初始可能因 store 仍走 healthFromScores 而结构不符。
 `frontend/src/stores/userOpsStore.ts`:
 - `:595` `next.operationHealth = healthFromScores(data.item.healthScores);` → `next.operationHealth = data.item.health;`
 - 删除 `healthFromScores`(:198-225)整个函数。
-- `defaultHealthItems`(:189-196):兜底用(legacy.tsx:313 `health?.items || defaultHealthItems()`)。改为返回**空数组**或 7-key 中性占位(不带伪造分值)。推荐空数组——health 为 null 时不渲染伪造分:
-
-```typescript
-function defaultHealthItems() {
-  return [] as Array<{ key: string; label: string; score: number; tone: "good" | "warn" | "danger"; detail: string }>;
-}
-```
-
-> 若 legacy.tsx:313 依赖非空兜底展示骨架,改为 7-key 中性占位(score 0 / tone "warn" / detail "暂无数据"),但**绝不**保留旧 4-key 伪造分。
+- 删除 store 内旧 4-key `defaultHealthItems`(:189-196,trust_level/engagement/intent_clarity/relationship_depth)——删 healthFromScores 后它在 store 内无引用(grep 确认)。**注意**:legacy.tsx:1950 有同名但不同实现的本地 defaultHealthItems(正确 canonical key),那是 legacy.tsx:316 渲染兜底用的,**不在本次删除范围**。
+- 若 store 内别处仍 import/引用 defaultHealthItems,改为不依赖它(:253 `operationHealth: null` 初始值不受影响)。
 
 - [ ] **Step 4: 跑测试 + 类型检查**
 
@@ -508,7 +504,7 @@ Expected: vitest PASS;tsc 编译过(确认删 healthFromScores 后无悬空引�
 - [ ] **Step 5: 提交**
 
 ```bash
-git add frontend/src/stores/userOpsStore.ts frontend/src/features/user-ops/legacy.tsx frontend/src/__tests__/stores/userOpsHealth.test.ts
+git add frontend/src/stores/userOpsStore.ts frontend/src/__tests__/stores/userOpsHealth.test.ts
 git commit -m "fix(frontend): guide preview 直接用后端 health.items,删 healthFromScores 坏函数(消除伪造健康分) (FE-1 前端)"
 ```
 
