@@ -628,40 +628,40 @@ git commit -m "feat(mgmt-agent): 扩工具集接配置/策略/知识端点(第�
 
 ## Task 6.5: 提示词自然语言编辑 — 三层分级 + 双闸校验（fail-closed）
 
-> **本任务经 4 路 opus 实证核实重写**。原草案有红线漏洞：①key 命名半数错（agent_soul/operation_playbook 不是 template_key，user.review.policy 不存在，reset_system_pack 是 handler）；②锚闸只校验 `DEFAULT_MODE_GATE_POLICY`，而该锚**故意不含反接管红线**（亲核 prompts.rs:29-34 + 测试 `default_mode_gate_policy_excludes_human_takeover_redline` prompts.rs:2361-2367）——真红线在 user.reply.policy 正文 :1000/:1023、soul 正文 :846-866，旧锚闸根本没在查。修正核心：**先抽红线为独立锚常量再扩锚闸**（用户 2026-06-26 决策）。
+> **本任务经 4 路 opus 实证核实重写**。原草案有红线漏洞：①key 命名半数错（agent_soul/operation_playbook 不是 template_key，user.review.policy 不存在，reset_system_pack 是 handler）；②锚闸只校验 `DEFAULT_MODE_GATE_POLICY`，而该锚**故意不含反接管红线**（亲核 prompts.rs:29-34 + 测试 `default_mode_gate_policy_excludes_human_takeover_redline` prompts.rs:2506-2511）——真红线在 user.reply.policy 正文 :1123/:1146、soul 正文 :968，旧锚闸根本没在查。修正核心：**先抽红线为独立锚常量再扩锚闸**（用户 2026-06-26 决策；行号为合并 origin/main 后真实值）。
 
 **Files:**
 - Modify: `src/prompts.rs`（新增红线锚常量 `DEFAULT_REPLY_REDLINE_ANCHORS` + 锚漂移护栏测试）
 - Create: `src/routes/management_prompt_edit.rs`（三层分级纯函数 + 双闸校验）
-- Modify: `src/routes/prompt_templates.rs:133 update_prompt_template`（真正拦截点：在 `validate_prompt_template_input` 之后插双闸）
+- Modify: `src/routes/prompt_templates.rs:138 update_prompt_template`（真正拦截点：在 `validate_prompt_template_input`(:144) 之后插双闸 + `$set` 加 `seeded_by="manual"` 防 PR#42 启动对齐覆盖）
 - Modify: `src/routes/mod.rs`（`mod management_prompt_edit;`）
 - Test: `src/routes/management_prompt_edit.rs` 内 `#[cfg(test)] mod tests`
 
 **Interfaces:**
-- Consumes: `crate::evolution::lint::passes_forbidden_words`（**定义在 src/evolution/lint.rs:33**，返回 true=干净；prompt_critic.rs:396 是调用点）；`crate::prompts::{DEFAULT_MODE_GATE_POLICY(:29), DEFAULT_REVIEWER_FEWSHOT(:47), DEFAULT_REPLY_REDLINE_ANCHORS(新增), PROMPT_EVOLUTION_FORBIDDEN_KEYS(:2138)}`。
+- Consumes: `crate::evolution::lint::passes_forbidden_words`（**定义在 src/evolution/lint.rs:33**，返回 true=干净；prompt_critic.rs:396 是调用点）；`crate::prompts::{normalize_prompt_content(:162), DEFAULT_MODE_GATE_POLICY(:29), DEFAULT_REVIEWER_FEWSHOT(:47), DEFAULT_REPLY_REDLINE_ANCHORS(新增), PROMPT_EVOLUTION_FORBIDDEN_KEYS(:2261)}`。
 - Produces: `enum PromptEditTier { FreelyEditable, ConstrainedEditable, Forbidden }`；`fn prompt_edit_tier(template_key: &str) -> PromptEditTier`；`fn required_anchors(template_key: &str) -> &'static [&'static str]`；`fn validate_prompt_edit(template_key: &str, new_content: &str) -> Result<(), String>`（双闸，命中即 Err，fail-closed）。
 
 > 设计依据 spec §4.4（已按核实修正）。三层（按**真实 template_key**）：
 > - 🔴**禁止改**：`evolution_critic_v1`（PROMPT_EVOLUTION_FORBIDDEN_KEYS）。`reset-system-pack` 是 route handler 不是 key，靠不接入工具来禁、不在本函数判。
-> - ⚠️**可改但需强约束**（落库前过双闸，红线锚逐字保留）：`user.reply.policy`（含反接管红线 :1000/:1023）、`user.reply.system`、`user.review.system`、`user.reply.task`（soul 红线 :846-866 注入此层）。
+> - ⚠️**可改但需强约束**（落库前过双闸，红线锚逐字保留）：`user.reply.policy`（含反接管红线 :1123/:1146）、`user.reply.system`、`user.review.system`、`user.reply.task`（soul 红线 :968 注入此层）。
 > - ✅**可自由改**（仍过禁词闸）：其余业务话术 key。
 > 注：soul/playbook 在独立集合（`agent_souls`/`operation_playbooks`，标识字段 `agent_kind`），**不走 prompt_templates 编辑通路**，故不在本函数的 template_key 分类内；它们的编辑若开放，另在 souls/playbooks handler 处接同一套 `validate_prompt_edit`（用 agent_kind 映射到对应红线锚）。本任务先覆盖 prompt_templates 通路。
 
 - [ ] **Step 0: 先在 prompts.rs 抽红线锚常量 + 护栏测试**
 
-亲核确认：反接管红线在 `user.reply.policy` 正文 prompts.rs:1000（"用户要求真人…严禁承诺安排真人…"整段）和 :1023（"用户主动要真人…严禁承诺…"整段）。把这两段**逐字**抽成常量（保持与正文字节一致，正文改为引用或保留副本 + 护栏测试锁死一致性，仿 DEFAULT_MODE_GATE_POLICY 的 `..._anchor_matches_pack` 模式）：
+亲核确认（合并 origin/main 后真实行号）：反接管红线在 `user.reply.policy` 正文 prompts.rs:**1123**（"用户要求真人…严禁承诺安排真人…"整段）和 :**1146**（"用户主动要真人…严禁承诺…"整段）。把这两段**逐字**抽成常量（保持与正文字节一致，正文保留副本 + 护栏测试锁死一致性，仿 DEFAULT_MODE_GATE_POLICY 的 `..._anchor_matches_pack` 模式）：
 
 ```rust
 // prompts.rs：新增（红线锚——锚闸据此校验写回后红线逐字仍在）
 pub const DEFAULT_REPLY_REDLINE_ANCHORS: &[&str] = &[
-    // :1000 boundary_protection 反接管续行（从"用户要求"到段末）
+    // :1123 boundary_protection 反接管续行（真实逐字子串）
     "用户要求\"真人 / 不想跟机器人聊\"时，用 AI 自治语义承接",
-    // :1023 表达红线反接管段（从"用户主动要真人"起的关键判定句）
+    // :1146 表达红线反接管段（真实逐字子串）
     "严禁承诺\"安排真人 / 让同事来联系 / 稍后有人对接你 / 转接客服\"",
 ];
 ```
 
-> 实现注意：常量值必须是正文里**真实存在的逐字子串**（实现时从 prompts.rs:1000/1023 复制，上面是示意）。加一个护栏测试 `reply_redline_anchors_present_in_pack`：断言 `user.reply.policy` 的 pack content `contains` 每条锚，防正文改动后锚失配（仿 prompts.rs:2344-2355）。
+> 实现注意：①常量值必须是正文里**真实存在的逐字子串**（实现时从 prompts.rs:1123/1146 复制，上面两条已与合并后正文核对一致）。②加护栏测试 `reply_redline_anchors_present_in_pack`：断言 `user.reply.policy` 的 pack content `contains` 每条锚，防正文改动后锚失配（仿 prompts.rs:2456-2520 的 anchor_matches_pack）。③这两条锚是子串、不跨行，CRLF 影响小，但锚闸统一走 normalize（见 Step 3 注）更稳。
 
 - [ ] **Step 1: 写失败测试**
 
@@ -750,8 +750,8 @@ Expected: FAIL（模块 / `PromptEditTier` / `prompt_edit_tier` / `validate_prom
 
 use crate::evolution::lint::passes_forbidden_words;
 use crate::prompts::{
-    DEFAULT_MODE_GATE_POLICY, DEFAULT_REPLY_REDLINE_ANCHORS, DEFAULT_REVIEWER_FEWSHOT,
-    PROMPT_EVOLUTION_FORBIDDEN_KEYS,
+    normalize_prompt_content, DEFAULT_MODE_GATE_POLICY, DEFAULT_REPLY_REDLINE_ANCHORS,
+    DEFAULT_REVIEWER_FEWSHOT, PROMPT_EVOLUTION_FORBIDDEN_KEYS,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -768,7 +768,7 @@ pub(super) enum PromptEditTier {
 fn required_anchors(template_key: &str) -> Vec<&'static str> {
     match template_key {
         "user.reply.policy" => {
-            // 业务锚 + 反接管红线锚（红线在正文 :1000/:1023，旧锚闸漏查）
+            // 业务锚 + 反接管红线锚（红线在正文 :1123/:1146，旧锚闸漏查）
             let mut v = vec![DEFAULT_MODE_GATE_POLICY];
             v.extend_from_slice(DEFAULT_REPLY_REDLINE_ANCHORS);
             v
@@ -811,9 +811,14 @@ pub(super) fn validate_prompt_edit(template_key: &str, new_content: &str) -> Res
     if !passes_forbidden_words(new_content) {
         return Err("写回内容命中禁用词（接管/人工/takeover/handoff），已拒绝".to_string());
     }
-    // 闸 2：锚完整性闸——强约束层的全部锚段（业务锚 + 红线锚）必须逐字仍在
+    // 闸 2：锚完整性闸——强约束层的全部锚段（业务锚 + 红线锚）必须逐字仍在。
+    // CRLF 归一（冲突修正）：锚常量是 Windows 工作树的 r#"..."# 多行串，git autocrlf
+    // 跨构建 LF↔CRLF 互转；管理者提交的 new_content 换行风格也不受控。裸 contains 会
+    // 因换行字节不同失配、误拒合法编辑 → 两边都过 normalize_prompt_content 再比
+    // （复用 PR#42 引入的 prompts.rs:162 同一归一函数）。
+    let normalized = normalize_prompt_content(new_content);
     for anchor in required_anchors(template_key) {
-        if !new_content.contains(anchor) {
+        if !normalized.contains(&normalize_prompt_content(anchor)) {
             return Err(format!(
                 "提示词 '{template_key}' 的红线/业务锚段缺失或被改，已拒绝（防 replace 静默失配 + 防红线被删）"
             ));
@@ -823,7 +828,7 @@ pub(super) fn validate_prompt_edit(template_key: &str, new_content: &str) -> Res
 }
 ```
 
-在 `src/routes/mod.rs` 加 `mod management_prompt_edit;`。**真正的拦截点是 `update_prompt_template`(prompt_templates.rs:133)**——它当前只调 `validate_prompt_template_input`(查空)、零红线校验。在它 `validate_prompt_template_input(&payload)?` 之后插一行（字面双闸，前置硬门）：
+在 `src/routes/mod.rs` 加 `mod management_prompt_edit;`。**真正的拦截点是 `update_prompt_template`(prompt_templates.rs:138)**——它当前只调 `validate_prompt_template_input`(查空，:144)、零红线校验。在它 `validate_prompt_template_input(&payload)?` 之后插一行（字面双闸，前置硬门）：
 
 ```rust
 // prompt_templates.rs update_prompt_template，validate_prompt_template_input 之后
@@ -831,7 +836,18 @@ crate::routes::management_prompt_edit::validate_prompt_edit(&payload.prompt_key,
     .map_err(AppError::BadRequest)?;
 ```
 
-这样无论走管理 agent 工具、还是管理员直接调 REST PUT /prompt-templates/:id，双闸都拦得住（单点拦截，不靠每个调用方自觉）。execute_management_tool 的 edit_prompt_template 工具分支复用 update_prompt_template 即自动过闸。**LLM 第三闸（语义审查）在 Task 6.6 接在同一拦截点的双闸之后**——本任务先把快、确定、无依赖的字面双闸落地。
+**冲突修正（必做，否则改动活不过一次重启）**：`update_prompt_template` 的 `$set` 当前**不写 `seeded_by`**，被编辑的系统种子行 `seeded_by` 仍是 `"system"`。而 main 刚合并的 PR#42 启动对齐 `align_prompt_specs`(prompts.rs:175) 会对 `seeded_by="system"` 且内容≠DEFAULT 的行**归档 + 重种回 DEFAULT**（`is_refreshable_prompt_seeded_by` 只认 "system"，prompts.rs:152；"manual" 返回 false，测试 :2366 坐实）。所以经双闸通过、确实要落库的编辑，`$set` **必须把 `seeded_by` 置成 `"manual"`**，让 align 跳过它（:237-238 `continue`）：
+
+```rust
+// update_prompt_template 的 $set 增加（防 PR#42 启动对齐覆盖管理者改动）：
+"seeded_by": "manual",
+```
+
+> 注：`"manual"` 入 align 白名单之外（永不被归档重种）。这是管理者"自然语言改 prompt"能持久化、活过重启的关键。reset-system-pack（显式销毁性重种）不受影响、也不接入工具。
+
+这样无论走管理 agent 工具、还是管理员直接调 REST PUT /prompt-templates/:id，双闸都拦得住（单点拦截，不靠每个调用方自觉）。execute_management_tool 的 edit_prompt_template 工具分支复用 update_prompt_template 即自动过闸 + 自动置 manual。**LLM 第三闸（语义审查）在 Task 6.6 接在同一拦截点的双闸之后**——本任务先把快、确定、无依赖的字面双闸落地。
+
+> **本任务额外回归测试**（守 PR#42 兼容）：`constrained_edit_marks_seeded_by_manual`——断言经双闸的 update 落库 `seeded_by="manual"`（防 align 覆盖）；`anchor_gate_normalizes_crlf`——断言锚常量用 CRLF 提交仍能通过（防换行误拒）。
 
 - [ ] **Step 4: 运行测试确认通过 + 全量 lib 不回归**
 
@@ -858,7 +874,7 @@ git commit -m "feat(mgmt-agent): 提示词三层分级+字面双闸(抽反接管
 **Files:**
 - Modify: `src/routes/management_prompt_edit.rs`（加三态 `PromptEditVerdict` + async `review_prompt_edit`，复用 `generate_agent_json` judge）
 - Modify: `src/prompts.rs`（加第三闸 judge 的 PromptSpec `management.prompt_redline_review.system`，bump PROMPT_PACK_VERSION）
-- Modify: `src/routes/prompt_templates.rs:133 update_prompt_template`（双闸后接第三闸，按三态分流；加 `force: Option<bool>` 入参）
+- Modify: `src/routes/prompt_templates.rs:138 update_prompt_template`（双闸后接第三闸，按三态分流；加 `force: Option<bool>` 入参）
 - Modify: `src/routes/management.rs`（execute_management_tool 的 edit_prompt_template 工具分支：NeedsHumanConfirm → 走 command pending_confirmation）
 - Test: `src/routes/management_prompt_edit.rs` 内 tests（三态判定纯函数部分 + diff 提取）
 
@@ -949,11 +965,11 @@ pub(super) async fn review_prompt_edit(
 }
 ```
 
-> 实现注意：`generate_agent_json` 的真实签名/schema 传法以 agent/mod.rs 为准（实现时对齐）；judge prompt 措辞要包含 :1000/:1023 红线的语义要点（变相承认真人后台、承诺转交、削弱 grounding、绕过 verify），但**判定靠 LLM 语义不靠词表**（守 agent-first）。
+> 实现注意：`generate_agent_json` 的真实签名/schema 传法以 agent/mod.rs 为准（实现时对齐）；judge prompt 措辞要包含 :1123/:1146 红线的语义要点（变相承认真人后台、承诺转交、削弱 grounding、绕过 verify），但**判定靠 LLM 语义不靠词表**（守 agent-first）。
 
 - [ ] **Step 4: 拦截点按三态分流 + force 覆盖 + 两路径消费**
 
-`update_prompt_template`(prompt_templates.rs:133) 双闸之后：
+`update_prompt_template`(prompt_templates.rs:138) 双闸之后：
 
 ```rust
 // 双闸已过（Task 6.5）。第三闸语义审查：
@@ -1172,9 +1188,14 @@ systemd `wechatagent.service`（Restart=always，RUST_MIN_STACK=8388608，仿现
 **4 路 opus 核实修正记录（2026-06-26，落笔前亲核 origin/main）**：
 - Task 1：函数名 `is_read_only_tool`→`is_read_tool`（笔误）；新增 `tool_always_requires_confirmation`（verify 类恒确认，守 AI 永不自动 verify）。
 - Task 6：build_management_plan 走 PROMPT_PACK_VERSION 版本化 prompt（非"内联字面量"，原判断错）；标出 3 个需小重构 handler（cancel_outbox/approve_taxonomy_candidate/approve_relationship_suggestion 返回 Response 非 Json<Value>，approve_taxonomy_candidate 缺 Extension<Admin>）；import-apply-pdf 用 Multipart 包不动需走 import_pdf_bytes；verify 红线 actor 处理。
-- Task 6.5（改动最大）：原草案 key 命名半数错已修（agent_soul/operation_playbook 不是 template_key→soul/playbook 在独立集合；user.review.policy 不存在；reset_system_pack 是 handler 非 key）；**核心红线漏洞已修**——原锚闸只查 `DEFAULT_MODE_GATE_POLICY`，而该锚故意不含反接管红线（测试 prompts.rs:2361-2367 坐实），真红线在 :1000/:1023 旧闸漏查；现 Step 0 先抽 `DEFAULT_REPLY_REDLINE_ANCHORS` 红线锚 + 护栏测试，`required_anchors` 返回多锚（业务锚+红线锚），新增 `dual_gate_rejects_redline_anchor_drift` 回归锁；拦截点明确为 `update_prompt_template`(prompt_templates.rs:133) 单点拦截；诚实标注插入型绕过残余风险（第一期靠确认+审计兜底，LLM 语义审查留后续）。
+- Task 6.5（改动最大）：原草案 key 命名半数错已修（agent_soul/operation_playbook 不是 template_key→soul/playbook 在独立集合；user.review.policy 不存在；reset_system_pack 是 handler 非 key）；**核心红线漏洞已修**——原锚闸只查 `DEFAULT_MODE_GATE_POLICY`，而该锚故意不含反接管红线（测试 prompts.rs:2506-2511 坐实），真红线在 :1123/:1146 旧闸漏查；现 Step 0 先抽 `DEFAULT_REPLY_REDLINE_ANCHORS` 红线锚 + 护栏测试，`required_anchors` 返回多锚（业务锚+红线锚），新增 `dual_gate_rejects_redline_anchor_drift` 回归锁；拦截点明确为 `update_prompt_template`(prompt_templates.rs:138) 单点拦截。插入型语义绕过由 Task 6.6 LLM 第三闸堵（非留后续）。
 
-**Placeholder scan**：无 TBD/TODO；execute_plan_tool_calls 抽取在 Task 5 明确；新工具分发在 Task 6 指明"复用已有写入函数"（具体函数实现时 grep 定位，因 routes 模块多）；Task 6.5 Step 0 红线锚常量值标注"实现时从 prompts.rs:1000/1023 逐字复制"（示意非占位）。
+**Placeholder scan**：无 TBD/TODO；execute_plan_tool_calls 抽取在 Task 5 明确；新工具分发在 Task 6 指明"复用已有写入函数"（具体函数实现时 grep 定位，因 routes 模块多）；Task 6.5 Step 0 红线锚常量值标注"实现时从 prompts.rs:1123/1146 逐字复制"（已与合并后正文核对一致）。
+
+**main 合并冲突修正记录（2026-06-26 合并 origin/main 25 提交后，opus 核实 + 亲核）**：合并了 PR#41（evolution/知识 workspace 隔离）+ PR#42（prompt-pack 启动对齐）。两个会让"自然语言改 prompt"白做的真冲突已修进 Task 6.5：
+- **冲突1 CRLF 误判**：锚闸 `contains` 前对 new_content 与每条锚常量都过 `normalize_prompt_content`(prompts.rs:162，PR#42 引入)——否则 Windows autocrlf 下换行字节差异误拒合法编辑。
+- **冲突2 启动对齐覆盖（最严重）**：PR#42 `align_prompt_specs`(prompts.rs:175) 每次重启把 `seeded_by="system"` 且内容≠DEFAULT 的行归档重种回 DEFAULT。`update_prompt_template` 的 `$set` 必须加 `seeded_by="manual"`（align 白名单只认 system，manual 跳过——测试 prompts.rs:2366 坐实），否则管理者改动活不过一次重启。
+- **行号对齐**：prompts.rs :175 后引用 +123（红线正文 :1123/:1146，FORBIDDEN_KEYS :2261，护栏测试 :2456-2520）；update_prompt_template :138；management.rs/lint.rs/mod.rs 未变。
 
 **Type consistency**：ToolRisk 四档（Task 1，含 Irreversible）/ ToolOutcome（Task 2）/ build_execution_summary（Task 3）/ TOOL_CALL_STATUSES（Task 4）/ build_confirm_filter + execute_plan_tool_calls（Task 5）/ PromptEditTier + validate_prompt_edit（Task 6.5）签名一致；read_only 字段名保留兼容既有调用点；plan_requires_confirmation 的 irreversible 恒拦逻辑与 Task 1 测试一致。
 
