@@ -12,7 +12,7 @@ use crate::{
     models::{AgentSoul, OperationDomainConfig, OperationPlaybook, PromptTemplate},
 };
 
-pub const PROMPT_PACK_VERSION: &str = "wechatagent_prompt_pack_v11_2026_06_24_ocean_personality";
+pub const PROMPT_PACK_VERSION: &str = "wechatagent_prompt_pack_v12_2026_06_25_clarify_tighten";
 
 /// universal-domain-adaptation A/T1：user.reply.policy prompt「## 模式与 5 闸的关系」
 /// 模式-闸说明段（逐字复刻 prompt pack v3 现文 :958-963：标题 + casual_relationship /
@@ -1138,6 +1138,8 @@ fn prompt_specs() -> Vec<PromptSpec> {
   "sufficiency": "enough",         // enough=信息已足够，直接定稿；need_more_context=缺我方内部上下文（需要更懂这个人或需要产品/知识资料）；need_clarification=客户没说清，需要先问清楚
   "missingTier": "none",           // 仅当 sufficiency=need_more_context 时有意义：relational=缺这个客户的关系/画像/历史；full=缺产品目录/知识切片/方法论。其它情况填 none
   "clarificationIntent": "",       // 仅当 sufficiency=need_clarification 时填：一句话说明要向客户澄清什么；其它情况留空
+  // 【need_clarification 硬约束】当 sufficiency=need_clarification 时，replyText 只能是面向客户的
+  // 澄清问句本身，不得给任何推测性答案/硬答（信息不足时硬答＝幻觉风险）。把不确定的点直接问清楚。
   "lastCommitment": "最近承诺或待确认事项",
   "commitment": {
     "text": "最近承诺或待确认事项（与 lastCommitment 同义，二选一即可）",
