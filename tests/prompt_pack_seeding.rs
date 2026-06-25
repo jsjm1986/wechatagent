@@ -363,3 +363,54 @@ async fn align_refreshes_drift_even_when_pack_version_matches() {
     assert!(archived.is_some(), "脏行应被归档保留可回溯");
     assert_eq!(archived.unwrap().status, "archived");
 }
+
+/// 终审 Minor #3 回归：archived GC（delete_redundant）在非空库路径每次启动都跑。
+/// 预置一条孤立 archived 行 → 重跑 ensure（不改版本号，走非空库）→ 该行被清除。
+#[tokio::test]
+#[ignore]
+async fn delete_redundant_runs_on_nonempty_db_each_startup() {
+    let app = common::TestApp::start().await;
+    let workspace = app.state.config.default_workspace_id.clone();
+    let account = app.state.config.default_account_id.clone();
+
+    // 预置一条孤立的 archived 行（key 不在 spec 中，不参与对齐）。
+    let mut archived_row = make_user_template(&workspace, "user.custom.archived_orphan", "archived");
+    archived_row.current_version = false;
+    app.state
+        .db
+        .prompt_templates()
+        .insert_one(&archived_row, None)
+        .await
+        .unwrap();
+
+    // 确认预置成功。
+    let before = app
+        .state
+        .db
+        .prompt_templates()
+        .find_one(
+            doc! { "workspace_id": &workspace, "prompt_key": "user.custom.archived_orphan" },
+            None,
+        )
+        .await
+        .unwrap();
+    assert!(before.is_some(), "预置 archived 行应存在");
+
+    // 重跑 ensure_prompt_pack_v2（不改版本号→非空库路径→delete_redundant 跑）。
+    wechatagent::prompts::ensure_prompt_pack_v2(&app.state.db, &workspace, &account)
+        .await
+        .expect("rerun ensure");
+
+    // archived 行应被 GC 清除。
+    let after = app
+        .state
+        .db
+        .prompt_templates()
+        .find_one(
+            doc! { "workspace_id": &workspace, "prompt_key": "user.custom.archived_orphan" },
+            None,
+        )
+        .await
+        .unwrap();
+    assert!(after.is_none(), "archived 孤立行应被 delete_redundant 在非空库路径清除");
+}
