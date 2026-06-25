@@ -84,6 +84,38 @@ pub(crate) async fn load_operation_knowledge(
     Ok(KnowledgeRuntime { documents, chunks })
 }
 
+/// KNOW-2：unverified-warning 的「切片总数」count filter。须与注入口径
+/// [`load_operation_knowledge`] 对齐——只统计 `status="active"` 的切片，否则归档
+/// 切片（不会被注入）会被算进 total，干扰「有切片却全不可注入」判断。
+fn unverified_warning_total_filter(workspace_id: &str, account_id: &str) -> Document {
+    doc! {
+        "workspace_id": workspace_id,
+        "domain": "user_operations",
+        "status": "active",
+        "$or": [
+            { "account_id": null },
+            { "account_id": account_id }
+        ]
+    }
+}
+
+/// KNOW-2：unverified-warning 的「已核验切片数」count filter。须与注入口径
+/// [`load_operation_knowledge`] 的 chunk 过滤逐字对齐（`status="active"` AND
+/// `integrity_status="verified"`），否则归档的已核验切片会让 verified>0 提前
+/// return、抑制本应发出的告警，而这些切片运行时根本不被注入。
+fn unverified_warning_verified_filter(workspace_id: &str, account_id: &str) -> Document {
+    doc! {
+        "workspace_id": workspace_id,
+        "domain": "user_operations",
+        "status": "active",
+        "integrity_status": "verified",
+        "$or": [
+            { "account_id": null },
+            { "account_id": account_id }
+        ]
+    }
+}
+
 /// MP-9 / Task 16：检测 verified chunks 为 0 但 chunks 总数 > 0 的情况，
 /// 并在当日按 contact 去重写一条 `knowledge_unverified_warning` event。
 ///
@@ -98,14 +130,7 @@ pub(crate) async fn maybe_emit_unverified_warning(
         .db
         .operation_knowledge_chunks()
         .count_documents(
-            doc! {
-                "workspace_id": &contact.workspace_id,
-                "domain": "user_operations",
-                "$or": [
-                    { "account_id": null },
-                    { "account_id": &contact.account_id }
-                ]
-            },
+            unverified_warning_total_filter(&contact.workspace_id, &contact.account_id),
             None,
         )
         .await
@@ -117,15 +142,7 @@ pub(crate) async fn maybe_emit_unverified_warning(
         .db
         .operation_knowledge_chunks()
         .count_documents(
-            doc! {
-                "workspace_id": &contact.workspace_id,
-                "domain": "user_operations",
-                "integrity_status": "verified",
-                "$or": [
-                    { "account_id": null },
-                    { "account_id": &contact.account_id }
-                ]
-            },
+            unverified_warning_verified_filter(&contact.workspace_id, &contact.account_id),
             None,
         )
         .await
@@ -1141,6 +1158,48 @@ mod tests {
         let back: SelectedChunkRanking =
             mongodb::bson::from_document(doc).expect("deserialize ranking");
         assert_eq!(back.selection_prob, None);
+    }
+
+    // ---- KNOW-2：unverified-warning count filter 须对齐注入口径 ----
+
+    #[test]
+    fn unverified_warning_total_filter_pins_status_active() {
+        // 回归：total count 必须带 status="active"，否则归档（status!=active）切片
+        // 也被计入 total。注入口径 load_operation_knowledge 只取 active，两者须对齐。
+        let f = unverified_warning_total_filter("ws1", "acct1");
+        assert_eq!(f.get_str("status").ok(), Some("active"), "total filter 须钉死 status=active");
+        assert_eq!(f.get_str("workspace_id").ok(), Some("ws1"));
+        assert_eq!(f.get_str("domain").ok(), Some("user_operations"));
+        // total 不限定 integrity_status（统计所有 active 切片，含未核验）。
+        assert!(!f.contains_key("integrity_status"), "total 不应限定 integrity_status");
+    }
+
+    #[test]
+    fn unverified_warning_verified_filter_matches_injection_path() {
+        // 回归核心：verified count 须与 load_operation_knowledge 的 chunk 过滤逐字对齐
+        // （status="active" AND integrity_status="verified"）。缺 status 时，归档的
+        // 已核验切片会让 verified>0 提前 return、抑制本应发出的告警，而它们不被注入。
+        let f = unverified_warning_verified_filter("ws1", "acct1");
+        assert_eq!(
+            f.get_str("status").ok(),
+            Some("active"),
+            "verified filter 缺 status=active 会让归档已核验切片抑制告警（KNOW-2）"
+        );
+        assert_eq!(f.get_str("integrity_status").ok(), Some("verified"));
+        assert_eq!(f.get_str("workspace_id").ok(), Some("ws1"));
+        assert_eq!(f.get_str("domain").ok(), Some("user_operations"));
+    }
+
+    #[test]
+    fn unverified_warning_filters_carry_account_or_clause() {
+        // workspace+account 隔离：两 filter 都带 account_id null/本账号 的 $or。
+        for f in [
+            unverified_warning_total_filter("ws1", "acct1"),
+            unverified_warning_verified_filter("ws1", "acct1"),
+        ] {
+            let or = f.get_array("$or").expect("filter 须带 $or 账号子句");
+            assert_eq!(or.len(), 2, "$or 应含 null + 本账号两支");
+        }
     }
 }
 
