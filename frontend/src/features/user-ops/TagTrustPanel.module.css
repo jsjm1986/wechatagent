@@ -78,9 +78,5 @@
 }
 .cancelBtn:hover { color: var(--ink-1); }
 
-/* 贝叶斯占位 */
-.bayesianPlaceholder {
-  font-size: 12px; color: var(--ink-4); letter-spacing: -.1px;
-  padding: 18px; border-radius: var(--r-sm); text-align: center;
-  background: var(--fill-brand); border: 1px dashed rgba(94,92,230,.24);
-}
+/* 贝叶斯层容器 —— 紫色系（AI 身份），承载走势图 */
+.bayesianLayer { display: flex; flex-direction: column; gap: 10px; }
