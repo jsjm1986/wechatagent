@@ -3401,6 +3401,10 @@ fn build_observed_dimensions(
     decision
         .bayesian_observations
         .iter()
+        // 代码侧截断单轮观测数(设计 plans-4 line 238「最多取前 N 个，N>6 时代码侧截断」)：
+        // prompt schema 的「最多 6 个」只是软自律，畸形/超量 LLM 输出须在代码侧兜底，
+        // 防止单轮把大量互异维度整份写进 bayesian_signals。
+        .take(crate::agent::bayesian_slots::MAX_BAYESIAN_SLOTS)
         .map(|o| {
             let ev = crate::agent::tag_evidence::resolve_evidence(window, &o.evidence_turns);
             let strong = ev
@@ -3838,6 +3842,12 @@ async fn apply_agent_updates(
             min_strong_evidence: runtime.bayesian_slot_min_strong,
         };
         let observed = build_observed_dimensions(decision, window);
+        // 备案（D3-F1）：此处是无 OCC 的 read-modify-write——从本次 run 起始的 contact
+        // 快照 clone signals，apply 后整体 $set 覆盖（filter 仅 _id，无版本字段）。与
+        // memory_card 的 memory_card_version 乐观锁不同。并发场景（follow-up 任务不经
+        // webhook 去抖，与 webhook runner 可对同一 contact 时间重叠）下后写者可覆盖前写者，
+        // 丢失前者新增的 history 走势点。**因 bayesian_signals 永不驱动（仅 BayesianTrendChart
+        // 可视化）+ 写回 fail-soft，故接受 last-write-wins，不加 OCC。**
         let mut signals = contact.bayesian_signals.clone();
         let current_turn = window.len() as i32;
         crate::agent::bayesian_slots::apply_bayesian_update(
@@ -4823,6 +4833,34 @@ mod tests {
         assert_eq!(observed[0].confidence, 0.9, "confidence 作为观察值原样带入");
         assert_eq!(observed[1].dimension, "决策果断度");
         assert_eq!(observed[1].strong_evidence_count, 0, "Outbound 证据不计入强证据");
+    }
+
+    // D5-F1：单轮观测数代码侧截断到 MAX_BAYESIAN_SLOTS，防畸形/超量 LLM 输出无界写脏。
+    #[test]
+    fn build_observed_dimensions_truncates_to_max_slots() {
+        use crate::agent::bayesian_slots::MAX_BAYESIAN_SLOTS;
+        use crate::agent::types::BayesianObservationRaw;
+
+        let window: Vec<ConversationMessage> = vec![];
+        let mut decision = AgentDecision::default();
+        // 灌入远超上限的互异维度(模拟畸形 LLM 单轮回 20 个)。
+        decision.bayesian_observations = (0..20)
+            .map(|i| BayesianObservationRaw {
+                dimension: format!("维度{i}"),
+                value: "x".into(),
+                confidence: 0.5,
+                evidence_turns: vec![],
+            })
+            .collect();
+        let observed = build_observed_dimensions(&decision, &window);
+        assert_eq!(
+            observed.len(),
+            MAX_BAYESIAN_SLOTS,
+            "单轮观测须截断到 MAX_BAYESIAN_SLOTS，防无界写脏"
+        );
+        // 截断保留前 N 个(顺序稳定)。
+        assert_eq!(observed[0].dimension, "维度0");
+        assert_eq!(observed[MAX_BAYESIAN_SLOTS - 1].dimension, "维度5");
     }
 
     // ⑥ 承诺兑现观测：reply 时间承诺特征检测（弱启发，仅观测覆盖率）。
