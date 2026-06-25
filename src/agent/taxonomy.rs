@@ -351,6 +351,7 @@ pub(crate) async fn upsert_candidate(
     raw_value: &str,
     evidence: Option<&str>,
     confidence: i32,
+    suggested_display_name: Option<&str>,
 ) -> AppResult<()> {
     let now = DateTime::now();
     let collection = db.collection_taxonomy_candidates();
@@ -425,6 +426,7 @@ pub(crate) async fn upsert_candidate(
         status: "pending".to_string(),
         reviewed_at: None,
         reviewed_by: None,
+        suggested_display_name: suggested_display_name.map(|s| s.to_string()),
     };
 
     // unique index 冲突视为竞态：另一个并发 run 已经写入；忽略错误，留给下次累加。
@@ -487,7 +489,12 @@ pub(crate) async fn approve(
         kind: candidate.kind.clone(),
         value: TaxonomyValue {
             id: candidate.raw_value.clone(),
-            display_name: candidate.raw_value.clone(),
+            // 流 C：优先用 AI 生成的中文 label（候选 suggested_display_name），缺省回落
+            // 英文 raw_value id（保持与 admin approve 路径口径一致）。
+            display_name: candidate
+                .suggested_display_name
+                .clone()
+                .unwrap_or_else(|| candidate.raw_value.clone()),
             description: candidate.evidence.clone().unwrap_or_default(),
             aliases: Vec::new(),
             status: "active".to_string(),

@@ -119,6 +119,60 @@ fn coerce_scalar_string_fields(value: Value) -> Value {
     Value::Object(map)
 }
 
+/// 流 C：从 LLM 生成的 JSON 中提取每个维度的 `suggestedValues`（AI 建议的取值集），
+/// **同时把 `suggestedValues` 键从各维度对象里 remove**——仿 `stateMachine` 的 pre-normalize
+/// 抽取法（`ProfileDimension` 只有 kind/display_name/participates_in_decision/description 四
+/// 字段，无 suggestedValues；显式 remove 避免污染 `from_document` 反序列化，与 stateMachine
+/// 一致更稳）。
+///
+/// **必须在 `normalize_json_keys` 之前调用**：此时维度键仍是 camelCase（`kind` /
+/// `suggestedValues` / `id` / `label`），直接读 `dim["kind"]`、`dim["suggestedValues"]`。
+///
+/// 返回 `Vec<(kind, Vec<(id, label)>)>`：每个维度的英文 kind + 其建议取值的 (id, label) 对。
+/// 缺 `suggestedValues`、非数组、或 id/label 缺失/空 → 该维度贡献空 vec / 跳过该取值（软化）。
+fn extract_suggested_values(generated: &mut Value) -> Vec<(String, Vec<(String, String)>)> {
+    let mut out: Vec<(String, Vec<(String, String)>)> = Vec::new();
+    let Some(dims) = generated
+        .get_mut("profileDimensions")
+        .and_then(Value::as_array_mut)
+    else {
+        return out;
+    };
+    for dim in dims.iter_mut() {
+        let Some(dim_obj) = dim.as_object_mut() else {
+            continue;
+        };
+        let kind = dim_obj
+            .get("kind")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .filter(|s| !s.trim().is_empty());
+        // 无论 kind 是否有效都 remove suggestedValues（避免残留污染反序列化）。
+        let raw_values = dim_obj.remove("suggestedValues");
+        let Some(kind) = kind else { continue };
+        let mut values: Vec<(String, String)> = Vec::new();
+        if let Some(Value::Array(arr)) = raw_values {
+            for v in arr {
+                let id = v
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty());
+                let label = v
+                    .get("label")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty());
+                if let (Some(id), Some(label)) = (id, label) {
+                    values.push((id.to_string(), label.to_string()));
+                }
+            }
+        }
+        out.push((kind, values));
+    }
+    out
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GenerateProfileRequest {
@@ -201,7 +255,10 @@ fn build_profile_generation_prompt(
       "kind": "维度英文key(snake_case)",
       "displayName": "中文维度名",
       "participatesInDecision": true,
-      "description": "这个维度如何影响 AI 的判断（写给 AI 看的，不是写给人看的）"
+      "description": "这个维度如何影响 AI 的判断（写给 AI 看的，不是写给人看的）",
+      "suggestedValues": [
+        {{"id": "取值英文id(snake_case)", "label": "中文取值名"}}
+      ]
     }}
   ],
   "promptFragment": "一段真实的 AI 决策提示片段——如果你是 AI，面对一个客户，你会怎么想这些问题。要有行业灵魂，不要空洞。",
@@ -240,6 +297,7 @@ fn build_profile_generation_prompt(
 - promptFragment 要写得像一段真实思考，不是产品说明书。
 - **字段类型严格**：`promptFragment`、`description` 必须是**单个纯文本字符串**（哪怕内容很长、包含多段思考，也要写在一个字符串里，用换行分隔），**不要写成 `{{...}}` 对象或数组**。
 - `profileDimensions` **必须**给出至少 3 个维度（这是配置的核心，不能为空数组）；每个维度的 `kind` 和 `displayName` 都必须是非空字符串。
+- 每个维度尽量给 3-8 个该行业典型取值（suggestedValues）：`id` 用 snake_case 英文 canonical、`label` 用中文行业术语。这些是「建议候选」，运营审核采纳后才生效，不必穷尽。
 - `stateMachine` 是**可选**的——如果你的业务没有清晰的分阶段旅程（客户来了就一锤子买卖、或纯随性陪伴聊天），就省略它或给空的 `states` 数组，AI 运行时会自动回落到一套通用默认阶段。"#,
         business_description = business_description,
         knowledge_context = knowledge_context,
@@ -310,6 +368,10 @@ pub async fn generate_domain_profile_candidate(
         .as_object_mut()
         .and_then(|m| m.remove("stateMachine"));
 
+    // 流 C：在 normalize 之前提取每个维度的 suggestedValues（AI 建议取值），同时从
+    // 维度对象里 remove（避免污染 ProfileDimension 反序列化，与 stateMachine 同法）。
+    let suggested_values = extract_suggested_values(&mut generated);
+
     let normalized = coerce_scalar_string_fields(normalize_json_keys(generated));
     let mut doc: Document = mongodb::bson::to_document(&normalized)
         .map_err(|e| AppError::External(format!("LLM 输出非对象: {e}")))?;
@@ -379,6 +441,28 @@ pub async fn generate_domain_profile_candidate(
         .as_object_id()
         .map(|i| i.to_hex())
         .unwrap_or_default();
+
+    // 流 C：AI 建议的维度取值落候选层（绝不直接进 system_taxonomies——守「AI 永不自动
+    // verify」红线），复用运行时同一候选 → admin approve 通路。confidence 传 10（即
+    // upsert_candidate 内 clamp(0,10) 的上界，表「确定性生成的建议」；运行时 0/50 同样被
+    // 钳进 [0,10]，本字段只表强度档位、不区分来源）。scope="global"：与 taxonomy global
+    // seed 同 scope，前端 active-view scope 回落 global 可达。
+    // 失败软化（let _）：候选落库失败不阻断 profile 生成（profile 已落库）。
+    for (kind, values) in &suggested_values {
+        for (id, label) in values {
+            let _ = agent::taxonomy::upsert_candidate(
+                &state.db,
+                "global",
+                kind,
+                id,
+                None,
+                10,
+                Some(label.as_str()),
+            )
+            .await;
+        }
+    }
+
     Ok(Json(json!({
         "ok": true,
         "id": hex,
@@ -415,7 +499,7 @@ async fn next_candidate_version(
 
 #[cfg(test)]
 mod tests {
-    use super::{coerce_scalar_string_fields, normalize_json_keys, to_snake_case};
+    use super::{coerce_scalar_string_fields, extract_suggested_values, normalize_json_keys, to_snake_case};
     use serde_json::json;
 
     /// 生产输入的正确性基线:LLM 实际输出的典型 camelCase key 必须正确归一化。
@@ -506,6 +590,100 @@ mod tests {
         let out = coerce_scalar_string_fields(input);
         assert!(out["description"].is_string());
         assert!(out["description"].as_str().unwrap().contains("点1"));
+    }
+
+    /// 流 C：`extract_suggested_values` 从含 suggestedValues 的维度提取 (id,label) 对，
+    /// 并把 suggestedValues 键从维度对象 remove（避免污染 ProfileDimension 反序列化）。
+    #[test]
+    fn extract_suggested_values_collects_pairs_and_removes_key() {
+        let mut generated = json!({
+            "profileDimensions": [
+                {
+                    "kind": "customer_stage",
+                    "displayName": "客户阶段",
+                    "suggestedValues": [
+                        {"id": "first_contact", "label": "初次接触"},
+                        {"id": "qualified", "label": "已确认意向"}
+                    ]
+                },
+                {
+                    "kind": "intent_level",
+                    "displayName": "意向强度",
+                    "suggestedValues": [{"id": "hot", "label": "高意向"}]
+                }
+            ]
+        });
+        let out = extract_suggested_values(&mut generated);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].0, "customer_stage");
+        assert_eq!(
+            out[0].1,
+            vec![
+                ("first_contact".to_string(), "初次接触".to_string()),
+                ("qualified".to_string(), "已确认意向".to_string()),
+            ]
+        );
+        assert_eq!(out[1].0, "intent_level");
+        assert_eq!(out[1].1, vec![("hot".to_string(), "高意向".to_string())]);
+        // suggestedValues 键必须已从每个维度对象 remove（否则 normalize 后污染反序列化）。
+        let dims = generated["profileDimensions"].as_array().unwrap();
+        for dim in dims {
+            assert!(
+                dim.get("suggestedValues").is_none(),
+                "suggestedValues 须被 remove"
+            );
+        }
+    }
+
+    /// 流 C：缺 suggestedValues 的维度 → 提取得空 vec、不 panic、维度本身仍正常
+    /// （`from_document` 后 profile_dimensions 不含 suggestedValues 键）。
+    #[test]
+    fn extract_suggested_values_missing_is_empty_and_dim_survives() {
+        let mut generated = json!({
+            "profileDimensions": [
+                {"kind": "trust", "displayName": "信任", "description": "x"}
+            ]
+        });
+        let out = extract_suggested_values(&mut generated);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].0, "trust");
+        assert!(out[0].1.is_empty(), "缺 suggestedValues → 空 vec");
+
+        // 提取后维度经 normalize → from_document 仍正常，不含 suggestedValues 键。
+        let normalized = coerce_scalar_string_fields(normalize_json_keys(generated));
+        let doc = to_profile_doc(normalized);
+        let profile: crate::models::DomainProfile =
+            mongodb::bson::from_document(doc).expect("缺 suggestedValues 应能反序列化");
+        assert_eq!(profile.profile_dimensions[0].kind, "trust");
+    }
+
+    /// 流 C：完全没有 profileDimensions / 非数组 → 提取得空 vec（软化，不 panic）。
+    #[test]
+    fn extract_suggested_values_no_dimensions_returns_empty() {
+        let mut none = json!({ "displayName": "x" });
+        assert!(extract_suggested_values(&mut none).is_empty());
+        let mut not_array = json!({ "profileDimensions": "oops" });
+        assert!(extract_suggested_values(&mut not_array).is_empty());
+    }
+
+    /// 流 C：取值缺 id 或 label / 空串 → 跳过该取值（软化），有效的保留。
+    #[test]
+    fn extract_suggested_values_skips_incomplete_values() {
+        let mut generated = json!({
+            "profileDimensions": [{
+                "kind": "stage",
+                "suggestedValues": [
+                    {"id": "ok", "label": "有效"},
+                    {"id": "", "label": "空id"},
+                    {"id": "no_label"},
+                    {"label": "无id"},
+                    {"id": "blank_label", "label": "  "}
+                ]
+            }]
+        });
+        let out = extract_suggested_values(&mut generated);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].1, vec![("ok".to_string(), "有效".to_string())]);
     }
 
     /// 把 brief 给的「裁剪版」LLM 输出补齐成 `from_document` 可反序列化的完整 doc：注入
