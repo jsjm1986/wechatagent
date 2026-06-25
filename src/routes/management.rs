@@ -186,6 +186,7 @@ pub(super) async fn post_management_message(
         .as_object_id()
         .ok_or_else(|| AppError::External("command run id missing".to_string()))?;
     let mut calls = Vec::new();
+    let mut outcomes: Vec<(String, ToolOutcome)> = Vec::new();
     let mut failed = None;
     let requires_confirmation =
         plan.requires_confirmation || plan.risk_level.eq_ignore_ascii_case("dangerous");
@@ -219,13 +220,21 @@ pub(super) async fn post_management_message(
             .ok_or_else(|| AppError::External("tool call id missing".to_string()))?;
         let result =
             execute_management_tool(&state, &admin.current_workspace, &payload.account_id, planned, effective_dry_run, &advertised_tools).await;
-        let succeeded_status = if should_dry_run_tool(&planned.tool_name, effective_dry_run) {
-            "dry_run"
-        } else {
-            "succeeded"
-        };
+        let is_dry_run = should_dry_run_tool(&planned.tool_name, effective_dry_run);
         match result {
             Ok(response) => {
+                // RPC 返 Ok 不等于业务成功：核实真实结果（dry_run 不核实，视为 Succeeded）。
+                let outcome = if is_dry_run {
+                    ToolOutcome::Succeeded
+                } else {
+                    assert_tool_outcome(&planned.tool_name, &response)
+                };
+                let status_str = match (&outcome, is_dry_run) {
+                    (_, true) => "dry_run",
+                    (ToolOutcome::Succeeded, _) => "succeeded",
+                    (ToolOutcome::Failed(_), _) => "failed",
+                    (ToolOutcome::Unverified(_), _) => "executed_unverified",
+                };
                 let response_doc = to_document(&response).ok();
                 state
                     .db
@@ -234,7 +243,7 @@ pub(super) async fn post_management_message(
                         doc! { "_id": call_id },
                         doc! {
                             "$set": {
-                                "status": succeeded_status,
+                                "status": status_str,
                                 "response": response_doc,
                                 "updated_at": DateTime::now()
                             }
@@ -246,9 +255,17 @@ pub(super) async fn post_management_message(
                     "id": call_id.to_hex(),
                     "toolName": planned.tool_name,
                     "arguments": planned.arguments,
-                    "status": succeeded_status,
+                    "status": status_str,
                     "response": response
                 }));
+                outcomes.push((planned.tool_name.clone(), outcome.clone()));
+                // 业务 Failed 走的是 Ok(response) 分支（RPC 成功但结果失败），
+                // 与原 Err 分支"失败即止"语义对齐：设 failed 并 break。
+                // Unverified 不算失败（已执行，仅结果待核实）→ 不设 failed、不 break。
+                if let ToolOutcome::Failed(why) = &outcome {
+                    failed = Some(why.clone());
+                    break;
+                }
             }
             Err(error) => {
                 let message = error.to_string();
@@ -317,6 +334,9 @@ pub(super) async fn post_management_message(
         }
     } else if let Some(error) = failed {
         format!("执行失败：{error}")
+    } else if !outcomes.is_empty() {
+        // spec §3.2：基于真实 outcome 汇报，区分"打算做"与"做成了什么"，不回放 plan.summary。
+        build_execution_summary(&outcomes)
     } else if plan.summary.trim().is_empty() {
         "执行完成".to_string()
     } else {
@@ -752,6 +772,22 @@ pub(super) fn assert_tool_outcome(tool_name: &str, response: &Value) -> ToolOutc
     ToolOutcome::Unverified(format!(
         "工具 '{tool_name}' 已执行，但响应结构无法确认业务结果，请核对"
     ))
+}
+
+/// 基于真实执行结果生成汇报（spec §3.2：不回放 plan.summary，区分打算做与做成了什么）。
+pub(super) fn build_execution_summary(results: &[(String, ToolOutcome)]) -> String {
+    if results.is_empty() {
+        return "没有需要执行的操作。".to_string();
+    }
+    let mut lines = Vec::new();
+    for (tool, outcome) in results {
+        match outcome {
+            ToolOutcome::Succeeded => lines.push(format!("✅ {tool}：已完成")),
+            ToolOutcome::Failed(why) => lines.push(format!("❌ {tool}：失败——{why}")),
+            ToolOutcome::Unverified(why) => lines.push(format!("⚠️ {tool}：已执行待核实——{why}")),
+        }
+    }
+    lines.join("\n")
 }
 
 /// verify 类工具：把 chunk 推向 verified 的动作。它写 source=Human（verify.rs:101），
@@ -1324,6 +1360,23 @@ mod tests {
         // readonly 查询：有数据即 Succeeded
         let r = json!({"items": []});
         assert!(matches!(assert_tool_outcome("wechatagent.query_runs", &r), ToolOutcome::Succeeded));
+    }
+
+    #[test]
+    fn execution_summary_reports_real_outcomes() {
+        let results = vec![
+            ("wechatagent.update_contact_profile".to_string(), ToolOutcome::Succeeded),
+            ("wechatagent.send_contact_message".to_string(), ToolOutcome::Failed("账号离线".to_string())),
+        ];
+        let s = build_execution_summary(&results);
+        assert!(s.contains("update_contact_profile"));
+        assert!(s.contains("失败") || s.contains("账号离线"));
+        // 不假报全部成功
+        assert!(!s.contains("全部成功"));
+
+        let unv = vec![("wechatagent.x".to_string(), ToolOutcome::Unverified("无法确认".to_string()))];
+        let s2 = build_execution_summary(&unv);
+        assert!(s2.contains("待核实") || s2.contains("无法确认"));
     }
 
     #[test]
