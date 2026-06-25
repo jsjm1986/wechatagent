@@ -621,10 +621,14 @@ pub(crate) async fn decide_reply_with_promote(
     // 只有 customer_stage/intent_level 两维（typed）→ 空串、prompt 字节等价；
     // 换非销售行业（含本专题的 purchase_lifecycle）→ 注入维度语义 + domainSignals
     // 输出位置，让维度值能真正从 LLM 流到 AgentDecision.domain_signals。
+    let taxonomy_cache = crate::agent::taxonomy::global_taxonomy_cache();
+    taxonomy_cache.find_or_load(&state.db).await;
     let task_template = format!(
         "{task_template}{}",
         super::domain_profile::render_decision_dimensions_guidance(
-            &active_profile.profile_dimensions
+            &active_profile.profile_dimensions,
+            &contact.account_id,
+            taxonomy_cache.as_ref(),
         )
     );
     // universal-domain-adaptation H9 修复（问题 A）：task final 形态契约写死的

@@ -1179,7 +1179,11 @@ pub fn decision_dimension_kinds(profile: &DomainProfile) -> Vec<String> {
 ///
 /// `dimensions` 传 `profile.profile_dimensions`；只取 `participates_in_decision=true`
 /// 且 kind 不在销售 typed 集合里的维度。`description` 非空时一并注入语义提示。
-pub fn render_decision_dimensions_guidance(dimensions: &[ProfileDimension]) -> String {
+pub fn render_decision_dimensions_guidance(
+    dimensions: &[ProfileDimension],
+    scope_account_id: &str,
+    cache: &crate::agent::taxonomy::TaxonomyCache,
+) -> String {
     let extra: Vec<&ProfileDimension> = dimensions
         .iter()
         .filter(|d| {
@@ -1203,11 +1207,33 @@ pub fn render_decision_dimensions_guidance(dimensions: &[ProfileDimension]) -> S
                 d.description.trim()
             ));
         }
+        // Task 2（流 A）：在每个 extra 维度行下注入字典合法取值（带中文名），引导 AI
+        // 优先命中字典 canonical id；无字典时明示「暂无受控取值」，让 AI 据语义判断
+        // （新取值会被写入侧收集为候选待运营确认，不阻塞决策）。
+        let values = crate::agent::taxonomy::dimension_values_with_labels(
+            &d.kind,
+            scope_account_id,
+            cache,
+        );
+        if values.is_empty() {
+            lines.push(
+                "  合法取值：暂无受控取值，请据对话语义判断；新取值会被收集为候选待运营确认。"
+                    .to_string(),
+            );
+        } else {
+            let rendered = values
+                .iter()
+                .map(|(id, label)| format!("{}（{}）", id, label))
+                .collect::<Vec<_>>()
+                .join(" / ");
+            lines.push(format!("  合法取值：{}", rendered));
+        }
     }
     format!(
         "\n\n# 本行业参与决策的画像维度（写进 domainSignals 容器）\n\
          除上面 schema 里的字段外，本行业还要在 JSON 顶层输出一个 \"domainSignals\" 对象，\
-         为下列每个维度给出当前取值（取值用简短词，能从对话或画像中解释）：\n{}\n\
+         为下列每个维度给出当前取值（取值用简短词，能从对话或画像中解释；若该维度列出了\
+         合法取值，优先用其中的 id）：\n{}\n\
          示例：\"domainSignals\": {{ {} }}。维度取值无法判断时该键留空或省略，不要臆测。",
         lines.join("\n"),
         extra
@@ -2313,15 +2339,21 @@ mod tests {
 
     #[test]
     fn decision_dimensions_guidance_empty_for_default_sales() {
+        use crate::agent::taxonomy::taxonomy_cache_for_tests;
         // DEFAULT 销售域只有 customer_stage/intent_level（均为 typed）→ 过滤后空 →
         // 空串、Reply Agent / 初始画像 prompt 字节不变、销售零扰动。
         let p = default_domain_profile("ws-1");
-        assert_eq!(render_decision_dimensions_guidance(&p.profile_dimensions), "");
-        assert_eq!(render_decision_dimensions_guidance(&[]), "");
+        let cache = taxonomy_cache_for_tests(vec![]);
+        assert_eq!(
+            render_decision_dimensions_guidance(&p.profile_dimensions, "ws-1", &cache),
+            ""
+        );
+        assert_eq!(render_decision_dimensions_guidance(&[], "ws-1", &cache), "");
     }
 
     #[test]
     fn decision_dimensions_guidance_lists_non_sales_dimensions() {
+        use crate::agent::taxonomy::taxonomy_cache_for_tests;
         // 非销售「参与决策」维度 → 进指引 + 提示走 domainSignals 容器；
         // participates_in_decision=false 的维度不进；销售 typed 两维即便在场也不进。
         let dims = vec![
@@ -2344,7 +2376,8 @@ mod tests {
                 description: String::new(),
             },
         ];
-        let out = render_decision_dimensions_guidance(&dims);
+        let cache = taxonomy_cache_for_tests(vec![]);
+        let out = render_decision_dimensions_guidance(&dims, "ws-1", &cache);
         assert!(out.contains("domainSignals"), "应告知 LLM 走 domainSignals 容器");
         assert!(out.contains("purchase_lifecycle"), "非销售参与决策维度进指引");
         assert!(out.contains("购买生命周期"), "带 display_name");
@@ -2357,5 +2390,65 @@ mod tests {
             !out.contains("anniversaries"),
             "participates_in_decision=false 的维度不进决策指引"
         );
+    }
+
+    /// Task 2（流 A）：extra 维度有字典取值时，注入「合法取值：id（label）/ ...」。
+    #[test]
+    fn dimensions_guidance_injects_dict_values_when_present() {
+        use crate::agent::taxonomy::taxonomy_cache_for_tests;
+        use crate::models::{TaxonomyEntry, TaxonomyValue};
+        use mongodb::bson::DateTime;
+
+        fn entry(kind: &str, id: &str, label: &str) -> TaxonomyEntry {
+            TaxonomyEntry {
+                id: None,
+                scope: "global".to_string(),
+                kind: kind.to_string(),
+                value: TaxonomyValue {
+                    id: id.to_string(),
+                    display_name: label.to_string(),
+                    description: String::new(),
+                    aliases: Vec::new(),
+                    status: "active".to_string(),
+                    priority_weight: None,
+                    is_terminal: false,
+                    is_reactivation_target: false,
+                },
+                updated_at: DateTime::now(),
+                version: 1,
+                current_version: true,
+                previous_version: None,
+                seeded_by: None,
+            }
+        }
+
+        let cache = taxonomy_cache_for_tests(vec![
+            entry("emotion_state", "anxious", "焦虑"),
+            entry("emotion_state", "calm", "平静"),
+        ]);
+        let dims = vec![ProfileDimension {
+            kind: "emotion_state".to_string(),
+            display_name: "情绪状态".to_string(),
+            participates_in_decision: true,
+            description: "客户当前情绪".to_string(),
+        }];
+        let out = render_decision_dimensions_guidance(&dims, "acct1", &cache);
+        assert!(out.contains("anxious（焦虑）"), "应注入字典取值: {out}");
+        assert!(out.contains("calm（平静）"), "应注入字典取值: {out}");
+    }
+
+    /// Task 2（流 A）：extra 维度无字典取值时，明示「暂无受控取值」。
+    #[test]
+    fn dimensions_guidance_marks_no_dict_when_empty() {
+        use crate::agent::taxonomy::taxonomy_cache_for_tests;
+        let cache = taxonomy_cache_for_tests(vec![]);
+        let dims = vec![ProfileDimension {
+            kind: "vibe".to_string(),
+            display_name: "氛围".to_string(),
+            participates_in_decision: true,
+            description: String::new(),
+        }];
+        let out = render_decision_dimensions_guidance(&dims, "acct1", &cache);
+        assert!(out.contains("暂无受控取值"), "无字典应提示: {out}");
     }
 }

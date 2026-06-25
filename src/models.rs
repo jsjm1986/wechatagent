@@ -2771,6 +2771,12 @@ pub struct TaxonomyCandidate {
     pub status: String,
     pub reviewed_at: Option<DateTime>,
     pub reviewed_by: Option<String>,
+    /// 流 C（行业配置 agent 化）：AI 生成 profile 时为该取值建议的中文 display_name。
+    /// 管理员审核 approve 时预填 label 用它（缺省回落英文 raw_value id）。运行时
+    /// 候选路径（decision/gateway）不知 label，写 `None`。`#[serde(default)]` 保证
+    /// 存量候选文档向后兼容（缺省 None）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub suggested_display_name: Option<String>,
 }
 
 /// 数字分身建议链 T5：`relationship_type_suggestions` 集合结构。
@@ -5194,6 +5200,7 @@ mod typed_tests {
             status: "pending".to_string(),
             reviewed_at: None,
             reviewed_by: None,
+            suggested_display_name: None,
         };
 
         let doc = mongodb::bson::to_document(&candidate).expect("serialize TaxonomyCandidate");

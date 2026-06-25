@@ -109,7 +109,7 @@ fn spawn_candidate_upserts(
     tokio::spawn(async move {
         for (kind, raw) in candidates {
             if let Err(err) =
-                upsert_candidate(&db, &scope, &kind, &raw, None, 0).await
+                upsert_candidate(&db, &scope, &kind, &raw, None, 0, None).await
             {
                 tracing::warn!(
                     kind = %kind,
