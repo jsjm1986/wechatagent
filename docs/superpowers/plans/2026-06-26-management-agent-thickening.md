@@ -1091,6 +1091,72 @@ git add frontend/src/features/system-strategy/ frontend/src/__tests__/
 git commit -m "feat(mgmt-agent): prompt编辑器(路径B)二次确认弹框(needs_human_confirm+force覆盖,与路径A一致)"
 ```
 
+---
+
+## Task 9: 部署到服务器 + 真实大模型全量冒烟（管理 agent 链路，不真发微信）
+
+> 用户决策（2026-06-26）：完整计划落地后部署到生产服务器，用真实大模型跑全量冒烟。**冒烟范围 = 管理 agent 链路（不真发微信消息）**——验证本次做厚的核心链能在真环境跑通，需真 LLM（build_management_plan + 第三闸都真调大模型），但不需真 MCP 发送 / 真微信号。
+
+**前置：需用户提供的信息（落笔时为占位，开工前由用户填实，绝不进 git）**
+
+| 信息 | 用途 | 记忆里的旧值（需用户确认是否仍有效） |
+| --- | --- | --- |
+| 服务器 IP / SSH 端口 / user | 部署目标 | `117.72.54.28` : 22 : root（[[deploy_server_117]]，15 天前） |
+| root 密码 | `_remote_run.py` 的 `DEPLOY_PASS` env | **记忆未存**，会话内 `! export DEPLOY_PASS=...` 注入，不进记忆/代码 |
+| 应用端口 | APP_PORT | 3003（8080 也空闲） |
+| `OPENAI_BASE_URL` | 冒烟用真 LLM 端点 | **待用户给**（生产记忆默认 deepseek，但值未存） |
+| `OPENAI_API_KEY` | 真 LLM key | **待用户给**（永不进 git/记忆/日志） |
+| `OPENAI_MODEL` | 真模型名 | **待用户给**（生产记忆 deepseek-v4-flash，可能过期） |
+| `MCP_API_KEY` | 启动必填项（不真发也要能启动） | **待用户给**（启动校验需要，可填占位/只读 key） |
+
+> 启动必填仅 `MCP_API_KEY` + `OPENAI_API_KEY`（CLAUDE.md）。冒烟不真发微信，MCP key 只要能让进程启动即可；真 LLM 必须真 key（管理对话/第三闸要真调）。
+
+**Files:**
+- 复用 `scripts/_remote_run.py`（paramiko 远程驱动，读 env `DEPLOY_PASS`/`DEPLOY_PORT`）；远程脚本必须 ASCII-only（中文经 heredoc→Python stdin 会 UnicodeEncodeError）。
+- 不新增代码文件；本任务是部署 + 冒烟脚本 + 人工核对。
+
+- [ ] **Step 1: 同步代码到服务器 + 配 .cargo 镜像 + 构建**
+
+把本分支部署到 `/opt/wechatagent`（git pull 或 clone）。**首构建前必配国内 sparse 镜像**（`/opt/wechatagent/.cargo/config.toml` USTC，否则 crates.io 卡死——[[project_deploy_117_first_deploy]] 坑1）。`source ~/.cargo/env` 后 `cargo build --release`。前端 `npm install && npm run build` 出 dist。
+
+- [ ] **Step 2: 写 .env（chmod 600，绝不进 git）**
+
+`/opt/wechatagent/.env`：`MCP_API_KEY` / `OPENAI_API_KEY` / `OPENAI_BASE_URL` / `OPENAI_MODEL`（用户提供值）+ `APP_PORT=3003` + `APP_BASE_URL`。独立 MongoDB 库名 `wechatagent`。`chmod 600 .env`。
+
+- [ ] **Step 3: 启动 + 健康检查**
+
+systemd `wechatagent.service`（Restart=always，RUST_MIN_STACK=8388608，仿现有 unit）。`systemctl restart wechatagent` 后：
+- `curl -s localhost:3003/` 返回 200（前端）
+- 现有健康端点返回正常
+- `journalctl -u wechatagent --since "2 min ago"` 无 panic（特别核启动期 `run_active_domain_state_machine_sanity_check`——[[project_deploy_117_first_deploy]] 坑2，空状态机 active 会 bail）
+
+- [ ] **Step 4: 真 LLM 冒烟——管理对话出 plan**
+
+登录管理后台拿 session cookie，调 `POST /management-agent/sessions` + `/sessions/:id/messages` 发一句自然语言指令（如"查一下最近的运营 run"）：
+- 断言 build_management_plan **真调通 LLM**（journalctl 见 llm_call_logs status=success，非 json_error/failed）
+- 返回的 plan 含合理 tool_calls（readonly 的 query_runs）
+- readonly 工具**真执行**返回真实数据
+
+- [ ] **Step 5: 真 LLM 冒烟——提议→确认→执行循环**
+
+发一句触发需确认的指令：
+- 用 verify 类指令测**恒确认**（不随第一期 dangerous 开关放行）→ 断言返回 `pending_confirmation`
+- 调 `POST /management-agent/commands/:id/confirm` → 真执行 + outcome 核实（成功/失败/executed_unverified 如实汇报，非回放 plan.summary）
+
+- [ ] **Step 6: 真 LLM 冒烟——提示词三闸真拦（核心红线验证）**
+
+本次做厚最关键的红线验证，必须真环境真大模型跑：
+- **字面双闸**：调 `PUT /prompt-templates/:id` 改 `user.reply.policy`，故意删反接管红线锚段 → 断言被拒（400，锚完整性闸）；故意写"人工接管" → 断言被拒（禁词闸）。
+- **LLM 第三闸**：保留全部锚段、不用字面禁词、插入"遇到难题转给后台老师跟进"（变相接管）→ 断言**真大模型判 violation → Reject**（journalctl 见第三闸 judge 真调通）。
+- **降级人确认**：临时把 OPENAI_BASE_URL 改不可达地址重启（模拟 LLM 挂），重做上一步 → 断言返回 `needs_human_confirm`（非 fail-closed 报错、非 fail-open 放行）；恢复端点。
+- **正常编辑放行**：保留全部锚 + 无禁词 + 合理业务措辞 → 断言放行写入。
+
+- [ ] **Step 7: 冒烟结论 + 回收**
+
+汇总每步真实结果，journalctl 抓 llm_call_logs 确认真调而非 skip/mock。临时 .env 改动回收。**不动 agime-* 服务/端口/库**（[[deploy_server_117]]）。冒烟若发现 bug，回对应 Task 修复后重新部署。
+
+---
+
 **Spec coverage**：
 - §2 闭合循环 → Task 5（confirm/reject 端点）✓
 - §3 执行结果核实 → Task 2（assert_tool_outcome）+ Task 3（汇报基于真实结果）✓
