@@ -1651,6 +1651,34 @@ pub struct DomainField {
 ///
 /// Phase 0 仅落存储 + 加载器，运行时**暂不消费**（并行加载、零行为变化）；
 /// 消费解耦在 Phase 1。
+///
+/// # 字段如何接到运行时（加字段前先读这段，判断你的字段属于哪一类）
+///
+/// 本结构的行业可配字段**不走单一 apply 入口**——它们按**消费载体**分三类，
+/// 每类有各自的接线约定，刻意不合并（载体异构、喂不同消费者，强行统一会牺牲清晰度）：
+///
+/// 1. **runtime 标量类**（改本 run 的 `UserRuntimeParameters` 阈值/开关，如
+///    `grounding_gate_bypass_without_claim` / `distrust_self_reported_low_risk` /
+///    `threshold_overrides`）→ 收敛在 `runtime.rs` 的
+///    `UserRuntimeParameters::apply_active_profile`（gateway 加载 profile 后一次性派生）。
+///    加同类字段在那里追加一行赋值。
+///
+/// 2. **prompt 文本类**（改喂 Agent 的 prompt 文本，如 `soul_override`/`methodology_override`/
+///    `conversation_mode_policy`/`mode_gate_policy_override`/`reviewer_orientation` 等）→ 按目标
+///    prompt 分两条收敛链，约定与「新增字段标准动作」详见 `agent/domain_profile.rs` 中
+///    `apply_reply_policy_prompt_overrides`（喂 Reply Agent）/ `apply_review_system_prompt_overrides`
+///    （喂 Review Agent）上方的注释块。**不要**回到 decision.rs/review.rs 里散接。
+///
+/// 3. **有意分散读取类**（语义开关，读 profile 后就地走对应业务分支，如
+///    `transaction_facts_enabled`：交易域才注入产品/持有事实，在 decision.rs/gateway.rs
+///    多个业务点各自 `if profile.xxx` 守门；又如 `outcome_polarity`：各反馈回路经
+///    `effective_negative_outcomes`/`resolve_effective_polarity` 就地解析）→ 这类**本就该
+///    分散**，每个读取点都带 `Gxx` 收口注释 + 逐字等价护栏测试。**不要误判成「漏接线」去
+///    强行收口**——分散是设计，收口反而破坏「读开关 + 做对应分支」的就近内聚。
+///
+/// 三类共同的**反回归红线**：DEFAULT 销售 profile（override 全 None/空）→ 每条接线均
+/// 原样回落 → 销售域**字节等价**。任何新字段都要补一条「DEFAULT 下输出 == 改造前」的护栏
+/// 测试（范式见 `domain_profile.rs` 的 `*_default_is_byte_identical` / `*_matches_hardcoded_verbatim`）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DomainProfile {
     #[serde(rename = "_id", skip_serializing_if = "Option::is_none")]
