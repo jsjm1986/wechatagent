@@ -572,3 +572,128 @@ async fn illegal_stage_jump_keeps_old_stage_and_audits_failsoft() {
         log.final_review_status
     );
 }
+
+// ───────────────────────────────────────────────────────────────────────
+// D7-F1：customer_stage 弱证据双层快通道（铁律5）的 gateway 接线 E2E。
+//
+// 此前 stage 强弱判定的纯函数零件（stage_realtime_write_allowed / evidence_strength /
+// resolve_evidence）单测齐全，但 apply_agent_updates 里把它们组合的实际行为——
+// weak_stage_drop 同时触发 (a) write_stage_observation 落 tag_observation 暂定层 +
+// (b) signals_for_attrs 剔除 customer_stage（不写 domain_attributes）——无任何端到端断言。
+// 这两个用例钉死「弱证据双写」与「强证据实时写」两条路径。
+// ───────────────────────────────────────────────────────────────────────
+
+/// 在 reply_decision_json 基础上注入 stage 证据字段（stageEvidenceTurns / stageExplicitIntent）。
+fn reply_decision_with_stage_evidence(
+    customer_stage: &str,
+    stage_evidence_turns: Vec<i32>,
+    stage_explicit_intent: bool,
+) -> serde_json::Value {
+    let mut v = reply_decision_json(customer_stage, customer_stage);
+    v["stageEvidenceTurns"] = json!(stage_evidence_turns);
+    v["stageExplicitIntent"] = json!(stage_explicit_intent);
+    v
+}
+
+/// 查 contact 的 domain_attributes.customer_stage。
+async fn reload_domain_stage(app: &common::TestApp, contact: &Contact) -> Option<String> {
+    app.state
+        .db
+        .contacts()
+        .find_one(doc! { "_id": contact.id }, None)
+        .await
+        .expect("query contact")
+        .expect("contact present")
+        .domain_attributes
+        .and_then(|d| d.get_str("customer_stage").ok().map(|s| s.to_string()))
+}
+
+/// 查 source=tag_observation 且含 customer_stage 维度的 pending 暂定层记录条数。
+async fn count_stage_observations(app: &common::TestApp, contact: &Contact) -> u64 {
+    app.state
+        .db
+        .memory_candidates()
+        .count_documents(
+            doc! {
+                "contact_wxid": &contact.wxid,
+                "source": "tag_observation",
+                "status": "pending",
+                "candidates.dimension": "customer_stage",
+            },
+            None,
+        )
+        .await
+        .expect("count stage observations")
+}
+
+/// 用例 A：**弱证据**（stageExplicitIntent=false，即便锚 Inbound 仍判 Weak）→
+/// 落 tag_observation 暂定层 + **不写** domain_attributes.customer_stage（保持缺失）。
+#[tokio::test]
+#[ignore]
+async fn weak_stage_evidence_drops_to_observation_not_domain_attrs() {
+    let app = common::TestApp::start().await;
+    let mut contact = make_managed_contact("user_d7_weak", "new_contact");
+    // stage 状态机的 prev_stage 读 domain_attributes.customer_stage（非 operation_state）。
+    // 预置为 new_contact，使 → relationship_building 合法迁移（否则 from=None→非 initial 态被拒）。
+    contact.domain_attributes = Some(doc! { "customer_stage": "new_contact" });
+    app.state.db.contacts().insert_one(&contact, None).await.expect("insert contact");
+    // 窗口序位 0 = 这条 Inbound（升序最早）。stageEvidenceTurns=[0] 能 resolve 出非空证据，
+    // 但 stageExplicitIntent=false → evidence_strength 判 Weak → 走 weak_stage_drop。
+    let inbound = make_inbound(&contact, "msg_d7_weak_001", "嗯，我再想想看吧。");
+    app.state.db.messages().insert_one(&inbound, None).await.expect("insert inbound");
+
+    app.llm.push_response(reply_decision_with_stage_evidence("relationship_building", vec![0], false));
+    app.llm.push_response(review_pass_json());
+
+    handle_managed_message(&app.state, contact.clone(), &inbound)
+        .await
+        .expect("handle_managed_message ok");
+
+    // (a) 落一条 customer_stage 暂定层 observation。
+    assert_eq!(
+        count_stage_observations(&app, &contact).await,
+        1,
+        "弱证据 stage 应落一条 tag_observation 暂定层记录"
+    );
+    // (b) domain_attributes.customer_stage 未被实时写入新值（保持预置的旧值 new_contact）。
+    assert_eq!(
+        reload_domain_stage(&app, &contact).await.as_deref(),
+        Some("new_contact"),
+        "弱证据 stage 不应写新值，应保持旧值 new_contact"
+    );
+}
+
+/// 用例 B（对照）：**强证据**（Inbound + stageExplicitIntent=true）→ 实时写
+/// domain_attributes.customer_stage + **不**落暂定层 observation。
+#[tokio::test]
+#[ignore]
+async fn strong_stage_evidence_writes_domain_attrs_not_observation() {
+    let app = common::TestApp::start().await;
+    let mut contact = make_managed_contact("user_d7_strong", "new_contact");
+    // 同弱证据用例：预置 domain_attributes.customer_stage=new_contact 使 → relationship_building 合法。
+    contact.domain_attributes = Some(doc! { "customer_stage": "new_contact" });
+    app.state.db.contacts().insert_one(&contact, None).await.expect("insert contact");
+    let inbound = make_inbound(&contact, "msg_d7_strong_001", "我明确想推进，咱们继续聊吧。");
+    app.state.db.messages().insert_one(&inbound, None).await.expect("insert inbound");
+
+    // Inbound 锚定 + explicit=true → Strong → 实时写状态机（relationship_building 合法 from new_contact）。
+    app.llm.push_response(reply_decision_with_stage_evidence("relationship_building", vec![0], true));
+    app.llm.push_response(review_pass_json());
+
+    handle_managed_message(&app.state, contact.clone(), &inbound)
+        .await
+        .expect("handle_managed_message ok");
+
+    // (a) 强证据实时写 domain_attributes.customer_stage。
+    assert_eq!(
+        reload_domain_stage(&app, &contact).await.as_deref(),
+        Some("relationship_building"),
+        "强证据 stage 应实时写 domain_attributes.customer_stage"
+    );
+    // (b) 不落暂定层 observation（强证据直接写库，不走 weak_stage_drop）。
+    assert_eq!(
+        count_stage_observations(&app, &contact).await,
+        0,
+        "强证据 stage 不应落 tag_observation 暂定层"
+    );
+}

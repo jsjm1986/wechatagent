@@ -52,7 +52,7 @@
   - `pub const MAX_BAYESIAN_SLOTS: usize = 6;`
   - `pub struct SlotPromotionThreshold { pub min_hits: i32, pub min_strong_evidence: i32 }`（可配，默认 min_hits=3 / min_strong=2）
   - `pub fn should_promote(hit_count: i32, strong_evidence_count: i32, th: &SlotPromotionThreshold) -> bool`
-  - `pub fn should_evict(signal: &BayesianSignal, turns_absent: i32, max_absent: i32, low_conf: f64) -> bool`
+  - ~~`pub fn should_evict(signal: &BayesianSignal, turns_absent: i32, max_absent: i32, low_conf: f64) -> bool`~~ —— **按 Option B / YAGNI 决策删除（未实现）**：bayesian_signals 是永不驱动旁路，槽僵化零业务影响；Step 验收弹性以 4 个不变量测试为准（不含淘汰）。详见交叉验证 D5-F2。
   - `pub fn apply_bayesian_update(signals: &mut Vec<BayesianSignal>, observed: &[ObservedDimension], turn: i32, th: &SlotPromotionThreshold)` —— 增量更新：已占槽的更新 history（封顶 100），未占槽的累积，达阈值才 lock 占槽（满 6 则排队）。
 
 - [ ] **Step 1: 写失败测试**
@@ -139,6 +139,7 @@ pub fn should_promote(hit_count: i32, strong_evidence_count: i32, th: &SlotPromo
 }
 
 /// 淘汰门（对称高阈值）：连续缺席多轮 + 当前置信低。
+/// **注：按 Option B / YAGNI 决策最终未实现（永不驱动旁路，槽僵化零业务影响）。下方为原设计示意，保留备查。**
 pub fn should_evict(signal: &BayesianSignal, turns_absent: i32, max_absent: i32, low_conf: f64) -> bool {
     turns_absent >= max_absent && signal.current_confidence < low_conf
 }
@@ -451,7 +452,7 @@ git commit -m "test(tag-trust): guard bayesian/personality never drive planner h
 - AI 自由发现维度 → Task 2（LLM 输出 dimension 自命名）✓
 - 严谨两阶段占槽（多轮+强证据，一两句不占）→ Task 1（should_promote + single_mention_never 测试）✓
 - 可配阈值 → Task 2 ✓
-- 低置信淘汰 → Task 1（should_evict）✓
+- 低置信淘汰 → **按 Option B / YAGNI 删除，未实现**（should_evict 不落地；永不驱动旁路，槽僵化零业务影响。见 D5-F2）
 - history 封顶 100 → Task 1（history_capped 测试）✓
 - 永不驱动 → Task 4（契约测试）✓
 - 压缩时大五、只压缩更新 → Task 3（在 consolidate_inner 内）✓

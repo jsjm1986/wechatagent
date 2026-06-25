@@ -655,6 +655,7 @@ pub(super) async fn update_manual_tags(
     let object_id = parse_object_id(&id)?;
     let _ = find_contact_by_id(&state, &admin.current_workspace, &id).await?; // 存在 + workspace scope 校验
     let cleaned = normalize_manual_tags(&payload.tags);
+    validate_manual_tags(&cleaned)?;
     state
         .db
         .contacts()
@@ -684,6 +685,28 @@ pub(crate) fn normalize_manual_tags(raw: &[String]) -> Vec<String> {
         }
     }
     out
+}
+
+/// 单标签字符上限。运营自由文本，但需兜底防超长标签膨胀 reply prompt。
+pub(crate) const MANUAL_TAG_MAX_CHARS: usize = 64;
+/// 标签条数上限。
+pub(crate) const MANUAL_TAGS_MAX_COUNT: usize = 32;
+
+/// 尺寸兜底校验（与 custom_agent_instructions 的 1000 字符上限同纪律）：
+/// manual_tags 经 render_tags_for_prompt join 进 reply prompt，无上限会膨胀 token。
+/// 入参须为已 normalize 的标签。
+pub(crate) fn validate_manual_tags(tags: &[String]) -> Result<(), AppError> {
+    if tags.len() > MANUAL_TAGS_MAX_COUNT {
+        return Err(AppError::BadRequest(format!(
+            "manual_tags 条数上限 {MANUAL_TAGS_MAX_COUNT} 个"
+        )));
+    }
+    if let Some(t) = tags.iter().find(|t| t.chars().count() > MANUAL_TAG_MAX_CHARS) {
+        return Err(AppError::BadRequest(format!(
+            "单个 manual_tag 长度上限 {MANUAL_TAG_MAX_CHARS} 字符（超限：{t}）"
+        )));
+    }
+    Ok(())
 }
 
 /// stage 是否算"发生变更"（决定 insert_domain_stage_fields 是否刷 customer_stage_updated_at）。
@@ -1093,5 +1116,26 @@ mod tests {
             normalize_manual_tags(&["".to_string(), "  ".to_string()]),
             Vec::<String>::new()
         );
+    }
+
+    #[test]
+    fn validate_manual_tags_accepts_within_limits() {
+        let tags: Vec<String> = (0..MANUAL_TAGS_MAX_COUNT).map(|i| format!("标签{i}")).collect();
+        assert!(validate_manual_tags(&tags).is_ok(), "正好满额应通过");
+        assert!(validate_manual_tags(&["a".repeat(MANUAL_TAG_MAX_CHARS)]).is_ok(), "正好满长应通过");
+        assert!(validate_manual_tags(&[]).is_ok());
+    }
+
+    #[test]
+    fn validate_manual_tags_rejects_too_many() {
+        let tags: Vec<String> =
+            (0..MANUAL_TAGS_MAX_COUNT + 1).map(|i| format!("标签{i}")).collect();
+        assert!(validate_manual_tags(&tags).is_err(), "超条数上限应拒绝");
+    }
+
+    #[test]
+    fn validate_manual_tags_rejects_too_long() {
+        let tags = vec!["x".repeat(MANUAL_TAG_MAX_CHARS + 1)];
+        assert!(validate_manual_tags(&tags).is_err(), "超单标签长度应拒绝");
     }
 }
