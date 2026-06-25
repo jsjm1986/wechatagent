@@ -683,7 +683,10 @@ async fn dump_d7_diag(app: &common::TestApp, contact: &Contact, label: &str) {
 #[ignore]
 async fn weak_stage_evidence_drops_to_observation_not_domain_attrs() {
     let app = common::TestApp::start().await;
-    let contact = make_managed_contact("user_d7_weak", "new_contact");
+    let mut contact = make_managed_contact("user_d7_weak", "new_contact");
+    // stage 状态机的 prev_stage 读 domain_attributes.customer_stage（非 operation_state）。
+    // 预置为 new_contact，使 → relationship_building 合法迁移（否则 from=None→非 initial 态被拒）。
+    contact.domain_attributes = Some(doc! { "customer_stage": "new_contact" });
     app.state.db.contacts().insert_one(&contact, None).await.expect("insert contact");
     // 窗口序位 0 = 这条 Inbound（升序最早）。stageEvidenceTurns=[0] 能 resolve 出非空证据，
     // 但 stageExplicitIntent=false → evidence_strength 判 Weak → 走 weak_stage_drop。
@@ -705,11 +708,11 @@ async fn weak_stage_evidence_drops_to_observation_not_domain_attrs() {
         1,
         "弱证据 stage 应落一条 tag_observation 暂定层记录"
     );
-    // (b) domain_attributes.customer_stage 未被实时写入（保持缺失/旧值）。
+    // (b) domain_attributes.customer_stage 未被实时写入新值（保持预置的旧值 new_contact）。
     assert_eq!(
-        reload_domain_stage(&app, &contact).await,
-        None,
-        "弱证据 stage 不应写 domain_attributes.customer_stage"
+        reload_domain_stage(&app, &contact).await.as_deref(),
+        Some("new_contact"),
+        "弱证据 stage 不应写新值，应保持旧值 new_contact"
     );
 }
 
@@ -719,7 +722,9 @@ async fn weak_stage_evidence_drops_to_observation_not_domain_attrs() {
 #[ignore]
 async fn strong_stage_evidence_writes_domain_attrs_not_observation() {
     let app = common::TestApp::start().await;
-    let contact = make_managed_contact("user_d7_strong", "new_contact");
+    let mut contact = make_managed_contact("user_d7_strong", "new_contact");
+    // 同弱证据用例：预置 domain_attributes.customer_stage=new_contact 使 → relationship_building 合法。
+    contact.domain_attributes = Some(doc! { "customer_stage": "new_contact" });
     app.state.db.contacts().insert_one(&contact, None).await.expect("insert contact");
     let inbound = make_inbound(&contact, "msg_d7_strong_001", "我明确想推进，咱们继续聊吧。");
     app.state.db.messages().insert_one(&inbound, None).await.expect("insert inbound");
