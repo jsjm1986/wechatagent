@@ -180,7 +180,8 @@ async fn async_main() -> anyhow::Result<()> {
         .0,
         jwt_keys: jwt_keys_arc,
     };
-    prompts::ensure_prompt_pack_v2(
+    // 启动期 LRU 缓存尚未建立，无需 bump；显式忽略返回的"是否写入"bool，保留 ? 传播错误。
+    let _ = prompts::ensure_prompt_pack_v2(
         &state.db,
         &state.config.default_workspace_id,
         &state.config.default_account_id,
