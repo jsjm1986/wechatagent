@@ -91,7 +91,13 @@ fn normalize_json_keys(value: Value) -> Value {
 /// 标量字段外，再对 `profile_dimensions`（normalize 后是 snake key）数组每个元素的
 /// `description` 做同样压平。其余数组/嵌套结构不动。
 fn coerce_scalar_string_fields(value: Value) -> Value {
-    const SCALAR_STRING_KEYS: &[&str] = &["description", "prompt_fragment"];
+    const SCALAR_STRING_KEYS: &[&str] = &[
+        "description",
+        "prompt_fragment",
+        "soul_override",
+        "methodology_override",
+        "conversation_mode_policy",
+    ];
     let Value::Object(mut map) = value else {
         return value;
     };
@@ -262,6 +268,9 @@ fn build_profile_generation_prompt(
     }}
   ],
   "promptFragment": "一段真实的 AI 决策提示片段——如果你是 AI，面对一个客户，你会怎么想这些问题。要有行业灵魂，不要空洞。",
+  "soulOverride": "本行业的 AI 人格本体——它是谁、面对客户的根本姿态。会整体替换默认人格。非销售行业建议给，纯销售可留空。",
+  "methodologyOverride": "本行业的运营方法论——客户会经历哪些阶段、每阶段怎么推进（这里写清各阶段的取值语义与推进规则）。会整体替换默认方法论。",
+  "conversationModePolicy": "本行业的对话模式判定规则——什么情况进入哪种对话模式（对应 conversationModes）。会整体替换默认判定段。",
   "conversationModes": ["这个行业真正需要的对话模式，不是填四个标准模式"],
   "businessFormulas": [
     {{"key": "公式key(camelCase)", "expression": "客户视角的可读展开式", "displayName": "中文名"}}
@@ -298,7 +307,8 @@ fn build_profile_generation_prompt(
 - **字段类型严格**：`promptFragment`、`description` 必须是**单个纯文本字符串**（哪怕内容很长、包含多段思考，也要写在一个字符串里，用换行分隔），**不要写成 `{{...}}` 对象或数组**。
 - `profileDimensions` **必须**给出至少 3 个维度（这是配置的核心，不能为空数组）；每个维度的 `kind` 和 `displayName` 都必须是非空字符串。
 - 每个维度尽量给 3-8 个该行业典型取值（suggestedValues）：`id` 用 snake_case 英文 canonical、`label` 用中文行业术语。这些是「建议候选」，运营审核采纳后才生效，不必穷尽。
-- `stateMachine` 是**可选**的——如果你的业务没有清晰的分阶段旅程（客户来了就一锤子买卖、或纯随性陪伴聊天），就省略它或给空的 `states` 数组，AI 运行时会自动回落到一套通用默认阶段。"#,
+- `stateMachine` 是**可选**的——如果你的业务没有清晰的分阶段旅程（客户来了就一锤子买卖、或纯随性陪伴聊天），就省略它或给空的 `states` 数组，AI 运行时会自动回落到一套通用默认阶段。
+- soulOverride / methodologyOverride / conversationModePolicy 是把本行业世界观「整段」写清楚——客户阶段（customer_stage 等）的取值语义、推进规则都写在这里（不要用销售词如「成交/逼单/续费」，除非你就是销售行业）。这三段决定 typed 维度对本行业的真实含义。留空则回落销售域默认。"#,
         business_description = business_description,
         knowledge_context = knowledge_context,
         display_name = display_name,
@@ -742,6 +752,82 @@ mod tests {
             !profile.profile_dimensions[0].description.is_empty(),
             "压平后的 description 须保留内容"
         );
+    }
+
+    /// Task9：AI 生成的三段 override（soulOverride / methodologyOverride /
+    /// conversationModePolicy）经 normalize_json_keys（camelCase→snake_case）+ coerce 后，
+    /// 应落到 DomainProfile 的 soul_override / methodology_override / conversation_mode_policy
+    /// （`Option<String>`，无 rename），值原样保留。
+    #[test]
+    fn generate_parses_overrides_when_present() {
+        let generated = json!({
+            "profileDimensions": [{"kind":"trust","displayName":"信任","description":"x"}],
+            "soulOverride": "我是教培行业的陪伴式顾问",
+            "methodologyOverride": "客户经历：试听→评估→报名，各阶段如下…",
+            "conversationModePolicy": "## 对话模式判定\n用户表达情绪→empathetic_support"
+        });
+        let normalized = coerce_scalar_string_fields(normalize_json_keys(generated));
+        // normalize 后键应为 snake_case，值保留。
+        assert_eq!(normalized["soul_override"], json!("我是教培行业的陪伴式顾问"));
+        assert!(normalized.get("soulOverride").is_none(), "camelCase 键不应残留");
+        // from_document 落 DomainProfile，三 Option 字段为 Some。
+        let doc = to_profile_doc(normalized);
+        let profile: crate::models::DomainProfile =
+            mongodb::bson::from_document(doc).expect("含 override 应能反序列化");
+        assert_eq!(
+            profile.soul_override.as_deref(),
+            Some("我是教培行业的陪伴式顾问")
+        );
+        assert!(profile
+            .methodology_override
+            .as_deref()
+            .unwrap()
+            .contains("试听→评估→报名"));
+        assert!(profile
+            .conversation_mode_policy
+            .as_deref()
+            .unwrap()
+            .contains("empathetic_support"));
+    }
+
+    /// Task9：不含三段 override 的输出（纯销售域，AI 留空不给）→ normalize 后无这三键 →
+    /// from_document 落 None（DEFAULT 兜底回落，逐字等价不回归）。
+    #[test]
+    fn generate_overrides_absent_default_to_none() {
+        let generated = json!({
+            "profileDimensions": [{"kind":"trust","displayName":"信任","description":"x"}]
+        });
+        let normalized = coerce_scalar_string_fields(normalize_json_keys(generated));
+        assert!(normalized.get("soul_override").is_none());
+        assert!(normalized.get("methodology_override").is_none());
+        assert!(normalized.get("conversation_mode_policy").is_none());
+        let doc = to_profile_doc(normalized);
+        let profile: crate::models::DomainProfile =
+            mongodb::bson::from_document(doc).expect("缺 override 应能反序列化");
+        assert_eq!(profile.soul_override, None);
+        assert_eq!(profile.methodology_override, None);
+        assert_eq!(profile.conversation_mode_policy, None);
+    }
+
+    /// Task9：LLM 偶发把 soulOverride 给成对象（与 description/prompt_fragment 同款风险）→
+    /// coerce_scalar_string_fields 应把 snake 化后的 soul_override 压平成 JSON 文本，内容不丢、
+    /// from_document 不报 `invalid type: map`。
+    #[test]
+    fn generate_coerces_object_soul_override_to_text() {
+        let generated = json!({
+            "profileDimensions": [{"kind":"trust","displayName":"信任","description":"x"}],
+            "soulOverride": {"身份": "顾问", "姿态": "倾听"}
+        });
+        let normalized = coerce_scalar_string_fields(normalize_json_keys(generated));
+        assert!(
+            normalized["soul_override"].is_string(),
+            "对象应被压平成字符串"
+        );
+        let doc = to_profile_doc(normalized);
+        let profile: crate::models::DomainProfile =
+            mongodb::bson::from_document(doc).expect("压平后应能反序列化");
+        let s = profile.soul_override.unwrap();
+        assert!(s.contains("顾问") && s.contains("倾听"), "内容须保留: {s}");
     }
 
     /// H13：生成 prompt 必须含 stateMachine 本体 schema，引导 AI 输出客户旅程状态机。
