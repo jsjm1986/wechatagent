@@ -205,6 +205,8 @@ export function UserOperationCockpit({
   onSimulationInput: (value: string) => void;
   onTab: (tab: SmartOpsTab) => void;
 }) {
+  const taxonomies = useProfileStore((s) => s.taxonomies);
+  const relationshipOptions = taxonomies.relationship_type ?? [];
   if (!selected) {
     return (
       <section className="cockpitEmpty">
@@ -432,9 +434,18 @@ export function UserOperationCockpit({
               onChange={(event) => onRelationshipType(event.target.value)}
             >
               <option value="">未分类</option>
-              <option value="customer">客户（销售型）</option>
-              <option value="peer">同行</option>
-              <option value="friend">朋友</option>
+              {relationshipOptions.length > 0 ? (
+                relationshipOptions.map((opt) => (
+                  <option key={opt.id} value={opt.id}>{opt.label}</option>
+                ))
+              ) : (
+                // 字典未配回落：保留原写死三项，避免下拉只剩"未分类"不可选（渐进降级）
+                <>
+                  <option value="customer">客户（销售型）</option>
+                  <option value="peer">同行</option>
+                  <option value="friend">朋友</option>
+                </>
+              )}
             </select>
             <button className="secondary" onClick={onSaveRelationshipType} disabled={busy} type="button">
               <SquarePen size={16} />
