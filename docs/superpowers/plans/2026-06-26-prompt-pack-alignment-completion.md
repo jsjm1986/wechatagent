@@ -340,6 +340,145 @@ EOF
 
 ---
 
+### Task 4: 修 LRU 缓存失效缺口——ensure_prompt_pack_v2 返回是否写入 + 运行时调用点 bump
+
+**Files:**
+- Modify: `src/prompts.rs`（`align_prompt_specs` 返回 `AppResult<bool>`；`ensure_prompt_pack_v2` 返回 `AppResult<bool>`）
+- Modify: `src/routes/prompt_templates.rs:51-56`（list 端点据返回值 bump）
+- Modify: `src/routes/souls.rs:181-188`（ensure_default_souls 据返回值 bump）
+- Modify: `src/main.rs:183-188`（启动期，显式忽略返回值——LRU 尚未建立无需 bump）
+
+**Interfaces:**
+- Consumes: `align_prompt_specs`（现 `AppResult<()>`）、`reset_prompt_pack_v2`（现 `pub AppResult<()>`，**不改其签名**）、`state.prompt_pack_version`（`AppState` 上的 `AtomicU64` LRU 计数器，`fetch_add(1, Ordering::SeqCst)`，现有 release.rs:338/645 同款用法）。
+- Produces: `ensure_prompt_pack_v2(db, workspace_id, default_account_id) -> AppResult<bool>`（`true`=本次发生写入需失效缓存）；`align_prompt_specs(db, workspace_id, account_id) -> AppResult<bool>`（任一 key 归档+重种则 true）。
+
+**背景（实现者必读）：** whole-branch 终审 Minor #1。补全后 `ensure_prompt_pack_v2` 非空库臂总是跑 `align_prompt_specs`。运行时两个调用点（`list_prompt_templates` 端点、`ensure_default_souls`）也调它——若 align 在运行时检测到 spec 漂移并写入（归档旧行+种新行），active 内容已换，但这俩调用点不 `fetch_add` 失效 LRU prompt 缓存 → 缓存继续发旧版本，直到下次别的 bump。spec 改动 2 明确承诺"对齐若产生任何写入…失效缓存"。本任务让 `ensure_prompt_pack_v2` 返回"是否写入"，运行时调用点据此 bump。`main.rs` 启动期调用无需 bump（进程刚起、LRU 缓存还没填）。
+
+**为什么不改 reset_prompt_pack_v2 签名：** 它是 `pub` 有其它调用方（grep 确认），改签名 blast radius 大。`ensure_prompt_pack_v2` 在空库臂/Err 臂调 reset 后**手动返回 `Ok(true)`**（reset 总是写入），不动 reset 自身。
+
+- [ ] **Step 1: 改 `align_prompt_specs` 返回 `AppResult<bool>`**
+
+把 `align_prompt_specs` 签名 `-> AppResult<()>` 改成 `-> AppResult<bool>`。函数体加一个 `let mut wrote = false;`（循环前），在每次实际归档+重种后（即现有 step 4a/4b 写入块所在的 `if !needs_align { continue; }` 之后、做了 update_many + insert_one 的那条路径末尾）置 `wrote = true;`。函数末尾 `Ok(())` 改 `Ok(wrote)`。
+
+注意：evolution 守卫的 `continue`（跳过 key）和"内容一致"的 `continue` 都不算写入，保持 `wrote` 不变。只有真正执行了归档+重种的 key 才置 true。
+
+- [ ] **Step 2: 改 `ensure_prompt_pack_v2` 返回 `AppResult<bool>`**
+
+签名 `-> AppResult<()>` 改 `-> AppResult<bool>`。三臂返回值：
+- `Ok(Some(_))`（非空库）：`delete_redundant_prompt_data(...).await?;` 后 `align_prompt_specs(...).await`（它现在返回 bool，直接作为该臂返回值——注意 delete_redundant 删 archived 也是写，但它只在有 archived 行时才删、且不影响 active 内容/LRU 发的是 active 行，故以 align 的 bool 为准即可，不必为 delete_redundant 额外置 true）。
+- `Ok(None)`（空库）：`reset_prompt_pack_v2(...).await?; Ok(true)`（reset 总是写）。
+- `Err(error)`（兜底）：现有 warn 事件逻辑不变，末尾 `reset_prompt_pack_v2(...).await?; Ok(true)`。
+
+- [ ] **Step 3: 改两个运行时调用点据返回值 bump**
+
+`src/routes/prompt_templates.rs:51-56`：
+```rust
+    let wrote = prompts::ensure_prompt_pack_v2(
+        &state.db,
+        &admin.current_workspace,
+        &state.config.default_account_id,
+    )
+    .await?;
+    if wrote {
+        state
+            .prompt_pack_version
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+```
+
+`src/routes/souls.rs:181-188`：
+```rust
+pub(super) async fn ensure_default_souls(state: &AppState, workspace_id: &str) -> AppResult<()> {
+    let wrote = prompts::ensure_prompt_pack_v2(
+        &state.db,
+        workspace_id,
+        &state.config.default_account_id,
+    )
+    .await?;
+    if wrote {
+        state
+            .prompt_pack_version
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+    Ok(())
+}
+```
+
+> 注：`Ordering` 若文件顶部已 `use std::sync::atomic::Ordering;` 则直接用 `Ordering::SeqCst`；否则用全路径 `std::sync::atomic::Ordering::SeqCst`。实现时先看文件顶部 import 决定。release.rs 用的是 `Ordering::SeqCst`（已 import）。
+
+- [ ] **Step 4: 改 main.rs 启动调用点显式忽略返回值**
+
+`src/main.rs:183-188` 现在 `ensure_prompt_pack_v2(...)` 返回 `()`，改返回 bool 后会有 `unused_must_use`/`unused` 风险（-Dwarnings 会挂）。启动期 LRU 缓存还没建立，无需 bump。改成 `let _ = prompts::ensure_prompt_pack_v2(...).await?;`（保留 `?` 传播错误，`let _` 吞掉 bool 返回值）。注意原代码可能是 `.await?;` 直接跟分号——看清原结构，把它改成 `let _written = ...await?;` 或在调用前加 `let _ =`。务必保留 `?` 的错误传播。
+
+- [ ] **Step 5: 写回归测试（align 返回 bool 的纯逻辑 + 运行时 bump 集成）**
+
+align 返回 bool 是它的新契约。加一个集成测试验证"运行时 list 端点遇漂移会 bump prompt_pack_version"成本高（要起路由+admin auth），**改为更聚焦的集成测试**放 `tests/prompt_pack_seeding.rs`：直接断言 `ensure_prompt_pack_v2` 的返回值语义——
+
+```rust
+/// 终审 Minor #1 回归：ensure_prompt_pack_v2 返回"是否写入",供运行时调用点据此失效 LRU。
+/// spec 漂移→返回 true；spec 一致(幂等)→返回 false。
+#[tokio::test]
+#[ignore]
+async fn ensure_returns_true_on_write_false_on_idempotent() {
+    let app = common::TestApp::start().await;
+    let workspace = app.state.config.default_workspace_id.clone();
+    let account = app.state.config.default_account_id.clone();
+
+    // 第一次重跑(spec 与 DB 一致)应幂等 → 返回 false(无写入)。
+    let wrote_idempotent = wechatagent::prompts::ensure_prompt_pack_v2(&app.state.db, &workspace, &account)
+        .await
+        .expect("rerun ensure");
+    assert!(!wrote_idempotent, "spec 一致时应幂等无写入→false");
+
+    // 制造漂移:把一个 system 行 content 改脏(不改版本号)。
+    let specs = wechatagent::prompts::prompt_specs_for_test();
+    let key = specs.first().expect("spec").0.clone();
+    app.state
+        .db
+        .prompt_templates()
+        .update_one(
+            doc! { "workspace_id": &workspace, "prompt_key": &key, "current_version": true },
+            doc! { "$set": { "content": "DRIFT_FOR_BOOL_RETURN" } },
+            None,
+        )
+        .await
+        .unwrap();
+
+    // 再跑应检测到漂移→对齐写入→返回 true。
+    let wrote_after_drift = wechatagent::prompts::ensure_prompt_pack_v2(&app.state.db, &workspace, &account)
+        .await
+        .expect("rerun ensure");
+    assert!(wrote_after_drift, "spec 漂移时对齐写入→true(供调用点失效LRU)");
+}
+```
+
+- [ ] **Step 6: 验证编译 + 全量基线门**
+
+Run: `RUSTFLAGS=-Dwarnings cargo check --tests`
+Expected: 0 error 0 warning（签名改动牵动的所有调用点都已更新；main.rs 的 `let _` 消除 unused 警告）。
+
+Run: `cargo test --lib`
+Expected: ≥ 350 passed, 0 failed。
+
+- [ ] **Step 7: 提交**
+
+```bash
+git add src/prompts.rs src/routes/prompt_templates.rs src/routes/souls.rs src/main.rs tests/prompt_pack_seeding.rs
+git commit -m "$(cat <<'EOF'
+fix(prompt-pack): ensure_prompt_pack_v2 返回是否写入,运行时调用点据此失效LRU(终审Minor#1)
+
+补全后非空库臂总是跑align,运行时list/souls端点遇spec漂移写入后未bump
+prompt_pack_version→LRU缓存继续发旧版。改ensure/align返回bool,两运行时
+调用点写后fetch_add失效缓存;main.rs启动期let _忽略(LRU未建)。兑现spec改动2
+"对齐写入必失效缓存"承诺。
+
+Co-Authored-By: Claude <noreply@anthropic.com>
+EOF
+)"
+```
+
+---
+
 ## Self-Review
 
 **1. Spec coverage（对照 spec 改动 2bis）：**
