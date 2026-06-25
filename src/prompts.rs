@@ -87,41 +87,25 @@ pub async fn ensure_prompt_pack_v2(
     workspace_id: &str,
     default_account_id: &str,
 ) -> AppResult<()> {
-    // 检测当前 workspace 是否已经种入过 v2 prompt pack。
-    // 把 status 为 "active" 或 "draft" 的模板都视为已种入：
-    // group/moment 的默认模板使用 status="draft"，运行时虽然不会注入，
-    // 但不应每次启动都把它们冲掉重新种。
-    let lookup = db
+    // spec 为真相的启动对齐：不再用 PROMPT_PACK_VERSION 做"生效闸"，而是按
+    // "库里有无任何 prompt_templates 行"分流——
+    // - 全新空库 → reset_prompt_pack_v2（首次种四集合：souls/playbook/configs/templates）
+    // - 非空库   → delete_redundant（清上一轮 archived）+ align_prompt_specs（逐 key 内容对齐）
+    // 生效判定完全交给 align 的 normalize 内容比对，所以改 spec 重启必生效、不靠版本号。
+    // 顺序铁律：delete_redundant 先、align 后——否则 align 刚归档的行会被立刻物理删除。
+    let any_existing = db
         .prompt_templates()
-        .find_one(
-            doc! {
-                "workspace_id": workspace_id,
-                "prompt_pack_version": PROMPT_PACK_VERSION,
-                "status": { "$in": ["active", "draft"] }
-            },
-            None,
-        )
+        .find_one(doc! { "workspace_id": workspace_id }, None)
         .await;
-    match lookup {
+    match any_existing {
         Ok(Some(_)) => {
+            // 非空库：清理上一轮归档行（GC），再逐 key 内容对齐。
             delete_redundant_prompt_data(db, workspace_id).await?;
-            ensure_missing_prompt_templates(db, workspace_id).await?;
-            Ok(())
+            align_prompt_specs(db, workspace_id, default_account_id).await
         }
         Ok(None) => {
-            // 区分全新空库 vs 旧版本库：
-            // - 全新空库（无任何 prompt_templates）→ reset 种四集合（souls/playbook/configs 首次种入）
-            // - 旧版本库（已有 prompt_templates 但版本不匹配）→ align 逐 key 对齐（不破坏 evolution/manual）
-            let any_existing = db
-                .prompt_templates()
-                .find_one(doc! { "workspace_id": workspace_id }, None)
-                .await?
-                .is_some();
-            if any_existing {
-                align_prompt_specs(db, workspace_id, default_account_id).await
-            } else {
-                reset_prompt_pack_v2(db, workspace_id, default_account_id).await
-            }
+            // 全新空库：首次种四集合。
+            reset_prompt_pack_v2(db, workspace_id, default_account_id).await
         }
         Err(error) => {
             // 查询异常（连接抖动、字段错乱等）时进入兜底：
@@ -154,52 +138,6 @@ pub async fn ensure_prompt_pack_v2(
             reset_prompt_pack_v2(db, workspace_id, default_account_id).await
         }
     }
-}
-
-async fn ensure_missing_prompt_templates(db: &Database, workspace_id: &str) -> AppResult<()> {
-    for spec in prompt_specs() {
-        let existing = db
-            .prompt_templates()
-            .find_one(
-                doc! {
-                    "workspace_id": workspace_id,
-                    "prompt_key": spec.key,
-                    "status": { "$in": ["active", "draft"] }
-                },
-                None,
-            )
-            .await?;
-        if existing.is_some() {
-            continue;
-        }
-        let version = next_prompt_version(db, workspace_id, spec.key).await?;
-        db.prompt_templates()
-            .insert_one(
-                PromptTemplate {
-                    id: None,
-                    workspace_id: workspace_id.to_string(),
-                    prompt_key: spec.key.to_string(),
-                    agent_kind: spec.agent_kind.to_string(),
-                    layer: spec.layer.to_string(),
-                    title: spec.title.to_string(),
-                    description: Some(spec.description.to_string()),
-                    content: spec.content.to_string(),
-                    status: spec.status.to_string(),
-                    version,
-                    prompt_pack_version: PROMPT_PACK_VERSION.to_string(),
-                    created_by: "system".to_string(),
-                    created_at: DateTime::now(),
-                    updated_at: DateTime::now(),
-                    current_version: true,
-                    previous_version: None,
-                    seeded_by: Some("system".to_string()),
-                    locale: Some(DEFAULT_LOCALE.to_string()),
-                },
-                None,
-            )
-            .await?;
-    }
-    Ok(())
 }
 
 /// 一条 prompt_template 行是否「系统种子脉络 / 可被启动对齐刷新」。
