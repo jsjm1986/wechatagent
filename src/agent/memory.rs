@@ -643,7 +643,10 @@ pub(crate) fn occ_memory_filter(
     }
 }
 
-pub(crate) async fn load_or_create_operating_memory(
+// `pub`（非 `pub(crate)`）：`tests/operating_memory_insert_idempotent.rs`（CONC-3
+// 并发首触达集成测试）需从 tests/ crate 直调本函数真链路驱动 create 分支。仿
+// `consolidate_contact_memory` 已有先例（同文件 + agent/mod.rs re-export）。
+pub async fn load_or_create_operating_memory(
     state: &AppState,
     contact: &Contact,
 ) -> AppResult<OperatingMemory> {
@@ -795,11 +798,20 @@ pub(crate) async fn load_or_create_operating_memory(
     } else {
         None
     };
-    state
+    if let Err(err) = state
         .db
         .operating_memories()
         .insert_one(&memory, None)
-        .await?;
+        .await
+    {
+        // CONC-3：首次触达 webhook（发送前）与后台任务并发 create，输给
+        // 唯一索引 (workspace_id, account_id, contact_wxid) 的一方收到 11000。
+        // 不透传（透传会让回复客户之前整轮 run 失败，且不受既成事实纪律保护），
+        // 落到下方既有的 find_one 重读分支返回赢家文档。其余错误仍透传。
+        if !crate::agent::escalation::is_duplicate_key_error(&err) {
+            return Err(err.into());
+        }
+    }
     state
         .db
         .operating_memories()
