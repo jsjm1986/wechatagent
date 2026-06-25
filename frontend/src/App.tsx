@@ -142,6 +142,7 @@ export function App() {
       .then((data) => useAccountStore.getState().setAccounts(data.items))
       .catch((err) => useUiStore.getState().setError(err instanceof Error ? err.message : String(err)));
     void useProfileStore.getState().loadActiveProfile();
+    void useProfileStore.getState().loadActiveView();
   }, []);
 
   return (

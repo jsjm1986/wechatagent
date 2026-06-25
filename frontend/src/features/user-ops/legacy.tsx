@@ -48,6 +48,7 @@ import type {
   SendHistoryItem
 } from "../../types";
 import { api } from "../../lib/api";
+import { useProfileStore, labelFor } from "../../stores/profileStore";
 
 type ActiveVersionMeta = {
   id: string;
@@ -1990,16 +1991,19 @@ function formatTime(value?: string) {
  */
 
 export function PlannerViewSection({ contact }: { contact: Contact | null }) {
+  const taxonomies = useProfileStore((s) => s.taxonomies);
   if (!contact) {
     return null;
   }
   const stageUpdatedAt = contact.domainAttributesUpdatedAt;
-  const stageLabel = (() => {
+  const stageRaw = (() => {
     const attrs = contact.domainAttributes;
     if (!attrs || typeof attrs !== "object") return "";
     const stage = (attrs as Record<string, unknown>).stage;
     return typeof stage === "string" ? stage : "";
   })();
+  // 走字典翻译：英文 canonical → 中文 display_name；按 status 分流渲染（见下方 stageNode）。
+  const stageResult = stageRaw ? labelFor(taxonomies, "customer_stage", stageRaw) : null;
   const commitments = (contact.commitments ?? []).slice(0, 5);
   const hasStage = !!stageUpdatedAt;
   const hasCommitments = commitments.length > 0;
@@ -2018,7 +2022,24 @@ export function PlannerViewSection({ contact }: { contact: Contact | null }) {
       )}
       {hasStage && (
         <div data-testid="planner-stage-row" style={{ fontSize: 13, color: "#444", marginBottom: 8 }}>
-          运营阶段 <strong>{stageLabel || "未分层"}</strong>
+          运营阶段 {(() => {
+            if (!stageResult) return <strong>未分层</strong>;
+            if (stageResult.status === "unknown_value") {
+              return (
+                <strong style={{ color: "#999" }} title="未知取值（不在当前字典内）">
+                  {stageResult.text}
+                </strong>
+              );
+            }
+            if (stageResult.status === "no_dict") {
+              return (
+                <strong style={{ color: "#999" }} title="该维度暂无取值字典，显示原始值（待配置）">
+                  {stageResult.text}
+                </strong>
+              );
+            }
+            return <strong>{stageResult.text}</strong>;
+          })()}
           ：自 <span>{formatStageTimestamp(stageUpdatedAt!)}</span> 起未变更
         </div>
       )}
