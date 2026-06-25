@@ -86,6 +86,24 @@ fn reply_has_time_commitment_feature(reply: &str) -> bool {
     MARKERS.iter().any(|m| reply.contains(m))
 }
 
+/// CONC-2：构造 commitments 的原子追加 update。`$push`+`$slice:-8` 保证并发
+/// writer 各自追加不互相覆盖（治"快照 RMW 丢累积项"），`$slice:-8` 保留最新 8
+/// 条（丢最旧，与原 `drain(0..drop)` 语义一致）。去重仍在应用层快照判定（并发
+/// 下可能写重复——接受：planner pick_commitment_emit_target 单选 +
+/// commitment_recently_emitted 按 id 幂等，重复项最多占槽不重复 emit）。
+fn build_commitment_push_update(entry: &crate::models::CommitmentEntry) -> mongodb::bson::Document {
+    let entry_bson = mongodb::bson::to_bson(entry)
+        .unwrap_or_else(|_| mongodb::bson::Bson::Document(mongodb::bson::Document::new()));
+    doc! {
+        "$push": {
+            "commitments": {
+                "$each": [entry_bson],
+                "$slice": -8i32,
+            }
+        }
+    }
+}
+
 pub async fn handle_managed_message(
     state: &AppState,
     contact: Contact,
@@ -3713,8 +3731,8 @@ async fn apply_agent_updates(
         // 到期/快到期时能 emit follow_up。PR-D：优先用结构化 decision.commitment
         // （带 dueAt），解析成 CommitmentEntry.due_at；LLM 未给结构化 commitment 时
         // 回落 last_commitment 字符串路径（due_at=None，由 planner created_at 兜底接住）。
-        let mut commitments: Vec<crate::models::CommitmentRepr> = contact.commitments.clone();
-        let already_present = commitments.iter().any(|c| c.text() == value.as_str());
+        // CONC-2：去重仍用快照判定（应用层），命中已存在则不追加。
+        let already_present = contact.commitments.iter().any(|c| c.text() == value.as_str());
         if !already_present {
             let mut entry = crate::models::CommitmentEntry::from_plain_text(value.clone());
             if let Some(c) = &decision.commitment {
@@ -3722,14 +3740,22 @@ async fn apply_agent_updates(
                     entry.due_at = crate::agent::types::parse_rfc3339_to_bson(&c.due_at);
                 }
             }
-            commitments.push(crate::models::CommitmentRepr::Structured(entry));
-            if commitments.len() > 8 {
-                let drop = commitments.len() - 8;
-                commitments.drain(0..drop);
+            // CONC-2：原子追加（$push+$slice:-8），不再走大 set_doc 的整体覆盖（$set），
+            // 避免并发 writer 各自从陈旧快照 append 互相覆盖丢累积项。
+            // 既成事实纪律：reply 已送出，此写失败只 warn 不阻断（不 `?` 透传，防重发）。
+            if let Err(e) = state
+                .db
+                .contacts()
+                .update_one(
+                    doc! { "_id": contact.id },
+                    build_commitment_push_update(&entry),
+                    None,
+                )
+                .await
+            {
+                tracing::warn!(error = %e, contact_wxid = %contact.wxid, "commitment $push 失败；reply 已送出，跳过");
             }
         }
-        let bson_commitments = mongodb::bson::to_bson(&commitments).unwrap_or(mongodb::bson::Bson::Array(Vec::new()));
-        set_doc.insert("commitments", bson_commitments);
     } else if reply_has_time_commitment_feature(&decision.reply_text) {
         // ⑥观测：reply 像做了时间承诺但 LLM 没填 commitment 字段 → 无 follow-up。
         // 仅观测 prompt 强化是否生效，不阻断、不改写、不进任何门。
@@ -4761,6 +4787,24 @@ pub(crate) fn compute_taxonomy_guard_outcome(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // CONC-2：commitments 原子追加 update 形态——$slice 必须是 -8（保留最新 8 条，
+    // 丢最旧，与原 drain(0..drop) 语义一致），$each 一次只追加一条新 entry，entry
+    // 序列化为子文档（Structured 形态）text 可取。
+    #[test]
+    fn build_commitment_push_update_shape() {
+        let entry = crate::models::CommitmentEntry::from_plain_text("明天回电".to_string());
+        let update = super::build_commitment_push_update(&entry);
+        let push = update.get_document("$push").expect("有 $push");
+        let commitments = push.get_document("commitments").expect("有 commitments");
+        // $slice 必须是 -8(保留最新 8 条,丢最旧,与原 drain(0..drop) 语义一致)
+        assert_eq!(commitments.get_i32("$slice").unwrap(), -8);
+        let each = commitments.get_array("$each").expect("有 $each");
+        assert_eq!(each.len(), 1, "一次只追加一条新 entry");
+        // entry 序列化为子文档(Structured 形态),text 字段可取
+        let entry_doc = each[0].as_document().expect("entry 是子文档");
+        assert_eq!(entry_doc.get_str("text").unwrap(), "明天回电");
+    }
 
     // media-asset Task 8：素材发送定序纯函数。当前两种 expression_pref 都「先文字后文件」。
     #[test]
