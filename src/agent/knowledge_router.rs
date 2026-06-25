@@ -276,6 +276,7 @@ pub fn format_operation_knowledge_for_prompt_with_roles(
 pub async fn test_knowledge_route_for_contact(
     state: &AppState,
     contact: Option<Contact>,
+    workspace_id: &str,
     account_id: &str,
     message: &str,
 ) -> AppResult<Document> {
@@ -284,7 +285,7 @@ pub async fn test_knowledge_route_for_contact(
     let preview_initial_state = if contact.is_none() {
         let domain_config = super::decision::load_user_operation_domain_config(
             state,
-            &state.config.default_workspace_id,
+            workspace_id,
         )
         .await?;
         super::guards::initial_operation_state_key(domain_config.as_ref())
@@ -294,7 +295,7 @@ pub async fn test_knowledge_route_for_contact(
     };
     let contact = contact.unwrap_or_else(|| Contact {
         id: None,
-        workspace_id: state.config.default_workspace_id.clone(),
+        workspace_id: workspace_id.to_string(),
         account_id: account_id.to_string(),
         wxid: "preview".to_string(),
         nickname: Some("知识命中测试".to_string()),
