@@ -95,7 +95,7 @@ async fn router_falls_back_to_top_n_when_agent_cites_nothing() {
         "sourceQuotes": [],
     }));
 
-    let result = test_knowledge_route_for_contact(&app.state, None, ACCOUNT, "随便问个问题")
+    let result = test_knowledge_route_for_contact(&app.state, None, &app.state.config.default_workspace_id, ACCOUNT, "随便问个问题")
         .await
         .expect("route");
 
@@ -191,7 +191,7 @@ async fn router_falls_back_when_agent_cites_chunks_outside_corpus() {
         }],
     }));
 
-    let result = test_knowledge_route_for_contact(&app.state, None, ACCOUNT, "查个东西")
+    let result = test_knowledge_route_for_contact(&app.state, None, &app.state.config.default_workspace_id, ACCOUNT, "查个东西")
         .await
         .expect("route");
     let route = result.get_document("route").expect("route doc");
@@ -227,7 +227,7 @@ async fn router_returns_missing_when_corpus_completely_empty() {
 
     // 不入队任何 LLM 响应；如果代码错误地走到 knowledge_agent / LLM 都会报错。
 
-    let result = test_knowledge_route_for_contact(&app.state, None, ACCOUNT, "什么都没有")
+    let result = test_knowledge_route_for_contact(&app.state, None, &app.state.config.default_workspace_id, ACCOUNT, "什么都没有")
         .await
         .expect("route");
 
