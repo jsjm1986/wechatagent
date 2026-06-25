@@ -188,6 +188,17 @@ async fn ensure_missing_prompt_templates(db: &Database, workspace_id: &str) -> A
     Ok(())
 }
 
+/// 一条 prompt_template 行是否「系统种子脉络 / 可被启动对齐刷新」。
+///
+/// 镜像 `routes::admin_ops_versions::is_refreshable_policy_seeded_by` 的白名单语义，
+/// 但**更保守**：prompt_templates 的系统种子历来都写 `seeded_by="system"`，故只认它；
+/// `evolution_release`（演化灰度）/ `manual`（运营手编）/ `system_evolution_v1`
+/// （critic 单独种）/ `None`（未打标）一律保留，绝不被启动对齐归档。
+/// 正向白名单匹配（agent-first，不用 `!=` 否定）。
+pub(crate) fn is_refreshable_prompt_seeded_by(seeded_by: &Option<String>) -> bool {
+    matches!(seeded_by.as_deref(), Some("system"))
+}
+
 pub async fn reset_prompt_pack_v2(
     db: &Database,
     workspace_id: &str,
@@ -2234,6 +2245,18 @@ mod ab_bucket_tests {
             "expected ≥6 distinct buckets out of 8, got {}",
             buckets.len()
         );
+    }
+
+    #[test]
+    fn refreshable_prompt_only_system_true() {
+        assert!(is_refreshable_prompt_seeded_by(&Some("system".to_string())));
+        // 其余脉络一律保留（不可刷新）
+        assert!(!is_refreshable_prompt_seeded_by(&Some("manual".to_string())));
+        assert!(!is_refreshable_prompt_seeded_by(&Some("evolution_release".to_string())));
+        assert!(!is_refreshable_prompt_seeded_by(&Some("system_evolution_v1".to_string())));
+        assert!(!is_refreshable_prompt_seeded_by(&Some("operator".to_string())));
+        // None 保守视为不可刷新（不照搬 domain_configs 的 None→可刷新）
+        assert!(!is_refreshable_prompt_seeded_by(&None));
     }
 }
 
