@@ -5,8 +5,8 @@
 //!   手工创建的 active / draft 模板（哪怕 prompt_key 不在 spec 中）。
 //! - 同一 workspace 上若 spec 里新增了 key（比如波 D 之前缺失的
 //!   `user.review.product_claim_markers` / `knowledge.auto_verify`），
-//!   `ensure_missing_prompt_templates` 会按 key upsert 把它们补齐，而不会因为
-//!   "版本号已匹配"整体跳过。
+//!   `align_prompt_specs` 会在该 key 缺失时（`None => true` 分支）把它们补齐，
+//!   而不会因为"版本号已匹配"整体跳过。
 //!
 //! 默认 `#[ignore]`，需要 Docker（testcontainers MongoDB）。
 
@@ -298,4 +298,68 @@ async fn align_is_idempotent_when_spec_unchanged() {
         .await
         .unwrap();
     assert_eq!(count_before, count_after, "spec 未变重跑不应新增行");
+}
+
+/// 终审 #1 核心回归：版本号匹配（不改 prompt_pack_version）但 system 行内容漂移时，
+/// 重跑 ensure_prompt_pack_v2 仍应对齐回 spec。
+/// 与 align_refreshes_drifted_system_row_and_archives_old 的区别：那个测试改旧版本号制造
+/// Ok(None)；本测试保持当前版本号（旧结构会走 Ok(Some) 不对齐），验证不再版本盲。
+#[tokio::test]
+#[ignore]
+async fn align_refreshes_drift_even_when_pack_version_matches() {
+    let app = common::TestApp::start().await;
+    let workspace = app.state.config.default_workspace_id.clone();
+    let account = app.state.config.default_account_id.clone();
+
+    let specs = wechatagent::prompts::prompt_specs_for_test();
+    let key = specs.first().expect("at least one spec").0.clone();
+
+    // 关键：不改 prompt_pack_version（保持 TestApp 种入的当前 PROMPT_PACK_VERSION）。
+    // 只把该 key 的 current system 行 content 改脏。
+    app.state
+        .db
+        .prompt_templates()
+        .update_one(
+            doc! { "workspace_id": &workspace, "prompt_key": &key, "current_version": true },
+            doc! { "$set": { "content": "DRIFT_WHILE_VERSION_MATCHES" } },
+            None,
+        )
+        .await
+        .unwrap();
+
+    // 重跑 ensure_prompt_pack_v2——新结构走非空库路径必对齐；旧版本盲结构会走 Ok(Some) 不对齐。
+    wechatagent::prompts::ensure_prompt_pack_v2(&app.state.db, &workspace, &account)
+        .await
+        .expect("rerun ensure");
+
+    // current active 行 content 不再是脏值（被 spec 覆盖）。
+    let current = app
+        .state
+        .db
+        .prompt_templates()
+        .find_one(
+            doc! { "workspace_id": &workspace, "prompt_key": &key, "current_version": true, "status": "active" },
+            None,
+        )
+        .await
+        .unwrap()
+        .expect("current row exists");
+    assert_ne!(
+        current.content, "DRIFT_WHILE_VERSION_MATCHES",
+        "版本号匹配时内容漂移也必须被对齐（不再版本盲）"
+    );
+
+    // 脏行被归档而非物删。
+    let archived = app
+        .state
+        .db
+        .prompt_templates()
+        .find_one(
+            doc! { "workspace_id": &workspace, "prompt_key": &key, "content": "DRIFT_WHILE_VERSION_MATCHES" },
+            None,
+        )
+        .await
+        .unwrap();
+    assert!(archived.is_some(), "脏行应被归档保留可回溯");
+    assert_eq!(archived.unwrap().status, "archived");
 }
