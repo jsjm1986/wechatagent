@@ -389,6 +389,7 @@ pub async fn reset_prompt_pack_v2(
                     version,
                     created_at: DateTime::now(),
                     updated_at: DateTime::now(),
+                    seeded_by: Some("system".to_string()),
                 },
                 None,
             )
