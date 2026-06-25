@@ -94,6 +94,7 @@ pub(super) async fn create_agent_soul(
         version,
         created_at: DateTime::now(),
         updated_at: DateTime::now(),
+        seeded_by: Some("manual".to_string()),
     };
     let result = state.db.agent_souls().insert_one(soul, None).await?;
     Ok(Json(
