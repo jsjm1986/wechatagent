@@ -626,6 +626,57 @@ async fn count_stage_observations(app: &common::TestApp, contact: &Contact) -> u
         .expect("count stage observations")
 }
 
+/// D7-F1 诊断 dump：落证 customer_stage 到底进没进 domain_attributes、有没有被字典校验
+/// drop（agent.dimension_dropped 事件）、active profile 声明了哪些维度。本地无 Docker
+/// 复现不了，靠 CI 把真实状态打出来再精准修测试/代码。
+async fn dump_d7_diag(app: &common::TestApp, contact: &Contact, label: &str) {
+    let reloaded = app
+        .state
+        .db
+        .contacts()
+        .find_one(doc! { "_id": contact.id }, None)
+        .await
+        .expect("query")
+        .expect("contact");
+    let dropped = app
+        .state
+        .db
+        .events()
+        .count_documents(
+            doc! { "contact_wxid": &contact.wxid, "kind": "agent.dimension_dropped" },
+            None,
+        )
+        .await
+        .unwrap_or(u64::MAX);
+    let stage_rejected = app
+        .state
+        .db
+        .events()
+        .count_documents(
+            doc! { "contact_wxid": &contact.wxid, "kind": "agent.stage_transition_rejected" },
+            None,
+        )
+        .await
+        .unwrap_or(u64::MAX);
+    let active = wechatagent::agent::load_active_domain_profile(&app.state.db, &contact.workspace_id).await;
+    let declared: Vec<&str> = active
+        .profile_dimensions
+        .iter()
+        .filter(|d| d.participates_in_decision)
+        .map(|d| d.kind.as_str())
+        .collect();
+    eprintln!(
+        "[D7诊断:{label}] operation_state={:?} domain_attributes={:?} dimension_dropped={} stage_transition_rejected={} obs={} active_profile={:?} declared={:?}",
+        reloaded.operation_state,
+        reloaded.domain_attributes,
+        dropped,
+        stage_rejected,
+        count_stage_observations(app, contact).await,
+        active.profile_id,
+        declared,
+    );
+}
+
 /// 用例 A：**弱证据**（stageExplicitIntent=false，即便锚 Inbound 仍判 Weak）→
 /// 落 tag_observation 暂定层 + **不写** domain_attributes.customer_stage（保持缺失）。
 #[tokio::test]
@@ -645,6 +696,8 @@ async fn weak_stage_evidence_drops_to_observation_not_domain_attrs() {
     handle_managed_message(&app.state, contact.clone(), &inbound)
         .await
         .expect("handle_managed_message ok");
+
+    dump_d7_diag(&app, &contact, "weak").await;
 
     // (a) 落一条 customer_stage 暂定层 observation。
     assert_eq!(
@@ -678,6 +731,8 @@ async fn strong_stage_evidence_writes_domain_attrs_not_observation() {
     handle_managed_message(&app.state, contact.clone(), &inbound)
         .await
         .expect("handle_managed_message ok");
+
+    dump_d7_diag(&app, &contact, "strong").await;
 
     // (a) 强证据实时写 domain_attributes.customer_stage。
     assert_eq!(
