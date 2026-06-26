@@ -44,6 +44,8 @@ type TaxonomyEntry = ActiveVersionMeta & {
     description?: string;
     aliases?: string[];
     status: string;
+    isReactivationTarget?: boolean;
+    isTerminal?: boolean;
   };
 };
 
@@ -54,9 +56,17 @@ type TaxonomyDraft = {
   label: string;
   aliases: string;
   description: string;
+  isReactivationTarget: boolean;
+  isTerminal: boolean;
 };
 
-type EditDraft = { label: string; aliases: string; description: string };
+type EditDraft = {
+  label: string;
+  aliases: string;
+  description: string;
+  isReactivationTarget: boolean;
+  isTerminal: boolean;
+};
 
 type LessonLearnedEntry = {
   lessonId: string;
@@ -613,11 +623,13 @@ function TaxonomiesAdmin({ busy }: { busy: boolean }) {
     label: "",
     aliases: "",
     description: "",
+    isReactivationTarget: false,
+    isTerminal: false,
   });
   const [acting, setActing] = useState(false);
   const [info, setInfo] = useState<string | null>(null);
   const [editingId, setEditingId] = useState<string | null>(null);
-  const [editDraft, setEditDraft] = useState<EditDraft>({ label: "", aliases: "", description: "" });
+  const [editDraft, setEditDraft] = useState<EditDraft>({ label: "", aliases: "", description: "", isReactivationTarget: false, isTerminal: false });
 
   async function reload() {
     setLoading(true);
@@ -658,6 +670,8 @@ function TaxonomiesAdmin({ busy }: { busy: boolean }) {
           label: createDraft.label.trim(),
           aliases,
           description: createDraft.description.trim() || undefined,
+          isTerminal: createDraft.isTerminal,
+          isReactivationTarget: createDraft.isReactivationTarget,
         },
       });
       if (res.status === 409) {
@@ -668,7 +682,7 @@ function TaxonomiesAdmin({ busy }: { busy: boolean }) {
       } else {
         setInfo(`已新增：${createDraft.id.trim()}`);
         setShowCreate(false);
-        setCreateDraft({ scope: "global", kind: "customer_stage", id: "", label: "", aliases: "", description: "" });
+        setCreateDraft({ scope: "global", kind: "customer_stage", id: "", label: "", aliases: "", description: "", isReactivationTarget: false, isTerminal: false });
       }
       await reload();
     } catch (e) {
@@ -692,6 +706,8 @@ function TaxonomiesAdmin({ busy }: { busy: boolean }) {
         label: editDraft.label.trim(),
         aliases,
         description: editDraft.description.trim(),
+        isTerminal: editDraft.isTerminal,
+        isReactivationTarget: editDraft.isReactivationTarget,
       });
       setInfo("已更新。");
       setEditingId(null);
@@ -803,6 +819,22 @@ function TaxonomiesAdmin({ busy }: { busy: boolean }) {
             <textarea className={styles.textarea} value={createDraft.description}
               onChange={(e) => setCreateDraft({ ...createDraft, description: e.target.value })} />
           </label>
+          <label className={styles.inlineCheckbox}>
+            <input
+              type="checkbox"
+              checked={createDraft.isReactivationTarget}
+              onChange={(e) => setCreateDraft({ ...createDraft, isReactivationTarget: e.target.checked })}
+            />
+            可作再激活目标 is_reactivation_target
+          </label>
+          <label className={styles.inlineCheckbox}>
+            <input
+              type="checkbox"
+              checked={createDraft.isTerminal}
+              onChange={(e) => setCreateDraft({ ...createDraft, isTerminal: e.target.checked })}
+            />
+            终态 is_terminal
+          </label>
           <div className={styles.buttonRow}>
             <button type="button" className={styles.btnPrimary} onClick={() => void submitCreate()} disabled={acting}>保存</button>
             <button type="button" className={styles.btnGhost} onClick={() => setShowCreate(false)} disabled={acting}>取消</button>
@@ -851,7 +883,7 @@ function TaxonomiesAdmin({ busy }: { busy: boolean }) {
             {editingId !== item.id && item.currentVersion !== false && (
               <div className={styles.buttonRow}>
                 <button type="button" className={styles.btnGhost}
-                  onClick={() => { setShowCreate(false); setEditingId(item.id); setEditDraft({ label: item.value.label, aliases: (item.value.aliases ?? []).join("，"), description: item.value.description ?? "" }); setInfo(null); setError(null); }}
+                  onClick={() => { setShowCreate(false); setEditingId(item.id); setEditDraft({ label: item.value.label, aliases: (item.value.aliases ?? []).join("，"), description: item.value.description ?? "", isReactivationTarget: item.value.isReactivationTarget ?? false, isTerminal: item.value.isTerminal ?? false }); setInfo(null); setError(null); }}
                   disabled={busy || acting}>编辑</button>
                 {item.value.status === "active" ? (
                   <button type="button" className={styles.btnGhost} onClick={() => void deprecateEntry(item.id)} disabled={busy || acting}>废弃</button>
@@ -876,6 +908,22 @@ function TaxonomiesAdmin({ busy }: { busy: boolean }) {
                   <span>描述（可空）</span>
                   <textarea className={styles.textarea} value={editDraft.description}
                     onChange={(e) => setEditDraft({ ...editDraft, description: e.target.value })} />
+                </label>
+                <label className={styles.inlineCheckbox}>
+                  <input
+                    type="checkbox"
+                    checked={editDraft.isReactivationTarget}
+                    onChange={(e) => setEditDraft({ ...editDraft, isReactivationTarget: e.target.checked })}
+                  />
+                  可作再激活目标 is_reactivation_target
+                </label>
+                <label className={styles.inlineCheckbox}>
+                  <input
+                    type="checkbox"
+                    checked={editDraft.isTerminal}
+                    onChange={(e) => setEditDraft({ ...editDraft, isTerminal: e.target.checked })}
+                  />
+                  终态 is_terminal
                 </label>
                 <div className={styles.buttonRow}>
                   <button type="button" className={styles.btnPrimary} onClick={() => void submitEdit(item.id)} disabled={acting}>保存编辑</button>
