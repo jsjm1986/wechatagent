@@ -4,6 +4,7 @@ import { api } from "../../lib/api";
 import { formatRate } from "../../lib/format";
 import { useAccountStore } from "../../stores/accountStore";
 import { OutboxPanel } from "./OutboxPanel";
+import { FINAL_REVIEW_STATUS_LABELS, HOLD_CATEGORY_LABELS, labelOf } from "../../lib/reviewLabels";
 import styles from "./Autonomy.module.css";
 
 // 自治回路监控频道：从 /api/outcomes/autonomy 拉指标 + revision 记录，渲染
@@ -357,8 +358,8 @@ function RevisionRow({
         <td>{item.preReplyExcerpt || "—"}</td>
         <td>{item.postReplyExcerpt || "—"}</td>
         <td>{item.revisionDirection || "—"}</td>
-        <td>{item.finalReviewStatus}</td>
-        <td>{item.holdCategory || "—"}</td>
+        <td>{labelOf(FINAL_REVIEW_STATUS_LABELS, item.finalReviewStatus)}</td>
+        <td>{labelOf(HOLD_CATEGORY_LABELS, item.holdCategory)}</td>
         <td>
           <button className={styles.linkBtn} onClick={onToggle}>
             {expanded ? "收起" : "展开"}
