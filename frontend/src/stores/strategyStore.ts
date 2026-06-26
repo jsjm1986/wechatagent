@@ -325,6 +325,11 @@ export const useStrategyStore = create<StrategyState & StrategyActions>((set, ge
         memory_dimensions: profile.memory_dimensions ?? undefined,
         outcome_polarity: profile.outcome_polarity ?? undefined,
         operation_mode: profile.operation_mode ?? undefined,
+        transaction_facts_enabled: profile.transaction_facts_enabled ?? undefined,
+        reviewer_orientation: profile.reviewer_orientation ?? undefined,
+        mode_gate_policy_override: profile.mode_gate_policy_override ?? undefined,
+        trajectory_dimensions: profile.trajectory_dimensions ?? undefined,
+        debounce_window_ms_override: profile.debounce_window_ms_override ?? undefined,
       }
     });
   },

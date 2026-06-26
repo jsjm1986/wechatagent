@@ -1947,6 +1947,76 @@ function ProfileEditor({
       </details>
 
       <details className={styles.advanced}>
+        <summary>高级：交易/评审/轨迹（发布危险字段）</summary>
+        <p className={styles.panelHint}>
+          交易事实注入 / 评审取向 / 模式说明属发布危险字段，改动经发布确认流（riskyFields）二次确认。
+        </p>
+        <div className={styles.formGrid}>
+          <label className={styles.inlineCheckbox}>
+            <input
+              type="checkbox"
+              checked={draft.transaction_facts_enabled ?? false}
+              onChange={(e) => update({ transaction_facts_enabled: e.target.checked })}
+            />
+            交易型域（注入产品目录 + 持有事实）transaction_facts_enabled
+          </label>
+        </div>
+        <label className={styles.field}>
+          <span>评审重点 review_focus</span>
+          <input
+            className={styles.input}
+            type="text"
+            value={draft.reviewer_orientation?.review_focus ?? ""}
+            onChange={(e) =>
+              update({
+                reviewer_orientation: {
+                  ...(draft.reviewer_orientation ?? {}),
+                  review_focus: e.target.value || undefined,
+                },
+              })
+            }
+          />
+        </label>
+        <label className={styles.field}>
+          <span>平衡原则 balance_principle</span>
+          <input
+            className={styles.input}
+            type="text"
+            value={draft.reviewer_orientation?.balance_principle ?? ""}
+            onChange={(e) =>
+              update({
+                reviewer_orientation: {
+                  ...(draft.reviewer_orientation ?? {}),
+                  balance_principle: e.target.value || undefined,
+                },
+              })
+            }
+          />
+        </label>
+        <label className={styles.field}>
+          <span>模式-闸说明覆盖 mode_gate_policy_override</span>
+          <textarea
+            className={styles.textarea}
+            value={draft.mode_gate_policy_override ?? ""}
+            onChange={(e) => update({ mode_gate_policy_override: e.target.value || undefined })}
+          />
+        </label>
+        <label className={styles.field}>
+          <span>去抖窗口（毫秒）debounce_window_ms_override</span>
+          <input
+            className={styles.input}
+            type="number"
+            value={draft.debounce_window_ms_override ?? ""}
+            onChange={(e) =>
+              update({
+                debounce_window_ms_override: e.target.value ? Number(e.target.value) : undefined,
+              })
+            }
+          />
+        </label>
+      </details>
+
+      <details className={styles.advanced}>
         <summary>领域标志位（高敏域可选）</summary>
         <div className={styles.formGrid}>
           <label className={styles.field}>
