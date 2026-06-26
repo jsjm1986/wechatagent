@@ -148,6 +148,7 @@ export default function OperationsFeature() {
     decisionReviews,
     llmUsage,
     agentRuns,
+    loading,
     opsTab,
     setOpsTab,
     loadOperationsData
@@ -201,7 +202,9 @@ export default function OperationsFeature() {
         </div>
 
         {opsTab === "tasks" &&
-          (tasks.length === 0 ? (
+          (loading ? (
+            <EmptyState title="加载中…" hint="正在拉取运营数据。" />
+          ) : tasks.length === 0 ? (
             <EmptyState title="暂无跟进任务" hint="Agent 排程的跟进会在这里按计划呈现。" />
           ) : (
             <table className={styles.table}>
@@ -248,7 +251,9 @@ export default function OperationsFeature() {
           ))}
 
         {opsTab === "events" &&
-          (events.length === 0 ? (
+          (loading ? (
+            <EmptyState title="加载中…" hint="正在拉取运营数据。" />
+          ) : events.length === 0 ? (
             <EmptyState title="暂无运营事件" hint="跟进任务、Agent 决策与拦截会按时间在这里呈现。" />
           ) : (
             <ol className={styles.timeline}>
@@ -276,7 +281,9 @@ export default function OperationsFeature() {
           ))}
 
         {opsTab === "reviews" &&
-          (decisionReviews.length === 0 ? (
+          (loading ? (
+            <EmptyState title="加载中…" hint="正在拉取运营数据。" />
+          ) : decisionReviews.length === 0 ? (
             <EmptyState title="暂无 Review 记录" hint="独立复盘 Agent 的结论与评分会在这里留痕。" />
           ) : (
             <table className={styles.table}>
@@ -306,7 +313,9 @@ export default function OperationsFeature() {
           ))}
 
         {opsTab === "runs" &&
-          (agentRuns.length === 0 ? (
+          (loading ? (
+            <EmptyState title="加载中…" hint="正在拉取运营数据。" />
+          ) : agentRuns.length === 0 ? (
             <EmptyState title="暂无运行日志" hint="Agent 每轮决策的 run envelope（含档位遥测）会在这里留痕。" />
           ) : (
             <table className={styles.table}>
@@ -359,7 +368,9 @@ export default function OperationsFeature() {
                 <div className={`${styles.usageV} ${styles.key}`}>{Math.round((usage?.promptCacheHitRate ?? 0) * 100)}%</div>
               </div>
             </div>
-            {usageItems.length === 0 ? (
+            {loading ? (
+              <EmptyState title="加载中…" hint="正在拉取运营数据。" />
+            ) : usageItems.length === 0 ? (
               <EmptyState title="暂无 LLM 调用记录" hint="Agent 的每次模型调用都会在这里计量成本。" />
             ) : (
               <table className={styles.table}>

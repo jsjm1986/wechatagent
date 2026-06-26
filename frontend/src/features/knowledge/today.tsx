@@ -16,6 +16,7 @@ import {
   X,
 } from "lucide-react";
 import { parseApiError } from "../../lib/api";
+import { createSseReconnector, type SseHandle } from "../../lib/useSseReconnect";
 import { LlmErrorBanner, focusChunk, loadChunkOptions } from "./shared";
 import { ChunkPicker } from "../../components/ui/ChunkRef";
 import { useConfirm } from "../../components/ui/ConfirmDialog";
@@ -76,7 +77,6 @@ export function ChatWorkbench({ initialAttachChunkId }: { initialAttachChunkId?:
   const [applying, setApplying] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [info, setInfo] = useState<string | null>(null);
-  const esRef = useRef<EventSource | null>(null);
   const scrollRef = useRef<HTMLDivElement | null>(null);
 
   const persistSession = useCallback((sid: string) => {
@@ -124,23 +124,11 @@ export function ChatWorkbench({ initialAttachChunkId }: { initialAttachChunkId?:
 
   useEffect(() => {
     if (!sessionId || typeof window === "undefined" || typeof window.EventSource === "undefined") return;
-    esRef.current?.close();
-    const es = new EventSource(
-      `/api/knowledge/chat/sessions/${encodeURIComponent(sessionId)}/stream`
+    const handle = createSseReconnector(
+      `/api/knowledge/chat/sessions/${encodeURIComponent(sessionId)}/stream`,
+      { onEvent: { turn: () => { void loadHistory(sessionId); } }, terminalEvents: ["close"] },
     );
-    esRef.current = es;
-    es.addEventListener("turn", () => {
-      void loadHistory(sessionId);
-    });
-    es.addEventListener("close", () => {
-      es.close();
-    });
-    es.addEventListener("error", () => {
-      es.close();
-    });
-    return () => {
-      es.close();
-    };
+    return () => handle.close();
   }, [sessionId, loadHistory]);
 
   useEffect(() => {
@@ -800,30 +788,20 @@ export function TaskRail() {
   const [pending, setPending] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [liveTurns, setLiveTurns] = useState<number[]>([]);
-  const esRef = useRef<EventSource | null>(null);
+  const sseRef = useRef<SseHandle | null>(null);
 
   function closeStream() {
-    if (esRef.current) {
-      esRef.current.close();
-      esRef.current = null;
-    }
+    sseRef.current?.close();
+    sseRef.current = null;
   }
 
   function attachStream(sid: string) {
     closeStream();
-    if (!sid || typeof window === "undefined" || typeof window.EventSource === "undefined") {
-      return;
-    }
-    const es = new EventSource(
-      `/api/knowledge/chat/sessions/${encodeURIComponent(sid)}/stream`
+    if (!sid || typeof window === "undefined" || typeof window.EventSource === "undefined") return;
+    sseRef.current = createSseReconnector(
+      `/api/knowledge/chat/sessions/${encodeURIComponent(sid)}/stream`,
+      { onEvent: { turn: (ev) => { const v = Number(ev.data); if (!Number.isNaN(v)) setLiveTurns((prev) => [...prev, v]); } }, terminalEvents: ["close"] },
     );
-    esRef.current = es;
-    es.addEventListener("turn", (ev) => {
-      const v = Number((ev as MessageEvent).data);
-      if (!Number.isNaN(v)) setLiveTurns((prev) => [...prev, v]);
-    });
-    es.addEventListener("close", () => closeStream());
-    es.addEventListener("error", () => closeStream());
   }
 
   useEffect(() => () => closeStream(), []);

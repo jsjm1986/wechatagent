@@ -44,6 +44,14 @@
   padding-left: 7px; border-left: 1px solid rgba(94,92,230,.22);
 }
 
+/* AI 确信来源徽标 —— 紫色系（AI 身份），区分强证据快通道 / 压缩重判 */
+.confirmedBySource {
+  font-size: 10px; font-weight: 600; color: var(--color-brand);
+  padding: 1px 7px; border-radius: 20px;
+  background: var(--fill-brand); border: 1px solid rgba(94,92,230,.24);
+  cursor: default;
+}
+
 /* 编辑行 */
 .editRow { display: flex; align-items: center; gap: 8px; }
 .input {
