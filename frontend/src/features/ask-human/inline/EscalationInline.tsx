@@ -17,6 +17,7 @@ export function EscalationInline({ item, ctx }: { item: InboxItem; ctx: RowCtx }
   const [verdict, setVerdict] = useState("approved");
   const [windowHours, setWindowHours] = useState("");
   const [constraintText, setConstraintText] = useState("");
+  const [reassignWxid, setReassignWxid] = useState("");
   const code = item.id; // escalation 的 id 即 short_code
 
   function resolve(v: string) {
@@ -31,6 +32,16 @@ export function EscalationInline({ item, ctx }: { item: InboxItem; ctx: RowCtx }
             v === "conditional" && windowHours ? Number(windowHours) : null,
         }),
       `裁决已提交（${label}）`,
+    );
+  }
+
+  function reassign() {
+    void ctx.runAction(
+      () =>
+        api.post(`/api/admin/principal-escalations/${encodeURIComponent(code)}/reassign`, {
+          toWxid: reassignWxid,
+        }),
+      "已改派给备选决策人",
     );
   }
 
@@ -74,6 +85,16 @@ export function EscalationInline({ item, ctx }: { item: InboxItem; ctx: RowCtx }
       <div className="escalationInlineActions">
         <button type="button" disabled={ctx.busy} onClick={() => resolve(verdict)}>
           提交裁决
+        </button>
+      </div>
+      <div className="escalationInlineReassign">
+        <input
+          placeholder="备选决策人 wxid"
+          value={reassignWxid}
+          onChange={(e) => setReassignWxid(e.target.value)}
+        />
+        <button type="button" disabled={ctx.busy} onClick={() => reassign()}>
+          改派
         </button>
       </div>
     </div>
