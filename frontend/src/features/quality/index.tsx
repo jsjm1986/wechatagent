@@ -3,6 +3,7 @@ import { Workflow } from "lucide-react";
 import { api } from "../../lib/api";
 import { formatRate, formatNumber } from "../../lib/format";
 import { useAccountStore } from "../../stores/accountStore";
+import { EvaluationScenariosPanel } from "./EvaluationScenariosPanel";
 import styles from "./Quality.module.css";
 
 // 运营成效中心频道：长期指标 / 知识自动校验 / 公式遵守度评测 / 产品声明兜底标记词。
@@ -279,6 +280,7 @@ export function FormulaAdherenceTab({ accountId }: { accountId?: string }) {
         （每场景 simulationTokenBudget × scenarios 数），超额时返回部分结果 + degraded:true。
         缺四个公式的场景标 invalid，不静默按 0 计入平均。
       </p>
+      <EvaluationScenariosPanel />
       <div className={styles.toolbar}>
         <button className={styles.btnPrimary} onClick={() => void run()} disabled={busy || !accountId}>
           {busy ? "评测中" : "开始评测"}

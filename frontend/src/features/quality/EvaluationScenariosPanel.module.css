@@ -1,0 +1,88 @@
+/* 评测场景配置面板 —— 色值/圆角全走 tokens.css 变量，禁硬编码；蓝(brand)仅主操作按钮。
+   控件全量重置规避全局裸控件规则污染，与 Quality.module.css 同风格。 */
+
+.panel { display: grid; gap: 14px; }
+
+.desc { margin: 0; font-size: 13px; color: var(--ink-3); line-height: 1.65; }
+.desc code {
+  font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 11.5px;
+  padding: 1px 5px; border-radius: 4px; background: var(--surface-page);
+  border: 1px solid var(--hairline); color: var(--ink-2);
+}
+
+/* —— 新建表单 —— */
+.form {
+  display: grid; gap: 10px;
+  padding: 14px 16px; border-radius: var(--r-md);
+  background: var(--surface-page); border: 1px solid var(--hairline);
+}
+.formRow { display: flex; gap: 10px; flex-wrap: wrap; }
+.input,
+.inputWide {
+  font: inherit; font-size: 12.5px; min-height: 0;
+  padding: 8px 12px; border-radius: var(--r-sm);
+  background: var(--surface-card); border: 1px solid var(--hairline); color: var(--ink-1);
+  box-shadow: inset 0 1px 1px rgba(255, 255, 255, .9);
+  transition: border-color .18s, box-shadow .18s;
+}
+.input { flex: 1 1 200px; min-width: 0; }
+.inputWide { width: 100%; }
+.input:focus,
+.inputWide:focus,
+.textarea:focus {
+  outline: none; border-color: rgba(10, 132, 255, .4);
+  box-shadow: inset 0 1px 1px rgba(255, 255, 255, .9), 0 0 0 3px var(--fill-scheduled);
+}
+.textarea {
+  font: inherit; font-size: 12.5px; width: 100%; min-height: 90px;
+  padding: 8px 12px; border-radius: var(--r-sm); line-height: 1.55; resize: vertical;
+  background: var(--surface-card); border: 1px solid var(--hairline); color: var(--ink-1);
+  box-shadow: inset 0 1px 1px rgba(255, 255, 255, .9);
+  transition: border-color .18s, box-shadow .18s;
+}
+
+.actions { display: flex; gap: 8px; }
+.btnPrimary {
+  font: inherit; font-size: 12.5px; font-weight: 600; letter-spacing: -.1px;
+  min-height: 0; padding: 8px 16px; border-radius: var(--r-sm); cursor: pointer;
+  display: inline-flex; align-items: center; justify-content: center; gap: 6px;
+  background: var(--color-brand); border: 1px solid var(--color-brand); color: #fff;
+  box-shadow: 0 6px 16px -10px rgba(94, 92, 230, .8);
+  transition: filter .18s, opacity .18s;
+}
+.btnPrimary:hover:not(:disabled) { filter: brightness(1.06); }
+.btnPrimary:disabled { opacity: .5; cursor: not-allowed; }
+.btnGhost {
+  font: inherit; font-size: 12.5px; font-weight: 600; letter-spacing: -.1px;
+  min-height: 0; padding: 8px 14px; border-radius: var(--r-sm); cursor: pointer;
+  display: inline-flex; align-items: center; justify-content: center; gap: 6px;
+  background: transparent; border: 1px solid var(--hairline); color: var(--ink-2); box-shadow: none;
+  transition: background .18s, color .18s, border-color .18s, opacity .18s;
+}
+.btnGhost:hover:not(:disabled) { background: rgba(0, 0, 0, .03); color: var(--ink-1); border-color: rgba(0, 0, 0, .14); }
+.btnGhost:disabled { opacity: .5; cursor: not-allowed; }
+
+.error {
+  padding: 11px 14px; border-radius: var(--r-sm);
+  font-size: 12.5px; color: var(--color-blocked);
+  background: var(--fill-blocked); border: 1px solid rgba(255, 69, 58, .3);
+}
+.hint { margin: 0; font-size: 13px; color: var(--ink-3); }
+
+/* —— 列表 —— */
+.table {
+  width: 100%; border-collapse: collapse;
+  border-radius: var(--r-md); overflow: hidden;
+  border: 1px solid var(--hairline); background: var(--surface-card);
+}
+.table thead th {
+  text-align: left; font-size: 11px; font-weight: 600; letter-spacing: .2px; text-transform: uppercase;
+  color: var(--ink-3); padding: 11px 14px; background: var(--surface-page);
+  border-bottom: 1px solid var(--hairline); white-space: nowrap;
+}
+.table tbody td {
+  font-size: 12.5px; color: var(--ink-1); padding: 12px 14px;
+  border-bottom: 1px solid var(--hairline); letter-spacing: -.1px; vertical-align: top;
+}
+.table tbody tr:last-child td { border-bottom: none; }
+.table small { color: var(--ink-4); }
