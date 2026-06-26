@@ -112,6 +112,7 @@ function UserOpsFeatureInner() {
     setGeneratePlaybookText,
     setOptimizePlaybookText,
     setDomainDrafts,
+    setMemoryDraft,
     hydrateSelected,
     loadMessages,
     loadPlaybooks,
@@ -125,6 +126,7 @@ function UserOpsFeatureInner() {
     saveCustomAgentInstructions,
     saveAssistOverride,
     saveRelationshipType,
+    saveOperatingMemory,
     saveManualTags,
     analyzeProfile,
     previewGuideInstruction,
@@ -300,6 +302,8 @@ function UserOpsFeatureInner() {
             onSaveAssistOverride={saveAssistOverride}
             onSaveRelationshipType={saveRelationshipType}
             onSaveManualTags={saveManualTags}
+            onMemoryDraftChange={setMemoryDraft}
+            onSaveOperatingMemory={saveOperatingMemory}
             onSelectedPlaybook={setSelectedPlaybookId}
             onSimulationInput={setSimulationInput}
             onTab={setSmartOpsTab}
