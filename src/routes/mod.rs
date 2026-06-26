@@ -21,6 +21,7 @@ mod accounts;
 mod admin_ops_versions;
 mod admin_outbox;
 mod admin_relationship_suggestions;
+pub mod admin_suspected_deals;
 mod admin_state_policies;
 mod admin_taxonomies;
 mod admin_taxonomy_candidates;
@@ -144,6 +145,9 @@ use admin_taxonomy_candidates::{
 };
 use admin_relationship_suggestions::{
     approve_relationship_suggestion, list_relationship_suggestions, reject_relationship_suggestion,
+};
+use admin_suspected_deals::{
+    approve_suspected_deal, list_suspected_deals, reject_suspected_deal,
 };
 use assets::{create_content_asset, list_content_assets};
 use ask_human_inbox::{ask_human_inbox, ask_human_summary};
@@ -828,6 +832,19 @@ pub fn api_router(state: AppState) -> Router<AppState> {
             "/admin/relationship-type-suggestions/:id/reject",
             post(reject_relationship_suggestion),
         )
+        // ── F23：疑似成交待核实闭环（方案B）核实路由 ──────────────────────────
+        // 红线：list/reject 仅改信号状态；approve 调 add_outcome_event_inner 落
+        // verification=staff_confirmed 正式成交（AI 永不直写 outcome）。挂在与
+        // relationship-type-suggestions 同段（AuthenticatedAdmin 保护 + workspace 隔离）。
+        .route("/admin/suspected-deals", get(list_suspected_deals))
+        .route(
+            "/admin/suspected-deals/:id/approve",
+            post(approve_suspected_deal),
+        )
+        .route(
+            "/admin/suspected-deals/:id/reject",
+            post(reject_suspected_deal),
+        )
         // ── Phase E / E5-T1：ops 三表多版本灰度 admin 路由 ──────────────────────
         // 同一套 publish/rollout/rollback 三动作分别覆盖
         // operation_domain_configs / operation_state_policies / system_taxonomies。
@@ -1028,6 +1045,7 @@ mod tests {
             include_str!("admin_taxonomies.rs"),
             include_str!("admin_taxonomy_candidates.rs"),
             include_str!("admin_relationship_suggestions.rs"),
+            include_str!("admin_suspected_deals.rs"),
             include_str!("assets.rs"),
             include_str!("auth.rs"),
             include_str!("behavior_signal_metrics.rs"),

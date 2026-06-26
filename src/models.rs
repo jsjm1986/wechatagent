@@ -2844,6 +2844,40 @@ pub struct RelationshipTypeSuggestion {
     pub reviewed_by: Option<String>,
 }
 
+/// F23：`suspected_deal_signals` 集合结构（疑似成交待核实闭环·方案B）。
+///
+/// LLM 决策时若判断客户疑似成交，会在 `agent_generated_signals` 输出一条
+/// `kind="suspected_deal"` 弱信号。该信号**绝不直接落正式成交**——红线：
+/// AI 永不直写 `outcome_events`。它先 upsert 进本待核实专表（`status=pending`），
+/// 由运营在后台 approve 才调 `add_outcome_event_inner(verification=staff_confirmed)`
+/// 落正式成交。仿 [`RelationshipTypeSuggestion`] 的 snake_case BSON + serde default
+/// 形态；同一 `(workspace_id, contact_id)` 只一条 pending 记录（unique 索引幂等锚，
+/// 重复观察累加 `occurrences` / 刷新 `last_seen_at`）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SuspectedDealSignal {
+    #[serde(rename = "_id", skip_serializing_if = "Option::is_none")]
+    pub id: Option<ObjectId>,
+    pub workspace_id: String,
+    pub account_id: String,
+    pub contact_id: String,
+    /// 疑似成交摘要文案，如 `"疑似成交·待核实"`（来自信号 value）。
+    pub value: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence: Option<String>,
+    #[serde(default)]
+    pub confidence: i32,
+    /// `"pending"` | `"approved"` | `"rejected"`。
+    pub status: String,
+    #[serde(default)]
+    pub occurrences: i32,
+    pub first_seen_at: DateTime,
+    pub last_seen_at: DateTime,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reviewed_at: Option<DateTime>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reviewed_by: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LlmCallLog {
     #[serde(rename = "_id", skip_serializing_if = "Option::is_none")]
@@ -5270,6 +5304,50 @@ mod typed_tests {
             Some("用户多次询问折扣并对比同类产品")
         );
         assert_eq!(parsed.confidence, 7);
+        assert_eq!(parsed.occurrences, 1);
+        assert_eq!(parsed.status, "pending");
+        assert!(parsed.reviewed_at.is_none());
+        assert!(parsed.reviewed_by.is_none());
+    }
+
+    /// F23：`SuspectedDealSignal` BSON 往返——字段名 snake_case 须与 indexes.rs /
+    /// gateway upsert / handler 逐字一致。
+    #[test]
+    fn suspected_deal_signal_bson_round_trip() {
+        let now = DateTime::now();
+        let signal = SuspectedDealSignal {
+            id: None,
+            workspace_id: "ws-1".to_string(),
+            account_id: "acc-1".to_string(),
+            contact_id: "507f1f77bcf86cd799439011".to_string(),
+            value: "疑似成交·待核实".to_string(),
+            evidence: Some("客户说要下单".to_string()),
+            confidence: 75,
+            status: "pending".to_string(),
+            occurrences: 1,
+            first_seen_at: now,
+            last_seen_at: now,
+            reviewed_at: None,
+            reviewed_by: None,
+        };
+
+        let doc = mongodb::bson::to_document(&signal).expect("serialize SuspectedDealSignal");
+        assert_eq!(doc.get_str("workspace_id").unwrap(), "ws-1");
+        assert_eq!(doc.get_str("account_id").unwrap(), "acc-1");
+        assert_eq!(doc.get_str("contact_id").unwrap(), "507f1f77bcf86cd799439011");
+        assert_eq!(doc.get_str("value").unwrap(), "疑似成交·待核实");
+        assert_eq!(doc.get_str("status").unwrap(), "pending");
+        assert_eq!(doc.get_i32("confidence").unwrap(), 75);
+        assert_eq!(doc.get_i32("occurrences").unwrap(), 1);
+
+        let parsed: SuspectedDealSignal =
+            mongodb::bson::from_document(doc).expect("deserialize SuspectedDealSignal");
+        assert_eq!(parsed.workspace_id, signal.workspace_id);
+        assert_eq!(parsed.account_id, signal.account_id);
+        assert_eq!(parsed.contact_id, signal.contact_id);
+        assert_eq!(parsed.value, "疑似成交·待核实");
+        assert_eq!(parsed.evidence.as_deref(), Some("客户说要下单"));
+        assert_eq!(parsed.confidence, 75);
         assert_eq!(parsed.occurrences, 1);
         assert_eq!(parsed.status, "pending");
         assert!(parsed.reviewed_at.is_none());

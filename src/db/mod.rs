@@ -25,7 +25,7 @@ use crate::models::{
     ManagementAgentMessage, ManagementAgentSession, McpCallLog, MemoryCandidate, MigrationRecord,
     OperatingMemory, OperationDomainConfig, OperationKnowledgeChunk, OperationKnowledgeDocument,
     OperationPlaybook, OutboxEntry, PostReleaseReview, Product, PromptTemplate,
-    Proposal, ReferralCard, RelationshipTypeSuggestion, ShadowReplay, TaxonomyCandidate, TaxonomyEntry,
+    Proposal, ReferralCard, RelationshipTypeSuggestion, ShadowReplay, SuspectedDealSignal, TaxonomyCandidate, TaxonomyEntry,
     ThresholdOverride, ThresholdOverrideAudit, UserOperationGuidePreview, WechatAccount,
 };
 
@@ -260,6 +260,14 @@ impl Database {
         &self,
     ) -> Collection<RelationshipTypeSuggestion> {
         self.db.collection("relationship_type_suggestions")
+    }
+
+    /// F23：`suspected_deal_signals` 集合 typed accessor（疑似成交待核实闭环·方案B）。
+    /// LLM 输出的 `kind="suspected_deal"` 弱信号 upsert 至此（`status=pending`），
+    /// 运营 approve 才落正式成交（红线：AI 永不直写 outcome）；索引见 [`indexes`] 的
+    /// `(workspace_id, contact_id)` unique + `(workspace_id, status)`。
+    pub fn collection_suspected_deal_signals(&self) -> Collection<SuspectedDealSignal> {
+        self.db.collection("suspected_deal_signals")
     }
 
     // ── agent-self-evolution W0 (Task 1.1) ──
