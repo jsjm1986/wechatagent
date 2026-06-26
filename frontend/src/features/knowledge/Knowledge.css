@@ -2739,6 +2739,19 @@
     flex: 1;
     min-width: 180px;
   }
+  .knowledgeWiki .wikiChatDispatch {
+    border-top: 1px dashed var(--surface-page);
+    padding-top: 8px;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }
+  .knowledgeWiki .wikiChatDispatchHead {
+    display: flex;
+    gap: 8px;
+    align-items: center;
+    flex-wrap: wrap;
+  }
   .knowledgeWiki .wikiInbox {
     display: flex;
     flex-direction: column;

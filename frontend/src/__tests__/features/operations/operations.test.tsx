@@ -3,10 +3,16 @@ import { render, screen } from "@testing-library/react";
 import OperationsFeature from "../../../features/operations";
 import { useOperationsStore } from "../../../stores/operationsStore";
 import { useAccountStore } from "../../../stores/accountStore";
+import { api } from "../../../lib/api";
 
 // Mock stores
 vi.mock("../../../stores/operationsStore");
 vi.mock("../../../stores/accountStore");
+
+// Mock api（复核 / 取消按钮走 api.post）
+vi.mock("../../../lib/api", () => ({
+  api: { post: vi.fn().mockResolvedValue({ ok: true }), get: vi.fn() },
+}));
 
 // Mock fetch for API calls
 (globalThis as any).fetch = vi.fn();
@@ -90,5 +96,23 @@ describe("OperationsFeature", () => {
     render(<OperationsFeature />);
 
     expect(screen.getByText("暂无跟进任务")).toBeInTheDocument();
+  });
+
+  it("跟进任务行点击「取消」调用 cancel 端点", async () => {
+    render(<OperationsFeature />);
+    const { fireEvent, waitFor } = await import("@testing-library/react");
+    fireEvent.click(screen.getByText("取消"));
+    await waitFor(() =>
+      expect(api.post).toHaveBeenCalledWith("/api/agent-tasks/1/cancel"),
+    );
+  });
+
+  it("跟进任务行点击「立即复核」调用 review-now 端点", async () => {
+    render(<OperationsFeature />);
+    const { fireEvent, waitFor } = await import("@testing-library/react");
+    fireEvent.click(screen.getByText("立即复核"));
+    await waitFor(() =>
+      expect(api.post).toHaveBeenCalledWith("/api/agent-tasks/1/review-now"),
+    );
   });
 });
