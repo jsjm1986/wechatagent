@@ -119,4 +119,45 @@ describe("CommandCenterFeature", () => {
     render(<CommandCenterFeature />);
     expect(screen.queryByRole("button", { name: "确认执行" })).not.toBeInTheDocument();
   });
+
+  it("F13: gatewayStatus 显示中文标签", () => {
+    useCommandStore.setState({
+      commandResult: {
+        id: "run-hex-4",
+        status: "succeeded",
+        summary: "已执行。",
+        toolCalls: [
+          {
+            id: "tc4",
+            toolName: "message_send_text",
+            status: "executed_unverified",
+            response: { sentContent: "您好，已收到您的咨询", gatewayStatus: "held_by_ai_policy" },
+          },
+        ],
+      },
+    });
+    render(<CommandCenterFeature />);
+    expect(screen.getByText(/AI 策略主动暂缓/)).toBeInTheDocument();
+    expect(screen.queryByText(/held_by_ai_policy/)).not.toBeInTheDocument();
+  });
+
+  it("F13: 未知 gatewayStatus 回落原值不崩", () => {
+    useCommandStore.setState({
+      commandResult: {
+        id: "run-hex-5",
+        status: "succeeded",
+        summary: "已执行。",
+        toolCalls: [
+          {
+            id: "tc5",
+            toolName: "message_send_text",
+            status: "executed_unverified",
+            response: { sentContent: "测试发送内容", gatewayStatus: "some_future_status" },
+          },
+        ],
+      },
+    });
+    render(<CommandCenterFeature />);
+    expect(screen.getByText(/some_future_status/)).toBeInTheDocument();
+  });
 });
