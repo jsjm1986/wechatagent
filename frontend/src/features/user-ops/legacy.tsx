@@ -2028,6 +2028,7 @@ function formatTime(value?: string) {
 
 export function PlannerViewSection({ contact }: { contact: Contact | null }) {
   const taxonomies = useProfileStore((s) => s.taxonomies);
+  const dimensions = useProfileStore((s) => s.dimensions);
   if (!contact) {
     return null;
   }
@@ -2045,7 +2046,20 @@ export function PlannerViewSection({ contact }: { contact: Contact | null }) {
   const hasCommitments = commitments.length > 0;
   const lastMode = (contact as { lastConversationMode?: string | null }).lastConversationMode || null;
   const hasMode = !!lastMode;
-  if (!hasStage && !hasCommitments && !hasMode) {
+  // 画像维度（除 customer_stage 专属行外）：遍历 store.dimensions、取 domainAttributes 上的值、跳过空值。
+  // 上提到守卫之前，使仅有其余维度（无 stage/commitments/mode）的客户也能渲染。
+  const extraDims = (() => {
+    const attrs = (contact.domainAttributes ?? {}) as Record<string, unknown>;
+    return dimensions
+      .filter((d) => d.kind !== "customer_stage")
+      .map((d) => {
+        const raw = attrs[d.kind];
+        const value = typeof raw === "string" ? raw : "";
+        return { dim: d, value };
+      })
+      .filter((x) => x.value !== "");
+  })();
+  if (!hasStage && !hasCommitments && !hasMode && extraDims.length === 0) {
     return null;
   }
   return (
@@ -2053,7 +2067,7 @@ export function PlannerViewSection({ contact }: { contact: Contact | null }) {
       <div className="sectionCaption">Planner 视角</div>
       {hasMode && (
         <div data-testid="planner-mode-row" style={{ fontSize: 13, color: "#444", marginBottom: 8 }}>
-          上轮对话模式 <strong>{conversationModeLabel(lastMode!)}</strong>
+          上轮对话模式 <strong>{labelFor(taxonomies, "conversation_mode", lastMode!).text}</strong>
         </div>
       )}
       {hasStage && (
@@ -2090,6 +2104,36 @@ export function PlannerViewSection({ contact }: { contact: Contact | null }) {
             </li>
           ))}
         </ul>
+      )}
+      {extraDims.length > 0 && (
+        <div data-testid="planner-dimensions" style={{ marginTop: 8 }}>
+          {extraDims.map(({ dim, value }) => {
+            const r = labelFor(taxonomies, dim.kind, value);
+            const dim_label = dim.displayName || dim.kind;
+            const isFallback = r.status === "unknown_value" || r.status === "no_dict";
+            return (
+              <div
+                key={dim.kind}
+                data-testid={`planner-dim-${dim.kind}`}
+                style={{ fontSize: 13, color: "#444", marginBottom: 6 }}
+              >
+                {dim_label}{" "}
+                <strong
+                  style={isFallback ? { color: "#999" } : undefined}
+                  title={
+                    r.status === "unknown_value"
+                      ? "未知取值（不在当前字典内）"
+                      : r.status === "no_dict"
+                        ? "该维度暂无取值字典，显示原始值（待配置）"
+                        : undefined
+                  }
+                >
+                  {r.text}
+                </strong>
+              </div>
+            );
+          })}
+        </div>
       )}
     </section>
   );
@@ -2174,21 +2218,6 @@ function SendHistoryResponseTag({ responded }: { responded?: boolean | null }) {
   return <p style={{ color: "var(--muted-soft)" }}>待评估</p>;
 }
 
-
-function conversationModeLabel(mode: string): string {
-  switch (mode) {
-    case "casual_relationship":
-      return "寒暄关系（casual_relationship）";
-    case "value_exchange":
-      return "价值互换（value_exchange）";
-    case "consultative":
-      return "顾问/销售（consultative）";
-    case "boundary_protection":
-      return "边界保护（boundary_protection）";
-    default:
-      return mode;
-  }
-}
 
 /** M3 / Task 79：把 ISO 时间格式化成 cockpit 显示用的"YYYY-MM-DD HH:mm"。 */
 

@@ -15,6 +15,9 @@ export interface InboxItem {
   questionForPrincipal?: string;
   contactWxid?: string;
   principalWxid?: string;
+  evidence?: string;
+  confidence?: number;
+  occurrences?: number;
 }
 export interface SourceError {
   source: string;

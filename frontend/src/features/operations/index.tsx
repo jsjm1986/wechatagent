@@ -5,6 +5,7 @@ import { StatusBadge, type StatusTone } from "../../components/ui/StatusBadge";
 import { useOperationsStore } from "../../stores/operationsStore";
 import { useAccountStore } from "../../stores/accountStore";
 import { api } from "../../lib/api";
+import { FINAL_REVIEW_STATUS_LABELS, HOLD_CATEGORY_LABELS, labelOf } from "../../lib/reviewLabels";
 import type { DecisionReview } from "../../types";
 import styles from "./Operations.module.css";
 
@@ -39,12 +40,20 @@ function taskStatusTone(status?: string): StatusTone {
   return "inactive";
 }
 
-function formatScores(scores: Record<string, number>) {
-  const keys = ["humanLike", "emotionalValue", "hallucinationScore", "knowledgeGroundingScore", "pressureRisk"];
+const SCORE_LABELS: Record<string, string> = {
+  humanLike: "拟人度",
+  emotionalValue: "情绪价值",
+  hallucinationScore: "幻觉风险",
+  knowledgeGroundingScore: "知识接地",
+  pressureRisk: "压迫风险",
+  boundaryPrivacySafety: "隐私边界",
+};
+
+export function formatScores(scores: Record<string, number>) {
+  const entries = Object.entries(scores ?? {}).filter(([, v]) => v !== undefined && v !== null);
   return (
-    keys
-      .filter((key) => scores[key] !== undefined)
-      .map((key) => `${key}:${scores[key]}`)
+    entries
+      .map(([key, v]) => `${SCORE_LABELS[key] ?? key}:${v}`)
       .join(" / ") || "-"
   );
 }
@@ -58,6 +67,15 @@ function nextBestActionLabel(action?: Record<string, unknown>) {
 
 function reviewTone(review: DecisionReview): StatusTone {
   return review.approved ? "running" : "blocked";
+}
+
+// 未通过时按可用字段选具体中文标签;finalReviewStatus / holdCategory 都缺失
+// (老数据 / 向后兼容)则回落二元"拦截"。注意 labelOf 对空值返回 "—"(truthy),
+// 故不能用 || 串联兜底,须显式判断字段存在性。
+function blockedLabel(review: DecisionReview): string {
+  if (review.finalReviewStatus) return labelOf(FINAL_REVIEW_STATUS_LABELS, review.finalReviewStatus);
+  if (review.holdCategory) return labelOf(HOLD_CATEGORY_LABELS, review.holdCategory);
+  return "拦截";
 }
 
 export default function OperationsFeature() {
@@ -207,7 +225,7 @@ export default function OperationsFeature() {
               <tbody>
                 {decisionReviews.map((review) => (
                   <tr key={review.id}>
-                    <td><StatusBadge tone={reviewTone(review)}>{review.approved ? "通过" : "拦截"}</StatusBadge></td>
+                    <td><StatusBadge tone={reviewTone(review)}>{review.approved ? "通过" : blockedLabel(review)}</StatusBadge></td>
                     <td>{nextBestActionLabel(review.nextBestAction)}</td>
                     <td className={styles.cellMuted}>{review.outcomeStatus || "pending"}</td>
                     <td className={styles.cellNum}>{formatScores(review.scores)}</td>

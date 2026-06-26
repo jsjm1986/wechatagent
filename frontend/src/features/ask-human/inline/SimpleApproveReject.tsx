@@ -21,6 +21,14 @@ export function SimpleApproveReject({
     <div className="simpleActionRow">
       <div className="simpleActionTitle">{item.title}</div>
       <div className="simpleActionSummary">{item.summary}</div>
+      {(item.evidence || item.confidence !== undefined || item.occurrences !== undefined) && (
+        <div className="simpleActionEvidence" style={{ fontSize: 12, color: "#666", marginTop: 4 }}>
+          {item.evidence && <div>判断依据：{item.evidence}</div>}
+          {item.confidence !== undefined && <div>置信度：{item.confidence}</div>}
+          {item.occurrences !== undefined && <div>出现次数：{item.occurrences}</div>}
+          {item.contactWxid && <div>客户标识：{item.contactWxid}</div>}
+        </div>
+      )}
       <div className="simpleActionButtons">
         {endpoints.approve && (
           <button

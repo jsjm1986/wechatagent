@@ -62,6 +62,7 @@ mod m024_seed_relationship_type;
 mod m025_backfill_ask_human_policy;
 mod m026_seed_sales_with_relationships;
 mod m027_contact_trust_fields;
+mod m028_seed_conversation_mode;
 
 type MigrationFuture<'a> = Pin<Box<dyn Future<Output = AppResult<()>> + Send + 'a>>;
 pub type MigrationFn = for<'a> fn(&'a Database) -> MigrationFuture<'a>;
@@ -181,6 +182,10 @@ pub const MIGRATIONS: &[Migration] = &[
     Migration {
         id: "2026_06_Y1_001_contact_trust_fields",
         run: |db| Box::pin(m027_contact_trust_fields::run_step(db)),
+    },
+    Migration {
+        id: "2026_06_Y2_001_seed_conversation_mode",
+        run: |db| Box::pin(m028_seed_conversation_mode::run_step(db)),
     },
 ];
 

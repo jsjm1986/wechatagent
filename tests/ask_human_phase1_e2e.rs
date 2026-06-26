@@ -757,3 +757,61 @@ async fn operation_domain_json_includes_ask_human_policy() {
     assert_eq!(body["item"]["askHumanPolicy"]["timeoutHours"], serde_json::json!(24.0));
     assert_eq!(body["item"]["askHumanPolicy"]["dailyPushCap"], serde_json::json!(3));
 }
+
+// ── 测试 8：关系类型建议富投影（E10 审核反盲批）────────────────────────────────
+//
+// seed 一条 pending RelationshipTypeSuggestion（evidence/confidence/occurrences 全持久化）
+// → 经真投影函数 collect_relationship_suggestions 聚合到 inbox → 断言对应 item 携带
+// evidence / confidence==80 / occurrences==3。证据全程经真投影函数流出（非手搓 InboxItem）。
+#[tokio::test]
+#[ignore]
+async fn inbox_relationship_suggestion_carries_evidence() {
+    let app = common::TestApp::start().await;
+    let ws = app.state.config.default_workspace_id.clone();
+
+    let now = DateTime::now();
+    let suggestion = wechatagent::models::RelationshipTypeSuggestion {
+        id: None,
+        workspace_id: ws.clone(),
+        account_id: "acc_test".to_string(),
+        contact_id: "contact_e10".to_string(),
+        suggested_value: "peer".to_string(),
+        evidence: Some("多次自称同行".to_string()),
+        confidence: 80,
+        status: "pending".to_string(),
+        occurrences: 3,
+        first_seen_at: now,
+        last_seen_at: now,
+        reviewed_at: None,
+        reviewed_by: None,
+    };
+    app.state
+        .db
+        .collection_relationship_type_suggestions()
+        .insert_one(&suggestion, None)
+        .await
+        .expect("seed relationship suggestion");
+
+    let resp = wechatagent::routes::ask_human_inbox::ask_human_inbox(
+        State(app.state.clone()),
+        Extension(test_admin(&ws)),
+        Query(
+            serde_json::from_value(serde_json::json!({ "source": "relationship_suggestion" }))
+                .expect("deserialize InboxQuery"),
+        ),
+    )
+    .await
+    .expect("inbox ok");
+    let body: Value = resp.0;
+
+    let items = body.get("items").and_then(|v| v.as_array()).expect("items array");
+    let item = items
+        .iter()
+        .find(|i| i.get("source").and_then(|s| s.as_str()) == Some("relationship_suggestion"))
+        .expect("应含 relationship_suggestion item");
+
+    assert_eq!(item["evidence"], serde_json::json!("多次自称同行"), "应投影 evidence");
+    assert_eq!(item["confidence"], serde_json::json!(80), "应投影 confidence==80");
+    assert_eq!(item["occurrences"], serde_json::json!(3), "应投影 occurrences==3");
+    assert_eq!(item["contactWxid"], serde_json::json!("contact_e10"), "应投影 contact_id 入 contactWxid");
+}
