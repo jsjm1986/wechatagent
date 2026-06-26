@@ -11,6 +11,10 @@ export interface InboxItem {
   actionKind: "inline" | "rich";
   richComponent?: string;
   richParams?: Record<string, unknown>;
+  category?: string;
+  questionForPrincipal?: string;
+  contactWxid?: string;
+  principalWxid?: string;
 }
 export interface SourceError {
   source: string;

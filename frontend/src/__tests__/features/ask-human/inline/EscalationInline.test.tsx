@@ -58,6 +58,19 @@ describe("EscalationInline", () => {
     );
   });
 
+  it("富展示客户/问题/类别", () => {
+    const richItem = {
+      ...item,
+      contactWxid: "wxid_cust",
+      questionForPrincipal: "能否给折扣",
+      category: "pricing",
+    };
+    const runAction = vi.fn();
+    render(<EscalationInline item={richItem} ctx={{ busy: false, runAction }} />);
+    expect(screen.getByText(/能否给折扣/)).toBeInTheDocument();
+    expect(screen.getByText(/wxid_cust/)).toBeInTheDocument();
+  });
+
   it("改派提交 toWxid 到 reassign 端点", async () => {
     const runAction = vi.fn(async (fn: () => Promise<unknown>) => {
       await fn();
