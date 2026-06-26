@@ -3,6 +3,7 @@ import { ShieldCheck } from "lucide-react";
 import { api } from "../../lib/api";
 import { formatRate } from "../../lib/format";
 import { useAccountStore } from "../../stores/accountStore";
+import { OutboxPanel } from "./OutboxPanel";
 import styles from "./Autonomy.module.css";
 
 // 自治回路监控频道：从 /api/outcomes/autonomy 拉指标 + revision 记录，渲染
@@ -405,6 +406,7 @@ export default function AutonomyFeature() {
           </div>
         </div>
         <AutonomyOutcomesTab accountId={accountId} />
+        <OutboxPanel />
       </section>
     </div>
   );

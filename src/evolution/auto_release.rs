@@ -33,6 +33,13 @@ use crate::routes::AppState;
 use super::error::EvolutionError;
 use super::threshold::THRESHOLD_REASONABLE_BANDS;
 
+/// EVO-3:auto_release 双闸 —— env 全局总闸 AND per-workspace 子闸。
+/// 总闸关:整段不跑。总闸开:再看该 workspace 的 threshold_auto_release_enabled
+/// (文档缺失视作 None→关,默认保守不自动 release,镜像 is_evolution_enabled_for)。
+fn auto_release_gate_open(env_enabled: bool, flag_threshold_enabled: Option<bool>) -> bool {
+    env_enabled && flag_threshold_enabled.unwrap_or(false)
+}
+
 /// 单 tick 自动 release 主入口。返回本 tick 实际触发自动 release 的条数。
 ///
 /// `evolution_auto_release_enabled=false` → 立即 return Ok(0)。任何下游错误均
@@ -43,6 +50,18 @@ pub async fn auto_release_eligible_thresholds(state: &AppState) -> Result<usize,
         return Ok(0);
     }
     let workspace_id = state.config.default_workspace_id.clone();
+    // EVO-3:总闸(env)开后,再读该 workspace 的子闸 threshold_auto_release_enabled。
+    // 子闸关/文档缺失/读失败 → 不自动 release(保守,镜像 is_evolution_enabled_for 顺序)。
+    // load_runtime_flag 返回 AppResult,这里 .ok().flatten() 把读失败也视作"子闸未开"——
+    // auto_release 整体 best-effort,调用方 run_one_tick 已 unwrap_or_else 兜底,不让读失败透传。
+    let flag_threshold = crate::evolution::runtime_flag::load_runtime_flag(state, &workspace_id)
+        .await
+        .ok()
+        .flatten()
+        .map(|f| f.threshold_auto_release_enabled);
+    if !auto_release_gate_open(state.config.evolution_auto_release_enabled, flag_threshold) {
+        return Ok(0);
+    }
     let account_id = state.config.default_account_id.clone();
     let cap = state.config.evolution_auto_release_per_tick_cap.max(1);
     let window_hours = state.config.evolution_auto_release_window_hours.max(1) as i64;
@@ -421,5 +440,19 @@ mod tests {
         // 门开但窗口内无已分类客户反应（None）→ 不强制 skip：无信号不盲动，
         // 与 decide_auto_release 的保守口径一致。
         assert!(!decide_negative_reaction_block(true, None, 0.30));
+    }
+
+    // ── EVO-3：auto_release 双闸（env 总闸 AND per-workspace 子闸）纯函数测 ──
+
+    #[test]
+    fn auto_release_dual_gate() {
+        // 总闸关 → 不论子闸都 false
+        assert!(!super::auto_release_gate_open(false, Some(true)));
+        assert!(!super::auto_release_gate_open(false, None));
+        // 总闸开 + 子闸关/缺失 → false(默认保守)
+        assert!(!super::auto_release_gate_open(true, Some(false)));
+        assert!(!super::auto_release_gate_open(true, None));
+        // 总闸开 + 子闸开 → true
+        assert!(super::auto_release_gate_open(true, Some(true)));
     }
 }

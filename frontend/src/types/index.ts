@@ -586,6 +586,24 @@ export type ProfileThresholds = {
   productAccuracyBlockBelow?: number | null;
 };
 
+// H13：AI 生成状态机本体（draft 暂存料，激活前供审阅）。后端 DomainProfile.generated_state_machine
+// 是 Option<Document>，**外层字段名 snake_case**（serde 无 rename_all），但**内层 key 保留 camelCase**
+// （guide_profile.rs:368-413 显式绕过 normalize_json_keys：states/key/name/goal/initial/allowedFrom/
+// allowFromAny/forbidsProactive/advanceSignals/riskRules）。goal/advanceSignals/riskRules 是**逐 state**
+// 字段（prompts.rs default_user_operation_state_machine 实证），非顶层。
+export type GeneratedState = {
+  key?: string;
+  name?: string;
+  goal?: string;
+  initial?: boolean;
+  advanceSignals?: string[];
+  riskRules?: string[];
+};
+
+export type GeneratedStateMachine = {
+  states?: GeneratedState[];
+};
+
 export type DomainProfile = {
   id: string;
   profile_id: string;
@@ -611,6 +629,8 @@ export type DomainProfile = {
   memory_dimensions?: MemoryDimension[];
   outcome_polarity?: OutcomePolarity;
   operation_mode?: OperationMode;
+  // H13：AI 生成状态机本体（draft），激活前供审阅；激活后运行时读 operation_domain_configs。
+  generated_state_machine?: GeneratedStateMachine | null;
   version: number;
   current_version: boolean;
   previous_version: number | null;

@@ -147,11 +147,11 @@ use admin_relationship_suggestions::{
 use assets::{create_content_asset, list_content_assets};
 use ask_human_inbox::{ask_human_inbox, ask_human_summary};
 use contacts::{
-    analyze_contact_profile, add_deal_event, disable_agent, enable_agent, get_contact,
-    get_contact_memory_card, get_operating_memory, get_operation_health, import_contacts_endpoint,
-    list_contact_memory_candidates, list_contacts, list_entitlements, list_outcome_events,
-    run_contact_memory_consolidation, search_contacts_endpoint, search_import_contacts,
-    update_operating_memory, update_operation_profile, update_profile_note,
+    analyze_contact_profile, add_deal_event, clear_referral, disable_agent, enable_agent,
+    get_contact, get_contact_memory_card, get_operating_memory, get_operation_health,
+    import_contacts_endpoint, list_contact_memory_candidates, list_contacts, list_entitlements,
+    list_outcome_events, run_contact_memory_consolidation, search_contacts_endpoint,
+    search_import_contacts, update_operating_memory, update_operation_profile, update_profile_note,
     update_assist_override, update_custom_agent_instructions, update_manual_tags,
 };
 use conversations::list_messages;
@@ -324,6 +324,7 @@ pub fn api_router(state: AppState) -> Router<AppState> {
             "/contacts/:id/assist-override",
             put(update_assist_override),
         )
+        .route("/contacts/:id/clear-referral", post(clear_referral))
         .route(
             "/contacts/:id/custom-agent-instructions",
             put(update_custom_agent_instructions),

@@ -4,6 +4,7 @@ import { EmptyState } from "../../components/ui/EmptyState";
 import { StatusBadge, type StatusTone } from "../../components/ui/StatusBadge";
 import { useOperationsStore } from "../../stores/operationsStore";
 import { useAccountStore } from "../../stores/accountStore";
+import { api } from "../../lib/api";
 import type { DecisionReview } from "../../types";
 import styles from "./Operations.module.css";
 
@@ -123,6 +124,7 @@ export default function OperationsFeature() {
                   <th>状态</th>
                   <th>任务内容</th>
                   <th>计划执行</th>
+                  <th>操作</th>
                 </tr>
               </thead>
               <tbody>
@@ -131,6 +133,28 @@ export default function OperationsFeature() {
                     <td><StatusBadge tone={taskStatusTone(task.status)}>{task.status}</StatusBadge></td>
                     <td>{task.content}</td>
                     <td className={styles.cellMuted}>{formatTime(task.runAt)}</td>
+                    <td className={styles.cellActions}>
+                      <button
+                        type="button"
+                        className={styles.linkBtn}
+                        onClick={async () => {
+                          await api.post(`/api/agent-tasks/${task.id}/review-now`);
+                          loadOperationsData(currentAccountId);
+                        }}
+                      >
+                        立即复核
+                      </button>
+                      <button
+                        type="button"
+                        className={styles.linkBtn}
+                        onClick={async () => {
+                          await api.post(`/api/agent-tasks/${task.id}/cancel`);
+                          loadOperationsData(currentAccountId);
+                        }}
+                      >
+                        取消
+                      </button>
+                    </td>
                   </tr>
                 ))}
               </tbody>
