@@ -130,6 +130,69 @@ function AccountSwitcher() {
   );
 }
 
+/// 多 workspace 切换器：仅在 user.workspaces.length > 1 时渲染（单 workspace
+/// 维持纯文本，见 Shell 内分支）。结构对齐 AccountSwitcher——trigger 显当前项 +
+/// ChevronsUpDown，点开 listbox 每项 option + active 项 Check，点击外部关闭。
+/// 选中某项调 authStore 的 onSwitchWorkspace（main.tsx 注入：POST 后 reload）。
+function WorkspaceSwitcher({
+  workspaces,
+  current,
+}: {
+  workspaces: string[];
+  current: string;
+}) {
+  const onSwitchWorkspace = useAuthStore((s) => s.onSwitchWorkspace);
+  const [open, setOpen] = useState(false);
+  const ref = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (!open) return;
+    function onDoc(e: MouseEvent) {
+      if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false);
+    }
+    document.addEventListener("mousedown", onDoc);
+    return () => document.removeEventListener("mousedown", onDoc);
+  }, [open]);
+
+  return (
+    <div className={styles.ws} ref={ref}>
+      <button
+        type="button"
+        data-testid="workspace-switcher-trigger"
+        className={`${styles.wsTrigger} ${open ? styles.wsTriggerOpen : ""}`}
+        onClick={() => setOpen((v) => !v)}
+      >
+        <span className={styles.wsTriggerName}>{current}</span>
+        <ChevronsUpDown size={12} className={styles.wsChevron} />
+      </button>
+      {open && (
+        <div className={styles.wsMenu} role="listbox">
+          {workspaces.map((ws) => {
+            const active = ws === current;
+            return (
+              <button
+                type="button"
+                key={ws}
+                role="option"
+                aria-selected={active}
+                data-testid={`workspace-option-${ws}`}
+                className={`${styles.wsOption} ${active ? styles.wsOptionActive : ""}`}
+                onClick={() => {
+                  onSwitchWorkspace?.(ws);
+                  setOpen(false);
+                }}
+              >
+                <span className={styles.wsOptionName}>{ws}</span>
+                {active && <Check size={12} className={styles.wsCheck} />}
+              </button>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+}
+
 export function Shell() {
   const activeChannel = useNavigationStore((s) => s.activeChannel);
   const setChannel = useNavigationStore((s) => s.setChannel);
@@ -184,7 +247,11 @@ export function Shell() {
               <div className={styles.userAvatar}>{user.username.slice(0, 1).toUpperCase()}</div>
               <div className={styles.userInfo}>
                 <span className={styles.userName}>{user.username}</span>
-                {showWorkspace && <span className={styles.userWs}>{workspace}</span>}
+                {showWorkspace ? (
+                  <WorkspaceSwitcher workspaces={workspaces} current={workspace} />
+                ) : (
+                  workspace && <span className={styles.userWs}>{workspace}</span>
+                )}
               </div>
               <button className={styles.logout} onClick={() => onLogout?.()}>
                 <LogOut size={14} />
