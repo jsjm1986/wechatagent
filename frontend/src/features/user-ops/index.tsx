@@ -15,6 +15,8 @@ import { useStrategyStore } from "../../stores/strategyStore";
 import { useContactStore } from "../../stores/contactStore";
 import { useAccountStore } from "../../stores/accountStore";
 import { useUiStore } from "../../stores/uiStore";
+import { ConfirmProvider } from "../../components/ui/ConfirmDialog";
+import { usePromptSaveConfirm } from "../../components/prompt/usePromptSaveConfirm";
 import type {
   Contact,
   DomainKey,
@@ -44,6 +46,17 @@ function operationDomainByKey(configs: OperationDomainConfig[] | undefined, doma
 }
 
 export default function UserOpsFeature() {
+  // 路径B 二次确认弹框（usePromptSaveConfirm → useConfirm）落在共享编辑器内部，
+  // 必须有 <ConfirmProvider> 祖先，否则 useConfirm 拿到 null 崩溃。system-strategy 已自带，
+  // user-ops 频道在此补挂（标准用法，参照 system-strategy 根 Provider）。
+  return (
+    <ConfirmProvider>
+      <UserOpsFeatureInner />
+    </ConfirmProvider>
+  );
+}
+
+function UserOpsFeatureInner() {
   // Store状态
   const userOpsStore = useUserOpsStore();
   const contactStore = useContactStore();
@@ -159,11 +172,13 @@ export default function UserOpsFeature() {
     editSoul,
     newSoulDraftFor,
     createPromptTemplate,
-    savePromptTemplate,
     publishPromptTemplate,
     editPromptTemplate,
     newPromptDraftFor
   } = strategyStore;
+
+  // 路径B 二次确认：prompt 保存改为组件层经此 hook 消费 store 三态。
+  const runSavePrompt = usePromptSaveConfirm();
 
   // 计算衍生状态
   const managedCount = useMemo(
@@ -344,7 +359,7 @@ export default function UserOpsFeature() {
               onPromptDraft={setPromptDraft}
               onPublishPromptTemplate={publishPromptTemplate}
               onPublishSoul={publishSoul}
-              onSavePromptTemplate={(e) => { e.preventDefault(); void savePromptTemplate(); }}
+              onSavePromptTemplate={(e) => { e.preventDefault(); void runSavePrompt(); }}
               onSaveSoul={(e) => { e.preventDefault(); void saveSoul(); }}
               onSoulDraft={setSoulDraft}
             />

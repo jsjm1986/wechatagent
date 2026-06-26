@@ -3,6 +3,8 @@ import { Workflow } from "lucide-react";
 import { api } from "../../lib/api";
 import { formatRate, formatNumber } from "../../lib/format";
 import { useAccountStore } from "../../stores/accountStore";
+import { ConfirmProvider, useConfirm } from "../../components/ui/ConfirmDialog";
+import { promptDiffBody } from "../../components/prompt/usePromptSaveConfirm";
 import styles from "./Quality.module.css";
 
 // 运营成效中心频道：长期指标 / 知识自动校验 / 公式遵守度评测 / 产品声明兜底标记词。
@@ -354,6 +356,17 @@ export function FormulaAdherenceTab({ accountId }: { accountId?: string }) {
 }
 
 export function ProductClaimMarkersTab() {
+  // 路径B 二次确认弹框需 <ConfirmProvider> 祖先；quality 频道未挂全局 Provider，
+  // 本 Tab 自包含补挂（独立内联 save()，与 strategyStore 无关）。
+  return (
+    <ConfirmProvider>
+      <ProductClaimMarkersTabInner />
+    </ConfirmProvider>
+  );
+}
+
+function ProductClaimMarkersTabInner() {
+  const confirm = useConfirm();
   const [template, setTemplate] = useState<PromptTemplateLite | null>(null);
   const [draft, setDraft] = useState<string>("");
   const [parseError, setParseError] = useState<string>("");
@@ -407,7 +420,7 @@ export function ProductClaimMarkersTab() {
     setParseError(validateJson(value));
   }
 
-  async function save() {
+  async function save(force?: boolean) {
     if (!template) return;
     const validation = validateJson(draft);
     if (validation) {
@@ -418,20 +431,52 @@ export function ProductClaimMarkersTab() {
     setErr("");
     setStatusMsg("");
     try {
-      await api.put(`/api/prompt-templates/${template.id}`, {
-        promptKey: template.promptKey,
-        agentKind: "user",
-        layer: "review_guard",
-        title: "产品事实风险兜底标记",
-        description: "Rust 字符串兜底 guard 使用的可编辑标记词和白名单。",
-        content: draft,
-        status: "active",
-      });
+      const resp = await api.put<{ status?: string; reason?: string; diff?: string }>(
+        `/api/prompt-templates/${template.id}`,
+        {
+          promptKey: template.promptKey,
+          agentKind: "user",
+          layer: "review_guard",
+          title: "产品事实风险兜底标记",
+          description: "Rust 字符串兜底 guard 使用的可编辑标记词和白名单。",
+          content: draft,
+          status: "active",
+          // force=true：管理者已逐字核对，覆盖 LLM 红线语义审查。
+          ...(force ? { force: true } : {}),
+        }
+      );
+      // 真 bug 修复：needs_human_confirm 是 200，不能静默当成功发布。
+      if (resp && resp.status === "needs_human_confirm") {
+        setSaving(false);
+        const ok = await confirm({
+          title: "改动需逐字核对后确认",
+          body: promptDiffBody(resp.reason ?? "", resp.diff ?? ""),
+          tone: "danger",
+          confirmText: "已核对，强制保存",
+          requireText: "已核对",
+        });
+        if (ok) await save(true);
+        return;
+      }
       await api.post(`/api/prompt-templates/${template.id}/publish`);
       setStatusMsg("已发布，Rust 端缓存已失效；下一次 review 即生效。");
       await load();
     } catch (e) {
-      setErr(e instanceof Error ? e.message : String(e));
+      const message = e instanceof Error ? e.message : String(e);
+      // Reject：4xx「红线语义审查拒绝」→ 弹框显拒绝理由 + 强制保存入口。
+      if (message.includes("红线语义审查拒绝")) {
+        setSaving(false);
+        const ok = await confirm({
+          title: "触碰自治边界红线，已被语义审查拦截",
+          body: promptDiffBody(message, ""),
+          tone: "danger",
+          confirmText: "已核对无误，强制保存",
+          requireText: "已核对",
+        });
+        if (ok) await save(true);
+        return;
+      }
+      setErr(message);
     } finally {
       setSaving(false);
     }
