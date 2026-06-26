@@ -213,6 +213,7 @@ pub(super) async fn post_management_message(
             created_at: DateTime::now(),
             updated_at: DateTime::now(),
         };
+        crate::models::assert_tool_call_status_valid(&call_start.status);
         let call_result = state.db.tool_calls().insert_one(call_start, None).await?;
         let call_id = call_result
             .inserted_id
@@ -236,6 +237,7 @@ pub(super) async fn post_management_message(
                     (ToolOutcome::Unverified(_), _) => "executed_unverified",
                 };
                 let response_doc = to_document(&response).ok();
+                crate::models::assert_tool_call_status_valid(status_str);
                 state
                     .db
                     .tool_calls()
@@ -269,6 +271,7 @@ pub(super) async fn post_management_message(
             }
             Err(error) => {
                 let message = error.to_string();
+                crate::models::assert_tool_call_status_valid("failed");
                 state
                     .db
                     .tool_calls()
@@ -1544,5 +1547,22 @@ mod tests {
         assert!(!names.contains("os.exec"));
         assert!(!names.contains("message_send_text"));
         assert!(!names.contains("admin.delete_workspace"));
+    }
+
+    #[test]
+    fn tool_call_status_closed_set() {
+        use crate::models::ALLOWED_TOOL_CALL_STATUS;
+        const EXPECTED: &[&str] = &["running", "dry_run", "succeeded", "failed", "executed_unverified"];
+        for s in EXPECTED {
+            assert!(ALLOWED_TOOL_CALL_STATUS.contains(s), "缺少状态 {s}");
+        }
+        assert_eq!(ALLOWED_TOOL_CALL_STATUS.len(), 5);
+    }
+
+    #[test]
+    fn assert_tool_call_status_accepts_all_valid() {
+        for s in ["running", "dry_run", "succeeded", "failed", "executed_unverified"] {
+            crate::models::assert_tool_call_status_valid(s); // 不 panic 即通过
+        }
     }
 }
