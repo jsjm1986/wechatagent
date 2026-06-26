@@ -4012,6 +4012,54 @@ async fn apply_agent_updates(
         }
     }
 
+    // F23：决策后从 agent_generated_signals 提取 suspected_deal 弱信号，upsert 至
+    // 待核实专表（status=pending）。**红线：AI 永不直写 outcome_events**——这里只进
+    // 待核实队列，运营 approve 才调 add_outcome_event_inner 落正式成交。suspected_deal
+    // 不是字典维度，无 dimension_registry 校验，直接用信号 value/evidence/confidence。
+    // 全程 fail-soft：回复已异步发出，写信号失败绝不阻断主流程。
+    if let Some((value, evidence, confidence)) =
+        extract_suspected_deal_signal(&decision.agent_generated_signals)
+    {
+        let contact_id = contact.id.map(|id| id.to_hex()).unwrap_or_default();
+        let now = DateTime::now();
+        let mut set_fields = doc! {
+            "value": &value,
+            "confidence": confidence,
+            "last_seen_at": now,
+        };
+        if let Some(ev) = &evidence {
+            set_fields.insert("evidence", ev);
+        }
+        // upsert 锚 (workspace_id, contact_id, status="pending")（F23 unique 索引）。已审
+        // （approved/rejected）的不复活——filter 加 status="pending" 约束：仅 pending 或
+        // 不存在时刷新累加；已审记录命中不到 → $setOnInsert 又因 unique 锚冲突而不新建
+        // → no-op，保核实结论不被新一轮信号覆盖回 pending。value 只放 $set（upsert 时
+        // 插入也会写），避免与 $setOnInsert 键冲突。
+        let filter = doc! {
+            "workspace_id": &contact.workspace_id,
+            "contact_id": &contact_id,
+            "status": "pending",
+        };
+        let update = doc! {
+            "$set": set_fields,
+            "$setOnInsert": {
+                "workspace_id": &contact.workspace_id,
+                "account_id": &contact.account_id,
+                "contact_id": &contact_id,
+                "status": "pending",
+                "first_seen_at": now,
+            },
+            "$inc": { "occurrences": 1 },
+        };
+        let opts = mongodb::options::UpdateOptions::builder().upsert(true).build();
+        // fail-soft：写信号失败（含已审记录与 unique 锚的 upsert 竞态 E11000）不阻断主流程。
+        let _ = state
+            .db
+            .collection_suspected_deal_signals()
+            .update_one(filter, update, opts)
+            .await;
+    }
+
     // 客观购买事实 spec §6：G4→G1 纠偏命中时记一条 fail-soft 审计事件（类比
     // operation_state_transition_rejected）。reply 已照常下发、纠偏值已写入画像，
     // 这里只留可观测痕迹，不阻塞、不回滚。llm_original 为空表示 LLM 漏报 G1（补客观锚），
@@ -4740,6 +4788,21 @@ fn extract_relationship_type_suggestion(
         .map(|s| (s.value.clone(), s.evidence.clone(), s.confidence))
 }
 
+/// F23：从 LLM 的 `agent_generated_signals` 提取第一个 `kind == "suspected_deal"`
+/// 的弱信号，返回 `(value, evidence, confidence)`。无该信号则 None。
+///
+/// 与 relationship_type 不同：suspected_deal **不是字典维度**，无 dimension_registry
+/// 校验——直接用信号的 value/evidence/confidence。纯函数无 IO，落库由调用方接力
+/// （upsert 至待核实专表，**绝不直接落正式成交**——红线：AI 永不直写 outcome）。
+fn extract_suspected_deal_signal(
+    signals: &[crate::agent::types::AgentSignal],
+) -> Option<(String, Option<String>, i32)> {
+    signals
+        .iter()
+        .find(|s| s.kind == "suspected_deal")
+        .map(|s| (s.value.clone(), s.evidence.clone(), s.confidence))
+}
+
 pub async fn write_event_for_account(
     state: &AppState,
     account_id: &str,
@@ -5053,6 +5116,37 @@ mod tests {
             confidence: 5,
         }];
         assert_eq!(extract_relationship_type_suggestion(&signals), None);
+    }
+
+    #[test]
+    fn extract_suspected_deal_signal_picks_kind() {
+        use crate::agent::types::AgentSignal;
+        let signals = vec![
+            AgentSignal { kind: "other".into(), value: "x".into(), evidence: None, confidence: 5 },
+            AgentSignal {
+                kind: "suspected_deal".into(),
+                value: "疑似成交·待核实".into(),
+                evidence: Some("客户说要下单".into()),
+                confidence: 75,
+            },
+        ];
+        let got = extract_suspected_deal_signal(&signals);
+        assert_eq!(
+            got,
+            Some(("疑似成交·待核实".to_string(), Some("客户说要下单".to_string()), 75))
+        );
+    }
+
+    #[test]
+    fn extract_suspected_deal_signal_none_when_absent() {
+        use crate::agent::types::AgentSignal;
+        let signals = vec![AgentSignal {
+            kind: "relationship_type".into(),
+            value: "peer".into(),
+            evidence: None,
+            confidence: 5,
+        }];
+        assert_eq!(extract_suspected_deal_signal(&signals), None);
     }
 
     #[test]
