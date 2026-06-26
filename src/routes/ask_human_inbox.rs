@@ -36,6 +36,14 @@ pub struct InboxItem {
     pub contact_wxid: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub principal_wxid: Option<String>,
+    // 关系类型建议富字段（仅 relationship_suggestion 来源填充）：决策人需看到
+    // AI 判断依据/置信度/出现次数，避免盲批改写 relationship_type。其余来源恒 None。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub evidence: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub confidence: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub occurrences: Option<i32>,
 }
 
 fn age_hours_of(created: Option<DateTime>, now_ms: i64) -> f64 {
@@ -74,6 +82,9 @@ fn escalation_to_inbox_item(
         question_for_principal: non_empty(&e.question_for_principal),
         contact_wxid: non_empty(&e.contact_wxid),
         principal_wxid: non_empty(&e.principal_wxid),
+        evidence: None,
+        confidence: None,
+        occurrences: None,
     }
 }
 
@@ -126,6 +137,9 @@ async fn collect_knowledge_review(
                 question_for_principal: None,
                 contact_wxid: None,
                 principal_wxid: None,
+                evidence: None,
+                confidence: None,
+                occurrences: None,
             }
         })
         .collect())
@@ -167,6 +181,9 @@ async fn collect_taxonomy_candidates(
                 question_for_principal: None,
                 contact_wxid: None,
                 principal_wxid: None,
+                evidence: None,
+                confidence: None,
+                occurrences: None,
             }
         })
         .collect())
@@ -196,17 +213,20 @@ async fn collect_relationship_suggestions(
                 source: "relationship_suggestion".into(),
                 id,
                 title: format!("关系类型建议：{}", r.suggested_value),
-                summary: r.suggested_value.clone(),
+                summary: r.evidence.clone().unwrap_or_else(|| r.suggested_value.clone()),
                 severity: "low".into(),
                 created_at: Some(r.last_seen_at),
                 age_hours: age_hours_of(Some(r.last_seen_at), now_ms),
                 action_kind: "inline".into(),
                 rich_component: None,
                 rich_params: None,
-                category: None,
+                category: Some(r.suggested_value.clone()),
                 question_for_principal: None,
-                contact_wxid: None,
+                contact_wxid: non_empty(&r.contact_id),
                 principal_wxid: None,
+                evidence: r.evidence.clone(),
+                confidence: Some(r.confidence),
+                occurrences: Some(r.occurrences),
             }
         })
         .collect())
@@ -247,6 +267,9 @@ async fn collect_gap_signals(
                 question_for_principal: None,
                 contact_wxid: None,
                 principal_wxid: None,
+                evidence: None,
+                confidence: None,
+                occurrences: None,
             }
         })
         .collect())
@@ -287,6 +310,9 @@ async fn collect_profile_drafts(
                 question_for_principal: None,
                 contact_wxid: None,
                 principal_wxid: None,
+                evidence: None,
+                confidence: None,
+                occurrences: None,
             }
         })
         .collect())
@@ -327,6 +353,9 @@ async fn collect_evolution_proposals(
                 question_for_principal: None,
                 contact_wxid: None,
                 principal_wxid: None,
+                evidence: None,
+                confidence: None,
+                occurrences: None,
             }
         })
         .collect())
@@ -371,6 +400,9 @@ async fn collect_lessons_learned(
                 question_for_principal: None,
                 contact_wxid: None,
                 principal_wxid: None,
+                evidence: None,
+                confidence: None,
+                occurrences: None,
             }
         })
         .collect())
