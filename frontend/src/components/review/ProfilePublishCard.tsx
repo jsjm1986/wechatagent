@@ -10,6 +10,7 @@
 // 定稿但未生效）→ useConfirm 模态二次确认 → POST /rollout 才真正生效；普通字段发布即生效。
 import { useCallback, useEffect, useState } from "react";
 import { api } from "../../lib/api";
+import type { GeneratedStateMachine } from "../../types";
 import { useConfirm } from "../ui/ConfirmDialog";
 import { useToast } from "../ui/Toast";
 
@@ -19,6 +20,9 @@ interface ProfileLite {
   display_name?: string;
   is_active?: boolean;
   current_version?: boolean;
+  // H13：AI 生成状态机本体（draft）。外层 snake_case，内层 key camelCase（绕过 normalize_json_keys）。
+  // 激活前供管理员审阅 states/goal/advanceSignals/riskRules（AI 不自我核验、审阅后才激活）。
+  generated_state_machine?: GeneratedStateMachine | null;
 }
 
 export function ProfilePublishCard({
@@ -115,12 +119,55 @@ export function ProfilePublishCard({
   if (error) return <div className="profilePublishError">加载失败：{error}</div>;
   if (!profile) return <div className="profilePublishLoading">加载中…</div>;
 
+  const states = profile.generated_state_machine?.states ?? [];
+
   return (
     <div className="profilePublishCard">
       <div className="profilePublishName">{profile.display_name ?? profileId}</div>
       <div className="profilePublishStatus">
         {profile.is_active ? "已激活" : profile.current_version ? "待激活" : "草稿"}
       </div>
+      {states.length > 0 && (
+        <div className="profilePublishStateMachine">
+          <div className="profilePublishStateMachineTitle">状态机（激活前审阅）</div>
+          <ul className="profilePublishStateList">
+            {states.map((s, i) => (
+              <li key={s.key ?? `state-${i}`} className="profilePublishState">
+                <div className="profilePublishStateHead">
+                  {s.name && <span className="profilePublishStateName">{s.name}</span>}
+                  {s.key && <code className="profilePublishStateKey">{s.key}</code>}
+                  {s.initial && <span className="profilePublishStateInitial">初始态</span>}
+                </div>
+                {s.goal && (
+                  <div className="profilePublishStateGoal">
+                    目标：<span className="profilePublishGoalText">{s.goal}</span>
+                  </div>
+                )}
+                {s.advanceSignals && s.advanceSignals.length > 0 && (
+                  <div className="profilePublishStateSignals">
+                    推进信号：
+                    {s.advanceSignals.map((sig, j) => (
+                      <span key={`adv-${i}-${j}`} className="profilePublishTag">
+                        {sig}
+                      </span>
+                    ))}
+                  </div>
+                )}
+                {s.riskRules && s.riskRules.length > 0 && (
+                  <div className="profilePublishStateRisks">
+                    风控规则：
+                    {s.riskRules.map((rule, j) => (
+                      <span key={`risk-${i}-${j}`} className="profilePublishTag">
+                        {rule}
+                      </span>
+                    ))}
+                  </div>
+                )}
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
       <div className="profilePublishActions">
         {!profile.is_active && !profile.current_version && (
           <button type="button" disabled={busy} onClick={() => void publish()}>
