@@ -854,6 +854,23 @@ pub(super) fn merge_product_tools(mut tools: Value) -> Value {
             "name": "wechatagent.import_knowledge_image",
             "description": "从图片（视觉理解）导入运营知识切片（落库 status=draft，需后续人核验）。参数：body（ImportApplyImageRequest：imageBase64 等）。"
         }),
+        // ── 批 4：需小重构才接入的工具（抽内部 fn / scope 校验 / 字节 helper）──
+        json!({
+            "name": "wechatagent.cancel_outbox",
+            "description": "取消指定的待发送 outbox 条目（仅 pending/in_flight 可取消，可逆单对象）。参数：id（outbox 条目 id），cancelReason（取消原因，上限 200 字）。"
+        }),
+        json!({
+            "name": "wechatagent.approve_relationship_suggestion",
+            "description": "审核通过指定的 relationship_type 建议，回写好友的关系类型（经维度字典校验）。参数：id（建议 id），可选 reviewedBy。"
+        }),
+        json!({
+            "name": "wechatagent.approve_taxonomy_candidate",
+            "description": "审核通过指定的标签候选并写入标签字典（出草稿性质）。仅可审 scope=global 或本账号的候选。参数：id（候选 id），canonicalValue（id、label、可选 aliases/description），可选 reviewedBy。"
+        }),
+        json!({
+            "name": "wechatagent.import_knowledge_pdf",
+            "description": "把 PDF（base64 编码字节）导入为运营知识切片（落库 status=draft，需后续人核验）。参数：sourceName（来源名），pdfBase64（base64 编码的 PDF 字节）。"
+        }),
     ];
     match &mut tools {
         Value::Object(map) => {
@@ -1125,7 +1142,13 @@ pub(super) fn tool_effect(tool_name: &str) -> ToolEffect {
         | "wechatagent.apply_gap_signal"
         | "wechatagent.dismiss_gap_signal"
         | "wechatagent.import_knowledge_text"
-        | "wechatagent.import_knowledge_image" => Low,
+        | "wechatagent.import_knowledge_image"
+        // 批 4：cancel_outbox（取消可逆单对象）/ approve_relationship_suggestion（单 contact 回写）
+        // / approve_taxonomy_candidate（出草稿性质）/ import_knowledge_pdf（导入落 draft 待核验）= Low
+        | "wechatagent.cancel_outbox"
+        | "wechatagent.approve_relationship_suggestion"
+        | "wechatagent.approve_taxonomy_candidate"
+        | "wechatagent.import_knowledge_pdf" => Low,
         // 高风险/宽影响（立即全量/改全局）
         "wechatagent.send_contact_message"
         | "wechatagent.publish_prompt_template"
@@ -2212,6 +2235,65 @@ pub(super) async fn execute_management_tool(
             .await?;
             Ok(resp.0)
         }
+        // ── 批 4：需小重构才接入的工具 ──
+        "wechatagent.cancel_outbox" => {
+            // 复用抽出的 cancel_outbox_inner（带 workspace 过滤）；不可取消时 inner
+            // 返 AppError::Conflict，由 execute_plan_tool_calls 当 Err「失败即止」处理。
+            let id = string_arg(&planned.arguments, "id")?;
+            let reason = string_arg(&planned.arguments, "cancelReason")
+                .or_else(|_| string_arg(&planned.arguments, "cancel_reason"))?;
+            crate::routes::admin_outbox::cancel_outbox_inner(state, workspace_id, &id, &reason).await
+        }
+        "wechatagent.approve_relationship_suggestion" => {
+            let id = string_arg(&planned.arguments, "id")?;
+            let payload = serde_json::from_value(planned.arguments.clone())
+                .or_else(|_| serde_json::from_value(json!({})))
+                .map_err(|e| AppError::BadRequest(format!("参数解析失败: {e}")))?;
+            crate::routes::admin_relationship_suggestions::approve_relationship_suggestion_inner(
+                state,
+                workspace_id,
+                &id,
+                payload,
+            )
+            .await
+        }
+        "wechatagent.approve_taxonomy_candidate" => {
+            // scope 隔离用 account_id（候选无 workspace_id 字段，隔离边界是 scope）：
+            // 管理者只能 approve scope=global 或本 account_id 的候选（inner 内校验）。
+            let id = string_arg(&planned.arguments, "id")?;
+            let payload = serde_json::from_value(planned.arguments.clone())
+                .map_err(|e| AppError::BadRequest(format!("参数解析失败: {e}")))?;
+            crate::routes::admin_taxonomy_candidates::approve_taxonomy_candidate_inner(
+                state, account_id, &id, payload,
+            )
+            .await
+        }
+        "wechatagent.import_knowledge_pdf" => {
+            // PDF 字节无法走 multipart，从 arguments 取 base64 解码后喂 import_pdf_bytes。
+            // base64 解码方式与 multimodal.rs / media_send.rs 一致（STANDARD engine）。
+            use base64::Engine;
+            let source_name = string_arg(&planned.arguments, "sourceName")
+                .or_else(|_| string_arg(&planned.arguments, "source_name"))?;
+            let pdf_base64 = string_arg(&planned.arguments, "pdfBase64")
+                .or_else(|_| string_arg(&planned.arguments, "pdf_base64"))?;
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(pdf_base64.trim())
+                .map_err(|e| AppError::BadRequest(format!("pdfBase64 解码失败: {e}")))?;
+            let outcome = crate::routes::knowledge::import_pdf_bytes(
+                state,
+                workspace_id,
+                Some(account_id),
+                &source_name,
+                bytes,
+            )
+            .await?;
+            Ok(json!({
+                "documentId": outcome.document_id,
+                "chunkIds": outcome.chunk_ids,
+                "parseWarnings": outcome.parse_warnings,
+                "fallbackBlob": outcome.fallback_blob,
+            }))
+        }
         _ => {
             // 兜底分支：只允许把 tools/list 真实公布过的工具名透传给生产 MCP。
             if !advertised.contains(planned.tool_name.as_str()) {
@@ -2511,6 +2593,48 @@ mod tests {
         assert_eq!(tool_effect("wechatagent.edit_state_machine").risk, ToolRisk::Dangerous);
         // verify 类 = Dangerous（推 chunk 到 verified，写 source=Human）
         assert_eq!(tool_effect("wechatagent.verify_knowledge_chunk").risk, ToolRisk::Dangerous);
+    }
+
+    #[test]
+    fn merged_catalog_includes_batch4_tools() {
+        let merged = merge_product_tools(json!({ "tools": [] }));
+        let names = advertised_tool_names(&merged);
+        for t in [
+            "wechatagent.cancel_outbox",
+            "wechatagent.approve_relationship_suggestion",
+            "wechatagent.approve_taxonomy_candidate",
+            "wechatagent.import_knowledge_pdf",
+        ] {
+            assert!(names.contains(t), "catalog 缺工具 {t}");
+        }
+    }
+
+    #[test]
+    fn tool_effect_classifies_batch4_risk() {
+        // 批 4 四工具均归 Low（取消可逆 / 单 contact 回写 / 出草稿 / 导入落 draft）
+        assert_eq!(tool_effect("wechatagent.cancel_outbox").risk, ToolRisk::Low);
+        assert_eq!(
+            tool_effect("wechatagent.approve_relationship_suggestion").risk,
+            ToolRisk::Low
+        );
+        assert_eq!(
+            tool_effect("wechatagent.approve_taxonomy_candidate").risk,
+            ToolRisk::Low
+        );
+        assert_eq!(tool_effect("wechatagent.import_knowledge_pdf").risk, ToolRisk::Low);
+        // Low 工具非只读：dry-run 下应被拦截不实际执行
+        assert!(!tool_effect("wechatagent.cancel_outbox").read_only);
+    }
+
+    #[test]
+    fn taxonomy_scope_check_allows_global_and_own_account() {
+        use crate::routes::admin_taxonomy_candidates::taxonomy_scope_allows;
+        // global 候选任何账号可审
+        assert!(taxonomy_scope_allows("global", "acc_a"));
+        // 同 account 候选本账号可审
+        assert!(taxonomy_scope_allows("acc_a", "acc_a"));
+        // 他 account 候选拒绝（跨 account scope 隔离）
+        assert!(!taxonomy_scope_allows("acc_b", "acc_a"));
     }
 
     #[test]
