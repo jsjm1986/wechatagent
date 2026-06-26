@@ -11,19 +11,22 @@
 //! - `GET /api/admin/suspected-deals?status=pending`
 //!     列待核实信号；按 status 过滤（默认 pending），**强制 workspace 隔离**。
 //! - `POST /api/admin/suspected-deals/:id/approve`
-//!     行为：
-//!       1. 读 signal（必须 `status=pending`，且属当前 workspace）。
-//!       2. `find_contact_by_id`（workspace 隔离）取回 contact。
-//!       3. **先落正式成交**：`add_outcome_event_inner(verification=staff_confirmed,
-//!          source="manual", event_kind="deal", marked_by=<admin>)`——这是业务生效点。
-//!       4. mark signal `status="approved"` + reviewed_at + reviewed_by。
+//!     行为（**CAS-first**，财务安全顺序）：
+//!       1. 读 signal（属当前 workspace），仅为拿 contact_id。
+//!       2. **原子 CAS 占位**：`update_one(filter:{_id, workspace_id, status:"pending"},
+//!          $set:{status:"approved", reviewed_at, reviewed_by})`；`matched_count==0`
+//!          （并发/已审/跨 workspace）→ NotFound，**绝不落成交**。
+//!       3. CAS 成功后才 `find_contact_by_id`（workspace 隔离）+ **落正式成交**：
+//!          `add_outcome_event_inner(verification=staff_confirmed, source="manual",
+//!          event_kind="deal", marked_by=<admin>)`。
 //! - `POST /api/admin/suspected-deals/:id/reject`
 //!     body: `{ reason }` —— 写 `rejection_reason` 并 `status="rejected"`。
 //!
-//! 注意：approve 涉及「落成交 + 改信号状态」两步，MongoDB 单机部署不支持事务，
-//! 这里采用「先落成交 → 再改信号状态」的最佳努力顺序写。先落成交是因为它才是业务
-//! 生效点；若改信号状态失败，信号仍为 pending，但成交已落（append-only 正例池），
-//! 下次 approve 会再 append 一条——故运营侧应避免对同一信号重复 approve。
+//! 注意：approve 涉及「改信号状态 + 落成交」两步，MongoDB 单机部署不支持事务。
+//! `outcome_events` 是 append-only 无 dedup，故这里采用 **CAS-first**：先原子地把信号
+//! 从 pending 占位改 approved，再落成交。重复 approve 在 CAS 步（status 已非 pending →
+//! matched==0）即被挡，根治财务双计；代价是「CAS 成功但落成交失败 → 已 approved 但未落
+//! 成交」的漏登假阴——可由运营走 add_deal_event 手动补登，对 append-only 财务远比双计可接受。
 
 use axum::{
     extract::{Path, Query, State},
@@ -123,9 +126,16 @@ pub async fn approve_suspected_deal(
     Ok(Json(value).into_response())
 }
 
-/// approve_suspected_deal 的内部核心：workspace 隔离读 signal（校验 pending）→
-/// 取回 contact → **落正式成交（verification=staff_confirmed）** → mark 信号 approved
-/// → 返回 `{"item": <signal json>}`。跨 workspace / 不存在的 _id 返 NotFound。
+/// approve_suspected_deal 的内部核心（**CAS-first**）：workspace 隔离读 signal（仅为
+/// 拿 contact_id）→ **原子 CAS 把信号从 pending 占位改 approved** → CAS 成功后才落正式
+/// 成交（verification=staff_confirmed）→ 返回 `{"item": <signal json>}`。
+/// 跨 workspace / 不存在 / 已非 pending 的 _id 返 NotFound（不泄漏存在性）。
+///
+/// **为什么先 CAS 再落成交**：`outcome_events` 是 append-only 无 dedup。若反过来「先落成交
+/// 再改状态」，步间崩溃会留下 pending 信号 → 重试 approve 再 append → 财务双计。CAS-first
+/// 让重复 approve 在第 1 步 CAS（status 已非 pending → matched==0）就被挡，根本到不了落成交，
+/// 把「双计假阳」换成「CAS 成功但落成交失败 → 已 approved 但未落成交」的「漏登假阴」——漏登
+/// 可由运营走 add_deal_event 手动补登，对 append-only 财务数据远比双计可接受。
 async fn approve_suspected_deal_inner(
     state: &AppState,
     admin: &AuthenticatedAdmin,
@@ -135,21 +145,12 @@ async fn approve_suspected_deal_inner(
     let workspace_id = &admin.current_workspace;
     let object_id = parse_object_id(id)?;
     let signals = state.db.collection_suspected_deal_signals();
-    // 查询带 workspace 过滤：跨 workspace 的 _id 返回 NotFound（不泄漏存在性）。
+    // 读 signal 仅为拿 contact_id（落成交需要）；pending 校验以下方 CAS 的 matched_count
+    // 为准（防 TOCTOU）。查询带 workspace 过滤：跨 workspace 的 _id 返回 NotFound。
     let signal = signals
         .find_one(doc! { "_id": object_id, "workspace_id": workspace_id }, None)
         .await?
         .ok_or_else(|| AppError::NotFound("suspected deal signal not found".to_string()))?;
-    if signal.status != "pending" {
-        return Err(AppError::BadRequest(format!(
-            "信号状态 = {}，仅 status=pending 可 approve",
-            signal.status
-        )));
-    }
-
-    // workspace 隔离取 contact——确认信号指向的 contact 仍在当前 workspace
-    // （跨 workspace / 不存在均 404，不落成交）。
-    let contact = find_contact_by_id(state, workspace_id, &signal.contact_id).await?;
 
     let reviewer = payload
         .reviewed_by
@@ -159,8 +160,37 @@ async fn approve_suspected_deal_inner(
         .map(ToString::to_string)
         .unwrap_or_else(|| admin.username.clone());
 
-    // 第 1 步（业务生效点）：落正式成交。**红线**：verification 强制 staff_confirmed
-    // ——疑似线索经人审核实后才落成交，AI 永不直写 outcome。
+    // 第 1 步（CAS 占位，先于落成交）：原子地把信号从 pending 改 approved。filter 带
+    // status:"pending" + workspace_id —— matched==0 说明并发/已审/跨 workspace，此时
+    // **绝不落成交**直接返回，重复 approve 在此被挡，根治 append-only 财务双计。
+    let now = DateTime::now();
+    let cas = signals
+        .update_one(
+            doc! {
+                "_id": object_id,
+                "workspace_id": workspace_id,
+                "status": "pending"
+            },
+            doc! {
+                "$set": {
+                    "status": "approved",
+                    "reviewed_at": now,
+                    "reviewed_by": &reviewer
+                }
+            },
+            None,
+        )
+        .await?;
+    if cas.matched_count == 0 {
+        return Err(AppError::NotFound(
+            "suspected deal signal not found or not pending".to_string(),
+        ));
+    }
+
+    // 第 2 步（CAS 成功后才执行）：workspace 隔离取 contact + 落正式成交。**红线**：
+    // verification 强制 staff_confirmed——疑似线索经人审核实后才落成交，AI 永不直写 outcome。
+    // 若此步失败 → 信号已 approved 但未落成交（漏登假阴，运营可手动补登），不会双计。
+    let contact = find_contact_by_id(state, workspace_id, &signal.contact_id).await?;
     add_outcome_event_inner(
         state,
         &contact,
@@ -180,25 +210,8 @@ async fn approve_suspected_deal_inner(
     )
     .await?;
 
-    // 第 2 步：mark 信号 approved。失败时成交已落，信号仍 pending；运营侧应避免重复
-    // approve（重复会再 append 一条成交事件）。
-    let now = DateTime::now();
-    signals
-        .update_one(
-            doc! { "_id": object_id },
-            doc! {
-                "$set": {
-                    "status": "approved",
-                    "reviewed_at": now,
-                    "reviewed_by": &reviewer
-                }
-            },
-            None,
-        )
-        .await?;
-
     let updated = signals
-        .find_one(doc! { "_id": object_id }, None)
+        .find_one(doc! { "_id": object_id, "workspace_id": workspace_id }, None)
         .await?
         .ok_or_else(|| AppError::NotFound("suspected deal signal not found".to_string()))?;
     Ok(json!({ "item": suspected_deal_json(updated) }))
