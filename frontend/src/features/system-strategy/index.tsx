@@ -1966,12 +1966,12 @@ function ProfileEditor({
           <input
             className={styles.input}
             type="text"
-            value={draft.reviewer_orientation?.review_focus ?? ""}
+            value={draft.reviewer_orientation?.reviewFocus ?? ""}
             onChange={(e) =>
               update({
                 reviewer_orientation: {
                   ...(draft.reviewer_orientation ?? {}),
-                  review_focus: e.target.value || undefined,
+                  reviewFocus: e.target.value || undefined,
                 },
               })
             }
@@ -1982,12 +1982,12 @@ function ProfileEditor({
           <input
             className={styles.input}
             type="text"
-            value={draft.reviewer_orientation?.balance_principle ?? ""}
+            value={draft.reviewer_orientation?.balancePrinciple ?? ""}
             onChange={(e) =>
               update({
                 reviewer_orientation: {
                   ...(draft.reviewer_orientation ?? {}),
-                  balance_principle: e.target.value || undefined,
+                  balancePrinciple: e.target.value || undefined,
                 },
               })
             }
