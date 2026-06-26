@@ -89,6 +89,21 @@ export interface RuntimeFlag {
   rolloutPercent: number;
 }
 
+// 阈值变更不可变审计行（release / rollback / auto-release）。后端字段为 camelCase，
+// 以宽松类型读取主要列（gateKey / action / decidedBy / decidedAt / value transition）。
+export interface ThresholdAuditRow {
+  id?: string | null;
+  gateKey?: string | null;
+  action?: string | null;
+  previousValue?: number | null;
+  newValue?: number | null;
+  sourceProposalId?: string | null;
+  decidedBy?: string | null;
+  decidedAt?: string | null;
+  hitRateObserved?: number | null;
+  [k: string]: unknown;
+}
+
 /// 7 天聚合（client 端从 experiments[] 推算 — 不打额外请求；后端尚未提供专用聚合 endpoint）。
 export function aggregateLast7Days(items: ExperimentItem[]): {
   experiments: number;
@@ -171,6 +186,28 @@ export function EvolutionCenterTab({ enabled = true }: { enabled?: boolean }) {
       setFlagMsg(e instanceof Error ? e.message : String(e));
     } finally {
       setFlagBusy(false);
+    }
+  }
+
+  // ── 阈值变更审计日志（点按钮加载，与 runtime-flag 同模式，挂载期不自动 GET）──
+  const [auditRows, setAuditRows] = useState<ThresholdAuditRow[]>([]);
+  const [auditLoaded, setAuditLoaded] = useState(false);
+  const [auditBusy, setAuditBusy] = useState(false);
+  const [auditError, setAuditError] = useState<string>("");
+
+  async function loadAudit() {
+    setAuditBusy(true);
+    setAuditError("");
+    try {
+      const data = await apiGet<{ items: ThresholdAuditRow[] }>(
+        "/api/evolution/threshold-overrides/audit",
+      );
+      setAuditRows(data.items || []);
+      setAuditLoaded(true);
+    } catch (e) {
+      setAuditError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setAuditBusy(false);
     }
   }
 
@@ -262,7 +299,59 @@ export function EvolutionCenterTab({ enabled = true }: { enabled?: boolean }) {
         <button className={styles.btnGhost} onClick={() => void load()} disabled={loading}>
           {loading ? "加载中" : "刷新"}
         </button>
+        <button
+          className={styles.btnGhost}
+          onClick={() => void loadAudit()}
+          disabled={auditBusy}
+          data-testid="threshold-audit-load"
+        >
+          {auditBusy ? "加载中" : "阈值变更审计"}
+        </button>
       </div>
+
+      {(auditLoaded || auditError) && (
+        <div className={styles.auditPanel} data-testid="threshold-audit-panel">
+          {auditError && (
+            <div className={styles.error} role="alert">
+              {auditError}
+            </div>
+          )}
+          {auditLoaded && auditRows.length === 0 && !auditError && (
+            <p className={styles.proposalEmpty} data-testid="threshold-audit-empty">
+              暂无审计记录。
+            </p>
+          )}
+          {auditRows.length > 0 && (
+            <table className={styles.proposalList} data-testid="threshold-audit-table">
+              <thead>
+                <tr>
+                  <th>动作</th>
+                  <th>阈值项</th>
+                  <th>值变更</th>
+                  <th>操作者</th>
+                  <th>时间</th>
+                </tr>
+              </thead>
+              <tbody>
+                {auditRows.map((row, idx) => (
+                  <tr
+                    key={row.id ?? `${row.decidedAt ?? "row"}-${idx}`}
+                    data-testid={`threshold-audit-row-${row.id ?? idx}`}
+                  >
+                    <td>{row.action ?? "—"}</td>
+                    <td>{row.gateKey ?? "—"}</td>
+                    <td>
+                      {formatNumber(row.previousValue ?? null)} → {formatNumber(row.newValue ?? null)}
+                    </td>
+                    <td>{row.decidedBy ?? "—"}</td>
+                    <td>{row.decidedAt ?? "—"}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          )}
+        </div>
+      )}
 
       {error && (
         <div className={styles.error} role="alert">
