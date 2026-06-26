@@ -44,6 +44,35 @@ interface ChatTurn {
   text: string;
   // AI 改动提示:对话能让 AI 用 update_chunk 改这条草稿,但改完仍由运营放行,对话本身不 verify。
   touchedChunk?: boolean;
+  // 本回合 AI 改了哪些字段(patch),键=chunk 字段名、值=改后内容;仅含被改字段。
+  patch?: Record<string, unknown>;
+}
+
+// patch 字段键 → 大白话中文名;键形态可能 camelCase 或 snake_case(来自 LLM 工具产物),两种都归一。
+const PATCH_FIELD_LABELS: Record<string, string> = {
+  title: "标题",
+  summary: "摘要",
+  body: "正文",
+  tags: "标签",
+  knowledgeType: "知识类型",
+  knowledge_type: "知识类型",
+  chunkType: "知识类型",
+  chunk_type: "知识类型",
+  priority: "优先级",
+  sourceQuote: "原话出处",
+  source_quote: "原话出处",
+};
+
+// patch 值渲染:字符串原样;对象/数组用 JSON 兜底,绝不吞内容。
+function renderPatchValue(value: unknown): string {
+  if (value == null) return "(已清空)";
+  if (typeof value === "string") return value;
+  if (typeof value === "number" || typeof value === "boolean") return String(value);
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return String(value);
+  }
 }
 
 function clip(text: string | null | undefined, max = 180): string {
@@ -146,10 +175,15 @@ export function ReviewChat({ chunk, onResolved }: ReviewChatProps) {
             : typeof data.reply === "string"
               ? data.reply
               : "好的。";
-      const touched = !!(turn.patch ?? data.patch);
+      const rawPatch = turn.patch ?? data.patch;
+      const patchObj =
+        rawPatch && typeof rawPatch === "object" && !Array.isArray(rawPatch)
+          ? (rawPatch as Record<string, unknown>)
+          : undefined;
+      const touched = !!patchObj;
       setTurns((prev) => [
         ...prev,
-        { role: "ai", text: naturalReply, touchedChunk: touched },
+        { role: "ai", text: naturalReply, touchedChunk: touched, patch: patchObj },
       ]);
     } catch {
       setTurns((prev) => [...prev, { role: "ai", text: "没接上,稍后再发一次。" }]);
@@ -312,6 +346,21 @@ export function ReviewChat({ chunk, onResolved }: ReviewChatProps) {
                 className={t.role === "operator" ? styles.msgOp : styles.msgAi}
               >
                 <p className={styles.msgText}>{t.text}</p>
+                {t.patch && Object.keys(t.patch).length > 0 && (
+                  <div className={styles.patchPreview}>
+                    <span className={styles.patchLabel}>这次改了</span>
+                    <ul className={styles.patchList}>
+                      {Object.entries(t.patch).map(([k, v]) => (
+                        <li key={k} className={styles.patchItem}>
+                          <span className={styles.patchField}>
+                            {PATCH_FIELD_LABELS[k] ?? k}
+                          </span>
+                          <span className={styles.patchValue}>{renderPatchValue(v)}</span>
+                        </li>
+                      ))}
+                    </ul>
+                  </div>
+                )}
                 {t.touchedChunk && (
                   <span className={styles.msgHint}>← 改动可在左边确认</span>
                 )}

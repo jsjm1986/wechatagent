@@ -221,3 +221,79 @@ describe("决策复盘 reviews tab 拦截四分支(C8)", () => {
     expect(screen.getByText("通过")).toBeInTheDocument();
   });
 });
+
+describe("运行日志 runs tab + tier 遥测(C6+C9)", () => {
+  const mockLoadOperationsData = vi.fn();
+  const mockCurrentAccountId = vi.fn();
+
+  function mountRunsTab(agentRuns: any[]) {
+    vi.clearAllMocks();
+    ((globalThis as any).fetch as any) = vi.fn().mockResolvedValue({
+      ok: true,
+      json: () => Promise.resolve({ items: [] }),
+    });
+    (useOperationsStore as any).mockReturnValue({
+      events: [],
+      tasks: [],
+      decisionReviews: [],
+      llmUsage: null,
+      agentRuns,
+      opsTab: "runs",
+      setOpsTab: vi.fn(),
+      loadOperationsData: mockLoadOperationsData,
+      loadAgentRuns: vi.fn(),
+    });
+    const accountState = {
+      accounts: [
+        { id: "test-account-id", accountId: "test-account-id", alias: "测试", displayName: "测试", online: true },
+      ],
+      selectedAccountId: "test-account-id",
+      currentAccountId: mockCurrentAccountId,
+    };
+    (useAccountStore as any).mockImplementation((selector?: any) =>
+      typeof selector === "function" ? selector(accountState) : accountState
+    );
+    mockCurrentAccountId.mockReturnValue("test-account-id");
+    render(<OperationsFeature />);
+  }
+
+  it("空运行日志显示 EmptyState", () => {
+    mountRunsTab([]);
+    expect(screen.getByText("暂无运行日志")).toBeInTheDocument();
+  });
+
+  it("摘要行渲染 runId/triggerKind/status + 档位遥测来自 decision", () => {
+    mountRunsTab([
+      {
+        id: "r1",
+        runId: "run-1",
+        status: "sent",
+        triggerKind: "inbound",
+        decision: { sufficiency: "need_more_context", missingTier: "full" },
+        gatewayResult: { status: "sent" },
+      },
+    ]);
+    expect(screen.getByText("run-1")).toBeInTheDocument();
+    expect(screen.getByText("inbound")).toBeInTheDocument();
+    // 档位遥测从 decision.missingTier 派生(Full)且标记需升档
+    expect(screen.getByText(/Full（需完整知识档）.*需升档/)).toBeInTheDocument();
+  });
+
+  it("展开后显式列出 tier 遥测三字段(档位/充分性/是否升档)", async () => {
+    mountRunsTab([
+      {
+        id: "r2",
+        runId: "run-2",
+        status: "sent",
+        triggerKind: "inbound",
+        decision: { sufficiency: "enough", missingTier: "none" },
+      },
+    ]);
+    const { fireEvent } = await import("@testing-library/react");
+    fireEvent.click(screen.getByText("展开"));
+    expect(screen.getByText(/充分性:信息充分/)).toBeInTheDocument();
+    expect(screen.getByText(/是否升档:否/)).toBeInTheDocument();
+    // decision 阶段通用 key-value 渲染暴露原始键
+    expect(screen.getByText("missingTier")).toBeInTheDocument();
+  });
+});

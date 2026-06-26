@@ -79,7 +79,7 @@ export function ProposalReleaseCard({
   }
   if (!data) return null;
 
-  const { proposal, shadowReplays } = data;
+  const { proposal, shadowReplays, cohortRunIds } = data;
   const releaseEnabled = proposal.status === "eligible_for_release";
   const rollbackEnabled = proposal.status === "released";
 
@@ -106,6 +106,8 @@ export function ProposalReleaseCard({
       )}
 
       <ShadowEvalReport summary={shadowReplays} proposal={proposal} />
+
+      <MetadataSection proposal={proposal} cohortRunIds={cohortRunIds} />
 
       <footer className={styles.detailActions}>
         <button
@@ -291,6 +293,94 @@ function ShadowEvalReport({
       )}
     </section>
   );
+}
+
+// ── 候选元数据区（后端已返回但原卡片未渲染的 5 字段，E12）──
+// 取值路径有别：diffSummary/riskNote/previousPromptVersion/evalMetrics 在 proposal.*；
+// cohortRunIds 在 ProposalDetailResponse 顶层（由父组件解构后透传）。
+// 空值（string 为 null/空、evalMetrics 空对象、cohortRunIds 空数组）时各区块整体不渲染，
+// 避免详情卡出现空标题。
+
+function MetadataSection({
+  proposal,
+  cohortRunIds,
+}: {
+  proposal: ProposalDetail;
+  cohortRunIds: string[];
+}) {
+  const diffSummary = proposal.diffSummary?.trim() ?? "";
+  const riskNote = proposal.riskNote?.trim() ?? "";
+  const prevVersion = proposal.previousPromptVersion?.trim() ?? "";
+  const metricEntries = Object.entries(proposal.evalMetrics ?? {});
+  const runIds = cohortRunIds ?? [];
+
+  // 5 字段全空时整段不渲染。
+  if (
+    !diffSummary &&
+    !riskNote &&
+    !prevVersion &&
+    metricEntries.length === 0 &&
+    runIds.length === 0
+  ) {
+    return null;
+  }
+
+  return (
+    <section className={styles.metadata} data-testid="proposal-metadata">
+      {diffSummary && (
+        <div className={styles.metaBlock} data-testid="proposal-diff-summary">
+          <h4>变更摘要</h4>
+          <p>{diffSummary}</p>
+        </div>
+      )}
+      {riskNote && (
+        <div className={styles.metaBlock} data-testid="proposal-risk-note">
+          <h4>风险提示</h4>
+          <p>{riskNote}</p>
+        </div>
+      )}
+      {prevVersion && (
+        <div className={styles.metaBlock} data-testid="proposal-prev-version">
+          <h4>上一版 Prompt 版本</h4>
+          <p>{prevVersion}</p>
+        </div>
+      )}
+      {metricEntries.length > 0 && (
+        <div className={styles.metaBlock} data-testid="proposal-eval-metrics">
+          <h4>评测指标</h4>
+          <table className={styles.thresholdTable}>
+            <tbody>
+              {metricEntries.map(([key, value]) => (
+                <tr key={key}>
+                  <th>{key}</th>
+                  <td>{formatMetricValue(value)}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+      {runIds.length > 0 && (
+        <div className={styles.metaBlock} data-testid="proposal-cohort-runs">
+          <h4>Cohort 运行（{runIds.length}）</h4>
+          <div className={styles.expectedTags}>
+            {runIds.map((runId) => (
+              <span key={runId} className={styles.tag}>
+                {runId}
+              </span>
+            ))}
+          </div>
+        </div>
+      )}
+    </section>
+  );
+}
+
+// evalMetrics 值类型不定（数值/字符串/嵌套对象），统一转可读文本。
+function formatMetricValue(value: unknown): string {
+  if (value === null || value === undefined) return "—";
+  if (typeof value === "object") return JSON.stringify(value);
+  return String(value);
 }
 
 // ── 确认弹窗 ──

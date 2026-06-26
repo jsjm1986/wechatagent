@@ -6,6 +6,7 @@ import { ReviewQueue, type RowCtx } from "../../components/review/ReviewQueue";
 import { type InboxItem } from "../../lib/inboxApi";
 import { EscalationInline } from "./inline/EscalationInline";
 import { SimpleApproveReject } from "./inline/SimpleApproveReject";
+import { ResolvedEscalations } from "./ResolvedEscalations";
 import { ChunkReviewCard } from "../../components/review/ChunkReviewCard";
 import { ProfilePublishCard } from "../../components/review/ProfilePublishCard";
 import { ProposalReleaseCard } from "../../components/review/ProposalReleaseCard";
@@ -90,6 +91,8 @@ function AskHumanView() {
   const { errors, summary, loading, fatalError, activeSource, setActiveSource, load } =
     useInboxStore();
   const [refreshNonce, setRefreshNonce] = useState(0);
+  // 视图维度（与 pending 收件箱正交）：pending=待处理统一收件箱，resolved=已裁决历史只读回顾。
+  const [showResolved, setShowResolved] = useState(false);
 
   // 所有刷新统一经 refreshNonce → ReviewQueue refetch → fetchItems → load()。
   // store 是唯一 fetch 来源，不再在这里额外 void load()（消除单次刷新打两次 /inbox）。
@@ -109,58 +112,77 @@ function AskHumanView() {
     <div className="askHumanChannel">
       <header className="askHumanHeader">
         <h1>统一收件箱</h1>
-        <button type="button" onClick={() => refreshAll()} disabled={loading}>
-          刷新
-        </button>
+        <div className="askHumanHeaderActions">
+          <button
+            type="button"
+            className={
+              showResolved ? "askHumanViewToggle askHumanViewToggle--active" : "askHumanViewToggle"
+            }
+            onClick={() => setShowResolved((v) => !v)}
+          >
+            {showResolved ? "待处理" : "已裁决历史"}
+          </button>
+          {!showResolved && (
+            <button type="button" onClick={() => refreshAll()} disabled={loading}>
+              刷新
+            </button>
+          )}
+        </div>
       </header>
 
-      {fatalError && (
-        <div className="askHumanFatal">加载失败（显示上次数据）：{fatalError}</div>
-      )}
-      {errors.length > 0 && (
-        <div className="askHumanSourceErrors">
-          {errors.length} 个来源暂时不可用：{errors.map((e) => e.source).join("、")}
-        </div>
-      )}
-
-      <div className="askHumanSummary">
-        {summary &&
-          SOURCE_META.map(({ summaryKey, source, label }) => (
-            <button
-              key={source}
-              type="button"
-              className={
-                activeSource === source
-                  ? "askHumanSummaryChip askHumanSummaryChip--active"
-                  : "askHumanSummaryChip"
-              }
-              onClick={() => {
-                const next = activeSource === source ? null : source;
-                setActiveSource(next); // 同步改 store.activeSource，load() 不传参时读它
-                setRefreshNonce((n) => n + 1); // 触发 ReviewQueue 重 fetch（经 load 读新 activeSource）
-              }}
-            >
-              {label}: {summary[summaryKey] ?? 0}
-            </button>
-          ))}
-      </div>
-
-      <ReviewQueue<InboxItem>
-        key={activeSource ?? "all"}
-        refreshToken={refreshNonce}
-        fetchItems={fetchItems}
-        getId={(i) => `${i.source}:${i.id}`}
-        renderItem={(item, ctx) =>
-          item.actionKind === "rich" ? (
-            <div className="askHumanRichRow">
-              {renderRich(item, () => refreshAll())}
+      {showResolved ? (
+        <ResolvedEscalations />
+      ) : (
+        <>
+          {fatalError && (
+            <div className="askHumanFatal">加载失败（显示上次数据）：{fatalError}</div>
+          )}
+          {errors.length > 0 && (
+            <div className="askHumanSourceErrors">
+              {errors.length} 个来源暂时不可用：{errors.map((e) => e.source).join("、")}
             </div>
-          ) : (
-            <div className="askHumanInlineRow">{renderInline(item, ctx)}</div>
-          )
-        }
-        emptyText="暂无待处理项"
-      />
+          )}
+
+          <div className="askHumanSummary">
+            {summary &&
+              SOURCE_META.map(({ summaryKey, source, label }) => (
+                <button
+                  key={source}
+                  type="button"
+                  className={
+                    activeSource === source
+                      ? "askHumanSummaryChip askHumanSummaryChip--active"
+                      : "askHumanSummaryChip"
+                  }
+                  onClick={() => {
+                    const next = activeSource === source ? null : source;
+                    setActiveSource(next); // 同步改 store.activeSource，load() 不传参时读它
+                    setRefreshNonce((n) => n + 1); // 触发 ReviewQueue 重 fetch（经 load 读新 activeSource）
+                  }}
+                >
+                  {label}: {summary[summaryKey] ?? 0}
+                </button>
+              ))}
+          </div>
+
+          <ReviewQueue<InboxItem>
+            key={activeSource ?? "all"}
+            refreshToken={refreshNonce}
+            fetchItems={fetchItems}
+            getId={(i) => `${i.source}:${i.id}`}
+            renderItem={(item, ctx) =>
+              item.actionKind === "rich" ? (
+                <div className="askHumanRichRow">
+                  {renderRich(item, () => refreshAll())}
+                </div>
+              ) : (
+                <div className="askHumanInlineRow">{renderInline(item, ctx)}</div>
+              )
+            }
+            emptyText="暂无待处理项"
+          />
+        </>
+      )}
     </div>
   );
 }

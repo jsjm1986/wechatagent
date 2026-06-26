@@ -643,6 +643,7 @@ pub(super) async fn ensure_all(db: &Database) -> anyhow::Result<()> {
     ensure_system_taxonomies_indexes(db).await?;
     ensure_taxonomy_candidates_indexes(db).await?;
     ensure_relationship_type_suggestions_indexes(db).await?;
+    ensure_suspected_deal_signals_indexes(db).await?;
     // ── agent-self-evolution W0 (Task 1.2) ──
     ensure_evolution_indexes(db).await?;
     // LLM 服务商配置：(workspace_id, provider_id) 唯一；is_active 部分索引便于
@@ -979,6 +980,36 @@ async fn ensure_relationship_type_suggestions_indexes(db: &Database) -> anyhow::
         )
         .await?;
     db.collection_relationship_type_suggestions()
+        .create_index(
+            IndexModel::builder()
+                .keys(doc! { "workspace_id": 1, "status": 1 })
+                .build(),
+            None,
+        )
+        .await?;
+    Ok(())
+}
+
+/// F23：`suspected_deal_signals` 索引（疑似成交待核实闭环·方案B）。
+///
+/// - `(workspace_id, contact_id)` unique：同一 contact 在同 workspace 只一条
+///   待核实信号，重复观察累加 `occurrences` / 刷新 `last_seen_at`，
+///   DuplicateKey 视为「信号已存在」（gateway upsert 锚此）。
+/// - `(workspace_id, status)`：后台核实列表按 status（pending/approved/rejected）筛选。
+///
+/// 字段为 snake_case：`SuspectedDealSignal` 未加 `#[serde(rename_all)]`，
+/// BSON 层即 snake_case，须与此处索引字段逐字一致。
+async fn ensure_suspected_deal_signals_indexes(db: &Database) -> anyhow::Result<()> {
+    db.collection_suspected_deal_signals()
+        .create_index(
+            IndexModel::builder()
+                .keys(doc! { "workspace_id": 1, "contact_id": 1 })
+                .options(IndexOptions::builder().unique(true).build())
+                .build(),
+            None,
+        )
+        .await?;
+    db.collection_suspected_deal_signals()
         .create_index(
             IndexModel::builder()
                 .keys(doc! { "workspace_id": 1, "status": 1 })

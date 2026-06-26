@@ -2214,6 +2214,7 @@ function DomainProfilePanel({ busy }: { busy: boolean }) {
     deleteDomainProfile,
     generateDomainProfile,
   } = useStrategyStore();
+  const isCreatingProfile = useStrategyStore((s) => s.isCreatingProfile);
 
   const [gen_pid, setGen_pid] = useState("");
   const [gen_display_name, setGen_display_name] = useState("");
@@ -2224,7 +2225,8 @@ function DomainProfilePanel({ busy }: { busy: boolean }) {
   }, [loadDomainProfiles]);
 
   const activeProfile = domainProfiles.find((p) => p.is_active);
-  const editing = editingProfile !== null;
+  // D5：editingProfile 非空（编辑既有）或 isCreatingProfile（手动新建空白）时都渲染编辑器。
+  const editing = editingProfile !== null || isCreatingProfile;
 
   function handleProfileClick(profile: DomainProfile) {
     editDomainProfile(profile);
@@ -2246,6 +2248,25 @@ function DomainProfilePanel({ busy }: { busy: boolean }) {
           <span className={styles.profileActiveMeta}>
             v{activeProfile.version} · {activeProfile.profile_id}
           </span>
+          {/* D4：复用资源无关的版本动作条，对生效 profile 暴露发布新版本 / 切到当前 / 回滚。
+              meta.id 必须填后端 :id 路径参数期望的 ObjectId hex（DomainProfile.id 即
+              profile_view 注入的 _id hex，与 publish/rollout/rollback handler 的
+              parse_object_id 同源）。 */}
+          <ActiveVersionsBar
+            meta={{
+              id: activeProfile.id,
+              version: activeProfile.version,
+              currentVersion: activeProfile.current_version,
+              previousVersion: activeProfile.previous_version,
+              seededBy: activeProfile.seeded_by,
+              updatedAt: activeProfile.updated_at,
+            }}
+            endpointPrefix="/api/admin/domain-profiles"
+            resourceLabel="行业画像"
+            busy={busy}
+            canPublish
+            onAfterAction={() => void loadDomainProfiles()}
+          />
         </div>
       )}
 
@@ -2375,9 +2396,7 @@ function DomainProfilePanel({ busy }: { busy: boolean }) {
               profile={editingProfile}
               draft={profileDraft}
               onChange={setProfileDraft}
-              onSave={() => {
-                if (editingProfile) void saveDomainProfile(editingProfile.id);
-              }}
+              onSave={() => void saveDomainProfile()}
               onDelete={() => {
                 if (editingProfile) void deleteDomainProfile(editingProfile.id);
               }}

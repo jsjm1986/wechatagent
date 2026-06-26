@@ -10,7 +10,7 @@ import {
   Undo2,
   Workflow,
 } from "lucide-react";
-import { parseApiError } from "../../lib/api";
+import { api, parseApiError } from "../../lib/api";
 import { ChunkReviewCard } from "../../components/review/ChunkReviewCard";
 import { parseCompleteness, parseIntegrityReport, type CompletenessView, type IntegrityReportView } from "./trustTypes";
 import { ChunkInspectorPane, classifyChunk, focusChunk, loadChunkOptions, type ReviewChunkItem, type ReviewCategory } from "./shared";
@@ -46,6 +46,40 @@ interface DocumentChunkRow {
   updatedAt?: string | null;
 }
 
+// GET /documents/:id 详情：含整替换 PUT 必须原样回带、避免被清空的字段
+// （rawContent / contentHash / lineIndex / sectionIndex 等）。注意 GET 详情
+// 不返回 productTags / businessTopics——这俩只在列表项里，提交时从列表项取。
+interface DocumentDetail {
+  id: string;
+  accountId?: string | null;
+  domain?: string | null;
+  sourceType?: string | null;
+  sourceName?: string | null;
+  title?: string | null;
+  summary?: string | null;
+  catalogSummary?: string | null;
+  routingMap?: string[] | null;
+  riskNotes?: string[] | null;
+  rawContent?: string | null;
+  contentHash?: string | null;
+  lineIndex?: unknown[] | null;
+  sectionIndex?: unknown[] | null;
+  status?: string | null;
+  version?: number | null;
+}
+
+// 编辑表单可改字段（少数元数据）；rawContent 等未编辑字段原样从 detail 回带。
+interface DocEditState {
+  detail: DocumentDetail;
+  productTags: string[]; // 来自列表项
+  businessTopics: string[]; // 来自列表项
+  title: string;
+  summary: string;
+  catalogSummary: string;
+  sourceName: string;
+  status: string;
+}
+
 export function DocumentsView() {
   const confirm = useConfirm();
   const [items, setItems] = useState<DocumentItem[]>([]);
@@ -59,6 +93,16 @@ export function DocumentsView() {
   const [docChunks, setDocChunks] = useState<Record<string, DocumentChunkRow[]>>({});
   const [docChunksLoading, setDocChunksLoading] = useState<string | null>(null);
   const [docChunksError, setDocChunksError] = useState<string | null>(null);
+  // 编辑文档：点「编辑」先 GET /documents/:id 取完整文档回填，提交时把
+  // 未编辑字段（rawContent/contentHash/lineIndex/sectionIndex 等）原样带上，
+  // 避免后端 replace_one 整替换把它们清空。
+  const [editState, setEditState] = useState<DocEditState | null>(null);
+  const [editLoadingId, setEditLoadingId] = useState<string | null>(null);
+  const [editSaving, setEditSaving] = useState(false);
+  // E7：手工单条新建切片。展开表单 → POST /chunks。
+  const [chunkFormOpen, setChunkFormOpen] = useState(false);
+  const [chunkDraft, setChunkDraft] = useState({ title: "", body: "", summary: "", documentId: "" });
+  const [chunkCreating, setChunkCreating] = useState(false);
 
   async function load() {
     setLoading(true);
@@ -121,6 +165,98 @@ export function DocumentsView() {
     }
   }
 
+  async function openEdit(d: DocumentItem) {
+    setEditLoadingId(d.id);
+    setError(null);
+    try {
+      const detail = await api.get<DocumentDetail>(
+        `/api/operation-knowledge/documents/${encodeURIComponent(d.id)}`,
+      );
+      setEditState({
+        detail,
+        // productTags / businessTopics 仅在列表项里（GET 详情不返回这俩）。
+        productTags: d.productTags ?? [],
+        businessTopics: d.businessTopics ?? [],
+        title: detail.title ?? d.title ?? "",
+        summary: detail.summary ?? "",
+        catalogSummary: detail.catalogSummary ?? "",
+        sourceName: detail.sourceName ?? "",
+        status: detail.status ?? "active",
+      });
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setEditLoadingId(null);
+    }
+  }
+
+  async function saveEdit(ev: FormEvent) {
+    ev.preventDefault();
+    if (!editState) return;
+    if (!editState.title.trim()) return;
+    setEditSaving(true);
+    setError(null);
+    const { detail } = editState;
+    // 整替换 PUT：未编辑字段原样从 detail 回带，绝不让 replace_one 清空
+    // rawContent / contentHash / lineIndex / sectionIndex / routingMap / riskNotes。
+    // productTags / businessTopics 从列表项带（GET 详情不返回）。
+    const body = {
+      accountId: detail.accountId ?? null,
+      domain: detail.domain ?? "user_operations",
+      sourceType: detail.sourceType ?? "imported_markdown",
+      sourceName: editState.sourceName.trim() || null,
+      title: editState.title.trim(),
+      summary: editState.summary.trim() || null,
+      catalogSummary: editState.catalogSummary.trim() || null,
+      routingMap: detail.routingMap ?? [],
+      riskNotes: detail.riskNotes ?? [],
+      productTags: editState.productTags,
+      businessTopics: editState.businessTopics,
+      rawContent: detail.rawContent ?? null,
+      contentHash: detail.contentHash ?? null,
+      lineIndex: detail.lineIndex ?? [],
+      sectionIndex: detail.sectionIndex ?? [],
+      status: editState.status || "active",
+    };
+    try {
+      await api.put(`/api/operation-knowledge/documents/${encodeURIComponent(detail.id)}`, body);
+      setEditState(null);
+      await load();
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setEditSaving(false);
+    }
+  }
+
+  async function handleCreateChunk(ev: FormEvent) {
+    ev.preventDefault();
+    if (!chunkDraft.title.trim()) return;
+    setChunkCreating(true);
+    setError(null);
+    try {
+      // ★红线★：后端 create handler 不传 status 默认落 active（default_active_status），
+      // 且 coerce_integrity_against_d2_gate 只在 integrityStatus=="verified" 时降级、
+      // 完全不碰 status。所以这里必须写死 status:"draft" + integrityStatus:"needs_review"，
+      // 让手工新建切片也先进待审池——AI/运营都不自动核验。两值非用户可选项。
+      await api.post("/api/operation-knowledge/chunks", {
+        title: chunkDraft.title.trim(),
+        body: chunkDraft.body.trim() || null,
+        summary: chunkDraft.summary.trim() || null,
+        documentId: chunkDraft.documentId.trim() || null,
+        status: "draft",
+        integrityStatus: "needs_review",
+      });
+      setChunkDraft({ title: "", body: "", summary: "", documentId: "" });
+      setChunkFormOpen(false);
+      await load();
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setChunkCreating(false);
+    }
+  }
+
   async function toggleDocChunks(docId: string) {
     if (expandedDoc === docId) {
       setExpandedDoc(null);
@@ -178,6 +314,136 @@ export function DocumentsView() {
           {creating ? "保存中…" : "新建"}
         </button>
       </form>
+      {/* E7：手工单条新建切片。游离 chunk（不强制先选文档），documentId 可空。
+          提交写死 status=draft + integrityStatus=needs_review，先进待审池守红线。 */}
+      <div style={{ marginBottom: 16 }}>
+        <button
+          type="button"
+          className="wikiBtn"
+          onClick={() => setChunkFormOpen((v) => !v)}
+        >
+          {chunkFormOpen ? "收起手工新建切片" : "手工新建切片"}
+        </button>
+        {chunkFormOpen ? (
+          <form
+            onSubmit={handleCreateChunk}
+            className="wikiArchiveShell"
+            style={{ padding: 14, marginTop: 8, display: "grid", gap: 8 }}
+          >
+            <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+              <span className="wikiArchiveSubtitle">手工新建知识切片</span>
+              <span className="wikiHint" style={{ marginLeft: "auto" }}>
+                新建切片一律存为待确认草稿，需你在「评审队列」里逐条确认后 AI 才会使用。
+              </span>
+            </div>
+            <input
+              type="text"
+              placeholder="知识标题（必填）"
+              value={chunkDraft.title}
+              onChange={(e) => setChunkDraft({ ...chunkDraft, title: e.target.value })}
+              className="wikiInput"
+            />
+            <textarea
+              placeholder="正文内容"
+              value={chunkDraft.body}
+              onChange={(e) => setChunkDraft({ ...chunkDraft, body: e.target.value })}
+              rows={6}
+              className="wikiInput"
+              style={{ fontFamily: "var(--font-mono)", fontSize: 12, resize: "vertical" }}
+            />
+            <input
+              type="text"
+              placeholder="摘要（可选）"
+              value={chunkDraft.summary}
+              onChange={(e) => setChunkDraft({ ...chunkDraft, summary: e.target.value })}
+              className="wikiInput"
+            />
+            <select
+              value={chunkDraft.documentId}
+              onChange={(e) => setChunkDraft({ ...chunkDraft, documentId: e.target.value })}
+              className="wikiInput"
+            >
+              <option value="">归属文档（可选，留空为游离切片）</option>
+              {items.map((d) => (
+                <option key={d.id} value={d.id}>{d.title}</option>
+              ))}
+            </select>
+            <div style={{ display: "flex", gap: 8 }}>
+              <button type="submit" className="wikiBtn primary" disabled={chunkCreating || !chunkDraft.title.trim()}>
+                {chunkCreating ? "保存中…" : "新建切片"}
+              </button>
+              <button
+                type="button"
+                className="wikiBtn"
+                disabled={chunkCreating}
+                onClick={() => { setChunkFormOpen(false); setChunkDraft({ title: "", body: "", summary: "", documentId: "" }); }}
+              >
+                取消
+              </button>
+            </div>
+          </form>
+        ) : null}
+      </div>
+      {editState ? (
+        <form
+          onSubmit={saveEdit}
+          className="wikiArchiveShell"
+          style={{ padding: 14, marginBottom: 16, display: "grid", gap: 8 }}
+        >
+          <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+            <span className="wikiArchiveSubtitle">编辑文档元数据</span>
+            <span className="wikiHint" style={{ marginLeft: "auto" }}>
+              原文与索引（rawContent / 行列索引）保持不变，仅更新这里填写的元数据。
+            </span>
+          </div>
+          <label className="wikiHint">标题（必填）</label>
+          <input
+            type="text"
+            value={editState.title}
+            onChange={(e) => setEditState({ ...editState, title: e.target.value })}
+            className="wikiInput"
+          />
+          <label className="wikiHint">摘要</label>
+          <input
+            type="text"
+            value={editState.summary}
+            onChange={(e) => setEditState({ ...editState, summary: e.target.value })}
+            className="wikiInput"
+          />
+          <label className="wikiHint">目录摘要</label>
+          <input
+            type="text"
+            value={editState.catalogSummary}
+            onChange={(e) => setEditState({ ...editState, catalogSummary: e.target.value })}
+            className="wikiInput"
+          />
+          <label className="wikiHint">来源名称</label>
+          <input
+            type="text"
+            value={editState.sourceName}
+            onChange={(e) => setEditState({ ...editState, sourceName: e.target.value })}
+            className="wikiInput"
+          />
+          <label className="wikiHint">状态</label>
+          <select
+            value={editState.status}
+            onChange={(e) => setEditState({ ...editState, status: e.target.value })}
+            className="wikiInput"
+          >
+            <option value="active">{statusLabel("active")}</option>
+            <option value="draft">{statusLabel("draft")}</option>
+            <option value="archived">{statusLabel("archived")}</option>
+          </select>
+          <div style={{ display: "flex", gap: 8 }}>
+            <button type="submit" className="wikiBtn primary" disabled={editSaving || !editState.title.trim()}>
+              {editSaving ? "保存中…" : "保存修改"}
+            </button>
+            <button type="button" className="wikiBtn" disabled={editSaving} onClick={() => setEditState(null)}>
+              取消
+            </button>
+          </div>
+        </form>
+      ) : null}
       {loading ? <div className="wikiHint">加载中…</div> : items.length === 0 ? (
         <div className="wikiHint">还没有文档。新建第一份，或使用导入向导。</div>
       ) : (
@@ -220,6 +486,15 @@ export function DocumentsView() {
                     onClick={() => void toggleDocChunks(d.id)}
                   >
                     {expandedDoc === d.id ? "收起知识条目" : "查看知识条目"}
+                  </button>
+                  <button
+                    type="button"
+                    className="wikiArchiveRollback"
+                    style={{ marginRight: 6 }}
+                    disabled={editLoadingId === d.id}
+                    onClick={() => void openEdit(d)}
+                  >
+                    {editLoadingId === d.id ? "加载中…" : "编辑"}
                   </button>
                   <button type="button" className="wikiArchiveRollback" onClick={() => handleDelete(d.id)}>删除</button>
                 </td>

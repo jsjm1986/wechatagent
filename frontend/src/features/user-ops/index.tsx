@@ -78,6 +78,8 @@ function UserOpsFeatureInner() {
     customAgentInstructions,
     assistOverride,
     relationshipType,
+    referredSpecialistAt,
+    profileEditDraft,
     importQuery,
     searchQuery,
     guideInstruction,
@@ -103,6 +105,7 @@ function UserOpsFeatureInner() {
     setCustomAgentInstructions,
     setAssistOverride,
     setRelationshipType,
+    setProfileEditDraft,
     setGuideInstruction,
     setSimulationInput,
     setSelectedPlaybookId,
@@ -112,6 +115,7 @@ function UserOpsFeatureInner() {
     setGeneratePlaybookText,
     setOptimizePlaybookText,
     setDomainDrafts,
+    setMemoryDraft,
     hydrateSelected,
     loadMessages,
     loadPlaybooks,
@@ -124,7 +128,8 @@ function UserOpsFeatureInner() {
     saveProfileNote,
     saveCustomAgentInstructions,
     saveAssistOverride,
-    saveRelationshipType,
+    saveOperationProfile,
+    saveOperatingMemory,
     saveManualTags,
     analyzeProfile,
     previewGuideInstruction,
@@ -278,6 +283,8 @@ function UserOpsFeatureInner() {
             customAgentInstructions={customAgentInstructions}
             assistOverride={assistOverride}
             relationshipType={relationshipType}
+            referredSpecialistAt={referredSpecialistAt}
+            profileEditDraft={profileEditDraft}
             selected={selected}
             selectedPlaybookId={selectedPlaybookId}
             simulationBusy={simulationBusy}
@@ -293,13 +300,16 @@ function UserOpsFeatureInner() {
             onCustomAgentInstructions={setCustomAgentInstructions}
             onAssistOverride={setAssistOverride}
             onRelationshipType={setRelationshipType}
+            onProfileEditDraftChange={setProfileEditDraft}
             onRunMemoryConsolidation={runMemoryConsolidation}
             onRunSimulation={runDialogueSimulation}
             onSaveProfileNote={saveProfileNote}
             onSaveCustomAgentInstructions={saveCustomAgentInstructions}
             onSaveAssistOverride={saveAssistOverride}
-            onSaveRelationshipType={saveRelationshipType}
+            onSaveRelationshipType={saveOperationProfile}
             onSaveManualTags={saveManualTags}
+            onMemoryDraftChange={setMemoryDraft}
+            onSaveOperatingMemory={saveOperatingMemory}
             onSelectedPlaybook={setSelectedPlaybookId}
             onSimulationInput={setSimulationInput}
             onTab={setSmartOpsTab}

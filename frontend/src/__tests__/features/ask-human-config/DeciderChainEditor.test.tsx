@@ -48,4 +48,20 @@ describe("DeciderChainEditor", () => {
     fireEvent.click(screen.getAllByLabelText("上移")[1]);
     expect(onChange).toHaveBeenCalledWith([{ wxid: "wxid_b" }, { wxid: "wxid_a" }]);
   });
+
+  it("加载失败显示错误态而非静默空列表（E16）", async () => {
+    (api.get as ReturnType<typeof vi.fn>).mockRejectedValueOnce(new Error("boom"));
+    render(<DeciderChainEditor chain={[]} onChange={vi.fn()} />);
+    fireEvent.click(screen.getByText(/从联系人添加/));
+    // 错误信息出现，且与「无可选联系人」空态区分开。
+    expect(await screen.findByText(/boom/)).toBeInTheDocument();
+    expect(screen.queryByText("无可选联系人")).toBeNull();
+  });
+
+  it("加载成功后不显示错误态", async () => {
+    render(<DeciderChainEditor chain={[]} onChange={vi.fn()} />);
+    fireEvent.click(screen.getByText(/从联系人添加/));
+    await waitFor(() => screen.getByText("阿伟"));
+    expect(screen.queryByText(/boom/)).toBeNull();
+  });
 });

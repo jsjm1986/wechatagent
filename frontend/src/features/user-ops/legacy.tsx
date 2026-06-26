@@ -79,6 +79,62 @@ type OperationStateDraft = {
 
 
 
+// A2：运营记忆可编辑表单字段定义。23 个扁平字段按后端四个 Document 分组渲染，
+// store 端 groupMemoryDraft 据同一映射把扁平 draft 归组提交，两侧字段名须对齐。
+const MEMORY_DRAFT_FIELD_GROUPS: Array<{
+  caption: string;
+  fields: Array<{
+    key: keyof OperatingMemoryDraft;
+    label: string;
+    placeholder?: string;
+    multiline?: boolean;
+  }>;
+}> = [
+  {
+    caption: "用户理解",
+    fields: [
+      { key: "identity", label: "身份", placeholder: "这个人是谁、什么角色" },
+      { key: "businessContext", label: "业务背景", placeholder: "所在行业 / 公司 / 团队情况" },
+      { key: "jobsToBeDone", label: "想完成的事", placeholder: "他真正想解决什么" },
+      { key: "painPoints", label: "痛点", multiline: true },
+      { key: "motivations", label: "动机", multiline: true },
+      { key: "decisionStyle", label: "决策风格", placeholder: "理性 / 感性 / 谨慎 / 果断" },
+      { key: "communicationPreference", label: "沟通偏好", placeholder: "喜欢的沟通方式与节奏" }
+    ]
+  },
+  {
+    caption: "关系状态",
+    fields: [
+      { key: "sensitivePoints", label: "敏感点", multiline: true },
+      { key: "trustLevel", label: "信任程度" },
+      { key: "temperature", label: "关系温度" },
+      { key: "lastEmotion", label: "最近情绪" },
+      { key: "relationshipGoal", label: "关系目标", placeholder: "希望把关系推进到什么程度" },
+      { key: "doNotDo", label: "不要做的事", multiline: true }
+    ]
+  },
+  {
+    caption: "产品契合",
+    fields: [
+      { key: "interestedProducts", label: "感兴趣的产品", placeholder: "他关注 / 提到的产品" },
+      { key: "fitReason", label: "契合理由", multiline: true }
+    ]
+  },
+  {
+    caption: "下一步动作",
+    fields: [
+      { key: "objections", label: "顾虑 / 异议", multiline: true },
+      { key: "riskPoints", label: "风险点", multiline: true },
+      { key: "unknowns", label: "未知信息", placeholder: "还需要确认什么" },
+      { key: "nextGoal", label: "下一步目标", placeholder: "下一步希望推进什么" },
+      { key: "recommendedMove", label: "建议动作", multiline: true },
+      { key: "avoid", label: "应避免", multiline: true },
+      { key: "timing", label: "时机", placeholder: "合适的跟进节奏 / 时机" },
+      { key: "reason", label: "判断依据", multiline: true }
+    ]
+  }
+];
+
 const USER_RUNTIME_PARAMETER_FIELDS: Array<{
   key: string;
   label: string;
@@ -142,6 +198,8 @@ export function UserOperationCockpit({
   customAgentInstructions,
   assistOverride,
   relationshipType,
+  referredSpecialistAt,
+  profileEditDraft,
   selected,
   selectedPlaybookId,
   simulationBusy,
@@ -157,6 +215,7 @@ export function UserOperationCockpit({
   onCustomAgentInstructions,
   onAssistOverride,
   onRelationshipType,
+  onProfileEditDraftChange,
   onRunMemoryConsolidation,
   onRunSimulation,
   onSaveProfileNote,
@@ -164,6 +223,8 @@ export function UserOperationCockpit({
   onSaveAssistOverride,
   onSaveRelationshipType,
   onSaveManualTags,
+  onMemoryDraftChange,
+  onSaveOperatingMemory,
   onSelectedPlaybook,
   onSimulationInput,
   onTab
@@ -184,6 +245,8 @@ export function UserOperationCockpit({
   customAgentInstructions: string;
   assistOverride: string;
   relationshipType: string;
+  referredSpecialistAt?: string;
+  profileEditDraft: { lastCommitment?: string; followUpPolicy?: string };
   selected: Contact | null;
   selectedPlaybookId: string;
   simulationBusy: boolean;
@@ -199,6 +262,7 @@ export function UserOperationCockpit({
   onCustomAgentInstructions: (value: string) => void;
   onAssistOverride: (mode: string) => void;
   onRelationshipType: (value: string) => void;
+  onProfileEditDraftChange: (patch: Partial<{ lastCommitment: string; followUpPolicy: string }>) => void;
   onRunMemoryConsolidation: () => void;
   onRunSimulation: () => void;
   onSaveProfileNote: () => void;
@@ -206,6 +270,8 @@ export function UserOperationCockpit({
   onSaveAssistOverride: () => void;
   onSaveRelationshipType: () => void;
   onSaveManualTags: (tags: string[]) => void;
+  onMemoryDraftChange: (patch: Partial<OperatingMemoryDraft>) => void;
+  onSaveOperatingMemory: () => void;
   onSelectedPlaybook: (value: string) => void;
   onSimulationInput: (value: string) => void;
   onTab: (tab: SmartOpsTab) => void;
@@ -269,6 +335,41 @@ export function UserOperationCockpit({
               <strong>{memoryDraft.avoid || selected.operationStateReason || "不要在信息不足时强推销售"}</strong>
             </div>
           </div>
+
+          <section className="cockpitSection profileEditor">
+            <div className="sectionCaption">运营记忆（运营可编辑，保存后影响 Agent 决策）</div>
+            {MEMORY_DRAFT_FIELD_GROUPS.map((group) => (
+              <div key={group.caption} className="memoryEditGroup">
+                <div className="modeLine editable">{group.caption}</div>
+                {group.fields.map((field) => (
+                  <label key={field.key}>
+                    <span>{field.label}</span>
+                    {field.multiline ? (
+                      <textarea
+                        value={memoryDraft[field.key]}
+                        rows={2}
+                        placeholder={field.placeholder}
+                        onChange={(event) => onMemoryDraftChange({ [field.key]: event.target.value })}
+                      />
+                    ) : (
+                      <input
+                        type="text"
+                        value={memoryDraft[field.key]}
+                        placeholder={field.placeholder}
+                        onChange={(event) => onMemoryDraftChange({ [field.key]: event.target.value })}
+                      />
+                    )}
+                  </label>
+                ))}
+              </div>
+            ))}
+            <div className="buttonRow">
+              <button onClick={onSaveOperatingMemory} disabled={busy} type="button">
+                <SquarePen size={16} />
+                保存运营记忆
+              </button>
+            </div>
+          </section>
 
           <section className="cockpitSection">
             <div className="sectionCaption">Agent 当前判断</div>
@@ -436,6 +537,12 @@ export function UserOperationCockpit({
                 <option value="force_on">强制开启引荐</option>
                 <option value="force_off">强制关闭引荐</option>
               </select>
+              {referredSpecialistAt && (
+                <div className="modeLine editable">
+                  已引荐 · AI 已退辅助答疑
+                  {`（${formatTime(referredSpecialistAt)}）`}
+                </div>
+              )}
               <button className="secondary" onClick={onSaveAssistOverride} disabled={busy} type="button">
                 <SquarePen size={16} />
                 保存辅助模式
@@ -475,6 +582,31 @@ export function UserOperationCockpit({
             <button className="secondary" onClick={onSaveRelationshipType} disabled={busy} type="button">
               <SquarePen size={16} />
               保存客户类型
+            </button>
+          </label>
+          <label>
+            <span>最近承诺（last_commitment）</span>
+            <small>运营可编辑：记录对客户作出的最近一条承诺，影响 AI 跟进话术。</small>
+            <textarea
+              rows={2}
+              value={profileEditDraft.lastCommitment ?? ""}
+              onChange={(event) => onProfileEditDraftChange({ lastCommitment: event.target.value })}
+              placeholder="例：本周内给到方案报价"
+            />
+          </label>
+          <label>
+            <span>跟进策略（follow_up_policy）</span>
+            <small>运营可编辑：约定主动跟进的节奏/边界，影响 AI 触达频率。</small>
+            <textarea
+              rows={2}
+              value={profileEditDraft.followUpPolicy ?? ""}
+              onChange={(event) => onProfileEditDraftChange({ followUpPolicy: event.target.value })}
+              placeholder="例：每周跟进一次，客户明确拒绝则停止"
+            />
+            <small>客户阶段 / 意向等级由 AI 派生，前端只读，此处不编辑。</small>
+            <button className="secondary" onClick={onSaveRelationshipType} disabled={busy} type="button">
+              <SquarePen size={16} />
+              保存运营画像
             </button>
           </label>
           <div className="buttonRow">

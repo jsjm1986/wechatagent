@@ -21,6 +21,7 @@ mod accounts;
 mod admin_ops_versions;
 mod admin_outbox;
 mod admin_relationship_suggestions;
+pub mod admin_suspected_deals;
 mod admin_state_policies;
 mod admin_taxonomies;
 mod admin_taxonomy_candidates;
@@ -114,7 +115,8 @@ pub mod ext_knowledge {
     // 的真模型链路；红线由测试侧硬断言锁（chat 起草只产 proposal 永不自动落库；
     // completeness answeringMode ∈ 闭集、绝不触发 auto-verify）。
     pub use super::knowledge::{
-        build_operation_knowledge_completeness, chat_turn, ChatTurnRequest,
+        build_operation_knowledge_completeness, build_operation_knowledge_integrity_report,
+        chat_turn, ChatTurnRequest,
     };
     // real-LLM 召回基准 maintenance / 闭环轨迹测试：chat_turn 只产 pending 草稿预览，
     // 真正落库 draft chunk + 回填 createdChunkId 的是独立的 chat_apply（两步
@@ -143,6 +145,9 @@ use admin_taxonomy_candidates::{
 };
 use admin_relationship_suggestions::{
     approve_relationship_suggestion, list_relationship_suggestions, reject_relationship_suggestion,
+};
+use admin_suspected_deals::{
+    approve_suspected_deal, list_suspected_deals, reject_suspected_deal,
 };
 use assets::{create_content_asset, list_content_assets};
 use ask_human_inbox::{ask_human_inbox, ask_human_summary};
@@ -827,6 +832,19 @@ pub fn api_router(state: AppState) -> Router<AppState> {
             "/admin/relationship-type-suggestions/:id/reject",
             post(reject_relationship_suggestion),
         )
+        // ── F23：疑似成交待核实闭环（方案B）核实路由 ──────────────────────────
+        // 红线：list/reject 仅改信号状态；approve 调 add_outcome_event_inner 落
+        // verification=staff_confirmed 正式成交（AI 永不直写 outcome）。挂在与
+        // relationship-type-suggestions 同段（AuthenticatedAdmin 保护 + workspace 隔离）。
+        .route("/admin/suspected-deals", get(list_suspected_deals))
+        .route(
+            "/admin/suspected-deals/:id/approve",
+            post(approve_suspected_deal),
+        )
+        .route(
+            "/admin/suspected-deals/:id/reject",
+            post(reject_suspected_deal),
+        )
         // ── Phase E / E5-T1：ops 三表多版本灰度 admin 路由 ──────────────────────
         // 同一套 publish/rollout/rollback 三动作分别覆盖
         // operation_domain_configs / operation_state_policies / system_taxonomies。
@@ -1027,6 +1045,7 @@ mod tests {
             include_str!("admin_taxonomies.rs"),
             include_str!("admin_taxonomy_candidates.rs"),
             include_str!("admin_relationship_suggestions.rs"),
+            include_str!("admin_suspected_deals.rs"),
             include_str!("assets.rs"),
             include_str!("auth.rs"),
             include_str!("behavior_signal_metrics.rs"),
@@ -1084,6 +1103,9 @@ mod tests {
             // knowledge.rs：完整度审计内核 helper，被 get/refresh completeness 两个 handler
             // 复用、不直接绑 HTTP；real_llm_knowledge.rs K11 通过 `pub use` 直调真模型审计。
             "build_operation_knowledge_completeness",
+            // catalog.rs：integrity-report 审计内核 helper，被 get integrity-report handler
+            // 复用、不直接绑 HTTP；integrity_report_d2_e2e.rs 通过 `pub use` 直调做 D2 降级断言。
+            "build_operation_knowledge_integrity_report",
             // domain_schemas.rs：D1-b active schema 加载 helper，被 chunk 写侧
             // （apply_chunk_revision）复用做 domain_attributes 校验，不直接绑 HTTP。
             "load_active_domain_schema",
