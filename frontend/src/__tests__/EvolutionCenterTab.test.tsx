@@ -367,4 +367,78 @@ describe("EvolutionCenterTab", () => {
       expect(input.value).toBe("30");
     });
   });
+
+  // 前后端对齐批次1 Task 6（C4）：阈值变更不可变审计日志视图。
+  // 按钮点击触发 GET /api/evolution/threshold-overrides/audit（与 runtime-flag
+  // 一致的"点按钮加载"模式，不在挂载期自动 GET，避免打乱既有顺序型 mock 队列）。
+  it("点按钮加载阈值变更审计日志并渲染行", async () => {
+    // 挂载只触发 experiments GET（call #1）。
+    fetchMock.mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ items: [] }),
+    });
+    // 审计 GET 返回一条 release 行（后端真实字段）。
+    fetchMock.mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({
+        items: [
+          {
+            id: "aud1",
+            gateKey: "fact_risk_block",
+            action: "release",
+            previousValue: 6,
+            newValue: 7,
+            sourceProposalId: "00000000000000000000abcd",
+            decidedBy: "admin",
+            decidedAt: "2026-06-26T00:00:00Z",
+            hitRateObserved: 0.18,
+            significanceMetrics: null,
+          },
+        ],
+      }),
+    });
+
+    render(<EvolutionCenterTab enabled={true} />);
+
+    fireEvent.click(await screen.findByText(/阈值变更审计/));
+
+    await waitFor(() => {
+      const auditCall = fetchMock.mock.calls.find(
+        ([url]) =>
+          typeof url === "string" &&
+          url.includes("/api/evolution/threshold-overrides/audit"),
+      );
+      expect(auditCall).toBeTruthy();
+    });
+
+    await waitFor(() => {
+      expect(screen.getByTestId("threshold-audit-table")).toBeInTheDocument();
+    });
+    const table = screen.getByTestId("threshold-audit-table");
+    expect(table.textContent).toContain("fact_risk_block");
+    expect(table.textContent).toContain("release");
+    expect(table.textContent).toContain("admin");
+  });
+
+  it("审计为空时显示暂无审计记录", async () => {
+    fetchMock.mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ items: [] }),
+    });
+    fetchMock.mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ items: [] }),
+    });
+
+    render(<EvolutionCenterTab enabled={true} />);
+
+    fireEvent.click(await screen.findByText(/阈值变更审计/));
+
+    await waitFor(() => {
+      expect(screen.getByTestId("threshold-audit-empty")).toBeInTheDocument();
+    });
+    expect(screen.getByTestId("threshold-audit-empty").textContent).toContain(
+      "暂无审计记录",
+    );
+  });
 });
