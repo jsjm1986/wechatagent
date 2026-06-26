@@ -71,4 +71,14 @@ describe("PlannerViewSection 多维度看板(A4)", () => {
     expect(screen.getByText("价值分层")).toBeInTheDocument();
     expect(screen.getByText("VIP")).toBeInTheDocument();
   });
+
+  it("conversation_mode 经字典翻译中文(A5)", () => {
+    setStore(
+      [],
+      { conversation_mode: [{ id: "consultative", label: "顾问咨询" }] },
+    );
+    const c = { ...baseContact, lastConversationMode: "consultative" } as any;
+    render(<PlannerViewSection contact={c} />);
+    expect(screen.getByText("顾问咨询")).toBeInTheDocument();
+  });
 });
