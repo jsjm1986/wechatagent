@@ -309,4 +309,164 @@ describe("EvolutionCenterTab", () => {
       "product_accuracy_score_block",
     );
   });
+
+  // 前后端对齐批次1 Task 5（C3）：runtime-flag 灰度开关 + rollout 比例控件。
+  // 本文件 mock 全局 fetch（非 lib/api 的 api.put），故断言落在 fetch 调用上：
+  // 找出 method === "PUT" 的那次 fetch，校验 URL 与 camelCase body。
+  it("渲染 runtime-flag 灰度控件并 PUT 保存", async () => {
+    // 挂载只触发 experiments GET（call #1）；不引入挂载期 flag GET，避免打乱
+    // 既有测试的顺序型 mockResolvedValueOnce 队列。
+    fetchMock.mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ items: [] }),
+    });
+    // PUT 响应（保存灰度后回写）。复刻后端真实结构：{ ok, flag: { 内层 } }。
+    fetchMock.mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({
+        ok: true,
+        flag: {
+          enabled: true,
+          rolloutPercent: 50,
+          rolloutPercentRaw: 50,
+          thresholdAutoReleaseEnabled: null,
+          updatedBy: "admin",
+          updatedAt: "2026-06-26T00:00:00Z",
+        },
+      }),
+    });
+
+    render(<EvolutionCenterTab enabled={true} />);
+
+    const input = (await screen.findByLabelText(/灰度比例/)) as HTMLInputElement;
+    fireEvent.change(input, { target: { value: "50" } });
+
+    const toggle = screen.getByLabelText(/启用演化灰度/) as HTMLInputElement;
+    fireEvent.click(toggle); // 关 -> 开
+
+    fireEvent.click(screen.getByText("保存灰度"));
+
+    await waitFor(() => {
+      const putCall = fetchMock.mock.calls.find(
+        ([, opts]) => opts && (opts as RequestInit).method === "PUT",
+      );
+      expect(putCall).toBeTruthy();
+      expect(putCall![0]).toBe("/api/evolution/runtime-flag");
+      const body = JSON.parse((putCall![1] as RequestInit).body as string);
+      expect(body).toMatchObject({ enabled: true, rolloutPercent: 50 });
+    });
+    // 保存后读回展示值来自 .flag 内层（rolloutPercent: 50）。
+    await waitFor(() => {
+      expect((screen.getByLabelText(/灰度比例/) as HTMLInputElement).value).toBe("50");
+    });
+  });
+
+  it("读取当前配置按钮 GET runtime-flag 并回填", async () => {
+    fetchMock.mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ items: [] }),
+    });
+    // 读取当前配置 GET 复刻后端真实结构：配置体在 .flag 子对象里（外层还有
+    // workspaceId / envEvolutionEnabled）。读回必须从 .flag 内层取，否则恒显 0。
+    fetchMock.mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({
+        workspaceId: "default",
+        envEvolutionEnabled: true,
+        flag: {
+          enabled: true,
+          rolloutPercent: 30,
+          rolloutPercentRaw: 30,
+          thresholdAutoReleaseEnabled: null,
+          updatedBy: "admin",
+          updatedAt: "2026-06-26T00:00:00Z",
+        },
+      }),
+    });
+
+    render(<EvolutionCenterTab enabled={true} />);
+
+    fireEvent.click(await screen.findByText("读取当前配置"));
+
+    await waitFor(() => {
+      const input = screen.getByLabelText(/灰度比例/) as HTMLInputElement;
+      expect(input.value).toBe("30");
+    });
+    // 同时断言开关回填来自 .flag 内层（enabled: true）。
+    expect((screen.getByLabelText(/启用演化灰度/) as HTMLInputElement).checked).toBe(true);
+  });
+
+  // 前后端对齐批次1 Task 6（C4）：阈值变更不可变审计日志视图。
+  // 按钮点击触发 GET /api/evolution/threshold-overrides/audit（与 runtime-flag
+  // 一致的"点按钮加载"模式，不在挂载期自动 GET，避免打乱既有顺序型 mock 队列）。
+  it("点按钮加载阈值变更审计日志并渲染行", async () => {
+    // 挂载只触发 experiments GET（call #1）。
+    fetchMock.mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ items: [] }),
+    });
+    // 审计 GET 返回一条 release 行（后端真实字段）。
+    fetchMock.mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({
+        items: [
+          {
+            id: "aud1",
+            gateKey: "fact_risk_block",
+            action: "release",
+            previousValue: 6,
+            newValue: 7,
+            sourceProposalId: "00000000000000000000abcd",
+            decidedBy: "admin",
+            decidedAt: "2026-06-26T00:00:00Z",
+            hitRateObserved: 0.18,
+            significanceMetrics: null,
+          },
+        ],
+      }),
+    });
+
+    render(<EvolutionCenterTab enabled={true} />);
+
+    fireEvent.click(await screen.findByText(/阈值变更审计/));
+
+    await waitFor(() => {
+      const auditCall = fetchMock.mock.calls.find(
+        ([url]) =>
+          typeof url === "string" &&
+          url.includes("/api/evolution/threshold-overrides/audit"),
+      );
+      expect(auditCall).toBeTruthy();
+    });
+
+    await waitFor(() => {
+      expect(screen.getByTestId("threshold-audit-table")).toBeInTheDocument();
+    });
+    const table = screen.getByTestId("threshold-audit-table");
+    expect(table.textContent).toContain("fact_risk_block");
+    expect(table.textContent).toContain("release");
+    expect(table.textContent).toContain("admin");
+  });
+
+  it("审计为空时显示暂无审计记录", async () => {
+    fetchMock.mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ items: [] }),
+    });
+    fetchMock.mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ items: [] }),
+    });
+
+    render(<EvolutionCenterTab enabled={true} />);
+
+    fireEvent.click(await screen.findByText(/阈值变更审计/));
+
+    await waitFor(() => {
+      expect(screen.getByTestId("threshold-audit-empty")).toBeInTheDocument();
+    });
+    expect(screen.getByTestId("threshold-audit-empty").textContent).toContain(
+      "暂无审计记录",
+    );
+  });
 });

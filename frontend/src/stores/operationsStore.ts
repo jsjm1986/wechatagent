@@ -1,6 +1,7 @@
 import { create } from "zustand";
 import type { EventItem, TaskItem, DecisionReview, LlmUsageResponse, OpsTab } from "../types";
 import { api } from "../lib/api";
+import { useUiStore } from "./uiStore";
 
 interface OperationsState {
   events: EventItem[];
@@ -41,7 +42,10 @@ export const useOperationsStore = create<OperationsState>((set) => ({
       });
     } catch (error) {
       console.error("Failed to load operations data:", error);
-      // 设置空数据以避免界面错误
+      useUiStore.getState().setError(
+        error instanceof Error ? error.message : String(error),
+      );
+      // 设置空数据以避免界面错误（错误横幅负责区分错误态，置空保持渲染不崩）
       set({
         events: [],
         tasks: [],

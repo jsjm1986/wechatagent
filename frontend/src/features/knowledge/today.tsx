@@ -63,6 +63,9 @@ export function ChatWorkbench({ initialAttachChunkId }: { initialAttachChunkId?:
   });
   const [draft, setDraft] = useState("");
   const [attachChunkId, setAttachChunkId] = useState<string>("");
+  const [stepsText, setStepsText] = useState("");
+  const [dispatching, setDispatching] = useState(false);
+  const [stepAction, setStepAction] = useState<string>("analyze_logs");
 
   // B2：从待办收件箱「找 AI 协作」跳转过来时预填 chunkId。
   useEffect(() => {
@@ -252,6 +255,56 @@ export function ChatWorkbench({ initialAttachChunkId }: { initialAttachChunkId?:
     [turns]
   );
 
+  // E14：把当前会话的 plannedSteps 派工为长任务（后端串行 worker 执行）。
+  // 每行一个步骤描述 → 一个 step；统一附带选定的 action（后端 ALLOWED_TASK_ACTIONS
+  // 闭集校验，缺 action 会 400）。成功后用返回 taskId 触发 TaskRail 自动跟踪。
+  async function dispatchTask() {
+    if (!sessionId) {
+      setError("请先与 AI 协作开启会话，再派工长任务");
+      return;
+    }
+    const steps = stepsText
+      .split("\n")
+      .map((s) => s.trim())
+      .filter(Boolean)
+      .map((description, idx) => ({
+        stepId: `step_${idx + 1}`,
+        action: stepAction,
+        description,
+      }));
+    if (steps.length === 0) {
+      setError("请至少填写一个步骤（每行一个）");
+      return;
+    }
+    setDispatching(true);
+    setError(null);
+    setInfo(null);
+    try {
+      const r = await fetch("/api/knowledge/chat/tasks", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          sessionId,
+          plannedSteps: steps,
+          cardIds: [],
+        }),
+      });
+      if (!r.ok) throw await parseApiError(r);
+      const data = (await r.json()) as { taskId?: string; totalSteps?: number };
+      setStepsText("");
+      setInfo(`已派工长任务${data.taskId ? `：${data.taskId}` : ""}，可在右侧「派工跟踪」查看进度`);
+      if (data.taskId) {
+        window.dispatchEvent(
+          new CustomEvent("wikiTrackTask", { detail: { taskId: data.taskId } })
+        );
+      }
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setDispatching(false);
+    }
+  }
+
   return (
     <div className="wikiArchiveShell wikiChatWorkbench">
       <header className="wikiArchiveHeader">
@@ -362,6 +415,45 @@ export function ChatWorkbench({ initialAttachChunkId }: { initialAttachChunkId?:
           <button type="button" onClick={() => void discard()} disabled={!sessionId}>
             <Trash2 size={14} /> 丢弃草稿
           </button>
+        </div>
+        <div className="wikiChatDispatch">
+          <div className="wikiChatDispatchHead">
+            <span className="wikiArchiveTag">派工长任务</span>
+            <span className="wikiArchiveTimelineTime">每行一个步骤，交由 AI worker 串行执行</span>
+          </div>
+          <textarea
+            className="wikiChatInput"
+            value={stepsText}
+            onChange={(e) => setStepsText(e.target.value)}
+            placeholder="每行一个步骤，例如：分析最近 24h 拦截日志"
+            disabled={dispatching || !sessionId}
+            rows={2}
+          />
+          <div className="wikiChatFooterRow">
+            <select
+              className="wikiInput"
+              value={stepAction}
+              onChange={(e) => setStepAction(e.target.value)}
+              disabled={dispatching || !sessionId}
+              aria-label="步骤动作"
+            >
+              <option value="analyze_logs">分析日志</option>
+              <option value="review_evolution">评估候选</option>
+              <option value="retag">重抽标签</option>
+              <option value="fix_chunk">修订条目</option>
+              <option value="add_chunk">新增条目</option>
+              <option value="dismiss">忽略</option>
+            </select>
+            <button
+              type="button"
+              className="primary"
+              onClick={() => void dispatchTask()}
+              disabled={dispatching || !sessionId}
+              title={sessionId ? "把以上步骤派发为长任务" : "请先开启会话"}
+            >
+              <SendHorizonal size={14} /> {dispatching ? "派工中…" : "派工"}
+            </button>
+          </div>
         </div>
       </footer>
     </div>
@@ -735,6 +827,21 @@ export function TaskRail() {
   }
 
   useEffect(() => () => closeStream(), []);
+
+  // E14：ChatWorkbench 派工成功后广播 wikiTrackTask，自动填入并跟踪新任务。
+  useEffect(() => {
+    function onTrack(ev: Event) {
+      const taskId = (ev as CustomEvent<{ taskId?: string }>).detail?.taskId;
+      if (taskId) {
+        setSessionId(taskId);
+        void loadTask(taskId);
+      }
+    }
+    window.addEventListener("wikiTrackTask", onTrack as EventListener);
+    return () => window.removeEventListener("wikiTrackTask", onTrack as EventListener);
+    // loadTask 为稳定闭包（仅引用 setter）；空依赖避免重复绑定。
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   async function loadTask(taskId: string) {
     setPending(true);

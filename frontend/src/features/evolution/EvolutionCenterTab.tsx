@@ -73,6 +73,45 @@ async function apiGet<T>(url: string): Promise<T> {
   return r.json();
 }
 
+async function apiPut<T>(url: string, body: unknown): Promise<T> {
+  const r = await fetch(url, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!r.ok) throw new Error(await r.text());
+  return r.json();
+}
+
+// runtime-flag GET/PUT 同形（camelCase）；server 钳 rolloutPercent ≤ 100。
+export interface RuntimeFlag {
+  enabled: boolean;
+  rolloutPercent: number;
+}
+
+// 后端响应把配置体放在 .flag 子对象里（未配置时 flag === null）：
+//   GET  → { workspaceId, envEvolutionEnabled, flag: { enabled, rolloutPercent, ... } | null }
+//   PUT  → { ok, flag: { enabled, rolloutPercent, ... } }
+// 读回必须从 .flag 内层取；flag 为 null（未配置）时回落逻辑默认 false/0。
+export interface RuntimeFlagResponse {
+  flag: RuntimeFlag | null;
+}
+
+// 阈值变更不可变审计行（release / rollback / auto-release）。后端字段为 camelCase，
+// 以宽松类型读取主要列（gateKey / action / decidedBy / decidedAt / value transition）。
+export interface ThresholdAuditRow {
+  id?: string | null;
+  gateKey?: string | null;
+  action?: string | null;
+  previousValue?: number | null;
+  newValue?: number | null;
+  sourceProposalId?: string | null;
+  decidedBy?: string | null;
+  decidedAt?: string | null;
+  hitRateObserved?: number | null;
+  [k: string]: unknown;
+}
+
 /// 7 天聚合（client 端从 experiments[] 推算 — 不打额外请求；后端尚未提供专用聚合 endpoint）。
 export function aggregateLast7Days(items: ExperimentItem[]): {
   experiments: number;
@@ -118,6 +157,69 @@ export function EvolutionCenterTab({ enabled = true }: { enabled?: boolean }) {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string>("");
   const [selectedProposalId, setSelectedProposalId] = useState<string | null>(null);
+
+  // ── runtime-flag 灰度控件（workspace 级 enabled + rolloutPercent 0-100）──
+  const [flagEnabled, setFlagEnabled] = useState(false);
+  const [rollout, setRollout] = useState<string>("0");
+  const [flagBusy, setFlagBusy] = useState(false);
+  const [flagMsg, setFlagMsg] = useState<string>("");
+
+  async function loadFlag() {
+    setFlagBusy(true);
+    setFlagMsg("");
+    try {
+      const resp = await apiGet<RuntimeFlagResponse>("/api/evolution/runtime-flag");
+      // 配置体在 .flag 子对象里；flag 为 null（未配置）回落 false/0。
+      setFlagEnabled(Boolean(resp.flag?.enabled ?? false));
+      setRollout(String(resp.flag?.rolloutPercent ?? 0));
+    } catch (e) {
+      setFlagMsg(e instanceof Error ? e.message : String(e));
+    } finally {
+      setFlagBusy(false);
+    }
+  }
+
+  async function saveFlag() {
+    setFlagBusy(true);
+    setFlagMsg("");
+    try {
+      const pct = Math.max(0, Math.min(100, Number(rollout) || 0));
+      const resp = await apiPut<RuntimeFlagResponse>("/api/evolution/runtime-flag", {
+        enabled: flagEnabled,
+        rolloutPercent: pct,
+      });
+      // PUT 回写同样在 .flag 子对象里。
+      setFlagEnabled(Boolean(resp.flag?.enabled ?? flagEnabled));
+      setRollout(String(resp.flag?.rolloutPercent ?? pct));
+      setFlagMsg("灰度配置已保存");
+    } catch (e) {
+      setFlagMsg(e instanceof Error ? e.message : String(e));
+    } finally {
+      setFlagBusy(false);
+    }
+  }
+
+  // ── 阈值变更审计日志（点按钮加载，与 runtime-flag 同模式，挂载期不自动 GET）──
+  const [auditRows, setAuditRows] = useState<ThresholdAuditRow[]>([]);
+  const [auditLoaded, setAuditLoaded] = useState(false);
+  const [auditBusy, setAuditBusy] = useState(false);
+  const [auditError, setAuditError] = useState<string>("");
+
+  async function loadAudit() {
+    setAuditBusy(true);
+    setAuditError("");
+    try {
+      const data = await apiGet<{ items: ThresholdAuditRow[] }>(
+        "/api/evolution/threshold-overrides/audit",
+      );
+      setAuditRows(data.items || []);
+      setAuditLoaded(true);
+    } catch (e) {
+      setAuditError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setAuditBusy(false);
+    }
+  }
 
   async function load() {
     if (!enabled) return;
@@ -167,11 +269,99 @@ export function EvolutionCenterTab({ enabled = true }: { enabled?: boolean }) {
         />
       </header>
 
+      <div className={styles.flagPanel} data-testid="runtime-flag-panel">
+        <div className={styles.flagRow}>
+          <label className={styles.flagToggle}>
+            <input
+              type="checkbox"
+              checked={flagEnabled}
+              onChange={(e) => setFlagEnabled(e.target.checked)}
+              disabled={flagBusy}
+            />
+            <span>启用演化灰度</span>
+          </label>
+          <label className={styles.flagField}>
+            <span>灰度比例（%）</span>
+            <input
+              type="number"
+              min={0}
+              max={100}
+              value={rollout}
+              onChange={(e) => setRollout(e.target.value)}
+              disabled={flagBusy}
+            />
+          </label>
+          <button className={styles.btnGhost} onClick={() => void loadFlag()} disabled={flagBusy}>
+            读取当前配置
+          </button>
+          <button className={styles.btnPrimary} onClick={() => void saveFlag()} disabled={flagBusy}>
+            保存灰度
+          </button>
+        </div>
+        {flagMsg && (
+          <div className={styles.flagMsg} data-testid="runtime-flag-msg">
+            {flagMsg}
+          </div>
+        )}
+      </div>
+
       <div className={styles.toolbar}>
         <button className={styles.btnGhost} onClick={() => void load()} disabled={loading}>
           {loading ? "加载中" : "刷新"}
         </button>
+        <button
+          className={styles.btnGhost}
+          onClick={() => void loadAudit()}
+          disabled={auditBusy}
+          data-testid="threshold-audit-load"
+        >
+          {auditBusy ? "加载中" : "阈值变更审计"}
+        </button>
       </div>
+
+      {(auditLoaded || auditError) && (
+        <div className={styles.auditPanel} data-testid="threshold-audit-panel">
+          {auditError && (
+            <div className={styles.error} role="alert">
+              {auditError}
+            </div>
+          )}
+          {auditLoaded && auditRows.length === 0 && !auditError && (
+            <p className={styles.proposalEmpty} data-testid="threshold-audit-empty">
+              暂无审计记录。
+            </p>
+          )}
+          {auditRows.length > 0 && (
+            <table className={styles.proposalList} data-testid="threshold-audit-table">
+              <thead>
+                <tr>
+                  <th>动作</th>
+                  <th>阈值项</th>
+                  <th>值变更</th>
+                  <th>操作者</th>
+                  <th>时间</th>
+                </tr>
+              </thead>
+              <tbody>
+                {auditRows.map((row, idx) => (
+                  <tr
+                    key={row.id ?? `${row.decidedAt ?? "row"}-${idx}`}
+                    data-testid={`threshold-audit-row-${row.id ?? idx}`}
+                  >
+                    <td>{row.action ?? "—"}</td>
+                    <td>{row.gateKey ?? "—"}</td>
+                    <td>
+                      {formatNumber(row.previousValue ?? null)} → {formatNumber(row.newValue ?? null)}
+                    </td>
+                    <td>{row.decidedBy ?? "—"}</td>
+                    <td>{row.decidedAt ?? "—"}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          )}
+        </div>
+      )}
 
       {error && (
         <div className={styles.error} role="alert">
