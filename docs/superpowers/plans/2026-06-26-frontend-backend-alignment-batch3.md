@@ -2,21 +2,21 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** 修复 76 缺口路线图中标 `[批次3]` 的全部 MEDIUM 条目 + 批次2 顺延的 C6/C9，共 19 条：补全编辑/操作入口、自治可观测深化、三条前后端闭环。
+**Goal:** 修复 76 缺口路线图中标 `[批次3]` 的全部 MEDIUM 条目 + 批次2 顺延的 C6/C9，共 18 条：补全编辑/操作入口、自治可观测深化、两条前后端闭环。（原列 19 条；**E11 management 高危确认流已在最新 main 完整实现——后端 confirm/reject 端点（management.rs:443/519）+ 乐观锁防 IDOR + 前端确认按钮（command-center/index.tsx:210 + commandStore.confirmCommand:109）均已落地，故从批次3 移除**。）
 
-**Architecture:** 按后端 blast radius 分三组——组一纯前端 16 条（接线已有端点）、组二轻后端 1 条（E9 补 integrity-report 字段）、组三重后端 2 条（E11 management confirm 续跑端点 + CAS 幂等 / F23 suspected_deal 全链：gateway fail-soft 提取 + 专表 + 三端点 + approve 落 staff_confirmed outcome）。组一打底，组三排最后独立隔离。
+**Architecture:** 按后端 blast radius 分三组——组一纯前端 16 条（接线已有端点）、组二轻后端 1 条（E9 补 integrity-report 字段）、组三重后端 1 条（F23 suspected_deal 全链：gateway fail-soft 提取 + 专表 + 三端点 + approve 落 staff_confirmed outcome）。组一打底，组三排最后独立隔离。
 
 **Tech Stack:** Rust 2021 / Axum / MongoDB（后端），React 19 + TypeScript + Vite + Zustand（前端），vitest（前端测）、cargo test（后端测）。
 
 ## Global Constraints
 
 - 子 agent 一律 `model:"opus"`；回复中文。代码标识符/注释遵循既有约定。
-- **无人工接管 CI lint**（`scripts/check-no-human-takeover.sh BASE HEAD`）：`src/agent|routes|evolution` + `frontend/src` 新增行（含注释/JSX 文案）禁含 `人工 / 接管 / takeover / hand-off / 人工接管 / 转人工 / 人工介入 / 人工托管`（测试目录除外）。E11 二次确认文案、E2 引荐态文案、F23 待核实文案用业务语义措辞（"AI 已退辅助答疑" / "确认执行 N 个操作" / "疑似成交待核实"）。
+- **无人工接管 CI lint**（`scripts/check-no-human-takeover.sh BASE HEAD`）：`src/agent|routes|evolution` + `frontend/src` 新增行（含注释/JSX 文案）禁含 `人工 / 接管 / takeover / hand-off / 人工接管 / 转人工 / 人工介入 / 人工托管`（测试目录除外）。E2 引荐态文案、F23 待核实文案用业务语义措辞（"AI 已退辅助答疑" / "疑似成交待核实"）。
 - **测试基线不回退**：`cargo test --lib ≥350/0`；4 PBT（state_transition_pbt / memory_card_invariants / wiki_chunk_revision_pbt / llm_retry_jitter）累计 ≥33/0；`RUSTFLAGS=-Dwarnings cargo check --tests` 0 err 0 warn。本地只跑 `cargo test --lib` + 单 PBT，集成测（`#[ignore]`）留 CI（无本地 Docker）。
 - **测试只增量叠加**：不删改旧维度/旧弧/旧金标；扩既有断言只能 ADD 不能弱化。
 - **AI 永不自动验证知识红线**：E7 手工新建切片**前端提交必须显式带** `status:"draft"` + `integrityStatus:"needs_review"`（后端裸 POST chunks 默认落 active，不强制 draft）；F23 落正式成交一律人审 + `verification="staff_confirmed"`，AI 永不直写 outcome_events。
-- **closed-set 枚举 DB 写点校验**：E11 run status（pending_confirmation→running→succeeded/failed）、F23 signal status（pending/approved/rejected）。
-- **后端改动 blast radius**：E9 补 integrity-report 字段须保 CockpitView 现有三卡不回归（加可选字段）；E11 confirm 端点会触发生产 MCP + 发送网关（CAS 幂等 + 加固测）；F23 gateway extract 必须 fail-soft（`let _ = ...` 吞错，不阻断主决策，受 RunBudget 约束）。
+- **closed-set 枚举 DB 写点校验**：F23 signal status（pending/approved/rejected）。
+- **后端改动 blast radius**：E9 补 integrity-report 字段须保 CockpitView 现有三卡不回归（加可选字段）；F23 gateway extract 必须 fail-soft（`let _ = ...` 吞错，不阻断主决策，受 RunBudget 约束）。
 - **前端遵守设计系统**：tokens.css 变量、`.module.css` + import 绑定、4 级层级、蓝=主操作专属、紫=AI 身份专属。**优先复用现有组件**：D4 复用 `ActiveVersionsBar`、F23 复用 `SimpleApproveReject` 模式、E16 复用 products-deals 的 setError 模式。
 - **git**：仅在用户要求时提交；只 `git add` 具名文件，**绝不 `git add -A`**（工作区有并行会话的 `scripts/biz-test/*` 未提交改动，绝不触碰）；commit message 末尾 `Co-Authored-By: Claude <noreply@anthropic.com>`。
 - **serde rename 铁律**（批次1/2 踩 5 次）：所有后端请求/响应 struct 须核实 `#[serde(rename_all)]` 属性——snake 字段名 ≠ wire 键。嵌套 struct 可独立于顶层有自己的 rename_all。前端 PUT/POST body 键须对齐后端 wire 键，否则 typed 反序列化静默丢键。
@@ -47,10 +47,8 @@
 - `src/routes/knowledge/catalog.rs` — E9（integrity-report 加 anchorsMissing 计数）
 - `frontend/src/features/knowledge/cockpit/CockpitView.tsx` + `trustTypes.ts` — E9（三计数改口径 + 渲染 gaps）
 
-**组三 重后端（2 条）**
-- `src/routes/management.rs` — E11（抽 execute_command_run_plan fn + post_management_command_confirm handler）
-- `src/routes/mod.rs` — E11（挂 confirm 路由）/ F23（挂 suspected-deals 三路由）
-- `frontend/src/features/command-center/` 或 management — E11（确认按钮 + 二次确认弹窗）
+**组三 重后端（1 条）**
+- `src/routes/mod.rs` — F23（挂 suspected-deals 三路由）
 - `src/models.rs` — F23（SuspectedDealSignal struct）
 - `src/db/mod.rs` — F23（collection_suspected_deal_signals accessor）
 - `src/db/indexes.rs` — F23（ensure_suspected_deal_signals_indexes）
@@ -58,7 +56,7 @@
 - `src/routes/admin_suspected_deals.rs` — F23（新建：list/approve/reject 三 handler）
 - `frontend/src/features/products-deals/` — F23（疑似成交待核实列表 + 审核）
 
-**执行顺序**：组一（任意序，建议 A2→A3→E2 相邻、D4→D5 相邻、E5→E6→E7→E8 相邻、B4、C6+C9、E12、E15、E16）→ 组二（E9）→ 组三（E11、F23）。
+**执行顺序**：组一（任意序，建议 A2→A3→E2 相邻、D4→D5 相邻、E5→E6→E7→E8 相邻、B4、C6+C9、E12、E15、E16）→ 组二（E9）→ 组三（F23）。
 
 ---
 
@@ -899,142 +897,9 @@ Co-Authored-By: Claude <noreply@anthropic.com>"
 
 ## 组三：重后端（blast 最大，排最后，独立隔离）
 
-### Task 16: E11 — management confirm 续跑端点 + CAS 幂等
+> **E11（management 高危确认流）已从批次3 移除** —— 写 plan 后复核最新 main 发现该条已完整实现：后端 `confirm_management_command`（management.rs:443）+ `reject_management_command`（:519）端点 + 乐观锁 `find_one_and_update`（filter `status=pending_confirmation` + workspace_id 防 IDOR）+ 抽公共 `execute_plan_tool_calls`（:93/:131）防 dual-path drift；路由已注册（mod.rs:788/792）；前端确认条 + "确认执行" 按钮（command-center/index.tsx:210-219）+ `commandStore.confirmCommand`（commandStore.ts:109 → POST /confirm）+ 测试（commandCenter.test.tsx:77）均已落地。故组三只剩 F23 一条。
 
-**Files:**
-- Modify: `src/routes/management.rs`（抽 `execute_command_run_plan` 共享 fn + 新增 `post_management_command_confirm` handler）
-- Modify: `src/routes/mod.rs`（挂 confirm 路由，仿 :808-819）
-- Modify: `frontend/src/features/command-center/`（或 management 视图）+ store（确认按钮 + 二次确认弹窗）
-- Test: 后端集成测（`#[ignore]`）+ 前端组件测
-
-**Interfaces:**
-- Consumes: `AgentCommandRun`（models.rs:2929，**无 rename_all** → snake BSON；`id` 即 _id 当 run_id，无独立字段；`plan: Option<Document>` 是 to_document(&ManagementPlan)；`status: String`）。`ManagementPlan`（management.rs:51，`rename_all="camelCase"`：tool_calls: Vec<PlannedToolCall>{tool_name, arguments}, risk_level, requires_confirmation）。`command_runs()` accessor（db/mod.rs:215 → "agent_command_runs"）。`mcp::list_tools_for_account` + `merge_product_tools`(management.rs:414) + `advertised_tool_names`(:484)。`execute_management_tool`（:220）。
-- Produces: `POST /api/management-agent/commands/:id/confirm` 端点 + `execute_command_run_plan` 共享 fn。
-
-**端点语义（spec 已定）**：
-1. 沿用 `Extension<AuthenticatedAdmin>` + workspace 隔离（读 run `{_id, workspace_id}`，仿 get_management_command:362）。
-2. **CAS 幂等护栏**：原子把 status 从 `pending_confirmation` 改 `running`（`update_one(filter{_id, status:"pending_confirmation"}, $set{status:"running"})` 查 matched_count；==0 即拒绝 409/400）——防并发双发/重放。
-3. 反序列化 `run.plan` 为 ManagementPlan（`from_document`）→ 重建 tools → 复用抽出的执行 fn 但 `take(12)`（真执行）。
-4. 执行后回写终态（succeeded/failed），立即推离 pending。
-5. dry_run 取舍：重查 session.dry_run 沿用原意，不擅自改真跑。
-
-**安全注意**：confirm 后续跑会真打生产 MCP + 发送网关（execute_management_tool → send_contact_message_gateway）。这是 batch3 唯一触发生产副作用的新端点 → 加固集成测。
-
-- [ ] **Step 1: 抽 execute_command_run_plan 共享 fn（重构，不改行为）**
-
-把 management.rs:188-340 的执行循环（落 run 后 → for tool_calls.take(N) execute → 回写终态 → 生成 assistant 文本）抽成：
-```rust
-async fn execute_command_run_plan(
-    state: &AppState,
-    ws: &str,
-    account_id: &str,
-    advertised_tools: &std::collections::HashSet<String>,
-    effective_dry_run: bool,
-    run_id: ObjectId,
-    plan: &ManagementPlan,
-    take_count: usize,   // post_management_message 传 0(待确认)/12(直执行); confirm 传 12
-) -> AppResult<(String, Vec<Value>)> {  // (final_status, tool_call_jsons)
-    // 原 :192-311 逻辑，take(take_count)
-}
-```
-`post_management_message` 改为调它（待确认时 take_count=0，否则 12），**行为零变化**——这是纯重构步。
-
-- [ ] **Step 2: 跑既有 management 测试确认重构无回归**
-
-Run: `cargo test --lib management 2>&1 | tail -5`（若有 management 单测）+ `RUSTFLAGS=-Dwarnings cargo check --tests 2>&1 | tail -3`
-Expected: 编译过，既有测试不回归。
-
-- [ ] **Step 3: 写失败的后端集成测（confirm 续跑 + CAS 拒绝二次）**
-
-`tests/` 新建 `management_confirm_e2e.rs`，append `#[ignore]`：
-```rust
-// 1. 造一条 pending_confirmation 的 AgentCommandRun（plan 含 1 个只读 tool）
-// 2. POST /api/management-agent/commands/:id/confirm → 200，run status 变 succeeded，tool 执行
-// 3. 再 POST confirm 同 id → 拒绝（status 已非 pending_confirmation，CAS matched=0）
-// 4. 跨 workspace confirm → 404/拒绝
-```
-
-- [ ] **Step 4: 跑测试确认失败（端点不存在）**
-
-Run: `RUSTFLAGS=-Dwarnings cargo check --tests 2>&1 | tail -5`
-Expected: 编译过（测试引用 confirm 路由），#[ignore] 本地不跑。
-
-- [ ] **Step 5: 实现 post_management_command_confirm handler**
-
-```rust
-pub(super) async fn post_management_command_confirm(
-    State(state): State<AppState>,
-    Extension(admin): Extension<AuthenticatedAdmin>,
-    Path(id): Path<String>,   // run_id
-) -> AppResult<Json<Value>> {
-    let run_id = ObjectId::parse_str(&id)?;
-    // CAS：pending_confirmation → running（matched==0 拒绝）
-    let cas = state.db.command_runs().update_one(
-        doc!{"_id": run_id, "workspace_id": &admin.current_workspace, "status": "pending_confirmation"},
-        doc!{"$set": {"status": "running", "updated_at": DateTime::now()}}, None).await?;
-    if cas.matched_count == 0 {
-        return Err(AppError::bad_request("命令不可确认（非待确认态或不存在）"));
-    }
-    let run = state.db.command_runs().find_one(doc!{"_id": run_id, "workspace_id": &admin.current_workspace}, None).await?
-        .ok_or_else(|| AppError::not_found("命令运行"))?;
-    let plan: ManagementPlan = mongodb::bson::from_document(run.plan.clone().unwrap_or_default())?;
-    // 重建 tools（仿 :145-147）
-    let tools = merge_product_tools(crate::mcp::list_tools_for_account(&state, &run.account_id).await?);
-    let advertised = advertised_tool_names(&tools);
-    // dry_run：按原会话语义重查 session.dry_run（run.session_id → management_sessions），
-    // 拿不到则保守 false（confirm 即真执行）。不擅自改原 dry_run 取舍。
-    let session = state.db.management_sessions()
-        .find_one(doc!{"_id": run.session_id, "workspace_id": &admin.current_workspace}, None).await?;
-    let dry_run = session.map(|s| s.dry_run).unwrap_or(false);
-    let (final_status, calls) = execute_command_run_plan(
-        &state, &admin.current_workspace, &run.account_id, &advertised, dry_run, run_id, &plan, 12).await?;
-    // 回写终态 + 生成 assistant 文本（仿 :297-340）
-    Ok(Json(json!({ "status": final_status, "toolCalls": calls })))
-}
-```
-（细节实现期对齐；关键是 CAS 幂等 + take(12) 真执行 + workspace 隔离。）
-
-- [ ] **Step 6: 挂路由**
-
-mod.rs 仿 :808-819 加：
-```rust
-.route("/management-agent/commands/:id/confirm", post(post_management_command_confirm))
-```
-import 补 `post_management_command_confirm`。
-
-- [ ] **Step 7: 后端编译确认**
-
-Run: `RUSTFLAGS=-Dwarnings cargo check --tests 2>&1 | tail -5`
-Expected: 0 警告 0 错误
-
-- [ ] **Step 8: 前端确认按钮 + 二次确认弹窗**
-
-command-center（或 management 视图）对 status=="pending_confirmation" 的 command 加"确认执行"按钮 → POST confirm。**二次确认弹窗明确提示"将真实执行 N 个操作（含发送消息/写库），确认？"**（N = plan.tool_calls.length）。措辞守无人工接管 lint（不用"人工接管"等词）。前端 store 加 confirmCommand action。
-
-- [ ] **Step 9: 前端组件测 + lint**
-
-```tsx
-it("confirm button posts to confirm endpoint after dialog", async () => {
-  const postSpy = vi.spyOn(api, "post").mockResolvedValue({ status: "succeeded" });
-  // 渲染 pending_confirmation command，点确认→弹窗确认，断言 POST /confirm
-});
-```
-Run: `cd frontend && npx vitest run && npx tsc --noEmit`
-Run: `bash scripts/check-no-human-takeover.sh <BASE> HEAD`（确认 0 violations）
-
-- [ ] **Step 10: 全量校验 + commit**
-
-Run: `cargo test --lib 2>&1 | tail -3`（≥350/0）+ `RUSTFLAGS=-Dwarnings cargo check --tests 2>&1 | tail -3`
-```bash
-git add src/routes/management.rs src/routes/mod.rs frontend/src/features/command-center/... frontend/src/__tests__/... tests/management_confirm_e2e.rs
-git commit -m "feat(management): 高危指令 confirm 续跑端点 + CAS 幂等(E11)
-
-Co-Authored-By: Claude <noreply@anthropic.com>"
-```
-
----
-
-### Task 17: F23 — 疑似成交待核实闭环（方案B 全链）
+### Task 16: F23 — 疑似成交待核实闭环（方案B 全链）
 
 **Files:**
 - Modify: `src/models.rs`（新增 `SuspectedDealSignal` struct，仿 RelationshipTypeSuggestion :2822）
@@ -1161,8 +1026,8 @@ Co-Authored-By: Claude <noreply@anthropic.com>"
 
 ## 完工后
 
-全 17 task 完成后：
-1. whole-branch 终审（最强模型，range = `git merge-base main HEAD`..HEAD），重点查跨 task 一致性（A2/A3/E2 同改 userOpsStore+legacy；D4/D5 同改 strategyStore+system-strategy；E5/E6/E7/E8 同改 knowledge；E11/F23 后端新端点鉴权/红线）+ serde rename 复核 + 累积 Minor triage。
+全 16 task 完成后：
+1. whole-branch 终审（最强模型，range = `git merge-base main HEAD`..HEAD），重点查跨 task 一致性（A2/A3/E2 同改 userOpsStore+legacy；D4/D5 同改 strategyStore+system-strategy；E5/E6/E7/E8 同改 knowledge；F23 后端新端点鉴权/红线）+ serde rename 复核 + 累积 Minor triage。
 2. 终审有 findings → 派 ONE fix subagent（完整 findings 列表）。
 3. `superpowers:finishing-a-development-branch`：push + 创建 PR（**不自动合并**，除非用户确认），等 CI 双门绿。
 
@@ -1177,7 +1042,6 @@ Co-Authored-By: Claude <noreply@anthropic.com>"
 - D5：手动新建空白配置可保存（走 POST）。
 - E2：联系人详情显"已引荐 · AI 已退辅助答疑"。
 - E5/E6/E7/E8：解除关联/文档编辑/手工建切片(draft)/patch 预览。
-- E11：✅高危指令二次确认按钮 → 真执行（重点验收，含生产副作用）。
 - E12：proposal 详情显 5 字段。
 - E15：多 workspace 可切换。
 - E16：决策链编辑器加载失败显错误态。
