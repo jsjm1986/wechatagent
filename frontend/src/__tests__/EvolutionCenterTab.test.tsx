@@ -320,10 +320,20 @@ describe("EvolutionCenterTab", () => {
       ok: true,
       json: async () => ({ items: [] }),
     });
-    // PUT 响应（保存灰度后回写）。
+    // PUT 响应（保存灰度后回写）。复刻后端真实结构：{ ok, flag: { 内层 } }。
     fetchMock.mockResolvedValueOnce({
       ok: true,
-      json: async () => ({ enabled: true, rolloutPercent: 50 }),
+      json: async () => ({
+        ok: true,
+        flag: {
+          enabled: true,
+          rolloutPercent: 50,
+          rolloutPercentRaw: 50,
+          thresholdAutoReleaseEnabled: null,
+          updatedBy: "admin",
+          updatedAt: "2026-06-26T00:00:00Z",
+        },
+      }),
     });
 
     render(<EvolutionCenterTab enabled={true} />);
@@ -345,6 +355,10 @@ describe("EvolutionCenterTab", () => {
       const body = JSON.parse((putCall![1] as RequestInit).body as string);
       expect(body).toMatchObject({ enabled: true, rolloutPercent: 50 });
     });
+    // 保存后读回展示值来自 .flag 内层（rolloutPercent: 50）。
+    await waitFor(() => {
+      expect((screen.getByLabelText(/灰度比例/) as HTMLInputElement).value).toBe("50");
+    });
   });
 
   it("读取当前配置按钮 GET runtime-flag 并回填", async () => {
@@ -352,10 +366,22 @@ describe("EvolutionCenterTab", () => {
       ok: true,
       json: async () => ({ items: [] }),
     });
-    // 读取当前配置 GET 返回 rolloutPercent: 30 / enabled: true
+    // 读取当前配置 GET 复刻后端真实结构：配置体在 .flag 子对象里（外层还有
+    // workspaceId / envEvolutionEnabled）。读回必须从 .flag 内层取，否则恒显 0。
     fetchMock.mockResolvedValueOnce({
       ok: true,
-      json: async () => ({ enabled: true, rolloutPercent: 30 }),
+      json: async () => ({
+        workspaceId: "default",
+        envEvolutionEnabled: true,
+        flag: {
+          enabled: true,
+          rolloutPercent: 30,
+          rolloutPercentRaw: 30,
+          thresholdAutoReleaseEnabled: null,
+          updatedBy: "admin",
+          updatedAt: "2026-06-26T00:00:00Z",
+        },
+      }),
     });
 
     render(<EvolutionCenterTab enabled={true} />);
@@ -366,6 +392,8 @@ describe("EvolutionCenterTab", () => {
       const input = screen.getByLabelText(/灰度比例/) as HTMLInputElement;
       expect(input.value).toBe("30");
     });
+    // 同时断言开关回填来自 .flag 内层（enabled: true）。
+    expect((screen.getByLabelText(/启用演化灰度/) as HTMLInputElement).checked).toBe(true);
   });
 
   // 前后端对齐批次1 Task 6（C4）：阈值变更不可变审计日志视图。

@@ -89,6 +89,14 @@ export interface RuntimeFlag {
   rolloutPercent: number;
 }
 
+// 后端响应把配置体放在 .flag 子对象里（未配置时 flag === null）：
+//   GET  → { workspaceId, envEvolutionEnabled, flag: { enabled, rolloutPercent, ... } | null }
+//   PUT  → { ok, flag: { enabled, rolloutPercent, ... } }
+// 读回必须从 .flag 内层取；flag 为 null（未配置）时回落逻辑默认 false/0。
+export interface RuntimeFlagResponse {
+  flag: RuntimeFlag | null;
+}
+
 // 阈值变更不可变审计行（release / rollback / auto-release）。后端字段为 camelCase，
 // 以宽松类型读取主要列（gateKey / action / decidedBy / decidedAt / value transition）。
 export interface ThresholdAuditRow {
@@ -160,9 +168,10 @@ export function EvolutionCenterTab({ enabled = true }: { enabled?: boolean }) {
     setFlagBusy(true);
     setFlagMsg("");
     try {
-      const flag = await apiGet<RuntimeFlag>("/api/evolution/runtime-flag");
-      setFlagEnabled(Boolean(flag.enabled));
-      setRollout(String(flag.rolloutPercent ?? 0));
+      const resp = await apiGet<RuntimeFlagResponse>("/api/evolution/runtime-flag");
+      // 配置体在 .flag 子对象里；flag 为 null（未配置）回落 false/0。
+      setFlagEnabled(Boolean(resp.flag?.enabled ?? false));
+      setRollout(String(resp.flag?.rolloutPercent ?? 0));
     } catch (e) {
       setFlagMsg(e instanceof Error ? e.message : String(e));
     } finally {
@@ -175,12 +184,13 @@ export function EvolutionCenterTab({ enabled = true }: { enabled?: boolean }) {
     setFlagMsg("");
     try {
       const pct = Math.max(0, Math.min(100, Number(rollout) || 0));
-      const flag = await apiPut<RuntimeFlag>("/api/evolution/runtime-flag", {
+      const resp = await apiPut<RuntimeFlagResponse>("/api/evolution/runtime-flag", {
         enabled: flagEnabled,
         rolloutPercent: pct,
       });
-      setFlagEnabled(Boolean(flag.enabled));
-      setRollout(String(flag.rolloutPercent ?? pct));
+      // PUT 回写同样在 .flag 子对象里。
+      setFlagEnabled(Boolean(resp.flag?.enabled ?? flagEnabled));
+      setRollout(String(resp.flag?.rolloutPercent ?? pct));
       setFlagMsg("灰度配置已保存");
     } catch (e) {
       setFlagMsg(e instanceof Error ? e.message : String(e));
