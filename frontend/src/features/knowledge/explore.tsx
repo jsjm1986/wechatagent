@@ -44,6 +44,10 @@ export function AskView() {
   const [showTrace, setShowTrace] = useState(false);
   const [openCited, setOpenCited] = useState<Set<string>>(new Set());
   const esRef = useRef<EventSource | null>(null);
+  // resultRef 同步跟踪 result 最新值。submitStream 的 error handler 同步触发，
+  // 而 setResult 是异步 state —— 必须在每个 setResult 处同步置 ref，否则 error
+  // handler 读到的是上一轮的旧 result（stale closure），导致新查询失败时错误横幅被误抑制。
+  const resultRef = useRef<AskResult | null>(null);
 
   // 组件卸载/重新提交时关掉旧 EventSource，避免连接泄漏。
   useEffect(() => () => {
@@ -54,6 +58,7 @@ export function AskView() {
   function resetForSubmit() {
     setError(null);
     setResult(null);
+    resultRef.current = null;
     setLiveTrace([]);
     setStreamText("");
     setOpenCited(new Set());
@@ -84,6 +89,7 @@ export function AskView() {
       if (!r.ok) throw await parseApiError(r);
       const data = (await r.json()) as AskResult;
       setResult(data);
+      resultRef.current = data;
     } catch (err: unknown) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
@@ -126,14 +132,16 @@ export function AskView() {
         const data = JSON.parse((ev as MessageEvent).data) as Omit<AskResult, "tookMs"> & {
           tookMs?: number;
         };
-        setResult({ ...data, tookMs: data.tookMs ?? Date.now() - startedAt });
+        const next: AskResult = { ...data, tookMs: data.tookMs ?? Date.now() - startedAt };
+        setResult(next);
+        resultRef.current = next;
       } catch (err) {
         setError(err instanceof Error ? err.message : "解析 answer 帧失败");
       }
     });
     es.addEventListener("error", () => {
       // 浏览器在 close 后也会触发 error；只在还没拿到 answer 时报警，避免误报。
-      if (!result) {
+      if (!resultRef.current) {
         setError("流式连接错误（请关闭实时模式或重试）");
       }
       es.close();
