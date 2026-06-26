@@ -272,6 +272,47 @@ workflow 发现 7 域里有些 LLM 决策被"穿过"却没断言行为质量，�
 
 ---
 
+## 4c. 执行约束（批判审查 + 代码查证后补充）
+
+写 plan 前查证了新增域的可执行性，以下约束必须落进每个域的脚本：
+
+### 4c.1 两批执行（避免 active profile 串扰）
+
+⑦行业闭环 activate 行业 profile 会改**全局 active profile**，会让①-⑥的销售域 canonical 断言失真。故**分两批**：
+
+- **批 A（销售域批）**：DEFAULT 销售 profile 下跑 ①②③④⑤⑥ + ⑧⑨⑩⑪⑬。断言用销售域 canonical 值。
+- **批 B（行业域批）**：心理/教育/医美**逐个** activate → 跑 ⑦闭环 + ⑫（该行业下初始画像/playbook 生成）→ 断言该行业 canonical 值 → activate 回原（或下一个行业）。
+- 批 A 跑完记录当前 active profile id；批 B 每切换前存档、跑完恢复。⑩⑪（管理 agent）与 active profile 无关，归批 A 省切换。
+
+### 4c.2 观测落点：mongo 为主，journalctl 为辅
+
+实测确认：ptier 事件 / reaction / escalation / outbox 都写 **mongo 集合（agent_events 等）**，**不都打 journalctl**。脚本观测纪律：
+- **业务行为断言查 mongo**（agent_send_outbox / agent_events / agent_principal_escalations / operation_knowledge_chunks / operating_memories / domain_profiles 等）。
+- **journalctl 只用来抓 `llm_call_logs` 真调铁证**（status=success/failed/json_error）+ panic。
+- 不要去 journalctl 找 ptier/reaction 事件——它们在 mongo。
+
+### 4c.3 域⑧ reaction 的触发方式（无独立端点）
+
+reaction 没有独立触发端点，是 webhook 进来时对**前一条 AI approved 回复**做 claim 分析（`reaction.rs:28 record_user_reaction` + `:280 analyze_user_reaction`）。故域⑧脚本必须**两段对话**：先发一条让 AI 回复的消息（产生 approved review）→ 再发客户反应消息（停止/购买/负面）才触发分析。
+
+### 4c.4 域⑨记忆固化有手动触发端点
+
+`POST /api/contacts/:id/memory-consolidation/run`（`mod.rs:352`）——域⑨不用等 worker 达窗口，直接调它触发固化，便于脚本化。
+
+### 4c.5 域⑬ vision 需 active vision provider
+
+deepseek-v4-flash supportsVision=false。vision 多模态抽取要先 active 一个 vision provider（llama-3.2-90b-vision，经 `/api/admin/llm-providers/:id/vision`）。**Step0 加一步**：确认/配 vision provider；没有则域⑬ vision 子项标 BLOCKED（其余 auto_verify/completeness/repair/tags 不受影响）。
+
+### 4c.6 统一 teardown
+
+13 个域造大量数据。除 biztest_* 前缀隔离外，建一个 `scripts/biz-test/cleanup.py` 一键清所有 biztest_* 数据（contacts/chunks/assets/cards/escalations/profiles/operating_memories）。每个域脚本开头先调 cleanup（幂等），全部跑完再调一次收尾。**绝不碰非 biztest_ 前缀的真实数据**。
+
+### 4c.7 端点路径以实现期 grep 为准
+
+spec 里端点路径（import preview/verify/chat 等）部分按记忆/调研标注，写脚本前 grep `routes/mod.rs` 实际 `.route(...)` 确认；mod.rs 已确认存在的：auto-verify(`:571`)、completeness(`:558`)、chunks/:id/repair(`:485`)、memory-consolidation/run(`:352`)、operation-playbooks/generate(`:756`)、domain-profiles/generate(`:961`)、principal-escalations/:short_code/resolve(`:849`)。
+
+---
+
 ## 5. 防假绿总则（贯穿每域）
 
 1. **真模型铁证**：每个涉 LLM 的断言都查 llm_call_logs status=success（非 skip/mock/json_error/failed）。端点挂了宁可标 BLOCKED 不假绿。
