@@ -78,6 +78,7 @@ function UserOpsFeatureInner() {
     customAgentInstructions,
     assistOverride,
     relationshipType,
+    profileEditDraft,
     importQuery,
     searchQuery,
     guideInstruction,
@@ -103,6 +104,7 @@ function UserOpsFeatureInner() {
     setCustomAgentInstructions,
     setAssistOverride,
     setRelationshipType,
+    setProfileEditDraft,
     setGuideInstruction,
     setSimulationInput,
     setSelectedPlaybookId,
@@ -125,7 +127,7 @@ function UserOpsFeatureInner() {
     saveProfileNote,
     saveCustomAgentInstructions,
     saveAssistOverride,
-    saveRelationshipType,
+    saveOperationProfile,
     saveOperatingMemory,
     saveManualTags,
     analyzeProfile,
@@ -280,6 +282,7 @@ function UserOpsFeatureInner() {
             customAgentInstructions={customAgentInstructions}
             assistOverride={assistOverride}
             relationshipType={relationshipType}
+            profileEditDraft={profileEditDraft}
             selected={selected}
             selectedPlaybookId={selectedPlaybookId}
             simulationBusy={simulationBusy}
@@ -295,12 +298,13 @@ function UserOpsFeatureInner() {
             onCustomAgentInstructions={setCustomAgentInstructions}
             onAssistOverride={setAssistOverride}
             onRelationshipType={setRelationshipType}
+            onProfileEditDraftChange={setProfileEditDraft}
             onRunMemoryConsolidation={runMemoryConsolidation}
             onRunSimulation={runDialogueSimulation}
             onSaveProfileNote={saveProfileNote}
             onSaveCustomAgentInstructions={saveCustomAgentInstructions}
             onSaveAssistOverride={saveAssistOverride}
-            onSaveRelationshipType={saveRelationshipType}
+            onSaveRelationshipType={saveOperationProfile}
             onSaveManualTags={saveManualTags}
             onMemoryDraftChange={setMemoryDraft}
             onSaveOperatingMemory={saveOperatingMemory}

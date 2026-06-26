@@ -45,6 +45,9 @@ interface UserOpsState {
   customAgentInstructions: string;
   assistOverride: string; // "default" | "force_on" | "force_off"
   relationshipType: string; // "" | "customer" | "peer" | "friend"
+  // A3：operation-profile 运营可编辑草稿（last_commitment / follow_up_policy）。
+  // customer_stage / intent_level 由 AI 派生、前端只读，不进此草稿。
+  profileEditDraft: { lastCommitment?: string; followUpPolicy?: string };
   guideInstruction: string;
   guidePreview: UserOperationGuidePreview | null;
   simulationInput: string;
@@ -76,6 +79,7 @@ interface UserOpsActions {
   setCustomAgentInstructions: (instructions: string) => void;
   setAssistOverride: (mode: string) => void;
   setRelationshipType: (value: string) => void;
+  setProfileEditDraft: (patch: Partial<{ lastCommitment: string; followUpPolicy: string }>) => void;
   setGuideInstruction: (instruction: string) => void;
   setSimulationInput: (input: string) => void;
   setSelectedPlaybookId: (id: string) => void;
@@ -104,7 +108,7 @@ interface UserOpsActions {
   saveProfileNote: () => Promise<void>;
   saveCustomAgentInstructions: () => Promise<void>;
   saveAssistOverride: () => Promise<void>;
-  saveRelationshipType: () => Promise<void>;
+  saveOperationProfile: () => Promise<void>;
   saveOperatingMemory: () => Promise<void>;
   clearReferral: (contactId: string) => Promise<void>;
   saveManualTags: (tags: string[]) => Promise<void>;
@@ -291,6 +295,7 @@ export const useUserOpsStore = create<UserOpsState & UserOpsActions>((set, get) 
   customAgentInstructions: "",
   assistOverride: "default",
   relationshipType: "",
+  profileEditDraft: {},
   importQuery: "",
   searchQuery: "",
   guideInstruction: "",
@@ -320,6 +325,7 @@ export const useUserOpsStore = create<UserOpsState & UserOpsActions>((set, get) 
   setCustomAgentInstructions: (instructions) => set({ customAgentInstructions: instructions }),
   setAssistOverride: (mode) => set({ assistOverride: mode }),
   setRelationshipType: (value) => set({ relationshipType: value }),
+  setProfileEditDraft: (patch) => set((s) => ({ profileEditDraft: { ...s.profileEditDraft, ...patch } })),
   setGuideInstruction: (instruction) => set({ guideInstruction: instruction }),
   setSimulationInput: (input) => set({ simulationInput: input }),
   setSelectedPlaybookId: (id) => set({ selectedPlaybookId: id }),
@@ -347,6 +353,11 @@ export const useUserOpsStore = create<UserOpsState & UserOpsActions>((set, get) 
         ((contact.domainAttributes as Record<string, unknown> | undefined)?.[
           "relationship_type"
         ] as string) || "",
+      // A3：回填运营可编辑的两字段（有则填，无则空），customer_stage/intent_level 不回填（AI 派生只读）。
+      profileEditDraft: {
+        lastCommitment: contact.lastCommitment || "",
+        followUpPolicy: contact.followUpPolicy || "",
+      },
       selectedPlaybookId: contact.playbookId || "",
       guidePreview: null
     });
@@ -550,10 +561,10 @@ export const useUserOpsStore = create<UserOpsState & UserOpsActions>((set, get) 
     }
   },
 
-  saveRelationshipType: async () => {
+  saveOperationProfile: async () => {
     const selected = useContactStore.getState().selected;
     const currentAccountId = useAccountStore.getState().currentAccountId();
-    const { relationshipType } = get();
+    const { relationshipType, profileEditDraft } = get();
 
     if (!selected) return;
 
@@ -563,6 +574,8 @@ export const useUserOpsStore = create<UserOpsState & UserOpsActions>((set, get) 
     try {
       await api.put(`/api/contacts/${selected.id}/operation-profile`, {
         relationshipType: relationshipType || undefined,
+        lastCommitment: profileEditDraft.lastCommitment || undefined,
+        followUpPolicy: profileEditDraft.followUpPolicy || undefined,
       });
       await refreshContacts(currentAccountId);
     } catch (error) {

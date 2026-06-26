@@ -31,6 +31,7 @@ const selected = { id: "c1", wxid: "wx1", agentStatus: "managed" } as Contact;
 function renderCockpit(overrides: Record<string, unknown> = {}) {
   const onMemoryDraftChange = vi.fn();
   const onSaveOperatingMemory = vi.fn();
+  const onProfileEditDraftChange = vi.fn();
   const noop = vi.fn();
   render(
     <UserOperationCockpit
@@ -50,6 +51,7 @@ function renderCockpit(overrides: Record<string, unknown> = {}) {
       customAgentInstructions=""
       assistOverride="default"
       relationshipType=""
+      profileEditDraft={{}}
       selected={selected}
       selectedPlaybookId=""
       simulationBusy={false}
@@ -65,6 +67,7 @@ function renderCockpit(overrides: Record<string, unknown> = {}) {
       onCustomAgentInstructions={noop}
       onAssistOverride={noop}
       onRelationshipType={noop}
+      onProfileEditDraftChange={onProfileEditDraftChange}
       onRunMemoryConsolidation={noop}
       onRunSimulation={noop}
       onSaveProfileNote={noop}
@@ -80,7 +83,7 @@ function renderCockpit(overrides: Record<string, unknown> = {}) {
       {...overrides}
     />,
   );
-  return { onMemoryDraftChange, onSaveOperatingMemory };
+  return { onMemoryDraftChange, onSaveOperatingMemory, onProfileEditDraftChange };
 }
 
 describe("UserOperationCockpit 运营记忆编辑表单", () => {
@@ -95,5 +98,19 @@ describe("UserOperationCockpit 运营记忆编辑表单", () => {
     const { onSaveOperatingMemory } = renderCockpit();
     fireEvent.click(screen.getByText("保存运营记忆"));
     expect(onSaveOperatingMemory).toHaveBeenCalledTimes(1);
+  });
+
+  it("编辑 last_commitment 输入框时以 patch 调 onProfileEditDraftChange", () => {
+    const { onProfileEditDraftChange } = renderCockpit({ activeTab: "profile" });
+    const input = screen.getByPlaceholderText("例：本周内给到方案报价");
+    fireEvent.change(input, { target: { value: "下周回复方案" } });
+    expect(onProfileEditDraftChange).toHaveBeenCalledWith({ lastCommitment: "下周回复方案" });
+  });
+
+  it("编辑 follow_up_policy 输入框时以 patch 调 onProfileEditDraftChange", () => {
+    const { onProfileEditDraftChange } = renderCockpit({ activeTab: "profile" });
+    const input = screen.getByPlaceholderText("例：每周跟进一次，客户明确拒绝则停止");
+    fireEvent.change(input, { target: { value: "每两周一次" } });
+    expect(onProfileEditDraftChange).toHaveBeenCalledWith({ followUpPolicy: "每两周一次" });
   });
 });
