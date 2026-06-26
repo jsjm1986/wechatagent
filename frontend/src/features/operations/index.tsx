@@ -1,4 +1,4 @@
-import { useEffect } from "react";
+import { useEffect, useState } from "react";
 import { Clock3 } from "lucide-react";
 import { EmptyState } from "../../components/ui/EmptyState";
 import { StatusBadge, type StatusTone } from "../../components/ui/StatusBadge";
@@ -6,7 +6,7 @@ import { useOperationsStore } from "../../stores/operationsStore";
 import { useAccountStore } from "../../stores/accountStore";
 import { api } from "../../lib/api";
 import { FINAL_REVIEW_STATUS_LABELS, HOLD_CATEGORY_LABELS, labelOf } from "../../lib/reviewLabels";
-import type { DecisionReview } from "../../types";
+import type { DecisionReview, AgentRunItem } from "../../types";
 import styles from "./Operations.module.css";
 
 function formatTime(value?: string) {
@@ -69,6 +69,69 @@ function reviewTone(review: DecisionReview): StatusTone {
   return review.approved ? "running" : "blocked";
 }
 
+// run envelope 终态 → StatusBadge tone（gateway_status 闭集，未知值回落 inactive）。
+function runStatusTone(status?: string): StatusTone {
+  const s = (status || "").toLowerCase();
+  if (s.includes("sent") || s.includes("success") || s.includes("done") || s.includes("approved")) return "running";
+  if (s.includes("fail") || s.includes("error") || s.includes("blocked") || s.includes("reject")) return "blocked";
+  if (s.includes("hold") || s.includes("held")) return "held";
+  if (s.includes("pending") || s.includes("wait") || s.includes("retry")) return "scheduled";
+  return "inactive";
+}
+
+// C9 tier 遥测：tier_used / sufficiency / escalated / forced_full 的实际可达数据源是
+// run envelope 的 decision 文档（AgentDecision 序列化 camelCase：sufficiency / missingTier），
+// 不是 gatewayResult（SendGatewayResult 无 tier 字段），也不是 events.detail（/api/events 不下发 detail）。
+// missingTier 即本轮需要升到的档位（none → Lean 足够；relational / full → 需升档）。
+const TIER_LABELS: Record<string, string> = {
+  none: "Lean（精简档已足够）",
+  relational: "Relational（需关系档）",
+  full: "Full（需完整知识档）",
+};
+const SUFFICIENCY_LABELS: Record<string, string> = {
+  enough: "信息充分",
+  need_more_context: "需更多上下文",
+  need_clarification: "需澄清",
+};
+
+type TierTelemetry = {
+  sufficiency: string;
+  missingTier: string;
+  escalated: boolean;
+};
+
+function tierTelemetry(run: AgentRunItem): TierTelemetry | null {
+  const decision = run.decision;
+  if (!decision || typeof decision !== "object") return null;
+  const sufficiency = typeof decision.sufficiency === "string" ? decision.sufficiency : "";
+  const missingTier = typeof decision.missingTier === "string" ? decision.missingTier : "";
+  if (!sufficiency && !missingTier) return null;
+  // escalated = 本轮需升档（missingTier 非 none/空 即代表 Lean 不够、需要关系/完整档）。
+  const escalated = missingTier !== "" && missingTier !== "none";
+  return { sufficiency, missingTier, escalated };
+}
+
+// 各阶段 Document 通用 key-value 渲染：未知字段不写死，标量直显，对象/数组 JSON 兜底。
+function renderStageValue(value: unknown): string {
+  if (value === null || value === undefined) return "-";
+  if (typeof value === "string") return value || "-";
+  if (typeof value === "number" || typeof value === "boolean") return String(value);
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return String(value);
+  }
+}
+
+const RUN_STAGE_KEYS: { key: keyof AgentRunItem; label: string }[] = [
+  { key: "planner", label: "Planner" },
+  { key: "context", label: "Context" },
+  { key: "knowledgeRoute", label: "知识路由" },
+  { key: "decision", label: "决策" },
+  { key: "review", label: "Review" },
+  { key: "gatewayResult", label: "送达网关" },
+];
+
 // 未通过时按可用字段选具体中文标签;finalReviewStatus / holdCategory 都缺失
 // (老数据 / 向后兼容)则回落二元"拦截"。注意 labelOf 对空值返回 "—"(truthy),
 // 故不能用 || 串联兜底,须显式判断字段存在性。
@@ -84,6 +147,7 @@ export default function OperationsFeature() {
     tasks,
     decisionReviews,
     llmUsage,
+    agentRuns,
     opsTab,
     setOpsTab,
     loadOperationsData
@@ -99,10 +163,14 @@ export default function OperationsFeature() {
     loadOperationsData(currentAccountId);
   }, [loadOperationsData, currentAccountId]);
 
+  // run envelope 视图：当前展开的运行（runId），点列表行切换。
+  const [expandedRunId, setExpandedRunId] = useState<string | null>(null);
+
   const tabs: { id: typeof opsTab; label: string }[] = [
     { id: "tasks", label: "跟进任务" },
     { id: "events", label: "运营事件" },
     { id: "reviews", label: "Review 记录" },
+    { id: "runs", label: "运行日志" },
     { id: "llm", label: "LLM 成本" }
   ];
 
@@ -237,6 +305,40 @@ export default function OperationsFeature() {
             </table>
           ))}
 
+        {opsTab === "runs" &&
+          (agentRuns.length === 0 ? (
+            <EmptyState title="暂无运行日志" hint="Agent 每轮决策的 run envelope（含档位遥测）会在这里留痕。" />
+          ) : (
+            <table className={styles.table}>
+              <thead>
+                <tr>
+                  <th>状态</th>
+                  <th>Run ID</th>
+                  <th>触发</th>
+                  <th>档位遥测</th>
+                  <th>时间</th>
+                </tr>
+              </thead>
+              <tbody>
+                {agentRuns.map((run) => {
+                  const tier = tierTelemetry(run);
+                  const expanded = expandedRunId === (run.runId || run.id);
+                  return (
+                    <RunEnvelopeRows
+                      key={run.id || run.runId}
+                      run={run}
+                      tier={tier}
+                      expanded={expanded}
+                      onToggle={() =>
+                        setExpandedRunId(expanded ? null : run.runId || run.id)
+                      }
+                    />
+                  );
+                })}
+              </tbody>
+            </table>
+          ))}
+
         {opsTab === "llm" && (
           <>
             <div className={styles.usageGrid}>
@@ -289,5 +391,77 @@ export default function OperationsFeature() {
         )}
       </section>
     </div>
+  );
+}
+
+// 单条 run envelope：摘要行 + 展开行（各阶段通用 key-value 渲染 + C9 档位遥测）。
+function RunEnvelopeRows({
+  run,
+  tier,
+  expanded,
+  onToggle,
+}: {
+  run: AgentRunItem;
+  tier: TierTelemetry | null;
+  expanded: boolean;
+  onToggle: () => void;
+}) {
+  return (
+    <>
+      <tr>
+        <td><StatusBadge tone={runStatusTone(run.status)}>{run.status || "-"}</StatusBadge></td>
+        <td className={styles.cellMuted}>{run.runId || run.id || "-"}</td>
+        <td>{run.triggerKind || "-"}</td>
+        <td className={styles.cellMuted}>
+          {tier
+            ? `${TIER_LABELS[tier.missingTier] ?? tier.missingTier ?? "-"}${tier.escalated ? " · 需升档" : ""}`
+            : "-"}
+        </td>
+        <td className={styles.cellMuted}>{formatTime(run.createdAt)}</td>
+        <td className={styles.cellActions}>
+          <button type="button" className={styles.linkBtn} onClick={onToggle}>
+            {expanded ? "收起" : "展开"}
+          </button>
+        </td>
+      </tr>
+      {expanded && (
+        <tr>
+          <td colSpan={6}>
+            <div className={styles.tCard}>
+              {/* C9 档位遥测：来自 decision 文档（sufficiency / missingTier）。 */}
+              {tier && (
+                <div className={styles.tChips}>
+                  <span>档位:{TIER_LABELS[tier.missingTier] ?? tier.missingTier ?? "-"}</span>
+                  <span>充分性:{SUFFICIENCY_LABELS[tier.sufficiency] ?? tier.sufficiency ?? "-"}</span>
+                  <span>是否升档:{tier.escalated ? "是" : "否"}</span>
+                </div>
+              )}
+              {run.error && <p className={styles.cellMuted}>错误：{run.error}</p>}
+              {RUN_STAGE_KEYS.map(({ key, label }) => {
+                const stage = run[key];
+                if (!stage || typeof stage !== "object") return null;
+                const entries = Object.entries(stage as Record<string, unknown>);
+                if (entries.length === 0) return null;
+                return (
+                  <div key={key as string} className={styles.tHead}>
+                    <strong>{label}</strong>
+                    <table className={styles.table}>
+                      <tbody>
+                        {entries.map(([k, v]) => (
+                          <tr key={k}>
+                            <td className={styles.cellMuted}>{k}</td>
+                            <td>{renderStageValue(v)}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                );
+              })}
+            </div>
+          </td>
+        </tr>
+      )}
+    </>
   );
 }
