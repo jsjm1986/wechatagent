@@ -17,6 +17,7 @@ export function DeciderChainEditor({
   const [picking, setPicking] = useState(false);
   const [contacts, setContacts] = useState<Contact[]>([]);
   const [q, setQ] = useState("");
+  const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
     if (!picking) return;
@@ -24,7 +25,9 @@ export function DeciderChainEditor({
       try {
         const res = await api.get<{ items: Contact[] }>("/api/contacts?limit=100");
         setContacts(res.items);
-      } catch {
+        setError(null);
+      } catch (e) {
+        setError(e instanceof Error ? e.message : String(e));
         setContacts([]);
       }
     })();
@@ -77,13 +80,19 @@ export function DeciderChainEditor({
             onChange={(e) => setQ(e.target.value)}
           />
           <div className={styles.pickerList}>
-            {candidates.map((c) => (
-              <button key={c.id} type="button" className={styles.pickerItem} onClick={() => add(c)}>
-                {contactLabel(c)}
-                <span className={styles.chainWxid}>{c.wxid}</span>
-              </button>
-            ))}
-            {candidates.length === 0 && <div className={styles.chainEmpty}>无可选联系人</div>}
+            {error ? (
+              <div className={styles.loadError} role="alert">加载联系人失败：{error}</div>
+            ) : (
+              <>
+                {candidates.map((c) => (
+                  <button key={c.id} type="button" className={styles.pickerItem} onClick={() => add(c)}>
+                    {contactLabel(c)}
+                    <span className={styles.chainWxid}>{c.wxid}</span>
+                  </button>
+                ))}
+                {candidates.length === 0 && <div className={styles.chainEmpty}>无可选联系人</div>}
+              </>
+            )}
           </div>
           <button type="button" className={styles.linkBtn} onClick={() => { setPicking(false); setQ(""); }}>取消</button>
         </div>
