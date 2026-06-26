@@ -3,20 +3,34 @@ import { api } from "../../../lib/api";
 import type { RowCtx } from "../../../components/review/ReviewQueue";
 import type { InboxItem } from "../../../lib/inboxApi";
 
+// 裁决口径闭集（与后端 ALLOWED_PRINCIPAL_VERDICT 同源）
+const VERDICT_OPTIONS: { value: string; label: string }[] = [
+  { value: "approved", label: "批准" },
+  { value: "rejected", label: "驳回" },
+  { value: "conditional", label: "有条件批准" },
+  { value: "deferred", label: "暂缓" },
+  { value: "delegated_back", label: "退回再议" },
+];
+
 export function EscalationInline({ item, ctx }: { item: InboxItem; ctx: RowCtx }) {
   const [substance, setSubstance] = useState("");
+  const [verdict, setVerdict] = useState("approved");
+  const [windowHours, setWindowHours] = useState("");
+  const [constraintText, setConstraintText] = useState("");
   const code = item.id; // escalation 的 id 即 short_code
 
-  function resolve(verdict: "approved" | "rejected") {
+  function resolve(v: string) {
+    const label = VERDICT_OPTIONS.find((o) => o.value === v)?.label ?? v;
     void ctx.runAction(
       () =>
         api.post(`/api/admin/principal-escalations/${encodeURIComponent(code)}/resolve`, {
-          verdict,
+          verdict: v,
           substance,
-          constraints: [],
-          authorizationWindowHours: null,
+          constraints: constraintText ? [constraintText] : [],
+          authorizationWindowHours:
+            v === "conditional" && windowHours ? Number(windowHours) : null,
         }),
-      verdict === "approved" ? "已批准并转述" : "已驳回",
+      `裁决已提交（${label}）`,
     );
   }
 
@@ -24,17 +38,42 @@ export function EscalationInline({ item, ctx }: { item: InboxItem; ctx: RowCtx }
     <div className="escalationInline">
       <div className="escalationInlineTitle">{item.title}</div>
       <div className="escalationInlineSummary">{item.summary}</div>
+      <label htmlFor={`verdict-${code}`}>裁决类型</label>
+      <select
+        id={`verdict-${code}`}
+        value={verdict}
+        onChange={(e) => setVerdict(e.target.value)}
+      >
+        {VERDICT_OPTIONS.map((o) => (
+          <option key={o.value} value={o.value}>
+            {o.label}
+          </option>
+        ))}
+      </select>
+      {verdict === "conditional" && (
+        <>
+          <label htmlFor={`window-${code}`}>授权窗(小时)</label>
+          <input
+            id={`window-${code}`}
+            type="number"
+            value={windowHours}
+            onChange={(e) => setWindowHours(e.target.value)}
+          />
+          <input
+            placeholder="约束条款"
+            value={constraintText}
+            onChange={(e) => setConstraintText(e.target.value)}
+          />
+        </>
+      )}
       <textarea
         placeholder="裁决意见（转述给客户的内容）"
         value={substance}
         onChange={(e) => setSubstance(e.target.value)}
       />
       <div className="escalationInlineActions">
-        <button type="button" disabled={ctx.busy} onClick={() => resolve("approved")}>
-          批准
-        </button>
-        <button type="button" disabled={ctx.busy} onClick={() => resolve("rejected")}>
-          驳回
+        <button type="button" disabled={ctx.busy} onClick={() => resolve(verdict)}>
+          提交裁决
         </button>
       </div>
     </div>
