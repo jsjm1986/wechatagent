@@ -14,6 +14,7 @@ interface CockpitViewProps {
 export function CockpitView({ onOpenReview, onOpenAutoVerify }: CockpitViewProps) {
   const [completeness, setCompleteness] = useState<CompletenessView | null>(null);
   const [integrity, setIntegrity] = useState<IntegrityReportView | null>(null);
+  const [gapPendingCount, setGapPendingCount] = useState(0);
   const [loadFailed, setLoadFailed] = useState(false);
 
   const load = useCallback(() => {
@@ -28,10 +29,17 @@ export function CockpitView({ onOpenReview, onOpenAutoVerify }: CockpitViewProps
         .then((r) => (r.ok ? r.json() : null))
         .then((j) => (j ? parseIntegrityReport(j) : null))
         .catch(() => null),
-    ]).then(([comp, integ]) => {
+      fetch("/api/knowledge/gap-signals?status=pending")
+        .then((r) => (r.ok ? r.json() : null))
+        .catch(() => null),
+    ]).then(([comp, integ, gaps]) => {
       if (!alive) return;
       setCompleteness(comp);
       setIntegrity(integ);
+      const signals = gaps && Array.isArray((gaps as { signals?: unknown[] }).signals)
+        ? (gaps as { signals: unknown[] }).signals
+        : [];
+      setGapPendingCount(signals.length);
       if (!comp) setLoadFailed(true);
     });
     return () => {
@@ -82,15 +90,15 @@ export function CockpitView({ onOpenReview, onOpenAutoVerify }: CockpitViewProps
             onClick={() => onOpenReview()}
           />
           <MetricCard
-            label="需复核"
-            value={integrity?.rejected ?? 0}
-            detail="AI 核验没过、退回待处理的"
+            label="D2 降级"
+            value={integrity?.anchorsMissing ?? 0}
+            detail="active 但缺原文锚点"
             onClick={() => onOpenReview()}
           />
           <MetricCard
-            label="知识总数"
-            value={integrity?.total ?? 0}
-            detail="知识库全部条目"
+            label="知识缺口"
+            value={gapPendingCount}
+            detail="待处理的缺口信号"
             onClick={() => onOpenReview()}
           />
         </div>
@@ -99,6 +107,20 @@ export function CockpitView({ onOpenReview, onOpenAutoVerify }: CockpitViewProps
           批量自动校验
         </button>
       </section>
+
+      {completeness.gaps.length > 0 && (
+        <section className={styles.block}>
+          <span className={styles.sectionLabel}>缺口明细</span>
+          <ul className={styles.gapList}>
+            {completeness.gaps.map((gap, i) => (
+              <li key={i} className={styles.gapItem}>
+                <span className={styles.gapBullet} aria-hidden="true" />
+                {gap}
+              </li>
+            ))}
+          </ul>
+        </section>
+      )}
     </div>
   );
 }

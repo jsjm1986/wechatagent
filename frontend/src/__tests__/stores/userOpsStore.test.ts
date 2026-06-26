@@ -90,6 +90,140 @@ describe("userOpsStore.loadMessages", () => {
   });
 });
 
+describe("userOpsStore.saveOperatingMemory", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    useContactStore.setState({ contacts: [], selected: null, contactTab: "all" });
+  });
+
+  it("无选中联系人时早退、不调 api.put", async () => {
+    await useUserOpsStore.getState().saveOperatingMemory();
+    expect(api.put).not.toHaveBeenCalled();
+  });
+
+  it("把扁平 memoryDraft 归组进四个 Document 后 PUT operating-memory", async () => {
+    useContactStore.setState({ selected: contact("c1") });
+    useUserOpsStore.getState().setMemoryDraft({
+      identity: "工程师",
+      relationshipGoal: "长期信任",
+      interestedProducts: "A产品",
+      nextGoal: "确认需求",
+    });
+    await useUserOpsStore.getState().saveOperatingMemory();
+    expect(api.put).toHaveBeenCalledWith(
+      "/api/contacts/c1/operating-memory",
+      expect.objectContaining({
+        userUnderstanding: expect.objectContaining({ identity: "工程师" }),
+        relationshipState: expect.objectContaining({ relationshipGoal: "长期信任" }),
+        productFit: expect.objectContaining({ interestedProducts: "A产品" }),
+        nextAction: expect.objectContaining({ nextGoal: "确认需求" }),
+      }),
+    );
+  });
+});
+
+describe("userOpsStore.saveOperationProfile", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    useContactStore.setState({ contacts: [], selected: null, contactTab: "all" });
+    useUserOpsStore.setState({ relationshipType: "", profileEditDraft: {} } as any);
+  });
+
+  it("无选中联系人时早退、不调 api.put", async () => {
+    await useUserOpsStore.getState().saveOperationProfile();
+    expect(api.put).not.toHaveBeenCalled();
+  });
+
+  it("提交 relationshipType + lastCommitment + followUpPolicy，且 body 不含 AI 派生字段", async () => {
+    useContactStore.setState({ selected: contact("c1") });
+    useUserOpsStore.setState({
+      relationshipType: "customer",
+      profileEditDraft: { lastCommitment: "下周回复", followUpPolicy: "每周跟进" },
+    } as any);
+    await useUserOpsStore.getState().saveOperationProfile();
+    expect(api.put).toHaveBeenCalledWith(
+      "/api/contacts/c1/operation-profile",
+      expect.objectContaining({
+        relationshipType: "customer",
+        lastCommitment: "下周回复",
+        followUpPolicy: "每周跟进",
+      }),
+    );
+    // customer_stage/intent_level 由 AI 派生，前端只读，不应出现在 body
+    const body = (api.put as any).mock.calls[0][1] as Record<string, unknown>;
+    expect(body).not.toHaveProperty("customerStage");
+    expect(body).not.toHaveProperty("intentLevel");
+  });
+});
+
+describe("userOpsStore.setMemoryDraft", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it("以 patch 形式增量合并 memoryDraft，不覆盖其它字段", () => {
+    useUserOpsStore.getState().setMemoryDraft({ identity: "工程师" });
+    useUserOpsStore.getState().setMemoryDraft({ nextGoal: "确认需求" });
+    const draft = useUserOpsStore.getState().memoryDraft;
+    expect(draft.identity).toBe("工程师");
+    expect(draft.nextGoal).toBe("确认需求");
+  });
+});
+
+describe("userOpsStore.loadMessages memoryDraft 回填", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    useUserOpsStore.setState({
+      messages: [], operatingMemory: null, memoryCandidates: [],
+      decisionReviews: [], operationHealth: null,
+    } as any);
+  });
+
+  it("从 operatingMemory 的四个 Document 拆回扁平 memoryDraft", async () => {
+    (api.get as any).mockImplementation((url: string) => {
+      if (url.includes("/operating-memory"))
+        return Promise.resolve({
+          item: {
+            id: "om",
+            userUnderstanding: { identity: "工程师" },
+            relationshipState: { relationshipGoal: "长期信任" },
+            productFit: { interestedProducts: "A产品" },
+            nextAction: { nextGoal: "确认需求" },
+          },
+        });
+      if (url.includes("/messages")) return Promise.resolve({ items: [] });
+      if (url.includes("/memory-candidates")) return Promise.resolve({ items: [] });
+      if (url.includes("/decision-reviews")) return Promise.resolve({ items: [] });
+      if (url.includes("/operation-health")) return Promise.resolve({ ok: true });
+      return Promise.reject(new Error("unexpected url " + url));
+    });
+
+    await useUserOpsStore.getState().loadMessages(contact("C1"));
+
+    const draft = useUserOpsStore.getState().memoryDraft;
+    expect(draft.identity).toBe("工程师");
+    expect(draft.relationshipGoal).toBe("长期信任");
+    expect(draft.interestedProducts).toBe("A产品");
+    expect(draft.nextGoal).toBe("确认需求");
+  });
+
+  it("operatingMemory 为 null 时 memoryDraft 回落空表单", async () => {
+    (api.get as any).mockImplementation((url: string) => {
+      if (url.includes("/operating-memory")) return Promise.reject(new Error("404"));
+      if (url.includes("/messages")) return Promise.resolve({ items: [] });
+      if (url.includes("/memory-candidates")) return Promise.resolve({ items: [] });
+      if (url.includes("/decision-reviews")) return Promise.resolve({ items: [] });
+      if (url.includes("/operation-health")) return Promise.resolve({ ok: true });
+      return Promise.reject(new Error("unexpected url " + url));
+    });
+    useUserOpsStore.getState().setMemoryDraft({ identity: "脏数据" });
+
+    await useUserOpsStore.getState().loadMessages(contact("C1"));
+
+    expect(useUserOpsStore.getState().memoryDraft.identity).toBe("");
+  });
+});
+
 describe("userOpsStore.clearReferral", () => {
   beforeEach(() => {
     vi.clearAllMocks();

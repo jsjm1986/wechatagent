@@ -24,6 +24,9 @@ interface StrategyState {
   // ── DomainProfile ───────────────────────────────────────────────────────
   domainProfiles: DomainProfile[];
   editingProfile: DomainProfile | null;
+  // D5：手动新建空白配置时 editingProfile 仍为 null（尚无 id），用此标志让右侧编辑器
+  // 在「新建态」也渲染（否则 editing===null 永远只渲染占位 → 死链路）。
+  isCreatingProfile: boolean;
   profileDraft: DomainProfileDraft;
   profileTab: "list" | "generate";
   generating: boolean;
@@ -53,7 +56,7 @@ interface StrategyActions {
   editDomainProfile: (profile: DomainProfile) => void;
   newDomainProfileDraft: () => void;
   setProfileDraft: (draft: DomainProfileDraft) => void;
-  saveDomainProfile: (id: string) => Promise<void>;
+  saveDomainProfile: () => Promise<void>;
   publishDomainProfile: (id: string) => Promise<{ id: string; riskyFields: string[] } | null>;
   confirmRiskyActivation: (id: string) => Promise<void>;
   activateDomainProfile: (id: string) => Promise<void>;
@@ -102,6 +105,7 @@ export const useStrategyStore = create<StrategyState & StrategyActions>((set, ge
   // DomainProfile initial state
   domainProfiles: [],
   editingProfile: null,
+  isCreatingProfile: false,
   profileDraft: {},
   profileTab: "list",
   generating: false,
@@ -333,6 +337,7 @@ export const useStrategyStore = create<StrategyState & StrategyActions>((set, ge
   editDomainProfile: (profile: DomainProfile) => {
     set({
       editingProfile: profile,
+      isCreatingProfile: false,
       profileDraft: {
         profile_id: profile.profile_id,
         display_name: profile.display_name,
@@ -368,18 +373,36 @@ export const useStrategyStore = create<StrategyState & StrategyActions>((set, ge
   newDomainProfileDraft: () => {
     set({
       editingProfile: null,
-      profileDraft: {}
+      isCreatingProfile: true,
+      // 最小合法空白 draft：profile_id/display_name 空串占位，保证编辑器渲染这些输入框
+      // （而非 {} 时部分 ?? "" 仍可工作但语义不清）。create POST 时由 saveDomainProfile
+      // 显式注入顶层 camelCase profileId（后端 UpsertRequest 读 profileId，非内层 profile_id）。
+      profileDraft: { profile_id: "", display_name: "" }
     });
   },
 
   setProfileDraft: (draft: DomainProfileDraft) => set({ profileDraft: draft }),
 
-  saveDomainProfile: async (id: string) => {
-    const { profileDraft } = get();
+  saveDomainProfile: async () => {
+    const { editingProfile, profileDraft } = get();
     useUiStore.getState().setBusy(true);
     try {
-      await api.put(`/api/admin/domain-profiles/${id}`, profileDraft);
+      if (editingProfile?.id) {
+        // update：PUT 到已有 id。后端 update 不消费顶层 profileId（只用 existing.profile_id），
+        // 直接发 DomainProfileDraft（snake_case，flatten 进 profile）即可。
+        await api.put(`/api/admin/domain-profiles/${editingProfile.id}`, profileDraft);
+      } else {
+        // create：POST 无 id。后端 UpsertRequest 顶层读 camelCase `profileId`（rename），
+        // DomainProfileDraft 只有 snake_case profile_id（会 flatten 进内层 profile），
+        // 故必须显式补顶层 profileId，否则 create 因 profileId 为空被 400。
+        await api.post(`/api/admin/domain-profiles`, {
+          ...profileDraft,
+          profileId: profileDraft.profile_id ?? ""
+        });
+      }
       await get().loadDomainProfiles();
+      // 保存后清新建/编辑态，回到占位（与列表刷新一致）。
+      set({ editingProfile: null, isCreatingProfile: false });
     } catch (error) {
       useUiStore.getState().setError(error instanceof Error ? error.message : String(error));
     } finally {

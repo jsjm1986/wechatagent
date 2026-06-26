@@ -45,6 +45,14 @@ interface UserOpsState {
   customAgentInstructions: string;
   assistOverride: string; // "default" | "force_on" | "force_off"
   relationshipType: string; // "" | "customer" | "peer" | "friend"
+  // E2：referral 已引荐态（只读观测）。后端把引荐时间/名片 id 写入 contact 的
+  // domain_attributes（referred_specialist_at / referred_card_id），前端经
+  // domainAttributes dotted-key 回填，仅用于详情面板展示"已引荐 · AI 已退辅助答疑"。
+  referredSpecialistAt?: string;
+  referredCardId?: string;
+  // A3：operation-profile 运营可编辑草稿（last_commitment / follow_up_policy）。
+  // customer_stage / intent_level 由 AI 派生、前端只读，不进此草稿。
+  profileEditDraft: { lastCommitment?: string; followUpPolicy?: string };
   guideInstruction: string;
   guidePreview: UserOperationGuidePreview | null;
   simulationInput: string;
@@ -76,6 +84,7 @@ interface UserOpsActions {
   setCustomAgentInstructions: (instructions: string) => void;
   setAssistOverride: (mode: string) => void;
   setRelationshipType: (value: string) => void;
+  setProfileEditDraft: (patch: Partial<{ lastCommitment: string; followUpPolicy: string }>) => void;
   setGuideInstruction: (instruction: string) => void;
   setSimulationInput: (input: string) => void;
   setSelectedPlaybookId: (id: string) => void;
@@ -88,6 +97,7 @@ interface UserOpsActions {
   setGuideBusy: (busy: boolean) => void;
   setSimulationBusy: (busy: boolean) => void;
   setDomainDrafts: (drafts: Record<string, OperationDomainDraft>) => void;
+  setMemoryDraft: (patch: Partial<OperatingMemoryDraft>) => void;
 
   // 核心业务方法
   hydrateSelected: (contact: Contact) => void;
@@ -103,7 +113,8 @@ interface UserOpsActions {
   saveProfileNote: () => Promise<void>;
   saveCustomAgentInstructions: () => Promise<void>;
   saveAssistOverride: () => Promise<void>;
-  saveRelationshipType: () => Promise<void>;
+  saveOperationProfile: () => Promise<void>;
+  saveOperatingMemory: () => Promise<void>;
   clearReferral: (contactId: string) => Promise<void>;
   saveManualTags: (tags: string[]) => Promise<void>;
   analyzeProfile: () => Promise<void>;
@@ -151,6 +162,75 @@ function emptyMemoryDraft(): OperatingMemoryDraft {
     timing: "",
     reason: ""
   };
+}
+
+// 扁平 memoryDraft → 后端四个 Document 的归组键映射（OperatingMemoryRequest，
+// camelCase wire 键）。saveOperatingMemory 据此把 23 个扁平字段拆进四组提交，
+// loadMessages 据此把后端四组拆回扁平 draft 回填表单——两向用同一份映射，避免漂移。
+const MEMORY_DRAFT_GROUPS: Record<
+  "userUnderstanding" | "relationshipState" | "productFit" | "nextAction",
+  (keyof OperatingMemoryDraft)[]
+> = {
+  userUnderstanding: [
+    "identity",
+    "businessContext",
+    "jobsToBeDone",
+    "painPoints",
+    "motivations",
+    "decisionStyle",
+    "communicationPreference"
+  ],
+  relationshipState: [
+    "sensitivePoints",
+    "trustLevel",
+    "temperature",
+    "lastEmotion",
+    "relationshipGoal",
+    "doNotDo"
+  ],
+  productFit: ["interestedProducts", "fitReason"],
+  nextAction: [
+    "objections",
+    "riskPoints",
+    "unknowns",
+    "nextGoal",
+    "recommendedMove",
+    "avoid",
+    "timing",
+    "reason"
+  ]
+};
+
+// 扁平 draft → 四个嵌套 Document（提交给后端 PUT /operating-memory）。
+function groupMemoryDraft(draft: OperatingMemoryDraft) {
+  const grouped: Record<string, Record<string, string>> = {};
+  for (const [group, keys] of Object.entries(MEMORY_DRAFT_GROUPS)) {
+    grouped[group] = {};
+    for (const key of keys) {
+      grouped[group][key] = draft[key];
+    }
+  }
+  return grouped;
+}
+
+// 后端 OperatingMemory 四个 Document → 扁平 draft（回填可编辑表单）。
+// memory 为 null 时回落空表单。值缺失或非字符串时归一为空串。
+function memoryDraftFromMemory(memory: OperatingMemory | null): OperatingMemoryDraft {
+  const draft = emptyMemoryDraft();
+  if (!memory) return draft;
+  for (const [group, keys] of Object.entries(MEMORY_DRAFT_GROUPS)) {
+    const source = (memory as unknown as Record<string, unknown>)[group] as
+      | Record<string, unknown>
+      | undefined;
+    if (!source) continue;
+    for (const key of keys) {
+      const value = source[key];
+      if (typeof value === "string") {
+        draft[key] = value;
+      }
+    }
+  }
+  return draft;
 }
 
 function emptyPlaybookDraft(): PlaybookDraft {
@@ -220,6 +300,9 @@ export const useUserOpsStore = create<UserOpsState & UserOpsActions>((set, get) 
   customAgentInstructions: "",
   assistOverride: "default",
   relationshipType: "",
+  referredSpecialistAt: undefined,
+  referredCardId: undefined,
+  profileEditDraft: {},
   importQuery: "",
   searchQuery: "",
   guideInstruction: "",
@@ -249,6 +332,7 @@ export const useUserOpsStore = create<UserOpsState & UserOpsActions>((set, get) 
   setCustomAgentInstructions: (instructions) => set({ customAgentInstructions: instructions }),
   setAssistOverride: (mode) => set({ assistOverride: mode }),
   setRelationshipType: (value) => set({ relationshipType: value }),
+  setProfileEditDraft: (patch) => set((s) => ({ profileEditDraft: { ...s.profileEditDraft, ...patch } })),
   setGuideInstruction: (instruction) => set({ guideInstruction: instruction }),
   setSimulationInput: (input) => set({ simulationInput: input }),
   setSelectedPlaybookId: (id) => set({ selectedPlaybookId: id }),
@@ -261,6 +345,7 @@ export const useUserOpsStore = create<UserOpsState & UserOpsActions>((set, get) 
   setGuideBusy: (busy) => set({ guideBusy: busy }),
   setSimulationBusy: (busy) => set({ simulationBusy: busy }),
   setDomainDrafts: (drafts) => set({ domainDrafts: drafts }),
+  setMemoryDraft: (patch) => set((s) => ({ memoryDraft: { ...s.memoryDraft, ...patch } })),
 
   // 选中联系人时同步状态
   hydrateSelected: (contact) => {
@@ -275,6 +360,20 @@ export const useUserOpsStore = create<UserOpsState & UserOpsActions>((set, get) 
         ((contact.domainAttributes as Record<string, unknown> | undefined)?.[
           "relationship_type"
         ] as string) || "",
+      // E2：从 domain_attributes 回填已引荐态（只读观测）。
+      referredSpecialistAt:
+        ((contact.domainAttributes as Record<string, unknown> | undefined)?.[
+          "referred_specialist_at"
+        ] as string) || undefined,
+      referredCardId:
+        ((contact.domainAttributes as Record<string, unknown> | undefined)?.[
+          "referred_card_id"
+        ] as string) || undefined,
+      // A3：回填运营可编辑的两字段（有则填，无则空），customer_stage/intent_level 不回填（AI 派生只读）。
+      profileEditDraft: {
+        lastCommitment: contact.lastCommitment || "",
+        followUpPolicy: contact.followUpPolicy || "",
+      },
       selectedPlaybookId: contact.playbookId || "",
       guidePreview: null
     });
@@ -292,6 +391,11 @@ export const useUserOpsStore = create<UserOpsState & UserOpsActions>((set, get) 
     set({
       messages: messagesR.status === "fulfilled" ? messagesR.value.items : [],
       operatingMemory: memoryR.status === "fulfilled" ? memoryR.value.item : null,
+      // A2：把 operatingMemory 拆回扁平字段回填 memoryDraft，让可编辑表单先看到现有值；
+      // 加载失败/无记忆时回落空表单（memoryDraftFromMemory(null)）。
+      memoryDraft: memoryDraftFromMemory(
+        memoryR.status === "fulfilled" ? memoryR.value.item : null,
+      ),
       memoryCandidates: candidateR.status === "fulfilled" ? candidateR.value.items : [],
       decisionReviews: reviewsR.status === "fulfilled" ? reviewsR.value.items : [],
       operationHealth: healthR.status === "fulfilled" ? healthR.value : null,
@@ -473,10 +577,10 @@ export const useUserOpsStore = create<UserOpsState & UserOpsActions>((set, get) 
     }
   },
 
-  saveRelationshipType: async () => {
+  saveOperationProfile: async () => {
     const selected = useContactStore.getState().selected;
     const currentAccountId = useAccountStore.getState().currentAccountId();
-    const { relationshipType } = get();
+    const { relationshipType, profileEditDraft } = get();
 
     if (!selected) return;
 
@@ -486,7 +590,31 @@ export const useUserOpsStore = create<UserOpsState & UserOpsActions>((set, get) 
     try {
       await api.put(`/api/contacts/${selected.id}/operation-profile`, {
         relationshipType: relationshipType || undefined,
+        lastCommitment: profileEditDraft.lastCommitment || undefined,
+        followUpPolicy: profileEditDraft.followUpPolicy || undefined,
       });
+      await refreshContacts(currentAccountId);
+    } catch (error) {
+      useUiStore.getState().setError(error instanceof Error ? error.message : String(error));
+    } finally {
+      useUiStore.getState().setBusy(false);
+    }
+  },
+
+  saveOperatingMemory: async () => {
+    const selected = useContactStore.getState().selected;
+    const currentAccountId = useAccountStore.getState().currentAccountId();
+    const { memoryDraft } = get();
+
+    if (!selected) return;
+
+    useUiStore.getState().setBusy(true);
+    useUiStore.getState().setError("");
+
+    try {
+      // A2：把扁平 23 字段 memoryDraft 归组成后端要求的四个嵌套 Document
+      // （userUnderstanding/relationshipState/productFit/nextAction）后整体 $set。
+      await api.put(`/api/contacts/${selected.id}/operating-memory`, groupMemoryDraft(memoryDraft));
       await refreshContacts(currentAccountId);
     } catch (error) {
       useUiStore.getState().setError(error instanceof Error ? error.message : String(error));

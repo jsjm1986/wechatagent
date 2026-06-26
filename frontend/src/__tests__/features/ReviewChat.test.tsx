@@ -59,4 +59,50 @@ describe("ReviewChat", () => {
     await waitFor(() => expect(screen.getByText(/退回没成功/)).toBeInTheDocument());
     expect(onResolved).not.toHaveBeenCalled();
   });
+  it("对话产 patch → AI 回合下渲染 patch diff 预览(字段中文label + 新值)", async () => {
+    globalThis.fetch = vi.fn(() =>
+      Promise.resolve({
+        ok: true,
+        json: () =>
+          Promise.resolve({
+            sessionId: "s1",
+            turn: {
+              naturalReply: "好的,已经按你说的改好了。",
+              patch: { title: "企业版年费 19800", summary: "含 10 个坐席" },
+            },
+          }),
+      } as Response)
+    ) as unknown as typeof fetch;
+    render(<ReviewChat chunk={chunk as never} onResolved={() => {}} />);
+    await userEvent.type(screen.getByPlaceholderText(/让 AI 改这条/), "把年费改成 19800");
+    await userEvent.click(screen.getByRole("button", { name: /发送/ }));
+    // patch 预览:字段中文 label
+    await waitFor(() => expect(screen.getByText(/标题/)).toBeInTheDocument());
+    expect(screen.getByText(/摘要/)).toBeInTheDocument();
+    // patch 预览:新值
+    expect(screen.getByText(/企业版年费 19800/)).toBeInTheDocument();
+    expect(screen.getByText(/含 10 个坐席/)).toBeInTheDocument();
+  });
+  it("patch 键为 snake_case / 未知键 → label 兜底(已知映射中文,未知显原键)", async () => {
+    globalThis.fetch = vi.fn(() =>
+      Promise.resolve({
+        ok: true,
+        json: () =>
+          Promise.resolve({
+            sessionId: "s2",
+            turn: {
+              naturalReply: "改好了。",
+              patch: { knowledge_type: "product_fact", customField: "abc" },
+            },
+          }),
+      } as Response)
+    ) as unknown as typeof fetch;
+    render(<ReviewChat chunk={chunk as never} onResolved={() => {}} />);
+    await userEvent.type(screen.getByPlaceholderText(/让 AI 改这条/), "改类型");
+    await userEvent.click(screen.getByRole("button", { name: /发送/ }));
+    // snake_case 已知键映射中文
+    await waitFor(() => expect(screen.getByText(/知识类型/)).toBeInTheDocument());
+    // 未知键不吞,显原键名
+    expect(screen.getByText(/customField/)).toBeInTheDocument();
+  });
 });

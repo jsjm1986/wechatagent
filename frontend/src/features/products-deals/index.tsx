@@ -1,12 +1,12 @@
 import { useCallback, useEffect, useState } from "react";
 import type { FormEvent } from "react";
-import { PackageSearch, BadgeCheck, CreditCard, HelpCircle } from "lucide-react";
+import { PackageSearch, BadgeCheck, CreditCard, HelpCircle, ClipboardCheck } from "lucide-react";
 import { EmptyState } from "../../components/ui/EmptyState";
 import { api } from "../../lib/api";
 import type { Contact } from "../../types";
 import styles from "./ProductsDeals.module.css";
 
-type Tab = "catalog" | "deals" | "holdings";
+type Tab = "catalog" | "deals" | "holdings" | "review";
 
 interface Product {
   productId: string;
@@ -156,11 +156,18 @@ export default function ProductsDealsFeature() {
         >
           客户持有
         </button>
+        <button
+          className={tab === "review" ? styles.tabActive : styles.tab}
+          onClick={() => setTab("review")}
+        >
+          疑似成交待核实
+        </button>
       </div>
 
       {tab === "catalog" && <CatalogTab />}
       {tab === "deals" && <DealsTab />}
       {tab === "holdings" && <HoldingsTab />}
+      {tab === "review" && <SuspectedDealsTab />}
     </div>
   );
 }
@@ -756,6 +763,186 @@ function HoldingsTab() {
                 </p>
               </div>
             ))}
+          </div>
+        )}
+      </section>
+    </div>
+  );
+}
+
+/** F23：一条疑似成交待核实信号（GET /api/admin/suspected-deals 返回形状）。 */
+interface SuspectedDeal {
+  id: string;
+  contactId: string;
+  value: string;
+  evidence?: string | null;
+  confidence: number;
+  occurrences: number;
+  status: string;
+  lastSeenAt?: string | null;
+}
+
+/**
+ * F23：疑似成交待核实闭环（方案B）。AI 决策时判断客户疑似成交会产出一条弱信号，
+ * 沉到待核实队列——**绝不直接落成交**。本面板由运营核实：通过则后端调用落正式
+ * 成交（verification=staff_confirmed），驳回则仅标记 rejected。富展示判断依据 /
+ * 置信度 / 客户 / 出现次数（呼应 SimpleApproveReject 模式）。
+ */
+function SuspectedDealsTab() {
+  const [items, setItems] = useState<SuspectedDeal[]>([]);
+  const [error, setError] = useState<string | null>(null);
+  const [info, setInfo] = useState<string | null>(null);
+  const [busyId, setBusyId] = useState<string | null>(null);
+  // 每条信号独立的成交金额 / 币种录入（通过时一并提交，均可选）。
+  const [drafts, setDrafts] = useState<Record<string, { amount: string; currency: string }>>({});
+
+  const load = useCallback(async () => {
+    try {
+      const res = await api.get<{ items: SuspectedDeal[] }>(
+        "/api/admin/suspected-deals?status=pending"
+      );
+      setItems(res.items);
+      setError(null);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    }
+  }, []);
+
+  useEffect(() => {
+    void load();
+  }, [load]);
+
+  const draftOf = (id: string) => drafts[id] ?? { amount: "", currency: "" };
+
+  const handleApprove = async (item: SuspectedDeal) => {
+    const d = draftOf(item.id);
+    const amountCents = yuanToCents(d.amount);
+    if (d.amount.trim() !== "" && amountCents == null) {
+      setError("金额必须是有效数字。");
+      return;
+    }
+    const body: Record<string, unknown> = {};
+    if (amountCents != null) body.amount = amountCents;
+    if (d.currency.trim()) body.currency = d.currency.trim();
+    setBusyId(item.id);
+    try {
+      await api.post(`/api/admin/suspected-deals/${encodeURIComponent(item.id)}/approve`, body);
+      setInfo("已确认成交（已核实）。");
+      setError(null);
+      await load();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusyId(null);
+    }
+  };
+
+  const handleReject = async (item: SuspectedDeal) => {
+    const reason = window.prompt("请填写驳回原因（如：误判，实际只是咨询）");
+    if (reason == null) return;
+    if (!reason.trim()) {
+      setError("驳回原因不能为空。");
+      return;
+    }
+    setBusyId(item.id);
+    try {
+      await api.post(`/api/admin/suspected-deals/${encodeURIComponent(item.id)}/reject`, {
+        reason: reason.trim(),
+      });
+      setInfo("已驳回该疑似成交线索。");
+      setError(null);
+      await load();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusyId(null);
+    }
+  };
+
+  return (
+    <div className={styles.workbench}>
+      <section className={styles.panel}>
+        <div className={styles.head}>
+          <div className={styles.headL}>
+            <span className={styles.eyebrow}>Suspected Deals</span>
+            <span className={styles.title}>疑似成交待核实</span>
+          </div>
+          <span className={styles.headIcon}>
+            <ClipboardCheck size={17} />
+          </span>
+        </div>
+        {error && <p className={styles.error}>{error}</p>}
+        {info && <p className={styles.success}>{info}</p>}
+        {items.length === 0 ? (
+          <EmptyState
+            title="暂无待核实线索"
+            hint="AI 判断客户疑似成交时会在此沉淀线索，待运营核实后才落正式成交。"
+          />
+        ) : (
+          <div className={styles.list}>
+            {items.map((item) => {
+              const d = draftOf(item.id);
+              return (
+                <div key={item.id} className={styles.row}>
+                  <div className={styles.rowHead}>
+                    <strong className={styles.rowTitle}>{item.value || "疑似成交·待核实"}</strong>
+                    <span className={styles.badgeSuspected}>
+                      <HelpCircle size={12} />
+                      待核实
+                    </span>
+                  </div>
+                  <p className={styles.body}>
+                    {item.evidence ? `判断依据：${item.evidence}` : "判断依据：—"}
+                    {` · 置信度 ${item.confidence}`}
+                    {` · 出现 ${item.occurrences} 次`}
+                    {` · 客户 ${item.contactId}`}
+                    {item.lastSeenAt ? ` · 最近 ${fmtTs(item.lastSeenAt)}` : ""}
+                  </p>
+                  <div className={styles.form}>
+                    <label className={styles.field}>
+                      <span className={styles.fieldLabel}>成交金额（可选）</span>
+                      <input
+                        className={styles.input}
+                        type="number"
+                        step="0.01"
+                        min="0"
+                        value={d.amount}
+                        onChange={(e) =>
+                          setDrafts({ ...drafts, [item.id]: { ...d, amount: e.target.value } })
+                        }
+                      />
+                    </label>
+                    <label className={styles.field}>
+                      <span className={styles.fieldLabel}>币种（可选）</span>
+                      <input
+                        className={styles.input}
+                        value={d.currency}
+                        placeholder="如 CNY"
+                        onChange={(e) =>
+                          setDrafts({ ...drafts, [item.id]: { ...d, currency: e.target.value } })
+                        }
+                      />
+                    </label>
+                  </div>
+                  <div className={styles.rowActions}>
+                    <button
+                      className={styles.submit}
+                      disabled={busyId === item.id}
+                      onClick={() => void handleApprove(item)}
+                    >
+                      确认成交
+                    </button>
+                    <button
+                      className={styles.linkBtn}
+                      disabled={busyId === item.id}
+                      onClick={() => void handleReject(item)}
+                    >
+                      驳回
+                    </button>
+                  </div>
+                </div>
+              );
+            })}
           </div>
         )}
       </section>
