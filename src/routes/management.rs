@@ -730,6 +730,48 @@ pub(super) fn merge_product_tools(mut tools: Value) -> Value {
             "name": "wechatagent.provider_test",
             "description": "测试指定 LLM provider 连通性（不改生效配置）。可选参数：providerId 或 inline 的 format/baseUrl/apiKey/model/timeoutSeconds，workspaceId"
         }),
+        // ── 批 2：运营态（单对象写，low）──
+        json!({
+            "name": "wechatagent.update_assist_override",
+            "description": "设置单个好友的辅助模式覆盖开关。参数：contactId，mode（default|force_on|force_off）。default 回落账号级总开关。"
+        }),
+        json!({
+            "name": "wechatagent.update_custom_instructions",
+            "description": "设置单个好友的运营特别指令（最高优先级 Operator Instruction 层，下一轮回复注入）。参数：contactId，instructions（上限 1000 字，trim 后空=清空）。"
+        }),
+        json!({
+            "name": "wechatagent.update_manual_tags",
+            "description": "更新好友的人工标签（manual，运营权威层；AI 永不覆盖本字段）。参数：contactId，tags（字符串数组，自动去空白去重）。"
+        }),
+        json!({
+            "name": "wechatagent.write_deal_events",
+            "description": "为好友登记一条成效/成交事件（append-only 正例）。参数：contactId，可选 amount（分）、currency、eventKind（deal|reversal）、productId、quantity、note、verification、occurredAtMs。"
+        }),
+        json!({
+            "name": "wechatagent.analyze_profile",
+            "description": "对指定好友重新生成运营画像（内部跑 LLM，老客户保留 stage/状态/承诺）。参数：contactId。"
+        }),
+        json!({
+            "name": "wechatagent.review_task_now",
+            "description": "立即触发执行指定跟进任务（不等调度间隔）。参数：taskId。"
+        }),
+        json!({
+            "name": "wechatagent.cancel_task",
+            "description": "取消指定的待执行跟进任务。参数：taskId。"
+        }),
+        json!({
+            "name": "wechatagent.resolve_principal_escalation",
+            "description": "对指定 AI 决策请示条目登记结构化裁决（跳过 LLM 解读直走转述）。参数：shortCode（请示短码），verdict，可选 substance、constraints、authorizationWindowHours。"
+        }),
+        // ── 批 2：运行时调参（update_operation_domain=low；update_ask_human_policy=dangerous 立即改全量在跑 agent 行为）──
+        json!({
+            "name": "wechatagent.update_operation_domain",
+            "description": "更新指定运营域配置本体（目标/方法论/工作流/工具策略/自动化策略/评审策略/运行参数/状态机），直接写当前生效版本。参数：domain（运营域标识），body（OperationDomainRequest 各字段）。"
+        }),
+        json!({
+            "name": "wechatagent.update_ask_human_policy",
+            "description": "更新指定运营域的请示决策链策略（decider_chain、安静时段等），立即改变全量在跑 agent 的请示行为。参数：domain，body（AskHumanPolicy：deciderChain 等）。"
+        }),
     ];
     match &mut tools {
         Value::Object(map) => {
@@ -975,7 +1017,16 @@ pub(super) fn tool_effect(tool_name: &str) -> ToolEffect {
         | "wechatagent.publish_state_policy_version"
         | "wechatagent.publish_taxonomy_version"
         | "wechatagent.publish_domain_profile"
-        | "wechatagent.provider_test" => Low,
+        | "wechatagent.provider_test"
+        // 批 2：运营态单对象写 + update_operation_domain（改配置本体不放量）= Low
+        | "wechatagent.update_assist_override"
+        | "wechatagent.update_custom_instructions"
+        | "wechatagent.update_manual_tags"
+        | "wechatagent.write_deal_events"
+        | "wechatagent.analyze_profile"
+        | "wechatagent.review_task_now"
+        | "wechatagent.cancel_task"
+        | "wechatagent.resolve_principal_escalation" => Low,
         // 高风险/宽影响（立即全量/改全局）
         "wechatagent.send_contact_message"
         | "wechatagent.publish_prompt_template"
@@ -994,7 +1045,9 @@ pub(super) fn tool_effect(tool_name: &str) -> ToolEffect {
         | "wechatagent.rollback_domain_profile"
         | "wechatagent.activate_domain_profile"
         | "wechatagent.release_evolution_proposal"
-        | "wechatagent.rollback_evolution_proposal" => Dangerous,
+        | "wechatagent.rollback_evolution_proposal"
+        // 批 2：update_ask_human_policy 立即改全量在跑 agent 的请示行为（spec §4.1）→ Dangerous
+        | "wechatagent.update_ask_human_policy" => Dangerous,
         // 不可逆（reset/delete/物理销毁）：档位高于 dangerous，第一期即便放权也保留确认
         "wechatagent.reset_domain"
         | "wechatagent.delete_knowledge_chunk"
@@ -1675,6 +1728,131 @@ pub(super) async fn execute_management_tool(
             .await?;
             Ok(resp.0)
         }
+        // ── 批 2：运营态（单对象写）──
+        "wechatagent.update_assist_override" => {
+            let id = string_arg(&planned.arguments, "contactId")?;
+            let body = serde_json::from_value(planned.arguments.clone())
+                .map_err(|e| AppError::BadRequest(format!("参数解析失败: {e}")))?;
+            let resp = crate::routes::contacts::update_assist_override(
+                State(state.clone()),
+                Extension(management_admin(workspace_id)),
+                Path(id),
+                Json(body),
+            )
+            .await?;
+            Ok(resp.0)
+        }
+        "wechatagent.update_custom_instructions" => {
+            let id = string_arg(&planned.arguments, "contactId")?;
+            let body = serde_json::from_value(planned.arguments.clone())
+                .map_err(|e| AppError::BadRequest(format!("参数解析失败: {e}")))?;
+            let resp = crate::routes::contacts::update_custom_agent_instructions(
+                State(state.clone()),
+                Extension(management_admin(workspace_id)),
+                Path(id),
+                Json(body),
+            )
+            .await?;
+            Ok(resp.0)
+        }
+        "wechatagent.update_manual_tags" => {
+            let id = string_arg(&planned.arguments, "contactId")?;
+            let body = serde_json::from_value(planned.arguments.clone())
+                .map_err(|e| AppError::BadRequest(format!("参数解析失败: {e}")))?;
+            let resp = crate::routes::contacts::update_manual_tags(
+                State(state.clone()),
+                Extension(management_admin(workspace_id)),
+                Path(id),
+                Json(body),
+            )
+            .await?;
+            Ok(resp.0)
+        }
+        "wechatagent.write_deal_events" => {
+            let id = string_arg(&planned.arguments, "contactId")?;
+            let body = serde_json::from_value(planned.arguments.clone())
+                .map_err(|e| AppError::BadRequest(format!("参数解析失败: {e}")))?;
+            let resp = crate::routes::contacts::add_deal_event(
+                State(state.clone()),
+                Extension(management_admin(workspace_id)),
+                Path(id),
+                Json(body),
+            )
+            .await?;
+            Ok(resp.0)
+        }
+        "wechatagent.analyze_profile" => {
+            let id = string_arg(&planned.arguments, "contactId")?;
+            let resp = crate::routes::contacts::analyze_contact_profile(
+                State(state.clone()),
+                Extension(management_admin(workspace_id)),
+                Path(id),
+            )
+            .await?;
+            Ok(resp.0)
+        }
+        "wechatagent.review_task_now" => {
+            // 注：tasks handler 提取器顺序为 State+Path+Extension（与多数 Ext 在前的不同）。
+            let id = string_arg(&planned.arguments, "taskId")?;
+            let resp = crate::routes::tasks::review_task_now(
+                State(state.clone()),
+                Path(id),
+                Extension(management_admin(workspace_id)),
+            )
+            .await?;
+            Ok(resp.0)
+        }
+        "wechatagent.cancel_task" => {
+            let id = string_arg(&planned.arguments, "taskId")?;
+            let resp = crate::routes::tasks::cancel_agent_task(
+                State(state.clone()),
+                Path(id),
+                Extension(management_admin(workspace_id)),
+            )
+            .await?;
+            Ok(resp.0)
+        }
+        "wechatagent.resolve_principal_escalation" => {
+            // Path 是 short_code（请示短码），不是 ObjectId。
+            let short_code = string_arg(&planned.arguments, "shortCode")?;
+            let body = serde_json::from_value(planned.arguments.clone())
+                .map_err(|e| AppError::BadRequest(format!("参数解析失败: {e}")))?;
+            let resp = crate::routes::principal_escalations::resolve_principal_escalation(
+                State(state.clone()),
+                Extension(management_admin(workspace_id)),
+                Path(short_code),
+                Json(body),
+            )
+            .await?;
+            Ok(resp.0)
+        }
+        // ── 批 2：运行时调参 ──
+        "wechatagent.update_operation_domain" => {
+            let domain = string_arg(&planned.arguments, "domain")?;
+            let body = serde_json::from_value(planned.arguments.clone())
+                .map_err(|e| AppError::BadRequest(format!("参数解析失败: {e}")))?;
+            let resp = crate::routes::domains::update_operation_domain(
+                State(state.clone()),
+                Extension(management_admin(workspace_id)),
+                Path(domain),
+                Json(body),
+            )
+            .await?;
+            Ok(resp.0)
+        }
+        "wechatagent.update_ask_human_policy" => {
+            let domain = string_arg(&planned.arguments, "domain")?;
+            let body = serde_json::from_value(planned.arguments.clone())
+                .map_err(|e| AppError::BadRequest(format!("参数解析失败: {e}")))?;
+            let resp = crate::routes::domains::put_ask_human_policy(
+                State(state.clone()),
+                Extension(management_admin(workspace_id)),
+                Path(domain),
+                Json(body),
+            )
+            .await?;
+            Ok(resp.0)
+        }
         _ => {
             // 兜底分支：只允许把 tools/list 真实公布过的工具名透传给生产 MCP。
             if !advertised.contains(planned.tool_name.as_str()) {
@@ -1910,6 +2088,38 @@ mod tests {
         assert_eq!(tool_effect("wechatagent.provider_activate").risk, ToolRisk::Dangerous);
         assert_eq!(
             tool_effect("wechatagent.release_evolution_proposal").risk,
+            ToolRisk::Dangerous
+        );
+    }
+
+    #[test]
+    fn merged_catalog_includes_batch2_tools() {
+        let merged = merge_product_tools(json!({ "tools": [] }));
+        let names = advertised_tool_names(&merged);
+        for t in [
+            // 运营态类代表
+            "wechatagent.update_manual_tags",
+            "wechatagent.analyze_profile",
+            "wechatagent.cancel_task",
+            // 运行时调参类代表
+            "wechatagent.update_operation_domain",
+            "wechatagent.update_ask_human_policy",
+        ] {
+            assert!(names.contains(t), "catalog 缺工具 {t}");
+        }
+    }
+
+    #[test]
+    fn tool_effect_classifies_batch2_risk() {
+        // 运营态单对象写 = Low
+        assert_eq!(tool_effect("wechatagent.update_manual_tags").risk, ToolRisk::Low);
+        assert_eq!(tool_effect("wechatagent.update_assist_override").risk, ToolRisk::Low);
+        assert_eq!(tool_effect("wechatagent.cancel_task").risk, ToolRisk::Low);
+        // 运行时调参：update_operation_domain = Low
+        assert_eq!(tool_effect("wechatagent.update_operation_domain").risk, ToolRisk::Low);
+        // ask_human_policy 立即改全量在跑 agent 行为 → Dangerous（spec §4.1）
+        assert_eq!(
+            tool_effect("wechatagent.update_ask_human_policy").risk,
             ToolRisk::Dangerous
         );
     }
