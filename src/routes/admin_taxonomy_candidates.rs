@@ -300,6 +300,127 @@ async fn mark_candidate_approved(
     Ok(())
 }
 
+/// 候选 scope 是否允许指定 account 审批（管理 Agent 工具侧 scope 隔离）。
+/// TaxonomyCandidate/TaxonomyEntry 无 workspace_id 字段，隔离边界是 `scope`：
+/// `"global"` 全局候选任何账号可审；否则 scope 必须等于发起者 account_id
+/// （账号级候选只能本账号审）。纯函数便于单测覆盖三种放行/拒绝路径。
+pub(in crate::routes) fn taxonomy_scope_allows(candidate_scope: &str, account_id: &str) -> bool {
+    candidate_scope == "global" || candidate_scope == account_id
+}
+
+/// approve_taxonomy_candidate 的管理 Agent 工具侧入口：在 REST 版本基础上**新增
+/// scope 校验**（管理者只能 approve global 或自己 account_id 的候选）。校验通过后
+/// 复用与 REST handler 完全相同的「写字典（幂等跳重复）→ mark approved →
+/// 刷新缓存」流程，返回结构化 `{"item": <candidate json>}`，重复 canonical value
+/// 时返 [`AppError::Conflict`]（管理 Agent 当 Err 处理）。
+///
+/// 注：REST handler（无 Extension、无 account 来源）保持原样不加 scope 校验，
+/// 维持现状不回归——scope 校验只在工具侧（有可信 account_id）施加。
+pub(in crate::routes) async fn approve_taxonomy_candidate_inner(
+    state: &AppState,
+    account_id: &str,
+    id: &str,
+    payload: ApproveCandidateRequest,
+) -> AppResult<Value> {
+    if payload.canonical_value.id.trim().is_empty()
+        || payload.canonical_value.label.trim().is_empty()
+    {
+        return Err(AppError::BadRequest(
+            "canonicalValue.id / canonicalValue.label 不能为空".to_string(),
+        ));
+    }
+
+    let object_id = parse_object_id(id)?;
+    let candidates = state.db.collection_taxonomy_candidates();
+    let candidate = candidates
+        .find_one(doc! { "_id": object_id }, None)
+        .await?
+        .ok_or_else(|| AppError::NotFound("candidate not found".to_string()))?;
+
+    // scope 隔离：跨 account 的非全局候选返 NotFound（不泄漏存在性，参照
+    // approve_relationship_suggestion 跨 workspace 返 NotFound 的做法）。
+    if !taxonomy_scope_allows(&candidate.scope, account_id) {
+        return Err(AppError::NotFound("candidate not found".to_string()));
+    }
+
+    if candidate.status != "pending" {
+        return Err(AppError::BadRequest(format!(
+            "候选状态 = {}，仅 status=pending 可 approve",
+            candidate.status
+        )));
+    }
+
+    let now = DateTime::now();
+    let entry = TaxonomyEntry {
+        id: None,
+        scope: candidate.scope.clone(),
+        kind: candidate.kind.clone(),
+        value: TaxonomyValue {
+            id: payload.canonical_value.id.trim().to_string(),
+            display_name: payload.canonical_value.label.trim().to_string(),
+            description: payload
+                .canonical_value
+                .description
+                .clone()
+                .unwrap_or_else(|| candidate.evidence.clone().unwrap_or_default()),
+            aliases: {
+                let mut aliases: Vec<String> = payload
+                    .canonical_value
+                    .aliases
+                    .iter()
+                    .map(|alias| alias.trim().to_string())
+                    .filter(|alias| !alias.is_empty())
+                    .collect();
+                let raw = candidate.raw_value.trim().to_string();
+                if !raw.is_empty()
+                    && raw != payload.canonical_value.id.trim()
+                    && !aliases.iter().any(|a| a == &raw)
+                {
+                    aliases.push(raw);
+                }
+                aliases
+            },
+            status: "active".to_string(),
+            priority_weight: None,
+            is_terminal: false,
+            is_reactivation_target: false,
+        },
+        updated_at: now,
+        version: 1,
+        current_version: true,
+        previous_version: None,
+        seeded_by: Some("manual".to_string()),
+    };
+
+    match state
+        .db
+        .collection_system_taxonomies()
+        .insert_one(&entry, None)
+        .await
+    {
+        Ok(_) => {}
+        Err(error) if is_duplicate_key_error(&error) => {
+            // 已存在则与 REST handler / `agent::taxonomy::approve` 行为一致：
+            // 跳过插入、候选仍 mark approved，再以 Conflict（409）告知重复。
+            mark_candidate_approved(state, object_id, payload.reviewed_by.as_deref()).await?;
+            return Err(AppError::Conflict(format!(
+                "duplicate_taxonomy: (scope={}, kind={}, value.id={}) 已存在；候选已置为 approved",
+                candidate.scope, candidate.kind, payload.canonical_value.id
+            )));
+        }
+        Err(error) => return Err(error.into()),
+    }
+
+    mark_candidate_approved(state, object_id, payload.reviewed_by.as_deref()).await?;
+    invalidate_global_taxonomy_cache();
+
+    let updated = candidates
+        .find_one(doc! { "_id": object_id }, None)
+        .await?
+        .ok_or_else(|| AppError::NotFound("candidate not found".to_string()))?;
+    Ok(json!({ "item": taxonomy_candidate_json(updated) }))
+}
+
 pub(super) fn taxonomy_candidate_json(item: TaxonomyCandidate) -> Value {
     json!({
         "id": item.id.map(|id| id.to_hex()).unwrap_or_default(),

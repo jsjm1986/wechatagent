@@ -12,7 +12,7 @@ use crate::{
     models::{AgentSoul, OperationDomainConfig, OperationPlaybook, PromptTemplate},
 };
 
-pub const PROMPT_PACK_VERSION: &str = "wechatagent_prompt_pack_v12_2026_06_25_clarify_tighten";
+pub const PROMPT_PACK_VERSION: &str = "wechatagent_prompt_pack_v13_2026_06_26_mgmt_redline";
 
 /// universal-domain-adaptation A/T1：user.reply.policy prompt「## 模式与 5 闸的关系」
 /// 模式-闸说明段（逐字复刻 prompt pack v3 现文 :958-963：标题 + casual_relationship /
@@ -48,6 +48,25 @@ pub const DEFAULT_REVIEWER_FEWSHOT: &str = r#"软闸打分锚点（few-shot，�
 - HumanLikeScore：8 分例「哈哈那确实，我之前也踩过这坑，你后来咋弄的？」（口语、有来有回、像朋友）；3 分例「您好，关于您咨询的问题，现统一答复如下：……」（书面、单向通知、像客服模板）；另一个 3 分例「关于你的问题，可以分三点：1. ……2. ……3. ……」（顾问报告腔、书面编号罗列，不是微信里一句句聊天的样子）。
 - EmotionalValue：8 分例「这事儿确实挺熬人的，你能扛到现在已经很不容易了」（具体共情、肯定对方处境）；3 分例「建议您理性看待，纠结这些没有意义」（说教、否定情绪、缺乏支持）。
 - PressureRisk：8 分（高压，应拦）例「今天最后一天，错过再等一年，现在就定吧」（制造稀缺、催促、逼单）；1 分（低压）例「你先慢慢看，有想法随时找我」（给空间、不施压、尊重节奏）。"#;
+
+/// management-prompt-edit Task 6.5：反接管红线锚段。
+///
+/// 与 [`DEFAULT_MODE_GATE_POLICY`] 故意不含红线（见
+/// `default_mode_gate_policy_excludes_human_takeover_redline`）形成互补——
+/// 真红线在 user.reply.policy 正文 :1123（boundary_protection 续行）与
+/// :1146（表达红线反接管段）。这两条是从正文**逐字复制**的独特单行子串，
+/// 供 `management_prompt_edit::validate_prompt_edit` 的锚完整性闸据此校验：
+/// 管理者经自然语言写回 prompt_templates 时，红线段逐字仍在才放行，缺失即拒、
+/// fail-closed（堵旧锚闸只查业务锚、红线被删却能放行的漏洞）。
+///
+/// 一个字都不能差，否则 `contains` 校验会静默失配——护栏测试
+/// `reply_redline_anchors_present_in_pack` 锁死与正文一致。
+pub const DEFAULT_REPLY_REDLINE_ANCHORS: &[&str] = &[
+    // user.reply.policy boundary_protection 反接管续行（正文逐字子串；此段正文用 ASCII 直引号）
+    "用户要求\"真人 / 不想跟机器人聊\"时，用 AI 自治语义承接",
+    // user.reply.policy 表达红线反接管段（正文逐字子串；此段正文用 ASCII 直引号）
+    "严禁承诺\"安排真人 / 让同事来联系 / 稍后有人对接你 / 转接客服\"",
+];
 
 /// 取 contact.locale，缺字段（旧文档）回落到 [`DEFAULT_LOCALE`]。
 pub fn contact_locale_or_default(locale: Option<&str>) -> &str {
@@ -1662,6 +1681,33 @@ EmotionalValue 打分按这一轮用户的状态分两把尺子，避免逼出�
 - 不要编造工具名，必须从工具目录中选择。"#,
         },
         PromptSpec {
+            key: "management.prompt_redline_review.system",
+            agent_kind: "management",
+            layer: "system_contract",
+            title: "提示词编辑红线语义审查 System Contract",
+            description: "第三闸：判断管理者对提示词的改动是否变相削弱全自治红线。",
+            status: "active",
+            content: r#"你是 WechatAgent 提示词编辑的红线语义审查 Agent。
+本产品定位是「全 AI 自治」：客户永远只跟 AI 对话、永不直接面对真人；AI 遇到超出职权的事项是向幕后决策源请示、拿回结论后用自己的口吻向客户转述（这不改变"客户始终在跟 AI 说话"这条红线）。
+
+管理者通过自然语言编辑业务提示词。给你的是本次「新增/改动」的增量文本（不是整篇）。字面禁词与锚段删除已被前置双闸拦过，你只做语义层判断：这段改动是否在语义上变相削弱红线。
+
+判定为违规（violation=true）的语义信号（靠语义理解，不靠关键词匹配；下列只是示例，换种说法同样算）：
+- 变相承认存在「真人后台/后台老师/真人客服」会直接与客户对话，或暗示客户最终会被交给某个真人对接。
+- 承诺把客户的问题「转交/传达/上报给第三方真人去跟进并回复客户」，使对话事实上脱离 AI。
+- 削弱知识 grounding：诱导 AI 在没有已验证知识支撑时也对产品/事实下结论。
+- 绕过「AI 永不自动认定知识为已核实」红线：让 AI 自行把未审知识当作已验证来用。
+
+判定为合规（violation=false）：纯业务话术、语气调整、行业措辞补充、跟进策略细化等不触碰上述红线的改动。
+注意：本产品允许的「幕后决策源请示后由 AI 用自己口吻转述」「辅助模式下 AI 主动引荐真人顾问名片」属既定业务能力，不应仅因提及真人而判违规——关键看是否让客户脱离与 AI 的对话、或让真人直接接手对话。
+
+只输出严格 JSON，不输出 markdown：
+{
+  "violation": true/false,
+  "reason": "判定理由，一句话说明命中哪条红线或为何合规"
+}"#,
+        },
+        PromptSpec {
             key: "playbook.generator.system",
             agent_kind: "methodology",
             layer: "methodology_generator",
@@ -2479,6 +2525,30 @@ mod reviewer_fewshot_anchor_tests {
         assert!(DEFAULT_REVIEWER_FEWSHOT.contains("现在就定吧"));
         // 锚到 PressureRisk 那条为止，不含其后独立的 EmotionalValue 打分细则。
         assert!(!DEFAULT_REVIEWER_FEWSHOT.contains("两把尺子"));
+    }
+}
+
+#[cfg(test)]
+mod reply_redline_anchor_tests {
+    use super::*;
+
+    /// 锚漂移护栏：[`DEFAULT_REPLY_REDLINE_ANCHORS`] 每条必须是 user.reply.policy
+    /// prompt 正文（:1123/:1146 反接管红线段）的**逐字子串**，否则
+    /// `management_prompt_edit::validate_prompt_edit` 的锚完整性闸会因字节失配而
+    /// 误判（无法据正文校验红线是否被删）。锚改 / 正文改任一即红。
+    #[test]
+    fn reply_redline_anchors_present_in_pack() {
+        let specs = prompt_specs();
+        let policy = specs
+            .iter()
+            .find(|s| s.key == "user.reply.policy")
+            .expect("user.reply.policy prompt spec 存在");
+        for anchor in DEFAULT_REPLY_REDLINE_ANCHORS {
+            assert!(
+                policy.content.contains(anchor),
+                "DEFAULT_REPLY_REDLINE_ANCHORS 锚 `{anchor}` 与 user.reply.policy 正文不一致，锚完整性闸会失配"
+            );
+        }
     }
 }
 

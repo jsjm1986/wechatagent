@@ -55,6 +55,7 @@ pub mod knowledge;
 mod lessons_learned;
 mod llm_providers;
 mod management;
+mod management_prompt_edit;
 // pub（非默认私有）：annotation_quality_gate_integration.rs 集成测试需从 tests/
 // crate 直调 review_media_asset handler 真函数（缺口 3 审核审计落库），仿
 // domain_profiles / ask_human_inbox 先例。生产路由注册仍走下方 use。
@@ -229,7 +230,8 @@ use knowledge::{
     verify_operation_knowledge_chunk,
 };
 use management::{
-    create_management_session, get_management_command, get_tool_catalog, post_management_message,
+    confirm_management_command, create_management_session, get_management_command, get_tool_catalog,
+    post_management_message, reject_management_command,
 };
 use behavior_signal_metrics::list_behavior_signal_metrics;
 use lessons_learned::{list_lessons_learned, promote_lesson_to_peer_case};
@@ -781,6 +783,14 @@ pub fn api_router(state: AppState) -> Router<AppState> {
         .route(
             "/management-agent/commands/:id",
             get(get_management_command),
+        )
+        .route(
+            "/management-agent/commands/:id/confirm",
+            post(confirm_management_command),
+        )
+        .route(
+            "/management-agent/commands/:id/reject",
+            post(reject_management_command),
         )
         .route("/management-agent/tool-catalog", get(get_tool_catalog))
         // ── agent-autonomy-loop W3 / Task 4.8：双层标签 admin 路由 ─────────────

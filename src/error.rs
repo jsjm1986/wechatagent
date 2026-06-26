@@ -11,6 +11,11 @@ pub enum AppError {
     BadRequest(String),
     #[error("{0}")]
     NotFound(String),
+    /// 资源处于不可执行该操作的状态（如 outbox 条目已是终态、不可再取消）。
+    /// 映射 HTTP 409 CONFLICT，与既有 cancel_outbox 的 `outbox_not_cancelable`
+    /// REST 行为对齐——抽内部 fn 后用此变体携带稳定的 error code。
+    #[error("{0}")]
+    Conflict(String),
     /// P0 鉴权：未登录 / session 失效 / cookie 缺失。前端按 401 跳回 LoginScreen。
     #[error("{0}")]
     Unauthorized(String),
@@ -59,6 +64,9 @@ impl IntoResponse for AppError {
             }
             AppError::NotFound(msg) => {
                 (StatusCode::NOT_FOUND, Json(json!({ "error": msg }))).into_response()
+            }
+            AppError::Conflict(msg) => {
+                (StatusCode::CONFLICT, Json(json!({ "error": msg }))).into_response()
             }
             AppError::Unauthorized(msg) => {
                 (StatusCode::UNAUTHORIZED, Json(json!({ "error": msg }))).into_response()

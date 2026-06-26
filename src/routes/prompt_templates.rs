@@ -41,6 +41,9 @@ pub(super) struct PromptTemplateRequest {
     /// Phase E / E3：可选 locale（BCP-47），未提供时落到 [`prompts::DEFAULT_LOCALE`]。
     #[serde(default)]
     locale: Option<String>,
+    /// Task 6.6 第三闸：管理者在收到 needs_human_confirm 后逐字核对无误，带 force=true 重提以覆盖语义审查。
+    #[serde(default)]
+    force: Option<bool>,
 }
 
 pub(super) async fn list_prompt_templates(
@@ -142,7 +145,55 @@ pub(super) async fn update_prompt_template(
     Json(payload): Json<PromptTemplateRequest>,
 ) -> AppResult<Json<Value>> {
     validate_prompt_template_input(&payload)?;
+    // 自然语言编辑硬门（fail-closed）：三层分级 + 字面双闸（禁用词 + 锚完整性）。
+    // 单点拦截——无论走管理 agent 工具还是管理员直接 PUT，命中即拒、不落库。
+    crate::routes::management_prompt_edit::validate_prompt_edit(&payload.prompt_key, &payload.content)
+        .map_err(AppError::BadRequest)?;
     let object_id = parse_object_id(&id)?;
+    // Task 6.6 第三闸：LLM 红线语义审查（审 diff 增量）。force=true 跳过（管理者已逐字核对）。
+    let force = payload.force.unwrap_or(false);
+    if !force {
+        let old_content = state
+            .db
+            .prompt_templates()
+            .find_one(
+                doc! {
+                    "_id": object_id,
+                    "workspace_id": &admin.current_workspace
+                },
+                None,
+            )
+            .await?
+            .map(|t| t.content)
+            .unwrap_or_default();
+        match crate::routes::management_prompt_edit::review_prompt_edit(
+            &state,
+            &admin.current_workspace,
+            &payload.prompt_key,
+            &old_content,
+            &payload.content,
+        )
+        .await
+        {
+            crate::routes::management_prompt_edit::PromptEditVerdict::Pass => {}
+            crate::routes::management_prompt_edit::PromptEditVerdict::Reject(reason) => {
+                return Err(AppError::BadRequest(format!(
+                    "红线语义审查拒绝：{reason}（确认无误可带 force 覆盖）"
+                )));
+            }
+            crate::routes::management_prompt_edit::PromptEditVerdict::NeedsHumanConfirm {
+                diff,
+                reason,
+            } => {
+                // 路径B：返回需二次确认（非错误），前端弹框显示 diff+reason，勾选后带 force=true 重提。
+                return Ok(Json(json!({
+                    "status": "needs_human_confirm",
+                    "reason": reason,
+                    "diff": diff
+                })));
+            }
+        }
+    }
     state
         .db
         .prompt_templates()
@@ -159,6 +210,10 @@ pub(super) async fn update_prompt_template(
                     "title": payload.title,
                     "description": normalize_optional(payload.description),
                     "content": payload.content,
+                    // 防 PR#42 启动对齐 align_prompt_specs 把被编辑的系统种子行
+                    // （seeded_by="system" 且内容≠DEFAULT）归档重种回 DEFAULT。
+                    // 置 "manual" 让 align 跳过，保住管理者编辑活过重启。
+                    "seeded_by": "manual",
                     "updated_at": DateTime::now()
                 }
             },

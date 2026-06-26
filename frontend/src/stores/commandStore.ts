@@ -18,6 +18,16 @@ interface CommandActions {
   setCommandDryRun: (value: boolean) => void;
   loadCommandData: (accountId?: string) => Promise<void>;
   runCommand: (accountId: string) => Promise<void>;
+  confirmCommand: (id: string) => Promise<void>;
+  rejectCommand: (id: string) => Promise<void>;
+}
+
+// confirm/reject 端点返回形状（src/routes/management.rs:506-549）。
+// 命中处理 → succeeded/failed/canceled；并发未命中 → already_processed_or_not_found。
+interface ConfirmResponse {
+  status: string;
+  summary?: string;
+  toolCalls?: CommandResult["toolCalls"];
 }
 
 export const useCommandStore = create<CommandState & CommandActions>((set, get) => ({
@@ -87,6 +97,56 @@ export const useCommandStore = create<CommandState & CommandActions>((set, get) 
       const pendingCount = tasksRes.items.filter(task => task.status === "pending").length;
       set({ pendingTasks: pendingCount });
 
+    } catch (error) {
+      useUiStore.getState().setError(error instanceof Error ? error.message : String(error));
+    } finally {
+      set({ commandBusy: false });
+    }
+  },
+
+  // 确认执行此前因高风险暂存（pending_confirmation）的命令。
+  // 后端真执行已确认的计划，返回新 status + toolCalls，合进 commandResult。
+  confirmCommand: async (id: string) => {
+    if (!id) return;
+    set({ commandBusy: true });
+    useUiStore.getState().setError("");
+    try {
+      const data = await api.post<ConfirmResponse>(
+        `/api/management-agent/commands/${id}/confirm`
+      );
+      set((state) => {
+        if (!state.commandResult || state.commandResult.id !== id) return {};
+        return {
+          commandResult: {
+            ...state.commandResult,
+            status: data.status,
+            summary: data.summary ?? state.commandResult.summary,
+            toolCalls: data.toolCalls ?? state.commandResult.toolCalls,
+          },
+        };
+      });
+    } catch (error) {
+      useUiStore.getState().setError(error instanceof Error ? error.message : String(error));
+    } finally {
+      set({ commandBusy: false });
+    }
+  },
+
+  // 否决此前暂存的命令：后端原子改 canceled，未执行任何工具。
+  rejectCommand: async (id: string) => {
+    if (!id) return;
+    set({ commandBusy: true });
+    useUiStore.getState().setError("");
+    try {
+      const data = await api.post<ConfirmResponse>(
+        `/api/management-agent/commands/${id}/reject`
+      );
+      set((state) => {
+        if (!state.commandResult || state.commandResult.id !== id) return {};
+        return {
+          commandResult: { ...state.commandResult, status: data.status },
+        };
+      });
     } catch (error) {
       useUiStore.getState().setError(error instanceof Error ? error.message : String(error));
     } finally {
