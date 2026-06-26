@@ -394,7 +394,7 @@ export function ChunkInspectorPane({
                     return (
                       <div
                         key={`${chunk.id}-irel-${i}`}
-                        className={`wikiRelatedChip ${dead ? "dead" : ""}`}
+                        className={`wikiRelatedChipWrap ${dead ? "dead" : ""}`}
                         title={dead ? "目标 chunk 不在活跃集合" : r.note ?? ""}
                       >
                         <button

@@ -1195,6 +1195,28 @@
     display: inline-flex;
     align-items: center;
     gap: 6px;
+    padding: 4px 10px;
+    font-size: 12px;
+    background: rgba(51, 90, 144, 0.06);
+    border: 1px solid rgba(51, 90, 144, 0.18);
+    color: var(--color-scheduled);
+    border-radius: 14px;
+    cursor: pointer;
+  }
+  .knowledgeWiki .wikiRelatedChip:hover {
+    background: rgba(51, 90, 144, 0.12);
+  }
+  .knowledgeWiki .wikiRelatedChip.dead {
+    background: #f1f3f4;
+    color: #9aa0a6;
+    border-color: #e3e6ec;
+    cursor: not-allowed;
+    text-decoration: line-through;
+  }
+  .knowledgeWiki .wikiRelatedChipWrap {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
     padding: 4px 6px 4px 10px;
     font-size: 12px;
     background: rgba(51, 90, 144, 0.06);
@@ -1202,10 +1224,10 @@
     color: var(--color-scheduled);
     border-radius: 14px;
   }
-  .knowledgeWiki .wikiRelatedChip:hover {
+  .knowledgeWiki .wikiRelatedChipWrap:hover {
     background: rgba(51, 90, 144, 0.12);
   }
-  .knowledgeWiki .wikiRelatedChip.dead {
+  .knowledgeWiki .wikiRelatedChipWrap.dead {
     background: #f1f3f4;
     color: #9aa0a6;
     border-color: #e3e6ec;
