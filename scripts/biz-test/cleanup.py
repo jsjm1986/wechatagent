@@ -11,7 +11,8 @@ import _lib
 
 def main() -> None:
     parts = []
-    # 按 biztest_ 前缀删（各集合的 wxid/contactWxid/fromWxid 字段）。
+    # 按 biztest_ 前缀删（各集合的 wxid/contact_wxid/from_wxid 字段）。
+    # 注意：mongo 直接查询用 snake_case BSON 字段名（API 响应才是 camelCase serde rename）。
     for c in [
         "contacts",
         "conversation_messages",
@@ -23,13 +24,13 @@ def main() -> None:
     ]:
         parts.append(
             f"r.{c}=db.{c}.deleteMany({{$or:["
-            f"{{contactWxid:/^biztest_/}},{{fromWxid:/^biztest_/}},{{wxid:/^biztest_/}}]}}).deletedCount"
+            f"{{contact_wxid:/^biztest_/}},{{from_wxid:/^biztest_/}},{{wxid:/^biztest_/}}]}}).deletedCount"
         )
-    # 知识/素材/卡片/profile 按 biztest_ 命名删。
-    parts.append("r.chunks=db.operation_knowledge_chunks.deleteMany({sourceName:/biztest/}).deletedCount")
+    # 知识/素材/卡片/profile 按 biztest_ 命名删（snake_case 字段）。
+    parts.append("r.chunks=db.operation_knowledge_chunks.deleteMany({source_name:/biztest/}).deletedCount")
     parts.append("r.assets=db.content_assets.deleteMany({title:/^biztest_/}).deletedCount")
-    parts.append("r.cards=db.referral_cards.deleteMany({displayName:/^biztest_/}).deletedCount")
-    parts.append("r.profiles=db.domain_profiles.deleteMany({profileId:/^biztest_/}).deletedCount")
+    parts.append("r.cards=db.referral_cards.deleteMany({display_name:/^biztest_/}).deletedCount")
+    parts.append("r.profiles=db.domain_profiles.deleteMany({profile_id:/^biztest_/}).deletedCount")
     js = "var r={}; " + "; ".join(parts) + "; printjson(r)"
     print(_lib.mongo(js))
 

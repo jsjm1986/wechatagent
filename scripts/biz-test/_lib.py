@@ -64,8 +64,11 @@ def mongo(js: str) -> str:
 
 
 def mongo_json(js: str) -> Any:
-    """跑 JSON.stringify(<js>)，取输出里第一个能 json.loads 的行。"""
-    out = mongo(f"JSON.stringify({js})").strip()
+    """跑 print(JSON.stringify(<js>))，取输出里第一个能 json.loads 的行。
+
+    mongosh --file 模式不回显表达式值（不像交互 REPL），必须显式 print。
+    """
+    out = mongo(f"print(JSON.stringify({js}))").strip()
     if not out:
         return None
     # mongosh --quiet 仍可能带连接/弃用提示行，逐行尝试解析，取最后一个成功的。
@@ -146,14 +149,17 @@ def send_webhook(app_id: str, from_wxid: str, content: str, msg_id: str) -> dict
 
 
 def llm_logs_since(seconds: int, prompt_key: str | None = None) -> list[dict]:
-    """查 llm_call_logs 最近 N 秒记录（mongo），用于真调铁证断言。"""
+    """查 llm_call_logs 最近 N 秒记录（mongo），用于真调铁证断言。
+
+    注意：mongo BSON 字段是 snake_case（prompt_key/created_at），非 API 的 camelCase。
+    """
     since = int(time.time() * 1000) - seconds * 1000
     if prompt_key:
-        q = f'{{createdAt:{{$gte:new Date({since})}},promptKey:"{prompt_key}"}}'
+        q = f'{{created_at:{{$gte:new Date({since})}},prompt_key:"{prompt_key}"}}'
     else:
-        q = f'{{createdAt:{{$gte:new Date({since})}}}}'
+        q = f'{{created_at:{{$gte:new Date({since})}}}}'
     js = (
-        f"db.llm_call_logs.find({q},{{promptKey:1,status:1,model:1,_id:0}})"
+        f"db.llm_call_logs.find({q},{{prompt_key:1,status:1,model:1,_id:0}})"
         f".sort({{_id:-1}}).limit(20).toArray()"
     )
     res = mongo_json(js)
