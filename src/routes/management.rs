@@ -73,6 +73,157 @@ pub(super) struct PlannedToolCall {
     arguments: Value,
 }
 
+/// 一组 plan tool_calls 执行后的产物，供调用方拼装响应/汇报。
+/// `calls`：每个工具调用的前端 JSON；`outcomes`：喂 build_execution_summary；
+/// `failed`：业务 Failed 或 RPC Err 时的失败原因（设置即"失败即止"）。
+pub(super) struct PlanExecution {
+    pub calls: Vec<Value>,
+    pub outcomes: Vec<(String, ToolOutcome)>,
+    pub failed: Option<String>,
+}
+
+/// 执行一组 plan tool_calls：对每个工具 insert tool_call → 调 execute_management_tool
+/// → 核实 outcome（assert_tool_outcome）→ 写终态（过闭集断言）→ 收集 calls/outcomes。
+/// 业务 Failed 与 Err 都"失败即止"（set failed + break）；Unverified 不算失败继续。
+/// post_message 与 confirm 共用，避免两份执行逻辑漂移（项目历史踩过 dual-path drift）。
+///
+/// 调用方决定要执行哪些 tool_calls：post_message 在 requires_confirmation 时传空切片
+/// （等价原 take(0)，不执行只暂存），否则传 plan.tool_calls；confirm 已确认全执行。
+/// 函数内部对传入切片做 `.take(12)` 上限（防一个 plan 塞超量工具）。
+pub(super) async fn execute_plan_tool_calls(
+    state: &AppState,
+    workspace_id: &str,
+    account_id: &str,
+    tool_calls: &[PlannedToolCall],
+    command_run_id: mongodb::bson::oid::ObjectId,
+    dry_run: bool,
+    advertised: &HashSet<String>,
+) -> AppResult<PlanExecution> {
+    let mut calls = Vec::new();
+    let mut outcomes: Vec<(String, ToolOutcome)> = Vec::new();
+    let mut failed = None;
+    for planned in tool_calls.iter().take(12) {
+        let arguments_doc = to_document(&planned.arguments).unwrap_or_else(|_| Document::new());
+        let call_start = AgentToolCall {
+            id: None,
+            workspace_id: workspace_id.to_string(),
+            account_id: account_id.to_string(),
+            command_run_id,
+            tool_name: planned.tool_name.clone(),
+            arguments: arguments_doc.clone(),
+            status: if should_dry_run_tool(&planned.tool_name, dry_run) {
+                "dry_run".to_string()
+            } else {
+                "running".to_string()
+            },
+            response: None,
+            error: None,
+            created_at: DateTime::now(),
+            updated_at: DateTime::now(),
+        };
+        crate::models::assert_tool_call_status_valid(&call_start.status);
+        let call_result = state.db.tool_calls().insert_one(call_start, None).await?;
+        let call_id = call_result
+            .inserted_id
+            .as_object_id()
+            .ok_or_else(|| AppError::External("tool call id missing".to_string()))?;
+        let result =
+            execute_management_tool(state, workspace_id, account_id, planned, dry_run, advertised).await;
+        let is_dry_run = should_dry_run_tool(&planned.tool_name, dry_run);
+        match result {
+            Ok(response) => {
+                // RPC 返 Ok 不等于业务成功：核实真实结果（dry_run 不核实，视为 Succeeded）。
+                let outcome = if is_dry_run {
+                    ToolOutcome::Succeeded
+                } else {
+                    assert_tool_outcome(&planned.tool_name, &response)
+                };
+                let status_str = match (&outcome, is_dry_run) {
+                    (_, true) => "dry_run",
+                    (ToolOutcome::Succeeded, _) => "succeeded",
+                    (ToolOutcome::Failed(_), _) => "failed",
+                    (ToolOutcome::Unverified(_), _) => "executed_unverified",
+                };
+                let response_doc = to_document(&response).ok();
+                crate::models::assert_tool_call_status_valid(status_str);
+                state
+                    .db
+                    .tool_calls()
+                    .update_one(
+                        doc! { "_id": call_id },
+                        doc! {
+                            "$set": {
+                                "status": status_str,
+                                "response": response_doc,
+                                "updated_at": DateTime::now()
+                            }
+                        },
+                        None,
+                    )
+                    .await?;
+                calls.push(json!({
+                    "id": call_id.to_hex(),
+                    "toolName": planned.tool_name,
+                    "arguments": planned.arguments,
+                    "status": status_str,
+                    "response": response
+                }));
+                outcomes.push((planned.tool_name.clone(), outcome.clone()));
+                // 业务 Failed 走的是 Ok(response) 分支（RPC 成功但结果失败），
+                // 与原 Err 分支"失败即止"语义对齐：设 failed 并 break。
+                // Unverified 不算失败（已执行，仅结果待核实）→ 不设 failed、不 break。
+                if let ToolOutcome::Failed(why) = &outcome {
+                    failed = Some(why.clone());
+                    break;
+                }
+            }
+            Err(error) => {
+                let message = error.to_string();
+                crate::models::assert_tool_call_status_valid("failed");
+                state
+                    .db
+                    .tool_calls()
+                    .update_one(
+                        doc! { "_id": call_id },
+                        doc! {
+                            "$set": {
+                                "status": "failed",
+                                "error": &message,
+                                "updated_at": DateTime::now()
+                            }
+                        },
+                        None,
+                    )
+                    .await?;
+                calls.push(json!({
+                    "id": call_id.to_hex(),
+                    "toolName": planned.tool_name,
+                    "arguments": planned.arguments,
+                    "status": "failed",
+                    "error": message
+                }));
+                failed = Some(message);
+                break;
+            }
+        }
+    }
+    Ok(PlanExecution {
+        calls,
+        outcomes,
+        failed,
+    })
+}
+
+/// 乐观锁过滤条件：仅命中本 workspace 下、状态为 pending_confirmation 的命令。
+/// 带 workspace_id 防 IDOR（不能跨 workspace 确认他人命令）；带 status 防二次确认
+/// / 防确认非待确认命令（confirm 与 reject 共用同一条件）。
+pub(super) fn build_confirm_filter(
+    workspace_id: &str,
+    run_id: &mongodb::bson::oid::ObjectId,
+) -> Document {
+    doc! { "_id": run_id, "workspace_id": workspace_id, "status": "pending_confirmation" }
+}
+
 pub(super) async fn create_management_session(
     State(state): State<AppState>,
     Extension(admin): Extension<AuthenticatedAdmin>,
@@ -185,120 +336,28 @@ pub(super) async fn post_management_message(
         .inserted_id
         .as_object_id()
         .ok_or_else(|| AppError::External("command run id missing".to_string()))?;
-    let mut calls = Vec::new();
-    let mut outcomes: Vec<(String, ToolOutcome)> = Vec::new();
-    let mut failed = None;
     let requires_confirmation =
         plan.requires_confirmation || plan.risk_level.eq_ignore_ascii_case("dangerous");
-    for planned in plan
-        .tool_calls
-        .iter()
-        .take(if requires_confirmation { 0 } else { 12 })
-    {
-        let arguments_doc = to_document(&planned.arguments).unwrap_or_else(|_| Document::new());
-        let call_start = AgentToolCall {
-            id: None,
-            workspace_id: admin.current_workspace.clone(),
-            account_id: payload.account_id.clone(),
-            command_run_id: run_id,
-            tool_name: planned.tool_name.clone(),
-            arguments: arguments_doc.clone(),
-            status: if should_dry_run_tool(&planned.tool_name, effective_dry_run) {
-                "dry_run".to_string()
-            } else {
-                "running".to_string()
-            },
-            response: None,
-            error: None,
-            created_at: DateTime::now(),
-            updated_at: DateTime::now(),
-        };
-        crate::models::assert_tool_call_status_valid(&call_start.status);
-        let call_result = state.db.tool_calls().insert_one(call_start, None).await?;
-        let call_id = call_result
-            .inserted_id
-            .as_object_id()
-            .ok_or_else(|| AppError::External("tool call id missing".to_string()))?;
-        let result =
-            execute_management_tool(&state, &admin.current_workspace, &payload.account_id, planned, effective_dry_run, &advertised_tools).await;
-        let is_dry_run = should_dry_run_tool(&planned.tool_name, effective_dry_run);
-        match result {
-            Ok(response) => {
-                // RPC 返 Ok 不等于业务成功：核实真实结果（dry_run 不核实，视为 Succeeded）。
-                let outcome = if is_dry_run {
-                    ToolOutcome::Succeeded
-                } else {
-                    assert_tool_outcome(&planned.tool_name, &response)
-                };
-                let status_str = match (&outcome, is_dry_run) {
-                    (_, true) => "dry_run",
-                    (ToolOutcome::Succeeded, _) => "succeeded",
-                    (ToolOutcome::Failed(_), _) => "failed",
-                    (ToolOutcome::Unverified(_), _) => "executed_unverified",
-                };
-                let response_doc = to_document(&response).ok();
-                crate::models::assert_tool_call_status_valid(status_str);
-                state
-                    .db
-                    .tool_calls()
-                    .update_one(
-                        doc! { "_id": call_id },
-                        doc! {
-                            "$set": {
-                                "status": status_str,
-                                "response": response_doc,
-                                "updated_at": DateTime::now()
-                            }
-                        },
-                        None,
-                    )
-                    .await?;
-                calls.push(json!({
-                    "id": call_id.to_hex(),
-                    "toolName": planned.tool_name,
-                    "arguments": planned.arguments,
-                    "status": status_str,
-                    "response": response
-                }));
-                outcomes.push((planned.tool_name.clone(), outcome.clone()));
-                // 业务 Failed 走的是 Ok(response) 分支（RPC 成功但结果失败），
-                // 与原 Err 分支"失败即止"语义对齐：设 failed 并 break。
-                // Unverified 不算失败（已执行，仅结果待核实）→ 不设 failed、不 break。
-                if let ToolOutcome::Failed(why) = &outcome {
-                    failed = Some(why.clone());
-                    break;
-                }
-            }
-            Err(error) => {
-                let message = error.to_string();
-                crate::models::assert_tool_call_status_valid("failed");
-                state
-                    .db
-                    .tool_calls()
-                    .update_one(
-                        doc! { "_id": call_id },
-                        doc! {
-                            "$set": {
-                                "status": "failed",
-                                "error": &message,
-                                "updated_at": DateTime::now()
-                            }
-                        },
-                        None,
-                    )
-                    .await?;
-                calls.push(json!({
-                    "id": call_id.to_hex(),
-                    "toolName": planned.tool_name,
-                    "arguments": planned.arguments,
-                    "status": "failed",
-                    "error": message
-                }));
-                failed = Some(message);
-                break;
-            }
-        }
-    }
+    // 抽公共执行函数后，"0 还是全部"由调用方传切片控制：requires_confirmation 时传空切片
+    // （等价原 take(0)，只暂存不执行），否则传全部 tool_calls（函数内 take(12) 上限保留）。
+    // confirm 与 post_message 共用同一执行函数，避免 dual-path drift。
+    let exec = execute_plan_tool_calls(
+        &state,
+        &admin.current_workspace,
+        &payload.account_id,
+        if requires_confirmation {
+            &[]
+        } else {
+            plan.tool_calls.as_slice()
+        },
+        run_id,
+        effective_dry_run,
+        &advertised_tools,
+    )
+    .await?;
+    let calls = exec.calls;
+    let outcomes = exec.outcomes;
+    let failed = exec.failed;
 
     let final_status = if requires_confirmation {
         "pending_confirmation"
@@ -371,6 +430,123 @@ pub(super) async fn post_management_message(
             "toolCalls": calls
         }
     })))
+}
+
+/// 确认并执行此前因高风险被暂存（pending_confirmation）的命令。
+/// 乐观锁仿 escalation/ledger.rs::resolve_escalation：find_one_and_update 仅命中
+/// pending_confirmation 原子改 running，二次确认/并发只一个命中，其余拿 None 幂等返回。
+/// filter 带 workspace_id 防 IDOR（不能跨 workspace 确认他人命令）。
+pub(super) async fn confirm_management_command(
+    State(state): State<AppState>,
+    Extension(admin): Extension<AuthenticatedAdmin>,
+    Path(id): Path<String>,
+) -> AppResult<Json<Value>> {
+    let run_id = parse_object_id(&id)?;
+    let run = state
+        .db
+        .command_runs()
+        .find_one_and_update(
+            build_confirm_filter(&admin.current_workspace, &run_id),
+            doc! { "$set": { "status": "running", "updated_at": DateTime::now() } },
+            None,
+        )
+        .await?;
+    let Some(run) = run else {
+        return Ok(Json(json!({ "status": "already_processed_or_not_found" })));
+    };
+    let plan: ManagementPlan = run
+        .plan
+        .as_ref()
+        .and_then(|d| mongodb::bson::from_document(d.clone()).ok())
+        .unwrap_or_default();
+    let tools = merge_product_tools(mcp::list_tools_for_account(&state, &run.account_id).await?);
+    let advertised = advertised_tool_names(&tools);
+    // 确认后真执行（非 dry_run），全执行已确认的 tool_calls（与 post_message 共用执行函数）。
+    let exec = execute_plan_tool_calls(
+        &state,
+        &admin.current_workspace,
+        &run.account_id,
+        &plan.tool_calls,
+        run_id,
+        false,
+        &advertised,
+    )
+    .await?;
+    let summary = build_execution_summary(&exec.outcomes);
+    let final_status = if exec.failed.is_some() {
+        "failed"
+    } else {
+        "succeeded"
+    };
+    state
+        .db
+        .command_runs()
+        .update_one(
+            doc! { "_id": run_id },
+            doc! { "$set": { "status": final_status, "summary": &summary, "error": &exec.failed, "updated_at": DateTime::now() } },
+            None,
+        )
+        .await?;
+    state
+        .db
+        .management_messages()
+        .insert_one(
+            ManagementAgentMessage {
+                id: None,
+                workspace_id: admin.current_workspace.clone(),
+                account_id: run.account_id.clone(),
+                session_id: run.session_id,
+                role: "assistant".to_string(),
+                content: summary.clone(),
+                created_at: DateTime::now(),
+            },
+            None,
+        )
+        .await?;
+    Ok(Json(json!({
+        "status": final_status,
+        "summary": summary,
+        "toolCalls": exec.calls
+    })))
+}
+
+/// 驳回此前因高风险被暂存的命令：乐观锁同 confirm filter（仅 pending_confirmation），
+/// 原子改 canceled，落一条 assistant message 说明未执行。filter 带 workspace_id 防 IDOR。
+pub(super) async fn reject_management_command(
+    State(state): State<AppState>,
+    Extension(admin): Extension<AuthenticatedAdmin>,
+    Path(id): Path<String>,
+) -> AppResult<Json<Value>> {
+    let run_id = parse_object_id(&id)?;
+    let run = state
+        .db
+        .command_runs()
+        .find_one_and_update(
+            build_confirm_filter(&admin.current_workspace, &run_id),
+            doc! { "$set": { "status": "canceled", "updated_at": DateTime::now() } },
+            None,
+        )
+        .await?;
+    let Some(run) = run else {
+        return Ok(Json(json!({ "status": "already_processed_or_not_found" })));
+    };
+    state
+        .db
+        .management_messages()
+        .insert_one(
+            ManagementAgentMessage {
+                id: None,
+                workspace_id: admin.current_workspace.clone(),
+                account_id: run.account_id.clone(),
+                session_id: run.session_id,
+                role: "assistant".to_string(),
+                content: "已取消该计划，未执行。".to_string(),
+                created_at: DateTime::now(),
+            },
+            None,
+        )
+        .await?;
+    Ok(Json(json!({ "status": "canceled" })))
 }
 
 pub(super) async fn get_management_command(
@@ -1547,6 +1723,15 @@ mod tests {
         assert!(!names.contains("os.exec"));
         assert!(!names.contains("message_send_text"));
         assert!(!names.contains("admin.delete_workspace"));
+    }
+
+    #[test]
+    fn confirm_filter_only_targets_pending_confirmation() {
+        let filter = build_confirm_filter("workspace1", &mongodb::bson::oid::ObjectId::new());
+        // filter 必须含 status: pending_confirmation（防二次确认 / 防确认非待确认命令）
+        // 且带 workspace_id（IDOR：不能跨 workspace 确认他人命令）
+        assert_eq!(filter.get_str("workspace_id").unwrap(), "workspace1");
+        assert_eq!(filter.get_str("status").unwrap(), "pending_confirmation");
     }
 
     #[test]
