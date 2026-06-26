@@ -300,6 +300,51 @@
   color: var(--color-brand);
 }
 
+/* ── patch diff 预览:对话产改动逐字段显形 ── */
+.patchPreview {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  margin-top: 2px;
+  padding: 8px 10px;
+  background: rgba(20, 30, 60, 0.04);
+  border-radius: var(--r-sm);
+}
+
+.patchLabel {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--ink-4);
+  letter-spacing: 0.2px;
+}
+
+.patchList {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.patchItem {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  font-size: 12.5px;
+  line-height: 1.45;
+}
+
+.patchField {
+  font-weight: 600;
+  color: var(--ink-3);
+}
+
+.patchValue {
+  color: var(--ink-2);
+  word-break: break-word;
+}
+
 .composer {
   display: flex;
   gap: 8px;
