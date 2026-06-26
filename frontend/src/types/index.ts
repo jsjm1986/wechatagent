@@ -649,6 +649,9 @@ export type DomainProfile = {
   debounce_window_ms_override?: number | null;
   // H13：AI 生成状态机本体（draft），激活前供审阅；激活后运行时读 operation_domain_configs。
   generated_state_machine?: GeneratedStateMachine | null;
+  // D8：按 relationship_type 分配运营范式（数字分身三级回落中间层）。后端 models.rs:1763
+  // per_relationship_operation_mode: Option<BTreeMap<String, OperationMode>>，键为 relationship_type。
+  per_relationship_operation_mode?: Record<string, OperationMode> | null;
   version: number;
   current_version: boolean;
   previous_version: number | null;
@@ -685,6 +688,7 @@ export type DomainProfileDraft = {
   mode_gate_policy_override?: string;
   trajectory_dimensions?: TrajectoryDimension[];
   debounce_window_ms_override?: number;
+  per_relationship_operation_mode?: Record<string, OperationMode>;
 };
 
 export type GenerateProfileRequest = {

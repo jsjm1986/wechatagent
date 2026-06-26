@@ -330,6 +330,7 @@ export const useStrategyStore = create<StrategyState & StrategyActions>((set, ge
         mode_gate_policy_override: profile.mode_gate_policy_override ?? undefined,
         trajectory_dimensions: profile.trajectory_dimensions ?? undefined,
         debounce_window_ms_override: profile.debounce_window_ms_override ?? undefined,
+        per_relationship_operation_mode: profile.per_relationship_operation_mode ?? undefined,
       }
     });
   },
