@@ -61,4 +61,21 @@ describe("createSseReconnector", () => {
     vi.advanceTimersByTime(60000);
     expect(FakeES.instances).toHaveLength(1);
   });
+
+  it("收到 terminal 事件（close）后停止重连，即便随后 error 也不再新建连接", () => {
+    const r = createSseReconnector("/s", {
+      onEvent: { turn: () => {} },
+      terminalEvents: ["close"],
+      baseDelayMs: 100,
+      capMs: 30000,
+      maxRetries: 6,
+    });
+    expect(FakeES.instances).toHaveLength(1);
+    FakeES.instances[0].emit("close");           // 后端正常终结流 → 主动停止
+    expect(FakeES.instances[0].closed).toBe(true);
+    FakeES.instances[0].emit("error");           // 浏览器随即触发 error
+    vi.advanceTimersByTime(60000);
+    expect(FakeES.instances).toHaveLength(1);     // 不再产生新 EventSource 实例
+    r.close();
+  });
 });
