@@ -103,7 +103,9 @@ pub use knowledge_agent::{
 pub use knowledge_router::{
     format_operation_knowledge_for_prompt, format_operation_knowledge_for_prompt_with_roles,
 };
-pub use memory::{consolidate_contact_memory, handle_memory_consolidation_task};
+pub use memory::{
+    consolidate_contact_memory, handle_memory_consolidation_task, load_or_create_operating_memory,
+};
 // §3.7：planner scan_calendar 只读取 contact memoryCard 的 extra 容器（纪念日槽），
 // 复用 memory 模块的纯解析入口（mod memory 私有，故在此 re-export 给 planner）。
 pub(crate) use memory::effective_memory_card;

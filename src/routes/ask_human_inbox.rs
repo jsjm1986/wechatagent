@@ -26,12 +26,55 @@ pub struct InboxItem {
     pub rich_component: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rich_params: Option<Document>,
+    // 请示卡富字段（仅 principal_escalation 来源填充）：决策人需看到客户是谁、
+    // 请示什么问题、属哪类，避免盲裁。其余来源恒 None（skip_serializing 不输出）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub category: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub question_for_principal: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub contact_wxid: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub principal_wxid: Option<String>,
 }
 
 fn age_hours_of(created: Option<DateTime>, now_ms: i64) -> f64 {
     created
         .map(|c| (now_ms - c.timestamp_millis()) as f64 / (3600.0 * 1000.0))
         .unwrap_or(0.0)
+}
+
+/// 空串归一成 None（避免把空字段当成有值投影给前端）。
+fn non_empty(s: &str) -> Option<String> {
+    if s.is_empty() {
+        None
+    } else {
+        Some(s.to_string())
+    }
+}
+
+/// 单条请示 → InboxItem（具名以便单测）。保留富字段
+/// category/question_for_principal/contact_wxid/principal_wxid，避免决策人盲裁。
+fn escalation_to_inbox_item(
+    e: &crate::models::AgentPrincipalEscalation,
+    now_ms: i64,
+) -> InboxItem {
+    InboxItem {
+        source: "principal_escalation".into(),
+        id: e.short_code.clone(),
+        title: format!("请示 #{}", e.short_code),
+        summary: e.reason.clone(),
+        severity: "high".into(),
+        created_at: Some(e.created_at),
+        age_hours: age_hours_of(Some(e.created_at), now_ms),
+        action_kind: "inline".into(),
+        rich_component: None,
+        rich_params: None,
+        category: non_empty(&e.category),
+        question_for_principal: non_empty(&e.question_for_principal),
+        contact_wxid: non_empty(&e.contact_wxid),
+        principal_wxid: non_empty(&e.principal_wxid),
+    }
 }
 
 /// 请示通道 pending → InboxItem（inline）。
@@ -44,18 +87,7 @@ async fn collect_escalations(
         crate::agent::escalation::list_escalations_by_workspace(state, ws, "pending").await?;
     Ok(items
         .into_iter()
-        .map(|e| InboxItem {
-            source: "principal_escalation".into(),
-            id: e.short_code.clone(),
-            title: format!("请示 #{}", e.short_code),
-            summary: e.reason.clone(),
-            severity: "high".into(),
-            created_at: Some(e.created_at),
-            age_hours: age_hours_of(Some(e.created_at), now_ms),
-            action_kind: "inline".into(),
-            rich_component: None,
-            rich_params: None,
-        })
+        .map(|e| escalation_to_inbox_item(&e, now_ms))
         .collect())
 }
 
@@ -90,6 +122,10 @@ async fn collect_knowledge_review(
                 action_kind: "rich".into(),
                 rich_component: Some("knowledgeReview".into()),
                 rich_params: Some(doc! { "chunkId": id }),
+                category: None,
+                question_for_principal: None,
+                contact_wxid: None,
+                principal_wxid: None,
             }
         })
         .collect())
@@ -127,6 +163,10 @@ async fn collect_taxonomy_candidates(
                 action_kind: "inline".into(),
                 rich_component: None,
                 rich_params: None,
+                category: None,
+                question_for_principal: None,
+                contact_wxid: None,
+                principal_wxid: None,
             }
         })
         .collect())
@@ -163,6 +203,10 @@ async fn collect_relationship_suggestions(
                 action_kind: "inline".into(),
                 rich_component: None,
                 rich_params: None,
+                category: None,
+                question_for_principal: None,
+                contact_wxid: None,
+                principal_wxid: None,
             }
         })
         .collect())
@@ -199,6 +243,10 @@ async fn collect_gap_signals(
                 action_kind: "inline".into(),
                 rich_component: None,
                 rich_params: None,
+                category: None,
+                question_for_principal: None,
+                contact_wxid: None,
+                principal_wxid: None,
             }
         })
         .collect())
@@ -235,6 +283,10 @@ async fn collect_profile_drafts(
                 action_kind: "rich".into(),
                 rich_component: Some("profilePublish".into()),
                 rich_params: Some(doc! { "profileId": id }),
+                category: None,
+                question_for_principal: None,
+                contact_wxid: None,
+                principal_wxid: None,
             }
         })
         .collect())
@@ -271,6 +323,10 @@ async fn collect_evolution_proposals(
                 action_kind: "rich".into(),
                 rich_component: Some("evolutionRelease".into()),
                 rich_params: Some(doc! { "proposalId": id }),
+                category: None,
+                question_for_principal: None,
+                contact_wxid: None,
+                principal_wxid: None,
             }
         })
         .collect())
@@ -311,6 +367,10 @@ async fn collect_lessons_learned(
                 action_kind: "rich".into(),
                 rich_component: Some("lessonsPromote".into()),
                 rich_params: Some(doc! { "lessonId": id }),
+                category: None,
+                question_for_principal: None,
+                contact_wxid: None,
+                principal_wxid: None,
             }
         })
         .collect())
@@ -428,4 +488,73 @@ pub async fn ask_human_summary(
         "evolutionProposal": evolution_proposal,
         "lessonsLearned": lessons_learned,
     })))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::AgentPrincipalEscalation;
+    use mongodb::bson::DateTime;
+
+    fn test_escalation_fixture() -> AgentPrincipalEscalation {
+        let now = DateTime::now();
+        AgentPrincipalEscalation {
+            id: None,
+            workspace_id: "ws1".into(),
+            account_id: "acc1".into(),
+            contact_wxid: "wxid_cust".into(),
+            short_code: "E1A2".into(),
+            status: "pending".into(),
+            category: "discount_request".into(),
+            reason: "客户想要折扣，超出 AI 职权".into(),
+            question_for_principal: "能否给折扣".into(),
+            principal_wxid: "wxid_boss".into(),
+            decision: None,
+            authorization_expires_at: None,
+            is_generalizable: false,
+            knowledge_proposal_emitted: false,
+            last_holding_reply_ms: None,
+            created_at: now,
+            updated_at: now,
+            resolved_at: None,
+            resolved_via: None,
+        }
+    }
+
+    #[test]
+    fn escalation_projection_carries_rich_fields() {
+        let esc = test_escalation_fixture();
+        let now_ms = DateTime::now().timestamp_millis();
+        let item = escalation_to_inbox_item(&esc, now_ms);
+        assert_eq!(item.category.as_deref(), Some("discount_request"));
+        assert_eq!(item.question_for_principal.as_deref(), Some("能否给折扣"));
+        assert_eq!(item.contact_wxid.as_deref(), Some("wxid_cust"));
+        assert_eq!(item.principal_wxid.as_deref(), Some("wxid_boss"));
+    }
+
+    #[test]
+    fn escalation_projection_empty_strings_become_none() {
+        let mut esc = test_escalation_fixture();
+        esc.category = String::new();
+        esc.question_for_principal = String::new();
+        esc.contact_wxid = String::new();
+        esc.principal_wxid = String::new();
+        let now_ms = DateTime::now().timestamp_millis();
+        let item = escalation_to_inbox_item(&esc, now_ms);
+        assert_eq!(item.category, None);
+        assert_eq!(item.question_for_principal, None);
+        assert_eq!(item.contact_wxid, None);
+        assert_eq!(item.principal_wxid, None);
+    }
+
+    #[test]
+    fn escalation_rich_fields_serialize_camel_case() {
+        let esc = test_escalation_fixture();
+        let item = escalation_to_inbox_item(&esc, 0);
+        let v = serde_json::to_value(&item).unwrap();
+        assert_eq!(v["questionForPrincipal"], "能否给折扣");
+        assert_eq!(v["contactWxid"], "wxid_cust");
+        assert_eq!(v["principalWxid"], "wxid_boss");
+        assert_eq!(v["category"], "discount_request");
+    }
 }

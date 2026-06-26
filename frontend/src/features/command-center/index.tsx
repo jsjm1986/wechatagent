@@ -6,6 +6,7 @@ import { useAccountStore } from "../../stores/accountStore";
 import { useContactStore } from "../../stores/contactStore";
 import { useCommandStore } from "../../stores/commandStore";
 import type { CommandToolCall, CommandResult } from "../../types";
+import { McpKeyForm } from "./McpKeyForm";
 import styles from "./CommandCenter.module.css";
 
 const EXAMPLES = ["把 xx 加入 Agent 运营", "发送 xx 给好友 xx", "查看今天失败任务"];
@@ -148,6 +149,9 @@ export default function CommandCenterFeature() {
             <strong>执行边界</strong>
             <p>当前版本开放完整 MCP 工具目录给 Management Agent，所有调用通过后端账号凭证代理并写入审计日志。</p>
           </div>
+          {currentAccount?.id && (
+            <McpKeyForm accountId={currentAccount.id} configured={!!currentAccount.mcpKeyConfigured} />
+          )}
         </aside>
 
         {/* —— 指令面板 —— */}

@@ -556,6 +556,45 @@ pub(super) fn is_valid_assist_mode(mode: &str) -> bool {
     matches!(mode, "default" | "force_on" | "force_off")
 }
 
+/// 构造「撤销引荐」的 update 文档（红线 §6.3）。$unset 两个 domain_attributes
+/// dotted-key（referred_specialist_at + referred_card_id），$set 刷新 updated_at。
+/// 必须 unset 两键：escalation/logic.rs 判 referred_specialist_at 键存在才注入
+/// 退辅助指引，两键都清才彻底退回主动运营态。抽纯函数以便单测 $unset 形态。
+fn build_clear_referral_update() -> Document {
+    let now = DateTime::now();
+    doc! {
+        "$unset": {
+            format!("domain_attributes.{}", crate::models::REFERRED_SPECIALIST_AT_ATTR): "",
+            format!("domain_attributes.{}", crate::models::REFERRED_CARD_ID_ATTR): "",
+        },
+        "$set": { "updated_at": now },
+    }
+}
+
+/// POST /api/contacts/:id/clear-referral：撤销引荐，让客户恢复主动运营（红线 §6.3）。
+/// $unset referred_specialist_at + referred_card_id 两键 → escalation 不再注入退辅助
+/// 指引。workspace 隔离防 IDOR（仿 update_assist_override）。无 body。
+pub async fn clear_referral(
+    State(state): State<AppState>,
+    Extension(admin): Extension<AuthenticatedAdmin>,
+    Path(id): Path<String>,
+) -> AppResult<Json<Value>> {
+    let object_id = parse_object_id(&id)?;
+    // workspace 隔离：跨 workspace / 不存在均 404（不泄漏存在性）。
+    find_contact_by_id(&state, &admin.current_workspace, &id).await?;
+    let update = build_clear_referral_update();
+    state
+        .db
+        .contacts()
+        .update_one(
+            doc! { "_id": object_id, "workspace_id": &admin.current_workspace },
+            update,
+            None,
+        )
+        .await?;
+    Ok(Json(json!({ "ok": true })))
+}
+
 /// PUT /api/contacts/:id/assist-override：写客户级辅助模式 override。
 /// default → $unset（回落账号级 assist_mode_enabled）；force_on/force_off → $set。
 /// workspace 隔离防 IDOR。
@@ -1137,5 +1176,25 @@ mod tests {
     fn validate_manual_tags_rejects_too_long() {
         let tags = vec!["x".repeat(MANUAL_TAG_MAX_CHARS + 1)];
         assert!(validate_manual_tags(&tags).is_err(), "超单标签长度应拒绝");
+    }
+
+    #[test]
+    fn clear_referral_unset_doc_drops_both_keys() {
+        // 红线 §6.3：撤销引荐必须 $unset 两个键才彻底退态——
+        // escalation/logic.rs 判 referred_specialist_at 键存在，
+        // 若只 unset 一个键则退辅助指引仍会注入。
+        let update = build_clear_referral_update();
+        let unset = update.get_document("$unset").expect("缺 $unset 子文档");
+        assert!(
+            unset.contains_key("domain_attributes.referred_specialist_at"),
+            "$unset 须含 referred_specialist_at"
+        );
+        assert!(
+            unset.contains_key("domain_attributes.referred_card_id"),
+            "$unset 须含 referred_card_id"
+        );
+        // $set updated_at（与 update_assist_override 写法对齐）。
+        let set = update.get_document("$set").expect("缺 $set 子文档");
+        assert!(set.contains_key("updated_at"), "$set 须刷新 updated_at");
     }
 }
