@@ -96,7 +96,7 @@ mod tests {
     };
 
     /// 用字符拼接构造禁用词，绕过源码字面量（本文件在 lint 扫描区，
-    /// 连续的禁用词字面量会被 check-no-human-takeover 扫到导致误判）。
+    /// 连续的禁用词字面量会被禁词 CI lint 扫到导致误判）。
     fn forbidden_phrase() -> String {
         ["人", "工", "接", "管"].concat()
     }
