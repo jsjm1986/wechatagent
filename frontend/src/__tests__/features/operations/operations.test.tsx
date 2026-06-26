@@ -131,3 +131,93 @@ describe("formatScores 动态遍历(E13)", () => {
     expect(formatScores({})).toBe("-");
   });
 });
+
+describe("决策复盘 reviews tab 拦截四分支(C8)", () => {
+  const mockLoadOperationsData = vi.fn();
+  const mockCurrentAccountId = vi.fn();
+
+  function mountReviewsTab(decisionReviews: any[]) {
+    vi.clearAllMocks();
+    ((globalThis as any).fetch as any) = vi.fn().mockResolvedValue({
+      ok: true,
+      json: () => Promise.resolve({ items: [] }),
+    });
+    (useOperationsStore as any).mockReturnValue({
+      events: [],
+      tasks: [],
+      decisionReviews,
+      llmUsage: null,
+      opsTab: "reviews",
+      setOpsTab: vi.fn(),
+      loadOperationsData: mockLoadOperationsData,
+    });
+    const accountState = {
+      accounts: [
+        { id: "test-account-id", accountId: "test-account-id", alias: "测试", displayName: "测试", online: true },
+      ],
+      selectedAccountId: "test-account-id",
+      currentAccountId: mockCurrentAccountId,
+    };
+    (useAccountStore as any).mockImplementation((selector?: any) =>
+      typeof selector === "function" ? selector(accountState) : accountState
+    );
+    mockCurrentAccountId.mockReturnValue("test-account-id");
+    render(<OperationsFeature />);
+  }
+
+  it("finalReviewStatus 存在时显具体分支标签而非裸「拦截」", () => {
+    mountReviewsTab([
+      {
+        id: "r1",
+        approved: false,
+        finalReviewStatus: "blocked_unverified_product_claim",
+        scores: {},
+        risks: [],
+        status: "blocked",
+      },
+    ]);
+    expect(screen.getByText("未验证产品声明拦截")).toBeInTheDocument();
+    expect(screen.queryByText("拦截", { exact: true })).not.toBeInTheDocument();
+  });
+
+  it("仅 holdCategory 存在时按 HOLD_CATEGORY_LABELS 显标签", () => {
+    mountReviewsTab([
+      {
+        id: "r2",
+        approved: false,
+        holdCategory: "blocked_by_safety_guard",
+        scores: {},
+        risks: [],
+        status: "blocked",
+      },
+    ]);
+    expect(screen.getByText("安全门拦截")).toBeInTheDocument();
+  });
+
+  it("两字段都缺失时回落二元「拦截」(向后兼容)", () => {
+    mountReviewsTab([
+      {
+        id: "r3",
+        approved: false,
+        scores: {},
+        risks: [],
+        status: "blocked",
+      },
+    ]);
+    expect(screen.getByText("拦截", { exact: true })).toBeInTheDocument();
+  });
+
+  it("approved 时显「通过」不受新字段影响", () => {
+    mountReviewsTab([
+      {
+        id: "r4",
+        approved: true,
+        finalReviewStatus: "approved",
+        scores: {},
+        risks: [],
+        status: "sent",
+      },
+    ]);
+    expect(screen.getByText("通过")).toBeInTheDocument();
+  });
+});

@@ -294,6 +294,8 @@ export type DecisionReview = {
   nextBestAction?: Record<string, unknown>;
   sendGatewayResult?: Record<string, unknown>;
   outcomeStatus?: string;
+  finalReviewStatus?: string;
+  holdCategory?: string;
   status: string;
   createdAt?: string;
 };

@@ -59,7 +59,8 @@ pub(super) async fn list_decision_reviews(
         .await?;
     let mut items = Vec::new();
     while let Some(review) = cursor.try_next().await? {
-        items.push(decision_review_json(review));
+        let (frs, hc) = fetch_run_status(&state, review.run_id.as_deref()).await;
+        items.push(decision_review_json(review, frs, hc));
     }
     Ok(Json(json!({ "items": items })))
 }
@@ -82,5 +83,39 @@ pub(super) async fn get_decision_review(
         )
         .await?
         .ok_or_else(|| AppError::NotFound("decision review not found".to_string()))?;
-    Ok(Json(json!({ "item": decision_review_json(review) })))
+    let (frs, hc) = fetch_run_status(&state, review.run_id.as_deref()).await;
+    Ok(Json(json!({ "item": decision_review_json(review, frs, hc) })))
+}
+
+/// 关联同 run_id 的 AgentRunLog，取 final_review_status（顶层 snake 字段）
+/// 与 review doc 内的 holdCategory（camelCase）。纯读投影，缺失则回 None。
+async fn fetch_run_status(
+    state: &AppState,
+    run_id: Option<&str>,
+) -> (Option<String>, Option<String>) {
+    let Some(run_id) = run_id.filter(|s| !s.is_empty()) else {
+        return (None, None);
+    };
+    match state
+        .db
+        .agent_run_logs()
+        .find_one(doc! { "run_id": run_id }, None)
+        .await
+    {
+        Ok(Some(log)) => {
+            let frs = if log.final_review_status.is_empty() {
+                None
+            } else {
+                Some(log.final_review_status.clone())
+            };
+            let hc = log
+                .review
+                .get_str("holdCategory")
+                .ok()
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string());
+            (frs, hc)
+        }
+        _ => (None, None),
+    }
 }

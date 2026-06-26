@@ -1050,7 +1050,11 @@ pub(super) fn llm_call_log_json(item: LlmCallLog) -> Value {
     })
 }
 
-pub(super) fn decision_review_json(review: AgentDecisionReview) -> Value {
+pub(super) fn decision_review_json(
+    review: AgentDecisionReview,
+    final_review_status: Option<String>,
+    hold_category: Option<String>,
+) -> Value {
     json!({
         "id": review.id.map(|id| id.to_hex()).unwrap_or_default(),
         "runId": review.run_id,
@@ -1078,6 +1082,8 @@ pub(super) fn decision_review_json(review: AgentDecisionReview) -> Value {
         "outcomeStatus": review.outcome_status,
         "reactionAnalysis": review.reaction_analysis,
         "status": review.status,
+        "finalReviewStatus": final_review_status,
+        "holdCategory": hold_category,
         "createdAt": crate::models::dt_to_string(review.created_at)
     })
 }
