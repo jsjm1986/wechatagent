@@ -13,7 +13,7 @@ import {
   Undo2,
   X,
 } from "lucide-react";
-import { parseApiError, LlmUnavailableError } from "../../lib/api";
+import { api, parseApiError, LlmUnavailableError } from "../../lib/api";
 import { useConfirm } from "../../components/ui/ConfirmDialog";
 import { useFormDialog } from "../../components/ui/FormDialog";
 import { useToast } from "../../components/ui/Toast";
@@ -189,6 +189,33 @@ export function ChunkInspectorPane({
   }, [chunkId, reloadKey]);
 
   const reload = () => setReloadKey((k) => k + 1);
+  const confirm = useConfirm();
+  const toast = useToast();
+  const [unrelating, setUnrelating] = useState<string | null>(null);
+
+  // E5：解除当前 chunk 指向某目标的关联（DELETE /relate/:target_id 只删关联不删 chunk）。
+  // :id 是源 chunk.id，:target_id 是 related 项的 chunk_id。成功后 reload 刷新关联列表。
+  async function onUnrelate(targetId: string, label: string) {
+    const ok = await confirm({
+      title: "解除这条知识关联？",
+      body: `将移除当前知识指向「${label}」的关联，目标知识本身不受影响。`,
+      tone: "danger",
+      confirmText: "确认解除",
+    });
+    if (!ok) return;
+    setUnrelating(targetId);
+    try {
+      await api.delete(
+        `/api/operation-knowledge/chunks/${encodeURIComponent(chunkId!)}/relate/${encodeURIComponent(targetId)}`,
+      );
+      toast.success("已解除关联");
+      reload();
+    } catch (e: unknown) {
+      toast.error(e instanceof Error ? e.message : String(e));
+    } finally {
+      setUnrelating(null);
+    }
+  }
 
   // P1-4：另一端写入此 chunk 时自动 reload，让两个 admin 同步看到。
   useEffect(() => {
@@ -363,18 +390,33 @@ export function ChunkInspectorPane({
                   {related.map((r, i) => {
                     const target = indexById.get(r.chunk_id);
                     const dead = !target;
+                    const label = target ? target.title : r.chunk_id;
                     return (
-                      <button
-                        type="button"
+                      <div
                         key={`${chunk.id}-irel-${i}`}
                         className={`wikiRelatedChip ${dead ? "dead" : ""}`}
-                        disabled={dead}
-                        onClick={() => focusChunk(r.chunk_id)}
                         title={dead ? "目标 chunk 不在活跃集合" : r.note ?? ""}
                       >
-                        <span className="wikiRelatedKind">{r.kind}</span>
-                        <span className="wikiRelatedTitle">{target ? target.title : r.chunk_id}</span>
-                      </button>
+                        <button
+                          type="button"
+                          className="wikiRelatedJump"
+                          disabled={dead}
+                          onClick={() => focusChunk(r.chunk_id)}
+                        >
+                          <span className="wikiRelatedKind">{r.kind}</span>
+                          <span className="wikiRelatedTitle">{label}</span>
+                        </button>
+                        <button
+                          type="button"
+                          className="wikiRelatedUnrelate"
+                          disabled={unrelating === r.chunk_id}
+                          onClick={() => onUnrelate(r.chunk_id, label)}
+                          title="解除关联"
+                          aria-label="解除关联"
+                        >
+                          {unrelating === r.chunk_id ? "…" : "解除"}
+                        </button>
+                      </div>
                     );
                   })}
                 </div>

@@ -1195,13 +1195,12 @@
     display: inline-flex;
     align-items: center;
     gap: 6px;
-    padding: 4px 10px;
+    padding: 4px 6px 4px 10px;
     font-size: 12px;
     background: rgba(51, 90, 144, 0.06);
     border: 1px solid rgba(51, 90, 144, 0.18);
     color: var(--color-scheduled);
     border-radius: 14px;
-    cursor: pointer;
   }
   .knowledgeWiki .wikiRelatedChip:hover {
     background: rgba(51, 90, 144, 0.12);
@@ -1210,8 +1209,38 @@
     background: #f1f3f4;
     color: #9aa0a6;
     border-color: #e3e6ec;
+  }
+  .knowledgeWiki .wikiRelatedJump {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    background: none;
+    border: none;
+    padding: 0;
+    font-size: inherit;
+    color: inherit;
+    cursor: pointer;
+  }
+  .knowledgeWiki .wikiRelatedJump:disabled {
     cursor: not-allowed;
     text-decoration: line-through;
+  }
+  .knowledgeWiki .wikiRelatedUnrelate {
+    font-size: 10.5px;
+    line-height: 1;
+    padding: 3px 7px;
+    background: rgba(190, 60, 60, 0.08);
+    border: 1px solid rgba(190, 60, 60, 0.22);
+    color: #b3261e;
+    border-radius: 10px;
+    cursor: pointer;
+  }
+  .knowledgeWiki .wikiRelatedUnrelate:hover {
+    background: rgba(190, 60, 60, 0.16);
+  }
+  .knowledgeWiki .wikiRelatedUnrelate:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
   }
   .knowledgeWiki .wikiRelatedKind {
     font-size: 10.5px;
