@@ -2960,6 +2960,23 @@ pub struct AgentToolCall {
     pub updated_at: DateTime,
 }
 
+/// `AgentToolCall.status` 合法闭集（管理 agent 工具调用终态）。
+/// executed_unverified：已执行但业务结果无法核实（spec §3.3，诚实优于好看）。
+pub const ALLOWED_TOOL_CALL_STATUS: &[&str] =
+    &["running", "dry_run", "succeeded", "failed", "executed_unverified"];
+
+/// `agent_tool_calls.status` 写入站点闭集断言。命中闭集外值 panic(debug) / tracing::error!(release)。
+#[track_caller]
+pub fn assert_tool_call_status_valid(status: &str) {
+    if !ALLOWED_TOOL_CALL_STATUS.contains(&status) {
+        let msg = format!(
+            "agent_tool_calls.status='{status}' 不在 ALLOWED_TOOL_CALL_STATUS 闭集 {ALLOWED_TOOL_CALL_STATUS:?}"
+        );
+        debug_assert!(false, "{msg}");
+        tracing::error!(target: "agent_protocol_violation", "{msg}");
+    }
+}
+
 /// S-19 / Task 17：长 horizon 用户运营 outcome 指标。
 ///
 /// `_id` 形如 `"{account_id}:{horizon}:{date}"`，便于幂等聚合（重跑覆盖同 _id）。

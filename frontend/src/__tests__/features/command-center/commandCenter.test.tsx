@@ -73,4 +73,50 @@ describe("CommandCenterFeature", () => {
     render(<CommandCenterFeature />);
     expect(screen.getByText("执行计划")).toBeInTheDocument();
   });
+
+  it("renders confirm/reject buttons when command is pending_confirmation", () => {
+    useCommandStore.setState({
+      commandResult: {
+        id: "run-hex-1",
+        status: "pending_confirmation",
+        summary: "该计划包含高风险操作，等待确认。",
+        toolCalls: [
+          { id: "tc1", toolName: "message_send_text", status: "pending" },
+        ],
+      },
+    });
+    render(<CommandCenterFeature />);
+    expect(screen.getByRole("button", { name: "确认执行" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "否决" })).toBeInTheDocument();
+  });
+
+  it("shows 待核实 marker for executed_unverified tool calls", () => {
+    useCommandStore.setState({
+      commandResult: {
+        id: "run-hex-2",
+        status: "succeeded",
+        summary: "已执行。",
+        toolCalls: [
+          { id: "tc2", toolName: "message_send_text", status: "executed_unverified" },
+        ],
+      },
+    });
+    render(<CommandCenterFeature />);
+    expect(screen.getByText(/待核实/)).toBeInTheDocument();
+  });
+
+  it("does not render confirm button for already succeeded commands", () => {
+    useCommandStore.setState({
+      commandResult: {
+        id: "run-hex-3",
+        status: "succeeded",
+        summary: "已执行。",
+        toolCalls: [
+          { id: "tc3", toolName: "message_send_text", status: "succeeded" },
+        ],
+      },
+    });
+    render(<CommandCenterFeature />);
+    expect(screen.queryByRole("button", { name: "确认执行" })).not.toBeInTheDocument();
+  });
 });

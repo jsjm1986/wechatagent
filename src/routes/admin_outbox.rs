@@ -13,7 +13,6 @@
 
 use axum::{
     extract::{Path, Query, State},
-    http::StatusCode,
     response::{IntoResponse, Response},
     Extension, Json,
 };
@@ -120,7 +119,25 @@ pub(super) async fn cancel_outbox(
     Path(id): Path<String>,
     Json(payload): Json<CancelOutboxRequest>,
 ) -> Result<Response, AppError> {
-    let cancel_reason = payload.cancel_reason.trim().to_string();
+    // 抽内部 fn 后 REST handler 只负责包 Response：成功 200 Json；不可取消时
+    // inner 返 AppError::Conflict("outbox_not_cancelable")，经 IntoResponse 映射
+    // 到 409 + `{"error":"outbox_not_cancelable"}`——与重构前 REST 行为等价。
+    let value = cancel_outbox_inner(&state, &admin.current_workspace, &id, &payload.cancel_reason).await?;
+    Ok(Json(value).into_response())
+}
+
+/// cancel_outbox 的内部核心：校验 cancel_reason → 仅命中本 workspace 下
+/// pending/in_flight 条目原子置 canceled → 写 outbox_canceled 事件 → 返回
+/// `{"item": <entry json>}`。不可取消（终态 / 跨租户 / 不存在）返回
+/// [`AppError::Conflict`]（REST 映射 409，管理 Agent 侧当 Err 处理）。
+/// REST handler 与管理 Agent 工具分支共用此 fn，避免取消逻辑两份漂移。
+pub(in crate::routes) async fn cancel_outbox_inner(
+    state: &AppState,
+    workspace_id: &str,
+    id: &str,
+    cancel_reason: &str,
+) -> AppResult<Value> {
+    let cancel_reason = cancel_reason.trim().to_string();
     if cancel_reason.is_empty() {
         return Err(AppError::BadRequest("cancel_reason 不能为空".to_string()));
     }
@@ -130,7 +147,7 @@ pub(super) async fn cancel_outbox(
             MAX_CANCEL_REASON_LEN
         )));
     }
-    let object_id = parse_object_id(&id)?;
+    let object_id = parse_object_id(id)?;
     let cancelable_statuses: Vec<&str> = [OutboxStatus::Pending, OutboxStatus::InFlight]
         .iter()
         .map(|s| s.as_str())
@@ -148,7 +165,7 @@ pub(super) async fn cancel_outbox(
         .find_one_and_update(
             doc! {
                 "_id": object_id,
-                "workspace_id": &admin.current_workspace,
+                "workspace_id": workspace_id,
                 "status": { "$in": &cancelable_statuses },
             },
             doc! {
@@ -169,14 +186,7 @@ pub(super) async fn cancel_outbox(
         .await?;
 
     let Some(entry) = updated else {
-        return Ok((
-            StatusCode::CONFLICT,
-            Json(json!({
-                "error": "outbox_not_cancelable",
-                "message": "entry not in pending/in_flight"
-            })),
-        )
-            .into_response());
+        return Err(AppError::Conflict("outbox_not_cancelable".to_string()));
     };
 
     // 写一条 outbox_canceled 事件，与用户反应通道写的事件 kind 对齐，便于
@@ -206,7 +216,7 @@ pub(super) async fn cancel_outbox(
         )
         .await;
 
-    Ok(Json(json!({ "item": outbox_entry_json(&entry) })).into_response())
+    Ok(json!({ "item": outbox_entry_json(&entry) }))
 }
 
 /// 解析 `status=pending,in_flight` 形式的逗号分隔列表，并强制每个 token

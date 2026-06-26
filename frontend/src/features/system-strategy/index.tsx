@@ -8,6 +8,7 @@ import type { AgentSoul, PromptTemplate, PromptTemplateDraft, DomainProfile, Dom
 import { ProfilePublishCard } from "../../components/review/ProfilePublishCard";
 import { LessonPromoteCard } from "../../components/review/LessonPromoteCard";
 import { ConfirmProvider } from "../../components/ui/ConfirmDialog";
+import { usePromptSaveConfirm } from "../../components/prompt/usePromptSaveConfirm";
 import { ToastProvider } from "../../components/ui/Toast";
 import styles from "./SystemStrategy.module.css";
 
@@ -2387,7 +2388,6 @@ function SystemStrategyInner() {
     saveSoul,
     publishSoul,
     createPromptTemplate,
-    savePromptTemplate,
     publishPromptTemplate,
     resetSystemPromptPack,
     editSoul,
@@ -2395,6 +2395,9 @@ function SystemStrategyInner() {
     editPromptTemplate,
     newPromptDraftFor,
   } = useStrategyStore();
+
+  // 路径B 二次确认：savePromptTemplate 改为组件层经此 hook 消费三态（needs_human_confirm / reject）。
+  const runSavePrompt = usePromptSaveConfirm();
 
   useEffect(() => {
     void loadStrategyData();
@@ -2414,7 +2417,7 @@ function SystemStrategyInner() {
   };
   const handleSavePromptTemplate = (e: FormEvent) => {
     e.preventDefault();
-    void savePromptTemplate();
+    void runSavePrompt();
   };
 
   return (

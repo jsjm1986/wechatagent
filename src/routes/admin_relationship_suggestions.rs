@@ -112,12 +112,29 @@ pub(super) async fn approve_relationship_suggestion(
     Path(id): Path<String>,
     Json(payload): Json<ApproveSuggestionRequest>,
 ) -> Result<Response, AppError> {
-    let object_id = parse_object_id(&id)?;
+    // 抽内部 fn 后 REST handler 只负责包 Response，业务逻辑全在 inner——
+    // 与管理 Agent 工具分支共用同一份校验 + 写 contact + 改状态流程，行为等价。
+    let value =
+        approve_relationship_suggestion_inner(&state, &admin.current_workspace, &id, payload).await?;
+    Ok(Json(value).into_response())
+}
+
+/// approve_relationship_suggestion 的内部核心：workspace 隔离读 suggestion →
+/// AdminWrite 校验 suggested_value → 写 contact 的 domain_attributes.relationship_type
+/// → mark 建议 approved → 返回 `{"item": <suggestion json>}`。
+/// 跨 workspace / 不存在的 _id 返 NotFound（不泄漏存在性）。
+pub(in crate::routes) async fn approve_relationship_suggestion_inner(
+    state: &AppState,
+    workspace_id: &str,
+    id: &str,
+    payload: ApproveSuggestionRequest,
+) -> AppResult<Value> {
+    let object_id = parse_object_id(id)?;
     let suggestions = state.db.collection_relationship_type_suggestions();
     // 查询带 workspace 过滤：跨 workspace 的 _id 返回 NotFound（不泄漏存在性）。
     let suggestion = suggestions
         .find_one(
-            doc! { "_id": object_id, "workspace_id": &admin.current_workspace },
+            doc! { "_id": object_id, "workspace_id": workspace_id },
             None,
         )
         .await?
@@ -155,7 +172,7 @@ pub(super) async fn approve_relationship_suggestion(
 
     // workspace 隔离取 contact——确认建议指向的 contact 仍在当前 workspace
     // （跨 workspace / 不存在均 404，不写 contact）。
-    find_contact_by_id(&state, &admin.current_workspace, &suggestion.contact_id).await?;
+    find_contact_by_id(state, workspace_id, &suggestion.contact_id).await?;
     let contact_oid = parse_object_id(&suggestion.contact_id)?;
 
     let now = DateTime::now();
@@ -165,7 +182,7 @@ pub(super) async fn approve_relationship_suggestion(
         .db
         .contacts()
         .update_one(
-            doc! { "_id": contact_oid, "workspace_id": &admin.current_workspace },
+            doc! { "_id": contact_oid, "workspace_id": workspace_id },
             doc! {
                 "$set": {
                     "domain_attributes.relationship_type": &canonical,
@@ -196,7 +213,7 @@ pub(super) async fn approve_relationship_suggestion(
         .find_one(doc! { "_id": object_id }, None)
         .await?
         .ok_or_else(|| AppError::NotFound("suggestion not found".to_string()))?;
-    Ok(Json(json!({ "item": relationship_suggestion_json(updated) })).into_response())
+    Ok(json!({ "item": relationship_suggestion_json(updated) }))
 }
 
 pub(super) async fn reject_relationship_suggestion(
