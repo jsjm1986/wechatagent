@@ -336,8 +336,12 @@ pub(super) async fn post_management_message(
         .inserted_id
         .as_object_id()
         .ok_or_else(|| AppError::External("command run id missing".to_string()))?;
-    let requires_confirmation =
-        plan.requires_confirmation || plan.risk_level.eq_ignore_ascii_case("dangerous");
+    let tool_names: Vec<&str> = plan.tool_calls.iter().map(|c| c.tool_name.as_str()).collect();
+    let requires_confirmation = plan.requires_confirmation
+        || plan.risk_level.eq_ignore_ascii_case("dangerous")
+        // §1.2 第一期 dangerous 开关仍关（传 false，不放大权限），但 §4.3 verify/§4.2 irreversible
+        // 恒确认硬门无视开关：安全裁定交代码，不靠 LLM 自报 requiresConfirmation/riskLevel。
+        || plan_requires_confirmation(&tool_names, false);
     // 抽公共执行函数后，"0 还是全部"由调用方传切片控制：requires_confirmation 时传空切片
     // （等价原 take(0)，只暂存不执行），否则传全部 tool_calls（函数内 take(12) 上限保留）。
     // confirm 与 post_message 共用同一执行函数，避免 dual-path drift。
