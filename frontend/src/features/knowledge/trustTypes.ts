@@ -111,12 +111,14 @@ export function parseCompleteness(raw: unknown): CompletenessView {
   };
 }
 
-// 完整性诊断:后端 GET /api/operation-knowledge/integrity-report 真实返回 { item: { total, verified, needsReview, rejected, items[] } }。
+// 完整性诊断:后端 GET /api/operation-knowledge/integrity-report 真实返回 { item: { total, verified, needsReview, rejected, anchorsMissing, items[] } }。
 export interface IntegrityReportView {
   total: number;
   verified: number;
   needsReview: number;
   rejected: number;
+  // D2 降级计数:active 但缺原文锚点(source_anchors 空)的 chunk 数。老后端没这字段则 0。
+  anchorsMissing: number;
 }
 
 export function parseIntegrityReport(raw: unknown): IntegrityReportView {
@@ -127,6 +129,7 @@ export function parseIntegrityReport(raw: unknown): IntegrityReportView {
     verified: Number(o.verified ?? 0),
     needsReview: Number(o.needsReview ?? 0),
     rejected: Number(o.rejected ?? 0),
+    anchorsMissing: Number(o.anchorsMissing ?? 0),
   };
 }
 
