@@ -73,6 +73,22 @@ async function apiGet<T>(url: string): Promise<T> {
   return r.json();
 }
 
+async function apiPut<T>(url: string, body: unknown): Promise<T> {
+  const r = await fetch(url, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!r.ok) throw new Error(await r.text());
+  return r.json();
+}
+
+// runtime-flag GET/PUT 同形（camelCase）；server 钳 rolloutPercent ≤ 100。
+export interface RuntimeFlag {
+  enabled: boolean;
+  rolloutPercent: number;
+}
+
 /// 7 天聚合（client 端从 experiments[] 推算 — 不打额外请求；后端尚未提供专用聚合 endpoint）。
 export function aggregateLast7Days(items: ExperimentItem[]): {
   experiments: number;
@@ -118,6 +134,45 @@ export function EvolutionCenterTab({ enabled = true }: { enabled?: boolean }) {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string>("");
   const [selectedProposalId, setSelectedProposalId] = useState<string | null>(null);
+
+  // ── runtime-flag 灰度控件（workspace 级 enabled + rolloutPercent 0-100）──
+  const [flagEnabled, setFlagEnabled] = useState(false);
+  const [rollout, setRollout] = useState<string>("0");
+  const [flagBusy, setFlagBusy] = useState(false);
+  const [flagMsg, setFlagMsg] = useState<string>("");
+
+  async function loadFlag() {
+    setFlagBusy(true);
+    setFlagMsg("");
+    try {
+      const flag = await apiGet<RuntimeFlag>("/api/evolution/runtime-flag");
+      setFlagEnabled(Boolean(flag.enabled));
+      setRollout(String(flag.rolloutPercent ?? 0));
+    } catch (e) {
+      setFlagMsg(e instanceof Error ? e.message : String(e));
+    } finally {
+      setFlagBusy(false);
+    }
+  }
+
+  async function saveFlag() {
+    setFlagBusy(true);
+    setFlagMsg("");
+    try {
+      const pct = Math.max(0, Math.min(100, Number(rollout) || 0));
+      const flag = await apiPut<RuntimeFlag>("/api/evolution/runtime-flag", {
+        enabled: flagEnabled,
+        rolloutPercent: pct,
+      });
+      setFlagEnabled(Boolean(flag.enabled));
+      setRollout(String(flag.rolloutPercent ?? pct));
+      setFlagMsg("灰度配置已保存");
+    } catch (e) {
+      setFlagMsg(e instanceof Error ? e.message : String(e));
+    } finally {
+      setFlagBusy(false);
+    }
+  }
 
   async function load() {
     if (!enabled) return;
@@ -166,6 +221,42 @@ export function EvolutionCenterTab({ enabled = true }: { enabled?: boolean }) {
           testid="agg-significance"
         />
       </header>
+
+      <div className={styles.flagPanel} data-testid="runtime-flag-panel">
+        <div className={styles.flagRow}>
+          <label className={styles.flagToggle}>
+            <input
+              type="checkbox"
+              checked={flagEnabled}
+              onChange={(e) => setFlagEnabled(e.target.checked)}
+              disabled={flagBusy}
+            />
+            <span>启用演化灰度</span>
+          </label>
+          <label className={styles.flagField}>
+            <span>灰度比例（%）</span>
+            <input
+              type="number"
+              min={0}
+              max={100}
+              value={rollout}
+              onChange={(e) => setRollout(e.target.value)}
+              disabled={flagBusy}
+            />
+          </label>
+          <button className={styles.btnGhost} onClick={() => void loadFlag()} disabled={flagBusy}>
+            读取当前配置
+          </button>
+          <button className={styles.btnPrimary} onClick={() => void saveFlag()} disabled={flagBusy}>
+            保存灰度
+          </button>
+        </div>
+        {flagMsg && (
+          <div className={styles.flagMsg} data-testid="runtime-flag-msg">
+            {flagMsg}
+          </div>
+        )}
+      </div>
 
       <div className={styles.toolbar}>
         <button className={styles.btnGhost} onClick={() => void load()} disabled={loading}>
