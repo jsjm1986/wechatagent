@@ -22,12 +22,38 @@ describe("EscalationInline", () => {
       await fn();
     });
     render(<EscalationInline item={item} ctx={{ busy: false, runAction }} />);
+    fireEvent.change(screen.getByLabelText(/裁决类型/), { target: { value: "approved" } });
     fireEvent.change(screen.getByPlaceholderText(/裁决意见/), { target: { value: "可以给8折" } });
-    fireEvent.click(screen.getByText("批准"));
+    fireEvent.click(screen.getByText("提交裁决"));
     await waitFor(() =>
       expect(api.post).toHaveBeenCalledWith(
         "/api/admin/principal-escalations/ESC1/resolve",
         expect.objectContaining({ verdict: "approved", substance: "可以给8折" }),
+      ),
+    );
+  });
+
+  it("选 conditional 时显示授权窗输入,提交 body 含 constraints+authorizationWindowHours", async () => {
+    const runAction = vi.fn(async (fn: () => Promise<unknown>) => {
+      await fn();
+    });
+    render(<EscalationInline item={item} ctx={{ busy: false, runAction }} />);
+    // 选择 conditional 裁决
+    fireEvent.change(screen.getByLabelText(/裁决类型/), { target: { value: "conditional" } });
+    // 授权窗输入出现
+    const win = screen.getByLabelText(/授权窗/);
+    fireEvent.change(win, { target: { value: "48" } });
+    fireEvent.change(screen.getByPlaceholderText(/约束条款/), { target: { value: "仅限本月" } });
+    fireEvent.change(screen.getByPlaceholderText(/裁决意见/), { target: { value: "有条件同意" } });
+    fireEvent.click(screen.getByText("提交裁决"));
+    await waitFor(() =>
+      expect(api.post).toHaveBeenCalledWith(
+        "/api/admin/principal-escalations/ESC1/resolve",
+        expect.objectContaining({
+          verdict: "conditional",
+          authorizationWindowHours: 48,
+          constraints: ["仅限本月"],
+        }),
       ),
     );
   });
