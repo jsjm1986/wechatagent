@@ -1417,6 +1417,18 @@ function ProfileEditor({
                   update({ profile_dimensions: dims });
                 }}
               />
+              <label className={styles.inlineCheckbox}>
+                <input
+                  type="checkbox"
+                  checked={dim.participates_in_decision}
+                  onChange={(e) => {
+                    const dims = [...(draft.profile_dimensions ?? [])];
+                    dims[i] = { ...dim, participates_in_decision: e.target.checked };
+                    update({ profile_dimensions: dims });
+                  }}
+                />
+                进决策
+              </label>
               <button
                 type="button"
                 className={styles.btnGhost}
