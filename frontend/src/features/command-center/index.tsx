@@ -24,6 +24,25 @@ function planStepStatus(call: CommandToolCall): PlanStepStatus {
   return call.status === "succeeded" || call.status === "dry_run" ? "ready" : "pending";
 }
 
+// tool call 终态标签：闭集见 src/routes/management.rs CommandToolCall.status。
+// executed_unverified = 工具 Ok 但业务结果未核实，必须显「待核实」不当成功展示（诚实优于好看）。
+function callStatusLabel(status: string): string {
+  switch (status) {
+    case "succeeded":
+      return "✅ 成功";
+    case "failed":
+      return "❌ 失败";
+    case "executed_unverified":
+      return "⚠️ 待核实";
+    case "dry_run":
+      return "演练";
+    case "running":
+      return "进行中";
+    default:
+      return status;
+  }
+}
+
 // 工具调用 detail 摘要：dry-run 时摊开 would_execute；真实执行时打出网关/发送结果。
 function commandCallDetail(call: CommandToolCall): string {
   if (call.error) return call.error;
@@ -84,7 +103,9 @@ export default function CommandCenterFeature() {
     setCommandDraft,
     setCommandDryRun,
     loadCommandData,
-    runCommand
+    runCommand,
+    confirmCommand,
+    rejectCommand
   } = useCommandStore();
 
   useEffect(() => {
@@ -181,6 +202,28 @@ export default function CommandCenterFeature() {
               <p>{commandResult.summary}</p>
             </div>
           )}
+
+          {commandResult?.status === "pending_confirmation" && (
+            <div className={styles.confirmBar}>
+              <span className={styles.confirmHint}>该计划包含高风险操作，确认前不会真实执行。</span>
+              <div className={styles.confirmActions}>
+                <button
+                  className={styles.confirmBtn}
+                  onClick={() => confirmCommand(commandResult.id)}
+                  disabled={commandBusy}
+                >
+                  确认执行
+                </button>
+                <button
+                  className={styles.rejectBtn}
+                  onClick={() => rejectCommand(commandResult.id)}
+                  disabled={commandBusy}
+                >
+                  否决
+                </button>
+              </div>
+            </div>
+          )}
         </section>
 
         {/* —— 执行计划 —— */}
@@ -198,7 +241,7 @@ export default function CommandCenterFeature() {
                 <PlanStep
                   key={call.id || call.toolName}
                   status={planStepStatus(call)}
-                  title={call.toolName}
+                  title={`${call.toolName} · ${callStatusLabel(call.status)}`}
                   detail={commandCallDetail(call)}
                 />
               ))}
