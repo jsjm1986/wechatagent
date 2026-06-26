@@ -142,6 +142,10 @@ pub(super) async fn update_prompt_template(
     Json(payload): Json<PromptTemplateRequest>,
 ) -> AppResult<Json<Value>> {
     validate_prompt_template_input(&payload)?;
+    // 自然语言编辑硬门（fail-closed）：三层分级 + 字面双闸（禁用词 + 锚完整性）。
+    // 单点拦截——无论走管理 agent 工具还是管理员直接 PUT，命中即拒、不落库。
+    crate::routes::management_prompt_edit::validate_prompt_edit(&payload.prompt_key, &payload.content)
+        .map_err(AppError::BadRequest)?;
     let object_id = parse_object_id(&id)?;
     state
         .db
@@ -159,6 +163,10 @@ pub(super) async fn update_prompt_template(
                     "title": payload.title,
                     "description": normalize_optional(payload.description),
                     "content": payload.content,
+                    // 防 PR#42 启动对齐 align_prompt_specs 把被编辑的系统种子行
+                    // （seeded_by="system" 且内容≠DEFAULT）归档重种回 DEFAULT。
+                    // 置 "manual" 让 align 跳过，保住管理者编辑活过重启。
+                    "seeded_by": "manual",
                     "updated_at": DateTime::now()
                 }
             },

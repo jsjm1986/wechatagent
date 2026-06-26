@@ -55,6 +55,7 @@ pub mod knowledge;
 mod lessons_learned;
 mod llm_providers;
 mod management;
+mod management_prompt_edit;
 // pub（非默认私有）：annotation_quality_gate_integration.rs 集成测试需从 tests/
 // crate 直调 review_media_asset handler 真函数（缺口 3 审核审计落库），仿
 // domain_profiles / ask_human_inbox 先例。生产路由注册仍走下方 use。
