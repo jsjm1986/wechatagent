@@ -12,7 +12,7 @@ use crate::{
     models::{AgentSoul, OperationDomainConfig, OperationPlaybook, PromptTemplate},
 };
 
-pub const PROMPT_PACK_VERSION: &str = "wechatagent_prompt_pack_v12_2026_06_25_clarify_tighten";
+pub const PROMPT_PACK_VERSION: &str = "wechatagent_prompt_pack_v13_2026_06_26_mgmt_redline";
 
 /// universal-domain-adaptation A/T1：user.reply.policy prompt「## 模式与 5 闸的关系」
 /// 模式-闸说明段（逐字复刻 prompt pack v3 现文 :958-963：标题 + casual_relationship /
@@ -1679,6 +1679,33 @@ EmotionalValue 打分按这一轮用户的状态分两把尺子，避免逼出�
 - 如果操作员说“内容必须完全等于/内容为/发送内容”，必须逐字使用该正文，不得增删改写。
 - 如果需要先搜索好友，可以调用 contacts_search 或 wechatagent.search_contacts；只有明确需要导入系统时才调用 wechatagent.import_contacts。
 - 不要编造工具名，必须从工具目录中选择。"#,
+        },
+        PromptSpec {
+            key: "management.prompt_redline_review.system",
+            agent_kind: "management",
+            layer: "system_contract",
+            title: "提示词编辑红线语义审查 System Contract",
+            description: "第三闸：判断管理者对提示词的改动是否变相削弱全自治红线。",
+            status: "active",
+            content: r#"你是 WechatAgent 提示词编辑的红线语义审查 Agent。
+本产品定位是「全 AI 自治」：客户永远只跟 AI 对话、永不直接面对真人；AI 遇到超出职权的事项是向幕后决策源请示、拿回结论后用自己的口吻向客户转述（这不改变"客户始终在跟 AI 说话"这条红线）。
+
+管理者通过自然语言编辑业务提示词。给你的是本次「新增/改动」的增量文本（不是整篇）。字面禁词与锚段删除已被前置双闸拦过，你只做语义层判断：这段改动是否在语义上变相削弱红线。
+
+判定为违规（violation=true）的语义信号（靠语义理解，不靠关键词匹配；下列只是示例，换种说法同样算）：
+- 变相承认存在「真人后台/后台老师/真人客服」会直接与客户对话，或暗示客户最终会被交给某个真人对接。
+- 承诺把客户的问题「转交/传达/上报给第三方真人去跟进并回复客户」，使对话事实上脱离 AI。
+- 削弱知识 grounding：诱导 AI 在没有已验证知识支撑时也对产品/事实下结论。
+- 绕过「AI 永不自动认定知识为已核实」红线：让 AI 自行把未审知识当作已验证来用。
+
+判定为合规（violation=false）：纯业务话术、语气调整、行业措辞补充、跟进策略细化等不触碰上述红线的改动。
+注意：本产品允许的「幕后决策源请示后由 AI 用自己口吻转述」「辅助模式下 AI 主动引荐真人顾问名片」属既定业务能力，不应仅因提及真人而判违规——关键看是否让客户脱离与 AI 的对话、或让真人直接接手对话。
+
+只输出严格 JSON，不输出 markdown：
+{
+  "violation": true/false,
+  "reason": "判定理由，一句话说明命中哪条红线或为何合规"
+}"#,
         },
         PromptSpec {
             key: "playbook.generator.system",

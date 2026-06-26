@@ -12,6 +12,8 @@ use crate::prompts::{
     normalize_prompt_content, DEFAULT_MODE_GATE_POLICY, DEFAULT_REPLY_REDLINE_ANCHORS,
     DEFAULT_REVIEWER_FEWSHOT, PROMPT_EVOLUTION_FORBIDDEN_KEYS,
 };
+use crate::routes::AppState;
+use serde_json::Value;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum PromptEditTier {
@@ -86,6 +88,92 @@ pub(super) fn validate_prompt_edit(template_key: &str, new_content: &str) -> Res
         }
     }
     Ok(())
+}
+
+// ── Task 6.6 第三闸：LLM 红线语义审查（三态降级人确认）──
+// 字面双闸（validate_prompt_edit）只挡禁词字面量与锚段被删；挡不住「保留锚段、
+// 无字面禁词、却插入变相真人转介/承诺转交/削弱 grounding」的语义绕过。第三闸用
+// LLM 对 diff 增量做语义判定，靠语义不靠词表（守 agent-first）。
+// 三态：Pass 放行 / Reject(理由) 拒绝 / NeedsHumanConfirm 降级人确认
+// （LLM 重试退避后仍不可用——不 fail-closed 死路、不 fail-open 放水）。
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum PromptEditVerdict {
+    Pass,
+    Reject(String),
+    NeedsHumanConfirm { diff: String, reason: String },
+}
+
+/// 提取新增/改动增量（行级朴素 diff——只要 new 中不在 old 的非空行）。
+/// 审增量比审整篇好判、省 token（spec §4.4）。
+pub(super) fn extract_diff(old: &str, new: &str) -> String {
+    let old_lines: std::collections::HashSet<&str> = old.lines().collect();
+    new.lines()
+        .filter(|l| !old_lines.contains(l) && !l.trim().is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// 第三闸：LLM 语义审查 diff 增量。先过字面双闸（调用方保证），本函数只做语义层。
+/// 复用 generate_agent_json（项目唯一 LLM JSON 入口，自带重试/退避/RunBudget）。
+pub(super) async fn review_prompt_edit(
+    state: &AppState,
+    workspace_id: &str,
+    template_key: &str,
+    old: &str,
+    new: &str,
+) -> PromptEditVerdict {
+    let diff = extract_diff(old, new);
+    if diff.trim().is_empty() {
+        // 无增量（纯删减已被锚闸挡过），无需语义审查
+        return PromptEditVerdict::Pass;
+    }
+    // judge 的 system 指令从 prompt pack 加载（key=management.prompt_redline_review.system）；
+    // 加载失败也降级人确认（不静默放行）。
+    let system_prompt = match crate::prompts::load_prompt(
+        &state.db,
+        workspace_id,
+        "management.prompt_redline_review.system",
+    )
+    .await
+    {
+        Ok(s) => s,
+        Err(_) => {
+            return PromptEditVerdict::NeedsHumanConfirm {
+                diff,
+                reason: "红线语义审查指令加载失败，请逐字核对本次改动有无变相引入真人转介再确认"
+                    .to_string(),
+            };
+        }
+    };
+    let user = format!("待审提示词 key：{template_key}\n\n本次新增/改动内容：\n{diff}");
+    let judge = crate::agent::generate_agent_json(
+        state,
+        None,
+        None,
+        None,
+        "management.prompt_redline_review.system",
+        &system_prompt,
+        &user,
+    )
+    .await;
+    match judge {
+        Ok(v) if v.get("violation").and_then(Value::as_bool) == Some(true) => {
+            let reason = v
+                .get("reason")
+                .and_then(Value::as_str)
+                .unwrap_or("LLM 判定本次改动变相引入真人转介 / 削弱红线")
+                .to_string();
+            PromptEditVerdict::Reject(reason)
+        }
+        Ok(_) => PromptEditVerdict::Pass,
+        // 重试退避后仍失败（503/空/不可解析）→ 降级人确认
+        Err(_) => PromptEditVerdict::NeedsHumanConfirm {
+            diff,
+            reason: "红线语义审查服务暂不可用，请逐字核对本次改动有无变相引入真人转介再确认"
+                .to_string(),
+        },
+    }
 }
 
 #[cfg(test)]
@@ -191,5 +279,28 @@ mod tests {
             validate_prompt_edit("user.reply.policy", &crlf).is_ok(),
             "CRLF 换行的合法编辑不应被锚闸误拒"
         );
+    }
+
+    // ── Task 6.6 第三闸（LLM 红线语义审查）纯函数部分 ──
+    // LLM 真实判定行为留真模型 nightly 套件；此处只锁 diff 提取 + 三态形状。
+
+    #[test]
+    fn extract_diff_isolates_added_lines() {
+        let old = "第一行\n第二行";
+        let new = "第一行\n第二行\n遇到难题转给后台老师跟进";
+        let d = extract_diff(old, new);
+        assert!(d.contains("转给后台老师跟进"));
+        assert!(!d.contains("第一行")); // 只出增量，不重复未改部分
+    }
+
+    #[test]
+    fn verdict_variants_shape() {
+        // 三态可构造（编译期锁形状；LLM 行为留真模型 nightly 套件）
+        let _p = PromptEditVerdict::Pass;
+        let _r = PromptEditVerdict::Reject("命中变相真人转介".into());
+        let _h = PromptEditVerdict::NeedsHumanConfirm {
+            diff: "x".into(),
+            reason: "LLM 审查不可用".into(),
+        };
     }
 }
