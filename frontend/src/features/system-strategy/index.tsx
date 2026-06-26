@@ -45,6 +45,8 @@ type TaxonomyEntry = ActiveVersionMeta & {
     description?: string;
     aliases?: string[];
     status: string;
+    isReactivationTarget?: boolean;
+    isTerminal?: boolean;
   };
 };
 
@@ -55,9 +57,17 @@ type TaxonomyDraft = {
   label: string;
   aliases: string;
   description: string;
+  isReactivationTarget: boolean;
+  isTerminal: boolean;
 };
 
-type EditDraft = { label: string; aliases: string; description: string };
+type EditDraft = {
+  label: string;
+  aliases: string;
+  description: string;
+  isReactivationTarget: boolean;
+  isTerminal: boolean;
+};
 
 type LessonLearnedEntry = {
   lessonId: string;
@@ -614,11 +624,13 @@ function TaxonomiesAdmin({ busy }: { busy: boolean }) {
     label: "",
     aliases: "",
     description: "",
+    isReactivationTarget: false,
+    isTerminal: false,
   });
   const [acting, setActing] = useState(false);
   const [info, setInfo] = useState<string | null>(null);
   const [editingId, setEditingId] = useState<string | null>(null);
-  const [editDraft, setEditDraft] = useState<EditDraft>({ label: "", aliases: "", description: "" });
+  const [editDraft, setEditDraft] = useState<EditDraft>({ label: "", aliases: "", description: "", isReactivationTarget: false, isTerminal: false });
 
   async function reload() {
     setLoading(true);
@@ -659,6 +671,8 @@ function TaxonomiesAdmin({ busy }: { busy: boolean }) {
           label: createDraft.label.trim(),
           aliases,
           description: createDraft.description.trim() || undefined,
+          isTerminal: createDraft.isTerminal,
+          isReactivationTarget: createDraft.isReactivationTarget,
         },
       });
       if (res.status === 409) {
@@ -669,7 +683,7 @@ function TaxonomiesAdmin({ busy }: { busy: boolean }) {
       } else {
         setInfo(`已新增：${createDraft.id.trim()}`);
         setShowCreate(false);
-        setCreateDraft({ scope: "global", kind: "customer_stage", id: "", label: "", aliases: "", description: "" });
+        setCreateDraft({ scope: "global", kind: "customer_stage", id: "", label: "", aliases: "", description: "", isReactivationTarget: false, isTerminal: false });
       }
       await reload();
     } catch (e) {
@@ -693,6 +707,8 @@ function TaxonomiesAdmin({ busy }: { busy: boolean }) {
         label: editDraft.label.trim(),
         aliases,
         description: editDraft.description.trim(),
+        isTerminal: editDraft.isTerminal,
+        isReactivationTarget: editDraft.isReactivationTarget,
       });
       setInfo("已更新。");
       setEditingId(null);
@@ -804,6 +820,22 @@ function TaxonomiesAdmin({ busy }: { busy: boolean }) {
             <textarea className={styles.textarea} value={createDraft.description}
               onChange={(e) => setCreateDraft({ ...createDraft, description: e.target.value })} />
           </label>
+          <label className={styles.inlineCheckbox}>
+            <input
+              type="checkbox"
+              checked={createDraft.isReactivationTarget}
+              onChange={(e) => setCreateDraft({ ...createDraft, isReactivationTarget: e.target.checked })}
+            />
+            可作再激活目标 is_reactivation_target
+          </label>
+          <label className={styles.inlineCheckbox}>
+            <input
+              type="checkbox"
+              checked={createDraft.isTerminal}
+              onChange={(e) => setCreateDraft({ ...createDraft, isTerminal: e.target.checked })}
+            />
+            终态 is_terminal
+          </label>
           <div className={styles.buttonRow}>
             <button type="button" className={styles.btnPrimary} onClick={() => void submitCreate()} disabled={acting}>保存</button>
             <button type="button" className={styles.btnGhost} onClick={() => setShowCreate(false)} disabled={acting}>取消</button>
@@ -852,7 +884,7 @@ function TaxonomiesAdmin({ busy }: { busy: boolean }) {
             {editingId !== item.id && item.currentVersion !== false && (
               <div className={styles.buttonRow}>
                 <button type="button" className={styles.btnGhost}
-                  onClick={() => { setShowCreate(false); setEditingId(item.id); setEditDraft({ label: item.value.label, aliases: (item.value.aliases ?? []).join("，"), description: item.value.description ?? "" }); setInfo(null); setError(null); }}
+                  onClick={() => { setShowCreate(false); setEditingId(item.id); setEditDraft({ label: item.value.label, aliases: (item.value.aliases ?? []).join("，"), description: item.value.description ?? "", isReactivationTarget: item.value.isReactivationTarget ?? false, isTerminal: item.value.isTerminal ?? false }); setInfo(null); setError(null); }}
                   disabled={busy || acting}>编辑</button>
                 {item.value.status === "active" ? (
                   <button type="button" className={styles.btnGhost} onClick={() => void deprecateEntry(item.id)} disabled={busy || acting}>废弃</button>
@@ -877,6 +909,22 @@ function TaxonomiesAdmin({ busy }: { busy: boolean }) {
                   <span>描述（可空）</span>
                   <textarea className={styles.textarea} value={editDraft.description}
                     onChange={(e) => setEditDraft({ ...editDraft, description: e.target.value })} />
+                </label>
+                <label className={styles.inlineCheckbox}>
+                  <input
+                    type="checkbox"
+                    checked={editDraft.isReactivationTarget}
+                    onChange={(e) => setEditDraft({ ...editDraft, isReactivationTarget: e.target.checked })}
+                  />
+                  可作再激活目标 is_reactivation_target
+                </label>
+                <label className={styles.inlineCheckbox}>
+                  <input
+                    type="checkbox"
+                    checked={editDraft.isTerminal}
+                    onChange={(e) => setEditDraft({ ...editDraft, isTerminal: e.target.checked })}
+                  />
+                  终态 is_terminal
                 </label>
                 <div className={styles.buttonRow}>
                   <button type="button" className={styles.btnPrimary} onClick={() => void submitEdit(item.id)} disabled={acting}>保存编辑</button>
@@ -1945,6 +1993,149 @@ function ProfileEditor({
             承诺到期 commitment
           </label>
         </div>
+      </details>
+
+      <details className={styles.advanced}>
+        <summary>高级：交易/评审/轨迹（发布危险字段）</summary>
+        <p className={styles.panelHint}>
+          交易事实注入 / 评审取向 / 模式说明属发布危险字段，改动经发布确认流（riskyFields）二次确认。
+        </p>
+        <div className={styles.formGrid}>
+          <label className={styles.inlineCheckbox}>
+            <input
+              type="checkbox"
+              checked={draft.transaction_facts_enabled ?? false}
+              onChange={(e) => update({ transaction_facts_enabled: e.target.checked })}
+            />
+            交易型域（注入产品目录 + 持有事实）transaction_facts_enabled
+          </label>
+        </div>
+        <label className={styles.field}>
+          <span>评审重点 review_focus</span>
+          <input
+            className={styles.input}
+            type="text"
+            value={draft.reviewer_orientation?.reviewFocus ?? ""}
+            onChange={(e) =>
+              update({
+                reviewer_orientation: {
+                  ...(draft.reviewer_orientation ?? {}),
+                  reviewFocus: e.target.value || undefined,
+                },
+              })
+            }
+          />
+        </label>
+        <label className={styles.field}>
+          <span>平衡原则 balance_principle</span>
+          <input
+            className={styles.input}
+            type="text"
+            value={draft.reviewer_orientation?.balancePrinciple ?? ""}
+            onChange={(e) =>
+              update({
+                reviewer_orientation: {
+                  ...(draft.reviewer_orientation ?? {}),
+                  balancePrinciple: e.target.value || undefined,
+                },
+              })
+            }
+          />
+        </label>
+        <label className={styles.field}>
+          <span>模式-闸说明覆盖 mode_gate_policy_override</span>
+          <textarea
+            className={styles.textarea}
+            value={draft.mode_gate_policy_override ?? ""}
+            onChange={(e) => update({ mode_gate_policy_override: e.target.value || undefined })}
+          />
+        </label>
+        <label className={styles.field}>
+          <span>去抖窗口（毫秒）debounce_window_ms_override</span>
+          <input
+            className={styles.input}
+            type="number"
+            value={draft.debounce_window_ms_override ?? ""}
+            onChange={(e) =>
+              update({
+                debounce_window_ms_override: e.target.value ? Number(e.target.value) : undefined,
+              })
+            }
+          />
+        </label>
+      </details>
+
+      <details className={styles.advanced}>
+        <summary>按关系类型分配运营范式（数字分身 per_relationship）</summary>
+        <p className={styles.panelHint}>
+          为不同关系类型(customer/peer/friend)各配一套范式。未配的关系类型回落 profile 级 operation_mode。
+        </p>
+        {(["customer", "peer", "friend"] as const).map((rt) => {
+          const map = draft.per_relationship_operation_mode ?? {};
+          const mode = map[rt];
+          const enabled = !!mode;
+          const setMode = (next: typeof mode | undefined) => {
+            const nextMap = { ...(draft.per_relationship_operation_mode ?? {}) };
+            if (next === undefined) {
+              delete nextMap[rt];
+            } else {
+              nextMap[rt] = next;
+            }
+            update({ per_relationship_operation_mode: nextMap });
+          };
+          return (
+            <div key={rt} className={styles.formGrid} data-testid={`per-rel-${rt}`}>
+              <label className={styles.inlineCheckbox}>
+                <input
+                  type="checkbox"
+                  checked={enabled}
+                  onChange={(e) =>
+                    setMode(
+                      e.target.checked
+                        ? { funnel: { enabled: true }, silence: { enabled: true }, commitment: { enabled: true }, quiet_hours: {} }
+                        : undefined,
+                    )
+                  }
+                />
+                为 {rt} 单独配置范式
+              </label>
+              {enabled && mode && (
+                <>
+                  <label className={styles.inlineCheckbox}>
+                    <input
+                      type="checkbox"
+                      checked={mode.funnel?.enabled ?? true}
+                      onChange={(e) =>
+                        setMode({ ...mode, funnel: { ...(mode.funnel ?? { enabled: true }), enabled: e.target.checked } })
+                      }
+                    />
+                    漏斗推进 funnel
+                  </label>
+                  <label className={styles.inlineCheckbox}>
+                    <input
+                      type="checkbox"
+                      checked={mode.silence?.enabled ?? true}
+                      onChange={(e) =>
+                        setMode({ ...mode, silence: { ...(mode.silence ?? { enabled: true }), enabled: e.target.checked } })
+                      }
+                    />
+                    沉默唤醒 silence
+                  </label>
+                  <label className={styles.inlineCheckbox}>
+                    <input
+                      type="checkbox"
+                      checked={mode.commitment?.enabled ?? true}
+                      onChange={(e) =>
+                        setMode({ ...mode, commitment: { ...(mode.commitment ?? { enabled: true }), enabled: e.target.checked } })
+                      }
+                    />
+                    承诺到期 commitment
+                  </label>
+                </>
+              )}
+            </div>
+          );
+        })}
       </details>
 
       <details className={styles.advanced}>

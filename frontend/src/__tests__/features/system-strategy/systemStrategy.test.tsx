@@ -133,7 +133,7 @@ describe("TaxonomiesAdmin 新增条目", () => {
     expect(postRaw).toHaveBeenCalledWith("/api/admin/taxonomies", {
       scope: "global",
       kind: "customer_stage",
-      value: { id: "need_discovery", label: "需求挖掘", aliases: ["挖需求", "需求探索", "探需"], description: undefined },
+      value: { id: "need_discovery", label: "需求挖掘", aliases: ["挖需求", "需求探索", "探需"], description: undefined, isTerminal: false, isReactivationTarget: false },
     });
   });
 });
@@ -176,7 +176,7 @@ describe("TaxonomiesAdmin 编辑与废弃恢复", () => {
     fireEvent.click(screen.getByText("保存编辑"));
     await waitFor(() => expect(patch).toHaveBeenCalled());
     expect(patch).toHaveBeenCalledWith("/api/admin/taxonomies/id_active", {
-      label: "需求探索阶段", aliases: ["挖需求"], description: "",
+      label: "需求探索阶段", aliases: ["挖需求"], description: "", isTerminal: false, isReactivationTarget: false,
     });
   });
 

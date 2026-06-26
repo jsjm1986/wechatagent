@@ -120,4 +120,55 @@ describe("AutonomyFeature — 一体化频道（新视觉壳）", () => {
     });
     expect(screen.getAllByText(/33\.3%（1 条）/)).toHaveLength(3);
   });
+
+  it("revision 行 finalReviewStatus/holdCategory 逐行中文化(C7)", async () => {
+    // 单条 revision: finalReviewStatus=held_by_ai_policy 经 reviewLabels 翻译为 "AI 策略主动暂缓",
+    // holdCategory=blocked_by_safety_guard 翻译为 "安全门拦截"。原始英文枚举不应再出现在表格。
+    const metrics = metricsBody();
+    globalThis.fetch = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      const body = url.includes("/revisions")
+        ? {
+            items: [
+              {
+                runId: "run-1",
+                contactWxid: "wx-1",
+                contactName: "客户甲",
+                preReplyExcerpt: "改前",
+                postReplyExcerpt: "改后",
+                preRevisionSummary: "前摘要",
+                postRevisionSummary: "后摘要",
+                revisionDirection: "更克制",
+                finalReviewStatus: "held_by_ai_policy",
+                holdCategory: "blocked_by_safety_guard",
+                selfCritique: null,
+                createdAt: "2026-06-26T00:00:00Z",
+              },
+            ],
+          }
+        : metrics;
+      return {
+        ok: true,
+        status: 200,
+        async json() {
+          return body;
+        },
+        async text() {
+          return JSON.stringify(body);
+        },
+      } as unknown as Response;
+    }) as typeof fetch;
+
+    render(<AutonomyOutcomesTab accountId="acc-1" />);
+
+    await waitFor(() => {
+      expect(screen.getByText("客户甲")).toBeInTheDocument();
+    });
+    // finalReviewStatus 中文化:hold bar(1) + revision 行(1) = 2 处出现，原 raw 枚举不出现。
+    expect(screen.getAllByText("AI 策略主动暂缓").length).toBeGreaterThanOrEqual(2);
+    expect(screen.queryByText("held_by_ai_policy")).not.toBeInTheDocument();
+    // holdCategory 中文化:hold bar(1) + revision 行(1)。
+    expect(screen.getAllByText("安全门拦截").length).toBeGreaterThanOrEqual(2);
+    expect(screen.queryByText("blocked_by_safety_guard")).not.toBeInTheDocument();
+  });
 });

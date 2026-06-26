@@ -294,6 +294,8 @@ export type DecisionReview = {
   nextBestAction?: Record<string, unknown>;
   sendGatewayResult?: Record<string, unknown>;
   outcomeStatus?: string;
+  finalReviewStatus?: string;
+  holdCategory?: string;
   status: string;
   createdAt?: string;
 };
@@ -576,6 +578,19 @@ export type OperationMode = {
   quiet_hours: QuietHoursMode;
 };
 
+// D7：reviewer 评审取向覆盖。对齐后端 ReviewerOrientation(models.rs:1939)。
+export type ReviewerOrientation = {
+  reviewFocus?: string | null;
+  balancePrinciple?: string | null;
+  reviewerFewshotOverride?: string | null;
+};
+
+// D7/H17：intent 轨迹维度声明。对齐后端 TrajectoryDimension(models.rs:4067)。
+export type TrajectoryDimension = {
+  kind: string;
+  display_name: string;
+};
+
 // 五闸阈值覆盖。对齐后端 ProfileThresholds（#[serde(rename_all = "camelCase")]）。
 // 字段为 undefined/缺省 = 不覆盖该闸，沿用该域默认（销售域 6/7/6/6/7）。
 export type ProfileThresholds = {
@@ -629,8 +644,16 @@ export type DomainProfile = {
   memory_dimensions?: MemoryDimension[];
   outcome_polarity?: OutcomePolarity;
   operation_mode?: OperationMode;
+  transaction_facts_enabled?: boolean;
+  reviewer_orientation?: ReviewerOrientation | null;
+  mode_gate_policy_override?: string | null;
+  trajectory_dimensions?: TrajectoryDimension[];
+  debounce_window_ms_override?: number | null;
   // H13：AI 生成状态机本体（draft），激活前供审阅；激活后运行时读 operation_domain_configs。
   generated_state_machine?: GeneratedStateMachine | null;
+  // D8：按 relationship_type 分配运营范式（数字分身三级回落中间层）。后端 models.rs:1763
+  // per_relationship_operation_mode: Option<BTreeMap<String, OperationMode>>，键为 relationship_type。
+  per_relationship_operation_mode?: Record<string, OperationMode> | null;
   version: number;
   current_version: boolean;
   previous_version: number | null;
@@ -662,6 +685,12 @@ export type DomainProfileDraft = {
   memory_dimensions?: MemoryDimension[];
   outcome_polarity?: OutcomePolarity;
   operation_mode?: OperationMode;
+  transaction_facts_enabled?: boolean;
+  reviewer_orientation?: ReviewerOrientation;
+  mode_gate_policy_override?: string;
+  trajectory_dimensions?: TrajectoryDimension[];
+  debounce_window_ms_override?: number;
+  per_relationship_operation_mode?: Record<string, OperationMode>;
 };
 
 export type GenerateProfileRequest = {

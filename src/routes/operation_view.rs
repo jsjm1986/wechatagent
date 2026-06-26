@@ -59,6 +59,9 @@ pub async fn active_view(
     if !kinds.iter().any(|k| k == "relationship_type") {
         kinds.push("relationship_type".to_string());
     }
+    if !kinds.iter().any(|k| k == "conversation_mode") {
+        kinds.push("conversation_mode".to_string());
+    }
 
     // 4) 预热进程级 taxonomy cache（冷 / 过期缓存会返回空，必须先 find_or_load）。
     let cache = crate::agent::taxonomy::global_taxonomy_cache();
