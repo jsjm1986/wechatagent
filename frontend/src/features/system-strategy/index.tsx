@@ -2214,6 +2214,7 @@ function DomainProfilePanel({ busy }: { busy: boolean }) {
     deleteDomainProfile,
     generateDomainProfile,
   } = useStrategyStore();
+  const isCreatingProfile = useStrategyStore((s) => s.isCreatingProfile);
 
   const [gen_pid, setGen_pid] = useState("");
   const [gen_display_name, setGen_display_name] = useState("");
@@ -2224,7 +2225,8 @@ function DomainProfilePanel({ busy }: { busy: boolean }) {
   }, [loadDomainProfiles]);
 
   const activeProfile = domainProfiles.find((p) => p.is_active);
-  const editing = editingProfile !== null;
+  // D5：editingProfile 非空（编辑既有）或 isCreatingProfile（手动新建空白）时都渲染编辑器。
+  const editing = editingProfile !== null || isCreatingProfile;
 
   function handleProfileClick(profile: DomainProfile) {
     editDomainProfile(profile);
@@ -2394,9 +2396,7 @@ function DomainProfilePanel({ busy }: { busy: boolean }) {
               profile={editingProfile}
               draft={profileDraft}
               onChange={setProfileDraft}
-              onSave={() => {
-                if (editingProfile) void saveDomainProfile(editingProfile.id);
-              }}
+              onSave={() => void saveDomainProfile()}
               onDelete={() => {
                 if (editingProfile) void deleteDomainProfile(editingProfile.id);
               }}
