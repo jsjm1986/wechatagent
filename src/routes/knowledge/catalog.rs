@@ -138,12 +138,27 @@ pub(in crate::routes) async fn get_operation_knowledge_integrity_report(
     let account_id = query
         .account_id
         .unwrap_or_else(|| state.config.default_account_id.clone());
+    let item =
+        build_operation_knowledge_integrity_report(&state, &admin.current_workspace, &account_id)
+            .await?;
+    Ok(Json(json!({ "item": item })))
+}
+
+/// 构建 integrity-report 主体（可被集成测直接调用，绕过 axum HTTP harness）。
+///
+/// `anchorsMissing` = D2 降级计数：`status=="active" && source_anchors.is_empty()`
+/// （对齐 digest_inbox.rs:455）。在同一 cursor 内累加，零额外查询。
+pub async fn build_operation_knowledge_integrity_report(
+    state: &AppState,
+    workspace_id: &str,
+    account_id: &str,
+) -> AppResult<Value> {
     let mut cursor = state
         .db
         .operation_knowledge_chunks()
         .find(
             doc! {
-                "workspace_id": &admin.current_workspace,
+                "workspace_id": workspace_id,
                 "domain": "user_operations",
                 "$or": [
                     { "account_id": null },
@@ -160,9 +175,14 @@ pub(in crate::routes) async fn get_operation_knowledge_integrity_report(
     let mut verified = 0;
     let mut needs_review = 0;
     let mut rejected = 0;
+    let mut anchors_missing = 0;
     let mut items = Vec::new();
     while let Some(chunk) = cursor.try_next().await? {
         total += 1;
+        // D2 降级口径（对齐 digest_inbox.rs:455）：active 但缺原文锚点。
+        if chunk.status == "active" && chunk.source_anchors.is_empty() {
+            anchors_missing += 1;
+        }
         match chunk.integrity_status.as_deref().unwrap_or("needs_review") {
             "verified" => verified += 1,
             "rejected" => rejected += 1,
@@ -178,15 +198,14 @@ pub(in crate::routes) async fn get_operation_knowledge_integrity_report(
             }));
         }
     }
-    Ok(Json(json!({
-        "item": {
-            "total": total,
-            "verified": verified,
-            "needsReview": needs_review,
-            "rejected": rejected,
-            "items": items
-        }
-    })))
+    Ok(json!({
+        "total": total,
+        "verified": verified,
+        "needsReview": needs_review,
+        "rejected": rejected,
+        "anchorsMissing": anchors_missing,
+        "items": items
+    }))
 }
 
 pub(in crate::routes) async fn search_operation_knowledge_tool(

@@ -114,7 +114,8 @@ pub mod ext_knowledge {
     // 的真模型链路；红线由测试侧硬断言锁（chat 起草只产 proposal 永不自动落库；
     // completeness answeringMode ∈ 闭集、绝不触发 auto-verify）。
     pub use super::knowledge::{
-        build_operation_knowledge_completeness, chat_turn, ChatTurnRequest,
+        build_operation_knowledge_completeness, build_operation_knowledge_integrity_report,
+        chat_turn, ChatTurnRequest,
     };
     // real-LLM 召回基准 maintenance / 闭环轨迹测试：chat_turn 只产 pending 草稿预览，
     // 真正落库 draft chunk + 回填 createdChunkId 的是独立的 chat_apply（两步
@@ -1084,6 +1085,9 @@ mod tests {
             // knowledge.rs：完整度审计内核 helper，被 get/refresh completeness 两个 handler
             // 复用、不直接绑 HTTP；real_llm_knowledge.rs K11 通过 `pub use` 直调真模型审计。
             "build_operation_knowledge_completeness",
+            // catalog.rs：integrity-report 审计内核 helper，被 get integrity-report handler
+            // 复用、不直接绑 HTTP；integrity_report_d2_e2e.rs 通过 `pub use` 直调做 D2 降级断言。
+            "build_operation_knowledge_integrity_report",
             // domain_schemas.rs：D1-b active schema 加载 helper，被 chunk 写侧
             // （apply_chunk_revision）复用做 domain_attributes 校验，不直接绑 HTTP。
             "load_active_domain_schema",
