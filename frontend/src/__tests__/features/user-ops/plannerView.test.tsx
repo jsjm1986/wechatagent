@@ -53,4 +53,22 @@ describe("PlannerViewSection 多维度看板(A4)", () => {
     render(<PlannerViewSection contact={c} />);
     expect(screen.queryByText("价值分层")).not.toBeInTheDocument();
   });
+
+  it("仅有额外维度(无 stage/commitments/mode)时仍渲染(守卫上提回归)", () => {
+    setStore(
+      [{ kind: "value_tier", displayName: "价值分层", participatesInDecision: true }],
+      { value_tier: [{ id: "vip", label: "VIP" }] },
+    );
+    // 无 domainAttributesUpdatedAt → hasStage=false；commitments 空；无 lastConversationMode。
+    // 仅 domainAttributes 携带一个非 customer_stage 的额外维度取值。
+    const c = {
+      wxid: "wx-extra-only",
+      domainAttributes: { value_tier: "vip" },
+      commitments: [],
+    } as unknown as Contact;
+    render(<PlannerViewSection contact={c} />);
+    expect(screen.getByTestId("planner-view-section")).toBeInTheDocument();
+    expect(screen.getByText("价值分层")).toBeInTheDocument();
+    expect(screen.getByText("VIP")).toBeInTheDocument();
+  });
 });
