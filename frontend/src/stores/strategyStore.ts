@@ -3,6 +3,17 @@ import type { AgentSoul, PromptTemplate, PromptTemplateDraft, DomainProfile, Dom
 import { api } from "../lib/api";
 import { useUiStore } from "./uiStore";
 
+// Task 8（路径B）：prompt 编辑保存的三态结果。后端 Task 6.6 第三闸：
+// - Pass / force → {ok:true}（200）
+// - NeedsHumanConfirm → 200 body {status:"needs_human_confirm", reason, diff}（非错误，必须从返回体读，不能静默当成功）
+// - Reject → 4xx，api 抛 Error，message 含「红线语义审查拒绝」
+// store 保持无 UI 依赖：只翻译成结构化结果返回，弹框交给组件层。
+export type SavePromptResult =
+  | { ok: true }
+  | { needsConfirm: true; reason: string; diff: string }
+  | { rejected: true; reason: string }
+  | { error: true; reason: string };
+
 interface StrategyState {
   souls: AgentSoul[];
   promptTemplates: PromptTemplate[];
@@ -28,7 +39,7 @@ interface StrategyActions {
   saveSoul: () => Promise<void>;
   publishSoul: (id: string) => Promise<void>;
   createPromptTemplate: () => Promise<void>;
-  savePromptTemplate: () => Promise<void>;
+  savePromptTemplate: (force?: boolean) => Promise<SavePromptResult>;
   publishPromptTemplate: (id: string) => Promise<void>;
   resetSystemPromptPack: () => Promise<void>;
   editSoul: (soul: AgentSoul) => void;
@@ -61,14 +72,16 @@ function emptyPromptTemplateDraft(): PromptTemplateDraft {
   };
 }
 
-function promptPayload(draft: PromptTemplateDraft) {
+function promptPayload(draft: PromptTemplateDraft, force?: boolean) {
   return {
     promptKey: draft.promptKey,
     agentKind: draft.agentKind,
     layer: draft.layer,
     title: draft.title,
     description: draft.description || undefined,
-    content: draft.content
+    content: draft.content,
+    // force=true：管理者已逐字核对，覆盖 LLM 红线语义审查（字面双闸仍跑）。
+    ...(force ? { force: true } : {})
   };
 }
 
@@ -182,18 +195,35 @@ export const useStrategyStore = create<StrategyState & StrategyActions>((set, ge
     }
   },
 
-  savePromptTemplate: async () => {
+  savePromptTemplate: async (force?: boolean): Promise<SavePromptResult> => {
     const { editingPromptId, promptDraft } = get();
-    if (!editingPromptId || !promptDraft.promptKey.trim() || !promptDraft.title.trim() || !promptDraft.content.trim()) return;
+    if (!editingPromptId || !promptDraft.promptKey.trim() || !promptDraft.title.trim() || !promptDraft.content.trim()) {
+      return { error: true, reason: "缺少必要字段" };
+    }
 
     useUiStore.getState().setBusy(true);
     useUiStore.getState().setError("");
 
     try {
-      await api.put(`/api/prompt-templates/${editingPromptId}`, promptPayload(promptDraft));
+      const resp = await api.put<{ status?: string; reason?: string; diff?: string }>(
+        `/api/prompt-templates/${editingPromptId}`,
+        promptPayload(promptDraft, force)
+      );
+      // 真 bug 修复：needs_human_confirm 是 200，不能当成功 reload。
+      if (resp && resp.status === "needs_human_confirm") {
+        return { needsConfirm: true, reason: resp.reason ?? "", diff: resp.diff ?? "" };
+      }
       await get().loadStrategyData();
+      return { ok: true };
     } catch (error) {
-      useUiStore.getState().setError(error instanceof Error ? error.message : String(error));
+      const message = error instanceof Error ? error.message : String(error);
+      // Reject：后端 4xx body {error:"红线语义审查拒绝：…"} → api 抛 Error(message)。
+      // 交组件层弹「逐字核对 + force 覆盖」，不进全局 setError（否则与普通错误混淆）。
+      if (message.includes("红线语义审查拒绝")) {
+        return { rejected: true, reason: message };
+      }
+      useUiStore.getState().setError(message);
+      return { error: true, reason: message };
     } finally {
       useUiStore.getState().setBusy(false);
     }
