@@ -57,4 +57,21 @@ describe("EscalationInline", () => {
       ),
     );
   });
+
+  it("改派提交 toWxid 到 reassign 端点", async () => {
+    const runAction = vi.fn(async (fn: () => Promise<unknown>) => {
+      await fn();
+    });
+    render(<EscalationInline item={item} ctx={{ busy: false, runAction }} />);
+    fireEvent.change(screen.getByPlaceholderText(/备选决策人/), {
+      target: { value: "wxid_backup" },
+    });
+    fireEvent.click(screen.getByText("改派"));
+    await waitFor(() =>
+      expect(api.post).toHaveBeenCalledWith(
+        "/api/admin/principal-escalations/ESC1/reassign",
+        { toWxid: "wxid_backup" },
+      ),
+    );
+  });
 });
