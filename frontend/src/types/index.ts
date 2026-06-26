@@ -578,9 +578,9 @@ export type OperationMode = {
 
 // D7：reviewer 评审取向覆盖。对齐后端 ReviewerOrientation(models.rs:1939)。
 export type ReviewerOrientation = {
-  review_focus?: string | null;
-  balance_principle?: string | null;
-  pressure_few_shot?: string | null;
+  reviewFocus?: string | null;
+  balancePrinciple?: string | null;
+  reviewerFewshotOverride?: string | null;
 };
 
 // D7/H17：intent 轨迹维度声明。对齐后端 TrajectoryDimension(models.rs:4067)。

@@ -10,7 +10,7 @@ describe("D7 profile 高级字段", () => {
       business_formulas: [], commitment_markers: { product_effect: [], tone_only: [] },
       coverage_dimensions: [],
       transaction_facts_enabled: true,
-      reviewer_orientation: { review_focus: "情感共鸣", balance_principle: "陪伴优先" },
+      reviewer_orientation: { reviewFocus: "情感共鸣", balancePrinciple: "陪伴优先" },
       mode_gate_policy_override: "自定模式说明",
       trajectory_dimensions: [{ kind: "emotion", display_name: "情绪轨迹" }],
       debounce_window_ms_override: 8000,
@@ -20,7 +20,7 @@ describe("D7 profile 高级字段", () => {
     useStrategyStore.getState().editDomainProfile(profile);
     const d = useStrategyStore.getState().profileDraft;
     expect(d.transaction_facts_enabled).toBe(true);
-    expect(d.reviewer_orientation?.review_focus).toBe("情感共鸣");
+    expect(d.reviewer_orientation?.reviewFocus).toBe("情感共鸣");
     expect(d.mode_gate_policy_override).toBe("自定模式说明");
     expect(d.trajectory_dimensions?.[0].kind).toBe("emotion");
     expect(d.debounce_window_ms_override).toBe(8000);
