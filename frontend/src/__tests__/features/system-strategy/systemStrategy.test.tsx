@@ -321,3 +321,57 @@ describe("DomainProfile 维度配置 participates_in_decision", () => {
     expect(lastArg.profile_dimensions[0].description).toBe("客户对价格的敏感程度");
   });
 });
+
+describe("DomainProfile completeness 维度 anchor_hint+initial_signal", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.spyOn(api, "get").mockResolvedValue({ items: [] } as never);
+    useUiStore.setState({
+      busy: false,
+      error: "",
+      setBusy: vi.fn(),
+      setError: vi.fn(),
+    });
+  });
+
+  // 让 ProfileEditor 进入编辑态并塞入一条 coverage_dimension，setProfileDraft 改成 spy，
+  // 断言 anchor_hint / initial_signal 两输入框 onChange 写回数组该项且不误删其它字段。
+  function seedProfileDraftWithCoverage(setProfileDraft: (draft: DomainProfileDraft) => void) {
+    useStrategyStore.setState({
+      editingProfile: null,
+      isCreatingProfile: true,
+      profileDraft: {
+        profile_id: "test_profile",
+        display_name: "测试配置",
+        coverage_dimensions: [{ key: "need", display_name: "需求", required: true }],
+      },
+      setProfileDraft,
+      loadDomainProfiles: vi.fn(),
+    });
+  }
+
+  it("D11: completeness 维度可编辑 anchor_hint 与 initial_signal 并提交", async () => {
+    const setProfileDraft = vi.fn();
+    seedProfileDraftWithCoverage(setProfileDraft);
+
+    render(<SystemStrategyFeature />);
+
+    // anchor_hint 输入框写入文本 → 写回该行 anchor_hint，保留 key/display_name/required
+    const anchorInput = await screen.findByPlaceholderText(/anchor_hint/i);
+    fireEvent.change(anchorInput, { target: { value: "在对话开场探明" } });
+    await waitFor(() => expect(setProfileDraft).toHaveBeenCalled());
+    let lastArg = setProfileDraft.mock.calls.at(-1)?.[0];
+    expect(lastArg.coverage_dimensions[0].anchor_hint).toBe("在对话开场探明");
+    expect(lastArg.coverage_dimensions[0].key).toBe("need");
+    expect(lastArg.coverage_dimensions[0].display_name).toBe("需求");
+    expect(lastArg.coverage_dimensions[0].required).toBe(true);
+
+    // initial_signal 输入框写入文本 → 写回该行 initial_signal
+    const signalInput = screen.getByPlaceholderText(/initial_signal/i);
+    fireEvent.change(signalInput, { target: { value: "客户主动提及预算" } });
+    await waitFor(() => expect(setProfileDraft.mock.calls.length).toBeGreaterThan(1));
+    lastArg = setProfileDraft.mock.calls.at(-1)?.[0];
+    expect(lastArg.coverage_dimensions[0].initial_signal).toBe("客户主动提及预算");
+    expect(lastArg.coverage_dimensions[0].key).toBe("need");
+  });
+});
