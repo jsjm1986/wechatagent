@@ -5,7 +5,7 @@ import styles from "./McpKeyForm.module.css";
 
 /// 账号 MCP 密钥配置表单。密钥是敏感值：输入框用 password 型、不回显已存值，
 /// 仅以「已配置」布尔提示状态；提交后立即清空输入，不在前端残留明文。
-/// body 键为 snake_case（后端 UpdateAccountMcpKeyRequest：mcp_api_key / mcp_base_url）。
+/// body 键为 camelCase（后端 UpdateAccountMcpKeyRequest 带 #[serde(rename_all = "camelCase")]：mcpApiKey / mcpBaseUrl）。
 export function McpKeyForm({ accountId, configured }: { accountId: string; configured: boolean }) {
   const [key, setKey] = useState("");
   const [baseUrl, setBaseUrl] = useState("");
@@ -23,8 +23,8 @@ export function McpKeyForm({ accountId, configured }: { accountId: string; confi
     setSaved(false);
     try {
       await api.put(`/api/accounts/${accountId}/mcp-key`, {
-        mcp_api_key: key,
-        ...(baseUrl.trim() ? { mcp_base_url: baseUrl.trim() } : {}),
+        mcpApiKey: key,
+        ...(baseUrl.trim() ? { mcpBaseUrl: baseUrl.trim() } : {}),
       });
       setKey("");
       setBaseUrl("");
