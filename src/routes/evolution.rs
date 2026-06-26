@@ -553,6 +553,9 @@ pub(super) struct UpdateRuntimeFlagRequest {
     /// 操作者审计字段；可选（未登录态写 "admin" 默认值）。
     #[serde(default)]
     updated_by: Option<String>,
+    /// EVO-3:per-workspace 自动 release 子闸。None 时不改(保持 upsert 既有值)。
+    #[serde(default)]
+    threshold_auto_release_enabled: Option<bool>,
 }
 
 /// `GET /api/evolution/runtime-flag` —— Phase C / C3 当前灰度配置。
@@ -593,20 +596,24 @@ pub(super) async fn put_evolution_runtime_flag(
         .unwrap_or(DEFAULT_RELEASE_ADMIN);
     let now = DateTime::now();
 
+    let mut set_fields = doc! {
+        "workspace_id": &workspace_id,
+        "enabled": payload.enabled,
+        "rollout_percent": rollout_percent as i64,
+        "updated_by": updated_by,
+        "updated_at": now,
+    };
+    // EVO-3:子闸字段 None 时不写($set 缺省即保持 upsert 既有值)。
+    if let Some(v) = payload.threshold_auto_release_enabled {
+        set_fields.insert("threshold_auto_release_enabled", v);
+    }
+
     state
         .db
         .evolution_runtime_flags()
         .update_one(
             doc! { "workspace_id": &workspace_id },
-            doc! {
-                "$set": {
-                    "workspace_id": &workspace_id,
-                    "enabled": payload.enabled,
-                    "rollout_percent": rollout_percent as i64,
-                    "updated_by": updated_by,
-                    "updated_at": now,
-                }
-            },
+            doc! { "$set": set_fields },
             mongodb::options::UpdateOptions::builder().upsert(true).build(),
         )
         .await?;
@@ -692,6 +699,7 @@ fn runtime_flag_json(f: &EvolutionRuntimeFlag) -> Value {
         "enabled": f.enabled,
         "rolloutPercent": f.rollout_percent_clamped(),
         "rolloutPercentRaw": f.rollout_percent,
+        "thresholdAutoReleaseEnabled": f.threshold_auto_release_enabled,
         "updatedBy": f.updated_by,
         "updatedAt": datetime_to_rfc3339(f.updated_at),
     })
