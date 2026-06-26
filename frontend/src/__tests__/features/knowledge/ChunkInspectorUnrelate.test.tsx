@@ -99,4 +99,64 @@ describe("ChunkInspectorPane — E5 解除关联 unrelate", () => {
       );
     });
   });
+
+  it("dead 关联项（target 不在活跃集合）解除按钮仍可点且 DELETE 正常打出", async () => {
+    // 覆盖默认 fetch：源 chunk 关联指向不在 items 里的目标 → 该关联项为 dead。
+    globalThis.fetch = vi.fn(async (url: unknown) => {
+      const u = String(url);
+      if (u.includes("/lock")) {
+        const body = { lock: { owner_user_id: "u1", owner_username: "admin", expires_at: "" } };
+        return {
+          ok: true,
+          status: 200,
+          async json() {
+            return body;
+          },
+          async text() {
+            return JSON.stringify(body);
+          },
+        } as unknown as Response;
+      }
+      // 注意：items 里没有 TARGET_ID，故关联项 dead（跳转禁用、解除仍可用）。
+      const body = {
+        items: [
+          {
+            id: SOURCE_ID,
+            title: "源知识",
+            relatedChunks: [{ chunk_id: TARGET_ID, kind: "supports", note: null }],
+          },
+        ],
+      };
+      return {
+        ok: true,
+        status: 200,
+        async json() {
+          return body;
+        },
+        async text() {
+          return JSON.stringify(body);
+        },
+      } as unknown as Response;
+    }) as typeof fetch;
+
+    const delSpy = vi
+      .spyOn(api, "delete")
+      .mockResolvedValue({ ok: true, removed: 1 } as never);
+    const user = userEvent.setup();
+    renderInspector();
+
+    // dead 项的解除按钮仍可点（disabled 只看 unrelating 态，不看 dead）。
+    const unrelateBtn = await screen.findByRole("button", { name: "解除关联" });
+    expect(unrelateBtn).not.toBeDisabled();
+    await user.click(unrelateBtn);
+
+    const confirmBtn = await screen.findByText("确认解除");
+    await user.click(confirmBtn);
+
+    await waitFor(() => {
+      expect(delSpy).toHaveBeenCalledWith(
+        `/api/operation-knowledge/chunks/${SOURCE_ID}/relate/${TARGET_ID}`,
+      );
+    });
+  });
 });
