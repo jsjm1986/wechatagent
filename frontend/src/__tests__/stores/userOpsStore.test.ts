@@ -122,6 +122,40 @@ describe("userOpsStore.saveOperatingMemory", () => {
   });
 });
 
+describe("userOpsStore.saveOperationProfile", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    useContactStore.setState({ contacts: [], selected: null, contactTab: "all" });
+    useUserOpsStore.setState({ relationshipType: "", profileEditDraft: {} } as any);
+  });
+
+  it("无选中联系人时早退、不调 api.put", async () => {
+    await useUserOpsStore.getState().saveOperationProfile();
+    expect(api.put).not.toHaveBeenCalled();
+  });
+
+  it("提交 relationshipType + lastCommitment + followUpPolicy，且 body 不含 AI 派生字段", async () => {
+    useContactStore.setState({ selected: contact("c1") });
+    useUserOpsStore.setState({
+      relationshipType: "customer",
+      profileEditDraft: { lastCommitment: "下周回复", followUpPolicy: "每周跟进" },
+    } as any);
+    await useUserOpsStore.getState().saveOperationProfile();
+    expect(api.put).toHaveBeenCalledWith(
+      "/api/contacts/c1/operation-profile",
+      expect.objectContaining({
+        relationshipType: "customer",
+        lastCommitment: "下周回复",
+        followUpPolicy: "每周跟进",
+      }),
+    );
+    // customer_stage/intent_level 由 AI 派生，前端只读，不应出现在 body
+    const body = (api.put as any).mock.calls[0][1] as Record<string, unknown>;
+    expect(body).not.toHaveProperty("customerStage");
+    expect(body).not.toHaveProperty("intentLevel");
+  });
+});
+
 describe("userOpsStore.setMemoryDraft", () => {
   beforeEach(() => {
     vi.clearAllMocks();

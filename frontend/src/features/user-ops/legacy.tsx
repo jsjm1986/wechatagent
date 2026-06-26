@@ -198,6 +198,7 @@ export function UserOperationCockpit({
   customAgentInstructions,
   assistOverride,
   relationshipType,
+  profileEditDraft,
   selected,
   selectedPlaybookId,
   simulationBusy,
@@ -213,6 +214,7 @@ export function UserOperationCockpit({
   onCustomAgentInstructions,
   onAssistOverride,
   onRelationshipType,
+  onProfileEditDraftChange,
   onRunMemoryConsolidation,
   onRunSimulation,
   onSaveProfileNote,
@@ -242,6 +244,7 @@ export function UserOperationCockpit({
   customAgentInstructions: string;
   assistOverride: string;
   relationshipType: string;
+  profileEditDraft: { lastCommitment?: string; followUpPolicy?: string };
   selected: Contact | null;
   selectedPlaybookId: string;
   simulationBusy: boolean;
@@ -257,6 +260,7 @@ export function UserOperationCockpit({
   onCustomAgentInstructions: (value: string) => void;
   onAssistOverride: (mode: string) => void;
   onRelationshipType: (value: string) => void;
+  onProfileEditDraftChange: (patch: Partial<{ lastCommitment: string; followUpPolicy: string }>) => void;
   onRunMemoryConsolidation: () => void;
   onRunSimulation: () => void;
   onSaveProfileNote: () => void;
@@ -570,6 +574,31 @@ export function UserOperationCockpit({
             <button className="secondary" onClick={onSaveRelationshipType} disabled={busy} type="button">
               <SquarePen size={16} />
               保存客户类型
+            </button>
+          </label>
+          <label>
+            <span>最近承诺（last_commitment）</span>
+            <small>运营可编辑：记录对客户作出的最近一条承诺，影响 AI 跟进话术。</small>
+            <textarea
+              rows={2}
+              value={profileEditDraft.lastCommitment ?? ""}
+              onChange={(event) => onProfileEditDraftChange({ lastCommitment: event.target.value })}
+              placeholder="例：本周内给到方案报价"
+            />
+          </label>
+          <label>
+            <span>跟进策略（follow_up_policy）</span>
+            <small>运营可编辑：约定主动跟进的节奏/边界，影响 AI 触达频率。</small>
+            <textarea
+              rows={2}
+              value={profileEditDraft.followUpPolicy ?? ""}
+              onChange={(event) => onProfileEditDraftChange({ followUpPolicy: event.target.value })}
+              placeholder="例：每周跟进一次，客户明确拒绝则停止"
+            />
+            <small>客户阶段 / 意向等级由 AI 派生，前端只读，此处不编辑。</small>
+            <button className="secondary" onClick={onSaveRelationshipType} disabled={busy} type="button">
+              <SquarePen size={16} />
+              保存运营画像
             </button>
           </label>
           <div className="buttonRow">
