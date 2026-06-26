@@ -49,6 +49,25 @@ pub const DEFAULT_REVIEWER_FEWSHOT: &str = r#"软闸打分锚点（few-shot，�
 - EmotionalValue：8 分例「这事儿确实挺熬人的，你能扛到现在已经很不容易了」（具体共情、肯定对方处境）；3 分例「建议您理性看待，纠结这些没有意义」（说教、否定情绪、缺乏支持）。
 - PressureRisk：8 分（高压，应拦）例「今天最后一天，错过再等一年，现在就定吧」（制造稀缺、催促、逼单）；1 分（低压）例「你先慢慢看，有想法随时找我」（给空间、不施压、尊重节奏）。"#;
 
+/// management-prompt-edit Task 6.5：反接管红线锚段。
+///
+/// 与 [`DEFAULT_MODE_GATE_POLICY`] 故意不含红线（见
+/// `default_mode_gate_policy_excludes_human_takeover_redline`）形成互补——
+/// 真红线在 user.reply.policy 正文 :1123（boundary_protection 续行）与
+/// :1146（表达红线反接管段）。这两条是从正文**逐字复制**的独特单行子串，
+/// 供 `management_prompt_edit::validate_prompt_edit` 的锚完整性闸据此校验：
+/// 管理者经自然语言写回 prompt_templates 时，红线段逐字仍在才放行，缺失即拒、
+/// fail-closed（堵旧锚闸只查业务锚、红线被删却能放行的漏洞）。
+///
+/// 一个字都不能差，否则 `contains` 校验会静默失配——护栏测试
+/// `reply_redline_anchors_present_in_pack` 锁死与正文一致。
+pub const DEFAULT_REPLY_REDLINE_ANCHORS: &[&str] = &[
+    // user.reply.policy boundary_protection 反接管续行（正文逐字子串；此段正文用 ASCII 直引号）
+    "用户要求\"真人 / 不想跟机器人聊\"时，用 AI 自治语义承接",
+    // user.reply.policy 表达红线反接管段（正文逐字子串；此段正文用 ASCII 直引号）
+    "严禁承诺\"安排真人 / 让同事来联系 / 稍后有人对接你 / 转接客服\"",
+];
+
 /// 取 contact.locale，缺字段（旧文档）回落到 [`DEFAULT_LOCALE`]。
 pub fn contact_locale_or_default(locale: Option<&str>) -> &str {
     match locale {
@@ -2479,6 +2498,30 @@ mod reviewer_fewshot_anchor_tests {
         assert!(DEFAULT_REVIEWER_FEWSHOT.contains("现在就定吧"));
         // 锚到 PressureRisk 那条为止，不含其后独立的 EmotionalValue 打分细则。
         assert!(!DEFAULT_REVIEWER_FEWSHOT.contains("两把尺子"));
+    }
+}
+
+#[cfg(test)]
+mod reply_redline_anchor_tests {
+    use super::*;
+
+    /// 锚漂移护栏：[`DEFAULT_REPLY_REDLINE_ANCHORS`] 每条必须是 user.reply.policy
+    /// prompt 正文（:1123/:1146 反接管红线段）的**逐字子串**，否则
+    /// `management_prompt_edit::validate_prompt_edit` 的锚完整性闸会因字节失配而
+    /// 误判（无法据正文校验红线是否被删）。锚改 / 正文改任一即红。
+    #[test]
+    fn reply_redline_anchors_present_in_pack() {
+        let specs = prompt_specs();
+        let policy = specs
+            .iter()
+            .find(|s| s.key == "user.reply.policy")
+            .expect("user.reply.policy prompt spec 存在");
+        for anchor in DEFAULT_REPLY_REDLINE_ANCHORS {
+            assert!(
+                policy.content.contains(anchor),
+                "DEFAULT_REPLY_REDLINE_ANCHORS 锚 `{anchor}` 与 user.reply.policy 正文不一致，锚完整性闸会失配"
+            );
+        }
     }
 }
 
