@@ -4,6 +4,7 @@ import SystemStrategyFeature from "../../../features/system-strategy";
 import { api } from "../../../lib/api";
 import { useStrategyStore } from "../../../stores/strategyStore";
 import { useUiStore } from "../../../stores/uiStore";
+import type { ProfileDimension, DomainProfileDraft } from "../../../types";
 
 // CSS module identity mock：vitest 默认 css:false 会把 styles.xxx 解析为 undefined，
 // 导致 className 不落到 DOM、无法按 .inlineError / .badgeOk 定位。这里把 CSS module
@@ -266,5 +267,111 @@ describe("TaxonomiesAdmin 边界", () => {
     expect(screen.getByText(/状态机灰度.*同步配置/)).toBeInTheDocument();
     fireEvent.change(screen.getByPlaceholderText("customer_stage"), { target: { value: "intent_level" } });
     expect(screen.queryByText(/状态机灰度.*同步配置/)).not.toBeInTheDocument();
+  });
+});
+
+describe("DomainProfile 维度配置 participates_in_decision", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.spyOn(api, "get").mockResolvedValue({ items: [] } as never);
+    useUiStore.setState({
+      busy: false,
+      error: "",
+      setBusy: vi.fn(),
+      setError: vi.fn(),
+    });
+  });
+
+  // 让 DomainProfilePanel 进入编辑态（isCreatingProfile=true 渲染右侧 ProfileEditor），
+  // 并塞入一条 participates_in_decision=true 的维度。setProfileDraft 改成 spy，断言 onChange 写回。
+  function seedProfileDraftWithDimension(setProfileDraft: (draft: DomainProfileDraft) => void) {
+    const dim: ProfileDimension = {
+      kind: "budget_sensitivity",
+      display_name: "预算敏感度",
+      participates_in_decision: true,
+      description: "客户对价格的敏感程度",
+    };
+    useStrategyStore.setState({
+      editingProfile: null,
+      isCreatingProfile: true,
+      profileDraft: { profile_id: "test_profile", display_name: "测试配置", profile_dimensions: [dim] },
+      setProfileDraft,
+      loadDomainProfiles: vi.fn(),
+    });
+  }
+
+  it("D10: 维度行可切换 participates_in_decision 为只观测维度", async () => {
+    const setProfileDraft = vi.fn();
+    seedProfileDraftWithDimension(setProfileDraft);
+
+    render(<SystemStrategyFeature />);
+
+    // 维度行的「进决策」复选框初始为 checked（participates_in_decision=true）
+    const checkbox = await screen.findByRole("checkbox", { name: "进决策" });
+    expect(checkbox).toBeChecked();
+
+    // 取消勾选 → onChange/update 写回该维度 participates_in_decision=false
+    fireEvent.click(checkbox);
+    await waitFor(() => expect(setProfileDraft).toHaveBeenCalled());
+    const lastArg = setProfileDraft.mock.calls.at(-1)?.[0];
+    expect(lastArg.profile_dimensions[0].participates_in_decision).toBe(false);
+    // 其余字段保持不变（不误删 kind/display_name/description）
+    expect(lastArg.profile_dimensions[0].kind).toBe("budget_sensitivity");
+    expect(lastArg.profile_dimensions[0].display_name).toBe("预算敏感度");
+    expect(lastArg.profile_dimensions[0].description).toBe("客户对价格的敏感程度");
+  });
+});
+
+describe("DomainProfile completeness 维度 anchor_hint+initial_signal", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.spyOn(api, "get").mockResolvedValue({ items: [] } as never);
+    useUiStore.setState({
+      busy: false,
+      error: "",
+      setBusy: vi.fn(),
+      setError: vi.fn(),
+    });
+  });
+
+  // 让 ProfileEditor 进入编辑态并塞入一条 coverage_dimension，setProfileDraft 改成 spy，
+  // 断言 anchor_hint / initial_signal 两输入框 onChange 写回数组该项且不误删其它字段。
+  function seedProfileDraftWithCoverage(setProfileDraft: (draft: DomainProfileDraft) => void) {
+    useStrategyStore.setState({
+      editingProfile: null,
+      isCreatingProfile: true,
+      profileDraft: {
+        profile_id: "test_profile",
+        display_name: "测试配置",
+        coverage_dimensions: [{ key: "need", display_name: "需求", required: true }],
+      },
+      setProfileDraft,
+      loadDomainProfiles: vi.fn(),
+    });
+  }
+
+  it("D11: completeness 维度可编辑 anchor_hint 与 initial_signal 并提交", async () => {
+    const setProfileDraft = vi.fn();
+    seedProfileDraftWithCoverage(setProfileDraft);
+
+    render(<SystemStrategyFeature />);
+
+    // anchor_hint 输入框写入文本 → 写回该行 anchor_hint，保留 key/display_name/required
+    const anchorInput = await screen.findByPlaceholderText(/anchor_hint/i);
+    fireEvent.change(anchorInput, { target: { value: "在对话开场探明" } });
+    await waitFor(() => expect(setProfileDraft).toHaveBeenCalled());
+    let lastArg = setProfileDraft.mock.calls.at(-1)?.[0];
+    expect(lastArg.coverage_dimensions[0].anchor_hint).toBe("在对话开场探明");
+    expect(lastArg.coverage_dimensions[0].key).toBe("need");
+    expect(lastArg.coverage_dimensions[0].display_name).toBe("需求");
+    expect(lastArg.coverage_dimensions[0].required).toBe(true);
+
+    // initial_signal 输入框写入文本 → 写回该行 initial_signal
+    const signalInput = screen.getByPlaceholderText(/initial_signal/i);
+    fireEvent.change(signalInput, { target: { value: "客户主动提及预算" } });
+    await waitFor(() => expect(setProfileDraft.mock.calls.length).toBeGreaterThan(1));
+    lastArg = setProfileDraft.mock.calls.at(-1)?.[0];
+    expect(lastArg.coverage_dimensions[0].initial_signal).toBe("客户主动提及预算");
+    expect(lastArg.coverage_dimensions[0].key).toBe("need");
   });
 });

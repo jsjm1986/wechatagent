@@ -115,6 +115,47 @@ describe("OperationsFeature", () => {
       expect(api.post).toHaveBeenCalledWith("/api/agent-tasks/1/review-now"),
     );
   });
+  it("F15: loading 时显加载态而非空态", () => {
+    (useOperationsStore as any).mockReturnValue({
+      events: [],
+      tasks: [],
+      decisionReviews: [],
+      llmUsage: null,
+      agentRuns: [],
+      loading: true,
+      opsTab: "tasks",
+      setOpsTab: vi.fn(),
+      loadOperationsData: mockLoadOperationsData,
+    });
+
+    render(<OperationsFeature />);
+
+    expect(screen.getByText("加载中…")).toBeInTheDocument();
+    expect(screen.queryByText("暂无跟进任务")).not.toBeInTheDocument();
+  });
+});
+
+describe("operationsStore loading 生命周期(F15)", () => {
+  it("F15: loadOperationsData 起置 loading=true,完成后 loading=false", async () => {
+    const actual = await vi.importActual<typeof import("../../../stores/operationsStore")>(
+      "../../../stores/operationsStore",
+    );
+    const store = actual.useOperationsStore;
+    // 受控 promise：让 5 个并行 api.get 的完成时机由测试掌控
+    const resolvers: ((v: any) => void)[] = [];
+    (api.get as any).mockImplementation(
+      () => new Promise((res) => resolvers.push(res)),
+    );
+
+    const p = store.getState().loadOperationsData("acc");
+    // 微任务前：loading 已置 true
+    expect(store.getState().loading).toBe(true);
+
+    resolvers.forEach((r) => r({ items: [] }));
+    await p;
+    // 完成后：finally 复位 loading=false
+    expect(store.getState().loading).toBe(false);
+  });
 });
 
 describe("formatScores 动态遍历(E13)", () => {

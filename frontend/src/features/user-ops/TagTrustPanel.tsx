@@ -3,6 +3,14 @@ import type { Contact } from "../../types";
 import BayesianTrendChart from "./BayesianTrendChart";
 import styles from "./TagTrustPanel.module.css";
 
+// AI 确信来源（后端 ConfirmedTag.confirmedBy 闭集）→ 中文标签 + tooltip 说明。
+// strong_evidence = 直接证据快通道确信；consolidation = 记忆压缩时整体重新判定确信。
+// 未知/缺省 → 返回 undefined（不显徽标，不崩）。
+const CONFIRMED_BY_META: Record<string, { label: string; hint: string }> = {
+  strong_evidence: { label: "强证据", hint: "直接证据快通道确信，可信度较高" },
+  consolidation: { label: "压缩重判", hint: "记忆压缩时整体重新判定确信" },
+};
+
 /**
  * 标签可信度改造 - 三层标签面板（子计划5 Task2）。
  * 物理分离三层，对应改造的可信度模型：
@@ -92,12 +100,20 @@ export default function TagTrustPanel({
         </div>
         <div className={styles.chips}>
           {confirmedTags.length > 0 ? (
-            confirmedTags.map((tag) => (
-              <span key={tag.value} className={styles.aiChip}>
-                {tag.value}
-                <span className={styles.evidenceCount}>{tag.evidences.length} 条证据</span>
-              </span>
-            ))
+            confirmedTags.map((tag) => {
+              const meta = CONFIRMED_BY_META[tag.confirmedBy];
+              return (
+                <span key={tag.value} className={styles.aiChip}>
+                  {tag.value}
+                  <span className={styles.evidenceCount}>{tag.evidences.length} 条证据</span>
+                  {meta ? (
+                    <span className={styles.confirmedBySource} title={meta.hint}>
+                      {meta.label}
+                    </span>
+                  ) : null}
+                </span>
+              );
+            })
           ) : (
             <span className={styles.empty}>AI 暂未确信任何标签</span>
           )}

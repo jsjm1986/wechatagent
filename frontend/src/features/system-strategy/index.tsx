@@ -1417,6 +1417,18 @@ function ProfileEditor({
                   update({ profile_dimensions: dims });
                 }}
               />
+              <label className={styles.inlineCheckbox}>
+                <input
+                  type="checkbox"
+                  checked={dim.participates_in_decision}
+                  onChange={(e) => {
+                    const dims = [...(draft.profile_dimensions ?? [])];
+                    dims[i] = { ...dim, participates_in_decision: e.target.checked };
+                    update({ profile_dimensions: dims });
+                  }}
+                />
+                进决策
+              </label>
               <button
                 type="button"
                 className={styles.btnGhost}
@@ -1682,6 +1694,26 @@ function ProfileEditor({
                 />
                 必备
               </label>
+              <input
+                className={styles.input}
+                value={cov.anchor_hint ?? ""}
+                placeholder="anchor_hint（锚点提示，可选）"
+                onChange={(e) => {
+                  const arr = [...(draft.coverage_dimensions ?? [])];
+                  arr[i] = { ...cov, anchor_hint: e.target.value };
+                  update({ coverage_dimensions: arr });
+                }}
+              />
+              <input
+                className={styles.input}
+                value={cov.initial_signal ?? ""}
+                placeholder="initial_signal（初始信号，可选）"
+                onChange={(e) => {
+                  const arr = [...(draft.coverage_dimensions ?? [])];
+                  arr[i] = { ...cov, initial_signal: e.target.value };
+                  update({ coverage_dimensions: arr });
+                }}
+              />
               <button
                 type="button"
                 className={styles.btnGhost}

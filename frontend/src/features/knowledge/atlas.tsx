@@ -15,6 +15,7 @@ import { useToast } from "../../components/ui/Toast";
 import { EmptyState } from "../../components/ui/EmptyState";
 import { focusChunk, type TreeChunkItem } from "./shared";
 import { wikiTypeLabel, statusLabel, fieldKindLabel } from "./labels";
+import { DomainSchemaEditor, type DomainSchemaUpsertBody } from "./DomainSchemaEditor";
 
 // ── P1 · ChunkGraphView · 关系图谱（SVG 原生布局，0 新依赖）─────────────
 //
@@ -487,6 +488,7 @@ export function DomainSchemaTab() {
   const [loading, setLoading] = useState(false);
   const [activating, setActivating] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [editing, setEditing] = useState<{ mode: "create" | "edit"; initial?: DomainSchemaItem } | null>(null);
   const confirm = useConfirm();
   const toast = useToast();
 
@@ -533,6 +535,50 @@ export function DomainSchemaTab() {
     }
   }
 
+  async function saveSchema(body: DomainSchemaUpsertBody) {
+    const isEdit = editing?.mode === "edit";
+    const url = isEdit
+      ? `/api/admin/domain-schemas/${encodeURIComponent(body.schemaId)}`
+      : "/api/admin/domain-schemas";
+    setError(null);
+    try {
+      const r = await fetch(url, {
+        method: isEdit ? "PUT" : "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      if (!r.ok) throw await parseApiError(r);
+      toast.success(isEdit ? "已更新字段表" : "已新建字段表（未激活，可在列表设为当前使用）");
+      setEditing(null);
+      await load();
+    } catch (e: unknown) {
+      setError(e instanceof Error ? e.message : String(e));
+    }
+  }
+
+  async function deleteSchema(s: DomainSchemaItem) {
+    if (s.isActive) {
+      toast.error("使用中的字段表不能删除，请先切换到其它字段表");
+      return;
+    }
+    const ok = await confirm({
+      title: `删除字段表「${s.name}」？`,
+      body: "删除后不可恢复。",
+      tone: "danger",
+      confirmText: "确认删除",
+    });
+    if (!ok) return;
+    setError(null);
+    try {
+      const r = await fetch(`/api/admin/domain-schemas/${encodeURIComponent(s.schemaId)}`, { method: "DELETE" });
+      if (!r.ok) throw await parseApiError(r);
+      toast.success("已删除");
+      await load();
+    } catch (e: unknown) {
+      setError(e instanceof Error ? e.message : String(e));
+    }
+  }
+
   return (
     <div className="wikiPanelBody">
       <div className="wikiToolbar">
@@ -540,16 +586,27 @@ export function DomainSchemaTab() {
           <RefreshCw size={14} />
           {loading ? "加载中…" : "刷新"}
         </button>
+        <button type="button" className="primary" onClick={() => setEditing({ mode: "create" })}>
+          + 新建字段表
+        </button>
         <span className="wikiHint">
-          这里是 AI 判断客户用的「字段表」——它规定了 AI 在对话里会记录客户的哪些信息（如所处阶段、意向程度）。字段表由系统管理员维护，这里可以查看不同版本、切换当前使用的一套，不能直接改内容。
+          这里是 AI 判断客户用的「字段表」——它规定了 AI 在对话里会记录客户的哪些信息（如所处阶段、意向程度）。你可以在这里创建、编辑、删除字段表，并切换当前使用的一套。
         </span>
       </div>
       {error ? <div className="wikiAlert error">{error}</div> : null}
+      {editing ? (
+        <DomainSchemaEditor
+          mode={editing.mode}
+          initial={editing.initial as never}
+          onSubmit={(body) => void saveSchema(body)}
+          onCancel={() => setEditing(null)}
+        />
+      ) : null}
       {!loading && items.length === 0 ? (
         <EmptyState
           icon={<LibraryBig size={28} />}
           title="还没有配置字段表"
-          hint="字段表由系统管理员在后台创建后，会显示在这里供切换。"
+          hint="点击「+ 新建字段表」创建第一套，创建后可在这里编辑或设为当前使用。"
         />
       ) : null}
       <div className="wikiSchemaList">
@@ -585,6 +642,18 @@ export function DomainSchemaTab() {
                       {activating === s.schemaId ? "切换中…" : "设为当前使用"}
                     </button>
                   )}
+                  <button type="button" className="ghost" onClick={() => setEditing({ mode: "edit", initial: s })}>
+                    编辑
+                  </button>
+                  <button
+                    type="button"
+                    className="ghost"
+                    onClick={() => void deleteSchema(s)}
+                    disabled={s.isActive}
+                    title={s.isActive ? "使用中的字段表不能删除，请先切换到其它字段表" : undefined}
+                  >
+                    删除
+                  </button>
                 </div>
               </div>
               <div className="wikiSchemaBody">

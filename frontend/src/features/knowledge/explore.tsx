@@ -43,22 +43,11 @@ export function AskView() {
   const [streamMode, setStreamMode] = useState(supportsEventSource);
   const [showTrace, setShowTrace] = useState(false);
   const [openCited, setOpenCited] = useState<Set<string>>(new Set());
-  // E6：workspace 显式覆盖。空字符串 → 后端用 default_workspace_id；
-  // localStorage 持久化，方便多租户切换后保留选择。
-  const [workspaceId, setWorkspaceId] = useState<string>(() => {
-    if (typeof window === "undefined") return "";
-    return window.localStorage.getItem("knowledgeAsk.workspaceId") ?? "";
-  });
   const esRef = useRef<EventSource | null>(null);
-
-  useEffect(() => {
-    if (typeof window === "undefined") return;
-    if (workspaceId) {
-      window.localStorage.setItem("knowledgeAsk.workspaceId", workspaceId);
-    } else {
-      window.localStorage.removeItem("knowledgeAsk.workspaceId");
-    }
-  }, [workspaceId]);
+  // resultRef 同步跟踪 result 最新值。submitStream 的 error handler 同步触发，
+  // 而 setResult 是异步 state —— 必须在每个 setResult 处同步置 ref，否则 error
+  // handler 读到的是上一轮的旧 result（stale closure），导致新查询失败时错误横幅被误抑制。
+  const resultRef = useRef<AskResult | null>(null);
 
   // 组件卸载/重新提交时关掉旧 EventSource，避免连接泄漏。
   useEffect(() => () => {
@@ -69,6 +58,7 @@ export function AskView() {
   function resetForSubmit() {
     setError(null);
     setResult(null);
+    resultRef.current = null;
     setLiveTrace([]);
     setStreamText("");
     setOpenCited(new Set());
@@ -94,11 +84,12 @@ export function AskView() {
       const r = await fetch("/api/knowledge/ask", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(workspaceId ? { query: q, workspaceId } : { query: q }),
+        body: JSON.stringify({ query: q }),
       });
       if (!r.ok) throw await parseApiError(r);
       const data = (await r.json()) as AskResult;
       setResult(data);
+      resultRef.current = data;
     } catch (err: unknown) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
@@ -114,7 +105,6 @@ export function AskView() {
     setShowTrace(true);
     const startedAt = Date.now();
     const params = new URLSearchParams({ query: q });
-    if (workspaceId) params.set("workspaceId", workspaceId);
     const url = `/api/knowledge/ask/stream?${params.toString()}`;
     const es = new EventSource(url);
     esRef.current = es;
@@ -142,14 +132,16 @@ export function AskView() {
         const data = JSON.parse((ev as MessageEvent).data) as Omit<AskResult, "tookMs"> & {
           tookMs?: number;
         };
-        setResult({ ...data, tookMs: data.tookMs ?? Date.now() - startedAt });
+        const next: AskResult = { ...data, tookMs: data.tookMs ?? Date.now() - startedAt };
+        setResult(next);
+        resultRef.current = next;
       } catch (err) {
         setError(err instanceof Error ? err.message : "解析 answer 帧失败");
       }
     });
     es.addEventListener("error", () => {
       // 浏览器在 close 后也会触发 error；只在还没拿到 answer 时报警，避免误报。
-      if (!result) {
+      if (!resultRef.current) {
         setError("流式连接错误（请关闭实时模式或重试）");
       }
       es.close();
@@ -214,16 +206,6 @@ export function AskView() {
         />
         <div className="wikiAskActions">
           <span className="wikiHint">AI 会自动检索知识库后作答。</span>
-          <label className="wikiAskWsField">
-            租户（可选）
-            <input
-              type="text"
-              value={workspaceId}
-              onChange={(e) => setWorkspaceId(e.target.value)}
-              placeholder="default"
-              disabled={pending}
-            />
-          </label>
           {supportsEventSource ? (
             <label className="wikiAskModeToggle" title="开启后可实时看到 AI 检索和作答的过程">
               <input

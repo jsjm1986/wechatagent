@@ -549,6 +549,7 @@ export type CoverageDimension = {
   display_name: string;
   required: boolean;
   anchor_hint?: string | null;
+  initial_signal?: string | null;
 };
 
 // H16 知识切片用途角色。对齐后端 ChunkRole。
