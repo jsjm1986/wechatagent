@@ -24,7 +24,7 @@ export type ContactTab = "all" | "managed" | "normal";
 export type SmartOpsTab = "cockpit" | "adjust" | "profile" | "memory" | "simulation" | "conversation";
 export type TraditionalOpsTab = "playbooks" | "prompts" | "settings" | "audit";
 export type UserOpsMode = "smart" | "traditional";
-export type OpsTab = "tasks" | "events" | "reviews" | "llm";
+export type OpsTab = "tasks" | "events" | "reviews" | "llm" | "runs";
 
 export type Account = {
   id: string;
@@ -297,6 +297,26 @@ export type DecisionReview = {
   finalReviewStatus?: string;
   holdCategory?: string;
   status: string;
+  createdAt?: string;
+};
+
+// C6：Agent 运行日志 run envelope。顶层键经后端 agent_run_json 手工拼 camelCase；
+// 各阶段是后端 Document，内部键由写入侧决定，前端用通用 key-value 渲染兜底，不写死字段名。
+export type AgentRunItem = {
+  id: string;
+  workspaceId?: string;
+  accountId?: string;
+  contactWxid?: string;
+  runId?: string;
+  triggerKind?: string;
+  status?: string;
+  planner?: Record<string, unknown>;
+  context?: Record<string, unknown>;
+  knowledgeRoute?: Record<string, unknown>;
+  decision?: Record<string, unknown>;
+  review?: Record<string, unknown>;
+  gatewayResult?: Record<string, unknown>;
+  error?: string | null;
   createdAt?: string;
 };
 
