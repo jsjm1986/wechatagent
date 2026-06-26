@@ -219,3 +219,30 @@ def biztest_account() -> tuple[str, str]:
     if len(parts) != 2:
         raise SystemExit(f"未找到 /tmp/biztest_account，请先跑 step0_preflight.py。got={out!r}")
     return parts[0], parts[1]
+
+
+def ensure_managed_contact(account_id: str, wxid: str, nickname: str = "biztest 客户") -> None:
+    """把测试 contact 设成 managed（webhook 触发 agent 决策链的前提）。
+
+    contacts 集合主键字段是 wxid + account_id（注意：不是 contact_wxid，那是别的集合的字段）。
+    upsert：不存在则建，存在则确保 agent_status=managed。
+    """
+    js = (
+        f'db.contacts.updateOne('
+        f'{{wxid:"{wxid}",account_id:"{account_id}"}},'
+        f'{{$set:{{agent_status:"managed",nickname:"{nickname}"}},'
+        f'$setOnInsert:{{workspace_id:"default",created_at:new Date()}}}},'
+        f'{{upsert:true}})'
+    )
+    mongo(js)
+
+
+def reset_contact_conversation(account_id: str, wxid: str) -> None:
+    """清掉某测试 contact 的历史对话/run/outbox/events，保证每次触发是干净起点。"""
+    for c, field in [
+        ("conversation_messages", "contact_wxid"),
+        ("agent_run_logs", "contact_wxid"),
+        ("agent_send_outbox", "contact_wxid"),
+        ("agent_events", "contact_wxid"),
+    ]:
+        mongo(f'db.{c}.deleteMany({{{field}:"{wxid}",account_id:"{account_id}"}})')
