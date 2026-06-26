@@ -86,6 +86,24 @@ fn reply_has_time_commitment_feature(reply: &str) -> bool {
     MARKERS.iter().any(|m| reply.contains(m))
 }
 
+/// CONC-2：构造 commitments 的原子追加 update。`$push`+`$slice:-8` 保证并发
+/// writer 各自追加不互相覆盖（治"快照 RMW 丢累积项"），`$slice:-8` 保留最新 8
+/// 条（丢最旧，与原 `drain(0..drop)` 语义一致）。去重仍在应用层快照判定（并发
+/// 下可能写重复——接受：planner pick_commitment_emit_target 单选 +
+/// commitment_recently_emitted 按 id 幂等，重复项最多占槽不重复 emit）。
+fn build_commitment_push_update(entry: &crate::models::CommitmentEntry) -> mongodb::bson::Document {
+    let entry_bson = mongodb::bson::to_bson(entry)
+        .unwrap_or_else(|_| mongodb::bson::Bson::Document(mongodb::bson::Document::new()));
+    doc! {
+        "$push": {
+            "commitments": {
+                "$each": [entry_bson],
+                "$slice": -8i32,
+            }
+        }
+    }
+}
+
 pub async fn handle_managed_message(
     state: &AppState,
     contact: Contact,
@@ -783,6 +801,63 @@ pub(crate) fn should_run_send(outbox_eligible: bool, media_pending: bool) -> boo
     outbox_eligible || media_pending
 }
 
+/// GATE-1:终态动作闸 —— 按 contact 当前 `operation_state` 校验"该状态是否允许本次
+/// action"。命中 forbidden / allowlist 收敛模式不含本次 action 时,置
+/// `held_by_ai_policy` + `should_reply=false` + 追加 risk + 落审计事件,并把传入的
+/// `finalize_status` 改成 `Held("held_by_ai_policy")`。
+///
+/// 初次 finalize 与 single-shot revision 后各调一次:revision 会整条替换
+/// `final_decision`,可能把 `operation_state` 迁到禁止 reply 的态,故必须对改写后的
+/// decision 复检,否则绕过。老库无 `operation_state_policies` 行 →
+/// `enforce_state_action_policy(None, _)` fallthrough(向前兼容),不会绕过 outbox。
+#[allow(clippy::too_many_arguments)]
+async fn apply_state_action_gate(
+    state: &AppState,
+    contact: &Contact,
+    final_decision: &mut AgentDecision,
+    review: &mut DecisionReviewResult,
+    finalize_status: &mut GatewayStatusFinal,
+    run_id: &str,
+) -> AppResult<()> {
+    let policy_opt = load_operation_state_policy_for_contact(
+        state,
+        &contact.workspace_id,
+        final_decision.operation_state.as_deref().unwrap_or(""),
+        &contact.wxid,
+    )
+    .await?;
+    let action = classify_decision_action(final_decision);
+    if let Err(reason) = enforce_state_action_policy(policy_opt.as_ref(), action) {
+        review.approved = false;
+        review.final_review_status = "held_by_ai_policy".to_string();
+        final_decision.should_reply = false;
+        final_decision.autonomy_mode = "blocked".to_string();
+        if !review.risks.iter().any(|r| r == "state_action_policy_blocked") {
+            review.risks.push("state_action_policy_blocked".to_string());
+        }
+        *finalize_status = GatewayStatusFinal::Held("held_by_ai_policy".to_string());
+        write_event_for_account(
+            state,
+            &contact.account_id,
+            Some(&contact.wxid),
+            "state_action_policy_blocked",
+            "blocked",
+            &reason,
+            Some(doc! {
+                "run_id": run_id,
+                "action": action,
+                "operation_state": final_decision
+                    .operation_state
+                    .clone()
+                    .unwrap_or_default(),
+                "reason": reason.clone(),
+            }),
+        )
+        .await?;
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_user_operation_gateway_inner(
     state: &AppState,
@@ -1396,43 +1471,15 @@ async fn run_user_operation_gateway_inner(
     // 老库无 `operation_state_policies` 行 → `enforce_state_action_policy(None, _)`
     // fallthrough（向前兼容）；该入口不会绕过 outbox / idempotency。
     if matches!(finalize_status, GatewayStatusFinal::Approved) {
-        let policy_opt = load_operation_state_policy_for_contact(
+        apply_state_action_gate(
             state,
-            &contact.workspace_id,
-            final_decision.operation_state.as_deref().unwrap_or(""),
-            &contact.wxid,
+            &contact,
+            &mut final_decision,
+            &mut review,
+            &mut finalize_status,
+            &run_id,
         )
         .await?;
-        let action = classify_decision_action(&final_decision);
-        if let Err(reason) = enforce_state_action_policy(policy_opt.as_ref(), action) {
-            review.approved = false;
-            review.final_review_status = "held_by_ai_policy".to_string();
-            final_decision.should_reply = false;
-            final_decision.autonomy_mode = "blocked".to_string();
-            if !review.risks.iter().any(|r| r == "state_action_policy_blocked") {
-                review.risks.push("state_action_policy_blocked".to_string());
-            }
-            finalize_status =
-                GatewayStatusFinal::Held("held_by_ai_policy".to_string());
-            write_event_for_account(
-                state,
-                &contact.account_id,
-                Some(&contact.wxid),
-                "state_action_policy_blocked",
-                "blocked",
-                &reason,
-                Some(doc! {
-                    "run_id": &run_id,
-                    "action": action,
-                    "operation_state": final_decision
-                        .operation_state
-                        .clone()
-                        .unwrap_or_default(),
-                    "reason": reason.clone(),
-                }),
-            )
-            .await?;
-        }
 
         // ── Phase A / A3：taxonomy 软闸 ──
         //
@@ -1701,6 +1748,19 @@ async fn run_user_operation_gateway_inner(
                             final_decision.reply_text.chars().count(),
                             review.risks
                         ));
+                        // GATE-1:revision 整条替换 final_decision,operation_state 可能迁入
+                        // 禁止 reply 的态。初次动作闸只校验了改写前的 decision,这里对改写后的
+                        // final_decision 复检一次,命中 forbidden 时把外层 finalize_status 置
+                        // Held —— 下游统一拦截分支据此 fail-closed,不 enqueue outbox。
+                        apply_state_action_gate(
+                            state,
+                            &contact,
+                            &mut final_decision,
+                            &mut review,
+                            &mut finalize_status,
+                            &run_id,
+                        )
+                        .await?;
                     } else {
                         // R2.4：第二轮仍 fail → revision_failed
                         revision_applied = true;
@@ -3713,8 +3773,8 @@ async fn apply_agent_updates(
         // 到期/快到期时能 emit follow_up。PR-D：优先用结构化 decision.commitment
         // （带 dueAt），解析成 CommitmentEntry.due_at；LLM 未给结构化 commitment 时
         // 回落 last_commitment 字符串路径（due_at=None，由 planner created_at 兜底接住）。
-        let mut commitments: Vec<crate::models::CommitmentRepr> = contact.commitments.clone();
-        let already_present = commitments.iter().any(|c| c.text() == value.as_str());
+        // CONC-2：去重仍用快照判定（应用层），命中已存在则不追加。
+        let already_present = contact.commitments.iter().any(|c| c.text() == value.as_str());
         if !already_present {
             let mut entry = crate::models::CommitmentEntry::from_plain_text(value.clone());
             if let Some(c) = &decision.commitment {
@@ -3722,14 +3782,22 @@ async fn apply_agent_updates(
                     entry.due_at = crate::agent::types::parse_rfc3339_to_bson(&c.due_at);
                 }
             }
-            commitments.push(crate::models::CommitmentRepr::Structured(entry));
-            if commitments.len() > 8 {
-                let drop = commitments.len() - 8;
-                commitments.drain(0..drop);
+            // CONC-2：原子追加（$push+$slice:-8），不再走大 set_doc 的整体覆盖（$set），
+            // 避免并发 writer 各自从陈旧快照 append 互相覆盖丢累积项。
+            // 既成事实纪律：reply 已送出，此写失败只 warn 不阻断（不 `?` 透传，防重发）。
+            if let Err(e) = state
+                .db
+                .contacts()
+                .update_one(
+                    doc! { "_id": contact.id },
+                    build_commitment_push_update(&entry),
+                    None,
+                )
+                .await
+            {
+                tracing::warn!(error = %e, contact_wxid = %contact.wxid, "commitment $push 失败；reply 已送出，跳过");
             }
         }
-        let bson_commitments = mongodb::bson::to_bson(&commitments).unwrap_or(mongodb::bson::Bson::Array(Vec::new()));
-        set_doc.insert("commitments", bson_commitments);
     } else if reply_has_time_commitment_feature(&decision.reply_text) {
         // ⑥观测：reply 像做了时间承诺但 LLM 没填 commitment 字段 → 无 follow-up。
         // 仅观测 prompt 强化是否生效，不阻断、不改写、不进任何门。
@@ -4173,22 +4241,51 @@ async fn apply_operating_memory_update(
     if decision.operating_memory_update.is_empty() && context_pack.is_empty() {
         return Ok(());
     }
-    let mut set_doc = doc! { "updated_at": DateTime::now() };
+    if decision.consolidation_needed || decision.memory_write_score >= 6 {
+        schedule_memory_consolidation_task(state, contact, run_id).await?;
+    }
+    // CONC-1：memory_card(+version) 走 OCC 单独写，镜像 memory.rs 的 occ_memory_filter
+    // 模板（filter 含 memory_card_version 谓词，并发只有看到 prev_version 的 writer 命中）。
+    // 门控外的 updated_at 仍走原三键 filter（它不 bump memory_card_version，不能套版本
+    // 谓词，否则永久 lost-race）。reply 已送出，OCC 输者 modified_count!=1 静默跳过——
+    // 既成事实纪律：不覆盖、不报错、不 `?` 透传。
     if !memory_card_has_signal(&effective_memory_card(memory)) {
         // task 6.3：把 typed memoryCard 在写入边界一次性转为 Document 落库。
         // H13：无 operation_state 时回落状态机初始态。
         let initial_state = super::decision::initial_operation_state_for_contact(state, contact).await?;
-        set_doc.insert(
-            "memory_card",
+        let prev_version = memory.memory_card_version;
+        let next_version = next_memory_card_version(memory);
+        let card_doc =
             mongodb::bson::to_document(&effective_memory_card_for_contact(memory, contact, &initial_state))
-                .unwrap_or_default(),
-        );
-        set_doc.insert("memory_card_version", next_memory_card_version(memory));
-        set_doc.insert("memory_card_updated_at", DateTime::now());
+                .unwrap_or_default();
+        let now = DateTime::now();
+        let res = state
+            .db
+            .operating_memories()
+            .update_one(
+                super::memory::occ_memory_filter(
+                    &contact.workspace_id,
+                    &contact.account_id,
+                    &contact.wxid,
+                    prev_version,
+                ),
+                doc! { "$set": {
+                    "memory_card": card_doc,
+                    "memory_card_version": next_version,
+                    "memory_card_updated_at": now,
+                    "updated_at": now,
+                }},
+                None,
+            )
+            .await?;
+        if res.modified_count != 1 {
+            // 输给并发 writer：对方已写入更新版本，本次 memory_card 写跳过（不覆盖、不报错）。
+            // apply_operating_memory_update 末尾无后续消费 memory，无需重读。
+            tracing::debug!(contact_wxid = %contact.wxid, "memory_card OCC lost race; skip");
+        }
     }
-    if decision.consolidation_needed || decision.memory_write_score >= 6 {
-        schedule_memory_consolidation_task(state, contact, run_id).await?;
-    }
+    // 门控外的字段（此函数仅 updated_at）走原三键 filter，不受 OCC 影响。
+    let set_doc = doc! { "updated_at": DateTime::now() };
     state
         .db
         .operating_memories()
@@ -4761,6 +4858,24 @@ pub(crate) fn compute_taxonomy_guard_outcome(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // CONC-2：commitments 原子追加 update 形态——$slice 必须是 -8（保留最新 8 条，
+    // 丢最旧，与原 drain(0..drop) 语义一致），$each 一次只追加一条新 entry，entry
+    // 序列化为子文档（Structured 形态）text 可取。
+    #[test]
+    fn build_commitment_push_update_shape() {
+        let entry = crate::models::CommitmentEntry::from_plain_text("明天回电".to_string());
+        let update = super::build_commitment_push_update(&entry);
+        let push = update.get_document("$push").expect("有 $push");
+        let commitments = push.get_document("commitments").expect("有 commitments");
+        // $slice 必须是 -8(保留最新 8 条,丢最旧,与原 drain(0..drop) 语义一致)
+        assert_eq!(commitments.get_i32("$slice").unwrap(), -8);
+        let each = commitments.get_array("$each").expect("有 $each");
+        assert_eq!(each.len(), 1, "一次只追加一条新 entry");
+        // entry 序列化为子文档(Structured 形态),text 字段可取
+        let entry_doc = each[0].as_document().expect("entry 是子文档");
+        assert_eq!(entry_doc.get_str("text").unwrap(), "明天回电");
+    }
 
     // media-asset Task 8：素材发送定序纯函数。当前两种 expression_pref 都「先文字后文件」。
     #[test]
