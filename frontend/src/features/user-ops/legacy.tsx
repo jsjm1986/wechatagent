@@ -198,6 +198,7 @@ export function UserOperationCockpit({
   customAgentInstructions,
   assistOverride,
   relationshipType,
+  referredSpecialistAt,
   profileEditDraft,
   selected,
   selectedPlaybookId,
@@ -244,6 +245,7 @@ export function UserOperationCockpit({
   customAgentInstructions: string;
   assistOverride: string;
   relationshipType: string;
+  referredSpecialistAt?: string;
   profileEditDraft: { lastCommitment?: string; followUpPolicy?: string };
   selected: Contact | null;
   selectedPlaybookId: string;
@@ -535,6 +537,12 @@ export function UserOperationCockpit({
                 <option value="force_on">强制开启引荐</option>
                 <option value="force_off">强制关闭引荐</option>
               </select>
+              {referredSpecialistAt && (
+                <div className="modeLine editable">
+                  已引荐 · AI 已退辅助答疑
+                  {`（${formatTime(referredSpecialistAt)}）`}
+                </div>
+              )}
               <button className="secondary" onClick={onSaveAssistOverride} disabled={busy} type="button">
                 <SquarePen size={16} />
                 保存辅助模式

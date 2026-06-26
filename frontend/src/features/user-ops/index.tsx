@@ -78,6 +78,7 @@ function UserOpsFeatureInner() {
     customAgentInstructions,
     assistOverride,
     relationshipType,
+    referredSpecialistAt,
     profileEditDraft,
     importQuery,
     searchQuery,
@@ -282,6 +283,7 @@ function UserOpsFeatureInner() {
             customAgentInstructions={customAgentInstructions}
             assistOverride={assistOverride}
             relationshipType={relationshipType}
+            referredSpecialistAt={referredSpecialistAt}
             profileEditDraft={profileEditDraft}
             selected={selected}
             selectedPlaybookId={selectedPlaybookId}

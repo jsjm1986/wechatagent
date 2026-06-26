@@ -45,6 +45,11 @@ interface UserOpsState {
   customAgentInstructions: string;
   assistOverride: string; // "default" | "force_on" | "force_off"
   relationshipType: string; // "" | "customer" | "peer" | "friend"
+  // E2：referral 已引荐态（只读观测）。后端把引荐时间/名片 id 写入 contact 的
+  // domain_attributes（referred_specialist_at / referred_card_id），前端经
+  // domainAttributes dotted-key 回填，仅用于详情面板展示"已引荐 · AI 已退辅助答疑"。
+  referredSpecialistAt?: string;
+  referredCardId?: string;
   // A3：operation-profile 运营可编辑草稿（last_commitment / follow_up_policy）。
   // customer_stage / intent_level 由 AI 派生、前端只读，不进此草稿。
   profileEditDraft: { lastCommitment?: string; followUpPolicy?: string };
@@ -295,6 +300,8 @@ export const useUserOpsStore = create<UserOpsState & UserOpsActions>((set, get) 
   customAgentInstructions: "",
   assistOverride: "default",
   relationshipType: "",
+  referredSpecialistAt: undefined,
+  referredCardId: undefined,
   profileEditDraft: {},
   importQuery: "",
   searchQuery: "",
@@ -353,6 +360,15 @@ export const useUserOpsStore = create<UserOpsState & UserOpsActions>((set, get) 
         ((contact.domainAttributes as Record<string, unknown> | undefined)?.[
           "relationship_type"
         ] as string) || "",
+      // E2：从 domain_attributes 回填已引荐态（只读观测）。
+      referredSpecialistAt:
+        ((contact.domainAttributes as Record<string, unknown> | undefined)?.[
+          "referred_specialist_at"
+        ] as string) || undefined,
+      referredCardId:
+        ((contact.domainAttributes as Record<string, unknown> | undefined)?.[
+          "referred_card_id"
+        ] as string) || undefined,
       // A3：回填运营可编辑的两字段（有则填，无则空），customer_stage/intent_level 不回填（AI 派生只读）。
       profileEditDraft: {
         lastCommitment: contact.lastCommitment || "",
