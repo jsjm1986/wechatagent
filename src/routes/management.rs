@@ -640,6 +640,96 @@ pub(super) fn merge_product_tools(mut tools: Value) -> Value {
             "name": "wechatagent.update_contact_profile",
             "description": "更新好友运营画像字段。参数：contactId 或 wxid，tags，customerStage，intentLevel，lastCommitment，followUpPolicy，profileAttributes"
         }),
+        // ── 批 1：观测查询类（只读，不写入）──
+        json!({
+            "name": "wechatagent.query_runs",
+            "description": "查询最近的 Agent 运行日志（只读）。可选参数：accountId、contactWxid、limit。用于排查某客户最近几轮自动回复/跟进的运行情况。"
+        }),
+        json!({
+            "name": "wechatagent.query_metrics",
+            "description": "查询 Agent 运营成效指标（只读）。可选参数：accountId、horizon、fromDate、toDate、limit。用于看一段时间内的运营效果汇总。"
+        }),
+        json!({
+            "name": "wechatagent.query_health",
+            "description": "查询指定好友的运营健康度（只读）。参数：contactId。用于查看某客户的运营记忆、最近评审与状态。"
+        }),
+        json!({
+            "name": "wechatagent.query_inbox",
+            "description": "查询 AI 决策请示收件箱（只读）。可选参数：source。用于查看等待幕后决策源处理的请示条目。"
+        }),
+        json!({
+            "name": "wechatagent.query_send_ledger",
+            "description": "查询发送台账统计（只读）。可选参数：kind。用于查看各类发送的聚合统计。"
+        }),
+        // ── 批 1：版本与灰度类（publish=出草稿低风险；rollout/rollback/activate/灰度=高风险）──
+        json!({
+            "name": "wechatagent.publish_operation_domain_version",
+            "description": "发布指定运营域配置为新版本（出草稿、不放量）。参数：id（运营域配置 id）"
+        }),
+        json!({
+            "name": "wechatagent.rollout_operation_domain_version",
+            "description": "把指定运营域配置版本放量生效（立即影响线上）。参数：id"
+        }),
+        json!({
+            "name": "wechatagent.rollback_operation_domain_version",
+            "description": "回滚运营域配置到指定版本（立即影响线上）。参数：id"
+        }),
+        json!({
+            "name": "wechatagent.publish_state_policy_version",
+            "description": "发布指定状态机策略为新版本（出草稿、不放量）。参数：id"
+        }),
+        json!({
+            "name": "wechatagent.rollout_state_policy_version",
+            "description": "把指定状态机策略版本放量生效（立即影响线上）。参数：id"
+        }),
+        json!({
+            "name": "wechatagent.rollback_state_policy_version",
+            "description": "回滚状态机策略到指定版本（立即影响线上）。参数：id"
+        }),
+        json!({
+            "name": "wechatagent.publish_taxonomy_version",
+            "description": "发布指定标签体系为新版本（出草稿、不放量）。参数：id"
+        }),
+        json!({
+            "name": "wechatagent.rollout_taxonomy_version",
+            "description": "把指定标签体系版本放量生效（立即影响线上）。参数：id"
+        }),
+        json!({
+            "name": "wechatagent.rollback_taxonomy_version",
+            "description": "回滚标签体系到指定版本（立即影响线上）。参数：id"
+        }),
+        json!({
+            "name": "wechatagent.publish_domain_profile",
+            "description": "发布指定 domain profile 为新版本（出草稿、不放量）。参数：id（profile id）"
+        }),
+        json!({
+            "name": "wechatagent.rollout_domain_profile",
+            "description": "把指定 domain profile 版本放量生效（立即影响线上）。参数：id"
+        }),
+        json!({
+            "name": "wechatagent.rollback_domain_profile",
+            "description": "回滚 domain profile 到指定版本（立即影响线上）。参数：id"
+        }),
+        json!({
+            "name": "wechatagent.activate_domain_profile",
+            "description": "把指定 domain profile 直接置为生效（立即影响线上）。参数：id"
+        }),
+        json!({
+            "name": "wechatagent.release_evolution_proposal",
+            "description": "发布（release）指定演进提案，使其阈值/提示词改动生效（立即影响线上，需确认串 RELEASE）。参数：id"
+        }),
+        json!({
+            "name": "wechatagent.rollback_evolution_proposal",
+            "description": "回滚指定演进提案的改动（立即影响线上，需确认串 ROLLBACK）。参数：id"
+        }),
+        json!({
+            "name": "wechatagent.provider_activate",
+            "description": "把指定 LLM provider 配置置为当前生效（立即切换线上模型）。参数：providerId，可选 workspaceId"
+        }),
+        json!({
+            "name": "wechatagent.provider_test",
+            "description": "测试指定 LLM provider 连通性（不改生效配置）。可选参数：providerId 或 inline 的 format/baseUrl/apiKey/model/timeoutSeconds，workspaceId"
+        }),
     ];
     match &mut tools {
         Value::Object(map) => {
@@ -870,7 +960,8 @@ pub(super) fn tool_effect(tool_name: &str) -> ToolEffect {
         | "wechatagent.query_runs"
         | "wechatagent.query_metrics"
         | "wechatagent.query_health"
-        | "wechatagent.query_inbox" => Readonly,
+        | "wechatagent.query_inbox"
+        | "wechatagent.query_send_ledger" => Readonly,
         // 低风险可逆写
         "wechatagent.import_contacts"
         | "wechatagent.enable_contact_agent"
@@ -878,17 +969,33 @@ pub(super) fn tool_effect(tool_name: &str) -> ToolEffect {
         | "wechatagent.create_follow_up_task"
         | "wechatagent.update_contact_profile"
         | "wechatagent.update_operation_domain"
-        | "wechatagent.set_assist_mode" => Low,
+        | "wechatagent.set_assist_mode"
+        // 批 1：publish_*（出草稿、不放量）+ provider_test（连通测试不改生效配置）
+        | "wechatagent.publish_operation_domain_version"
+        | "wechatagent.publish_state_policy_version"
+        | "wechatagent.publish_taxonomy_version"
+        | "wechatagent.publish_domain_profile"
+        | "wechatagent.provider_test" => Low,
         // 高风险/宽影响（立即全量/改全局）
         "wechatagent.send_contact_message"
-        | "wechatagent.publish_domain_profile"
-        | "wechatagent.activate_domain_profile"
         | "wechatagent.publish_prompt_template"
         | "wechatagent.edit_state_machine"
         | "wechatagent.provider_activate"
         | "wechatagent.rollout_evolution_proposal"
         | "wechatagent.verify_knowledge_chunk"
-        | "wechatagent.reject_knowledge_chunk" => Dangerous,
+        | "wechatagent.reject_knowledge_chunk"
+        // 批 1：rollout/rollback/activate/灰度立即生效 → 高风险
+        | "wechatagent.rollout_operation_domain_version"
+        | "wechatagent.rollback_operation_domain_version"
+        | "wechatagent.rollout_state_policy_version"
+        | "wechatagent.rollback_state_policy_version"
+        | "wechatagent.rollout_taxonomy_version"
+        | "wechatagent.rollback_taxonomy_version"
+        | "wechatagent.rollout_domain_profile"
+        | "wechatagent.rollback_domain_profile"
+        | "wechatagent.activate_domain_profile"
+        | "wechatagent.release_evolution_proposal"
+        | "wechatagent.rollback_evolution_proposal" => Dangerous,
         // 不可逆（reset/delete/物理销毁）：档位高于 dangerous，第一期即便放权也保留确认
         "wechatagent.reset_domain"
         | "wechatagent.delete_knowledge_chunk"
@@ -1316,9 +1423,260 @@ pub(super) async fn execute_management_tool(
                 .await?;
             Ok(json!({ "ok": true }))
         }
+        // ── 批 1：版本与灰度类（17 个）+ 观测查询类（5 个）。复用 crate::routes
+        // 兄弟模块已有 REST handler——构造提取器 newtype 调用，拆 .0 取 Value。
+        // 管理 agent 发起：username 标 "management-agent" 便于审计，user_id 占位，
+        // current_workspace 用传入 workspace_id（多租户隔离关键）。──
+        "wechatagent.query_runs" => {
+            let q = serde_json::from_value(planned.arguments.clone())
+                .or_else(|_| serde_json::from_value(json!({})))
+                .map_err(|e| AppError::BadRequest(format!("参数解析失败: {e}")))?;
+            let resp = crate::routes::tasks::list_agent_runs(
+                State(state.clone()),
+                Extension(management_admin(workspace_id)),
+                Query(q),
+            )
+            .await?;
+            Ok(resp.0)
+        }
+        "wechatagent.query_metrics" => {
+            let q = serde_json::from_value(planned.arguments.clone())
+                .or_else(|_| serde_json::from_value(json!({})))
+                .map_err(|e| AppError::BadRequest(format!("参数解析失败: {e}")))?;
+            let resp = crate::routes::outcome_metrics::list_agent_outcome_metrics(
+                State(state.clone()),
+                Extension(management_admin(workspace_id)),
+                Query(q),
+            )
+            .await?;
+            Ok(resp.0)
+        }
+        "wechatagent.query_health" => {
+            let contact_id = string_arg(&planned.arguments, "contactId")?;
+            let resp = crate::routes::contacts::get_operation_health(
+                State(state.clone()),
+                Extension(management_admin(workspace_id)),
+                Path(contact_id),
+            )
+            .await?;
+            Ok(resp.0)
+        }
+        "wechatagent.query_inbox" => {
+            let q = serde_json::from_value(planned.arguments.clone())
+                .or_else(|_| serde_json::from_value(json!({})))
+                .map_err(|e| AppError::BadRequest(format!("参数解析失败: {e}")))?;
+            let resp = crate::routes::ask_human_inbox::ask_human_inbox(
+                State(state.clone()),
+                Extension(management_admin(workspace_id)),
+                Query(q),
+            )
+            .await?;
+            Ok(resp.0)
+        }
+        "wechatagent.query_send_ledger" => {
+            let q = serde_json::from_value(planned.arguments.clone())
+                .or_else(|_| serde_json::from_value(json!({})))
+                .map_err(|e| AppError::BadRequest(format!("参数解析失败: {e}")))?;
+            let resp = crate::routes::send_ledger::send_ledger_stats(
+                State(state.clone()),
+                Extension(management_admin(workspace_id)),
+                Query(q),
+            )
+            .await?;
+            Ok(resp.0)
+        }
+        "wechatagent.publish_operation_domain_version" => {
+            let id = string_arg(&planned.arguments, "id")?;
+            let resp = crate::routes::admin_ops_versions::publish_operation_domain_version(
+                State(state.clone()),
+                Extension(management_admin(workspace_id)),
+                Path(id),
+            )
+            .await?;
+            Ok(resp.0)
+        }
+        "wechatagent.rollout_operation_domain_version" => {
+            let id = string_arg(&planned.arguments, "id")?;
+            let resp = crate::routes::admin_ops_versions::rollout_operation_domain_version(
+                State(state.clone()),
+                Extension(management_admin(workspace_id)),
+                Path(id),
+            )
+            .await?;
+            Ok(resp.0)
+        }
+        "wechatagent.rollback_operation_domain_version" => {
+            let id = string_arg(&planned.arguments, "id")?;
+            let resp = crate::routes::admin_ops_versions::rollback_operation_domain_version(
+                State(state.clone()),
+                Extension(management_admin(workspace_id)),
+                Path(id),
+            )
+            .await?;
+            Ok(resp.0)
+        }
+        "wechatagent.publish_state_policy_version" => {
+            let id = string_arg(&planned.arguments, "id")?;
+            let resp = crate::routes::admin_ops_versions::publish_operation_state_policy_version(
+                State(state.clone()),
+                Extension(management_admin(workspace_id)),
+                Path(id),
+            )
+            .await?;
+            Ok(resp.0)
+        }
+        "wechatagent.rollout_state_policy_version" => {
+            let id = string_arg(&planned.arguments, "id")?;
+            let resp = crate::routes::admin_ops_versions::rollout_operation_state_policy_version(
+                State(state.clone()),
+                Extension(management_admin(workspace_id)),
+                Path(id),
+            )
+            .await?;
+            Ok(resp.0)
+        }
+        "wechatagent.rollback_state_policy_version" => {
+            let id = string_arg(&planned.arguments, "id")?;
+            let resp = crate::routes::admin_ops_versions::rollback_operation_state_policy_version(
+                State(state.clone()),
+                Extension(management_admin(workspace_id)),
+                Path(id),
+            )
+            .await?;
+            Ok(resp.0)
+        }
+        "wechatagent.publish_taxonomy_version" => {
+            let id = string_arg(&planned.arguments, "id")?;
+            // 注：taxonomy 版本 handler 全局作用域，签名仅 State+Path（无 Extension）。
+            let resp = crate::routes::admin_ops_versions::publish_taxonomy_version(
+                State(state.clone()),
+                Path(id),
+            )
+            .await?;
+            Ok(resp.0)
+        }
+        "wechatagent.rollout_taxonomy_version" => {
+            let id = string_arg(&planned.arguments, "id")?;
+            let resp = crate::routes::admin_ops_versions::rollout_taxonomy_version(
+                State(state.clone()),
+                Path(id),
+            )
+            .await?;
+            Ok(resp.0)
+        }
+        "wechatagent.rollback_taxonomy_version" => {
+            let id = string_arg(&planned.arguments, "id")?;
+            let resp = crate::routes::admin_ops_versions::rollback_taxonomy_version(
+                State(state.clone()),
+                Path(id),
+            )
+            .await?;
+            Ok(resp.0)
+        }
+        "wechatagent.publish_domain_profile" => {
+            let id = string_arg(&planned.arguments, "id")?;
+            let resp = crate::routes::domain_profiles::publish_domain_profile(
+                State(state.clone()),
+                Extension(management_admin(workspace_id)),
+                Path(id),
+            )
+            .await?;
+            Ok(resp.0)
+        }
+        "wechatagent.rollout_domain_profile" => {
+            let id = string_arg(&planned.arguments, "id")?;
+            let resp = crate::routes::domain_profiles::rollout_domain_profile(
+                State(state.clone()),
+                Extension(management_admin(workspace_id)),
+                Path(id),
+            )
+            .await?;
+            Ok(resp.0)
+        }
+        "wechatagent.rollback_domain_profile" => {
+            let id = string_arg(&planned.arguments, "id")?;
+            let resp = crate::routes::domain_profiles::rollback_domain_profile(
+                State(state.clone()),
+                Extension(management_admin(workspace_id)),
+                Path(id),
+            )
+            .await?;
+            Ok(resp.0)
+        }
+        "wechatagent.activate_domain_profile" => {
+            let id = string_arg(&planned.arguments, "id")?;
+            let resp = crate::routes::domain_profiles::activate_domain_profile(
+                State(state.clone()),
+                Extension(management_admin(workspace_id)),
+                Path(id),
+            )
+            .await?;
+            Ok(resp.0)
+        }
+        "wechatagent.release_evolution_proposal" => {
+            let id = string_arg(&planned.arguments, "id")?;
+            // ConfirmationRequest 需精确确认串 "RELEASE"（evolution.rs:45）。管理 agent 经
+            // plan 确认门后执行此动作，确认串由本分支补足以满足 handler 的硬校验。
+            let body = serde_json::from_value(json!({ "confirmation": "RELEASE" }))
+                .map_err(|e| AppError::BadRequest(format!("参数解析失败: {e}")))?;
+            let resp = crate::routes::evolution::release_evolution_proposal(
+                State(state.clone()),
+                Extension(management_admin(workspace_id)),
+                Path(id),
+                Json(body),
+            )
+            .await?;
+            Ok(resp.0)
+        }
+        "wechatagent.rollback_evolution_proposal" => {
+            let id = string_arg(&planned.arguments, "id")?;
+            let body = serde_json::from_value(json!({ "confirmation": "ROLLBACK" }))
+                .map_err(|e| AppError::BadRequest(format!("参数解析失败: {e}")))?;
+            let resp = crate::routes::evolution::rollback_evolution_proposal(
+                State(state.clone()),
+                Extension(management_admin(workspace_id)),
+                Path(id),
+                Json(body),
+            )
+            .await?;
+            Ok(resp.0)
+        }
+        "wechatagent.provider_activate" => {
+            let provider_id = string_arg(&planned.arguments, "providerId")?;
+            // activate_provider 的 workspace 从 Query.workspaceId 取，缺省回落 admin.current_workspace；
+            // 这里显式塞入传入 workspace_id 保证多租户隔离一致。
+            let q = serde_json::from_value(json!({ "workspaceId": workspace_id }))
+                .map_err(|e| AppError::BadRequest(format!("参数解析失败: {e}")))?;
+            let resp = crate::routes::llm_providers::activate_provider(
+                State(state.clone()),
+                Extension(management_admin(workspace_id)),
+                Path(provider_id),
+                Query(q),
+            )
+            .await?;
+            Ok(resp.0)
+        }
+        "wechatagent.provider_test" => {
+            // test_provider 无 Path，workspace 从 body.workspaceId 取；显式塞入传入 workspace_id。
+            let mut args = planned.arguments.clone();
+            if let Some(map) = args.as_object_mut() {
+                map.entry("workspaceId")
+                    .or_insert_with(|| json!(workspace_id));
+            } else {
+                args = json!({ "workspaceId": workspace_id });
+            }
+            let body = serde_json::from_value(args)
+                .map_err(|e| AppError::BadRequest(format!("参数解析失败: {e}")))?;
+            let resp = crate::routes::llm_providers::test_provider(
+                State(state.clone()),
+                Extension(management_admin(workspace_id)),
+                Json(body),
+            )
+            .await?;
+            Ok(resp.0)
+        }
         _ => {
             // 兜底分支：只允许把 tools/list 真实公布过的工具名透传给生产 MCP。
-            // 拦截 LLM 幻觉或提示注入产生的、服务端从未声明的工具名。
             if !advertised.contains(planned.tool_name.as_str()) {
                 return Err(AppError::BadRequest(format!(
                     "tool '{}' is not advertised by the MCP server and is not a known product tool",
@@ -1333,6 +1691,17 @@ pub(super) async fn execute_management_tool(
             )
             .await
         }
+    }
+}
+
+/// 构造管理 Agent 复用 REST handler 时的 AuthenticatedAdmin 上下文。
+/// current_workspace 用传入 workspace_id（多租户隔离关键）；username 标 "management-agent"
+/// 便于审计能看出是管理 Agent 发起；user_id 占位（这些 handler 不依赖 user_id 做业务）。
+pub(super) fn management_admin(workspace_id: &str) -> AuthenticatedAdmin {
+    AuthenticatedAdmin {
+        user_id: String::new(),
+        username: "management-agent".to_string(),
+        current_workspace: workspace_id.to_string(),
     }
 }
 
@@ -1497,10 +1866,52 @@ mod tests {
         assert_eq!(tool_effect("wechatagent.search_contacts").risk, ToolRisk::Readonly);
         assert_eq!(tool_effect("wechatagent.create_follow_up_task").risk, ToolRisk::Low);
         assert_eq!(tool_effect("wechatagent.send_contact_message").risk, ToolRisk::Dangerous);
-        assert_eq!(tool_effect("wechatagent.publish_domain_profile").risk, ToolRisk::Dangerous);
+        // 批 1：publish_* 出草稿不放量 → Low（rollout/rollback 才 Dangerous）
+        assert_eq!(tool_effect("wechatagent.publish_domain_profile").risk, ToolRisk::Low);
         assert_eq!(tool_effect("wechatagent.reset_domain").risk, ToolRisk::Irreversible);
         // 只读工具同时 read_only=true（与既有 dry-run 逻辑兼容）
         assert!(tool_effect("wechatagent.search_contacts").read_only);
+    }
+
+    #[test]
+    fn merged_catalog_includes_batch1_tools() {
+        let merged = merge_product_tools(json!({ "tools": [] }));
+        let names = advertised_tool_names(&merged);
+        for t in [
+            // 观测查询类（5 个里取 2 个代表）
+            "wechatagent.query_runs",
+            "wechatagent.query_health",
+            // 版本与灰度类代表
+            "wechatagent.publish_domain_profile",
+            "wechatagent.rollout_domain_profile",
+            "wechatagent.activate_domain_profile",
+            "wechatagent.release_evolution_proposal",
+            "wechatagent.provider_activate",
+        ] {
+            assert!(names.contains(t), "catalog 缺工具 {t}");
+        }
+    }
+
+    #[test]
+    fn tool_effect_classifies_batch1_risk() {
+        // query_* = Readonly
+        assert_eq!(tool_effect("wechatagent.query_runs").risk, ToolRisk::Readonly);
+        assert!(tool_effect("wechatagent.query_send_ledger").read_only);
+        // publish_* = Low（出草稿不放量）
+        assert_eq!(tool_effect("wechatagent.publish_domain_profile").risk, ToolRisk::Low);
+        assert_eq!(
+            tool_effect("wechatagent.publish_operation_domain_version").risk,
+            ToolRisk::Low
+        );
+        // rollout/rollback/activate/provider/evolution = Dangerous
+        assert_eq!(tool_effect("wechatagent.rollout_domain_profile").risk, ToolRisk::Dangerous);
+        assert_eq!(tool_effect("wechatagent.rollback_taxonomy_version").risk, ToolRisk::Dangerous);
+        assert_eq!(tool_effect("wechatagent.activate_domain_profile").risk, ToolRisk::Dangerous);
+        assert_eq!(tool_effect("wechatagent.provider_activate").risk, ToolRisk::Dangerous);
+        assert_eq!(
+            tool_effect("wechatagent.release_evolution_proposal").risk,
+            ToolRisk::Dangerous
+        );
     }
 
     #[test]
