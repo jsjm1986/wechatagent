@@ -67,6 +67,10 @@ pub(super) struct CreateTaxonomyValue {
     aliases: Vec<String>,
     #[serde(default)]
     description: Option<String>,
+    #[serde(default)]
+    is_terminal: bool,
+    #[serde(default)]
+    is_reactivation_target: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -78,6 +82,8 @@ pub(super) struct PatchTaxonomyRequest {
     description: Option<String>,
     /// `true` → `value.status = "deprecated"`；`false` → 恢复为 `active`。
     deprecated: Option<bool>,
+    is_terminal: Option<bool>,
+    is_reactivation_target: Option<bool>,
 }
 
 pub(super) async fn list_taxonomies(
@@ -149,8 +155,8 @@ pub(super) async fn create_taxonomy(
                 .collect(),
             status: "active".to_string(),
             priority_weight: None,
-            is_terminal: false,
-            is_reactivation_target: false,
+            is_terminal: payload.value.is_terminal,
+            is_reactivation_target: payload.value.is_reactivation_target,
         },
         updated_at: now,
         version: 1,
@@ -217,6 +223,12 @@ pub(super) async fn patch_taxonomy(
             "value.status",
             if deprecated { "deprecated" } else { "active" },
         );
+    }
+    if let Some(is_terminal) = payload.is_terminal {
+        set_doc.insert("value.isTerminal", is_terminal);
+    }
+    if let Some(is_reactivation_target) = payload.is_reactivation_target {
+        set_doc.insert("value.isReactivationTarget", is_reactivation_target);
     }
     if set_doc.is_empty() {
         return Err(AppError::BadRequest(
