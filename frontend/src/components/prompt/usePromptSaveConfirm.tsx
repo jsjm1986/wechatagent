@@ -18,7 +18,7 @@ export function promptDiffBody(reason: string, diff: string): ReactNode {
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
       <p style={{ margin: 0 }}>
-        语义审查提示：{reason || "需人工逐字核对本次改动"}
+        语义审查提示：{reason || "需逐字核对本次改动"}
       </p>
       <p style={{ margin: 0, fontSize: 13, color: "#6b7280" }}>
         请逐字核对以下改动是否变相引入真人转介，触碰自治边界红线：
