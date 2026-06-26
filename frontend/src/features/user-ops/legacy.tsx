@@ -2067,7 +2067,7 @@ export function PlannerViewSection({ contact }: { contact: Contact | null }) {
       <div className="sectionCaption">Planner 视角</div>
       {hasMode && (
         <div data-testid="planner-mode-row" style={{ fontSize: 13, color: "#444", marginBottom: 8 }}>
-          上轮对话模式 <strong>{conversationModeLabel(lastMode!)}</strong>
+          上轮对话模式 <strong>{labelFor(taxonomies, "conversation_mode", lastMode!).text}</strong>
         </div>
       )}
       {hasStage && (
@@ -2218,21 +2218,6 @@ function SendHistoryResponseTag({ responded }: { responded?: boolean | null }) {
   return <p style={{ color: "var(--muted-soft)" }}>待评估</p>;
 }
 
-
-function conversationModeLabel(mode: string): string {
-  switch (mode) {
-    case "casual_relationship":
-      return "寒暄关系（casual_relationship）";
-    case "value_exchange":
-      return "价值互换（value_exchange）";
-    case "consultative":
-      return "顾问/销售（consultative）";
-    case "boundary_protection":
-      return "边界保护（boundary_protection）";
-    default:
-      return mode;
-  }
-}
 
 /** M3 / Task 79：把 ISO 时间格式化成 cockpit 显示用的"YYYY-MM-DD HH:mm"。 */
 

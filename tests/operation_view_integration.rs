@@ -198,4 +198,24 @@ async fn active_view_returns_dimensions_and_taxonomy_labels() {
         body["taxonomies"]["relationship_type"].is_array(),
         "relationship_type 取值应是数组（可空）"
     );
+
+    // A5：taxonomies 必含 conversation_mode 键，验证 kind 集 ∪ conversation_mode——
+    // 它不在 profile_dimensions 里但被强制并入 kind 集，供前端 labelFor 翻译对话模式。
+    assert!(
+        body["taxonomies"]
+            .as_object()
+            .expect("taxonomies object")
+            .contains_key("conversation_mode"),
+        "taxonomies 必须含 conversation_mode 键（A5 kind 集 ∪ conversation_mode）"
+    );
+    let cm_values = body["taxonomies"]["conversation_mode"]
+        .as_array()
+        .expect("conversation_mode 取值应是数组");
+    // m028 seed 的四个默认值经 active-view 下发，consultative→顾问咨询 可被 labelFor 命中。
+    assert!(
+        cm_values
+            .iter()
+            .any(|v| v["id"] == "consultative" && v["label"] == "顾问咨询"),
+        "conversation_mode 取值字典应含 consultative→顾问咨询（m028 seed），实际: {cm_values:?}"
+    );
 }
