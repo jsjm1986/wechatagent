@@ -772,6 +772,88 @@ pub(super) fn merge_product_tools(mut tools: Value) -> Value {
             "name": "wechatagent.update_ask_human_policy",
             "description": "更新指定运营域的请示决策链策略（decider_chain、安静时段等），立即改变全量在跑 agent 的请示行为。参数：domain，body（AskHumanPolicy：deciderChain 等）。"
         }),
+        // ── 批 3：策略编辑类 ──
+        json!({
+            "name": "wechatagent.edit_soul",
+            "description": "编辑指定 Agent 灵魂（人格底座）内容草稿。参数：soulId，body（AgentSoulRequest：agentKind、name、content）。仅改草稿不发布生效。"
+        }),
+        json!({
+            "name": "wechatagent.publish_soul",
+            "description": "发布指定 Agent 灵魂为当前生效版本（立即影响全量在跑 agent 的人格底座）。参数：soulId。"
+        }),
+        json!({
+            "name": "wechatagent.edit_playbook",
+            "description": "编辑指定运营 playbook（方法论/口吻/禁则/成功标准等）。参数：playbookId，body（OperationPlaybookRequest：name、methodPrompt 等）。改本体并 +1 版本。"
+        }),
+        json!({
+            "name": "wechatagent.set_default_playbook",
+            "description": "把指定运营 playbook 设为账号默认（生效）playbook。参数：playbookId。注：playbook 无独立发布动作，设为默认即生效。"
+        }),
+        json!({
+            "name": "wechatagent.generate_playbook",
+            "description": "用自然语言描述生成一份新运营 playbook（内部跑 LLM）。参数：body（GeneratePlaybookRequest：accountId、description）。"
+        }),
+        json!({
+            "name": "wechatagent.optimize_playbook",
+            "description": "用自然语言指令优化指定运营 playbook（内部跑 LLM）。参数：playbookId，body（OptimizePlaybookRequest：instruction）。"
+        }),
+        json!({
+            "name": "wechatagent.edit_state_machine",
+            "description": "直接编辑指定运营域的状态机本体（states/transitions/initial 等），立即改全局状态流转。参数：domain，body（裸状态机 Document）。"
+        }),
+        json!({
+            "name": "wechatagent.promote_lesson",
+            "description": "把指定经验沉淀（lesson）提升为同行案例库条目。参数：lessonId，body（PromoteLessonRequest：title、body 等）。"
+        }),
+        // ── 批 3：知识维护类 ──
+        json!({
+            "name": "wechatagent.verify_knowledge_chunk",
+            "description": "把指定知识切片核验为 verified（写 source=Human，恒需人确认）。参数：chunkId，可选 verifiedClaims（字符串数组）。核验前须有 sourceQuote 且能锚定父文档。"
+        }),
+        json!({
+            "name": "wechatagent.reject_knowledge_chunk",
+            "description": "把指定知识切片标为 rejected（不可用）。参数：chunkId。"
+        }),
+        json!({
+            "name": "wechatagent.archive_knowledge_chunk",
+            "description": "归档指定知识切片（软下线，可逆）。参数：chunkId，body（ChunkArchiveRequest）。"
+        }),
+        json!({
+            "name": "wechatagent.patch_knowledge_chunk",
+            "description": "局部修改指定知识切片内容（留修订历史）。参数：chunkId，body（ChunkPatchRequest）。"
+        }),
+        json!({
+            "name": "wechatagent.split_knowledge_chunk",
+            "description": "把一条知识切片拆成多条。参数：chunkId，body（ChunkSplitRequest）。"
+        }),
+        json!({
+            "name": "wechatagent.merge_knowledge_chunk",
+            "description": "把指定知识切片与其它切片合并。参数：chunkId，body（ChunkMergeRequest）。"
+        }),
+        json!({
+            "name": "wechatagent.relate_knowledge_chunk",
+            "description": "为指定知识切片建立与其它切片的关联关系。参数：chunkId，body（ChunkRelateRequest）。"
+        }),
+        json!({
+            "name": "wechatagent.batch_verify_chunks",
+            "description": "批量核验多条知识切片（写 source=Human，恒需人确认）。参数：body（ChunkBatchVerifyRequest：ids 等）。"
+        }),
+        json!({
+            "name": "wechatagent.apply_gap_signal",
+            "description": "采纳指定知识缺口信号并登记处置。参数：signalId，body（GapSignalResolutionRequest：note 等）。"
+        }),
+        json!({
+            "name": "wechatagent.dismiss_gap_signal",
+            "description": "忽略指定知识缺口信号。参数：signalId，body（GapSignalResolutionRequest：note 等）。"
+        }),
+        json!({
+            "name": "wechatagent.import_knowledge_text",
+            "description": "把整理好的文本知识导入为运营知识切片（落库 status=draft，需后续人核验）。参数：body（OperationKnowledgeImportApplyRequest：items 或 chunkedText 等）。"
+        }),
+        json!({
+            "name": "wechatagent.import_knowledge_image",
+            "description": "从图片（视觉理解）导入运营知识切片（落库 status=draft，需后续人核验）。参数：body（ImportApplyImageRequest：imageBase64 等）。"
+        }),
     ];
     match &mut tools {
         Value::Object(map) => {
@@ -1026,7 +1108,24 @@ pub(super) fn tool_effect(tool_name: &str) -> ToolEffect {
         | "wechatagent.analyze_profile"
         | "wechatagent.review_task_now"
         | "wechatagent.cancel_task"
-        | "wechatagent.resolve_principal_escalation" => Low,
+        | "wechatagent.resolve_principal_escalation"
+        // 批 3：策略编辑（soul/playbook 编辑出草稿、不放量；generate/optimize 跑 LLM 出草稿）= Low
+        | "wechatagent.edit_soul"
+        | "wechatagent.edit_playbook"
+        | "wechatagent.set_default_playbook"
+        | "wechatagent.generate_playbook"
+        | "wechatagent.optimize_playbook"
+        | "wechatagent.promote_lesson"
+        // 批 3：知识维护（可逆单对象写 / 落 draft 待核验）= Low
+        | "wechatagent.archive_knowledge_chunk"
+        | "wechatagent.patch_knowledge_chunk"
+        | "wechatagent.split_knowledge_chunk"
+        | "wechatagent.merge_knowledge_chunk"
+        | "wechatagent.relate_knowledge_chunk"
+        | "wechatagent.apply_gap_signal"
+        | "wechatagent.dismiss_gap_signal"
+        | "wechatagent.import_knowledge_text"
+        | "wechatagent.import_knowledge_image" => Low,
         // 高风险/宽影响（立即全量/改全局）
         "wechatagent.send_contact_message"
         | "wechatagent.publish_prompt_template"
@@ -1034,6 +1133,9 @@ pub(super) fn tool_effect(tool_name: &str) -> ToolEffect {
         | "wechatagent.provider_activate"
         | "wechatagent.verify_knowledge_chunk"
         | "wechatagent.reject_knowledge_chunk"
+        // 批 3：publish_soul 发布=生效全局人格底座；batch_verify 同 verify 类（写 source=Human）→ Dangerous
+        | "wechatagent.publish_soul"
+        | "wechatagent.batch_verify_chunks"
         // 批 1：rollout/rollback/activate/灰度立即生效 → 高风险
         | "wechatagent.rollout_operation_domain_version"
         | "wechatagent.rollback_operation_domain_version"
@@ -1130,8 +1232,12 @@ pub(super) fn build_execution_summary(results: &[(String, ToolOutcome)]) -> Stri
 
 /// verify 类工具：把 chunk 推向 verified 的动作。它写 source=Human（verify.rs:101），
 /// 包成 AI 工具会"AI 调用被记成人确认"——故恒强制确认，不随第一期开关放行（spec §4.3）。
+/// batch_verify_chunks 同属 verify 类，一并恒确认。
 pub(super) fn tool_always_requires_confirmation(tool_name: &str) -> bool {
-    matches!(tool_name, "wechatagent.verify_knowledge_chunk")
+    matches!(
+        tool_name,
+        "wechatagent.verify_knowledge_chunk" | "wechatagent.batch_verify_chunks"
+    )
 }
 
 /// 第一期权限放大：dangerous_confirm_enabled 默认 false（见 spec §1.2），
@@ -1853,6 +1959,259 @@ pub(super) async fn execute_management_tool(
             .await?;
             Ok(resp.0)
         }
+        // ── 批 3：策略编辑类 ──
+        "wechatagent.edit_soul" => {
+            let id = string_arg(&planned.arguments, "soulId")?;
+            let body = serde_json::from_value(planned.arguments.clone())
+                .map_err(|e| AppError::BadRequest(format!("参数解析失败: {e}")))?;
+            let resp = crate::routes::souls::update_agent_soul(
+                State(state.clone()),
+                Extension(management_admin(workspace_id)),
+                Path(id),
+                Json(body),
+            )
+            .await?;
+            Ok(resp.0)
+        }
+        "wechatagent.publish_soul" => {
+            // 注：publish_agent_soul 提取器顺序为 State+Path+Extension（Path 在 Ext 前）。
+            let id = string_arg(&planned.arguments, "soulId")?;
+            let resp = crate::routes::souls::publish_agent_soul(
+                State(state.clone()),
+                Path(id),
+                Extension(management_admin(workspace_id)),
+            )
+            .await?;
+            Ok(resp.0)
+        }
+        "wechatagent.edit_playbook" => {
+            let id = string_arg(&planned.arguments, "playbookId")?;
+            let body = serde_json::from_value(planned.arguments.clone())
+                .map_err(|e| AppError::BadRequest(format!("参数解析失败: {e}")))?;
+            let resp = crate::routes::playbooks::update_operation_playbook(
+                State(state.clone()),
+                Extension(management_admin(workspace_id)),
+                Path(id),
+                Json(body),
+            )
+            .await?;
+            Ok(resp.0)
+        }
+        "wechatagent.set_default_playbook" => {
+            let id = string_arg(&planned.arguments, "playbookId")?;
+            let resp = crate::routes::playbooks::set_default_operation_playbook(
+                State(state.clone()),
+                Extension(management_admin(workspace_id)),
+                Path(id),
+            )
+            .await?;
+            Ok(resp.0)
+        }
+        "wechatagent.generate_playbook" => {
+            let body = serde_json::from_value(planned.arguments.clone())
+                .map_err(|e| AppError::BadRequest(format!("参数解析失败: {e}")))?;
+            let resp = crate::routes::playbooks::generate_operation_playbook(
+                State(state.clone()),
+                Extension(management_admin(workspace_id)),
+                Json(body),
+            )
+            .await?;
+            Ok(resp.0)
+        }
+        "wechatagent.optimize_playbook" => {
+            let id = string_arg(&planned.arguments, "playbookId")?;
+            let body = serde_json::from_value(planned.arguments.clone())
+                .map_err(|e| AppError::BadRequest(format!("参数解析失败: {e}")))?;
+            let resp = crate::routes::playbooks::optimize_operation_playbook(
+                State(state.clone()),
+                Extension(management_admin(workspace_id)),
+                Path(id),
+                Json(body),
+            )
+            .await?;
+            Ok(resp.0)
+        }
+        "wechatagent.edit_state_machine" => {
+            // body 是裸状态机 Document（mongodb::bson::Document），从 arguments.body 取。
+            let domain = string_arg(&planned.arguments, "domain")?;
+            let body_value = planned
+                .arguments
+                .get("body")
+                .cloned()
+                .unwrap_or_else(|| planned.arguments.clone());
+            let body: Document = serde_json::from_value(body_value)
+                .map_err(|e| AppError::BadRequest(format!("参数解析失败: {e}")))?;
+            let resp = crate::routes::domains::update_operation_domain_state_machine(
+                State(state.clone()),
+                Extension(management_admin(workspace_id)),
+                Path(domain),
+                Json(body),
+            )
+            .await?;
+            Ok(resp.0)
+        }
+        "wechatagent.promote_lesson" => {
+            let id = string_arg(&planned.arguments, "lessonId")?;
+            let body = serde_json::from_value(planned.arguments.clone())
+                .map_err(|e| AppError::BadRequest(format!("参数解析失败: {e}")))?;
+            let resp = crate::routes::lessons_learned::promote_lesson_to_peer_case(
+                State(state.clone()),
+                Extension(management_admin(workspace_id)),
+                Path(id),
+                Json(body),
+            )
+            .await?;
+            Ok(resp.0)
+        }
+        // ── 批 3：知识维护类 ──
+        "wechatagent.verify_knowledge_chunk" => {
+            let id = string_arg(&planned.arguments, "chunkId")?;
+            let body = serde_json::from_value(planned.arguments.clone())
+                .map_err(|e| AppError::BadRequest(format!("参数解析失败: {e}")))?;
+            let resp = crate::routes::knowledge::verify_operation_knowledge_chunk(
+                State(state.clone()),
+                Extension(management_admin(workspace_id)),
+                Path(id),
+                Json(body),
+            )
+            .await?;
+            Ok(resp.0)
+        }
+        "wechatagent.reject_knowledge_chunk" => {
+            // 注：reject 无 Json body（State+Ext+Path）。
+            let id = string_arg(&planned.arguments, "chunkId")?;
+            let resp = crate::routes::knowledge::reject_operation_knowledge_chunk(
+                State(state.clone()),
+                Extension(management_admin(workspace_id)),
+                Path(id),
+            )
+            .await?;
+            Ok(resp.0)
+        }
+        "wechatagent.archive_knowledge_chunk" => {
+            let id = string_arg(&planned.arguments, "chunkId")?;
+            let body = serde_json::from_value(planned.arguments.clone())
+                .map_err(|e| AppError::BadRequest(format!("参数解析失败: {e}")))?;
+            let resp = crate::routes::knowledge::archive_operation_knowledge_chunk(
+                State(state.clone()),
+                Extension(management_admin(workspace_id)),
+                Path(id),
+                Json(body),
+            )
+            .await?;
+            Ok(resp.0)
+        }
+        "wechatagent.patch_knowledge_chunk" => {
+            let id = string_arg(&planned.arguments, "chunkId")?;
+            let body = serde_json::from_value(planned.arguments.clone())
+                .map_err(|e| AppError::BadRequest(format!("参数解析失败: {e}")))?;
+            let resp = crate::routes::knowledge::patch_operation_knowledge_chunk(
+                State(state.clone()),
+                Extension(management_admin(workspace_id)),
+                Path(id),
+                Json(body),
+            )
+            .await?;
+            Ok(resp.0)
+        }
+        "wechatagent.split_knowledge_chunk" => {
+            let id = string_arg(&planned.arguments, "chunkId")?;
+            let body = serde_json::from_value(planned.arguments.clone())
+                .map_err(|e| AppError::BadRequest(format!("参数解析失败: {e}")))?;
+            let resp = crate::routes::knowledge::split_operation_knowledge_chunk(
+                State(state.clone()),
+                Extension(management_admin(workspace_id)),
+                Path(id),
+                Json(body),
+            )
+            .await?;
+            Ok(resp.0)
+        }
+        "wechatagent.merge_knowledge_chunk" => {
+            let id = string_arg(&planned.arguments, "chunkId")?;
+            let body = serde_json::from_value(planned.arguments.clone())
+                .map_err(|e| AppError::BadRequest(format!("参数解析失败: {e}")))?;
+            let resp = crate::routes::knowledge::merge_operation_knowledge_chunk(
+                State(state.clone()),
+                Extension(management_admin(workspace_id)),
+                Path(id),
+                Json(body),
+            )
+            .await?;
+            Ok(resp.0)
+        }
+        "wechatagent.relate_knowledge_chunk" => {
+            let id = string_arg(&planned.arguments, "chunkId")?;
+            let body = serde_json::from_value(planned.arguments.clone())
+                .map_err(|e| AppError::BadRequest(format!("参数解析失败: {e}")))?;
+            let resp = crate::routes::knowledge::relate_operation_knowledge_chunk(
+                State(state.clone()),
+                Extension(management_admin(workspace_id)),
+                Path(id),
+                Json(body),
+            )
+            .await?;
+            Ok(resp.0)
+        }
+        "wechatagent.batch_verify_chunks" => {
+            let body = serde_json::from_value(planned.arguments.clone())
+                .map_err(|e| AppError::BadRequest(format!("参数解析失败: {e}")))?;
+            let resp = crate::routes::knowledge::batch_verify_chunks(
+                State(state.clone()),
+                Extension(management_admin(workspace_id)),
+                Json(body),
+            )
+            .await?;
+            Ok(resp.0)
+        }
+        "wechatagent.apply_gap_signal" => {
+            let id = string_arg(&planned.arguments, "signalId")?;
+            let body = serde_json::from_value(planned.arguments.clone())
+                .map_err(|e| AppError::BadRequest(format!("参数解析失败: {e}")))?;
+            let resp = crate::routes::knowledge::apply_knowledge_gap_signal(
+                State(state.clone()),
+                Extension(management_admin(workspace_id)),
+                Path(id),
+                Json(body),
+            )
+            .await?;
+            Ok(resp.0)
+        }
+        "wechatagent.dismiss_gap_signal" => {
+            let id = string_arg(&planned.arguments, "signalId")?;
+            let body = serde_json::from_value(planned.arguments.clone())
+                .map_err(|e| AppError::BadRequest(format!("参数解析失败: {e}")))?;
+            let resp = crate::routes::knowledge::dismiss_knowledge_gap_signal(
+                State(state.clone()),
+                Extension(management_admin(workspace_id)),
+                Path(id),
+                Json(body),
+            )
+            .await?;
+            Ok(resp.0)
+        }
+        "wechatagent.import_knowledge_text" => {
+            let body = serde_json::from_value(planned.arguments.clone())
+                .map_err(|e| AppError::BadRequest(format!("参数解析失败: {e}")))?;
+            let resp = crate::routes::knowledge::import_operation_knowledge_apply(
+                State(state.clone()),
+                Extension(management_admin(workspace_id)),
+                Json(body),
+            )
+            .await?;
+            Ok(resp.0)
+        }
+        "wechatagent.import_knowledge_image" => {
+            let body = serde_json::from_value(planned.arguments.clone())
+                .map_err(|e| AppError::BadRequest(format!("参数解析失败: {e}")))?;
+            let resp = crate::routes::knowledge::import_operation_knowledge_apply_image(
+                State(state.clone()),
+                Extension(management_admin(workspace_id)),
+                Json(body),
+            )
+            .await?;
+            Ok(resp.0)
+        }
         _ => {
             // 兜底分支：只允许把 tools/list 真实公布过的工具名透传给生产 MCP。
             if !advertised.contains(planned.tool_name.as_str()) {
@@ -2122,6 +2481,44 @@ mod tests {
             tool_effect("wechatagent.update_ask_human_policy").risk,
             ToolRisk::Dangerous
         );
+    }
+
+    #[test]
+    fn merged_catalog_includes_batch3_tools() {
+        let merged = merge_product_tools(json!({ "tools": [] }));
+        let names = advertised_tool_names(&merged);
+        for t in [
+            // 策略编辑类代表
+            "wechatagent.edit_soul",
+            "wechatagent.edit_playbook",
+            "wechatagent.edit_state_machine",
+            // 知识维护类代表
+            "wechatagent.verify_knowledge_chunk",
+            "wechatagent.patch_knowledge_chunk",
+            "wechatagent.import_knowledge_text",
+        ] {
+            assert!(names.contains(t), "catalog 缺工具 {t}");
+        }
+    }
+
+    #[test]
+    fn tool_effect_classifies_batch3_risk() {
+        // 策略编辑：soul/playbook 编辑 = Low（出草稿不放量）
+        assert_eq!(tool_effect("wechatagent.edit_soul").risk, ToolRisk::Low);
+        // 知识维护：patch 等可逆单对象写 = Low
+        assert_eq!(tool_effect("wechatagent.patch_knowledge_chunk").risk, ToolRisk::Low);
+        // 改全局状态机 = Dangerous（spec §4.1）
+        assert_eq!(tool_effect("wechatagent.edit_state_machine").risk, ToolRisk::Dangerous);
+        // verify 类 = Dangerous（推 chunk 到 verified，写 source=Human）
+        assert_eq!(tool_effect("wechatagent.verify_knowledge_chunk").risk, ToolRisk::Dangerous);
+    }
+
+    #[test]
+    fn batch_verify_always_requires_confirmation() {
+        // batch_verify 与单条 verify 同属 verify 类，恒强制确认无视第一期 dangerous 开关
+        // （spec §4.3：守"AI 永不自动 verify"，AI 调 verify 会落 source=Human）。
+        assert!(plan_requires_confirmation(&["wechatagent.batch_verify_chunks"], false));
+        assert!(tool_always_requires_confirmation("wechatagent.batch_verify_chunks"));
     }
 
     #[test]
