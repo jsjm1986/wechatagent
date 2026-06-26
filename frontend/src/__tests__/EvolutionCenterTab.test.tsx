@@ -309,4 +309,62 @@ describe("EvolutionCenterTab", () => {
       "product_accuracy_score_block",
     );
   });
+
+  // 前后端对齐批次1 Task 5（C3）：runtime-flag 灰度开关 + rollout 比例控件。
+  // 本文件 mock 全局 fetch（非 lib/api 的 api.put），故断言落在 fetch 调用上：
+  // 找出 method === "PUT" 的那次 fetch，校验 URL 与 camelCase body。
+  it("渲染 runtime-flag 灰度控件并 PUT 保存", async () => {
+    // 挂载只触发 experiments GET（call #1）；不引入挂载期 flag GET，避免打乱
+    // 既有测试的顺序型 mockResolvedValueOnce 队列。
+    fetchMock.mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ items: [] }),
+    });
+    // PUT 响应（保存灰度后回写）。
+    fetchMock.mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ enabled: true, rolloutPercent: 50 }),
+    });
+
+    render(<EvolutionCenterTab enabled={true} />);
+
+    const input = (await screen.findByLabelText(/灰度比例/)) as HTMLInputElement;
+    fireEvent.change(input, { target: { value: "50" } });
+
+    const toggle = screen.getByLabelText(/启用演化灰度/) as HTMLInputElement;
+    fireEvent.click(toggle); // 关 -> 开
+
+    fireEvent.click(screen.getByText("保存灰度"));
+
+    await waitFor(() => {
+      const putCall = fetchMock.mock.calls.find(
+        ([, opts]) => opts && (opts as RequestInit).method === "PUT",
+      );
+      expect(putCall).toBeTruthy();
+      expect(putCall![0]).toBe("/api/evolution/runtime-flag");
+      const body = JSON.parse((putCall![1] as RequestInit).body as string);
+      expect(body).toMatchObject({ enabled: true, rolloutPercent: 50 });
+    });
+  });
+
+  it("读取当前配置按钮 GET runtime-flag 并回填", async () => {
+    fetchMock.mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ items: [] }),
+    });
+    // 读取当前配置 GET 返回 rolloutPercent: 30 / enabled: true
+    fetchMock.mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ enabled: true, rolloutPercent: 30 }),
+    });
+
+    render(<EvolutionCenterTab enabled={true} />);
+
+    fireEvent.click(await screen.findByText("读取当前配置"));
+
+    await waitFor(() => {
+      const input = screen.getByLabelText(/灰度比例/) as HTMLInputElement;
+      expect(input.value).toBe("30");
+    });
+  });
 });
