@@ -9,6 +9,7 @@ interface OperationsState {
   decisionReviews: DecisionReview[];
   llmUsage: LlmUsageResponse | null;
   agentRuns: AgentRunItem[];
+  loading: boolean;
   opsTab: OpsTab;
   setOpsTab: (tab: OpsTab) => void;
   loadOperationsData: (accountId?: string) => Promise<void>;
@@ -21,6 +22,7 @@ export const useOperationsStore = create<OperationsState>((set) => ({
   decisionReviews: [],
   llmUsage: null,
   agentRuns: [],
+  loading: false,
   opsTab: "tasks",
 
   setOpsTab: (tab: OpsTab) => set({ opsTab: tab }),
@@ -28,6 +30,7 @@ export const useOperationsStore = create<OperationsState>((set) => ({
   loadOperationsData: async (accountId?: string) => {
     const accountParam = accountId ? `accountId=${encodeURIComponent(accountId)}` : "";
 
+    set({ loading: true });
     try {
       // 并行加载所有数据（agent-runs 与 events 同处一次加载，确保 run envelope 视图就绪）
       const [eventsRes, tasksRes, reviewsRes, llmUsageRes, agentRunsRes] = await Promise.all([
@@ -58,6 +61,8 @@ export const useOperationsStore = create<OperationsState>((set) => ({
         llmUsage: null,
         agentRuns: [],
       });
+    } finally {
+      set({ loading: false });
     }
   },
 
