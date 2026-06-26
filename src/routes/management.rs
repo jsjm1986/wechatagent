@@ -741,7 +741,7 @@ pub(super) fn merge_product_tools(mut tools: Value) -> Value {
         }),
         json!({
             "name": "wechatagent.update_manual_tags",
-            "description": "更新好友的人工标签（manual，运营权威层；AI 永不覆盖本字段）。参数：contactId，tags（字符串数组，自动去空白去重）。"
+            "description": "更新好友的手动标签（manual，运营权威层；AI 永不覆盖本字段）。参数：contactId，tags（字符串数组，自动去空白去重）。"
         }),
         json!({
             "name": "wechatagent.write_deal_events",
