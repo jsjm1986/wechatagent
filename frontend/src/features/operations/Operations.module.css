@@ -42,6 +42,18 @@
 .cellMuted { color: var(--ink-3); }
 .cellNum { font-variant-numeric: tabular-nums; color: var(--ink-2); }
 
+/* 行内文字链接型操作 —— button 全量重置，避免全局裸 button 蓝底污染。
+   用 --color-scheduled（可点击语义色），非实心主按钮。 */
+.cellActions { white-space: nowrap; }
+.linkBtn {
+  font: inherit; font-size: 12px; font-weight: 600; letter-spacing: -.1px;
+  padding: 2px 6px; margin: 0; min-height: 0; border-radius: 6px;
+  background: transparent; border: none; box-shadow: none; cursor: pointer;
+  color: var(--color-scheduled); transition: background .15s, color .15s;
+}
+.linkBtn + .linkBtn { margin-left: 10px; }
+.linkBtn:hover { background: var(--fill-scheduled); }
+
 /* LLM 成本统计卡 */
 .usageGrid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 14px; margin-bottom: 18px; }
 .usageCard {
