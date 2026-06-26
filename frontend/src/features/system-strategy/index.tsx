@@ -2017,6 +2017,79 @@ function ProfileEditor({
       </details>
 
       <details className={styles.advanced}>
+        <summary>按关系类型分配运营范式（数字分身 per_relationship）</summary>
+        <p className={styles.panelHint}>
+          为不同关系类型(customer/peer/friend)各配一套范式。未配的关系类型回落 profile 级 operation_mode。
+        </p>
+        {(["customer", "peer", "friend"] as const).map((rt) => {
+          const map = draft.per_relationship_operation_mode ?? {};
+          const mode = map[rt];
+          const enabled = !!mode;
+          const setMode = (next: typeof mode | undefined) => {
+            const nextMap = { ...(draft.per_relationship_operation_mode ?? {}) };
+            if (next === undefined) {
+              delete nextMap[rt];
+            } else {
+              nextMap[rt] = next;
+            }
+            update({ per_relationship_operation_mode: nextMap });
+          };
+          return (
+            <div key={rt} className={styles.formGrid} data-testid={`per-rel-${rt}`}>
+              <label className={styles.inlineCheckbox}>
+                <input
+                  type="checkbox"
+                  checked={enabled}
+                  onChange={(e) =>
+                    setMode(
+                      e.target.checked
+                        ? { funnel: { enabled: true }, silence: { enabled: true }, commitment: { enabled: true }, quiet_hours: {} }
+                        : undefined,
+                    )
+                  }
+                />
+                为 {rt} 单独配置范式
+              </label>
+              {enabled && mode && (
+                <>
+                  <label className={styles.inlineCheckbox}>
+                    <input
+                      type="checkbox"
+                      checked={mode.funnel?.enabled ?? true}
+                      onChange={(e) =>
+                        setMode({ ...mode, funnel: { ...(mode.funnel ?? { enabled: true }), enabled: e.target.checked } })
+                      }
+                    />
+                    漏斗推进 funnel
+                  </label>
+                  <label className={styles.inlineCheckbox}>
+                    <input
+                      type="checkbox"
+                      checked={mode.silence?.enabled ?? true}
+                      onChange={(e) =>
+                        setMode({ ...mode, silence: { ...(mode.silence ?? { enabled: true }), enabled: e.target.checked } })
+                      }
+                    />
+                    沉默唤醒 silence
+                  </label>
+                  <label className={styles.inlineCheckbox}>
+                    <input
+                      type="checkbox"
+                      checked={mode.commitment?.enabled ?? true}
+                      onChange={(e) =>
+                        setMode({ ...mode, commitment: { ...(mode.commitment ?? { enabled: true }), enabled: e.target.checked } })
+                      }
+                    />
+                    承诺到期 commitment
+                  </label>
+                </>
+              )}
+            </div>
+          );
+        })}
+      </details>
+
+      <details className={styles.advanced}>
         <summary>领域标志位（高敏域可选）</summary>
         <div className={styles.formGrid}>
           <label className={styles.field}>
