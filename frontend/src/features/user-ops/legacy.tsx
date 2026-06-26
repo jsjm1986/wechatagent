@@ -49,6 +49,7 @@ import type {
 } from "../../types";
 import { api } from "../../lib/api";
 import { useProfileStore, labelFor } from "../../stores/profileStore";
+import { useUserOpsStore } from "../../stores/userOpsStore";
 import TagTrustPanel from "./TagTrustPanel";
 import PersonalityPanel from "./PersonalityPanel";
 
@@ -211,6 +212,7 @@ export function UserOperationCockpit({
 }) {
   const taxonomies = useProfileStore((s) => s.taxonomies);
   const relationshipOptions = taxonomies.relationship_type ?? [];
+  const clearReferral = useUserOpsStore((s) => s.clearReferral);
   if (!selected) {
     return (
       <section className="cockpitEmpty">
@@ -437,6 +439,15 @@ export function UserOperationCockpit({
               <button className="secondary" onClick={onSaveAssistOverride} disabled={busy} type="button">
                 <SquarePen size={16} />
                 保存辅助模式
+              </button>
+              <button
+                className="secondary"
+                onClick={() => void clearReferral(selected.id)}
+                disabled={busy}
+                type="button"
+              >
+                <UserRoundCheck size={16} />
+                撤销引荐 / 恢复主动运营
               </button>
             </label>
           )}

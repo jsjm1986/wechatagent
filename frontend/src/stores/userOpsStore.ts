@@ -104,6 +104,7 @@ interface UserOpsActions {
   saveCustomAgentInstructions: () => Promise<void>;
   saveAssistOverride: () => Promise<void>;
   saveRelationshipType: () => Promise<void>;
+  clearReferral: (contactId: string) => Promise<void>;
   saveManualTags: (tags: string[]) => Promise<void>;
   analyzeProfile: () => Promise<void>;
   previewGuideInstruction: (instruction: string) => Promise<void>;
@@ -494,10 +495,25 @@ export const useUserOpsStore = create<UserOpsState & UserOpsActions>((set, get) 
     }
   },
 
+  clearReferral: async (contactId: string) => {
+    const currentAccountId = useAccountStore.getState().currentAccountId();
+    useUiStore.getState().setBusy(true);
+    useUiStore.getState().setError("");
+
+    try {
+      await api.post(`/api/contacts/${contactId}/clear-referral`);
+      await refreshContacts(currentAccountId);
+    } catch (error) {
+      useUiStore.getState().setError(error instanceof Error ? error.message : String(error));
+    } finally {
+      useUiStore.getState().setBusy(false);
+    }
+  },
+
   saveManualTags: async (tags: string[]) => {
     // 标签可信度改造 - 运营录入层：保存运营录入标签，后端权威覆盖。
-    const selected = useContactStore.getState().selected;
     const currentAccountId = useAccountStore.getState().currentAccountId();
+    const selected = useContactStore.getState().selected;
     if (!selected) return;
 
     useUiStore.getState().setBusy(true);

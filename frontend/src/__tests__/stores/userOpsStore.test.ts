@@ -89,3 +89,15 @@ describe("userOpsStore.loadMessages", () => {
     expect(st.operationHealth).toBeNull();             // 失败面板保持默认
   });
 });
+
+describe("userOpsStore.clearReferral", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    useContactStore.setState({ contacts: [], selected: null, contactTab: "all" });
+  });
+
+  it("clearReferral 调用撤销引荐端点", async () => {
+    await useUserOpsStore.getState().clearReferral("C1");
+    expect(api.post).toHaveBeenCalledWith("/api/contacts/C1/clear-referral");
+  });
+});
