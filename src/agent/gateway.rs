@@ -801,6 +801,63 @@ pub(crate) fn should_run_send(outbox_eligible: bool, media_pending: bool) -> boo
     outbox_eligible || media_pending
 }
 
+/// GATE-1:终态动作闸 —— 按 contact 当前 `operation_state` 校验"该状态是否允许本次
+/// action"。命中 forbidden / allowlist 收敛模式不含本次 action 时,置
+/// `held_by_ai_policy` + `should_reply=false` + 追加 risk + 落审计事件,并把传入的
+/// `finalize_status` 改成 `Held("held_by_ai_policy")`。
+///
+/// 初次 finalize 与 single-shot revision 后各调一次:revision 会整条替换
+/// `final_decision`,可能把 `operation_state` 迁到禁止 reply 的态,故必须对改写后的
+/// decision 复检,否则绕过。老库无 `operation_state_policies` 行 →
+/// `enforce_state_action_policy(None, _)` fallthrough(向前兼容),不会绕过 outbox。
+#[allow(clippy::too_many_arguments)]
+async fn apply_state_action_gate(
+    state: &AppState,
+    contact: &Contact,
+    final_decision: &mut AgentDecision,
+    review: &mut DecisionReviewResult,
+    finalize_status: &mut GatewayStatusFinal,
+    run_id: &str,
+) -> AppResult<()> {
+    let policy_opt = load_operation_state_policy_for_contact(
+        state,
+        &contact.workspace_id,
+        final_decision.operation_state.as_deref().unwrap_or(""),
+        &contact.wxid,
+    )
+    .await?;
+    let action = classify_decision_action(final_decision);
+    if let Err(reason) = enforce_state_action_policy(policy_opt.as_ref(), action) {
+        review.approved = false;
+        review.final_review_status = "held_by_ai_policy".to_string();
+        final_decision.should_reply = false;
+        final_decision.autonomy_mode = "blocked".to_string();
+        if !review.risks.iter().any(|r| r == "state_action_policy_blocked") {
+            review.risks.push("state_action_policy_blocked".to_string());
+        }
+        *finalize_status = GatewayStatusFinal::Held("held_by_ai_policy".to_string());
+        write_event_for_account(
+            state,
+            &contact.account_id,
+            Some(&contact.wxid),
+            "state_action_policy_blocked",
+            "blocked",
+            &reason,
+            Some(doc! {
+                "run_id": run_id,
+                "action": action,
+                "operation_state": final_decision
+                    .operation_state
+                    .clone()
+                    .unwrap_or_default(),
+                "reason": reason.clone(),
+            }),
+        )
+        .await?;
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_user_operation_gateway_inner(
     state: &AppState,
@@ -1414,43 +1471,15 @@ async fn run_user_operation_gateway_inner(
     // 老库无 `operation_state_policies` 行 → `enforce_state_action_policy(None, _)`
     // fallthrough（向前兼容）；该入口不会绕过 outbox / idempotency。
     if matches!(finalize_status, GatewayStatusFinal::Approved) {
-        let policy_opt = load_operation_state_policy_for_contact(
+        apply_state_action_gate(
             state,
-            &contact.workspace_id,
-            final_decision.operation_state.as_deref().unwrap_or(""),
-            &contact.wxid,
+            &contact,
+            &mut final_decision,
+            &mut review,
+            &mut finalize_status,
+            &run_id,
         )
         .await?;
-        let action = classify_decision_action(&final_decision);
-        if let Err(reason) = enforce_state_action_policy(policy_opt.as_ref(), action) {
-            review.approved = false;
-            review.final_review_status = "held_by_ai_policy".to_string();
-            final_decision.should_reply = false;
-            final_decision.autonomy_mode = "blocked".to_string();
-            if !review.risks.iter().any(|r| r == "state_action_policy_blocked") {
-                review.risks.push("state_action_policy_blocked".to_string());
-            }
-            finalize_status =
-                GatewayStatusFinal::Held("held_by_ai_policy".to_string());
-            write_event_for_account(
-                state,
-                &contact.account_id,
-                Some(&contact.wxid),
-                "state_action_policy_blocked",
-                "blocked",
-                &reason,
-                Some(doc! {
-                    "run_id": &run_id,
-                    "action": action,
-                    "operation_state": final_decision
-                        .operation_state
-                        .clone()
-                        .unwrap_or_default(),
-                    "reason": reason.clone(),
-                }),
-            )
-            .await?;
-        }
 
         // ── Phase A / A3：taxonomy 软闸 ──
         //
@@ -1719,6 +1748,19 @@ async fn run_user_operation_gateway_inner(
                             final_decision.reply_text.chars().count(),
                             review.risks
                         ));
+                        // GATE-1:revision 整条替换 final_decision,operation_state 可能迁入
+                        // 禁止 reply 的态。初次动作闸只校验了改写前的 decision,这里对改写后的
+                        // final_decision 复检一次,命中 forbidden 时把外层 finalize_status 置
+                        // Held —— 下游统一拦截分支据此 fail-closed,不 enqueue outbox。
+                        apply_state_action_gate(
+                            state,
+                            &contact,
+                            &mut final_decision,
+                            &mut review,
+                            &mut finalize_status,
+                            &run_id,
+                        )
+                        .await?;
                     } else {
                         // R2.4：第二轮仍 fail → revision_failed
                         revision_applied = true;
