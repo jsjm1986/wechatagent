@@ -2,6 +2,9 @@ import { render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import KnowledgeFeature from "../../../features/knowledge";
+import { DomainSchemaTab } from "../../../features/knowledge/atlas";
+import { ConfirmProvider } from "../../../components/ui/ConfirmDialog";
+import { ToastProvider } from "../../../components/ui/Toast";
 
 // knowledge 频道 IA 重组后的视觉/集成测试。
 // 验证：(1) 自包含 KnowledgeFeature 渲染档案馆小标题 + 工作站标题（Shell 拥有页头）；
@@ -152,5 +155,90 @@ describe("KnowledgeFeature — 一体化频道（全量重塑视觉壳）", () =
     } finally {
       window.localStorage.removeItem("knowledgeChat.sessionId");
     }
+  });
+});
+
+describe("DomainSchemaTab — D9 字段表写表单（create/edit/delete 对接 CRUD）", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+  afterEach(() => {
+    globalThis.fetch = realFetch;
+  });
+
+  function renderTab() {
+    return render(
+      <ToastProvider>
+        <ConfirmProvider>
+          <DomainSchemaTab />
+        </ConfirmProvider>
+      </ToastProvider>,
+    );
+  }
+
+  it("D9: 新建字段表 POST 到 /api/admin/domain-schemas，body 含 camelCase schemaId", async () => {
+    const fetchMock = vi.fn(async (url: unknown, init?: { method?: string; body?: string }) => {
+      const u = String(url);
+      // create POST 返回 ok；list GET 返回空。
+      const body =
+        u.includes("/api/admin/domain-schemas") && init?.method === "POST"
+          ? { ok: true }
+          : { items: [] };
+      return {
+        ok: true,
+        status: 200,
+        async json() {
+          return body;
+        },
+        async text() {
+          return JSON.stringify(body);
+        },
+      } as unknown as Response;
+    });
+    globalThis.fetch = fetchMock as typeof fetch;
+
+    const user = userEvent.setup();
+    renderTab();
+
+    // 空态出现后点「+ 新建字段表」。
+    await screen.findByText("还没有配置字段表");
+    await user.click(screen.getByText("+ 新建字段表"));
+
+    // 填 schemaId + name → 保存。
+    await user.type(screen.getByPlaceholderText(/schemaId/i), "real_estate");
+    await user.type(screen.getByPlaceholderText(/字段表名称/), "房产销售");
+    await user.click(screen.getByText("保存"));
+
+    const call = fetchMock.mock.calls.find(
+      (c) => String(c[0]) === "/api/admin/domain-schemas" && (c[1] as { method?: string })?.method === "POST",
+    );
+    expect(call).toBeTruthy();
+    const sent = JSON.parse((call as unknown as [string, { body: string }])[1].body);
+    expect(sent).toHaveProperty("schemaId", "real_estate");
+    expect(sent).toHaveProperty("name", "房产销售");
+    // wire 键 camelCase（非 snake_case）。
+    expect(sent).toHaveProperty("aliasDict");
+    expect(sent).not.toHaveProperty("alias_dict");
+  });
+
+  it("D9: 文案不再承诺只读（去掉「不能直接改内容」，出现「创建、编辑、删除」）", async () => {
+    globalThis.fetch = vi.fn(async () => {
+      const body = { items: [] };
+      return {
+        ok: true,
+        status: 200,
+        async json() {
+          return body;
+        },
+        async text() {
+          return JSON.stringify(body);
+        },
+      } as unknown as Response;
+    }) as typeof fetch;
+
+    renderTab();
+    await screen.findByText("还没有配置字段表");
+    expect(screen.queryByText(/不能直接改内容/)).toBeNull();
+    expect(screen.getByText(/创建、编辑、删除字段表/)).toBeInTheDocument();
   });
 });
