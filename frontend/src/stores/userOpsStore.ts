@@ -281,30 +281,26 @@ export const useUserOpsStore = create<UserOpsState & UserOpsActions>((set, get) 
 
   // 加载选中联系人的数据
   loadMessages: async (contact) => {
-    try {
-      const [
-        messagesData,
-        memoryData,
-        candidateData,
-        reviewsData,
-        healthData
-      ] = await Promise.all([
-        api.get<{ items: Message[] }>(`/api/contacts/${contact.id}/messages?limit=50`),
-        api.get<{ item: OperatingMemory }>(`/api/contacts/${contact.id}/operating-memory`),
-        api.get<{ items: MemoryCandidateItem[] }>(`/api/contacts/${contact.id}/memory-candidates?limit=30`),
-        api.get<{ items: DecisionReview[] }>(`/api/contacts/${contact.id}/decision-reviews?limit=20`),
-        api.get<any>(`/api/contacts/${contact.id}/operation-health`)
-      ]);
-
-      set({
-        messages: messagesData.items,
-        operatingMemory: memoryData.item,
-        memoryCandidates: candidateData.items,
-        decisionReviews: reviewsData.items,
-        operationHealth: healthData
-      });
-    } catch (error) {
-      useUiStore.getState().setError(error instanceof Error ? error.message : String(error));
+    const [messagesR, memoryR, candidateR, reviewsR, healthR] = await Promise.allSettled([
+      api.get<{ items: Message[] }>(`/api/conversations/${contact.id}/messages?limit=50`),
+      api.get<{ item: OperatingMemory }>(`/api/contacts/${contact.id}/operating-memory`),
+      api.get<{ items: MemoryCandidateItem[] }>(`/api/contacts/${contact.id}/memory-candidates?limit=30`),
+      api.get<{ items: DecisionReview[] }>(`/api/decision-reviews?contactId=${contact.id}&limit=20`),
+      api.get<OperationHealth>(`/api/contacts/${contact.id}/operation-health`),
+    ]);
+    set({
+      messages: messagesR.status === "fulfilled" ? messagesR.value.items : [],
+      operatingMemory: memoryR.status === "fulfilled" ? memoryR.value.item : null,
+      memoryCandidates: candidateR.status === "fulfilled" ? candidateR.value.items : [],
+      decisionReviews: reviewsR.status === "fulfilled" ? reviewsR.value.items : [],
+      operationHealth: healthR.status === "fulfilled" ? healthR.value : null,
+    });
+    const firstErr = [messagesR, memoryR, candidateR, reviewsR, healthR]
+      .find((r) => r.status === "rejected") as PromiseRejectedResult | undefined;
+    if (firstErr) {
+      useUiStore.getState().setError(
+        firstErr.reason instanceof Error ? firstErr.reason.message : String(firstErr.reason),
+      );
     }
   },
 
