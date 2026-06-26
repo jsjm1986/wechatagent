@@ -2246,6 +2246,25 @@ function DomainProfilePanel({ busy }: { busy: boolean }) {
           <span className={styles.profileActiveMeta}>
             v{activeProfile.version} · {activeProfile.profile_id}
           </span>
+          {/* D4：复用资源无关的版本动作条，对生效 profile 暴露发布新版本 / 切到当前 / 回滚。
+              meta.id 必须填后端 :id 路径参数期望的 ObjectId hex（DomainProfile.id 即
+              profile_view 注入的 _id hex，与 publish/rollout/rollback handler 的
+              parse_object_id 同源）。 */}
+          <ActiveVersionsBar
+            meta={{
+              id: activeProfile.id,
+              version: activeProfile.version,
+              currentVersion: activeProfile.current_version,
+              previousVersion: activeProfile.previous_version,
+              seededBy: activeProfile.seeded_by,
+              updatedAt: activeProfile.updated_at,
+            }}
+            endpointPrefix="/api/admin/domain-profiles"
+            resourceLabel="行业画像"
+            busy={busy}
+            canPublish
+            onAfterAction={() => void loadDomainProfiles()}
+          />
         </div>
       )}
 
