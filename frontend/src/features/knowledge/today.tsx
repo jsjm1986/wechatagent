@@ -126,7 +126,7 @@ export function ChatWorkbench({ initialAttachChunkId }: { initialAttachChunkId?:
     if (!sessionId || typeof window === "undefined" || typeof window.EventSource === "undefined") return;
     const handle = createSseReconnector(
       `/api/knowledge/chat/sessions/${encodeURIComponent(sessionId)}/stream`,
-      { onEvent: { turn: () => { void loadHistory(sessionId); } } },
+      { onEvent: { turn: () => { void loadHistory(sessionId); } }, terminalEvents: ["close"] },
     );
     return () => handle.close();
   }, [sessionId, loadHistory]);
@@ -800,7 +800,7 @@ export function TaskRail() {
     if (!sid || typeof window === "undefined" || typeof window.EventSource === "undefined") return;
     sseRef.current = createSseReconnector(
       `/api/knowledge/chat/sessions/${encodeURIComponent(sid)}/stream`,
-      { onEvent: { turn: (ev) => { const v = Number(ev.data); if (!Number.isNaN(v)) setLiveTurns((prev) => [...prev, v]); } } },
+      { onEvent: { turn: (ev) => { const v = Number(ev.data); if (!Number.isNaN(v)) setLiveTurns((prev) => [...prev, v]); } }, terminalEvents: ["close"] },
     );
   }
 
