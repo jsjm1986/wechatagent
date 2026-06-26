@@ -49,6 +49,28 @@ export function EscalationInline({ item, ctx }: { item: InboxItem; ctx: RowCtx }
     <div className="escalationInline">
       <div className="escalationInlineTitle">{item.title}</div>
       <div className="escalationInlineSummary">{item.summary}</div>
+      {(item.contactWxid || item.questionForPrincipal || item.category) && (
+        <dl className="escalationInlineMeta">
+          {item.contactWxid && (
+            <>
+              <dt>客户</dt>
+              <dd>{item.contactWxid}</dd>
+            </>
+          )}
+          {item.questionForPrincipal && (
+            <>
+              <dt>具体问题</dt>
+              <dd>{item.questionForPrincipal}</dd>
+            </>
+          )}
+          {item.category && (
+            <>
+              <dt>类别</dt>
+              <dd>{item.category}</dd>
+            </>
+          )}
+        </dl>
+      )}
       <label htmlFor={`verdict-${code}`}>裁决类型</label>
       <select
         id={`verdict-${code}`}
