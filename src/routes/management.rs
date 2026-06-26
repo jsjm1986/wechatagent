@@ -981,7 +981,6 @@ pub(super) fn tool_effect(tool_name: &str) -> ToolEffect {
         | "wechatagent.publish_prompt_template"
         | "wechatagent.edit_state_machine"
         | "wechatagent.provider_activate"
-        | "wechatagent.rollout_evolution_proposal"
         | "wechatagent.verify_knowledge_chunk"
         | "wechatagent.reject_knowledge_chunk"
         // 批 1：rollout/rollback/activate/灰度立即生效 → 高风险
@@ -1657,11 +1656,12 @@ pub(super) async fn execute_management_tool(
             Ok(resp.0)
         }
         "wechatagent.provider_test" => {
-            // test_provider 无 Path，workspace 从 body.workspaceId 取；显式塞入传入 workspace_id。
+            // test_provider 无 Path，workspace 从 body.workspaceId 取；强制覆盖为可信的
+            // 传入 workspace_id（同 provider_activate），丢弃 LLM arguments 里可能注入的
+            // workspaceId，防跨租户读他人 provider 配置 apiKey 发起连通测试。
             let mut args = planned.arguments.clone();
             if let Some(map) = args.as_object_mut() {
-                map.entry("workspaceId")
-                    .or_insert_with(|| json!(workspace_id));
+                map.insert("workspaceId".to_string(), json!(workspace_id));
             } else {
                 args = json!({ "workspaceId": workspace_id });
             }
