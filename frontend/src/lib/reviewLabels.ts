@@ -1,7 +1,7 @@
 // C7/C8 共用:最终复核状态 + 暂缓类别的中文闭集标签。
 // 闭集对齐后端:FINAL_REVIEW_STATUS_VALUES(run_envelope.rs:67-78,10 项)、
 // HOLD_CATEGORY_VALUES(types.rs:1227-1231,3 项)。措辞遵守 AI 自主定位
-// (见 scripts/check-no-human-takeover.sh 的禁词闸,frontend/src 新增行受扫)。
+// (见 scripts/ 下的自治禁词闸 CI lint,frontend/src 新增行受扫)。
 
 export const FINAL_REVIEW_STATUS_LABELS: Record<string, string> = {
   approved: "已通过",
