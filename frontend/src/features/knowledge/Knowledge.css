@@ -333,6 +333,53 @@
     font-size: 12px;
     color: var(--ink-2);
   }
+  /* D9 · 字段表内联编辑器 DomainSchemaEditor */
+  .knowledgeWiki .wikiSchemaEditor {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+    border: 1px solid var(--hairline);
+    border-radius: 10px;
+    background: var(--surface-card);
+    padding: 16px 18px;
+    margin-bottom: 12px;
+  }
+  .knowledgeWiki .wikiField {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+  }
+  .knowledgeWiki .wikiField > span {
+    font-size: 12px;
+    color: var(--ink-3);
+  }
+  .knowledgeWiki .wikiSchemaEditorFields {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }
+  .knowledgeWiki .wikiSchemaEditorRow {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 8px;
+    border: 1px solid var(--hairline);
+    border-radius: 8px;
+    background: var(--surface-page);
+    padding: 8px 10px;
+  }
+  .knowledgeWiki .wikiInlineCheckbox {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    font-size: 12px;
+    color: var(--ink-2);
+  }
+  .knowledgeWiki .wikiSchemaEditorActions {
+    display: flex;
+    justify-content: flex-end;
+    gap: 8px;
+  }
   /* GapSignalsTab */
   .knowledgeWiki .wikiSignalList {
     display: flex;
