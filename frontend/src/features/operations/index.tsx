@@ -39,12 +39,20 @@ function taskStatusTone(status?: string): StatusTone {
   return "inactive";
 }
 
-function formatScores(scores: Record<string, number>) {
-  const keys = ["humanLike", "emotionalValue", "hallucinationScore", "knowledgeGroundingScore", "pressureRisk"];
+const SCORE_LABELS: Record<string, string> = {
+  humanLike: "拟人度",
+  emotionalValue: "情绪价值",
+  hallucinationScore: "幻觉风险",
+  knowledgeGroundingScore: "知识接地",
+  pressureRisk: "压迫风险",
+  boundaryPrivacySafety: "隐私边界",
+};
+
+export function formatScores(scores: Record<string, number>) {
+  const entries = Object.entries(scores ?? {}).filter(([, v]) => v !== undefined && v !== null);
   return (
-    keys
-      .filter((key) => scores[key] !== undefined)
-      .map((key) => `${key}:${scores[key]}`)
+    entries
+      .map(([key, v]) => `${SCORE_LABELS[key] ?? key}:${v}`)
       .join(" / ") || "-"
   );
 }

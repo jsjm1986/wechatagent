@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { render, screen } from "@testing-library/react";
-import OperationsFeature from "../../../features/operations";
+import OperationsFeature, { formatScores } from "../../../features/operations";
 import { useOperationsStore } from "../../../stores/operationsStore";
 import { useAccountStore } from "../../../stores/accountStore";
 import { api } from "../../../lib/api";
@@ -114,5 +114,20 @@ describe("OperationsFeature", () => {
     await waitFor(() =>
       expect(api.post).toHaveBeenCalledWith("/api/agent-tasks/1/review-now"),
     );
+  });
+});
+
+describe("formatScores 动态遍历(E13)", () => {
+  it("渲染 boundaryPrivacySafety 隐私维度(不再被白名单丢弃)", () => {
+    const out = formatScores({ humanLike: 8, boundaryPrivacySafety: 7 });
+    expect(out).toContain("拟人度:8");
+    expect(out).toContain("隐私边界:7");
+  });
+  it("未知 key 回落原始 key 名,不吞", () => {
+    const out = formatScores({ someNewDimension: 5 });
+    expect(out).toContain("someNewDimension:5");
+  });
+  it("空 scores 回落 -", () => {
+    expect(formatScores({})).toBe("-");
   });
 });
