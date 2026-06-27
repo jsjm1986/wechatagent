@@ -421,16 +421,29 @@ pub(crate) async fn decide_reply_with_promote(
     } else {
         String::new()
     };
-    // ④升档盲区修复（2026-06-27）：assist_on 账号在 Lean/Relational 档注入「辅助模式告知段」。
-    // 名片引荐是「推真人名片」重动作，候选清单保持仅 Full 档加载（上方 include_business 门控）；
-    // 但 Lean 档若不告知 AI「本账号开了辅助模式、遇引荐场景该升档」，AI 永远不会主动升 Full 去
-    // 看名片清单。本段只在「辅助模式开 + 非 Full 档」非空——升档由 LLM 语义自评驱动（agent-first，
-    // 不列具体触发词）。assist 关账号（默认全自治）= 空串、prompt 不变；Full 档已有完整名片清单
-    // → 空串、字节等价。与 referral_block 档位互斥（最多一个非空），复用同一 prompt 占位、零结构变化。
-    // 措辞红线：用「专属顾问 / 辅助模式」，定位为「AI 主动增配顾问」，绝不出现把客户交给真人
-    // 那类措辞（受提交期文本 lint 约束 + CLAUDE.md 受控例外语义）。
-    let assist_hint_text = if assist_on && !include_business {
+    // ④升档盲区 + 红线让位修复（2026-06-27）：原单段 assist_hint_text 只在 Lean/Relational
+    // 催升档，但实测 AI 升 Full 拿到名片清单的那一刻，被两句恒注入的反向承接强红线碾压、主动
+    // 拒绝引荐。这两句强红线（反向承接语义）分别是：
+    //   · prompts.rs:1142（boundary_protection 段）：「回复里除"我"之外不得再出现任何可兜底/
+    //     可接收诉求的人类角色」；
+    //   · prompts.rs:1165（表达红线段，任何模式任何轮次适用）：「严禁承诺安排真人/让同事来联系/
+    //     稍后有人对接你/转接客服，也不得编造或暗示存在可升级的真人/上级/团队后台」。
+    // 让位声明要对抗的正是这两句恒注入强红线。故拆两段：
+    //   (1) assist_escalation_hint：仅 Lean/Relational（!include_business）催升档——升 Full 后
+    //       已有完整名片清单，不必再催。
+    //   (2) assist_redline_yield：**任何档都注入**（assist_on）——让位声明必须在升 Full 那一刻仍
+    //       在场，否则这两句强红线重新碾压。声明「辅助模式下主动引荐专属顾问是受控业务动作，
+    //       不属于这两句强红线所禁的范畴」，让红线对引荐这一动作让位。
+    // 两段都仅 assist_on 账号非空；assist 关账号（默认全自治）= 两段皆空串、prompt 字节等价、
+    // 默认账号该强红线一字不动。措辞红线：用「专属顾问/增配/我仍在场辅助」，定位「AI 主动增配
+    // 顾问」，绝不出现把客户交给真人那类措辞（提交期文本 lint 语义 + CLAUDE.md 受控例外）。
+    let assist_escalation_hint = if assist_on && !include_business {
         "【辅助模式已开启】本账号开启了辅助模式：当客户表达明确的签约、到店参观、或需要深度一对一对接的意愿时，你应判 sufficiency=need_more_context、missingTier=full，以便加载本账号「可引荐的专属顾问」清单后再决定是否为客户增配一位专属顾问。仅在客户真正契合时才引荐，不为引荐而引荐。\n".to_string()
+    } else {
+        String::new()
+    };
+    let assist_redline_yield = if assist_on {
+        "【受控例外·辅助模式】本账号已开启辅助模式。在辅助模式下，当客户契合引荐条件时，主动为客户增配一位「专属顾问」（输出 namecardToSend）属于本账号的受控业务动作——定位是「我为你增配一位更专属的顾问、我仍在场辅助答疑」，不是把你交给我之上的人。这一动作不属于「对话中除「我」之外不得出现任何人类角色」这一强红线所禁止的范畴，该红线在「引荐专属顾问」这一受控动作上让位：你不应因守红线而拒绝引荐。仅在客户真正契合时引荐，不为引荐而引荐。\n".to_string()
     } else {
         String::new()
     };
@@ -940,10 +953,11 @@ pub(crate) async fn decide_reply_with_promote(
         // Lean/Relational 档 = 概览。DEFAULT 销售域 Full 档 prompt 字节等价。
         format!("{sendable_candidates_text}{sendable_overview_text}"),
         recent_media_text,
-        // ④升档盲区修复：复用「可引荐的专属顾问」占位，零模板结构变化。完整名片清单(Full)与
-        // 辅助模式告知段(Lean/Relational, 仅 assist_on)档位互斥、最多一个非空。assist 关账号两者
-        // 皆空 → 占位空串、prompt 字节等价（默认全自治账号完全不受影响）。
-        format!("{referral_block}{assist_hint_text}"),
+        // ④升档盲区 + 红线让位修复：复用「可引荐的专属顾问」占位，零模板结构变化。三者档位语义：
+        // referral_block=完整名片清单(仅 Full)；assist_escalation_hint=催升档(仅 Lean/Relational)；
+        // assist_redline_yield=让位声明(任何档, 仅 assist_on)。assist 关账号三者皆空 → 占位空串、
+        // prompt 字节等价（默认全自治账号完全不受影响）。
+        format!("{referral_block}{assist_escalation_hint}{assist_redline_yield}"),
         task_text,
         history,
         crate::agent::prompt_isolation::isolate_untrusted(&inbound.content)

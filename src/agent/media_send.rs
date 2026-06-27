@@ -95,6 +95,15 @@ pub(crate) fn render_candidate_overview(candidates: &[&ContentAsset]) -> String 
             out.push_str(&format!("- {} | 发送时机：{hint}\n", a.title));
         }
     }
+    // ③升档盲区修复（2026-06-27）：A/B 已证「passive 客观罗列」不足以驱动升档——
+    // LLM 在 Lean 档看到素材线索后会自评 enough 停档，导致承诺发素材却拿不到 assetId。
+    // 故此处补一句**显式升档引导**（与 ④ assist_hint 同构）：只描述"契合即升档"的语义
+    // 条件，不列任何触发关键词（守 agent-first，是否契合由 LLM 判）。
+    out.push_str(
+        "以上仅为线索概览。若你判断客户当前消息契合其中某条素材的发送时机，应判 \
+         sufficiency=need_more_context、missingTier=full，以便加载完整清单（含可发送的素材标识）\
+         后再决定是否发送；不契合就正常回复，不为发而发。\n",
+    );
     out
 }
 
@@ -444,5 +453,17 @@ mod tests {
     #[test]
     fn overview_empty_candidates_is_empty() {
         assert_eq!(render_candidate_overview(&[]), "");
+    }
+
+    #[test]
+    fn overview_appends_escalation_guidance_when_nonempty() {
+        // 非空候选：概览末尾必须带显式升档引导（A/B 已证 passive 列举不足以升档）。
+        let mut a = asset(Some(true), Some("approved"), Some("file"), None);
+        a.title = "报价单".to_string();
+        let out = render_candidate_overview(&[&a]);
+        // 升档引导：语义描述"契合就判 need_more_context + missingTier=full"，不列触发词。
+        assert!(out.contains("need_more_context"), "概览应含升档引导关键判定");
+        assert!(out.contains("missingTier") || out.contains("full"),
+                "升档引导应指明升 full 档");
     }
 }

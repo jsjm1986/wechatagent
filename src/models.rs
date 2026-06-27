@@ -3815,6 +3815,13 @@ mod typed {
         /// 弃用理由。≤ 200 chars。仅在 `deprecated_at == Some` 时有意义。
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub deprecation_reason: Option<String>,
+        /// ⑨记忆冲突机制侧兜底（2026-06-27）：consolidator 在固化时对这条 fact 做语义维度归类
+        /// （如"孩子年龄""预算"），**是 LLM 的语义归类，不是关键词匹配**。合并时（compact）同一
+        /// dimension 的 incoming 与 prev fact 视为冲突 → 新值胜、旧值自动移入 deprecated，不依赖
+        /// LLM 主动填 discarded。None = 未归类（旧数据 / consolidator 未输出）→ 退回按 text 去重
+        /// 的旧行为（字节等价）。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub dimension: Option<String>,
         /// 触发本条 fact 的入站消息 id 列表。≤ 5（写入侧 cap）。
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         pub source_message_ids: Vec<ObjectId>,
@@ -3848,6 +3855,7 @@ mod typed {
                 may_expire: false,
                 deprecated_at: None,
                 deprecation_reason: None,
+                dimension: None,
                 source_message_ids: Vec::new(),
                 source_run_id: None,
                 created_at: DateTime::from_millis(0),
@@ -3871,6 +3879,7 @@ mod typed {
                 may_expire: false,
                 deprecated_at: None,
                 deprecation_reason: None,
+                dimension: None,
                 source_message_ids: Vec::new(),
                 source_run_id: None,
                 created_at: now,
@@ -4885,6 +4894,7 @@ mod typed_tests {
             may_expire: true,
             deprecated_at: None,
             deprecation_reason: None,
+            dimension: None,
             source_message_ids: vec![ObjectId::new(), ObjectId::new()],
             source_run_id: Some("run-abc".to_string()),
             created_at: DateTime::from_millis(1_700_000_000_000),

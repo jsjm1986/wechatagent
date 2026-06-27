@@ -12,7 +12,7 @@ use crate::{
     models::{AgentSoul, OperationDomainConfig, OperationPlaybook, PromptTemplate},
 };
 
-pub const PROMPT_PACK_VERSION: &str = "wechatagent_prompt_pack_v14_2026_06_27_escalation_and_memory_conflict";
+pub const PROMPT_PACK_VERSION: &str = "wechatagent_prompt_pack_v15_2026_06_27_escalation_required_and_memory_dimension";
 
 /// universal-domain-adaptation A/T1：user.reply.policy prompt「## 模式与 5 闸的关系」
 /// 模式-闸说明段（逐字复刻 prompt pack v3 现文 :958-963：标题 + casual_relationship /
@@ -1353,11 +1353,11 @@ fn prompt_specs() -> Vec<PromptSpec> {
   // 当客户明确契合某顾问的触发提示（如要签约/要到店参观/需要深入对接）时，可选一位引荐。
   "namecardToSend": { "cardId": "只能填上方「可引荐的专属顾问」清单里出现的 cardId，禁止编造", "reason": "为什么这一刻把这位顾问引荐给客户" },
 
-  // ── 决策墙请示（escalationRequest，可选；不需要时整个字段省略） ──
-  // escalationRequest：仅当你判断本轮遇到"决策墙"（超出你的职权/能力，需要幕后领导拍板）时输出；否则整个字段省略或 needed=false。
-  // 判定按"事项实质"，不是客户嘴上"要换人对接"——客户嘴上要换人但事项你能处理，就继续自己处理，不要 escalate。
+  // ── 决策墙请示（escalationRequest，条件必填） ──
+  // escalationRequest：判定按**事项实质**——一旦你判断本轮触及超出自身职权的「决策墙」（合同变更 / 特殊折扣 / 退款纠纷 / 法律承诺 / 定制需求等超出标准政策权限的事项，或风险被闸门拦下、需领导授权才能答的件），该字段就**不是可选、而是必填**：必须输出 needed=true 并填对应 category。只有本轮**确实没有**触及任何决策墙时，才省略该字段或填 needed=false。
+  // 判定看事项实质，不是客户嘴上"要换人对接"——客户嘴上要换人但事项你能处理，就继续自己处理，不要 escalate。
   // 重要：即使你输出 escalationRequest，这一轮的 reply 仍要正常写——把"安抚占位话术 + selfServiceablePart 里你能自主答的部分"自然地融进 reply 一起发给客户（reply 会照常经发送链路送达，请示是后台动作，客户不会冷场）。绝不要把 reply 留空。
-  // 【自洽硬约束】reply 与 escalationRequest 必须一致：如果你在 replyText 里向客户表达了"这事我需要向上反馈 / 向领导确认一下 / 帮你申请看看 / 我确认之后再答复你"这类意思，就说明你已判定本轮触及了超出自身职权的决策墙——此时必须同步输出 escalationRequest(needed=true) 并填对应 category。只在 replyText 口头说"要请示/要确认"却不输出 escalationRequest，等于这件事永远到不了幕后决策源、你对客户的承诺会落空。所以二选一：要么你自己有职权直接答（reply 里就别说要请示），要么你说了要请示就必须 emit escalationRequest。这是结构与话术的一致性要求，对所有 category 生效。
+  // 【自洽自检·必做】如果你在 replyText 里向客户表达了"这事我需要向上反馈 / 向领导确认一下 / 帮你申请看看 / 我确认之后再答复你"这类意思，就说明你已判定本轮触及了决策墙——此时**省略 escalationRequest 就是自相矛盾**：口头向客户承诺了请示，但结构化字段缺失会让这件事永远到不了幕后决策源、承诺落空。所以二选一：要么你自己有职权直接答（reply 里就别说要请示），要么你说了要请示就**必须** emit escalationRequest(needed=true)。这条对所有 category 生效。
   // 三类（category 取其一）：
   //   out_of_scope_decision：合同变更/特殊折扣/退款纠纷/法律承诺/定制需求等超出标准政策权限。
   //   high_risk_gated：触及未验证产品声明、或风险被闸门拦下、需领导授权才能答的件。
@@ -1471,6 +1471,7 @@ fn prompt_specs() -> Vec<PromptSpec> {
 - recentFacts 最多 10 条，按 recency（越新越靠前）排列；放近期但不一定长期重要的事实。
 - 不要在 coreFacts 中重复 recentFacts 已经覆盖的内容。
 - 系统会自动合并上一版 memoryCard 中未在 `discarded` 里出现的 coreFacts；要让某条旧 coreFact 失效，必须显式列入 `discarded`。
+- 每条 fact 可选带 dimension 字段：对这条事实做语义维度归类（如客户的某个稳定属性维度）。当客户改口 / 更正某维度的旧信息时，给新 fact 标同一 dimension——系统会自动让该维度的旧值退出生效层（你不必手动把旧值列进 discarded）。同一维度同时只应保留一条生效 fact。
 - preferences 最多 8 条，doNotDo 最多 10 条。
 - commitments、objections、openLoops 各最多 8 条。
 - recentEpisodeSummary 用短自然语言，不要流水账。
