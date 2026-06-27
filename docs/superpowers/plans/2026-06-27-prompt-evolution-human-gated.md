@@ -539,38 +539,173 @@ Expected: 编译通过（按 memory `config_field_add_test_helpers`：本地 `ca
 
 ---
 
-## 阶段二：证据闭环（骨架，待阶段一落地后细化）
+## 阶段二：证据闭环（已核实细化 2026-06-28，基于 phase2 分支真实签名）
 
-> 阶段二涉及改 `decision.rs` / `review/mod.rs` 多处签名加 `prompt_override`，真实代码量大且需逐一核实当前签名（13+ 入参）。本章先锁定目标/文件/接口/验收，**待阶段一合并后**用同一份 plan 文档补全 bite-sized TDD 步骤（届时重新 Read decision.rs/review/mod.rs/simulation.rs 确认签名无变化）。
+> 目标：对 cohort.prompt 每条历史失败 run，用「原 prompt + 追加候选片段」跑真模型 Reply+Review，记新旧 5 闸/自评对照存入 `proposal.eval_metrics`，**作为人工 release 的参考证据，不自动放行**。修 G1（replay placeholder）+ G4（假基线）。
 
-### 目标
-对 cohort.prompt 每条历史失败 run，用「原 prompt + 追加候选片段」跑真模型 Reply+Review，记新旧 `review.scores` 对照存入 proposal，**作为人工 release 的参考证据，不自动放行**。修 G1（replay placeholder）+ G4（假基线）。
+### 已核实的真实签名 / 行号（phase2 分支，写代码以此为准，勿用旧骨架数字）
 
-### 文件结构
-- **Create** `src/agent/prompt_shadow.rs` — 与 `simulation.rs` 同层（必须在 `src/agent/`，因为要引用 `gateway` 的非发送 helper `load_context_messages`/`load_pending_tasks`，evolution/ 引这些会被隔离脚本拦）。暴露 `pub(crate) async fn shadow_replay_prompt_candidate(state, proposal, source_run_id, prompt_override) -> AppResult<PromptShadowOutcome>`。
-- **Modify** `src/agent/mod.rs` — 加 `mod prompt_shadow;` + 必要 re-export。
-- **Modify** `src/agent/decision.rs` — `decide_reply_with_promote`（:268，14 入参）加可选入参 `prompt_override: Option<&PromptOverride>`，注入到 `assemble_system_prompt`（:704）之前；定义 `PromptOverride { reply_policy_append: Option<String>, ... }` 结构。**现有所有调用点传 `None`（字节等价护栏）。**
-- **Modify** `src/agent/review/mod.rs` — `review_decision`（:253，13 入参）同加 `prompt_override` 可选入参。
-- **Modify** `src/evolution/replay.rs:222` — prompt 分支从 `ReplayOutcome::failed("prompt_replay_not_implemented_w3")` 改为调 `crate::agent::prompt_shadow::shadow_replay_prompt_candidate(...)`（调 agent 模块入口，不引入 8 禁符号 → 隔离合规）。
-- **Modify** `src/evolution/significance.rs:219/424/445` — `grade_prompt` 改存对照证据到 `proposal.eval_metrics`（不自动放行）；修 `original_self_critique_for_metric`/`original_5gate_hit_or_default` 从源 run 真实数据取（G4）；`aggregate_and_grade` 对 prompt 候选 shadow 完成即置 `eligible_for_release`（语义重定为「证据就绪等人工」）。
-- **Modify** `src/models.rs:4286` — `Proposal.status` 注释补 `eligible_for_release` 的 prompt 语义说明（不改类型，不加新态）。
+- `decide_reply` = `src/agent/decision.rs:151`，**14 入参**（末尾多 `run_id: Option<&str>`），包一层调 `decide_reply_with_promote(..., PromptTier::Full)`。
+- `decide_reply_with_promote` = `decision.rs:268`，**15 入参**：`(state, contact, inbound, recent_messages, pending_tasks, playbook, domain_config, runtime, memory, context_pack, knowledge_chunks, knowledge_route, rewrite_instruction, run_id, tier)`，返回 `AppResult<(AgentDecision, Vec<String>)>`。
+- prompt 在 `decide_reply_with_promote` **内部**加载（**非入参**）：`prompts::load_prompt_for_contact(&db, &state.config.default_workspace_id, KEY, &contact.wxid, contact.locale.as_deref()) -> AppResult<(String, Option<i32>)>` 调 3 次：`user.reply.system`（:562）/`user.reply.policy`（:570，随后 :587 经 `apply_reply_policy_prompt_overrides`）/`user.reply.task`（:588）。`load_prompt_for_contact` = `prompts.rs:487`，**纯按 key 读 DB 无注入口子**，全 src 仅这 3 处调用。
+- decision.rs 已是「DB 读基线 → 内存 `format!` 追加 override → 喂 LLM」主模式：:587/:599/:609/:615/:626 有 5+ 处同构追加。critic 片段就是同构再加一处。`assemble_system_prompt` = `decision.rs:1204`（5 入参纯函数）。
+- `review_decision` = `src/agent/review/mod.rs:253`，**13 入参**（末尾 `run_id`）。它内部加载自己的 system prompt：`prompts::load_prompt(&db, &state.config.default_workspace_id, prompt_key)`（**:287-288**），`prompt_key` = `review_mode=="light"?"user.review.light.system":"user.review.system"`（:282-286），随后 :302 经 `apply_review_system_prompt_overrides`。reviewer 的 user 段是 :339 起的硬编码 `format!`（非模板，critic 不可改）。
+- `run_shadow_replay` = `src/evolution/replay.rs:163`：step1 反查 `original`（AgentRunLog）；step2（:194-217）只做 inbound **retention 探针**（`count_documents`，不取原文）；step3 dispatch（:220-224）prompt 分支 = `ReplayOutcome::failed("prompt_replay_not_implemented_w3")`。`evaluate_threshold`=:230（纯函数）。
+- `grade_prompt` = `src/evolution/significance.rs:219`，签名 `(replays: &[ShadowReplay], cfg: &SignificanceCfg) -> (bool, Document)`。假基线是 `ShadowReplay` 的 trait `ShadowReplayExt`（定义 :414，impl :423）：`original_self_critique_for_metric() -> Option<bool>` 恒 None（:424-427）、`original_5gate_hit_or_default(&str) -> bool` 恒 false（:429-430）。`aggregate_and_grade`=:445（async，→ eligible_for_release / rejected_below_threshold）。
+- `Proposal`（`src/models.rs:4267`）：`status`:4277 / `proposed_template_key:Option<String>`:4288 / `proposed_section:Option<String>`:4290 / `diff_snippet:Option<String>`:4293 / `eval_metrics:Document`:4302 / `eval_replays_completed/failed:i32`:4304/4306 / `significance_passed:Option<bool>`:4307。`ShadowReplay` 模型也在 models.rs（含 status/failure_reason/original_* 字段，写代码时 Read 确认其全字段）。
+- `EvolutionBudget::record_call(&mut self, tokens:i64, calls:i32)` = `src/evolution/budget.rs:44`。critic 同款用法 `prompt_critic.rs:137`。
+- **LRU 零串味**：`user.reply.*` / `user.review.*` 不在 `llm_exact_cache_key` 白名单（`agent/mod.rs:473-495`，白名单仅 4 个 import/playbook/guide key），reply/review 链恒不进 LRU；白名单链也按 `hash(system)+hash(user)` 分桶 → 追加片段自然换 key。shadow 注入临时 prompt 安全。
 
-### 接口（待阶段一落地后核实签名补全）
-- `pub(crate) async fn shadow_replay_prompt_candidate(...) -> AppResult<PromptShadowOutcome>`
-- `pub struct PromptShadowOutcome { completed: usize, failed: usize, per_sample: Vec<SampleComparison> }`
-- `pub struct PromptOverride { reply_policy_append: Option<String> }`（注入点：load_prompt_for_contact 加载 user.reply.policy 后追加）
+### 注入设计（核实后定的最优解）
 
-### 关键约束（已核实，写步骤时遵守）
-- **prompt_override=None 字节等价**：现有所有 `decide_reply_with_promote` / `review_decision` 调用点（gateway/planner/simulation）传 None，行为与改造前逐字相同 → 反过拟合护栏。写完后必须 `cargo test --lib` 基线不动 + 抽查一条现有 decision 测试快照不变。
-- **shadow 复用 simulation 加载链**：`load_operation_playbook_for_contact`/`load_or_create_operating_memory`/`load_operation_knowledge`/`load_context_messages`/`route_operation_knowledge`/`select_operation_knowledge_chunks`；源 run inbound 经 `AgentRunLog.context.inboundMessageId`（replay.rs:196 既有读法）反查 `messages()`；inbound 已清理 → 记 failed `source_message_unavailable`。
-- **预算**：shadow 真模型计入 `EvolutionBudget`（`budget.record_call`，prompt_critic.rs:137 同款）；耗尽停止后续，候选留 `pending_eval` 下 tick 续跑。
-- **隔离脚本**：`prompt_shadow.rs` 放 `src/agent/` 非 evolution/；replay.rs 只调其入口。
+不改 `load_prompt_for_contact` / `load_prompt` 签名（纯数据访问函数保持纯净）。在两条链各自加载 prompt 后、喂 LLM 前，按 `PromptOverride` 里匹配的 prompt_key 用 `crate::prompt_guard::compose_appended_content` 追加 critic 片段（复用阶段一已落地的末尾追加纯函数）。
 
-### 验收
-- `cargo test --lib` 基线不回归；隔离 + no-human-takeover 双 lint 绿。
-- prompt 候选能走完 critic → shadow → eligible_for_release（不再卡 G1 placeholder）。
-- grade_prompt 的 original 侧基线非恒 None/false（G4 修复，加单测锁定）。
-- 一条 prompt 候选 shadow 跑完后 `proposal.eval_metrics` 含 per-sample 新旧五闸对照。
+```rust
+// 新增（放 agent 模块，被 decide/review 共用）
+pub struct PromptOverride {
+    pub target_prompt_key: String,   // critic 候选的 proposed_template_key
+    pub append_snippet: String,      // critic 的 diff_snippet
+}
+impl PromptOverride {
+    /// 若 key 命中则末尾追加,否则原样返回（复用 prompt_guard::compose_appended_content）
+    pub fn apply_if_matches(&self, prompt_key: &str, loaded: String) -> String {
+        if prompt_key == self.target_prompt_key {
+            crate::prompt_guard::compose_appended_content(&loaded, &self.append_snippet)
+        } else { loaded }
+    }
+}
+```
+
+- **reply 链**：`decide_reply_with_promote` 加第 16 入参 `prompt_override: Option<&PromptOverride>`；在 :562/:570/:588 三处 `load_prompt_for_contact` 拿到 String 后各插一行 `let x = prompt_override.map(|o| o.apply_if_matches(KEY, x.clone())).unwrap_or(x);`（policy 在 :587 `apply_reply_policy_prompt_overrides` 之后再 apply override，使追加在最末尾）。`decide_reply`（:151）也加同名第 15 入参，透传给 `_with_promote`。
+- **review 链**：`review_decision` 加第 14 入参 `prompt_override: Option<&PromptOverride>`；在 :288 `load_prompt` 拿到 system 后、:302 override 之前插一行 apply。
+- **字节等价护栏**：现有所有调用点（gateway / planner / simulation / 测试）传 `None` → `apply_if_matches` 不触发 → prompt 逐字不变。这是反过拟合硬约束，必须 `cargo test --lib` 基线不动验证。
+
+### Task 9: PromptOverride 结构 + apply_if_matches 纯函数
+
+**Files:** Modify `src/agent/decision.rs`（顶部加 struct + impl，紧邻其它 pub struct）或新建 `src/agent/prompt_override.rs`（择一，倾向放 decision.rs 顶部减少 mod 接线）。Test: 同文件 `#[cfg(test)]`。
+
+**Interfaces — Produces:** `pub struct PromptOverride { pub target_prompt_key: String, pub append_snippet: String }` + `pub fn apply_if_matches(&self, prompt_key: &str, loaded: String) -> String`。
+
+- [ ] **Step 1: 写失败测试**
+
+```rust
+#[test]
+fn prompt_override_appends_only_on_key_match() {
+    let ov = PromptOverride { target_prompt_key: "user.reply.policy".into(), append_snippet: "补充约束".into() };
+    // 命中 key → 末尾追加（复用 compose_appended_content 语义:原文开头+片段结尾）
+    let hit = ov.apply_if_matches("user.reply.policy", "原策略正文".into());
+    assert!(hit.starts_with("原策略正文"));
+    assert!(hit.ends_with("补充约束"));
+    // 不命中 key → 原样逐字返回（字节等价护栏）
+    let miss = ov.apply_if_matches("user.reply.system", "系统契约正文".into());
+    assert_eq!(miss, "系统契约正文");
+}
+```
+
+- [ ] **Step 2: 运行验证失败** — Run: `export CARGO_TARGET_DIR="E:/yw/agiatme/工作项目/wechatagent/target" && cargo test --lib prompt_override_appends`，Expected: FAIL（未定义）。
+- [ ] **Step 3: 写实现**（见上「注入设计」代码块的 struct + impl，apply_if_matches 调 `crate::prompt_guard::compose_appended_content`）。
+- [ ] **Step 4: 运行验证通过** — 同命令 PASS。
+- [ ] **Step 5: Commit** — `feat(agent): PromptOverride 按 key 末尾追加 critic 片段（复用 prompt_guard）`。
+
+### Task 10: reply 链接 prompt_override 入参（字节等价）
+
+**Files:** Modify `src/agent/decision.rs`（`decide_reply` :151 加第 15 入参、`decide_reply_with_promote` :268 加第 16 入参 + 3 处 load 后 apply）。所有现有调用点补传 `None`。
+
+**Interfaces — Consumes:** Task 9 的 `PromptOverride`。**Produces:** 两函数新签名（末尾 `prompt_override: Option<&PromptOverride>`，置于 `tier` 之前 / `run_id` 之后对 `decide_reply`）。
+
+- [ ] **Step 1: 改 `decide_reply_with_promote` 签名** 加 `prompt_override: Option<&PromptOverride>`（放 `tier` 参数之前）。
+- [ ] **Step 2: 3 处 load 后插 apply**（:562 system / :570 policy 注意在 :587 apply_reply_policy_prompt_overrides 之后 / :588 task）：
+```rust
+let system_contract = prompt_override.map(|o| o.apply_if_matches("user.reply.system", system_contract.clone())).unwrap_or(system_contract);
+// policy: 在现有 let policy = apply_reply_policy_prompt_overrides(...) 之后
+let policy = prompt_override.map(|o| o.apply_if_matches("user.reply.policy", policy.clone())).unwrap_or(policy);
+// task: 在现有所有 task_template format! 追加链之后（最末，使 critic 片段在最后）
+let task_template = prompt_override.map(|o| o.apply_if_matches("user.reply.task", task_template.clone())).unwrap_or(task_template);
+```
+- [ ] **Step 3: `decide_reply`（:151）加同名入参并透传** 给 `_with_promote`。
+- [ ] **Step 4: 补所有调用点传 None** — `grep -rn "decide_reply\b\|decide_reply_with_promote" src/` 找全（已知：gateway、simulation:153、planner、review 内若有、各测试）。逐一在新参位置插 `None`。
+- [ ] **Step 5: 编译 + 基线** — `cargo check` 通过；`cargo test --lib` ≥ 350/0（字节等价护栏：传 None 行为不变）。
+- [ ] **Step 6: Commit** — `feat(agent): decide_reply 加 prompt_override 入参（现有调用点全传 None 字节等价）`。
+
+### Task 11: review 链接 prompt_override 入参（字节等价）
+
+**Files:** Modify `src/agent/review/mod.rs`（`review_decision` :253 加第 14 入参 + :288 load 后 apply）。所有调用点补传 `None`。
+
+- [ ] **Step 1: 改 `review_decision` 签名** 末尾加 `prompt_override: Option<&PromptOverride>`（`run_id` 之后）。引入 `use super::decision::PromptOverride;`（或其定义处路径）。
+- [ ] **Step 2: :288 load_prompt 后插 apply**（在 :302 apply_review_system_prompt_overrides 之前）：
+```rust
+let system = prompt_override.map(|o| o.apply_if_matches(prompt_key, system.clone())).unwrap_or(system);
+```
+注意 `prompt_key` 此处是 `user.review.system` 或 `user.review.light.system` 变量——apply_if_matches 用变量值匹配。
+- [ ] **Step 3: 补所有调用点传 None** — `grep -rn "review_decision" src/`（gateway、simulation:188、各测试）逐一插 None。
+- [ ] **Step 4: 编译 + 基线** — `cargo check` + `cargo test --lib` ≥ 350/0。
+- [ ] **Step 5: Commit** — `feat(agent): review_decision 加 prompt_override 入参（调用点全传 None 字节等价）`。
+
+### Task 12: prompt_shadow.rs — 真模型跑单条对照（核心）
+
+**Files:** Create `src/agent/prompt_shadow.rs`；Modify `src/agent/mod.rs`（加 `pub(crate) mod prompt_shadow;`）。
+
+**Interfaces — Produces:**
+```rust
+pub(crate) struct PromptShadowSample {
+    pub source_run_id: ObjectId,
+    pub status: String,                 // "completed" | "failed"
+    pub failure_reason: Option<String>,
+    pub original_scores: Option<Document>,   // 源 run review.scores（G4 真实原始侧）
+    pub new_scores: Option<Document>,        // 用「原+追加」跑出的 review.scores
+    pub original_self_critique_addressed: Option<bool>,
+    pub new_self_critique_addressed: Option<bool>,
+}
+pub(crate) async fn shadow_replay_prompt_one(
+    state: &AppState, proposal: &Proposal, source_run_id: ObjectId,
+) -> AppResult<PromptShadowSample>;
+```
+
+**Consumes（核实的 loader，全 `super::`，prompt_shadow 在 agent/ 内合法引用 gateway）：**
+`super::decision::{decide_reply, load_operation_playbook_for_contact, load_user_operation_domain_config_for_contact, PromptOverride}` / `super::gateway::{load_context_messages, load_pending_tasks}` / `super::knowledge_router::{load_operation_knowledge, route_operation_knowledge, empty_knowledge_route, select_operation_knowledge_chunks, route_used_knowledge_ids}` / `super::memory::{load_or_create_operating_memory, effective_memory_card_for_contact}` / `super::review::review_decision` / `super::runtime::{UserRuntimeParameters, resolve_thresholds}` / `super::budget::{RunBudget, RUN_BUDGET}`。
+
+- [ ] **Step 1: 实现 shadow_replay_prompt_one** 逻辑：
+  1. 反查 `original = agent_run_logs().find_one({_id: source_run_id})`；无 → `failed("source_run_not_found")`。
+  2. 取 `original.review.get_document("scores")` 作 `original_scores`（G4 真实原始侧）。从 original 取 self_critique addressed（Read AgentRunLog 确认字段名）作 `original_self_critique_addressed`。
+  3. 从 `original.contact_wxid` + `workspace_id` + `account_id` 反查 `contacts().find_one`（自写，参照 gateway 既有查询）；无 → `failed("contact_unavailable")`。
+  4. 从 `original.context` 取 `inboundMessageId`/`inbound_message_id`，`messages().find_one({messageId: id})` 取**真实** inbound `ConversationMessage`；无 → `failed("source_message_unavailable")`。
+  5. 按 simulation 同款由 contact 实时重建：playbook / domain_config / runtime（含 resolve_thresholds）/ memory / context_pack / pending_tasks / recent(load_context_messages) / knowledge_route / selected_chunks。
+  6. 构造 `PromptOverride { target_prompt_key: proposal.proposed_template_key, append_snippet: proposal.diff_snippet }`（两者缺任一 → `failed("proposal_missing_key_or_snippet")`）。
+  7. `decide_reply(...全入参..., Some(&override))` → `review_decision(...全入参..., Some(&override))`（两条链都传 override，覆盖 reply+review）。**绝不调发送链 / outbox / mcp**（本函数在 agent/ 但仍只跑决策+评审，不发送）。
+  8. 取新 review 的 scores 作 `new_scores`、self_critique addressed 作 `new_self_critique_addressed`，status="completed"。
+  9. 预算：用 `RunBudget` + `RUN_BUDGET.scope(...)` 包裹（同 simulation），超额 → `failed("budget_exceeded")`。
+- [ ] **Step 2: mod.rs 注册** `pub(crate) mod prompt_shadow;`（simulation `mod simulation;` 附近）。
+- [ ] **Step 3: 隔离 + no-human-takeover 双 lint** — `bash scripts/check-evolution-isolation.sh`（prompt_shadow 在 agent/ 不被扫，replay 改动见 Task 13）+ `bash scripts/check-no-human-takeover.sh`（prompt_shadow 在 agent/ 扫描区，确认 import 的 loader 名 + 新增行无禁词；核实结论：全部 loader 名无 takeover/接管/人工）。
+- [ ] **Step 4: 编译 + 基线** — `cargo check` + `cargo test --lib` ≥ 350/0。
+- [ ] **Step 5: Commit** — `feat(agent): prompt_shadow 真模型跑单条新旧 prompt 对照（复用 simulation loader 链,不发送）`。
+
+> 注：真模型对照的端到端正确性需真实 LLM + Docker，留 CI/nightly；本 task 本地只验编译 + 不破基线。结构正确性靠 Task 13 集成测试 + 纯函数单测覆盖。
+
+### Task 13: replay.rs 接 shadow + significance 存证据修 G4
+
+**Files:** Modify `src/evolution/replay.rs:222`（prompt 分支改调 shadow）；Modify `src/evolution/significance.rs`（grade_prompt 改存证据 + 修 trait 假基线）；Modify `src/models.rs:4277`（Proposal.status 注释补 eligible_for_release prompt 语义）。
+
+- [ ] **Step 1: replay.rs prompt 分支改调 shadow** —— `:222` 把 `ReplayOutcome::failed("prompt_replay_not_implemented_w3")` 改为调 `crate::agent::prompt_shadow::shadow_replay_prompt_one(state, proposal, source_run_id).await` 并把 `PromptShadowSample` 映射成 `ReplayOutcome` / 写 `shadow_replays`（含 original_scores/new_scores，供 grade 用）。**路径字面量 `crate::agent::prompt_shadow::` 不含 8 隔离禁词**（已核实）。Run `bash scripts/check-evolution-isolation.sh` 必 ok。
+- [ ] **Step 2: 修 G4 假基线** —— `significance.rs:424/429` 的 `original_self_critique_for_metric`/`original_5gate_hit_or_default` 改为从 ShadowReplay 真实存的 original 侧字段取（Task 12 已把 original_scores/original_self_critique_addressed 存进 replay）。加纯函数单测锁定：构造一条带 original_scores 的 ShadowReplay，断言 original 侧非恒 None/false。
+- [ ] **Step 3: grade_prompt 存证据** —— `:219` grade_prompt 把 per-sample 新旧 5 闸/自评对照 + completed/failed 计数写进返回的 `Document`（已是 `(bool, Document)` 第二元素），供 aggregate 写 `proposal.eval_metrics`。**对 prompt 候选：completed ≥ 1 即让 aggregate_and_grade 置 `eligible_for_release`（语义 = 证据就绪等人工），不再用 critique_delta gate 自动放行/拒绝**——人工看证据定夺。
+- [ ] **Step 4: models.rs 注释** —— `Proposal.status`（:4277）补注释：prompt 类 `eligible_for_release` = 「shadow 证据就绪，等人工 release」（不改类型，不加新态）。
+- [ ] **Step 5: 编译 + 基线 + 隔离 lint** — `cargo check` + `cargo test --lib`（含新 G4 单测）≥ 350/0 + `bash scripts/check-evolution-isolation.sh` ok。
+- [ ] **Step 6: Commit** — `feat(evolution): replay 接 prompt_shadow + grade_prompt 存证据 + 修 G4 假基线`。
+
+### Task 14: prompt shadow 集成测试 + 阶段二收尾
+
+**Files:** Test `tests/evolution_prompt_shadow.rs`（新建，`#[ignore]` 留 CI，复用阶段一 `common::TestApp::start_repl_set` + `TestLlmGenerator` mock 模式）。
+
+- [ ] **Step 1: 集成测试** —— 种一条 prompt proposal（proposed_template_key=user.reply.policy + diff_snippet 合法片段）+ 一条源 AgentRunLog + 对应 inbound message + contact；mock LLM 让 decide/review 返回确定分；调 `run_shadow_replay` → 断言写出的 shadow_replay status=completed、含 original_scores+new_scores。再加一条 inbound 缺失用例断言 `failed("source_message_unavailable")`。本地只 `cargo test --test evolution_prompt_shadow -- --list` 验编译。
+- [ ] **Step 2: 阶段二收尾全验证** —— `cargo test --lib` ≥ 350/0；4 PBT ≥ 33/0；`cargo check --tests`；隔离 + no-human-takeover 双 lint 绿。
+- [ ] **Step 3: Commit** — `test(evolution): prompt shadow 集成测试 + 阶段二收尾`。
+
+### 阶段二验收
+- prompt 候选能走完 critic → shadow（真模型对照）→ `eligible_for_release`（不再卡 G1 placeholder）。
+- `grade_prompt` original 侧基线从 ShadowReplay 真实数据取（G4 修复，纯函数单测锁定）。
+- 一条 prompt 候选 shadow 跑完后 `proposal.eval_metrics` 含 per-sample 新旧 5 闸/自评对照。
+- `prompt_override=None` 字节等价（现有调用点全传 None，`cargo test --lib` 基线不动）。
+- 隔离 + no-human-takeover 双 lint 绿；reply+review 两条链都能注入（critic 对 user.review.system 提的候选也能真评估）。
 
 ---
 
