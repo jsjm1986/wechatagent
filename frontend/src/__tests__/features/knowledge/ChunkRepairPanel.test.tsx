@@ -1,6 +1,8 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { render, screen, fireEvent, waitFor } from "@testing-library/react";
 import { ChunkRepairPanel } from "../../../features/knowledge/ChunkRepairPanel";
+import { applyAiRepairPatch } from "../../../lib/applyAiRepairPatch";
+vi.mock("../../../lib/applyAiRepairPatch", () => ({ applyAiRepairPatch: vi.fn() }));
 
 const PROPOSAL = {
   chunkId: "c1", sessionId: "s1", turn: 1,
@@ -59,5 +61,33 @@ describe("ChunkRepairPanel", () => {
     expect(body.turn).toBe(1);
     expect(body.answers[0]).toMatchObject({ id: "q1", field: "sourceQuote", text: "第三段" });
     expect(body.previousPatch).toBeDefined();
+  });
+
+  it("落库：勾选字段调applyAiRepairPatch→done+onApplied", async () => {
+    fetchSpy.mockResolvedValueOnce(okResp(PROPOSAL));
+    (applyAiRepairPatch as ReturnType<typeof vi.fn>).mockResolvedValue({ ok: true });
+    const onApplied = vi.fn();
+    render(<ChunkRepairPanel chunkId="c1" originalChunk={{ summary: "原" }} onApplied={onApplied} />);
+    fireEvent.click(screen.getByText(/AI 修复建议/));
+    await waitFor(() => screen.getByText(/AI改的summary/));
+    fireEvent.click(screen.getByText(/落库/));
+    await waitFor(() => screen.getByText(/已落库/));
+    expect(applyAiRepairPatch).toHaveBeenCalledWith(expect.objectContaining({
+      chunkId: "c1", sessionId: "s1", turn: 1, confidenceHint: 65,
+      acceptedFieldNames: expect.arrayContaining(["summary", "sourceQuote"]),
+    }));
+    expect(onApplied).toHaveBeenCalled();
+  });
+
+  it("落库失败显错误不调onApplied", async () => {
+    fetchSpy.mockResolvedValueOnce(okResp(PROPOSAL));
+    (applyAiRepairPatch as ReturnType<typeof vi.fn>).mockResolvedValue({ ok: false, reason: "apply_failed" });
+    const onApplied = vi.fn();
+    render(<ChunkRepairPanel chunkId="c1" originalChunk={{}} onApplied={onApplied} />);
+    fireEvent.click(screen.getByText(/AI 修复建议/));
+    await waitFor(() => screen.getByText(/AI改的summary/));
+    fireEvent.click(screen.getByText(/落库/));
+    await waitFor(() => screen.getByText(/落库失败|失败/));
+    expect(onApplied).not.toHaveBeenCalled();
   });
 });

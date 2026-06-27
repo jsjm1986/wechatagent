@@ -1,5 +1,6 @@
 import { useState } from "react";
 import type { ChunkRepairProposal } from "./trustTypes";
+import { applyAiRepairPatch } from "../../lib/applyAiRepairPatch";
 
 type RepairStatus = "idle" | "proposing" | "reviewing" | "answering" | "applying" | "done" | "error";
 
@@ -17,8 +18,6 @@ export function ChunkRepairPanel({
   const [accepted, setAccepted] = useState<Set<string>>(new Set());
   const [answerDrafts, setAnswerDrafts] = useState<Record<string, string>>({});
   const [error, setError] = useState<string | null>(null);
-  // onApplied / originalChunk 在 Task4 落库时使用；此处先标记避免 tsc unused
-  void onApplied; void originalChunk;
 
   async function propose() {
     setStatus("proposing");
@@ -73,6 +72,29 @@ export function ChunkRepairPanel({
     } catch { setError("追问应答失败，请稍后重试"); setStatus("error"); }
   }
 
+  async function apply() {
+    if (!proposal) return;
+    setStatus("applying");
+    setError(null);
+    const r = await applyAiRepairPatch({
+      chunkId,
+      originalChunk,
+      patch: proposal.patch,
+      acceptedFieldNames: [...accepted],
+      sessionId: proposal.sessionId,
+      turn: proposal.turn,
+      confidenceHint: proposal.confidenceHint,
+      extras: (proposal.patch as Record<string, unknown>).extras,
+    });
+    if (r.ok) {
+      setStatus("done");
+      onApplied();
+    } else {
+      setError(r.message ?? (r.reason === "apply_failed" ? "落库失败，请重试" : "操作失败，请重试"));
+      setStatus("error");
+    }
+  }
+
   if (status === "idle") {
     return (
       <button type="button" className="wikiBtn" onClick={() => void propose()}>
@@ -81,6 +103,8 @@ export function ChunkRepairPanel({
     );
   }
   if (status === "proposing") return <div className="wikiHint">AI 正在分析这条切片…</div>;
+  if (status === "applying") return <div className="wikiHint">正在落库…</div>;
+  if (status === "done") return <div className="wikiAlert ok">已落库为草稿，可在上方「确认放行」按钮去核验。</div>;
   if (status === "error") return (
     <div className="wikiAlert error">
       {error}
@@ -130,6 +154,9 @@ export function ChunkRepairPanel({
           <button type="button" className="wikiBtn" onClick={() => void answer()}>提交回答</button>
         </div>
       ) : null}
+      <button type="button" className="primary" disabled={accepted.size === 0} onClick={() => void apply()}>
+        落库勾选字段（{accepted.size}）
+      </button>
     </div>
   );
 }
