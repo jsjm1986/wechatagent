@@ -253,7 +253,7 @@ pub async fn release_prompt(
             ))
         })?;
 
-    // ── 红线三闸（与人工编辑路径同源,从 prompt_guard 复用）──
+    // ── 红线三闸（与管理员手动编辑路径同源,从 prompt_guard 复用）──
     // 末尾追加:原 prompt 正文逐字保留,critic 片段追加到末尾。
     let new_content = crate::prompt_guard::compose_appended_content(&current.content, &append_snippet);
     // 闸 1+2:禁词 + 锚点完整性（原文保留 → 锚点天然过;不过说明原 prompt 已缺锚,fail-closed 正确）
