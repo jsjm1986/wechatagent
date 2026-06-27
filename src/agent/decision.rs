@@ -29,6 +29,22 @@ use super::types::{
 };
 use crate::models::AgentTask;
 
+/// critic 候选的 prompt 覆盖：按 key 命中则末尾追加片段(复用阶段一 compose_appended_content),
+/// 供 shadow replay 用「原 prompt + 追加片段」跑真模型对照。
+pub struct PromptOverride {
+    pub target_prompt_key: String,
+    pub append_snippet: String,
+}
+impl PromptOverride {
+    pub fn apply_if_matches(&self, prompt_key: &str, loaded: String) -> String {
+        if prompt_key == self.target_prompt_key {
+            crate::prompt_guard::compose_appended_content(&loaded, &self.append_snippet)
+        } else {
+            loaded
+        }
+    }
+}
+
 pub async fn build_initial_operation_profile(
     state: &AppState,
     workspace_id: &str,
@@ -1858,5 +1874,22 @@ mod persona_override_tests {
         assert!(out.contains("价格敏感"));
         assert!(out.contains("运营确认"));
         assert!(out.contains("AI 判断"));
+    }
+}
+
+#[cfg(test)]
+mod prompt_override_tests {
+    use super::PromptOverride;
+
+    #[test]
+    fn prompt_override_appends_only_on_key_match() {
+        let ov = PromptOverride { target_prompt_key: "user.reply.policy".into(), append_snippet: "补充约束".into() };
+        // 命中 key → 末尾追加（复用 compose_appended_content 语义:原文开头+片段结尾）
+        let hit = ov.apply_if_matches("user.reply.policy", "原策略正文".into());
+        assert!(hit.starts_with("原策略正文"));
+        assert!(hit.ends_with("补充约束"));
+        // 不命中 key → 原样逐字返回（字节等价护栏）
+        let miss = ov.apply_if_matches("user.reply.system", "系统契约正文".into());
+        assert_eq!(miss, "系统契约正文");
     }
 }
