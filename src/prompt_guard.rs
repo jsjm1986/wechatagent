@@ -117,6 +117,16 @@ pub fn extract_diff(old: &str, new: &str) -> String {
         .join("\n")
 }
 
+/// 末尾追加合成：原 prompt 正文逐字保留在开头（红线锚点据此天然通过锚闸），
+/// critic 片段追加到末尾,空行分隔。critic 只能「加约束」不能改写原红线段。
+pub fn compose_appended_content(current: &str, snippet: &str) -> String {
+    let snippet = snippet.trim();
+    if snippet.is_empty() {
+        return current.to_string();
+    }
+    format!("{}\n\n{}", current.trim_end(), snippet)
+}
+
 /// 第三闸：LLM 语义审查 diff 增量。先过字面双闸（调用方保证），本函数只做语义层。
 /// 复用 generate_agent_json（项目唯一 LLM JSON 入口，自带重试/退避/RunBudget）。
 pub async fn review_prompt_edit(
@@ -305,5 +315,27 @@ mod tests {
             diff: "x".into(),
             reason: "LLM 审查不可用".into(),
         };
+    }
+
+    #[test]
+    fn compose_appends_snippet_preserving_original() {
+        let current = "原始 prompt 正文\n红线锚段";
+        let snippet = "补充：本行业语气更稳重";
+        let composed = compose_appended_content(current, snippet);
+        // 原文逐字保留在开头（锚点闸据此天然通过）
+        assert!(composed.starts_with(current));
+        // 片段出现在末尾
+        assert!(composed.ends_with(snippet));
+        // 中间有空行分隔
+        assert!(composed.contains("红线锚段\n\n补充"));
+    }
+
+    #[test]
+    fn compose_trims_snippet_edge_whitespace_but_keeps_body() {
+        let composed = compose_appended_content("正文", "  \n追加片段\n  ");
+        assert!(composed.starts_with("正文\n\n"));
+        assert!(composed.contains("追加片段"));
+        // 不产生多余尾部空白行
+        assert_eq!(composed.trim_end(), composed.trim_end_matches('\n').trim_end());
     }
 }
