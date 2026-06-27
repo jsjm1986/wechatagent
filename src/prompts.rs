@@ -12,7 +12,7 @@ use crate::{
     models::{AgentSoul, OperationDomainConfig, OperationPlaybook, PromptTemplate},
 };
 
-pub const PROMPT_PACK_VERSION: &str = "wechatagent_prompt_pack_v13_2026_06_26_mgmt_redline";
+pub const PROMPT_PACK_VERSION: &str = "wechatagent_prompt_pack_v14_2026_06_27_escalation_and_memory_conflict";
 
 /// universal-domain-adaptation A/T1：user.reply.policy prompt「## 模式与 5 闸的关系」
 /// 模式-闸说明段（逐字复刻 prompt pack v3 现文 :958-963：标题 + casual_relationship /
@@ -1357,6 +1357,7 @@ fn prompt_specs() -> Vec<PromptSpec> {
   // escalationRequest：仅当你判断本轮遇到"决策墙"（超出你的职权/能力，需要幕后领导拍板）时输出；否则整个字段省略或 needed=false。
   // 判定按"事项实质"，不是客户嘴上"要换人对接"——客户嘴上要换人但事项你能处理，就继续自己处理，不要 escalate。
   // 重要：即使你输出 escalationRequest，这一轮的 reply 仍要正常写——把"安抚占位话术 + selfServiceablePart 里你能自主答的部分"自然地融进 reply 一起发给客户（reply 会照常经发送链路送达，请示是后台动作，客户不会冷场）。绝不要把 reply 留空。
+  // 【自洽硬约束】reply 与 escalationRequest 必须一致：如果你在 replyText 里向客户表达了"这事我需要向上反馈 / 向领导确认一下 / 帮你申请看看 / 我确认之后再答复你"这类意思，就说明你已判定本轮触及了超出自身职权的决策墙——此时必须同步输出 escalationRequest(needed=true) 并填对应 category。只在 replyText 口头说"要请示/要确认"却不输出 escalationRequest，等于这件事永远到不了幕后决策源、你对客户的承诺会落空。所以二选一：要么你自己有职权直接答（reply 里就别说要请示），要么你说了要请示就必须 emit escalationRequest。这是结构与话术的一致性要求，对所有 category 生效。
   // 三类（category 取其一）：
   //   out_of_scope_decision：合同变更/特殊折扣/退款纠纷/法律承诺/定制需求等超出标准政策权限。
   //   high_risk_gated：触及未验证产品声明、或风险被闸门拦下、需领导授权才能答的件。
@@ -1458,6 +1459,12 @@ fn prompt_specs() -> Vec<PromptSpec> {
 - reconfirmedTags：每个保留的标签必须指认对话依据，evidenceTurns 填「对话原文」里支撑该标签的 0-based 序号数组。
 - discardedTags：旧结论里不再被对话支撑、或被对话推翻的标签放这里，写明 reason。
 - 没有对话依据支撑的标签不要保留（宁可少，不要脑补）。「待重判标签观察」只是线索，仍需对话原文佐证才能进 reconfirmedTags。
+
+事实冲突 / 客户改口（重要，决定记忆质量）：上面「当前 memoryCard」里每条 coreFacts / recentFacts 都带有 id 字段。当本轮对话出现与某条已固化事实相矛盾的新信息（典型：客户改口、纠正之前说错的信息、更新了之前的状况），你必须用结构化字段显式弃用旧事实，不能只在 summary 里写"已失效"——summary 只是说明，不触发任何实际的弃用动作。两种等效写法择一：
+- 在 deprecatedFacts 填 [{ "id": "被推翻的旧事实的 id", "reason": "为何失效，如：客户改口更正", "supersededBy": "取代它的新 fact 的 id", "deprecatedAt": "RFC3339 时间" }]；
+- 或把被推翻的旧事实原文放进 discarded 数组。
+关键机制：系统会自动保留上一版 memoryCard 中你没有显式弃用（既不在 deprecatedFacts、也不在 discarded）的 coreFacts——这是为了防止有价值的早期事实被新一轮整理意外丢掉。所以如果你只输出了新事实、却没显式弃用与它矛盾的旧事实，旧事实会被自动保留，导致新旧两个矛盾值同时生效、污染后续决策。
+例：上一版 coreFacts 有 { id:"abc123", text:"客户预算3万左右" }，本轮客户明确改口"预算其实有5万"→ 你应输出新 fact { text:"客户预算5万" } 并在 deprecatedFacts 填 [{ "id":"abc123", "reason":"客户改口更新预算", "supersededBy":"<新fact的id>", "deprecatedAt":"..." }]，确保旧的"预算3万"退出生效事实层。
 
 限制：
 - coreFacts 最多 6 条，必须按 importance（对未来运营决策影响）倒序排列；只放真正长期重要的事实（如身份/角色/预算/决策方式/明确禁忌等）。
