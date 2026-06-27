@@ -39,4 +39,25 @@ describe("ChunkRepairPanel", () => {
     fireEvent.click(screen.getByText(/AI 修复建议/));
     await waitFor(() => screen.getByText(/修复.*失败/));
   });
+
+  it("有followupQuestions→填答→answer→刷新patch", async () => {
+    const withFollowup = { ...PROPOSAL, followupQuestions: [{ id: "q1", field: "sourceQuote", question: "原文哪段支持？" }] };
+    const answered = { ...PROPOSAL, turn: 2, patch: { summary: "改进后summary", sourceQuote: "运营补充的quote" }, followupQuestions: [] };
+    fetchSpy.mockResolvedValueOnce(okResp(withFollowup)).mockResolvedValueOnce(okResp(answered));
+    render(<ChunkRepairPanel chunkId="c1" originalChunk={{}} onApplied={vi.fn()} />);
+    fireEvent.click(screen.getByText(/AI 修复建议/));
+    await waitFor(() => screen.getByText(/原文哪段支持/));
+    // 填答
+    fireEvent.change(screen.getByPlaceholderText(/回答/), { target: { value: "第三段" } });
+    fireEvent.click(screen.getByText(/提交回答/));
+    // answer 端点对 + 刷新 patch
+    await waitFor(() => screen.getByText(/运营补充的quote/));
+    const [answerUrl, answerInit] = fetchSpy.mock.calls[1];
+    expect(answerUrl).toContain("/chunks/c1/repair/answer");
+    const body = JSON.parse(answerInit.body);
+    expect(body.sessionId).toBe("s1");
+    expect(body.turn).toBe(1);
+    expect(body.answers[0]).toMatchObject({ id: "q1", field: "sourceQuote", text: "第三段" });
+    expect(body.previousPatch).toBeDefined();
+  });
 });

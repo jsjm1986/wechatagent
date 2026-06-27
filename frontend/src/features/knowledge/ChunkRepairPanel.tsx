@@ -15,6 +15,7 @@ export function ChunkRepairPanel({
   const [status, setStatus] = useState<RepairStatus>("idle");
   const [proposal, setProposal] = useState<ChunkRepairProposal | null>(null);
   const [accepted, setAccepted] = useState<Set<string>>(new Set());
+  const [answerDrafts, setAnswerDrafts] = useState<Record<string, string>>({});
   const [error, setError] = useState<string | null>(null);
   // onApplied / originalChunk 在 Task4 落库时使用；此处先标记避免 tsc unused
   void onApplied; void originalChunk;
@@ -47,6 +48,29 @@ export function ChunkRepairPanel({
       if (next.has(name)) next.delete(name); else next.add(name);
       return next;
     });
+  }
+
+  async function answer() {
+    if (!proposal) return;
+    setStatus("answering");
+    setError(null);
+    try {
+      const answers = proposal.followupQuestions.map((q) => ({
+        id: q.id, field: q.field ?? null, text: answerDrafts[q.id] ?? "",
+      }));
+      const r = await fetch(`/api/operation-knowledge/chunks/${encodeURIComponent(chunkId)}/repair/answer`, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          sessionId: proposal.sessionId, previousPatch: proposal.patch, answers, turn: proposal.turn,
+        }),
+      });
+      if (!r.ok) { setError("追问应答失败，请稍后重试"); setStatus("error"); return; }
+      const data = (await r.json()) as ChunkRepairProposal;
+      setProposal(data);
+      setAccepted(new Set(Object.keys(data.patch ?? {}).filter((k) => k !== "extras")));
+      setAnswerDrafts({});
+      setStatus("reviewing");
+    } catch { setError("追问应答失败，请稍后重试"); setStatus("error"); }
   }
 
   if (status === "idle") {
@@ -88,6 +112,22 @@ export function ChunkRepairPanel({
       {proposal && proposal.missingFields.length > 0 ? (
         <div className="wikiRepairMissing">
           仍缺：{proposal.missingFields.map((m) => m.field).join("、")}
+        </div>
+      ) : null}
+      {proposal && proposal.followupQuestions.length > 0 ? (
+        <div className="wikiRepairFollowup">
+          {proposal.followupQuestions.map((q) => (
+            <label key={q.id} className="wikiRepairFollowupItem">
+              <span>{q.question}</span>
+              <input
+                type="text"
+                placeholder="回答 AI 的追问（可留空）"
+                value={answerDrafts[q.id] ?? ""}
+                onChange={(e) => setAnswerDrafts((p) => ({ ...p, [q.id]: e.target.value }))}
+              />
+            </label>
+          ))}
+          <button type="button" className="wikiBtn" onClick={() => void answer()}>提交回答</button>
         </div>
       ) : null}
     </div>
