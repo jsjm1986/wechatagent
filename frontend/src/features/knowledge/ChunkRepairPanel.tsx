@@ -1,0 +1,95 @@
+import { useState } from "react";
+import type { ChunkRepairProposal } from "./trustTypes";
+
+type RepairStatus = "idle" | "proposing" | "reviewing" | "answering" | "applying" | "done" | "error";
+
+export function ChunkRepairPanel({
+  chunkId,
+  originalChunk,
+  onApplied,
+}: {
+  chunkId: string;
+  originalChunk: Record<string, unknown>;
+  onApplied: () => void;
+}) {
+  const [status, setStatus] = useState<RepairStatus>("idle");
+  const [proposal, setProposal] = useState<ChunkRepairProposal | null>(null);
+  const [accepted, setAccepted] = useState<Set<string>>(new Set());
+  const [error, setError] = useState<string | null>(null);
+  // onApplied / originalChunk 在 Task4 落库时使用；此处先标记避免 tsc unused
+  void onApplied; void originalChunk;
+
+  async function propose() {
+    setStatus("proposing");
+    setError(null);
+    try {
+      const r = await fetch(`/api/operation-knowledge/chunks/${encodeURIComponent(chunkId)}/repair`, {
+        method: "POST", headers: { "Content-Type": "application/json" }, body: "{}",
+      });
+      if (!r.ok) {
+        setError("AI 修复建议生成失败（可能预算用尽），请稍后重试");
+        setStatus("error");
+        return;
+      }
+      const data = (await r.json()) as ChunkRepairProposal;
+      setProposal(data);
+      setAccepted(new Set(Object.keys(data.patch ?? {}).filter((k) => k !== "extras"))); // 默认全勾，运营可取消
+      setStatus("reviewing");
+    } catch {
+      setError("AI 修复建议生成失败，请稍后重试");
+      setStatus("error");
+    }
+  }
+
+  function toggleField(name: string) {
+    setAccepted((prev) => {
+      const next = new Set(prev);
+      if (next.has(name)) next.delete(name); else next.add(name);
+      return next;
+    });
+  }
+
+  if (status === "idle") {
+    return (
+      <button type="button" className="wikiBtn" onClick={() => void propose()}>
+        AI 修复建议
+      </button>
+    );
+  }
+  if (status === "proposing") return <div className="wikiHint">AI 正在分析这条切片…</div>;
+  if (status === "error") return (
+    <div className="wikiAlert error">
+      {error}
+      <button type="button" className="wikiBtn" onClick={() => void propose()}>重试</button>
+    </div>
+  );
+
+  // reviewing（answer 区 Task3 补、落库按钮 Task4 补）
+  const patchEntries = proposal ? Object.entries(proposal.patch ?? {}).filter(([k]) => k !== "extras") : [];
+  return (
+    <div className="wikiRepairPanel">
+      {proposal?.interpretation ? (
+        <div className="wikiRepairInterp">
+          {Object.entries(proposal.interpretation).map(([k, v]) => (
+            <span key={k} className="wikiArchiveTag">{k}: {String(v)}</span>
+          ))}
+        </div>
+      ) : null}
+      <div className="wikiRepairConfidence">AI 自评可信度：{proposal?.confidenceHint ?? 0}</div>
+      <div className="wikiRepairFields">
+        {patchEntries.map(([field, value]) => (
+          <label key={field} className="wikiRepairField">
+            <input type="checkbox" checked={accepted.has(field)} onChange={() => toggleField(field)} />
+            <span className="wikiRepairFieldName">{field}</span>
+            <span className="wikiRepairFieldValue">{typeof value === "string" ? value : JSON.stringify(value)}</span>
+          </label>
+        ))}
+      </div>
+      {proposal && proposal.missingFields.length > 0 ? (
+        <div className="wikiRepairMissing">
+          仍缺：{proposal.missingFields.map((m) => m.field).join("、")}
+        </div>
+      ) : null}
+    </div>
+  );
+}

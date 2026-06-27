@@ -178,3 +178,20 @@ export function canGoLive(input: { hasQuote: boolean; hasAnchor: boolean }): GoL
   if (!input.hasAnchor) missing.push("anchor");
   return { ok: missing.length === 0, missing };
 }
+
+// AI 修复闭环:needs_review 切片接 AI 修复建议。后端 propose 端点
+// POST /api/operation-knowledge/chunks/:id/repair 返回如下结构(前端无现成类型,
+// today.tsx 的 missingFields 是 string[] 形态不同不可复用,故新建)。
+export interface RepairMissingField { field: string; reason?: string | null; }
+export interface RepairFollowupQuestion { id: string; field?: string | null; question: string; }
+export interface ChunkRepairProposal {
+  chunkId: string;
+  sessionId: string;
+  turn: number;
+  interpretation: Record<string, unknown>;
+  patch: Record<string, unknown>;
+  missingFields: RepairMissingField[];
+  followupQuestions: RepairFollowupQuestion[];
+  stillMissing: RepairMissingField[];
+  confidenceHint: number;
+}
