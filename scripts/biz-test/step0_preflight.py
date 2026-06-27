@@ -70,6 +70,17 @@ def main() -> None:
         raise SystemExit("测试 account 不存在")
     app_id = acc[0]["app_id"]
     print(f"account_id={TEST_ACCOUNT_ID} app_id={app_id} name={acc[0].get('display_name')}")
+    # 强制把测试账号置 online=true：outbox_dispatcher.rs:634 发送前查 account.online，
+    # 离线则 defer_account_offline（推后 next_retry_at、不增 attempt、不走 terminal，60s 一轮）
+    # → 发送永远卡在 deferred、outbox 无终态 → send_and_wait 轮询假死（域④⑥真模型重测卡 10min+
+    # 的真因，2026-06-27）。真实部署里账号连上微信即 online=true；测试账号无真实 MCP 连接，
+    # online 默认 false/缺失。这里置 true 让 dispatcher 照常发到 outbox（仍不真发微信——MCP
+    # 调用被测试 MCP_API_KEY 拦在 outbox 入队后）。纯测试环境补齐，不碰 src、不改离线 defer 逻辑。
+    _lib.mongo(
+        f'db.wechat_accounts.updateOne({{account_id:"{TEST_ACCOUNT_ID}"}},'
+        f'{{$set:{{online:true,updated_at:new Date()}}}})'
+    )
+    print(f"已置 account_id={TEST_ACCOUNT_ID} online=true（避免 outbox 离线 defer 卡死）")
     _lib.remote_run(f"echo '{TEST_ACCOUNT_ID}|{app_id}' > /tmp/biztest_account")
 
     banner("[5/5] preflight 完成")

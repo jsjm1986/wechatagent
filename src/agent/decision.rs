@@ -334,19 +334,16 @@ pub(crate) async fn decide_reply_with_promote(
     } else {
         String::new()
     };
-    // media-asset Task 8：加载可发送素材（sendable+approved）→ 按当前客户阶段过滤候选
-    // → 渲染成清单注入 prompt，供 Reply Agent 选材输出 assetsToSend。best-effort：DB
-    // 故障 → 空清单（不发素材、不阻塞决策，同 reaction_hint / operator_memory 路径）。
+    // media-asset Task 8 + ③升档盲区修复（2026-06-27）：加载可发送素材（sendable+approved）。
+    // **恒加载**（任何档，只需 account_id）：让 Lean 档也能注入「素材线索概览」，使 Reply Agent
+    // 在第一程就知道库里有哪些可发素材 + 运营标注的 send_trigger_hint，据此自评本轮客户消息
+    // 是否契合某条发送时机→契合则自评 need_more_context+full 升档→Full 档拿完整清单选材。
+    // best-effort：DB 故障 → 空清单（不发素材、不阻塞决策，同 reaction_hint / operator_memory）。
     // customer_stage 取 contact.domain_attributes（与下方画像段同源），缺失 = None →
     // 只命中 target_stages 为空/全阶段的素材。
-    // 业务组：仅 Full 档加载/渲染；Lean+Relational 跳过 DB 查询、空清单。
-    let sendable_assets = if include_business {
-        load_sendable_assets(state, &contact.account_id)
-            .await
-            .unwrap_or_default()
-    } else {
-        Vec::new()
-    };
+    let sendable_assets = load_sendable_assets(state, &contact.account_id)
+        .await
+        .unwrap_or_default();
     let current_customer_stage = contact
         .domain_attributes
         .as_ref()
@@ -356,7 +353,19 @@ pub(crate) async fn decide_reply_with_promote(
         &sendable_assets,
         current_customer_stage.as_deref(),
     );
-    let sendable_candidates_text = super::media_send::render_candidate_lines(&sendable_candidates);
+    // 完整清单（带 assetId，供选材输出 assetsToSend）：仅 Full 档注入（业务组）。
+    let sendable_candidates_text = if include_business {
+        super::media_send::render_candidate_lines(&sendable_candidates)
+    } else {
+        String::new()
+    };
+    // 轻量概览（只标题+hint，不露 id/元数据）：仅 Lean/Relational 档注入。Full 档此段空串
+    // → Full prompt 逐字不变（DEFAULT 销售域字节等价）；完整清单与概览二者档位互斥、不重复。
+    let sendable_overview_text = if include_business {
+        String::new()
+    } else {
+        super::media_send::render_candidate_overview(&sendable_candidates)
+    };
     // 已发素材历史注入（防重发软约束，缺口 5）：查该客户近期已发素材，
     // 渲染成提示段供 Reply Agent 判重。best-effort，空 = 不加段。
     // 业务组：仅 Full 档查询；非 Full 跳过 DB、空段。
@@ -409,6 +418,19 @@ pub(crate) async fn decide_reply_with_promote(
                     })
             });
         super::referral::render_referral_lines(&candidates, already.as_ref())
+    } else {
+        String::new()
+    };
+    // ④升档盲区修复（2026-06-27）：assist_on 账号在 Lean/Relational 档注入「辅助模式告知段」。
+    // 名片引荐是「推真人名片」重动作，候选清单保持仅 Full 档加载（上方 include_business 门控）；
+    // 但 Lean 档若不告知 AI「本账号开了辅助模式、遇引荐场景该升档」，AI 永远不会主动升 Full 去
+    // 看名片清单。本段只在「辅助模式开 + 非 Full 档」非空——升档由 LLM 语义自评驱动（agent-first，
+    // 不列具体触发词）。assist 关账号（默认全自治）= 空串、prompt 不变；Full 档已有完整名片清单
+    // → 空串、字节等价。与 referral_block 档位互斥（最多一个非空），复用同一 prompt 占位、零结构变化。
+    // 措辞红线：用「专属顾问 / 辅助模式」，定位为「AI 主动增配顾问」，绝不出现把客户交给真人
+    // 那类措辞（受提交期文本 lint 约束 + CLAUDE.md 受控例外语义）。
+    let assist_hint_text = if assist_on && !include_business {
+        "【辅助模式已开启】本账号开启了辅助模式：当客户表达明确的签约、到店参观、或需要深度一对一对接的意愿时，你应判 sufficiency=need_more_context、missingTier=full，以便加载本账号「可引荐的专属顾问」清单后再决定是否为客户增配一位专属顾问。仅在客户真正契合时才引荐，不为引荐而引荐。\n".to_string()
     } else {
         String::new()
     };
@@ -913,9 +935,15 @@ pub(crate) async fn decide_reply_with_promote(
         follow_up_policy_text,
         profile_attributes_text,
         assets,
-        sendable_candidates_text,
+        // ③升档盲区修复：复用同一占位，零模板结构变化。完整清单(Full)与轻量概览(Lean/Relational)
+        // 档位互斥，二者最多一个非空，拼接后填入——Full 档 = 完整清单(逐字同改造前)，
+        // Lean/Relational 档 = 概览。DEFAULT 销售域 Full 档 prompt 字节等价。
+        format!("{sendable_candidates_text}{sendable_overview_text}"),
         recent_media_text,
-        referral_block,
+        // ④升档盲区修复：复用「可引荐的专属顾问」占位，零模板结构变化。完整名片清单(Full)与
+        // 辅助模式告知段(Lean/Relational, 仅 assist_on)档位互斥、最多一个非空。assist 关账号两者
+        // 皆空 → 占位空串、prompt 字节等价（默认全自治账号完全不受影响）。
+        format!("{referral_block}{assist_hint_text}"),
         task_text,
         history,
         crate::agent::prompt_isolation::isolate_untrusted(&inbound.content)

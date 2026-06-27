@@ -73,6 +73,31 @@ pub(crate) fn render_candidate_lines(candidates: &[&ContentAsset]) -> String {
     out
 }
 
+/// 轻量概览（纯函数）：渐进式三档 Lean/Relational 档恒注入用。只列「标题 + 发送时机
+/// （send_trigger_hint）」，**不含** assetId / 文件元数据 / 阶段 / 表达偏好——目的是让
+/// Reply Agent 在第一程小档就知道「库里有哪些可发素材 + 运营标注的何时发」，据此自评
+/// 本轮客户消息是否契合某条发送时机；契合则它会自评 need_more_context + missingTier=full
+/// 升档，到 Full 档再用完整的 [`render_candidate_lines`]（带 assetId）选材输出 assetsToSend。
+///
+/// 设计取舍：概览段**不带**「契合就升档」的显式指令，只客观罗列素材线索，把「是否升档」
+/// 完全交给 LLM 语义判断（agent-first，不硬塞指令、不引入关键词）。空候选返回空串。
+pub(crate) fn render_candidate_overview(candidates: &[&ContentAsset]) -> String {
+    if candidates.is_empty() {
+        return String::new();
+    }
+    let mut out =
+        String::from("可发送素材线索（仅概览；完整清单与发送方式在你确认需要时会提供）：\n");
+    for a in candidates {
+        let hint = a.send_trigger_hint.as_deref().unwrap_or("").trim();
+        if hint.is_empty() {
+            out.push_str(&format!("- {}\n", a.title));
+        } else {
+            out.push_str(&format!("- {} | 发送时机：{hint}\n", a.title));
+        }
+    }
+    out
+}
+
 /// media_id 缓存有效性（纯函数）：`updated_at` 距 `now` 不超过 `ttl_hours`，
 /// 且非未来时间（时钟回拨 / 脏数据 → 视为无效，强制重传）。
 /// 不依赖"media_id 永久有效"——超 TTL 即过期重传。
@@ -391,5 +416,33 @@ mod tests {
         a.tags = vec![];
         let out = render_candidate_lines(&[&a]);
         assert!(!out.contains("标签:"), "空 tags 不渲染标签段");
+    }
+
+    #[test]
+    fn overview_lists_title_and_hint_but_not_id_or_metadata() {
+        // 轻量概览只露标题 + 发送时机，绝不露 assetId / 阶段 / 表达偏好（那是 Full 档完整清单的事）。
+        let mut a = asset(Some(true), Some("approved"), Some("file"), Some(vec!["意向"]));
+        a.title = "报价单".to_string();
+        let out = render_candidate_overview(&[&a]);
+        assert!(out.contains("报价单"), "概览应含标题");
+        assert!(out.contains("问价时发"), "概览应含 send_trigger_hint");
+        assert!(!out.contains("id:"), "概览绝不露 assetId");
+        assert!(!out.contains("阶段:"), "概览不露阶段");
+        assert!(!out.contains("表达:"), "概览不露表达偏好");
+    }
+
+    #[test]
+    fn overview_handles_missing_hint() {
+        let mut a = asset(Some(true), Some("approved"), Some("file"), None);
+        a.title = "无提示素材".to_string();
+        a.send_trigger_hint = None;
+        let out = render_candidate_overview(&[&a]);
+        assert!(out.contains("无提示素材"), "无 hint 也应列出标题");
+        assert!(!out.contains("发送时机："), "无 hint 不渲染发送时机段");
+    }
+
+    #[test]
+    fn overview_empty_candidates_is_empty() {
+        assert_eq!(render_candidate_overview(&[]), "");
     }
 }
