@@ -151,7 +151,14 @@ export function chunkTypeLabel(t?: string | null): string | null {
 }
 
 export interface ChunkUsageStats { hitCount30d?: number; blockedCount30d?: number; }
-export interface ChunkProvenanceView { source?: string; llmModelAlias?: string | null; }
+export interface ChunkProvenanceView {
+  source?: string;
+  sourceDocId?: string | null;
+  sourceQuote?: string | null;
+  llmModelAlias?: string | null;
+  editedAt?: string | null;
+  editedBy?: string | null;
+}
 
 export interface TrustChunkFields {
   chunkType?: ChunkType | null;
