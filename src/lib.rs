@@ -25,6 +25,7 @@ pub mod media_storage;
 pub mod models;
 pub mod planner;
 pub mod prompts;
+pub mod prompt_guard;
 pub mod routes;
 pub mod secret;
 pub mod silence_signal_worker;

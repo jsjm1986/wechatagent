@@ -19,6 +19,10 @@ pub enum EvolutionError {
     Mongo(#[from] mongodb::error::Error),
     #[error("serde bson error: {0}")]
     Bson(#[from] mongodb::bson::de::Error),
+    /// release 路径过红线闸（禁词/锚点/LLM 语义）被拒。与 InvalidStatus 区分：
+    /// 这不是状态机错误,而是候选内容触碰红线,前端需单独展示「已拒绝发布」。
+    #[error("redline gate rejected: {0}")]
+    RedlineGateRejected(String),
     #[error("internal: {0}")]
     Internal(String),
 }
