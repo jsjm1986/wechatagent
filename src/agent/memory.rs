@@ -468,6 +468,73 @@ fn limit_extra_array(doc: &mut Document, key: &str, max_items: usize) {
     }
 }
 
+/// ⑨记忆冲突机制侧兜底（2026-06-27）：对 `card.core_facts` 内**同 dimension** 的多条
+/// Structured fact 做自动裁决——保留 `updated_at` 最新的一条，其余移入 `deprecated_facts`
+/// （带 deprecation_reason + supersededBy=最新条 id）。
+///
+/// 设计依据：A/B 已证「靠 consolidator prompt 让 LLM 主动填 discarded」无效（客户改口时
+/// LLM 只在 summary 写"已失效"却不填结构化字段 → 旧值被 compact 自动合并救回 → 矛盾并存）。
+/// 本函数是**机制侧兜底**：只比较 `dimension` 键相等性（consolidator 固化时的语义归类），
+/// **不做任何关键词匹配 / 不调 LLM**（守 agent-first）。dimension=None 的 fact 完全不参与
+/// （退回按 text 去重的旧行为，字节等价）。在 compact + apply_consolidator_deprecations 之后调用。
+pub(crate) fn deprecate_same_dimension_conflicts(
+    card: &mut MemoryCardTyped,
+    now: DateTime,
+) -> Vec<String> {
+    use std::collections::HashMap;
+    let mut warnings = Vec::new();
+    let mut by_dim: HashMap<String, Vec<usize>> = HashMap::new();
+    for (idx, repr) in card.core_facts.iter().enumerate() {
+        if let MemoryFactRepr::Structured(f) = repr {
+            if let Some(dim) = f.dimension.as_ref().filter(|d| !d.trim().is_empty()) {
+                by_dim.entry(dim.clone()).or_default().push(idx);
+            }
+        }
+    }
+    let mut to_deprecate: Vec<usize> = Vec::new();
+    let mut winner_id_by_loser: HashMap<usize, String> = HashMap::new();
+    for (dim, idxs) in &by_dim {
+        if idxs.len() < 2 {
+            continue;
+        }
+        let winner = *idxs
+            .iter()
+            .max_by_key(|&&i| match &card.core_facts[i] {
+                MemoryFactRepr::Structured(f) => (f.updated_at.timestamp_millis(), i as i64),
+                _ => (0, i as i64),
+            })
+            .unwrap();
+        let winner_id = match &card.core_facts[winner] {
+            MemoryFactRepr::Structured(f) => f.id.clone(),
+            _ => String::new(),
+        };
+        for &i in idxs {
+            if i != winner {
+                to_deprecate.push(i);
+                winner_id_by_loser.insert(i, winner_id.clone());
+                warnings.push(format!("same_dimension_conflict_deprecated:{dim}:idx{i}"));
+            }
+        }
+    }
+    if to_deprecate.is_empty() {
+        return warnings;
+    }
+    to_deprecate.sort_unstable();
+    for &i in to_deprecate.iter().rev() {
+        if let MemoryFactRepr::Structured(mut f) = card.core_facts.remove(i) {
+            f.deprecated_at = Some(now);
+            f.deprecation_reason = Some("superseded by newer fact in same dimension".to_string());
+            f.updated_at = now;
+            if let Some(sup) = winner_id_by_loser.get(&i) {
+                f.extra.insert("supersededBy", sup.clone());
+            }
+            card.deprecated_facts.push(MemoryFactRepr::Structured(f));
+        }
+    }
+    card.deprecated_facts.truncate(20);
+    warnings
+}
+
 /// agent-autonomy-loop W5 / Task 6.4：把 consolidator 输出的
 /// `deprecatedFacts` / `conflicts` 应用到合并后的 [`MemoryCardTyped`]。
 ///
@@ -1256,6 +1323,10 @@ async fn consolidate_contact_memory_inner(
     // conflicts 应用到合并后的 typed card；warnings 写入 agent_run_logs。
     let mut consolidator_warnings =
         apply_consolidator_deprecations(&mut compact, Some(&previous_card), &value);
+    // ⑨机制侧兜底：consolidator 主动填的 deprecatedFacts 应用后，再对同 dimension 的残余冲突
+    // 做自动裁决（防 LLM 漏填 discarded 致旧值被 compact 合并救回）。now 复用本次固化时刻。
+    let dim_warnings = deprecate_same_dimension_conflicts(&mut compact, DateTime::now());
+    consolidator_warnings.extend(dim_warnings);
     if auto_upgraded > 0 {
         // Task 6.7：把"老 Vec<String> 形态被自动升级"作为可观测信号写入审计。
         // 数量也带出来，方便 sunset 灰度期度量曲线。
@@ -1961,6 +2032,7 @@ mod r7_deprecation_tests {
     //!    不进 deprecatedFacts。
 
     use super::apply_consolidator_deprecations;
+    use super::deprecate_same_dimension_conflicts;
     use crate::models::{MemoryCardTyped, MemoryFact, MemoryFactRepr};
     use mongodb::bson::DateTime;
     use serde_json::json;
@@ -1975,6 +2047,7 @@ mod r7_deprecation_tests {
             may_expire: false,
             deprecated_at: None,
             deprecation_reason: None,
+            dimension: None,
             source_message_ids: vec![],
             source_run_id: None,
             created_at: DateTime::from_millis(0),
@@ -2111,6 +2184,87 @@ mod r7_deprecation_tests {
             20,
             "deprecated_facts 必须 cap 在 20"
         );
+    }
+
+    #[test]
+    fn same_dimension_conflict_keeps_newest_deprecates_old() {
+        use crate::models::{MemoryCardTyped, MemoryFact, MemoryFactRepr};
+        let old = MemoryFact {
+            id: "old1".into(), text: "客户孩子8岁".into(),
+            dimension: Some("child_age".into()),
+            updated_at: DateTime::from_millis(1000),
+            ..Default::default()
+        };
+        let new = MemoryFact {
+            id: "new1".into(), text: "客户孩子10岁".into(),
+            dimension: Some("child_age".into()),
+            updated_at: DateTime::from_millis(2000),
+            ..Default::default()
+        };
+        let mut card = MemoryCardTyped::default();
+        card.core_facts = vec![MemoryFactRepr::Structured(old), MemoryFactRepr::Structured(new)];
+        let warnings = deprecate_same_dimension_conflicts(&mut card, DateTime::from_millis(3000));
+        let live: Vec<&str> = card.core_facts.iter().map(|f| f.as_text()).collect();
+        assert_eq!(live.len(), 1, "同维冲突后生效层只留最新一条");
+        assert!(live[0].contains("10"), "保留最新值(10岁)");
+        let dep: Vec<&str> = card.deprecated_facts.iter().map(|f| f.as_text()).collect();
+        assert!(dep.iter().any(|t| t.contains("8")), "旧值进 deprecated");
+        assert!(!warnings.is_empty(), "裁决应记 warning 供审计");
+    }
+
+    #[test]
+    fn different_dimension_facts_both_kept() {
+        use crate::models::{MemoryCardTyped, MemoryFact, MemoryFactRepr};
+        let age = MemoryFact { id: "a".into(), text: "孩子8岁".into(),
+            dimension: Some("child_age".into()), updated_at: DateTime::from_millis(1000), ..Default::default() };
+        let budget = MemoryFact { id: "b".into(), text: "预算5000".into(),
+            dimension: Some("budget".into()), updated_at: DateTime::from_millis(2000), ..Default::default() };
+        let mut card = MemoryCardTyped::default();
+        card.core_facts = vec![MemoryFactRepr::Structured(age), MemoryFactRepr::Structured(budget)];
+        let warnings = deprecate_same_dimension_conflicts(&mut card, DateTime::from_millis(3000));
+        assert_eq!(card.core_facts.len(), 2, "不同维度都保留");
+        assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn none_dimension_facts_untouched() {
+        use crate::models::{MemoryCardTyped, MemoryFact, MemoryFactRepr};
+        let f1 = MemoryFact { id: "x".into(), text: "事实A".into(), dimension: None, ..Default::default() };
+        let f2 = MemoryFact { id: "y".into(), text: "事实B".into(), dimension: None, ..Default::default() };
+        let mut card = MemoryCardTyped::default();
+        card.core_facts = vec![MemoryFactRepr::Structured(f1), MemoryFactRepr::Structured(f2)];
+        let warnings = deprecate_same_dimension_conflicts(&mut card, DateTime::from_millis(3000));
+        assert_eq!(card.core_facts.len(), 2, "None 维度不裁决");
+        assert!(warnings.is_empty());
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn pbt_same_dimension_at_most_one_live(
+            facts in proptest::collection::vec(
+                (proptest::option::of("dim[0-2]"), "txt[0-9]", 0u64..10000), 2..6)
+        ) {
+            use crate::models::{MemoryCardTyped, MemoryFact, MemoryFactRepr};
+            use std::collections::HashMap;
+            let mut card = MemoryCardTyped::default();
+            card.core_facts = facts.iter().enumerate().map(|(i, (dim, txt, ts))| {
+                MemoryFactRepr::Structured(MemoryFact {
+                    id: format!("id{i}"), text: txt.clone(),
+                    dimension: dim.clone(), updated_at: DateTime::from_millis(*ts as i64),
+                    ..Default::default()
+                })
+            }).collect();
+            deprecate_same_dimension_conflicts(&mut card, DateTime::from_millis(99999));
+            let mut cnt: HashMap<String, usize> = HashMap::new();
+            for repr in &card.core_facts {
+                if let MemoryFactRepr::Structured(f) = repr {
+                    if let Some(d) = f.dimension.as_ref().filter(|d| !d.trim().is_empty()) {
+                        *cnt.entry(d.clone()).or_default() += 1;
+                    }
+                }
+            }
+            for (_d, c) in cnt { proptest::prop_assert!(c <= 1, "同维生效层应≤1"); }
+        }
     }
 }
 
