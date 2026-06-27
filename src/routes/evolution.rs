@@ -379,6 +379,7 @@ fn baseline_threshold_value(config: &crate::config::AppConfig, gate: &str) -> f6
 fn evolution_error_to_app_error(err: EvolutionError) -> AppError {
     match err {
         EvolutionError::InvalidStatus(msg) => AppError::BadRequest(msg),
+        EvolutionError::RedlineGateRejected(msg) => AppError::BadRequest(msg),
         EvolutionError::Mongo(e) => AppError::Db(e),
         EvolutionError::Bson(e) => AppError::External(format!("bson decode: {e}")),
         EvolutionError::BudgetExceeded {
@@ -727,6 +728,15 @@ mod tests {
         let err = EvolutionError::InvalidStatus("proposal not eligible".to_string());
         match evolution_error_to_app_error(err) {
             AppError::BadRequest(msg) => assert!(msg.contains("not eligible")),
+            other => panic!("expected BadRequest, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn evolution_error_redline_rejected_maps_to_bad_request() {
+        let err = EvolutionError::RedlineGateRejected("命中禁用词表".to_string());
+        match evolution_error_to_app_error(err) {
+            AppError::BadRequest(msg) => assert!(msg.contains("禁用词")),
             other => panic!("expected BadRequest, got {other:?}"),
         }
     }
