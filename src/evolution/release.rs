@@ -185,9 +185,12 @@ pub async fn release_threshold(
 /// 2. 加载 `(workspace_id, prompt_key, current_version=true)` 那条；不存在则
 ///    `InvalidStatus`（不应当发生：seed 总会保证有 current）
 /// 3. 把旧 current 置 `current_version=false`
+/// 3.5. 合成 new_content = compose_appended_content(current.content, diff_snippet)
+///      （末尾追加,原红线正文逐字保留）→ 过 validate_prompt_edit（禁词+锚点闸）
+///      + review_prompt_edit（LLM 语义闸）；任一拒则 RedlineGateRejected,不写库
 /// 4. insert 新一条 `version = old.version + 1`、`current_version=true`、
 ///    `previous_version = Some(old.version)`、`seeded_by="evolution_release"`、
-///    `content` = proposal.diff_snippet（W4 简化路径：把整段 diff_snippet 当成新 content）
+///    `content` = new_content（原文 + 追加片段）
 /// 5. update proposals: `status="released"`、`released_at`、`released_by`、
 ///    `previous_prompt_version = old.version.to_string()`
 /// 6. commit 后 `state.prompt_pack_version.fetch_add(1, SeqCst)` 让 LRU cache 立即失效
@@ -222,9 +225,9 @@ pub async fn release_prompt(
             "prompt proposal missing proposed_template_key: {proposal_id}"
         ))
     })?;
-    let new_content = proposal.diff_snippet.clone().ok_or_else(|| {
+    let append_snippet = proposal.diff_snippet.clone().ok_or_else(|| {
         EvolutionError::InvalidStatus(format!(
-            "prompt proposal missing diff_snippet (W4 release path requires a complete content body): {proposal_id}"
+            "prompt proposal missing diff_snippet: {proposal_id}"
         ))
     })?;
 
@@ -249,6 +252,38 @@ pub async fn release_prompt(
                 "no current_version prompt template for key={prompt_key} workspace={workspace_id}"
             ))
         })?;
+
+    // ── 红线三闸（与人工编辑路径同源,从 prompt_guard 复用）──
+    // 末尾追加:原 prompt 正文逐字保留,critic 片段追加到末尾。
+    let new_content = crate::prompt_guard::compose_appended_content(&current.content, &append_snippet);
+    // 闸 1+2:禁词 + 锚点完整性（原文保留 → 锚点天然过;不过说明原 prompt 已缺锚,fail-closed 正确）
+    crate::prompt_guard::validate_prompt_edit(&prompt_key, &new_content)
+        .map_err(EvolutionError::RedlineGateRejected)?;
+    // 闸 3:LLM 语义审查追加增量（变相真人转介/削弱 grounding 等语义绕过）
+    match crate::prompt_guard::review_prompt_edit(
+        state,
+        &workspace_id,
+        &prompt_key,
+        &current.content,
+        &new_content,
+    )
+    .await
+    {
+        crate::prompt_guard::PromptEditVerdict::Pass => {}
+        crate::prompt_guard::PromptEditVerdict::Reject(reason) => {
+            return Err(EvolutionError::RedlineGateRejected(format!(
+                "LLM 语义闸拒绝:{reason}"
+            )));
+        }
+        crate::prompt_guard::PromptEditVerdict::NeedsHumanConfirm { reason, .. } => {
+            // LLM 不可用 → 不 fail-open 放水,不 fail-closed 死路:本次 release 中止,
+            // 要求管理员逐字核对后再确认（具体 UI 交互见阶段三）。
+            return Err(EvolutionError::RedlineGateRejected(format!(
+                "红线语义审查暂不可用,请逐字核对后再发布:{reason}"
+            )));
+        }
+    }
+
     let old_version = current.version;
     let new_version = old_version + 1;
     let now = DateTime::now();
