@@ -1,0 +1,13 @@
+{
+  "accountId": "acc-1",
+  "agentBlockRate": 0.1,
+  "aiHoldClearedRate": 0.8,
+  "conversationDepth": 3.5,
+  "createdAt": "2023-11-14T22:13:20Z",
+  "dailyRunCount": 120,
+  "dailyRunTokenTotal": 45000,
+  "date": "2026-06-29",
+  "horizon": "7d",
+  "id": "acc-1:7d:2026-06-29",
+  "replyRate": 0.42
+}
