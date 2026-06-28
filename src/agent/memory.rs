@@ -1224,6 +1224,22 @@ async fn consolidate_contact_memory_inner(
         .filter(|c| c.get_str("source").ok() == Some("tag_observation"))
         .collect();
     let tag_observations_json = serde_json::to_string(&tag_observations).unwrap_or_default();
+    // ⑨治上游：注入给 LLM 的「当前 memoryCard」必须带稳定 id（让 LLM 有 id 可显式弃用旧 fact），
+    // 且与下方 prev-merge 用的 previous_card 同源（同一升级实例），否则 LLM 引用的 id 在合并时
+    // 匹配不上（from_plain_text 每次 fresh UUID）。历史 Plain 字符串在此一次性升级为 Structured。
+    let mut injected_card = effective_memory_card(&memory);
+    injected_card.auto_upgrade_plain_facts();
+    // 跨轮命名稳定化：把当前卡里已有的 dimension 名告知 LLM，引导同属性沿用同名。
+    // 冷启动（首轮全是 Plain 升级来 → dimension=None）→ 清单空 → 不注入该行（字节等价）。
+    let existing_dim_names = injected_card.live_dimension_names();
+    let existing_dims_line = if existing_dim_names.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "\n已有维度名（同一属性请沿用下列名称，不要新造同义名）：[{}]\n",
+            existing_dim_names.join(", ")
+        )
+    };
     let user = format!(
         r#"{}
 
@@ -1245,12 +1261,11 @@ async fn consolidate_contact_memory_inner(
 
 待重判标签观察（线索，需对话佐证才保留）:
 {}
+{}
 "#,
         task_prompt,
-        // task 6.3：prompt wire shape 仍是 Document JSON；在最末端通过
-        // `to_document()` 一次性把 typed memoryCard 转成 BSON Document 再
-        // 序列化为 JSON，避免 typed 与 Document 双轨并存。
-        serde_json::to_string(&effective_memory_card(&memory).to_document()).unwrap_or_default(),
+        // task 6.3：prompt wire shape 仍是 Document JSON；典型用 injected_card（已升级带 id）。
+        serde_json::to_string(&injected_card.to_document()).unwrap_or_default(),
         serde_json::to_string(&candidates).unwrap_or_default(),
         contact.nickname.clone().unwrap_or_default(),
         contact
@@ -1265,7 +1280,8 @@ async fn consolidate_contact_memory_inner(
             .unwrap_or_default(),
         convo,
         current_tags,
-        tag_observations_json
+        tag_observations_json,
+        existing_dims_line
     );
     let value = generate_agent_json(
         state,
@@ -1309,7 +1325,8 @@ async fn consolidate_contact_memory_inner(
                 .collect()
         })
         .unwrap_or_default();
-    let previous_card = effective_memory_card(&memory);
+    // ⑨治上游：prev-merge 用与注入同一份升级后的卡（id 一致），保证 LLM 引用的 id 命中。
+    let previous_card = injected_card.clone();
     // H17：用 active profile 的记忆维度驱动 cap（DEFAULT 销售八维与写死表等价；
     // 情感 profile 声明的情绪史/纪念日槽在此按各自 cap 截断，防无界增长）。
     // active_profile 已在函数头部加载（consolidator prompt 注入复用同一份）。
@@ -2054,6 +2071,28 @@ mod r7_deprecation_tests {
             updated_at: DateTime::from_millis(0),
             extra: Default::default(),
         }
+    }
+
+    #[test]
+    fn injected_card_upgraded_carries_ids_and_dims() {
+        // 模拟注入前升级：Plain 字符串 → Structured 带 fresh id。
+        let mut card = MemoryCardTyped {
+            core_facts: vec![
+                MemoryFactRepr::Plain("孩子8岁零基础".to_string()),
+                MemoryFactRepr::Plain("预算5000".to_string()),
+            ],
+            ..Default::default()
+        };
+        let n = card.auto_upgrade_plain_facts();
+        assert_eq!(n, 2, "两条 Plain 应被升级");
+        for repr in &card.core_facts {
+            match repr {
+                MemoryFactRepr::Structured(f) => assert!(!f.id.is_empty(), "升级后必须带 id"),
+                MemoryFactRepr::Plain(_) => panic!("不应残留 Plain"),
+            }
+        }
+        // 升级来自 Plain → dimension 仍 None → 维度名清单为空（冷启动语义）。
+        assert!(card.live_dimension_names().is_empty());
     }
 
     #[test]
