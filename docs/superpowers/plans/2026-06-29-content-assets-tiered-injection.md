@@ -518,15 +518,27 @@ git commit -m "feat(content-assets): create端点去url/mediaId入参+加min_inj
                   <option value="relational">关系档（进入关系经营时注入）</option>
                   <option value="full">完整档（仅深入业务时注入）</option>
                 </select>
-                <span className={styles.fieldHint}>核心禁语/口吻选精简档时刻生效；重型话术/长 FAQ 选完整档。</span>
+                <span className={styles.hint}>核心禁语/口吻选精简档时刻生效；重型话术/长 FAQ 选完整档。</span>
               </label>
 ```
 
-> 若 `styles.fieldHint` 不存在，改用已有的提示样式 class 或省略该 hint span（查 ContentAssets.module.css 现有 class）。
+> 已核实：ContentAssets.module.css 有 `.hint`（:104）和 `.select`（:68）、`.fieldLabel`（:64），**无 `.fieldHint`**——故用 `styles.hint`。
 
-- [ ] **Step 5: 改测试断言**
+- [ ] **Step 5: 改测试 mock 数据 + 断言**
 
-读 `frontend/src/__tests__/features/content-assets/contentAssets.test.tsx`，若有断言「素材 URL」/「MCP Media ID」/「朋友圈素材」存在的，改为断言它们**不存在**（`queryByText` 为 null）；若 createAsset 测试断言 POST body 含 url/mediaId，改为断言含 minInjectTier 不含 url/mediaId。补一条：选注入档下拉 → createAsset POST body 带对应 minInjectTier。
+读 `frontend/src/__tests__/features/content-assets/contentAssets.test.tsx`：
+1. **必改**：beforeEach 里的 `assetDraft` mock（约 :33-40）含 `url: ""` / `mediaId: ""` 两行 → 删除这两行，加 `minInjectTier: "full"`。否则 TS 类型与新 assetDraft 不符报错。改后：
+```typescript
+      assetDraft: {
+        kind: "text",
+        title: "",
+        body: "",
+        usageScene: "",
+        minInjectTier: "full"
+      },
+```
+2. 若有断言「素材 URL」/「MCP Media ID」/「朋友圈素材」文本存在的，改为断言它们**不存在**（`queryByText` 为 null）。现有断言（标题/header/列表展示）不涉及这些字段名，不受影响。
+3. 补一条：选注入档下拉 → createAsset POST body 带对应 minInjectTier、不含 url/mediaId。
 
 - [ ] **Step 6: 跑前端测试 + tsc**
 
