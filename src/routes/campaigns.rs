@@ -462,6 +462,123 @@ fn bump(map: &mut serde_json::Map<String, Value>, reason: &str) {
     map.insert(reason.to_string(), json!(n + 1));
 }
 
+/// GET /campaigns/:id/sends —— 活动推送结果聚合（只读）。
+/// 把 campaign_sends 台账与 agent_run_logs（关联键 source_event_id=taskId.hex）
+/// 聚合成 6 桶分布 + 每人明细。零写入。IDOR：filter 含 workspaceId。
+pub async fn campaign_sends_report(
+    State(state): State<AppState>,
+    Extension(admin): Extension<AuthenticatedAdmin>,
+    Path(id): Path<String>,
+) -> AppResult<Json<Value>> {
+    let oid = ObjectId::parse_str(&id)
+        .map_err(|_| AppError::BadRequest("非法 campaign id".to_string()))?;
+    // IDOR：先核实活动归属本 workspace。
+    let campaign = state
+        .db
+        .campaigns()
+        .find_one(doc! { "_id": oid, "workspaceId": &admin.current_workspace }, None)
+        .await?
+        .ok_or_else(|| AppError::NotFound("campaign not found".to_string()))?;
+
+    // 1) 台账（已有唯一索引 (campaignId, contactWxid)）。
+    let sends: Vec<CampaignSend> = state
+        .db
+        .campaign_sends()
+        .find(
+            doc! { "campaignId": oid, "workspaceId": &admin.current_workspace },
+            None,
+        )
+        .await?
+        .try_collect()
+        .await?;
+
+    // 2) 批量拉 run log：taskId.hex 集合 → 一次 $in，内存按 source_event_id 取最新（max _id）。
+    let task_hexes: Vec<String> = sends
+        .iter()
+        .filter_map(|s| s.task_id.map(|t| t.to_hex()))
+        .collect();
+    let mut latest_run: std::collections::HashMap<String, AgentRunLog> = std::collections::HashMap::new();
+    if !task_hexes.is_empty() {
+        let logs: Vec<AgentRunLog> = state
+            .db
+            .agent_run_logs()
+            .find(
+                doc! {
+                    "source_event_id": { "$in": &task_hexes },
+                    "source_kind": SOURCE_KIND_FOLLOW_UP_TASK,
+                },
+                None,
+            )
+            .await?
+            .try_collect()
+            .await?;
+        for log in logs {
+            let key = log.source_event_id.clone();
+            // 同一 task 多条（retry）取 _id 最大那条 = 最新一次 run。
+            match latest_run.get(&key) {
+                Some(prev) if prev.id >= log.id => {}
+                _ => {
+                    latest_run.insert(key, log);
+                }
+            }
+        }
+    }
+
+    // 3) 批量补客户名。
+    let wxids: Vec<&String> = sends.iter().map(|s| &s.contact_wxid).collect();
+    let mut name_of: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    if !wxids.is_empty() {
+        let contacts: Vec<Contact> = state
+            .db
+            .contacts()
+            .find(
+                doc! {
+                    "workspace_id": &admin.current_workspace,
+                    "account_id": &campaign.account_id,
+                    "wxid": { "$in": &wxids },
+                },
+                None,
+            )
+            .await?
+            .try_collect()
+            .await?;
+        for c in contacts {
+            let name = c.remark.clone().or(c.nickname.clone()).unwrap_or_default();
+            name_of.insert(c.wxid, name);
+        }
+    }
+
+    // 4) 逐人分类 → items。
+    let mut items: Vec<Value> = Vec::with_capacity(sends.len());
+    for s in &sends {
+        let run_doc = s
+            .task_id
+            .map(|t| t.to_hex())
+            .and_then(|hex| latest_run.get(&hex))
+            .and_then(|log| mongodb::bson::to_document(log).ok());
+        let (bucket, reason) = classify_send_outcome(&s.status, run_doc.as_ref());
+        let name = name_of.get(&s.contact_wxid).cloned().unwrap_or_default();
+        let mut item = json!({
+            "contactWxid": s.contact_wxid,
+            "name": name,
+            "status": bucket,
+        });
+        if let Some(r) = reason {
+            item["reason"] = json!(r);
+        }
+        items.push(item);
+    }
+
+    let summary = build_sends_summary(&items);
+    Ok(Json(json!({
+        "campaignId": id,
+        "title": campaign.title,
+        "status": campaign.status,
+        "summary": summary,
+        "items": items,
+    })))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
