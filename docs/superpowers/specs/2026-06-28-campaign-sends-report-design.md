@@ -125,15 +125,16 @@ GET /api/campaigns/:id/sends
          policy_cooldown, policy_wait_user_reply, policy_consecutive_limit,
          blocked_by_required_field, blocked_by_budget,
          review_blocked, revision_failed, revision_skipped_invalid_direction,
-         revision_skipped_budget_exceeded, revision_llm_failure, tool_loop_timeout}
-        → ("blocked", Some(status))            频控/硬约束/改写失败——没发出且无后续
+         revision_skipped_budget_exceeded, revision_llm_failure, tool_loop_timeout,
+         gateway_blocked}
+        → ("blocked", Some(status))            频控/硬约束/改写失败/二次precheck拦截——没发出且无后续
    c. ∈ {blocked_unverified_product_claim, blocked_by_safety_guard,
          held_by_ai_policy, ai_waiting_for_more_context}
         → ("escalated", Some(status))          已转交幕后领导请示，待裁决后 AI 会继续触达
    d. ∈ {context_changed, expired, not_managed,
          no_reply, admin_cancelled, superseded_by_new_inbound}
         → ("canceled", Some(status))           取消（无后续）
-   e. 其它（legacy_mode_unchecked / gateway_blocked / precheck_blocked / 不认识的值）
+   e. 其它（legacy_mode_unchecked / precheck_blocked / 不认识的值）
         → ("unknown", Some(status))            诚实标，绝不强划进 sent
 ⑦ run_log 存在但 status 字段缺失
       → ("unknown", None)                      诚实标
@@ -187,12 +188,12 @@ classify_send_outcome 逐桶：
   ⑥a status ∈ {allowed,outbox_enqueued,quiet_hours_deferred} → pending
   ⑥b status ∈ {daily_limit,cooldown,rate_limited,policy_*,blocked_by_required_field,
        blocked_by_budget,review_blocked,revision_failed,revision_skipped_*,
-       revision_llm_failure,tool_loop_timeout} → blocked + reason
+       revision_llm_failure,tool_loop_timeout,gateway_blocked} → blocked + reason
   ⑥c status ∈ {blocked_unverified_product_claim,blocked_by_safety_guard,
        held_by_ai_policy,ai_waiting_for_more_context} → escalated + reason
   ⑥d status ∈ {context_changed,expired,not_managed,no_reply,admin_cancelled,
        superseded_by_new_inbound} → canceled + reason
-  ⑥e status ∈ {legacy_mode_unchecked,gateway_blocked,precheck_blocked,未知值} → unknown + reason
+  ⑥e status ∈ {legacy_mode_unchecked,precheck_blocked,未知值} → unknown + reason
   ⑦ run_log 有但 status 字段缺失 → unknown/None
   优先级：outbox_status=sent 时即便 status=daily_limit 也归 sent（命中即停）
   escalated 优先级：status=blocked_unverified_product_claim 且无 outbox=sent → escalated（非 blocked）
@@ -226,6 +227,7 @@ build_sends_summary：
 | **产品红线触发条件（三 AND）** | CONFIRMED | gates.rs:653-686：`claim_requires_product_knowledge(claim_analysis)` ∧ `verified_chunks.is_empty()` ∧ `!priced_from_catalog` 三者全真才 `blocked_unverified_product_claim`。拦的是 AI 临场生成的"未背书具体产品话术"，非运营活动指令 |
 | **活动意图是内部触发语境，非客户消息** | CONFIRMED | gateway.rs:4873 `follow_up_trigger_message_text` 把 task.content 包成"系统跟进任务到期…任务内容：{intent}"喂 Reply Agent，AI 据此重新生成面向客户的话术、走完整决策+知识路由+review |
 | **escalated 类有请示通道出口（非死路、非人工接管）** | CONFIRMED | logic.rs:328-342 `should_escalate_held`：blocked_unverified_product_claim/blocked_by_safety_guard 默认升级、held_by_ai_policy 按开关；held=AI 内部状态，请示交幕后领导补 verified 知识/裁决后 AI 继续，客户始终只跟 AI 对话 |
+| **【二审补充】gateway_blocked 归 blocked（非 unknown）** | CONFIRMED | 二道 precheck（gateway.rs:2013，LLM 决策后）命中频控/状态翻转时，顶层 `agent_run_logs.status` 写字面量 `"gateway_blocked"`（:2064），真实原因（final_precheck.status）落 `gateway_result` 子文档（:2070，SendGatewayResult.status types.rs:1500）。语义=被网关拦下没发出 → 归 `blocked`（泛标签 reason）。推翻 plan 原 §5.3e"看不到原因故 unknown"前提（原因可恢复，但泛标签桶已足够诚实，不耦合子文档 shape） |
 
 **结论**：所有技术断言已对 origin/main 最新代码闭环。基线 = origin/main d615bdc（新分支 feat/campaign-sends-report 零落后），与 main 在建的优化零冲突。无残留猜测。
 

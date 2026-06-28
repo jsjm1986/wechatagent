@@ -110,7 +110,7 @@ pub(super) fn classify_send_outcome(
             | "blocked_by_required_field" | "blocked_by_budget"
             | "review_blocked" | "revision_failed" | "revision_skipped_invalid_direction"
             | "revision_skipped_budget_exceeded" | "revision_llm_failure"
-            | "tool_loop_timeout")) => ("blocked", Some(s.to_string())),
+            | "tool_loop_timeout" | "gateway_blocked")) => ("blocked", Some(s.to_string())),
         // c. 已转交幕后领导请示，待裁决后 AI 会继续触达（非失败漏推）。
         Some(s @ ("blocked_unverified_product_claim" | "blocked_by_safety_guard"
             | "held_by_ai_policy" | "ai_waiting_for_more_context")) => {
@@ -256,6 +256,11 @@ fn bump(map: &mut serde_json::Map<String, Value>, reason: &str) {
         assert_eq!(
             classify_send_outcome("enqueued", Some(&run_log("revision_failed", None))),
             ("blocked", Some("revision_failed".to_string()))
+        );
+        // gateway_blocked = 二次 precheck 命中（顶层泛标签）→ blocked
+        assert_eq!(
+            classify_send_outcome("enqueued", Some(&run_log("gateway_blocked", None))),
+            ("blocked", Some("gateway_blocked".to_string()))
         );
         // ⑥c 请示通道（escalated）：产品红线/安全门/AI策略/等上下文，原因保留
         assert_eq!(

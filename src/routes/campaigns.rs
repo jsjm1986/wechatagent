@@ -414,13 +414,15 @@ pub(super) fn classify_send_outcome(
     match run_status {
         // a. 放行/已入队/作息重排：会继续，视作在途。
         Some("allowed" | "outbox_enqueued" | "quiet_hours_deferred") => ("pending", None),
-        // b. 频控/硬约束/改写失败——没发出且无后续。
+        // b. 频控/硬约束/改写失败——没发出且无后续。gateway_blocked = 二次 precheck
+        //    在 LLM 决策后命中（罕见：频控/状态在决策窗口内翻转），顶层 status 是泛标签
+        //    （真实原因在 gateway_result 子文档），语义上确定是一次"被拦下没发出"。
         Some(s @ ("daily_limit" | "cooldown" | "rate_limited"
             | "policy_cooldown" | "policy_wait_user_reply" | "policy_consecutive_limit"
             | "blocked_by_required_field" | "blocked_by_budget"
             | "review_blocked" | "revision_failed" | "revision_skipped_invalid_direction"
             | "revision_skipped_budget_exceeded" | "revision_llm_failure"
-            | "tool_loop_timeout")) => ("blocked", Some(s.to_string())),
+            | "tool_loop_timeout" | "gateway_blocked")) => ("blocked", Some(s.to_string())),
         // c. 已转交幕后领导请示，待裁决后 AI 会继续触达（非失败漏推）。
         Some(s @ ("blocked_unverified_product_claim" | "blocked_by_safety_guard"
             | "held_by_ai_policy" | "ai_waiting_for_more_context")) => {
@@ -847,6 +849,11 @@ mod tests {
         assert_eq!(
             classify_send_outcome("enqueued", Some(&run_log("revision_failed", None))),
             ("blocked", Some("revision_failed".to_string()))
+        );
+        // gateway_blocked = 二次 precheck 命中（顶层泛标签），语义=被拦下没发出 → blocked
+        assert_eq!(
+            classify_send_outcome("enqueued", Some(&run_log("gateway_blocked", None))),
+            ("blocked", Some("gateway_blocked".to_string()))
         );
         // ⑥c 请示通道（escalated）：产品红线/安全门/AI策略/等上下文，原因保留
         assert_eq!(
