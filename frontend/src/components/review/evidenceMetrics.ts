@@ -52,8 +52,6 @@ function numOrNull(v: unknown): number | null {
 
 export interface GateDelta {
   gate: string;
-  original: number | null;
-  neu: number | null;
   delta: number | null;
 }
 
@@ -96,8 +94,6 @@ export function readAggregateEvidence(
   const perGateObj = hasPerGate ? (perGate as Record<string, unknown>) : {};
   const gateDeltas: GateDelta[] = FIVE_GATE_KEYS.map((gate) => ({
     gate,
-    original: null,
-    neu: null,
     delta: numOrNull(perGateObj[gate]),
   }));
 

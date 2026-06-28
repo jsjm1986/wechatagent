@@ -45,8 +45,6 @@ describe("evidenceMetrics 窄化读取", () => {
     expect(ev.gateDeltas).toHaveLength(5);
     expect(ev.gateDeltas[0]).toEqual({
       gate: "fact_risk_block",
-      original: null, // per-gate 原始率不在聚合 doc 里，只有 delta；original/neu 由调用方从样本另算或留 null
-      neu: null,
       delta: -0.2,
     });
     expect(ev.originalCritiqueRate).toBe(0.4);

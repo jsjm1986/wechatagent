@@ -250,7 +250,7 @@ function ShadowEvalReport({
   summary: ShadowReplaysSummary;
   proposal: ProposalDetail;
 }) {
-  const isPrompt = proposal.kind !== "threshold";
+  const isPrompt = proposal.kind === "prompt";
   const aggregate = isPrompt ? readAggregateEvidence(proposal.evalMetrics ?? {}) : null;
   return (
     <section className={styles.shadowEval} data-testid="shadow-eval">
@@ -310,7 +310,7 @@ function ShadowEvalReport({
               </tr>
               <tr>
                 <td>token 均值Δ</td>
-                <td>{formatNumber(aggregate.tokenDelta)}</td>
+                <td>{formatNumber(aggregate.tokenDelta, 0)}</td>
               </tr>
             </tbody>
           </table>
