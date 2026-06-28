@@ -209,7 +209,7 @@ pub(in crate::routes) async fn create_operation_knowledge_chunk(
     ))
 }
 
-pub(in crate::routes) async fn update_operation_knowledge_chunk(
+pub async fn update_operation_knowledge_chunk(
     State(state): State<AppState>,
     Extension(admin): Extension<AuthenticatedAdmin>,
     Path(id): Path<String>,
@@ -243,6 +243,26 @@ pub(in crate::routes) async fn update_operation_knowledge_chunk(
         }
     }
     coerce_integrity_against_d2_gate(&mut payload);
+    // 取原 chunk：用于回填请求体 OperationKnowledgeChunkRequest 无法表达、但
+    // replace_one 会整条清空的 model 字段（provenance 来源追溯 / wiki_type /
+    // locked_fields 等 + created_at）。filter 必须带 workspace_id（与 replace_one 一致），
+    // 不能跨租户取原值。PUT 一个不存在的 chunk 返回 NotFound（create 有独立 POST 端点，
+    // PUT 不该 upsert）。
+    let existing = state
+        .db
+        .operation_knowledge_chunks()
+        .find_one(
+            doc! {
+                "_id": object_id,
+                "workspace_id": &admin.current_workspace
+            },
+            None,
+        )
+        .await?
+        .ok_or_else(|| AppError::NotFound("operation knowledge chunk not found".to_string()))?;
+    let next =
+        operation_knowledge_chunk_from_request(&state, &admin.current_workspace, payload, Some(object_id))?;
+    let next = preserve_unmodeled_chunk_fields(next, &existing);
     state
         .db
         .operation_knowledge_chunks()
@@ -251,7 +271,7 @@ pub(in crate::routes) async fn update_operation_knowledge_chunk(
                 "_id": object_id,
                 "workspace_id": &admin.current_workspace
             },
-            operation_knowledge_chunk_from_request(&state, &admin.current_workspace, payload, Some(object_id))?,
+            next,
             None,
         )
         .await?;

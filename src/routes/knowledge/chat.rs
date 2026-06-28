@@ -1,9 +1,10 @@
 //! 运营知识库对话补库：chat turn/apply/history + 意图分诊 + 草拟/更新/应用 + 后台任务流。
 
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     Extension, Json,
 };
+use futures::TryStreamExt;
 use mongodb::bson::{doc, oid::ObjectId, Bson, DateTime, Document};
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -2010,6 +2011,60 @@ pub(in crate::routes) async fn chat_task_create(
     })))
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(in crate::routes) struct ChatTaskListQuery {
+    pub status: Option<String>,
+    pub limit: Option<i64>,
+}
+
+/// 任务列表 limit clamp：缺省 50，区间 [1, 200]。
+fn clamp_task_list_limit(limit: Option<i64>) -> i64 {
+    limit.unwrap_or(50).clamp(1, 200)
+}
+
+/// `GET /api/knowledge/chat/tasks`：列出本 workspace 的长任务（F21 任务总览）。
+/// 可选 status 过滤（非法值忽略，与现有 chunk 列表 query 宽松风格一致）；
+/// limit clamp [1,200] 默认 50；按 created_at 倒序。列表项不带 plannedSteps/cards
+/// 全文（控 payload 体积），详情仍走 GET /tasks/:id。
+pub(in crate::routes) async fn chat_task_list(
+    State(state): State<AppState>,
+    Extension(admin): Extension<AuthenticatedAdmin>,
+    Query(query): Query<ChatTaskListQuery>,
+) -> AppResult<Json<Value>> {
+    let mut filter = doc! { "workspace_id": &admin.current_workspace };
+    if let Some(status) = query.status.as_ref().filter(|s| !s.trim().is_empty()) {
+        filter.insert("status", status.trim());
+    }
+    let limit = clamp_task_list_limit(query.limit);
+    let mut cursor = state
+        .db
+        .knowledge_chat_tasks()
+        .find(
+            filter,
+            mongodb::options::FindOptions::builder()
+                .sort(doc! { "created_at": -1 })
+                .limit(limit)
+                .build(),
+        )
+        .await?;
+    let mut items = Vec::new();
+    while let Some(task) = cursor.try_next().await? {
+        items.push(json!({
+            "taskId": task.id.map(|i| i.to_hex()).unwrap_or_default(),
+            "sessionId": task.session_id,
+            "status": task.status,
+            "errorKind": task.error_kind,
+            "totalSteps": task.planned_steps.len() as i32,
+            "completedStepCount": task.completed_steps.len() as i32,
+            "createdAt": task.created_at.to_string(),
+            "startedAt": task.started_at.map(|d| d.to_string()),
+            "finishedAt": task.finished_at.map(|d| d.to_string()),
+        }));
+    }
+    Ok(Json(json!({ "items": items })))
+}
+
 /// `GET /api/knowledge/chat/tasks/:id`：查询 task 状态（前端 fallback 拉取）。
 pub(in crate::routes) async fn chat_task_get(
     State(state): State<AppState>,
@@ -2225,5 +2280,14 @@ mod tests {
                 "anchor.sourceQuote 必须与返回 quote 成对一致"
             );
         }
+    }
+
+    #[test]
+    fn clamp_task_list_limit_defaults_and_bounds() {
+        assert_eq!(clamp_task_list_limit(None), 50, "缺省 50");
+        assert_eq!(clamp_task_list_limit(Some(0)), 1, "下界 clamp 到 1");
+        assert_eq!(clamp_task_list_limit(Some(-5)), 1, "负数 clamp 到 1");
+        assert_eq!(clamp_task_list_limit(Some(10)), 10, "区间内原值");
+        assert_eq!(clamp_task_list_limit(Some(9999)), 200, "上界 clamp 到 200");
     }
 }
