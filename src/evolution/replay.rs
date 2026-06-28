@@ -189,27 +189,34 @@ pub async fn run_shadow_replay(
         }
     };
 
-    // 2. inbound message 必须仍在（retention 未清理）。AgentRunLog.context 里有
-    //    inbound_message_id；不强求拿到完整 ConversationMessage（threshold 重判
-    //    不需要原文），但 prompt 重放需要——这里先做 retention 探针。
-    let inbound_id = original
-        .context
-        .get_str("inboundMessageId")
-        .or_else(|_| original.context.get_str("inbound_message_id"))
-        .ok()
-        .map(str::to_string);
-    if let Some(ref inb_id) = inbound_id {
-        // ConversationMessage 无 rename_all → BSON 字段是 snake_case `message_id`
-        // （见 models.rs ConversationMessage、db/indexes.rs:49 的索引、webhooks.rs
-        // 写入路径、prompt_shadow.rs 的同款 find_one）。此处必须用 `message_id`，
-        // 否则 retention 探针对任何真实消息都 count==0 → 误判 source_message_unavailable，
-        // 把所有 prompt shadow happy path 错杀成 failed。
-        let count = state
-            .db
-            .messages()
-            .count_documents(doc! { "message_id": inb_id }, None)
-            .await
-            .map_err(AppError::from)?;
+    // 2. inbound message 必须仍在（retention 未清理）。源 inbound id 落在
+    //    AgentRunLog 顶层 `source_event_id`（= envelope 的 message.message_id，见
+    //    gateway `trigger_envelope_source`）——gateway 从不往 `context` 写
+    //    inboundMessageId。retention 探针**只对 prompt 候选**做：threshold 重判
+    //    纯读 review.scores、不需要原文，探针会把 retention 已清理的源 run 错杀；
+    //    prompt 重放才需要真实历史消息。follow_up / 合成兜底（`synthetic:` 前缀）
+    //    的 source_event_id 查 messages 必 miss——也按 source_message_unavailable 短路。
+    if proposal.proposal_kind == "prompt" {
+        let inbound_id = original.source_event_id.trim();
+        let probe_ok = original.source_kind
+            == crate::agent::run_envelope::SOURCE_KIND_INBOUND_MESSAGE
+            && !inbound_id.is_empty()
+            && !inbound_id.starts_with("synthetic:");
+        let count = if probe_ok {
+            // ConversationMessage 无 rename_all → BSON 字段是 snake_case `message_id`
+            // （见 models.rs ConversationMessage、db/indexes.rs:49 的索引、webhooks.rs
+            // 写入路径、prompt_shadow.rs 的同款 find_one）。此处必须用 `message_id`，
+            // 否则 retention 探针对任何真实消息都 count==0 → 误判 source_message_unavailable，
+            // 把所有 prompt shadow happy path 错杀成 failed。
+            state
+                .db
+                .messages()
+                .count_documents(doc! { "message_id": inbound_id }, None)
+                .await
+                .map_err(AppError::from)?
+        } else {
+            0
+        };
         if count == 0 {
             return persist_replay(
                 state,
