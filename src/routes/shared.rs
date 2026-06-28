@@ -1671,5 +1671,37 @@ mod tests {
         assert!(validate_deal_verification(Some("conversation_inferred")).is_err());
         assert!(validate_deal_verification(Some("guessed")).is_err());
     }
+
+    /// 契约快照：llm_call_log_json。id 走 ObjectId→hex;account_id/contact_wxid 是
+    /// Option（给 Some 穿透 string 分支）;retry_count/final_status 赋值但投影不下发。
+    #[test]
+    fn llm_call_log_json_matches_contract_fixture() {
+        use super::llm_call_log_json;
+        use crate::models::LlmCallLog;
+        use mongodb::bson::{oid::ObjectId, DateTime};
+
+        let item = LlmCallLog {
+            id: Some(ObjectId::parse_str("64a1f2c3e4b5a6978899c001").unwrap()),
+            workspace_id: "ws-1".to_string(),
+            account_id: Some("acc-1".to_string()),
+            contact_wxid: Some("wxid_abc".to_string()),
+            run_id: Some("run-1".to_string()),
+            prompt_key: "user.reply".to_string(),
+            model: "provider-a".to_string(),
+            status: "success".to_string(),
+            latency_ms: 1200,
+            prompt_tokens: 800,
+            completion_tokens: 200,
+            total_tokens: 1000,
+            prompt_cache_hit_tokens: 600,
+            prompt_cache_miss_tokens: 200,
+            error: Some("none".to_string()),
+            retry_count: 1,
+            final_status: Some("success".to_string()),
+            created_at: DateTime::from_millis(1_700_000_000_000),
+        };
+        let projected = llm_call_log_json(item);
+        crate::routes::contract_snapshot::assert_contract_fixture("llm_call_log", projected);
+    }
 }
 
