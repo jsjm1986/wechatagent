@@ -133,6 +133,61 @@ describe("OperationsFeature", () => {
     expect(screen.getByText("加载中…")).toBeInTheDocument();
     expect(screen.queryByText("暂无跟进任务")).not.toBeInTheDocument();
   });
+
+  it("C10: 事件含结构化 detail 时渲染可展开明细", () => {
+    (useOperationsStore as any).mockReturnValue({
+      events: [
+        {
+          id: "e1",
+          kind: "ptier_escalated",
+          status: "ok",
+          summary: "升档为完整知识档",
+          detail: { runId: "run-9", knowledgeCoverage: 0.42 },
+          createdAt: "2026-06-28T00:00:00Z",
+        },
+      ],
+      tasks: [],
+      decisionReviews: [],
+      llmUsage: null,
+      agentRuns: [],
+      opsTab: "events",
+      setOpsTab: vi.fn(),
+      loadOperationsData: mockLoadOperationsData,
+    });
+
+    const { container } = render(<OperationsFeature />);
+
+    expect(screen.getByText("结构化明细")).toBeInTheDocument();
+    // detail 经 <pre>JSON.stringify</pre> 渲染，run_id/coverage 在文本中可读
+    const pre = container.querySelector("pre");
+    expect(pre?.textContent).toContain("run-9");
+    expect(pre?.textContent).toContain("knowledgeCoverage");
+  });
+
+  it("C10: 事件无 detail 时不渲染明细块(向后兼容)", () => {
+    (useOperationsStore as any).mockReturnValue({
+      events: [
+        {
+          id: "e2",
+          kind: "follow_up",
+          status: "ok",
+          summary: "跟进",
+          createdAt: "2026-06-28T00:00:00Z",
+        },
+      ],
+      tasks: [],
+      decisionReviews: [],
+      llmUsage: null,
+      agentRuns: [],
+      opsTab: "events",
+      setOpsTab: vi.fn(),
+      loadOperationsData: mockLoadOperationsData,
+    });
+
+    render(<OperationsFeature />);
+
+    expect(screen.queryByText("结构化明细")).not.toBeInTheDocument();
+  });
 });
 
 describe("operationsStore loading 生命周期(F15)", () => {

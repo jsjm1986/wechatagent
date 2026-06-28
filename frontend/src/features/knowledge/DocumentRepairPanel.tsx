@@ -13,10 +13,12 @@ export function DocumentRepairPanel({
   documentId,
   documentTitle,
   onClose,
+  onRepaired,
 }: {
   documentId: string;
   documentTitle?: string;
   onClose?: () => void;
+  onRepaired?: () => void;
 }) {
   const [chunks, setChunks] = useState<ChunkView[]>([]);
   const [loading, setLoading] = useState(true);
@@ -83,6 +85,7 @@ export function DocumentRepairPanel({
                     window.dispatchEvent(
                       new CustomEvent("wikiChunkRevised", { detail: { chunk_id: chunk.id } }),
                     );
+                    onRepaired?.();
                   }}
                 />
               ) : null}

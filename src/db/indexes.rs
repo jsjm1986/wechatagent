@@ -1242,7 +1242,9 @@ async fn ensure_evolution_indexes(db: &Database) -> anyhow::Result<()> {
         .await?;
 
     // knowledge_chat_tasks：worker 取 pending 用 (status, created_at)；
-    // chat 面板按 sessionId 拉历史用 (session_id, status)。
+    // chat 面板按 sessionId 拉历史用 (session_id, status)；
+    // 任务总览列表 chat_task_list 按 workspace 过滤 + created_at 倒序拉，
+    // 用 (workspace_id, created_at) 服务该查询避免全表扫。
     db.knowledge_chat_tasks()
         .create_index(
             IndexModel::builder()
@@ -1255,6 +1257,14 @@ async fn ensure_evolution_indexes(db: &Database) -> anyhow::Result<()> {
         .create_index(
             IndexModel::builder()
                 .keys(doc! { "session_id": 1, "status": 1 })
+                .build(),
+            None,
+        )
+        .await?;
+    db.knowledge_chat_tasks()
+        .create_index(
+            IndexModel::builder()
+                .keys(doc! { "workspace_id": 1, "created_at": -1 })
                 .build(),
             None,
         )

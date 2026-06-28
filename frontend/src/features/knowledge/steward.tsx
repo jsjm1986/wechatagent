@@ -282,6 +282,19 @@ export function DocumentsView() {
     }
   }
 
+  // 单 chunk 修复落库后强制重拉该文档 chunks（绕过 toggle 的缓存短路），
+  // 使父列表 integrityStatus 标记与「批量 AI 修复」入口显隐实时反映修复进度。
+  async function refetchDocChunks(docId: string) {
+    try {
+      const r = await fetch(`/api/operation-knowledge/documents/${encodeURIComponent(docId)}/chunks`);
+      if (!r.ok) throw await parseApiError(r);
+      const data = (await r.json()) as { items?: DocumentChunkRow[] };
+      setDocChunks((prev) => ({ ...prev, [docId]: data.items ?? [] }));
+    } catch (e) {
+      setDocChunksError(String(e));
+    }
+  }
+
   return (
     <div className="wikiArchiveShell" style={{ padding: 18 }}>
       <header className="wikiArchiveHeader">
@@ -558,6 +571,7 @@ export function DocumentsView() {
                             documentId={d.id}
                             documentTitle={d.title}
                             onClose={() => setRepairDoc(null)}
+                            onRepaired={() => void refetchDocChunks(d.id)}
                           />
                         ) : null}
                       </div>
