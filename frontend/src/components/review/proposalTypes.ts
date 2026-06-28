@@ -63,6 +63,8 @@ export interface ShadowReplaySample {
   status: string;
   failureReason: string | null;
   originalFinalReviewStatus: string | null;
+  original5gateHit: Record<string, unknown>;
+  originalSelfCritiqueAddressed: boolean | null;
   newFinalReviewStatus: string | null;
   newReviewRisks: unknown;
   newTokenCost: number | null;
