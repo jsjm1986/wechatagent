@@ -29,6 +29,22 @@ use super::types::{
 };
 use crate::models::AgentTask;
 
+/// critic 候选的 prompt 覆盖：按 key 命中则末尾追加片段(复用阶段一 compose_appended_content),
+/// 供 shadow replay 用「原 prompt + 追加片段」跑真模型对照。
+pub struct PromptOverride {
+    pub target_prompt_key: String,
+    pub append_snippet: String,
+}
+impl PromptOverride {
+    pub fn apply_if_matches(&self, prompt_key: &str, loaded: String) -> String {
+        if prompt_key == self.target_prompt_key {
+            crate::prompt_guard::compose_appended_content(&loaded, &self.append_snippet)
+        } else {
+            loaded
+        }
+    }
+}
+
 pub async fn build_initial_operation_profile(
     state: &AppState,
     workspace_id: &str,
@@ -163,6 +179,7 @@ pub(crate) async fn decide_reply(
     knowledge_route: &KnowledgeRouteResult,
     rewrite_instruction: Option<&str>,
     run_id: Option<&str>,
+    prompt_override: Option<&PromptOverride>,
 ) -> AppResult<AgentDecision> {
     let (decision, _risks) = decide_reply_with_promote(
         state,
@@ -179,6 +196,7 @@ pub(crate) async fn decide_reply(
         knowledge_route,
         rewrite_instruction,
         run_id,
+        prompt_override,
         crate::agent::sufficiency::PromptTier::Full,
     )
     .await?;
@@ -280,6 +298,7 @@ pub(crate) async fn decide_reply_with_promote(
     knowledge_route: &KnowledgeRouteResult,
     rewrite_instruction: Option<&str>,
     run_id: Option<&str>,
+    prompt_override: Option<&PromptOverride>,
     tier: crate::agent::sufficiency::PromptTier,
 ) -> AppResult<(AgentDecision, Vec<String>)> {
     // 渐进式三档（2026-06-23）：按 tier 真实裁剪槽位三组。
@@ -567,6 +586,9 @@ pub(crate) async fn decide_reply_with_promote(
         contact.locale.as_deref(),
     )
     .await?;
+    let system_contract = prompt_override
+        .map(|o| o.apply_if_matches("user.reply.system", system_contract.clone()))
+        .unwrap_or(system_contract);
     let (policy, _policy_version) = prompts::load_prompt_for_contact(
         &state.db,
         &state.config.default_workspace_id,
@@ -585,6 +607,9 @@ pub(crate) async fn decide_reply_with_promote(
     // **红线**：boundary_protection 不放宽边界保护硬规则段不在任何替换范围、任何行业写死守护。
     // 新增 reply.policy 类 prompt override 字段时，加进那个 helper（勿在此散接）——见 helper 文档。
     let policy = super::domain_profile::apply_reply_policy_prompt_overrides(&policy, &active_profile);
+    let policy = prompt_override
+        .map(|o| o.apply_if_matches("user.reply.policy", policy.clone()))
+        .unwrap_or(policy);
     let (task_template, _task_version) = prompts::load_prompt_for_contact(
         &state.db,
         &state.config.default_workspace_id,
@@ -638,6 +663,9 @@ pub(crate) async fn decide_reply_with_promote(
         &task_template,
         &active_profile.conversation_modes,
     );
+    let task_template = prompt_override
+        .map(|o| o.apply_if_matches("user.reply.task", task_template.clone()))
+        .unwrap_or(task_template);
     // R-prompt-v3：Operator Instruction 层（最高优先级）。运营人员可在后台对
     // 单个联系人写一段 ≤ 1000 字的特别指令，覆盖 Soul + Policy 的默认人格判定
     // （如"老客户已签约，不要主动推销"、"这个客户技术背景，可以多用术语"）。
@@ -1858,5 +1886,22 @@ mod persona_override_tests {
         assert!(out.contains("价格敏感"));
         assert!(out.contains("运营确认"));
         assert!(out.contains("AI 判断"));
+    }
+}
+
+#[cfg(test)]
+mod prompt_override_tests {
+    use super::PromptOverride;
+
+    #[test]
+    fn prompt_override_appends_only_on_key_match() {
+        let ov = PromptOverride { target_prompt_key: "user.reply.policy".into(), append_snippet: "补充约束".into() };
+        // 命中 key → 末尾追加（复用 compose_appended_content 语义:原文开头+片段结尾）
+        let hit = ov.apply_if_matches("user.reply.policy", "原策略正文".into());
+        assert!(hit.starts_with("原策略正文"));
+        assert!(hit.ends_with("补充约束"));
+        // 不命中 key → 原样逐字返回（字节等价护栏）
+        let miss = ov.apply_if_matches("user.reply.system", "系统契约正文".into());
+        assert_eq!(miss, "系统契约正文");
     }
 }

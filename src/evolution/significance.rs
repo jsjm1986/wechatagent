@@ -11,10 +11,11 @@
 //! - send_success_rate_delta = new_rate - original_rate
 //! - 通过条件：delta ≥ min_send_success_delta；同时 5 闸任一项 new_hit_rate - original_hit_rate ≤ max_5gate_hit_increase
 //!
-//! Prompt 候选（prompt）：
-//! - self_critique_addressed_delta = new_addressed_rate - original_addressed_rate
-//! - 通过条件：delta ≥ min_self_critique_delta；同时 5 闸任一项 hit_rate 涨幅 ≤ max_5gate_hit_increase
-//! - token_cost_delta（仅观测，不强制）
+//! Prompt 候选（prompt）：**不自动放行/拒绝**。阶段二改造——prompt 改动靠真模型
+//! shadow 对照产出证据供管理员 release 把关。`completed ≥ 1` → `eligible_for_release`
+//! （证据就绪待管理员把关）；`completed == 0` → rejected。self_critique addressed 新旧率 /
+//! delta、5 闸涨幅、token_cost_delta 全部降为**仅观测证据**（带 `_observed` 后缀），
+//! 不再是放行闸。
 //!
 //! 5 闸 key 列表与 [`crate::evolution::threshold::THRESHOLD_REASONABLE_BANDS`] 一致：
 //! `fact_risk_block / pressure_risk_block / human_like_score_rewrite /
@@ -68,7 +69,6 @@ pub fn safety_block_status_for(gate_key: Option<&str>) -> Option<&'static str> {
 pub struct SignificanceCfg {
     pub min_replays: usize,
     pub min_send_success_delta: f64,
-    pub min_self_critique_delta: f64,
     pub max_5gate_hit_increase: f64,
     pub max_fail_rate: f64,
     /// #152：安全闸放松回归率上限。shadow 中"原本被该安全闸拦下、新配置却
@@ -82,7 +82,6 @@ impl SignificanceCfg {
         Self {
             min_replays: cfg.evolution_min_replays,
             min_send_success_delta: cfg.evolution_min_send_success_delta,
-            min_self_critique_delta: cfg.evolution_min_self_critique_delta,
             max_5gate_hit_increase: cfg.evolution_max_5gate_hit_increase,
             max_fail_rate: cfg.evolution_replay_max_fail_rate,
             max_safety_regression_rate: cfg.evolution_max_safety_regression_rate,
@@ -209,21 +208,42 @@ pub fn grade_threshold(
 
 /// Prompt 候选显著性测试。
 ///
-/// 通过条件（必须全部成立）：
-/// - completed ≥ min_replays
-/// - failed / total ≤ max_fail_rate
-/// - self_critique_addressed_delta ≥ min_self_critique_delta
-/// - 5 闸任一项 hit_rate 涨幅 ≤ max_5gate_hit_increase
+/// 阶段二语义：prompt 候选**不**用数值阈值（send_success / self_critique delta /
+/// 5 闸涨幅）自动判生死——那是 threshold 数值候选的玩法。prompt 改动靠真模型
+/// shadow 对照产出**证据**供管理员 release 把关。详见下方语义说明。
+/// Prompt 候选证据汇总（**不自动放行/拒绝**）。
 ///
-/// `token_cost_delta` 仅观测、不强制。
+/// 阶段二语义改造：prompt 候选不再用 critique_delta / 5 闸涨幅 gate 自动判生死
+/// （那是 threshold 数值候选的玩法）。prompt 改动靠真模型 shadow 对照产出**证据**
+/// 供管理员 release 把关。故：
+/// - `completed ≥ 1` → `passed=true`（= `eligible_for_release`，语义=证据就绪待管理员把关）；
+/// - `completed == 0` → `passed=false`（= rejected，无可对照证据）。
+///
+/// 返回的 `Document`（写进 `proposal.eval_metrics`）承载全部对照证据：
+/// - per-sample 新旧 5 闸命中 / selfCritique addressed / final 状态（`per_sample_evidence`）；
+/// - 聚合观测：self_critique addressed 新旧率与 delta、5 闸涨幅、token_cost_delta；
+///   这些字段**仅供管理员参考**，不再是放行闸（带 `_observed` 后缀强调）。
 pub fn grade_prompt(replays: &[ShadowReplay], cfg: &SignificanceCfg) -> (bool, Document) {
-    if let Some(reason) = early_reject(replays, cfg) {
-        return reason;
-    }
+    let _ = cfg; // prompt 路径不再消费数值阈值；保留入参签名一致性。
+    let total = replays.len();
     let completed: Vec<&ShadowReplay> =
         replays.iter().filter(|r| r.status == "completed").collect();
+    let failed = total - completed.len();
 
-    // self_critique_addressed_rate
+    // completed==0 → 无可对照证据 → rejected。
+    if completed.is_empty() {
+        return (
+            false,
+            doc! {
+                "kind": "prompt",
+                "completed_replay_count": 0_i64,
+                "failed_replay_count": failed as i64,
+                "reason": "no_completed_replays",
+            },
+        );
+    }
+
+    // ── 聚合观测（仅证据，不 gating）──────────────────────────────────
     let original_addressed = ratio_of(&completed, |r| match r.original_self_critique_for_metric() {
         Some(true) => Some(1.0),
         Some(false) => Some(0.0),
@@ -235,53 +255,67 @@ pub fn grade_prompt(replays: &[ShadowReplay], cfg: &SignificanceCfg) -> (bool, D
         None => None,
     });
     let critique_delta = new_addressed - original_addressed;
-
-    // token_cost_delta：仅观测
     let token_delta = mean_token_delta(&completed);
-
-    if critique_delta.is_nan() || token_delta.is_nan() {
-        return (false, doc! { "reason": "nan_in_metrics" });
-    }
-
     let gate_deltas = compute_5gate_deltas(&completed);
-    if let Some(reason) = nan_in_gate_deltas(&gate_deltas) {
-        return (false, doc! { "reason": reason });
-    }
     let max_increase = gate_deltas
         .iter()
         .map(|(_, d)| *d)
         .fold(f64::NEG_INFINITY, f64::max);
 
-    let critique_passed = critique_delta >= cfg.min_self_critique_delta;
-    let gate_passed = max_increase <= cfg.max_5gate_hit_increase;
-    let passed = critique_passed && gate_passed;
+    // ── per-sample 新旧对照证据 ───────────────────────────────────────
+    let per_sample: Vec<Bson> = completed
+        .iter()
+        .map(|r| {
+            Bson::Document(doc! {
+                "source_run_id": r.source_run_id,
+                "original_final_review_status": opt_str_bson(r.original_final_review_status.as_deref()),
+                "new_final_review_status": opt_str_bson(r.new_final_review_status.as_deref()),
+                "original_self_critique_addressed": opt_bool_bson(r.original_self_critique_for_metric()),
+                "new_self_critique_addressed": opt_bool_bson(r.new_self_critique_addressed),
+                "original_5gate_hit": r.original_5gate_hit.clone(),
+                "new_5gate_hit": r.new_5gate_hit.clone(),
+                "new_token_cost": r.new_token_cost,
+            })
+        })
+        .collect();
 
     let mut metrics = doc! {
         "kind": "prompt",
         "completed_replay_count": completed.len() as i64,
-        "failed_replay_count": (replays.len() - completed.len()) as i64,
+        "failed_replay_count": failed as i64,
+        // 语义说明：prompt 候选靠管理员看证据 release，completed≥1 即证据就绪。
+        "eligibility_basis": "completed_ge_1_pending_human_review",
         "original_self_critique_addressed_rate": original_addressed,
         "new_self_critique_addressed_rate": new_addressed,
-        "self_critique_addressed_delta": critique_delta,
+        "self_critique_addressed_delta_observed": critique_delta,
         "max_5gate_hit_increase_observed": max_increase,
-        "self_critique_delta_passed": critique_passed,
-        "gate_increase_passed": gate_passed,
-        "token_cost_delta_mean": token_delta,
+        "token_cost_delta_mean_observed": token_delta,
     };
     let mut gate_doc = Document::new();
     for (gate, delta) in gate_deltas {
         gate_doc.insert(gate, Bson::Double(delta));
     }
     metrics.insert("five_gate_hit_delta_per_gate", gate_doc);
-    if !passed {
-        let reason = if !critique_passed {
-            "self_critique_delta_below_threshold"
-        } else {
-            "gate_hit_increase_above_threshold"
-        };
-        metrics.insert("reason", reason);
+    metrics.insert("per_sample_evidence", Bson::Array(per_sample));
+
+    // 证据就绪 → eligible（待管理员把关）。
+    (true, metrics)
+}
+
+/// `Option<&str>` → Bson（None → Null）。per-sample 证据用。
+fn opt_str_bson(v: Option<&str>) -> Bson {
+    match v {
+        Some(s) => Bson::String(s.to_string()),
+        None => Bson::Null,
     }
-    (passed, metrics)
+}
+
+/// `Option<bool>` → Bson（None → Null）。per-sample 证据用。
+fn opt_bool_bson(v: Option<bool>) -> Bson {
+    match v {
+        Some(b) => Bson::Boolean(b),
+        None => Bson::Null,
+    }
 }
 
 /// 共享的早期 reject 路径：completed 不足 / 失败率过高 → 直接 reject。
@@ -360,9 +394,10 @@ where
 }
 
 /// 算 5 闸的 hit-rate delta = new_rate - original_rate。
-/// `new_5gate_hit` 是 `Document { fact_risk_block: bool, ... }` 形态。
-/// 由于 [`ShadowReplay`] 现阶段只记 `new_5gate_hit`（无 `original_5gate_hit`），
-/// `original` 一侧默认全 false（即原 run 全部走 send_success 路径不命中 5 闸）。
+/// `new_5gate_hit` / `original_5gate_hit` 都是 `Document { fact_risk_block: bool, ... }`
+/// 形态。prompt shadow（replay.rs）把源 run review.scores 推回 `original_5gate_hit`
+/// 后，original 一侧拿到真实命中（G4 假基线已修）；未填 original 侧的路径
+/// （如 threshold）该 gate 缺失 → `original_5gate_hit_or_default` 回落 false。
 fn compute_5gate_deltas(replays: &[&ShadowReplay]) -> Vec<(&'static str, f64)> {
     let n = replays.len() as f64;
     if n == 0.0 {
@@ -412,22 +447,22 @@ fn mean_token_delta(replays: &[&ShadowReplay]) -> f64 {
 
 /// `ShadowReplay` 内部 helpers —— 给 significance 用。
 trait ShadowReplayExt {
-    /// `original_self_critique_addressed` 在 [`ShadowReplay`] 现阶段未被冗余记录
-    /// （只记 new 侧），原值默认 None；W3 task 4.1 的 replay 路径会同时填好两侧。
-    /// 这里给一个稳定的访问点，便于后续替换字段。
+    /// 读 ShadowReplay 真实存的 original 侧 `selfCritique addressed`。prompt
+    /// shadow（replay.rs）把源 run 的 selfCritique addressed 推回这里，G4 真实
+    /// 基线由此而来（此前恒 None 的假基线已修）。
     fn original_self_critique_for_metric(&self) -> Option<bool>;
-    /// 同理：现阶段 `original_5gate_hit` 未存，默认全 false（不命中）。
+    /// 读 ShadowReplay 真实存的 original 侧 5 闸命中向量；缺该 gate → false。
+    /// prompt shadow 把源 run review.scores 推回 5 闸口径填 `original_5gate_hit`，
+    /// G4 真实基线由此而来（此前恒 false 的假基线已修）。
     fn original_5gate_hit_or_default(&self, gate: &str) -> bool;
 }
 
 impl ShadowReplayExt for ShadowReplay {
     fn original_self_critique_for_metric(&self) -> Option<bool> {
-        // 当前 schema 没有 original_self_critique_addressed 字段；W3 replay 可在
-        // started_at 之前由 caller 写入 ad-hoc Document，这里返回 None 占位。
-        None
+        self.original_self_critique_addressed
     }
-    fn original_5gate_hit_or_default(&self, _gate: &str) -> bool {
-        false
+    fn original_5gate_hit_or_default(&self, gate: &str) -> bool {
+        self.original_5gate_hit.get_bool(gate).unwrap_or(false)
     }
 }
 
@@ -555,7 +590,6 @@ mod tests {
         SignificanceCfg {
             min_replays: 30,
             min_send_success_delta: 0.05,
-            min_self_critique_delta: 0.10,
             max_5gate_hit_increase: 0.10,
             max_fail_rate: 0.30,
             max_safety_regression_rate: 0.0,
@@ -584,6 +618,8 @@ mod tests {
             new_review_risks: vec![],
             new_token_cost,
             new_5gate_hit: gate_hits,
+            original_5gate_hit: Document::new(),
+            original_self_critique_addressed: None,
             new_self_critique_addressed: new_self_critique,
             similarity_to_original_text: 0.0,
             started_at: DateTime::now(),
@@ -642,12 +678,12 @@ mod tests {
         );
     }
 
-    /// 4.7 case 3：5gate_hit_delta 任一 > 0.10 → prompt reject
+    /// 阶段二语义：prompt 候选不再用 5 闸涨幅 gate 自动拒绝——5 闸涨幅降为
+    /// 仅观测证据（`max_5gate_hit_increase_observed`），completed≥1 即 eligible。
     #[test]
-    fn prompt_reject_when_any_5gate_increase_above_max() {
+    fn prompt_5gate_increase_is_observed_not_gating() {
         let mut replays = Vec::new();
-        // 30 条 completed；其中 5 条 fact_risk_block=true（0.166 hit_rate vs 原 0），
-        // self_critique 全部 addressed=true（delta=1.0，过门）。
+        // 30 条 completed；其中 5 条 fact_risk_block=true（0.166 hit_rate vs 原 0）。
         for i in 0..30 {
             let mut gate = no_gate();
             if i < 5 {
@@ -663,11 +699,70 @@ mod tests {
             ));
         }
         let (passed, metrics) = grade_prompt(&replays, &cfg());
-        assert!(!passed);
-        assert_eq!(
-            metrics.get_str("reason").unwrap(),
-            "gate_hit_increase_above_threshold"
+        // 证据就绪 → eligible（不再因 5 闸涨幅自动拒）。
+        assert!(passed);
+        assert_eq!(metrics.get_str("kind").unwrap(), "prompt");
+        // 5 闸涨幅仍被记录为观测证据（≈0.166）。
+        assert!(metrics.get_f64("max_5gate_hit_increase_observed").unwrap() > 0.1);
+        // per-sample 证据齐全。
+        assert_eq!(metrics.get_array("per_sample_evidence").unwrap().len(), 30);
+        assert_eq!(metrics.get_str("reason").ok(), None);
+    }
+
+    /// G4 假基线已修：构造一条带真实 `original_5gate_hit` +
+    /// `original_self_critique_addressed` 的 ShadowReplay，断言 ShadowReplayExt
+    /// 读到真值（非此前恒 None/false 的占位）。
+    #[test]
+    fn g4_original_side_reads_real_values_not_placeholder() {
+        let mut replay = rep(
+            "completed",
+            Some("held_by_ai_policy"),
+            Some("approved"),
+            no_gate(),
+            Some(false),
+            Some(800),
         );
+        replay.original_5gate_hit = doc! {
+            "fact_risk_block": true,
+            "pressure_risk_block": false,
+        };
+        replay.original_self_critique_addressed = Some(true);
+
+        // 真实 original 侧字段被读到（假基线已修：非恒 None / 恒 false）。
+        assert_eq!(replay.original_self_critique_for_metric(), Some(true));
+        assert!(replay.original_5gate_hit_or_default("fact_risk_block"));
+        assert!(!replay.original_5gate_hit_or_default("pressure_risk_block"));
+        // 缺失的 gate 回落 false（不 panic）。
+        assert!(!replay.original_5gate_hit_or_default("emotional_value_rewrite"));
+    }
+
+    /// G4 配套：compute_5gate_deltas 现在能拿到非零的 original 侧 hit_rate
+    /// （此前 original 恒 0 → delta 永远 = new_rate）。这里 original 全命中
+    /// fact_risk_block、new 全不命中 → delta = -1.0（负 delta，证明 original 真消费）。
+    #[test]
+    fn g4_compute_5gate_deltas_consumes_original_side() {
+        let mut replays = Vec::new();
+        for _ in 0..30 {
+            let mut r = rep(
+                "completed",
+                Some("approved"),
+                Some("approved"),
+                no_gate(), // new 全不命中
+                Some(true),
+                Some(1000),
+            );
+            r.original_5gate_hit = doc! { "fact_risk_block": true };
+            replays.push(r);
+        }
+        let completed: Vec<&ShadowReplay> = replays.iter().collect();
+        let deltas = compute_5gate_deltas(&completed);
+        let fact_delta = deltas
+            .iter()
+            .find(|(g, _)| *g == "fact_risk_block")
+            .map(|(_, d)| *d)
+            .unwrap();
+        // new_rate(0) - original_rate(1.0) = -1.0；若 original 仍恒 false 则会是 0.0。
+        assert!((fact_delta - (-1.0)).abs() < 1e-9, "got {fact_delta}");
     }
 
     /// 4.7 case 4：completed_replay_count < min_replays → reject 'insufficient_completed_replays'
@@ -693,14 +788,14 @@ mod tests {
         assert_eq!(metrics.get_i64("completed_replay_count").unwrap(), 29);
     }
 
-    /// PBT/防御: prompt grade 在 replay vec empty 时永远 reject
+    /// PBT/防御: prompt grade 在 replay vec empty 时永远 reject（无可对照证据）
     #[test]
     fn prompt_reject_when_replays_empty() {
         let (passed, metrics) = grade_prompt(&[], &cfg());
         assert!(!passed);
         assert_eq!(
             metrics.get_str("reason").unwrap(),
-            "insufficient_completed_replays"
+            "no_completed_replays"
         );
     }
 
@@ -752,9 +847,11 @@ mod tests {
         assert!(!passed); // delta=0 < 0.05
     }
 
-    /// 自评 delta 测路径：原 0.5、新 0.7 → critique_delta=+0.2 通过
+    /// 阶段二语义：completed≥1 即 eligible，self_critique addressed 新旧率
+    /// 降为观测证据。这里原侧（original_self_critique_addressed=None）→ rate=0.0，
+    /// 新侧 0.7 → delta=+0.7 作为 `self_critique_addressed_delta_observed` 记录。
     #[test]
-    fn prompt_pass_when_self_critique_delta_above_min() {
+    fn prompt_eligible_records_self_critique_evidence() {
         let mut replays = Vec::new();
         for i in 0..30 {
             let new_addressed = i < 21; // 0.7
@@ -767,10 +864,14 @@ mod tests {
                 Some(1200),
             ));
         }
-        // 用一组"已修正" original_self_critique 模拟：当前 ShadowReplayExt 默认返回 None →
-        // ratio_of denom=0 → original_addressed=0.0；new_addressed=0.7 → delta=+0.7（≥ 0.10）。
-        let (passed, _) = grade_prompt(&replays, &cfg());
+        let (passed, metrics) = grade_prompt(&replays, &cfg());
         assert!(passed);
+        // 观测证据：新侧 addressed rate=0.7、delta=+0.7（原侧 None→0.0）。
+        let new_rate = metrics
+            .get_f64("new_self_critique_addressed_rate")
+            .unwrap();
+        assert!((new_rate - 0.7).abs() < 1e-9);
+        assert!(metrics.get_f64("self_critique_addressed_delta_observed").unwrap() > 0.6);
     }
 
     /// PBT 准备 / 防御：deltas 含 NaN 被检出
