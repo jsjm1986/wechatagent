@@ -163,3 +163,25 @@
   padding: 28px; text-align: center; font-size: 13px; color: var(--ink-3);
   border-radius: var(--r-md); border: 1px dashed var(--hairline); background: var(--surface-page);
 }
+
+/* —— 阶段三：新旧对照证据表 —— */
+.evidenceAggregate,
+.evidenceSamples { display: grid; gap: 8px; }
+.evidenceAggregate h5,
+.evidenceSamples h5 {
+  margin: 0; font-size: 11.5px; font-weight: 600; color: var(--ink-3); letter-spacing: .1px;
+}
+.evidenceTable { width: 100%; border-collapse: collapse; }
+.evidenceTable th {
+  text-align: left; font-size: 11px; color: var(--ink-3); font-weight: 600;
+  padding: 6px 8px; border-bottom: 1px solid var(--hairline);
+}
+.evidenceTable td {
+  font-size: 11.5px; color: var(--ink-1); padding: 6px 8px;
+  border-bottom: 1px solid var(--hairline);
+  font-family: ui-monospace, "SF Mono", Menlo, monospace; word-break: break-all;
+}
+.evidenceTable tr:last-child td { border-bottom: none; }
+.deltaGood { color: var(--color-running); }
+.deltaBad { color: var(--color-blocked); }
+.deltaNeutral { color: var(--ink-3); }

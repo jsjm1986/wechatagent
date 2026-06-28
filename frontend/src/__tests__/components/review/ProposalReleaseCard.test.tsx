@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { render, screen, waitFor } from "@testing-library/react";
 import { ProposalReleaseCard } from "../../../components/review/ProposalReleaseCard";
+import type { ShadowReplaySample } from "../../../components/review/proposalTypes";
 
 // ProposalReleaseCard 自身拉详情（GET /api/evolution/proposals/:id → ProposalDetailResponse）。
 // 取值路径有别（proposalTypes.ts 实证）：diffSummary/riskNote/previousPromptVersion/evalMetrics
@@ -52,7 +53,7 @@ function baseDetail(overrides: Record<string, unknown> = {}) {
     },
     experiment: null,
     cohortRunIds: ["run-aaa", "run-bbb"],
-    shadowReplays: { totalCompleted: 10, totalFailed: 0, samples: [] },
+    shadowReplays: { totalCompleted: 10, totalFailed: 0, samples: [] as ShadowReplaySample[] },
     currentState: {},
   };
 }
@@ -118,5 +119,82 @@ describe("ProposalReleaseCard 元数据 5 字段渲染（E12）", () => {
     expect(screen.queryByTestId("proposal-prev-version")).not.toBeInTheDocument();
     expect(screen.queryByTestId("proposal-eval-metrics")).not.toBeInTheDocument();
     expect(screen.queryByTestId("proposal-cohort-runs")).not.toBeInTheDocument();
+  });
+});
+
+describe("ProposalReleaseCard prompt 新旧对照表（阶段三）", () => {
+  beforeEach(() => vi.clearAllMocks());
+
+  function promptDetailWithEvidence() {
+    const d = baseDetail({
+      evalMetrics: {
+        kind: "prompt",
+        completed_replay_count: 2,
+        failed_replay_count: 0,
+        five_gate_hit_delta_per_gate: {
+          fact_risk_block: -0.5,
+          pressure_risk_block: 0,
+          human_like_score_rewrite: 0,
+          emotional_value_rewrite: 0,
+          product_accuracy_score_block: -0.5,
+        },
+        original_self_critique_addressed_rate: 0.5,
+        new_self_critique_addressed_rate: 1.0,
+        self_critique_addressed_delta_observed: 0.5,
+        token_cost_delta_mean_observed: 88,
+      },
+    });
+    d.shadowReplays = {
+      totalCompleted: 2,
+      totalFailed: 0,
+      samples: [
+        {
+          id: "s1",
+          sourceRunId: "run-001",
+          status: "completed",
+          failureReason: null,
+          originalFinalReviewStatus: "held_by_ai_policy",
+          original5gateHit: { fact_risk_block: true, pressure_risk_block: false, human_like_score_rewrite: false, emotional_value_rewrite: false, product_accuracy_score_block: false },
+          originalSelfCritiqueAddressed: false,
+          newFinalReviewStatus: "approved",
+          newReviewRisks: [],
+          newTokenCost: 200,
+          new5gateHit: { fact_risk_block: false, pressure_risk_block: false, human_like_score_rewrite: false, emotional_value_rewrite: false, product_accuracy_score_block: false },
+          newSelfCritiqueAddressed: true,
+          similarityToOriginalText: 0,
+          startedAt: "2026-06-01T00:00:00Z",
+          finishedAt: "2026-06-01T00:00:01Z",
+        },
+      ] as ShadowReplaySample[],
+    };
+    return d;
+  }
+
+  it("prompt 类有对照数据时渲染聚合表与样本对照表", async () => {
+    getMock.mockResolvedValue(promptDetailWithEvidence());
+    renderCard();
+
+    const agg = await screen.findByTestId("evidence-aggregate");
+    // 5 行 gate 标签
+    expect(agg).toHaveTextContent("事实风险");
+    expect(agg).toHaveTextContent("产品准确度");
+    // 自评率对照
+    expect(agg).toHaveTextContent("自评解决率");
+
+    const samples = screen.getByTestId("evidence-samples");
+    expect(samples).toHaveTextContent("run-001");
+    expect(samples).toHaveTextContent("held_by_ai_policy");
+    expect(samples).toHaveTextContent("approved");
+  });
+
+  it("空 original 数据时样本单元格显示占位不 crash", async () => {
+    const d = promptDetailWithEvidence();
+    d.shadowReplays.samples[0].original5gateHit = {};
+    d.shadowReplays.samples[0].originalSelfCritiqueAddressed = null;
+    getMock.mockResolvedValue(d);
+    renderCard();
+
+    const samples = await screen.findByTestId("evidence-samples");
+    expect(samples).toHaveTextContent("run-001"); // 仍渲染，不 crash
   });
 });

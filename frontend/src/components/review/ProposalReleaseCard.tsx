@@ -27,6 +27,12 @@ import type {
   ProposalDetailResponse,
   ShadowReplaysSummary,
 } from "./proposalTypes";
+import {
+  FIVE_GATE_KEYS,
+  GATE_LABELS,
+  gateHit,
+  readAggregateEvidence,
+} from "./evidenceMetrics";
 
 export function ProposalReleaseCard({
   proposalId,
@@ -243,6 +249,8 @@ function ShadowEvalReport({
   summary: ShadowReplaysSummary;
   proposal: ProposalDetail;
 }) {
+  const isPrompt = proposal.kind !== "threshold";
+  const aggregate = isPrompt ? readAggregateEvidence(proposal.evalMetrics ?? {}) : null;
   return (
     <section className={styles.shadowEval} data-testid="shadow-eval">
       <h4>Shadow 评测</h4>
@@ -266,7 +274,83 @@ function ShadowEvalReport({
           </strong>
         </div>
       </div>
-      {summary.samples.length > 0 && (
+
+      {isPrompt && aggregate && (
+        <div className={styles.evidenceAggregate} data-testid="evidence-aggregate">
+          <h5>新旧对照·五闸涨跌</h5>
+          <table className={styles.evidenceTable}>
+            <thead>
+              <tr>
+                <th>闸</th>
+                <th>Δ 命中率</th>
+              </tr>
+            </thead>
+            <tbody>
+              {aggregate.gateDeltas.map((g) => (
+                <tr key={g.gate}>
+                  <td>{GATE_LABELS[g.gate] ?? g.gate}</td>
+                  <td className={deltaToneClass(g.delta)}>
+                    {g.delta === null ? "—" : `${g.delta > 0 ? "+" : ""}${formatPercent(g.delta)}`}
+                  </td>
+                </tr>
+              ))}
+              <tr>
+                <td>自评解决率</td>
+                <td>
+                  {formatPercent(aggregate.originalCritiqueRate)} →{" "}
+                  {formatPercent(aggregate.newCritiqueRate)}
+                  {aggregate.critiqueDelta !== null && (
+                    <span className={deltaToneClass(aggregate.critiqueDelta, true)}>
+                      {" "}({aggregate.critiqueDelta > 0 ? "+" : ""}
+                      {formatPercent(aggregate.critiqueDelta)})
+                    </span>
+                  )}
+                </td>
+              </tr>
+              <tr>
+                <td>token 均值Δ</td>
+                <td>{formatNumber(aggregate.tokenDelta)}</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      )}
+
+      {isPrompt && summary.samples.length > 0 && (
+        <div className={styles.evidenceSamples} data-testid="evidence-samples">
+          <h5>逐样本新旧对照（前 5 条）</h5>
+          <table className={styles.evidenceTable}>
+            <thead>
+              <tr>
+                <th>run</th>
+                <th>原 final</th>
+                <th>新 final</th>
+                <th>原五闸</th>
+                <th>新五闸</th>
+                <th>自评</th>
+              </tr>
+            </thead>
+            <tbody>
+              {summary.samples.map((s) => (
+                <tr key={s.id ?? s.sourceRunId}>
+                  <td>{s.sourceRunId}</td>
+                  <td>{s.originalFinalReviewStatus ?? "—"}</td>
+                  <td>{s.newFinalReviewStatus ?? "—"}</td>
+                  <td>{renderGateDots(s.original5gateHit)}</td>
+                  <td>{renderGateDots(s.new5gateHit)}</td>
+                  <td>
+                    {fmtCritique(s.originalSelfCritiqueAddressed)}→
+                    {fmtCritique(s.newSelfCritiqueAddressed)}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+
+      {/* threshold 类保留原样本表（new 侧），prompt 类已被上方对照表取代 */}
+      {!isPrompt && summary.samples.length > 0 && (
         <details>
           <summary>样本（前 5 条）</summary>
           <table>
@@ -293,6 +377,25 @@ function ShadowEvalReport({
       )}
     </section>
   );
+}
+
+// 五闸命中点阵：按固定序渲染 ●(命中)/○(未中)/·(缺失)。
+function renderGateDots(doc: Record<string, unknown>): string {
+  return FIVE_GATE_KEYS.map((g) => {
+    const h = gateHit(doc, g);
+    return h === null ? "·" : h ? "●" : "○";
+  }).join("");
+}
+
+function fmtCritique(v: boolean | null): string {
+  return v === null ? "—" : v ? "已解决" : "未解决";
+}
+
+// Δ 语义色：五闸命中率下降为好(绿)、上升为坏(红)；自评率方向相反(critiqueGood=true 时升为好)。
+function deltaToneClass(delta: number | null, critiqueGood = false): string {
+  if (delta === null || delta === 0) return styles.deltaNeutral;
+  const good = critiqueGood ? delta > 0 : delta < 0;
+  return good ? styles.deltaGood : styles.deltaBad;
 }
 
 // ── 候选元数据区（后端已返回但原卡片未渲染的 5 字段，E12）──
