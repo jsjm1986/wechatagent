@@ -70,20 +70,23 @@ GET /api/campaigns/:id/sends
     "sent": 470,
     "pending": 8,
     "blocked": { "daily_limit": 25, "cooldown": 5 },
+    "escalated": { "blocked_unverified_product_claim": 12, "held_by_ai_policy": 3 },
     "canceled": { "context_changed": 5 },
     "skipped": 3,
     "unknown": 2
   },
   "items": [
     { "contactWxid": "wxid_a", "name": "张三", "status": "sent" },
-    { "contactWxid": "wxid_b", "name": "李四", "status": "blocked", "reason": "daily_limit" }
+    { "contactWxid": "wxid_b", "name": "李四", "status": "blocked", "reason": "daily_limit" },
+    { "contactWxid": "wxid_c", "name": "王五", "status": "escalated", "reason": "blocked_unverified_product_claim" }
   ]
 }
 ```
 
 - `summary.targetCount` = items 总数 = campaign_sends 行数。
-- `summary` 的 `sent/pending/skipped/unknown` 是标量计数；`blocked/canceled` 是 `{reason: count}` 子 map（reason 二级细分）。
-- `items` 每人一行；`sent/pending/skipped` 不带 reason，`blocked/canceled/unknown` 带 `reason`（原始底层值）。
+- `summary` 的 `sent/pending/skipped/unknown` 是标量计数；`blocked/canceled/escalated` 是 `{reason: count}` 子 map（reason 二级细分）。
+- `items` 每人一行；`sent/pending/skipped` 不带 reason，`blocked/canceled/escalated/unknown` 带 `reason`（原始底层 status 值）。
+- `escalated` = 已转交幕后领导请示、待裁决后 AI 会继续触达的件（产品声明待背书 / 安全门 / AI 策略暂缓 / 等更多上下文），区别于 `blocked`（纯频控/硬约束、无后续）。详见 §5.3。
 - 字段名 camelCase（前端 JSON 契约一致，沿用 ProductView/preview 返回风格）。
 
 ## 5. 聚合算法
@@ -100,7 +103,7 @@ GET /api/campaigns/:id/sends
 - `agent_run_logs` 查询用 **snake_case**：`source_event_id` / `source_kind`（AgentRunLog **无** rename_all）。
 - `contacts` 查询用 **snake_case**：`workspace_id` / `account_id` / `wxid`（Contact 无 rename_all）。
 
-### 5.3 分类（纯函数，6 桶，优先级自上而下命中即停）
+### 5.3 分类（纯函数，7 桶，优先级自上而下命中即停）
 
 `classify_send_outcome(send_status: &str, run_log: Option<&Document>) -> (bucket, Option<reason>)`：
 
@@ -110,27 +113,44 @@ GET /api/campaigns/:id/sends
 ② 有 taskId 但 run_log == None（task 还没被 worker 跑到）
       → ("pending", Some("not_yet_run"))
 ③ run_log.outbox_status == "sent"
-      → ("sent", None)                         唯一"真送达"
-④ run_log.outbox_status ∈ {"pending","in_flight"}
-   或 outbox_status 缺失但 run_log.status == "allowed"
+      → ("sent", None)                         唯一"真送达"（最高优先级）
+④ run_log.outbox_status ∈ {"failed_terminal","canceled"}
+      → ("canceled", Some(outbox_status))      outbox 终态失败/取消
+⑤ run_log.outbox_status ∈ {"pending","in_flight"}
       → ("pending", None)                      进了发送队列，未发出/发送中
-⑤ run_log.status ∈ {daily_limit, cooldown, rate_limited,
-                     policy_cooldown, policy_wait_user_reply, policy_consecutive_limit}
-      → ("blocked", Some(status))              频控拦截，原因保留
-⑥ run_log.status ∈ {context_changed, expired, not_managed}
-   或 run_log.outbox_status ∈ {"failed_terminal","canceled"}
-      → ("canceled", Some(status))             取消/终态失败，原因保留
-⑦ 其它（字段缺失 / 不认识的值）
-      → ("unknown", Some(原始值))              诚实标，绝不强划进 sent
+⑥ run_log.status（在 outbox_status 未命中上面后判定）：
+   a. ∈ {allowed, outbox_enqueued, quiet_hours_deferred}
+        → ("pending", None)                    放行/已入队/作息重排（会继续）
+   b. ∈ {daily_limit, cooldown, rate_limited,
+         policy_cooldown, policy_wait_user_reply, policy_consecutive_limit,
+         blocked_by_required_field, blocked_by_budget,
+         review_blocked, revision_failed, revision_skipped_invalid_direction,
+         revision_skipped_budget_exceeded, revision_llm_failure, tool_loop_timeout}
+        → ("blocked", Some(status))            频控/硬约束/改写失败——没发出且无后续
+   c. ∈ {blocked_unverified_product_claim, blocked_by_safety_guard,
+         held_by_ai_policy, ai_waiting_for_more_context}
+        → ("escalated", Some(status))          已转交幕后领导请示，待裁决后 AI 会继续触达
+   d. ∈ {context_changed, expired, not_managed,
+         no_reply, admin_cancelled, superseded_by_new_inbound}
+        → ("canceled", Some(status))           取消（无后续）
+   e. 其它（legacy_mode_unchecked / gateway_blocked / precheck_blocked / 不认识的值）
+        → ("unknown", Some(status))            诚实标，绝不强划进 sent
+⑦ run_log 存在但 status 字段缺失
+      → ("unknown", None)                      诚实标
 ```
 
-**桶全集**：`sent / pending / blocked / canceled / skipped / unknown`。
+**桶全集**：`sent / pending / blocked / canceled / escalated / skipped / unknown`（7 桶）。
 
-底层 status 字面量全部来自 §7 核实（precheck `blocked(...)` 全集 + `OutboxStatus` 闭集），非猜测。优先级关键点：`outbox_status=="sent"`（③）先于 `status` 判定（⑤⑥），即便 run log 的 status 字段还留着 `allowed` 也归 sent。
+底层 status 字面量全部来自 §7 核实（`GATEWAY_STATUS_VALUES` 闭集 run_envelope.rs:86-135 + `OutboxStatus` 闭集），逐值明确归桶，无值意外落 unknown（仅灰度/口径态与真未知归 unknown）。
+
+**关键设计点**：
+- **优先级**：`outbox_status=="sent"`（③）先于一切 `status` 判定，即便 status 还留着 `daily_limit`/`allowed` 也归 sent（真送达优先）。
+- **escalated 单列（⑥c）**：`blocked_unverified_product_claim`（产品声明无 verified 背书）/ `blocked_by_safety_guard` / `held_by_ai_policy` / `ai_waiting_for_more_context` 触发后**走请示通道交幕后领导裁决**（should_escalate_held 默认升级，§7），领导补 verified 知识/裁决后 AI 会继续触达——它们**不是失败漏推**，与 `blocked`（纯频控、无后续）语义不同，故单列一桶让运营区分"在请示流程里"vs"彻底没推成"。这符合"无人工接管"红线（客户始终只跟 AI 对话）。
+- **红线不拆**：产品红线拦的是 AI 据活动意图临场对客户生成的"未背书具体产品话术"，非运营的活动指令本身（活动意图只是内部触发语境）。本端点只**如实呈现**该状态，不改红线行为。
 
 ### 5.4 聚合
 
-`build_sends_summary(items: &[SendItem]) -> Summary`：纯函数，遍历 items，`sent/pending/skipped/unknown` 标量 +1，`blocked/canceled` 按 reason 二级 map +1。
+`build_sends_summary(items: &[SendItem]) -> Summary`：纯函数，遍历 items，`sent/pending/skipped/unknown` 标量 +1；`blocked/canceled/escalated` 按 reason 二级 map +1（escalated 的 reason 二级 map 尤其重要——区分产品红线 / 安全门 / AI 策略 / 等上下文）。
 
 ## 6. 错误处理与边界
 
@@ -162,15 +182,24 @@ classify_send_outcome 逐桶：
   ① send_status=skipped_duplicate → skipped
   ② 有 taskId、run_log=None → pending/not_yet_run
   ③ outbox_status=sent → sent
-  ④ outbox_status=pending / status=allowed → pending
-  ⑤ status ∈ {daily_limit,cooldown,rate_limited,policy_*} → blocked + reason
-  ⑥ status ∈ {context_changed,expired,not_managed}、outbox=failed_terminal/canceled → canceled + reason
-  ⑦ 空 doc / 不认识的值 → unknown（不进 sent）
-  优先级：outbox_status=sent 时即便 status 有值也归 sent（命中即停）
+  ④ outbox_status=failed_terminal/canceled → canceled + reason
+  ⑤ outbox_status=pending/in_flight → pending
+  ⑥a status ∈ {allowed,outbox_enqueued,quiet_hours_deferred} → pending
+  ⑥b status ∈ {daily_limit,cooldown,rate_limited,policy_*,blocked_by_required_field,
+       blocked_by_budget,review_blocked,revision_failed,revision_skipped_*,
+       revision_llm_failure,tool_loop_timeout} → blocked + reason
+  ⑥c status ∈ {blocked_unverified_product_claim,blocked_by_safety_guard,
+       held_by_ai_policy,ai_waiting_for_more_context} → escalated + reason
+  ⑥d status ∈ {context_changed,expired,not_managed,no_reply,admin_cancelled,
+       superseded_by_new_inbound} → canceled + reason
+  ⑥e status ∈ {legacy_mode_unchecked,gateway_blocked,precheck_blocked,未知值} → unknown + reason
+  ⑦ run_log 有但 status 字段缺失 → unknown/None
+  优先级：outbox_status=sent 时即便 status=daily_limit 也归 sent（命中即停）
+  escalated 优先级：status=blocked_unverified_product_claim 且无 outbox=sent → escalated（非 blocked）
 
 build_sends_summary：
-  混合桶 items → 标量计数 + blocked/canceled reason 二级 map 正确
-  空 items → 全 0（空活动不崩）
+  混合桶 items → 标量计数(sent/pending/skipped/unknown) + blocked/canceled/escalated reason 二级 map 正确
+  空 items → 全 0（空活动不崩），blocked/canceled/escalated 为 {}
 ```
 
 分类是纯函数（输入 send_status + run log doc → 输出 bucket+reason），零 LLM、零关键词猜测——符合项目 agent-first 但客观度量用确定性函数的立场。
@@ -193,5 +222,21 @@ build_sends_summary：
 | OutboxStatus 闭集 | CONFIRMED | outbox.rs:41-65：pending/in_flight/sent/failed_terminal/canceled |
 | campaigns.rs 现 3 handler、路由注册 mod.rs:782-784 | CONFIRMED | create(:194)/preview(:227)/dispatch(:280)；mod.rs:37 mod、:257 use、:782-784 route |
 | **冲突核对**：main #53 后 12 提交动的文件与本设计依赖零重叠 | CONFIRMED | main 改 decision/media_send/memory/referral/review/prompts/knowledge + models.rs（仅 mod typed 行 3902+）；本设计依赖的 campaigns/mod/gateway/outbox_dispatcher/tasks/db 全部 UNCHANGED |
+| **【最终审查补充】follow_up 走完整 gateway，status 不止 precheck 值** | CONFIRMED | finalize 写 run log 的 status = `outbox_enqueued`/`no_reply`（gateway.rs:2225）或 finalize 终态；`GATEWAY_STATUS_VALUES` 闭集（run_envelope.rs:86-135）是 `agent_run_logs.status` 全集——含 blocked_by_*/held_by_ai_policy/ai_waiting_for_more_context/review_blocked/revision_*/tool_loop_timeout/no_reply/admin_cancelled/superseded_by_new_inbound/quiet_hours_deferred。分类必须覆盖全集（§5.3 已扩 7 桶），否则漏计 |
+| **产品红线触发条件（三 AND）** | CONFIRMED | gates.rs:653-686：`claim_requires_product_knowledge(claim_analysis)` ∧ `verified_chunks.is_empty()` ∧ `!priced_from_catalog` 三者全真才 `blocked_unverified_product_claim`。拦的是 AI 临场生成的"未背书具体产品话术"，非运营活动指令 |
+| **活动意图是内部触发语境，非客户消息** | CONFIRMED | gateway.rs:4873 `follow_up_trigger_message_text` 把 task.content 包成"系统跟进任务到期…任务内容：{intent}"喂 Reply Agent，AI 据此重新生成面向客户的话术、走完整决策+知识路由+review |
+| **escalated 类有请示通道出口（非死路、非人工接管）** | CONFIRMED | logic.rs:328-342 `should_escalate_held`：blocked_unverified_product_claim/blocked_by_safety_guard 默认升级、held_by_ai_policy 按开关；held=AI 内部状态，请示交幕后领导补 verified 知识/裁决后 AI 继续，客户始终只跟 AI 对话 |
 
 **结论**：所有技术断言已对 origin/main 最新代码闭环。基线 = origin/main d615bdc（新分支 feat/campaign-sends-report 零落后），与 main 在建的优化零冲突。无残留猜测。
+
+## 10. 设计澄清：产品红线与活动指令不冲突（最终审查留痕）
+
+**质疑**：运营在总控 AI 下的活动推送是人类明确授权的最高指令，为何会被产品红线（`blocked_unverified_product_claim`）拦下？
+
+**核实结论（100% 读全链，红线 HOLDS 不拆）**：
+1. 运营说"双11老客7折" → 仅决定 `campaign.intent_text` 并据此建 follow_up task。**这一步红线不参与，畅通无阻**。
+2. task 到期 → 活动意图作为**内部触发语境**喂 Reply Agent（gateway.rs:4873），AI **自己生成**面向客户的话术。
+3. 红线只在 AI 生成的话术满足三 AND 条件（含未背书具体产品声明）时拦——拦的是"AI 临场对客户编的、无后台数据背书的产品数字/承诺"，**不是运营的活动授权**。人类授权了"搞活动"，但无法预先校验 AI 对每个客户临场编的每个数字；红线正是这层保护，CLAUDE.md 列为 baked-in 红线。
+4. 触发后非死路：走请示通道交幕后领导补 verified 知识/裁决 → AI 继续触达（符合"无人工接管"——客户始终只跟 AI 对话）。
+
+**本端点的职责**：只**如实呈现**这一状态（归 `escalated` 桶，与纯频控 `blocked` 区分），不改红线行为、不绕过它。运营看到 `escalated: {blocked_unverified_product_claim: N}` 即知"这 N 人的活动话术涉及待背书产品声明，已转请示，补料后会继续推"。
