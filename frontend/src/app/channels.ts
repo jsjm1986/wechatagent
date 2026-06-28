@@ -18,6 +18,7 @@ import {
   Contact,
   SlidersHorizontal,
   BarChart3,
+  Megaphone,
   type LucideIcon,
 } from "lucide-react";
 import type { Channel, DomainProfile } from "../types";
@@ -38,6 +39,7 @@ const ReferralCardsFeature = lazy(() => import("../features/referral-cards"));
 const AskHumanFeature = lazy(() => import("../features/ask-human"));
 const AskHumanConfigFeature = lazy(() => import("../features/ask-human-config"));
 const SendAnalyticsFeature = lazy(() => import("../features/send-analytics"));
+const CampaignFeature = lazy(() => import("../features/campaign"));
 
 export interface ChannelDef {
   id: Channel;
@@ -156,6 +158,17 @@ export const CHANNELS: ChannelDef[] = [
     title: "请示通道配置",
     subtitle: "配置决策人链、触发请示的情形、超时转备选与推送频控；保存后即时生效于私聊运营域。",
     Component: AskHumanConfigFeature,
+  },
+  {
+    id: "campaign",
+    group: "运营",
+    label: "活动",
+    caption: "Campaign",
+    icon: Megaphone,
+    eyebrow: "Campaign",
+    title: "活动推送结果",
+    subtitle: "查看活动定向推送的真实触达分布：已送达 / 在途 / 被拦 / 已请示 / 已取消 / 去重跳过。从 AI 总控 dispatch 活动后点「查看推送结果」进入。",
+    Component: CampaignFeature,
   },
   {
     id: "productsDeals",
