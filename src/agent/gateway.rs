@@ -859,6 +859,66 @@ async fn apply_state_action_gate(
     Ok(())
 }
 
+/// 客户回应保障守卫：本轮若是 Inbound 且落到会晾死客户的零回复状态，给客户补一条
+/// 确定性中性占位（走 outbox）。统一三道 precheck 出口 + 拦截分支 + A3 主动沉默路径。
+///
+/// - 黑名单判定见 [`should_send_ack_placeholder`]（仅 Inbound、非豁免状态才补）。
+/// - 入队前复查 `should_abort_send()`：客户又发了新消息 → 下一轮会真回，补占位会与下轮
+///   回复竞争重复打扰，故跳过（这也是"绝不破坏去抖聚合"的代码级兜底）。
+/// - fail-soft：入队失败只记 warn、不阻断 run、不改终态（与 `escalate_held_decision`
+///   的 let _ / warn 同纪律）。
+async fn ensure_customer_acknowledged(
+    state: &AppState,
+    contact: &Contact,
+    run_id: &str,
+    trigger_kind: &str,
+    source_event_id: &str,
+    status: &str,
+    should_abort_send: &Option<Arc<dyn Fn() -> bool + Send + Sync>>,
+) {
+    if !should_send_ack_placeholder(trigger_kind, status) {
+        return;
+    }
+    if let Some(guard) = should_abort_send {
+        if guard() {
+            tracing::info!(
+                %run_id,
+                contact_wxid = %contact.wxid,
+                "客户回应保障占位跳过：客户又发新消息，下一轮真回"
+            );
+            return;
+        }
+    }
+    let req = build_ack_enqueue_request(
+        &contact.workspace_id,
+        &contact.account_id,
+        &contact.wxid,
+        run_id,
+        source_event_id,
+        trigger_kind,
+    );
+    match outbox_enqueue(state, req).await {
+        Ok(outcome) => {
+            tracing::info!(
+                %run_id,
+                contact_wxid = %contact.wxid,
+                %status,
+                ?outcome,
+                "客户回应保障占位已入 outbox"
+            );
+        }
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                %run_id,
+                contact_wxid = %contact.wxid,
+                %status,
+                "客户回应保障占位入队失败（不阻断 run）"
+            );
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_user_operation_gateway_inner(
     state: &AppState,
@@ -913,6 +973,16 @@ async fn run_user_operation_gateway_inner(
             &envelope_source_kind,
         )
         .await?;
+        ensure_customer_acknowledged(
+            state,
+            &contact,
+            &run_id,
+            trigger.kind(),
+            &envelope_source_event_id,
+            &precheck.status,
+            &should_abort_send,
+        )
+        .await;
         return Ok(());
     }
 
@@ -2007,6 +2077,16 @@ async fn run_user_operation_gateway_inner(
                 );
             }
         }
+        ensure_customer_acknowledged(
+            state,
+            &contact,
+            &run_id,
+            trigger.kind(),
+            &envelope_source_event_id,
+            &blocked_status,
+            &should_abort_send,
+        )
+        .await;
         return Ok(());
     }
 
@@ -2084,6 +2164,16 @@ async fn run_user_operation_gateway_inner(
             },
         )
         .await?;
+        ensure_customer_acknowledged(
+            state,
+            &contact,
+            &run_id,
+            trigger.kind(),
+            &envelope_source_event_id,
+            &final_precheck.status,
+            &should_abort_send,
+        )
+        .await;
         return Ok(());
     }
 
@@ -2201,6 +2291,16 @@ async fn run_user_operation_gateway_inner(
         if let Some(task_id) = task_id {
             cancel_task(state, task_id, "no_reply", "Agent 判断无需触达").await?;
         }
+        ensure_customer_acknowledged(
+            state,
+            &contact,
+            &run_id,
+            trigger.kind(),
+            &envelope_source_event_id,
+            "no_reply",
+            &should_abort_send,
+        )
+        .await;
     }
     let details = build_decision_event_details(&final_decision, playbook.as_ref(), &review);
     write_event_for_account(
