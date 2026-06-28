@@ -166,8 +166,8 @@ export const CHANNELS: ChannelDef[] = [
     caption: "Campaign",
     icon: Megaphone,
     eyebrow: "Campaign",
-    title: "活动推送结果",
-    subtitle: "查看活动定向推送的真实触达分布：已送达 / 在途 / 被拦 / 已请示 / 已取消 / 去重跳过。从 AI 总控 dispatch 活动后点「查看推送结果」进入。",
+    title: "活动推送",
+    subtitle: "建活动、按购买产品/价值分层圈人预览，查看真实触达分布（已送达/在途/被拦/已请示）。确认推送在 AI 总控对话中完成。",
     Component: CampaignFeature,
   },
   {
