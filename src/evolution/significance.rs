@@ -584,6 +584,8 @@ mod tests {
             new_review_risks: vec![],
             new_token_cost,
             new_5gate_hit: gate_hits,
+            original_5gate_hit: Document::new(),
+            original_self_critique_addressed: None,
             new_self_critique_addressed: new_self_critique,
             similarity_to_original_text: 0.0,
             started_at: DateTime::now(),
