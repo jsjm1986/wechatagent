@@ -16,13 +16,13 @@ describe("看板加载失败不进入重试循环", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     useCampaignStore.setState({
-      selectedCampaignId: null, report: null, loading: false, lastAttemptedId: null,
+      selectedCampaignId: null, report: null, loading: false, lastAttemptedId: null, view: "board",
     });
   });
 
   it("加载失败后 effect 不再自动重发请求（lastAttemptedId 守卫）", async () => {
     (api.get as any).mockRejectedValue(new Error("boom"));
-    // 模拟「直接切到该频道、未经 openReport」：只设 selectedCampaignId
+    // 模拟「直接切到该频道、未经 openReport」：只设 selectedCampaignId（index 路由壳已置 view:"board" 渲看板）
     useCampaignStore.setState({ selectedCampaignId: "c1" });
 
     render(<CampaignFeature />);
