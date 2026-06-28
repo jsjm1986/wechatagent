@@ -34,6 +34,7 @@ pub mod ask_human_inbox;
 pub mod assets;
 mod auth;
 mod behavior_signal_metrics;
+mod campaigns;
 pub mod chunk_locks;
 // pub（非默认私有）：annotation_quality_gate_integration.rs 集成测试需从 tests/
 // crate 直调 update_assist_override handler 真函数（缺口 2 override + IDOR），仿
