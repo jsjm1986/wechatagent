@@ -1,0 +1,126 @@
+/* ============================================================
+   WeAgent 官网 — 智能体编队页专属样式
+   依赖 shared.css 的 token
+   ============================================================ */
+
+/* ---------- 页内英雄（与 technology 一致的轻量深色） ---------- */
+.page-hero { position: relative; overflow: hidden; padding: clamp(64px,9vw,116px) 0 clamp(48px,6vw,80px); }
+.page-hero-bg { position: absolute; inset: 0; pointer-events: none; }
+.page-hero .h-display { margin: 22px 0 20px; }
+.page-hero .lead { max-width: 760px; }
+.page-hero-meta { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 30px; }
+.page-hero-meta .pill { background: rgba(255,255,255,.06); border: 1px solid var(--ink-hair); color: var(--on-deep-2); }
+
+/* 英雄统计条 */
+.ah-stats { position: relative; display: grid; grid-template-columns: repeat(4,1fr); gap: 24px; margin-top: clamp(36px,5vw,56px); padding-top: 36px; border-top: 1px solid var(--ink-hair); }
+.ah-stat { text-align: center; }
+.ah-stat .ah-n { font-size: clamp(26px,3vw,34px); font-weight: 800; letter-spacing: -.03em; color: var(--on-deep-1); }
+.ah-stat .ah-l { font-size: 13px; color: var(--on-deep-3); margin-top: 4px; }
+
+/* ---------- 章节小标题 ---------- */
+.t-head { max-width: 800px; margin-bottom: 40px; }
+.t-head .eyebrow { color: var(--brand); }
+.section-deep .t-head .eyebrow { color: var(--brand-2); }
+
+/* ---------- 编队分组 ---------- */
+.squad { margin-bottom: clamp(40px,6vw,72px); }
+.squad:last-child { margin-bottom: 0; }
+.squad-head { display: flex; align-items: center; gap: 14px; margin-bottom: 8px; }
+.squad-badge { width: 44px; height: 44px; border-radius: 12px; flex-shrink: 0; display: grid; place-items: center;
+  font-family: var(--mono); font-weight: 800; font-size: 16px; color: #fff; }
+.squad-badge.s-core { background: linear-gradient(135deg, var(--brand), var(--brand-2)); }
+.squad-badge.s-rel { background: linear-gradient(135deg, var(--scheduled), #4DA3FF); }
+.squad-badge.s-know { background: linear-gradient(135deg, var(--ai), #14C9B8); }
+.squad-badge.s-esc { background: linear-gradient(135deg, var(--held), #FFB84D); }
+.squad-badge.s-evo { background: linear-gradient(135deg, #8B5CF6, var(--brand-2)); }
+.squad-head h3 { font-size: clamp(21px,2.4vw,27px); font-weight: 800; letter-spacing: -.02em; }
+.squad-sub { font-size: 14.5px; color: var(--ink-2); line-height: 1.6; max-width: 720px; margin-bottom: 22px; }
+
+/* ---------- agent 卡 ---------- */
+.agent-grid { display: grid; grid-template-columns: repeat(3,1fr); gap: 16px; }
+.agent-grid.cols-2 { grid-template-columns: repeat(2,1fr); }
+.agent-card { position: relative; display: flex; flex-direction: column; background: var(--card); border: 1px solid var(--hair);
+  border-radius: var(--r-lg); padding: 24px; transition: transform .25s, border-color .25s, box-shadow .25s; }
+.agent-card:hover { transform: translateY(-4px); box-shadow: var(--shadow-md); border-color: rgba(94,92,230,.28); }
+.agent-card .ac-top { display: flex; align-items: center; gap: 12px; margin-bottom: 12px; }
+.agent-card .ac-ico { width: 42px; height: 42px; border-radius: 11px; flex-shrink: 0; display: grid; place-items: center;
+  background: linear-gradient(135deg, var(--fill-brand), var(--fill-ai)); border: 1px solid rgba(94,92,230,.2); color: var(--brand); }
+.agent-card .ac-ico svg { width: 21px; height: 21px; }
+.agent-card h4 { font-size: 17px; font-weight: 700; letter-spacing: -.01em; }
+.agent-card .ac-key { font-family: var(--mono); font-size: 11px; color: var(--ink-3); margin-top: 2px; word-break: break-all; }
+.agent-card > p { font-size: 13.6px; color: var(--ink-2); line-height: 1.62; margin-bottom: 14px; }
+.agent-io { margin-top: auto; display: flex; flex-direction: column; gap: 7px; }
+.agent-io .io-row { display: flex; gap: 9px; font-size: 12.5px; line-height: 1.45; }
+.agent-io .io-k { flex-shrink: 0; width: 34px; font-family: var(--mono); font-weight: 700; color: var(--ink-3); }
+.agent-io .io-v { color: var(--ink-2); }
+.agent-tags { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 14px; }
+.agent-tag { font-family: var(--mono); font-size: 11px; padding: 3px 9px; border-radius: 7px;
+  color: var(--brand); background: var(--fill-brand); border: 1px solid rgba(94,92,230,.18); }
+.agent-tag.ai { color: var(--ai-ink); background: var(--fill-ai); border-color: rgba(15,181,168,.22); }
+.agent-tag.blue { color: var(--scheduled-ink); background: var(--fill-blue); border-color: rgba(10,132,255,.2); }
+/* LLM 真调标记 */
+.llm-dot { display: inline-flex; align-items: center; gap: 6px; font-family: var(--mono); font-size: 10.5px; font-weight: 700;
+  color: var(--ai-ink); background: var(--fill-ai); border: 1px solid rgba(15,181,168,.26); padding: 3px 8px; border-radius: 999px; margin-left: auto; }
+.llm-dot::before { content: ""; width: 6px; height: 6px; border-radius: 50%; background: var(--ai); }
+
+/* ---------- 确定性编排器（诚实区分，深色区） ---------- */
+.orch-note { max-width: 760px; margin-bottom: 28px; }
+.orch-grid { display: grid; grid-template-columns: repeat(2,1fr); gap: 16px; }
+.orch-card { background: rgba(255,255,255,.04); border: 1px solid var(--ink-hair); border-radius: var(--r-lg); padding: 26px; }
+.orch-card .oc-top { display: flex; align-items: center; gap: 12px; margin-bottom: 10px; }
+.orch-card .oc-ico { width: 42px; height: 42px; border-radius: 11px; flex-shrink: 0; display: grid; place-items: center;
+  background: rgba(10,132,255,.16); color: #6FB4FF; }
+.orch-card .oc-ico svg { width: 21px; height: 21px; }
+.orch-card h4 { font-size: 17px; font-weight: 700; color: var(--on-deep-1); }
+.orch-card .oc-en { font-family: var(--mono); font-size: 11px; color: var(--on-deep-3); margin-top: 2px; }
+.orch-card p { font-size: 13.6px; color: var(--on-deep-2); line-height: 1.62; }
+.orch-card .oc-tag { display: inline-block; margin-top: 14px; font-family: var(--mono); font-size: 11px; color: #6FB4FF;
+  background: rgba(10,132,255,.12); border: 1px solid rgba(10,132,255,.24); border-radius: 7px; padding: 3px 9px; }
+
+/* ---------- 一条消息的完整流程时间线 ---------- */
+.relay { position: relative; max-width: 920px; margin: 0 auto; }
+.relay-step { position: relative; display: flex; gap: 22px; padding-bottom: 24px; }
+.relay-step:last-child { padding-bottom: 0; }
+.relay-step::before { content: ""; position: absolute; left: 23px; top: 50px; bottom: 0; width: 2px;
+  background: linear-gradient(180deg, rgba(94,92,230,.5), rgba(94,92,230,.12)); }
+.relay-step:last-child::before { display: none; }
+.relay-node { flex-shrink: 0; width: 48px; height: 48px; border-radius: 14px; display: grid; place-items: center;
+  font-family: var(--mono); font-size: 13px; font-weight: 700; color: #fff; z-index: 1; }
+.relay-node.n-det { background: linear-gradient(135deg, var(--scheduled), #4DA3FF); box-shadow: 0 6px 16px rgba(10,132,255,.3); }
+.relay-node.n-llm { background: linear-gradient(135deg, var(--brand), var(--brand-2)); box-shadow: 0 6px 16px rgba(94,92,230,.3); }
+.relay-body { padding-top: 3px; flex: 1; min-width: 0; }
+.relay-body .rb-actor { display: flex; align-items: center; gap: 9px; flex-wrap: wrap; margin-bottom: 5px; }
+.relay-body h4 { font-size: 16.5px; font-weight: 700; }
+.relay-body .rb-who { font-family: var(--mono); font-size: 11px; padding: 2px 8px; border-radius: 6px; }
+.relay-body .rb-who.is-det { color: var(--scheduled-ink); background: var(--fill-blue); border: 1px solid rgba(10,132,255,.22); }
+.relay-body .rb-who.is-llm { color: var(--brand); background: var(--fill-brand); border: 1px solid rgba(94,92,230,.2); }
+.relay-body p { font-size: 13.8px; color: var(--ink-2); line-height: 1.6; }
+
+.relay-legend { display: flex; flex-wrap: wrap; gap: 18px; justify-content: center; margin-bottom: 34px; }
+.relay-legend span { display: inline-flex; align-items: center; gap: 8px; font-size: 13px; color: var(--ink-2); }
+.relay-legend i { width: 14px; height: 14px; border-radius: 5px; }
+.relay-legend i.l-det { background: linear-gradient(135deg, var(--scheduled), #4DA3FF); }
+.relay-legend i.l-llm { background: linear-gradient(135deg, var(--brand), var(--brand-2)); }
+
+/* ---------- 行业通用化亮点（iron-law 横幅） ---------- */
+.iron-law { margin-top: 24px; display: flex; align-items: flex-start; gap: 18px; padding: 24px 28px; border-radius: var(--r-lg); }
+.iron-law .il-ico { width: 46px; height: 46px; border-radius: 12px; flex-shrink: 0; display: grid; place-items: center; }
+.iron-law .il-ico svg { width: 24px; height: 24px; }
+.iron-law h4 { font-size: 17px; font-weight: 700; margin-bottom: 7px; color: var(--ink-1); }
+.iron-law p { font-size: 14px; color: var(--ink-2); line-height: 1.64; }
+
+/* ---------- 响应式 ---------- */
+@media (max-width: 980px) {
+  .agent-grid, .agent-grid.cols-2 { grid-template-columns: repeat(2,1fr); }
+  .orch-grid { grid-template-columns: 1fr; }
+  .ah-stats { grid-template-columns: repeat(2,1fr); gap: 24px 16px; }
+}
+@media (max-width: 680px) {
+  .agent-grid, .agent-grid.cols-2 { grid-template-columns: 1fr; }
+  .ah-stats { grid-template-columns: repeat(2,1fr); }
+  .squad-head h3 { font-size: 20px; }
+  .relay-step { gap: 15px; }
+  .relay-node { width: 42px; height: 42px; }
+  .relay-step::before { left: 20px; }
+  .iron-law { flex-direction: column; gap: 12px; padding: 20px; }
+}

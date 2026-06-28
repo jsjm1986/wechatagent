@@ -1,0 +1,114 @@
+/* ============================================================
+   WeAgent 官网 — 工程深度页专属样式
+   依赖 shared.css 的 token
+   ============================================================ */
+
+/* ---------- 页内英雄（自包含，与其它子页一致） ---------- */
+.page-hero { position: relative; overflow: hidden; padding: clamp(64px,9vw,116px) 0 clamp(48px,6vw,80px); }
+.page-hero-bg { position: absolute; inset: 0; pointer-events: none; }
+.page-hero .h-display { margin: 22px 0 20px; }
+.page-hero .lead { max-width: 820px; color: var(--on-deep-2); }
+.page-hero-meta { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 30px; }
+.page-hero-meta .pill { background: rgba(255,255,255,.06); border: 1px solid var(--ink-hair); color: var(--on-deep-2); }
+
+/* ---------- 防线吸顶导航 ---------- */
+.eng-jump { position: sticky; top: 0; z-index: 30; background: rgba(245,247,251,.86);
+  backdrop-filter: saturate(160%) blur(12px); border-bottom: 1px solid var(--hair); }
+.eng-jump-inner { display: flex; gap: 6px; overflow-x: auto; padding: 11px 24px; scrollbar-width: none; }
+.eng-jump-inner::-webkit-scrollbar { display: none; }
+.eng-jump a { display: inline-flex; align-items: center; gap: 8px; white-space: nowrap; flex-shrink: 0;
+  font-size: 13.5px; font-weight: 600; color: var(--ink-2); padding: 8px 14px; border-radius: 999px;
+  border: 1px solid transparent; transition: background .18s, color .18s, border-color .18s; }
+.eng-jump a:hover { background: var(--card); color: var(--ink-1); border-color: var(--hair); }
+.eng-jump a b { font-family: var(--mono); font-size: 12px; font-weight: 700; color: var(--brand); }
+
+/* ---------- 章节头 ---------- */
+.eng-cluster { position: relative; }
+
+/* ---------- 技术采购三关切 ---------- */
+.buyer-band { background: var(--card-2); border-bottom: 1px solid var(--hair); }
+.buyer-band .e-head { margin-bottom: clamp(28px,3.5vw,40px); }
+.buyer-band .e-head .h-section { margin-top: 14px; }
+.buyer-grid { display: grid; grid-template-columns: repeat(3,1fr); gap: var(--gap); align-items: stretch; }
+.buyer-card { display: flex; flex-direction: column; background: var(--card); border: 1px solid var(--hair);
+  border-radius: var(--r-lg); padding: 28px 28px 24px; box-shadow: var(--shadow-sm);
+  border-top: 3px solid var(--brand); transition: transform .22s, box-shadow .22s; }
+.buyer-card:nth-child(2) { border-top-color: var(--blocked); }
+.buyer-card:nth-child(3) { border-top-color: var(--ai); }
+.buyer-card:hover { transform: translateY(-4px); box-shadow: var(--shadow-md); }
+.bc-q { font-size: 13px; font-weight: 700; color: var(--ink-3); margin-bottom: 12px;
+  padding-left: 20px; position: relative; }
+.bc-q::before { content: "?"; position: absolute; left: 0; top: -1px; font-family: var(--mono);
+  font-weight: 800; color: var(--brand); }
+.buyer-card:nth-child(2) .bc-q::before { color: var(--blocked-ink); }
+.buyer-card:nth-child(3) .bc-q::before { color: var(--ai-ink); }
+.buyer-card h4 { font-size: 18px; font-weight: 700; line-height: 1.34; margin-bottom: 11px; letter-spacing: -.01em; }
+.buyer-card > p { font-size: 13.8px; color: var(--ink-2); line-height: 1.64; flex: 1; }
+.buyer-card > p code { font-family: var(--mono); font-size: 12.5px; color: var(--brand);
+  background: var(--fill-brand); padding: 1px 6px; border-radius: 5px; word-break: break-all; }
+.bc-ref { font-family: var(--mono); font-size: 11.5px; color: var(--ink-3); background: var(--card-2);
+  border: 1px solid var(--hair); border-radius: 8px; padding: 8px 11px; margin-top: 16px;
+  word-break: break-all; line-height: 1.5; }
+
+
+.e-head { max-width: 880px; margin-bottom: clamp(32px,4vw,52px); }
+.e-head .h-section { margin: 14px 0 16px; }
+.e-tag { display: flex; align-items: center; gap: 13px; }
+.e-no { font-family: var(--mono); font-size: 14px; font-weight: 800; color: #fff;
+  background: var(--brand); width: 34px; height: 34px; border-radius: 10px; display: grid; place-items: center;
+  flex-shrink: 0; }
+.is-deep .e-head .lead { color: var(--on-deep-2); }
+.is-deep .eyebrow { color: var(--brand-2); }
+
+/* 每簇主色：序号块 + 卡片左缘 hover */
+.c-resil  .e-no { background: var(--brand); }
+.c-deliver .e-no { background: var(--scheduled); }
+.c-know   .e-no { background: var(--ai); }
+.c-mem    .e-no { background: var(--held); }
+.c-obs    .e-no { background: var(--brand-2); }
+
+/* ---------- 能力卡网格 ---------- */
+.eng-grid { display: grid; grid-template-columns: repeat(3,1fr); gap: var(--gap); }
+.eng-grid-5 { grid-template-columns: repeat(3,1fr); }
+.eng-card { position: relative; background: var(--card); border: 1px solid var(--hair); border-radius: var(--r-lg);
+  padding: 26px 26px 24px; box-shadow: var(--shadow-sm); display: flex; flex-direction: column;
+  transition: transform .22s, box-shadow .22s, border-color .22s; overflow: hidden; }
+.eng-card::before { content: ""; position: absolute; left: 0; top: 0; bottom: 0; width: 3px;
+  background: var(--brand); opacity: 0; transition: opacity .22s; }
+.eng-card:hover { transform: translateY(-4px); box-shadow: var(--shadow-md); }
+.eng-card:hover::before { opacity: 1; }
+.c-resil  .eng-card::before { background: var(--brand); }
+.c-deliver .eng-card::before { background: var(--scheduled); }
+.c-know   .eng-card::before { background: var(--ai); }
+.c-mem    .eng-card::before { background: var(--held); }
+
+/* 代码引用条 */
+.ec-ref { font-family: var(--mono); font-size: 12px; font-weight: 600; color: var(--ink-3);
+  background: var(--card-2); border: 1px solid var(--hair); border-radius: 8px; padding: 7px 11px;
+  margin-bottom: 15px; word-break: break-all; align-self: flex-start; max-width: 100%; }
+.c-resil  .ec-ref { color: var(--brand); }
+.c-deliver .ec-ref { color: var(--scheduled-ink); }
+.c-know   .ec-ref { color: var(--ai-ink); }
+.c-mem    .ec-ref { color: var(--held-ink); }
+
+.eng-card h4 { font-size: 16.5px; font-weight: 700; line-height: 1.36; margin-bottom: 9px; letter-spacing: -.01em; }
+.eng-card p { font-size: 13.6px; color: var(--ink-2); line-height: 1.62; }
+
+/* ---------- 深色簇（05 可观测） ---------- */
+.is-deep .eng-card { background: linear-gradient(180deg, rgba(255,255,255,.05), rgba(255,255,255,.02));
+  border-color: var(--ink-hair); box-shadow: none; }
+.is-deep .eng-card:hover { border-color: rgba(124,107,255,.4); }
+.is-deep .eng-card::before { background: var(--brand-2); }
+.is-deep .ec-ref { color: #C9C5FF; background: rgba(124,107,255,.14); border-color: rgba(124,107,255,.24); }
+.is-deep .eng-card h4 { color: var(--on-deep-1); }
+.is-deep .eng-card p { color: var(--on-deep-2); }
+
+/* ---------- 响应式 ---------- */
+@media (max-width: 980px) {
+  .eng-grid, .eng-grid-5 { grid-template-columns: repeat(2,1fr); }
+  .buyer-grid { grid-template-columns: 1fr; }
+}
+@media (max-width: 680px) {
+  .eng-grid, .eng-grid-5 { grid-template-columns: 1fr; }
+  .e-tag { flex-wrap: wrap; gap: 10px; }
+}

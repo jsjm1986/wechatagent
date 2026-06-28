@@ -1,0 +1,571 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title data-zh="自我演化 · WeAgent" data-en="Self-evolution · WeAgent">自我演化 · WeAgent</title>
+<meta name="description" content="WeAgent 的自我演化子系统：一个与生产链路物理隔离的后台演化器，从历史决策日志学习，生成阈值与提示词候选，在影子里重放重判，只有显著变好且通过零容忍安全回归门、再经管理员确认，才会发布。回滚永远手动。">
+<link rel="canonical" href="https://weagent.example.com/evolution.html">
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="WeAgent">
+<meta property="og:locale" content="zh_CN">
+<meta property="og:locale:alternate" content="en_US">
+<meta property="og:title" content="自我演化 · WeAgent">
+<meta property="og:description" content="与生产链路物理隔离的后台演化器：从历史日志学习、生成候选、影子重放重判，只有显著变好且过零容忍安全回归门、经管理员确认才发布。回滚永远手动。">
+<meta property="og:url" content="https://weagent.example.com/evolution.html">
+<meta property="og:image" content="https://weagent.example.com/assets/og-cover.png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="WeAgent — 全自治微信私域 AI 运营">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="自我演化 · WeAgent">
+<meta name="twitter:description" content="影子里重放重判，只有显著变好且过安全回归门、经管理员确认才发布。回滚永远手动。">
+<meta name="twitter:image" content="https://weagent.example.com/assets/og-cover.png">
+<link rel="stylesheet" href="assets/shared.css">
+<link rel="stylesheet" href="assets/evolution.css">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='18' fill='%235E5CE6'/%3E%3Cpath fill='%23fff' fill-rule='evenodd' clip-rule='evenodd' d='M18.5 7 H45.5 Q57.5 7 57.5 19 V33 Q57.5 45 45.5 45 H24 L13 57 V44.4 Q6.5 43 6.5 33 V19 Q6.5 7 18.5 7 Z M14 15.5 L20.2 38 L31 23 L33 23 L43.8 38 L50 15.5 L44.3 15.5 L40.4 31 L33.4 21 L30.6 21 L23.6 31 L19.7 15.5 Z M47 6.1 C47 12.02 46 13.5 42 13.5 C46 13.5 47 14.98 47 20.9 C47 14.98 48 13.5 52 13.5 C48 13.5 47 12.02 47 6.1 Z'/%3E%3C/svg%3E">
+</head>
+<body>
+
+<!-- ============ 导航 ============ -->
+<nav class="nav">
+  <div class="wrap nav-inner">
+    <a href="index.html" class="brand">
+      <span class="brand-mark"><svg viewBox="0 0 64 64" fill="none"><path fill="#fff" fill-rule="evenodd" clip-rule="evenodd" d="M18.5 7 H45.5 Q57.5 7 57.5 19 V33 Q57.5 45 45.5 45 H24 L13 57 V44.4 Q6.5 43 6.5 33 V19 Q6.5 7 18.5 7 Z M14 15.5 L20.2 38 L31 23 L33 23 L43.8 38 L50 15.5 L44.3 15.5 L40.4 31 L33.4 21 L30.6 21 L23.6 31 L19.7 15.5 Z M47 6.1 C47 12.02 46 13.5 42 13.5 C46 13.5 47 14.98 47 20.9 C47 14.98 48 13.5 52 13.5 C48 13.5 47 12.02 47 6.1 Z"/></svg></span>
+      WeAgent
+    </a>
+    <div class="nav-links">
+      <a href="index.html" data-lang-zh>首页</a><a href="index.html" data-lang-en>Home</a>
+      <a href="solutions.html" data-lang-zh>解决什么</a><a href="solutions.html" data-lang-en>Solutions</a>
+      <a href="product.html" data-lang-zh>产品能力</a><a href="product.html" data-lang-en>Product</a>
+      <a href="agents.html" data-lang-zh>智能体编队</a><a href="agents.html" data-lang-en>Agents</a>
+      <a href="technology.html" data-lang-zh>技术架构</a><a href="technology.html" data-lang-en>Technology</a>
+      <a href="engineering.html" data-lang-zh>工程深度</a><a href="engineering.html" data-lang-en>Engineering</a>
+      <a href="evolution.html" class="active" data-lang-zh>自我演化</a><a href="evolution.html" class="active" data-lang-en>Self-evolution</a>
+      <a href="scenarios.html" data-lang-zh>行业场景</a><a href="scenarios.html" data-lang-en>Scenarios</a>
+      <a href="observability.html" data-lang-zh>运营透视</a><a href="observability.html" data-lang-en>Observability</a>
+      <a href="trust.html" data-lang-zh>信任与安全</a><a href="trust.html" data-lang-en>Trust</a>
+    </div>
+    <div class="nav-right">
+      <div class="lang-toggle">
+        <button data-lang-btn="zh">中</button>
+        <button data-lang-btn="en">EN</button>
+      </div>
+      <button class="nav-burger" aria-label="menu"><svg viewBox="0 0 24 24" width="22" height="22" fill="none"><path d="M4 7h16M4 12h16M4 17h16" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg></button>
+    </div>
+  </div>
+</nav>
+<div class="mobile-menu">
+  <a href="index.html" data-lang-zh>首页</a><a href="index.html" data-lang-en>Home</a>
+  <a href="solutions.html" data-lang-zh>解决什么</a><a href="solutions.html" data-lang-en>Solutions</a>
+  <a href="product.html" data-lang-zh>产品能力</a><a href="product.html" data-lang-en>Product</a>
+  <a href="agents.html" data-lang-zh>智能体编队</a><a href="agents.html" data-lang-en>Agents</a>
+  <a href="technology.html" data-lang-zh>技术架构</a><a href="technology.html" data-lang-en>Technology</a>
+  <a href="engineering.html" data-lang-zh>工程深度</a><a href="engineering.html" data-lang-en>Engineering</a>
+  <a href="evolution.html" data-lang-zh>自我演化</a><a href="evolution.html" data-lang-en>Self-evolution</a>
+  <a href="scenarios.html" data-lang-zh>行业场景</a><a href="scenarios.html" data-lang-en>Scenarios</a>
+  <a href="observability.html" data-lang-zh>运营透视</a><a href="observability.html" data-lang-en>Observability</a>
+  <a href="trust.html" data-lang-zh>信任与安全</a><a href="trust.html" data-lang-en>Trust</a>
+</div>
+
+<!-- ============ 页内英雄 ============ -->
+<header class="page-hero section-deep">
+  <div class="page-hero-bg" aria-hidden="true">
+    <div class="hero-glow hero-glow-1" style="position:absolute;width:560px;height:560px;border-radius:50%;filter:blur(90px);opacity:.5;top:-160px;left:-90px;background:radial-gradient(circle,rgba(15,181,168,.36),transparent 68%)"></div>
+    <div class="hero-glow" style="position:absolute;width:500px;height:500px;border-radius:50%;filter:blur(90px);opacity:.42;top:-40px;right:-90px;background:radial-gradient(circle,rgba(94,92,230,.42),transparent 70%)"></div>
+  </div>
+  <div class="wrap" style="position:relative">
+    <span class="eyebrow reveal" data-lang-zh>自我演化 · 隔离的演化器</span><span class="eyebrow reveal" data-lang-en>Self-evolution · isolated evolver</span>
+    <h1 class="h-display reveal reveal-d1" data-lang-zh>它会越用越好，<span class="text-grad">但每一步都要先在影子里证明</span></h1>
+    <h1 class="h-display reveal reveal-d1" data-lang-en>It gets better with use — <span class="text-grad">but proves every step in the shadow first</span></h1>
+    <p class="lead reveal reveal-d2" data-lang-zh>演化器是一个与生产链路物理隔离的后台子系统。它从历史决策日志里学习，生成发送阈值与提示词的改进候选，在「影子」里用历史对话重放重判，只有统计上显著变好、且通过零容忍的安全回归门，再经管理员二次确认，才会真正发布到生产。回滚永远由人手动触发——没有自动回滚。</p>
+    <p class="lead reveal reveal-d2" data-lang-en>The evolver is a background subsystem physically isolated from the production path. It learns from past decision logs, generates improvement candidates for send thresholds and prompts, replays them against real history in a "shadow", and only ships to production after a statistically significant gain that passes a zero-tolerance safety-regression gate — confirmed by an admin. Rollback is always a manual human action; there is no auto-rollback.</p>
+    <div class="page-hero-meta reveal reveal-d3">
+      <span class="pill" data-lang-zh>物理隔离 · CI 强制</span><span class="pill" data-lang-en>Physically isolated · CI-enforced</span>
+      <span class="pill" data-lang-zh>9 步流水线</span><span class="pill" data-lang-en>9-step pipeline</span>
+      <span class="pill" data-lang-zh>零容忍安全回归</span><span class="pill" data-lang-en>Zero-tolerance safety</span>
+      <span class="pill" data-lang-zh>默认全部关闭</span><span class="pill" data-lang-en>Off by default</span>
+    </div>
+  </div>
+</header>
+
+<!-- ============ 隔离红线 ============ -->
+<section class="section section-deep" id="isolation">
+  <div class="wrap">
+    <div class="s-head reveal">
+      <span class="eyebrow" data-lang-zh>第一原则 · 物理隔离</span><span class="eyebrow" data-lang-en>First principle · physical isolation</span>
+      <h2 class="h-section" data-lang-zh>能自我改进的系统，<span class="text-grad">必须先证明它碰不到生产</span></h2>
+      <h2 class="h-section" data-lang-en>A self-improving system <span class="text-grad">must first prove it cannot touch production</span></h2>
+    </div>
+    <div class="iso-band reveal">
+      <div class="iso-copy">
+        <h3 data-lang-zh>演化器不引用任何生产发送链路</h3><h3 data-lang-en>The evolver references no production send path</h3>
+        <p data-lang-zh>整个 <code>src/evolution/</code> 模块严禁引用统一网关、发件箱、MCP 客户端、任务循环与 Webhook。它读历史日志、写实验与候选记录，但永远没有一条通往「给客户发消息」的代码路径。这条隔离红线不是靠自觉——<code>scripts/check-evolution-isolation.sh</code> 在 CI 里静态扫描该目录强制执行，一旦出现被禁的依赖，构建直接失败。</p>
+        <p data-lang-en>The entire <code>src/evolution/</code> module is forbidden from referencing the unified gateway, outbox, MCP client, task loop or webhooks. It reads history and writes experiment and proposal records, but there is never a code path that reaches "send a message to a customer". This line is not a matter of discipline — <code>scripts/check-evolution-isolation.sh</code> statically scans the directory in CI and fails the build the moment a forbidden dependency appears.</p>
+        <div class="iso-script">scripts/check-evolution-isolation.sh · CI 静态扫描</div>
+      </div>
+      <div class="forbidden-list">
+        <div class="fb-item">
+          <span class="fb-x"><svg viewBox="0 0 24 24" fill="none"><path d="M6 6l12 12M18 6L6 18" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"/></svg></span>
+          <code>agent::gateway</code><span data-lang-zh>统一发送网关</span><span data-lang-en>send gateway</span>
+        </div>
+        <div class="fb-item">
+          <span class="fb-x"><svg viewBox="0 0 24 24" fill="none"><path d="M6 6l12 12M18 6L6 18" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"/></svg></span>
+          <code>agent::outbox</code><span data-lang-zh>持久化发件箱</span><span data-lang-en>persistent outbox</span>
+        </div>
+        <div class="fb-item">
+          <span class="fb-x"><svg viewBox="0 0 24 24" fill="none"><path d="M6 6l12 12M18 6L6 18" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"/></svg></span>
+          <code>mcp::*</code><span data-lang-zh>微信发送工具</span><span data-lang-en>WeChat send tools</span>
+        </div>
+        <div class="fb-item">
+          <span class="fb-x"><svg viewBox="0 0 24 24" fill="none"><path d="M6 6l12 12M18 6L6 18" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"/></svg></span>
+          <code>tasks · webhooks</code><span data-lang-zh>任务循环 / 回调</span><span data-lang-en>task loop / webhooks</span>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ============ 九步流水线 ============ -->
+<section class="section" id="pipeline">
+  <div class="wrap">
+    <div class="s-head reveal">
+      <span class="eyebrow" data-lang-zh>主循环 · run_one_tick</span><span class="eyebrow" data-lang-en>Main loop · run_one_tick</span>
+      <h2 class="h-section" data-lang-zh>每一次演化，<span class="text-grad">都是同一条九步流水线</span></h2>
+      <h2 class="h-section" data-lang-en>Every evolution cycle is <span class="text-grad">the same nine-step pipeline</span></h2>
+      <p class="lead" data-lang-zh>后台 worker 每隔一个周期（默认 6 小时）触发一次 tick。单次 tick 失败不影响下一次，异常会被捕获并写入 <code>evolution_tick_failed</code> 事件——worker 的存活永远优先。</p>
+      <p class="lead" data-lang-en>A background worker fires one tick per interval (6 hours by default). A failed tick never affects the next; exceptions are caught and recorded as an <code>evolution_tick_failed</code> event — worker survival always comes first.</p>
+    </div>
+    <div class="pipe-grid">
+      <div class="pipe-step reveal">
+        <div class="ps-no">01</div>
+        <h5 data-lang-zh>写实验信封</h5><h5 data-lang-en>Write experiment envelope</h5>
+        <p data-lang-zh>每个 tick 开一条 experiments 记录，唯一索引，初始状态 collecting。</p>
+        <p data-lang-en>Each tick opens one experiments record with a unique index, initial status collecting.</p>
+        <span class="ps-fn">insert_experiment_envelope</span>
+      </div>
+      <div class="pipe-step reveal reveal-d1">
+        <div class="ps-no">02</div>
+        <h5 data-lang-zh>选队列 + 灰度过滤</h5><h5 data-lang-en>Select cohorts + rollout filter</h5>
+        <p data-lang-zh>从最近 72 小时已完成的决策日志取样，按联系人哈希分桶灰度，同联系人去重。</p>
+        <p data-lang-en>Samples completed run logs from the last 72h, buckets by contact hash for rollout, dedupes per contact.</p>
+        <span class="ps-fn">select_cohorts_filtered</span>
+      </div>
+      <div class="pipe-step reveal reveal-d2">
+        <div class="ps-no">03</div>
+        <h5 data-lang-zh>生成阈值候选</h5><h5 data-lang-en>Generate threshold candidates</h5>
+        <p data-lang-zh>纯统计路径：对比闸门命中率与目标区间，提出阈值微调。不调 LLM、不消预算。</p>
+        <p data-lang-en>Pure-stats path: compares gate hit rates to target bands and proposes threshold nudges. No LLM, no budget.</p>
+        <span class="ps-fn">threshold::generate</span>
+        <span class="ps-tag stat" data-lang-zh>纯统计 · 零成本</span><span class="ps-tag stat" data-lang-en>pure stats · no cost</span>
+      </div>
+      <div class="pipe-step is-budget reveal">
+        <div class="ps-no">04</div>
+        <h5 data-lang-zh>生成提示词候选</h5><h5 data-lang-en>Generate prompt candidates</h5>
+        <p data-lang-zh>把失败案例分桶喂给 Critic LLM，产出提示词修订草案。唯一消耗演化预算的阶段。</p>
+        <p data-lang-en>Feeds bucketed failures to a critic LLM to draft prompt revisions. The only stage that spends the evolution budget.</p>
+        <span class="ps-fn">prompt_critic::generate</span>
+        <span class="ps-tag llm" data-lang-zh>Critic LLM · 计预算</span><span class="ps-tag llm" data-lang-en>critic LLM · budgeted</span>
+      </div>
+      <div class="pipe-step is-budget reveal reveal-d1">
+        <div class="ps-no">05</div>
+        <h5 data-lang-zh>记录预算用量</h5><h5 data-lang-en>Record budget usage</h5>
+        <p data-lang-zh>把本次 tick 消耗的 token 与调用数写回信封。预算耗尽不报错，静默跳过剩余候选。</p>
+        <p data-lang-en>Writes tokens and calls spent back to the envelope. Budget exhaustion never errors — it silently skips remaining work.</p>
+        <span class="ps-fn">budget_used_tokens · _calls</span>
+      </div>
+      <div class="pipe-step is-eval reveal reveal-d2">
+        <div class="ps-no">06</div>
+        <h5 data-lang-zh>影子回放 + 显著性</h5><h5 data-lang-en>Shadow replay + significance</h5>
+        <p data-lang-zh>对每条候选在历史样本上重放重判，聚合指标，按显著性与安全回归门分级。</p>
+        <p data-lang-en>Replays each candidate over history, aggregates metrics, then grades by significance and the safety-regression gate.</p>
+        <span class="ps-fn">replay::eval_all · significance</span>
+        <span class="ps-tag safe" data-lang-zh>影子 · 零副作用</span><span class="ps-tag safe" data-lang-en>shadow · no side effects</span>
+      </div>
+      <div class="pipe-step is-admin reveal">
+        <div class="ps-no">07</div>
+        <h5 data-lang-zh>推进到待确认</h5><h5 data-lang-en>Advance to awaiting-admin</h5>
+        <p data-lang-zh>实验状态推进到 awaiting_admin。通过显著性的候选标为 eligible_for_release，等管理员裁决。</p>
+        <p data-lang-en>Experiment status advances to awaiting_admin. Passing candidates become eligible_for_release, pending an admin's call.</p>
+        <span class="ps-fn">status = awaiting_admin</span>
+      </div>
+      <div class="pipe-step is-admin reveal reveal-d1">
+        <div class="ps-no">08</div>
+        <h5 data-lang-zh>发布后复盘</h5><h5 data-lang-en>Post-release review</h5>
+        <p data-lang-zh>扫一遍到期的发布后复盘（发布 +24h），对比前后窗口的真实指标。仅观测，绝不自动回滚。</p>
+        <p data-lang-en>Sweeps due post-release reviews (release +24h), comparing real metrics before and after. Observe only — never auto-rollback.</p>
+        <span class="ps-fn">post_release::run_due_reviews</span>
+      </div>
+      <div class="pipe-step is-admin reveal reveal-d2">
+        <div class="ps-no">09</div>
+        <h5 data-lang-zh>阈值自动放量</h5><h5 data-lang-en>Threshold auto-release</h5>
+        <p data-lang-zh>仅阈值候选、且双重开关开启时，对仍未回正的信号闭环放量。提示词永远要人确认。默认关闭。</p>
+        <p data-lang-en>Only for threshold candidates, only when a double switch is on, closing the loop for signals that haven't self-corrected. Prompts always need a human. Off by default.</p>
+        <span class="ps-fn">auto_release_eligible_thresholds</span>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ============ 两类候选对照 ============ -->
+<section class="section section-tint" id="candidates">
+  <div class="wrap">
+    <div class="s-head reveal">
+      <span class="eyebrow" data-lang-zh>两类候选 · 阈值 vs 提示词</span><span class="eyebrow" data-lang-en>Two candidate kinds · threshold vs prompt</span>
+      <h2 class="h-section" data-lang-zh>它学两件事：<span class="text-grad">闸门松紧，和怎么说话</span></h2>
+      <h2 class="h-section" data-lang-en>It learns two things: <span class="text-grad">how tight the gates are, and how it speaks</span></h2>
+    </div>
+    <div class="cand-grid">
+      <div class="cand-card threshold reveal">
+        <div class="cand-head">
+          <span class="cand-ico"><svg viewBox="0 0 24 24" fill="none"><path d="M4 12h4l3-7 4 14 3-7h2" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+          <div><h3 data-lang-zh>阈值候选</h3><h3 data-lang-en>Threshold candidates</h3><div class="cand-kind">proposal_kind = threshold</div></div>
+        </div>
+        <p data-lang-zh>纯统计驱动：统计每道发送闸门在近期决策里的命中率，和经过校准的目标区间对比。命中率偏低说明闸门过严，往松调；偏高说明过松，往紧调。每步固定 0.5，永远不超出 1–10 的硬边界。</p>
+        <p data-lang-en>Purely statistical: measures each send gate's recent hit rate against a calibrated target band. Too low means the gate is too strict — loosen it; too high means too loose — tighten it. Each step is a fixed 0.5 and never crosses the hard 1–10 bounds.</p>
+        <span class="cand-budget no-cost" data-lang-zh>不调用 LLM · 不消耗预算</span><span class="cand-budget no-cost" data-lang-en>No LLM · no budget spent</span>
+        <div class="cand-rows">
+          <div class="cand-row"><code>fact_risk_block</code><span data-lang-zh>事实风险拦截</span><span data-lang-en>fact-risk block</span></div>
+          <div class="cand-row"><code>pressure_risk_block</code><span data-lang-zh>压迫感拦截</span><span data-lang-en>pressure-risk block</span></div>
+          <div class="cand-row"><code>product_accuracy_score_block</code><span data-lang-zh>产品准确性拦截</span><span data-lang-en>product-accuracy block</span></div>
+          <div class="cand-row"><code>human_like_score_rewrite</code><span data-lang-zh>拟人度重写</span><span data-lang-en>human-likeness rewrite</span></div>
+          <div class="cand-row"><code>emotional_value_rewrite</code><span data-lang-zh>情绪价值重写</span><span data-lang-en>emotional-value rewrite</span></div>
+          <div class="cand-row"><code>planner_block_rate_threshold</code><span data-lang-zh>规划器拦截率</span><span data-lang-en>planner block rate</span></div>
+        </div>
+        <div class="cand-foot" data-lang-zh>单 tick 最多 4 条候选，按「距目标区间最远」优先；同一闸门 24 小时内发布过则跳过冷却。</div>
+        <div class="cand-foot" data-lang-en>Up to 4 candidates per tick, prioritized by distance from the target band; a gate released within 24h is skipped for cooldown.</div>
+      </div>
+      <div class="cand-card prompt reveal reveal-d1">
+        <div class="cand-head">
+          <span class="cand-ico"><svg viewBox="0 0 24 24" fill="none"><path d="M4 6h16M4 12h12M4 18h8" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg></span>
+          <div><h3 data-lang-zh>提示词候选</h3><h3 data-lang-en>Prompt candidates</h3><div class="cand-kind">proposal_kind = prompt</div></div>
+        </div>
+        <p data-lang-zh>由独立的 Critic LLM 驱动：把失败案例按最终评审状态分桶，让 Critic 针对某个提示词分段提出修订草案，并声明它预期改善哪些指标。产出经三道安全闸校验——字段超长、命中禁词、或试图修改演化器自己的提示词，整批丢弃。</p>
+        <p data-lang-en>Driven by a separate critic LLM: buckets failures by final review status and asks the critic to draft a revision to a specific prompt section, declaring which metrics it expects to improve. Output passes three safety checks — over-length fields, forbidden words, or any attempt to edit the evolver's own prompt drops the whole batch.</p>
+        <span class="cand-budget cost" data-lang-zh>调用 Critic LLM · 计入演化预算</span><span class="cand-budget cost" data-lang-en>Calls a critic LLM · counts against budget</span>
+        <div class="cand-rows">
+          <div class="cand-row"><code>soul</code><span data-lang-zh>人格灵魂层</span><span data-lang-en>soul layer</span></div>
+          <div class="cand-row"><code>system_contract</code><span data-lang-zh>系统契约层</span><span data-lang-en>system contract</span></div>
+          <div class="cand-row"><code>policy</code><span data-lang-zh>策略层</span><span data-lang-en>policy layer</span></div>
+          <div class="cand-row"><code>operator_instruction</code><span data-lang-zh>运营指令层</span><span data-lang-en>operator instruction</span></div>
+        </div>
+        <div class="cand-foot" data-lang-zh>提示词改动只能落在这四个分段；发布时整段作为新版本写入，版本号 +1，并使提示词缓存失效。</div>
+        <div class="cand-foot" data-lang-en>Prompt edits land only in these four sections; on release the section is written as a new version (+1), invalidating the prompt cache.</div>
+      </div>
+    </div>
+    <div class="band-table reveal reveal-d1">
+      <div class="band-row head">
+        <span data-lang-zh>闸门键</span><span data-lang-en>gate key</span>
+        <span data-lang-zh>默认基线</span><span data-lang-en>baseline</span>
+        <span data-lang-zh>目标命中率区间</span><span data-lang-en>target hit band</span>
+      </div>
+      <div class="band-row"><span class="br-key">fact_risk_block</span><span class="br-base">≥ 6.0</span><span class="br-band">0.05 – 0.15</span></div>
+      <div class="band-row"><span class="br-key">pressure_risk_block</span><span class="br-base">≥ 7.0</span><span class="br-band">0.05 – 0.15</span></div>
+      <div class="band-row"><span class="br-key">product_accuracy_score_block</span><span class="br-base">&lt; 7.0</span><span class="br-band">0.05 – 0.15</span></div>
+      <div class="band-row"><span class="br-key">human_like_score_rewrite</span><span class="br-base">&lt; 6.0</span><span class="br-band">0.08 – 0.18</span></div>
+      <div class="band-row"><span class="br-key">emotional_value_rewrite</span><span class="br-base">&lt; 5.0</span><span class="br-band">0.08 – 0.18</span></div>
+      <div class="band-row"><span class="br-key">planner_block_rate_threshold</span><span class="br-base">0.60</span><span class="br-band">0.10 – 0.30</span></div>
+    </div>
+  </div>
+</section>
+
+<!-- ============ 影子回放 ============ -->
+<section class="section section-deep" id="shadow">
+  <div class="wrap">
+    <div class="s-head reveal">
+      <span class="eyebrow" data-lang-zh>影子回放 · 零副作用评估</span><span class="eyebrow" data-lang-en>Shadow replay · zero-side-effect eval</span>
+      <h2 class="h-section" data-lang-zh>在「影子」里证明，<span class="text-grad">不碰任何一个真实客户</span></h2>
+      <h2 class="h-section" data-lang-en>Prove it in the shadow, <span class="text-grad">without touching a single real customer</span></h2>
+      <p class="lead" data-lang-zh>影子回放是演化器最关键的安全设计：候选不会作用于任何在线对话，而是在历史样本上「假装」自己已经生效，看结果会怎样。它不调网关、不入发件箱、不调 MCP、不写出站消息，也不写决策日志——纯粹只读、纯粹评估。</p>
+      <p class="lead" data-lang-en>Shadow replay is the evolver's key safety design: a candidate never acts on a live conversation. Instead it "pretends" to already be in effect over historical samples and observes the outcome. It calls no gateway, no outbox, no MCP, writes no outbound message and no run log — strictly read-only, strictly evaluation.</p>
+    </div>
+    <div class="shadow-wrap">
+      <div class="shadow-card live reveal">
+        <span class="sc-tag" data-lang-zh>已实装 · 阈值候选</span><span class="sc-tag" data-lang-en>Live · threshold candidates</span>
+        <h4 data-lang-zh>阈值候选：用历史评分重判</h4><h4 data-lang-en>Threshold: re-grade on recorded scores</h4>
+        <p data-lang-zh>每条历史决策都记录了当时的五维评分（事实风险、压迫感、拟人度、情绪价值、产品准确性）。阈值候选不需要重新生成回复——它直接拿这些已记录的评分，套上新阈值重新判定每道闸门是否命中，得出一个「如果当时用新阈值会怎样」的最终评审状态，再和旧结果逐条对比。</p>
+        <p data-lang-en>Every past decision recorded its five-dimension scores (fact-risk, pressure, human-likeness, emotional value, product accuracy). A threshold candidate needs no regeneration — it takes those recorded scores, re-applies the new threshold to each gate, derives a "what if the new threshold had been used" final review status, and compares it against the old result, case by case.</p>
+        <div class="sc-zero">
+          <span>no gateway</span><span>no outbox</span><span>no MCP</span><span>no outbound</span><span>no run_log</span>
+        </div>
+      </div>
+      <div class="shadow-card wip reveal reveal-d1">
+        <span class="sc-tag" data-lang-zh>分阶段建设中 · 提示词候选</span><span class="sc-tag" data-lang-en>Staged · prompt candidates</span>
+        <h4 data-lang-zh>提示词候选：完整 LLM 重放分期落地</h4><h4 data-lang-en>Prompt: full LLM replay is staged</h4>
+        <p data-lang-zh>诚实地说：提示词候选的完整影子重放（用新提示词在历史对话上真实重跑 LLM）尚在分期建设中，当前阶段记为 <code>prompt_replay_not_implemented_w3</code>。这意味着提示词改动当前必须走管理员人工确认这条更保守的路径——而不会被自动放量。我们选择把现状写清楚，而不是夸大能力。</p>
+        <p data-lang-en>To be honest: full shadow replay for prompt candidates (actually re-running the LLM with the new prompt over real history) is still being built in stages, currently recorded as <code>prompt_replay_not_implemented_w3</code>. This means prompt edits today must take the more conservative admin-confirmation path — they are never auto-released. We state the status plainly rather than overstate the capability.</p>
+        <div class="sc-zero">
+          <span data-lang-zh>提示词永远要人确认</span><span data-lang-en>prompts always need a human</span>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ============ 显著性 + 安全回归门 ============ -->
+<section class="section" id="significance">
+  <div class="wrap">
+    <div class="s-head reveal">
+      <span class="eyebrow" data-lang-zh>显著性 · 通过 / 拒绝</span><span class="eyebrow" data-lang-en>Significance · pass / reject</span>
+      <h2 class="h-section" data-lang-zh>「变好」必须达标，<span class="text-grad">「变危险」一票否决</span></h2>
+      <h2 class="h-section" data-lang-en>"Better" must clear a bar; <span class="text-grad">"more dangerous" is an instant veto</span></h2>
+    </div>
+    <p class="sig-intro reveal" data-lang-zh>显著性判定是一组确定性的阈值门，不是统计假设检验——没有 p 值，只有「改进幅度是否达到下限、回归幅度是否超过上限」的硬比较，结果只有<b>通过</b>或<b>拒绝</b>两档。一条候选要发布，必须同时满足最小样本量、失败率上限、改进幅度下限、闸门命中涨幅上限四项；如果它放松的是安全闸，还要额外通过零容忍的安全回归门。</p>
+    <p class="sig-intro reveal" data-lang-en>Significance is a set of deterministic threshold gates, not a hypothesis test — no p-values, just hard comparisons of whether the gain clears a floor and the regression stays under a ceiling. The verdict is binary: <b>pass</b> or <b>reject</b>. To ship, a candidate must clear minimum sample size, a fail-rate ceiling, an improvement floor and a gate-hit-increase ceiling — and if it loosens a safety gate, it must also pass the zero-tolerance safety-regression gate.</p>
+    <div class="sig-grid">
+      <div class="sig-cell reveal">
+        <div class="sg-val">30</div>
+        <div class="sg-key">min_replays</div>
+        <h5 data-lang-zh>最小样本量</h5><h5 data-lang-en>Minimum replays</h5>
+        <p data-lang-zh>低于 30 条完成重放，直接判样本不足，不予发布。</p>
+        <p data-lang-en>Below 30 completed replays, it's ruled insufficient and not shipped.</p>
+      </div>
+      <div class="sig-cell reveal reveal-d1">
+        <div class="sg-val">+0.05</div>
+        <div class="sg-key">min_send_success_delta</div>
+        <h5 data-lang-zh>发送成功率改进下限</h5><h5 data-lang-en>Send-success improvement floor</h5>
+        <p data-lang-zh>阈值候选的发送成功率至少要提升 5 个百分点。</p>
+        <p data-lang-en>A threshold candidate must lift send-success by at least 5 points.</p>
+      </div>
+      <div class="sig-cell reveal reveal-d2">
+        <div class="sg-val">0.30</div>
+        <div class="sg-key">replay_max_fail_rate</div>
+        <h5 data-lang-zh>重放失败率上限</h5><h5 data-lang-en>Replay fail-rate ceiling</h5>
+        <p data-lang-zh>重放失败率超过 30%，结果不可信，拒绝。</p>
+        <p data-lang-en>Above a 30% replay fail rate the result is untrustworthy — rejected.</p>
+      </div>
+      <div class="sig-cell zero reveal reveal-d3">
+        <div class="sg-val">0.0</div>
+        <div class="sg-key">max_safety_regression_rate</div>
+        <h5 data-lang-zh>安全回归率上限</h5><h5 data-lang-en>Safety-regression ceiling</h5>
+        <p data-lang-zh>零容忍：哪怕一条曾被安全闸拦下的消息被放行，就否决。</p>
+        <p data-lang-en>Zero tolerance: even one once-blocked message now allowed vetoes it.</p>
+      </div>
+    </div>
+    <div class="safety-band reveal reveal-d1">
+      <span class="sb-ico"><svg viewBox="0 0 24 24" fill="none"><path d="M12 3l8 4v5c0 4.4-3 8-8 9-5-1-8-4.6-8-9V7l8-4z" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/><path d="M9 12l2 2 4-4" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+      <div>
+        <h4 data-lang-zh>反向安全门：放松闸门，不能漏过风险</h4><h4 data-lang-en>The reverse safety gate: loosening must not let risk through</h4>
+        <p data-lang-zh>三道安全闸（事实风险、压迫感、产品准确性）被特殊保护。任何放松它们的候选，只要在影子重判里出现「原本被拦下、现在被放行」的样本——哪怕只有一条——安全回归率就超过 <code>0.0</code> 上限，直接否决。重写类闸门和规划器不属于安全闸，放松它们不构成漏过风险。</p>
+        <p data-lang-en>Three safety gates (fact-risk, pressure, product-accuracy) get special protection. Any candidate loosening them is vetoed the moment a shadow re-grade shows a "was blocked, now allowed" sample — even one — because the safety-regression rate then exceeds the <code>0.0</code> ceiling. Rewrite gates and the planner are not safety gates; loosening them lets no risk through.</p>
+        <div class="safety-map">
+          <span class="sm-pair"><b>fact_risk_block</b> → held_by_ai_policy</span>
+          <span class="sm-pair"><b>pressure_risk_block</b> → blocked_by_safety_guard</span>
+          <span class="sm-pair"><b>product_accuracy</b> → blocked_unverified_product_claim</span>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ============ 发布 / 自动放量 / 回滚 + 状态机 ============ -->
+<section class="section section-tint" id="release">
+  <div class="wrap">
+    <div class="s-head reveal">
+      <span class="eyebrow" data-lang-zh>发布 · 自动放量 · 回滚</span><span class="eyebrow" data-lang-en>Release · auto-release · rollback</span>
+      <h2 class="h-section" data-lang-zh>从候选到生效，<span class="text-grad">每一步状态都留痕、可回滚</span></h2>
+      <h2 class="h-section" data-lang-en>From candidate to live, <span class="text-grad">every state is recorded and reversible</span></h2>
+    </div>
+    <div class="flow-states reveal">
+      <div class="fs-node start">
+        <div class="fn-status">pending_eval</div>
+        <div class="fn-desc" data-lang-zh>候选生成，待评估</div><div class="fn-desc" data-lang-en>generated, awaiting eval</div>
+      </div>
+      <div class="fs-arrow">→</div>
+      <div class="fs-node pass">
+        <div class="fn-status">eligible_for_release</div>
+        <div class="fn-desc" data-lang-zh>显著性通过，可发布</div><div class="fn-desc" data-lang-en>passed, ready to ship</div>
+      </div>
+      <div class="fs-arrow">→</div>
+      <div class="fs-node live">
+        <div class="fn-status">released</div>
+        <div class="fn-desc" data-lang-zh>已生效 + released_by</div><div class="fn-desc" data-lang-en>live + released_by</div>
+      </div>
+      <div class="fs-arrow">→</div>
+      <div class="fs-node back">
+        <div class="fn-status">rolled_back</div>
+        <div class="fn-desc" data-lang-zh>已回滚 + rolled_back_by</div><div class="fn-desc" data-lang-en>reverted + rolled_back_by</div>
+      </div>
+      <div class="fs-arrow">⇣</div>
+      <div class="fs-node reject">
+        <div class="fn-status">rejected_below_threshold</div>
+        <div class="fn-desc" data-lang-zh>未达标 / 超额 → 终态</div><div class="fn-desc" data-lang-en>failed / over-quota → terminal</div>
+      </div>
+    </div>
+    <div class="rel-grid">
+      <div class="rel-card manual reveal">
+        <span class="rc-ico"><svg viewBox="0 0 24 24" fill="none"><path d="M12 4v9m0 0l-3-3m3 3l3-3" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/><path d="M5 16v2a2 2 0 002 2h10a2 2 0 002-2v-2" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg></span>
+        <span class="rc-flag" data-lang-zh>管理员手动</span><span class="rc-flag" data-lang-en>admin manual</span>
+        <h4 data-lang-zh>发布</h4><h4 data-lang-en>Release</h4>
+        <p data-lang-zh>管理员对 eligible 候选确认后发布。阈值写入 threshold_overrides，提示词写入新版本，两者各用一个 Mongo 事务把「生效写入」和「状态推进」绑成原子操作——要么都成，要么都不成。</p>
+        <p data-lang-en>An admin confirms an eligible candidate. Thresholds write to threshold_overrides, prompts write a new version; each uses a Mongo transaction to bind "apply" and "state advance" atomically — all or nothing.</p>
+        <div class="rc-meta">
+          <div class="rc-line"><code>released_at</code><span data-lang-zh>发布时间</span><span data-lang-en>release time</span></div>
+          <div class="rc-line"><code>released_by</code><span data-lang-zh>发布人身份</span><span data-lang-en>who released</span></div>
+        </div>
+      </div>
+      <div class="rel-card auto reveal reveal-d1">
+        <span class="rc-ico"><svg viewBox="0 0 24 24" fill="none"><path d="M4 12a8 8 0 018-8 8 8 0 017 4m1 4a8 8 0 01-8 8 8 8 0 01-7-4" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><path d="M19 4v4h-4M5 20v-4h4" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+        <span class="rc-flag" data-lang-zh>默认关闭 · 仅阈值</span><span class="rc-flag" data-lang-en>off by default · threshold only</span>
+        <h4 data-lang-zh>自动放量</h4><h4 data-lang-en>Auto-release</h4>
+        <p data-lang-zh>仅阈值候选可走闭环自动放量，且需要环境总开关与工作区子开关「双闸」同时开启（默认都关）。还要满足：回看窗口里信号仍未自然回正、且窗口内的负反应率未超过上限。提示词永远不自动放量。</p>
+        <p data-lang-en>Only threshold candidates can auto-release, and only when both an env switch and a per-workspace switch are on (both off by default). The signal must still be off-band in the look-back window, and the window's negative-reaction rate must stay under the cap. Prompts never auto-release.</p>
+        <div class="rc-meta">
+          <div class="rc-line"><code>336h</code><span data-lang-zh>回看窗口（14 天）</span><span data-lang-en>look-back (14 days)</span></div>
+          <div class="rc-line"><code>cap = 1 / tick</code><span data-lang-zh>单 tick 至多放量 1 条</span><span data-lang-en>at most 1 per tick</span></div>
+        </div>
+      </div>
+      <div class="rel-card rollback reveal reveal-d2">
+        <span class="rc-ico"><svg viewBox="0 0 24 24" fill="none"><path d="M9 14l-4-4 4-4" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/><path d="M5 10h9a5 5 0 015 5v1" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+        <span class="rc-flag" data-lang-zh>永远手动 · Req 9.7</span><span class="rc-flag" data-lang-en>always manual · Req 9.7</span>
+        <h4 data-lang-zh>回滚</h4><h4 data-lang-en>Rollback</h4>
+        <p data-lang-zh>回滚永远只能由管理员手动触发——这条铁律在三处代码注释里明确写着，对应需求 9.7。发布后复盘只观测、只记录前后窗口的真实指标差，绝不据此自动回滚。前置校验要求状态必须是 released，否则拒绝。</p>
+        <p data-lang-en>Rollback can only ever be triggered manually by an admin — a rule spelled out in three code comments, mapping to Requirement 9.7. Post-release review only observes and records the real before/after metric deltas; it never auto-rolls-back. A precondition requires the status to be released, else it's refused.</p>
+        <div class="rc-meta">
+          <div class="rc-line"><code>+24h</code><span data-lang-zh>发布后复盘窗口</span><span data-lang-en>post-release window</span></div>
+          <div class="rc-line"><code>rolled_back_by</code><span data-lang-zh>回滚人身份</span><span data-lang-en>who rolled back</span></div>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ============ 可观测事件流 ============ -->
+<section class="section section-deep" id="observability">
+  <div class="wrap">
+    <div class="s-head reveal">
+      <span class="eyebrow" data-lang-zh>可观测性 · agent_events</span><span class="eyebrow" data-lang-en>Observability · agent_events</span>
+      <h2 class="h-section" data-lang-zh>演化器做的每件事，<span class="text-grad">都落成一条可查的事件</span></h2>
+      <h2 class="h-section" data-lang-en>Everything the evolver does <span class="text-grad">lands as a queryable event</span></h2>
+      <p class="lead" data-lang-zh>演化器从不静默运行。每个 tick 的完成、预算耗尽、发布、回滚、自动放量决策、发布后复盘，都写一条带工作区与账号边界的事件。前端的演化中心据此呈现完整的演化历史。</p>
+      <p class="lead" data-lang-en>The evolver never runs silently. Every tick completion, budget exhaustion, release, rollback, auto-release decision and post-release review writes an event scoped to workspace and account. The admin's evolution center renders the full history from these.</p>
+    </div>
+    <div class="evt-grid">
+      <div class="evt-cell reveal">
+        <div class="ev-kind">evolution_tick_completed</div>
+        <p data-lang-zh>一次 tick 正常收尾，汇总队列大小、候选数、合格数、放量数。</p>
+        <p data-lang-en>A tick finished cleanly, summarizing cohort sizes, candidates, eligible and released counts.</p>
+        <span class="ev-status ok">ok</span>
+      </div>
+      <div class="evt-cell reveal reveal-d1">
+        <div class="ev-kind">evolution_tick_failed</div>
+        <p data-lang-zh>单次 tick 抛错被捕获，记录错误摘要，不影响下一次。</p>
+        <p data-lang-en>A tick threw and was caught, recording an error summary without affecting the next.</p>
+        <span class="ev-status err">error</span>
+      </div>
+      <div class="evt-cell reveal reveal-d2">
+        <div class="ev-kind">evolution_budget_exceeded</div>
+        <p data-lang-zh>演化预算耗尽，记录已用 token 与调用数，静默跳过剩余候选。</p>
+        <p data-lang-en>The evolution budget ran out, logging tokens and calls used, silently skipping the rest.</p>
+        <span class="ev-status warn">warning</span>
+      </div>
+      <div class="evt-cell reveal">
+        <div class="ev-kind">evolution_threshold_released</div>
+        <p data-lang-zh>一条阈值候选发布生效（无论手动还是自动放量）。</p>
+        <p data-lang-en>A threshold candidate went live (whether by manual or auto-release).</p>
+        <span class="ev-status ok">ok</span>
+      </div>
+      <div class="evt-cell reveal reveal-d1">
+        <div class="ev-kind">evolution_prompt_released</div>
+        <p data-lang-zh>一条提示词候选发布为新版本，提示词缓存随之失效。</p>
+        <p data-lang-en>A prompt candidate shipped as a new version, invalidating the prompt cache.</p>
+        <span class="ev-status ok">ok</span>
+      </div>
+      <div class="evt-cell reveal reveal-d2">
+        <div class="ev-kind">evolution_rollback_completed</div>
+        <p data-lang-zh>管理员手动回滚完成，阈值或提示词恢复到上一档。</p>
+        <p data-lang-en>An admin's manual rollback finished, restoring the prior threshold or prompt.</p>
+        <span class="ev-status ok">ok</span>
+      </div>
+      <div class="evt-cell reveal">
+        <div class="ev-kind">evolution_auto_release_decision</div>
+        <p data-lang-zh>自动放量判定结果（放量 / 跳过），含命中率与负反应率依据。</p>
+        <p data-lang-en>An auto-release verdict (release / skip) with hit-rate and negative-reaction basis.</p>
+        <span class="ev-status ok">release · skip</span>
+      </div>
+      <div class="evt-cell reveal reveal-d1">
+        <div class="ev-kind">evolution_post_release_review</div>
+        <p data-lang-zh>发布 +24h 的复盘完成，落前后窗口的真实指标差。</p>
+        <p data-lang-en>A release +24h review completed, recording real before/after metric deltas.</p>
+        <span class="ev-status ok">ok</span>
+      </div>
+      <div class="evt-cell reveal reveal-d2">
+        <div class="ev-kind">EvolutionError（隔离）</div>
+        <p data-lang-zh>演化器有独立错误类型，预算耗尽绝不映射成 webhook 的 5xx。</p>
+        <p data-lang-en>The evolver has its own error type; budget exhaustion never maps to a webhook 5xx.</p>
+        <span class="ev-status warn" data-lang-zh>与主链路解耦</span><span class="ev-status warn" data-lang-en>decoupled</span>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ============ 结尾 CTA ============ -->
+<section class="section cta-band">
+  <div class="wrap cta-inner reveal" style="text-align:center;max-width:720px;margin:0 auto;position:relative">
+    <h2 class="h-section" data-lang-zh>会进化的 AI 很多，<span class="text-grad">敢把刹车也写进代码的不多</span></h2>
+    <h2 class="h-section" data-lang-en>Plenty of AI evolves; <span class="text-grad">few compile the brakes in too</span></h2>
+    <p class="lead" data-lang-zh>物理隔离、影子回放、零容忍安全回归门、管理员确认、永远手动的回滚、默认全部关闭——自我演化的每一道约束，都和它的能力一样，是写进代码、被 CI 守住的工程事实。</p>
+    <p class="lead" data-lang-en>Physical isolation, shadow replay, a zero-tolerance safety gate, admin confirmation, always-manual rollback, off by default — every constraint on self-evolution is, like its capability, an engineering fact written into code and held by CI.</p>
+    <div class="hero-cta" style="justify-content:center;margin-top:8px">
+      <a href="trust.html" class="btn btn-primary"><span data-lang-zh>看信任与安全</span><span data-lang-en>Trust &amp; safety</span><svg viewBox="0 0 24 24" fill="none"><path d="M5 12h14M13 6l6 6-6 6" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></a>
+      <a href="technology.html" class="btn btn-ghost"><span data-lang-zh>回到技术架构</span><span data-lang-en>Back to architecture</span></a>
+    </div>
+  </div>
+</section>
+
+<!-- ============ 页脚 ============ -->
+<footer class="footer">
+  <div class="wrap">
+    <div class="footer-grid">
+      <div class="footer-brand">
+        <a href="index.html" class="brand"><span class="brand-mark"><svg viewBox="0 0 64 64" fill="none"><path fill="#fff" fill-rule="evenodd" clip-rule="evenodd" d="M18.5 7 H45.5 Q57.5 7 57.5 19 V33 Q57.5 45 45.5 45 H24 L13 57 V44.4 Q6.5 43 6.5 33 V19 Q6.5 7 18.5 7 Z M14 15.5 L20.2 38 L31 23 L33 23 L43.8 38 L50 15.5 L44.3 15.5 L40.4 31 L33.4 21 L30.6 21 L23.6 31 L19.7 15.5 Z M47 6.1 C47 12.02 46 13.5 42 13.5 C46 13.5 47 14.98 47 20.9 C47 14.98 48 13.5 52 13.5 C48 13.5 47 12.02 47 6.1 Z"/></svg></span>WeAgent</a>
+        <p data-lang-zh>全自治微信私域 AI 运营系统。客户永远只跟 AI 对话，AI 像真人一样长期经营每一段关系。</p>
+        <p data-lang-en>The autonomous WeChat private-domain AI operator. Customers only ever talk to the AI, which nurtures every relationship over time.</p>
+        <button class="wx-copy" data-wx="agimeme" type="button">
+          <svg viewBox="0 0 24 24" fill="none"><path d="M8.5 14.5c-3 0-5.5-2-5.5-4.6C3 7 5.8 5 9 5s6 2 6 4.9c0 .5-.1 1-.3 1.5M16 19c2.2 0 4-1.4 4-3.3 0-1.9-1.8-3.4-4-3.4s-4 1.5-4 3.4c0 .6.2 1.2.6 1.7L12 19l1.6-.5c.7.3 1.5.5 2.4.5z" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          <span data-lang-zh>顾问微信 <span class="wx-id">agimeme</span></span><span data-lang-en>WeChat <span class="wx-id">agimeme</span></span>
+          <span class="wx-hint" data-lang-zh>点击复制</span><span class="wx-hint" data-lang-en>tap to copy</span>
+        </button>
+      </div>
+      <div>
+        <h5 data-lang-zh>产品</h5><h5 data-lang-en>Product</h5>
+        <div class="footer-links">
+          <a href="solutions.html" data-lang-zh>解决什么问题</a><a href="solutions.html" data-lang-en>What it solves</a>
+          <a href="product.html" data-lang-zh>产品能力</a><a href="product.html" data-lang-en>Product</a>
+          <a href="agents.html" data-lang-zh>智能体编队</a><a href="agents.html" data-lang-en>Agents</a>
+          <a href="scenarios.html" data-lang-zh>行业场景</a><a href="scenarios.html" data-lang-en>Scenarios</a>
+          <a href="product.html#channels" data-lang-zh>管理频道</a><a href="product.html#channels" data-lang-en>Channels</a>
+        </div>
+      </div>
+      <div>
+        <h5 data-lang-zh>技术</h5><h5 data-lang-en>Technology</h5>
+        <div class="footer-links">
+          <a href="technology.html" data-lang-zh>技术架构</a><a href="technology.html" data-lang-en>Architecture</a>
+          <a href="technology.html#gateway" data-lang-zh>统一网关</a><a href="technology.html#gateway" data-lang-en>The gateway</a>
+          <a href="engineering.html" data-lang-zh>工程深度</a><a href="engineering.html" data-lang-en>Engineering depth</a>
+          <a href="evolution.html" data-lang-zh>自我演化</a><a href="evolution.html" data-lang-en>Self-evolution</a>
+        </div>
+      </div>
+      <div>
+        <h5 data-lang-zh>信任</h5><h5 data-lang-en>Trust</h5>
+        <div class="footer-links">
+          <a href="observability.html" data-lang-zh>运营透视</a><a href="observability.html" data-lang-en>Observability</a>
+          <a href="trust.html" data-lang-zh>信任与安全</a><a href="trust.html" data-lang-en>Trust &amp; safety</a>
+          <a href="trust.html#redlines" data-lang-zh>红线与守门</a><a href="trust.html#redlines" data-lang-en>Hard lines</a>
+          <a href="trust.html#audit" data-lang-zh>可审计性</a><a href="trust.html#audit" data-lang-en>Auditability</a>
+        </div>
+      </div>
+    </div>
+    <div class="footer-bottom">
+      <span>© 2026 WeAgent · <span data-lang-zh>私域自主运营</span><span data-lang-en>Autonomous private-domain operations</span></span>
+      <span data-lang-zh>构建于 2026-06-28 · 由 Claude Code 根据项目代码生成 · by opus-4.8 · 11 万行 Rust 代码 · 比例 100%</span><span data-lang-en>Built 2026-06-28 · generated by Claude Code from the project codebase · by opus-4.8 · 110k+ lines of Rust · 100% generated</span>
+      <span data-lang-zh>Rust · Axum · MongoDB · React · MCP</span>
+      <span data-lang-en>Built with Rust · Axum · MongoDB · React · MCP</span>
+    </div>
+  </div>
+</footer>
+
+<script src="assets/i18n.js"></script>
+<script src="assets/shared.js"></script>
+</body>
+</html>

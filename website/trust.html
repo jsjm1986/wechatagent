@@ -1,0 +1,502 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title data-zh="信任与安全 · WeAgent" data-en="Trust & Safety · WeAgent">信任与安全 · WeAgent</title>
+<meta name="description" content="WeAgent 把承诺写成代码里的硬约束：无人工接管红线、五道发送闸门、产品声明必须有据、四类执行留痕、租户与账号双键隔离，以及两道 CI 门禁守住每一次提交。">
+<link rel="canonical" href="https://weagent.example.com/trust.html">
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="WeAgent">
+<meta property="og:locale" content="zh_CN">
+<meta property="og:locale:alternate" content="en_US">
+<meta property="og:title" content="信任与安全 · WeAgent">
+<meta property="og:description" content="把承诺写成代码里的硬约束：无人工接管红线、五道发送闸门、产品声明必须有据、四类执行留痕、租户与账号双键隔离，两道 CI 门禁守住每一次提交。">
+<meta property="og:url" content="https://weagent.example.com/trust.html">
+<meta property="og:image" content="https://weagent.example.com/assets/og-cover.png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="WeAgent — 全自治微信私域 AI 运营">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="信任与安全 · WeAgent">
+<meta name="twitter:description" content="把承诺写成代码里的硬约束：无人工接管红线、五道发送闸门、产品声明必须有据。">
+<meta name="twitter:image" content="https://weagent.example.com/assets/og-cover.png">
+<link rel="stylesheet" href="assets/shared.css">
+<link rel="stylesheet" href="assets/trust.css">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='18' fill='%235E5CE6'/%3E%3Cpath fill='%23fff' fill-rule='evenodd' clip-rule='evenodd' d='M18.5 7 H45.5 Q57.5 7 57.5 19 V33 Q57.5 45 45.5 45 H24 L13 57 V44.4 Q6.5 43 6.5 33 V19 Q6.5 7 18.5 7 Z M14 15.5 L20.2 38 L31 23 L33 23 L43.8 38 L50 15.5 L44.3 15.5 L40.4 31 L33.4 21 L30.6 21 L23.6 31 L19.7 15.5 Z M47 6.1 C47 12.02 46 13.5 42 13.5 C46 13.5 47 14.98 47 20.9 C47 14.98 48 13.5 52 13.5 C48 13.5 47 12.02 47 6.1 Z'/%3E%3C/svg%3E">
+</head>
+<body>
+
+<!-- ============ 导航 ============ -->
+<nav class="nav">
+  <div class="wrap nav-inner">
+    <a href="index.html" class="brand">
+      <span class="brand-mark"><svg viewBox="0 0 64 64" fill="none"><path fill="#fff" fill-rule="evenodd" clip-rule="evenodd" d="M18.5 7 H45.5 Q57.5 7 57.5 19 V33 Q57.5 45 45.5 45 H24 L13 57 V44.4 Q6.5 43 6.5 33 V19 Q6.5 7 18.5 7 Z M14 15.5 L20.2 38 L31 23 L33 23 L43.8 38 L50 15.5 L44.3 15.5 L40.4 31 L33.4 21 L30.6 21 L23.6 31 L19.7 15.5 Z M47 6.1 C47 12.02 46 13.5 42 13.5 C46 13.5 47 14.98 47 20.9 C47 14.98 48 13.5 52 13.5 C48 13.5 47 12.02 47 6.1 Z"/></svg></span>
+      WeAgent
+    </a>
+    <div class="nav-links">
+      <a href="index.html" data-lang-zh>首页</a><a href="index.html" data-lang-en>Home</a>
+      <a href="solutions.html" data-lang-zh>解决什么</a><a href="solutions.html" data-lang-en>Solutions</a>
+      <a href="product.html" data-lang-zh>产品能力</a><a href="product.html" data-lang-en>Product</a>
+      <a href="agents.html" data-lang-zh>智能体编队</a><a href="agents.html" data-lang-en>Agents</a>
+      <a href="technology.html" data-lang-zh>技术架构</a><a href="technology.html" data-lang-en>Technology</a>
+      <a href="engineering.html" data-lang-zh>工程深度</a><a href="engineering.html" data-lang-en>Engineering</a>
+      <a href="evolution.html" data-lang-zh>自我演化</a><a href="evolution.html" data-lang-en>Self-evolution</a>
+      <a href="scenarios.html" data-lang-zh>行业场景</a><a href="scenarios.html" data-lang-en>Scenarios</a>
+      <a href="observability.html" data-lang-zh>运营透视</a><a href="observability.html" data-lang-en>Observability</a>
+      <a href="trust.html" class="active" data-lang-zh>信任与安全</a><a href="trust.html" class="active" data-lang-en>Trust</a>
+    </div>
+    <div class="nav-right">
+      <div class="lang-toggle">
+        <button data-lang-btn="zh">中</button>
+        <button data-lang-btn="en">EN</button>
+      </div>
+      <button class="nav-burger" aria-label="menu"><svg viewBox="0 0 24 24" width="22" height="22" fill="none"><path d="M4 7h16M4 12h16M4 17h16" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg></button>
+    </div>
+  </div>
+</nav>
+<div class="mobile-menu">
+  <a href="index.html" data-lang-zh>首页</a><a href="index.html" data-lang-en>Home</a>
+  <a href="solutions.html" data-lang-zh>解决什么</a><a href="solutions.html" data-lang-en>Solutions</a>
+  <a href="product.html" data-lang-zh>产品能力</a><a href="product.html" data-lang-en>Product</a>
+  <a href="agents.html" data-lang-zh>智能体编队</a><a href="agents.html" data-lang-en>Agents</a>
+  <a href="technology.html" data-lang-zh>技术架构</a><a href="technology.html" data-lang-en>Technology</a>
+  <a href="engineering.html" data-lang-zh>工程深度</a><a href="engineering.html" data-lang-en>Engineering</a>
+  <a href="evolution.html" data-lang-zh>自我演化</a><a href="evolution.html" data-lang-en>Self-evolution</a>
+  <a href="scenarios.html" data-lang-zh>行业场景</a><a href="scenarios.html" data-lang-en>Scenarios</a>
+  <a href="observability.html" data-lang-zh>运营透视</a><a href="observability.html" data-lang-en>Observability</a>
+  <a href="trust.html" data-lang-zh>信任与安全</a><a href="trust.html" data-lang-en>Trust</a>
+</div>
+
+<!-- ============ 页内英雄 ============ -->
+<header class="page-hero section-deep">
+  <div class="page-hero-bg" aria-hidden="true"><div class="hero-glow hero-glow-1" style="position:absolute;width:560px;height:560px;border-radius:50%;filter:blur(90px);opacity:.5;top:-160px;left:-100px;background:radial-gradient(circle,rgba(255,69,58,.32),transparent 68%)"></div><div class="hero-glow" style="position:absolute;width:480px;height:480px;border-radius:50%;filter:blur(90px);opacity:.4;top:-40px;right:-80px;background:radial-gradient(circle,rgba(15,181,168,.4),transparent 70%)"></div></div>
+  <div class="wrap" style="position:relative">
+    <span class="eyebrow reveal" data-lang-zh>信任与安全 · 红线写进代码</span><span class="eyebrow reveal" data-lang-en>Trust & Safety · Red lines compiled in</span>
+    <h1 class="h-display reveal reveal-d1" data-lang-zh>把承诺，<span class="text-grad">写成代码里的硬约束</span></h1>
+    <h1 class="h-display reveal reveal-d1" data-lang-en>Turn promises into <span class="text-grad">hard constraints in code</span></h1>
+    <p class="lead reveal reveal-d2" data-lang-zh>「无人工接管」不是一句宣传语，而是评审闸门、字符串白名单、审计留痕与 CI 门禁层层落实的工程事实。每一条消息发出前都被同一套规则检查；每一次决策、调用、发送都留痕；每一次代码提交都被门禁扫描。</p>
+    <p class="lead reveal reveal-d2" data-lang-en>"No human handoff" is not a slogan — it is an engineering fact enforced by review gates, string allowlists, audit trails and CI guards. Every message is checked by one rule set before it sends; every decision, call and send is recorded; every commit is scanned at the gate.</p>
+    <div class="page-hero-meta reveal reveal-d3">
+      <span class="pill" data-lang-zh>5 道发送闸门</span><span class="pill" data-lang-en>5 send gates</span>
+      <span class="pill" data-lang-zh>4 类执行留痕</span><span class="pill" data-lang-en>4 audit trails</span>
+      <span class="pill" data-lang-zh>2 道 CI 门禁</span><span class="pill" data-lang-en>2 CI guards</span>
+    </div>
+  </div>
+</header>
+
+<!-- ============ 红线一：无人工接管 ============ -->
+<section class="section" id="redlines">
+  <div class="wrap">
+    <div class="s-head reveal">
+      <span class="eyebrow" data-lang-zh>第一红线 · 无人工接管</span><span class="eyebrow" data-lang-en>Red line 01 · No human handoff</span>
+      <h2 class="h-section" data-lang-zh>客户永远只跟 AI 对话，<br>从不直接面对真人</h2>
+      <h2 class="h-section" data-lang-en>Customers only ever talk to the AI —<br>never directly to a human</h2>
+      <p class="lead" data-lang-zh>这是产品定位的最高约束。AI 遇到超出自身职权的事，会向幕后决策源（领导）请示、拿回结论，再用自己的口吻向客户转述——对话始终是 AI 在说，客户从不被「转接给人工」。</p>
+      <p class="lead" data-lang-en>This is the product's highest constraint. When something exceeds its mandate, the AI consults the behind-the-scenes principal, gets a verdict, and relays it to the customer in its own voice — the conversation is always the AI speaking, the customer is never "handed off to a human."</p>
+    </div>
+
+    <div class="rl-grid">
+      <div class="rl-card is-customer reveal">
+        <div class="rl-ico"><svg viewBox="0 0 24 24" fill="none"><circle cx="12" cy="8" r="4" stroke="currentColor" stroke-width="1.8"/><path d="M4 21c0-4 3.6-7 8-7s8 3 8 7" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg></div>
+        <h4 data-lang-zh>客户侧：始终面对同一个 AI</h4><h4 data-lang-en>Customer side: always the same AI</h4>
+        <p data-lang-zh>无论问题简单还是棘手，客户收到的永远是同一个 AI 的口吻与人格，没有「正在为您转接」、没有突然换人。等待期间的占位回复也不含任何转接类措辞。</p>
+        <p data-lang-en>Simple or thorny, the customer always meets the same AI voice and persona — no "transferring you now," no sudden human. Even the holding reply contains no handoff wording.</p>
+        <div class="rl-code" data-lang-zh>占位回复：「这个我帮你确认一下，稍等我给你准信。」</div>
+        <div class="rl-code" data-lang-en>Holding reply: "Let me confirm this for you — back shortly with a definite answer."</div>
+      </div>
+
+      <div class="rl-card is-principal reveal reveal-d1">
+        <div class="rl-ico"><svg viewBox="0 0 24 24" fill="none"><path d="M5 7h14M5 12h9M5 17h6" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/><circle cx="18" cy="15" r="3" stroke="currentColor" stroke-width="1.8"/></svg></div>
+        <h4 data-lang-zh>幕后：AI 向领导请示，拿回结论</h4><h4 data-lang-en>Behind the scenes: AI consults, gets a verdict</h4>
+        <p data-lang-zh>超出职权的事项进入请示通道，由真人决策源拍板。结论回到 AI 手里，AI 再以第一人称转述给客户。决策源在幕后，客户看不到、也不与之对话。</p>
+        <p data-lang-en>Out-of-mandate matters enter the escalation channel where a human principal decides. The verdict returns to the AI, which relays it first-person to the customer. The principal stays backstage — unseen, never in the chat.</p>
+        <div class="rl-code">relay_principal_decision_to_customer()</div>
+      </div>
+
+      <div class="rl-card is-assist reveal reveal-d2">
+        <div class="rl-ico"><svg viewBox="0 0 24 24" fill="none"><rect x="3" y="5" width="18" height="14" rx="2" stroke="currentColor" stroke-width="1.8"/><circle cx="9" cy="11" r="2.2" stroke="currentColor" stroke-width="1.7"/><path d="M5.5 16c.6-1.8 2-2.6 3.5-2.6s2.9.8 3.5 2.6M15 10h4M15 13.5h3" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></svg></div>
+        <span class="rl-flag" data-lang-zh>受控例外 · 默认关闭</span><span class="rl-flag" data-lang-en>Controlled exception · off by default</span>
+        <h4 data-lang-zh>辅助模式：AI 主动递上真人名片</h4><h4 data-lang-en>Assist mode: AI hands over a human card</h4>
+        <p data-lang-zh>仅当账号显式开启「辅助模式」、且 AI 判定客户契合引荐条件时，AI 才主动把真人顾问的名片推给客户。这仍是 AI 发起的动作，全自治模式（默认）下「只跟 AI 对话」一字不动。</p>
+        <p data-lang-en>Only when an account opts into "assist mode" and the AI judges the customer fits referral conditions does it proactively push a human advisor's card. Still an AI-initiated action; the default autonomous mode's "only talk to AI" stays untouched.</p>
+        <div class="rl-code" data-lang-zh>台前顾问 ≠ 幕后决策源（两者解耦）</div>
+        <div class="rl-code" data-lang-en>Front-stage advisor ≠ behind-scenes principal</div>
+      </div>
+    </div>
+
+    <!-- AI 内部状态名 -->
+    <div class="status-band reveal">
+      <div class="sb-head">
+        <h3 data-lang-zh>连「暂缓」都用 AI 自治的措辞</h3><h3 data-lang-en>Even "hold" uses autonomous wording</h3>
+        <p data-lang-zh>当一条消息没能发出，系统记录的状态名是 AI 内部语义，而不是「转人工」。这些字符串是闭集白名单，写入未知状态会在数据库层被拒。</p>
+        <p data-lang-en>When a message can't send, the recorded status is AI-internal semantics, never "to a human." These strings are a closed allowlist; unknown values are rejected at the DB write site.</p>
+      </div>
+      <div class="sb-chips">
+        <span class="sb-chip"><code>held_by_ai_policy</code><span data-lang-zh>AI 策略主动暂缓</span><span data-lang-en>AI policy hold</span></span>
+        <span class="sb-chip"><code>blocked_by_safety_guard</code><span data-lang-zh>安全门拦截</span><span data-lang-en>Safety-guard block</span></span>
+        <span class="sb-chip"><code>ai_waiting_for_more_context</code><span data-lang-zh>AI 等待更多上下文</span><span data-lang-en>Awaiting more context</span></span>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ============ 五道发送闸门 ============ -->
+<section class="section section-tint" id="gates">
+  <div class="wrap">
+    <div class="s-head reveal">
+      <span class="eyebrow" data-lang-zh>发送闸门 · 五道检查</span><span class="eyebrow" data-lang-en>Send gates · five checks</span>
+      <h2 class="h-section" data-lang-zh>每一条消息，<span class="text-grad">过闸才发得出去</span></h2>
+      <h2 class="h-section" data-lang-en>Every message passes <span class="text-grad">the gates before it sends</span></h2>
+      <p class="lead" data-lang-zh>独立评审 Agent 会对回复打分。两类指标超标直接拦截、不送出；三类指标先触发一次改写，改写后仍不达标才落 hold。阈值是行业画像可覆盖的配置，下方为默认销售画像的取值。</p>
+      <p class="lead" data-lang-en>An independent review agent scores each reply. Two metrics block outright; three trigger a single rewrite first, and only block if still failing after. Thresholds are profile-overridable; below are the default sales-profile values.</p>
+    </div>
+
+    <div class="gate-cols">
+      <!-- 硬拦截 -->
+      <div class="gate-col reveal">
+        <div class="gc-label is-hard"><span class="gc-dot"></span><span data-lang-zh>硬拦截 · 直接不送出</span><span data-lang-en>Hard block · never sends</span></div>
+        <div class="gate-row">
+          <div class="gr-top"><span class="gr-name" data-lang-zh>事实风险</span><span class="gr-name" data-lang-en>Fact risk</span><span class="gr-act block">block</span></div>
+          <div class="gr-metric">FactRisk &nbsp;≥&nbsp; 6</div>
+          <p data-lang-zh>幻觉 / 事实风险评分达到 6 即拦截，不给改写机会，杜绝 AI 编造事实发出去。</p>
+          <p data-lang-en>A hallucination/fact-risk score of 6 blocks immediately — no rewrite — so the AI never sends fabricated facts.</p>
+        </div>
+        <div class="gate-row">
+          <div class="gr-top"><span class="gr-name" data-lang-zh>产品准确性</span><span class="gr-name" data-lang-en>Product accuracy</span><span class="gr-act block">block</span></div>
+          <div class="gr-metric">ProductAccuracy &nbsp;&lt;&nbsp; 7</div>
+          <p data-lang-zh>含产品声明的发送，准确性低于 7 直接拦截；产品声明还必须有已验证知识支撑（见下一节）。</p>
+          <p data-lang-en>Product-claim sends below 7 are blocked; product claims must also be backed by verified knowledge (next section).</p>
+        </div>
+      </div>
+
+      <!-- 先改写一次 -->
+      <div class="gate-col reveal reveal-d1">
+        <div class="gc-label is-soft"><span class="gc-dot"></span><span data-lang-zh>先改写一次 · 不达标再拦</span><span data-lang-en>Rewrite once · then block</span></div>
+        <div class="gate-row">
+          <div class="gr-top"><span class="gr-name" data-lang-zh>拟人度</span><span class="gr-name" data-lang-en>Human-likeness</span><span class="gr-act rewrite">rewrite</span></div>
+          <div class="gr-metric">HumanLikeScore &nbsp;&lt;&nbsp; 6</div>
+          <p data-lang-zh>读起来不像真人在说话，先自动重写一次，让语气更自然。</p>
+          <p data-lang-en>If it doesn't read like a real person, rewrite once for a more natural tone.</p>
+        </div>
+        <div class="gate-row">
+          <div class="gr-top"><span class="gr-name" data-lang-zh>情感价值</span><span class="gr-name" data-lang-en>Emotional value</span><span class="gr-act rewrite">rewrite</span></div>
+          <div class="gr-metric">EmotionalValue &nbsp;&lt;&nbsp; 6</div>
+          <p data-lang-zh>缺乏情感价值、过于机械时，先重写一次补足温度。</p>
+          <p data-lang-en>Too mechanical or low on warmth — rewrite once to add it back.</p>
+        </div>
+        <div class="gate-row">
+          <div class="gr-top"><span class="gr-name" data-lang-zh>压力感</span><span class="gr-name" data-lang-en>Pressure</span><span class="gr-act rewrite">rewrite</span></div>
+          <div class="gr-metric">PressureRisk &nbsp;≥&nbsp; 7</div>
+          <p data-lang-zh>话术给客户的压力过大时，先重写一次降低逼单感；改写后仍超标才拦下。</p>
+          <p data-lang-en>If the wording pressures the customer too hard, rewrite once to ease it; only block if still failing.</p>
+        </div>
+      </div>
+    </div>
+    <p class="gate-foot reveal" data-lang-zh>评审通过的判定是「全闸通过才放行」。改写只发生一次，避免无限循环；改写后仍不达标的发送落入 hold 或 block，状态用前述 AI 内部语义记录。</p>
+    <p class="gate-foot reveal" data-lang-en>A reply ships only when all gates pass. Rewrite happens at most once to avoid loops; still-failing sends fall into hold or block, recorded with the AI-internal statuses above.</p>
+  </div>
+</section>
+
+<!-- ============ grounding：有据才说 ============ -->
+<section class="section section-deep" id="grounding">
+  <div class="hero-bg" aria-hidden="true"><div class="hero-glow" style="position:absolute;width:680px;height:680px;border-radius:50%;filter:blur(100px);opacity:.16;top:50%;left:50%;transform:translate(-50%,-50%);background:radial-gradient(circle,rgba(15,181,168,.42),transparent 72%)"></div></div>
+  <div class="wrap" style="position:relative">
+    <div class="s-head reveal">
+      <span class="eyebrow" data-lang-zh>知识红线 · 有据才说</span><span class="eyebrow" data-lang-en>Knowledge red line · grounded or silent</span>
+      <h2 class="h-section" data-lang-zh>产品声明，<span class="text-grad">必须有已验证知识背书</span></h2>
+      <h2 class="h-section" data-lang-en>Product claims must be <span class="text-grad">backed by verified knowledge</span></h2>
+      <p class="lead" data-lang-zh>AI 不能凭印象谈价格、谈功效、谈政策。任何产品声明都要能在知识库的已验证切片里找到依据，否则这条发送被直接拦截，状态记为未验证产品声明。</p>
+      <p class="lead" data-lang-en>The AI can't talk price, efficacy or policy from memory. Any product claim must trace to a verified slice in the knowledge base, or the send is blocked outright.</p>
+    </div>
+    <div class="ground-grid">
+      <div class="ground-card reveal">
+        <span class="gc-tag block" data-lang-zh>拦截</span><span class="gc-tag block" data-lang-en>Block</span>
+        <h4 data-lang-zh>无依据即拦截</h4><h4 data-lang-en>No backing, no send</h4>
+        <p data-lang-zh>产品声明若在 <code>operation_knowledge_chunks</code> 中找不到已验证支撑，且不是来自产品目录的报价，发送被拦下。</p>
+        <p data-lang-en>If a product claim has no verified backing in <code>operation_knowledge_chunks</code> and isn't a catalog-priced quote, the send is blocked.</p>
+        <div class="gc-state">final_review_status = "blocked_unverified_product_claim"</div>
+      </div>
+      <div class="ground-card reveal reveal-d1">
+        <span class="gc-tag ai" data-lang-zh>不自动核验</span><span class="gc-tag ai" data-lang-en>No self-verify</span>
+        <h4 data-lang-zh>AI 永不自动核验知识</h4><h4 data-lang-en>The AI never self-verifies</h4>
+        <p data-lang-zh>所有新摄入的知识——RSS、网页、PDF、图像识别——一律落 <code>draft</code> + 待核验状态，由人确认后才能成为发送依据。这条红线在每个摄入入口都成立。</p>
+        <p data-lang-en>All newly ingested knowledge — RSS, HTML, PDF, vision — lands as <code>draft</code> + needs-review, usable only after a human confirms. This holds at every ingestion entry.</p>
+        <div class="gc-state">status = "draft" · integrity_status = "needs_review"</div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ============ 信息信任层级 ============ -->
+<section class="section section-tint" id="trust-layers">
+  <div class="wrap">
+    <div class="s-head reveal">
+      <span class="eyebrow" data-lang-zh>信任红线 · 信息分层</span><span class="eyebrow" data-lang-en>Trust red line · tiered information</span>
+      <h2 class="h-section" data-lang-zh>人类录入的，AI <span class="text-grad">永远改不了</span>；<br>AI 自己猜的，<span class="text-grad">只用来记录</span></h2>
+      <h2 class="h-section" data-lang-en>What a human enters, the AI <span class="text-grad">can never change</span>;<br>what the AI guesses is <span class="text-grad">for the record only</span></h2>
+      <p class="lead" data-lang-zh>对客户的认知不是一锅炖。系统把信息按可信度物理分成三层：人类录入的标签 AI 绝对碰不到、坚信不疑；AI 确信的判断必须挂着消息证据；AI 自己逐轮猜测的信号只进观测台账，永远不允许驱动任何决策。这不是靠提示词自律，是写进代码、有契约测试守护的硬约束。</p>
+      <p class="lead" data-lang-en>Knowledge about a customer isn't one big soup. The system physically splits it into three tiers by trustworthiness: human-entered tags the AI can never touch and trusts absolutely; AI-confirmed judgments that must carry message evidence; and the AI's per-turn guesses, which only enter an observation ledger and are never allowed to drive any decision. This isn't prompt self-discipline — it's a hard constraint in code, guarded by contract tests.</p>
+    </div>
+
+    <div class="trust-tiers">
+
+      <div class="tier-row is-human reveal">
+        <div class="tier-rank">
+          <span class="tr-no">01</span>
+          <span class="tr-ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9"><path d="M12 3l7 3v5c0 4-3 7-7 8-4-1-7-4-7-8V6l7-3z"/><path d="M9.5 12l1.8 1.8 3.5-3.6" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+        </div>
+        <div class="tier-main">
+          <div class="tm-head"><h4 data-lang-zh>人类权威层</h4><h4 data-lang-en>Human authority tier</h4><span class="tier-field">manual_tags</span></div>
+          <p data-lang-zh>运营手动录入的标签。AI 的所有写路径都触达不到这个字段——压缩归并、重新判断，统统绕开它。这是人类对客户的判断，AI 坚信不疑、原样带进决策，永远不会被 AI 覆盖或"优化"。</p>
+          <p data-lang-en>Tags an operator enters by hand. None of the AI's write paths can reach this field — consolidation and re-judgment all bypass it. This is the human's read on the customer: the AI trusts it unconditionally, carries it verbatim into decisions, and can never overwrite or "optimize" it.</p>
+          <div class="tier-attrs">
+            <span class="tier-attr lock"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="5" y="11" width="14" height="9" rx="2"/><path d="M8 11V8a4 4 0 0 1 8 0v3" stroke-linecap="round"/></svg><span data-lang-zh>仅人类可写 · AI 永不触达</span><span data-lang-en>Human-only · AI never writes</span></span>
+            <span class="tier-attr drive-yes"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><path d="M5 12l5 5 9-11" stroke-linecap="round" stroke-linejoin="round"/></svg><span data-lang-zh>驱动决策</span><span data-lang-en>Drives decisions</span></span>
+          </div>
+        </div>
+      </div>
+
+      <div class="tier-row is-confirmed reveal reveal-d1">
+        <div class="tier-rank">
+          <span class="tr-no">02</span>
+          <span class="tr-ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9"><path d="M9 11l2 2 4-4" stroke-linecap="round" stroke-linejoin="round"/><path d="M12 3l7 3v5c0 4-3 7-7 8-4-1-7-4-7-8V6l7-3z" opacity=".45"/></svg></span>
+        </div>
+        <div class="tier-main">
+          <div class="tm-head"><h4 data-lang-zh>AI 确信层</h4><h4 data-lang-en>AI-confirmed tier</h4><span class="tier-field">confirmed_tags</span></div>
+          <p data-lang-zh>AI 经过压缩重判或强证据快通道确信的标签。每一条都必须挂着具体的消息证据——找不到能锚定的原始消息，这条标签直接丢弃。它会进决策，但门槛是"拿得出依据"，而不是 AI 随口一说。</p>
+          <p data-lang-en>Tags the AI is confident in, via consolidation re-judgment or a strong-evidence fast path. Each must carry concrete message evidence — if no anchoring source message is found, the tag is discarded. It feeds decisions, but the bar is "can show its receipts," not the AI's say-so.</p>
+          <div class="tier-attrs">
+            <span class="tier-attr evidence"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M7 8h10M7 12h10M7 16h6" stroke-linecap="round"/></svg><span data-lang-zh>每条必挂消息证据 · 锚不上即丢弃</span><span data-lang-en>Message evidence required · dropped if unanchored</span></span>
+            <span class="tier-attr drive-yes"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><path d="M5 12l5 5 9-11" stroke-linecap="round" stroke-linejoin="round"/></svg><span data-lang-zh>驱动决策</span><span data-lang-en>Drives decisions</span></span>
+          </div>
+        </div>
+      </div>
+
+      <div class="tier-row is-observed reveal reveal-d2">
+        <div class="tier-rank">
+          <span class="tr-no">03</span>
+          <span class="tr-ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9"><path d="M2.5 12S6 5 12 5s9.5 7 9.5 7-3.5 7-9.5 7-9.5-7-9.5-7z"/><circle cx="12" cy="12" r="2.5"/></svg></span>
+        </div>
+        <div class="tier-main">
+          <div class="tm-head"><h4 data-lang-zh>AI 暂定观测层</h4><h4 data-lang-en>AI observation tier</h4><span class="tier-field">bayesian_signals · tag_observation · personality_profile</span></div>
+          <p data-lang-zh>AI 逐轮的猜测与人格画像——证据还不够硬、置信还不够高的判断。它们只写进观测台账，是给运营看走势的辅助工具。铁律是：永不进入任何 planner 过滤、状态机、选材或触达门。代码里有一条专门的契约测试守着这条线，防止哪天有人手滑让它驱动行为。</p>
+          <p data-lang-en>The AI's per-turn guesses and personality profile — judgments whose evidence isn't hard enough or confidence high enough. They only enter an observation ledger, an aid for operators to watch trends. The iron rule: they never enter any planner filter, state machine, selection or outreach gate. A dedicated contract test in the code guards this line, so no one can accidentally let them drive behavior.</p>
+          <div class="tier-attrs">
+            <span class="tier-attr drive-no"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M5 12h14" stroke-linecap="round"/></svg><span data-lang-zh>只记录 · 永不驱动行为</span><span data-lang-en>Record only · never drives behavior</span></span>
+            <span class="tier-attr"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 8v5l3 2" stroke-linecap="round" stroke-linejoin="round"/><circle cx="12" cy="12" r="8.5"/></svg><span data-lang-zh>契约测试守护</span><span data-lang-en>Guarded by a contract test</span></span>
+          </div>
+        </div>
+      </div>
+
+    </div>
+
+    <div class="trust-laws">
+      <div class="law-card reveal">
+        <div class="lc-ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9"><rect x="5" y="11" width="14" height="9" rx="2"/><path d="M8 11V8a4 4 0 0 1 8 0v3" stroke-linecap="round"/></svg></div>
+        <div>
+          <h5 data-lang-zh>铁律一：AI 改不动人类的判断</h5><h5 data-lang-en>Law 1: the AI can't alter the human's call</h5>
+          <p data-lang-zh>人类权威层与 AI 确信层在存储上物理分家，写在不同字段。AI 的压缩重判只能 replace 自己那层，对 <code>manual_tags</code> 连写权限都没有。</p>
+          <p data-lang-en>The human-authority and AI-confirmed tiers are physically separated into different fields. The AI's re-judgment can only replace its own tier — it holds no write access to <code>manual_tags</code> at all.</p>
+        </div>
+      </div>
+      <div class="law-card is-record reveal reveal-d1">
+        <div class="lc-ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9"><path d="M4 5h16M4 12h16M4 19h10" stroke-linecap="round"/></svg></div>
+        <div>
+          <h5 data-lang-zh>铁律二：猜测只记录，不决策</h5><h5 data-lang-en>Law 2: guesses are logged, not acted on</h5>
+          <p data-lang-zh>贝叶斯信号、人格画像这类 AI 自评，写进台账供观察，但永不接入任何决策路径。<code>bayesian_and_personality_do_not_affect_planner_filters</code> 测试守着这条不变量。</p>
+          <p data-lang-en>AI self-assessments like Bayesian signals and personality profiles are logged for observation but never wired into any decision path. The test <code>bayesian_and_personality_do_not_affect_planner_filters</code> guards this invariant.</p>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ============ 可审计性 ============ -->
+<section class="section" id="audit">
+  <div class="wrap">
+    <div class="s-head reveal">
+      <span class="eyebrow" data-lang-zh>可审计性 · 全程留痕</span><span class="eyebrow" data-lang-en>Auditability · full trail</span>
+      <h2 class="h-section" data-lang-zh>每一次决策、调用、发送，<span class="text-grad">都查得到</span></h2>
+      <h2 class="h-section" data-lang-en>Every decision, call and send <span class="text-grad">is traceable</span></h2>
+      <p class="lead" data-lang-zh>系统不是黑箱。从模型调用到最终发送，四类留痕构成完整审计链，配上幂等键防重发、异常降级而非崩溃。出了问题能复盘到具体哪一步。</p>
+      <p class="lead" data-lang-en>Not a black box. From model call to final send, four trails form a complete audit chain — with idempotency keys against double-sends and graceful degradation instead of crashes.</p>
+    </div>
+    <div class="audit-grid">
+      <div class="audit-card reveal">
+        <div class="ac-key">agent_run_logs</div>
+        <h4 data-lang-zh>运行日志</h4><h4 data-lang-en>Run logs</h4>
+        <p data-lang-zh>每一次 Agent 运行的完整信封：触发来源、决策、评审、所用提示词版本与最终结果。</p>
+        <p data-lang-en>The full envelope of each agent run: trigger, decision, review, prompt versions used and final outcome.</p>
+      </div>
+      <div class="audit-card reveal reveal-d1">
+        <div class="ac-key">llm_call_logs</div>
+        <h4 data-lang-zh>模型调用日志</h4><h4 data-lang-en>LLM call logs</h4>
+        <p data-lang-zh>每次模型调用留痕，状态四态可分：<code>success</code> / <code>cache_hit</code> / <code>failed</code> / <code>json_error</code>，并累计 token 用量。</p>
+        <p data-lang-en>Every model call recorded across four states: <code>success</code> / <code>cache_hit</code> / <code>failed</code> / <code>json_error</code>, with token usage tallied.</p>
+      </div>
+      <div class="audit-card reveal reveal-d2">
+        <div class="ac-key">events</div>
+        <h4 data-lang-zh>审计事件</h4><h4 data-lang-en>Audit events</h4>
+        <p data-lang-zh>关键动作落审计事件，例如非法状态跃迁会发 <code>agent.operation_state_transition_rejected</code>，带前后状态详情。</p>
+        <p data-lang-en>Key actions emit audit events — e.g. an illegal state transition emits <code>agent.operation_state_transition_rejected</code> with before/after detail.</p>
+      </div>
+      <div class="audit-card reveal reveal-d3">
+        <div class="ac-key">agent_send_outbox</div>
+        <h4 data-lang-zh>发送 Outbox</h4><h4 data-lang-en>Send outbox</h4>
+        <p data-lang-zh>批准的发送先落 outbox、带幂等键 <code>idempotency_key</code>，再调 MCP 发送；客户拒绝或冷却会取消待发条目，杜绝重发。</p>
+        <p data-lang-en>Approved sends hit the outbox with an <code>idempotency_key</code> before the MCP call; rejection or cooldown cancels pending entries — no double-sends.</p>
+      </div>
+    </div>
+
+    <!-- fail-soft -->
+    <div class="fs-band reveal">
+      <div class="fs-head">
+        <span class="fs-eyebrow" data-lang-zh>失败软着陆</span><span class="fs-eyebrow" data-lang-en>Fail-soft</span>
+        <h3 data-lang-zh>异常不崩溃，降级兜底</h3><h3 data-lang-en>Faults degrade, not crash</h3>
+      </div>
+      <div class="fs-grid">
+        <div class="fs-card">
+          <h5 data-lang-zh>非法状态跃迁</h5><h5 data-lang-en>Illegal state transition</h5>
+          <p data-lang-zh>消息已发出后若状态机判定跃迁非法，不回滚已发送内容——跳过 operation_state 写入、保留旧状态，并发审计事件留痕。</p>
+          <p data-lang-en>If the state machine rejects a transition after a message is already sent, it doesn't roll back the send — it skips the operation_state write, keeps the old state, and emits an audit event.</p>
+        </div>
+        <div class="fs-card">
+          <h5 data-lang-zh>运行预算超限</h5><h5 data-lang-en>Run budget exceeded</h5>
+          <p data-lang-zh>每次运行有 token 与调用预算（默认 30000 token / 6 次模型调用）。超限走本地降级（如本地评审、跳过改写），绝不把 5xx 抛给 Webhook 调用方。</p>
+          <p data-lang-en>Each run has a token and call budget (default 30000 tokens / 6 model calls). Exceeding it triggers local fallback (local review, skip rewrite) — never a 5xx to the webhook caller.</p>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ============ 隔离红线 ============ -->
+<section class="section section-tint" id="isolation">
+  <div class="wrap">
+    <div class="s-head reveal">
+      <span class="eyebrow" data-lang-zh>隔离红线 · 双键边界</span><span class="eyebrow" data-lang-en>Isolation · double-key boundary</span>
+      <h2 class="h-section" data-lang-zh>租户与账号，<span class="text-grad">查询时双键校验</span></h2>
+      <h2 class="h-section" data-lang-en>Tenant and account, <span class="text-grad">checked on every query</span></h2>
+      <p class="lead" data-lang-zh>多租户与多微信号下，数据边界靠两把键守住。敏感查询一律带上归属键，从不信任请求体传入的边界字段，杜绝越权访问。</p>
+      <p class="lead" data-lang-en>Across tenants and WeChat accounts, two keys guard the data boundary. Sensitive queries always carry the ownership key and never trust a boundary field from the request body — closing off cross-boundary access.</p>
+    </div>
+    <div class="iso-grid">
+      <div class="iso-card ws reveal">
+        <div class="iso-key">workspace_id</div>
+        <h3 data-lang-zh>租户边界</h3><h3 data-lang-en>Tenant boundary</h3>
+        <p data-lang-zh>联系人、产品、名片等查询按 <code>_id + workspace_id</code> 双条件过滤；workspace 锁定在服务端解析，不接受请求体传入，从源头堵住跨租户越权（IDOR）。</p>
+        <p data-lang-en>Contacts, products and cards are filtered by <code>_id + workspace_id</code>; the workspace is resolved server-side, never from the request body — closing IDOR at the source.</p>
+        <div class="iso-meta"><span data-lang-zh>画像隔离</span><span data-lang-en>Profile isolation</span><span data-lang-zh>知识隔离</span><span data-lang-en>Knowledge isolation</span><span data-lang-zh>防越权</span><span data-lang-en>Anti-IDOR</span></div>
+      </div>
+      <div class="iso-card acct reveal reveal-d1">
+        <div class="iso-key">account_id</div>
+        <h3 data-lang-zh>账号边界</h3><h3 data-lang-en>Account boundary</h3>
+        <p data-lang-zh>单个微信号的态势独立：审计事件、调用日志、当日发送软上限都按 <code>account_id</code> 归集与限流，多账号互不串扰。</p>
+        <p data-lang-en>Each WeChat account stands alone: audit events, call logs and the daily send soft-cap are all keyed and throttled by <code>account_id</code> — no cross-account bleed.</p>
+        <div class="iso-meta"><span data-lang-zh>账号调度</span><span data-lang-en>Scheduling</span><span data-lang-zh>独立态势</span><span data-lang-en>Own posture</span><span data-lang-zh>发送限流</span><span data-lang-en>Send throttle</span></div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ============ CI 门禁 ============ -->
+<section class="section section-deep" id="ci">
+  <div class="wrap">
+    <div class="s-head reveal">
+      <span class="eyebrow" data-lang-zh>CI 门禁 · 红线不靠自觉</span><span class="eyebrow" data-lang-en>CI guards · not on the honor system</span>
+      <h2 class="h-section" data-lang-zh>每一次提交，<span class="text-grad">都被门禁扫一遍</span></h2>
+      <h2 class="h-section" data-lang-en>Every commit is <span class="text-grad">scanned at the gate</span></h2>
+      <p class="lead" data-lang-zh>红线不只写在文档里，还固化成两道合并门禁：一道在字符串层面守住「无人工接管」措辞，一道守住测试基线不退化。任一不过，合并被拒。</p>
+      <p class="lead" data-lang-en>Red lines aren't just docs — they're two merge gates: one guards the "no handoff" wording at the string level, one keeps the test baseline from regressing. Fail either, and the merge is rejected.</p>
+    </div>
+    <div class="ci-grid">
+      <div class="ci-card reveal">
+        <div class="ci-file">check-no-human-takeover</div>
+        <h4 data-lang-zh>措辞门禁</h4><h4 data-lang-en>Wording guard</h4>
+        <p data-lang-zh>扫描 <code>src/agent</code> / <code>src/routes</code> / <code>src/evolution</code> / <code>frontend/src</code> 新增代码行，命中「接管 / takeover / hand-off / 人工」等禁用词即失败。强制使用 AI 自治措辞，不留侥幸。</p>
+        <p data-lang-en>Scans newly added lines under <code>src/agent</code> / <code>src/routes</code> / <code>src/evolution</code> / <code>frontend/src</code>; any forbidden word (takeover / hand-off / 人工 …) fails the build. Autonomous wording is mandatory.</p>
+        <div class="ci-meta"><span data-lang-zh>只扫新增行</span><span data-lang-en>Added lines only</span><span data-lang-zh>大小写不敏感</span><span data-lang-en>Case-insensitive</span></div>
+      </div>
+      <div class="ci-card reveal reveal-d1">
+        <div class="ci-file">check-baseline</div>
+        <h4 data-lang-zh>基线门禁</h4><h4 data-lang-en>Baseline guard</h4>
+        <p data-lang-zh>单元测试 <code>cargo test --lib</code> 须 ≥ 350 通过、0 失败；四个属性测试文件累计须 ≥ 33 通过、0 失败。新工作只能加测试，不能拉低基线。</p>
+        <p data-lang-en>Unit tests <code>cargo test --lib</code> must pass ≥ 350 with 0 failures; four property-test files must cumulatively pass ≥ 33 with 0 failures. New work adds tests — never lowers the bar.</p>
+        <div class="ci-meta"><span class="ci-num">≥350</span><span data-lang-zh>lib 通过</span><span data-lang-en>lib passed</span><span class="ci-num">≥33</span><span data-lang-zh>PBT 累计</span><span data-lang-en>PBT total</span></div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ============ 结尾 CTA ============ -->
+<section class="section cta-band">
+  <div class="hero-bg" aria-hidden="true"><div class="hero-glow hero-glow-1" style="position:absolute;width:560px;height:560px;border-radius:50%;filter:blur(90px);opacity:.4;top:-160px;left:-80px;background:radial-gradient(circle,rgba(94,92,230,.5),transparent 68%)"></div></div>
+  <div class="wrap cta-inner reveal" style="text-align:center;max-width:720px;margin:0 auto;position:relative">
+    <h2 class="h-section" data-lang-zh>红线之上，是<span class="text-grad">可以放心交付的自治</span></h2>
+    <h2 class="h-section" data-lang-en>On top of red lines, <span class="text-grad">autonomy you can trust to ship</span></h2>
+    <p class="lead" data-lang-zh>约束越清晰，自治越敢放手。看看这套规则如何落在统一网关与自我演化的工程实现里。</p>
+    <p class="lead" data-lang-en>The clearer the constraints, the bolder the autonomy. See how these rules land in the gateway and the self-evolution engine.</p>
+    <div class="hero-cta" style="justify-content:center;margin-top:8px">
+      <a href="technology.html" class="btn btn-primary"><span data-lang-zh>看技术架构</span><span data-lang-en>See the architecture</span><svg viewBox="0 0 24 24" fill="none"><path d="M5 12h14M13 6l6 6-6 6" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></a>
+      <a href="product.html" class="btn btn-ghost"><span data-lang-zh>看产品能力</span><span data-lang-en>Product capabilities</span></a>
+    </div>
+  </div>
+</section>
+
+<!-- ============ 页脚 ============ -->
+<footer class="footer">
+  <div class="wrap">
+    <div class="footer-grid">
+      <div class="footer-brand">
+        <a href="index.html" class="brand"><span class="brand-mark"><svg viewBox="0 0 64 64" fill="none"><path fill="#fff" fill-rule="evenodd" clip-rule="evenodd" d="M18.5 7 H45.5 Q57.5 7 57.5 19 V33 Q57.5 45 45.5 45 H24 L13 57 V44.4 Q6.5 43 6.5 33 V19 Q6.5 7 18.5 7 Z M14 15.5 L20.2 38 L31 23 L33 23 L43.8 38 L50 15.5 L44.3 15.5 L40.4 31 L33.4 21 L30.6 21 L23.6 31 L19.7 15.5 Z M47 6.1 C47 12.02 46 13.5 42 13.5 C46 13.5 47 14.98 47 20.9 C47 14.98 48 13.5 52 13.5 C48 13.5 47 12.02 47 6.1 Z"/></svg></span>WeAgent</a>
+        <p data-lang-zh>全自治微信私域 AI 运营系统。客户永远只跟 AI 对话，AI 像真人一样长期经营每一段关系。</p>
+        <p data-lang-en>The autonomous WeChat private-domain AI operator. Customers only ever talk to the AI, which nurtures every relationship over time.</p>
+        <button class="wx-copy" data-wx="agimeme" type="button">
+          <svg viewBox="0 0 24 24" fill="none"><path d="M8.5 14.5c-3 0-5.5-2-5.5-4.6C3 7 5.8 5 9 5s6 2 6 4.9c0 .5-.1 1-.3 1.5M16 19c2.2 0 4-1.4 4-3.3 0-1.9-1.8-3.4-4-3.4s-4 1.5-4 3.4c0 .6.2 1.2.6 1.7L12 19l1.6-.5c.7.3 1.5.5 2.4.5z" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          <span data-lang-zh>顾问微信 <span class="wx-id">agimeme</span></span><span data-lang-en>WeChat <span class="wx-id">agimeme</span></span>
+          <span class="wx-hint" data-lang-zh>点击复制</span><span class="wx-hint" data-lang-en>tap to copy</span>
+        </button>
+      </div>
+      <div>
+        <h5 data-lang-zh>产品</h5><h5 data-lang-en>Product</h5>
+        <div class="footer-links">
+          <a href="solutions.html" data-lang-zh>解决什么问题</a><a href="solutions.html" data-lang-en>What it solves</a>
+          <a href="product.html" data-lang-zh>产品能力</a><a href="product.html" data-lang-en>Product</a>
+          <a href="agents.html" data-lang-zh>智能体编队</a><a href="agents.html" data-lang-en>Agents</a>
+          <a href="scenarios.html" data-lang-zh>行业场景</a><a href="scenarios.html" data-lang-en>Scenarios</a>
+          <a href="product.html#channels" data-lang-zh>管理频道</a><a href="product.html#channels" data-lang-en>Channels</a>
+        </div>
+      </div>
+      <div>
+        <h5 data-lang-zh>技术</h5><h5 data-lang-en>Technology</h5>
+        <div class="footer-links">
+          <a href="technology.html" data-lang-zh>技术架构</a><a href="technology.html" data-lang-en>Architecture</a>
+          <a href="technology.html#gateway" data-lang-zh>统一网关</a><a href="technology.html#gateway" data-lang-en>The gateway</a>
+          <a href="engineering.html" data-lang-zh>工程深度</a><a href="engineering.html" data-lang-en>Engineering depth</a>
+          <a href="evolution.html" data-lang-zh>自我演化</a><a href="evolution.html" data-lang-en>Self-evolution</a>
+        </div>
+      </div>
+      <div>
+        <h5 data-lang-zh>信任</h5><h5 data-lang-en>Trust</h5>
+        <div class="footer-links">
+          <a href="observability.html" data-lang-zh>运营透视</a><a href="observability.html" data-lang-en>Observability</a>
+          <a href="trust.html" data-lang-zh>信任与安全</a><a href="trust.html" data-lang-en>Trust & safety</a>
+          <a href="trust.html#redlines" data-lang-zh>红线与守门</a><a href="trust.html#redlines" data-lang-en>Hard lines</a>
+          <a href="trust.html#audit" data-lang-zh>可审计性</a><a href="trust.html#audit" data-lang-en>Auditability</a>
+        </div>
+      </div>
+    </div>
+    <div class="footer-bottom">
+      <span>© 2026 WeAgent · <span data-lang-zh>私域自主运营</span><span data-lang-en>Autonomous private-domain operations</span></span>
+      <span data-lang-zh>构建于 2026-06-28 · 由 Claude Code 根据项目代码生成 · by opus-4.8 · 11 万行 Rust 代码 · 比例 100%</span><span data-lang-en>Built 2026-06-28 · generated by Claude Code from the project codebase · by opus-4.8 · 110k+ lines of Rust · 100% generated</span>
+      <span data-lang-zh>Rust · Axum · MongoDB · React · MCP</span>
+      <span data-lang-en>Built with Rust · Axum · MongoDB · React · MCP</span>
+    </div>
+  </div>
+</footer>
+
+<script src="assets/i18n.js"></script>
+<script src="assets/shared.js"></script>
+</body>
+</html>

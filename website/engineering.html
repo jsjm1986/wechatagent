@@ -1,0 +1,448 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title data-zh="工程深度 · WeAgent" data-en="Engineering depth · WeAgent">工程深度 · WeAgent</title>
+<meta name="description" content="WeAgent 的工程深度：当大模型会胡说、网络会抖动、进程会崩溃、客户不能被打扰，我们用什么样的工程把这些都接住。三层 JSON 鲁棒解析、tool_use 劫持检测、合成幂等键防重发、崩溃后送达核对、知识召回自进化、记忆乐观并发、Run Envelope 崩溃不丢记录——每一条都对应真实 Rust 代码里的函数与行号。">
+<link rel="canonical" href="https://weagent.example.com/engineering.html">
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="WeAgent">
+<meta property="og:locale" content="zh_CN">
+<meta property="og:locale:alternate" content="en_US">
+<meta property="og:title" content="工程深度 · WeAgent">
+<meta property="og:description" content="真正的难度不在能聊，在靠得住。三层 JSON 鲁棒解析、幂等防重发、崩溃后送达核对、知识自进化、记忆乐观并发、崩溃不丢记录——每一条都对应真实 Rust 代码的函数与行号。">
+<meta property="og:url" content="https://weagent.example.com/engineering.html">
+<meta property="og:image" content="https://weagent.example.com/assets/og-cover.png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="WeAgent — 全自治微信私域 AI 运营">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="工程深度 · WeAgent">
+<meta name="twitter:description" content="真正的难度不在能聊，在靠得住——每一条都对应真实 Rust 代码的函数与行号。">
+<meta name="twitter:image" content="https://weagent.example.com/assets/og-cover.png">
+<link rel="stylesheet" href="assets/shared.css">
+<link rel="stylesheet" href="assets/engineering.css">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='18' fill='%235E5CE6'/%3E%3Cpath fill='%23fff' fill-rule='evenodd' clip-rule='evenodd' d='M18.5 7 H45.5 Q57.5 7 57.5 19 V33 Q57.5 45 45.5 45 H24 L13 57 V44.4 Q6.5 43 6.5 33 V19 Q6.5 7 18.5 7 Z M14 15.5 L20.2 38 L31 23 L33 23 L43.8 38 L50 15.5 L44.3 15.5 L40.4 31 L33.4 21 L30.6 21 L23.6 31 L19.7 15.5 Z M47 6.1 C47 12.02 46 13.5 42 13.5 C46 13.5 47 14.98 47 20.9 C47 14.98 48 13.5 52 13.5 C48 13.5 47 12.02 47 6.1 Z'/%3E%3C/svg%3E">
+</head>
+<body>
+
+<!-- ============ 导航 ============ -->
+<nav class="nav">
+  <div class="wrap nav-inner">
+    <a href="index.html" class="brand">
+      <span class="brand-mark"><svg viewBox="0 0 64 64" fill="none"><path fill="#fff" fill-rule="evenodd" clip-rule="evenodd" d="M18.5 7 H45.5 Q57.5 7 57.5 19 V33 Q57.5 45 45.5 45 H24 L13 57 V44.4 Q6.5 43 6.5 33 V19 Q6.5 7 18.5 7 Z M14 15.5 L20.2 38 L31 23 L33 23 L43.8 38 L50 15.5 L44.3 15.5 L40.4 31 L33.4 21 L30.6 21 L23.6 31 L19.7 15.5 Z M47 6.1 C47 12.02 46 13.5 42 13.5 C46 13.5 47 14.98 47 20.9 C47 14.98 48 13.5 52 13.5 C48 13.5 47 12.02 47 6.1 Z"/></svg></span>
+      WeAgent
+    </a>
+    <div class="nav-links">
+      <a href="index.html" data-lang-zh>首页</a><a href="index.html" data-lang-en>Home</a>
+      <a href="solutions.html" data-lang-zh>解决什么</a><a href="solutions.html" data-lang-en>Solutions</a>
+      <a href="product.html" data-lang-zh>产品能力</a><a href="product.html" data-lang-en>Product</a>
+      <a href="agents.html" data-lang-zh>智能体编队</a><a href="agents.html" data-lang-en>Agents</a>
+      <a href="technology.html" data-lang-zh>技术架构</a><a href="technology.html" data-lang-en>Technology</a>
+      <a href="engineering.html" class="active" data-lang-zh>工程深度</a><a href="engineering.html" class="active" data-lang-en>Engineering</a>
+      <a href="evolution.html" data-lang-zh>自我演化</a><a href="evolution.html" data-lang-en>Self-evolution</a>
+      <a href="scenarios.html" data-lang-zh>行业场景</a><a href="scenarios.html" data-lang-en>Scenarios</a>
+      <a href="observability.html" data-lang-zh>运营透视</a><a href="observability.html" data-lang-en>Observability</a>
+      <a href="trust.html" data-lang-zh>信任与安全</a><a href="trust.html" data-lang-en>Trust</a>
+    </div>
+    <div class="nav-right">
+      <div class="lang-toggle">
+        <button data-lang-btn="zh">中</button>
+        <button data-lang-btn="en">EN</button>
+      </div>
+      <button class="nav-burger" aria-label="menu"><svg viewBox="0 0 24 24" width="22" height="22" fill="none"><path d="M4 7h16M4 12h16M4 17h16" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg></button>
+    </div>
+  </div>
+</nav>
+<div class="mobile-menu">
+  <a href="index.html" data-lang-zh>首页</a><a href="index.html" data-lang-en>Home</a>
+  <a href="solutions.html" data-lang-zh>解决什么</a><a href="solutions.html" data-lang-en>Solutions</a>
+  <a href="product.html" data-lang-zh>产品能力</a><a href="product.html" data-lang-en>Product</a>
+  <a href="agents.html" data-lang-zh>智能体编队</a><a href="agents.html" data-lang-en>Agents</a>
+  <a href="technology.html" data-lang-zh>技术架构</a><a href="technology.html" data-lang-en>Technology</a>
+  <a href="engineering.html" data-lang-zh>工程深度</a><a href="engineering.html" data-lang-en>Engineering</a>
+  <a href="evolution.html" data-lang-zh>自我演化</a><a href="evolution.html" data-lang-en>Self-evolution</a>
+  <a href="scenarios.html" data-lang-zh>行业场景</a><a href="scenarios.html" data-lang-en>Scenarios</a>
+  <a href="observability.html" data-lang-zh>运营透视</a><a href="observability.html" data-lang-en>Observability</a>
+  <a href="trust.html" data-lang-zh>信任与安全</a><a href="trust.html" data-lang-en>Trust</a>
+</div>
+
+<!-- ============ 页内英雄 ============ -->
+<header class="page-hero section-deep">
+  <div class="page-hero-bg" aria-hidden="true">
+    <div class="hero-glow" style="position:absolute;width:560px;height:560px;border-radius:50%;filter:blur(90px);opacity:.5;top:-160px;left:-100px;background:radial-gradient(circle,rgba(94,92,230,.5),transparent 68%)"></div>
+    <div class="hero-glow" style="position:absolute;width:480px;height:480px;border-radius:50%;filter:blur(90px);opacity:.38;top:-40px;right:-80px;background:radial-gradient(circle,rgba(10,132,255,.42),transparent 70%)"></div>
+  </div>
+  <div class="wrap" style="position:relative">
+    <span class="eyebrow reveal" data-lang-zh>工程深度 · 怎么做到的</span><span class="eyebrow reveal" data-lang-en>Engineering depth · how it's done</span>
+    <h1 class="h-display reveal reveal-d1" data-lang-zh>真正的难度，不在<span class="text-grad">能聊</span>，<br>在<span class="text-grad">靠得住</span></h1>
+    <h1 class="h-display reveal reveal-d1" data-lang-en>The hard part isn't <span class="text-grad">chatting</span> —<br>it's being <span class="text-grad">dependable</span></h1>
+    <p class="lead reveal reveal-d2" data-lang-zh>这一页是写给要把它放进生产环境的技术负责人的。别的页讲"能做什么"，这一页只回答一个问题：当大模型会胡说、网络会抖动、进程会崩溃、而客户绝不能被打扰，这套系统凭什么靠得住。下面每一条都对应真实 Rust 代码里的函数与行号——可以拉着你的团队逐一核对，不是 PPT 话术。</p>
+    <p class="lead reveal reveal-d2" data-lang-en>This page is for the engineering lead who has to put it into production. Other pages cover features; this one answers one question: when the model hallucinates, the network flickers, processes crash, and customers must never be disturbed — why is this system dependable? Every item maps to a real function and line number — bring your team and verify, line by line. Not slideware.</p>
+    <div class="page-hero-meta reveal reveal-d3">
+      <span class="pill" data-lang-zh>可私有部署 · 不锁厂商</span><span class="pill" data-lang-en>Self-hostable · no lock-in</span>
+      <span class="pill" data-lang-zh>红线由 CI 强制</span><span class="pill" data-lang-en>Red lines enforced by CI</span>
+      <span class="pill" data-lang-zh>成本逐次可精算</span><span class="pill" data-lang-en>Per-call cost accounting</span>
+      <span class="pill" data-lang-zh>真实 file:line 可核对</span><span class="pill" data-lang-en>Real file:line, checkable</span>
+    </div>
+  </div>
+</header>
+
+<!-- ============ 技术采购三关切 ============ -->
+<section class="section buyer-band">
+  <div class="wrap">
+    <div class="e-head reveal" style="max-width:760px">
+      <span class="eyebrow" data-lang-zh>放进生产前，你会先问这三件事</span><span class="eyebrow" data-lang-en>Before it ships, you'll ask these three</span>
+      <h2 class="h-section" data-lang-zh>评估一套自治 AI，<span class="text-grad">技术团队真正在意的</span></h2>
+      <h2 class="h-section" data-lang-en>What an engineering team <span class="text-grad">actually weighs</span> in an autonomous AI</h2>
+    </div>
+    <div class="buyer-grid">
+      <div class="buyer-card reveal">
+        <div class="bc-q" data-lang-zh>会被厂商锁死吗？</div><div class="bc-q" data-lang-en>Will I be locked in?</div>
+        <h4 data-lang-zh>可私有部署，模型自己选</h4><h4 data-lang-en>Self-hostable, your model</h4>
+        <p data-lang-zh>对接的是 OpenAI 兼容协议，<code>OPENAI_BASE_URL</code> 一个环境变量就能指向自托管模型或任意兼容端点；运行时还能热切换 provider，不停机。代码、数据、模型都可以留在你自己的机房。</p>
+        <p data-lang-en>It speaks the OpenAI-compatible protocol; one env var, <code>OPENAI_BASE_URL</code>, points it at a self-hosted model or any compatible endpoint, with hot provider swap at runtime — no downtime. Code, data and model can all stay in your own datacenter.</p>
+        <div class="bc-ref">config.rs:408 · llm.rs:1419 swap</div>
+      </div>
+      <div class="buyer-card reveal reveal-d1">
+        <div class="bc-q" data-lang-zh>红线靠谱吗，还是全凭自觉？</div><div class="bc-q" data-lang-en>Are the red lines real, or honor-system?</div>
+        <h4 data-lang-zh>承诺写进代码，CI 每次提交都扫</h4><h4 data-lang-en>Promises compiled in, scanned every commit</h4>
+        <p data-lang-zh>"客户永远只跟 AI 对话""AI 永不自动核验知识""演化器碰不到生产"——这些不是文档里的承诺，是三道 CI 门禁：测试基线、红线词静态扫描、演化器隔离校验。任何一道挂了，提交进不来。</p>
+        <p data-lang-en>"Customers only ever talk to the AI", "the AI never self-verifies knowledge", "the evolver can't touch production" — not doc promises but three CI gates: a test baseline, a red-line static scan, and an evolver-isolation check. Fail one and the commit can't land.</p>
+        <div class="bc-ref">check-baseline · check-no-human-takeover · check-evolution-isolation</div>
+      </div>
+      <div class="buyer-card reveal reveal-d2">
+        <div class="bc-q" data-lang-zh>跑起来花多少钱，说得清吗？</div><div class="bc-q" data-lang-en>Can you account for the spend?</div>
+        <h4 data-lang-zh>每一次模型调用都记账</h4><h4 data-lang-en>Every model call is metered</h4>
+        <p data-lang-zh>每条运营有 token 与调用次数的硬预算，超额降级而不是失控烧钱；每一次模型调用单独落账，记 token、缓存命中、重试、延迟。成本能精确到每一次请求，不是月底一张看不懂的账单。</p>
+        <p data-lang-en>Each run has a hard budget on tokens and call count — overruns degrade instead of burning money; every model call is logged on its own with tokens, cache hits, retries and latency. Cost is accountable per request, not a mystery bill at month-end.</p>
+        <div class="bc-ref">budget.rs · models.rs:2882 LlmCallLog</div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ============ 防线导航 ============ -->
+<nav class="eng-jump" aria-label="sections">
+  <div class="wrap eng-jump-inner">
+    <a href="#resilience"><b>01</b><span data-lang-zh>大模型韧性</span><span data-lang-en>LLM resilience</span></a>
+    <a href="#delivery"><b>02</b><span data-lang-zh>发送可靠与节制</span><span data-lang-en>Reliable, restrained sending</span></a>
+    <a href="#knowledge"><b>03</b><span data-lang-zh>知识自进化</span><span data-lang-en>Self-evolving knowledge</span></a>
+    <a href="#memory"><b>04</b><span data-lang-zh>记忆的严谨</span><span data-lang-en>Rigorous memory</span></a>
+    <a href="#observability"><b>05</b><span data-lang-zh>全链路可观测</span><span data-lang-en>Full observability</span></a>
+  </div>
+</nav>
+
+<!-- ============ 01 · 大模型韧性 ============ -->
+<section class="section eng-cluster c-resil" id="resilience">
+  <div class="wrap">
+    <div class="e-head reveal">
+      <div class="e-tag"><span class="e-no">01</span><span class="eyebrow" data-lang-zh>把不稳定的大模型，驯服成生产级</span><span class="eyebrow" data-lang-en>Taming an unreliable LLM into production</span></div>
+      <h2 class="h-section" data-lang-zh>模型会胡说、会截断、会跑偏——<span class="text-grad">这些都不该让客户看见</span></h2>
+      <h2 class="h-section" data-lang-en>Models ramble, truncate and drift — <span class="text-grad">the customer should never see it</span></h2>
+      <p class="lead" data-lang-zh>大模型的输出天生不稳定：JSON 缺个逗号、长任务把正文塞进工具调用、网关半路掐断连接。我们没有把这些风险抛给客户，而是在客户端这一层用确定性代码逐一接住。</p>
+      <p class="lead" data-lang-en>LLM output is inherently unstable: a missing comma in JSON, a long task that buries the answer in a tool call, a gateway that cuts the connection midway. We don't pass that risk to the customer — deterministic code at the client layer catches each case.</p>
+    </div>
+    <div class="eng-grid">
+      <div class="eng-card reveal">
+        <div class="ec-ref">llm.rs:318 · parse_or_repair</div>
+        <h4 data-lang-zh>三层 JSON 鲁棒解析</h4><h4 data-lang-en>Three-layer JSON parsing</h4>
+        <p data-lang-zh>直接解析 → 确定性修复（补逗号、转义裸控制字符、拆单对象数组）→ 实在不行回喂模型修复，最多两次。一个标点不会毁掉整条运营。</p>
+        <p data-lang-en>Direct parse → deterministic repair (commas, raw control chars, singleton arrays) → as a last resort, hand it back to the model to fix, at most twice. One punctuation slip won't kill a run.</p>
+      </div>
+      <div class="eng-card reveal reveal-d1">
+        <div class="ec-ref">llm.rs:1153 · detect_tool_use_hijack</div>
+        <h4 data-lang-zh>tool_use 劫持检测</h4><h4 data-lang-en>tool_use hijack detection</h4>
+        <p data-lang-zh>某些模型在长任务里会先调工具，真正的答案跑进 tool_use block、正文只剩一句开场白。系统能识别这种"劫持"并给出明确诊断，而不是对着半句话硬解析。</p>
+        <p data-lang-en>On long tasks some models call a tool first — the real answer lands in a tool_use block while the text is just a greeting. The system detects this hijack and reports it clearly, instead of parsing half a sentence.</p>
+      </div>
+      <div class="eng-card reveal reveal-d2">
+        <div class="ec-ref">llm.rs:272 · with_format</div>
+        <h4 data-lang-zh>传输层抗截断硬调优</h4><h4 data-lang-en>Transport hardening vs. truncation</h4>
+        <p data-lang-zh>关连接池复用、强制 HTTP/1.1、开 TCP keepalive、绕代理——专治某些网关在 60 秒后静默截断 chunked 响应体的疑难杂症。这是真踩过的坑。</p>
+        <p data-lang-en>No pooled connections, forced HTTP/1.1, TCP keepalive, no proxy — a fix for gateways that silently truncate chunked bodies after 60s. A pothole we actually hit.</p>
+      </div>
+      <div class="eng-card reveal">
+        <div class="ec-ref">llm.rs:1049 · compute_backoff</div>
+        <h4 data-lang-zh>退避带抖动 · 封顶 · 尊重 Retry-After</h4><h4 data-lang-en>Backoff with jitter, cap & Retry-After</h4>
+        <p data-lang-zh>指数退避叠加 ±随机抖动、封顶 60 秒、并尊重服务端返回的 Retry-After。既防重试雪崩，也避免单次睡几十分钟撞上任务超时墙。</p>
+        <p data-lang-en>Exponential backoff with ±jitter, capped at 60s, honoring the server's Retry-After. Prevents retry storms and avoids a single multi-minute sleep slamming into the task timeout.</p>
+      </div>
+      <div class="eng-card reveal reveal-d1">
+        <div class="ec-ref">llm.rs:1026 · is_retryable_llm_error</div>
+        <h4 data-lang-zh>可重试错误精确分类</h4><h4 data-lang-en>Precise retryable-error classification</h4>
+        <p data-lang-zh>区分"瞬时不可达"（含 Cloudflare 520/522/524、body 解码失败）与"确定性失败"。JSON 格式错误不重试——重试只会再烧一次 token，结果一样。</p>
+        <p data-lang-en>Separates transient failures (incl. Cloudflare 520/522/524, body-decode) from deterministic ones. JSON errors are never retried — a retry just burns tokens for the same result.</p>
+      </div>
+      <div class="eng-card reveal reveal-d2">
+        <div class="ec-ref">budget.rs:112 · record_tool_call</div>
+        <h4 data-lang-zh>运行预算双维硬上限</h4><h4 data-lang-en>Dual-axis run budget</h4>
+        <p data-lang-zh>每条运营有 token 与工具调用两个维度的预算，在一把锁内原子校验并累加。超额触发降级（跳过改写、本地评审兜底），而不是把 5xx 抛给微信回调。</p>
+        <p data-lang-en>Every run has a budget on both tokens and tool calls, checked and incremented atomically under one lock. Overruns degrade gracefully (skip rewrite, local review) rather than throwing a 5xx at the WeChat callback.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ============ 02 · 发送可靠与节制 ============ -->
+<section class="section section-tint eng-cluster c-deliver" id="delivery">
+  <div class="wrap">
+    <div class="e-head reveal">
+      <div class="e-tag"><span class="e-no">02</span><span class="eyebrow" data-lang-zh>主动，但克制</span><span class="eyebrow" data-lang-en>Proactive, but restrained</span></div>
+      <h2 class="h-section" data-lang-zh>一条消息只发一次，<span class="text-grad">而且像真人一样懂分寸</span></h2>
+      <h2 class="h-section" data-lang-en>Send once, never twice — <span class="text-grad">and with a human's sense of timing</span></h2>
+      <p class="lead" data-lang-zh>私域里发错一条、发重一条、半夜连发三条，都是事故。发送链路上最不性感、却最值钱的工程，全在"不该发的时候忍住，该发的时候不重复"。</p>
+      <p class="lead" data-lang-en>In private domains, a wrong send, a duplicate, or three messages at midnight are all incidents. The least glamorous, most valuable engineering on the send path is about holding back when it shouldn't fire, and never repeating when it does.</p>
+    </div>
+    <div class="eng-grid">
+      <div class="eng-card reveal">
+        <div class="ec-ref">outbox.rs:399 · compute_synthetic_key</div>
+        <h4 data-lang-zh>合成幂等键 · 按天去重</h4><h4 data-lang-en>Synthetic idempotency key</h4>
+        <p data-lang-zh>每条发送算一把幂等键落唯一索引。连无源头的主动跟进、后台手滑双击"发送"，也会用"账号+联系人+内容+当天"合成键挡住，同样内容当天只发一次。</p>
+        <p data-lang-en>Every send computes an idempotency key on a unique index. Even source-less proactive follow-ups or a double-clicked "send" are caught by an account+contact+content+day key — the same content goes out once per day.</p>
+      </div>
+      <div class="eng-card reveal reveal-d1">
+        <div class="ec-ref">gateway.rs:2752 · send_outbound_message</div>
+        <h4 data-lang-zh>发出后落库失败 · 绝不重发</h4><h4 data-lang-en>Post-send DB failure never resends</h4>
+        <p data-lang-zh>消息已经送到微信、但写本地库失败时，系统只记一条审计、绝不返回错误——因为返回错误会让派发器重试，把同一条消息再发给客户一次。宁可少记一笔，不能重发一条。</p>
+        <p data-lang-en>If a message reached WeChat but the local write failed, the system logs an audit and never returns an error — an error would make the dispatcher retry and resend. Better to miss a log than repeat a message.</p>
+      </div>
+      <div class="eng-card reveal reveal-d2">
+        <div class="ec-ref">outbox_dispatcher.rs:645 · mcp_already_succeeded</div>
+        <h4 data-lang-zh>崩溃 / 超时后 · 先核对再补发</h4><h4 data-lang-en>Post-crash delivery check</h4>
+        <p data-lang-zh>worker 崩了或 30 秒超时被回收时，补发前先查 MCP 调用日志确认上一次到底送没送达。送达了就直接标完成，不会因为一次崩溃让客户收到两条。</p>
+        <p data-lang-en>When a worker crashes or a 30s timeout reclaims the job, it first checks the MCP call log to see whether the previous attempt actually delivered. If so it marks done — a crash never yields a duplicate.</p>
+      </div>
+      <div class="eng-card reveal">
+        <div class="ec-ref">pacing.rs:15 · account_send_interval_ms</div>
+        <h4 data-lang-zh>账号级最小间隔 · 反连珠炮</h4><h4 data-lang-en>Per-account min interval</h4>
+        <p data-lang-zh>单个 worker 串行跨客户背靠背零间隔地发，是典型的机器特征。每条发送前查这个账号上次实发时刻，间隔不够就重排，并叠加随机抖动，像真人一样有呼吸。</p>
+        <p data-lang-en>One worker firing back-to-back across customers is a telltale bot signature. Before each send it checks the account's last actual send time, reschedules if too soon, and adds random jitter — the cadence breathes like a human.</p>
+      </div>
+      <div class="eng-card reveal reveal-d1">
+        <div class="ec-ref">gateway.rs:2982 · precheck_operation_policy</div>
+        <h4 data-lang-zh>四道节制门</h4><h4 data-lang-en>Four restraint gates</h4>
+        <p data-lang-zh>连续主动触达上限、必须等客户先回复、每日触达计数、策略冷却期——任何一道不满足就忍住不发。主动经营关系，但绝不变成骚扰。</p>
+        <p data-lang-en>A cap on consecutive proactive sends, "wait for the customer to reply first", a daily touch count, and policy cooldown — fail any one and it holds. Proactive about relationships, never spammy.</p>
+      </div>
+      <div class="eng-card reveal reveal-d2">
+        <div class="ec-ref">tasks.rs:33 · reclaim_stale_running_tasks</div>
+        <h4 data-lang-zh>任务认领 · 超时回收 · 心跳续约</h4><h4 data-lang-en>Claim, reclaim & heartbeat</h4>
+        <p data-lang-zh>任务用 CAS 原子认领，抢不到就跳过，杜绝多副本重复跑；卡死的任务超时自动回收重试，连续回收三次强制失败防死循环；长任务用心跳续约认领时间，不被误回收。</p>
+        <p data-lang-en>Tasks are claimed atomically via CAS — lose the race, skip it, no duplicate runs. Stuck tasks are reclaimed on timeout; three reclaims force a failure to break loops; long tasks renew their claim via heartbeat so they aren't reclaimed by mistake.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ============ 03 · 知识自进化 ============ -->
+<section class="section eng-cluster c-know" id="knowledge">
+  <div class="wrap">
+    <div class="e-head reveal">
+      <div class="e-tag"><span class="e-no">03</span><span class="eyebrow" data-lang-zh>知识库会自己变聪明</span><span class="eyebrow" data-lang-en>Knowledge that gets smarter</span></div>
+      <h2 class="h-section" data-lang-zh>不只是存知识，<span class="text-grad">还会自己发现哪里缺、哪里旧</span></h2>
+      <h2 class="h-section" data-lang-en>It doesn't just store knowledge — <span class="text-grad">it finds what's missing and stale</span></h2>
+      <p class="lead" data-lang-zh>检索准不准、知识新不新，决定了 AI 说得对不对。这一层的工程，是让知识库随真实业务反应自我打磨，而不是建好就僵在那里。</p>
+      <p class="lead" data-lang-en>Retrieval quality and freshness decide whether the AI is right. The engineering here lets the knowledge base polish itself against real business feedback, rather than freezing the day it's built.</p>
+    </div>
+    <div class="eng-grid">
+      <div class="eng-card reveal">
+        <div class="ec-ref">knowledge_agent.rs:1653 · RankKey</div>
+        <h4 data-lang-zh>过期知识只降权 · 不剔除</h4><h4 data-lang-en>Stale knowledge is down-ranked, not dropped</h4>
+        <p data-lang-zh>被取代的知识 ×0.1、过期的 ×0.5 乘进有效相关度，数学化压到队尾，而不是突然消失或污染答案。属性测试锁定了排序随时间的单调性。</p>
+        <p data-lang-en>Superseded knowledge ×0.1, expired ×0.5 fold into effective relevance — pushed to the tail, not vanished or polluting answers. A property test locks ranking monotonicity over time.</p>
+      </div>
+      <div class="eng-card reveal reveal-d1">
+        <div class="ec-ref">knowledge_agent.rs:1711 · classify_recall_outcome</div>
+        <h4 data-lang-zh>"查了等于没查"自动转整改</h4><h4 data-lang-en>Failed recalls become fix tickets</h4>
+        <p data-lang-zh>一次召回是"完全没命中"还是"翻了一堆却引用不上"，会被自动归类成知识缺口信号，沉淀进离线整改队列。知识的短板自己浮出来。</p>
+        <p data-lang-en>Whether a recall "missed entirely" or "opened a lot but cited little" is auto-classified into a knowledge-gap signal and queued for offline remediation. Weak spots surface themselves.</p>
+      </div>
+      <div class="eng-card reveal reveal-d2">
+        <div class="ec-ref">gap_signals.rs:834 · refresh_usage_stats_and_confidence</div>
+        <h4 data-lang-zh>置信度随真实成交换血</h4><h4 data-lang-en>Confidence refreshed by real outcomes</h4>
+        <p data-lang-zh>知识的置信度按 30 天滑窗动态升降：被引用后带来正向成交就加分，引发拦截就扣分，沉默则按域配置衰减。不是靠人拍脑袋定高低。</p>
+        <p data-lang-en>Confidence floats on a 30-day window: cited then converted earns points, cited then blocked loses them, silence decays per domain config. Not a human's gut call.</p>
+      </div>
+      <div class="eng-card reveal">
+        <div class="ec-ref">structural_proposals.rs:25 · StructuralKind</div>
+        <h4 data-lang-zh>结构化写 · 只产提案，不能自动删</h4><h4 data-lang-en>Structural writes propose, never delete</h4>
+        <p data-lang-zh>拆分、合并、重分类、标记取代这些不可逆操作，结构体里根本没有"提交/落地/删除"字段——物理上就不允许 AI 自动改库，必须经人审。</p>
+        <p data-lang-en>Split, merge, reclassify, supersede — these irreversible ops have no "commit/apply/delete" field in the struct at all. The AI physically cannot mutate the base on its own; a human must review.</p>
+      </div>
+      <div class="eng-card reveal reveal-d1">
+        <div class="ec-ref">ingest_worker.rs:46 · run_one_round</div>
+        <h4 data-lang-zh>自动摄取 · 条件 GET + 失败熔断</h4><h4 data-lang-en>Auto-ingest with conditional GET & breaker</h4>
+        <p data-lang-zh>外部源自动增量抓取：用 If-None-Match / 304 跳过没变的内容、按计划节流，连续失败三次降级、七天不可达自动停扫。RSS 走解析器、HTML 启发式抽正文。</p>
+        <p data-lang-en>External sources are pulled incrementally: If-None-Match/304 skips unchanged content, schedule throttles, three failures degrade, seven days unreachable disables. RSS via a parser, HTML via heuristic extraction.</p>
+      </div>
+      <div class="eng-card reveal reveal-d2">
+        <div class="ec-ref">knowledge_agent.rs:69 · CATALOG_CANDIDATE_CAP</div>
+        <h4 data-lang-zh>中文友好的进程内重排</h4><h4 data-lang-en>CJK-friendly in-process re-ranking</h4>
+        <p data-lang-zh>明确不引入向量库这个部署负担，也绕开对中文不分词的全文索引，改用语言无关的 bigram 在进程内重排——中文私域照样避免"高相关却被静态截断"的漏召。</p>
+        <p data-lang-en>It deliberately avoids the deployment burden of a vector DB and the CJK-blind full-text index, re-ranking in-process with language-agnostic bigrams — so Chinese private domains still dodge "relevant but statically truncated" misses.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ============ 04 · 记忆的严谨 ============ -->
+<section class="section section-tint eng-cluster c-mem" id="memory">
+  <div class="wrap">
+    <div class="e-head reveal">
+      <div class="e-tag"><span class="e-no">04</span><span class="eyebrow" data-lang-zh>记得住，也记得准</span><span class="eyebrow" data-lang-en>Remembers — accurately</span></div>
+      <h2 class="h-section" data-lang-zh>长期关系靠记忆，<span class="text-grad">而记忆最怕被写脏</span></h2>
+      <h2 class="h-section" data-lang-en>Long-term relationships run on memory — <span class="text-grad">which must never be corrupted</span></h2>
+      <p class="lead" data-lang-zh>"经营关系"听起来很软，落到工程上却是一组很硬的约束：并发写不能撕裂、没证据的猜测不能升格成事实、关键早期记忆不能被新观察挤掉。</p>
+      <p class="lead" data-lang-en>"Nurturing relationships" sounds soft, but in engineering it's a set of hard constraints: concurrent writes mustn't tear, evidence-free guesses mustn't become facts, and key early memories mustn't be crowded out.</p>
+    </div>
+    <div class="eng-grid eng-grid-5">
+      <div class="eng-card reveal">
+        <div class="ec-ref">memory.rs:1316 · occ_memory_filter</div>
+        <h4 data-lang-zh>记忆巩固 · 乐观并发控制</h4><h4 data-lang-en>Memory consolidation with OCC</h4>
+        <p data-lang-zh>入站消息和后台巩固任务可能同时改同一份长期记忆。用版本号做乐观并发：输给并发写的一方不落地、转重试，绝不出现半新半旧的撕裂状态。</p>
+        <p data-lang-en>An inbound message and a background consolidation may edit the same memory at once. Optimistic concurrency on a version field means the loser doesn't commit and retries — never a half-old, half-new torn state.</p>
+      </div>
+      <div class="eng-card reveal reveal-d1">
+        <div class="ec-ref">memory.rs:964 · personality confidence</div>
+        <h4 data-lang-zh>没证据 · 置信度强制归零</h4><h4 data-lang-en>No evidence → confidence forced to zero</h4>
+        <p data-lang-zh>人格画像的每个维度，只要没有对话原文证据锚定，置信度一律被代码强制设为 0——绝不采信模型自己报上来的高置信。猜测就是猜测。</p>
+        <p data-lang-en>Every personality dimension without a quoted conversational anchor has its confidence forced to 0 by code — the model's self-reported confidence is never trusted. A guess stays a guess.</p>
+      </div>
+      <div class="eng-card reveal reveal-d2">
+        <div class="ec-ref">memory.rs:344 · compact + PBT</div>
+        <h4 data-lang-zh>关键记忆 · 不被新观察挤掉</h4><h4 data-lang-en>Key memories survive compaction</h4>
+        <p data-lang-zh>记忆压缩时，未被作废的核心事实强制保留，数组永不无界膨胀（核心≤6 / 近期≤10 / 弃用≤20）。两条属性测试守住"上限"和"保留性"两个不变量。</p>
+        <p data-lang-en>On compaction, non-deprecated core facts are forced to persist and arrays never grow unbounded (core ≤6 / recent ≤10 / deprecated ≤20). Two property tests guard the cap and retention invariants.</p>
+      </div>
+      <div class="eng-card reveal">
+        <div class="ec-ref">reaction.rs:85 · find_one_and_update</div>
+        <h4 data-lang-zh>用户反应分析 · 原子 claim 锁</h4><h4 data-lang-en>Reaction analysis claim lock</h4>
+        <p data-lang-zh>同一条客户消息被多个回调重复触发时，只有抢到原子锁的那一个能真正调模型分析，其余直接返回。杜绝重复扣费、重复结论。</p>
+        <p data-lang-en>When one customer message is fired by multiple callbacks, only the one that wins the atomic lock actually calls the model; the rest return. No double billing, no double conclusions.</p>
+      </div>
+      <div class="eng-card reveal reveal-d1">
+        <div class="ec-ref">models.rs:3723 · MemoryFactRepr</div>
+        <h4 data-lang-zh>历史记忆 · 零停机平滑升级</h4><h4 data-lang-en>Zero-downtime memory upgrade</h4>
+        <p data-lang-zh>老库里的纯字符串记忆，通过无标签联合类型在反序列化边界自动升级成结构化事实，与新格式共存。升级一套系统不需要先停机迁移数据。</p>
+        <p data-lang-en>Legacy plain-string memories auto-upgrade to structured facts at the deserialization boundary via an untagged union, coexisting with the new shape. Upgrading needs no data-migration downtime.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ============ 05 · 全链路可观测 ============ -->
+<section class="section section-deep eng-cluster c-obs is-deep" id="observability">
+  <div class="wrap">
+    <div class="e-head reveal">
+      <div class="e-tag"><span class="e-no">05</span><span class="eyebrow" data-lang-zh>崩溃了，也不丢一条记录</span><span class="eyebrow" data-lang-en>Even a crash leaves a record</span></div>
+      <h2 class="h-section" data-lang-zh>每一次决策、调用、发送，<span class="text-grad">都查得到、对得上</span></h2>
+      <h2 class="h-section" data-lang-en>Every decision, call and send is <span class="text-grad">traceable and reconcilable</span></h2>
+      <p class="lead" data-lang-zh>自治系统最让人不安的，是"它到底做了什么、为什么这么做"说不清。我们的答案是：在每一次模型调用之前就先落一条记录，哪怕后面超时、panic、解析失败，也留得下痕迹。</p>
+      <p class="lead" data-lang-en>What unsettles people about autonomy is not knowing what it did or why. Our answer: write a record before the model is even called, so that even a later timeout, panic or parse failure still leaves a trail.</p>
+    </div>
+    <div class="eng-grid eng-grid-5">
+      <div class="eng-card reveal">
+        <div class="ec-ref">run_envelope.rs:362 · write_run_envelope_started</div>
+        <h4 data-lang-zh>Run Envelope · 调用前先落记录</h4><h4 data-lang-en>Run Envelope written before the call</h4>
+        <p data-lang-zh>每条运营在调模型之前就写下一条 started 记录，结束时更新终态；万一连这条都没匹配上，还有 upsert 兜底补插并发事件。崩溃也不会有"凭空消失的一次运行"。</p>
+        <p data-lang-en>Each run writes a "started" record before calling the model and updates the terminal state on finish; if even that doesn't match, an upsert fallback inserts it and emits an event. No run ever vanishes into thin air.</p>
+      </div>
+      <div class="eng-card reveal reveal-d1">
+        <div class="ec-ref">run_envelope.rs:274 · is_valid_lifecycle_transition</div>
+        <h4 data-lang-zh>生命周期 · 闭集枚举 fail-closed</h4><h4 data-lang-en>Closed-set lifecycle, fail-closed</h4>
+        <p data-lang-zh>运行状态是不可逆的闭集枚举，终态吸收、脏状态值写库前直接拒收。状态机本身就拒绝"人工接管"这类违反全自治定位的语义。</p>
+        <p data-lang-en>Run lifecycle is an irreversible closed-set enum with absorbing terminal states; dirty values are rejected before they reach the DB. The state machine itself refuses semantics that violate the fully-autonomous stance.</p>
+      </div>
+      <div class="eng-card reveal reveal-d2">
+        <div class="ec-ref">models.rs:2543 · AgentRunLog</div>
+        <h4 data-lang-zh>运行日志 · 约 40 个维度</h4><h4 data-lang-en>~40-field run logs</h4>
+        <p data-lang-zh>每条运营记录提示词版本、token 预算与实耗、调用次数、各阶段结果、降级原因、改写前后摘要。分阶段写入互不覆盖，复盘时一条 run 看到底。</p>
+        <p data-lang-en>Each run records prompt versions, token budget vs. spend, call counts, per-stage results, degradation reasons and pre/post-rewrite summaries. Staged writes don't overwrite each other — one run, fully legible.</p>
+      </div>
+      <div class="eng-card reveal">
+        <div class="ec-ref">models.rs:2882 · LlmCallLog</div>
+        <h4 data-lang-zh>逐次调用 · 成本可精算</h4><h4 data-lang-en>Per-call cost accounting</h4>
+        <p data-lang-zh>每一次模型调用都记 prompt / completion / 总 token、缓存命中与否、重试次数、延迟毫秒、最终状态。成本和性能可以精确到每一次请求。</p>
+        <p data-lang-en>Every model call logs prompt/completion/total tokens, cache hit or miss, retry count, latency in ms and final status. Cost and performance are accountable down to a single request.</p>
+      </div>
+      <div class="eng-card reveal reveal-d1">
+        <div class="ec-ref">models.rs:2492 · AgentDecisionReview</div>
+        <h4 data-lang-zh>独立评审 · 带快照与反应回填</h4><h4 data-lang-en>Independent review with snapshots</h4>
+        <p data-lang-zh>评审独立成档，存评分、公式拆解、用到的知识，外加行业配置 / 运行参数 / 上下文三份快照，再回填客户真实反应与评审误判信号——形成可复盘的闭环。</p>
+        <p data-lang-en>Reviews are filed independently with scores, formula breakdowns, knowledge used, plus three snapshots — domain config, runtime params, context — then backfilled with the customer's real reaction and reviewer-misjudgment signals. A closeable loop.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ============ 结尾 CTA ============ -->
+<section class="section cta-band">
+  <div class="wrap cta-inner reveal" style="text-align:center;max-width:720px;margin:0 auto;position:relative">
+    <h2 class="h-section" data-lang-zh>把它放进<span class="text-grad">你自己的环境里验</span></h2>
+    <h2 class="h-section" data-lang-en>Put it in <span class="text-grad">your own environment</span> and verify</h2>
+    <p class="lead" data-lang-zh>能聊天的产品很多，靠得住的不多。这一页的每一条都对应真实代码里的函数与行号——可私有部署，模型、数据、代码留在你的机房，拉着你的技术团队逐条验。想看这些工程怎么串成一条完整的发送链路，去技术架构页；想看红线怎么写进代码、被 CI 强制，去信任与安全页。</p>
+    <p class="lead" data-lang-en>Plenty of products can chat; few are dependable. Every item here maps to a real function and line number — self-host it, keep model, data and code in your datacenter, and verify with your team. To see how it forms one send path, visit Technology; to see red lines compiled in and enforced by CI, visit Trust.</p>
+    <div class="hero-cta" style="justify-content:center;margin-top:8px">
+      <a href="technology.html" class="btn btn-primary"><span data-lang-zh>看技术架构</span><span data-lang-en>Technology</span><svg viewBox="0 0 24 24" fill="none"><path d="M5 12h14M13 6l6 6-6 6" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></a>
+      <a href="trust.html" class="btn btn-ghost"><span data-lang-zh>看红线与 CI 门禁</span><span data-lang-en>Red lines &amp; CI gates</span></a>
+    </div>
+  </div>
+</section>
+
+<!-- ============ 页脚 ============ -->
+<footer class="footer">
+  <div class="wrap">
+    <div class="footer-grid">
+      <div class="footer-brand">
+        <a href="index.html" class="brand"><span class="brand-mark"><svg viewBox="0 0 64 64" fill="none"><path fill="#fff" fill-rule="evenodd" clip-rule="evenodd" d="M18.5 7 H45.5 Q57.5 7 57.5 19 V33 Q57.5 45 45.5 45 H24 L13 57 V44.4 Q6.5 43 6.5 33 V19 Q6.5 7 18.5 7 Z M14 15.5 L20.2 38 L31 23 L33 23 L43.8 38 L50 15.5 L44.3 15.5 L40.4 31 L33.4 21 L30.6 21 L23.6 31 L19.7 15.5 Z M47 6.1 C47 12.02 46 13.5 42 13.5 C46 13.5 47 14.98 47 20.9 C47 14.98 48 13.5 52 13.5 C48 13.5 47 12.02 47 6.1 Z"/></svg></span>WeAgent</a>
+        <p data-lang-zh>全自治微信私域 AI 运营系统。客户永远只跟 AI 对话，AI 像真人一样长期经营每一段关系。</p>
+        <p data-lang-en>The autonomous WeChat private-domain AI operator. Customers only ever talk to the AI, which nurtures every relationship over time.</p>
+        <button class="wx-copy" data-wx="agimeme" type="button">
+          <svg viewBox="0 0 24 24" fill="none"><path d="M8.5 14.5c-3 0-5.5-2-5.5-4.6C3 7 5.8 5 9 5s6 2 6 4.9c0 .5-.1 1-.3 1.5M16 19c2.2 0 4-1.4 4-3.3 0-1.9-1.8-3.4-4-3.4s-4 1.5-4 3.4c0 .6.2 1.2.6 1.7L12 19l1.6-.5c.7.3 1.5.5 2.4.5z" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          <span data-lang-zh>顾问微信 <span class="wx-id">agimeme</span></span><span data-lang-en>WeChat <span class="wx-id">agimeme</span></span>
+          <span class="wx-hint" data-lang-zh>点击复制</span><span class="wx-hint" data-lang-en>tap to copy</span>
+        </button>
+      </div>
+      <div>
+        <h5 data-lang-zh>产品</h5><h5 data-lang-en>Product</h5>
+        <div class="footer-links">
+          <a href="solutions.html" data-lang-zh>解决什么问题</a><a href="solutions.html" data-lang-en>What it solves</a>
+          <a href="product.html" data-lang-zh>产品能力</a><a href="product.html" data-lang-en>Product</a>
+          <a href="agents.html" data-lang-zh>智能体编队</a><a href="agents.html" data-lang-en>Agents</a>
+          <a href="scenarios.html" data-lang-zh>行业场景</a><a href="scenarios.html" data-lang-en>Scenarios</a>
+          <a href="product.html#channels" data-lang-zh>管理频道</a><a href="product.html#channels" data-lang-en>Channels</a>
+        </div>
+      </div>
+      <div>
+        <h5 data-lang-zh>技术</h5><h5 data-lang-en>Technology</h5>
+        <div class="footer-links">
+          <a href="technology.html" data-lang-zh>技术架构</a><a href="technology.html" data-lang-en>Architecture</a>
+          <a href="engineering.html" data-lang-zh>工程深度</a><a href="engineering.html" data-lang-en>Engineering depth</a>
+          <a href="evolution.html" data-lang-zh>自我演化</a><a href="evolution.html" data-lang-en>Self-evolution</a>
+        </div>
+      </div>
+      <div>
+        <h5 data-lang-zh>信任</h5><h5 data-lang-en>Trust</h5>
+        <div class="footer-links">
+          <a href="observability.html" data-lang-zh>运营透视</a><a href="observability.html" data-lang-en>Observability</a>
+          <a href="trust.html" data-lang-zh>信任与安全</a><a href="trust.html" data-lang-en>Trust &amp; safety</a>
+          <a href="trust.html#redlines" data-lang-zh>红线与守门</a><a href="trust.html#redlines" data-lang-en>Hard lines</a>
+          <a href="trust.html#audit" data-lang-zh>可审计性</a><a href="trust.html#audit" data-lang-en>Auditability</a>
+        </div>
+      </div>
+    </div>
+    <div class="footer-bottom">
+      <span>© 2026 WeAgent · <span data-lang-zh>私域自主运营</span><span data-lang-en>Autonomous private-domain operations</span></span>
+      <span data-lang-zh>构建于 2026-06-28 · 由 Claude Code 根据项目代码生成 · by opus-4.8 · 11 万行 Rust 代码 · 比例 100%</span><span data-lang-en>Built 2026-06-28 · generated by Claude Code from the project codebase · by opus-4.8 · 110k+ lines of Rust · 100% generated</span>
+      <span data-lang-zh>Rust · Axum · MongoDB · React · MCP</span>
+      <span data-lang-en>Built with Rust · Axum · MongoDB · React · MCP</span>
+    </div>
+  </div>
+</footer>
+
+<script src="assets/i18n.js"></script>
+<script src="assets/shared.js"></script>
+</body>
+</html>

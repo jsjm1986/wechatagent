@@ -1,0 +1,515 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title data-zh="行业场景 · WeAgent" data-en="Scenarios · WeAgent">行业场景 · WeAgent</title>
+<meta name="description" content="一套行业无关的引擎，换一份业务画像就换一个行业。DomainProfile 单一事实源、数字分身的触达轴与口吻轴、辅助模式名片引荐、幕后请示通道与多账号多租户——WeAgent 如何适配任意私域业务。">
+<link rel="canonical" href="https://weagent.example.com/scenarios.html">
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="WeAgent">
+<meta property="og:locale" content="zh_CN">
+<meta property="og:locale:alternate" content="en_US">
+<meta property="og:title" content="行业场景 · WeAgent">
+<meta property="og:description" content="一套行业无关的引擎，换一份业务画像就换一个行业。DomainProfile 单一事实源、数字分身触达轴与口吻轴、辅助模式名片引荐、幕后请示通道与多账号多租户。">
+<meta property="og:url" content="https://weagent.example.com/scenarios.html">
+<meta property="og:image" content="https://weagent.example.com/assets/og-cover.png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="WeAgent — 全自治微信私域 AI 运营">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="行业场景 · WeAgent">
+<meta name="twitter:description" content="一套行业无关的引擎，换一份业务画像就换一个行业。">
+<meta name="twitter:image" content="https://weagent.example.com/assets/og-cover.png">
+<link rel="stylesheet" href="assets/shared.css">
+<link rel="stylesheet" href="assets/scenarios.css">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='18' fill='%235E5CE6'/%3E%3Cpath fill='%23fff' fill-rule='evenodd' clip-rule='evenodd' d='M18.5 7 H45.5 Q57.5 7 57.5 19 V33 Q57.5 45 45.5 45 H24 L13 57 V44.4 Q6.5 43 6.5 33 V19 Q6.5 7 18.5 7 Z M14 15.5 L20.2 38 L31 23 L33 23 L43.8 38 L50 15.5 L44.3 15.5 L40.4 31 L33.4 21 L30.6 21 L23.6 31 L19.7 15.5 Z M47 6.1 C47 12.02 46 13.5 42 13.5 C46 13.5 47 14.98 47 20.9 C47 14.98 48 13.5 52 13.5 C48 13.5 47 12.02 47 6.1 Z'/%3E%3C/svg%3E">
+</head>
+<body>
+
+<!-- ============ 导航 ============ -->
+<nav class="nav">
+  <div class="wrap nav-inner">
+    <a href="index.html" class="brand">
+      <span class="brand-mark"><svg viewBox="0 0 64 64" fill="none"><path fill="#fff" fill-rule="evenodd" clip-rule="evenodd" d="M18.5 7 H45.5 Q57.5 7 57.5 19 V33 Q57.5 45 45.5 45 H24 L13 57 V44.4 Q6.5 43 6.5 33 V19 Q6.5 7 18.5 7 Z M14 15.5 L20.2 38 L31 23 L33 23 L43.8 38 L50 15.5 L44.3 15.5 L40.4 31 L33.4 21 L30.6 21 L23.6 31 L19.7 15.5 Z M47 6.1 C47 12.02 46 13.5 42 13.5 C46 13.5 47 14.98 47 20.9 C47 14.98 48 13.5 52 13.5 C48 13.5 47 12.02 47 6.1 Z"/></svg></span>
+      WeAgent
+    </a>
+    <div class="nav-links">
+      <a href="index.html" data-lang-zh>首页</a><a href="index.html" data-lang-en>Home</a>
+      <a href="solutions.html" data-lang-zh>解决什么</a><a href="solutions.html" data-lang-en>Solutions</a>
+      <a href="product.html" data-lang-zh>产品能力</a><a href="product.html" data-lang-en>Product</a>
+      <a href="agents.html" data-lang-zh>智能体编队</a><a href="agents.html" data-lang-en>Agents</a>
+      <a href="technology.html" data-lang-zh>技术架构</a><a href="technology.html" data-lang-en>Technology</a>
+      <a href="engineering.html" data-lang-zh>工程深度</a><a href="engineering.html" data-lang-en>Engineering</a>
+      <a href="evolution.html" data-lang-zh>自我演化</a><a href="evolution.html" data-lang-en>Self-evolution</a>
+      <a href="scenarios.html" class="active" data-lang-zh>行业场景</a><a href="scenarios.html" class="active" data-lang-en>Scenarios</a>
+      <a href="observability.html" data-lang-zh>运营透视</a><a href="observability.html" data-lang-en>Observability</a>
+      <a href="trust.html" data-lang-zh>信任与安全</a><a href="trust.html" data-lang-en>Trust</a>
+    </div>
+    <div class="nav-right">
+      <div class="lang-toggle">
+        <button data-lang-btn="zh">中</button>
+        <button data-lang-btn="en">EN</button>
+      </div>
+      <button class="nav-burger" aria-label="menu"><svg viewBox="0 0 24 24" width="22" height="22" fill="none"><path d="M4 7h16M4 12h16M4 17h16" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg></button>
+    </div>
+  </div>
+</nav>
+<div class="mobile-menu">
+  <a href="index.html" data-lang-zh>首页</a><a href="index.html" data-lang-en>Home</a>
+  <a href="solutions.html" data-lang-zh>解决什么</a><a href="solutions.html" data-lang-en>Solutions</a>
+  <a href="product.html" data-lang-zh>产品能力</a><a href="product.html" data-lang-en>Product</a>
+  <a href="agents.html" data-lang-zh>智能体编队</a><a href="agents.html" data-lang-en>Agents</a>
+  <a href="technology.html" data-lang-zh>技术架构</a><a href="technology.html" data-lang-en>Technology</a>
+  <a href="engineering.html" data-lang-zh>工程深度</a><a href="engineering.html" data-lang-en>Engineering</a>
+  <a href="evolution.html" data-lang-zh>自我演化</a><a href="evolution.html" data-lang-en>Self-evolution</a>
+  <a href="scenarios.html" data-lang-zh>行业场景</a><a href="scenarios.html" data-lang-en>Scenarios</a>
+  <a href="observability.html" data-lang-zh>运营透视</a><a href="observability.html" data-lang-en>Observability</a>
+  <a href="trust.html" data-lang-zh>信任与安全</a><a href="trust.html" data-lang-en>Trust</a>
+</div>
+
+<!-- ============ 页内英雄 ============ -->
+<header class="page-hero section-deep">
+  <div class="page-hero-bg" aria-hidden="true"><div class="hero-glow hero-glow-1" style="position:absolute;width:560px;height:560px;border-radius:50%;filter:blur(90px);opacity:.5;top:-160px;left:-100px;background:radial-gradient(circle,rgba(15,181,168,.42),transparent 68%)"></div><div class="hero-glow" style="position:absolute;width:480px;height:480px;border-radius:50%;filter:blur(90px);opacity:.4;top:-40px;right:-80px;background:radial-gradient(circle,rgba(94,92,230,.5),transparent 70%)"></div></div>
+  <div class="wrap" style="position:relative">
+    <span class="eyebrow reveal" data-lang-zh>行业场景 · 一套引擎适配任意业务</span><span class="eyebrow reveal" data-lang-en>Scenarios · one engine, any business</span>
+    <h1 class="h-display reveal reveal-d1" data-lang-zh>换一份业务画像，<span class="text-grad">就换一个行业</span></h1>
+    <h1 class="h-display reveal reveal-d1" data-lang-en>Swap one profile, <span class="text-grad">swap the entire industry</span></h1>
+    <p class="lead reveal reveal-d2" data-lang-zh>引擎本身不认识"销售""教育""情感陪伴"。所有业务语义——阶段、意图、公式、口吻、关系——都收进一份 DomainProfile。开箱即用的默认画像与销售域字节等价；要做别的行业，配置另一份画像即可，引擎代码一行不改。</p>
+    <p class="lead reveal reveal-d2" data-lang-en>The engine knows nothing of "sales," "education" or "companionship." All business semantics — stages, intent, formulas, voice, relationships — live in one DomainProfile. The shipped default is byte-equivalent to the sales domain; another industry is just another profile, with zero engine changes.</p>
+    <div class="page-hero-meta reveal reveal-d3">
+      <span class="pill" data-lang-zh>DomainProfile 单一事实源</span><span class="pill" data-lang-en>Single source of truth</span>
+      <span class="pill" data-lang-zh>触达轴 × 口吻轴</span><span class="pill" data-lang-en>Reach × voice axes</span>
+      <span class="pill" data-lang-zh>多账号 · 多租户</span><span class="pill" data-lang-en>Multi-account · multi-tenant</span>
+    </div>
+  </div>
+</header>
+
+<!-- ============ 01 通用化底座 ============ -->
+<section class="section" id="universal">
+  <div class="wrap">
+    <div class="base-grid">
+      <div class="base-copy reveal">
+        <span class="eyebrow" data-lang-zh>01 · 通用化底座</span><span class="eyebrow" data-lang-en>01 · Universal base</span>
+        <h2 data-lang-zh>业务的全部"个性"，收进一份画像</h2>
+        <h2 data-lang-en>A business's whole personality, in one profile</h2>
+        <p data-lang-zh>DomainProfile 是引擎读取业务语义的唯一入口：可配置维度（阶段 / 意图等）、承诺词、覆盖维度、对话模式、运营模式、四个方法论公式、记忆维度、成效极性、知识切片角色、阈值覆盖、评审取向、灵魂与方法论覆盖——全部在这一份结构里。</p>
+        <p data-lang-en>DomainProfile is the engine's only entry to business meaning: configurable dimensions (stage / intent), commitment markers, coverage dimensions, conversation modes, operation mode, four methodology formulas, memory dimensions, outcome polarity, chunk roles, threshold overrides, reviewer orientation, soul and methodology overrides — all in one structure.</p>
+        <p data-lang-zh>默认画像的 id 是 <code style="font-family:var(--mono);color:var(--brand)">__default__</code>，被设计为逐字复刻销售域，并由一组"字节等价"护栏测试锁死——意味着默认行为稳定可预期，而任何新行业都从复制、改写这份画像开始。</p>
+        <p data-lang-en>The default profile id is <code style="font-family:var(--mono);color:var(--brand)">__default__</code>, designed to reproduce the sales domain verbatim and locked by byte-equivalence guard tests — so default behavior is stable and predictable, and every new industry starts by copying and editing this profile.</p>
+        <div class="mono-note" data-lang-zh><b>行业无关引擎：</b>状态机、评审闸门、知识路由、发送网关都读画像里的配置，不内嵌任何单一行业的硬编码取值。</div>
+        <div class="mono-note" data-lang-en><b>Industry-agnostic engine:</b> the state machine, review gates, knowledge router and send gateway all read profile config — no single industry's values are hard-coded.</div>
+      </div>
+      <div class="profile-stack reveal reveal-d2">
+        <div class="profile-row is-default">
+          <div class="pr-main">
+            <div class="pr-id">__default__</div>
+            <div class="pr-desc" data-lang-zh>开箱即用默认画像 · 与销售域字节等价 · 护栏测试锁死</div>
+            <div class="pr-desc" data-lang-en>Shipped default · byte-equivalent to sales · locked by guards</div>
+          </div>
+          <span class="pr-badge base" data-lang-zh>基线</span><span class="pr-badge base" data-lang-en>Baseline</span>
+        </div>
+        <div class="profile-row">
+          <div class="pr-main">
+            <div class="pr-id">sales_with_relationships</div>
+            <div class="pr-desc" data-lang-zh>销售 + 关系类型轴 · 按 customer / peer / friend 分流运营模式</div>
+            <div class="pr-desc" data-lang-en>Sales + relationship axis · routes mode by customer / peer / friend</div>
+          </div>
+          <span class="pr-badge live" data-lang-zh>示例画像</span><span class="pr-badge live" data-lang-en>Sample</span>
+        </div>
+        <div class="profile-row">
+          <div class="pr-main">
+            <div class="pr-id">emotional_companion_minimal</div>
+            <div class="pr-desc" data-lang-zh>情感陪伴最小画像 · 不同的公式与口吻取向，同一套引擎</div>
+            <div class="pr-desc" data-lang-en>Minimal companionship profile · different formulas & voice, same engine</div>
+          </div>
+          <span class="pr-badge live" data-lang-zh>示例画像</span><span class="pr-badge live" data-lang-en>Sample</span>
+        </div>
+        <div class="profile-row">
+          <div class="pr-main">
+            <div class="pr-id" style="color:var(--ink-3)">your_industry_here</div>
+            <div class="pr-desc" data-lang-zh>教育 / 咨询 / 健康 / 本地服务…复制默认画像，改写维度与公式即可</div>
+            <div class="pr-desc" data-lang-en>Education / advisory / health / local services… copy the default, edit dimensions & formulas</div>
+          </div>
+          <span class="pr-badge" style="color:var(--ink-3);background:var(--card-2);border:1px solid var(--hair)" data-lang-zh>可配置</span><span class="pr-badge" style="color:var(--ink-3);background:var(--card-2);border:1px solid var(--hair)" data-lang-en>Configurable</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- 可配置维度 -->
+    <div class="dim-grid">
+      <div class="dim-cell reveal"><div class="dc-field">profile_dimensions</div><h5 data-lang-zh>分类维度</h5><h5 data-lang-en>Dimensions</h5><p data-lang-zh>客户阶段、意图等级等的取值集，来自标签字典；新取值收集为候选待审，不阻塞决策。</p><p data-lang-en>Value sets for stage, intent etc. from the taxonomy; new values become review candidates, never block.</p></div>
+      <div class="dim-cell reveal reveal-d1"><div class="dc-field">business_formulas</div><h5 data-lang-zh>方法论公式</h5><h5 data-lang-en>Formulas</h5><p data-lang-zh>信任、成交就绪、情感价值、下一步动作分——四个文字表达式，由 LLM 自评。</p><p data-lang-en>Trust, conversion-readiness, emotional value, next-best-action — four text expressions, self-scored by the LLM.</p></div>
+      <div class="dim-cell reveal reveal-d2"><div class="dc-field">conversation_modes</div><h5 data-lang-zh>对话模式</h5><h5 data-lang-en>Conv. modes</h5><p data-lang-zh>不同业务的对话基调与节奏由画像定义，而非写死在代码里。</p><p data-lang-en>Each business's conversational tone and cadence is defined by the profile, not the code.</p></div>
+      <div class="dim-cell reveal reveal-d3"><div class="dc-field">threshold_overrides</div><h5 data-lang-zh>阈值覆盖</h5><h5 data-lang-en>Thresholds</h5><p data-lang-zh>事实风险、压力风险等闸门阈值可按行业覆盖，并被钳制在合法区间。</p><p data-lang-en>Gate thresholds like fact/pressure risk are overridable per industry, clamped to a valid range.</p></div>
+      <div class="dim-cell reveal"><div class="dc-field">outcome_polarity</div><h5 data-lang-zh>成效极性</h5><h5 data-lang-en>Outcome polarity</h5><p data-lang-zh>什么算"好结果"因业务而异——成交、复诊、续费或仅是被信任地陪伴。</p><p data-lang-en>What counts as a good outcome differs — a deal, a revisit, a renewal, or simply trusted company.</p></div>
+      <div class="dim-cell reveal reveal-d1"><div class="dc-field">chunk_roles</div><h5 data-lang-zh>知识角色</h5><h5 data-lang-en>Chunk roles</h5><p data-lang-zh>知识切片在本行业里扮演的角色（卖点、政策、案例…）由画像声明。</p><p data-lang-en>The role each knowledge slice plays in this industry (selling point, policy, case…) is profile-declared.</p></div>
+      <div class="dim-cell reveal reveal-d2"><div class="dc-field">reviewer_orientation</div><h5 data-lang-zh>评审取向</h5><h5 data-lang-en>Reviewer bias</h5><p data-lang-zh>独立评审在本行业更看重什么、对低风险自报是否更不信任，可配置。</p><p data-lang-en>What the independent reviewer weights, and whether to distrust self-reported low risk, is configurable.</p></div>
+      <div class="dim-cell reveal reveal-d3"><div class="dc-field">soul_override</div><h5 data-lang-zh>灵魂覆盖</h5><h5 data-lang-en>Soul override</h5><p data-lang-zh>整体人格基调可按行业覆盖，决定 AI 在这条业务线上"是谁"。</p><p data-lang-en>The overall persona can be overridden per industry — who the AI is on this business line.</p></div>
+    </div>
+  </div>
+</section>
+
+<!-- ============ 02 行业示例 ============ -->
+<section class="section section-tint" id="industries">
+  <div class="wrap">
+    <div class="s-head reveal">
+      <span class="eyebrow" data-lang-zh>02 · 行业映射</span><span class="eyebrow" data-lang-en>02 · Industry mapping</span>
+      <h2 class="h-section" data-lang-zh>同一套引擎，落到<span class="text-grad">不同私域生意</span></h2>
+      <h2 class="h-section" data-lang-en>One engine, mapped onto <span class="text-grad">different private-domain businesses</span></h2>
+      <p class="lead" data-lang-zh>下面是几类典型私域场景。代码里已带销售与情感陪伴两类示例画像；其余方向都按同样的方式——复制默认画像、改写维度与公式、配置知识库——即可适配，无需改引擎。</p>
+      <p class="lead" data-lang-en>A few typical private-domain scenarios. Sales and companionship ship as sample profiles in code; the rest adapt the same way — copy the default, edit dimensions and formulas, configure the knowledge base — with no engine changes.</p>
+    </div>
+    <div class="ind-grid">
+
+      <div class="card card-hover ind-card reveal">
+        <div class="ind-top">
+          <span class="ind-ico"><svg viewBox="0 0 24 24" fill="none"><path d="M4 7l8-4 8 4-8 4-8-4z" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round"/><path d="M4 7v10l8 4 8-4V7" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round"/></svg></span>
+          <div><h3 data-lang-zh>高客单销售</h3><h3 data-lang-en>High-ticket sales</h3><div class="ind-id">profile · __default__</div></div>
+        </div>
+        <p data-lang-zh>长周期培育、信任建立、成交就绪度评估。产品声明必须有可核验知识支撑，否则发送被拦截。这是默认画像直接覆盖的场景。</p>
+        <p data-lang-en>Long-cycle nurturing, trust-building, conversion-readiness scoring. Product claims must be grounded or the send is blocked. Covered directly by the default profile.</p>
+        <div class="ind-tags"><span class="ind-tag" data-lang-zh>信任公式</span><span class="ind-tag" data-lang-en>Trust formula</span><span class="ind-tag" data-lang-zh>成交就绪</span><span class="ind-tag" data-lang-en>Readiness</span><span class="ind-tag" data-lang-zh>产品核验</span><span class="ind-tag" data-lang-en>Grounding</span></div>
+      </div>
+
+      <div class="card card-hover ind-card reveal reveal-d1">
+        <div class="ind-top">
+          <span class="ind-ico"><svg viewBox="0 0 24 24" fill="none"><path d="M12 4l9 4-9 4-9-4 9-4z" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round"/><path d="M7 10v5c0 1.5 2.2 3 5 3s5-1.5 5-3v-5" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></svg></span>
+          <div><h3 data-lang-zh>教育招生 / 课程顾问</h3><h3 data-lang-en>Education & course advisory</h3><div class="ind-id cfg" data-lang-zh>画像 · 可配置</div><div class="ind-id cfg" data-lang-en>profile · configurable</div></div>
+        </div>
+        <p data-lang-zh>试听、报名、续费的阶段链路，家长决策与学员体验双线。把"成交就绪"改写为"报名就绪"，知识库换成课程与师资。</p>
+        <p data-lang-en>Trial → enroll → renew stages, with parent decisions and student experience in parallel. Rewrite "conversion" as "enrollment," swap the knowledge base for courses and faculty.</p>
+        <div class="ind-tags"><span class="ind-tag" data-lang-zh>阶段自定义</span><span class="ind-tag" data-lang-en>Custom stages</span><span class="ind-tag" data-lang-zh>课程知识</span><span class="ind-tag" data-lang-en>Course KB</span></div>
+      </div>
+
+      <div class="card card-hover ind-card reveal reveal-d2">
+        <div class="ind-top">
+          <span class="ind-ico"><svg viewBox="0 0 24 24" fill="none"><path d="M12 21s-7-4.3-7-10a4 4 0 017-2.6A4 4 0 0119 11c0 5.7-7 10-7 10z" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round"/></svg></span>
+          <div><h3 data-lang-zh>情感陪伴 / 长期关系</h3><h3 data-lang-en>Companionship & relationships</h3><div class="ind-id">profile · emotional_companion_minimal</div></div>
+        </div>
+        <p data-lang-zh>不追求成交，追求被信任地长期陪伴。情感价值成为核心公式，成效极性也随之改变。代码里已有最小示例画像。</p>
+        <p data-lang-en>Not chasing deals but trusted, long-term company. Emotional value becomes the core formula and outcome polarity shifts. A minimal sample profile ships in code.</p>
+        <div class="ind-tags"><span class="ind-tag" data-lang-zh>情感价值公式</span><span class="ind-tag" data-lang-en>Emotional value</span><span class="ind-tag" data-lang-zh>成效极性</span><span class="ind-tag" data-lang-en>Polarity</span></div>
+      </div>
+
+      <div class="card card-hover ind-card reveal">
+        <div class="ind-top">
+          <span class="ind-ico"><svg viewBox="0 0 24 24" fill="none"><path d="M12 3v18M5 8l7-5 7 5M5 8v9a2 2 0 002 2h10a2 2 0 002-2V8" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round" stroke-linecap="round"/></svg></span>
+          <div><h3 data-lang-zh>健康 / 医美咨询</h3><h3 data-lang-en>Health & aesthetics</h3><div class="ind-id cfg" data-lang-zh>画像 · 可配置</div><div class="ind-id cfg" data-lang-en>profile · configurable</div></div>
+        </div>
+        <p data-lang-zh>合规是命门：调高事实风险与产品准确度阈值，把"绝不替客户做医疗判断"写进灵魂与策略，超界事项一律请示。</p>
+        <p data-lang-en>Compliance is everything: raise fact-risk and product-accuracy thresholds, bake "never make medical calls for the client" into soul and policy, escalate anything out of scope.</p>
+        <div class="ind-tags"><span class="ind-tag" data-lang-zh>阈值收紧</span><span class="ind-tag" data-lang-en>Tighter gates</span><span class="ind-tag" data-lang-zh>合规请示</span><span class="ind-tag" data-lang-en>Escalation</span></div>
+      </div>
+
+      <div class="card card-hover ind-card reveal reveal-d1">
+        <div class="ind-top">
+          <span class="ind-ico"><svg viewBox="0 0 24 24" fill="none"><path d="M4 9h16v11H4zM9 9V5a3 3 0 016 0v4" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round"/></svg></span>
+          <div><h3 data-lang-zh>本地门店 / 到店服务</h3><h3 data-lang-en>Local stores & visits</h3><div class="ind-id cfg" data-lang-zh>画像 · 可配置</div><div class="ind-id cfg" data-lang-en>profile · configurable</div></div>
+        </div>
+        <p data-lang-zh>目标是把线上对话变成到店。开启辅助模式后，识别到"想到店参观"的客户可由 AI 主动引荐真人顾问名片完成临门一脚。</p>
+        <p data-lang-en>The goal is turning chats into visits. With assist mode on, customers signaling "want to visit" can be handed a human advisor's card by the AI for the last step.</p>
+        <div class="ind-tags"><span class="ind-tag" data-lang-zh>辅助模式</span><span class="ind-tag" data-lang-en>Assist mode</span><span class="ind-tag" data-lang-zh>名片引荐</span><span class="ind-tag" data-lang-en>Referral</span></div>
+      </div>
+
+      <div class="card card-hover ind-card reveal reveal-d2">
+        <div class="ind-top">
+          <span class="ind-ico"><svg viewBox="0 0 24 24" fill="none"><circle cx="12" cy="12" r="9" stroke="currentColor" stroke-width="1.7"/><path d="M12 7v5l3 2" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+          <div><h3 data-lang-zh>专业服务 / 咨询顾问</h3><h3 data-lang-en>Professional services</h3><div class="ind-id cfg" data-lang-zh>画像 · 可配置</div><div class="ind-id cfg" data-lang-en>profile · configurable</div></div>
+        </div>
+        <p data-lang-zh>法律、财税、保险等强专业域：知识切片角色重写为"条款 / 案例 / 风险提示"，超出职权的判断走幕后请示，再由 AI 转述结论。</p>
+        <p data-lang-en>Law, tax, insurance and other expert domains: rewrite chunk roles as "clause / case / risk note," route out-of-mandate calls through the principal, and relay the verdict via the AI.</p>
+        <div class="ind-tags"><span class="ind-tag" data-lang-zh>知识角色重写</span><span class="ind-tag" data-lang-en>Chunk roles</span><span class="ind-tag" data-lang-zh>幕后请示</span><span class="ind-tag" data-lang-en>Principal</span></div>
+      </div>
+
+    </div>
+  </div>
+</section>
+
+<!-- ============ 03 两条正交轴 ============ -->
+<section class="section section-deep" id="twin">
+  <div class="hero-bg" aria-hidden="true"><div class="hero-glow" style="position:absolute;width:680px;height:680px;border-radius:50%;filter:blur(100px);opacity:.18;top:30%;left:60%;transform:translate(-50%,-50%);background:radial-gradient(circle,rgba(94,92,230,.45),transparent 72%)"></div></div>
+  <div class="wrap" style="position:relative">
+    <div class="section-head reveal">
+      <span class="eyebrow" data-lang-zh>03 · 数字分身</span><span class="eyebrow" data-lang-en>03 · Digital twin</span>
+      <h2 class="h-section" data-lang-zh>"对谁"和"怎么说"，<span class="text-grad">是两条独立的轴</span></h2>
+      <h2 class="h-section" data-lang-en>"To whom" and "how it speaks" <span class="text-grad">are two separate axes</span></h2>
+      <p class="lead" data-lang-zh>把数字分身拆成两条正交的轴，互不耦合：触达轴决定对不同关系采取什么运营模式，口吻轴决定 AI 用什么语气说话。两者可以任意组合。</p>
+      <p class="lead" data-lang-en>The digital twin splits into two orthogonal, decoupled axes: the reach axis sets the operation mode per relationship; the voice axis sets how the AI speaks. They combine freely.</p>
+    </div>
+    <div class="axes-grid">
+      <div class="axis-card reach reveal">
+        <span class="ax-label" data-lang-zh>触达轴 · per_relationship_operation_mode</span><span class="ax-label" data-lang-en>Reach axis · per_relationship_operation_mode</span>
+        <h3 data-lang-zh>对不同关系，不同运营模式</h3><h3 data-lang-en>Different modes for different relationships</h3>
+        <p data-lang-zh>联系人的关系类型来自全局标签字典的三个 canonical 值。画像可为每种关系映射不同的运营模式——比如对客户主动跟进，对同行只被动回复，对朋友自然寒暄。</p>
+        <p data-lang-en>A contact's relationship type comes from three canonical values in the global taxonomy. The profile maps each to its own operation mode — proactively follow up customers, only react to peers, chat naturally with friends.</p>
+        <div class="ax-vals">
+          <span class="ax-val">customer</span><span class="ax-arrow">·</span><span class="ax-val">peer</span><span class="ax-arrow">·</span><span class="ax-val">friend</span>
+        </div>
+        <div class="ax-foot" data-lang-zh>护栏：默认画像的 per_relationship 恒为 None——不配置就不会凭空切换模式。</div>
+        <div class="ax-foot" data-lang-en>Guard: the default profile keeps per_relationship as None — without config, modes never switch on their own.</div>
+      </div>
+      <div class="axis-card voice reveal reveal-d1">
+        <span class="ax-label" data-lang-zh>口吻轴 · custom_agent_instructions</span><span class="ax-label" data-lang-en>Voice axis · custom_agent_instructions</span>
+        <h3 data-lang-zh>对单个人，定制专属口吻</h3><h3 data-lang-en>A bespoke voice for one person</h3>
+        <p data-lang-zh>每个联系人都可写一段自然语言的专属指令。它在系统提示词的最末位注入，被声明为最高优先级，与灵魂、策略冲突时以它为准——让 AI 对这个人"换一种说法"，而不必新建一套人格。</p>
+        <p data-lang-en>Each contact can carry a natural-language instruction. It is injected last in the system prompt, declared highest priority, overriding soul and policy on conflict — so the AI "talks differently" to this person without a whole new persona.</p>
+        <div class="ax-vals">
+          <span class="ax-val" data-lang-zh>自然语言 · 最高优先级</span><span class="ax-val" data-lang-en>Natural language · top priority</span>
+        </div>
+        <div class="ax-foot" data-lang-zh>注入位置靠后 = 权重更高；灵魂主动让位由提示词文案声明实现。</div>
+        <div class="ax-foot" data-lang-en>Later injection = higher weight; the soul yields by prompt wording, by design.</div>
+      </div>
+    </div>
+    <p class="axes-note reveal" data-lang-zh>两轴正交：你可以对一位<b>朋友</b>关系的人，配置<b>主动问候</b>的触达模式，同时叠加一段<b>更随性口语</b>的专属口吻——互不干扰。</p>
+    <p class="axes-note reveal" data-lang-en>Orthogonal axes: a <b>friend</b> can get a <b>proactive-greeting</b> reach mode plus a <b>more casual</b> bespoke voice — independently.</p>
+  </div>
+</section>
+
+<!-- ============ 04 关系识别链路 ============ -->
+<section class="section" id="relationship">
+  <div class="wrap">
+    <div class="s-head reveal">
+      <span class="eyebrow" data-lang-zh>04 · 关系识别 · 识别而非接管</span><span class="eyebrow" data-lang-en>04 · Relationship detection</span>
+      <h2 class="h-section" data-lang-zh>AI 能识别关系，<span class="text-grad">但改不了关系</span></h2>
+      <h2 class="h-section" data-lang-en>The AI detects relationships, <span class="text-grad">but can't change them</span></h2>
+      <p class="lead" data-lang-zh>关系类型不是只能手工打标。AI 在对话中识别出关系类型建议，但建议要经过字典校验、落入待审队列，运营确认后才生效——AI 的判断从不直接改写联系人。</p>
+      <p class="lead" data-lang-en>Relationship type isn't manual-only. The AI proposes a type from conversation, but the suggestion is dictionary-validated, queued for review, and takes effect only after operator confirmation — the AI never rewrites the contact directly.</p>
+    </div>
+    <div class="chain-flow">
+      <div class="chain-node reveal">
+        <div class="cn-no">01</div>
+        <h5 data-lang-zh>注入引导</h5><h5 data-lang-en>Inject guidance</h5>
+        <div class="cn-fn">decision.rs</div>
+        <p data-lang-zh>决策时向 Agent 注入"关系类型建议"的引导，让它在思考里给出判断。</p>
+        <p data-lang-en>At decision time the agent is prompted to suggest a relationship type in its reasoning.</p>
+      </div>
+      <div class="chain-node reveal reveal-d1">
+        <div class="cn-no">02</div>
+        <h5 data-lang-zh>提取建议</h5><h5 data-lang-en>Extract</h5>
+        <div class="cn-fn">extract_relationship_type_suggestion</div>
+        <p data-lang-zh>网关从决策结果里提取关系建议，进入校验前不做任何写入。</p>
+        <p data-lang-en>The gateway extracts the suggestion; nothing is written before validation.</p>
+      </div>
+      <div class="chain-node reveal reveal-d2">
+        <div class="cn-no">03</div>
+        <h5 data-lang-zh>字典校验</h5><h5 data-lang-en>Validate</h5>
+        <div class="cn-fn">validate_dimension_value · MachineWrite</div>
+        <p data-lang-zh>必须命中标签字典的合法取值，越界直接拒绝——AI 不能发明新关系类型。</p>
+        <p data-lang-en>Must hit a valid taxonomy value; out-of-range is rejected — no inventing new types.</p>
+      </div>
+      <div class="chain-node reveal reveal-d3">
+        <div class="cn-no">04</div>
+        <h5 data-lang-zh>落待审</h5><h5 data-lang-en>Queue for review</h5>
+        <div class="cn-fn">status = "pending"</div>
+        <p data-lang-zh>写入建议队列、标记待审，运营在收件箱确认后才作用于联系人。</p>
+        <p data-lang-en>Written as pending; only applied to the contact after operator confirmation in the inbox.</p>
+      </div>
+    </div>
+    <div class="chain-guard reveal">
+      <svg viewBox="0 0 24 24" fill="none"><path d="M12 3l8 4v5c0 5-3.5 8-8 9-4.5-1-8-4-8-9V7l8-4z" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round"/><path d="M9 12l2 2 4-4" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      <p data-lang-zh><b>为什么这样设计：</b>关系类型会改变运营模式，是高影响动作。让 AI 识别（省去运营逐个手标），但把"是否生效"留给人——既通用化又不失控。这与"AI 自创标签先落候选待审"是同一条铁律。</p>
+      <p data-lang-en><b>Why:</b> relationship type changes the operation mode — a high-impact action. The AI detects (sparing manual tagging) but humans decide whether it takes effect — universal yet controlled. Same rule as "AI-proposed tags land as candidates first."</p>
+    </div>
+  </div>
+</section>
+
+<!-- ============ 05 辅助模式 ============ -->
+<section class="section section-tint" id="assist">
+  <div class="wrap">
+    <div class="s-head reveal">
+      <span class="eyebrow" data-lang-zh>05 · 辅助模式 · 受控例外</span><span class="eyebrow" data-lang-en>05 · Assist mode · controlled exception</span>
+      <h2 class="h-section" data-lang-zh>临门一脚，<span class="text-grad">由 AI 主动把真人递上去</span></h2>
+      <h2 class="h-section" data-lang-en>For the final step, <span class="text-grad">the AI introduces a human</span></h2>
+      <p class="lead" data-lang-zh>默认全自治模式下，客户永远只跟 AI 对话。辅助模式是账号级、默认关闭的受控例外：当 AI 判定客户契合人类预先标注的引荐条件，它会主动把真人专属顾问的名片推送过去，自己退为辅助答疑——发起方与转述方仍是 AI。</p>
+      <p class="lead" data-lang-en>By default the customer only ever talks to the AI. Assist mode is an account-level, off-by-default exception: when the AI judges a customer fits human-annotated referral conditions, it proactively pushes a human advisor's card and steps back to support — the AI is still the initiator.</p>
+    </div>
+    <div class="assist-grid">
+      <div class="assist-steps reveal">
+        <div class="assist-step">
+          <span class="as-no">1</span>
+          <div class="as-body"><h5 data-lang-zh>账号显式开启</h5><h5 data-lang-en>Account opts in</h5><p data-lang-zh>辅助模式默认 <code>false</code>，必须由账号显式打开；还可对单个客户用 <code>assist_mode_override</code> 强制开 / 关。</p><p data-lang-en>Assist mode defaults to <code>false</code> and must be enabled per account; a single customer can be forced on/off via <code>assist_mode_override</code>.</p></div>
+        </div>
+        <div class="assist-step">
+          <span class="as-no">2</span>
+          <div class="as-body"><h5 data-lang-zh>人类标注引荐条件</h5><h5 data-lang-en>Human annotates conditions</h5><p data-lang-zh>顾问名片库里录入触发提示（如"明确要签约 / 到店参观"），作为候选清单注入 AI 的决策上下文。</p><p data-lang-en>The advisor card library carries trigger hints (e.g. "clearly wants to sign / visit"), injected as a candidate list into the AI's decision context.</p></div>
+        </div>
+        <div class="assist-step">
+          <span class="as-no">3</span>
+          <div class="as-body"><h5 data-lang-zh>AI 自主判定</h5><h5 data-lang-en>AI decides</h5><p data-lang-zh>提示是软引导而非硬过滤门——由 AI 在对话语境中自主选择是否、何时引荐，运营 Agent 因此更简单。</p><p data-lang-en>Hints are soft guidance, not a hard filter — the AI chooses whether and when to refer, keeping the ops agent simpler.</p></div>
+        </div>
+        <div class="assist-step">
+          <span class="as-no">4</span>
+          <div class="as-body"><h5 data-lang-zh>主动推送名片</h5><h5 data-lang-en>Push the card</h5><p data-lang-zh>经 MCP 工具 <code>message_send_namecard</code> 发送真人名片，由客户与顾问对接完成临门一脚。</p><p data-lang-en>Sends the human card via the MCP tool <code>message_send_namecard</code>, letting the customer connect with the advisor for the final step.</p></div>
+        </div>
+      </div>
+      <div class="assist-aside reveal reveal-d1">
+        <span class="aa-flag" data-lang-zh>受控例外 · 默认关闭</span><span class="aa-flag" data-lang-en>Controlled · off by default</span>
+        <h4 data-lang-zh>红线如何保持不变</h4><h4 data-lang-en>How the red line holds</h4>
+        <p data-lang-zh>被引荐的台前顾问 ≠ 幕后决策源（领导），两者解耦。名片是 AI 主动引荐的"发送物"，对话始终是 AI 在说。全自治模式（默认）下"客户永远只跟 AI 对话"的红线一字不动。</p>
+        <p data-lang-en>The front-stage advisor is not the behind-the-scenes principal — the two are decoupled. The card is something the AI sends; the conversation is always the AI speaking. The default-mode red line — customers only ever talk to the AI — stays untouched.</p>
+        <div class="aa-line" data-lang-zh><b>实现状态：</b>名片推送调用已在代码中落地；MCP 入参契约待与服务端 tools/list 最终确认。</div>
+        <div class="aa-line" data-lang-en><b>Status:</b> the card-push call exists in code; the MCP argument contract awaits final confirmation against the server's tools/list.</div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ============ 06 请示通道 ============ -->
+<section class="section section-deep" id="principal">
+  <div class="hero-bg" aria-hidden="true"><div class="hero-glow" style="position:absolute;width:640px;height:640px;border-radius:50%;filter:blur(100px);opacity:.18;top:20%;left:30%;transform:translate(-50%,-50%);background:radial-gradient(circle,rgba(10,132,255,.42),transparent 72%)"></div></div>
+  <div class="wrap" style="position:relative">
+    <div class="section-head reveal">
+      <span class="eyebrow" data-lang-zh>06 · 请示通道 · 幕后决策源</span><span class="eyebrow" data-lang-en>06 · Escalation · the principal</span>
+      <h2 class="h-section" data-lang-zh>遇到拿不准的事，<span class="text-grad">AI 向幕后领导请示</span></h2>
+      <h2 class="h-section" data-lang-en>When unsure, <span class="text-grad">the AI consults a principal</span></h2>
+      <p class="lead" data-lang-zh>"无人工接管"不等于"AI 什么都自己拍板"。遇到超出职权的事，AI 向幕后决策源（领导）请示，拿回结论后用自己的口吻向客户转述——客户从不直接面对真人，对话始终是 AI 在说。这是请示，不是接管。</p>
+      <p class="lead" data-lang-en>"No human handoff" doesn't mean "the AI decides everything." For out-of-mandate matters the AI consults a behind-the-scenes principal, then relays the verdict to the customer in its own voice — the customer never faces a human. This is consultation, not handoff.</p>
+    </div>
+    <div class="esc-grid">
+      <div class="esc-card reveal">
+        <div class="ec-ico" style="background:rgba(94,92,230,.18);color:#C9C5FF"><svg viewBox="0 0 24 24" width="22" height="22" fill="none"><path d="M9 18l6-6-6-6" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></div>
+        <h4 data-lang-zh>超出职权</h4><h4 data-lang-en>Out of scope</h4>
+        <div class="ec-key">out_of_scope_decision</div>
+        <p data-lang-zh>客户提出的事项超出 AI 被授予的决策权限——价格让步、特殊承诺、政策外请求等，须由决策源拍板。</p>
+        <p data-lang-en>The matter exceeds the AI's granted authority — price concessions, special promises, off-policy requests — and needs the principal's call.</p>
+      </div>
+      <div class="esc-card reveal reveal-d1">
+        <div class="ec-ico" style="background:rgba(255,69,58,.14);color:#FF8C84"><svg viewBox="0 0 24 24" width="22" height="22" fill="none"><path d="M12 8v5M12 16v.5" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><circle cx="12" cy="12" r="9" stroke="currentColor" stroke-width="1.7"/></svg></div>
+        <h4 data-lang-zh>高风险被闸</h4><h4 data-lang-en>High-risk gated</h4>
+        <div class="ec-key">high_risk_gated</div>
+        <p data-lang-zh>评审闸门判定动作高风险被拦下，需要人来确认是否放行，而不是 AI 自行强推。</p>
+        <p data-lang-en>A review gate flags the action as high-risk and blocks it, needing human confirmation rather than the AI forcing it through.</p>
+      </div>
+      <div class="esc-card reveal reveal-d2">
+        <div class="ec-ico" style="background:rgba(255,159,10,.16);color:#FFCB6B"><svg viewBox="0 0 24 24" width="22" height="22" fill="none"><circle cx="12" cy="12" r="9" stroke="currentColor" stroke-width="1.7"/><path d="M12 7v5l3 2" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg></div>
+        <h4 data-lang-zh>卡住或未送达</h4><h4 data-lang-en>Stuck or undelivered</h4>
+        <div class="ec-key">stuck_or_undelivered</div>
+        <p data-lang-zh>对话陷入僵局或消息长期未送达，AI 主动上报，避免客户被"晾在那里"。</p>
+        <p data-lang-en>The conversation stalls or a message stays undelivered; the AI raises it proactively so the customer isn't left hanging.</p>
+      </div>
+    </div>
+
+    <!-- 转述链 -->
+    <div class="relay-bar reveal">
+      <div class="relay-node principal">
+        <div class="rn-role" data-lang-zh>幕后决策源</div><div class="rn-role" data-lang-en>Principal</div>
+        <p data-lang-zh>领导在收件箱里给出裁决，从不直接面对客户。</p><p data-lang-en>The principal rules in the inbox, never facing the customer.</p>
+      </div>
+      <div class="relay-arrow"><svg viewBox="0 0 24 24" fill="none"><path d="M5 12h14M13 6l6 6-6 6" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></div>
+      <div class="relay-node ai">
+        <div class="rn-role" data-lang-zh>AI 转述</div><div class="rn-role" data-lang-en>AI relays</div>
+        <p data-lang-zh>裁决以哨兵消息喂回网关，由 AI 用自己的口吻改写转述。</p><p data-lang-en>The verdict re-enters the gateway as a sentinel and the AI rewrites it in its own voice.</p>
+        <div class="rn-fn">relay_principal_decision_to_customer</div>
+      </div>
+      <div class="relay-arrow"><svg viewBox="0 0 24 24" fill="none"><path d="M5 12h14M13 6l6 6-6 6" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></div>
+      <div class="relay-node customer">
+        <div class="rn-role" data-lang-zh>客户</div><div class="rn-role" data-lang-en>Customer</div>
+        <p data-lang-zh>始终只看到 AI 的一句话，感知不到背后的请示过程。</p><p data-lang-en>Only ever sees the AI's reply, unaware of the consultation behind it.</p>
+      </div>
+    </div>
+    <p class="relay-note reveal" data-lang-zh>请示状态在 <b>pending → resolved</b> 之间流转；占位等待期间 AI 给出的兜底回复<b>不含任何转接类措辞</b>——红线在代码层就被守住。</p>
+    <p class="relay-note reveal" data-lang-en>Escalation flows <b>pending → resolved</b>; while waiting, the AI's holding reply contains <b>no handoff wording at all</b> — the red line is enforced in code.</p>
+  </div>
+</section>
+
+<!-- ============ 07 多账号多租户 ============ -->
+<section class="section" id="tenant">
+  <div class="wrap">
+    <div class="s-head reveal">
+      <span class="eyebrow" data-lang-zh>07 · 多账号 · 多租户</span><span class="eyebrow" data-lang-en>07 · Multi-account · multi-tenant</span>
+      <h2 class="h-section" data-lang-zh>一套部署，<span class="text-grad">管多个号、隔多个租户</span></h2>
+      <h2 class="h-section" data-lang-en>One deployment, <span class="text-grad">many accounts, isolated tenants</span></h2>
+      <p class="lead" data-lang-zh>系统按两层键隔离：workspace 是租户边界，account 是单个微信号。几乎所有数据查询都带双键 scope，从根上防止跨租户、跨账号串数据。多账号是一等公民，由专门的调度器轮转。</p>
+      <p class="lead" data-lang-en>Two isolation keys: workspace is the tenant boundary, account is a single WeChat number. Nearly every query is scoped by both keys, preventing cross-tenant and cross-account leakage by construction. Multi-account is a first-class citizen, rotated by a dedicated scheduler.</p>
+    </div>
+    <div class="tenant-grid">
+      <div class="tenant-card ws reveal">
+        <div class="tc-key">workspace_id</div>
+        <h3 data-lang-zh>租户边界</h3><h3 data-lang-en>Tenant boundary</h3>
+        <p data-lang-zh>画像、灵魂、提示词包、知识库、请示通道全部按 workspace 隔离。不同客户、不同业务线之间互不可见，每个租户都有自己的一套配置与数据。</p>
+        <p data-lang-en>Profiles, souls, prompt packs, knowledge bases and escalation channels are all isolated per workspace. Different clients and business lines can't see each other; each tenant owns its config and data.</p>
+        <div class="tc-meta"><span data-lang-zh>画像隔离</span><span data-lang-en>Profile</span><span data-lang-zh>知识隔离</span><span data-lang-en>Knowledge</span><span data-lang-zh>防越权</span><span data-lang-en>Anti-IDOR</span></div>
+      </div>
+      <div class="tenant-card reveal reveal-d1">
+        <div class="tc-key">account_id</div>
+        <h3 data-lang-zh>单个微信号</h3><h3 data-lang-en>Single WeChat account</h3>
+        <p data-lang-zh>一个 workspace 下可挂多个微信号，由多账号调度器轮转运营。Webhook 按 account 路由入站消息，冷启动联系人按账号归属处理，互不串台。</p>
+        <p data-lang-en>A workspace can hold many WeChat accounts, rotated by the multi-account scheduler. Webhooks route inbound by account and cold-start contacts are handled by ownership — no crosstalk.</p>
+        <div class="tc-meta"><span data-lang-zh>账号调度器</span><span data-lang-en>Scheduler</span><span data-lang-zh>Webhook 路由</span><span data-lang-en>Routing</span><span data-lang-zh>独立态势</span><span data-lang-en>Per-account view</span></div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ============ 结尾 CTA ============ -->
+<section class="section cta-band section-deep">
+  <div class="hero-bg" aria-hidden="true"><div class="hero-glow hero-glow-1" style="position:absolute;width:560px;height:560px;border-radius:50%;filter:blur(90px);opacity:.4;top:-160px;left:-80px;background:radial-gradient(circle,rgba(94,92,230,.5),transparent 68%)"></div></div>
+  <div class="wrap cta-inner reveal" style="text-align:center;max-width:720px;margin:0 auto;position:relative">
+    <h2 class="h-section" data-lang-zh>通用，不是<span class="text-grad">放任</span></h2>
+    <h2 class="h-section" data-lang-en>Universal, <span class="text-grad">not unrestrained</span></h2>
+    <p class="lead" data-lang-zh>无论换到哪个行业、对哪种关系、用什么口吻，同一套红线与闸门都不会松动。这正是 WeAgent 敢全自治的底气。</p>
+    <p class="lead" data-lang-en>Whatever the industry, relationship or voice, the same red lines and gates never loosen. That's what lets WeAgent run fully autonomously.</p>
+    <div class="hero-cta" style="justify-content:center;margin-top:8px">
+      <a href="trust.html" class="btn btn-primary"><span data-lang-zh>看红线与守门</span><span data-lang-en>See the hard lines</span><svg viewBox="0 0 24 24" fill="none"><path d="M5 12h14M13 6l6 6-6 6" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></a>
+      <a href="technology.html" class="btn btn-ghost"><span data-lang-zh>看技术架构</span><span data-lang-en>The architecture</span></a>
+    </div>
+  </div>
+</section>
+
+<!-- ============ 页脚 ============ -->
+<footer class="footer">
+  <div class="wrap">
+    <div class="footer-grid">
+      <div class="footer-brand">
+        <a href="index.html" class="brand"><span class="brand-mark"><svg viewBox="0 0 64 64" fill="none"><path fill="#fff" fill-rule="evenodd" clip-rule="evenodd" d="M18.5 7 H45.5 Q57.5 7 57.5 19 V33 Q57.5 45 45.5 45 H24 L13 57 V44.4 Q6.5 43 6.5 33 V19 Q6.5 7 18.5 7 Z M14 15.5 L20.2 38 L31 23 L33 23 L43.8 38 L50 15.5 L44.3 15.5 L40.4 31 L33.4 21 L30.6 21 L23.6 31 L19.7 15.5 Z M47 6.1 C47 12.02 46 13.5 42 13.5 C46 13.5 47 14.98 47 20.9 C47 14.98 48 13.5 52 13.5 C48 13.5 47 12.02 47 6.1 Z"/></svg></span>WeAgent</a>
+        <p data-lang-zh>全自治微信私域 AI 运营系统。客户永远只跟 AI 对话，AI 像真人一样长期经营每一段关系。</p>
+        <p data-lang-en>The autonomous WeChat private-domain AI operator. Customers only ever talk to the AI, which nurtures every relationship over time.</p>
+        <button class="wx-copy" data-wx="agimeme" type="button">
+          <svg viewBox="0 0 24 24" fill="none"><path d="M8.5 14.5c-3 0-5.5-2-5.5-4.6C3 7 5.8 5 9 5s6 2 6 4.9c0 .5-.1 1-.3 1.5M16 19c2.2 0 4-1.4 4-3.3 0-1.9-1.8-3.4-4-3.4s-4 1.5-4 3.4c0 .6.2 1.2.6 1.7L12 19l1.6-.5c.7.3 1.5.5 2.4.5z" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          <span data-lang-zh>顾问微信 <span class="wx-id">agimeme</span></span><span data-lang-en>WeChat <span class="wx-id">agimeme</span></span>
+          <span class="wx-hint" data-lang-zh>点击复制</span><span class="wx-hint" data-lang-en>tap to copy</span>
+        </button>
+      </div>
+      <div>
+        <h5 data-lang-zh>产品</h5><h5 data-lang-en>Product</h5>
+        <div class="footer-links">
+          <a href="solutions.html" data-lang-zh>解决什么问题</a><a href="solutions.html" data-lang-en>What it solves</a>
+          <a href="product.html" data-lang-zh>产品能力</a><a href="product.html" data-lang-en>Product</a>
+          <a href="agents.html" data-lang-zh>智能体编队</a><a href="agents.html" data-lang-en>Agents</a>
+          <a href="scenarios.html" data-lang-zh>行业场景</a><a href="scenarios.html" data-lang-en>Scenarios</a>
+          <a href="product.html#channels" data-lang-zh>管理频道</a><a href="product.html#channels" data-lang-en>Channels</a>
+        </div>
+      </div>
+      <div>
+        <h5 data-lang-zh>技术</h5><h5 data-lang-en>Technology</h5>
+        <div class="footer-links">
+          <a href="technology.html" data-lang-zh>技术架构</a><a href="technology.html" data-lang-en>Architecture</a>
+          <a href="technology.html#gateway" data-lang-zh>统一网关</a><a href="technology.html#gateway" data-lang-en>The gateway</a>
+          <a href="engineering.html" data-lang-zh>工程深度</a><a href="engineering.html" data-lang-en>Engineering depth</a>
+          <a href="evolution.html" data-lang-zh>自我演化</a><a href="evolution.html" data-lang-en>Self-evolution</a>
+        </div>
+      </div>
+      <div>
+        <h5 data-lang-zh>信任</h5><h5 data-lang-en>Trust</h5>
+        <div class="footer-links">
+          <a href="observability.html" data-lang-zh>运营透视</a><a href="observability.html" data-lang-en>Observability</a>
+          <a href="trust.html" data-lang-zh>信任与安全</a><a href="trust.html" data-lang-en>Trust & safety</a>
+          <a href="trust.html#redlines" data-lang-zh>红线与守门</a><a href="trust.html#redlines" data-lang-en>Hard lines</a>
+          <a href="trust.html#audit" data-lang-zh>可审计性</a><a href="trust.html#audit" data-lang-en>Auditability</a>
+        </div>
+      </div>
+    </div>
+    <div class="footer-bottom">
+      <span>© 2026 WeAgent · <span data-lang-zh>私域自主运营</span><span data-lang-en>Autonomous private-domain operations</span></span>
+      <span data-lang-zh>构建于 2026-06-28 · 由 Claude Code 根据项目代码生成 · by opus-4.8 · 11 万行 Rust 代码 · 比例 100%</span><span data-lang-en>Built 2026-06-28 · generated by Claude Code from the project codebase · by opus-4.8 · 110k+ lines of Rust · 100% generated</span>
+      <span data-lang-zh>Rust · Axum · MongoDB · React · MCP</span>
+      <span data-lang-en>Built with Rust · Axum · MongoDB · React · MCP</span>
+    </div>
+  </div>
+</footer>
+
+<script src="assets/i18n.js"></script>
+<script src="assets/shared.js"></script>
+</body>
+</html>
