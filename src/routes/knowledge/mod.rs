@@ -308,6 +308,7 @@ pub(super) fn operation_knowledge_chunk_json(item: OperationKnowledgeChunk) -> V
         "validTo": item.valid_to.and_then(crate::models::dt_to_string),
         "relatedChunks": item.related_chunks,
         "businessTopics": item.business_topics,
+        "productTags": item.product_tags,
         "supersededBy": item.superseded_by,
         "previousVersionId": item.previous_version_id,
         "provenance": provenance_json,
@@ -1338,6 +1339,23 @@ mod tests {
         };
         let v = operation_knowledge_chunk_json(chunk);
         assert_eq!(v["provenance"], json!(null), "provenance 缺失下发 null");
+    }
+
+    #[test]
+    fn chunk_json_emits_product_tags() {
+        // #9 根治：列表投影必须下发 productTags，否则 AI 修复用列表数据作
+        // originalChunk 落库时 productTags 缺失会被 PUT 的 serde default 清空。
+        use crate::models::OperationKnowledgeChunk;
+        let chunk = OperationKnowledgeChunk {
+            product_tags: vec!["方案A".to_string(), "方案B".to_string()],
+            ..Default::default()
+        };
+        let v = operation_knowledge_chunk_json(chunk);
+        assert_eq!(
+            v["productTags"],
+            json!(["方案A", "方案B"]),
+            "列表投影必须下发 productTags(camelCase),防 AI 修复落库清空"
+        );
     }
 
     // ── G-后续Ⅱ/1：纯逻辑 helper 单测扩展 ─────────────────────────────────
