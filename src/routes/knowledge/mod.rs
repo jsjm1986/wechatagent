@@ -1509,6 +1509,32 @@ mod tests {
         );
     }
 
+    #[test]
+    fn knowledge_usage_json_matches_contract_fixture() {
+        use crate::models::KnowledgeUsageLog;
+        use mongodb::bson::{doc, oid::ObjectId, DateTime};
+
+        let log = KnowledgeUsageLog {
+            id: Some(ObjectId::parse_str("64a1f2c3e4b5a6978899b001").unwrap()),
+            workspace_id: "ws-1".to_string(),
+            account_id: "acc-1".to_string(),
+            contact_wxid: Some("wxid_abc".to_string()),
+            run_id: "run-1".to_string(),
+            knowledge_ids: vec![ObjectId::parse_str("64a1f2c3e4b5a6978899b002").unwrap()],
+            route_result: doc! { "matched": 2i32, "strategy": "catalog" },
+            reply_text: Some("回复正文".to_string()),
+            review_approved: true,
+            blocked_reason: Some("blocked_unverified_product_claim".to_string()),
+            tool_trace: vec![doc! { "tool": "search", "ms": 12i32 }],
+            created_at: DateTime::from_millis(1_700_000_000_000),
+        };
+        let projected = knowledge_usage_json(log);
+        crate::routes::contract_snapshot::assert_contract_fixture(
+            "knowledge_usage_log",
+            projected,
+        );
+    }
+
     /// 根治 chunk PUT replace_one 清空 model 字段：请求体无法表达的 13 个字段 +
     /// created_at 必须从原 chunk 回填，请求体能表达的字段（title 等）仍来自 next。
     #[test]
