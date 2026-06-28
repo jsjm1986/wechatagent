@@ -20,6 +20,7 @@ import { useToast } from "../../components/ui/Toast";
 import type { PickerChunk } from "../../components/ui/ChunkRef";
 import { type TrustChunkFields, chunkTypeLabel } from "./trustTypes";
 import { wikiTypeLabel, statusLabel, integrityStatusLabel, revisionOpLabel, revisionSourceLabel } from "./labels";
+import { ChunkRepairPanel } from "./ChunkRepairPanel";
 
 /// ChunkPicker 列表加载器:拉全部 chunk 供搜索选择,替代手输 ObjectId。
 /// 模块级缓存 20s,避免多个选择器/Inspector 首次聚焦各拉一次全量。
@@ -348,6 +349,16 @@ export function ChunkInspectorPane({
                   </>
                 );
               })() : null}
+              {chunk.provenance ? (
+                <>
+                  <dt>来源</dt>
+                  <dd className="wikiProvenance">
+                    {chunk.provenance.source ? <span className="wikiArchiveTag">{chunk.provenance.source}</span> : null}
+                    {chunk.provenance.editedBy ? <span className="wikiProvBy">编辑者：{chunk.provenance.editedBy}</span> : null}
+                    {chunk.provenance.llmModelAlias ? <span className="wikiProvModel">{chunk.provenance.llmModelAlias}</span> : null}
+                  </dd>
+                </>
+              ) : null}
             </dl>
             <hr className="wikiArchiveRule" />
             <h3 className="wikiInspectorChunkTitle">{chunk.title || "（无标题）"}</h3>
@@ -427,6 +438,18 @@ export function ChunkInspectorPane({
                 <div className="wikiInspectorSectionTitle">正文</div>
                 <pre>{chunk.body}</pre>
               </section>
+            ) : null}
+            {chunk.integrityStatus === "needs_review" ? (
+              <ChunkRepairPanel
+                chunkId={chunk.id}
+                originalChunk={chunk as unknown as Record<string, unknown>}
+                onApplied={() => {
+                  reload();
+                  window.dispatchEvent(
+                    new CustomEvent("wikiChunkRevised", { detail: { chunk_id: chunk.id } }),
+                  );
+                }}
+              />
             ) : null}
             <ChunkActionsBar chunk={chunk} onChanged={reload} lockedByOther={lock.state === "other"} />
             <ChunkReferrersList chunkId={chunk.id} />

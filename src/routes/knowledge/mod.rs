@@ -266,6 +266,19 @@ pub(super) fn operation_knowledge_chunk_json(item: OperationKnowledgeChunk) -> V
             "blockedCount30d": u.blocked_count_30d,
         })
     });
+    // F12-provenance：chunk 来源（AI 修复 / 导入 / 运营编辑等）。后端 ChunkProvenance 是裸 serde
+    // （snake_case），但列表端点其余字段已手工映射成 camelCase，故 provenance 也逐字段映射成
+    // camelCase 对齐前端 ChunkProvenanceView。None（旧数据 / 非追溯来源）→ null，前端不显来源区。
+    let provenance_json = item.provenance.as_ref().map(|p| {
+        json!({
+            "source": p.source,
+            "sourceDocId": p.source_doc_id,
+            "sourceQuote": p.source_quote,
+            "llmModelAlias": p.llm_model_alias,
+            "editedAt": crate::models::dt_to_string(p.edited_at),
+            "editedBy": p.edited_by,
+        })
+    });
     json!({
         "id": item.id.map(|id| id.to_hex()).unwrap_or_default(),
         "workspaceId": item.workspace_id,
@@ -297,6 +310,7 @@ pub(super) fn operation_knowledge_chunk_json(item: OperationKnowledgeChunk) -> V
         "businessTopics": item.business_topics,
         "supersededBy": item.superseded_by,
         "previousVersionId": item.previous_version_id,
+        "provenance": provenance_json,
         "updatedAt": crate::models::dt_to_string(item.updated_at)
     })
 }
@@ -1284,6 +1298,46 @@ mod tests {
         let msg = r.unwrap();
         assert!(msg.contains("sourceQuote"));
         assert!(msg.contains("source_anchors"));
+    }
+
+    /// F12-provenance：列表端点 `operation_knowledge_chunk_json` 必须把 chunk.provenance
+    /// 下发给前端（camelCase），否则 ChunkInspectorPane（走列表端点）的来源区永远拿不到数据。
+    /// 字段名对齐前端 ChunkProvenanceView（source/sourceDocId/sourceQuote/llmModelAlias/
+    /// editedAt/editedBy）；edited_at 走 dt_to_string 与 updatedAt 同构。
+    #[test]
+    fn chunk_json_emits_provenance_camelcase() {
+        use crate::models::{ChunkProvenance, OperationKnowledgeChunk};
+        let chunk = OperationKnowledgeChunk {
+            provenance: Some(ChunkProvenance {
+                source: "ai_repair".to_string(),
+                source_doc_id: Some("doc1".to_string()),
+                source_quote: Some("原文片段".to_string()),
+                llm_model_alias: Some("provider-a".to_string()),
+                edited_at: mongodb::bson::DateTime::from_millis(1_700_000_000_000),
+                edited_by: Some("admin1".to_string()),
+            }),
+            ..Default::default()
+        };
+        let v = operation_knowledge_chunk_json(chunk);
+        let prov = &v["provenance"];
+        assert_eq!(prov["source"], json!("ai_repair"), "下发 source");
+        assert_eq!(prov["sourceDocId"], json!("doc1"), "下发 sourceDocId(camelCase)");
+        assert_eq!(prov["sourceQuote"], json!("原文片段"), "下发 sourceQuote");
+        assert_eq!(prov["llmModelAlias"], json!("provider-a"), "下发 llmModelAlias");
+        assert_eq!(prov["editedBy"], json!("admin1"), "下发 editedBy");
+        assert!(prov["editedAt"].is_string(), "editedAt 走 dt_to_string 成字符串");
+    }
+
+    /// provenance 为 None（旧数据 / 非修复来源）时下发 null，前端来源区不显、不崩。
+    #[test]
+    fn chunk_json_emits_null_provenance_when_absent() {
+        use crate::models::OperationKnowledgeChunk;
+        let chunk = OperationKnowledgeChunk {
+            provenance: None,
+            ..Default::default()
+        };
+        let v = operation_knowledge_chunk_json(chunk);
+        assert_eq!(v["provenance"], json!(null), "provenance 缺失下发 null");
     }
 
     // ── G-后续Ⅱ/1：纯逻辑 helper 单测扩展 ─────────────────────────────────
