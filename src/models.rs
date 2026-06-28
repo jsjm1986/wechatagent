@@ -4005,6 +4005,25 @@ mod typed {
             }
             upgraded
         }
+
+        /// ⑨跨轮命名稳定化：提取 core_facts + recent_facts 中所有 Structured fact 的
+        /// 非空 dimension 名（去重、保首次出现顺序）。供 consolidator prompt 注入
+        /// 「已有维度名」引导 LLM 对同一属性沿用同名，缓解跨轮命名漂移。
+        /// 仅 Structured 且 dimension 非空白参与；Plain / None / 空白 → 跳过。
+        pub fn live_dimension_names(&self) -> Vec<String> {
+            let mut seen = std::collections::HashSet::new();
+            let mut out = Vec::new();
+            for repr in self.core_facts.iter().chain(self.recent_facts.iter()) {
+                if let MemoryFactRepr::Structured(f) = repr {
+                    if let Some(dim) = f.dimension.as_ref().filter(|d| !d.trim().is_empty()) {
+                        if seen.insert(dim.clone()) {
+                            out.push(dim.clone());
+                        }
+                    }
+                }
+            }
+            out
+        }
     }
 
     /// agent-autonomy-loop M2：`Contact.commitments` 元素的反序列化容器。
@@ -4207,6 +4226,50 @@ mod typed {
     impl From<OperationStateMachineTyped> for Document {
         fn from(machine: OperationStateMachineTyped) -> Self {
             bson::to_document(&machine).expect("OperationStateMachineTyped serializable")
+        }
+    }
+
+    #[cfg(test)]
+    mod live_dimension_names_tests {
+        use super::*;
+
+        fn structured(id: &str, text: &str, dim: Option<&str>) -> MemoryFactRepr {
+            let mut f = MemoryFact::from_plain_text(text.to_string());
+            f.id = id.to_string();
+            f.dimension = dim.map(|s| s.to_string());
+            MemoryFactRepr::Structured(f)
+        }
+
+        #[test]
+        fn collects_nonempty_dims_dedup_in_order() {
+            let card = MemoryCardTyped {
+                core_facts: vec![
+                    structured("a", "孩子10岁", Some("孩子年龄")),
+                    structured("b", "预算5000", Some("预算")),
+                    structured("c", "再提年龄", Some("孩子年龄")), // 重复
+                    structured("d", "纯字符串无维度", None),
+                ],
+                recent_facts: vec![structured("e", "决策人是妈妈", Some("决策角色"))],
+                ..Default::default()
+            };
+            assert_eq!(
+                card.live_dimension_names(),
+                vec!["孩子年龄".to_string(), "预算".to_string(), "决策角色".to_string()]
+            );
+        }
+
+        #[test]
+        fn ignores_plain_and_blank_dims() {
+            let mut blank = MemoryFact::from_plain_text("x".to_string());
+            blank.dimension = Some("   ".to_string());
+            let card = MemoryCardTyped {
+                core_facts: vec![
+                    MemoryFactRepr::Plain("纯字符串".to_string()),
+                    MemoryFactRepr::Structured(blank),
+                ],
+                ..Default::default()
+            };
+            assert!(card.live_dimension_names().is_empty());
         }
     }
 }
