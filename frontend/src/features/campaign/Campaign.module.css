@@ -1,0 +1,68 @@
+/* 活动推送结果看板 —— 镜像 SendAnalytics 的企业白色基调：实色白卡 + tokens.css 变量。
+   色值统一走 tokens.css 变量，禁止硬编码。 */
+
+.page { position: relative; display: grid; gap: 18px; }
+
+.panel {
+  border-radius: var(--r-lg);
+  padding: 22px 26px 20px;
+  background: var(--surface-card);
+  border: 1px solid var(--hairline);
+  box-shadow: 0 14px 34px -24px rgba(20, 30, 60, .3), inset 0 1px 1px rgba(255, 255, 255, .9);
+}
+
+.head { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 16px; }
+.headL { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.eyebrow { font-size: 11px; color: var(--ink-3); font-weight: 600; letter-spacing: .2px; text-transform: uppercase; }
+.title { font-size: 15px; color: var(--ink-1); font-weight: 600; letter-spacing: -.3px; }
+
+/* 7 桶汇总 —— 扁平网格，不嵌套卡片 */
+.metrics {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 14px;
+}
+@media (max-width: 860px) { .metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+@media (max-width: 480px) { .metrics { grid-template-columns: 1fr; } }
+.metric {
+  display: flex; flex-direction: column; gap: 6px;
+  padding: 14px 16px; border-radius: var(--r-md);
+  border: 1px solid var(--hairline); background: var(--fill-inactive);
+}
+.metricLabel { font-size: 11.5px; color: var(--ink-3); font-weight: 600; letter-spacing: -.1px; }
+.metricValue { font-size: 24px; color: var(--ink-1); font-weight: 700; letter-spacing: -.5px; line-height: 1.1; }
+.reasons { display: flex; flex-wrap: wrap; gap: 4px 8px; margin-top: 4px; }
+.reasonItem { font-size: 10.5px; color: var(--ink-3); letter-spacing: -.1px; font-variant-numeric: tabular-nums; }
+
+/* 桶筛选 chip */
+.filters { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 14px; }
+.chip {
+  font: inherit; font-size: 12px; font-weight: 600; letter-spacing: -.1px;
+  min-height: 0; padding: 7px 14px; border-radius: var(--r-sm); cursor: pointer;
+  color: var(--ink-2); background: var(--surface-card);
+  border: 1px solid var(--hairline);
+  box-shadow: inset 0 1px 1px rgba(255, 255, 255, .9);
+  transition: background .18s, border-color .18s, color .18s;
+}
+.chip:hover { border-color: rgba(10, 132, 255, .3); background: rgba(10, 132, 255, .03); }
+.chipActive {
+  color: #fff; background: var(--color-scheduled);
+  border-color: rgba(10, 132, 255, .4);
+  box-shadow: inset 0 1px 1px rgba(255, 255, 255, .35);
+}
+.chipActive:hover { background: #0a78ec; }
+
+/* 明细表 —— 固定行高、不外包卡片 */
+.table { width: 100%; border-collapse: collapse; }
+.tr { border-bottom: 1px solid var(--hairline); }
+.tr:last-child { border-bottom: none; }
+.th {
+  text-align: left; padding: 10px 12px;
+  font-size: 11px; font-weight: 600; letter-spacing: .2px; text-transform: uppercase;
+  color: var(--ink-3); white-space: nowrap;
+}
+.td { padding: 11px 12px; font-size: 13px; color: var(--ink-1); letter-spacing: -.1px; }
+.tdName { font-weight: 600; }
+.thName { width: 30%; }
+.tdWxid { color: var(--ink-3); font-variant-numeric: tabular-nums; max-width: 220px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.table tbody .tr:hover { background: rgba(10, 132, 255, .02); }
