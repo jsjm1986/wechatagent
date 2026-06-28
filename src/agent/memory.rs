@@ -389,6 +389,21 @@ pub fn compact_memory_card_with_dimensions(
             if discarded.iter().any(|d| d == fact_text) {
                 continue;
             }
+            // ⑨件一：dimension 感知救回。若该旧 fact 带非空 dimension，且 incoming
+            // 已有同 dimension 的 Structured fact（新值已覆盖该维度），则不救回旧值
+            // ——防 LLM 漏填 deprecatedFacts/discarded 时改口旧值被 text 不等救回致双值。
+            // dimension=None 退回纯 text 去重（字节等价）。纯结构判定,零关键词零 LLM。
+            if let MemoryFactRepr::Structured(prev_f) = fact {
+                if let Some(prev_dim) = prev_f.dimension.as_ref().filter(|d| !d.trim().is_empty()) {
+                    let incoming_has_same_dim = compact.core_facts.iter().any(|item| {
+                        matches!(item, MemoryFactRepr::Structured(f)
+                            if f.dimension.as_ref().map(|d| d.trim()) == Some(prev_dim.trim()))
+                    });
+                    if incoming_has_same_dim {
+                        continue;
+                    }
+                }
+            }
             if !compact
                 .core_facts
                 .iter()
@@ -2304,6 +2319,82 @@ mod r7_deprecation_tests {
             }
             for (_d, c) in cnt { proptest::prop_assert!(c <= 1, "同维生效层应≤1"); }
         }
+    }
+
+    // ⑨件一：dimension 感知救回——同 dimension 新值在场时不救回旧值。
+    fn structured_fact(text: &str, dim: Option<&str>) -> crate::models::MemoryFactRepr {
+        use crate::models::{MemoryFact, MemoryFactRepr};
+        let mut f = MemoryFact::from_plain_text(text.to_string());
+        f.dimension = dim.map(|d| d.to_string());
+        MemoryFactRepr::Structured(f)
+    }
+
+    #[test]
+    fn recall_drops_old_value_when_same_dimension_new_value_present() {
+        use crate::agent::domain_profile::default_memory_dimensions;
+        use crate::agent::memory::compact_memory_card_with_dimensions;
+        use super::default_memory_card;
+        let mut incoming = default_memory_card();
+        incoming.core_facts = vec![structured_fact("孩子10岁", Some("孩子年龄"))];
+        let mut previous = default_memory_card();
+        previous.core_facts = vec![structured_fact("孩子8岁", Some("孩子年龄"))];
+        let out = compact_memory_card_with_dimensions(
+            &incoming, Some(&previous), &[], &default_memory_dimensions(),
+        );
+        let texts: Vec<&str> = out.core_facts.iter().map(|f| f.as_text()).collect();
+        assert!(texts.contains(&"孩子10岁"), "新值应在: {texts:?}");
+        assert!(!texts.contains(&"孩子8岁"), "同 dimension 旧值不应被救回: {texts:?}");
+    }
+
+    #[test]
+    fn recall_keeps_old_value_when_no_same_dimension_in_incoming() {
+        use crate::agent::domain_profile::default_memory_dimensions;
+        use crate::agent::memory::compact_memory_card_with_dimensions;
+        use super::default_memory_card;
+        let mut incoming = default_memory_card();
+        incoming.core_facts = vec![structured_fact("预算5000", Some("预算"))];
+        let mut previous = default_memory_card();
+        previous.core_facts = vec![structured_fact("孩子8岁", Some("孩子年龄"))];
+        let out = compact_memory_card_with_dimensions(
+            &incoming, Some(&previous), &[], &default_memory_dimensions(),
+        );
+        let texts: Vec<&str> = out.core_facts.iter().map(|f| f.as_text()).collect();
+        assert!(texts.contains(&"孩子8岁"), "无同 dimension 时旧值应正常救回: {texts:?}");
+    }
+
+    #[test]
+    fn recall_none_dimension_keeps_text_dedup_behavior() {
+        use crate::agent::domain_profile::default_memory_dimensions;
+        use crate::agent::memory::compact_memory_card_with_dimensions;
+        use super::default_memory_card;
+        let mut incoming = default_memory_card();
+        incoming.core_facts = vec![structured_fact("孩子10岁", None)];
+        let mut previous = default_memory_card();
+        previous.core_facts = vec![structured_fact("孩子8岁", None)];
+        let out = compact_memory_card_with_dimensions(
+            &incoming, Some(&previous), &[], &default_memory_dimensions(),
+        );
+        let texts: Vec<&str> = out.core_facts.iter().map(|f| f.as_text()).collect();
+        // dimension=None → 维持原 text 去重：text 不等 → 两条都在（字节等价回归保护）
+        assert!(texts.contains(&"孩子10岁") && texts.contains(&"孩子8岁"),
+            "dimension=None 应维持原 text 去重(两条都留): {texts:?}");
+    }
+
+    #[test]
+    fn recall_keeps_different_dimensions() {
+        use crate::agent::domain_profile::default_memory_dimensions;
+        use crate::agent::memory::compact_memory_card_with_dimensions;
+        use super::default_memory_card;
+        let mut incoming = default_memory_card();
+        incoming.core_facts = vec![structured_fact("孩子10岁", Some("孩子年龄"))];
+        let mut previous = default_memory_card();
+        previous.core_facts = vec![structured_fact("预算3万", Some("预算"))];
+        let out = compact_memory_card_with_dimensions(
+            &incoming, Some(&previous), &[], &default_memory_dimensions(),
+        );
+        let texts: Vec<&str> = out.core_facts.iter().map(|f| f.as_text()).collect();
+        assert!(texts.contains(&"孩子10岁") && texts.contains(&"预算3万"),
+            "不同 dimension 不应互相误删: {texts:?}");
     }
 }
 
