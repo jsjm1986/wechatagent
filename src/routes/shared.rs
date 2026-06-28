@@ -1703,5 +1703,31 @@ mod tests {
         let projected = llm_call_log_json(item);
         crate::routes::contract_snapshot::assert_contract_fixture("llm_call_log", projected);
     }
+
+    /// 契约快照：memory_candidate_json。candidates:Vec<Document> 桥接,放纯标量
+    /// （String/i32）避免 BSON 包装泄漏;id 走 ObjectId→hex。
+    #[test]
+    fn memory_candidate_json_matches_contract_fixture() {
+        use super::memory_candidate_json;
+        use crate::models::MemoryCandidate;
+        use mongodb::bson::{doc, oid::ObjectId, DateTime};
+
+        let item = MemoryCandidate {
+            id: Some(ObjectId::parse_str("64a1f2c3e4b5a6978899d001").unwrap()),
+            workspace_id: "ws-1".to_string(),
+            account_id: "acc-1".to_string(),
+            contact_wxid: "wxid_abc".to_string(),
+            run_id: Some("run-1".to_string()),
+            source: "consolidator".to_string(),
+            candidates: vec![doc! { "text": "客户偏好下午沟通", "confidence": 8i32 }],
+            memory_write_score: 7,
+            status: "pending".to_string(),
+            reason: Some("高价值事实".to_string()),
+            created_at: DateTime::from_millis(1_700_000_000_000),
+            updated_at: DateTime::from_millis(1_700_000_100_000),
+        };
+        let projected = memory_candidate_json(item);
+        crate::routes::contract_snapshot::assert_contract_fixture("memory_candidate", projected);
+    }
 }
 
