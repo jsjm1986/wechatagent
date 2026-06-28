@@ -4329,6 +4329,13 @@ pub struct ShadowReplay {
     pub status: String,
     pub failure_reason: Option<String>,
     pub original_final_review_status: Option<String>,
+    /// G4：源 run 的 5 闸命中向量（与 `new_5gate_hit` 同形态）。此前只记 new 侧，
+    /// 导致 significance 假基线恒 false；prompt shadow 把源 run review.scores 推回
+    /// 同一 5 闸口径后填这里，让显著性测试拿到真实新旧对照。
+    #[serde(default)]
+    pub original_5gate_hit: Document,
+    /// G4：源 run 的 selfCritique 是否被解决（与 `new_self_critique_addressed` 对照）。
+    pub original_self_critique_addressed: Option<bool>,
     pub new_final_review_status: Option<String>,
     #[serde(default)]
     pub new_review_risks: Vec<String>,
@@ -5500,6 +5507,8 @@ mod typed_tests {
             new_review_risks: vec!["pressure_risk:hard_close".to_string()],
             new_token_cost: Some(1234),
             new_5gate_hit: doc! { "fact_risk": false, "pressure_risk": true },
+            original_5gate_hit: doc! { "fact_risk": false, "pressure_risk": false },
+            original_self_critique_addressed: Some(false),
             new_self_critique_addressed: Some(true),
             similarity_to_original_text: 0.0,
             started_at: now,
