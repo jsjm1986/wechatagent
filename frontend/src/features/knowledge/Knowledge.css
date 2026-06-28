@@ -3515,3 +3515,42 @@
     color: var(--ink-3);
     font-family: var(--font-mono);
   }
+  /* F21：派工跟踪任务总览列表项（复用 TaskRail 既有 token，不引新颜色）。 */
+  .wikiTaskRailList {
+    list-style: none;
+    margin: 8px 0 0;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    max-height: 240px;
+    overflow-y: auto;
+  }
+  .wikiTaskRailListItem {
+    width: 100%;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 6px 8px;
+    border: 1px solid var(--hairline);
+    border-radius: 6px;
+    background: var(--surface-card);
+    cursor: pointer;
+    text-align: left;
+    font-size: 12px;
+  }
+  .wikiTaskRailListItem.active {
+    border-color: var(--color-scheduled);
+    background: var(--surface-page);
+  }
+  .wikiTaskRailListSess {
+    flex: 1;
+    color: var(--ink-2);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .wikiTaskRailListSteps {
+    color: var(--ink-3);
+    font-variant-numeric: tabular-nums;
+  }
