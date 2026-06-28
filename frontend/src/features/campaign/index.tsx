@@ -105,7 +105,7 @@ export default function CampaignFeature() {
           </div>
         </div>
 
-        <div className={styles.filters} role="tablist">
+        <div className={styles.filters}>
           <button
             type="button"
             className={`${styles.chip} ${filter === "all" ? styles.chipActive : ""}`}

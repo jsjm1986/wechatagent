@@ -39,6 +39,9 @@ describe("bucketTone / bucketLabel", () => {
     expect(bucketLabel("escalated")).toBe("已请示");
     expect(bucketLabel("blocked")).toBe("被拦");
     expect(bucketLabel("unknown")).toBe("未知");
+    expect(bucketLabel("pending")).toBe("在途");
+    expect(bucketLabel("canceled")).toBe("已取消");
+    expect(bucketLabel("skipped")).toBe("去重跳过");
   });
 });
 
