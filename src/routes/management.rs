@@ -875,6 +875,14 @@ pub(super) fn merge_product_tools(mut tools: Value) -> Value {
             "name": "wechatagent.import_knowledge_pdf",
             "description": "把 PDF（base64 编码字节）导入为运营知识切片（落库 status=draft，需后续人核验）。参数：sourceName（来源名），pdfBase64（base64 编码的 PDF 字节）。"
         }),
+        json!({
+            "name": "wechatagent.preview_campaign",
+            "description": "创建活动并预览圈中多少客户（只读，不发送）。先建活动再按条件圈人，返回命中人数+抽样示例。参数：title(活动名)，intentText(活动意图要点，将作为给客户的推送语境)，segmentFilter(圈人条件对象：productIds 买过的产品id数组、aftercare 售后状态 in_aftercare|expired|any、valueTier 价值分层 high|mid|low、customerStage 客户阶段，各项可选留空即不限)。返回 campaignId 供后续 dispatch。"
+        }),
+        json!({
+            "name": "wechatagent.dispatch_campaign",
+            "description": "确认扇出活动推送：给圈中的每个客户创建主动跟进任务，由 AI 结合各自画像生成个性化话术并经发送网关逐条发出。高风险动作，执行前必须确认。参数：campaignId（先用 preview_campaign 拿到并核对命中人数）。"
+        }),
     ];
     match &mut tools {
         Value::Object(map) => {
@@ -1106,7 +1114,8 @@ pub(super) fn tool_effect(tool_name: &str) -> ToolEffect {
         | "wechatagent.query_metrics"
         | "wechatagent.query_health"
         | "wechatagent.query_inbox"
-        | "wechatagent.query_send_ledger" => Readonly,
+        | "wechatagent.query_send_ledger"
+        | "wechatagent.preview_campaign" => Readonly,
         // 低风险可逆写
         "wechatagent.import_contacts"
         | "wechatagent.enable_contact_agent"
@@ -1263,7 +1272,9 @@ pub(super) fn build_execution_summary(results: &[(String, ToolOutcome)]) -> Stri
 pub(super) fn tool_always_requires_confirmation(tool_name: &str) -> bool {
     matches!(
         tool_name,
-        "wechatagent.verify_knowledge_chunk" | "wechatagent.batch_verify_chunks"
+        "wechatagent.verify_knowledge_chunk"
+            | "wechatagent.batch_verify_chunks"
+            | "wechatagent.dispatch_campaign"
     )
 }
 
@@ -2298,6 +2309,34 @@ pub(super) async fn execute_management_tool(
                 "fallbackBlob": outcome.fallback_blob,
             }))
         }
+        "wechatagent.preview_campaign" => {
+            // 先创建活动，再预览。create + preview 两步，返回 preview 结果。
+            let body = serde_json::from_value(planned.arguments.clone())
+                .map_err(|e| AppError::BadRequest(format!("参数解析失败: {e}")))?;
+            let created = crate::routes::campaigns::create_campaign(
+                State(state.clone()),
+                Extension(management_admin(workspace_id)),
+                Json(body),
+            ).await?;
+            let campaign_id = created.0.get("id").and_then(Value::as_str)
+                .ok_or_else(|| AppError::External("campaign id missing".to_string()))?
+                .to_string();
+            let resp = crate::routes::campaigns::preview_campaign(
+                State(state.clone()),
+                Extension(management_admin(workspace_id)),
+                Path(campaign_id),
+            ).await?;
+            Ok(resp.0)
+        }
+        "wechatagent.dispatch_campaign" => {
+            let campaign_id = string_arg(&planned.arguments, "campaignId")?;
+            let resp = crate::routes::campaigns::dispatch_campaign(
+                State(state.clone()),
+                Extension(management_admin(workspace_id)),
+                Path(campaign_id),
+            ).await?;
+            Ok(resp.0)
+        }
         _ => {
             // 兜底分支：只允许把 tools/list 真实公布过的工具名透传给生产 MCP。
             if !advertised.contains(planned.tool_name.as_str()) {
@@ -2494,6 +2533,25 @@ mod tests {
         assert_eq!(tool_effect("wechatagent.reset_domain").risk, ToolRisk::Irreversible);
         // 只读工具同时 read_only=true（与既有 dry-run 逻辑兼容）
         assert!(tool_effect("wechatagent.search_contacts").read_only);
+    }
+
+    #[test]
+    fn campaign_tools_risk_and_confirmation() {
+        // preview 只读（dry-run 下也执行返回圈人结果）
+        assert_eq!(tool_effect("wechatagent.preview_campaign").risk, ToolRisk::Readonly);
+        assert!(tool_effect("wechatagent.preview_campaign").read_only);
+        // dispatch 恒确认门——关键：dangerous 开关默认 false 下仍须确认
+        assert!(tool_always_requires_confirmation("wechatagent.dispatch_campaign"));
+        assert!(plan_requires_confirmation(&["wechatagent.dispatch_campaign"], false),
+            "dispatch 必须无视第一期 dangerous 开关恒走确认门");
+    }
+
+    #[test]
+    fn campaign_tools_in_catalog() {
+        let merged = merge_product_tools(json!({ "tools": [] }));
+        let names = advertised_tool_names(&merged);
+        assert!(names.contains("wechatagent.preview_campaign"));
+        assert!(names.contains("wechatagent.dispatch_campaign"));
     }
 
     #[test]
