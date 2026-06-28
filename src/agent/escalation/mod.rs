@@ -29,14 +29,14 @@ use crate::prompts;
 use crate::routes::AppState;
 use mongodb::bson::{doc, DateTime};
 
-/// hold→升级请示：被风险闸门拦下的高风险件，按 workspace 升级模式请示领导并补发安全占位。
+/// hold→升级请示：被风险闸门拦下的高风险件，按 workspace 升级模式请示领导。
 ///
-/// 与 `trigger_principal_escalation` 的区别：后者用于 approved 路径（占位已由 outbox 发出，
-/// 本函数只推卡+落台账）；hold 路径无 outbox、客户尚未收到任何回复，故本函数额外**补发安全占位**
-/// 安抚客户（体验与 approved 一致），并直接写 awaiting 标记（hold 路径不走 apply_agent_updates）。
+/// 与 `trigger_principal_escalation` 的区别：后者用于 approved 路径（占位已由 outbox 发出）；
+/// 本函数用于 hold 路径，只推领导卡 + 落 pending 台账 + 写 awaiting 标记，**不向客户发任何消息**。
+/// 客户侧的安抚占位由网关守卫 `ensure_customer_acknowledged` 统一负责（解耦"安抚客户"与
+/// "请示领导"：前者对任何 Inbound 零回复无条件补，后者受领导骚扰门 / 去重约束）。
 ///
-/// 红线：占位走 `fallback_holding_reply()`（不含任何转接类措辞），客户始终只跟 AI 对话；
-/// 真人仅作幕后决策源。调用方对本函数错误只记 warn、不阻断 run、不改终态。
+/// 调用方对本函数错误只记 warn、不阻断 run、不改终态。
 pub(crate) async fn escalate_held_decision(
     state: &AppState,
     contact: &Contact,
@@ -131,14 +131,6 @@ pub(crate) async fn escalate_held_decision(
         &contact.account_id,
         "message_send_text",
         serde_json::json!({ "recipient": principal_wxid, "content": card }),
-    )
-    .await?;
-    // 补发安全占位安抚客户（hold 路径无 outbox，直发；体验与 approved 占位一致）。
-    mcp::logged_call_for_account(
-        state,
-        &contact.account_id,
-        "message_send_text",
-        serde_json::json!({ "recipient": &contact.wxid, "content": fallback_holding_reply() }),
     )
     .await?;
     // 写 awaiting 标记（hold 路径不走 apply_agent_updates，需单独写），

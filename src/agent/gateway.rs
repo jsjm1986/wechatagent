@@ -859,6 +859,67 @@ async fn apply_state_action_gate(
     Ok(())
 }
 
+/// 客户回应保障守卫：本轮若是 Inbound 且落到会晾死客户的零回复状态，给客户补一条
+/// 确定性中性占位（走 outbox）。统一两道 precheck 出口 + 拦截分支（held/blocked）。
+/// A3 主动沉默（no_reply）不在此列——AI 判定该沉默更拟人，见黑名单豁免。
+///
+/// - 黑名单判定见 [`should_send_ack_placeholder`]（仅 Inbound、非豁免状态才补）。
+/// - 入队前复查 `should_abort_send()`：客户又发了新消息 → 下一轮会真回，补占位会与下轮
+///   回复竞争重复打扰，故跳过（这也是"绝不破坏去抖聚合"的代码级兜底）。
+/// - fail-soft：入队失败只记 warn、不阻断 run、不改终态（与 `escalate_held_decision`
+///   的 let _ / warn 同纪律）。
+async fn ensure_customer_acknowledged(
+    state: &AppState,
+    contact: &Contact,
+    run_id: &str,
+    trigger_kind: &str,
+    source_event_id: &str,
+    status: &str,
+    should_abort_send: &Option<Arc<dyn Fn() -> bool + Send + Sync>>,
+) {
+    if !should_send_ack_placeholder(trigger_kind, status) {
+        return;
+    }
+    if let Some(guard) = should_abort_send {
+        if guard() {
+            tracing::info!(
+                %run_id,
+                contact_wxid = %contact.wxid,
+                "客户回应保障占位跳过：客户又发新消息，下一轮真回"
+            );
+            return;
+        }
+    }
+    let req = build_ack_enqueue_request(
+        &contact.workspace_id,
+        &contact.account_id,
+        &contact.wxid,
+        run_id,
+        source_event_id,
+        trigger_kind,
+    );
+    match outbox_enqueue(state, req).await {
+        Ok(outcome) => {
+            tracing::info!(
+                %run_id,
+                contact_wxid = %contact.wxid,
+                %status,
+                ?outcome,
+                "客户回应保障占位已入 outbox"
+            );
+        }
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                %run_id,
+                contact_wxid = %contact.wxid,
+                %status,
+                "客户回应保障占位入队失败（不阻断 run）"
+            );
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_user_operation_gateway_inner(
     state: &AppState,
@@ -913,6 +974,16 @@ async fn run_user_operation_gateway_inner(
             &envelope_source_kind,
         )
         .await?;
+        ensure_customer_acknowledged(
+            state,
+            &contact,
+            &run_id,
+            trigger.kind(),
+            &envelope_source_event_id,
+            &precheck.status,
+            &should_abort_send,
+        )
+        .await;
         return Ok(());
     }
 
@@ -1962,7 +2033,8 @@ async fn run_user_operation_gateway_inner(
             },
         )
         .await?;
-        // hold→升级请示：被风险闸门拦下的高风险件，按 workspace 升级模式请示领导并补发安全占位。
+        // hold→升级请示：被风险闸门拦下的高风险件，按 workspace 升级模式请示领导（只推卡+落台账+写
+        // awaiting）。客户安抚占位不在这里——由下方 ensure_customer_acknowledged 守卫统一负责（方案 B 解耦）。
         // 错误只记 warn、不阻断 run、不改终态（与 approved 末尾 trigger_principal_escalation 同纪律）。
         // context_changed 不是决策墙，should_escalate_held 对其返回 false，不会误升级。
         if let Err(e) = escalation::escalate_held_decision(
@@ -2007,6 +2079,16 @@ async fn run_user_operation_gateway_inner(
                 );
             }
         }
+        ensure_customer_acknowledged(
+            state,
+            &contact,
+            &run_id,
+            trigger.kind(),
+            &envelope_source_event_id,
+            &blocked_status,
+            &should_abort_send,
+        )
+        .await;
         return Ok(());
     }
 
@@ -2084,6 +2166,16 @@ async fn run_user_operation_gateway_inner(
             },
         )
         .await?;
+        ensure_customer_acknowledged(
+            state,
+            &contact,
+            &run_id,
+            trigger.kind(),
+            &envelope_source_event_id,
+            &final_precheck.status,
+            &should_abort_send,
+        )
+        .await;
         return Ok(());
     }
 
@@ -3148,6 +3240,66 @@ fn split_long_segment(seg: &str, max_chars: usize) -> Vec<String> {
         out.push(seg.trim().to_string());
     }
     out
+}
+
+/// 客户回应保障——零回复豁免清单（黑名单语义）。这些终态 / precheck 状态下
+/// 「客户零回复」是**正确**的，不补占位（口径见 plan「黑名单口径」表）。
+///
+/// `no_reply`（A3 主动沉默）在列：那是 AI **主动判定**该沉默更拟人（如客户只回
+/// "好的👌"客套），非被闸门拦下的晾死——补"稍等我给你准信"反而破坏拟人，故豁免。
+/// 守卫只覆盖真正的晾死：held/blocked/precheck 类（AI 想回却被拦，客户在等）。
+pub(crate) const ACK_PLACEHOLDER_EXCLUDED_STATUSES: &[&str] = &[
+    "cooldown",
+    "rate_limited",
+    "quiet_hours_deferred",
+    "expired",
+    "superseded_by_new_inbound",
+    "not_managed",
+    "context_changed",
+    "no_reply",
+];
+
+/// 是否该给本轮零回复的客户补一条确定性安抚占位。
+///
+/// 黑名单语义：只要是 Inbound（`trigger_kind == "inbound"`，客户真发了消息）
+/// 且 `status` 不在豁免清单内，就补。`status` 取各零回复出口的状态串：
+/// precheck.status / 拦截分支 blocked_status。
+///
+/// 红线：FollowUp（AI 主动触达，客户没在等回复）任何状态都不补；A3 主动沉默
+/// （`no_reply`，AI 判定该沉默更拟人）也不补——都避免发"稍等我给你准信"这类非所问占位。
+pub(crate) fn should_send_ack_placeholder(trigger_kind: &str, status: &str) -> bool {
+    trigger_kind == "inbound" && !ACK_PLACEHOLDER_EXCLUDED_STATUSES.contains(&status)
+}
+
+/// 构造"客户回应保障占位"的 outbox 入参。
+///
+/// 复用 `fallback_holding_reply()` 确定性文案，走 outbox（享受 dispatcher 在线门控 +
+/// 幂等键，与正常发送路径一致）。幂等键派生：`{source_event_id}#ack-placeholder` 后缀，
+/// 保证同 run 重复挂载只入一条、且与真回复 / 分段（`#seg{idx}`）key 天然不碰撞。
+///
+/// 取 contact 的三个字符串字段而非 `&Contact`：本函数只需这三个值，原语入参使其成为
+/// 零依赖纯函数（单测无需构造 40 字段的 Contact）。
+pub(crate) fn build_ack_enqueue_request(
+    workspace_id: &str,
+    account_id: &str,
+    contact_wxid: &str,
+    run_id: &str,
+    source_event_id: &str,
+    trigger_kind: &str,
+) -> EnqueueRequest {
+    EnqueueRequest {
+        workspace_id: workspace_id.to_string(),
+        account_id: account_id.to_string(),
+        contact_wxid: contact_wxid.to_string(),
+        run_id: run_id.to_string(),
+        decision_id: None,
+        source_event_id: format!("{source_event_id}#ack-placeholder"),
+        source_kind: trigger_kind.to_string(),
+        content: escalation::fallback_holding_reply().to_string(),
+        media_asset_id: None,
+        referral_card_id: None,
+        max_attempts: 3,
+    }
 }
 
 pub(crate) fn blocked(status: &str, reason: &str) -> SendGatewayResult {
@@ -4930,6 +5082,89 @@ pub(crate) fn compute_taxonomy_guard_outcome(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // 客户回应保障守卫判定纯函数（黑名单语义）：
+    // 只要 Inbound 且 status 不在豁免清单内就补占位（覆盖真正的晾死：held/blocked/precheck）。
+    #[test]
+    fn ack_placeholder_inbound_held_and_blocked_terminals_get_ack() {
+        for status in [
+            "held_by_ai_policy",
+            "blocked_by_required_field",
+            "blocked_by_budget",
+            "blocked_by_safety_guard",
+            "blocked_unverified_product_claim",
+            "daily_limit",       // 每日触达上限：客户主动问也须 ack（全兜底）
+            "policy_cooldown",   // 运营策略冷却：仍 ack
+        ] {
+            assert!(
+                should_send_ack_placeholder("inbound", status),
+                "inbound + {status} 应补占位"
+            );
+        }
+    }
+
+    #[test]
+    fn ack_placeholder_excluded_statuses_skip() {
+        for status in [
+            "cooldown",
+            "rate_limited",
+            "quiet_hours_deferred",
+            "expired",
+            "superseded_by_new_inbound",
+            "not_managed",
+            "context_changed",
+            "no_reply",          // A3 主动沉默：AI 判定该沉默更拟人，非晾死，不补占位
+        ] {
+            assert!(
+                !should_send_ack_placeholder("inbound", status),
+                "豁免清单内的 {status} 不该补占位"
+            );
+        }
+    }
+
+    #[test]
+    fn ack_placeholder_follow_up_never_acks() {
+        // FollowUp 是 AI 主动触达，不是客户在等回复——任何状态都不补占位。
+        for status in [
+            "held_by_ai_policy",
+            "blocked_by_safety_guard",
+            "no_reply",
+            "daily_limit",
+        ] {
+            assert!(
+                !should_send_ack_placeholder("follow_up", status),
+                "follow_up + {status} 不该补占位"
+            );
+        }
+    }
+
+    #[test]
+    fn build_ack_enqueue_request_shape() {
+        let req = build_ack_enqueue_request("ws1", "acc1", "cust_wxid", "run_abc", "evt123", "inbound");
+
+        // 幂等键派生：源事件 id 加 `#ack-placeholder` 后缀，与真回复 / 分段 key 天然不碰撞
+        assert_eq!(req.source_event_id, "evt123#ack-placeholder");
+        // 占位文案 = 确定性兜底（agent-first，不靠 LLM）
+        assert_eq!(req.content, escalation::fallback_holding_reply());
+        // 占位是纯文本，不带媒体 / 名片
+        assert!(req.media_asset_id.is_none());
+        assert!(req.referral_card_id.is_none());
+        // 占位无决策评审记录
+        assert!(req.decision_id.is_none());
+        assert_eq!(req.workspace_id, "ws1");
+        assert_eq!(req.account_id, "acc1");
+        assert_eq!(req.contact_wxid, "cust_wxid");
+        assert_eq!(req.run_id, "run_abc");
+        assert_eq!(req.source_kind, "inbound");
+        assert_eq!(req.max_attempts, 3);
+    }
+
+    #[test]
+    fn build_ack_enqueue_request_empty_source_event_id_still_suffixed() {
+        let req = build_ack_enqueue_request("ws", "acc", "wx", "run1", "", "inbound");
+        // 空 source_event_id 仍带后缀（非空），走 outbox 非 synthetic 路径
+        assert_eq!(req.source_event_id, "#ack-placeholder");
+    }
 
     // CONC-2：commitments 原子追加 update 形态——$slice 必须是 -8（保留最新 8 条，
     // 丢最旧，与原 drain(0..drop) 语义一致），$each 一次只追加一条新 entry，entry
