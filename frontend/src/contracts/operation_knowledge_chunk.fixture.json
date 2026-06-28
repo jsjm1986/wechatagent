@@ -1,0 +1,69 @@
+{
+  "accountId": "acc-1",
+  "applicableScenes": [
+    "售前咨询"
+  ],
+  "body": "WechatAgent 企业版提供 7x24 小时自动应答,支持私域多账号统一纳管。",
+  "businessContext": "企业版能力说明",
+  "businessTopics": [
+    "产品定位"
+  ],
+  "chunkType": "product_fact",
+  "confidenceScore": 90,
+  "documentId": "64a1f2c3e4b5a6978899ccdd",
+  "domain": "user_operations",
+  "dynamicConfidence": 0.73,
+  "id": "64a1f2c3e4b5a6978899aabb",
+  "integrityStatus": "needs_review",
+  "itemId": "64a1f2c3e4b5a6978899eeff",
+  "knowledgeType": "product_fact",
+  "lockedFields": [
+    "title"
+  ],
+  "notApplicableScenes": [
+    "售后投诉"
+  ],
+  "previousVersionId": "c-0",
+  "priority": 5,
+  "productTags": [
+    "企业版",
+    "自动应答"
+  ],
+  "provenance": {
+    "editedAt": "2023-11-14T22:14:10Z",
+    "editedBy": "admin1",
+    "llmModelAlias": "provider-a",
+    "source": "imported",
+    "sourceDocId": "doc-1",
+    "sourceQuote": "提供 7x24 小时自动应答"
+  },
+  "relatedChunks": [
+    {
+      "chunk_id": "c-2",
+      "kind": "references",
+      "note": "相关切片"
+    }
+  ],
+  "sourceAnchors": [
+    {
+      "documentId": "doc-1",
+      "endLine": 5,
+      "quoteHash": "abc123",
+      "startLine": 3
+    }
+  ],
+  "sourceQuote": "提供 7x24 小时自动应答",
+  "status": "draft",
+  "summary": "企业版提供全天候自动应答",
+  "supersededBy": null,
+  "title": "7x24 自动应答",
+  "updatedAt": "2023-11-14T22:15:00Z",
+  "usageStats": {
+    "blockedCount30d": 1,
+    "hitCount30d": 12
+  },
+  "validFrom": "2023-11-03T08:26:40Z",
+  "validTo": "2033-05-06T13:46:40Z",
+  "wikiType": "entity",
+  "workspaceId": "ws-1"
+}

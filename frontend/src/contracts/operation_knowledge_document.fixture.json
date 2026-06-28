@@ -1,0 +1,32 @@
+{
+  "accountId": "acc-1",
+  "catalogSummary": "目录摘要",
+  "contentHash": "hash-abc",
+  "domain": "user_operations",
+  "id": "64a1f2c3e4b5a6978899a001",
+  "lineIndex": [
+    {
+      "line": 1
+    }
+  ],
+  "rawContent": "原文全文",
+  "riskNotes": [
+    "勿夸大疗效"
+  ],
+  "routingMap": [
+    "产品定位"
+  ],
+  "sectionIndex": [
+    {
+      "section": 1
+    }
+  ],
+  "sourceName": "产品手册.pdf",
+  "sourceType": "import",
+  "status": "draft",
+  "summary": "企业版能力总览",
+  "title": "企业版产品手册",
+  "updatedAt": "2023-11-14T22:15:00Z",
+  "version": 2,
+  "workspaceId": "ws-1"
+}

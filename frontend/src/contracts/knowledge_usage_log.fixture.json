@@ -1,0 +1,24 @@
+{
+  "accountId": "acc-1",
+  "blockedReason": "blocked_unverified_product_claim",
+  "contactWxid": "wxid_abc",
+  "createdAt": "2023-11-14T22:13:20Z",
+  "id": "64a1f2c3e4b5a6978899b001",
+  "knowledgeIds": [
+    "64a1f2c3e4b5a6978899b002"
+  ],
+  "replyText": "回复正文",
+  "reviewApproved": true,
+  "routeResult": {
+    "matched": 2,
+    "strategy": "catalog"
+  },
+  "runId": "run-1",
+  "toolTrace": [
+    {
+      "ms": 12,
+      "tool": "search"
+    }
+  ],
+  "workspaceId": "ws-1"
+}

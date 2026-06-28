@@ -1070,3 +1070,23 @@ pub async fn batch_archive_chunks(
         "skipped": skipped,
     })))
 }
+
+#[cfg(test)]
+mod contract_tests {
+    use super::*;
+    use crate::knowledge_wiki::chunk_revisions::RevisionApplied;
+
+    #[test]
+    fn revision_applied_to_json_matches_contract_fixture() {
+        let applied = RevisionApplied {
+            revision_id: "rev-1".to_string(),
+            chunk_id: "chunk-1".to_string(),
+            op: "patch".to_string(),
+            before_hash: "hash-before".to_string(),
+            after_hash: "hash-after".to_string(),
+            unchanged: false,
+        };
+        let projected = revision_applied_to_json(&applied);
+        crate::routes::contract_snapshot::assert_contract_fixture("revision_applied", projected);
+    }
+}
