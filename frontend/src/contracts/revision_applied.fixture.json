@@ -1,0 +1,9 @@
+{
+  "afterHash": "hash-after",
+  "beforeHash": "hash-before",
+  "chunkId": "chunk-1",
+  "ok": true,
+  "op": "patch",
+  "revisionId": "rev-1",
+  "unchanged": false
+}

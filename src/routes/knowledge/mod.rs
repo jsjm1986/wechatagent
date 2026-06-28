@@ -1398,6 +1398,143 @@ mod tests {
         );
     }
 
+    /// 契约快照 POC:列表投影 `operation_knowledge_chunk_json` 的线上形状(33 键,camelCase)
+    /// 是前后端契约的唯一真相源。构造全量 chunk → 调投影 → canonicalize → 对账 fixture。
+    /// 默认只读:投影变了没 re-bless → 测红(挡住"后端改了没同步前端")。
+    /// 注意:model 上的 created_at / integrity_score / domain_attributes 投影**不下发**,
+    /// 故 fixture 无这三键——契约是"线上形状"而非"model 形状"。
+    #[test]
+    fn operation_knowledge_chunk_json_matches_contract_fixture() {
+        use crate::models::{ChunkProvenance, OperationKnowledgeChunk, RelatedRef, UsageStats};
+        use mongodb::bson::{doc, oid::ObjectId, DateTime};
+
+        let chunk = OperationKnowledgeChunk {
+            id: Some(ObjectId::parse_str("64a1f2c3e4b5a6978899aabb").unwrap()),
+            workspace_id: "ws-1".to_string(),
+            account_id: Some("acc-1".to_string()),
+            document_id: Some(ObjectId::parse_str("64a1f2c3e4b5a6978899ccdd").unwrap()),
+            item_id: Some(ObjectId::parse_str("64a1f2c3e4b5a6978899eeff").unwrap()),
+            domain: "user_operations".to_string(),
+            knowledge_type: Some("product_fact".to_string()),
+            business_context: Some("企业版能力说明".to_string()),
+            title: "7x24 自动应答".to_string(),
+            summary: Some("企业版提供全天候自动应答".to_string()),
+            body: Some("WechatAgent 企业版提供 7x24 小时自动应答,支持私域多账号统一纳管。".to_string()),
+            applicable_scenes: vec!["售前咨询".to_string()],
+            not_applicable_scenes: vec!["售后投诉".to_string()],
+            product_tags: vec!["企业版".to_string(), "自动应答".to_string()],
+            business_topics: vec!["产品定位".to_string()],
+            source_quote: Some("提供 7x24 小时自动应答".to_string()),
+            source_anchors: vec![doc! {
+                "startLine": 3i32, "endLine": 5i32, "quoteHash": "abc123", "documentId": "doc-1"
+            }],
+            integrity_status: Some("needs_review".to_string()),
+            confidence_score: Some(90),
+            status: "draft".to_string(),
+            priority: 5,
+            created_at: DateTime::from_millis(1_700_000_000_000),
+            updated_at: DateTime::from_millis(1_700_000_100_000),
+            wiki_type: Some("entity".to_string()),
+            domain_attributes: Some(doc! { "customer_stage": "negotiation" }),
+            provenance: Some(ChunkProvenance {
+                source: "imported".to_string(),
+                source_doc_id: Some("doc-1".to_string()),
+                source_quote: Some("提供 7x24 小时自动应答".to_string()),
+                llm_model_alias: Some("provider-a".to_string()),
+                edited_at: DateTime::from_millis(1_700_000_050_000),
+                edited_by: Some("admin1".to_string()),
+            }),
+            valid_from: Some(DateTime::from_millis(1_699_000_000_000)),
+            valid_to: Some(DateTime::from_millis(1_999_000_000_000)),
+            superseded_by: None,
+            previous_version_id: Some("c-0".to_string()),
+            related_chunks: Some(vec![RelatedRef {
+                chunk_id: "c-2".to_string(),
+                kind: "references".to_string(),
+                note: Some("相关切片".to_string()),
+            }]),
+            usage_stats: Some(UsageStats {
+                hit_count_30d: 12,
+                blocked_count_30d: 1,
+                last_used_at: None,
+                last_blocked_reason: None,
+            }),
+            dynamic_confidence: Some(0.73),
+            integrity_score: Some(0.91),
+            locked_fields: Some(vec!["title".to_string()]),
+            chunk_type: "product_fact".to_string(),
+        };
+
+        let projected = operation_knowledge_chunk_json(chunk);
+        crate::routes::contract_snapshot::assert_contract_fixture(
+            "operation_knowledge_chunk",
+            projected,
+        );
+    }
+
+    #[test]
+    fn operation_knowledge_document_json_matches_contract_fixture() {
+        use crate::models::OperationKnowledgeDocument;
+        use mongodb::bson::{doc, oid::ObjectId, DateTime};
+
+        let document = OperationKnowledgeDocument {
+            id: Some(ObjectId::parse_str("64a1f2c3e4b5a6978899a001").unwrap()),
+            workspace_id: "ws-1".to_string(),
+            account_id: Some("acc-1".to_string()),
+            domain: "user_operations".to_string(),
+            source_type: "import".to_string(),
+            source_name: Some("产品手册.pdf".to_string()),
+            title: "企业版产品手册".to_string(),
+            summary: Some("企业版能力总览".to_string()),
+            catalog_summary: Some("目录摘要".to_string()),
+            routing_map: vec!["产品定位".to_string()],
+            risk_notes: vec!["勿夸大疗效".to_string()],
+            product_tags: vec!["企业版".to_string()],
+            business_topics: vec!["产品定位".to_string()],
+            raw_content: Some("原文全文".to_string()),
+            content_hash: Some("hash-abc".to_string()),
+            line_index: vec![doc! { "line": 1i32 }],
+            section_index: vec![doc! { "section": 1i32 }],
+            status: "draft".to_string(),
+            version: 2,
+            created_at: DateTime::from_millis(1_700_000_000_000),
+            updated_at: DateTime::from_millis(1_700_000_100_000),
+            catalog_summary_persisted: Some("持久化目录".to_string()),
+            catalog_version: Some(3),
+        };
+        let projected = operation_knowledge_document_json(document);
+        crate::routes::contract_snapshot::assert_contract_fixture(
+            "operation_knowledge_document",
+            projected,
+        );
+    }
+
+    #[test]
+    fn knowledge_usage_json_matches_contract_fixture() {
+        use crate::models::KnowledgeUsageLog;
+        use mongodb::bson::{doc, oid::ObjectId, DateTime};
+
+        let log = KnowledgeUsageLog {
+            id: Some(ObjectId::parse_str("64a1f2c3e4b5a6978899b001").unwrap()),
+            workspace_id: "ws-1".to_string(),
+            account_id: "acc-1".to_string(),
+            contact_wxid: Some("wxid_abc".to_string()),
+            run_id: "run-1".to_string(),
+            knowledge_ids: vec![ObjectId::parse_str("64a1f2c3e4b5a6978899b002").unwrap()],
+            route_result: doc! { "matched": 2i32, "strategy": "catalog" },
+            reply_text: Some("回复正文".to_string()),
+            review_approved: true,
+            blocked_reason: Some("blocked_unverified_product_claim".to_string()),
+            tool_trace: vec![doc! { "tool": "search", "ms": 12i32 }],
+            created_at: DateTime::from_millis(1_700_000_000_000),
+        };
+        let projected = knowledge_usage_json(log);
+        crate::routes::contract_snapshot::assert_contract_fixture(
+            "knowledge_usage_log",
+            projected,
+        );
+    }
+
     /// 根治 chunk PUT replace_one 清空 model 字段：请求体无法表达的 13 个字段 +
     /// created_at 必须从原 chunk 回填，请求体能表达的字段（title 等）仍来自 next。
     #[test]
