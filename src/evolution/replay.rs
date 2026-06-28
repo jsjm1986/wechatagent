@@ -199,10 +199,15 @@ pub async fn run_shadow_replay(
         .ok()
         .map(str::to_string);
     if let Some(ref inb_id) = inbound_id {
+        // ConversationMessage 无 rename_all → BSON 字段是 snake_case `message_id`
+        // （见 models.rs ConversationMessage、db/indexes.rs:49 的索引、webhooks.rs
+        // 写入路径、prompt_shadow.rs 的同款 find_one）。此处必须用 `message_id`，
+        // 否则 retention 探针对任何真实消息都 count==0 → 误判 source_message_unavailable，
+        // 把所有 prompt shadow happy path 错杀成 failed。
         let count = state
             .db
             .messages()
-            .count_documents(doc! { "messageId": inb_id }, None)
+            .count_documents(doc! { "message_id": inb_id }, None)
             .await
             .map_err(AppError::from)?;
         if count == 0 {
