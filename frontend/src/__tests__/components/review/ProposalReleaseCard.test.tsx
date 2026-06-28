@@ -2,6 +2,7 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 import { render, screen, waitFor } from "@testing-library/react";
 import { ProposalReleaseCard } from "../../../components/review/ProposalReleaseCard";
 import type { ShadowReplaySample } from "../../../components/review/proposalTypes";
+import { GATE_LABELS } from "../../../components/review/evidenceMetrics";
 
 // ProposalReleaseCard 自身拉详情（GET /api/evolution/proposals/:id → ProposalDetailResponse）。
 // 取值路径有别（proposalTypes.ts 实证）：diffSummary/riskNote/previousPromptVersion/evalMetrics
@@ -185,6 +186,23 @@ describe("ProposalReleaseCard prompt 新旧对照表（阶段三）", () => {
     expect(samples).toHaveTextContent("run-001");
     expect(samples).toHaveTextContent("held_by_ai_policy");
     expect(samples).toHaveTextContent("approved");
+
+    // 补强 1：样本点阵字形回归保护（按 FIVE_GATE_KEYS 序）。
+    // run-001 original5gateHit={fact_risk_block:true,其余false} → 原五闸点阵 ●○○○○；
+    // new5gateHit={全false} → 新五闸点阵 ○○○○○。● 命中 / ○ 未中 / · 缺失。
+    const samplesText = samples.textContent ?? "";
+    expect(samplesText).toContain("●○○○○");
+    expect(samplesText).toContain("○○○○○");
+    // 自评列：original=false→「未解决」、new=true→「已解决」
+    expect(samples).toHaveTextContent("未解决");
+    expect(samples).toHaveTextContent("已解决");
+
+    // 补强 2：聚合表恰好 5 行五闸——GATE_LABELS 的 5 个中文标签全部出现。
+    expect(agg).toHaveTextContent(GATE_LABELS.fact_risk_block);
+    expect(agg).toHaveTextContent(GATE_LABELS.pressure_risk_block);
+    expect(agg).toHaveTextContent(GATE_LABELS.human_like_score_rewrite);
+    expect(agg).toHaveTextContent(GATE_LABELS.emotional_value_rewrite);
+    expect(agg).toHaveTextContent(GATE_LABELS.product_accuracy_score_block);
   });
 
   it("空 original 数据时样本单元格显示占位不 crash", async () => {
