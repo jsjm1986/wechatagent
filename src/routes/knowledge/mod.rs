@@ -1472,6 +1472,43 @@ mod tests {
         );
     }
 
+    #[test]
+    fn operation_knowledge_document_json_matches_contract_fixture() {
+        use crate::models::OperationKnowledgeDocument;
+        use mongodb::bson::{doc, oid::ObjectId, DateTime};
+
+        let document = OperationKnowledgeDocument {
+            id: Some(ObjectId::parse_str("64a1f2c3e4b5a6978899a001").unwrap()),
+            workspace_id: "ws-1".to_string(),
+            account_id: Some("acc-1".to_string()),
+            domain: "user_operations".to_string(),
+            source_type: "import".to_string(),
+            source_name: Some("产品手册.pdf".to_string()),
+            title: "企业版产品手册".to_string(),
+            summary: Some("企业版能力总览".to_string()),
+            catalog_summary: Some("目录摘要".to_string()),
+            routing_map: vec!["产品定位".to_string()],
+            risk_notes: vec!["勿夸大疗效".to_string()],
+            product_tags: vec!["企业版".to_string()],
+            business_topics: vec!["产品定位".to_string()],
+            raw_content: Some("原文全文".to_string()),
+            content_hash: Some("hash-abc".to_string()),
+            line_index: vec![doc! { "line": 1i32 }],
+            section_index: vec![doc! { "section": 1i32 }],
+            status: "draft".to_string(),
+            version: 2,
+            created_at: DateTime::from_millis(1_700_000_000_000),
+            updated_at: DateTime::from_millis(1_700_000_100_000),
+            catalog_summary_persisted: Some("持久化目录".to_string()),
+            catalog_version: Some(3),
+        };
+        let projected = operation_knowledge_document_json(document);
+        crate::routes::contract_snapshot::assert_contract_fixture(
+            "operation_knowledge_document",
+            projected,
+        );
+    }
+
     /// 根治 chunk PUT replace_one 清空 model 字段：请求体无法表达的 13 个字段 +
     /// created_at 必须从原 chunk 回填，请求体能表达的字段（title 等）仍来自 next。
     #[test]
