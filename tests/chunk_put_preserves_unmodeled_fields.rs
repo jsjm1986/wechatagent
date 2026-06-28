@@ -143,5 +143,8 @@ async fn put_nonexistent_chunk_returns_not_found() {
     )
     .await;
 
-    assert!(result.is_err(), "PUT 不存在的 chunk 必须返回错误(NotFound)而非静默 no-op");
+    assert!(
+        matches!(result, Err(wechatagent::error::AppError::NotFound(_))),
+        "PUT 不存在的 chunk 必须返回 NotFound 而非静默 no-op 或其他错误变体，实际 {result:?}"
+    );
 }
