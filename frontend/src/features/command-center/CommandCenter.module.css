@@ -172,3 +172,12 @@
   .scopeStack { grid-template-columns: 1fr; }
   .actions { align-items: flex-start; flex-direction: column; }
 }
+
+/* 活动推送结果跳转入口 —— 蓝色文字按钮（主操作色，可点击） */
+.campaignJump {
+  font: inherit; font-size: 12px; font-weight: 600; letter-spacing: -.1px;
+  margin: 4px 0 8px 26px; padding: 4px 0;
+  background: none; border: none; cursor: pointer;
+  color: var(--color-scheduled);
+}
+.campaignJump:hover { text-decoration: underline; }
