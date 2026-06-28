@@ -12,7 +12,7 @@ use crate::{
     models::{AgentSoul, OperationDomainConfig, OperationPlaybook, PromptTemplate},
 };
 
-pub const PROMPT_PACK_VERSION: &str = "wechatagent_prompt_pack_v15_2026_06_27_escalation_required_and_memory_dimension";
+pub const PROMPT_PACK_VERSION: &str = "wechatagent_prompt_pack_v16_2026_06_28_memory_structured_fact_and_dimension_required";
 
 /// universal-domain-adaptation A/T1：user.reply.policy prompt「## 模式与 5 闸的关系」
 /// 模式-闸说明段（逐字复刻 prompt pack v3 现文 :958-963：标题 + casual_relationship /
@@ -1429,8 +1429,12 @@ fn prompt_specs() -> Vec<PromptSpec> {
       "temperature": "",
       "lastEmotion": ""
     },
-    "coreFacts": [],
-    "recentFacts": [],
+    "coreFacts": [
+      { "id": "沿用「当前 memoryCard」里该条 fact 的 id；新事实留空字符串由系统生成", "text": "一条只讲一个事实的原子陈述（一个属性/一个数值/一个角色）", "dimension": "该事实的语义维度名（如 孩子年龄/预算/决策角色），同一属性跨轮沿用同名", "importance": 8 }
+    ],
+    "recentFacts": [
+      { "id": "", "text": "近期事实，结构同 coreFacts", "dimension": "可留空", "importance": 5 }
+    ],
     "preferences": [],
     "doNotDo": [],
     "commitments": [],
@@ -1471,7 +1475,8 @@ fn prompt_specs() -> Vec<PromptSpec> {
 - recentFacts 最多 10 条，按 recency（越新越靠前）排列；放近期但不一定长期重要的事实。
 - 不要在 coreFacts 中重复 recentFacts 已经覆盖的内容。
 - 系统会自动合并上一版 memoryCard 中未在 `discarded` 里出现的 coreFacts；要让某条旧 coreFact 失效，必须显式列入 `discarded`。
-- 每条 fact 可选带 dimension 字段：对这条事实做语义维度归类（如客户的某个稳定属性维度）。当客户改口 / 更正某维度的旧信息时，给新 fact 标同一 dimension——系统会自动让该维度的旧值退出生效层（你不必手动把旧值列进 discarded）。同一维度同时只应保留一条生效 fact。
+- 每条 fact 必须原子化：只讲一个事实（一个属性 / 一个数值 / 一个角色），不要把多个事实揉进一条 summary 式长句（否则系统无法对单个事实做冲突裁决）。
+- dimension 字段：对这条事实做语义维度归类（如 孩子年龄 / 预算 / 决策角色）。当本轮出现对某属性的改口 / 更正（典型：年龄、预算、决策角色变化）时，新 fact 必须带 dimension 字段标注该属性维度，且与被更正的旧 fact 用同一 dimension 名——系统据此自动让该维度旧值退出生效层（你不必手动把旧值列进 discarded）。同一维度同时只应保留一条生效 fact。非改口场景的稳定属性也建议带 dimension。
 - preferences 最多 8 条，doNotDo 最多 10 条。
 - commitments、objections、openLoops 各最多 8 条。
 - recentEpisodeSummary 用短自然语言，不要流水账。
@@ -2654,6 +2659,30 @@ mod reply_schema_evidence_tests {
         assert!(
             task.content.contains("evidenceTurns"),
             "consolidator schema 缺 evidenceTurns——重判标签无证据序位指认"
+        );
+    }
+
+    #[test]
+    fn consolidator_schema_has_structured_fact_shape_and_dimension_required() {
+        let specs = prompt_specs();
+        let task = specs
+            .iter()
+            .find(|s| s.key == "user.memory_consolidator.task")
+            .expect("user.memory_consolidator.task prompt spec 存在");
+        // schema 给出 per-item 对象示例（含 dimension 键），而非空数组。
+        assert!(
+            task.content.contains("\"dimension\""),
+            "coreFacts schema 须给带 dimension 的对象示例,否则 LLM 倾向吐字符串"
+        );
+        // fact 原子化要求（直接针对累积巨型 summary 根因）。
+        assert!(
+            task.content.contains("只讲一个事实"),
+            "须要求 fact 原子化(一条只讲一个事实)"
+        );
+        // dimension 改口必填(镜像⑥决策墙手法,不是"可选")。
+        assert!(
+            task.content.contains("改口") && task.content.contains("必须"),
+            "改口/更正场景须把 dimension 升为必填"
         );
     }
 
