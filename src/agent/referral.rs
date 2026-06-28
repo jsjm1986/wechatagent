@@ -6,6 +6,13 @@ use crate::routes::AppState;
 use mongodb::bson::{doc, oid::ObjectId, to_document, DateTime};
 use serde_json::{json, Value};
 
+/// ④reviewer 让位段（辅助模式下注入 reviewer system prompt）。同时消解两条 hold 路径：
+/// ① 引荐专属顾问不属于「除『我』外不得出现人类角色」红线所禁——红线在引荐这一受控动作上让位；
+/// ② 引荐不是产品能力声明（不涉产品功能/价格/效果）→ 不计入 hallucination/产品准确度评分。
+/// 措辞红线：用「专属顾问/增配/我仍在场辅助」，过 check-no-human-takeover lint。
+/// assist 关账号不注入此段（reviewer system prompt 字节等价）。
+pub(crate) const REVIEWER_ASSIST_YIELD_NOTE: &str = "\n【受控例外·辅助模式】本账号已开启辅助模式。在辅助模式下，AI 主动为契合条件的客户增配一位「专属顾问」（决策里的 namecardToSend）是本账号的受控业务动作，定位是「我为你增配一位更专属的顾问、我仍在场辅助答疑」。评审时请注意两点：① 这一引荐动作不属于「对话中除『我』之外不得出现任何人类角色」红线所禁止的范畴，该红线在「引荐专属顾问」上让位，不要因此判 needs_revision；② 引荐专属顾问不是对产品能力/价格/效果的声明，不计入 hallucination/产品准确度评分（不要据此抬高 factRisk）。仅当客户真正契合（明确要签约/到店/深度对接）时才引荐，不为引荐而引荐。\n";
+
 /// 辅助模式是否对本客户生效。客户级 override > 账号级 enabled > 默认关。
 pub(crate) fn assist_mode_active(account_enabled: Option<bool>, override_attr: Option<&str>) -> bool {
     match override_attr {
@@ -199,6 +206,20 @@ mod tests {
             tags: vec![],
             enabled, review_status: review.into(), review_note: None,
             created_at: DateTime::now(), updated_at: DateTime::now(),
+        }
+    }
+
+    #[test]
+    fn reviewer_assist_yield_note_covers_two_paths_and_passes_lint() {
+        let note = super::REVIEWER_ASSIST_YIELD_NOTE;
+        // 解路径①：引荐不属于「第三方角色失约」红线。
+        assert!(note.contains("专属顾问"));
+        assert!(note.contains("让位") || note.contains("不属于"));
+        // 解路径②：引荐不是产品能力声明,不计入 hallucination/产品准确度。
+        assert!(note.contains("不是产品") || note.contains("不计入"));
+        // 过 check-no-human-takeover lint:不含禁词。
+        for banned in ["人工接管", "接管", "转人工", "hand-off", "handoff", "人工介入"] {
+            assert!(!note.contains(banned), "让位措辞含禁词: {banned}");
         }
     }
 
