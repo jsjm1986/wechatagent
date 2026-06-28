@@ -1,0 +1,699 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title data-zh="技术架构 · WeAgent" data-en="Technology · WeAgent">技术架构 · WeAgent</title>
+<meta name="description" content="WeAgent 的技术内核：用户运营 Agent 大脑、统一发送网关 13 步流水线、独立评审与认知隔离、三道闸门、方法论文本公式、长短期记忆与多轮证据置信、大五人格与意图轨迹等认知科学方法、影子回放自我演化、知识 Wiki 双写，并用真实大模型对每个业务域做端到端测试。每条都对应真实 Rust 代码。">
+<link rel="canonical" href="https://weagent.example.com/technology.html">
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="WeAgent">
+<meta property="og:locale" content="zh_CN">
+<meta property="og:locale:alternate" content="en_US">
+<meta property="og:title" content="技术架构 · WeAgent">
+<meta property="og:description" content="统一发送网关 13 步流水线、独立评审与认知隔离、三道闸门、长短期记忆与多轮证据置信、大五人格与意图轨迹等认知科学方法、影子回放自我演化，并用真实大模型做端到端业务测试——每条都对应真实 Rust 代码。">
+<meta property="og:url" content="https://weagent.example.com/technology.html">
+<meta property="og:image" content="https://weagent.example.com/assets/og-cover.png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="WeAgent — 全自治微信私域 AI 运营">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="技术架构 · WeAgent">
+<meta name="twitter:description" content="统一发送网关 13 步流水线、独立评审、影子回放自我演化——每条都对应真实 Rust 代码。">
+<meta name="twitter:image" content="https://weagent.example.com/assets/og-cover.png">
+<link rel="stylesheet" href="assets/shared.css">
+<link rel="stylesheet" href="assets/technology.css">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='18' fill='%235E5CE6'/%3E%3Cpath fill='%23fff' fill-rule='evenodd' clip-rule='evenodd' d='M18.5 7 H45.5 Q57.5 7 57.5 19 V33 Q57.5 45 45.5 45 H24 L13 57 V44.4 Q6.5 43 6.5 33 V19 Q6.5 7 18.5 7 Z M14 15.5 L20.2 38 L31 23 L33 23 L43.8 38 L50 15.5 L44.3 15.5 L40.4 31 L33.4 21 L30.6 21 L23.6 31 L19.7 15.5 Z M47 6.1 C47 12.02 46 13.5 42 13.5 C46 13.5 47 14.98 47 20.9 C47 14.98 48 13.5 52 13.5 C48 13.5 47 12.02 47 6.1 Z'/%3E%3C/svg%3E">
+</head>
+<body>
+
+<!-- ============ 导航 ============ -->
+<nav class="nav">
+  <div class="wrap nav-inner">
+    <a href="index.html" class="brand">
+      <span class="brand-mark"><svg viewBox="0 0 64 64" fill="none"><path fill="#fff" fill-rule="evenodd" clip-rule="evenodd" d="M18.5 7 H45.5 Q57.5 7 57.5 19 V33 Q57.5 45 45.5 45 H24 L13 57 V44.4 Q6.5 43 6.5 33 V19 Q6.5 7 18.5 7 Z M14 15.5 L20.2 38 L31 23 L33 23 L43.8 38 L50 15.5 L44.3 15.5 L40.4 31 L33.4 21 L30.6 21 L23.6 31 L19.7 15.5 Z M47 6.1 C47 12.02 46 13.5 42 13.5 C46 13.5 47 14.98 47 20.9 C47 14.98 48 13.5 52 13.5 C48 13.5 47 12.02 47 6.1 Z"/></svg></span>
+      WeAgent
+    </a>
+    <div class="nav-links">
+      <a href="index.html" data-lang-zh>首页</a><a href="index.html" data-lang-en>Home</a>
+      <a href="solutions.html" data-lang-zh>解决什么</a><a href="solutions.html" data-lang-en>Solutions</a>
+      <a href="product.html" data-lang-zh>产品能力</a><a href="product.html" data-lang-en>Product</a>
+      <a href="agents.html" data-lang-zh>智能体编队</a><a href="agents.html" data-lang-en>Agents</a>
+      <a href="technology.html" class="active" data-lang-zh>技术架构</a><a href="technology.html" class="active" data-lang-en>Technology</a>
+      <a href="engineering.html" data-lang-zh>工程深度</a><a href="engineering.html" data-lang-en>Engineering</a>
+      <a href="evolution.html" data-lang-zh>自我演化</a><a href="evolution.html" data-lang-en>Self-evolution</a>
+      <a href="scenarios.html" data-lang-zh>行业场景</a><a href="scenarios.html" data-lang-en>Scenarios</a>
+      <a href="observability.html" data-lang-zh>运营透视</a><a href="observability.html" data-lang-en>Observability</a>
+      <a href="trust.html" data-lang-zh>信任与安全</a><a href="trust.html" data-lang-en>Trust</a>
+    </div>
+    <div class="nav-right">
+      <div class="lang-toggle">
+        <button data-lang-btn="zh">中</button>
+        <button data-lang-btn="en">EN</button>
+      </div>
+      <button class="nav-burger" aria-label="menu"><svg viewBox="0 0 24 24" width="22" height="22" fill="none"><path d="M4 7h16M4 12h16M4 17h16" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg></button>
+    </div>
+  </div>
+</nav>
+<div class="mobile-menu">
+  <a href="index.html" data-lang-zh>首页</a><a href="index.html" data-lang-en>Home</a>
+  <a href="solutions.html" data-lang-zh>解决什么</a><a href="solutions.html" data-lang-en>Solutions</a>
+  <a href="product.html" data-lang-zh>产品能力</a><a href="product.html" data-lang-en>Product</a>
+  <a href="agents.html" data-lang-zh>智能体编队</a><a href="agents.html" data-lang-en>Agents</a>
+  <a href="technology.html" data-lang-zh>技术架构</a><a href="technology.html" data-lang-en>Technology</a>
+  <a href="engineering.html" data-lang-zh>工程深度</a><a href="engineering.html" data-lang-en>Engineering</a>
+  <a href="evolution.html" data-lang-zh>自我演化</a><a href="evolution.html" data-lang-en>Self-evolution</a>
+  <a href="scenarios.html" data-lang-zh>行业场景</a><a href="scenarios.html" data-lang-en>Scenarios</a>
+  <a href="observability.html" data-lang-zh>运营透视</a><a href="observability.html" data-lang-en>Observability</a>
+  <a href="trust.html" data-lang-zh>信任与安全</a><a href="trust.html" data-lang-en>Trust</a>
+</div>
+
+<!-- ============ 页内英雄 ============ -->
+<header class="page-hero section-deep">
+  <div class="page-hero-bg" aria-hidden="true"><div class="hero-glow hero-glow-1" style="position:absolute;width:560px;height:560px;border-radius:50%;filter:blur(90px);opacity:.5;top:-160px;left:-100px;background:radial-gradient(circle,rgba(94,92,230,.5),transparent 68%)"></div><div class="hero-glow" style="position:absolute;width:480px;height:480px;border-radius:50%;filter:blur(90px);opacity:.4;top:-40px;right:-80px;background:radial-gradient(circle,rgba(15,181,168,.42),transparent 70%)"></div></div>
+  <div class="wrap" style="position:relative">
+    <span class="eyebrow reveal" data-lang-zh>技术架构 · 单进程 · 同一套网关</span><span class="eyebrow reveal" data-lang-en>Architecture · single process · one gateway</span>
+    <h1 class="h-display reveal reveal-d1" data-lang-zh>每一条消息，都走<span class="text-grad">同一条可审计的路</span></h1>
+    <h1 class="h-display reveal reveal-d1" data-lang-en>Every message takes <span class="text-grad">the same auditable path</span></h1>
+    <p class="lead reveal reveal-d2" data-lang-zh>一个 Rust（Axum）进程托管管理后台、对外 API、微信回调与后台任务循环。无论是回调自动回复还是主动跟进，每一次发送都流经同一个发送网关：重载上下文 → 多重前置检查 → 知识路由 → 分层决策 → 独立评审 → 至多一次改写 → 幂等发件箱 → MCP 发送。绕过网关，就是 bug。</p>
+    <p class="lead reveal reveal-d2" data-lang-en>A single Rust (Axum) process hosts the admin SPA, the public API, WeChat callbacks and the background task loop. Whether an auto-reply or a proactive follow-up, every send flows through one gateway: reload context → prechecks → knowledge route → tiered decision → independent review → at most one rewrite → idempotent outbox → MCP send. Bypassing it is a bug.</p>
+    <div class="page-hero-meta reveal reveal-d3">
+      <span class="pill" data-lang-zh>Rust · Axum 单进程</span><span class="pill" data-lang-en>Rust · Axum monolith</span>
+      <span class="pill">MongoDB</span>
+      <span class="pill" data-lang-zh>OpenAI 兼容 LLM</span><span class="pill" data-lang-en>OpenAI-compatible LLM</span>
+      <span class="pill" data-lang-zh>MCP 微信工具</span><span class="pill" data-lang-en>MCP WeChat tools</span>
+    </div>
+  </div>
+</header>
+
+<!-- ============ Agent 大脑 ============ -->
+<section class="section">
+  <div class="wrap">
+    <div class="t-head reveal">
+      <span class="eyebrow" data-lang-zh>Agent 大脑</span><span class="eyebrow" data-lang-en>The agent brain</span>
+      <h2 class="h-section" data-lang-zh>一个大脑，<span class="text-grad">拆成职责清晰的模块</span></h2>
+      <h2 class="h-section" data-lang-en>One brain, <span class="text-grad">split into focused modules</span></h2>
+      <p class="lead" data-lang-zh>用户运营 Agent 不是一个巨型函数，而是一组各司其职的子模块。决策、评审、知识路由、预算、守卫、记忆彼此隔离，可单独理解与测试——外部调用方只通过统一入口访问。</p>
+      <p class="lead" data-lang-en>The user-ops agent isn't one giant function but a set of single-purpose submodules. Decision, review, knowledge routing, budget, guards and memory are isolated — callers reach them only through unified entrypoints.</p>
+    </div>
+    <div class="brain-grid">
+      <div class="brain-card reveal"><div class="bc-mod">decision</div><h4 data-lang-zh>回复决策</h4><h4 data-lang-en>Reply decision</h4><p data-lang-zh>Reply Agent 主决策与初始画像生成，产出结构化决策 JSON。</p><p data-lang-en>The Reply Agent's main decision and initial profile generation, emitting structured decision JSON.</p></div>
+      <div class="brain-card reveal reveal-d1"><div class="bc-mod">review</div><h4 data-lang-zh>独立评审</h4><h4 data-lang-en>Independent review</h4><p data-lang-zh>独立评审 Agent 与本地评审、改写流，只看事实不看推理。</p><p data-lang-en>The independent reviewer plus local review and rewrite flow — sees facts, not reasoning.</p></div>
+      <div class="brain-card reveal reveal-d2"><div class="bc-mod">knowledge_router</div><h4 data-lang-zh>知识路由</h4><h4 data-lang-en>Knowledge router</h4><p data-lang-zh>catalog → list_chunks → open_slice 的工具调用式规划，渐进披露知识。</p><p data-lang-en>A catalog → list_chunks → open_slice tool-calling planner that discloses knowledge progressively.</p></div>
+      <div class="brain-card reveal"><div class="bc-mod">gateway</div><h4 data-lang-zh>发送网关</h4><h4 data-lang-en>Send gateway</h4><p data-lang-zh>统一编排整条链路，所有发送的唯一出口，绕过即 bug。</p><p data-lang-en>Orchestrates the whole path — the single exit for all sends. Bypassing it is a bug.</p></div>
+      <div class="brain-card reveal reveal-d1"><div class="bc-mod">guards</div><h4 data-lang-zh>决策守卫</h4><h4 data-lang-en>Guards</h4><p data-lang-zh>状态机转移、字符串级 fact-risk 与知识支撑校验。</p><p data-lang-en>State-machine transitions, string-level fact-risk and knowledge-grounding checks.</p></div>
+      <div class="brain-card reveal reveal-d2"><div class="bc-mod">budget</div><h4 data-lang-zh>运行预算</h4><h4 data-lang-en>Run budget</h4><p data-lang-zh>task-local 的 token / 调用计数，超额触发降级而非报错。</p><p data-lang-en>A task-local token/call counter; exceeding it degrades gracefully rather than erroring.</p></div>
+      <div class="brain-card reveal"><div class="bc-mod">memory</div><h4 data-lang-zh>长期记忆</h4><h4 data-lang-en>Long-term memory</h4><p data-lang-zh>长期 memoryCard 整理与合并，沉淀对每个人的认知。</p><p data-lang-en>Consolidates long-term memory cards, accruing understanding of each person.</p></div>
+      <div class="brain-card reveal reveal-d1"><div class="bc-mod">outbox</div><h4 data-lang-zh>持久发件箱</h4><h4 data-lang-en>Persistent outbox</h4><p data-lang-zh>带幂等键的发件箱，二次安全闸与重试，异步派发到 MCP。</p><p data-lang-en>An idempotency-keyed outbox with a second safety gate and retries, dispatched async to MCP.</p></div>
+      <div class="brain-card reveal reveal-d2"><div class="bc-mod">simulation</div><h4 data-lang-zh>影子模拟</h4><h4 data-lang-en>Shadow simulation</h4><p data-lang-zh>上线前对单人模拟对话，验证表现后再放行真实运营。</p><p data-lang-en>Simulates dialogue for one person before go-live, validating behavior ahead of real operations.</p></div>
+    </div>
+    <p class="reveal" style="margin-top:22px;font-size:13px;color:var(--ink-3)">
+      <span data-lang-zh>所有 LLM JSON 调用都经唯一入口 <code style="font-family:var(--mono);color:var(--brand)">generate_agent_json</code>：它持有 LRU 提示词缓存、写入 <code style="font-family:var(--mono);color:var(--brand)">llm_call_logs</code>（状态 success / cache_hit / failed / json_error），并把 token 用量累加进运行预算。</span>
+      <span data-lang-en>Every LLM JSON call goes through one entrypoint, <code style="font-family:var(--mono);color:var(--brand)">generate_agent_json</code>: it owns the LRU prompt cache, writes <code style="font-family:var(--mono);color:var(--brand)">llm_call_logs</code> (status success / cache_hit / failed / json_error) and accumulates token usage into the run budget.</span>
+    </p>
+  </div>
+</section>
+
+<!-- ============ 统一网关流水线 ============ -->
+<section class="section section-tint" id="gateway">
+  <div class="wrap">
+    <div class="t-head reveal">
+      <span class="eyebrow" data-lang-zh>统一发送网关</span><span class="eyebrow" data-lang-en>The unified gateway</span>
+      <h2 class="h-section" data-lang-zh>发一条消息，<span class="text-grad">要过这么多关</span></h2>
+      <h2 class="h-section" data-lang-en>One message, <span class="text-grad">this many checkpoints</span></h2>
+      <p class="lead" data-lang-zh>下面是真实代码里 <code style="font-family:var(--mono);color:var(--brand)">run_user_operation_gateway</code> 的执行顺序。每一步都可能改变结果，每一步都留痕。前置检查通不过就不发，发出前还要再查一次。</p>
+      <p class="lead" data-lang-en>This is the real execution order inside <code style="font-family:var(--mono);color:var(--brand)">run_user_operation_gateway</code>. Each step can change the outcome and each is recorded. If prechecks fail, nothing is sent — and they run again right before send.</p>
+    </div>
+
+    <div class="flow-pipe">
+      <div class="flow-step reveal"><div class="flow-num">1</div><div class="flow-body">
+        <h4 data-lang-zh>前置检查（第一道）</h4><h4 data-lang-en>Precheck (first pass)</h4>
+        <div class="fb-en">precheck_send_gateway</div>
+        <p data-lang-zh>逐项核对是否允许发送。任一不通过即停下，写跳过事件与运行日志，并按原因取消或重排任务。</p>
+        <p data-lang-en>Checks every condition for sending. Any failure stops here, logs a skip event and run log, then cancels or reschedules the task by reason.</p>
+        <div class="flow-tags"><span class="flow-tag">not_managed</span><span class="flow-tag">cooldown</span><span class="flow-tag">rate_limited</span><span class="flow-tag">daily_limit</span><span class="flow-tag">expired</span><span class="flow-tag">quiet_hours_deferred</span><span class="flow-tag">context_changed</span></div>
+      </div></div>
+
+      <div class="flow-step reveal"><div class="flow-num">2</div><div class="flow-body">
+        <h4 data-lang-zh>重载上下文</h4><h4 data-lang-en>Reload context</h4>
+        <div class="fb-en">load_recent_messages · load_active_domain_profile · effective_memory_card</div>
+        <p data-lang-zh>每次都从头取：最近消息、激活的行业画像、运行参数、待办任务、运营方法论、运营记忆与长期记忆卡。不靠内存里的旧状态。</p>
+        <p data-lang-en>Everything is fetched fresh: recent messages, the active domain profile, run params, pending tasks, playbooks, operating memory and the long-term memory card. No stale in-memory state.</p>
+      </div></div>
+
+      <div class="flow-step reveal"><div class="flow-num">3</div><div class="flow-body">
+        <h4 data-lang-zh>知识路由（永远前置）</h4><h4 data-lang-en>Knowledge route (always first)</h4>
+        <div class="fb-en">route_operation_knowledge · select_operation_knowledge_chunks</div>
+        <p data-lang-zh>先决定要不要查知识、查什么、引用哪些切片。预算超额时退化为空路由并标记降级——绝不假装有据。</p>
+        <p data-lang-en>First decides whether and what knowledge to consult and which slices to cite. If over budget, it degrades to an empty route and marks the run degraded — never faking grounding.</p>
+      </div></div>
+
+      <div class="flow-step reveal"><div class="flow-num">4</div><div class="flow-body">
+        <h4 data-lang-zh>分层决策（渐进式三档）</h4><h4 data-lang-en>Tiered decision (progressive)</h4>
+        <div class="fb-en">Lean → Relational / Full · decide_tier_escalation</div>
+        <p data-lang-zh>先用最省的 Lean 档自评，按充分性判定 Enough / 升档 / 需澄清。命中知识缺口会当场升到 Full 档重新生成。</p>
+        <p data-lang-en>Starts on the lean tier and self-assesses: Enough / escalate / clarify. A knowledge gap forces an immediate escalation to the Full tier and regenerates.</p>
+        <div class="flow-tags"><span class="flow-tag">Lean</span><span class="flow-tag">Relational</span><span class="flow-tag">Full</span><span class="flow-tag">Clarify</span></div>
+      </div></div>
+
+      <div class="flow-step reveal"><div class="flow-num">5</div><div class="flow-body">
+        <h4 data-lang-zh>独立评审</h4><h4 data-lang-en>Independent review</h4>
+        <div class="fb-en">review_decision</div>
+        <p data-lang-zh>另一个评审 Agent 只拿到事实面投影，看不到 Reply Agent 的自我推理，独立打分。预算超额时退化为本地评审。</p>
+        <p data-lang-en>A separate reviewer gets only a facts projection — never the Reply Agent's self-reasoning — and scores independently. Over budget, it falls back to local review.</p>
+      </div></div>
+
+      <div class="flow-step reveal"><div class="flow-num">6</div><div class="flow-body">
+        <h4 data-lang-zh>至多一次改写</h4><h4 data-lang-en>At most one rewrite</h4>
+        <div class="fb-en">decide_reply_with_promote(rewrite) → review_decision</div>
+        <p data-lang-zh>评审要求改写时，按改写指令在 Full 档重生成一次并复审一次——single-shot，不无限循环。预算超额则跳过。</p>
+        <p data-lang-en>If review asks for a rewrite, it regenerates once on the Full tier and re-reviews once — single-shot, never an infinite loop. Skipped if over budget.</p>
+      </div></div>
+
+      <div class="flow-step reveal"><div class="flow-num">7</div><div class="flow-body">
+        <h4 data-lang-zh>终态汇总 + 状态闸</h4><h4 data-lang-en>Finalize + state gate</h4>
+        <div class="fb-en">finalize_review_for_send · apply_state_action_gate</div>
+        <p data-lang-zh>汇总最终评审状态，运营状态按状态机校验合法转移（非法则保留旧状态、记审计，不阻断已定稿的回复）。</p>
+        <p data-lang-en>Finalizes the review status; the operation state is validated against the state machine (illegal transitions keep the old state and log an audit, never blocking a finalized reply).</p>
+      </div></div>
+
+      <div class="flow-step reveal"><div class="flow-num">8</div><div class="flow-body">
+        <h4 data-lang-zh>前置检查（第二道）+ 去抖</h4><h4 data-lang-en>Precheck (second) + debounce</h4>
+        <div class="fb-en">precheck_send_gateway · should_abort_send</div>
+        <p data-lang-zh>发出前再查一遍前置条件；若期间客户又来了新消息，则中止本次、标记被新入站取代，避免抢话。</p>
+        <p data-lang-en>Re-runs prechecks just before sending; if the customer sent a new message meanwhile, it aborts and marks itself superseded — no talking over them.</p>
+      </div></div>
+
+      <div class="flow-step reveal"><div class="flow-num">9</div><div class="flow-body">
+        <h4 data-lang-zh>幂等发件箱</h4><h4 data-lang-en>Idempotent outbox</h4>
+        <div class="fb-en">outbox_enqueue · idempotency key</div>
+        <p data-lang-zh>仅当评审为 approved / 改写后通过、应当回复且文本非空，才入发件箱。多段回复逐段入队，各带幂等键。转述类还要再过两道红线。</p>
+        <p data-lang-en>Only enqueues when review is approved / approved-after-rewrite, should reply and text is non-empty. Multi-segment replies enqueue per segment with idempotency keys; relays pass two more hard lines.</p>
+        <div class="flow-tags"><span class="flow-tag is-send">approved</span><span class="flow-tag is-send">revision_applied_approved</span></div>
+      </div></div>
+
+      <div class="flow-step reveal"><div class="flow-num">10</div><div class="flow-body">
+        <h4 data-lang-zh>MCP 发送（异步抢占）</h4><h4 data-lang-en>MCP send (async claim)</h4>
+        <div class="fb-en">outbox_dispatcher · atomic_claim_pending · message_send_text</div>
+        <p data-lang-zh>独立的派发 worker 原子抢占待发条目（租约 + worker 标记），调 MCP 工具发出。超时由回收器收回租约重试，不重复发送。</p>
+        <p data-lang-en>A separate dispatcher atomically claims pending entries (lease + worker tag) and calls the MCP tool. Expired leases are reclaimed and retried — never double-sent.</p>
+      </div></div>
+    </div>
+  </div>
+</section>
+
+<!-- ============ 渐进式三档加载（token 优化） ============ -->
+<section class="section" id="tiering">
+  <div class="wrap">
+    <div class="t-head reveal">
+      <span class="eyebrow" data-lang-zh>渐进式三档加载</span><span class="eyebrow" data-lang-en>Progressive tiered loading</span>
+      <h2 class="h-section" data-lang-zh>该省的 token 一个不浪费，<span class="text-grad">该给的上下文一条不少</span></h2>
+      <h2 class="h-section" data-lang-en>Spend tokens only where they pay off — <span class="text-grad">never skimp on context that matters</span></h2>
+      <p class="lead" data-lang-zh>不是每一句话都需要把知识库、完整 SOP、长期记忆全塞进上下文。大多数寒暄、确认、闲聊，用最精简的一档就能答好。系统先用最省的 Lean 档生成并自评「信息够不够」，不够才按缺口逐档加料——把算力花在真正复杂的那一轮。</p>
+      <p class="lead" data-lang-en>Not every message needs the whole knowledge base, full SOP and long-term memory stuffed into context. Most greetings, confirmations and small talk are handled well by the leanest tier. The system generates on the lean tier first, self-assesses whether it has enough, and only adds layers by the actual gap — spending compute on the turns that truly need it.</p>
+    </div>
+
+    <div class="tier-grid">
+      <!-- Lean -->
+      <div class="tier-card is-lean reveal">
+        <div class="tier-top">
+          <span class="tier-name">TIER 1 · LEAN</span>
+          <span class="tier-cost" data-lang-zh>最省 token</span><span class="tier-cost" data-lang-en>Lowest cost</span>
+        </div>
+        <h4 data-lang-zh>精简档</h4><h4 data-lang-en>Lean tier</h4>
+        <p data-lang-zh>只带人格、各提示词层、当前对话与客户基础身份。日常寒暄、确认、轻量闲聊够用。</p>
+        <p data-lang-en>Carries only the persona, prompt layers, the current conversation and basic identity. Enough for greetings, confirmations and light chat.</p>
+        <ul class="tier-load">
+          <li class="on"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4"><polyline points="20 6 9 17 4 12"/></svg><span data-lang-zh>人格 + 提示词层 + 任务契约</span><span data-lang-en>Persona + prompt layers + task contract</span></li>
+          <li class="on"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4"><polyline points="20 6 9 17 4 12"/></svg><span data-lang-zh>对话历史 + 客户基础身份</span><span data-lang-en>Conversation + basic identity</span></li>
+          <li class="off"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg><span data-lang-zh>长期记忆 / 意图轨迹</span><span data-lang-en>Long-term memory / intent trajectory</span></li>
+          <li class="off"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg><span data-lang-zh>知识库 / 完整运营 SOP</span><span data-lang-en>Knowledge base / full SOP</span></li>
+        </ul>
+        <div class="tier-foot" data-lang-zh>跳过关系组与业务组的 DB 加载——省查询，也省 token。</div>
+        <div class="tier-foot" data-lang-en>Skips the relational and business DB loads — fewer queries, fewer tokens.</div>
+      </div>
+
+      <!-- Relational -->
+      <div class="tier-card is-rel reveal reveal-d1">
+        <div class="tier-top">
+          <span class="tier-name">TIER 2 · RELATIONAL</span>
+          <span class="tier-cost" data-lang-zh>按需加料</span><span class="tier-cost" data-lang-en>Add on demand</span>
+        </div>
+        <h4 data-lang-zh>关系档</h4><h4 data-lang-en>Relational tier</h4>
+        <p data-lang-zh>在 Lean 之上接入完整长期记忆、记忆卡片与意图轨迹——需要「记得这个人」时才升上来。</p>
+        <p data-lang-en>Adds the full long-term memory, memory card and intent trajectory on top of Lean — escalated when it needs to "remember this person".</p>
+        <ul class="tier-load">
+          <li class="on"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4"><polyline points="20 6 9 17 4 12"/></svg><span data-lang-zh>Lean 的全部上下文</span><span data-lang-en>Everything in Lean</span></li>
+          <li class="on"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4"><polyline points="20 6 9 17 4 12"/></svg><span data-lang-zh>长期运营记忆 + 记忆卡片</span><span data-lang-en>Long-term memory + memory card</span></li>
+          <li class="on"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4"><polyline points="20 6 9 17 4 12"/></svg><span data-lang-zh>意图轨迹 + 反应提示</span><span data-lang-en>Intent trajectory + reaction hints</span></li>
+          <li class="off"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg><span data-lang-zh>知识库 / 完整运营 SOP</span><span data-lang-en>Knowledge base / full SOP</span></li>
+        </ul>
+        <div class="tier-foot" data-lang-zh>自评 <code>missing_tier = relational</code> 时升到这一档重新生成。</div>
+        <div class="tier-foot" data-lang-en>Reached when self-assessment reports <code>missing_tier = relational</code>.</div>
+      </div>
+
+      <!-- Full -->
+      <div class="tier-card is-full reveal reveal-d2">
+        <div class="tier-top">
+          <span class="tier-name">TIER 3 · FULL</span>
+          <span class="tier-cost" data-lang-zh>完整上下文</span><span class="tier-cost" data-lang-en>Full context</span>
+        </div>
+        <h4 data-lang-zh>完整档</h4><h4 data-lang-en>Full tier</h4>
+        <p data-lang-zh>再叠加知识库切片、产品目录、运营方法、状态机、名片引荐等全部业务组——报价、产品主张、复杂推进走这一档。</p>
+        <p data-lang-en>Layers on knowledge slices, the product catalog, playbooks, the state machine, referral cards and the rest of the business group — quotes, product claims and complex moves run here.</p>
+        <ul class="tier-load">
+          <li class="on"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4"><polyline points="20 6 9 17 4 12"/></svg><span data-lang-zh>Relational 的全部上下文</span><span data-lang-en>Everything in Relational</span></li>
+          <li class="on"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4"><polyline points="20 6 9 17 4 12"/></svg><span data-lang-zh>知识切片 + 知识路由</span><span data-lang-en>Knowledge slices + route</span></li>
+          <li class="on"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4"><polyline points="20 6 9 17 4 12"/></svg><span data-lang-zh>产品目录 + 运营方法 + 状态机</span><span data-lang-en>Catalog + playbook + state machine</span></li>
+          <li class="on"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4"><polyline points="20 6 9 17 4 12"/></svg><span data-lang-zh>名片引荐 + 可发素材</span><span data-lang-en>Referral cards + sendable assets</span></li>
+        </ul>
+        <div class="tier-foot" data-lang-zh>铁律：Full 档与改造前的 prompt <b style="color:var(--ink-1)">逐字节等价</b>，能力零损失。</div>
+        <div class="tier-foot" data-lang-en>Iron law: the Full tier is <b style="color:var(--ink-1)">byte-for-byte identical</b> to the pre-refactor prompt — zero capability loss.</div>
+      </div>
+    </div>
+
+    <!-- 自评 → 动作 -->
+    <div class="tier-flow">
+      <div class="tier-flow-card is-enough reveal">
+        <div class="tf-cond">sufficiency = enough</div>
+        <h5 data-lang-zh>够了 · 直接评审</h5><h5 data-lang-en>Enough · go to review</h5>
+        <p data-lang-zh>本轮信息充足，不升档，直接进入五道闸门评审。</p>
+        <p data-lang-en>Context is sufficient; no escalation — straight into the five gates.</p>
+      </div>
+      <div class="tier-flow-card is-esc reveal reveal-d1">
+        <div class="tf-cond">need_more_context</div>
+        <h5 data-lang-zh>不够 · 升档重生成</h5><h5 data-lang-en>Not enough · escalate</h5>
+        <p data-lang-zh>按缺口升到 Relational 或 Full 重新生成。需产品知识却连弱证据都没有时，当场强制升 Full。</p>
+        <p data-lang-en>Escalates to Relational or Full and regenerates. If it needs product knowledge but has no evidence at all, it is forced to Full on the spot.</p>
+      </div>
+      <div class="tier-flow-card is-clarify reveal reveal-d2">
+        <div class="tf-cond">need_clarification</div>
+        <h5 data-lang-zh>信息缺口 · 反问澄清</h5><h5 data-lang-en>Gap · ask to clarify</h5>
+        <p data-lang-zh>客户表述本身不明确时，不硬猜，先反问一句把需求问清。</p>
+        <p data-lang-en>When the customer's request itself is ambiguous, it asks one clarifying question instead of guessing.</p>
+      </div>
+    </div>
+
+    <!-- 恒注入铁律 -->
+    <div class="iron-law reveal">
+      <div class="il-ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg></div>
+      <div>
+        <h4 data-lang-zh>省 token，但绝不省安全</h4><h4 data-lang-en>Save tokens, never safety</h4>
+        <p data-lang-zh>「禁止做的事」与「已对客户承诺的事」属于安全/身份铁律——<b>任何一档都注入</b>。降档若丢了这两项，AI 可能违背承诺或踩禁止项，是不可恢复的事故。所以即便是最省的 Lean 档，也会单独补一份精简安全子片：<code>doNotDo</code> 与 <code>commitments</code> 一字不漏。</p>
+        <p data-lang-en>"Things never to do" and "promises already made to the customer" are safety/identity hard lines — <b>injected at every tier</b>. Dropping them on a lower tier could make the AI break a promise or cross a forbidden line — an unrecoverable failure. So even the leanest tier injects a compact safety subset: <code>doNotDo</code> and <code>commitments</code> are kept verbatim.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ============ 独立评审：认知隔离 ============ -->
+<section class="section section-deep">
+  <div class="hero-bg" aria-hidden="true"><div class="hero-glow" style="position:absolute;width:640px;height:640px;border-radius:50%;filter:blur(100px);opacity:.2;top:40%;right:-120px;background:radial-gradient(circle,rgba(94,92,230,.5),transparent 72%)"></div></div>
+  <div class="wrap" style="position:relative">
+    <div class="t-head reveal">
+      <span class="eyebrow" data-lang-zh>独立评审 · 认知隔离</span><span class="eyebrow" data-lang-en>Independent review · epistemic distance</span>
+      <h2 class="h-section" data-lang-zh>评审者只看事实，<span class="text-grad">不看它怎么想</span></h2>
+      <h2 class="h-section" data-lang-en>The reviewer sees facts, <span class="text-grad">not the reasoning</span></h2>
+      <p class="lead" data-lang-zh>如果评审 Agent 能看到 Reply Agent 的内心独白，它很容易被说服、变成「追认」。所以评审拿到的是一份事实投影：回复文本、引用了哪些知识、检测到的异议、客户阶段——而 user_understanding、self_critique、why_should_reply 等九个自我推理字段被刻意剥离。</p>
+      <p class="lead" data-lang-en>If the reviewer could read the Reply Agent's inner monologue, it would be easily persuaded into rubber-stamping. So it gets a facts projection — reply text, cited knowledge, detected objections, customer stage — while nine self-reasoning fields (user_understanding, self_critique, why_should_reply…) are deliberately stripped.</p>
+    </div>
+    <div class="grid-2">
+      <div class="card card-deep reveal">
+        <span class="pill pill-ai" data-lang-zh>评审看得到</span><span class="pill pill-ai" data-lang-en>Reviewer sees</span>
+        <ul style="margin-top:14px;list-style:none;display:flex;flex-direction:column;gap:10px">
+          <li style="display:flex;gap:10px;font-size:14px;color:var(--on-deep-2)"><span style="color:var(--ai)">✓</span><span data-lang-zh>回复文本与是否应回复</span><span data-lang-en>Reply text & whether to reply</span></li>
+          <li style="display:flex;gap:10px;font-size:14px;color:var(--on-deep-2)"><span style="color:var(--ai)">✓</span><span data-lang-zh>引用 / 命中的知识切片 ID</span><span data-lang-en>Cited / matched knowledge IDs</span></li>
+          <li style="display:flex;gap:10px;font-size:14px;color:var(--on-deep-2)"><span style="color:var(--ai)">✓</span><span data-lang-zh>检测到的异议、客户阶段、意向等级</span><span data-lang-en>Objections, customer stage, intent level</span></li>
+          <li style="display:flex;gap:10px;font-size:14px;color:var(--on-deep-2)"><span style="color:var(--ai)">✓</span><span data-lang-zh>运营状态、风险等级、知识需求</span><span data-lang-en>Operation state, risk level, knowledge need</span></li>
+        </ul>
+      </div>
+      <div class="card card-deep reveal reveal-d1">
+        <span class="pill pill-blocked" data-lang-zh>评审看不到</span><span class="pill pill-blocked" data-lang-en>Reviewer can't see</span>
+        <ul style="margin-top:14px;list-style:none;display:flex;flex-direction:column;gap:10px">
+          <li style="display:flex;gap:10px;font-size:14px;color:var(--on-deep-2)"><span style="color:var(--blocked)">✕</span><span style="font-family:var(--mono);font-size:13px">user_understanding · relationship_read</span></li>
+          <li style="display:flex;gap:10px;font-size:14px;color:var(--on-deep-2)"><span style="color:var(--blocked)">✕</span><span style="font-family:var(--mono);font-size:13px">risk_self_check · self_critique</span></li>
+          <li style="display:flex;gap:10px;font-size:14px;color:var(--on-deep-2)"><span style="color:var(--blocked)">✕</span><span style="font-family:var(--mono);font-size:13px">why_should_reply · why_skip_reply</span></li>
+          <li style="display:flex;gap:10px;font-size:14px;color:var(--on-deep-2)"><span style="color:var(--blocked)">✕</span><span style="font-family:var(--mono);font-size:13px">intent_analysis · next_best_action</span></li>
+        </ul>
+      </div>
+    </div>
+    <p class="reveal" style="margin-top:22px;font-size:13.5px;color:var(--on-deep-3);text-align:center">
+      <span data-lang-zh>可选地，第二个评审者（不同模型）并行评审，分歧会触发改写——双脑交叉，不偏听一面。</span>
+      <span data-lang-en>Optionally a second reviewer (a different model) reviews in parallel; disagreement triggers a rewrite — two heads cross-checking, not one voice.</span>
+    </p>
+  </div>
+</section>
+
+<!-- ============ 三道闸门 ============ -->
+<section class="section">
+  <div class="wrap">
+    <div class="t-head reveal">
+      <span class="eyebrow" data-lang-zh>三道闸门</span><span class="eyebrow" data-lang-en>Three gates</span>
+      <h2 class="h-section" data-lang-zh>该拦的拦下，<span class="text-grad">但绝不把错误抛给客户</span></h2>
+      <h2 class="h-section" data-lang-en>Block what must be blocked — <span class="text-grad">never throw errors at the customer</span></h2>
+      <p class="lead" data-lang-zh>知识支撑、事实风险、运行预算三道闸共同决定一条回复能否发出。关键设计是 fail-soft：闸门触发或预算耗尽时降级处理（本地评审、跳过改写、暂缓发送），webhook 调用方永远拿到正常响应，不会收到 5xx。</p>
+      <p class="lead" data-lang-en>Grounding, fact-risk and run-budget gates together decide whether a reply ships. The key design is fail-soft: when a gate fires or budget runs out, it degrades (local review, skip rewrite, hold the send) — callers never get a 5xx.</p>
+    </div>
+    <div class="gate-grid">
+      <div class="gate-card reveal">
+        <div class="g-ico" style="background:rgba(15,181,168,.14);color:var(--ai)"><svg viewBox="0 0 24 24" width="22" height="22" fill="none"><path d="M12 3l8 4v5c0 5-3.5 8-8 9-4.5-1-8-4-8-9V7l8-4z" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/><path d="M9 12l2 2 4-4" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"/></svg></div>
+        <h4 data-lang-zh>知识支撑</h4><h4 data-lang-en>Grounding</h4>
+        <div class="g-en">grounding gate</div>
+        <p data-lang-zh>产品声明必须有已核验知识支撑。支撑分过低则拦；若需要产品知识却没有已验证切片，直接判定为未验证产品声明。</p>
+        <p data-lang-en>Product claims must rest on verified knowledge. Too low a grounding score blocks; if product knowledge is required but no verified slice exists, it's an unverified claim.</p>
+        <div class="g-rule">blocked_unverified_product_claim</div>
+      </div>
+      <div class="gate-card reveal reveal-d1">
+        <div class="g-ico" style="background:rgba(255,69,58,.12);color:var(--blocked)"><svg viewBox="0 0 24 24" width="22" height="22" fill="none"><path d="M12 8v5M12 16.5v.5" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><path d="M10.3 3.8 2.5 18a2 2 0 0 0 1.7 3h15.6a2 2 0 0 0 1.7-3L13.7 3.8a2 2 0 0 0-3.4 0z" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round"/></svg></div>
+        <h4 data-lang-zh>事实风险</h4><h4 data-lang-en>Fact-risk</h4>
+        <div class="g-en">hallucination gate</div>
+        <p data-lang-zh>对幻觉 / 编造事实打分，达到阈值即硬拦。压力风险过高同样拦截，避免逼单与越界承诺。</p>
+        <p data-lang-en>Scores hallucination / fabrication; at threshold it hard-blocks. Excessive pressure risk is blocked too — no hard-selling or out-of-bounds promises.</p>
+        <div class="g-rule">held_by_ai_policy · blocked_by_safety_guard</div>
+      </div>
+      <div class="gate-card reveal reveal-d2">
+        <div class="g-ico" style="background:rgba(255,159,10,.14);color:var(--held)"><svg viewBox="0 0 24 24" width="22" height="22" fill="none"><circle cx="12" cy="12" r="9" stroke="currentColor" stroke-width="1.8"/><path d="M12 7v5l3 3" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"/></svg></div>
+        <h4 data-lang-zh>运行预算</h4><h4 data-lang-en>Run budget</h4>
+        <div class="g-en">run_budget</div>
+        <p data-lang-zh>每次运行有 token / 调用 / 工具调用上限。超额不报错而是降级：跳过知识路由、退化本地评审、跳过改写；仅当还需评审时才暂缓。</p>
+        <p data-lang-en>Each run has token / call / tool-call caps. Exceeding them degrades rather than errors: skip routing, fall back to local review, skip rewrite; only holds when review is still required.</p>
+        <div class="g-rule">blocked_by_budget · fail-soft</div>
+      </div>
+    </div>
+
+    <div class="thr-wrap reveal">
+      <table class="thr-table">
+        <thead><tr>
+          <th data-lang-zh>评分维度</th><th data-lang-en>Score</th>
+          <th data-lang-zh>判定</th><th data-lang-en>Condition</th>
+          <th data-lang-zh>动作</th><th data-lang-en>Action</th>
+        </tr></thead>
+        <tbody>
+          <tr><td data-lang-zh>事实风险 FactRisk</td><td data-lang-en>FactRisk</td><td class="thr-metric">&ge; 6</td><td><span class="thr-act block" data-lang-zh>拦截</span><span class="thr-act block" data-lang-en>Block</span></td></tr>
+          <tr><td data-lang-zh>压力风险 PressureRisk</td><td data-lang-en>PressureRisk</td><td class="thr-metric">&ge; 7</td><td><span class="thr-act block" data-lang-zh>拦截</span><span class="thr-act block" data-lang-en>Block</span></td></tr>
+          <tr><td data-lang-zh>产品准确度 ProductAccuracy</td><td data-lang-en>ProductAccuracy</td><td class="thr-metric">&lt; 7</td><td><span class="thr-act block" data-lang-zh>拦截</span><span class="thr-act block" data-lang-en>Block</span></td></tr>
+          <tr><td data-lang-zh>拟人度 HumanLikeScore</td><td data-lang-en>HumanLikeScore</td><td class="thr-metric">&lt; 6</td><td><span class="thr-act rewrite" data-lang-zh>改写一次</span><span class="thr-act rewrite" data-lang-en>Rewrite once</span></td></tr>
+          <tr><td data-lang-zh>情绪价值 EmotionalValue</td><td data-lang-en>EmotionalValue</td><td class="thr-metric">&lt; 6</td><td><span class="thr-act rewrite" data-lang-zh>改写一次</span><span class="thr-act rewrite" data-lang-en>Rewrite once</span></td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p class="reveal" style="margin-top:14px;font-size:12.5px;color:var(--ink-3)">
+      <span data-lang-zh>以上为默认阈值，管理员可在画像中覆盖并自动夹紧到 1–10 区间。阈值是行业画像的一部分，不是写死的魔法数。</span>
+      <span data-lang-en>These are defaults; admins can override them in the profile, clamped to 1–10. Thresholds live in the domain profile, not as hardcoded magic numbers.</span>
+    </p>
+  </div>
+</section>
+
+<!-- ============ 方法论公式 ============ -->
+<section class="section section-tint">
+  <div class="wrap">
+    <div class="t-head reveal">
+      <span class="eyebrow" data-lang-zh>方法论公式</span><span class="eyebrow" data-lang-en>Methodology formulas</span>
+      <h2 class="h-section" data-lang-zh>公式是<span class="text-grad">给 AI 读的，不是 Rust 算的</span></h2>
+      <h2 class="h-section" data-lang-en>Formulas are <span class="text-grad">read by the AI, not computed in Rust</span></h2>
+      <p class="lead" data-lang-zh>运营方法论以人类可读的文本表达式存在行业画像里，作为 LLM 自评打分的锚点注入提示词——代码侧只渲染字符串、保存 AI 的自报结果，没有任何数值求值器。这让方法论能随行业自由替换，而不必改一行 Rust。</p>
+      <p class="lead" data-lang-en>Playbook methodology lives as human-readable text expressions in the domain profile, injected into prompts as anchors for the LLM's self-scoring. Rust only renders strings and stores the AI's self-reported result — there is no numeric evaluator. Methodology swaps per industry without touching a line of Rust.</p>
+    </div>
+    <div class="formula-grid">
+      <div class="formula-card reveal"><div class="fc-name" data-lang-zh>信任度 Trust</div><div class="fc-name" data-lang-en>Trust</div><div class="fc-expr">Consistency × Reliability × Intimacy ÷ SelfOrientation</div><p data-lang-zh>信任随一致性、可靠度、亲密度上升，随自我中心下降。</p><p data-lang-en>Trust rises with consistency, reliability and intimacy; falls with self-orientation.</p></div>
+      <div class="formula-card reveal reveal-d1"><div class="fc-name" data-lang-zh>成交就绪度 ConversionReadiness</div><div class="fc-name" data-lang-en>ConversionReadiness</div><div class="fc-expr">Motivation × ProductFit × Timing × Trust ÷ Friction</div><p data-lang-zh>动机、契合、时机、信任共同推动，阻力拉低。</p><p data-lang-en>Motivation, fit, timing and trust drive it; friction holds it back.</p></div>
+      <div class="formula-card reveal"><div class="fc-name" data-lang-zh>情绪价值 EmotionalValue</div><div class="fc-name" data-lang-en>EmotionalValue</div><div class="fc-expr">(Empathy + Encouragement + Recognition) − Pressure</div><p data-lang-zh>共情、鼓励、认可累加，压力扣减。</p><p data-lang-en>Empathy, encouragement and recognition add up; pressure subtracts.</p></div>
+      <div class="formula-card reveal reveal-d1"><div class="fc-name" data-lang-zh>下一步动作分 NextBestAction</div><div class="fc-name" data-lang-en>NextBestAction</div><div class="fc-expr">Relevance × Timing × ExpectedValue ÷ Intrusiveness</div><p data-lang-zh>相关性、时机、预期价值越高越该做，打扰感越低越好。</p><p data-lang-en>Higher relevance, timing and expected value favor acting; lower intrusiveness is better.</p></div>
+    </div>
+  </div>
+</section>
+
+<!-- ============ 认知科学方法论 ============ -->
+<section class="section section-deep" id="cognition">
+  <div class="hero-bg" aria-hidden="true"><div class="hero-glow" style="position:absolute;width:620px;height:620px;border-radius:50%;filter:blur(100px);opacity:.2;top:-120px;left:-100px;background:radial-gradient(circle,rgba(15,181,168,.4),transparent 72%)"></div></div>
+  <div class="wrap" style="position:relative">
+    <div class="t-head reveal" style="max-width:800px">
+      <span class="eyebrow" data-lang-zh>认知科学方法论</span><span class="eyebrow" data-lang-en>Cognitive-science methods</span>
+      <h2 class="h-section" data-lang-zh>智能的底子，<span class="text-grad">是真实代码里的认知机制</span></h2>
+      <h2 class="h-section" data-lang-en>The intelligence is <span class="text-grad">cognitive machinery in real code</span></h2>
+      <p class="lead" data-lang-zh>下面四项把心理学与认知科学里被验证的方法落进了引擎。我们把每一项的真实机制讲清楚——它做了什么、用什么数据结构、以及刻意不做什么。技术买家值得这份坦诚。</p>
+      <p class="lead" data-lang-en>These four bring validated methods from psychology and cognitive science into the engine. We spell out the real mechanism of each — what it does, on what data structures, and what it deliberately does not do. Technical buyers deserve that candor.</p>
+    </div>
+    <div class="method-grid">
+      <div class="method-card reveal">
+        <div class="mc-top">
+          <div class="mc-ico"><svg viewBox="0 0 24 24" fill="none"><path d="M12 3a4 4 0 00-4 4v1a3 3 0 00-2 5.5A3 3 0 008 19a3.5 3.5 0 004 1 3.5 3.5 0 004-1 3 3 0 002-5.5A3 3 0 0016 8V7a4 4 0 00-4-4z" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/><path d="M12 3v17" stroke="currentColor" stroke-width="1.4"/></svg></div>
+          <div><h4 data-lang-zh>长短期记忆</h4><h4 data-lang-en>Long & short-term memory</h4><div class="mc-real">candidate pool → consolidator → compaction</div></div>
+        </div>
+        <p data-lang-zh>短期是当轮上下文包，长期是一张分三层（核心 / 近期 / 已弃）的记忆卡。新观察先写入候选池，由整理 Agent 周期性固化为记忆卡，并做容量压缩与冲突作废，用乐观锁版本号保证并发安全。</p>
+        <p data-lang-en>Short-term is the per-turn context pack; long-term is a memory card in three layers (core / recent / deprecated). New observations land in a candidate pool, a consolidator periodically promotes them into the card, compacts by capacity and deprecates on conflict — guarded by an optimistic version lock.</p>
+        <div class="mc-mech">
+          <div class="mc-mech-h" data-lang-zh>真实机制</div><div class="mc-mech-h" data-lang-en>How it really works</div>
+          <p data-lang-zh>是完整的「候选 → 固化 → 压缩 → 作废」流水线，不是把历史对话整段塞回提示词。压缩时保留上一版未丢弃的核心事实，防止新近事件挤掉关键认知。</p>
+          <p data-lang-en>A full candidate → consolidate → compact → deprecate pipeline, not stuffing raw history back into the prompt. Compaction preserves last version's undiscarded core facts so recency can't crowd out key knowledge.</p>
+        </div>
+      </div>
+      <div class="method-card reveal reveal-d1">
+        <div class="mc-top">
+          <div class="mc-ico"><svg viewBox="0 0 24 24" fill="none"><path d="M4 18c2-8 5-12 8-12s6 4 8 12" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/><circle cx="8" cy="14" r="1.6" fill="currentColor"/><circle cx="14" cy="9" r="1.6" fill="currentColor"/><circle cx="18" cy="15" r="1.6" fill="currentColor"/></svg></div>
+          <div><h4 data-lang-zh>多轮证据置信 · 贝叶斯信号</h4><h4 data-lang-en>Evidence-accumulation · Bayesian signals</h4><div class="mc-real">cross-round hits + code-side strong evidence</div></div>
+        </div>
+        <p data-lang-zh>AI 自由发现至多 6 个客户维度，每个维度维护一条置信走势（最多 100 点）。占槽门槛是：跨 ≥3 轮反复命中，且代码侧客观统计到 ≥2 次强证据（锚定客户真实 Inbound 发言）。</p>
+        <p data-lang-en>The AI freely discovers up to 6 customer dimensions, each with a confidence trajectory (up to 100 points). Promotion requires hits across ≥3 rounds plus ≥2 strong-evidence counts objectively tallied in code (anchored to the customer's own inbound messages).</p>
+        <div class="mc-mech">
+          <div class="mc-mech-h" data-lang-zh>坦诚说明</div><div class="mc-mech-h" data-lang-en>Straight talk</div>
+          <p data-lang-zh>这里走的是<b>多轮证据累积 + 客观强证据计数</b>的置信追踪，不是先验/后验的概率推断；强证据由代码统计，不采信大模型自报的置信数字。它<code>永不驱动行为</code>，只用于观测与走势可视化。</p>
+          <p data-lang-en>This is <b>multi-round evidence accumulation with objective strong-evidence counting</b>, not prior/posterior probabilistic inference; strong evidence is counted in code, never the model's self-reported confidence. It is <code>observation-only</code> — for trends and visualization, never driving behavior.</p>
+        </div>
+      </div>
+      <div class="method-card reveal">
+        <div class="mc-top">
+          <div class="mc-ico"><svg viewBox="0 0 24 24" fill="none"><circle cx="12" cy="8" r="4" stroke="currentColor" stroke-width="1.7"/><path d="M5 20c0-3.5 3-6 7-6s7 2.5 7 6" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></svg></div>
+          <div><h4 data-lang-zh>大五人格画像</h4><h4 data-lang-en>Big Five profiling</h4><div class="mc-real">OCEAN facets + capped snapshots</div></div>
+        </div>
+        <p data-lang-zh>沿用心理学公认的大五人格（OCEAN）五维封闭量表，每维带分值、置信与证据引用，不许模型自创维度。每个记忆周期 append 一张人格快照（封顶留存），构成演化序列。</p>
+        <p data-lang-en>It uses the psychology-standard Big Five (OCEAN) as a closed five-facet scale — each facet carrying a score, confidence and evidence refs, with no model-invented dimensions. Each memory cycle appends a capped personality snapshot, forming an evolution sequence.</p>
+        <div class="mc-mech">
+          <div class="mc-mech-h" data-lang-zh>刻意的克制</div><div class="mc-mech-h" data-lang-en>A deliberate restraint</div>
+          <p data-lang-zh>人格是<code>纯观测旁路</code>：只写不读，绝不进入逐轮决策、闸门或选择逻辑。这是为了避免「基于人格标签的偏见」——画像供人看、供复盘，但不替客户预设回应。</p>
+          <p data-lang-en>Personality is a <code>pure observation side-channel</code>: written, never read into per-turn decisions, gates or selection. This avoids personality-label bias — the profile informs humans and retrospectives, but never pre-scripts a customer's treatment.</p>
+        </div>
+      </div>
+      <div class="method-card reveal reveal-d1">
+        <div class="mc-top">
+          <div class="mc-ico"><svg viewBox="0 0 24 24" fill="none"><path d="M3 12h4l3-7 4 14 3-7h4" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg></div>
+          <div><h4 data-lang-zh>意图轨迹走势</h4><h4 data-lang-en>Intent trajectory</h4><div class="mc-real">a time series that DOES drive action</div></div>
+        </div>
+        <p data-lang-zh>每轮把归一化的推进结果记入意图轨迹（50 项滑窗）。它是真正被消费的时间序列：统计「连续未推进轮数」，叠加末轮负面信号，触发换策略或向幕后请示，并注入下一轮决策提示词。</p>
+        <p data-lang-en>Each round records a normalized progress outcome into the intent trajectory (a 50-item sliding window). This time series is actually consumed: it counts consecutive unprogressed turns, and with a negative final turn triggers a strategy switch or a behind-the-scenes consult, then feeds the next decision prompt.</p>
+        <div class="mc-mech">
+          <div class="mc-mech-h" data-lang-zh>真实机制</div><div class="mc-mech-h" data-lang-en>How it really works</div>
+          <p data-lang-zh>与人格 / 贝叶斯信号不同，意图轨迹<b>真的改变行为</b>——这是「会复盘、会调整」落到代码层的体现，不是只存不用的装饰字段。</p>
+          <p data-lang-en>Unlike personality / Bayesian signals, the intent trajectory <b>genuinely changes behavior</b> — the code-level embodiment of "reflect and adapt," not a stored-but-unused decorative field.</p>
+        </div>
+      </div>
+    </div>
+    <div class="honest-deep reveal">
+      <div class="hd-ico"><svg viewBox="0 0 24 24" fill="none"><path d="M12 3l8 4v5c0 5-3.5 8-8 9-4.5-1-8-4-8-9V7l8-4z" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/><path d="M12 8v4M12 15v.5" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg></div>
+      <div>
+        <h4 data-lang-zh>诚实置信铁律：找不到证据，置信度强制归零</h4><h4 data-lang-en>The honest-confidence rule: no anchored evidence → confidence forced to zero</h4>
+        <p data-lang-zh>无论是标签、人格还是记忆事实，只要证据序位映射不到对话里的真实锚点，置信度一律归零——这条 fail-closed 规则贯穿记忆与画像全链路。严谨是智能的前提，宁可承认不知道，也不凭印象给人贴标签。</p>
+        <p data-lang-en>Whether a tag, a personality facet or a remembered fact — if its evidence can't be mapped to a real anchor in the conversation, confidence is zeroed. This fail-closed rule runs through the entire memory and profiling chain. Rigor precedes intelligence: better to admit not knowing than to label on a hunch.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ============ 真实大模型测试 ============ -->
+<section class="section" id="realtest">
+  <div class="wrap">
+    <div class="t-head reveal" style="max-width:800px">
+      <span class="eyebrow" data-lang-zh>真实大模型测试 · 进行中</span><span class="eyebrow" data-lang-en>Real-LLM testing · ongoing</span>
+      <h2 class="h-section" data-lang-zh>用 AI 的方式，<span class="text-grad">验证 AI 的产品</span></h2>
+      <h2 class="h-section" data-lang-en>Verify an AI product <span class="text-grad">the AI way</span></h2>
+      <p class="lead" data-lang-zh>纯单元测试只能证明代码没崩，证明不了大模型在真实业务里说得对不对。所以我们另起一套：用真实大模型，对每个业务域跑端到端真实剧本——真调用、真决策、真评审、真发送判定，不 mock、不打桩。</p>
+      <p class="lead" data-lang-en>Unit tests prove the code doesn't crash; they can't prove the model behaves correctly in real business. So we run a second track: real LLMs executing end-to-end scripts per domain — real calls, decisions, review and send judgments, with no mocks or stubs.</p>
+    </div>
+    <div class="realtest-band">
+      <div class="rtb-card reveal"><div class="rtb-num stat-grad" data-lang-zh>真大模型</div><div class="rtb-num stat-grad" data-lang-en>Real LLM</div><div class="rtb-lbl" data-lang-zh>端到端真链路，无 mock 无桩</div><div class="rtb-lbl" data-lang-en>End-to-end, no mocks or stubs</div></div>
+      <div class="rtb-card reveal reveal-d1"><div class="rtb-num stat-grad"><span data-count="10" data-suffix="+">10+</span></div><div class="rtb-lbl" data-lang-zh>真实业务域剧本</div><div class="rtb-lbl" data-lang-en>real business-domain scripts</div></div>
+      <div class="rtb-card reveal reveal-d2"><div class="rtb-num stat-grad"><span data-count="350" data-suffix="+">350+</span></div><div class="rtb-lbl" data-lang-zh>单元测试基线 · 0 失败</div><div class="rtb-lbl" data-lang-en>unit baseline · 0 failures</div></div>
+      <div class="rtb-card reveal reveal-d3"><div class="rtb-num stat-grad" data-lang-zh>CI 双门</div><div class="rtb-num stat-grad" data-lang-en>Dual gate</div><div class="rtb-lbl" data-lang-zh>基线门 + 红线静态扫描</div><div class="rtb-lbl" data-lang-en>baseline + red-line scan</div></div>
+    </div>
+    <div class="rt-domain-wrap reveal">
+      <h4 data-lang-zh>正在覆盖的业务域</h4><h4 data-lang-en>Domains under coverage</h4>
+      <p class="rtd-note" data-lang-zh>每个域是一段完整运营剧本，由真实大模型从头跑到尾。发现的问题只抽象成可复现的方法论缺陷再修，绝不对单条对话、单次样本点对点打补丁——这是写进纪律的反过拟合红线。</p>
+      <p class="rtd-note" data-lang-en>Each domain is a complete operating script run end-to-end by a real LLM. Findings are abstracted into reproducible methodology gaps before fixing — never patched point-by-point against a single conversation or sample. This anti-overfitting line is written into our discipline.</p>
+      <div class="rt-domain-list">
+        <div class="rtd-item"><span class="rtd-no">01</span><span data-lang-zh>文章进库与知识沉淀</span><span data-lang-en>Article ingest & knowledge curation</span></div>
+        <div class="rtd-item"><span class="rtd-no">02</span><span data-lang-zh>报价单五道闸门拦截</span><span data-lang-en>Quote five-gate interception</span></div>
+        <div class="rtd-item"><span class="rtd-no">03</span><span data-lang-zh>顾问名片引荐（辅助模式）</span><span data-lang-en>Advisor referral (assist mode)</span></div>
+        <div class="rtd-item"><span class="rtd-no">04</span><span data-lang-zh>渐进式三段提示词加载</span><span data-lang-en>Progressive tiered prompts</span></div>
+        <div class="rtd-item"><span class="rtd-no">05</span><span data-lang-zh>幕后决策请示通道</span><span data-lang-en>Behind-the-scenes decision channel</span></div>
+        <div class="rtd-item"><span class="rtd-no">06</span><span data-lang-zh>用户反应分析与抢锁</span><span data-lang-en>Reaction analysis with claim lock</span></div>
+        <div class="rtd-item"><span class="rtd-no">07</span><span data-lang-zh>长期记忆固化与压缩</span><span data-lang-en>Long-term memory consolidation</span></div>
+        <div class="rtd-item"><span class="rtd-no">08</span><span data-lang-zh>管理 Agent 编排与红线</span><span data-lang-en>Management-agent orchestration</span></div>
+        <div class="rtd-item"><span class="rtd-no">09</span><span data-lang-zh>知识库自治 LLM 能力群</span><span data-lang-en>Knowledge-base autonomy suite</span></div>
+        <div class="rtd-item"><span class="rtd-no">10</span><span data-lang-zh>行业画像热切换</span><span data-lang-en>Industry-profile hot switch</span></div>
+      </div>
+    </div>
+  </div>
+</section>
+
+
+<!-- ============ 自我演化 ============ -->
+<section class="section" id="evolution">
+  <div class="wrap">
+    <div class="t-head reveal">
+      <span class="eyebrow" data-lang-zh>自我演化 · 影子回放</span><span class="eyebrow" data-lang-en>Self-evolution · shadow replay</span>
+      <h2 class="h-section" data-lang-zh>它会自我改进，<span class="text-grad">但每一步都要先在影子里证明</span></h2>
+      <h2 class="h-section" data-lang-en>It improves itself — <span class="text-grad">but proves every step in the shadow first</span></h2>
+      <p class="lead" data-lang-zh>演化器是一个完全隔离的子系统：它不引用网关、发件箱、MCP 或任务循环（CI 静态扫描强制这条隔离红线）。它从历史决策日志里学习，生成阈值与提示词候选，在影子里重放重判，只有显著变好且通过安全回归门，再经管理员二次确认，才会真正发布。</p>
+      <p class="lead" data-lang-en>The evolver is a fully isolated subsystem: it references no gateway, outbox, MCP or task loop (a CI scan enforces this isolation line). It learns from past decision logs, generates threshold and prompt candidates, replays and re-grades them in the shadow, and only releases after a significant, safety-passing result — confirmed by an admin.</p>
+    </div>
+    <div class="evo-flow">
+      <div class="evo-stage reveal">
+        <div class="es-no">01</div>
+        <h4 data-lang-zh>生成候选</h4><h4 data-lang-en>Generate candidates</h4>
+        <p data-lang-zh>从决策日志选取队列，产出阈值候选（纯统计）与提示词候选（Critic LLM）。</p>
+        <p data-lang-en>Select cohorts from decision logs; produce threshold candidates (pure stats) and prompt candidates (a critic LLM).</p>
+        <span class="es-tag" data-lang-zh>cohort · threshold · critic</span><span class="es-tag" data-lang-en>cohort · threshold · critic</span>
+      </div>
+      <div class="evo-stage reveal reveal-d1">
+        <div class="es-no">02</div>
+        <h4 data-lang-zh>影子回放</h4><h4 data-lang-en>Shadow replay</h4>
+        <p data-lang-zh>只读历史 agent_run_logs 重放重判，零副作用：不调网关、不入发件箱、不调 MCP、不写出站消息。</p>
+        <p data-lang-en>Reads past run logs and re-grades — zero side effects: no gateway, no outbox, no MCP, no outbound writes.</p>
+        <span class="es-tag" data-lang-zh>只读 · 零副作用</span><span class="es-tag" data-lang-en>read-only · no side effects</span>
+      </div>
+      <div class="evo-stage reveal reveal-d2">
+        <div class="es-no">03</div>
+        <h4 data-lang-zh>显著性 + 安全回归门</h4><h4 data-lang-en>Significance + safety gate</h4>
+        <p data-lang-zh>必须达到最小样本与改进幅度；安全回归默认零容忍——任何原本被安全闸拦下的消息被放行，直接否决。</p>
+        <p data-lang-en>Needs minimum samples and improvement; safety regression is zero-tolerance by default — any once-blocked message now allowed is rejected.</p>
+        <span class="es-tag safe" data-lang-zh>零容忍安全回归</span><span class="es-tag safe" data-lang-en>zero-tolerance safety</span>
+      </div>
+      <div class="evo-stage reveal reveal-d3">
+        <div class="es-no">04</div>
+        <h4 data-lang-zh>管理员发布 / 回滚</h4><h4 data-lang-en>Admin release / rollback</h4>
+        <p data-lang-zh>发布与回滚都要管理员身份与确认串，留下 released_by / rolled_back_by。回滚永远手动，没有自动回滚。</p>
+        <p data-lang-en>Release and rollback require an admin and a confirmation string, recording released_by / rolled_back_by. Rollback is always manual — never automatic.</p>
+        <span class="es-tag admin" data-lang-zh>admin-only · 可回滚</span><span class="es-tag admin" data-lang-en>admin-only · reversible</span>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ============ 知识 Wiki 双写 ============ -->
+<section class="section section-deep">
+  <div class="hero-bg" aria-hidden="true"><div class="hero-glow" style="position:absolute;width:620px;height:620px;border-radius:50%;filter:blur(100px);opacity:.18;top:50%;left:-100px;background:radial-gradient(circle,rgba(10,132,255,.42),transparent 72%)"></div></div>
+  <div class="wrap" style="position:relative">
+    <div class="t-head reveal">
+      <span class="eyebrow" data-lang-zh>知识 Wiki · 双写</span><span class="eyebrow" data-lang-en>Knowledge Wiki · double-write</span>
+      <h2 class="h-section" data-lang-zh>知识改了什么，<span class="text-grad">永远查得到</span></h2>
+      <h2 class="h-section" data-lang-en>What changed in knowledge <span class="text-grad">is always traceable</span></h2>
+      <p class="lead" data-lang-zh>每次知识写入都是双写：先写一条不可变的修订记录（带 sha256 前后哈希），再更新可变的当前切片。历史永远在，回溯任何一次改动都有据。而 AI 写入的知识一律落草稿、标记待核验——AI 永不自动核验自己产出的知识。</p>
+      <p class="lead" data-lang-en>Every knowledge write is a double-write: first an immutable revision record (with before/after sha256 hashes), then the mutable current slice. History always survives; any change is auditable. Knowledge written by the AI always lands as a draft marked for review — the AI never self-verifies its own output.</p>
+    </div>
+    <div class="dwrite">
+      <div class="dwrite-node immutable reveal">
+        <span class="dw-badge" data-lang-zh>不可变 · 先写</span><span class="dw-badge" data-lang-en>Immutable · written first</span>
+        <h4>chunk_revisions</h4>
+        <p data-lang-zh>每次变更追加一条修订，记录前后 sha256 哈希与修订 ID，永不覆盖——构成完整的知识变更史。</p>
+        <p data-lang-en>Each change appends a revision with before/after sha256 hashes and a revision ID, never overwritten — a full history of knowledge change.</p>
+      </div>
+      <div class="dwrite-arrow reveal reveal-d1">
+        <svg viewBox="0 0 24 24" fill="none"><path d="M5 12h14M13 6l6 6-6 6" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        <span class="da-label" data-lang-zh>仅内容变化时</span><span class="da-label" data-lang-en>only if changed</span>
+      </div>
+      <div class="dwrite-node mutable reveal reveal-d2">
+        <span class="dw-badge" data-lang-zh>可变 · 后写</span><span class="dw-badge" data-lang-en>Mutable · written after</span>
+        <h4>operation_knowledge_chunks</h4>
+        <p data-lang-zh>保存当前最新切片，供 Agent 检索引用。AI 来源强制 status=draft + 待核验，核验字段被 AI 写入会被拒。</p>
+        <p data-lang-en>Holds the latest slice for the agent to retrieve. AI-sourced writes are forced to status=draft + needs-review; verification fields written by AI are rejected.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ============ 规模数字 ============ -->
+<section class="section">
+  <div class="wrap">
+    <div class="t-head reveal" style="text-align:center;margin:0 auto 36px">
+      <h2 class="h-section" data-lang-zh>这套系统，<span class="text-grad">能为你扛下多少</span></h2>
+      <h2 class="h-section" data-lang-en>How much <span class="text-grad">it carries for you</span></h2>
+    </div>
+    <div class="stack-grid">
+      <div class="stack-card reveal"><div class="sk-num stat-grad" data-count="18">18</div><div class="sk-label" data-lang-zh>管理频道 · 一个后台全管</div><div class="sk-label" data-lang-en>admin channels · one console</div></div>
+      <div class="stack-card reveal reveal-d1"><div class="sk-num stat-grad">1 张/人</div><div class="sk-label" data-lang-zh>长期记忆卡 · 客户属于企业</div><div class="sk-label" data-lang-en>memory card / person</div></div>
+      <div class="stack-card reveal reveal-d2"><div class="sk-num stat-grad" data-count="4">4</div><div class="sk-label" data-lang-zh>维自治能力 · 自运营到自进化</div><div class="sk-label" data-lang-en>autonomy capabilities</div></div>
+      <div class="stack-card reveal reveal-d3"><div class="sk-num stat-grad">7×24</div><div class="sk-label" data-lang-zh>全天候在岗 · 不漏不忘不离职</div><div class="sk-label" data-lang-en>always on duty</div></div>
+    </div>
+  </div>
+</section>
+
+<!-- ============ 结尾 CTA ============ -->
+<section class="section cta-band">
+  <div class="wrap cta-inner reveal" style="text-align:center;max-width:720px;margin:0 auto;position:relative">
+    <h2 class="h-section" data-lang-zh>架构的每一条红线，<span class="text-grad">都写进了代码</span></h2>
+    <h2 class="h-section" data-lang-en>Every hard line in the architecture <span class="text-grad">is written into code</span></h2>
+    <p class="lead" data-lang-zh>从「客户永远只跟 AI 对话」到「AI 永不自动核验知识」，这些不是承诺，是被守门函数、CI 静态扫描和测试基线强制执行的约束。</p>
+    <p class="lead" data-lang-en>From "customers only ever talk to the AI" to "the AI never self-verifies knowledge" — these aren't promises but constraints enforced by guard functions, CI scans and a test baseline.</p>
+    <div class="hero-cta" style="justify-content:center;margin-top:8px">
+      <a href="trust.html" class="btn btn-primary"><span data-lang-zh>看信任与安全</span><span data-lang-en>Trust & safety</span><svg viewBox="0 0 24 24" fill="none"><path d="M5 12h14M13 6l6 6-6 6" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></a>
+      <a href="scenarios.html" class="btn btn-ghost"><span data-lang-zh>看行业场景</span><span data-lang-en>Industry scenarios</span></a>
+    </div>
+  </div>
+</section>
+
+<!-- ============ 页脚 ============ -->
+<footer class="footer">
+  <div class="wrap">
+    <div class="footer-grid">
+      <div class="footer-brand">
+        <a href="index.html" class="brand"><span class="brand-mark"><svg viewBox="0 0 64 64" fill="none"><path fill="#fff" fill-rule="evenodd" clip-rule="evenodd" d="M18.5 7 H45.5 Q57.5 7 57.5 19 V33 Q57.5 45 45.5 45 H24 L13 57 V44.4 Q6.5 43 6.5 33 V19 Q6.5 7 18.5 7 Z M14 15.5 L20.2 38 L31 23 L33 23 L43.8 38 L50 15.5 L44.3 15.5 L40.4 31 L33.4 21 L30.6 21 L23.6 31 L19.7 15.5 Z M47 6.1 C47 12.02 46 13.5 42 13.5 C46 13.5 47 14.98 47 20.9 C47 14.98 48 13.5 52 13.5 C48 13.5 47 12.02 47 6.1 Z"/></svg></span>WeAgent</a>
+        <p data-lang-zh>全自治微信私域 AI 运营系统。客户永远只跟 AI 对话，AI 像真人一样长期经营每一段关系。</p>
+        <p data-lang-en>The autonomous WeChat private-domain AI operator. Customers only ever talk to the AI, which nurtures every relationship over time.</p>
+        <button class="wx-copy" data-wx="agimeme" type="button">
+          <svg viewBox="0 0 24 24" fill="none"><path d="M8.5 14.5c-3 0-5.5-2-5.5-4.6C3 7 5.8 5 9 5s6 2 6 4.9c0 .5-.1 1-.3 1.5M16 19c2.2 0 4-1.4 4-3.3 0-1.9-1.8-3.4-4-3.4s-4 1.5-4 3.4c0 .6.2 1.2.6 1.7L12 19l1.6-.5c.7.3 1.5.5 2.4.5z" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          <span data-lang-zh>顾问微信 <span class="wx-id">agimeme</span></span><span data-lang-en>WeChat <span class="wx-id">agimeme</span></span>
+          <span class="wx-hint" data-lang-zh>点击复制</span><span class="wx-hint" data-lang-en>tap to copy</span>
+        </button>
+      </div>
+      <div>
+        <h5 data-lang-zh>产品</h5><h5 data-lang-en>Product</h5>
+        <div class="footer-links">
+          <a href="solutions.html" data-lang-zh>解决什么问题</a><a href="solutions.html" data-lang-en>What it solves</a>
+          <a href="product.html" data-lang-zh>产品能力</a><a href="product.html" data-lang-en>Product</a>
+          <a href="agents.html" data-lang-zh>智能体编队</a><a href="agents.html" data-lang-en>Agents</a>
+          <a href="scenarios.html" data-lang-zh>行业场景</a><a href="scenarios.html" data-lang-en>Scenarios</a>
+          <a href="product.html#channels" data-lang-zh>管理频道</a><a href="product.html#channels" data-lang-en>Channels</a>
+        </div>
+      </div>
+      <div>
+        <h5 data-lang-zh>技术</h5><h5 data-lang-en>Technology</h5>
+        <div class="footer-links">
+          <a href="technology.html" data-lang-zh>技术架构</a><a href="technology.html" data-lang-en>Architecture</a>
+          <a href="technology.html#gateway" data-lang-zh>统一网关</a><a href="technology.html#gateway" data-lang-en>The gateway</a>
+          <a href="engineering.html" data-lang-zh>工程深度</a><a href="engineering.html" data-lang-en>Engineering depth</a>
+          <a href="evolution.html" data-lang-zh>自我演化</a><a href="evolution.html" data-lang-en>Self-evolution</a>
+        </div>
+      </div>
+      <div>
+        <h5 data-lang-zh>信任</h5><h5 data-lang-en>Trust</h5>
+        <div class="footer-links">
+          <a href="observability.html" data-lang-zh>运营透视</a><a href="observability.html" data-lang-en>Observability</a>
+          <a href="trust.html" data-lang-zh>信任与安全</a><a href="trust.html" data-lang-en>Trust & safety</a>
+          <a href="trust.html#redlines" data-lang-zh>红线与守门</a><a href="trust.html#redlines" data-lang-en>Hard lines</a>
+          <a href="trust.html#audit" data-lang-zh>可审计性</a><a href="trust.html#audit" data-lang-en>Auditability</a>
+        </div>
+      </div>
+    </div>
+    <div class="footer-bottom">
+      <span>© 2026 WeAgent · <span data-lang-zh>私域自主运营</span><span data-lang-en>Autonomous private-domain operations</span></span>
+      <span data-lang-zh>构建于 2026-06-28 · 由 Claude Code 根据项目代码生成 · by opus-4.8 · 11 万行 Rust 代码 · 比例 100%</span><span data-lang-en>Built 2026-06-28 · generated by Claude Code from the project codebase · by opus-4.8 · 110k+ lines of Rust · 100% generated</span>
+      <span data-lang-zh>Rust · Axum · MongoDB · React · MCP</span>
+      <span data-lang-en>Built with Rust · Axum · MongoDB · React · MCP</span>
+    </div>
+  </div>
+</footer>
+
+<script src="assets/i18n.js"></script>
+<script src="assets/shared.js"></script>
+</body>
+</html>

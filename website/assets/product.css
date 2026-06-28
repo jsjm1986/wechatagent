@@ -1,0 +1,67 @@
+/* ============================================================
+   WeAgent 官网 — 产品能力页专属样式
+   依赖 shared.css 的 token
+   ============================================================ */
+
+/* ---------- 页内英雄（轻量深色） ---------- */
+.page-hero { position: relative; overflow: hidden; padding: clamp(64px,9vw,116px) 0 clamp(48px,6vw,80px); }
+.page-hero-bg { position: absolute; inset: 0; pointer-events: none; }
+.page-hero .h-display { margin: 22px 0 20px; }
+.page-hero .lead { max-width: 720px; }
+.page-hero-meta { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 30px; }
+.page-hero-meta .pill { background: rgba(255,255,255,.06); border: 1px solid var(--ink-hair); color: var(--on-deep-2); }
+
+/* ---------- 频道分组导航锚 ---------- */
+.grp-head { display: flex; align-items: center; gap: 16px; margin-bottom: 28px; }
+.grp-head .grp-no { font-family: var(--mono); font-size: 13px; font-weight: 700; color: var(--brand); background: var(--fill-brand); padding: 5px 12px; border-radius: 8px; }
+.grp-head h2 { font-size: clamp(24px,3vw,34px); font-weight: 800; letter-spacing: -.03em; }
+.grp-head .grp-count { font-size: 14px; color: var(--ink-3); margin-left: auto; }
+
+/* ---------- 频道卡 ---------- */
+.ch-grid { display: grid; grid-template-columns: repeat(2,1fr); gap: var(--gap); }
+.ch-card { position: relative; display: flex; flex-direction: column; }
+.ch-card .ch-top { display: flex; align-items: flex-start; gap: 16px; margin-bottom: 14px; }
+.ch-ico { width: 48px; height: 48px; flex-shrink: 0; border-radius: 13px; display: grid; place-items: center;
+  background: linear-gradient(135deg, var(--fill-brand), var(--fill-blue)); border: 1px solid rgba(94,92,230,.2); color: var(--brand); }
+.ch-ico svg { width: 24px; height: 24px; }
+.ch-card h3 { font-size: 19px; font-weight: 700; line-height: 1.25; }
+.ch-eyebrow { font-family: var(--mono); font-size: 11.5px; font-weight: 600; color: var(--ink-3); letter-spacing: .02em; margin-top: 3px; }
+.ch-card p { font-size: 14.5px; color: var(--ink-2); line-height: 1.62; }
+.ch-feats { display: flex; flex-wrap: wrap; gap: 7px; margin-top: 16px; }
+.ch-feat { font-size: 12.5px; font-weight: 500; color: var(--ink-2); background: var(--card-2); border: 1px solid var(--hair); padding: 5px 10px; border-radius: 8px; }
+
+/* 占位频道（下一阶段） */
+.ch-card.is-planned { border-style: dashed; border-color: var(--hair-strong); background: var(--card-2); }
+.ch-card.is-planned .ch-ico { background: rgba(122,129,153,.1); border-color: var(--hair); color: var(--ink-3); }
+.ch-tag-planned { position: absolute; top: 18px; right: 18px; font-size: 11.5px; font-weight: 700; color: var(--held-ink); background: rgba(255,159,10,.14); border: 1px solid rgba(255,159,10,.3); padding: 4px 10px; border-radius: 999px; }
+
+/* 强调频道（核心能力） */
+.ch-card.is-flagship { border-color: rgba(94,92,230,.32); box-shadow: var(--shadow-md); }
+.ch-card.is-flagship .ch-ico { background: linear-gradient(135deg, var(--brand), var(--scheduled)); border-color: transparent; color: #fff; box-shadow: 0 6px 16px rgba(94,92,230,.34); }
+.ch-tag-core { position: absolute; top: 18px; right: 18px; font-size: 11.5px; font-weight: 700; color: var(--brand); background: var(--fill-brand); border: 1px solid rgba(94,92,230,.28); padding: 4px 10px; border-radius: 999px; }
+
+/* ---------- 双模视角条 ---------- */
+.dual-mode { display: grid; grid-template-columns: 1fr 1fr; gap: var(--gap); margin-top: var(--gap); }
+.dm-card { background: var(--card); border: 1px solid var(--hair); border-radius: var(--r-lg); padding: 28px; box-shadow: var(--shadow-sm); }
+.dm-card .pill { margin-bottom: 14px; }
+.dm-card h4 { font-size: 18px; font-weight: 700; margin-bottom: 8px; color: var(--ink-1); }
+.dm-card p { font-size: 14px; color: var(--ink-2); }
+
+/* ---------- 收件箱 8 流 ---------- */
+.stream-grid { display: grid; grid-template-columns: repeat(4,1fr); gap: 14px; }
+.stream { background: var(--card); border: 1px solid var(--hair); border-radius: var(--r-md); padding: 18px 16px; transition: transform .2s, border-color .2s; }
+.stream:hover { transform: translateY(-3px); border-color: rgba(94,92,230,.3); }
+.stream .s-ico { width: 36px; height: 36px; border-radius: 10px; display: grid; place-items: center; margin-bottom: 12px; }
+.stream h5 { font-size: 14.5px; font-weight: 700; margin-bottom: 5px; color: var(--ink-1); }
+.stream p { font-size: 12.5px; color: var(--ink-2); line-height: 1.5; }
+
+/* ---------- 响应式 ---------- */
+@media (max-width: 980px) {
+  .ch-grid { grid-template-columns: 1fr; }
+  .dual-mode { grid-template-columns: 1fr; }
+  .stream-grid { grid-template-columns: repeat(2,1fr); }
+}
+@media (max-width: 600px) {
+  .stream-grid { grid-template-columns: 1fr; }
+  .grp-head .grp-count { display: none; }
+}

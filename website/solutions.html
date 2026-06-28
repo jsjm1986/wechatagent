@@ -1,0 +1,990 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title data-zh="解决什么问题 · WeAgent" data-en="What it solves · WeAgent">解决什么问题 · WeAgent</title>
+<meta name="description" content="几千个好友一个人维护不过来、谁买过什么记不住、答应发的资料忘了发、成交后就断了档、销售一离职客户和记忆全被带走——这些才是私域运营真正的痛。WeAgent 把私域从「人肉承载」换成「系统承载 + AI 自治运营」：每个客户一张长期记忆卡、承诺自动跟进、冷客户自动重激活、客户资产永远沉淀在企业系统里。">
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="WeAgent">
+<meta property="og:locale" content="zh_CN">
+<meta property="og:locale:alternate" content="en_US">
+<meta property="og:title" content="解决什么问题 · WeAgent">
+<meta property="og:description" content="几千好友记不住、答应的事忘了发、成交就断档、离职带走客户——私域真正的痛，WeAgent 用「系统承载 + AI 自治运营」一一接住。">
+<meta property="og:url" content="https://weagent.example.com/solutions.html">
+<meta property="og:image" content="https://weagent.example.com/assets/og-cover.png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="WeAgent — 全自治微信私域 AI 运营">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="解决什么问题 · WeAgent">
+<meta name="twitter:description" content="私域真正的痛：记不住、忘了发、断了档、离职带走客户。WeAgent 一一接住。">
+<meta name="twitter:image" content="https://weagent.example.com/assets/og-cover.png">
+<link rel="canonical" href="https://weagent.example.com/solutions.html">
+<link rel="stylesheet" href="assets/shared.css">
+<link rel="stylesheet" href="assets/solutions.css">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='18' fill='%235E5CE6'/%3E%3Cpath fill='%23fff' fill-rule='evenodd' clip-rule='evenodd' d='M18.5 7 H45.5 Q57.5 7 57.5 19 V33 Q57.5 45 45.5 45 H24 L13 57 V44.4 Q6.5 43 6.5 33 V19 Q6.5 7 18.5 7 Z M14 15.5 L20.2 38 L31 23 L33 23 L43.8 38 L50 15.5 L44.3 15.5 L40.4 31 L33.4 21 L30.6 21 L23.6 31 L19.7 15.5 Z M47 6.1 C47 12.02 46 13.5 42 13.5 C46 13.5 47 14.98 47 20.9 C47 14.98 48 13.5 52 13.5 C48 13.5 47 12.02 47 6.1 Z'/%3E%3C/svg%3E">
+</head>
+<body>
+
+<!-- ============ 导航 ============ -->
+<nav class="nav">
+  <div class="wrap nav-inner">
+    <a href="index.html" class="brand">
+      <span class="brand-mark"><svg viewBox="0 0 64 64" fill="none"><path fill="#fff" fill-rule="evenodd" clip-rule="evenodd" d="M18.5 7 H45.5 Q57.5 7 57.5 19 V33 Q57.5 45 45.5 45 H24 L13 57 V44.4 Q6.5 43 6.5 33 V19 Q6.5 7 18.5 7 Z M14 15.5 L20.2 38 L31 23 L33 23 L43.8 38 L50 15.5 L44.3 15.5 L40.4 31 L33.4 21 L30.6 21 L23.6 31 L19.7 15.5 Z M47 6.1 C47 12.02 46 13.5 42 13.5 C46 13.5 47 14.98 47 20.9 C47 14.98 48 13.5 52 13.5 C48 13.5 47 12.02 47 6.1 Z"/></svg></span>
+      WeAgent
+    </a>
+    <div class="nav-links">
+      <a href="index.html" data-lang-zh>首页</a><a href="index.html" data-lang-en>Home</a>
+      <a href="solutions.html" class="active" data-lang-zh>解决什么</a><a href="solutions.html" class="active" data-lang-en>Solutions</a>
+      <a href="product.html" data-lang-zh>产品能力</a><a href="product.html" data-lang-en>Product</a>
+      <a href="agents.html" data-lang-zh>智能体编队</a><a href="agents.html" data-lang-en>Agents</a>
+      <a href="technology.html" data-lang-zh>技术架构</a><a href="technology.html" data-lang-en>Technology</a>
+      <a href="engineering.html" data-lang-zh>工程深度</a><a href="engineering.html" data-lang-en>Engineering</a>
+      <a href="scenarios.html" data-lang-zh>行业场景</a><a href="scenarios.html" data-lang-en>Scenarios</a>
+      <a href="observability.html" data-lang-zh>运营透视</a><a href="observability.html" data-lang-en>Observability</a>
+      <a href="trust.html" data-lang-zh>信任与安全</a><a href="trust.html" data-lang-en>Trust</a>
+    </div>
+    <div class="nav-right">
+      <div class="lang-toggle">
+        <button data-lang-btn="zh">中</button>
+        <button data-lang-btn="en">EN</button>
+      </div>
+      <button class="nav-burger" aria-label="menu"><svg viewBox="0 0 24 24" width="22" height="22" fill="none"><path d="M4 7h16M4 12h16M4 17h16" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg></button>
+    </div>
+  </div>
+</nav>
+<div class="mobile-menu">
+  <a href="index.html" data-lang-zh>首页</a><a href="index.html" data-lang-en>Home</a>
+  <a href="solutions.html" data-lang-zh>解决什么</a><a href="solutions.html" data-lang-en>Solutions</a>
+  <a href="product.html" data-lang-zh>产品能力</a><a href="product.html" data-lang-en>Product</a>
+  <a href="agents.html" data-lang-zh>智能体编队</a><a href="agents.html" data-lang-en>Agents</a>
+  <a href="technology.html" data-lang-zh>技术架构</a><a href="technology.html" data-lang-en>Technology</a>
+  <a href="engineering.html" data-lang-zh>工程深度</a><a href="engineering.html" data-lang-en>Engineering</a>
+  <a href="scenarios.html" data-lang-zh>行业场景</a><a href="scenarios.html" data-lang-en>Scenarios</a>
+  <a href="observability.html" data-lang-zh>运营透视</a><a href="observability.html" data-lang-en>Observability</a>
+  <a href="trust.html" data-lang-zh>信任与安全</a><a href="trust.html" data-lang-en>Trust</a>
+</div>
+
+<!-- ============ 页内英雄 ============ -->
+<header class="page-hero section-deep">
+  <div class="page-hero-bg" aria-hidden="true">
+    <div class="hero-glow" style="position:absolute;width:560px;height:560px;border-radius:50%;filter:blur(90px);opacity:.5;top:-160px;left:-100px;background:radial-gradient(circle,rgba(94,92,230,.5),transparent 68%)"></div>
+    <div class="hero-glow" style="position:absolute;width:480px;height:480px;border-radius:50%;filter:blur(90px);opacity:.36;top:-40px;right:-80px;background:radial-gradient(circle,rgba(15,181,168,.4),transparent 70%)"></div>
+  </div>
+  <div class="wrap" style="position:relative">
+    <span class="eyebrow reveal" data-lang-zh>解决什么问题 · 给业务负责人看</span><span class="eyebrow reveal" data-lang-en>What it solves · for business owners</span>
+    <h1 class="h-display reveal reveal-d1" data-lang-zh>几千个好友，<br>一个人<span class="text-grad">真维护得过来吗</span>？</h1>
+    <h1 class="h-display reveal reveal-d1" data-lang-en>Thousands of contacts —<br>can <span class="text-grad">one person really keep up</span>?</h1>
+    <p class="lead reveal reveal-d2" data-lang-zh>这一页不讲技术，只讲一件事：私域运营每天真实发生的麻烦，以及 WeAgent 到底替你接住了哪些。谁买过什么、答应发的资料、上次聊到哪——全靠人脑记、靠翻聊天记录。人会忘、会忙不过来、会离职。WeAgent 把这些麻烦交给一个不会忘、不下班、不会被带走的 AI 运营官。</p>
+    <p class="lead reveal reveal-d2" data-lang-en>No tech on this page — just one thing: the everyday headaches of private-domain operations, and which of them WeAgent actually takes off your plate. Who bought what, the doc you promised to send, where the last chat left off — all carried in someone's head and chat history. People forget, get overloaded, and leave. WeAgent hands these to an AI operator that never forgets, never clocks out, and can't be walked out the door.</p>
+    <div class="page-hero-meta reveal reveal-d3">
+      <span class="pill" data-lang-zh>不懂技术也能看懂</span><span class="pill" data-lang-en>No tech background needed</span>
+      <span class="pill" data-lang-zh>客户资产归企业</span><span class="pill" data-lang-en>Customer assets stay with you</span>
+      <span class="pill" data-lang-zh>每条都对应真实能力</span><span class="pill" data-lang-en>Each maps to a real capability</span>
+    </div>
+  </div>
+</header>
+
+<!-- ============ 核心论点：人肉承载 → 系统承载 ============ -->
+<section class="section thesis">
+  <div class="wrap">
+    <div class="thesis-inner reveal">
+      <span class="eyebrow" data-lang-zh>问题的根子</span><span class="eyebrow" data-lang-en>The root cause</span>
+      <h2 class="h-section" data-lang-zh>私域最大的风险，是它<span class="text-grad">长在人身上</span></h2>
+      <h2 class="h-section" data-lang-en>The real risk: your private domain <span class="text-grad">lives inside people</span></h2>
+      <p class="lead" data-lang-zh>客户关系、客户记忆、该跟进的事，今天全都装在销售的脑子和手机里。人记不过来、会遗忘、会离职——于是客户被晾着、承诺被漏掉、复购断了档，员工一走，多年积累的客户资产就跟着蒸发。这不是哪个员工不努力，是「人肉承载」这件事本身扛不住规模。</p>
+      <p class="lead" data-lang-en>Customer relationships, customer memory, the follow-ups that are due — today they all sit in a salesperson's head and phone. People can't remember it all, they forget, they leave. So customers get neglected, promises slip, repeat business dries up, and when staff walk out, years of customer assets evaporate with them. It's not that anyone slacks off — it's that carrying it all in people doesn't scale.</p>
+      <div class="thesis-flip">
+        <div class="tf-side tf-old">
+          <div class="tf-tag" data-lang-zh>现在 · 人肉承载</div><div class="tf-tag" data-lang-en>TODAY · carried by people</div>
+          <h4 data-lang-zh>靠记忆力、靠时间、靠在不在职</h4><h4 data-lang-en>Relies on memory, time, and who's still employed</h4>
+          <p data-lang-zh>能维护多少客户，取决于销售记得住多少、忙不忙得过来、还在不在公司。</p>
+          <p data-lang-en>How many customers get nurtured depends on what one person remembers, how busy they are, and whether they're still around.</p>
+        </div>
+        <div class="tf-arrow" aria-hidden="true">
+          <svg viewBox="0 0 24 24" fill="none"><path d="M5 12h14M13 6l6 6-6 6" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        </div>
+        <div class="tf-side tf-new">
+          <div class="tf-tag" data-lang-zh>WeAgent · 系统承载</div><div class="tf-tag" data-lang-en>WeAgent · carried by the system</div>
+          <h4 data-lang-zh>记忆在系统、跟进靠 AI、客户归企业</h4><h4 data-lang-en>Memory in the system, follow-up by AI, customers belong to you</h4>
+          <p data-lang-zh>每个客户一张长期记忆卡，跟进由 AI 自动执行，客户资产永远沉淀在企业，不随某个人走。</p>
+          <p data-lang-en>Each customer gets a long-term memory card, follow-up runs by AI, and the assets stay with the company — never tied to one person.</p>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ============ 痛点 → 解法 大卡 ============ -->
+<section class="section">
+  <div class="wrap">
+    <div class="section-head reveal">
+      <span class="eyebrow" data-lang-zh>五个真实场景</span><span class="eyebrow" data-lang-en>Five real scenarios</span>
+      <h2 class="h-section" data-lang-zh>你每天头疼的事，<span class="text-grad">逐个接住</span></h2>
+      <h2 class="h-section" data-lang-en>The daily headaches, <span class="text-grad">caught one by one</span></h2>
+      <p class="lead" data-lang-zh>左边是私域运营里每天真实发生的麻烦，右边是 WeAgent 怎么解、落在什么能力上。我们只写系统真做得到的，做不到的也如实说。</p>
+      <p class="lead" data-lang-en>On the left, the headaches that happen every day; on the right, how WeAgent handles each and which capability it rests on. We only claim what the system truly does — and say plainly what it doesn't.</p>
+    </div>
+
+    <div class="painwrap">
+
+      <!-- 痛点1：记不住 -->
+      <div class="pain reveal">
+        <div class="pain-q">
+          <div class="pain-ico"><svg viewBox="0 0 24 24" fill="none"><path d="M12 8v4l3 2" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"/><circle cx="12" cy="12" r="9" stroke="currentColor" stroke-width="1.8"/><path d="M3 12a9 9 0 019-9" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" opacity=".3"/></svg></div>
+          <div class="pq-label" data-lang-zh>痛点 01</div><div class="pq-label" data-lang-en>PAIN 01</div>
+          <h3 data-lang-zh>几千个好友，谁是谁都对不上号</h3><h3 data-lang-en>Thousands of contacts, and you can't keep them straight</h3>
+          <p data-lang-zh>这个客户上次说孩子要中考、那个客户对价格敏感、还有个三个月前聊过想换车——人脑根本记不住几千人的细节，时间一长全成了陌生人。</p>
+          <p data-lang-en>This one mentioned a kid's exam, that one is price-sensitive, another talked about changing cars three months ago — no human brain holds the details of thousands of people. Given time, they all become strangers again.</p>
+        </div>
+        <div class="pain-a">
+          <div class="pa-label" data-lang-zh>WeAgent 怎么解</div><div class="pa-label" data-lang-en>How WeAgent solves it</div>
+          <h4 data-lang-zh>每个客户一张会成长的长期记忆卡</h4><h4 data-lang-en>A growing long-term memory card for every customer</h4>
+          <p data-lang-zh>每段对话里的关键信息会被自动沉淀进这个人的记忆卡：他的偏好、聊过的事、在意的点。新信息先进候选池，反复确认后才固化为长期记忆，过时的事实会被作废——像一个永远记得每位客户的超级业务员。</p>
+          <p data-lang-en>Key facts from each conversation settle into that person's memory card: preferences, past topics, what they care about. New info enters a candidate pool, gets confirmed before becoming long-term memory, and stale facts are retired — like a super-salesperson who remembers every single customer.</p>
+          <div class="pain-feat">
+            <span data-lang-zh>长期记忆卡</span><span data-lang-en>Long-term memory card</span>
+            <span data-lang-zh>候选 → 固化 → 压缩</span><span data-lang-en>candidate → consolidate → compact</span>
+            <span data-lang-zh>大五人格画像</span><span data-lang-en>Big Five profile</span>
+          </div>
+        </div>
+      </div>
+
+      <!-- 痛点2：买卖记不清 -->
+      <div class="pain reveal">
+        <div class="pain-q">
+          <div class="pain-ico"><svg viewBox="0 0 24 24" fill="none"><path d="M6 6h15l-1.5 9h-12z" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/><path d="M6 6L5 3H2" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/><circle cx="9" cy="20" r="1.4" fill="currentColor"/><circle cx="17" cy="20" r="1.4" fill="currentColor"/></svg></div>
+          <div class="pq-label" data-lang-zh>痛点 02</div><div class="pq-label" data-lang-en>PAIN 02</div>
+          <h3 data-lang-zh>谁买过什么、卖过什么，全凭印象</h3><h3 data-lang-en>Who bought what, what you sold them — all guesswork</h3>
+          <p data-lang-zh>客户问"我上次买的那个还有货吗"，销售得翻半天记录甚至直接问回去；想做精准复购推荐，却连客户处在什么阶段都说不清。</p>
+          <p data-lang-en>A customer asks "is the thing I bought last time still in stock?" and the rep has to dig through records or ask back. Want to pitch the right repeat purchase? You can't even tell what stage they're in.</p>
+        </div>
+        <div class="pain-a">
+          <div class="pa-label" data-lang-zh>WeAgent 怎么解</div><div class="pa-label" data-lang-en>How WeAgent solves it</div>
+          <h4 data-lang-zh>购买生命周期被结构化记录</h4><h4 data-lang-en>The purchase lifecycle, structured and remembered</h4>
+          <p data-lang-zh>系统用统一的字典刻画每个客户的购买阶段（意向、已购、复购窗口等），结合记忆卡里的成交记录，AI 随时知道这个人买过什么、现在处在哪一步，回应和跟进都基于真实历史，而不是凭印象。</p>
+          <p data-lang-en>A shared taxonomy captures each customer's purchase stage (intent, purchased, repeat window, etc.), and combined with deal records on the memory card, the AI always knows what they bought and where they stand — replies and follow-ups rest on real history, not impressions.</p>
+          <div class="pain-feat">
+            <span data-lang-zh>购买生命周期字典</span><span data-lang-en>Purchase-lifecycle taxonomy</span>
+            <span data-lang-zh>客户阶段标签</span><span data-lang-en>Customer-stage tags</span>
+            <span data-lang-zh>成交记录沉淀</span><span data-lang-en>Deal history retained</span>
+          </div>
+        </div>
+      </div>
+
+      <!-- 痛点3：答应的事忘了发 -->
+      <div class="pain reveal">
+        <div class="pain-q">
+          <div class="pain-ico"><svg viewBox="0 0 24 24" fill="none"><path d="M4 4h16v12H7l-3 3z" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/><path d="M9 10h6M9 7h2" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg></div>
+          <div class="pq-label" data-lang-zh>痛点 03</div><div class="pq-label" data-lang-en>PAIN 03</div>
+          <h3 data-lang-zh>答应客户发的资料，忙起来就忘了</h3><h3 data-lang-en>The doc you promised — forgotten the moment things get busy</h3>
+          <p data-lang-zh>"稍后把方案发您"、"明天给您报个价"——这些口头承诺一多就漏，客户记得清清楚楚，你这边石沉大海，信任就这么一点点磨没了。</p>
+          <p data-lang-en>"I'll send the proposal shortly," "I'll quote you tomorrow" — pile up enough of these and some slip. The customer remembers perfectly; on your end it vanishes. Trust erodes one missed promise at a time.</p>
+        </div>
+        <div class="pain-a">
+          <div class="pa-label" data-lang-zh>WeAgent 怎么解</div><div class="pa-label" data-lang-en>How WeAgent solves it</div>
+          <h4 data-lang-zh>承诺被记成待办，到点自动跟进</h4><h4 data-lang-en>Promises become to-dos that follow up on time</h4>
+          <p data-lang-zh>AI 会把对话里的承诺单独记进"已承诺"槽位，任何时候都不会丢；没有明确时间的承诺，系统也会合成一个兜底到期时间。到点后由后台自动发起跟进——经过同一套评审与安全门，再发给客户。</p>
+          <p data-lang-en>The AI logs promises into a dedicated "commitments" slot that's never dropped; for promises with no stated time, the system synthesizes a fallback due time. When it's due, a background worker initiates the follow-up — through the same review and safety gates before anything reaches the customer.</p>
+          <div class="pain-feat">
+            <span data-lang-zh>承诺槽位恒注入</span><span data-lang-en>Always-injected commitments</span>
+            <span data-lang-zh>到期兜底跟进</span><span data-lang-en>Fallback due-time follow-up</span>
+            <span data-lang-zh>跟进走统一网关</span><span data-lang-en>Follow-up via the gateway</span>
+          </div>
+        </div>
+      </div>
+
+      <!-- 痛点4：成交就断档 -->
+      <div class="pain reveal">
+        <div class="pain-q">
+          <div class="pain-ico"><svg viewBox="0 0 24 24" fill="none"><path d="M3 17l5-5 4 3 5-7" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"/><path d="M17 8h4v4" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" opacity=".4"/><path d="M3 21h18" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" opacity=".3"/></svg></div>
+          <div class="pq-label" data-lang-zh>痛点 04</div><div class="pq-label" data-lang-en>PAIN 04</div>
+          <h3 data-lang-zh>成交那一刻热闹，之后就再没下文</h3><h3 data-lang-en>All buzz at the deal — then radio silence</h3>
+          <p data-lang-zh>签完单关系就凉了，复购、转介绍全靠客户自己想起来。老客户慢慢沉默、流失，而开发一个新客户的成本是维护老客户的好几倍。</p>
+          <p data-lang-en>Once the deal closes, the relationship goes cold; repeat buys and referrals depend on the customer remembering you. Old customers quietly go silent and churn — while winning a new one costs several times more than keeping an existing one.</p>
+        </div>
+        <div class="pain-a">
+          <div class="pa-label" data-lang-zh>WeAgent 怎么解</div><div class="pa-label" data-lang-en>How WeAgent solves it</div>
+          <h4 data-lang-zh>沉默的客户，AI 主动找回来</h4><h4 data-lang-en>Gone quiet? The AI reaches back out</h4>
+          <p data-lang-zh>系统能识别很久没互动的"冷客户"，在合适的时机自动发起重激活——结合这个人的记忆卡和购买阶段，找一个自然的由头开口，而不是群发打扰。每一次主动触达同样要过冷却、频控和安全门。</p>
+          <p data-lang-en>The system can spot "cold" customers who've gone quiet and reactivate them at the right moment — using their memory card and purchase stage to open with a natural reason, not a mass blast. Every proactive touch still passes cooldown, rate limits and safety gates.</p>
+          <div class="pain-feat">
+            <span data-lang-zh>冷客户重激活</span><span data-lang-en>Cold-customer reactivation</span>
+            <span data-lang-zh>沉默时段检测</span><span data-lang-en>Silence detection</span>
+            <span data-lang-zh>频控不打扰</span><span data-lang-en>Rate-limited, never spammy</span>
+          </div>
+        </div>
+      </div>
+
+      <!-- 痛点5：离职带走客户（重点强调） -->
+      <div class="pain is-hero reveal">
+        <div class="pain-q">
+          <div class="pain-ico"><svg viewBox="0 0 24 24" fill="none"><path d="M16 17l5-5-5-5M21 12H9" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"/><path d="M12 3H5a2 2 0 00-2 2v14a2 2 0 002 2h7" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg></div>
+          <div class="pq-label" data-lang-zh>痛点 05 · 最致命</div><div class="pq-label" data-lang-en>PAIN 05 · the costly one</div>
+          <h3 data-lang-zh>客户攥在个别销售手里，人一走，客户就没了</h3><h3 data-lang-en>Customers held by individual reps — they leave, the customers go too</h3>
+          <p data-lang-zh>企业最贵的资产是客户关系，可它现在装在销售个人的微信和脑子里。员工一离职，不光客户被带走，连"这个客户喜欢什么、聊到哪、答应过什么"这些关系记忆也一并蒸发，新人接手等于从零开始。</p>
+          <p data-lang-en>A company's most valuable asset is its customer relationships — yet today they live in a rep's personal WeChat and head. When that person leaves, not only do the customers walk, but the relationship memory — what they like, where the conversation stood, what was promised — evaporates too. The next person starts from zero.</p>
+        </div>
+        <div class="pain-a">
+          <div class="pa-label" data-lang-zh>WeAgent 怎么解</div><div class="pa-label" data-lang-en>How WeAgent solves it</div>
+          <h4 data-lang-zh>客户和记忆沉淀在系统，天然属于企业</h4><h4 data-lang-en>Customers and memory live in the system — owned by the company</h4>
+          <p data-lang-zh>每个客户的画像、长期记忆、对话历史、承诺与决策记录，全都存在企业自己的系统里，而不是某个人的手机。日常经营由 AI 运营官承担，人员变动不影响关系的连续性——换人接手，记忆和上下文原样还在。客户始终是企业的客户。</p>
+          <p data-lang-en>Every customer's profile, long-term memory, conversation history, promises and decision records live in the company's own system — not on someone's phone. Day-to-day operations are carried by the AI operator, so staff changes don't break continuity — a new owner inherits the memory and context intact. The customer is always the company's customer.</p>
+          <div class="pain-feat">
+            <span data-lang-zh>资产沉淀在系统</span><span data-lang-en>Assets stored in the system</span>
+            <span data-lang-zh>记忆与上下文留存</span><span data-lang-en>Memory & context retained</span>
+            <span data-lang-zh>可私有部署</span><span data-lang-en>Self-hostable</span>
+          </div>
+        </div>
+      </div>
+
+    </div>
+  </div>
+</section>
+
+<!-- ============ 千人千面 ============ -->
+<section class="section section-tint">
+  <div class="wrap">
+    <div class="section-head reveal">
+      <span class="eyebrow" data-lang-zh>千人千面 · 核心理念</span><span class="eyebrow" data-lang-en>A thousand faces · core philosophy</span>
+      <h2 class="h-section" data-lang-zh>同样一句话，<span class="text-grad">对一千个人有一千种说法</span></h2>
+      <h2 class="h-section" data-lang-en>The same intent, <span class="text-grad">told a thousand ways to a thousand people</span></h2>
+      <p class="lead" data-lang-zh>真正会做关系的人都懂：对急性子要干脆、对谨慎的人要给足依据、对老朋友可以随意、对新客户得先建立信任。WeAgent 不是把一套话术群发给所有人，而是用同一套可配置的方法论，结合每个人的画像、阶段、关系和历史，对每个客户给出不一样的判断和动作——方法论是统一的，执行是千人千面的。</p>
+      <p class="lead" data-lang-en>Anyone good with people knows it: be crisp with the impatient, give the cautious solid reasons, be casual with old friends, build trust first with newcomers. WeAgent doesn't blast one script to everyone — it takes one configurable methodology and, combined with each person's profile, stage, relationship and history, produces a different judgment and action for every customer. One methodology, a thousand executions.</p>
+    </div>
+
+    <div class="facet-stage reveal">
+      <!-- 左：同一套方法论 -->
+      <div class="facet-method">
+        <span class="fm-badge" data-lang-zh>同一套方法论</span><span class="fm-badge" data-lang-en>One methodology</span>
+        <h3 data-lang-zh>你定一次"怎么经营"，<br>它对每个人因人而异地执行</h3><h3 data-lang-en>You set "how to operate" once;<br>it executes per person</h3>
+        <p data-lang-zh>什么阶段说什么、怎么推进、什么不能碰、用什么口吻——这套方法论你配一次。系统不会机械照搬，而是把它当成原则，再叠加这个客户独有的输入，算出对"这一个人"此刻最该做的事。不同客户还能绑不同方法论，口吻也能逐人微调。</p>
+        <p data-lang-en>What to say at each stage, how to advance, what to avoid, in what voice — you configure this once. The system doesn't apply it mechanically; it treats it as principles, layers on this customer's unique inputs, and computes the best move for this one person right now. Different customers can even bind different playbooks, and the voice tunes per person.</p>
+        <div class="facet-inputs">
+          <span data-lang-zh><b>+</b> 大五人格画像</span><span data-lang-en><b>+</b> Big Five profile</span>
+          <span data-lang-zh><b>+</b> 长期记忆</span><span data-lang-en><b>+</b> Long-term memory</span>
+          <span data-lang-zh><b>+</b> 当前阶段</span><span data-lang-en><b>+</b> Current stage</span>
+          <span data-lang-zh><b>+</b> 关系类型</span><span data-lang-en><b>+</b> Relationship type</span>
+          <span data-lang-zh><b>+</b> 意图走势</span><span data-lang-en><b>+</b> Intent trajectory</span>
+        </div>
+      </div>
+
+      <!-- 右：不同的人 → 不同执行 -->
+      <div class="facet-people">
+        <div class="facet-person" style="--fp:var(--scheduled);--fp-tx:var(--scheduled-ink);--fp-bg:rgba(10,132,255,.12);--fp-bd:rgba(10,132,255,.22)">
+          <div class="fp-ava"><svg viewBox="0 0 24 24" fill="none"><path d="M13 2L4 14h6l-1 8 9-12h-6z" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round"/></svg></div>
+          <div class="fp-body">
+            <div class="fp-who" data-lang-zh>急性子 · 高意向新客户</div><div class="fp-who" data-lang-en>Impatient · high-intent newcomer</div>
+            <div class="fp-trait" data-lang-zh>外向高、耐心低、想快点定</div><div class="fp-trait" data-lang-en>Extraverted, low patience, wants to decide fast</div>
+            <div class="fp-act" data-lang-zh>→ <b>干脆给方案和价格</b>，少寒暄，直奔重点</div><div class="fp-act" data-lang-en>→ <b>Lead with offer and price</b>, skip small talk, get to the point</div>
+          </div>
+        </div>
+        <div class="facet-person" style="--fp:var(--ai);--fp-tx:var(--ai-ink);--fp-bg:rgba(15,181,168,.12);--fp-bd:rgba(15,181,168,.22)">
+          <div class="fp-ava"><svg viewBox="0 0 24 24" fill="none"><circle cx="11" cy="11" r="7" stroke="currentColor" stroke-width="1.8"/><path d="M21 21l-4-4" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg></div>
+          <div class="fp-body">
+            <div class="fp-who" data-lang-zh>谨慎型 · 反复比较</div><div class="fp-who" data-lang-en>Cautious · compares repeatedly</div>
+            <div class="fp-trait" data-lang-zh>尽责高、风险敏感、要依据</div><div class="fp-trait" data-lang-en>Conscientious, risk-sensitive, wants evidence</div>
+            <div class="fp-act" data-lang-zh>→ <b>给足可核实的依据</b>，不催，留空间慢慢决定</div><div class="fp-act" data-lang-en>→ <b>Provide verifiable evidence</b>, no pressure, room to decide</div>
+          </div>
+        </div>
+        <div class="facet-person" style="--fp:var(--held);--fp-tx:var(--held-ink);--fp-bg:rgba(255,159,10,.12);--fp-bd:rgba(255,159,10,.22)">
+          <div class="fp-ava"><svg viewBox="0 0 24 24" fill="none"><path d="M12 21C7 17 3 13.5 3 9a4.5 4.5 0 018-2.8A4.5 4.5 0 0121 9c0 4.5-4 8-9 12z" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/></svg></div>
+          <div class="fp-body">
+            <div class="fp-who" data-lang-zh>老客户 · 已成交多次</div><div class="fp-who" data-lang-en>Loyal · bought many times</div>
+            <div class="fp-trait" data-lang-zh>关系熟、记得他的偏好和过往</div><div class="fp-trait" data-lang-en>Familiar; remembers preferences and history</div>
+            <div class="fp-act" data-lang-zh>→ <b>口吻更随意</b>，基于历史推荐，重情感维系</div><div class="fp-act" data-lang-en>→ <b>Casual voice</b>, recommend from history, nurture the bond</div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ============ 经验与知识：从此长在系统里 ============ -->
+<section class="section asset-band">
+  <div class="hero-bg" aria-hidden="true"><div class="hero-glow" style="position:absolute;width:640px;height:640px;border-radius:50%;filter:blur(100px);opacity:.2;top:-160px;left:-80px;background:radial-gradient(circle,rgba(94,92,230,.45),transparent 70%)"></div><div class="hero-glow" style="position:absolute;width:520px;height:520px;border-radius:50%;filter:blur(100px);opacity:.16;bottom:-140px;right:-80px;background:radial-gradient(circle,rgba(15,181,168,.4),transparent 72%)"></div></div>
+  <div class="wrap" style="position:relative">
+    <div class="section-head reveal" style="max-width:840px">
+      <span class="eyebrow" data-lang-zh>不止客户，能力也别长在人身上</span><span class="eyebrow" data-lang-en>Not just customers — capability shouldn't live in people either</span>
+      <h2 class="h-section" data-lang-zh>运营的经验和知识，<br><span class="text-grad">沉淀进系统，而不是某个人脑子里</span></h2>
+      <h2 class="h-section" data-lang-en>Operating know-how and knowledge,<br><span class="text-grad">accrue in the system — not in someone's head</span></h2>
+      <p class="lead" data-lang-zh>新人不会聊、老手带不动、好方法只装在某个销冠脑子里、知识库永远缺一块——这些和"离职带走客户"是同一个病根：能力长在人身上。WeAgent 把"怎么运营"本身也变成系统资产，越长期运行越完整。</p>
+      <p class="lead" data-lang-en>New hires can't hold a conversation, mentoring doesn't scale, the best tactics live only in one top rep's head, and the knowledge base is always missing a piece — same root cause as "reps walk off with customers": capability lives in people. WeAgent turns "how to operate" itself into a system asset that grows more complete the longer it runs.</p>
+    </div>
+    <div class="asset-grid">
+
+      <!-- 新手即专家 -->
+      <div class="asset-card reveal">
+        <div class="asset-ico"><svg viewBox="0 0 24 24" fill="none"><path d="M12 3l9 5-9 5-9-5 9-5z" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/><path d="M7 10.5V15c0 1.5 2.5 3 5 3s5-1.5 5-3v-4.5" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg></div>
+        <div class="asset-body">
+          <div class="asset-pain" data-lang-zh><s>新手不会运营、上手慢</s></div><div class="asset-pain" data-lang-en><s>New hires ramp slowly</s></div>
+          <h4 data-lang-zh>方法论写一次，全员同一水准</h4><h4 data-lang-en>Write the playbook once, everyone operates at one bar</h4>
+          <p data-lang-zh>"什么阶段该说什么、怎么推进、什么不能碰"这些过去靠老带新口口相传的功夫，在 WeAgent 里固化成可配置的方法论与分层提示词。AI 一上岗就是按最佳实践运营，不存在新人摸索期，服务水准不再因人而异。</p>
+          <p data-lang-en>"What to say at each stage, how to advance, what never to touch" — the craft once passed down by mentoring is fixed here as configurable playbooks and layered prompts. The AI operates by best practice from day one; there's no rookie fumbling and no person-to-person quality gap.</p>
+        </div>
+      </div>
+
+      <!-- 销冠经验可复制 -->
+      <div class="asset-card reveal reveal-d1">
+        <div class="asset-ico"><svg viewBox="0 0 24 24" fill="none"><path d="M12 15a4 4 0 100-8 4 4 0 000 8z" stroke="currentColor" stroke-width="1.8"/><path d="M9 14l-2 7 5-3 5 3-2-7" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/></svg></div>
+        <div class="asset-body">
+          <div class="asset-pain" data-lang-zh><s>处理方法散在每个人手里，难积累</s></div><div class="asset-pain" data-lang-en><s>Tactics scattered across people, never pooled</s></div>
+          <h4 data-lang-zh>有效经验自动聚合，沉淀为共用资产</h4><h4 data-lang-en>Effective tactics auto-pooled into shared assets</h4>
+          <p data-lang-zh>系统跨客户、按滑动窗口聚合那些真正奏效的处理方式，把分散在每段对话里的经验提炼成"可复用经验"候选。一个人摸索出的好打法，经晋升后变成整套系统的共同能力——不再随某个人的离开而消失。</p>
+          <p data-lang-en>Across customers and over a sliding window, the system aggregates what actually works, distilling tactics scattered through conversations into reusable "lessons." A good move one person figured out becomes, once promoted, the whole system's shared capability — no longer lost when that person leaves.</p>
+        </div>
+      </div>
+
+      <!-- 知识缺口自动发现 -->
+      <div class="asset-card reveal">
+        <div class="asset-ico"><svg viewBox="0 0 24 24" fill="none"><circle cx="11" cy="11" r="7" stroke="currentColor" stroke-width="1.8"/><path d="M21 21l-4-4M11 8v3M11 14v.5" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg></div>
+        <div class="asset-body">
+          <div class="asset-pain" data-lang-zh><s>知识库缺一块，没人发现、没人补</s></div><div class="asset-pain" data-lang-en><s>Knowledge gaps no one notices or fills</s></div>
+          <h4 data-lang-zh>对话暴露的盲区，自动识别进待办</h4><h4 data-lang-en>Blind spots surfaced in chat, auto-queued for review</h4>
+          <p data-lang-zh>当客户问到知识库答不上来的问题，系统会把这个"知识缺口"自动记录成待补条目，进统一收件箱排队。你要做的只是补上答案——而不是等某天客户流失了，才发现这块一直没人管。缺口被看见，是补全的前提。</p>
+          <p data-lang-en>When a customer asks something the knowledge base can't answer, the system records that "gap" as a to-do and queues it in the unified inbox. All you do is supply the answer — instead of discovering the hole only after a customer churns. A gap seen is a gap that can be filled.</p>
+        </div>
+      </div>
+
+      <!-- 红线：补充仍由人把关 -->
+      <div class="asset-card reveal reveal-d1">
+        <div class="asset-ico"><svg viewBox="0 0 24 24" fill="none"><path d="M12 3l8 4v5c0 5-3.5 8-8 9-4.5-1-8-4-8-9V7l8-4z" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/><path d="M9 12l2 2 4-4" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"/></svg></div>
+        <div class="asset-body">
+          <div class="asset-pain" data-lang-zh>越积累，越要守住准确</div><div class="asset-pain" data-lang-en>The more it accrues, the more accuracy matters</div>
+          <h4 data-lang-zh>自动发现，但绝不自动当真</h4><h4 data-lang-en>Auto-discovered, never auto-trusted</h4>
+          <p data-lang-zh>这里有条不动摇的红线：AI 可以发现缺口、起草知识、聚合经验，但任何新知识都先落"草稿待审"，必须经人核验才会生效。系统帮你把"该补什么"找全、整理好，准确性的最后一关永远握在人手里——知识库越长越大，也越可信。</p>
+          <p data-lang-en>One firm red line: the AI may surface gaps, draft knowledge and pool lessons, but every new piece lands as a review-pending draft and takes effect only after human verification. The system finds and organizes "what to add"; the final check on accuracy always stays with people — so the knowledge base grows larger and more trustworthy at once.</p>
+        </div>
+      </div>
+
+    </div>
+
+    <div class="flywheel reveal">
+      <span class="fw-step" data-lang-zh><b>跑</b> 长期运营每段对话</span><span class="fw-step" data-lang-en><b>Run</b> every conversation</span>
+      <span class="fw-arrow" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none"><path d="M5 12h14M13 6l6 6-6 6" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+      <span class="fw-step" data-lang-zh><b>记</b> 发现缺口 · 沉淀经验</span><span class="fw-step" data-lang-en><b>Capture</b> gaps & lessons</span>
+      <span class="fw-arrow" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none"><path d="M5 12h14M13 6l6 6-6 6" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+      <span class="fw-step" data-lang-zh><b>审</b> 人工核验把关</span><span class="fw-step" data-lang-en><b>Review</b> human verifies</span>
+      <span class="fw-arrow" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none"><path d="M5 12h14M13 6l6 6-6 6" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+      <span class="fw-step" data-lang-zh><b>长</b> 知识库越跑越全</span><span class="fw-step" data-lang-en><b>Grow</b> a fuller knowledge base</span>
+    </div>
+  </div>
+</section>
+
+<!-- ============ 不止解决问题：把运营做得更好 ============ -->
+<section class="section section-tint">
+  <div class="wrap">
+    <div class="section-head reveal">
+      <span class="eyebrow" data-lang-zh>不止解决问题</span><span class="eyebrow" data-lang-en>Beyond fixing problems</span>
+      <h2 class="h-section" data-lang-zh>它还把运营，<span class="text-grad">做得比人更细</span></h2>
+      <h2 class="h-section" data-lang-en>It also runs ops <span class="text-grad">finer than a person can</span></h2>
+      <p class="lead" data-lang-zh>接住麻烦只是底线。WeAgent 真正的价值，是把"经营一段关系"里那些难以量化、容易被忽略的功夫——情绪价值、懂客户、像真人、不惹烦——变成可衡量、可约束、可复盘的能力。下面每一项都对应系统里真实的度量与闸门。</p>
+      <p class="lead" data-lang-en>Catching headaches is just the floor. WeAgent's real value is turning the hard-to-quantify, easily-overlooked craft of nurturing a relationship — emotional value, knowing the customer, sounding human, never being pushy — into capabilities you can measure, constrain and review. Each below maps to a real metric or gate in the system.</p>
+    </div>
+    <div class="value-grid">
+
+      <!-- 情绪价值 -->
+      <div class="value-card reveal" style="--vc:var(--ai);--vc-tx:var(--ai-ink)">
+        <div class="vc-ico"><svg viewBox="0 0 24 24" fill="none"><path d="M12 21C7 17 3 13.5 3 9a4.5 4.5 0 018-2.8A4.5 4.5 0 0121 9c0 4.5-4 8-9 12z" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/></svg></div>
+        <h4 data-lang-zh>情绪价值，不是玄学，是被打分的</h4><h4 data-lang-en>Emotional value isn't fuzzy — it's scored</h4>
+        <p data-lang-zh>客户要的不只是答案，是被理解、被认可、不被推着走。WeAgent 把"情绪价值"拆成可计算的维度去评判每条回复：共情、认可、具体、给自主感、减压力。分数不达标的回复会被自动重写——温度不是靠运气，是被守住的。</p>
+        <p data-lang-en>Customers want more than answers — they want to feel understood, validated, not pushed. WeAgent breaks "emotional value" into computable dimensions scored on every reply: empathy, validation, specificity, autonomy-support, less pressure. Replies that fall short get rewritten — warmth isn't luck, it's enforced.</p>
+        <div class="vc-formula" data-lang-zh>情绪价值 = 共情 + 认可 + 具体 + <b>自主感</b> − 压力</div>
+        <div class="vc-formula" data-lang-en>EmotionalValue = Empathy + Validation + Specificity + <b>Autonomy</b> − Pressure</div>
+      </div>
+
+      <!-- 越聊越懂客户：画像 -->
+      <div class="value-card reveal reveal-d1" style="--vc:var(--brand)">
+        <div class="vc-ico"><svg viewBox="0 0 24 24" fill="none"><circle cx="12" cy="8" r="4" stroke="currentColor" stroke-width="1.8"/><path d="M5 20c0-3.5 3-6 7-6s7 2.5 7 6" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg></div>
+        <h4 data-lang-zh>越聊越懂客户，却不瞎贴标签</h4><h4 data-lang-en>It understands customers more over time — without mislabeling</h4>
+        <p data-lang-zh>系统用心理学公认的大五人格刻画每位客户，结合长期记忆和意图走势，越互动越懂他。但有条铁律：任何标签、人格、记忆事实，只要在对话里找不到可锚定的证据，置信度强制归零——宁可说"还不了解"，绝不凭印象给人贴标签。</p>
+        <p data-lang-en>It profiles each customer along the psychology-standard Big Five, combined with long-term memory and intent trajectory — understanding them more with every exchange. But one iron rule: any tag, trait or fact without anchored evidence in the conversation has its confidence forced to zero. Better "don't know yet" than a label on a hunch.</p>
+        <div class="vc-tags"><span data-lang-zh>大五人格画像</span><span data-lang-en>Big Five profile</span><span data-lang-zh>意图走势</span><span data-lang-en>Intent trajectory</span><span data-lang-zh>无据不臆断</span><span data-lang-en>No evidence, no guess</span></div>
+      </div>
+
+      <!-- 像真人 -->
+      <div class="value-card reveal reveal-d2" style="--vc:var(--scheduled);--vc-tx:var(--scheduled-ink)">
+        <div class="vc-ico"><svg viewBox="0 0 24 24" fill="none"><path d="M21 15a2 2 0 01-2 2H7l-4 4V5a2 2 0 012-2h14a2 2 0 012 2z" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/><path d="M8 9h8M8 12h5" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg></div>
+        <h4 data-lang-zh>每句话都像真人在发，不像机器人</h4><h4 data-lang-en>Every line sounds human, not robotic</h4>
+        <p data-lang-zh>客户一眼就能看出"这是不是机器人客服"。WeAgent 给每条回复打一个"拟真度"分，太像模板、太官腔、太生硬的回复会被打回重写一次。再叠加稳定人格和可按客户微调的口吻，让对话自然得像真人在用微信聊天。</p>
+        <p data-lang-en>Customers can spot a bot instantly. WeAgent scores every reply for "human-likeness" — anything too templated, too formal or too stiff gets sent back for one rewrite. Layered with a stable persona and a per-customer tunable voice, conversations feel like a real person chatting on WeChat.</p>
+        <div class="vc-tags"><span data-lang-zh>拟真度评分</span><span data-lang-en>Human-like score</span><span data-lang-zh>不达标重写</span><span data-lang-en>Rewrite if low</span><span data-lang-zh>口吻可微调</span><span data-lang-en>Tunable voice</span></div>
+      </div>
+
+      <!-- 低压推进 -->
+      <div class="value-card reveal" style="--vc:var(--held);--vc-tx:var(--held-ink)">
+        <div class="vc-ico"><svg viewBox="0 0 24 24" fill="none"><path d="M12 3v6M12 9l-3-2M12 9l3-2" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/><rect x="4" y="9" width="16" height="11" rx="2" stroke="currentColor" stroke-width="1.8"/><path d="M9 14h6" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg></div>
+        <h4 data-lang-zh>会推进成交，但绝不惹人烦</h4><h4 data-lang-en>It moves deals forward — never annoyingly</h4>
+        <p data-lang-zh>催单催到客户拉黑，是私域最常见的翻车。WeAgent 给每条回复评估"压力风险"，催逼感、操控式营销过线会被直接拦截、不允许发出。它推进关系靠的是价值和时机，而不是话术施压——这条由发送前的安全闸强制执行。</p>
+        <p data-lang-en>Pushing so hard the customer blocks you is the classic private-domain failure. WeAgent rates every reply for "pressure risk" — pushiness or manipulative selling over the line is blocked outright. It advances relationships through value and timing, not pressure tactics — enforced by a pre-send safety gate.</p>
+        <div class="vc-tags"><span data-lang-zh>压力风险闸</span><span data-lang-en>Pressure-risk gate</span><span data-lang-zh>反操控营销</span><span data-lang-en>Anti-manipulation</span><span data-lang-zh>过线即拦截</span><span data-lang-en>Over-line blocked</span></div>
+      </div>
+
+      <!-- 运营驾驶舱 / 协作分析 -->
+      <div class="value-card reveal reveal-d1" style="--vc:var(--brand-2)">
+        <div class="vc-ico"><svg viewBox="0 0 24 24" fill="none"><path d="M4 19V5M4 19h16M8 16l3-4 3 2 4-6" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg></div>
+        <h4 data-lang-zh>每个客户都有一块运营驾驶舱</h4><h4 data-lang-en>A cockpit for every customer</h4>
+        <p data-lang-zh>你随时能看清 AI 正在为某个客户做什么决策、依据哪些知识和记忆、把哪些"下一步动作"按价值排了序。运营负责人不再靠盘问销售掌握进展，而是打开后台就看到每段关系的真实状态——人和 AI 在同一块面板上协作。</p>
+        <p data-lang-en>You can always see what the AI is deciding for a given customer, which knowledge and memory it drew on, and how it ranked the "next best actions" by value. Ops leads no longer interrogate reps for status — they open the console and see the real state of every relationship, with people and AI collaborating on one panel.</p>
+        <div class="vc-tags"><span data-lang-zh>单人决策视角</span><span data-lang-en>Per-person view</span><span data-lang-zh>下一步动作排序</span><span data-lang-en>Next-best-action</span><span data-lang-zh>会话可回放</span><span data-lang-en>Replayable</span></div>
+      </div>
+
+      <!-- 模拟验证 -->
+      <div class="value-card reveal reveal-d2" style="--vc:var(--running)">
+        <div class="vc-ico"><svg viewBox="0 0 24 24" fill="none"><path d="M12 3l8 4v5c0 5-3.5 8-8 9-4.5-1-8-4-8-9V7l8-4z" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/><path d="M9 12l2 2 4-4" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"/></svg></div>
+        <h4 data-lang-zh>上线之前，先模拟跑一遍</h4><h4 data-lang-en>Rehearse before it goes live</h4>
+        <p data-lang-zh>担心 AI 上来就说错话？你可以先对一个客户发起"模拟对话"，在影子环境里看它会怎么应对、怎么决策，确认满意再让它真正上岗。改了方法论、调了策略，也能先模拟验证泛化效果，而不是拿真实客户试错。</p>
+        <p data-lang-en>Worried it'll say the wrong thing out of the gate? You can run a "simulated dialogue" for a customer first, watch how it responds and decides in a shadow environment, and only go live once you're satisfied. Changed a playbook or tuned strategy? Simulate to check it generalizes — instead of experimenting on real customers.</p>
+        <div class="vc-tags"><span data-lang-zh>影子模拟对话</span><span data-lang-en>Shadow simulation</span><span data-lang-zh>先验证再上线</span><span data-lang-en>Verify then ship</span><span data-lang-zh>不拿客户试错</span><span data-lang-en>No live trial-and-error</span></div>
+      </div>
+
+    </div>
+  </div>
+</section>
+
+<!-- ============ 像真人一样聊天：对话场景处理 ============ -->
+<section class="section">
+  <div class="wrap">
+    <div class="section-head reveal">
+      <span class="eyebrow" data-lang-zh>不只是会说话，更会"聊天"</span><span class="eyebrow" data-lang-en>Not just talking — actually chatting</span>
+      <h2 class="h-section" data-lang-zh>微信怎么聊，<span class="text-grad">它就怎么接</span></h2>
+      <h2 class="h-section" data-lang-en>However people chat on WeChat, <span class="text-grad">it keeps up</span></h2>
+      <p class="lead" data-lang-zh>真人在微信里从不是"一问一答"：你会连着发好几条、想到哪说到哪，回话也是一条一条蹦出来，而不是甩一大段。很多 AI 客服一看就露馅，正是栽在这些聊天细节上。WeAgent 在对话节奏上做了一整套贴合真实聊天习惯的处理——下面这些都对应系统里真实的机制。</p>
+      <p class="lead" data-lang-en>Real people never chat in clean Q&A on WeChat: you fire off several messages as thoughts come, and replies pop out one at a time, not in one big block. Many AI agents give themselves away on exactly these details. WeAgent handles conversation rhythm to match how people really chat — and each of these maps to a real mechanism in the system.</p>
+    </div>
+
+    <div class="talk-stage reveal">
+      <!-- 左：微信式对话演示 -->
+      <div class="chat-demo">
+        <div class="chat-head">
+          <span class="ch-ava"><svg viewBox="0 0 24 24" fill="none"><path d="M8.5 14.5c-3 0-5.5-2-5.5-4.6C3 7 5.8 5 9 5s6 2 6 4.9c0 .5-.1 1-.3 1.5M16 19c2.2 0 4-1.4 4-3.3 0-1.9-1.8-3.4-4-3.4s-4 1.5-4 3.4c0 .6.2 1.2.6 1.7L12 19l1.6-.5c.7.3 1.5.5 2.4.5z" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+          <div>
+            <div class="ch-name" data-lang-zh>微信对话</div><div class="ch-name" data-lang-en>WeChat thread</div>
+            <div class="ch-sub">live demo</div>
+          </div>
+        </div>
+        <!-- 客户连发三条 -->
+        <div class="chat-row in"><div class="bubble" data-lang-zh>在吗</div><div class="bubble" data-lang-en>Hey, you there?</div></div>
+        <div class="chat-row in"><div class="bubble" data-lang-zh>想问下上次那个套餐</div><div class="bubble" data-lang-en>Wanted to ask about that package</div></div>
+        <div class="chat-row in"><div class="bubble" data-lang-zh>现在还有优惠不</div><div class="bubble" data-lang-en>any discount still on?</div></div>
+        <!-- 合并理解标注 -->
+        <div class="chat-anno"><span data-lang-zh>⏳ 等几秒，看你是不是还在打字 · 合并成一次理解</span><span data-lang-en>⏳ Waits a few seconds for you to finish · merges into one</span></div>
+        <!-- AI 分两条回 -->
+        <div class="chat-row out"><div class="bubble" data-lang-zh>在的～您说的是上次看的那个季度套餐对吧</div><div class="bubble" data-lang-en>Yep! You mean the quarterly package from last time?</div></div>
+        <div class="chat-row out"><div class="bubble" data-lang-zh>这两天刚好有活动，我把价格和权益发您看看 👍</div><div class="bubble" data-lang-en>There's a promo on right now — let me send you the price and perks 👍</div></div>
+        <div class="chat-anno is-ai"><span data-lang-zh>✓ 一次理解，分两条自然回 · 不机械逐条抢答</span><span data-lang-en>✓ Understood once, replied in two natural lines · no robotic per-message answering</span></div>
+      </div>
+
+      <!-- 右：对话处理要点 -->
+      <div class="talk-points">
+        <div class="talk-point" style="--tp:var(--brand)">
+          <div class="tp-ico" style="--tp-bg:var(--fill-brand);--tp-bd:rgba(94,92,230,.22)"><svg viewBox="0 0 24 24" fill="none"><path d="M4 5h16v10H7l-3 3z" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/><path d="M8 9h.01M12 9h.01M16 9h.01" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"/></svg></div>
+          <div class="tp-body">
+            <h4 data-lang-zh>连发好几条？等你说完再回</h4><h4 data-lang-en>Sent several? It waits till you're done</h4>
+            <p data-lang-zh>收到消息不抢着回，而是留一个几秒的小窗口（默认约 4 秒、可按行业调）。你接着发，它就把这几条合在一起理解，统一回一次——绝不对每条都蹦一句，把对话切得支离破碎。</p>
+            <p data-lang-en>It doesn't rush to answer — it holds a short window (about 4 seconds by default, tunable). Keep typing and it merges your messages into one understanding and replies once — never firing a line at each, chopping the chat to pieces.</p>
+          </div>
+        </div>
+        <div class="talk-point" style="--tp:var(--ai)">
+          <div class="tp-ico" style="--tp-bg:rgba(15,181,168,.12);--tp-bd:rgba(15,181,168,.22)"><svg viewBox="0 0 24 24" fill="none"><path d="M21 11.5a8.4 8.4 0 01-11.3 7.9L3 21l1.6-6.7A8.4 8.4 0 1121 11.5z" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/></svg></div>
+          <div class="tp-body">
+            <h4 data-lang-zh>回话像真人，一条一条说</h4><h4 data-lang-en>Replies like a person, line by line</h4>
+            <p data-lang-zh>不甩一大坨长段落。系统按换行和句子把回复自然切成几条短消息依次发出，读起来就像真人边想边打——既好读，节奏上也不像复制粘贴的机器人。</p>
+            <p data-lang-en>No giant wall of text. The system splits a reply into a few short messages along line breaks and sentences, sent in sequence — reading like a person typing as they think: easier to read, and nothing like a copy-paste bot.</p>
+          </div>
+        </div>
+        <div class="talk-point" style="--tp:var(--scheduled)">
+          <div class="tp-ico" style="--tp-bg:rgba(10,132,255,.12);--tp-bd:rgba(10,132,255,.22)"><svg viewBox="0 0 24 24" fill="none"><path d="M4 9V7a2 2 0 012-2h10M20 15v2a2 2 0 01-2 2H8" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/><path d="M16 2l4 3-4 3M8 22l-4-3 4-3" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg></div>
+          <div class="tp-body">
+            <h4 data-lang-zh>刚要回，你又发了？它会重想</h4><h4 data-lang-en>About to reply, you sent more? It rethinks</h4>
+            <p data-lang-zh>如果它正在组织回复、你又补了一条新消息，它会丢掉刚才那版没发出去的草稿，结合你的新消息重新想一遍再回——不会自顾自把过时的话发出来，答非所问。</p>
+            <p data-lang-en>If it's drafting a reply and you add another message, it drops the unsent draft and rethinks with your new message before answering — never blurting out a now-stale line that misses what you just said.</p>
+          </div>
+        </div>
+        <div class="talk-point" style="--tp:var(--held)">
+          <div class="tp-ico" style="--tp-bg:rgba(255,159,10,.12);--tp-bd:rgba(255,159,10,.22)"><svg viewBox="0 0 24 24" fill="none"><path d="M5 13l4 4L19 7" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></div>
+          <div class="tp-body">
+            <h4 data-lang-zh>"好的""在吗"——分寸拿捏</h4><h4 data-lang-en>"OK," "you there?" — it reads the room</h4>
+            <p data-lang-zh>不是每条都得回。客户一句"好的""收到"，它不会硬尬聊刷存在感；但"在吗""早"这类招呼一定接住，不晾着客户。该回的回、该收的收，分寸贴近真人。</p>
+            <p data-lang-en>Not everything needs a reply. To a "got it" or "OK," it won't force small talk to look busy; but a "you there?" or "morning" always gets caught — never left hanging. Answer what's due, let the rest rest — like a real person would.</p>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="talk-note reveal">
+      <span class="tn-ico" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none"><path d="M4 5h16v14H4z" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/><path d="M4 9h16M8 13h8M8 16h5" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></svg></span>
+      <p data-lang-zh><b>发来图片、语音、链接也接得住。</b>客户发的不是文字时，AI 能识别这是图片 / 语音 / 链接 / 名片等，用自然的口吻请客户把关键信息补成文字，不会答非所问、更不会卡死。微信偶尔重复推送同一条消息，系统也在数据库层原子去重——绝不会因平台重推而把同一句话回两遍。</p>
+      <p data-lang-en><b>Images, voice, links — it catches those too.</b> When a customer sends something non-text, the AI recognizes it as an image / voice / link / card and naturally asks them to add the key details in text — never answering off-topic or freezing. And when WeChat occasionally re-pushes the same message, the system de-dupes atomically at the database layer — so a platform retry never makes it reply twice.</p>
+    </div>
+  </div>
+</section>
+
+<!-- ============ 它如何长期自己转起来 ============ -->
+<section class="section loop-band">
+  <div class="hero-bg" aria-hidden="true"><div class="hero-glow" style="position:absolute;width:600px;height:600px;border-radius:50%;filter:blur(100px);opacity:.2;top:-140px;right:-100px;background:radial-gradient(circle,rgba(15,181,168,.4),transparent 70%)"></div></div>
+  <div class="wrap" style="position:relative">
+    <div class="section-head reveal" style="max-width:820px">
+      <span class="eyebrow" data-lang-zh>不只是工具，是会自己干活的运营官</span><span class="eyebrow" data-lang-en>Not a tool — an operator that works on its own</span>
+      <h2 class="h-section" data-lang-zh>你只做两件事：<span class="text-grad">定规矩、被请示</span></h2>
+      <h2 class="h-section" data-lang-en>You do just two things: <span class="text-grad">set the rules, be consulted</span></h2>
+      <p class="lead" data-lang-zh>WeAgent 不需要你天天盯着。用一句大白话告诉它方向和分寸，它就自己上岗：该说话时说话、拿不准时向你请示、发完自己复盘。客户永远只跟 AI 对话，永不直接面对真人。</p>
+      <p class="lead" data-lang-en>WeAgent doesn't need you watching all day. Tell it the direction and boundaries in one plain sentence, and it goes to work: speaks when it should, consults you when unsure, reflects after each send. Customers only ever talk to the AI — never directly to a human.</p>
+    </div>
+    <div class="loop-steps">
+      <div class="loop-step reveal">
+        <div class="loop-n">01</div>
+        <h4 data-lang-zh>你定规矩</h4><h4 data-lang-en>You set the rules</h4>
+        <p data-lang-zh>用自然语言交代方向、分寸、哪些事要先问你。不用配置表格、不用写规则引擎。</p>
+        <p data-lang-en>State direction, boundaries and what needs your sign-off — in plain language. No config sheets, no rule engine.</p>
+      </div>
+      <div class="loop-step reveal reveal-d1">
+        <div class="loop-n">02</div>
+        <h4 data-lang-zh>它自己经营</h4><h4 data-lang-en>It runs operations</h4>
+        <p data-lang-zh>判断该不该开口、查知识、起草、自我评审、发送，全天候不打烊，每段关系都顾得上。</p>
+        <p data-lang-en>Decides whether to reach out, consults knowledge, drafts, self-reviews and sends — around the clock, every relationship covered.</p>
+      </div>
+      <div class="loop-step reveal reveal-d2">
+        <div class="loop-n">03</div>
+        <h4 data-lang-zh>拿不准就请示</h4><h4 data-lang-en>Unsure? It consults</h4>
+        <p data-lang-zh>遇到超出职权的事，向幕后的你请示、拿回结论，再用自己的口吻转述给客户。</p>
+        <p data-lang-en>For anything beyond its mandate, it consults you behind the scenes, gets a verdict, and relays it to the customer in its own voice.</p>
+      </div>
+      <div class="loop-step reveal reveal-d3">
+        <div class="loop-n">04</div>
+        <h4 data-lang-zh>发完会复盘</h4><h4 data-lang-en>It reflects afterward</h4>
+        <p data-lang-zh>分析客户反应、更新记忆与意图走势，连续没进展就换策略——越做越准，不一条道走到黑。</p>
+        <p data-lang-en>Analyzes reactions, updates memory and intent trajectory, switches strategy when progress stalls — getting sharper over time, never pushing blindly.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ============ 方向盘还在你手里 ============ -->
+<section class="section section-tint">
+  <div class="wrap">
+    <div class="section-head reveal">
+      <span class="eyebrow" data-lang-zh>交给 AI，不等于撒手不管</span><span class="eyebrow" data-lang-en>Handing it to AI ≠ losing control</span>
+      <h2 class="h-section" data-lang-zh>生意交给 AI 跑，<span class="text-grad">方向盘还在你手里</span></h2>
+      <h2 class="h-section" data-lang-en>The AI runs it, <span class="text-grad">but you hold the wheel</span></h2>
+      <p class="lead" data-lang-zh>把客户交给 AI，最大的担心是"它会不会失控、我还能不能管得住"。WeAgent 给你一整套掌控面板：一句话指挥它、所有该拍板的事收口到一处、拿不准它会先问你、干得好不好全是看得见的数据。你在幕后说了算，客户那头永远只跟 AI 对话。</p>
+      <p class="lead" data-lang-en>The biggest worry in handing customers to an AI is "will it go off the rails, can I still rein it in?" WeAgent gives you a full control surface: command it in one sentence, funnel every call-worthy item into one place, get consulted when it's unsure, and see exactly how well it's doing. You're in charge behind the scenes — the customer only ever talks to the AI.</p>
+    </div>
+    <div class="ctrl-grid">
+
+      <!-- AI 总控 -->
+      <div class="ctrl-card reveal" style="--cc:var(--brand)">
+        <div class="cc-ico"><svg viewBox="0 0 24 24" fill="none"><path d="M12 3v4M12 17v4M3 12h4M17 12h4" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/><circle cx="12" cy="12" r="3.4" stroke="currentColor" stroke-width="1.8"/></svg></div>
+        <div class="cc-body">
+          <div class="cc-pain" data-lang-zh>不想学复杂后台、不会写规则</div><div class="cc-pain" data-lang-en>Don't want to learn a complex console or write rules</div>
+          <h4 data-lang-zh>一句大白话，就能指挥整个系统</h4><h4 data-lang-en>Command the whole system in plain words</h4>
+          <p data-lang-zh>"看看今天有哪些客户该跟进""把这条产品信息更新一下""给这批人安排一次问候"——你用自然语言交代，后台的总控 AI 就去查询、配置、发消息、建任务。它会先把执行计划摆给你看，高风险动作必须你点头才动手。</p>
+          <p data-lang-en>"Show me who's due for follow-up today," "update this product info," "schedule a check-in for these people" — you say it in plain language and the management AI queries, configures, sends and schedules. It lays out the plan first, and high-risk actions move only after you approve.</p>
+          <div class="cc-tags"><span data-lang-zh>自然语言操作</span><span data-lang-en>Natural-language control</span><span data-lang-zh>执行计划可见</span><span data-lang-en>Visible plan</span><span data-lang-zh>高风险先确认</span><span data-lang-en>Confirm before risky moves</span></div>
+        </div>
+      </div>
+
+      <!-- 统一收件箱 -->
+      <div class="ctrl-card reveal reveal-d1" style="--cc:var(--scheduled)">
+        <div class="cc-ico"><svg viewBox="0 0 24 24" fill="none"><path d="M3 13l3-8h12l3 8M3 13v6h18v-6M3 13h5l1.5 3h5L16 13h5" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round" stroke-linecap="round"/></svg></div>
+        <div class="cc-body">
+          <div class="cc-pain" data-lang-zh>怕漏掉要紧事、信息散落各处</div><div class="cc-pain" data-lang-en>Afraid of missing what matters, scattered everywhere</div>
+          <h4 data-lang-zh>所有要你拍板的事，收口在一处</h4><h4 data-lang-en>Everything that needs your call, in one place</h4>
+          <p data-lang-zh>请示裁决、知识核验、画像发布、经验晋升、知识缺口……所有需要你决策或审核的事项，按清晰的待办流汇聚到同一个收件箱，逐条处置，点进去就能直达对应的客户或对话。不用在十几个页面之间来回找。</p>
+          <p data-lang-en>Escalations, knowledge verification, profile publishing, lesson promotion, knowledge gaps — everything needing your decision or review converges into one inbox as clear streams, handled item by item, each deep-linking straight to the relevant customer or chat. No hunting across a dozen pages.</p>
+          <div class="cc-tags"><span data-lang-zh>多类待办收口</span><span data-lang-en>Unified streams</span><span data-lang-zh>单一数据源</span><span data-lang-en>One source</span><span data-lang-zh>深链直达对象</span><span data-lang-en>Deep links</span></div>
+        </div>
+      </div>
+
+      <!-- 请示通道 -->
+      <div class="ctrl-card reveal" style="--cc:var(--ai)">
+        <div class="cc-ico"><svg viewBox="0 0 24 24" fill="none"><path d="M5 7h14M5 12h9M5 17h6" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/><circle cx="18" cy="15" r="3" stroke="currentColor" stroke-width="1.8"/></svg></div>
+        <div class="cc-body">
+          <div class="cc-pain" data-lang-zh>怕 AI 自作主张、超出职权乱答应</div><div class="cc-pain" data-lang-en>Afraid the AI overreaches and promises things</div>
+          <h4 data-lang-zh>拿不准时它先问你，而不是自己拍板</h4><h4 data-lang-en>Unsure? It asks you first, instead of deciding alone</h4>
+          <p data-lang-zh>遇到超出职权的事（特批价格、特殊承诺等），AI 不会自己硬扛，而是带一个短码向幕后的你请示；你回一句结论，它再用自己的口吻转述给客户。你可以配置谁来拍板、哪些情形要请示、超时转给谁。这是"请示而非接管"——客户始终只跟 AI 对话，从不直接面对真人。</p>
+          <p data-lang-en>For anything beyond its mandate (special pricing, unusual commitments), the AI doesn't wing it — it escalates to you behind the scenes with a short code; you reply with a verdict and it relays it to the customer in its own voice. You configure who decides, which situations trigger escalation, and the timeout fallback. This is "consult, not hand off" — the customer always talks only to the AI, never directly to a person.</p>
+          <div class="cc-tags"><span data-lang-zh>决策人链</span><span data-lang-en>Decider chain</span><span data-lang-zh>短码请示回流</span><span data-lang-en>Short-code escalation</span><span data-lang-zh>超时转备选</span><span data-lang-en>Timeout fallback</span></div>
+        </div>
+      </div>
+
+      <!-- 成效与审计 -->
+      <div class="ctrl-card reveal reveal-d1" style="--cc:var(--running)">
+        <div class="cc-ico"><svg viewBox="0 0 24 24" fill="none"><path d="M4 19V9M10 19V5M16 19v-7M22 19H2" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg></div>
+        <div class="cc-body">
+          <div class="cc-pain" data-lang-zh>怕看不见 AI 到底干了什么、好不好</div><div class="cc-pain" data-lang-en>Afraid you can't see what the AI did, or how well</div>
+          <h4 data-lang-zh>干得好不好，全是看得见的数据</h4><h4 data-lang-en>How well it's doing — all in visible data</h4>
+          <p data-lang-zh>回复率、对话深度、阶段推进、主动触达的真实效果……运营成效被量化成可追踪的指标。更重要的是：每一次决策、每一次工具调用、每一次发送都留痕，构成完整的执行审计链。AI 做了什么、依据什么，事后都查得到，不是黑盒。</p>
+          <p data-lang-en>Reply rate, conversation depth, stage progression, the real effect of proactive outreach — operations are quantified into trackable metrics. More importantly: every decision, tool call and send is recorded into a complete audit trail. What the AI did and why is fully traceable after the fact — not a black box.</p>
+          <div class="cc-tags"><span data-lang-zh>运营 / 发送成效</span><span data-lang-en>Ops & send analytics</span><span data-lang-zh>每步留痕</span><span data-lang-en>Every step logged</span><span data-lang-zh>完整审计链</span><span data-lang-en>Full audit trail</span></div>
+        </div>
+      </div>
+
+    </div>
+
+    <!-- 专属顾问引荐：辅助模式 -->
+    <div class="assist-banner reveal">
+      <div class="ab-ico"><svg viewBox="0 0 24 24" fill="none"><rect x="3" y="5" width="18" height="14" rx="2" stroke="currentColor" stroke-width="1.8"/><circle cx="9" cy="11" r="2.2" stroke="currentColor" stroke-width="1.7"/><path d="M5.5 16c.6-1.8 2-2.6 3.5-2.6s2.9.8 3.5 2.6M15 10h4M15 13.5h3" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></svg></div>
+      <div>
+        <span class="ab-badge" data-lang-zh>辅助模式 · 默认关闭</span><span class="ab-badge" data-lang-en>Assist mode · off by default</span>
+        <h4 data-lang-zh>需要真人临门一脚时，AI 会主动把顾问名片递过去</h4><h4 data-lang-en>When a human's final touch helps, the AI hands over an advisor card</h4>
+        <p data-lang-zh>有些生意到了签约、到店这一步，客户更想跟真人聊两句。开启「辅助模式」后，当 AI 判断客户契合你预先标注的引荐条件，它会主动把真人专属顾问的微信名片推给客户，自己退为辅助答疑。这是你显式配置、默认关闭的受控选项——名片由 AI 主动引荐，对话发起方仍是 AI，不改变"客户只跟 AI 对话"的底色。</p>
+        <p data-lang-en>Some deals reach a point — signing, an in-store visit — where the customer would rather speak with a real person. With "assist mode" on, when the AI judges a customer fits your pre-labeled referral conditions, it proactively pushes a human advisor's WeChat card and steps back to a support role. It's an explicit, off-by-default controlled option — the card is introduced by the AI, which remains the initiator, leaving the "customers talk to the AI" foundation intact.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ============ 主动维系：不等客户开口 ============ -->
+<section class="section reach-band">
+  <div class="hero-bg" aria-hidden="true"><div class="hero-glow" style="position:absolute;width:620px;height:620px;border-radius:50%;filter:blur(100px);opacity:.18;top:-150px;right:-90px;background:radial-gradient(circle,rgba(94,92,230,.45),transparent 70%)"></div><div class="hero-glow" style="position:absolute;width:500px;height:500px;border-radius:50%;filter:blur(100px);opacity:.15;bottom:-130px;left:-70px;background:radial-gradient(circle,rgba(15,181,168,.4),transparent 72%)"></div></div>
+  <div class="wrap" style="position:relative">
+    <div class="section-head reveal" style="max-width:840px">
+      <span class="eyebrow" data-lang-zh>不只是被动回话，更会主动维系</span><span class="eyebrow" data-lang-en>Not just replies — it keeps relationships warm</span>
+      <h2 class="h-section" data-lang-zh>真正的关系，<br><span class="text-grad">是在没事的时候也被记着</span></h2>
+      <h2 class="h-section" data-lang-en>Real relationships are kept warm <br><span class="text-grad">even when there's nothing to sell</span></h2>
+      <p class="lead" data-lang-zh>客户不开口，多数销售就想不起来。可感情恰恰是在"没事找你"的时刻攒下的。WeAgent 像一个永远记得每个人的运营官，会主动找合适的由头维系关系——重要的日子送上问候、该复购了温柔提醒、聊着聊着冷了就找个自然的话头唤回。这些不靠人记，由后台定时扫描自动发起。</p>
+      <p class="lead" data-lang-en>When customers go quiet, most reps simply forget them. Yet bonds are built precisely in the "reaching out for no reason" moments. WeAgent is like an operator who remembers everyone — it finds the right occasion to stay in touch: a greeting on the day that matters, a gentle nudge when it's time to reorder, a natural reopener when a chat has gone cold. None of it rides on human memory; background schedulers scan and initiate it automatically.</p>
+    </div>
+    <div class="reach-grid">
+
+      <!-- 纪念日 / 生日关怀 -->
+      <div class="reach-card reveal" style="--rc:#FFCB6B;--rc-bg:rgba(255,159,10,.16);--rc-bd:rgba(255,159,10,.3)">
+        <div class="reach-ico"><svg viewBox="0 0 24 24" fill="none"><path d="M5 10h14v9a1 1 0 01-1 1H6a1 1 0 01-1-1z" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/><path d="M3 10h18M12 10V6m0 0a2 2 0 11-1.5-3.3M12 6a2 2 0 101.5-3.3" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg></div>
+        <h4 data-lang-zh>重要的日子，替你记着</h4><h4 data-lang-en>It remembers the days that matter</h4>
+        <p data-lang-zh>聊天里客户随口提过的生日、相识纪念、重要日子，AI 会从对话中抽取并记进记忆卡。临近那一天，系统自动发起一次贴心问候——不是群发模板，而是结合这个人专属的由头。一句"今天是个特别的日子吧"，比一百条促销都暖。</p>
+        <p data-lang-en>A birthday, an anniversary, a meaningful date the customer mentioned in passing — the AI extracts it from the chat and saves it to the memory card. As the day nears, the system initiates a thoughtful greeting — not a mass template, but tied to that person's own occasion. One "today's a special day, isn't it?" beats a hundred promos.</p>
+        <span class="reach-when" data-lang-zh>临近当天 · 自动扫描</span><span class="reach-when" data-lang-en>Near the day · auto-scan</span>
+      </div>
+
+      <!-- 复购周期提醒 -->
+      <div class="reach-card reveal reveal-d1" style="--rc:#6FE0C8;--rc-bg:rgba(15,181,168,.16);--rc-bd:rgba(15,181,168,.3)">
+        <div class="reach-ico"><svg viewBox="0 0 24 24" fill="none"><path d="M20 12a8 8 0 10-2.3 5.6M20 12V7m0 5h-5" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg></div>
+        <h4 data-lang-zh>到点该回访了，恰到好处地出现</h4><h4 data-lang-en>Due for a check-in — showing up at just the right time</h4>
+        <p data-lang-zh>很多生意有天然的节奏：耗材该补了、季度该回访、用了一阵子该问问体验。系统结合购买阶段和时间节奏，在客户差不多该被想起的时候主动出现一次，把"反正他需要会自己来"的被动，变成稳稳接住的主动。（服务到期这类有明确时效的，见下方生命周期管理。）</p>
+        <p data-lang-en>Many businesses have a natural rhythm: supplies to restock, a quarterly check-in, a "how's it going" after a while. Combining purchase stage with timing, the system shows up right when the customer is about due to be remembered — turning "they'll come back if they need to" into reliably reaching out. (Time-bound service expiry is covered in lifecycle management below.)</p>
+        <span class="reach-when" data-lang-zh>按节奏 · 结合购买阶段</span><span class="reach-when" data-lang-en>By cadence · with purchase stage</span>
+      </div>
+
+      <!-- 沉默唤回 -->
+      <div class="reach-card reveal reveal-d2" style="--rc:#8FC4FF;--rc-bg:rgba(10,132,255,.16);--rc-bd:rgba(10,132,255,.3)">
+        <div class="reach-ico"><svg viewBox="0 0 24 24" fill="none"><path d="M21 11.5a8.4 8.4 0 01-11.3 7.9L3 21l1.6-6.7A8.4 8.4 0 1121 11.5z" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/><path d="M8.5 11.5h.01M12 11.5h.01M15.5 11.5h.01" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg></div>
+        <h4 data-lang-zh>聊冷了，找个自然话头唤回</h4><h4 data-lang-en>Gone cold? A natural reopener brings them back</h4>
+        <p data-lang-zh>关系最怕"上次聊完就没下文"。系统能识别很久没互动的客户，在合适的时机结合他的记忆卡找一个自然的由头重新开口——接着上次的话题，而不是硬邦邦地"在吗"。把快凉的关系，悄悄重新焐热。</p>
+        <p data-lang-en>The biggest risk to a relationship is "we talked once and it went nowhere." The system spots customers who've gone quiet and, at the right time, uses their memory card to open with a natural reason — picking up the last topic rather than a blunt "you there?" Quietly warming a cooling bond back up.</p>
+        <span class="reach-when" data-lang-zh>沉默时段 · 默认需开启</span><span class="reach-when" data-lang-en>Silent period · opt-in</span>
+      </div>
+
+    </div>
+
+    <div class="reach-guard reveal">
+      <span class="rg-ico" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none"><path d="M12 3l8 4v5c0 5-3.5 8-8 9-4.5-1-8-4-8-9V7l8-4z" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/><path d="M9 12l2 2 4-4" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+      <p data-lang-zh><b>主动，但绝不骚扰。</b>每一次主动触达都过同一套闸门：冷却时间、每日频控、最小间隔、安全门，还要先看这个人有没有未完成的跟进。情感关怀类触达默认关闭、需显式开启——销售场景不会被默认变成"节日轰炸"。靠的是记得住、挑对时机，而不是发得勤。</p>
+      <p data-lang-en><b>Proactive, never spammy.</b> Every outreach passes the same gates: cooldown, daily rate limits, minimum interval, safety checks — and it first checks whether the person already has a pending follow-up. Emotional-care outreach is off by default and opt-in, so sales scenarios never turn into "holiday bombing." It works by remembering and timing well, not by messaging often.</p>
+    </div>
+  </div>
+</section>
+
+<!-- ============ 客户生命周期管理 ============ -->
+<section class="section section-tint">
+  <div class="wrap">
+    <div class="section-head reveal">
+      <span class="eyebrow" data-lang-zh>从陌生到复购，全程被管理</span><span class="eyebrow" data-lang-en>From stranger to repeat buyer, managed end to end</span>
+      <h2 class="h-section" data-lang-zh>每个客户走到哪一步，<span class="text-grad">系统都心里有数</span></h2>
+      <h2 class="h-section" data-lang-en>Where each customer stands, <span class="text-grad">the system always knows</span></h2>
+      <p class="lead" data-lang-zh>客户不是一锤子买卖，而是一条有阶段的旅程：从还没买、到成交、到使用售后、到服务快到期、再到续费或复购。WeAgent 用统一的购买生命周期字典刻画每个人当前所处的阶段，并用已核实的成交记录做客观校准——LLM 推断的阶段和真实成交对不上时，以真实成交为准，绝不靠印象拍脑袋。</p>
+      <p class="lead" data-lang-en>A customer isn't a one-off sale but a staged journey: not yet bought, closed, in use and after-sales, service nearing expiry, then renewal or repurchase. WeAgent maps each person's current stage with a shared purchase-lifecycle taxonomy, calibrated against verified deal records — when the LLM's inferred stage conflicts with real deals, the real deal wins. Never a hunch.</p>
+    </div>
+
+    <div class="life-wrap reveal">
+      <div class="life-track">
+        <div class="life-node" style="--ln:var(--brand)">
+          <div class="life-dot"><svg viewBox="0 0 24 24" fill="none"><circle cx="12" cy="8" r="4" stroke="currentColor" stroke-width="1.8"/><path d="M5 20c0-3.5 3-6 7-6s7 2.5 7 6" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg></div>
+          <div class="life-stage">01 · not_purchased</div>
+          <h4 data-lang-zh>意向期</h4><h4 data-lang-en>Intent</h4>
+          <p data-lang-zh>还没成交，AI 持续了解需求、培育信任。</p><p data-lang-en>Not yet closed; the AI keeps learning needs and building trust.</p>
+        </div>
+        <div class="life-node" style="--ln:var(--ai)">
+          <div class="life-dot"><svg viewBox="0 0 24 24" fill="none"><path d="M5 13l4 4L19 7" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></div>
+          <div class="life-stage">02 · purchased</div>
+          <h4 data-lang-zh>已购期</h4><h4 data-lang-en>Purchased</h4>
+          <p data-lang-zh>成交记录入账，客户持有什么一清二楚。</p><p data-lang-en>The deal is booked; what they hold is crystal clear.</p>
+        </div>
+        <div class="life-node" style="--ln:var(--scheduled)">
+          <div class="life-dot"><svg viewBox="0 0 24 24" fill="none"><path d="M12 3l8 4v5c0 5-3.5 8-8 9-4.5-1-8-4-8-9V7l8-4z" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/><path d="M9 12l2 2 4-4" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"/></svg></div>
+          <div class="life-stage">03 · aftercare</div>
+          <h4 data-lang-zh>售后期</h4><h4 data-lang-en>Aftercare</h4>
+          <p data-lang-zh>陪伴使用、答疑、积累口碑与信任。</p><p data-lang-en>Supporting usage, answering questions, earning trust.</p>
+        </div>
+        <div class="life-node is-alert" style="--ln:var(--held)">
+          <div class="life-dot"><svg viewBox="0 0 24 24" fill="none"><path d="M12 8v4l3 2" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"/><circle cx="12" cy="12" r="9" stroke="currentColor" stroke-width="1.8"/></svg></div>
+          <div class="life-stage">04 · expiring</div>
+          <h4 data-lang-zh>快到期</h4><h4 data-lang-en>Expiring soon</h4>
+          <p data-lang-zh>服务/会员临近到期，提前主动提醒续费。</p><p data-lang-en>Service nearing expiry; proactively nudged ahead of time.</p>
+        </div>
+        <div class="life-node" style="--ln:var(--blocked)">
+          <div class="life-dot"><svg viewBox="0 0 24 24" fill="none"><path d="M20 12a8 8 0 10-2.3 5.6M20 12V7m0 5h-5" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg></div>
+          <div class="life-stage">05 · repurchase</div>
+          <h4 data-lang-zh>续费 / 复购</h4><h4 data-lang-en>Renew / repurchase</h4>
+          <p data-lang-zh>推进续费或复购；过期短期内仍主动挽留。</p><p data-lang-en>Drives renewal or repurchase; still wins back just after expiry.</p>
+        </div>
+      </div>
+
+      <div class="life-alert reveal">
+        <div class="la-ico"><svg viewBox="0 0 24 24" fill="none"><path d="M12 3v2M12 8a6 6 0 00-6 6c0 3-1 4-2 5h16c-1-1-2-2-2-5a6 6 0 00-6-6zM9.5 21a2.5 2.5 0 005 0" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg></div>
+        <div>
+          <h4 data-lang-zh>服务快到期？提前提醒，不等流失才后悔</h4><h4 data-lang-en>Service about to expire? Reminded early — not after they're gone</h4>
+          <p data-lang-zh>会员、订阅、年卡、合约这类有时效的服务，最怕到期那天客户悄无声息地走了。系统从已核实的成交里算出每个客户的到期时间，在到期前的一段窗口主动发起续费推进；就算刚过期，短期内也还会主动挽留一把。永久有效、没有到期时间的产品则永远不会被提醒打扰——只在真正该提醒时才开口。</p>
+          <p data-lang-en>Memberships, subscriptions, annual cards, contracts — time-bound services where the worst case is a customer slipping away silently on expiry day. The system computes each customer's expiry from verified deals and proactively drives renewal within a window before it lapses; even just after expiry, it still makes a short-lived win-back attempt. Products with no expiry are never nagged — it only speaks up when a reminder is genuinely due.</p>
+          <span class="la-win" data-lang-zh>到期前主动推进 · 过期短期挽留 · 永久产品不打扰</span><span class="la-win" data-lang-en>Pre-expiry push · brief post-expiry win-back · never nags lifetime products</span>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ============ 交给它，会不会闯祸 ============ -->
+<section class="section safe-band">
+  <div class="hero-bg" aria-hidden="true"><div class="hero-glow" style="position:absolute;width:620px;height:620px;border-radius:50%;filter:blur(100px);opacity:.18;top:-150px;left:-90px;background:radial-gradient(circle,rgba(48,209,88,.34),transparent 70%)"></div><div class="hero-glow" style="position:absolute;width:500px;height:500px;border-radius:50%;filter:blur(100px);opacity:.15;bottom:-130px;right:-70px;background:radial-gradient(circle,rgba(15,181,168,.4),transparent 72%)"></div></div>
+  <div class="wrap" style="position:relative">
+    <div class="section-head reveal" style="max-width:840px">
+      <span class="eyebrow" data-lang-zh>把客户交出去，最怕的就是出岔子</span><span class="eyebrow" data-lang-en>Handing over customers, the real fear is a slip-up</span>
+      <h2 class="h-section" data-lang-zh>它替你说话，<br><span class="text-grad">不会替你闯祸</span></h2>
+      <h2 class="h-section" data-lang-en>It speaks for you — <br><span class="text-grad">without getting you in trouble</span></h2>
+      <p class="lead" data-lang-zh>让 AI 直接面对客户，老板心里都有几个"万一"：万一发太勤被封号、万一抽风重复发、万一后台报错客户看见一堆乱码、万一一句话说错就发出去了。WeAgent 把这些"万一"做成了系统里实打实的护栏——下面每一条都对应真实存在的发送闸门与兜底机制。</p>
+      <p class="lead" data-lang-en>Letting an AI face customers directly, every owner has a few "what ifs": what if it messages too often and gets the account banned, what if it glitches and double-sends, what if a backend error shows the customer gibberish, what if one wrong line goes out. WeAgent turns those "what ifs" into real guardrails in the system — each below maps to an actual send gate or fallback.</p>
+    </div>
+    <div class="safe-grid">
+
+      <!-- 防封号 -->
+      <div class="safe-card reveal" style="--sc:var(--running);--sc-bg:rgba(48,209,88,.16);--sc-bd:rgba(48,209,88,.3)">
+        <div class="safe-ico"><svg viewBox="0 0 24 24" fill="none"><path d="M12 3l8 4v5c0 5-3.5 8-8 9-4.5-1-8-4-8-9V7l8-4z" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/><path d="M12 8v4M12 15v.5" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg></div>
+        <div class="safe-fear" data-lang-zh>万一发太勤，号被封了怎么办</div><div class="safe-fear" data-lang-en>What if it messages too much and gets banned</div>
+        <h4 data-lang-zh>发消息像真人，不机关枪式连发</h4><h4 data-lang-en>It paces like a person, not a machine gun</h4>
+        <p data-lang-zh>每个账号有最小发送间隔加随机抖动，绝不背靠背零间隔狂发；主动触达还要过"必须等客户先回""连续触达上限""每日触达上限""冷却期"等多道节制门。背靠背连发是最典型的机器特征，它从根上避开。</p>
+        <p data-lang-en>Each account has a minimum send interval with random jitter — never back-to-back blasting; proactive touches also pass "wait for the customer to reply first," a consecutive-touch cap, a daily cap and a cooldown. Back-to-back sending is the classic bot tell, and it avoids it by design.</p>
+        <span class="safe-line" data-lang-zh>最小间隔 + 抖动 · 多道节制门</span><span class="safe-line" data-lang-en>Min interval + jitter · multiple gates</span>
+      </div>
+
+      <!-- 不重复发 -->
+      <div class="safe-card reveal reveal-d1" style="--sc:var(--scheduled);--sc-bg:rgba(10,132,255,.16);--sc-bd:rgba(10,132,255,.3)">
+        <div class="safe-ico"><svg viewBox="0 0 24 24" fill="none"><path d="M4 9V7a2 2 0 012-2h10M20 15v2a2 2 0 01-2 2H8" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/><path d="M16 2l4 3-4 3M8 22l-4-3 4-3" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg></div>
+        <div class="safe-fear" data-lang-zh>万一系统抽风，同一句连发好几遍</div><div class="safe-fear" data-lang-en>What if it glitches and sends the same line twice</div>
+        <h4 data-lang-zh>同一句话，绝不重复砸给客户</h4><h4 data-lang-en>The same message never lands twice</h4>
+        <p data-lang-zh>每条要发的消息都带一个唯一的幂等键，经持久化发件箱发出。哪怕服务器中途崩了重启，它也会先回头核对这条到底发出去没有，确认没发才补发——绝不会让客户连收两三条一模一样的话，在你面前显得像出故障的机器人。</p>
+        <p data-lang-en>Every outgoing message carries a unique idempotency key and goes through a persistent outbox. Even if the server crashes and restarts mid-way, it first checks whether that message actually went out, and only resends if it didn't — so customers never get the same line two or three times, and you never look like a malfunctioning bot.</p>
+        <span class="safe-line" data-lang-zh>幂等键 · 崩溃先核对再补发</span><span class="safe-line" data-lang-en>Idempotency key · verify-then-resend</span>
+      </div>
+
+      <!-- fail-soft -->
+      <div class="safe-card reveal" style="--sc:var(--ai);--sc-bg:rgba(15,181,168,.16);--sc-bd:rgba(15,181,168,.3)">
+        <div class="safe-ico"><svg viewBox="0 0 24 24" fill="none"><path d="M12 3v6m0 0l-2.5-2.5M12 9l2.5-2.5" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/><path d="M4 13h4l2 4 4-10 2 6h4" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg></div>
+        <div class="safe-fear" data-lang-zh>万一后台报错，客户看见一堆乱码</div><div class="safe-fear" data-lang-en>What if a backend error shows the customer gibberish</div>
+        <h4 data-lang-zh>后台出点状况，客户那头照常</h4><h4 data-lang-en>A hiccup backstage, business as usual up front</h4>
+        <p data-lang-zh>大模型偶尔会超时、抽风，预算偶尔会触顶。这些都被挡在面向客户的对话链路之外——异常在后台被接住、降级处理，绝不把报错或乱码抛到客户那一侧。客户看到的，永远是一个稳定、正常说话的它。</p>
+        <p data-lang-en>Large models occasionally time out or glitch, and budgets occasionally hit their ceiling. All of it is kept off the customer-facing conversation path — exceptions are caught and gracefully degraded in the background, never surfacing an error or garbled text to the customer. What they see is always a stable, normally-speaking assistant.</p>
+        <span class="safe-line" data-lang-zh>入站链路 fail-soft · 异常后台消化</span><span class="safe-line" data-lang-en>Fail-soft inbound path · degrade quietly</span>
+      </div>
+
+      <!-- 第二个大脑 -->
+      <div class="safe-card reveal reveal-d1" style="--sc:var(--brand-2);--sc-bg:rgba(124,107,255,.18);--sc-bd:rgba(124,107,255,.32)">
+        <div class="safe-ico"><svg viewBox="0 0 24 24" fill="none"><path d="M9 3a3 3 0 00-3 3 3 3 0 00-1 5.8M9 3a2.5 2.5 0 012.5 2.5v13A2.5 2.5 0 019 21a3 3 0 01-3-3 3 3 0 01-1-5.8" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/><path d="M15 3a3 3 0 013 3 3 3 0 011 5.8M15 3a2.5 2.5 0 00-2.5 2.5M18 18a3 3 0 01-3 3 2.5 2.5 0 01-2.5-2.5" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/></svg></div>
+        <div class="safe-fear" data-lang-zh>万一 AI 一时糊涂，说错话就发了</div><div class="safe-fear" data-lang-en>What if the AI slips and a wrong line goes out</div>
+        <h4 data-lang-zh>重要的话发出前，先过独立一审</h4><h4 data-lang-en>Important lines pass an independent review first</h4>
+        <p data-lang-zh>写回复的和挑错的不是同一个大脑。回复先交给一个独立的评审环节，按拟真度、情绪价值、事实风险、压力感等多个维度打分——而且它故意看不到起草那一方的内部思路，只独立判断这句话能不能发，可放行、可打回重写、可直接拦截。高风险或拿不准的回复必经此审，还可选开启第二个独立模型并行交叉评审。</p>
+        <p data-lang-en>The one who writes and the one who checks aren't the same brain. Each reply first goes to an independent review step scored on human-likeness, emotional value, fact risk, pressure and more — and it deliberately can't see the drafter's inner reasoning, judging only whether the line is safe to send: pass, send back for a rewrite, or block outright. High-risk or low-confidence replies always go through it, and you can optionally enable a second independent model for parallel cross-review.</p>
+        <span class="safe-line" data-lang-zh>认知隔离评审 · 可选双模型交叉</span><span class="safe-line" data-lang-en>Isolated review · optional dual-model</span>
+      </div>
+
+    </div>
+
+    <div class="safe-note reveal">
+      <span class="sn-ico" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none"><circle cx="12" cy="12" r="9" stroke="currentColor" stroke-width="1.8"/><path d="M12 8v5M12 16v.5" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg></span>
+      <p data-lang-zh><b>实话实说：没人能保证"永远不被封"。</b>平台规则一直在变，谁承诺百分百都是不负责任。我们能做的，是让它的行为尽量不像机器——有节奏、有节制、不背靠背骚扰、出错不外溢。这些都是工程上看得见、可核对的守门，不是营销话术。</p>
+      <p data-lang-en><b>Honestly: no one can guarantee "never banned."</b> Platform rules keep changing, and any 100% promise is irresponsible. What we can do is make its behavior as un-robotic as possible — paced, restrained, never back-to-back, errors contained. These are visible, verifiable engineering guardrails, not marketing copy.</p>
+    </div>
+  </div>
+</section>
+
+<!-- ============ 数据与资产归属 ============ -->
+<section class="section section-tint">
+  <div class="wrap">
+    <div class="section-head reveal">
+      <span class="eyebrow" data-lang-zh>这套系统，主动权在你</span><span class="eyebrow" data-lang-en>This system answers to you</span>
+      <h2 class="h-section" data-lang-zh>你的数据、你的模型、你的客户，<span class="text-grad">始终是你的</span></h2>
+      <h2 class="h-section" data-lang-en>Your data, your model, your customers — <span class="text-grad">always yours</span></h2>
+      <p class="lead" data-lang-zh>把生意交给一套系统，最该问清楚的是：数据会不会被拿走、会不会被某个供应商卡脖子、花销能不能控制得住、我说了到底还算不算数。WeAgent 在这几件事上，把主动权牢牢留在你这边。</p>
+      <p class="lead" data-lang-en>Before handing your business to any system, the questions that matter most are: will my data be taken, will some vendor hold me hostage, can spend be kept in check, and does my word still stand. On all of these, WeAgent keeps the control firmly on your side.</p>
+    </div>
+    <div class="own-grid">
+
+      <!-- 私有部署 + 换模型 -->
+      <div class="own-card reveal" style="--oc:var(--brand)">
+        <div class="own-ico"><svg viewBox="0 0 24 24" fill="none"><rect x="3" y="4" width="18" height="6" rx="1.6" stroke="currentColor" stroke-width="1.8"/><rect x="3" y="14" width="18" height="6" rx="1.6" stroke="currentColor" stroke-width="1.8"/><path d="M7 7h.01M7 17h.01" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"/></svg></div>
+        <div class="own-body">
+          <h4 data-lang-zh>数据留在你手里，模型随时可换</h4><h4 data-lang-en>Data stays with you, the model swaps anytime</h4>
+          <p data-lang-zh>系统对接通用的大模型协议，可以指向你自己托管的私有模型端点——代码、数据、模型都能留在你自己的服务器，不必交给第三方。想换底层大模型？在后台切换即时生效、不用重启停机，永远不被某一家供应商绑死。</p>
+          <p data-lang-en>The system speaks a standard large-model protocol and can point at your own self-hosted model endpoint — code, data and model can all live on your own servers, handed to no third party. Want to switch the underlying model? Do it in the console and it takes effect instantly, no restart or downtime — never locked to one vendor.</p>
+          <div class="own-tags"><span data-lang-zh>兼容协议</span><span data-lang-en>Standard protocol</span><span data-lang-zh>私有化端点</span><span data-lang-en>Self-hosted endpoint</span><span data-lang-zh>后台热切换不停机</span><span data-lang-en>Hot-swap, no downtime</span></div>
+        </div>
+      </div>
+
+      <!-- 多账号隔离 -->
+      <div class="own-card reveal reveal-d1" style="--oc:var(--scheduled);--oc-bg:rgba(10,132,255,.1);--oc-bd:rgba(10,132,255,.22)">
+        <div class="own-ico"><svg viewBox="0 0 24 24" fill="none"><rect x="3" y="4" width="7" height="7" rx="1.5" stroke="currentColor" stroke-width="1.8"/><rect x="14" y="4" width="7" height="7" rx="1.5" stroke="currentColor" stroke-width="1.8"/><rect x="3" y="14" width="7" height="6" rx="1.5" stroke="currentColor" stroke-width="1.8"/><rect x="14" y="14" width="7" height="6" rx="1.5" stroke="currentColor" stroke-width="1.8"/></svg></div>
+        <div class="own-body">
+          <h4 data-lang-zh>多个微信号一套后台，数据互不串台</h4><h4 data-lang-en>Many WeChat accounts, one console, zero cross-talk</h4>
+          <p data-lang-zh>不是一个号一套系统。多个微信号、多条业务线、多个团队，一个后台统一管，但数据按"租户 + 账号"双重边界严格隔开，接口层强制按你的登录归属过滤，跨边界访问一律挡回。号多了照样顾得过来，彼此的客户也绝不串台。</p>
+          <p data-lang-en>Not one system per account. Multiple WeChat accounts, business lines and teams are managed from one console, yet data is strictly separated by a dual "tenant + account" boundary, with the API forcibly filtering by your login scope and blocking any cross-boundary access. Scale up the accounts and still keep up — their customers never bleed into each other.</p>
+          <div class="own-tags"><span data-lang-zh>租户 + 账号双键</span><span data-lang-en>Tenant + account keys</span><span data-lang-zh>跨边界即挡回</span><span data-lang-en>Cross-boundary blocked</span><span data-lang-zh>一处统管</span><span data-lang-en>One console</span></div>
+        </div>
+      </div>
+
+      <!-- 手动标签改不动 -->
+      <div class="own-card reveal" style="--oc:var(--ai);--oc-bg:rgba(15,181,168,.1);--oc-bd:rgba(15,181,168,.22)">
+        <div class="own-ico"><svg viewBox="0 0 24 24" fill="none"><path d="M3 7l2.5-2.5a2 2 0 011.4-.6H12l8 8-7 7-8-8V7z" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/><circle cx="8" cy="9" r="1.4" fill="currentColor"/><path d="M14 10l-3 3" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></svg></div>
+        <div class="own-body">
+          <h4 data-lang-zh>你手标的判断，AI 永远改不动</h4><h4 data-lang-en>Your hand-set tags, the AI can never overwrite</h4>
+          <p data-lang-zh>你对一个客户的亲手判断（手动标签）存在独立的"运营权威层"。AI 的所有自动写回，在代码层面只能写它自己的字段，物理上根本碰不到你手标的内容——它的猜测最多放在一旁给你参考，绝不会拿去覆盖你说了算的判断，也不会拿没证据的猜测去驱动行动。</p>
+          <p data-lang-en>Your own call on a customer (manual tags) sits in a separate "operator-authority layer." Every automatic write by the AI can, at the code level, only touch its own fields — it physically cannot reach what you hand-labeled. Its guesses sit aside for your reference at most, never overwriting the call that's yours, and never driving action on an evidence-free hunch.</p>
+          <div class="own-tags"><span data-lang-zh>运营权威层</span><span data-lang-en>Operator-authority layer</span><span data-lang-zh>AI 写路径触不到</span><span data-lang-en>Out of AI's write path</span><span data-lang-zh>猜测不驱动决策</span><span data-lang-en>Guesses don't drive action</span></div>
+        </div>
+      </div>
+
+      <!-- 成本可控 -->
+      <div class="own-card reveal reveal-d1" style="--oc:var(--running);--oc-bg:rgba(48,209,88,.1);--oc-bd:rgba(48,209,88,.22)">
+        <div class="own-ico"><svg viewBox="0 0 24 24" fill="none"><circle cx="12" cy="12" r="9" stroke="currentColor" stroke-width="1.8"/><path d="M12 7v10M9.5 9.2c0-1 1.1-1.7 2.5-1.7s2.5.6 2.5 1.7-1.1 1.6-2.5 1.6-2.5.7-2.5 1.7 1.1 1.7 2.5 1.7 2.5-.7 2.5-1.7" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg></div>
+        <div class="own-body">
+          <h4 data-lang-zh>花了多少清清楚楚，不会偷偷烧钱</h4><h4 data-lang-en>Every cost is visible — no silent burn</h4>
+          <p data-lang-zh>每一次模型调用都被记账，花在哪、花了多少有据可查。每一次决策会话还设了 token 量和调用次数的硬上限，到顶就自动降级处理，而不是不管不顾地一直烧。AI 产品最怕"账单不可控"，这里把它做成看得见、有封顶的明白账。</p>
+          <p data-lang-en>Every model call is metered — where and how much was spent is on the record. Each decision session also has a hard ceiling on tokens and call count; at the ceiling it gracefully degrades instead of burning on unchecked. The classic fear with AI products is an uncontrollable bill — here it's a visible, capped, plain-to-read account.</p>
+          <div class="own-tags"><span data-lang-zh>每次调用落账</span><span data-lang-en>Every call metered</span><span data-lang-zh>单次会话硬上限</span><span data-lang-en>Per-session ceiling</span><span data-lang-zh>到顶自动降级</span><span data-lang-en>Degrades at ceiling</span></div>
+        </div>
+      </div>
+
+    </div>
+  </div>
+</section>
+
+<!-- ============ 谁该看这一页 ============ -->
+<section class="section">
+  <div class="wrap">
+    <div class="section-head reveal">
+      <span class="eyebrow" data-lang-zh>这是给谁做的</span><span class="eyebrow" data-lang-en>Who it's for</span>
+      <h2 class="h-section" data-lang-zh>如果你正被这些问题困住</h2>
+      <h2 class="h-section" data-lang-en>If any of these sound like you</h2>
+    </div>
+    <div class="who-grid">
+      <div class="who-card reveal">
+        <div class="who-ico"><svg viewBox="0 0 24 24" fill="none"><path d="M3 21v-2a4 4 0 014-4h6a4 4 0 014 4v2" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/><circle cx="10" cy="7" r="4" stroke="currentColor" stroke-width="1.8"/><path d="M19 8l2 2 3-3" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" opacity=".5"/></svg></div>
+        <h4 data-lang-zh>企业主 / 老板</h4><h4 data-lang-en>Founders & owners</h4>
+        <p data-lang-zh>怕客户资产攥在个别员工手里，怕人一走客户就流失。想让客户真正属于公司，而不是属于销售。</p>
+        <p data-lang-en>Worried customer assets are locked in a few employees, and that churn follows their exits. You want customers to belong to the company, not to a rep.</p>
+      </div>
+      <div class="who-card reveal reveal-d1">
+        <div class="who-ico"><svg viewBox="0 0 24 24" fill="none"><path d="M4 19V5M4 19h16M8 16l3-4 3 2 4-6" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg></div>
+        <h4 data-lang-zh>私域 / 运营负责人</h4><h4 data-lang-en>Private-domain & ops leads</h4>
+        <p data-lang-zh>几千上万好友维护不过来，跟进总有遗漏，复购转化提不上去。想要稳定、不漏人、可衡量的长期经营。</p>
+        <p data-lang-en>Tens of thousands of contacts you can't keep up with, follow-ups that slip, repeat-purchase rates that won't climb. You want steady, no-one-left-behind, measurable nurturing.</p>
+      </div>
+      <div class="who-card reveal reveal-d2">
+        <div class="who-ico"><svg viewBox="0 0 24 24" fill="none"><path d="M21 15a2 2 0 01-2 2H7l-4 4V5a2 2 0 012-2h14a2 2 0 012 2z" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/><path d="M8 9h8M8 12h5" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg></div>
+        <h4 data-lang-zh>销售团队管理者</h4><h4 data-lang-en>Sales managers</h4>
+        <p data-lang-zh>团队服务水平参差不齐，新人上手慢、老客户被冷落。想要一致、可复制、不依赖个人状态的服务质量。</p>
+        <p data-lang-en>Uneven service across the team, slow ramp for new hires, neglected long-time customers. You want consistent, repeatable quality that doesn't hinge on any one person's day.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ============ 诚实边界 ============ -->
+<section class="section section-tint">
+  <div class="wrap">
+    <div class="bound-banner reveal">
+      <div class="bb-ico"><svg viewBox="0 0 24 24" fill="none"><path d="M12 3l8 4v5c0 5-3.5 8-8 9-4.5-1-8-4-8-9V7l8-4z" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/><path d="M9 12l2 2 4-4" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></div>
+      <div>
+        <h4 data-lang-zh>我们只承诺做得到的</h4><h4 data-lang-en>We only promise what it actually does</h4>
+        <p data-lang-zh>WeAgent 不是魔法，它是一套有明确边界的工程系统。主动重激活等能力默认需要显式开启；产品类回答必须有知识库依据，没依据时它宁可保守也不瞎编；任何画像和记忆，找不到证据就不假装知道。这一页讲的每一条，都对应系统里真实存在的能力——具体到代码与行号，可以在「工程深度」页逐一核对。</p>
+        <p data-lang-en>WeAgent isn't magic — it's an engineered system with clear boundaries. Capabilities like proactive reactivation are off until explicitly enabled; product answers must be backed by the knowledge base, and absent evidence it stays conservative rather than making things up; no profile or memory is assumed without evidence. Every claim here maps to a capability that really exists — down to the code and line number, verifiable on the Engineering page.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ============ 结尾 CTA ============ -->
+<section class="section cta-band">
+  <div class="hero-bg" aria-hidden="true">
+    <div class="hero-glow" style="position:absolute;width:560px;height:560px;border-radius:50%;filter:blur(90px);opacity:.42;top:-160px;left:-80px;background:radial-gradient(circle,rgba(94,92,230,.5),transparent 68%)"></div>
+    <div class="hero-glow" style="position:absolute;width:460px;height:460px;border-radius:50%;filter:blur(90px);opacity:.32;bottom:-120px;right:-60px;background:radial-gradient(circle,rgba(10,132,255,.42),transparent 70%)"></div>
+  </div>
+  <div class="wrap cta-inner reveal">
+    <h2 class="h-section" data-lang-zh>让客户资产，<span class="text-grad">真正长在企业身上</span></h2>
+    <h2 class="h-section" data-lang-en>Let customer assets <span class="text-grad">truly belong to the company</span></h2>
+    <p class="lead" data-lang-zh>不用再担心谁离职、谁忘了跟进、谁记不住客户。一个不下班、不遗忘、不会被带走的 AI 运营官，替你把每段关系长期经营下去。</p>
+    <p class="lead" data-lang-en>Stop worrying about who quits, who forgot to follow up, who can't remember a customer. An AI operator that never clocks out, never forgets, and can't be walked out the door — nurturing every relationship for the long run.</p>
+    <div class="hero-cta">
+      <button class="btn btn-primary" data-wx="agimeme" type="button">
+        <svg viewBox="0 0 24 24" fill="none"><path d="M8.5 14.5c-3 0-5.5-2-5.5-4.6C3 7 5.8 5 9 5s6 2 6 4.9c0 .5-.1 1-.3 1.5M16 19c2.2 0 4-1.4 4-3.3 0-1.9-1.8-3.4-4-3.4s-4 1.5-4 3.4c0 .6.2 1.2.6 1.7L12 19l1.6-.5c.7.3 1.5.5 2.4.5z" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        <span data-lang-zh>加顾问微信 <span class="wx-id">agimeme</span></span><span data-lang-en>Add us on WeChat <span class="wx-id">agimeme</span></span>
+      </button>
+      <a href="product.html" class="btn btn-ghost"><span data-lang-zh>看完整产品能力</span><span data-lang-en>See full product</span></a>
+      <a href="engineering.html" class="btn btn-ghost"><span data-lang-zh>技术负责人看这里</span><span data-lang-en>For technical leads</span></a>
+    </div>
+  </div>
+</section>
+
+<!-- ============ 页脚 ============ -->
+<footer class="footer">
+  <div class="wrap">
+    <div class="footer-grid">
+      <div class="footer-brand">
+        <a href="index.html" class="brand"><span class="brand-mark"><svg viewBox="0 0 64 64" fill="none"><path fill="#fff" fill-rule="evenodd" clip-rule="evenodd" d="M18.5 7 H45.5 Q57.5 7 57.5 19 V33 Q57.5 45 45.5 45 H24 L13 57 V44.4 Q6.5 43 6.5 33 V19 Q6.5 7 18.5 7 Z M14 15.5 L20.2 38 L31 23 L33 23 L43.8 38 L50 15.5 L44.3 15.5 L40.4 31 L33.4 21 L30.6 21 L23.6 31 L19.7 15.5 Z M47 6.1 C47 12.02 46 13.5 42 13.5 C46 13.5 47 14.98 47 20.9 C47 14.98 48 13.5 52 13.5 C48 13.5 47 12.02 47 6.1 Z"/></svg></span>WeAgent</a>
+        <p data-lang-zh>全自治微信私域 AI 运营系统。客户永远只跟 AI 对话，AI 像真人一样长期经营每一段关系。</p>
+        <p data-lang-en>The autonomous WeChat private-domain AI operator. Customers only ever talk to the AI, which nurtures every relationship over time.</p>
+        <button class="wx-copy" data-wx="agimeme" type="button">
+          <svg viewBox="0 0 24 24" fill="none"><path d="M8.5 14.5c-3 0-5.5-2-5.5-4.6C3 7 5.8 5 9 5s6 2 6 4.9c0 .5-.1 1-.3 1.5M16 19c2.2 0 4-1.4 4-3.3 0-1.9-1.8-3.4-4-3.4s-4 1.5-4 3.4c0 .6.2 1.2.6 1.7L12 19l1.6-.5c.7.3 1.5.5 2.4.5z" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          <span data-lang-zh>顾问微信 <span class="wx-id">agimeme</span></span><span data-lang-en>WeChat <span class="wx-id">agimeme</span></span>
+          <span class="wx-hint" data-lang-zh>点击复制</span><span class="wx-hint" data-lang-en>tap to copy</span>
+        </button>
+      </div>
+      <div>
+        <h5 data-lang-zh>产品</h5><h5 data-lang-en>Product</h5>
+        <div class="footer-links">
+          <a href="solutions.html" data-lang-zh>解决什么问题</a><a href="solutions.html" data-lang-en>What it solves</a>
+          <a href="product.html" data-lang-zh>产品能力</a><a href="product.html" data-lang-en>Product</a>
+          <a href="agents.html" data-lang-zh>智能体编队</a><a href="agents.html" data-lang-en>Agents</a>
+          <a href="scenarios.html" data-lang-zh>行业场景</a><a href="scenarios.html" data-lang-en>Scenarios</a>
+        </div>
+      </div>
+      <div>
+        <h5 data-lang-zh>技术</h5><h5 data-lang-en>Technology</h5>
+        <div class="footer-links">
+          <a href="technology.html" data-lang-zh>技术架构</a><a href="technology.html" data-lang-en>Architecture</a>
+          <a href="engineering.html" data-lang-zh>工程深度</a><a href="engineering.html" data-lang-en>Engineering depth</a>
+          <a href="evolution.html" data-lang-zh>自我演化</a><a href="evolution.html" data-lang-en>Self-evolution</a>
+        </div>
+      </div>
+      <div>
+        <h5 data-lang-zh>信任</h5><h5 data-lang-en>Trust</h5>
+        <div class="footer-links">
+          <a href="observability.html" data-lang-zh>运营透视</a><a href="observability.html" data-lang-en>Observability</a>
+          <a href="trust.html" data-lang-zh>信任与安全</a><a href="trust.html" data-lang-en>Trust & safety</a>
+          <a href="trust.html#redlines" data-lang-zh>红线与守门</a><a href="trust.html#redlines" data-lang-en>Hard lines</a>
+          <a href="trust.html#audit" data-lang-zh>可审计性</a><a href="trust.html#audit" data-lang-en>Auditability</a>
+        </div>
+      </div>
+    </div>
+    <div class="footer-bottom">
+      <span>© 2026 WeAgent · <span data-lang-zh>私域自主运营</span><span data-lang-en>Autonomous private-domain operations</span></span>
+      <span data-lang-zh>构建于 2026-06-28 · 由 Claude Code 根据项目代码生成 · by opus-4.8 · 11 万行 Rust 代码 · 比例 100%</span><span data-lang-en>Built 2026-06-28 · generated by Claude Code from the project codebase · by opus-4.8 · 110k+ lines of Rust · 100% generated</span>
+      <span data-lang-zh>Rust · Axum · MongoDB · React · MCP</span>
+      <span data-lang-en>Built with Rust · Axum · MongoDB · React · MCP</span>
+    </div>
+  </div>
+</footer>
+
+<script src="assets/i18n.js"></script>
+<script src="assets/shared.js"></script>
+</body>
+</html>

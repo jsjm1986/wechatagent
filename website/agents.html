@@ -1,0 +1,679 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title data-zh="智能体编队 · WeAgent" data-en="The agent fleet · WeAgent">智能体编队 · WeAgent</title>
+<meta name="description" content="WeAgent 不是单个大模型在硬扛，而是一支分工明确、认知隔离的智能体编队：回复决策、独立评审、用户反应分析、长期记忆固化、知识库自治、配置生成、管理编排、请示通道、自我演化——20+ 个 LLM 驱动的 Agent 各司其职，由确定性编排器自主调度，串成一条从消息进来到回复发出的完整流程。每个 Agent 都对应真实 Rust 代码里的 prompt_key。">
+<link rel="canonical" href="https://weagent.example.com/agents.html">
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="WeAgent">
+<meta property="og:locale" content="zh_CN">
+<meta property="og:locale:alternate" content="en_US">
+<meta property="og:title" content="智能体编队 · WeAgent">
+<meta property="og:description" content="不是单个大模型在硬扛，而是一支分工明确、认知隔离的智能体编队：20+ 个 LLM 驱动的 Agent 各司其职，由确定性编排器自主调度，串成完整运营流程。每个都对应真实代码。">
+<meta property="og:url" content="https://weagent.example.com/agents.html">
+<meta property="og:image" content="https://weagent.example.com/assets/og-cover.png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="WeAgent — 全自治微信私域 AI 运营">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="智能体编队 · WeAgent">
+<meta name="twitter:description" content="一支分工明确、认知隔离的智能体编队，20+ 个 Agent 各司其职串成完整运营流程——每个都对应真实代码。">
+<meta name="twitter:image" content="https://weagent.example.com/assets/og-cover.png">
+<link rel="stylesheet" href="assets/shared.css">
+<link rel="stylesheet" href="assets/agents.css">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='18' fill='%235E5CE6'/%3E%3Cpath fill='%23fff' fill-rule='evenodd' clip-rule='evenodd' d='M18.5 7 H45.5 Q57.5 7 57.5 19 V33 Q57.5 45 45.5 45 H24 L13 57 V44.4 Q6.5 43 6.5 33 V19 Q6.5 7 18.5 7 Z M14 15.5 L20.2 38 L31 23 L33 23 L43.8 38 L50 15.5 L44.3 15.5 L40.4 31 L33.4 21 L30.6 21 L23.6 31 L19.7 15.5 Z M47 6.1 C47 12.02 46 13.5 42 13.5 C46 13.5 47 14.98 47 20.9 C47 14.98 48 13.5 52 13.5 C48 13.5 47 12.02 47 6.1 Z'/%3E%3C/svg%3E">
+</head>
+<body>
+
+<!-- ============ 导航 ============ -->
+<nav class="nav">
+  <div class="wrap nav-inner">
+    <a href="index.html" class="brand">
+      <span class="brand-mark"><svg viewBox="0 0 64 64" fill="none"><path fill="#fff" fill-rule="evenodd" clip-rule="evenodd" d="M18.5 7 H45.5 Q57.5 7 57.5 19 V33 Q57.5 45 45.5 45 H24 L13 57 V44.4 Q6.5 43 6.5 33 V19 Q6.5 7 18.5 7 Z M14 15.5 L20.2 38 L31 23 L33 23 L43.8 38 L50 15.5 L44.3 15.5 L40.4 31 L33.4 21 L30.6 21 L23.6 31 L19.7 15.5 Z M47 6.1 C47 12.02 46 13.5 42 13.5 C46 13.5 47 14.98 47 20.9 C47 14.98 48 13.5 52 13.5 C48 13.5 47 12.02 47 6.1 Z"/></svg></span>
+      WeAgent
+    </a>
+    <div class="nav-links">
+      <a href="index.html" data-lang-zh>首页</a><a href="index.html" data-lang-en>Home</a>
+      <a href="solutions.html" data-lang-zh>解决什么</a><a href="solutions.html" data-lang-en>Solutions</a>
+      <a href="product.html" data-lang-zh>产品能力</a><a href="product.html" data-lang-en>Product</a>
+      <a href="agents.html" class="active" data-lang-zh>智能体编队</a><a href="agents.html" class="active" data-lang-en>Agents</a>
+      <a href="technology.html" data-lang-zh>技术架构</a><a href="technology.html" data-lang-en>Technology</a>
+      <a href="engineering.html" data-lang-zh>工程深度</a><a href="engineering.html" data-lang-en>Engineering</a>
+      <a href="evolution.html" data-lang-zh>自我演化</a><a href="evolution.html" data-lang-en>Self-evolution</a>
+      <a href="scenarios.html" data-lang-zh>行业场景</a><a href="scenarios.html" data-lang-en>Scenarios</a>
+      <a href="observability.html" data-lang-zh>运营透视</a><a href="observability.html" data-lang-en>Observability</a>
+      <a href="trust.html" data-lang-zh>信任与安全</a><a href="trust.html" data-lang-en>Trust</a>
+    </div>
+    <div class="nav-right">
+      <div class="lang-toggle">
+        <button data-lang-btn="zh">中</button>
+        <button data-lang-btn="en">EN</button>
+      </div>
+      <button class="nav-burger" aria-label="menu"><svg viewBox="0 0 24 24" width="22" height="22" fill="none"><path d="M4 7h16M4 12h16M4 17h16" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg></button>
+    </div>
+  </div>
+</nav>
+<div class="mobile-menu">
+  <a href="index.html" data-lang-zh>首页</a><a href="index.html" data-lang-en>Home</a>
+  <a href="solutions.html" data-lang-zh>解决什么</a><a href="solutions.html" data-lang-en>Solutions</a>
+  <a href="product.html" data-lang-zh>产品能力</a><a href="product.html" data-lang-en>Product</a>
+  <a href="agents.html" data-lang-zh>智能体编队</a><a href="agents.html" data-lang-en>Agents</a>
+  <a href="technology.html" data-lang-zh>技术架构</a><a href="technology.html" data-lang-en>Technology</a>
+  <a href="engineering.html" data-lang-zh>工程深度</a><a href="engineering.html" data-lang-en>Engineering</a>
+  <a href="evolution.html" data-lang-zh>自我演化</a><a href="evolution.html" data-lang-en>Self-evolution</a>
+  <a href="scenarios.html" data-lang-zh>行业场景</a><a href="scenarios.html" data-lang-en>Scenarios</a>
+  <a href="observability.html" data-lang-zh>运营透视</a><a href="observability.html" data-lang-en>Observability</a>
+  <a href="trust.html" data-lang-zh>信任与安全</a><a href="trust.html" data-lang-en>Trust</a>
+</div>
+
+<!-- ============ 页内英雄 ============ -->
+<section class="page-hero section-deep">
+  <div class="page-hero-bg">
+    <div class="hero-glow hero-glow-1"></div>
+    <div class="hero-glow hero-glow-2"></div>
+    <div class="hero-grid"></div>
+  </div>
+  <div class="wrap" style="position:relative">
+    <span class="eyebrow" data-lang-zh>智能体编队</span><span class="eyebrow" data-lang-en>The agent fleet</span>
+    <h1 class="h-display" data-lang-zh>不是一个大模型硬扛，<br><span class="text-grad">是一支各司其职的 Agent 编队</span></h1>
+    <h1 class="h-display" data-lang-en>Not one model doing everything —<br><span class="text-grad">a fleet of agents, each with one job</span></h1>
+    <p class="lead" data-lang-zh>把"全自治运营"拆开看，里面是二十多个 LLM 驱动的 Agent：有人负责回复，有人只负责挑错，有人记住每段关系，有人维护知识库，有人把运营者的一句话编排成批量动作。它们认知隔离、各管一段，再由确定性的调度器自主串起来。</p>
+    <p class="lead" data-lang-en>Open up "autonomous operations" and you'll find twenty-plus LLM-driven agents: one replies, one only catches mistakes, one remembers every relationship, one tends the knowledge base, one turns a single operator sentence into a batch of actions. They're cognitively isolated, each owns one slice, and a deterministic scheduler wires them together.</p>
+    <div class="ah-stats">
+      <div class="ah-stat reveal"><div class="ah-n" data-count="20" data-suffix="+">20+</div><div class="ah-l" data-lang-zh>生产链路 LLM Agent</div><div class="ah-l" data-lang-en>Production LLM agents</div></div>
+      <div class="ah-stat reveal reveal-d1"><div class="ah-n">6</div><div class="ah-l" data-lang-zh>分工编队</div><div class="ah-l" data-lang-en>Specialized squads</div></div>
+      <div class="ah-stat reveal reveal-d2"><div class="ah-n">3</div><div class="ah-l" data-lang-zh>确定性调度器</div><div class="ah-l" data-lang-en>Deterministic schedulers</div></div>
+      <div class="ah-stat reveal reveal-d3"><div class="ah-n">1</div><div class="ah-l" data-lang-zh>统一 LLM 入口 / 全程留痕</div><div class="ah-l" data-lang-en>One LLM entrypoint, fully logged</div></div>
+    </div>
+  </div>
+</section>
+
+<!-- ============ 编队 ① 运营核心 ============ -->
+<section class="section">
+  <div class="wrap">
+    <div class="t-head reveal">
+      <span class="eyebrow" data-lang-zh>核心编队 · 一次对话内协作</span><span class="eyebrow" data-lang-en>Core squads · collaborate within one turn</span>
+      <h2 class="h-section" data-lang-zh>每一条回复，<span class="text-grad">都至少过三个 Agent 的手</span></h2>
+      <h2 class="h-section" data-lang-en>Every reply passes through <span class="text-grad">at least three agents</span></h2>
+      <p class="lead" data-lang-zh>客户发来一句话，先由回复决策 Agent 拿主意，再交给一个看不到它内心戏的独立评审 Agent 打分挑错——写回复的和挑错的，从来不是同一个大脑。</p>
+      <p class="lead" data-lang-en>When a message arrives, the reply agent decides; then an independent reviewer that can't see its inner reasoning scores and catches errors — the one writing and the one checking are never the same brain.</p>
+    </div>
+
+    <div class="squad">
+      <div class="squad-head">
+        <span class="squad-badge s-core">01</span>
+        <h3 data-lang-zh>运营核心编队</h3><h3 data-lang-en>Operations core squad</h3>
+      </div>
+      <p class="squad-sub" data-lang-zh>决策、评审、建画像——驱动每一次自动回复的三个 Agent。</p>
+      <p class="squad-sub" data-lang-en>Decide, review, profile — the three agents behind every auto-reply.</p>
+      <div class="agent-grid">
+
+        <div class="agent-card reveal">
+          <div class="ac-top">
+            <span class="ac-ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2a4 4 0 0 1 4 4c0 1.5-.8 2.8-2 3.5V11h2a3 3 0 0 1 3 3v1a3 3 0 0 1-3 3h-1v1a2 2 0 1 1-4 0v-1H10a3 3 0 0 1-3-3v-1a3 3 0 0 1 3-3h2V9.5C10.8 8.8 10 7.5 10 6a4 4 0 0 1 4-4z"/></svg></span>
+            <div><h4 data-lang-zh>回复决策 Agent</h4><h4 data-lang-en>Reply decision agent</h4><div class="ac-key">user.reply.task</div></div>
+            <span class="llm-dot">LLM</span>
+          </div>
+          <p data-lang-zh>系统的"主嘴"。读完上下文、记忆、知识与画像后，决定这一轮说什么、推进到哪一步、要不要发素材或引荐名片。</p>
+          <p data-lang-en>The system's voice. After reading context, memory, knowledge and the profile, it decides what to say this turn, how far to advance, whether to send assets or refer a card.</p>
+          <div class="agent-io">
+            <div class="io-row"><span class="io-k" data-lang-zh>输入</span><span class="io-k" data-lang-en>In</span><span class="io-v" data-lang-zh>对话 + 记忆 + 知识切片 + 画像</span><span class="io-v" data-lang-en>Conversation + memory + knowledge + profile</span></div>
+            <div class="io-row"><span class="io-k" data-lang-zh>输出</span><span class="io-k" data-lang-en>Out</span><span class="io-v" data-lang-zh>回复草案 + 阶段 + 风险自评</span><span class="io-v" data-lang-en>Draft reply + stage + self-assessed risk</span></div>
+          </div>
+          <div class="agent-tags"><span class="agent-tag">渐进式三档</span><span class="agent-tag">RunBudget</span></div>
+        </div>
+
+        <div class="agent-card reveal reveal-d1">
+          <div class="ac-top">
+            <span class="ac-ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20 6 9 17l-5-5"/></svg></span>
+            <div><h4 data-lang-zh>独立评审 Agent</h4><h4 data-lang-en>Independent reviewer</h4><div class="ac-key">user.review.system</div></div>
+            <span class="llm-dot">LLM</span>
+          </div>
+          <p data-lang-zh>专职挑错。只拿到事实面投影，看不到回复 Agent 的自我推理，独立给五个维度打分——事实风险、压力感、拟人度、情感价值、产品准确性。</p>
+          <p data-lang-en>The dedicated critic. Gets only a facts projection — never the reply agent's reasoning — and scores five dimensions independently: fact risk, pressure, human-likeness, emotional value, product accuracy.</p>
+          <div class="agent-io">
+            <div class="io-row"><span class="io-k" data-lang-zh>输入</span><span class="io-k" data-lang-en>In</span><span class="io-v" data-lang-zh>回复草案 + 事实投影（无内心戏）</span><span class="io-v" data-lang-en>Draft + facts projection (no reasoning)</span></div>
+            <div class="io-row"><span class="io-k" data-lang-zh>输出</span><span class="io-k" data-lang-en>Out</span><span class="io-v" data-lang-zh>五维评分 + 放行/改写/拦截</span><span class="io-v" data-lang-en>5-D scores + approve / rewrite / block</span></div>
+          </div>
+          <div class="agent-tags"><span class="agent-tag ai">认知隔离</span><span class="agent-tag">轻量档可选</span></div>
+        </div>
+
+        <div class="agent-card reveal reveal-d2">
+          <div class="ac-top">
+            <span class="ac-ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="8" r="4"/><path d="M4 21v-1a6 6 0 0 1 6-6h4a6 6 0 0 1 6 6v1"/></svg></span>
+            <div><h4 data-lang-zh>初始画像 Agent</h4><h4 data-lang-en>Initial profile agent</h4><div class="ac-key">user.initial_profile.task</div></div>
+            <span class="llm-dot">LLM</span>
+          </div>
+          <p data-lang-zh>第一次接触某位客户时建立基础画像：从已有备注与开场对话里，给出初步的身份、阶段与关系判断，作为后续经营的起点。</p>
+          <p data-lang-en>On first contact, it builds a base profile: from existing notes and the opening exchange it drafts an initial identity, stage and relationship read — the starting point for everything after.</p>
+          <div class="agent-io">
+            <div class="io-row"><span class="io-k" data-lang-zh>输入</span><span class="io-k" data-lang-en>In</span><span class="io-v" data-lang-zh>备注 + 开场对话</span><span class="io-v" data-lang-en>Notes + opening exchange</span></div>
+            <div class="io-row"><span class="io-k" data-lang-zh>输出</span><span class="io-k" data-lang-en>Out</span><span class="io-v" data-lang-zh>初始画像（身份/阶段/关系）</span><span class="io-v" data-lang-en>Initial profile (identity/stage/relationship)</span></div>
+          </div>
+          <div class="agent-tags"><span class="agent-tag">仅首轮</span><span class="agent-tag">画像基线</span></div>
+        </div>
+
+      </div>
+    </div>
+  </div>
+</section>
+<!-- ============ 编队 ② 关系经营 + ③ 知识库自治 ============ -->
+<section class="section section-tint">
+  <div class="wrap">
+
+    <!-- 编队 ② 关系经营 -->
+    <div class="squad">
+      <div class="squad-head">
+        <span class="squad-badge s-rel">02</span>
+        <h3 data-lang-zh>关系经营编队</h3><h3 data-lang-en>Relationship squad</h3>
+      </div>
+      <p class="squad-sub" data-lang-zh>跨轮、长期。回复发出之后，这两个 Agent 负责"记住这个人"——读懂反应、沉淀记忆，让下一次对话接得上。它们产出的标签与画像并非都可信：哪些进决策、哪些只做记录，由<a href="trust.html#trust-layers" style="color:var(--brand)">信息信任层级</a>严格分层。</p>
+      <p class="squad-sub" data-lang-en>Cross-turn and long-lived. After a reply goes out, these two agents "remember the person" — reading reactions and consolidating memory so the next turn picks up where it left off. Not all the tags and profiles they produce are trusted equally: what drives decisions versus what's record-only is strictly split by the <a href="trust.html#trust-layers" style="color:var(--brand)">information trust tiers</a>.</p>
+      <div class="agent-grid cols-2">
+
+        <div class="agent-card reveal">
+          <div class="ac-top">
+            <span class="ac-ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg></span>
+            <div><h4 data-lang-zh>用户反应分析 Agent</h4><h4 data-lang-en>Reaction analysis agent</h4><div class="ac-key">user.reaction.task</div></div>
+            <span class="llm-dot">LLM</span>
+          </div>
+          <p data-lang-zh>回复发出后，分析客户的下一句话是什么态度——认可、犹豫、抗拒还是冷场，把"刚才那句说得对不对"变成可沉淀的信号，反哺下一轮决策。</p>
+          <p data-lang-en>After a reply, it reads the customer's next message — agreement, hesitation, resistance or silence — turning "did that land?" into a signal that feeds back into the next decision.</p>
+          <div class="agent-io">
+            <div class="io-row"><span class="io-k" data-lang-zh>输入</span><span class="io-k" data-lang-en>In</span><span class="io-v" data-lang-zh>我方回复 + 客户后续反应</span><span class="io-v" data-lang-en>Our reply + customer's reaction</span></div>
+            <div class="io-row"><span class="io-k" data-lang-zh>输出</span><span class="io-k" data-lang-en>Out</span><span class="io-v" data-lang-zh>反应极性 + 意图轨迹更新</span><span class="io-v" data-lang-en>Reaction polarity + intent trajectory</span></div>
+          </div>
+          <div class="agent-tags"><span class="agent-tag blue">意图轨迹</span><span class="agent-tag">claim lock 防重</span></div>
+        </div>
+
+        <div class="agent-card reveal reveal-d1">
+          <div class="ac-top">
+            <span class="ac-ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 4h11l5 5v11a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V5a1 1 0 0 1 1-1z"/><path d="M9 9h4M9 13h6M9 17h6"/></svg></span>
+            <div><h4 data-lang-zh>长期记忆固化 Agent</h4><h4 data-lang-en>Memory consolidation agent</h4><div class="ac-key">user.memory_consolidator.task</div></div>
+            <span class="llm-dot">LLM</span>
+          </div>
+          <p data-lang-zh>把零散的对话压缩成结构化的长期记忆卡：确认的事实、关系状态、产品契合、下一步动作。过期事实会被显式标记，不再被引用。</p>
+          <p data-lang-en>Compresses scattered dialogue into a structured long-term memory card: confirmed facts, relationship state, product fit, next action. Stale facts are explicitly deprecated and no longer cited.</p>
+          <div class="agent-io">
+            <div class="io-row"><span class="io-k" data-lang-zh>输入</span><span class="io-k" data-lang-en>In</span><span class="io-v" data-lang-zh>近期对话 + 现有记忆卡</span><span class="io-v" data-lang-en>Recent dialogue + existing card</span></div>
+            <div class="io-row"><span class="io-k" data-lang-zh>输出</span><span class="io-k" data-lang-en>Out</span><span class="io-v" data-lang-zh>更新的记忆卡 + 过期事实标记</span><span class="io-v" data-lang-en>Updated card + deprecated facts</span></div>
+          </div>
+          <div class="agent-tags"><span class="agent-tag ai">记忆卡片</span><span class="agent-tag">事实失效追踪</span></div>
+        </div>
+
+      </div>
+    </div>
+
+    <!-- 编队 ③ 知识库自治 -->
+    <div class="squad">
+      <div class="squad-head">
+        <span class="squad-badge s-know">03</span>
+        <h3 data-lang-zh>知识库自治编队</h3><h3 data-lang-en>Knowledge autonomy squad</h3>
+      </div>
+      <p class="squad-sub" data-lang-zh>知识从哪来、怎么查、缺了谁来补、过期谁来修——一整套围绕知识库的 Agent，唯独不碰"自动判定为真"那条红线（新知识永远先落草稿待人核验）。</p>
+      <p class="squad-sub" data-lang-en>Where knowledge comes from, how it's retrieved, who fills gaps, who repairs staleness — a full set of agents around the knowledge base, never crossing the one red line: it never auto-verifies (new knowledge always lands as a draft awaiting human review).</p>
+      <div class="agent-grid">
+
+        <div class="agent-card reveal">
+          <div class="ac-top">
+            <span class="ac-ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="7"/><path d="m21 21-4.3-4.3"/></svg></span>
+            <div><h4 data-lang-zh>知识库问答 Agent</h4><h4 data-lang-en>Knowledge Q&A agent</h4><div class="ac-key">knowledge.agent</div></div>
+            <span class="llm-dot">LLM</span>
+          </div>
+          <p data-lang-zh>渐进式检索的"规划大脑"：看目录 → 下钻文档 → 展开切片，多轮工具调用按需取证，token 级流式吐答案。只读，绝不改写知识。</p>
+          <p data-lang-en>The planning brain for progressive retrieval: catalog → drill into a doc → open the slice, fetching evidence on demand over tool-calling rounds, streaming the answer token by token. Read-only, never rewrites knowledge.</p>
+          <div class="agent-io">
+            <div class="io-row"><span class="io-k" data-lang-zh>输入</span><span class="io-k" data-lang-en>In</span><span class="io-v" data-lang-zh>问题 + 知识目录</span><span class="io-v" data-lang-en>Question + knowledge catalog</span></div>
+            <div class="io-row"><span class="io-k" data-lang-zh>输出</span><span class="io-k" data-lang-en>Out</span><span class="io-v" data-lang-zh>带引用的答案（流式）</span><span class="io-v" data-lang-en>Cited answer (streaming)</span></div>
+          </div>
+          <div class="agent-tags"><span class="agent-tag">tool-calling</span><span class="agent-tag ai">token 流式</span></div>
+        </div>
+
+        <div class="agent-card reveal reveal-d1">
+          <div class="ac-top">
+            <span class="ac-ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="9"/><path d="M9.5 9a2.5 2.5 0 0 1 5 0c0 1.7-2.5 2.5-2.5 4M12 17h.01"/></svg></span>
+            <div><h4 data-lang-zh>知识缺口追问 Agent</h4><h4 data-lang-en>Gap follow-up agent</h4><div class="ac-key">knowledge.gap.followup</div></div>
+            <span class="llm-dot">LLM</span>
+          </div>
+          <p data-lang-zh>查无可引用知识时，不编造——而是生成一句面向运营者的精炼追问，引导把缺失的知识补进库里。把"答不上来"变成"知道该补什么"。</p>
+          <p data-lang-en>When there's nothing to cite, it doesn't fabricate — it generates one crisp question for the operator, guiding them to fill the missing knowledge. Turns "can't answer" into "knows what to add".</p>
+          <div class="agent-io">
+            <div class="io-row"><span class="io-k" data-lang-zh>输入</span><span class="io-k" data-lang-en>In</span><span class="io-v" data-lang-zh>查空的原始问题</span><span class="io-v" data-lang-en>The unanswerable question</span></div>
+            <div class="io-row"><span class="io-k" data-lang-zh>输出</span><span class="io-k" data-lang-en>Out</span><span class="io-v" data-lang-zh>一句补全引导追问</span><span class="io-v" data-lang-en>One gap-filling prompt</span></div>
+          </div>
+          <div class="agent-tags"><span class="agent-tag">不编造</span></div>
+        </div>
+
+        <div class="agent-card reveal reveal-d2">
+          <div class="ac-top">
+            <span class="ac-ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 18v-6a9 9 0 0 1 18 0v6"/><path d="M21 19a2 2 0 0 1-2 2h-1a2 2 0 0 1-2-2v-3a2 2 0 0 1 2-2h3zM3 19a2 2 0 0 0 2 2h1a2 2 0 0 0 2-2v-3a2 2 0 0 0-2-2H3z"/></svg></span>
+            <div><h4 data-lang-zh>知识对话补库 Agent</h4><h4 data-lang-en>Conversational ingest agent</h4><div class="ac-key">knowledge.chat.*</div></div>
+            <span class="llm-dot">LLM</span>
+          </div>
+          <p data-lang-zh>运营者用大白话就能补库。意图识别 → 起草切片 → 更新 → 澄清四个 prompt 协同，把一段对话变成结构化知识草稿。</p>
+          <p data-lang-en>Operators grow the base in plain language. Four prompts work together — intent, draft, update, clarify — turning a conversation into a structured knowledge draft.</p>
+          <div class="agent-io">
+            <div class="io-row"><span class="io-k" data-lang-zh>输入</span><span class="io-k" data-lang-en>In</span><span class="io-v" data-lang-zh>运营者自然语言</span><span class="io-v" data-lang-en>Operator's natural language</span></div>
+            <div class="io-row"><span class="io-k" data-lang-zh>输出</span><span class="io-k" data-lang-en>Out</span><span class="io-v" data-lang-zh>知识切片草稿（待核验）</span><span class="io-v" data-lang-en>Draft chunk (pending review)</span></div>
+          </div>
+          <div class="agent-tags"><span class="agent-tag">intent / draft / update / clarify</span></div>
+        </div>
+
+        <div class="agent-card reveal">
+          <div class="ac-top">
+            <span class="ac-ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2v6h6"/><path d="M4 2h10l6 6v12a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V3a1 1 0 0 1 1-1z"/><path d="m9 14 2 2 4-4"/></svg></span>
+            <div><h4 data-lang-zh>知识修复提案 Agent</h4><h4 data-lang-en>Repair proposal agent</h4><div class="ac-key">knowledge.chunk.repair.*</div></div>
+            <span class="llm-dot">LLM</span>
+          </div>
+          <p data-lang-zh>切片过期、锚点失效或内容存疑时，提出修复方案——只是"提案"，落地与否仍需人确认，守住"AI 不自证为真"。</p>
+          <p data-lang-en>When a chunk goes stale, an anchor breaks or content is doubtful, it proposes a fix — only a proposal; whether it lands still needs human confirmation.</p>
+          <div class="agent-io">
+            <div class="io-row"><span class="io-k" data-lang-zh>输入</span><span class="io-k" data-lang-en>In</span><span class="io-v" data-lang-zh>存疑切片 + 上下文</span><span class="io-v" data-lang-en>Doubtful chunk + context</span></div>
+            <div class="io-row"><span class="io-k" data-lang-zh>输出</span><span class="io-k" data-lang-en>Out</span><span class="io-v" data-lang-zh>修复提案（待确认）</span><span class="io-v" data-lang-en>Repair proposal (pending)</span></div>
+          </div>
+          <div class="agent-tags"><span class="agent-tag">propose / followup</span></div>
+        </div>
+
+        <div class="agent-card reveal reveal-d1">
+          <div class="ac-top">
+            <span class="ac-ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3 4 7v5c0 4.5 3.4 7.3 8 9 4.6-1.7 8-4.5 8-9V7z"/><path d="m9 12 2 2 4-4"/></svg></span>
+            <div><h4 data-lang-zh>知识自动核验 Agent</h4><h4 data-lang-en>Auto-verify assist agent</h4><div class="ac-key">knowledge.auto_verify</div></div>
+            <span class="llm-dot">LLM</span>
+          </div>
+          <p data-lang-zh>辅助核验，而非自动放行。给出一致性与可信度评估供人参考，但"判定为真"的最终权永远在人手里——这是不可逾越的红线。</p>
+          <p data-lang-en>It assists verification, never auto-approves. It offers a consistency and trust assessment for humans, but the final "this is true" call always stays with a person — a hard line.</p>
+          <div class="agent-io">
+            <div class="io-row"><span class="io-k" data-lang-zh>输入</span><span class="io-k" data-lang-en>In</span><span class="io-v" data-lang-zh>待核验切片</span><span class="io-v" data-lang-en>Chunk under review</span></div>
+            <div class="io-row"><span class="io-k" data-lang-zh>输出</span><span class="io-k" data-lang-en>Out</span><span class="io-v" data-lang-zh>核验建议（人最终拍板）</span><span class="io-v" data-lang-en>Suggestion (human decides)</span></div>
+          </div>
+          <div class="agent-tags"><span class="agent-tag ai">AI 永不自证</span></div>
+        </div>
+
+        <div class="agent-card reveal reveal-d2">
+          <div class="ac-top">
+            <span class="ac-ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3v12m0 0 4-4m-4 4-4-4"/><path d="M4 17v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2"/></svg></span>
+            <div><h4 data-lang-zh>知识导入与标签 Agent</h4><h4 data-lang-en>Import & tagging agent</h4><div class="ac-key">knowledge.import.preview · tags.extract</div></div>
+            <span class="llm-dot">LLM</span>
+          </div>
+          <p data-lang-zh>导入 PDF、图片等素材时先生成结构化预览，并自动抽取标签。无论哪种入口，新知识一律落草稿、标记待核验。</p>
+          <p data-lang-en>When importing PDFs, images and more, it generates a structured preview and auto-extracts tags. Whatever the entrypoint, new knowledge always lands as a draft, marked for review.</p>
+          <div class="agent-io">
+            <div class="io-row"><span class="io-k" data-lang-zh>输入</span><span class="io-k" data-lang-en>In</span><span class="io-v" data-lang-zh>PDF / 图片 / 文本素材</span><span class="io-v" data-lang-en>PDF / image / text source</span></div>
+            <div class="io-row"><span class="io-k" data-lang-zh>输出</span><span class="io-k" data-lang-en>Out</span><span class="io-v" data-lang-zh>结构化预览 + 候选标签</span><span class="io-v" data-lang-en>Structured preview + tags</span></div>
+          </div>
+          <div class="agent-tags"><span class="agent-tag">多模态</span><span class="agent-tag">draft + needs_review</span></div>
+        </div>
+
+        <div class="agent-card reveal">
+          <div class="ac-top">
+            <span class="ac-ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 5h16M4 12h16M4 19h10"/><circle cx="19" cy="19" r="2"/></svg></span>
+            <div><h4 data-lang-zh>知识日报 Agent</h4><h4 data-lang-en>Daily digest agent</h4><div class="ac-key">knowledge.digest.summarize_logs · compose</div></div>
+            <span class="llm-dot">LLM</span>
+          </div>
+          <p data-lang-zh>两个 Agent 接力：一个分析当天知识使用日志、识别健康信号，一个把分析成文为日报卡。让知识库的"用得好不好"每天看得见。</p>
+          <p data-lang-en>Two agents in relay: one analyzes the day's knowledge-usage logs and spots health signals, the other composes them into a digest card — making "how well knowledge performs" visible daily.</p>
+          <div class="agent-io">
+            <div class="io-row"><span class="io-k" data-lang-zh>输入</span><span class="io-k" data-lang-en>In</span><span class="io-v" data-lang-zh>知识使用日志</span><span class="io-v" data-lang-en>Knowledge usage logs</span></div>
+            <div class="io-row"><span class="io-k" data-lang-zh>输出</span><span class="io-k" data-lang-en>Out</span><span class="io-v" data-lang-zh>每日知识健康日报</span><span class="io-v" data-lang-en>Daily knowledge health digest</span></div>
+          </div>
+          <div class="agent-tags"><span class="agent-tag">定时触发</span><span class="agent-tag">默认关</span></div>
+        </div>
+
+      </div>
+    </div>
+
+  </div>
+</section>
+<!-- ============ 编队 ④ 配置生成 + ⑤ 管理与请示 + ⑥ 自我演化 ============ -->
+<section class="section">
+  <div class="wrap">
+
+    <!-- 编队 ④ 配置生成 -->
+    <div class="squad">
+      <div class="squad-head">
+        <span class="squad-badge s-know">04</span>
+        <h3 data-lang-zh>配置生成编队</h3><h3 data-lang-en>Configuration squad</h3>
+      </div>
+      <p class="squad-sub" data-lang-zh>上线一个新行业不用写代码。这组 Agent 帮运营者把"我想做什么生意"草拟成可运行的运营方法、行业画像与状态机。</p>
+      <p class="squad-sub" data-lang-en>Onboarding a new industry takes no code. These agents help operators draft "what business I run" into runnable playbooks, domain profiles and state machines.</p>
+      <div class="agent-grid cols-2">
+
+        <div class="agent-card reveal">
+          <div class="ac-top">
+            <span class="ac-ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2v4M12 18v4M2 12h4M18 12h4M5 5l2.5 2.5M16.5 16.5 19 19M19 5l-2.5 2.5M7.5 16.5 5 19"/><circle cx="12" cy="12" r="3"/></svg></span>
+            <div><h4 data-lang-zh>运营方法生成 / 优化 Agent</h4><h4 data-lang-en>Playbook generate / optimize agent</h4><div class="ac-key">playbook.generator · playbook.optimizer</div></div>
+            <span class="llm-dot">LLM</span>
+          </div>
+          <p data-lang-zh>从运营者的业务描述生成一套完整的运营方法论（playbook），并能基于运行表现持续优化。这是"全自治"能落到任意行业的关键一环。</p>
+          <p data-lang-en>Generates a complete playbook from the operator's business description, and refines it from runtime performance. The key to landing "autonomous" in any industry.</p>
+          <div class="agent-io">
+            <div class="io-row"><span class="io-k" data-lang-zh>输入</span><span class="io-k" data-lang-en>In</span><span class="io-v" data-lang-zh>业务描述 / 运行表现</span><span class="io-v" data-lang-en>Business description / performance</span></div>
+            <div class="io-row"><span class="io-k" data-lang-zh>输出</span><span class="io-k" data-lang-en>Out</span><span class="io-v" data-lang-zh>运营方法草案（待发布）</span><span class="io-v" data-lang-en>Playbook draft (pending publish)</span></div>
+          </div>
+          <div class="agent-tags"><span class="agent-tag">generate</span><span class="agent-tag">optimize</span></div>
+        </div>
+
+        <div class="agent-card reveal reveal-d1">
+          <div class="ac-top">
+            <span class="ac-ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 7v10a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2V9a2 2 0 0 0-2-2h-7L9 4H5a2 2 0 0 0-2 2z"/><path d="M12 11v4M10 13h4"/></svg></span>
+            <div><h4 data-lang-zh>行业画像草案 / 引导预览 Agent</h4><h4 data-lang-en>Domain profile draft agent</h4><div class="ac-key">guide.domain_profile.draft · user.guide.preview</div></div>
+            <span class="llm-dot">LLM</span>
+          </div>
+          <p data-lang-zh>引导向导里，AI 帮你起草这个行业该有的客户阶段、标签维度、状态机与人格基调，并实时预览效果。新行业从"零配置"到"能跑"，由 AI 陪着搭。</p>
+          <p data-lang-en>In the setup wizard, the AI drafts the customer stages, tag dimensions, state machine and persona this industry needs, with a live preview. From zero config to runnable, with the AI alongside.</p>
+          <div class="agent-io">
+            <div class="io-row"><span class="io-k" data-lang-zh>输入</span><span class="io-k" data-lang-en>In</span><span class="io-v" data-lang-zh>行业 / 业务意图</span><span class="io-v" data-lang-en>Industry / business intent</span></div>
+            <div class="io-row"><span class="io-k" data-lang-zh>输出</span><span class="io-k" data-lang-en>Out</span><span class="io-v" data-lang-zh>行业画像草案 + 预览</span><span class="io-v" data-lang-en>Domain profile draft + preview</span></div>
+          </div>
+          <div class="agent-tags"><span class="agent-tag blue">引导向导</span><span class="agent-tag">行业通用化</span></div>
+        </div>
+
+      </div>
+    </div>
+
+    <!-- 编队 ⑤ 管理与请示 -->
+    <div class="squad">
+      <div class="squad-head">
+        <span class="squad-badge s-esc">05</span>
+        <h3 data-lang-zh>管理与请示编队</h3><h3 data-lang-en>Management & escalation squad</h3>
+      </div>
+      <p class="squad-sub" data-lang-zh>自治不只在客户侧。运营者一句话就能驱动批量动作，改 prompt 要先过红线裁判，遇到超出职权的事 AI 会向幕后决策源请示——拿回结论后仍用自己的口吻向客户转述。</p>
+      <p class="squad-sub" data-lang-en>Autonomy isn't only customer-side. One operator sentence drives a batch of actions, prompt edits face a red-line judge first, and on matters beyond its authority the AI consults the behind-the-scenes decision source — then relays the conclusion to the customer in its own voice.</p>
+      <div class="agent-grid">
+
+        <div class="agent-card reveal">
+          <div class="ac-top">
+            <span class="ac-ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2 2 7l10 5 10-5z"/><path d="m2 17 10 5 10-5M2 12l10 5 10-5"/></svg></span>
+            <div><h4 data-lang-zh>管理编排 Agent</h4><h4 data-lang-en>Management orchestrator</h4><div class="ac-key">management.plan</div></div>
+            <span class="llm-dot">LLM</span>
+          </div>
+          <p data-lang-zh>运营者用一句自然语言（"给所有犹豫期客户发个关怀"），它就编排成一份带风险分级的操作计划——观测、调参、改策略、灰度发布、知识维护都能调度。危险与核验类动作恒需人确认。</p>
+          <p data-lang-en>One operator sentence ("send a check-in to all hesitating customers") becomes a risk-graded action plan — observation, tuning, strategy edits, staged rollout, knowledge upkeep. Dangerous and verify actions always need confirmation.</p>
+          <div class="agent-io">
+            <div class="io-row"><span class="io-k" data-lang-zh>输入</span><span class="io-k" data-lang-en>In</span><span class="io-v" data-lang-zh>运营者自然语言指令</span><span class="io-v" data-lang-en>Operator's natural-language command</span></div>
+            <div class="io-row"><span class="io-k" data-lang-zh>输出</span><span class="io-k" data-lang-en>Out</span><span class="io-v" data-lang-zh>分级操作计划（提议→确认→执行）</span><span class="io-v" data-lang-en>Graded plan (propose→confirm→execute)</span></div>
+          </div>
+          <div class="agent-tags"><span class="agent-tag">四级风险分级</span><span class="agent-tag ai">执行结果核实</span></div>
+        </div>
+
+        <div class="agent-card reveal reveal-d1">
+          <div class="ac-top">
+            <span class="ac-ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3 4 6v6c0 4.5 3.4 7.3 8 9 4.6-1.7 8-4.5 8-9V6z"/><path d="M12 8v4M12 16h.01"/></svg></span>
+            <div><h4 data-lang-zh>Prompt 红线评审 Agent</h4><h4 data-lang-en>Prompt red-line reviewer</h4><div class="ac-key">management.prompt_redline_review</div></div>
+            <span class="llm-dot">LLM</span>
+          </div>
+          <p data-lang-zh>改提示词的"第三道闸"。语义级判断这次改动有没有变相引入真人接管、削弱知识 grounding，三态裁决：放行 / 拒绝 / 需人确认。裁判掉线则降级为人确认。</p>
+          <p data-lang-en>The third gate on prompt edits. It judges, at the semantic level, whether a change sneaks in human takeover or weakens grounding — three verdicts: pass / reject / needs confirmation. If the judge is down, it falls back to human confirmation.</p>
+          <div class="agent-io">
+            <div class="io-row"><span class="io-k" data-lang-zh>输入</span><span class="io-k" data-lang-en>In</span><span class="io-v" data-lang-zh>提示词改动前后</span><span class="io-v" data-lang-en>Prompt before/after</span></div>
+            <div class="io-row"><span class="io-k" data-lang-zh>输出</span><span class="io-k" data-lang-en>Out</span><span class="io-v" data-lang-zh>放行 / 拒绝 / 需人确认</span><span class="io-v" data-lang-en>Pass / reject / needs confirm</span></div>
+          </div>
+          <div class="agent-tags"><span class="agent-tag">语义红线守门</span></div>
+        </div>
+
+        <div class="agent-card reveal reveal-d2">
+          <div class="ac-top">
+            <span class="ac-ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17 8a5 5 0 0 0-10 0c0 6-3 7-3 7h16s-3-1-3-7"/><path d="M10.3 21a1.9 1.9 0 0 0 3.4 0"/></svg></span>
+            <div><h4 data-lang-zh>请示通道决策解读 Agent</h4><h4 data-lang-en>Principal decision interpreter</h4><div class="ac-key">escalation.principal.interpret</div></div>
+            <span class="llm-dot">LLM</span>
+          </div>
+          <p data-lang-zh>遇到超出 AI 职权的事项（如能否破例、特批价格），向幕后决策源（领导）请示，拿回结论后解读成可执行的对客转述。客户始终只跟 AI 对话，从不面对真人。</p>
+          <p data-lang-en>On matters beyond its authority (an exception, a special price), it consults the behind-the-scenes decision source, then interprets the verdict into an actionable relay. The customer only ever talks to the AI, never a human.</p>
+          <div class="agent-io">
+            <div class="io-row"><span class="io-k" data-lang-zh>输入</span><span class="io-k" data-lang-en>In</span><span class="io-v" data-lang-zh>领导回复的决策结论</span><span class="io-v" data-lang-en>The principal's verdict</span></div>
+            <div class="io-row"><span class="io-k" data-lang-zh>输出</span><span class="io-k" data-lang-en>Out</span><span class="io-v" data-lang-zh>AI 口吻的对客转述</span><span class="io-v" data-lang-en>An AI-voiced relay to the customer</span></div>
+          </div>
+          <div class="agent-tags"><span class="agent-tag ai">无人工接管</span><span class="agent-tag">幕后决策源</span></div>
+        </div>
+
+      </div>
+    </div>
+
+    <!-- 编队 ⑥ 自我演化 -->
+    <div class="squad">
+      <div class="squad-head">
+        <span class="squad-badge s-evo">06</span>
+        <h3 data-lang-zh>自我演化编队</h3><h3 data-lang-en>Self-evolution squad</h3>
+      </div>
+      <p class="squad-sub" data-lang-zh>系统会自己提议怎么把话说得更好——但每一条改动都要先在影子里证明，再灰度放量，与生产链路完全隔离。</p>
+      <p class="squad-sub" data-lang-en>The system proposes how to speak better — but every change is proven in the shadow first, then rolled out gradually, fully isolated from the production path.</p>
+      <div class="agent-grid cols-2">
+
+        <div class="agent-card reveal">
+          <div class="ac-top">
+            <span class="ac-ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 20a8 8 0 1 0-8-8"/><path d="m4 12-2-2m2 2 2-2"/><path d="M12 8v4l3 2"/></svg></span>
+            <div><h4 data-lang-zh>Prompt 批判 Agent</h4><h4 data-lang-en>Prompt critic agent</h4><div class="ac-key">evolution_critic_v1</div></div>
+            <span class="llm-dot">LLM</span>
+          </div>
+          <p data-lang-zh>分析失败样本，提出对回复 Agent 提示词的改写方案。它刻意不走统一 LLM 入口、与生产 Reply 链路完全分离，token 单独计入演化预算——演化绝不污染线上。</p>
+          <p data-lang-en>It analyzes failed samples and proposes rewrites to the reply agent's prompt. It deliberately bypasses the shared LLM entrypoint, stays separate from the production reply path, and bills tokens to a dedicated evolution budget — evolution never contaminates production.</p>
+          <div class="agent-io">
+            <div class="io-row"><span class="io-k" data-lang-zh>输入</span><span class="io-k" data-lang-en>In</span><span class="io-v" data-lang-zh>分桶失败样本 + 现役模板</span><span class="io-v" data-lang-en>Bucketed failures + live template</span></div>
+            <div class="io-row"><span class="io-k" data-lang-zh>输出</span><span class="io-k" data-lang-en>Out</span><span class="io-v" data-lang-zh>提示词改写提案（影子验证）</span><span class="io-v" data-lang-en>Prompt rewrite proposal (shadow-tested)</span></div>
+          </div>
+          <div class="agent-tags"><span class="agent-tag">默认关</span><span class="agent-tag ai">生产隔离</span></div>
+        </div>
+
+        <div class="agent-card reveal reveal-d1" style="background:linear-gradient(180deg,var(--fill-brand),var(--card));border-color:rgba(94,92,230,.28)">
+          <div class="ac-top">
+            <span class="ac-ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></svg></span>
+            <div><h4 data-lang-zh>影子验证 → 灰度放量</h4><h4 data-lang-en>Shadow proof → staged rollout</h4><div class="ac-key">evolution / replay</div></div>
+          </div>
+          <p data-lang-zh>批判 Agent 的每条提案都不会直接上线：先在影子回放里用历史样本验证，达标才进入灰度发布、显著性检验与自动放量/回滚。这套调度是确定性的统计逻辑，不是 LLM。</p>
+          <p data-lang-en>No proposal goes live directly: it's first proven on historical samples in shadow replay, and only then enters staged release, significance testing and auto rollout/rollback. This orchestration is deterministic statistics — not an LLM.</p>
+          <div class="agent-tags"><span class="agent-tag blue">确定性编排</span><span class="agent-tag">影子回放</span></div>
+        </div>
+
+      </div>
+    </div>
+
+  </div>
+</section>
+<!-- ============ 行业通用化亮点 ============ -->
+<section class="section section-tint">
+  <div class="wrap">
+    <div class="iron-law reveal" style="background:linear-gradient(120deg,rgba(15,181,168,.1),rgba(94,92,230,.08));border-color:rgba(15,181,168,.28)">
+      <div class="il-ico" style="background:rgba(15,181,168,.16);color:var(--ai)"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 7h18M3 12h18M3 17h18"/><circle cx="7.5" cy="7" r="1.4" fill="currentColor"/><circle cx="13" cy="12" r="1.4" fill="currentColor"/><circle cx="9" cy="17" r="1.4" fill="currentColor"/></svg></div>
+      <div>
+        <h4 data-lang-zh>换行业，不靠堆 Agent，靠换"配置"</h4><h4 data-lang-en>New industry? Swap config, not agents</h4>
+        <p data-lang-zh>很多人以为做多行业要给每个行业养一支专属 Agent。我们没有。教育、医美、电商、咨询……用的是<b style="color:var(--ink-1)">同一个回复决策 Agent</b>，差异全部来自注入的行业画像数据——客户阶段、标签维度、状态机、运营方法、人格基调都是配置，不是代码。引擎层与行业彻底解耦：上一个新行业，配的是数据，不是新写一个智能体。这也是为什么"配置生成编队"如此关键——它让通用引擎一键适配任意私域生意。</p>
+        <p data-lang-en>Many assume multi-industry means a dedicated agent per industry. We don't. Education, aesthetics, e-commerce, consulting — all run on <b style="color:var(--ink-1)">one reply decision agent</b>; the differences come entirely from injected domain-profile data — stages, tag dimensions, state machine, playbook, persona are config, not code. The engine is fully decoupled from any industry: onboarding a new one means configuring data, not writing a new agent. That's why the configuration squad matters — it lets one universal engine adapt to any private-domain business.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ============ 确定性编排器（诚实区分） ============ -->
+<section class="section section-deep">
+  <div class="wrap">
+    <div class="t-head reveal">
+      <span class="eyebrow" data-lang-zh>调度层 · 诚实区分</span><span class="eyebrow" data-lang-en>Scheduling layer · honest distinction</span>
+      <h2 class="h-section" data-lang-zh>负责"何时发起"的，<span class="text-grad">是确定性代码，不是 LLM</span></h2>
+      <h2 class="h-section" data-lang-en>What decides "when to act" is <span class="text-grad">deterministic code, not an LLM</span></h2>
+      <p class="lead orch-note" data-lang-zh>我们不把调度也包装成"智能体"。决定何时主动跟进、何时派发、何时唤醒沉默客户的，是可预测、可审计的规则引擎。它们自主发起，但绝不直接说话——真正开口的永远是上面那些 LLM Agent，经过完整的决策与评审链路。</p>
+      <p class="lead orch-note" data-lang-en>We don't dress up scheduling as "agents" either. What decides when to follow up, when to dispatch, when to re-engage a quiet customer is a predictable, auditable rule engine. They initiate autonomously but never speak directly — the actual talking always goes through the LLM agents above, via the full decision-and-review path.</p>
+    </div>
+    <div class="orch-grid">
+
+      <div class="orch-card reveal">
+        <div class="oc-top">
+          <span class="oc-ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg></span>
+          <div><h4 data-lang-zh>战略规划器</h4><h4 data-lang-en>Strategic planner</h4><div class="oc-en">planner / run_strategic_planner</div></div>
+        </div>
+        <p data-lang-zh>周期扫描已纳管客户，三段规则识别该不该主动跟进：太久没说话（沉默唤醒）、答应过的事没兑现（承诺兑现）、卡在某阶段不动（阶段停滞）。命中只生成跟进任务，从不直接发消息。</p>
+        <p data-lang-en>Periodically scans managed customers; three rules decide whether to follow up: gone quiet (re-engage), an unkept promise (commitment), stuck at a stage (stagnation). A hit only emits a follow-up task — it never sends directly.</p>
+        <span class="oc-tag">silent · commitment · stage_stagnation</span>
+      </div>
+
+      <div class="orch-card reveal reveal-d1">
+        <div class="oc-top">
+          <span class="oc-ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 4h16v6H4zM4 14h16v6H4z"/><path d="M8 7h.01M8 17h.01"/></svg></span>
+          <div><h4 data-lang-zh>跟进任务 Worker</h4><h4 data-lang-en>Follow-up task worker</h4><div class="oc-en">tasks / TASK_WORKER_INTERVAL</div></div>
+        </div>
+        <p data-lang-zh>定时轮询到期的跟进任务，逐个送进统一发送网关——和客户主动发消息触发的，是同一条决策+评审+发送流水线。没有"绕过网关"的捷径。</p>
+        <p data-lang-en>Polls due follow-up tasks on an interval and feeds each into the unified gateway — the same decide-review-send pipeline triggered by an inbound message. No shortcut bypasses the gateway.</p>
+        <span class="oc-tag">默认开 · 复用网关</span>
+      </div>
+
+      <div class="orch-card reveal reveal-d2">
+        <div class="oc-top">
+          <span class="oc-ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 12h4l2 5 4-14 2 7h6"/></svg></span>
+          <div><h4 data-lang-zh>发件箱派发器</h4><h4 data-lang-en>Outbox dispatcher</h4><div class="oc-en">outbox_dispatcher / atomic_claim</div></div>
+        </div>
+        <p data-lang-zh>独立 worker 原子抢占待发条目（租约 + 幂等键），调 MCP 工具真正发出。超时由回收器收回租约重试，绝不重复发送。发送与决策解耦，互不阻塞。</p>
+        <p data-lang-en>An independent worker atomically claims pending entries (lease + idempotency key) and calls the MCP tool to actually send. Expired leases are reclaimed and retried — never double-sent. Sending and deciding are decoupled.</p>
+        <span class="oc-tag">幂等 · 租约回收</span>
+      </div>
+
+    </div>
+  </div>
+</section>
+
+<!-- ============ 一条消息的完整流程 ============ -->
+<section class="section" id="flow">
+  <div class="wrap">
+    <div class="t-head reveal">
+      <span class="eyebrow" data-lang-zh>完整流程</span><span class="eyebrow" data-lang-en>The full relay</span>
+      <h2 class="h-section" data-lang-zh>一条消息进来，<span class="text-grad">这些 Agent 依次接手</span></h2>
+      <h2 class="h-section" data-lang-en>One message arrives, <span class="text-grad">and these agents take turns</span></h2>
+      <p class="lead" data-lang-zh>把上面的编队串成一条线：从客户发来一句话，到 AI 的回复真正送达，中间哪些是确定性调度、哪些是 LLM Agent 在思考，一目了然。</p>
+      <p class="lead" data-lang-en>Stringing the squads into one line: from the customer's message to the AI's reply landing, you can see exactly which steps are deterministic scheduling and which are LLM agents thinking.</p>
+    </div>
+
+    <div class="relay-legend reveal">
+      <span><i class="l-det"></i><span data-lang-zh>确定性调度 / 守门</span><span data-lang-en>Deterministic scheduling / gating</span></span>
+      <span><i class="l-llm"></i><span data-lang-zh>LLM Agent 在思考</span><span data-lang-en>An LLM agent thinking</span></span>
+    </div>
+
+    <div class="relay">
+      <div class="relay-step reveal">
+        <div class="relay-node n-det">IN</div>
+        <div class="relay-body">
+          <div class="rb-actor"><h4 data-lang-zh>消息进来 + 前置守门</h4><h4 data-lang-en>Inbound + precheck</h4><span class="rb-who is-det" data-lang-zh>确定性</span><span class="rb-who is-det" data-lang-en>Deterministic</span></div>
+          <p data-lang-zh>webhook 接收、落库，校验纳管状态、冷却、频率、每日上限。未纳管的只存不回。或由战略规划器/任务 worker 主动发起。</p>
+          <p data-lang-en>The webhook receives and persists, checks managed status, cooldown, rate and daily cap. Unmanaged contacts are stored, not answered. Or initiated by the planner / task worker.</p>
+        </div>
+      </div>
+
+      <div class="relay-step reveal">
+        <div class="relay-node n-llm">01</div>
+        <div class="relay-body">
+          <div class="rb-actor"><h4 data-lang-zh>知识库问答 Agent 取证</h4><h4 data-lang-en>Knowledge agent gathers evidence</h4><span class="rb-who is-llm">LLM</span></div>
+          <p data-lang-zh>永远前置：先决定要不要查知识、查什么、引用哪些切片。查不到就如实标记，绝不假装有据。</p>
+          <p data-lang-en>Always first: decide whether and what to consult, and which slices to cite. If nothing's found it says so — never fakes grounding.</p>
+        </div>
+      </div>
+
+      <div class="relay-step reveal">
+        <div class="relay-node n-llm">02</div>
+        <div class="relay-body">
+          <div class="rb-actor"><h4 data-lang-zh>回复决策 Agent 拿主意</h4><h4 data-lang-en>Reply agent decides</h4><span class="rb-who is-llm">LLM</span></div>
+          <p data-lang-zh>读完上下文、记忆、知识、画像，渐进式三档按需加载，生成回复草案与风险自评。首次接触会先由初始画像 Agent 建画像。</p>
+          <p data-lang-en>After context, memory, knowledge and profile — loaded by progressive tier on demand — it drafts a reply with self-assessed risk. First contact starts with the initial-profile agent.</p>
+        </div>
+      </div>
+
+      <div class="relay-step reveal">
+        <div class="relay-node n-llm">03</div>
+        <div class="relay-body">
+          <div class="rb-actor"><h4 data-lang-zh>独立评审 Agent 挑错</h4><h4 data-lang-en>Independent reviewer checks</h4><span class="rb-who is-llm">LLM</span></div>
+          <p data-lang-zh>只看事实投影、看不到内心戏，五维打分。要求改写时，回复 Agent 在完整档重生成一次并复审一次——至多一次，不无限循环。</p>
+          <p data-lang-en>Sees only the facts projection, not the reasoning, and scores five dimensions. If it asks for a rewrite, the reply agent regenerates once on the full tier and re-reviews once — at most once.</p>
+        </div>
+      </div>
+
+      <div class="relay-step reveal">
+        <div class="relay-node n-det">04</div>
+        <div class="relay-body">
+          <div class="rb-actor"><h4 data-lang-zh>闸门 + 幂等发件箱 + MCP 发送</h4><h4 data-lang-en>Gates + idempotent outbox + MCP send</h4><span class="rb-who is-det" data-lang-zh>确定性</span><span class="rb-who is-det" data-lang-en>Deterministic</span></div>
+          <p data-lang-zh>三道闸门、状态机校验、发出前再查一次前置条件，approved 才入幂等发件箱，由派发器调 MCP 真正送达。全程留痕、可审计。</p>
+          <p data-lang-en>Three gates, state-machine validation, a final precheck; only approved enters the idempotent outbox, where the dispatcher calls MCP to deliver. Fully logged and auditable.</p>
+        </div>
+      </div>
+
+      <div class="relay-step reveal">
+        <div class="relay-node n-llm">05</div>
+        <div class="relay-body">
+          <div class="rb-actor"><h4 data-lang-zh>反应分析 + 记忆固化 Agent 收尾</h4><h4 data-lang-en>Reaction + memory agents close the loop</h4><span class="rb-who is-llm">LLM</span></div>
+          <p data-lang-zh>送达之后，关系经营编队接手：读懂客户的下一句反应、把这一轮沉淀进长期记忆卡，让下一次对话从这里继续。</p>
+          <p data-lang-en>After delivery, the relationship squad takes over: read the customer's next reaction and fold this turn into the long-term memory card, so the next conversation continues from here.</p>
+        </div>
+      </div>
+    </div>
+
+    <!-- CI 评测一句话带过 -->
+    <p class="lead" style="max-width:780px;margin:clamp(36px,5vw,56px) auto 0;text-align:center;color:var(--ink-3);font-size:15.5px" data-lang-zh>以上都是<b style="color:var(--ink-1)">生产链路</b>的 Agent。此外还有一组只在 CI 里跑的<b style="color:var(--ink-1)">质量保障 Agent</b>——异族大模型扮演难缠客户、多裁判交叉打分，专门给运营对话挑刺，从不参与线上对话。<a href="technology.html#realtest" style="color:var(--brand)">看真实大模型测试 →</a></p>
+    <p class="lead" style="max-width:780px;margin:clamp(36px,5vw,56px) auto 0;text-align:center;color:var(--ink-3);font-size:15.5px" data-lang-en>All of the above are <b style="color:var(--ink-1)">production</b> agents. Beyond them is a set of <b style="color:var(--ink-1)">quality-assurance agents</b> that run only in CI — cross-family models role-playing tough customers, multiple judges scoring in crossfire to stress-test operational dialogue, never part of live conversations. <a href="technology.html#realtest" style="color:var(--brand)">See real-LLM testing →</a></p>
+  </div>
+</section>
+
+<!-- ============ 结尾 CTA ============ -->
+<section class="section cta-band">
+  <div class="wrap" style="text-align:center;max-width:760px">
+    <h2 class="h-section reveal" data-lang-zh>每一个 Agent，<span class="text-grad">都对应真实代码里的一行 prompt_key</span></h2>
+    <h2 class="h-section reveal" data-lang-en>Every agent maps to <span class="text-grad">a real prompt_key in the code</span></h2>
+    <p class="lead reveal" style="margin:18px auto 26px" data-lang-zh>不是营销话术堆出来的"智能"。每个 Agent 的职责、输入、输出、守门规则，都写进了 Rust 代码，跑在统一的 LLM 入口下，全程留痕、可审计。</p>
+    <p class="lead reveal" style="margin:18px auto 26px" data-lang-en>This isn't "intelligence" stacked from marketing copy. Each agent's role, inputs, outputs and guardrails are written into Rust, running under one LLM entrypoint — fully logged and auditable.</p>
+    <div class="reveal" style="display:flex;gap:14px;justify-content:center;flex-wrap:wrap">
+      <a href="technology.html" class="btn btn-primary"><span data-lang-zh>看技术架构</span><span data-lang-en>Technology</span><svg viewBox="0 0 24 24" fill="none"><path d="M5 12h14M13 6l6 6-6 6" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></a>
+      <a href="trust.html" class="btn btn-ghost"><span data-lang-zh>看信任与安全</span><span data-lang-en>Trust &amp; safety</span></a>
+    </div>
+  </div>
+</section>
+
+<!-- ============ 页脚 ============ -->
+<footer class="footer">
+  <div class="wrap">
+    <div class="footer-grid">
+      <div class="footer-brand">
+        <a href="index.html" class="brand"><span class="brand-mark"><svg viewBox="0 0 64 64" fill="none"><path fill="#fff" fill-rule="evenodd" clip-rule="evenodd" d="M18.5 7 H45.5 Q57.5 7 57.5 19 V33 Q57.5 45 45.5 45 H24 L13 57 V44.4 Q6.5 43 6.5 33 V19 Q6.5 7 18.5 7 Z M14 15.5 L20.2 38 L31 23 L33 23 L43.8 38 L50 15.5 L44.3 15.5 L40.4 31 L33.4 21 L30.6 21 L23.6 31 L19.7 15.5 Z M47 6.1 C47 12.02 46 13.5 42 13.5 C46 13.5 47 14.98 47 20.9 C47 14.98 48 13.5 52 13.5 C48 13.5 47 12.02 47 6.1 Z"/></svg></span>WeAgent</a>
+        <p data-lang-zh>全自治微信私域 AI 运营系统。客户永远只跟 AI 对话，AI 像真人一样长期经营每一段关系。</p>
+        <p data-lang-en>The autonomous WeChat private-domain AI operator. Customers only ever talk to the AI, which nurtures every relationship over time.</p>
+        <button class="wx-copy" data-wx="agimeme" type="button">
+          <svg viewBox="0 0 24 24" fill="none"><path d="M8.5 14.5c-3 0-5.5-2-5.5-4.6C3 7 5.8 5 9 5s6 2 6 4.9c0 .5-.1 1-.3 1.5M16 19c2.2 0 4-1.4 4-3.3 0-1.9-1.8-3.4-4-3.4s-4 1.5-4 3.4c0 .6.2 1.2.6 1.7L12 19l1.6-.5c.7.3 1.5.5 2.4.5z" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          <span data-lang-zh>顾问微信 <span class="wx-id">agimeme</span></span><span data-lang-en>WeChat <span class="wx-id">agimeme</span></span>
+          <span class="wx-hint" data-lang-zh>点击复制</span><span class="wx-hint" data-lang-en>tap to copy</span>
+        </button>
+      </div>
+      <div>
+        <h5 data-lang-zh>产品</h5><h5 data-lang-en>Product</h5>
+        <div class="footer-links">
+          <a href="solutions.html" data-lang-zh>解决什么问题</a><a href="solutions.html" data-lang-en>What it solves</a>
+          <a href="product.html" data-lang-zh>产品能力</a><a href="product.html" data-lang-en>Product</a>
+          <a href="agents.html" data-lang-zh>智能体编队</a><a href="agents.html" data-lang-en>Agents</a>
+          <a href="scenarios.html" data-lang-zh>行业场景</a><a href="scenarios.html" data-lang-en>Scenarios</a>
+        </div>
+      </div>
+      <div>
+        <h5 data-lang-zh>技术</h5><h5 data-lang-en>Technology</h5>
+        <div class="footer-links">
+          <a href="technology.html" data-lang-zh>技术架构</a><a href="technology.html" data-lang-en>Architecture</a>
+          <a href="agents.html#flow" data-lang-zh>完整流程</a><a href="agents.html#flow" data-lang-en>The full relay</a>
+          <a href="engineering.html" data-lang-zh>工程深度</a><a href="engineering.html" data-lang-en>Engineering depth</a>
+          <a href="evolution.html" data-lang-zh>自我演化</a><a href="evolution.html" data-lang-en>Self-evolution</a>
+        </div>
+      </div>
+      <div>
+        <h5 data-lang-zh>信任</h5><h5 data-lang-en>Trust</h5>
+        <div class="footer-links">
+          <a href="observability.html" data-lang-zh>运营透视</a><a href="observability.html" data-lang-en>Observability</a>
+          <a href="trust.html" data-lang-zh>信任与安全</a><a href="trust.html" data-lang-en>Trust &amp; safety</a>
+          <a href="trust.html" data-lang-zh>红线与守门</a><a href="trust.html" data-lang-en>Hard lines</a>
+        </div>
+      </div>
+    </div>
+    <div class="footer-bottom">
+      <span>© 2026 WeAgent · <span data-lang-zh>私域自主运营</span><span data-lang-en>Autonomous private-domain operations</span></span>
+      <span data-lang-zh>构建于 2026-06-28 · 由 Claude Code 根据项目代码生成 · by opus-4.8 · 11 万行 Rust 代码 · 比例 100%</span><span data-lang-en>Built 2026-06-28 · generated by Claude Code from the project codebase · by opus-4.8 · 110k+ lines of Rust · 100% generated</span>
+      <span data-lang-zh>Rust · Axum · MongoDB · React · MCP</span>
+      <span data-lang-en>Built with Rust · Axum · MongoDB · React · MCP</span>
+    </div>
+  </div>
+</footer>
+
+<script src="assets/i18n.js"></script>
+<script src="assets/shared.js"></script>
+</body>
+</html>
