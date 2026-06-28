@@ -545,6 +545,93 @@ pub(crate) fn is_valid_minor_amount(amount: Option<i64>) -> bool {
     amount.map_or(true, |v| v >= 0)
 }
 
+/// 活动定向推送：活动实体（workspace+account 级）。圈出买过指定产品的客户，
+/// 经运营确认后批量建 follow_up 任务定向推送活动信息。
+/// 字段 camelCase 落库（与 OutcomeEvent 同约定，前端 JSON 契约一致）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Campaign {
+    #[serde(rename = "_id", skip_serializing_if = "Option::is_none")]
+    pub id: Option<ObjectId>,
+    pub workspace_id: String,
+    pub account_id: String,
+    pub title: String,
+    /// 活动意图要点（注入 follow_up content，喂 Reply Agent 生成个性化话术）。
+    pub intent_text: String,
+    #[serde(default)]
+    pub segment_filter: SegmentFilter,
+    /// draft / previewed / confirmed / dispatching / completed / canceled（闭集，
+    /// 见 [`ALLOWED_CAMPAIGN_STATUS`]）。
+    pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_count: Option<i64>,
+    #[serde(default)]
+    pub dispatched_count: i64,
+    pub created_by: String,
+    pub created_at: DateTime,
+    pub updated_at: DateTime,
+}
+
+/// 活动人群圈选条件。各维 AND；空 = 不约束该维。
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct SegmentFilter {
+    /// 买过其中任一产品（$in 取并集）；空 = 不限产品。
+    #[serde(default)]
+    pub product_ids: Vec<String>,
+    /// 售后状态过滤：`in_aftercare` / `expired` / `any`；None = 不限。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub aftercare: Option<String>,
+    /// 价值分层：`high` / `mid` / `low`；None = 不限。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value_tier: Option<String>,
+    /// 客户阶段（走 system_taxonomies 字典）；None = 不限。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub customer_stage: Option<String>,
+}
+
+/// 活动每人推送台账。唯一索引 (campaign_id, contact_wxid) = 活动级去重闸：
+/// 同一活动对同一人只推一次（仿 outbox idempotency_key 幂等）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CampaignSend {
+    #[serde(rename = "_id", skip_serializing_if = "Option::is_none")]
+    pub id: Option<ObjectId>,
+    pub workspace_id: String,
+    pub account_id: String,
+    pub campaign_id: ObjectId,
+    pub contact_wxid: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<ObjectId>,
+    /// `enqueued`（已建 follow_up 任务）/ `skipped_duplicate`（去重命中）。
+    pub status: String,
+    pub created_at: DateTime,
+}
+
+/// `campaigns.status` 封闭枚举。所有写入路径在 `$set: { status: ... }` 前
+/// 必须经 [`assert_campaign_status_valid`] 校验。
+pub const ALLOWED_CAMPAIGN_STATUS: &[&str] = &[
+    "draft",
+    "previewed",
+    "confirmed",
+    "dispatching",
+    "completed",
+    "canceled",
+];
+
+/// 任意 `campaigns.status` 写入站点的闭集断言。命中闭集外值 debug panic /
+/// release 下 `tracing::error!` + 拒绝。仿 [`assert_agent_task_status_valid`]。
+#[track_caller]
+pub fn assert_campaign_status_valid(status: &str) {
+    if !ALLOWED_CAMPAIGN_STATUS.contains(&status) {
+        let msg = format!(
+            "campaigns.status='{status}' 不在 ALLOWED_CAMPAIGN_STATUS 闭集 {ALLOWED_CAMPAIGN_STATUS:?}"
+        );
+        debug_assert!(false, "{msg}");
+        tracing::error!(target: "agent_protocol_violation", "{msg}");
+    }
+}
+
 /// 自学习采集管道 S1–S3：行为信号（append-only 事件日志）。
 ///
 /// 方法论铁律落到结构上的体现：
@@ -6432,5 +6519,60 @@ mod tag_trust_tests {
             "snapshots[].consolidatedAt 必须是 string（D4-F1 修复），实际={}",
             v["personalityProfile"]["snapshots"][0]["consolidatedAt"]
         );
+    }
+}
+
+#[cfg(test)]
+mod campaign_model_tests {
+    use super::*;
+
+    #[test]
+    fn campaign_status_closed_set_covers_lifecycle() {
+        for s in ["draft", "previewed", "confirmed", "dispatching", "completed", "canceled"] {
+            assert!(ALLOWED_CAMPAIGN_STATUS.contains(&s), "缺少状态 {s}");
+        }
+        assert_eq!(ALLOWED_CAMPAIGN_STATUS.len(), 6);
+    }
+
+    #[test]
+    fn assert_campaign_status_accepts_valid_rejects_unknown() {
+        // 合法值不 panic
+        for s in ["draft", "previewed", "confirmed", "dispatching", "completed", "canceled"] {
+            assert_campaign_status_valid(s);
+        }
+        // 闭集外值在 debug 下 panic（用 catch_unwind 验证）
+        let r = std::panic::catch_unwind(|| assert_campaign_status_valid("bogus"));
+        assert!(r.is_err(), "闭集外值应触发 debug_assert panic");
+    }
+
+    #[test]
+    fn segment_filter_serializes_camelcase_and_defaults_empty() {
+        // SegmentFilter 默认全空 = 不约束任何维度
+        let f = SegmentFilter::default();
+        assert!(f.product_ids.is_empty());
+        assert!(f.aftercare.is_none());
+        assert!(f.value_tier.is_none());
+        assert!(f.customer_stage.is_none());
+        // camelCase 序列化（前端/JSON 契约）
+        let v = serde_json::to_value(&f).unwrap();
+        assert!(v.get("productIds").is_some(), "应序列化为 productIds");
+    }
+
+    #[test]
+    fn campaign_send_roundtrips_bson() {
+        // CampaignSend 能 BSON 往返（落库可行）
+        let cs = CampaignSend {
+            id: None,
+            workspace_id: "ws".into(),
+            account_id: "acc".into(),
+            campaign_id: ObjectId::new(),
+            contact_wxid: "wx1".into(),
+            task_id: None,
+            status: "enqueued".into(),
+            created_at: DateTime::now(),
+        };
+        let doc = mongodb::bson::to_document(&cs).unwrap();
+        let back: CampaignSend = mongodb::bson::from_document(doc).unwrap();
+        assert_eq!(back.contact_wxid, "wx1");
     }
 }
