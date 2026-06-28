@@ -707,6 +707,11 @@ pub(crate) async fn shadow_replay_prompt_one(
 - `prompt_override=None` 字节等价（现有调用点全传 None，`cargo test --lib` 基线不动）。
 - 隔离 + no-human-takeover 双 lint 绿；reply+review 两条链都能注入（critic 对 user.review.system 提的候选也能真评估）。
 
+### 阶段二跟进项（合并 PR #51 时一并记录；均不阻断，EVOLUTION_ENABLED 默认关）
+- [ ] **Important#1：shadow 的 LLM 消耗未计入 EvolutionBudget 全局闸。** 当前每条 prompt 候选 shadow 跑 `decide+review`（约 2 次 LLM 调用）走 `RunBudget`（run-local），不回灌 tick 级 `EvolutionBudget`；靠 cohort 大小间接兑底，极端大 cohort 下单 tick 真实 LLM 开销可能超出 `EvolutionBudget` 预期。两条修法：①fold-back 记账（shadow 跑完把 RunBudget 实际消耗 `EvolutionBudget::record_call` 回灌，低风险、仅上报准确）；②per-tick 全局闸（有界 stream + 共享原子，并发重构，本地无 Docker 难验）。倾向①。
+- [ ] **Minor-A：dead config `evolution_min_self_critique_delta`。** significance 已不读它（grade_prompt 改 completed≥1 即 eligible），残留配置项可清。
+- [ ] **Minor-B：完成测试的「恰好 2 次 LLM 调用」断言略脆。** `tests/evolution_prompt_shadow.rs` 对 mock 调用次数硬断言==2，若未来 shadow 内联多一次 LLM（如二次修订）会脆断；可放宽为 ≥2 或按角色计数。
+
 ---
 
 ## 阶段三：前端证据展示 + 人工 release（骨架，待阶段二落地后细化）
