@@ -6,10 +6,11 @@
 //!   humanLike, emotionalValue, productAccuracy}` 与候选阈值对比，给出 new_5gate_hit
 //!   与 new_final_review_status（不调 LLM、不写 outbox / mcp / conversation_messages
 //!   outbound / agent_run_logs）。
-//! - **Prompt 候选**：W3 不实装完整 LLM 短路（需要知识工具循环 +
-//!   review_decision 双 helper 全栈调用 + 大量上下文重建）；本期写
-//!   `shadow_replays.failed`，`failure_reason="prompt_replay_not_implemented_w3"`。
-//!   W4/W5 在 release 路径上线后再补完整 LLM 重放。
+//! - **Prompt 候选**：调 `crate::agent::prompt_shadow::shadow_replay_prompt_one`
+//!   用「原 prompt + critic 追加片段」对单条源样本跑一次真实的 Reply + Review
+//!   链路（纯演练，永不触达发送链 / outbox / MCP），把新旧两侧的 review.scores
+//!   推回 5 闸命中向量 + selfCritique addressed 落进 `shadow_replays`（含 G4
+//!   真实 original 侧字段），供显著性测试与管理员 release 对照。
 //!
 //! 严格隔离：
 //! - **不**调 `agent::run_user_operation_gateway` / `handle_managed_message` /
@@ -219,7 +220,21 @@ pub async fn run_shadow_replay(
     // 3. 按 proposal kind 分派。
     let outcome = match proposal.proposal_kind.as_str() {
         "threshold" => evaluate_threshold(proposal, &original),
-        "prompt" => ReplayOutcome::failed("prompt_replay_not_implemented_w3"),
+        // prompt 候选走真模型对照（async）。短路 gateway / outbox / MCP——
+        // shadow_replay_prompt_one 只跑 decide_reply + review_decision 演练。
+        "prompt" => {
+            match crate::agent::prompt_shadow::shadow_replay_prompt_one(
+                state,
+                proposal,
+                source_run_id,
+            )
+            .await
+            {
+                Ok(sample) => prompt_sample_to_outcome(sample),
+                // DB / LLM 故障 → 记 failed，不向上抛（避免单条 replay 拖垮整批）。
+                Err(e) => ReplayOutcome::failed_with(format!("prompt_shadow_error:{e}")),
+            }
+        }
         other => ReplayOutcome::failed_with(format!("unknown_proposal_kind:{other}")),
     };
 
@@ -273,42 +288,16 @@ fn evaluate_threshold(proposal: &Proposal, original: &AgentRunLog) -> ReplayOutc
     // 如果"被改的"那个 gate 仍然命中（block / rewrite 触发），final_review_status
     // 沿用源 run（多半是 blocked_*）；如果 new gate 未命中且其它 gate 也未命中，
     // 可标 approved；否则保留源 run 的 final 状态作为"无显著变化"信号。
-    let any_block_hit = new_5gate_hit
-        .get_bool("fact_risk_block")
-        .unwrap_or(false)
-        || new_5gate_hit.get_bool("pressure_risk_block").unwrap_or(false)
-        || new_5gate_hit
-            .get_bool("product_accuracy_score_block")
-            .unwrap_or(false);
-    let any_rewrite_hit = new_5gate_hit
-        .get_bool("human_like_score_rewrite")
-        .unwrap_or(false)
-        || new_5gate_hit
-            .get_bool("emotional_value_rewrite")
-            .unwrap_or(false);
-
-    let new_final = if any_block_hit {
-        // 与源 run 同款 block 类 —— 选最严的：fact > pressure > product
-        if new_5gate_hit.get_bool("fact_risk_block").unwrap_or(false) {
-            "held_by_ai_policy"
-        } else if new_5gate_hit
-            .get_bool("pressure_risk_block")
-            .unwrap_or(false)
-        {
-            "blocked_by_safety_guard"
-        } else {
-            "blocked_unverified_product_claim"
-        }
-    } else if any_rewrite_hit {
-        "approved_after_revision"
-    } else {
-        "approved"
-    };
+    let new_final = final_status_from_5gate(&new_5gate_hit);
 
     ReplayOutcome {
         completed: true,
         failure_reason: None,
         original_final_review_status: Some(original.final_review_status.clone()),
+        // threshold 路径不推 original 5 闸 / selfCritique（significance 用
+        // send_success 口径推 original 侧）；留默认空 / None。
+        original_5gate_hit: Document::new(),
+        original_self_critique_addressed: None,
         new_final_review_status: Some(new_final.to_string()),
         new_review_risks: Vec::new(),
         new_token_cost: Some(0),
@@ -342,15 +331,144 @@ fn evaluate_single_gate(scores: &Document, gate: &str, threshold: f64) -> bool {
 /// product < 7 / human < 6 / emotional < 5）。这是退化路径，仅用于 W3 短路；
 /// W4 task 5.1 的 `resolve_thresholds` 落地后会被替换。
 fn evaluate_single_gate_default(scores: &Document, gate: &str) -> bool {
-    let default_threshold = match gate {
-        "fact_risk_block" => 6.0,
-        "pressure_risk_block" => 7.0,
-        "human_like_score_rewrite" => 6.0,
-        "emotional_value_rewrite" => 5.0,
-        "product_accuracy_score_block" => 7.0,
-        _ => return false,
+    let default_threshold = match default_gate_threshold(gate) {
+        Some(t) => t,
+        None => return false,
     };
     evaluate_single_gate(scores, gate, default_threshold)
+}
+
+/// 5 闸的业务"惯用阈值"硬常量（与生产 gateway 默认一致）。prompt shadow 重放
+/// 不改阈值——新旧两侧都用同一组默认阈值把 review.scores 推回 5 闸命中口径，
+/// 唯一变量是 prompt 片段。
+fn default_gate_threshold(gate: &str) -> Option<f64> {
+    match gate {
+        "fact_risk_block" => Some(6.0),
+        "pressure_risk_block" => Some(7.0),
+        "human_like_score_rewrite" => Some(6.0),
+        "emotional_value_rewrite" => Some(5.0),
+        "product_accuracy_score_block" => Some(7.0),
+        _ => None,
+    }
+}
+
+/// 从 review.scores Document 读某 5 闸对应分数；兼容两套字段命名——reviewer
+/// 历史以 `factRisk`/`productAccuracy` 命名，`ReviewScores` 序列化形态是
+/// `hallucinationScore`/`knowledgeGroundingScore`（仅反序列化带 alias）。任一
+/// 命中即取，i32 / f64 落库都接。
+fn read_gate_score(scores: &Document, gate: &str) -> Option<f64> {
+    let candidates: &[&str] = match gate {
+        "fact_risk_block" => &["factRisk", "hallucinationScore"],
+        "pressure_risk_block" => &["pressureRisk"],
+        "human_like_score_rewrite" => &["humanLike"],
+        "emotional_value_rewrite" => &["emotionalValue"],
+        "product_accuracy_score_block" => &["productAccuracy", "knowledgeGroundingScore"],
+        _ => return None,
+    };
+    for k in candidates {
+        if let Ok(v) = scores.get_i32(k) {
+            return Some(v as f64);
+        }
+        if let Ok(v) = scores.get_f64(k) {
+            return Some(v);
+        }
+    }
+    None
+}
+
+/// 把 review.scores 推回 5 闸命中布尔向量（用默认阈值）。prompt shadow 用它
+/// 把新旧两侧 scores 统一映射成与 threshold 路径同形态的 `*_5gate_hit` Document。
+/// 缺字段按 0.0 计（保守：block 类不命中、rewrite 类命中——与生产对缺分的保守
+/// 处理一致）。
+fn scores_to_5gate_hit(scores: &Document) -> Document {
+    let mut hit = Document::new();
+    for gate in [
+        "fact_risk_block",
+        "pressure_risk_block",
+        "human_like_score_rewrite",
+        "emotional_value_rewrite",
+        "product_accuracy_score_block",
+    ] {
+        let score = read_gate_score(scores, gate).unwrap_or(0.0);
+        let threshold = default_gate_threshold(gate).unwrap_or(0.0);
+        let h = if BLOCK_DIRECTION_GTE.contains(&gate) {
+            score >= threshold
+        } else if REWRITE_DIRECTION_LT.contains(&gate) {
+            score < threshold
+        } else {
+            false
+        };
+        hit.insert(gate, h);
+    }
+    hit
+}
+
+/// 从 5 闸命中向量推 final_review_status：block 类（fact > pressure > product
+/// 取最严）→ 拦截态；否则 rewrite 类命中 → `approved_after_revision`；全不命中
+/// → `approved`。threshold / prompt 两条 shadow 路径共用同一口径。
+fn final_status_from_5gate(hit: &Document) -> &'static str {
+    let any_block_hit = hit.get_bool("fact_risk_block").unwrap_or(false)
+        || hit.get_bool("pressure_risk_block").unwrap_or(false)
+        || hit.get_bool("product_accuracy_score_block").unwrap_or(false);
+    let any_rewrite_hit = hit.get_bool("human_like_score_rewrite").unwrap_or(false)
+        || hit.get_bool("emotional_value_rewrite").unwrap_or(false);
+    if any_block_hit {
+        if hit.get_bool("fact_risk_block").unwrap_or(false) {
+            "held_by_ai_policy"
+        } else if hit.get_bool("pressure_risk_block").unwrap_or(false) {
+            "blocked_by_safety_guard"
+        } else {
+            "blocked_unverified_product_claim"
+        }
+    } else if any_rewrite_hit {
+        "approved_after_revision"
+    } else {
+        "approved"
+    }
+}
+
+/// 把 `PromptShadowSample` 映射成 `ReplayOutcome`。新旧两侧 review.scores 各自
+/// 推回 5 闸命中向量（同一组默认阈值，唯一变量是 prompt 片段），再推 final
+/// 状态；selfCritique addressed 两侧直接透传。`status="failed"` 的 sample →
+/// `ReplayOutcome::failed*`（completed=false，进 significance 的 failed 分母）。
+fn prompt_sample_to_outcome(
+    sample: crate::agent::prompt_shadow::PromptShadowSample,
+) -> ReplayOutcome {
+    if sample.status != "completed" {
+        return ReplayOutcome::failed_with(
+            sample
+                .failure_reason
+                .unwrap_or_else(|| "prompt_shadow_failed".to_string()),
+        );
+    }
+    let original_5gate_hit = sample
+        .original_scores
+        .as_ref()
+        .map(scores_to_5gate_hit)
+        .unwrap_or_default();
+    let new_5gate_hit = sample
+        .new_scores
+        .as_ref()
+        .map(scores_to_5gate_hit)
+        .unwrap_or_default();
+    let original_final = sample
+        .original_scores
+        .as_ref()
+        .map(|_| final_status_from_5gate(&original_5gate_hit).to_string());
+    let new_final = final_status_from_5gate(&new_5gate_hit).to_string();
+
+    ReplayOutcome {
+        completed: true,
+        failure_reason: None,
+        original_final_review_status: original_final,
+        original_5gate_hit,
+        original_self_critique_addressed: sample.original_self_critique_addressed,
+        new_final_review_status: Some(new_final),
+        new_review_risks: Vec::new(),
+        new_token_cost: None,
+        new_self_critique_addressed: sample.new_self_critique_addressed,
+        new_5gate_hit,
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -358,6 +476,12 @@ struct ReplayOutcome {
     completed: bool,
     failure_reason: Option<String>,
     original_final_review_status: Option<String>,
+    /// G4：源 run 的 5 闸命中向量（threshold 路径不填——其 original 侧 hit 由
+    /// significance 用 send_success 口径推；prompt 路径把源 run review.scores
+    /// 推回 5 闸口径填这里，喂 significance 真实新旧对照）。
+    original_5gate_hit: Document,
+    /// G4：源 run 的 selfCritique 是否被解决。
+    original_self_critique_addressed: Option<bool>,
     new_final_review_status: Option<String>,
     new_review_risks: Vec<String>,
     new_token_cost: Option<i64>,
@@ -371,6 +495,8 @@ impl ReplayOutcome {
             completed: false,
             failure_reason: Some(reason.to_string()),
             original_final_review_status: None,
+            original_5gate_hit: Document::new(),
+            original_self_critique_addressed: None,
             new_final_review_status: None,
             new_review_risks: Vec::new(),
             new_token_cost: None,
@@ -383,6 +509,8 @@ impl ReplayOutcome {
             completed: false,
             failure_reason: Some(reason),
             original_final_review_status: None,
+            original_5gate_hit: Document::new(),
+            original_self_critique_addressed: None,
             new_final_review_status: None,
             new_review_risks: Vec::new(),
             new_token_cost: None,
@@ -417,8 +545,8 @@ async fn persist_replay(
         status: if outcome.completed { "completed" } else { "failed" }.to_string(),
         failure_reason: outcome.failure_reason,
         original_final_review_status: outcome.original_final_review_status,
-        original_5gate_hit: Document::new(),
-        original_self_critique_addressed: None,
+        original_5gate_hit: outcome.original_5gate_hit,
+        original_self_critique_addressed: outcome.original_self_critique_addressed,
         new_final_review_status: outcome.new_final_review_status,
         new_review_risks: outcome.new_review_risks,
         new_token_cost: outcome.new_token_cost,

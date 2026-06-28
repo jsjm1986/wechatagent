@@ -4274,6 +4274,11 @@ pub struct Proposal {
     pub proposal_kind: String,
     /// `"pending_eval"` | `"evaluating"` | `"eligible_for_release"`
     /// | `"rejected_below_threshold"` | `"released"` | `"rolled_back"`。
+    ///
+    /// 对 prompt 类候选，`"eligible_for_release"` = 「shadow 真模型对照证据就绪，
+    /// 待管理员 release」——prompt 改动不自动放行，由管理员看 `eval_metrics` 里的
+    /// per-sample 新旧对照证据把关后决定是否发布（threshold 类才是阈值显著性
+    /// 自动判定）。此处不新增 status 取值。
     pub status: String,
     /// threshold 类专用（如 `"fact_risk_block"` / `"planner_block_rate_threshold"`）。
     pub gate_key: Option<String>,

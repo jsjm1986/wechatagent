@@ -3,7 +3,7 @@
 //! 对一条历史源 run（`agent_run_logs`），用「原 prompt + critic 追加片段」
 //! （[`PromptOverride`]）重新跑一次真实的 Reply + Review 链路，把新旧两侧的
 //! 5 闸命中 / 自评 addressed / review 状态打包成 [`PromptShadowSample`]，作为
-//! 人工 release 的对照证据。
+//! 管理员 release 的对照证据。
 //!
 //! 与 [`super::simulation`] 共用同一套加载链（playbook / memory / 知识路由 /
 //! recent / context_pack），区别有四：
