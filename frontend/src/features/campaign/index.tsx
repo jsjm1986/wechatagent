@@ -46,9 +46,12 @@ export default function CampaignFeature() {
 
   // 直接切到本频道（未经 openReport）且有选中 id 但无 report 且不在加载中 → 补一次加载。
   const loading = useCampaignStore((s) => s.loading);
+  const lastAttemptedId = useCampaignStore((s) => s.lastAttemptedId);
   useEffect(() => {
-    if (selectedCampaignId && !report && !loading) void loadReport(selectedCampaignId);
-  }, [selectedCampaignId, report, loading, loadReport]);
+    if (selectedCampaignId && !report && !loading && selectedCampaignId !== lastAttemptedId) {
+      void loadReport(selectedCampaignId);
+    }
+  }, [selectedCampaignId, report, loading, lastAttemptedId, loadReport]);
 
   if (!selectedCampaignId) {
     return (

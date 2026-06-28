@@ -31,7 +31,7 @@ const sample: CampaignReport = {
 describe("campaignStore", () => {
   beforeEach(() => {
     vi.clearAllMocks();
-    useCampaignStore.setState({ selectedCampaignId: null, report: null, loading: false });
+    useCampaignStore.setState({ selectedCampaignId: null, report: null, loading: false, lastAttemptedId: null });
   });
 
   it("loadReport 成功写入 report 并清 loading", async () => {
@@ -49,6 +49,12 @@ describe("campaignStore", () => {
     const s = useCampaignStore.getState();
     expect(s.report).toBeNull();
     expect(s.loading).toBe(false);
+  });
+
+  it("loadReport 失败也会记录 lastAttemptedId（守卫用）", async () => {
+    (api.get as any).mockRejectedValue(new Error("boom"));
+    await useCampaignStore.getState().loadReport("c1");
+    expect(useCampaignStore.getState().lastAttemptedId).toBe("c1");
   });
 
   it("openReport 设置 selectedCampaignId 并触发加载", async () => {
