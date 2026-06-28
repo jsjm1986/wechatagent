@@ -1901,4 +1901,121 @@ mod tests {
         let projected = guide_preview_json(preview);
         crate::routes::contract_snapshot::assert_contract_fixture("guide_preview", projected);
     }
+
+    /// 契约快照：operation_health_json（聚合 2 键 scores+items）。吃 Contact（44 字段全量
+    /// 构造,无 Default）+ OperatingMemory + Some(&AgentDecisionReview)。review 给 Some
+    /// 让 3 个 review-derived score 非零;键集对 Some/None 不变。
+    #[test]
+    fn operation_health_json_matches_contract_fixture() {
+        use super::operation_health_json;
+        use crate::models::{
+            AgentDecisionReview, AgentStatus, Contact, MemoryCardTyped, OperatingMemory,
+        };
+        use mongodb::bson::{doc, oid::ObjectId, DateTime, Document};
+
+        let contact = Contact {
+            id: Some(ObjectId::parse_str("64a1f2c3e4b5a697889c0001").unwrap()),
+            workspace_id: "ws-1".to_string(),
+            account_id: "acc-1".to_string(),
+            wxid: "wxid_abc".to_string(),
+            nickname: None,
+            remark: None,
+            alias: None,
+            agent_status: AgentStatus::Managed,
+            human_profile_note: Some("企业主，关注降本".to_string()),
+            custom_agent_instructions: None,
+            operation_mode_override: None,
+            agent_profile: None,
+            memory_summary: None,
+            playbook_id: None,
+            playbook_version: None,
+            manual_tags: vec![],
+            manual_tags_updated_at: None,
+            manual_tags_by: None,
+            confirmed_tags: vec![],
+            bayesian_signals: vec![],
+            personality_profile: None,
+            tags_version: 0,
+            domain_attributes: Some(doc! { "customer_stage": "negotiation", "intent_level": "high" }),
+            domain_attributes_updated_at: None,
+            commitments: vec![],
+            follow_up_policy: Some("每周一次".to_string()),
+            operation_state: None,
+            operation_state_reason: None,
+            operation_state_confidence: None,
+            operation_state_updated_at: None,
+            cooldown_until: Some(DateTime::from_millis(1_700_000_200_000)),
+            operation_policy: Document::new(),
+            profile_attributes: Document::new(),
+            profile_updated_at: None,
+            last_message_at: None,
+            last_inbound_at: None,
+            last_outbound_at: None,
+            last_agent_run_at: Some(DateTime::from_millis(1_700_000_000_000)),
+            last_outbound_style: None,
+            intent_trajectory: vec![],
+            outcome_events: vec![],
+            locale: None,
+            created_at: DateTime::from_millis(1_699_000_000_000),
+            updated_at: DateTime::from_millis(1_700_000_100_000),
+        };
+
+        let memory = OperatingMemory {
+            id: Some(ObjectId::parse_str("64a1f2c3e4b5a697889c0002").unwrap()),
+            workspace_id: "ws-1".to_string(),
+            account_id: "acc-1".to_string(),
+            contact_wxid: "wxid_abc".to_string(),
+            user_understanding: doc! { "identity": "企业主", "businessContext": "餐饮连锁" },
+            relationship_state: doc! { "trustLevel": "high", "temperature": "warm" },
+            product_fit: doc! { "fitReason": "需要私域自动化" },
+            next_action: doc! { "action": "follow_up" },
+            context_pack: Document::new(),
+            context_pack_version: 0,
+            context_pack_updated_at: None,
+            memory_card: MemoryCardTyped::default(),
+            memory_card_version: 0,
+            memory_card_updated_at: None,
+            created_at: DateTime::from_millis(1_699_000_000_000),
+            updated_at: DateTime::from_millis(1_700_000_100_000),
+        };
+
+        let review = AgentDecisionReview {
+            id: Some(ObjectId::parse_str("64a1f2c3e4b5a697889c0003").unwrap()),
+            workspace_id: "ws-1".to_string(),
+            account_id: "acc-1".to_string(),
+            contact_wxid: Some("wxid_abc".to_string()),
+            run_id: Some("run-1".to_string()),
+            inbound_message_id: None,
+            reply_text: None,
+            approved: true,
+            scores: doc! {
+                "knowledgeGroundingScore": 8i32,
+                "hallucinationScore": 2i32,
+                "pressureRisk": 3i32,
+            },
+            formula_breakdown: Document::new(),
+            risks: vec![],
+            rewrite_instruction: None,
+            review_summary: None,
+            playbook_id: None,
+            playbook_version: None,
+            used_knowledge_ids: vec![],
+            prompt_versions: Document::new(),
+            operation_state: None,
+            next_best_action: Document::new(),
+            context_pack_snapshot: Document::new(),
+            domain_config_snapshot: Document::new(),
+            runtime_parameters_snapshot: Document::new(),
+            send_gateway_result: Document::new(),
+            outcome_status: None,
+            reaction_analysis: Document::new(),
+            reaction_claimed_at: None,
+            reviewer_misjudge_signal: None,
+            status: "approved".to_string(),
+            created_at: DateTime::from_millis(1_700_000_000_000),
+        };
+
+        let projected = operation_health_json(&contact, &memory, Some(&review));
+        crate::routes::contract_snapshot::assert_contract_fixture("operation_health", projected);
+    }
 }
