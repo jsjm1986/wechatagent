@@ -1344,7 +1344,7 @@ async fn consolidate_contact_memory_inner(
         tag_observations_json,
         existing_dims_line
     );
-    let value = generate_agent_json(
+    let mut value = generate_agent_json(
         state,
         Some(&contact.account_id),
         Some(&contact.wxid),
@@ -1354,6 +1354,45 @@ async fn consolidate_contact_memory_inner(
         &user,
     )
     .await?;
+    // ⑨件二B：consolidator 偶发降级会把多条事实揉成一条非原子 blob
+    // （多句 / 数百字 / dimension=None），导致下游同 dimension 裁决纯函数空转、
+    // 旧值不退场。在落库前用结构度量（`value_has_non_atomic_fact`，零关键词、零数值
+    // 实体提取——守 agent-first）检测；命中则**至多重试一次**全新 LLM 调用（v4 探针
+    // 证明 1 次足够）。重试干净 → 用重试结果；重试仍非原子 → 保留重试结果继续走
+    // 落库前的"丢弃非原子 fact"兜底；重试调用本身失败（端点 glitch）→ **不阻断**
+    // 固化（既成事实纪律），保留首次 value + 记 warning 继续。
+    let mut non_atomic_warnings: Vec<String> = Vec::new();
+    if value_has_non_atomic_fact(&value) {
+        match generate_agent_json(
+            state,
+            Some(&contact.account_id),
+            Some(&contact.wxid),
+            Some(&run_id),
+            "user.memory_consolidator.task",
+            &system,
+            &user,
+        )
+        .await
+        {
+            Ok(retry_value) => {
+                if value_has_non_atomic_fact(&retry_value) {
+                    // 重试仍非原子：采用重试结果，标记交给落库前丢弃兜底处理。
+                    non_atomic_warnings.push("non_atomic_fact_persists_after_retry".to_string());
+                } else {
+                    non_atomic_warnings.push("non_atomic_fact_resolved_by_retry".to_string());
+                }
+                value = retry_value;
+            }
+            Err(err) => {
+                // 端点 glitch：不阻断固化，保留首次 value，记 warning，继续走丢弃兜底。
+                tracing::warn!(
+                    error = %err,
+                    "consolidator 非原子重试 LLM 调用失败，保留首次输出继续固化"
+                );
+                non_atomic_warnings.push("non_atomic_fact_retry_call_failed".to_string());
+            }
+        }
+    }
     // task 6.3：consolidator 输出的 memoryCard 是 JSON Document，先经
     // `MemoryCardTyped::from_document` 解析为 typed，再走 typed compact 合并；
     // 写入路径 `bson::to_document(&MemoryCardTyped)` 一次性序列化，不保留
@@ -1375,6 +1414,28 @@ async fn consolidate_contact_memory_inner(
     // 后此路径直接返回 400 / 拒收，由 caller 端契约保证 Structured 形态。
     let mut card_typed = card_typed;
     let auto_upgraded = card_typed.auto_upgrade_plain_facts();
+    // ⑨件二B：重试后仍非原子 → 落库前丢弃那几条非原子 fact（用结构度量纯函数判定，
+    // 零关键词），避免 blob 进入 compact 后污染同 dimension 裁决。干净 fact 全部保留。
+    // 只在重试仍持续非原子时执行；正常 / 重试已解决路径不触碰（retain 对干净卡是 no-op，
+    // 但显式 gate 更清晰、避免对每次固化都做无谓扫描）。
+    if non_atomic_warnings
+        .iter()
+        .any(|w| w == "non_atomic_fact_persists_after_retry")
+    {
+        let core_before = card_typed.core_facts.len();
+        let recent_before = card_typed.recent_facts.len();
+        card_typed
+            .core_facts
+            .retain(|f| !fact_is_non_atomic(f.as_text()));
+        card_typed
+            .recent_facts
+            .retain(|f| !fact_is_non_atomic(f.as_text()));
+        let dropped =
+            (core_before - card_typed.core_facts.len()) + (recent_before - card_typed.recent_facts.len());
+        if dropped > 0 {
+            non_atomic_warnings.push(format!("non_atomic_facts_dropped:{dropped}"));
+        }
+    }
     // HP-2 / Task 8：consolidator 输出与上一份 memoryCard 合并，
     // 未被显式 discarded 的 coreFacts 不会因为新近性被挤出。
     let discarded_list: Vec<String> = value
@@ -1405,6 +1466,8 @@ async fn consolidate_contact_memory_inner(
     // 做自动裁决（防 LLM 漏填 discarded 致旧值被 compact 合并救回）。now 复用本次固化时刻。
     let dim_warnings = deprecate_same_dimension_conflicts(&mut compact, DateTime::now());
     consolidator_warnings.extend(dim_warnings);
+    // ⑨件二B：把非原子检测 / 重试 / 丢弃产生的 warning 并入审计流。
+    consolidator_warnings.extend(non_atomic_warnings);
     if auto_upgraded > 0 {
         // Task 6.7：把"老 Vec<String> 形态被自动升级"作为可观测信号写入审计。
         // 数量也带出来，方便 sunset 灰度期度量曲线。
@@ -2512,6 +2575,58 @@ mod r7_deprecation_tests {
             }
         });
         assert!(!value_has_non_atomic_fact(&v));
+    }
+
+    // ⑨件二B：consolidator 调用点的"检测→重试→丢弃"接线行为单测。
+    #[test]
+    fn blob_value_is_flagged_for_retry() {
+        use crate::agent::memory::value_has_non_atomic_fact;
+        // consolidator 偶发降级：多条事实揉成一条非原子 blob（多换行）→ 应被标记触发重试。
+        let v = serde_json::json!({
+            "memoryCard": {
+                "coreFacts": [
+                    {"text": "孩子8岁\n后更新为10岁\n最终确认8岁\n预算5000", "dimension": ""}
+                ],
+                "recentFacts": []
+            }
+        });
+        assert!(value_has_non_atomic_fact(&v), "blob 应被标记触发重试");
+    }
+
+    #[test]
+    fn clean_value_not_flagged() {
+        use crate::agent::memory::value_has_non_atomic_fact;
+        // 干净原子 fact → 不应触发重试。
+        let v = serde_json::json!({
+            "memoryCard": {
+                "coreFacts": [
+                    {"text": "孩子10岁", "dimension": "孩子年龄"},
+                    {"text": "预算5000", "dimension": "预算"}
+                ],
+                "recentFacts": [{"text": "初次接触", "dimension": ""}]
+            }
+        });
+        assert!(!value_has_non_atomic_fact(&v), "干净原子 fact 不应触发重试");
+    }
+
+    #[test]
+    fn drop_non_atomic_facts_keeps_clean_ones() {
+        // 重试仍非原子时落库前的丢弃语义：retain(!fact_is_non_atomic) 丢 blob 保留干净 fact。
+        use crate::agent::memory::fact_is_non_atomic;
+        use crate::models::{MemoryCardTyped, MemoryFactRepr};
+        let mut card = MemoryCardTyped {
+            core_facts: vec![
+                MemoryFactRepr::Plain("孩子8岁\n更新为10岁\n确认8岁".to_string()),
+                MemoryFactRepr::Plain("预算5000".to_string()),
+            ],
+            recent_facts: vec![MemoryFactRepr::Plain("初次接触".to_string())],
+            ..Default::default()
+        };
+        card.core_facts.retain(|f| !fact_is_non_atomic(f.as_text()));
+        card.recent_facts.retain(|f| !fact_is_non_atomic(f.as_text()));
+        assert_eq!(card.core_facts.len(), 1, "blob 被丢弃，干净 fact 保留");
+        assert_eq!(card.core_facts[0].as_text(), "预算5000");
+        assert_eq!(card.recent_facts.len(), 1, "干净 recent fact 保留");
     }
 }
 
