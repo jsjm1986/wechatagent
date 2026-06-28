@@ -1398,61 +1398,6 @@ mod tests {
         );
     }
 
-    /// 契约快照 bless/对账：canonicalize(递归排序键)后与
-    /// `frontend/src/contracts/<name>.fixture.json` 比对。`UPDATE_SNAPSHOTS=1` 写文件(bless),
-    /// 否则只读比对,不一致即 panic 提示 re-bless。fixture 是前后端共用的单一真相源:
-    /// 后端测试写它、前端 vitest 导入同一份做 key 集对账,杜绝手抄漂移。
-    #[cfg(test)]
-    fn assert_contract_fixture(name: &str, value: Value) {
-        fn canonicalize(v: Value) -> Value {
-            match v {
-                Value::Object(map) => {
-                    let mut entries: Vec<(String, Value)> = map.into_iter().collect();
-                    entries.sort_by(|a, b| a.0.cmp(&b.0));
-                    let mut out = serde_json::Map::new();
-                    for (k, val) in entries {
-                        out.insert(k, canonicalize(val));
-                    }
-                    Value::Object(out)
-                }
-                Value::Array(arr) => Value::Array(arr.into_iter().map(canonicalize).collect()),
-                other => other,
-            }
-        }
-
-        let canonical = canonicalize(value);
-        let pretty = serde_json::to_string_pretty(&canonical).expect("serialize fixture") + "\n";
-
-        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("frontend/src/contracts")
-            .join(format!("{name}.fixture.json"));
-
-        if std::env::var("UPDATE_SNAPSHOTS").as_deref() == Ok("1") {
-            std::fs::create_dir_all(path.parent().unwrap()).expect("create contracts dir");
-            std::fs::write(&path, &pretty).expect("write fixture");
-            return;
-        }
-
-        let existing = std::fs::read_to_string(&path).unwrap_or_else(|_| {
-            panic!(
-                "契约 fixture 缺失:{}\n请运行 UPDATE_SNAPSHOTS=1 cargo test --lib {} 生成(bless)。",
-                path.display(),
-                name
-            )
-        });
-        let existing_canonical =
-            canonicalize(serde_json::from_str(&existing).expect("fixture 不是合法 JSON"));
-        let existing_pretty =
-            serde_json::to_string_pretty(&existing_canonical).expect("re-serialize") + "\n";
-
-        assert_eq!(
-            existing_pretty, pretty,
-            "\n投影 {name} 的线上形状与 fixture 不一致。\n\
-             若后端投影确有变更:运行 UPDATE_SNAPSHOTS=1 cargo test --lib {name} re-bless,\n\
-             再同步前端 vitest 契约测试的 CANONICAL_KEYS。\n"
-        );
-    }
-
     /// 契约快照 POC:列表投影 `operation_knowledge_chunk_json` 的线上形状(33 键,camelCase)
     /// 是前后端契约的唯一真相源。构造全量 chunk → 调投影 → canonicalize → 对账 fixture。
     /// 默认只读:投影变了没 re-bless → 测红(挡住"后端改了没同步前端")。
@@ -1521,7 +1466,10 @@ mod tests {
         };
 
         let projected = operation_knowledge_chunk_json(chunk);
-        assert_contract_fixture("operation_knowledge_chunk", projected);
+        crate::routes::contract_snapshot::assert_contract_fixture(
+            "operation_knowledge_chunk",
+            projected,
+        );
     }
 
     /// 根治 chunk PUT replace_one 清空 model 字段：请求体无法表达的 13 个字段 +
