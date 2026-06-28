@@ -17,7 +17,7 @@ use mongodb::{options::ClientOptions, Client, Collection, Database as MongoDatab
 use crate::models::{
     AgentCommandRun, AgentDecisionReview, AgentEvent, AgentOutcomeMetric, AgentPrincipalEscalation,
     AgentRunLog, AgentSendLedger, AgentSoul,
-    AgentTask, AgentToolCall, BehaviorSignal, BehaviorSignalMetric, CatalogRebuildJob,
+    AgentTask, AgentToolCall, BehaviorSignal, BehaviorSignalMetric, Campaign, CampaignSend, CatalogRebuildJob,
     ChunkRevision, Contact,
     ContentAsset, ConversationMessage, DomainProfile, DomainSchema, EvaluationScenario, Experiment, IngestSource,
     KnowledgeChatTask, KnowledgeChatTurn, KnowledgeDailyReport, KnowledgeGapSignal,
@@ -380,5 +380,15 @@ impl Database {
     /// 索引（`(workspace_id, product_id)` unique + `(workspace_id, status)`）见 `db/indexes.rs`。
     pub fn products(&self) -> Collection<Product> {
         self.db.collection("products")
+    }
+
+    /// 活动定向推送：活动实体集合。
+    pub fn campaigns(&self) -> Collection<Campaign> {
+        self.db.collection("campaigns")
+    }
+
+    /// 活动每人推送台账（去重 + 送达追踪）。
+    pub fn campaign_sends(&self) -> Collection<CampaignSend> {
+        self.db.collection("campaign_sends")
     }
 }
