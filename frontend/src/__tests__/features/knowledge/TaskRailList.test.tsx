@@ -34,6 +34,9 @@ describe("TaskRail 任务总览列表", () => {
     render(<TaskRail />);
     await waitFor(() => expect(screen.getByText("S1")).toBeInTheDocument());
     expect(screen.getByText("S2")).toBeInTheDocument();
+    // 进度文本用 completedStepCount 数字渲染（防止被误改成对数组取 .length）。
+    expect(screen.getByText("1/3")).toBeInTheDocument();
+    expect(screen.getByText("2/2")).toBeInTheDocument();
   });
 
   it("点选列表项触发 loadTask 拉详情", async () => {

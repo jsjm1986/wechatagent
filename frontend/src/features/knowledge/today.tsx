@@ -814,7 +814,11 @@ export function TaskRail() {
     }
   }
 
-  useEffect(() => { void loadTaskList(); }, []);
+  useEffect(() => {
+    void loadTaskList();
+    // loadTaskList 为组件内闭包（仅引用 setter/fetch）；空依赖仅在挂载时拉取一次。
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   function closeStream() {
     sseRef.current?.close();
@@ -839,6 +843,7 @@ export function TaskRail() {
       if (taskId) {
         setSessionId(taskId);
         void loadTask(taskId);
+        void loadTaskList();
       }
     }
     window.addEventListener("wikiTrackTask", onTrack as EventListener);
@@ -874,6 +879,7 @@ export function TaskRail() {
       );
       if (!r.ok) throw await parseApiError(r);
       await loadTask(task.taskId);
+      void loadTaskList();
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
