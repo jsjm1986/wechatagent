@@ -179,6 +179,7 @@ pub(crate) async fn decide_reply(
     knowledge_route: &KnowledgeRouteResult,
     rewrite_instruction: Option<&str>,
     run_id: Option<&str>,
+    prompt_override: Option<&PromptOverride>,
 ) -> AppResult<AgentDecision> {
     let (decision, _risks) = decide_reply_with_promote(
         state,
@@ -195,6 +196,7 @@ pub(crate) async fn decide_reply(
         knowledge_route,
         rewrite_instruction,
         run_id,
+        prompt_override,
         crate::agent::sufficiency::PromptTier::Full,
     )
     .await?;
@@ -296,6 +298,7 @@ pub(crate) async fn decide_reply_with_promote(
     knowledge_route: &KnowledgeRouteResult,
     rewrite_instruction: Option<&str>,
     run_id: Option<&str>,
+    prompt_override: Option<&PromptOverride>,
     tier: crate::agent::sufficiency::PromptTier,
 ) -> AppResult<(AgentDecision, Vec<String>)> {
     // 渐进式三档（2026-06-23）：按 tier 真实裁剪槽位三组。
@@ -583,6 +586,9 @@ pub(crate) async fn decide_reply_with_promote(
         contact.locale.as_deref(),
     )
     .await?;
+    let system_contract = prompt_override
+        .map(|o| o.apply_if_matches("user.reply.system", system_contract.clone()))
+        .unwrap_or(system_contract);
     let (policy, _policy_version) = prompts::load_prompt_for_contact(
         &state.db,
         &state.config.default_workspace_id,
@@ -601,6 +607,9 @@ pub(crate) async fn decide_reply_with_promote(
     // **红线**：boundary_protection 不放宽边界保护硬规则段不在任何替换范围、任何行业写死守护。
     // 新增 reply.policy 类 prompt override 字段时，加进那个 helper（勿在此散接）——见 helper 文档。
     let policy = super::domain_profile::apply_reply_policy_prompt_overrides(&policy, &active_profile);
+    let policy = prompt_override
+        .map(|o| o.apply_if_matches("user.reply.policy", policy.clone()))
+        .unwrap_or(policy);
     let (task_template, _task_version) = prompts::load_prompt_for_contact(
         &state.db,
         &state.config.default_workspace_id,
@@ -654,6 +663,9 @@ pub(crate) async fn decide_reply_with_promote(
         &task_template,
         &active_profile.conversation_modes,
     );
+    let task_template = prompt_override
+        .map(|o| o.apply_if_matches("user.reply.task", task_template.clone()))
+        .unwrap_or(task_template);
     // R-prompt-v3：Operator Instruction 层（最高优先级）。运营人员可在后台对
     // 单个联系人写一段 ≤ 1000 字的特别指令，覆盖 Soul + Policy 的默认人格判定
     // （如"老客户已签约，不要主动推销"、"这个客户技术背景，可以多用术语"）。
