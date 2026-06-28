@@ -19,6 +19,7 @@ import { useConfirm } from "../../components/ui/ConfirmDialog";
 import { ChunkPicker } from "../../components/ui/ChunkRef";
 import { EmptyState } from "../../components/ui/EmptyState";
 import { sourceTypeLabel, statusLabel, integrityStatusLabel, wikiTypeLabel, severityLabel, sourceKindLabel, ingestStatusLabel, riskLevelLabel, revisionOpLabel, revisionSourceLabel } from "./labels";
+import { DocumentRepairPanel } from "./DocumentRepairPanel";
 
 // ── G2 · DocumentsView · 知识文档目录 CRUD ─────────────────────────────
 interface DocumentItem {
@@ -93,6 +94,9 @@ export function DocumentsView() {
   const [docChunks, setDocChunks] = useState<Record<string, DocumentChunkRow[]>>({});
   const [docChunksLoading, setDocChunksLoading] = useState<string | null>(null);
   const [docChunksError, setDocChunksError] = useState<string | null>(null);
+  // E4：文档级批量修复——展开区点「批量 AI 修复」打开 DocumentRepairPanel，
+  // 它聚合该文档下 needs_review 切片，逐个复用 ChunkRepairPanel（落 draft+needs_review，AI 永不自动核验）。
+  const [repairDoc, setRepairDoc] = useState<{ id: string; title: string } | null>(null);
   // 编辑文档：点「编辑」先 GET /documents/:id 取完整文档回填，提交时把
   // 未编辑字段（rawContent/contentHash/lineIndex/sectionIndex 等）原样带上，
   // 避免后端 replace_one 整替换把它们清空。
@@ -510,8 +514,26 @@ export function DocumentsView() {
                       <div className="wikiHint">该文档下还没有知识条目。可走导入向导或手工新建。</div>
                     ) : (
                       <div style={{ display: "grid", gap: 4 }}>
-                        <div style={{ fontFamily: "var(--font-mono)", fontSize: 11, color: "var(--muted)", marginBottom: 4 }}>
-                          {docChunks[d.id].length} 条知识 · 点击编号查看详情
+                        <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 4 }}>
+                          <span style={{ fontFamily: "var(--font-mono)", fontSize: 11, color: "var(--muted)" }}>
+                            {docChunks[d.id].length} 条知识 · 点击编号查看详情
+                          </span>
+                          {/* E4：仅当该文档存在 needs_review 切片时显示批量 AI 修复入口。
+                              点击打开 DocumentRepairPanel（渲染在 chunk 列表下方），现有列表照常可用。 */}
+                          {docChunks[d.id].some((c) => c.integrityStatus === "needs_review") ? (
+                            <button
+                              type="button"
+                              className="wikiArchiveRollback"
+                              style={{ marginLeft: "auto" }}
+                              onClick={() =>
+                                setRepairDoc(
+                                  repairDoc?.id === d.id ? null : { id: d.id, title: d.title },
+                                )
+                              }
+                            >
+                              {repairDoc?.id === d.id ? "收起批量 AI 修复" : "批量 AI 修复"}
+                            </button>
+                          ) : null}
                         </div>
                         {docChunks[d.id].map((c) => (
                           <button
@@ -531,6 +553,13 @@ export function DocumentsView() {
                             <code style={{ fontSize: 10, color: "var(--muted)" }}>{c.id.slice(-6)}</code>
                           </button>
                         ))}
+                        {repairDoc?.id === d.id ? (
+                          <DocumentRepairPanel
+                            documentId={d.id}
+                            documentTitle={d.title}
+                            onClose={() => setRepairDoc(null)}
+                          />
+                        ) : null}
                       </div>
                     )}
                   </td>

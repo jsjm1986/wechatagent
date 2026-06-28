@@ -125,6 +125,11 @@ pub mod ext_knowledge {
     // 拿到 draft chunk 去 verify。ChatApplyRequest 派生 Deserialize，测试侧用
     // serde_json::from_value 构造，无需放开字段可见性。
     pub use super::knowledge::{chat_apply, ChatApplyRequest};
+    // Task6：chunk PUT update handler + 其请求体，供集成测试直驱（绕过 axum），
+    // 断言 replace_one 不再清空 provenance / wiki_type / locked_fields / created_at 等
+    // 「请求体无法表达」的 model 字段。请求体字段私有但派生 Deserialize，测试侧用
+    // serde_json::from_value 构造。
+    pub use super::knowledge::{update_operation_knowledge_chunk, OperationKnowledgeChunkRequest};
 }
 pub use shared::upsert_contact_from_value;
 
@@ -201,6 +206,7 @@ use knowledge::{
     batch_archive_chunks, batch_verify_chunks,
     chat_apply, chat_discard,
     chat_history, chat_session_stream, chat_task_cancel, chat_task_create, chat_task_get,
+    chat_task_list,
     chat_turn, create_ingest_source, create_operation_knowledge,
     create_operation_knowledge_chunk, create_operation_knowledge_document,
     delete_ingest_source, delete_operation_knowledge, delete_operation_knowledge_chunk,
@@ -672,7 +678,10 @@ pub fn api_router(state: AppState) -> Router<AppState> {
             "/knowledge/digest/cards/:id/dismiss",
             post(digest_dismiss_card),
         )
-        .route("/knowledge/chat/tasks", post(chat_task_create))
+        .route(
+            "/knowledge/chat/tasks",
+            get(chat_task_list).post(chat_task_create),
+        )
         .route(
             "/knowledge/chat/tasks/:id",
             get(chat_task_get),

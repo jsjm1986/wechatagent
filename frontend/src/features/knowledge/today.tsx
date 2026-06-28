@@ -782,13 +782,43 @@ interface ChatTaskView {
   finishedAt?: string | null;
 }
 
+interface ChatTaskListItem {
+  taskId: string;
+  sessionId: string;
+  status: string;
+  errorKind?: string | null;
+  totalSteps: number;
+  completedStepCount: number;
+  createdAt?: string;
+  startedAt?: string | null;
+  finishedAt?: string | null;
+}
+
 export function TaskRail() {
   const [sessionId, setSessionId] = useState("");
   const [task, setTask] = useState<ChatTaskView | null>(null);
   const [pending, setPending] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [liveTurns, setLiveTurns] = useState<number[]>([]);
+  const [taskList, setTaskList] = useState<ChatTaskListItem[]>([]);
   const sseRef = useRef<SseHandle | null>(null);
+
+  async function loadTaskList() {
+    try {
+      const r = await fetch("/api/knowledge/chat/tasks");
+      if (!r.ok) return; // 列表失败不阻塞手工跟踪，静默降级
+      const data = (await r.json()) as { items?: ChatTaskListItem[] };
+      setTaskList(data.items ?? []);
+    } catch {
+      /* 列表拉取失败：保留手工输入 fallback，不弹错 */
+    }
+  }
+
+  useEffect(() => {
+    void loadTaskList();
+    // loadTaskList 为组件内闭包（仅引用 setter/fetch）；空依赖仅在挂载时拉取一次。
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   function closeStream() {
     sseRef.current?.close();
@@ -813,6 +843,7 @@ export function TaskRail() {
       if (taskId) {
         setSessionId(taskId);
         void loadTask(taskId);
+        void loadTaskList();
       }
     }
     window.addEventListener("wikiTrackTask", onTrack as EventListener);
@@ -848,6 +879,7 @@ export function TaskRail() {
       );
       if (!r.ok) throw await parseApiError(r);
       await loadTask(task.taskId);
+      void loadTaskList();
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -881,6 +913,23 @@ export function TaskRail() {
           <Search size={14} /> 拉取
         </button>
       </div>
+      {taskList.length > 0 ? (
+        <ul className="wikiTaskRailList">
+          {taskList.map((t) => (
+            <li key={t.taskId}>
+              <button
+                type="button"
+                className={`wikiTaskRailListItem${task?.taskId === t.taskId ? " active" : ""}`}
+                onClick={() => { setSessionId(t.taskId); void loadTask(t.taskId); }}
+              >
+                <span className={`wikiTaskStatus s-${t.status}`}>{taskStatusLabel(t.status)}</span>
+                <span className="wikiTaskRailListSess">{t.sessionId}</span>
+                <span className="wikiTaskRailListSteps">{t.completedStepCount}/{t.totalSteps}</span>
+              </button>
+            </li>
+          ))}
+        </ul>
+      ) : null}
       {error ? <div className="wikiAlert error">{error}</div> : null}
       {task ? (
         <div className="wikiTaskRailBody">
