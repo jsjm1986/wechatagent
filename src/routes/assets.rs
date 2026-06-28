@@ -144,6 +144,7 @@ pub(super) async fn create_content_asset(
         requires_principal_approval: None,
         review_status: None,
         review_note: None,
+        min_inject_tier: None,
         created_at: DateTime::now(),
         updated_at: DateTime::now(),
     };

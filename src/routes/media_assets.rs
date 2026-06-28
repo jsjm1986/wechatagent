@@ -180,6 +180,7 @@ pub(super) async fn upload_media_asset(
         // AI 不自我核验红线：默认草稿，待人类 approve 才可发。
         review_status: Some("draft".into()),
         review_note: None,
+        min_inject_tier: None,
         created_at: DateTime::now(),
         updated_at: DateTime::now(),
     };
