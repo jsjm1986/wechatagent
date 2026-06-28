@@ -35,6 +35,22 @@ pub(super) async fn ensure_all(db: &Database) -> anyhow::Result<()> {
             None,
         )
         .await?;
+    // 活动定向推送：按购买产品反查客户。真实 BSON 路径是混合大小写——
+    // outcome_events(snake_case，Contact 无 rename_all) + productRef.productId
+    // (camelCase，OutcomeEvent/OutcomeProductRef 带 rename_all=camelCase)。
+    // outcome_events 是数组 → multikey 索引；$elemMatch 按产品反查命中此索引前缀。
+    db.contacts()
+        .create_index(
+            IndexModel::builder()
+                .keys(doc! {
+                    "workspace_id": 1,
+                    "account_id": 1,
+                    "outcome_events.productRef.productId": 1
+                })
+                .build(),
+            None,
+        )
+        .await?;
     db.messages()
         .create_index(
             IndexModel::builder()
@@ -651,6 +667,7 @@ pub(super) async fn ensure_all(db: &Database) -> anyhow::Result<()> {
     ensure_llm_provider_indexes(db).await?;
     // objective-purchase-facts G2：商品库索引。
     ensure_products_indexes(db).await?;
+    ensure_campaigns_indexes(db).await?;
     Ok(())
 }
 
@@ -707,6 +724,36 @@ async fn ensure_products_indexes(db: &Database) -> anyhow::Result<()> {
         .create_index(
             IndexModel::builder()
                 .keys(doc! { "workspace_id": 1, "status": 1 })
+                .build(),
+            None,
+        )
+        .await?;
+    Ok(())
+}
+
+/// 活动定向推送索引。
+/// - campaigns `(workspaceId, accountId, status)`：按状态列活动。
+/// - campaign_sends `(campaignId, contactWxid)` unique：活动级去重闸
+///   （同一活动对同一人只推一次，仿 outbox idempotency_key）。
+///
+/// key 用 camelCase：`Campaign` / `CampaignSend` 均带 `#[serde(rename_all =
+/// "camelCase")]`，BSON 层字段即 camelCase。若用 snake_case 会重蹈
+/// `ensure_llm_provider_indexes` 的覆辙——索引建在 null 字段上，unique 门把所有
+/// 文档当 (null, null) 重复键，第二条 CampaignSend 起全部 DuplicateKey，去重闸失效。
+async fn ensure_campaigns_indexes(db: &Database) -> anyhow::Result<()> {
+    db.campaigns()
+        .create_index(
+            IndexModel::builder()
+                .keys(doc! { "workspaceId": 1, "accountId": 1, "status": 1 })
+                .build(),
+            None,
+        )
+        .await?;
+    db.campaign_sends()
+        .create_index(
+            IndexModel::builder()
+                .keys(doc! { "campaignId": 1, "contactWxid": 1 })
+                .options(IndexOptions::builder().unique(true).build())
                 .build(),
             None,
         )
