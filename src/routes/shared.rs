@@ -1809,4 +1809,55 @@ mod tests {
         let projected = agent_run_json(item);
         crate::routes::contract_snapshot::assert_contract_fixture("agent_run", projected);
     }
+
+    /// 契约快照：decision_review_json（29 键）。AgentDecisionReview 29 字段全量构造;
+    /// 9 个下发 Document 放纯标量;used_knowledge_ids:Vec<ObjectId>→hex 字符串数组（不泄漏）;
+    /// final_review_status/hold_category 是函数参数,给 Some;reaction_claimed_at/
+    /// reviewer_misjudge_signal 赋值但投影不下发。
+    #[test]
+    fn decision_review_json_matches_contract_fixture() {
+        use super::decision_review_json;
+        use crate::models::AgentDecisionReview;
+        use mongodb::bson::{doc, oid::ObjectId, DateTime};
+
+        let review = AgentDecisionReview {
+            id: Some(ObjectId::parse_str("64a1f2c3e4b5a697889a0001").unwrap()),
+            workspace_id: "ws-1".to_string(),
+            account_id: "acc-1".to_string(),
+            contact_wxid: Some("wxid_abc".to_string()),
+            run_id: Some("run-1".to_string()),
+            inbound_message_id: Some("msg-1".to_string()),
+            reply_text: Some("您好，已收到".to_string()),
+            approved: true,
+            scores: doc! { "humanLikeScore": 8i32, "pressureRisk": 2i32 },
+            formula_breakdown: doc! { "weighted": "ok" },
+            risks: vec!["low".to_string()],
+            rewrite_instruction: Some("无需改写".to_string()),
+            review_summary: Some("通过".to_string()),
+            playbook_id: Some(ObjectId::parse_str("64a1f2c3e4b5a697889a0002").unwrap()),
+            playbook_version: Some(2),
+            used_knowledge_ids: vec![
+                ObjectId::parse_str("64a1f2c3e4b5a697889a0003").unwrap(),
+            ],
+            prompt_versions: doc! { "user.reply": "v2" },
+            operation_state: Some("negotiation".to_string()),
+            next_best_action: doc! { "action": "follow_up" },
+            context_pack_snapshot: doc! { "ctx": "snap" },
+            domain_config_snapshot: doc! { "domain": "user_operations" },
+            runtime_parameters_snapshot: doc! { "temp": "0.7" },
+            send_gateway_result: doc! { "status": "sent" },
+            outcome_status: Some("replied".to_string()),
+            reaction_analysis: doc! { "sentiment": "positive" },
+            reaction_claimed_at: Some(DateTime::from_millis(1_700_000_050_000)),
+            reviewer_misjudge_signal: Some("none".to_string()),
+            status: "approved".to_string(),
+            created_at: DateTime::from_millis(1_700_000_000_000),
+        };
+        let projected = decision_review_json(
+            review,
+            Some("approved_sent".to_string()),
+            Some("none".to_string()),
+        );
+        crate::routes::contract_snapshot::assert_contract_fixture("decision_review", projected);
+    }
 }
