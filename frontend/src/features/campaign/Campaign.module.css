@@ -87,3 +87,33 @@
 .pagerBtn:hover:not(:disabled) { border-color: rgba(10, 132, 255, .3); }
 .pagerBtn:disabled { color: var(--ink-3); cursor: not-allowed; opacity: .6; }
 .pagerInfo { font-size: 12px; color: var(--ink-3); font-variant-numeric: tabular-nums; }
+
+.form { display: grid; gap: 16px; }
+.field { display: grid; gap: 6px; }
+.fieldRow { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 14px; }
+@media (max-width: 720px) { .fieldRow { grid-template-columns: 1fr; } }
+.fieldLabel { font-size: 13px; font-weight: 600; color: var(--ink-1); }
+.fieldSub { font-size: 12px; font-weight: 600; color: var(--ink-2); }
+.fieldHint { font-size: 12px; color: var(--ink-3); }
+.input, .textarea, .select {
+  font: inherit; font-size: 13px; color: var(--ink-1);
+  padding: 9px 12px; border-radius: var(--r-sm);
+  border: 1px solid var(--hairline); background: var(--surface-card);
+}
+.textarea { min-height: 72px; resize: vertical; }
+.input:focus, .textarea:focus, .select:focus { outline: none; border-color: var(--color-scheduled); }
+.checkGroup { display: flex; flex-wrap: wrap; gap: 8px 16px; }
+.checkItem { display: inline-flex; align-items: center; gap: 6px; font-size: 13px; color: var(--ink-1); }
+.primaryBtn {
+  justify-self: start; font: inherit; font-size: 13px; font-weight: 600;
+  padding: 9px 20px; border-radius: var(--r-sm); cursor: pointer;
+  color: #fff; background: var(--color-scheduled); border: 1px solid rgba(10, 132, 255, .4);
+}
+.primaryBtn:hover:not(:disabled) { background: #0a78ec; }
+.primaryBtn:disabled { background: var(--fill-inactive); color: var(--ink-3); cursor: not-allowed; border-color: var(--hairline); }
+.previewNote { font-size: 12px; color: var(--ink-3); margin: 0 0 12px; }
+.samples { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 14px; }
+.sampleChip { font-size: 12px; padding: 5px 12px; border-radius: var(--r-sm); background: var(--fill-inactive); color: var(--ink-2); border: 1px solid var(--hairline); }
+.previewActions { display: grid; gap: 10px; }
+.dispatchHint { font-size: 12.5px; color: var(--ink-2); margin: 0; padding: 10px 14px; border-radius: var(--r-sm); background: rgba(10, 132, 255, .05); border: 1px solid rgba(10, 132, 255, .2); }
+.previewBtns { display: flex; gap: 10px; }
