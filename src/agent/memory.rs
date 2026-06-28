@@ -529,7 +529,17 @@ pub(crate) fn value_has_non_atomic_fact(value: &serde_json::Value) -> bool {
     false
 }
 
-/// ⑨记忆冲突机制侧兜底（2026-06-27）：对 `card.core_facts` 内**同 dimension** 的多条
+/// ⑨件二：落库前是否执行"丢弃非原子 fact"兜底的 gate 谓词（纯函数）。两种情形丢弃：
+/// - `non_atomic_fact_persists_after_retry`：重试输出仍非原子；
+/// - `non_atomic_fact_retry_call_failed`：重试 LLM 调用本身失败（端点 glitch），首次已确认
+///   非原子的 blob 不能原样落库——否则它进存储后，下轮固化若新输出干净则不触发检测、
+///   且 compact 按 text 去重把它救回，导致 blob 跨轮滞留。丢弃后下轮 LLM 从候选记忆重产。
+/// 干净 / 重试已解决（`non_atomic_fact_resolved_by_retry`）→ 不丢弃（常驻路径零开销）。
+pub(crate) fn should_drop_non_atomic(warnings: &[String]) -> bool {
+    warnings.iter().any(|w| {
+        w == "non_atomic_fact_persists_after_retry" || w == "non_atomic_fact_retry_call_failed"
+    })
+}
 /// Structured fact 做自动裁决——保留 `updated_at` 最新的一条，其余移入 `deprecated_facts`
 /// （带 deprecation_reason + supersededBy=最新条 id）。
 ///
@@ -1358,9 +1368,9 @@ async fn consolidate_contact_memory_inner(
     // （多句 / 数百字 / dimension=None），导致下游同 dimension 裁决纯函数空转、
     // 旧值不退场。在落库前用结构度量（`value_has_non_atomic_fact`，零关键词、零数值
     // 实体提取——守 agent-first）检测；命中则**至多重试一次**全新 LLM 调用（v4 探针
-    // 证明 1 次足够）。重试干净 → 用重试结果；重试仍非原子 → 保留重试结果继续走
-    // 落库前的"丢弃非原子 fact"兜底；重试调用本身失败（端点 glitch）→ **不阻断**
-    // 固化（既成事实纪律），保留首次 value + 记 warning 继续。
+    // 证明 1 次足够）。重试干净 → 用重试结果；重试仍非原子 → 落库前丢弃非原子条；
+    // 重试调用本身失败（端点 glitch）→ **不阻断**固化（既成事实纪律），但首次 value 已确认
+    // 非原子，同样走落库前丢弃剔除那几条 blob（防原样落库后跨轮滞留）。
     let mut non_atomic_warnings: Vec<String> = Vec::new();
     if value_has_non_atomic_fact(&value) {
         match generate_agent_json(
@@ -1384,10 +1394,12 @@ async fn consolidate_contact_memory_inner(
                 value = retry_value;
             }
             Err(err) => {
-                // 端点 glitch：不阻断固化，保留首次 value，记 warning，继续走丢弃兜底。
+                // 端点 glitch：不阻断固化（既成事实纪律），但首次 value 已确认非原子，
+                // 标记 retry_call_failed → 走落库前丢弃兜底剔除那几条 blob（防跨轮滞留），
+                // 其余正常 fact 照常落库。下轮固化由 LLM 从候选记忆重产被丢弃的内容。
                 tracing::warn!(
                     error = %err,
-                    "consolidator 非原子重试 LLM 调用失败，保留首次输出继续固化"
+                    "consolidator 非原子重试 LLM 调用失败，丢弃首次非原子 fact 后继续固化"
                 );
                 non_atomic_warnings.push("non_atomic_fact_retry_call_failed".to_string());
             }
@@ -1414,14 +1426,11 @@ async fn consolidate_contact_memory_inner(
     // 后此路径直接返回 400 / 拒收，由 caller 端契约保证 Structured 形态。
     let mut card_typed = card_typed;
     let auto_upgraded = card_typed.auto_upgrade_plain_facts();
-    // ⑨件二B：重试后仍非原子 → 落库前丢弃那几条非原子 fact（用结构度量纯函数判定，
-    // 零关键词），避免 blob 进入 compact 后污染同 dimension 裁决。干净 fact 全部保留。
-    // 只在重试仍持续非原子时执行；正常 / 重试已解决路径不触碰（retain 对干净卡是 no-op，
-    // 但显式 gate 更清晰、避免对每次固化都做无谓扫描）。
-    if non_atomic_warnings
-        .iter()
-        .any(|w| w == "non_atomic_fact_persists_after_retry")
-    {
+    // ⑨件二B：重试后仍非原子、**或**重试 LLM 调用失败（端点 glitch）→ 落库前丢弃那几条
+    // 非原子 fact（用结构度量纯函数判定，零关键词），避免 blob 进入 compact 后污染同 dimension
+    // 裁决、或原样落库后跨轮滞留。干净 fact 全部保留。gate 见 `should_drop_non_atomic`；
+    // 正常 / 重试已解决路径不触碰（避免对每次固化做无谓扫描）。
+    if should_drop_non_atomic(&non_atomic_warnings) {
         let core_before = card_typed.core_facts.len();
         let recent_before = card_typed.recent_facts.len();
         card_typed
@@ -2627,6 +2636,34 @@ mod r7_deprecation_tests {
         assert_eq!(card.core_facts.len(), 1, "blob 被丢弃，干净 fact 保留");
         assert_eq!(card.core_facts[0].as_text(), "预算5000");
         assert_eq!(card.recent_facts.len(), 1, "干净 recent fact 保留");
+    }
+
+    #[test]
+    fn drop_gate_fires_when_retry_still_non_atomic() {
+        use crate::agent::memory::should_drop_non_atomic;
+        // 重试后仍非原子 → 必须丢弃。
+        let w = vec!["non_atomic_fact_persists_after_retry".to_string()];
+        assert!(should_drop_non_atomic(&w), "重试仍非原子应触发丢弃");
+    }
+
+    #[test]
+    fn drop_gate_fires_when_retry_call_failed() {
+        use crate::agent::memory::should_drop_non_atomic;
+        // 重试 LLM 调用本身失败（端点 glitch）：首次已确认非原子的 blob 不能原样落库
+        // （否则跨轮滞留），同样要走丢弃兜底——闭合 Err 分支残留自愈缺口。
+        let w = vec!["non_atomic_fact_retry_call_failed".to_string()];
+        assert!(should_drop_non_atomic(&w), "重试调用失败也应触发丢弃");
+    }
+
+    #[test]
+    fn drop_gate_silent_on_clean_or_resolved() {
+        use crate::agent::memory::should_drop_non_atomic;
+        // 干净（无 warning）或重试已解决 → 不丢弃（常驻路径零开销，不误删干净 fact）。
+        assert!(!should_drop_non_atomic(&[]), "干净输出不触发丢弃");
+        assert!(
+            !should_drop_non_atomic(&["non_atomic_fact_resolved_by_retry".to_string()]),
+            "重试已解决不触发丢弃"
+        );
     }
 }
 
