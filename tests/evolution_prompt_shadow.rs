@@ -5,10 +5,10 @@
 //! nightly real-llm 套件覆盖）：
 //!   1. **completed**：种好 prompt proposal（proposed_template_key=user.reply.policy
 //!      + 合法 diff_snippet）+ 源 AgentRunLog（含 review.scores + selfCritiqueAddressed
-//!      + context.inboundMessageId）+ 对应 inbound message + managed contact；
-//!      mock 让 decide_reply + review_decision 各返回一条确定结果 → 断言写出的
-//!      ShadowReplay status=="completed"，original/new 两侧 5 闸命中向量都被填。
-//!   2. **source_message_unavailable**：源 run 的 inboundMessageId 指向一条不存在的
+//!      + 顶层 source_event_id = 真实 message.message_id）+ 对应 inbound message +
+//!      managed contact；mock 让 decide_reply + review_decision 各返回一条确定结果 →
+//!      断言写出的 ShadowReplay status=="completed"，original/new 两侧 5 闸命中向量都被填。
+//!   2. **source_message_unavailable**：源 run 的 source_event_id 指向一条不存在的
 //!      message → run_shadow_replay 的 retention 探针拦下，status=="failed"、
 //!      failure_reason=="source_message_unavailable"。该用例同时回归 replay.rs
 //!      retention 探针字段名（必须用 snake_case `message_id`，与 ConversationMessage
@@ -102,9 +102,11 @@ fn make_inbound(contact: &Contact, message_id: &str, content: &str) -> Conversat
 }
 
 /// 构造源 AgentRunLog：带 `review.scores`（G4 原始基线）+ `selfCritiqueAddressed`
-/// + `context.inboundMessageId`（shadow 据此反查真实历史消息）。`contact_wxid`
-/// 决定 contact 反查命中与否。字段集与 `src/evolution/replay.rs` 单测 `mk_run_log`
-/// 对齐。
+/// + 顶层 `source_event_id`（= R0 envelope 的 message.message_id；shadow 据此反查
+/// 真实历史消息）。生产 gateway 从不往 `context` 写 inboundMessageId——shadow /
+/// replay retention 探针都读顶层 `source_event_id`，这里还原该真实形状。
+/// `contact_wxid` 决定 contact 反查命中与否。字段集与 `src/evolution/replay.rs`
+/// 单测 `mk_run_log` 对齐。
 fn make_run_log(contact_wxid: &str, inbound_message_id: &str) -> AgentRunLog {
     let scores = doc! {
         "humanLike": 8_i32,
@@ -122,8 +124,9 @@ fn make_run_log(contact_wxid: &str, inbound_message_id: &str) -> AgentRunLog {
         trigger_kind: "inbound_message".to_string(),
         status: "completed".to_string(),
         planner: Document::new(),
-        // shadow 读 context.inboundMessageId（camelCase，与 gateway 落库一致）。
-        context: doc! { "inboundMessageId": inbound_message_id },
+        // 生产形状：gateway 不往 context 写 inboundMessageId。源 inbound id 走
+        // 顶层 source_event_id（见下方）。
+        context: Document::new(),
         knowledge_route: Document::new(),
         decision: Document::new(),
         review: doc! { "scores": scores, "selfCritiqueAddressed": true },
@@ -134,6 +137,7 @@ fn make_run_log(contact_wxid: &str, inbound_message_id: &str) -> AgentRunLog {
         llm_calls_used: 0,
         degraded_reasons: vec![],
         lifecycle: "completed".to_string(),
+        // shadow / replay retention 探针据此反查真实历史消息（snake_case message_id）。
         source_event_id: inbound_message_id.to_string(),
         source_kind: "inbound_message".to_string(),
         error_summary: None,
@@ -339,7 +343,7 @@ async fn run_shadow_replay_prompt_completed_fills_both_sides() {
     assert_eq!(replay.source_run_id, source_run_id, "source_run_id 透传一致");
 }
 
-/// source_message_unavailable：context.inboundMessageId 指向不存在的 message。
+/// source_message_unavailable：source_event_id 指向不存在的 message。
 /// 同时回归 replay.rs retention 探针字段名（snake_case message_id）：若探针误用
 /// camelCase，则**真实**消息也恒 count==0、completed 路径会被错杀——这里反向锁定
 /// 「不存在 → failed」「存在 → completed（见上一个用例）」两侧一致。
@@ -356,7 +360,7 @@ async fn run_shadow_replay_prompt_failed_when_message_missing() {
         .await
         .expect("insert contact");
 
-    // 故意不插入 inbound message：context 引用 msg_ghost_404，messages 集合里没有。
+    // 故意不插入 inbound message：source_event_id 引用 msg_ghost_404，messages 集合里没有。
     let run = make_run_log(&contact.wxid, "msg_ghost_404");
     let source_run_id = run.id.expect("run id present");
     app.state

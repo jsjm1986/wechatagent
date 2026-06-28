@@ -69,7 +69,6 @@ pub fn safety_block_status_for(gate_key: Option<&str>) -> Option<&'static str> {
 pub struct SignificanceCfg {
     pub min_replays: usize,
     pub min_send_success_delta: f64,
-    pub min_self_critique_delta: f64,
     pub max_5gate_hit_increase: f64,
     pub max_fail_rate: f64,
     /// #152：安全闸放松回归率上限。shadow 中"原本被该安全闸拦下、新配置却
@@ -83,7 +82,6 @@ impl SignificanceCfg {
         Self {
             min_replays: cfg.evolution_min_replays,
             min_send_success_delta: cfg.evolution_min_send_success_delta,
-            min_self_critique_delta: cfg.evolution_min_self_critique_delta,
             max_5gate_hit_increase: cfg.evolution_max_5gate_hit_increase,
             max_fail_rate: cfg.evolution_replay_max_fail_rate,
             max_safety_regression_rate: cfg.evolution_max_safety_regression_rate,
@@ -210,13 +208,9 @@ pub fn grade_threshold(
 
 /// Prompt 候选显著性测试。
 ///
-/// 通过条件（必须全部成立）：
-/// - completed ≥ min_replays
-/// - failed / total ≤ max_fail_rate
-/// - self_critique_addressed_delta ≥ min_self_critique_delta
-/// - 5 闸任一项 hit_rate 涨幅 ≤ max_5gate_hit_increase
-///
-/// `token_cost_delta` 仅观测、不强制。
+/// 阶段二语义：prompt 候选**不**用数值阈值（send_success / self_critique delta /
+/// 5 闸涨幅）自动判生死——那是 threshold 数值候选的玩法。prompt 改动靠真模型
+/// shadow 对照产出**证据**供管理员 release 把关。详见下方语义说明。
 /// Prompt 候选证据汇总（**不自动放行/拒绝**）。
 ///
 /// 阶段二语义改造：prompt 候选不再用 critique_delta / 5 闸涨幅 gate 自动判生死
@@ -596,7 +590,6 @@ mod tests {
         SignificanceCfg {
             min_replays: 30,
             min_send_success_delta: 0.05,
-            min_self_critique_delta: 0.10,
             max_5gate_hit_increase: 0.10,
             max_fail_rate: 0.30,
             max_safety_regression_rate: 0.0,

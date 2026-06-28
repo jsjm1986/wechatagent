@@ -40,6 +40,7 @@ use super::memory::{
     effective_memory_card_for_contact, load_or_create_operating_memory, next_memory_card_version,
 };
 use super::review::{effective_review_mode, review_decision};
+use super::run_envelope::SOURCE_KIND_INBOUND_MESSAGE;
 use super::runtime::{resolve_thresholds, UserRuntimeParameters};
 use super::types::RunPlannerResult;
 
@@ -143,23 +144,26 @@ pub(crate) async fn shadow_replay_prompt_one(
         None => return Ok(PromptShadowSample::failed(source_run_id, "contact_unavailable")),
     };
 
-    // 5. inbound 用源 run 关联的真实消息（context 里 inboundMessageId / 兼容
-    //    inbound_message_id），不合成。retention 已清理 → failed。
-    let inbound_id = original
-        .context
-        .get_str("inboundMessageId")
-        .or_else(|_| original.context.get_str("inbound_message_id"))
-        .ok()
-        .map(str::to_string);
-    let inbound_id = match inbound_id {
-        Some(id) => id,
-        None => {
-            return Ok(PromptShadowSample::failed(
-                source_run_id,
-                "source_message_unavailable",
-            ))
-        }
-    };
+    // 5. inbound 用源 run 关联的真实消息，不合成。源 inbound id 落在 AgentRunLog
+    //    顶层 `source_event_id`（= R0 envelope 的 `message.message_id`，见
+    //    gateway `trigger_envelope_source`）——gateway 从不往 `context` 写
+    //    inboundMessageId，故必须读顶层字段。prompt shadow 只针对 inbound run：
+    //    follow_up 的 source_event_id 是 task hex，查 messages 必 miss——这里靠
+    //    source_kind 显式短路，避免无意义的一次 DB 查询。空串 / `synthetic:`
+    //    前缀表示无真实 message id（兜底合成 id）→ 同记 `source_message_unavailable`。
+    if original.source_kind != SOURCE_KIND_INBOUND_MESSAGE {
+        return Ok(PromptShadowSample::failed(
+            source_run_id,
+            "source_message_unavailable",
+        ));
+    }
+    let inbound_id = original.source_event_id.trim().to_string();
+    if inbound_id.is_empty() || inbound_id.starts_with("synthetic:") {
+        return Ok(PromptShadowSample::failed(
+            source_run_id,
+            "source_message_unavailable",
+        ));
+    }
     let inbound = match state
         .db
         .messages()
@@ -197,7 +201,6 @@ pub(crate) async fn shadow_replay_prompt_one(
             budget.clone(),
             shadow_replay_inner(
                 state,
-                &original.context,
                 contact,
                 inbound,
                 domain_config,
@@ -216,7 +219,6 @@ pub(crate) async fn shadow_replay_prompt_one(
 #[allow(clippy::too_many_arguments)]
 async fn shadow_replay_inner(
     state: &AppState,
-    _original_context: &Document,
     contact: crate::models::Contact,
     inbound: ConversationMessage,
     domain_config: Option<crate::models::OperationDomainConfig>,
