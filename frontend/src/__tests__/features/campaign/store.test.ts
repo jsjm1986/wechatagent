@@ -76,3 +76,63 @@ describe("campaignStore", () => {
     expect(s.loading).toBe(false);
   });
 });
+
+describe("campaignStore 列表/视图扩展", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    useCampaignStore.setState({
+      selectedCampaignId: null, report: null, loading: false, lastAttemptedId: null,
+      view: "list", campaigns: [], listLoading: false, listLoaded: false, page: 0,
+    });
+  });
+
+  it("setView 切换视图", () => {
+    useCampaignStore.getState().setView("create");
+    expect(useCampaignStore.getState().view).toBe("create");
+  });
+
+  it("loadCampaigns 成功写入 campaigns + listLoaded", async () => {
+    const items = [{ campaignId: "c1", title: "T", status: "completed", dispatchedCount: 5, createdBy: "a" }];
+    (api.get as any).mockResolvedValue({ items });
+    await useCampaignStore.getState().loadCampaigns();
+    const s = useCampaignStore.getState();
+    expect(s.campaigns).toEqual(items);
+    expect(s.listLoaded).toBe(true);
+    expect(s.listLoading).toBe(false);
+    expect(api.get).toHaveBeenCalledWith("/api/campaigns");
+  });
+
+  it("loadCampaigns 失败也置 listLoaded=true(防重试循环) + campaigns 保持空", async () => {
+    (api.get as any).mockRejectedValue(new Error("boom"));
+    await useCampaignStore.getState().loadCampaigns();
+    const s = useCampaignStore.getState();
+    expect(s.listLoaded).toBe(true);
+    expect(s.listLoading).toBe(false);
+    expect(s.campaigns).toEqual([]);
+  });
+
+  it("openReport 多设 view=board + page=0", () => {
+    (api.get as any).mockResolvedValue({ campaignId: "c1", title: "", status: "", summary: {}, items: [] });
+    useCampaignStore.setState({ page: 7 });
+    useCampaignStore.getState().openReport("c1");
+    const s = useCampaignStore.getState();
+    expect(s.view).toBe("board");
+    expect(s.page).toBe(0);
+    expect(s.selectedCampaignId).toBe("c1");
+  });
+
+  it("setPage 改翻页", () => {
+    useCampaignStore.getState().setPage(3);
+    expect(useCampaignStore.getState().page).toBe(3);
+  });
+
+  it("clear 重置新字段", () => {
+    useCampaignStore.setState({ view: "board", campaigns: [{ campaignId: "x", title: "", status: "", dispatchedCount: 0, createdBy: "" }], listLoaded: true, page: 5 });
+    useCampaignStore.getState().clear();
+    const s = useCampaignStore.getState();
+    expect(s.view).toBe("list");
+    expect(s.campaigns).toEqual([]);
+    expect(s.listLoaded).toBe(false);
+    expect(s.page).toBe(0);
+  });
+});
