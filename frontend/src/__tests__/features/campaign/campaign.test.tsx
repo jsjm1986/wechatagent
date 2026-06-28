@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { render, screen, within, fireEvent } from "@testing-library/react";
-import CampaignFeature, { bucketTone, bucketLabel } from "../../../features/campaign";
+import CampaignFeature from "../../../features/campaign/CampaignBoard";
+import { bucketTone, bucketLabel } from "../../../features/campaign/buckets";
 import { useCampaignStore } from "../../../stores/campaignStore";
 import type { CampaignReport } from "../../../stores/campaignStore";
 
@@ -57,8 +58,9 @@ describe("CampaignFeature", () => {
   });
 
   it("有 report 渲汇总数值 + 明细表行数 = items 长度", () => {
-    (useCampaignStore as any).mockReturnValue({
-      selectedCampaignId: "c1", report, loading: false, loadReport: vi.fn(),
+    (useCampaignStore as any).mockImplementation((sel?: any) => {
+      const state = { selectedCampaignId: "c1", report, loading: false, lastAttemptedId: "c1", loadReport: vi.fn(), page: 0, setPage: vi.fn() };
+      return sel ? sel(state) : state;
     });
     render(<CampaignFeature />);
     // 标题
@@ -81,15 +83,16 @@ describe("CampaignFeature", () => {
     (useCampaignStore as any).mockReturnValue({
       selectedCampaignId: "c1",
       report: { ...report, items: [], summary: { ...report.summary, targetCount: 0, sent: 0, pending: 0, blocked: {}, escalated: {} } },
-      loading: false, loadReport: vi.fn(),
+      loading: false, loadReport: vi.fn(), page: 0, setPage: vi.fn(),
     });
     render(<CampaignFeature />);
     expect(screen.getByText("暂无推送明细")).toBeInTheDocument();
   });
 
   it("点某桶 chip 后明细表只剩该桶行", () => {
-    (useCampaignStore as any).mockReturnValue({
-      selectedCampaignId: "c1", report, loading: false, loadReport: vi.fn(),
+    (useCampaignStore as any).mockImplementation((sel?: any) => {
+      const state = { selectedCampaignId: "c1", report, loading: false, lastAttemptedId: "c1", loadReport: vi.fn(), page: 0, setPage: vi.fn() };
+      return sel ? sel(state) : state;
     });
     render(<CampaignFeature />);
     // 初始 5 行
