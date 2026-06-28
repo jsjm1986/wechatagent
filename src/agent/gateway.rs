@@ -1033,6 +1033,7 @@ async fn run_user_operation_gateway_inner(
         &knowledge_route,
         None,
         Some(&run_id),
+        None,
         first_pass_tier,
     )
     .await?;
@@ -1114,6 +1115,7 @@ async fn run_user_operation_gateway_inner(
                     &knowledge_route,
                     None,
                     Some(&run_id),
+                    None,
                     crate::agent::sufficiency::PromptTier::Full,
                 )
                 .await?
@@ -1189,6 +1191,7 @@ async fn run_user_operation_gateway_inner(
                 &knowledge_route,
                 None,
                 Some(&run_id),
+                None,
                 target_tier,
             )
             .await?
@@ -1385,6 +1388,7 @@ async fn run_user_operation_gateway_inner(
                 &knowledge_route,
                 Some(&review.rewrite_instruction),
                 Some(&run_id),
+                None,
                 crate::agent::sufficiency::PromptTier::Full,
             )
             .await?;
@@ -1660,6 +1664,7 @@ async fn run_user_operation_gateway_inner(
                 &knowledge_route,
                 Some(&revision_direction),
                 Some(&run_id),
+                None,
                 crate::agent::sufficiency::PromptTier::Full,
             );
             match tokio::time::timeout(std::time::Duration::from_secs(30), revision_future).await {

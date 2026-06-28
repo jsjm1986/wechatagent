@@ -165,6 +165,7 @@ async fn simulate_user_dialogue_inner(
             &knowledge_route,
             None,
             Some(&run_id),
+            None,
         )
         .await?;
         normalize_decision_state(&mut decision, domain_config.as_ref());
