@@ -3430,3 +3430,88 @@
       grid-template-columns: minmax(0, 1fr);
     }
   }
+
+  /* ── Task5 · chunk AI 修复面板（ChunkRepairPanel）+ provenance 来源区 ──
+     AI 提议区用 brand 紫（--fill-brand / #5E5CE6）标 AI 身份；落库按钮走已有
+     .wikiBtn.primary（蓝）；其余中性墨色。仅 needs_review chunk 在 Inspector 显入口。 */
+  .wikiRepairPanel {
+    margin: 12px 0;
+    padding: 12px 14px;
+    border: 1px solid rgba(94, 92, 230, 0.28);
+    border-left: 3px solid #5e5ce6;
+    border-radius: var(--r-sm);
+    background: var(--fill-brand);
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+  }
+  .wikiRepairInterp {
+    font-size: 12px;
+    line-height: 1.5;
+    color: var(--ink-1);
+    font-family: var(--font-body);
+  }
+  .wikiRepairConfidence {
+    font-size: 11px;
+    color: var(--ink-3);
+    font-family: var(--font-mono);
+  }
+  .wikiRepairFields {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }
+  .wikiRepairField {
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+    padding: 8px 10px;
+    background: var(--surface-card);
+    border: 1px solid var(--hairline);
+    border-radius: var(--r-sm);
+  }
+  .wikiRepairFieldName {
+    font-size: 11px;
+    font-weight: 600;
+    color: var(--ink-2);
+    font-family: var(--font-mono);
+  }
+  .wikiRepairFieldValue {
+    font-size: 12px;
+    line-height: 1.5;
+    color: var(--ink-1);
+    font-family: var(--font-body);
+    white-space: pre-wrap;
+    word-break: break-word;
+  }
+  .wikiRepairMissing {
+    font-size: 11px;
+    color: var(--color-held, #ff9f0a);
+    font-family: var(--font-body);
+  }
+  .wikiRepairFollowup {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }
+  .wikiRepairFollowupItem {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    font-size: 12px;
+    color: var(--ink-1);
+    font-family: var(--font-body);
+  }
+  /* provenance 来源区：Inspector 元信息 dl 内的一项，中性墨色，与 wikiArchiveTag 协调。 */
+  .wikiProvenance {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 6px;
+  }
+  .wikiProvBy,
+  .wikiProvModel {
+    font-size: 11px;
+    color: var(--ink-3);
+    font-family: var(--font-mono);
+  }
