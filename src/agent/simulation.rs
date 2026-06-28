@@ -200,6 +200,7 @@ async fn simulate_user_dialogue_inner(
                 &knowledge_route,
                 effective_review_mode(&planner, &decision, &runtime, false),
                 Some(&run_id),
+                None,
             )
             .await?
         };

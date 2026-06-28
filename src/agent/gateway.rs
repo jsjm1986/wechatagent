@@ -267,6 +267,7 @@ pub async fn send_contact_message_gateway(
         &knowledge_route,
         "full",
         Some(&run_id),
+        None,
     )
     .await?;
     if !review_passed(&review, &runtime) {
@@ -1320,6 +1321,7 @@ async fn run_user_operation_gateway_inner(
             &knowledge_route,
             effective_review_mode(&planner, &decision, &runtime, false),
             Some(&run_id),
+            None,
         )
         .await?
     } else {
@@ -1417,6 +1419,7 @@ async fn run_user_operation_gateway_inner(
                 &knowledge_route,
                 "full",
                 Some(&run_id),
+                None,
             )
             .await?;
         }
@@ -1689,6 +1692,7 @@ async fn run_user_operation_gateway_inner(
                         &knowledge_route,
                         "full",
                         Some(&run_id),
+                        None,
                     )
                     .await?;
 

@@ -45,7 +45,9 @@ use crate::prompts;
 use crate::routes::AppState;
 
 use super::budget::RunBudget;
-use super::decision::{format_operation_domain_config_for_prompt, format_playbook_for_prompt};
+use super::decision::{
+    format_operation_domain_config_for_prompt, format_playbook_for_prompt, PromptOverride,
+};
 use super::generate_agent_json;
 use super::knowledge_router::format_operation_knowledge_for_prompt_with_roles;
 use super::runtime::UserRuntimeParameters;
@@ -245,6 +247,7 @@ pub async fn review_fixed_candidate_for_test(
         &knowledge_route,
         review_mode,
         None,
+        None,
     )
     .await
 }
@@ -264,6 +267,7 @@ pub(crate) async fn review_decision(
     knowledge_route: &KnowledgeRouteResult,
     review_mode: &str,
     run_id: Option<&str>,
+    prompt_override: Option<&PromptOverride>,
 ) -> AppResult<DecisionReviewResult> {
     if !decision.should_reply {
         return Ok(DecisionReviewResult {
@@ -286,6 +290,12 @@ pub(crate) async fn review_decision(
     };
     let system =
         prompts::load_prompt(&state.db, &state.config.default_workspace_id, prompt_key).await?;
+    // shadow replay：critic 候选若命中本 prompt_key（user.review.system /
+    // user.review.light.system）则末尾追加片段，跑「原 prompt + 追加」真模型对照。
+    // 现有调用点全传 None → 不触发 → review prompt 逐字不变（字节等价护栏）。
+    let system = prompt_override
+        .map(|o| o.apply_if_matches(prompt_key, system.clone()))
+        .unwrap_or(system);
     // universal-domain-adaptation H16-b：reviewer 的产品知识段也按 active profile 的
     // chunk_roles 渲染（与 Reply Agent 同源）。缓存命中即廉价；DEFAULT 销售四态字节等价。
     let active_profile = crate::agent::domain_profile::load_active_domain_profile(
