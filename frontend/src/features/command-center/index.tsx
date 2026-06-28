@@ -5,6 +5,7 @@ import { PlanStep, type PlanStepStatus } from "../../components/ui/PlanStep";
 import { useAccountStore } from "../../stores/accountStore";
 import { useContactStore } from "../../stores/contactStore";
 import { useCommandStore } from "../../stores/commandStore";
+import { useCampaignStore } from "../../stores/campaignStore";
 import type { CommandToolCall, CommandResult } from "../../types";
 import { McpKeyForm } from "./McpKeyForm";
 import styles from "./CommandCenter.module.css";
@@ -119,6 +120,15 @@ function commandCallDetail(call: CommandToolCall): string {
     ].filter(Boolean).join(" · ");
   }
   return call.status;
+}
+
+// 活动推送结果跳转守卫：仅当 dispatch_campaign 真实执行成功且带 campaignId 才给跳转 id，
+// 否则返回 null（dry-run / 待确认 / 非该工具 / 无 id 一律不渲，防死链）。
+export function dispatchCampaignId(call: CommandToolCall): string | null {
+  if (call.toolName !== "wechatagent.dispatch_campaign") return null;
+  if (call.status !== "succeeded" && call.status !== "executed_unverified") return null;
+  const id = call.response?.campaignId;
+  return typeof id === "string" ? id : null;
 }
 
 function resultTitle(result: CommandResult): string {
@@ -281,14 +291,27 @@ export default function CommandCenterFeature() {
           </div>
           {commandResult?.toolCalls.length ? (
             <div className={styles.planSteps}>
-              {commandResult.toolCalls.map((call) => (
-                <PlanStep
-                  key={call.id || call.toolName}
-                  status={planStepStatus(call)}
-                  title={`${call.toolName} · ${callStatusLabel(call.status)}`}
-                  detail={commandCallDetail(call)}
-                />
-              ))}
+              {commandResult.toolCalls.map((call) => {
+                const campaignId = dispatchCampaignId(call);
+                return (
+                  <div key={call.id || call.toolName}>
+                    <PlanStep
+                      status={planStepStatus(call)}
+                      title={`${call.toolName} · ${callStatusLabel(call.status)}`}
+                      detail={commandCallDetail(call)}
+                    />
+                    {campaignId && (
+                      <button
+                        type="button"
+                        className={styles.campaignJump}
+                        onClick={() => useCampaignStore.getState().openReport(campaignId)}
+                      >
+                        查看推送结果 →
+                      </button>
+                    )}
+                  </div>
+                );
+              })}
             </div>
           ) : (
             <div className={styles.planSteps}>
