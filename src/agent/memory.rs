@@ -389,6 +389,21 @@ pub fn compact_memory_card_with_dimensions(
             if discarded.iter().any(|d| d == fact_text) {
                 continue;
             }
+            // ⑨件一：dimension 感知救回。若该旧 fact 带非空 dimension，且 incoming
+            // 已有同 dimension 的 Structured fact（新值已覆盖该维度），则不救回旧值
+            // ——防 LLM 漏填 deprecatedFacts/discarded 时改口旧值被 text 不等救回致双值。
+            // dimension=None 退回纯 text 去重（字节等价）。纯结构判定,零关键词零 LLM。
+            if let MemoryFactRepr::Structured(prev_f) = fact {
+                if let Some(prev_dim) = prev_f.dimension.as_ref().filter(|d| !d.trim().is_empty()) {
+                    let incoming_has_same_dim = compact.core_facts.iter().any(|item| {
+                        matches!(item, MemoryFactRepr::Structured(f)
+                            if f.dimension.as_ref().map(|d| d.trim()) == Some(prev_dim.trim()))
+                    });
+                    if incoming_has_same_dim {
+                        continue;
+                    }
+                }
+            }
             if !compact
                 .core_facts
                 .iter()
@@ -468,7 +483,63 @@ fn limit_extra_array(doc: &mut Document, key: &str, max_items: usize) {
     }
 }
 
-/// ⑨记忆冲突机制侧兜底（2026-06-27）：对 `card.core_facts` 内**同 dimension** 的多条
+/// ⑨件二（方案 X）：结构性非原子检测——判断一条 fact 的 text 是否是"非原子 blob"
+/// （consolidator 偶发降级把多个事实揉进一条）。**纯结构度量，零关键词、零数值实体
+/// 提取、零 LLM**（守 agent-first）：仅看换行数 / 句界标点数 / char 长度这类客观结构特征。
+///
+/// 三条 OR 判据（互为冗余兜底）：
+/// - ≥2 个换行 `\n`（blob 典型形态：多句 summary 用换行拼接）；
+/// - ≥2 个句界标点（`。`/`！`/`？`/`;`）（多个完整句 = 多个事实）；
+/// - char 数 > 80（正常原子 fact 实测 ≤~20 字，blob 数百字；80 是宽松上界，
+///   宁漏判不误伤——漏判的 blob 还有换行/句界判据兜底 + 件一救回 + 重试）。
+pub(crate) fn fact_is_non_atomic(text: &str) -> bool {
+    let newline_count = text.matches('\n').count();
+    if newline_count >= 2 {
+        return true;
+    }
+    let sentence_breaks = text
+        .chars()
+        .filter(|c| matches!(c, '。' | '！' | '？' | ';' | '；'))
+        .count();
+    if sentence_breaks >= 2 {
+        return true;
+    }
+    text.chars().count() > 80
+}
+
+/// ⑨件二：扫 consolidator 原始输出 `value` 的 `memoryCard.coreFacts[].text` 与
+/// `recentFacts[].text`，任一条 `fact_is_non_atomic` 即判定本次输出含非原子 blob。
+/// 兼容 `memoryCard`（camelCase）/ `memory_card`（snake_case）两种 key。
+pub(crate) fn value_has_non_atomic_fact(value: &serde_json::Value) -> bool {
+    let card = value
+        .get("memoryCard")
+        .or_else(|| value.get("memory_card"))
+        .unwrap_or(value);
+    for key in ["coreFacts", "recentFacts"] {
+        if let Some(arr) = card.get(key).and_then(|v| v.as_array()) {
+            for item in arr {
+                if let Some(text) = item.get("text").and_then(|t| t.as_str()) {
+                    if fact_is_non_atomic(text) {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    false
+}
+
+/// ⑨件二：落库前是否执行"丢弃非原子 fact"兜底的 gate 谓词（纯函数）。两种情形丢弃：
+/// - `non_atomic_fact_persists_after_retry`：重试输出仍非原子；
+/// - `non_atomic_fact_retry_call_failed`：重试 LLM 调用本身失败（端点 glitch），首次已确认
+///   非原子的 blob 不能原样落库——否则它进存储后，下轮固化若新输出干净则不触发检测、
+///   且 compact 按 text 去重把它救回，导致 blob 跨轮滞留。丢弃后下轮 LLM 从候选记忆重产。
+/// 干净 / 重试已解决（`non_atomic_fact_resolved_by_retry`）→ 不丢弃（常驻路径零开销）。
+pub(crate) fn should_drop_non_atomic(warnings: &[String]) -> bool {
+    warnings.iter().any(|w| {
+        w == "non_atomic_fact_persists_after_retry" || w == "non_atomic_fact_retry_call_failed"
+    })
+}
 /// Structured fact 做自动裁决——保留 `updated_at` 最新的一条，其余移入 `deprecated_facts`
 /// （带 deprecation_reason + supersededBy=最新条 id）。
 ///
@@ -1283,7 +1354,7 @@ async fn consolidate_contact_memory_inner(
         tag_observations_json,
         existing_dims_line
     );
-    let value = generate_agent_json(
+    let mut value = generate_agent_json(
         state,
         Some(&contact.account_id),
         Some(&contact.wxid),
@@ -1293,6 +1364,47 @@ async fn consolidate_contact_memory_inner(
         &user,
     )
     .await?;
+    // ⑨件二B：consolidator 偶发降级会把多条事实揉成一条非原子 blob
+    // （多句 / 数百字 / dimension=None），导致下游同 dimension 裁决纯函数空转、
+    // 旧值不退场。在落库前用结构度量（`value_has_non_atomic_fact`，零关键词、零数值
+    // 实体提取——守 agent-first）检测；命中则**至多重试一次**全新 LLM 调用（v4 探针
+    // 证明 1 次足够）。重试干净 → 用重试结果；重试仍非原子 → 落库前丢弃非原子条；
+    // 重试调用本身失败（端点 glitch）→ **不阻断**固化（既成事实纪律），但首次 value 已确认
+    // 非原子，同样走落库前丢弃剔除那几条 blob（防原样落库后跨轮滞留）。
+    let mut non_atomic_warnings: Vec<String> = Vec::new();
+    if value_has_non_atomic_fact(&value) {
+        match generate_agent_json(
+            state,
+            Some(&contact.account_id),
+            Some(&contact.wxid),
+            Some(&run_id),
+            "user.memory_consolidator.task",
+            &system,
+            &user,
+        )
+        .await
+        {
+            Ok(retry_value) => {
+                if value_has_non_atomic_fact(&retry_value) {
+                    // 重试仍非原子：采用重试结果，标记交给落库前丢弃兜底处理。
+                    non_atomic_warnings.push("non_atomic_fact_persists_after_retry".to_string());
+                } else {
+                    non_atomic_warnings.push("non_atomic_fact_resolved_by_retry".to_string());
+                }
+                value = retry_value;
+            }
+            Err(err) => {
+                // 端点 glitch：不阻断固化（既成事实纪律），但首次 value 已确认非原子，
+                // 标记 retry_call_failed → 走落库前丢弃兜底剔除那几条 blob（防跨轮滞留），
+                // 其余正常 fact 照常落库。下轮固化由 LLM 从候选记忆重产被丢弃的内容。
+                tracing::warn!(
+                    error = %err,
+                    "consolidator 非原子重试 LLM 调用失败，丢弃首次非原子 fact 后继续固化"
+                );
+                non_atomic_warnings.push("non_atomic_fact_retry_call_failed".to_string());
+            }
+        }
+    }
     // task 6.3：consolidator 输出的 memoryCard 是 JSON Document，先经
     // `MemoryCardTyped::from_document` 解析为 typed，再走 typed compact 合并；
     // 写入路径 `bson::to_document(&MemoryCardTyped)` 一次性序列化，不保留
@@ -1314,6 +1426,25 @@ async fn consolidate_contact_memory_inner(
     // 后此路径直接返回 400 / 拒收，由 caller 端契约保证 Structured 形态。
     let mut card_typed = card_typed;
     let auto_upgraded = card_typed.auto_upgrade_plain_facts();
+    // ⑨件二B：重试后仍非原子、**或**重试 LLM 调用失败（端点 glitch）→ 落库前丢弃那几条
+    // 非原子 fact（用结构度量纯函数判定，零关键词），避免 blob 进入 compact 后污染同 dimension
+    // 裁决、或原样落库后跨轮滞留。干净 fact 全部保留。gate 见 `should_drop_non_atomic`；
+    // 正常 / 重试已解决路径不触碰（避免对每次固化做无谓扫描）。
+    if should_drop_non_atomic(&non_atomic_warnings) {
+        let core_before = card_typed.core_facts.len();
+        let recent_before = card_typed.recent_facts.len();
+        card_typed
+            .core_facts
+            .retain(|f| !fact_is_non_atomic(f.as_text()));
+        card_typed
+            .recent_facts
+            .retain(|f| !fact_is_non_atomic(f.as_text()));
+        let dropped =
+            (core_before - card_typed.core_facts.len()) + (recent_before - card_typed.recent_facts.len());
+        if dropped > 0 {
+            non_atomic_warnings.push(format!("non_atomic_facts_dropped:{dropped}"));
+        }
+    }
     // HP-2 / Task 8：consolidator 输出与上一份 memoryCard 合并，
     // 未被显式 discarded 的 coreFacts 不会因为新近性被挤出。
     let discarded_list: Vec<String> = value
@@ -1344,6 +1475,8 @@ async fn consolidate_contact_memory_inner(
     // 做自动裁决（防 LLM 漏填 discarded 致旧值被 compact 合并救回）。now 复用本次固化时刻。
     let dim_warnings = deprecate_same_dimension_conflicts(&mut compact, DateTime::now());
     consolidator_warnings.extend(dim_warnings);
+    // ⑨件二B：把非原子检测 / 重试 / 丢弃产生的 warning 并入审计流。
+    consolidator_warnings.extend(non_atomic_warnings);
     if auto_upgraded > 0 {
         // Task 6.7：把"老 Vec<String> 形态被自动升级"作为可观测信号写入审计。
         // 数量也带出来，方便 sunset 灰度期度量曲线。
@@ -2304,6 +2437,233 @@ mod r7_deprecation_tests {
             }
             for (_d, c) in cnt { proptest::prop_assert!(c <= 1, "同维生效层应≤1"); }
         }
+    }
+
+    // ⑨件一：dimension 感知救回——同 dimension 新值在场时不救回旧值。
+    fn structured_fact(text: &str, dim: Option<&str>) -> crate::models::MemoryFactRepr {
+        use crate::models::{MemoryFact, MemoryFactRepr};
+        let mut f = MemoryFact::from_plain_text(text.to_string());
+        f.dimension = dim.map(|d| d.to_string());
+        MemoryFactRepr::Structured(f)
+    }
+
+    #[test]
+    fn recall_drops_old_value_when_same_dimension_new_value_present() {
+        use crate::agent::domain_profile::default_memory_dimensions;
+        use crate::agent::memory::compact_memory_card_with_dimensions;
+        use super::default_memory_card;
+        let mut incoming = default_memory_card();
+        incoming.core_facts = vec![structured_fact("孩子10岁", Some("孩子年龄"))];
+        let mut previous = default_memory_card();
+        previous.core_facts = vec![structured_fact("孩子8岁", Some("孩子年龄"))];
+        let out = compact_memory_card_with_dimensions(
+            &incoming, Some(&previous), &[], &default_memory_dimensions(),
+        );
+        let texts: Vec<&str> = out.core_facts.iter().map(|f| f.as_text()).collect();
+        assert!(texts.contains(&"孩子10岁"), "新值应在: {texts:?}");
+        assert!(!texts.contains(&"孩子8岁"), "同 dimension 旧值不应被救回: {texts:?}");
+    }
+
+    #[test]
+    fn recall_keeps_old_value_when_no_same_dimension_in_incoming() {
+        use crate::agent::domain_profile::default_memory_dimensions;
+        use crate::agent::memory::compact_memory_card_with_dimensions;
+        use super::default_memory_card;
+        let mut incoming = default_memory_card();
+        incoming.core_facts = vec![structured_fact("预算5000", Some("预算"))];
+        let mut previous = default_memory_card();
+        previous.core_facts = vec![structured_fact("孩子8岁", Some("孩子年龄"))];
+        let out = compact_memory_card_with_dimensions(
+            &incoming, Some(&previous), &[], &default_memory_dimensions(),
+        );
+        let texts: Vec<&str> = out.core_facts.iter().map(|f| f.as_text()).collect();
+        assert!(texts.contains(&"孩子8岁"), "无同 dimension 时旧值应正常救回: {texts:?}");
+    }
+
+    #[test]
+    fn recall_none_dimension_keeps_text_dedup_behavior() {
+        use crate::agent::domain_profile::default_memory_dimensions;
+        use crate::agent::memory::compact_memory_card_with_dimensions;
+        use super::default_memory_card;
+        let mut incoming = default_memory_card();
+        incoming.core_facts = vec![structured_fact("孩子10岁", None)];
+        let mut previous = default_memory_card();
+        previous.core_facts = vec![structured_fact("孩子8岁", None)];
+        let out = compact_memory_card_with_dimensions(
+            &incoming, Some(&previous), &[], &default_memory_dimensions(),
+        );
+        let texts: Vec<&str> = out.core_facts.iter().map(|f| f.as_text()).collect();
+        // dimension=None → 维持原 text 去重：text 不等 → 两条都在（字节等价回归保护）
+        assert!(texts.contains(&"孩子10岁") && texts.contains(&"孩子8岁"),
+            "dimension=None 应维持原 text 去重(两条都留): {texts:?}");
+    }
+
+    #[test]
+    fn recall_keeps_different_dimensions() {
+        use crate::agent::domain_profile::default_memory_dimensions;
+        use crate::agent::memory::compact_memory_card_with_dimensions;
+        use super::default_memory_card;
+        let mut incoming = default_memory_card();
+        incoming.core_facts = vec![structured_fact("孩子10岁", Some("孩子年龄"))];
+        let mut previous = default_memory_card();
+        previous.core_facts = vec![structured_fact("预算3万", Some("预算"))];
+        let out = compact_memory_card_with_dimensions(
+            &incoming, Some(&previous), &[], &default_memory_dimensions(),
+        );
+        let texts: Vec<&str> = out.core_facts.iter().map(|f| f.as_text()).collect();
+        assert!(texts.contains(&"孩子10岁") && texts.contains(&"预算3万"),
+            "不同 dimension 不应互相误删: {texts:?}");
+    }
+
+    // ⑨件二：结构性非原子检测(零关键词,纯结构度量)。
+    #[test]
+    fn atomic_fact_normal_short_is_atomic() {
+        use crate::agent::memory::fact_is_non_atomic;
+        assert!(!fact_is_non_atomic("孩子10岁"));
+        assert!(!fact_is_non_atomic("预算5000左右"));
+    }
+
+    #[test]
+    fn atomic_fact_normal_slightly_long_not_misflagged() {
+        use crate::agent::memory::fact_is_non_atomic;
+        // 含 1 逗号、~13 字的正常稍长 fact 不应误判
+        assert!(!fact_is_non_atomic("孩子10岁，零基础想报编程课"));
+    }
+
+    #[test]
+    fn non_atomic_multiple_newlines() {
+        use crate::agent::memory::fact_is_non_atomic;
+        assert!(fact_is_non_atomic("孩子8岁\n更新为10岁\n确认8岁"));
+    }
+
+    #[test]
+    fn non_atomic_multiple_sentence_breaks() {
+        use crate::agent::memory::fact_is_non_atomic;
+        assert!(fact_is_non_atomic("孩子8岁。预算5000。男孩。"));
+    }
+
+    #[test]
+    fn non_atomic_over_length() {
+        use crate::agent::memory::fact_is_non_atomic;
+        let long = "客户".repeat(45); // 90 字,无换行无句界,仅靠长度命中
+        assert!(fact_is_non_atomic(&long));
+    }
+
+    #[test]
+    fn atomic_single_sentence_break_ok() {
+        use crate::agent::memory::fact_is_non_atomic;
+        // 单个句号(末尾)不触发(需 ≥2 句界)
+        assert!(!fact_is_non_atomic("孩子10岁。"));
+    }
+
+    #[test]
+    fn value_scan_detects_blob_in_corefacts() {
+        use crate::agent::memory::value_has_non_atomic_fact;
+        let v = serde_json::json!({
+            "memoryCard": {
+                "coreFacts": [
+                    {"text": "孩子8岁\n更新为10岁\n确认8岁", "dimension": ""},
+                    {"text": "预算5000", "dimension": "预算"}
+                ],
+                "recentFacts": []
+            }
+        });
+        assert!(value_has_non_atomic_fact(&v));
+    }
+
+    #[test]
+    fn value_scan_clean_corefacts_is_false() {
+        use crate::agent::memory::value_has_non_atomic_fact;
+        let v = serde_json::json!({
+            "memoryCard": {
+                "coreFacts": [
+                    {"text": "孩子10岁", "dimension": "孩子年龄"},
+                    {"text": "预算5000", "dimension": "预算"}
+                ],
+                "recentFacts": [{"text": "初次接触", "dimension": ""}]
+            }
+        });
+        assert!(!value_has_non_atomic_fact(&v));
+    }
+
+    // ⑨件二B：consolidator 调用点的"检测→重试→丢弃"接线行为单测。
+    #[test]
+    fn blob_value_is_flagged_for_retry() {
+        use crate::agent::memory::value_has_non_atomic_fact;
+        // consolidator 偶发降级：多条事实揉成一条非原子 blob（多换行）→ 应被标记触发重试。
+        let v = serde_json::json!({
+            "memoryCard": {
+                "coreFacts": [
+                    {"text": "孩子8岁\n后更新为10岁\n最终确认8岁\n预算5000", "dimension": ""}
+                ],
+                "recentFacts": []
+            }
+        });
+        assert!(value_has_non_atomic_fact(&v), "blob 应被标记触发重试");
+    }
+
+    #[test]
+    fn clean_value_not_flagged() {
+        use crate::agent::memory::value_has_non_atomic_fact;
+        // 干净原子 fact → 不应触发重试。
+        let v = serde_json::json!({
+            "memoryCard": {
+                "coreFacts": [
+                    {"text": "孩子10岁", "dimension": "孩子年龄"},
+                    {"text": "预算5000", "dimension": "预算"}
+                ],
+                "recentFacts": [{"text": "初次接触", "dimension": ""}]
+            }
+        });
+        assert!(!value_has_non_atomic_fact(&v), "干净原子 fact 不应触发重试");
+    }
+
+    #[test]
+    fn drop_non_atomic_facts_keeps_clean_ones() {
+        // 重试仍非原子时落库前的丢弃语义：retain(!fact_is_non_atomic) 丢 blob 保留干净 fact。
+        use crate::agent::memory::fact_is_non_atomic;
+        use crate::models::{MemoryCardTyped, MemoryFactRepr};
+        let mut card = MemoryCardTyped {
+            core_facts: vec![
+                MemoryFactRepr::Plain("孩子8岁\n更新为10岁\n确认8岁".to_string()),
+                MemoryFactRepr::Plain("预算5000".to_string()),
+            ],
+            recent_facts: vec![MemoryFactRepr::Plain("初次接触".to_string())],
+            ..Default::default()
+        };
+        card.core_facts.retain(|f| !fact_is_non_atomic(f.as_text()));
+        card.recent_facts.retain(|f| !fact_is_non_atomic(f.as_text()));
+        assert_eq!(card.core_facts.len(), 1, "blob 被丢弃，干净 fact 保留");
+        assert_eq!(card.core_facts[0].as_text(), "预算5000");
+        assert_eq!(card.recent_facts.len(), 1, "干净 recent fact 保留");
+    }
+
+    #[test]
+    fn drop_gate_fires_when_retry_still_non_atomic() {
+        use crate::agent::memory::should_drop_non_atomic;
+        // 重试后仍非原子 → 必须丢弃。
+        let w = vec!["non_atomic_fact_persists_after_retry".to_string()];
+        assert!(should_drop_non_atomic(&w), "重试仍非原子应触发丢弃");
+    }
+
+    #[test]
+    fn drop_gate_fires_when_retry_call_failed() {
+        use crate::agent::memory::should_drop_non_atomic;
+        // 重试 LLM 调用本身失败（端点 glitch）：首次已确认非原子的 blob 不能原样落库
+        // （否则跨轮滞留），同样要走丢弃兜底——闭合 Err 分支残留自愈缺口。
+        let w = vec!["non_atomic_fact_retry_call_failed".to_string()];
+        assert!(should_drop_non_atomic(&w), "重试调用失败也应触发丢弃");
+    }
+
+    #[test]
+    fn drop_gate_silent_on_clean_or_resolved() {
+        use crate::agent::memory::should_drop_non_atomic;
+        // 干净（无 warning）或重试已解决 → 不丢弃（常驻路径零开销，不误删干净 fact）。
+        assert!(!should_drop_non_atomic(&[]), "干净输出不触发丢弃");
+        assert!(
+            !should_drop_non_atomic(&["non_atomic_fact_resolved_by_retry".to_string()]),
+            "重试已解决不触发丢弃"
+        );
     }
 }
 
