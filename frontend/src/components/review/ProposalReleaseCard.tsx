@@ -32,6 +32,7 @@ import {
   GATE_LABELS,
   gateHit,
   readAggregateEvidence,
+  PROMPT_AGG_METRIC_KEYS,
 } from "./evidenceMetrics";
 
 export function ProposalReleaseCard({
@@ -414,7 +415,17 @@ function MetadataSection({
   const diffSummary = proposal.diffSummary?.trim() ?? "";
   const riskNote = proposal.riskNote?.trim() ?? "";
   const prevVersion = proposal.previousPromptVersion?.trim() ?? "";
-  const metricEntries = Object.entries(proposal.evalMetrics ?? {});
+  // prompt 类：移出已被新旧对照表结构化展示的聚合 key（按白名单），
+  // 避免与对照表重复平铺。threshold 类完全不动（其 evalMetrics 是另一套
+  // send_success/safety 字段，且与 prompt 共享 five_gate_hit_delta_per_gate
+  // 等 key——绝不能按 key 名笼统过滤，只在 kind==="prompt" 时按白名单移除）。
+  const allMetricEntries = Object.entries(proposal.evalMetrics ?? {});
+  const metricEntries =
+    proposal.kind === "prompt"
+      ? allMetricEntries.filter(
+          ([key]) => !(PROMPT_AGG_METRIC_KEYS as readonly string[]).includes(key),
+        )
+      : allMetricEntries;
   const runIds = cohortRunIds ?? [];
 
   // 5 字段全空时整段不渲染。
