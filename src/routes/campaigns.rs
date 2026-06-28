@@ -379,9 +379,11 @@ pub async fn dispatch_campaign(
 
 /// 把一条 campaign_send 的真实推送结果归桶。输入 = 台账 status + 关联到的最新
 /// agent_run_log（None 表示 task 还没被 worker 跑到 / 无关联 run log）。
-/// 桶：sent/pending/blocked/canceled/skipped/unknown。优先级自上而下命中即停：
-/// outbox_status=sent（真送达）先于 status 判定。底层 status 字面量来自 gateway
-/// precheck（daily_limit/cooldown/...）与 OutboxStatus 闭集，详见设计 spec §9。
+/// 桶：sent/pending/blocked/canceled/escalated/skipped/unknown。优先级自上而下命中即停：
+/// outbox_status=sent（真送达）先于 status 判定。run_log.status 取值是
+/// GATEWAY_STATUS_VALUES 闭集（run_envelope.rs:86-135），逐值明确归桶。
+/// escalated = 走请示通道交幕后领导裁决、待补料后 AI 会继续触达（非失败漏推），
+/// 与 blocked（纯频控/硬约束、无后续）区分。详见设计 spec §5.3/§10。
 pub(super) fn classify_send_outcome(
     send_status: &str,
     run_log: Option<&Document>,
@@ -396,43 +398,53 @@ pub(super) fn classify_send_outcome(
     };
     let outbox_status = log.get_str("outbox_status").ok();
     let run_status = log.get_str("status").ok();
-    // ③ 真送达（最高优先级）。
+    // ③ 真送达（最高优先级，先于一切 status 判定）。
     if outbox_status == Some("sent") {
         return ("sent", None);
     }
-    // ⑥ outbox 终态失败/取消。
+    // ④ outbox 终态失败/取消。
     if matches!(outbox_status, Some("failed_terminal") | Some("canceled")) {
         return ("canceled", outbox_status.map(str::to_string));
     }
-    // ④ 进了发送队列、还没发出/发送中。
+    // ⑤ 进了发送队列、还没发出/发送中。
     if matches!(outbox_status, Some("pending") | Some("in_flight")) {
         return ("pending", None);
     }
+    // ⑥ 按 run_log.status 归桶（GATEWAY_STATUS_VALUES 闭集逐值明确）。
     match run_status {
-        // ④ 网关放行但 outbox 字段还没回写（罕见竞态）：视作在途。
-        Some("allowed") => ("pending", None),
-        // ⑤ 频控拦截，原因保留。
+        // a. 放行/已入队/作息重排：会继续，视作在途。
+        Some("allowed" | "outbox_enqueued" | "quiet_hours_deferred") => ("pending", None),
+        // b. 频控/硬约束/改写失败——没发出且无后续。
         Some(s @ ("daily_limit" | "cooldown" | "rate_limited"
-            | "policy_cooldown" | "policy_wait_user_reply" | "policy_consecutive_limit")) => {
-            ("blocked", Some(s.to_string()))
+            | "policy_cooldown" | "policy_wait_user_reply" | "policy_consecutive_limit"
+            | "blocked_by_required_field" | "blocked_by_budget"
+            | "review_blocked" | "revision_failed" | "revision_skipped_invalid_direction"
+            | "revision_skipped_budget_exceeded" | "revision_llm_failure"
+            | "tool_loop_timeout")) => ("blocked", Some(s.to_string())),
+        // c. 已转交幕后领导请示，待裁决后 AI 会继续触达（非失败漏推）。
+        Some(s @ ("blocked_unverified_product_claim" | "blocked_by_safety_guard"
+            | "held_by_ai_policy" | "ai_waiting_for_more_context")) => {
+            ("escalated", Some(s.to_string()))
         }
-        // ⑥ 取消/不可达，原因保留。
-        Some(s @ ("context_changed" | "expired" | "not_managed")) => {
+        // d. 取消（无后续）。
+        Some(s @ ("context_changed" | "expired" | "not_managed"
+            | "no_reply" | "admin_cancelled" | "superseded_by_new_inbound")) => {
             ("canceled", Some(s.to_string()))
         }
-        // ⑦ 不认识的 status / 字段缺失：诚实标 unknown，绝不强划进 sent。
+        // e. 灰度/口径态 / 不认识的值：诚实标 unknown，绝不强划进 sent。
         Some(other) => ("unknown", Some(other.to_string())),
         None => ("unknown", None),
     }
 }
 
 /// 把每人明细 items 聚合成 summary。sent/pending/skipped/unknown 标量计数，
-/// blocked/canceled 按 reason 二级 map 计数。targetCount = items 总数。
+/// blocked/canceled/escalated 按 reason 二级 map 计数。targetCount = items 总数。
 pub(super) fn build_sends_summary(items: &[Value]) -> Value {
     use serde_json::Map;
     let (mut sent, mut pending, mut skipped, mut unknown) = (0i64, 0i64, 0i64, 0i64);
     let mut blocked: Map<String, Value> = Map::new();
     let mut canceled: Map<String, Value> = Map::new();
+    let mut escalated: Map<String, Value> = Map::new();
     for it in items {
         let status = it.get("status").and_then(Value::as_str).unwrap_or("unknown");
         let reason = it.get("reason").and_then(Value::as_str);
@@ -442,6 +454,7 @@ pub(super) fn build_sends_summary(items: &[Value]) -> Value {
             "skipped" => skipped += 1,
             "blocked" => bump(&mut blocked, reason.unwrap_or("unknown")),
             "canceled" => bump(&mut canceled, reason.unwrap_or("unknown")),
+            "escalated" => bump(&mut escalated, reason.unwrap_or("unknown")),
             _ => unknown += 1,
         }
     }
@@ -453,6 +466,7 @@ pub(super) fn build_sends_summary(items: &[Value]) -> Value {
         "unknown": unknown,
         "blocked": Value::Object(blocked),
         "canceled": Value::Object(canceled),
+        "escalated": Value::Object(escalated),
     })
 }
 
@@ -778,17 +792,46 @@ mod tests {
             classify_send_outcome("enqueued", Some(&run_log("daily_limit", Some("sent")))),
             ("sent", None)
         );
-        // ④ 在途（outbox pending）
+        // ③优先级关键：outbox=sent 压过 escalated 类 status（已送达优先于请示）
+        assert_eq!(
+            classify_send_outcome(
+                "enqueued",
+                Some(&run_log("blocked_unverified_product_claim", Some("sent")))
+            ),
+            ("sent", None)
+        );
+        // ④ outbox 终态失败
+        assert_eq!(
+            classify_send_outcome("enqueued", Some(&run_log("allowed", Some("failed_terminal")))),
+            ("canceled", Some("failed_terminal".to_string()))
+        );
+        assert_eq!(
+            classify_send_outcome("enqueued", Some(&run_log("allowed", Some("canceled")))),
+            ("canceled", Some("canceled".to_string()))
+        );
+        // ⑤ 在途（outbox pending / in_flight）
         assert_eq!(
             classify_send_outcome("enqueued", Some(&run_log("allowed", Some("pending")))),
             ("pending", None)
         );
-        // ④ 放行但 outbox 字段缺失
+        assert_eq!(
+            classify_send_outcome("enqueued", Some(&run_log("daily_limit", Some("in_flight")))),
+            ("pending", None)
+        );
+        // ⑥a 放行/已入队/作息重排 → pending（会继续）
         assert_eq!(
             classify_send_outcome("enqueued", Some(&run_log("allowed", None))),
             ("pending", None)
         );
-        // ⑤ 频控拦截，原因保留
+        assert_eq!(
+            classify_send_outcome("enqueued", Some(&run_log("outbox_enqueued", None))),
+            ("pending", None)
+        );
+        assert_eq!(
+            classify_send_outcome("enqueued", Some(&run_log("quiet_hours_deferred", None))),
+            ("pending", None)
+        );
+        // ⑥b 频控/硬约束/改写失败 → blocked，原因保留
         assert_eq!(
             classify_send_outcome("enqueued", Some(&run_log("daily_limit", None))),
             ("blocked", Some("daily_limit".to_string()))
@@ -797,22 +840,50 @@ mod tests {
             classify_send_outcome("enqueued", Some(&run_log("policy_wait_user_reply", None))),
             ("blocked", Some("policy_wait_user_reply".to_string()))
         );
-        // ⑥ 取消（run status）
+        assert_eq!(
+            classify_send_outcome("enqueued", Some(&run_log("blocked_by_required_field", None))),
+            ("blocked", Some("blocked_by_required_field".to_string()))
+        );
+        assert_eq!(
+            classify_send_outcome("enqueued", Some(&run_log("revision_failed", None))),
+            ("blocked", Some("revision_failed".to_string()))
+        );
+        // ⑥c 请示通道（escalated）：产品红线/安全门/AI策略/等上下文，原因保留
+        assert_eq!(
+            classify_send_outcome("enqueued", Some(&run_log("blocked_unverified_product_claim", None))),
+            ("escalated", Some("blocked_unverified_product_claim".to_string()))
+        );
+        assert_eq!(
+            classify_send_outcome("enqueued", Some(&run_log("blocked_by_safety_guard", None))),
+            ("escalated", Some("blocked_by_safety_guard".to_string()))
+        );
+        assert_eq!(
+            classify_send_outcome("enqueued", Some(&run_log("held_by_ai_policy", None))),
+            ("escalated", Some("held_by_ai_policy".to_string()))
+        );
+        assert_eq!(
+            classify_send_outcome("enqueued", Some(&run_log("ai_waiting_for_more_context", None))),
+            ("escalated", Some("ai_waiting_for_more_context".to_string()))
+        );
+        // ⑥d 取消（run status）
         assert_eq!(
             classify_send_outcome("enqueued", Some(&run_log("context_changed", None))),
             ("canceled", Some("context_changed".to_string()))
         );
-        // ⑥ outbox 终态失败
         assert_eq!(
-            classify_send_outcome("enqueued", Some(&run_log("allowed", Some("failed_terminal")))),
-            ("canceled", Some("failed_terminal".to_string()))
+            classify_send_outcome("enqueued", Some(&run_log("no_reply", None))),
+            ("canceled", Some("no_reply".to_string()))
         );
-        // ⑦ 不认识的 status
+        // ⑥e 灰度/口径态 / 不认识的 status → unknown
         assert_eq!(
             classify_send_outcome("enqueued", Some(&run_log("weird_new_status", None))),
             ("unknown", Some("weird_new_status".to_string()))
         );
-        // ⑦ 空 doc（status 字段都没有）
+        assert_eq!(
+            classify_send_outcome("enqueued", Some(&run_log("precheck_blocked", None))),
+            ("unknown", Some("precheck_blocked".to_string()))
+        );
+        // ⑦ run log 有但 status 字段缺失
         assert_eq!(
             classify_send_outcome("enqueued", Some(&Document::new())),
             ("unknown", None)
@@ -830,10 +901,13 @@ mod tests {
             json!({ "contactWxid": "f", "name": "己", "status": "blocked", "reason": "daily_limit" }),
             json!({ "contactWxid": "g", "name": "庚", "status": "blocked", "reason": "cooldown" }),
             json!({ "contactWxid": "h", "name": "辛", "status": "canceled", "reason": "context_changed" }),
+            json!({ "contactWxid": "j", "name": "癸", "status": "escalated", "reason": "blocked_unverified_product_claim" }),
+            json!({ "contactWxid": "k", "name": "子", "status": "escalated", "reason": "blocked_unverified_product_claim" }),
+            json!({ "contactWxid": "l", "name": "丑", "status": "escalated", "reason": "held_by_ai_policy" }),
             json!({ "contactWxid": "i", "name": "壬", "status": "unknown" }),
         ];
         let s = build_sends_summary(&items);
-        assert_eq!(s["targetCount"], json!(9));
+        assert_eq!(s["targetCount"], json!(12));
         assert_eq!(s["sent"], json!(2));
         assert_eq!(s["pending"], json!(1));
         assert_eq!(s["skipped"], json!(1));
@@ -841,6 +915,8 @@ mod tests {
         assert_eq!(s["blocked"]["daily_limit"], json!(2));
         assert_eq!(s["blocked"]["cooldown"], json!(1));
         assert_eq!(s["canceled"]["context_changed"], json!(1));
+        assert_eq!(s["escalated"]["blocked_unverified_product_claim"], json!(2));
+        assert_eq!(s["escalated"]["held_by_ai_policy"], json!(1));
     }
 
     #[test]
@@ -853,5 +929,6 @@ mod tests {
         assert_eq!(s["unknown"], json!(0));
         assert_eq!(s["blocked"], json!({}));
         assert_eq!(s["canceled"], json!({}));
+        assert_eq!(s["escalated"], json!({}));
     }
 }
