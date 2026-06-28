@@ -3175,6 +3175,37 @@ pub(crate) fn should_send_ack_placeholder(trigger_kind: &str, status: &str) -> b
     trigger_kind == "inbound" && !ACK_PLACEHOLDER_EXCLUDED_STATUSES.contains(&status)
 }
 
+/// 构造"客户回应保障占位"的 outbox 入参。
+///
+/// 复用 `fallback_holding_reply()` 确定性文案，走 outbox（享受 dispatcher 在线门控 +
+/// 幂等键，与正常发送路径一致）。幂等键派生：`{source_event_id}#ack-placeholder` 后缀，
+/// 保证同 run 重复挂载只入一条、且与真回复 / 分段（`#seg{idx}`）key 天然不碰撞。
+///
+/// 取 contact 的三个字符串字段而非 `&Contact`：本函数只需这三个值，原语入参使其成为
+/// 零依赖纯函数（单测无需构造 40 字段的 Contact）。
+pub(crate) fn build_ack_enqueue_request(
+    workspace_id: &str,
+    account_id: &str,
+    contact_wxid: &str,
+    run_id: &str,
+    source_event_id: &str,
+    trigger_kind: &str,
+) -> EnqueueRequest {
+    EnqueueRequest {
+        workspace_id: workspace_id.to_string(),
+        account_id: account_id.to_string(),
+        contact_wxid: contact_wxid.to_string(),
+        run_id: run_id.to_string(),
+        decision_id: None,
+        source_event_id: format!("{source_event_id}#ack-placeholder"),
+        source_kind: trigger_kind.to_string(),
+        content: escalation::fallback_holding_reply().to_string(),
+        media_asset_id: None,
+        referral_card_id: None,
+        max_attempts: 3,
+    }
+}
+
 pub(crate) fn blocked(status: &str, reason: &str) -> SendGatewayResult {
     SendGatewayResult {
         allowed: false,
@@ -5009,6 +5040,34 @@ mod tests {
                 "follow_up + {status} 不该补占位"
             );
         }
+    }
+
+    #[test]
+    fn build_ack_enqueue_request_shape() {
+        let req = build_ack_enqueue_request("ws1", "acc1", "cust_wxid", "run_abc", "evt123", "inbound");
+
+        // 幂等键派生：源事件 id 加 `#ack-placeholder` 后缀，与真回复 / 分段 key 天然不碰撞
+        assert_eq!(req.source_event_id, "evt123#ack-placeholder");
+        // 占位文案 = 确定性兜底（agent-first，不靠 LLM）
+        assert_eq!(req.content, escalation::fallback_holding_reply());
+        // 占位是纯文本，不带媒体 / 名片
+        assert!(req.media_asset_id.is_none());
+        assert!(req.referral_card_id.is_none());
+        // 占位无决策评审记录
+        assert!(req.decision_id.is_none());
+        assert_eq!(req.workspace_id, "ws1");
+        assert_eq!(req.account_id, "acc1");
+        assert_eq!(req.contact_wxid, "cust_wxid");
+        assert_eq!(req.run_id, "run_abc");
+        assert_eq!(req.source_kind, "inbound");
+        assert_eq!(req.max_attempts, 3);
+    }
+
+    #[test]
+    fn build_ack_enqueue_request_empty_source_event_id_still_suffixed() {
+        let req = build_ack_enqueue_request("ws", "acc", "wx", "run1", "", "inbound");
+        // 空 source_event_id 仍带后缀（非空），走 outbox 非 synthetic 路径
+        assert_eq!(req.source_event_id, "#ack-placeholder");
     }
 
     // CONC-2：commitments 原子追加 update 形态——$slice 必须是 -8（保留最新 8 条，
