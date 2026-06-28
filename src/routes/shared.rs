@@ -1760,5 +1760,53 @@ mod tests {
         let projected = operating_memory_json(memory);
         crate::routes::contract_snapshot::assert_contract_fixture("operating_memory", projected);
     }
-}
 
+    /// 契约快照：agent_run_json。AgentRunLog 35 字段全量构造（无 Default）;6 个
+    /// 下发 Document 放纯标量;投影只下发 15 键,其余 20 字段不下发。
+    #[test]
+    fn agent_run_json_matches_contract_fixture() {
+        use super::agent_run_json;
+        use crate::models::AgentRunLog;
+        use mongodb::bson::{doc, oid::ObjectId, DateTime};
+
+        let item = AgentRunLog {
+            id: Some(ObjectId::parse_str("64a1f2c3e4b5a6978899f001").unwrap()),
+            workspace_id: "ws-1".to_string(),
+            account_id: "acc-1".to_string(),
+            contact_wxid: Some("wxid_abc".to_string()),
+            run_id: "run-1".to_string(),
+            trigger_kind: "inbound_message".to_string(),
+            status: "completed".to_string(),
+            planner: doc! { "step": "plan", "n": 1i32 },
+            context: doc! { "loaded": true },
+            knowledge_route: doc! { "matched": 2i32 },
+            decision: doc! { "action": "reply" },
+            review: doc! { "approved": true },
+            gateway_result: doc! { "status": "sent" },
+            error: Some("none".to_string()),
+            token_budget: 8000,
+            tokens_used: 1200,
+            llm_calls_used: 3,
+            degraded_reasons: vec!["none".to_string()],
+            lifecycle: "completed".to_string(),
+            source_event_id: "evt-1".to_string(),
+            source_kind: "inbound_message".to_string(),
+            error_summary: Some("ok".to_string()),
+            abort_reason: Some("none".to_string()),
+            revision_applied: false,
+            revision_reason: "none".to_string(),
+            pre_revision_summary: Some("before".to_string()),
+            post_revision_summary: Some("after".to_string()),
+            self_critique: Some("looks good".to_string()),
+            autonomy_mode: "auto".to_string(),
+            conversation_mode: "consultative".to_string(),
+            conversation_mode_reason: Some("customer_stage:proposal_evaluation".to_string()),
+            final_review_status: "approved_sent".to_string(),
+            outbox_status: Some("sent".to_string()),
+            memory_consolidator_warnings: vec!["none".to_string()],
+            created_at: DateTime::from_millis(1_700_000_000_000),
+        };
+        let projected = agent_run_json(item);
+        crate::routes::contract_snapshot::assert_contract_fixture("agent_run", projected);
+    }
+}

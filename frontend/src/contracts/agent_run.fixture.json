@@ -1,0 +1,30 @@
+{
+  "accountId": "acc-1",
+  "contactWxid": "wxid_abc",
+  "context": {
+    "loaded": true
+  },
+  "createdAt": "2023-11-14T22:13:20Z",
+  "decision": {
+    "action": "reply"
+  },
+  "error": "none",
+  "gatewayResult": {
+    "status": "sent"
+  },
+  "id": "64a1f2c3e4b5a6978899f001",
+  "knowledgeRoute": {
+    "matched": 2
+  },
+  "planner": {
+    "n": 1,
+    "step": "plan"
+  },
+  "review": {
+    "approved": true
+  },
+  "runId": "run-1",
+  "status": "completed",
+  "triggerKind": "inbound_message",
+  "workspaceId": "ws-1"
+}
