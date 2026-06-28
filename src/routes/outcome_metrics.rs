@@ -89,3 +89,31 @@ pub(super) fn outcome_metric_json(item: AgentOutcomeMetric) -> Value {
         "createdAt": crate::models::dt_to_string(item.created_at)
     })
 }
+
+#[cfg(test)]
+mod contract_tests {
+    use super::*;
+    use mongodb::bson::DateTime;
+
+    /// 契约快照：outcome_metric_json。4 个 Option<f64> 全给 Some（穿透 number 分支）；
+    /// workspace_id 赋值但投影不下发（fixture 应无 workspaceId 键，证明投影过滤生效）。
+    #[test]
+    fn outcome_metric_json_matches_contract_fixture() {
+        let item = AgentOutcomeMetric {
+            id: "acc-1:7d:2026-06-29".to_string(),
+            workspace_id: "ws-1".to_string(),
+            account_id: "acc-1".to_string(),
+            horizon: "7d".to_string(),
+            date: "2026-06-29".to_string(),
+            reply_rate: Some(0.42),
+            conversation_depth: Some(3.5),
+            ai_hold_cleared_rate: Some(0.8),
+            agent_block_rate: Some(0.1),
+            daily_run_count: 120,
+            daily_run_token_total: 45000,
+            created_at: DateTime::from_millis(1_700_000_000_000),
+        };
+        let projected = outcome_metric_json(item);
+        crate::routes::contract_snapshot::assert_contract_fixture("outcome_metric", projected);
+    }
+}

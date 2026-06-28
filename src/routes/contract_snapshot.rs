@@ -123,7 +123,7 @@ mod tests {
             "threshold_override_json",
             "threshold_override_audit_json",
             "runtime_flag_json",
-            // 批次2/3/5 域投影:本批次只覆盖知识域,其余域在后续批次纳入。
+            // 批次3/5 域投影:本批次只覆盖知识域 + 运营/Agent 域,其余域在后续批次纳入。
             // 批次铺开时从本清单移除对应项,使 lint 真正强制。
             "operation_state_policy_json",
             "taxonomy_candidate_json",
@@ -131,19 +131,10 @@ mod tests {
             "outbox_entry_json",
             "relationship_suggestion_json",
             "taxonomy_entry_json",
-            "behavior_signal_metric_json",
             "operation_domain_json",
             "evaluation_scenario_json",
             "playbook_json",
             "prompt_template_json",
-            "operation_health_json",
-            "guide_preview_json",
-            "operating_memory_json",
-            "memory_candidate_json",
-            "llm_call_log_json",
-            "decision_review_json",
-            "agent_run_json",
-            "outcome_metric_json",
         ];
 
         fn collect_rs(dir: &Path, out: &mut Vec<PathBuf>) {

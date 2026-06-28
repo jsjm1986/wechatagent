@@ -1,0 +1,19 @@
+{
+  "accountId": "acc-1",
+  "candidates": [
+    {
+      "confidence": 8,
+      "text": "客户偏好下午沟通"
+    }
+  ],
+  "contactWxid": "wxid_abc",
+  "createdAt": "2023-11-14T22:13:20Z",
+  "id": "64a1f2c3e4b5a6978899d001",
+  "memoryWriteScore": 7,
+  "reason": "高价值事实",
+  "runId": "run-1",
+  "source": "consolidator",
+  "status": "pending",
+  "updatedAt": "2023-11-14T22:15:00Z",
+  "workspaceId": "ws-1"
+}

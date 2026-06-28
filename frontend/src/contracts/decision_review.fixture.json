@@ -1,0 +1,54 @@
+{
+  "accountId": "acc-1",
+  "approved": true,
+  "contactWxid": "wxid_abc",
+  "contextPackSnapshot": {
+    "ctx": "snap"
+  },
+  "createdAt": "2023-11-14T22:13:20Z",
+  "domainConfigSnapshot": {
+    "domain": "user_operations"
+  },
+  "finalReviewStatus": "approved_sent",
+  "formulaBreakdown": {
+    "weighted": "ok"
+  },
+  "holdCategory": "none",
+  "id": "64a1f2c3e4b5a697889a0001",
+  "inboundMessageId": "msg-1",
+  "nextBestAction": {
+    "action": "follow_up"
+  },
+  "operationState": "negotiation",
+  "outcomeStatus": "replied",
+  "playbookId": "64a1f2c3e4b5a697889a0002",
+  "playbookVersion": 2,
+  "promptVersions": {
+    "user.reply": "v2"
+  },
+  "reactionAnalysis": {
+    "sentiment": "positive"
+  },
+  "replyText": "您好，已收到",
+  "reviewSummary": "通过",
+  "rewriteInstruction": "无需改写",
+  "risks": [
+    "low"
+  ],
+  "runId": "run-1",
+  "runtimeParametersSnapshot": {
+    "temp": "0.7"
+  },
+  "scores": {
+    "humanLikeScore": 8,
+    "pressureRisk": 2
+  },
+  "sendGatewayResult": {
+    "status": "sent"
+  },
+  "status": "approved",
+  "usedKnowledgeIds": [
+    "64a1f2c3e4b5a697889a0003"
+  ],
+  "workspaceId": "ws-1"
+}
