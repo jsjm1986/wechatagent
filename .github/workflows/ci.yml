@@ -8,19 +8,16 @@ concurrency:
 on:
   pull_request:
     branches: [main]
-    # 纯前端/文档改动不触发后端 CI(baseline + integration + 5 个 real-llm 真模型 job)——
-    # CI 全是 Rust 后端测试,前端改动不影响其结果,跑它们纯浪费时间且烧真模型 API 配额。
-    # 黑名单语义:本次 diff 的文件全落在下列模式内才跳过;只要碰了任何后端代码
-    # (src/tests/Cargo/scripts/ci.yml 等不在表内)就照常全跑——宁可多跑,不漏跑。
-    # 前端有独立的本地 vitest 三连(tsc+build+test)兜底,不依赖此 CI。
+    # 纯文档改动不触发后端 CI。前端改动**会**触发 workflow(下方 changes job 用 paths-filter
+    # 细分 backend/frontend,baseline/integration 仅 backend 路径才跑、frontend-contract 仅
+    # frontend 路径才跑),既让前端契约对账进合并门,又不在纯前端 PR 上烧后端/真模型配额。
+    # frontend/src/contracts/** 归 backend(fixture 由后端 bless,改它须跑 baseline 投影测试)。
     paths-ignore:
-      - 'frontend/**'
       - 'docs/**'
       - '**/*.md'
   push:
     branches: [main]
     paths-ignore:
-      - 'frontend/**'
       - 'docs/**'
       - '**/*.md'
   # nightly 全量真模型能力套件回归：smoke/recall/ops/quality/adversarial 这 5 组
@@ -60,10 +57,38 @@ env:
   RUSTFLAGS: "-Dwarnings"
 
 jobs:
+  # 路径分流:PR 上用 dorny/paths-filter 判定本次 diff 碰了 backend 还是 frontend。
+  # baseline/integration 仅 backend 变更跑;frontend-contract 仅 frontend 变更跑。
+  # 非 PR 事件(push/schedule/workflow_dispatch)无 PR diff 基线,filter 输出按"变更"处理,
+  # 下游 job 的 if 用 `!= 'false'` 兜底(缺省也跑),保证 push/schedule 全量不被误跳。
+  changes:
+    runs-on: ubuntu-latest
+    if: ${{ github.event_name != 'workflow_dispatch' }}
+    outputs:
+      backend: ${{ steps.filter.outputs.backend }}
+      frontend: ${{ steps.filter.outputs.frontend }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            backend:
+              - 'src/**'
+              - 'tests/**'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - 'scripts/**'
+              - '.github/workflows/ci.yml'
+              - 'frontend/src/contracts/**'
+            frontend:
+              - 'frontend/**'
+
   baseline:
     name: Baseline gate (R11.6)
     runs-on: ubuntu-latest
-    if: ${{ github.event_name != 'workflow_dispatch' }}
+    needs: changes
+    if: ${{ github.event_name != 'workflow_dispatch' && needs.changes.outputs.backend != 'false' }}
     timeout-minutes: 30
     steps:
       - name: Checkout (with full history for diff)
@@ -116,7 +141,8 @@ jobs:
   integration:
     name: Integration tests (Docker / testcontainers)
     runs-on: ubuntu-latest
-    if: ${{ github.event_name != 'workflow_dispatch' }}
+    needs: changes
+    if: ${{ github.event_name != 'workflow_dispatch' && needs.changes.outputs.backend != 'false' }}
     # 首次接入：101 个 #[ignore] 集成测试从未在 CI 跑过，bit-rot 几乎必然。
     # 先 continue-on-error 拿到真实绿/红体检报告，不阻塞合并；逐个修复后
     # 再视情况抬升为硬门（与 baseline 同级）。
@@ -163,6 +189,30 @@ jobs:
         # abort（cargo 默认 fail-fast 会 exit 101 后跳过剩余 ~96 个测试，拿不到
         # 真实绿/红分布）。本 job continue-on-error，失败不阻塞合并。
         run: cargo test --no-fail-fast -- --ignored
+
+  frontend-contract:
+    name: 前端契约对账 (tsc + vitest)
+    runs-on: ubuntu-latest
+    needs: changes
+    # 仅前端变更跑(契约对账进合并门)。非 PR 事件 filter 输出非 'false' 也跑一次兜底。
+    if: ${{ github.event_name != 'workflow_dispatch' && needs.changes.outputs.frontend != 'false' }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: frontend/package-lock.json
+      - name: 安装依赖
+        working-directory: frontend
+        run: npm ci
+      - name: 类型检查
+        working-directory: frontend
+        run: npx tsc --noEmit
+      - name: 契约对账 + 组件测试
+        working-directory: frontend
+        run: npx vitest run
 
   real-llm:
     name: Real-LLM smoke (真实大模型 / MCP 桩)
