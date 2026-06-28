@@ -4274,6 +4274,11 @@ pub struct Proposal {
     pub proposal_kind: String,
     /// `"pending_eval"` | `"evaluating"` | `"eligible_for_release"`
     /// | `"rejected_below_threshold"` | `"released"` | `"rolled_back"`。
+    ///
+    /// 对 prompt 类候选，`"eligible_for_release"` = 「shadow 真模型对照证据就绪，
+    /// 待管理员 release」——prompt 改动不自动放行，由管理员看 `eval_metrics` 里的
+    /// per-sample 新旧对照证据把关后决定是否发布（threshold 类才是阈值显著性
+    /// 自动判定）。此处不新增 status 取值。
     pub status: String,
     /// threshold 类专用（如 `"fact_risk_block"` / `"planner_block_rate_threshold"`）。
     pub gate_key: Option<String>,
@@ -4329,6 +4334,13 @@ pub struct ShadowReplay {
     pub status: String,
     pub failure_reason: Option<String>,
     pub original_final_review_status: Option<String>,
+    /// G4：源 run 的 5 闸命中向量（与 `new_5gate_hit` 同形态）。此前只记 new 侧，
+    /// 导致 significance 假基线恒 false；prompt shadow 把源 run review.scores 推回
+    /// 同一 5 闸口径后填这里，让显著性测试拿到真实新旧对照。
+    #[serde(default)]
+    pub original_5gate_hit: Document,
+    /// G4：源 run 的 selfCritique 是否被解决（与 `new_self_critique_addressed` 对照）。
+    pub original_self_critique_addressed: Option<bool>,
     pub new_final_review_status: Option<String>,
     #[serde(default)]
     pub new_review_risks: Vec<String>,
@@ -5500,6 +5512,8 @@ mod typed_tests {
             new_review_risks: vec!["pressure_risk:hard_close".to_string()],
             new_token_cost: Some(1234),
             new_5gate_hit: doc! { "fact_risk": false, "pressure_risk": true },
+            original_5gate_hit: doc! { "fact_risk": false, "pressure_risk": false },
+            original_self_critique_addressed: Some(false),
             new_self_critique_addressed: Some(true),
             similarity_to_original_text: 0.0,
             started_at: now,
