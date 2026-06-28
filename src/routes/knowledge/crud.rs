@@ -388,3 +388,31 @@ pub(in crate::routes) async fn delete_operation_knowledge(
             .to_string(),
     ))
 }
+
+#[cfg(test)]
+mod contract_tests {
+    use crate::models::OperationKnowledgeChunk;
+    use mongodb::bson::{oid::ObjectId, DateTime};
+
+    /// 详情端点 `get_operation_knowledge_chunk`(crud.rs:357) 直接 `json!({"item": item})`
+    /// 裸序列化 model——snake_case + `{$oid}`，与列表投影 camelCase **形状冲突**。
+    /// 本快照刻意暴露该冲突(spec §9):快照它,让"统一与否"成为可见的产品决策,而非静默漂移。
+    #[test]
+    fn chunk_detail_raw_struct_matches_contract_fixture() {
+        let chunk = OperationKnowledgeChunk {
+            id: Some(ObjectId::parse_str("64a1f2c3e4b5a6978899aabb").unwrap()),
+            workspace_id: "ws-1".to_string(),
+            title: "7x24 自动应答".to_string(),
+            domain: "user_operations".to_string(),
+            status: "draft".to_string(),
+            created_at: DateTime::from_millis(1_700_000_000_000),
+            updated_at: DateTime::from_millis(1_700_000_100_000),
+            ..Default::default()
+        };
+        let projected = serde_json::json!({ "item": chunk });
+        crate::routes::contract_snapshot::assert_contract_fixture(
+            "operation_knowledge_chunk_detail",
+            projected,
+        );
+    }
+}

@@ -1,0 +1,38 @@
+{
+  "item": {
+    "_id": {
+      "$oid": "64a1f2c3e4b5a6978899aabb"
+    },
+    "account_id": null,
+    "applicable_scenes": [],
+    "body": null,
+    "business_context": null,
+    "business_topics": [],
+    "chunk_type": "product_fact",
+    "confidence_score": null,
+    "created_at": {
+      "$date": {
+        "$numberLong": "1700000000000"
+      }
+    },
+    "document_id": null,
+    "domain": "user_operations",
+    "integrity_status": null,
+    "item_id": null,
+    "knowledge_type": null,
+    "not_applicable_scenes": [],
+    "priority": 0,
+    "product_tags": [],
+    "source_anchors": [],
+    "source_quote": null,
+    "status": "draft",
+    "summary": null,
+    "title": "7x24 自动应答",
+    "updated_at": {
+      "$date": {
+        "$numberLong": "1700000100000"
+      }
+    },
+    "workspace_id": "ws-1"
+  }
+}
