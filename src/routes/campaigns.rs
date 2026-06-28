@@ -595,6 +595,60 @@ pub async fn campaign_sends_report(
     })))
 }
 
+/// `GET /api/campaigns` 列表项投影（不裸序列化 Campaign，避免泄漏
+/// workspace_id/segment_filter/intent_text，且 created_at 转 RFC3339 string
+/// 而非 {$date}——照 products.rs:85 ProductView 范式）。
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CampaignListItem {
+    campaign_id: String,
+    title: String,
+    status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    target_count: Option<i64>,
+    dispatched_count: i64,
+    created_by: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    created_at: Option<String>,
+}
+
+impl From<&Campaign> for CampaignListItem {
+    fn from(c: &Campaign) -> Self {
+        Self {
+            campaign_id: c.id.map(|i| i.to_hex()).unwrap_or_default(),
+            title: c.title.clone(),
+            status: c.status.clone(),
+            target_count: c.target_count,
+            dispatched_count: c.dispatched_count,
+            created_by: c.created_by.clone(),
+            created_at: crate::models::dt_to_string(c.created_at),
+        }
+    }
+}
+
+/// GET /api/campaigns —— 列出本 workspace 全部活动（只读，createdAt 倒序）。
+/// 无分页（活动数量本身有限）。IDOR：filter 含 workspace_id。
+pub async fn list_campaigns(
+    State(state): State<AppState>,
+    Extension(admin): Extension<AuthenticatedAdmin>,
+) -> AppResult<Json<Value>> {
+    let mut cursor = state
+        .db
+        .campaigns()
+        .find(
+            doc! { "workspaceId": &admin.current_workspace },
+            mongodb::options::FindOptions::builder()
+                .sort(doc! { "createdAt": -1 })
+                .build(),
+        )
+        .await?;
+    let mut items: Vec<CampaignListItem> = Vec::new();
+    while let Some(c) = cursor.try_next().await? {
+        items.push(CampaignListItem::from(&c));
+    }
+    Ok(Json(json!({ "items": items })))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -675,6 +729,24 @@ mod tests {
             locale: None,
             created_at: DateTime::now(),
             updated_at: DateTime::now(),
+        }
+    }
+
+    pub(super) fn base_campaign() -> Campaign {
+        let now = DateTime::from_millis(1_700_000_000_000);
+        Campaign {
+            id: Some(ObjectId::new()),
+            workspace_id: "ws".to_string(),
+            account_id: "acc".to_string(),
+            title: "t".to_string(),
+            intent_text: "i".to_string(),
+            segment_filter: SegmentFilter::default(),
+            status: "draft".to_string(),
+            target_count: None,
+            dispatched_count: 0,
+            created_by: "admin".to_string(),
+            created_at: now,
+            updated_at: now,
         }
     }
 
@@ -937,5 +1009,53 @@ mod tests {
         assert_eq!(s["blocked"], json!({}));
         assert_eq!(s["canceled"], json!({}));
         assert_eq!(s["escalated"], json!({}));
+    }
+
+    #[test]
+    fn campaign_list_item_projection_shape_and_no_leak() {
+        use serde_json::to_value;
+        let now = DateTime::from_millis(1_700_000_000_000);
+        let c = Campaign {
+            id: Some(ObjectId::parse_str("64a1f0c2e4b0a1b2c3d4e5f6").unwrap()),
+            workspace_id: "ws_secret".to_string(),
+            account_id: "acc".to_string(),
+            title: "双11老客7折".to_string(),
+            intent_text: "内部意图不该泄漏".to_string(),
+            segment_filter: SegmentFilter::default(),
+            status: "completed".to_string(),
+            target_count: Some(500),
+            dispatched_count: 470,
+            created_by: "admin".to_string(),
+            created_at: now,
+            updated_at: now,
+        };
+        let v = to_value(CampaignListItem::from(&c)).unwrap();
+        // 投影字段齐全且 camelCase
+        assert_eq!(v.get("campaignId").unwrap(), "64a1f0c2e4b0a1b2c3d4e5f6");
+        assert_eq!(v.get("title").unwrap(), "双11老客7折");
+        assert_eq!(v.get("status").unwrap(), "completed");
+        assert_eq!(v.get("targetCount").unwrap(), 500);
+        assert_eq!(v.get("dispatchedCount").unwrap(), 470);
+        assert_eq!(v.get("createdBy").unwrap(), "admin");
+        // createdAt 是 RFC3339 字符串（非 {$date} 对象）
+        assert!(v.get("createdAt").unwrap().is_string());
+        assert!(v.get("createdAt").unwrap().as_str().unwrap().contains("2023"));
+        // 不泄漏内部字段
+        assert!(v.get("workspaceId").is_none());
+        assert!(v.get("workspace_id").is_none());
+        assert!(v.get("segmentFilter").is_none());
+        assert!(v.get("intentText").is_none());
+        assert!(v.get("accountId").is_none());
+    }
+
+    #[test]
+    fn campaign_list_item_omits_target_count_when_none() {
+        use serde_json::to_value;
+        let mut c = base_campaign();
+        c.target_count = None;
+        let v = to_value(CampaignListItem::from(&c)).unwrap();
+        // draft 没预览过 → targetCount 字段整个缺失（skip_serializing_if）
+        assert!(v.get("targetCount").is_none());
+        assert_eq!(v.get("dispatchedCount").unwrap(), 0);
     }
 }
