@@ -1860,4 +1860,45 @@ mod tests {
         );
         crate::routes::contract_snapshot::assert_contract_fixture("decision_review", projected);
     }
+
+    /// 契约快照：guide_preview_json（17 顶层键）。health_scores 给 7 个 i32 键;
+    /// contact_id→hex（非 Option）;impact_scope/scope_reason 非空走 pass-through;
+    /// suggested_changes 纯标量;workspace_id 赋值但不下发。
+    #[test]
+    fn guide_preview_json_matches_contract_fixture() {
+        // guide_preview_json + UserOperationGuidePreview 已由 mod tests 模块级 import
+        // （shared.rs:1459/1461）。这里函数级 import 与之遮蔽兼容（同名遮蔽合法，非 E0252）。
+        use crate::models::UserOperationGuidePreview;
+        use mongodb::bson::{doc, oid::ObjectId, DateTime};
+
+        let preview = UserOperationGuidePreview {
+            id: Some(ObjectId::parse_str("64a1f2c3e4b5a697889b0001").unwrap()),
+            workspace_id: "ws-1".to_string(),
+            account_id: "acc-1".to_string(),
+            contact_id: ObjectId::parse_str("64a1f2c3e4b5a697889b0002").unwrap(),
+            contact_wxid: "wxid_abc".to_string(),
+            instruction: "更关注客户情绪".to_string(),
+            mode: "tune".to_string(),
+            status: "pending".to_string(),
+            summary: "测试预览".to_string(),
+            impact_scope: "current_contact".to_string(),
+            scope_reason: "只影响当前好友".to_string(),
+            readable_changes: vec!["语气更温和".to_string()],
+            health_scores: doc! {
+                "userUnderstanding": 80i32,
+                "relationshipQuality": 50i32,
+                "productFit": 30i32,
+                "rhythmRisk": 20i32,
+                "knowledgeGrounding": 70i32,
+                "hallucinationRisk": 10i32,
+                "pressureRisk": 10i32,
+            },
+            suggested_changes: doc! { "tone": "warmer" },
+            risk_warnings: vec!["勿过度承诺".to_string()],
+            created_at: DateTime::from_millis(1_700_000_000_000),
+            updated_at: DateTime::from_millis(1_700_000_100_000),
+        };
+        let projected = guide_preview_json(preview);
+        crate::routes::contract_snapshot::assert_contract_fixture("guide_preview", projected);
+    }
 }

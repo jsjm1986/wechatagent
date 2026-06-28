@@ -1,0 +1,94 @@
+{
+  "accountId": "acc-1",
+  "contactId": "64a1f2c3e4b5a697889b0002",
+  "contactWxid": "wxid_abc",
+  "createdAt": "2023-11-14T22:13:20Z",
+  "health": {
+    "items": [
+      {
+        "detail": "身份、痛点、动机、偏好和禁忌是否清楚",
+        "key": "userUnderstanding",
+        "label": "用户理解完整度",
+        "score": 80,
+        "tone": "good"
+      },
+      {
+        "detail": "当前互动是否适合推进，是否需要先建立信任",
+        "key": "relationshipQuality",
+        "label": "信任关系质量",
+        "score": 50,
+        "tone": "warn"
+      },
+      {
+        "detail": "是否知道用户需求与产品价值之间的真实匹配",
+        "key": "productFit",
+        "label": "产品匹配清晰度",
+        "score": 30,
+        "tone": "danger"
+      },
+      {
+        "detail": "是否存在过度打扰或冷却中的风险",
+        "key": "rhythmRisk",
+        "label": "跟进节奏风险",
+        "score": 20,
+        "tone": "good"
+      },
+      {
+        "detail": "回应是否被 verified 知识支撑",
+        "key": "knowledgeGrounding",
+        "label": "知识匹配度",
+        "score": 70,
+        "tone": "warn"
+      },
+      {
+        "detail": "是否可能出现编造案例、承诺结果或产品事实不准确",
+        "key": "hallucinationRisk",
+        "label": "幻觉风险",
+        "score": 10,
+        "tone": "good"
+      },
+      {
+        "detail": "表达是否可能显得催促、强推或过度营销",
+        "key": "pressureRisk",
+        "label": "销售压迫感风险",
+        "score": 10,
+        "tone": "good"
+      }
+    ],
+    "scores": {
+      "hallucinationRisk": 10,
+      "knowledgeGrounding": 70,
+      "pressureRisk": 10,
+      "productFit": 30,
+      "relationshipQuality": 50,
+      "rhythmRisk": 20,
+      "userUnderstanding": 80
+    }
+  },
+  "healthScores": {
+    "hallucinationRisk": 10,
+    "knowledgeGrounding": 70,
+    "pressureRisk": 10,
+    "productFit": 30,
+    "relationshipQuality": 50,
+    "rhythmRisk": 20,
+    "userUnderstanding": 80
+  },
+  "id": "64a1f2c3e4b5a697889b0001",
+  "impactScope": "current_contact",
+  "instruction": "更关注客户情绪",
+  "mode": "tune",
+  "readableChanges": [
+    "语气更温和"
+  ],
+  "riskWarnings": [
+    "勿过度承诺"
+  ],
+  "scopeReason": "只影响当前好友",
+  "status": "pending",
+  "suggestedChanges": {
+    "tone": "warmer"
+  },
+  "summary": "测试预览",
+  "updatedAt": "2023-11-14T22:15:00Z"
+}
