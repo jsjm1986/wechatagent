@@ -86,6 +86,8 @@ POC 与审查都确认：前端没有"canonical 契约类型"这一层。`Contac
 
 > POC 顺带暴露的真 wart：`relatedChunks[].chunk_id` 是 snake_case（裸 `RelatedRef` serde），而顶层全 camelCase。这类嵌套不一致正是本机制要暴露的——记入 4.3 第二档，铺开时逐个定性（修 or 容差）。
 
+> **实现澄清（批次1/2 落地后）**：上述三档容差是针对 Document **子键级**对账精度的设计。但落地的机制（§3.6 第二条）**只锁顶层键集、不碰子键/值**——`assertKeysMatch` 只比 `Object.keys` 顶层。因此第三档"纯审计字段整体剔除"的初衷（避免快照庞大/频繁 re-bless）在只锁顶层键时不成立：后端测试用固定构造（空/纯标量 Document）bless，fixture 稳定零维护成本。故批次铺开统一决定 **contextPackSnapshot/domainConfigSnapshot/promptVersions/reactionAnalysis 等第三档字段作为顶层键照常纳入对账，不剔除**（与批次1 知识域 usageStats/provenance 同口径）。子键级容差（第一/二档区分）留待将来若引入子键对账时再启用。
+
 ## 5. 五域分批铺开
 
 按 `src/routes/` 文件归属分五批，每批独立可测、独立 PR：
