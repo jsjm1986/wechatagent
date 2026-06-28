@@ -268,6 +268,12 @@ export default function OperationsFeature() {
                         <span>{formatTime(event.createdAt)}</span>
                       </div>
                       {event.summary && <p>{event.summary}</p>}
+                      {event.detail && Object.keys(event.detail).length > 0 && (
+                        <details className={styles.eventDetail}>
+                          <summary>结构化明细</summary>
+                          <pre>{JSON.stringify(event.detail, null, 2)}</pre>
+                        </details>
+                      )}
                       {event.status && (
                         <div className={styles.tChips}>
                           <span>{event.status}</span>

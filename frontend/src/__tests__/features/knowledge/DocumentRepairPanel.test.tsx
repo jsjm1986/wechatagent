@@ -1,6 +1,16 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { render, screen, waitFor } from "@testing-library/react";
+import { render, screen, waitFor, fireEvent } from "@testing-library/react";
 import { DocumentRepairPanel } from "../../../features/knowledge/DocumentRepairPanel";
+
+// mock 复用的单 chunk 修复面板：渲染一个能手动触发 onApplied 的按钮，
+// 用于验证 DocumentRepairPanel 的 onApplied→onRepaired 透传（不拉真实修复流程）。
+vi.mock("../../../features/knowledge/ChunkRepairPanel", () => ({
+  ChunkRepairPanel: ({ chunkId, onApplied }: { chunkId: string; onApplied: () => void }) => (
+    <button type="button" data-testid={`apply-${chunkId}`} onClick={onApplied}>
+      模拟落库
+    </button>
+  ),
+}));
 
 function mockChunks(items: unknown[]) {
   globalThis.fetch = vi.fn(async (url: unknown) => {
@@ -37,5 +47,16 @@ describe("DocumentRepairPanel 文档级批量修复", () => {
     } as unknown as Response)) as typeof fetch;
     render(<DocumentRepairPanel documentId="d1" />);
     await waitFor(() => expect(screen.getByText(/加载失败/)).toBeInTheDocument());
+  });
+
+  it("单 chunk 落库后触发 onRepaired 回调（供父列表刷新进度）", async () => {
+    mockChunks([{ id: "c1", documentId: "d1", title: "待修切片A", integrityStatus: "needs_review" }]);
+    const onRepaired = vi.fn();
+    render(<DocumentRepairPanel documentId="d1" onRepaired={onRepaired} />);
+    await waitFor(() => expect(screen.getByText("待修切片A")).toBeInTheDocument());
+    // 展开该 chunk → 渲染 mock 的 ChunkRepairPanel → 模拟落库触发 onApplied
+    fireEvent.click(screen.getByText("待修切片A"));
+    fireEvent.click(await screen.findByTestId("apply-c1"));
+    expect(onRepaired).toHaveBeenCalledTimes(1);
   });
 });

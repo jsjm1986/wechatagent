@@ -190,6 +190,7 @@ export type EventItem = {
   kind: string;
   status: string;
   summary: string;
+  detail?: Record<string, unknown> | null;
   createdAt?: string;
 };
 

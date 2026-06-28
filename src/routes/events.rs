@@ -54,12 +54,19 @@ pub(super) async fn list_events(
         .await?;
     let mut items = Vec::new();
     while let Some(event) = cursor.try_next().await? {
+        // details 是 BSON Document — 走 extjson 桥接避免 `{"$numberInt":"…"}`
+        // 等 BSON 包装泄漏到前端（同 knowledge_usage_json 范式）。运营事件 feed
+        // 借此可读 run_id / knowledge_coverage 等结构化 detail（C10）。
+        let detail_json = event
+            .details
+            .map(|d| mongodb::bson::Bson::Document(d).into_relaxed_extjson());
         items.push(json!({
             "id": event.id.map(|id| id.to_hex()).unwrap_or_default(),
             "contactWxid": event.contact_wxid,
             "kind": event.kind,
             "status": event.status,
             "summary": event.summary,
+            "detail": detail_json,
             "createdAt": crate::models::dt_to_string(event.created_at)
         }));
     }
