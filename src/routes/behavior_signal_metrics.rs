@@ -74,3 +74,30 @@ pub(super) fn behavior_signal_metric_json(item: BehaviorSignalMetric) -> Value {
         "updatedAt": crate::models::dt_to_string(item.updated_at),
     })
 }
+
+#[cfg(test)]
+mod contract_tests {
+    use super::*;
+    use mongodb::bson::DateTime;
+
+    /// 契约快照：behavior_signal_metric_json 线上形状钉死到 fixture。
+    /// 全量赋值（每个 Option 给 Some、DateTime 用固定值），调投影 → assert_contract_fixture。
+    #[test]
+    fn behavior_signal_metric_json_matches_contract_fixture() {
+        let item = BehaviorSignalMetric {
+            id: "ws-1:2026-06-29".to_string(),
+            workspace_id: "ws-1".to_string(),
+            date: "2026-06-29".to_string(),
+            persisted: 42,
+            dedupe_skipped: 3,
+            errors: 1,
+            last_success_at: Some(DateTime::from_millis(1_700_000_000_000)),
+            updated_at: DateTime::from_millis(1_700_000_100_000),
+        };
+        let projected = behavior_signal_metric_json(item);
+        crate::routes::contract_snapshot::assert_contract_fixture(
+            "behavior_signal_metric",
+            projected,
+        );
+    }
+}

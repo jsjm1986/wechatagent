@@ -1671,5 +1671,351 @@ mod tests {
         assert!(validate_deal_verification(Some("conversation_inferred")).is_err());
         assert!(validate_deal_verification(Some("guessed")).is_err());
     }
-}
 
+    /// 契约快照：llm_call_log_json。id 走 ObjectId→hex;account_id/contact_wxid 是
+    /// Option（给 Some 穿透 string 分支）;retry_count/final_status 赋值但投影不下发。
+    #[test]
+    fn llm_call_log_json_matches_contract_fixture() {
+        use super::llm_call_log_json;
+        use crate::models::LlmCallLog;
+        use mongodb::bson::{oid::ObjectId, DateTime};
+
+        let item = LlmCallLog {
+            id: Some(ObjectId::parse_str("64a1f2c3e4b5a6978899c001").unwrap()),
+            workspace_id: "ws-1".to_string(),
+            account_id: Some("acc-1".to_string()),
+            contact_wxid: Some("wxid_abc".to_string()),
+            run_id: Some("run-1".to_string()),
+            prompt_key: "user.reply".to_string(),
+            model: "provider-a".to_string(),
+            status: "success".to_string(),
+            latency_ms: 1200,
+            prompt_tokens: 800,
+            completion_tokens: 200,
+            total_tokens: 1000,
+            prompt_cache_hit_tokens: 600,
+            prompt_cache_miss_tokens: 200,
+            error: Some("none".to_string()),
+            retry_count: 1,
+            final_status: Some("success".to_string()),
+            created_at: DateTime::from_millis(1_700_000_000_000),
+        };
+        let projected = llm_call_log_json(item);
+        crate::routes::contract_snapshot::assert_contract_fixture("llm_call_log", projected);
+    }
+
+    /// 契约快照：memory_candidate_json。candidates:Vec<Document> 桥接,放纯标量
+    /// （String/i32）避免 BSON 包装泄漏;id 走 ObjectId→hex。
+    #[test]
+    fn memory_candidate_json_matches_contract_fixture() {
+        use super::memory_candidate_json;
+        use crate::models::MemoryCandidate;
+        use mongodb::bson::{doc, oid::ObjectId, DateTime};
+
+        let item = MemoryCandidate {
+            id: Some(ObjectId::parse_str("64a1f2c3e4b5a6978899d001").unwrap()),
+            workspace_id: "ws-1".to_string(),
+            account_id: "acc-1".to_string(),
+            contact_wxid: "wxid_abc".to_string(),
+            run_id: Some("run-1".to_string()),
+            source: "consolidator".to_string(),
+            candidates: vec![doc! { "text": "客户偏好下午沟通", "confidence": 8i32 }],
+            memory_write_score: 7,
+            status: "pending".to_string(),
+            reason: Some("高价值事实".to_string()),
+            created_at: DateTime::from_millis(1_700_000_000_000),
+            updated_at: DateTime::from_millis(1_700_000_100_000),
+        };
+        let projected = memory_candidate_json(item);
+        crate::routes::contract_snapshot::assert_contract_fixture("memory_candidate", projected);
+    }
+
+    /// 契约快照：operating_memory_json。memory_card/context_pack 都空 → memoryCard
+    /// 走 default skeleton 分支（确定形状）;4 个下发 Document 放纯标量;id→hex。
+    /// context_pack 系列 + created_at 赋值但投影不下发。
+    #[test]
+    fn operating_memory_json_matches_contract_fixture() {
+        use super::operating_memory_json;
+        use crate::models::{MemoryCardTyped, OperatingMemory};
+        use mongodb::bson::{doc, oid::ObjectId, DateTime, Document};
+
+        let memory = OperatingMemory {
+            id: Some(ObjectId::parse_str("64a1f2c3e4b5a6978899e001").unwrap()),
+            workspace_id: "ws-1".to_string(),
+            account_id: "acc-1".to_string(),
+            contact_wxid: "wxid_abc".to_string(),
+            user_understanding: doc! { "identity": "企业主", "businessContext": "餐饮连锁" },
+            relationship_state: doc! { "trustLevel": "high", "temperature": "warm" },
+            product_fit: doc! { "fitReason": "需要私域自动化" },
+            next_action: doc! { "action": "follow_up", "due": "2026-07-01" },
+            context_pack: Document::new(),
+            context_pack_version: 0,
+            context_pack_updated_at: None,
+            memory_card: MemoryCardTyped::default(),
+            memory_card_version: 3,
+            memory_card_updated_at: Some(DateTime::from_millis(1_700_000_050_000)),
+            created_at: DateTime::from_millis(1_700_000_000_000),
+            updated_at: DateTime::from_millis(1_700_000_100_000),
+        };
+        let projected = operating_memory_json(memory);
+        crate::routes::contract_snapshot::assert_contract_fixture("operating_memory", projected);
+    }
+
+    /// 契约快照：agent_run_json。AgentRunLog 35 字段全量构造（无 Default）;6 个
+    /// 下发 Document 放纯标量;投影只下发 15 键,其余 20 字段不下发。
+    #[test]
+    fn agent_run_json_matches_contract_fixture() {
+        use super::agent_run_json;
+        use crate::models::AgentRunLog;
+        use mongodb::bson::{doc, oid::ObjectId, DateTime};
+
+        let item = AgentRunLog {
+            id: Some(ObjectId::parse_str("64a1f2c3e4b5a6978899f001").unwrap()),
+            workspace_id: "ws-1".to_string(),
+            account_id: "acc-1".to_string(),
+            contact_wxid: Some("wxid_abc".to_string()),
+            run_id: "run-1".to_string(),
+            trigger_kind: "inbound_message".to_string(),
+            status: "completed".to_string(),
+            planner: doc! { "step": "plan", "n": 1i32 },
+            context: doc! { "loaded": true },
+            knowledge_route: doc! { "matched": 2i32 },
+            decision: doc! { "action": "reply" },
+            review: doc! { "approved": true },
+            gateway_result: doc! { "status": "sent" },
+            error: Some("none".to_string()),
+            token_budget: 8000,
+            tokens_used: 1200,
+            llm_calls_used: 3,
+            degraded_reasons: vec!["none".to_string()],
+            lifecycle: "completed".to_string(),
+            source_event_id: "evt-1".to_string(),
+            source_kind: "inbound_message".to_string(),
+            error_summary: Some("ok".to_string()),
+            abort_reason: Some("none".to_string()),
+            revision_applied: false,
+            revision_reason: "none".to_string(),
+            pre_revision_summary: Some("before".to_string()),
+            post_revision_summary: Some("after".to_string()),
+            self_critique: Some("looks good".to_string()),
+            autonomy_mode: "auto".to_string(),
+            conversation_mode: "consultative".to_string(),
+            conversation_mode_reason: Some("customer_stage:proposal_evaluation".to_string()),
+            final_review_status: "approved_sent".to_string(),
+            outbox_status: Some("sent".to_string()),
+            memory_consolidator_warnings: vec!["none".to_string()],
+            created_at: DateTime::from_millis(1_700_000_000_000),
+        };
+        let projected = agent_run_json(item);
+        crate::routes::contract_snapshot::assert_contract_fixture("agent_run", projected);
+    }
+
+    /// 契约快照：decision_review_json（29 键）。AgentDecisionReview 29 字段全量构造;
+    /// 9 个下发 Document 放纯标量;used_knowledge_ids:Vec<ObjectId>→hex 字符串数组（不泄漏）;
+    /// final_review_status/hold_category 是函数参数,给 Some;reaction_claimed_at/
+    /// reviewer_misjudge_signal 赋值但投影不下发。
+    #[test]
+    fn decision_review_json_matches_contract_fixture() {
+        use super::decision_review_json;
+        use crate::models::AgentDecisionReview;
+        use mongodb::bson::{doc, oid::ObjectId, DateTime};
+
+        let review = AgentDecisionReview {
+            id: Some(ObjectId::parse_str("64a1f2c3e4b5a697889a0001").unwrap()),
+            workspace_id: "ws-1".to_string(),
+            account_id: "acc-1".to_string(),
+            contact_wxid: Some("wxid_abc".to_string()),
+            run_id: Some("run-1".to_string()),
+            inbound_message_id: Some("msg-1".to_string()),
+            reply_text: Some("您好，已收到".to_string()),
+            approved: true,
+            scores: doc! { "humanLikeScore": 8i32, "pressureRisk": 2i32 },
+            formula_breakdown: doc! { "weighted": "ok" },
+            risks: vec!["low".to_string()],
+            rewrite_instruction: Some("无需改写".to_string()),
+            review_summary: Some("通过".to_string()),
+            playbook_id: Some(ObjectId::parse_str("64a1f2c3e4b5a697889a0002").unwrap()),
+            playbook_version: Some(2),
+            used_knowledge_ids: vec![
+                ObjectId::parse_str("64a1f2c3e4b5a697889a0003").unwrap(),
+            ],
+            prompt_versions: doc! { "user.reply": "v2" },
+            operation_state: Some("negotiation".to_string()),
+            next_best_action: doc! { "action": "follow_up" },
+            context_pack_snapshot: doc! { "ctx": "snap" },
+            domain_config_snapshot: doc! { "domain": "user_operations" },
+            runtime_parameters_snapshot: doc! { "temp": "0.7" },
+            send_gateway_result: doc! { "status": "sent" },
+            outcome_status: Some("replied".to_string()),
+            reaction_analysis: doc! { "sentiment": "positive" },
+            reaction_claimed_at: Some(DateTime::from_millis(1_700_000_050_000)),
+            reviewer_misjudge_signal: Some("none".to_string()),
+            status: "approved".to_string(),
+            created_at: DateTime::from_millis(1_700_000_000_000),
+        };
+        let projected = decision_review_json(
+            review,
+            Some("approved_sent".to_string()),
+            Some("none".to_string()),
+        );
+        crate::routes::contract_snapshot::assert_contract_fixture("decision_review", projected);
+    }
+
+    /// 契约快照：guide_preview_json（17 顶层键）。health_scores 给 7 个 i32 键;
+    /// contact_id→hex（非 Option）;impact_scope/scope_reason 非空走 pass-through;
+    /// suggested_changes 纯标量;workspace_id 赋值但不下发。
+    #[test]
+    fn guide_preview_json_matches_contract_fixture() {
+        // guide_preview_json + UserOperationGuidePreview 已由 mod tests 模块级 import
+        // （shared.rs:1459/1461）。这里函数级 import 与之遮蔽兼容（同名遮蔽合法，非 E0252）。
+        use crate::models::UserOperationGuidePreview;
+        use mongodb::bson::{doc, oid::ObjectId, DateTime};
+
+        let preview = UserOperationGuidePreview {
+            id: Some(ObjectId::parse_str("64a1f2c3e4b5a697889b0001").unwrap()),
+            workspace_id: "ws-1".to_string(),
+            account_id: "acc-1".to_string(),
+            contact_id: ObjectId::parse_str("64a1f2c3e4b5a697889b0002").unwrap(),
+            contact_wxid: "wxid_abc".to_string(),
+            instruction: "更关注客户情绪".to_string(),
+            mode: "tune".to_string(),
+            status: "pending".to_string(),
+            summary: "测试预览".to_string(),
+            impact_scope: "current_contact".to_string(),
+            scope_reason: "只影响当前好友".to_string(),
+            readable_changes: vec!["语气更温和".to_string()],
+            health_scores: doc! {
+                "userUnderstanding": 80i32,
+                "relationshipQuality": 50i32,
+                "productFit": 30i32,
+                "rhythmRisk": 20i32,
+                "knowledgeGrounding": 70i32,
+                "hallucinationRisk": 10i32,
+                "pressureRisk": 10i32,
+            },
+            suggested_changes: doc! { "tone": "warmer" },
+            risk_warnings: vec!["勿过度承诺".to_string()],
+            created_at: DateTime::from_millis(1_700_000_000_000),
+            updated_at: DateTime::from_millis(1_700_000_100_000),
+        };
+        let projected = guide_preview_json(preview);
+        crate::routes::contract_snapshot::assert_contract_fixture("guide_preview", projected);
+    }
+
+    /// 契约快照：operation_health_json（聚合 2 键 scores+items）。吃 Contact（44 字段全量
+    /// 构造,无 Default）+ OperatingMemory + Some(&AgentDecisionReview)。review 给 Some
+    /// 让 3 个 review-derived score 非零;键集对 Some/None 不变。
+    #[test]
+    fn operation_health_json_matches_contract_fixture() {
+        use super::operation_health_json;
+        use crate::models::{
+            AgentDecisionReview, AgentStatus, Contact, MemoryCardTyped, OperatingMemory,
+        };
+        use mongodb::bson::{doc, oid::ObjectId, DateTime, Document};
+
+        let contact = Contact {
+            id: Some(ObjectId::parse_str("64a1f2c3e4b5a697889c0001").unwrap()),
+            workspace_id: "ws-1".to_string(),
+            account_id: "acc-1".to_string(),
+            wxid: "wxid_abc".to_string(),
+            nickname: None,
+            remark: None,
+            alias: None,
+            agent_status: AgentStatus::Managed,
+            human_profile_note: Some("企业主，关注降本".to_string()),
+            custom_agent_instructions: None,
+            operation_mode_override: None,
+            agent_profile: None,
+            memory_summary: None,
+            playbook_id: None,
+            playbook_version: None,
+            manual_tags: vec![],
+            manual_tags_updated_at: None,
+            manual_tags_by: None,
+            confirmed_tags: vec![],
+            bayesian_signals: vec![],
+            personality_profile: None,
+            tags_version: 0,
+            domain_attributes: Some(doc! { "customer_stage": "negotiation", "intent_level": "high" }),
+            domain_attributes_updated_at: None,
+            commitments: vec![],
+            follow_up_policy: Some("每周一次".to_string()),
+            operation_state: None,
+            operation_state_reason: None,
+            operation_state_confidence: None,
+            operation_state_updated_at: None,
+            cooldown_until: Some(DateTime::from_millis(1_700_000_200_000)),
+            operation_policy: Document::new(),
+            profile_attributes: Document::new(),
+            profile_updated_at: None,
+            last_message_at: None,
+            last_inbound_at: None,
+            last_outbound_at: None,
+            last_agent_run_at: Some(DateTime::from_millis(1_700_000_000_000)),
+            last_outbound_style: None,
+            intent_trajectory: vec![],
+            outcome_events: vec![],
+            locale: None,
+            created_at: DateTime::from_millis(1_699_000_000_000),
+            updated_at: DateTime::from_millis(1_700_000_100_000),
+        };
+
+        let memory = OperatingMemory {
+            id: Some(ObjectId::parse_str("64a1f2c3e4b5a697889c0002").unwrap()),
+            workspace_id: "ws-1".to_string(),
+            account_id: "acc-1".to_string(),
+            contact_wxid: "wxid_abc".to_string(),
+            user_understanding: doc! { "identity": "企业主", "businessContext": "餐饮连锁" },
+            relationship_state: doc! { "trustLevel": "high", "temperature": "warm" },
+            product_fit: doc! { "fitReason": "需要私域自动化" },
+            next_action: doc! { "action": "follow_up" },
+            context_pack: Document::new(),
+            context_pack_version: 0,
+            context_pack_updated_at: None,
+            memory_card: MemoryCardTyped::default(),
+            memory_card_version: 0,
+            memory_card_updated_at: None,
+            created_at: DateTime::from_millis(1_699_000_000_000),
+            updated_at: DateTime::from_millis(1_700_000_100_000),
+        };
+
+        let review = AgentDecisionReview {
+            id: Some(ObjectId::parse_str("64a1f2c3e4b5a697889c0003").unwrap()),
+            workspace_id: "ws-1".to_string(),
+            account_id: "acc-1".to_string(),
+            contact_wxid: Some("wxid_abc".to_string()),
+            run_id: Some("run-1".to_string()),
+            inbound_message_id: None,
+            reply_text: None,
+            approved: true,
+            scores: doc! {
+                "knowledgeGroundingScore": 8i32,
+                "hallucinationScore": 2i32,
+                "pressureRisk": 3i32,
+            },
+            formula_breakdown: Document::new(),
+            risks: vec![],
+            rewrite_instruction: None,
+            review_summary: None,
+            playbook_id: None,
+            playbook_version: None,
+            used_knowledge_ids: vec![],
+            prompt_versions: Document::new(),
+            operation_state: None,
+            next_best_action: Document::new(),
+            context_pack_snapshot: Document::new(),
+            domain_config_snapshot: Document::new(),
+            runtime_parameters_snapshot: Document::new(),
+            send_gateway_result: Document::new(),
+            outcome_status: None,
+            reaction_analysis: Document::new(),
+            reaction_claimed_at: None,
+            reviewer_misjudge_signal: None,
+            status: "approved".to_string(),
+            created_at: DateTime::from_millis(1_700_000_000_000),
+        };
+
+        let projected = operation_health_json(&contact, &memory, Some(&review));
+        crate::routes::contract_snapshot::assert_contract_fixture("operation_health", projected);
+    }
+}

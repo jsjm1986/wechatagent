@@ -1,0 +1,18 @@
+{
+  "accountId": "acc-1",
+  "completionTokens": 200,
+  "contactWxid": "wxid_abc",
+  "createdAt": "2023-11-14T22:13:20Z",
+  "error": "none",
+  "id": "64a1f2c3e4b5a6978899c001",
+  "latencyMs": 1200,
+  "model": "provider-a",
+  "promptCacheHitTokens": 600,
+  "promptCacheMissTokens": 200,
+  "promptKey": "user.reply",
+  "promptTokens": 800,
+  "runId": "run-1",
+  "status": "success",
+  "totalTokens": 1000,
+  "workspaceId": "ws-1"
+}

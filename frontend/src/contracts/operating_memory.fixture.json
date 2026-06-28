@@ -1,0 +1,38 @@
+{
+  "accountId": "acc-1",
+  "contactWxid": "wxid_abc",
+  "id": "64a1f2c3e4b5a6978899e001",
+  "memoryCard": {
+    "commitments": [],
+    "conflicts": [],
+    "coreFacts": [],
+    "coreProfile": {},
+    "deprecatedFacts": [],
+    "doNotDo": [],
+    "objections": [],
+    "openLoops": [],
+    "preferences": [],
+    "recentEpisodeSummary": "",
+    "recentFacts": [],
+    "relationshipState": {}
+  },
+  "memoryCardUpdatedAt": "2023-11-14T22:14:10Z",
+  "memoryCardVersion": 3,
+  "nextAction": {
+    "action": "follow_up",
+    "due": "2026-07-01"
+  },
+  "productFit": {
+    "fitReason": "需要私域自动化"
+  },
+  "relationshipState": {
+    "temperature": "warm",
+    "trustLevel": "high"
+  },
+  "updatedAt": "2023-11-14T22:15:00Z",
+  "userUnderstanding": {
+    "businessContext": "餐饮连锁",
+    "identity": "企业主"
+  },
+  "workspaceId": "ws-1"
+}
