@@ -1398,6 +1398,132 @@ mod tests {
         );
     }
 
+    /// 契约快照 bless/对账：canonicalize(递归排序键)后与
+    /// `frontend/src/contracts/<name>.fixture.json` 比对。`UPDATE_SNAPSHOTS=1` 写文件(bless),
+    /// 否则只读比对,不一致即 panic 提示 re-bless。fixture 是前后端共用的单一真相源:
+    /// 后端测试写它、前端 vitest 导入同一份做 key 集对账,杜绝手抄漂移。
+    #[cfg(test)]
+    fn assert_contract_fixture(name: &str, value: Value) {
+        fn canonicalize(v: Value) -> Value {
+            match v {
+                Value::Object(map) => {
+                    let mut entries: Vec<(String, Value)> = map.into_iter().collect();
+                    entries.sort_by(|a, b| a.0.cmp(&b.0));
+                    let mut out = serde_json::Map::new();
+                    for (k, val) in entries {
+                        out.insert(k, canonicalize(val));
+                    }
+                    Value::Object(out)
+                }
+                Value::Array(arr) => Value::Array(arr.into_iter().map(canonicalize).collect()),
+                other => other,
+            }
+        }
+
+        let canonical = canonicalize(value);
+        let pretty = serde_json::to_string_pretty(&canonical).expect("serialize fixture") + "\n";
+
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("frontend/src/contracts")
+            .join(format!("{name}.fixture.json"));
+
+        if std::env::var("UPDATE_SNAPSHOTS").as_deref() == Ok("1") {
+            std::fs::create_dir_all(path.parent().unwrap()).expect("create contracts dir");
+            std::fs::write(&path, &pretty).expect("write fixture");
+            return;
+        }
+
+        let existing = std::fs::read_to_string(&path).unwrap_or_else(|_| {
+            panic!(
+                "契约 fixture 缺失:{}\n请运行 UPDATE_SNAPSHOTS=1 cargo test --lib {} 生成(bless)。",
+                path.display(),
+                name
+            )
+        });
+        let existing_canonical =
+            canonicalize(serde_json::from_str(&existing).expect("fixture 不是合法 JSON"));
+        let existing_pretty =
+            serde_json::to_string_pretty(&existing_canonical).expect("re-serialize") + "\n";
+
+        assert_eq!(
+            existing_pretty, pretty,
+            "\n投影 {name} 的线上形状与 fixture 不一致。\n\
+             若后端投影确有变更:运行 UPDATE_SNAPSHOTS=1 cargo test --lib {name} re-bless,\n\
+             再同步前端 vitest 契约测试的 CANONICAL_KEYS。\n"
+        );
+    }
+
+    /// 契约快照 POC:列表投影 `operation_knowledge_chunk_json` 的线上形状(33 键,camelCase)
+    /// 是前后端契约的唯一真相源。构造全量 chunk → 调投影 → canonicalize → 对账 fixture。
+    /// 默认只读:投影变了没 re-bless → 测红(挡住"后端改了没同步前端")。
+    /// 注意:model 上的 created_at / integrity_score / domain_attributes 投影**不下发**,
+    /// 故 fixture 无这三键——契约是"线上形状"而非"model 形状"。
+    #[test]
+    fn operation_knowledge_chunk_json_matches_contract_fixture() {
+        use crate::models::{ChunkProvenance, OperationKnowledgeChunk, RelatedRef, UsageStats};
+        use mongodb::bson::{doc, oid::ObjectId, DateTime};
+
+        let chunk = OperationKnowledgeChunk {
+            id: Some(ObjectId::parse_str("64a1f2c3e4b5a6978899aabb").unwrap()),
+            workspace_id: "ws-1".to_string(),
+            account_id: Some("acc-1".to_string()),
+            document_id: Some(ObjectId::parse_str("64a1f2c3e4b5a6978899ccdd").unwrap()),
+            item_id: Some(ObjectId::parse_str("64a1f2c3e4b5a6978899eeff").unwrap()),
+            domain: "user_operations".to_string(),
+            knowledge_type: Some("product_fact".to_string()),
+            business_context: Some("企业版能力说明".to_string()),
+            title: "7x24 自动应答".to_string(),
+            summary: Some("企业版提供全天候自动应答".to_string()),
+            body: Some("WechatAgent 企业版提供 7x24 小时自动应答,支持私域多账号统一纳管。".to_string()),
+            applicable_scenes: vec!["售前咨询".to_string()],
+            not_applicable_scenes: vec!["售后投诉".to_string()],
+            product_tags: vec!["企业版".to_string(), "自动应答".to_string()],
+            business_topics: vec!["产品定位".to_string()],
+            source_quote: Some("提供 7x24 小时自动应答".to_string()),
+            source_anchors: vec![doc! {
+                "startLine": 3i32, "endLine": 5i32, "quoteHash": "abc123", "documentId": "doc-1"
+            }],
+            integrity_status: Some("needs_review".to_string()),
+            confidence_score: Some(90),
+            status: "draft".to_string(),
+            priority: 5,
+            created_at: DateTime::from_millis(1_700_000_000_000),
+            updated_at: DateTime::from_millis(1_700_000_100_000),
+            wiki_type: Some("entity".to_string()),
+            domain_attributes: Some(doc! { "customer_stage": "negotiation" }),
+            provenance: Some(ChunkProvenance {
+                source: "imported".to_string(),
+                source_doc_id: Some("doc-1".to_string()),
+                source_quote: Some("提供 7x24 小时自动应答".to_string()),
+                llm_model_alias: Some("provider-a".to_string()),
+                edited_at: DateTime::from_millis(1_700_000_050_000),
+                edited_by: Some("admin1".to_string()),
+            }),
+            valid_from: Some(DateTime::from_millis(1_699_000_000_000)),
+            valid_to: Some(DateTime::from_millis(1_999_000_000_000)),
+            superseded_by: None,
+            previous_version_id: Some("c-0".to_string()),
+            related_chunks: Some(vec![RelatedRef {
+                chunk_id: "c-2".to_string(),
+                kind: "references".to_string(),
+                note: Some("相关切片".to_string()),
+            }]),
+            usage_stats: Some(UsageStats {
+                hit_count_30d: 12,
+                blocked_count_30d: 1,
+                last_used_at: None,
+                last_blocked_reason: None,
+            }),
+            dynamic_confidence: Some(0.73),
+            integrity_score: Some(0.91),
+            locked_fields: Some(vec!["title".to_string()]),
+            chunk_type: "product_fact".to_string(),
+        };
+
+        let projected = operation_knowledge_chunk_json(chunk);
+        assert_contract_fixture("operation_knowledge_chunk", projected);
+    }
+
     /// 根治 chunk PUT replace_one 清空 model 字段：请求体无法表达的 13 个字段 +
     /// created_at 必须从原 chunk 回填，请求体能表达的字段（title 等）仍来自 next。
     #[test]
