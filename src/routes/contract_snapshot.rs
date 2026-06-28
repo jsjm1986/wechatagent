@@ -97,4 +97,138 @@ mod tests {
         let out = project_subset(input, &["dropMe"]);
         assert_eq!(out, json!({"keep": 1}));
     }
+
+    /// 防腐烂:扫 src/routes/** 找所有投影函数(`fn <name>_json(...) -> Value`),
+    /// 断言每个非豁免投影都"被契约测试覆盖"(投影名出现在某个 assert_contract_fixture
+    /// 调用的窗口内)。新增投影忘配测试 → 红。现有 no_orphan_pub_async_route_handlers
+    /// (mod.rs)手维护清单已腐烂,故用运行时扫描。纯 std 实现(本项目无 regex 依赖)。
+    #[test]
+    fn every_projection_has_contract_test() {
+        use std::fs;
+        use std::path::{Path, PathBuf};
+
+        // 非实体投影豁免清单(helper / 非 model→Value / 异步生成器 / 其它批次域),逐条注明理由。
+        const ALLOWLIST: &[&str] = &[
+            "bson_from_json",          // helper:JSON→BSON Document,非投影
+            "bson_doc_to_json",        // helper:Document→Value 通用桥
+            "parse_warning_to_json",   // 解析告警,非实体投影
+            "vision_generate_json",    // async LLM 调用,非 model→Value
+            "lesson_doc_to_json",      // 入参是裸 Document 非 model(批次2 评估纳入)
+            "experiment_summary_json", // 批次4 进化域(本批不覆盖)
+            "experiment_envelope_json",
+            "proposal_summary_json",
+            "proposal_detail_json",
+            "cohort_run_ids_json",
+            "shadow_replay_json",
+            "threshold_override_json",
+            "threshold_override_audit_json",
+            "runtime_flag_json",
+            // 批次2/3/5 域投影:本批次只覆盖知识域,其余域在后续批次纳入。
+            // 批次铺开时从本清单移除对应项,使 lint 真正强制。
+            "operation_state_policy_json",
+            "taxonomy_candidate_json",
+            "suspected_deal_json",
+            "outbox_entry_json",
+            "relationship_suggestion_json",
+            "taxonomy_entry_json",
+            "behavior_signal_metric_json",
+            "operation_domain_json",
+            "evaluation_scenario_json",
+            "playbook_json",
+            "prompt_template_json",
+            "operation_health_json",
+            "guide_preview_json",
+            "operating_memory_json",
+            "memory_candidate_json",
+            "llm_call_log_json",
+            "decision_review_json",
+            "agent_run_json",
+            "outcome_metric_json",
+        ];
+
+        fn collect_rs(dir: &Path, out: &mut Vec<PathBuf>) {
+            for entry in fs::read_dir(dir).unwrap().flatten() {
+                let p = entry.path();
+                if p.is_dir() {
+                    collect_rs(&p, out);
+                } else if p.extension().and_then(|e| e.to_str()) == Some("rs") {
+                    out.push(p);
+                }
+            }
+        }
+
+        // 从一行形如 `... fn operation_knowledge_chunk_json(item: ...` 抽出投影名。
+        fn extract_projection_name(line: &str) -> Option<String> {
+            let after_fn = line.split("fn ").nth(1)?;
+            let name_end = after_fn.find(|c| c == '(' || c == '<')?;
+            let name = after_fn[..name_end].trim();
+            if name.ends_with("_json") && !name.is_empty() {
+                Some(name.to_string())
+            } else {
+                None
+            }
+        }
+
+        let routes_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/routes");
+        let mut files = Vec::new();
+        collect_rs(&routes_dir, &mut files);
+
+        let all_src: Vec<String> = files
+            .iter()
+            .map(|f| fs::read_to_string(f).unwrap_or_default())
+            .collect();
+
+        // 覆盖集:一个投影"被契约测试覆盖"当且仅当它出现在某个**契约测试块**里。
+        // 契约测试块 = 含 `assert_contract_fixture` 调用的代码区。production handler 里
+        // 调用投影(document=4/chunk=14 次)不算覆盖——必须是测试块里调用,才挡得住
+        // "有 production 调用方但零测试"的投影。
+        // 纯 std 近似:在每次 `assert_contract_fixture` 出现处切前 600 / 后 200 字符窗口
+        // (覆盖一个测试函数体),窗口里出现的 `_json` 名即记为已覆盖。
+        let mut covered: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for src in &all_src {
+            let mut from = 0usize;
+            while let Some(rel) = src[from..].find("assert_contract_fixture") {
+                let pos = from + rel;
+                let mut s = pos.saturating_sub(600);
+                while s < src.len() && !src.is_char_boundary(s) {
+                    s += 1;
+                }
+                let mut e = (pos + 200).min(src.len());
+                while e < src.len() && !src.is_char_boundary(e) {
+                    e += 1;
+                }
+                let window = &src[s..e];
+                for tok in window.split(|c: char| !(c.is_alphanumeric() || c == '_')) {
+                    if tok.ends_with("_json") && tok.len() > 5 {
+                        covered.insert(tok.to_string());
+                    }
+                }
+                from = pos + "assert_contract_fixture".len();
+            }
+        }
+
+        // 收集所有投影定义,逐个比对覆盖集。
+        let mut orphans = Vec::new();
+        for src in &all_src {
+            for line in src.lines() {
+                if !line.contains("fn ") || !line.contains("_json") || !line.contains("-> Value") {
+                    continue;
+                }
+                if let Some(name) = extract_projection_name(line) {
+                    if ALLOWLIST.contains(&name.as_str()) {
+                        continue;
+                    }
+                    if !covered.contains(&name) {
+                        orphans.push(name);
+                    }
+                }
+            }
+        }
+
+        assert!(
+            orphans.is_empty(),
+            "以下投影函数缺契约测试(加测试或加入 ALLOWLIST 并注明理由):\n{}",
+            orphans.join("\n")
+        );
+    }
 }
