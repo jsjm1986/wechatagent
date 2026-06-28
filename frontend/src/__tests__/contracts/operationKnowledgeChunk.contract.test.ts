@@ -6,7 +6,9 @@ import { CANONICAL_KEYS } from "../../contracts/operationKnowledgeChunk.contract
 // 与前端 CANONICAL_KEYS 声明双向比对。任何一侧漂移都在此测红。
 describe("契约: operation_knowledge_chunk 列表投影", () => {
   const actualKeys = Object.keys(fixture).sort();
-  const declaredKeys = [...CANONICAL_KEYS].sort();
+  // 显式 string[]:CANONICAL_KEYS 是 as const 字面量联合,直接 .includes(k: string) 会被
+  // strict 模式拒(参数须是字面量之一)。对账只比键集,在此放宽到 string[] 即可。
+  const declaredKeys: string[] = [...CANONICAL_KEYS].sort();
 
   it("后端下发的键集 == 前端声明的 CANONICAL_KEYS(无缺、无多)", () => {
     const missingInFrontend = actualKeys.filter((k) => !declaredKeys.includes(k));
