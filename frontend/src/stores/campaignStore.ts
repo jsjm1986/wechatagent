@@ -29,13 +29,31 @@ export interface CampaignReport {
   items: CampaignSendItem[];
 }
 
+export interface CampaignListItem {
+  campaignId: string;
+  title: string;
+  status: string;
+  targetCount?: number;
+  dispatchedCount: number;
+  createdBy: string;
+  createdAt?: string;
+}
+
 interface CampaignState {
   selectedCampaignId: string | null;
   report: CampaignReport | null;
   loading: boolean;
   lastAttemptedId: string | null;
+  view: "list" | "create" | "board";
+  campaigns: CampaignListItem[];
+  listLoading: boolean;
+  listLoaded: boolean;
+  page: number;
   openReport: (id: string) => void;
   loadReport: (id: string) => Promise<void>;
+  setView: (v: "list" | "create" | "board") => void;
+  loadCampaigns: () => Promise<void>;
+  setPage: (n: number) => void;
   clear: () => void;
 }
 
@@ -44,8 +62,13 @@ export const useCampaignStore = create<CampaignState>((set, get) => ({
   report: null,
   loading: false,
   lastAttemptedId: null,
+  view: "list",
+  campaigns: [],
+  listLoading: false,
+  listLoaded: false,
+  page: 0,
   openReport: (id) => {
-    set({ selectedCampaignId: id, report: null });
+    set({ selectedCampaignId: id, report: null, view: "board", page: 0 });
     useNavigationStore.getState().setChannel("campaign");
     void get().loadReport(id);
   },
@@ -60,5 +83,18 @@ export const useCampaignStore = create<CampaignState>((set, get) => ({
       set({ loading: false });
     }
   },
-  clear: () => set({ selectedCampaignId: null, report: null, loading: false, lastAttemptedId: null }),
+  setView: (v) => set({ view: v }),
+  loadCampaigns: async () => {
+    set({ listLoading: true, listLoaded: true });
+    try {
+      const r = await api.get<{ items: CampaignListItem[] }>("/api/campaigns");
+      set({ campaigns: r.items });
+    } catch (e) {
+      useUiStore.getState().setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      set({ listLoading: false });
+    }
+  },
+  setPage: (n) => set({ page: n }),
+  clear: () => set({ selectedCampaignId: null, report: null, loading: false, lastAttemptedId: null, view: "list", campaigns: [], listLoading: false, listLoaded: false, page: 0 }),
 }));
