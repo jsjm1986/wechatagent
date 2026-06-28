@@ -200,6 +200,7 @@ use knowledge::{
     batch_archive_chunks, batch_verify_chunks,
     chat_apply, chat_discard,
     chat_history, chat_session_stream, chat_task_cancel, chat_task_create, chat_task_get,
+    chat_task_list,
     chat_turn, create_ingest_source, create_operation_knowledge,
     create_operation_knowledge_chunk, create_operation_knowledge_document,
     delete_ingest_source, delete_operation_knowledge, delete_operation_knowledge_chunk,
@@ -670,7 +671,10 @@ pub fn api_router(state: AppState) -> Router<AppState> {
             "/knowledge/digest/cards/:id/dismiss",
             post(digest_dismiss_card),
         )
-        .route("/knowledge/chat/tasks", post(chat_task_create))
+        .route(
+            "/knowledge/chat/tasks",
+            get(chat_task_list).post(chat_task_create),
+        )
         .route(
             "/knowledge/chat/tasks/:id",
             get(chat_task_get),
