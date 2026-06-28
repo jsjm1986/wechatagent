@@ -36,6 +36,8 @@ mod wiki_edit;
 mod sources_meta;
 //
 pub(in crate::routes) use crud::*;
+// Task6：chunk PUT update handler 暴露给集成测试 crate（经 routes::ext_knowledge 再导出）。
+pub use crud::update_operation_knowledge_chunk;
 pub use verify::*;
 pub use import::*;
 pub use catalog::*;
@@ -164,7 +166,7 @@ pub(super) struct OperationKnowledgeRequest {
 #[derive(Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[allow(dead_code)] // HTTP schema：routing_card / forbidden_claims 字段保留前端兼容
-pub(super) struct OperationKnowledgeChunkRequest {
+pub struct OperationKnowledgeChunkRequest {
     account_id: Option<String>,
     document_id: Option<String>,
     item_id: Option<String>,
@@ -505,6 +507,44 @@ pub(super) fn operation_knowledge_chunk_from_request(
         updated_at: now,
         ..Default::default()
     })
+}
+
+/// PUT 用 `replace_one` 整条替换文档，但请求体 [`OperationKnowledgeChunkRequest`] 不携带
+/// `provenance` / `wiki_type` / `chunk_type` 等 model 字段。转换函数
+/// [`operation_knowledge_chunk_from_request`] 对它们走 `..Default::default()`，
+/// 整条替换时会把已有值清空（AI 修复闭环每次 PUT 都丢失知识来源追溯）。
+///
+/// 本函数把这些「请求体无法表达」的字段从原 chunk 回填，使 PUT 只覆盖请求体能表达的
+/// 字段，未表达字段保持原值（与 domain_profiles PUT 的「未触及字段保持原值」语义对齐：
+/// 那条走 `$set` 局部更新，chunk 走 `replace_one` 整体替换，故需显式回填）。
+///
+/// `created_at` 同样回填原值——转换函数把它设成 `now`，PUT 时若不回填会把创建时间
+/// 篡改成更新时间；`updated_at` 跟随 `now` 是正确的，不回填。
+///
+/// 注意：本函数不碰 `integrity_status` / `source_anchors` / `confidence_score` /
+/// `distortion_risks` 等请求体**能表达**的字段——它们的 integrity 判定由 handler 里的
+/// `apply_chunk_integrity` / `coerce_integrity_against_d2_gate` 负责，本函数不引入任何
+/// 自动 verify。
+pub(super) fn preserve_unmodeled_chunk_fields(
+    mut next: OperationKnowledgeChunk,
+    existing: &OperationKnowledgeChunk,
+) -> OperationKnowledgeChunk {
+    next.wiki_type = existing.wiki_type.clone();
+    next.chunk_type = existing.chunk_type.clone();
+    next.provenance = existing.provenance.clone();
+    next.related_chunks = existing.related_chunks.clone();
+    next.usage_stats = existing.usage_stats.clone();
+    next.dynamic_confidence = existing.dynamic_confidence;
+    next.valid_from = existing.valid_from;
+    next.valid_to = existing.valid_to;
+    next.superseded_by = existing.superseded_by.clone();
+    next.previous_version_id = existing.previous_version_id.clone();
+    next.locked_fields = existing.locked_fields.clone();
+    next.integrity_score = existing.integrity_score;
+    next.domain_attributes = existing.domain_attributes.clone();
+    // created_at 保留原值（转换函数设成 now，PUT 不应篡改创建时间）。
+    next.created_at = existing.created_at;
+    next
 }
 
 pub(super) fn normalize_operation_knowledge_preview_item(
@@ -1356,6 +1396,96 @@ mod tests {
             json!(["方案A", "方案B"]),
             "列表投影必须下发 productTags(camelCase),防 AI 修复落库清空"
         );
+    }
+
+    /// 根治 chunk PUT replace_one 清空 model 字段：请求体无法表达的 13 个字段 +
+    /// created_at 必须从原 chunk 回填，请求体能表达的字段（title 等）仍来自 next。
+    #[test]
+    fn preserve_unmodeled_chunk_fields_restores_request_unrepresentable_fields() {
+        use crate::models::{ChunkProvenance, OperationKnowledgeChunk, RelatedRef, UsageStats};
+        use mongodb::bson::{doc, DateTime};
+
+        let created = DateTime::from_millis(1_000_000);
+        let updated = DateTime::from_millis(9_000_000);
+
+        // existing：13 字段 + created_at 全部有值。
+        let existing = OperationKnowledgeChunk {
+            wiki_type: Some("entity".to_string()),
+            chunk_type: "style_template".to_string(),
+            provenance: Some(ChunkProvenance {
+                source: "imported".to_string(),
+                source_doc_id: Some("doc-1".to_string()),
+                source_quote: None,
+                llm_model_alias: None,
+                edited_at: created,
+                edited_by: None,
+            }),
+            related_chunks: Some(vec![RelatedRef {
+                chunk_id: "c-2".to_string(),
+                kind: "references".to_string(),
+                note: None,
+            }]),
+            usage_stats: Some(UsageStats::default()),
+            dynamic_confidence: Some(0.73),
+            valid_from: Some(DateTime::from_millis(2_000_000)),
+            valid_to: Some(DateTime::from_millis(3_000_000)),
+            superseded_by: Some("c-9".to_string()),
+            previous_version_id: Some("c-0".to_string()),
+            locked_fields: Some(vec!["title".to_string(), "body".to_string()]),
+            integrity_score: Some(0.91),
+            domain_attributes: Some(doc! { "customer_stage": "negotiation" }),
+            created_at: created,
+            ..Default::default()
+        };
+
+        // next：模拟转换函数产物——请求体能表达的字段来自请求，13 字段走 Default，
+        // created_at 被设成 now（这里用 updated 占位）。
+        let next = OperationKnowledgeChunk {
+            title: "新标题".to_string(),
+            summary: Some("新摘要".to_string()),
+            created_at: updated,
+            updated_at: updated,
+            ..Default::default()
+        };
+
+        let merged = preserve_unmodeled_chunk_fields(next, &existing);
+
+        // 请求体能表达的字段仍来自 next。
+        assert_eq!(merged.title, "新标题", "title 来自请求体");
+        assert_eq!(merged.summary.as_deref(), Some("新摘要"), "summary 来自请求体");
+        assert_eq!(merged.updated_at, updated, "updated_at 跟随 now,不回填");
+
+        // 13 个请求体无法表达的字段 + created_at 全部回填原值。
+        assert_eq!(merged.wiki_type.as_deref(), Some("entity"), "wiki_type 回填");
+        assert_eq!(merged.chunk_type, "style_template", "chunk_type 回填(不被重置为 product_fact)");
+        assert_eq!(
+            merged.provenance.as_ref().map(|p| p.source.as_str()),
+            Some("imported"),
+            "provenance 回填(知识来源追溯)"
+        );
+        assert_eq!(
+            merged.related_chunks.as_ref().map(|v| v.len()),
+            Some(1),
+            "related_chunks 回填"
+        );
+        assert!(merged.usage_stats.is_some(), "usage_stats 回填");
+        assert_eq!(merged.dynamic_confidence, Some(0.73), "dynamic_confidence 回填");
+        assert_eq!(merged.valid_from, Some(DateTime::from_millis(2_000_000)), "valid_from 回填");
+        assert_eq!(merged.valid_to, Some(DateTime::from_millis(3_000_000)), "valid_to 回填");
+        assert_eq!(merged.superseded_by.as_deref(), Some("c-9"), "superseded_by 回填");
+        assert_eq!(merged.previous_version_id.as_deref(), Some("c-0"), "previous_version_id 回填");
+        assert_eq!(
+            merged.locked_fields.as_deref(),
+            Some(&["title".to_string(), "body".to_string()][..]),
+            "locked_fields 回填(编辑保护清单)"
+        );
+        assert_eq!(merged.integrity_score, Some(0.91), "integrity_score 回填");
+        assert_eq!(
+            merged.domain_attributes.as_ref().and_then(|d| d.get_str("customer_stage").ok()),
+            Some("negotiation"),
+            "domain_attributes 回填"
+        );
+        assert_eq!(merged.created_at, created, "created_at 回填原值(不被篡改成更新时间)");
     }
 
     // ── G-后续Ⅱ/1：纯逻辑 helper 单测扩展 ─────────────────────────────────

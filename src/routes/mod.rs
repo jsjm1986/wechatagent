@@ -124,6 +124,11 @@ pub mod ext_knowledge {
     // 拿到 draft chunk 去 verify。ChatApplyRequest 派生 Deserialize，测试侧用
     // serde_json::from_value 构造，无需放开字段可见性。
     pub use super::knowledge::{chat_apply, ChatApplyRequest};
+    // Task6：chunk PUT update handler + 其请求体，供集成测试直驱（绕过 axum），
+    // 断言 replace_one 不再清空 provenance / wiki_type / locked_fields / created_at 等
+    // 「请求体无法表达」的 model 字段。请求体字段私有但派生 Deserialize，测试侧用
+    // serde_json::from_value 构造。
+    pub use super::knowledge::{update_operation_knowledge_chunk, OperationKnowledgeChunkRequest};
 }
 pub use shared::upsert_contact_from_value;
 
