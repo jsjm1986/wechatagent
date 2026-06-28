@@ -260,7 +260,7 @@ use prompt_templates::{
 use products::{
     archive_product, create_product, list_products, restore_product, update_product,
 };
-use campaigns::{create_campaign, dispatch_campaign, preview_campaign};
+use campaigns::{campaign_sends_report, create_campaign, dispatch_campaign, preview_campaign};
 use principal_escalations::{
     list_principal_escalations, reassign_principal_escalation, resolve_principal_escalation,
 };
@@ -791,6 +791,7 @@ pub fn api_router(state: AppState) -> Router<AppState> {
         .route("/campaigns", post(create_campaign))
         .route("/campaigns/:id/preview", post(preview_campaign))
         .route("/campaigns/:id/dispatch", post(dispatch_campaign))
+        .route("/campaigns/:id/sends", get(campaign_sends_report))
         .route(
             "/management-agent/sessions",
             post(create_management_session),
