@@ -860,7 +860,8 @@ async fn apply_state_action_gate(
 }
 
 /// 客户回应保障守卫：本轮若是 Inbound 且落到会晾死客户的零回复状态，给客户补一条
-/// 确定性中性占位（走 outbox）。统一三道 precheck 出口 + 拦截分支 + A3 主动沉默路径。
+/// 确定性中性占位（走 outbox）。统一两道 precheck 出口 + 拦截分支（held/blocked）。
+/// A3 主动沉默（no_reply）不在此列——AI 判定该沉默更拟人，见黑名单豁免。
 ///
 /// - 黑名单判定见 [`should_send_ack_placeholder`]（仅 Inbound、非豁免状态才补）。
 /// - 入队前复查 `should_abort_send()`：客户又发了新消息 → 下一轮会真回，补占位会与下轮
@@ -2292,16 +2293,6 @@ async fn run_user_operation_gateway_inner(
         if let Some(task_id) = task_id {
             cancel_task(state, task_id, "no_reply", "Agent 判断无需触达").await?;
         }
-        ensure_customer_acknowledged(
-            state,
-            &contact,
-            &run_id,
-            trigger.kind(),
-            &envelope_source_event_id,
-            "no_reply",
-            &should_abort_send,
-        )
-        .await;
     }
     let details = build_decision_event_details(&final_decision, playbook.as_ref(), &review);
     write_event_for_account(
@@ -3253,7 +3244,10 @@ fn split_long_segment(seg: &str, max_chars: usize) -> Vec<String> {
 
 /// 客户回应保障——零回复豁免清单（黑名单语义）。这些终态 / precheck 状态下
 /// 「客户零回复」是**正确**的，不补占位（口径见 plan「黑名单口径」表）。
-/// 逐字等于 spec §3.2 排除清单。
+///
+/// `no_reply`（A3 主动沉默）在列：那是 AI **主动判定**该沉默更拟人（如客户只回
+/// "好的👌"客套），非被闸门拦下的晾死——补"稍等我给你准信"反而破坏拟人，故豁免。
+/// 守卫只覆盖真正的晾死：held/blocked/precheck 类（AI 想回却被拦，客户在等）。
 pub(crate) const ACK_PLACEHOLDER_EXCLUDED_STATUSES: &[&str] = &[
     "cooldown",
     "rate_limited",
@@ -3262,16 +3256,17 @@ pub(crate) const ACK_PLACEHOLDER_EXCLUDED_STATUSES: &[&str] = &[
     "superseded_by_new_inbound",
     "not_managed",
     "context_changed",
+    "no_reply",
 ];
 
 /// 是否该给本轮零回复的客户补一条确定性安抚占位。
 ///
-/// 黑名单语义（全兜底）：只要是 Inbound（`trigger_kind == "inbound"`，客户真发了消息）
+/// 黑名单语义：只要是 Inbound（`trigger_kind == "inbound"`，客户真发了消息）
 /// 且 `status` 不在豁免清单内，就补。`status` 取各零回复出口的状态串：
-/// precheck.status / 拦截分支 blocked_status / A3 主动沉默路径的 `"no_reply"`。
+/// precheck.status / 拦截分支 blocked_status。
 ///
-/// 红线：FollowUp（AI 主动触达，客户没在等回复）任何状态都不补——避免"主动触达被拦"
-/// 时发"稍等我给你准信"这类非所问的占位。
+/// 红线：FollowUp（AI 主动触达，客户没在等回复）任何状态都不补；A3 主动沉默
+/// （`no_reply`，AI 判定该沉默更拟人）也不补——都避免发"稍等我给你准信"这类非所问占位。
 pub(crate) fn should_send_ack_placeholder(trigger_kind: &str, status: &str) -> bool {
     trigger_kind == "inbound" && !ACK_PLACEHOLDER_EXCLUDED_STATUSES.contains(&status)
 }
@@ -5088,8 +5083,8 @@ pub(crate) fn compute_taxonomy_guard_outcome(
 mod tests {
     use super::*;
 
-    // 客户回应保障守卫判定纯函数（黑名单语义，全兜底）：
-    // 只要 Inbound 且 status 不在豁免清单内就补占位。
+    // 客户回应保障守卫判定纯函数（黑名单语义）：
+    // 只要 Inbound 且 status 不在豁免清单内就补占位（覆盖真正的晾死：held/blocked/precheck）。
     #[test]
     fn ack_placeholder_inbound_held_and_blocked_terminals_get_ack() {
         for status in [
@@ -5098,7 +5093,6 @@ mod tests {
             "blocked_by_budget",
             "blocked_by_safety_guard",
             "blocked_unverified_product_claim",
-            "no_reply",          // A3 主动沉默：Inbound 仍须 ack
             "daily_limit",       // 每日触达上限：客户主动问也须 ack（全兜底）
             "policy_cooldown",   // 运营策略冷却：仍 ack
         ] {
@@ -5119,6 +5113,7 @@ mod tests {
             "superseded_by_new_inbound",
             "not_managed",
             "context_changed",
+            "no_reply",          // A3 主动沉默：AI 判定该沉默更拟人，非晾死，不补占位
         ] {
             assert!(
                 !should_send_ack_placeholder("inbound", status),
