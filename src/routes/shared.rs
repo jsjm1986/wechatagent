@@ -1729,5 +1729,36 @@ mod tests {
         let projected = memory_candidate_json(item);
         crate::routes::contract_snapshot::assert_contract_fixture("memory_candidate", projected);
     }
+
+    /// 契约快照：operating_memory_json。memory_card/context_pack 都空 → memoryCard
+    /// 走 default skeleton 分支（确定形状）;4 个下发 Document 放纯标量;id→hex。
+    /// context_pack 系列 + created_at 赋值但投影不下发。
+    #[test]
+    fn operating_memory_json_matches_contract_fixture() {
+        use super::operating_memory_json;
+        use crate::models::{MemoryCardTyped, OperatingMemory};
+        use mongodb::bson::{doc, oid::ObjectId, DateTime, Document};
+
+        let memory = OperatingMemory {
+            id: Some(ObjectId::parse_str("64a1f2c3e4b5a6978899e001").unwrap()),
+            workspace_id: "ws-1".to_string(),
+            account_id: "acc-1".to_string(),
+            contact_wxid: "wxid_abc".to_string(),
+            user_understanding: doc! { "identity": "企业主", "businessContext": "餐饮连锁" },
+            relationship_state: doc! { "trustLevel": "high", "temperature": "warm" },
+            product_fit: doc! { "fitReason": "需要私域自动化" },
+            next_action: doc! { "action": "follow_up", "due": "2026-07-01" },
+            context_pack: Document::new(),
+            context_pack_version: 0,
+            context_pack_updated_at: None,
+            memory_card: MemoryCardTyped::default(),
+            memory_card_version: 3,
+            memory_card_updated_at: Some(DateTime::from_millis(1_700_000_050_000)),
+            created_at: DateTime::from_millis(1_700_000_000_000),
+            updated_at: DateTime::from_millis(1_700_000_100_000),
+        };
+        let projected = operating_memory_json(memory);
+        crate::routes::contract_snapshot::assert_contract_fixture("operating_memory", projected);
+    }
 }
 
