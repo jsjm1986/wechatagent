@@ -483,6 +483,52 @@ fn limit_extra_array(doc: &mut Document, key: &str, max_items: usize) {
     }
 }
 
+/// ⑨件二（方案 X）：结构性非原子检测——判断一条 fact 的 text 是否是"非原子 blob"
+/// （consolidator 偶发降级把多个事实揉进一条）。**纯结构度量，零关键词、零数值实体
+/// 提取、零 LLM**（守 agent-first）：仅看换行数 / 句界标点数 / char 长度这类客观结构特征。
+///
+/// 三条 OR 判据（互为冗余兜底）：
+/// - ≥2 个换行 `\n`（blob 典型形态：多句 summary 用换行拼接）；
+/// - ≥2 个句界标点（`。`/`！`/`？`/`;`）（多个完整句 = 多个事实）；
+/// - char 数 > 80（正常原子 fact 实测 ≤~20 字，blob 数百字；80 是宽松上界，
+///   宁漏判不误伤——漏判的 blob 还有换行/句界判据兜底 + 件一救回 + 重试）。
+pub(crate) fn fact_is_non_atomic(text: &str) -> bool {
+    let newline_count = text.matches('\n').count();
+    if newline_count >= 2 {
+        return true;
+    }
+    let sentence_breaks = text
+        .chars()
+        .filter(|c| matches!(c, '。' | '！' | '？' | ';' | '；'))
+        .count();
+    if sentence_breaks >= 2 {
+        return true;
+    }
+    text.chars().count() > 80
+}
+
+/// ⑨件二：扫 consolidator 原始输出 `value` 的 `memoryCard.coreFacts[].text` 与
+/// `recentFacts[].text`，任一条 `fact_is_non_atomic` 即判定本次输出含非原子 blob。
+/// 兼容 `memoryCard`（camelCase）/ `memory_card`（snake_case）两种 key。
+pub(crate) fn value_has_non_atomic_fact(value: &serde_json::Value) -> bool {
+    let card = value
+        .get("memoryCard")
+        .or_else(|| value.get("memory_card"))
+        .unwrap_or(value);
+    for key in ["coreFacts", "recentFacts"] {
+        if let Some(arr) = card.get(key).and_then(|v| v.as_array()) {
+            for item in arr {
+                if let Some(text) = item.get("text").and_then(|t| t.as_str()) {
+                    if fact_is_non_atomic(text) {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    false
+}
+
 /// ⑨记忆冲突机制侧兜底（2026-06-27）：对 `card.core_facts` 内**同 dimension** 的多条
 /// Structured fact 做自动裁决——保留 `updated_at` 最新的一条，其余移入 `deprecated_facts`
 /// （带 deprecation_reason + supersededBy=最新条 id）。
@@ -2395,6 +2441,77 @@ mod r7_deprecation_tests {
         let texts: Vec<&str> = out.core_facts.iter().map(|f| f.as_text()).collect();
         assert!(texts.contains(&"孩子10岁") && texts.contains(&"预算3万"),
             "不同 dimension 不应互相误删: {texts:?}");
+    }
+
+    // ⑨件二：结构性非原子检测(零关键词,纯结构度量)。
+    #[test]
+    fn atomic_fact_normal_short_is_atomic() {
+        use crate::agent::memory::fact_is_non_atomic;
+        assert!(!fact_is_non_atomic("孩子10岁"));
+        assert!(!fact_is_non_atomic("预算5000左右"));
+    }
+
+    #[test]
+    fn atomic_fact_normal_slightly_long_not_misflagged() {
+        use crate::agent::memory::fact_is_non_atomic;
+        // 含 1 逗号、~13 字的正常稍长 fact 不应误判
+        assert!(!fact_is_non_atomic("孩子10岁，零基础想报编程课"));
+    }
+
+    #[test]
+    fn non_atomic_multiple_newlines() {
+        use crate::agent::memory::fact_is_non_atomic;
+        assert!(fact_is_non_atomic("孩子8岁\n更新为10岁\n确认8岁"));
+    }
+
+    #[test]
+    fn non_atomic_multiple_sentence_breaks() {
+        use crate::agent::memory::fact_is_non_atomic;
+        assert!(fact_is_non_atomic("孩子8岁。预算5000。男孩。"));
+    }
+
+    #[test]
+    fn non_atomic_over_length() {
+        use crate::agent::memory::fact_is_non_atomic;
+        let long = "客户".repeat(45); // 90 字,无换行无句界,仅靠长度命中
+        assert!(fact_is_non_atomic(&long));
+    }
+
+    #[test]
+    fn atomic_single_sentence_break_ok() {
+        use crate::agent::memory::fact_is_non_atomic;
+        // 单个句号(末尾)不触发(需 ≥2 句界)
+        assert!(!fact_is_non_atomic("孩子10岁。"));
+    }
+
+    #[test]
+    fn value_scan_detects_blob_in_corefacts() {
+        use crate::agent::memory::value_has_non_atomic_fact;
+        let v = serde_json::json!({
+            "memoryCard": {
+                "coreFacts": [
+                    {"text": "孩子8岁\n更新为10岁\n确认8岁", "dimension": ""},
+                    {"text": "预算5000", "dimension": "预算"}
+                ],
+                "recentFacts": []
+            }
+        });
+        assert!(value_has_non_atomic_fact(&v));
+    }
+
+    #[test]
+    fn value_scan_clean_corefacts_is_false() {
+        use crate::agent::memory::value_has_non_atomic_fact;
+        let v = serde_json::json!({
+            "memoryCard": {
+                "coreFacts": [
+                    {"text": "孩子10岁", "dimension": "孩子年龄"},
+                    {"text": "预算5000", "dimension": "预算"}
+                ],
+                "recentFacts": [{"text": "初次接触", "dimension": ""}]
+            }
+        });
+        assert!(!value_has_non_atomic_fact(&v));
     }
 }
 
