@@ -216,3 +216,51 @@ describe("ProposalReleaseCard prompt 新旧对照表（阶段三）", () => {
     expect(samples).toHaveTextContent("run-001"); // 仍渲染，不 crash
   });
 });
+
+describe("MetadataSection 聚合证据移出（阶段三）", () => {
+  beforeEach(() => vi.clearAllMocks());
+
+  it("prompt 类通用 evalMetrics 表不再平铺已结构化的聚合 key", async () => {
+    getMock.mockResolvedValue(
+      baseDetail({
+        evalMetrics: {
+          kind: "prompt",
+          five_gate_hit_delta_per_gate: { fact_risk_block: -0.1 },
+          self_critique_addressed_delta_observed: 0.2,
+          custom_extra_note: "保留这条",
+        },
+      }),
+    );
+    renderCard();
+    await screen.findByTestId("proposal-detail");
+    const metrics = screen.queryByTestId("proposal-eval-metrics");
+    // 非白名单 key 仍展示
+    expect(metrics).toHaveTextContent("custom_extra_note");
+    // 白名单 key 不在通用表里（已被对照表结构化展示）
+    expect(metrics).not.toHaveTextContent("five_gate_hit_delta_per_gate");
+    expect(metrics).not.toHaveTextContent("self_critique_addressed_delta_observed");
+  });
+
+  it("threshold 类通用 evalMetrics 表保留全部 key（含共有的 five_gate_hit_delta_per_gate）", async () => {
+    getMock.mockResolvedValue(
+      baseDetail({
+        kind: "threshold",
+        gateKey: "fact_risk_block",
+        evalMetrics: {
+          kind: "threshold",
+          original_send_success_rate: 0.8,
+          new_send_success_rate: 0.85,
+          five_gate_hit_delta_per_gate: { fact_risk_block: -0.05 },
+          safety_regression_rate: 0.0,
+        },
+      }),
+    );
+    renderCard();
+    await screen.findByTestId("proposal-detail");
+    const metrics = screen.getByTestId("proposal-eval-metrics");
+    // threshold 类完全不移出：独有 + 共有 key 都在
+    expect(metrics).toHaveTextContent("original_send_success_rate");
+    expect(metrics).toHaveTextContent("five_gate_hit_delta_per_gate");
+    expect(metrics).toHaveTextContent("safety_regression_rate");
+  });
+});
