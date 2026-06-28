@@ -478,7 +478,7 @@ fn bump(map: &mut serde_json::Map<String, Value>, reason: &str) {
 
 /// GET /campaigns/:id/sends —— 活动推送结果聚合（只读）。
 /// 把 campaign_sends 台账与 agent_run_logs（关联键 source_event_id=taskId.hex）
-/// 聚合成 6 桶分布 + 每人明细。零写入。IDOR：filter 含 workspaceId。
+/// 聚合成 7 桶分布 + 每人明细。零写入。IDOR：filter 含 workspaceId。
 pub async fn campaign_sends_report(
     State(state): State<AppState>,
     Extension(admin): Extension<AuthenticatedAdmin>,
