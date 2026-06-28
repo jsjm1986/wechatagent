@@ -511,6 +511,8 @@ fn shadow_replay_json(r: &ShadowReplay) -> Value {
         "status": r.status,
         "failureReason": r.failure_reason,
         "originalFinalReviewStatus": r.original_final_review_status,
+        "original5gateHit": bson_doc_to_json(&r.original_5gate_hit),
+        "originalSelfCritiqueAddressed": r.original_self_critique_addressed,
         "newFinalReviewStatus": r.new_final_review_status,
         "newReviewRisks": r.new_review_risks,
         "newTokenCost": r.new_token_cost,
@@ -780,6 +782,82 @@ mod tests {
         assert_eq!(v["decidedBy"], "evolution_auto_release");
         // None significance_metrics 必须序列化成 null，不是缺字段。
         assert!(v["significanceMetrics"].is_null());
+    }
+
+    #[test]
+    fn shadow_replay_json_exposes_original_side_for_comparison() {
+        use mongodb::bson::doc;
+        let r = ShadowReplay {
+            id: Some(ObjectId::new()),
+            proposal_id: ObjectId::new(),
+            experiment_id: "EXP1".to_string(),
+            workspace_id: "default".to_string(),
+            account_id: "acct".to_string(),
+            source_run_id: ObjectId::new(),
+            status: "completed".to_string(),
+            failure_reason: None,
+            original_final_review_status: Some("held_by_ai_policy".to_string()),
+            original_5gate_hit: doc! {
+                "fact_risk_block": true,
+                "pressure_risk_block": false,
+                "human_like_score_rewrite": false,
+                "emotional_value_rewrite": false,
+                "product_accuracy_score_block": false,
+            },
+            original_self_critique_addressed: Some(false),
+            new_final_review_status: Some("approved".to_string()),
+            new_review_risks: Vec::new(),
+            new_token_cost: Some(321),
+            new_5gate_hit: doc! {
+                "fact_risk_block": false,
+                "pressure_risk_block": false,
+                "human_like_score_rewrite": false,
+                "emotional_value_rewrite": false,
+                "product_accuracy_score_block": false,
+            },
+            new_self_critique_addressed: Some(true),
+            similarity_to_original_text: 0.0,
+            started_at: DateTime::now(),
+            finished_at: Some(DateTime::now()),
+        };
+        let v = shadow_replay_json(&r);
+        // 新增 original 侧对照字段
+        assert_eq!(v["original5gateHit"]["fact_risk_block"], true);
+        assert_eq!(v["original5gateHit"]["human_like_score_rewrite"], false);
+        assert_eq!(v["originalSelfCritiqueAddressed"], false);
+        // 既有 new 侧不回归
+        assert_eq!(v["new5gateHit"]["fact_risk_block"], false);
+        assert_eq!(v["newSelfCritiqueAddressed"], true);
+        assert_eq!(v["originalFinalReviewStatus"], "held_by_ai_policy");
+    }
+
+    #[test]
+    fn shadow_replay_json_empty_original_5gate_is_empty_object() {
+        let r = ShadowReplay {
+            id: None,
+            proposal_id: ObjectId::new(),
+            experiment_id: "EXP1".to_string(),
+            workspace_id: "default".to_string(),
+            account_id: "acct".to_string(),
+            source_run_id: ObjectId::new(),
+            status: "failed".to_string(),
+            failure_reason: Some("source_message_unavailable".to_string()),
+            original_final_review_status: None,
+            original_5gate_hit: mongodb::bson::Document::new(),
+            original_self_critique_addressed: None,
+            new_final_review_status: None,
+            new_review_risks: Vec::new(),
+            new_token_cost: None,
+            new_5gate_hit: mongodb::bson::Document::new(),
+            new_self_critique_addressed: None,
+            similarity_to_original_text: 0.0,
+            started_at: DateTime::now(),
+            finished_at: None,
+        };
+        let v = shadow_replay_json(&r);
+        // 空 Document → {}；Option None → null
+        assert_eq!(v["original5gateHit"], serde_json::json!({}));
+        assert!(v["originalSelfCritiqueAddressed"].is_null());
     }
 
     fn test_app_config() -> crate::config::AppConfig {
