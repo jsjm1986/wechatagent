@@ -1444,6 +1444,41 @@ pub(crate) async fn load_referral_cards(
     Ok(out)
 }
 
+/// 档位序数：Lean=0 < Relational=1 < Full=2。用于分档注入可见性判定。
+fn tier_rank(t: crate::agent::sufficiency::PromptTier) -> u8 {
+    match t {
+        crate::agent::sufficiency::PromptTier::Lean => 0,
+        crate::agent::sufficiency::PromptTier::Relational => 1,
+        crate::agent::sufficiency::PromptTier::Full => 2,
+    }
+}
+
+/// 文本资产是否在当前轮档位注入：当前档序 >= 资产最低档序时可见。
+/// min_tier=None/非法值按 "full"（序 2）处理 —— 仅 Full 可见，等价改造前。
+pub(crate) fn asset_visible_at_tier(
+    min_tier: Option<&str>,
+    current: crate::agent::sufficiency::PromptTier,
+) -> bool {
+    let min_rank = match min_tier {
+        Some("lean") => 0,
+        Some("relational") => 1,
+        _ => 2, // "full" / None / 非法值
+    };
+    tier_rank(current) >= min_rank
+}
+
+/// 当前档可见的 min_inject_tier 取值集合（供 Mongo 查询下推 $in）。
+/// Lean→{lean}；Relational→{lean,relational}；Full→{lean,relational,full}。
+pub(crate) fn visible_min_tiers_for(
+    current: crate::agent::sufficiency::PromptTier,
+) -> Vec<&'static str> {
+    match current {
+        crate::agent::sufficiency::PromptTier::Lean => vec!["lean"],
+        crate::agent::sufficiency::PromptTier::Relational => vec!["lean", "relational"],
+        crate::agent::sufficiency::PromptTier::Full => vec!["lean", "relational", "full"],
+    }
+}
+
 pub(crate) async fn load_context_assets(state: &AppState, account_id: &str) -> AppResult<String> {
     use futures::TryStreamExt;
     use mongodb::bson::doc;
@@ -1945,5 +1980,55 @@ mod prompt_override_tests {
         // 不命中 key → 原样逐字返回（字节等价护栏）
         let miss = ov.apply_if_matches("user.reply.system", "系统契约正文".into());
         assert_eq!(miss, "系统契约正文");
+    }
+}
+
+#[cfg(test)]
+mod tier_injection_tests {
+    use super::{asset_visible_at_tier, visible_min_tiers_for};
+    use crate::agent::sufficiency::PromptTier;
+
+    #[test]
+    fn lean_asset_visible_in_all_tiers() {
+        assert!(asset_visible_at_tier(Some("lean"), PromptTier::Lean));
+        assert!(asset_visible_at_tier(Some("lean"), PromptTier::Relational));
+        assert!(asset_visible_at_tier(Some("lean"), PromptTier::Full));
+    }
+
+    #[test]
+    fn relational_asset_hidden_in_lean_visible_from_relational() {
+        assert!(!asset_visible_at_tier(Some("relational"), PromptTier::Lean));
+        assert!(asset_visible_at_tier(Some("relational"), PromptTier::Relational));
+        assert!(asset_visible_at_tier(Some("relational"), PromptTier::Full));
+    }
+
+    #[test]
+    fn full_asset_visible_only_in_full() {
+        assert!(!asset_visible_at_tier(Some("full"), PromptTier::Lean));
+        assert!(!asset_visible_at_tier(Some("full"), PromptTier::Relational));
+        assert!(asset_visible_at_tier(Some("full"), PromptTier::Full));
+    }
+
+    #[test]
+    fn none_and_invalid_default_to_full() {
+        // None/非法值按 full 处理 → 仅 Full 可见（与改造前逐字等价）
+        assert!(!asset_visible_at_tier(None, PromptTier::Lean));
+        assert!(!asset_visible_at_tier(None, PromptTier::Relational));
+        assert!(asset_visible_at_tier(None, PromptTier::Full));
+        assert!(!asset_visible_at_tier(Some("garbage"), PromptTier::Relational));
+        assert!(asset_visible_at_tier(Some("garbage"), PromptTier::Full));
+    }
+
+    #[test]
+    fn visible_set_widens_with_tier() {
+        assert_eq!(visible_min_tiers_for(PromptTier::Lean), vec!["lean"]);
+        assert_eq!(
+            visible_min_tiers_for(PromptTier::Relational),
+            vec!["lean", "relational"]
+        );
+        assert_eq!(
+            visible_min_tiers_for(PromptTier::Full),
+            vec!["lean", "relational", "full"]
+        );
     }
 }
