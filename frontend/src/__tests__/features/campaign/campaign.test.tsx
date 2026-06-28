@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { render, screen, within } from "@testing-library/react";
+import { render, screen, within, fireEvent } from "@testing-library/react";
 import CampaignFeature, { bucketTone, bucketLabel } from "../../../features/campaign";
 import { useCampaignStore } from "../../../stores/campaignStore";
 import type { CampaignReport } from "../../../stores/campaignStore";
@@ -85,5 +85,23 @@ describe("CampaignFeature", () => {
     });
     render(<CampaignFeature />);
     expect(screen.getByText("暂无推送明细")).toBeInTheDocument();
+  });
+
+  it("点某桶 chip 后明细表只剩该桶行", () => {
+    (useCampaignStore as any).mockReturnValue({
+      selectedCampaignId: "c1", report, loading: false, loadReport: vi.fn(),
+    });
+    render(<CampaignFeature />);
+    // 初始 5 行
+    expect(screen.getAllByTestId("detail-row")).toHaveLength(5);
+    // 点「被拦」chip（bucketLabel("blocked")）。注意「被拦」在 metric 块和 chip 都出现，
+    // 用 getAllByRole("button") 精确取 chip（metric label 是 span 不是 button）。
+    const blockedChip = screen.getAllByRole("button").find((b) => b.textContent === "被拦");
+    expect(blockedChip).toBeTruthy();
+    fireEvent.click(blockedChip!);
+    // 只剩 1 行 blocked（赵六）
+    const rows = screen.getAllByTestId("detail-row");
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toHaveTextContent("赵六");
   });
 });

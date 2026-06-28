@@ -33,6 +33,7 @@ interface CampaignState {
   selectedCampaignId: string | null;
   report: CampaignReport | null;
   loading: boolean;
+  lastAttemptedId: string | null;
   openReport: (id: string) => void;
   loadReport: (id: string) => Promise<void>;
   clear: () => void;
@@ -42,13 +43,14 @@ export const useCampaignStore = create<CampaignState>((set, get) => ({
   selectedCampaignId: null,
   report: null,
   loading: false,
+  lastAttemptedId: null,
   openReport: (id) => {
     set({ selectedCampaignId: id, report: null });
     useNavigationStore.getState().setChannel("campaign");
     void get().loadReport(id);
   },
   loadReport: async (id) => {
-    set({ loading: true });
+    set({ loading: true, lastAttemptedId: id });
     try {
       const r = await api.get<CampaignReport>(`/api/campaigns/${id}/sends`);
       set({ report: r });
@@ -58,5 +60,5 @@ export const useCampaignStore = create<CampaignState>((set, get) => ({
       set({ loading: false });
     }
   },
-  clear: () => set({ selectedCampaignId: null, report: null, loading: false }),
+  clear: () => set({ selectedCampaignId: null, report: null, loading: false, lastAttemptedId: null }),
 }));
