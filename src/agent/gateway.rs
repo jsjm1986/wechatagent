@@ -3150,6 +3150,31 @@ fn split_long_segment(seg: &str, max_chars: usize) -> Vec<String> {
     out
 }
 
+/// 客户回应保障——零回复豁免清单（黑名单语义）。这些终态 / precheck 状态下
+/// 「客户零回复」是**正确**的，不补占位（口径见 plan「黑名单口径」表）。
+/// 逐字等于 spec §3.2 排除清单。
+pub(crate) const ACK_PLACEHOLDER_EXCLUDED_STATUSES: &[&str] = &[
+    "cooldown",
+    "rate_limited",
+    "quiet_hours_deferred",
+    "expired",
+    "superseded_by_new_inbound",
+    "not_managed",
+    "context_changed",
+];
+
+/// 是否该给本轮零回复的客户补一条确定性安抚占位。
+///
+/// 黑名单语义（全兜底）：只要是 Inbound（`trigger_kind == "inbound"`，客户真发了消息）
+/// 且 `status` 不在豁免清单内，就补。`status` 取各零回复出口的状态串：
+/// precheck.status / 拦截分支 blocked_status / A3 主动沉默路径的 `"no_reply"`。
+///
+/// 红线：FollowUp（AI 主动触达，客户没在等回复）任何状态都不补——避免"主动触达被拦"
+/// 时发"稍等我给你准信"这类非所问的占位。
+pub(crate) fn should_send_ack_placeholder(trigger_kind: &str, status: &str) -> bool {
+    trigger_kind == "inbound" && !ACK_PLACEHOLDER_EXCLUDED_STATUSES.contains(&status)
+}
+
 pub(crate) fn blocked(status: &str, reason: &str) -> SendGatewayResult {
     SendGatewayResult {
         allowed: false,
@@ -4930,6 +4955,61 @@ pub(crate) fn compute_taxonomy_guard_outcome(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // 客户回应保障守卫判定纯函数（黑名单语义，全兜底）：
+    // 只要 Inbound 且 status 不在豁免清单内就补占位。
+    #[test]
+    fn ack_placeholder_inbound_held_and_blocked_terminals_get_ack() {
+        for status in [
+            "held_by_ai_policy",
+            "blocked_by_required_field",
+            "blocked_by_budget",
+            "blocked_by_safety_guard",
+            "blocked_unverified_product_claim",
+            "no_reply",          // A3 主动沉默：Inbound 仍须 ack
+            "daily_limit",       // 每日触达上限：客户主动问也须 ack（全兜底）
+            "policy_cooldown",   // 运营策略冷却：仍 ack
+        ] {
+            assert!(
+                should_send_ack_placeholder("inbound", status),
+                "inbound + {status} 应补占位"
+            );
+        }
+    }
+
+    #[test]
+    fn ack_placeholder_excluded_statuses_skip() {
+        for status in [
+            "cooldown",
+            "rate_limited",
+            "quiet_hours_deferred",
+            "expired",
+            "superseded_by_new_inbound",
+            "not_managed",
+            "context_changed",
+        ] {
+            assert!(
+                !should_send_ack_placeholder("inbound", status),
+                "豁免清单内的 {status} 不该补占位"
+            );
+        }
+    }
+
+    #[test]
+    fn ack_placeholder_follow_up_never_acks() {
+        // FollowUp 是 AI 主动触达，不是客户在等回复——任何状态都不补占位。
+        for status in [
+            "held_by_ai_policy",
+            "blocked_by_safety_guard",
+            "no_reply",
+            "daily_limit",
+        ] {
+            assert!(
+                !should_send_ack_placeholder("follow_up", status),
+                "follow_up + {status} 不该补占位"
+            );
+        }
+    }
 
     // CONC-2：commitments 原子追加 update 形态——$slice 必须是 -8（保留最新 8 条，
     // 丢最旧，与原 drain(0..drop) 语义一致），$each 一次只追加一条新 entry，entry
