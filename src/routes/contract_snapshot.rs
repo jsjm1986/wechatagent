@@ -173,9 +173,11 @@ mod tests {
         let mut files = Vec::new();
         collect_rs(&routes_dir, &mut files);
 
-        let all_src: Vec<String> = files
+        // (路径, 源文本) 对:覆盖扫描要按文件名排除本 helper 模块(它自己满篇
+        // `assert_contract_fixture` 字面量 + 文档注释里的投影名,会污染覆盖判定)。
+        let all_src: Vec<(PathBuf, String)> = files
             .iter()
-            .map(|f| fs::read_to_string(f).unwrap_or_default())
+            .map(|f| (f.clone(), fs::read_to_string(f).unwrap_or_default()))
             .collect();
 
         // 覆盖集:一个投影"被契约测试覆盖"当且仅当它出现在某个**契约测试块**里。
@@ -184,8 +186,13 @@ mod tests {
         // "有 production 调用方但零测试"的投影。
         // 纯 std 近似:在每次 `assert_contract_fixture` 出现处切前 600 / 后 200 字符窗口
         // (覆盖一个测试函数体),窗口里出现的 `_json` 名即记为已覆盖。
+        // **排除 contract_snapshot.rs 自身**:它是 helper 定义处,满篇 `assert_contract_fixture`
+        // 字面量与文档/ALLOWLIST 注释里的投影名,纳入会把任意投影名误判为已覆盖。
         let mut covered: std::collections::HashSet<String> = std::collections::HashSet::new();
-        for src in &all_src {
+        for (path, src) in &all_src {
+            if path.file_name().and_then(|n| n.to_str()) == Some("contract_snapshot.rs") {
+                continue;
+            }
             let mut from = 0usize;
             while let Some(rel) = src[from..].find("assert_contract_fixture") {
                 let pos = from + rel;
@@ -208,19 +215,39 @@ mod tests {
         }
 
         // 收集所有投影定义,逐个比对覆盖集。
+        // 投影签名可能多行(operation_health_json/decision_review_json 的 `-> Value` 在独立行),
+        // 故命中 `fn <name>_json` 后向下最多 6 行找 `-> Value`(遇到函数体 `{` 之前),
+        // 单行签名也覆盖。否则多行签名投影会被静默漏扫 → 防腐烂护栏对它们成空门。
         let mut orphans = Vec::new();
-        for src in &all_src {
-            for line in src.lines() {
-                if !line.contains("fn ") || !line.contains("_json") || !line.contains("-> Value") {
+        for (_path, src) in &all_src {
+            let lines: Vec<&str> = src.lines().collect();
+            for (i, line) in lines.iter().enumerate() {
+                if !line.contains("fn ") || !line.contains("_json") {
                     continue;
                 }
-                if let Some(name) = extract_projection_name(line) {
-                    if ALLOWLIST.contains(&name.as_str()) {
-                        continue;
+                let Some(name) = extract_projection_name(line) else {
+                    continue;
+                };
+                // 在签名行 + 后续最多 6 行内找 `-> Value`(到函数体 `{` 为止)。
+                let mut returns_value = false;
+                for probe in lines.iter().skip(i).take(7) {
+                    if probe.contains("-> Value") {
+                        returns_value = true;
+                        break;
                     }
-                    if !covered.contains(&name) {
-                        orphans.push(name);
+                    // 已进入函数体却没见到 `-> Value` → 不是投影(如 `-> AppResult<...>`)。
+                    if probe.contains(" {") || probe.ends_with('{') {
+                        break;
                     }
+                }
+                if !returns_value {
+                    continue;
+                }
+                if ALLOWLIST.contains(&name.as_str()) {
+                    continue;
+                }
+                if !covered.contains(&name) {
+                    orphans.push(name);
                 }
             }
         }
