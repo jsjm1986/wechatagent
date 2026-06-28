@@ -252,6 +252,36 @@ pub async fn review_fixed_candidate_for_test(
     .await
 }
 
+/// ④reviewer 让位：assist_on 时在 reviewer system prompt 末尾追加让位段，否则原样返回。
+/// 纯函数便于单测;DEFAULT(assist 关)字节等价。
+fn append_assist_yield(system: String, assist_on: bool) -> String {
+    if assist_on {
+        format!("{system}{}", crate::agent::referral::REVIEWER_ASSIST_YIELD_NOTE)
+    } else {
+        system
+    }
+}
+
+#[cfg(test)]
+mod assist_yield_tests {
+    use super::append_assist_yield;
+
+    #[test]
+    fn assist_off_is_byte_identical() {
+        let base = "原始 reviewer system prompt".to_string();
+        assert_eq!(append_assist_yield(base.clone(), false), base);
+    }
+
+    #[test]
+    fn assist_on_appends_yield_note() {
+        let base = "原始 reviewer system prompt".to_string();
+        let out = append_assist_yield(base.clone(), true);
+        assert!(out.starts_with(&base), "让位段追加在末尾,不改原文");
+        assert!(out.contains("专属顾问"));
+        assert!(out.len() > base.len());
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn review_decision(
     state: &AppState,
@@ -313,6 +343,18 @@ pub(crate) async fn review_decision(
         &system,
         &active_profile,
     );
+    // ④reviewer 让位下沉：辅助模式下,reviewer 须知「引荐专属顾问」是受控业务动作,
+    // 解两条 hold 路径(第三方角色红线 + 误判产品承诺抬 factRisk)。assist 关账号字节等价。
+    // assist 判定复用 reply 侧同一纯函数(referral::assist_mode_active),客户级 override > 账号级。
+    let assist_override = contact
+        .domain_attributes
+        .as_ref()
+        .and_then(|d| d.get_str(crate::models::ASSIST_MODE_OVERRIDE_ATTR).ok());
+    let assist_on = crate::agent::referral::assist_mode_active(
+        domain_config.and_then(|c| c.assist_mode_enabled),
+        assist_override,
+    );
+    let system = append_assist_yield(system, assist_on);
     let runtime_text = serde_json::to_string(&runtime.as_document()).unwrap_or_default();
     let memory_card_text = serde_json::to_string(context_pack).unwrap_or_default();
     let memory_text = serde_json::to_string(&mongodb::bson::doc! {
