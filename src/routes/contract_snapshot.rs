@@ -123,15 +123,10 @@ mod tests {
             "threshold_override_json",
             "threshold_override_audit_json",
             "runtime_flag_json",
-            // 批次3/5 域投影:本批次只覆盖知识域 + 运营/Agent 域,其余域在后续批次纳入。
+            // 批次5 域投影:本批次只覆盖知识域 + 运营/Agent 域 + 字典/分类域,配置/playbook 域在后续批次纳入。
             // 批次铺开时从本清单移除对应项,使 lint 真正强制。
-            "operation_state_policy_json",
-            "taxonomy_candidate_json",
             "suspected_deal_json",
             "outbox_entry_json",
-            "relationship_suggestion_json",
-            "taxonomy_entry_json",
-            "operation_domain_json",
             "evaluation_scenario_json",
             "playbook_json",
             "prompt_template_json",

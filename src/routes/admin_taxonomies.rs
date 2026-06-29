@@ -394,4 +394,35 @@ mod tests {
         .unwrap();
         assert_eq!(req_dn.value.label, "Y");
     }
+
+    /// 契约快照:taxonomy_entry_json。TaxonomyEntry 9 字段 + TaxonomyValue 8 字段全量构造
+    /// (previous_version/seeded_by/priority_weight 三个 Option 给 Some);id→hex;
+    /// updated_at→RFC3339。顶层 9 键,value 是嵌套对象(6 子键,内部形状由快照固定不进对账)。
+    /// TaxonomyValue 的 priority_weight/is_terminal/is_reactivation_target 投影不下发,但须赋值。
+    #[test]
+    fn taxonomy_entry_json_matches_contract_fixture() {
+        use mongodb::bson::{oid::ObjectId, DateTime};
+        let entry = TaxonomyEntry {
+            id: Some(ObjectId::parse_str("507f1f77bcf86cd799439011").unwrap()),
+            scope: "global".to_string(),
+            kind: "customer_stage".to_string(),
+            value: TaxonomyValue {
+                id: "first_contact".to_string(),
+                display_name: "首次接触".to_string(),
+                description: "刚加上微信、还没业务对话".to_string(),
+                aliases: vec!["new_lead".to_string()],
+                status: "active".to_string(),
+                priority_weight: Some(10),
+                is_terminal: false,
+                is_reactivation_target: false,
+            },
+            updated_at: DateTime::from_millis(1_700_000_000_000),
+            version: 1,
+            current_version: true,
+            previous_version: Some(0),
+            seeded_by: Some("system".to_string()),
+        };
+        let value = taxonomy_entry_json(entry);
+        crate::routes::contract_snapshot::assert_contract_fixture("taxonomy_entry", value);
+    }
 }
