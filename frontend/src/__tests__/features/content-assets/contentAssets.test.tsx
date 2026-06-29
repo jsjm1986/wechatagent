@@ -147,4 +147,23 @@ describe("ContentAssetsFeature", () => {
     expect(deleteAsset).toHaveBeenCalledWith("asset1", "test123");
     confirmSpy.mockRestore();
   });
+
+  // D：禁语资产行显示「恒注入」徽标，不渲染档位标签误导（后端禁语恒注入、无视档位）
+  it("forbidden asset row shows 恒注入 badge not tier label", () => {
+    useContentStore.setState({
+      assets: [
+        {
+          id: "f1",
+          kind: "forbidden_expression",
+          title: "保本承诺",
+          body: "不得说保本",
+          minInjectTier: "full"
+        } as ContentAsset
+      ],
+    });
+    render(<ContentAssetsFeature />);
+    expect(screen.getByText("恒注入")).toBeInTheDocument();
+    // 不应把禁语渲染成「完整档」误导
+    expect(screen.queryByText("完整档")).toBeNull();
+  });
 });
