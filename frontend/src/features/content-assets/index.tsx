@@ -13,8 +13,7 @@ const KIND_OPTIONS: { value: string; label: string }[] = [
   { value: "faq", label: "FAQ" },
   { value: "script", label: "话术" },
   { value: "forbidden_expression", label: "禁用表达" },
-  { value: "brand_voice", label: "品牌语气" },
-  { value: "moment_media", label: "朋友圈素材" }
+  { value: "brand_voice", label: "品牌语气" }
 ];
 
 const ACCEPT =
@@ -234,28 +233,25 @@ export default function ContentAssetsFeature() {
                 />
               </label>
               <label className={styles.field}>
-                <span className={styles.fieldLabel}>素材 URL</span>
-                <input
-                  className={styles.input}
-                  value={assetDraft.url}
-                  onChange={(event) => setAssetDraft({ ...assetDraft, url: event.target.value })}
-                />
-              </label>
-              <label className={styles.field}>
-                <span className={styles.fieldLabel}>MCP Media ID</span>
-                <input
-                  className={styles.input}
-                  value={assetDraft.mediaId}
-                  onChange={(event) => setAssetDraft({ ...assetDraft, mediaId: event.target.value })}
-                />
-              </label>
-              <label className={styles.field}>
                 <span className={styles.fieldLabel}>使用场景</span>
                 <input
                   className={styles.input}
                   value={assetDraft.usageScene}
                   onChange={(event) => setAssetDraft({ ...assetDraft, usageScene: event.target.value })}
                 />
+              </label>
+              <label className={styles.field}>
+                <span className={styles.fieldLabel}>最低注入档</span>
+                <select
+                  className={styles.select}
+                  value={assetDraft.minInjectTier}
+                  onChange={(event) => setAssetDraft({ ...assetDraft, minInjectTier: event.target.value })}
+                >
+                  <option value="lean">精简档（任何对话都注入，最常生效）</option>
+                  <option value="relational">关系档（进入关系经营时注入）</option>
+                  <option value="full">完整档（仅深入业务时注入）</option>
+                </select>
+                <span className={styles.hint}>核心禁语/口吻选精简档时刻生效；重型话术/长 FAQ 选完整档。</span>
               </label>
               <button className={styles.submit} type="submit" disabled={busy || !assetDraft.title.trim()}>
                 保存资产

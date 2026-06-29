@@ -90,6 +90,7 @@ fn make_draft_asset(workspace_id: &str, title: &str) -> ContentAsset {
         requires_principal_approval: Some(false),
         review_status: Some("draft".to_string()),
         review_note: None,
+        min_inject_tier: None,
         created_at: now,
         updated_at: now,
     }

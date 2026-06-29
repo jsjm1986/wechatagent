@@ -71,6 +71,7 @@ fn make_asset(workspace_id: &str, title: &str, tags: Vec<String>) -> ContentAsse
         requires_principal_approval: Some(false),
         review_status: Some("approved".to_string()),
         review_note: None,
+        min_inject_tier: None,
         created_at: now,
         updated_at: now,
     }

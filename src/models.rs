@@ -977,6 +977,14 @@ pub struct ContentAsset {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub review_note: Option<String>,
 
+    // ===== 文本资产分档注入（2026-06-29）=====
+    /// 文本型资产的最低注入档：控制本条资产从哪个档位起注入决策 prompt。
+    /// "lean"=任何档恒注入（最常生效）/ "relational"=关系档起 / "full"=仅完整档。
+    /// None（缺失/老数据）按 "full" 处理 —— 与改造前「只 Full 注入」逐字等价。
+    /// 仅对文本型 kind 有意义；文件型素材（走 sendable 发送链）不读此字段。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_inject_tier: Option<String>,
+
     pub created_at: DateTime,
     pub updated_at: DateTime,
 }
@@ -6240,6 +6248,7 @@ mod content_asset_compat_tests {
             requires_principal_approval: Some(false),
             review_status: Some("approved".into()),
             review_note: None,
+            min_inject_tier: None,
             created_at: DateTime::now(),
             updated_at: DateTime::now(),
         };
