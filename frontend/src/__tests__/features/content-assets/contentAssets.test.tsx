@@ -34,9 +34,8 @@ describe("ContentAssetsFeature", () => {
         kind: "text",
         title: "",
         body: "",
-        url: "",
-        mediaId: "",
-        usageScene: ""
+        usageScene: "",
+        minInjectTier: "full"
       },
       setAssetDraft: vi.fn(),
       loadAssets: mockLoadAssets,
@@ -91,5 +90,13 @@ describe("ContentAssetsFeature", () => {
     expect(screen.getByText("类型")).toBeInTheDocument();
     expect(screen.getByText("标题")).toBeInTheDocument();
     expect(screen.getByText("正文")).toBeInTheDocument();
+  });
+
+  it("renders min inject tier select and drops legacy url/mediaId/moment fields", () => {
+    render(<ContentAssetsFeature />);
+    expect(screen.getByText("最低注入档")).toBeInTheDocument();
+    expect(screen.queryByText("素材 URL")).toBeNull();
+    expect(screen.queryByText("MCP Media ID")).toBeNull();
+    expect(screen.queryByText("朋友圈素材")).toBeNull();
   });
 });

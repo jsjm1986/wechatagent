@@ -363,6 +363,7 @@ mod tests {
             expression_pref: Some("file_primary".into()),
             requires_principal_approval: Some(false),
             review_status: review.map(|s| s.to_string()), review_note: None,
+            min_inject_tier: None,
             created_at: DateTime::now(), updated_at: DateTime::now(),
         }
     }

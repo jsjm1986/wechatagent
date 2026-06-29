@@ -84,6 +84,7 @@ fn make_asset(
         requires_principal_approval: Some(false),
         review_status: Some(review_status.to_string()),
         review_note: None,
+        min_inject_tier: None,
         created_at: now,
         updated_at: now,
     }
