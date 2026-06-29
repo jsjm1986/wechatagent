@@ -1115,4 +1115,35 @@ mod tests {
         let value = proposal_summary_json(&p);
         crate::routes::contract_snapshot::assert_contract_fixture("proposal_summary", value);
     }
+
+    /// 契约快照:shadow_replay_json。ShadowReplay 19 字段全量构造(各 Option 给 Some、
+    /// new_review_risks 非空 Vec、两 5gate Document 纯标量 bool doc!);
+    /// id→Option.map(to_hex);source_run_id→to_hex()。投影下发 15 顶层键。
+    #[test]
+    fn shadow_replay_json_matches_contract_fixture() {
+        use mongodb::bson::{doc, oid::ObjectId, DateTime};
+        let r = ShadowReplay {
+            id: Some(ObjectId::parse_str("507f1f77bcf86cd799439011").unwrap()),
+            proposal_id: ObjectId::parse_str("507f1f77bcf86cd799439012").unwrap(),
+            experiment_id: "EXP-1".to_string(),
+            workspace_id: "ws-1".to_string(),
+            account_id: "acc-1".to_string(),
+            source_run_id: ObjectId::parse_str("507f1f77bcf86cd799439013").unwrap(),
+            status: "completed".to_string(),
+            failure_reason: Some("none".to_string()),
+            original_final_review_status: Some("held_by_ai_policy".to_string()),
+            original_5gate_hit: doc! { "fact_risk_block": true, "pressure_risk_block": false },
+            original_self_critique_addressed: Some(false),
+            new_final_review_status: Some("approved".to_string()),
+            new_review_risks: vec!["minor_tone".to_string()],
+            new_token_cost: Some(321),
+            new_5gate_hit: doc! { "fact_risk_block": false, "pressure_risk_block": false },
+            new_self_critique_addressed: Some(true),
+            similarity_to_original_text: 0.85,
+            started_at: DateTime::from_millis(1_700_000_000_000),
+            finished_at: Some(DateTime::from_millis(1_700_000_100_000)),
+        };
+        let value = shadow_replay_json(&r);
+        crate::routes::contract_snapshot::assert_contract_fixture("shadow_replay", value);
+    }
 }
