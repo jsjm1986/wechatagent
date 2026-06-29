@@ -16,6 +16,26 @@ const KIND_OPTIONS: { value: string; label: string }[] = [
   { value: "brand_voice", label: "品牌语气" }
 ];
 
+// kind → 中文标签；查不到回退原值（兼容 moment_media 等老数据）。
+function kindLabel(kind: string): string {
+  const hit = KIND_OPTIONS.find((o) => o.value === kind);
+  if (hit) return hit.label;
+  if (kind === "moment_media") return "朋友圈素材";
+  return kind;
+}
+
+// 最低注入档 → 中文标签；缺失/未知按完整档（与后端 None=full 语义一致）。
+function tierLabel(tier?: string): string {
+  switch (tier) {
+    case "lean":
+      return "精简档";
+    case "relational":
+      return "关系档";
+    default:
+      return "完整档";
+  }
+}
+
 const ACCEPT =
   "image/*,application/pdf,.doc,.docx,.xls,.xlsx,.ppt,.pptx,video/mp4";
 
@@ -148,15 +168,15 @@ export default function ContentAssetsFeature() {
               {textAssets.length > 0 && (
                 <div className={styles.list}>
                   {textAssets.map((asset) => (
-                    <div key={asset.id} className={styles.row}>
-                      <div className={styles.rowHead}>
-                        <strong className={styles.rowTitle}>{asset.title}</strong>
-                        <span className={styles.kind}>{asset.kind}</span>
-                      </div>
-                      <p className={styles.body}>
-                        {asset.body || asset.url || asset.mediaId || asset.usageScene || "暂无内容"}
-                      </p>
-                    </div>
+                    <TextAssetRow
+                      key={asset.id}
+                      asset={asset}
+                      busy={busy}
+                      onEditMeta={(fields) =>
+                        void editAssetMeta(asset.id, fields, currentAccountId)
+                      }
+                      onDelete={() => void deleteAsset(asset.id, currentAccountId)}
+                    />
                   ))}
                 </div>
               )}
@@ -359,6 +379,131 @@ export default function ContentAssetsFeature() {
           </form>
         </div>
       </div>
+    </div>
+  );
+}
+
+function TextAssetRow({
+  asset,
+  busy,
+  onEditMeta,
+  onDelete
+}: {
+  asset: ContentAsset;
+  busy: boolean;
+  onEditMeta: (fields: Record<string, unknown>) => void;
+  onDelete: () => void;
+}) {
+  const [editing, setEditing] = useState(false);
+  const [editTitle, setEditTitle] = useState(asset.title);
+  const [editBody, setEditBody] = useState(asset.body ?? "");
+  const [editUsageScene, setEditUsageScene] = useState(asset.usageScene ?? "");
+  const [editTier, setEditTier] = useState(asset.minInjectTier ?? "full");
+
+  const openEdit = () => {
+    setEditTitle(asset.title);
+    setEditBody(asset.body ?? "");
+    setEditUsageScene(asset.usageScene ?? "");
+    setEditTier(asset.minInjectTier ?? "full");
+    setEditing(true);
+  };
+
+  const handleSaveMeta = () => {
+    onEditMeta({
+      title: editTitle.trim(),
+      body: editBody,
+      usageScene: editUsageScene,
+      minInjectTier: editTier
+    });
+    setEditing(false);
+  };
+
+  const handleDelete = () => {
+    if (window.confirm("确认删除该资产？此操作不可撤销。")) {
+      onDelete();
+    }
+  };
+
+  return (
+    <div className={styles.row}>
+      <div className={styles.rowHead}>
+        <strong className={styles.rowTitle}>{asset.title}</strong>
+        <span style={{ display: "flex", gap: 6, flexShrink: 0 }}>
+          <span className={styles.kind}>{kindLabel(asset.kind)}</span>
+          <span className={styles.kind}>{tierLabel(asset.minInjectTier)}</span>
+        </span>
+      </div>
+      <p className={styles.body}>{asset.body || asset.usageScene || "暂无内容"}</p>
+      <div style={{ display: "flex", flexWrap: "wrap", gap: 8, marginTop: 8 }}>
+        <button
+          className={styles.reviewBtn}
+          type="button"
+          disabled={busy}
+          onClick={() => (editing ? setEditing(false) : openEdit())}
+          style={{ marginTop: 0 }}
+        >
+          编辑
+        </button>
+        <button
+          className={styles.reviewBtn}
+          type="button"
+          disabled={busy}
+          onClick={handleDelete}
+          style={{ marginTop: 0 }}
+        >
+          删除
+        </button>
+      </div>
+
+      {editing && (
+        <div className={styles.form} style={{ marginTop: 12 }}>
+          <label className={styles.field}>
+            <span className={styles.fieldLabel}>标题</span>
+            <input
+              className={styles.input}
+              value={editTitle}
+              onChange={(event) => setEditTitle(event.target.value)}
+            />
+          </label>
+          <label className={styles.field}>
+            <span className={styles.fieldLabel}>正文</span>
+            <textarea
+              className={styles.textarea}
+              value={editBody}
+              onChange={(event) => setEditBody(event.target.value)}
+            />
+          </label>
+          <label className={styles.field}>
+            <span className={styles.fieldLabel}>使用场景</span>
+            <input
+              className={styles.input}
+              value={editUsageScene}
+              onChange={(event) => setEditUsageScene(event.target.value)}
+            />
+          </label>
+          <label className={styles.field}>
+            <span className={styles.fieldLabel}>最低注入档</span>
+            <select
+              className={styles.select}
+              value={editTier}
+              onChange={(event) => setEditTier(event.target.value)}
+            >
+              <option value="lean">精简档（任何对话都注入，最常生效）</option>
+              <option value="relational">关系档（进入关系经营时注入）</option>
+              <option value="full">完整档（仅深入业务时注入）</option>
+            </select>
+          </label>
+          <button
+            className={styles.reviewBtn}
+            type="button"
+            disabled={busy || !editTitle.trim()}
+            onClick={handleSaveMeta}
+            style={{ marginTop: 0 }}
+          >
+            保存
+          </button>
+        </div>
+      )}
     </div>
   );
 }
