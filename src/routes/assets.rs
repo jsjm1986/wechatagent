@@ -22,7 +22,8 @@ use super::AppState;
 
 /// 归一化前端传入的 min_inject_tier：闭集 {lean,relational,full} 内保留原值，
 /// 否则（None/空/非法）落 "full"（保守，等价改造前仅 Full 注入）。
-fn normalize_min_inject_tier(raw: Option<&str>) -> String {
+/// pub(crate)：PUT 编辑路径（media_assets::update_content_asset_meta）复用同一归一化。
+pub(crate) fn normalize_min_inject_tier(raw: Option<&str>) -> String {
     match raw.map(str::trim) {
         Some("lean") => "lean".to_string(),
         Some("relational") => "relational".to_string(),

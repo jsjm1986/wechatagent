@@ -266,6 +266,7 @@ pub struct UpdateMetaRequest {
     expression_pref: Option<String>,
     target_stages: Option<Vec<String>>,
     requires_principal_approval: Option<bool>,
+    min_inject_tier: Option<String>,
 }
 
 /// PUT /content-assets/:id —— 改元数据（JSON，部分更新）。
@@ -323,6 +324,13 @@ pub async fn update_content_asset_meta(
                     AppError::BadRequest(format!("target_stages 校验未通过：{reason}"))
                 })?;
         set.insert("target_stages", normalized);
+    }
+    if let Some(v) = payload.min_inject_tier {
+        // 复用 create 路径同一归一化：闭集校验，非法/空落 "full"（防脏值进注入查询）。
+        set.insert(
+            "min_inject_tier",
+            crate::routes::assets::normalize_min_inject_tier(Some(&v)),
+        );
     }
     set.insert("updated_at", DateTime::now());
 
@@ -579,5 +587,18 @@ mod tests {
         let e = file_replace_effects();
         assert_eq!(e.review_status, "draft", "换文件必须退回草稿强制重审");
         assert!(e.clear_media_id, "换文件必须清 media_id 防发旧文件");
+    }
+
+    #[test]
+    fn update_meta_deserializes_min_inject_tier_camel_case() {
+        // PUT 编辑路径必须能接收 minInjectTier（camelCase）→ 落 min_inject_tier。
+        // 这把"前端编辑注入档被后端静默丢弃"的回归钉死。
+        let payload: UpdateMetaRequest =
+            serde_json::from_str(r#"{"title":"话术A","minInjectTier":"lean"}"#).unwrap();
+        assert_eq!(payload.min_inject_tier.as_deref(), Some("lean"));
+        assert_eq!(payload.title.as_deref(), Some("话术A"));
+        // 缺省时为 None（部分更新语义：不传则不动该字段）。
+        let bare: UpdateMetaRequest = serde_json::from_str(r#"{"title":"x"}"#).unwrap();
+        assert_eq!(bare.min_inject_tier, None);
     }
 }
