@@ -197,4 +197,32 @@ mod tests {
         assert!(filter.contains_key("state_key"));
         assert!(filter.contains_key("current_version"));
     }
+
+    /// 契约快照:operation_state_policy_json。OperationStatePolicy 13 字段全量构造
+    /// (recommended_pace/previous_version/seeded_by 三个 Option 给 Some;allowed/forbidden
+    /// 非空 Vec);id→hex。投影下发全部 13 键(无字段过滤)。
+    #[test]
+    fn operation_state_policy_json_matches_contract_fixture() {
+        use mongodb::bson::{oid::ObjectId, DateTime};
+        let policy = OperationStatePolicy {
+            id: Some(ObjectId::parse_str("507f1f77bcf86cd799439011").unwrap()),
+            workspace_id: "ws-1".to_string(),
+            domain: "user_operations".to_string(),
+            state_key: "need_discovery".to_string(),
+            allowed: vec!["text_reply".to_string()],
+            forbidden: vec!["product_pitch".to_string()],
+            recommended_pace: Some("normal".to_string()),
+            status: "active".to_string(),
+            updated_at: DateTime::from_millis(1_700_000_000_000),
+            version: 3,
+            current_version: true,
+            previous_version: Some(2),
+            seeded_by: Some("manual".to_string()),
+        };
+        let value = operation_state_policy_json(policy);
+        crate::routes::contract_snapshot::assert_contract_fixture(
+            "operation_state_policy",
+            value,
+        );
+    }
 }

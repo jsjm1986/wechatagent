@@ -1,0 +1,19 @@
+{
+  "allowed": [
+    "text_reply"
+  ],
+  "currentVersion": true,
+  "domain": "user_operations",
+  "forbidden": [
+    "product_pitch"
+  ],
+  "id": "507f1f77bcf86cd799439011",
+  "previousVersion": 2,
+  "recommendedPace": "normal",
+  "seededBy": "manual",
+  "stateKey": "need_discovery",
+  "status": "active",
+  "updatedAt": "2023-11-14T22:13:20Z",
+  "version": 3,
+  "workspaceId": "ws-1"
+}
