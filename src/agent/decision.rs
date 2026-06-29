@@ -1480,6 +1480,26 @@ pub(crate) fn visible_min_tiers_for(
         .collect()
 }
 
+/// 把查回的内容资产按 kind 分流渲染成两段提示词文本：
+/// - 可引用组（text/faq/script/brand_voice）：`- [kind] 标题: 正文`，语义＝可引用。
+/// - 禁语组（forbidden_expression）：`- 标题: 正文`（不带 kind 标签，段落标题已框定语义）。
+/// 返回 (referable, forbidden)，各自 `\n` 连接；某组空 → 空串。
+pub(crate) fn split_context_assets(
+    assets: Vec<crate::models::ContentAsset>,
+) -> (String, String) {
+    let mut referable = Vec::new();
+    let mut forbidden = Vec::new();
+    for asset in assets {
+        let body = asset.body.unwrap_or_default();
+        if asset.kind == "forbidden_expression" {
+            forbidden.push(format!("- {}: {}", asset.title, body));
+        } else {
+            referable.push(format!("- [{}] {}: {}", asset.kind, asset.title, body));
+        }
+    }
+    (referable.join("\n"), forbidden.join("\n"))
+}
+
 pub(crate) async fn load_context_assets(
     state: &AppState,
     account_id: &str,
@@ -2046,5 +2066,82 @@ mod tier_injection_tests {
             visible_min_tiers_for(PromptTier::Full),
             vec!["lean", "relational", "full"]
         );
+    }
+}
+
+#[cfg(test)]
+mod split_context_assets_tests {
+    use super::split_context_assets;
+    use crate::models::ContentAsset;
+    use mongodb::bson::DateTime;
+
+    fn asset(kind: &str, title: &str, body: Option<&str>) -> ContentAsset {
+        ContentAsset {
+            id: None,
+            workspace_id: "w".into(),
+            account_id: None,
+            kind: kind.into(),
+            title: title.into(),
+            body: body.map(|b| b.into()),
+            tags: vec![],
+            url: None,
+            media_id: None,
+            usage_scene: None,
+            media_type: None,
+            file_path: None,
+            file_name: None,
+            file_size: None,
+            mime_type: None,
+            file_sha256: None,
+            sendable: None,
+            send_trigger_hint: None,
+            target_stages: None,
+            expression_pref: None,
+            requires_principal_approval: None,
+            review_status: None,
+            review_note: None,
+            min_inject_tier: None,
+            created_at: DateTime::now(),
+            updated_at: DateTime::now(),
+        }
+    }
+
+    #[test]
+    fn forbidden_goes_to_forbidden_group_others_to_referable() {
+        let input = vec![
+            asset("faq", "退款政策", Some("7天无理由")),
+            asset("forbidden_expression", "保本承诺", Some("不得说保本保收益")),
+            asset("script", "开场白", Some("你好")),
+        ];
+        let (referable, forbidden) = split_context_assets(input);
+        // 可引用组带 [kind] 前缀
+        assert_eq!(referable, "- [faq] 退款政策: 7天无理由\n- [script] 开场白: 你好");
+        // 禁语组不带 kind 标签
+        assert_eq!(forbidden, "- 保本承诺: 不得说保本保收益");
+    }
+
+    #[test]
+    fn empty_groups_return_empty_string() {
+        let (referable, forbidden) = split_context_assets(vec![]);
+        assert_eq!(referable, "");
+        assert_eq!(forbidden, "");
+        // 只有可引用 → forbidden 空
+        let (r, f) = split_context_assets(vec![asset("text", "A", Some("a"))]);
+        assert_eq!(r, "- [text] A: a");
+        assert_eq!(f, "");
+        // 只有禁语 → referable 空
+        let (r2, f2) = split_context_assets(vec![asset("forbidden_expression", "X", Some("x"))]);
+        assert_eq!(r2, "");
+        assert_eq!(f2, "- X: x");
+    }
+
+    #[test]
+    fn none_body_renders_empty_without_panic() {
+        let (referable, forbidden) = split_context_assets(vec![
+            asset("text", "无正文", None),
+            asset("forbidden_expression", "禁语无正文", None),
+        ]);
+        assert_eq!(referable, "- [text] 无正文: ");
+        assert_eq!(forbidden, "- 禁语无正文: ");
     }
 }
