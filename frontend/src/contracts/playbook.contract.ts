@@ -1,0 +1,21 @@
+// 后端 playbook_json 投影下发的 canonical 顶层键集(抄自 fixture,非手猜)。
+export const CANONICAL_KEYS = [
+  "accountId",
+  "createdBy",
+  "description",
+  "followUpMethod",
+  "forbiddenRules",
+  "id",
+  "intentMethod",
+  "isDefault",
+  "methodPrompt",
+  "name",
+  "profileMethod",
+  "replyStyle",
+  "stageMethod",
+  "successCriteria",
+  "tagMethod",
+  "updatedAt",
+  "version",
+  "workspaceId",
+] as const;
