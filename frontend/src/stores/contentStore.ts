@@ -9,9 +9,8 @@ interface ContentState {
     kind: string;
     title: string;
     body: string;
-    url: string;
-    mediaId: string;
     usageScene: string;
+    minInjectTier: string;
   };
 }
 
@@ -20,9 +19,8 @@ interface ContentActions {
     kind: string;
     title: string;
     body: string;
-    url: string;
-    mediaId: string;
     usageScene: string;
+    minInjectTier: string;
   }) => void;
   loadAssets: (accountId?: string, tag?: string) => Promise<void>;
   createAsset: (accountId?: string) => Promise<void>;
@@ -45,9 +43,8 @@ export const useContentStore = create<ContentState & ContentActions>((set, get) 
     kind: "text",
     title: "",
     body: "",
-    url: "",
-    mediaId: "",
-    usageScene: ""
+    usageScene: "",
+    minInjectTier: "full"
   },
 
   setAssetDraft: (draft) => set({ assetDraft: draft }),
@@ -80,9 +77,8 @@ export const useContentStore = create<ContentState & ContentActions>((set, get) 
         kind: assetDraft.kind,
         title: assetDraft.title,
         body: assetDraft.body || undefined,
-        url: assetDraft.url || undefined,
-        mediaId: assetDraft.mediaId || undefined,
-        usageScene: assetDraft.usageScene || undefined
+        usageScene: assetDraft.usageScene || undefined,
+        minInjectTier: assetDraft.minInjectTier
       });
 
       // 重置 draft，保留 kind
@@ -91,9 +87,8 @@ export const useContentStore = create<ContentState & ContentActions>((set, get) 
           kind: assetDraft.kind,
           title: "",
           body: "",
-          url: "",
-          mediaId: "",
-          usageScene: ""
+          usageScene: "",
+          minInjectTier: assetDraft.minInjectTier
         }
       });
 
