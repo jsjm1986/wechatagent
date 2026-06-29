@@ -307,7 +307,9 @@ pub(crate) async fn decide_reply_with_promote(
     // 关系组（完整 memory / memory_card / 意图轨迹 / 反应提示 / 运营记忆 / 画像各阶段字段）——
     //   Relational + Full 才注入；Lean 跳过对应 DB 加载（省查询省 token），用空串/默认占位。
     // 业务组（知识 / 知识路由 / 产品目录 / 持有投影 / 疑似成交 / 可发素材 / 已发素材 /
-    //   名片引荐 / 运营方法 / 运营域策略 / 状态机 / 硬运行参数 / 可引用内容资产）——仅 Full 注入。
+    //   名片引荐 / 运营方法 / 运营域策略 / 状态机 / 硬运行参数）——仅 Full 注入。
+    // 内容资产例外：可引用内容资产按每条 min_inject_tier 分档注入（不绑死 Full）；
+    //   禁语（forbidden_expression）恒注入无视 tier（安全红线）——见 load_context_assets。
     // 铁律：Full 档两标志均 true，所有槽位与改造前逐字等价（现有调用点全传 Full）。
     let include_relational = matches!(
         tier,
