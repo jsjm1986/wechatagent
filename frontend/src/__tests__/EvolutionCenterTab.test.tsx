@@ -122,6 +122,20 @@ describe("EvolutionCenterTab", () => {
     vi.clearAllMocks();
   });
 
+  // Task 3 三态重构后，Tab 挂载即先 GET /api/evolution/runtime-flag（loadFlag，第一个 fetch），
+  // 再按 flag 启用与否决定是否 GET experiments（第二个 fetch）。既有用例的顺序型
+  // mockResolvedValueOnce 队列原本第一个是 experiments，现在全部错位——故每个用例须在
+  // experiments mock 之前插一个 runtime-flag mock。默认 env 允许 + flag 开 + 100% 全量。
+  function mockRuntimeFlag(over?: { envEvolutionEnabled?: boolean; enabled?: boolean; rolloutPercent?: number }) {
+    return {
+      ok: true,
+      json: async () => ({
+        envEvolutionEnabled: over?.envEvolutionEnabled ?? true,
+        flag: { enabled: over?.enabled ?? true, rolloutPercent: over?.rolloutPercent ?? 100 },
+      }),
+    };
+  }
+
   it("renders status badges for the four W4 statuses", async () => {
     const proposals = [
       makeProposal({ id: "1".repeat(24), status: "eligible_for_release" }),
@@ -129,6 +143,7 @@ describe("EvolutionCenterTab", () => {
       makeProposal({ id: "3".repeat(24), status: "rolled_back" }),
       makeProposal({ id: "4".repeat(24), status: "rejected_below_threshold" }),
     ];
+    fetchMock.mockResolvedValueOnce(mockRuntimeFlag());
     fetchMock.mockResolvedValueOnce({
       ok: true,
       json: async () => ({ items: [makeExperimentItem(proposals)] }),
@@ -164,6 +179,7 @@ describe("EvolutionCenterTab", () => {
       status: "released",
     });
     // 列表 fetch
+    fetchMock.mockResolvedValueOnce(mockRuntimeFlag());
     fetchMock.mockResolvedValueOnce({
       ok: true,
       json: async () => ({ items: [makeExperimentItem([eligibleProposal, releasedProposal])] }),
@@ -245,6 +261,7 @@ describe("EvolutionCenterTab", () => {
       currentValue: null,
       proposedValue: null,
     });
+    fetchMock.mockResolvedValueOnce(mockRuntimeFlag());
     fetchMock.mockResolvedValueOnce({
       ok: true,
       json: async () => ({ items: [makeExperimentItem([promptProposal])] }),
@@ -314,8 +331,9 @@ describe("EvolutionCenterTab", () => {
   // 本文件 mock 全局 fetch（非 lib/api 的 api.put），故断言落在 fetch 调用上：
   // 找出 method === "PUT" 的那次 fetch，校验 URL 与 camelCase body。
   it("渲染 runtime-flag 灰度控件并 PUT 保存", async () => {
-    // 挂载只触发 experiments GET（call #1）；不引入挂载期 flag GET，避免打乱
-    // 既有测试的顺序型 mockResolvedValueOnce 队列。
+    // Task 3 后 Tab 挂载先 loadFlag(call#1)；flag 开 → 触发 experiments(call#2)。
+    // 高级灰度比例改 50 后点「保存灰度」走 saveFlag → PUT(call#3)。
+    fetchMock.mockResolvedValueOnce(mockRuntimeFlag({ enabled: true, rolloutPercent: 100 }));
     fetchMock.mockResolvedValueOnce({
       ok: true,
       json: async () => ({ items: [] }),
@@ -341,9 +359,6 @@ describe("EvolutionCenterTab", () => {
     const input = (await screen.findByLabelText(/灰度比例/)) as HTMLInputElement;
     fireEvent.change(input, { target: { value: "50" } });
 
-    const toggle = screen.getByLabelText(/启用演化灰度/) as HTMLInputElement;
-    fireEvent.click(toggle); // 关 -> 开
-
     fireEvent.click(screen.getByText("保存灰度"));
 
     await waitFor(() => {
@@ -362,12 +377,14 @@ describe("EvolutionCenterTab", () => {
   });
 
   it("读取当前配置按钮 GET runtime-flag 并回填", async () => {
+    // 挂载 loadFlag(call#1)：env 允许 + flag 开 + 100% → 触发 experiments(call#2)。
+    fetchMock.mockResolvedValueOnce(mockRuntimeFlag({ enabled: true, rolloutPercent: 100 }));
     fetchMock.mockResolvedValueOnce({
       ok: true,
       json: async () => ({ items: [] }),
     });
-    // 读取当前配置 GET 复刻后端真实结构：配置体在 .flag 子对象里（外层还有
-    // workspaceId / envEvolutionEnabled）。读回必须从 .flag 内层取，否则恒显 0。
+    // 「读取当前配置」按钮再次 GET(call#3)。复刻后端真实结构：配置体在 .flag 子对象里
+    //（外层还有 workspaceId / envEvolutionEnabled）。读回必须从 .flag 内层取，否则恒显 0。
     fetchMock.mockResolvedValueOnce({
       ok: true,
       json: async () => ({
@@ -392,15 +409,16 @@ describe("EvolutionCenterTab", () => {
       const input = screen.getByLabelText(/灰度比例/) as HTMLInputElement;
       expect(input.value).toBe("30");
     });
-    // 同时断言开关回填来自 .flag 内层（enabled: true）。
-    expect((screen.getByLabelText(/启用演化灰度/) as HTMLInputElement).checked).toBe(true);
+    // 同时断言总开关回填来自 .flag 内层（enabled: true）。
+    expect((screen.getByText("演化中心总开关").closest("label")!.querySelector("input") as HTMLInputElement).checked).toBe(true);
   });
 
   // 前后端对齐批次1 Task 6（C4）：阈值变更不可变审计日志视图。
   // 按钮点击触发 GET /api/evolution/threshold-overrides/audit（与 runtime-flag
   // 一致的"点按钮加载"模式，不在挂载期自动 GET，避免打乱既有顺序型 mock 队列）。
   it("点按钮加载阈值变更审计日志并渲染行", async () => {
-    // 挂载只触发 experiments GET（call #1）。
+    // 挂载 loadFlag(call#1) → 触发 experiments(call#2)。
+    fetchMock.mockResolvedValueOnce(mockRuntimeFlag());
     fetchMock.mockResolvedValueOnce({
       ok: true,
       json: async () => ({ items: [] }),
@@ -449,6 +467,7 @@ describe("EvolutionCenterTab", () => {
   });
 
   it("审计为空时显示暂无审计记录", async () => {
+    fetchMock.mockResolvedValueOnce(mockRuntimeFlag());
     fetchMock.mockResolvedValueOnce({
       ok: true,
       json: async () => ({ items: [] }),
@@ -468,5 +487,58 @@ describe("EvolutionCenterTab", () => {
     expect(screen.getByTestId("threshold-audit-empty").textContent).toContain(
       "暂无审计记录",
     );
+  });
+
+  // ── Task 3 三态重构验证：运维硬锁 / env 允许但 flag 关 / 打开总开关=100% 全量 ──
+
+  it("env 硬锁定（envEvolutionEnabled=false）渲染锁定占位", async () => {
+    fetchMock.mockResolvedValueOnce(mockRuntimeFlag({ envEvolutionEnabled: false, enabled: false }));
+    render(<EvolutionCenterTab enabled={true} />);
+    await waitFor(() => {
+      expect(screen.getByTestId("evolution-disabled")).toHaveTextContent("运维硬锁定");
+    });
+  });
+
+  it("env 允许但 flag 关时显示可点总开关、不加载实验数据", async () => {
+    fetchMock.mockResolvedValueOnce(mockRuntimeFlag({ envEvolutionEnabled: true, enabled: false, rolloutPercent: 0 }));
+    render(<EvolutionCenterTab enabled={true} />);
+    await waitFor(() => {
+      expect(screen.getByTestId("runtime-flag-panel")).toBeInTheDocument();
+    });
+    // flag 关 → load() 早返回，不应发起 experiments 请求（唯一 fetch 是挂载期 runtime-flag GET）。
+    const experimentsCall = fetchMock.mock.calls.find(([url]) =>
+      String(url).includes("/api/evolution/experiments"),
+    );
+    expect(experimentsCall).toBeUndefined();
+    // 总开关 checkbox 可点（未 disabled）。
+    const toggle = screen.getByText("演化中心总开关").closest("label")?.querySelector("input");
+    expect(toggle).not.toBeNull();
+    expect(toggle).not.toBeDisabled();
+  });
+
+  it("打开总开关 PUT 写 enabled:true + rolloutPercent:100", async () => {
+    fetchMock.mockResolvedValueOnce(mockRuntimeFlag({ envEvolutionEnabled: true, enabled: false, rolloutPercent: 0 }));
+    // PUT 响应
+    fetchMock.mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ ok: true, flag: { enabled: true, rolloutPercent: 100 } }),
+    });
+    // 打开后 flagEnabled→true 会触发 load(experiments)
+    fetchMock.mockResolvedValueOnce({ ok: true, json: async () => ({ items: [] }) });
+
+    render(<EvolutionCenterTab enabled={true} />);
+    await waitFor(() => screen.getByText("演化中心总开关"));
+    const toggle = screen.getByText("演化中心总开关").closest("label")!.querySelector("input")!;
+    fireEvent.click(toggle);
+
+    await waitFor(() => {
+      const putCall = fetchMock.mock.calls.find(
+        (c) => String(c[0]).includes("/api/evolution/runtime-flag") && (c[1] as RequestInit)?.method === "PUT",
+      );
+      expect(putCall).toBeTruthy();
+      const body = JSON.parse((putCall![1] as RequestInit).body as string);
+      expect(body.enabled).toBe(true);
+      expect(body.rolloutPercent).toBe(100);
+    });
   });
 });
