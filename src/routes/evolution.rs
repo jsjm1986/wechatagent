@@ -1047,4 +1047,31 @@ mod tests {
             value,
         );
     }
+
+    /// 契约快照:experiment_envelope_json。Experiment 15 字段全量构造
+    /// (finished_at 给 Some;两 cohort Vec 非空——投影只下发 .len() 数字不泄漏 ObjectId);
+    /// id 不下发。投影下发 14 顶层键。
+    #[test]
+    fn experiment_envelope_json_matches_contract_fixture() {
+        use mongodb::bson::{oid::ObjectId, DateTime};
+        let exp = Experiment {
+            id: Some(ObjectId::parse_str("507f1f77bcf86cd799439011").unwrap()),
+            experiment_id: "EXP-1".to_string(),
+            workspace_id: "ws-1".to_string(),
+            account_id: "acc-1".to_string(),
+            status: "evaluating".to_string(),
+            window_hours: 24,
+            started_at: DateTime::from_millis(1_700_000_000_000),
+            updated_at: DateTime::from_millis(1_700_000_100_000),
+            finished_at: Some(DateTime::from_millis(1_700_000_200_000)),
+            cohort_threshold_run_ids: vec![ObjectId::parse_str("507f1f77bcf86cd799439012").unwrap()],
+            cohort_prompt_run_ids: vec![ObjectId::parse_str("507f1f77bcf86cd799439013").unwrap()],
+            budget_used_tokens: 45000,
+            budget_used_calls: 120,
+            proposals_count: 5,
+            proposals_eligible_count: 2,
+        };
+        let value = experiment_envelope_json(&exp);
+        crate::routes::contract_snapshot::assert_contract_fixture("experiment_envelope", value);
+    }
 }
