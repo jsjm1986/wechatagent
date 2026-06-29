@@ -1503,6 +1503,60 @@ pub(crate) fn split_context_assets(
     (referable.join("\n"), forbidden.join("\n"))
 }
 
+/// 可引用内容资产（text/faq/script/brand_voice）query 形状：本 workspace+account
+/// （或 account 无关 null）、kind 在可引用白名单、按当前 tier 过滤 min_inject_tier。
+/// Full 档纳入「字段缺失」老数据（按 full 处理）；非 Full 档只取显式可见值。
+pub(crate) fn build_referable_assets_filter(
+    workspace_id: &str,
+    account_id: &str,
+    tier: crate::agent::sufficiency::PromptTier,
+) -> mongodb::bson::Document {
+    use mongodb::bson::doc;
+    let visible: Vec<&str> = visible_min_tiers_for(tier);
+    let tier_cond = if matches!(tier, crate::agent::sufficiency::PromptTier::Full) {
+        doc! { "$or": [
+            { "min_inject_tier": { "$in": &visible } },
+            { "min_inject_tier": { "$exists": false } },
+        ] }
+    } else {
+        doc! { "min_inject_tier": { "$in": &visible } }
+    };
+    doc! {
+        "workspace_id": workspace_id,
+        "$or": [ { "account_id": null }, { "account_id": account_id } ],
+        "kind": { "$in": ["text", "faq", "script", "brand_voice"] },
+        "$and": [ tier_cond ],
+    }
+}
+
+/// 禁语（forbidden_expression）query 形状：本 workspace+account，**无 tier 过滤**
+/// （安全红线恒注入）。调用方对此查询**不设 limit**（禁语数量天然少，恒全量入 prompt）。
+pub(crate) fn build_forbidden_assets_filter(
+    workspace_id: &str,
+    account_id: &str,
+) -> mongodb::bson::Document {
+    use mongodb::bson::doc;
+    doc! {
+        "workspace_id": workspace_id,
+        "$or": [ { "account_id": null }, { "account_id": account_id } ],
+        "kind": "forbidden_expression",
+    }
+}
+
+/// 可发送素材 query 形状（原 load_sendable_assets 内联 filter 抽出）。
+pub(crate) fn build_sendable_assets_filter(
+    workspace_id: &str,
+    account_id: &str,
+) -> mongodb::bson::Document {
+    use mongodb::bson::doc;
+    doc! {
+        "workspace_id": workspace_id,
+        "$or": [ { "account_id": null }, { "account_id": account_id } ],
+        "sendable": true,
+        "review_status": "approved",
+    }
+}
+
 pub(crate) async fn load_context_assets(
     state: &AppState,
     account_id: &str,
@@ -2147,5 +2201,67 @@ mod split_context_assets_tests {
         ]);
         assert_eq!(referable, "- [text] 无正文: ");
         assert_eq!(forbidden, "- 禁语无正文: ");
+    }
+}
+
+#[cfg(test)]
+mod context_assets_filter_tests {
+    //! content_assets 注入加固：三个 query 形状契约。镜像 reaction_hint / referral
+    //! 同构——避免 filter 被静默改坏（漏 workspace pin → 跨租户泄漏；禁语误带 tier
+    //! → 恒注入被破；可引用漏 tier_cond → 分档失效）。
+    use super::*;
+    use crate::agent::sufficiency::PromptTier;
+
+    #[test]
+    fn referable_filter_lean_pins_workspace_kind_tier_in_only() {
+        let f = build_referable_assets_filter("ws", "acct", PromptTier::Lean);
+        assert_eq!(f.get_str("workspace_id").ok(), Some("ws"));
+        assert!(f.contains_key("$or")); // account_id null / acct
+        let kind = f.get_document("kind").unwrap();
+        let arr = kind.get_array("$in").unwrap();
+        assert_eq!(arr.len(), 4); // text/faq/script/brand_voice
+        // 非 Full 档：tier_cond 只有 $in，无 $exists 兜底
+        let and = f.get_array("$and").unwrap();
+        let tier_cond = and[0].as_document().unwrap();
+        let mit = tier_cond.get_document("min_inject_tier").unwrap();
+        assert!(mit.contains_key("$in"));
+        assert!(!mit.contains_key("$exists"));
+    }
+
+    #[test]
+    fn referable_filter_full_adds_exists_false_fallback() {
+        let f = build_referable_assets_filter("ws", "acct", PromptTier::Full);
+        let and = f.get_array("$and").unwrap();
+        let tier_cond = and[0].as_document().unwrap();
+        // Full 档：tier_cond 是 $or [ {$in}, {$exists:false} ]
+        let or = tier_cond.get_array("$or").unwrap();
+        assert_eq!(or.len(), 2);
+        let has_exists = or.iter().any(|b| {
+            b.as_document()
+                .and_then(|d| d.get_document("min_inject_tier").ok())
+                .map(|m| m.contains_key("$exists"))
+                .unwrap_or(false)
+        });
+        assert!(has_exists);
+    }
+
+    #[test]
+    fn forbidden_filter_has_no_tier_no_limit_key() {
+        let f = build_forbidden_assets_filter("ws", "acct");
+        assert_eq!(f.get_str("workspace_id").ok(), Some("ws"));
+        assert_eq!(f.get_str("kind").ok(), Some("forbidden_expression"));
+        assert!(f.contains_key("$or")); // account
+        // 恒注入证据：filter 完全不含 min_inject_tier / tier 相关键
+        assert!(!f.contains_key("min_inject_tier"));
+        assert!(!f.contains_key("$and"));
+    }
+
+    #[test]
+    fn sendable_filter_pins_workspace_account_sendable_approved() {
+        let f = build_sendable_assets_filter("ws", "acct");
+        assert_eq!(f.get_str("workspace_id").ok(), Some("ws"));
+        assert_eq!(f.get_bool("sendable").ok(), Some(true));
+        assert_eq!(f.get_str("review_status").ok(), Some("approved"));
+        assert!(f.contains_key("$or"));
     }
 }
