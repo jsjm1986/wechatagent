@@ -978,4 +978,23 @@ mod tests {
             wake_jitter_max_seconds: 900,
         }
     }
+
+    /// 契约快照:runtime_flag_json。EvolutionRuntimeFlag 7 字段全量构造
+    /// (updated_by 给 Some);rolloutPercent=rollout_percent_clamped() 方法值 +
+    /// rolloutPercentRaw=原始字段双发;id 不下发。投影下发 7 顶层键。
+    #[test]
+    fn runtime_flag_json_matches_contract_fixture() {
+        use mongodb::bson::{oid::ObjectId, DateTime};
+        let f = EvolutionRuntimeFlag {
+            id: Some(ObjectId::parse_str("507f1f77bcf86cd799439011").unwrap()),
+            workspace_id: "ws-1".to_string(),
+            enabled: true,
+            rollout_percent: 25,
+            updated_by: Some("admin-1".to_string()),
+            threshold_auto_release_enabled: false,
+            updated_at: DateTime::from_millis(1_700_000_000_000),
+        };
+        let value = runtime_flag_json(&f);
+        crate::routes::contract_snapshot::assert_contract_fixture("runtime_flag", value);
+    }
 }

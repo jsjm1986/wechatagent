@@ -1,0 +1,9 @@
+{
+  "enabled": true,
+  "rolloutPercent": 25,
+  "rolloutPercentRaw": 25,
+  "thresholdAutoReleaseEnabled": false,
+  "updatedAt": "2023-11-14T22:13:20Z",
+  "updatedBy": "admin-1",
+  "workspaceId": "ws-1"
+}
