@@ -1019,4 +1019,32 @@ mod tests {
         let value = threshold_override_json(&o);
         crate::routes::contract_snapshot::assert_contract_fixture("threshold_override", value);
     }
+
+    /// 契约快照:threshold_override_audit_json。ThresholdOverrideAudit 12 字段全量构造
+    /// (previous_value/new_value/hit_rate_observed 给 Some;significance_metrics 给
+    /// Some(纯标量 doc!) 暴露 significanceMetrics 非 null);id→Option.map(to_hex);
+    /// source_proposal_id→to_hex()。投影下发 10 顶层键。
+    #[test]
+    fn threshold_override_audit_json_matches_contract_fixture() {
+        use mongodb::bson::{doc, oid::ObjectId, DateTime};
+        let a = crate::models::ThresholdOverrideAudit {
+            id: Some(ObjectId::parse_str("507f1f77bcf86cd799439011").unwrap()),
+            workspace_id: "ws-1".to_string(),
+            account_id: "acc-1".to_string(),
+            gate_key: "fact_risk_block".to_string(),
+            action: "auto_released".to_string(),
+            previous_value: Some(6.0),
+            new_value: Some(5.5),
+            source_proposal_id: ObjectId::parse_str("507f1f77bcf86cd799439012").unwrap(),
+            decided_by: "evolution_auto_release".to_string(),
+            decided_at: DateTime::from_millis(1_700_000_000_000),
+            hit_rate_observed: Some(0.012),
+            significance_metrics: Some(doc! { "pValue": 0.03, "sampleSize": 120 }),
+        };
+        let value = threshold_override_audit_json(&a);
+        crate::routes::contract_snapshot::assert_contract_fixture(
+            "threshold_override_audit",
+            value,
+        );
+    }
 }

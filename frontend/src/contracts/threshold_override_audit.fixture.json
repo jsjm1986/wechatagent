@@ -1,0 +1,15 @@
+{
+  "action": "auto_released",
+  "decidedAt": "2023-11-14T22:13:20Z",
+  "decidedBy": "evolution_auto_release",
+  "gateKey": "fact_risk_block",
+  "hitRateObserved": 0.012,
+  "id": "507f1f77bcf86cd799439011",
+  "newValue": 5.5,
+  "previousValue": 6.0,
+  "significanceMetrics": {
+    "pValue": 0.03,
+    "sampleSize": 120
+  },
+  "sourceProposalId": "507f1f77bcf86cd799439012"
+}
