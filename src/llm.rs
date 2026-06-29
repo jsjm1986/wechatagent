@@ -1040,6 +1040,11 @@ pub fn is_retryable_llm_error(error: &AppError) -> bool {
                 || message.contains("LLM HTTP 522")
                 || message.contains("LLM HTTP 524")
                 || message.contains("LLM HTTP body_decode_error")
+                // tool_use 劫持：claude 偶发无视 ANTHROPIC_JSON_GUARD 的禁工具约束,返回
+                // tool_use block 而非 JSON(detect_tool_use_hijack 抛此诊断,~25% 长任务高发)。
+                // 是"同输入重跑通常成功"的瞬态模型不遵从,与 HTTP 5xx 同属应熬过的抖动——此前
+                // 漏列致一次冒泡(最该重试却没重试)。重试走指数退避,耗尽仍劫持才抛(行为不退化)。
+                || message.contains("llm_tool_use_instead_of_json")
         }
         _ => false,
     }
@@ -1564,6 +1569,22 @@ mod tests {
     fn http_400_is_not_retryable() {
         let err = AppError::External("LLM HTTP 400: bad request".to_string());
         assert!(!is_retryable_llm_error(&err));
+    }
+
+    #[test]
+    fn tool_use_hijack_is_retryable() {
+        // claude 偶发无视禁工具约束返回 tool_use block 而非 JSON(~25%,长任务高发)。
+        // detect_tool_use_hijack 抛 External("llm_tool_use_instead_of_json: ...")。
+        // 这是"同输入重跑通常成功"的瞬态不遵从,本该重试——此前不在白名单致一次都不重试
+        // 就冒泡(HTTP 5xx 反而能熬过抖动),是最该重试却没重试的错误。用真实诊断串锚定。
+        let body = r#"{"content":[{"type":"text","text":"我将为您生成。"},{"type":"tool_use","name":"WebFetch","input":{}}],"stop_reason":"tool_use"}"#;
+        let parsed: AnthropicMessageResponse = serde_json::from_str(body).unwrap();
+        let diag = detect_tool_use_hijack(&parsed).expect("应识别 tool_use 劫持");
+        let err = AppError::External(diag);
+        assert!(
+            is_retryable_llm_error(&err),
+            "tool_use 劫持应可重试(同输入重跑通常成功),而非一次冒泡"
+        );
     }
 
     #[test]
