@@ -1483,24 +1483,23 @@ pub(crate) fn visible_min_tiers_for(
         .collect()
 }
 
-/// 把查回的内容资产按 kind 分流渲染成两段提示词文本：
-/// - 可引用组（text/faq/script/brand_voice）：`- [kind] 标题: 正文`，语义＝可引用。
-/// - 禁语组（forbidden_expression）：`- 标题: 正文`（不带 kind 标签，段落标题已框定语义）。
-/// 返回 (referable, forbidden)，各自 `\n` 连接；某组空 → 空串。
-pub(crate) fn split_context_assets(
-    assets: Vec<crate::models::ContentAsset>,
-) -> (String, String) {
-    let mut referable = Vec::new();
-    let mut forbidden = Vec::new();
-    for asset in assets {
-        let body = asset.body.unwrap_or_default();
-        if asset.kind == "forbidden_expression" {
-            forbidden.push(format!("- {}: {}", asset.title, body));
-        } else {
-            referable.push(format!("- [{}] {}: {}", asset.kind, asset.title, body));
-        }
-    }
-    (referable.join("\n"), forbidden.join("\n"))
+/// 渲染可引用内容资产为 prompt 行：`- [kind] 标题: 正文`，`\n` 连接；空 → 空串。
+pub(crate) fn render_referable_assets(assets: Vec<crate::models::ContentAsset>) -> String {
+    assets
+        .into_iter()
+        .map(|a| format!("- [{}] {}: {}", a.kind, a.title, a.body.unwrap_or_default()))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// 渲染禁语为 prompt 行：`- 标题: 正文`（不带 kind 标签，段落标题已框定禁止语义）；
+/// `\n` 连接；空 → 空串。
+pub(crate) fn render_forbidden_assets(assets: Vec<crate::models::ContentAsset>) -> String {
+    assets
+        .into_iter()
+        .map(|a| format!("- {}: {}", a.title, a.body.unwrap_or_default()))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// 可引用内容资产（text/faq/script/brand_voice）query 形状：本 workspace+account
@@ -2128,8 +2127,8 @@ mod tier_injection_tests {
 }
 
 #[cfg(test)]
-mod split_context_assets_tests {
-    use super::split_context_assets;
+mod render_assets_tests {
+    use super::{render_referable_assets, render_forbidden_assets};
     use crate::models::ContentAsset;
     use mongodb::bson::DateTime;
 
@@ -2165,42 +2164,32 @@ mod split_context_assets_tests {
     }
 
     #[test]
-    fn forbidden_goes_to_forbidden_group_others_to_referable() {
-        let input = vec![
+    fn referable_renders_with_kind_prefix() {
+        let out = render_referable_assets(vec![
             asset("faq", "退款政策", Some("7天无理由")),
-            asset("forbidden_expression", "保本承诺", Some("不得说保本保收益")),
             asset("script", "开场白", Some("你好")),
-        ];
-        let (referable, forbidden) = split_context_assets(input);
-        // 可引用组带 [kind] 前缀
-        assert_eq!(referable, "- [faq] 退款政策: 7天无理由\n- [script] 开场白: 你好");
-        // 禁语组不带 kind 标签
-        assert_eq!(forbidden, "- 保本承诺: 不得说保本保收益");
+        ]);
+        assert_eq!(out, "- [faq] 退款政策: 7天无理由\n- [script] 开场白: 你好");
     }
 
     #[test]
-    fn empty_groups_return_empty_string() {
-        let (referable, forbidden) = split_context_assets(vec![]);
-        assert_eq!(referable, "");
-        assert_eq!(forbidden, "");
-        // 只有可引用 → forbidden 空
-        let (r, f) = split_context_assets(vec![asset("text", "A", Some("a"))]);
-        assert_eq!(r, "- [text] A: a");
-        assert_eq!(f, "");
-        // 只有禁语 → referable 空
-        let (r2, f2) = split_context_assets(vec![asset("forbidden_expression", "X", Some("x"))]);
-        assert_eq!(r2, "");
-        assert_eq!(f2, "- X: x");
+    fn forbidden_renders_without_kind_label() {
+        let out = render_forbidden_assets(vec![
+            asset("forbidden_expression", "保本承诺", Some("不得说保本保收益")),
+        ]);
+        assert_eq!(out, "- 保本承诺: 不得说保本保收益");
+    }
+
+    #[test]
+    fn empty_returns_empty_string() {
+        assert_eq!(render_referable_assets(vec![]), "");
+        assert_eq!(render_forbidden_assets(vec![]), "");
     }
 
     #[test]
     fn none_body_renders_empty_without_panic() {
-        let (referable, forbidden) = split_context_assets(vec![
-            asset("text", "无正文", None),
-            asset("forbidden_expression", "禁语无正文", None),
-        ]);
-        assert_eq!(referable, "- [text] 无正文: ");
-        assert_eq!(forbidden, "- 禁语无正文: ");
+        assert_eq!(render_referable_assets(vec![asset("text", "无正文", None)]), "- [text] 无正文: ");
+        assert_eq!(render_forbidden_assets(vec![asset("forbidden_expression", "禁语无正文", None)]), "- 禁语无正文: ");
     }
 }
 
