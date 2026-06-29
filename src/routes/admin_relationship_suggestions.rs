@@ -351,4 +351,32 @@ mod tests {
             serde_json::from_value(json!({ "reason": "误判，实际是普通客户" })).unwrap();
         assert_eq!(ok.reason, "误判，实际是普通客户");
     }
+
+    /// 契约快照:relationship_suggestion_json。RelationshipTypeSuggestion 13 字段全量构造
+    /// (evidence/reviewed_at/reviewed_by 三个 Option 给 Some);id→hex;
+    /// first_seen_at/last_seen_at→RFC3339;reviewed_at→Some 后 RFC3339。投影下发全部 13 键。
+    #[test]
+    fn relationship_suggestion_json_matches_contract_fixture() {
+        use mongodb::bson::{oid::ObjectId, DateTime};
+        let item = RelationshipTypeSuggestion {
+            id: Some(ObjectId::parse_str("507f1f77bcf86cd799439011").unwrap()),
+            workspace_id: "ws-1".to_string(),
+            account_id: "acc-1".to_string(),
+            contact_id: "507f1f77bcf86cd799439012".to_string(),
+            suggested_value: "peer".to_string(),
+            evidence: Some("用户自称同行".to_string()),
+            confidence: 7,
+            status: "pending".to_string(),
+            occurrences: 2,
+            first_seen_at: DateTime::from_millis(1_700_000_000_000),
+            last_seen_at: DateTime::from_millis(1_700_000_100_000),
+            reviewed_at: Some(DateTime::from_millis(1_700_000_200_000)),
+            reviewed_by: Some("admin-1".to_string()),
+        };
+        let value = relationship_suggestion_json(item);
+        crate::routes::contract_snapshot::assert_contract_fixture(
+            "relationship_suggestion",
+            value,
+        );
+    }
 }
