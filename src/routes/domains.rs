@@ -592,4 +592,57 @@ mod tests {
             validate_state_machine(&crate::prompts::default_user_operation_state_machine()).is_ok()
         );
     }
+
+    /// 契约快照:operation_domain_json。OperationDomainConfig 22 字段全量构造。
+    /// methodology 等 5 个是 String(非 Document);runtime_parameters/state_machine 是
+    /// Document(纯标量 doc! 避泄漏);ask_human_policy 给 Some(完整 AskHumanPolicy);
+    /// principal_decider/high_risk_escalation_mode 赋值但投影不下发。顶层下发 20 键。
+    #[test]
+    fn operation_domain_json_matches_contract_fixture() {
+        use crate::models::{AskHumanPolicy, AskHumanQuietHours, DeciderRef};
+        use mongodb::bson::{doc, oid::ObjectId, DateTime};
+        let config = OperationDomainConfig {
+            id: Some(ObjectId::parse_str("507f1f77bcf86cd799439011").unwrap()),
+            workspace_id: "ws-1".to_string(),
+            domain: "user_operations".to_string(),
+            name: "私域用户运营".to_string(),
+            goal: "把新客养成签约客户".to_string(),
+            methodology: "FAB + 顾问式销售".to_string(),
+            workflow: "破冰→需求挖掘→方案→促单".to_string(),
+            tool_policy: "知识库优先,无依据不报价".to_string(),
+            automation_policy: "高风险静默 hold".to_string(),
+            review_policy: "独立复核 + 一次重写".to_string(),
+            runtime_parameters: doc! { "minIntervalSeconds": 60, "dailyCap": 20 },
+            state_machine: doc! { "states": "new_contact,need_discovery" },
+            status: "active".to_string(),
+            updated_at: DateTime::from_millis(1_700_000_000_000),
+            version: 2,
+            current_version: true,
+            previous_version: Some(1),
+            seeded_by: Some("system".to_string()),
+            principal_decider: Some("wxid_leader".to_string()),
+            high_risk_escalation_mode: Some("decision_only".to_string()),
+            ask_human_policy: Some(AskHumanPolicy {
+                decider_chain: vec![DeciderRef {
+                    wxid: "wxid_leader".to_string(),
+                    display_name: Some("张总".to_string()),
+                }],
+                escalate_safety_guard: true,
+                escalate_unverified_product: true,
+                escalate_ai_policy_hold: false,
+                escalate_stuck: true,
+                dedupe_window_hours: Some(6.0),
+                daily_push_cap: Some(10),
+                quiet_hours: Some(AskHumanQuietHours {
+                    start_hour: 22,
+                    end_hour: 8,
+                    tz_offset_hours: 8,
+                }),
+                timeout_hours: Some(24.0),
+            }),
+            assist_mode_enabled: Some(false),
+        };
+        let value = operation_domain_json(config);
+        crate::routes::contract_snapshot::assert_contract_fixture("operation_domain", value);
+    }
 }

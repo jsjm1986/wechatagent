@@ -1,0 +1,15 @@
+{
+  "accountId": "acc-1",
+  "confidence": 7,
+  "contactId": "507f1f77bcf86cd799439012",
+  "evidence": "用户自称同行",
+  "firstSeenAt": "2023-11-14T22:13:20Z",
+  "id": "507f1f77bcf86cd799439011",
+  "lastSeenAt": "2023-11-14T22:15:00Z",
+  "occurrences": 2,
+  "reviewedAt": "2023-11-14T22:16:40Z",
+  "reviewedBy": "admin-1",
+  "status": "pending",
+  "suggestedValue": "peer",
+  "workspaceId": "ws-1"
+}

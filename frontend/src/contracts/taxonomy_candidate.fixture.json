@@ -1,0 +1,15 @@
+{
+  "confidence": 7,
+  "evidence": "用户说价格高",
+  "firstSeenAt": "2023-11-14T22:13:20Z",
+  "id": "507f1f77bcf86cd799439011",
+  "kind": "objection_type",
+  "lastSeenAt": "2023-11-14T22:15:00Z",
+  "occurrences": 3,
+  "rawValue": "太贵了",
+  "reviewedAt": "2023-11-14T22:16:40Z",
+  "reviewedBy": "admin-1",
+  "scope": "global",
+  "status": "pending",
+  "suggestedDisplayName": "价格异议"
+}

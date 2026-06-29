@@ -517,4 +517,29 @@ mod tests {
             serde_json::from_value(json!({ "reason": "无业务相关性" })).unwrap();
         assert_eq!(ok.reason, "无业务相关性");
     }
+
+    /// 契约快照:taxonomy_candidate_json。TaxonomyCandidate 12 字段全量构造
+    /// (evidence/reviewed_at/reviewed_by/suggested_display_name 四个 Option 给 Some);id→hex;
+    /// first_seen_at/last_seen_at→RFC3339;reviewed_at→Some 后 RFC3339。投影下发 13 键。
+    #[test]
+    fn taxonomy_candidate_json_matches_contract_fixture() {
+        use mongodb::bson::{oid::ObjectId, DateTime};
+        let item = TaxonomyCandidate {
+            id: Some(ObjectId::parse_str("507f1f77bcf86cd799439011").unwrap()),
+            scope: "global".to_string(),
+            kind: "objection_type".to_string(),
+            raw_value: "太贵了".to_string(),
+            evidence: Some("用户说价格高".to_string()),
+            confidence: 7,
+            first_seen_at: DateTime::from_millis(1_700_000_000_000),
+            last_seen_at: DateTime::from_millis(1_700_000_100_000),
+            occurrences: 3,
+            status: "pending".to_string(),
+            reviewed_at: Some(DateTime::from_millis(1_700_000_200_000)),
+            reviewed_by: Some("admin-1".to_string()),
+            suggested_display_name: Some("价格异议".to_string()),
+        };
+        let value = taxonomy_candidate_json(item);
+        crate::routes::contract_snapshot::assert_contract_fixture("taxonomy_candidate", value);
+    }
 }
