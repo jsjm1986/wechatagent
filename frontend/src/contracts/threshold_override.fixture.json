@@ -1,0 +1,10 @@
+{
+  "gateKey": "fact_risk_block",
+  "id": "507f1f77bcf86cd799439011",
+  "releasedAt": "2023-11-14T22:13:20Z",
+  "releasedBy": "admin-1",
+  "rolledBackAt": "2023-11-14T22:15:00Z",
+  "rolledBackBy": "admin-2",
+  "sourceProposalId": "507f1f77bcf86cd799439012",
+  "value": 5.5
+}

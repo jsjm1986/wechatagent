@@ -114,16 +114,8 @@ mod tests {
             "parse_warning_to_json",   // 解析告警,非实体投影
             "vision_generate_json",    // async LLM 调用,非 model→Value
             "lesson_doc_to_json",      // 入参是裸 Document 非 model(批次2 评估纳入)
-            "experiment_summary_json", // 批次4 进化域(本批不覆盖)
-            "experiment_envelope_json",
-            "proposal_summary_json",
-            "proposal_detail_json",
-            "cohort_run_ids_json",
-            "shadow_replay_json",
-            "threshold_override_json",
-            "threshold_override_audit_json",
-            "runtime_flag_json",
-            // 批次5 域投影:本批次只覆盖知识域 + 运营/Agent 域 + 字典/分类域,配置/playbook 域在后续批次纳入。
+            "cohort_run_ids_json",     // helper:返回裸数组(json!([hex...]))非对象投影,无顶层键集;形状由 proposal 详情端点 cohortRunIds 键间接覆盖
+            // 批次5 域投影:本批次只覆盖知识域 + 运营/Agent 域 + 字典/分类域 + 进化/实验域,配置/playbook 域在后续批次纳入。
             // 批次铺开时从本清单移除对应项,使 lint 真正强制。
             "suspected_deal_json",
             "outbox_entry_json",
