@@ -331,7 +331,7 @@ pub(crate) async fn decide_reply_with_promote(
     };
     // 文本资产分档注入（2026-06-29）：不再绑死 Full，按当前轮 tier 过滤每条 min_inject_tier。
     // best-effort：DB 故障 → 空串（不阻塞决策，同 reaction_hint / sendable 路径）。
-    let (referable_assets, forbidden_assets) = load_context_assets(state, &contact.account_id, tier)
+    let (referable_assets, forbidden_assets) = load_context_assets(state, &contact.workspace_id, &contact.account_id, tier)
         .await
         .unwrap_or_default();
     // media-asset Task 8 + ③升档盲区修复（2026-06-27）：加载可发送素材（sendable+approved）。
@@ -1558,52 +1558,47 @@ pub(crate) fn build_sendable_assets_filter(
 
 pub(crate) async fn load_context_assets(
     state: &AppState,
+    workspace_id: &str,
     account_id: &str,
     tier: crate::agent::sufficiency::PromptTier,
 ) -> AppResult<(String, String)> {
     use futures::TryStreamExt;
-    use mongodb::bson::doc;
     use mongodb::options::FindOptions;
-    let visible: Vec<&str> = visible_min_tiers_for(tier);
-    // Full 档额外纳入「字段缺失」= 老数据按 full 处理；非 Full 档只取显式可见值。
-    let tier_cond = if matches!(tier, crate::agent::sufficiency::PromptTier::Full) {
-        doc! { "$or": [
-            { "min_inject_tier": { "$in": &visible } },
-            { "min_inject_tier": { "$exists": false } },
-        ] }
-    } else {
-        doc! { "min_inject_tier": { "$in": &visible } }
-    };
-    // 禁语恒注入（安全红线，无视 tier）；可引用 4 类仍受 tier_cond 约束（保留 $in 下推）。
-    let mut cursor = state
+    // 可引用 4 类：tier 下推 + limit(16)（与改造前一致）。
+    let mut ref_cursor = state
         .db
         .content_assets()
         .find(
-            doc! {
-                "workspace_id": &state.config.default_workspace_id,
-                "$or": [
-                    { "account_id": null },
-                    { "account_id": account_id }
-                ],
-                "$and": [ doc! { "$or": [
-                    {
-                        "kind": { "$in": ["text", "faq", "script", "brand_voice"] },
-                        "$and": [ tier_cond ]
-                    },
-                    { "kind": "forbidden_expression" }
-                ] } ]
-            },
+            build_referable_assets_filter(workspace_id, account_id, tier),
             FindOptions::builder()
-                .sort(doc! { "updated_at": -1 })
+                .sort(mongodb::bson::doc! { "updated_at": -1 })
                 .limit(16)
                 .build(),
         )
         .await?;
-    let mut collected = Vec::new();
-    while let Some(asset) = cursor.try_next().await? {
-        collected.push(asset);
+    let mut ref_assets = Vec::new();
+    while let Some(a) = ref_cursor.try_next().await? {
+        ref_assets.push(a);
     }
-    Ok(split_context_assets(collected))
+    // 禁语：无 tier、无 limit（安全红线恒全量注入，绝不与可引用争 limit 名额）。
+    let mut forb_cursor = state
+        .db
+        .content_assets()
+        .find(
+            build_forbidden_assets_filter(workspace_id, account_id),
+            FindOptions::builder()
+                .sort(mongodb::bson::doc! { "updated_at": -1 })
+                .build(),
+        )
+        .await?;
+    let mut forb_assets = Vec::new();
+    while let Some(a) = forb_cursor.try_next().await? {
+        forb_assets.push(a);
+    }
+    Ok((
+        render_referable_assets(ref_assets),
+        render_forbidden_assets(forb_assets),
+    ))
 }
 
 #[cfg(test)]
