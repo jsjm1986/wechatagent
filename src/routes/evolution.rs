@@ -1075,7 +1075,7 @@ mod tests {
         crate::routes::contract_snapshot::assert_contract_fixture("experiment_envelope", value);
     }
 
-    /// 契约快照:proposal_summary_json。Proposal 28 字段全量构造(各 Option 给 Some、
+    /// 契约快照:proposal_summary_json。Proposal 29 字段全量构造(各 Option 给 Some、
     /// expected_improvement_on 非空 Vec、cohort_notes/eval_metrics 纯标量 doc!);
     /// id→Option.map(to_hex)。投影下发 14 顶层键(summary 子集)。
     #[test]
