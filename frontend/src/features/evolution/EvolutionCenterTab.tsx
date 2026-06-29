@@ -269,6 +269,15 @@ export function EvolutionCenterTab({ enabled = true }: { enabled?: boolean }) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [enabled, envAllowed, flagEnabled]);
 
+  // useMemo 必须在任何早返回之前调用——hooks 调用顺序在每次渲染必须一致，
+  // 否则 envAllowed null→bool 跳变时早返回路径的 hook 数量不同 → React 崩溃。
+  const aggregate = useMemo(() => aggregateLast7Days(items), [items]);
+
+  const proposalsFlat = useMemo<ProposalSummary[]>(
+    () => items.flatMap((it) => it.proposals).sort((a, b) => b.createdAt.localeCompare(a.createdAt)),
+    [items]
+  );
+
   const locked = !enabled || envAllowed === false;
   if (locked) {
     return (
@@ -284,13 +293,6 @@ export function EvolutionCenterTab({ enabled = true }: { enabled?: boolean }) {
       </div>
     );
   }
-
-  const aggregate = useMemo(() => aggregateLast7Days(items), [items]);
-
-  const proposalsFlat = useMemo<ProposalSummary[]>(
-    () => items.flatMap((it) => it.proposals).sort((a, b) => b.createdAt.localeCompare(a.createdAt)),
-    [items]
-  );
 
   return (
     <section className={styles.center} data-testid="evolution-center">
