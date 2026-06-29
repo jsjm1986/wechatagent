@@ -1,0 +1,15 @@
+{
+  "agentKind": "reply",
+  "content": "你是私域运营助手……",
+  "createdBy": "system",
+  "description": "主决策层提示词",
+  "id": "507f1f77bcf86cd799439011",
+  "layer": "policy",
+  "promptKey": "reply_agent_main",
+  "promptPackVersion": "v2",
+  "status": "active",
+  "title": "回复 Agent 主提示词",
+  "updatedAt": "2023-11-14T22:15:00Z",
+  "version": 11,
+  "workspaceId": "ws-1"
+}

@@ -318,3 +318,38 @@ pub(super) fn validate_prompt_template_input(payload: &PromptTemplateRequest) ->
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 契约快照:prompt_template_json。PromptTemplate 18 字段全量构造(description/previous_version/
+    /// seeded_by/locale 给 Some);id→Option.map(to_hex).unwrap_or_default();updatedAt→dt_to_string。
+    /// 投影下发 13 顶层键(漏发 createdAt/currentVersion/previousVersion/seededBy/locale)。
+    #[test]
+    fn prompt_template_json_matches_contract_fixture() {
+        use mongodb::bson::{oid::ObjectId, DateTime};
+        let template = PromptTemplate {
+            id: Some(ObjectId::parse_str("507f1f77bcf86cd799439011").unwrap()),
+            workspace_id: "ws-1".to_string(),
+            prompt_key: "reply_agent_main".to_string(),
+            agent_kind: "reply".to_string(),
+            layer: "policy".to_string(),
+            title: "回复 Agent 主提示词".to_string(),
+            description: Some("主决策层提示词".to_string()),
+            content: "你是私域运营助手……".to_string(),
+            status: "active".to_string(),
+            version: 11,
+            prompt_pack_version: "v2".to_string(),
+            created_by: "system".to_string(),
+            created_at: DateTime::from_millis(1_700_000_000_000),
+            updated_at: DateTime::from_millis(1_700_000_100_000),
+            current_version: true,
+            previous_version: Some(10),
+            seeded_by: Some("system".to_string()),
+            locale: Some("zh-CN".to_string()),
+        };
+        let value = prompt_template_json(template);
+        crate::routes::contract_snapshot::assert_contract_fixture("prompt_template", value);
+    }
+}
