@@ -997,4 +997,26 @@ mod tests {
         let value = runtime_flag_json(&f);
         crate::routes::contract_snapshot::assert_contract_fixture("runtime_flag", value);
     }
+
+    /// 契约快照:threshold_override_json。ThresholdOverride 9 字段全量构造
+    /// (rolled_back_at/rolled_back_by 两 Option 给 Some);id→Option.map(to_hex);
+    /// source_proposal_id→to_hex()(非 Option)。投影下发 8 顶层键。
+    #[test]
+    fn threshold_override_json_matches_contract_fixture() {
+        use mongodb::bson::{oid::ObjectId, DateTime};
+        let o = ThresholdOverride {
+            id: Some(ObjectId::parse_str("507f1f77bcf86cd799439011").unwrap()),
+            workspace_id: "ws-1".to_string(),
+            account_id: "acc-1".to_string(),
+            gate_key: "fact_risk_block".to_string(),
+            value: 5.5,
+            source_proposal_id: ObjectId::parse_str("507f1f77bcf86cd799439012").unwrap(),
+            released_at: DateTime::from_millis(1_700_000_000_000),
+            released_by: "admin-1".to_string(),
+            rolled_back_at: Some(DateTime::from_millis(1_700_000_100_000)),
+            rolled_back_by: Some("admin-2".to_string()),
+        };
+        let value = threshold_override_json(&o);
+        crate::routes::contract_snapshot::assert_contract_fixture("threshold_override", value);
+    }
 }
