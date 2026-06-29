@@ -218,6 +218,7 @@ export type ContentAsset = {
   url?: string;
   mediaId?: string;
   usageScene?: string;
+  minInjectTier?: string;
   // 销售素材文件字段
   mediaType?: "image" | "file" | "video";
   fileName?: string;
