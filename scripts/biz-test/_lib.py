@@ -562,11 +562,24 @@ def ensure_managed_contact(account_id: str, wxid: str, nickname: str = "biztest 
 
 
 def reset_contact_conversation(account_id: str, wxid: str) -> None:
-    """清掉某测试 contact 的历史对话/run/outbox/events，保证每次触发是干净起点。"""
+    """清掉某测试 contact 的历史对话/run/outbox/events/决策评审 + 重置滚动记忆，保证干净起点。
+
+    含 agent_decision_reviews（召回/反应/五维证据所在层）与 contact.memory_summary（短期滚动
+    上下文）：二者不清则跨轮残留污染——AI 从 memory_summary 加载"已承诺核对口径""重复发同一
+    问题"等历史→后续轮回"先核对再答"/no_reply 而不再引用知识直接答（实证 c2 阶段4 召回恢复
+    假阴根因）。不碰 operating_memories（长期记忆/memory_card，各域如⑨自行 deleteMany 管理）。
+    """
     for c, field in [
         ("conversation_messages", "contact_wxid"),
         ("agent_run_logs", "contact_wxid"),
         ("agent_send_outbox", "contact_wxid"),
         ("agent_events", "contact_wxid"),
+        ("agent_decision_reviews", "contact_wxid"),
     ]:
         mongo(f'db.{c}.deleteMany({{{field}:"{wxid}",account_id:"{account_id}"}})')
+    # 重置滚动短期记忆（独立字段，非上面任何集合）：清空 memory_summary + last_outbound_style，
+    # 让每轮触发不带历史承诺包袱。不动 manual_tags/human_profile_note（运营权威，非对话残留）。
+    mongo(
+        f'db.contacts.updateOne({{wxid:"{wxid}",account_id:"{account_id}"}},'
+        '{$set:{memory_summary:null,last_outbound_style:null}})'
+    )
