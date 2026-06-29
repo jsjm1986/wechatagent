@@ -1,0 +1,16 @@
+{
+  "createdAt": "2023-11-14T22:13:20Z",
+  "currentValue": 6.0,
+  "evalReplaysCompleted": 20,
+  "evalReplaysFailed": 1,
+  "failureReason": "none",
+  "gateKey": "fact_risk_block",
+  "id": "507f1f77bcf86cd799439011",
+  "kind": "threshold",
+  "proposedSection": "policy",
+  "proposedTemplateKey": "reply_agent_main",
+  "proposedValue": 5.5,
+  "significancePassed": true,
+  "status": "eligible_for_release",
+  "updatedAt": "2023-11-14T22:15:00Z"
+}

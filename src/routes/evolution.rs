@@ -1074,4 +1074,45 @@ mod tests {
         let value = experiment_envelope_json(&exp);
         crate::routes::contract_snapshot::assert_contract_fixture("experiment_envelope", value);
     }
+
+    /// 契约快照:proposal_summary_json。Proposal 28 字段全量构造(各 Option 给 Some、
+    /// expected_improvement_on 非空 Vec、cohort_notes/eval_metrics 纯标量 doc!);
+    /// id→Option.map(to_hex)。投影下发 14 顶层键(summary 子集)。
+    #[test]
+    fn proposal_summary_json_matches_contract_fixture() {
+        use mongodb::bson::{doc, oid::ObjectId, DateTime};
+        let p = Proposal {
+            id: Some(ObjectId::parse_str("507f1f77bcf86cd799439011").unwrap()),
+            experiment_id: "EXP-1".to_string(),
+            workspace_id: "ws-1".to_string(),
+            account_id: "acc-1".to_string(),
+            proposal_kind: "threshold".to_string(),
+            status: "eligible_for_release".to_string(),
+            gate_key: Some("fact_risk_block".to_string()),
+            current_value: Some(6.0),
+            proposed_value: Some(5.5),
+            cohort_notes: doc! { "hitRate": 0.012 },
+            proposed_template_key: Some("reply_agent_main".to_string()),
+            proposed_section: Some("policy".to_string()),
+            diff_summary: Some("收紧 fact_risk 阈值".to_string()),
+            diff_snippet: Some("- 6.0\n+ 5.5".to_string()),
+            critic_reasoning: Some("命中率证据充分".to_string()),
+            expected_improvement_on: vec!["fact_accuracy".to_string()],
+            risk_note: Some("低风险".to_string()),
+            previous_prompt_version: Some("v11".to_string()),
+            eval_metrics: doc! { "pValue": 0.03 },
+            eval_replays_completed: 20,
+            eval_replays_failed: 1,
+            significance_passed: Some(true),
+            failure_reason: Some("none".to_string()),
+            released_at: Some(DateTime::from_millis(1_700_000_300_000)),
+            released_by: Some("admin-1".to_string()),
+            rolled_back_at: Some(DateTime::from_millis(1_700_000_400_000)),
+            rolled_back_by: Some("admin-2".to_string()),
+            created_at: DateTime::from_millis(1_700_000_000_000),
+            updated_at: DateTime::from_millis(1_700_000_100_000),
+        };
+        let value = proposal_summary_json(&p);
+        crate::routes::contract_snapshot::assert_contract_fixture("proposal_summary", value);
+    }
 }
