@@ -360,4 +360,30 @@ mod tests {
             serde_json::from_value(json!({ "reason": "误判，实际只是咨询" })).unwrap();
         assert_eq!(ok.reason, "误判，实际只是咨询");
     }
+
+    /// 契约快照:suspected_deal_json。SuspectedDealSignal 13 字段全量构造(evidence/reviewed_at/
+    /// reviewed_by 给 Some,reviewedAt 非 null);id→Option.map(to_hex).unwrap_or_default();
+    /// contact_id 是 String 直发;first_seen_at/last_seen_at→dt_to_string,reviewed_at→and_then。
+    /// 投影 1:1 下发 13 顶层键。
+    #[test]
+    fn suspected_deal_json_matches_contract_fixture() {
+        use mongodb::bson::{oid::ObjectId, DateTime};
+        let item = SuspectedDealSignal {
+            id: Some(ObjectId::parse_str("507f1f77bcf86cd799439011").unwrap()),
+            workspace_id: "ws-1".to_string(),
+            account_id: "acc-1".to_string(),
+            contact_id: "wxid_alice".to_string(),
+            value: "疑似成交·待核实".to_string(),
+            evidence: Some("客户已确认付款意向".to_string()),
+            confidence: 8,
+            status: "pending".to_string(),
+            occurrences: 3,
+            first_seen_at: DateTime::from_millis(1_700_000_000_000),
+            last_seen_at: DateTime::from_millis(1_700_000_100_000),
+            reviewed_at: Some(DateTime::from_millis(1_700_000_200_000)),
+            reviewed_by: Some("admin-1".to_string()),
+        };
+        let value = suspected_deal_json(item);
+        crate::routes::contract_snapshot::assert_contract_fixture("suspected_deal", value);
+    }
 }

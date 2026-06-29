@@ -1,0 +1,27 @@
+{
+  "accountId": "acc-1",
+  "contactSeed": {
+    "intentLevel": "高意向",
+    "operationState": "need_discovery"
+  },
+  "createdAt": "2023-11-14T22:13:20Z",
+  "description": "用户主动表达需求并询问能否落地",
+  "groundTruth": {
+    "conversionReadiness": 6,
+    "emotionalValue": 7,
+    "nextBestActionScore": 7,
+    "trust": 7
+  },
+  "id": "507f1f77bcf86cd799439011",
+  "inboundMessages": [
+    "AI 能不能帮忙跟进?"
+  ],
+  "scenarioId": "example_high_intent_user",
+  "status": "active",
+  "tags": [
+    "example",
+    "high_intent"
+  ],
+  "title": "高意向用户主动询问产品能力",
+  "updatedAt": "2023-11-14T22:15:00Z"
+}

@@ -611,3 +611,38 @@ pub(super) fn build_playbook_optimization_prompt(
         playbook.success_criteria.as_deref().unwrap_or("")
     )
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 契约快照:playbook_json。OperationPlaybook 19 字段全量构造(7 个 Option<String> 给 Some);
+    /// id→Option.map(to_hex).unwrap_or_default();updatedAt→dt_to_string。投影下发 18 顶层键(漏发 createdAt)。
+    #[test]
+    fn playbook_json_matches_contract_fixture() {
+        use mongodb::bson::{oid::ObjectId, DateTime};
+        let playbook = OperationPlaybook {
+            id: Some(ObjectId::parse_str("507f1f77bcf86cd799439011").unwrap()),
+            workspace_id: "ws-1".to_string(),
+            account_id: "acc-1".to_string(),
+            name: "默认销售剧本".to_string(),
+            description: Some("用于高意向客户跟进".to_string()),
+            method_prompt: "先共情再给方案".to_string(),
+            profile_method: Some("三段式画像".to_string()),
+            tag_method: Some("意向分级打标".to_string()),
+            stage_method: Some("AIDA 阶段推进".to_string()),
+            intent_method: Some("显式信号优先".to_string()),
+            follow_up_method: Some("三天未回主动跟进".to_string()),
+            reply_style: Some("简洁口语".to_string()),
+            forbidden_rules: Some("不承诺无依据效果".to_string()),
+            success_criteria: Some("客户主动询价".to_string()),
+            created_by: "admin-1".to_string(),
+            is_default: true,
+            version: 3,
+            created_at: DateTime::from_millis(1_700_000_000_000),
+            updated_at: DateTime::from_millis(1_700_000_100_000),
+        };
+        let value = playbook_json(playbook);
+        crate::routes::contract_snapshot::assert_contract_fixture("playbook", value);
+    }
+}
