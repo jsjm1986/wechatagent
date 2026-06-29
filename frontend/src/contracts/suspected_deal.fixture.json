@@ -1,0 +1,15 @@
+{
+  "accountId": "acc-1",
+  "confidence": 8,
+  "contactId": "wxid_alice",
+  "evidence": "客户已确认付款意向",
+  "firstSeenAt": "2023-11-14T22:13:20Z",
+  "id": "507f1f77bcf86cd799439011",
+  "lastSeenAt": "2023-11-14T22:15:00Z",
+  "occurrences": 3,
+  "reviewedAt": "2023-11-14T22:16:40Z",
+  "reviewedBy": "admin-1",
+  "status": "pending",
+  "value": "疑似成交·待核实",
+  "workspaceId": "ws-1"
+}
