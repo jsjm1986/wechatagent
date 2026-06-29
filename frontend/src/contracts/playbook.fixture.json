@@ -1,0 +1,20 @@
+{
+  "accountId": "acc-1",
+  "createdBy": "admin-1",
+  "description": "用于高意向客户跟进",
+  "followUpMethod": "三天未回主动跟进",
+  "forbiddenRules": "不承诺无依据效果",
+  "id": "507f1f77bcf86cd799439011",
+  "intentMethod": "显式信号优先",
+  "isDefault": true,
+  "methodPrompt": "先共情再给方案",
+  "name": "默认销售剧本",
+  "profileMethod": "三段式画像",
+  "replyStyle": "简洁口语",
+  "stageMethod": "AIDA 阶段推进",
+  "successCriteria": "客户主动询价",
+  "tagMethod": "意向分级打标",
+  "updatedAt": "2023-11-14T22:15:00Z",
+  "version": 3,
+  "workspaceId": "ws-1"
+}
