@@ -1504,7 +1504,7 @@ pub(crate) async fn load_context_assets(
     state: &AppState,
     account_id: &str,
     tier: crate::agent::sufficiency::PromptTier,
-) -> AppResult<String> {
+) -> AppResult<(String, String)> {
     use futures::TryStreamExt;
     use mongodb::bson::doc;
     use mongodb::options::FindOptions;
@@ -1518,6 +1518,7 @@ pub(crate) async fn load_context_assets(
     } else {
         doc! { "min_inject_tier": { "$in": &visible } }
     };
+    // 禁语恒注入（安全红线，无视 tier）；可引用 4 类仍受 tier_cond 约束（保留 $in 下推）。
     let mut cursor = state
         .db
         .content_assets()
@@ -1528,25 +1529,25 @@ pub(crate) async fn load_context_assets(
                     { "account_id": null },
                     { "account_id": account_id }
                 ],
-                "kind": { "$in": ["text", "faq", "script", "brand_voice", "forbidden_expression"] },
-                "$and": [ tier_cond ]
+                "$and": [ doc! { "$or": [
+                    {
+                        "kind": { "$in": ["text", "faq", "script", "brand_voice"] },
+                        "$and": [ tier_cond ]
+                    },
+                    { "kind": "forbidden_expression" }
+                ] } ]
             },
             FindOptions::builder()
                 .sort(doc! { "updated_at": -1 })
-                .limit(12)
+                .limit(16)
                 .build(),
         )
         .await?;
-    let mut lines = Vec::new();
+    let mut collected = Vec::new();
     while let Some(asset) = cursor.try_next().await? {
-        lines.push(format!(
-            "- [{}] {}: {}",
-            asset.kind,
-            asset.title,
-            asset.body.unwrap_or_default()
-        ));
+        collected.push(asset);
     }
-    Ok(lines.join("\n"))
+    Ok(split_context_assets(collected))
 }
 
 #[cfg(test)]
