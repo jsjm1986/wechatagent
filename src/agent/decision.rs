@@ -341,7 +341,7 @@ pub(crate) async fn decide_reply_with_promote(
     // best-effort：DB 故障 → 空清单（不发素材、不阻塞决策，同 reaction_hint / operator_memory）。
     // customer_stage 取 contact.domain_attributes（与下方画像段同源），缺失 = None →
     // 只命中 target_stages 为空/全阶段的素材。
-    let sendable_assets = load_sendable_assets(state, &contact.account_id)
+    let sendable_assets = load_sendable_assets(state, &contact.workspace_id, &contact.account_id)
         .await
         .unwrap_or_default();
     let current_customer_stage = contact
@@ -395,7 +395,7 @@ pub(crate) async fn decide_reply_with_promote(
         assist_override,
     );
     let referral_block = if include_business && assist_on {
-        let cards = load_referral_cards(state, &contact.account_id)
+        let cards = load_referral_cards(state, &contact.workspace_id, &contact.account_id)
             .await
             .unwrap_or_default();
         let candidates = super::referral::filter_referral_candidates(
@@ -1370,6 +1370,7 @@ pub(crate) async fn load_published_soul(
 /// best-effort 由调用方处理（DB 故障时空清单 → 不发素材，不阻塞决策）。
 pub(crate) async fn load_sendable_assets(
     state: &AppState,
+    workspace_id: &str,
     account_id: &str,
 ) -> AppResult<Vec<crate::models::ContentAsset>> {
     use futures::TryStreamExt;
@@ -1379,15 +1380,7 @@ pub(crate) async fn load_sendable_assets(
         .db
         .content_assets()
         .find(
-            doc! {
-                "workspace_id": &state.config.default_workspace_id,
-                "$or": [
-                    { "account_id": null },
-                    { "account_id": account_id }
-                ],
-                "sendable": true,
-                "review_status": "approved",
-            },
+            build_sendable_assets_filter(workspace_id, account_id),
             FindOptions::builder()
                 .sort(doc! { "updated_at": -1 })
                 .limit(30)
@@ -1424,11 +1417,12 @@ pub(crate) fn build_referral_cards_filter(
 /// 不引荐、不阻塞决策，同 load_sendable_assets 路径）。
 pub(crate) async fn load_referral_cards(
     state: &AppState,
+    workspace_id: &str,
     account_id: &str,
 ) -> AppResult<Vec<crate::models::ReferralCard>> {
     use futures::TryStreamExt;
     use mongodb::options::FindOptions;
-    let filter = build_referral_cards_filter(&state.config.default_workspace_id, account_id);
+    let filter = build_referral_cards_filter(workspace_id, account_id);
     let mut cursor = state
         .db
         .referral_cards()
