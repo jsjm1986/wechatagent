@@ -1,0 +1,37 @@
+{
+  "accountId": "acc-1",
+  "cohortNotes": {
+    "hitRate": 0.012
+  },
+  "createdAt": "2023-11-14T22:13:20Z",
+  "criticReasoning": "命中率证据充分",
+  "currentValue": 6.0,
+  "diffSnippet": "- 6.0\n+ 5.5",
+  "diffSummary": "收紧 fact_risk 阈值",
+  "evalMetrics": {
+    "pValue": 0.03
+  },
+  "evalReplaysCompleted": 20,
+  "evalReplaysFailed": 1,
+  "expectedImprovementOn": [
+    "fact_accuracy"
+  ],
+  "experimentId": "EXP-1",
+  "failureReason": "none",
+  "gateKey": "fact_risk_block",
+  "id": "507f1f77bcf86cd799439011",
+  "kind": "threshold",
+  "previousPromptVersion": "v11",
+  "proposedSection": "policy",
+  "proposedTemplateKey": "reply_agent_main",
+  "proposedValue": 5.5,
+  "releasedAt": "2023-11-14T22:18:20Z",
+  "releasedBy": "admin-1",
+  "riskNote": "低风险",
+  "rolledBackAt": "2023-11-14T22:20:00Z",
+  "rolledBackBy": "admin-2",
+  "significancePassed": true,
+  "status": "eligible_for_release",
+  "updatedAt": "2023-11-14T22:15:00Z",
+  "workspaceId": "ws-1"
+}

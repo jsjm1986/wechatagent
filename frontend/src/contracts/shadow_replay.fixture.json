@@ -1,0 +1,25 @@
+{
+  "failureReason": "none",
+  "finishedAt": "2023-11-14T22:15:00Z",
+  "id": "507f1f77bcf86cd799439011",
+  "new5gateHit": {
+    "fact_risk_block": false,
+    "pressure_risk_block": false
+  },
+  "newFinalReviewStatus": "approved",
+  "newReviewRisks": [
+    "minor_tone"
+  ],
+  "newSelfCritiqueAddressed": true,
+  "newTokenCost": 321,
+  "original5gateHit": {
+    "fact_risk_block": true,
+    "pressure_risk_block": false
+  },
+  "originalFinalReviewStatus": "held_by_ai_policy",
+  "originalSelfCritiqueAddressed": false,
+  "similarityToOriginalText": 0.85,
+  "sourceRunId": "507f1f77bcf86cd799439013",
+  "startedAt": "2023-11-14T22:13:20Z",
+  "status": "completed"
+}

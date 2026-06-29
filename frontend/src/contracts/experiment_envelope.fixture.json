@@ -1,0 +1,16 @@
+{
+  "accountId": "acc-1",
+  "budgetUsedCalls": 120,
+  "budgetUsedTokens": 45000,
+  "cohortPromptSize": 1,
+  "cohortThresholdSize": 1,
+  "experimentId": "EXP-1",
+  "finishedAt": "2023-11-14T22:16:40Z",
+  "proposalsCount": 5,
+  "proposalsEligibleCount": 2,
+  "startedAt": "2023-11-14T22:13:20Z",
+  "status": "evaluating",
+  "updatedAt": "2023-11-14T22:15:00Z",
+  "windowHours": 24,
+  "workspaceId": "ws-1"
+}

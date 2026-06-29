@@ -978,4 +978,272 @@ mod tests {
             wake_jitter_max_seconds: 900,
         }
     }
+
+    /// 契约快照:runtime_flag_json。EvolutionRuntimeFlag 7 字段全量构造
+    /// (updated_by 给 Some);rolloutPercent=rollout_percent_clamped() 方法值 +
+    /// rolloutPercentRaw=原始字段双发;id 不下发。投影下发 7 顶层键。
+    #[test]
+    fn runtime_flag_json_matches_contract_fixture() {
+        use mongodb::bson::{oid::ObjectId, DateTime};
+        let f = EvolutionRuntimeFlag {
+            id: Some(ObjectId::parse_str("507f1f77bcf86cd799439011").unwrap()),
+            workspace_id: "ws-1".to_string(),
+            enabled: true,
+            rollout_percent: 25,
+            updated_by: Some("admin-1".to_string()),
+            threshold_auto_release_enabled: false,
+            updated_at: DateTime::from_millis(1_700_000_000_000),
+        };
+        let value = runtime_flag_json(&f);
+        crate::routes::contract_snapshot::assert_contract_fixture("runtime_flag", value);
+    }
+
+    /// 契约快照:threshold_override_json。ThresholdOverride 9 字段全量构造
+    /// (rolled_back_at/rolled_back_by 两 Option 给 Some);id→Option.map(to_hex);
+    /// source_proposal_id→to_hex()(非 Option)。投影下发 8 顶层键。
+    #[test]
+    fn threshold_override_json_matches_contract_fixture() {
+        use mongodb::bson::{oid::ObjectId, DateTime};
+        let o = ThresholdOverride {
+            id: Some(ObjectId::parse_str("507f1f77bcf86cd799439011").unwrap()),
+            workspace_id: "ws-1".to_string(),
+            account_id: "acc-1".to_string(),
+            gate_key: "fact_risk_block".to_string(),
+            value: 5.5,
+            source_proposal_id: ObjectId::parse_str("507f1f77bcf86cd799439012").unwrap(),
+            released_at: DateTime::from_millis(1_700_000_000_000),
+            released_by: "admin-1".to_string(),
+            rolled_back_at: Some(DateTime::from_millis(1_700_000_100_000)),
+            rolled_back_by: Some("admin-2".to_string()),
+        };
+        let value = threshold_override_json(&o);
+        crate::routes::contract_snapshot::assert_contract_fixture("threshold_override", value);
+    }
+
+    /// 契约快照:threshold_override_audit_json。ThresholdOverrideAudit 12 字段全量构造
+    /// (previous_value/new_value/hit_rate_observed 给 Some;significance_metrics 给
+    /// Some(纯标量 doc!) 暴露 significanceMetrics 非 null);id→Option.map(to_hex);
+    /// source_proposal_id→to_hex()。投影下发 10 顶层键。
+    #[test]
+    fn threshold_override_audit_json_matches_contract_fixture() {
+        use mongodb::bson::{doc, oid::ObjectId, DateTime};
+        let a = crate::models::ThresholdOverrideAudit {
+            id: Some(ObjectId::parse_str("507f1f77bcf86cd799439011").unwrap()),
+            workspace_id: "ws-1".to_string(),
+            account_id: "acc-1".to_string(),
+            gate_key: "fact_risk_block".to_string(),
+            action: "auto_released".to_string(),
+            previous_value: Some(6.0),
+            new_value: Some(5.5),
+            source_proposal_id: ObjectId::parse_str("507f1f77bcf86cd799439012").unwrap(),
+            decided_by: "evolution_auto_release".to_string(),
+            decided_at: DateTime::from_millis(1_700_000_000_000),
+            hit_rate_observed: Some(0.012),
+            significance_metrics: Some(doc! { "pValue": 0.03, "sampleSize": 120 }),
+        };
+        let value = threshold_override_audit_json(&a);
+        crate::routes::contract_snapshot::assert_contract_fixture(
+            "threshold_override_audit",
+            value,
+        );
+    }
+
+    /// 契约快照:experiment_envelope_json。Experiment 15 字段全量构造
+    /// (finished_at 给 Some;两 cohort Vec 非空——投影只下发 .len() 数字不泄漏 ObjectId);
+    /// id 不下发。投影下发 14 顶层键。
+    #[test]
+    fn experiment_envelope_json_matches_contract_fixture() {
+        use mongodb::bson::{oid::ObjectId, DateTime};
+        let exp = Experiment {
+            id: Some(ObjectId::parse_str("507f1f77bcf86cd799439011").unwrap()),
+            experiment_id: "EXP-1".to_string(),
+            workspace_id: "ws-1".to_string(),
+            account_id: "acc-1".to_string(),
+            status: "evaluating".to_string(),
+            window_hours: 24,
+            started_at: DateTime::from_millis(1_700_000_000_000),
+            updated_at: DateTime::from_millis(1_700_000_100_000),
+            finished_at: Some(DateTime::from_millis(1_700_000_200_000)),
+            cohort_threshold_run_ids: vec![ObjectId::parse_str("507f1f77bcf86cd799439012").unwrap()],
+            cohort_prompt_run_ids: vec![ObjectId::parse_str("507f1f77bcf86cd799439013").unwrap()],
+            budget_used_tokens: 45000,
+            budget_used_calls: 120,
+            proposals_count: 5,
+            proposals_eligible_count: 2,
+        };
+        let value = experiment_envelope_json(&exp);
+        crate::routes::contract_snapshot::assert_contract_fixture("experiment_envelope", value);
+    }
+
+    /// 契约快照:proposal_summary_json。Proposal 29 字段全量构造(各 Option 给 Some、
+    /// expected_improvement_on 非空 Vec、cohort_notes/eval_metrics 纯标量 doc!);
+    /// id→Option.map(to_hex)。投影下发 14 顶层键(summary 子集)。
+    #[test]
+    fn proposal_summary_json_matches_contract_fixture() {
+        use mongodb::bson::{doc, oid::ObjectId, DateTime};
+        let p = Proposal {
+            id: Some(ObjectId::parse_str("507f1f77bcf86cd799439011").unwrap()),
+            experiment_id: "EXP-1".to_string(),
+            workspace_id: "ws-1".to_string(),
+            account_id: "acc-1".to_string(),
+            proposal_kind: "threshold".to_string(),
+            status: "eligible_for_release".to_string(),
+            gate_key: Some("fact_risk_block".to_string()),
+            current_value: Some(6.0),
+            proposed_value: Some(5.5),
+            cohort_notes: doc! { "hitRate": 0.012 },
+            proposed_template_key: Some("reply_agent_main".to_string()),
+            proposed_section: Some("policy".to_string()),
+            diff_summary: Some("收紧 fact_risk 阈值".to_string()),
+            diff_snippet: Some("- 6.0\n+ 5.5".to_string()),
+            critic_reasoning: Some("命中率证据充分".to_string()),
+            expected_improvement_on: vec!["fact_accuracy".to_string()],
+            risk_note: Some("低风险".to_string()),
+            previous_prompt_version: Some("v11".to_string()),
+            eval_metrics: doc! { "pValue": 0.03 },
+            eval_replays_completed: 20,
+            eval_replays_failed: 1,
+            significance_passed: Some(true),
+            failure_reason: Some("none".to_string()),
+            released_at: Some(DateTime::from_millis(1_700_000_300_000)),
+            released_by: Some("admin-1".to_string()),
+            rolled_back_at: Some(DateTime::from_millis(1_700_000_400_000)),
+            rolled_back_by: Some("admin-2".to_string()),
+            created_at: DateTime::from_millis(1_700_000_000_000),
+            updated_at: DateTime::from_millis(1_700_000_100_000),
+        };
+        let value = proposal_summary_json(&p);
+        crate::routes::contract_snapshot::assert_contract_fixture("proposal_summary", value);
+    }
+
+    /// 契约快照:shadow_replay_json。ShadowReplay 19 字段全量构造(各 Option 给 Some、
+    /// new_review_risks 非空 Vec、两 5gate Document 纯标量 bool doc!);
+    /// id→Option.map(to_hex);source_run_id→to_hex()。投影下发 15 顶层键。
+    #[test]
+    fn shadow_replay_json_matches_contract_fixture() {
+        use mongodb::bson::{doc, oid::ObjectId, DateTime};
+        let r = ShadowReplay {
+            id: Some(ObjectId::parse_str("507f1f77bcf86cd799439011").unwrap()),
+            proposal_id: ObjectId::parse_str("507f1f77bcf86cd799439012").unwrap(),
+            experiment_id: "EXP-1".to_string(),
+            workspace_id: "ws-1".to_string(),
+            account_id: "acc-1".to_string(),
+            source_run_id: ObjectId::parse_str("507f1f77bcf86cd799439013").unwrap(),
+            status: "completed".to_string(),
+            failure_reason: Some("none".to_string()),
+            original_final_review_status: Some("held_by_ai_policy".to_string()),
+            original_5gate_hit: doc! { "fact_risk_block": true, "pressure_risk_block": false },
+            original_self_critique_addressed: Some(false),
+            new_final_review_status: Some("approved".to_string()),
+            new_review_risks: vec!["minor_tone".to_string()],
+            new_token_cost: Some(321),
+            new_5gate_hit: doc! { "fact_risk_block": false, "pressure_risk_block": false },
+            new_self_critique_addressed: Some(true),
+            similarity_to_original_text: 0.85,
+            started_at: DateTime::from_millis(1_700_000_000_000),
+            finished_at: Some(DateTime::from_millis(1_700_000_100_000)),
+        };
+        let value = shadow_replay_json(&r);
+        crate::routes::contract_snapshot::assert_contract_fixture("shadow_replay", value);
+    }
+
+    /// 契约快照:proposal_detail_json。Proposal 29 字段全量构造(同 Task5 形态;各 Option
+    /// 给 Some、expected_improvement_on 非空、cohort_notes/eval_metrics 纯标量 doc!——
+    /// detail 下发 cohortNotes/evalMetrics 故必须纯标量避泄漏);id→Option.map(to_hex)。
+    /// 投影下发 29 顶层键。
+    #[test]
+    fn proposal_detail_json_matches_contract_fixture() {
+        use mongodb::bson::{doc, oid::ObjectId, DateTime};
+        let p = Proposal {
+            id: Some(ObjectId::parse_str("507f1f77bcf86cd799439011").unwrap()),
+            experiment_id: "EXP-1".to_string(),
+            workspace_id: "ws-1".to_string(),
+            account_id: "acc-1".to_string(),
+            proposal_kind: "threshold".to_string(),
+            status: "eligible_for_release".to_string(),
+            gate_key: Some("fact_risk_block".to_string()),
+            current_value: Some(6.0),
+            proposed_value: Some(5.5),
+            cohort_notes: doc! { "hitRate": 0.012 },
+            proposed_template_key: Some("reply_agent_main".to_string()),
+            proposed_section: Some("policy".to_string()),
+            diff_summary: Some("收紧 fact_risk 阈值".to_string()),
+            diff_snippet: Some("- 6.0\n+ 5.5".to_string()),
+            critic_reasoning: Some("命中率证据充分".to_string()),
+            expected_improvement_on: vec!["fact_accuracy".to_string()],
+            risk_note: Some("低风险".to_string()),
+            previous_prompt_version: Some("v11".to_string()),
+            eval_metrics: doc! { "pValue": 0.03 },
+            eval_replays_completed: 20,
+            eval_replays_failed: 1,
+            significance_passed: Some(true),
+            failure_reason: Some("none".to_string()),
+            released_at: Some(DateTime::from_millis(1_700_000_300_000)),
+            released_by: Some("admin-1".to_string()),
+            rolled_back_at: Some(DateTime::from_millis(1_700_000_400_000)),
+            rolled_back_by: Some("admin-2".to_string()),
+            created_at: DateTime::from_millis(1_700_000_000_000),
+            updated_at: DateTime::from_millis(1_700_000_100_000),
+        };
+        let value = proposal_detail_json(&p);
+        crate::routes::contract_snapshot::assert_contract_fixture("proposal_detail", value);
+    }
+
+    /// 契约快照:experiment_summary_json。聚合投影吃 (&Experiment, Vec<Proposal>)。
+    /// 顶层 3 键:experiment(嵌套 envelope)/proposalsCounts(BTreeMap status 计数)/
+    /// proposals(数组)。构造 1 Experiment + 含 1 Proposal 的非空 Vec。
+    #[test]
+    fn experiment_summary_json_matches_contract_fixture() {
+        use mongodb::bson::{doc, oid::ObjectId, DateTime};
+        let exp = Experiment {
+            id: Some(ObjectId::parse_str("507f1f77bcf86cd799439011").unwrap()),
+            experiment_id: "EXP-1".to_string(),
+            workspace_id: "ws-1".to_string(),
+            account_id: "acc-1".to_string(),
+            status: "evaluating".to_string(),
+            window_hours: 24,
+            started_at: DateTime::from_millis(1_700_000_000_000),
+            updated_at: DateTime::from_millis(1_700_000_100_000),
+            finished_at: Some(DateTime::from_millis(1_700_000_200_000)),
+            cohort_threshold_run_ids: vec![ObjectId::parse_str("507f1f77bcf86cd799439012").unwrap()],
+            cohort_prompt_run_ids: vec![ObjectId::parse_str("507f1f77bcf86cd799439013").unwrap()],
+            budget_used_tokens: 45000,
+            budget_used_calls: 120,
+            proposals_count: 1,
+            proposals_eligible_count: 1,
+        };
+        let p = Proposal {
+            id: Some(ObjectId::parse_str("507f1f77bcf86cd799439014").unwrap()),
+            experiment_id: "EXP-1".to_string(),
+            workspace_id: "ws-1".to_string(),
+            account_id: "acc-1".to_string(),
+            proposal_kind: "threshold".to_string(),
+            status: "eligible_for_release".to_string(),
+            gate_key: Some("fact_risk_block".to_string()),
+            current_value: Some(6.0),
+            proposed_value: Some(5.5),
+            cohort_notes: doc! { "hitRate": 0.012 },
+            proposed_template_key: Some("reply_agent_main".to_string()),
+            proposed_section: Some("policy".to_string()),
+            diff_summary: Some("收紧 fact_risk 阈值".to_string()),
+            diff_snippet: Some("- 6.0\n+ 5.5".to_string()),
+            critic_reasoning: Some("命中率证据充分".to_string()),
+            expected_improvement_on: vec!["fact_accuracy".to_string()],
+            risk_note: Some("低风险".to_string()),
+            previous_prompt_version: Some("v11".to_string()),
+            eval_metrics: doc! { "pValue": 0.03 },
+            eval_replays_completed: 20,
+            eval_replays_failed: 1,
+            significance_passed: Some(true),
+            failure_reason: Some("none".to_string()),
+            released_at: Some(DateTime::from_millis(1_700_000_300_000)),
+            released_by: Some("admin-1".to_string()),
+            rolled_back_at: Some(DateTime::from_millis(1_700_000_400_000)),
+            rolled_back_by: Some("admin-2".to_string()),
+            created_at: DateTime::from_millis(1_700_000_000_000),
+            updated_at: DateTime::from_millis(1_700_000_100_000),
+        };
+        let value = experiment_summary_json(&exp, vec![p]);
+        crate::routes::contract_snapshot::assert_contract_fixture("experiment_summary", value);
+    }
 }
