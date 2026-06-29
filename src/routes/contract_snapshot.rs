@@ -115,13 +115,6 @@ mod tests {
             "vision_generate_json",    // async LLM 调用,非 model→Value
             "lesson_doc_to_json",      // 入参是裸 Document 非 model(批次2 评估纳入)
             "cohort_run_ids_json",     // helper:返回裸数组(json!([hex...]))非对象投影,无顶层键集;形状由 proposal 详情端点 cohortRunIds 键间接覆盖
-            // 批次5 域投影:本批次只覆盖知识域 + 运营/Agent 域 + 字典/分类域 + 进化/实验域,配置/playbook 域在后续批次纳入。
-            // 批次铺开时从本清单移除对应项,使 lint 真正强制。
-            "suspected_deal_json",
-            "outbox_entry_json",
-            "evaluation_scenario_json",
-            "playbook_json",
-            "prompt_template_json",
         ];
 
         fn collect_rs(dir: &Path, out: &mut Vec<PathBuf>) {
