@@ -1,0 +1,20 @@
+{
+  "currentVersion": true,
+  "id": "507f1f77bcf86cd799439011",
+  "kind": "customer_stage",
+  "previousVersion": 0,
+  "scope": "global",
+  "seededBy": "system",
+  "updatedAt": "2023-11-14T22:13:20Z",
+  "value": {
+    "aliases": [
+      "new_lead"
+    ],
+    "description": "刚加上微信、还没业务对话",
+    "displayName": "首次接触",
+    "id": "first_contact",
+    "label": "首次接触",
+    "status": "active"
+  },
+  "version": 1
+}
