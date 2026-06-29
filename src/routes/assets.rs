@@ -20,6 +20,16 @@ use crate::{
 
 use super::AppState;
 
+/// 归一化前端传入的 min_inject_tier：闭集 {lean,relational,full} 内保留原值，
+/// 否则（None/空/非法）落 "full"（保守，等价改造前仅 Full 注入）。
+fn normalize_min_inject_tier(raw: Option<&str>) -> String {
+    match raw.map(str::trim) {
+        Some("lean") => "lean".to_string(),
+        Some("relational") => "relational".to_string(),
+        _ => "full".to_string(),
+    }
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ContentAssetQuery {
@@ -37,9 +47,8 @@ pub(super) struct ContentAssetRequest {
     body: Option<String>,
     #[serde(default)]
     tags: Vec<String>,
-    url: Option<String>,
-    media_id: Option<String>,
     usage_scene: Option<String>,
+    min_inject_tier: Option<String>,
 }
 
 pub async fn list_content_assets(
@@ -104,6 +113,7 @@ pub async fn list_content_assets(
             "reviewStatus": asset.review_status,
             "sendable": asset.sendable,
             "reviewNote": asset.review_note,
+            "minInjectTier": asset.min_inject_tier,
             "updatedAt": crate::models::dt_to_string(asset.updated_at)
         }));
     }
@@ -128,8 +138,8 @@ pub(super) async fn create_content_asset(
         title: payload.title,
         body: payload.body,
         tags: payload.tags,
-        url: payload.url,
-        media_id: payload.media_id,
+        url: None,
+        media_id: None,
         usage_scene: payload.usage_scene,
         media_type: None,
         file_path: None,
@@ -144,7 +154,7 @@ pub(super) async fn create_content_asset(
         requires_principal_approval: None,
         review_status: None,
         review_note: None,
-        min_inject_tier: None,
+        min_inject_tier: Some(normalize_min_inject_tier(payload.min_inject_tier.as_deref())),
         created_at: DateTime::now(),
         updated_at: DateTime::now(),
     };
@@ -152,4 +162,19 @@ pub(super) async fn create_content_asset(
     Ok(Json(
         json!({ "id": result.inserted_id.as_object_id().map(|id| id.to_hex()) }),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::normalize_min_inject_tier;
+
+    #[test]
+    fn normalize_keeps_valid_lowercases_defaults_full() {
+        assert_eq!(normalize_min_inject_tier(Some("lean")), "lean");
+        assert_eq!(normalize_min_inject_tier(Some("relational")), "relational");
+        assert_eq!(normalize_min_inject_tier(Some("full")), "full");
+        assert_eq!(normalize_min_inject_tier(None), "full");
+        assert_eq!(normalize_min_inject_tier(Some("garbage")), "full");
+        assert_eq!(normalize_min_inject_tier(Some("")), "full");
+    }
 }
