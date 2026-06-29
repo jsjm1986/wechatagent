@@ -212,7 +212,8 @@ pub(crate) fn memory_card_from_contact(
         .or_else(|| doc_string(&memory.user_understanding, "businessContext"))
         .unwrap_or_default();
     let mut core_facts: Vec<String> = Vec::new();
-    push_unique_text(&mut core_facts, contact.memory_summary.as_deref());
+    // ⑨真因修正:memory_summary 是短期滚动上下文(gateway append 累积),不当权威 core_fact;
+    // 归位到下方 extra.recentEpisodeSummary。human_profile_note(运营手写)仍是权威事实。
     push_unique_text(&mut core_facts, contact.human_profile_note.as_deref());
     // 标签可信度改造：manual_tags（运营权威）优先，confirmed_tags 补充
     for tag in &contact.manual_tags {
@@ -276,7 +277,10 @@ pub(crate) fn memory_card_from_contact(
         string_array_from_doc(&memory.product_fit, "objections"),
     );
     extra.insert("openLoops", open_loops);
-    extra.insert("recentEpisodeSummary", "");
+    extra.insert(
+        "recentEpisodeSummary",
+        contact.memory_summary.clone().unwrap_or_default(),
+    );
     extra.insert("conflicts", Vec::<Document>::new());
     extra.insert("source", "contact_seed");
 
@@ -2664,6 +2668,150 @@ mod r7_deprecation_tests {
             !should_drop_non_atomic(&["non_atomic_fact_resolved_by_retry".to_string()]),
             "重试已解决不触发丢弃"
         );
+    }
+
+    // ⑨真因修正：memory_summary(短期滚动上下文)不再当权威 core_fact,归位 recentEpisodeSummary。
+    // 注:Contact / OperatingMemory 均无 Default derive,本模块自建全字段 seed helper。
+    use crate::models::{AgentStatus, Contact, OperatingMemory};
+    use crate::models::{MemoryCardTyped as SeedCard};
+    use mongodb::bson::Document;
+
+    fn seed_contact() -> Contact {
+        Contact {
+            id: None,
+            workspace_id: "default".to_string(),
+            account_id: "default".to_string(),
+            wxid: "c".to_string(),
+            nickname: None,
+            remark: None,
+            alias: None,
+            agent_status: AgentStatus::Managed,
+            human_profile_note: None,
+            agent_profile: None,
+            memory_summary: None,
+            playbook_id: None,
+            playbook_version: None,
+            manual_tags: Vec::new(),
+            manual_tags_updated_at: None,
+            manual_tags_by: None,
+            confirmed_tags: Vec::new(),
+            bayesian_signals: Vec::new(),
+            personality_profile: None,
+            tags_version: 0,
+            commitments: Vec::new(),
+            follow_up_policy: None,
+            operation_state: None,
+            operation_state_reason: None,
+            operation_state_confidence: None,
+            operation_state_updated_at: None,
+            cooldown_until: None,
+            operation_policy: Document::new(),
+            profile_attributes: Document::new(),
+            profile_updated_at: None,
+            domain_attributes: None,
+            domain_attributes_updated_at: None,
+            last_message_at: None,
+            last_inbound_at: None,
+            last_outbound_at: None,
+            last_agent_run_at: None,
+            custom_agent_instructions: None,
+            operation_mode_override: None,
+            last_outbound_style: None,
+            intent_trajectory: Vec::new(),
+            outcome_events: Vec::new(),
+            locale: None,
+            created_at: DateTime::from_millis(0),
+            updated_at: DateTime::from_millis(0),
+        }
+    }
+
+    fn seed_memory() -> OperatingMemory {
+        OperatingMemory {
+            id: None,
+            workspace_id: "ws".to_string(),
+            account_id: "acct".to_string(),
+            contact_wxid: "c".to_string(),
+            user_understanding: Document::new(),
+            relationship_state: Document::new(),
+            product_fit: Document::new(),
+            next_action: Document::new(),
+            context_pack: Document::new(),
+            context_pack_version: 0,
+            context_pack_updated_at: None,
+            memory_card: SeedCard::default(),
+            memory_card_version: 0,
+            memory_card_updated_at: None,
+            created_at: DateTime::from_millis(0),
+            updated_at: DateTime::from_millis(0),
+        }
+    }
+
+    #[test]
+    fn memory_summary_blob_not_in_core_facts_goes_to_recent_episode() {
+        use super::doc_string;
+        use super::memory_card_from_contact;
+        // 改口累积 blob:多行各版本 summary(模拟真测 contact.memory_summary 现场)。
+        let blob = "孩子8岁零基础\n更新为10岁\n确认8岁";
+        let contact = Contact {
+            wxid: "biztest_c9".into(),
+            memory_summary: Some(blob.to_string()),
+            ..seed_contact()
+        };
+        let memory = seed_memory();
+        let card = memory_card_from_contact(&contact, &memory, "new_contact");
+        // 权威事实层不含累积 blob。
+        let core_texts: Vec<&str> = card.core_facts.iter().map(|f| f.as_text()).collect();
+        assert!(
+            !core_texts.iter().any(|t| t.contains("更新为10岁")),
+            "memory_summary blob 不应进 core_facts(权威事实层),实际={core_texts:?}"
+        );
+        // 内容归位到 recentEpisodeSummary。
+        let recent = doc_string(&card.extra, "recentEpisodeSummary").unwrap_or_default();
+        assert_eq!(recent, blob, "memory_summary 应归位 extra.recentEpisodeSummary");
+    }
+
+    #[test]
+    fn authoritative_facts_still_in_core_facts() {
+        use super::memory_card_from_contact;
+        let contact = Contact {
+            wxid: "c".into(),
+            human_profile_note: Some("VIP 客户".to_string()),
+            manual_tags: vec!["家长".to_string()],
+            ..seed_contact()
+        };
+        let card = memory_card_from_contact(&contact, &seed_memory(), "new_contact");
+        let core_texts: Vec<&str> = card.core_facts.iter().map(|f| f.as_text()).collect();
+        assert!(core_texts.iter().any(|t| *t == "VIP 客户"), "human_profile_note 应留 core_facts");
+        assert!(core_texts.iter().any(|t| *t == "家长"), "manual_tags 应留 core_facts");
+    }
+
+    #[test]
+    fn identity_fallback_to_memory_summary_unchanged() {
+        use super::memory_card_from_contact;
+        // human_profile_note 为空 → identity 回落 memory_summary(单值画像字段,不变)。
+        let contact = Contact {
+            wxid: "c".into(),
+            memory_summary: Some("张三老板".to_string()),
+            ..seed_contact()
+        };
+        let card = memory_card_from_contact(&contact, &seed_memory(), "new_contact");
+        let identity = card
+            .extra
+            .get_document("coreProfile")
+            .ok()
+            .and_then(|d| d.get_str("identity").ok().map(|s| s.to_string()))
+            .unwrap_or_default();
+        assert_eq!(identity, "张三老板", "identity 单值回落 memory_summary 应保留");
+    }
+
+    #[test]
+    fn empty_memory_summary_recent_episode_is_blank() {
+        use super::doc_string;
+        use super::memory_card_from_contact;
+        let contact = Contact { wxid: "c".into(), ..seed_contact() };
+        let card = memory_card_from_contact(&contact, &seed_memory(), "new_contact");
+        let recent = doc_string(&card.extra, "recentEpisodeSummary").unwrap_or_default();
+        assert_eq!(recent, "", "无 memory_summary 时 recentEpisodeSummary 空串(字节等价原行为)");
     }
 }
 
