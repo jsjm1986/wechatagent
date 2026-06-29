@@ -5,8 +5,9 @@
 //! / handle_follow_up_task` 等生产链路入口。`scripts/check-evolution-isolation.sh`
 //! 在 CI 内静态扫描该目录强制此约束（M4 W0 Task 1.4）。
 //!
-//! 主循环 [`run_evolutionary_worker`] 由 `main.rs` 在 `EVOLUTION_ENABLED=true`
-//! 时 spawn；关闭时 worker 直接 return，不影响主进程。波次落地节奏：
+//! 主循环 [`run_evolutionary_worker`] 由 `main.rs` 无条件 spawn；`EVOLUTION_ENABLED`
+//! 是硬上限——为 false（运维硬锁定）时 worker 进函数即 return，不进 tick；为 true
+//! 时进常驻 tick 循环，每 tick 内由 mongo runtime flag 决定是否真选 cohort。波次落地节奏：
 //! - W1（本波）：worker 主循环 + EvolutionBudget + experiment 信封 + cohort 选择
 //! - W2：threshold 候选 + Critic LLM prompt 候选
 //! - W3：Shadow eval + 显著性
@@ -44,13 +45,14 @@ pub use self::runtime_flag::{
     bucket_for_contact, is_evolution_enabled_for, load_runtime_flag, rollout_bucket_index,
 };
 
-/// 演化器主循环。`EVOLUTION_ENABLED=false` 时立即 return，等价于功能未启用。
+/// 演化器主循环。`EVOLUTION_ENABLED=false`（运维硬锁定）时立即 return；为 true 时
+/// 进常驻 tick 循环，实际是否产出由 mongo runtime flag（UI 总开关）每 tick 决定。
 ///
 /// 每 `evolution_tick_seconds` 秒触发一次 [`run_one_tick`]，单次 tick 失败
 /// 不影响下次（异常被捕获后写 `agent_events kind="evolution_tick_failed"`）。
 pub async fn run_evolutionary_worker(state: AppState) {
     if !state.config.evolution_enabled {
-        tracing::info!("evolution worker disabled (EVOLUTION_ENABLED=false); skip spawn");
+        tracing::info!("evolution worker hard-locked (EVOLUTION_ENABLED=false); not entering tick loop");
         return;
     }
     let tick_seconds = state.config.evolution_tick_seconds.max(60);
