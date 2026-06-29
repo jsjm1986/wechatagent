@@ -307,7 +307,9 @@ pub(crate) async fn decide_reply_with_promote(
     // 关系组（完整 memory / memory_card / 意图轨迹 / 反应提示 / 运营记忆 / 画像各阶段字段）——
     //   Relational + Full 才注入；Lean 跳过对应 DB 加载（省查询省 token），用空串/默认占位。
     // 业务组（知识 / 知识路由 / 产品目录 / 持有投影 / 疑似成交 / 可发素材 / 已发素材 /
-    //   名片引荐 / 运营方法 / 运营域策略 / 状态机 / 硬运行参数 / 可引用内容资产）——仅 Full 注入。
+    //   名片引荐 / 运营方法 / 运营域策略 / 状态机 / 硬运行参数）——仅 Full 注入。
+    // 内容资产例外：可引用内容资产按每条 min_inject_tier 分档注入（不绑死 Full）；
+    //   禁语（forbidden_expression）恒注入无视 tier（安全红线）——见 load_context_assets。
     // 铁律：Full 档两标志均 true，所有槽位与改造前逐字等价（现有调用点全传 Full）。
     let include_relational = matches!(
         tier,
@@ -331,7 +333,7 @@ pub(crate) async fn decide_reply_with_promote(
     };
     // 文本资产分档注入（2026-06-29）：不再绑死 Full，按当前轮 tier 过滤每条 min_inject_tier。
     // best-effort：DB 故障 → 空串（不阻塞决策，同 reaction_hint / sendable 路径）。
-    let (referable_assets, forbidden_assets) = load_context_assets(state, &contact.account_id, tier)
+    let (referable_assets, forbidden_assets) = load_context_assets(state, &contact.workspace_id, &contact.account_id, tier)
         .await
         .unwrap_or_default();
     // media-asset Task 8 + ③升档盲区修复（2026-06-27）：加载可发送素材（sendable+approved）。
@@ -341,7 +343,7 @@ pub(crate) async fn decide_reply_with_promote(
     // best-effort：DB 故障 → 空清单（不发素材、不阻塞决策，同 reaction_hint / operator_memory）。
     // customer_stage 取 contact.domain_attributes（与下方画像段同源），缺失 = None →
     // 只命中 target_stages 为空/全阶段的素材。
-    let sendable_assets = load_sendable_assets(state, &contact.account_id)
+    let sendable_assets = load_sendable_assets(state, &contact.workspace_id, &contact.account_id)
         .await
         .unwrap_or_default();
     let current_customer_stage = contact
@@ -395,7 +397,7 @@ pub(crate) async fn decide_reply_with_promote(
         assist_override,
     );
     let referral_block = if include_business && assist_on {
-        let cards = load_referral_cards(state, &contact.account_id)
+        let cards = load_referral_cards(state, &contact.workspace_id, &contact.account_id)
             .await
             .unwrap_or_default();
         let candidates = super::referral::filter_referral_candidates(
@@ -1370,6 +1372,7 @@ pub(crate) async fn load_published_soul(
 /// best-effort 由调用方处理（DB 故障时空清单 → 不发素材，不阻塞决策）。
 pub(crate) async fn load_sendable_assets(
     state: &AppState,
+    workspace_id: &str,
     account_id: &str,
 ) -> AppResult<Vec<crate::models::ContentAsset>> {
     use futures::TryStreamExt;
@@ -1379,15 +1382,7 @@ pub(crate) async fn load_sendable_assets(
         .db
         .content_assets()
         .find(
-            doc! {
-                "workspace_id": &state.config.default_workspace_id,
-                "$or": [
-                    { "account_id": null },
-                    { "account_id": account_id }
-                ],
-                "sendable": true,
-                "review_status": "approved",
-            },
+            build_sendable_assets_filter(workspace_id, account_id),
             FindOptions::builder()
                 .sort(doc! { "updated_at": -1 })
                 .limit(30)
@@ -1424,11 +1419,12 @@ pub(crate) fn build_referral_cards_filter(
 /// 不引荐、不阻塞决策，同 load_sendable_assets 路径）。
 pub(crate) async fn load_referral_cards(
     state: &AppState,
+    workspace_id: &str,
     account_id: &str,
 ) -> AppResult<Vec<crate::models::ReferralCard>> {
     use futures::TryStreamExt;
     use mongodb::options::FindOptions;
-    let filter = build_referral_cards_filter(&state.config.default_workspace_id, account_id);
+    let filter = build_referral_cards_filter(workspace_id, account_id);
     let mut cursor = state
         .db
         .referral_cards()
@@ -1483,36 +1479,35 @@ pub(crate) fn visible_min_tiers_for(
         .collect()
 }
 
-/// 把查回的内容资产按 kind 分流渲染成两段提示词文本：
-/// - 可引用组（text/faq/script/brand_voice）：`- [kind] 标题: 正文`，语义＝可引用。
-/// - 禁语组（forbidden_expression）：`- 标题: 正文`（不带 kind 标签，段落标题已框定语义）。
-/// 返回 (referable, forbidden)，各自 `\n` 连接；某组空 → 空串。
-pub(crate) fn split_context_assets(
-    assets: Vec<crate::models::ContentAsset>,
-) -> (String, String) {
-    let mut referable = Vec::new();
-    let mut forbidden = Vec::new();
-    for asset in assets {
-        let body = asset.body.unwrap_or_default();
-        if asset.kind == "forbidden_expression" {
-            forbidden.push(format!("- {}: {}", asset.title, body));
-        } else {
-            referable.push(format!("- [{}] {}: {}", asset.kind, asset.title, body));
-        }
-    }
-    (referable.join("\n"), forbidden.join("\n"))
+/// 渲染可引用内容资产为 prompt 行：`- [kind] 标题: 正文`，`\n` 连接；空 → 空串。
+pub(crate) fn render_referable_assets(assets: Vec<crate::models::ContentAsset>) -> String {
+    assets
+        .into_iter()
+        .map(|a| format!("- [{}] {}: {}", a.kind, a.title, a.body.unwrap_or_default()))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
-pub(crate) async fn load_context_assets(
-    state: &AppState,
+/// 渲染禁语为 prompt 行：`- 标题: 正文`（不带 kind 标签，段落标题已框定禁止语义）；
+/// `\n` 连接；空 → 空串。
+pub(crate) fn render_forbidden_assets(assets: Vec<crate::models::ContentAsset>) -> String {
+    assets
+        .into_iter()
+        .map(|a| format!("- {}: {}", a.title, a.body.unwrap_or_default()))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// 可引用内容资产（text/faq/script/brand_voice）query 形状：本 workspace+account
+/// （或 account 无关 null）、kind 在可引用白名单、按当前 tier 过滤 min_inject_tier。
+/// Full 档纳入「字段缺失」老数据（按 full 处理）；非 Full 档只取显式可见值。
+pub(crate) fn build_referable_assets_filter(
+    workspace_id: &str,
     account_id: &str,
     tier: crate::agent::sufficiency::PromptTier,
-) -> AppResult<(String, String)> {
-    use futures::TryStreamExt;
+) -> mongodb::bson::Document {
     use mongodb::bson::doc;
-    use mongodb::options::FindOptions;
     let visible: Vec<&str> = visible_min_tiers_for(tier);
-    // Full 档额外纳入「字段缺失」= 老数据按 full 处理；非 Full 档只取显式可见值。
     let tier_cond = if matches!(tier, crate::agent::sufficiency::PromptTier::Full) {
         doc! { "$or": [
             { "min_inject_tier": { "$in": &visible } },
@@ -1521,36 +1516,85 @@ pub(crate) async fn load_context_assets(
     } else {
         doc! { "min_inject_tier": { "$in": &visible } }
     };
-    // 禁语恒注入（安全红线，无视 tier）；可引用 4 类仍受 tier_cond 约束（保留 $in 下推）。
-    let mut cursor = state
+    doc! {
+        "workspace_id": workspace_id,
+        "$or": [ { "account_id": null }, { "account_id": account_id } ],
+        "kind": { "$in": ["text", "faq", "script", "brand_voice"] },
+        "$and": [ tier_cond ],
+    }
+}
+
+/// 禁语（forbidden_expression）query 形状：本 workspace+account，**无 tier 过滤**
+/// （安全红线恒注入）。调用方对此查询**不设 limit**（禁语数量天然少，恒全量入 prompt）。
+pub(crate) fn build_forbidden_assets_filter(
+    workspace_id: &str,
+    account_id: &str,
+) -> mongodb::bson::Document {
+    use mongodb::bson::doc;
+    doc! {
+        "workspace_id": workspace_id,
+        "$or": [ { "account_id": null }, { "account_id": account_id } ],
+        "kind": "forbidden_expression",
+    }
+}
+
+/// 可发送素材 query 形状（原 load_sendable_assets 内联 filter 抽出）。
+pub(crate) fn build_sendable_assets_filter(
+    workspace_id: &str,
+    account_id: &str,
+) -> mongodb::bson::Document {
+    use mongodb::bson::doc;
+    doc! {
+        "workspace_id": workspace_id,
+        "$or": [ { "account_id": null }, { "account_id": account_id } ],
+        "sendable": true,
+        "review_status": "approved",
+    }
+}
+
+pub(crate) async fn load_context_assets(
+    state: &AppState,
+    workspace_id: &str,
+    account_id: &str,
+    tier: crate::agent::sufficiency::PromptTier,
+) -> AppResult<(String, String)> {
+    use futures::TryStreamExt;
+    use mongodb::options::FindOptions;
+    // 可引用 4 类：tier 下推 + limit(16)（与改造前一致）。
+    let mut ref_cursor = state
         .db
         .content_assets()
         .find(
-            doc! {
-                "workspace_id": &state.config.default_workspace_id,
-                "$or": [
-                    { "account_id": null },
-                    { "account_id": account_id }
-                ],
-                "$and": [ doc! { "$or": [
-                    {
-                        "kind": { "$in": ["text", "faq", "script", "brand_voice"] },
-                        "$and": [ tier_cond ]
-                    },
-                    { "kind": "forbidden_expression" }
-                ] } ]
-            },
+            build_referable_assets_filter(workspace_id, account_id, tier),
             FindOptions::builder()
-                .sort(doc! { "updated_at": -1 })
+                .sort(mongodb::bson::doc! { "updated_at": -1 })
                 .limit(16)
                 .build(),
         )
         .await?;
-    let mut collected = Vec::new();
-    while let Some(asset) = cursor.try_next().await? {
-        collected.push(asset);
+    let mut ref_assets = Vec::new();
+    while let Some(a) = ref_cursor.try_next().await? {
+        ref_assets.push(a);
     }
-    Ok(split_context_assets(collected))
+    // 禁语：无 tier、无 limit（安全红线恒全量注入，绝不与可引用争 limit 名额）。
+    let mut forb_cursor = state
+        .db
+        .content_assets()
+        .find(
+            build_forbidden_assets_filter(workspace_id, account_id),
+            FindOptions::builder()
+                .sort(mongodb::bson::doc! { "updated_at": -1 })
+                .build(),
+        )
+        .await?;
+    let mut forb_assets = Vec::new();
+    while let Some(a) = forb_cursor.try_next().await? {
+        forb_assets.push(a);
+    }
+    Ok((
+        render_referable_assets(ref_assets),
+        render_forbidden_assets(forb_assets),
+    ))
 }
 
 #[cfg(test)]
@@ -2074,8 +2118,8 @@ mod tier_injection_tests {
 }
 
 #[cfg(test)]
-mod split_context_assets_tests {
-    use super::split_context_assets;
+mod render_assets_tests {
+    use super::{render_referable_assets, render_forbidden_assets};
     use crate::models::ContentAsset;
     use mongodb::bson::DateTime;
 
@@ -2111,41 +2155,93 @@ mod split_context_assets_tests {
     }
 
     #[test]
-    fn forbidden_goes_to_forbidden_group_others_to_referable() {
-        let input = vec![
+    fn referable_renders_with_kind_prefix() {
+        let out = render_referable_assets(vec![
             asset("faq", "退款政策", Some("7天无理由")),
-            asset("forbidden_expression", "保本承诺", Some("不得说保本保收益")),
             asset("script", "开场白", Some("你好")),
-        ];
-        let (referable, forbidden) = split_context_assets(input);
-        // 可引用组带 [kind] 前缀
-        assert_eq!(referable, "- [faq] 退款政策: 7天无理由\n- [script] 开场白: 你好");
-        // 禁语组不带 kind 标签
-        assert_eq!(forbidden, "- 保本承诺: 不得说保本保收益");
+        ]);
+        assert_eq!(out, "- [faq] 退款政策: 7天无理由\n- [script] 开场白: 你好");
     }
 
     #[test]
-    fn empty_groups_return_empty_string() {
-        let (referable, forbidden) = split_context_assets(vec![]);
-        assert_eq!(referable, "");
-        assert_eq!(forbidden, "");
-        // 只有可引用 → forbidden 空
-        let (r, f) = split_context_assets(vec![asset("text", "A", Some("a"))]);
-        assert_eq!(r, "- [text] A: a");
-        assert_eq!(f, "");
-        // 只有禁语 → referable 空
-        let (r2, f2) = split_context_assets(vec![asset("forbidden_expression", "X", Some("x"))]);
-        assert_eq!(r2, "");
-        assert_eq!(f2, "- X: x");
+    fn forbidden_renders_without_kind_label() {
+        let out = render_forbidden_assets(vec![
+            asset("forbidden_expression", "保本承诺", Some("不得说保本保收益")),
+        ]);
+        assert_eq!(out, "- 保本承诺: 不得说保本保收益");
+    }
+
+    #[test]
+    fn empty_returns_empty_string() {
+        assert_eq!(render_referable_assets(vec![]), "");
+        assert_eq!(render_forbidden_assets(vec![]), "");
     }
 
     #[test]
     fn none_body_renders_empty_without_panic() {
-        let (referable, forbidden) = split_context_assets(vec![
-            asset("text", "无正文", None),
-            asset("forbidden_expression", "禁语无正文", None),
-        ]);
-        assert_eq!(referable, "- [text] 无正文: ");
-        assert_eq!(forbidden, "- 禁语无正文: ");
+        assert_eq!(render_referable_assets(vec![asset("text", "无正文", None)]), "- [text] 无正文: ");
+        assert_eq!(render_forbidden_assets(vec![asset("forbidden_expression", "禁语无正文", None)]), "- 禁语无正文: ");
+    }
+}
+
+#[cfg(test)]
+mod context_assets_filter_tests {
+    //! content_assets 注入加固：三个 query 形状契约。镜像 reaction_hint / referral
+    //! 同构——避免 filter 被静默改坏（漏 workspace pin → 跨租户泄漏；禁语误带 tier
+    //! → 恒注入被破；可引用漏 tier_cond → 分档失效）。
+    use super::*;
+    use crate::agent::sufficiency::PromptTier;
+
+    #[test]
+    fn referable_filter_lean_pins_workspace_kind_tier_in_only() {
+        let f = build_referable_assets_filter("ws", "acct", PromptTier::Lean);
+        assert_eq!(f.get_str("workspace_id").ok(), Some("ws"));
+        assert!(f.contains_key("$or")); // account_id null / acct
+        let kind = f.get_document("kind").unwrap();
+        let arr = kind.get_array("$in").unwrap();
+        assert_eq!(arr.len(), 4); // text/faq/script/brand_voice
+        // 非 Full 档：tier_cond 只有 $in，无 $exists 兜底
+        let and = f.get_array("$and").unwrap();
+        let tier_cond = and[0].as_document().unwrap();
+        let mit = tier_cond.get_document("min_inject_tier").unwrap();
+        assert!(mit.contains_key("$in"));
+        assert!(!mit.contains_key("$exists"));
+    }
+
+    #[test]
+    fn referable_filter_full_adds_exists_false_fallback() {
+        let f = build_referable_assets_filter("ws", "acct", PromptTier::Full);
+        let and = f.get_array("$and").unwrap();
+        let tier_cond = and[0].as_document().unwrap();
+        // Full 档：tier_cond 是 $or [ {$in}, {$exists:false} ]
+        let or = tier_cond.get_array("$or").unwrap();
+        assert_eq!(or.len(), 2);
+        let has_exists = or.iter().any(|b| {
+            b.as_document()
+                .and_then(|d| d.get_document("min_inject_tier").ok())
+                .map(|m| m.contains_key("$exists"))
+                .unwrap_or(false)
+        });
+        assert!(has_exists);
+    }
+
+    #[test]
+    fn forbidden_filter_has_no_tier_no_limit_key() {
+        let f = build_forbidden_assets_filter("ws", "acct");
+        assert_eq!(f.get_str("workspace_id").ok(), Some("ws"));
+        assert_eq!(f.get_str("kind").ok(), Some("forbidden_expression"));
+        assert!(f.contains_key("$or")); // account
+        // 恒注入证据：filter 完全不含 min_inject_tier / tier 相关键
+        assert!(!f.contains_key("min_inject_tier"));
+        assert!(!f.contains_key("$and"));
+    }
+
+    #[test]
+    fn sendable_filter_pins_workspace_account_sendable_approved() {
+        let f = build_sendable_assets_filter("ws", "acct");
+        assert_eq!(f.get_str("workspace_id").ok(), Some("ws"));
+        assert_eq!(f.get_bool("sendable").ok(), Some(true));
+        assert_eq!(f.get_str("review_status").ok(), Some("approved"));
+        assert!(f.contains_key("$or"));
     }
 }
