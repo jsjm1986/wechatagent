@@ -329,11 +329,11 @@ pub(crate) async fn decide_reply_with_promote(
             "你是长期运行的微信私域运营 AI Agent。你只为已纳管好友服务，目标是自然、克制、持续推进关系和业务目标。".to_string()
         }),
     };
-    let assets = if include_business {
-        load_context_assets(state, &contact.account_id).await?
-    } else {
-        String::new()
-    };
+    // 文本资产分档注入（2026-06-29）：不再绑死 Full，按当前轮 tier 过滤每条 min_inject_tier。
+    // best-effort：DB 故障 → 空串（不阻塞决策，同 reaction_hint / sendable 路径）。
+    let assets = load_context_assets(state, &contact.account_id, tier)
+        .await
+        .unwrap_or_default();
     // media-asset Task 8 + ③升档盲区修复（2026-06-27）：加载可发送素材（sendable+approved）。
     // **恒加载**（任何档，只需 account_id）：让 Lean 档也能注入「素材线索概览」，使 Reply Agent
     // 在第一程就知道库里有哪些可发素材 + 运营标注的 send_trigger_hint，据此自评本轮客户消息
@@ -1479,10 +1479,24 @@ pub(crate) fn visible_min_tiers_for(
     }
 }
 
-pub(crate) async fn load_context_assets(state: &AppState, account_id: &str) -> AppResult<String> {
+pub(crate) async fn load_context_assets(
+    state: &AppState,
+    account_id: &str,
+    tier: crate::agent::sufficiency::PromptTier,
+) -> AppResult<String> {
     use futures::TryStreamExt;
     use mongodb::bson::doc;
     use mongodb::options::FindOptions;
+    let visible: Vec<&str> = visible_min_tiers_for(tier);
+    // Full 档额外纳入「字段缺失」= 老数据按 full 处理；非 Full 档只取显式可见值。
+    let tier_cond = if matches!(tier, crate::agent::sufficiency::PromptTier::Full) {
+        doc! { "$or": [
+            { "min_inject_tier": { "$in": &visible } },
+            { "min_inject_tier": { "$exists": false } },
+        ] }
+    } else {
+        doc! { "min_inject_tier": { "$in": &visible } }
+    };
     let mut cursor = state
         .db
         .content_assets()
@@ -1493,7 +1507,8 @@ pub(crate) async fn load_context_assets(state: &AppState, account_id: &str) -> A
                     { "account_id": null },
                     { "account_id": account_id }
                 ],
-                "kind": { "$in": ["text", "faq", "script", "brand_voice", "forbidden_expression"] }
+                "kind": { "$in": ["text", "faq", "script", "brand_voice", "forbidden_expression"] },
+                "$and": [ tier_cond ]
             },
             FindOptions::builder()
                 .sort(doc! { "updated_at": -1 })
