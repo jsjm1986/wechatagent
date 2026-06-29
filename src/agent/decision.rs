@@ -1468,15 +1468,16 @@ pub(crate) fn asset_visible_at_tier(
 }
 
 /// 当前档可见的 min_inject_tier 取值集合（供 Mongo 查询下推 $in）。
+/// 由 [`asset_visible_at_tier`] 派生：对三个候选档值过滤出在 current 档可见的，
+/// 保证集合与单值判定语义恒一致（同一真值表的两种表达，避免双份逻辑漂移）。
 /// Lean→{lean}；Relational→{lean,relational}；Full→{lean,relational,full}。
 pub(crate) fn visible_min_tiers_for(
     current: crate::agent::sufficiency::PromptTier,
 ) -> Vec<&'static str> {
-    match current {
-        crate::agent::sufficiency::PromptTier::Lean => vec!["lean"],
-        crate::agent::sufficiency::PromptTier::Relational => vec!["lean", "relational"],
-        crate::agent::sufficiency::PromptTier::Full => vec!["lean", "relational", "full"],
-    }
+    ["lean", "relational", "full"]
+        .into_iter()
+        .filter(|t| asset_visible_at_tier(Some(t), current))
+        .collect()
 }
 
 pub(crate) async fn load_context_assets(
