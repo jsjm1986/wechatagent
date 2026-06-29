@@ -671,4 +671,36 @@ mod tests {
             );
         }
     }
+
+    /// 契约快照:evaluation_scenario_json。EvaluationScenario 13 字段全量构造
+    /// (account_id 给 Some;contact_seed/ground_truth 用纯标量 doc! 照搬生产种子形状——
+    /// 整数走 bson Int32 渲染干净不泄漏;铁律:绝不塞 ObjectId/DateTime);
+    /// id→Option.map(to_hex).unwrap_or_default();created_at/updated_at→dt_to_string。
+    /// 投影下发 12 顶层键(漏发 workspaceId)。
+    #[test]
+    fn evaluation_scenario_json_matches_contract_fixture() {
+        use mongodb::bson::{doc, oid::ObjectId, DateTime};
+        let item = EvaluationScenario {
+            id: Some(ObjectId::parse_str("507f1f77bcf86cd799439011").unwrap()),
+            workspace_id: "ws-1".to_string(),
+            scenario_id: "example_high_intent_user".to_string(),
+            title: "高意向用户主动询问产品能力".to_string(),
+            description: "用户主动表达需求并询问能否落地".to_string(),
+            account_id: Some("acc-1".to_string()),
+            contact_seed: doc! { "operationState": "need_discovery", "intentLevel": "高意向" },
+            inbound_messages: vec!["AI 能不能帮忙跟进?".to_string()],
+            ground_truth: doc! {
+                "trust": 7,
+                "conversionReadiness": 6,
+                "emotionalValue": 7,
+                "nextBestActionScore": 7
+            },
+            tags: vec!["example".to_string(), "high_intent".to_string()],
+            status: "active".to_string(),
+            created_at: DateTime::from_millis(1_700_000_000_000),
+            updated_at: DateTime::from_millis(1_700_000_100_000),
+        };
+        let value = evaluation_scenario_json(item);
+        crate::routes::contract_snapshot::assert_contract_fixture("evaluation_scenario", value);
+    }
 }
