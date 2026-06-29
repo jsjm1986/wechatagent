@@ -36,7 +36,7 @@
 | 4 | `experiment_envelope_json` | :416 | `(exp: &Experiment)` | 14 | cohortThresholdSize/cohortPromptSize=`Vec.len() as i64`;finishedAt 是 Option;id 不下发 |
 | 5 | `proposal_summary_json` | :435 | `(p: &Proposal)` | 14 | id→`Option.map(to_hex)`;多 Option 字段;无 Document |
 | 6 | `shadow_replay_json` | :507 | `(r: &ShadowReplay)` | 15 | sourceRunId→`to_hex()`(非Option);original5gateHit/new5gateHit=bson_doc_to_json(纯标量 doc!);现有测试 :788 完整构造可参照 |
-| 7 | `proposal_detail_json` | :454 | `(p: &Proposal)` | 28 | **最重**:cohortNotes/evalMetrics=bson_doc_to_json(纯标量 doc!);多 Option;experimentId/workspaceId/accountId 直发 |
+| 7 | `proposal_detail_json` | :454 | `(p: &Proposal)` | 29 | **最重**:cohortNotes/evalMetrics=bson_doc_to_json(纯标量 doc!);多 Option;experimentId/workspaceId/accountId 直发 |
 | 8 | `experiment_summary_json` | :395 | `(exp: &Experiment, proposals: Vec<Proposal>)` | 3 | **聚合**:顶层仅 experiment(嵌套 envelope)/proposalsCounts(BTreeMap)/proposals(数组);吃 2 参数 |
 
 > **cohort_run_ids_json(:488)不纳入本批**:返回裸数组 `json!([...])` 非对象,无顶层键集概念,契约机制(canonicalize+CANONICAL_KEYS 比 Object.keys)只适配对象;且它从不作顶层响应——作 `cohortRunIds` 键嵌在 proposal 详情端点 inline 聚合(:132)里,形状由该端点间接覆盖。本质是数组化 helper,Task 9 把它从 ALLOWLIST"待覆盖批次域"区移到 helper 豁免区并加注释。
@@ -51,7 +51,7 @@
 
 **Experiment**(models.rs:4405,15 字段):`id:Option<ObjectId>` / `experiment_id:String` / `workspace_id:String` / `account_id:String` / `status:String` / `window_hours:i32` / `started_at:DateTime` / `updated_at:DateTime` / `finished_at:Option<DateTime>` / `cohort_threshold_run_ids:Vec<ObjectId>` / `cohort_prompt_run_ids:Vec<ObjectId>` / `budget_used_tokens:i64` / `budget_used_calls:i32` / `proposals_count:i32` / `proposals_eligible_count:i32`。
 
-**Proposal**(models.rs:4434,28 字段):`id:Option<ObjectId>` / `experiment_id:String` / `workspace_id:String` / `account_id:String` / `proposal_kind:String` / `status:String` / `gate_key:Option<String>` / `current_value:Option<f64>` / `proposed_value:Option<f64>` / `cohort_notes:Document` / `proposed_template_key:Option<String>` / `proposed_section:Option<String>` / `diff_summary:Option<String>` / `diff_snippet:Option<String>` / `critic_reasoning:Option<String>` / `expected_improvement_on:Vec<String>` / `risk_note:Option<String>` / `previous_prompt_version:Option<String>` / `eval_metrics:Document` / `eval_replays_completed:i32` / `eval_replays_failed:i32` / `significance_passed:Option<bool>` / `failure_reason:Option<String>` / `released_at:Option<DateTime>` / `released_by:Option<String>` / `rolled_back_at:Option<DateTime>` / `rolled_back_by:Option<String>` / `created_at:DateTime` / `updated_at:DateTime`。
+**Proposal**(models.rs:4434,29 字段):`id:Option<ObjectId>` / `experiment_id:String` / `workspace_id:String` / `account_id:String` / `proposal_kind:String` / `status:String` / `gate_key:Option<String>` / `current_value:Option<f64>` / `proposed_value:Option<f64>` / `cohort_notes:Document` / `proposed_template_key:Option<String>` / `proposed_section:Option<String>` / `diff_summary:Option<String>` / `diff_snippet:Option<String>` / `critic_reasoning:Option<String>` / `expected_improvement_on:Vec<String>` / `risk_note:Option<String>` / `previous_prompt_version:Option<String>` / `eval_metrics:Document` / `eval_replays_completed:i32` / `eval_replays_failed:i32` / `significance_passed:Option<bool>` / `failure_reason:Option<String>` / `released_at:Option<DateTime>` / `released_by:Option<String>` / `rolled_back_at:Option<DateTime>` / `rolled_back_by:Option<String>` / `created_at:DateTime` / `updated_at:DateTime`。
 
 **ShadowReplay**(models.rs:4492,19 字段):`id:Option<ObjectId>` / `proposal_id:ObjectId` / `experiment_id:String` / `workspace_id:String` / `account_id:String` / `source_run_id:ObjectId` / `status:String` / `failure_reason:Option<String>` / `original_final_review_status:Option<String>` / `original_5gate_hit:Document` / `original_self_critique_addressed:Option<bool>` / `new_final_review_status:Option<String>` / `new_review_risks:Vec<String>` / `new_token_cost:Option<i64>` / `new_5gate_hit:Document` / `new_self_critique_addressed:Option<bool>` / `similarity_to_original_text:f64` / `started_at:DateTime` / `finished_at:Option<DateTime>`。现有测试 :788 完整构造可参照。
 
@@ -309,12 +309,12 @@ EOF
 - Consumes: `assert_contract_fixture`;投影 `proposal_summary_json(p: &Proposal) -> Value`(:435,不改)。
 - Produces: fixture `proposal_summary.fixture.json`(14 顶层键),供 Task 9 前端对账。
 
-**关键点**:Proposal 28 字段全构造(proposal_summary 只下发其中 14 键,proposal_detail 下发 28 键;两 task 复用同一构造形态)。cohort_notes/eval_metrics 是 Document,proposal_summary 不下发它们但全字段构造仍须赋值(纯标量 doc! 或空 `Document::new()`——summary 不下发故空亦可,但为与 Task 7 一致建议纯标量)。
+**关键点**:Proposal 29 字段全构造(proposal_summary 只下发其中 14 键,proposal_detail 下发 29 键;两 task 复用同一构造形态)。cohort_notes/eval_metrics 是 Document,proposal_summary 不下发它们但全字段构造仍须赋值(纯标量 doc! 或空 `Document::new()`——summary 不下发故空亦可,但为与 Task 7 一致建议纯标量)。
 
 - [ ] **Step 1: 在 `mod tests` 末尾追加契约测试**
 
 ```rust
-    /// 契约快照:proposal_summary_json。Proposal 28 字段全量构造(各 Option 给 Some、
+    /// 契约快照:proposal_summary_json。Proposal 29 字段全量构造(各 Option 给 Some、
     /// expected_improvement_on 非空 Vec、cohort_notes/eval_metrics 纯标量 doc!);
     /// id→Option.map(to_hex)。投影下发 14 顶层键(summary 子集)。
     #[test]
@@ -439,7 +439,7 @@ EOF
 
 ---
 
-### Task 7: proposal_detail_json 契约快照(本批最重之一,28 键)
+### Task 7: proposal_detail_json 契约快照(本批最重之一,29 键)
 
 **Files:**
 - Modify: `src/routes/evolution.rs`(追加契约测试进现有 `mod tests`)
@@ -447,17 +447,17 @@ EOF
 
 **Interfaces:**
 - Consumes: `assert_contract_fixture`;投影 `proposal_detail_json(p: &Proposal) -> Value`(:454,不改)。
-- Produces: fixture `proposal_detail.fixture.json`(28 顶层键),供 Task 9 前端对账。
+- Produces: fixture `proposal_detail.fixture.json`(29 顶层键),供 Task 9 前端对账。
 
-**关键点**:Proposal 28 字段全构造(与 Task 5 同一构造形态——可直接复用 Task 5 的 Proposal 构造代码);cohort_notes/eval_metrics 是 Document,proposal_detail **下发** cohortNotes/evalMetrics(bson_doc_to_json),必须纯标量 doc! 避泄漏。
+**关键点**:Proposal 29 字段全构造(与 Task 5 同一构造形态——可直接复用 Task 5 的 Proposal 构造代码);cohort_notes/eval_metrics 是 Document,proposal_detail **下发** cohortNotes/evalMetrics(bson_doc_to_json),必须纯标量 doc! 避泄漏。
 
 - [ ] **Step 1: 在 `mod tests` 末尾追加契约测试**
 
 ```rust
-    /// 契约快照:proposal_detail_json。Proposal 28 字段全量构造(同 Task5 形态;各 Option
+    /// 契约快照:proposal_detail_json。Proposal 29 字段全量构造(同 Task5 形态;各 Option
     /// 给 Some、expected_improvement_on 非空、cohort_notes/eval_metrics 纯标量 doc!——
     /// detail 下发 cohortNotes/evalMetrics 故必须纯标量避泄漏);id→Option.map(to_hex)。
-    /// 投影下发 28 顶层键。
+    /// 投影下发 29 顶层键。
     #[test]
     fn proposal_detail_json_matches_contract_fixture() {
         use mongodb::bson::{doc, oid::ObjectId, DateTime};
@@ -499,14 +499,14 @@ EOF
 
 - [ ] **Step 2: bless** — `... UPDATE_SNAPSHOTS=1 cargo test --lib proposal_detail_json_matches_contract_fixture`。
 
-- [ ] **Step 3: 只读对账 + 核对** — `... cargo test --lib proposal_detail_json_matches_contract_fixture`(PASS)。核对 `proposal_detail.fixture.json`:28 键(id/experimentId/workspaceId/accountId/kind/status/gateKey/currentValue/proposedValue/cohortNotes/proposedTemplateKey/proposedSection/diffSummary/diffSnippet/criticReasoning/expectedImprovementOn/riskNote/previousPromptVersion/evalMetrics/evalReplaysCompleted/evalReplaysFailed/significancePassed/failureReason/releasedAt/releasedBy/rolledBackAt/rolledBackBy/createdAt/updatedAt——以实际 Object.keys 为准);cohortNotes/evalMetrics 是纯标量对象;id hex;四时间戳 RFC3339;**无 $oid/$date/$numberInt 泄漏**(cohort_notes/eval_metrics 纯标量)。
+- [ ] **Step 3: 只读对账 + 核对** — `... cargo test --lib proposal_detail_json_matches_contract_fixture`(PASS)。核对 `proposal_detail.fixture.json`:29 键(id/experimentId/workspaceId/accountId/kind/status/gateKey/currentValue/proposedValue/cohortNotes/proposedTemplateKey/proposedSection/diffSummary/diffSnippet/criticReasoning/expectedImprovementOn/riskNote/previousPromptVersion/evalMetrics/evalReplaysCompleted/evalReplaysFailed/significancePassed/failureReason/releasedAt/releasedBy/rolledBackAt/rolledBackBy/createdAt/updatedAt——以实际 Object.keys 为准);cohortNotes/evalMetrics 是纯标量对象;id hex;四时间戳 RFC3339;**无 $oid/$date/$numberInt 泄漏**(cohort_notes/eval_metrics 纯标量)。
 
 - [ ] **Step 4: Commit**
 
 ```bash
 git add src/routes/evolution.rs frontend/src/contracts/proposal_detail.fixture.json
 git commit -m "$(cat <<'EOF'
-feat(contract): proposal_detail 投影契约快照(批次4,28 键)
+feat(contract): proposal_detail 投影契约快照(批次4,29 键)
 
 Co-Authored-By: Claude <noreply@anthropic.com>
 EOF
@@ -643,7 +643,7 @@ export const CANONICAL_KEYS = [
 ] as const;
 ```
 
-其余 7 份同构,文件名 camelCase、键抄自各自 fixture。预期键数(以 fixture 实际为准):runtimeFlag 7 / thresholdOverride 8 / thresholdOverrideAudit 10 / experimentEnvelope 14 / proposalSummary 14 / shadowReplay 15 / proposalDetail 28 / experimentSummary 3(experiment/proposals/proposalsCounts)。
+其余 7 份同构,文件名 camelCase、键抄自各自 fixture。预期键数(以 fixture 实际为准):runtimeFlag 7 / thresholdOverride 8 / thresholdOverrideAudit 10 / experimentEnvelope 14 / proposalSummary 14 / shadowReplay 15 / proposalDetail 29 / experimentSummary 3(experiment/proposals/proposalsCounts)。
 
 - [ ] **Step 3: 写 evolutionDomain.contract.test.ts**
 
@@ -697,7 +697,7 @@ describe("契约: 进化/实验域投影键集对账", () => {
     assertKeysMatch("proposalSummary", proposalSummaryFixture, PROPOSAL_SUMMARY_KEYS));
   it("shadow_replay 投影", () =>
     assertKeysMatch("shadowReplay", shadowReplayFixture, SHADOW_REPLAY_KEYS));
-  it("proposal_detail 投影(28 键)", () =>
+  it("proposal_detail 投影(29 键)", () =>
     assertKeysMatch("proposalDetail", proposalDetailFixture, PROPOSAL_DETAIL_KEYS));
   it("experiment_summary 聚合投影(顶层 3 键)", () =>
     assertKeysMatch("experimentSummary", experimentSummaryFixture, EXPERIMENT_SUMMARY_KEYS));
@@ -781,5 +781,5 @@ EOF
 4. experiment_summary 聚合吃 2 参数、顶层仅 3 键——Task8 关键点明确。
 5. 投影"不下发"字段(runtime_flag/experiment_envelope 的 id、threshold_override/audit 的 workspaceId/accountId)——各 task Step3 核对明确 fixture 应无这些键。
 
-**键数核对预期**(以 fixture 为最终真相源):runtime_flag 7 / threshold_override 8 / threshold_override_audit 10 / experiment_envelope 14 / proposal_summary 14 / shadow_replay 15 / proposal_detail 28 / experiment_summary 3。
+**键数核对预期**(以 fixture 为最终真相源):runtime_flag 7 / threshold_override 8 / threshold_override_audit 10 / experiment_envelope 14 / proposal_summary 14 / shadow_replay 15 / proposal_detail 29 / experiment_summary 3。
 
