@@ -1,0 +1,46 @@
+{
+  "askHumanPolicy": {
+    "dailyPushCap": 10,
+    "deciderChain": [
+      {
+        "displayName": "张总",
+        "wxid": "wxid_leader"
+      }
+    ],
+    "dedupeWindowHours": 6.0,
+    "escalateAiPolicyHold": false,
+    "escalateSafetyGuard": true,
+    "escalateStuck": true,
+    "escalateUnverifiedProduct": true,
+    "quietHours": {
+      "endHour": 8,
+      "startHour": 22,
+      "tzOffsetHours": 8
+    },
+    "timeoutHours": 24.0
+  },
+  "assistModeEnabled": false,
+  "automationPolicy": "高风险静默 hold",
+  "currentVersion": true,
+  "domain": "user_operations",
+  "goal": "把新客养成签约客户",
+  "id": "507f1f77bcf86cd799439011",
+  "methodology": "FAB + 顾问式销售",
+  "name": "私域用户运营",
+  "previousVersion": 1,
+  "reviewPolicy": "独立复核 + 一次重写",
+  "runtimeParameters": {
+    "dailyCap": 20,
+    "minIntervalSeconds": 60
+  },
+  "seededBy": "system",
+  "stateMachine": {
+    "states": "new_contact,need_discovery"
+  },
+  "status": "active",
+  "toolPolicy": "知识库优先,无依据不报价",
+  "updatedAt": "2023-11-14T22:13:20Z",
+  "version": 2,
+  "workflow": "破冰→需求挖掘→方案→促单",
+  "workspaceId": "ws-1"
+}
