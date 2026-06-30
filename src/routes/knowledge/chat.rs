@@ -1665,7 +1665,7 @@ fn resolve_quote_anchors(statement: &str, patch_quote: Option<&str>) -> QuoteAnc
     }
 }
 
-async fn apply_create_chunk(
+pub async fn apply_create_chunk(
     state: &AppState,
     workspace_id: &str,
     account_id: Option<&str>,

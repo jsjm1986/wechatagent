@@ -30,7 +30,8 @@ mod verify;
 mod import;
 mod catalog;
 mod repair;
-mod chat;
+// pub:knowledge_chat_apply_integration.rs 集成测试需从 tests/ 直调 apply_create_chunk。
+pub mod chat;
 mod digest_inbox;
 mod wiki_edit;
 mod sources_meta;

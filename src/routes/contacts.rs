@@ -678,14 +678,14 @@ pub(super) async fn update_custom_agent_instructions(
 }
 
 #[derive(serde::Deserialize)]
-pub(super) struct ManualTagsRequest {
+pub struct ManualTagsRequest {
     pub tags: Vec<String>,
 }
 
 /// `PUT /api/contacts/:id/manual-tags`
 ///
 /// 运营录入标签（运营权威层）。自由文本，去空白去重，AI 永不覆盖本字段。
-pub(super) async fn update_manual_tags(
+pub async fn update_manual_tags(
     State(state): State<AppState>,
     Extension(admin): Extension<AuthenticatedAdmin>,
     Path(id): Path<String>,
@@ -715,7 +715,7 @@ pub(super) async fn update_manual_tags(
 }
 
 /// 去首尾空白、去空串、去重保序。自由文本，不查字典（设计选择）。
-pub(crate) fn normalize_manual_tags(raw: &[String]) -> Vec<String> {
+pub fn normalize_manual_tags(raw: &[String]) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     for t in raw {
         let s = t.trim();
@@ -727,14 +727,14 @@ pub(crate) fn normalize_manual_tags(raw: &[String]) -> Vec<String> {
 }
 
 /// 单标签字符上限。运营自由文本，但需兜底防超长标签膨胀 reply prompt。
-pub(crate) const MANUAL_TAG_MAX_CHARS: usize = 64;
+pub const MANUAL_TAG_MAX_CHARS: usize = 64;
 /// 标签条数上限。
-pub(crate) const MANUAL_TAGS_MAX_COUNT: usize = 32;
+pub const MANUAL_TAGS_MAX_COUNT: usize = 32;
 
 /// 尺寸兜底校验（与 custom_agent_instructions 的 1000 字符上限同纪律）：
 /// manual_tags 经 render_tags_for_prompt join 进 reply prompt，无上限会膨胀 token。
 /// 入参须为已 normalize 的标签。
-pub(crate) fn validate_manual_tags(tags: &[String]) -> Result<(), AppError> {
+pub fn validate_manual_tags(tags: &[String]) -> Result<(), AppError> {
     if tags.len() > MANUAL_TAGS_MAX_COUNT {
         return Err(AppError::BadRequest(format!(
             "manual_tags 条数上限 {MANUAL_TAGS_MAX_COUNT} 个"

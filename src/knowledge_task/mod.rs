@@ -428,13 +428,13 @@ pub async fn run_task(
     Ok(())
 }
 
-struct StepOutcome {
-    chunk_id: Option<String>,
-    message: String,
+pub struct StepOutcome {
+    pub chunk_id: Option<String>,
+    pub message: String,
 }
 
 /// 执行单个 step；不同 action 走不同 fail-soft 路径，但都不写 verified、不发送 outbox。
-async fn execute_step(
+pub async fn execute_step(
     _state: &AppState,
     _workspace_id: &str,
     _account_id: &str,
