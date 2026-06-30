@@ -861,7 +861,27 @@ pub(super) fn build_guide_preview_prompt(
     playbook: Option<&OperationPlaybook>,
     review: Option<&AgentDecisionReview>,
     health: &Value,
+    legal_states: &[String],
+    stage_values: &[(String, String)],
+    intent_values: &[(String, String)],
 ) -> String {
+    let render_states = if legal_states.is_empty() {
+        "暂无受控取值,留空此字段(不要臆造)".to_string()
+    } else {
+        legal_states.join(" / ")
+    };
+    let render_pairs = |vals: &[(String, String)]| -> String {
+        if vals.is_empty() {
+            "暂无受控取值,留空此字段(不要臆造)".to_string()
+        } else {
+            vals.iter()
+                .map(|(id, label)| format!("{id}({label})"))
+                .collect::<Vec<_>>()
+                .join(" / ")
+        }
+    };
+    let render_stages = render_pairs(stage_values);
+    let render_intents = render_pairs(intent_values);
     format!(
         r#"请为微信用户运营 Agent 生成一份“修改预览”，不要直接输出聊天话术。
 
@@ -946,7 +966,12 @@ wxid：{}
 
 最近复盘：{}
 
-当前健康度：{}"#,
+当前健康度：{}
+
+可选枚举字段的合法取值(只能从下列里选,留空表示不改;绝不能臆造下列以外的值):
+- operationState 合法值：{}
+- customerStage 合法值：{}
+- intentLevel 合法值：{}"#,
         mode,
         instruction,
         contact.wxid,
@@ -964,7 +989,10 @@ wxid：{}
         review
             .and_then(|item| item.review_summary.clone())
             .unwrap_or_else(|| "暂无".to_string()),
-        serde_json::to_string(health).unwrap_or_default()
+        serde_json::to_string(health).unwrap_or_default(),
+        render_states,
+        render_stages,
+        render_intents
     )
 }
 
