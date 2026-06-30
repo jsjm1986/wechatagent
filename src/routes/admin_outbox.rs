@@ -445,4 +445,42 @@ mod tests {
         let bad = DateTime::parse_rfc3339_str("not a date");
         assert!(bad.is_err());
     }
+
+    /// 契约快照:outbox_entry_json。OutboxEntry 25 字段全量构造(各 Option 给 Some;decision_id
+    /// 给 Some 暴露 decisionId hex 形状;3 个 Option<DateTime> 给 Some);id→Option.map(to_hex)
+    /// .unwrap_or_default(),decisionId→Option.map(to_hex)(None 则 null);必填 DateTime→dt_to_string,
+    /// 可选 DateTime→and_then。投影下发 22 顶层键(漏发 mediaAssetId/referralCardId/reclaimedInFlight)。
+    #[test]
+    fn outbox_entry_json_matches_contract_fixture() {
+        use mongodb::bson::{oid::ObjectId, DateTime};
+        let entry = OutboxEntry {
+            id: Some(ObjectId::parse_str("507f1f77bcf86cd799439011").unwrap()),
+            workspace_id: "ws-1".to_string(),
+            account_id: "acc-1".to_string(),
+            contact_wxid: "wxid_alice".to_string(),
+            run_id: "run-001".to_string(),
+            decision_id: Some(ObjectId::parse_str("507f1f77bcf86cd799439012").unwrap()),
+            source_event_id: "evt-001".to_string(),
+            source_kind: "inbound_message".to_string(),
+            content: "您好,已收到您的咨询".to_string(),
+            content_hash: "abc123".to_string(),
+            idempotency_key: "idem-001".to_string(),
+            media_asset_id: Some("asset-1".to_string()),
+            referral_card_id: Some("card-1".to_string()),
+            attempt: 1,
+            max_attempts: 3,
+            status: "pending".to_string(),
+            cancel_reason: Some("无".to_string()),
+            last_error: Some("无".to_string()),
+            next_retry_at: Some(DateTime::from_millis(1_700_000_200_000)),
+            worker_id: Some("worker-1".to_string()),
+            locked_until: Some(DateTime::from_millis(1_700_000_300_000)),
+            reclaimed_in_flight: false,
+            created_at: DateTime::from_millis(1_700_000_000_000),
+            updated_at: DateTime::from_millis(1_700_000_100_000),
+            sent_at: Some(DateTime::from_millis(1_700_000_400_000)),
+        };
+        let value = outbox_entry_json(&entry);
+        crate::routes::contract_snapshot::assert_contract_fixture("outbox_entry", value);
+    }
 }
