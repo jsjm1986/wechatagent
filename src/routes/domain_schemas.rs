@@ -509,7 +509,7 @@ fn validate_schema_payload(
 }
 
 /// universal-domain-adaptation D1-b：加载某 workspace 当前 active 的 `DomainSchema`
-/// （`isActive=true`，每 workspace 至多一条，见 activate 路由维持的不变量）。无 active
+/// （`is_active=true`，每 workspace 至多一条，见 activate 路由维持的不变量）。无 active
 /// schema（DEFAULT / 未配置行业 schema 的 workspace）返回 `None` → 写侧据此 no-op 直通。
 /// DB 错误向上传播（与 chunk 写入同事务语义，配置错误不应被静默吞掉）。
 pub async fn load_active_domain_schema(
