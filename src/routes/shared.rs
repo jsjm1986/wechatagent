@@ -2091,4 +2091,125 @@ mod tests {
         let projected = operation_health_json(&contact, &memory, Some(&review));
         crate::routes::contract_snapshot::assert_contract_fixture("operation_health", projected);
     }
+
+    /// Task 5：build_guide_preview_prompt 注入合法值文本契约。
+    #[test]
+    fn guide_prompt_injects_legal_values() {
+        use super::build_guide_preview_prompt;
+        use crate::models::{AgentStatus, Contact, MemoryCardTyped, OperatingMemory};
+        use mongodb::bson::{DateTime, Document};
+
+        // build_guide_preview_prompt 只读 Contact 的少数字段;Contact 无 Default,全字段构造。
+        let contact = Contact {
+            id: None,
+            workspace_id: "default".to_string(),
+            account_id: "default".to_string(),
+            wxid: "wx_prompt".to_string(),
+            nickname: None,
+            remark: None,
+            alias: None,
+            agent_status: AgentStatus::Managed,
+            human_profile_note: None,
+            custom_agent_instructions: None,
+            operation_mode_override: None,
+            agent_profile: None,
+            memory_summary: None,
+            playbook_id: None,
+            playbook_version: None,
+            manual_tags: Vec::new(),
+            manual_tags_updated_at: None,
+            manual_tags_by: None,
+            confirmed_tags: Vec::new(),
+            bayesian_signals: Vec::new(),
+            personality_profile: None,
+            tags_version: 0,
+            domain_attributes: None,
+            domain_attributes_updated_at: None,
+            commitments: Vec::new(),
+            follow_up_policy: None,
+            operation_state: Some("new_contact".to_string()),
+            operation_state_reason: None,
+            operation_state_confidence: None,
+            operation_state_updated_at: None,
+            cooldown_until: None,
+            operation_policy: Document::new(),
+            profile_attributes: Document::new(),
+            profile_updated_at: None,
+            last_message_at: None,
+            last_inbound_at: None,
+            last_outbound_at: None,
+            last_agent_run_at: None,
+            last_outbound_style: None,
+            intent_trajectory: Vec::new(),
+            outcome_events: Vec::new(),
+            locale: None,
+            created_at: DateTime::now(),
+            updated_at: DateTime::now(),
+        };
+        let memory = OperatingMemory {
+            id: None,
+            workspace_id: "default".to_string(),
+            account_id: "default".to_string(),
+            contact_wxid: "wx_prompt".to_string(),
+            user_understanding: Document::new(),
+            relationship_state: Document::new(),
+            product_fit: Document::new(),
+            next_action: Document::new(),
+            context_pack: Document::new(),
+            context_pack_version: 0,
+            context_pack_updated_at: None,
+            memory_card: MemoryCardTyped::default(),
+            memory_card_version: 0,
+            memory_card_updated_at: None,
+            created_at: DateTime::now(),
+            updated_at: DateTime::now(),
+        };
+        let health = serde_json::json!({});
+
+        // 有合法值:输出含状态机 key + 字典中文标签 + "合法值"字样。
+        let legal_states = vec!["new_contact".to_string(), "need_discovery".to_string()];
+        let stage_values = vec![
+            ("new_contact".to_string(), "初始了解".to_string()),
+            ("need_discovery".to_string(), "需求探索".to_string()),
+        ];
+        let intent_values = vec![
+            ("high".to_string(), "高意向".to_string()),
+            ("low".to_string(), "低意向".to_string()),
+        ];
+        let prompt = build_guide_preview_prompt(
+            "标记成高意向",
+            "smart",
+            &contact,
+            &memory,
+            None,
+            None,
+            &health,
+            &legal_states,
+            &stage_values,
+            &intent_values,
+        );
+        assert!(prompt.contains("合法值"), "应注入'合法值'引导段");
+        assert!(prompt.contains("need_discovery"), "应含状态机/字典 canonical key");
+        assert!(prompt.contains("高意向"), "应含字典中文标签");
+
+        // 空切片:输出"暂无受控取值"兜底,不 panic。
+        let empty: Vec<String> = vec![];
+        let empty_pairs: Vec<(String, String)> = vec![];
+        let prompt_empty = build_guide_preview_prompt(
+            "标记成高意向",
+            "smart",
+            &contact,
+            &memory,
+            None,
+            None,
+            &health,
+            &empty,
+            &empty_pairs,
+            &empty_pairs,
+        );
+        assert!(
+            prompt_empty.contains("暂无受控取值"),
+            "空字典应输出'暂无受控取值'兜底"
+        );
+    }
 }
