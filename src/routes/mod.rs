@@ -47,7 +47,7 @@ mod contract_snapshot;
 // publish/update/rollout/rollback handler 真函数（覆盖 realign + $set 部分更新），仿
 // guide_profile 已有先例。生产路由注册仍走下方 use。
 pub mod domain_profiles;
-pub(crate) mod domain_schemas;
+pub mod domain_schemas;
 pub mod domains;
 mod evaluations;
 mod events;
