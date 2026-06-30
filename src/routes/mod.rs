@@ -1141,6 +1141,10 @@ mod tests {
             // publish_state_machine_version / rollout / rollback / domains.rs 直编路由复用，
             // 不直接绑 HTTP。
             "reconcile_state_policies_for_machine",
+            // knowledge/chat.rs：chat_apply 落库内核（强制 draft+needs_review），被
+            // chat_turn / chat_task 复用、不直接绑 HTTP；knowledge_chat_apply_integration.rs
+            // 通过 `pub` 直调断言"AI 永不自动 verify"红线。
+            "apply_create_chunk",
         ];
 
         let mut handlers: Vec<&str> = Vec::new();
