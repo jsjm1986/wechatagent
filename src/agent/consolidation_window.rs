@@ -45,6 +45,7 @@ mod tests {
             msg_type: None,
             media_ref: None,
             raw: None,
+            is_synthetic_relay: false,
             created_at: mongodb::bson::DateTime::from_millis(ms),
         }
     }

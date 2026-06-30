@@ -352,6 +352,7 @@ async fn r2_5_1_quiet_hours_wake_reply_real() {
             msg_type: None,
             media_ref: None,
             raw: None,
+            is_synthetic_relay: false,
             created_at: DateTime::now(),
         };
         state.db.messages().insert_one(&msg, None).await.expect("insert inbound");

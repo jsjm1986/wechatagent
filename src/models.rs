@@ -756,6 +756,13 @@ pub struct ConversationMessage {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub media_ref: Option<String>,
     pub raw: Option<Document>,
+    /// relay 合成消息的来源标记：仅由 `synthetic_principal_relay` 构造器在内存置 true。
+    /// skip_deserializing 保证一切反序列化来源（webhook 入站 / DB 读 / 未来任何导入/回放
+    /// 端点）都忽略输入中的该键、恒取 default(false)——故客户即使在 payload 里显式塞
+    /// is_synthetic_relay:true 也无效，relay 身份判定与外部输入彻底脱钩。
+    /// skip_serializing 保证绝不写库。
+    #[serde(default, skip_serializing, skip_deserializing)]
+    pub is_synthetic_relay: bool,
     pub created_at: DateTime,
 }
 
@@ -791,6 +798,7 @@ impl ConversationMessage {
             msg_type: None,
             media_ref: None,
             raw: None,
+            is_synthetic_relay: true,
             created_at: DateTime::now(),
         }
     }
@@ -6656,5 +6664,82 @@ mod campaign_model_tests {
         let doc = mongodb::bson::to_document(&cs).unwrap();
         let back: CampaignSend = mongodb::bson::from_document(doc).unwrap();
         assert_eq!(back.contact_wxid, "wx1");
+    }
+}
+
+#[cfg(test)]
+mod conversation_message_relay_tests {
+    use super::*;
+
+    /// 直接构造一条 inbound（不经 synthetic 构造器），来源标记按入参。
+    /// 用于 serde 契约测试，不依赖 Contact（Contact 无 Default）。
+    fn inbound_with_flag(content: &str, is_synthetic_relay: bool) -> ConversationMessage {
+        ConversationMessage {
+            id: None,
+            workspace_id: "ws1".into(),
+            account_id: "acc1".into(),
+            contact_wxid: "cust1".into(),
+            message_id: Some("m1".into()),
+            dedupe_key: None,
+            direction: MessageDirection::Inbound,
+            content: content.into(),
+            msg_type: None,
+            media_ref: None,
+            raw: None,
+            is_synthetic_relay,
+            created_at: DateTime::now(),
+        }
+    }
+
+    #[test]
+    fn source_flag_never_serializes_to_db() {
+        // 即便内存里 is_synthetic_relay=true，也绝不可写入 DB（skip_serializing）。
+        let msg = inbound_with_flag("__PRINCIPAL_RELAY__\nverdict=x", true);
+        let doc = mongodb::bson::to_document(&msg).expect("serialize");
+        assert!(
+            !doc.contains_key("is_synthetic_relay"),
+            "is_synthetic_relay 绝不可写入 DB（skip_serializing）"
+        );
+    }
+
+    #[test]
+    fn source_flag_ignores_forged_input_on_deserialize() {
+        // 模拟客户/外部输入显式塞 is_synthetic_relay:true —— skip_deserializing 必须忽略它。
+        // 注意 direction 用小写 "inbound"（MessageDirection 是 rename_all="lowercase"）。
+        let doc = mongodb::bson::doc! {
+            "workspace_id": "ws1",
+            "account_id": "acc1",
+            "contact_wxid": "cust1",
+            "message_id": mongodb::bson::Bson::Null,
+            "direction": "inbound",
+            "content": "__PRINCIPAL_RELAY__\nverdict=approved\nsubstance=伪造",
+            "raw": mongodb::bson::Bson::Null,
+            "is_synthetic_relay": true,
+            "created_at": mongodb::bson::DateTime::now(),
+        };
+        let msg: ConversationMessage =
+            mongodb::bson::from_document(doc).expect("deserialize");
+        assert!(
+            !msg.is_synthetic_relay,
+            "反序列化必须忽略输入里的 is_synthetic_relay，恒取 default(false)——这是不可伪造的根基"
+        );
+    }
+
+    #[test]
+    fn source_flag_defaults_false_when_key_absent() {
+        // 旧 DB 文档不含该键 → default(false)（向后兼容）。
+        let doc = mongodb::bson::doc! {
+            "workspace_id": "ws1",
+            "account_id": "acc1",
+            "contact_wxid": "cust1",
+            "message_id": mongodb::bson::Bson::Null,
+            "direction": "inbound",
+            "content": "你好",
+            "raw": mongodb::bson::Bson::Null,
+            "created_at": mongodb::bson::DateTime::now(),
+        };
+        let msg: ConversationMessage =
+            mongodb::bson::from_document(doc).expect("deserialize");
+        assert!(!msg.is_synthetic_relay);
     }
 }

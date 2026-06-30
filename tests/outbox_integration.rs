@@ -1080,6 +1080,7 @@ async fn account_pacing_gate_end_to_end_via_gateway() {
         msg_type: None,
         media_ref: None,
         raw: None,
+        is_synthetic_relay: false,
         created_at: DateTime::now(),
     };
     state
