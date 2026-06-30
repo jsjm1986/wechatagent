@@ -155,7 +155,20 @@ pub(super) async fn apply_user_operation_guide(
         )
         .await?
         .ok_or_else(|| AppError::NotFound("contact not found".to_string()))?;
-    apply_contact_changes(&state, &contact, &preview.suggested_changes).await?;
+    let skipped = apply_contact_changes(&state, &contact, &preview.suggested_changes).await?;
+    // appliedFields = suggestedChanges 顶层键 - 被跳过的字段(给前端"已应用 N 项"用)。
+    let skipped_names: std::collections::HashSet<&str> =
+        skipped.iter().map(|s| s.field.as_str()).collect();
+    let applied_fields: Vec<String> = preview
+        .suggested_changes
+        .keys()
+        .filter(|k| !skipped_names.contains(k.as_str()))
+        .cloned()
+        .collect();
+    let skipped_json: Vec<Value> = skipped
+        .iter()
+        .map(|s| json!({ "field": s.field, "reason": s.reason }))
+        .collect();
     apply_memory_changes(&state, &contact, &preview.suggested_changes).await?;
     apply_playbook_changes(&state, &contact, &preview.suggested_changes).await?;
     apply_domain_changes(&state, &admin.current_workspace, &preview.suggested_changes).await?;
@@ -186,7 +199,8 @@ pub(super) async fn apply_user_operation_guide(
                     "impactScope": preview.impact_scope,
                     "scopeReason": preview.scope_reason,
                     "readableChanges": preview.readable_changes,
-                    "suggestedChanges": preview.suggested_changes
+                    "suggestedChanges": preview.suggested_changes,
+                    "skippedFields": mongodb::bson::to_bson(&skipped_json).unwrap_or(mongodb::bson::Bson::Array(vec![]))
                 }),
                 created_at: DateTime::now(),
                 dedupe_key: None,
@@ -207,7 +221,9 @@ pub(super) async fn apply_user_operation_guide(
         "item": {
             "contact": ApiContact::from(updated_contact),
             "operatingMemory": operating_memory_json(memory),
-            "health": health
+            "health": health,
+            "appliedFields": applied_fields,
+            "skippedFields": skipped_json
         }
     })))
 }
