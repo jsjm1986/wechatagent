@@ -94,7 +94,7 @@ pub(crate) fn is_workspace_authorized(
 
 ## 4. 核心单元二：DB 包装 `resolve_authorized_workspace`
 
-落点：`src/routes/shared.rs`（已是 fail-closed workspace 辅助函数之家：`validate_account:126`、`find_contact_by_id:155`）。
+落点：`src/routes/shared.rs`（已是 fail-closed workspace 辅助函数之家：`validate_account:126`、`find_contact_by_id:155`）。shared.rs 顶部已 import `AppError` / `AppResult` / `AppState`；实现时需补 `use crate::auth::session::get_admin_user;` 与 `use crate::auth::is_workspace_authorized;`（或全路径引用）。
 
 ```rust
 /// 解析请求的目标 workspace 并校验 ∈ admin ACL。
@@ -110,11 +110,18 @@ pub(super) async fn resolve_authorized_workspace(
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| admin.current_workspace.clone());
 
+    // get_admin_user 返回 Result<Option<AdminUser>, AuthError>（不是 AppResult）。
+    // AuthError 无 From<AppError>，故不能裸 `?`；这里只会发生 AuthError::Mongo
+    // （函数体仅一次 find_one），映射成 AppError::Db 与既有错误语义一致。
     let user = get_admin_user(&state.db, &admin.user_id)
-        .await?
+        .await
+        .map_err(|e| match e {
+            crate::auth::session::AuthError::Mongo(err) => AppError::Db(err),
+            other => AppError::External(format!("admin lookup: {other}")),
+        })?
         .ok_or_else(|| AppError::Unauthorized("admin_user_not_found".into()))?;
 
-    if !crate::auth::is_workspace_authorized(
+    if !is_workspace_authorized(
         &resolved,
         &user.workspaces,
         &state.config.default_workspace_id,
@@ -124,6 +131,11 @@ pub(super) async fn resolve_authorized_workspace(
     Ok(resolved)
 }
 ```
+
+> **错误映射注意（实现阶段核对）：** `get_admin_user` 的错误类型是 `auth::session::AuthError`，**不是** `AppError`，所以**不能**裸 `?`（`switch_workspace` 因此用了私有 `map_auth_error`）。`map_auth_error` 是 `routes/auth.rs` 的私有 fn，shared.rs 取不到。两条路可选，实现时择一：
+> - **(a) 内联 map_err**（上方代码所示）：`get_admin_user` 体内只有一次 `find_one`，唯一可能的 `AuthError` 变体是 `Mongo(_)`，映射到 `AppError::Db` 即可；
+> - **(b) 把 `map_auth_error` 提为 `pub(crate)`** 并移到可共享位置（如 `auth/mod.rs`），shared.rs 与 auth.rs 共用——更 DRY，但改动面略大。
+> 推荐 (a)，blast radius 更小；最终以实现阶段读 `AuthError` 定义确认变体集合为准。注意 `AuthError` 当前是否 `pub` 也需核对（若非 pub 需配合 (b)）。
 
 **错误模型复用既有码（AppError 无 Forbidden 变体）：**
 - 越权 → `BadRequest("workspace_not_in_user_acl")`（HTTP 400），与 `switch_workspace` 拒绝时同字符串。
