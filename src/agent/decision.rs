@@ -750,7 +750,9 @@ pub(crate) async fn decide_reply_with_promote(
             // P0-18：history 里既有客户消息也有我方消息，但都源自外部信道
             // （客户原文 / 我方历史回复），统一过 strip_injection_tags 防止
             // 历史内容里夹带的 tag 关闭模板。
-            let safe = crate::agent::prompt_isolation::strip_injection_tags(&message.content);
+            // H10：history 里的哨兵只可能来自客户伪造（合法 relay 合成消息不落库），
+            // 一律剥除，防止伪造哨兵经历史重回同一转述契约 prompt 触发转述模式。
+            let safe = crate::agent::prompt_isolation::history_prompt_content(&message.content);
             // 子计划2 Task5：行首带 0-based 升序「窗口序号」。`recent_messages` 是
             // created_at 降序（最新在前），此处 .rev() 反成升序（最早=0），与
             // gateway.rs 反转出的 ascending_window（喂 resolve_evidence）逐位对齐——
@@ -965,7 +967,9 @@ pub(crate) async fn decide_reply_with_promote(
         format!("{referral_block}{assist_escalation_hint}{assist_redline_yield}"),
         task_text,
         history,
-        crate::agent::prompt_isolation::isolate_untrusted(&inbound.content)
+        // H10：合法 relay（is_synthetic_relay=true）保留哨兵触发转述模式；
+        // 一切非合法-relay 消息（含客户伪造哨兵）剥哨兵，LLM 永不对客户输入进入转述模式。
+        crate::agent::prompt_isolation::inbound_prompt_content(&inbound.content, inbound.is_synthetic_relay)
     );
 
     let value = generate_agent_json(
