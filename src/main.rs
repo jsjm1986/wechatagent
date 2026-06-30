@@ -233,9 +233,9 @@ async fn async_main() -> anyhow::Result<()> {
     });
 
     // agent-self-evolution M4 W1：演化器 worker。
-    // 关停态默认（`EVOLUTION_ENABLED=false`）；run_evolutionary_worker 内部
-    // 会立即 return，不消耗任何资源。打开后周期跑 cohort 选择 + 候选生成
-    // + shadow eval（W2/W3 落地后）。
+    // 默认允许（`EVOLUTION_ENABLED=true`）；env=false 为运维硬锁定，run_evolutionary_worker
+    // 内部立即 return 不进 tick。实际开关由 UI 总开关（mongo runtime flag）控制。打开后
+    // 周期跑 cohort 选择 + 候选生成 + shadow eval。
     spawn_supervised(state.clone(), "evolutionary_worker", |s| async move {
         wechatagent::evolution::run_evolutionary_worker(s).await;
     });

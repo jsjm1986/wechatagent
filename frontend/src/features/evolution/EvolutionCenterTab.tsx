@@ -166,17 +166,20 @@ export function EvolutionCenterTab({ enabled = true }: { enabled?: boolean }) {
   const [rollout, setRollout] = useState<string>("0");
   const [flagBusy, setFlagBusy] = useState(false);
   const [flagMsg, setFlagMsg] = useState<string>("");
+  const [flagError, setFlagError] = useState<string>("");
 
   async function loadFlag() {
     setFlagBusy(true);
     setFlagMsg("");
+    setFlagError("");
     try {
       const resp = await apiGet<RuntimeFlagResponse>("/api/evolution/runtime-flag");
       setEnvAllowed(resp.envEvolutionEnabled !== false); // 缺省按允许；显式 false 才硬锁
       setFlagEnabled(Boolean(resp.flag?.enabled ?? false));
       setRollout(String(resp.flag?.rolloutPercent ?? 0));
     } catch (e) {
-      setFlagMsg(e instanceof Error ? e.message : String(e));
+      // 拉取失败必须落到可见错误态，否则 envAllowed 永远 null → 卡在"加载中"且错误无处显示。
+      setFlagError(e instanceof Error ? e.message : String(e));
     } finally {
       setFlagBusy(false);
     }
@@ -287,6 +290,18 @@ export function EvolutionCenterTab({ enabled = true }: { enabled?: boolean }) {
     );
   }
   if (envAllowed === null) {
+    if (flagError) {
+      return (
+        <div className={styles.disabled} data-testid="evolution-flag-error">
+          <div className={styles.error} role="alert">
+            读取演化中心开关失败：{flagError}
+          </div>
+          <button className={styles.btnGhost} onClick={() => void loadFlag()} disabled={flagBusy}>
+            重试
+          </button>
+        </div>
+      );
+    }
     return (
       <div className={styles.disabled} data-testid="evolution-flag-loading">
         加载中…

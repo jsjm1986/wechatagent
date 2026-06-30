@@ -541,4 +541,18 @@ describe("EvolutionCenterTab", () => {
       expect(body.rolloutPercent).toBe(100);
     });
   });
+
+  it("runtime-flag 拉取失败时显错误+重试,不卡在加载中", async () => {
+    // 首次 GET 失败（非 ok）→ loadFlag catch → 错误态，而非永久 envAllowed=null 卡加载中。
+    fetchMock.mockResolvedValueOnce({ ok: false, text: async () => "boom" });
+    render(<EvolutionCenterTab enabled={true} />);
+    await waitFor(() => {
+      expect(screen.getByTestId("evolution-flag-error")).toBeInTheDocument();
+    });
+    expect(screen.getByRole("alert")).toHaveTextContent("boom");
+    // 不应停在加载中占位
+    expect(screen.queryByTestId("evolution-flag-loading")).toBeNull();
+    // 有重试入口
+    expect(screen.getByText("重试")).toBeInTheDocument();
+  });
 });
