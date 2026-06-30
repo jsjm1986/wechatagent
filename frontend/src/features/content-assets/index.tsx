@@ -24,6 +24,9 @@ function kindLabel(kind: string): string {
   return kind;
 }
 
+// 禁语是安全红线，后端恒注入、无视 minInjectTier，故行内不显档位而显「恒注入」。
+const FORBIDDEN_TIER_BADGE = "恒注入";
+
 // 最低注入档 → 中文标签；缺失/未知按完整档（与后端 None=full 语义一致）。
 function tierLabel(tier?: string): string {
   switch (tier) {
@@ -260,19 +263,21 @@ export default function ContentAssetsFeature() {
                   onChange={(event) => setAssetDraft({ ...assetDraft, usageScene: event.target.value })}
                 />
               </label>
-              <label className={styles.field}>
-                <span className={styles.fieldLabel}>最低注入档</span>
-                <select
-                  className={styles.select}
-                  value={assetDraft.minInjectTier}
-                  onChange={(event) => setAssetDraft({ ...assetDraft, minInjectTier: event.target.value })}
-                >
-                  <option value="lean">精简档（任何对话都注入，最常生效）</option>
-                  <option value="relational">关系档（进入关系经营时注入）</option>
-                  <option value="full">完整档（仅深入业务时注入）</option>
-                </select>
-                <span className={styles.hint}>核心禁语/口吻选精简档时刻生效；重型话术/长 FAQ 选完整档。</span>
-              </label>
+              {assetDraft.kind !== "forbidden_expression" && (
+                <label className={styles.field}>
+                  <span className={styles.fieldLabel}>最低注入档</span>
+                  <select
+                    className={styles.select}
+                    value={assetDraft.minInjectTier}
+                    onChange={(event) => setAssetDraft({ ...assetDraft, minInjectTier: event.target.value })}
+                  >
+                    <option value="lean">精简档（任何对话都注入，最常生效）</option>
+                    <option value="relational">关系档（进入关系经营时注入）</option>
+                    <option value="full">完整档（仅深入业务时注入）</option>
+                  </select>
+                  <span className={styles.hint}>核心禁语/口吻选精简档时刻生效；重型话术/长 FAQ 选完整档。</span>
+                </label>
+              )}
               <button className={styles.submit} type="submit" disabled={busy || !assetDraft.title.trim()}>
                 保存资产
               </button>
@@ -430,7 +435,9 @@ function TextAssetRow({
         <strong className={styles.rowTitle}>{asset.title}</strong>
         <span style={{ display: "flex", gap: 6, flexShrink: 0 }}>
           <span className={styles.kind}>{kindLabel(asset.kind)}</span>
-          <span className={styles.kind}>{tierLabel(asset.minInjectTier)}</span>
+          <span className={styles.kind}>
+            {asset.kind === "forbidden_expression" ? FORBIDDEN_TIER_BADGE : tierLabel(asset.minInjectTier)}
+          </span>
         </span>
       </div>
       <p className={styles.body}>{asset.body || asset.usageScene || "暂无内容"}</p>
@@ -481,18 +488,20 @@ function TextAssetRow({
               onChange={(event) => setEditUsageScene(event.target.value)}
             />
           </label>
-          <label className={styles.field}>
-            <span className={styles.fieldLabel}>最低注入档</span>
-            <select
-              className={styles.select}
-              value={editTier}
-              onChange={(event) => setEditTier(event.target.value)}
-            >
-              <option value="lean">精简档（任何对话都注入，最常生效）</option>
-              <option value="relational">关系档（进入关系经营时注入）</option>
-              <option value="full">完整档（仅深入业务时注入）</option>
-            </select>
-          </label>
+          {asset.kind !== "forbidden_expression" && (
+            <label className={styles.field}>
+              <span className={styles.fieldLabel}>最低注入档</span>
+              <select
+                className={styles.select}
+                value={editTier}
+                onChange={(event) => setEditTier(event.target.value)}
+              >
+                <option value="lean">精简档（任何对话都注入，最常生效）</option>
+                <option value="relational">关系档（进入关系经营时注入）</option>
+                <option value="full">完整档（仅深入业务时注入）</option>
+              </select>
+            </label>
+          )}
           <button
             className={styles.reviewBtn}
             type="button"
