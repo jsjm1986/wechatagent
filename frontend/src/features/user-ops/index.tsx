@@ -16,7 +16,7 @@ import { useContactStore } from "../../stores/contactStore";
 import { useAccountStore } from "../../stores/accountStore";
 import { useUiStore } from "../../stores/uiStore";
 import { ConfirmProvider } from "../../components/ui/ConfirmDialog";
-import { usePromptSaveConfirm } from "../../components/prompt/usePromptSaveConfirm";
+import { usePromptSaveConfirm, usePromptPublishConfirm } from "../../components/prompt/usePromptSaveConfirm";
 import type {
   Contact,
   DomainKey,
@@ -177,13 +177,14 @@ function UserOpsFeatureInner() {
     editSoul,
     newSoulDraftFor,
     createPromptTemplate,
-    publishPromptTemplate,
     editPromptTemplate,
     newPromptDraftFor
   } = strategyStore;
 
   // 路径B 二次确认：prompt 保存改为组件层经此 hook 消费 store 三态。
   const runSavePrompt = usePromptSaveConfirm();
+  // publish 同款三态二次确认：needs_human_confirm / reject 弹逐字核对框 → 带 force 重提。
+  const runPublishPrompt = usePromptPublishConfirm();
 
   // 计算衍生状态
   const managedCount = useMemo(
@@ -367,7 +368,7 @@ function UserOpsFeatureInner() {
               onNewPromptTemplate={() => newPromptDraftFor("user")}
               onNewSoul={() => newSoulDraftFor("user")}
               onPromptDraft={setPromptDraft}
-              onPublishPromptTemplate={publishPromptTemplate}
+              onPublishPromptTemplate={(id) => void runPublishPrompt(id)}
               onPublishSoul={publishSoul}
               onSavePromptTemplate={(e) => { e.preventDefault(); void runSavePrompt(); }}
               onSaveSoul={(e) => { e.preventDefault(); void saveSoul(); }}
