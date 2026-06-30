@@ -34,7 +34,8 @@ pub mod ask_human_inbox;
 // crate 直调 list_content_assets handler 真函数（缺口 8 tags 检索 + workspace 隔离），
 // 仿 domain_profiles / ask_human_inbox / contacts 先例。生产路由注册仍走下方 use。
 pub mod assets;
-mod auth;
+// pub:auth_middleware_integration.rs 集成测试需从 tests/ 直调 switch_workspace handler。
+pub mod auth;
 mod behavior_signal_metrics;
 mod campaigns;
 pub mod chunk_locks;
@@ -59,7 +60,8 @@ mod guides;
 mod health;
 pub mod knowledge;
 mod lessons_learned;
-mod llm_providers;
+// pub:llm_provider_activate_integration.rs 集成测试需从 tests/ 直调 activate_provider handler。
+pub mod llm_providers;
 mod management;
 mod management_prompt_edit;
 // pub（非默认私有）：annotation_quality_gate_integration.rs 集成测试需从 tests/

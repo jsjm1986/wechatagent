@@ -122,12 +122,12 @@ pub(super) async fn me(
 }
 
 #[derive(Debug, Deserialize)]
-pub(super) struct SwitchWorkspaceRequest {
+pub struct SwitchWorkspaceRequest {
     #[serde(rename = "workspaceId")]
     pub workspace_id: String,
 }
 
-pub(super) async fn switch_workspace(
+pub async fn switch_workspace(
     State(state): State<AppState>,
     Extension(admin): Extension<AuthenticatedAdmin>,
     jar: CookieJar,
