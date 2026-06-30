@@ -188,6 +188,7 @@ pub async fn send_contact_message_gateway(
         msg_type: None,
         media_ref: None,
         raw: Some(request.source.clone()),
+        is_synthetic_relay: false,
         created_at: DateTime::now(),
     };
     let trigger = AgentTrigger::Inbound(&synthetic_inbound);
@@ -2870,6 +2871,7 @@ pub(crate) async fn send_outbound_message(
                 msg_type: None,
                 media_ref: None,
                 raw: Some(raw),
+                is_synthetic_relay: false,
                 created_at: now,
             },
             None,
@@ -2955,6 +2957,7 @@ pub(crate) fn trigger_message(
                 "taskId": task.id.map(|id| id.to_hex()).unwrap_or_default(),
                 "kind": task.kind.clone()
             }),
+            is_synthetic_relay: false,
             created_at: DateTime::now(),
         },
     }
@@ -5227,6 +5230,7 @@ mod tests {
                 msg_type: None,
                 media_ref: None,
                 raw: None,
+                is_synthetic_relay: false,
                 created_at: DateTime::now(),
             }
         }

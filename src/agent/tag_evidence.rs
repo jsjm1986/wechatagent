@@ -64,6 +64,7 @@ mod tests {
             message_id: None, dedupe_key: None,
             direction: dir, content: "x".into(),
             msg_type: None, media_ref: None, raw: None,
+            is_synthetic_relay: false,
             created_at: mongodb::bson::DateTime::from_millis(0),
         }
     }

@@ -499,6 +499,7 @@ pub async fn wechat_webhook(
         msg_type: Some(msg_type.to_string()),
         media_ref,
         raw,
+        is_synthetic_relay: false,
         created_at: DateTime::now(),
     };
     match state.db.messages().insert_one(&inbound, None).await {
@@ -1356,6 +1357,7 @@ mod debounce_tests {
             msg_type: None,
             media_ref: None,
             raw: None,
+            is_synthetic_relay: false,
             created_at: DateTime::now(),
         };
 
@@ -1388,6 +1390,7 @@ mod debounce_tests {
             msg_type: None,
             media_ref: None,
             raw: None,
+            is_synthetic_relay: false,
             created_at: DateTime::now(),
         }
     }

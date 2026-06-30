@@ -368,6 +368,7 @@ pub async fn test_knowledge_route_for_contact(
         msg_type: None,
         media_ref: None,
         raw: Some(doc! { "runMode": "knowledge_test" }),
+        is_synthetic_relay: false,
         created_at: DateTime::now(),
     };
     let memory = if has_persisted_contact {

@@ -3114,6 +3114,7 @@ mod render_window_tests {
             msg_type: None,
             media_ref: None,
             raw: None,
+            is_synthetic_relay: false,
             created_at: DateTime::from_millis(0),
         }
     }
@@ -3173,6 +3174,7 @@ mod parse_reconfirmed_tests {
             msg_type: None,
             media_ref: None,
             raw: None,
+            is_synthetic_relay: false,
             created_at: DateTime::from_millis(0),
         }
     }
@@ -3217,6 +3219,7 @@ mod parse_personality_tests {
             msg_type: None,
             media_ref: None,
             raw: None,
+            is_synthetic_relay: false,
             created_at: DateTime::from_millis(0),
         }
     }
