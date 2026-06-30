@@ -1045,7 +1045,8 @@ fn render_window_numbered(window: &[ConversationMessage]) -> String {
             };
             // 压缩重判 prompt 喂原始对话，客户原文须过注入隔离（与 decision.rs reply
             // prompt 同口径），防止对话内夹带的 tag 操纵重判 LLM 产出伪造的 confirmedTags。
-            let safe = crate::agent::prompt_isolation::strip_injection_tags(&m.content);
+            // H10：客户内容剥哨兵保持不变量(本 prompt 非转述契约,字节等价)。
+            let safe = crate::agent::prompt_isolation::history_prompt_content(&m.content);
             format!("[{i}] {speaker}: {safe}")
         })
         .collect::<Vec<_>>()
