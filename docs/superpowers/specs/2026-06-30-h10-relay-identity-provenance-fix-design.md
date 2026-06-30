@@ -69,17 +69,20 @@ pub(crate) fn is_principal_relay_trigger(trigger: &AgentTrigger<'_>) -> bool {
 
 ```rust
 /// relay 合成消息的来源标记：仅由 `synthetic_principal_relay` 构造器在内存置 true。
-/// `skip_serializing` 保证绝不写库；`default` 保证任何反序列化来源（webhook 入站 / DB 读）
-/// 恒得 false——故客户伪造 content 无法伪造此标记，relay 身份判定与 content 彻底脱钩。
-#[serde(default, skip_serializing)]
+/// skip_deserializing 保证一切反序列化来源（webhook 入站 / DB 读 / 未来任何导入/回放端点）
+/// 都忽略输入中的该键、恒取 default(false)——故客户即使在 payload 里显式塞
+/// is_synthetic_relay:true 也无效，relay 身份判定与外部输入彻底脱钩。
+/// skip_serializing 保证绝不写库。
+#[serde(default, skip_serializing, skip_deserializing)]
 pub is_synthetic_relay: bool,
 ```
 
-serde 属性是安全根基：
+serde 属性是安全根基，三个属性缺一不可（已对抗式核实 serde 语义，修正初稿的错误论证）：
+- **`skip_deserializing`**：反序列化时**忽略输入中的该键**，恒取 `default`。这是真正的不可伪造保证——`default` 单独**不够**：`default` 只在字段缺失时回落，客户显式提供 `is_synthetic_relay:true` 时 serde 会忠实读成 true。必须 `skip_deserializing` 才能让"显式提供"也失效。
 - **`skip_serializing`**：永不写入 DB（合成消息本就不落客户会话；真客户 inbound 落库也不带它）。
-- **`default`**：任何来源反序列化出的 `ConversationMessage`（webhook 入站、DB 读旧文档）该字段**恒为 false**。
+- **`default`**：`skip_deserializing` 要求字段有默认值来源，`default` 提供 false。
 
-**安全论证**：客户消息经 webhook 反序列化进来 → 该字段恒 false → 无论 content 写什么都进不了 relay 分支。伪造无从下手。
+**安全论证（双重保险）**：①架构层——webhook 入站是结构体字面量构造（`is_synthetic_relay: false` 硬编码，E0063 强制），全仓无任何客户可达的 `ConversationMessage` 反序列化点（已 grep 确认 0 个 `from_value/from_document::<ConversationMessage>`）。②serde 层——即便将来新增反序列化入口，`skip_deserializing` 也让该字段恒 false。两层独立，任一成立即不可伪造。
 
 唯一置 true 处——`synthetic_principal_relay` 构造器（models.rs:782）结构体字面量加 `is_synthetic_relay: true`。
 
@@ -145,11 +148,26 @@ pub(crate) fn is_principal_relay_trigger(trigger: &AgentTrigger<'_>) -> bool {
 
 合法 relay（标记 true）哨兵原样进 prompt，转述模式与改造前**逐字等价**，不破坏功能。
 
-#### 3.3.4 同源加固其余进 prompt 的客户内容路径
+#### 3.3.4 history 路径剥哨兵（**必须**，非可选）
 
-`inbound.content` 还经另几处 `isolate_untrusted` 进其它 prompt（已 grep 确认）：`knowledge_router.rs:479/483`、`reaction.rs:332`、`review/mod.rs:473`。这些 prompt 不含转述模式契约（不会因哨兵进转述模式），但为彻底起见，writing-plans 阶段评估是否对这些路径同样按 `is_synthetic_relay` 剥哨兵。**优先级**：decision.rs:963 是唯一承载转述模式契约的路径，**必须**改；其余为可选的一致性加固（哨兵在那些 prompt 里只是普通文本，留与不留都不触发转述，倾向于一并剥以保持"客户内容里的哨兵一律无效"的清晰不变量）。
+**这是 963 修复在多轮场景下的必要补全（对抗式核实升级，初稿误列为可选）。**
 
-history 路径（`decision.rs:751` 的 `strip_injection_tags`）：relay 合成消息**不落库**（不进 recent_messages），故 history 里出现哨兵的只可能是客户伪造，可一并剥除，安全无副作用。
+伪造哨兵的客户消息**会落库**（`webhooks.rs:504 insert_one(&inbound)`，不受身份判定修复影响），后续轮次经 `load_recent_messages`（gateway.rs:1009）进入 history 渲染（`decision.rs:739-756`）。而 history 走的 `strip_injection_tags`→`strip_known_tags` **不剥哨兵**（已核实只剥 `<<<USER_TURN>>>`/`<user>` 等四类 tag）。于是一条历史伪造哨兵消息以 `[N] 客户: __PRINCIPAL_RELAY__\nverdict=...` 形态进入**同一个**承载转述契约的 `user.reply.task` prompt。只改 963（当前 inbound）不补 history，等于把修复在"第二轮"打折。
+
+**改 `decision.rs:751`**：history 渲染对每条消息 content 剥哨兵。
+
+```rust
+// decision.rs:751 —— history 里的哨兵只可能来自客户伪造（合法 relay 合成消息不落库、
+// 不进 recent_messages），一律剥除。
+let safe = crate::agent::prompt_isolation::strip_injection_tags(&message.content)
+    .replace(crate::models::PRINCIPAL_RELAY_SENTINEL, "");
+```
+
+**安全无副作用**：合法 relay 合成消息从不落库（relay 不写 conversation_messages），故 history 永不含合法哨兵——剥除只命中客户伪造，零误伤。
+
+#### 3.3.5 其余进 prompt 的客户内容路径（可选一致性加固）
+
+`inbound.content` / 持久化消息 content 还经另几处 `isolate_untrusted` / `strip_injection_tags` 进其它 prompt（已 grep 全量确认）：`knowledge_router.rs:479/483`、`reaction.rs:332`、`review/mod.rs:473`、`memory.rs:1044`。这些 prompt **不含转述模式契约**（哨兵在其中只是惰性文本，不触发转述），故为**可选**的一致性加固——倾向一并剥哨兵以保持"客户内容里的哨兵一律无效"的清晰不变量，但非阻断项。**优先级**：decision.rs:963（当前 inbound）+ decision.rs:751（history）是仅有的两条承载转述契约的路径，**必须**改；3.3.5 列的为可选。
 
 ---
 
@@ -187,16 +205,17 @@ history 路径（`decision.rs:751` 的 `strip_injection_tags`）：relay 合成�
 
 ## 6. 改动清单（收敛后）
 
-**真改 3 处**：
-1. `src/models.rs`：`ConversationMessage` 加 `is_synthetic_relay` 字段（`#[serde(default, skip_serializing)]`）+ `synthetic_principal_relay` 构造器置 true。
-2. `src/agent/escalation/logic.rs`：`is_principal_relay_trigger` 判据改 `m.is_synthetic_relay` + 修正错误注释（删除 prompt_isolation 防护的事实错误声明）+ 调整现有单测。
+**真改 4 处**：
+1. `src/models.rs`：`ConversationMessage` 加 `is_synthetic_relay` 字段（`#[serde(default, skip_serializing, skip_deserializing)]`——三属性缺一不可，见 3.1）+ `synthetic_principal_relay` 构造器置 true。
+2. `src/agent/escalation/logic.rs`：`is_principal_relay_trigger` 判据改 `m.is_synthetic_relay` + 修正错误注释（删除 prompt_isolation 防护的事实错误声明）+ **重写现有单测 `relay_trigger_not_detected_for_normal_inbound`（logic.rs:703-710）**——当前它"用 synthetic 构造器再改 content"，改判据后该消息 `is_synthetic_relay` 仍是 true、断言会 panic；必须改成显式构造一条 `is_synthetic_relay=false` 的消息（不能复用 synthetic 构造器）。
 3. `src/agent/decision.rs:963`：拼 user prompt 时按 `inbound.is_synthetic_relay` 区别对待——合法 relay 保留哨兵，非 relay 剥哨兵（堵 LLM 层转述模式攻击面，见 3.3.3）。**注意：不是改全局 `strip_known_tags`（会误伤合法 relay，见 3.3.2）。**
+4. `src/agent/decision.rs:751`：history 渲染剥哨兵（见 3.3.4，**必须**——伪造哨兵消息落库后经 history 重回同一转述契约 prompt，是 963 修复的多轮残口；合法 relay 不落库故零误伤）。
 
-**机械补字段**：所有 `ConversationMessage { ... }` 结构体字面量构造点补 `is_synthetic_relay: false`（E0063 编译器强制，含 src + tests；`synthetic_principal_relay` 是唯一置 true 处）。
+**机械补字段**：所有 `ConversationMessage { ... }` 结构体字面量构造点补 `is_synthetic_relay: false`（E0063 编译器强制，含 src + tests；`synthetic_principal_relay` 是唯一置 true 处）。构造点清单（已核实，约 30 处）：models.rs:782(=true) / webhooks.rs:490,1347,1379 / gateway.rs:179,2861,2938,5218 / knowledge_router.rs:359 / simulation.rs:94,246 / referral.rs:146 / media_send.rs:236 / tag_evidence.rs:61 / memory.rs:2957,3016,3060 / consolidation_window.rs:36 / tests/*.rs 约 18 处。无 `..Default::default()`/From 构造（ConversationMessage 无 Default 派生）。
 
-**可选一致性加固**（writing-plans 评估）：`knowledge_router.rs:479/483`、`reaction.rs:332`、`review/mod.rs:473`、history（`decision.rs:751`）按 `is_synthetic_relay` 剥哨兵（见 3.3.4，非转述模式路径，倾向一并剥保持不变量清晰）。
+**可选一致性加固**（3.3.5，writing-plans 评估）：`knowledge_router.rs:479/483`、`reaction.rs:332`、`review/mod.rs:473`、`memory.rs:1044` 剥哨兵（非转述模式路径，倾向一并剥保持不变量清晰）。
 
-**新增测试**：5.1 安全回归 5 项（含 LLM 层：伪造哨兵客户消息进 decision prompt 时哨兵被剥）+ 5.2 调整既有单测。
+**新增测试**：5.1 安全回归 5 项（含 LLM 层：伪造哨兵客户消息进 decision prompt 时哨兵被剥）+ 5.2 调整既有单测（含 logic.rs:703 单测重写）。
 
 **不改**（自动收敛）：`gateway.rs:2985` relay-exempt、`gateway.rs:2356` 号码护栏授权源——均因调用/门控 `is_principal_relay_trigger` 自动修好。
 
@@ -205,6 +224,7 @@ history 路径（`decision.rs:751` 的 `strip_injection_tags`）：relay 合成�
 ## 7. 风险与回滚
 
 - **原"strip 误伤"风险已消解**：3.3.3 的方案在 `decision.rs:963` 按 `is_synthetic_relay` 区别对待，合法 relay 哨兵原样进 prompt、转述模式逐字等价，不再有"全局剥离误伤合法 relay"的风险（已 100% 读码验证合法 relay 与伪造消息都走 963 同一行，故必须在该行按标记分流，而非改全局 strip）。
-- **残留待办**：3.3.4 列的其余 isolate_untrusted 路径是否一并剥哨兵，留 writing-plans 评估——非转述模式路径，留与不留都不触发转述，非阻断项。
-- **回滚**：3 处改动均为局部，`is_synthetic_relay` 字段 skip_serializing 不污染 DB，回滚无数据迁移负担。
-- **向后兼容**：字段 `default` 反序列化，旧 DB 文档（虽不落该字段）读出恒 false，无兼容问题；`coreFacts` 等其他兼容契约不受影响。
+- **serde 不可伪造性已收口**：字段属性用 `skip_deserializing`（非仅 `default`）。对抗式核实发现 `default` 单独不够——客户显式提供 `is_synthetic_relay:true` 时 `default` 不防护，serde 会读成 true。今日因"无客户可达的反序列化路径"安全，但加 `skip_deserializing` 才能让标记对一切反序列化来源恒 false，消除"未来新增反序列化入口即复活 H10"的纵深脆弱。
+- **history 多轮残口已收口**：3.3.4 把 history 剥哨兵从可选升为必须——伪造哨兵消息落库后经 history 重回同一转述契约 prompt，不补则 963 修复在第二轮被打折。
+- **回滚**：4 处改动均为局部，`is_synthetic_relay` 字段 skip_serializing/skip_deserializing 不污染 DB、不读 DB，回滚无数据迁移负担。
+- **向后兼容**：字段 `skip_deserializing+default`，旧 DB 文档（不落该字段）读出恒 false；即便旧文档误含该键也被忽略，无兼容问题；`coreFacts` 等其他兼容契约不受影响。
