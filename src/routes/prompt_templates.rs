@@ -46,6 +46,15 @@ pub(super) struct PromptTemplateRequest {
     force: Option<bool>,
 }
 
+/// publish 端点可选 body：force=true 时跳过 LLM 第三闸（管理者已逐字核对），
+/// 但仍过字面双闸（禁词/锚完整性是确定性硬闸，force 不可绕）。无 body 时落 default（force=None）。
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct PublishRequest {
+    #[serde(default)]
+    force: Option<bool>,
+}
+
 pub(super) async fn list_prompt_templates(
     State(state): State<AppState>,
     Extension(admin): Extension<AuthenticatedAdmin>,
@@ -92,6 +101,11 @@ pub(super) async fn create_prompt_template(
     Json(payload): Json<PromptTemplateRequest>,
 ) -> AppResult<Json<Value>> {
     validate_prompt_template_input(&payload)?;
+    // #2 修复：create 与 update 对齐，过字面双闸（禁用词 + 锚完整性）。
+    // create 是写入全新整篇内容，对整篇过双闸语义正确；不加 LLM 第三闸
+    //（无 old 基线做 diff，且该 draft 最终须经 publish，publish 关口兜 LLM 闸）。
+    crate::routes::management_prompt_edit::validate_prompt_edit(&payload.prompt_key, &payload.content)
+        .map_err(AppError::BadRequest)?;
     let latest = state
         .db
         .prompt_templates()
@@ -227,7 +241,9 @@ pub(super) async fn publish_prompt_template(
     State(state): State<AppState>,
     Extension(admin): Extension<AuthenticatedAdmin>,
     Path(id): Path<String>,
+    body: Option<Json<PublishRequest>>,
 ) -> AppResult<Json<Value>> {
+    let force = body.and_then(|b| b.0.force).unwrap_or(false);
     let object_id = parse_object_id(&id)?;
     let template = state
         .db
@@ -241,6 +257,61 @@ pub(super) async fn publish_prompt_template(
         )
         .await?
         .ok_or_else(|| AppError::NotFound("prompt template not found".to_string()))?;
+
+    // #2 修复：publish 是 draft→active 的最终生效点，红线最该把守的关口。
+    // 闸 1+2 字面双闸（禁词 + 锚完整性），force 不可绕。
+    crate::routes::management_prompt_edit::validate_prompt_edit(
+        &template.prompt_key,
+        &template.content,
+    )
+    .map_err(AppError::BadRequest)?;
+
+    // 闸 3 LLM 语义审查（审 diff 增量）。force=true 跳过（管理者已逐字核对）。
+    if !force {
+        // old 基线 = 当前 current_version=true（回退 status=active）那条的 content；
+        // 查不到则空串（全文当增量审，与 update 加载 old 同构）。
+        let old_content = state
+            .db
+            .prompt_templates()
+            .find_one(
+                doc! {
+                    "workspace_id": &template.workspace_id,
+                    "prompt_key": &template.prompt_key,
+                    "current_version": true
+                },
+                None,
+            )
+            .await?
+            .map(|t| t.content)
+            .unwrap_or_default();
+        match crate::routes::management_prompt_edit::review_prompt_edit(
+            &state,
+            &admin.current_workspace,
+            &template.prompt_key,
+            &old_content,
+            &template.content,
+        )
+        .await
+        {
+            crate::routes::management_prompt_edit::PromptEditVerdict::Pass => {}
+            crate::routes::management_prompt_edit::PromptEditVerdict::Reject(reason) => {
+                return Err(AppError::BadRequest(format!(
+                    "红线语义审查拒绝：{reason}（确认无误可带 force 覆盖）"
+                )));
+            }
+            crate::routes::management_prompt_edit::PromptEditVerdict::NeedsHumanConfirm {
+                diff,
+                reason,
+            } => {
+                return Ok(Json(json!({
+                    "status": "needs_human_confirm",
+                    "reason": reason,
+                    "diff": diff
+                })));
+            }
+        }
+    }
+
     state
         .db
         .prompt_templates()
@@ -262,8 +333,6 @@ pub(super) async fn publish_prompt_template(
             None,
         )
         .await?;
-    // 旧的 product_claim_markers 缓存随 sales 守卫一起删除，commit 3 wiki
-    // 化以后再决定要不要在这里集中失效新的缓存层。
     let _ = template;
     Ok(Json(json!({ "ok": true })))
 }

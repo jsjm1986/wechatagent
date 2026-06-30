@@ -173,9 +173,9 @@ pub(super) async fn list_domain_schemas(
         .workspace_id
         .clone()
         .unwrap_or_else(|| admin.current_workspace.clone());
-    let mut filter = doc! { "workspaceId": &workspace_id };
+    let mut filter = doc! { "workspace_id": &workspace_id };
     if params.active_only {
-        filter.insert("isActive", true);
+        filter.insert("is_active", true);
     }
     let mut cursor = state
         .db
@@ -249,7 +249,7 @@ pub(super) async fn update_domain_schema(
         .db
         .domain_schemas()
         .find_one(
-            doc! { "workspaceId": &workspace_id, "schema_id": &schema_id },
+            doc! { "workspace_id": &workspace_id, "schema_id": &schema_id },
             FindOneOptions::builder()
                 .sort(doc! { "version": -1 })
                 .build(),
@@ -263,7 +263,7 @@ pub(super) async fn update_domain_schema(
         "name": &body.name,
         "fields": fields_bson,
         "alias_dict": alias_dict_doc,
-        "updatedAt": now,
+        "updated_at": now,
     };
     if let Some(g) = &body.guard_dsl {
         update.insert("guard_dsl", g);
@@ -274,7 +274,7 @@ pub(super) async fn update_domain_schema(
         .db
         .domain_schemas()
         .update_one(
-            doc! { "workspaceId": &workspace_id, "schema_id": &schema_id, "version": existing.version },
+            doc! { "workspace_id": &workspace_id, "schema_id": &schema_id, "version": existing.version },
             doc! { "$set": update },
             None,
         )
@@ -283,7 +283,7 @@ pub(super) async fn update_domain_schema(
         .db
         .domain_schemas()
         .find_one(
-            doc! { "workspaceId": &workspace_id, "schema_id": &schema_id, "version": existing.version },
+            doc! { "workspace_id": &workspace_id, "schema_id": &schema_id, "version": existing.version },
             None,
         )
         .await?
@@ -305,7 +305,7 @@ pub(super) async fn delete_domain_schema(
         .db
         .domain_schemas()
         .find_one(
-            doc! { "workspaceId": &workspace_id, "schema_id": &schema_id },
+            doc! { "workspace_id": &workspace_id, "schema_id": &schema_id },
             FindOneOptions::builder()
                 .sort(doc! { "version": -1 })
                 .build(),
@@ -321,7 +321,7 @@ pub(super) async fn delete_domain_schema(
         .db
         .domain_schemas()
         .delete_many(
-            doc! { "workspaceId": &workspace_id, "schema_id": &schema_id },
+            doc! { "workspace_id": &workspace_id, "schema_id": &schema_id },
             None,
         )
         .await?;
@@ -342,7 +342,7 @@ pub(super) async fn activate_domain_schema(
         .db
         .domain_schemas()
         .find_one(
-            doc! { "workspaceId": &workspace_id, "schema_id": &schema_id },
+            doc! { "workspace_id": &workspace_id, "schema_id": &schema_id },
             FindOneOptions::builder()
                 .sort(doc! { "version": -1 })
                 .build(),
@@ -355,10 +355,10 @@ pub(super) async fn activate_domain_schema(
         .domain_schemas()
         .update_many(
             doc! {
-                "workspaceId": &workspace_id,
-                "isActive": true,
+                "workspace_id": &workspace_id,
+                "is_active": true,
             },
-            doc! { "$set": { "isActive": false, "updatedAt": now } },
+            doc! { "$set": { "is_active": false, "updated_at": now } },
             None,
         )
         .await?;
@@ -367,11 +367,11 @@ pub(super) async fn activate_domain_schema(
         .domain_schemas()
         .update_one(
             doc! {
-                "workspaceId": &workspace_id,
+                "workspace_id": &workspace_id,
                 "schema_id": &schema_id,
                 "version": target.version,
             },
-            doc! { "$set": { "isActive": true, "updatedAt": now } },
+            doc! { "$set": { "is_active": true, "updated_at": now } },
             None,
         )
         .await?;
@@ -380,7 +380,7 @@ pub(super) async fn activate_domain_schema(
         .domain_schemas()
         .find_one(
             doc! {
-                "workspaceId": &workspace_id,
+                "workspace_id": &workspace_id,
                 "schema_id": &schema_id,
                 "version": target.version,
             },
@@ -403,7 +403,7 @@ async fn next_version_for(
         .db
         .domain_schemas()
         .find_one(
-            doc! { "workspaceId": workspace_id, "schema_id": schema_id },
+            doc! { "workspace_id": workspace_id, "schema_id": schema_id },
             FindOneOptions::builder()
                 .sort(doc! { "version": -1 })
                 .build(),
@@ -509,7 +509,7 @@ fn validate_schema_payload(
 }
 
 /// universal-domain-adaptation D1-b：加载某 workspace 当前 active 的 `DomainSchema`
-/// （`isActive=true`，每 workspace 至多一条，见 activate 路由维持的不变量）。无 active
+/// （`is_active=true`，每 workspace 至多一条，见 activate 路由维持的不变量）。无 active
 /// schema（DEFAULT / 未配置行业 schema 的 workspace）返回 `None` → 写侧据此 no-op 直通。
 /// DB 错误向上传播（与 chunk 写入同事务语义，配置错误不应被静默吞掉）。
 pub async fn load_active_domain_schema(
@@ -519,7 +519,7 @@ pub async fn load_active_domain_schema(
     let found = db
         .domain_schemas()
         .find_one(
-            doc! { "workspaceId": workspace_id, "isActive": true },
+            doc! { "workspace_id": workspace_id, "is_active": true },
             None,
         )
         .await?;

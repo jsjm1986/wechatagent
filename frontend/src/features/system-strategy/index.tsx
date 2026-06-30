@@ -8,7 +8,7 @@ import type { AgentSoul, PromptTemplate, PromptTemplateDraft, DomainProfile, Dom
 import { ProfilePublishCard } from "../../components/review/ProfilePublishCard";
 import { LessonPromoteCard } from "../../components/review/LessonPromoteCard";
 import { ConfirmProvider } from "../../components/ui/ConfirmDialog";
-import { usePromptSaveConfirm } from "../../components/prompt/usePromptSaveConfirm";
+import { usePromptSaveConfirm, usePromptPublishConfirm } from "../../components/prompt/usePromptSaveConfirm";
 import { ToastProvider } from "../../components/ui/Toast";
 import styles from "./SystemStrategy.module.css";
 
@@ -2630,7 +2630,6 @@ function SystemStrategyInner() {
     saveSoul,
     publishSoul,
     createPromptTemplate,
-    publishPromptTemplate,
     resetSystemPromptPack,
     editSoul,
     newSoulDraftFor,
@@ -2640,6 +2639,8 @@ function SystemStrategyInner() {
 
   // 路径B 二次确认：savePromptTemplate 改为组件层经此 hook 消费三态（needs_human_confirm / reject）。
   const runSavePrompt = usePromptSaveConfirm();
+  // publish 同款三态二次确认：needs_human_confirm / reject 弹逐字核对框 → 带 force 重提。
+  const runPublishPrompt = usePromptPublishConfirm();
 
   useEffect(() => {
     void loadStrategyData();
@@ -2718,7 +2719,7 @@ function SystemStrategyInner() {
         onNewPromptTemplate={() => newPromptDraftFor("management")}
         onNewSoul={() => newSoulDraftFor("management")}
         onPromptDraft={setPromptDraft}
-        onPublishPromptTemplate={(id) => void publishPromptTemplate(id)}
+        onPublishPromptTemplate={(id) => void runPublishPrompt(id)}
         onPublishSoul={(id) => void publishSoul(id)}
         onSavePromptTemplate={handleSavePromptTemplate}
         onSaveSoul={handleSaveSoul}
