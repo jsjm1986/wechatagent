@@ -460,9 +460,50 @@ function ProductClaimMarkersTabInner() {
         if (ok) await save(true);
         return;
       }
-      await api.post(`/api/prompt-templates/${template.id}/publish`);
-      setStatusMsg("已发布，Rust 端缓存已失效；下一次 review 即生效。");
-      await load();
+      // publish 独立三态流：publish 可能在 update 通过后仍被 publish 自己的 LLM 闸拦。
+      // 用独立 try/catch + 内联 {force:true} 重发（不再重走 save(true)，避免 double-PUT/死循环）。
+      const doPublish = async (publishForce?: boolean): Promise<void> => {
+        try {
+          const pubResp = await api.post<{ status?: string; reason?: string; diff?: string }>(
+            `/api/prompt-templates/${template.id}/publish`,
+            publishForce ? { force: true } : {}
+          );
+          if (pubResp && pubResp.status === "needs_human_confirm") {
+            setSaving(false);
+            const ok = await confirm({
+              title: "发布前需逐字核对后确认",
+              body: promptDiffBody(pubResp.reason ?? "", pubResp.diff ?? ""),
+              tone: "danger",
+              confirmText: "已核对，强制发布",
+              requireText: "已核对",
+            });
+            // 带 force 重发 publish（不再重走 update）。
+            if (ok) await doPublish(true);
+            return;
+          }
+          setStatusMsg("已发布，Rust 端缓存已失效；下一次 review 即生效。");
+          await load();
+        } catch (e) {
+          const message = e instanceof Error ? e.message : String(e);
+          // publish 阶段的红线 reject：内联带 force 重发 publish，不走外层 save(true)（避免 double-PUT）。
+          if (message.includes("红线语义审查拒绝")) {
+            setSaving(false);
+            const ok = await confirm({
+              title: "触碰自治边界红线，已被语义审查拦截",
+              body: promptDiffBody(message, ""),
+              tone: "danger",
+              confirmText: "已核对无误，强制发布",
+              requireText: "已核对",
+            });
+            if (ok) await doPublish(true);
+            return;
+          }
+          setErr(message);
+        }
+      };
+      // publish 的 force 与 update 的 force 独立：publish 始终先以无 force 跑自己的红线闸，
+      // force 只由 publish 自身的 confirm 产生（不继承 update 的 force）。
+      await doPublish();
     } catch (e) {
       const message = e instanceof Error ? e.message : String(e);
       // Reject：4xx「红线语义审查拒绝」→ 弹框显拒绝理由 + 强制保存入口。
