@@ -91,7 +91,7 @@ impl From<&LlmProviderConfig> for LlmProviderView {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub(super) struct ListQuery {
+pub struct ListQuery {
     workspace_id: Option<String>,
 }
 
@@ -310,7 +310,7 @@ pub(super) async fn delete_provider(
     Ok(Json(json!({ "ok": true })))
 }
 
-pub(super) async fn activate_provider(
+pub async fn activate_provider(
     State(state): State<AppState>,
     Extension(admin): Extension<AuthenticatedAdmin>,
     Path(provider_id): Path<String>,
