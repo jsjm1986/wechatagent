@@ -1,0 +1,2264 @@
+[
+  {
+    "anchor": "后台worker",
+    "capabilities": [
+      {
+        "name": "task_worker (follow-up 任务执行循环)",
+        "entry": "src/main.rs:204 (spawn) → src/tasks.rs:12 run_task_worker",
+        "rule": "经 spawn_supervised 无条件启动(无 gating flag,常驻)。每隔 task_worker_interval_seconds 调 tick(&state) 拉取并执行 follow-up 任务,下游走 gateway。tick 失败仅 log 不退出循环。默认间隔 30s(TASK_WORKER_INTERVAL_SECONDS, config.rs:427)。",
+        "kind": "worker"
+      },
+      {
+        "name": "outbox_dispatcher (持久化发件箱派发循环)",
+        "entry": "src/main.rs:208 (spawn) → src/agent/outbox_dispatcher.rs:1001 run_outbox_dispatcher",
+        "rule": "经 spawn_supervised 无条件启动(无 gating flag,常驻)。轮询 agent_send_outbox,按 lease 租约领取 pending 条目经二次安全门后调 MCP message_send_text 发送,支持幂等键与重试。poll/lease 间隔为模块内常量 DEFAULT_POLL_INTERVAL_SECONDS/DEFAULT_LEASE_SECONDS(非 env)。",
+        "kind": "worker"
+      },
+      {
+        "name": "strategic_planner (战略规划/主动触达 planner)",
+        "entry": "src/main.rs:214-218 (spawn) → src/planner/mod.rs:94 run_strategic_planner",
+        "rule": "spawn 位点受 if state.config.strategic_planner_enabled 包裹——仅 flag 为 true 才 spawn(关停时连 worker 都不启动)。gating env=STRATEGIC_PLANNER_ENABLED,默认 false(config.rs:440)。轮询间隔 STRATEGIC_PLANNER_INTERVAL_SECONDS 默认 600s(config.rs:441)。",
+        "kind": "worker"
+      },
+      {
+        "name": "cold_contact_worker (冷联系人重激活 worker)",
+        "entry": "src/main.rs:223 (spawn) → src/cold_contact_worker.rs:34 run_cold_contact_worker",
+        "rule": "经 spawn_supervised 无条件 spawn,但 worker 内部 cold_contact_worker.rs:35 检查 if !cold_contact_worker_enabled 即 return(loop 不启动)。gating env=COLD_CONTACT_WORKER_ENABLED,默认 false(config.rs:549)。开启后周期挑 last_outbound_at 旧的 managed contact 写 follow_up 任务,下游走 gateway/outbox。",
+        "kind": "worker"
+      },
+      {
+        "name": "silence_signal_worker (沉默删失信号采集 worker)",
+        "entry": "src/main.rs:231 (spawn) → src/silence_signal_worker.rs:31 run_silence_signal_worker",
+        "rule": "经 spawn_supervised 无条件 spawn,但 worker 内部 silence_signal_worker.rs:32-37 检查 if !silence_signal_worker_enabled || silence_signal_interval_seconds==0 即 return。gating env=SILENCE_SIGNAL_WORKER_ENABLED,默认 false(config.rs:559);间隔 SILENCE_SIGNAL_INTERVAL_SECONDS 默认 600s。开启后只采集 censored=true 删失信号,不发任何消息。",
+        "kind": "worker"
+      },
+      {
+        "name": "evolutionary_worker (自演化器 worker)",
+        "entry": "src/main.rs:239 (spawn) → src/evolution/mod.rs:51 run_evolutionary_worker",
+        "rule": "经 spawn_supervised 无条件 spawn,但 worker 内部 evolution/mod.rs:52 检查 if !evolution_enabled 即 return。gating env=EVOLUTION_ENABLED,默认 false(config.rs:584)。tick 间隔 EVOLUTION_TICK_SECONDS 默认 21600s(6h),内部 .max(60) 钳制最小 60s。当前 mod.rs 注释标注为 M4 W1 skeleton(empty tick by design)。",
+        "kind": "worker"
+      },
+      {
+        "name": "knowledge_digest_worker (知识日报合成 worker)",
+        "entry": "src/main.rs:247 (spawn) → src/knowledge_digest/mod.rs:37 worker_loop",
+        "rule": "经 spawn_supervised 无条件 spawn,但 worker 内部 knowledge_digest/mod.rs:38 检查 if !knowledge_digest_enabled 即 return。gating env=KNOWLEDGE_DIGEST_ENABLED,默认 false(config.rs:646)。开启后每天 KNOWLEDGE_DIGEST_RUN_HOUR 整点(默认 9,内部 .min(23) 钳制)扫数据源合成卡片。",
+        "kind": "worker"
+      },
+      {
+        "name": "knowledge_task_worker (chat 长任务执行 worker)",
+        "entry": "src/main.rs:255 (spawn) → src/knowledge_task/mod.rs:145 worker_loop",
+        "rule": "经 spawn_supervised 无条件 spawn;无 bool flag,改用 interval==0 关停:worker 内部 knowledge_task/mod.rs:147 检查 if knowledge_task_worker_interval_seconds==0 即 return。env=KNOWLEDGE_TASK_WORKER_INTERVAL_SECONDS,默认 30s(config.rs:658,即默认开启)。取 pending knowledge_chat_tasks 按 sessionId 串行执行 plannedSteps,经 ChatProgressBus 推 SSE。",
+        "kind": "worker"
+      },
+      {
+        "name": "catalog_rebuild_worker (知识目录重建 worker)",
+        "entry": "src/main.rs:266 (spawn,闭包传 interval) → src/knowledge_wiki/catalog_rebuild.rs:43 catalog_rebuild_worker_loop",
+        "rule": "经 spawn_supervised 无条件 spawn;无 bool flag,interval==0 关停:catalog_rebuild.rs:44 检查 if interval_secs==0 即 return。env=CATALOG_REBUILD_WORKER_INTERVAL_SECONDS,默认 3s(config.rs:663,即默认开启)。消费 catalog_rebuild_jobs 队列,把 document 的 active chunk 渲染为 markdown 落 documents.catalog_summary_persisted + 自增 catalog_version。",
+        "kind": "worker"
+      },
+      {
+        "name": "knowledge_feedback_worker (知识反馈/动态置信 worker)",
+        "entry": "src/main.rs:284 (spawn,闭包传 interval) → src/knowledge_wiki/feedback_worker.rs:21 feedback_worker_loop",
+        "rule": "经 spawn_supervised 无条件 spawn;无 bool flag,interval==0 关停:feedback_worker.rs:22 检查 if interval_secs==0 即 return。env=KNOWLEDGE_FEEDBACK_INTERVAL_SECONDS,默认 600s(config.rs:668,即默认开启)。逐 workspace 跑 30d usage_stats 滑窗回写 + dynamic_confidence 计算 + structural lint + stage1 sweep(stage2 LLM 不入热路径)。",
+        "kind": "worker"
+      },
+      {
+        "name": "ingest_worker (RSS/HTML 自动采集 worker)",
+        "entry": "src/main.rs:296-304 (spawn,闭包传 interval) → src/knowledge_wiki/ingest_worker.rs:29 ingest_worker_loop",
+        "rule": "双层 gating:spawn 位点受 if state.config.ingest_worker_enabled 包裹(关停时不 spawn),worker 内部 ingest_worker.rs:30 再查 if interval_secs==0 即 return。gating env=INGEST_WORKER_ENABLED,默认 false(config.rs:673);间隔 INGEST_WORKER_INTERVAL_SECONDS 默认 3600s。开启后跨 workspace 扫 active IngestSource→条件GET→解析→ingest_chunked_text 落 chunks(draft+needs_review,红线 AI 永不自动 verify)。",
+        "kind": "worker"
+      }
+    ],
+    "notes": "穷举来源:src/main.rs async_main()。全部后台循环统一经 wechatagent::supervisor::spawn_supervised(main.rs:202 引入)启动,而非裸 tokio::spawn——supervisor 包裹 panic 后退避重启并写 agent_events.kind=background_worker_panic(main.rs:200-201 注释)。共 11 个 spawn_supervised 调用(11 个 distinct worker)。三种 gating 形态:①无 flag 常驻(task_worker / outbox_dispatcher);②spawn 位点 if-gated(strategic_planner=STRATEGIC_PLANNER_ENABLED、ingest_worker=INGEST_WORKER_ENABLED,二者均默认 false,关停时不 spawn);③无条件 spawn 但 worker 内部首行 flag/interval 检查后 return(cold_contact/silence_signal/evolutionary/knowledge_digest 用 bool flag 默认 false;knowledge_task/catalog_rebuild/knowledge_feedback 用 interval==0 关停且默认间隔>0 即默认开启)。ingest_worker 是唯一双层 gating(spawn 位点 bool + 内部 interval==0)。所有 worker 的 tick 失败均 log 但不退出循环。除 11 个后台 worker 外,async_main 末尾 axum::serve 是主 HTTP 服务(前台,非 spawn,不计入)。EVOLUTION_ENABLED/INGEST_WORKER_ENABLED 等开关含义已在 main.rs 行内注释与 config.rs 逐一核实,默认值取自 config.rs env_or 第二参数。"
+  },
+  {
+    "anchor": "agent子模块",
+    "capabilities": [
+      {
+        "name": "decision (Reply Agent 主决策)",
+        "entry": "src/agent/decision.rs:48",
+        "rule": "构造 user.reply.task prompt,注入运营方法/状态机/知识切片/长期记忆/最近聊天,调 LLM 生成 AgentDecision;build_initial_operation_profile(decision.rs:48) 据运营备注生成联系人初始运营画像并注入 active DomainProfile(非销售域不被销售 schema 框住,DEFAULT 销售域 prompt_fragment=None 字节等价);decide_reply 是各子模块复用的统一 prompt 渲染入口。",
+        "kind": "决策生成"
+      },
+      {
+        "name": "review (Review Agent + 本地兜底评审)",
+        "entry": "src/agent/review/mod.rs:1",
+        "rule": "review_decision 调 user.review.system / user.review.light.system 评审候选回复,结束后串行跑 guards::enforce_decision_guards 守卫,review_passed 把多评分阈值收敛成单一 approved 布尔(gateway/simulation 判可发送的统一入口);local_decision_review 在预算超额时返回保守通过避免阻塞;effective_review_mode/should_run_review 据 planner+置信度决定 light/full;纯判定闸门拆到 gates.rs,风格指纹拆到 style.rs。",
+        "kind": "评审闸门"
+      },
+      {
+        "name": "memory (长期 memoryCard 整理)",
+        "entry": "src/agent/memory.rs:1",
+        "rule": "MP-8 长期记忆;compact_memory_card_with_previous 保证 coreFacts/recentFacts 截留(core 上限6/recent 上限10)与上一版合并语义(未 discarded 事实保留,discarded 显式移除);effective_memory_card_for_contact 从 OperatingMemory+Contact 推出 prompt 应注入的卡片;consolidate_contact_memory/handle_memory_consolidation_task 是 consolidator Agent 入口合并候选记忆并写回;统一以 MemoryCardTyped 为入出参,Document 形态仅在 wire 边界出现;另含运营长期偏好记忆(operator memory)与 contact memory 物理隔离。",
+        "kind": "记忆固化"
+      },
+      {
+        "name": "escalation (决策请示通道/幕后领导模式)",
+        "entry": "src/agent/escalation/mod.rs:40",
+        "rule": "Agent 撞决策墙(超职权/高风险件/多轮卡死)向幕后真人决策源请示,拿裁决后用 AI 口吻向客户转述——客户永远只跟 Agent 对话,真人绝不直接面对客户(非人工接管);escalate_held_decision(mod.rs:40) 处理 hold 路径:只推领导卡+落 pending 台账+写 awaiting 标记,不向客户发任何消息;按 workspace ask_human_policy 决定 safety/product/stuck/ai_policy 是否升级;拆分为 logic/policy/ledger 三子文件,fallback_holding_reply 兜底文案不含转接类措辞(红线测试断言)。",
+        "kind": "请示升级"
+      },
+      {
+        "name": "referral (专属顾问名片引荐/辅助模式)",
+        "entry": "src/agent/referral.rs:17",
+        "rule": "辅助模式(账号级可选默认关)受控例外:AI 识别契合客户(签约/到店/深度对接)主动推真人专属顾问名片,AI 退辅助答疑;assist_mode_active(referral.rs:17) 客户级 override>账号级 enabled>默认关;validate_card_sendable 仅 enabled+approved 可发;filter_referral_candidates 按 target_stages 过滤;REVIEWER_ASSIST_YIELD_NOTE 注入 reviewer 让位段,消解红线 hold 与产品准确度评分两条路径(仅 assist 开启账号注入,关账号字节等价);引荐≠全自治红线让步,对话始终 AI 在说。",
+        "kind": "主动引荐"
+      },
+      {
+        "name": "knowledge_router (知识库加载/Knowledge Tool Planner)",
+        "entry": "src/agent/knowledge_router.rs:35",
+        "rule": "MP-9;load_operation_knowledge(kr.rs:35) 按 workspace+account 拉 documents/items/chunks(chunks 仅取 integrity_status=verified);route_operation_knowledge 调 Knowledge Tool Planner LLM 规划本轮打开哪些文档/切片(catalog→list_chunks→open_slice 渐进式披露非全塞 prompt);format_operation_knowledge* 格式化切片;maybe_emit_unverified_warning 切片全未校验时当日去重写 knowledge_unverified_warning 事件;write_knowledge_usage_log 写每 run 知识引用审计;test_knowledge_route_for_contact 后台测试入口。",
+        "kind": "知识路由"
+      },
+      {
+        "name": "reaction (用户反应分析)",
+        "entry": "src/agent/reaction.rs:28",
+        "rule": "HP-3;record_user_reaction(reaction.rs:28) 对用户最新入站消息异步分析(购买信号/反对/停止/不分类),用 atomic claim 防并发 webhook 重复触发,reclaim_stuck 把卡在 analyzing 超阈值的 review 重置 pending;reaction_outcome_status 纯函数优先取模型 outcomeStatus 再用结构化 flags(无关键词);波A1 整路进 RUN_BUDGET.scope,LLM 调用计入 tokens_used,预算超额降级到 user_replied_unclassified;cap_intent_trajectory 限意图轨迹。",
+        "kind": "反应分析"
+      },
+      {
+        "name": "taxonomy (双层标签字典+候选)",
+        "entry": "src/agent/taxonomy.rs:1",
+        "rule": "双层标签(运营领域无关):严格字典层 system_taxonomies 按 (scope,kind) 任意维度可枚举取值(kind 字符串后台维护不硬编码),候选层 taxonomy_candidates 承接 Agent 输出但不在字典的取值(含 evidence/occurrences)由后台审核并入;check_value 纯函数命中判定返回 Active/AliasActive(改写为 canonical)/Deprecated(加 risk)/CandidateNew(加 risk+异步 upsert,候选 SHALL NOT 阻塞 Reply Agent);upsert_candidate 幂等;approve/reject 后台审核;TaxonomyCache 进程级 TTL(30s)缓存启动预热+写后失效。",
+        "kind": "标签字典"
+      },
+      {
+        "name": "budget (单 run LLM/Tool 预算计数)",
+        "entry": "src/agent/budget.rs:1",
+        "rule": "MP-5;tokio::task_local 注入 RunBudget 到当前 run 子 future,generate_agent_json 自动累加 token 与调用次数;is_exceeded 判断是否进降级路径(跳 review/跳 rewrite/跳二次知识路由);record_call 累计不抛错(向后兼容),record_tool_call 原子检查并累加 tool_calls+tokens 超额抛 BudgetError(ToolCallsExceeded/TokensExceeded 对应 R4.3 两类硬上限),dispatcher 转为 budget_exceeded 工具结果回传 Agent;tool_call_budget 由 knowledge_max_tool_calls(默认6 clamp[1,16])注入,test/fallback 传 i32::MAX 不限;mark_degraded 记降级原因。",
+        "kind": "预算计数"
+      },
+      {
+        "name": "guards (决策守卫/状态机迁移)",
+        "entry": "src/agent/guards.rs:15",
+        "rule": "销售域硬编码守卫(fact-risk/pressure-risk/product_accuracy 等)已在 2026-05-25 知识库清理删除,方法论切到 wiki+3闸(knowledge_grounding/hallucination/run_budget);本模块剩与 operation_domain_configs 状态机字典对齐的纯函数:normalize_decision_state(guards.rs:15) 把 LLM 输出的状态名归一到 key;check_state_transition 校验迁移合法性(读 initial/allowFromAny/allowedFrom,行业无关,非法迁移返回 reason 由 gateway fail-soft 跳写不阻断已发回复);normalize_decision_runtime 回填 memory_write_score;initial_operation_state_key 取状态机初始态。",
+        "kind": "决策守卫"
+      },
+      {
+        "name": "simulation (Shadow 模式演练)",
+        "entry": "src/agent/simulation.rs:38",
+        "rule": "simulate_user_dialogue(simulation.rs:38) 让运营人员不真实发消息地演练完整 Reply Agent 链路:复用真实 decide_reply/route_operation_knowledge/review_decision,但发送阶段只输出 would_send;每轮决策/评审/知识路由/状态迁移打包成 UserOperationSimulationTurn 供前端展示完整轨迹;经 precheck_send_gateway 走与生产同样的网关前置检查,起独立 RunBudget(simulation_token_budget)。",
+        "kind": "影子模拟"
+      }
+    ],
+    "notes": "从 src/agent/mod.rs:8-20 的模块树文档锚点逐一穷举并打开各子模块头部 doc-comment 核实。注意:review 与 escalation 是目录而非单文件——review/{mod,gates,style}.rs、escalation/{mod,logic,policy,ledger}.rs;referral.rs 是单文件且未在 mod.rs:8-20 的注释列表中列出(列表写于 LP-11 拆分时,referral 为后加),但已在 mod.rs:52 声明为 mod referral。mod.rs 头部注释列举的子模块还包括 types/runtime/gateway,gateway 是发送网关+链路编排(run_user_operation_gateway,本次任务未要求枚举)。所有 entry 行号为各模块 doc-comment 或首个职责函数定义处,均已亲自 Read 确认,未凭记忆。"
+  },
+  {
+    "anchor": "路由表",
+    "notes": "来源:src/routes/mod.rs(api_router 全量路由表,行号见 entry)+ verify.rs / campaigns.rs / admin_suspected_deals.rs 抽查确认红线。所有 /api 路由(除 /health 与 /auth/login 白名单)经 require_session middleware(mod.rs:1038)鉴权,admin handler 普遍带 workspace 隔离。webhook(/webhooks/wechat)与 follow-up worker 不在 routes/ 下,不在本锚点范围。kind 判定:e2e闭环=触发 AI 决策/发送或知识抽取等业务全链;CRUD管理=资源增删改查/配置;worker=后台任务/SSE/WS 进度;红线=承载明确不可逾越业务约束的端点。部分端点同时是 CRUD 且承载红线,按其最突出属性归类并在 rule 中点明红线。未能逐文件全部打开(40+ 文件),业务名/红线主要据 mod.rs 详注与抽查推断,个别 handler 内部细节未逐一核对。",
+    "capabilities": [
+      {
+        "name": "健康检查",
+        "entry": "src/routes/mod.rs:323 GET /health",
+        "rule": "返回服务存活;白名单免鉴权",
+        "kind": "CRUD管理"
+      },
+      {
+        "name": "管理员登录",
+        "entry": "src/routes/mod.rs:324 POST /auth/login",
+        "rule": "会话 cookie 登录(Argon2);白名单免鉴权,是唯一鉴权入口",
+        "kind": "红线"
+      },
+      {
+        "name": "登出",
+        "entry": "src/routes/mod.rs:325 POST /auth/logout",
+        "rule": "清除 wa_session 会话",
+        "kind": "CRUD管理"
+      },
+      {
+        "name": "当前用户",
+        "entry": "src/routes/mod.rs:326 GET /auth/me",
+        "rule": "返回当前登录管理员身份与 workspace",
+        "kind": "CRUD管理"
+      },
+      {
+        "name": "切换工作空间",
+        "entry": "src/routes/mod.rs:327 POST /auth/workspace",
+        "rule": "多租户切换 current_workspace;后续读写按此隔离",
+        "kind": "CRUD管理"
+      },
+      {
+        "name": "签发 JWT",
+        "entry": "src/routes/mod.rs:328 POST /auth/token",
+        "rule": "签发 RS256 Bearer;仅 JWT_ENABLED=true 时生效",
+        "kind": "红线"
+      },
+      {
+        "name": "账号列表",
+        "entry": "src/routes/mod.rs:329 GET /accounts",
+        "rule": "列出微信运营账号",
+        "kind": "CRUD管理"
+      },
+      {
+        "name": "同步账号",
+        "entry": "src/routes/mod.rs:330 POST /accounts/sync",
+        "rule": "从 MCP 拉取微信账号到本地",
+        "kind": "CRUD管理"
+      },
+      {
+        "name": "账号 MCP 密钥更新",
+        "entry": "src/routes/mod.rs:331 PUT /accounts/:id/mcp-key",
+        "rule": "写入账号级 MCP 密钥;密钥敏感不应回显",
+        "kind": "红线"
+      },
+      {
+        "name": "联系人列表",
+        "entry": "src/routes/mod.rs:332 GET /contacts",
+        "rule": "分页列出联系人",
+        "kind": "CRUD管理"
+      },
+      {
+        "name": "联系人搜索",
+        "entry": "src/routes/mod.rs:333 POST /contacts/search",
+        "rule": "按条件搜索本地联系人",
+        "kind": "CRUD管理"
+      },
+      {
+        "name": "导入联系人",
+        "entry": "src/routes/mod.rs:334 POST /contacts/import",
+        "rule": "批量导入联系人到本地库",
+        "kind": "CRUD管理"
+      },
+      {
+        "name": "搜索并导入联系人",
+        "entry": "src/routes/mod.rs:335 POST /contacts/search-import",
+        "rule": "经 MCP 搜索微信侧联系人并落库",
+        "kind": "CRUD管理"
+      },
+      {
+        "name": "联系人详情",
+        "entry": "src/routes/mod.rs:336 GET /contacts/:id",
+        "rule": "读取单个联系人画像/状态",
+        "kind": "CRUD管理"
+      },
+      {
+        "name": "开启 AI 托管",
+        "entry": "src/routes/mod.rs:337 POST /contacts/:id/enable-agent",
+        "rule": "置 agent_status=managed,该联系人入站才触发自动回复",
+        "kind": "红线"
+      },
+      {
+        "name": "关闭 AI 托管",
+        "entry": "src/routes/mod.rs:338 POST /contacts/:id/disable-agent",
+        "rule": "取消托管,入站仅持久化不回复;非'人工接管'语义",
+        "kind": "红线"
+      },
+      {
+        "name": "画像备注更新",
+        "entry": "src/routes/mod.rs:339 PUT /contacts/:id/profile-note",
+        "rule": "运营手写画像备注",
+        "kind": "CRUD管理"
+      },
+      {
+        "name": "辅助模式覆盖",
+        "entry": "src/routes/mod.rs:341 PUT /contacts/:id/assist-override",
+        "rule": "账号级辅助模式的联系人级覆盖;受控例外不破坏全自治红线",
+        "kind": "红线"
+      },
+      {
+        "name": "清除引荐",
+        "entry": "src/routes/mod.rs:344 POST /contacts/:id/clear-referral",
+        "rule": "清掉已推送的真人顾问引荐标记",
+        "kind": "CRUD管理"
+      },
+      {
+        "name": "自定义 Agent 指令",
+        "entry": "src/routes/mod.rs:346 PUT /contacts/:id/custom-agent-instructions",
+        "rule": "写 system 末位最高优先级口吻指令(关系类型口吻分化载体)",
+        "kind": "红线"
+      },
+      {
+        "name": "手动标签更新",
+        "entry": "src/routes/mod.rs:349 PUT /contacts/:id/manual-tags",
+        "rule": "运营权威 manual 层标签;凌驾 AI 自报标签",
+        "kind": "红线"
+      },
+      {
+        "name": "运营画像更新",
+        "entry": "src/routes/mod.rs:351 PUT /contacts/:id/operation-profile",
+        "rule": "更新 customer_stage/intent 等结构化运营画像",
+        "kind": "CRUD管理"
+      },
+      {
+        "name": "登记成交事件",
+        "entry": "src/routes/mod.rs:354 POST /contacts/:id/deal-events",
+        "rule": "运营手动登记成交(verification=staff_confirmed);AI 永不直写 outcome",
+        "kind": "红线"
+      },
+      {
+        "name": "成效事件列表",
+        "entry": "src/routes/mod.rs:355 GET /contacts/:id/outcome-events",
+        "rule": "读联系人 append-only 成效流水",
+        "kind": "CRUD管理"
+      },
+      {
+        "name": "权益列表",
+        "entry": "src/routes/mod.rs:356 GET /contacts/:id/entitlements",
+        "rule": "读联系人权益",
+        "kind": "CRUD管理"
+      },
+      {
+        "name": "分析联系人画像",
+        "entry": "src/routes/mod.rs:358 POST /contacts/:id/analyze-profile",
+        "rule": "LLM 生成/刷新画像;写画像保守不凭单句盲断",
+        "kind": "e2e闭环"
+      },
+      {
+        "name": "运行记忆读写",
+        "entry": "src/routes/mod.rs:362 GET/PUT /contacts/:id/operating-memory",
+        "rule": "读/写联系人运行记忆(operating memory)",
+        "kind": "CRUD管理"
+      },
+      {
+        "name": "记忆卡读取",
+        "entry": "src/routes/mod.rs:365 GET /contacts/:id/memory-card",
+        "rule": "读长期 memoryCard;coreFacts 须兼容旧 Vec<String>",
+        "kind": "红线"
+      },
+      {
+        "name": "记忆候选列表",
+        "entry": "src/routes/mod.rs:367 GET /contacts/:id/memory-candidates",
+        "rule": "列出待固化的记忆候选",
+        "kind": "CRUD管理"
+      },
+      {
+        "name": "记忆固化运行",
+        "entry": "src/routes/mod.rs:371 POST /contacts/:id/memory-consolidation/run",
+        "rule": "触发长期记忆固化;非原子 fact 检测→重试→丢弃,同维裁决",
+        "kind": "e2e闭环"
+      },
+      {
+        "name": "运营健康度",
+        "entry": "src/routes/mod.rs:374 GET /contacts/:id/operation-health",
+        "rule": "读单联系人运营健康指标",
+        "kind": "CRUD管理"
+      },
+      {
+        "name": "运营引导预览",
+        "entry": "src/routes/mod.rs:376 POST /user-operations/guide/preview",
+        "rule": "预览引导层生成结果,不落库",
+        "kind": "e2e闭环"
+      },
+      {
+        "name": "运营引导应用",
+        "entry": "src/routes/mod.rs:380 POST /user-operations/guide/apply",
+        "rule": "应用 AI 生成的运营引导配置",
+        "kind": "CRUD管理"
+      },
+      {
+        "name": "对话模拟(影子模式)",
+        "entry": "src/routes/mod.rs:384 POST /user-operations/simulations/dialogue",
+        "rule": "shadow 模式跑 simulate_user_dialogue,不真实发送",
+        "kind": "e2e闭环"
+      },
+      {
+        "name": "运营评估运行",
+        "entry": "src/routes/mod.rs:388 POST /user-operations/evaluations/run",
+        "rule": "跑用户运营评估场景",
+        "kind": "e2e闭环"
+      },
+      {
+        "name": "会话消息列表",
+        "entry": "src/routes/mod.rs:391 GET /conversations/:contact_id/messages",
+        "rule": "读某联系人会话消息流",
+        "kind": "CRUD管理"
+      },
+      {
+        "name": "事件列表",
+        "entry": "src/routes/mod.rs:392 GET /events",
+        "rule": "读系统/agent 审计事件",
+        "kind": "CRUD管理"
+      },
+      {
+        "name": "任务列表",
+        "entry": "src/routes/mod.rs:393 GET /tasks",
+        "rule": "读 follow-up 任务",
+        "kind": "CRUD管理"
+      },
+      {
+        "name": "Agent 运行日志",
+        "entry": "src/routes/mod.rs:394 GET /agent-runs",
+        "rule": "读 agent_run_logs 运行轨迹",
+        "kind": "CRUD管理"
+      },
+      {
+        "name": "LLM 用量",
+        "entry": "src/routes/mod.rs:395 GET /llm-usage",
+        "rule": "读 llm_call_logs token 用量",
+        "kind": "CRUD管理"
+      },
+      {
+        "name": "立即审查任务",
+        "entry": "src/routes/mod.rs:396 POST /agent-tasks/:id/review-now",
+        "rule": "手动触发 follow-up 任务经网关决策→审查→发送",
+        "kind": "e2e闭环"
+      },
+      {
+        "name": "取消 Agent 任务",
+        "entry": "src/routes/mod.rs:397 POST /agent-tasks/:id/cancel",
+        "rule": "取消待执行 follow-up 任务",
+        "kind": "CRUD管理"
+      },
+      {
+        "name": "内容素材列表/创建",
+        "entry": "src/routes/mod.rs:399 GET/POST /content-assets",
+        "rule": "销售素材 CRUD;workspace 隔离 + tags 检索",
+        "kind": "CRUD管理"
+      },
+      {
+        "name": "素材文件上传",
+        "entry": "src/routes/mod.rs:403 POST /content-assets/upload",
+        "rule": "上传 PDF/海报/视频,单路由抬高 body limit 到配置上限",
+        "kind": "CRUD管理"
+      },
+      {
+        "name": "素材审核",
+        "entry": "src/routes/mod.rs:414 POST /content-assets/:id/review",
+        "rule": "人工审核媒体素材并落审计;AI 不自动审定",
+        "kind": "红线"
+      },
+      {
+        "name": "素材元信息/删除",
+        "entry": "src/routes/mod.rs:418 PUT/DELETE /content-assets/:id",
+        "rule": "改素材元信息或删除",
+        "kind": "CRUD管理"
+      },
+      {
+        "name": "素材文件替换",
+        "entry": "src/routes/mod.rs:423 POST /content-assets/:id/file",
+        "rule": "替换素材文件(抬高 body limit)",
+        "kind": "CRUD管理"
+      },
+      {
+        "name": "素材可发送开关",
+        "entry": "src/routes/mod.rs:431 POST /content-assets/:id/toggle",
+        "rule": "切换素材是否允许 AI 发送",
+        "kind": "红线"
+      },
+      {
+        "name": "引荐名片创建/列表",
+        "entry": "src/routes/mod.rs:435 POST/GET /referral-cards",
+        "rule": "管理真人顾问名片;仅辅助模式由 AI 主动引荐",
+        "kind": "红线"
+      },
+      {
+        "name": "引荐名片审核",
+        "entry": "src/routes/mod.rs:439 POST /referral-cards/:id/review",
+        "rule": "审核名片可用性;台前顾问≠幕后决策源",
+        "kind": "红线"
+      },
+      {
+        "name": "引荐名片开关",
+        "entry": "src/routes/mod.rs:443 POST /referral-cards/:id/toggle",
+        "rule": "启停名片引荐",
+        "kind": "CRUD管理"
+      },
+      {
+        "name": "引荐名片删除",
+        "entry": "src/routes/mod.rs:447 DELETE /referral-cards/:id",
+        "rule": "删除名片",
+        "kind": "CRUD管理"
+      },
+      {
+        "name": "联系人发送历史",
+        "entry": "src/routes/mod.rs:451 GET /contacts/:wxid/send-history",
+        "rule": "读单联系人发送台账",
+        "kind": "CRUD管理"
+      },
+      {
+        "name": "发送台账统计",
+        "entry": "src/routes/mod.rs:454 GET /send-ledger/stats",
+        "rule": "发送台账聚合统计",
+        "kind": "CRUD管理"
+      },
+      {
+        "name": "运营驾驶舱视图",
+        "entry": "src/routes/mod.rs:456 GET /operation/active-view",
+        "rule": "聚合活跃运营态势(active_view)",
+        "kind": "CRUD管理"
+      },
+      {
+        "name": "发送台账总览",
+        "entry": "src/routes/mod.rs:460 GET /send-ledger/overview",
+        "rule": "发送台账总览",
+        "kind": "CRUD管理"
+      },
+      {
+        "name": "运营知识列表/创建",
+        "entry": "src/routes/mod.rs:464 GET/POST /operation-knowledge",
+        "rule": "知识条目 CRUD;新建写 draft+needs_review",
+        "kind": "红线"
+      },
+      {
+        "name": "知识文档列表/创建",
+        "entry": "src/routes/mod.rs:468 GET/POST /operation-knowledge/documents",
+        "rule": "文档级容器 CRUD(一对多 chunk)",
+        "kind": "CRUD管理"
+      },
+      {
+        "name": "知识文档详情/改/删",
+        "entry": "src/routes/mod.rs:472 GET/PUT/DELETE /operation-knowledge/documents/:id",
+        "rule": "文档增删改查",
+        "kind": "CRUD管理"
+      },
+      {
+        "name": "文档切片列表",
+        "entry": "src/routes/mod.rs:478 GET /operation-knowledge/documents/:id/chunks",
+        "rule": "列出文档下 chunks",
+        "kind": "CRUD管理"
+      },
+      {
+        "name": "切片列表/创建",
+        "entry": "src/routes/mod.rs:482 GET/POST /operation-knowledge/chunks",
+        "rule": "chunk CRUD;新建 draft,product_fact 须人审",
+        "kind": "红线"
+      },
+      {
+        "name": "切片详情/改/删",
+        "entry": "src/routes/mod.rs:486 GET/PUT/DELETE /operation-knowledge/chunks/:id",
+        "rule": "chunk 改查删;PUT 不清空 provenance/locked_fields/created_at",
+        "kind": "红线"
+      },
+      {
+        "name": "切片溯源源文",
+        "entry": "src/routes/mod.rs:492 GET /operation-knowledge/chunks/:id/source",
+        "rule": "读 chunk 原始来源切片",
+        "kind": "CRUD管理"
+      },
+      {
+        "name": "切片核验",
+        "entry": "src/routes/mod.rs:496 POST /operation-knowledge/chunks/:id/verify",
+        "rule": "人工核验置 verified;AI 永不自动核验",
+        "kind": "红线"
+      },
+      {
+        "name": "切片拒绝",
+        "entry": "src/routes/mod.rs:500 POST /operation-knowledge/chunks/:id/reject",
+        "rule": "拒绝切片",
+        "kind": "CRUD管理"
+      },
+      {
+        "name": "切片修复发起",
+        "entry": "src/routes/mod.rs:504 POST /operation-knowledge/chunks/:id/repair",
+        "rule": "发起 chunk 修复(propose,仍走 review)",
+        "kind": "e2e闭环"
+      },
+      {
+        "name": "切片修复答复",
+        "entry": "src/routes/mod.rs:508 POST /operation-knowledge/chunks/:id/repair/answer",
+        "rule": "回答修复问询,推进修复闭环",
+        "kind": "e2e闭环"
+      },
+      {
+        "name": "切片局部编辑",
+        "entry": "src/routes/mod.rs:513 POST /operation-knowledge/chunks/:id/patch",
+        "rule": "patch 切片;写 revision + 广播事件总线",
+        "kind": "CRUD管理"
+      },
+      {
+        "name": "切片归档",
+        "entry": "src/routes/mod.rs:517 POST /operation-knowledge/chunks/:id/archive",
+        "rule": "归档切片(软删)",
+        "kind": "CRUD管理"
+      },
+      {
+        "name": "切片恢复",
+        "entry": "src/routes/mod.rs:521 POST /operation-knowledge/chunks/:id/restore",
+        "rule": "恢复归档切片",
+        "kind": "CRUD管理"
+      },
+      {
+        "name": "切片回滚",
+        "entry": "src/routes/mod.rs:525 POST /operation-knowledge/chunks/:id/rollback/:revision_id",
+        "rule": "回滚到历史 revision",
+        "kind": "CRUD管理"
+      },
+      {
+        "name": "切片版本历史",
+        "entry": "src/routes/mod.rs:529 GET /operation-knowledge/chunks/:id/revisions",
+        "rule": "读 chunk 修订历史",
+        "kind": "CRUD管理"
+      },
+      {
+        "name": "切片拆分",
+        "entry": "src/routes/mod.rs:533 POST /operation-knowledge/chunks/:id/split",
+        "rule": "拆分一个 chunk 为多个",
+        "kind": "CRUD管理"
+      },
+      {
+        "name": "切片合并",
+        "entry": "src/routes/mod.rs:537 POST /operation-knowledge/chunks/:id/merge",
+        "rule": "合并多个 chunk",
+        "kind": "CRUD管理"
+      },
+      {
+        "name": "切片建立关系",
+        "entry": "src/routes/mod.rs:541 POST /operation-knowledge/chunks/:id/relate",
+        "rule": "为切片建立关联边",
+        "kind": "CRUD管理"
+      },
+      {
+        "name": "切片解除关系",
+        "entry": "src/routes/mod.rs:545 DELETE /operation-knowledge/chunks/:id/relate/:target_id",
+        "rule": "删除切片关联边",
+        "kind": "CRUD管理"
+      },
+      {
+        "name": "切片软锁获取/释放",
+        "entry": "src/routes/mod.rs:550 POST/DELETE /operation-knowledge/chunks/:id/lock",
+        "rule": "协作编辑软锁(进程内 DashMap,重启清空)",
+        "kind": "worker"
+      },
+      {
+        "name": "切片事件 WebSocket",
+        "entry": "src/routes/mod.rs:554 GET /ws/chunks",
+        "rule": "订阅 chunk 协作事件总线(WS 推送)",
+        "kind": "worker"
+      },
+      {
+        "name": "切片反向引用查询",
+        "entry": "src/routes/mod.rs:557 GET /operation-knowledge/chunks/referrers",
+        "rule": "查谁引用了某 chunk(admin 手工,非 AI)",
+        "kind": "CRUD管理"
+      },
+      {
+        "name": "切片批量核验",
+        "entry": "src/routes/mod.rs:561 POST /operation-knowledge/chunks/batch-verify",
+        "rule": "admin 手工批量核验",
+        "kind": "红线"
+      },
+      {
+        "name": "切片批量归档",
+        "entry": "src/routes/mod.rs:565 POST /operation-knowledge/chunks/batch-archive",
+        "rule": "admin 手工批量归档",
+        "kind": "CRUD管理"
+      },
+      {
+        "name": "知识目录",
+        "entry": "src/routes/mod.rs:569 GET /operation-knowledge/catalog",
+        "rule": "渐进式披露目录(catalog→list→open_slice 第一层)",
+        "kind": "CRUD管理"
+      },
+      {
+        "name": "持久化目录",
+        "entry": "src/routes/mod.rs:573 GET /operation-knowledge/catalog/persisted",
+        "rule": "读持久化目录快照",
+        "kind": "CRUD管理"
+      },
+      {
+        "name": "完整度审计读/刷新",
+        "entry": "src/routes/mod.rs:577 GET/POST /operation-knowledge/completeness",
+        "rule": "LLM 完整度审计;answeringMode 闭集且绝不触发 auto-verify",
+        "kind": "红线"
+      },
+      {
+        "name": "完整性报告",
+        "entry": "src/routes/mod.rs:582 GET /operation-knowledge/integrity-report",
+        "rule": "读 D2 降级完整性报告",
+        "kind": "CRUD管理"
+      },
+      {
+        "name": "知识搜索工具",
+        "entry": "src/routes/mod.rs:586 POST /operation-knowledge/tools/search",
+        "rule": "知识路由搜索工具(tool-calling 用)",
+        "kind": "e2e闭环"
+      },
+      {
+        "name": "切片自动核验",
+        "entry": "src/routes/mod.rs:590 POST /operation-knowledge/auto-verify",
+        "rule": "批量自动核验;强制人审抽样下限 5%,product_fact 全量人审,禁 100% 无人审",
+        "kind": "红线"
+      },
+      {
+        "name": "知识缺口信号列表",
+        "entry": "src/routes/mod.rs:594 GET /knowledge/gap-signals",
+        "rule": "列出知识缺口信号",
+        "kind": "CRUD管理"
+      },
+      {
+        "name": "缺口信号忽略",
+        "entry": "src/routes/mod.rs:598 POST /knowledge/gap-signals/:id/dismiss",
+        "rule": "忽略某缺口信号",
+        "kind": "CRUD管理"
+      },
+      {
+        "name": "缺口信号应用",
+        "entry": "src/routes/mod.rs:602 POST /knowledge/gap-signals/:id/apply",
+        "rule": "应用缺口信号(生成补缺动作)",
+        "kind": "e2e闭环"
+      },
+      {
+        "name": "缺口信号扫描",
+        "entry": "src/routes/mod.rs:606 POST /knowledge/gap-signals/sweep",
+        "rule": "批量扫描汇总缺口信号",
+        "kind": "worker"
+      },
+      {
+        "name": "知识问答",
+        "entry": "src/routes/mod.rs:609 POST /knowledge/ask",
+        "rule": "基于已核验知识的问答;产品声明须 grounding",
+        "kind": "e2e闭环"
+      },
+      {
+        "name": "知识问答流式",
+        "entry": "src/routes/mod.rs:610 GET /knowledge/ask/stream",
+        "rule": "SSE 流式知识问答",
+        "kind": "worker"
+      },
+      {
+        "name": "知识指标",
+        "entry": "src/routes/mod.rs:611 GET /knowledge/metrics",
+        "rule": "知识库指标聚合",
+        "kind": "CRUD管理"
+      },
+      {
+        "name": "运营记忆列表",
+        "entry": "src/routes/mod.rs:612 GET /knowledge/operator-memory",
+        "rule": "读运营记忆条目",
+        "kind": "CRUD管理"
+      },
+      {
+        "name": "打开知识切片/证据",
+        "entry": "src/routes/mod.rs:614 POST /operation-knowledge/tools/open-slice 及 /open-evidence",
+        "rule": "渐进披露第三层 open_slice(两路由同一 handler)",
+        "kind": "e2e闭环"
+      },
+      {
+        "name": "知识导入预览",
+        "entry": "src/routes/mod.rs:622 POST /operation-knowledge/import-preview",
+        "rule": "导入预览,不落库",
+        "kind": "e2e闭环"
+      },
+      {
+        "name": "知识导入应用",
+        "entry": "src/routes/mod.rs:626 POST /operation-knowledge/import-apply",
+        "rule": "应用导入;一律 draft+needs_review",
+        "kind": "红线"
+      },
+      {
+        "name": "PDF 导入应用",
+        "entry": "src/routes/mod.rs:630 POST /operation-knowledge/import-apply-pdf",
+        "rule": "多模态 PDF 导入;draft+needs_review",
+        "kind": "红线"
+      },
+      {
+        "name": "图片视觉导入应用",
+        "entry": "src/routes/mod.rs:634 POST /operation-knowledge/import-apply-image",
+        "rule": "视觉模型识图导入;draft+needs_review",
+        "kind": "红线"
+      },
+      {
+        "name": "知识标签抽取",
+        "entry": "src/routes/mod.rs:638 POST /operation-knowledge/extract-tags",
+        "rule": "LLM 抽取知识标签",
+        "kind": "e2e闭环"
+      },
+      {
+        "name": "知识匹配测试",
+        "entry": "src/routes/mod.rs:642 POST /operation-knowledge/test-match",
+        "rule": "测试某问句命中哪些知识",
+        "kind": "e2e闭环"
+      },
+      {
+        "name": "知识使用记录",
+        "entry": "src/routes/mod.rs:645 GET /operation-knowledge/usage",
+        "rule": "读知识使用日志",
+        "kind": "CRUD管理"
+      },
+      {
+        "name": "知识日志分析",
+        "entry": "src/routes/mod.rs:647 GET /operation-knowledge/logs/analyze",
+        "rule": "分析知识使用日志",
+        "kind": "CRUD管理"
+      },
+      {
+        "name": "pack 修复发起",
+        "entry": "src/routes/mod.rs:651 POST /operation-knowledge/items/:id/repair",
+        "rule": "pack 级修复 propose;依赖已删集合,实为永返 400 死桩",
+        "kind": "CRUD管理"
+      },
+      {
+        "name": "修复应用记录",
+        "entry": "src/routes/mod.rs:655 POST /operation-knowledge/repair/applied",
+        "rule": "登记修复已应用",
+        "kind": "CRUD管理"
+      },
+      {
+        "name": "知识对话工作台",
+        "entry": "src/routes/mod.rs:658 POST /operation-knowledge/chat",
+        "rule": "chat_turn 真模型意图分类+切片起草;只产 proposal 永不自动落库",
+        "kind": "红线"
+      },
+      {
+        "name": "知识收件箱",
+        "entry": "src/routes/mod.rs:660 GET /operation-knowledge/inbox",
+        "rule": "读知识收件箱(open_repair 来源)",
+        "kind": "CRUD管理"
+      },
+      {
+        "name": "知识元数据聚合",
+        "entry": "src/routes/mod.rs:664 GET /operation-knowledge/metadata",
+        "rule": "聚合知识元数据",
+        "kind": "CRUD管理"
+      },
+      {
+        "name": "对话历史",
+        "entry": "src/routes/mod.rs:668 GET /operation-knowledge/chat/:session_id",
+        "rule": "读知识对话会话历史",
+        "kind": "CRUD管理"
+      },
+      {
+        "name": "对话起草应用",
+        "entry": "src/routes/mod.rs:672 POST /operation-knowledge/chat/:session_id/apply",
+        "rule": "两步 preview→apply 落 draft chunk(回填 createdChunkId)",
+        "kind": "红线"
+      },
+      {
+        "name": "对话起草丢弃",
+        "entry": "src/routes/mod.rs:676 POST /operation-knowledge/chat/:session_id/discard",
+        "rule": "丢弃对话起草草稿",
+        "kind": "CRUD管理"
+      },
+      {
+        "name": "今日知识摘要",
+        "entry": "src/routes/mod.rs:679 GET /knowledge/digest/today",
+        "rule": "读今日 digest 卡片",
+        "kind": "CRUD管理"
+      },
+      {
+        "name": "摘要重生成",
+        "entry": "src/routes/mod.rs:680 POST /knowledge/digest/regenerate",
+        "rule": "重新生成 digest",
+        "kind": "worker"
+      },
+      {
+        "name": "摘要卡片忽略",
+        "entry": "src/routes/mod.rs:682 POST /knowledge/digest/cards/:id/dismiss",
+        "rule": "忽略 digest 卡片",
+        "kind": "CRUD管理"
+      },
+      {
+        "name": "知识对话任务列表/创建",
+        "entry": "src/routes/mod.rs:686 GET/POST /knowledge/chat/tasks",
+        "rule": "异步知识对话任务(KnowledgeTaskWorker)",
+        "kind": "worker"
+      },
+      {
+        "name": "对话任务详情",
+        "entry": "src/routes/mod.rs:690 GET /knowledge/chat/tasks/:id",
+        "rule": "读对话任务状态",
+        "kind": "CRUD管理"
+      },
+      {
+        "name": "对话任务取消",
+        "entry": "src/routes/mod.rs:694 POST /knowledge/chat/tasks/:id/cancel",
+        "rule": "取消对话任务",
+        "kind": "worker"
+      },
+      {
+        "name": "对话会话进度流",
+        "entry": "src/routes/mod.rs:698 GET /knowledge/chat/sessions/:sid/stream",
+        "rule": "SSE 订阅 chat_progress_bus 推 turn id",
+        "kind": "worker"
+      },
+      {
+        "name": "采集源列表/创建",
+        "entry": "src/routes/mod.rs:702 GET/POST /knowledge/ingest-sources",
+        "rule": "RSS/HTML 自动采集源 CRUD(INGEST_WORKER_ENABLED 门)",
+        "kind": "CRUD管理"
+      },
+      {
+        "name": "采集源改/删",
+        "entry": "src/routes/mod.rs:706 PATCH/DELETE /knowledge/ingest-sources/:id",
+        "rule": "采集源更新/删除",
+        "kind": "CRUD管理"
+      },
+      {
+        "name": "知识条目改/删",
+        "entry": "src/routes/mod.rs:710 PUT/DELETE /operation-knowledge/:id",
+        "rule": "知识条目更新/删除",
+        "kind": "CRUD管理"
+      },
+      {
+        "name": "决策审查列表",
+        "entry": "src/routes/mod.rs:713 GET /decision-reviews",
+        "rule": "读独立审查 Agent 决策记录",
+        "kind": "CRUD管理"
+      },
+      {
+        "name": "决策审查详情",
+        "entry": "src/routes/mod.rs:714 GET /decision-reviews/:id",
+        "rule": "读单条决策审查",
+        "kind": "CRUD管理"
+      },
+      {
+        "name": "成效指标列表",
+        "entry": "src/routes/mod.rs:715 GET /agent-outcome-metrics",
+        "rule": "读 agent 成效指标",
+        "kind": "CRUD管理"
+      },
+      {
+        "name": "行为信号指标",
+        "entry": "src/routes/mod.rs:717 GET /behavior-signal-metrics",
+        "rule": "读行为信号度量",
+        "kind": "CRUD管理"
+      },
+      {
+        "name": "自治成效",
+        "entry": "src/routes/mod.rs:720 GET /outcomes/autonomy",
+        "rule": "读自治运营成效",
+        "kind": "CRUD管理"
+      },
+      {
+        "name": "自治修订记录",
+        "entry": "src/routes/mod.rs:722 GET /outcomes/autonomy/revisions",
+        "rule": "读自治链路 revision 记录",
+        "kind": "CRUD管理"
+      },
+      {
+        "name": "评估场景列表/创建",
+        "entry": "src/routes/mod.rs:726 GET/POST /evaluation-scenarios",
+        "rule": "评估场景 CRUD",
+        "kind": "CRUD管理"
+      },
+      {
+        "name": "评估场景改/删",
+        "entry": "src/routes/mod.rs:730 PUT/DELETE /evaluation-scenarios/:id",
+        "rule": "评估场景更新/删除",
+        "kind": "CRUD管理"
+      },
+      {
+        "name": "公式遵从评估",
+        "entry": "src/routes/mod.rs:734 POST /user-operations/evaluations/formula-adherence",
+        "rule": "跑 business_formula 遵从度评估",
+        "kind": "e2e闭环"
+      },
+      {
+        "name": "Agent 灵魂列表/创建",
+        "entry": "src/routes/mod.rs:738 GET/POST /agent-souls",
+        "rule": "agent_souls 人格 CRUD(prompt 分层)",
+        "kind": "CRUD管理"
+      },
+      {
+        "name": "灵魂更新",
+        "entry": "src/routes/mod.rs:741 PUT /agent-souls/:id",
+        "rule": "更新灵魂草稿",
+        "kind": "CRUD管理"
+      },
+      {
+        "name": "灵魂发布",
+        "entry": "src/routes/mod.rs:742 POST /agent-souls/:id/publish",
+        "rule": "发布灵魂版本;bump prompt_pack_version 触发缓存失效",
+        "kind": "红线"
+      },
+      {
+        "name": "运营域列表",
+        "entry": "src/routes/mod.rs:743 GET /operation-domains",
+        "rule": "列出运营域配置",
+        "kind": "CRUD管理"
+      },
+      {
+        "name": "运营域详情/更新",
+        "entry": "src/routes/mod.rs:745 GET/PUT /operation-domains/:domain",
+        "rule": "读/改运营域",
+        "kind": "CRUD管理"
+      },
+      {
+        "name": "状态机读/写",
+        "entry": "src/routes/mod.rs:749 GET/PUT /operation-domains/:domain/state-machine",
+        "rule": "状态机字典 CRUD;initial/allowedFrom 驱动 check_state_transition,行业无关",
+        "kind": "红线"
+      },
+      {
+        "name": "运营域重置",
+        "entry": "src/routes/mod.rs:753 POST /operation-domains/:domain/reset",
+        "rule": "重置运营域到默认",
+        "kind": "CRUD管理"
+      },
+      {
+        "name": "请示策略设置",
+        "entry": "src/routes/mod.rs:757 PUT /operation-domains/:domain/ask-human-policy",
+        "rule": "配置决策请示通道策略(幕后领导,非人工接管)",
+        "kind": "红线"
+      },
+      {
+        "name": "提示词模板列表/创建",
+        "entry": "src/routes/mod.rs:761 GET/POST /prompt-templates",
+        "rule": "prompt_templates CRUD",
+        "kind": "CRUD管理"
+      },
+      {
+        "name": "模板更新",
+        "entry": "src/routes/mod.rs:764 PUT /prompt-templates/:id",
+        "rule": "更新模板草稿",
+        "kind": "CRUD管理"
+      },
+      {
+        "name": "模板发布",
+        "entry": "src/routes/mod.rs:766 POST /prompt-templates/:id/publish",
+        "rule": "发布模板版本",
+        "kind": "红线"
+      },
+      {
+        "name": "重置系统 pack",
+        "entry": "src/routes/mod.rs:770 POST /prompt-templates/reset-system-pack",
+        "rule": "物理删除并重种 v2 pack;显式维护动作,非每启动幂等覆盖(会clobber运营编辑)",
+        "kind": "红线"
+      },
+      {
+        "name": "运营 playbook 列表/创建",
+        "entry": "src/routes/mod.rs:774 GET/POST /operation-playbooks",
+        "rule": "playbook CRUD",
+        "kind": "CRUD管理"
+      },
+      {
+        "name": "playbook 生成",
+        "entry": "src/routes/mod.rs:778 POST /operation-playbooks/generate",
+        "rule": "AI 生成 playbook 候选",
+        "kind": "e2e闭环"
+      },
+      {
+        "name": "playbook 优化",
+        "entry": "src/routes/mod.rs:782 POST /operation-playbooks/:id/optimize",
+        "rule": "AI 优化 playbook",
+        "kind": "e2e闭环"
+      },
+      {
+        "name": "playbook 更新",
+        "entry": "src/routes/mod.rs:785 PUT /operation-playbooks/:id",
+        "rule": "更新 playbook",
+        "kind": "CRUD管理"
+      },
+      {
+        "name": "设默认 playbook",
+        "entry": "src/routes/mod.rs:787 POST /operation-playbooks/:id/set-default",
+        "rule": "设默认运营 playbook",
+        "kind": "CRUD管理"
+      },
+      {
+        "name": "产品列表/创建",
+        "entry": "src/routes/mod.rs:791 GET/POST /products",
+        "rule": "产品目录 CRUD(客观购买事实)",
+        "kind": "CRUD管理"
+      },
+      {
+        "name": "产品更新",
+        "entry": "src/routes/mod.rs:792 PUT /products/:product_id",
+        "rule": "更新产品",
+        "kind": "CRUD管理"
+      },
+      {
+        "name": "产品归档",
+        "entry": "src/routes/mod.rs:793 POST /products/:product_id/archive",
+        "rule": "归档产品",
+        "kind": "CRUD管理"
+      },
+      {
+        "name": "产品恢复",
+        "entry": "src/routes/mod.rs:794 POST /products/:product_id/restore",
+        "rule": "恢复归档产品",
+        "kind": "CRUD管理"
+      },
+      {
+        "name": "活动创建/列表",
+        "entry": "src/routes/mod.rs:795 POST/GET /campaigns",
+        "rule": "批量触达活动 CRUD",
+        "kind": "CRUD管理"
+      },
+      {
+        "name": "活动预览",
+        "entry": "src/routes/mod.rs:796 POST /campaigns/:id/preview",
+        "rule": "预览圈人命中,不发送",
+        "kind": "e2e闭环"
+      },
+      {
+        "name": "活动派发",
+        "entry": "src/routes/mod.rs:797 POST /campaigns/:id/dispatch",
+        "rule": "重跑圈人→唯一索引去重 enqueue follow-up 任务(经网关发送);命中0人拒绝",
+        "kind": "e2e闭环"
+      },
+      {
+        "name": "活动发送报告",
+        "entry": "src/routes/mod.rs:798 GET /campaigns/:id/sends",
+        "rule": "读活动发送结果",
+        "kind": "CRUD管理"
+      },
+      {
+        "name": "管理 Agent 会话创建",
+        "entry": "src/routes/mod.rs:800 POST /management-agent/sessions",
+        "rule": "创建运营管理对话会话",
+        "kind": "e2e闭环"
+      },
+      {
+        "name": "管理 Agent 消息",
+        "entry": "src/routes/mod.rs:804 POST /management-agent/sessions/:id/messages",
+        "rule": "管理对话产出待确认命令(command),不直接执行",
+        "kind": "红线"
+      },
+      {
+        "name": "管理命令详情",
+        "entry": "src/routes/mod.rs:808 GET /management-agent/commands/:id",
+        "rule": "读待确认管理命令",
+        "kind": "CRUD管理"
+      },
+      {
+        "name": "管理命令确认",
+        "entry": "src/routes/mod.rs:812 POST /management-agent/commands/:id/confirm",
+        "rule": "二次确认后才真正执行管理命令(写操作闸)",
+        "kind": "红线"
+      },
+      {
+        "name": "管理命令拒绝",
+        "entry": "src/routes/mod.rs:816 POST /management-agent/commands/:id/reject",
+        "rule": "拒绝管理命令",
+        "kind": "CRUD管理"
+      },
+      {
+        "name": "管理工具目录",
+        "entry": "src/routes/mod.rs:819 GET /management-agent/tool-catalog",
+        "rule": "读管理 Agent 可用工具清单",
+        "kind": "CRUD管理"
+      },
+      {
+        "name": "分类法列表/创建",
+        "entry": "src/routes/mod.rs:822 GET/POST /admin/taxonomies",
+        "rule": "system_taxonomies CRUD;customer_stage 等须来自此",
+        "kind": "红线"
+      },
+      {
+        "name": "分类法改/删",
+        "entry": "src/routes/mod.rs:826 PATCH/DELETE /admin/taxonomies/:id",
+        "rule": "分类法更新/删除",
+        "kind": "CRUD管理"
+      },
+      {
+        "name": "分类候选列表",
+        "entry": "src/routes/mod.rs:830 GET /admin/taxonomy-candidates",
+        "rule": "列出 AI 生成待审分类候选;未审不得阻断 run",
+        "kind": "红线"
+      },
+      {
+        "name": "分类候选批准",
+        "entry": "src/routes/mod.rs:834 POST /admin/taxonomy-candidates/:id/approve",
+        "rule": "批准候选晋升为正式分类",
+        "kind": "CRUD管理"
+      },
+      {
+        "name": "分类候选拒绝",
+        "entry": "src/routes/mod.rs:838 POST /admin/taxonomy-candidates/:id/reject",
+        "rule": "拒绝分类候选",
+        "kind": "CRUD管理"
+      },
+      {
+        "name": "关系类型建议列表",
+        "entry": "src/routes/mod.rs:843 GET /admin/relationship-type-suggestions",
+        "rule": "列出 AI 识别的 relationship_type 建议(待审)",
+        "kind": "红线"
+      },
+      {
+        "name": "关系建议批准",
+        "entry": "src/routes/mod.rs:847 POST /admin/relationship-type-suggestions/:id/approve",
+        "rule": "批准关系类型建议(canonical customer/peer/friend)",
+        "kind": "CRUD管理"
+      },
+      {
+        "name": "关系建议拒绝",
+        "entry": "src/routes/mod.rs:851 POST /admin/relationship-type-suggestions/:id/reject",
+        "rule": "拒绝关系建议",
+        "kind": "CRUD管理"
+      },
+      {
+        "name": "疑似成交列表",
+        "entry": "src/routes/mod.rs:858 GET /admin/suspected-deals",
+        "rule": "列出 AI 疑似成交信号(待核实)",
+        "kind": "红线"
+      },
+      {
+        "name": "疑似成交批准",
+        "entry": "src/routes/mod.rs:860 POST /admin/suspected-deals/:id/approve",
+        "rule": "CAS-first 占位改 approved 再落 staff_confirmed 成交,防双计;AI 永不直写 outcome",
+        "kind": "红线"
+      },
+      {
+        "name": "疑似成交拒绝",
+        "entry": "src/routes/mod.rs:864 POST /admin/suspected-deals/:id/reject",
+        "rule": "仅改信号状态为 rejected",
+        "kind": "CRUD管理"
+      },
+      {
+        "name": "状态策略列表",
+        "entry": "src/routes/mod.rs:873 GET /admin/operation-state-policies",
+        "rule": "列出状态策略(无独立CRUD,写走publish)",
+        "kind": "CRUD管理"
+      },
+      {
+        "name": "状态策略详情",
+        "entry": "src/routes/mod.rs:877 GET /admin/operation-state-policies/:id",
+        "rule": "读状态策略 active_versions 流水",
+        "kind": "CRUD管理"
+      },
+      {
+        "name": "运营域版本发布",
+        "entry": "src/routes/mod.rs:881 POST /admin/operation-domains/:id/publish",
+        "rule": "多版本灰度发布 operation_domain_configs",
+        "kind": "红线"
+      },
+      {
+        "name": "运营域版本灰度",
+        "entry": "src/routes/mod.rs:885 POST /admin/operation-domains/:id/rollout",
+        "rule": "灰度放量运营域版本",
+        "kind": "红线"
+      },
+      {
+        "name": "运营域版本回滚",
+        "entry": "src/routes/mod.rs:889 POST /admin/operation-domains/:id/rollback",
+        "rule": "回滚运营域版本",
+        "kind": "红线"
+      },
+      {
+        "name": "请示通道列表",
+        "entry": "src/routes/mod.rs:894 GET /admin/principal-escalations",
+        "rule": "列出决策请示(幕后领导裁决队列)",
+        "kind": "红线"
+      },
+      {
+        "name": "请示裁决",
+        "entry": "src/routes/mod.rs:896 POST /admin/principal-escalations/:short_code/resolve",
+        "rule": "admin 直接裁决,复用 relay 下游由 AI 口吻转述;非人工接管",
+        "kind": "红线"
+      },
+      {
+        "name": "请示改派",
+        "entry": "src/routes/mod.rs:900 POST /admin/principal-escalations/:short_code/reassign",
+        "rule": "改派决策人",
+        "kind": "CRUD管理"
+      },
+      {
+        "name": "请示收件箱",
+        "entry": "src/routes/mod.rs:904 GET /admin/ask-human/inbox",
+        "rule": "只读聚合请示收件箱",
+        "kind": "CRUD管理"
+      },
+      {
+        "name": "请示汇总",
+        "entry": "src/routes/mod.rs:905 GET /admin/ask-human/summary",
+        "rule": "只读请示统计汇总",
+        "kind": "CRUD管理"
+      },
+      {
+        "name": "状态策略发布",
+        "entry": "src/routes/mod.rs:907 POST /admin/operation-state-policies/:id/publish",
+        "rule": "发布状态策略版本",
+        "kind": "红线"
+      },
+      {
+        "name": "状态策略灰度",
+        "entry": "src/routes/mod.rs:911 POST /admin/operation-state-policies/:id/rollout",
+        "rule": "灰度放量状态策略",
+        "kind": "红线"
+      },
+      {
+        "name": "状态策略回滚",
+        "entry": "src/routes/mod.rs:915 POST /admin/operation-state-policies/:id/rollback",
+        "rule": "回滚状态策略",
+        "kind": "红线"
+      },
+      {
+        "name": "分类法发布",
+        "entry": "src/routes/mod.rs:919 POST /admin/taxonomies/:id/publish",
+        "rule": "发布分类法版本",
+        "kind": "红线"
+      },
+      {
+        "name": "分类法灰度",
+        "entry": "src/routes/mod.rs:923 POST /admin/taxonomies/:id/rollout",
+        "rule": "灰度放量分类法",
+        "kind": "红线"
+      },
+      {
+        "name": "分类法回滚",
+        "entry": "src/routes/mod.rs:927 POST /admin/taxonomies/:id/rollback",
+        "rule": "回滚分类法",
+        "kind": "红线"
+      },
+      {
+        "name": "Outbox 列表",
+        "entry": "src/routes/mod.rs:931 GET /admin/outbox",
+        "rule": "读发送 outbox(幂等键+二道安全闸)",
+        "kind": "CRUD管理"
+      },
+      {
+        "name": "Outbox 取消",
+        "entry": "src/routes/mod.rs:932 POST /admin/outbox/:id/cancel",
+        "rule": "取消待发 outbox 条目",
+        "kind": "红线"
+      },
+      {
+        "name": "经验教训列表",
+        "entry": "src/routes/mod.rs:934 GET /admin/lessons-learned",
+        "rule": "只读 lessons_learned",
+        "kind": "CRUD管理"
+      },
+      {
+        "name": "教训晋升为同行案例",
+        "entry": "src/routes/mod.rs:938 POST /admin/lessons-learned/:lesson_id/promote-to-peer-case",
+        "rule": "admin 手工晋升为 peer_case 候选 chunk,仍走 review;AI 永不自动 promote",
+        "kind": "红线"
+      },
+      {
+        "name": "阶段汇总可观测",
+        "entry": "src/routes/mod.rs:943 GET /admin/observability/phase-rollup",
+        "rule": "只读自治信号阶段聚合",
+        "kind": "CRUD管理"
+      },
+      {
+        "name": "worker 健康聚合",
+        "entry": "src/routes/mod.rs:946 GET /admin/observability/worker-health",
+        "rule": "一次 RTT 拉齐 chat_tasks/gap sweep/lessons 健康",
+        "kind": "CRUD管理"
+      },
+      {
+        "name": "LLM provider 列表/创建",
+        "entry": "src/routes/mod.rs:949 GET/POST /admin/llm-providers",
+        "rule": "LLM provider 配置 CRUD",
+        "kind": "CRUD管理"
+      },
+      {
+        "name": "provider 改/删",
+        "entry": "src/routes/mod.rs:953 PUT/DELETE /admin/llm-providers/:id",
+        "rule": "更新/删除 provider",
+        "kind": "CRUD管理"
+      },
+      {
+        "name": "provider 激活",
+        "entry": "src/routes/mod.rs:957 POST /admin/llm-providers/:id/activate",
+        "rule": "原子热切换 LlmRegistry,整进程 LLM 调用切到新配置",
+        "kind": "红线"
+      },
+      {
+        "name": "视觉 provider 激活",
+        "entry": "src/routes/mod.rs:961 POST /admin/llm-providers/:id/vision",
+        "rule": "设激活视觉模型",
+        "kind": "CRUD管理"
+      },
+      {
+        "name": "provider 测试",
+        "entry": "src/routes/mod.rs:964 POST /admin/llm-providers/test",
+        "rule": "测试 provider 连通性",
+        "kind": "e2e闭环"
+      },
+      {
+        "name": "行业 schema 列表/创建",
+        "entry": "src/routes/mod.rs:967 GET/POST /admin/domain-schemas",
+        "rule": "行业可配 schema CRUD",
+        "kind": "CRUD管理"
+      },
+      {
+        "name": "schema 改/删",
+        "entry": "src/routes/mod.rs:971 PUT/DELETE /admin/domain-schemas/:id",
+        "rule": "更新/删除 schema",
+        "kind": "CRUD管理"
+      },
+      {
+        "name": "schema 激活",
+        "entry": "src/routes/mod.rs:975 POST /admin/domain-schemas/:id/activate",
+        "rule": "激活行业 schema(驱动 chunk domain_attributes 校验)",
+        "kind": "红线"
+      },
+      {
+        "name": "行业总装配单列表/创建",
+        "entry": "src/routes/mod.rs:980 GET/POST /admin/domain-profiles",
+        "rule": "DomainProfile CRUD(行业总装配单)",
+        "kind": "CRUD管理"
+      },
+      {
+        "name": "激活 profile 查询",
+        "entry": "src/routes/mod.rs:983 GET /admin/domain-profiles/active",
+        "rule": "读当前激活 DomainProfile",
+        "kind": "CRUD管理"
+      },
+      {
+        "name": "profile 详情/改/删",
+        "entry": "src/routes/mod.rs:985 GET/PUT/DELETE /admin/domain-profiles/:id",
+        "rule": "DomainProfile 改查删",
+        "kind": "CRUD管理"
+      },
+      {
+        "name": "profile 发布",
+        "entry": "src/routes/mod.rs:991 POST /admin/domain-profiles/:id/publish",
+        "rule": "发布 profile 版本(含 realign)",
+        "kind": "红线"
+      },
+      {
+        "name": "profile 灰度",
+        "entry": "src/routes/mod.rs:995 POST /admin/domain-profiles/:id/rollout",
+        "rule": "灰度放量 profile",
+        "kind": "红线"
+      },
+      {
+        "name": "profile 回滚",
+        "entry": "src/routes/mod.rs:999 POST /admin/domain-profiles/:id/rollback",
+        "rule": "回滚 profile 版本",
+        "kind": "红线"
+      },
+      {
+        "name": "profile 激活",
+        "entry": "src/routes/mod.rs:1003 POST /admin/domain-profiles/:id/activate",
+        "rule": "激活 profile;联动写 operation_domain_configs 新 current 版本",
+        "kind": "红线"
+      },
+      {
+        "name": "profile 候选生成",
+        "entry": "src/routes/mod.rs:1008 POST /admin/domain-profiles/generate",
+        "rule": "引导层 AI 对话生成候选 DomainProfile",
+        "kind": "e2e闭环"
+      },
+      {
+        "name": "evolution 实验列表",
+        "entry": "src/routes/mod.rs:1012 GET /evolution/experiments",
+        "rule": "读自优化实验",
+        "kind": "CRUD管理"
+      },
+      {
+        "name": "evolution 提案详情",
+        "entry": "src/routes/mod.rs:1014 GET /evolution/proposals/:id",
+        "rule": "读自优化提案",
+        "kind": "CRUD管理"
+      },
+      {
+        "name": "提案发布",
+        "entry": "src/routes/mod.rs:1018 POST /evolution/proposals/:id/release",
+        "rule": "发布自优化提案;prompt 通道半实装(replay placeholder 必被拒)",
+        "kind": "红线"
+      },
+      {
+        "name": "提案回滚",
+        "entry": "src/routes/mod.rs:1022 POST /evolution/proposals/:id/rollback",
+        "rule": "回滚自优化提案",
+        "kind": "红线"
+      },
+      {
+        "name": "阈值变更审计",
+        "entry": "src/routes/mod.rs:1026 GET /evolution/threshold-overrides/audit",
+        "rule": "读 threshold 不可变审计日志(release/rollback/auto-release)",
+        "kind": "CRUD管理"
+      },
+      {
+        "name": "evolution 运行时开关",
+        "entry": "src/routes/mod.rs:1032 GET/PUT /evolution/runtime-flag",
+        "rule": "读/写灰度运行时开关;EVOLUTION_ENABLED 仍是最外熔断",
+        "kind": "红线"
+      }
+    ]
+  },
+  {
+    "anchor": "红线守卫",
+    "notes": "穷举依据：通读 src/agent/guards.rs（818行,纯函数:状态机迁移+R5.4 verified背书+承诺词分类）、src/agent/review/gates.rs（2560行,review_passed/classify_dual_gate/finalize_review_for_send最终安全汇总层）、docs/agent-policy.md、CLAUDE.md「Hard rules baked into the code」、scripts/check-no-human-takeover.{sh,ps1} + check-evolution-isolation.sh + check-no-model-hint.sh + check-baseline.sh 四个CI守门脚本，以及 grep 全 src 的「AI 永不自动/永不直写」红线注释锚点。\n\n重要时效校正（以代码为准）：agent-policy.md 顶部 2026-05-25 Notice + guards.rs:1-7 注释证实——旧销售域 5 闸（fact_risk/pressure_risk/product_accuracy/human_like/emotional_value 作为独立 enforce_* 函数）已删除，方法论收敛。当前真实在线硬闸入口是 review/gates.rs 的 review_passed（评分硬门）/ classify_dual_gate（双闸分类）/ finalize_review_for_send（所有硬门汇于一处）。旧函数名 enforce_hallucination/enforce_knowledge_grounding/enforce_decision_guards 已不存在；阈值字段有历史别名（fact_risk_block_at 实际承载 hallucination 阈值，product_accuracy_block_below 实际承载 knowledge_grounding 阈值）。\n\nagent-autonomy-loop/user-ops-agent-hardening 两 spec 带 Sunset Notice，未直接读其 requirements.md 文件（按指示以代码为准）；R 编号引自 gates.rs/guards.rs 内嵌注释里仍在引用的 spec 条款号，作为锚点辅助，非独立验证。\n\n软闸（human_like/pressure_risk/emotional_value/boundary_privacy_safety）非硬红线：低于/高于阈值触发一次 single-shot revision，二次仍不过才写 blocked_review，故不列为「绝不能 X」硬红线，仅在状态闭集红线下提及其闭环。\n\ngrounding 漏判探针（ProductEffect/ToneOnly CommitmentClass）2026-06-14 已从硬闸回退为「仅观测」（落 grounding_probe_reviewer_missed 事件,不改发送判定），故不是当前硬红线——只有 reviewer 自报 requiresProductKnowledge=true 路径仍是硬 block。",
+    "capabilities": [
+      {
+        "name": "无人工接管(全自治红线)",
+        "entry": "scripts/check-no-human-takeover.sh:35 (FORBIDDEN_PATTERN) + .ps1 同款; CLAUDE.md「check-no-human-takeover」段; docs/agent-policy.md:114-153 辅助模式受控例外",
+        "rule": "src/agent/ src/routes/ src/evolution/ frontend/src/ 四目录的 git diff 新增行绝不能引入 human[_ -]?takeover|takeover|hand[ -]?off|人工接管|人工介入|人工托管|接管|人工 等字面量;命中即 exit 1。held/blocked 一律用 AI 内部状态名(held_by_ai_policy/blocked_by_safety_guard/ai_waiting_for_more_context)。客户永远只跟 AI 对话、永不直接面对真人;唯一受控例外=账号显式开启辅助模式时 AI 主动引荐真人顾问名片(默认关,全自治红线不动)",
+        "kind": "红线"
+      },
+      {
+        "name": "AI 永不自动 verify 知识",
+        "entry": "src/knowledge_wiki/chunk_revisions.rs:207-211 (ProvenanceSource::Ai 强制 status=draft + integrity_status=needs_review); main.rs:295; ingest_worker.rs:9; routes/knowledge/chat.rs:1679; import.rs:305",
+        "rule": "任何 AI/LLM 写入路径(import/chat/digest/ingest/escalation ledger)产出的 chunk 一律 status=draft + integrity_status=needs_review;绝不能自动置 verified。verify 仍走 /chunks/:id/verify + sourceQuote→anchor 模糊匹配 gate,source=human(或 auto_verify 批处理 source=rule),落 chunk_revisions 审计历史",
+        "kind": "红线"
+      },
+      {
+        "name": "产品声明须 verified 知识背书(R5.4)",
+        "entry": "src/agent/review/gates.rs:653-686 (finalize_review_for_send); guards.rs:309-363 (is_verified / compute_verified_chunks)",
+        "rule": "reviewer claim_analysis.requiresProductKnowledge=true 时,若本 run 引用的 used_knowledge_ids 里没有任何 integrity_status==verified 且未过期的 chunk,且报价未命中 active 产品目录(priced_from_catalog=false)→强制 blocked_unverified_product_claim:approved=false、should_reply=false、autonomy_mode=blocked。过期 verified(valid_to<now)知识不得背书",
+        "kind": "红线"
+      },
+      {
+        "name": "幻觉硬闸(hallucination block)",
+        "entry": "src/agent/review/gates.rs:20-40 (review_passed) + 110-139 (classify_dual_gate HardGateFailure)",
+        "rule": "hallucination_score >= runtime.fact_risk_block_at(字段别名,实为 hallucination 阈值)→硬闸失败,approved=false,finalize 走 Held;硬闸失败绝不能触发 single-shot revision(route_dual_gate 不写 needs_revision),不可被 soft-gate 矫正分支放行",
+        "kind": "红线"
+      },
+      {
+        "name": "知识 grounding 硬闸",
+        "entry": "src/agent/review/gates.rs:127-136 (classify_dual_gate grounding_gate_applies)",
+        "rule": "knowledge_grounding_score < runtime.product_accuracy_block_below(字段别名)→HardGateFailure。仅当 profile 显式 grounding_gate_bypass_without_claim=true 且本条无产品声明(claim_requires_product_knowledge=false)时旁路;DEFAULT bypass=false→每条都判(字节等价)。有产品声明时 bypass 不豁免",
+        "kind": "红线"
+      },
+      {
+        "name": "状态机非法转移拦截(fail-closed)",
+        "entry": "src/agent/guards.rs:156-225 (check_state_transition); main.rs::run_active_domain_state_machine_sanity_check",
+        "rule": "active domain 未配状态机(states 为空)→fail-closed 返回 state_machine_empty,启动期 sanity check 先拒绝;迁向状态机里不存在的态→unknown_target fail-closed 拒绝(防幻影态旁路 policy);空 from 只能迁入标 initial:true 的态;否则 from 必须在目标态 allowedFrom 列表。fail-soft:非法迁移不阻断已发回复,只跳过 operation_state 写入(保留旧态)+写 operation_state_transition_rejected 审计事件。Agent 不得发明新 state key,引擎读 initial/allowFromAny/allowedFrom 标志行业无关",
+        "kind": "红线"
+      },
+      {
+        "name": "预算超限终止(RunBudget)",
+        "entry": "src/agent/review/gates.rs:615-632 (finalize blocked_by_budget); src/agent/budget.rs (RunBudget)",
+        "rule": "每 run 有 token/call 预算,超限返 AppError::BudgetExceeded;预算超额 + needs_review=true → blocked_by_budget:approved=false、should_reply=false、autonomy_mode=blocked。绝不能因预算超限对 webhook 调用方返 5xx,须 fail-soft 落 fallback(local_decision_review/跳过 rewrite)",
+        "kind": "红线"
+      },
+      {
+        "name": "网关/finalReview 状态枚举闭集",
+        "entry": "src/agent/review/gates.rs:431-473 (GatewayStatusFinal); run_envelope.rs (assert_final_review_status_valid / assert_gateway_status_valid); CLAUDE.md「Gateway/finalReview status enums are closed sets (R9.10.e)」",
+        "rule": "gateway_status / final_review_status 是封闭集合(approved/blocked_by_required_field/blocked_by_budget/blocked_unverified_product_claim/blocked_by_safety_guard/held_by_ai_policy/no_reply/revision_failed 等);写入未知 status 必须在 DB 写入站点被拒绝,绝不能静默强转",
+        "kind": "红线"
+      },
+      {
+        "name": "hold_category 三选一闭集",
+        "entry": "src/agent/review/gates.rs:757-791 (assert_hold_category_valid); types.rs (HOLD_CATEGORY_* 常量)",
+        "rule": "Review Agent 输出 should_hold=true 时 hold_category 必须是 held_by_ai_policy / blocked_by_safety_guard / ai_waiting_for_more_context 三者之一;非法值被强制矫正为 held_by_ai_policy 并落 autonomy_hold_category_invalid warning 事件。绝不能出现三者之外的 hold 状态名",
+        "kind": "红线"
+      },
+      {
+        "name": "自治协议必填/枚举校验(blocked_by_required_field)",
+        "entry": "src/agent/review/gates.rs:554-580 (has_protocol_violation) + 870-875 (is_protocol_violation_tag)",
+        "rule": "missing_required_field / invalid_enum_value / invalid_type / decision_phase_invalid 任一结构性协议违规→强制 blocked_by_required_field、should_reply=false、autonomy_mode=blocked,无法靠改写补救。注意 insufficient_detail_in_critical_turn(字段已输出但偏短)刻意不算硬违规,走 single-shot revision",
+        "kind": "红线"
+      },
+      {
+        "name": "Outbox 幂等键先于 MCP 发送",
+        "entry": "src/agent/outbox.rs:8 (idempotency_key=sha256(source_event_id:contact_wxid:content_hash)) + enqueue/compute_synthetic_key; CLAUDE.md「Outbox + idempotency」",
+        "rule": "approved 决策在调 MCP message_send_text 前必须先入 agent_send_outbox 并带幂等键;命中同 idempotency_key unique 索引→IdempotentSkip 不发第二次。媒体/手动发送走 synthetic 前缀键。用户拒绝/冷却取消 pending outbox 条目。绕过网关直发是 bug",
+        "kind": "红线"
+      },
+      {
+        "name": "统一发送网关不可绕过",
+        "entry": "docs/agent-policy.md:110; CLAUDE.md「Every send flows through the same gateway」; src/agent/gateway.rs::run_user_operation_gateway",
+        "rule": "任何自动发送(webhook 自动回复 + follow-up 定时任务)都必须走同一网关:reload context→检查 managed/cooldown/min-interval/daily cap/expiry→Reply Agent→独立 Review→可选一次 revision→outbox→MCP。只有 agent_status=managed 联系人获自动回复,normal 仅持久化不回。绕过网关是 bug",
+        "kind": "红线"
+      },
+      {
+        "name": "AI 永不直写成交 outcome_events",
+        "entry": "src/agent/gateway.rs:4177,4957; src/db/mod.rs:267; routes/admin_suspected_deals.rs:7,191; models.rs:2946,6077; agent/entitlements.rs:292,462",
+        "rule": "AI 绝不能直接写 Contact.outcome_events 正式成交;疑似成交信号只 upsert 进待核实专表(status=pending),只有运营 approve(verification=staff_confirmed)才落正式成交。deal_events 手动标记是唯一 T0 真相源,成交真相源分级是「AI 永不自断成交」红线载体",
+        "kind": "红线"
+      },
+      {
+        "name": "画像/profile/候选须人审才生效",
+        "entry": "src/routes/domain_profiles.rs:30,662,942; routes/guide_profile.rs:10,455; CLAUDE.md「Dual-layer tagging」「画像draft不自动生效」",
+        "rule": "引导层 AI 生成的 domain profile 必须人审才能 activate(继承 AI 永不自动 verify);AI 建议的维度取值落 taxonomy_candidates 候选层,绝不直接进 system_taxonomies;customer_stage/intent_level/objection_type 必须来自 system_taxonomies,未审候选不得阻塞 run 也不得生效",
+        "kind": "红线"
+      },
+      {
+        "name": "AI 永不覆盖运营手动标签(manual)",
+        "entry": "src/routes/contacts.rs:687; routes/management.rs:748; project_tag_trust_reform 记忆",
+        "rule": "manual_tags 是运营权威层,AI 永不覆盖该字段;AI 标签三层物理隔离(manual 运营权威/confirmed AI/tag_observation 暂定),personality/bayesian 信号只写不进决策(永不驱动铁律)",
+        "kind": "红线"
+      },
+      {
+        "name": "AI 永不自动 promote 经验为 peer_case",
+        "entry": "src/routes/mod.rs:936; docs/agent-policy.md:729 (Phase D lessons_learned)",
+        "rule": "lessons_learned 晋升为 chunk_type=peer_case 候选必须 admin 手工触发 POST promote-to-peer-case;晋升后默认 integrity_status=needs_review+status=draft,仍走 chunk review queue 二次确认才能 verify。AI 绝不能自动 promote",
+        "kind": "红线"
+      },
+      {
+        "name": "演化器与主链路物理隔离(R9.4)",
+        "entry": "scripts/check-evolution-isolation.sh; docs/agent-policy.md:377",
+        "rule": "src/evolution/ 绝不能引用 crate::agent::gateway / crate::agent::outbox / crate::mcp:: / agent_send_outbox.insert / mcp_client.send / run_user_operation_gateway 等主链路符号;CI grep 命中即 exit 1。shadow replay 零副作用:100 次后 outbox 与 conversation_messages outbound size 不变",
+        "kind": "红线"
+      },
+      {
+        "name": "演化器自我引用悖论禁止(R10.1)",
+        "entry": "docs/agent-policy.md:355,381 (W2 内置黑名单); src/evolution/lint.rs",
+        "rule": "Critic LLM 自身 prompt 永不进入 prompt evolution 循环;演化器绝不能演化自己的代码/配置/Critic prompt/显著性算法,只演化被运营 Agent 用到的阈值与 prompt。release 的 prompt diff 须经 validate_diffs 剥离禁词(同 no-human-takeover 规则)+长度上下界",
+        "kind": "红线"
+      },
+      {
+        "name": "安全闸放松零容忍回归门(#152)",
+        "entry": "docs/agent-policy.md:349,364 (EVOLUTION_MAX_SAFETY_REGRESSION_RATE 默认 0.0)",
+        "rule": "放松安全闸(fact_risk_block/pressure_risk_block/product_accuracy_score_block)的 threshold 候选必须过反向显著性门:shadow 中原配置被安全闸拦下、新配置却放行的比例超过 0.0(零容忍)即判 safety_gate_regression,凌驾于 send_success 提升之上。绝不能用「发送成功率提升」证明放松正当",
+        "kind": "红线"
+      },
+      {
+        "name": "知识子系统不可暗示模型品牌",
+        "entry": "scripts/check-no-model-hint.sh; docs/agent-policy.md:669-671",
+        "rule": "prompt/schema/UI/docs/错误信息里绝不能硬编码具体模型名(GPT-4/Claude/Gemini/DeepSeek/Qwen 等)或品牌词(Anthropic/OpenAI/千问/豆包/文心/kimi 等)做广告暗示;LLM provider 由用户自填,ChunkProvenance.llm_model_alias 仅写 provider_id。每次 PR 必跑 check-no-model-hint.sh",
+        "kind": "红线"
+      },
+      {
+        "name": "状态 action 策略 forbidden 拦截",
+        "entry": "src/agent/guards.rs:271-292 (enforce_state_action_policy)",
+        "rule": "operation_state_policies 行校验候选 action:forbidden 命中→state_action_forbidden(优先级最高);allowed 非空且不含 action→state_action_not_allowed(白名单收敛)。policy 缺失或 status!=active 时 fail-open 向后兼容老部署",
+        "kind": "红线"
+      },
+      {
+        "name": "reviewer 独立性(遮罩 reply-agent 推理)",
+        "entry": "src/agent/review/gates.rs:56-74 (build_reviewer_decision_view)",
+        "rule": "reviewer 输入只暴露候选回复事实面(should_reply/reply_text/used_knowledge_ids/stage 等),绝不能喂 reply-agent 的自洽推理字段(user_understanding/self_critique/why_should_reply/reasoning doc 等),否则形成 reviewer 追认 reply-agent 的自洽幻觉。独立 Review Agent 未通过不发送",
+        "kind": "红线"
+      },
+      {
+        "name": "Group/Moments 不折叠进 user-ops + 高危工具默认不自动",
+        "entry": "CLAUDE.md「Phase 1 scope」; docs/agent-policy.md:155-234 (Group/Moment/Tool Risk Levels); src/agent/domain.rs (OpsDomain trait 边界)",
+        "rule": "群运营/朋友圈是独立运营域,绝不能折叠进 user-ops 代码路径;默认禁止自动群内发言/邀请/移除/改公告/解散、朋友圈无规则自动发布。高危 MCP 工具(moment_post_*/group_* 修改类/friend_delete/account_logout/personal_update_*/gewe_execute_raw)默认不自动;管理 Agent requiresConfirmation=true 须等人工确认",
+        "kind": "红线"
+      }
+    ]
+  },
+  {
+    "anchor": "新增业务",
+    "notes": "从【2026-06 新增业务】锚点穷举七大特性,逐一定位入口+核心规则。全部经 Read/Grep 核实,file:line 亲自确认。覆盖盲区提示:多数特性有专属 tests/ 集成测试(suspected_deal_e2e.rs / ask_human_phase1_e2e.rs)且为 #[ignore] 需 Docker,本地 cargo test --lib 不跑;campaign 派发去重/分档注入/pacing 节流/evolution prompt release 三红线闸是最可能未被 lib 单测覆盖的业务路径(部分有纯函数单测如 pacing.rs 5 测、entitlements suspected_deal guidance 测,但 dispatch/gateway upsert/CAS 等 DB 路径靠集成测试)。evolution prompt 通道关键事实:replay.rs prompt 现阶段走 prompt_shadow 真采样(非旧 placeholder),release_prompt 经三红线闸(禁词+锚点+LLM语义),LLM 不可用时 fail-closed 中止 release(不放水)。",
+    "capabilities": [
+      {
+        "name": "campaign 营销活动批量派发",
+        "entry": "src/routes/campaigns.rs:281",
+        "rule": "create_campaign/preview_campaign/dispatch_campaign/campaign_sends_report/list_campaigns 五端点(routes/mod.rs:795-798)。dispatch 重跑圈人防预览后数据漂移(resolve_segment_contacts),命中 0 人返 BadRequest;活动级去重靠 campaign_sends 唯一索引 (campaignId,contactWxid),DuplicateKey→已推过跳过;每命中一人建 follow-up task(build_campaign_follow_up_task 注入 intent_text)再回填 taskId;status 经 assert_campaign_status_valid 闭集校验(dispatching→completed)。classify_send_outcome(campaigns.rs:387) 把台账+run_log 归桶 sent/pending/blocked/canceled/escalated/skipped/unknown,outbox_status=sent 优先,escalated(请示通道,后续会续推)与 blocked(纯频控无后续)区分。所有真实推送仍走统一 gateway(task→worker)。",
+        "kind": "route+worker"
+      },
+      {
+        "name": "evolution prompt 自进化(提议→影子重放→人工发布)",
+        "entry": "src/evolution/mod.rs:80",
+        "rule": "run_one_tick: 信封→runtime_flag 灰度分桶(hash(contact_id)%100<rollout_percent,读失败按 disabled 不误开门)→cohort 过滤→threshold 候选(纯统计不消预算)→prompt_critic 候选(消 EvolutionBudget,BudgetExceeded 不上抛只写事件)→replay::eval_all 影子重放(prompt 走 prompt_shadow 真采样,新旧 prompt 唯一变量推 5 闸命中再推 final 状态)→significance 聚合定级→状态推 awaiting_admin(eligible_for_release 须 admin 二次确认)。release_prompt(release.rs:198) 仅 status=eligible_for_release 可发,经红线三闸:禁词+锚点完整性(原文逐字保留+critic 片段末尾追加 compose_appended_content)+LLM 语义审查 review_prompt_edit(变相真人转介/削弱 grounding 等语义绕过→Reject→RedlineGateRejected 不写库);LLM 不可用(NeedsHumanConfirm)→fail-closed 中止 release 不放水。发布成功 fetch_add prompt_pack_version 失效 LRU。admin 端点 /evolution/{experiments,proposals/:id,proposals/:id/release,proposals/:id/rollback,threshold-overrides/audit,runtime-flag}(routes/mod.rs:1012-1034),EVOLUTION_ENABLED 灰度门控。",
+        "kind": "worker+route"
+      },
+      {
+        "name": "content-assets 文本资产分档注入",
+        "entry": "src/agent/decision.rs:1483",
+        "rule": "load_context_assets 按 PromptTier(Lean<Relational<Full)分档注入文本资产:asset_visible_at_tier(decision.rs:1458) 当前档序>=资产 min_inject_tier 序时可见,min_tier=None/非法→按 full(仅 Full 可见,等价改造前);visible_min_tiers_for 派生 $in 下推保单值/集合语义一致(Lean→{lean};Relational→{lean,relational};Full→全);Full 档额外纳入 min_inject_tier 字段缺失的老数据。query 过滤 workspace+account(或 account_id=null)+kind∈{text,faq,script,brand_voice,forbidden_expression}+tier_cond,按 updated_at 倒序 limit 12。另有 load_sendable_assets(decision.rs:1368) 取 sendable+approved 媒体资产 limit 30。admin 端点 GET/POST /content-assets(assets.rs:55/124)+upload/review/toggle/file(media_assets.rs)。",
+        "kind": "agent+route"
+      },
+      {
+        "name": "digital-twin 数字分身关系性质(relationship-type)建议→审核回写",
+        "entry": "src/agent/gateway.rs:4118",
+        "rule": "决策后 extract_relationship_type_suggestion(gateway.rs:4943) 从 agent_generated_signals 提 kind=relationship_type 弱信号(value/evidence/confidence,与 entitlements.rs:333 render_relationship_type_suggestion_guidance 注入契约逐字对齐)。经 dimension_registry::validate_dimension_value(MachineWrite) 校验:LLM 臆造非字典值 Reject/Drop 不污染审核队列(canonical seed customer/peer/friend,m024);合法→upsert 建议表锚 (workspace_id,contact_id,status=pending),已审(approved/rejected)不复活($setOnInsert 撞 unique 锚 no-op),$inc occurrences。全程 fail-soft 不阻断已发回复。审核:approve_relationship_suggestion_inner(admin_relationship_suggestions.rs:126) 仅 pending 可批,AdminWrite 校验越界恒 Reject,先写 contact.domain_attributes.relationship_type 再 mark approved(失败仍 pending 下次幂等)。端点 /admin/relationship-suggestions[+/:id/approve|reject](routes/mod.rs:844-852)。relationship_type 稳定属性不每轮臆测,只在新证据出现时报。",
+        "kind": "agent+route"
+      },
+      {
+        "name": "suspected-deals 疑似成交弱信号→运营核实落成交",
+        "entry": "src/agent/gateway.rs:4176",
+        "rule": "决策后 extract_suspected_deal_signal(gateway.rs:4958) 提第一个 kind=suspected_deal 信号(非字典维度,无 registry 校验,直用 value/evidence/confidence),upsert 待核实专表 status=pending,锚 (workspace_id,contact_id,status=pending),已审不复活,$inc occurrences,fail-soft。render_suspected_deal_guidance(entitlements.rs:302) 仅本 workspace 有 active 产品时非空注入,引导 LLM 走弱信号通道+主动求证话术,绝不直写 outcome_events(红线 §2.1)。核实:approve_suspected_deal_inner(admin_suspected_deals.rs:139) CAS-first:先原子 CAS pending→approved(matched==0 即并发/已审/跨 ws 直接挡,根治 append-only 财务双计)再落正式成交,verification 强制 staff_confirmed(AI 永不直写),失败留漏登假阴(可手动补登)而非双计假阳;reject 须非空 reason。端点 /admin/suspected-deals[+/:id/approve|reject](routes/mod.rs:858-865)。",
+        "kind": "agent+route"
+      },
+      {
+        "name": "account send-pacing 账号级发送节流(拟人化)",
+        "entry": "src/agent/outbox_dispatcher.rs:719",
+        "rule": "outbox dispatcher 发送前账号级最小发送间隔闸:account_last_sent_at_ms 查该账号上次实发,now-last<随机间隔则 defer_account_pacing reschedule(写 agent.send_deferred_account_pacing 事件)。间隔由 pacing::account_send_interval_ms(pacing.rs:15) 纯函数把 fastrand::f64() 抖动线性映射到 [account_send_min_interval_ms,account_send_max_interval_ms](clamp [0,1],max<min 退 min)。位置在 reclaim 幂等门之后(不误拦 post-hoc 标 sent)、发送之前;查询失败 fail-soft 放行(宁漏限不丢消息)。防单 worker 串行循环跨客户/多段背靠背零间隔=机器特征。pacing.rs 有 5 个纯函数单测。",
+        "kind": "worker"
+      },
+      {
+        "name": "ask-human 请示通道(幕后领导决策,非人工接管)",
+        "entry": "src/agent/escalation/policy.rs:21",
+        "rule": "resolve_ask_human_policy 解析 OperationDomainConfig.ask_human_policy(显式配置优先);缺省时按 high_risk_escalation_mode=='all'→escalate_ai_policy_hold,否则 DecisionOnly 默认(safety_guard/unverified_product/stuck 升级,ai_policy_hold 不升级),principal_decider 单人成链。escalate_held_decision(escalation/mod.rs:40) hold 路径:推领导卡+落 pending 台账+写 awaiting 标记,不向客户发任何消息(客户安抚由网关 ensure_customer_acknowledged 解耦负责)。骚扰门 push_allowed(policy.rs:68):daily_push_cap/dedupe_window_hours/quiet_hours(in_quiet_hours 支持跨午夜+tz_offset)任一不满足不推,全 None 字节等价全放行。超时 next_decider_on_timeout 转链中下一位(timeout_hours=None 无限等待)。领导回复 match_principal_reply/short_code 提取,relay 经 relay_output_leaks_internal_payload/relay_introduces_unauthorized_number 出站守卫,sanitize_verdict 清洗;authorization_is_usable 过期返中性话术。admin 端点 /admin/ask-human/{inbox,summary}(ask_human_inbox.rs:418/453)+/admin/principal-escalations[+resolve|reassign];put_ask_human_policy 配置(routes/mod.rs:758)。scan_escalation_timeouts 后台扫超时。",
+        "kind": "agent+route+worker"
+      }
+    ]
+  },
+  {
+    "anchor": "发送主链路",
+    "notes": "从入站到发送的全链路按代码实际顺序穷举。三大文件分工：src/webhooks.rs 负责入站解析→去抖聚合→managed/作息门；src/agent/gateway.rs 负责决策→评审→revision→finalize 闸→入 outbox；src/agent/outbox.rs + outbox_dispatcher.rs 负责幂等入队→崩溃恢复→二次安全门→MCP 发送；src/mcp.rs 负责真正的 message_send_text JSON-RPC 调用。关键不变量已逐条核实：HMAC 常时间比对、dedupe 靠 11000 唯一索引原子去重、去抖按联系人单 runner 串行 + generation 抢占重算、5 闸 finalize 强制 should_reply=false、单次 revision、outbox idempotency_key=sha256(source_event:contact:content_hash)、二次安全门(cooldown/stop/30min stale)、撤管 cancel、掉线/节奏 defer 不耗 attempt、MCP 30s timeout + post-hoc mcp_call_logs 核对防重发。未找到的部分如实标注：媒体理解链路 fetch_inbound_media 当前打桩恒 None（F2 未接通），非文本入站只发过渡话术。",
+    "capabilities": [
+      {
+        "name": "Webhook HMAC 签名校验",
+        "entry": "src/webhooks.rs:295-308 wechat_webhook / verify_hmac_sha256:1132",
+        "rule": "WEBHOOK_VERIFY_SIGNATURE 开(默认)时,用 MCP_API_KEY 对 raw body 做 HMAC-SHA256,与 header X-MCP-Signature hex 常时间比对(verify_slice 防 timing attack);任一为空/解码失败/不匹配→400 invalid signature,不泄露原因",
+        "kind": "e2e闭环"
+      },
+      {
+        "name": "控制事件短路(探活/在线状态)",
+        "entry": "src/webhooks.rs:323-362",
+        "rule": "testMsg 探活直接 ack;TypeName=Offline/Online 落 accounts.online 建状态源(供 dispatcher 发送前 gate)后 ack;三类控制事件不喂 Agent、不占限流配额,保证 MCP 5s timeout 内收到 ack",
+        "kind": "e2e闭环"
+      },
+      {
+        "name": "appId→account 上下文解析",
+        "entry": "src/webhooks.rs:369-383 / resolve_account_context:939",
+        "rule": "按 appId 查 wechat_accounts 解出 (workspace_id, account_id);未注册的 appId 不再静默回退 default,写 webhook_unknown_app_id 事件后明确 400,避免 inbound 落错 account 致 managed 永远 lookup 不到",
+        "kind": "e2e闭环"
+      },
+      {
+        "name": "per-account 入站限流",
+        "entry": "src/webhooks.rs:385-398 / limiter_for:39",
+        "rule": "按 account_id 令牌桶(capacity/window 来自 config),超额返回 429 + retry_after;命中写 webhook_rate_limited 事件,dedupe_key=rate_limit:{account}:{day_bucket} 经 partial unique 索引当日去重防事件爆量",
+        "kind": "e2e闭环"
+      },
+      {
+        "name": "领导回复分流(请示通道)",
+        "entry": "src/webhooks.rs:436-450 / escalation::handle_principal_reply",
+        "rule": "在落库/managed 处理之前,若 from_wxid 是本 workspace 的 principal_decider→走请示通道 handle_principal_reply;consumed=true 短路返回 routed:principal,避免领导消息被当客户入站处理",
+        "kind": "e2e闭环"
+      },
+      {
+        "name": "入站类型解析 + 媒体引用提取",
+        "entry": "src/webhooks.rs:486-503 / parse_inbound_msg_type:868 / extract_inbound_media_ref:910",
+        "rule": "从 payload 归一 msg_type(仅认 MsgType/msgType 专用键,刻意不收泛化 type 防误命中;未知码→unknown 不当 text);非 text 才提取媒体引用,找不到返回 None 不造假;无类型字段默认 text 保持纯文本主链路不变",
+        "kind": "e2e闭环"
+      },
+      {
+        "name": "入站消息原子去重落库",
+        "entry": "src/webhooks.rs:486-510 / is_duplicate_key_error:804",
+        "rule": "dedupe_key 优先用 sourceMsgId,缺失则 payload 稳定哈希;直接 insert_one + 捕获 11000/11001 duplicate key(依赖 workspace+account+dedupe_key partial unique 索引)原子去重,消除 check-then-insert 的 TOCTOU 双写;命中重复返回 {duplicate:true}",
+        "kind": "e2e闭环"
+      },
+      {
+        "name": "联系人解析/upsert + 时间戳/行为信号",
+        "entry": "src/webhooks.rs:512-568 / upsert_webhook_contact:994 / collect_inbound_behavior_signals:755",
+        "rule": "按 (workspace,account,wxid) 查 contact,无则 upsert 为 normal 影子记录(并对跨 account managed 错配写 mismatch 事件);更新 last_inbound_at 前快照 prev_* 时间用于 T1 行为信号(reply_latency/length/reactivation),采集是 best-effort 旁路失败仅 warn 不阻断应答",
+        "kind": "e2e闭环"
+      },
+      {
+        "name": "managed 门(只回托管联系人)",
+        "entry": "src/webhooks.rs:578",
+        "rule": "contact.agent_status==Managed 才进发送链路;normal/其它状态只持久化入站不应答(managed=false 时响应 queued=false)",
+        "kind": "e2e闭环"
+      },
+      {
+        "name": "作息时段延迟回复门控",
+        "entry": "src/webhooks.rs:604-612 / ensure_wake_followup_task:663 / quiet_hours",
+        "rule": "静默时段(运营方时区)客户来消息不立即回,排一条 deferred_inbound_reply 跟进任务到醒来时刻(去重:同 contact 已有未终态 wake 任务则不重插);醒来由 task worker→handle_follow_up_task→gateway 基于累积消息一次回",
+        "kind": "e2e闭环"
+      },
+      {
+        "name": "去抖聚合 + 单联系人串行 + 抢占重算",
+        "entry": "src/webhooks.rs:614-639 register_inbound:105 / run_debounce_pipeline:130",
+        "rule": "按联系人单 runner(PENDING DashMap entry 存在即 runner 存活)天然串行;每条入站刷新 deadline(去抖窗口重置)+generation+1;首条 entry 在 shard 锁内原子决定 spawn(防 double-spawn),后续只 bump;runner 等去抖到点跑一次聚合,运行期 generation 变了即 barge_in 抢占重算;退休用 remove_if 谓词复核 generation 未变,证明边界期到达消息不丢;runner panic 捕获后移除 state 下条重 spawn(注:进程内 DashMap,串行仅单副本成立)",
+        "kind": "e2e闭环"
+      },
+      {
+        "name": "单次用户反应分析(claim lock)",
+        "entry": "src/webhooks.rs:188 / agent::record_user_reaction",
+        "rule": "每串只在最新入站上跑一次反应分析→串行化修反应写竞态;失败写 agent_error 事件但不阻断后续聚合网关",
+        "kind": "e2e闭环"
+      },
+      {
+        "name": "聚合网关入口(带抢占 guard)",
+        "entry": "src/webhooks.rs:205 handle_managed_message_aggregated / gateway.rs:120,574 run_user_operation_gateway",
+        "rule": "webhook 自动回复与跟进任务走同一 gateway;reload context→构建 RunBudget(token/call 预算 task_local 注入)→resolve_thresholds 把 release 阈值写回 runtime→进 inner;should_abort_send guard=barge_in_triggered,让过时生成在落盘/入队前主动放弃",
+        "kind": "e2e闭环"
+      },
+      {
+        "name": "precheck 发送前门(冷却/限流/日上限/过期/作息)",
+        "entry": "src/agent/gateway.rs:939,2971 precheck_send_gateway",
+        "rule": "reload 后检查 cooldown/rate_limited(min_reply_interval)/policy_cooldown/expired(跟进任务过期)/quiet_hours_deferred;not_allowed 时按 status 取消或重排任务+写 agent_skipped 事件+写 run log,并经 ensure_customer_acknowledged 视情补中性占位(主动 follow-up 跳过冷却类门)",
+        "kind": "e2e闭环"
+      },
+      {
+        "name": "非文本入站过渡话术拦截",
+        "entry": "src/agent/gateway.rs:995 maybe_handle_non_text_transition",
+        "rule": "image/voice/link/file/unknown 等非文本入站在进决策前拦下(媒体理解 fetch_inbound_media 当前打桩恒 None 未接通),发一条 AI 自治口吻过渡话术请客户文字补充并走 outbox,绝不把空串/原始 XML 当文本硬答、绝不崩;text 继续主链路",
+        "kind": "e2e闭环"
+      },
+      {
+        "name": "知识路由(catalog→search→open_slice)",
+        "entry": "src/agent/gateway.rs:1057-1081 route_operation_knowledge",
+        "rule": "每轮先跑知识路由(含硬关键词快路径)再让 Reply Agent single-pass 决策(修复旧两段式寒暄态致知识永进不来);预算超额则降级 empty_knowledge_route 标 degraded;select_operation_knowledge_chunks 产出 selected_chunks 供决策/评审/grounding",
+        "kind": "e2e闭环"
+      },
+      {
+        "name": "Reply Agent 决策(渐进式三档)",
+        "entry": "src/agent/gateway.rs:1088-1326 decide_reply_with_promote / sufficiency",
+        "rule": "第一程 Lean 瘦档自评 sufficiency→decide_tier_escalation 决定直接进闸/升档 Full 重生成/澄清;自评 enough 但 coverage=missing 且需知识→强制升 Full(最多一次);仅经 Full 知识档(forced_full/escalated_to_full)才记 used_knowledge_ids 防架空 grounding;PROGRESSIVE_TIER_ENABLED 关→退单程 Full(kill switch)",
+        "kind": "e2e闭环"
+      },
+      {
+        "name": "独立评审 Agent",
+        "entry": "src/agent/gateway.rs:1380-1400 review_decision / should_run_review",
+        "rule": "决策后跑独立 Review Agent(异于决策的评分:HumanLikeScore/EmotionalValue/FactRisk/PressureRisk/ProductAccuracyScore + grounding/style);预算超额降级 local_decision_review;route_dual_gate 区分软闸(needs_revision)与硬闸(hallucination/grounding 写非空 rewrite_instruction)",
+        "kind": "e2e闭环"
+      },
+      {
+        "name": "rewrite 重写(硬闸失败一次)",
+        "entry": "src/agent/gateway.rs:1403-1497",
+        "rule": "should_reply 且 review 未过且非 needs_revision(即硬闸 hallucination/grounding)→写 rewrite_requested 决策记录,带 rewrite_instruction 二次 decide_reply(Full 档)后再 review 一次;名片引荐意图不因 tone-polish 改写丢失(沿用改写前);预算超额跳过 rewrite 直接走拦截",
+        "kind": "e2e闭环"
+      },
+      {
+        "name": "finalize 五闸硬安全门",
+        "entry": "src/agent/gateway.rs:1523-1540 finalize_review_for_send",
+        "rule": "统一汇总三分支 review:FactRisk≥6/PressureRisk≥7 block,HumanLikeScore<6/EmotionalValue<5 rewrite once,ProductAccuracyScore<7 block 产品声明,未验证产品声明→blocked_unverified_product_claim(priced_from_catalog 并联背书,受 transaction_facts_enabled 闸);任一硬门强制 should_reply=false+autonomy_mode=blocked,产出 pending_events 持久化;任何上游 approved 不得绕过本调用",
+        "kind": "e2e闭环"
+      },
+      {
+        "name": "operation_state 动作策略门(GATE-1)",
+        "entry": "src/agent/gateway.rs:1551-1560,815 apply_state_action_gate / enforce_state_action_policy",
+        "rule": "finalize Approved 后按 contact 当前 operation_state 校验该态是否允许本次 action;命中 forbidden/allowlist 收敛不含→held_by_ai_policy+should_reply=false+追加 state_action_policy_blocked 风险+审计;老库无 policy 行 fallthrough 向前兼容不绕过 outbox;初次与 revision 后各检一次",
+        "kind": "e2e闭环"
+      },
+      {
+        "name": "single-shot revision(单次重试)",
+        "entry": "src/agent/gateway.rs:1614-1640+",
+        "rule": "Approved 且 needs_revision 且非 hold 且 revision_direction 非空且预算未超额且单 run 未重试过→二次 Reply Agent(30s timeout);超时/错误→revision_failed;二次 review 仍 fail→gateway_status=revision_failed+should_reply=false;另有 Phase D/D2 风格指纹 3/5 轴漂移强制 revision 向 last_outbound_style 靠拢",
+        "kind": "e2e闭环"
+      },
+      {
+        "name": "superseded 去抖中止(文本+媒体两轨)",
+        "entry": "src/agent/gateway.rs:2407-2418 should_run_send",
+        "rule": "入队前复查 should_abort_send guard;客户又发新消息(generation 变)→放弃本 run 不入队,下一轮真回;media_pending 纳入(只要本 run 会发文本/素材/名片就受去抖保护,防 superseded run 发孤立文件)",
+        "kind": "e2e闭环"
+      },
+      {
+        "name": "回复拆短多段 + 逐段独立幂等",
+        "entry": "src/agent/gateway.rs:2429-2493 split_reply_into_segments",
+        "rule": "整条回复拆成多条短消息逐条 enqueue,每段把序号拼进 source_event_id({src}#seg{idx})保证 N 段幂等 key 不碰撞(避免两段雷同内容 content_hash 相同被误去重吞掉);单段失败不中断继续发剩余段,循环后有失败写 outbox_enqueue_partial_failure 并返首错(已入队段不回滚)",
+        "kind": "e2e闭环"
+      },
+      {
+        "name": "outbox 强幂等入队",
+        "entry": "src/agent/outbox.rs:166 enqueue / compute_synthetic_key:399 / media_routes_synthetic:444",
+        "rule": "idempotency_key=sha256(source_event_id:contact:content_hash),agent_send_outbox 唯一索引兜底永不发两次;空 source_event_id(跟进任务)走 synthetic:run_id:contact:hash 兜底+warning 事件;manual_send 摘 run_id 改 account+contact+content+day_bucket(双击当日去重次日可重发);媒体/名片条目一律 synthetic 且 key 含 asset_id/card_id(content 空 sha256(\"\")相同会撞键漏发);DuplicateKey→IdempotentSkip 不重发",
+        "kind": "e2e闭环"
+      },
+      {
+        "name": "dispatcher 崩溃恢复(reclaim 过期租约)",
+        "entry": "src/agent/outbox_dispatcher.rs:77 reclaim_expired_leases / 114 atomic_claim_pending / tick:1021",
+        "rule": "worker 5s 轮询:先把 in_flight 且 locked_until<now 的 entry 改回 pending 并置 reclaimed_in_flight=true(标记上个 worker 可能已送达,重发前须 post-hoc 核对);findOneAndUpdate returnDocument:After 原子抢占 pending(多 worker 并发恰好一个成功),切 in_flight+worker_id+lease=60s;单 tick 处理上限 16 防饿死",
+        "kind": "e2e闭环"
+      },
+      {
+        "name": "二次安全门(发送前 cooldown/stop/陈旧)",
+        "entry": "src/agent/outbox_dispatcher.rs:153 second_safety_gate / outbox.rs:497 check_second_safety_gate_pure",
+        "rule": "发送前再查:contact.cooldown_until>now→contact_cooldown_active;last_inbound>decision_created 且 outcome 命中 stop/cooldown_requested→user_stop_requested_after_decision;entry 超 30min→outbox_stale_30min;任一命中 cancel_entry(仅 in_flight)+写 outbox_canceled+回写 run log",
+        "kind": "e2e闭环"
+      },
+      {
+        "name": "撤管状态门(发送前 agent_status 复查)",
+        "entry": "src/agent/outbox_dispatcher.rs:557,614 check_contact_status_pure",
+        "rule": "入队后到抢占间 contact 可能被改 normal/paused(撤管),非 managed 且非 manual_send→cancel(contact_status_changed_unmanaged)实现撤管即停;manual_send(admin UI 主动)不受此门约束;contact 查不到→走 retry/terminal",
+        "kind": "e2e闭环"
+      },
+      {
+        "name": "账号掉线/节奏 defer(不耗 attempt)",
+        "entry": "src/agent/outbox_dispatcher.rs:396 defer_account_offline / 465 defer_account_pacing",
+        "rule": "发送前查 account.online,掉线→推后 next_retry_at 60s、attempt 不变、不走 terminal,恢复后照常抢占发(account 查不到保守放行);账号级最小发送间隔闸(随机区间)防连珠炮机器特征,距上次实发过近→reschedule 到 last_sent+interval,attempt 不变;均 fail-soft,查询失败放行宁漏限不丢消息",
+        "kind": "e2e闭环"
+      },
+      {
+        "name": "崩溃/超时 post-hoc 核对防重发",
+        "entry": "src/agent/outbox_dispatcher.rs:521 mcp_already_succeeded / process_entry:645,807",
+        "rule": "reclaimed_in_flight 或 30s timeout 后,去 mcp_call_logs 查 5min 内同 recipient+同 content(媒体用 media_id,名片跳过核对保守重发)且 error=null 的成功记录;命中即标 sent 不重发+写 outbox_sent_post_hoc,避免回包慢于 timeout 时给客户重复消息/文件",
+        "kind": "e2e闭环"
+      },
+      {
+        "name": "MCP 发送(30s timeout + 状态推进)",
+        "entry": "src/agent/outbox_dispatcher.rs:574 process_entry / 742 send_fut",
+        "rule": "按条目类型选 send_outbound_namecard/send_outbound_media/send_outbound_message,tokio timeout 30s 包裹;成功→status=sent+sent_at+清 worker 字段+写 outbox_sent+回写 run log+素材/名片记发送台账;失败→schedule_retry_or_terminal(attempt+1,backoff=2^attempt*5s±20% jitter,达 max_attempts→failed_terminal);单 entry 事件 ≤20 条(write_event_with_cap)防 retry 风暴",
+        "kind": "e2e闭环"
+      },
+      {
+        "name": "出站文本发送 + 落库降级",
+        "entry": "src/agent/gateway.rs:2803 send_outbound_message",
+        "rule": "调 mcp::logged_call_for_account message_send_text;MCP 成功=既成事实,此后任何 DB 写失败(conversation_messages/contact 时间戳)只记审计事件不返 Err(否则 dispatcher retry 重发);账号当日 sent 达软上限写 warning(仅告警不拦);写 last_outbound_style 风格指纹供下轮 reviewer style_diverged 判定",
+        "kind": "e2e闭环"
+      },
+      {
+        "name": "MCP JSON-RPC tools/call 出栈",
+        "entry": "src/mcp.rs:144 logged_call_for_account / call_tool_with_key:39",
+        "rule": "按 account 解 MCP 凭证(account 自带 mcp_base_url/mcp_api_key 否则回退 config),POST {base}/mcp 带 Bearer + jsonrpc tools/call,取 result.structuredContent;HTTP 非 2xx 或 body.error→AppError::External;每次调用(成功/失败)落 mcp_call_logs(request/response/error)供 post-hoc 核对与审计",
+        "kind": "e2e闭环"
+      },
+      {
+        "name": "用户反应驱动的取消通道",
+        "entry": "src/agent/outbox.rs:545 cancel_for_contact_on_user_reaction",
+        "rule": "用户回 stop/cooldown 信号时,把同 contact 名下 pending/in_flight 的 outbox 全置 canceled(cancel_reason=user_reaction_stop_requested)+清 worker 字段,让 dispatcher 不再推进;仅 pending/in_flight 可取消(sent/canceled/failed_terminal noop 防污染审计);并发已推进的 modified_count=0 跳过不写事件",
+        "kind": "e2e闭环"
+      }
+    ]
+  },
+  {
+    "anchor": "数据集合",
+    "notes": "穷举依据：src/db/mod.rs(typed accessor 全清单,行64-393)+ src/db/indexes.rs(raw collection 索引)+ grep 全 src 反查每个 accessor 的读写点。\"无 typed accessor\"的集合走 raw().collection::<Document>(...)。确认的死集合只有 operation_knowledge_items（typed accessor 在 commit 2 删除，m011/m014 delete_many 物理清空，全 src 仅剩占位注释/410 端点/migration，零业务读写）。所有 typed accessor 中 collection_suspected_deal_signals 与 collection_relationship_type_suggestions 表面 grep 0 命中，因调用点用了别名方法名(.collection_suspected_deal_signals/.collection_relationship_type_suggestions 实际命中 6/8，是我第一轮 grep 把 collection_ 前缀算进 .$m() 误判，第二轮已纠正确认存活)。knowledge_chat_session_seqs/behavior_signals 命中少但确为活跃(原子自增/采集管道)。raw-only 集合: admin_users/admin_sessions(auth)、reviewer_stats/deal_attribution_stats/lessons_learned(knowledge_wiki feedback 闭环)、structural_proposals(knowledge_agent)。未单独核对每个集合的 workspace 隔离与索引细节。",
+    "capabilities": [
+      {
+        "name": "wechat_accounts(集合→微信账号实体)",
+        "entry": "src/db/mod.rs:64 accounts()",
+        "rule": "账号管理路由 CRUD + webhook 按 appId 解析账号 + gateway 读账号配置(MCP key/辅助模式开关);workspace_isolation 测试覆盖",
+        "kind": "collection"
+      },
+      {
+        "name": "contacts(集合→联系人/客户实体+画像)",
+        "entry": "src/db/mod.rs:74 contacts()",
+        "rule": "webhook 解析 fromWxid→contact;gateway 读 agent_status(managed/normal)决定是否自动回复;decision 写 customer_stage/intent/memory_summary/relationship_type;cold_contact_worker 扫休眠;m008/m010/m018/m027 backfill 画像字段",
+        "kind": "collection"
+      },
+      {
+        "name": "conversation_messages(集合→对话消息流)",
+        "entry": "src/db/mod.rs:78 messages()",
+        "rule": "webhook 持久化 inbound;gateway 读历史拼上下文+写 outbound;normal 联系人也只 persist 不回复",
+        "kind": "collection"
+      },
+      {
+        "name": "agent_tasks(集合→跟进任务队列)",
+        "entry": "src/db/mod.rs:82 tasks()",
+        "rule": "tasks.rs follow-up worker 按 TASK_WORKER_INTERVAL 轮询 claim 执行→走同一 gateway;observability.rs 暴露任务查询",
+        "kind": "collection"
+      },
+      {
+        "name": "agent_events(集合→agent 审计事件日志)",
+        "entry": "src/db/mod.rs:86 events()",
+        "rule": "gateway/guards 写审计事件(operation_state_transition_rejected 等);account_scheduler/planner_block_rate 读;observability 不直接但 outcomes 测试读",
+        "kind": "collection"
+      },
+      {
+        "name": "behavior_signals(集合→客观行为信号 append-only)",
+        "entry": "src/db/mod.rs:94 behavior_signals()",
+        "rule": "自学习采集管道 S1-S3 写客观行为量(reply_latency/length/reactivation/silence),不含 LLM 解释;(workspace_id,dedupe_key) partial unique 幂等",
+        "kind": "collection"
+      },
+      {
+        "name": "behavior_signal_metrics(集合→采集健康度日聚合)",
+        "entry": "src/db/mod.rs:100 behavior_signal_metrics()",
+        "rule": "P3 每日每 workspace 三态计数(_id={workspace_id}:{date});采集管道写,健康度查询读",
+        "kind": "collection"
+      },
+      {
+        "name": "mcp_call_logs(集合→MCP 调用日志)",
+        "entry": "src/db/mod.rs:104 mcp_logs()",
+        "rule": "mcp.rs 调微信账号/联系人/message_send_text 后写调用日志",
+        "kind": "collection"
+      },
+      {
+        "name": "content_assets(集合→内容素材库)",
+        "entry": "src/db/mod.rs:108 content_assets()",
+        "rule": "内容素材 CRUD 路由读写(25 处命中,活跃)",
+        "kind": "collection"
+      },
+      {
+        "name": "agent_souls(集合→agent 人格 Soul 版本)",
+        "entry": "src/db/mod.rs:112 agent_souls()",
+        "rule": "prompts 分层(Soul→System→Policy)读;decision 拼提示词时注入 customAgentInstructions/Soul;版本记入 run log promptVersions",
+        "kind": "collection"
+      },
+      {
+        "name": "operation_playbooks(集合→运营剧本版本)",
+        "entry": "src/db/mod.rs:116 operation_playbooks()",
+        "rule": "prompt pack 分层之 Operator Instruction 层;decision 读注入;m015 active version 标记",
+        "kind": "collection"
+      },
+      {
+        "name": "operation_domain_configs(集合→状态机/行业字典底座)",
+        "entry": "src/db/mod.rs:120 operation_domain_configs()",
+        "rule": "guards check_state_transition 读 initial/allowFromAny/allowedFrom 状态机标志;prompts.rs ensure_prompt_pack_v2 种 default_domain_configs 三域(非 migration 种);m003/m019 改状态机标志",
+        "kind": "collection"
+      },
+      {
+        "name": "operation_state_policies(集合→每状态允许动作+节奏)",
+        "entry": "src/db/mod.rs:127 operation_state_policies()",
+        "rule": "Phase B/B4;guards enforce 路径读每 (workspace,domain,state_key) 的允许/禁止动作+推荐节奏;m013 种 user_operation_state_policies",
+        "kind": "collection"
+      },
+      {
+        "name": "prompt_templates(集合→分层提示词模板版本化)",
+        "entry": "src/db/mod.rs:131 prompt_templates()",
+        "rule": "generate_agent_json 读模板拼提示词;m009 版本化;evolution release.rs 通过 prompt 通道改写(replay placeholder 被拒);run log 记 promptVersions",
+        "kind": "collection"
+      },
+      {
+        "name": "operating_memories(集合→运营记忆)",
+        "entry": "src/db/mod.rs:135 operating_memories()",
+        "rule": "运营记忆读写(decision/memory 路径消费)",
+        "kind": "collection"
+      },
+      {
+        "name": "operation_knowledge_documents(集合→知识文档容器)",
+        "entry": "src/db/mod.rs:139 operation_knowledge_documents()",
+        "rule": "知识库 ingest/import 写 status=draft;document_id 是一对多 chunk 唯一容器;catalog_rebuild_worker 落 catalog_summary_persisted;m010 backfill",
+        "kind": "collection"
+      },
+      {
+        "name": "operation_knowledge_chunks(集合→知识切片·grounding 源)",
+        "entry": "src/db/mod.rs:143 operation_knowledge_chunks()",
+        "rule": "knowledge_router catalog→search→open_slice 读;review 产品声明须此表 verified 知识背书否则 blocked_unverified_product_claim;chunk 修复闭环写;cold_contact_worker/observability 读;新切片恒 needs_review",
+        "kind": "collection"
+      },
+      {
+        "name": "knowledge_usage_logs(集合→知识引用日志)",
+        "entry": "src/db/mod.rs:147 knowledge_usage_logs()",
+        "rule": "knowledge_router 记 used_knowledge_ids 引用;TTL 索引;feedback/grounding 追溯读",
+        "kind": "collection"
+      },
+      {
+        "name": "knowledge_chat_turns(集合→知识问答轮)",
+        "entry": "src/db/mod.rs:151 knowledge_chat_turns()",
+        "rule": "知识库对话路由按 turn_index 写每轮;依赖 knowledge_chat_session_seqs 原子自增",
+        "kind": "collection"
+      },
+      {
+        "name": "knowledge_chat_session_seqs(集合→知识会话 turn 原子自增)",
+        "entry": "src/db/mod.rs:159 knowledge_chat_session_seqs()",
+        "rule": "P1-7;每 session 一行 findOneAndUpdate $inc seq upsert 得原子 turn_index,避免并发重复命中 unique 索引;raw Document 类型",
+        "kind": "collection"
+      },
+      {
+        "name": "knowledge_daily_reports(集合→知识库日报)",
+        "entry": "src/db/mod.rs:163 knowledge_daily_reports()",
+        "rule": "知识库 digest 线生成日报;前端日报页读(8 处命中)",
+        "kind": "collection"
+      },
+      {
+        "name": "knowledge_chat_tasks(集合→知识修复派工任务)",
+        "entry": "src/db/mod.rs:167 knowledge_chat_tasks()",
+        "rule": "知识库派工闭环;worker execute_step(Phase4 占位桩,6 action 不真改 chunk);observability 暴露;inbox 来源",
+        "kind": "collection"
+      },
+      {
+        "name": "knowledge_operator_memory(集合→知识运营记忆)",
+        "entry": "src/db/mod.rs:171 knowledge_operator_memory()",
+        "rule": "知识库运营 agent 记忆读写(8 处命中)",
+        "kind": "collection"
+      },
+      {
+        "name": "agent_decision_reviews(集合→独立 review 结果)",
+        "entry": "src/db/mod.rs:175 decision_reviews()",
+        "rule": "独立 Review Agent 评判结果写(HumanLikeScore/FactRisk 等);observability.rs 查询读",
+        "kind": "collection"
+      },
+      {
+        "name": "agent_run_logs(集合→单次运行 envelope 日志)",
+        "entry": "src/db/mod.rs:179 agent_run_logs()",
+        "rule": "gateway 每 run 写 envelope(promptVersions/状态/token);lessons_learned 扫;observability 主查询;planner_block_rate/outcomes 测试读",
+        "kind": "collection"
+      },
+      {
+        "name": "agent_principal_escalations(集合→决策请示通道)",
+        "entry": "src/db/mod.rs:183 agent_principal_escalations()",
+        "rule": "幕后领导决策源请示;AI 遇超职权事项写 escalation→拿回结论转述;observability 暴露;去重逻辑",
+        "kind": "collection"
+      },
+      {
+        "name": "referral_cards(集合→专属顾问名片引荐)",
+        "entry": "src/db/mod.rs:187 referral_cards()",
+        "rule": "辅助模式(默认关);AI 识别高价值客户调 MCP message_send_namecard 推真人名片记此表(11 处命中)",
+        "kind": "collection"
+      },
+      {
+        "name": "agent_send_ledger(集合→发送台账)",
+        "entry": "src/db/mod.rs:191 agent_send_ledger()",
+        "rule": "gateway 每次发送记台账(11 处命中)",
+        "kind": "collection"
+      },
+      {
+        "name": "llm_call_logs(集合→LLM 调用日志)",
+        "entry": "src/db/mod.rs:195 llm_call_logs()",
+        "rule": "generate_agent_json 写每次 LLM JSON 调用(status success/cache_hit/failed/json_error)+token usage;LRU 缓存命中记 cache_hit",
+        "kind": "collection"
+      },
+      {
+        "name": "memory_candidates(集合→长期记忆候选)",
+        "entry": "src/db/mod.rs:199 memory_candidates()",
+        "rule": "MP-8 memoryCard consolidation 写候选;memory 模块非原子检测→重试→丢弃闭环(7 处命中)",
+        "kind": "collection"
+      },
+      {
+        "name": "user_operation_guide_previews(集合→运营引导预览)",
+        "entry": "src/db/mod.rs:203 user_operation_guide_previews()",
+        "rule": "行业配置 AI 生成引导层预览读写(5 处命中)",
+        "kind": "collection"
+      },
+      {
+        "name": "management_agent_sessions(集合→管理 agent 会话)",
+        "entry": "src/db/mod.rs:207 management_sessions()",
+        "rule": "管理 agent(运营管理对话)会话读写;routes/management.rs",
+        "kind": "collection"
+      },
+      {
+        "name": "management_agent_messages(集合→管理 agent 消息)",
+        "entry": "src/db/mod.rs:211 management_messages()",
+        "rule": "管理 agent 对话消息流读写",
+        "kind": "collection"
+      },
+      {
+        "name": "agent_command_runs(集合→管理指令执行)",
+        "entry": "src/db/mod.rs:215 command_runs()",
+        "rule": "管理 agent 指令执行记录读写(7 处命中)",
+        "kind": "collection"
+      },
+      {
+        "name": "agent_tool_calls(集合→agent 工具调用)",
+        "entry": "src/db/mod.rs:219 tool_calls()",
+        "rule": "agent tool-calling(知识路由/管理指令)工具调用记录(5 处命中)",
+        "kind": "collection"
+      },
+      {
+        "name": "agent_outcome_metrics(集合→结果指标聚合)",
+        "entry": "src/db/mod.rs:223 outcome_metrics()",
+        "rule": "成交/转化结果指标;m004 id 规整;m017 dedupe 聚合;红线 AI 永不直写正式成交(经 suspected_deal_signals approve 才落)",
+        "kind": "collection"
+      },
+      {
+        "name": "evaluation_scenarios(集合→评测场景)",
+        "entry": "src/db/mod.rs:227 evaluation_scenarios()",
+        "rule": "simulation shadow-mode 评测场景读写(8 处命中)",
+        "kind": "collection"
+      },
+      {
+        "name": "migrations(集合→迁移记录)",
+        "entry": "src/db/mod.rs:231 migrations()",
+        "rule": "migrations::run 记录已执行迁移版本(MigrationRecord),启动时先于 ensure_indexes 跑",
+        "kind": "collection"
+      },
+      {
+        "name": "agent_send_outbox(集合→持久化发件箱+幂等)",
+        "entry": "src/db/mod.rs:242 collection_agent_send_outbox()",
+        "rule": "autonomy-loop W0/R13.1;approved 决策必先写 outbox(idempotency_key)再调 MCP;二次安全门+重试;用户拒绝/cooldown 取消 pending(19 处命中)",
+        "kind": "collection"
+      },
+      {
+        "name": "system_taxonomies(集合→权威字典·双层标签)",
+        "entry": "src/db/mod.rs:247 collection_system_taxonomies()",
+        "rule": "R8.1;customer_stage/intent_level/objection_type 必来自此表;m006/m012/m020-m028 种各维字典(purchase_lifecycle/churn/value_tier/relationship_type/conversation_mode)(23 处命中)",
+        "kind": "collection"
+      },
+      {
+        "name": "taxonomy_candidates(集合→标签候选待审)",
+        "entry": "src/db/mod.rs:252 collection_taxonomy_candidates()",
+        "rule": "R8.3;agent 自由发挥标签进候选待运营审核;未审候选不得阻断 run(12 处命中)",
+        "kind": "collection"
+      },
+      {
+        "name": "relationship_type_suggestions(集合→关系类型识别建议)",
+        "entry": "src/db/mod.rs:259 collection_relationship_type_suggestions()",
+        "rule": "数字分身 T5;LLM 识别 customer/peer/friend 建议→运营审核→回写 contact 保守闭环;(workspace_id,contact_id) unique(8 处命中)",
+        "kind": "collection"
+      },
+      {
+        "name": "suspected_deal_signals(集合→疑似成交待核实)",
+        "entry": "src/db/mod.rs:269 collection_suspected_deal_signals()",
+        "rule": "F23 方案B;LLM 输出 suspected_deal 弱信号 upsert(status=pending);运营 approve 才落正式成交(红线 AI 永不直写 outcome)(6 处命中)",
+        "kind": "collection"
+      },
+      {
+        "name": "experiments(集合→自优化实验)",
+        "entry": "src/db/mod.rs:280 experiments()",
+        "rule": "agent-self-evolution W0;evolution 实验记录读写(10 处命中)",
+        "kind": "collection"
+      },
+      {
+        "name": "proposals(集合→演化提议)",
+        "entry": "src/db/mod.rs:285 proposals()",
+        "rule": "evolution release.rs 与 threshold_overrides 事务原子落地;prompt/threshold 提议 status 流转(eligible_for_release→released);workspace_scope/redline 测试(18 处命中)",
+        "kind": "collection"
+      },
+      {
+        "name": "shadow_replays(集合→影子重放)",
+        "entry": "src/db/mod.rs:290 shadow_replays()",
+        "rule": "evolution R5 shadow 重放;replay.rs(prompt 通道 placeholder 必被拒)(6 处命中)",
+        "kind": "collection"
+      },
+      {
+        "name": "threshold_overrides(集合→阈值覆盖当前生效层)",
+        "entry": "src/db/mod.rs:295 threshold_overrides()",
+        "rule": "evolution 阈值通道真闭环;resolve_thresholds 在 gateway 真消费(可生产);release 事务写(5 处命中)",
+        "kind": "collection"
+      },
+      {
+        "name": "threshold_overrides_audit(集合→阈值变更不可变审计)",
+        "entry": "src/db/mod.rs:302 threshold_overrides_audit()",
+        "rule": "Phase C/C5;每次 release/rollback/auto-release 追加一行,与生效层解耦便于追因(4 处命中)",
+        "kind": "collection"
+      },
+      {
+        "name": "post_release_reviews(集合→发布后复盘)",
+        "entry": "src/db/mod.rs:309 post_release_reviews()",
+        "rule": "W4 Task5.6/R9.7;+24h 对比窗口评测由 evolution worker 末尾扫描,不参与 release 决策(post_release.rs)",
+        "kind": "collection"
+      },
+      {
+        "name": "evolution_runtime_flags(集合→演化器开关+灰度)",
+        "entry": "src/db/mod.rs:317 evolution_runtime_flags()",
+        "rule": "Phase C/C3;is_evolution_enabled_for 读此条算 hash(contact_id)%100<rollout_percent;不存在按关停(4 处命中)",
+        "kind": "collection"
+      },
+      {
+        "name": "llm_provider_configs(集合→LLM 服务商运行时配置)",
+        "entry": "src/db/mod.rs:325 llm_provider_configs()",
+        "rule": "把 .env LLM 配置抬升为前端可编辑 DB 数据(format=openai|anthropic);is_active=true 那条由 LlmRegistry 启动/切换时加载为 AppState.llm 后端(25 处命中,DB provider 热替换非.env)",
+        "kind": "collection"
+      },
+      {
+        "name": "chunk_revisions(集合→知识切片编辑历史)",
+        "entry": "src/db/mod.rs:341 chunk_revisions()",
+        "rule": "knowledge-wiki Phase A;不可变编辑历史(patch/split/merge/rollback/archive/verify);apply_chunk_revision 与 chunks 双写,先写一行(7 处命中)",
+        "kind": "collection"
+      },
+      {
+        "name": "knowledge_gap_signals(集合→知识缺口 lint 队列)",
+        "entry": "src/db/mod.rs:348 knowledge_gap_signals()",
+        "rule": "structural+semantic lint 待办;两阶段 sweep 状态 pending→auto_resolved/llm_resolved/applied/dismissed;observability/inbox 读(18 处命中)",
+        "kind": "collection"
+      },
+      {
+        "name": "domain_schemas(集合→行业可配 schema)",
+        "entry": "src/db/mod.rs:353 domain_schemas()",
+        "rule": "每 workspace 同时 1 条 is_active=true 的行业 schema(15 处命中)",
+        "kind": "collection"
+      },
+      {
+        "name": "domain_profiles(集合→行业总装配单)",
+        "entry": "src/db/mod.rs:360 domain_profiles()",
+        "rule": "universal-domain Phase0;每 workspace 1 条 active,运行时加载(无则 fallback DEFAULT_PROFILE);decision/guards/judge 全消费 distrust_self_reported_low_risk 等(21 处命中)",
+        "kind": "collection"
+      },
+      {
+        "name": "catalog_rebuild_jobs(集合→catalog 重建队列)",
+        "entry": "src/db/mod.rs:366 catalog_rebuild_jobs()",
+        "rule": "apply_chunk_revision 写完即 enqueue;catalog_rebuild_worker 每 200ms 取 status=queued 落 documents.catalog_summary_persisted(6 处命中)",
+        "kind": "collection"
+      },
+      {
+        "name": "ingest_sources(集合→自动 ingest 数据源)",
+        "entry": "src/db/mod.rs:373 ingest_sources()",
+        "rule": "P1-6(INGEST_WORKER_ENABLED 默认关);ingest_worker_loop 逐 workspace 扫 status=active,按 schedule_minutes 节流 GET→解析→落 chunks needs_review(11 处命中)",
+        "kind": "collection"
+      },
+      {
+        "name": "products(集合→商品库)",
+        "entry": "src/db/mod.rs:381 products()",
+        "rule": "objective-purchase-facts G2;运营前端录入结构化商品(product_id/name/price/sku);成交事件 product_ref 是下单快照拷贝不实时引用此表;(workspace_id,product_id) unique(9 处命中)",
+        "kind": "collection"
+      },
+      {
+        "name": "campaigns(集合→活动定向推送实体)",
+        "entry": "src/db/mod.rs:386 campaigns()",
+        "rule": "活动定向推送活动实体读写(9 处命中)",
+        "kind": "collection"
+      },
+      {
+        "name": "campaign_sends(集合→活动每人推送台账)",
+        "entry": "src/db/mod.rs:391 campaign_sends()",
+        "rule": "活动推送去重+送达追踪台账(4 处命中)",
+        "kind": "collection"
+      },
+      {
+        "name": "operation_knowledge_items(集合→旧销售知识项·已死)",
+        "entry": "src/db/migrations/m011_drop_legacy_sales_collections.rs:29 + m014",
+        "rule": "死集合:typed accessor 在 commit2 删除,m011/m014 delete_many 物理清空;全 src 仅剩占位注释(knowledge_tools/catalog/chat items 维度永远空)+ crud.rs 410 端点 + repair.rs pack 修复下线;零业务读写",
+        "kind": "collection"
+      },
+      {
+        "name": "admin_users(集合→管理员账号·无 typed accessor)",
+        "entry": "src/db/indexes.rs:1530(raw)+ src/auth/session.rs",
+        "rule": "auth 登录(Argon2)读;走 raw().collection::<Document>;m016 backfill workspace_id;main.rs 初始管理员",
+        "kind": "collection"
+      },
+      {
+        "name": "admin_sessions(集合→会话 cookie·无 typed accessor)",
+        "entry": "src/db/indexes.rs:1546(raw)+ src/auth/session.rs",
+        "rule": "auth 中间件读 wa_session cookie 校验会话;走 raw;TTL 索引",
+        "kind": "collection"
+      },
+      {
+        "name": "lessons_learned(集合→经验教训·无 typed accessor)",
+        "entry": "src/db/indexes.rs:1653(raw)",
+        "rule": "knowledge_wiki feedback_worker/lessons_learned.rs 写;ask_human_inbox/routes/lessons_learned/observability 读;无 struct,走 raw Document(review_status=pending_review)",
+        "kind": "collection"
+      },
+      {
+        "name": "reviewer_stats(集合→reviewer 校准统计·无 typed accessor)",
+        "entry": "src/db/indexes.rs:1613(raw)",
+        "rule": "knowledge_wiki reviewer_stats.rs/feedback_worker 写;reaction.rs/observability 读;走 raw Document",
+        "kind": "collection"
+      },
+      {
+        "name": "deal_attribution_stats(集合→成交归因统计·无 typed accessor)",
+        "entry": "src/db/indexes.rs:1633(raw)",
+        "rule": "knowledge_wiki feedback_worker 写归因;observability 读;走 raw Document",
+        "kind": "collection"
+      },
+      {
+        "name": "structural_proposals(集合→知识结构提议·无 typed accessor)",
+        "entry": "src/knowledge_wiki/structural_proposals.rs:111(raw)",
+        "rule": "knowledge_agent 提议知识结构变更写;structural_proposals.rs 读;走 raw",
+        "kind": "collection"
+      }
+    ]
+  }
+]
