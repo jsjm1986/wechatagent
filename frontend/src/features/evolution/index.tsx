@@ -1,28 +1,11 @@
-import { useEffect, useState } from "react";
 import { ShieldCheck } from "lucide-react";
 import { EvolutionCenterTab } from "./EvolutionCenterTab";
 import styles from "./EvolutionCenterTab.module.css";
 
-// 演化中心频道：自取 /api/health 判定演化器是否启用，再委托 EvolutionCenterTab。
+// 演化中心频道：直接委托 EvolutionCenterTab。运维硬锁定态（EVOLUTION_ENABLED=false）
+// 与总开关态均由 Tab 内 loadFlag 拉取的 envEvolutionEnabled / flag 单数据源驱动。
 // 大页头（eyebrow/title/subtitle）由 Shell 依据 channels.ts 渲染，组件仅保留面板级小标题。
 export default function EvolutionFeature() {
-  const [enabled, setEnabled] = useState<boolean | null>(null);
-
-  useEffect(() => {
-    let cancelled = false;
-    fetch("/api/health")
-      .then((r) => (r.ok ? r.json() : { evolutionEnabled: false }))
-      .then((d: { evolutionEnabled?: boolean }) => {
-        if (!cancelled) setEnabled(d.evolutionEnabled === true);
-      })
-      .catch(() => {
-        if (!cancelled) setEnabled(false);
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, []);
-
   return (
     <div className={styles.page}>
       <section className={styles.panel}>
@@ -35,11 +18,7 @@ export default function EvolutionFeature() {
             <ShieldCheck size={18} />
           </div>
         </div>
-        {enabled === null ? (
-          <div className={styles.loading}>加载中…</div>
-        ) : (
-          <EvolutionCenterTab enabled={enabled} />
-        )}
+        <EvolutionCenterTab />
       </section>
     </div>
   );

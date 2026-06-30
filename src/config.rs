@@ -2,6 +2,10 @@ use std::env;
 
 use crate::secret::mask_secret;
 
+/// EVOLUTION_ENABLED 默认串。语义：是否允许在 UI 开启演化中心（默认允许）；
+/// 设 "false" 为运维硬锁定（紧急熔断，无需 mongo 写权限）。
+pub(crate) const EVOLUTION_ENABLED_DEFAULT: &str = "true";
+
 #[derive(Clone)]
 pub struct AppConfig {
     pub app_host: String,
@@ -190,7 +194,8 @@ pub struct AppConfig {
     // 默认全部保守值。`evolution_enabled=false` 是安装态默认；运维需显式
     // 通过 env 打开。所有阈值在 design.md §5 中有明确单位与范围说明。
 
-    /// M4：是否启用 evolutionary worker。默认 false（安装态关停，需运维显式打开）。
+    /// M4：是否允许在 UI 开启演化中心（runtime flag 总开关的硬上限）。默认 true（允许）；
+    /// 设 false 为运维硬锁定——worker 不进 tick、UI 总开关锁定。
     pub evolution_enabled: bool,
     /// M4：演化器主循环间隔秒数。默认 21600（6 小时）——比 strategic planner 长一档。
     pub evolution_tick_seconds: u64,
@@ -581,7 +586,7 @@ impl AppConfig {
             knowledge_exploration_temperature: env_or("KNOWLEDGE_EXPLORATION_TEMPERATURE", "1.0")
                 .parse()?,
             // ── agent-self-evolution M4 ──
-            evolution_enabled: parse_bool(&env_or("EVOLUTION_ENABLED", "false")),
+            evolution_enabled: parse_bool(&env_or("EVOLUTION_ENABLED", EVOLUTION_ENABLED_DEFAULT)),
             evolution_tick_seconds: env_or("EVOLUTION_TICK_SECONDS", "21600").parse()?,
             evolution_run_token_budget: env_or("EVOLUTION_RUN_TOKEN_BUDGET", "60000").parse()?,
             evolution_run_max_llm_calls: env_or("EVOLUTION_RUN_MAX_LLM_CALLS", "30").parse()?,
@@ -739,5 +744,13 @@ mod tests {
             .parse()
             .expect("default media id cache ttl must parse as i64");
         assert_eq!(ttl_hours, 24);
+    }
+
+    /// EVOLUTION_ENABLED 默认＝允许（true）。锁定 EVOLUTION_ENABLED_DEFAULT 常量值，
+    /// 防止有人把默认改回 "false" 而不更新部署文档（语义：默认允许 UI 开启演化中心）。
+    #[test]
+    fn evolution_enabled_defaults_to_true() {
+        assert_eq!(EVOLUTION_ENABLED_DEFAULT, "true");
+        assert!(parse_bool(EVOLUTION_ENABLED_DEFAULT));
     }
 }

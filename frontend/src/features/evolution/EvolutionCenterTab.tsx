@@ -94,6 +94,8 @@ export interface RuntimeFlag {
 //   PUT  → { ok, flag: { enabled, rolloutPercent, ... } }
 // 读回必须从 .flag 内层取；flag 为 null（未配置）时回落逻辑默认 false/0。
 export interface RuntimeFlagResponse {
+  // GET 返回；PUT 响应无此字段，故可选。true=env 允许 UI 开启；false=运维硬锁定。
+  envEvolutionEnabled?: boolean;
   flag: RuntimeFlag | null;
 }
 
@@ -160,20 +162,24 @@ export function EvolutionCenterTab({ enabled = true }: { enabled?: boolean }) {
 
   // ── runtime-flag 灰度控件（workspace 级 enabled + rolloutPercent 0-100）──
   const [flagEnabled, setFlagEnabled] = useState(false);
+  const [envAllowed, setEnvAllowed] = useState<boolean | null>(null);
   const [rollout, setRollout] = useState<string>("0");
   const [flagBusy, setFlagBusy] = useState(false);
   const [flagMsg, setFlagMsg] = useState<string>("");
+  const [flagError, setFlagError] = useState<string>("");
 
   async function loadFlag() {
     setFlagBusy(true);
     setFlagMsg("");
+    setFlagError("");
     try {
       const resp = await apiGet<RuntimeFlagResponse>("/api/evolution/runtime-flag");
-      // 配置体在 .flag 子对象里；flag 为 null（未配置）回落 false/0。
+      setEnvAllowed(resp.envEvolutionEnabled !== false); // 缺省按允许；显式 false 才硬锁
       setFlagEnabled(Boolean(resp.flag?.enabled ?? false));
       setRollout(String(resp.flag?.rolloutPercent ?? 0));
     } catch (e) {
-      setFlagMsg(e instanceof Error ? e.message : String(e));
+      // 拉取失败必须落到可见错误态，否则 envAllowed 永远 null → 卡在"加载中"且错误无处显示。
+      setFlagError(e instanceof Error ? e.message : String(e));
     } finally {
       setFlagBusy(false);
     }
@@ -183,15 +189,36 @@ export function EvolutionCenterTab({ enabled = true }: { enabled?: boolean }) {
     setFlagBusy(true);
     setFlagMsg("");
     try {
-      const pct = Math.max(0, Math.min(100, Number(rollout) || 0));
+      // 开=全量：enabled 时若高级灰度值为 0 则按 100 全量；关时保留原 rollout 值。
+      const advanced = Math.max(0, Math.min(100, Number(rollout) || 0));
+      const pct = flagEnabled ? (advanced === 0 ? 100 : advanced) : advanced;
       const resp = await apiPut<RuntimeFlagResponse>("/api/evolution/runtime-flag", {
         enabled: flagEnabled,
         rolloutPercent: pct,
       });
-      // PUT 回写同样在 .flag 子对象里。
       setFlagEnabled(Boolean(resp.flag?.enabled ?? flagEnabled));
       setRollout(String(resp.flag?.rolloutPercent ?? pct));
-      setFlagMsg("灰度配置已保存");
+      setFlagMsg("演化中心总开关已保存");
+    } catch (e) {
+      setFlagMsg(e instanceof Error ? e.message : String(e));
+    } finally {
+      setFlagBusy(false);
+    }
+  }
+
+  async function saveFlagWith(nextEnabled: boolean) {
+    setFlagBusy(true);
+    setFlagMsg("");
+    try {
+      const advanced = Math.max(0, Math.min(100, Number(rollout) || 0));
+      const pct = nextEnabled ? (advanced === 0 ? 100 : advanced) : advanced;
+      const resp = await apiPut<RuntimeFlagResponse>("/api/evolution/runtime-flag", {
+        enabled: nextEnabled,
+        rolloutPercent: pct,
+      });
+      setFlagEnabled(Boolean(resp.flag?.enabled ?? nextEnabled));
+      setRollout(String(resp.flag?.rolloutPercent ?? pct));
+      setFlagMsg("演化中心总开关已保存");
     } catch (e) {
       setFlagMsg(e instanceof Error ? e.message : String(e));
     } finally {
@@ -222,7 +249,7 @@ export function EvolutionCenterTab({ enabled = true }: { enabled?: boolean }) {
   }
 
   async function load() {
-    if (!enabled) return;
+    if (!enabled || envAllowed === false || !flagEnabled) return;
     setLoading(true);
     setError("");
     try {
@@ -236,24 +263,51 @@ export function EvolutionCenterTab({ enabled = true }: { enabled?: boolean }) {
   }
 
   useEffect(() => {
+    void loadFlag();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  useEffect(() => {
     void load();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [enabled]);
+  }, [enabled, envAllowed, flagEnabled]);
 
-  if (!enabled) {
-    return (
-      <div className={styles.disabled} data-testid="evolution-disabled">
-        演化器未启用（EVOLUTION_ENABLED=false）。启用后此处会展示自动产出的实验信封与候选。
-      </div>
-    );
-  }
-
+  // useMemo 必须在任何早返回之前调用——hooks 调用顺序在每次渲染必须一致，
+  // 否则 envAllowed null→bool 跳变时早返回路径的 hook 数量不同 → React 崩溃。
   const aggregate = useMemo(() => aggregateLast7Days(items), [items]);
 
   const proposalsFlat = useMemo<ProposalSummary[]>(
     () => items.flatMap((it) => it.proposals).sort((a, b) => b.createdAt.localeCompare(a.createdAt)),
     [items]
   );
+
+  const locked = !enabled || envAllowed === false;
+  if (locked) {
+    return (
+      <div className={styles.disabled} data-testid="evolution-disabled">
+        演化中心已被运维硬锁定（EVOLUTION_ENABLED=false），请联系运维解除后再在此开启。
+      </div>
+    );
+  }
+  if (envAllowed === null) {
+    if (flagError) {
+      return (
+        <div className={styles.disabled} data-testid="evolution-flag-error">
+          <div className={styles.error} role="alert">
+            读取演化中心开关失败：{flagError}
+          </div>
+          <button className={styles.btnGhost} onClick={() => void loadFlag()} disabled={flagBusy}>
+            重试
+          </button>
+        </div>
+      );
+    }
+    return (
+      <div className={styles.disabled} data-testid="evolution-flag-loading">
+        加载中…
+      </div>
+    );
+  }
 
   return (
     <section className={styles.center} data-testid="evolution-center">
@@ -275,22 +329,29 @@ export function EvolutionCenterTab({ enabled = true }: { enabled?: boolean }) {
             <input
               type="checkbox"
               checked={flagEnabled}
-              onChange={(e) => setFlagEnabled(e.target.checked)}
+              onChange={(e) => {
+                setFlagEnabled(e.target.checked);
+                // 状态更新后保存：用新值直接 PUT，避免读到旧 state。
+                void saveFlagWith(e.target.checked);
+              }}
               disabled={flagBusy}
             />
-            <span>启用演化灰度</span>
+            <span>演化中心总开关</span>
           </label>
-          <label className={styles.flagField}>
-            <span>灰度比例（%）</span>
-            <input
-              type="number"
-              min={0}
-              max={100}
-              value={rollout}
-              onChange={(e) => setRollout(e.target.value)}
-              disabled={flagBusy}
-            />
-          </label>
+          <details className={styles.advanced}>
+            <summary>高级设置（灰度比例）</summary>
+            <label className={styles.flagField}>
+              <span>灰度比例（%）</span>
+              <input
+                type="number"
+                min={0}
+                max={100}
+                value={rollout}
+                onChange={(e) => setRollout(e.target.value)}
+                disabled={flagBusy}
+              />
+            </label>
+          </details>
           <button className={styles.btnGhost} onClick={() => void loadFlag()} disabled={flagBusy}>
             读取当前配置
           </button>
