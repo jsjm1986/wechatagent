@@ -178,32 +178,18 @@ pub(super) fn judge_user_operation_scenario(
     let hallucination = doc_i32_opt(scores, "hallucinationScore");
     let knowledge_grounding = doc_i32_opt(scores, "knowledgeGroundingScore");
     let pressure_risk = doc_i32_opt(scores, "pressureRisk");
-    let final_review_status = last_turn
-        .review
-        .get_str("finalReviewStatus")
-        .unwrap_or("")
-        .to_string();
     let mut issues = Vec::new();
-    // 硬闸：与 review_passed 同源——hallucination 高 / knowledge_grounding 低 必拦。
-    // 软闸：human_like / emotional_value / pressure_risk —— 不直接拦截，仅作评测信号。
-    if hallucination >= 50 {
-        issues.push("hallucination 评分过高（≥50）");
+    // 硬闸判定复用生产同源信号:simulation.rs:207-216 已用生产 review_passed
+    // 把每轮终态算进 turn.status(would_send/review_blocked/gateway_blocked/no_reply)。
+    // 不再自算 hallucination/grounding 硬阈值——旧 50/60 阈值是 0-100 档,与 reviewer
+    // 的 0-10 档错配(幻觉闸恒不触发=死闸、grounding 闸恒误判 failed);旧 finalReviewStatus
+    // 匹配块读的字段 DecisionReviewResult 序列化根本不产生,恒为空=死门。
+    match last_turn.status.as_str() {
+        "review_blocked" => issues.push("Review 闸拦截：候选回复未通过独立 Review"),
+        "gateway_blocked" => issues.push("发送网关拦截，需要检查频控或纳管状态"),
+        _ => {} // would_send / no_reply 视为本轮无风险项
     }
-    if knowledge_grounding > 0 && knowledge_grounding < 60 {
-        issues.push("knowledge_grounding 评分不足（<60）");
-    }
-    if matches!(
-        final_review_status.as_str(),
-        "rejected"
-            | "blocked_by_safety_guard"
-            | "held_by_ai_policy"
-            | "ai_waiting_for_more_context"
-    ) {
-        issues.push("Review 终态非 approved");
-    }
-    if last_turn.should_reply && last_turn.status == "gateway_blocked" {
-        issues.push("发送网关拦截，需要检查频控或纳管状态");
-    }
+    // scores 仍读取并透传给前端展示(humanLike/hallucination 等),但不参与拦截判定。
     let passed = issues.is_empty();
     json!({
         "passed": passed,
@@ -215,7 +201,7 @@ pub(super) fn judge_user_operation_scenario(
             "knowledgeGroundingScore": knowledge_grounding,
             "pressureRisk": pressure_risk,
         },
-        "finalReviewStatus": final_review_status,
+        "finalReviewStatus": last_turn.status.clone(),
         "issues": issues,
         "summary": if passed { "场景通过 prod 同源 review 终态" } else { "场景存在需要优化的风险项" },
         "scenario": scenario,
@@ -227,4 +213,59 @@ pub(super) fn judge_user_operation_scenario(
 pub(super) fn doc_i32_opt(doc: Option<&Document>, key: &str) -> i32 {
     doc.and_then(|item| item.get_i32(key).ok())
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod judge_tests {
+    use super::*;
+    use crate::agent::UserOperationSimulationTurn;
+
+    // 构造一个"生产已判通过"的 turn:status=would_send(simulation.rs:211 仅在
+    // decision.should_reply && review_passed 时取此值),scores 健康(0-10 档)。
+    fn would_send_turn() -> UserOperationSimulationTurn {
+        UserOperationSimulationTurn {
+            turn: 1,
+            inbound_text: "你们产品多少钱".into(),
+            should_reply: true,
+            reply_text: "您好，我帮您看下".into(),
+            status: "would_send".into(),
+            decision: Document::new(),
+            review: doc! { "scores": {
+                "humanLike": 8i32, "emotionalValue": 7i32,
+                "hallucinationScore": 1i32, "knowledgeGroundingScore": 9i32,
+                "pressureRisk": 2i32,
+            }},
+            gateway_result: Document::new(),
+            knowledge_route: Document::new(),
+            context_pack: Document::new(),
+            memory_preview: Document::new(),
+            state_transition: Document::new(),
+        }
+    }
+
+    #[test]
+    fn would_send_turn_judged_passed() {
+        let turns = vec![would_send_turn()];
+        let v = judge_user_operation_scenario("询价", "正常报价", &turns);
+        // 生产 review_passed 已让该 turn=would_send,judge 不应再判 failed
+        assert_eq!(
+            v["passed"],
+            serde_json::Value::Bool(true),
+            "would_send(生产已通过)必须 judged passed;旧 grounding<60 死规则会误判 failed: issues={}",
+            v["issues"]
+        );
+    }
+
+    #[test]
+    fn review_blocked_turn_judged_failed() {
+        let mut turns = vec![would_send_turn()];
+        // status=review_blocked 表示生产 review_passed 拦了它(simulation.rs:209)
+        turns[0].status = "review_blocked".into();
+        let v = judge_user_operation_scenario("询价", "正常报价", &turns);
+        assert_eq!(
+            v["passed"],
+            serde_json::Value::Bool(false),
+            "review_blocked(生产已拦)必须 judged failed"
+        );
+    }
 }

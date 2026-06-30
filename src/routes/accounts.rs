@@ -24,12 +24,12 @@ use super::AppState;
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub(super) struct UpdateAccountMcpKeyRequest {
+pub struct UpdateAccountMcpKeyRequest {
     mcp_api_key: String,
     mcp_base_url: Option<String>,
 }
 
-pub(super) async fn list_accounts(
+pub async fn list_accounts(
     State(state): State<AppState>,
     Extension(admin): Extension<AuthenticatedAdmin>,
 ) -> AppResult<Json<Value>> {
@@ -60,7 +60,7 @@ pub(super) async fn list_accounts(
     Ok(Json(json!({ "items": items })))
 }
 
-pub(super) async fn sync_accounts(
+pub async fn sync_accounts(
     State(state): State<AppState>,
     Extension(admin): Extension<AuthenticatedAdmin>,
 ) -> AppResult<Json<Value>> {
@@ -156,7 +156,7 @@ pub(super) async fn sync_accounts(
     Ok(Json(json!({ "synced": synced })))
 }
 
-pub(super) async fn update_account_mcp_key(
+pub async fn update_account_mcp_key(
     State(state): State<AppState>,
     Path(id): Path<String>,
     Extension(admin): Extension<AuthenticatedAdmin>,

@@ -17,7 +17,9 @@ use crate::{
     mcp::McpClient,
 };
 
-mod accounts;
+// pub（非默认私有）：account_security_integration.rs 集成测试需从 tests/ crate 直调
+// list_accounts / sync_accounts / update_account_mcp_key handler 真函数，仿 admin_suspected_deals 先例。
+pub mod accounts;
 mod admin_ops_versions;
 mod admin_outbox;
 mod admin_relationship_suggestions;
@@ -32,9 +34,11 @@ pub mod ask_human_inbox;
 // crate 直调 list_content_assets handler 真函数（缺口 8 tags 检索 + workspace 隔离），
 // 仿 domain_profiles / ask_human_inbox / contacts 先例。生产路由注册仍走下方 use。
 pub mod assets;
-mod auth;
+// pub:auth_middleware_integration.rs 集成测试需从 tests/ 直调 switch_workspace handler。
+pub mod auth;
 mod behavior_signal_metrics;
-mod campaigns;
+// pub:campaign_dispatch_integration.rs 集成测试需从 tests/ 直调 dispatch_campaign handler。
+pub mod campaigns;
 pub mod chunk_locks;
 // pub（非默认私有）：annotation_quality_gate_integration.rs 集成测试需从 tests/
 // crate 直调 update_assist_override handler 真函数（缺口 2 override + IDOR），仿
@@ -57,7 +61,8 @@ mod guides;
 mod health;
 pub mod knowledge;
 mod lessons_learned;
-mod llm_providers;
+// pub:llm_provider_activate_integration.rs 集成测试需从 tests/ 直调 activate_provider handler。
+pub mod llm_providers;
 mod management;
 mod management_prompt_edit;
 // pub（非默认私有）：annotation_quality_gate_integration.rs 集成测试需从 tests/
@@ -1136,6 +1141,10 @@ mod tests {
             // publish_state_machine_version / rollout / rollback / domains.rs 直编路由复用，
             // 不直接绑 HTTP。
             "reconcile_state_policies_for_machine",
+            // knowledge/chat.rs：chat_apply 落库内核（强制 draft+needs_review），被
+            // chat_turn / chat_task 复用、不直接绑 HTTP；knowledge_chat_apply_integration.rs
+            // 通过 `pub` 直调断言"AI 永不自动 verify"红线。
+            "apply_create_chunk",
         ];
 
         let mut handlers: Vec<&str> = Vec::new();
