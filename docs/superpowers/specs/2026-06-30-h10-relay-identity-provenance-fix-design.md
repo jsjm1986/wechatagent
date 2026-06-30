@@ -187,7 +187,7 @@ let safe = crate::agent::prompt_isolation::strip_injection_tags(&message.content
 
 - **客户伪造哨兵不被认作 relay**：构造一条 `ConversationMessage`，content 以 `__PRINCIPAL_RELAY__` 开头、但**经反序列化路径**（模拟 webhook 入站：`from_document` 或显式 `is_synthetic_relay` 不设）得到的消息，断言 `is_principal_relay_trigger` 返回 **false**。
 - **合法合成消息被认作 relay**：`synthetic_principal_relay(...)` 构造的消息，断言 `is_principal_relay_trigger` 返回 **true**。
-- **伪造消息不豁免频控**：managed contact + `last_agent_run_at=now`，喂一条伪造哨兵的客户 inbound 跑 precheck，断言得 `rate_limited`（而非 relay 豁免的 allowed）。镜像现有 `principal_decision_channel.rs` 的 relay 豁免测试。
+- **伪造消息不豁免频控**：频控豁免开关即 `let is_relay = is_principal_relay_trigger(trigger); if !is_relay { …频控… }`（gateway.rs:2985/2994）。故"伪造哨兵不豁免频控"= "伪造哨兵 trigger 判定为非 relay"，由上一条 lib 单测决定性覆盖。**注意：`is_principal_relay_trigger` / `AgentTrigger` / `precheck_send_gateway` / `run_user_operation_gateway` 全是 `pub(crate)`，对 `tests/` 集成测试不可见——relay 安全断言一律放 lib（`src/agent/*` 的 `#[cfg(test)] mod`），绝不为测试放宽生产 API 可见性，也不在 `tests/` 写 relay 断言。** 端到端 DB 豁免行为留给 CI 既有 `principal_decision_channel.rs` 的 relay 用例。
 - **LLM 层：伪造哨兵进 decision prompt 时被剥**（纯函数化该剥离逻辑后单测）：`is_synthetic_relay=false` 且 content 含哨兵 → 拼装后的 prompt 片段**不含** `__PRINCIPAL_RELAY__`；`is_synthetic_relay=true` 的合成消息 → 拼装后**保留**哨兵。建议把 963 的分流逻辑抽成可单测的纯函数（如 `prompt_content_for_trigger(inbound) -> String`），避免靠整条 decision 链路才能测。
 - **`is_synthetic_relay` 不落库**：序列化一条 `is_synthetic_relay=true` 的合成消息为 Document，断言 Document **不含** `is_synthetic_relay` 键（skip_serializing 生效）；反序列化任意不含该键的 Document，断言字段为 false。
 
