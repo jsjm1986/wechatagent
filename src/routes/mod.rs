@@ -139,6 +139,7 @@ pub mod ext_knowledge {
     pub use super::knowledge::{update_operation_knowledge_chunk, OperationKnowledgeChunkRequest};
 }
 pub use shared::upsert_contact_from_value;
+pub use shared::{apply_contact_changes, SkippedField};
 
 use accounts::{list_accounts, sync_accounts, update_account_mcp_key};
 use admin_ops_versions::{

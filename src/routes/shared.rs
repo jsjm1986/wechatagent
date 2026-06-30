@@ -19,6 +19,17 @@ use crate::{
 
 use super::AppState;
 
+/// guide apply 中被跳过的越界字段(LLM 产出但不在字典/状态机内)。
+/// 仅 guide 路径(apply_contact_changes)产出 —— 手动表单(contacts.rs)/审批
+/// (admin_relationship_suggestions)路径的 AdminWrite 越界仍硬拒 400,不收集。
+#[derive(Debug, Clone)]
+pub struct SkippedField {
+    /// camelCase 字段名,如 "operationState"(与 suggestedChanges 输入键一致)。
+    pub field: String,
+    /// 人类可读原因,如 "非法的 operation_state 迁移:...";直接回流给前端 toast。
+    pub reason: String,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(super) struct AccountScopedQuery {
@@ -569,12 +580,13 @@ pub(super) fn score_presence(values: &[Option<String>]) -> i32 {
     ((present * 100) / values.len().max(1) as i32).clamp(0, 100)
 }
 
-pub(super) async fn apply_contact_changes(
+pub async fn apply_contact_changes(
     state: &AppState,
     contact: &Contact,
     changes: &Document,
-) -> AppResult<()> {
+) -> AppResult<Vec<SkippedField>> {
     let mut set_doc = Document::new();
+    let mut skipped: Vec<SkippedField> = Vec::new();
     if let Some(value) = doc_get_string(changes, "humanProfileNote") {
         set_doc.insert("human_profile_note", value);
     }
@@ -582,53 +594,82 @@ pub(super) async fn apply_contact_changes(
         set_doc.insert("tags", to_bson(&value)?);
     }
     if let Some(value) = doc_get_string(changes, "customerStage") {
-        // M1：admin 手填值经 dimension_registry 校验（alias→canonical 归一 + 越界拒绝），
-        // 与 contacts.rs::update_operation_profile 同口径。guide-preview apply 是 admin
-        // 权威写入 → WriteIntent::AdminWrite：越界值 `?` 提前返回 400（不静默落脏值）。
-        // DropSilently（admin 通道理论不触发，仅空串兜底）→ 跳过该维度写入，不影响其它字段。
-        let validated_stage = apply_admin_dim_validation(
-            agent::dimension_registry::validate_dimension_value(
+        // guide 路径(LLM 产值):越界 → 记 skipped 跳过(不像 contacts.rs 手动表单那样硬拒)。
+        // 绕过 apply_admin_dim_validation(它把 Reject 吞成 Err)直接 match 原始 DimValidation。
+        use crate::agent::dimension_registry::DimValidation::{Accept, DropSilently, Reject};
+        let validated_stage = match agent::dimension_registry::validate_dimension_value(
+            &state.db,
+            "customer_stage",
+            &value,
+            &contact.account_id,
+            agent::dimension_registry::WriteIntent::AdminWrite,
+        )
+        .await
+        {
+            Accept(s) => Some(s),
+            DropSilently => None,
+            Reject(reason) => {
+                skipped.push(SkippedField {
+                    field: "customerStage".to_string(),
+                    reason,
+                });
+                None
+            }
+        };
+        let intent = match doc_get_string(changes, "intentLevel") {
+            Some(v) => match agent::dimension_registry::validate_dimension_value(
                 &state.db,
-                "customer_stage",
-                &value,
+                "intent_level",
+                &v,
                 &contact.account_id,
                 agent::dimension_registry::WriteIntent::AdminWrite,
             )
-            .await,
-        )?;
-        let intent = match doc_get_string(changes, "intentLevel") {
-            Some(v) => apply_admin_dim_validation(
-                agent::dimension_registry::validate_dimension_value(
-                    &state.db,
-                    "intent_level",
-                    &v,
-                    &contact.account_id,
-                    agent::dimension_registry::WriteIntent::AdminWrite,
-                )
-                .await,
-            )?,
+            .await
+            {
+                Accept(s) => Some(s),
+                DropSilently => None,
+                Reject(reason) => {
+                    skipped.push(SkippedField {
+                        field: "intentLevel".to_string(),
+                        reason,
+                    });
+                    None
+                }
+            },
             None => None,
         };
         if let Some(value) = validated_stage {
-            // M2：customer_stage 实际变化时同步刷新 customer_stage_updated_at（归一后再比较）。
+            // M2:customer_stage 实际变化时同步刷新 customer_stage_updated_at(归一后再比较)。
             let prev = contact_domain_str(contact, "customer_stage");
             let stage_changed = prev.as_deref().map(|s| s != value.as_str()).unwrap_or(true);
             insert_domain_stage_fields(&mut set_doc, Some(&value), intent.as_deref(), stage_changed);
         } else if intent.is_some() {
-            // stage 被 drop 但 intent 通过：仍写 intent（stage_changed=false，不刷 stage 计时）。
+            // stage 越界/缺席但 intent 通过:仍写 intent(stage_changed=false,不刷 stage 计时)。
             insert_domain_stage_fields(&mut set_doc, None, intent.as_deref(), false);
         }
+        // stage 与 intent 都 None(都越界被跳过)→ 不调 insert_domain_stage_fields,
+        // 守住 set_doc 空判不变量(否则会凭空写 domain_attributes_updated_at)。
     } else if let Some(value) = doc_get_string(changes, "intentLevel") {
-        let validated = apply_admin_dim_validation(
-            agent::dimension_registry::validate_dimension_value(
-                &state.db,
-                "intent_level",
-                &value,
-                &contact.account_id,
-                agent::dimension_registry::WriteIntent::AdminWrite,
-            )
-            .await,
-        )?;
+        use crate::agent::dimension_registry::DimValidation::{Accept, DropSilently, Reject};
+        let validated = match agent::dimension_registry::validate_dimension_value(
+            &state.db,
+            "intent_level",
+            &value,
+            &contact.account_id,
+            agent::dimension_registry::WriteIntent::AdminWrite,
+        )
+        .await
+        {
+            Accept(s) => Some(s),
+            DropSilently => None,
+            Reject(reason) => {
+                skipped.push(SkippedField {
+                    field: "intentLevel".to_string(),
+                    reason,
+                });
+                None
+            }
+        };
         if let Some(value) = validated {
             insert_domain_stage_fields(&mut set_doc, None, Some(&value), false);
         }
@@ -655,12 +696,16 @@ pub(super) async fn apply_contact_changes(
             contact.operation_state.as_deref(),
             &value,
         ) {
-            return Err(AppError::BadRequest(format!(
-                "非法的 operation_state 迁移：{reason}（admin 手改也须符合状态机；如需任意设值请先调整状态机定义）"
-            )));
+            // guide 路径:LLM 产的非法迁移 → 记 skipped 跳过该字段(不像 contacts.rs 手动表单
+            // 硬拒 400),其余合法字段照落。domain_config=None 时 check 返回 None,照写不变。
+            skipped.push(SkippedField {
+                field: "operationState".to_string(),
+                reason: format!("非法的 operation_state 迁移:{reason}"),
+            });
+        } else {
+            set_doc.insert("operation_state", value);
+            set_doc.insert("operation_state_updated_at", DateTime::now());
         }
-        set_doc.insert("operation_state", value);
-        set_doc.insert("operation_state_updated_at", DateTime::now());
     }
     if let Some(value) = doc_get_string(changes, "operationStateReason") {
         set_doc.insert("operation_state_reason", value);
@@ -669,7 +714,7 @@ pub(super) async fn apply_contact_changes(
         set_doc.insert("operation_policy", value.clone());
     }
     if set_doc.is_empty() {
-        return Ok(());
+        return Ok(skipped);
     }
     set_doc.insert("updated_at", DateTime::now());
     state
@@ -677,7 +722,7 @@ pub(super) async fn apply_contact_changes(
         .contacts()
         .update_one(doc! { "_id": contact.id }, doc! { "$set": set_doc }, None)
         .await?;
-    Ok(())
+    Ok(skipped)
 }
 
 pub(super) async fn apply_memory_changes(
