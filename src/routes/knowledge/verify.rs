@@ -171,10 +171,7 @@ pub async fn auto_verify_operation_knowledge_chunks(
     // 100% 无人审落 verified。下限保证「永远有一批被抽出人审」这条红线姿态不可被关掉。
     // 默认从 0.1 抬到 0.3（更积极抽审）。注：product_fact 类已由 C-② 全量强制人审，本抽样
     // 主要覆盖其他三类（不进产品报价链路、风险较低），故下限取温和的 5%。
-    let sample_rate = payload
-        .human_audit_sample_rate
-        .unwrap_or(AUTO_VERIFY_DEFAULT_SAMPLE_RATE)
-        .clamp(AUTO_VERIFY_MIN_SAMPLE_RATE, 1.0);
+    let sample_rate = clamp_sample_rate(payload.human_audit_sample_rate);
     let limit = payload.limit.unwrap_or(50).clamp(1, 500);
 
     let (token_budget, max_llm_calls) =
