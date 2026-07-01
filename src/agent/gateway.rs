@@ -243,7 +243,7 @@ pub async fn send_contact_message_gateway(
     .await?;
     let selected_chunks =
         select_operation_knowledge_chunks(&operation_knowledge.chunks, &knowledge_route);
-    let decision = AgentDecision {
+    let mut decision = AgentDecision {
         should_reply: true,
         reply_text: content.clone(),
         context_pack_version: Some(next_memory_card_version(&memory)),
@@ -271,12 +271,53 @@ pub async fn send_contact_message_gateway(
         None,
     )
     .await?;
-    if !review_passed(&review, &runtime) {
+    // M1：与客户主链路对齐——管理发送也走 finalize_review_for_send 汇总所有硬门
+    // （R5.4 verified-knowledge / R3.5-R3.6 协议 / R3.7 预算 / R2.6 should_hold），
+    // 不再仅凭 review_passed 的软闸折叠 bool 放行。放行条件带 `&& review_passed`
+    // guard：finalize 对软闸失败会标 Approved+needs_revision 指望 revision 循环，而
+    // 管理发送无 revision 通道，故必须用 review_passed 二次确认软闸达标（镜像主链路
+    // 的 second_passed，gateway.rs 内 revision 分支）。
+    let active_profile =
+        crate::agent::domain_profile::load_active_domain_profile(&state.db, &contact.workspace_id)
+            .await;
+    let priced_from_catalog = if active_profile.transaction_facts_enabled {
+        let active_products =
+            super::entitlements::load_active_products(&state.db, &contact.workspace_id).await;
+        super::entitlements::priced_from_active_catalog(
+            &decision.quoted_product_ids,
+            &active_products,
+        )
+    } else {
+        false
+    };
+    let outcome = finalize_review_for_send(
+        review,
+        &mut decision,
+        &runtime,
+        &contact,
+        &selected_chunks,
+        // 管理发送 decision 直接构造、非 LLM raw output，无 protocol promote_risks。
+        Vec::new(),
+        synthetic_inbound.content.as_str(),
+        &active_profile.commitment_markers,
+        priced_from_catalog,
+    );
+    let FinalizeOutcome {
+        review: finalized_review,
+        status: finalize_status,
+        pending_events,
+    } = outcome;
+    let review = finalized_review;
+    persist_finalize_pending_events(state, &contact, &pending_events).await?;
+    let passed = matches!(finalize_status, GatewayStatusFinal::Approved)
+        && review_passed(&review, &runtime);
+    if !passed {
+        let blocked_status = finalize_status.gateway_status_str();
         let blocked_result = SendGatewayResult {
             allowed: false,
-            status: "review_blocked".to_string(),
-            reason: "Review Agent 拦截本次发送".to_string(),
-            policy_blocks: vec!["review_blocked".to_string()],
+            status: blocked_status.clone(),
+            reason: "生产发送网关安全门拦截本次发送".to_string(),
+            policy_blocks: vec![blocked_status.clone()],
             run_mode: "live".to_string(),
             message_id: None,
         };
@@ -302,8 +343,8 @@ pub async fn send_contact_message_gateway(
             &contact.account_id,
             Some(&contact.wxid),
             "blocked_review",
-            "blocked",
-            "生产发送网关 Review 未通过，已拦截私聊发送",
+            &blocked_status,
+            "生产发送网关安全门未通过，已拦截私聊发送",
             Some(review_event_details(&review)),
         )
         .await?;
@@ -311,8 +352,8 @@ pub async fn send_contact_message_gateway(
             sent_content: content,
             message_id: None,
             review_approved: false,
-            gateway_status: "review_blocked".to_string(),
-            gateway_reason: "Review Agent 拦截本次发送".to_string(),
+            gateway_status: blocked_status.clone(),
+            gateway_reason: "生产发送网关安全门拦截本次发送".to_string(),
             decision_review_id: Some(review_id.to_hex()),
         });
     }
