@@ -18,6 +18,7 @@ use crate::{
 };
 
 use super::AppState;
+use crate::auth::{is_workspace_authorized, session::get_admin_user, AuthenticatedAdmin};
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -1450,6 +1451,38 @@ pub(crate) async fn add_outcome_event_inner(
     )
     .await?;
     Ok(outcome_event)
+}
+
+/// #H3：解析请求目标 workspace 并校验 ∈ admin ACL，堵认证后水平越权。
+///
+/// 解析顺序：`override_ws`（trim 后非空）优先，否则回落 `admin.current_workspace`。
+/// 校验对**每个请求**都做（含回落值），单一路径无遗漏。失败语义与
+/// `switch_workspace` 同源（同错误码字符串）。
+pub(super) async fn resolve_authorized_workspace(
+    state: &AppState,
+    admin: &AuthenticatedAdmin,
+    override_ws: Option<String>,
+) -> AppResult<String> {
+    let resolved = override_ws
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| admin.current_workspace.clone());
+
+    // get_admin_user 返回 Result<_, AuthError>（非 AppResult，无 From<AppError>），
+    // 故不能裸 `?`。函数体仅一次 find_one，唯一可能变体是 AuthError::Mongo，
+    // 映射成 AppError::Db 与既有错误语义一致（兜底 External 防变体新增时漏接）。
+    let user = get_admin_user(&state.db, &admin.user_id)
+        .await
+        .map_err(|e| match e {
+            crate::auth::session::AuthError::Mongo(err) => AppError::Db(err),
+            other => AppError::External(format!("admin lookup: {other}")),
+        })?
+        .ok_or_else(|| AppError::Unauthorized("admin_user_not_found".into()))?;
+
+    if !is_workspace_authorized(&resolved, &user.workspaces, &state.config.default_workspace_id) {
+        return Err(AppError::BadRequest("workspace_not_in_user_acl".into()));
+    }
+    Ok(resolved)
 }
 
 #[cfg(test)]
