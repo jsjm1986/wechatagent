@@ -319,6 +319,9 @@ async fn write_event(
 ///
 /// peer_case 是 Phase B 引入的"用作参考的同类案例"chunk 类型；冷链路重激活
 /// 文案最适合走该类型，避免直接搬 product_fact（容易被识别为推销话术）。
+///
+/// ①-b 红线：只取 integrity_status="verified" 的 peer_case——对客推送文案必须内容
+/// 已核实（active/approved 是启用门，verified 是内容门，双门都过才可推送给客户）。
 async fn load_peer_case_hooks(state: &AppState, workspace_id: &str) -> anyhow::Result<Vec<String>> {
     let mut cursor = state
         .db
@@ -329,6 +332,7 @@ async fn load_peer_case_hooks(state: &AppState, workspace_id: &str) -> anyhow::R
                 "workspace_id": workspace_id,
                 "chunk_type": "peer_case",
                 "status": { "$in": ["active", "approved"] },
+                "integrity_status": "verified",
             },
             None,
         )
