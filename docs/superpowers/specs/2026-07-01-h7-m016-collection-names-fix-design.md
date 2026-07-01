@@ -16,8 +16,9 @@
 1. **集合名拼错**：m016 的名字在真实集合里不存在 → `update_many` 匹配 0 行（Mongo 对不存在集合不报错），该真实集合的 legacy 行**永不被回填**。
 2. **集合漏收录**：有 `workspace_id` 字段、却两张表都没列的集合 → legacy 行永不被回填。
 3. **snake/camel 归错类**：集合真实字段是 camelCase 却放进 SNAKE 表（或反之）→ `$set` 写错字段名，legacy 行仍缺正确字段。
+4. **收录了无 workspace_id 字段的集合**：集合的租户模型不是"单值 workspace_id"（如 `chunk_revisions` 靠 chunk_id 反查租户、`admin_users` 用 `workspaces: Vec`）却被列入表 → `update_many` 给每行**注入一个从不被查询/索引使用的垃圾字段**。非数据黑掉，但属字段污染，违反"只回填真正需要单值 workspace_id 的集合"契约。
 
-后果统一：多租户过滤上线后，未正确回填的 legacy 行 workspace_id 缺失 → 数据不可见/丢失。这是数据完整性缺陷。
+前三类后果统一：多租户过滤上线后，未正确回填的 legacy 行 workspace_id 缺失 → 数据不可见/丢失。第四类是反向问题（写了不该写的字段）。二者都是数据完整性缺陷。
 
 ### 触发条件
 
@@ -46,9 +47,10 @@ m016 有 `APP_ENV=production` 守卫（m016:76-82）：生产环境 noop，要�
 
 （括号为 models.rs 里 `pub workspace_id` 字段行号；camel 两个的 rename_all 在 struct 头行 552/596。）
 
-### C. 归错类 / 该移除
+### C. 该移除（无单值 workspace_id 字段，不符合"回填单值 workspace_id"契约）
 
-- `admin_users`（m016:72 CAMEL 表）→ **移除**：`AdminUser`（src/auth/mod.rs:28-39）租户模型是 `workspaces: Vec<String>` + `default_workspace: Option<String>`，**无单值 workspace_id/workspaceId 字段**，不符合"回填单值 workspace_id"的契约。它由 `auth/session.rs:35` 的 `db.raw().collection("admin_users")` 访问（不走 typed accessor），是真实集合但租户模型不同。
+- `admin_users`（m016:72 CAMEL 表）→ **移除**：`AdminUser`（src/auth/mod.rs:28-39）租户模型是 `workspaces: Vec<String>` + `default_workspace: Option<String>`，**无单值 workspace_id/workspaceId 字段**。它由 `auth/session.rs:35` 的 `db.raw().collection("admin_users")` 访问（不走 typed accessor），是真实集合但租户模型不同。
+- `chunk_revisions`（m016:63 SNAKE 表）→ **移除**：`ChunkRevision`（models.rs:1613-1632）**无 workspace_id 字段**——它靠 `chunk_id` 反查所属 chunk 的租户，自身不带租户维度。铁证：(a) 索引 `db/indexes.rs:1306-1331` 只有 `(chunk_id, revision_id)` 和 `created_at`，无任何 workspace_id 索引；(b) 全部读路径（`routes/knowledge/wiki_edit.rs:220/233/336`、`sources_meta.rs:280`）一律按 `chunk_id` 查，从不按 workspace_id 过滤。m016 现对它 `update_many({workspace_id:{$exists:false}}, {$set:{workspace_id:"default"}})` 会给**每行**注入一个从不被查询/索引使用的垃圾字段（非数据黑掉，但属字段污染）。与 admin_users **同一移除判据**——无单值 workspace_id 就不进回填范围。（此项为主控二次全量核对 SNAKE 表 40 项时发现的首轮亲验遗漏，见 §7。）
 - `llm_provider_configs`（m016:71 CAMEL 表）→ **正确保留**：`LlmProviderConfig`（models.rs:4731-4736）有 `#[serde(rename_all="camelCase")]`（4732），字段 `workspace_id` 序列化成 `workspaceId`，放 CAMEL 表正确。
 
 ### D. 确认排除（用户已确认，不入回填范围）
@@ -57,9 +59,11 @@ m016 有 `APP_ENV=production` 守卫（m016:76-82）：生产环境 noop，要�
 - `knowledge_chat_session_seqs`（mod.rs:159）：`Collection<Document>`，原子自增计数器，无 model、无 workspace_id。
 - `migrations`：迁移记账系统表。
 
-### E. SNAKE 表 33 个有效项（除 7 拼错）已亲验全 snake（无 rename_all），归类正确
+### E. SNAKE 表有效项（40 项 − 7 拼错 − 1 移除(chunk_revisions) = 32 项）已亲验全 snake（无 rename_all），归类正确
 
-WechatAccount / Contact / ConversationMessage / AgentTask / AgentEvent / ContentAsset / AgentSoul / OperationPlaybook / OperationDomainConfig / OperationStatePolicy / PromptTemplate / OperatingMemory / OperationKnowledgeDocument / OperationKnowledgeChunk / KnowledgeUsageLog / KnowledgeChatTurn / KnowledgeDailyReport / KnowledgeOperatorMemory / AgentRunLog / LlmCallLog / MemoryCandidate / UserOperationGuidePreview / EvaluationScenario / Experiment / Proposal / ShadowReplay / ThresholdOverride / ThresholdOverrideAudit / PostReleaseReview / EvolutionRuntimeFlag / ChunkRevision / KnowledgeGapSignal / DomainSchema / CatalogRebuildJob。
+WechatAccount / Contact / ConversationMessage / AgentTask / AgentEvent / ContentAsset / AgentSoul / OperationPlaybook / OperationDomainConfig / OperationStatePolicy / PromptTemplate / OperatingMemory / OperationKnowledgeDocument / OperationKnowledgeChunk / KnowledgeUsageLog / KnowledgeChatTurn / KnowledgeDailyReport / KnowledgeOperatorMemory / AgentRunLog / LlmCallLog / MemoryCandidate / UserOperationGuidePreview / EvaluationScenario / Experiment / Proposal / ShadowReplay / ThresholdOverride / ThresholdOverrideAudit / PostReleaseReview / EvolutionRuntimeFlag / KnowledgeGapSignal / DomainSchema / CatalogRebuildJob。
+
+（原 spec 首轮把 ChunkRevision 也列进此白名单——错误：ChunkRevision 无 workspace_id 字段，见 §2.C 已移除。剔除后本白名单恰为 32 项，与 `40 − 7 − 1` 吻合。）
 
 ## 3. 方案选型
 
@@ -86,6 +90,7 @@ WechatAccount / Contact / ConversationMessage / AgentTask / AgentEvent / Content
 ### 4.1 SNAKE_CASE_COLLECTIONS
 
 - 改 7 个拼错：`accounts`→`wechat_accounts`、`decision_reviews`→`agent_decision_reviews`、`management_sessions`→`management_agent_sessions`、`management_messages`→`management_agent_messages`、`command_runs`→`agent_command_runs`、`tool_calls`→`agent_tool_calls`、`outcome_metrics`→`agent_outcome_metrics`
+- 移除 `chunk_revisions`（ChunkRevision 无 workspace_id 字段，§2.C）。
 - 补 13 个 snake 漏掉集合（B 类 snake 组）。
 
 ### 4.2 CAMEL_CASE_COLLECTIONS
@@ -99,7 +104,7 @@ WechatAccount / Contact / ConversationMessage / AgentTask / AgentEvent / Content
 - 维护 `const KNOWN_TENANT_COLLECTIONS: &[&str]`（本 spec §2 定稿的全部真实集合名，snake + camel 合并）。
 - 测试 1：`SNAKE_CASE_COLLECTIONS` ∪ `CAMEL_CASE_COLLECTIONS` 的每个名字都 ∈ `KNOWN_TENANT_COLLECTIONS`（挡拼错）。
 - 测试 2：两表内部 + 跨表无重复项、无空串。
-- 测试 3：`admin_users` 不在任一表内（锁 C 类移除，防回退）。
+- 测试 3：`admin_users` 和 `chunk_revisions` 都不在任一表内（锁 C 类移除，防回退——这两个集合无单值 workspace_id 字段）。
 
 ## 5. 数据行为（改动后）
 
@@ -117,3 +122,5 @@ WechatAccount / Contact / ConversationMessage / AgentTask / AgentEvent / Content
 ## 7. 附：为何权威清单由主控亲验（方法论记录）
 
 两轮 Explore subagent 核查这份清单均不可靠且互相矛盾：第一轮报 7 处拼错、第二轮主表否认其中 6 处（把真实名误当 m016 内容）；第二轮把 `system_taxonomies` 说成有 workspace_id（实为 `scope`，把注释行张冠李戴）；漏看 struct 头 `rename_all` 导致 llm_provider_configs 归类误判。故 §2 清单由主控逐集合 Read struct + 对照 m016 表原文 + db/mod.rs accessor 亲验定稿，每条附 file:line。实现阶段（SDD）subagent 同样必须先读码验证每个集合名再改，产出带 file:line 证据。
+
+**二次全量核对补记（关键教训）：** 首轮主控亲验仍漏掉 `chunk_revisions` 无 workspace_id 字段这一事实——它当时被错误列进 §2.E"已亲验正确"白名单。第二轮改用**机械穷举**（把 grep 到的每个 `pub workspace_id` 声明行号 + 每个 struct 起始行号 + 每处 `rename_all` 命中行号做区间归属，逐一核对 SNAKE 表全部 40 项）才发现：40 项里唯独 `chunk_revisions` 对应的 `ChunkRevision`(1613-1632) 无 workspace_id 命中，并经索引(indexes.rs:1306-1331 无 ws 索引)+读路径(全按 chunk_id 查)反查坐实。教训：**逐集合抽样式亲读仍会漏；对"清单完整性"这类不变量，要用可枚举、可穷尽的机械判据（字段声明行 vs struct 边界 vs rename_all 命中）交叉锁死，而非逐个凭眼过。** SDD 实现 brief 要求 subagent 用同一机械判据复核，不接受"我读了都对"式结论。
