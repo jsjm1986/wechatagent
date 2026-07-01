@@ -16,6 +16,7 @@ import { useContactStore } from "../../stores/contactStore";
 import { useAccountStore } from "../../stores/accountStore";
 import { useUiStore } from "../../stores/uiStore";
 import { ConfirmProvider } from "../../components/ui/ConfirmDialog";
+import { ToastProvider, useToast } from "../../components/ui/Toast";
 import { usePromptSaveConfirm } from "../../components/prompt/usePromptSaveConfirm";
 import type {
   Contact,
@@ -50,9 +51,11 @@ export default function UserOpsFeature() {
   // 必须有 <ConfirmProvider> 祖先，否则 useConfirm 拿到 null 崩溃。system-strategy 已自带，
   // user-ops 频道在此补挂（标准用法，参照 system-strategy 根 Provider）。
   return (
-    <ConfirmProvider>
-      <UserOpsFeatureInner />
-    </ConfirmProvider>
+    <ToastProvider>
+      <ConfirmProvider>
+        <UserOpsFeatureInner />
+      </ConfirmProvider>
+    </ToastProvider>
   );
 }
 
@@ -185,6 +188,24 @@ function UserOpsFeatureInner() {
   // 路径B 二次确认：prompt 保存改为组件层经此 hook 消费 store 三态。
   const runSavePrompt = usePromptSaveConfirm();
 
+  const toast = useToast();
+  // apply 成功后：有跳过字段就提示哪些被跳过（文案动态拼接，不硬编码字段名）。
+  // appliedFields 语义偏大（含 memory/playbookPatch 等非枚举键、且 DropSilently 静默丢弃的字段亦计入），
+  // 故成功文案中性化为“已处理”，避免让运营误以为“精确应用了 N 个字段”。
+  const onApplyGuide = async () => {
+    const res = await applyGuidePreview();
+    if (!res) return;
+    if (res.skippedFields.length) {
+      toast.info(
+        `已处理 ${res.appliedFields.length} 项，跳过 ${res.skippedFields
+          .map((s) => s.field)
+          .join("、")}（取值越界，已忽略）`
+      );
+    } else {
+      toast.success("配置已应用");
+    }
+  };
+
   // 计算衍生状态
   const managedCount = useMemo(
     () => contacts.filter((contact) => contact.agentStatus === "managed").length,
@@ -291,7 +312,7 @@ function UserOpsFeatureInner() {
             simulationInput={simulationInput}
             simulationTurns={simulationTurns}
             onAnalyzeProfile={analyzeProfile}
-            onApplyGuidePreview={applyGuidePreview}
+            onApplyGuidePreview={onApplyGuide}
             onDisableAgent={disableAgent}
             onEnableAgent={enableAgent}
             onGuideInstruction={setGuideInstruction}

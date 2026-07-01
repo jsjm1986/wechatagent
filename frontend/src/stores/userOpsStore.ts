@@ -10,6 +10,7 @@ import type {
   OperatingMemoryDraft,
   OperationHealth,
   UserOperationGuidePreview,
+  UserOperationGuideApplyResult,
   SimulationTurn,
   UserOpsMode,
   SmartOpsTab,
@@ -119,7 +120,7 @@ interface UserOpsActions {
   saveManualTags: (tags: string[]) => Promise<void>;
   analyzeProfile: () => Promise<void>;
   previewGuideInstruction: (instruction: string) => Promise<void>;
-  applyGuidePreview: () => Promise<void>;
+  applyGuidePreview: () => Promise<UserOperationGuideApplyResult | null>;
   runMemoryConsolidation: () => Promise<void>;
   runDialogueSimulation: () => Promise<void>;
   createPlaybook: () => Promise<void>;
@@ -711,13 +712,13 @@ export const useUserOpsStore = create<UserOpsState & UserOpsActions>((set, get) 
     const currentAccountId = useAccountStore.getState().currentAccountId();
     const { guidePreview } = get();
 
-    if (!selected || !guidePreview) return;
+    if (!selected || !guidePreview) return null;
 
     useUiStore.getState().setBusy(true);
     useUiStore.getState().setError("");
 
     try {
-      const data = await api.post<{ item: { contact: Contact; operatingMemory: OperatingMemory; health: any } }>(
+      const data = await api.post<{ item: UserOperationGuideApplyResult }>(
         "/api/user-operations/guide/apply",
         { previewId: guidePreview.id }
       );
@@ -729,8 +730,10 @@ export const useUserOpsStore = create<UserOpsState & UserOpsActions>((set, get) 
       });
 
       await refreshContacts(currentAccountId);
+      return data.item;
     } catch (error) {
       useUiStore.getState().setError(error instanceof Error ? error.message : String(error));
+      return null;
     } finally {
       useUiStore.getState().setBusy(false);
     }
