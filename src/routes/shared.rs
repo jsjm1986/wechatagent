@@ -1468,6 +1468,15 @@ pub(super) async fn resolve_authorized_workspace(
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| admin.current_workspace.clone());
 
+    // crate 内部合成 admin（management_admin，user_id 为空）：租户信任已由上游真实
+    // admin 会话确立，隔离靠 current_workspace（调用方强制覆盖为可信 workspace），从不
+    // 依赖 user_id。全仓唯一空-user_id 构造点是 management_admin；真实请求的 user_id
+    // 来自 session.admin_user_id / JWT claims.sub 恒非空。故空 user_id ⟹ 可信内部委托，
+    // 跳过 ACL（否则 get_admin_user("") 必 None，误伤打死管理 Agent 的 provider 控制链）。
+    if admin.user_id.is_empty() {
+        return Ok(resolved);
+    }
+
     // get_admin_user 返回 Result<_, AuthError>（非 AppResult，无 From<AppError>），
     // 故不能裸 `?`。函数体仅一次 find_one，唯一可能变体是 AuthError::Mongo，
     // 映射成 AppError::Db 与既有错误语义一致（兜底 External 防变体新增时漏接）。

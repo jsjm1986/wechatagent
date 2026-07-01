@@ -56,6 +56,24 @@ fn make_provider(ws: &str, provider_id: &str, active: bool) -> LlmProviderConfig
 async fn activate_yields_exactly_one_active_and_is_target() {
     let app = TestApp::start().await;
     let ws = app.state.config.default_workspace_id.clone();
+    // seed admin（user_id=llm_admin，workspaces=[ws]），让 H3 ACL 闸 get_admin_user 命中。
+    app.state
+        .db
+        .raw()
+        .collection::<mongodb::bson::Document>("admin_users")
+        .insert_one(
+            doc! {
+                "user_id": "llm_admin",
+                "username": "llm_admin",
+                "password_hash": "x",
+                "created_at": DateTime::now(),
+                "workspaces": [ &ws ],
+                "default_workspace": &ws,
+            },
+            None,
+        )
+        .await
+        .expect("seed admin");
     let coll = app.state.db.llm_provider_configs();
     // seed:p_old 当前 active,p_new 未激活
     coll.insert_one(make_provider(&ws, "p_old", true), None)
@@ -100,6 +118,24 @@ async fn activate_yields_exactly_one_active_and_is_target() {
 async fn activate_missing_provider_not_found() {
     let app = TestApp::start().await;
     let ws = app.state.config.default_workspace_id.clone();
+    // seed admin（user_id=llm_admin，workspaces=[ws]），让 H3 ACL 闸 get_admin_user 命中。
+    app.state
+        .db
+        .raw()
+        .collection::<mongodb::bson::Document>("admin_users")
+        .insert_one(
+            doc! {
+                "user_id": "llm_admin",
+                "username": "llm_admin",
+                "password_hash": "x",
+                "created_at": DateTime::now(),
+                "workspaces": [ &ws ],
+                "default_workspace": &ws,
+            },
+            None,
+        )
+        .await
+        .expect("seed admin");
     let query: Query<wechatagent::routes::llm_providers::ListQuery> =
         Query(serde_json::from_value(serde_json::json!({})).expect("构造 ListQuery"));
     let result = activate_provider(
