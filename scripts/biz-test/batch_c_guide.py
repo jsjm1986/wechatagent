@@ -137,15 +137,26 @@ def main() -> None:
     skipped = item.get("skippedFields", [])
     applied = item.get("appliedFields", [])
     print(f"  appliedFields={applied} skippedFields={skipped}")
-    # 若 LLM 这轮产了越界 operationState,它必须出现在 skippedFields(被跳过)而非致全局失败。
+    # 部分应用红线的真正证据:当有字段被跳过(越界)时,合法字段必须仍然落库——
+    # 即"单个越界字段不得连坐丢弃全部合法字段"。skipped 非空恰是本次修复要治的 bug 场景
+    # (旧代码此时整请求 400、合法字段全丢),故只要 skipped 非空就强断言"至少一个合法字段幸存"。
+    skipped_names = {s.get("field") for s in skipped if isinstance(s, dict)}
+    if skipped:
+        # 合法字段幸存 = updated_at 被刷新(有字段落库)或 appliedFields 非空。二者任一即证未连坐。
+        snap_partial = _contact_snapshot(account_id)
+        ua_pre = _field(snap_after_preview, "updated_at")
+        ua_post = _field(snap_partial, "updated_at")
+        survived = bool(applied) or (has_changes and ua_pre != ua_post)
+        _lib.expect(survived, DOMAIN,
+                    "有字段被跳过时合法字段仍落库(部分应用红线:越界字段不连坐)",
+                    f"skipped={skipped} applied={applied} updated_at {ua_pre}->{ua_post}", "critical",
+                    "旧 bug=单越界字段致整请求 400 合法字段全丢;修复后须越界跳过、合法字段照落")
+    # skippedFields 里的字段名必须是已知枚举键之一(不臆造),且确实来自本次 suggestedChanges。
     sc_keys = set(sc0.get("keys", []))
-    if "operationState" in sc_keys:
-        skipped_names = {s.get("field") for s in skipped if isinstance(s, dict)}
-        # operationState 要么被 skip(越界),要么被 apply(LLM 这次产了合法态)——两者都不该整体 400。
-        _lib.expect("operationState" in skipped_names or "operationState" in applied,
-                    DOMAIN, "operationState 要么跳过要么应用,不再连坐合法字段",
-                    f"applied={applied} skipped={skipped}", "high",
-                    "部分应用红线:单个越界字段不得致全部合法字段丢弃")
+    for name in skipped_names:
+        _lib.expect(name in sc_keys, DOMAIN, "skippedFields 字段来自本次 suggestedChanges(不臆造)",
+                    f"skipped_field={name} suggested_keys={sc_keys}", "high",
+                    "回流的越界字段名必须是运营实际提交的键,否则回流数据失真")
 
     # apply 成功路径:铁证 3+4(preview.status=applied + updated_at 刷新)。
     # 修复后 apply 越界不再整体 400,此路径恒到达。
