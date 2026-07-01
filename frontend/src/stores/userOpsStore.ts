@@ -20,6 +20,7 @@ import type {
   DomainKey
 } from "../types";
 import { api } from "../lib/api";
+import { fetchSummary } from "../lib/inboxApi";
 import { useUiStore } from "./uiStore";
 import { useContactStore } from "./contactStore";
 import { useAccountStore } from "./accountStore";
@@ -38,6 +39,8 @@ interface UserOpsState {
   memoryDraft: OperatingMemoryDraft;
   operationHealth: OperationHealth | null;
   decisionReviews: DecisionReview[];
+  // 判断条请示灯（Task 3）：统一收件箱里待本人裁决的请示数量（principalEscalation）。
+  escalationPendingCount: number;
 
   // 表单/草稿
   importQuery: string;
@@ -103,6 +106,7 @@ interface UserOpsActions {
   // 核心业务方法
   hydrateSelected: (contact: Contact) => void;
   loadMessages: (contact: Contact) => Promise<void>;
+  loadEscalationCount: () => Promise<void>;
   loadPlaybooks: (accountId: string) => Promise<void>;
   loadContacts: (accountId: string) => Promise<void>;
   importContacts: () => Promise<void>;
@@ -296,6 +300,7 @@ export const useUserOpsStore = create<UserOpsState & UserOpsActions>((set, get) 
   memoryDraft: emptyMemoryDraft(),
   operationHealth: null,
   decisionReviews: [],
+  escalationPendingCount: 0,
 
   profileNote: "",
   customAgentInstructions: "",
@@ -407,6 +412,20 @@ export const useUserOpsStore = create<UserOpsState & UserOpsActions>((set, get) 
       useUiStore.getState().setError(
         firstErr.reason instanceof Error ? firstErr.reason.message : String(firstErr.reason),
       );
+    }
+    // 判断条请示灯：与选中联系人数据并行加载（失败不阻断，优雅降级为 0）。
+    void get().loadEscalationCount();
+  },
+
+  // 判断条请示灯：拉统一收件箱 summary，取待本人裁决的请示数（principalEscalation）。
+  // 失败/字段缺失回落 0（不弹错、不渲染此 chip）——纯观测灯，不阻断驾驶舱。
+  loadEscalationCount: async () => {
+    try {
+      const summary = await fetchSummary();
+      const count = typeof summary.principalEscalation === "number" ? summary.principalEscalation : 0;
+      set({ escalationPendingCount: count });
+    } catch {
+      set({ escalationPendingCount: 0 });
     }
   },
 

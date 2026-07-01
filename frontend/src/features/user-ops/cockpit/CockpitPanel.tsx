@@ -27,8 +27,10 @@ import type {
 } from "../../../types";
 import { useProfileStore } from "../../../stores/profileStore";
 import { useUserOpsStore } from "../../../stores/userOpsStore";
+import { useNavigationStore } from "../../../stores/navigationStore";
 import TagTrustPanel from "../TagTrustPanel";
 import PersonalityPanel from "../PersonalityPanel";
+import { JudgmentBar } from "./JudgmentBar";
 import {
   MEMORY_DRAFT_FIELD_GROUPS,
   ChangePreview,
@@ -104,6 +106,9 @@ export function CockpitPanel(props: CockpitPanelProps) {
   const { selected } = props;
   const [viewMode, setViewMode] = useState<ViewMode>("observe");
   const [drilldown, setDrilldown] = useState<Drilldown>(null);
+  const taxonomies = useProfileStore((s) => s.taxonomies);
+  const escalationPendingCount = useUserOpsStore((s) => s.escalationPendingCount);
+  const setChannel = useNavigationStore((s) => s.setChannel);
 
   // 空态：搬自原 UserOperationCockpit（legacy.tsx:282-292）。
   if (!selected) {
@@ -120,7 +125,7 @@ export function CockpitPanel(props: CockpitPanelProps) {
 
   return (
     <section className={`smartWorkspace panel ${styles.cockpitPanel}`}>
-      {/* panelHead：搬自 legacy.tsx:305-314。JudgmentBar 常驻判断条留待 Task 3 填充。 */}
+      {/* panelHead：搬自 legacy.tsx:305-314。JudgmentBar 常驻判断条（Task 3）挂在头部之下。 */}
       <div className="panelHead">
         <div>
           <span>当前运营对象</span>
@@ -131,6 +136,19 @@ export function CockpitPanel(props: CockpitPanelProps) {
           {selected.agentStatus === "managed" ? "Agent 运营中" : "未加入 Agent"}
         </div>
       </div>
+
+      <JudgmentBar
+        contact={selected}
+        latestReview={props.decisionReviews[0]}
+        health={props.health}
+        escalationCount={escalationPendingCount}
+        taxonomies={taxonomies}
+        onRiskClick={() => {
+          setDrilldown(null);
+          setViewMode("observe");
+        }}
+        onEscalationClick={() => setChannel("askHuman")}
+      />
 
       {drilldown === null ? (
         <>
