@@ -32,7 +32,7 @@ SCAN_DIRS=(
 
 # 严禁词列表（不区分大小写）。中文词通过 grep -E 直接匹配；
 # 英文词同时覆盖 hyphen / underscore 变体。
-FORBIDDEN_PATTERN='(human[_ -]?takeover|takeover|hand[ -]?off|人工接管|人工介入|人工托管|接管|人工)'
+FORBIDDEN_PATTERN='(human[_ -]?takeover|takeover|hand[_ -]?off|人工接管|人工介入|人工托管|接管|人工)'
 
 # 列出 base..HEAD 之间在 SCAN_DIRS 下变更的文件（仅文本文件，排除删除）。
 mapfile -t CHANGED < <(
