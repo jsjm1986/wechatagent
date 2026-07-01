@@ -1150,6 +1150,9 @@ mod tests {
             // 被 guides.rs::apply handler 复用、不直接绑 HTTP；guide_apply_partial_validation
             // 集成测试通过 `pub` 直调断言部分应用语义(越界 skip / 合法字段落库)。
             "apply_contact_changes",
+            // repair.rs：AI 自主修复 chunk 首轮核心业务逻辑，与 axum handler / auth 解耦，
+            // 被 propose_chunk_repair handler 与 knowledge_task worker 复用、不直接绑 HTTP。
+            "propose_chunk_repair_inner",
         ];
 
         let mut handlers: Vec<&str> = Vec::new();
