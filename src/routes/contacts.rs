@@ -28,7 +28,7 @@ use super::AppState;
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub(super) struct OperationProfileRequest {
+pub struct OperationProfileRequest {
     #[serde(default)]
     tags: Vec<String>,
     customer_stage: Option<String>,
@@ -756,7 +756,7 @@ fn stage_changed(prev_stage: Option<&str>, new_stage: Option<&str>) -> bool {
     new_stage.is_some() && prev_stage != new_stage
 }
 
-pub(super) async fn update_operation_profile(
+pub async fn update_operation_profile(
     State(state): State<AppState>,
     Extension(admin): Extension<AuthenticatedAdmin>,
     Path(id): Path<String>,
@@ -796,10 +796,16 @@ pub(super) async fn update_operation_profile(
         "tags": payload.tags,
         "commitments": commitments_bson,
         "follow_up_policy": normalize_optional(payload.follow_up_policy),
-        "profile_attributes": payload.profile_attributes,
         "profile_updated_at": DateTime::now(),
         "updated_at": DateTime::now(),
     };
+    // 与 gateway.rs 写回一致:profile_attributes 非空才写。前端「运营画像」表单
+    // 不管理 profile_attributes(它由 AI 在 gateway 积累),PUT 时不带该字段 →
+    // payload 反序列化为空 Document。无条件 $set 会把 AI 积累的画像清空(M13),
+    // 故空则跳过、保留现值。
+    if !payload.profile_attributes.is_empty() {
+        set_doc.insert("profile_attributes", payload.profile_attributes);
+    }
     let intent_level = match normalize_optional(payload.intent_level) {
         Some(v) => apply_admin_dim_validation(
             crate::agent::dimension_registry::validate_dimension_value(
