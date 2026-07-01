@@ -166,7 +166,6 @@ pub(super) struct OperationKnowledgeRequest {
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
-#[allow(dead_code)] // HTTP schema：routing_card / forbidden_claims 字段保留前端兼容
 pub struct OperationKnowledgeChunkRequest {
     account_id: Option<String>,
     document_id: Option<String>,
@@ -178,17 +177,10 @@ pub struct OperationKnowledgeChunkRequest {
     title: String,
     summary: Option<String>,
     body: Option<String>,
-    routing_card: Option<String>,
     #[serde(default)]
     applicable_scenes: Vec<String>,
     #[serde(default)]
     not_applicable_scenes: Vec<String>,
-    #[serde(default)]
-    safe_claims: Vec<String>,
-    #[serde(default)]
-    forbidden_claims: Vec<String>,
-    #[serde(default)]
-    evidence_items: Vec<String>,
     /// 知识标签（≤5）：产品名/解决方案，LLM 自动抽取，后台可编辑。
     #[serde(default)]
     product_tags: Vec<String>,
@@ -202,10 +194,6 @@ pub struct OperationKnowledgeChunkRequest {
     confidence_score: Option<i32>,
     #[serde(default)]
     distortion_risks: Vec<String>,
-    #[serde(default)]
-    unsupported_claims: Vec<String>,
-    #[serde(default)]
-    verified_claims: Vec<String>,
     #[serde(default = "default_active_status")]
     status: String,
     #[serde(default)]
@@ -867,14 +855,12 @@ pub(super) fn integrity_report_for_preview(raw_content: &str, chunks: &mut [Valu
     // 红线「AI 永不自动 verify」：preview 路径恒 0 verified，anchor 命中只作审计线索。
     let verified = 0;
     let mut needs_review = 0;
-    let mut rejected = 0;
+    let rejected = 0;
     let mut items = Vec::new();
     for chunk in chunks.iter_mut() {
         let source_quote = json_string(chunk, "sourceQuote")
             .or_else(|| json_string(chunk, "source_quote"))
             .unwrap_or_default();
-        let safe_claims = json_string_list(chunk, "safeClaims").unwrap_or_default();
-        let evidence_items = json_string_list(chunk, "evidenceItems").unwrap_or_default();
         let mut risks = Vec::new();
         let mut anchors = Vec::new();
         if let Some(anchor) = source_anchor_for_quote(raw_content, None, &source_quote) {
@@ -884,46 +870,17 @@ pub(super) fn integrity_report_for_preview(raw_content: &str, chunks: &mut [Valu
         } else {
             risks.push("缺少原文引用".to_string());
         }
-        if anchors.is_empty() && (!safe_claims.is_empty() || !evidence_items.is_empty()) {
-            risks.push("存在安全事实或证据项，但没有可验证原文锚点".to_string());
-        }
-        let has_quote = !source_quote.trim().is_empty();
         let anchored = !anchors.is_empty() && risks.is_empty();
-        // 红线「AI 永不自动 verify」：preview 与 apply handler（见
-        // import_operation_knowledge_apply / *_apply_chunked 落库前
-        // 无条件压回 needs_review）保持一致——anchor 命中只作审计线索
-        // （保留 anchors + confidence=90，前端「距离 verify 一步之遥」可用），
-        // integrityStatus 绝不直接 verified。光有声明却无源仍硬挡 rejected（更严方向）。
-        let status = if anchored || has_quote || (safe_claims.is_empty() && evidence_items.is_empty())
-        {
-            needs_review += 1;
-            "needs_review"
-        } else {
-            rejected += 1;
-            "rejected"
-        };
+        // 红线「AI 永不自动 verify」：preview 路径 anchor 命中只作审计线索
+        // （保留 anchors + confidence=90），integrityStatus 恒 needs_review，绝不 verified。
+        needs_review += 1;
+        let status = "needs_review";
         let confidence = if anchored { 90 } else { 45 };
         if let Some(object) = chunk.as_object_mut() {
             object.insert("sourceAnchors".to_string(), json!(anchors));
             object.insert("integrityStatus".to_string(), json!(status));
             object.insert("confidenceScore".to_string(), json!(confidence));
             object.insert("distortionRisks".to_string(), json!(risks.clone()));
-            object.insert(
-                "unsupportedClaims".to_string(),
-                json!(if anchors.is_empty() {
-                    safe_claims.clone()
-                } else {
-                    Vec::<String>::new()
-                }),
-            );
-            object.insert(
-                "verifiedClaims".to_string(),
-                json!(if anchors.is_empty() {
-                    Vec::<String>::new()
-                } else {
-                    safe_claims.clone()
-                }),
-            );
         }
         items.push(json!({
             "title": json_string(chunk, "title").unwrap_or_default(),
@@ -955,52 +912,32 @@ pub(super) fn apply_chunk_integrity(
     let has_anchor = !chunk.source_anchors.is_empty();
     let has_quote = !source_quote.trim().is_empty();
     if has_anchor {
-        if chunk.verified_claims.is_empty() {
-            chunk.verified_claims = chunk.safe_claims.clone();
-        }
         chunk.integrity_status = Some("verified".to_string());
         chunk.confidence_score = Some(chunk.confidence_score.unwrap_or(90));
         return;
     }
-    // 没 anchor。区分两种情况：
-    // 1) 还有 source_quote → AI 出了引用但模糊匹配也没找到，留 needs_review，
-    //    让 AI 自主修复流程来纠正引用 / 重新锚定。
-    // 2) 既没 quote、也没 safe_claims/evidence_items（光有 routing 元数据）→ needs_review。
-    // 3) 没 quote 但有 claim/evidence → rejected（声明无源，硬挡）。
-    if has_quote || (chunk.safe_claims.is_empty() && chunk.evidence_items.is_empty()) {
-        if !has_quote && chunk.distortion_risks.is_empty() {
-            chunk
-                .distortion_risks
-                .push("缺 sourceQuote 与原文锚点，建议触发 AI 自主修复".to_string());
-        } else if has_quote && chunk.distortion_risks.is_empty() {
-            chunk
-                .distortion_risks
-                .push("sourceQuote 未在原文中精确匹配，建议触发 AI 自主修复以纠正引用".to_string());
-        }
-        chunk.integrity_status = Some(
-            chunk
-                .integrity_status
-                .clone()
-                .filter(|s| matches!(s.as_str(), "needs_review" | "verified" | "rejected"))
-                .unwrap_or_else(|| "needs_review".to_string()),
-        );
-        if matches!(chunk.integrity_status.as_deref(), Some("verified")) {
-            chunk.integrity_status = Some("needs_review".to_string());
-        }
-        chunk.confidence_score = Some(chunk.confidence_score.unwrap_or(45));
-        return;
-    }
-    // 既没 quote 又有 claim/evidence：硬声明无源，标 rejected。
-    if chunk.unsupported_claims.is_empty() {
-        chunk.unsupported_claims = chunk.safe_claims.clone();
-    }
-    if chunk.distortion_risks.is_empty() {
+    // 无 anchor：一律 needs_review（有 quote 但没锚定 = 引用待纠正；无 quote = 缺出处）。
+    // 由下游 AI 自主修复流程重新锚定。红线「AI 永不自动 verify」：绝不在此直接 verified。
+    if !has_quote && chunk.distortion_risks.is_empty() {
         chunk
             .distortion_risks
-            .push("安全事实或证据缺少 sourceQuote 与原文锚点".to_string());
+            .push("缺 sourceQuote 与原文锚点，建议触发 AI 自主修复".to_string());
+    } else if has_quote && chunk.distortion_risks.is_empty() {
+        chunk
+            .distortion_risks
+            .push("sourceQuote 未在原文中精确匹配，建议触发 AI 自主修复以纠正引用".to_string());
     }
-    chunk.integrity_status = Some("rejected".to_string());
-    chunk.confidence_score = Some(0);
+    chunk.integrity_status = Some(
+        chunk
+            .integrity_status
+            .clone()
+            .filter(|s| matches!(s.as_str(), "needs_review" | "verified" | "rejected"))
+            .unwrap_or_else(|| "needs_review".to_string()),
+    );
+    if matches!(chunk.integrity_status.as_deref(), Some("verified")) {
+        chunk.integrity_status = Some("needs_review".to_string());
+    }
+    chunk.confidence_score = Some(chunk.confidence_score.unwrap_or(45));
 }
 
 pub(super) async fn load_operation_knowledge_chunks_for_query(
@@ -1241,9 +1178,7 @@ mod tests {
         let raw = "WechatAgent 企业版提供 7x24 小时自动应答，支持私域多账号统一纳管。";
         let mut chunks = vec![json!({
             "title": "企业版能力",
-            "sourceQuote": "WechatAgent 企业版提供 7x24 小时自动应答",
-            "safeClaims": ["提供 7x24 小时自动应答"],
-            "evidenceItems": ["官网服务说明"]
+            "sourceQuote": "WechatAgent 企业版提供 7x24 小时自动应答"
         })];
         let report = integrity_report_for_preview(raw, &mut chunks);
         // 报告聚合：verified 恒 0。
@@ -1265,18 +1200,18 @@ mod tests {
         );
     }
 
-    /// preview：有声明/证据但完全无原文引用与锚点 → rejected（更严方向，硬挡）。
+    /// preview：无 sourceQuote/anchor 的 chunk → needs_review（claim 维度已随死字段移除，
+    /// 不再硬 reject；红线「AI 永不自动 verify」仍恒 0 verified）。
     #[test]
-    fn preview_claim_without_source_is_rejected() {
+    fn preview_no_source_is_needs_review() {
         let raw = "本文与产品声明无关的纯背景介绍。";
         let mut chunks = vec![json!({
-            "title": "无源声明",
-            "sourceQuote": "",
-            "safeClaims": ["保证三天见效"],
-            "evidenceItems": ["内部数据"]
+            "title": "无源切片",
+            "body": "一段没有原文引用的正文",
+            "sourceQuote": ""
         })];
         let report = integrity_report_for_preview(raw, &mut chunks);
-        assert_eq!(chunks[0]["integrityStatus"], json!("rejected"));
+        assert_eq!(chunks[0]["integrityStatus"], json!("needs_review"));
         assert_eq!(report["verified"], json!(0));
     }
 
