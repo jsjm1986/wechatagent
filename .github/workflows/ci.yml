@@ -138,6 +138,10 @@ jobs:
         shell: bash
         run: bash scripts/check-evolution-isolation.sh
 
+      - name: scripts/test-ci-lints.sh (红线 lint 词表 drift 自测)
+        shell: bash
+        run: bash scripts/test-ci-lints.sh
+
   integration:
     name: Integration tests (Docker / testcontainers)
     runs-on: ubuntu-latest

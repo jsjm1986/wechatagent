@@ -69,17 +69,17 @@ fn limiter_for(account_id: &str, capacity: u32, window_seconds: u32) -> Arc<Webh
 // caveat：PENDING 是进程内 DashMap——串行只在单副本下成立。若 webhook 摄入
 // 将来横向扩多副本，需改用 DB 原子 claim + 心跳（参 tasks.rs 的 lease 模式）。
 
-fn contact_key(workspace_id: &str, account_id: &str, wxid: &str) -> String {
+pub fn contact_key(workspace_id: &str, account_id: &str, wxid: &str) -> String {
     format!("{workspace_id}:{account_id}:{wxid}")
 }
 
 /// 单联系人的去抖 / 抢占共享状态。`generation` 每入站 +1，既是去抖触发也是
 /// 抢占信号；`deadline_ms` 每入站刷新即重置去抖窗口；`latest_inbound` 是最新
 /// 入站快照（短锁，绝不跨 `.await` 持有）。
-struct PendingState {
-    generation: AtomicU64,
+pub struct PendingState {
+    pub generation: AtomicU64,
     deadline_ms: AtomicI64,
-    latest_inbound: parking_lot::Mutex<ConversationMessage>,
+    pub latest_inbound: parking_lot::Mutex<ConversationMessage>,
 }
 
 static PENDING: LazyLock<DashMap<String, Arc<PendingState>>> = LazyLock::new(DashMap::new);
@@ -102,7 +102,7 @@ fn barge_in_triggered(gen_at_start: u64, current_generation: u64) -> bool {
 /// spawn-vs-bump：已有 runner 只刷新 deadline / 替换最新入站 / bump generation
 /// （不再 spawn）；没有则插入新状态并 spawn 一个 runner。返回 true 表示本次
 /// 新起了 runner（调用方据此 spawn）。
-fn register_inbound(
+pub fn register_inbound(
     key: String,
     inbound: ConversationMessage,
     window_ms: u64,
@@ -127,7 +127,7 @@ fn register_inbound(
 /// 去抖 runner 主体：等用户说完（deadline 到）→ 快照 generation + 最新入站 →
 /// reload contact（非 managed 则退休）→ 一次反应分析 + 一次聚合网关（带抢占
 /// guard）→ 若期间有新入站则重算，否则原子退休。
-async fn run_debounce_pipeline(
+pub async fn run_debounce_pipeline(
     state: AppState,
     key: String,
     st: Arc<PendingState>,
