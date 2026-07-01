@@ -56,8 +56,6 @@ pub const DEFAULT_UNION_ARRAY_KEYS: &[&str] = &[
     "not_applicable_scenes",
     "business_topics",
     "product_tags",
-    "safe_claims",
-    "forbidden_claims",
 ];
 
 /// 70% body 长度阈值（LLW page-merge.ts:53）。
