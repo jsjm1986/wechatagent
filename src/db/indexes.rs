@@ -298,32 +298,15 @@ pub(super) async fn ensure_all(db: &Database) -> anyhow::Result<()> {
             None,
         )
         .await?;
-    db.operation_domain_configs()
-        .create_index(
-            IndexModel::builder()
-                .keys(doc! { "workspace_id": 1, "domain": 1 })
-                .options(IndexOptions::builder().unique(true).build())
-                .build(),
-            None,
-        )
-        .await?;
-    // Phase B / B4：operation_state_policies 唯一索引——
-    //   (workspace_id, domain, state_key) 复合 unique。
-    // enforce 路径单次 find_one，索引保命中。
-    db.operation_state_policies()
-        .create_index(
-            IndexModel::builder()
-                .keys(doc! { "workspace_id": 1, "domain": 1, "state_key": 1 })
-                .options(IndexOptions::builder().unique(true).build())
-                .build(),
-            None,
-        )
-        .await?;
-    // Phase E5-T1：ops 三表 active_versions 灰度——
-    //   把 (workspace_id, domain[, state_key/value.id]) 旧 unique 索引下线，
-    //   换成包含 `version` 的 4-tuple unique，让多版本可同时驻留 collection。
-    //   `(..., current_version=true)` 部分索引快路径，给读路径筛 active 集合。
-    ensure_ops_versioned_indexes(db).await?;    db.operating_memories()
+    // Phase E5-T1：operation_domain_configs / operation_state_policies /
+    //   system_taxonomies 三表的唯一性索引统一由 `ensure_ops_versioned_indexes`
+    //   负责——(workspace_id, domain[, state_key/value.id], version) 4-tuple unique
+    //   + (..., current_version=true) 部分索引。这里不再单独建旧的 2-key/3-key
+    //   unique:那两处 create_index 会被 ensure_ops_versioned_indexes 立即 drop
+    //   掉,且在多版本数据(admin publish 攒下同 (ws,domain[,state_key]) 多 version
+    //   行)下建旧 unique 会 E11000 → ensure_indexes 返 Err → 启动崩溃(H8 boot-brick)。
+    ensure_ops_versioned_indexes(db).await?;
+    db.operating_memories()
         .create_index(
             IndexModel::builder()
                 .keys(doc! { "workspace_id": 1, "account_id": 1, "contact_wxid": 1 })
