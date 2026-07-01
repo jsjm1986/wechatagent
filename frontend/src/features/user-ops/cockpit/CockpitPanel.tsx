@@ -26,11 +26,12 @@ import { ConfigureView } from "./ConfigureView";
 import { MemoryDetailView } from "./drilldowns/MemoryDetailView";
 import { ConversationReviewView } from "./drilldowns/ConversationReviewView";
 import { SendHistoryView } from "./drilldowns/SendHistoryView";
+import { TrendsDetailView } from "./drilldowns/TrendsDetailView";
 import { PlanStep } from "../legacy";
 import styles from "./cockpit.module.css";
 
 type ViewMode = "observe" | "configure";
-type Drilldown = null | "memory" | "conversation" | "sendHistory";
+type Drilldown = null | "memory" | "conversation" | "sendHistory" | "trends";
 
 // CockpitPanel 接收与原 UserOperationCockpit 完全相同的 props，唯独去掉
 // activeTab / onTab（段控 + 下钻自管本地 state，不再由外部 tab 驱动）。
@@ -178,6 +179,10 @@ function DrilldownHost(props: CockpitPanelProps & { drilldown: Exclude<Drilldown
 
   if (drilldown === "sendHistory") {
     return <SendHistoryView wxid={selected.wxid} onBack={onBack} />;
+  }
+
+  if (drilldown === "trends") {
+    return <TrendsDetailView contact={selected} onBack={onBack} />;
   }
 
   return <MemoryDetailView memoryCard={operatingMemory?.memoryCard} onBack={onBack} />;

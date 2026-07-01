@@ -75,4 +75,10 @@ describe("ObserveView", () => {
     fireEvent.click(screen.getByText("查看发送历史"));
     expect(onDrilldown).toHaveBeenCalledWith("sendHistory");
   });
+
+  it("点击查看走势详情触发 onDrilldown('trends')", () => {
+    const onDrilldown = renderView();
+    fireEvent.click(screen.getByText("查看走势详情"));
+    expect(onDrilldown).toHaveBeenCalledWith("trends");
+  });
 });

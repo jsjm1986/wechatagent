@@ -4,7 +4,7 @@
 //     底色引用 tokens.css 的 --fill-running/held/blocked，不再走全局 `healthItem ${tone}` 硬编码。
 //  2) 长期记忆卡片加下钻入口（data-testid + onClick → onDrilldown("memory")）。
 // 复用的 helper/子组件全部从 ../legacy 导入（canonical 定义所在），不改数据流。
-import { SendHorizonal } from "lucide-react";
+import { SendHorizonal, TrendingUp } from "lucide-react";
 import type {
   Contact,
   DecisionReview,
@@ -23,7 +23,7 @@ import {
 } from "../legacy";
 import styles from "./cockpit.module.css";
 
-type Drilldown = "memory" | "conversation" | "sendHistory";
+type Drilldown = "memory" | "conversation" | "sendHistory" | "trends";
 
 // 观测段所需 props 子集（从 CockpitPanelProps 抽出，避免 ObserveView 被无关配置项耦合）。
 type ObserveViewProps = {
@@ -109,6 +109,12 @@ export function ObserveView(props: ObserveViewProps) {
       <section className="cockpitSection">
         <div className="sectionCaption">人格画像（OCEAN）</div>
         <PersonalityPanel profile={selected.personalityProfile} />
+        <div className="buttonRow">
+          <button className="secondary" type="button" onClick={() => onDrilldown("trends")}>
+            <TrendingUp size={16} />
+            查看走势详情
+          </button>
+        </div>
       </section>
 
       <section className="cockpitSection">
