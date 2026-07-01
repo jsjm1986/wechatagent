@@ -96,7 +96,9 @@ pub struct ListQuery {
     workspace_id: Option<String>,
 }
 
-pub(super) async fn list_providers(
+// pub（非默认私有）：h3_cross_tenant_idor.rs 集成测试需从 tests/ 直调
+// list_providers 验证跨租户读泄漏被拒,仿 activate_provider 先例。
+pub async fn list_providers(
     State(state): State<AppState>,
     Extension(admin): Extension<AuthenticatedAdmin>,
     Query(params): Query<ListQuery>,

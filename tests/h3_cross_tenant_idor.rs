@@ -1,12 +1,13 @@
 //! H3 跨租户 IDOR 回归：handler 解析的 workspaceId 必须 ∈ admin ACL，否则拒绝。
-//! 直调真实 handler（activate_provider），seed 真实 AdminUser 提供 ACL。
+//! 直调真实 handler（activate_provider / list_providers），seed 真实 AdminUser 提供 ACL。
 //! 全部 #[ignore]，需 Docker testcontainers。
 //! CI: `cargo test --test h3_cross_tenant_idor -- --ignored`。
 //!
-//! 说明：`list_providers` 在 src 中是 `pub(super)`（routes/llm_providers.rs:99），
-//! 外部 test crate 无法命名（E0603），与 brief 已排除的 `TestRequest`/`UpsertRequest`
-//! 同因，故本文件仅覆盖 `pub` 的 `activate_provider`。两条测试（越权被拒 + 本租户成功）
-//! 已端到端验证 14 站点共用的单一闸 `resolve_authorized_workspace` 在真实 handler 生效。
+//! 覆盖 14 站点共用的单一闸 `resolve_authorized_workspace` 在真实 handler 生效的
+//! 两条路径：拒绝（越权 override）与放行（本租户回落）。挑 `activate_provider`
+//! （进程级热切换面）+ `list_providers`（读泄漏面）两个最高危 handler；二者均已提为
+//! `pub`（llm_providers.rs，仿既有集成测试先例）。其余 handler 的请求体结构体是
+//! `pub(super)`，外部 test crate 不可命名，但共用同一闸，故无需逐一覆盖。
 #![cfg(test)]
 
 mod common;
@@ -17,7 +18,7 @@ use mongodb::bson::{doc, DateTime};
 use wechatagent::auth::session::{authenticate, bootstrap_admin_if_needed};
 use wechatagent::auth::AuthenticatedAdmin;
 use wechatagent::models::LlmProviderConfig;
-use wechatagent::routes::llm_providers::{activate_provider, ListQuery};
+use wechatagent::routes::llm_providers::{activate_provider, list_providers, ListQuery};
 
 use crate::common::TestApp;
 
@@ -141,4 +142,38 @@ async fn activate_provider_allows_own_workspace() {
         .expect("find mine")
         .expect("mine exists");
     assert!(mine.is_active, "本租户 provider 应被激活");
+}
+
+/// 红线：list_providers 用 override=ws_b（ACL 外）必须被拒，不泄漏 ws_b 列表。
+#[tokio::test]
+#[ignore]
+async fn list_providers_blocks_cross_tenant_override() {
+    let app = TestApp::start().await;
+    let ws_a = "ws_a";
+    let ws_b = "ws_b";
+    let user_id = seed_admin_with_acl(&app, ws_a).await;
+
+    app.state
+        .db
+        .llm_provider_configs()
+        .insert_one(make_provider(ws_b, "secret_b", true), None)
+        .await
+        .expect("seed ws_b provider");
+
+    let query: Query<ListQuery> =
+        Query(serde_json::from_value(serde_json::json!({ "workspaceId": ws_b })).expect("query"));
+    let result = list_providers(
+        State(app.state.clone()),
+        Extension(admin_ctx(&user_id, ws_a)),
+        query,
+    )
+    .await;
+    assert!(
+        result.is_err(),
+        "list_providers 用 override=ws_b 必须被拒，不能泄漏他租户 provider 列表"
+    );
+    assert!(
+        format!("{:?}", result.err().unwrap()).contains("workspace_not_in_user_acl"),
+        "拒绝错误码必须是 workspace_not_in_user_acl"
+    );
 }
