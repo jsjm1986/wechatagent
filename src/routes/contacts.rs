@@ -1080,10 +1080,15 @@ pub(super) async fn get_operation_health(
     let contact = find_contact_by_id(&state, &admin.current_workspace, &id).await?;
     let memory = ensure_operating_memory(&state, &contact).await?;
     let latest_review = latest_decision_review(&state, &contact).await?;
+    let (in_quiet_hours, next_wake_at, quiet_hours_enabled) =
+        compute_quiet_hours_view(&state, &contact).await?;
     Ok(Json(operation_health_json(
         &contact,
         &memory,
         latest_review.as_ref(),
+        in_quiet_hours,
+        next_wake_at,
+        quiet_hours_enabled,
     )))
 }
 
