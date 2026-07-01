@@ -18,6 +18,7 @@ use crate::{
 };
 
 use super::AppState;
+use crate::auth::{is_workspace_authorized, session::get_admin_user, AuthenticatedAdmin};
 
 /// guide apply 中被跳过的越界字段(LLM 产出但不在字典/状态机内)。
 /// 仅 guide 路径(apply_contact_changes)产出 —— 手动表单(contacts.rs)/审批
@@ -1523,6 +1524,47 @@ pub(crate) async fn add_outcome_event_inner(
     )
     .await?;
     Ok(outcome_event)
+}
+
+/// #H3：解析请求目标 workspace 并校验 ∈ admin ACL，堵认证后水平越权。
+///
+/// 解析顺序：`override_ws`（trim 后非空）优先，否则回落 `admin.current_workspace`。
+/// 校验对**每个请求**都做（含回落值），单一路径无遗漏。失败语义与
+/// `switch_workspace` 同源（同错误码字符串）。
+pub(super) async fn resolve_authorized_workspace(
+    state: &AppState,
+    admin: &AuthenticatedAdmin,
+    override_ws: Option<String>,
+) -> AppResult<String> {
+    let resolved = override_ws
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| admin.current_workspace.clone());
+
+    // crate 内部合成 admin（management_admin，user_id 为空）：租户信任已由上游真实
+    // admin 会话确立，隔离靠 current_workspace（调用方强制覆盖为可信 workspace），从不
+    // 依赖 user_id。全仓唯一空-user_id 构造点是 management_admin；真实请求的 user_id
+    // 来自 session.admin_user_id / JWT claims.sub 恒非空。故空 user_id ⟹ 可信内部委托，
+    // 跳过 ACL（否则 get_admin_user("") 必 None，误伤打死管理 Agent 的 provider 控制链）。
+    if admin.user_id.is_empty() {
+        return Ok(resolved);
+    }
+
+    // get_admin_user 返回 Result<_, AuthError>（非 AppResult，无 From<AppError>），
+    // 故不能裸 `?`。函数体仅一次 find_one，唯一可能变体是 AuthError::Mongo，
+    // 映射成 AppError::Db 与既有错误语义一致（兜底 External 防变体新增时漏接）。
+    let user = get_admin_user(&state.db, &admin.user_id)
+        .await
+        .map_err(|e| match e {
+            crate::auth::session::AuthError::Mongo(err) => AppError::Db(err),
+            other => AppError::External(format!("admin lookup: {other}")),
+        })?
+        .ok_or_else(|| AppError::Unauthorized("admin_user_not_found".into()))?;
+
+    if !is_workspace_authorized(&resolved, &user.workspaces, &state.config.default_workspace_id) {
+        return Err(AppError::BadRequest("workspace_not_in_user_acl".into()));
+    }
+    Ok(resolved)
 }
 
 #[cfg(test)]
