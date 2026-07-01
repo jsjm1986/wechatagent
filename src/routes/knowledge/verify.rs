@@ -32,6 +32,15 @@ const AUTO_VERIFY_MIN_SAMPLE_RATE: f64 = 0.05;
 /// auto-verify 人审抽样率默认值（修复 C-①：从 0.1 抬到 0.3，更积极抽审）。
 const AUTO_VERIFY_DEFAULT_SAMPLE_RATE: f64 = 0.3;
 
+/// auto-verify 抽样率钳制:未传用默认 [`AUTO_VERIFY_DEFAULT_SAMPLE_RATE`],并强制钳到硬下限
+/// [`AUTO_VERIFY_MIN_SAMPLE_RATE`](传 0 也不许 100% 无人审)。抽成纯函数以便单测锁死下限——
+/// 删下界 / 改成 0 会让「永远留一批人审」这条红线被静默关掉。
+fn clamp_sample_rate(requested: Option<f64>) -> f64 {
+    requested
+        .unwrap_or(AUTO_VERIFY_DEFAULT_SAMPLE_RATE)
+        .clamp(AUTO_VERIFY_MIN_SAMPLE_RATE, 1.0)
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct KnowledgeVerifyRequest {
@@ -644,5 +653,14 @@ mod tests {
         // 同理 token budget 默认值不能再复用 simulationTokenBudget=60000。
         let v = doc_i64_with_default(None, "autoVerifyTokenBudget", 240000);
         assert!(v >= 100_000, "autoVerify token budget 默认 {v} 太小，无法跑 50 条");
+    }
+
+    #[test]
+    fn clamp_sample_rate_enforces_hard_floor() {
+        // 命门:传 0(前端取消"留一批复查")也不许 100% 无人审,钳到 5% 下限。
+        assert_eq!(clamp_sample_rate(Some(0.0)), 0.05, "传0钳到硬下限,红线不可关");
+        assert_eq!(clamp_sample_rate(None), 0.3, "未传用默认 0.3");
+        assert_eq!(clamp_sample_rate(Some(2.0)), 1.0, "超上限钳到 1.0");
+        assert_eq!(clamp_sample_rate(Some(0.5)), 0.5, "区间内原样透传");
     }
 }
