@@ -39,18 +39,6 @@ use crate::routes::AppState;
 use super::budget::EvolutionBudget;
 use super::error::EvolutionError;
 
-/// 5 闸 gate_key → review.scores BSON 字段（camelCase）映射。
-fn gate_key_to_score_field(gate: &str) -> Option<&'static str> {
-    match gate {
-        "fact_risk_block" => Some("factRisk"),
-        "pressure_risk_block" => Some("pressureRisk"),
-        "human_like_score_rewrite" => Some("humanLike"),
-        "emotional_value_rewrite" => Some("emotionalValue"),
-        "product_accuracy_score_block" => Some("productAccuracy"),
-        _ => None,
-    }
-}
-
 /// Block-class gates with `score >= threshold` 触发（分数越高越危险）。
 const BLOCK_DIRECTION_GTE: &[&str] = &[
     "fact_risk_block",
@@ -270,9 +258,11 @@ fn evaluate_threshold(proposal: &Proposal, original: &AgentRunLog) -> ReplayOutc
         }
     };
 
-    // 把每个 5 闸（其它 4 个用源 run 的当前阈值默认 = current_value，本 proposal
-    // 只动一个 gate）算 new_hit；当前实现里"其它 4 个"用 original_final_review_status
-    // 推断 hit/no-hit，避免引入新的阈值面。
+    // 同时产出 original / new 两个 5 闸命中向量:被改的 gate 两侧只差阈值
+    // (original 用 current_value、new 用 proposed_value),其余 4 个 gate 本
+    // proposal 不动 → 两侧都用 default 阈值、delta 恒 0。original_5gate_hit
+    // 供 significance compute_5gate_deltas 算真实基线(此前恒空 → 偏拒,M9)。
+    let mut original_5gate_hit = Document::new();
     let mut new_5gate_hit = Document::new();
     for gate in [
         "fact_risk_block",
@@ -281,20 +271,18 @@ fn evaluate_threshold(proposal: &Proposal, original: &AgentRunLog) -> ReplayOutc
         "emotional_value_rewrite",
         "product_accuracy_score_block",
     ] {
-        let hit = if gate == gate_key {
-            evaluate_single_gate(&scores, gate, new_value)
+        if gate == gate_key {
+            let current = proposal
+                .current_value
+                .or_else(|| default_gate_threshold(gate))
+                .unwrap_or(0.0);
+            original_5gate_hit.insert(gate, evaluate_single_gate(&scores, gate, current));
+            new_5gate_hit.insert(gate, evaluate_single_gate(&scores, gate, new_value));
         } else {
-            // 其它 4 个：用源 run 已记录的 review.scores 与 current_value 推 hit
-            // —— current_value 是 proposal 域的"当前生效阈值"（W2 已写）；这里用
-            // proposal.current_value 作 fallback；如果不可用，按 false 默认。
-            match proposal.current_value {
-                Some(c) if proposal.gate_key.as_deref() == Some(gate) => {
-                    evaluate_single_gate(&scores, gate, c)
-                }
-                _ => evaluate_single_gate_default(&scores, gate),
-            }
-        };
-        new_5gate_hit.insert(gate, hit);
+            let hit = evaluate_single_gate_default(&scores, gate);
+            original_5gate_hit.insert(gate, hit);
+            new_5gate_hit.insert(gate, hit);
+        }
     }
 
     // 如果"被改的"那个 gate 仍然命中（block / rewrite 触发），final_review_status
@@ -306,9 +294,7 @@ fn evaluate_threshold(proposal: &Proposal, original: &AgentRunLog) -> ReplayOutc
         completed: true,
         failure_reason: None,
         original_final_review_status: Some(original.final_review_status.clone()),
-        // threshold 路径不推 original 5 闸 / selfCritique（significance 用
-        // send_success 口径推 original 侧）；留默认空 / None。
-        original_5gate_hit: Document::new(),
+        original_5gate_hit,
         original_self_critique_addressed: None,
         new_final_review_status: Some(new_final.to_string()),
         new_review_risks: Vec::new(),
@@ -324,11 +310,9 @@ fn evaluate_threshold(proposal: &Proposal, original: &AgentRunLog) -> ReplayOutc
 /// 单 gate 命中判断。`scores` 是 `agent_run_logs.review.scores` Document
 /// （camelCase）。block 类用 `>=`；rewrite 类用 `<`。
 fn evaluate_single_gate(scores: &Document, gate: &str, threshold: f64) -> bool {
-    let field = match gate_key_to_score_field(gate) {
-        Some(f) => f,
-        None => return false,
-    };
-    let score = scores.get_i32(field).ok().map(|v| v as f64).unwrap_or(0.0);
+    // 复用双键兼容的 read_gate_score(factRisk/hallucinationScore 等两套键名都读);
+    // 缺分 → 0.0,与 prompt 路径 scores_to_5gate_hit 的保守处理一致。
+    let score = read_gate_score(scores, gate).unwrap_or(0.0);
     if BLOCK_DIRECTION_GTE.contains(&gate) {
         score >= threshold
     } else if REWRITE_DIRECTION_LT.contains(&gate) {
@@ -764,6 +748,77 @@ mod tests {
         );
     }
 
+    /// H11 真护栏:源 run 用生产真实序列化键 `hallucinationScore` 时,
+    /// evaluate_single_gate 必须读到它(旧代码读 factRisk→miss→0.0)。
+    /// seed hallucinationScore=8,收紧 fact_risk_block 6→7 → new 命中(8≥7)。
+    /// 旧 bug 下读 0.0→0≥7 false→断言 true 失败。
+    #[test]
+    fn evaluate_threshold_reads_real_hallucination_score_key() {
+        let scores = doc! {
+            "hallucinationScore": 8_i32,
+            "pressureRisk": 1_i32,
+            "humanLike": 8_i32,
+            "emotionalValue": 7_i32,
+            "knowledgeGroundingScore": 9_i32,
+        };
+        let run = mk_run_log(scores, "held_by_ai_policy");
+        let proposal = mk_threshold_proposal("fact_risk_block", 6.0, 7.0);
+        let outcome = evaluate_threshold(&proposal, &run);
+        assert!(outcome.completed);
+        assert_eq!(
+            outcome.new_5gate_hit.get_bool("fact_risk_block").unwrap(),
+            true,
+            "hallucinationScore=8 ≥ 7 应命中(旧代码读 factRisk miss→0.0→不命中)"
+        );
+    }
+
+    /// H11 真护栏(product 方向):源 run 用真实键 knowledgeGroundingScore。
+    /// product_accuracy_score_block 是 LT(score<threshold 命中),seed=9,阈值 7
+    /// → 9<7 false 不命中。旧 bug 读 productAccuracy→miss→0.0→0<7 true 命中→断言 false 失败。
+    #[test]
+    fn evaluate_threshold_reads_real_knowledge_grounding_score_key() {
+        let scores = doc! {
+            "hallucinationScore": 0_i32,
+            "pressureRisk": 1_i32,
+            "humanLike": 8_i32,
+            "emotionalValue": 7_i32,
+            "knowledgeGroundingScore": 9_i32,
+        };
+        let run = mk_run_log(scores, "approved");
+        let proposal = mk_threshold_proposal("product_accuracy_score_block", 7.0, 7.0);
+        let outcome = evaluate_threshold(&proposal, &run);
+        assert!(outcome.completed);
+        assert_eq!(
+            outcome.new_5gate_hit.get_bool("product_accuracy_score_block").unwrap(),
+            false,
+            "knowledgeGroundingScore=9 ≥ 7 不该触发 product block(旧代码读 productAccuracy miss→0.0→<7 误命中)"
+        );
+    }
+
+    /// M9 真护栏:original_5gate_hit 必须非空且正确(旧代码恒 Document::new())。
+    /// seed hallucinationScore=8;放松 fact_risk_block 6→7(current=6,proposed=7)。
+    /// original 用 current=6:8≥6 命中=true。旧代码 original_5gate_hit 空→get_bool None→失败。
+    #[test]
+    fn evaluate_threshold_fills_original_5gate_hit_baseline() {
+        let scores = doc! {
+            "hallucinationScore": 8_i32,
+            "pressureRisk": 1_i32,
+            "humanLike": 8_i32,
+            "emotionalValue": 7_i32,
+            "knowledgeGroundingScore": 9_i32,
+        };
+        let run = mk_run_log(scores, "held_by_ai_policy");
+        let proposal = mk_threshold_proposal("fact_risk_block", 6.0, 7.0);
+        let outcome = evaluate_threshold(&proposal, &run);
+        assert!(outcome.completed);
+        assert_eq!(
+            outcome.original_5gate_hit.get_bool("fact_risk_block"),
+            Ok(true),
+            "original 用 current_value=6:hallucinationScore=8≥6 命中(旧代码恒空→None)"
+        );
+        assert_eq!(outcome.new_5gate_hit.get_bool("fact_risk_block"), Ok(true));
+    }
+
     /// 缺 review.scores → failed("source_run_missing_review_scores")
     #[test]
     fn evaluate_threshold_fails_when_review_scores_missing() {
@@ -776,30 +831,6 @@ mod tests {
             outcome.failure_reason.as_deref(),
             Some("source_run_missing_review_scores")
         );
-    }
-
-    /// gate_key_to_score_field 映射全 5 闸 + 未知 gate 返 None
-    #[test]
-    fn gate_key_field_mapping() {
-        assert_eq!(gate_key_to_score_field("fact_risk_block"), Some("factRisk"));
-        assert_eq!(
-            gate_key_to_score_field("pressure_risk_block"),
-            Some("pressureRisk")
-        );
-        assert_eq!(
-            gate_key_to_score_field("human_like_score_rewrite"),
-            Some("humanLike")
-        );
-        assert_eq!(
-            gate_key_to_score_field("emotional_value_rewrite"),
-            Some("emotionalValue")
-        );
-        assert_eq!(
-            gate_key_to_score_field("product_accuracy_score_block"),
-            Some("productAccuracy")
-        );
-        assert_eq!(gate_key_to_score_field("planner_block_rate_threshold"), None);
-        assert_eq!(gate_key_to_score_field("unknown"), None);
     }
 
     /// 任务 4.7 case 5：evaluate_threshold 是纯函数，调用前后多次 invoke
