@@ -198,19 +198,36 @@ async fn write_repair_usage_log(
         .await;
 }
 
-pub async fn propose_chunk_repair(
-    State(state): State<AppState>,
-    Extension(admin): Extension<AuthenticatedAdmin>,
-    Path(id): Path<String>,
-) -> AppResult<Json<Value>> {
-    let object_id = parse_object_id(&id)?;
+/// AI 自主修复 chunk 首轮的核心业务逻辑，与 axum handler / auth 解耦，供
+/// knowledge_task worker 复用。
+///
+/// 契约：
+/// - **不自建 `RUN_BUDGET.scope`**：假定调用方已在某个 scope 内（handler 建自己
+///   的 4000-token scope；worker 复用它的 STEP scope）。`generate_agent_json` 会读
+///   ambient `RUN_BUDGET`（task_local）累计 token，因此 inner 不 scope 也能正确计入
+///   调用方的 scope；不在任何 scope 内时 `current_run_budget()` 返回 None，budget
+///   快照退化为空 doc（fail-soft）。
+/// - `workspace_id` / `run_id` 由入参传入；`account_id` 内部从 `chunk.account_id`
+///   派生（fallback default_account_id）。
+/// - **红线**：只 load chunk + parent document → generate_agent_json → parse →
+///   写 usage_log + repair_event → 返回 JSON。**绝不改 chunk 本身**。
+///
+/// 返回：`parse_repair_response` 的完整产物 Value
+/// （`{ interpretation, patch, missingFields, followupQuestions, stillMissing, confidenceHint }`）。
+/// **不含** chunkId/sessionId/turn/promptKey/budget 外层信封——那些由 handler 拼。
+pub(crate) async fn propose_chunk_repair_inner(
+    state: &AppState,
+    workspace_id: &str,
+    chunk_object_id: ObjectId,
+    run_id: &str,
+) -> AppResult<Value> {
     let chunk = state
         .db
         .operation_knowledge_chunks()
         .find_one(
             doc! {
-                "_id": object_id,
-                "workspace_id": &admin.current_workspace
+                "_id": chunk_object_id,
+                "workspace_id": workspace_id
             },
             None,
         )
@@ -225,7 +242,7 @@ pub async fn propose_chunk_repair(
             .find_one(
                 doc! {
                     "_id": document_id,
-                    "workspace_id": &admin.current_workspace
+                    "workspace_id": workspace_id
                 },
                 None,
             )
@@ -244,7 +261,7 @@ pub async fn propose_chunk_repair(
 
     let system = prompts::load_prompt(
         &state.db,
-        &admin.current_workspace,
+        workspace_id,
         "knowledge.chunk.repair.propose",
     )
     .await
@@ -266,6 +283,8 @@ pub async fn propose_chunk_repair(
         .as_ref()
         .map(|_| Value::Null)
         .unwrap_or(Value::Null);
+
+    let id_str = chunk_object_id.to_hex();
 
     let user = format!(
         r#"请为下面这条 integrityStatus = needs_review 的知识切片做 AI 自主修复（首轮）。
@@ -289,29 +308,17 @@ pub async fn propose_chunk_repair(
         serde_json::to_string_pretty(&document_payload).unwrap_or_default(),
     );
 
-    let session_id = uuid::Uuid::new_v4().to_string();
-    let run_id = format!("repair-chunk-{}-{}", id, session_id);
-    let budget = Arc::new(agent::RunBudget::new(
-        run_id.clone(),
-        REPAIR_TOKEN_BUDGET_PER_TURN,
-        REPAIR_MAX_LLM_CALLS_PER_TURN,
-        i32::MAX,
-    ));
-
-    let value = agent::RUN_BUDGET
-        .scope(budget.clone(), async {
-            agent::generate_agent_json(
-                &state,
-                Some(&account_id),
-                None,
-                Some(&run_id),
-                "knowledge.chunk.repair.propose",
-                &system,
-                &user,
-            )
-            .await
-        })
-        .await?;
+    // 不建 budget、不 scope：直接调 generate_agent_json，token 计入调用方的 ambient scope。
+    let value = agent::generate_agent_json(
+        state,
+        Some(&account_id),
+        None,
+        Some(run_id),
+        "knowledge.chunk.repair.propose",
+        &system,
+        &user,
+    )
+    .await?;
 
     let parsed = parse_repair_response(&value);
     let confidence = parsed
@@ -330,38 +337,64 @@ pub async fn propose_chunk_repair(
         .unwrap_or_default();
 
     write_repair_usage_log(
-        &state,
-        &admin.current_workspace,
+        state,
+        workspace_id,
         &account_id,
-        &run_id,
+        run_id,
         chunk.id,
         "chunk_repair_session",
         "knowledge.chunk.repair.propose",
-        &id,
+        &id_str,
         1,
         confidence,
         &missing,
         followup.len(),
     )
     .await;
+    // ambient budget 快照；不在 scope 内则空 doc（fail-soft）。
+    let budget_doc = agent::current_run_budget()
+        .map(|b| budget_document(&b))
+        .unwrap_or_default();
     record_repair_event(
-        &state,
-        &admin.current_workspace,
+        state,
+        workspace_id,
         &account_id,
         "knowledge_repair_proposed",
-        format!("AI 自主修复 chunk:{id} 第 1 轮"),
+        format!("AI 自主修复 chunk:{id_str} 第 1 轮"),
         doc! {
             "kind": "chunk_repair_session",
-            "chunkId": &id,
+            "chunkId": &id_str,
             "turn": 1i32,
             "confidenceHint": confidence,
             "followupCount": followup.len() as i32,
             "missingFieldCount": missing.len() as i32,
-            "budget": budget_document(&budget),
+            "budget": budget_doc,
         },
     )
     .await;
 
+    Ok(parsed)
+}
+
+pub async fn propose_chunk_repair(
+    State(state): State<AppState>,
+    Extension(admin): Extension<AuthenticatedAdmin>,
+    Path(id): Path<String>,
+) -> AppResult<Json<Value>> {
+    let object_id = parse_object_id(&id)?;
+    let session_id = uuid::Uuid::new_v4().to_string();
+    let run_id = format!("repair-chunk-{}-{}", id, session_id);
+    let budget = Arc::new(agent::RunBudget::new(
+        run_id.clone(),
+        REPAIR_TOKEN_BUDGET_PER_TURN,
+        REPAIR_MAX_LLM_CALLS_PER_TURN,
+        i32::MAX,
+    ));
+    let parsed = agent::RUN_BUDGET
+        .scope(budget.clone(), async {
+            propose_chunk_repair_inner(&state, &admin.current_workspace, object_id, &run_id).await
+        })
+        .await?;
     Ok(Json(json!({
         "chunkId": id,
         "sessionId": session_id,

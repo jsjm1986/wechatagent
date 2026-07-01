@@ -267,13 +267,17 @@ pub async fn run_task(
             "action": &action,
         };
         let progress_msg;
+        let mut step_details: Option<Document> = None;
         match outcome {
-            Ok(StepOutcome { chunk_id, message }) => {
+            Ok(StepOutcome { chunk_id, message, details }) => {
                 if let Some(cid) = chunk_id.as_deref() {
                     entry.insert("chunkId", cid);
                     needs_review.push(cid.to_string());
                 }
                 entry.insert("status", "ok");
+                if let Some(d) = details.as_ref() {
+                    entry.insert("repairDraft", d.clone());
+                }
                 progress_msg = format!(
                     "第 {}/{} 步完成 · {} · {}",
                     idx + 1,
@@ -281,6 +285,7 @@ pub async fn run_task(
                     action,
                     if message.is_empty() { summary_text.clone() } else { message }
                 );
+                step_details = details; // 供下方 write_progress_turn 的 turn details 使用
             }
             Err(err) => {
                 let msg = format!("{err}");
@@ -306,6 +311,15 @@ pub async fn run_task(
                 None,
             )
             .await?;
+        let mut turn_details = doc! {
+            "taskId": task_id,
+            "phase": "step",
+            "stepIndex": idx as i32 + 1,
+            "total": total as i32,
+        };
+        if let Some(d) = step_details {
+            turn_details.insert("repairDraft", d);
+        }
         write_progress_turn(
             state,
             bus,
@@ -313,12 +327,7 @@ pub async fn run_task(
             &account_id,
             &session_id,
             progress_msg,
-            doc! {
-                "taskId": task_id,
-                "phase": "step",
-                "stepIndex": idx as i32 + 1,
-                "total": total as i32,
-            },
+            turn_details,
         )
         .await?;
     }
@@ -431,35 +440,85 @@ pub async fn run_task(
 pub struct StepOutcome {
     pub chunk_id: Option<String>,
     pub message: String,
+    /// ③-b：fix_chunk 产的 AI 修复草稿（patch/missingFields/confidenceHint）。
+    /// merge 进本 step 的 progress turn details，供运营在 chunk 编辑器审核。
+    /// 其它 action 为 None。
+    pub details: Option<Document>,
 }
 
 /// 执行单个 step；不同 action 走不同 fail-soft 路径，但都不写 verified、不发送 outbox。
 pub async fn execute_step(
-    _state: &AppState,
-    _workspace_id: &str,
+    state: &AppState,
+    workspace_id: &str,
     _account_id: &str,
     action: &str,
     step: &Document,
 ) -> anyhow::Result<StepOutcome> {
     match action {
         "fix_chunk" => {
-            // Phase 4 占位：worker 仅负责派工编排；实际 fix/apply 仍走运营在
-            // chat 内的 chat_apply（强制 needs_review）。这里只把目标 chunk 标
-            // 一条 progress，避免 worker 直接写 verified 状态。
-            let chunk_id = step
-                .get_str("targetChunkId")
-                .ok()
-                .map(|s| s.to_string());
-            Ok(StepOutcome {
-                chunk_id,
-                message: "已派至 chat 起草补丁，请运营在 chunk 编辑器审核".to_string(),
-            })
+            // ③-b：调 repair inner 生成 AI 修复草稿（patch/missingFields/confidenceHint），
+            // 把草稿塞进 details 供运营在 chunk 编辑器审核；chunkId 推入 needs_review 池。
+            // 红线：inner 只产 JSON（Task 6 已保证不改 chunk），worker **不 apply**。
+            let chunk_id = step.get_str("targetChunkId").ok().map(|s| s.to_string());
+            let Some(cid) = chunk_id.clone() else {
+                // 无 targetChunkId：退回文案，不阻断（fail-soft）。
+                return Ok(StepOutcome {
+                    chunk_id: None,
+                    message: "缺 targetChunkId，未生成修复草稿".to_string(),
+                    details: None,
+                });
+            };
+            let Ok(object_id) = ObjectId::parse_str(&cid) else {
+                return Ok(StepOutcome {
+                    chunk_id: Some(cid.clone()),
+                    message: format!("targetChunkId={cid} 非法，未生成修复草稿"),
+                    details: None,
+                });
+            };
+            let run_id = format!("knowledge-task-fix-{}", cid);
+            // 已在外层 RUN_BUDGET.scope(STEP budget) 内；inner 不自建 scope。
+            match crate::routes::knowledge::propose_chunk_repair_inner(
+                state, workspace_id, object_id, &run_id,
+            )
+            .await
+            {
+                Ok(parsed) => {
+                    let details = parsed.as_object().map(|obj| {
+                        obj.iter()
+                            .filter_map(|(k, v)| {
+                                mongodb::bson::to_bson(v).ok().map(|b| (k.clone(), b))
+                            })
+                            .collect::<Document>()
+                    });
+                    let missing_n = parsed
+                        .get("missingFields")
+                        .and_then(|v| v.as_array())
+                        .map(|a| a.len())
+                        .unwrap_or(0);
+                    Ok(StepOutcome {
+                        chunk_id: Some(cid.clone()),
+                        message: format!(
+                            "已为 chunk {cid} 生成 AI 修复草稿（含 {missing_n} 个待补字段），请运营在 chunk 编辑器审核后 apply"
+                        ),
+                        details,
+                    })
+                }
+                // budget 超额 / LLM 失败：fail-soft，仍把 chunk 推入待审池。
+                Err(err) => Ok(StepOutcome {
+                    chunk_id: Some(cid.clone()),
+                    message: format!(
+                        "chunk {cid} 修复草稿生成失败（{err}，fail-soft），请运营在编辑器手动处理"
+                    ),
+                    details: None,
+                }),
+            }
         }
         "add_chunk" => {
             // 同上：实际 add 走 chat_apply（强制 draft + needs_review）。
             Ok(StepOutcome {
                 chunk_id: None,
                 message: "已起草新 chunk，请运营在 chunk 编辑器审核".to_string(),
+                details: None,
             })
         }
         "retag" => Ok(StepOutcome {
@@ -468,18 +527,22 @@ pub async fn execute_step(
                 .ok()
                 .map(|s| s.to_string()),
             message: "已标记需要重抽标签".to_string(),
+            details: None,
         }),
         "review_evolution" => Ok(StepOutcome {
             chunk_id: None,
             message: "已记录：请去 EvolutionCenterTab 评估候选".to_string(),
+            details: None,
         }),
         "analyze_logs" => Ok(StepOutcome {
             chunk_id: None,
             message: "已生成 24h block/hold 日志摘要（详见 turn 详情）".to_string(),
+            details: None,
         }),
         "dismiss" => Ok(StepOutcome {
             chunk_id: None,
             message: "已忽略本卡片".to_string(),
+            details: None,
         }),
         other => Err(anyhow::anyhow!("unsupported action: {other}")),
     }

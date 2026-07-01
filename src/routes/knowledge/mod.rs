@@ -210,6 +210,12 @@ pub struct OperationKnowledgeChunkRequest {
     status: String,
     #[serde(default)]
     priority: i32,
+    /// 知识体系类型（methodology / product_fact 等），导入 LLM 判定后透传落库。
+    #[serde(default)]
+    wiki_type: Option<String>,
+    /// 切片类型；空/缺省时转换函数走 `default_chunk_type()`（`product_fact`）。
+    #[serde(default)]
+    chunk_type: Option<String>,
 }
 
 fn budget_document(budget: &agent::RunBudget) -> Document {
@@ -504,6 +510,11 @@ pub(super) fn operation_knowledge_chunk_from_request(
             payload.status
         },
         priority: payload.priority,
+        wiki_type: payload.wiki_type.filter(|s| !s.trim().is_empty()),
+        chunk_type: payload
+            .chunk_type
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(crate::models::default_chunk_type),
         created_at: now,
         updated_at: now,
         ..Default::default()
@@ -574,21 +585,8 @@ pub(super) fn normalize_operation_knowledge_preview_item(
         "title": json_string(&value, "title").unwrap_or_else(|| "未命名知识包".to_string()),
         "summary": json_string(&value, "summary").unwrap_or_default(),
         "body": json_string(&value, "body").unwrap_or_default(),
-        "routingCard": json_string(&value, "routingCard")
-            .or_else(|| json_string(&value, "routing_card"))
-            .unwrap_or_default(),
         "applicableScenes": json_string_list(&value, "applicableScenes").or_else(|| json_string_list(&value, "applicable_scenes")).unwrap_or_default(),
         "notApplicableScenes": json_string_list(&value, "notApplicableScenes").or_else(|| json_string_list(&value, "not_applicable_scenes")).unwrap_or_default(),
-        "suitableFor": json_string_list(&value, "suitableFor").or_else(|| json_string_list(&value, "suitable_for")).unwrap_or_default(),
-        "notSuitableFor": json_string_list(&value, "notSuitableFor").or_else(|| json_string_list(&value, "not_suitable_for")).unwrap_or_default(),
-        "customerStages": json_string_list(&value, "customerStages").or_else(|| json_string_list(&value, "customer_stages")).unwrap_or_default(),
-        "operationStates": json_string_list(&value, "operationStates").or_else(|| json_string_list(&value, "operation_states")).unwrap_or_default(),
-        "intentLevels": json_string_list(&value, "intentLevels").or_else(|| json_string_list(&value, "intent_levels")).unwrap_or_default(),
-        "safeClaims": json_string_list(&value, "safeClaims").or_else(|| json_string_list(&value, "safe_claims")).unwrap_or_default(),
-        "forbiddenClaims": json_string_list(&value, "forbiddenClaims").or_else(|| json_string_list(&value, "forbidden_claims")).unwrap_or_default(),
-        "commonQuestions": json_string_list(&value, "commonQuestions").or_else(|| json_string_list(&value, "common_questions")).unwrap_or_default(),
-        "commonObjections": json_string_list(&value, "commonObjections").or_else(|| json_string_list(&value, "common_objections")).unwrap_or_default(),
-        "evidenceItems": json_string_list(&value, "evidenceItems").or_else(|| json_string_list(&value, "evidence_items")).unwrap_or_default(),
         "productTags": json_string_list(&value, "productTags").or_else(|| json_string_list(&value, "product_tags")).unwrap_or_default(),
         "businessTopics": json_string_list(&value, "businessTopics").or_else(|| json_string_list(&value, "business_topics")).unwrap_or_default(),
         "sourceType": json_string(&value, "sourceType").or_else(|| json_string(&value, "source_type")).unwrap_or_else(|| "imported_markdown".to_string()),
@@ -667,12 +665,8 @@ pub(super) fn normalize_operation_knowledge_preview_chunk(
         "title": json_string(&value, "title").unwrap_or_else(|| "未命名知识切片".to_string()),
         "summary": json_string(&value, "summary").unwrap_or_default(),
         "body": json_string(&value, "body").unwrap_or_default(),
-        "routingCard": json_string(&value, "routingCard").or_else(|| json_string(&value, "routing_card")).unwrap_or_default(),
         "applicableScenes": json_string_list(&value, "applicableScenes").or_else(|| json_string_list(&value, "applicable_scenes")).unwrap_or_default(),
         "notApplicableScenes": json_string_list(&value, "notApplicableScenes").or_else(|| json_string_list(&value, "not_applicable_scenes")).unwrap_or_default(),
-        "safeClaims": json_string_list(&value, "safeClaims").or_else(|| json_string_list(&value, "safe_claims")).unwrap_or_default(),
-        "forbiddenClaims": json_string_list(&value, "forbiddenClaims").or_else(|| json_string_list(&value, "forbidden_claims")).unwrap_or_default(),
-        "evidenceItems": json_string_list(&value, "evidenceItems").or_else(|| json_string_list(&value, "evidence_items")).unwrap_or_default(),
         "productTags": json_string_list(&value, "productTags").or_else(|| json_string_list(&value, "product_tags")).unwrap_or_default(),
         "businessTopics": json_string_list(&value, "businessTopics").or_else(|| json_string_list(&value, "business_topics")).unwrap_or_default(),
         "sourceQuote": json_string(&value, "sourceQuote").or_else(|| json_string(&value, "source_quote")).unwrap_or_default(),
@@ -1820,5 +1814,32 @@ mod tests {
         coerce_integrity_against_d2_gate(&mut p);
         assert_eq!(p.integrity_status.as_deref(), Some("needs_review"));
         assert!(p.distortion_risks.is_empty());
+    }
+
+    /// ②-a：带类型的 JSON（camelCase wire 键）→ 请求体携带 wiki_type/chunk_type，
+    /// 导入 LLM 判定的类型不再被 serde 静默丢弃。
+    #[test]
+    fn chunk_request_carries_wiki_type_and_chunk_type() {
+        let json = serde_json::json!({
+            "domain": "user_operations",
+            "title": "T",
+            "body": "B",
+            "wikiType": "methodology",
+            "chunkType": "peer_case",
+        });
+        let req: OperationKnowledgeChunkRequest =
+            serde_json::from_value(json).expect("deserialize");
+        assert_eq!(req.wiki_type.as_deref(), Some("methodology"));
+        assert_eq!(req.chunk_type.as_deref(), Some("peer_case"));
+    }
+
+    /// ②-a 向后兼容：老 JSON 不带类型 → None（`#[serde(default)]` 兜底）。
+    #[test]
+    fn chunk_request_defaults_type_fields_when_absent() {
+        let json = serde_json::json!({ "domain": "user_operations", "title": "T", "body": "B" });
+        let req: OperationKnowledgeChunkRequest =
+            serde_json::from_value(json).expect("deserialize");
+        assert_eq!(req.wiki_type, None);
+        assert_eq!(req.chunk_type, None);
     }
 }

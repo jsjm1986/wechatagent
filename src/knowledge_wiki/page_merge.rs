@@ -28,13 +28,14 @@ use thiserror::Error;
 /// 默认锁定字段集合 —— `apply_chunk_revision` 的 patch 入参不允许命中其中任一。
 ///
 /// 列表语义：
-/// - `chunk_id` / `wiki_type` / `created_at`：身份/类型/创建时间永不变；
+/// - `chunk_id` / `wiki_type` / `chunk_type` / `created_at`：身份/类型/创建时间永不变；
 /// - `source_anchor`：原文锚点是 verify gate 的事实依据，重写会破坏可追溯；
-/// - `verified_at` / `verified_by` / `approved_at`：人工核验/审批时间戳，
+/// - `verified_at` / `verified_by` / `approved_at`：核验/审批时间戳，
 ///   AI 永不自动 verify（见 CLAUDE.md / docs/agent-policy.md）。
 pub const DEFAULT_LOCKED_FIELDS: &[&str] = &[
     "chunk_id",
     "wiki_type",
+    "chunk_type",
     "created_at",
     "source_anchor",
     "verified_at",
