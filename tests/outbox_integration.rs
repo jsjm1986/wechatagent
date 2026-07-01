@@ -1176,6 +1176,177 @@ async fn account_pacing_gate_end_to_end_via_gateway() {
     );
 }
 
+// ── Case 13: reclaim 幂等门(2B) vs 账号级发送间隔闸 相对执行顺序 ──────────────
+//
+// process_entry 里 reclaim 幂等门 post-hoc 核对(:645)在账号 pacing 节流闸(:719)
+// **之前**（源码注释 :721 明写此序）。上面 4 个 account_pacing_gate_* 只验闸
+// 本身（拦/放行/隔离/fail-soft），没有锁定这两道门的先后。
+//
+// 命门：一条 reclaimed_in_flight=true 且 MCP 已经发过、又恰好落在 pacing 间隔内
+// 的 entry，必须走 2B post-hoc 标 sent（因为消息其实已送达客户），而**不能**被
+// pacing 先拦成 pending——否则这条"已发过"的消息会永远卡在 pending 里成僵尸条目
+// （每轮 claim 又被 pacing 拦，永远发不出也不 sent）。若把 pacing 闸误挪到 2B 之前，
+// 本例 status 会变成 pending → 测试红，从而把"reclaim 门在 pacing 之前"这条不变量
+// 锁死在测试里。
+
+/// reclaim 门 vs pacing 闸相对序：reclaimed_in_flight + MCP 已发过 + pacing 命中
+/// → 走 2B post-hoc 标 sent（非被 pacing reschedule 成僵尸 pending）。
+#[tokio::test]
+#[ignore]
+async fn reclaim_gate_precedes_pacing_gate() {
+    let app = common::TestApp::start().await;
+    let mcp_server = start_mcp_mock_success().await;
+    let mut state = common::rebuild_app_state_with_mcp_url(&app, mcp_server.uri());
+    // 开 pacing 闸（固定 2s，min=max 消除随机性）：默认 0/0 是关的，必须显式覆盖。
+    // 这样若 2B 门不先命中、执行落到 pacing，就会被拦成 pending，暴露顺序错误。
+    state.config.account_send_min_interval_ms = 2000;
+    state.config.account_send_max_interval_ms = 2000;
+
+    let contact = make_contact("user_reclaim_before_pacing");
+    state
+        .db
+        .contacts()
+        .insert_one(&contact, None)
+        .await
+        .expect("insert contact");
+
+    // (a) 预置一条同账号「刚刚 sent」(sent_at=now) 的历史 → account_last_sent_at_ms
+    // 返回 now，把 pacing 闸的命中前置条件做实（若执行到 pacing 必被拦）。
+    state
+        .db
+        .raw()
+        .collection::<Document>("agent_send_outbox")
+        .insert_one(
+            doc! {
+                "workspace_id": "default",
+                "account_id": "default",
+                "contact_wxid": &contact.wxid,
+                "run_id": "seed_reclaim_pacing",
+                "source_event_id": format!("seed_evt_{}", ObjectId::new()),
+                "source_kind": "inbound_message",
+                "status": "sent",
+                "sent_at": DateTime::now(),
+                "content": "刚发过的历史一条（arms pacing）",
+                "content_hash": "seed_hash_reclaim_pacing",
+                "idempotency_key": format!("seed_{}", ObjectId::new()),
+                "created_at": DateTime::now(),
+                "updated_at": DateTime::now(),
+            },
+            None,
+        )
+        .await
+        .expect("seed sent history to arm pacing");
+
+    // (b) enqueue 目标 pending 条目（content 来自 enqueue_request，text 版无
+    // media_asset_id / referral_card_id → 走 mcp_already_succeeded 文本核对分支）。
+    let outcome = enqueue(
+        &state,
+        enqueue_request("run_reclaim_pacing", "evt_reclaim_pacing", &contact.wxid),
+    )
+    .await
+    .expect("enqueue ok");
+    let outbox_id = match outcome {
+        EnqueueOutcome::Created { outbox_id, .. } => outbox_id,
+        other => panic!("expected Created, got {other:?}"),
+    };
+
+    // (c) 置 reclaimed_in_flight=true，模拟"上一个 worker 抢占后在写 sent 前崩溃、
+    // 被 reclaim_expired_leases 放回 pending"的状态（reclaim 门只对这条跑 post-hoc）。
+    let collection = state.db.collection_agent_send_outbox();
+    collection
+        .update_one(
+            doc! { "_id": outbox_id },
+            doc! { "$set": { "reclaimed_in_flight": true } },
+            None,
+        )
+        .await
+        .expect("set reclaimed_in_flight=true");
+
+    // (d) claim（status pending → in_flight，reclaimed_in_flight 原样保留、After 返回）。
+    let claimed = atomic_claim_pending(&state, "worker_reclaim_pacing", 60)
+        .await
+        .expect("claim ok")
+        .expect("claimed entry");
+    assert_eq!(claimed.id, Some(outbox_id));
+    assert!(
+        claimed.reclaimed_in_flight,
+        "claim 应保留 reclaimed_in_flight=true（后续走 2B 门的前提）"
+    );
+
+    // (e) seed mcp_call_logs 一条成功记录（tool_name=message_send_text、同 recipient +
+    // 同 content、error=null、created_at=now），让 mcp_already_succeeded(:521) 命中
+    // → "这条其实已发过"。用 claimed.content 精确对齐 request.content，避免与
+    // enqueue_request 字面量漂移导致命不中而假绿。
+    state
+        .db
+        .raw()
+        .collection::<Document>("mcp_call_logs")
+        .insert_one(
+            doc! {
+                "workspace_id": "default",
+                "account_id": "default",
+                "tool_name": "message_send_text",
+                "request": {
+                    "recipient": &contact.wxid,
+                    "content": &claimed.content,
+                },
+                "response": { "ok": true },
+                "error": null,
+                "created_at": DateTime::now(),
+            },
+            None,
+        )
+        .await
+        .expect("seed successful mcp_call_logs record");
+
+    // (f) 驱动真实 process_entry——由它自己走完整链路决定顺序（不在测试内自判顺序）。
+    process_entry(&state, &claimed)
+        .await
+        .expect("process entry ok");
+
+    // (g) 断言：走了 2B post-hoc 标 sent，而非被 pacing 拦成 pending。
+    let entry = collection
+        .find_one(doc! { "_id": outbox_id }, None)
+        .await
+        .expect("query")
+        .expect("entry exists");
+    assert_eq!(
+        entry.status,
+        OutboxStatus::Sent.as_str(),
+        "reclaim 门必须在 pacing 闸之前命中：MCP 已发过的条目应走 2B post-hoc 标 sent，\
+         而非被 pacing reschedule 成僵尸 pending。status={:?}",
+        entry.status
+    );
+    assert_ne!(
+        entry.status,
+        OutboxStatus::Pending.as_str(),
+        "若 status=pending 说明 pacing 闸被误挪到 reclaim 门之前，已发过的消息被拦成僵尸条目"
+    );
+    // last_error 是 reclaim 分支专属 marker(:685)——确认确实走的是 2B post-hoc，
+    // 而非碰巧走真实发送（后者 last_error 为 None、且会有 MCP 调用）。
+    let last_error = entry.last_error.clone().unwrap_or_default();
+    assert!(
+        last_error.contains("MCP already succeeded"),
+        "应走 reclaim 2B post-hoc 分支（last_error 带专属 marker），实际 last_error={last_error:?}"
+    );
+    assert!(entry.worker_id.is_none(), "标 sent 时 worker_id 应清空");
+    assert!(entry.locked_until.is_none(), "标 sent 时 locked_until 应清空");
+
+    // (h) 2B 门标 sent 不重发 → MCP 未收到任何真实发送调用（seed 历史与 seed
+    // mcp_call_logs 都是直接写库，未经 wiremock）。这坐实了走的是"已发过"分支
+    // 而非真实发送。
+    let recv = mcp_server
+        .received_requests()
+        .await
+        .expect("wiremock recorded requests");
+    assert_eq!(
+        recv.len(),
+        0,
+        "2B post-hoc 确认已发过，不应再向 MCP 发送；recv={}",
+        recv.len()
+    );
+}
+
 // ── gateway 决策 / 审查 mock JSON（端到端用，照搬 full_flow_suite 的最小形态）──
 
 /// Reply Agent 决策 JSON（shouldReply=true，knowledge_need=not_required 直发）。
