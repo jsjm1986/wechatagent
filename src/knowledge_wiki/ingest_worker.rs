@@ -53,6 +53,9 @@ pub async fn run_one_round(state: &AppState) -> anyhow::Result<()> {
         let sources = list_active_sources(state, &ws).await?;
         for src in sources {
             match process_source(state, &client, &src).await {
+                // not-due:本轮没到点、未发请求 → 不写任何 DB(尤其不刷 last_fetched_at,
+                // 否则 worker interval<schedule 时把节流基准无限前推,源永不更新)。
+                Ok(SourceOutcome::Skipped) => {}
                 Ok(SourceOutcome::NotModified) => {
                     let _ = mark_success(state, &src, 0).await;
                 }
@@ -78,6 +81,10 @@ pub async fn run_one_round(state: &AppState) -> anyhow::Result<()> {
 }
 
 enum SourceOutcome {
+    /// 没到 schedule_minutes、本轮跳过(未发请求)——绝不刷 last_fetched_at。
+    /// 与 NotModified(真 304,发了条件 GET、内容未变、是一次成功探测)语义区分:
+    /// 只有 NotModified 才走 mark_success 刷 last_fetched_at。
+    Skipped,
     NotModified,
     Ingested {
         chunk_count: usize,
@@ -91,7 +98,7 @@ async fn process_source(
     src: &IngestSource,
 ) -> anyhow::Result<SourceOutcome> {
     if !is_due(src) {
-        return Ok(SourceOutcome::NotModified);
+        return Ok(SourceOutcome::Skipped);
     }
     let mut req = client.get(&src.url);
     if let Some(etag) = &src.last_etag {
