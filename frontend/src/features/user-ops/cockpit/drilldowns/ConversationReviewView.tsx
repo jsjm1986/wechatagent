@@ -10,6 +10,7 @@ import { useState } from "react";
 import { ArrowLeft } from "lucide-react";
 import type { DecisionReview, Message } from "../../../../types";
 import { ConversationStream, EmptyInline, formatTime, nextBestActionLabel } from "../../legacy";
+import { FINAL_REVIEW_STATUS_LABELS, HOLD_CATEGORY_LABELS, labelOf } from "../../../../lib/reviewLabels";
 import styles from "../cockpit.module.css";
 
 function scoreEntries(scores?: Record<string, number>): Array<[string, number]> {
@@ -50,10 +51,10 @@ function ReviewItem({ review }: { review: DecisionReview }) {
           {(review.finalReviewStatus || review.holdCategory) && (
             <div className={styles.reviewMetaRow}>
               {review.finalReviewStatus && (
-                <span className={styles.reviewChip}>终审 {review.finalReviewStatus}</span>
+                <span className={styles.reviewChip}>终审 {labelOf(FINAL_REVIEW_STATUS_LABELS, review.finalReviewStatus)}</span>
               )}
               {review.holdCategory && (
-                <span className={styles.reviewChip}>暂缓类别 {review.holdCategory}</span>
+                <span className={styles.reviewChip}>暂缓类别 {labelOf(HOLD_CATEGORY_LABELS, review.holdCategory)}</span>
               )}
             </div>
           )}
