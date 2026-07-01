@@ -38,6 +38,7 @@ use crate::{
     models::{DomainField, DomainSchema},
 };
 
+use super::shared::resolve_authorized_workspace;
 use super::AppState;
 
 /// chunk 主表既有字段名黑名单：domain_schema 自定义字段不可与之冲突。
@@ -169,10 +170,7 @@ pub(super) async fn list_domain_schemas(
     Extension(admin): Extension<AuthenticatedAdmin>,
     Query(params): Query<ListQuery>,
 ) -> AppResult<Json<Value>> {
-    let workspace_id = params
-        .workspace_id
-        .clone()
-        .unwrap_or_else(|| admin.current_workspace.clone());
+    let workspace_id = resolve_authorized_workspace(&state, &admin, params.workspace_id.clone()).await?;
     let mut filter = doc! { "workspace_id": &workspace_id };
     if params.active_only {
         filter.insert("is_active", true);
@@ -199,10 +197,7 @@ pub(super) async fn create_domain_schema(
     Extension(admin): Extension<AuthenticatedAdmin>,
     Json(body): Json<UpsertRequest>,
 ) -> AppResult<Json<Value>> {
-    let workspace_id = body
-        .workspace_id
-        .clone()
-        .unwrap_or_else(|| admin.current_workspace.clone());
+    let workspace_id = resolve_authorized_workspace(&state, &admin, body.workspace_id.clone()).await?;
     if body.schema_id.trim().is_empty() {
         return Err(AppError::BadRequest("schemaId 不能为空".to_string()));
     }
@@ -241,10 +236,7 @@ pub(super) async fn update_domain_schema(
     Path(schema_id): Path<String>,
     Json(body): Json<UpsertRequest>,
 ) -> AppResult<Json<Value>> {
-    let workspace_id = body
-        .workspace_id
-        .clone()
-        .unwrap_or_else(|| admin.current_workspace.clone());
+    let workspace_id = resolve_authorized_workspace(&state, &admin, body.workspace_id.clone()).await?;
     let existing = state
         .db
         .domain_schemas()
@@ -297,10 +289,7 @@ pub(super) async fn delete_domain_schema(
     Path(schema_id): Path<String>,
     Query(params): Query<ListQuery>,
 ) -> AppResult<Json<Value>> {
-    let workspace_id = params
-        .workspace_id
-        .clone()
-        .unwrap_or_else(|| admin.current_workspace.clone());
+    let workspace_id = resolve_authorized_workspace(&state, &admin, params.workspace_id.clone()).await?;
     let existing = state
         .db
         .domain_schemas()
@@ -334,10 +323,7 @@ pub(super) async fn activate_domain_schema(
     Path(schema_id): Path<String>,
     Query(params): Query<ListQuery>,
 ) -> AppResult<Json<Value>> {
-    let workspace_id = params
-        .workspace_id
-        .clone()
-        .unwrap_or_else(|| admin.current_workspace.clone());
+    let workspace_id = resolve_authorized_workspace(&state, &admin, params.workspace_id.clone()).await?;
     let target = state
         .db
         .domain_schemas()
