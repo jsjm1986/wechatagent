@@ -26,7 +26,7 @@ $ScanDirs = @(
 )
 
 # 与 .sh 同一份正则：中文词 + 英文词 + 常见连字符变体。不区分大小写。
-$ForbiddenPattern = '(human[_ -]?takeover|takeover|hand[ -]?off|人工接管|人工介入|人工托管|接管|人工)'
+$ForbiddenPattern = '(human[_ -]?takeover|takeover|hand[_ -]?off|人工接管|人工介入|人工托管|接管|人工)'
 
 # 列出 base..HEAD 之间在 ScanDirs 下变更的文件（仅文本文件，排除删除）。
 $changed = git diff --name-only --diff-filter=ACMR "$Base..$HeadRef" -- $ScanDirs 2>$null
