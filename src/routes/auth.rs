@@ -25,6 +25,7 @@ use crate::auth::{
     },
     AuthenticatedAdmin, SESSION_COOKIE_NAME,
 };
+use crate::auth::is_workspace_authorized;
 use crate::error::{AppError, AppResult};
 
 use super::AppState;
@@ -141,12 +142,7 @@ pub async fn switch_workspace(
         .await
         .map_err(map_auth_error)?
         .ok_or_else(|| AppError::Unauthorized("admin_user_not_found".into()))?;
-    let allowed = if user.workspaces.is_empty() {
-        target == state.config.default_workspace_id
-    } else {
-        user.workspaces.iter().any(|w| w == target)
-    };
-    if !allowed {
+    if !is_workspace_authorized(target, &user.workspaces, &state.config.default_workspace_id) {
         return Err(AppError::BadRequest("workspace_not_in_user_acl".into()));
     }
     let session_id = jar
