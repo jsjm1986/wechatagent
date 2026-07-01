@@ -127,7 +127,6 @@ describe("UserOpsFeature", () => {
     domainDrafts: {},
     // Actions
     setUserOpsMode: vi.fn(),
-    setSmartOpsTab: vi.fn(),
     setTraditionalOpsTab: vi.fn(),
     setProfileNote: vi.fn(),
     setCustomAgentInstructions: vi.fn(),
