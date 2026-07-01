@@ -64,7 +64,6 @@ describe("UserOpsFeature", () => {
 
   const createMockStore = (overrides = {}) => ({
     userOpsMode: "smart",
-    smartOpsTab: "cockpit",
     traditionalOpsTab: "playbooks",
     messages: [],
     operatingMemory: null,

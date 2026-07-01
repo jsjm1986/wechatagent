@@ -13,7 +13,6 @@ import type {
   UserOperationGuideApplyResult,
   SimulationTurn,
   UserOpsMode,
-  SmartOpsTab,
   TraditionalOpsTab,
   OperationDomainConfig,
   OperationDomainDraft,
@@ -29,7 +28,6 @@ import { domainPayload, domainDraftsFromConfigs } from "./userOpsDomainHelpers";
 interface UserOpsState {
   // 模式/Tab
   userOpsMode: UserOpsMode;
-  smartOpsTab: SmartOpsTab;
   traditionalOpsTab: TraditionalOpsTab;
 
   // 选中联动数据
@@ -82,7 +80,6 @@ interface UserOpsState {
 interface UserOpsActions {
   // 设置器
   setUserOpsMode: (mode: UserOpsMode) => void;
-  setSmartOpsTab: (tab: SmartOpsTab) => void;
   setTraditionalOpsTab: (tab: TraditionalOpsTab) => void;
   setProfileNote: (note: string) => void;
   setCustomAgentInstructions: (instructions: string) => void;
@@ -291,7 +288,6 @@ async function refreshContacts(currentAccountId: string | null, q?: string) {
 export const useUserOpsStore = create<UserOpsState & UserOpsActions>((set, get) => ({
   // 初始状态
   userOpsMode: "smart",
-  smartOpsTab: "cockpit",
   traditionalOpsTab: "playbooks",
 
   messages: [],
@@ -332,7 +328,6 @@ export const useUserOpsStore = create<UserOpsState & UserOpsActions>((set, get) 
 
   // 设置器
   setUserOpsMode: (mode) => set({ userOpsMode: mode }),
-  setSmartOpsTab: (tab) => set({ smartOpsTab: tab }),
   setTraditionalOpsTab: (tab) => set({ traditionalOpsTab: tab }),
   setProfileNote: (note) => set({ profileNote: note }),
   setCustomAgentInstructions: (instructions) => set({ customAgentInstructions: instructions }),

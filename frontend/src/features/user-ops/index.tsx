@@ -69,7 +69,6 @@ function UserOpsFeatureInner() {
   // 从store中解构需要的状态
   const {
     userOpsMode,
-    smartOpsTab,
     traditionalOpsTab,
     messages,
     operatingMemory,
@@ -102,7 +101,6 @@ function UserOpsFeatureInner() {
     domainDrafts,
     // Actions
     setUserOpsMode,
-    setSmartOpsTab,
     setTraditionalOpsTab,
     setProfileNote,
     setCustomAgentInstructions,
