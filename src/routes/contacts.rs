@@ -425,10 +425,20 @@ pub(super) async fn enable_agent(
         let domain_config =
             agent::load_user_operation_domain_config(&state, &admin.current_workspace).await?;
         let initial_state = agent::initial_operation_state_key(domain_config.as_ref());
-        insert_domain_stage_fields(
-            &mut set_doc,
+        // M4：AI 生成的初始画像 stage/intent 经 dimension_registry 校验后再落库
+        // （对齐 management.rs 建档路径 + AI 主决策 validate_and_normalize_decision）。
+        // AI 产出 → WriteIntent::MachineWrite：越界值 drop（不阻断建档），不像 admin 那样 reject。
+        let (gen_stage, gen_intent) = validate_generated_stage_intent(
+            &state,
+            &contact.account_id,
             generated.customer_stage.as_deref(),
             generated.intent_level.as_deref(),
+        )
+        .await?;
+        insert_domain_stage_fields(
+            &mut set_doc,
+            gen_stage.as_deref(),
+            gen_intent.as_deref(),
             true,
         );
         set_doc.insert("commitments", commitments_bson);
@@ -516,10 +526,17 @@ pub(super) async fn update_profile_note(
         let domain_config =
             agent::load_user_operation_domain_config(&state, &admin.current_workspace).await?;
         let initial_state = agent::initial_operation_state_key(domain_config.as_ref());
-        insert_domain_stage_fields(
-            &mut set_doc,
+        let (gen_stage, gen_intent) = validate_generated_stage_intent(
+            &state,
+            &contact.account_id,
             generated.customer_stage.as_deref(),
             generated.intent_level.as_deref(),
+        )
+        .await?;
+        insert_domain_stage_fields(
+            &mut set_doc,
+            gen_stage.as_deref(),
+            gen_intent.as_deref(),
             true,
         );
         set_doc.insert("commitments", commitments_bson);
@@ -756,6 +773,32 @@ fn stage_changed(prev_stage: Option<&str>, new_stage: Option<&str>) -> bool {
     new_stage.is_some() && prev_stage != new_stage
 }
 
+/// M4：AI 生成的初始画像 stage/intent 落库前经 `system_taxonomies` 字典校验，
+/// 与 `management.rs` 建档路径 + AI 主决策 `validate_and_normalize_decision` 对齐。
+/// AI 产出 → `WriteIntent::MachineWrite`：越界值 `DropSilently`（返 `None`，不阻断
+/// 建档），alias 归一到 canonical，已登记/未配置值原样通过。
+async fn validate_generated_stage_intent(
+    state: &AppState,
+    account_id: &str,
+    customer_stage: Option<&str>,
+    intent_level: Option<&str>,
+) -> AppResult<(Option<String>, Option<String>)> {
+    use crate::agent::dimension_registry::{validate_dimension_value, WriteIntent};
+    let gen_stage = match customer_stage {
+        Some(v) => apply_admin_dim_validation(
+            validate_dimension_value(&state.db, "customer_stage", v, account_id, WriteIntent::MachineWrite).await,
+        )?,
+        None => None,
+    };
+    let gen_intent = match intent_level {
+        Some(v) => apply_admin_dim_validation(
+            validate_dimension_value(&state.db, "intent_level", v, account_id, WriteIntent::MachineWrite).await,
+        )?,
+        None => None,
+    };
+    Ok((gen_stage, gen_intent))
+}
+
 pub async fn update_operation_profile(
     State(state): State<AppState>,
     Extension(admin): Extension<AuthenticatedAdmin>,
@@ -937,10 +980,17 @@ pub(super) async fn analyze_contact_profile(
         let domain_config =
             agent::load_user_operation_domain_config(&state, &admin.current_workspace).await?;
         let initial_state = agent::initial_operation_state_key(domain_config.as_ref());
-        insert_domain_stage_fields(
-            &mut set_doc,
+        let (gen_stage, gen_intent) = validate_generated_stage_intent(
+            &state,
+            &contact.account_id,
             generated.customer_stage.as_deref(),
             generated.intent_level.as_deref(),
+        )
+        .await?;
+        insert_domain_stage_fields(
+            &mut set_doc,
+            gen_stage.as_deref(),
+            gen_intent.as_deref(),
             true,
         );
         set_doc.insert("commitments", commitments_bson);
