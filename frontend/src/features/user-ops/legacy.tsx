@@ -792,7 +792,7 @@ export function MemoryCardSummary({ memoryCard }: { memoryCard?: Record<string, 
 }
 
 
-type MemoryFactView = {
+export type MemoryFactView = {
   text: string;
   evidence?: string;
   confidence?: number;
@@ -803,7 +803,7 @@ type MemoryFactView = {
 };
 
 
-function memoryFactList(source: Record<string, unknown> | undefined, key: string): MemoryFactView[] {
+export function memoryFactList(source: Record<string, unknown> | undefined, key: string): MemoryFactView[] {
   const value = source?.[key];
   if (!Array.isArray(value)) return [];
   return value
@@ -830,7 +830,7 @@ function memoryFactList(source: Record<string, unknown> | undefined, key: string
 }
 
 
-function MemoryFactRow({ fact }: { fact: MemoryFactView }) {
+export function MemoryFactRow({ fact }: { fact: MemoryFactView }) {
   const [expanded, setExpanded] = useState(false);
   const isDeprecated = Boolean(fact.deprecatedAt);
   const tooltip = isDeprecated
@@ -2014,7 +2014,7 @@ function statusSortOrder(status: string): number {
 }
 
 
-function stringField(source: Record<string, unknown>, key: string) {
+export function stringField(source: Record<string, unknown>, key: string) {
   const value = source[key];
   if (typeof value === "string") return value;
   if (Array.isArray(value)) return value.join(", ");
@@ -2031,7 +2031,7 @@ function listField(source: Record<string, unknown>, key: string) {
 }
 
 
-function contextPackList(source: Record<string, unknown> | undefined, key: string): string[] {
+export function contextPackList(source: Record<string, unknown> | undefined, key: string): string[] {
   const value = source?.[key];
   if (Array.isArray(value)) {
     return value

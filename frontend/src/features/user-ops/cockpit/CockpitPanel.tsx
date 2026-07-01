@@ -6,7 +6,6 @@
 import { useState } from "react";
 import {
   Activity,
-  ArrowLeft,
   Bot,
   SendHorizonal,
   Sparkles,
@@ -32,6 +31,9 @@ import TagTrustPanel from "../TagTrustPanel";
 import PersonalityPanel from "../PersonalityPanel";
 import { JudgmentBar } from "./JudgmentBar";
 import { ObserveView } from "./ObserveView";
+import { MemoryDetailView } from "./drilldowns/MemoryDetailView";
+import { ConversationReviewView } from "./drilldowns/ConversationReviewView";
+import { SendHistoryView } from "./drilldowns/SendHistoryView";
 import {
   MEMORY_DRAFT_FIELD_GROUPS,
   ChangePreview,
@@ -535,49 +537,22 @@ function ConfigureContent(props: CockpitPanelProps) {
   );
 }
 
-// 下钻视图：conversation 分支搬自 conversation 块（legacy.tsx:698-714）；
-// sendHistory 分支复用 SendHistorySection；memory 分支 Task 5 做，先占位 + 返回按钮。
+// 下钻视图：conversation → ConversationReviewView（会话流 + 复盘展开自治判断依据）；
+// sendHistory → SendHistoryView（复用 SendHistorySection）；memory → MemoryDetailView（记忆溯源全景）。
+// 三视图各自带下钻头部 + 返回按钮，onBack 统一回到 drilldown=null。
 function DrilldownHost(props: CockpitPanelProps & { drilldown: Exclude<Drilldown, null>; onBack: () => void }) {
-  const { drilldown, onBack, selected, messages, decisionReviews } = props;
+  const { drilldown, onBack, selected, messages, decisionReviews, operatingMemory } = props;
   if (!selected) return null;
 
-  const title = drilldown === "conversation" ? "会话记录" : drilldown === "sendHistory" ? "AI 已发送" : "长期记忆";
+  if (drilldown === "conversation") {
+    return (
+      <ConversationReviewView messages={messages} decisionReviews={decisionReviews} onBack={onBack} />
+    );
+  }
 
-  return (
-    <section className="smartTabPanel">
-      <div className={styles.drilldownHead}>
-        <button className={styles.backButton} type="button" onClick={onBack}>
-          <ArrowLeft size={15} />
-          返回
-        </button>
-        <strong>{title}</strong>
-      </div>
+  if (drilldown === "sendHistory") {
+    return <SendHistoryView wxid={selected.wxid} onBack={onBack} />;
+  }
 
-      {drilldown === "conversation" && (
-        <section className="conversationGrid">
-          <ConversationStream messages={messages} />
-
-          <div className="reviewList">
-            <div className="sectionCaption">最近复盘</div>
-            {decisionReviews.slice(0, 4).map((review) => (
-              <div key={review.id} className="reviewItem">
-                <strong>{review.approved ? "通过" : "拦截"} / {review.operationState || "未记录状态"}</strong>
-                <p>{review.reviewSummary || review.replyText || "-"}</p>
-                <span>{formatTime(review.createdAt)}</span>
-              </div>
-            ))}
-            {!decisionReviews.length && <EmptyInline text="暂无决策复盘" />}
-          </div>
-        </section>
-      )}
-
-      {drilldown === "sendHistory" && <SendHistorySection wxid={selected.wxid} />}
-
-      {drilldown === "memory" && (
-        <section className="cockpitSection">
-          <EmptyInline text="长期记忆下钻详情将在后续版本提供。" />
-        </section>
-      )}
-    </section>
-  );
+  return <MemoryDetailView memoryCard={operatingMemory?.memoryCard} onBack={onBack} />;
 }
