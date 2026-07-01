@@ -1288,7 +1288,7 @@ mod dual_gate_classification_tests {
     };
     use super::{
         classify_dual_gate, decide_revision, finalize_review_for_send, reply_objective_features,
-        route_dual_gate, DualGateClassification, FinalizeOutcome,
+        review_passed, route_dual_gate, DualGateClassification, FinalizeOutcome,
         GatewayStatusFinal, RevisionDecision,
     };
     use crate::models::{AgentStatus, Contact};
@@ -2369,6 +2369,87 @@ mod dual_gate_classification_tests {
             outcome.status,
             GatewayStatusFinal::BlockedByRequiredField,
             "混合违规时结构性硬门优先，不走 revision 降级"
+        );
+    }
+
+    // ── M1：管理发送网关接入 finalize 后的两道核心不变量 ──
+    //
+    // send_contact_message_gateway 原先仅凭 review_passed 放行（软/硬闸折叠 bool），
+    // 缺 finalize 的 R5.4 verified-knowledge 确定性硬门。下面两测钉死修复：
+    //   1. review_passed 会放行的无背书产品声明，finalize 确定性拦截；
+    //   2. finalize 对软闸失败标 Approved，靠 `&& review_passed` guard 仍不发。
+
+    #[test]
+    fn m1_review_passed_lets_unverified_product_claim_through_but_finalize_blocks() {
+        // M1 核心：reviewer 自报 grounding 高分（review_passed=true），但本 run 引用的
+        // 切片无 verified chunk → finalize R5.4 确定性 block。证明管理发送仅凭
+        // review_passed 会误发这条危险内容，接入 finalize 后被拦。
+        let runtime = UserRuntimeParameters::default();
+        let mut review = full_pass_review();
+        // 显式产品声明；grounding 分仍高（reviewer 自评乐观）。
+        review.claim_analysis = mongodb::bson::doc! { "requiresProductKnowledge": true };
+        let mut decision = shouldreply_decision();
+        let chunk = mk_chunk("needs_review"); // 非 verified
+        decision.used_knowledge_ids = vec![chunk.id.unwrap().to_hex()];
+
+        // 断言 1：旧管理路径仅凭 review_passed —— 会放行这条无背书产品声明。
+        assert!(
+            review_passed(&review, &runtime),
+            "reviewer 自报 grounding 高分时 review_passed 放行（M1 的漏点）"
+        );
+
+        // 断言 2：接入 finalize 后 —— R5.4 verified_chunks=∅ 确定性拦截。
+        let contact = finalize_contact();
+        let outcome = finalize_review_for_send(
+            review,
+            &mut decision,
+            &runtime,
+            &contact,
+            std::slice::from_ref(&chunk),
+            Vec::new(),
+            "我们的产品一定能帮您解决",
+            &crate::models::CommitmentMarkers::default(),
+            false,
+        );
+        assert_eq!(
+            outcome.status,
+            GatewayStatusFinal::BlockedUnverifiedProductClaim,
+            "finalize R5.4 必须拦截无 verified 背书的产品声明（管理发送新增保护）"
+        );
+    }
+
+    #[test]
+    fn m1_soft_gate_failure_stays_blocked_via_review_passed_guard() {
+        // M1 回归：软闸失败（human_like 不达标）时 finalize 会标 Approved，
+        // 管理发送必须靠 `matches!(Approved) && review_passed` 的 guard 仍不发，
+        // 否则会把软闸失败内容未经改写直接发出（管理发送无 revision 通道）。
+        let runtime = UserRuntimeParameters::default();
+        let mut review = full_pass_review();
+        review.scores.human_like = runtime.human_like_rewrite_below - 1; // 软闸失败
+        let mut decision = shouldreply_decision();
+        let contact = finalize_contact();
+        let outcome = finalize_review_for_send(
+            review,
+            &mut decision,
+            &runtime,
+            &contact,
+            &[],
+            Vec::new(),
+            "用户最新消息",
+            &crate::models::CommitmentMarkers::default(),
+            false,
+        );
+        // finalize 单看：软闸失败仍落 Approved（指望 revision 循环）。
+        assert!(
+            matches!(outcome.status, GatewayStatusFinal::Approved),
+            "finalize 对软闸失败标 Approved（依赖调用方 revision 或 guard）"
+        );
+        // 但 review_passed 因 human_like 不达标返 false → 管理发送 guard 挡住。
+        let passed = matches!(outcome.status, GatewayStatusFinal::Approved)
+            && review_passed(&outcome.review, &runtime);
+        assert!(
+            !passed,
+            "管理发送的 `&& review_passed` guard 必须挡住软闸失败被当 Approved 发出"
         );
     }
 }
