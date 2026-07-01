@@ -52,6 +52,24 @@ async fn ensure_indexes_survives_multi_version_domain_configs() {
 async fn ensure_indexes_survives_multi_version_state_policies() {
     let app = TestApp::start().await;
     let coll = app.state.db.raw().collection::<Document>("operation_state_policies");
+    // 先 seed v1 底座:TestApp::start 后 operation_state_policies 为空——m013(migrations::run,
+    // 早于 ensure_prompt_pack_v2)遍历 operation_domain_configs 生成 policy,但 domain_configs
+    // 要到 ensure_prompt_pack_v2 才 seed,故 m013 跑时读到 0 行 domain_configs → seed 出 0 行
+    // state_policies。缺了这条 v1 行,下面单插 1 行 v2 时旧 3-key unique 建在单行上不会 E11000,
+    // 测试即便在旧 bug 存在时也会 pass(空转)。补上同 (ws, domain, state_key) 的 v1 行后,
+    // 与 v2 行共享 (default, user_operations, new_contact) → 旧 3-key unique 重建时撞重复键。
+    coll.insert_one(
+        doc! {
+            "workspace_id": "default",
+            "domain": "user_operations",
+            "state_key": "new_contact",
+            "version": 1_i32,
+            "current_version": true,
+        },
+        None,
+    )
+    .await
+    .expect("seed v1 state policy 底座");
     coll.insert_one(
         doc! {
             "workspace_id": "default",
