@@ -82,6 +82,17 @@ pub(crate) fn is_coverage_optimism(decision: &AgentDecision, knowledge_coverage:
         && super::guards::decision_requires_knowledge(decision)
 }
 
+/// 纯谓词:本决策是否应记录 `used_knowledge_ids`(知识路由命中的切片 id)。
+///
+/// 仅当经 **Full** 知识档(`forced_full` 强升 Full / `escalated_to_full` 升档到 Full)时才记——
+/// 只有 Full 档 `include_business=true` 真注入并读了切片(decision.rs:318)。Lean-Enough /
+/// Clarify(Lean) / Escalate(Relational) 都 `include_business=false`,没读切片;若记路由 id,
+/// grounding 硬闸 `compute_verified_chunks` 取 `used ∩ verified` 非空即放行,会架空
+/// `blocked_unverified_product_claim` 红线(gates.rs:660)。正向条件,绝不改成无条件赋值。
+pub(crate) fn should_record_used_knowledge_ids(forced_full: bool, escalated_to_full: bool) -> bool {
+    forced_full || escalated_to_full
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -227,5 +238,22 @@ mod tests {
         assert!(is_sufficiency_recognized(&make_decision("need_clarification", "")));
         assert!(!is_sufficiency_recognized(&make_decision("", "")));
         assert!(!is_sufficiency_recognized(&make_decision("garbage", "")));
+    }
+
+    #[test]
+    fn used_knowledge_ids_recorded_only_for_full_tier() {
+        // 命门:Lean-Enough / Clarify(Lean) / Escalate(Relational) 都没读切片
+        // (forced_full=false, escalated_to_full=false),绝不能记路由 id——否则
+        // grounding 硬闸把"没读过的切片"误当读过,架空 blocked_unverified_product_claim。
+        assert!(
+            !should_record_used_knowledge_ids(false, false),
+            "非 Full 档不读切片,记路由 id 会架空 grounding 硬闸(红线)"
+        );
+        // forced_full 强升 Full(自评 enough 但 coverage=missing 且需知识)→ 记。
+        assert!(should_record_used_knowledge_ids(true, false));
+        // escalated_to_full 升档到 Full → 记。
+        assert!(should_record_used_knowledge_ids(false, true));
+        // 两者同真(理论不同时发生,防御)→ 记。
+        assert!(should_record_used_knowledge_ids(true, true));
     }
 }
