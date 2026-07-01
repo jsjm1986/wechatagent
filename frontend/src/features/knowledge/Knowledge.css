@@ -91,7 +91,7 @@
     opacity: 0.6;
     cursor: not-allowed;
   }
-  /* knowledge-wiki Phase G：Wiki 管理频道（DomainSchemaTab / GapSignalsTab / ChunkRevisionsDrawer） */
+  /* knowledge-wiki Phase G：知识库 Wiki 频道（DomainSchemaTab / GapSignalsTab / ChunkRevisionsDrawer） */
   .knowledgeWiki .wikiPanelBody {
     display: flex;
     flex-direction: column;

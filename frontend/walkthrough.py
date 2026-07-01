@@ -81,10 +81,10 @@ with sync_playwright() as p:
     print("=== 1. landing title:", page.title())
     body = page.inner_text("body")
     check("登录" not in body or "WeAgent" in body, "已过登录墙(未卡 LoginScreen)")
-    check("Wiki 管理" in body, "侧栏含「Wiki 管理」频道")
+    check("知识库 Wiki" in body, "侧栏含「知识库 Wiki」频道")
 
-    # ========== 2. 进 Wiki 管理频道 → 切「治理」模式 ==========
-    page.locator("aside button", has_text="Wiki 管理").first.click(timeout=5000)
+    # ========== 2. 进 知识库 Wiki 频道 → 切「治理」模式 ==========
+    page.locator("aside button", has_text="知识库 Wiki").first.click(timeout=5000)
     page.wait_for_timeout(1500)
     page.screenshot(path=f"{SHOTS}/02-knowledge.png", full_page=True)
     # 知识库工作站默认 today 模式,需切到「治理」模式(StewardMode)才有 cockpit

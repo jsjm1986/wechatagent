@@ -470,7 +470,8 @@ Review 模式: {}
         review_mode,
         extra_score_lines,
         formula_breakdown_lines,
-        crate::agent::prompt_isolation::isolate_untrusted(&inbound.content),
+        // H10：客户内容剥哨兵保持不变量(本 prompt 非转述契约,字节等价)。
+        crate::agent::prompt_isolation::inbound_prompt_content(&inbound.content, inbound.is_synthetic_relay),
         decision.reply_text,
         decision_view_text,
         memory_text,

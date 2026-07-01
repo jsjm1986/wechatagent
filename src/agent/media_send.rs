@@ -245,6 +245,7 @@ pub(crate) async fn send_outbound_media(
                 msg_type: Some("media".to_string()),
                 media_ref: Some(asset_id.to_string()),
                 raw: Some(raw),
+                is_synthetic_relay: false,
                 created_at: now,
             },
             None,

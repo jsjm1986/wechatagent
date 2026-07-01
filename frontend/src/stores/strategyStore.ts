@@ -43,7 +43,7 @@ interface StrategyActions {
   publishSoul: (id: string) => Promise<void>;
   createPromptTemplate: () => Promise<void>;
   savePromptTemplate: (force?: boolean) => Promise<SavePromptResult>;
-  publishPromptTemplate: (id: string) => Promise<void>;
+  publishPromptTemplate: (id: string, force?: boolean) => Promise<SavePromptResult>;
   resetSystemPromptPack: () => Promise<void>;
   editSoul: (soul: AgentSoul) => void;
   newSoulDraftFor: (kind: string) => void;
@@ -233,15 +233,28 @@ export const useStrategyStore = create<StrategyState & StrategyActions>((set, ge
     }
   },
 
-  publishPromptTemplate: async (id: string) => {
+  publishPromptTemplate: async (id: string, force?: boolean): Promise<SavePromptResult> => {
     useUiStore.getState().setBusy(true);
     useUiStore.getState().setError("");
 
     try {
-      await api.post(`/api/prompt-templates/${id}/publish`);
+      const resp = await api.post<{ status?: string; reason?: string; diff?: string }>(
+        `/api/prompt-templates/${id}/publish`,
+        force ? { force: true } : {}
+      );
+      // needs_human_confirm 是 200，不能当成功 reload。
+      if (resp && resp.status === "needs_human_confirm") {
+        return { needsConfirm: true, reason: resp.reason ?? "", diff: resp.diff ?? "" };
+      }
       await get().loadStrategyData();
+      return { ok: true };
     } catch (error) {
-      useUiStore.getState().setError(error instanceof Error ? error.message : String(error));
+      const message = error instanceof Error ? error.message : String(error);
+      if (message.includes("红线语义审查拒绝")) {
+        return { rejected: true, reason: message };
+      }
+      useUiStore.getState().setError(message);
+      return { error: true, reason: message };
     } finally {
       useUiStore.getState().setBusy(false);
     }

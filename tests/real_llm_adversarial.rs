@@ -396,6 +396,7 @@ fn make_inbound(contact: &Contact, message_id: &str, content: &str) -> Conversat
         msg_type: None,
         media_ref: None,
         raw: None,
+        is_synthetic_relay: false,
         created_at: DateTime::now(),
     }
 }
@@ -420,6 +421,7 @@ fn make_dated_message(
         msg_type: None,
         media_ref: None,
         raw: None,
+        is_synthetic_relay: false,
         created_at,
     }
 }

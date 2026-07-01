@@ -103,6 +103,7 @@ async fn simulate_user_dialogue_inner(
             msg_type: None,
             media_ref: None,
             raw: Some(doc! { "runMode": "shadow" }),
+            is_synthetic_relay: false,
             created_at: DateTime::now(),
         };
         let trigger = AgentTrigger::Inbound(&inbound);
@@ -255,6 +256,7 @@ async fn simulate_user_dialogue_inner(
                 msg_type: None,
                 media_ref: None,
                 raw: Some(doc! { "runMode": "shadow" }),
+                is_synthetic_relay: false,
                 created_at: DateTime::now(),
             });
         }

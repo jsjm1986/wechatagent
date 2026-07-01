@@ -155,6 +155,7 @@ pub(crate) async fn send_outbound_namecard(
                 msg_type: Some("namecard".to_string()),
                 media_ref: Some(card_id.to_string()),
                 raw: Some(raw),
+                is_synthetic_relay: false,
                 created_at: now,
             },
             None,
