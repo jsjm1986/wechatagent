@@ -472,6 +472,16 @@ export type UserOperationGuidePreview = {
   updatedAt?: string;
 };
 
+export type GuideSkippedField = { field: string; reason: string };
+
+export type UserOperationGuideApplyResult = {
+  contact: Contact;
+  operatingMemory: OperatingMemory;
+  health: OperationHealth;
+  appliedFields: string[];
+  skippedFields: GuideSkippedField[];
+};
+
 export type SimulationTurn = {
   turn: number;
   inboundText: string;

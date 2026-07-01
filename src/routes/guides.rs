@@ -49,6 +49,29 @@ pub(super) async fn preview_user_operation_guide(
     let latest_review = latest_decision_review(&state, &contact).await?;
     let playbook = agent::load_operation_playbook_for_contact(&state, &contact).await?;
     let health = operation_health_json(&contact, &memory, latest_review.as_ref());
+    // 注入合法值(治 LLM 产越界值的源头):状态机合法态 key + customer_stage/intent_level 字典 canonical。
+    let domain_config = agent::load_user_operation_domain_config_for_contact(
+        &state,
+        &contact.workspace_id,
+        &contact.wxid,
+    )
+    .await?;
+    let legal_states: Vec<String> = agent::operation_states(domain_config.as_ref())
+        .iter()
+        .filter_map(|d| d.get_str("key").ok().map(String::from))
+        .collect();
+    let cache = agent::taxonomy::global_taxonomy_cache();
+    cache.find_or_load(&state.db).await; // 冷/过期缓存返回空,先 load(幂等自愈)
+    let stage_values = agent::taxonomy::dimension_values_with_labels(
+        "customer_stage",
+        &admin.current_workspace,
+        cache.as_ref(),
+    );
+    let intent_values = agent::taxonomy::dimension_values_with_labels(
+        "intent_level",
+        &admin.current_workspace,
+        cache.as_ref(),
+    );
     let system = "你是微信私域用户运营产品里的 AI 引导助手。你的职责不是直接写聊天回复，而是根据运营人员的自然语言指令，生成一份可确认的配置修改预览。必须输出严格 JSON。";
     let user = build_guide_preview_prompt(
         &payload.instruction,
@@ -58,6 +81,9 @@ pub(super) async fn preview_user_operation_guide(
         playbook.as_ref(),
         latest_review.as_ref(),
         &health,
+        &legal_states,
+        &stage_values,
+        &intent_values,
     );
     let generated = agent::generate_agent_json(
         &state,
@@ -155,7 +181,20 @@ pub(super) async fn apply_user_operation_guide(
         )
         .await?
         .ok_or_else(|| AppError::NotFound("contact not found".to_string()))?;
-    apply_contact_changes(&state, &contact, &preview.suggested_changes).await?;
+    let skipped = apply_contact_changes(&state, &contact, &preview.suggested_changes).await?;
+    // appliedFields = suggestedChanges 顶层键 - 被跳过的字段(给前端"已应用 N 项"用)。
+    let skipped_names: std::collections::HashSet<&str> =
+        skipped.iter().map(|s| s.field.as_str()).collect();
+    let applied_fields: Vec<String> = preview
+        .suggested_changes
+        .keys()
+        .filter(|k| !skipped_names.contains(k.as_str()))
+        .cloned()
+        .collect();
+    let skipped_json: Vec<Value> = skipped
+        .iter()
+        .map(|s| json!({ "field": s.field, "reason": s.reason }))
+        .collect();
     apply_memory_changes(&state, &contact, &preview.suggested_changes).await?;
     apply_playbook_changes(&state, &contact, &preview.suggested_changes).await?;
     apply_domain_changes(&state, &admin.current_workspace, &preview.suggested_changes).await?;
@@ -186,7 +225,8 @@ pub(super) async fn apply_user_operation_guide(
                     "impactScope": preview.impact_scope,
                     "scopeReason": preview.scope_reason,
                     "readableChanges": preview.readable_changes,
-                    "suggestedChanges": preview.suggested_changes
+                    "suggestedChanges": preview.suggested_changes,
+                    "skippedFields": mongodb::bson::to_bson(&skipped_json).unwrap_or(mongodb::bson::Bson::Array(vec![]))
                 }),
                 created_at: DateTime::now(),
                 dedupe_key: None,
@@ -207,7 +247,9 @@ pub(super) async fn apply_user_operation_guide(
         "item": {
             "contact": ApiContact::from(updated_contact),
             "operatingMemory": operating_memory_json(memory),
-            "health": health
+            "health": health,
+            "appliedFields": applied_fields,
+            "skippedFields": skipped_json
         }
     })))
 }
