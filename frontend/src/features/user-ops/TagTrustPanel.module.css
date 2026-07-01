@@ -32,16 +32,30 @@
   background: var(--fill-inactive); border: 1px solid var(--hairline);
 }
 
-/* AI 确信 chip —— 紫色系（AI 身份），带证据条数 */
+/* AI 确信 chip —— 紫色系（AI 身份），带证据条数，可点击展开证据明细 */
+.aiChipWrap { display: inline-flex; flex-direction: column; gap: 5px; }
 .aiChip {
   display: inline-flex; align-items: center; gap: 7px;
-  font-size: 11.5px; font-weight: 500; color: var(--color-brand);
-  padding: 3px 11px; border-radius: 20px;
+  font: inherit; font-size: 11.5px; font-weight: 500; color: var(--color-brand);
+  padding: 3px 11px; border-radius: 20px; cursor: pointer; min-height: 0;
   background: var(--fill-brand); border: 1px solid rgba(94,92,230,.24);
 }
+.aiChip:hover { filter: brightness(.98); }
 .evidenceCount {
   font-size: 10px; font-weight: 500; color: var(--ink-3);
   padding-left: 7px; border-left: 1px solid rgba(94,92,230,.22);
+}
+
+/* AI 确信 chip 展开的证据明细（turn / msgId），紧贴 chip 下方缩进呈现 */
+.evidenceList {
+  display: flex; flex-wrap: wrap; gap: 5px; padding: 6px 11px;
+  border-radius: var(--r-sm); background: var(--fill-brand);
+  border: 1px solid rgba(94,92,230,.18);
+}
+.evidenceItem {
+  font-size: 10.5px; font-weight: 500; color: var(--color-brand);
+  padding: 2px 8px; border-radius: 12px;
+  background: var(--surface-card); border: 1px solid rgba(94,92,230,.2);
 }
 
 /* AI 确信来源徽标 —— 紫色系（AI 身份），区分强证据快通道 / 压缩重判 */

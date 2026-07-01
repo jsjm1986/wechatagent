@@ -109,3 +109,32 @@
   font-size: 13px;
   cursor: pointer;
 }
+
+/* 运营健康度卡 tone 底色（Task 4）：全部引用 tokens.css 半透明 fill 变量，
+   替代原全局 `healthItem ${tone}` 的硬编码色值。good=绿 / warn=橙 / danger=红。 */
+.health_good {
+  background: var(--fill-running);
+}
+
+.health_warn {
+  background: var(--fill-held);
+}
+
+.health_danger {
+  background: var(--fill-blocked);
+}
+
+/* 长期记忆卡下钻入口（Task 4）：把只读记忆摘要包成可点击按钮进 memory 下钻。
+   显式重置 button 默认外观，避免全局裸 button 规则污染；块级铺满、文本左对齐。 */
+.memoryDrillCard {
+  display: block;
+  width: 100%;
+  text-align: left;
+  padding: 0;
+  border: none;
+  background: transparent;
+  cursor: pointer;
+  font: inherit;
+  color: inherit;
+}
+
