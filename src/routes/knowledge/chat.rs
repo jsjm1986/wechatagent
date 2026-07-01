@@ -1847,6 +1847,8 @@ fn chunk_request_from_chat_patch(
         verified_claims: vec![],
         status: "draft".to_string(),
         priority: 0,
+        wiki_type: s(patch, "wikiType"),
+        chunk_type: s(patch, "chunkType"),
     }
 }
 
