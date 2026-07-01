@@ -19,6 +19,17 @@ use crate::{
 
 use super::AppState;
 
+/// guide apply 中被跳过的越界字段(LLM 产出但不在字典/状态机内)。
+/// 仅 guide 路径(apply_contact_changes)产出 —— 手动表单(contacts.rs)/审批
+/// (admin_relationship_suggestions)路径的 AdminWrite 越界仍硬拒 400,不收集。
+#[derive(Debug, Clone)]
+pub struct SkippedField {
+    /// camelCase 字段名,如 "operationState"(与 suggestedChanges 输入键一致)。
+    pub field: String,
+    /// 人类可读原因,如 "非法的 operation_state 迁移:...";直接回流给前端 toast。
+    pub reason: String,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(super) struct AccountScopedQuery {
@@ -569,12 +580,13 @@ pub(super) fn score_presence(values: &[Option<String>]) -> i32 {
     ((present * 100) / values.len().max(1) as i32).clamp(0, 100)
 }
 
-pub(super) async fn apply_contact_changes(
+pub async fn apply_contact_changes(
     state: &AppState,
     contact: &Contact,
     changes: &Document,
-) -> AppResult<()> {
+) -> AppResult<Vec<SkippedField>> {
     let mut set_doc = Document::new();
+    let mut skipped: Vec<SkippedField> = Vec::new();
     if let Some(value) = doc_get_string(changes, "humanProfileNote") {
         set_doc.insert("human_profile_note", value);
     }
@@ -582,53 +594,82 @@ pub(super) async fn apply_contact_changes(
         set_doc.insert("tags", to_bson(&value)?);
     }
     if let Some(value) = doc_get_string(changes, "customerStage") {
-        // M1：admin 手填值经 dimension_registry 校验（alias→canonical 归一 + 越界拒绝），
-        // 与 contacts.rs::update_operation_profile 同口径。guide-preview apply 是 admin
-        // 权威写入 → WriteIntent::AdminWrite：越界值 `?` 提前返回 400（不静默落脏值）。
-        // DropSilently（admin 通道理论不触发，仅空串兜底）→ 跳过该维度写入，不影响其它字段。
-        let validated_stage = apply_admin_dim_validation(
-            agent::dimension_registry::validate_dimension_value(
+        // guide 路径(LLM 产值):越界 → 记 skipped 跳过(不像 contacts.rs 手动表单那样硬拒)。
+        // 绕过 apply_admin_dim_validation(它把 Reject 吞成 Err)直接 match 原始 DimValidation。
+        use crate::agent::dimension_registry::DimValidation::{Accept, DropSilently, Reject};
+        let validated_stage = match agent::dimension_registry::validate_dimension_value(
+            &state.db,
+            "customer_stage",
+            &value,
+            &contact.account_id,
+            agent::dimension_registry::WriteIntent::AdminWrite,
+        )
+        .await
+        {
+            Accept(s) => Some(s),
+            DropSilently => None,
+            Reject(reason) => {
+                skipped.push(SkippedField {
+                    field: "customerStage".to_string(),
+                    reason,
+                });
+                None
+            }
+        };
+        let intent = match doc_get_string(changes, "intentLevel") {
+            Some(v) => match agent::dimension_registry::validate_dimension_value(
                 &state.db,
-                "customer_stage",
-                &value,
+                "intent_level",
+                &v,
                 &contact.account_id,
                 agent::dimension_registry::WriteIntent::AdminWrite,
             )
-            .await,
-        )?;
-        let intent = match doc_get_string(changes, "intentLevel") {
-            Some(v) => apply_admin_dim_validation(
-                agent::dimension_registry::validate_dimension_value(
-                    &state.db,
-                    "intent_level",
-                    &v,
-                    &contact.account_id,
-                    agent::dimension_registry::WriteIntent::AdminWrite,
-                )
-                .await,
-            )?,
+            .await
+            {
+                Accept(s) => Some(s),
+                DropSilently => None,
+                Reject(reason) => {
+                    skipped.push(SkippedField {
+                        field: "intentLevel".to_string(),
+                        reason,
+                    });
+                    None
+                }
+            },
             None => None,
         };
         if let Some(value) = validated_stage {
-            // M2：customer_stage 实际变化时同步刷新 customer_stage_updated_at（归一后再比较）。
+            // M2:customer_stage 实际变化时同步刷新 customer_stage_updated_at(归一后再比较)。
             let prev = contact_domain_str(contact, "customer_stage");
             let stage_changed = prev.as_deref().map(|s| s != value.as_str()).unwrap_or(true);
             insert_domain_stage_fields(&mut set_doc, Some(&value), intent.as_deref(), stage_changed);
         } else if intent.is_some() {
-            // stage 被 drop 但 intent 通过：仍写 intent（stage_changed=false，不刷 stage 计时）。
+            // stage 越界/缺席但 intent 通过:仍写 intent(stage_changed=false,不刷 stage 计时)。
             insert_domain_stage_fields(&mut set_doc, None, intent.as_deref(), false);
         }
+        // stage 与 intent 都 None(都越界被跳过)→ 不调 insert_domain_stage_fields,
+        // 守住 set_doc 空判不变量(否则会凭空写 domain_attributes_updated_at)。
     } else if let Some(value) = doc_get_string(changes, "intentLevel") {
-        let validated = apply_admin_dim_validation(
-            agent::dimension_registry::validate_dimension_value(
-                &state.db,
-                "intent_level",
-                &value,
-                &contact.account_id,
-                agent::dimension_registry::WriteIntent::AdminWrite,
-            )
-            .await,
-        )?;
+        use crate::agent::dimension_registry::DimValidation::{Accept, DropSilently, Reject};
+        let validated = match agent::dimension_registry::validate_dimension_value(
+            &state.db,
+            "intent_level",
+            &value,
+            &contact.account_id,
+            agent::dimension_registry::WriteIntent::AdminWrite,
+        )
+        .await
+        {
+            Accept(s) => Some(s),
+            DropSilently => None,
+            Reject(reason) => {
+                skipped.push(SkippedField {
+                    field: "intentLevel".to_string(),
+                    reason,
+                });
+                None
+            }
+        };
         if let Some(value) = validated {
             insert_domain_stage_fields(&mut set_doc, None, Some(&value), false);
         }
@@ -637,13 +678,13 @@ pub(super) async fn apply_contact_changes(
         set_doc.insert("follow_up_policy", value);
     }
     if let Some(value) = doc_get_string(changes, "operationState") {
-        // 修复（问题 F）：admin 手改 operation_state 也必须过状态机迁移闸，与 AI 决策
-        // 路径（gateway C2）同一道 check_state_transition。此前 admin 直写不校验，可置入
-        // 与 customer_stage / 状态机矛盾的值（甚至状态机里不存在的态），造成 planner（读
-        // customer_stage）与 policy enforcement（读 operation_state）口径漂移，且休眠
-        // contact 无 AI 消息触发 C2 自愈时漂移无限期。admin 是交互操作 → 非法迁移**硬拒**
-        // （BadRequest），让操作者立即看到而非静默吞。domain_config=None（未配状态机）时
-        // check_state_transition fail-open，行为不变。
+        // 修复（问题 F）：operation_state 也必须过状态机迁移闸，与 AI 决策路径（gateway
+        // C2）同一道 check_state_transition。此前直写不校验，可置入与 customer_stage / 状态机
+        // 矛盾的值（甚至状态机里不存在的态），造成 planner（读 customer_stage）与 policy
+        // enforcement（读 operation_state）口径漂移，且休眠 contact 无 AI 消息触发 C2 自愈时
+        // 漂移无限期。本函数是 guide 路径（LLM 产值）：非法迁移**记 skipped 跳过**该字段、
+        // 其余合法字段照落（手动表单 contacts.rs 仍硬拒 BadRequest，人是权威）。
+        // domain_config=None（未配状态机）时 check_state_transition fail-open，照写不变。
         let domain_config = agent::load_user_operation_domain_config_for_contact(
             state,
             &contact.workspace_id,
@@ -655,12 +696,16 @@ pub(super) async fn apply_contact_changes(
             contact.operation_state.as_deref(),
             &value,
         ) {
-            return Err(AppError::BadRequest(format!(
-                "非法的 operation_state 迁移：{reason}（admin 手改也须符合状态机；如需任意设值请先调整状态机定义）"
-            )));
+            // guide 路径:LLM 产的非法迁移 → 记 skipped 跳过该字段(不像 contacts.rs 手动表单
+            // 硬拒 400),其余合法字段照落。domain_config=None 时 check 返回 None,照写不变。
+            skipped.push(SkippedField {
+                field: "operationState".to_string(),
+                reason: format!("非法的 operation_state 迁移:{reason}"),
+            });
+        } else {
+            set_doc.insert("operation_state", value);
+            set_doc.insert("operation_state_updated_at", DateTime::now());
         }
-        set_doc.insert("operation_state", value);
-        set_doc.insert("operation_state_updated_at", DateTime::now());
     }
     if let Some(value) = doc_get_string(changes, "operationStateReason") {
         set_doc.insert("operation_state_reason", value);
@@ -669,7 +714,7 @@ pub(super) async fn apply_contact_changes(
         set_doc.insert("operation_policy", value.clone());
     }
     if set_doc.is_empty() {
-        return Ok(());
+        return Ok(skipped);
     }
     set_doc.insert("updated_at", DateTime::now());
     state
@@ -677,7 +722,7 @@ pub(super) async fn apply_contact_changes(
         .contacts()
         .update_one(doc! { "_id": contact.id }, doc! { "$set": set_doc }, None)
         .await?;
-    Ok(())
+    Ok(skipped)
 }
 
 pub(super) async fn apply_memory_changes(
@@ -816,7 +861,27 @@ pub(super) fn build_guide_preview_prompt(
     playbook: Option<&OperationPlaybook>,
     review: Option<&AgentDecisionReview>,
     health: &Value,
+    legal_states: &[String],
+    stage_values: &[(String, String)],
+    intent_values: &[(String, String)],
 ) -> String {
+    let render_states = if legal_states.is_empty() {
+        "暂无受控取值,留空此字段(不要臆造)".to_string()
+    } else {
+        legal_states.join(" / ")
+    };
+    let render_pairs = |vals: &[(String, String)]| -> String {
+        if vals.is_empty() {
+            "暂无受控取值,留空此字段(不要臆造)".to_string()
+        } else {
+            vals.iter()
+                .map(|(id, label)| format!("{id}({label})"))
+                .collect::<Vec<_>>()
+                .join(" / ")
+        }
+    };
+    let render_stages = render_pairs(stage_values);
+    let render_intents = render_pairs(intent_values);
     format!(
         r#"请为微信用户运营 Agent 生成一份“修改预览”，不要直接输出聊天话术。
 
@@ -901,7 +966,12 @@ wxid：{}
 
 最近复盘：{}
 
-当前健康度：{}"#,
+当前健康度：{}
+
+可选枚举字段的合法取值(只能从下列里选,留空表示不改;绝不能臆造下列以外的值):
+- operationState 合法值：{}
+- customerStage 合法值：{}
+- intentLevel 合法值：{}"#,
         mode,
         instruction,
         contact.wxid,
@@ -919,7 +989,10 @@ wxid：{}
         review
             .and_then(|item| item.review_summary.clone())
             .unwrap_or_else(|| "暂无".to_string()),
-        serde_json::to_string(health).unwrap_or_default()
+        serde_json::to_string(health).unwrap_or_default(),
+        render_states,
+        render_stages,
+        render_intents
     )
 }
 
@@ -2017,5 +2090,126 @@ mod tests {
 
         let projected = operation_health_json(&contact, &memory, Some(&review));
         crate::routes::contract_snapshot::assert_contract_fixture("operation_health", projected);
+    }
+
+    /// Task 5：build_guide_preview_prompt 注入合法值文本契约。
+    #[test]
+    fn guide_prompt_injects_legal_values() {
+        use super::build_guide_preview_prompt;
+        use crate::models::{AgentStatus, Contact, MemoryCardTyped, OperatingMemory};
+        use mongodb::bson::{DateTime, Document};
+
+        // build_guide_preview_prompt 只读 Contact 的少数字段;Contact 无 Default,全字段构造。
+        let contact = Contact {
+            id: None,
+            workspace_id: "default".to_string(),
+            account_id: "default".to_string(),
+            wxid: "wx_prompt".to_string(),
+            nickname: None,
+            remark: None,
+            alias: None,
+            agent_status: AgentStatus::Managed,
+            human_profile_note: None,
+            custom_agent_instructions: None,
+            operation_mode_override: None,
+            agent_profile: None,
+            memory_summary: None,
+            playbook_id: None,
+            playbook_version: None,
+            manual_tags: Vec::new(),
+            manual_tags_updated_at: None,
+            manual_tags_by: None,
+            confirmed_tags: Vec::new(),
+            bayesian_signals: Vec::new(),
+            personality_profile: None,
+            tags_version: 0,
+            domain_attributes: None,
+            domain_attributes_updated_at: None,
+            commitments: Vec::new(),
+            follow_up_policy: None,
+            operation_state: Some("new_contact".to_string()),
+            operation_state_reason: None,
+            operation_state_confidence: None,
+            operation_state_updated_at: None,
+            cooldown_until: None,
+            operation_policy: Document::new(),
+            profile_attributes: Document::new(),
+            profile_updated_at: None,
+            last_message_at: None,
+            last_inbound_at: None,
+            last_outbound_at: None,
+            last_agent_run_at: None,
+            last_outbound_style: None,
+            intent_trajectory: Vec::new(),
+            outcome_events: Vec::new(),
+            locale: None,
+            created_at: DateTime::now(),
+            updated_at: DateTime::now(),
+        };
+        let memory = OperatingMemory {
+            id: None,
+            workspace_id: "default".to_string(),
+            account_id: "default".to_string(),
+            contact_wxid: "wx_prompt".to_string(),
+            user_understanding: Document::new(),
+            relationship_state: Document::new(),
+            product_fit: Document::new(),
+            next_action: Document::new(),
+            context_pack: Document::new(),
+            context_pack_version: 0,
+            context_pack_updated_at: None,
+            memory_card: MemoryCardTyped::default(),
+            memory_card_version: 0,
+            memory_card_updated_at: None,
+            created_at: DateTime::now(),
+            updated_at: DateTime::now(),
+        };
+        let health = serde_json::json!({});
+
+        // 有合法值:输出含状态机 key + 字典中文标签 + "合法值"字样。
+        let legal_states = vec!["new_contact".to_string(), "need_discovery".to_string()];
+        let stage_values = vec![
+            ("new_contact".to_string(), "初始了解".to_string()),
+            ("need_discovery".to_string(), "需求探索".to_string()),
+        ];
+        let intent_values = vec![
+            ("high".to_string(), "高意向".to_string()),
+            ("low".to_string(), "低意向".to_string()),
+        ];
+        let prompt = build_guide_preview_prompt(
+            "标记成高意向",
+            "smart",
+            &contact,
+            &memory,
+            None,
+            None,
+            &health,
+            &legal_states,
+            &stage_values,
+            &intent_values,
+        );
+        assert!(prompt.contains("合法值"), "应注入'合法值'引导段");
+        assert!(prompt.contains("need_discovery"), "应含状态机/字典 canonical key");
+        assert!(prompt.contains("高意向"), "应含字典中文标签");
+
+        // 空切片:输出"暂无受控取值"兜底,不 panic。
+        let empty: Vec<String> = vec![];
+        let empty_pairs: Vec<(String, String)> = vec![];
+        let prompt_empty = build_guide_preview_prompt(
+            "标记成高意向",
+            "smart",
+            &contact,
+            &memory,
+            None,
+            None,
+            &health,
+            &empty,
+            &empty_pairs,
+            &empty_pairs,
+        );
+        assert!(
+            prompt_empty.contains("暂无受控取值"),
+            "空字典应输出'暂无受控取值'兜底"
+        );
     }
 }

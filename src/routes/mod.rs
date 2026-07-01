@@ -139,6 +139,7 @@ pub mod ext_knowledge {
     pub use super::knowledge::{update_operation_knowledge_chunk, OperationKnowledgeChunkRequest};
 }
 pub use shared::upsert_contact_from_value;
+pub use shared::{apply_contact_changes, SkippedField};
 
 use accounts::{list_accounts, sync_accounts, update_account_mcp_key};
 use admin_ops_versions::{
@@ -1145,6 +1146,10 @@ mod tests {
             // chat_turn / chat_task 复用、不直接绑 HTTP；knowledge_chat_apply_integration.rs
             // 通过 `pub` 直调断言"AI 永不自动 verify"红线。
             "apply_create_chunk",
+            // shared.rs：guide apply 的 contact 字段落库内核(越界字段跳过返 SkippedField)，
+            // 被 guides.rs::apply handler 复用、不直接绑 HTTP；guide_apply_partial_validation
+            // 集成测试通过 `pub` 直调断言部分应用语义(越界 skip / 合法字段落库)。
+            "apply_contact_changes",
         ];
 
         let mut handlers: Vec<&str> = Vec::new();
