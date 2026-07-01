@@ -66,3 +66,44 @@ pub struct AuthenticatedAdmin {
 
 /// session cookie 名。固定字面量，前后端约定一致。
 pub const SESSION_COOKIE_NAME: &str = "wa_session";
+
+/// 判定 `resolved` workspace 是否在 admin 的允许列表内。
+/// 空列表 = 单租户回落语义：只允许默认 workspace（与 `switch_workspace` 同源）。
+pub fn is_workspace_authorized(
+    resolved: &str,
+    user_workspaces: &[String],
+    default_workspace_id: &str,
+) -> bool {
+    if user_workspaces.is_empty() {
+        resolved == default_workspace_id
+    } else {
+        user_workspaces.iter().any(|w| w == resolved)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn empty_acl_allows_only_default_workspace() {
+        let acl: Vec<String> = vec![];
+        assert!(is_workspace_authorized("default", &acl, "default"));
+        assert!(!is_workspace_authorized("other", &acl, "default"));
+    }
+
+    #[test]
+    fn non_empty_acl_allows_only_contained() {
+        let acl = vec!["ws_a".to_string(), "ws_b".to_string()];
+        assert!(is_workspace_authorized("ws_a", &acl, "default"));
+        assert!(is_workspace_authorized("ws_b", &acl, "default"));
+        // 非空 ACL 下 default 不在列表 → 拒绝（不因 default 特殊放行）
+        assert!(!is_workspace_authorized("default", &acl, "default"));
+    }
+
+    #[test]
+    fn non_empty_acl_rejects_outsider() {
+        let acl = vec!["ws_a".to_string()];
+        assert!(!is_workspace_authorized("ws_evil", &acl, "default"));
+    }
+}

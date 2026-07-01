@@ -35,6 +35,7 @@ use crate::{
 };
 
 use super::AppState;
+use super::shared::resolve_authorized_workspace;
 
 /// api_key mask：复用 [`crate::secret::mask_secret`]（保留前 3 + 后 4，
 /// 中间 `****`）。本路由保留 `mask_api_key` 名称是为兼容已有调用站点；
@@ -95,14 +96,14 @@ pub struct ListQuery {
     workspace_id: Option<String>,
 }
 
-pub(super) async fn list_providers(
+// pub（非默认私有）：h3_cross_tenant_idor.rs 集成测试需从 tests/ 直调
+// list_providers 验证跨租户读泄漏被拒,仿 activate_provider 先例。
+pub async fn list_providers(
     State(state): State<AppState>,
     Extension(admin): Extension<AuthenticatedAdmin>,
     Query(params): Query<ListQuery>,
 ) -> AppResult<Json<Value>> {
-    let workspace_id = params
-        .workspace_id
-        .unwrap_or_else(|| admin.current_workspace.clone());
+    let workspace_id = resolve_authorized_workspace(&state, &admin, params.workspace_id).await?;
     let mut cursor = state
         .db
         .llm_provider_configs()
@@ -149,10 +150,7 @@ pub(super) async fn create_provider(
     Extension(admin): Extension<AuthenticatedAdmin>,
     Json(body): Json<UpsertRequest>,
 ) -> AppResult<Json<Value>> {
-    let workspace_id = body
-        .workspace_id
-        .clone()
-        .unwrap_or_else(|| admin.current_workspace.clone());
+    let workspace_id = resolve_authorized_workspace(&state, &admin, body.workspace_id.clone()).await?;
     LlmFormat::parse(&body.format)?;
     if body.provider_id.trim().is_empty() {
         return Err(AppError::BadRequest("providerId 不能为空".to_string()));
@@ -208,10 +206,7 @@ pub(super) async fn update_provider(
     Path(provider_id): Path<String>,
     Json(body): Json<UpsertRequest>,
 ) -> AppResult<Json<Value>> {
-    let workspace_id = body
-        .workspace_id
-        .clone()
-        .unwrap_or_else(|| admin.current_workspace.clone());
+    let workspace_id = resolve_authorized_workspace(&state, &admin, body.workspace_id.clone()).await?;
     LlmFormat::parse(&body.format)?;
     let existing = state
         .db
@@ -281,10 +276,7 @@ pub(super) async fn delete_provider(
     Path(provider_id): Path<String>,
     Query(params): Query<ListQuery>,
 ) -> AppResult<Json<Value>> {
-    let workspace_id = params
-        .workspace_id
-        .clone()
-        .unwrap_or_else(|| admin.current_workspace.clone());
+    let workspace_id = resolve_authorized_workspace(&state, &admin, params.workspace_id.clone()).await?;
     let existing = state
         .db
         .llm_provider_configs()
@@ -316,10 +308,7 @@ pub async fn activate_provider(
     Path(provider_id): Path<String>,
     Query(params): Query<ListQuery>,
 ) -> AppResult<Json<Value>> {
-    let workspace_id = params
-        .workspace_id
-        .clone()
-        .unwrap_or_else(|| admin.current_workspace.clone());
+    let workspace_id = resolve_authorized_workspace(&state, &admin, params.workspace_id.clone()).await?;
     let target = state
         .db
         .llm_provider_configs()
@@ -383,10 +372,7 @@ pub(super) async fn set_vision_active(
     Path(provider_id): Path<String>,
     Json(body): Json<VisionActivateRequest>,
 ) -> AppResult<Json<Value>> {
-    let workspace_id = body
-        .workspace_id
-        .clone()
-        .unwrap_or_else(|| admin.current_workspace.clone());
+    let workspace_id = resolve_authorized_workspace(&state, &admin, body.workspace_id.clone()).await?;
     let target = state
         .db
         .llm_provider_configs()
@@ -455,10 +441,7 @@ pub(super) async fn test_provider(
     Extension(admin): Extension<AuthenticatedAdmin>,
     Json(body): Json<TestRequest>,
 ) -> AppResult<Json<Value>> {
-    let workspace_id = body
-        .workspace_id
-        .clone()
-        .unwrap_or_else(|| admin.current_workspace.clone());
+    let workspace_id = resolve_authorized_workspace(&state, &admin, body.workspace_id.clone()).await?;
     let (format, base_url, api_key, model, timeout) = if let Some(pid) = body
         .provider_id
         .as_ref()

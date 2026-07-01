@@ -48,7 +48,7 @@ use crate::{
     models::DomainProfile,
 };
 
-use super::shared::parse_object_id;
+use super::shared::{parse_object_id, resolve_authorized_workspace};
 use super::AppState;
 
 #[derive(Debug, Deserialize)]
@@ -65,10 +65,7 @@ pub(super) async fn list_domain_profiles(
     Extension(admin): Extension<AuthenticatedAdmin>,
     Query(params): Query<ListQuery>,
 ) -> AppResult<Json<Value>> {
-    let workspace_id = params
-        .workspace_id
-        .clone()
-        .unwrap_or_else(|| admin.current_workspace.clone());
+    let workspace_id = resolve_authorized_workspace(&state, &admin, params.workspace_id.clone()).await?;
     let mut filter = doc! { "workspace_id": &workspace_id };
     if !params.include_all_versions {
         filter.insert("current_version", true);
@@ -168,10 +165,7 @@ pub async fn create_domain_profile(
     Extension(admin): Extension<AuthenticatedAdmin>,
     Json(body): Json<UpsertRequest>,
 ) -> AppResult<Json<Value>> {
-    let workspace_id = body
-        .workspace_id
-        .clone()
-        .unwrap_or_else(|| admin.current_workspace.clone());
+    let workspace_id = resolve_authorized_workspace(&state, &admin, body.workspace_id.clone()).await?;
     if body.profile_id.trim().is_empty() {
         return Err(AppError::BadRequest("profileId 不能为空".to_string()));
     }
