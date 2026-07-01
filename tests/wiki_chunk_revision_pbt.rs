@@ -2,7 +2,7 @@
 //!
 //! 8 个 property（plan §F + §8 锁定）：
 //!
-//! 1. **locked_field_rejection** — patch 含 `chunk_id/wiki_type/created_at/source_anchor/
+//! 1. **locked_field_rejection** — patch 含 `chunk_id/wiki_type/chunk_type/created_at/source_anchor/
 //!    verified_at/verified_by/approved_at` 任一 → `apply_field_patch` 必返
 //!    `RevisionError::LockedFieldInPatch`。
 //! 2. **array_union_monotonic** — `union_array_fields` 输出集合 ⊇ existing ∪ patch。
@@ -47,7 +47,7 @@ fn vec_to_bson(v: &[String]) -> Bson {
 // ── Property 1：locked_field_rejection ────────────────────────────────
 
 proptest! {
-    /// patch 含任意 7 个锁定字段之一 → apply_field_patch 必返 LockedFieldInPatch。
+    /// patch 含任意 8 个锁定字段之一 → apply_field_patch 必返 LockedFieldInPatch。
     #[test]
     fn locked_field_rejection(
         locked_idx in 0usize..DEFAULT_LOCKED_FIELDS.len(),
