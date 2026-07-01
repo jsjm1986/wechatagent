@@ -386,13 +386,13 @@ source_anchors: {}
         if final_status == "verified" && sample_rate > 0.0 && fastrand::f64() < sample_rate {
             final_status = "needs_human_audit".to_string();
         }
-        // 修复（问题 C-②）：product_fact 是唯一经 R5.4 成为**产品声明背书**的 chunk 类
-        // （models.rs chunk_type 文档：仅 verified product_fact 可用作产品声明）。auto-verify
-        // 让它仅凭 LLM 自评直接 verified → agent 会据 AI 自己背书的 chunk 对客户报价/承诺，
-        // 实质架空「verified 需人把关」红线。故 product_fact 类一律强制 needs_human_audit，
-        // 绝不经 auto-verify 直 verified（无论抽样是否命中）。其他三类（style_template /
-        // peer_case / negative_example）不进产品报价链路，不受影响。
-        final_status = enforce_product_claim_human_audit(final_status, &chunk.chunk_type);
+        // ①-a：auto-verify **对所有 chunk_type 都不得直 verified**。依据 CLAUDE.md 红线
+        // 「AI 永不自动 verify」适用于所有类型知识：auto-verify 仅凭 LLM 自评 + 证据闸不足以
+        // 替代运营核验，一律强制 needs_human_audit（无论抽样是否命中）。auto-verify 退化为
+        // "预审分诊"——过闸的挑出来等运营重点看，绝不自动放行。product_fact 更是唯一经 R5.4
+        // 成为产品声明背书的类型（models.rs chunk_type 文档），一旦直 verified 会让 agent 据
+        // AI 自己背书的 chunk 对客户报价，风险最高；其余三类同样不放行。
+        final_status = enforce_verified_needs_human_audit(final_status);
 
         match final_status.as_str() {
             "verified" => verified += 1,
@@ -403,7 +403,7 @@ source_anchors: {}
 
         // D2：auto_verify 的每条裁决也接回 apply_chunk_revision，留 chunk_revisions
         // 审计痕迹。**source=Rule**（非 Human）：裁决由 LLM 自评 + 规则闸门
-        // （decide_auto_verify_status + enforce_product_claim_human_audit + 抽样）做出，
+        // （decide_auto_verify_status + enforce_verified_needs_human_audit + 抽样）做出，
         // admin 只触发了批处理、并未逐条审定——标 Rule 才如实反映"规则化批处理写入"，
         // 避免审计按 source 过滤时误判"运营逐条审定了这条"。created_by="auto_verify" 进一步
         // 标识自动来源。perf：每条多一次 find_one+hash+revision insert+replace_one，但本循环
@@ -538,20 +538,15 @@ pub fn decide_auto_verify_status(
     "needs_review".to_string()
 }
 
-/// 修复（问题 C-②）：产品声明类（`product_fact`）chunk 的 auto-verify **不得直 verified**，
-/// 强制降级 `needs_human_audit` 等人审。
+/// ①-a：auto-verify 的最终状态若为 `verified`，强制降级 `needs_human_audit`——
+/// **对所有 chunk_type 生效**。依据：CLAUDE.md 红线「AI 永不自动 verify」适用于
+/// 所有类型知识；auto-verify 仅凭 LLM 自评 + 证据闸不足以替代运营核验。auto-verify
+/// 退化为"预审分诊"：过闸的挑出来等运营重点看，绝不自动放行。
 ///
-/// 性质：仅当 `final_status == "verified"` 且 `chunk_type == "product_fact"` 时降级为
-/// `needs_human_audit`；其它一律原样返回。
-///
-/// 依据：`product_fact` 是 4 类 chunk_type 里**唯一**经 R5.4（gates 产品声明背书闸）
-/// 成为产品报价/承诺合法背书的类型（见 `models::OperationKnowledgeChunk::chunk_type`
-/// 文档）。auto-verify 让它仅凭 LLM 自评 + provenance 地板就直 verified，会让 agent 据
-/// AI 自己背书的 chunk 对客户报价——实质架空「AI 永不自动 verify / verified 需人把关」
-/// 红线。其他三类（`style_template` / `peer_case` / `negative_example`）不进产品报价
-/// 链路，auto-verify 直 verified 无报错价风险，故不降级。
-pub fn enforce_product_claim_human_audit(final_status: String, chunk_type: &str) -> String {
-    if final_status == "verified" && chunk_type == "product_fact" {
+/// 性质：仅当 `final_status == "verified"` 时降级；其它（rejected / needs_review /
+/// needs_human_audit）一律原样返回。
+pub fn enforce_verified_needs_human_audit(final_status: String) -> String {
+    if final_status == "verified" {
         return "needs_human_audit".to_string();
     }
     final_status
@@ -564,25 +559,27 @@ mod tests {
     /// 修复 C-②：product_fact 的 verified 被强制降级 needs_human_audit（堵报错价链路）。
     #[test]
     fn product_fact_verified_forced_to_human_audit() {
-        let s = enforce_product_claim_human_audit("verified".to_string(), "product_fact");
+        let s = enforce_verified_needs_human_audit("verified".to_string());
         assert_eq!(s, "needs_human_audit", "product_fact 不得经 auto-verify 直 verified");
     }
 
-    /// 修复 C-②：非 product_fact 类的 verified 不降级（不进产品报价链路，无报错价风险）。
+    /// ①-a：auto-verify 对**所有** chunk_type 的 verified 都强制降级 needs_human_audit
+    /// （AI 永不自动 verify 适用所有类型，不只 product_fact）。
     #[test]
-    fn non_product_fact_verified_kept() {
-        for ct in ["style_template", "peer_case", "negative_example"] {
-            let s = enforce_product_claim_human_audit("verified".to_string(), ct);
-            assert_eq!(s, "verified", "{ct} 不应被降级");
+    fn all_types_verified_forced_to_human_audit() {
+        for ct in ["product_fact", "style_template", "peer_case", "negative_example"] {
+            let _ = ct; // 类型不再影响判定；保留循环表达"覆盖全类型"意图
+            let s = enforce_verified_needs_human_audit("verified".to_string());
+            assert_eq!(s, "needs_human_audit", "所有类型的 verified 都必须降级");
         }
     }
 
     /// 修复 C-②：非 verified 终态（needs_review / rejected / needs_human_audit）原样透传，
-    /// 即便是 product_fact——只拦"verified"这一档，不影响 reject/缺证据降级。
+    /// 只拦"verified"这一档，不影响 reject/缺证据降级。
     #[test]
     fn product_fact_non_verified_passthrough() {
         for st in ["needs_review", "rejected", "needs_human_audit"] {
-            let s = enforce_product_claim_human_audit(st.to_string(), "product_fact");
+            let s = enforce_verified_needs_human_audit(st.to_string());
             assert_eq!(s, st, "非 verified 终态应原样透传");
         }
     }

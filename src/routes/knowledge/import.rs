@@ -51,6 +51,79 @@ pub(in crate::routes) struct OperationKnowledgeImportApplyRequest {
     chunked_text: Option<String>,
 }
 
+/// 长文本导入抽取 prompt 的静态模板（user 消息）。
+/// `{SOURCE_NAME}` / `{CONTENT}` 两个占位符在运行时用 `.replace()` 填充。
+/// 抽成模块级 const 以便字符串锁定测试断言其内容（`format!` 需要字面量格式串，
+/// 无法直接取到运行时局部变量里的模板文本）。
+const LONG_IMPORT_PROMPT_TEMPLATE: &str = r#"请把下面文本拆分为渐进式运营知识。输出 JSON：
+{
+  "document": {
+    "domain": "user_operations",
+    "sourceType": "imported_markdown",
+    "sourceName": "{SOURCE_NAME}",
+    "title": "",
+    "summary": "",
+    "catalogSummary": "给 Agent 看的目录摘要，说明这份文档解决什么问题、何时应该打开",
+    "routingMap": ["自然语言目录项，不使用固定分类"],
+    "riskNotes": ["不能承诺、证据不足或需要 admin 后台确认的风险点"],
+    "productTags": ["产品/品牌/解决方案名称，最多 5 个，可空"],
+    "businessTopics": ["业务主题（如 产品定位差异 / 竞品对比 / 部署方式），最多 3 个，可空"],
+    "status": "draft"
+  },
+  "items": [
+    {
+      "domain": "user_operations",
+      "category": "用自然语言生成的主题标签，不要使用固定枚举",
+      "businessType": "用自然语言说明业务语境，不要使用固定枚举",
+      "knowledgeType": "AI 自主生成的知识类型",
+      "businessContext": "这条知识适合的业务上下文",
+      "title": "",
+      "summary": "",
+      "body": "",
+      "applicableScenes": [],
+      "notApplicableScenes": [],
+      "productTags": ["最多 5 个，可空"],
+      "businessTopics": ["最多 3 个，可空"],
+      "sourceType": "imported_markdown",
+      "sourceName": "{SOURCE_NAME}",
+      "status": "draft",
+      "priority": 0
+    }
+  ],
+  "chunks": [
+    {
+      "domain": "user_operations",
+      "wikiType": "9 类之一：source/entity/concept/comparison/synthesis/methodology/finding/query/thesis。按知识形态选：有步骤/分支的方法→methodology；具体数据点/案例事实→finding；纯定义→concept；多源综述→synthesis；带论据的判断/主张→thesis；FAQ→query；单一实体→entity；原始出处→source；对比→comparison",
+      "chunkType": "4 类之一：product_fact（可对客户承诺的产品事实，需核验背书）/ style_template（语气模板）/ peer_case（同行案例参考，不作产品承诺）/ negative_example（不该做的反例）。绝大多数产品/服务事实类知识填 product_fact",
+      "knowledgeType": "AI 自主生成的切片类型",
+      "businessContext": "业务上下文",
+      "title": "",
+      "summary": "",
+      "body": "可被 Agent 按需打开的原文要点或经过整理的知识正文",
+      "applicableScenes": [],
+      "notApplicableScenes": [],
+      "productTags": ["如：WechatAgent / AI 私域销售助手；最多 5 个；可空"],
+      "businessTopics": ["如：产品定位差异 / 竞品对比；最多 3 个；可空"],
+      "sourceQuote": "如有必要，保留支撑该切片的原文短句",
+      "status": "draft",
+      "priority": 0
+    }
+  ]
+}
+
+要求：
+- 不要用固定枚举分类；知识类型、适用场景、目录项都用自然语言生成。
+- document 是整篇资料的目录入口；items 是主题包；chunks 是 Agent 运行时真正按需打开的知识切片。
+- 穷尽且忠实抽取：原文中每一个量化事实（数字/比例/金额/期限/数量）及其**限定条件**（起售门槛、前置要求、适用范围、例外、有效期等）都必须落入对应 chunk 的 body，**绝不能丢掉限定条件**只留主数字（例："X 元起，含 N 个起"必须连"含 N 个起"一起保留）。一条原子承载一个规格/事实时尤其要完整。
+- 穷尽覆盖的对象不止量化事实：原文里每一个**离散信息单元**都要落地，不要因为它没有数字就漏掉。离散信息单元包括但不限于——决议/结论、动作项/待办及其**责任人与截止日期**、分项条款、流程步骤、各方观点、适用与不适用条件。例如会议纪要类文档，每一条决议、每一项待办（连同谁负责、何时完成）都必须各自落入 body，绝不能只总结成一句"会上讨论了若干事项"。判断标准：原文每一个可独立成立、能被单独追溯核对的陈述，都应在抽取结果里找得到对应内容。
+- 只忠于原文：body、summary 只能包含原文已陈述的内容，**禁止补充原文没有的描述、范围、功能、优惠条件或推断**。拿不准是否在原文里，就不写。
+- 案例、报价、效果数据必须完整落入对应 chunk 的 body；没有证据不要编造成案例。
+- productTags / businessTopics 用于运行时把用户消息匹配到对应 chunk。
+- document 级 productTags / businessTopics 可以是其下所有 chunks 的去重并集，也可由 LLM 自行抽取。
+
+导入文本：
+{CONTENT}"#;
+
 pub async fn import_operation_knowledge_preview(
     State(state): State<AppState>,
     Json(payload): Json<OperationKnowledgeImportRequest>,
@@ -63,93 +136,9 @@ pub async fn import_operation_knowledge_preview(
         .source_name
         .clone()
         .unwrap_or_else(|| "导入文本".to_string());
-    let user = format!(
-        r#"请把下面文本拆分为渐进式运营知识。输出 JSON：
-{{
-  "document": {{
-    "domain": "user_operations",
-    "sourceType": "imported_markdown",
-    "sourceName": "{}",
-    "title": "",
-    "summary": "",
-    "catalogSummary": "给 Agent 看的目录摘要，说明这份文档解决什么问题、何时应该打开",
-    "routingMap": ["自然语言目录项，不使用固定分类"],
-    "riskNotes": ["不能承诺、证据不足或需要 admin 后台确认的风险点"],
-    "productTags": ["产品/品牌/解决方案名称，最多 5 个，可空"],
-    "businessTopics": ["业务主题（如 产品定位差异 / 竞品对比 / 部署方式），最多 3 个，可空"],
-    "status": "draft"
-  }},
-  "items": [
-    {{
-      "domain": "user_operations",
-      "category": "用自然语言生成的主题标签，不要使用固定枚举",
-      "businessType": "用自然语言说明业务语境，不要使用固定枚举",
-      "knowledgeType": "AI 自主生成的知识类型",
-      "businessContext": "这条知识适合的业务上下文",
-      "title": "",
-      "summary": "",
-      "body": "",
-      "routingCard": "什么时候应该使用这条知识，什么时候不该使用",
-      "applicableScenes": [],
-      "notApplicableScenes": [],
-      "suitableFor": [],
-      "notSuitableFor": [],
-      "customerStages": [],
-      "operationStates": [],
-      "intentLevels": [],
-      "safeClaims": [],
-      "forbiddenClaims": [],
-      "commonQuestions": [],
-      "commonObjections": [],
-      "evidenceItems": [],
-      "productTags": ["最多 5 个，可空"],
-      "businessTopics": ["最多 3 个，可空"],
-      "sourceType": "imported_markdown",
-      "sourceName": "{}",
-      "status": "draft",
-      "priority": 0
-    }}
-  ],
-  "chunks": [
-    {{
-      "domain": "user_operations",
-      "knowledgeType": "AI 自主生成的切片类型",
-      "businessContext": "业务上下文",
-      "title": "",
-      "summary": "",
-      "body": "可被 Agent 按需打开的原文要点或经过整理的知识正文",
-      "routingCard": "什么时候打开这个切片",
-      "applicableScenes": [],
-      "notApplicableScenes": [],
-      "safeClaims": [],
-      "forbiddenClaims": [],
-      "evidenceItems": [],
-      "productTags": ["如：WechatAgent / AI 私域销售助手；最多 5 个；可空"],
-      "businessTopics": ["如：产品定位差异 / 竞品对比；最多 3 个；可空"],
-      "sourceQuote": "如有必要，保留支撑该切片的原文短句",
-      "status": "draft",
-      "priority": 0
-    }}
-  ]
-}}
-
-要求：
-- 不要用固定枚举分类；知识类型、适用场景、目录项都用自然语言生成。
-- document 是整篇资料的目录入口；items 是主题包；chunks 是 Agent 运行时真正按需打开的知识切片。
-- 穷尽且忠实抽取：原文中每一个量化事实（数字/比例/金额/期限/数量）及其**限定条件**（起售门槛、前置要求、适用范围、例外、有效期等）都必须落入对应 chunk 的 body，**绝不能丢掉限定条件**只留主数字（例："X 元起，含 N 个起"必须连"含 N 个起"一起保留）。一条原子承载一个规格/事实时尤其要完整。
-- 穷尽覆盖的对象不止量化事实：原文里每一个**离散信息单元**都要落地，不要因为它没有数字就漏掉。离散信息单元包括但不限于——决议/结论、动作项/待办及其**责任人与截止日期**、分项条款、流程步骤、各方观点、适用与不适用条件。例如会议纪要类文档，每一条决议、每一项待办（连同谁负责、何时完成）都必须各自落入 body，绝不能只总结成一句"会上讨论了若干事项"。判断标准：原文每一个可独立成立、能被单独追溯核对的陈述，都应在抽取结果里找得到对应内容。
-- 只忠于原文：body、summary、safeClaims、evidenceItems 只能包含原文已陈述的内容，**禁止补充原文没有的描述、范围、功能、优惠条件或推断**。拿不准是否在原文里，就不写。
-- safeClaims 必须是有依据、可安全对客户表达的事实。
-- forbiddenClaims 必须列出不能承诺、不能暗示、不能编造的内容。
-- 案例、报价、效果数据必须进入 evidenceItems；没有证据不要编造成案例。
-- routingCard 要短，供运行时知识工具选择使用，不要堆正文。
-- productTags / businessTopics 用于运行时把用户消息匹配到对应 chunk。
-- document 级 productTags / businessTopics 可以是其下所有 chunks 的去重并集，也可由 LLM 自行抽取。
-
-导入文本：
-{}"#,
-        source_name, source_name, payload.content
-    );
+    let user = LONG_IMPORT_PROMPT_TEMPLATE
+        .replace("{SOURCE_NAME}", &source_name)
+        .replace("{CONTENT}", &payload.content);
     let value = agent::generate_agent_json(
         &state,
         payload.account_id.as_deref(),
@@ -685,7 +674,7 @@ pub async fn import_operation_knowledge_apply_image(
     // 2) 拼 vision prompt：约束 LLM 输出 JSON {"fence": "..." }，让我们直接走 chunked_text 流程。
     let mime = req.mime.as_deref().unwrap_or("image/png");
     let hint = req.hint.as_deref().unwrap_or("无特定领域 hint");
-    let system_prompt = "你是知识库 chunk 抽取助手。任务：把图片中的可读文本结构化为 fence 块。每块前后用 `---CHUNK: <短安全 id，仅字母数字和连字符>---` 与 `---END CHUNK---` 包裹（结束符必须是 `---END CHUNK---`，不要写 `---END---`）。块体必须是单个 JSON 对象，至少含 `title` 字段，且 `body`/`summary`/`answer` 中至少一个非空字符串，例如 {\"title\":\"小节标题\",\"body\":\"完整正文\"}。\n\
+    let system_prompt = "你是知识库 chunk 抽取助手。任务：把图片中的可读文本结构化为 fence 块。每块前后用 `---CHUNK: <短安全 id，仅字母数字和连字符>---` 与 `---END CHUNK---` 包裹（结束符必须是 `---END CHUNK---`，不要写 `---END---`）。块体必须是单个 JSON 对象，至少含 `title` 字段，且 `body`/`summary`/`answer` 中至少一个非空字符串，例如 {\"title\":\"小节标题\",\"body\":\"完整正文\"}。块体 JSON 可选带 \"wikiType\"（9 类知识形态之一：source/entity/concept/comparison/synthesis/methodology/finding/query/thesis）与 \"chunkType\"（4 类运营用途之一：product_fact/style_template/peer_case/negative_example，产品事实类填 product_fact）；拿不准可省略，省略时系统按默认处理。\n\
 抽取方法（原子信息单元召回，对任何图片一视同仁，不针对特定主题）：\n\
 1. 先把图片内容在脑中拆解为一组**原子信息单元**——每个单元是一条可独立成立、不可再拆的事实/条目/字段/陈述（一行表格、一个标题下的一段说明、一条编号项、一组「字段名:值」都各算一个单元）。\n\
 2. **穷尽枚举**这些单元：逐个落成 chunk，覆盖图中出现的每一个单元，不要只挑你觉得重要的几条；宁可多分几个 chunk，也不要遗漏。划分以图片自身的视觉/语义边界（标题、分栏、表格行、列表项）为准，而不是以任何预设的主题清单为准。\n\
@@ -912,3 +901,56 @@ pub async fn ingest_chunked_text(
         fallback_blob,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn long_import_prompt_carries_types_and_drops_dead_fields() {
+        // ②-c：prompt 让 LLM 产 wikiType/chunkType（类型透传的源头）
+        assert!(
+            LONG_IMPORT_PROMPT_TEMPLATE.contains("wikiType"),
+            "chunks 模板须含 wikiType"
+        );
+        assert!(
+            LONG_IMPORT_PROMPT_TEMPLATE.contains("chunkType"),
+            "chunks 模板须含 chunkType"
+        );
+        // 已删死字段不得再出现在 prompt（防未来回退）
+        for dead in ["safeClaims", "forbiddenClaims", "evidenceItems", "routingCard"] {
+            assert!(
+                !LONG_IMPORT_PROMPT_TEMPLATE.contains(dead),
+                "已删字段 {dead} 不应再出现在抽取 prompt"
+            );
+        }
+        // items 分支的已删枚举字段也不应再出现
+        for dead in [
+            "suitableFor",
+            "notSuitableFor",
+            "customerStages",
+            "operationStates",
+            "intentLevels",
+            "commonQuestions",
+            "commonObjections",
+        ] {
+            assert!(
+                !LONG_IMPORT_PROMPT_TEMPLATE.contains(dead),
+                "已删字段 {dead} 不应再出现在抽取 prompt"
+            );
+        }
+        // 护栏保留：忠于原文/不编造案例
+        assert!(
+            LONG_IMPORT_PROMPT_TEMPLATE.contains("只忠于原文"),
+            "须保留忠于原文护栏"
+        );
+        assert!(
+            LONG_IMPORT_PROMPT_TEMPLATE.contains("不要编造成案例"),
+            "须保留不编造案例护栏"
+        );
+        // 占位符仍在，运行时 .replace() 依赖
+        assert!(LONG_IMPORT_PROMPT_TEMPLATE.contains("{SOURCE_NAME}"));
+        assert!(LONG_IMPORT_PROMPT_TEMPLATE.contains("{CONTENT}"));
+    }
+}
+
