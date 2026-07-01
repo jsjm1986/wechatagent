@@ -11,10 +11,11 @@
 mod common;
 
 use axum::extract::{Extension, Path, Query, State};
+use chrono::Utc;
 use futures::TryStreamExt;
 use mongodb::bson::{doc, DateTime};
 
-use wechatagent::auth::AuthenticatedAdmin;
+use wechatagent::auth::{AdminUser, AuthenticatedAdmin};
 use wechatagent::models::LlmProviderConfig;
 use wechatagent::routes::llm_providers::activate_provider;
 
@@ -50,6 +51,28 @@ fn make_provider(ws: &str, provider_id: &str, active: bool) -> LlmProviderConfig
     }
 }
 
+/// seed 一个 user_id=llm_admin、ACL=[ws] 的 admin，让 H3 ACL 闸 get_admin_user 命中。
+/// 用 typed `Collection<AdminUser>` 写入（与生产 bootstrap_admin_if_needed 同源），
+/// created_at 走 chrono `Utc::now()` 落 RFC3339 字符串——typed 读端才能反序列化。
+async fn seed_admin(app: &TestApp, ws: &str) {
+    let user = AdminUser {
+        user_id: "llm_admin".to_string(),
+        username: "llm_admin".to_string(),
+        password_hash: "x".to_string(),
+        created_at: Utc::now(),
+        last_login_at: None,
+        workspaces: vec![ws.to_string()],
+        default_workspace: Some(ws.to_string()),
+    };
+    app.state
+        .db
+        .raw()
+        .collection::<AdminUser>("admin_users")
+        .insert_one(&user, None)
+        .await
+        .expect("seed admin");
+}
+
 /// 红线:activate target 后,同 workspace 恰好一条 isActive=true,且就是 target。
 #[tokio::test]
 #[ignore]
@@ -57,23 +80,7 @@ async fn activate_yields_exactly_one_active_and_is_target() {
     let app = TestApp::start().await;
     let ws = app.state.config.default_workspace_id.clone();
     // seed admin（user_id=llm_admin，workspaces=[ws]），让 H3 ACL 闸 get_admin_user 命中。
-    app.state
-        .db
-        .raw()
-        .collection::<mongodb::bson::Document>("admin_users")
-        .insert_one(
-            doc! {
-                "user_id": "llm_admin",
-                "username": "llm_admin",
-                "password_hash": "x",
-                "created_at": DateTime::now(),
-                "workspaces": [ &ws ],
-                "default_workspace": &ws,
-            },
-            None,
-        )
-        .await
-        .expect("seed admin");
+    seed_admin(&app, &ws).await;
     let coll = app.state.db.llm_provider_configs();
     // seed:p_old 当前 active,p_new 未激活
     coll.insert_one(make_provider(&ws, "p_old", true), None)
@@ -119,23 +126,7 @@ async fn activate_missing_provider_not_found() {
     let app = TestApp::start().await;
     let ws = app.state.config.default_workspace_id.clone();
     // seed admin（user_id=llm_admin，workspaces=[ws]），让 H3 ACL 闸 get_admin_user 命中。
-    app.state
-        .db
-        .raw()
-        .collection::<mongodb::bson::Document>("admin_users")
-        .insert_one(
-            doc! {
-                "user_id": "llm_admin",
-                "username": "llm_admin",
-                "password_hash": "x",
-                "created_at": DateTime::now(),
-                "workspaces": [ &ws ],
-                "default_workspace": &ws,
-            },
-            None,
-        )
-        .await
-        .expect("seed admin");
+    seed_admin(&app, &ws).await;
     let query: Query<wechatagent::routes::llm_providers::ListQuery> =
         Query(serde_json::from_value(serde_json::json!({})).expect("构造 ListQuery"));
     let result = activate_provider(
