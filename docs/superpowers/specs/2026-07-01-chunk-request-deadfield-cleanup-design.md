@@ -75,7 +75,7 @@
 - 实现前先 Read 确认这两个键的确切位置和该常量的其它用途，只删这两个字符串，不动其它键。
 
 ### 2.6 连带改测试
-- `preview_claim_without_source_is_rejected`（`mod.rs:1270`）：靠 safeClaims 无源触发 rejected，删字段后语义消失。**改写**为新语义（无 quote/anchor → needs_review）或删除该测试（二选一，实现时按"测试仍表达有意义的 preview 契约"原则定；若改写，断言 preview 对无源 chunk 产 needs_review 而非 rejected）。
+- `preview_claim_without_source_is_rejected`（`mod.rs:1270`）：靠 safeClaims 无源触发 rejected，删字段后语义消失。**决定：改写（不删）**——保留"preview 对无源 chunk 的判定"这条契约的测试覆盖比直接删更有价值，只把过期的 rejected 预期更新为删字段后的正确行为。具体：测试名改为 `preview_no_source_is_needs_review`（或等价名），构造去掉 safeClaims/evidenceItems（改用一个仅有 body、无 sourceQuote 的 chunk），断言 `integrityStatus == "needs_review"`（不再是 rejected），佐证"preview 恒不 auto-verify 且无源不再硬 reject（因 claim 维度已随死字段移除）"。
 - `preview_anchor_match_never_auto_verifies`（`mod.rs:1240`）：删构造里的 safeClaims/evidenceItems，保留"anchor 命中也不 auto-verify"的核心断言（这条契约不变）。
 - 遵守"测试只增量叠加"铁律的例外说明：本次是**字段删除导致的测试契约更新**（被测字段不复存在），属必要连带，非为调绿而改。
 
