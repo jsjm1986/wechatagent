@@ -329,7 +329,8 @@ async fn analyze_user_reaction(
         serde_json::to_string(&effective_memory_card(&memory).to_document())
             .unwrap_or_default(),
         serde_json::to_string(&memory).unwrap_or_default(),
-        crate::agent::prompt_isolation::isolate_untrusted(&inbound.content)
+        // H10：客户内容剥哨兵保持不变量(本 prompt 非转述契约,字节等价)。
+        crate::agent::prompt_isolation::inbound_prompt_content(&inbound.content, inbound.is_synthetic_relay)
     );
     let value = generate_agent_json(
         state,

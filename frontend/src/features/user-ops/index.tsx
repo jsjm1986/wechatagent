@@ -17,7 +17,7 @@ import { useAccountStore } from "../../stores/accountStore";
 import { useUiStore } from "../../stores/uiStore";
 import { ConfirmProvider } from "../../components/ui/ConfirmDialog";
 import { ToastProvider, useToast } from "../../components/ui/Toast";
-import { usePromptSaveConfirm } from "../../components/prompt/usePromptSaveConfirm";
+import { usePromptSaveConfirm, usePromptPublishConfirm } from "../../components/prompt/usePromptSaveConfirm";
 import type {
   Contact,
   DomainKey,
@@ -180,13 +180,14 @@ function UserOpsFeatureInner() {
     editSoul,
     newSoulDraftFor,
     createPromptTemplate,
-    publishPromptTemplate,
     editPromptTemplate,
     newPromptDraftFor
   } = strategyStore;
 
   // 路径B 二次确认：prompt 保存改为组件层经此 hook 消费 store 三态。
   const runSavePrompt = usePromptSaveConfirm();
+  // publish 同款三态二次确认：needs_human_confirm / reject 弹逐字核对框 → 带 force 重提。
+  const runPublishPrompt = usePromptPublishConfirm();
 
   const toast = useToast();
   // apply 成功后：有跳过字段就提示哪些被跳过（文案动态拼接，不硬编码字段名）。
@@ -388,7 +389,7 @@ function UserOpsFeatureInner() {
               onNewPromptTemplate={() => newPromptDraftFor("user")}
               onNewSoul={() => newSoulDraftFor("user")}
               onPromptDraft={setPromptDraft}
-              onPublishPromptTemplate={publishPromptTemplate}
+              onPublishPromptTemplate={(id) => void runPublishPrompt(id)}
               onPublishSoul={publishSoul}
               onSavePromptTemplate={(e) => { e.preventDefault(); void runSavePrompt(); }}
               onSaveSoul={(e) => { e.preventDefault(); void saveSoul(); }}

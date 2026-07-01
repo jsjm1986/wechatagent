@@ -171,7 +171,25 @@ pub async fn review_prompt_edit(
     )
     .await;
     match judge {
-        Ok(v) if v.get("violation").and_then(Value::as_bool) == Some(true) => {
+        Ok(v) => classify_review_verdict(&v, &diff),
+        // 重试退避后仍失败（503/空/不可解析）→ 降级人确认
+        Err(_) => PromptEditVerdict::NeedsHumanConfirm {
+            diff,
+            reason: "红线语义审查服务暂不可用，请逐字核对本次改动有无变相引入真人转介再确认"
+                .to_string(),
+        },
+    }
+}
+
+/// 把 judge 返回的 JSON 解析为三态。纯函数,便于单测。
+/// judge 契约（prompts.rs management.prompt_redline_review.system）：{"violation": bool, "reason": str}。
+/// - violation==true → Reject(reason)
+/// - violation==false → Pass（LLM 明确判合规）
+/// - 其余（字段缺失/非布尔/空对象/拼写异常等模糊响应）→ NeedsHumanConfirm（不 fail-open 放行）
+///   收紧自原 `Ok(_) => Pass`：模糊响应里无法确认 LLM 到底判没判违规,不能当审查通过。
+fn classify_review_verdict(v: &Value, diff: &str) -> PromptEditVerdict {
+    match v.get("violation").and_then(Value::as_bool) {
+        Some(true) => {
             let reason = v
                 .get("reason")
                 .and_then(Value::as_str)
@@ -179,11 +197,10 @@ pub async fn review_prompt_edit(
                 .to_string();
             PromptEditVerdict::Reject(reason)
         }
-        Ok(_) => PromptEditVerdict::Pass,
-        // 重试退避后仍失败（503/空/不可解析）→ 降级人确认
-        Err(_) => PromptEditVerdict::NeedsHumanConfirm {
-            diff,
-            reason: "红线语义审查服务暂不可用，请逐字核对本次改动有无变相引入真人转介再确认"
+        Some(false) => PromptEditVerdict::Pass,
+        None => PromptEditVerdict::NeedsHumanConfirm {
+            diff: diff.to_string(),
+            reason: "红线语义审查返回结果无法解析（缺 violation 字段或格式异常），请逐字核对本次改动有无变相引入真人转介再确认"
                 .to_string(),
         },
     }
@@ -337,5 +354,56 @@ mod tests {
         assert!(composed.contains("追加片段"));
         // 不产生多余尾部空白行
         assert_eq!(composed.trim_end(), composed.trim_end_matches('\n').trim_end());
+    }
+
+    // ── classify_review_verdict：第三闸 JSON→三态判定（收紧 fail-open 回归门）──
+    // 原 `Ok(_) => Pass` 把所有非 violation==true 的合法 JSON 都放行；收紧后仅
+    // violation==false 才 Pass，模糊响应（字段缺失/非布尔/空对象）降级 NeedsHumanConfirm。
+
+    #[test]
+    fn classify_verdict_violation_true_rejects() {
+        let v = serde_json::json!({"violation": true, "reason": "变相真人转介"});
+        assert!(matches!(
+            classify_review_verdict(&v, "diff"),
+            PromptEditVerdict::Reject(_)
+        ));
+    }
+
+    #[test]
+    fn classify_verdict_violation_false_passes() {
+        let v = serde_json::json!({"violation": false});
+        assert!(matches!(
+            classify_review_verdict(&v, "diff"),
+            PromptEditVerdict::Pass
+        ));
+    }
+
+    #[test]
+    fn classify_verdict_missing_field_needs_confirm() {
+        // 字段缺失 → 不再 fail-open Pass，降级人确认
+        let v = serde_json::json!({"reason": "忘了填 violation"});
+        assert!(matches!(
+            classify_review_verdict(&v, "diff"),
+            PromptEditVerdict::NeedsHumanConfirm { .. }
+        ));
+    }
+
+    #[test]
+    fn classify_verdict_non_bool_violation_needs_confirm() {
+        // violation 是字符串而非布尔 → 模糊响应，降级人确认
+        let v = serde_json::json!({"violation": "true"});
+        assert!(matches!(
+            classify_review_verdict(&v, "diff"),
+            PromptEditVerdict::NeedsHumanConfirm { .. }
+        ));
+    }
+
+    #[test]
+    fn classify_verdict_empty_object_needs_confirm() {
+        let v = serde_json::json!({});
+        assert!(matches!(
+            classify_review_verdict(&v, "diff"),
+            PromptEditVerdict::NeedsHumanConfirm { .. }
+        ));
     }
 }
