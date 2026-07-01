@@ -81,7 +81,7 @@ type OperationStateDraft = {
 
 // A2：运营记忆可编辑表单字段定义。23 个扁平字段按后端四个 Document 分组渲染，
 // store 端 groupMemoryDraft 据同一映射把扁平 draft 归组提交，两侧字段名须对齐。
-const MEMORY_DRAFT_FIELD_GROUPS: Array<{
+export const MEMORY_DRAFT_FIELD_GROUPS: Array<{
   caption: string;
   fields: Array<{
     key: keyof OperatingMemoryDraft;
@@ -717,7 +717,7 @@ export function UserOperationCockpit({
 }
 
 
-function ChangePreview({ changes, readableChanges }: { changes: Record<string, unknown>; readableChanges?: string[] }) {
+export function ChangePreview({ changes, readableChanges }: { changes: Record<string, unknown>; readableChanges?: string[] }) {
   const items = readableChanges?.length
     ? readableChanges.map((value) => ({ label: "将执行", value }))
     : readableChangeItems(changes);
@@ -735,7 +735,7 @@ function ChangePreview({ changes, readableChanges }: { changes: Record<string, u
 }
 
 
-function MemoryCardSummary({ memoryCard }: { memoryCard?: Record<string, unknown> }) {
+export function MemoryCardSummary({ memoryCard }: { memoryCard?: Record<string, unknown> }) {
   const factSections = [
     { key: "coreFacts", label: "核心事实" },
     { key: "recentFacts", label: "近期事实" },
@@ -868,7 +868,7 @@ function MemoryFactRow({ fact }: { fact: MemoryFactView }) {
 }
 
 
-function SimulationResult({ turns }: { turns: SimulationTurn[] }) {
+export function SimulationResult({ turns }: { turns: SimulationTurn[] }) {
   if (!turns.length) return <EmptyInline text="还没有验证结果。输入多轮用户消息后开始验证。" />;
   return (
     <div className="simulationResult">
@@ -1795,7 +1795,7 @@ export function DomainPromptPanel({
 }
 
 
-function PlanStep({ detail, status, title }: { detail: string; status: "ready" | "pending"; title: string }) {
+export function PlanStep({ detail, status, title }: { detail: string; status: "ready" | "pending"; title: string }) {
   return (
     <div className={`planStep ${status}`}>
       <CheckCircle2 size={16} />
@@ -1808,7 +1808,7 @@ function PlanStep({ detail, status, title }: { detail: string; status: "ready" |
 }
 
 
-function EmptyInline({ text }: { text: string }) {
+export function EmptyInline({ text }: { text: string }) {
   return (
     <div className="emptyState">
       <MessageSquareText size={30} />
@@ -1830,7 +1830,7 @@ function EmptyState({ icon, title, hint, action }: { icon?: React.ReactNode; tit
 }
 
 
-function ConversationStream({ messages }: { messages: Message[] }) {
+export function ConversationStream({ messages }: { messages: Message[] }) {
   if (!messages.length) {
     return <EmptyState icon={<MessageSquareText size={28} />} title="暂无会话记录" hint="一旦有用户消息或 AI 触达，对话会按时间在这里以左右气泡呈现。" />;
   }
@@ -2047,7 +2047,7 @@ function contextPackList(source: Record<string, unknown> | undefined, key: strin
 }
 
 
-function memoryStatusLabel(status: string) {
+export function memoryStatusLabel(status: string) {
   if (status === "pending") return "待整理";
   if (status === "consolidated") return "已入库";
   if (status === "ignored_low_score") return "低价值忽略";
@@ -2055,7 +2055,7 @@ function memoryStatusLabel(status: string) {
 }
 
 
-function memoryCandidateText(candidate: Record<string, unknown>) {
+export function memoryCandidateText(candidate: Record<string, unknown>) {
   const type = stringField(candidate, "type");
   const content = stringField(candidate, "content");
   const evidence = stringField(candidate, "evidence");
@@ -2071,7 +2071,7 @@ function splitTags(value: string) {
 }
 
 
-function simulationStatusLabel(status: string) {
+export function simulationStatusLabel(status: string) {
   const labels: Record<string, string> = {
     would_send: "会发送",
     no_reply: "不回复",
@@ -2082,7 +2082,7 @@ function simulationStatusLabel(status: string) {
 }
 
 
-function nextBestActionLabel(action?: Record<string, unknown>) {
+export function nextBestActionLabel(action?: Record<string, unknown>) {
   if (!action) return "-";
   const type = typeof action.type === "string" ? action.type : "-";
   const score = typeof action.score === "number" ? ` / ${action.score}` : "";
@@ -2090,7 +2090,7 @@ function nextBestActionLabel(action?: Record<string, unknown>) {
 }
 
 
-function defaultHealthItems(): OperationHealthItem[] {
+export function defaultHealthItems(): OperationHealthItem[] {
   return [
     { key: "userUnderstanding", label: "用户理解完整度", score: 0, tone: "warn", detail: "选择好友后自动诊断。" },
     { key: "relationshipQuality", label: "信任关系质量", score: 0, tone: "warn", detail: "选择好友后自动诊断。" },
@@ -2120,7 +2120,7 @@ function readableChangeItems(changes: Record<string, unknown>) {
 }
 
 
-function impactScopeLabel(scope?: string) {
+export function impactScopeLabel(scope?: string) {
   if (scope === "all_user_operations") return "影响所有用户运营";
   if (scope === "agent_personality") return "影响 Agent 整体人格";
   return "只影响当前好友";
@@ -2138,7 +2138,7 @@ function formatChangeValue(value: unknown): string {
 }
 
 
-function formatTime(value?: string) {
+export function formatTime(value?: string) {
   if (!value) return "-";
   return new Intl.DateTimeFormat("zh-CN", {
     month: "2-digit",
@@ -2277,7 +2277,7 @@ export function PlannerViewSection({ contact }: { contact: Contact | null }) {
  *  素材 / 名片记录及客户反应信号，纯只读、无操作按钮，符合全自治定位。
  *  选中客户 wxid 变化时随画像同生命周期重新拉取；客户端故障置空不崩页。 */
 
-function SendHistorySection({ wxid }: { wxid: string }) {
+export function SendHistorySection({ wxid }: { wxid: string }) {
   const [items, setItems] = useState<SendHistoryItem[]>([]);
   const [loaded, setLoaded] = useState(false);
 
