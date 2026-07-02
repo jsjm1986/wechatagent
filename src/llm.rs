@@ -802,7 +802,9 @@ impl LlmClient {
             }
         }
 
-        let value = parse_json_content(&accumulated)?;
+        // M10：与非流式路径对齐——三层确定性解析全失败时再走第四层 LLM-repair
+        // （对已累积完的文本发独立修复请求，不向 token_tx 再推 token、不 re-stream）。
+        let value = self.parse_or_repair(&accumulated).await?;
         Ok(LlmJsonResult {
             value,
             usage: usage.unwrap_or_default(),
