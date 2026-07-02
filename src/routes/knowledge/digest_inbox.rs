@@ -24,13 +24,13 @@ use super::*;
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub(in crate::routes) struct DigestTodayQuery {
+pub struct DigestTodayQuery {
     pub account_id: Option<String>,
     /// `YYYY-MM-DD`；缺省时用运营时区今天。
     pub report_date: Option<String>,
 }
 
-pub(in crate::routes) async fn digest_today(
+pub async fn digest_today(
     State(state): State<AppState>,
     Extension(admin): Extension<AuthenticatedAdmin>,
     Query(query): Query<DigestTodayQuery>,
@@ -62,7 +62,12 @@ pub(in crate::routes) async fn digest_today(
         None => {
             // Phase 2：未命中时**同步合成**今日日报；失败则按 503 / 404 上抛。
             // 避免运营反复刷新 → 命中 worker 还没醒的窗口期。
-            crate::knowledge_digest::generate_today_digest(&state).await?
+            crate::knowledge_digest::generate_today_digest(
+                &state,
+                &admin.current_workspace,
+                &account_id,
+            )
+            .await?
         }
     };
 
@@ -107,7 +112,12 @@ pub(in crate::routes) async fn digest_regenerate(
             return Ok(serialize_digest_report(&existing));
         }
     }
-    let report = crate::knowledge_digest::generate_today_digest(&state).await?;
+    let report = crate::knowledge_digest::generate_today_digest(
+        &state,
+        &admin.current_workspace,
+        &account_id,
+    )
+    .await?;
     Ok(serialize_digest_report(&report))
 }
 

@@ -50,7 +50,7 @@ pub(super) struct PromptTemplateRequest {
 /// 但仍过字面双闸（禁词/锚完整性是确定性硬闸，force 不可绕）。无 body 时落 default（force=None）。
 #[derive(Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub(super) struct PublishRequest {
+pub struct PublishRequest {
     #[serde(default)]
     force: Option<bool>,
 }
@@ -237,7 +237,7 @@ pub(super) async fn update_prompt_template(
     Ok(Json(json!({ "ok": true })))
 }
 
-pub(super) async fn publish_prompt_template(
+pub async fn publish_prompt_template(
     State(state): State<AppState>,
     Extension(admin): Extension<AuthenticatedAdmin>,
     Path(id): Path<String>,
@@ -312,6 +312,21 @@ pub(super) async fn publish_prompt_template(
         }
     }
 
+    // evolution 守卫：seeded_by="evolution_release" 的历史行是 rollback 链所需
+    //（rollback_prompt 靠 version=previous_version 找回），手动 publish 的单版本清理
+    // 绝不物删它们——镜像 prompts::align_prompt_specs 的同款 evolution 守卫。
+    let evolution_rows = state
+        .db
+        .prompt_templates()
+        .count_documents(
+            doc! {
+                "workspace_id": &template.workspace_id,
+                "prompt_key": &template.prompt_key,
+                "seeded_by": "evolution_release",
+            },
+            None,
+        )
+        .await?;
     state
         .db
         .prompt_templates()
@@ -319,11 +334,41 @@ pub(super) async fn publish_prompt_template(
             doc! {
                 "workspace_id": &template.workspace_id,
                 "prompt_key": &template.prompt_key,
-                "_id": { "$ne": object_id }
+                "_id": { "$ne": object_id },
+                "seeded_by": { "$ne": "evolution_release" }
             },
             None,
         )
         .await?;
+    // 边缘副作用可见化：该 key 存在 evolution 灰度链历史行时，手动 publish 会让本行
+    // 与 evolution 行并存为多条 active 参与 A/B。写观测事件交 admin 在演化页收口。
+    if evolution_rows > 0 {
+        let _ = state
+            .db
+            .events()
+            .insert_one(
+                crate::models::AgentEvent {
+                    id: None,
+                    workspace_id: template.workspace_id.clone(),
+                    account_id: state.config.default_account_id.clone(),
+                    contact_wxid: None,
+                    kind: "prompt_publish_kept_evolution_rows".to_string(),
+                    status: "warn".to_string(),
+                    summary: format!(
+                        "手动 publish prompt_key={} 时保留了 {} 条 evolution 历史行（未物删，保住 rollback）；该 key 若正处 evolution 灰度，请在演化页收口多版本 A/B。",
+                        template.prompt_key, evolution_rows
+                    ),
+                    details: Some(doc! {
+                        "prompt_key": &template.prompt_key,
+                        "kept_evolution_rows": evolution_rows as i64,
+                    }),
+                    created_at: DateTime::now(),
+                    dedupe_key: None,
+                },
+                None,
+            )
+            .await;
+    }
     state
         .db
         .prompt_templates()
