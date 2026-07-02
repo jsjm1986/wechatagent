@@ -1382,7 +1382,7 @@ async fn run_user_operation_gateway_inner(
     // 没读过任何切片却记了路由 id=误当"Agent 读过")。仅当本决策确实经 **Full** 知识档
     // (forced_full=强升Full,或 escalated_to_full=升档到Full)时才记路由 id;
     // 纯 Lean-Enough / Clarify(Lean) / 升到 Relational(同样 include_business=false)都不记。
-    if forced_full || escalated_to_full {
+    if crate::agent::sufficiency::should_record_used_knowledge_ids(forced_full, escalated_to_full) {
         decision.used_knowledge_ids = route_used_knowledge_ids(&knowledge_route);
     }
     let _ = &mut promote_risks;

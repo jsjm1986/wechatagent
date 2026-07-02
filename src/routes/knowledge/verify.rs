@@ -32,6 +32,15 @@ const AUTO_VERIFY_MIN_SAMPLE_RATE: f64 = 0.05;
 /// auto-verify 人审抽样率默认值（修复 C-①：从 0.1 抬到 0.3，更积极抽审）。
 const AUTO_VERIFY_DEFAULT_SAMPLE_RATE: f64 = 0.3;
 
+/// auto-verify 抽样率钳制:未传用默认 [`AUTO_VERIFY_DEFAULT_SAMPLE_RATE`],并强制钳到硬下限
+/// [`AUTO_VERIFY_MIN_SAMPLE_RATE`](传 0 也不许 100% 无人审)。抽成纯函数以便单测锁死下限——
+/// 删下界 / 改成 0 会让「永远留一批人审」这条红线被静默关掉。
+fn clamp_sample_rate(requested: Option<f64>) -> f64 {
+    requested
+        .unwrap_or(AUTO_VERIFY_DEFAULT_SAMPLE_RATE)
+        .clamp(AUTO_VERIFY_MIN_SAMPLE_RATE, 1.0)
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct KnowledgeVerifyRequest {
@@ -162,10 +171,7 @@ pub async fn auto_verify_operation_knowledge_chunks(
     // 100% 无人审落 verified。下限保证「永远有一批被抽出人审」这条红线姿态不可被关掉。
     // 默认从 0.1 抬到 0.3（更积极抽审）。注：product_fact 类已由 C-② 全量强制人审，本抽样
     // 主要覆盖其他三类（不进产品报价链路、风险较低），故下限取温和的 5%。
-    let sample_rate = payload
-        .human_audit_sample_rate
-        .unwrap_or(AUTO_VERIFY_DEFAULT_SAMPLE_RATE)
-        .clamp(AUTO_VERIFY_MIN_SAMPLE_RATE, 1.0);
+    let sample_rate = clamp_sample_rate(payload.human_audit_sample_rate);
     let limit = payload.limit.unwrap_or(50).clamp(1, 500);
 
     let (token_budget, max_llm_calls) =
@@ -644,5 +650,14 @@ mod tests {
         // 同理 token budget 默认值不能再复用 simulationTokenBudget=60000。
         let v = doc_i64_with_default(None, "autoVerifyTokenBudget", 240000);
         assert!(v >= 100_000, "autoVerify token budget 默认 {v} 太小，无法跑 50 条");
+    }
+
+    #[test]
+    fn clamp_sample_rate_enforces_hard_floor() {
+        // 命门:传 0(前端取消"留一批复查")也不许 100% 无人审,钳到 5% 下限。
+        assert_eq!(clamp_sample_rate(Some(0.0)), 0.05, "传0钳到硬下限,红线不可关");
+        assert_eq!(clamp_sample_rate(None), 0.3, "未传用默认 0.3");
+        assert_eq!(clamp_sample_rate(Some(2.0)), 1.0, "超上限钳到 1.0");
+        assert_eq!(clamp_sample_rate(Some(0.5)), 0.5, "区间内原样透传");
     }
 }
