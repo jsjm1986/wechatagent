@@ -48,7 +48,16 @@ pub(super) async fn preview_user_operation_guide(
     let memory = ensure_operating_memory(&state, &contact).await?;
     let latest_review = latest_decision_review(&state, &contact).await?;
     let playbook = agent::load_operation_playbook_for_contact(&state, &contact).await?;
-    let health = operation_health_json(&contact, &memory, latest_review.as_ref());
+    let (in_quiet_hours, next_wake_at, quiet_hours_enabled) =
+        compute_quiet_hours_view(&state, &contact).await?;
+    let health = operation_health_json(
+        &contact,
+        &memory,
+        latest_review.as_ref(),
+        in_quiet_hours,
+        next_wake_at,
+        quiet_hours_enabled,
+    );
     // 注入合法值(治 LLM 产越界值的源头):状态机合法态 key + customer_stage/intent_level 字典 canonical。
     let domain_config = agent::load_user_operation_domain_config_for_contact(
         &state,
@@ -242,7 +251,16 @@ pub(super) async fn apply_user_operation_guide(
         .ok_or_else(|| AppError::NotFound("contact not found after guide apply".to_string()))?;
     let memory = ensure_operating_memory(&state, &updated_contact).await?;
     let latest_review = latest_decision_review(&state, &updated_contact).await?;
-    let health = operation_health_json(&updated_contact, &memory, latest_review.as_ref());
+    let (in_quiet_hours, next_wake_at, quiet_hours_enabled) =
+        compute_quiet_hours_view(&state, &updated_contact).await?;
+    let health = operation_health_json(
+        &updated_contact,
+        &memory,
+        latest_review.as_ref(),
+        in_quiet_hours,
+        next_wake_at,
+        quiet_hours_enabled,
+    );
     Ok(Json(json!({
         "item": {
             "contact": ApiContact::from(updated_contact),

@@ -1,4 +1,5 @@
 {
+  "inQuietHours": true,
   "items": [
     {
       "detail": "身份、痛点、动机、偏好和禁忌是否清楚",
@@ -50,6 +51,8 @@
       "tone": "good"
     }
   ],
+  "nextWakeAt": "2026-07-02T00:00:00Z",
+  "quietHoursEnabled": true,
   "scores": {
     "hallucinationRisk": 20,
     "knowledgeGrounding": 80,

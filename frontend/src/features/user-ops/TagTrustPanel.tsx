@@ -30,6 +30,8 @@ export default function TagTrustPanel({
 
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState("");
+  // AI 确信 chip 的证据展开态：按标签 value 记录哪几条展开了 evidence 明细（turn/msgId）。
+  const [expandedTag, setExpandedTag] = useState<string | null>(null);
 
   const startEdit = () => {
     setDraft(manualTags.join(", "));
@@ -102,16 +104,37 @@ export default function TagTrustPanel({
           {confirmedTags.length > 0 ? (
             confirmedTags.map((tag) => {
               const meta = CONFIRMED_BY_META[tag.confirmedBy];
+              const open = expandedTag === tag.value;
               return (
-                <span key={tag.value} className={styles.aiChip}>
-                  {tag.value}
-                  <span className={styles.evidenceCount}>{tag.evidences.length} 条证据</span>
-                  {meta ? (
-                    <span className={styles.confirmedBySource} title={meta.hint}>
-                      {meta.label}
-                    </span>
-                  ) : null}
-                </span>
+                <div key={tag.value} className={styles.aiChipWrap}>
+                  <button
+                    type="button"
+                    className={styles.aiChip}
+                    aria-expanded={open}
+                    onClick={() => setExpandedTag(open ? null : tag.value)}
+                  >
+                    {tag.value}
+                    <span className={styles.evidenceCount}>{tag.evidences.length} 条证据</span>
+                    {meta ? (
+                      <span className={styles.confirmedBySource} title={meta.hint}>
+                        {meta.label}
+                      </span>
+                    ) : null}
+                  </button>
+                  {open && (
+                    <div className={styles.evidenceList}>
+                      {tag.evidences.length > 0 ? (
+                        tag.evidences.map((ev, index) => (
+                          <span key={`${tag.value}-${index}`} className={styles.evidenceItem}>
+                            第 {ev.turn} 轮 · {ev.msgId}
+                          </span>
+                        ))
+                      ) : (
+                        <span className={styles.empty}>暂无证据引用</span>
+                      )}
+                    </div>
+                  )}
+                </div>
               );
             })
           ) : (

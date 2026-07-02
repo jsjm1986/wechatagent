@@ -1,7 +1,6 @@
 import { useEffect } from "react";
 import type { FormEvent } from "react";
 import {
-  UserOperationCockpit,
   ContactsView,
   UserOpsModeHeader,
   UserPlaybookPanel,
@@ -9,6 +8,7 @@ import {
   DomainConfigEditor,
   TraditionalOpsTabs
 } from "./legacy";
+import { CockpitPanel } from "./cockpit/CockpitPanel";
 import OperationsFeature from "../operations";
 import { useUserOpsStore } from "../../stores/userOpsStore";
 import { useStrategyStore } from "../../stores/strategyStore";
@@ -69,7 +69,6 @@ function UserOpsFeatureInner() {
   // 从store中解构需要的状态
   const {
     userOpsMode,
-    smartOpsTab,
     traditionalOpsTab,
     messages,
     operatingMemory,
@@ -102,7 +101,6 @@ function UserOpsFeatureInner() {
     domainDrafts,
     // Actions
     setUserOpsMode,
-    setSmartOpsTab,
     setTraditionalOpsTab,
     setProfileNote,
     setCustomAgentInstructions,
@@ -288,8 +286,7 @@ function UserOpsFeatureInner() {
             onOpenContact={openContact}
             onQuery={setSearchQuery}
           />
-          <UserOperationCockpit
-            activeTab={smartOpsTab}
+          <CockpitPanel
             busy={busy}
             decisionReviews={decisionReviews}
             guideBusy={guideBusy}
@@ -334,7 +331,6 @@ function UserOpsFeatureInner() {
             onSaveOperatingMemory={saveOperatingMemory}
             onSelectedPlaybook={setSelectedPlaybookId}
             onSimulationInput={setSimulationInput}
-            onTab={setSmartOpsTab}
           />
         </section>
       )}
