@@ -190,4 +190,13 @@
   margin-top: 2px;
 }
 
+/* 决策复盘：AI 内心独白（自治协议 9 字段）三分组展示。 */
+.protocolSection { display: flex; flex-direction: column; gap: 10px; margin-top: 10px; padding-top: 10px; border-top: 1px solid var(--hairline); }
+.protocolHeading { font-size: 12px; font-weight: 640; color: var(--ai); }
+.protocolGroup { display: flex; flex-direction: column; gap: 6px; }
+.protocolGroupTitle { font-size: 12px; color: var(--muted); }
+.protocolField { display: flex; flex-direction: column; gap: 2px; }
+.protocolLabel { font-size: 12px; color: var(--ink-2); }
+.protocolText { margin: 0; font-size: 13px; color: var(--ink-1); white-space: pre-wrap; }
+
 
