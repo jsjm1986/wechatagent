@@ -1176,6 +1176,7 @@ pub(super) fn decision_review_json(
     review: AgentDecisionReview,
     final_review_status: Option<String>,
     hold_category: Option<String>,
+    autonomy_protocol: Option<Value>,
 ) -> Value {
     json!({
         "id": review.id.map(|id| id.to_hex()).unwrap_or_default(),
@@ -1206,6 +1207,7 @@ pub(super) fn decision_review_json(
         "status": review.status,
         "finalReviewStatus": final_review_status,
         "holdCategory": hold_category,
+        "autonomyProtocol": autonomy_protocol,
         "createdAt": crate::models::dt_to_string(review.created_at)
     })
 }
@@ -2020,6 +2022,17 @@ mod tests {
             review,
             Some("approved_sent".to_string()),
             Some("none".to_string()),
+            Some(serde_json::json!({
+                "userUnderstanding": "用户在比较两款方案的价格",
+                "relationshipRead": "关系处于评估期，信任中等",
+                "operationGoal": "推进到方案确认",
+                "knowledgeNeedReason": "需引用已核实的报价切片",
+                "memoryUpdateReason": "记录用户预算区间",
+                "riskSelfCheck": "避免对未验证功能做承诺",
+                "selfCritique": "上一轮略急，本轮放慢确认",
+                "whyShouldReply": "用户主动询问差异，及时回应推进决策",
+                "whySkipReply": ""
+            })),
         );
         crate::routes::contract_snapshot::assert_contract_fixture("decision_review", projected);
     }
