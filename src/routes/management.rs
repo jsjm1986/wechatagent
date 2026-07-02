@@ -1743,9 +1743,9 @@ pub(super) async fn execute_management_tool(
         }
         "wechatagent.publish_taxonomy_version" => {
             let id = string_arg(&planned.arguments, "id")?;
-            // 注：taxonomy 版本 handler 全局作用域，签名仅 State+Path（无 Extension）。
             let resp = crate::routes::admin_ops_versions::publish_taxonomy_version(
                 State(state.clone()),
+                Extension(management_admin(workspace_id)),
                 Path(id),
             )
             .await?;
@@ -1755,6 +1755,7 @@ pub(super) async fn execute_management_tool(
             let id = string_arg(&planned.arguments, "id")?;
             let resp = crate::routes::admin_ops_versions::rollout_taxonomy_version(
                 State(state.clone()),
+                Extension(management_admin(workspace_id)),
                 Path(id),
             )
             .await?;
@@ -1764,6 +1765,7 @@ pub(super) async fn execute_management_tool(
             let id = string_arg(&planned.arguments, "id")?;
             let resp = crate::routes::admin_ops_versions::rollback_taxonomy_version(
                 State(state.clone()),
+                Extension(management_admin(workspace_id)),
                 Path(id),
             )
             .await?;
