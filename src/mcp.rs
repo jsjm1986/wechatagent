@@ -110,6 +110,23 @@ impl McpClient {
     }
 }
 
+/// M16：落库 mcp_logs 前脱敏超大二进制字段。`media_upload_base64` 的 `base64`
+/// 参数可达 ~67MB（50MB 文件上限 ×4/3），原样落库会超 16MB BSON 上限致 insert
+/// 静默失败、或撑爆崩溃恢复热路径集合 `mcp_logs`。base64 对审计/恢复零价值
+/// （`mcp_already_succeeded` 只读 recipient/mediaId/content），故仅把它替换成
+/// 占位符（保留字节数供审计），其它字段一字不动——尤其不碰 `content`，否则
+/// `mcp_already_succeeded` 的 `request.content` 精确匹配会失败 → 重复发送。
+fn redact_request_for_log(request: &mongodb::bson::Document) -> mongodb::bson::Document {
+    let mut doc = request.clone();
+    if let Ok(b64) = request.get_str("base64") {
+        doc.insert(
+            "base64",
+            format!("<redacted base64: {} chars>", b64.len()),
+        );
+    }
+    doc
+}
+
 pub async fn logged_call<A: Serialize>(
     state: &AppState,
     tool_name: &str,
@@ -130,7 +147,7 @@ pub async fn logged_call<A: Serialize>(
                 workspace_id: state.config.default_workspace_id.clone(),
                 account_id: state.config.default_account_id.clone(),
                 tool_name: tool_name.to_string(),
-                request: request_doc,
+                request: redact_request_for_log(&request_doc),
                 response,
                 error,
                 created_at: DateTime::now(),
@@ -172,7 +189,7 @@ pub async fn logged_call_for_account<A: Serialize>(
                 workspace_id: state.config.default_workspace_id.clone(),
                 account_id: account_id.to_string(),
                 tool_name: tool_name.to_string(),
-                request: request_doc,
+                request: redact_request_for_log(&request_doc),
                 response,
                 error,
                 created_at: DateTime::now(),
@@ -217,3 +234,48 @@ async fn credentials_for_account(state: &AppState, account_id: &str) -> AppResul
         .unwrap_or_else(|| state.config.mcp_api_key.clone());
     Ok(McpCredentials { base_url, api_key })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::redact_request_for_log;
+    use mongodb::bson::doc;
+
+    #[test]
+    fn redact_removes_base64_keeps_other_fields() {
+        let req = doc! {
+            "fileName": "报价单.pdf",
+            "mediaType": "file",
+            "base64": "AAAABBBBCCCC",
+        };
+        let out = redact_request_for_log(&req);
+        assert_eq!(
+            out.get_str("base64").unwrap(),
+            "<redacted base64: 12 chars>",
+            "base64 应被替换为占位符(保留字节数)"
+        );
+        assert_eq!(out.get_str("fileName").unwrap(), "报价单.pdf");
+        assert_eq!(out.get_str("mediaType").unwrap(), "file");
+    }
+
+    #[test]
+    fn redact_preserves_content_and_recipient() {
+        // 红线:content/recipient 是崩溃恢复 mcp_already_succeeded 的精确匹配字段,
+        // 绝不能被脱敏改动,否则匹配失败→重复发送。
+        let long_content = "很长的AI回复".repeat(1000);
+        let req = doc! {
+            "recipient": "wxid_customer_a",
+            "content": &long_content,
+        };
+        let out = redact_request_for_log(&req);
+        assert_eq!(out.get_str("content").unwrap(), long_content, "content 一字不动");
+        assert_eq!(out.get_str("recipient").unwrap(), "wxid_customer_a");
+    }
+
+    #[test]
+    fn redact_noop_without_base64() {
+        let req = doc! { "recipient": "wxid_x", "mediaId": "mid_123" };
+        let out = redact_request_for_log(&req);
+        assert_eq!(out, req, "无 base64 key 时脱敏应与原 doc 相等");
+    }
+}
+
