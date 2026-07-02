@@ -161,6 +161,22 @@ pub(in crate::routes) async fn digest_dismiss_card(
 }
 
 fn serialize_digest_report(report: &crate::models::KnowledgeDailyReport) -> Json<Value> {
+    let cards_json: Vec<Value> = report
+        .cards
+        .iter()
+        .map(|card| {
+            json!({
+                "cardId": card.card_id.to_hex(),
+                "kind": &card.kind,
+                "title": &card.title,
+                "summary": &card.summary,
+                "targetRefs": &card.target_refs,
+                "suggestedAction": &card.suggested_action,
+                "severity": &card.severity,
+                "metric": &card.metric,
+            })
+        })
+        .collect();
     Json(json!({
         "reportId": report.id.map(|id| id.to_hex()),
         "workspaceId": report.workspace_id,
@@ -171,7 +187,7 @@ fn serialize_digest_report(report: &crate::models::KnowledgeDailyReport) -> Json
         "status": report.status,
         "errorKind": report.error_kind,
         "budgetSnapshot": serde_json::to_value(&report.budget_snapshot).unwrap_or(json!({})),
-        "cards": serde_json::to_value(&report.cards).unwrap_or(json!([])),
+        "cards": cards_json,
         "dismissedCardIds": report
             .dismissed_card_ids
             .iter()
@@ -624,5 +640,72 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// serde 修复验证：serialize_digest_report 输出的 cards 必须是 camelCase 键名，
+    /// 且 cardId 是 hex string（非 ObjectId 扩展 JSON {$oid}）。
+    /// 这是前后端对齐 Critical 缺陷修复后的契约快照（防回退）。
+    #[test]
+    fn serialize_digest_report_cards_are_camel_case_with_hex_card_id() {
+        use crate::models::{KnowledgeDigestCard, KnowledgeDailyReport};
+        use mongodb::bson::{doc, oid::ObjectId, DateTime};
+
+        let card_id = ObjectId::new();
+        let card = KnowledgeDigestCard {
+            card_id,
+            kind: "chunk_missing_field".to_string(),
+            title: "测试卡片".to_string(),
+            summary: "摘要".to_string(),
+            target_refs: vec![doc! {"kind": "chunk", "id": "test"}],
+            suggested_action: "fix_chunk".to_string(),
+            severity: "warn".to_string(),
+            metric: Some(doc! {"name": "hit_rate", "value": 0.5}),
+        };
+        let report = KnowledgeDailyReport {
+            id: Some(ObjectId::new()),
+            workspace_id: "ws1".to_string(),
+            account_id: "acc1".to_string(),
+            report_date: "2026-07-02".to_string(),
+            generated_at: DateTime::now(),
+            generated_by: "test".to_string(),
+            status: "ready".to_string(),
+            error_kind: None,
+            budget_snapshot: doc! {},
+            cards: vec![card],
+            dismissed_card_ids: vec![],
+            prompt_versions: doc! {},
+        };
+
+        let json_response = serialize_digest_report(&report);
+        let json_val: serde_json::Value =
+            serde_json::from_str(&json_response.0.to_string()).unwrap();
+
+        // 验证 cards[0] 是 camelCase 且 cardId 是 hex string
+        let cards = json_val["cards"].as_array().expect("cards should be array");
+        assert_eq!(cards.len(), 1);
+        let c = &cards[0];
+
+        // cardId 必须是 string（hex），不能是 ObjectId 扩展 JSON {$oid}
+        let card_id_val = c["cardId"].as_str().expect("cardId should be string");
+        assert_eq!(card_id_val, card_id.to_hex());
+
+        // 其它字段验证 camelCase 键名存在
+        assert_eq!(c["suggestedAction"].as_str().unwrap(), "fix_chunk");
+        assert!(c["targetRefs"].is_array());
+        assert_eq!(c["kind"].as_str().unwrap(), "chunk_missing_field");
+
+        // 确认 snake_case 键不存在（证明 rename_all 生效）
+        assert!(
+            c.get("card_id").is_none(),
+            "should not have snake_case card_id"
+        );
+        assert!(
+            c.get("suggested_action").is_none(),
+            "should not have snake_case suggested_action"
+        );
+        assert!(
+            c.get("target_refs").is_none(),
+            "should not have snake_case target_refs"
+        );
     }
 }
