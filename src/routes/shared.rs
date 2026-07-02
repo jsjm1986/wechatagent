@@ -1975,7 +1975,7 @@ mod tests {
         crate::routes::contract_snapshot::assert_contract_fixture("agent_run", projected);
     }
 
-    /// 契约快照：decision_review_json（29 键）。AgentDecisionReview 29 字段全量构造;
+    /// 契约快照：decision_review_json（30 键，含 autonomyProtocol 嵌套对象）。AgentDecisionReview 29 字段全量构造;
     /// 9 个下发 Document 放纯标量;used_knowledge_ids:Vec<ObjectId>→hex 字符串数组（不泄漏）;
     /// final_review_status/hold_category 是函数参数,给 Some;reaction_claimed_at/
     /// reviewer_misjudge_signal 赋值但投影不下发。
