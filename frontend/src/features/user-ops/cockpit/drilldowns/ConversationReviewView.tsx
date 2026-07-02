@@ -1,11 +1,9 @@
 // 决策复盘下钻（Task 5）。会话流 verbatim 迁移自 CockpitPanel/legacy 的 conversation 块
-// （ConversationStream + reviewList），数据流不变。新增：每条复盘可展开显示
-// DecisionReview 上真实存在的结构化字段（scores 打分 / risks 风险 / nextBestAction /
-// finalReviewStatus / holdCategory），把这些被列表压掉的自治判断证据上前台。
-//
-// 说明：自治协议独白字段（selfCritique / whyShouldReply / userUnderstanding）并不在
-// DecisionReview 类型上（它们由 features/autonomy 的独立聚合接口提供），本视图只渲染
-// DecisionReview 真实携带的字段，避免渲染 undefined / tsc 报错。
+// （ConversationStream + reviewList），数据流不变。每条复盘可展开显示 DecisionReview 上
+// 的结构化字段（scores / risks / nextBestAction / finalReviewStatus / holdCategory），
+// 以及自治协议 9 字段独白（autonomyProtocol，后端由 run log 的 decision 投影而来，见
+// AutonomyProtocolView 三组：回复决策 / 理解 / 运营依据）。autonomyProtocol 为 null 或
+// 全空时该区不渲染（优雅降级，覆盖历史旧数据 + 管理发送等无完整 decision 的来源）。
 import { useState } from "react";
 import { ArrowLeft } from "lucide-react";
 import type { AutonomyProtocol, DecisionReview, Message } from "../../../../types";
