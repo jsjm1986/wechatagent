@@ -35,6 +35,14 @@ run log 写入侧 `to_document(&final_decision).unwrap_or_default()`（`gateway.
 - `ConversationReviewView`（`frontend/src/features/user-ops/cockpit/drilldowns/ConversationReviewView.tsx`）的 `ReviewItem` 展开区（现渲染 finalReviewStatus/holdCategory/scores/risks/nextBestAction）是新增「AI 内心独白」分组的落点。
 - store `userOpsStore.ts` 拉 `/api/decision-reviews` 得 `decisionReviews`（无需改 loader，字段随投影自动带上）。
 
+### 1.7 存在「有复盘但无完整 decision」的持续来源（决定优雅降级是硬要求，非仅向后兼容）
+核对全部 7 个 `write_decision_review` 与 6 个 run log 写入点后确认两类边界：
+- **主自治路径**（webhook → `run_user_operation_gateway_inner`，`gateway.rs:966`）：复盘（`gateway.rs:2020/2156/2303`）与 run log（`2050/2183/2354`，写 `to_document(&final_decision)`）**共用同一 run_id**，9 字段齐备。现有 `fetch_run_status` join 今天就能正确取到 finalReviewStatus/holdCategory，证明 run_id 关联链路本就成立。→ 核心断言 ✓。
+- **管理 Agent 主动发送路径**（`send_contact_message_gateway`，`gateway.rs:161`，被 `routes/management.rs:1516` 调用）：写复盘（`324/363/403`）但**函数体内不写 agent_run_log**；且其 `AgentDecision` 是直接构造（`gateway.rs:246-256`，`..Default::default()`），9 个自治字段全是**空串**（非 LLM 产出，本无内心独白）。→ 这条路径产生的复盘，`fetch_run_status(run_id)` find_one 得 None → `autonomyProtocol: null`。这是**持续存在**的来源（不只是历史旧数据），语义正确（运营手写内容无 AI 独白可显），降级为不渲染是对的。
+- **空 decision 的 2 个 run log 路径**（`595` non_text_inbound_transition、`1002` precheck_blocked）经核**不写复盘**，不产生 reviews，无影响。
+
+→ 结论：优雅降级（`autonomyProtocol=null` 时前端不渲染该区）是**硬功能要求**，覆盖「历史旧数据」+「管理发送」两类现实来源，不是可选的向后兼容。
+
 ## 2. 目标与方案
 
 **核心洞察**：9 字段后端已落库、端点已 join，故这是**纯读投影 + 前端展示**改动 —— 零迁移、零新查询、不动 `AgentDecisionReview` 模型、不动写入侧、不动 autonomy 聚合接口。
