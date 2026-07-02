@@ -419,6 +419,13 @@ pub async fn reset_prompt_pack_v2(
             .await?;
     }
 
+    // M12：reset 无条件删了本 workspace 全部 prompt_templates（含 evolution_critic_v1），
+    // 上面的 prompt_specs() 只重种业务 Reply Agent pack，演化器 Critic pack 是独立 pack、
+    // 平时只在启动时种（main.rs）。这里补种回来，否则 reset 后演化循环会因 critic prompt
+    // 缺失（load_prompt→default_prompt_content 也不含它）持续报错直到进程重启。
+    // ensure_evolution_prompt_pack_v1 幂等：critic 刚被删故会重插一条 current_version。
+    ensure_evolution_prompt_pack_v1(db, workspace_id).await?;
+
     Ok(())
 }
 
