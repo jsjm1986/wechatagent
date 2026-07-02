@@ -742,8 +742,9 @@ pub(super) async fn rollback_operation_state_policy_version(
 
 /// ── system_taxonomies ────────────────────────────────────────────────────────
 
-pub(super) async fn publish_taxonomy_version(
+pub async fn publish_taxonomy_version(
     State(state): State<AppState>,
+    Extension(admin): Extension<AuthenticatedAdmin>,
     Path(id): Path<String>,
 ) -> AppResult<Json<Value>> {
     let object_id = parse_object_id(&id)?;
@@ -787,6 +788,7 @@ pub(super) async fn publish_taxonomy_version(
     )
     .await?;
     invalidate_global_taxonomy_cache();
+    audit_taxonomy_change(&state, &admin, "publish", &new_entry).await;
     Ok(Json(json!({
         "ok": true,
         "id": inserted.inserted_id.as_object_id().map(|i| i.to_hex()).unwrap_or_default(),
@@ -795,8 +797,9 @@ pub(super) async fn publish_taxonomy_version(
     })))
 }
 
-pub(super) async fn rollout_taxonomy_version(
+pub async fn rollout_taxonomy_version(
     State(state): State<AppState>,
+    Extension(admin): Extension<AuthenticatedAdmin>,
     Path(id): Path<String>,
 ) -> AppResult<Json<Value>> {
     let object_id = parse_object_id(&id)?;
@@ -824,11 +827,13 @@ pub(super) async fn rollout_taxonomy_version(
     )
     .await?;
     invalidate_global_taxonomy_cache();
+    audit_taxonomy_change(&state, &admin, "rollout", &target).await;
     Ok(Json(json!({ "ok": true, "version": target.version })))
 }
 
-pub(super) async fn rollback_taxonomy_version(
+pub async fn rollback_taxonomy_version(
     State(state): State<AppState>,
+    Extension(admin): Extension<AuthenticatedAdmin>,
     Path(id): Path<String>,
 ) -> AppResult<Json<Value>> {
     let object_id = parse_object_id(&id)?;
@@ -878,6 +883,7 @@ pub(super) async fn rollback_taxonomy_version(
     )
     .await?;
     invalidate_global_taxonomy_cache();
+    audit_taxonomy_change(&state, &admin, "rollback", &prev).await;
     Ok(Json(json!({ "ok": true, "rolledBackTo": prev_version })))
 }
 
@@ -910,6 +916,68 @@ where
         0
     };
     Ok(max + 1)
+}
+
+/// system_taxonomies 版本改动（publish / rollout / rollback）成功后写一条审计事件，
+/// 记录**是谁**改了哪条全局/账号 scope 字典项。
+///
+/// 背景（Stage4 孤儿 #4）：`TaxonomyEntry` 无 `workspace_id`、只有 `scope`（`"global"`
+/// 或 account_id），三个版本 handler 历史上不接 `AuthenticatedAdmin`——全局字典任一
+/// admin 皆可改且改动无迹可查。本系统无 RBAC 角色模型（`AuthenticatedAdmin` 仅
+/// user_id/username/current_workspace），"谁有权改全局字典" 红线/文档均无定义，故
+/// **不加拦截门**（保持策略型孤儿的现状语义），只补最小可观测：把改动主体与目标
+/// scope 落一条 `taxonomy_version_changed` 事件，让全局字典变更 who/what 可追溯。
+///
+/// **fail-soft**：审计写失败绝不影响已成功的字典改动（best-effort，忽略错误）——
+/// 与 gateway 送达后审计降级、prompt publish 观测事件同红线（可观测不得反噬业务）。
+async fn audit_taxonomy_change(
+    state: &AppState,
+    admin: &AuthenticatedAdmin,
+    action: &str,
+    entry: &TaxonomyEntry,
+) {
+    let is_global = entry.scope == "global";
+    let _ = state
+        .db
+        .events()
+        .insert_one(
+            crate::models::AgentEvent {
+                id: None,
+                workspace_id: admin.current_workspace.clone(),
+                account_id: state.config.default_account_id.clone(),
+                contact_wxid: None,
+                kind: "taxonomy_version_changed".to_string(),
+                status: "ok".to_string(),
+                summary: format!(
+                    "admin={} {} taxonomy scope={} kind={} value.id={}（{}）",
+                    admin.username,
+                    action,
+                    entry.scope,
+                    entry.kind,
+                    entry.value.id,
+                    if is_global {
+                        "全局字典改动"
+                    } else {
+                        "账号级字典改动"
+                    }
+                ),
+                details: Some(doc! {
+                    "action": action,
+                    "adminUserId": &admin.user_id,
+                    "adminUsername": &admin.username,
+                    "currentWorkspace": &admin.current_workspace,
+                    "scope": &entry.scope,
+                    "isGlobalScope": is_global,
+                    "kind": &entry.kind,
+                    "valueId": &entry.value.id,
+                    "version": entry.version,
+                }),
+                created_at: DateTime::now(),
+                dedupe_key: None,
+            },
+            None,
+        )
+        .await;
 }
 
 #[cfg(test)]

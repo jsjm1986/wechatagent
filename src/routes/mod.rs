@@ -20,7 +20,7 @@ use crate::{
 // pub（非默认私有）：account_security_integration.rs 集成测试需从 tests/ crate 直调
 // list_accounts / sync_accounts / update_account_mcp_key handler 真函数，仿 admin_suspected_deals 先例。
 pub mod accounts;
-mod admin_ops_versions;
+pub mod admin_ops_versions;
 mod admin_outbox;
 mod admin_relationship_suggestions;
 pub mod admin_suspected_deals;
