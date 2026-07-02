@@ -8,7 +8,7 @@
 // DecisionReview 真实携带的字段，避免渲染 undefined / tsc 报错。
 import { useState } from "react";
 import { ArrowLeft } from "lucide-react";
-import type { DecisionReview, Message } from "../../../../types";
+import type { AutonomyProtocol, DecisionReview, Message } from "../../../../types";
 import { ConversationStream, EmptyInline, formatTime, nextBestActionLabel } from "../../legacy";
 import { FINAL_REVIEW_STATUS_LABELS, HOLD_CATEGORY_LABELS, labelOf } from "../../../../lib/reviewLabels";
 import styles from "../cockpit.module.css";
@@ -18,11 +18,43 @@ function scoreEntries(scores?: Record<string, number>): Array<[string, number]> 
   return Object.entries(scores).filter(([, v]) => typeof v === "number");
 }
 
+const PROTOCOL_GROUPS: Array<{ title: string; fields: Array<[keyof AutonomyProtocol, string]> }> = [
+  { title: "回复决策", fields: [["whyShouldReply", "为何回复"], ["whySkipReply", "为何不回复"], ["selfCritique", "自我批判"]] },
+  { title: "理解", fields: [["userUnderstanding", "用户理解"], ["relationshipRead", "关系解读"], ["operationGoal", "运营目标"]] },
+  { title: "运营依据", fields: [["knowledgeNeedReason", "知识需求"], ["memoryUpdateReason", "记忆更新理由"], ["riskSelfCheck", "风险自查"]] },
+];
+
+export function AutonomyProtocolView({ protocol }: { protocol: AutonomyProtocol }) {
+  return (
+    <div className={styles.protocolSection}>
+      <div className={styles.protocolHeading}>AI 内心独白</div>
+      {PROTOCOL_GROUPS.map((group) => {
+        const rows = group.fields.filter(([key]) => (protocol[key] ?? "").trim() !== "");
+        if (rows.length === 0) return null;
+        return (
+          <div key={group.title} className={styles.protocolGroup}>
+            <div className={styles.protocolGroupTitle}>{group.title}</div>
+            {rows.map(([key, label]) => (
+              <div key={key} className={styles.protocolField}>
+                <span className={styles.protocolLabel}>{label}</span>
+                <p className={styles.protocolText}>{protocol[key]}</p>
+              </div>
+            ))}
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
 function ReviewItem({ review }: { review: DecisionReview }) {
   const [expanded, setExpanded] = useState(false);
   const scores = scoreEntries(review.scores);
   const risks = Array.isArray(review.risks) ? review.risks : [];
   const nextAction = review.nextBestAction ? nextBestActionLabel(review.nextBestAction) : "";
+  const protocol = review.autonomyProtocol;
+  const hasProtocol =
+    !!protocol && PROTOCOL_GROUPS.some((g) => g.fields.some(([k]) => (protocol[k] ?? "").trim() !== ""));
   const hasDetail =
     scores.length > 0 ||
     risks.length > 0 ||
@@ -46,7 +78,7 @@ function ReviewItem({ review }: { review: DecisionReview }) {
           {expanded ? "收起判断依据" : "展开判断依据"}
         </button>
       )}
-      {expanded && hasDetail && (
+      {expanded && (hasDetail || hasProtocol) && (
         <div className={styles.reviewDetail}>
           {(review.finalReviewStatus || review.holdCategory) && (
             <div className={styles.reviewMetaRow}>
@@ -77,6 +109,7 @@ function ReviewItem({ review }: { review: DecisionReview }) {
           {nextAction && nextAction !== "-" && (
             <p className={styles.reviewNextAction}>下一步建议：{nextAction}</p>
           )}
+          {hasProtocol && protocol && <AutonomyProtocolView protocol={protocol} />}
         </div>
       )}
     </div>
