@@ -5,7 +5,10 @@ use axum::{
     Extension, Json,
 };
 use futures::TryStreamExt;
-use mongodb::{bson::doc, options::FindOptions};
+use mongodb::{
+    bson::{doc, Document},
+    options::FindOptions,
+};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
@@ -59,8 +62,13 @@ pub(super) async fn list_decision_reviews(
         .await?;
     let mut items = Vec::new();
     while let Some(review) = cursor.try_next().await? {
-        let (frs, hc) = fetch_run_status(&state, review.run_id.as_deref()).await;
-        items.push(decision_review_json(review, frs, hc));
+        let status = fetch_run_status(&state, review.run_id.as_deref()).await;
+        items.push(decision_review_json(
+            review,
+            status.final_review_status,
+            status.hold_category,
+            status.autonomy_protocol,
+        ));
     }
     Ok(Json(json!({ "items": items })))
 }
@@ -83,18 +91,60 @@ pub(super) async fn get_decision_review(
         )
         .await?
         .ok_or_else(|| AppError::NotFound("decision review not found".to_string()))?;
-    let (frs, hc) = fetch_run_status(&state, review.run_id.as_deref()).await;
-    Ok(Json(json!({ "item": decision_review_json(review, frs, hc) })))
+    let status = fetch_run_status(&state, review.run_id.as_deref()).await;
+    Ok(Json(json!({ "item": decision_review_json(
+        review,
+        status.final_review_status,
+        status.hold_category,
+        status.autonomy_protocol,
+    ) })))
 }
 
-/// 关联同 run_id 的 AgentRunLog，取 final_review_status（顶层 snake 字段）
-/// 与 review doc 内的 holdCategory（camelCase）。纯读投影，缺失则回 None。
-async fn fetch_run_status(
-    state: &AppState,
-    run_id: Option<&str>,
-) -> (Option<String>, Option<String>) {
+/// agent_run_logs.decision（camelCase Document）里的 9 个 R1.1 自治协议字段。
+/// 9 个全空（缺失或空串）→ None（优雅降级，前端不渲染「AI 内心独白」区，覆盖历史
+/// 旧数据 + 管理发送路径两类无完整 decision 的复盘）；否则 Some(全 9 键对象，空的填 "")。
+fn autonomy_protocol_from_decision(decision: &Document) -> Option<Value> {
+    const KEYS: [&str; 9] = [
+        "userUnderstanding",
+        "relationshipRead",
+        "operationGoal",
+        "knowledgeNeedReason",
+        "memoryUpdateReason",
+        "riskSelfCheck",
+        "selfCritique",
+        "whyShouldReply",
+        "whySkipReply",
+    ];
+    let vals: Vec<&str> = KEYS
+        .iter()
+        .map(|k| decision.get_str(*k).unwrap_or(""))
+        .collect();
+    if vals.iter().all(|v| v.trim().is_empty()) {
+        return None;
+    }
+    let mut obj = serde_json::Map::new();
+    for (k, v) in KEYS.iter().zip(vals.iter()) {
+        obj.insert((*k).to_string(), Value::from(*v));
+    }
+    Some(Value::Object(obj))
+}
+
+struct RunStatusView {
+    final_review_status: Option<String>,
+    hold_category: Option<String>,
+    autonomy_protocol: Option<Value>,
+}
+
+/// 关联同 run_id 的 AgentRunLog，取 final_review_status（顶层 snake 字段）、
+/// review doc 内的 holdCategory（camelCase），以及 decision doc 内的 9 个自治协议字段。
+/// 纯读投影，缺失则回 None。
+async fn fetch_run_status(state: &AppState, run_id: Option<&str>) -> RunStatusView {
     let Some(run_id) = run_id.filter(|s| !s.is_empty()) else {
-        return (None, None);
+        return RunStatusView {
+            final_review_status: None,
+            hold_category: None,
+            autonomy_protocol: None,
+        };
     };
     match state
         .db
@@ -114,8 +164,42 @@ async fn fetch_run_status(
                 .ok()
                 .filter(|s| !s.is_empty())
                 .map(|s| s.to_string());
-            (frs, hc)
+            let ap = autonomy_protocol_from_decision(&log.decision);
+            RunStatusView {
+                final_review_status: frs,
+                hold_category: hc,
+                autonomy_protocol: ap,
+            }
         }
-        _ => (None, None),
+        _ => RunStatusView {
+            final_review_status: None,
+            hold_category: None,
+            autonomy_protocol: None,
+        },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mongodb::bson::doc;
+
+    #[test]
+    fn autonomy_protocol_all_empty_returns_none() {
+        // decision 无任何自治字段（或全空串）→ None（优雅降级）
+        let decision = doc! { "replyText": "hi", "userUnderstanding": "" };
+        assert!(autonomy_protocol_from_decision(&decision).is_none());
+    }
+
+    #[test]
+    fn autonomy_protocol_partial_returns_full_nine_keys() {
+        // 任一非空 → Some，含全 9 键，缺失/空的填 ""
+        let decision = doc! { "whyShouldReply": "用户主动询问，及时回应推进决策" };
+        let v = autonomy_protocol_from_decision(&decision).expect("some");
+        let obj = v.as_object().expect("object");
+        assert_eq!(obj.len(), 9);
+        assert_eq!(obj.get("whyShouldReply").and_then(|x| x.as_str()), Some("用户主动询问，及时回应推进决策"));
+        assert_eq!(obj.get("userUnderstanding").and_then(|x| x.as_str()), Some(""));
+        assert_eq!(obj.get("riskSelfCheck").and_then(|x| x.as_str()), Some(""));
     }
 }

@@ -2,6 +2,7 @@
 export const CANONICAL_KEYS = [
   "accountId",
   "approved",
+  "autonomyProtocol",
   "contactWxid",
   "contextPackSnapshot",
   "createdAt",

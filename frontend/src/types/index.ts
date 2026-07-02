@@ -284,6 +284,18 @@ export type LlmUsageResponse = {
   items: LlmUsageItem[];
 };
 
+export type AutonomyProtocol = {
+  userUnderstanding?: string;
+  relationshipRead?: string;
+  operationGoal?: string;
+  knowledgeNeedReason?: string;
+  memoryUpdateReason?: string;
+  riskSelfCheck?: string;
+  selfCritique?: string;
+  whyShouldReply?: string;
+  whySkipReply?: string;
+};
+
 export type DecisionReview = {
   id: string;
   contactWxid?: string;
@@ -299,6 +311,7 @@ export type DecisionReview = {
   finalReviewStatus?: string;
   holdCategory?: string;
   status: string;
+  autonomyProtocol?: AutonomyProtocol | null;
   createdAt?: string;
 };
 
