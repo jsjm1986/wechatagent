@@ -4612,6 +4612,7 @@ pub struct PostReleaseReview {
 /// 快照）。`severity` / `kind` / `suggested_action` 是封闭枚举，写库前必须经
 /// 后端校验，不允许 LLM 输出未知值。
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct KnowledgeDigestCard {
     /// 持久 id：前端勾选 / dismiss / single-card 派工都按这个引用。
     pub card_id: ObjectId,

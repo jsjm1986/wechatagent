@@ -2,6 +2,7 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 import { render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { TaskRail } from "../../../features/knowledge/today";
+import { ToastProvider } from "../../../components/ui/Toast";
 
 function mockFetch(handler: (url: string, init?: RequestInit) => unknown) {
   globalThis.fetch = vi.fn(async (url: unknown, init?: RequestInit) => {
@@ -31,7 +32,11 @@ describe("TaskRail 任务总览列表", () => {
       }
       return {};
     });
-    render(<TaskRail />);
+    render(
+      <ToastProvider>
+        <TaskRail />
+      </ToastProvider>
+    );
     await waitFor(() => expect(screen.getByText("S1")).toBeInTheDocument());
     expect(screen.getByText("S2")).toBeInTheDocument();
     // 进度文本用 completedStepCount 数字渲染（防止被误改成对数组取 .length）。
@@ -52,7 +57,11 @@ describe("TaskRail 任务总览列表", () => {
       }
       return {};
     });
-    render(<TaskRail />);
+    render(
+      <ToastProvider>
+        <TaskRail />
+      </ToastProvider>
+    );
     await waitFor(() => expect(screen.getByText("S1")).toBeInTheDocument());
     await user.click(screen.getByText("S1"));
     await waitFor(() =>
