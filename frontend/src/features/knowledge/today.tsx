@@ -513,7 +513,7 @@ export function KnowledgeInbox({
   function handleDismiss(id: string) {
     // 本地乐观隐藏 + toast（后端暂无逐条 dismiss 接口时不发死请求）
     setDismissed((prev) => new Set(prev).add(id));
-    toast.success("已从待办中移除");
+    toast.success("已暂时忽略（刷新后恢复）");
   }
 
   return (
@@ -593,7 +593,7 @@ export function KnowledgeInbox({
               ) : null}
               {it.suggestedActions.includes("dismiss") ? (
                 <button type="button" className="wikiInboxDismiss" onClick={() => handleDismiss(it.id)}>
-                  <X size={12} /> 忽略
+                  <X size={12} /> 暂时忽略
                 </button>
               ) : null}
             </div>
@@ -795,6 +795,7 @@ interface ChatTaskListItem {
 }
 
 export function TaskRail() {
+  const toast = useToast();
   const [sessionId, setSessionId] = useState("");
   const [task, setTask] = useState<ChatTaskView | null>(null);
   const [pending, setPending] = useState(false);
@@ -806,11 +807,16 @@ export function TaskRail() {
   async function loadTaskList() {
     try {
       const r = await fetch("/api/knowledge/chat/tasks");
-      if (!r.ok) return; // 列表失败不阻塞手工跟踪，静默降级
+      if (!r.ok) {
+        // 列表失败不阻塞手工跟踪，静默降级 + 轻量提示
+        toast.error("任务列表加载失败，可手动输入任务 ID");
+        return;
+      }
       const data = (await r.json()) as { items?: ChatTaskListItem[] };
       setTaskList(data.items ?? []);
     } catch {
-      /* 列表拉取失败：保留手工输入 fallback，不弹错 */
+      // 列表拉取失败：保留手工输入 fallback + 轻量提示
+      toast.error("任务列表加载失败，可手动输入任务 ID");
     }
   }
 
