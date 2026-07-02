@@ -1,0 +1,193 @@
+/* 驾驶舱三段式外壳样式（Task 2 脚手架）。
+ * 变量全部取自 components/ui/tokens.css，禁止硬编码色值。
+ * 注意：本文件用 CSS Modules（import styles + className={styles.x}），
+ * 绝不改成全局字符串 className 后副作用导入（Rollup tree-shake 会删光）。 */
+
+.cockpitPanel {
+  display: grid;
+  gap: 14px;
+}
+
+/* 段控（观测/配置）——胶囊分段器 */
+.segmented {
+  display: inline-flex;
+  gap: 4px;
+  background: var(--surface-page);
+  border: 1px solid var(--hairline);
+  border-radius: var(--r-sm);
+  padding: 3px;
+  width: fit-content;
+}
+
+.seg,
+.segActive {
+  border: none;
+  background: transparent;
+  padding: 6px 16px;
+  border-radius: calc(var(--r-sm) - 3px);
+  font-size: 13px;
+  cursor: pointer;
+  color: var(--ink-3);
+}
+
+.segActive {
+  background: var(--surface-card);
+  color: var(--ink-1);
+  font-weight: 640;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.06);
+}
+
+/* 常驻判断条（Task 3）：6 chip 横排换行，色值全取 tokens.css，禁硬编码。 */
+.judgmentBar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+}
+
+.chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 5px 11px;
+  border-radius: var(--r-sm);
+  font-size: 12.5px;
+  font-weight: 560;
+  color: var(--ink-1);
+  border: 1px solid var(--hairline);
+  background: var(--surface-page);
+  line-height: 1.2;
+}
+
+/* 可点击 chip（风险灯 / 请示灯）：去按钮默认样式，保留 chip 外观 + 手型。 */
+.chipButton {
+  cursor: pointer;
+  font-family: inherit;
+}
+
+/* tone 底色：全部引用 tokens.css 的半透明 fill 变量。 */
+.chipSent {
+  background: var(--fill-running);
+}
+
+.chipHeld {
+  background: var(--fill-held);
+}
+
+.chipBlocked {
+  background: var(--fill-blocked);
+}
+
+.chipBrand {
+  background: var(--fill-brand);
+}
+
+.chipScheduled {
+  background: var(--fill-scheduled);
+}
+
+.chipNeutral {
+  background: var(--fill-inactive);
+}
+
+/* 下钻视图：返回按钮 + 头部 */
+.drilldownHead {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.backButton {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  border: 1px solid var(--hairline);
+  background: var(--surface-card);
+  color: var(--ink-2);
+  padding: 6px 12px;
+  border-radius: var(--r-sm);
+  font-size: 13px;
+  cursor: pointer;
+}
+
+/* 运营健康度卡 tone 底色（Task 4）：全部引用 tokens.css 半透明 fill 变量，
+   替代原全局 `healthItem ${tone}` 的硬编码色值。good=绿 / warn=橙 / danger=红。 */
+.health_good {
+  background: var(--fill-running);
+}
+
+.health_warn {
+  background: var(--fill-held);
+}
+
+.health_danger {
+  background: var(--fill-blocked);
+}
+
+/* 长期记忆卡下钻入口（Task 4）：把只读记忆摘要包成可点击按钮进 memory 下钻。
+   显式重置 button 默认外观，避免全局裸 button 规则污染；块级铺满、文本左对齐。 */
+.memoryDrillCard {
+  display: block;
+  width: 100%;
+  text-align: left;
+  padding: 0;
+  border: none;
+  background: transparent;
+  cursor: pointer;
+  font: inherit;
+  color: inherit;
+}
+
+/* 决策复盘下钻（Task 5）：每条复盘的展开/收起按钮 + 结构化判断依据。
+   色值全取 tokens.css，禁硬编码。 */
+.reviewToggle {
+  align-self: flex-start;
+  margin-top: 6px;
+  padding: 2px 0;
+  border: none;
+  background: transparent;
+  color: var(--ai);
+  font-size: 12.5px;
+  cursor: pointer;
+  font-family: inherit;
+}
+
+.reviewDetail {
+  display: grid;
+  gap: 8px;
+  margin-top: 8px;
+  padding-top: 8px;
+  border-top: 1px dashed var(--hairline);
+}
+
+.reviewMetaRow,
+.reviewScores {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.reviewChip {
+  display: inline-flex;
+  align-items: center;
+  padding: 3px 9px;
+  border-radius: var(--r-sm);
+  font-size: 12px;
+  color: var(--ink-2);
+  border: 1px solid var(--hairline);
+  background: var(--surface-page);
+}
+
+.reviewNextAction {
+  font-size: 12.5px;
+  color: var(--ink-2);
+}
+
+/* 记忆全景：已弃用事实的显性弃用说明（时间 + 原因），替代原来只藏在 title 里的 tooltip。 */
+.factDeprecatedNote {
+  font-size: 12px;
+  color: var(--muted);
+  margin-top: 2px;
+}
+
+

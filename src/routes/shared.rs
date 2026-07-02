@@ -460,13 +460,61 @@ pub(super) fn operation_health_json(
     contact: &Contact,
     memory: &OperatingMemory,
     review: Option<&AgentDecisionReview>,
+    in_quiet_hours: bool,
+    next_wake_at: Option<String>,
+    quiet_hours_enabled: bool,
 ) -> Value {
     let scores = health_scores_document(contact, memory, review);
     let items = health_items_from_scores(&scores);
     json!({
         "scores": scores,
-        "items": items
+        "items": items,
+        "inQuietHours": in_quiet_hours,
+        "nextWakeAt": next_wake_at,
+        "quietHoursEnabled": quiet_hours_enabled
     })
+}
+
+/// Task 1：为 operation-health 只读聚合算出作息门控三值（`inQuietHours` /
+/// `nextWakeAt` / `quietHoursEnabled`），供驾驶舱「作息灯」消费。
+///
+/// 纯只读：加载该 contact workspace 的 domain_config → runtime，加载 active
+/// domain_profile，调 `quiet_hours` 现成纯函数判定。**不碰 agent 决策 / gateway /
+/// 发送逻辑**。`jitter_seed` 用 `contact.wxid`、`jitter_max_seconds` 用
+/// `config.wake_jitter_max_seconds`（与 gateway 重排 wake 口径一致）。非静默时
+/// `next_wake_at` 为 `None`（前端渲染为 null）。
+pub(super) async fn compute_quiet_hours_view(
+    state: &AppState,
+    contact: &Contact,
+) -> AppResult<(bool, Option<String>, bool)> {
+    let domain_config =
+        agent::load_user_operation_domain_config(state, &contact.workspace_id).await?;
+    let runtime = agent::UserRuntimeParameters::from_config(domain_config.as_ref(), state);
+    let profile = agent::load_active_domain_profile(&state.db, &contact.workspace_id).await;
+    let quiet_hours_enabled = agent::quiet_hours::effective_quiet_hours_enabled(
+        contact,
+        &profile,
+        runtime.quiet_hours_enabled,
+    );
+    let in_quiet_hours = quiet_hours_enabled
+        && agent::quiet_hours::is_quiet_now(
+            runtime.quiet_hours_start,
+            runtime.quiet_hours_end,
+            runtime.quiet_hours_tz_offset_hours,
+        );
+    let next_wake_at = if in_quiet_hours {
+        agent::quiet_hours::next_wake_at(
+            runtime.quiet_hours_end,
+            runtime.quiet_hours_tz_offset_hours,
+            &contact.wxid,
+            state.config.wake_jitter_max_seconds,
+        )
+        .try_to_rfc3339_string()
+        .ok()
+    } else {
+        None
+    };
+    Ok((in_quiet_hours, next_wake_at, quiet_hours_enabled))
 }
 
 /// 把一个 health scores document 组装成 canonical 7 项 health items 数组（JSON）。
@@ -2130,7 +2178,14 @@ mod tests {
             created_at: DateTime::from_millis(1_700_000_000_000),
         };
 
-        let projected = operation_health_json(&contact, &memory, Some(&review));
+        let projected = operation_health_json(
+            &contact,
+            &memory,
+            Some(&review),
+            true,
+            Some("2026-07-02T00:00:00Z".to_string()),
+            true,
+        );
         crate::routes::contract_snapshot::assert_contract_fixture("operation_health", projected);
     }
 
@@ -2253,5 +2308,101 @@ mod tests {
             prompt_empty.contains("暂无受控取值"),
             "空字典应输出'暂无受控取值'兜底"
         );
+    }
+
+    /// Task 1：operation_health_json 返回 JSON 顶层携带 quiet_hours 三只读字段。
+    /// 静默中：inQuietHours=true + nextWakeAt 为 RFC3339 string + quietHoursEnabled=true；
+    /// 非静默：nextWakeAt 为 null。
+    #[test]
+    fn operation_health_json_carries_quiet_hours_fields() {
+        use super::operation_health_json;
+        use crate::models::{AgentStatus, Contact, MemoryCardTyped, OperatingMemory};
+        use mongodb::bson::{DateTime, Document};
+
+        let contact = Contact {
+            id: None,
+            workspace_id: "default".to_string(),
+            account_id: "default".to_string(),
+            wxid: "wx_health".to_string(),
+            nickname: None,
+            remark: None,
+            alias: None,
+            agent_status: AgentStatus::Managed,
+            human_profile_note: None,
+            custom_agent_instructions: None,
+            operation_mode_override: None,
+            agent_profile: None,
+            memory_summary: None,
+            playbook_id: None,
+            playbook_version: None,
+            manual_tags: Vec::new(),
+            manual_tags_updated_at: None,
+            manual_tags_by: None,
+            confirmed_tags: Vec::new(),
+            bayesian_signals: Vec::new(),
+            personality_profile: None,
+            tags_version: 0,
+            domain_attributes: None,
+            domain_attributes_updated_at: None,
+            commitments: Vec::new(),
+            follow_up_policy: None,
+            operation_state: Some("new_contact".to_string()),
+            operation_state_reason: None,
+            operation_state_confidence: None,
+            operation_state_updated_at: None,
+            cooldown_until: None,
+            operation_policy: Document::new(),
+            profile_attributes: Document::new(),
+            profile_updated_at: None,
+            last_message_at: None,
+            last_inbound_at: None,
+            last_outbound_at: None,
+            last_agent_run_at: None,
+            last_outbound_style: None,
+            intent_trajectory: Vec::new(),
+            outcome_events: Vec::new(),
+            locale: None,
+            created_at: DateTime::now(),
+            updated_at: DateTime::now(),
+        };
+        let memory = OperatingMemory {
+            id: None,
+            workspace_id: "default".to_string(),
+            account_id: "default".to_string(),
+            contact_wxid: "wx_health".to_string(),
+            user_understanding: Document::new(),
+            relationship_state: Document::new(),
+            product_fit: Document::new(),
+            next_action: Document::new(),
+            context_pack: Document::new(),
+            context_pack_version: 0,
+            context_pack_updated_at: None,
+            memory_card: MemoryCardTyped::default(),
+            memory_card_version: 0,
+            memory_card_updated_at: None,
+            created_at: DateTime::now(),
+            updated_at: DateTime::now(),
+        };
+
+        let v = operation_health_json(
+            &contact,
+            &memory,
+            None,
+            true,
+            Some("2026-07-02T00:00:00Z".to_string()),
+            true,
+        );
+        assert_eq!(v["inQuietHours"], serde_json::json!(true));
+        assert_eq!(v["nextWakeAt"], serde_json::json!("2026-07-02T00:00:00Z"));
+        assert_eq!(v["quietHoursEnabled"], serde_json::json!(true));
+        // 既有 scores/items 仍保留。
+        assert!(v.get("scores").is_some(), "scores 不应丢失");
+        assert!(v.get("items").is_some(), "items 不应丢失");
+
+        // 非静默时 nextWakeAt 应为 null。
+        let v2 = operation_health_json(&contact, &memory, None, false, None, false);
+        assert_eq!(v2["inQuietHours"], serde_json::json!(false));
+        assert_eq!(v2["nextWakeAt"], serde_json::json!(null));
+        assert_eq!(v2["quietHoursEnabled"], serde_json::json!(false));
     }
 }

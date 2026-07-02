@@ -1,9 +1,11 @@
 // A2：运营记忆可编辑表单的组件级测试。
-// 渲染 cockpit 标签，改一个输入框（onChange 调 onMemoryDraftChange），
-// 点"保存运营记忆"（onClick 调 onSaveOperatingMemory），断言回调被触发。
+// 驾驶舱重构后，运营记忆编辑器 + last_commitment/follow_up_policy 编辑项统一落在
+// 配置段 ConfigureView（原 UserOperationCockpit 的 cockpit/profile 标签内容合并成一屏）。
+// 断言等价：改一个输入框（onChange 调 onMemoryDraftChange / onProfileEditDraftChange），
+// 点"保存运营记忆"（onClick 调 onSaveOperatingMemory）。
 import { describe, it, expect, vi } from "vitest";
 import { render, screen, fireEvent } from "@testing-library/react";
-import { UserOperationCockpit } from "../../features/user-ops/legacy";
+import { ConfigureView } from "../../features/user-ops/cockpit/ConfigureView";
 import type { Contact, OperatingMemoryDraft } from "../../types";
 
 // 子区块（PlannerViewSection / SendHistorySection）挂载即 fetch，mock api 静默。
@@ -34,8 +36,7 @@ function renderCockpit(overrides: Record<string, unknown> = {}) {
   const onProfileEditDraftChange = vi.fn();
   const noop = vi.fn();
   render(
-    <UserOperationCockpit
-      activeTab="cockpit"
+    <ConfigureView
       busy={false}
       decisionReviews={[]}
       guideBusy={false}
@@ -79,14 +80,13 @@ function renderCockpit(overrides: Record<string, unknown> = {}) {
       onSaveOperatingMemory={onSaveOperatingMemory}
       onSelectedPlaybook={noop}
       onSimulationInput={noop}
-      onTab={noop}
       {...overrides}
     />,
   );
   return { onMemoryDraftChange, onSaveOperatingMemory, onProfileEditDraftChange };
 }
 
-describe("UserOperationCockpit 运营记忆编辑表单", () => {
+describe("配置段（ConfigureView）运营记忆编辑表单", () => {
   it("编辑身份输入框时以 patch 调 onMemoryDraftChange", () => {
     const { onMemoryDraftChange } = renderCockpit();
     const input = screen.getByPlaceholderText("这个人是谁、什么角色");
@@ -101,14 +101,14 @@ describe("UserOperationCockpit 运营记忆编辑表单", () => {
   });
 
   it("编辑 last_commitment 输入框时以 patch 调 onProfileEditDraftChange", () => {
-    const { onProfileEditDraftChange } = renderCockpit({ activeTab: "profile" });
+    const { onProfileEditDraftChange } = renderCockpit();
     const input = screen.getByPlaceholderText("例：本周内给到方案报价");
     fireEvent.change(input, { target: { value: "下周回复方案" } });
     expect(onProfileEditDraftChange).toHaveBeenCalledWith({ lastCommitment: "下周回复方案" });
   });
 
   it("编辑 follow_up_policy 输入框时以 patch 调 onProfileEditDraftChange", () => {
-    const { onProfileEditDraftChange } = renderCockpit({ activeTab: "profile" });
+    const { onProfileEditDraftChange } = renderCockpit();
     const input = screen.getByPlaceholderText("例：每周跟进一次，客户明确拒绝则停止");
     fireEvent.change(input, { target: { value: "每两周一次" } });
     expect(onProfileEditDraftChange).toHaveBeenCalledWith({ followUpPolicy: "每两周一次" });
