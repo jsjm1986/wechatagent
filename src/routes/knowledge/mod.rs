@@ -45,6 +45,10 @@ pub use catalog::*;
 pub use repair::*;
 pub use chat::*;
 pub(in crate::routes) use digest_inbox::*;
+// 跨租户 digest 缺陷回归钉:digest_today handler + query 暴露给集成测试 crate
+// （经 routes::ext_knowledge 再导出）。glob 再导出被 pub(in crate::routes) 收窄，
+// 故显式 pub use 提升这两项可见性（同 crud::update_operation_knowledge_chunk 惯例）。
+pub use digest_inbox::{digest_today, DigestTodayQuery};
 pub use wiki_edit::*;
 pub use sources_meta::*;
 

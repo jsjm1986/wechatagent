@@ -1022,19 +1022,37 @@ async fn ensure_relationship_type_suggestions_indexes(db: &Database) -> anyhow::
 
 /// F23：`suspected_deal_signals` 索引（疑似成交待核实闭环·方案B）。
 ///
-/// - `(workspace_id, contact_id)` unique：同一 contact 在同 workspace 只一条
-///   待核实信号，重复观察累加 `occurrences` / 刷新 `last_seen_at`，
-///   DuplicateKey 视为「信号已存在」（gateway upsert 锚此）。
+/// - `(workspace_id, contact_id)` **部分唯一**（partialFilterExpression
+///   `{status:"pending"}`）：同一 contact 在同 workspace **至多一条 pending** 待核实
+///   信号，重复观察累加 `occurrences` / 刷新 `last_seen_at`，DuplicateKey 视为
+///   「pending 信号已存在」（gateway upsert 锚此）。approved/rejected 终态记录**不占**
+///   唯一槽 → 同一 contact 经核实闭环后，真实二次成交能再生成一条新 pending 进队列。
+///   （历史全量 unique `workspace_id_1_contact_id_1` 会让终态记录永久阻断后续 pending，
+///   已改；见 gateway.rs upsert 注释。）
 /// - `(workspace_id, status)`：后台核实列表按 status（pending/approved/rejected）筛选。
 ///
 /// 字段为 snake_case：`SuspectedDealSignal` 未加 `#[serde(rename_all)]`，
 /// BSON 层即 snake_case，须与此处索引字段逐字一致。
 async fn ensure_suspected_deal_signals_indexes(db: &Database) -> anyhow::Result<()> {
+    // 旧全量 unique (workspace_id, contact_id) → 部分 unique(仅 status=pending)。
+    // 同键不同 options 必须先 drop 旧索引否则 create 报 code 85 IndexOptionsConflict。
+    // best-effort：旧索引不存在(全新库 / 已迁移)时 IndexNotFound 被吞,二次启动安全。
+    // 旧索引无显式 name → MongoDB 自动命名 "workspace_id_1_contact_id_1"。
+    let _ = db
+        .collection_suspected_deal_signals()
+        .drop_index("workspace_id_1_contact_id_1", None)
+        .await;
     db.collection_suspected_deal_signals()
         .create_index(
             IndexModel::builder()
                 .keys(doc! { "workspace_id": 1, "contact_id": 1 })
-                .options(IndexOptions::builder().unique(true).build())
+                .options(
+                    IndexOptions::builder()
+                        .unique(true)
+                        .partial_filter_expression(doc! { "status": "pending" })
+                        .name("uniq_suspected_deal_pending_ws_contact".to_string())
+                        .build(),
+                )
                 .build(),
             None,
         )

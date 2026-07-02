@@ -244,3 +244,93 @@ async fn reject_marks_rejected() {
         .expect("contact exists");
     assert!(after.outcome_events.is_empty(), "reject 绝不落成交");
 }
+
+/// 回归钉（Stage4 孤儿#suspected_deal.2 修复）：unique 锚从全量 (ws,contact) 改为
+/// 仅 status="pending" 的部分唯一索引后，同一 contact 在**终态记录已存在**时仍能
+/// 因真实二次成交再生成一条新 pending。
+///
+/// 修复前（全量 unique (ws,contact)）：seed 一条 approved 后，再 insert 一条 pending
+/// → 同 (ws,contact) → E11000 DuplicateKey，新 pending 被吞，二次成交永远进不了队列。
+/// 修复后（partial unique on status=pending）：approved 不在部分索引内、不占槽，新
+/// pending 插入成功；但第二条 pending 仍与第一条 pending 冲突 → 去重意图保留。
+///
+/// 本测试直接锤 `TestApp::start()` 经 `ensure_indexes` 建出的**真实索引**（非平行
+/// 重写逻辑）。把 indexes.rs 的部分唯一索引改回全量 unique → 断言 1（approved 共存
+/// 下新 pending 插入成功）翻红。
+#[tokio::test]
+#[ignore]
+async fn terminal_signal_does_not_block_new_pending() {
+    use mongodb::error::{ErrorKind, WriteFailure};
+
+    let app = common::TestApp::start().await;
+    let ws = app.state.config.default_workspace_id.clone();
+    let contact_id = ObjectId::new().to_hex();
+
+    // 先落一条 approved（模拟上一轮成交已核实闭环）。
+    seed_signal(&app.state, &ws, &contact_id, "approved").await;
+
+    // 断言 1：同一 contact 的新 pending 必须能插入（修复前 = E11000 失败）。
+    let new_pending = SuspectedDealSignal {
+        id: None,
+        workspace_id: ws.clone(),
+        account_id: "default".to_string(),
+        contact_id: contact_id.clone(),
+        value: "二次成交·待核实".to_string(),
+        evidence: Some("客户说要再下一单".to_string()),
+        confidence: 80,
+        status: "pending".to_string(),
+        occurrences: 1,
+        first_seen_at: DateTime::now(),
+        last_seen_at: DateTime::now(),
+        reviewed_at: None,
+        reviewed_by: None,
+    };
+    app.state
+        .db
+        .collection_suspected_deal_signals()
+        .insert_one(&new_pending, None)
+        .await
+        .expect("approved 存在时新 pending 必须能插入(修复前会 E11000)");
+
+    // 断言 2：第二条 pending 仍被部分唯一索引拒（去重意图保留）。
+    let dup_pending = SuspectedDealSignal {
+        id: None,
+        ..new_pending.clone()
+    };
+    let err = app
+        .state
+        .db
+        .collection_suspected_deal_signals()
+        .insert_one(&dup_pending, None)
+        .await
+        .expect_err("第二条 pending 应被部分唯一索引拒(去重)");
+    let is_dup_key = matches!(
+        err.kind.as_ref(),
+        ErrorKind::Write(WriteFailure::WriteError(we)) if we.code == 11000
+    );
+    assert!(is_dup_key, "第二条 pending 应因 DuplicateKey(11000) 被拒,实际={err:?}");
+
+    // 断言 3：该 contact 下恰好 1 条 pending + 1 条 approved 并存。
+    let pending_count = app
+        .state
+        .db
+        .collection_suspected_deal_signals()
+        .count_documents(
+            doc! { "workspace_id": &ws, "contact_id": &contact_id, "status": "pending" },
+            None,
+        )
+        .await
+        .expect("count pending");
+    let approved_count = app
+        .state
+        .db
+        .collection_suspected_deal_signals()
+        .count_documents(
+            doc! { "workspace_id": &ws, "contact_id": &contact_id, "status": "approved" },
+            None,
+        )
+        .await
+        .expect("count approved");
+    assert_eq!(pending_count, 1, "应恰好 1 条 pending");
+    assert_eq!(approved_count, 1, "approved 记录应仍在(未被覆盖)");
+}
