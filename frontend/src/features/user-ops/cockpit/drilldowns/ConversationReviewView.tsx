@@ -69,7 +69,7 @@ function ReviewItem({ review }: { review: DecisionReview }) {
       </strong>
       <p>{review.reviewSummary || review.replyText || "-"}</p>
       <span>{formatTime(review.createdAt)}</span>
-      {hasDetail && (
+      {(hasDetail || hasProtocol) && (
         <button
           type="button"
           className={styles.reviewToggle}
