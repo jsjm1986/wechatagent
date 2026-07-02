@@ -81,7 +81,7 @@ mod playbooks;
 // resolve / reassign / list handler 真函数及其请求体结构，仿 domain_profiles 先例。
 pub mod principal_escalations;
 mod products;
-mod prompt_templates;
+pub mod prompt_templates;
 mod referral_cards;
 mod send_ledger;
 mod reviews;
@@ -137,6 +137,10 @@ pub mod ext_knowledge {
     // 「请求体无法表达」的 model 字段。请求体字段私有但派生 Deserialize，测试侧用
     // serde_json::from_value 构造。
     pub use super::knowledge::{update_operation_knowledge_chunk, OperationKnowledgeChunkRequest};
+    // 跨租户 digest 缺陷回归钉：digest_today handler 未命中时按需合成，必须把
+    // admin.current_workspace 透传给 generate_today_digest（旧代码硬编码
+    // default_workspace_id → 跨租户串写/串读）。供集成测试直驱（绕过 axum）。
+    pub use super::knowledge::{digest_today, DigestTodayQuery};
 }
 pub use shared::upsert_contact_from_value;
 pub use shared::{apply_contact_changes, SkippedField};

@@ -4235,11 +4235,12 @@ async fn apply_agent_updates(
         if let Some(ev) = &evidence {
             set_fields.insert("evidence", ev);
         }
-        // upsert 锚 (workspace_id, contact_id, status="pending")（F23 unique 索引）。已审
-        // （approved/rejected）的不复活——filter 加 status="pending" 约束：仅 pending 或
-        // 不存在时刷新累加；已审记录命中不到 → $setOnInsert 又因 unique 锚冲突而不新建
-        // → no-op，保核实结论不被新一轮信号覆盖回 pending。value 只放 $set（upsert 时
-        // 插入也会写），避免与 $setOnInsert 键冲突。
+        // upsert 锚 (workspace_id, contact_id) 仅在 status="pending" 时唯一（F23 部分唯一
+        // 索引 uniq_suspected_deal_pending_ws_contact）。filter 加 status="pending" 约束：
+        // 仅命中或不存在 pending 时刷新累加 / 新建。已审（approved/rejected）终态记录不在
+        // 部分索引内、不占唯一槽 —— 同一 contact 经核实闭环后，真实二次成交产生的新信号会
+        // $setOnInsert 新建一条 pending 重新进待核实队列（复购场景不再被永久阻断）。value
+        // 只放 $set（upsert 插入也会写），避免与 $setOnInsert 键冲突。
         let filter = doc! {
             "workspace_id": &contact.workspace_id,
             "contact_id": &contact_id,

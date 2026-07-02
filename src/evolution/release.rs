@@ -631,7 +631,7 @@ pub async fn rollback_prompt(
         .map_err(EvolutionError::from)?;
 
     // 2. 把 previous_version 那条重新置 true
-    state
+    let restored = state
         .db
         .raw()
         .collection::<mongodb::bson::Document>("prompt_templates")
@@ -653,6 +653,13 @@ pub async fn rollback_prompt(
         )
         .await
         .map_err(EvolutionError::from)?;
+    // previous_version 行不存在（如被手动 publish 物删历史）→ 中止事务返错，避免翻掉
+    // 当前 current 后无 current 可用的静默假成功。早返丢 session 即中止未提交事务。
+    if restored.matched_count == 0 {
+        return Err(EvolutionError::InvalidStatus(format!(
+            "rollback 目标 prompt 版本 {previous_version}（key={prompt_key}）不存在，已中止回滚（历史行是否被物删？）"
+        )));
+    }
 
     // 3. 推 proposal 到 rolled_back
     state

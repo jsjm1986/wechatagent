@@ -50,7 +50,9 @@ pub async fn worker_loop(state: AppState) {
         let wait = duration_until_next_run(run_hour);
         tracing::debug!(?wait, "knowledge digest worker sleeping until next run");
         sleep(wait).await;
-        if let Err(err) = generate_today_digest(&state).await {
+        let workspace_id = state.config.default_workspace_id.clone();
+        let account_id = state.config.default_account_id.clone();
+        if let Err(err) = generate_today_digest(&state, &workspace_id, &account_id).await {
             tracing::warn!(?err, "knowledge digest tick failed; continuing");
         }
     }
@@ -736,9 +738,11 @@ fn parse_cards_from_llm_array(raw_arr: Vec<Value>, report_date: &str) -> Vec<Kno
 /// `(workspace_id, account_id, report_date)`。
 ///
 /// 调用方：worker_loop（每日 09:00）+ digest_today / digest_regenerate sync 路径。
-pub(crate) async fn generate_today_digest(state: &AppState) -> AppResult<KnowledgeDailyReport> {
-    let workspace_id = state.config.default_workspace_id.clone();
-    let account_id = state.config.default_account_id.clone();
+pub(crate) async fn generate_today_digest(
+    state: &AppState,
+    workspace_id: &str,
+    account_id: &str,
+) -> AppResult<KnowledgeDailyReport> {
     let report_date = chrono::Local::now().format("%Y-%m-%d").to_string();
     let run_id = format!("digest_{}_{}", account_id, report_date);
 
@@ -748,7 +752,7 @@ pub(crate) async fn generate_today_digest(state: &AppState) -> AppResult<Knowled
         8,
         i32::MAX,
     ));
-    generate_today_digest_inner(state, &workspace_id, &account_id, &report_date, &run_id, budget).await
+    generate_today_digest_inner(state, workspace_id, account_id, &report_date, &run_id, budget).await
 }
 
 async fn generate_today_digest_inner(
