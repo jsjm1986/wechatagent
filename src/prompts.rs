@@ -1192,20 +1192,8 @@ fn prompt_specs() -> Vec<PromptSpec> {
             status: "active",
             content: r#"请基于以下上下文生成运营决策 JSON。本契约由系统校验层 (`RawAgentDecision::validate_and_promote`) 强制：缺字段、枚举非法、互斥违规、关键变化轮长度不足都会被自动拦截，无法发送。请把所有字段都填好。
 
-## 决策模式（决定接下来 JSON 用哪种形态）
-1. tool_calling 中间轮：本次只请求知识工具，不出回复。该形态只填 `decisionPhase` + `toolCalls`，其它字段全部省略。
-2. final 轮（默认）：完整决策，必须填本契约下方所有 final 必填字段。
-
-### tool_calling 形态示例
-{
-  "decisionPhase": "tool_calling",
-  "toolCalls": [
-    { "tool": "knowledge.list_catalog", "args": {} },
-    { "tool": "knowledge.search",       "args": { "query": "企业版定价" } },
-    { "tool": "knowledge.open_slice",   "args": { "chunkId": "..." } }
-  ]
-}
-仅这 3 个工具名合法；其它名会被判 `invalid_tool_call`。
+## 决策形态（本轮只输出一次完整决策，没有中间轮）
+本模板是**单发**决策：需要的知识检索已由系统在本轮之前完成并注入下方上下文，你不需要、也不能再请求任何工具或分多轮。请直接输出下面 final 形态的完整决策 JSON（`decisionPhase` 恒为 `"final"`）。
 
 ### final 形态契约（下面所有字段都必填，缺一即全局阻断）
 {
@@ -2569,6 +2557,39 @@ mod reply_redline_anchor_tests {
                 "DEFAULT_REPLY_REDLINE_ANCHORS 锚 `{anchor}` 与 user.reply.policy 正文不一致，锚完整性闸会失配"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod reply_task_single_shot_tests {
+    use super::*;
+
+    /// tool_calling 静默 no_reply 根治护栏：`user.reply.task` 是**单发**决策 prompt
+    /// （主链路无 tool-loop 包裹，用户运营 tool_loop 已 sunset，`decision.tool_calls`
+    /// 永不执行；知识检索由 knowledge_router 独立前置完成）。若 prompt 仍提供
+    /// tool_calling 决策形态，LLM 可能误选该相位 → `build_tool_calling_decision`
+    /// 强制 `reply_text=""` / `should_reply=false`（types.rs）→ 客户提问被静默吞。
+    /// 网关兜底闸（gateway.rs `decision_phase_tool_calling_in_single_shot`）只能记
+    /// degraded、无法恢复从未生成的回复文本——它保留 `should_reply=false`——故**根治
+    /// = prompt 不再提供该形态**，且一次覆盖首发 / rewrite / revision 三个共用本 prompt
+    /// 的决策站点。本护栏锁死：user.reply.task 决策 JSON 只有 final 形态，绝不含
+    /// tool_calling。
+    #[test]
+    fn reply_task_prompt_offers_only_final_phase() {
+        let specs = prompt_specs();
+        let task = specs
+            .iter()
+            .find(|s| s.key == "user.reply.task")
+            .expect("user.reply.task prompt spec 存在");
+        assert!(
+            !task.content.contains("tool_calling"),
+            "user.reply.task 单发 prompt 不得再提供 tool_calling 决策形态（会诱发静默 no_reply）"
+        );
+        // final 形态契约仍在（决策 JSON 主体没被误删）
+        assert!(
+            task.content.contains("\"decisionPhase\": \"final\""),
+            "user.reply.task 应保留 final 形态契约"
+        );
     }
 }
 
