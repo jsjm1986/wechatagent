@@ -140,12 +140,15 @@ pub async fn sync_accounts(
                         "online": account.online,
                         "last_sync_at": account.last_sync_at,
                         "updated_at": account.updated_at,
-                    },
-                    "$setOnInsert": {
+                        // 确保所有 WechatAccount 必填字段都在 $set 或 $setOnInsert 中，
+                        // 避免部分更新留下反序列化失败的不完整记录（capacity 有 serde default=0 可省略）。
                         "workspace_id": &account.workspace_id,
                         "account_id": &account.account_id,
+                    },
+                    "$setOnInsert": {
                         "mcp_api_key": &account.mcp_api_key,
                         "created_at": account.created_at,
+                        "capacity": 0,
                     }
                 },
                 UpdateOptions::builder().upsert(true).build(),
