@@ -89,6 +89,9 @@ function renderCockpit(overrides: Record<string, unknown> = {}) {
 describe("配置段（ConfigureView）运营记忆编辑表单", () => {
   it("编辑身份输入框时以 patch 调 onMemoryDraftChange", () => {
     const { onMemoryDraftChange } = renderCockpit();
+    // 运营记忆编辑器落在「记忆」次级 tab（默认显示「画像」），先切过去；
+    // 「身份」在默认展开的「用户理解」分组内，切 tab 后即可见。
+    fireEvent.click(screen.getByRole("tab", { name: "记忆" }));
     const input = screen.getByPlaceholderText("这个人是谁、什么角色");
     fireEvent.change(input, { target: { value: "工程师" } });
     expect(onMemoryDraftChange).toHaveBeenCalledWith({ identity: "工程师" });
@@ -96,6 +99,7 @@ describe("配置段（ConfigureView）运营记忆编辑表单", () => {
 
   it("点保存运营记忆按钮时调 onSaveOperatingMemory", () => {
     const { onSaveOperatingMemory } = renderCockpit();
+    fireEvent.click(screen.getByRole("tab", { name: "记忆" }));
     fireEvent.click(screen.getByText("保存运营记忆"));
     expect(onSaveOperatingMemory).toHaveBeenCalledTimes(1);
   });
