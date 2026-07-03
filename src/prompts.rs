@@ -1557,7 +1557,7 @@ fn prompt_specs() -> Vec<PromptSpec> {
 - FactRisk >= 6 禁止发送（hallucination 闸）
 - PressureRisk >= 7 禁止发送（软闸；0 仅在你完全无法判断压迫感时使用，正常情况必须给 1-10 的实分）
 - HumanLikeScore < 6 需要改写（软闸；必须填实分）
-- EmotionalValue < 5 需要改写
+- EmotionalValue < 6 需要改写
 - ProductAccuracyScore < 7 禁止发送涉及产品承诺的内容（grounding 闸）
 判 requiresProductKnowledge 时：候选回复只要含可被知识库验证的产品断言——效果数据（成功率、见效时间、回款、百分比）、具体价格、客户案例、能力承诺——无论语气是软是硬，都必须置 requiresProductKnowledge=true，交由 grounding 闸核对 verified 知识背书；只有纯情感承接 / 表达理解 / 轻量澄清问题（不含任何可验证产品断言）才置 false。
 评审重点：事实准确、像真人微信、情绪价值、低压推进、产品知识一致性、没有操控营销。
