@@ -1324,6 +1324,33 @@ async fn run_user_operation_gateway_inner(
     )
     .await
     .ok();
+
+    // 防御兜底：单发决策路径（知识前置）不支持 tool_calling 中间轮，若 LLM 误选该相位
+    // 会导致 should_reply=false（types.rs:907 强制）→ 静默 no_reply，客户提问得不到回复。
+    // 这里检测到 tool_calling 时强制转 final + 清空 tool_calls + 记 degraded，避免误发空回复。
+    // 根因：user.reply.task prompt 提供了 tool_calling 形态但主链路是单发（无工具循环包裹），
+    // LLM 误选后 gateway 无处理 → 回复被吞。本防御是兜底，根治需同时收紧 prompt。
+    if decision.decision_phase == "tool_calling" {
+        write_event_for_account(
+            state,
+            &contact.account_id,
+            Some(&contact.wxid),
+            "decision_phase_tool_calling_in_single_shot",
+            "degraded",
+            "单发决策路径收到 tool_calling 相位（不支持），强制转 final 避免静默 no_reply",
+            Some(doc! {
+                "run_id": &run_id,
+                "tool_calls_count": decision.tool_calls.len() as i64,
+            }),
+        )
+        .await
+        .ok();
+        decision.decision_phase = "final".to_string();
+        decision.tool_calls.clear();
+        // should_reply 保持原值（LLM 在 tool_calling 时默认 false，转 final 后若有 reply_text
+        // 则应该发，但 build_tool_calling_decision 已强制清空 reply_text，此时保持 false 安全）。
+    }
+
     normalize_decision_state(&mut decision, domain_config.as_ref());
     normalize_decision_runtime(&mut decision, &initial_planner);
     let mut planner = planner_from_decision(&decision, "Reply Agent 单轮决策（知识路由前置）");
