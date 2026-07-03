@@ -962,6 +962,18 @@ async fn ensure_customer_acknowledged(
     }
 }
 
+/// 分段 enqueue 的 idempotency base：非空 source_event_id（=message_id，本身即
+/// 幂等锚，同消息重放须命中同 key 去重）原样用；空时回落 run_id，保证多段 key 仍
+/// 按 run 隔离（否则 "#seg{idx}" 非空会走非 synthetic 分支丢掉 run_id，跨 run 雷同
+/// 分段撞键被误去重、静默丢消息）。
+fn segment_idempotency_base<'a>(source_event_id: &'a str, run_id: &'a str) -> &'a str {
+    if source_event_id.is_empty() {
+        run_id
+    } else {
+        source_event_id
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_user_operation_gateway_inner(
     state: &AppState,
@@ -2508,7 +2520,10 @@ async fn run_user_operation_gateway_inner(
         let mut enqueue_errors: Vec<(usize, AppError)> = Vec::new();
         for (idx, segment) in segments.into_iter().enumerate() {
             let seg_source_event_id = if total > 1 {
-                format!("{source_event_id}#seg{idx}")
+                format!(
+                    "{}#seg{idx}",
+                    segment_idempotency_base(&source_event_id, &run_id)
+                )
             } else {
                 source_event_id.clone()
             };
@@ -5527,6 +5542,20 @@ mod tests {
     fn split_reply_empty_or_blank_yields_nothing() {
         assert!(split_reply_into_segments("", 120, 4).is_empty());
         assert!(split_reply_into_segments("   \n\n  ", 120, 4).is_empty());
+    }
+
+    #[test]
+    fn segment_idempotency_base_falls_back_to_run_id_when_source_empty() {
+        // 空 source_event_id(畸形入站无 message_id)→ 多段 key base 回落 run_id,
+        // 保证跨 run 雷同分段不撞键被误去重、静默丢消息。
+        assert_eq!(segment_idempotency_base("", "run123"), "run123");
+    }
+
+    #[test]
+    fn segment_idempotency_base_keeps_source_when_present() {
+        // 非空 source(=message_id,本身即幂等锚)原样用,绝不掺 run_id,
+        // 否则同消息重放命中不同 key 破坏去重致重复发送。
+        assert_eq!(segment_idempotency_base("msg456", "run123"), "msg456");
     }
 
     #[test]
