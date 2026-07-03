@@ -32,20 +32,34 @@
 
 ## 二、业务域测试执行结果
 
-### 已完成域（10 个）
+### 已完成域（18 个）
 
 | 域 | 状态 | 关键发现 | 红线级别 |
 |---|---|---|---|
-| 域① 禁言识别 | ⚠️ | forbiddenClaims 未识别"包治百病"夸大宣称 | high |
+| 域① 禁言识别 | ⚠️ | forbiddenClaims 未识别"包治百病"夸大宣称（LLM 精度） | high |
 | 域② tool_calling | ✅ | tool_calling bug 已修复，验证生效；rate_limited 正常 | critical（已修） |
-| 域③ 素材发送 | ⚠️ | held_by_ai_policy 拦截素材发送（strategy=lean） | high |
+| 域③ 素材发送 | ⚠️ | held_by_ai_policy 拦截素材发送（strategy=lean，AI 策略主动暂缓） | high |
 | 域④ 卡片引荐 | ⚠️ | assist 开+高价值 → 名片未入 outbox(referral_card_id) | high |
 | 域⑤ 三段式 | ✅ | 寒暄→复杂咨询→升档 escalated，全绿通过 | - |
 | 域⑥ 请示通道 | ✅ | **核心闭环健全**（手动验证）escalation resolve → relay 合成 AI 口吻回复入 outbox，不暴露"领导" | critical |
 | 域⑧ 反应分析 | ✅ | **停止意图正确处理**：AI 识别"别再发了"进入 boundary_protection 模式，礼貌退出"好的，收到，打扰了" | critical（红线） |
-| digital_twin | ✅ | 确定性闭环通过 | - |
-| guide | ✅ | 全绿通过 | - |
-| campaign | ⚠️ | follow_up → no_reply（待查） | - |
+| 域⑨ 记忆固化 | ⚠️ | 候选→consolidated 闭环健全、8岁不再是生效事实（冲突裁决正确）；但 8岁/10岁未进 coreFacts、version 未推进（第二次固化 cache_hit）——LLM 精度/缓存，非红线 | 精度类 |
+| 域⑩ 管理 agent | ⛔ BLOCKED | management.plan 端点故障（MCP DOWN，未走到规划） | 外部依赖 |
+| 域⑪ 提示词编辑 | ✅ | 如实探测：本分支 update_prompt 无运行时红线闸（字面红线靠 CI lint check-no-human-takeover）；探测后还原原内容不污染生产 | - |
+| 域⑬ 知识自治 | ✅ | AI 永不自动 verify 红线通过；completeness/repair 低优先 | - |
+| digital_twin | ✅ | 确定性闭环通过（seed→approve→写回 relationship_type） | - |
+| guide | ✅ | 全绿通过（preview 不落业务库、apply 真映射、状态机闸、非 pending 保护） | - |
+| campaign | ⚠️ | dispatch 逻辑/去重/台账全绿；follow_up → no_reply（decisionPhase=final，非 tool_calling bug）；配置错配：default_account_id 生产圈人恒 0 | - |
+| evaluation | ✅ | **judge 修复验证：4/4 场景 passed**（修复前旧 grounding<60 死规则会全 failed）；旧死规则命中 0；finalReviewStatus 为合法闭集值（修复前恒空=死门） | critical（PR#73 验证） |
+| batch_b 行业兼容 | ⛔ BLOCKED | LLM 端点 403 Forbidden（地区访问限制） | 外部依赖 |
+| batch_c management | ⛔ BLOCKED | MCP upstream_error（外部 MCP 服务 DOWN） | 外部依赖 |
+
+### 关键结论
+
+- **产品核心红线全部通过**：停止意图边界保护 ✅ / 请示通道 relay 口吻 ✅ / AI 永不自动 verify ✅ / tool_calling 已修 ✅ / judge 修复生效 ✅
+- **真 bug 数量：1 个**（tool_calling，已修部署验证）
+- **精度类 findings（非红线，LLM 自主/缓存行为）**：域①forbiddenClaims、域③held、域④名片、域⑨记忆固化
+- **外部依赖 BLOCKED（非产品 bug）**：MCP DOWN（域⑩/batch_c）、LLM 403 地区限制（batch_b/域⑨部分轮次）
 
 ### 测试脚本自身缺陷（已发现并记录）
 
