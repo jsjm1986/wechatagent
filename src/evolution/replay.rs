@@ -324,7 +324,7 @@ fn evaluate_single_gate(scores: &Document, gate: &str, threshold: f64) -> bool {
 
 /// 默认其它 4 个 gate 的命中判断（不带 proposed_value 时）：当前 review.scores
 /// 已经过 gateway 写入，用业务"惯用阈值"硬常量推断（fact ≥ 6 / pressure ≥ 7 /
-/// product < 7 / human < 6 / emotional < 5）。这是退化路径，仅用于 W3 短路；
+/// product < 7 / human < 6 / emotional < 6）。这是退化路径，仅用于 W3 短路；
 /// W4 task 5.1 的 `resolve_thresholds` 落地后会被替换。
 fn evaluate_single_gate_default(scores: &Document, gate: &str) -> bool {
     let default_threshold = match default_gate_threshold(gate) {
@@ -342,7 +342,7 @@ fn default_gate_threshold(gate: &str) -> Option<f64> {
         "fact_risk_block" => Some(6.0),
         "pressure_risk_block" => Some(7.0),
         "human_like_score_rewrite" => Some(6.0),
-        "emotional_value_rewrite" => Some(5.0),
+        "emotional_value_rewrite" => Some(6.0),
         "product_accuracy_score_block" => Some(7.0),
         _ => None,
     }
