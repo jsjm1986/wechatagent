@@ -281,3 +281,189 @@
 .simpleActionSummary { font-size: 13px; color: var(--ink-2); margin: 6px 0; line-height: 1.5; }
 .simpleActionEvidence { display: grid; gap: 2px; }
 .simpleActionButtons { display: flex; gap: 8px; margin-top: 12px; }
+
+/* 卡内动作按钮（三张知识卡的按钮无 className，作用域到卡容器内，与 header 按钮同款描边规范） */
+.chunkReviewCard button,
+.profilePublishCard button,
+.lessonPromoteCard button {
+  font: inherit;
+  font-size: 12.5px;
+  font-weight: 600;
+  padding: 8px 16px;
+  border-radius: var(--r-sm);
+  cursor: pointer;
+  background: transparent;
+  border: 1px solid var(--hairline);
+  color: var(--ink-2);
+  transition: background 0.18s, color 0.18s, border-color 0.18s;
+}
+.chunkReviewCard button:hover:not(:disabled),
+.profilePublishCard button:hover:not(:disabled),
+.lessonPromoteCard button:hover:not(:disabled) {
+  background: rgba(0, 0, 0, 0.03);
+  color: var(--ink-1);
+}
+.chunkReviewCard button:disabled,
+.profilePublishCard button:disabled,
+.lessonPromoteCard button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+/* 知识切片核验卡（ChunkReviewCard）——容器无边框，外层 .askHumanRichRow 已描边 */
+.chunkReviewCard { display: flex; flex-direction: column; gap: 8px; }
+.chunkReviewTitle { font-size: 14px; font-weight: 650; color: var(--ink-1); }
+.chunkReviewBody { font-size: 13px; color: var(--ink-2); line-height: 1.5; }
+.chunkReviewCitation {
+  margin: 0;
+  padding: 8px 12px;
+  border-left: 3px solid var(--color-held);
+  background: var(--fill-held);
+  border-radius: 0 var(--r-sm) var(--r-sm) 0;
+  font-size: 12.5px;
+  color: var(--ink-1);
+  line-height: 1.5;
+}
+.chunkReviewMeta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  font-size: 12.5px;
+  color: var(--ink-3, var(--ink-2));
+}
+.chunkReviewMeta code {
+  font-size: 12px;
+  color: var(--ink-2);
+  background: rgba(0, 0, 0, 0.05);
+  padding: 1px 6px;
+  border-radius: 6px;
+}
+.chunkReviewGate {
+  font-size: 12.5px;
+  color: var(--color-held);
+  background: var(--fill-held);
+  border: 1px solid rgba(255, 159, 10, 0.3);
+  border-radius: var(--r-sm);
+  padding: 8px 12px;
+}
+.chunkReviewActions { display: flex; gap: 8px; margin-top: 4px; }
+.chunkReviewError {
+  font-size: 12.5px;
+  color: var(--color-blocked);
+  background: var(--fill-blocked);
+  border: 1px solid rgba(255, 69, 58, 0.3);
+  border-radius: var(--r-sm);
+  padding: 8px 12px;
+}
+.chunkReviewLoading { font-size: 12.5px; color: var(--ink-3, var(--ink-2)); padding: 8px 0; }
+
+/* 画像发布卡（ProfilePublishCard）*/
+.profilePublishCard { display: flex; flex-direction: column; gap: 8px; }
+.profilePublishName { font-size: 14px; font-weight: 650; color: var(--ink-1); }
+.profilePublishStatus {
+  align-self: flex-start;
+  font-size: 12px;
+  font-weight: 600;
+  padding: 2px 10px;
+  border-radius: 999px;
+  background: rgba(0, 0, 0, 0.05);
+  color: var(--ink-2);
+}
+.profilePublishStateMachine {
+  border: 1px solid var(--hairline);
+  border-radius: var(--r-sm);
+  padding: 12px;
+  background: rgba(0, 0, 0, 0.015);
+}
+.profilePublishStateMachineTitle {
+  font-size: 12.5px;
+  font-weight: 650;
+  color: var(--ink-1);
+  margin-bottom: 8px;
+}
+.profilePublishStateList {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.profilePublishState {
+  border-top: 1px solid var(--hairline);
+  padding-top: 8px;
+}
+.profilePublishState:first-child { border-top: none; padding-top: 0; }
+.profilePublishStateHead { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.profilePublishStateName { font-size: 13px; font-weight: 600; color: var(--ink-1); }
+.profilePublishStateKey {
+  font-size: 12px;
+  color: var(--ink-2);
+  background: rgba(0, 0, 0, 0.05);
+  padding: 1px 6px;
+  border-radius: 6px;
+}
+.profilePublishStateInitial {
+  font-size: 11.5px;
+  font-weight: 600;
+  padding: 1px 8px;
+  border-radius: 999px;
+  background: var(--fill-scheduled);
+  color: var(--color-scheduled);
+}
+.profilePublishStateGoal { font-size: 12.5px; color: var(--ink-2); margin-top: 4px; line-height: 1.5; }
+.profilePublishGoalText { color: var(--ink-1); }
+.profilePublishStateSignals,
+.profilePublishStateRisks {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  font-size: 12.5px;
+  color: var(--ink-3, var(--ink-2));
+  margin-top: 4px;
+}
+.profilePublishTag {
+  font-size: 11.5px;
+  font-weight: 600;
+  padding: 2px 9px;
+  border-radius: 999px;
+  background: var(--fill-brand);
+  color: var(--ink-1);
+}
+.profilePublishActions { display: flex; gap: 8px; margin-top: 4px; }
+.profilePublishError {
+  font-size: 12.5px;
+  color: var(--color-blocked);
+  background: var(--fill-blocked);
+  border: 1px solid rgba(255, 69, 58, 0.3);
+  border-radius: var(--r-sm);
+  padding: 8px 12px;
+}
+.profilePublishLoading { font-size: 12.5px; color: var(--ink-3, var(--ink-2)); padding: 8px 0; }
+
+/* 经验晋升卡（LessonPromoteCard）*/
+.lessonPromoteCard { display: flex; flex-direction: column; gap: 10px; }
+.lessonPromoteKind { font-size: 13px; font-weight: 600; color: var(--ink-1); line-height: 1.5; }
+.lessonPromoteInput,
+.lessonPromoteTextarea {
+  width: 100%;
+  border: 1px solid var(--hairline);
+  border-radius: var(--r-sm);
+  padding: 8px 10px;
+  font: inherit;
+  font-size: 12.5px;
+  box-sizing: border-box;
+}
+.lessonPromoteTextarea { min-height: 88px; resize: vertical; }
+.lessonPromoteCard button { align-self: flex-start; }
+.lessonPromoteError {
+  font-size: 12.5px;
+  color: var(--color-blocked);
+  background: var(--fill-blocked);
+  border: 1px solid rgba(255, 69, 58, 0.3);
+  border-radius: var(--r-sm);
+  padding: 8px 12px;
+}
+.lessonPromoteLoading,
+.lessonPromoteDone { font-size: 12.5px; color: var(--ink-3, var(--ink-2)); padding: 8px 0; }
