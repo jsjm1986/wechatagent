@@ -92,16 +92,6 @@
   color: #fff;
 }
 
-/* 行容器：rich 卡片行 / inline 处置行 */
-.askHumanRichRow,
-.askHumanInlineRow {
-  border: 1px solid var(--hairline);
-  border-radius: var(--r-md, 12px);
-  padding: 16px;
-  margin-bottom: 12px;
-  background: var(--surface-1, #fff);
-}
-
 /* 兜底弱化文案 */
 .askHumanUnknownRich,
 .askHumanUnknownInline {
@@ -310,7 +300,7 @@
   cursor: not-allowed;
 }
 
-/* 知识切片核验卡（ChunkReviewCard）——容器无边框，外层 .askHumanRichRow 已描边 */
+/* 知识切片核验卡（ChunkReviewCard）——容器无边框，外层 InboxRow 折叠壳已描边 */
 .chunkReviewCard { display: flex; flex-direction: column; gap: 8px; }
 .chunkReviewTitle { font-size: 14px; font-weight: 650; color: var(--ink-1); }
 .chunkReviewBody { font-size: 13px; color: var(--ink-2); line-height: 1.5; }
