@@ -353,7 +353,7 @@ async fn analyze_run_logs(
                 }
             }
         } else {
-            format!("AI 观察：该切片在 {} 条 run 上被 {} 拦截", block_count, top_block_reason)
+            format!("AI 观察：该切片在 {} 条 run 上被{}拦截", block_count, labels::block_reason_zh(&top_block_reason))
         };
         out.push(BlockSignal {
             chunk_id,
