@@ -1,5 +1,13 @@
 import { describe, it, expect } from "vitest";
-import { FINAL_REVIEW_STATUS_LABELS, HOLD_CATEGORY_LABELS, labelOf } from "../../lib/reviewLabels";
+import {
+  FINAL_REVIEW_STATUS_LABELS,
+  HOLD_CATEGORY_LABELS,
+  GAP_SIGNAL_KIND_LABELS,
+  ESCALATION_CATEGORY_LABELS,
+  ESCALATION_VERDICT_LABELS,
+  RISK_DIMENSION_LABELS,
+  labelOf,
+} from "../../lib/reviewLabels";
 
 describe("reviewLabels 闭集标签(C7/C8 共用)", () => {
   it("FINAL_REVIEW_STATUS_LABELS 覆盖 10 项闭集", () => {
@@ -22,5 +30,36 @@ describe("reviewLabels 闭集标签(C7/C8 共用)", () => {
     expect(labelOf(FINAL_REVIEW_STATUS_LABELS, "approved")).toBe("已通过");
     expect(labelOf(FINAL_REVIEW_STATUS_LABELS, "weird_value")).toBe("weird_value");
     expect(labelOf(FINAL_REVIEW_STATUS_LABELS, null)).toBe("—");
+  });
+});
+
+describe("reviewLabels 扩展字典", () => {
+  it("gap_signal kind 覆盖 10 类且中文", () => {
+    ["orphan","broken_link","missing_chunk","no_outlinks","low_confidence",
+     "stale","contradiction","suggestion","dangling_anchor","recall_miss"
+    ].forEach((k) => {
+      expect(GAP_SIGNAL_KIND_LABELS[k]).toBeTruthy();
+      expect(GAP_SIGNAL_KIND_LABELS[k]).not.toBe(k);
+    });
+  });
+
+  it("escalation category 中文", () => {
+    expect(ESCALATION_CATEGORY_LABELS["high_risk_gated"]).toBe("高风险待裁决");
+    expect(ESCALATION_CATEGORY_LABELS["out_of_scope_decision"]).toBe("超出职权待决策");
+    expect(ESCALATION_CATEGORY_LABELS["stuck_or_undelivered"]).toBe("多轮僵局待介入");
+  });
+
+  it("verdict 中文", () => {
+    expect(ESCALATION_VERDICT_LABELS["approved"]).toBe("同意");
+    expect(ESCALATION_VERDICT_LABELS["delegated_back"]).toBe("授权 AI 自行处理");
+  });
+
+  it("风险维度名中文", () => {
+    expect(RISK_DIMENSION_LABELS["factRisk"]).toBeTruthy();
+    expect(RISK_DIMENSION_LABELS["ProductAccuracyScore"]).toBeTruthy();
+  });
+
+  it("labelOf 未知值回落原值", () => {
+    expect(labelOf(GAP_SIGNAL_KIND_LABELS, "brand_new")).toBe("brand_new");
   });
 });
