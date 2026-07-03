@@ -160,7 +160,7 @@ GET /api/evolution/experiments     (仅 S9 期间有效)
 | 5 闸 | FactRisk block | review.rs / guards.rs | S2 | `final_review_status=blocked_by_safety_guard`；`scores.factRisk ≥ 6`（**实测注**：`enforce_string_fact_risk_guard` 只扫 `decision.reply_text` 不扫 inbound；自然路径下 LLM 对违禁 inbound 默认走 `should_reply=false / reply_text=""` → string guard 0 命中 → factRisk=0；实际证据是 `held_by_ai_policy + reply_text 为空`，治理末端兜底有效。要稳定触发 factRisk ≥ 6 必须用 unit test 直接给 reply_text=违禁串，详见 ISSUE-004 终态） |
 | 5 闸 | PressureRisk block | review.rs LLM 评分 | S3 | `final_review_status` ∈ {blocked_by_safety_guard, held_by_ai_policy}；`pressureRisk ≥ 7`（**实测注**：同 S2，pressureRisk 是 review LLM free-form 评分，自然路径偏低；治理末端兜底有效但前端阈值识别信号有损） |
 | 5 闸 | HumanLikeScore rewrite | gateway.rs:611-690 | S4 | `final_review_status=revision_applied_approved` + `revision_applied=true` |
-| 5 闸 | EmotionalValue rewrite | 同上 | S4 备用 | 同上，`emotionalValue<5` |
+| 5 闸 | EmotionalValue rewrite | 同上 | S4 备用 | 同上，`emotionalValue<6` |
 | 5 闸 | ProductAccuracyScore block | review.rs:885-925（R5.4 结构化兜底）+ guards.rs `claim_requires_product_knowledge` / `compute_verified_chunks` | S5 | `final_review_status=blocked_unverified_product_claim` + 无 verified chunk（reviewer `claimAnalysis.requiresProductKnowledge=true` 触发） |
 | Review | 二次仍未通过 | review.rs:860-865 | revision 后仍 fail 的输入 | `final_review_status=revision_failed` |
 | Review | 必填字段拦截 | review.rs:496-526 | LLM 输出缺自治协议字段 | `final_review_status=blocked_by_required_field` + `risks` 含 `missing_required_field:*` |
