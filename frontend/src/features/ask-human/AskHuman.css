@@ -7,12 +7,13 @@
   flex-direction: column;
   gap: 16px;
   padding: 24px 28px 40px;
+  max-width: 920px;
 }
 
 .askHumanHeader {
   display: flex;
   align-items: center;
-  justify-content: space-between;
+  justify-content: flex-end;
   gap: 16px;
 }
 .askHumanHeader h1 {
@@ -195,3 +196,48 @@
   margin: 0;
   color: var(--ink-1);
 }
+
+/* 折叠式收件箱行 */
+.inboxRow {
+  border: 1px solid var(--hairline);
+  border-radius: var(--r-md, 12px);
+  background: var(--surface-1, #fff);
+  margin-bottom: 10px;
+}
+.inboxRowHead {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  padding: 12px 14px;
+  border: none;
+  background: transparent;
+  cursor: pointer;
+  font: inherit;
+  text-align: left;
+}
+.inboxRowTitle { font-size: 13.5px; font-weight: 650; color: var(--ink-1); flex-shrink: 0; }
+.inboxRowPreview {
+  font-size: 12.5px;
+  color: var(--ink-3, var(--ink-2));
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  flex: 1;
+}
+.inboxRowChevron { margin-left: auto; color: var(--ink-3, var(--ink-2)); font-size: 12px; }
+.inboxRowBody { padding: 4px 14px 16px; border-top: 1px solid var(--hairline); }
+.inboxBadge {
+  font-size: 11.5px;
+  font-weight: 600;
+  padding: 2px 9px;
+  border-radius: 999px;
+  color: var(--ink-1);
+  flex-shrink: 0;
+}
+.inboxBadge--brand { background: var(--fill-brand); }
+.inboxBadge--scheduled { background: var(--fill-scheduled); }
+.inboxBadge--held { background: var(--fill-held); }
+.inboxBadge--blocked { background: var(--fill-blocked); }
+.inboxBadge--running { background: var(--fill-running); }
+.inboxBadge--neutral { background: var(--fill-inactive); }

@@ -87,6 +87,31 @@ function renderInline(item: InboxItem, ctx: RowCtx) {
   }
 }
 
+export function InboxRow({
+  badge,
+  title,
+  preview,
+  children,
+}: {
+  badge: { label: string; tone: string };
+  title: string;
+  preview: string;
+  children: React.ReactNode;
+}) {
+  const [open, setOpen] = useState(false);
+  return (
+    <div className="inboxRow">
+      <button type="button" className="inboxRowHead" onClick={() => setOpen((v) => !v)} aria-expanded={open}>
+        <span className={`inboxBadge inboxBadge--${badge.tone}`}>{badge.label}</span>
+        <span className="inboxRowTitle">{title}</span>
+        {!open && <span className="inboxRowPreview">{preview}</span>}
+        <span className="inboxRowChevron">{open ? "▾" : "▸"}</span>
+      </button>
+      {open && <div className="inboxRowBody">{children}</div>}
+    </div>
+  );
+}
+
 function AskHumanView() {
   const { errors, summary, loading, fatalError, activeSource, setActiveSource, load } =
     useInboxStore();
@@ -111,7 +136,6 @@ function AskHumanView() {
   return (
     <div className="askHumanChannel">
       <header className="askHumanHeader">
-        <h1>统一收件箱</h1>
         <div className="askHumanHeaderActions">
           <button
             type="button"
