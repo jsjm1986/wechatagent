@@ -55,8 +55,9 @@ describe("reviewLabels 扩展字典", () => {
   });
 
   it("风险维度名中文", () => {
-    expect(RISK_DIMENSION_LABELS["factRisk"]).toBeTruthy();
-    expect(RISK_DIMENSION_LABELS["ProductAccuracyScore"]).toBeTruthy();
+    expect(RISK_DIMENSION_LABELS["hallucinationScore"]).toBeTruthy();
+    expect(RISK_DIMENSION_LABELS["humanLike"]).toBeTruthy();
+    expect(RISK_DIMENSION_LABELS["knowledgeGroundingScore"]).toBeTruthy();
   });
 
   it("labelOf 未知值回落原值", () => {

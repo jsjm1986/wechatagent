@@ -77,19 +77,18 @@ export const ESCALATION_RESOLVED_VIA_LABELS: Record<string, string> = {
   admin: "后台裁决",
 };
 
-// 复核风险维度名(types.rs:1135-1160,含历史别名)。
+// 复核风险维度名。键为 serde camelCase wire 键(ReviewScores #[serde(rename_all="camelCase")],
+// types.rs:1136),与 features/operations SCORE_LABELS 同形态;另收 factRisk/productAccuracy
+// 两个后端反序列化 alias(types.rs:1144,1147),覆盖 LLM 输出/旧文档形态。
 export const RISK_DIMENSION_LABELS: Record<string, string> = {
+  hallucinationScore: "事实可靠度风险",
   factRisk: "事实可靠度风险",
-  hallucination_score: "事实可靠度风险",
-  PressureRisk: "压迫感风险",
-  pressure_risk: "压迫感风险",
-  HumanLikeScore: "真人感评分",
-  human_like: "真人感评分",
-  EmotionalValue: "情绪价值评分",
-  emotional_value: "情绪价值评分",
-  ProductAccuracyScore: "产品准确度评分",
-  knowledge_grounding_score: "产品准确度评分",
-  boundary_privacy_safety: "边界隐私安全评分",
+  pressureRisk: "压迫感风险",
+  humanLike: "真人感评分",
+  emotionalValue: "情绪价值评分",
+  knowledgeGroundingScore: "产品准确度评分",
+  productAccuracy: "产品准确度评分",
+  boundaryPrivacySafety: "边界隐私安全评分",
 };
 
 export function labelOf(
