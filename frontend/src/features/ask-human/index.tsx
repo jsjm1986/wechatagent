@@ -26,6 +26,18 @@ const SOURCE_META: { summaryKey: string; source: string; label: string }[] = [
   { summaryKey: "lessonsLearned", source: "lessons_learned", label: "经验晋升" },
 ];
 
+// InboxRow badge 的语义色调：source → tone（tone 值对齐 AskHuman.css 的 .inboxBadge--* 与 tokens.css 语义色）。
+const SOURCE_TONE: Record<string, string> = {
+  principal_escalation: "brand",
+  knowledge_review: "scheduled",
+  taxonomy_candidate: "neutral",
+  relationship_suggestion: "neutral",
+  gap_signal: "held",
+  profile_risky: "blocked",
+  evolution_proposal: "running",
+  lessons_learned: "neutral",
+};
+
 // rich 分派：richComponent → 卡片。richParams 提供 id（key 已对齐 ask_human_inbox.rs 实证）。
 function renderRich(item: InboxItem, onDone: () => void) {
   const p = item.richParams ?? {};
@@ -194,15 +206,20 @@ function AskHumanView() {
             refreshToken={refreshNonce}
             fetchItems={fetchItems}
             getId={(i) => `${i.source}:${i.id}`}
-            renderItem={(item, ctx) =>
-              item.actionKind === "rich" ? (
-                <div className="askHumanRichRow">
-                  {renderRich(item, () => refreshAll())}
-                </div>
-              ) : (
-                <div className="askHumanInlineRow">{renderInline(item, ctx)}</div>
-              )
-            }
+            renderItem={(item, ctx) => {
+              const meta = SOURCE_META.find((m) => m.source === item.source);
+              return (
+                <InboxRow
+                  badge={{ label: meta?.label ?? item.source, tone: SOURCE_TONE[item.source] ?? "neutral" }}
+                  title={item.title}
+                  preview={item.summary ?? ""}
+                >
+                  {item.actionKind === "rich"
+                    ? renderRich(item, () => refreshAll())
+                    : renderInline(item, ctx)}
+                </InboxRow>
+              );
+            }}
             emptyText="暂无待处理项"
           />
         </>
