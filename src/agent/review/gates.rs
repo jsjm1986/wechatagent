@@ -37,6 +37,11 @@ pub fn review_passed(
         // 0 表示 reviewer 未给分（含老数据反序列化默认），不参与拦截。
         && (review.scores.pressure_risk == 0
             || review.scores.pressure_risk < runtime.pressure_risk_block_at)
+        // boundary/privacy 软闸对偶（与 classify_dual_gate 的 boundary_privacy_safety
+        // <= 3 判定同源）：1-3 低分（泄露内部画像/评判、暴露 AI 身份或幕后领导信息）
+        // 拦截。0 = reviewer 未填 / 老数据豁免（同 pressure_risk）；>=4 放行。
+        && (review.scores.boundary_privacy_safety == 0
+            || review.scores.boundary_privacy_safety > 3)
 }
 
 /// Phase B / B2：把 [`AgentDecision`] 投影成 reviewer 可见的 **事实面** 视图，
@@ -1154,6 +1159,55 @@ mod review_passed_dual_gate_tests {
         assert!(
             !review_passed(&review, &runtime),
             "有产品声明时 bypass 不豁免 grounding"
+        );
+    }
+
+    #[test]
+    fn review_passed_blocks_when_boundary_privacy_low() {
+        // boundary_privacy_safety 低分(1-3)=泄露内部画像/暴露AI身份/幕后领导，
+        // review_passed 必须拦截（与 classify_dual_gate 同源）。
+        let runtime = UserRuntimeParameters::default();
+        let mut review = full_pass_review();
+        review.scores.boundary_privacy_safety = 2;
+        assert!(
+            !review_passed(&review, &runtime),
+            "boundary_privacy_safety=2 必须拦截"
+        );
+    }
+
+    #[test]
+    fn review_passed_blocks_when_boundary_privacy_at_3() {
+        // 边界值：3 仍在低分区间(<=3)，必须拦截。
+        let runtime = UserRuntimeParameters::default();
+        let mut review = full_pass_review();
+        review.scores.boundary_privacy_safety = 3;
+        assert!(
+            !review_passed(&review, &runtime),
+            "boundary_privacy_safety=3（低分上沿）必须拦截"
+        );
+    }
+
+    #[test]
+    fn review_passed_passes_when_boundary_privacy_at_4() {
+        // 阈值上沿：4 >3 放行。
+        let runtime = UserRuntimeParameters::default();
+        let mut review = full_pass_review();
+        review.scores.boundary_privacy_safety = 4;
+        assert!(
+            review_passed(&review, &runtime),
+            "boundary_privacy_safety=4（>3）应放行"
+        );
+    }
+
+    #[test]
+    fn review_passed_ignores_boundary_privacy_zero_for_legacy_data() {
+        // 老数据 / reviewer 未输出 boundary_privacy_safety → 默认 0，豁免不拦截。
+        let runtime = UserRuntimeParameters::default();
+        let mut review = full_pass_review();
+        review.scores.boundary_privacy_safety = 0;
+        assert!(
+            review_passed(&review, &runtime),
+            "boundary_privacy_safety=0（老数据/未填）必须视为豁免"
         );
     }
 }
