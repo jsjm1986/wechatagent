@@ -10,6 +10,7 @@ import { LessonPromoteCard } from "../../components/review/LessonPromoteCard";
 import { ConfirmProvider } from "../../components/ui/ConfirmDialog";
 import { usePromptSaveConfirm, usePromptPublishConfirm } from "../../components/prompt/usePromptSaveConfirm";
 import { ToastProvider } from "../../components/ui/Toast";
+import { VERSION_STATUS_LABELS } from "../../lib/reviewLabels";
 import styles from "./SystemStrategy.module.css";
 
 // 系统策略频道：全局总控 Prompt（人格/任务）+ 状态机灰度 + 双层标签字典 + 跨用户教训。
@@ -104,15 +105,9 @@ function promptLayerLabel(layer: string): string {
   return labels[layer] || layer;
 }
 
-// prompt/soul 版本状态(prompt_templates.rs draft→active;未知值回落原值)。
+// prompt/soul 版本状态。映射收敛到共享字典 VERSION_STATUS_LABELS(单一真相源);未知值回落原值。
 function versionStatusLabel(status: string): string {
-  const labels: Record<string, string> = {
-    draft: "草稿",
-    active: "生效中",
-    published: "已发布",
-    archived: "已归档",
-  };
-  return labels[status] || status;
+  return VERSION_STATUS_LABELS[status] || status;
 }
 
 // lessons 教训评审状态(lessons_learned.rs;未知值回落原值)。

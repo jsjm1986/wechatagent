@@ -104,6 +104,15 @@ export const ESCALATION_RESOLVED_VIA_LABELS: Record<string, string> = {
   admin: "后台裁决",
 };
 
+// prompt / soul / prompt_template / evaluation_scenario 版本生命周期状态。
+// 后端默认 draft(prompt_templates.rs:132)/ active(evaluation_scenario 默认)。
+export const VERSION_STATUS_LABELS: Record<string, string> = {
+  draft: "草稿",
+  active: "生效中",
+  published: "已发布",
+  archived: "已归档",
+};
+
 export function labelOf(
   map: Record<string, string>,
   value: string | null | undefined,

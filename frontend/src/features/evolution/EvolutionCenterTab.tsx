@@ -114,6 +114,20 @@ export interface ThresholdAuditRow {
   [k: string]: unknown;
 }
 
+// 阈值审计动作 → 中文（后端 action 闭集：released / rolled_back / auto_released，models.rs:4563）。
+function auditActionLabel(action?: string | null): string {
+  switch (action) {
+    case "released":
+      return "已发布";
+    case "rolled_back":
+      return "已回滚";
+    case "auto_released":
+      return "自动发布";
+    default:
+      return action ?? "—";
+  }
+}
+
 /// 7 天聚合（client 端从 experiments[] 推算 — 不打额外请求；后端尚未提供专用聚合 endpoint）。
 export function aggregateLast7Days(items: ExperimentItem[]): {
   experiments: number;
@@ -409,7 +423,7 @@ export function EvolutionCenterTab({ enabled = true }: { enabled?: boolean }) {
                     key={row.id ?? `${row.decidedAt ?? "row"}-${idx}`}
                     data-testid={`threshold-audit-row-${row.id ?? idx}`}
                   >
-                    <td>{row.action ?? "—"}</td>
+                    <td>{auditActionLabel(row.action)}</td>
                     <td>{row.gateKey ?? "—"}</td>
                     <td>
                       {formatNumber(row.previousValue ?? null)} → {formatNumber(row.newValue ?? null)}
