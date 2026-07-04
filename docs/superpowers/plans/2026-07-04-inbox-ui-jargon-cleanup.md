@@ -845,3 +845,163 @@ git commit -m "feat(inbox): 补全知识面板 rich 卡片样式"
 
 - 情绪价值阈值三处不一致(后端默认6/前端展示5/CLAUDE.md<5)——涉改阈值红线。
 - 请示 severity 恒 high(`ask_human_inbox.rs:75`)——排序分流独立 UX。
+
+---
+
+# 追加任务(Task 8/9):审查发现的字典缺口收尾
+
+> 全分支审查后审查发现:Task 4 加的 8 个翻译字典里只有 `ESCALATION_CATEGORY_LABELS` 真正接进 UI,其余 7 个是「加了没接」的死导出;且 `ResolvedEscalations.tsx`(计划外文件)有自己硬编码的 verdict/resolvedVia 标签,与新字典措辞漂移(approved: "批准" vs "同意";delegated_back: "退回再议" vs "授权 AI 自行处理")——正是本任务要消灭的黑话/口径不一致。用户选择「全接:补展示位再翻译」。
+>
+> 已亲验关键事实(动手依据):
+> - `resolved_via` 后端只写两个值:`"wechat"`(escalation/mod.rs:331)、`"admin"`(principal_escalations.rs:106)。故共享 `ESCALATION_RESOLVED_VIA_LABELS`(wechat/admin)完整;ResolvedEscalations 现有的 `principal_chat`/`admin_direct` 是永不出现的死键。
+> - gap_signal 的 inbox 分支(`ask_human_inbox.rs:236-276`)**没有下发真实 kind**,`InboxItem` 无 kind 字段,severity 硬编码 `"medium"`(:260)。要展示 kind 必须后端加字段。
+> - `InboxItem.severity` 是 high/medium/low 标度(用于 `severityRank` 跨来源排序,inboxApi.ts:32-43),与 gap_signal 的 info/warning/error/high 标度**不同**——不能覆盖 severity 字段,须加独立展示字段。
+
+## Task 8: 修 ResolvedEscalations 措辞漂移 + 删无展示位死导出(纯前端)
+
+**Files:**
+- Modify: `frontend/src/features/ask-human/ResolvedEscalations.tsx`
+- Modify: `frontend/src/lib/reviewLabels.ts`(删 3 个死导出)
+- Modify: `frontend/src/__tests__/lib/reviewLabels.test.ts`(删对应断言)
+
+- [ ] **Step 1: ResolvedEscalations 改用共享字典**
+
+先 Read `frontend/src/features/ask-human/ResolvedEscalations.tsx` 全文确认当前 `VERDICT_LABEL`(:11-17)、`RESOLVED_VIA_LABEL`(:20-25)与使用点(:99-102)。
+删除文件内这两个本地 `const`,改为顶部 import:
+
+```tsx
+import { ESCALATION_VERDICT_LABELS, ESCALATION_RESOLVED_VIA_LABELS, labelOf } from "../../lib/reviewLabels";
+```
+
+把使用点(:98-102)改为:
+
+```tsx
+        const v = it.decision?.verdict;
+        const verdictLabel = labelOf(ESCALATION_VERDICT_LABELS, v);
+        const viaLabel = labelOf(ESCALATION_RESOLVED_VIA_LABELS, it.resolvedVia);
+```
+
+(`labelOf` 已处理 null/空→"—"、未知值→原样回显,行为等价于原本地逻辑。)
+
+- [ ] **Step 2: 删无展示位的死导出**
+
+`frontend/src/lib/reviewLabels.ts` 删除三个在收件箱无展示位、且与既有翻译重复的导出:
+- `RISK_DIMENSION_LABELS`(:80-92)——与 `features/operations/index.tsx:43` 的 `SCORE_LABELS` 重复,收件箱无风险分展示位。
+- `GAP_SIGNAL_STATUS_LABELS`(:46-52)——收件箱只查 `status=pending`,不展示 status。
+- `GAP_SIGNAL_SOURCE_LABELS`(:54-58)——收件箱不展示 source。
+
+保留 `GAP_SIGNAL_KIND_LABELS`、`GAP_SIGNAL_SEVERITY_LABELS`(Task 9 用)、`ESCALATION_*`(已用 / 本任务接入)。
+
+- [ ] **Step 3: 删测试里对应断言**
+
+先 Read `frontend/src/__tests__/lib/reviewLabels.test.ts`,删除针对上述 3 个已删导出的 import 与 `it(...)` 用例(**只删对应已删导出的断言**,不动 gap_signal kind/escalation/其余用例——这是删除死代码连带删其测试,非削减存活行为的覆盖,不违反「测试只增量」)。
+
+- [ ] **Step 4: 验证 + 提交**
+
+Run: `cd frontend && npx vitest run src/__tests__/lib/reviewLabels.test.ts 2>&1 | tail -12` → 全绿
+Run: `cd frontend && npx vitest run 2>&1 | tail -8` → 不回归(ResolvedEscalations 若有测试须仍绿;EvolutionCenterTab 已知 flaky 隔离跑绿可忽略)
+Run: `cd frontend && npm run build 2>&1 | tail -3` → 0 errors
+Run: `bash scripts/check-no-human-takeover.sh 2>&1 | tail -3` → 0 violations
+
+```bash
+git add frontend/src/features/ask-human/ResolvedEscalations.tsx frontend/src/lib/reviewLabels.ts frontend/src/__tests__/lib/reviewLabels.test.ts
+git commit -m "fix(inbox): 已裁决历史改用共享裁决字典(消除措辞漂移)+ 删无展示位死导出"
+```
+
+## Task 9: gap_signal kind/severity 端到端展示(跨前后端)
+
+**Files:**
+- Modify: `src/routes/ask_human_inbox.rs`(InboxItem 加字段 + collect_gap_signals 填充 + 单测)
+- Modify: `frontend/src/lib/inboxApi.ts`(InboxItem 接口加字段)
+- Modify: `frontend/src/features/ask-human/index.tsx`(gap_signal 行渲染 kind/severity)
+- Test: `frontend/src/__tests__/features/ask-human/gapSignalLabels.test.tsx`(新建)
+
+**Interfaces:**
+- Produces(后端 InboxItem 新增两个可选 camelCase wire 字段):`kind?: string`、`signalSeverity?: string`
+
+- [ ] **Step 1: 后端 InboxItem 加字段**
+
+`src/routes/ask_human_inbox.rs` 的 `struct InboxItem`(:16-47)在 `occurrences` 后追加(沿用 `skip_serializing_if` 模式):
+
+```rust
+    // gap_signal 富字段:知识缺口的类型 + 语义严重度(info/warning/error/high,
+    // 独立于 severity 排序标度)。仅 gap_signal 来源填充,其余恒 None。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub signal_severity: Option<String>,
+```
+
+- [ ] **Step 2: 所有 InboxItem 构造点补 None,gap_signal 填真值**
+
+`InboxItem` 有 9 个构造点(escalation/knowledge_review/taxonomy/relationship/gap/profile/evolution/lessons + 测试 fixture)。逐个在末尾补 `kind: None, signal_severity: None,`。**唯独 `collect_gap_signals`(:255-273)** 改为:
+
+```rust
+                kind: crate::routes::ask_human_inbox::non_empty(&g.kind),
+                signal_severity: crate::routes::ask_human_inbox::non_empty(&g.severity),
+```
+
+(用文件内已有的 `non_empty` 辅助;若在同模块内直接 `non_empty(&g.kind)` 即可。先 Read 确认 `KnowledgeGapSignal` 的 `kind`/`severity` 字段名与类型 `models.rs`,以真实字段为准。)`severity` 排序字段保持原 `"medium"` 不动。
+
+- [ ] **Step 3: 后端单测(gap_signal 投影带 kind/severity)**
+
+在 `ask_human_inbox.rs` 的 `#[cfg(test)] mod tests` 追加(照现有 `escalation_projection_*` 风格,构造一个 KnowledgeGapSignal fixture 走 collect 逻辑的映射闭包——若映射闭包未抽函数,可仿照 escalation 抽一个 `gap_to_inbox_item` 具名函数再测,或直接断言 struct 字段)。断言:
+
+```rust
+    #[test]
+    fn gap_signal_projection_carries_kind_and_severity() {
+        // 构造 kind="orphan", severity="warning" 的 gap fixture,
+        // 走投影后断言 item.kind == Some("orphan")、item.signal_severity == Some("warning")。
+    }
+```
+
+先 Read `collect_gap_signals` 确认是否需抽函数;若抽,命名 `gap_to_inbox_item(&KnowledgeGapSignal, now_ms) -> InboxItem`,与 escalation 对称。
+
+- [ ] **Step 4: 前端 InboxItem 接口加字段**
+
+`frontend/src/lib/inboxApi.ts` 的 `interface InboxItem`(:3-21)在 `occurrences?` 后加:
+
+```ts
+  kind?: string;
+  signalSeverity?: string;
+```
+
+- [ ] **Step 5: 前端 gap_signal 行展示 kind/severity(TDD)**
+
+先写失败测试 `frontend/src/__tests__/features/ask-human/gapSignalLabels.test.tsx`:渲染一个 `source: "gap_signal", kind: "orphan", signalSeverity: "warning"` 的 item 经 `renderInline`(SimpleApproveReject)后,断言出现中文「孤立知识」「需注意」而非英文 `orphan`/`warning`。
+
+`SimpleApproveReject.tsx` 现只显示 title/summary/evidence。在 evidence 区块(或标题旁)加一行:当 `item.kind` 存在时,用 `labelOf(GAP_SIGNAL_KIND_LABELS, item.kind)` 显示类型,`item.signalSeverity` 存在时用 `labelOf(GAP_SIGNAL_SEVERITY_LABELS, item.signalSeverity)` 显示严重度。import 从 `../../../lib/reviewLabels`。
+
+先 Read `SimpleApproveReject.tsx` 确认它是否能拿到 `item`(能,签名有 `item: InboxItem`),在 `simpleActionEvidence` 区块内追加:
+
+```tsx
+      {(item.kind || item.signalSeverity) && (
+        <div className="simpleActionMeta">
+          {item.kind && <span>类型：{labelOf(GAP_SIGNAL_KIND_LABELS, item.kind)}</span>}
+          {item.signalSeverity && <span>严重度：{labelOf(GAP_SIGNAL_SEVERITY_LABELS, item.signalSeverity)}</span>}
+        </div>
+      )}
+```
+
+(`.simpleActionMeta` 样式可选补进 AskHuman.css,复用 `.simpleActionEvidence` 观感即可;或直接复用 evidence 类。)
+
+- [ ] **Step 6: 验证 + 提交**
+
+Run: `cd frontend && npx vitest run src/__tests__/features/ask-human/gapSignalLabels.test.tsx 2>&1 | tail -12` → 绿
+Run: `cd frontend && npx vitest run 2>&1 | tail -8` → 不回归
+Run: `cd frontend && npm run build 2>&1 | tail -3` → 0 errors
+Run: `cargo test --lib ask_human_inbox 2>&1 | tail -10` → 新单测绿 + 现有 escalation_projection_* 不回归
+Run: `cargo check 2>&1 | tail -5` → 无错误
+Run: `bash scripts/check-no-human-takeover.sh 2>&1 | tail -3` → 0 violations
+
+```bash
+git add src/routes/ask_human_inbox.rs frontend/src/lib/inboxApi.ts frontend/src/features/ask-human/inline/SimpleApproveReject.tsx frontend/src/features/ask-human/AskHuman.css frontend/src/__tests__/features/ask-human/gapSignalLabels.test.tsx
+git commit -m "feat(inbox): gap_signal 下发并展示 kind/severity 中文(端到端接字典)"
+```
+
+## 追加任务 Self-Review
+
+- Task 8 修的是真 bug(措辞漂移),删的是审查确认的死导出;删测试连带死代码是正当的(非削减存活覆盖)。
+- Task 9 用独立 `signal_severity` 字段而非覆盖 `severity`,避免破坏 `severityRank` 跨来源排序。
+- 端到端闭环:后端下发 kind/signalSeverity → 前端接口 → SimpleApproveReject 渲染 → labelOf 查 GAP_SIGNAL_KIND/SEVERITY 字典。
+- 保留的字典(GAP_SIGNAL_KIND/SEVERITY、ESCALATION_*)此后全部有真实消费点;删除的(RISK_DIMENSION/GAP_SIGNAL_STATUS/SOURCE)无展示位或与既有重复。
