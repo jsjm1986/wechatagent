@@ -22,7 +22,7 @@ import { ChunkPicker } from "../../components/ui/ChunkRef";
 import { useConfirm } from "../../components/ui/ConfirmDialog";
 import { useToast } from "../../components/ui/Toast";
 import { EmptyState } from "../../components/ui/EmptyState";
-import { severityLabel, priorityLabel, originLabel, draftKindLabel, taskStatusLabel, reportStatusLabel, digestCardKindLabel, digestSuggestedActionLabel } from "./labels";
+import { severityLabel, priorityLabel, originLabel, draftKindLabel, taskStatusLabel, reportStatusLabel, digestCardKindLabel, digestSuggestedActionLabel, chatIntentLabel } from "./labels";
 
 interface ChatTurnView {
   role: "user" | "assistant";
@@ -300,7 +300,7 @@ export function ChatWorkbench({ initialAttachChunkId }: { initialAttachChunkId?:
           <h2>AI 协作工坊</h2>
         </div>
         <div className="wikiArchiveHeaderActions">
-          <span className="wikiArchiveTag">session</span>
+          <span className="wikiArchiveTag">会话</span>
           <span className="wikiChatSessionId">{sessionId || "未开始"}</span>
           <button type="button" onClick={newSession}>
             <Plus size={14} /> 新会话
@@ -327,7 +327,7 @@ export function ChatWorkbench({ initialAttachChunkId }: { initialAttachChunkId?:
             <div className="wikiChatTurnHead">
               <span className="wikiArchiveTag">{t.role === "user" ? "运营" : "AI"}</span>
               <span className="wikiArchiveTimelineTime">#{t.turnIndex}</span>
-              {t.intent ? <span className="wikiArchiveTag">{t.intent}</span> : null}
+              {t.intent ? <span className="wikiArchiveTag">{chatIntentLabel(t.intent)}</span> : null}
               {t.draftKind ? <span className="wikiArchiveTag">{draftKindLabel(t.draftKind)}</span> : null}
             </div>
             <div className="wikiChatTurnBody">
