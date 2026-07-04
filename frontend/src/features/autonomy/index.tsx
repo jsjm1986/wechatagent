@@ -141,7 +141,7 @@ export function AutonomyOutcomesTab({ accountId }: { accountId?: string }) {
           {loading ? "加载中" : "刷新"}
         </button>
         <small className={styles.toolbarHint}>
-          指标说明：null（"—"）= 该窗口内没有升级后样本；legacy 行单独计数不进任何分子分母。
+          指标说明：显示「—」表示该窗口内没有升级后样本；旧模式行单独计数，不计入任何比率。
         </small>
       </div>
       {err && <div className={styles.error}>{err}</div>}
@@ -154,12 +154,12 @@ export function AutonomyOutcomesTab({ accountId }: { accountId?: string }) {
           </div>
           <div className={styles.metricGrid}>
             <AutonomyMetricCard
-              label="revision 触发率"
+              label="改写触发率"
               value={m?.revisionTriggerRate ?? null}
               hint={`${data.rawCounts.revisionApplied}/${data.rawCounts.totalRuns}`}
             />
             <AutonomyMetricCard
-              label="revision 通过率"
+              label="改写通过率"
               value={m?.revisionPassRate ?? null}
               hint={`${data.rawCounts.revisionPass}/${data.rawCounts.revisionApplied}`}
             />
@@ -179,14 +179,14 @@ export function AutonomyOutcomesTab({ accountId }: { accountId?: string }) {
               hint={`${data.rawCounts.selfCritiqueAddressed}/${data.rawCounts.revisionApplied}`}
             />
             <AutonomyMetricCard
-              label="自治模式：auto"
+              label="自治模式：全自动"
               value={dist?.auto ?? null}
               hint={`${data.rawCounts.autonomyAuto}/${data.rawCounts.totalRuns}`}
             />
             <AutonomyMetricCard
-              label="自治模式：assisted / blocked"
+              label="自治模式：辅助 / 拦截"
               value={null}
-              hint={`assisted ${data.rawCounts.autonomyAssisted} · blocked ${data.rawCounts.autonomyBlocked}`}
+              hint={`辅助 ${data.rawCounts.autonomyAssisted} · 拦截 ${data.rawCounts.autonomyBlocked}`}
             />
           </div>
 
@@ -230,9 +230,9 @@ export function AutonomyOutcomesTab({ accountId }: { accountId?: string }) {
           {data.planner && <AutonomyPlannerSection planner={data.planner} />}
 
           <div className={styles.section}>
-            <h3>近 50 条 revision 记录</h3>
+            <h3>近 50 条改写记录</h3>
             {revisions.length === 0 ? (
-              <p className={styles.hint}>该窗口内没有 revision 记录。</p>
+              <p className={styles.hint}>该窗口内没有改写记录。</p>
             ) : (
               <table className={styles.table}>
                 <thead>
@@ -378,7 +378,7 @@ function RevisionRow({
               <pre>{item.postRevisionSummary || "—"}</pre>
             </div>
             <div>
-              <strong>自我批判（selfCritique）：</strong>
+              <strong>自我批判：</strong>
               <pre>{item.selfCritique || "—"}</pre>
             </div>
           </td>
