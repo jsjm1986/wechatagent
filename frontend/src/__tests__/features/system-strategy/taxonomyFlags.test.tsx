@@ -45,8 +45,8 @@ describe("TaxonomiesAdmin 终态 / 再激活 flag 配置（D6）", () => {
     fireEvent.change(screen.getByPlaceholderText(/canonical id/i), { target: { value: "customer_success" } });
     fireEvent.change(screen.getByPlaceholderText(/显示名/i), { target: { value: "成交维护" } });
     // 勾两个复选（按 label 文案中的 flag 名定位）。
-    fireEvent.click(screen.getByLabelText(/is_reactivation_target/));
-    fireEvent.click(screen.getByLabelText(/is_terminal/));
+    fireEvent.click(screen.getByLabelText(/可作再激活目标/));
+    fireEvent.click(screen.getByLabelText(/终态/));
     fireEvent.click(screen.getByText("保存"));
 
     await waitFor(() => expect(postRaw).toHaveBeenCalled());
