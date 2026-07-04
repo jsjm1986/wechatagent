@@ -12,7 +12,8 @@ describe("toCsv", () => {
     const lines = csv.split("\r\n");
     expect(lines[0]).toBe("客户名,wxid,状态,原因");
     expect(lines[1]).toBe("张三,wx_a,已送达,");
-    expect(lines[2]).toBe("李四,wx_b,被拦,daily_limit");
+    // reason 经 SEND_OUTCOME_REASON_LABELS 翻译:daily_limit→已达每日上限。
+    expect(lines[2]).toBe("李四,wx_b,被拦,已达每日上限");
   });
 
   it("空 items 仅表头", () => {

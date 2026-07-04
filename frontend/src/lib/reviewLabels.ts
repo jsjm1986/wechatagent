@@ -52,6 +52,17 @@ export const GATEWAY_STATUS_LABELS: Record<string, string> = {
   quiet_hours_deferred: "作息时段顺延",
 };
 
+// campaign 每人推送归桶原因(src/routes/campaigns.rs classify_send_outcome:388-440)。
+// 主体是 GATEWAY_STATUS_VALUES 子集,复用 GATEWAY_STATUS_LABELS;另补 4 个 campaign 专有值:
+// not_yet_run(task 未跑)/outbox 终态 failed_terminal、canceled/policy_consecutive_limit(不在 32 值闭集)。
+export const SEND_OUTCOME_REASON_LABELS: Record<string, string> = {
+  ...GATEWAY_STATUS_LABELS,
+  not_yet_run: "尚未执行",
+  failed_terminal: "发送失败（终态）",
+  canceled: "已取消",
+  policy_consecutive_limit: "连续触达限额",
+};
+
 // gap_signal(sources_meta.rs:363 裸下发)。kind 10 类 gap_signals.rs 各判定点。
 export const GAP_SIGNAL_KIND_LABELS: Record<string, string> = {
   orphan: "孤立知识",

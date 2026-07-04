@@ -68,9 +68,9 @@ describe("CampaignFeature", () => {
     // sent 汇总值 2（用 testid 精确取，避免与表格数字串扰）
     expect(screen.getByTestId("metric-sent")).toHaveTextContent("2");
     expect(screen.getByTestId("metric-pending")).toHaveTextContent("1");
-    // escalated reason 二级细分（在 escalated 汇总桶内）
+    // escalated reason 二级细分经 SEND_OUTCOME_REASON_LABELS 翻译:blocked_unverified_product_claim→未验证产品声明拦截。
     expect(
-      within(screen.getByTestId("metric-escalated")).getByText(/blocked_unverified_product_claim/)
+      within(screen.getByTestId("metric-escalated")).getByText(/未验证产品声明拦截/)
     ).toBeInTheDocument();
     // 明细表行数（tbody tr）= 5
     expect(screen.getAllByTestId("detail-row")).toHaveLength(5);
