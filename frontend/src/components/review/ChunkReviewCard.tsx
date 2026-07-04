@@ -107,23 +107,23 @@ export function ChunkReviewCard({
         <blockquote className="chunkReviewCitation">{quote}</blockquote>
       ) : null}
       <div className="chunkReviewMeta">
-        <span>id：<code>{chunkId}</code></span>
-        {hasAnchor ? <span>anchors：{anchors?.length ?? 0}</span> : <span>无 anchors</span>}
+        <span>编号：<code>{chunkId}</code></span>
+        {hasAnchor ? <span>原文定位：{anchors?.length ?? 0} 处</span> : <span>无原文定位</span>}
       </div>
       {!canVerify && (
-        <div className="chunkReviewGate">缺少 source_quote / anchor，未达 verify 门槛</div>
+        <div className="chunkReviewGate">缺少原文引用或原文定位，未达核验条件</div>
       )}
       <div className="chunkReviewActions">
         <button
           type="button"
           disabled={busy || !canVerify}
-          title={!canVerify ? "verify gate：需 source_quote + source_anchors 全有" : "标记为 verified"}
+          title={!canVerify ? "核验条件：需同时具备原文引用与原文定位" : "标记为已核验"}
           onClick={() => void act("verify")}
         >
-          verify
+          核验通过
         </button>
         <button type="button" disabled={busy} onClick={() => void act("reject")}>
-          reject
+          驳回
         </button>
       </div>
     </div>
