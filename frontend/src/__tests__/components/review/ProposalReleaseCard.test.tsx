@@ -184,8 +184,9 @@ describe("ProposalReleaseCard prompt 新旧对照表（阶段三）", () => {
 
     const samples = screen.getByTestId("evidence-samples");
     expect(samples).toHaveTextContent("run-001");
-    expect(samples).toHaveTextContent("held_by_ai_policy");
-    expect(samples).toHaveTextContent("approved");
+    // final_review_status 经 FINAL_REVIEW_STATUS_LABELS 翻译:held_by_ai_policy→AI 策略主动暂缓、approved→已通过。
+    expect(samples).toHaveTextContent("AI 策略主动暂缓");
+    expect(samples).toHaveTextContent("已通过");
 
     // 补强 1：样本点阵字形回归保护（按 FIVE_GATE_KEYS 序）。
     // run-001 original5gateHit={fact_risk_block:true,其余false} → 原五闸点阵 ●○○○○；
