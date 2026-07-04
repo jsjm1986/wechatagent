@@ -249,3 +249,19 @@ export function fieldKindLabel(v?: string | null): string {
   if (!v) return "—";
   return FIELD_KIND_LABELS[v] ?? v;
 }
+
+/// chunk 关系类型(models.rs:1488 六值闭集 superseded_by/references/requires/
+/// contradicts/clarifies/refines;权威中文与关系新建下拉 shared.tsx 同源);未知回落原值。
+export const RELATED_KIND_LABELS: Record<string, string> = {
+  supports: "支持",
+  contradicts: "矛盾",
+  superseded_by: "被取代",
+  references: "引用",
+  requires: "依赖",
+  clarifies: "澄清",
+  refines: "细化",
+};
+export function relatedKindLabel(v?: string | null): string {
+  if (!v) return "—";
+  return RELATED_KIND_LABELS[v] ?? v;
+}
