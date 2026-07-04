@@ -265,3 +265,29 @@ export function relatedKindLabel(v?: string | null): string {
   if (!v) return "—";
   return RELATED_KIND_LABELS[v] ?? v;
 }
+
+/// AI 协作工坊单轮意图(chat.rs:1332 闭集);未知回落原值。
+export const CHAT_INTENT_LABELS: Record<string, string> = {
+  create_chunk: "起草知识",
+  update_chunk: "修订知识",
+  clarify_chunk: "澄清核对",
+  digest_action: "摘要派工",
+  update_operator_memory: "更新运营记忆",
+  freeform: "自由对话",
+};
+export function chatIntentLabel(v?: string | null): string {
+  if (!v) return "—";
+  return CHAT_INTENT_LABELS[v] ?? v;
+}
+
+/// 运营记忆类型(memory.rs:2067 闭集 preference/rejection/context;
+/// 中文与后端 chat.rs:959 同源);未知回落原值。
+export const OPERATOR_MEMORY_KIND_LABELS: Record<string, string> = {
+  preference: "偏好",
+  rejection: "红线",
+  context: "背景",
+};
+export function operatorMemoryKindLabel(v?: string | null): string {
+  if (!v) return "—";
+  return OPERATOR_MEMORY_KIND_LABELS[v] ?? v;
+}

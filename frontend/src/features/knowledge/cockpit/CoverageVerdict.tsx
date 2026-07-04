@@ -48,7 +48,6 @@ export function CoverageVerdict({ view, onDrillDown }: CoverageVerdictProps) {
         >
           <span className={styles.vdDim}>
             <span className={styles.vdLabel}>{dim.label}</span>
-            <span className={styles.vdKey}>{dim.key}</span>
           </span>
           <span className={styles.vdBadge}>
             <StatusBadge tone={TONE_BY_STATE[dim.state]}>

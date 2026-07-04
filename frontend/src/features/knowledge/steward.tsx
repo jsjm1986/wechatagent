@@ -1584,7 +1584,7 @@ export function ReviewView({ initialDimFilter }: { initialDimFilter?: string | n
             disabled={batchBusy}
             onClick={() => void batchAction("verify")}
           >
-            <CheckCircle2 size={13} /> 批量 verify
+            <CheckCircle2 size={13} /> 批量核验
           </button>
           <button
             type="button"
@@ -1658,7 +1658,7 @@ export function ReviewView({ initialDimFilter }: { initialDimFilter?: string | n
                       className="wikiBatchCheckbox"
                       checked={selected.has(c.id)}
                       onChange={() => toggleSelect(c.id)}
-                      title="选中以批量 verify / archive"
+                      title="选中以批量核验 / 归档"
                     />
                     {/* 单 chunk 处置（展示 + verify-gate + verify/reject）走中立化共享卡片。
                         chunk={c}：传入列表已 pre-fetch 的整行，卡片不再发 GET-by-id（消除 N+1）。
