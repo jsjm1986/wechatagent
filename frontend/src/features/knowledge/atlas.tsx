@@ -14,7 +14,7 @@ import { useConfirm } from "../../components/ui/ConfirmDialog";
 import { useToast } from "../../components/ui/Toast";
 import { EmptyState } from "../../components/ui/EmptyState";
 import { focusChunk, type TreeChunkItem } from "./shared";
-import { wikiTypeLabel, statusLabel, fieldKindLabel } from "./labels";
+import { wikiTypeLabel, statusLabel, fieldKindLabel, operatorMemoryKindLabel } from "./labels";
 import { DomainSchemaEditor, type DomainSchemaUpsertBody } from "./DomainSchemaEditor";
 
 // ── P1 · ChunkGraphView · 关系图谱（SVG 原生布局，0 新依赖）─────────────
@@ -1168,15 +1168,15 @@ function TaxonomiesGovernance() {
       <table className="wikiAdminTable">
         <thead>
           <tr>
-            <th>scope</th>
-            <th>kind</th>
-            <th>value</th>
-            <th>label</th>
-            <th>status</th>
-            <th>version</th>
-            <th>active</th>
-            <th>updated</th>
-            <th>actions</th>
+            <th>范围</th>
+            <th>类型</th>
+            <th>取值</th>
+            <th>标签</th>
+            <th>状态</th>
+            <th>版本</th>
+            <th>当前生效</th>
+            <th>更新时间</th>
+            <th>操作</th>
           </tr>
         </thead>
         <tbody>
@@ -1258,12 +1258,12 @@ function StatePoliciesGovernance() {
       <table className="wikiAdminTable">
         <thead>
           <tr>
-            <th>domain</th>
-            <th>version</th>
-            <th>active</th>
-            <th>states</th>
-            <th>updated</th>
-            <th>actions</th>
+            <th>业务域</th>
+            <th>版本</th>
+            <th>当前生效</th>
+            <th>状态数</th>
+            <th>更新时间</th>
+            <th>操作</th>
           </tr>
         </thead>
         <tbody>
@@ -1339,11 +1339,11 @@ function DomainGovernance() {
       <table className="wikiAdminTable">
         <thead>
           <tr>
-            <th>domain</th>
-            <th>version</th>
-            <th>active</th>
-            <th>updated</th>
-            <th>actions</th>
+            <th>业务域</th>
+            <th>版本</th>
+            <th>当前生效</th>
+            <th>更新时间</th>
+            <th>操作</th>
           </tr>
         </thead>
         <tbody>
@@ -1460,13 +1460,13 @@ export function MemoryDrawer() {
         {items.map((m) => (
           <li className={`wikiMemoryItem kind-${m.kind}`} key={m.id ?? `${m.kind}-${m.createdAt}`}>
             <div className="wikiMemoryItemHead">
-              <span className={`wikiMemoryKind kind-${m.kind}`}>{m.kind}</span>
+              <span className={`wikiMemoryKind kind-${m.kind}`}>{operatorMemoryKindLabel(m.kind)}</span>
               <span className="wikiMemoryOperator">{m.operatorId}</span>
             </div>
             <div className="wikiMemoryContent">{m.content}</div>
             <div className="wikiMemoryFoot">
-              <span>last_used_at: {m.lastUsedAt ?? "—"}</span>
-              <span>expires_at: {m.expiresAt ?? "—"}</span>
+              <span>最近使用：{m.lastUsedAt ?? "—"}</span>
+              <span>过期时间：{m.expiresAt ?? "—"}</span>
             </div>
           </li>
         ))}
