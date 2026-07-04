@@ -22,7 +22,7 @@ import { ChunkPicker } from "../../components/ui/ChunkRef";
 import { useConfirm } from "../../components/ui/ConfirmDialog";
 import { useToast } from "../../components/ui/Toast";
 import { EmptyState } from "../../components/ui/EmptyState";
-import { severityLabel, priorityLabel, originLabel, draftKindLabel, taskStatusLabel, reportStatusLabel, digestCardKindLabel } from "./labels";
+import { severityLabel, priorityLabel, originLabel, draftKindLabel, taskStatusLabel, reportStatusLabel, digestCardKindLabel, digestSuggestedActionLabel } from "./labels";
 
 interface ChatTurnView {
   role: "user" | "assistant";
@@ -751,7 +751,7 @@ export function DigestCanvas() {
               </div>
             ) : null}
             <div className="wikiDigestCardFoot">
-              <span className="wikiDigestAction">建议：{card.suggestedAction}</span>
+              <span className="wikiDigestAction">建议：{digestSuggestedActionLabel(card.suggestedAction)}</span>
               <button
                 type="button"
                 className="wikiDigestDismiss"

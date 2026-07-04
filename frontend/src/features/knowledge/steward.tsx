@@ -18,7 +18,8 @@ import { ReviewChat, type ReviewChatChunk } from "./cockpit/ReviewChat";
 import { useConfirm } from "../../components/ui/ConfirmDialog";
 import { ChunkPicker } from "../../components/ui/ChunkRef";
 import { EmptyState } from "../../components/ui/EmptyState";
-import { sourceTypeLabel, statusLabel, integrityStatusLabel, wikiTypeLabel, severityLabel, sourceKindLabel, ingestStatusLabel, riskLevelLabel, revisionOpLabel, revisionSourceLabel } from "./labels";
+import { sourceTypeLabel, statusLabel, integrityStatusLabel, wikiTypeLabel, sourceKindLabel, ingestStatusLabel, riskLevelLabel, revisionOpLabel, revisionSourceLabel } from "./labels";
+import { GAP_SIGNAL_KIND_LABELS, GAP_SIGNAL_SEVERITY_LABELS, labelOf } from "../../lib/reviewLabels";
 import { DocumentRepairPanel } from "./DocumentRepairPanel";
 
 // ── G2 · DocumentsView · 知识文档目录 CRUD ─────────────────────────────
@@ -901,7 +902,7 @@ export function ImportWizard() {
                 <div key={i} className={`wikiImportCandidate${isOn ? " selected" : ""}`}>
                   <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
                     <input type="checkbox" checked={isOn} onChange={() => toggle(i)} />
-                    <span className="wikiArchiveTag">{merged.wikiType ?? "—"}</span>
+                    <span className="wikiArchiveTag">{wikiTypeLabel(merged.wikiType ?? undefined)}</span>
                     <input
                       type="text"
                       value={merged.title ?? ""}
@@ -1193,24 +1194,15 @@ interface GapSignalItem {
   resolvedAt?: string | null;
 }
 
-// 8 类 gap_signal kind —— 与 src/knowledge_wiki/gap_signals.rs:11-19 对齐。
-const GAP_SIGNAL_KINDS: { v: string; label: string }[] = [
-  { v: "orphan", label: "孤立条目" },
-  { v: "broken_link", label: "失效引用" },
-  { v: "no_outlinks", label: "无出链" },
-  { v: "low_confidence", label: "低置信" },
-  { v: "stale", label: "内容过期" },
-  { v: "contradiction", label: "内容矛盾" },
-  { v: "missing_chunk", label: "缺失条目" },
-  { v: "suggestion", label: "改进建议" },
+// gap_signal kind 顺序(过滤树用);标签/严重度统一取共享字典 lib/reviewLabels.ts
+// (含 recall_miss/dangling_anchor 共 10 类,与 src/knowledge_wiki/gap_signals.rs 对齐)。
+const GAP_SIGNAL_KIND_ORDER = [
+  "orphan", "broken_link", "no_outlinks", "low_confidence", "stale",
+  "contradiction", "missing_chunk", "suggestion", "dangling_anchor", "recall_miss",
 ];
 
-const GAP_SIGNAL_KIND_LABEL: Record<string, string> = Object.fromEntries(
-  GAP_SIGNAL_KINDS.map((k) => [k.v, k.label]),
-);
 function gapKindLabel(v?: string | null): string {
-  if (!v) return "—";
-  return GAP_SIGNAL_KIND_LABEL[v] ?? v;
+  return labelOf(GAP_SIGNAL_KIND_LABELS, v);
 }
 
 export function LintView() {
@@ -1322,19 +1314,19 @@ export function LintView() {
             <span>全部</span>
             <span className="wikiLintCount">{items.length}</span>
           </button>
-          {GAP_SIGNAL_KINDS.map((k) => {
-            const c = counts.get(k.v) ?? 0;
+          {GAP_SIGNAL_KIND_ORDER.map((kv) => {
+            const c = counts.get(kv) ?? 0;
             return (
               <button
                 type="button"
-                key={k.v}
-                className={`wikiLintTreeNode ${activeKind === k.v ? "active" : ""} ${
+                key={kv}
+                className={`wikiLintTreeNode ${activeKind === kv ? "active" : ""} ${
                   c === 0 ? "empty" : ""
                 }`}
-                onClick={() => setActiveKind(k.v)}
+                onClick={() => setActiveKind(kv)}
               >
                 <span>
-                  <span className={`wikiKind ${k.v}`} /> {k.label}
+                  <span className={`wikiKind ${kv}`} /> {gapKindLabel(kv)}
                 </span>
                 <span className="wikiLintCount">{c}</span>
               </button>
@@ -1354,7 +1346,7 @@ export function LintView() {
                 <div className="wikiSignalHead">
                   <div className="wikiSignalTitle">
                     <span className={`wikiKind ${s.kind}`}>{gapKindLabel(s.kind)}</span>
-                    <span className={`wikiSev ${s.severity}`}>{severityLabel(s.severity)}</span>
+                    <span className={`wikiSev ${s.severity}`}>{labelOf(GAP_SIGNAL_SEVERITY_LABELS, s.severity)}</span>
                     <strong>{s.title}</strong>
                   </div>
                   <div className="wikiSignalActions">
