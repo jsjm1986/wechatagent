@@ -974,6 +974,18 @@ fn segment_idempotency_base<'a>(source_event_id: &'a str, run_id: &'a str) -> &'
     }
 }
 
+/// 本 run 是否会把文本回复投递到 outbox（task 终态判定用）。等价于 `outbox_eligible`
+/// 的文本部分（后者再加 `final_status ∈ {approved, revision_applied_approved}` 门，但
+/// 本判定的调用点已在 `finalize_status == Approved` 分支内，故等价）。
+///
+/// 媒体/名片发送也复用 `outbox_eligible`（`media_send_allowed` 依赖它），故本条件为
+/// 假 ⟺ 本 run 不会 enqueue 任何东西。用它统一决定 task 终态：`should_reply=true` 但
+/// `reply_text` 为空这种退化决策此前既不置 `outbox_enqueued`（因文本空）、也不 cancel
+/// （因 should_reply 真）→ task 卡在 `running` 被 reclaim 反复重试、3 次后强制 failed。
+fn text_send_eligible(should_reply: bool, reply_text: &str) -> bool {
+    should_reply && !reply_text.trim().is_empty()
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_user_operation_gateway_inner(
     state: &AppState,
@@ -2293,7 +2305,7 @@ async fn run_user_operation_gateway_inner(
         }
     }
 
-    if final_decision.should_reply && !final_decision.reply_text.trim().is_empty() {
+    if text_send_eligible(final_decision.should_reply, &final_decision.reply_text) {
         if let Some(task_id) = task_id {
             // W4 / Task 5.5：发送改异步走 outbox，把 task 状态推进为
             // `outbox_enqueued` 而不是 `sent`；真正 `sent` 由 dispatcher 在
@@ -2370,9 +2382,17 @@ async fn run_user_operation_gateway_inner(
         &run_id,
     )
     .await?;
-    if !final_decision.should_reply {
+    if !text_send_eligible(final_decision.should_reply, &final_decision.reply_text) {
         if let Some(task_id) = task_id {
-            cancel_task(state, task_id, "no_reply", "Agent 判断无需触达").await?;
+            // should_reply=false → 无需触达；should_reply=true 但 reply_text 为空 → 退化
+            // 决策无内容可发（媒体/名片也因 outbox_eligible 要求非空文本而不会发）。两者都
+            // 须落终态，否则 task 卡在 running 被 reclaim 反复重试、3 次后强制 failed。
+            let reason = if final_decision.should_reply {
+                "Agent 想回复但生成的正文为空，无内容可发送"
+            } else {
+                "Agent 判断无需触达"
+            };
+            cancel_task(state, task_id, "no_reply", reason).await?;
         }
     }
     let details = build_decision_event_details(&final_decision, playbook.as_ref(), &review);
@@ -5556,6 +5576,26 @@ mod tests {
         // 非空 source(=message_id,本身即幂等锚)原样用,绝不掺 run_id,
         // 否则同消息重放命中不同 key 破坏去重致重复发送。
         assert_eq!(segment_idempotency_base("msg456", "run123"), "msg456");
+    }
+
+    #[test]
+    fn text_send_eligible_true_only_when_should_reply_and_nonempty() {
+        assert!(text_send_eligible(true, "你好呀"));
+    }
+
+    #[test]
+    fn text_send_eligible_false_when_should_reply_but_text_empty_or_blank() {
+        // 退化决策:想回复却给空/纯空白正文。此前既不置 outbox_enqueued(文本空)、
+        // 也不 cancel(should_reply 真)→ task 卡 running 被 reclaim 反复重试后强制
+        // failed。此判定为假 → 走 cancel_task 落终态,根治卡死。
+        assert!(!text_send_eligible(true, ""));
+        assert!(!text_send_eligible(true, "   \n\t "));
+    }
+
+    #[test]
+    fn text_send_eligible_false_when_not_should_reply() {
+        assert!(!text_send_eligible(false, "你好呀"));
+        assert!(!text_send_eligible(false, ""));
     }
 
     #[test]
