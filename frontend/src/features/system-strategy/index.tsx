@@ -110,6 +110,29 @@ function versionStatusLabel(status: string): string {
   return VERSION_STATUS_LABELS[status] || status;
 }
 
+// 数字分身关系类型(canonical:customer/peer/friend,同 m024 字典/seed profile);未知回落原值。
+const RELATIONSHIP_TYPE_LABELS: Record<string, string> = {
+  customer: "客户",
+  peer: "同行",
+  friend: "朋友",
+};
+function relationshipTypeLabel(rt: string): string {
+  return RELATIONSHIP_TYPE_LABELS[rt] || rt;
+}
+
+// domain profile / soul 种子来源(models.rs:1012/1044:system/manual/legacy_migration/
+// evolution_release/generated_by_ai);未知回落原值。
+const SEEDED_BY_LABELS: Record<string, string> = {
+  system: "系统内置",
+  manual: "管理员新建",
+  legacy_migration: "历史迁移",
+  evolution_release: "自优化发布",
+  generated_by_ai: "AI 生成",
+};
+function seededByLabel(v: string): string {
+  return SEEDED_BY_LABELS[v] || v;
+}
+
 // lessons 教训评审状态(lessons_learned.rs;未知值回落原值)。
 function lessonReviewStatusLabel(status: string): string {
   const labels: Record<string, string> = {
@@ -854,7 +877,7 @@ function TaxonomiesAdmin({ busy }: { busy: boolean }) {
               checked={createDraft.isReactivationTarget}
               onChange={(e) => setCreateDraft({ ...createDraft, isReactivationTarget: e.target.checked })}
             />
-            可作再激活目标 is_reactivation_target
+            可作再激活目标
           </label>
           <label className={styles.inlineCheckbox}>
             <input
@@ -862,7 +885,7 @@ function TaxonomiesAdmin({ busy }: { busy: boolean }) {
               checked={createDraft.isTerminal}
               onChange={(e) => setCreateDraft({ ...createDraft, isTerminal: e.target.checked })}
             />
-            终态 is_terminal
+            终态
           </label>
           <div className={styles.buttonRow}>
             <button type="button" className={styles.btnPrimary} onClick={() => void submitCreate()} disabled={acting}>保存</button>
@@ -882,7 +905,7 @@ function TaxonomiesAdmin({ busy }: { busy: boolean }) {
                 <h3>{item.value.label || item.value.id}</h3>
               </div>
               <span className={item.value.status === "active" ? styles.badgeOk : styles.badgeDegraded}>
-                {item.value.status}
+                {versionStatusLabel(item.value.status)}
               </span>
             </div>
             <ActiveVersionsBar
@@ -944,7 +967,7 @@ function TaxonomiesAdmin({ busy }: { busy: boolean }) {
                     checked={editDraft.isReactivationTarget}
                     onChange={(e) => setEditDraft({ ...editDraft, isReactivationTarget: e.target.checked })}
                   />
-                  可作再激活目标 is_reactivation_target
+                  可作再激活目标
                 </label>
                 <label className={styles.inlineCheckbox}>
                   <input
@@ -952,7 +975,7 @@ function TaxonomiesAdmin({ busy }: { busy: boolean }) {
                     checked={editDraft.isTerminal}
                     onChange={(e) => setEditDraft({ ...editDraft, isTerminal: e.target.checked })}
                   />
-                  终态 is_terminal
+                  终态
                 </label>
                 <div className={styles.buttonRow}>
                   <button type="button" className={styles.btnPrimary} onClick={() => void submitEdit(item.id)} disabled={acting}>保存编辑</button>
@@ -1530,7 +1553,7 @@ function ProfileEditor({
       <details className={styles.advanced}>
         <summary>方法论生成器引导语（可选）</summary>
         <label className={styles.field}>
-          <span>methodologyGeneratorPreamble</span>
+          <span>方法论生成器引导语</span>
           <textarea
             className={styles.textarea}
             value={draft.methodology_generator_preamble ?? ""}
@@ -1613,7 +1636,7 @@ function ProfileEditor({
           只换人格口吻与方法论叙述，<strong>不放宽边界保护红线</strong>（边界硬规则始终由系统 prompt 守护）。
         </p>
         <label className={styles.field}>
-          <span>人格本体覆盖 soulOverride</span>
+          <span>人格本体覆盖</span>
           <textarea
             className={styles.textarea}
             value={draft.soul_override ?? ""}
@@ -1623,7 +1646,7 @@ function ProfileEditor({
           />
         </label>
         <label className={styles.field}>
-          <span>方法论本体覆盖 methodologyOverride</span>
+          <span>方法论本体覆盖</span>
           <textarea
             className={styles.textarea}
             value={draft.methodology_override ?? ""}
@@ -1633,7 +1656,7 @@ function ProfileEditor({
           />
         </label>
         <label className={styles.field}>
-          <span>对话模式判定规则覆盖 conversationModePolicy</span>
+          <span>对话模式判定规则覆盖</span>
           <textarea
             className={styles.textarea}
             value={draft.conversation_mode_policy ?? ""}
@@ -2067,11 +2090,11 @@ function ProfileEditor({
               checked={draft.transaction_facts_enabled ?? false}
               onChange={(e) => update({ transaction_facts_enabled: e.target.checked })}
             />
-            交易型域（注入产品目录 + 持有事实）transaction_facts_enabled
+            交易型域（注入产品目录 + 持有事实）
           </label>
         </div>
         <label className={styles.field}>
-          <span>评审重点 review_focus</span>
+          <span>评审重点</span>
           <input
             className={styles.input}
             type="text"
@@ -2087,7 +2110,7 @@ function ProfileEditor({
           />
         </label>
         <label className={styles.field}>
-          <span>平衡原则 balance_principle</span>
+          <span>平衡原则</span>
           <input
             className={styles.input}
             type="text"
@@ -2103,7 +2126,7 @@ function ProfileEditor({
           />
         </label>
         <label className={styles.field}>
-          <span>模式-闸说明覆盖 mode_gate_policy_override</span>
+          <span>模式-闸说明覆盖</span>
           <textarea
             className={styles.textarea}
             value={draft.mode_gate_policy_override ?? ""}
@@ -2111,7 +2134,7 @@ function ProfileEditor({
           />
         </label>
         <label className={styles.field}>
-          <span>去抖窗口（毫秒）debounce_window_ms_override</span>
+          <span>去抖窗口（毫秒）</span>
           <input
             className={styles.input}
             type="number"
@@ -2157,7 +2180,7 @@ function ProfileEditor({
                     )
                   }
                 />
-                为 {rt} 单独配置范式
+                为「{relationshipTypeLabel(rt)}」单独配置范式
               </label>
               {enabled && mode && (
                 <>
@@ -2202,7 +2225,7 @@ function ProfileEditor({
         <summary>领域标志位（高敏域可选）</summary>
         <div className={styles.formGrid}>
           <label className={styles.field}>
-            <span>停滞计时驱动维度 stagnationDimension</span>
+            <span>停滞计时驱动维度</span>
             <input
               className={styles.input}
               value={draft.stagnation_dimension ?? ""}
@@ -2428,7 +2451,7 @@ function DomainProfilePanel({ busy }: { busy: boolean }) {
                   <div className={styles.profileListMeta}>
                     <ProfileStatusBadge profile={profile} />
                     {profile.seeded_by && (
-                      <span className={styles.activeVersionsSeeded}>{profile.seeded_by}</span>
+                      <span className={styles.activeVersionsSeeded}>{seededByLabel(profile.seeded_by)}</span>
                     )}
                     {profile.updated_at && (
                       <span className={styles.activeVersionsTimestamp}>{profile.updated_at}</span>
