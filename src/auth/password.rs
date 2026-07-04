@@ -3,10 +3,20 @@
 //! 直接走 [`argon2`] crate 的默认参数（OWASP 2024 推荐 m=19MiB / t=2 / p=1）。
 //! PHC 字符串自带盐与参数，不需要单独存盐字段。
 
+use std::sync::LazyLock;
+
 use argon2::{
     password_hash::{rand_core::OsRng, PasswordHash, PasswordHasher, PasswordVerifier, SaltString},
     Argon2,
 };
+
+/// 进程级预计算的假 PHC 哈希。用户不存在时对它跑一次 verify，抹平"用户存在 vs
+/// 不存在"的 Argon2 耗时差——否则不存在的用户会因跳过 verify 而秒回，泄漏用户名
+/// 是否存在（枚举时序侧信道）。必须是合法 PHC，否则 verify 会早退成 Err（快路径）
+/// 反而重新制造时序差；`dummy_hash_is_valid_phc` 测试锁住这一不变量。
+static DUMMY_HASH: LazyLock<String> = LazyLock::new(|| {
+    hash_password("constant-time-dummy-never-a-real-password").expect("dummy hash must build")
+});
 
 #[derive(Debug, thiserror::Error)]
 pub enum PasswordError {
@@ -32,6 +42,12 @@ pub fn verify_password(plaintext: &str, phc: &str) -> Result<bool, PasswordError
     Ok(Argon2::default()
         .verify_password(plaintext.as_bytes(), &parsed)
         .is_ok())
+}
+
+/// 用户名不存在时跑一次 verify（对进程级假哈希），支付与"用户存在"路径等价的
+/// Argon2 耗时，抹平枚举时序侧信道。恒返回 false，调用方按"凭据无效"处理。
+pub fn verify_against_dummy(plaintext: &str) -> bool {
+    verify_password(plaintext, &DUMMY_HASH).unwrap_or(false)
 }
 
 #[cfg(test)]
@@ -61,5 +77,18 @@ mod tests {
     fn rejects_malformed_phc() {
         let res = verify_password("any", "not-a-phc-string");
         assert!(res.is_err());
+    }
+
+    #[test]
+    fn dummy_hash_is_valid_phc() {
+        // 假哈希必须是合法 PHC，否则 verify_against_dummy 会走 PHC 解析失败的
+        // 快路径（不跑 Argon2），重新制造用户存在/不存在的时序差。
+        assert!(PasswordHash::new(&DUMMY_HASH).is_ok());
+    }
+
+    #[test]
+    fn verify_against_dummy_always_false() {
+        assert!(!verify_against_dummy("anything"));
+        assert!(!verify_against_dummy(""));
     }
 }
