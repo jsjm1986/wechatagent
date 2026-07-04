@@ -270,6 +270,7 @@
 .simpleActionTitle { font-size: 14px; font-weight: 650; color: var(--ink-1); }
 .simpleActionSummary { font-size: 13px; color: var(--ink-2); margin: 6px 0; line-height: 1.5; }
 .simpleActionEvidence { display: grid; gap: 2px; }
+.simpleActionMeta { display: flex; flex-wrap: wrap; gap: 12px; margin-top: 6px; font-size: 12px; color: var(--ink-2); }
 .simpleActionButtons { display: flex; gap: 8px; margin-top: 12px; }
 
 /* 卡内动作按钮（三张知识卡的按钮无 className，作用域到卡容器内，与 header 按钮同款描边规范） */
