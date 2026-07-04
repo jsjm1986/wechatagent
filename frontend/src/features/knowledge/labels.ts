@@ -210,20 +210,18 @@ export function digestCardKindLabel(v?: string | null): string {
   return DIGEST_CARD_KIND_LABELS[v] ?? v;
 }
 
-/// 质量信号类型(LintView 的 kind 封闭枚举)
-export const LINT_KIND_LABELS: Record<string, string> = {
-  orphan: "孤立条目",
-  broken_link: "失效引用",
-  no_outlinks: "无出链",
-  low_confidence: "低置信",
-  stale: "内容过期",
-  contradiction: "内容矛盾",
-  missing_chunk: "缺失条目",
-  suggestion: "改进建议",
+/// 今日 Digest 卡片建议动作(后端 knowledge_digest/mod.rs allowed_actions 封闭枚举)
+export const DIGEST_SUGGESTED_ACTION_LABELS: Record<string, string> = {
+  fix_chunk: "补字段/修复",
+  add_chunk: "补录条目",
+  retag: "重打标签",
+  review_evolution: "评估进化提案",
+  dismiss: "忽略",
+  freeform: "查看详情",
 };
-export function lintKindLabel(v?: string | null): string {
+export function digestSuggestedActionLabel(v?: string | null): string {
   if (!v) return "—";
-  return LINT_KIND_LABELS[v] ?? v;
+  return DIGEST_SUGGESTED_ACTION_LABELS[v] ?? v;
 }
 
 /// 后台任务状态(knowledge_chat_tasks 封闭枚举)
