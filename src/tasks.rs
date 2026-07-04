@@ -29,7 +29,8 @@ pub async fn run_task_worker(state: AppState) {
 /// 只回收启动前留下来的；本进程启动后的运行任务即使没写 claimed_at 也跳过
 /// 一次，避免误回收正在跑的任务。
 ///
-/// `claim_recovery_count` 24h 内 ≥ 3 时直接标 `failed`，避免无限循环。
+/// 累计 `claim_recovery_count` ≥ 3 时直接标 `failed`，避免无限循环（按累计次数、
+/// 无时间窗——比 24h 滑窗更保守，健康任务本就不累积重试）。
 async fn reclaim_stale_running_tasks(state: &AppState) -> anyhow::Result<usize> {
     let timeout_secs = state.config.task_claim_timeout_seconds.max(1) as i64;
     let now_ms = DateTime::now().timestamp_millis();
@@ -62,7 +63,7 @@ async fn reclaim_stale_running_tasks(state: &AppState) -> anyhow::Result<usize> 
             0
         };
         let recovery_count = task.claim_recovery_count.saturating_add(1);
-        // 24h 内回收次数 ≥ 3 → 直接 failed，防止死循环。
+        // 累计回收次数 ≥ 3 → 直接 failed，防止死循环。
         if recovery_count >= 3 {
             assert_agent_task_status_valid("failed");
             let res = state
