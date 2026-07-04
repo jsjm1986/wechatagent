@@ -606,7 +606,7 @@ function StatePolicyAdmin({ busy }: { busy: boolean }) {
                 <span className={styles.versionedListScope}>{item.domain}</span>
                 <h3>{item.stateKey}</h3>
               </div>
-              <span className={item.status === "active" ? styles.badgeOk : styles.badgeDegraded}>{item.status}</span>
+              <span className={item.status === "active" ? styles.badgeOk : styles.badgeDegraded}>{versionStatusLabel(item.status)}</span>
             </div>
             <ActiveVersionsBar
               meta={item}
