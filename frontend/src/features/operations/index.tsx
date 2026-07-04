@@ -5,7 +5,7 @@ import { StatusBadge, type StatusTone } from "../../components/ui/StatusBadge";
 import { useOperationsStore } from "../../stores/operationsStore";
 import { useAccountStore } from "../../stores/accountStore";
 import { api } from "../../lib/api";
-import { FINAL_REVIEW_STATUS_LABELS, HOLD_CATEGORY_LABELS, labelOf } from "../../lib/reviewLabels";
+import { FINAL_REVIEW_STATUS_LABELS, GATEWAY_STATUS_LABELS, HOLD_CATEGORY_LABELS, labelOf } from "../../lib/reviewLabels";
 import type { DecisionReview, AgentRunItem } from "../../types";
 import styles from "./Operations.module.css";
 
@@ -92,6 +92,40 @@ const SUFFICIENCY_LABELS: Record<string, string> = {
   enough: "信息充分",
   need_more_context: "需更多上下文",
   need_clarification: "需澄清",
+};
+
+// 跟进任务状态(agent_tasks.status;未知值回落原值)。
+const TASK_STATUS_LABELS: Record<string, string> = {
+  pending: "待执行",
+  scheduled: "已排程",
+  running: "执行中",
+  done: "已完成",
+  completed: "已完成",
+  failed: "已失败",
+  cancelled: "已取消",
+  canceled: "已取消",
+};
+
+// 客户反应 outcome_status(reaction.rs;LLM 派生 + polarity 配置,未知值回落原值)。
+const OUTCOME_STATUS_LABELS: Record<string, string> = {
+  user_replied_positive: "客户正面回应",
+  user_replied_neutral: "客户中性回应",
+  user_replied_negative: "客户负面回应",
+  user_replied_objection: "客户提出异议",
+  user_replied_stop_requested: "客户要求停止",
+  user_replied_buying_signal: "客户释放购买信号",
+  user_replied_continue_exploring: "客户继续了解",
+  user_replied_unclassified: "反应待分类",
+  pending: "待客户反应",
+};
+
+// run 触发来源 trigger_kind(未知值回落原值)。
+const TRIGGER_KIND_LABELS: Record<string, string> = {
+  inbound_message: "客户来信",
+  reply: "回复触发",
+  follow_up: "主动跟进",
+  scheduled: "定时任务",
+  envelope_recovered: "任务恢复重跑",
 };
 
 type TierTelemetry = {
@@ -219,7 +253,7 @@ export default function OperationsFeature() {
               <tbody>
                 {tasks.map((task) => (
                   <tr key={task.id}>
-                    <td><StatusBadge tone={taskStatusTone(task.status)}>{task.status}</StatusBadge></td>
+                    <td><StatusBadge tone={taskStatusTone(task.status)}>{labelOf(TASK_STATUS_LABELS, task.status)}</StatusBadge></td>
                     <td>{task.content}</td>
                     <td className={styles.cellMuted}>{formatTime(task.runAt)}</td>
                     <td className={styles.cellActions}>
@@ -308,7 +342,7 @@ export default function OperationsFeature() {
                   <tr key={review.id}>
                     <td><StatusBadge tone={reviewTone(review)}>{review.approved ? "通过" : blockedLabel(review)}</StatusBadge></td>
                     <td>{nextBestActionLabel(review.nextBestAction)}</td>
-                    <td className={styles.cellMuted}>{review.outcomeStatus || "pending"}</td>
+                    <td className={styles.cellMuted}>{labelOf(OUTCOME_STATUS_LABELS, review.outcomeStatus || "pending")}</td>
                     <td className={styles.cellNum}>{formatScores(review.scores)}</td>
                     <td>{review.reviewSummary || review.replyText || "-"}</td>
                     <td className={styles.cellMuted}>{formatTime(review.createdAt)}</td>
@@ -426,9 +460,9 @@ function RunEnvelopeRows({
   return (
     <>
       <tr>
-        <td><StatusBadge tone={runStatusTone(run.status)}>{run.status || "-"}</StatusBadge></td>
+        <td><StatusBadge tone={runStatusTone(run.status)}>{run.status ? labelOf(GATEWAY_STATUS_LABELS, run.status) : "-"}</StatusBadge></td>
         <td className={styles.cellMuted}>{run.runId || run.id || "-"}</td>
-        <td>{run.triggerKind || "-"}</td>
+        <td>{run.triggerKind ? labelOf(TRIGGER_KIND_LABELS, run.triggerKind) : "-"}</td>
         <td className={styles.cellMuted}>
           {tier
             ? `${TIER_LABELS[tier.missingTier] ?? tier.missingTier ?? "-"}${tier.escalated ? " · 需升档" : ""}`
