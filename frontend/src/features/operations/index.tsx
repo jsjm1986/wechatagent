@@ -40,6 +40,14 @@ function taskStatusTone(status?: string): StatusTone {
   return "inactive";
 }
 
+// LLM 调用日志状态(models.rs:3005 闭集:success/cache_hit/failed/json_error);未知回落原值。
+const LLM_CALL_STATUS_LABELS: Record<string, string> = {
+  success: "成功",
+  cache_hit: "缓存命中",
+  failed: "失败",
+  json_error: "返回解析失败",
+};
+
 export function formatScores(scores: Record<string, number>) {
   const entries = Object.entries(scores ?? {}).filter(([, v]) => v !== undefined && v !== null);
   return (
@@ -408,7 +416,7 @@ export default function OperationsFeature() {
               <table className={styles.table}>
                 <thead>
                   <tr>
-                    <th>Prompt Key</th>
+                    <th>提示词</th>
                     <th>状态</th>
                     <th>耗时</th>
                     <th>命中</th>
@@ -420,7 +428,7 @@ export default function OperationsFeature() {
                   {usageItems.map((item) => (
                     <tr key={item.id}>
                       <td>{item.promptKey}</td>
-                      <td className={styles.cellMuted}>{item.status}</td>
+                      <td className={styles.cellMuted}>{LLM_CALL_STATUS_LABELS[item.status] ?? item.status}</td>
                       <td className={styles.cellNum}>{item.latencyMs}ms</td>
                       <td className={styles.cellNum}>hit {item.promptCacheHitTokens}</td>
                       <td className={styles.cellNum}>miss {item.promptCacheMissTokens}</td>
