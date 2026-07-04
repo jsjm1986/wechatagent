@@ -5,7 +5,6 @@ import {
   GAP_SIGNAL_KIND_LABELS,
   ESCALATION_CATEGORY_LABELS,
   ESCALATION_VERDICT_LABELS,
-  RISK_DIMENSION_LABELS,
   labelOf,
 } from "../../lib/reviewLabels";
 
@@ -52,12 +51,6 @@ describe("reviewLabels 扩展字典", () => {
   it("verdict 中文", () => {
     expect(ESCALATION_VERDICT_LABELS["approved"]).toBe("同意");
     expect(ESCALATION_VERDICT_LABELS["delegated_back"]).toBe("授权 AI 自行处理");
-  });
-
-  it("风险维度名中文", () => {
-    expect(RISK_DIMENSION_LABELS["hallucinationScore"]).toBeTruthy();
-    expect(RISK_DIMENSION_LABELS["humanLike"]).toBeTruthy();
-    expect(RISK_DIMENSION_LABELS["knowledgeGroundingScore"]).toBeTruthy();
   });
 
   it("labelOf 未知值回落原值", () => {

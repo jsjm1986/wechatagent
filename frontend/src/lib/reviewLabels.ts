@@ -43,20 +43,6 @@ export const GAP_SIGNAL_SEVERITY_LABELS: Record<string, string> = {
   high: "高优",
 };
 
-export const GAP_SIGNAL_STATUS_LABELS: Record<string, string> = {
-  pending: "待处理",
-  auto_resolved: "已自动消解",
-  llm_resolved: "AI 已消解",
-  applied: "已按建议处理",
-  dismissed: "已忽略",
-};
-
-export const GAP_SIGNAL_SOURCE_LABELS: Record<string, string> = {
-  rule: "规则检出",
-  llm: "AI 判定",
-  recall_trace: "对话追踪",
-};
-
 // escalation(principal_escalations.rs / ask_human_inbox.rs)。
 export const ESCALATION_CATEGORY_LABELS: Record<string, string> = {
   high_risk_gated: "高风险待裁决",
@@ -75,20 +61,6 @@ export const ESCALATION_VERDICT_LABELS: Record<string, string> = {
 export const ESCALATION_RESOLVED_VIA_LABELS: Record<string, string> = {
   wechat: "领导微信裁决",
   admin: "后台裁决",
-};
-
-// 复核风险维度名。键为 serde camelCase wire 键(ReviewScores #[serde(rename_all="camelCase")],
-// types.rs:1136),与 features/operations SCORE_LABELS 同形态;另收 factRisk/productAccuracy
-// 两个后端反序列化 alias(types.rs:1144,1147),覆盖 LLM 输出/旧文档形态。
-export const RISK_DIMENSION_LABELS: Record<string, string> = {
-  hallucinationScore: "事实可靠度风险",
-  factRisk: "事实可靠度风险",
-  pressureRisk: "压迫感风险",
-  humanLike: "真人感评分",
-  emotionalValue: "情绪价值评分",
-  knowledgeGroundingScore: "产品准确度评分",
-  productAccuracy: "产品准确度评分",
-  boundaryPrivacySafety: "边界隐私安全评分",
 };
 
 export function labelOf(

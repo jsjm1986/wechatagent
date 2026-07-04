@@ -1,28 +1,12 @@
 import { useEffect, useState } from "react";
 import { api } from "../../lib/api";
+import { ESCALATION_VERDICT_LABELS, ESCALATION_RESOLVED_VIA_LABELS, labelOf } from "../../lib/reviewLabels";
 
 // 已裁决（resolved）请示历史：只读回顾，不是待办，故与 pending 统一收件箱（inboxStore）正交，
 // 自取数走专门端点 GET /api/admin/principal-escalations?status=resolved。
 // wire 键核实：list handler 用 json!{} 手工拼 camelCase 外层键（principal_escalations.rs:42-55）；
 // decision 是 PrincipalDecision，其 struct 无 rename_all（models.rs:3308 注释明示保 snake_case），
 // 故内层键为 verdict / substance / constraints / authorization_window_hours（verdict/substance 单词无大小写差异）。
-
-// 裁决口径闭集 → 中文标签（与 EscalationInline 的 VERDICT_OPTIONS 同源）。
-const VERDICT_LABEL: Record<string, string> = {
-  approved: "批准",
-  rejected: "驳回",
-  conditional: "有条件批准",
-  deferred: "暂缓",
-  delegated_back: "退回再议",
-};
-
-// 裁决渠道 → 中文标签。未知值原样回显（不吞）。
-const RESOLVED_VIA_LABEL: Record<string, string> = {
-  wechat: "决策人微信回复",
-  admin: "后台直接裁决",
-  principal_chat: "决策人对话",
-  admin_direct: "后台直接裁决",
-};
 
 interface ResolvedDecision {
   verdict?: string;
@@ -96,10 +80,8 @@ export function ResolvedEscalations() {
     <div className="resolvedEscList">
       {items.map((it) => {
         const v = it.decision?.verdict;
-        const verdictLabel = v ? (VERDICT_LABEL[v] ?? v) : "—";
-        const viaLabel = it.resolvedVia
-          ? (RESOLVED_VIA_LABEL[it.resolvedVia] ?? it.resolvedVia)
-          : "—";
+        const verdictLabel = labelOf(ESCALATION_VERDICT_LABELS, v);
+        const viaLabel = labelOf(ESCALATION_RESOLVED_VIA_LABELS, it.resolvedVia);
         return (
           <div className="resolvedEscRow" key={it.shortCode}>
             <div className="resolvedEscHead">
