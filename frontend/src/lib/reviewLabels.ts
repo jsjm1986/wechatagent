@@ -22,6 +22,47 @@ export const HOLD_CATEGORY_LABELS: Record<string, string> = {
   ai_waiting_for_more_context: "AI 等待更多上下文",
 };
 
+// gap_signal(sources_meta.rs:363 裸下发)。kind 10 类 gap_signals.rs 各判定点。
+export const GAP_SIGNAL_KIND_LABELS: Record<string, string> = {
+  orphan: "孤立知识",
+  broken_link: "引用失效",
+  missing_chunk: "依赖已归档",
+  no_outlinks: "缺关联引用",
+  low_confidence: "置信度偏低",
+  stale: "时效已过",
+  contradiction: "同题冲突",
+  suggestion: "建议补完核实",
+  dangling_anchor: "出处对不上",
+  recall_miss: "知识缺口（答不上）",
+};
+
+export const GAP_SIGNAL_SEVERITY_LABELS: Record<string, string> = {
+  info: "一般提示",
+  warning: "需注意",
+  error: "严重",
+  high: "高优",
+};
+
+// escalation(principal_escalations.rs / ask_human_inbox.rs)。
+export const ESCALATION_CATEGORY_LABELS: Record<string, string> = {
+  high_risk_gated: "高风险待裁决",
+  out_of_scope_decision: "超出职权待决策",
+  stuck_or_undelivered: "多轮僵局待介入",
+};
+
+export const ESCALATION_VERDICT_LABELS: Record<string, string> = {
+  approved: "同意",
+  rejected: "拒绝",
+  conditional: "有条件同意",
+  deferred: "暂缓待定",
+  delegated_back: "授权 AI 自行处理",
+};
+
+export const ESCALATION_RESOLVED_VIA_LABELS: Record<string, string> = {
+  wechat: "领导微信裁决",
+  admin: "后台裁决",
+};
+
 export function labelOf(
   map: Record<string, string>,
   value: string | null | undefined,

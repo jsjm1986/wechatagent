@@ -18,6 +18,8 @@ export interface InboxItem {
   evidence?: string;
   confidence?: number;
   occurrences?: number;
+  kind?: string;
+  signalSeverity?: string;
 }
 export interface SourceError {
   source: string;

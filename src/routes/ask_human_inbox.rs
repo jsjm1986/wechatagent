@@ -44,6 +44,12 @@ pub struct InboxItem {
     pub confidence: Option<i32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub occurrences: Option<i32>,
+    // gap_signal 富字段:知识缺口的类型 + 语义严重度(info/warning/error/high,
+    // 独立于 severity 排序标度)。仅 gap_signal 来源填充,其余恒 None。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub signal_severity: Option<String>,
 }
 
 fn age_hours_of(created: Option<DateTime>, now_ms: i64) -> f64 {
@@ -85,6 +91,8 @@ fn escalation_to_inbox_item(
         evidence: None,
         confidence: None,
         occurrences: None,
+        kind: None,
+        signal_severity: None,
     }
 }
 
@@ -140,6 +148,8 @@ async fn collect_knowledge_review(
                 evidence: None,
                 confidence: None,
                 occurrences: None,
+                kind: None,
+                signal_severity: None,
             }
         })
         .collect())
@@ -184,6 +194,8 @@ async fn collect_taxonomy_candidates(
                 evidence: None,
                 confidence: None,
                 occurrences: None,
+                kind: None,
+                signal_severity: None,
             }
         })
         .collect())
@@ -227,9 +239,38 @@ async fn collect_relationship_suggestions(
                 evidence: r.evidence.clone(),
                 confidence: Some(r.confidence),
                 occurrences: Some(r.occurrences),
+                kind: None,
+                signal_severity: None,
             }
         })
         .collect())
+}
+
+/// 单条知识缺口信号 → InboxItem(具名以便单测)。kind/signal_severity 富字段
+/// 让决策人看到缺口类型与语义严重度;severity 保持 "medium" 排序标度不变。
+fn gap_to_inbox_item(g: &crate::models::KnowledgeGapSignal, now_ms: i64) -> InboxItem {
+    let id = g.id.map(|o| o.to_hex()).unwrap_or_default();
+    InboxItem {
+        source: "gap_signal".into(),
+        id,
+        title: g.title.clone(),
+        summary: g.description.clone(),
+        severity: "medium".into(),
+        created_at: Some(g.created_at),
+        age_hours: age_hours_of(Some(g.created_at), now_ms),
+        action_kind: "inline".into(),
+        rich_component: None,
+        rich_params: None,
+        category: None,
+        question_for_principal: None,
+        contact_wxid: None,
+        principal_wxid: None,
+        evidence: None,
+        confidence: None,
+        occurrences: None,
+        kind: non_empty(&g.kind),
+        signal_severity: non_empty(&g.severity),
+    }
 }
 
 /// 知识缺口信号 pending → inline。
@@ -250,28 +291,7 @@ async fn collect_gap_signals(
     let rows: Vec<crate::models::KnowledgeGapSignal> = cursor.try_collect().await?;
     Ok(rows
         .into_iter()
-        .map(|g| {
-            let id = g.id.map(|o| o.to_hex()).unwrap_or_default();
-            InboxItem {
-                source: "gap_signal".into(),
-                id,
-                title: g.title.clone(),
-                summary: g.description.clone(),
-                severity: "medium".into(),
-                created_at: Some(g.created_at),
-                age_hours: age_hours_of(Some(g.created_at), now_ms),
-                action_kind: "inline".into(),
-                rich_component: None,
-                rich_params: None,
-                category: None,
-                question_for_principal: None,
-                contact_wxid: None,
-                principal_wxid: None,
-                evidence: None,
-                confidence: None,
-                occurrences: None,
-            }
-        })
+        .map(|g| gap_to_inbox_item(&g, now_ms))
         .collect())
 }
 
@@ -313,6 +333,8 @@ async fn collect_profile_drafts(
                 evidence: None,
                 confidence: None,
                 occurrences: None,
+                kind: None,
+                signal_severity: None,
             }
         })
         .collect())
@@ -356,6 +378,8 @@ async fn collect_evolution_proposals(
                 evidence: None,
                 confidence: None,
                 occurrences: None,
+                kind: None,
+                signal_severity: None,
             }
         })
         .collect())
@@ -403,6 +427,8 @@ async fn collect_lessons_learned(
                 evidence: None,
                 confidence: None,
                 occurrences: None,
+                kind: None,
+                signal_severity: None,
             }
         })
         .collect())
@@ -588,5 +614,45 @@ mod tests {
         assert_eq!(v["contactWxid"], "wxid_cust");
         assert_eq!(v["principalWxid"], "wxid_boss");
         assert_eq!(v["category"], "discount_request");
+    }
+
+    fn test_gap_fixture() -> crate::models::KnowledgeGapSignal {
+        crate::models::KnowledgeGapSignal {
+            id: None,
+            signal_id: "g1".into(),
+            workspace_id: "ws1".into(),
+            kind: "orphan".into(),
+            title: "孤立切片：定价政策".into(),
+            description: "该切片无任何入向引用".into(),
+            affected_chunk_ids: vec![],
+            search_queries: vec![],
+            severity: "warning".into(),
+            source: "rule".into(),
+            status: "pending".into(),
+            resolution_note: None,
+            created_at: DateTime::now(),
+            resolved_at: None,
+        }
+    }
+
+    #[test]
+    fn gap_signal_projection_carries_kind_and_severity() {
+        let gap = test_gap_fixture();
+        let now_ms = DateTime::now().timestamp_millis();
+        let item = gap_to_inbox_item(&gap, now_ms);
+        assert_eq!(item.kind.as_deref(), Some("orphan"));
+        assert_eq!(item.signal_severity.as_deref(), Some("warning"));
+        // severity 排序标度必须保持 "medium",绝不被 gap 语义严重度污染。
+        assert_eq!(item.severity, "medium");
+    }
+
+    #[test]
+    fn gap_signal_rich_fields_serialize_camel_case() {
+        let gap = test_gap_fixture();
+        let item = gap_to_inbox_item(&gap, 0);
+        let v = serde_json::to_value(&item).unwrap();
+        assert_eq!(v["kind"], "orphan");
+        assert_eq!(v["signalSeverity"], "warning");
+        assert_eq!(v["severity"], "medium");
     }
 }

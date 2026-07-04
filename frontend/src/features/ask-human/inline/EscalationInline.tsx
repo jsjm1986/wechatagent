@@ -2,14 +2,15 @@ import { useState } from "react";
 import { api } from "../../../lib/api";
 import type { RowCtx } from "../../../components/review/ReviewQueue";
 import type { InboxItem } from "../../../lib/inboxApi";
+import { ESCALATION_CATEGORY_LABELS, labelOf } from "../../../lib/reviewLabels";
 
-// 裁决口径闭集（与后端 ALLOWED_PRINCIPAL_VERDICT 同源）
+// 裁决口径闭集（与后端 ALLOWED_PRINCIPAL_VERDICT 同源；口径与 ESCALATION_VERDICT_LABELS 统一）
 const VERDICT_OPTIONS: { value: string; label: string }[] = [
-  { value: "approved", label: "批准" },
-  { value: "rejected", label: "驳回" },
-  { value: "conditional", label: "有条件批准" },
-  { value: "deferred", label: "暂缓" },
-  { value: "delegated_back", label: "退回再议" },
+  { value: "approved", label: "同意" },
+  { value: "rejected", label: "拒绝" },
+  { value: "conditional", label: "有条件同意" },
+  { value: "deferred", label: "暂缓待定" },
+  { value: "delegated_back", label: "授权 AI 自行处理" },
 ];
 
 export function EscalationInline({ item, ctx }: { item: InboxItem; ctx: RowCtx }) {
@@ -66,7 +67,7 @@ export function EscalationInline({ item, ctx }: { item: InboxItem; ctx: RowCtx }
           {item.category && (
             <>
               <dt>类别</dt>
-              <dd>{item.category}</dd>
+              <dd>{labelOf(ESCALATION_CATEGORY_LABELS, item.category)}</dd>
             </>
           )}
         </dl>

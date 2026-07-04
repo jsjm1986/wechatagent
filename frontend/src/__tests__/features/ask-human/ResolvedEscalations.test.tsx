@@ -41,9 +41,9 @@ describe("ResolvedEscalations 已裁决历史", () => {
     await waitFor(() =>
       expect(get).toHaveBeenCalledWith("/api/admin/principal-escalations?status=resolved"),
     );
-    // 短码、裁决结果（verdict 标签 + substance）、授权到期、裁决渠道均渲染。
+    // 短码、裁决结果（verdict 标签用共享字典 approved→"同意" + substance）、授权到期、裁决渠道均渲染。
     await screen.findByText("E1");
-    expect(screen.getByText(/批准/)).toBeTruthy();
+    expect(screen.getByText("同意")).toBeTruthy();
     expect(screen.getByText(/同意 8 折/)).toBeTruthy();
     expect(screen.getByText(/2026/)).toBeTruthy();
     expect(screen.getByText(/裁决渠道/)).toBeTruthy();

@@ -4,6 +4,7 @@
 //! 请示，拿到裁决后用 AI 口吻向客户转述。客户永远只跟 Agent 对话——真人是
 //! 幕后决策源，绝不直接面对客户。这不是真人下场：AI 向内部决策源请示，转述仍由 AI 完成。
 
+mod labels;
 mod ledger;
 mod logic;
 mod policy;
@@ -101,7 +102,8 @@ pub(crate) async fn escalate_held_decision(
     };
     let question = format!(
         "该客户议题触发高风险闸门（{}），AI 暂不自行答复。拟答风险等级：{}。请领导定夺该如何回复。",
-        blocked_status, final_decision.risk_level
+        labels::blocked_status_zh(blocked_status),
+        labels::risk_level_zh(&final_decision.risk_level),
     );
     let Some(entry) = insert_pending_escalation(
         state,

@@ -26,6 +26,18 @@ const SOURCE_META: { summaryKey: string; source: string; label: string }[] = [
   { summaryKey: "lessonsLearned", source: "lessons_learned", label: "经验晋升" },
 ];
 
+// InboxRow badge 的语义色调：source → tone（tone 值对齐 AskHuman.css 的 .inboxBadge--* 与 tokens.css 语义色）。
+const SOURCE_TONE: Record<string, string> = {
+  principal_escalation: "brand",
+  knowledge_review: "scheduled",
+  taxonomy_candidate: "neutral",
+  relationship_suggestion: "neutral",
+  gap_signal: "held",
+  profile_risky: "blocked",
+  evolution_proposal: "running",
+  lessons_learned: "neutral",
+};
+
 // rich 分派：richComponent → 卡片。richParams 提供 id（key 已对齐 ask_human_inbox.rs 实证）。
 function renderRich(item: InboxItem, onDone: () => void) {
   const p = item.richParams ?? {};
@@ -87,6 +99,31 @@ function renderInline(item: InboxItem, ctx: RowCtx) {
   }
 }
 
+export function InboxRow({
+  badge,
+  title,
+  preview,
+  children,
+}: {
+  badge: { label: string; tone: string };
+  title: string;
+  preview: string;
+  children: React.ReactNode;
+}) {
+  const [open, setOpen] = useState(false);
+  return (
+    <div className="inboxRow">
+      <button type="button" className="inboxRowHead" onClick={() => setOpen((v) => !v)} aria-expanded={open}>
+        <span className={`inboxBadge inboxBadge--${badge.tone}`}>{badge.label}</span>
+        <span className="inboxRowTitle">{title}</span>
+        {!open && <span className="inboxRowPreview">{preview}</span>}
+        <span className="inboxRowChevron">{open ? "▾" : "▸"}</span>
+      </button>
+      {open && <div className="inboxRowBody">{children}</div>}
+    </div>
+  );
+}
+
 function AskHumanView() {
   const { errors, summary, loading, fatalError, activeSource, setActiveSource, load } =
     useInboxStore();
@@ -111,7 +148,6 @@ function AskHumanView() {
   return (
     <div className="askHumanChannel">
       <header className="askHumanHeader">
-        <h1>统一收件箱</h1>
         <div className="askHumanHeaderActions">
           <button
             type="button"
@@ -170,15 +206,20 @@ function AskHumanView() {
             refreshToken={refreshNonce}
             fetchItems={fetchItems}
             getId={(i) => `${i.source}:${i.id}`}
-            renderItem={(item, ctx) =>
-              item.actionKind === "rich" ? (
-                <div className="askHumanRichRow">
-                  {renderRich(item, () => refreshAll())}
-                </div>
-              ) : (
-                <div className="askHumanInlineRow">{renderInline(item, ctx)}</div>
-              )
-            }
+            renderItem={(item, ctx) => {
+              const meta = SOURCE_META.find((m) => m.source === item.source);
+              return (
+                <InboxRow
+                  badge={{ label: meta?.label ?? item.source, tone: SOURCE_TONE[item.source] ?? "neutral" }}
+                  title={item.title}
+                  preview={item.summary ?? ""}
+                >
+                  {item.actionKind === "rich"
+                    ? renderRich(item, () => refreshAll())
+                    : renderInline(item, ctx)}
+                </InboxRow>
+              );
+            }}
             emptyText="暂无待处理项"
           />
         </>
