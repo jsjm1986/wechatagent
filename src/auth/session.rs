@@ -81,10 +81,12 @@ pub async fn authenticate(
     password_plain: &str,
 ) -> Result<AdminUser, AuthError> {
     let coll = admin_users(db);
-    let user = coll
-        .find_one(doc! { "username": username }, None)
-        .await?
-        .ok_or(AuthError::InvalidCredentials)?;
+    let Some(user) = coll.find_one(doc! { "username": username }, None).await? else {
+        // 用户名不存在时也跑一次 verify（对进程级假哈希），支付与"用户存在"等价的
+        // Argon2 耗时，抹平枚举时序侧信道；恒判凭据无效。
+        let _ = password::verify_against_dummy(password_plain);
+        return Err(AuthError::InvalidCredentials);
+    };
     let ok = password::verify_password(password_plain, &user.password_hash)?;
     if !ok {
         return Err(AuthError::InvalidCredentials);
