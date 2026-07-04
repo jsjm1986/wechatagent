@@ -43,7 +43,7 @@ export function LessonPromoteCard({ lessonId, onDone }: { lessonId: string; onDo
 
   async function promote() {
     if (!title.trim() || !body.trim()) {
-      toast.error("title 和 body 都不能为空");
+      toast.error("标题和案例正文都不能为空");
       return;
     }
     setBusy(true);
@@ -54,7 +54,7 @@ export function LessonPromoteCard({ lessonId, onDone }: { lessonId: string; onDo
         `/api/admin/lessons-learned/${encodeURIComponent(lessonId)}/promote-to-peer-case`,
         payload,
       );
-      toast.success("已晋升为 peer_case 候选（仍需知识审核队列 verify）");
+      toast.success("已晋升为同行案例候选（仍需在知识审核队列核验）");
       onDone?.();
       await load();
     } catch (e) {
@@ -69,18 +69,18 @@ export function LessonPromoteCard({ lessonId, onDone }: { lessonId: string; onDo
 
   // 已晋升的不再提供晋升表单（与老页 reviewStatus==="promoted" 隐藏按钮一致）。
   if (lesson.reviewStatus === "promoted") {
-    return <div className="lessonPromoteDone">已晋升为 peer_case</div>;
+    return <div className="lessonPromoteDone">已晋升为同行案例</div>;
   }
 
   return (
     <div className="lessonPromoteCard">
       <div className="lessonPromoteKind">
-        晋升为 peer_case 候选 chunk（仍需 admin 在知识审核队列 verify）
+        晋升为同行案例候选（仍需在知识审核队列核验）
       </div>
       <input
         className="lessonPromoteInput"
         type="text"
-        placeholder="title（≤ 200 字，必填）"
+        placeholder="标题（≤ 200 字，必填）"
         value={title}
         maxLength={200}
         onChange={(e) => setTitle(e.target.value)}
@@ -88,13 +88,13 @@ export function LessonPromoteCard({ lessonId, onDone }: { lessonId: string; onDo
       <input
         className="lessonPromoteInput"
         type="text"
-        placeholder="summary（一句话，可选）"
+        placeholder="一句话摘要（可选）"
         value={summary}
         onChange={(e) => setSummary(e.target.value)}
       />
       <textarea
         className="lessonPromoteTextarea"
-        placeholder="body：案例正文（≤ 4000 字，必填）"
+        placeholder="案例正文（≤ 4000 字，必填）"
         value={body}
         rows={6}
         maxLength={4000}
