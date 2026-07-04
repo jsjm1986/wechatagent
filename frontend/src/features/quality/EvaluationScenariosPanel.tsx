@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { api } from "../../lib/api";
+import { VERSION_STATUS_LABELS, labelOf } from "../../lib/reviewLabels";
 import styles from "./EvaluationScenariosPanel.module.css";
 
 // 评测场景配置入口：管理员自助维护 formula-adherence 评测所依赖的 active evaluation_scenarios，
@@ -161,7 +162,7 @@ export function EvaluationScenariosPanel() {
                   <br />
                   <small>{s.scenarioId}</small>
                 </td>
-                <td>{s.status || "—"}</td>
+                <td>{labelOf(VERSION_STATUS_LABELS, s.status)}</td>
                 <td>{s.inboundMessages?.length ?? 0}</td>
                 <td>
                   <button
