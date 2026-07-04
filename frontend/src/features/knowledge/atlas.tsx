@@ -451,8 +451,8 @@ export function ChunkGraphView() {
           <div className="wikiGraphTooltip">
             <div className="wikiGraphTooltipTitle">{focused.title || "（无标题）"}</div>
             <div className="wikiGraphTooltipMeta">
-              <span className="wikiArchiveTag">{focused.wikiType ?? "—"}</span>
-              <span className="wikiBadge">{focused.status ?? "—"}</span>
+              <span className="wikiArchiveTag">{wikiTypeLabel(focused.wikiType ?? undefined)}</span>
+              <span className="wikiBadge">{statusLabel(focused.status ?? undefined)}</span>
               <span className="wikiGraphTooltipDeg">入度 {inDegree.get(focused.id) ?? 0}</span>
             </div>
           </div>
