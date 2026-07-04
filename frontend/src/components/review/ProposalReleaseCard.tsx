@@ -180,7 +180,7 @@ function ThresholdDiffView({
       <table className={styles.thresholdTable}>
         <tbody>
           <tr>
-            <th>Gate Key</th>
+            <th>闸门项</th>
             <td data-testid="threshold-gate-key">{proposal.gateKey ?? "—"}</td>
           </tr>
           <tr>
@@ -192,7 +192,7 @@ function ThresholdDiffView({
             <td data-testid="threshold-proposed">{formatNumber(proposed)}</td>
           </tr>
           <tr>
-            <th>cohort 命中率</th>
+            <th>样本组命中率</th>
             <td data-testid="threshold-hit-rate">{formatPercent(hitRate)}</td>
           </tr>
         </tbody>
@@ -227,7 +227,7 @@ function PromptDiffView({
       </div>
       {proposal.criticReasoning && (
         <div className={styles.criticReasoning} data-testid="critic-reasoning">
-          <h4>Critic 推理</h4>
+          <h4>评审推理</h4>
           <p>{proposal.criticReasoning}</p>
         </div>
       )}
@@ -255,7 +255,7 @@ function ShadowEvalReport({
   const aggregate = isPrompt ? readAggregateEvidence(proposal.evalMetrics ?? {}) : null;
   return (
     <section className={styles.shadowEval} data-testid="shadow-eval">
-      <h4>Shadow 评测</h4>
+      <h4>影子评测</h4>
       <div className={styles.shadowGrid}>
         <div data-testid="shadow-completed">
           <span>完成</span>
@@ -324,9 +324,9 @@ function ShadowEvalReport({
           <table className={styles.evidenceTable}>
             <thead>
               <tr>
-                <th>run</th>
-                <th>原 final</th>
-                <th>新 final</th>
+                <th>运行编号</th>
+                <th>原终审</th>
+                <th>新终审</th>
                 <th>原五闸</th>
                 <th>新五闸</th>
                 <th>自评</th>
@@ -358,10 +358,10 @@ function ShadowEvalReport({
           <table>
             <thead>
               <tr>
-                <th>source_run_id</th>
-                <th>原 final_review</th>
-                <th>新 final_review</th>
-                <th>tokens</th>
+                <th>运行编号</th>
+                <th>原终审</th>
+                <th>新终审</th>
+                <th>token 数</th>
               </tr>
             </thead>
             <tbody>
@@ -477,7 +477,7 @@ function MetadataSection({
       )}
       {runIds.length > 0 && (
         <div className={styles.metaBlock} data-testid="proposal-cohort-runs">
-          <h4>Cohort 运行（{runIds.length}）</h4>
+          <h4>样本组运行（{runIds.length}）</h4>
           <div className={styles.expectedTags}>
             {runIds.map((runId) => (
               <span key={runId} className={styles.tag}>

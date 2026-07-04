@@ -13,7 +13,7 @@ import { ChunkReviewCard } from "../../../components/review/ChunkReviewCard";
 // 无需 mock api，直接喂字段、读 verify 按钮的 disabled 真值。
 
 function verifyButton() {
-  return screen.getByRole("button", { name: "verify" }) as HTMLButtonElement;
+  return screen.getByRole("button", { name: "核验通过" }) as HTMLButtonElement;
 }
 
 describe("ChunkReviewCard verify-gate 真值表（红线：hasQuote && hasAnchor）", () => {
@@ -74,7 +74,7 @@ describe("ChunkReviewCard verify-gate 真值表（红线：hasQuote && hasAnchor
 
   it("reject 永远可点（不受 verify-gate 约束）", () => {
     render(<ChunkReviewCard chunkId="c7" chunk={{ title: "t" }} />);
-    const reject = screen.getByRole("button", { name: "reject" }) as HTMLButtonElement;
+    const reject = screen.getByRole("button", { name: "驳回" }) as HTMLButtonElement;
     expect(reject.disabled).toBe(false);
   });
 });
