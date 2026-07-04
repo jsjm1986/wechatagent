@@ -16,8 +16,9 @@
 //!   claim 保证；
 //! - **每个 entry 事件 ≤ 20 条**：写 event 前查询计数，超过即 stop（防 retry
 //!   风暴写爆 events）；
-//! - **lease 自动续约不必要**：lease=60s 大于 MCP 30s timeout，正常路径
-//!   一次 tick 内完成；超时 → 下一轮 reclaim 自动恢复。
+//! - **lease 自动续约不必要**：lease 严格大于单条 send 的外层 timeout（见
+//!   `DEFAULT_LEASE_SECONDS` / `MCP_SEND_TIMEOUT_SECONDS`），正常路径一次 tick
+//!   内完成；worker 崩溃 → 下一轮 reclaim 自动恢复。
 
 use std::time::Duration;
 
@@ -33,14 +34,29 @@ use super::outbox::{
 };
 use super::run_envelope::SOURCE_KIND_MANUAL_SEND;
 
-/// MCP 单次调用 timeout。lease (60s) 远大于此，确保 worker 出错不会卡住 entry。
+/// dispatcher 对**整条 send**（可含多次顺序 MCP 调用）的外层 timeout。
 ///
-/// 历史值 5s 在远程 MCP（如 47.108.57.147 + 微信协议出栈）上经常不够：
-/// MCP 已经把消息发出去 → wechat 协议层回包慢于 5s → dispatcher timeout
-/// → 重试 → 同一句话被发第二次到客户。提到 30s 与 LLM revision 同档，匹配
-/// 真实链路 RTT；同时 `process_entry` 的 timeout 分支会先查 `mcp_call_logs`
-/// post-hoc 核对，命中已成功则直接标 sent 不重发。
-const MCP_SEND_TIMEOUT_SECONDS: u64 = 30;
+/// 历史值 5s / 30s 在远程 MCP（如 47.108.57.147 + 微信协议出栈）上都太短：
+/// MCP 已经把消息发出去 → wechat 协议层回包慢 → 外层 timeout 触发 → **取消正在
+/// await 的 send future** → `logged_call_for_account` 尾部的 mcp_logs 写入随之被
+/// 丢弃 → timeout 分支的 `mcp_already_succeeded` post-hoc 守卫查不到成功记录 →
+/// 误重试 → 同一句话 / 同一文件被发第二次到客户（finding ①）。
+///
+/// 取值约束（不变量，由 `send_timeout_covers_worst_case_mcp_calls_and_stays_below_lease`
+/// 守护）：
+///   `mcp::MCP_CLIENT_TIMEOUT_SECONDS × MAX_SEQUENTIAL_MCP_CALLS_PER_SEND`
+///     ≤ 本值 < `DEFAULT_LEASE_SECONDS`
+/// 左界保证「已送达但回包慢」时是 reqwest 自己超时返回 `Err`（future 跑到尾部照常
+/// 写 mcp_logs），而非被外层取消丢日志；右界保证 worker 还在发就不会被 reclaim 成
+/// 另一次并发发送。60s × 2 次（媒体上传 + 发送）= 120s 下界，取 150s 留裕度。
+const MCP_SEND_TIMEOUT_SECONDS: u64 = 150;
+
+/// 单条 send 内最坏情况下顺序发起的 MCP HTTP 调用次数。媒体发送 =
+/// `media_upload_base64`（media_id 缓存未命中时）+ `message_send_*`，共 2 次；
+/// 文本 / 名片各 1 次。dispatcher 外层 timeout 必须 > 本值 × 每次 reqwest 上界
+/// （`crate::mcp::MCP_CLIENT_TIMEOUT_SECONDS`），见 `MCP_SEND_TIMEOUT_SECONDS`
+/// 的取值约束（finding ①）。
+const MAX_SEQUENTIAL_MCP_CALLS_PER_SEND: u64 = 2;
 
 /// 二次安全门陈旧度阈值（R13.4：>30min 自动 canceled）。
 const STALE_THRESHOLD_MILLIS: i64 = 30 * 60 * 1000;
@@ -845,7 +861,7 @@ pub async fn process_entry(state: &AppState, entry: &OutboxEntry) -> AppResult<(
                                 "status": OutboxStatus::Sent.as_str(),
                                 "sent_at": now,
                                 "updated_at": now,
-                                "last_error": "send timeout (30s) but MCP already succeeded — confirmed via mcp_call_logs",
+                                "last_error": "send timeout (150s) but MCP already succeeded — confirmed via mcp_call_logs",
                             },
                             "$unset": {
                                 "worker_id": "",
@@ -875,7 +891,7 @@ pub async fn process_entry(state: &AppState, entry: &OutboxEntry) -> AppResult<(
                 // 主动发送台账：超时 post-hoc 确认送达同样记一条（素材/名片才记）。
                 super::send_ledger::record_send_for_entry(state, entry, &contact, now).await;
             } else {
-                schedule_retry_or_terminal(state, entry_id, entry, "send timeout (30s)").await?;
+                schedule_retry_or_terminal(state, entry_id, entry, "send timeout (150s)").await?;
             }
         }
     }
@@ -992,9 +1008,12 @@ pub(crate) async fn write_event_with_cap(
 /// 路径的偏好，本 worker 用全局默认即可。
 const DEFAULT_POLL_INTERVAL_SECONDS: u64 = 5;
 
-/// 默认 lease 时长（秒）。> MCP timeout(30s) 远大于 1 个 tick 处理时长，
-/// 避免正常路径 lease 过期。
-const DEFAULT_LEASE_SECONDS: i32 = 60;
+/// 默认 lease 时长（秒）。必须 **严格大于** `MCP_SEND_TIMEOUT_SECONDS`（见其
+/// 取值约束不变量）：否则一条正在发送（最坏可达 150s）的 entry 会在 lease 到期
+/// 时被 `reclaim_expired_leases` 回收成 pending，另一次 tick 抢占后并发再发一遍 →
+/// 客户收重复消息。取 180s（> 150s send 上界）：worker 崩溃后 entry 至多滞留
+/// 180s 才被 reclaim（单 worker 场景下这是可接受的恢复延迟）。
+const DEFAULT_LEASE_SECONDS: i32 = 180;
 
 /// **后台 worker 入口**：循环 reclaim → claim → process。`main.rs` 在启动期
 /// `tokio::spawn` 调用本函数。
@@ -1102,10 +1121,30 @@ mod tests {
         assert_eq!(STALE_THRESHOLD_MILLIS, 30 * 60 * 1000);
     }
 
-    /// MCP send timeout 与 LLM revision 30s 对齐。
+    /// finding ①：dispatcher 对整条 send 的外层 timeout 必须覆盖「单条 send 内
+    /// 最坏顺序 MCP 调用次数 × 每次 reqwest 上界」，否则慢响应下外层 timeout 会
+    /// 取消正在 await 的 send future → mcp_logs 写入被丢 → post-hoc 守卫查不到
+    /// 成功记录 → 误重试 → 客户收重复消息。且必须 < lease，避免 worker 还在发
+    /// 就被 reclaim 成另一次并发发送。
     #[test]
-    fn mcp_send_timeout_is_thirty_seconds() {
-        assert_eq!(MCP_SEND_TIMEOUT_SECONDS, 30);
+    fn send_timeout_covers_worst_case_mcp_calls_and_stays_below_lease() {
+        let worst_case_send_seconds =
+            crate::mcp::MCP_CLIENT_TIMEOUT_SECONDS * MAX_SEQUENTIAL_MCP_CALLS_PER_SEND;
+        assert!(
+            MCP_SEND_TIMEOUT_SECONDS >= worst_case_send_seconds,
+            "dispatcher timeout {}s 必须 ≥ 最坏 send 耗时 {}s（reqwest {}s × {} 次），\
+             否则外层 timeout 会取消已送达但回包慢的 send，丢掉 mcp_logs 写入 → 重复发送",
+            MCP_SEND_TIMEOUT_SECONDS,
+            worst_case_send_seconds,
+            crate::mcp::MCP_CLIENT_TIMEOUT_SECONDS,
+            MAX_SEQUENTIAL_MCP_CALLS_PER_SEND,
+        );
+        assert!(
+            (MCP_SEND_TIMEOUT_SECONDS as i32) < DEFAULT_LEASE_SECONDS,
+            "dispatcher timeout {}s 必须 < lease {}s，否则 send 未完就被 reclaim 重发",
+            MCP_SEND_TIMEOUT_SECONDS,
+            DEFAULT_LEASE_SECONDS,
+        );
     }
 
     /// P2-3：cap 未触发 → 正常写事件。
