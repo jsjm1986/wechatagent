@@ -34,6 +34,7 @@ import {
   readAggregateEvidence,
   PROMPT_AGG_METRIC_KEYS,
 } from "./evidenceMetrics";
+import { FINAL_REVIEW_STATUS_LABELS, labelOf } from "../../lib/reviewLabels";
 
 export function ProposalReleaseCard({
   proposalId,
@@ -335,8 +336,8 @@ function ShadowEvalReport({
               {summary.samples.map((s) => (
                 <tr key={s.id ?? s.sourceRunId}>
                   <td>{s.sourceRunId}</td>
-                  <td>{s.originalFinalReviewStatus ?? "—"}</td>
-                  <td>{s.newFinalReviewStatus ?? "—"}</td>
+                  <td>{labelOf(FINAL_REVIEW_STATUS_LABELS, s.originalFinalReviewStatus)}</td>
+                  <td>{labelOf(FINAL_REVIEW_STATUS_LABELS, s.newFinalReviewStatus)}</td>
                   <td>{renderGateDots(s.original5gateHit)}</td>
                   <td>{renderGateDots(s.new5gateHit)}</td>
                   <td>
@@ -367,8 +368,8 @@ function ShadowEvalReport({
               {summary.samples.map((s) => (
                 <tr key={s.id ?? s.sourceRunId}>
                   <td>{s.sourceRunId}</td>
-                  <td>{s.originalFinalReviewStatus ?? "—"}</td>
-                  <td>{s.newFinalReviewStatus ?? "—"}</td>
+                  <td>{labelOf(FINAL_REVIEW_STATUS_LABELS, s.originalFinalReviewStatus)}</td>
+                  <td>{labelOf(FINAL_REVIEW_STATUS_LABELS, s.newFinalReviewStatus)}</td>
                   <td>{s.newTokenCost ?? "—"}</td>
                 </tr>
               ))}

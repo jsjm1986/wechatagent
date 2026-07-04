@@ -22,6 +22,36 @@ export const HOLD_CATEGORY_LABELS: Record<string, string> = {
   ai_waiting_for_more_context: "AI 等待更多上下文",
 };
 
+// gateway 过程态闭集(src/agent/run_envelope.rs GATEWAY_STATUS_VALUES,32 值)→ 中文。
+// 单一真相源:先展开 FINAL_REVIEW_STATUS_LABELS(两闭集交集键复用同一措辞,消除口径漂移),
+// 再补 gateway 独有的过程态键。default 回落原值(labelOf),未来新值不崩。
+export const GATEWAY_STATUS_LABELS: Record<string, string> = {
+  ...FINAL_REVIEW_STATUS_LABELS,
+  pending: "待处理",
+  allowed: "已放行",
+  sent: "已发送",
+  no_reply: "无需回复",
+  review_blocked: "复核拦截",
+  revision_skipped_invalid_direction: "改写跳过（方向无效）",
+  revision_skipped_budget_exceeded: "改写跳过（预算超限）",
+  revision_llm_failure: "改写时模型失败",
+  tool_loop_timeout: "工具循环超时",
+  not_managed: "未托管",
+  cooldown: "冷却中",
+  rate_limited: "限流中",
+  daily_limit: "已达每日上限",
+  expired: "已过期",
+  context_changed: "上下文已变更",
+  policy_cooldown: "策略冷却",
+  policy_wait_user_reply: "等待客户回复",
+  gateway_blocked: "网关拦截",
+  precheck_blocked: "预检拦截",
+  outbox_enqueued: "已入发件队列",
+  admin_cancelled: "管理员已取消",
+  superseded_by_new_inbound: "被更新消息取代",
+  quiet_hours_deferred: "作息时段顺延",
+};
+
 // gap_signal(sources_meta.rs:363 裸下发)。kind 10 类 gap_signals.rs 各判定点。
 export const GAP_SIGNAL_KIND_LABELS: Record<string, string> = {
   orphan: "孤立知识",
