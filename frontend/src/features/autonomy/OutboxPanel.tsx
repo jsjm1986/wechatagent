@@ -22,6 +22,18 @@ type OutboxItem = {
 // 其它状态后端返回 409，前端直接隐藏取消按钮避免误点。
 const CANCELABLE_STATUSES = new Set(["pending", "in_flight"]);
 
+// 发件箱状态(src/agent/outbox.rs OutboxStatus 闭集;未知值回落原值)。
+const OUTBOX_STATUS_LABELS: Record<string, string> = {
+  pending: "待发送",
+  in_flight: "发送中",
+  sent: "已送达",
+  failed_terminal: "发送失败",
+  canceled: "已取消",
+};
+function outboxStatusLabel(status: string): string {
+  return OUTBOX_STATUS_LABELS[status] ?? status;
+}
+
 export function OutboxPanel() {
   const accountId = useAccountStore((s) => s.currentAccountId());
   const [items, setItems] = useState<OutboxItem[]>([]);
@@ -94,7 +106,7 @@ export function OutboxPanel() {
           <tbody>
             {items.map((it) => (
               <tr key={it.id}>
-                <td>{it.status}</td>
+                <td>{outboxStatusLabel(it.status)}</td>
                 <td>{it.contactWxid || "—"}</td>
                 <td className={styles.contentCell}>{it.content}</td>
                 <td>{it.createdAt || "—"}</td>
