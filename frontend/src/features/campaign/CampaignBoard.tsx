@@ -5,7 +5,9 @@ import { StatusBadge } from "../../components/ui/StatusBadge";
 import { useCampaignStore } from "../../stores/campaignStore";
 import type { CampaignSendItem } from "../../stores/campaignStore";
 import { bucketTone, bucketLabel, bucketCount } from "./buckets";
+import { campaignStatusLabel } from "./CampaignList";
 import { toCsv } from "./csv";
+import { SEND_OUTCOME_REASON_LABELS, labelOf } from "../../lib/reviewLabels";
 import styles from "./Campaign.module.css";
 
 const BUCKETS = ["sent", "pending", "blocked", "escalated", "canceled", "skipped", "unknown"] as const;
@@ -67,7 +69,7 @@ export default function CampaignBoard() {
             <span className={styles.eyebrow}>Campaign Result</span>
             <span className={styles.title}>{report ? report.title : "—"}</span>
           </div>
-          {report && <StatusBadge tone="scheduled">{report.status}</StatusBadge>}
+          {report && <StatusBadge tone="scheduled">{campaignStatusLabel(report.status)}</StatusBadge>}
         </div>
         <div className={styles.metrics}>
           {BUCKETS.map((b) => (
@@ -77,7 +79,7 @@ export default function CampaignBoard() {
               {(b === "blocked" || b === "canceled" || b === "escalated") && summary && (
                 <div className={styles.reasons}>
                   {Object.entries(reasonMap(b)).map(([reason, n]) => (
-                    <span key={reason} className={styles.reasonItem}>{reason} ×{n}</span>
+                    <span key={reason} className={styles.reasonItem}>{labelOf(SEND_OUTCOME_REASON_LABELS, reason)} ×{n}</span>
                   ))}
                 </div>
               )}
@@ -132,7 +134,7 @@ export default function CampaignBoard() {
                     <td className={`${styles.td} ${styles.tdName}`}>{it.name || "—"}</td>
                     <td className={`${styles.td} ${styles.tdWxid}`}>{it.contactWxid}</td>
                     <td className={styles.td}><StatusBadge tone={bucketTone(it.status)}>{bucketLabel(it.status)}</StatusBadge></td>
-                    <td className={styles.td}>{it.reason || "—"}</td>
+                    <td className={styles.td}>{it.reason ? labelOf(SEND_OUTCOME_REASON_LABELS, it.reason) : "—"}</td>
                   </tr>
                 ))}
               </tbody>
