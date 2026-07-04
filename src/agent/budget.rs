@@ -26,7 +26,6 @@ use parking_lot::Mutex as PlMutex;
 /// Reply Agent；调用 LLM 用的 [`RunBudget::record_call`] 不抛错（保留向
 /// 兼容）。
 #[derive(Debug, thiserror::Error)]
-#[allow(dead_code)]
 pub enum BudgetError {
     /// `tool_calls_used >= tool_call_budget`：任何后续 tool call SHALL
     /// 立即返回 `budget_exceeded` 而不实际执行（R4.3）。

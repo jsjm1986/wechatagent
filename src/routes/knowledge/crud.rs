@@ -361,7 +361,7 @@ pub(in crate::routes) async fn create_operation_knowledge(
     State(_state): State<AppState>,
     Json(_payload): Json<OperationKnowledgeRequest>,
 ) -> AppResult<Json<Value>> {
-    // operation_knowledge_items 已随 sales 旧库删除；保留 410 行为占位。
+    // operation_knowledge_items 已随 sales 旧库删除；此端点恒返 400（BadRequest），引导改用 operation_knowledge_chunks。
     Err(AppError::BadRequest(
         "operation_knowledge_items has been removed; use operation_knowledge_chunks instead"
             .to_string(),

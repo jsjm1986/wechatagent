@@ -324,8 +324,9 @@ fn evaluate_single_gate(scores: &Document, gate: &str, threshold: f64) -> bool {
 
 /// 默认其它 4 个 gate 的命中判断（不带 proposed_value 时）：当前 review.scores
 /// 已经过 gateway 写入，用业务"惯用阈值"硬常量推断（fact ≥ 6 / pressure ≥ 7 /
-/// product < 7 / human < 6 / emotional < 6）。这是退化路径，仅用于 W3 短路；
-/// W4 task 5.1 的 `resolve_thresholds` 落地后会被替换。
+/// product < 7 / human < 6 / emotional < 6）。prompt shadow 重放刻意不引入
+/// per-contact `resolve_thresholds`——新旧两侧固定同一组默认阈值，唯一变量是
+/// prompt 片段，才能把 5 闸命中差异干净归因到 prompt 改动本身。
 fn evaluate_single_gate_default(scores: &Document, gate: &str) -> bool {
     let default_threshold = match default_gate_threshold(gate) {
         Some(t) => t,
