@@ -132,7 +132,7 @@ export default function CampaignCreate() {
           )}
           {preview.targetCount === 0 && <p className={styles.fieldHint}>命中 0 人，调整条件再试。</p>}
           <div className={styles.previewActions}>
-            <p className={styles.dispatchHint}>确认推送请在 AI 总控对话中对该活动 dispatch（高风险动作由 AI 恒确认门把关）。</p>
+            <p className={styles.dispatchHint}>确认推送请在 AI 总控对话中对该活动下发推送（高风险动作由 AI 恒确认门把关）。</p>
             <div className={styles.previewBtns}>
               <button type="button" className={styles.pagerBtn} onClick={() => setView("list")}>返回列表</button>
               {draftCampaignId && (

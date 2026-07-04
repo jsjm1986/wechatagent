@@ -19,7 +19,7 @@ import { useFormDialog } from "../../components/ui/FormDialog";
 import { useToast } from "../../components/ui/Toast";
 import type { PickerChunk } from "../../components/ui/ChunkRef";
 import { type TrustChunkFields, chunkTypeLabel } from "./trustTypes";
-import { wikiTypeLabel, statusLabel, integrityStatusLabel, revisionOpLabel, revisionSourceLabel } from "./labels";
+import { wikiTypeLabel, statusLabel, integrityStatusLabel, revisionOpLabel, revisionSourceLabel, relatedKindLabel } from "./labels";
 import { ChunkRepairPanel } from "./ChunkRepairPanel";
 
 /// ChunkPicker 列表加载器:拉全部 chunk 供搜索选择,替代手输 ObjectId。
@@ -252,7 +252,7 @@ export function ChunkInspectorPane({
     <aside className="wikiInspectorPane wikiModePane--side">
       <header className="wikiInspectorHead">
         <div className="wikiInspectorTitle">
-          <Eye size={14} /> Inspector
+          <Eye size={14} /> 详情
         </div>
         <div style={{ display: "flex", gap: 4 }}>
           {chunk ? (
@@ -325,7 +325,7 @@ export function ChunkInspectorPane({
               {chunkTypeLabel(chunk.chunkType) ? (<><dt>运营用途</dt><dd><span className="wikiArchiveTag">{chunkTypeLabel(chunk.chunkType)}</span></dd></>) : null}
               {Array.isArray(chunk.businessTopics) && chunk.businessTopics.length > 0 ? (
                 <>
-                  <dt>business topics</dt>
+                  <dt>业务主题</dt>
                   <dd>{chunk.businessTopics.map((t, i) => <span key={i} className="wikiArchiveTag">{t}</span>)}</dd>
                 </>
               ) : null}
@@ -342,7 +342,7 @@ export function ChunkInspectorPane({
                         onClick={() => focusChunk(chunk.previousVersionId!)}
                         title={prev ? "跳转到上一版本" : "目标 chunk 不在活跃集合"}
                       >
-                        <span className="wikiRelatedKind">previous</span>
+                        <span className="wikiRelatedKind">上一版</span>
                         <span className="wikiRelatedTitle">{prev ? prev.title : chunk.previousVersionId}</span>
                       </button>
                     </dd>
@@ -372,11 +372,11 @@ export function ChunkInspectorPane({
                 </span>
               </blockquote>
             ) : (
-              <div className="wikiHint">无 source_quote — 该 chunk 不可被 verify。</div>
+              <div className="wikiHint">无原文引用 — 该知识片段不可核验。</div>
             )}
             {anchors.length > 0 ? (
               <section className="wikiInspectorSection">
-                <div className="wikiInspectorSectionTitle">source_anchors（{anchors.length}）</div>
+                <div className="wikiInspectorSectionTitle">原文定位（{anchors.length}）</div>
                 <div className="wikiSourceAnchorList">
                   {anchors.map((a, i) => {
                     const sl = numberOr(a["startLine"]);
@@ -396,7 +396,7 @@ export function ChunkInspectorPane({
             ) : null}
             {related.length > 0 ? (
               <section className="wikiInspectorSection">
-                <div className="wikiInspectorSectionTitle">related_chunks（{related.length}）</div>
+                <div className="wikiInspectorSectionTitle">关联知识（{related.length}）</div>
                 <div className="wikiRelatedList">
                   {related.map((r, i) => {
                     const target = indexById.get(r.chunk_id);
@@ -414,7 +414,7 @@ export function ChunkInspectorPane({
                           disabled={dead}
                           onClick={() => focusChunk(r.chunk_id)}
                         >
-                          <span className="wikiRelatedKind">{r.kind}</span>
+                          <span className="wikiRelatedKind">{relatedKindLabel(r.kind)}</span>
                           <span className="wikiRelatedTitle">{label}</span>
                         </button>
                         <button

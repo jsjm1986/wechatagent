@@ -3,7 +3,7 @@ import { ChevronDown, ChevronRight, Clock3, RefreshCw, Sparkles } from "lucide-r
 import { parseApiError } from "../../lib/api";
 import { numberOr, stringOr, type TreeChunkItem } from "./shared";
 import { EmptyState } from "../../components/ui/EmptyState";
-import { wikiTypeLabel, statusLabel, integrityStatusLabel } from "./labels";
+import { wikiTypeLabel, statusLabel, integrityStatusLabel, relatedKindLabel } from "./labels";
 
 interface AskSourceQuote {
   chunkId: string;
@@ -623,7 +623,7 @@ function ChunkDetail(props: {
                   onClick={() => onJump(r.chunk_id)}
                   title={dead ? "目标 chunk 不在活跃集合（已 archived 或不存在）" : r.note ?? ""}
                 >
-                  <span className="wikiRelatedKind">{r.kind}</span>
+                  <span className="wikiRelatedKind">{relatedKindLabel(r.kind)}</span>
                   <span className="wikiRelatedTitle">{target ? target.title : r.chunk_id}</span>
                 </button>
               );
