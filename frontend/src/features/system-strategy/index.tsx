@@ -92,6 +92,39 @@ function agentKindLabel(kind: string) {
   return labels[kind] || kind;
 }
 
+// prompt 模板 layer(与新建下拉选项同源;后端 prompts.rs 5 值)。
+function promptLayerLabel(layer: string): string {
+  const labels: Record<string, string> = {
+    system_contract: "系统契约",
+    policy: "运营规则",
+    task_template: "任务模板",
+    review: "复盘审查",
+    methodology_generator: "方法论生成",
+  };
+  return labels[layer] || layer;
+}
+
+// prompt/soul 版本状态(prompt_templates.rs draft→active;未知值回落原值)。
+function versionStatusLabel(status: string): string {
+  const labels: Record<string, string> = {
+    draft: "草稿",
+    active: "生效中",
+    published: "已发布",
+    archived: "已归档",
+  };
+  return labels[status] || status;
+}
+
+// lessons 教训评审状态(lessons_learned.rs;未知值回落原值)。
+function lessonReviewStatusLabel(status: string): string {
+  const labels: Record<string, string> = {
+    pending_review: "待评审",
+    promoted: "已晋升",
+    dismissed: "已忽略",
+  };
+  return labels[status] || status;
+}
+
 function statusSortOrder(status: string): number {
   switch (status) {
     case "active":
@@ -318,7 +351,7 @@ function DomainPromptPanel({
                 {soul.status === "draft" && <span className={styles.statusBadge}>草稿</span>}
               </strong>
               <span>
-                {agentKindLabel(soul.agentKind)} / v{soul.version} / {soul.status}
+                {agentKindLabel(soul.agentKind)} / v{soul.version} / {versionStatusLabel(soul.status)}
               </span>
               <p>{soul.content}</p>
             </button>
@@ -408,7 +441,7 @@ function DomainPromptPanel({
                 {template.status === "draft" && <span className={styles.statusBadge}>草稿</span>}
               </strong>
               <span>
-                {agentKindLabel(template.agentKind)} / {template.layer} / v{template.version} / {template.status}
+                {agentKindLabel(template.agentKind)} / {promptLayerLabel(template.layer)} / v{template.version} / {versionStatusLabel(template.status)}
               </span>
               <p>{template.description || template.content}</p>
             </button>
@@ -1139,7 +1172,7 @@ function TaxonomyCandidatesAdmin({ busy }: { busy: boolean }) {
                 </span>
                 <h3>{item.rawValue}</h3>
               </div>
-              <span className={candidateStatusBadgeClass(item.status)}>{item.status}</span>
+              <span className={candidateStatusBadgeClass(item.status)}>{CANDIDATE_STATUS_LABEL[item.status as CandidateStatusFilter] ?? item.status}</span>
             </div>
             <div className={styles.versionedListBody}>
               <div className={styles.versionedListChunk}>
@@ -2514,9 +2547,9 @@ function LessonsLearnedAdmin({ busy }: { busy: boolean }) {
             disabled={busy || loading}
           >
             <option value="">全部模式</option>
-            <option value="success">success</option>
-            <option value="reviewer_misjudge_negative">reviewer_misjudge_negative</option>
-            <option value="blocked_by_safety_guard">blocked_by_safety_guard</option>
+            <option value="success">{patternLabel("success")}</option>
+            <option value="reviewer_misjudge_negative">{patternLabel("reviewer_misjudge_negative")}</option>
+            <option value="blocked_by_safety_guard">{patternLabel("blocked_by_safety_guard")}</option>
           </select>
           <button type="button" className={styles.btnGhost} onClick={() => void reload()} disabled={busy || loading}>
             刷新
@@ -2541,7 +2574,7 @@ function LessonsLearnedAdmin({ busy }: { busy: boolean }) {
                 </h3>
               </div>
               <div className={styles.buttonRow}>
-                <span className={patternBadgeClass(item.patternKind)}>{item.reviewStatus}</span>
+                <span className={patternBadgeClass(item.patternKind)}>{lessonReviewStatusLabel(item.reviewStatus)}</span>
                 {item.reviewStatus !== "promoted" && (
                   <button
                     type="button"
