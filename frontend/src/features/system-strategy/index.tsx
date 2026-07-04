@@ -10,7 +10,7 @@ import { LessonPromoteCard } from "../../components/review/LessonPromoteCard";
 import { ConfirmProvider } from "../../components/ui/ConfirmDialog";
 import { usePromptSaveConfirm, usePromptPublishConfirm } from "../../components/prompt/usePromptSaveConfirm";
 import { ToastProvider } from "../../components/ui/Toast";
-import { VERSION_STATUS_LABELS } from "../../lib/reviewLabels";
+import { VERSION_STATUS_LABELS, seededByLabel, promptLayerLabel } from "../../lib/reviewLabels";
 import styles from "./SystemStrategy.module.css";
 
 // 系统策略频道：全局总控 Prompt（人格/任务）+ 状态机灰度 + 双层标签字典 + 跨用户教训。
@@ -93,18 +93,6 @@ function agentKindLabel(kind: string) {
   return labels[kind] || kind;
 }
 
-// prompt 模板 layer(与新建下拉选项同源;后端 prompts.rs 5 值)。
-function promptLayerLabel(layer: string): string {
-  const labels: Record<string, string> = {
-    system_contract: "系统契约",
-    policy: "运营规则",
-    task_template: "任务模板",
-    review: "复盘审查",
-    methodology_generator: "方法论生成",
-  };
-  return labels[layer] || layer;
-}
-
 // prompt/soul 版本状态。映射收敛到共享字典 VERSION_STATUS_LABELS(单一真相源);未知值回落原值。
 function versionStatusLabel(status: string): string {
   return VERSION_STATUS_LABELS[status] || status;
@@ -118,19 +106,6 @@ const RELATIONSHIP_TYPE_LABELS: Record<string, string> = {
 };
 function relationshipTypeLabel(rt: string): string {
   return RELATIONSHIP_TYPE_LABELS[rt] || rt;
-}
-
-// domain profile / soul 种子来源(models.rs:1012/1044:system/manual/legacy_migration/
-// evolution_release/generated_by_ai);未知回落原值。
-const SEEDED_BY_LABELS: Record<string, string> = {
-  system: "系统内置",
-  manual: "管理员新建",
-  legacy_migration: "历史迁移",
-  evolution_release: "自优化发布",
-  generated_by_ai: "AI 生成",
-};
-function seededByLabel(v: string): string {
-  return SEEDED_BY_LABELS[v] || v;
 }
 
 // lessons 教训评审状态(lessons_learned.rs;未知值回落原值)。
