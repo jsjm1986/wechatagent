@@ -5,6 +5,7 @@ import { EmptyState } from "../../components/ui/EmptyState";
 import { useContactStore } from "../../stores/contactStore";
 import { useAccountStore } from "../../stores/accountStore";
 import { useNavigationStore } from "../../stores/navigationStore";
+import { useProfileStore, labelFor } from "../../stores/profileStore";
 import type { Contact } from "../../types";
 import styles from "./Overview.module.css";
 
@@ -28,6 +29,7 @@ function contactStateLabel(contact: Contact): { tone: StatusTone; label: string 
 export default function OverviewFeature() {
   const contacts = useContactStore((s) => s.contacts);
   const managedCount = useContactStore((s) => s.managedCount());
+  const taxonomies = useProfileStore((s) => s.taxonomies);
   const normalCount = useContactStore((s) => s.normalCount());
   const onlineCount = useAccountStore((s) => s.onlineCount());
   const accountCount = useAccountStore((s) => s.accounts.length);
@@ -87,7 +89,7 @@ export default function OverviewFeature() {
                 <div className={styles.itxt}>
                   <div className={styles.n}>
                     {name}
-                    {c.operationState && <em>{c.operationState}</em>}
+                    {c.operationState && <em>{labelFor(taxonomies, "customer_stage", c.operationState).text}</em>}
                   </div>
                   <div className={styles.s}>
                     {c.memorySummary || c.humanProfileNote || "尚无运营备注"}

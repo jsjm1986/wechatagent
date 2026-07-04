@@ -331,6 +331,7 @@ export function MemoryFactRow({ fact }: { fact: MemoryFactView }) {
 
 
 export function SimulationResult({ turns }: { turns: SimulationTurn[] }) {
+  const taxonomies = useProfileStore((s) => s.taxonomies);
   if (!turns.length) return <EmptyInline text="还没有验证结果。输入多轮用户消息后开始验证。" />;
   return (
     <div className="simulationResult">
@@ -362,7 +363,7 @@ export function SimulationResult({ turns }: { turns: SimulationTurn[] }) {
               <span>知识匹配：{reviewScores.knowledgeGroundingScore ?? "-"}</span>
               <span>真人感：{reviewScores.humanLike ?? "-"}</span>
               <span>知识切片：{selectedChunks}</span>
-              <span>状态：{String(turn.stateTransition?.from || "-")} → {String(turn.stateTransition?.to || "-")}</span>
+              <span>状态：{turn.stateTransition?.from ? labelFor(taxonomies, "customer_stage", String(turn.stateTransition.from)).text : "-"} → {turn.stateTransition?.to ? labelFor(taxonomies, "customer_stage", String(turn.stateTransition.to)).text : "-"}</span>
             </div>
             {Array.isArray(turn.review?.risks) && turn.review.risks.length > 0 && (
               <div className="riskList compact">

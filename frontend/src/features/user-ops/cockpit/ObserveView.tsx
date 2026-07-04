@@ -22,6 +22,7 @@ import {
   nextBestActionLabel
 } from "../legacy";
 import styles from "./cockpit.module.css";
+import { useProfileStore, labelFor } from "../../../stores/profileStore";
 
 type Drilldown = "memory" | "conversation" | "sendHistory" | "trends";
 
@@ -45,6 +46,7 @@ const HEALTH_TONE_CLASS: Record<string, string> = {
 
 export function ObserveView(props: ObserveViewProps) {
   const { selected, decisionReviews, memoryDraft, health, operatingMemory, onSaveManualTags, onDrilldown } = props;
+  const taxonomies = useProfileStore((s) => s.taxonomies);
   if (!selected) return null;
   const latestReview = decisionReviews[0];
 
@@ -82,7 +84,7 @@ export function ObserveView(props: ObserveViewProps) {
           </div>
           <div>
             <span>当前运营状态</span>
-            <p>{selected.operationState || "待判断"}</p>
+            <p>{selected.operationState ? labelFor(taxonomies, "customer_stage", selected.operationState).text : "待判断"}</p>
           </div>
           <div>
             <span>领域信号</span>
