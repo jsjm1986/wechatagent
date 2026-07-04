@@ -498,7 +498,7 @@ pub(in crate::routes) struct KnowledgeAskRequest {
     workspace_id: Option<String>,
     account_id: Option<String>,
     query: String,
-    /// 1..=3；为 None 时由 knowledge_agent 默认走 3 轮。
+    /// clamp 到 [1, MAX_ROUNDS(=4)]；为 None 时由 knowledge_agent 默认走 MAX_ROUNDS(4) 轮。
     max_rounds: Option<i32>,
     #[serde(default)]
     filter: KnowledgeAskFilter,

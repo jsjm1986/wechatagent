@@ -29,8 +29,6 @@ use super::AppState;
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct OperationProfileRequest {
-    #[serde(default)]
-    tags: Vec<String>,
     customer_stage: Option<String>,
     intent_level: Option<String>,
     /// §3.7 数字分身：关系类型（customer/peer/friend，走 system_taxonomies）。运营接入时
@@ -836,7 +834,6 @@ pub async fn update_operation_profile(
         normalize_optional(payload.last_commitment).as_deref(),
     );
     let mut set_doc = doc! {
-        "tags": payload.tags,
         "commitments": commitments_bson,
         "follow_up_policy": normalize_optional(payload.follow_up_policy),
         "profile_updated_at": DateTime::now(),
