@@ -9,6 +9,7 @@ import { ArrowLeft } from "lucide-react";
 import type { AutonomyProtocol, DecisionReview, Message } from "../../../../types";
 import { ConversationStream, EmptyInline, formatTime, nextBestActionLabel } from "../../legacy";
 import { FINAL_REVIEW_STATUS_LABELS, HOLD_CATEGORY_LABELS, labelOf } from "../../../../lib/reviewLabels";
+import { useProfileStore, labelFor } from "../../../../stores/profileStore";
 import styles from "../cockpit.module.css";
 
 function scoreEntries(scores?: Record<string, number>): Array<[string, number]> {
@@ -47,6 +48,7 @@ export function AutonomyProtocolView({ protocol }: { protocol: AutonomyProtocol 
 
 function ReviewItem({ review }: { review: DecisionReview }) {
   const [expanded, setExpanded] = useState(false);
+  const taxonomies = useProfileStore((s) => s.taxonomies);
   const scores = scoreEntries(review.scores);
   const risks = Array.isArray(review.risks) ? review.risks : [];
   const nextAction = review.nextBestAction ? nextBestActionLabel(review.nextBestAction) : "";
@@ -63,7 +65,7 @@ function ReviewItem({ review }: { review: DecisionReview }) {
   return (
     <div className="reviewItem">
       <strong>
-        {review.approved ? "通过" : "拦截"} / {review.operationState || "未记录状态"}
+        {review.approved ? "通过" : "拦截"} / {review.operationState ? labelFor(taxonomies, "customer_stage", review.operationState).text : "未记录状态"}
       </strong>
       <p>{review.reviewSummary || review.replyText || "-"}</p>
       <span>{formatTime(review.createdAt)}</span>
