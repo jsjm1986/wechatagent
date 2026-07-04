@@ -113,6 +113,26 @@ export const VERSION_STATUS_LABELS: Record<string, string> = {
   archived: "已归档",
 };
 
+// next_best_action.type：LLM 自由产出字段(types.rs:134 无闭集),已知 canonical 值
+// reply / follow_up(guards.rs classify_decision_action:242/246);未知值回落原值。
+export const NEXT_BEST_ACTION_TYPE_LABELS: Record<string, string> = {
+  reply: "回复",
+  follow_up: "主动跟进",
+};
+
+// review scores 维度 key → 中文。8 项已亲验(operations 现有 6 项 + replay.rs:358-362
+// 的 factRisk / productAccuracy);未知维度经 labelOf 回落原 key 名,不吞。
+export const REVIEW_SCORE_LABELS: Record<string, string> = {
+  humanLike: "拟人度",
+  emotionalValue: "情绪价值",
+  hallucinationScore: "幻觉风险",
+  knowledgeGroundingScore: "知识接地",
+  pressureRisk: "压迫风险",
+  boundaryPrivacySafety: "隐私边界",
+  factRisk: "事实风险",
+  productAccuracy: "产品准确度",
+};
+
 export function labelOf(
   map: Record<string, string>,
   value: string | null | undefined,
