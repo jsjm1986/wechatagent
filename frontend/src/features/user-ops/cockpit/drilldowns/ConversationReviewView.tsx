@@ -8,7 +8,7 @@ import { useState } from "react";
 import { ArrowLeft } from "lucide-react";
 import type { AutonomyProtocol, DecisionReview, Message } from "../../../../types";
 import { ConversationStream, EmptyInline, formatTime, nextBestActionLabel } from "../../legacy";
-import { FINAL_REVIEW_STATUS_LABELS, HOLD_CATEGORY_LABELS, labelOf } from "../../../../lib/reviewLabels";
+import { FINAL_REVIEW_STATUS_LABELS, HOLD_CATEGORY_LABELS, REVIEW_SCORE_LABELS, labelOf } from "../../../../lib/reviewLabels";
 import { useProfileStore, labelFor } from "../../../../stores/profileStore";
 import styles from "../cockpit.module.css";
 
@@ -94,7 +94,7 @@ function ReviewItem({ review }: { review: DecisionReview }) {
             <div className={styles.reviewScores}>
               {scores.map(([key, value]) => (
                 <span key={key} className={styles.reviewChip} title={key}>
-                  {key} {value}
+                  {labelOf(REVIEW_SCORE_LABELS, key)} {value}
                 </span>
               ))}
             </div>

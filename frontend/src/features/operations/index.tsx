@@ -5,7 +5,7 @@ import { StatusBadge, type StatusTone } from "../../components/ui/StatusBadge";
 import { useOperationsStore } from "../../stores/operationsStore";
 import { useAccountStore } from "../../stores/accountStore";
 import { api } from "../../lib/api";
-import { FINAL_REVIEW_STATUS_LABELS, GATEWAY_STATUS_LABELS, HOLD_CATEGORY_LABELS, labelOf } from "../../lib/reviewLabels";
+import { FINAL_REVIEW_STATUS_LABELS, GATEWAY_STATUS_LABELS, HOLD_CATEGORY_LABELS, NEXT_BEST_ACTION_TYPE_LABELS, REVIEW_SCORE_LABELS, labelOf } from "../../lib/reviewLabels";
 import type { DecisionReview, AgentRunItem } from "../../types";
 import styles from "./Operations.module.css";
 
@@ -40,20 +40,11 @@ function taskStatusTone(status?: string): StatusTone {
   return "inactive";
 }
 
-const SCORE_LABELS: Record<string, string> = {
-  humanLike: "拟人度",
-  emotionalValue: "情绪价值",
-  hallucinationScore: "幻觉风险",
-  knowledgeGroundingScore: "知识接地",
-  pressureRisk: "压迫风险",
-  boundaryPrivacySafety: "隐私边界",
-};
-
 export function formatScores(scores: Record<string, number>) {
   const entries = Object.entries(scores ?? {}).filter(([, v]) => v !== undefined && v !== null);
   return (
     entries
-      .map(([key, v]) => `${SCORE_LABELS[key] ?? key}:${v}`)
+      .map(([key, v]) => `${REVIEW_SCORE_LABELS[key] ?? key}:${v}`)
       .join(" / ") || "-"
   );
 }
@@ -61,8 +52,9 @@ export function formatScores(scores: Record<string, number>) {
 function nextBestActionLabel(action?: Record<string, unknown>) {
   if (!action) return "-";
   const type = typeof action.type === "string" ? action.type : "-";
+  const typeLabel = NEXT_BEST_ACTION_TYPE_LABELS[type] ?? type;
   const score = typeof action.score === "number" ? ` / ${action.score}` : "";
-  return `${type}${score}`;
+  return `${typeLabel}${score}`;
 }
 
 function reviewTone(review: DecisionReview): StatusTone {

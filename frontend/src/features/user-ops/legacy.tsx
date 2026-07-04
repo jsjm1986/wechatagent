@@ -46,6 +46,7 @@ import type {
   SendHistoryItem
 } from "../../types";
 import { api } from "../../lib/api";
+import { GATEWAY_STATUS_LABELS, NEXT_BEST_ACTION_TYPE_LABELS, labelOf } from "../../lib/reviewLabels";
 import { useProfileStore, labelFor } from "../../stores/profileStore";
 import { useUserOpsStore } from "../../stores/userOpsStore";
 import TagTrustPanel from "./TagTrustPanel";
@@ -358,7 +359,7 @@ export function SimulationResult({ turns }: { turns: SimulationTurn[] }) {
               </div>
             </div>
             <div className="simMetrics">
-              <span>网关：{gatewayAllowed ? "通过" : String(turn.gatewayResult?.reason || "拦截")}</span>
+              <span>网关：{gatewayAllowed ? "通过" : (turn.gatewayResult?.reason ? labelOf(GATEWAY_STATUS_LABELS, String(turn.gatewayResult.reason)) : "拦截")}</span>
               <span>幻觉风险：{reviewScores.hallucinationScore ?? "-"}</span>
               <span>知识匹配：{reviewScores.knowledgeGroundingScore ?? "-"}</span>
               <span>真人感：{reviewScores.humanLike ?? "-"}</span>
@@ -1519,8 +1520,9 @@ export function simulationStatusLabel(status: string) {
 export function nextBestActionLabel(action?: Record<string, unknown>) {
   if (!action) return "-";
   const type = typeof action.type === "string" ? action.type : "-";
+  const typeLabel = NEXT_BEST_ACTION_TYPE_LABELS[type] ?? type;
   const score = typeof action.score === "number" ? ` / ${action.score}` : "";
-  return `${type}${score}`;
+  return `${typeLabel}${score}`;
 }
 
 
