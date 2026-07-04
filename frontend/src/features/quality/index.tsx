@@ -6,6 +6,7 @@ import { useAccountStore } from "../../stores/accountStore";
 import { ConfirmProvider, useConfirm } from "../../components/ui/ConfirmDialog";
 import { promptDiffBody } from "../../components/prompt/usePromptSaveConfirm";
 import { EvaluationScenariosPanel } from "./EvaluationScenariosPanel";
+import { VERSION_STATUS_LABELS, labelOf } from "../../lib/reviewLabels";
 import styles from "./Quality.module.css";
 
 // 运营成效中心频道：长期指标 / 知识自动校验 / 公式遵守度评测 / 产品声明兜底标记词。
@@ -235,10 +236,10 @@ export function AutoVerifyTab({ accountId }: { accountId?: string }) {
             {result.degraded && <span className={styles.badgeDegraded}>预算超额降级</span>}
           </h3>
           <ul>
-            <li>verified：{result.verified}</li>
-            <li>needs_review：{result.needsReview}</li>
-            <li>rejected：{result.rejected}</li>
-            <li>needs_human_audit：{result.needsHumanAudit}</li>
+            <li>已通过：{result.verified}</li>
+            <li>待复核：{result.needsReview}</li>
+            <li>已拒绝：{result.rejected}</li>
+            <li>待人工抽查：{result.needsHumanAudit}</li>
           </ul>
           {result.budget && <pre>{JSON.stringify(result.budget, null, 2)}</pre>}
         </div>
@@ -537,7 +538,7 @@ function ProductClaimMarkersTabInner() {
       {template && (
         <>
           <small className={styles.metaLine}>
-            模板版本 v{template.version} · status={template.status}
+            模板版本 v{template.version} · 状态：{labelOf(VERSION_STATUS_LABELS, template.status)}
           </small>
           <textarea
             className={styles.textarea}
