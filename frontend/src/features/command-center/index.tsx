@@ -8,6 +8,7 @@ import { useCommandStore } from "../../stores/commandStore";
 import { useCampaignStore } from "../../stores/campaignStore";
 import type { CommandToolCall, CommandResult } from "../../types";
 import { McpKeyForm } from "./McpKeyForm";
+import { GATEWAY_STATUS_LABELS, labelOf } from "../../lib/reviewLabels";
 import styles from "./CommandCenter.module.css";
 
 const EXAMPLES = ["把 xx 加入 Agent 运营", "发送 xx 给好友 xx", "查看今天失败任务"];
@@ -46,43 +47,9 @@ function callStatusLabel(status: string): string {
 }
 
 // gateway 终态闭集（src/agent/run_envelope.rs GATEWAY_STATUS_VALUES，32 值）→ 中文业务语义标签。
-// 措辞守 AI 自治定位（无禁词）：held_by_ai_policy=AI 策略主动暂缓 等。default 回落原值，未来新值不崩。
+// 单一真相源统一到 lib/reviewLabels.ts 的 GATEWAY_STATUS_LABELS（与 finalReviewStatus 交集键复用同措辞）。
 function gatewayStatusLabel(status: string): string {
-  switch (status) {
-    case "pending": return "待处理";
-    case "approved": return "已批准";
-    case "allowed": return "已放行";
-    case "sent": return "已发送";
-    case "no_reply": return "无需回复";
-    case "review_blocked": return "Review 拦截";
-    case "revision_failed": return "改写失败";
-    case "revision_skipped_invalid_direction": return "改写跳过（方向无效）";
-    case "revision_skipped_budget_exceeded": return "改写跳过（预算超限）";
-    case "revision_llm_failure": return "改写时模型失败";
-    case "held_by_ai_policy": return "AI 策略主动暂缓";
-    case "blocked_by_safety_guard": return "安全门拦截";
-    case "ai_waiting_for_more_context": return "AI 等待更多上下文";
-    case "blocked_by_required_field": return "缺必填字段拦截";
-    case "blocked_by_budget": return "预算超限拦截";
-    case "blocked_unverified_product_claim": return "未核实产品主张拦截";
-    case "tool_loop_timeout": return "工具循环超时";
-    case "legacy_mode_unchecked": return "旧模式未校验";
-    case "not_managed": return "未托管";
-    case "cooldown": return "冷却中";
-    case "rate_limited": return "限流中";
-    case "daily_limit": return "已达每日上限";
-    case "expired": return "已过期";
-    case "context_changed": return "上下文已变更";
-    case "policy_cooldown": return "策略冷却";
-    case "policy_wait_user_reply": return "等待客户回复";
-    case "gateway_blocked": return "网关拦截";
-    case "precheck_blocked": return "预检拦截";
-    case "outbox_enqueued": return "已入发件队列";
-    case "admin_cancelled": return "管理员已取消";
-    case "superseded_by_new_inbound": return "被更新消息取代";
-    case "quiet_hours_deferred": return "作息时段顺延";
-    default: return status;
-  }
+  return labelOf(GATEWAY_STATUS_LABELS, status);
 }
 
 // 工具调用 detail 摘要：dry-run 时摊开 would_execute；真实执行时打出网关/发送结果。
