@@ -28,6 +28,8 @@ use crate::models::{KnowledgeDailyReport, KnowledgeDigestCard, KnowledgeUsageLog
 use crate::prompts::load_prompt;
 use crate::routes::AppState;
 
+mod labels;
+
 /// 主循环：`KNOWLEDGE_DIGEST_ENABLED=false` 时立即 return，等价于功能未启用。
 ///
 /// 启用时按 `KNOWLEDGE_DIGEST_RUN_HOUR`（运营时区，默认 9）计算到下一次本地
@@ -347,11 +349,11 @@ async fn analyze_run_logs(
                 Ok(s) => s,
                 Err(err) => {
                     tracing::warn!(?err, chunk_id = %chunk_id, "summarize_logs failed; using fallback");
-                    format!("AI 观察：该切片在 {} 条 run 上被 {} 拦截", block_count, top_block_reason)
+                    format!("AI 观察：该切片在 {} 条 run 上被{}拦截", block_count, labels::block_reason_zh(&top_block_reason))
                 }
             }
         } else {
-            format!("AI 观察：该切片在 {} 条 run 上被 {} 拦截", block_count, top_block_reason)
+            format!("AI 观察：该切片在 {} 条 run 上被{}拦截", block_count, labels::block_reason_zh(&top_block_reason))
         };
         out.push(BlockSignal {
             chunk_id,

@@ -62,6 +62,15 @@ pub async fn active_view(
     if !kinds.iter().any(|k| k == "conversation_mode") {
         kinds.push("conversation_mode".to_string());
     }
+    // objection_type / value_tier / churn_reason / purchase_lifecycle 的中文 label 早已在
+    // seed migration 里（m006 / m023 / m021 / m020）：这些维度在部分 profile 下不进
+    // profile_dimensions，前端 labelFor 拿不到字典就只能显示英文 id。恒定补上下发范围，
+    // 前端即可翻译，无需新建映射。
+    for extra in ["objection_type", "value_tier", "churn_reason", "purchase_lifecycle"] {
+        if !kinds.iter().any(|k| k == extra) {
+            kinds.push(extra.to_string());
+        }
+    }
 
     // 4) 预热进程级 taxonomy cache（冷 / 过期缓存会返回空，必须先 find_or_load）。
     let cache = crate::agent::taxonomy::global_taxonomy_cache();
