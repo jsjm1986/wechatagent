@@ -133,6 +133,33 @@ export const REVIEW_SCORE_LABELS: Record<string, string> = {
   productAccuracy: "产品准确度",
 };
 
+// prompt / soul / domain_profile / prompt_template 等版本化资源的写入来源
+// (models.rs:1012/1044:system/manual/legacy_migration/evolution_release/generated_by_ai);未知回落原值。
+export const SEEDED_BY_LABELS: Record<string, string> = {
+  system: "系统内置",
+  manual: "管理员新建",
+  legacy_migration: "历史迁移",
+  evolution_release: "自优化发布",
+  generated_by_ai: "AI 生成",
+};
+export function seededByLabel(v?: string | null): string {
+  if (!v) return "—";
+  return SEEDED_BY_LABELS[v] ?? v;
+}
+
+// prompt 模板层级(与提示词新建下拉同源;后端 prompts.rs 5 值);未知回落原值。
+export const PROMPT_LAYER_LABELS: Record<string, string> = {
+  system_contract: "系统契约",
+  policy: "运营规则",
+  task_template: "任务模板",
+  review: "复盘审查",
+  methodology_generator: "方法论生成",
+};
+export function promptLayerLabel(v?: string | null): string {
+  if (!v) return "—";
+  return PROMPT_LAYER_LABELS[v] ?? v;
+}
+
 export function labelOf(
   map: Record<string, string>,
   value: string | null | undefined,

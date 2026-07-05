@@ -46,7 +46,7 @@ import type {
   SendHistoryItem
 } from "../../types";
 import { api } from "../../lib/api";
-import { GATEWAY_STATUS_LABELS, NEXT_BEST_ACTION_TYPE_LABELS, labelOf } from "../../lib/reviewLabels";
+import { GATEWAY_STATUS_LABELS, NEXT_BEST_ACTION_TYPE_LABELS, VERSION_STATUS_LABELS, labelOf, seededByLabel, promptLayerLabel } from "../../lib/reviewLabels";
 import { useProfileStore, labelFor } from "../../stores/profileStore";
 import { useUserOpsStore } from "../../stores/userOpsStore";
 import TagTrustPanel from "./TagTrustPanel";
@@ -568,20 +568,20 @@ function ActiveVersionsBar({
       <div className="activeVersionsMeta">
         <span className={`activeVersionsBadge ${isCurrent ? "current" : "shadow"}`}>
           v{version}
-          {isCurrent ? " · current" : " · shadow"}
+          {isCurrent ? " · 当前生效" : " · 影子版本"}
         </span>
         {previousVersion !== null && (
-          <span className="activeVersionsChain" title="previous_version 回滚链">
+          <span className="activeVersionsChain" title="上一版本回滚链">
             ← v{previousVersion}
           </span>
         )}
         {seededBy && (
           <span className={`activeVersionsSeeded seeded-${seededBy}`} title="写入来源">
-            {seededBy}
+            {seededByLabel(seededBy)}
           </span>
         )}
         {meta.updatedAt && (
-          <span className="activeVersionsTimestamp" title="updated_at">
+          <span className="activeVersionsTimestamp" title="更新时间">
             {meta.updatedAt}
           </span>
         )}
@@ -683,7 +683,7 @@ export function DomainConfigEditor({
         <ActiveVersionsBar
           meta={config}
           endpointPrefix="/api/admin/operation-domains"
-          resourceLabel={`Domain ${config.domain}`}
+          resourceLabel={`业务域 ${config.domain}`}
           busy={busy}
           canPublish
           onAfterAction={onAfterVersionAction}
@@ -891,7 +891,7 @@ export function UserPlaybookPanel({
         </form>
         <section className="methodologyPanel">
           <div>
-            <span>Formula</span>
+            <span>运营公式</span>
             <h3>长期用户运营公式</h3>
           </div>
           <div className="formulaGrid">
@@ -986,7 +986,7 @@ export function UserPlaybookPanel({
         {editingPlaybookId && (
           <section className="optimizeBox">
             <div>
-              <span>AI Optimize</span>
+              <span>AI 优化</span>
               <h3>优化当前方法</h3>
             </div>
             <textarea value={optimizePlaybookText} onChange={(event) => onOptimizePlaybookText(event.target.value)} />
@@ -1104,7 +1104,7 @@ export function DomainPromptPanel({
                 {soul.name}
                 {soul.status === "draft" && <span className="statusBadge statusBadgeDraft">草稿</span>}
               </strong>
-              <span>{agentKindLabel(soul.agentKind)} / v{soul.version} / {soul.status}</span>
+              <span>{agentKindLabel(soul.agentKind)} / v{soul.version} / {VERSION_STATUS_LABELS[soul.status] ?? soul.status}</span>
               <p>{soul.content}</p>
             </button>
           ))}
@@ -1157,7 +1157,7 @@ export function DomainPromptPanel({
                 {template.title}
                 {template.status === "draft" && <span className="statusBadge statusBadgeDraft">草稿</span>}
               </strong>
-              <span>{agentKindLabel(template.agentKind)} / {template.layer} / v{template.version} / {template.status}</span>
+              <span>{agentKindLabel(template.agentKind)} / {promptLayerLabel(template.layer)} / v{template.version} / {VERSION_STATUS_LABELS[template.status] ?? template.status}</span>
               <p>{template.description || template.content}</p>
             </button>
           ))}
@@ -1632,7 +1632,7 @@ export function PlannerViewSection({ contact }: { contact: Contact | null }) {
   }
   return (
     <section className="cockpitSection" data-testid="planner-view-section">
-      <div className="sectionCaption">Planner 视角</div>
+      <div className="sectionCaption">主动跟进视角</div>
       {hasMode && (
         <div data-testid="planner-mode-row" style={{ fontSize: 13, color: "#444", marginBottom: 8 }}>
           上轮对话模式 <strong>{labelFor(taxonomies, "conversation_mode", lastMode!).text}</strong>
