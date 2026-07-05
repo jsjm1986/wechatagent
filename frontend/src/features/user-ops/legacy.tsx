@@ -921,7 +921,7 @@ export function UserPlaybookPanel({
               onClick={() => onEditPlaybook(playbook)}
             >
               <strong>{playbook.name}</strong>
-              <span>v{playbook.version} / {playbook.createdBy}{playbook.isDefault ? " / 默认" : ""}</span>
+              <span>v{playbook.version} / {playbookCreatedByLabel(playbook.createdBy)}{playbook.isDefault ? " / 默认" : ""}</span>
               <p>{playbook.description || playbook.methodPrompt}</p>
             </button>
           ))}
@@ -1485,6 +1485,16 @@ export function contextPackList(source: Record<string, unknown> | undefined, key
   return [];
 }
 
+
+// 运营公式写入来源（playbooks.rs / prompts.rs：system*/manual/agent/agent_optimized）→ 中文；未知回落原值。
+export function playbookCreatedByLabel(createdBy?: string | null) {
+  if (!createdBy) return "";
+  if (createdBy.startsWith("system")) return "系统内置";
+  if (createdBy === "manual") return "管理员新建";
+  if (createdBy === "agent") return "AI 生成";
+  if (createdBy === "agent_optimized") return "AI 优化";
+  return createdBy;
+}
 
 export function memoryStatusLabel(status: string) {
   if (status === "pending") return "待整理";
