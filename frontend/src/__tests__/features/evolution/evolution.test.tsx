@@ -30,7 +30,7 @@ describe("EvolutionFeature", () => {
 
     render(<EvolutionFeature />);
 
-    expect(screen.getByText("实验信封 · 候选 · Shadow 评测")).toBeInTheDocument();
+    expect(screen.getByText("实验信封 · 候选 · 影子评测")).toBeInTheDocument();
 
     await waitFor(() => {
       expect(screen.getByTestId("evolution-center")).toBeInTheDocument();

@@ -282,16 +282,16 @@ export function AutonomyMetricCard({ label, value, hint }: { label: string; valu
 export function AutonomyPlannerSection({ planner }: { planner: PlannerSection }) {
   return (
     <div className={styles.section} data-testid="planner-section">
-      <h3>Planner 自主调度</h3>
+      <h3>自主调度</h3>
       <small className={styles.toolbarHint}>
-        三段扫描器（沉默跟进 / 承诺到期 / 阶段停滞）的 tick、emit、capped、backoff 计数；backoff 表示 AI 因 block-rate 过高自主回退。
+        三段扫描器（沉默跟进 / 承诺到期 / 阶段停滞）的轮次、触发、限流、回退计数；回退表示 AI 因拦截率过高自主收敛。
       </small>
       <div className={styles.metricGrid} style={{ marginTop: 12 }}>
         <div className={styles.metricCard} data-testid="planner-silent">
           <div className={styles.metricLabel}>沉默跟进</div>
           <div className={`${styles.metricValue} autonomyMetricValue`}>{planner.silent.emitted}</div>
           <div className={styles.metricHint}>
-            tick {planner.silent.tick} · scanned {planner.silent.scanned} · capped {planner.silent.capped} · backoff {planner.silent.backoff}
+            轮次 {planner.silent.tick} · 扫描 {planner.silent.scanned} · 限流 {planner.silent.capped} · 回退 {planner.silent.backoff}
           </div>
         </div>
         <div className={styles.metricCard} data-testid="planner-commitment">
@@ -300,14 +300,14 @@ export function AutonomyPlannerSection({ planner }: { planner: PlannerSection })
             {planner.commitment.overdueEmits + planner.commitment.imminentEmits}
           </div>
           <div className={styles.metricHint}>
-            tick {planner.commitment.tick} · overdue {planner.commitment.overdueEmits} · imminent {planner.commitment.imminentEmits} · backoff {planner.commitment.backoff}
+            轮次 {planner.commitment.tick} · 已逾期 {planner.commitment.overdueEmits} · 临近 {planner.commitment.imminentEmits} · 回退 {planner.commitment.backoff}
           </div>
         </div>
         <div className={styles.metricCard} data-testid="planner-stagnation">
           <div className={styles.metricLabel}>阶段停滞</div>
           <div className={`${styles.metricValue} autonomyMetricValue`}>{planner.stagnation.emitted}</div>
           <div className={styles.metricHint}>
-            tick {planner.stagnation.tick} · backoff {planner.stagnation.backoff}
+            轮次 {planner.stagnation.tick} · 回退 {planner.stagnation.backoff}
           </div>
         </div>
       </div>

@@ -260,17 +260,17 @@ describe("AutonomyOutcomesTab — 自治回路监控 Tab", () => {
     expect(commitment.querySelector(".autonomyMetricValue")?.textContent).toBe("7");
     expect(stagnation.querySelector(".autonomyMetricValue")?.textContent).toBe("2");
 
-    // hint 行中包含 backoff / capped / tick 等 raw count
-    expect(silent.textContent).toMatch(/tick 12/);
-    expect(silent.textContent).toMatch(/scanned 30/);
-    expect(silent.textContent).toMatch(/capped 1/);
-    expect(silent.textContent).toMatch(/backoff 2/);
+    // hint 行中包含 回退 / 限流 / 轮次 等 raw count
+    expect(silent.textContent).toMatch(/轮次 12/);
+    expect(silent.textContent).toMatch(/扫描 30/);
+    expect(silent.textContent).toMatch(/限流 1/);
+    expect(silent.textContent).toMatch(/回退 2/);
 
-    expect(commitment.textContent).toMatch(/overdue 3/);
-    expect(commitment.textContent).toMatch(/imminent 4/);
-    expect(commitment.textContent).toMatch(/backoff 1/);
+    expect(commitment.textContent).toMatch(/已逾期 3/);
+    expect(commitment.textContent).toMatch(/临近 4/);
+    expect(commitment.textContent).toMatch(/回退 1/);
 
-    expect(stagnation.textContent).toMatch(/backoff 0/);
+    expect(stagnation.textContent).toMatch(/回退 0/);
   });
 
   // M3 / Task 72：响应未带 planner 子段时（兼容旧后端）整段不渲染，且不抛错。
