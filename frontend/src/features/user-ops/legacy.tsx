@@ -1493,9 +1493,42 @@ export function memoryStatusLabel(status: string) {
   return status || "未知";
 }
 
+// 记忆候选类型闭集（prompts.rs:1317 candidate type + domain_profile 派生桶）→ 中文；未知回落原值。
+const MEMORY_CANDIDATE_TYPE_LABELS: Record<string, string> = {
+  fact: "事实",
+  preference: "偏好",
+  doNotDo: "禁忌",
+  commitment: "承诺",
+  objection: "异议",
+  openLoop: "待办",
+  conflict: "冲突",
+};
+export function memoryCandidateTypeLabel(type: string) {
+  if (!type) return "";
+  return MEMORY_CANDIDATE_TYPE_LABELS[type] ?? type;
+}
+
+// 记忆候选写入来源闭集（memory.rs：tag_observation/memory_card/contact_seed/
+// memory_consolidator_agent + run_mode fast_chat/memory_candidate/knowledge_grounded/high_risk/live）→ 中文；未知回落原值。
+const MEMORY_CANDIDATE_SOURCE_LABELS: Record<string, string> = {
+  tag_observation: "标签观测",
+  memory_card: "记忆卡",
+  contact_seed: "初始录入",
+  memory_consolidator_agent: "记忆整理",
+  fast_chat: "快速对话",
+  memory_candidate: "记忆候选",
+  knowledge_grounded: "知识接地",
+  high_risk: "高风险",
+  live: "实时对话",
+};
+export function memoryCandidateSourceLabel(source?: string | null) {
+  if (!source) return "AI";
+  return MEMORY_CANDIDATE_SOURCE_LABELS[source] ?? source;
+}
+
 
 export function memoryCandidateText(candidate: Record<string, unknown>) {
-  const type = stringField(candidate, "type");
+  const type = memoryCandidateTypeLabel(stringField(candidate, "type"));
   const content = stringField(candidate, "content");
   const evidence = stringField(candidate, "evidence");
   return [type, content, evidence ? `依据：${evidence}` : ""].filter(Boolean).join(" · ");

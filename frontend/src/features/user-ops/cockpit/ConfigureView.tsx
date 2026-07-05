@@ -27,6 +27,7 @@ import {
   formatTime,
   impactScopeLabel,
   memoryCandidateText,
+  memoryCandidateSourceLabel,
   memoryStatusLabel
 } from "../legacy";
 import type { CockpitPanelProps } from "./CockpitPanel";
@@ -406,7 +407,7 @@ export function ConfigureView(props: CockpitPanelProps) {
               {memoryCandidates.map((item) => (
                 <article key={item.id} className="memoryCandidate">
                   <header>
-                    <strong>{memoryStatusLabel(item.status)} / {item.source || "agent"}</strong>
+                    <strong>{memoryStatusLabel(item.status)} / {memoryCandidateSourceLabel(item.source)}</strong>
                     <span>评分 {item.memoryWriteScore} · {formatTime(item.createdAt)}</span>
                   </header>
                   {(item.candidates || []).slice(0, 4).map((candidate, index) => (
