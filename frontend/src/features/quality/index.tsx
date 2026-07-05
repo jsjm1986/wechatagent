@@ -119,7 +119,7 @@ export function OutcomeMetricsTab({ accountId }: { accountId?: string }) {
       {err && <div className={styles.error}>{err}</div>}
       {!accountId && <p className={styles.hint}>请先在顶部选择一个微信账号。</p>}
       {accountId && items.length === 0 && !loading && (
-        <p className={styles.hint}>该账号在选定 horizon 内还没有 outcome aggregation 任务跑过。后台 worker 会在每天 tick 时自动生成。</p>
+        <p className={styles.hint}>该账号在选定周期内还没有效果汇总任务跑过。系统每天会自动生成。</p>
       )}
       {items.length > 0 && (
         <table className={styles.table}>
