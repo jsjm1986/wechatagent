@@ -19,9 +19,9 @@
 **三家 LLM provider 全部不可用（2026-07-05 ~01:00 CST，逐一 provider-test 端点串行验证 retries=1）：**
 | provider | baseUrl | 结果 | 判定 |
 |---|---|---|---|
-| rsxermu-claude-opus-48（active 主模型） | rsxermu666.cn | HTTP 503 "Service temporarily unavailable"（retryCount:0，连测两次均 503） | 平台侧全面 outage，非 2 线程并发争用 |
-| nvidia-deepseek-v4-flash | integrate.api.nvidia.com | HTTP 503 "ResourceExhausted: Worker local total request limit reached (62/48)" | NVIDIA 配额/worker 限流打满 |
-| default（aliyun qwen3.7-max） | dashscope.aliyuncs.com | HTTP 400 "Arrearage / Access denied...good standing"（overdue payment） | 阿里云账号欠费 |
+| 主端点（active 主模型） | rsxermu666.cn | HTTP 503 "Service temporarily unavailable"（retryCount:0，连测两次均 503） | 平台侧全面 outage，非 2 线程并发争用 |
+| 备用端点 B | integrate.api.nvidia.com | HTTP 503 "ResourceExhausted: Worker local total request limit reached (62/48)" | 端点配额/worker 限流打满 |
+| default 端点 C | dashscope.aliyuncs.com | HTTP 400 "Arrearage / Access denied...good standing"（overdue payment） | 云账号欠费 |
 
 **铁证**：近 90min `llm_call_logs` = 0 success / 0 cache / 10 failed；0 run log 落库。domain2 跑 31min 仍失败于"run log 未落"= 端点 503 级联，**非项目 bug**（domain2 断言 critical 是端点噪声）。
 
@@ -36,7 +36,7 @@
 ## Findings（真实缺陷）
 | 域 | 现象 | severity | 根因 | 证据 |
 |---|---|---|---|---|
-| 可观测性 | 失败的 llm_call_logs 记录的 `model` 是 `.env` 里的陈旧标签 `deepseek-ai/deepseek-v4-flash`，而非实际 active provider（claude-opus-4.8）。调试端点故障时会误判"是 deepseek 在失败" | low | 成功路径写 `result.model`（真实模型，agent/mod.rs:287），但失败路径写 `state.config.openai_model`（陈旧 .env 值，agent/mod.rs:443）。`.env` 仍 `OPENAI_MODEL=deepseek-ai/deepseek-v4-flash`（DB active provider 与 .env 解耦，热切后 .env 未更新） | 失败日志 6 条全 deepseek 标签 + 全 http_5xx；同期成功日志全 claude-opus-4.8 |
+| 可观测性 | 失败的 llm_call_logs 记录的 `model` 字段是 `.env` 里的陈旧标签值，而非实际 active provider 的模型标识。调试端点故障时会误判"是哪个模型在失败" | low | 成功路径写 `result.model`（真实模型标识，agent/mod.rs:287），但失败路径写 `state.config.openai_model`（陈旧 `.env` 值，agent/mod.rs:443）。`.env` 的 `OPENAI_MODEL` 与 DB active provider 解耦，热切 provider 后 `.env` 标签未更新 | 失败日志 6 条全带陈旧 `.env` 标签 + 全 http_5xx；同期成功日志全带真实 active 模型标识 |
 | 用户运营·影子验证 | **前端「影子验证」功能从 UI 完全不可用**：点「开始验证」恒返 HTTP 400 `"messages are required"`。 | **HIGH（已修 6822ffb）** | 前后端字段契约漂移。store `runDialogueSimulation`（userOpsStore.ts:787-796）发 `{inboundText, runMode, dryRun}`；后端 `UserDialogueSimulationRequest`（simulations.rs:19-26，camelCase）只读 `{messages:Vec<String>, applyMemory}`，二者均 `#[serde(default)]` → `messages` 恒空 → handler 早退 400。`inboundText/runMode/dryRun` 后端完全不读（runMode="shadow"/applied=false 硬编码返回）。 | 本地 e2e `deep_simulation.mjs`：(A) 原前端 payload → 400；(B) `{messages:[...]}` → 200 + 1 turn。修复=store 按换行 split 成 `messages[]`（UI placeholder 已写"每行一条用户消息"），tsc --noEmit 绿。 |
 | dispatcher | `MAX_SEQUENTIAL_MCP_CALLS_PER_SEND` 常量非 test 构建 dead_code 警告 | trivial（已修 0149abd） | 该常量只在 `send_timeout_covers_worst_case` 不变量测试引用，非 test 构建 cargo check 报 dead_code | 加 `#[cfg(test)]` 门；运行时行为不变，不变量测试仍 1 passed |
 
