@@ -226,7 +226,7 @@ export function ConfigureView(props: CockpitPanelProps) {
             </button>
           </label>
           <label>
-            <span>最近承诺（last_commitment）</span>
+            <span>最近承诺</span>
             <small>运营可编辑：记录对客户作出的最近一条承诺，影响 AI 跟进话术。</small>
             <textarea
               rows={2}
@@ -236,7 +236,7 @@ export function ConfigureView(props: CockpitPanelProps) {
             />
           </label>
           <label>
-            <span>跟进策略（follow_up_policy）</span>
+            <span>跟进策略</span>
             <small>运营可编辑：约定主动跟进的节奏/边界，影响 AI 触达频率。</small>
             <textarea
               rows={2}
@@ -407,7 +407,7 @@ export function ConfigureView(props: CockpitPanelProps) {
                 <article key={item.id} className="memoryCandidate">
                   <header>
                     <strong>{memoryStatusLabel(item.status)} / {item.source || "agent"}</strong>
-                    <span>score {item.memoryWriteScore} · {formatTime(item.createdAt)}</span>
+                    <span>评分 {item.memoryWriteScore} · {formatTime(item.createdAt)}</span>
                   </header>
                   {(item.candidates || []).slice(0, 4).map((candidate, index) => (
                     <p key={`${item.id}-${index}`}>{memoryCandidateText(candidate)}</p>
@@ -433,7 +433,7 @@ export function ConfigureView(props: CockpitPanelProps) {
               placeholder="每行一条用户消息，按真实聊天顺序输入。"
             />
             <div className="simulationToolbar">
-              <span>Shadow 模式只看决策、风险和记忆变化，不写入真实会话。</span>
+              <span>影子模式只看决策、风险和记忆变化，不写入真实会话。</span>
               <button onClick={onRunSimulation} disabled={simulationBusy || !simulationInput.trim()}>
                 <Sparkles size={16} />
                 {simulationBusy ? "验证中" : "开始验证"}
