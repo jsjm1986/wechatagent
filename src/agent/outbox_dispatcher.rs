@@ -55,7 +55,8 @@ const MCP_SEND_TIMEOUT_SECONDS: u64 = 150;
 /// `media_upload_base64`（media_id 缓存未命中时）+ `message_send_*`，共 2 次；
 /// 文本 / 名片各 1 次。dispatcher 外层 timeout 必须 > 本值 × 每次 reqwest 上界
 /// （`crate::mcp::MCP_CLIENT_TIMEOUT_SECONDS`），见 `MCP_SEND_TIMEOUT_SECONDS`
-/// 的取值约束（finding ①）。
+/// 的取值约束（finding ①）。仅供下方不变量测试断言时序关系使用。
+#[cfg(test)]
 const MAX_SEQUENTIAL_MCP_CALLS_PER_SEND: u64 = 2;
 
 /// 二次安全门陈旧度阈值（R13.4：>30min 自动 canceled）。
