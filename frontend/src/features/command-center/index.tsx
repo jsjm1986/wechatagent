@@ -86,7 +86,7 @@ function commandCallDetail(call: CommandToolCall): string {
       gatewayReason ? `原因：${String(gatewayReason)}` : ""
     ].filter(Boolean).join(" · ");
   }
-  return call.status;
+  return callStatusLabel(call.status);
 }
 
 // 活动推送结果跳转守卫：仅当 dispatch_campaign 真实执行成功且带 campaignId 才给跳转 id，

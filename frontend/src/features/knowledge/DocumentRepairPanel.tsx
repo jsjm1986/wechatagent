@@ -1,5 +1,6 @@
 import { useEffect, useState, useCallback } from "react";
 import { ChunkRepairPanel } from "./ChunkRepairPanel";
+import { integrityStatusLabel } from "./labels";
 
 interface ChunkView {
   id: string;
@@ -73,7 +74,7 @@ export function DocumentRepairPanel({
                 onClick={() => setExpandedId(expandedId === chunk.id ? null : chunk.id)}
               >
                 <span className="wikiDocRepairItemTitle">{chunk.title || chunk.id}</span>
-                <span className="wikiDocRepairItemTag">needs_review</span>
+                <span className="wikiDocRepairItemTag">{integrityStatusLabel("needs_review")}</span>
               </button>
               {expandedId === chunk.id ? (
                 <ChunkRepairPanel
