@@ -12,3 +12,5 @@ __pycache__/
 /tmp/
 /.superpowers/
 /.claude/
+/scripts/e2e/node_modules
+*.bundle
