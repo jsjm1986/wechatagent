@@ -491,7 +491,7 @@ function ProposalList({
   onSelect: (id: string) => void;
 }) {
   if (proposals.length === 0) {
-    return <p className={styles.proposalEmpty} data-testid="proposal-list-empty">最近 N 个 experiment 还没有候选。</p>;
+    return <p className={styles.proposalEmpty} data-testid="proposal-list-empty">最近 N 个实验还没有候选。</p>;
   }
   return (
     <table className={styles.proposalList} data-testid="proposal-list">
@@ -501,7 +501,7 @@ function ProposalList({
           <th>类型</th>
           <th>主题</th>
           <th>显著性</th>
-          <th>Replays</th>
+          <th>回放</th>
           <th>创建时间</th>
         </tr>
       </thead>
@@ -517,7 +517,7 @@ function ProposalList({
             <td>
               <StatusBadge status={p.status} />
             </td>
-            <td>{p.kind === "threshold" ? "阈值" : "Prompt"}</td>
+            <td>{p.kind === "threshold" ? "阈值" : "提示词"}</td>
             <td>
               {p.kind === "threshold"
                 ? `${p.gateKey ?? "—"}: ${formatNumber(p.currentValue)} → ${formatNumber(p.proposedValue)}`

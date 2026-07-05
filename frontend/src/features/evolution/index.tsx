@@ -12,7 +12,7 @@ export default function EvolutionFeature() {
         <div className={styles.panelHead}>
           <div className={styles.panelHeadL}>
             <span className={styles.eyebrow}>Self Evolution</span>
-            <span className={styles.title}>实验信封 · 候选 · Shadow 评测</span>
+            <span className={styles.title}>实验信封 · 候选 · 影子评测</span>
           </div>
           <div className={styles.headIcon}>
             <ShieldCheck size={18} />
