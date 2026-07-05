@@ -1015,7 +1015,7 @@ function ChunkReferrersList({ chunkId }: { chunkId: string }) {
               >
                 <div className="wikiReferrerCardHead">
                   {r.wikiType ? <span className="wikiArchiveTag">{wikiTypeLabel(r.wikiType)}</span> : null}
-                  <span className="wikiReferrerKind">{r.kind ?? "—"}</span>
+                  <span className="wikiReferrerKind">{relatedKindLabel(r.kind)}</span>
                 </div>
                 <div className="wikiReferrerCardTitle">{r.title || r.chunkId}</div>
                 {r.note ? <div className="wikiReferrerCardNote">{r.note}</div> : null}

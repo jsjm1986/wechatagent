@@ -202,7 +202,7 @@ function ActiveVersionsBar({
         )}
         {seededBy && (
           <span className={styles.activeVersionsSeeded} title="写入来源">
-            {seededBy}
+            {seededByLabel(seededBy)}
           </span>
         )}
         {meta.updatedAt && (
