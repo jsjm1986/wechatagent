@@ -102,7 +102,8 @@ describe("CommandCenterFeature", () => {
       },
     });
     render(<CommandCenterFeature />);
-    expect(screen.getByText(/待核实/)).toBeInTheDocument();
+    // executed_unverified 现在标题与明细行都映射为「⚠️ 待核实」（明细不再泄漏原始状态码）
+    expect(screen.getAllByText(/待核实/).length).toBeGreaterThan(0);
   });
 
   it("does not render confirm button for already succeeded commands", () => {

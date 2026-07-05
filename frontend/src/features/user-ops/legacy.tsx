@@ -199,6 +199,7 @@ export function ChangePreview({ changes, readableChanges }: { changes: Record<st
 
 
 export function MemoryCardSummary({ memoryCard }: { memoryCard?: Record<string, unknown> }) {
+  const taxonomies = useProfileStore((s) => s.taxonomies);
   const factSections = [
     { key: "coreFacts", label: "核心事实" },
     { key: "recentFacts", label: "近期事实" },
@@ -232,7 +233,10 @@ export function MemoryCardSummary({ memoryCard }: { memoryCard?: Record<string, 
             stringField(profile || {}, "identity"),
             stringField(profile || {}, "businessContext"),
             stringField(profile || {}, "communicationStyle"),
-            stringField(relation || {}, "stage")
+            (() => {
+              const s = stringField(relation || {}, "stage");
+              return s ? labelFor(taxonomies, "customer_stage", s).text : "";
+            })()
           ].filter(Boolean).join(" / ") || "待确认"}</p>
         </div>
       )}
