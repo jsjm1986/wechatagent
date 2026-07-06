@@ -149,8 +149,8 @@ export function AutonomyOutcomesTab({ accountId }: { accountId?: string }) {
       {accountId && data && (
         <>
           <div className={styles.runHeader}>
-            <span>升级后 run 数：<strong>{data.totalRuns}</strong></span>
-            <span>未升级 run（独立计数）：<strong>{data.legacyModeUnchecked}</strong></span>
+            <span>升级后运行数：<strong>{data.totalRuns}</strong></span>
+            <span>未升级运行（独立计数）：<strong>{data.legacyModeUnchecked}</strong></span>
           </div>
           <div className={styles.metricGrid}>
             <AutonomyMetricCard

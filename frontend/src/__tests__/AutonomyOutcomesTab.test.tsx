@@ -143,7 +143,7 @@ describe("AutonomyOutcomesTab — 自治回路监控 Tab", () => {
 
     // 等待异步 fetch resolve + setData 完成
     await waitFor(() => {
-      expect(screen.getByText(/升级后 run 数/)).toBeInTheDocument();
+      expect(screen.getByText(/升级后运行数/)).toBeInTheDocument();
     });
 
     // 7 个 metric card（revisionTrigger / revisionPass / unverifiedClaim /
@@ -229,7 +229,7 @@ describe("AutonomyOutcomesTab — 自治回路监控 Tab", () => {
     expect(zeroBars).toHaveLength(3);
 
     // legacyModeUnchecked 单独计数：rawCount 行可能是 0 也行；要点是它不污染上面三类。
-    expect(screen.getByText(/未升级 run/)).toBeInTheDocument();
+    expect(screen.getByText(/未升级运行/)).toBeInTheDocument();
   });
 
   // M3 / Task 72：Planner section 渲染。
@@ -280,7 +280,7 @@ describe("AutonomyOutcomesTab — 自治回路监控 Tab", () => {
     render(<AutonomyOutcomesTab accountId="default" />);
 
     await waitFor(() => {
-      expect(screen.getByText(/升级后 run 数/)).toBeInTheDocument();
+      expect(screen.getByText(/升级后运行数/)).toBeInTheDocument();
     });
     expect(screen.queryByTestId("planner-section")).toBeNull();
   });
