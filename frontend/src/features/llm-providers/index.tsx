@@ -242,7 +242,7 @@ export default function LlmProvidersFeature() {
   // #574：指派 / 取消本 workspace 专职视觉模型。要求 supportsVision=true。
   async function setVisionItem(item: LlmProviderItem, activeFlag: boolean) {
     if (activeFlag && !item.supportsVision) {
-      window.alert("该供应商未勾选「支持图片」，请先在编辑里开启 supportsVision 再指派为视觉模型");
+      window.alert("该供应商未勾选「支持图片输入」，请先在编辑里勾选后再指派为视觉模型");
       return;
     }
     setBusy(true);

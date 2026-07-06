@@ -732,7 +732,7 @@ export function MetricsTab() {
   return (
     <div className="wikiPanelBody">
       <div className="wikiMetricsHead">
-        <div className="wikiMetricsTitle">Answer Cache</div>
+        <div className="wikiMetricsTitle">问答缓存</div>
         <button type="button" className="wikiMetricsRefresh" onClick={refresh} disabled={loading}>
           {loading ? "刷新中…" : "刷新"}
         </button>
@@ -934,7 +934,7 @@ function MetadataDashboard() {
             <dl className="wikiArchiveMeta">
               {data.topEditors.map((row, i) => (
                 <Fragment key={i}>
-                  <dt>{row.author ?? "unknown"}</dt>
+                  <dt>{row.author ?? "未知"}</dt>
                   <dd>{row.count ?? 0}</dd>
                 </Fragment>
               ))}

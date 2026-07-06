@@ -324,7 +324,7 @@ export default function OperationsFeature() {
           (loading ? (
             <EmptyState title="加载中…" hint="正在拉取运营数据。" />
           ) : decisionReviews.length === 0 ? (
-            <EmptyState title="暂无 Review 记录" hint="独立复盘 Agent 的结论与评分会在这里留痕。" />
+            <EmptyState title="暂无复核记录" hint="独立复盘 Agent 的结论与评分会在这里留痕。" />
           ) : (
             <table className={styles.table}>
               <thead>

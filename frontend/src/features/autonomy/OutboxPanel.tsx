@@ -75,7 +75,7 @@ export function OutboxPanel() {
   return (
     <div className={styles.panel}>
       <div className={styles.head}>
-        <h3 className={styles.title}>发件箱（outbox）</h3>
+        <h3 className={styles.title}>发件箱</h3>
         <button
           type="button"
           className={styles.refresh}
