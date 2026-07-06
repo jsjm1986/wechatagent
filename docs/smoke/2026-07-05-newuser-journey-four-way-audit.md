@@ -116,16 +116,19 @@
 
 ## 汇总
 
-**覆盖频道（12 组，全部可达业务频道）**：登录/鉴权 → 概览 → 账号配置+联系人导入+托管 → AI 模型配置 → 内容资产+专属顾问 → 产品与成交 → 系统策略 → 请示通道配置 → 系统看板(5频道) → AI 总控 → 活动 → 知识库 Wiki。groupOps/momentOps 是 Phase-2 占位（指向 OverviewFeature），非独立业务频道。
+**覆盖频道（13 组，全部可达业务频道 + 产品心脏后端入口）**：登录/鉴权 → 概览 → 账号配置+联系人导入+托管 → AI 模型配置 → 内容资产+专属顾问 → 产品与成交 → 系统策略 → 请示通道配置 → 系统看板(5频道) → AI 总控 → 活动 → 知识库 Wiki → **webhook→自动回复链路（POST /webhooks/wechat，产品心脏）**。groupOps/momentOps 是 Phase-2 占位（指向 OverviewFeature），非独立业务频道。
 
-**A 类真 bug（已修）**：本轮新用户全旅程四方对账**零新增 A 类 bug**。上一轮已修：simulation 字段漂移(6822ffb)、SendHistory 吞空态(a5f8b8b)、dead_code(0149abd)。
+**A 类真 bug（已修）**：本轮新用户全旅程四方对账**零新增 A 类 bug**。上一轮已修：simulation 字段漂移(6822ffb)、SendHistory 吞空态(a5f8b8b)、dead_code(0149abd)。本会话另修 2 个发送路径 deferred bug（②outbox claim FIFO 86d127f、③MCP isError 检查 5779c33），已合并 PR #136。
 
-**B 类待裁决**：无。所有"是 bug 还是设计"的疑点（analyze-profile 稀疏 note fail-closed、haiku 少产结构化字段、operation_state camelCase 存储、reset-system-pack 破坏性回避）均读码确认为既定设计。
+**B 类待裁决**：
+- **B-1（CONFIRMED，当前 main 可复现）**：progressive-tier 升档（Lean→Full）撑爆 30000 run 预算 → 需知识/触发升档的首触问题被 `blocked_by_budget`，永不回复。对照实验精确定界：简单问候停 Lean 单程（23501 tokens）正常回复，仅升档路径两程（25k+29k=56770）超预算。非 fail-open（有埋点、主回复没漏发）。详见 Findings B-1。修复触碰阈值/prompt 体积/progressive-tier 计费，一律待裁决。
+- 其余"是 bug 还是设计"疑点（analyze-profile 稀疏 note fail-closed、haiku 少产结构化字段、operation_state camelCase 存储、reset-system-pack 破坏性回避、状态机 transition_rejected/dimension_dropped fail-soft）均读码确认为既定设计。
 
 **C 类 BLOCKED（外部依赖，非项目 bug）**：
 1. 联系人导入 query 路径（MCP contacts_search）→ 502。candidates 路径本地 GREEN。
 2. AI 总控 tool-catalog / send-message（MCP tools/list + tool 编排）→ 502。session/message 落库本地 GREEN。
-均因 MCP server 47.108.57.147:3001 宕机，后端正确转译 502 不吞错。
+3. webhook 自动回复的 MCP 发送步（`message_send_text`）→ 000/5s 超时。decision/review/outbox 入队全本地 GREEN，仅最终发送 BLOCKED。
+均因 MCP server 47.108.57.147:3001 宕机，后端正确转译/重试后转 terminal 不吞错。
 
 **零未解释的遗留不一致**：全部对账项归类完毕。
 - 环境说明：测试期间后端进程被前一会话终止一次，已用 `target/debug/wechatagent.exe` 重启后继续，非崩溃。
