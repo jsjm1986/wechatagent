@@ -4,7 +4,7 @@ export function MetricCard({ detail, label, onClick, value }: {
   detail: string;
   label: string;
   onClick: () => void;
-  value: number;
+  value: number | string;
 }) {
   return (
     <button className={styles.card} onClick={onClick}>
