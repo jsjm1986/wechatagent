@@ -287,7 +287,7 @@ export function ChunkInspectorPane({
           <div className="wikiAlert error">{error}</div>
         ) : !chunk ? (
           <div className="wikiInspectorEmpty">
-            未找到 chunk <code>{chunkId}</code>，可能已 archived 或不在当前 workspace。
+            未找到知识条目 <code>{chunkId}</code>，可能已归档或不在当前工作区。
           </div>
         ) : (
           <>
@@ -1002,7 +1002,7 @@ function ChunkReferrersList({ chunkId }: { chunkId: string }) {
         ) : error ? (
           <div className="wikiAlert error">{error}</div>
         ) : !items || items.length === 0 ? (
-          <div className="wikiInspectorEmpty">无 chunk 引用此 chunk。</div>
+          <div className="wikiInspectorEmpty">没有其他知识条目引用此条目。</div>
         ) : (
           <div className="wikiReferrerList">
             {items.map((r, i) => (
@@ -1121,7 +1121,7 @@ export function ChunkRevisionsTimeline({
         ) : error ? (
           <div className="wikiAlert error">{error}</div>
         ) : !items || items.length === 0 ? (
-          <div className="wikiInspectorEmpty">无 revisions。</div>
+          <div className="wikiInspectorEmpty">暂无修订记录。</div>
         ) : (
           <ol className="wikiArchiveTimeline">
             {items.map((rev, i) => {

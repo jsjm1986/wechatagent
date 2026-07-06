@@ -90,9 +90,9 @@ export function CockpitView({ onOpenReview, onOpenAutoVerify }: CockpitViewProps
             onClick={() => onOpenReview()}
           />
           <MetricCard
-            label="D2 降级"
+            label="缺原文出处"
             value={integrity?.anchorsMissing ?? 0}
-            detail="active 但缺原文锚点"
+            detail="已启用但没填原文出处，AI 用前需补齐"
             onClick={() => onOpenReview()}
           />
           <MetricCard

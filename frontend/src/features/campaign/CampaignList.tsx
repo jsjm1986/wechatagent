@@ -61,7 +61,7 @@ export default function CampaignList() {
               <tr className={styles.tr}>
                 <th className={`${styles.th} ${styles.thName}`}>活动标题</th>
                 <th className={styles.th}>状态</th>
-                <th className={styles.th} title="已扇出的跟进任务数，非真实送达数">已扇出</th>
+                <th className={styles.th} title="已下发的跟进任务数，非真实送达数">已下发</th>
                 <th className={styles.th} title="圈人命中数，真实送达见结果看板">命中数</th>
                 <th className={styles.th}>创建人</th>
                 <th className={styles.th}>创建时间</th>

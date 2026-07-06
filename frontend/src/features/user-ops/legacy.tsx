@@ -150,8 +150,8 @@ const USER_RUNTIME_PARAMETER_FIELDS: Array<{
   { key: "hallucinationBlockAt", label: "幻觉风险拦截线", detail: "幻觉风险达到该分值则禁止发送", kind: "number", defaultValue: 6 },
   { key: "knowledgeGroundingBlockBelow", label: "知识落地拦截线", detail: "低于该分值则禁止发送涉及产品/价格/政策的内容", kind: "number", defaultValue: 7 },
   { key: "humanLikeRewriteBelow", label: "真人感重写线", detail: "低于该分值时要求重写", kind: "number", defaultValue: 6 },
-  { key: "emotionalValueRewriteBelow", label: "情绪价值重写线", detail: "低于该分值时要求重写", kind: "number", defaultValue: 5 },
-  { key: "operationStateConfidenceFullReviewBelow", label: "状态置信 Review 线", detail: "低于该分值强制完整 Review", kind: "number", defaultValue: 4 },
+  { key: "emotionalValueRewriteBelow", label: "情绪价值重写线", detail: "低于该分值时要求重写", kind: "number", defaultValue: 6 },
+  { key: "operationStateConfidenceFullReviewBelow", label: "状态置信复盘线", detail: "低于该分值强制完整复盘", kind: "number", defaultValue: 4 },
   { key: "runTokenBudget", label: "单次 Token 预算", detail: "单次用户运营运行的最大 token", kind: "number", defaultValue: 30000 },
   { key: "runMaxLlmCalls", label: "单次模型调用上限", detail: "单次用户运营最多 LLM 调用次数", kind: "number", defaultValue: 6 },
   { key: "simulationTokenBudget", label: "模拟评测预算", detail: "单次模拟/评测可用 token", kind: "number", defaultValue: 60000 },
@@ -313,10 +313,10 @@ export function MemoryFactRow({ fact }: { fact: MemoryFactView }) {
       </p>
       <div className="memoryFactMeta">
         {typeof fact.confidence === "number" && (
-          <span className="memoryFactChip" title="confidence 0-10">置信 {fact.confidence}</span>
+          <span className="memoryFactChip" title="置信度 0-10">置信 {fact.confidence}</span>
         )}
         {typeof fact.importance === "number" && (
-          <span className="memoryFactChip" title="importance 0-10">重要 {fact.importance}</span>
+          <span className="memoryFactChip" title="重要度 0-10">重要 {fact.importance}</span>
         )}
         {fact.mayExpire && <span className="memoryFactChip memoryFactBadge">易失效</span>}
         {fact.evidence && (
@@ -547,9 +547,11 @@ function ActiveVersionsBar({
 
   async function runAction(action: "publish" | "rollout" | "rollback") {
     if (!meta || !meta.id) return;
+    const actionLabel =
+      action === "publish" ? "发布" : action === "rollout" ? "切到当前" : "回滚";
     const confirmText =
       action === "publish"
-        ? `确认发布 ${resourceLabel} 新版本（version=${version + 1}）？`
+        ? `确认发布 ${resourceLabel} 新版本（v${version + 1}）？`
         : action === "rollout"
         ? `确认把 ${resourceLabel} v${version} 设为当前生效版本？`
         : `确认回滚 ${resourceLabel} 到上一版本（v${previousVersion ?? "?"}）？`;
@@ -559,7 +561,7 @@ function ActiveVersionsBar({
       await api.post(`${endpointPrefix}/${meta.id}/${action}`, {});
       if (onAfterAction) await onAfterAction();
     } catch (error) {
-      window.alert(`${resourceLabel} ${action} 失败：${(error as Error).message}`);
+      window.alert(`${resourceLabel} ${actionLabel}失败：${(error as Error).message}`);
     } finally {
       setActionBusy(false);
     }
@@ -597,7 +599,7 @@ function ActiveVersionsBar({
             className="secondary"
             onClick={() => void runAction("publish")}
             disabled={disabled}
-            title="基于当前 row 发布新版本（version+1，previous_version 自动写入）"
+            title="基于当前内容发布新版本，版本号+1，自动记录上一版本"
           >
             发布新版本
           </button>
@@ -608,7 +610,7 @@ function ActiveVersionsBar({
             className="secondary"
             onClick={() => void runAction("rollout")}
             disabled={disabled}
-            title="把这一版本切到当前生效（其他版本 soft demote）"
+            title="把这一版本切到当前生效（其他版本自动降为影子版本）"
           >
             切到当前
           </button>
@@ -687,7 +689,7 @@ export function DomainConfigEditor({
         <ActiveVersionsBar
           meta={config}
           endpointPrefix="/api/admin/operation-domains"
-          resourceLabel={`业务域 ${config.domain}`}
+          resourceLabel={config.domain === "user_operations" ? "用户运营域" : `业务域 ${config.domain}`}
           busy={busy}
           canPublish
           onAfterAction={onAfterVersionAction}
@@ -1198,7 +1200,7 @@ export function DomainPromptPanel({
             <input value={promptDraft.description} onChange={(event) => updatePromptDraft({ description: event.target.value })} />
           </label>
           <label>
-            <span>Prompt 内容</span>
+            <span>提示词内容</span>
             <textarea value={promptDraft.content} onChange={(event) => updatePromptDraft({ content: event.target.value })} />
           </label>
           <details className="advancedFields">

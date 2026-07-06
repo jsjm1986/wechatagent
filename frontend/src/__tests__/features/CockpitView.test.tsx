@@ -36,9 +36,9 @@ describe("CockpitView", () => {
     const draftCard = screen.getByText("待审草稿").closest("button");
     expect(draftCard?.textContent).toContain("12"); // needsReview
 
-    const d2Card = screen.getByText("D2 降级").closest("button");
+    const d2Card = screen.getByText("缺原文出处").closest("button");
     expect(d2Card?.textContent).toContain("2"); // anchorsMissing
-    expect(d2Card?.textContent).toContain("active 但缺原文锚点");
+    expect(d2Card?.textContent).toContain("已启用但没填原文出处，AI 用前需补齐");
 
     const gapCard = screen.getByText("知识缺口").closest("button");
     expect(gapCard?.textContent).toContain("3"); // gap-signals pending 计数 = signals.length

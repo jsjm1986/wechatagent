@@ -156,7 +156,7 @@ export function DocumentsView() {
   async function handleDelete(id: string) {
     const ok = await confirm({
       title: "删除文档？",
-      body: "关联知识条目不会被删除，但会失去文档归属。",
+      body: "删除该文档会同时删除其下所有知识条目，且不可恢复。",
       tone: "danger",
       confirmText: "确认删除",
     });
@@ -1299,7 +1299,7 @@ export function LintView() {
           {sweeping ? "扫描中…" : "立即扫描"}
         </button>
         <span className="wikiHint">
-          仅展示 status=pending；扫描包含 structural lint + stage 1 规则消解。
+          仅展示待处理项；扫描包含结构规范检查与初步规则消解。
         </span>
       </div>
       {error ? <div className="wikiAlert error">{error}</div> : null}
@@ -1371,7 +1371,7 @@ export function LintView() {
                 <p className="wikiSignalDesc">{s.description}</p>
                 {s.affectedChunkIds.length > 0 ? (
                   <div className="wikiSignalRefs">
-                    <span className="wikiSignalLabel">affected：</span>
+                    <span className="wikiSignalLabel">影响的知识：</span>
                     {s.affectedChunkIds.slice(0, 8).map((id) => (
                       <button
                         type="button"
@@ -1390,7 +1390,7 @@ export function LintView() {
                 ) : null}
                 {s.searchQueries.length > 0 ? (
                   <div className="wikiSignalRefs">
-                    <span className="wikiSignalLabel">queries：</span>
+                    <span className="wikiSignalLabel">检索词：</span>
                     {s.searchQueries.slice(0, 5).map((q, i) => (
                       <code key={`${s.signalId}-q-${i}`}>{q}</code>
                     ))}
@@ -1536,7 +1536,7 @@ export function ReviewView({ initialDimFilter }: { initialDimFilter?: string | n
       const okCount = (data.verified?.length ?? data.archived?.length ?? 0);
       const skippedCount = data.skipped?.length ?? 0;
       setInfo(
-        `批量${action === "verify" ? "verify" : "archive"} 完成：成功 ${okCount}，跳过 ${skippedCount}` +
+        `批量${action === "verify" ? "确认" : "归档"}完成：成功 ${okCount}，跳过 ${skippedCount}` +
           (skippedCount > 0 && data.skipped
             ? `（${data.skipped.slice(0, 3).map((s) => `${s.id}:${s.reason}`).join("； ")}${skippedCount > 3 ? "…" : ""}）`
             : ""),
@@ -1565,7 +1565,7 @@ export function ReviewView({ initialDimFilter }: { initialDimFilter?: string | n
       </header>
       <div className="wikiToolbar">
         <span className="wikiHint">
-          仅展示活跃 chunks。verify / reject 直接走现有路由，AI 永不自动 verify。
+          仅展示活跃知识条目。确认 / 退回直接操作，AI 永不自动确认。
         </span>
       </div>
       {initialDimFilter ? (

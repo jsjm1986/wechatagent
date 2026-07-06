@@ -193,7 +193,7 @@ function ActiveVersionsBar({
       <div className={styles.activeVersionsMeta}>
         <span className={isCurrent ? styles.activeVersionsBadgeCurrent : styles.activeVersionsBadgeShadow}>
           v{version}
-          {isCurrent ? " · current" : " · shadow"}
+          {isCurrent ? " · 当前生效" : " · 影子版本"}
         </span>
         {previousVersion !== null && (
           <span className={styles.activeVersionsChain} title="previous_version 回滚链">
@@ -616,15 +616,15 @@ function StatePolicyAdmin({ busy }: { busy: boolean }) {
             />
             <div className={styles.versionedListBody}>
               <div className={styles.versionedListChunk}>
-                <span>allowed</span>
+                <span>允许动作</span>
                 <p>{item.allowed.join("，") || "—"}</p>
               </div>
               <div className={styles.versionedListChunk}>
-                <span>forbidden</span>
+                <span>禁止动作</span>
                 <p>{item.forbidden.join("，") || "—"}</p>
               </div>
               <div className={styles.versionedListChunk}>
-                <span>recommendedPace</span>
+                <span>建议节奏</span>
                 <p>{item.recommendedPace || "—"}</p>
               </div>
             </div>
@@ -1169,14 +1169,14 @@ function TaxonomyCandidatesAdmin({ busy }: { busy: boolean }) {
             </div>
             <div className={styles.versionedListBody}>
               <div className={styles.versionedListChunk}>
-                <span>confidence / 出现次数</span>
+                <span>置信度 / 出现次数</span>
                 <p>
                   {item.confidence} · {item.occurrences} 次
                 </p>
               </div>
               {item.evidence && (
                 <div className={styles.versionedListChunk}>
-                  <span>evidence</span>
+                  <span>判断依据</span>
                   <p>{item.evidence}</p>
                 </div>
               )}
@@ -1643,7 +1643,7 @@ function ProfileEditor({
       </details>
 
       <details className={styles.advanced}>
-        <summary>自学习极性（H11）</summary>
+        <summary>自学习极性</summary>
         <p className={styles.panelHint}>
           正/负极 outcome 词集驱动召回排序 + 反向训练 + 卡死请示。留空回落内置销售极性。沉默/未分类一律删失（绝不臆测为负），本字段只声明正/负集。
         </p>
@@ -1684,7 +1684,7 @@ function ProfileEditor({
       </details>
 
       <details className={styles.advanced}>
-        <summary>completeness 审计维度</summary>
+        <summary>完整度审计维度</summary>
         <div className={styles.profileDimensionsSection}>
           {(draft.coverage_dimensions ?? []).map((cov, i) => (
             <div key={i} className={styles.profileDimensionRow}>
@@ -1771,7 +1771,7 @@ function ProfileEditor({
       </details>
 
       <details className={styles.advanced}>
-        <summary>经营公式（H15）</summary>
+        <summary>经营公式</summary>
         <p className={styles.panelHint}>reviewer 自检 + /evaluations 度量锚点，不进硬闸。留空回落销售四公式。</p>
         <div className={styles.profileDimensionsSection}>
           {(draft.business_formulas ?? []).map((f, i) => (
@@ -1837,7 +1837,7 @@ function ProfileEditor({
       </details>
 
       <details className={styles.advanced}>
-        <summary>知识切片用途角色（H16）</summary>
+        <summary>知识条目用途角色</summary>
         <p className={styles.panelHint}>替代写死的销售四态分桶。留空回落内置销售四态。</p>
         <div className={styles.profileDimensionsSection}>
           {(draft.chunk_roles ?? []).map((role, i) => (
@@ -1916,7 +1916,7 @@ function ProfileEditor({
       </details>
 
       <details className={styles.advanced}>
-        <summary>记忆维度（H17）</summary>
+        <summary>记忆维度</summary>
         <p className={styles.panelHint}>memoryCard.extra 容器里的业务数组槽位。留空回落销售八槽。</p>
         <div className={styles.profileDimensionsSection}>
           {(draft.memory_dimensions ?? []).map((m, i) => (
@@ -1996,7 +1996,7 @@ function ProfileEditor({
       </details>
 
       <details className={styles.advanced}>
-        <summary>运营范式（H8/H19 三驱动力 + 作息门控）</summary>
+        <summary>运营范式（三驱动力 + 作息门控）</summary>
         <p className={styles.panelHint}>关掉某驱动力 → 对应 planner 扫描短路（陪伴型常关 funnel）。</p>
         <div className={styles.formGrid}>
           <label className={styles.inlineCheckbox}>
@@ -2014,7 +2014,7 @@ function ProfileEditor({
                 })
               }
             />
-            漏斗推进 funnel（停滞催进）
+            漏斗推进（停滞催进）
           </label>
           <label className={styles.inlineCheckbox}>
             <input
@@ -2031,7 +2031,7 @@ function ProfileEditor({
                 })
               }
             />
-            沉默唤醒 silence
+            沉默唤醒
           </label>
           <label className={styles.inlineCheckbox}>
             <input
@@ -2048,7 +2048,7 @@ function ProfileEditor({
                 })
               }
             />
-            承诺到期 commitment
+            承诺到期
           </label>
         </div>
       </details>
@@ -2126,7 +2126,7 @@ function ProfileEditor({
       <details className={styles.advanced}>
         <summary>按关系类型分配运营范式（数字分身 per_relationship）</summary>
         <p className={styles.panelHint}>
-          为不同关系类型(customer/peer/friend)各配一套范式。未配的关系类型回落 profile 级 operation_mode。
+          为不同关系类型（客户 / 同行 / 朋友）各配一套范式。未配置的关系类型回落到画像级默认运营模式。
         </p>
         {(["customer", "peer", "friend"] as const).map((rt) => {
           const map = draft.per_relationship_operation_mode ?? {};
@@ -2177,7 +2177,7 @@ function ProfileEditor({
                         setMode({ ...mode, silence: { ...(mode.silence ?? { enabled: true }), enabled: e.target.checked } })
                       }
                     />
-                    沉默唤醒 silence
+                    沉默唤醒
                   </label>
                   <label className={styles.inlineCheckbox}>
                     <input
@@ -2187,7 +2187,7 @@ function ProfileEditor({
                         setMode({ ...mode, commitment: { ...(mode.commitment ?? { enabled: true }), enabled: e.target.checked } })
                       }
                     />
-                    承诺到期 commitment
+                    承诺到期
                   </label>
                 </>
               )}
@@ -2214,7 +2214,7 @@ function ProfileEditor({
               checked={draft.grounding_gate_bypass_without_claim ?? false}
               onChange={(e) => update({ grounding_gate_bypass_without_claim: e.target.checked })}
             />
-            无产品声明时旁路 grounding 软闸（纯情感/关系域）
+            无产品声明时跳过知识接地校验（纯情感/关系域）
           </label>
           <label className={styles.inlineCheckbox}>
             <input
@@ -2520,7 +2520,7 @@ function LessonsLearnedAdmin({ busy }: { busy: boolean }) {
 
   function patternLabel(kind: string): string {
     if (kind === "success") return "成功模式";
-    if (kind === "reviewer_misjudge_negative") return "Reviewer 误判（用户负反应）";
+    if (kind === "reviewer_misjudge_negative") return "复核误判（用户负反应）";
     if (kind === "blocked_by_safety_guard") return "安全门拦截";
     return kind || "未识别";
   }
@@ -2575,7 +2575,7 @@ function LessonsLearnedAdmin({ busy }: { busy: boolean }) {
                     onClick={() => openPromote(item.lessonId)}
                     disabled={busy || loading || promoting !== null}
                   >
-                    晋升为 peer_case
+                    晋升为同行案例
                   </button>
                 )}
               </div>
@@ -2722,7 +2722,7 @@ function SystemStrategyInner() {
             onClick={() => void resetSystemPromptPack()}
             disabled={busy}
           >
-            重置系统 Prompt Pack v2
+            重置系统提示词包 v2
           </button>
         </div>
       </section>

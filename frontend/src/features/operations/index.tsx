@@ -84,9 +84,9 @@ function runStatusTone(status?: string): StatusTone {
 // 不是 gatewayResult（SendGatewayResult 无 tier 字段），也不是 events.detail（/api/events 不下发 detail）。
 // missingTier 即本轮需要升到的档位（none → Lean 足够；relational / full → 需升档）。
 const TIER_LABELS: Record<string, string> = {
-  none: "Lean（精简档已足够）",
-  relational: "Relational（需关系档）",
-  full: "Full（需完整知识档）",
+  none: "精简档已足够",
+  relational: "需关系档",
+  full: "需完整知识档",
 };
 const SUFFICIENCY_LABELS: Record<string, string> = {
   enough: "信息充分",
@@ -158,11 +158,11 @@ function renderStageValue(value: unknown): string {
 }
 
 const RUN_STAGE_KEYS: { key: keyof AgentRunItem; label: string }[] = [
-  { key: "planner", label: "Planner" },
-  { key: "context", label: "Context" },
+  { key: "planner", label: "规划" },
+  { key: "context", label: "上下文" },
   { key: "knowledgeRoute", label: "知识路由" },
   { key: "decision", label: "决策" },
-  { key: "review", label: "Review" },
+  { key: "review", label: "复核" },
   { key: "gatewayResult", label: "送达网关" },
 ];
 
@@ -204,7 +204,7 @@ export default function OperationsFeature() {
   const tabs: { id: typeof opsTab; label: string }[] = [
     { id: "tasks", label: "跟进任务" },
     { id: "events", label: "运营事件" },
-    { id: "reviews", label: "Review 记录" },
+    { id: "reviews", label: "复核记录" },
     { id: "runs", label: "运行日志" },
     { id: "llm", label: "LLM 成本" }
   ];
@@ -218,7 +218,7 @@ export default function OperationsFeature() {
         <div className={styles.head}>
           <div className={styles.headL}>
             <span className={styles.eyebrow}>Operations</span>
-            <span className={styles.title}>任务、事件与 Review</span>
+            <span className={styles.title}>任务、事件与复核</span>
           </div>
           <span className={styles.clock}><Clock3 size={17} /></span>
         </div>
@@ -356,7 +356,7 @@ export default function OperationsFeature() {
           (loading ? (
             <EmptyState title="加载中…" hint="正在拉取运营数据。" />
           ) : agentRuns.length === 0 ? (
-            <EmptyState title="暂无运行日志" hint="Agent 每轮决策的 run envelope（含档位遥测）会在这里留痕。" />
+            <EmptyState title="暂无运行日志" hint="AI 每轮决策的运行记录（含档位遥测）会在这里留痕。" />
           ) : (
             <table className={styles.table}>
               <thead>
@@ -430,8 +430,8 @@ export default function OperationsFeature() {
                       <td>{item.promptKey}</td>
                       <td className={styles.cellMuted}>{LLM_CALL_STATUS_LABELS[item.status] ?? item.status}</td>
                       <td className={styles.cellNum}>{item.latencyMs}ms</td>
-                      <td className={styles.cellNum}>hit {item.promptCacheHitTokens}</td>
-                      <td className={styles.cellNum}>miss {item.promptCacheMissTokens}</td>
+                      <td className={styles.cellNum}>{item.promptCacheHitTokens}</td>
+                      <td className={styles.cellNum}>{item.promptCacheMissTokens}</td>
                       <td className={styles.cellMuted}>{formatTime(item.createdAt)}</td>
                     </tr>
                   ))}

@@ -13,9 +13,9 @@ export const FIVE_GATE_KEYS = [
 
 export const GATE_LABELS: Record<string, string> = {
   fact_risk_block: "事实风险",
-  pressure_risk_block: "施压风险",
-  human_like_score_rewrite: "人性化(重写)",
-  emotional_value_rewrite: "情感价值(重写)",
+  pressure_risk_block: "压迫风险",
+  human_like_score_rewrite: "拟人度（重写）",
+  emotional_value_rewrite: "情绪价值（重写）",
   product_accuracy_score_block: "产品准确度",
 };
 

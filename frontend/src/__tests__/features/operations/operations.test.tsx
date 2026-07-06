@@ -73,7 +73,7 @@ describe("OperationsFeature", () => {
     expect(screen.getByText("测试任务")).toBeInTheDocument();
     // tab 标签真实渲染
     expect(screen.getByText("跟进任务")).toBeInTheDocument();
-    expect(screen.getByText("Review 记录")).toBeInTheDocument();
+    expect(screen.getByText("复核记录")).toBeInTheDocument();
   });
 
   it("loads operations data on mount", () => {
@@ -372,7 +372,7 @@ describe("运行日志 runs tab + tier 遥测(C6+C9)", () => {
     expect(screen.getByText("run-1")).toBeInTheDocument();
     expect(screen.getByText("inbound")).toBeInTheDocument();
     // 档位遥测从 decision.missingTier 派生(Full)且标记需升档
-    expect(screen.getByText(/Full（需完整知识档）.*需升档/)).toBeInTheDocument();
+    expect(screen.getByText(/需完整知识档.*需升档/)).toBeInTheDocument();
   });
 
   it("展开后显式列出 tier 遥测三字段(档位/充分性/是否升档)", async () => {

@@ -407,7 +407,7 @@ export function ChatWorkbench({ initialAttachChunkId }: { initialAttachChunkId?:
         <div className="wikiChatDispatch">
           <div className="wikiChatDispatchHead">
             <span className="wikiArchiveTag">派工长任务</span>
-            <span className="wikiArchiveTimelineTime">每行一个步骤，交由 AI worker 串行执行</span>
+            <span className="wikiArchiveTimelineTime">每行一个步骤，交由后台任务串行执行</span>
           </div>
           <textarea
             className="wikiChatInput"
@@ -986,11 +986,11 @@ export function TaskRail() {
             <div className="wikiTaskLive">
               <div className="wikiTaskLiveHead">
                 <Loader2 size={12} className="wikiTaskSpin" />
-                实时 turn
+                实时进度
               </div>
               <ol className="wikiTaskLiveList">
                 {liveTurns.slice(-12).map((t, i) => (
-                  <li key={`${t}-${i}`}>turn #{t}</li>
+                  <li key={`${t}-${i}`}>第 {t} 步</li>
                 ))}
               </ol>
             </div>

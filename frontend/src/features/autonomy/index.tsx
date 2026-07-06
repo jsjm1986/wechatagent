@@ -400,7 +400,7 @@ export default function AutonomyFeature() {
         <div className={styles.panelHead}>
           <div className={styles.panelHeadL}>
             <span className={styles.eyebrow}>Autonomy Loop</span>
-            <span className={styles.title}>修订 · AI 暂缓 · 发送链路 · Planner</span>
+            <span className={styles.title}>修订 · AI 暂缓 · 发送链路 · 自主调度</span>
           </div>
           <div className={styles.headIcon}>
             <ShieldCheck size={18} />
