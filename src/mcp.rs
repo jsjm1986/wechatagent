@@ -29,6 +29,11 @@ pub struct McpClient {
     base_url: String,
     api_key: String,
     client: reqwest::Client,
+    /// MCP Streamable-HTTP 会话缓存，键 = `base_url|api_key`（同一进程可对多个
+    /// server / 多把 key 调用，会话按 pair 隔离），值 = server 在 `initialize`
+    /// 时下发的 `mcp-session-id`。`gewe-multi-tenant` server 要求所有非 initialize
+    /// 请求携带该头，缺失/失效（HTTP 404 `Unknown MCP session`）时本模块丢缓存重连一次。
+    sessions: std::sync::Arc<dashmap::DashMap<String, String>>,
 }
 
 impl McpClient {
@@ -39,12 +44,107 @@ impl McpClient {
             client: reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(MCP_CLIENT_TIMEOUT_SECONDS))
                 .build()?,
+            sessions: std::sync::Arc::new(dashmap::DashMap::new()),
         })
     }
 
     pub async fn call_tool<A: Serialize>(&self, tool_name: &str, arguments: A) -> AppResult<Value> {
         self.call_tool_with_key(&self.base_url, &self.api_key, tool_name, arguments)
             .await
+    }
+
+    /// MCP Streamable-HTTP 会话缓存键：同一进程可对不同 server / 不同 key 调用，
+    /// 会话按 `(base_url, api_key)` pair 隔离。
+    fn session_cache_key(base_url: &str, api_key: &str) -> String {
+        format!("{}|{}", base_url.trim_end_matches('/'), api_key)
+    }
+
+    /// 取本 (base_url, api_key) 的缓存会话，缺失则跑一次 `initialize` 握手拿到并缓存。
+    async fn ensure_session(&self, base_url: &str, api_key: &str) -> AppResult<String> {
+        let cache_key = Self::session_cache_key(base_url, api_key);
+        if let Some(existing) = self.sessions.get(&cache_key) {
+            return Ok(existing.clone());
+        }
+        let session_id = self.initialize_session(base_url, api_key).await?;
+        self.sessions.insert(cache_key, session_id.clone());
+        Ok(session_id)
+    }
+
+    /// 跑 MCP `initialize` 握手，返回 server 下发的 `mcp-session-id`。
+    async fn initialize_session(&self, base_url: &str, api_key: &str) -> AppResult<String> {
+        let request = json!({
+            "jsonrpc": "2.0",
+            "id": uuid::Uuid::new_v4().to_string(),
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {},
+                "clientInfo": { "name": "wechatagent", "version": "0.1" }
+            }
+        });
+        let response = self
+            .client
+            .post(format!("{}/mcp", base_url.trim_end_matches('/')))
+            .header(AUTHORIZATION, format!("Bearer {}", api_key))
+            .header(CONTENT_TYPE, "application/json")
+            .header(ACCEPT, "application/json, text/event-stream")
+            .json(&request)
+            .send()
+            .await?;
+        let status = response.status();
+        // session id 在响应头，body 可能是 SSE，必须先取头再消费 body。
+        let session_id = response
+            .headers()
+            .get("mcp-session-id")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string);
+        let body = response.text().await?;
+        if !status.is_success() {
+            return Err(AppError::External(format!(
+                "MCP initialize HTTP {status}: {}",
+                truncate_for_error(&body)
+            )));
+        }
+        if let Some(error) = parse_mcp_response_body(&body)?.get("error") {
+            return Err(AppError::External(format!("MCP initialize failed: {error}")));
+        }
+        session_id
+            .ok_or_else(|| AppError::External("MCP initialize 未返回 mcp-session-id 头".to_string()))
+    }
+
+    /// 发一条 JSON-RPC 请求（带会话头），返回解析后的 JSON-RPC 消息体。
+    /// 会话失效（server 重启 / 驱逐 → HTTP 404 `Unknown MCP session`）时丢缓存重握手一次。
+    async fn post_rpc(&self, base_url: &str, api_key: &str, request: &Value) -> AppResult<Value> {
+        let mut reinitialized = false;
+        loop {
+            let session_id = self.ensure_session(base_url, api_key).await?;
+            let response = self
+                .client
+                .post(format!("{}/mcp", base_url.trim_end_matches('/')))
+                .header(AUTHORIZATION, format!("Bearer {}", api_key))
+                .header(CONTENT_TYPE, "application/json")
+                .header(ACCEPT, "application/json, text/event-stream")
+                .header("mcp-session-id", &session_id)
+                .json(request)
+                .send()
+                .await?;
+            let status = response.status();
+            let body = response.text().await?;
+            // 会话失效：丢缓存重握手一次（server 重启常见），仍失败则如实报错。
+            if status.as_u16() == 404 && !reinitialized {
+                self.sessions
+                    .remove(&Self::session_cache_key(base_url, api_key));
+                reinitialized = true;
+                continue;
+            }
+            if !status.is_success() {
+                return Err(AppError::External(format!(
+                    "MCP HTTP {status}: {}",
+                    truncate_for_error(&body)
+                )));
+            }
+            return parse_mcp_response_body(&body);
+        }
     }
 
     pub async fn call_tool_with_key<A: Serialize>(
@@ -63,22 +163,7 @@ impl McpClient {
                 "arguments": arguments
             }
         });
-
-        let response = self
-            .client
-            .post(format!("{}/mcp", base_url.trim_end_matches('/')))
-            .header(AUTHORIZATION, format!("Bearer {}", api_key))
-            .header(CONTENT_TYPE, "application/json")
-            .header(ACCEPT, "application/json, text/event-stream")
-            .json(&request)
-            .send()
-            .await?;
-
-        let status = response.status();
-        let body: Value = response.json().await?;
-        if !status.is_success() {
-            return Err(AppError::External(format!("MCP HTTP {status}: {body}")));
-        }
+        let body = self.post_rpc(base_url, api_key, &request).await?;
         if let Some(error) = body.get("error") {
             return Err(AppError::External(format!(
                 "MCP tool {tool_name} failed: {error}"
@@ -114,20 +199,7 @@ impl McpClient {
             "method": "tools/list",
             "params": {}
         });
-        let response = self
-            .client
-            .post(format!("{}/mcp", base_url.trim_end_matches('/')))
-            .header(AUTHORIZATION, format!("Bearer {}", api_key))
-            .header(CONTENT_TYPE, "application/json")
-            .header(ACCEPT, "application/json, text/event-stream")
-            .json(&request)
-            .send()
-            .await?;
-        let status = response.status();
-        let body: Value = response.json().await?;
-        if !status.is_success() {
-            return Err(AppError::External(format!("MCP HTTP {status}: {body}")));
-        }
+        let body = self.post_rpc(base_url, api_key, &request).await?;
         if let Some(error) = body.get("error") {
             return Err(AppError::External(format!(
                 "MCP tools/list failed: {error}"
@@ -135,6 +207,42 @@ impl McpClient {
         }
         Ok(body.get("result").cloned().unwrap_or(Value::Null))
     }
+}
+
+/// 截断 body 供错误信息，避免超长 SSE / HTML 灌满日志。
+fn truncate_for_error(body: &str) -> String {
+    body.chars().take(300).collect()
+}
+
+/// 解析 MCP Streamable-HTTP 响应体：可能是 SSE（`event: message\ndata: {json}`）
+/// 或纯 JSON。取 `data:` 行拼成的 JSON-RPC 消息；纯 JSON 则直接解析。
+fn parse_mcp_response_body(body: &str) -> AppResult<Value> {
+    let looks_like_sse = body
+        .lines()
+        .any(|line| line.starts_with("data:") || line.starts_with("event:"));
+    if looks_like_sse {
+        // SSE 单事件的多条 data 行按 \n 拼接（SSE 规范）；MCP 通常单行整段 JSON。
+        let data = body
+            .lines()
+            .filter_map(|line| line.strip_prefix("data:"))
+            .map(str::trim_start)
+            .collect::<Vec<_>>()
+            .join("\n");
+        if !data.is_empty() {
+            return serde_json::from_str(&data).map_err(|e| {
+                AppError::External(format!(
+                    "MCP SSE data 解析失败: {e}; data={}",
+                    truncate_for_error(&data)
+                ))
+            });
+        }
+    }
+    serde_json::from_str(body.trim()).map_err(|e| {
+        AppError::External(format!(
+            "MCP 响应解析失败: {e}; body={}",
+            truncate_for_error(body)
+        ))
+    })
 }
 
 /// M16：落库 mcp_logs 前脱敏超大二进制字段。`media_upload_base64` 的 `base64`
@@ -260,6 +368,59 @@ async fn credentials_for_account(state: &AppState, account_id: &str) -> AppResul
         .and_then(|item| item.mcp_api_key)
         .unwrap_or_else(|| state.config.mcp_api_key.clone());
     Ok(McpCredentials { base_url, api_key })
+}
+
+#[cfg(test)]
+mod sse_parse_tests {
+    use super::{parse_mcp_response_body, McpClient};
+
+    #[test]
+    fn parses_sse_single_data_line() {
+        // gewe-multi-tenant server 的真实回包形态：event: message + 单行 data JSON。
+        let body = "event: message\nid: abc\ndata: {\"jsonrpc\":\"2.0\",\"id\":\"c\",\"result\":{\"structuredContent\":{\"ok\":true}}}\n\n";
+        let v = parse_mcp_response_body(body).expect("SSE data 应解析成 JSON-RPC");
+        assert_eq!(
+            v.pointer("/result/structuredContent/ok"),
+            Some(&serde_json::Value::Bool(true))
+        );
+    }
+
+    #[test]
+    fn parses_plain_json_body() {
+        // initialize 用 Accept 协商到纯 JSON 时（或 server 直接回 JSON）也要能解析。
+        let body = "{\"jsonrpc\":\"2.0\",\"id\":\"x\",\"result\":{\"a\":1}}";
+        let v = parse_mcp_response_body(body).expect("纯 JSON 应解析");
+        assert_eq!(v.pointer("/result/a"), Some(&serde_json::json!(1)));
+    }
+
+    #[test]
+    fn parses_sse_multiline_data_concatenated() {
+        // SSE 规范：单事件多条 data 行按 \n 拼接后才是完整负载。
+        let body = "event: message\ndata: {\"jsonrpc\":\"2.0\",\ndata: \"id\":\"m\",\"result\":{}}\n\n";
+        let v = parse_mcp_response_body(body).expect("多行 data 拼接后应解析");
+        assert_eq!(v.pointer("/id"), Some(&serde_json::json!("m")));
+    }
+
+    #[test]
+    fn errors_on_garbage_body() {
+        // 非 JSON、非 SSE → 如实报错，不静默吞成空（防误判送达）。
+        assert!(parse_mcp_response_body("<html>Bad Gateway</html>").is_err());
+    }
+
+    #[test]
+    fn session_cache_key_isolates_by_base_url_and_key() {
+        // 同一进程对不同 server / 不同 key 调用，会话必须按 pair 隔离，绝不串用。
+        let a = McpClient::session_cache_key("http://h1:3001", "keyA");
+        let b = McpClient::session_cache_key("http://h1:3001", "keyB");
+        let c = McpClient::session_cache_key("http://h2:3001", "keyA");
+        assert_ne!(a, b);
+        assert_ne!(a, c);
+        // 尾部斜杠归一化，避免同一 server 因写法不同分裂出两份会话。
+        assert_eq!(
+            McpClient::session_cache_key("http://h1:3001/", "keyA"),
+            McpClient::session_cache_key("http://h1:3001", "keyA")
+        );
+    }
 }
 
 #[cfg(test)]
