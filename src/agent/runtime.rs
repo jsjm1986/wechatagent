@@ -33,6 +33,9 @@ pub struct UserRuntimeParameters {
     pub operation_state_confidence_full_review_below: i32,
     /// MP-5 / Task 15：单 run 累计 token 上限。超额触发降级（跳过 review/rewrite/二次 router 等）。
     pub run_token_budget: i64,
+    /// B-1 修复:progressive-tier 升档 run 的 token gating 上限(默认 100000)。
+    /// gateway 升档分支经 RunBudget::grant_escalated_ceiling 授予本 run。
+    pub run_token_budget_escalated: i64,
     /// MP-5 / Task 15：单 run 最多 LLM 调用次数。
     pub run_max_llm_calls: i32,
     /// MP-5 / Task 15：simulation 路径单次累计 token 上限。
@@ -160,6 +163,7 @@ impl UserRuntimeParameters {
             operation_state_confidence_full_review_below: typed
                 .operation_state_confidence_full_review_below,
             run_token_budget: typed.run_token_budget,
+            run_token_budget_escalated: typed.run_token_budget_escalated,
             run_max_llm_calls: typed.run_max_llm_calls,
             simulation_token_budget: typed.simulation_token_budget,
             reaction_token_budget: typed.reaction_token_budget,
@@ -211,6 +215,7 @@ impl UserRuntimeParameters {
             "productAccuracyBlockBelow": self.product_accuracy_block_below,
             "operationStateConfidenceFullReviewBelow": self.operation_state_confidence_full_review_below,
             "runTokenBudget": self.run_token_budget,
+            "runTokenBudgetEscalated": self.run_token_budget_escalated,
             "runMaxLlmCalls": self.run_max_llm_calls,
             "simulationTokenBudget": self.simulation_token_budget,
             "reactionTokenBudget": self.reaction_token_budget,
@@ -312,6 +317,7 @@ impl Default for UserRuntimeParameters {
             operation_state_confidence_full_review_below: typed
                 .operation_state_confidence_full_review_below,
             run_token_budget: typed.run_token_budget,
+            run_token_budget_escalated: typed.run_token_budget_escalated,
             run_max_llm_calls: typed.run_max_llm_calls,
             simulation_token_budget: typed.simulation_token_budget,
             reaction_token_budget: typed.reaction_token_budget,
@@ -594,6 +600,7 @@ mod tests {
             distrust_self_reported_low_risk: false,
             operation_state_confidence_full_review_below: 4,
             run_token_budget: 30000,
+            run_token_budget_escalated: 100000,
             run_max_llm_calls: 6,
             simulation_token_budget: 60000,
             reaction_token_budget: 8000,

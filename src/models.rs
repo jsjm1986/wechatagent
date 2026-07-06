@@ -3557,6 +3557,10 @@ mod typed {
         pub operation_state_confidence_full_review_below: i32,
         #[serde(default = "defaults::run_token_budget")]
         pub run_token_budget: i64,
+        /// B-1 修复：progressive-tier 升档(Lean→Full)的 run 的 token gating 上限。
+        /// 升档触发两程 reply.task,base run_token_budget(30000)容不下,此值放宽升档路径。
+        #[serde(default = "defaults::run_token_budget_escalated")]
+        pub run_token_budget_escalated: i64,
         #[serde(default = "defaults::run_max_llm_calls")]
         pub run_max_llm_calls: i32,
         #[serde(default = "defaults::simulation_token_budget")]
@@ -3643,6 +3647,7 @@ mod typed {
                 operation_state_confidence_full_review_below:
                     defaults::operation_state_confidence_full_review_below(),
                 run_token_budget: defaults::run_token_budget(),
+                run_token_budget_escalated: defaults::run_token_budget_escalated(),
                 run_max_llm_calls: defaults::run_max_llm_calls(),
                 simulation_token_budget: defaults::simulation_token_budget(),
                 reaction_token_budget: defaults::reaction_token_budget(),
@@ -3710,6 +3715,9 @@ mod typed {
         }
         pub fn run_token_budget() -> i64 {
             30000
+        }
+        pub fn run_token_budget_escalated() -> i64 {
+            100000
         }
         pub fn run_max_llm_calls() -> i32 {
             6
@@ -4855,6 +4863,22 @@ mod typed_tests {
         assert_eq!(p.run_token_budget, 50000);
         // 其它字段 fallback 默认值。
         assert_eq!(p.knowledge_grounding_block_below, 7);
+    }
+
+    #[test]
+    fn runtime_parameters_typed_escalated_budget_default() {
+        let p: RuntimeParametersTyped =
+            mongodb::bson::from_document(doc! {}).expect("default deserialize");
+        assert_eq!(p.run_token_budget_escalated, 100000);
+        assert_eq!(typed::defaults::run_token_budget_escalated(), 100000);
+    }
+
+    #[test]
+    fn runtime_parameters_typed_reads_escalated_budget() {
+        let doc = doc! { "runTokenBudgetEscalated": 120000_i64 };
+        let p: RuntimeParametersTyped =
+            mongodb::bson::from_document(doc).expect("deserialize");
+        assert_eq!(p.run_token_budget_escalated, 120000);
     }
 
     /// #1 sunset：删除 knowledgeRoutingMode/knowledgeMaxToolLoops 字段后，旧 run envelope /
