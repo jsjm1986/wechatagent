@@ -654,10 +654,10 @@ export default function LlmProvidersFeature() {
                 onChange={(e) => setDraft({ ...draft, supportsVision: e.target.checked })}
                 disabled={busy}
               />
-              <span>支持图片输入（multimodal vision）</span>
+              <span>支持图片输入（多模态视觉）</span>
             </label>
             <small className={`${styles.fieldHint} ${styles.spanFull}`}>
-              勾选后该模型可识别图片。若文字主模型不支持图片，可单独配置一条支持图片的模型，保存后在卡片上「设为视觉模型」——图片导入会自动路由到该视觉模型；否则图片导入返回 visionNotSupported。
+              勾选后该模型可识别图片。若文字主模型不支持图片，可单独配置一条支持图片的模型，保存后在卡片上「设为视觉模型」——图片导入会自动路由到该视觉模型；否则图片导入会因缺少可用视觉模型而失败。
             </small>
           </div>
 
