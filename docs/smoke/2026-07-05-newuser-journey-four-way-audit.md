@@ -94,9 +94,19 @@
 - tool-catalog HTTP 502：直接走 MCP tools/list。
 - **C 类 BLOCKED**：管理 Agent 的工具编排能力依赖外部 MCP server（47.108.57.147:3001，宕机）；本地可测部分（session/message 落库、字段契约）GREEN，MCP 编排部分 BLOCKED，非项目 bug（后端正确转译 502 不吞错）。
 
+### 11. 活动（campaign，GREEN 只读）
+- campaign 前端只读（campaignStore 仅 loadCampaigns/loadReport 两个 GET；create/preview/dispatch 后端有但无前端调用，dispatch 走 MCP）。
+- `/api/campaigns` HTTP 200 items[0]（真空库正确返空数组）✓；`/api/campaigns/:id/sends` 为报表读端点。
+- 四方对齐（读路径），无 bug。
+
+### 12. 知识库 Wiki（knowledgeWiki，GREEN）
+- 写路径 chat→apply→verify capstone 上一轮已深测（已核实知识解锁产品红线，grounding 4→10）。
+- 本轮补测读端点全 200：`/api/knowledge/digest/today`（reportId/reportDate）、`/api/knowledge/gap-signals`（signals）、`/api/knowledge/chat/tasks` items[0]、`/api/operation-knowledge/chunks` items[0] ✓。
+- 四方对齐，无 bug。
+
 ## 汇总
 
-**覆盖频道（10 组，新用户全旅程）**：登录/鉴权 → 概览 → 账号配置+联系人导入+托管 → AI 模型配置 → 内容资产+专属顾问 → 产品与成交 → 系统策略 → 请示通道配置 → 系统看板(5频道) → AI 总控。groupOps/momentOps 是 Phase-2 占位（指向 OverviewFeature），非独立业务频道。
+**覆盖频道（12 组，全部可达业务频道）**：登录/鉴权 → 概览 → 账号配置+联系人导入+托管 → AI 模型配置 → 内容资产+专属顾问 → 产品与成交 → 系统策略 → 请示通道配置 → 系统看板(5频道) → AI 总控 → 活动 → 知识库 Wiki。groupOps/momentOps 是 Phase-2 占位（指向 OverviewFeature），非独立业务频道。
 
 **A 类真 bug（已修）**：本轮新用户全旅程四方对账**零新增 A 类 bug**。上一轮已修：simulation 字段漂移(6822ffb)、SendHistory 吞空态(a5f8b8b)、dead_code(0149abd)。
 
