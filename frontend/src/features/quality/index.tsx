@@ -480,7 +480,7 @@ function ProductClaimMarkersTabInner() {
             if (ok) await doPublish(true);
             return;
           }
-          setStatusMsg("已发布，Rust 端缓存已失效；下一次 review 即生效。");
+          setStatusMsg("已保存。注：该兜底守卫当前未启用，改动暂不影响评审行为。");
           await load();
         } catch (e) {
           const message = e instanceof Error ? e.message : String(e);
@@ -527,9 +527,9 @@ function ProductClaimMarkersTabInner() {
   return (
     <div className={styles.tabPanel}>
       <p className={styles.desc}>
-        Rust 端字符串级 fact-risk 兜底守卫使用的标记词与白名单短语。这是 Review Agent
-        判断"看似中性的话术里夹带绝对承诺"的最后一道防线。修改后会立即让进程内
-        30s TTL 缓存失效，下一次 review 加载新规则。
+        产品事实风险兜底的标记词与白名单短语（预留配置，当前未启用）。当前线上对产品声明的把关由
+        「已验证知识背书」机制负责——AI 只能基于已核验的知识条目做产品 / 价格 / 政策声明，否则拦截。
+        本配置为将来重新启用字符串级兜底守卫时预留，编辑后不会改变当前评审行为。
       </p>
       {err && <div className={styles.error}>{err}</div>}
       {statusMsg && <div className={styles.success}>{statusMsg}</div>}
