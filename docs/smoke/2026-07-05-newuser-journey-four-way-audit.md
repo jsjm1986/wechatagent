@@ -126,7 +126,19 @@
 （暂无本轮新增；上一轮已修 simulation 字段漂移 6822ffb / SendHistory 空态 a5f8b8b）
 
 ### B 类（待裁决）
-（暂无）
+
+**B-1：progressive-tier 升档（Lean→Full）路径撑爆 run 预算 → 需知识的首触问题被 `blocked_by_budget`,永不收到回复（CONFIRMED,当前 main 可复现;经对照实验精确定界）**
+
+- **现象**：全新零历史 managed contact 发第一条**需知识的** webhook（"你们的课程怎么收费？"）→ 后台去抖流水线跑完 → run `lifecycle=aborted_by_budget` / `final_review_status=blocked_by_budget` / `decision.should_reply=false` → **主回复从不发送**。
+- **对照实验精确定界（关键——不是"所有新用户都被拦"）**：
+  - **需知识/会升档** "课程怎么收费"（run `8b9ba8a6…`）：触发 `ptier_escalated`（Lean→Full）→ **两次** `user.reply.task`（Lean 程 prompt 24920 + Full 程 29203 = `tokens_used` 56770）→ 超 30000 → `blocked_by_budget`,**不回复**。
+  - **简单问候/停 Lean** "你好，在吗？"（run `…`,`e2e_greet_*`）：只有 `ptier_run_tier`、**无 `ptier_escalated`** → **单次** reply.task（23501 tokens）→ 23501 < 30000 → `completed` / `approved` / `should_reply=true` → 回复正常发出（"在的，你好呀。有什么需要帮忙的吗？"）。
+  - 结论：**单档 Lean 回复（~23–25k tokens,占 30000 预算 ~80%）勉强过关；一旦 progressive-tier 判定信息不足升 Full,叠加第二次满额调用（~29k）必然超预算**。爆炸半径 = 首触即需知识/触发升档的问题（产品咨询、报价等真实高价值入口），不是全部流量。
+- **后果链**（`src/agent/review/gates.rs:620` R3.7）：`review_skipped_budget_exceeded`（降级 local review）→ `rewrite_skipped_budget_exceeded` → needs_review + 预算超额 → `blocked_by_budget` → `autonomy_mode=blocked`、`should_reply=false`。
+- **非 fail-open（安全侧正确）**：被拦主回复没有漏发；有完整事件埋点（`run_budget_exceeded`×2 / `budget_exceeded_no_review` / `blocked_review`）可观测；那条 `pending`→最终 `failed_terminal` 的 outbox 是 escalation 的 `ack-placeholder`（"这个我帮你确认一下,稍等给你准信",`source_event_id` 尾缀 `#ack-placeholder`,failed_terminal 是 MCP 宕机所致,见 C 类）,不是被拦回复的漏发。
+- **根因判断**：单条 reply.task prompt(~24–25k tokens)本身就逼近 30000 预算(`src/agent/runtime.rs:596`)——**预算刚好够单程 Lean,容不下 progressive-tier 两程(Lean 自评→升 Full)**。token 数由 prompt 组装体积决定（soul+system+policy+task+知识指引+记忆候选类型+疑似成交+关系类型+决策维度+operator 指令等多层叠加）,与 LLM 端点无关 → 生产 deepseek 端点同样成立。
+- **为何归 B 类（需裁决,未动手）**：修复触碰阈值/prompt 体积/progressive-tier 计费任一——(a) 抬高 `run_token_budget`；(b) 压缩 reply.task 基础 prompt 体积；(c) 改 progressive-tier 两程对 budget 的计费方式（如升档后不叠加而是替换计数,或升档路径单独放宽预算）。三者都属业务逻辑/阈值红线,按分级自主一律延后待裁决,绝不自主赌选一个改。
+- **附注**：本地 LLM 是测试隧道 `r4b53lm.abc-tunnel.us/v1`(kr/claude-haiku-4.5),但 token 计数取自真实 usage 回包、由 prompt 体积决定,非模型 tokenizer artifact；用多个不同 wxid（含全新零历史）+ 两种问法对照复现一致,排除历史累积/单次抖动。复现脚本：`scripts/e2e/fresh_contact_budget.mjs`（升档路径）、`scripts/e2e/fresh_greeting.mjs`（Lean 路径对照）。
 
 ### C 类（BLOCKED 外部依赖）
 （暂无）
