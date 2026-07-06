@@ -713,7 +713,7 @@ export function DigestCanvas() {
     <div className="wikiDigestCanvas">
       <div className="wikiDigestHead">
         <div>
-          <h3>今日 Digest</h3>
+          <h3>今日摘要</h3>
           <span className="wikiDigestMeta">
             {report?.reportDate ?? "—"} · {reportStatusLabel(report?.status)} · 生成于 {report?.generatedAt ?? "—"}
           </span>
