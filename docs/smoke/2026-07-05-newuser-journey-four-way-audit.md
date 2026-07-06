@@ -104,18 +104,31 @@
 - 本轮补测读端点全 200：`/api/knowledge/digest/today`（reportId/reportDate）、`/api/knowledge/gap-signals`（signals）、`/api/knowledge/chat/tasks` items[0]、`/api/operation-knowledge/chunks` items[0] ✓。
 - 四方对齐，无 bug。
 
+### 13. webhook → 自动回复链路（产品心脏，POST /webhooks/wechat，GREEN happy-path + 1 B类 + MCP 发送步 BLOCKED）
+本轮新增补测（上一轮 12 组均为 UI 频道,未端到端触发后端入口）。新编译二进制（后端源码 `git diff HEAD..origin/main -- src/` **为空** = main 一字不差）+ 本地 Mongo 四方对账。链路：`POST /webhooks/wechat`→落库 conversation_messages→contact 解析/upsert→行为信号→去抖调度 spawn runner→`handle_managed_message_aggregated`（reaction→decision→review→outbox→MCP send）→立即 ack。
+- **HTTP ack 契约**：managed contact → `{ok:true,managed:true,queued:true,deferred:false}`；`WEBHOOK_VERIFY_SIGNATURE=false` 故无需 HMAC（.env 确认）✓。
+- **happy-path（简单问候"你好，在吗？"，run `bf344077…`）**：LLM decision 成功（`user.reply.task` 单程 23501 tokens）→ `final_review_status=approved` / `should_reply=true` → 回复"在的，你好呀。有什么需要帮忙的吗？"入 outbox（status=in_flight，MCP 宕机故未真发，见 C 类）✓。
+  - **画像/记忆维度**（goal「→画像/记忆/引导」步）：DB contact `agent_profile` 落库 4 键（summary/interests/communicationStyle/operationGoal）✓；`agent_reply` 事件 success ✓。
+  - **红线守卫真执行（四方一致）**：LLM 产出非 canonical 的 `customerStage="陌生"` + `operationState="initial_greeting"`（DEFAULT 状态机合法态仅 new_contact/relationship_building/need_discovery…）→ 两闸如 CLAUDE.md 所述正确触发：`agent.dimension_dropped`（非法 stage 丢弃,双层标签生效）+ `agent.operation_state_transition_rejected`（`unknown_target`,跳过 operation_state 写入、保留旧值,**fail-soft 不阻断已发回复**）✓。这是既定设计,非 bug。
+  - 注：`last_outbound_at` + 出站 conversation_messages 落库在 **MCP 发送成功之后**（gateway.rs:3011/2990）,MCP 宕机故这两项正确未写——是 C 类连带,非写路径缺陷。
+- **B 类发现 B-1**：需知识/触发 progressive-tier 升档（Lean→Full）的首触问题被 `blocked_by_budget`,永不回复。详见 Findings B-1（对照实验精确定界:简单问候停 Lean 单程正常,仅升档路径两程超 30000 预算）。
+- **C 类 BLOCKED**：MCP 发送步（`message_send_text`）依赖外部 server（47.108.57.147:3001,本轮探活 000/5s 超时,宕机）→ outbox 最终 `failed_terminal`。decision/review/outbox 入队全本地 GREEN,发送步 BLOCKED,后端正确重试后转 terminal 不吞错。
+
 ## 汇总
 
-**覆盖频道（12 组，全部可达业务频道）**：登录/鉴权 → 概览 → 账号配置+联系人导入+托管 → AI 模型配置 → 内容资产+专属顾问 → 产品与成交 → 系统策略 → 请示通道配置 → 系统看板(5频道) → AI 总控 → 活动 → 知识库 Wiki。groupOps/momentOps 是 Phase-2 占位（指向 OverviewFeature），非独立业务频道。
+**覆盖频道（13 组，全部可达业务频道 + 产品心脏后端入口）**：登录/鉴权 → 概览 → 账号配置+联系人导入+托管 → AI 模型配置 → 内容资产+专属顾问 → 产品与成交 → 系统策略 → 请示通道配置 → 系统看板(5频道) → AI 总控 → 活动 → 知识库 Wiki → **webhook→自动回复链路（POST /webhooks/wechat，产品心脏）**。groupOps/momentOps 是 Phase-2 占位（指向 OverviewFeature），非独立业务频道。
 
-**A 类真 bug（已修）**：本轮新用户全旅程四方对账**零新增 A 类 bug**。上一轮已修：simulation 字段漂移(6822ffb)、SendHistory 吞空态(a5f8b8b)、dead_code(0149abd)。
+**A 类真 bug（已修）**：本轮新用户全旅程四方对账**零新增 A 类 bug**。上一轮已修：simulation 字段漂移(6822ffb)、SendHistory 吞空态(a5f8b8b)、dead_code(0149abd)。本会话另修 2 个发送路径 deferred bug（②outbox claim FIFO 86d127f、③MCP isError 检查 5779c33），已合并 PR #136。
 
-**B 类待裁决**：无。所有"是 bug 还是设计"的疑点（analyze-profile 稀疏 note fail-closed、haiku 少产结构化字段、operation_state camelCase 存储、reset-system-pack 破坏性回避）均读码确认为既定设计。
+**B 类待裁决**：
+- **B-1（CONFIRMED，当前 main 可复现）**：progressive-tier 升档（Lean→Full）撑爆 30000 run 预算 → 需知识/触发升档的首触问题被 `blocked_by_budget`，永不回复。对照实验精确定界：简单问候停 Lean 单程（23501 tokens）正常回复，仅升档路径两程（25k+29k=56770）超预算。非 fail-open（有埋点、主回复没漏发）。详见 Findings B-1。修复触碰阈值/prompt 体积/progressive-tier 计费，一律待裁决。
+- 其余"是 bug 还是设计"疑点（analyze-profile 稀疏 note fail-closed、haiku 少产结构化字段、operation_state camelCase 存储、reset-system-pack 破坏性回避、状态机 transition_rejected/dimension_dropped fail-soft）均读码确认为既定设计。
 
 **C 类 BLOCKED（外部依赖，非项目 bug）**：
 1. 联系人导入 query 路径（MCP contacts_search）→ 502。candidates 路径本地 GREEN。
 2. AI 总控 tool-catalog / send-message（MCP tools/list + tool 编排）→ 502。session/message 落库本地 GREEN。
-均因 MCP server 47.108.57.147:3001 宕机，后端正确转译 502 不吞错。
+3. webhook 自动回复的 MCP 发送步（`message_send_text`）→ 000/5s 超时。decision/review/outbox 入队全本地 GREEN，仅最终发送 BLOCKED。
+均因 MCP server 47.108.57.147:3001 宕机，后端正确转译/重试后转 terminal 不吞错。
 
 **零未解释的遗留不一致**：全部对账项归类完毕。
 - 环境说明：测试期间后端进程被前一会话终止一次，已用 `target/debug/wechatagent.exe` 重启后继续，非崩溃。
@@ -126,7 +139,27 @@
 （暂无本轮新增；上一轮已修 simulation 字段漂移 6822ffb / SendHistory 空态 a5f8b8b）
 
 ### B 类（待裁决）
-（暂无）
+
+**B-1：progressive-tier 升档（Lean→Full）路径撑爆 run 预算 → 需知识的首触问题被 `blocked_by_budget`,永不收到回复（CONFIRMED,当前 main 可复现;经对照实验精确定界）**
+
+- **现象**：全新零历史 managed contact 发第一条**需知识的** webhook（"你们的课程怎么收费？"）→ 后台去抖流水线跑完 → run `lifecycle=aborted_by_budget` / `final_review_status=blocked_by_budget` / `decision.should_reply=false` → **主回复从不发送**。
+- **对照实验精确定界（关键——不是"所有新用户都被拦"）**：
+  - **需知识/会升档** "课程怎么收费"（run `8b9ba8a6…`）：触发 `ptier_escalated`（Lean→Full）→ **两次** `user.reply.task`（Lean 程 prompt 24920 + Full 程 29203 = `tokens_used` 56770）→ 超 30000 → `blocked_by_budget`,**不回复**。
+  - **简单问候/停 Lean** "你好，在吗？"（run `…`,`e2e_greet_*`）：只有 `ptier_run_tier`、**无 `ptier_escalated`** → **单次** reply.task（23501 tokens）→ 23501 < 30000 → `completed` / `approved` / `should_reply=true` → 回复正常发出（"在的，你好呀。有什么需要帮忙的吗？"）。
+  - 结论：**单档 Lean 回复（~23–25k tokens,占 30000 预算 ~80%）勉强过关；一旦 progressive-tier 判定信息不足升 Full,叠加第二次满额调用（~29k）必然超预算**。爆炸半径 = 首触即需知识/触发升档的问题（产品咨询、报价等真实高价值入口），不是全部流量。
+- **后果链**（`src/agent/review/gates.rs:620` R3.7）：`review_skipped_budget_exceeded`（降级 local review）→ `rewrite_skipped_budget_exceeded` → needs_review + 预算超额 → `blocked_by_budget` → `autonomy_mode=blocked`、`should_reply=false`。
+- **非 fail-open（安全侧正确）**：被拦主回复没有漏发；有完整事件埋点（`run_budget_exceeded`×2 / `budget_exceeded_no_review` / `blocked_review`）可观测；那条 `pending`→最终 `failed_terminal` 的 outbox 是 escalation 的 `ack-placeholder`（"这个我帮你确认一下,稍等给你准信",`source_event_id` 尾缀 `#ack-placeholder`,failed_terminal 是 MCP 宕机所致,见 C 类）,不是被拦回复的漏发。
+- **根因判断**：单条 reply.task prompt(~24–25k tokens)本身就逼近 30000 预算(`src/agent/runtime.rs:596`)——**预算刚好够单程 Lean,容不下 progressive-tier 两程(Lean 自评→升 Full)**。token 数由 prompt 组装体积决定（soul+system+policy+task+知识指引+记忆候选类型+疑似成交+关系类型+决策维度+operator 指令等多层叠加）,与 LLM 端点无关 → 生产 deepseek 端点同样成立。
+- **为何归 B 类（需裁决,未动手）**：修复触碰阈值/prompt 体积/progressive-tier 计费任一——(a) 抬高 `run_token_budget`；(b) 压缩 reply.task 基础 prompt 体积；(c) 改 progressive-tier 两程对 budget 的计费方式（如升档后不叠加而是替换计数,或升档路径单独放宽预算）。三者都属业务逻辑/阈值红线,按分级自主一律延后待裁决,绝不自主赌选一个改。
+- **附注**：本地 LLM 是测试隧道 `r4b53lm.abc-tunnel.us/v1`(kr/claude-haiku-4.5),但 token 计数取自真实 usage 回包、由 prompt 体积决定,非模型 tokenizer artifact；用多个不同 wxid（含全新零历史）+ 两种问法对照复现一致,排除历史累积/单次抖动。复现脚本：`scripts/e2e/fresh_contact_budget.mjs`（升档路径）、`scripts/e2e/fresh_greeting.mjs`（Lean 路径对照）。
+
+**B-1 修复（已实施,用户裁决方向 (c)「升档路径单独放宽预算」）**：
+- 方案：仅对升档 run（`forced_full` / `Escalate(_)`）在第二程重生成前把本 run 的 token gating 上限抬到 `run_token_budget_escalated`（默认 100000，运营域可配）；非升档 run 保持 30000 紧上限；`tokens_used` 仍如实累计（只放宽判定、不改消费记录）。设计 `docs/superpowers/specs/2026-07-06-escalated-run-budget-design.md`，计划 `docs/superpowers/plans/2026-07-06-escalated-run-budget.md`。
+- 实现 commits：`66789e0`（RunBudget.grant_escalated_ceiling）+ `301f88a`（配置字段打通）+ `6410ff4`（gateway 两处升档分支授予）。lib 基线 1821/0。
+- **修复后端到端复验（新编译二进制，后端源码=main）**：
+  - **升档路径**（run `e0c9f6b7…`，全新零历史）：`degraded_reasons=[]`（**不再有** review_skipped/rewrite_skipped 预算降级）；完整跑完 Lean(24759)→Full(31034)→**review(15434)**→**rewrite(29731)**→**re-review(14921)**。机制核实：预算闸是逐阶段 `is_exceeded()` 检查点（review 闸 `gateway.rs:1458`、rewrite 闸 `:1519`、revision 闸 `:1737`），各在该阶段 LLM 调用**前**看累计 token；review 闸看到 ~55k、rewrite 闸看到 ~71k，均 < 100000 授予上限 → 两阶段正常执行（此前 30000 上限下这里就被拦了）；`tokens_used` 最终累计到 115879 是 rewrite 自身 + re-review 在各自闸通过**之后**才产生的，不影响已执行的阶段。最终 `blocked_unverified_product_claim`——**另一条正确红线**（空测试知识库无法背书报价，R5.4 拦造假回复，CLAUDE.md:149），客户仍收到诚实的 escalation ack-placeholder + 报价问题升领导。这是预算 bug 此前掩盖的既定流程。
+  - **Lean 路径无回归**（run `e2e_greet_*`）：`completed`/`approved`/`should_reply=true`，单程 reply.task(23453 tokens)，无 `ptier_escalated`——非升档 run 不授予、行为不变，回复正常发出。
+  - 注：MCP 宕机故 outbox 停在 in_flight/failed_terminal（C 类，非本修复回归）。
 
 ### C 类（BLOCKED 外部依赖）
 （暂无）

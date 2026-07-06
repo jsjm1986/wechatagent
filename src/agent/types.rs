@@ -1714,6 +1714,7 @@ mod validate_and_promote_tests {
             product_accuracy_block_below: 7,
             operation_state_confidence_full_review_below: 4,
             run_token_budget: 30000,
+            run_token_budget_escalated: 100000,
             run_max_llm_calls: 6,
             simulation_token_budget: 60000,
             reaction_token_budget: 8000,
