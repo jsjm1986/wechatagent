@@ -84,8 +84,24 @@ impl McpClient {
                 "MCP tool {tool_name} failed: {error}"
             )));
         }
-        Ok(body
-            .get("result")
+        let result = body.get("result");
+        // finding ③：MCP 标准用 result.isError=true + HTTP200 表示「工具执行了但失败」
+        // （如联系人拒收）。仅查 HTTP 状态 + 顶层 JSON-RPC error 会把这类失败读成成功，
+        // 令发送链路误判送达。server 不发 isError 时此分支不触发（标准兼容 no-op）。
+        if result
+            .and_then(|r| r.get("isError"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            let detail = result
+                .and_then(|r| r.get("content"))
+                .map(|c| c.to_string())
+                .unwrap_or_default();
+            return Err(AppError::External(format!(
+                "MCP tool {tool_name} returned isError: {detail}"
+            )));
+        }
+        Ok(result
             .and_then(|result| result.get("structuredContent"))
             .cloned()
             .unwrap_or(Value::Null))
