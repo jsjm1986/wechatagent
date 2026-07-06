@@ -153,5 +153,13 @@
 - **为何归 B 类（需裁决,未动手）**：修复触碰阈值/prompt 体积/progressive-tier 计费任一——(a) 抬高 `run_token_budget`；(b) 压缩 reply.task 基础 prompt 体积；(c) 改 progressive-tier 两程对 budget 的计费方式（如升档后不叠加而是替换计数,或升档路径单独放宽预算）。三者都属业务逻辑/阈值红线,按分级自主一律延后待裁决,绝不自主赌选一个改。
 - **附注**：本地 LLM 是测试隧道 `r4b53lm.abc-tunnel.us/v1`(kr/claude-haiku-4.5),但 token 计数取自真实 usage 回包、由 prompt 体积决定,非模型 tokenizer artifact；用多个不同 wxid（含全新零历史）+ 两种问法对照复现一致,排除历史累积/单次抖动。复现脚本：`scripts/e2e/fresh_contact_budget.mjs`（升档路径）、`scripts/e2e/fresh_greeting.mjs`（Lean 路径对照）。
 
+**B-1 修复（已实施,用户裁决方向 (c)「升档路径单独放宽预算」）**：
+- 方案：仅对升档 run（`forced_full` / `Escalate(_)`）在第二程重生成前把本 run 的 token gating 上限抬到 `run_token_budget_escalated`（默认 100000，运营域可配）；非升档 run 保持 30000 紧上限；`tokens_used` 仍如实累计（只放宽判定、不改消费记录）。设计 `docs/superpowers/specs/2026-07-06-escalated-run-budget-design.md`，计划 `docs/superpowers/plans/2026-07-06-escalated-run-budget.md`。
+- 实现 commits：`66789e0`（RunBudget.grant_escalated_ceiling）+ `301f88a`（配置字段打通）+ `6410ff4`（gateway 两处升档分支授予）。lib 基线 1821/0。
+- **修复后端到端复验（新编译二进制，后端源码=main）**：
+  - **升档路径**（run `e0c9f6b7…`，全新零历史）：`degraded_reasons=[]`（**不再有** review_skipped/rewrite_skipped 预算降级）；完整跑完 Lean(24759)→Full(31034)→**review(15434)**→**rewrite(29731)**→**re-review(14921)**。机制核实：预算闸是逐阶段 `is_exceeded()` 检查点（review 闸 `gateway.rs:1458`、rewrite 闸 `:1519`、revision 闸 `:1737`），各在该阶段 LLM 调用**前**看累计 token；review 闸看到 ~55k、rewrite 闸看到 ~71k，均 < 100000 授予上限 → 两阶段正常执行（此前 30000 上限下这里就被拦了）；`tokens_used` 最终累计到 115879 是 rewrite 自身 + re-review 在各自闸通过**之后**才产生的，不影响已执行的阶段。最终 `blocked_unverified_product_claim`——**另一条正确红线**（空测试知识库无法背书报价，R5.4 拦造假回复，CLAUDE.md:149），客户仍收到诚实的 escalation ack-placeholder + 报价问题升领导。这是预算 bug 此前掩盖的既定流程。
+  - **Lean 路径无回归**（run `e2e_greet_*`）：`completed`/`approved`/`should_reply=true`，单程 reply.task(23453 tokens)，无 `ptier_escalated`——非升档 run 不授予、行为不变，回复正常发出。
+  - 注：MCP 宕机故 outbox 停在 in_flight/failed_terminal（C 类，非本修复回归）。
+
 ### C 类（BLOCKED 外部依赖）
 （暂无）
