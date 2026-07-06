@@ -64,6 +64,10 @@ pub struct RunBudget {
     /// agent-autonomy-loop W3 / Task 4.1：单 run 已执行的 tool call 累计数；
     /// 与 [`Self::llm_calls_used`] **独立** 计数（R4.3：1 次 LLM = 0 次 tool）。
     pub tool_calls_used: PlMutex<i32>,
+    /// B-1 修复：progressive-tier 升档 run 的额外 token gating 余量（默认 0）。
+    /// 效果 = 抬高 is_exceeded/record_tool_call 判定用的 token 上限，**不**改
+    /// tokens_used 真实累计。只在 gateway 升档分支经 grant_escalated_ceiling 授予。
+    pub escalation_bonus: PlMutex<i64>,
     pub degraded_reasons: PlMutex<Vec<String>>,
 }
 
@@ -82,6 +86,7 @@ impl RunBudget {
             tokens_used: PlMutex::new(0),
             llm_calls_used: PlMutex::new(0),
             tool_calls_used: PlMutex::new(0),
+            escalation_bonus: PlMutex::new(0),
             degraded_reasons: PlMutex::new(Vec::new()),
         }
     }
@@ -92,6 +97,14 @@ impl RunBudget {
     pub fn record_call(&self, tokens: i64) {
         *self.tokens_used.lock() += tokens.max(0);
         *self.llm_calls_used.lock() += 1;
+    }
+
+    /// B-1 修复：把本 run 的有效 token gating 上限抬到 `max(token_budget, escalated_total)`。
+    /// 幂等——重复以同值调用无副作用；`escalated_total <= token_budget` 时 bonus=0（绝不缩小上限）。
+    /// 仅放宽判定上限，不改 tokens_used 真实累计。
+    pub fn grant_escalated_ceiling(&self, escalated_total: i64) {
+        let bonus = escalated_total.saturating_sub(self.token_budget).max(0);
+        *self.escalation_bonus.lock() = bonus;
     }
 
     /// agent-autonomy-loop W3 / Task 4.1：原子地检查并累计 1 次 tool call
@@ -110,6 +123,7 @@ impl RunBudget {
     /// `llm_calls_used`，不与本方法竞争 `tool_calls_used`，所以不会形成环。
     pub fn record_tool_call(&self, tokens_consumed: i64) -> Result<(), BudgetError> {
         let consumed = tokens_consumed.max(0);
+        let effective_token_budget = self.token_budget + *self.escalation_bonus.lock();
         let mut tokens = self.tokens_used.lock();
         let mut tool_calls = self.tool_calls_used.lock();
         if *tool_calls >= self.tool_call_budget {
@@ -118,11 +132,11 @@ impl RunBudget {
                 budget: self.tool_call_budget,
             });
         }
-        if (*tokens).saturating_add(consumed) > self.token_budget {
+        if (*tokens).saturating_add(consumed) > effective_token_budget {
             return Err(BudgetError::TokensExceeded {
                 used: *tokens,
                 consumed,
-                budget: self.token_budget,
+                budget: effective_token_budget,
             });
         }
         *tokens += consumed;
@@ -134,7 +148,10 @@ impl RunBudget {
     /// "超额"判定基础上，叠加 tool_calls 维度——任一硬上限达到即视为
     /// 超额，触发降级路径（跳过 review / rewrite / 二次知识路由）。
     pub fn is_exceeded(&self) -> bool {
-        *self.tokens_used.lock() >= self.token_budget
+        // escalation_bonus 在独立语句里取值并立即释放，再取 tokens_used 锁——
+        // 避免与 record_tool_call 的 tokens→tool_calls 锁顺序形成环。
+        let effective_token_budget = self.token_budget + *self.escalation_bonus.lock();
+        *self.tokens_used.lock() >= effective_token_budget
             || *self.llm_calls_used.lock() >= self.max_llm_calls
             || *self.tool_calls_used.lock() >= self.tool_call_budget
     }
@@ -152,6 +169,7 @@ impl RunBudget {
             tokens_used: *self.tokens_used.lock(),
             llm_calls_used: *self.llm_calls_used.lock(),
             tool_calls_used: *self.tool_calls_used.lock(),
+            escalation_bonus: *self.escalation_bonus.lock(),
             degraded_reasons: self.degraded_reasons.lock().clone(),
         }
     }
@@ -167,6 +185,7 @@ pub struct RunBudgetSnapshot {
     pub tokens_used: i64,
     pub llm_calls_used: i32,
     pub tool_calls_used: i32,
+    pub escalation_bonus: i64,
     pub degraded_reasons: Vec<String>,
 }
 
@@ -268,5 +287,64 @@ mod tests {
         let snap = budget.snapshot();
         assert_eq!(snap.tool_calls_used, 1);
         assert_eq!(snap.tokens_used, 0);
+    }
+
+    #[test]
+    fn grant_escalated_ceiling_raises_effective_token_budget() {
+        let budget = RunBudget::new("run_e", 30_000, 6, 6);
+        budget.record_call(40_000);
+        assert!(budget.is_exceeded(), "40000 >= 30000 base budget → 超额");
+        budget.grant_escalated_ceiling(100_000);
+        assert!(
+            !budget.is_exceeded(),
+            "授予后 40000 < 100000 有效上限 → 不再超额"
+        );
+    }
+
+    #[test]
+    fn grant_escalated_ceiling_is_idempotent() {
+        let budget = RunBudget::new("run_e", 30_000, 6, 6);
+        budget.grant_escalated_ceiling(100_000);
+        budget.grant_escalated_ceiling(100_000);
+        budget.record_call(90_000);
+        assert!(!budget.is_exceeded(), "90000 < 100000，重复授予同值无副作用");
+        budget.record_call(20_000);
+        assert!(budget.is_exceeded(), "110000 >= 100000");
+    }
+
+    #[test]
+    fn grant_escalated_ceiling_below_base_does_not_shrink() {
+        let budget = RunBudget::new("run_e", 30_000, 6, 6);
+        budget.grant_escalated_ceiling(10_000);
+        budget.record_call(20_000);
+        assert!(
+            !budget.is_exceeded(),
+            "escalated_total < token_budget 时 bonus=0，绝不缩小上限"
+        );
+    }
+
+    #[test]
+    fn is_exceeded_without_grant_uses_base_budget() {
+        let budget = RunBudget::new("run_e", 100, 6, 6);
+        budget.record_call(60);
+        assert!(!budget.is_exceeded());
+        budget.record_call(50);
+        assert!(budget.is_exceeded(), "未授予时 110 >= 100 base，行为逐字不变");
+    }
+
+    #[test]
+    fn record_tool_call_uses_escalated_ceiling() {
+        let budget = RunBudget::new("run_e", 100, 6, 16);
+        budget.grant_escalated_ceiling(300);
+        budget.record_tool_call(250).expect("250 <= 300 有效上限");
+        let err = budget
+            .record_tool_call(60)
+            .expect_err("250+60 > 300 → TokensExceeded");
+        match err {
+            BudgetError::TokensExceeded { budget: cap, .. } => {
+                assert_eq!(cap, 300, "错误须报有效上限(300)而非 base(100)");
+            }
+            other => panic!("expected TokensExceeded, got {other:?}"),
+        }
     }
 }
