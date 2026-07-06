@@ -154,8 +154,13 @@ pub async fn atomic_claim_pending(
             "updated_at": now,
         }
     };
+    // finding ②：按 created_at 升序领取（FIFO），保证同一 run 的多段回复（文本
+    // seg0/seg1…后接媒体，各段独立 enqueue、created_at 单调递增）按入队顺序发出，
+    // 不被 MongoDB 自然序打乱成「媒体先于后续文本段」。_id 作同毫秒并列的稳定兜底
+    // （ObjectId 内含进程内递增计数器，等价入队顺序）。
     let options = FindOneAndUpdateOptions::builder()
         .return_document(ReturnDocument::After)
+        .sort(doc! { "created_at": 1, "_id": 1 })
         .build();
     Ok(collection
         .find_one_and_update(filter, update, options)
