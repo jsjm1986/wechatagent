@@ -521,14 +521,70 @@ pub async fn execute_step(
                 details: None,
             })
         }
-        "retag" => Ok(StepOutcome {
-            chunk_id: step
-                .get_str("targetChunkId")
-                .ok()
-                .map(|s| s.to_string()),
-            message: "已标记需要重抽标签".to_string(),
-            details: None,
-        }),
+        "retag" => {
+            let Some(cid) = step.get_str("targetChunkId").ok().map(|s| s.to_string()) else {
+                return Ok(StepOutcome {
+                    chunk_id: None,
+                    message: "缺 targetChunkId，未重抽标签".to_string(),
+                    details: None,
+                });
+            };
+            let Ok(object_id) = ObjectId::parse_str(&cid) else {
+                return Ok(StepOutcome {
+                    chunk_id: Some(cid.clone()),
+                    message: format!("targetChunkId={cid} 非法，未重抽标签"),
+                    details: None,
+                });
+            };
+            let chunk = state
+                .db
+                .operation_knowledge_chunks()
+                .find_one(doc! { "_id": object_id, "workspace_id": workspace_id }, None)
+                .await?;
+            let Some(chunk) = chunk else {
+                return Ok(StepOutcome {
+                    chunk_id: Some(cid.clone()),
+                    message: format!("chunk {cid} 不存在，未重抽标签"),
+                    details: None,
+                });
+            };
+            let body = chunk.body.clone().unwrap_or_default();
+            match crate::routes::knowledge::extract_knowledge_tags_inner(
+                state,
+                Some(_account_id),
+                &chunk.title,
+                &body,
+            )
+            .await
+            {
+                Ok((product_tags, business_topics)) => {
+                    let patch = doc! {
+                        "productTags": product_tags.clone(),
+                        "businessTopics": business_topics.clone(),
+                    };
+                    // apply_update_chunk 强制 status=draft + integrity_status=needs_review。
+                    // operator_statement 传空（retag 不改 sourceQuote，不触发重锚定）。
+                    crate::routes::knowledge::apply_update_chunk(
+                        state, workspace_id, _account_id, &cid, &patch, "",
+                    )
+                    .await?;
+                    Ok(StepOutcome {
+                        chunk_id: Some(cid.clone()),
+                        message: format!(
+                            "已为 chunk {cid} 重抽标签（产品 {} / 主题 {}），落为待确认草稿",
+                            product_tags.len(),
+                            business_topics.len()
+                        ),
+                        details: None,
+                    })
+                }
+                Err(err) => Ok(StepOutcome {
+                    chunk_id: Some(cid.clone()),
+                    message: format!("chunk {cid} 重抽标签失败（{err}，fail-soft）"),
+                    details: None,
+                }),
+            }
+        }
         "review_evolution" => Ok(StepOutcome {
             chunk_id: None,
             message: "已记录：请去 EvolutionCenterTab 评估候选".to_string(),

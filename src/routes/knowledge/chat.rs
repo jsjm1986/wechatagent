@@ -1708,7 +1708,7 @@ pub async fn apply_create_chunk(
     }))
 }
 
-async fn apply_update_chunk(
+pub(crate) async fn apply_update_chunk(
     state: &AppState,
     workspace_id: &str,
     _account_id: &str,
