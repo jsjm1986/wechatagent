@@ -223,7 +223,7 @@ export function ConfigureView(props: CockpitPanelProps) {
             </select>
             <button className="secondary" onClick={onSaveRelationshipType} disabled={busy} type="button">
               <SquarePen size={16} />
-              保存客户类型
+              保存运营画像（含承诺 / 跟进策略）
             </button>
           </label>
           <label>
