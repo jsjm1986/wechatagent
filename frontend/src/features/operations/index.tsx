@@ -362,7 +362,7 @@ export default function OperationsFeature() {
               <thead>
                 <tr>
                   <th>状态</th>
-                  <th>Run ID</th>
+                  <th>运行 ID</th>
                   <th>触发</th>
                   <th>档位遥测</th>
                   <th>时间</th>

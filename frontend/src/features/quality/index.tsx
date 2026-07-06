@@ -130,7 +130,7 @@ export function OutcomeMetricsTab({ accountId }: { accountId?: string }) {
               <th>对话深度</th>
               <th>AI暂缓澄清率</th>
               <th>AI 拦截率</th>
-              <th>当日 run 数</th>
+              <th>当日运行数</th>
               <th>当日 token</th>
             </tr>
           </thead>

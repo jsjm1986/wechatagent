@@ -142,7 +142,7 @@ export function EvaluationScenariosPanel() {
       {err && <div className={styles.error}>{err}</div>}
 
       {items.length === 0 && !loading ? (
-        <p className={styles.hint}>还没有评测场景。新建一个 active 场景后，公式遵守度评测才有基准可跑。</p>
+        <p className={styles.hint}>还没有评测场景。新建一个启用中的场景后，公式遵守度评测才有基准可跑。</p>
       ) : (
         <table className={styles.table}>
           <thead>
