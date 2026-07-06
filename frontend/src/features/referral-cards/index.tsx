@@ -47,7 +47,7 @@ export default function ReferralCardsFeature() {
       </p>
       <p className={styles.notice}>
         辅助模式为账号级开关（默认关闭）。本页仅维护名片库本身；要让 AI 真正引荐，还需到「用户运营 → 运营域配置」把
-        user_operations 域的「辅助模式」开关打开（对应 assist_mode_enabled 字段）。
+        用户运营域的「辅助模式」开关打开。
       </p>
 
       <div className={styles.workbench}>
@@ -102,7 +102,7 @@ export default function ReferralCardsFeature() {
               />
             </label>
             <label className={styles.field}>
-              <span className={styles.fieldLabel}>顾问微信号（targetWxid）</span>
+              <span className={styles.fieldLabel}>顾问微信号</span>
               <input
                 className={styles.input}
                 placeholder="用于发送名片的微信 wxid"

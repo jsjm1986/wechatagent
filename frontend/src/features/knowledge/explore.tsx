@@ -447,7 +447,7 @@ export function KnowledgeTreeView() {
           {loading ? "加载中…" : "刷新"}
         </button>
         <span className="wikiHint">
-          只读视图。verify / reject 请去"待评审"，编辑请去"编辑历史"。
+          只读视图。确认 / 退回请去"待评审"，查看改动请去"修订历史"。
         </span>
       </div>
       {error ? <div className="wikiAlert error">{error}</div> : null}

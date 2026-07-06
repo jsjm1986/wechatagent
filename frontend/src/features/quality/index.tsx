@@ -113,7 +113,7 @@ export function OutcomeMetricsTab({ accountId }: { accountId?: string }) {
           {loading ? "加载中" : "刷新"}
         </button>
         <small className={styles.toolbarHint}>
-          指标说明：null（"—"）= 该窗口内无样本；不要把它当 0 解读。
+          指标说明：显示"—"表示该窗口内无样本；不要把它当 0 解读。
         </small>
       </div>
       {err && <div className={styles.error}>{err}</div>}
@@ -129,7 +129,7 @@ export function OutcomeMetricsTab({ accountId }: { accountId?: string }) {
               <th>回复率</th>
               <th>对话深度</th>
               <th>AI暂缓澄清率</th>
-              <th>Agent 拦截率</th>
+              <th>AI 拦截率</th>
               <th>当日 run 数</th>
               <th>当日 token</th>
             </tr>
@@ -184,10 +184,9 @@ export function AutoVerifyTab({ accountId }: { accountId?: string }) {
   return (
     <div className={styles.tabPanel}>
       <p className={styles.desc}>
-        对 <strong>needs_review</strong> 状态的知识切片做 LLM 自动校验。verified 必须满足：
-        切片自带 <code>source_quote</code> 非空 + <code>source_anchors</code> 可定位 +
-        模型 <code>integrityStatus="verified"</code> + 置信分 ≥ 阈值。否则降级为 needs_review/rejected。
-        随机 <code>sampleRate</code> 比例的 verified 切片改成 needs_human_audit 走运营抽查。
+        对<strong>待确认</strong>状态的知识条目做 AI 预审分诊：满足「自带原文引用 + 原文出处可定位 +
+        模型自评通过 + 置信分 ≥ 阈值」的条目会被挑出、转为<strong>待人工抽查</strong>，其余降级为待确认或退回。
+        为守住「AI 永不自动放行」红线，预审<strong>绝不</strong>把任何知识直接标记为已确认，最终是否采纳一律由运营核验。
       </p>
       <div className={styles.toolbar}>
         <label className={styles.label}>
@@ -236,10 +235,9 @@ export function AutoVerifyTab({ accountId }: { accountId?: string }) {
             {result.degraded && <span className={styles.badgeDegraded}>预算超额降级</span>}
           </h3>
           <ul>
-            <li>已通过：{result.verified}</li>
-            <li>待复核：{result.needsReview}</li>
-            <li>已拒绝：{result.rejected}</li>
             <li>待人工抽查：{result.needsHumanAudit}</li>
+            <li>仍待确认：{result.needsReview}</li>
+            <li>已退回：{result.rejected}</li>
           </ul>
           {result.budget && <pre>{JSON.stringify(result.budget, null, 2)}</pre>}
         </div>

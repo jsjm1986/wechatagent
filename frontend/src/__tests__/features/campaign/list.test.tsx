@@ -23,14 +23,14 @@ describe("CampaignList 列表", () => {
     expect(screen.getByText("还没有活动")).toBeInTheDocument();
   });
 
-  it("有 campaigns 渲行数 = 长度 + 列头含「已扇出」文案", () => {
+  it("有 campaigns 渲行数 = 长度 + 列头含「已下发」文案", () => {
     mockStore({ campaigns: [
       { campaignId: "c1", title: "活动一", status: "completed", targetCount: 100, dispatchedCount: 90, createdBy: "admin", createdAt: "2026-06-28T10:00:00Z" },
       { campaignId: "c2", title: "活动二", status: "draft", dispatchedCount: 0, createdBy: "admin", createdAt: "2026-06-28T11:00:00Z" },
     ] });
     render(<CampaignList />);
     expect(screen.getAllByTestId("campaign-row")).toHaveLength(2);
-    expect(screen.getByText("已扇出")).toBeInTheDocument();   // A: 文案区分
+    expect(screen.getByText("已下发")).toBeInTheDocument();   // A: 文案区分
     expect(screen.getByText("活动一")).toBeInTheDocument();
     // draft 无 targetCount → 渲 —
     expect(screen.getByText("—")).toBeInTheDocument();

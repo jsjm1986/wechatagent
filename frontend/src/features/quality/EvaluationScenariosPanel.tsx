@@ -87,9 +87,8 @@ export function EvaluationScenariosPanel() {
   return (
     <div className={styles.panel}>
       <p className={styles.desc}>
-        管理 formula-adherence 评测所依赖的 <code>evaluation_scenarios</code>。只有 <code>active</code>{" "}
-        的场景会被「公式遵守度」评测跑到。每个场景包含输入消息序列与 ground truth；这里维护基础字段，
-        更细的 <code>contactSeed</code> / <code>groundTruth</code> 仍可由后端补全。
+        管理「公式遵守度」评测所依赖的评测场景。只有<strong>启用中</strong>的场景会被评测跑到。
+        每个场景包含输入消息序列与标准答案；这里维护基础字段，更细的初始联系人 / 标准答案仍可由后端补全。
       </p>
 
       <form

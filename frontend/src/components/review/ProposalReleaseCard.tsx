@@ -94,7 +94,7 @@ export function ProposalReleaseCard({
   return (
     <aside className={styles.detail} data-testid="proposal-detail">
       <header className={styles.detailHead}>
-        <h3>{proposal.kind === "threshold" ? "阈值候选" : "Prompt 候选"} 详情</h3>
+        <h3>{proposal.kind === "threshold" ? "阈值候选" : "提示词候选"} 详情</h3>
         <button className={styles.btnQuiet} onClick={onClose}>关闭</button>
       </header>
 
@@ -456,7 +456,7 @@ function MetadataSection({
       )}
       {prevVersion && (
         <div className={styles.metaBlock} data-testid="proposal-prev-version">
-          <h4>上一版 Prompt 版本</h4>
+          <h4>上一版提示词版本</h4>
           <p>{prevVersion}</p>
         </div>
       )}

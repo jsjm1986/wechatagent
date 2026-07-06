@@ -99,7 +99,7 @@ describe("AutonomyFeature — 一体化频道（新视觉壳）", () => {
     render(<AutonomyFeature />);
 
     // 面板级小标题（Shell 拥有大页头 eyebrow/title/subtitle）
-    expect(screen.getByText("修订 · AI 暂缓 · 发送链路 · Planner")).toBeInTheDocument();
+    expect(screen.getByText("修订 · AI 暂缓 · 发送链路 · 自主调度")).toBeInTheDocument();
 
     await waitFor(() => {
       expect(screen.getByText("40.0%")).toBeInTheDocument();

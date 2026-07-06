@@ -175,7 +175,7 @@ function AskHumanView() {
           )}
           {errors.length > 0 && (
             <div className="askHumanSourceErrors">
-              {errors.length} 个来源暂时不可用：{errors.map((e) => e.source).join("、")}
+              {errors.length} 个来源暂时不可用：{errors.map((e) => SOURCE_META.find((m) => m.source === e.source)?.label ?? e.source).join("、")}
             </div>
           )}
 
