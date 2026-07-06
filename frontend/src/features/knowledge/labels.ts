@@ -314,3 +314,79 @@ export function chunkFieldLabel(v?: string | null): string {
   if (!v) return "—";
   return CHUNK_FIELD_LABELS[v] ?? v;
 }
+
+// ── 诊断仪表专用字典（PhaseRollup / WorkerHealth）──────────────────────────
+// 全部取值经后端聚合写入点逐点亲验枚举；均带原值兜底，闭集外新值回落原样不崩。
+
+/// run 终态(agent_run_logs.lifecycle,run_envelope.rs 7 值闭集)
+export const RUN_LIFECYCLE_LABELS: Record<string, string> = {
+  started: "已启动",
+  running: "运行中",
+  completed: "已完成",
+  failed_before_decision: "决策前失败",
+  failed_after_decision: "决策后失败",
+  aborted_by_budget: "预算耗尽中止",
+  aborted_by_external_signal: "外部信号中止",
+};
+export function runLifecycleLabel(v?: string | null): string {
+  if (!v) return "—";
+  return RUN_LIFECYCLE_LABELS[v] ?? v;
+}
+
+/// 单轮改写原因(agent_run_logs.revision_reason,gateway/gates 写入点枚举;
+/// revision_llm_error:<err> 为动态前缀,按前缀归一)
+export const REVISION_REASON_LABELS: Record<string, string> = {
+  revision_applied_approved: "改写后二审通过",
+  revisionDirection_empty: "改写方向为空跳过",
+  budget_exceeded_before_revision: "改写前预算超额跳过",
+  revision_post_review_failed: "改写后二审未过",
+  revision_llm_timeout_30s: "改写模型 30 秒超时",
+};
+export function revisionReasonLabel(v?: string | null): string {
+  if (!v) return "—";
+  if (v.startsWith("revision_llm_error")) return "改写模型报错";
+  return REVISION_REASON_LABELS[v] ?? v;
+}
+
+/// 审核员误判信号(agent_decision_reviews.reviewer_misjudge_signal,单值闭集)
+export const REVIEWER_MISJUDGE_KIND_LABELS: Record<string, string> = {
+  approved_but_user_negative: "放行后客户负反馈",
+};
+export function reviewerMisjudgeKindLabel(v?: string | null): string {
+  if (!v) return "—";
+  return REVIEWER_MISJUDGE_KIND_LABELS[v] ?? v;
+}
+
+/// 知识缺口信号状态(knowledge_gap_signals.status,observability.rs 5 值闭集)
+export const GAP_SIGNAL_STATUS_LABELS: Record<string, string> = {
+  pending: "待处理",
+  auto_resolved: "规则自动消解",
+  llm_resolved: "模型判定消解",
+  applied: "已处理",
+  dismissed: "已忽略",
+};
+export function gapSignalStatusLabel(v?: string | null): string {
+  if (!v) return "—";
+  return GAP_SIGNAL_STATUS_LABELS[v] ?? v;
+}
+
+/// 经验沉淀模式(lessons_learned.pattern_kind,3 值闭集)
+export const LESSON_PATTERN_LABELS: Record<string, string> = {
+  success: "成功案例",
+  reviewer_misjudge_negative: "审核员误判负反馈",
+  blocked_by_safety_guard: "安全门拦截",
+};
+export function lessonPatternLabel(v?: string | null): string {
+  if (!v) return "—";
+  return LESSON_PATTERN_LABELS[v] ?? v;
+}
+
+/// 知识对话任务失败错误类型(knowledge 任务/日报 error_kind,自由字符串,已知值兜底)
+export const CHAT_ERROR_KIND_LABELS: Record<string, string> = {
+  budget_exceeded: "预算耗尽",
+  internal: "内部错误",
+};
+export function chatErrorKindLabel(v?: string | null): string {
+  if (!v) return "—";
+  return CHAT_ERROR_KIND_LABELS[v] ?? v;
+}

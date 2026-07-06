@@ -18,7 +18,7 @@ import { ReviewChat, type ReviewChatChunk } from "./cockpit/ReviewChat";
 import { useConfirm } from "../../components/ui/ConfirmDialog";
 import { ChunkPicker } from "../../components/ui/ChunkRef";
 import { EmptyState } from "../../components/ui/EmptyState";
-import { sourceTypeLabel, statusLabel, integrityStatusLabel, wikiTypeLabel, sourceKindLabel, ingestStatusLabel, riskLevelLabel, revisionOpLabel, revisionSourceLabel } from "./labels";
+import { sourceTypeLabel, statusLabel, integrityStatusLabel, wikiTypeLabel, sourceKindLabel, ingestStatusLabel, riskLevelLabel, revisionOpLabel, revisionSourceLabel, runLifecycleLabel, revisionReasonLabel, reviewerMisjudgeKindLabel, gapSignalStatusLabel, lessonPatternLabel, chatErrorKindLabel, taskStatusLabel } from "./labels";
 import { GAP_SIGNAL_KIND_LABELS, GAP_SIGNAL_SEVERITY_LABELS, labelOf } from "../../lib/reviewLabels";
 import { DocumentRepairPanel } from "./DocumentRepairPanel";
 
@@ -2152,7 +2152,7 @@ export function ObservabilityDashboard() {
           {completeness ? (
             <dl className="wikiArchiveMeta">
               <dt>应答模式</dt>
-              <dd>{completeness.answeringMode}</dd>
+              <dd>{completeness.answeringModeLabels[completeness.answeringMode] ?? completeness.answeringMode}</dd>
               <dt>已验证</dt>
               <dd>
                 {completeness.verifiedChunks}/{completeness.totalChunks}
@@ -2176,13 +2176,13 @@ export function ObservabilityDashboard() {
             <h4>完整性诊断</h4>
           </header>
           <dl className="wikiArchiveMeta">
-            <dt>needs_review</dt>
+            <dt>待确认</dt>
             <dd>{integrity?.needsReview ?? 0}</dd>
-            <dt>verified</dt>
+            <dt>已确认</dt>
             <dd>{integrity?.verified ?? 0}</dd>
-            <dt>rejected</dt>
+            <dt>已退回</dt>
             <dd>{integrity?.rejected ?? 0}</dd>
-            <dt>total</dt>
+            <dt>合计</dt>
             <dd>{integrity?.total ?? 0}</dd>
           </dl>
         </article>
@@ -2335,7 +2335,7 @@ function PhaseRollupPanel({
         <article className="wikiObservabilityCard">
           <header className="wikiObservabilityCardHead">
             <span className="wikiArchiveTag">lifecycle</span>
-            <h4>run lifecycle 终态</h4>
+            <h4>运行终态</h4>
           </header>
           {lifecycleTotal === 0 ? (
             <div className="wikiEmpty">该时段无运行记录</div>
@@ -2344,9 +2344,9 @@ function PhaseRollupPanel({
               {lifecycle.map((row, i) => (
                 <Fragment key={i}>
                   <dt>
-                    {row.lifecycle}
+                    {runLifecycleLabel(row.lifecycle)}
                     {row.outOfClosedSet ? (
-                      <span className="wikiObservabilityDrift"> · out-of-closed-set</span>
+                      <span className="wikiObservabilityDrift"> · 超出合法集</span>
                     ) : null}
                   </dt>
                   <dd>{row.count}</dd>
@@ -2359,7 +2359,7 @@ function PhaseRollupPanel({
         <article className="wikiObservabilityCard">
           <header className="wikiObservabilityCardHead">
             <span className="wikiArchiveTag">revision</span>
-            <h4>single-shot revision top</h4>
+            <h4>单轮改写高频原因</h4>
           </header>
           {revisionReasons.length === 0 ? (
             <div className="wikiEmpty">该时段无改动记录</div>
@@ -2367,7 +2367,7 @@ function PhaseRollupPanel({
             <dl className="wikiArchiveMeta">
               {revisionReasons.map((row, i) => (
                 <Fragment key={i}>
-                  <dt>{row.reason}</dt>
+                  <dt>{revisionReasonLabel(row.reason)}</dt>
                   <dd>{row.count}</dd>
                 </Fragment>
               ))}
@@ -2378,7 +2378,7 @@ function PhaseRollupPanel({
         <article className="wikiObservabilityCard">
           <header className="wikiObservabilityCardHead">
             <span className="wikiArchiveTag">reviewer</span>
-            <h4>reviewer 误判信号</h4>
+            <h4>审核员误判信号</h4>
           </header>
           {reviewerMisjudge.length === 0 ? (
             <div className="wikiEmpty">该时段无误判信号</div>
@@ -2386,7 +2386,7 @@ function PhaseRollupPanel({
             <dl className="wikiArchiveMeta">
               {reviewerMisjudge.map((row, i) => (
                 <Fragment key={i}>
-                  <dt>{row.kind}</dt>
+                  <dt>{reviewerMisjudgeKindLabel(row.kind)}</dt>
                   <dd>{row.count}</dd>
                 </Fragment>
               ))}
@@ -2397,7 +2397,7 @@ function PhaseRollupPanel({
         <article className="wikiObservabilityCard">
           <header className="wikiObservabilityCardHead">
             <span className="wikiArchiveTag">negative-example</span>
-            <h4>负例候选 needs_review</h4>
+            <h4>负例候选（待确认）</h4>
           </header>
           <dl className="wikiArchiveMeta">
             <dt>待审核</dt>
@@ -2414,7 +2414,7 @@ function PhaseRollupPanel({
         <article className="wikiObservabilityCard">
           <header className="wikiObservabilityCardHead">
             <span className="wikiArchiveTag">reviewer-stats</span>
-            <h4>reviewer 双脑表现</h4>
+            <h4>审核员双脑表现</h4>
           </header>
           {reviewerStatsHasData ? (
             <dl className="wikiArchiveMeta">
@@ -2444,7 +2444,7 @@ function PhaseRollupPanel({
               <dd>{reviewerStats?.windowDays ?? 0}d</dd>
             </dl>
           ) : (
-            <div className="wikiEmpty">暂无 reviewer 统计</div>
+            <div className="wikiEmpty">暂无审核员统计</div>
           )}
         </article>
 
@@ -2545,13 +2545,13 @@ function WorkerHealthPanel({
     <section className="wikiObservabilityPhaseRollup">
       <header className="wikiObservabilityCardHead">
         <span className="wikiArchiveTag">worker-health</span>
-        <h4>worker 健康聚合</h4>
+        <h4>后台任务健康聚合</h4>
       </header>
       <div className="wikiObservabilityGrid">
         <article className="wikiObservabilityCard">
           <header className="wikiObservabilityCardHead">
             <span className="wikiArchiveTag">chat-tasks</span>
-            <h4>chat task 状态</h4>
+            <h4>对话任务状态</h4>
           </header>
           {chatTotal === 0 ? (
             <div className="wikiEmpty">无任务</div>
@@ -2560,9 +2560,9 @@ function WorkerHealthPanel({
               {chatStatuses.map((row, i) => (
                 <Fragment key={i}>
                   <dt>
-                    {row.status}
+                    {taskStatusLabel(row.status)}
                     {row.outOfClosedSet ? (
-                      <span className="wikiObservabilityDrift"> · out-of-closed-set</span>
+                      <span className="wikiObservabilityDrift"> · 超出合法集</span>
                     ) : null}
                   </dt>
                   <dd
@@ -2580,11 +2580,11 @@ function WorkerHealthPanel({
           )}
           {chatErrors.length > 0 ? (
             <div className="wikiArchiveCitation">
-              <strong>error_kind top</strong>
+              <strong>高频错误类型</strong>
               <ul style={{ margin: 0, paddingLeft: "1.2em" }}>
                 {chatErrors.map((row, i) => (
                   <li key={i}>
-                    <span className="wikiArchiveTag">{row.errorKind}</span> {row.count}
+                    <span className="wikiArchiveTag">{chatErrorKindLabel(row.errorKind)}</span> {row.count}
                   </li>
                 ))}
               </ul>
@@ -2595,16 +2595,16 @@ function WorkerHealthPanel({
         <article className="wikiObservabilityCard">
           <header className="wikiObservabilityCardHead">
             <span className="wikiArchiveTag">gap-signals</span>
-            <h4>gap signals · sweep 命中率</h4>
+            <h4>知识缺口 · 扫描命中率</h4>
           </header>
           <dl className="wikiArchiveMeta">
             <dt>总计</dt>
             <dd>{gapTotal}</dd>
-            <dt>pending</dt>
+            <dt>待处理</dt>
             <dd className={gapPending > 0 ? "wikiObservabilityDrift" : undefined}>
               {gapPending}
             </dd>
-            <dt>resolved</dt>
+            <dt>已处理</dt>
             <dd>{gapResolved}</dd>
             <dt>命中率</dt>
             <dd className={gapHitRate >= 0.5 ? "wikiObservabilityDrift" : undefined}>
@@ -2613,11 +2613,11 @@ function WorkerHealthPanel({
           </dl>
           {gapKinds.length > 0 ? (
             <div className="wikiArchiveCitation">
-              <strong>pending kind top</strong>
+              <strong>待处理类型高频</strong>
               <ul style={{ margin: 0, paddingLeft: "1.2em" }}>
                 {gapKinds.map((row, i) => (
                   <li key={i}>
-                    <span className="wikiArchiveTag">{row.kind}</span> {row.count}
+                    <span className="wikiArchiveTag">{labelOf(GAP_SIGNAL_KIND_LABELS, row.kind)}</span> {row.count}
                   </li>
                 ))}
               </ul>
@@ -2630,9 +2630,9 @@ function WorkerHealthPanel({
                 {gapStatuses.map((row, i) => (
                   <Fragment key={i}>
                     <dt>
-                      {row.status}
+                      {gapSignalStatusLabel(row.status)}
                       {row.outOfClosedSet ? (
-                        <span className="wikiObservabilityDrift"> · out-of-closed-set</span>
+                        <span className="wikiObservabilityDrift"> · 超出合法集</span>
                       ) : null}
                     </dt>
                     <dd>{row.count}</dd>
@@ -2646,7 +2646,7 @@ function WorkerHealthPanel({
         <article className="wikiObservabilityCard">
           <header className="wikiObservabilityCardHead">
             <span className="wikiArchiveTag">lessons-learned</span>
-            <h4>lessons_learned ({lessonsWindow}d)</h4>
+            <h4>经验沉淀（{lessonsWindow}天）</h4>
           </header>
           {lessonsPatterns.length === 0 ? (
             <div className="wikiEmpty">该时段无产出</div>
@@ -2655,9 +2655,9 @@ function WorkerHealthPanel({
               {lessonsPatterns.map((row, i) => (
                 <Fragment key={i}>
                   <dt>
-                    {row.pattern}
+                    {lessonPatternLabel(row.pattern)}
                     {row.outOfClosedSet ? (
-                      <span className="wikiObservabilityDrift"> · out-of-closed-set</span>
+                      <span className="wikiObservabilityDrift"> · 超出合法集</span>
                     ) : null}
                   </dt>
                   <dd
@@ -2671,7 +2671,7 @@ function WorkerHealthPanel({
                   </dd>
                 </Fragment>
               ))}
-              <dt>blocked_total</dt>
+              <dt>拦截合计</dt>
               <dd className={lessonsBlocked > 0 ? "wikiObservabilityDrift" : undefined}>
                 {lessonsBlocked}
               </dd>
