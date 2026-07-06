@@ -291,3 +291,26 @@ export function operatorMemoryKindLabel(v?: string | null): string {
   if (!v) return "—";
   return OPERATOR_MEMORY_KIND_LABELS[v] ?? v;
 }
+
+/// chunk 字段名 → 大白话中文名(AI 修复面板/字段锁展示用)。键形态可能 camelCase
+/// 或 snake_case(来自 LLM 工具产物),两种都归一;措辞与 ReviewChat 的
+/// PATCH_FIELD_LABELS/LOCKED_FIELD_LABELS 同源。未知字段回落原名,不吞。
+export const CHUNK_FIELD_LABELS: Record<string, string> = {
+  title: "标题",
+  summary: "摘要",
+  body: "正文",
+  tags: "标签",
+  priority: "优先级",
+  sourceQuote: "原话出处",
+  source_quote: "原话出处",
+  sourceAnchors: "来源锚点",
+  source_anchors: "来源锚点",
+  knowledgeType: "知识类型",
+  knowledge_type: "知识类型",
+  chunkType: "知识类型",
+  chunk_type: "知识类型",
+};
+export function chunkFieldLabel(v?: string | null): string {
+  if (!v) return "—";
+  return CHUNK_FIELD_LABELS[v] ?? v;
+}

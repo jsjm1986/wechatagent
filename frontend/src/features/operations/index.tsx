@@ -5,7 +5,7 @@ import { StatusBadge, type StatusTone } from "../../components/ui/StatusBadge";
 import { useOperationsStore } from "../../stores/operationsStore";
 import { useAccountStore } from "../../stores/accountStore";
 import { api } from "../../lib/api";
-import { FINAL_REVIEW_STATUS_LABELS, GATEWAY_STATUS_LABELS, HOLD_CATEGORY_LABELS, NEXT_BEST_ACTION_TYPE_LABELS, REVIEW_SCORE_LABELS, labelOf } from "../../lib/reviewLabels";
+import { FINAL_REVIEW_STATUS_LABELS, GATEWAY_STATUS_LABELS, HOLD_CATEGORY_LABELS, NEXT_BEST_ACTION_TYPE_LABELS, REVIEW_SCORE_LABELS, EVENT_KIND_LABELS, EVENT_STATUS_LABELS, labelOf } from "../../lib/reviewLabels";
 import type { DecisionReview, AgentRunItem } from "../../types";
 import styles from "./Operations.module.css";
 
@@ -298,7 +298,7 @@ export default function OperationsFeature() {
                     <span className={styles.tDot} />
                     <div className={styles.tCard}>
                       <div className={styles.tHead}>
-                        <strong>{event.kind}</strong>
+                        <strong>{labelOf(EVENT_KIND_LABELS, event.kind)}</strong>
                         <span>{formatTime(event.createdAt)}</span>
                       </div>
                       {event.summary && <p>{event.summary}</p>}
@@ -310,7 +310,7 @@ export default function OperationsFeature() {
                       )}
                       {event.status && (
                         <div className={styles.tChips}>
-                          <span>{event.status}</span>
+                          <span>{labelOf(EVENT_STATUS_LABELS, event.status)}</span>
                         </div>
                       )}
                     </div>
