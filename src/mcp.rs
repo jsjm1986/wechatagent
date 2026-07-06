@@ -30,10 +30,12 @@ pub struct McpClient {
     api_key: String,
     client: reqwest::Client,
     /// MCP Streamable-HTTP 会话缓存，键 = `base_url|api_key`（同一进程可对多个
-    /// server / 多把 key 调用，会话按 pair 隔离），值 = server 在 `initialize`
-    /// 时下发的 `mcp-session-id`。`gewe-multi-tenant` server 要求所有非 initialize
-    /// 请求携带该头，缺失/失效（HTTP 404 `Unknown MCP session`）时本模块丢缓存重连一次。
-    sessions: std::sync::Arc<dashmap::DashMap<String, String>>,
+    /// server / 多把 key 调用，会话按 pair 隔离）。值 = `initialize` 结果：
+    /// `Some(id)` = 有状态 server 下发的 `mcp-session-id`（后续请求须带该头，
+    /// `gewe-multi-tenant` 即此类，失效返 HTTP 404 `Unknown MCP session` → 丢缓存重连一次）；
+    /// `None` = server 无状态（initialize 未回 session 头，如无状态 mock）→ 后续请求不带 session 头。
+    /// MCP 规范里 `mcp-session-id` 是可选的，两类 server 都要兼容。
+    sessions: std::sync::Arc<dashmap::DashMap<String, Option<String>>>,
 }
 
 impl McpClient {
@@ -49,7 +51,7 @@ impl McpClient {
     }
 
     pub async fn call_tool<A: Serialize>(&self, tool_name: &str, arguments: A) -> AppResult<Value> {
-        self.call_tool_with_key(&self.base_url, &self.api_key, tool_name, arguments)
+        self.call_tool_with_key(&self.base_url, &self.api_key, tool_name, arguments, None)
             .await
     }
 
@@ -60,7 +62,7 @@ impl McpClient {
     }
 
     /// 取本 (base_url, api_key) 的缓存会话，缺失则跑一次 `initialize` 握手拿到并缓存。
-    async fn ensure_session(&self, base_url: &str, api_key: &str) -> AppResult<String> {
+    async fn ensure_session(&self, base_url: &str, api_key: &str) -> AppResult<Option<String>> {
         let cache_key = Self::session_cache_key(base_url, api_key);
         if let Some(existing) = self.sessions.get(&cache_key) {
             return Ok(existing.clone());
@@ -70,8 +72,9 @@ impl McpClient {
         Ok(session_id)
     }
 
-    /// 跑 MCP `initialize` 握手，返回 server 下发的 `mcp-session-id`。
-    async fn initialize_session(&self, base_url: &str, api_key: &str) -> AppResult<String> {
+    /// 跑 MCP `initialize` 握手，返回 server 下发的 `mcp-session-id`（有状态 server）
+    /// 或 `None`（无状态 server）。
+    async fn initialize_session(&self, base_url: &str, api_key: &str) -> AppResult<Option<String>> {
         let request = json!({
             "jsonrpc": "2.0",
             "id": uuid::Uuid::new_v4().to_string(),
@@ -108,8 +111,8 @@ impl McpClient {
         if let Some(error) = parse_mcp_response_body(&body)?.get("error") {
             return Err(AppError::External(format!("MCP initialize failed: {error}")));
         }
-        session_id
-            .ok_or_else(|| AppError::External("MCP initialize 未返回 mcp-session-id 头".to_string()))
+        // 有状态 server 返回 session-id；无状态 server 可不返回（兼容两类）。
+        Ok(session_id)
     }
 
     /// 发一条 JSON-RPC 请求（带会话头），返回解析后的 JSON-RPC 消息体。
@@ -118,16 +121,17 @@ impl McpClient {
         let mut reinitialized = false;
         loop {
             let session_id = self.ensure_session(base_url, api_key).await?;
-            let response = self
+            let mut req = self
                 .client
                 .post(format!("{}/mcp", base_url.trim_end_matches('/')))
                 .header(AUTHORIZATION, format!("Bearer {}", api_key))
                 .header(CONTENT_TYPE, "application/json")
-                .header(ACCEPT, "application/json, text/event-stream")
-                .header("mcp-session-id", &session_id)
-                .json(request)
-                .send()
-                .await?;
+                .header(ACCEPT, "application/json, text/event-stream");
+            // 有状态 server 带 mcp-session-id 头；无状态 server（session_id=None）不带。
+            if let Some(ref sid) = session_id {
+                req = req.header("mcp-session-id", sid);
+            }
+            let response = req.json(request).send().await?;
             let status = response.status();
             let body = response.text().await?;
             // 会话失效：丢缓存重握手一次（server 重启常见），仍失败则如实报错。
@@ -153,14 +157,23 @@ impl McpClient {
         api_key: &str,
         tool_name: &str,
         arguments: A,
+        account_alias: Option<&str>,
     ) -> AppResult<Value> {
+        // Workspace Key 下调用账号类工具需传 account_alias；Account Key 下可省略。
+        // 自动注入 account_alias（如果提供且 arguments 是对象且未包含该键）。
+        let mut arguments_value = serde_json::to_value(arguments)?;
+        if let (Some(alias), Some(obj)) = (account_alias, arguments_value.as_object_mut()) {
+            if !obj.contains_key("account_alias") {
+                obj.insert("account_alias".to_string(), json!(alias));
+            }
+        }
         let request = json!({
             "jsonrpc": "2.0",
             "id": uuid::Uuid::new_v4().to_string(),
             "method": "tools/call",
             "params": {
                 "name": tool_name,
-                "arguments": arguments
+                "arguments": arguments_value
             }
         });
         let body = self.post_rpc(base_url, api_key, &request).await?;
@@ -192,12 +205,22 @@ impl McpClient {
             .unwrap_or(Value::Null))
     }
 
-    pub async fn list_tools_with_key(&self, base_url: &str, api_key: &str) -> AppResult<Value> {
+    pub async fn list_tools_with_key(
+        &self,
+        base_url: &str,
+        api_key: &str,
+        account_alias: Option<&str>,
+    ) -> AppResult<Value> {
+        // tools/list 是系统工具，通常不需要 account_alias，但为统一接口仍支持注入。
+        let mut params = json!({});
+        if let (Some(alias), Some(obj)) = (account_alias, params.as_object_mut()) {
+            obj.insert("account_alias".to_string(), json!(alias));
+        }
         let request = json!({
             "jsonrpc": "2.0",
             "id": uuid::Uuid::new_v4().to_string(),
             "method": "tools/list",
-            "params": {}
+            "params": params
         });
         let body = self.post_rpc(base_url, api_key, &request).await?;
         if let Some(error) = body.get("error") {
@@ -309,6 +332,7 @@ pub async fn logged_call_for_account<A: Serialize>(
             &credentials.api_key,
             tool_name,
             arguments_value,
+            credentials.account_alias.as_deref(),
         )
         .await;
     let (response, error) = match &result {
@@ -339,13 +363,21 @@ pub async fn list_tools_for_account(state: &AppState, account_id: &str) -> AppRe
     let credentials = credentials_for_account(state, account_id).await?;
     state
         .mcp
-        .list_tools_with_key(&credentials.base_url, &credentials.api_key)
+        .list_tools_with_key(
+            &credentials.base_url,
+            &credentials.api_key,
+            credentials.account_alias.as_deref(),
+        )
         .await
 }
 
 struct McpCredentials {
     base_url: String,
     api_key: String,
+    /// MCP server 的账号别名（Workspace Key 下调用账号类工具时必须传此参数，
+    /// Account Key 下可省略）。来自 `wechat_accounts.alias`，对应 MCP server
+    /// `auth_whoami` 响应的 `accounts[].alias`（如 "t-1"）。
+    account_alias: Option<String>,
 }
 
 async fn credentials_for_account(state: &AppState, account_id: &str) -> AppResult<McpCredentials> {
@@ -365,9 +397,15 @@ async fn credentials_for_account(state: &AppState, account_id: &str) -> AppResul
         .and_then(|item| item.mcp_base_url.clone())
         .unwrap_or_else(|| state.config.mcp_base_url.clone());
     let api_key = account
-        .and_then(|item| item.mcp_api_key)
+        .as_ref()
+        .and_then(|item| item.mcp_api_key.clone())
         .unwrap_or_else(|| state.config.mcp_api_key.clone());
-    Ok(McpCredentials { base_url, api_key })
+    let account_alias = account.as_ref().map(|item| item.alias.clone());
+    Ok(McpCredentials {
+        base_url,
+        api_key,
+        account_alias,
+    })
 }
 
 #[cfg(test)]
