@@ -1,5 +1,6 @@
 import { useState } from "react";
 import type { ChunkRepairProposal } from "./trustTypes";
+import { chunkFieldLabel } from "./labels";
 import { applyAiRepairPatch } from "../../lib/applyAiRepairPatch";
 
 type RepairStatus = "idle" | "proposing" | "reviewing" | "answering" | "applying" | "done" | "error";
@@ -128,14 +129,14 @@ export function ChunkRepairPanel({
         {patchEntries.map(([field, value]) => (
           <label key={field} className="wikiRepairField">
             <input type="checkbox" checked={accepted.has(field)} onChange={() => toggleField(field)} />
-            <span className="wikiRepairFieldName">{field}</span>
+            <span className="wikiRepairFieldName">{chunkFieldLabel(field)}</span>
             <span className="wikiRepairFieldValue">{typeof value === "string" ? value : JSON.stringify(value)}</span>
           </label>
         ))}
       </div>
       {proposal && proposal.missingFields.length > 0 ? (
         <div className="wikiRepairMissing">
-          仍缺：{proposal.missingFields.map((m) => m.field).join("、")}
+          仍缺：{proposal.missingFields.map((m) => chunkFieldLabel(m.field)).join("、")}
         </div>
       ) : null}
       {proposal && proposal.followupQuestions.length > 0 ? (

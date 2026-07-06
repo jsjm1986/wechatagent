@@ -91,7 +91,7 @@ export default function CampaignBoard() {
       <section className={styles.panel}>
         <div className={styles.head}>
           <div className={styles.headL}>
-            <span className={styles.eyebrow}>Per-Contact</span>
+            <span className={styles.eyebrow}>逐人明细</span>
             <span className={styles.title}>推送明细</span>
           </div>
           <button
