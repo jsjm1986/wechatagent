@@ -897,12 +897,12 @@ function TaxonomiesAdmin({ busy }: { busy: boolean }) {
                 <p>{item.value.id}</p>
               </div>
               <div className={styles.versionedListChunk}>
-                <span>aliases</span>
+                <span>别名</span>
                 <p>{(item.value.aliases ?? []).join("，") || "—"}</p>
               </div>
               {item.value.description && (
                 <div className={styles.versionedListChunk}>
-                  <span>description</span>
+                  <span>描述</span>
                   <p>{item.value.description}</p>
                 </div>
               )}
@@ -1765,7 +1765,7 @@ function ProfileEditor({
               })
             }
           >
-            + 添加 completeness 维度
+            + 添加完整度维度
           </button>
         </div>
       </details>
@@ -2334,7 +2334,7 @@ function DomainProfilePanel({ busy }: { busy: boolean }) {
         <div className={styles.profileGenerateSection}>
           <p className={styles.panelHint}>
             描述你的业务（行业/产品/客户/经营目标/对话风格），AI 将生成一份候选行业配置。
-            候选需要你审核确认后 publish + activate 才会生效。
+            候选需要你审核确认后「发布并激活」才会生效。
           </p>
           <label className={styles.field}>
             <span>Profile ID（英文唯一标识，生成后不可改）</span>
@@ -2367,7 +2367,7 @@ function DomainProfilePanel({ busy }: { busy: boolean }) {
           {generateError && <div className={styles.inlineError}>{generateError}</div>}
           {generateResult && (
             <div className={styles.profileGenerateSuccess}>
-              ✅ 候选配置已生成！可在「已有配置」列表中找到 v1 草稿，逐项审核后 publish + activate。
+              ✅ 候选配置已生成！可在「已有配置」列表中找到 v1 草稿，逐项审核后发布并激活。
               <br />
               如本次为新行业，AI 同时生成了取值字典候选（客户阶段 / 意向等级等维度的中文标签），需在本频道「新词候选审核」面板逐条采纳后，运营看板才会把这些维度显示为中文，否则将灰显英文原值。
             </div>
@@ -2582,7 +2582,7 @@ function LessonsLearnedAdmin({ busy }: { busy: boolean }) {
             </div>
             <div className={styles.versionedListBody}>
               <div className={styles.versionedListChunk}>
-                <span>sample run ids ({item.sampleRunIds.length})</span>
+                <span>样本运行 ID（{item.sampleRunIds.length}）</span>
                 <p>
                   {item.sampleRunIds.length === 0
                     ? "—"
@@ -2594,16 +2594,16 @@ function LessonsLearnedAdmin({ busy }: { busy: boolean }) {
                 </p>
               </div>
               <div className={styles.versionedListChunk}>
-                <span>updated</span>
+                <span>更新时间</span>
                 <p>{item.updatedAt || "—"}</p>
               </div>
               <div className={styles.versionedListChunk}>
-                <span>created</span>
+                <span>创建时间</span>
                 <p>{item.createdAt || "—"}</p>
               </div>
               {item.promotedChunkId && (
                 <div className={styles.versionedListChunk}>
-                  <span>promoted chunk</span>
+                  <span>已晋升切片</span>
                   <p>
                     <code>{item.promotedChunkId}</code>
                   </p>

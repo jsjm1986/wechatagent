@@ -5,7 +5,7 @@ import { StatusBadge, type StatusTone } from "../../components/ui/StatusBadge";
 import { useOperationsStore } from "../../stores/operationsStore";
 import { useAccountStore } from "../../stores/accountStore";
 import { api } from "../../lib/api";
-import { FINAL_REVIEW_STATUS_LABELS, GATEWAY_STATUS_LABELS, HOLD_CATEGORY_LABELS, NEXT_BEST_ACTION_TYPE_LABELS, REVIEW_SCORE_LABELS, labelOf } from "../../lib/reviewLabels";
+import { FINAL_REVIEW_STATUS_LABELS, GATEWAY_STATUS_LABELS, HOLD_CATEGORY_LABELS, NEXT_BEST_ACTION_TYPE_LABELS, REVIEW_SCORE_LABELS, EVENT_KIND_LABELS, EVENT_STATUS_LABELS, labelOf } from "../../lib/reviewLabels";
 import type { DecisionReview, AgentRunItem } from "../../types";
 import styles from "./Operations.module.css";
 
@@ -298,7 +298,7 @@ export default function OperationsFeature() {
                     <span className={styles.tDot} />
                     <div className={styles.tCard}>
                       <div className={styles.tHead}>
-                        <strong>{event.kind}</strong>
+                        <strong>{labelOf(EVENT_KIND_LABELS, event.kind)}</strong>
                         <span>{formatTime(event.createdAt)}</span>
                       </div>
                       {event.summary && <p>{event.summary}</p>}
@@ -310,7 +310,7 @@ export default function OperationsFeature() {
                       )}
                       {event.status && (
                         <div className={styles.tChips}>
-                          <span>{event.status}</span>
+                          <span>{labelOf(EVENT_STATUS_LABELS, event.status)}</span>
                         </div>
                       )}
                     </div>
@@ -324,7 +324,7 @@ export default function OperationsFeature() {
           (loading ? (
             <EmptyState title="加载中…" hint="正在拉取运营数据。" />
           ) : decisionReviews.length === 0 ? (
-            <EmptyState title="暂无 Review 记录" hint="独立复盘 Agent 的结论与评分会在这里留痕。" />
+            <EmptyState title="暂无复核记录" hint="独立复盘 Agent 的结论与评分会在这里留痕。" />
           ) : (
             <table className={styles.table}>
               <thead>
