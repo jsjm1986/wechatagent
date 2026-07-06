@@ -9,6 +9,21 @@ use crate::{
     routes::AppState,
 };
 
+/// reqwest 客户端级硬超时——**每一次** MCP HTTP 调用的上界。
+///
+/// 关键约束（finding ①）：本值必须 **严格小于** dispatcher 对整条 send 的外层
+/// `tokio::time::timeout`（`outbox_dispatcher::MCP_SEND_TIMEOUT_SECONDS`，且后者需
+/// 覆盖单条 send 内最多顺序调用次数 × 本值）。这样「MCP 已送达但回包慢」时是
+/// reqwest 自己超时返回 `Err`、`logged_call_for_account` 随后照常写 mcp_logs，而
+/// **不是**被外层 timeout 取消整个 future——取消会丢掉 mcp_logs 写入，令 post-hoc
+/// 守卫查不到成功记录 → 误重试 → 客户收重复消息。
+///
+/// 取值需 ≥ 真实「已送达但回包慢」的最大延迟：过小会把已送达的发送经 `Ok(Err)`
+/// 分支（无 post-hoc 守卫）当失败重试而重复；60s 匹配 47.108.57.147 + 微信协议
+/// 出栈的真实链路 RTT。无外层 timeout 的直接调用路径（推 principal 卡 / relay
+/// 转述）也以本值为唯一阻塞上界。
+pub(crate) const MCP_CLIENT_TIMEOUT_SECONDS: u64 = 60;
+
 #[derive(Clone)]
 pub struct McpClient {
     base_url: String,
@@ -21,12 +36,8 @@ impl McpClient {
         Ok(Self {
             base_url: base_url.trim_end_matches('/').to_string(),
             api_key,
-            // 客户端级硬超时，防非 dispatcher 路径（推 principal 卡 / relay 转述等
-            // 直接 logged_call_for_account 的调用）在 MCP 挂起时无限阻塞。
-            // 取 60s（> dispatcher 自身的 30s tokio::time::timeout，两者不冲突，
-            // 本超时仅作那些无外层 timeout 路径的兜底上限）。
             client: reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(60))
+                .timeout(std::time::Duration::from_secs(MCP_CLIENT_TIMEOUT_SECONDS))
                 .build()?,
         })
     }
@@ -73,8 +84,24 @@ impl McpClient {
                 "MCP tool {tool_name} failed: {error}"
             )));
         }
-        Ok(body
-            .get("result")
+        let result = body.get("result");
+        // finding ③：MCP 标准用 result.isError=true + HTTP200 表示「工具执行了但失败」
+        // （如联系人拒收）。仅查 HTTP 状态 + 顶层 JSON-RPC error 会把这类失败读成成功，
+        // 令发送链路误判送达。server 不发 isError 时此分支不触发（标准兼容 no-op）。
+        if result
+            .and_then(|r| r.get("isError"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            let detail = result
+                .and_then(|r| r.get("content"))
+                .map(|c| c.to_string())
+                .unwrap_or_default();
+            return Err(AppError::External(format!(
+                "MCP tool {tool_name} returned isError: {detail}"
+            )));
+        }
+        Ok(result
             .and_then(|result| result.get("structuredContent"))
             .cloned()
             .unwrap_or(Value::Null))

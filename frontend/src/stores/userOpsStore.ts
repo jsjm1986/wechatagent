@@ -784,14 +784,17 @@ export const useUserOpsStore = create<UserOpsState & UserOpsActions>((set, get) 
     useUiStore.getState().setError("");
 
     try {
+      const messages = simulationInput
+        .split("\n")
+        .map((line) => line.trim())
+        .filter((line) => line.length > 0);
+
       const data = await api.post<{ items: SimulationTurn[]; runMode: string; applied: boolean }>(
         "/api/user-operations/simulations/dialogue",
         {
           accountId: currentAccountId,
           contactId: selected.id,
-          inboundText: simulationInput,
-          runMode: "once",
-          dryRun: true
+          messages
         }
       );
 

@@ -37,12 +37,28 @@ os.environ.setdefault("DEPLOY_USER", "root")
 # DEPLOY_PASS 必须由调用者 export，不在这里设默认（绝不硬编码凭据）。
 
 
+LOCAL_MODE = os.environ.get("BIZTEST_LOCAL") == "1"
+
+
 def remote_run(cmd: str) -> tuple[int, str]:
     """在 server 执行 ASCII cmd，返回 (exit_code, combined_output)。
 
-    cmd 经 stdin 传给 _remote_run.py（argv[1]=='-'），避开 Windows argv 32KB 上限
-    （大 body base64 后可达数十 KB，走 argv 会 WinError 206）。
+    默认（远程模式）：cmd 经 stdin 传给 _remote_run.py（argv[1]=='-'），走 paramiko
+    SSH，避开 Windows argv 32KB 上限（大 body base64 后可达数十 KB，走 argv 会 WinError 206）。
+
+    BIZTEST_LOCAL=1（本机模式）：整套脚本已 setsid 托管在 server 上直接跑，cmd 直接用
+    本机 bash 执行——免 SSH-to-self、免 fail2ban、免本机会话中断被杀。合并 stdout+stderr
+    与远程 PTY 行为一致（解析方按"最后一个可解析 JSON 行"取值，stderr 噪声不影响）。
     """
+    if LOCAL_MODE:
+        p = subprocess.run(
+            ["bash", "-c", cmd],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+        return p.returncode, (p.stdout or "") + (p.stderr or "")
     p = subprocess.run(
         [sys.executable, str(REMOTE_RUN), "-"],
         input=cmd,
