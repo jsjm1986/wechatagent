@@ -668,11 +668,47 @@ pub async fn execute_step(
             message: "已记录：请去 EvolutionCenterTab 评估候选".to_string(),
             details: None,
         }),
-        "analyze_logs" => Ok(StepOutcome {
-            chunk_id: None,
-            message: "已生成 24h block/hold 日志摘要（详见 turn 详情）".to_string(),
-            details: None,
-        }),
+        "analyze_logs" => {
+            let cutoff = mongodb::bson::DateTime::from_millis(
+                mongodb::bson::DateTime::now().timestamp_millis() - 24 * 3600 * 1000,
+            );
+            let filter = doc! {
+                "workspace_id": workspace_id,
+                "account_id": _account_id,
+                "created_at": { "$gte": cutoff },
+                "status": { "$in": ["blocked", "blocked_by_safety_guard", "warning", "warn"] },
+            };
+            let mut cursor = state
+                .db
+                .events()
+                .find(
+                    filter,
+                    mongodb::options::FindOptions::builder()
+                        .sort(doc! { "created_at": -1 })
+                        .limit(200)
+                        .build(),
+                )
+                .await?;
+            let mut by_kind: std::collections::HashMap<String, i32> =
+                std::collections::HashMap::new();
+            let mut total = 0i32;
+            while let Some(ev) = futures::TryStreamExt::try_next(&mut cursor).await? {
+                total += 1;
+                *by_kind.entry(ev.kind.clone()).or_insert(0) += 1;
+            }
+            let mut lines: Vec<(String, i32)> = by_kind.into_iter().collect();
+            lines.sort_by(|a, b| b.1.cmp(&a.1));
+            let top: Vec<Document> = lines
+                .iter()
+                .take(10)
+                .map(|(k, n)| doc! { "kind": k, "count": *n })
+                .collect();
+            Ok(StepOutcome {
+                chunk_id: None,
+                message: format!("已汇总近 24h 拦截/暂缓事件 {} 条（详见 turn 详情）", total),
+                details: Some(doc! { "analyzeLogsTotal": total, "byKind": top }),
+            })
+        }
         "dismiss" => Ok(StepOutcome {
             chunk_id: None,
             message: "已忽略本卡片".to_string(),
