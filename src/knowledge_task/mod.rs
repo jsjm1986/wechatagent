@@ -665,7 +665,7 @@ pub async fn execute_step(
         }
         "review_evolution" => Ok(StepOutcome {
             chunk_id: None,
-            message: "已记录：请去 EvolutionCenterTab 评估候选".to_string(),
+            message: "本项需人工评估：请到「自优化中心」查看并裁决候选提案，AI 不自动放量".to_string(),
             details: None,
         }),
         "analyze_logs" => {
@@ -709,11 +709,43 @@ pub async fn execute_step(
                 details: Some(doc! { "analyzeLogsTotal": total, "byKind": top }),
             })
         }
-        "dismiss" => Ok(StepOutcome {
-            chunk_id: None,
-            message: "已忽略本卡片".to_string(),
-            details: None,
-        }),
+        "dismiss" => {
+            let card_id_hex = step.get_str("cardId").unwrap_or("").to_string();
+            if let Ok(card_oid) = ObjectId::parse_str(&card_id_hex) {
+                let report_date = step
+                    .get_str("reportDate")
+                    .ok()
+                    .map(|s| s.to_string())
+                    .unwrap_or_default();
+                let mut filter = doc! {
+                    "workspace_id": workspace_id,
+                    "cards.cardId": card_oid,
+                };
+                if !report_date.is_empty() {
+                    filter.insert("report_date", &report_date);
+                }
+                let _ = state
+                    .db
+                    .knowledge_daily_reports()
+                    .update_one(
+                        filter,
+                        doc! { "$addToSet": { "dismissed_card_ids": card_oid } },
+                        None,
+                    )
+                    .await;
+                Ok(StepOutcome {
+                    chunk_id: None,
+                    message: format!("已忽略卡片 {card_id_hex}"),
+                    details: None,
+                })
+            } else {
+                Ok(StepOutcome {
+                    chunk_id: None,
+                    message: "缺有效 cardId，未忽略卡片".to_string(),
+                    details: None,
+                })
+            }
+        }
         other => Err(anyhow::anyhow!("unsupported action: {other}")),
     }
 }
