@@ -104,6 +104,16 @@
 - 本轮补测读端点全 200：`/api/knowledge/digest/today`（reportId/reportDate）、`/api/knowledge/gap-signals`（signals）、`/api/knowledge/chat/tasks` items[0]、`/api/operation-knowledge/chunks` items[0] ✓。
 - 四方对齐，无 bug。
 
+### 13. webhook → 自动回复链路（产品心脏，POST /webhooks/wechat，GREEN happy-path + 1 B类 + MCP 发送步 BLOCKED）
+本轮新增补测（上一轮 12 组均为 UI 频道,未端到端触发后端入口）。新编译二进制（后端源码 `git diff HEAD..origin/main -- src/` **为空** = main 一字不差）+ 本地 Mongo 四方对账。链路：`POST /webhooks/wechat`→落库 conversation_messages→contact 解析/upsert→行为信号→去抖调度 spawn runner→`handle_managed_message_aggregated`（reaction→decision→review→outbox→MCP send）→立即 ack。
+- **HTTP ack 契约**：managed contact → `{ok:true,managed:true,queued:true,deferred:false}`；`WEBHOOK_VERIFY_SIGNATURE=false` 故无需 HMAC（.env 确认）✓。
+- **happy-path（简单问候"你好，在吗？"，run `bf344077…`）**：LLM decision 成功（`user.reply.task` 单程 23501 tokens）→ `final_review_status=approved` / `should_reply=true` → 回复"在的，你好呀。有什么需要帮忙的吗？"入 outbox（status=in_flight，MCP 宕机故未真发，见 C 类）✓。
+  - **画像/记忆维度**（goal「→画像/记忆/引导」步）：DB contact `agent_profile` 落库 4 键（summary/interests/communicationStyle/operationGoal）✓；`agent_reply` 事件 success ✓。
+  - **红线守卫真执行（四方一致）**：LLM 产出非 canonical 的 `customerStage="陌生"` + `operationState="initial_greeting"`（DEFAULT 状态机合法态仅 new_contact/relationship_building/need_discovery…）→ 两闸如 CLAUDE.md 所述正确触发：`agent.dimension_dropped`（非法 stage 丢弃,双层标签生效）+ `agent.operation_state_transition_rejected`（`unknown_target`,跳过 operation_state 写入、保留旧值,**fail-soft 不阻断已发回复**）✓。这是既定设计,非 bug。
+  - 注：`last_outbound_at` + 出站 conversation_messages 落库在 **MCP 发送成功之后**（gateway.rs:3011/2990）,MCP 宕机故这两项正确未写——是 C 类连带,非写路径缺陷。
+- **B 类发现 B-1**：需知识/触发 progressive-tier 升档（Lean→Full）的首触问题被 `blocked_by_budget`,永不回复。详见 Findings B-1（对照实验精确定界:简单问候停 Lean 单程正常,仅升档路径两程超 30000 预算）。
+- **C 类 BLOCKED**：MCP 发送步（`message_send_text`）依赖外部 server（47.108.57.147:3001,本轮探活 000/5s 超时,宕机）→ outbox 最终 `failed_terminal`。decision/review/outbox 入队全本地 GREEN,发送步 BLOCKED,后端正确重试后转 terminal 不吞错。
+
 ## 汇总
 
 **覆盖频道（12 组，全部可达业务频道）**：登录/鉴权 → 概览 → 账号配置+联系人导入+托管 → AI 模型配置 → 内容资产+专属顾问 → 产品与成交 → 系统策略 → 请示通道配置 → 系统看板(5频道) → AI 总控 → 活动 → 知识库 Wiki。groupOps/momentOps 是 Phase-2 占位（指向 OverviewFeature），非独立业务频道。
