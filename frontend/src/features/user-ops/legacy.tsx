@@ -1765,11 +1765,15 @@ export function PlannerViewSection({ contact }: { contact: Contact | null }) {
 export function SendHistorySection({ wxid }: { wxid: string }) {
   const [items, setItems] = useState<SendHistoryItem[]>([]);
   const [loaded, setLoaded] = useState(false);
+  // 区分「拉取失败」与「确实没发过」：失败时绝不渲染"还没发过"这句事实性断言，
+  // 否则网络/服务故障会被当成真实业务结论展示给运营，误导判断。
+  const [failed, setFailed] = useState(false);
 
   useEffect(() => {
     let alive = true;
     setLoaded(false);
     setItems([]);
+    setFailed(false);
     if (!wxid) {
       setLoaded(true);
       return;
@@ -1783,13 +1787,22 @@ export function SendHistorySection({ wxid }: { wxid: string }) {
       })
       .catch(() => {
         if (!alive) return;
-        setItems([]);
+        setFailed(true);
         setLoaded(true);
       });
     return () => {
       alive = false;
     };
   }, [wxid]);
+
+  if (loaded && failed) {
+    return (
+      <section className="cockpitSection">
+        <div className="sectionCaption">AI 已发送</div>
+        <EmptyInline text="发送记录加载失败，可能是网络或服务未响应，请稍后重试。" />
+      </section>
+    );
+  }
 
   if (loaded && !items.length) {
     return (
