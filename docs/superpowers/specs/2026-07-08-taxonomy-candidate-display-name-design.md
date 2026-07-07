@@ -2,7 +2,7 @@
 
 - 日期：2026-07-08
 - 状态：设计待批
-- 范围：后端 `src/agent/types.rs`（数据结构 + carry-through）、`src/prompts.rs`（决策 prompt + 版本）、`src/agent/gateway.rs`（取名传参）、`src/agent/decision_taxonomy.rs`（同处理，待亲验）
+- 范围：后端 `src/agent/types.rs`（数据结构 + carry-through + 手写 Default）、`src/prompts.rs`（决策 prompt + 版本 bump）、`src/agent/gateway.rs`（取名传参 + 纯函数）、`src/agent/decision_taxonomy.rs`（同源竞争路径，须同改——写计划时已亲验）
 
 ## 一、问题
 
@@ -62,7 +62,7 @@ if let Some(v) = raw.dimension_display_names {
 
 > 当你为 `customer_stage` / `intent_level` / 其它维度填的值可能不在标准字典里（你自造的新值）时，在 `dimensionDisplayNames` 对象里为该维度配一个简洁中文名，例如 `{"customer_stage": "焦虑观望"}`。字典已有的标准值不必填。
 
-bump `PROMPT_PACK_VERSION`（`prompts.rs:15`，v16→v17）。**改 prompt 不 bump 版本，启动对齐比对可能不生效**（上一批踩过）。
+**不 bump `PROMPT_PACK_VERSION`**（写计划时已亲验当前机制，纠正早期设想）：`ensure_prompt_pack_v2` → `align_prompt_specs`（`prompts.rs:104,181,240-265`）在启动时按 `normalize_prompt_content(row.content) != normalize_prompt_content(spec.content)`（`:259`）逐 key 内容比对决定是否重种——**内容变了重启必生效，不靠版本号**（`:113` 注释 + `domain_profile.rs:262`「不 bump PROMPT_PACK_VERSION」是既定方案核心）。`PROMPT_PACK_VERSION`（`:15`）只是 stamp 到行上（`:304`）的 provenance 字段，非生效闸。运行时 `state.prompt_pack_version` 是另一个独立的 `AtomicU64` LRU 失效计数器（evolution release / 启动各 fetch_add），与本字符串常量无关。若 bump，只有内容变了的 `user.reply.task` 一行被重种为 v17、其余未变行留 v16 → 行间版本混乱，反而更差。故本改动**只改 prompt 文本，不动版本常量**。
 
 ### 3.4 gateway 取名并传入（`src/agent/gateway.rs:1598-1612`）
 
@@ -96,12 +96,14 @@ for (kind, raw) in &outcome.candidate_writes {
 
 返回类型 `Option<&str>` 与 `upsert_candidate` 第 7 参签名（`taxonomy.rs:354` `suggested_display_name: Option<&str>`）逐字匹配，无需 `.as_deref()`。取不到/空 → `None` → 回落原英文，无回归。
 
-### 3.5 decision_taxonomy 路径（`src/agent/decision_taxonomy.rs:112`，待实现时亲验）
+### 3.5 decision_taxonomy 路径（`src/agent/decision_taxonomy.rs:112`）——已亲验：必须同改
 
-`decision_taxonomy.rs:112` 也是 `upsert_candidate(..., None)`。**其函数上下文是否持有 decision 的 `dimension_display_names` 尚未亲验**。实现时须先 Read 该函数完整签名与可达数据：
+写计划阶段已亲验（`decision.rs:1015` + `decision_taxonomy.rs:84-123` + `taxonomy.rs:371-430`）：
 
-- 能取到 decision/其 display_names → 同样传中文名（复用 3.4 的纯函数）。
-- 取不到 → 诚实保持 `None`，并在实施计划里标注为已知局限（不猜、不硬塞）。
+- **它是活路径，不是死桩**：`decide_reply_with_promote`（`decision.rs:1015`）每轮调 `validate_and_normalize_decision`，对 `customer_stage`/`intent_level` 同样判 `CandidateNew` 并 `tokio::spawn` fire-and-forget `upsert_candidate(..., None)`（`:112`）。
+- **它与 gateway ③ 写同一幂等键**：两条路径的候选键都是 `(scope, kind, raw_value)`，而 `upsert_candidate` 对**已存在**候选**不更新** `suggested_display_name`（`:371-413` 命中即 return，只有 `:416-430` 首次 insert 才写名）——**先写者赢**。
+- **结论：④ 必须同改，否则 ③ 的中文名可能被 ④ 的 `None` 抢先写掉**。二者读的是同一个 `final_decision.dimension_display_names`（decision 在 `decide_reply_with_promote` 内产出，gateway 收到的就是它），取到的中文名一致，重复写幂等无害。
+- **它能取到名**：`validate_and_normalize_decision(db, &mut decision, ...)` 持有 `&mut decision`，可在 `classify_decision_tags` 返回后、`spawn_candidate_upserts` 之前读 `decision.dimension_display_names`，把 `candidates: Vec<(kind, raw)>` 升级为带名传参。**纯函数 `classify_decision_tags` 不动**（PBT 覆盖），只在生产入口 `validate_and_normalize_decision` / `spawn_candidate_upserts` 侧取名——复用 3.4 的 `pick_dimension_display_name`。
 
 ## 四、错误处理
 
@@ -134,3 +136,5 @@ for (kind, raw) in &outcome.candidate_writes {
 - 不改 `upsert_candidate` 函数签名（第 7 参 `Option<&str>` 已存在，本就为此设计）。
 - 不碰前端（命名卡 `suggestedDisplayName || rawValue` 预填逻辑已就绪，后端喂中文名即自动生效）。
 - 不做存量数据迁移/兼容（全新项目，无存量 taxonomy_candidates 需迁就）。
+- 不 bump `PROMPT_PACK_VERSION`（见 §3.3：启动对齐按内容 diff 生效，bump 反致行间版本混乱）。
+- 不改 `upsert_candidate` 对已存在候选「不更新 suggested_display_name」的语义（③④同源同名，先写者赢已足够；改成"后写覆盖"会引入并发写放大且无收益）。
