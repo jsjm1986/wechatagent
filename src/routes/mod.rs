@@ -145,7 +145,7 @@ pub mod ext_knowledge {
 pub use shared::upsert_contact_from_value;
 pub use shared::{apply_contact_changes, SkippedField};
 
-use accounts::{list_accounts, sync_accounts, update_account_mcp_key};
+use accounts::{list_accounts, login_begin, login_poll, sync_accounts, update_account_mcp_key};
 use admin_ops_versions::{
     publish_operation_domain_version, publish_operation_state_policy_version,
     publish_taxonomy_version, rollback_operation_domain_version,
@@ -338,6 +338,8 @@ pub fn api_router(state: AppState) -> Router<AppState> {
         .route("/auth/token", post(auth::issue_token))
         .route("/accounts", get(list_accounts))
         .route("/accounts/sync", post(sync_accounts))
+        .route("/accounts/login/begin", post(login_begin))
+        .route("/accounts/login/poll", get(login_poll))
         .route("/accounts/:id/mcp-key", put(update_account_mcp_key))
         .route("/contacts", get(list_contacts))
         .route("/contacts/search", post(search_contacts_endpoint))

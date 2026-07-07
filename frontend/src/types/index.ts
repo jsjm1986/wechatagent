@@ -3,6 +3,7 @@
 export type AgentStatus = "normal" | "managed";
 export type Channel =
   | "command"
+  | "accountManagement"
   | "overview"
   | "userOps"
   | "groupOps"
@@ -36,6 +37,7 @@ export type Account = {
   nickName?: string;
   mcpKeyConfigured?: boolean;
   online: boolean;
+  status?: string;
 };
 
 export type AgentProfile = {

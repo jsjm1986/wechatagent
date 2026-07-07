@@ -68,6 +68,11 @@ pub struct WechatAccount {
     pub mcp_base_url: Option<String>,
     pub mcp_api_key: Option<String>,
     pub online: bool,
+    /// MCP server 侧账号激活状态（`active` / `inactive` 等，来自 account_list 的
+    /// `status` 字段）。区别于 `online`（当前是否在线）：status 是账号在 MCP 侧的
+    /// 生命周期状态，online 是实时连接状态。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
     pub last_sync_at: DateTime,
     /// Phase D / D4：单 account 在调度窗口内允许承接的并发联系人上限。
     /// 0 表示未配置（视为不参与多账号轮询，落回单 account 行为）。
@@ -105,6 +110,7 @@ impl std::fmt::Debug for WechatAccount {
                 &self.mcp_api_key.as_deref().map(crate::secret::mask_secret),
             )
             .field("online", &self.online)
+            .field("status", &self.status)
             .field("last_sync_at", &self.last_sync_at)
             .field("capacity", &self.capacity)
             .field("persona_tag", &self.persona_tag)
