@@ -25,6 +25,7 @@ import type { Channel, DomainProfile } from "../types";
 
 const OverviewFeature = lazy(() => import("../features/overview"));
 const CommandCenterFeature = lazy(() => import("../features/command-center"));
+const AccountManagementFeature = lazy(() => import("../features/account-management"));
 const UserOpsFeature = lazy(() => import("../features/user-ops"));
 const ContentAssetsFeature = lazy(() => import("../features/content-assets"));
 const SystemStrategyFeature = lazy(() => import("../features/system-strategy"));
@@ -70,6 +71,17 @@ export const CHANNELS: ChannelDef[] = [
     title: "AI Command Center",
     subtitle: "用一个后台管理 Agent 统筹好友、微信群、朋友圈与系统任务。",
     Component: CommandCenterFeature,
+  },
+  {
+    id: "accountManagement",
+    group: "运营",
+    label: "账号管理",
+    caption: "微信账号",
+    icon: Contact,
+    eyebrow: "Account Management",
+    title: "账号管理",
+    subtitle: "管理微信账号、配置 MCP 凭证、监控在线状态。",
+    Component: AccountManagementFeature,
   },
   {
     id: "overview",
