@@ -43,6 +43,7 @@ fn make_account_with_key(workspace_id: &str, account_id: &str, key: &str) -> Wec
         mcp_base_url: Some("http://mcp.example".to_string()),
         mcp_api_key: Some(key.to_string()),
         online: true,
+        status: None,
         last_sync_at: now,
         capacity: 0,
         persona_tag: None,

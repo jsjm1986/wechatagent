@@ -139,6 +139,12 @@ export default function AccountManagementFeature() {
                     <span className={styles.metaValue}>{account.appId}</span>
                   </div>
                 )}
+                {account.status && (
+                  <div className={styles.metaRow}>
+                    <span className={styles.metaLabel}>账号状态</span>
+                    <span className={styles.metaValue}>{account.status}</span>
+                  </div>
+                )}
                 <div className={styles.metaRow}>
                   <span className={styles.metaLabel}>MCP 配置</span>
                   <span className={styles.metaValue}>{account.mcpKeyConfigured ? "已配置" : "未配置"}</span>

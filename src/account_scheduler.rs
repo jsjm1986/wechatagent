@@ -267,6 +267,7 @@ mod tests {
             mcp_base_url: None,
             mcp_api_key: None,
             online,
+            status: None,
             last_sync_at: BsonDate::now(),
             capacity,
             persona_tag: Some("sales_assistant".to_string()),
