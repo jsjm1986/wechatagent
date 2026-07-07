@@ -1261,6 +1261,11 @@ fn prompt_specs() -> Vec<PromptSpec> {
   "tags": ["自由标签"],
   "customerStage": "自由生成的客户阶段",
   "intentLevel": "自由生成的意向等级",
+  // ── 维度中文显示名（仅在你为上面 customerStage / intentLevel 等维度填了"字典里可能没有的自造新值"时才填） ──
+  "dimensionDisplayNames": {
+    "customer_stage": "为你上面填的 customerStage 值配一个 4-8 字简洁中文名（如 焦虑观望）；若该值是常见标准阶段、或你没把握，就不要填这一项",
+    "intent_level": "同理，为你上面填的 intentLevel 自造新值配简洁中文名；标准值或没把握就不填"
+  },
   // ── 标签 / 阶段的对话证据（每个判断都要能指回对话里的依据） ──
   // 「窗口序号」= 下方「最近聊天」列表里每条消息行首方括号内的编号（从 0 起、最早的消息为 0、依次递增）。
   "tagEvidenceTurns": [0],         // 支撑上面 tags 的证据消息窗口序号数组；没有对话依据支撑的标签就不要输出。
